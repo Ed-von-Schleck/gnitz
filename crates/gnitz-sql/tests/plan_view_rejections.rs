@@ -65,14 +65,7 @@ fn cat() -> CatalogSnapshot {
         ("wr", table(46, wide(), vec![0])),
         (
             "st",
-            rel(
-                49,
-                RelClass::Stream,
-                false,
-                vec![col("id", i), col("v", i)],
-                vec![0],
-                &[],
-            ),
+            rel(49, RelClass::Stream, vec![col("id", i), col("v", i)], vec![0], &[]),
         ),
         (
             "x",

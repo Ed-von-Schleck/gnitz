@@ -6,14 +6,14 @@
 //! built once per table, cached, and re-sent on every cold scan, seek, push and
 //! SAL group, so anything added to it is paid for system-wide. This blob is
 //! built per resolve and never cached, so the facts only a resolve needs — the
-//! relation's kind and placement, its foreign keys, its secondary indexes —
+//! relation's kind, its foreign keys, its secondary indexes —
 //! ride here instead of taxing every schema block in the system.
 //!
 //! Layout (all little-endian):
 //!
 //! ```text
 //! u8   version
-//! u8   flags         bit 0 = replicated; bits 1..5 = the relation's class
+//! u8   flags         bits 1..5 = the relation's class
 //!                    (bit 1 = view, bit 2 = capacity-bounded, bit 3 = stream,
 //!                    bit 4 = delta feed)
 //! u16  fk_count
@@ -38,9 +38,6 @@ use crate::{unpack_pk_cols, PkColList};
 /// other value rather than guessing at field offsets.
 const VERSION: u8 = 1;
 
-/// Descriptor `flags` bit 0: the ingestion point's rows are a full copy on every
-/// worker.
-const DESC_FLAG_REPLICATED: u8 = 1 << 0;
 /// Descriptor `flags` bits 1..5: the [`RelClass`] encoding.
 const DESC_FLAG_VIEW: u8 = 1 << 1;
 const DESC_FLAG_BOUNDED: u8 = 1 << 2;
@@ -115,10 +112,7 @@ pub struct RelIndex {
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct RelDescriptorBlob {
     pub class: RelClass,
-    /// The relation is an ingestion point whose rows are a full copy on every
-    /// worker. Never set on a view.
-    pub replicated: bool,
-    /// [`DESC_FLAG_PK_REPEATS`], reported for every class unlike `replicated`.
+    /// [`DESC_FLAG_PK_REPEATS`], reported for every class.
     pub pk_repeats: bool,
     pub fks: Vec<RelFk>,
     pub indexes: Vec<RelIndex>,
@@ -135,9 +129,7 @@ impl RelDescriptorBlob {
     pub fn encode(&self) -> Vec<u8> {
         debug_assert!(self.fks.len() <= u16::MAX as usize && self.indexes.len() <= u16::MAX as usize);
         let mut w = Writer::with_capacity(HEADER_LEN + 16 * (self.fks.len() + self.indexes.len()));
-        let flags = self.class.as_wire()
-            | if self.replicated { DESC_FLAG_REPLICATED } else { 0 }
-            | if self.pk_repeats { DESC_FLAG_PK_REPEATS } else { 0 };
+        let flags = self.class.as_wire() | if self.pk_repeats { DESC_FLAG_PK_REPEATS } else { 0 };
         w.u8(VERSION)
             .u8(flags)
             .u16(self.fks.len() as u16)
@@ -168,7 +160,7 @@ impl RelDescriptorBlob {
         if version != VERSION {
             return Err(format!("rel descriptor: unknown version {version}"));
         }
-        let flags = r.flags(DESC_FLAG_REPLICATED | DESC_FLAG_PK_REPEATS | DESC_FLAG_CLASS)?;
+        let flags = r.flags(DESC_FLAG_PK_REPEATS | DESC_FLAG_CLASS)?;
         let class = RelClass::from_wire(flags & DESC_FLAG_CLASS).ok_or_else(|| {
             format!(
                 "rel descriptor: no relation class for flag bits {:#04x}",
@@ -210,7 +202,6 @@ impl RelDescriptorBlob {
         r.expect_consumed()?;
         Ok(Some(RelDescriptorBlob {
             class,
-            replicated: flags & DESC_FLAG_REPLICATED != 0,
             pk_repeats: flags & DESC_FLAG_PK_REPEATS != 0,
             fks,
             indexes,

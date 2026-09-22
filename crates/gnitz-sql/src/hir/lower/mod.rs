@@ -9,7 +9,7 @@
 //! * source collision — [`materialize`];
 //! * reduce derivation — [`resolve_reduce_specs`], [`keyed_frame`];
 //! * join keep — [`join_sides`];
-//! * addressing — `physical::Frame`, [`project_front`], [`project_tail`].
+//! * addressing — `physical::Frame`, [`project_front`].
 
 mod exists;
 pub(crate) mod fold;
@@ -21,9 +21,9 @@ mod setop;
 mod spine;
 mod topn;
 
-use super::chain::{EmitPieces, ViewChain};
+use super::chain::{admit, EmitPieces, ViewChain};
 use super::physical::{self, Frame};
-use super::{as_col, slots_of, split_filter, ColId, GetSource, HirAgg, HirExpr, ProjEntry, RelExpr};
+use super::{as_col, slots_of, split_filter, AggCol, ColId, GetSource, HirCol, HirExpr, ProjEntry, RelExpr};
 use super::{JoinClass, JoinShape, JoinType};
 use crate::agg::group_pk_def;
 use crate::codec::project_schema::{payload_map, ProjItem};
@@ -45,37 +45,32 @@ pub(crate) struct ReduceSpecs {
     pub(crate) group: Vec<u32>,
     pub(crate) specs: Vec<AggDescriptor>,
     /// Each spec's output column, parallel to `specs`.
-    pub(crate) cols: Vec<(ColId, ColumnDef)>,
+    pub(crate) cols: Vec<HirCol>,
 }
 
 impl ReduceSpecs {
-    pub(crate) fn push(&mut self, spec: AggDescriptor, id: ColId, def: ColumnDef) {
+    pub(crate) fn push(&mut self, spec: AggDescriptor, col: HirCol) {
         self.specs.push(spec);
-        self.cols.push((id, def));
+        self.cols.push(col);
     }
 }
 
-/// Resolve a `Reduce`'s group columns and aggregates against its input's layout
-/// — the derivation `lower::reduce` and `lower::fold` share. The output defs are
-/// `HirAgg`'s, the ones HAVING and finalize are typed against.
+/// Resolve a `Reduce`'s group and aggregate columns against its input's layout.
 pub(crate) fn resolve_reduce_specs(
     group_cols: &[ColId],
-    aggs: &[HirAgg],
+    aggs: &[AggCol],
     layout: &[ColId],
 ) -> Result<ReduceSpecs, GnitzSqlError> {
     let group = slots_of(layout, group_cols)?.into_iter().map(|c| c as u32).collect();
     let mut r = ReduceSpecs {
         group,
-        specs: Vec::new(),
-        cols: Vec::new(),
+        specs: Vec::with_capacity(aggs.len() + 1),
+        cols: Vec::with_capacity(aggs.len() + 1),
     };
-    for c in aggs.iter().flat_map(HirAgg::cols) {
-        if r.cols.iter().any(|(id, _)| *id == c.col.id) {
-            continue; // shared with an earlier aggregate
-        }
+    for c in aggs {
         // COUNT(*) reads no column; slot 0 is the placeholder.
         let col_idx = c.arg.map(|id| super::slot_of(layout, id)).transpose()?.unwrap_or(0) as u32;
-        r.push(AggDescriptor { agg_op: c.op, col_idx }, c.col.id, c.col.def.clone());
+        r.push(AggDescriptor { agg_op: c.op, col_idx }, c.col.clone());
     }
     Ok(r)
 }
@@ -87,10 +82,10 @@ pub(crate) fn keyed_frame(
     out_key: ReduceOutKey,
     group: &[u32],
     row: impl IntoIterator<Item = u32>,
-    tail: Vec<(ColId, ColumnDef)>,
+    tail: Vec<HirCol>,
     what: &str,
 ) -> Result<Frame, GnitzSqlError> {
-    let (mut layout, mut cols, mut npk) = (Vec::new(), Vec::new(), 0u32);
+    let (mut layout, mut cols, mut npk) = (Vec::new(), Vec::new(), 0usize);
     for slot in out_key.output_layout(&input.schema.pk_cols, group, row) {
         let (id, def) = match slot {
             ReduceOutSlot::SyntheticKey => (ColId::NONE, group_pk_def()),
@@ -98,16 +93,15 @@ pub(crate) fn keyed_frame(
                 (input.layout[c as usize], input.schema.columns[c as usize].clone())
             }
         };
-        npk += u32::from(!matches!(slot, ReduceOutSlot::Carried(_)));
+        npk += usize::from(!matches!(slot, ReduceOutSlot::Carried(_)));
         layout.push(id);
         cols.push(def);
     }
-    let (ids, defs): (Vec<_>, Vec<_>) = tail.into_iter().unzip();
-    layout.extend(ids);
-    cols.extend(defs);
-    let schema =
-        Schema::from_parts(cols, (0..npk).collect()).map_err(|e| GnitzSqlError::Unsupported(format!("{what}: {e}")))?;
-    Ok(Frame { layout, schema: Arc::new(schema) })
+    layout.extend(tail.iter().map(|c| c.id));
+    cols.extend(tail.into_iter().map(|c| c.def));
+    let frame = Frame::leading(layout, cols, npk);
+    admit(&frame.schema, what)?;
+    Ok(frame)
 }
 
 /// The downstream demand on a combine's output: the final projection and the
@@ -133,8 +127,7 @@ pub(crate) struct SegInput {
     pub frame: Frame,
     /// The catalog descriptor `tid` resolved to, or `None` when `tid` is a
     /// chain-minted segment, which has no catalog rows until the chain commits.
-    /// The lowering reads every catalog fact off this: the scan-bound index list
-    /// and the reduce's replication flag.
+    /// The lowering reads the scan-bound index list off this.
     pub desc: Option<Arc<RelDescriptor>>,
     /// Off `desc` for a catalog relation, off the pushed segment otherwise.
     pub pk_repeats: bool,
@@ -191,38 +184,6 @@ pub(crate) fn project_front(
     let proj = physical::physicalize_projection(items, &input.layout, &input.schema)?;
     let node = emit_projection(cb, node, &proj.items, &proj.out.schema, &input.schema)?;
     Ok((node, proj.out))
-}
-
-/// A combine's projection over `frame`'s leading key region. The first item passing
-/// a key-region column through renames that slot in place (a reduce's natural
-/// group key); anything else lands in the payload.
-pub(crate) fn project_tail(
-    cb: &mut gnitz_core::Circuit,
-    node: gnitz_core::NodeId,
-    items: &[ProjEntry],
-    frame: &Frame,
-) -> Result<(gnitz_core::NodeId, Frame), GnitzSqlError> {
-    let npk = frame.npk();
-    debug_assert!(frame.schema.pk_cols.iter().enumerate().all(|(i, &c)| c as usize == i));
-    let mut proj: Vec<ProjItem> = (0..npk).map(|src_col| ProjItem::PassThrough { src_col }).collect();
-    let mut cols = frame.schema.columns[..npk].to_vec();
-    let mut layout = frame.layout[..npk].to_vec();
-    let mut renamed = vec![false; npk];
-    for entry in items {
-        let item = ProjItem::from_bound(physical::resolve_refs(&entry.expr, &frame.layout)?);
-        if let Some(slot) = item.passthrough_src().filter(|&c| c < npk && !renamed[c]) {
-            cols[slot].name = entry.out.def.name.clone();
-            layout[slot] = entry.out.id;
-            renamed[slot] = true;
-            continue;
-        }
-        proj.push(item);
-        cols.push(entry.out.def.clone());
-        layout.push(entry.out.id);
-    }
-    let out = Frame::leading(layout, cols, npk);
-    let node = emit_projection(cb, node, &proj, &out.schema, &frame.schema)?;
-    Ok((node, out))
 }
 
 /// Lower a bound `RelExpr` tree to circuit pieces.

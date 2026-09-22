@@ -17,13 +17,12 @@ fn cat() -> CatalogSnapshot {
     let u = TypeCode::U64;
     let tvw = || vec![col("id", u), col("v", u), col("w", u)];
     catalog(vec![
-        ("t", rel(16, RelClass::Table, false, tvw(), vec![0], &[&[1], &[2]])),
+        ("t", rel(16, RelClass::Table, tvw(), vec![0], &[&[1], &[2]])),
         (
             "wide",
             rel(
                 17,
                 RelClass::Table,
-                false,
                 vec![col("id", u), col("flag", u), col("big", TypeCode::U128)],
                 vec![0],
                 &[&[1], &[2]],
@@ -33,7 +32,7 @@ fn cat() -> CatalogSnapshot {
             "c",
             table(18, vec![col("a", u), col("b", u), col("x", TypeCode::I64)], vec![0, 1]),
         ),
-        ("tv", rel(19, RelClass::View, false, tvw(), vec![0], &[])),
+        ("tv", rel(19, RelClass::View, tvw(), vec![0], &[])),
         (
             "tw",
             table(20, vec![col("id", TypeCode::I64), col("w", TypeCode::U128)], vec![0]),
@@ -553,14 +552,7 @@ fn a_read_the_planner_rejects_names_its_rule() {
     cat.insert(SN, "r", Some(r));
     let jv = view(&cat, "SELECT * FROM l JOIN r ON l.val = r.val");
     register(&mut cat, "jv", 32, &jv);
-    let st = rel(
-        33,
-        RelClass::Stream,
-        false,
-        vec![col("id", TypeCode::I64)],
-        vec![0],
-        &[],
-    );
+    let st = rel(33, RelClass::Stream, vec![col("id", TypeCode::I64)], vec![0], &[]);
     cat.insert(SN, "st", Some(st));
 
     for (sql, variant, msg) in [
@@ -793,7 +785,6 @@ fn a_cte_expands_to_the_flat_query() {
         rel(
             30,
             RelClass::View,
-            false,
             vec![col("id", i), col("v", i), col("v", i)],
             vec![0],
             &[],

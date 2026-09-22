@@ -252,7 +252,9 @@ def test_a_global_aggregate_is_one_row_over_any_source(client, schema_name):
     combine — weight-exact at any worker count, and a COUNT over a *fresh*
     all-NULL column must ground to 0 there too. A lone aggregate grounds when the
     cardinality gate sheds its computed row; a projection computed on the way in
-    or out keeps the one row; and HAVING filters the ground row like any other,
+    or out keeps the one row; a COUNT over a NOT NULL column counts rows even
+    where a derived table's projection is all that carries the column; and
+    HAVING filters the ground row like any other,
     so `SUM(a) = 0` admits a genuine zero sum and never the ground's NULL."""
     sn = schema_name
     client.execute_sql(
@@ -265,6 +267,7 @@ def test_a_global_aggregate_is_one_row_over_any_source(client, schema_name):
         "MAX(n) AS hi FROM t; "
         "CREATE VIEW lone_count AS SELECT COUNT(n) AS cn FROM t; "
         "CREATE VIEW lone_sum AS SELECT SUM(a) AS sa FROM t; "
+        "CREATE VIEW count_not_null AS SELECT COUNT(a) AS ca FROM (SELECT pk, a FROM t) d; "
         "CREATE VIEW computed AS SELECT COUNT(*) + 1 AS c, SUM(a * 2) AS s, 'x' AS lit FROM t; "
         "CREATE VIEW having_count AS SELECT COUNT(*) AS c FROM t HAVING COUNT(*) > 2; "
         "CREATE VIEW having_zero AS SELECT SUM(a) AS s FROM t HAVING SUM(a) = 0",
@@ -298,6 +301,7 @@ def test_a_global_aggregate_is_one_row_over_any_source(client, schema_name):
         assert bag(scanned(client, sn, "nullable"), "cn", "sn", "an", "lo", "hi") == {fn: 1}, sql
         assert bag(scanned(client, sn, "lone_count"), "cn") == {(fn[0],): 1}, sql
         assert bag(scanned(client, sn, "lone_sum"), "sa") == {(sa,): 1}, sql
+        assert bag(scanned(client, sn, "count_not_null"), "ca") == {(c,): 1}, sql
         assert bag(scanned(client, sn, "computed"), "c", "s", "lit") == \
             {(c + 1, None if sa is None else 2 * sa, "x"): 1}, sql
         assert bag(scanned(client, sn, "having_count"), "c") == ({(c,): 1} if c > 2 else {}), sql

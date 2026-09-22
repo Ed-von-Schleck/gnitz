@@ -166,21 +166,19 @@ const SHAPES: &[Row] = &[
     // Pure range: A is owned before the join, so its output needs no exchange.
     ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w < a.v)", 1, &[], &[(RangeJoin, 2), (Reduce, 1), (WorkerFilter, 1)]),
     ("SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.w < a.v)", 1, &[], &[(RangeJoin, 2), (Reduce, 1), (WorkerFilter, 1)]),
-    // Reduce: grouped shards on the group columns; a global aggregate funnels
-    // through an empty-key exchange with a ground row, two-phase when linear;
-    // a replicated source needs no exchange at all.
+    // Reduce: an exchange on the group columns — for a global aggregate an empty
+    // key, and a ground row.
     ("SELECT g, COUNT(*) AS n, SUM(v) AS s FROM t GROUP BY g", 1, &[&[1]], &[(Reduce, 1)]),
     ("SELECT a AS ka, b AS kb, COUNT(*) AS n, SUM(v) AS s FROM c GROUP BY a, b", 1, &[&[0, 1]], &[(Reduce, 1)]),
     ("SELECT g, SUM(v) AS s FROM t GROUP BY g HAVING SUM(v) > 10", 1, &[&[1]], &[(Reduce, 1), (Filter, 1)]),
     ("SELECT g + v AS k, SUM(g * v) AS s FROM t GROUP BY g + v", 1, &[&[1]], &[(Reduce, 1)]),
     ("SELECT SUM(v) AS s, MIN(v) AS mn, MAX(v) AS mx FROM t", 1, &[&[]], &[(Reduce, 1), (GlobalGround, 1)]),
-    ("SELECT SUM(v) AS s, COUNT(*) AS c FROM t", 1, &[&[]], &[(Reduce, 2), (GlobalGround, 1)]),
-    ("SELECT AVG(i32c) AS s FROM ty", 1, &[&[]], &[(Reduce, 2), (GlobalGround, 1)]),
-    ("SELECT COUNT(k) AS c FROM n", 1, &[&[]], &[(Reduce, 2), (GlobalGround, 1)]),
-    // A float SUM, and an AVG over one, would reassociate by worker count: funnel.
+    ("SELECT SUM(v) AS s, COUNT(*) AS c FROM t", 1, &[&[]], &[(Reduce, 1), (GlobalGround, 1)]),
+    ("SELECT AVG(i32c) AS s FROM ty", 1, &[&[]], &[(Reduce, 1), (GlobalGround, 1)]),
+    ("SELECT COUNT(k) AS c FROM n", 1, &[&[]], &[(Reduce, 1), (GlobalGround, 1)]),
     ("SELECT SUM(f) AS s FROM ty", 1, &[&[]], &[(Reduce, 1), (GlobalGround, 1)]),
     ("SELECT AVG(f) AS s FROM ty", 1, &[&[]], &[(Reduce, 1), (GlobalGround, 1)]),
-    ("SELECT v, COUNT(*) AS n FROM r GROUP BY v", 1, &[], &[(Reduce, 1)]),
+    ("SELECT v, COUNT(*) AS n FROM r GROUP BY v", 1, &[&[1]], &[(Reduce, 1)]),
     // DISTINCT and set operations: content-hashed leaves behind an exchange on
     // the hash key, then weight clamps; never a join.
     ("SELECT DISTINCT g FROM t", 1, &[&[0]], &[(Distinct, 1)]),
@@ -282,7 +280,6 @@ fn indexed(indexes: &[&[u32]]) -> CatalogSnapshot {
             rel(
                 40,
                 gnitz_core::RelClass::Table,
-                false,
                 vec![col("pk", i), col("g", i), col("ind", i), col("other", i)],
                 vec![0],
                 indexes,

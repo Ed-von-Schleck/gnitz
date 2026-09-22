@@ -53,10 +53,11 @@ impl FoldFinish {
     ) -> Result<FoldFinish, GnitzSqlError> {
         let merge = ops
             .into_iter()
-            .map(|op| match op {
-                WireAggFunc::Count | WireAggFunc::CountNonNull | WireAggFunc::Sum => None,
+            .map(|op| match op.merge_op() {
+                WireAggFunc::Sum => None,
                 WireAggFunc::Min => Some(Ordering::Less),
                 WireAggFunc::Max => Some(Ordering::Greater),
+                WireAggFunc::Count | WireAggFunc::CountNonNull => unreachable!("merge_op never yields a count"),
             })
             .collect();
         let having = compile_filter_program(having, &partial_schema.columns)?

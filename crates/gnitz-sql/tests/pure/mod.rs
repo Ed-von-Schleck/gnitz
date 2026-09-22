@@ -82,7 +82,6 @@ pub fn ncol(name: &str, tc: TypeCode) -> ColumnDef {
 pub fn rel_with(
     tid: u64,
     class: RelClass,
-    replicated: bool,
     columns: Vec<ColumnDef>,
     pk_cols: Vec<u32>,
     indexes: &[(&[u32], bool)],
@@ -90,7 +89,6 @@ pub fn rel_with(
     Arc::new(RelDescriptor {
         tid,
         class,
-        replicated,
         pk_repeats: class == RelClass::Stream,
         schema: Arc::new(Schema { columns, pk_cols }),
         indexes: indexes
@@ -107,18 +105,17 @@ pub fn rel_with(
 pub fn rel(
     tid: u64,
     class: RelClass,
-    replicated: bool,
     columns: Vec<ColumnDef>,
     pk_cols: Vec<u32>,
     indexes: &[&[u32]],
 ) -> Arc<RelDescriptor> {
     let indexes: Vec<(&[u32], bool)> = indexes.iter().map(|&c| (c, false)).collect();
-    rel_with(tid, class, replicated, columns, pk_cols, &indexes)
+    rel_with(tid, class, columns, pk_cols, &indexes)
 }
 
 /// A plain, partitioned, unindexed base table.
 pub fn table(tid: u64, columns: Vec<ColumnDef>, pk_cols: Vec<u32>) -> Arc<RelDescriptor> {
-    rel(tid, RelClass::Table, false, columns, pk_cols, &[])
+    rel(tid, RelClass::Table, columns, pk_cols, &[])
 }
 
 /// A catalog holding `rels` under [`SN`].
@@ -141,7 +138,7 @@ pub fn catalog(rels: Vec<(&str, Arc<RelDescriptor>)>) -> CatalogSnapshot {
 /// | `n` | `(id PK, k NULL, v NULL)` — nullable join keys and values |
 /// | `ty` | `(id PK, s TEXT, f DOUBLE, big DECIMAL(38,0), uid UUID, i32c INT, u8c U8, i16c SMALLINT)` |
 /// | `c` | `(a U64, b U64, v)` with `PRIMARY KEY (a, b)` |
-/// | `r` | `(id PK, v)`, replicated |
+/// | `r` | `(id PK, v)` |
 /// | `tv` | a view with `t`'s columns |
 /// | `bv` | a capacity-bounded view with `t`'s columns |
 /// | `fv` | a view with a delta feed, with `t`'s columns |
@@ -149,7 +146,7 @@ pub fn base() -> CatalogSnapshot {
     let i = TypeCode::I64;
     let tgv = || vec![col("id", i), col("g", i), col("v", i)];
     catalog(vec![
-        ("t", rel(16, RelClass::Table, false, tgv(), vec![0], &[&[2]])),
+        ("t", rel(16, RelClass::Table, tgv(), vec![0], &[&[2]])),
         ("u", table(17, tgv(), vec![0])),
         ("a", table(18, vec![col("id", i), col("k", i), col("v", i)], vec![0])),
         ("b", table(19, vec![col("id", i), col("k", i), col("w", i)], vec![0])),
@@ -181,11 +178,11 @@ pub fn base() -> CatalogSnapshot {
         ),
         (
             "r",
-            rel(23, RelClass::Table, true, vec![col("id", i), col("v", i)], vec![0], &[]),
+            rel(23, RelClass::Table, vec![col("id", i), col("v", i)], vec![0], &[]),
         ),
-        ("tv", rel(24, RelClass::View, false, tgv(), vec![0], &[])),
-        ("bv", rel(25, RelClass::BoundedView, false, tgv(), vec![0], &[])),
-        ("fv", rel(26, RelClass::FedView, false, tgv(), vec![0], &[])),
+        ("tv", rel(24, RelClass::View, tgv(), vec![0], &[])),
+        ("bv", rel(25, RelClass::BoundedView, tgv(), vec![0], &[])),
+        ("fv", rel(26, RelClass::FedView, tgv(), vec![0], &[])),
     ])
 }
 
@@ -229,11 +226,7 @@ pub fn register(cat: &mut CatalogSnapshot, name: &str, tid: u64, chain: &Planned
         ViewProps::Fed { .. } => RelClass::FedView,
     };
     let pk_cols = fv.pk_cols.clone();
-    cat.insert(
-        SN,
-        name,
-        Some(rel(tid, class, false, fv.output_columns.clone(), pk_cols, &[])),
-    );
+    cat.insert(SN, name, Some(rel(tid, class, fv.output_columns.clone(), pk_cols, &[])));
 }
 
 /// The final view's output columns as `(name, hidden, nullable)`.

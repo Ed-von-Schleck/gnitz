@@ -52,8 +52,7 @@ pub(crate) fn order_column_name(i: usize) -> String {
 
 /// Reject an output column list that names the same *visible* column twice.
 /// Hidden key slots are skipped — they are excluded from name resolution, so
-/// they cannot bind ambiguously. `context` names the DDL surface for the error
-/// message (e.g. "CREATE VIEW projection", "GROUP BY view").
+/// they cannot bind ambiguously. `context` names the surface in the error message.
 pub(crate) fn reject_duplicate_column_names<'a>(
     cols: impl Iterator<Item = &'a ColumnDef>,
     context: &str,

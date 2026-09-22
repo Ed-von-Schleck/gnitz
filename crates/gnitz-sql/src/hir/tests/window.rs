@@ -20,7 +20,6 @@ fn catalog() -> CatalogSnapshot {
             Some(Arc::new(RelDescriptor {
                 tid,
                 class,
-                replicated: false,
                 // A stream's PK is a routing and sort key, never unique.
                 pk_repeats: class == RelClass::Stream,
                 schema,
@@ -345,7 +344,6 @@ fn register_view(cat: &mut CatalogSnapshot, tid: u64, name: &str, sql: &str) -> 
         Some(Arc::new(RelDescriptor {
             tid,
             class: RelClass::View,
-            replicated: false,
             pk_repeats: v.pk_repeats,
             schema: Arc::new(Schema {
                 columns: v.output_columns,
@@ -408,7 +406,6 @@ fn a_user_named_join_pk_column_is_a_row_key() {
         Some(Arc::new(RelDescriptor {
             tid,
             class,
-            replicated: false,
             pk_repeats,
             schema: Arc::new(Schema { columns, pk_cols }),
             indexes: Vec::new(),

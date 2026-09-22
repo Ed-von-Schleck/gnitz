@@ -27,6 +27,13 @@ _SHAPES = {
     "distinct": ("SELECT DISTINCT av FROM a", ("av",), {(100,): 1}, {(100,): 1}),
     "group_by_text": ("SELECT cat, COUNT(*) AS cnt FROM a GROUP BY cat",
                       ("cat", "cnt"), {("x", 1): 1, ("y", 1): 1}, {("x", 1): 1}),
+    # A natural group key the SELECT list drops rides hidden, and keeps two
+    # groups of equal count two elements.
+    "group_by_unprojected_pk": ("SELECT COUNT(*) AS cnt FROM a GROUP BY pk",
+                                ("cnt",), {(1,): 2}, {(1,): 1}),
+    # So an aggregate may take the hidden key's name.
+    "aggregate_named_as_key": ("SELECT COUNT(*) AS k FROM a GROUP BY k",
+                               ("k",), {(1,): 2}, {(1,): 1}),
     # No synthetic key: the source PK the projection drops rides hidden, and is
     # what keeps two rows sharing `av` two elements.
     "unprojected_source_pk": ("SELECT av FROM a", ("av",), {(100,): 2}, {(100,): 1}),

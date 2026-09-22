@@ -1,13 +1,12 @@
 //! The GROUP BY / aggregate shell: the reduce's input through the spine, then the
 //! reduce, HAVING and the finalize projection.
 
-use super::super::{ColId, HirExpr, ProjEntry, RelExpr};
+use super::super::{ColId, HirCol, HirExpr, ProjEntry, RelExpr};
 use super::spine::{open, Top};
-use super::{emit_filter, keyed_frame, project_tail, resolve_reduce_specs, CutMemo, ReduceSpecs};
+use super::{emit_filter, keyed_frame, project_front, resolve_reduce_specs, CutMemo};
 use crate::agg::agg_col_def;
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
-use crate::validate::reject_duplicate_column_names;
 use gnitz_core::Circuit;
 use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc};
 use std::collections::HashSet;
@@ -27,11 +26,8 @@ pub(super) fn lower_reduce(
     };
 
     let mut live: HashSet<ColId> = group_cols.iter().copied().collect();
-    live.extend(aggs.iter().filter_map(|a| a.arg));
+    live.extend(aggs.iter().filter_map(|c| c.arg));
     let spine = open(chain, memo, input, &live)?;
-    // A chain-minted segment carries no descriptor, so it plans as partitioned; the
-    // engine elides the exchange of a view whose sources are all replicated.
-    let replicated = spine.replicated();
     let mut cb = Circuit::default();
     // The spine's output is what the reduce groups and aggregates over, so the
     // group/argument positions, the strategy and the reduce-output layout all
@@ -41,39 +37,15 @@ pub(super) fn lower_reduce(
     let mut r = resolve_reduce_specs(group_cols, aggs, &reduce_in.layout)?;
     let (out_key, group) = reduce_in.schema.reduce_key(&r.group);
     let ungrouped = group.is_empty();
-    // A stateful reduce gates group existence on a NULL-blind COUNT(*): a user one
-    // (or a count over a NOT NULL argument) serves, else a hidden one.
+    // The engine reads group existence off a COUNT(*); a hidden one if no
+    // aggregate is one.
     if !r.specs.iter().any(|d| d.agg_op == WireAggFunc::Count) {
         r.push(
             AggDescriptor::COUNT_STAR,
-            ColId::NONE,
-            agg_col_def(WireAggFunc::Count, None, ungrouped),
+            HirCol::new(ColId::NONE, agg_col_def(WireAggFunc::Count, None, ungrouped)),
         );
     }
-    let ReduceSpecs { specs, mut cols, .. } = r;
-    // Per-worker partials combined: exact for linear aggregates, but not a float
-    // SUM, whose addition reassociates by worker count.
-    let two_phase = ungrouped
-        && !replicated
-        && specs
-            .iter()
-            .zip(&cols)
-            .all(|(d, (_, c))| d.agg_op.is_linear() && !(d.agg_op == WireAggFunc::Sum && c.ty.tc.is_float()));
-    let reduced = if two_phase {
-        // Each worker folds a partial; V₀'s owner merges them and seeds the ground row.
-        let partials = cb.reduce_multi_local(node, &[], &specs, false);
-        let mut merge: Vec<AggDescriptor> = (1..=specs.len() as u32)
-            .map(|col_idx| AggDescriptor { agg_op: WireAggFunc::Sum, col_idx })
-            .collect();
-        merge.push(AggDescriptor::COUNT_STAR);
-        cols.push((ColId::NONE, agg_col_def(WireAggFunc::Count, None, true)));
-        cb.reduce_multi(partials, &[], &merge, true)
-    } else if replicated {
-        // Shard-free: every worker reduces its full local copy to the same aggregate.
-        cb.reduce_multi_local(node, &group, &specs, ungrouped)
-    } else {
-        cb.reduce_multi(node, &group, &specs, ungrouped)
-    };
+    let reduced = cb.reduce_multi(node, &group, &r.specs, ungrouped);
 
     // HAVING over the raw reduce output, then the finalize projection.
     let having_frame = keyed_frame(
@@ -81,12 +53,11 @@ pub(super) fn lower_reduce(
         out_key,
         &group,
         group.iter().copied(),
-        cols,
+        r.cols,
         "GROUP BY output",
     )?;
     let filtered = emit_filter(&mut cb, reduced, having_preds, &having_frame)?;
-    let (node, out) = project_tail(&mut cb, filtered, items, &having_frame)?;
-    reject_duplicate_column_names(out.schema.columns.iter(), "GROUP BY view")?;
+    let (node, out) = project_front(&mut cb, filtered, items, &having_frame)?;
     cb.sink(node);
     // One row per group key, which the reduce output is keyed on.
     Ok(EmitPieces { circuit: cb, out, pk_repeats: false })

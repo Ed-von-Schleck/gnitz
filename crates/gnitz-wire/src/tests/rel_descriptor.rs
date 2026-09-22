@@ -30,7 +30,6 @@ fn empty_lists_roundtrip() {
 fn multi_column_index_and_multi_fk_roundtrip() {
     let d = RelDescriptorBlob {
         class: RelClass::BoundedView,
-        replicated: true,
         pk_repeats: true,
         fks: vec![
             RelFk {
@@ -58,12 +57,10 @@ fn multi_column_index_and_multi_fk_roundtrip() {
     assert_eq!(roundtrip(&d, 3), d);
 }
 
-/// Every class survives a roundtrip alongside `replicated`, which is orthogonal
-/// to all of them: reading `replicated` back as false on a replicated stream
-/// would make every worker hold a full copy while the client still folded
-/// per-worker partials.
+/// Every class survives a roundtrip alongside `pk_repeats`, which is orthogonal
+/// to all of them.
 #[test]
-fn every_class_roundtrips_with_replicated() {
+fn every_class_roundtrips_with_pk_repeats() {
     for class in [
         RelClass::Table,
         RelClass::Stream,
@@ -71,10 +68,10 @@ fn every_class_roundtrips_with_replicated() {
         RelClass::BoundedView,
         RelClass::FedView,
     ] {
-        for &replicated in &[false, true] {
-            let d = RelDescriptorBlob { class, replicated, ..Default::default() };
+        for &pk_repeats in &[false, true] {
+            let d = RelDescriptorBlob { class, pk_repeats, ..Default::default() };
             let back = roundtrip(&d, 2);
-            assert_eq!(back, d, "{class:?} replicated={replicated}");
+            assert_eq!(back, d, "{class:?} pk_repeats={pk_repeats}");
         }
     }
 }

@@ -1,7 +1,9 @@
 use super::fixtures::*;
 use super::*;
 use crate::catalog::CatalogEngine;
-use crate::test_support::{col_def, pk_only_schema, scratch_dir, write_circuit, write_identity_circuit};
+use crate::test_support::{
+    col_def, make_schema_u64_i64, pk_only_schema, scratch_dir, u64_pk_schema, write_circuit, write_identity_circuit,
+};
 use gnitz_store::schema::SchemaColumn;
 use gnitz_wire::{OpNode, TypeCode};
 
@@ -284,4 +286,128 @@ fn a_circuit_over_the_node_limit_is_rejected() {
         chain(MAX_CIRCUIT_NODES).is_ok(),
         "exactly MAX_CIRCUIT_NODES is accepted"
     );
+}
+
+// ── compile_view: the global split ──────────────────────────────────────
+
+/// `ScanDelta(10) → [ExchangeShard []] → op → IntegrateSink`.
+fn global_circuit(op: OpNode, exchanged: bool) -> LoadedCircuit {
+    let mut nodes = vec![(0, scan_delta(10))];
+    if exchanged {
+        nodes.push((1, OpNode::ExchangeShard { shard_cols: vec![] }));
+    }
+    let n = nodes.len();
+    nodes.push((n, op));
+    nodes.push((n + 1, OpNode::IntegrateSink));
+    let edges = (0..n + 1).map(|i| (i, i + 1, SLOT_IN)).collect();
+    loaded_for_test(nodes, edges)
+}
+
+/// The schema `op`'s side relays, compiled over `source` as worker 0 of `of`, in a
+/// view placed as `source` is.
+fn side_output(op: OpNode, source: SchemaDescriptor, of: u32) -> SchemaDescriptor {
+    let loaded = global_circuit(op.clone(), true);
+    let mut registry = RelationRegistry::new("", gnitz_store::storage::Slot::new(0, of), Default::default());
+    register_sources(&mut registry, [(10, source)]);
+    let view_schema = match &op {
+        OpNode::Reduce { agg, .. } => {
+            gnitz_store::ops::ReducePlan::from_wire(&source, &[], agg, true, true)
+                .unwrap()
+                .shape
+                .output_schema
+        }
+        OpNode::TopN { order, limit, offset, .. } => {
+            gnitz_store::ops::TopNPlan::from_wire(&source, &[], order, *limit, *offset)
+                .unwrap()
+                .output_schema
+        }
+        _ => unreachable!("a global operator"),
+    }
+    .with_placement(source.placement());
+    let (out, _) = compile_view(&loaded, &registry, &view_schema, false).expect("the fixture compiles");
+    *out.sides[0].plan.vm.program.out_schema()
+}
+
+fn global_reduce(op: gnitz_wire::AggFunc) -> OpNode {
+    OpNode::Reduce {
+        group_cols: vec![],
+        agg: vec![
+            gnitz_wire::AggDescriptor { agg_op: op, col_idx: 1 },
+            gnitz_wire::AggDescriptor::COUNT_STAR,
+        ],
+        global_ground: true,
+    }
+}
+
+fn global_topn() -> OpNode {
+    OpNode::TopN {
+        group_cols: vec![],
+        order: vec![gnitz_wire::OrderKey { col: 1, desc: false, nulls_first: false }],
+        limit: 10,
+        offset: 5,
+    }
+}
+
+/// A partitioned global SUM or top-N relays its partials, which lead with the
+/// synthetic group key.
+#[test]
+fn a_partitioned_global_reduce_or_topn_relays_partials() {
+    let keyed = make_schema_u64_i64();
+    for op in [global_reduce(gnitz_wire::AggFunc::Sum), global_topn()] {
+        assert_eq!(side_output(op, keyed, 4).columns[0].type_code, TypeCode::U128);
+    }
+}
+
+/// One worker, a replicated source, a float SUM and an extreme each relay the
+/// input as is.
+#[test]
+fn a_global_reduce_splits_only_where_partials_combine_and_workers_differ() {
+    use gnitz_store::schema::Placement;
+    let keyed = make_schema_u64_i64();
+    let unsplit =
+        |op: OpNode, source: SchemaDescriptor, of: u32| side_output(op, source, of).same_physical_layout(&source);
+    assert!(unsplit(global_reduce(gnitz_wire::AggFunc::Sum), keyed, 1), "one worker");
+    assert!(unsplit(global_topn(), keyed, 1), "one worker");
+    let replicated = keyed.with_placement(Placement::Replicated);
+    assert!(
+        unsplit(global_reduce(gnitz_wire::AggFunc::Sum), replicated, 4),
+        "a replicated source"
+    );
+    assert!(unsplit(global_topn(), replicated, 4), "a replicated source");
+    let float = u64_pk_schema(SchemaColumn::new(TypeCode::F64, false));
+    assert!(
+        unsplit(global_reduce(gnitz_wire::AggFunc::Sum), float, 4),
+        "a float SUM"
+    );
+    assert!(
+        unsplit(global_reduce(gnitz_wire::AggFunc::Min), keyed, 4),
+        "a global MIN"
+    );
+}
+
+/// Only a worker holding the whole input may seed a ground row without an exchange.
+#[test]
+fn a_global_ground_reduce_with_no_exchange_is_refused_unless_self_contained() {
+    use gnitz_store::schema::Placement;
+    let compile = |of: u32, placement: Placement| {
+        let source = make_schema_u64_i64().with_placement(placement);
+        let op = global_reduce(gnitz_wire::AggFunc::Sum);
+        let OpNode::Reduce { agg, .. } = &op else {
+            unreachable!()
+        };
+        let view_schema = gnitz_store::ops::ReducePlan::from_wire(&source, &[], agg, true, true)
+            .unwrap()
+            .shape
+            .output_schema
+            .with_placement(placement);
+        let mut registry = RelationRegistry::new("", gnitz_store::storage::Slot::new(0, of), Default::default());
+        register_sources(&mut registry, [(10, source)]);
+        compile_view(&global_circuit(op, false), &registry, &view_schema, false).map(drop)
+    };
+    assert_eq!(
+        rejection(compile(4, make_schema_u64_i64().placement())),
+        "reduce: a global aggregate over a partitioned input with no exchange"
+    );
+    assert!(compile(1, make_schema_u64_i64().placement()).is_ok(), "one worker");
+    assert!(compile(4, Placement::Replicated).is_ok(), "a replicated view");
 }

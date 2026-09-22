@@ -113,13 +113,12 @@ impl ReduceShape {
     }
 }
 
-/// The baked per-instruction circuit reduce plan, built by
-/// [`ReducePlan::from_wire`] only.
+/// The baked per-instruction circuit reduce plan.
 pub struct ReducePlan {
     pub shape: ReduceShape,
     /// This worker publishes the global-aggregate ground row.
     pub seeds_ground: bool,
-    /// Position of the COUNT(*) carrying a group's net cardinality.
+    /// Position of the aggregate holding a group's net row count.
     pub(super) cardinality: usize,
     /// The value index the non-linear aggregates read their history from;
     /// `Some` iff there is one.
@@ -127,11 +126,21 @@ pub struct ReducePlan {
 }
 
 impl ReducePlan {
-    /// True iff this reduce needs its input delta folded to net weights: only
-    /// the non-linear aggregates, which walk the value index.
+    /// True iff the VM folds this reduce's input first: a value index reads net
+    /// weights, and a float sum depends on row order.
     #[inline]
     pub fn consolidates_input(&self) -> bool {
-        self.avi.is_some()
+        self.avi.is_some() || self.sums_float()
+    }
+
+    /// True iff per-worker partials of this global reduce [`Self::combine`] to
+    /// exactly its result.
+    pub fn combines(&self) -> bool {
+        self.avi.is_none() && !self.sums_float()
+    }
+
+    fn sums_float(&self) -> bool {
+        self.shape.acc_template.iter().any(Accumulator::sums_float)
     }
 
     /// `Err` for a shape [`ReduceShape`] refuses, a ground row over a group set,
@@ -143,16 +152,57 @@ impl ReducePlan {
         global_ground: bool,
         i_am_owner: bool,
     ) -> Result<Self, OpBuildErr> {
+        let cardinality = first_count(agg_descs);
+        Self::new(
+            input_schema,
+            group_by_cols,
+            agg_descs,
+            cardinality,
+            global_ground,
+            i_am_owner,
+        )
+    }
+
+    /// The global reduce over `partials`, the relayed outputs of [`Self::from_wire`]
+    /// over `aggs` and no group: each column merges by its [`AggFunc::merge_op`].
+    /// `Err` unless the output keeps the partials' layout.
+    pub fn combine(
+        partials: &SchemaDescriptor,
+        aggs: &[AggDescriptor],
+        global_ground: bool,
+        i_am_owner: bool,
+    ) -> Result<Self, OpBuildErr> {
+        let mismatch = || OpBuildErr::shape("reduce: the partials do not match the aggregates");
+        let cbase = (partials.num_columns() as u32)
+            .checked_sub(aggs.len() as u32)
+            .ok_or_else(mismatch)?;
+        let merged: Vec<AggDescriptor> = aggs
+            .iter()
+            .zip(cbase..)
+            .map(|(d, col_idx)| AggDescriptor { agg_op: d.agg_op.merge_op(), col_idx })
+            .collect();
+        let plan = Self::new(partials, &[], &merged, first_count(aggs), global_ground, i_am_owner)?;
+        if plan.shape.output_schema != *partials {
+            return Err(mismatch());
+        }
+        Ok(plan)
+    }
+
+    fn new(
+        input_schema: &SchemaDescriptor,
+        group_by_cols: &[u32],
+        agg_descs: &[AggDescriptor],
+        cardinality: Option<usize>,
+        global_ground: bool,
+        i_am_owner: bool,
+    ) -> Result<Self, OpBuildErr> {
         // The ground row carries no group columns.
         if global_ground && !group_by_cols.is_empty() {
             return Err(OpBuildErr::shape("reduce: global-ground over a non-empty group set"));
         }
         let shape = ReduceShape::for_circuit(input_schema, group_by_cols, agg_descs)?;
         // Only the net row count tells an emptied group from a live one.
-        let cardinality = agg_descs
-            .iter()
-            .position(|d| d.agg_op == AggFunc::Count)
-            .ok_or_else(|| OpBuildErr::shape("reduce: a circuit reduce needs a COUNT(*)"))?;
+        let cardinality = cardinality.ok_or_else(|| OpBuildErr::shape("reduce: a circuit reduce needs a COUNT(*)"))?;
         let avi = AviBake::new(input_schema, group_by_cols, &shape.acc_template)?;
         Ok(ReducePlan {
             shape,
@@ -161,4 +211,9 @@ impl ReducePlan {
             avi,
         })
     }
+}
+
+/// The position of the first COUNT(*).
+fn first_count(aggs: &[AggDescriptor]) -> Option<usize> {
+    aggs.iter().position(|d| d.agg_op == AggFunc::Count)
 }

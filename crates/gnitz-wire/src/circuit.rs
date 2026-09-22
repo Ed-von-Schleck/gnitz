@@ -86,6 +86,16 @@ impl AggFunc {
         }
     }
 
+    /// The op a reduce folds this aggregate's own output with: linear partials add,
+    /// extremes compete.
+    pub const fn merge_op(self) -> AggFunc {
+        if self.is_linear() {
+            AggFunc::Sum
+        } else {
+            self
+        }
+    }
+
     /// True iff a reduce's raw output column for this aggregate can hold NULL.
     pub const fn raw_output_nullable(self, src_nullable: bool, ungrouped: bool) -> bool {
         !self.is_linear() && (src_nullable || ungrouped)
@@ -671,10 +681,7 @@ impl Circuit {
     }
 
     /// [`OpNode::Reduce`] with **no upstream exchange**: it aggregates `input` as
-    /// each worker holds it. Over a replicated input every worker computes the
-    /// whole aggregate; over a partitioned one each folds a per-worker partial for
-    /// a downstream [`Self::reduce_multi`] to combine, and must pass
-    /// `global_ground = false` so a worker with no rows contributes no partial.
+    /// each worker holds it.
     pub fn reduce_multi_local(
         &mut self,
         input: NodeId,
@@ -700,28 +707,13 @@ impl Circuit {
         offset: u64,
     ) -> NodeId {
         let sharded = self.shard(input, group_cols);
-        self.top_n_local(sharded, group_cols, order, limit, offset)
-    }
-
-    /// [`OpNode::TopN`] with **no upstream exchange**: the window of each group as
-    /// this worker holds it. Correct over a replicated input, and the local phase
-    /// of the two-phase global top-N — exact because the global window's slots lie
-    /// inside the union of every worker's local `limit + offset` slots.
-    pub fn top_n_local(
-        &mut self,
-        input: NodeId,
-        group_cols: &[u32],
-        order: &[crate::OrderKey],
-        limit: u64,
-        offset: u64,
-    ) -> NodeId {
         let op = OpNode::TopN {
             group_cols: group_cols.to_vec(),
             order: order.to_vec(),
             limit,
             offset,
         };
-        self.add(op, NodeInputs::Unary(input))
+        self.add(op, NodeInputs::Unary(sharded))
     }
 
     /// [`OpNode::ExchangeShard`].

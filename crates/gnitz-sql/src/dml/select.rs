@@ -219,7 +219,7 @@ fn plan_query(cat: &CatalogSnapshot, query: &Query, schema_name: &str) -> Result
     // the same one whichever sink it lands on.
     let access = plan_access(&desc, &alias, select)?;
     let (case, order) = if fold {
-        plan_fold(select, query.order_by.as_ref(), ctx, name, &alias, desc, access)?
+        plan_fold(select, query.order_by.as_ref(), name, &alias, desc, access)?
     } else {
         // OFFSET+LIMIT logical rows; `0` = unbounded (an OFFSET with no LIMIT too).
         let limit_k = window.end().map_or(0, |e| e as u64);
@@ -256,7 +256,6 @@ fn plan_access(desc: &RelDescriptor, alias: &str, select: &Select) -> Result<(Re
 fn plan_fold(
     select: &Select,
     order_by: Option<&OrderBy>,
-    ctx: &str,
     name: String,
     alias: &str,
     desc: Arc<RelDescriptor>,
@@ -266,9 +265,6 @@ fn plan_fold(
     // not cover rejects before the fold is dispatched, as HAVING already does.
     let keys = parse_order_by(order_by)?;
     let (pieces, order_cols) = bind_and_lower_fold(select, &desc.schema, alias, &order_exprs(&keys))?;
-    // Over this sink's output, which lacks the group columns a view's reduce carries:
-    // `SELECT COUNT(*) AS kind FROM t GROUP BY kind` is refused as a view, accepted here.
-    reject_duplicate_projection_names(&select.projection, pieces.finalize.iter().map(|(_, d)| d), ctx)?;
     // Compiled here rather than at finish, so every rejection is pre-dispatch — and
     // the same one a view gives, the finalize being compiled as a view's map is.
     let finish = FoldFinish::new(

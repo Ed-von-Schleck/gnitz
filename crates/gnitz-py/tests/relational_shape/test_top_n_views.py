@@ -27,6 +27,8 @@ _WINDOWS = {
     "by_name": ("SELECT id FROM scores ORDER BY name DESC LIMIT 1", ("id",)),
     # `dup` holds grp=1's rows at weight 2.
     "weighted": ("SELECT id, score FROM dup ORDER BY score DESC LIMIT 3", ("id", "score")),
+    # The largest LIMIT the grammar admits, behind an OFFSET.
+    "unbounded": ("SELECT id FROM scores ORDER BY score DESC LIMIT 9223372036854775807 OFFSET 1", ("id",)),
 }
 
 # (statement, {view: bag}) — each view's whole state after the statement.
@@ -35,26 +37,31 @@ _CHURN = [
      "(4, 2, 5, 7, 'z'), (5, 2, 25, 1, 'w')",
      {"top2": {(2, 30): 1, (5, 25): 1}, "offset": {(2,): 1, (1,): 1}, "nulls_first": {(3,): 1},
       "nulls_desc": {(3,): 1}, "hidden_key": {(2, "y"): 1, (5, "w"): 1}, "by_name": {(4,): 1},
-      "weighted": {(2, 30): 2, (5, 25): 1}}),
+      "weighted": {(2, 30): 2, (5, 25): 1},
+      "unbounded": {(5,): 1, (3,): 1, (1,): 1, (4,): 1}}),
     # A member leaves and the next row is promoted from the index.
     ("DELETE FROM scores WHERE id = 2",
      {"top2": {(5, 25): 1, (3, 20): 1}, "offset": {(1,): 1, (4,): 1}, "nulls_first": {(3,): 1},
       "nulls_desc": {(3,): 1}, "hidden_key": {(5, "w"): 1, (3, "n"): 1}, "by_name": {(4,): 1},
-      "weighted": {(5, 25): 1, (3, 20): 2}}),
+      "weighted": {(5, 25): 1, (3, 20): 2},
+      "unbounded": {(3,): 1, (1,): 1, (4,): 1}}),
     # Into the window, cutting through weight-2 element 3.
     ("UPDATE scores SET score = 28 WHERE id = 4",
      {"top2": {(4, 28): 1, (5, 25): 1}, "offset": {(1,): 1, (4,): 1}, "nulls_first": {(3,): 1},
       "nulls_desc": {(3,): 1}, "hidden_key": {(4, "z"): 1, (5, "w"): 1}, "by_name": {(4,): 1},
-      "weighted": {(4, 28): 1, (5, 25): 1, (3, 20): 1}}),
+      "weighted": {(4, 28): 1, (5, 25): 1, (3, 20): 1},
+      "unbounded": {(5,): 1, (3,): 1, (1,): 1}}),
     # Out of the window.
     ("UPDATE scores SET score = 1 WHERE id = 5",
      {"top2": {(4, 28): 1, (3, 20): 1}, "offset": {(1,): 1, (4,): 1}, "nulls_first": {(3,): 1},
       "nulls_desc": {(3,): 1}, "hidden_key": {(4, "z"): 1, (3, "n"): 1}, "by_name": {(4,): 1},
-      "weighted": {(4, 28): 1, (3, 20): 2}}),
+      "weighted": {(4, 28): 1, (3, 20): 2},
+      "unbounded": {(3,): 1, (1,): 1, (5,): 1}}),
     ("INSERT INTO scores VALUES (6, 1, 40, 0, 'a')",
      {"top2": {(6, 40): 1, (4, 28): 1}, "offset": {(5,): 1, (1,): 1}, "nulls_first": {(3,): 1},
       "nulls_desc": {(3,): 1}, "hidden_key": {(6, "a"): 1, (4, "z"): 1}, "by_name": {(4,): 1},
-      "weighted": {(6, 40): 2, (4, 28): 1}}),
+      "weighted": {(6, 40): 2, (4, 28): 1},
+      "unbounded": {(4,): 1, (3,): 1, (1,): 1, (5,): 1}}),
     ("DELETE FROM scores", dict.fromkeys(_WINDOWS, {})),
 ]
 

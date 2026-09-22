@@ -266,7 +266,6 @@ fn fixture_priming(views: &[(u64, &str, u64)], prime: impl FnOnce(&mut Session))
             desc: Arc::new(RelDescriptor {
                 tid,
                 class: RelClass::FedView,
-                replicated: false,
                 pk_repeats: false,
                 schema: Arc::clone(&schema),
                 indexes: Vec::new(),

@@ -156,42 +156,6 @@ fn the_index_list_is_exact_across_create_and_drop() {
     assert_eq!(list[0].cols.as_slice(), &[1]);
 }
 
-/// `replicated` is a planner hint for a reduce built directly over a source, so
-/// only a base table reports it. A view over a replicated source and a system
-/// family are both *stamped* `Replicated`; answering with that stamp would
-/// re-plan an aggregate over a view on a second authority.
-#[test]
-fn only_a_base_table_reports_its_replication() {
-    let (_srv, mut client, sn) = boot(1);
-    exec(
-        &mut client,
-        &sn,
-        "CREATE TABLE r (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL) WITH (replicated = true)",
-    );
-    exec(
-        &mut client,
-        &sn,
-        "CREATE TABLE plain (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-    );
-    exec(&mut client, &sn, "CREATE VIEW rv AS SELECT id, v FROM r");
-
-    let (r_tid, _) = client.resolve_table_or_view_id(&sn, "r").unwrap();
-    let (plain_tid, _) = client.resolve_table_or_view_id(&sn, "plain").unwrap();
-    let rv_tid = client.resolve_relation(&sn, "rv").unwrap().tid;
-    let replicated = |c: &mut GnitzClient, tid: u64| c.describe_by_id(tid).unwrap().replicated;
-
-    assert!(replicated(&mut client, r_tid), "a REPLICATED base table");
-    assert!(!replicated(&mut client, plain_tid), "a plain base table");
-    assert!(
-        !replicated(&mut client, rv_tid),
-        "a view's locality is the compiler's call, not this hint's"
-    );
-    assert!(
-        !replicated(&mut client, gnitz_core::TABLE_TAB),
-        "a system family is not a base table"
-    );
-}
-
 // ── The by-id addressing form ────────────────────────────────────────────
 
 /// Every id-addressed probe ends at the same registration gate, so no

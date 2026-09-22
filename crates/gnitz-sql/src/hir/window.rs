@@ -49,7 +49,7 @@ use crate::ast_util::{
 use crate::bind::{bind_structural, LeafBinder};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
-use crate::validate::{reject_duplicate_projection_names, reject_float_key_of};
+use crate::validate::reject_float_key_of;
 use gnitz_core::{ColType, ColumnDef, TypeCode};
 use sqlparser::ast::{
     Expr, Function, FunctionArguments, Ident, NamedWindowDefinition, NamedWindowExpr, OrderByExpr, OrderByOptions,
@@ -79,7 +79,6 @@ pub(crate) fn bind_window_final<L: ItemLeaf>(
         aliases: RefCell::new(Vec::new()),
     };
     let mut items = bind_projection(&select.projection, &wleaf, ids, ctx)?;
-    reject_duplicate_projection_names(&select.projection, items.iter().map(|e| &e.out.def), ctx)?;
     // The body's `ORDER BY … LIMIT` keys, placed like any other body's — a
     // window call among them binds to its placeholder like a SELECT item does.
     let placed = super::bind::place_order_keys(order_exprs, &mut items, ids, &wleaf)?;
@@ -920,7 +919,7 @@ fn whole_partition(
             _ => (BExpr::LitInt(1), ColType::of(TypeCode::I64), false),
         });
     }
-    let reduce = RelExpr::reduce(wf.rel, keys.clone(), aggs.list);
+    let reduce = RelExpr::reduce(wf.rel, keys.clone(), HirAgg::physical(&aggs.list));
     Ok(windowed(
         ids,
         reduce,
@@ -971,7 +970,7 @@ fn cumulative(ids: &ColIdGen, w: &WRel, spec: &Spec<ColId>, calls: &[&Call<ColId
         });
     }
     let g_values = g_aggs.list.iter().map(HirAgg::as_value).collect();
-    let reduce = RelExpr::reduce(wf.rel, g_keys.clone(), g_aggs.list);
+    let reduce = RelExpr::reduce(wf.rel, g_keys.clone(), HirAgg::physical(&g_aggs.list));
     let (g, _, _) = present(ids, reduce, &g_keys, "g", g_values);
 
     // The band self-join: g1 is the current peer group, g2 every group of the
@@ -1039,7 +1038,7 @@ fn cumulative(ids: &ColIdGen, w: &WRel, spec: &Spec<ColId>, calls: &[&Call<ColId
         });
     }
     let projected_keys: Vec<ColId> = r_keys[..nkeys].to_vec();
-    let reduce = RelExpr::reduce(band, r_keys, r_aggs.list);
+    let reduce = RelExpr::reduce(band, r_keys, HirAgg::physical(&r_aggs.list));
     Ok(windowed(ids, reduce, &projected_keys, w_keys, "r", calls, per_call))
 }
 

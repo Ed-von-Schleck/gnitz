@@ -6,10 +6,14 @@ use crate::storage::{Batch, ReadCursor};
 
 use super::plan::TopNPlan;
 
+/// The most rows the output batch reserves up front; it grows past that.
+const MAX_TOPN_CAP_HINT: usize = 1 << 16;
+
 /// Visits only the groups `delta` touched — the only ones whose window can have
 /// moved — retracting each stored window and re-emitting the post-delta one,
-/// both `O(offset + limit)`; a row that held its slot cancels itself. `history`
-/// is the operator's index, populated with this epoch's rows before the call.
+/// both `O(offset + limit)`; the output fold cancels a row that held its slot.
+/// `history` is the operator's index, populated with this epoch's rows before the
+/// call.
 pub fn op_topn(delta: &Batch, trace_out: &mut ReadCursor, history: &mut ReadCursor, plan: &TopNPlan) -> Batch {
     let output_schema = &plan.output_schema;
     let n = delta.count;
@@ -20,10 +24,13 @@ pub fn op_topn(delta: &Batch, trace_out: &mut ReadCursor, history: &mut ReadCurs
 
     let runs = plan.key.runs(delta);
 
-    // A hint: one window per touched group, capped by the delta rows that could
-    // have touched one, and never below the window a single-row delta still fills.
-    let window = 2 * plan.limit as usize;
-    let cap = window.saturating_mul(runs.len()).min(n).max(window);
+    // A retracted and a re-emitted window per touched group.
+    let window = usize::try_from(plan.limit).map_or(usize::MAX, |l| l.saturating_mul(2));
+    let cap = window
+        .saturating_mul(runs.len())
+        .min(n)
+        .max(window)
+        .min(MAX_TOPN_CAP_HINT);
     let mut out = Batch::with_capacity(output_schema, cap);
     let mut key = [0u8; MAX_PK_BYTES];
 
@@ -66,6 +73,7 @@ pub fn op_topn(delta: &Batch, trace_out: &mut ReadCursor, history: &mut ReadCurs
         }
     }
 
+    let out = out.into_consolidated(output_schema);
     gnitz_debug!("op_topn: in={} groups={} out={}", n, runs.len(), out.count);
     out
 }

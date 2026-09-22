@@ -70,6 +70,9 @@ fn the_output_exchange_skip_reads_the_shard_key_in_the_sources_columns() {
         !behind_a_map(vec![1]),
         "a payload slot is never the distribution prefix"
     );
+    // The relay a split side's partials take to their combine.
+    assert!(!skips(three_col_pk_schema(1), vec![]), "an empty key");
+    assert!(!skips(three_col_pk_schema(0), vec![]), "an empty key");
 }
 
 /// The exchange is skipped where the join key is exactly a source's distribution

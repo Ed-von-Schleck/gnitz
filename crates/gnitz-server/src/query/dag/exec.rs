@@ -1,5 +1,5 @@
-//! Epoch execution: the one pre → relay → consolidate → post pipeline every
-//! compiled shape runs through, and the DAG evaluation driver.
+//! Epoch execution: the one pre → relay → post pipeline every compiled shape
+//! runs through, and the DAG evaluation driver.
 
 use super::*;
 use crate::query::compiler::OUTPUT_RELAY;
@@ -121,8 +121,7 @@ fn run_post(
     vm::execute_epoch_multi(&mut code.post.vm, state, seeds)
 }
 
-/// Side `i`'s seed for the post phase, folded: the relay delivers rows in an
-/// order that varies with the worker count, and a float SUM follows it.
+/// Side `i`'s seed for the post phase: its relayed output.
 fn run_side(
     host: &mut impl DriveHost,
     relay: &Relay,
@@ -130,19 +129,14 @@ fn run_side(
     delta: Batch,
     src_id: i64,
 ) -> Result<(vm::DeltaReg, Batch), StoreError> {
-    let (pre, seed_reg, emits_replica, schema) = {
+    let (pre, seed_reg, emits_replica) = {
         let ViewPlan { code, state } = plan_of(host, relay.view_id);
         let side = &mut code.sides[i];
-        // The pre-exchange schema, never the view's combine-widened one.
-        let schema = *side.plan.vm.program.out_schema();
         let seed = sub_seed(&side.plan, delta, src_id);
         let pre = vm::execute_epoch_multi(&mut side.plan.vm, state, [seed])?;
-        (pre, side.seed_reg, side.emits_replica, schema)
+        (pre, side.seed_reg, side.emits_replica)
     };
-    Ok((
-        seed_reg,
-        relay.round(host, pre, emits_replica).into_consolidated(&schema),
-    ))
+    Ok((seed_reg, relay.round(host, pre, emits_replica)))
 }
 
 // ── DAG traversal driver ────────────────────────────────────────────────

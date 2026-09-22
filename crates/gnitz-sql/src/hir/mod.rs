@@ -298,14 +298,13 @@ pub(crate) enum RelExpr {
         /// left in a `Filter` above the join as it was built.
         on: JoinClass,
     },
-    /// A GROUP BY / aggregate reduce: the group columns, then each aggregate's raw
-    /// value and companion, which the finalize `Project` above renders. The
-    /// engine's cardinality COUNT has no logical column here.
+    /// A GROUP BY / aggregate reduce: the group columns, then the aggregate
+    /// columns the finalize `Project` above renders.
     Reduce {
         input: Rc<RelExpr>,
         /// `ColId`s of `input`'s columns; an expression key is a `Project` column below.
         group_cols: Vec<ColId>,
-        aggs: Vec<HirAgg>,
+        aggs: AggCols,
     },
     /// SELECT DISTINCT — and the set a DISTINCT aggregate reduces over: dedup over
     /// every one of the input's columns, hidden ones included, via a synthetic
@@ -388,6 +387,25 @@ pub(crate) struct AggCol {
     pub col: HirCol,
 }
 
+/// A reduce's physical aggregate columns: each once, in first-use order.
+#[derive(Clone)]
+pub(crate) struct AggCols(Vec<AggCol>);
+
+impl std::ops::Deref for AggCols {
+    type Target = [AggCol];
+    fn deref(&self) -> &[AggCol] {
+        &self.0
+    }
+}
+
+impl IntoIterator for AggCols {
+    type Item = AggCol;
+    type IntoIter = std::vec::IntoIter<AggCol>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
 /// One aggregate over a reduce: the logical `func(arg)`, and the physical value
 /// and count columns ([`crate::agg::agg_ops`]) it may share with other aggregates.
 #[derive(Clone)]
@@ -439,6 +457,17 @@ impl HirAgg {
     /// Its physical columns: the value, then the count.
     pub(crate) fn cols(&self) -> impl Iterator<Item = &AggCol> {
         std::iter::once(&self.out).chain(&self.companion)
+    }
+
+    /// The physical columns of `aggs`.
+    pub(crate) fn physical(aggs: &[HirAgg]) -> AggCols {
+        let mut out: Vec<AggCol> = Vec::new();
+        for c in aggs.iter().flat_map(HirAgg::cols) {
+            if !out.iter().any(|p| p.col.id == c.col.id) {
+                out.push(c.clone());
+            }
+        }
+        AggCols(out)
     }
 
     /// The finalize composite over this aggregate's raw reduce column(s) — the one
@@ -732,9 +761,7 @@ impl RelExpr {
         Rc::new(RelExpr::Project { input, items })
     }
 
-    /// A reduce. `aggs` are already validated + nullability-stamped by bind (which
-    /// holds the input env), so this is a plain node build — parity by construction.
-    pub(crate) fn reduce(input: Rc<RelExpr>, group_cols: Vec<ColId>, aggs: Vec<HirAgg>) -> Rc<RelExpr> {
+    pub(crate) fn reduce(input: Rc<RelExpr>, group_cols: Vec<ColId>, aggs: AggCols) -> Rc<RelExpr> {
         Rc::new(RelExpr::Reduce { input, group_cols, aggs })
     }
 
@@ -932,15 +959,9 @@ impl RelExpr {
                 }
             },
             RelExpr::Reduce { input, group_cols, aggs } => {
-                // A hidden cardinality COUNT has no logical column and is absent here.
                 let in_cols = input.cols();
                 let mut cols: Vec<HirCol> = group_cols.iter().map(|id| hircol_of(&in_cols, *id).clone()).collect();
-                let n_group = cols.len();
-                for c in aggs.iter().flat_map(HirAgg::cols) {
-                    if !cols[n_group..].iter().any(|h| h.id == c.col.id) {
-                        cols.push(c.col.clone());
-                    }
-                }
+                cols.extend(aggs.iter().map(|c| c.col.clone()));
                 cols
             }
             RelExpr::Distinct { input } | RelExpr::TopN { input, .. } => input.cols(),

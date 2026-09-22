@@ -3,7 +3,7 @@
 //! finishes. It shares `lower::reduce`'s rules and builds no evaluator.
 
 use super::super::physical::{self, Frame};
-use super::super::{as_col, split_filter, ColId, GetSource, HirAgg, HirExpr, ProjEntry, RelExpr};
+use super::super::{as_col, split_filter, AggCol, ColId, GetSource, HirExpr, ProjEntry, RelExpr};
 use super::{keyed_frame, resolve_reduce_specs, ReduceSpecs};
 use crate::codec::project_schema::read_reply_shape;
 use crate::error::GnitzSqlError;
@@ -121,7 +121,7 @@ fn fold(
     base: &RelExpr,
     pre: Option<&[ProjEntry]>,
     group_cols: &[ColId],
-    aggs: &[HirAgg],
+    aggs: &[AggCol],
     having: &[HirExpr],
     finalize: &[ProjEntry],
     what: &str,

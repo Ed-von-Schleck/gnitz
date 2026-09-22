@@ -57,7 +57,6 @@ pub type ScanResult = Result<ScanReply, ClientError>;
 pub struct RelDescriptor {
     pub tid: u64,
     pub class: RelClass,
-    pub replicated: bool,
     /// A stream, or a view whose planner set [`gnitz_wire::VIEW_FLAG_PK_REPEATS`].
     pub pk_repeats: bool,
     pub schema: Arc<Schema>,
@@ -1043,7 +1042,6 @@ fn resolve_descriptor(
     Ok(Some(Arc::new(RelDescriptor {
         tid: ctrl.hdr.target_id,
         class: desc.class,
-        replicated: desc.replicated,
         pk_repeats: desc.pk_repeats,
         schema,
         indexes: desc.indexes,

@@ -53,15 +53,20 @@ fn build(
     seeds: &[(NodeId, SchemaDescriptor)],
     out: NodeId,
 ) -> Result<(SubPlan, Vec<Option<OutReg>>), String> {
+    let seeds: Vec<Seed> = seeds
+        .iter()
+        .map(|&(shard, schema)| Seed { shard, schema, partials: false })
+        .collect();
     build_plan(
         loaded,
         ordered,
         registry,
         &mut StateLayout::default(),
         self_contained,
-        seeds,
-        out,
+        &seeds,
+        PlanOut::Node(out),
     )
+    .map(|b| (b.plan, b.regs))
 }
 
 // ── The plan's output ───────────────────────────────────────────────────

@@ -58,7 +58,10 @@ struct Harness {
 
 impl Harness {
     fn new(group_cols: &[u32], order: &[OrderKey], limit: u64, offset: u64) -> Self {
-        let plan = TopNPlan::from_wire(&schema(), group_cols, order, limit, offset).unwrap();
+        Harness::of(TopNPlan::from_wire(&schema(), group_cols, order, limit, offset).unwrap())
+    }
+
+    fn of(plan: TopNPlan) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let index = scratch_table(dir.path().join("idx").to_str().unwrap(), plan.index.schema);
         let trace_out = scratch_table(dir.path().join("out").to_str().unwrap(), plan.output_schema);
@@ -107,12 +110,9 @@ impl Harness {
             .collect()
     }
 
-    /// An epoch's emitted delta, consolidated — the net change the operator
-    /// published, which is what a downstream reader sees. The raw batch carries
-    /// a retract/re-emit pair per unchanged window row; those cancel here, so
-    /// this asserts the delta is *correct* without pinning that shape.
-    fn net(&self, out: Batch) -> Vec<(u64, i64)> {
-        let b = out.into_consolidated(&self.plan.output_schema);
+    /// An epoch's emitted delta as `(id, weight)`, which must be folded.
+    fn net(&self, b: Batch) -> Vec<(u64, i64)> {
+        assert!(b.is_consolidated(), "op_topn certifies its output folded");
         (0..b.count)
             .map(|r| match self.plan.output_schema.num_payload_cols() {
                 // The id is a carried payload column under a synthetic key, and
@@ -139,8 +139,9 @@ fn global_top_2_desc_promotes_from_the_index_on_retraction() {
     // The published delta is exactly the window's change: id 3 held its slot, so
     // its retract/re-emit pair cancels and only the swap survives.
     assert_eq!(h.net(out), vec![(1, 1), (2, -1)]);
-    // A row below the window changes nothing in the state.
-    h.tick(&batch(&[(4, 1, 0, Some(5), "d")]));
+    // A row below the window changes nothing, and publishes nothing.
+    let out = h.tick(&batch(&[(4, 1, 0, Some(5), "d")]));
+    assert_eq!(h.net(out), vec![]);
     assert_eq!(h.ids(), vec![(0, 1, 1), (0, 3, 1)]);
     // A new leader displaces the last row of the window.
     h.tick(&batch(&[(5, 1, 0, Some(40), "e")]));
@@ -224,10 +225,9 @@ fn from_wire_rejects_what_it_cannot_run() {
     assert!(TopNPlan::from_wire(&float, &[], &[key(1, true, false)], 1, 0).is_ok());
 }
 
-/// The maintained window and the read path's ORDER BY comparator must select
-/// the same rows in the same order — one is byte images in an index, the other
-/// `cmp_order_keys` over the values, and nothing but this holds them together.
-/// Over a limit covering every row, the emitted window *is* the full sort.
+/// The maintained window (byte images in an index) and the read path's
+/// `cmp_order_keys` order rows alike: a window of `k` slots holds the
+/// comparator's first `k` rows, for every `k`.
 #[test]
 fn the_window_order_is_the_shared_comparator_order() {
     let rows: &[Row<'_>] = &[
@@ -250,9 +250,6 @@ fn the_window_order_is_the_shared_comparator_order() {
             key(3, desc, nulls_first),
             key(0, false, false),
         ];
-        let mut h = Harness::new(&[], &keys, rows.len() as u64, 0);
-        let out = h.tick(&batch(rows));
-
         let b = batch(rows);
         let mb = b.as_mem_batch();
         let locs: Vec<gnitz_expr::OrderLocator> = keys
@@ -263,10 +260,83 @@ fn the_window_order_is_the_shared_comparator_order() {
         want.sort_by(|&x, &y| gnitz_expr::cmp_order_keys(&locs, &mb, x, &mb, y));
         let want: Vec<u64> = want.into_iter().map(|r| rows[r].0).collect();
 
-        // The first epoch retracts nothing, so the delta is the window in order.
-        let got: Vec<u64> = (0..out.count)
-            .map(|r| read_i64_le(out.col_data(0), r * 8) as u64)
-            .collect();
-        assert_eq!(got, want, "desc={desc} nulls_first={nulls_first}");
+        for k in 1..=rows.len() {
+            let mut h = Harness::new(&[], &keys, k as u64, 0);
+            // The first epoch retracts nothing, so the delta is the window.
+            let out = h.tick(&batch(rows));
+            let mut got: Vec<u64> = (0..out.count)
+                .map(|r| read_i64_le(out.col_data(0), r * 8) as u64)
+                .collect();
+            got.sort_unstable();
+            let mut first_k = want[..k].to_vec();
+            first_k.sort_unstable();
+            assert_eq!(got, first_k, "desc={desc} nulls_first={nulls_first} k={k}");
+        }
     }
+}
+
+// ── The global top-N split into per-worker partials ─────────────────────
+
+/// A top-N combine outputs the funnel's layout.
+#[test]
+fn a_topn_combine_outputs_the_funnels_layout() {
+    let order = [key(2, true, false), key(0, false, false)];
+    let funnel = TopNPlan::from_wire(&schema(), &[], &order, 3, 1).unwrap();
+    let partial = TopNPlan::partial(&schema(), &order, 3, 1).unwrap();
+    let combine = TopNPlan::combine(&partial.output_schema, &order, 3, 1).unwrap();
+    assert_eq!(combine.output_schema, funnel.output_schema);
+}
+
+/// Two workers' partial windows, relayed to one combine, publish exactly the
+/// funnel's delta every epoch — an OFFSET included, which a partial's window
+/// has to cover.
+#[test]
+fn two_workers_partials_combine_to_the_funnels_window() {
+    let order = [key(2, false, false), key(0, false, false)];
+    let (limit, offset) = (2, 1);
+    let partial = || Harness::of(TopNPlan::partial(&schema(), &order, limit, offset).unwrap());
+    let (mut a, mut b) = (partial(), partial());
+    let partials = a.plan.output_schema;
+    let mut combine = Harness::of(TopNPlan::combine(&partials, &order, limit, offset).unwrap());
+    let mut funnel = Harness::new(&[], &order, limit, offset);
+
+    let ticks: &[(&[Row<'_>], &[Row<'_>])] = &[
+        (
+            &[(1, 1, 0, Some(50), "a"), (2, 1, 0, Some(10), "b")],
+            &[(3, 1, 0, Some(30), "c")],
+        ),
+        (
+            &[(4, 1, 0, Some(20), "d")],
+            &[(5, 1, 0, Some(5), "e"), (6, 1, 0, Some(40), "f")],
+        ),
+        (&[(2, -1, 0, Some(10), "b")], &[]),
+        (&[], &[(5, -1, 0, Some(5), "e"), (3, -1, 0, Some(30), "c")]),
+        (&[(7, 1, 0, None, "g")], &[(8, 2, 0, Some(1), "h")]),
+    ];
+    for (i, &(da, db)) in ticks.iter().enumerate() {
+        let relayed = Batch::concat(&partials, [a.tick(&batch(da)), b.tick(&batch(db))].iter());
+        let whole = Batch::concat(&schema(), [batch(da), batch(db)].iter());
+        let got = combine.tick(&relayed);
+        let want = funnel.tick(&whole);
+        let (got, want) = (combine.net(got), funnel.net(want));
+        assert_eq!(got, want, "tick {i}");
+    }
+}
+
+/// A `LIMIT` past any batch runs, and so does a partial whose `limit + offset`
+/// saturates.
+#[test]
+fn a_huge_limit_and_a_saturated_partial_run() {
+    let rows = [
+        (1, 1, 0, Some(3), "a"),
+        (2, 1, 0, Some(1), "b"),
+        (3, 1, 0, Some(2), "c"),
+    ];
+    let order = [key(2, false, false), key(0, false, false)];
+    let mut h = Harness::new(&[], &order, u64::MAX / 2, 0);
+    let out = h.tick(&batch(&rows));
+    assert_eq!(h.net(out), vec![(1, 1), (2, 1), (3, 1)]);
+    let mut p = Harness::of(TopNPlan::partial(&schema(), &order, u64::MAX / 2, u64::MAX).unwrap());
+    let out = p.tick(&batch(&rows));
+    assert_eq!(p.net(out), vec![(1, 1), (2, 1), (3, 1)]);
 }

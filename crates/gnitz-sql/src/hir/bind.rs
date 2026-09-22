@@ -430,7 +430,6 @@ fn bind_body_suffix(
         super::window::bind_window_final(ids, select, rel, leaf, ctx, order_exprs)?
     } else {
         let mut items = bind_projection(&select.projection, leaf, ids, ctx)?;
-        reject_duplicate_projection_names(&select.projection, items.iter().map(|e| &e.out.def), ctx)?;
         let placed = place_order_keys(order_exprs, &mut items, ids, leaf)?;
         (leaf.project(rel, items)?, placed)
     };
@@ -507,7 +506,7 @@ pub(crate) trait ItemLeaf: LeafBinder<ColId> {
 }
 
 /// Resolve every SELECT item into a `ProjEntry` in SELECT order, expanding a bare
-/// `*` via [`expand_wildcard`].
+/// `*` via [`expand_wildcard`], and refuse two visible items of one name.
 pub(crate) fn bind_projection<L: ItemLeaf>(
     projection: &[SelectItem],
     leaf: &L,
@@ -528,6 +527,7 @@ pub(crate) fn bind_projection<L: ItemLeaf>(
         let (expr, alias) = scalar_projection_item(item, ctx)?;
         items.push(bind_scalar_item(expr, alias, idx, leaf, ids)?);
     }
+    reject_duplicate_projection_names(projection, items.iter().map(|e| &e.out.def), ctx)?;
     Ok(items)
 }
 
@@ -1048,7 +1048,10 @@ fn scalar_leaf(
     Ok(SubqueryRef {
         id: value.id,
         kind: SubqueryKind::Scalar { ty, count: func == AggFunc::Count },
-        rel: RelExpr::project(RelExpr::reduce(ir.rel, group_cols, vec![agg]), items),
+        rel: RelExpr::project(
+            RelExpr::reduce(ir.rel, group_cols, HirAgg::physical(std::slice::from_ref(&agg))),
+            items,
+        ),
         correlation: ir.correlation,
     })
 }
@@ -1571,7 +1574,6 @@ pub(crate) fn bind_adhoc_projection(
         sub: SubPolicy::PerKind,
     };
     let written = bind_projection(projection, &leaf, ids, "SELECT")?;
-    reject_duplicate_projection_names(projection, written.iter().map(|e| &e.out.def), "SELECT")?;
     let cols = &scope.combined;
     // Hidden, so no SELECT-list name resolves to one and no position counts one; an
     // ORDER BY key over an unselected PK column sorts on its slot.
@@ -1656,15 +1658,21 @@ fn bind_grouped_suffix(
             "DISTINCT aggregates are supported in a CREATE VIEW body only".into(),
         ));
     }
-    // What the reduce reads: its group columns, then each aggregate argument. A
-    // DISTINCT aggregate reduces over `Distinct` of exactly that projection.
+    let mut aggs: Vec<HirAgg> = Vec::with_capacity(calls.len());
+    for c in &calls {
+        let agg = HirAgg::new(ids, c.func, c.arg.ignoring_distinct(), &pre.env, is_global, &aggs)?;
+        aggs.push(agg);
+    }
+    let phys = HirAgg::physical(&aggs);
+    // What the reduce reads, and under a DISTINCT aggregate the set it reduces over.
+    let distinct = distinct_arg(&calls)?;
     let mut reads = group_cols.clone();
-    for id in calls.iter().filter_map(|c| c.arg.ignoring_distinct()) {
+    for id in phys.iter().filter_map(|c| c.arg).chain(distinct) {
         if !reads.contains(&id) {
             reads.push(id);
         }
     }
-    let input = match distinct_arg(&calls)? {
+    let input = match distinct {
         Some(arg) => {
             reject_float_key(&hircol_of(&pre.env, arg).def, "DISTINCT aggregate")?;
             RelExpr::distinct(RelExpr::project(input, pre.items_for(&reads)))?
@@ -1672,21 +1680,12 @@ fn bind_grouped_suffix(
         None if pre.extra.is_empty() => input,
         None => RelExpr::project(input, pre.items_for(&reads)),
     };
-    let mut aggs: Vec<HirAgg> = Vec::with_capacity(calls.len());
-    for c in &calls {
-        let agg = HirAgg::new(ids, c.func, c.arg.ignoring_distinct(), &pre.env, is_global, &aggs)?;
-        aggs.push(agg);
-    }
 
-    let mut rel = RelExpr::reduce(input, group_cols.clone(), aggs.clone());
+    let mut rel = RelExpr::reduce(input, group_cols.clone(), phys.clone());
 
     // Everything a `ColId` over the reduce output can resolve to.
     let PreMap { mut env, extra, .. } = pre;
-    for c in aggs.iter().flat_map(HirAgg::cols) {
-        if !env.iter().any(|e| e.id == c.col.id) {
-            env.push(c.col.clone());
-        }
-    }
+    env.extend(phys.into_iter().map(|c| c.col));
     // One leaf per clause over the same grouped relation: only the wording of a
     // rejection differs, so only the clause does.
     let grouped = |clause| GroupedLeaf {
@@ -1709,8 +1708,6 @@ fn bind_grouped_suffix(
         // The desugar owns its own projection.
         return super::window::bind_window_final(ids, select, rel, &select_leaf, "GROUP BY", order_exprs);
     }
-    // The dup-name guard is `lower_reduce`'s: its output carries the group
-    // columns, including ones this projection never named.
     let mut items = bind_projection(&select.projection, &select_leaf, ids, "GROUP BY")?;
     let order_cols = place_order_keys(order_exprs, &mut items, ids, &grouped("ORDER BY"))?;
     Ok((RelExpr::project(rel, items), order_cols))

@@ -8,7 +8,7 @@ use super::joincore::{
     src_pk_coldefs, EquiTerms,
 };
 use super::prims::rekey_on_source_pk;
-use super::{emit_filter, emit_join_inputs, project_tail, CutMemo, Demand, JoinSide};
+use super::{emit_filter, emit_join_inputs, project_front, CutMemo, Demand, JoinSide};
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::physical::Frame;
@@ -85,7 +85,7 @@ pub(super) fn lower_join_view(
             _ => (Cow::Borrowed(where_preds), Cow::Borrowed(items)),
         };
         let filtered = emit_filter(&mut cb, node, preds.iter(), &frame)?;
-        let (node, out) = project_tail(&mut cb, filtered, &items, &frame)?;
+        let (node, out) = project_front(&mut cb, filtered, &items, &frame)?;
         acc = Some(match acc {
             None => (node, out),
             Some((prior, out)) => (cb.union(node, prior), out),

@@ -4941,130 +4941,137 @@ fn ground_row_renders_count_family_zero_null_clear() {
     );
 }
 
-/// Combine-input partial schema: `[_group_pk:U128, cnt:I64(nullable)]` — one
-/// per-worker partial count column, all rows at PK V₀ (the local reduce output).
-fn combine_partial_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U128, false),
-            SchemaColumn::new(TypeCode::I64, true),
-        ],
-        &[0],
-    )
-}
+// ── ReducePlan::combine — the global reduce split into partials ─────────
 
-/// Build a combine-input delta of partials at PK V₀ from `(weight, Option<value>)`
-/// (a `None` value is a NULL partial count column).
-fn combine_partials(rows: &[(i64, Option<i64>)]) -> Batch {
-    let schema = combine_partial_schema();
-    let v0 = gnitz_wire::global_group_key();
-    let mut b = Batch::with_capacity(&schema, rows.len().max(1));
-    for &(w, val) in rows {
-        b.extend_pk(v0);
-        b.extend_weight(&w.to_le_bytes());
-        match val {
-            Some(v) => {
-                b.extend_null_bmp(&0u64.to_le_bytes());
-                b.extend_col(0, &v.to_le_bytes());
-            }
-            None => {
-                b.extend_null_bmp(&1u64.to_le_bytes()); // cnt (payload idx 0) NULL
-                b.extend_col(0, &0i64.to_le_bytes());
+/// A combine outputs the funnel's schema.
+#[test]
+fn a_combine_outputs_the_funnels_schema() {
+    for tc in [TypeCode::I32, TypeCode::U64, TypeCode::I64, TypeCode::Decimal] {
+        for nullable in [false, true] {
+            let input = u64_pk_schema(SchemaColumn::new(tc, nullable));
+            for op in [AggFunc::Count, AggFunc::CountNonNull, AggFunc::Sum] {
+                let aggs = [AggDescriptor { agg_op: op, col_idx: 1 }, AggDescriptor::COUNT_STAR];
+                let partial = make_plan(&input, &[], &aggs, false, false);
+                assert!(partial.combines(), "{op:?} over {tc}");
+                let partials = partial.shape.output_schema;
+                let funnel = make_plan(&input, &[], &aggs, true, true).shape.output_schema;
+                let combined = ReducePlan::combine(&partials, &aggs, true, true)
+                    .unwrap()
+                    .shape
+                    .output_schema;
+                assert_eq!(combined, funnel, "{op:?} over {tc} nullable={nullable}");
             }
         }
-        b.count += 1;
     }
-    b
 }
 
-// Sum merges the partial counts; a trailing Count counts partial rows (the
-// existence gate `op_reduce` finds via the lone AggFunc::Count).
-const C_SUM: AggDescriptor = AggDescriptor { col_idx: 1, agg_op: AggFunc::Sum };
-const C_COUNT_PARTIALS: AggDescriptor = AggDescriptor::COUNT_STAR;
-
-/// The phase-3 combine `op_reduce` over hand-built partials (empty group cols →
-/// one global group at V₀, `global_ground = true`, `i_am_owner = true`).
-fn combine_reduce(delta: &Batch, trace_out: &mut crate::storage::ReadCursor) -> Batch {
-    let in_schema = combine_partial_schema();
-    op_reduce(
-        delta,
-        trace_out,
-        &in_schema,
-        &[], // empty group cols ⇒ one global group at V₀
-        &[C_SUM, C_COUNT_PARTIALS],
-        None,
-        true, // global_ground
-        true, // i_am_owner (V₀'s owner)
-    )
-}
-
-/// The combine sums the partial *count values* (3 + 5 = 8), not the number of
-/// partials (2). Consolidation of identical partials nets by weight.
+/// Counts and an integer SUM combine; a float SUM and an extreme do not.
 #[test]
-fn combine_sums_partial_counts_not_partial_rows() {
-    let out_schema = out_schema_for(&combine_partial_schema(), &[], &[C_SUM, C_COUNT_PARTIALS]);
-    let mut to_ch = empty_trace(out_schema);
-
-    // Two workers' partials: counts 3 and 5.
-    let out = combine_reduce(&combine_partials(&[(1, Some(3)), (1, Some(5))]), &mut to_ch);
-    assert_eq!(out.count, 1, "one combined row");
-    assert_eq!(out.get_pk(0), gnitz_wire::global_group_key(), "combined row at V₀");
-    assert_eq!(
-        read_i64_le(out.col_data(0), 0),
-        8,
-        "Sum sums partial counts (3 + 5), not the partial count (#partials = 2)"
-    );
-    assert_eq!(read_i64_le(out.col_data(1), 0), 2, "COUNT-of-partials gate = 2");
+fn only_exact_linear_aggregates_combine() {
+    let with = |tc: TypeCode, op: AggFunc| {
+        let input = u64_pk_schema(SchemaColumn::new(tc, false));
+        make_plan(
+            &input,
+            &[],
+            &[AggDescriptor { agg_op: op, col_idx: 1 }, AggDescriptor::COUNT_STAR],
+            false,
+            false,
+        )
+        .combines()
+    };
+    assert!(with(TypeCode::I64, AggFunc::Sum));
+    assert!(with(TypeCode::F64, AggFunc::Count));
+    assert!(!with(TypeCode::F64, AggFunc::Sum));
+    assert!(!with(TypeCode::F32, AggFunc::Sum));
+    assert!(!with(TypeCode::I64, AggFunc::Min));
+    assert!(!with(TypeCode::I64, AggFunc::Max));
 }
 
-/// All-NULL partials (every worker's COUNT(col) is NULL — a fresh all-NULL
-/// column) combine to a concrete `0` with the null bit clear, never NULL.
+/// A float SUM folds its input to fix the summation order; an integer one does not.
 #[test]
-fn combine_all_null_partials_render_zero_not_null() {
-    let out_schema = out_schema_for(&combine_partial_schema(), &[], &[C_SUM, C_COUNT_PARTIALS]);
-    let mut to_ch = empty_trace(out_schema);
-
-    // Two non-empty workers, each with a NULL partial count → the Sum untouched.
-    let out = combine_reduce(&combine_partials(&[(1, None), (1, None)]), &mut to_ch);
-    assert_eq!(out.count, 1, "non-empty global (2 partials) emits one combined row");
-    assert_eq!(read_i64_le(out.col_data(0), 0), 0, "all-NULL COUNT(col) combines to 0");
-    assert_eq!(
-        out.get_null_word(0) & 1,
-        0,
-        "combined COUNT(col) is 0 with null bit CLEAR, not NULL"
-    );
-    assert_eq!(
-        read_i64_le(out.col_data(1), 0),
-        2,
-        "still 2 partials (global non-empty)"
-    );
+fn a_float_sum_consolidates_its_input() {
+    let aggs = sum_count_aggs(1);
+    let float = u64_pk_schema(SchemaColumn::new(TypeCode::F64, false));
+    assert!(make_plan(&float, &[], &aggs, false, false).consolidates_input());
+    assert!(!make_plan(&make_schema_u64_i64(), &[], &aggs, false, false).consolidates_input());
 }
 
-/// Full retraction nets the COUNT-of-partials to 0; the gate sheds the computed
-/// row and the combine emits the ground (combined = 0, null clear).
+/// One reduce instance: its plan and the output it has emitted so far.
+struct Instance {
+    plan: ReducePlan,
+    emitted: Vec<Batch>,
+}
+
+impl Instance {
+    fn new(plan: ReducePlan) -> Self {
+        Instance { plan, emitted: Vec::new() }
+    }
+
+    /// One epoch over `delta`, the trace being everything emitted before it.
+    fn tick(&mut self, delta: &Batch) -> Batch {
+        let schema = self.plan.shape.output_schema;
+        let trace = Batch::concat(&schema, self.emitted.iter()).into_consolidated(&schema);
+        let out = super::op_reduce::op_reduce(delta, &mut trace_cursor(trace, schema), None, &self.plan)
+            .into_consolidated(&schema);
+        self.emitted.push(out.clone_batch());
+        out
+    }
+}
+
+/// `(pk, weight, payload…)` of every row, the payload read as `i64`s.
+fn reduce_rows(b: &Batch) -> Vec<(u128, i64, Vec<i64>)> {
+    let mb = b.as_mem_batch();
+    (0..b.count)
+        .map(|r| {
+            let payload = (0..b.schema().num_columns() - 1)
+                .map(|c| read_i64_le(b.col_data(c), r * 8))
+                .collect();
+            (b.get_pk(r), mb.get_weight(r), payload)
+        })
+        .collect()
+}
+
+/// Two workers' partials, relayed to one combine, emit exactly the funnel's rows
+/// and weights every epoch — through a group emptied back to its ground row.
 #[test]
-fn combine_full_retraction_sheds_to_ground() {
-    let out_schema = out_schema_for(&combine_partial_schema(), &[], &[C_SUM, C_COUNT_PARTIALS]);
-    let mut to_ch = empty_trace(out_schema);
+fn two_workers_partials_combine_to_the_funnels_output() {
+    let input = make_schema_u64_i64();
+    let aggs = [
+        AggDescriptor { agg_op: AggFunc::Sum, col_idx: 1 },
+        AggDescriptor {
+            agg_op: AggFunc::CountNonNull,
+            col_idx: 1,
+        },
+        AggDescriptor::COUNT_STAR,
+    ];
+    let partial = || Instance::new(make_plan(&input, &[], &aggs, false, false));
+    let (mut a, mut b) = (partial(), partial());
+    let partials = a.plan.shape.output_schema;
+    let mut combine = Instance::new(ReducePlan::combine(&partials, &aggs, true, true).unwrap());
+    let mut funnel = Instance::new(make_plan(&input, &[], &aggs, true, true));
 
-    let out1 = combine_reduce(&combine_partials(&[(1, Some(5))]), &mut to_ch);
-    assert_eq!(read_i64_le(out1.col_data(0), 0), 5, "combined = 5");
-
-    // Retract the only partial → COUNT-of-partials nets to 0.
-    let mut to_ch2 = trace_cursor(out1, out_schema);
-    let out2 = combine_reduce(&combine_partials(&[(-1, Some(5))]), &mut to_ch2);
-    assert_eq!(out2.count, 2, "retract old computed (−1) + ground insert (+1)");
-    let mb = out2.as_mem_batch();
-    let pos = (0..2).find(|&i| mb.get_weight(i) == 1).expect("a +1 row");
+    // Per epoch, each worker's `(pk, weight, val)` rows.
+    type Rows<'a> = &'a [(u64, i64, i64)];
+    let ticks: &[(Rows<'_>, Rows<'_>)] = &[
+        (&[], &[]),
+        (&[(1, 1, 10), (2, 1, 20)], &[(3, 1, 5)]),
+        (&[(1, -1, 10)], &[]),
+        (&[], &[(4, 2, 7)]),
+        (&[(2, -1, 20)], &[(3, -1, 5), (4, -2, 7)]),
+    ];
+    for (i, &(da, db)) in ticks.iter().enumerate() {
+        let (da, db) = (make_batch_raw(&input, da), make_batch_raw(&input, db));
+        let relayed = Batch::concat(&partials, [a.tick(&da), b.tick(&db)].iter());
+        let combined = combine.tick(&relayed);
+        let whole = Batch::concat(&input, [da, db].iter());
+        let want = funnel.tick(&whole);
+        assert_eq!(reduce_rows(&combined), reduce_rows(&want), "tick {i}");
+    }
+    // The last tick emptied the group: the ground row stands, at V₀.
+    let net = Batch::concat(&partials, combine.emitted.iter()).into_consolidated(&partials);
     assert_eq!(
-        read_i64_le(out2.col_data(0), pos * 8),
-        0,
-        "ground combined count = 0 (a linear aggregate's `0` identity)"
-    );
-    assert_eq!(
-        out2.get_null_word(pos) & 1,
-        0,
-        "combined count present (the Sum grounds to 0, not NULL)"
+        reduce_rows(&net),
+        vec![(gnitz_wire::global_group_key(), 1, vec![0, 0, 0])]
     );
 }
 

@@ -7,7 +7,7 @@ use gnitz_wire::{OrderKey, ReduceOutSlot};
 use super::super::group_key::{GroupOutKey, GROUP_PK_COL};
 use super::index::TopNIndex;
 
-/// The baked per-instruction top-N plan. Built by [`TopNPlan::from_wire`] only.
+/// The baked per-instruction top-N plan.
 pub struct TopNPlan {
     /// The output layout: the group key region a reduce over the same group set
     /// would have ([`ReduceOutKey`]), then every input column not in that region,
@@ -70,5 +70,41 @@ impl TopNPlan {
         let index = TopNIndex::new(input_schema, group_cols, order, &carried)?;
         let key = GroupOutKey::new(input_schema, group_cols, out_key, &output_schema)?;
         Ok(TopNPlan { output_schema, key, offset, limit, index })
+    }
+
+    /// One worker's window of a global top-N: its first `limit + offset` slots,
+    /// which hold every global slot.
+    pub fn partial(
+        input_schema: &SchemaDescriptor,
+        order: &[OrderKey],
+        limit: u64,
+        offset: u64,
+    ) -> Result<Self, OpBuildErr> {
+        Self::from_wire(input_schema, &[], order, limit.saturating_add(offset), 0)
+    }
+
+    /// The global window over relayed [`Self::partial`] outputs, grouped on their
+    /// key. `Err` unless the output keeps the partials' layout.
+    pub fn combine(
+        partials: &SchemaDescriptor,
+        order: &[OrderKey],
+        limit: u64,
+        offset: u64,
+    ) -> Result<Self, OpBuildErr> {
+        let mismatch = || OpBuildErr::shape("top-n: the partials do not match the order");
+        // A partial's key, then the input's columns in order.
+        let key = partials.pk_indices();
+        let shifted: Vec<OrderKey> = order
+            .iter()
+            .map(|k| {
+                let col = k.col.checked_add(key.len() as u16).ok_or_else(mismatch)?;
+                Ok(OrderKey { col, ..*k })
+            })
+            .collect::<Result<_, OpBuildErr>>()?;
+        let plan = Self::from_wire(partials, key, &shifted, limit, offset)?;
+        if plan.output_schema != *partials {
+            return Err(mismatch());
+        }
+        Ok(plan)
     }
 }

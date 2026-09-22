@@ -89,7 +89,7 @@ impl Accumulator {
             src,
             out,
             kind: step(op, src),
-            merge: step(if op.is_linear() { AggFunc::Sum } else { op }, out),
+            merge: step(op.merge_op(), out),
         }
     }
 
@@ -102,6 +102,10 @@ impl Accumulator {
     #[inline(always)]
     pub(super) fn is_linear(&self) -> bool {
         !matches!(self.kind, StepKind::Extreme { .. })
+    }
+
+    pub(super) fn sums_float(&self) -> bool {
+        matches!(self.kind, StepKind::Sum(ScalarKind::F32 | ScalarKind::F64))
     }
 
     /// Width of this aggregate's output column — the emitted value's truncation.
@@ -119,10 +123,13 @@ impl Accumulator {
         }
     }
 
-    /// A COUNT accumulator's net row count.
+    /// The net row count a COUNT, or a combine's sum of partial COUNTs, holds.
     #[inline(always)]
     pub(super) fn count_value(&self) -> i64 {
-        debug_assert!(matches!(self.kind, StepKind::Count | StepKind::CountNonNull));
+        debug_assert!(matches!(
+            self.kind,
+            StepKind::Count | StepKind::CountNonNull | StepKind::Sum(ScalarKind::Int(FixedInt::I64))
+        ));
         self.acc
     }
 

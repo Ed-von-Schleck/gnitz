@@ -185,6 +185,26 @@ impl LoadedCircuit {
         Ok(Carve { sides, post })
     }
 
+    /// `shard`'s one reader, when it is a global `Reduce` or `TopN` behind an empty
+    /// key: the node whose partial a side may end in.
+    fn global_split(&self, shard: NodeId) -> Option<NodeId> {
+        if !matches!(self.op(shard), gnitz_wire::OpNode::ExchangeShard { shard_cols } if shard_cols.is_empty()) {
+            return None;
+        }
+        let mut readers = (shard + 1..self.len()).filter(|&n| self.inputs(n).iter().any(|p| p == shard));
+        let (Some(consumer), None) = (readers.next(), readers.next()) else {
+            return None;
+        };
+        match self.op(consumer) {
+            gnitz_wire::OpNode::Reduce { group_cols, .. } | gnitz_wire::OpNode::TopN { group_cols, .. }
+                if group_cols.is_empty() =>
+            {
+                Some(consumer)
+            }
+            _ => None,
+        }
+    }
+
     /// The circuit's one `IntegrateSink`.
     fn sink(&self) -> Result<NodeId, String> {
         let mut sinks = self
@@ -276,22 +296,31 @@ pub(super) fn compile_view(
     let mut side_plans = Vec::with_capacity(carve.sides.len());
     let mut seeds = Vec::with_capacity(carve.sides.len());
     for side in &carve.sides {
-        let ex_in = loaded.inputs(side.shard).unary();
-        let (plan, _) = build_plan(loaded, &side.nodes, registry, &mut layout, self_contained, &[], ex_in)?;
+        // A worker holding the whole input has nothing to pre-aggregate.
+        let out = match loaded.global_split(side.shard).filter(|_| !self_contained) {
+            Some(consumer) => PlanOut::Split { consumer },
+            None => PlanOut::Node(loaded.inputs(side.shard).unary()),
+        };
+        let Built { plan, partial, .. } =
+            build_plan(loaded, &side.nodes, registry, &mut layout, self_contained, &[], out)?;
         let schema = *plan.vm.program.out_schema();
         // The relay routes by this spec mid-round, where a refusal aborts the master.
         ScatterSpec::GroupKey(side.cols).check(&schema)?;
-        seeds.push((side.shard, schema));
+        seeds.push(Seed {
+            shard: side.shard,
+            schema,
+            partials: partial,
+        });
         side_plans.push(plan);
     }
-    let (post, post_regs) = build_plan(
+    let Built { plan: post, regs: post_regs, .. } = build_plan(
         loaded,
         &carve.post,
         registry,
         &mut layout,
         self_contained,
         &seeds,
-        loaded.sink()?,
+        PlanOut::Node(loaded.sink()?),
     )?;
     // Column count alone is not enough: equal counts with mismatched types would
     // let the client read a string descriptor out of integer storage.

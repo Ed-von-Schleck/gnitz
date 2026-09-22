@@ -39,11 +39,11 @@ fn created(cat: &gnitz_core::CatalogSnapshot, sql: &str) -> Created {
 fn fk_catalog() -> gnitz_core::CatalogSnapshot {
     let i = TypeCode::I64;
     let cols = || vec![col("id", i), col("u", i)];
-    let mut cat = catalog(vec![("q", rel(40, RelClass::Table, false, cols(), vec![0], &[&[1]]))]);
+    let mut cat = catalog(vec![("q", rel(40, RelClass::Table, cols(), vec![0], &[&[1]]))]);
     cat.insert(
         SN,
         "p",
-        Some(rel_with(41, RelClass::Table, false, cols(), vec![0], &[(&[1], true)])),
+        Some(rel_with(41, RelClass::Table, cols(), vec![0], &[(&[1], true)])),
     );
     cat
 }
@@ -205,14 +205,7 @@ fn an_unhonoured_clause_or_fk_target_is_named() {
         vec![0, 1],
     );
     known.insert(SN, "cp", Some(cp));
-    let st = rel(
-        43,
-        RelClass::Stream,
-        false,
-        vec![col("id", TypeCode::I64)],
-        vec![0],
-        &[],
-    );
+    let st = rel(43, RelClass::Stream, vec![col("id", TypeCode::I64)], vec![0], &[]);
     known.insert(SN, "st", Some(st));
     for (sql, variant, needle) in [
         (

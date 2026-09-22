@@ -516,10 +516,9 @@ fn relay_scatter_merge_bench() {
             );
 
             // Two timings: the scatter alone, and the scatter plus the
-            // `into_consolidated` the receiving side runs on each slice
-            // (`dag::exec::run_side`). The second is the one the layout claim
-            // moves — a certified slice returns by move where a `Raw` one pays a
-            // full argsort into a fresh arena.
+            // `into_consolidated` a receiving reader that needs net weights runs
+            // on its slice. A certified slice returns by move where a `Raw` one
+            // pays a full argsort into a fresh arena.
             for (label, consolidate) in [("scatter", false), ("scatter+consolidate", true)] {
                 let t = Instant::now();
                 let mut acc = 0usize;

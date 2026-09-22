@@ -162,10 +162,6 @@ impl Spine<'_> {
         self.seg.tid
     }
 
-    pub(crate) fn replicated(&self) -> bool {
-        self.seg.desc.as_ref().is_some_and(|d| d.replicated)
-    }
-
     /// The opened source's, since no fused level re-keys.
     pub(crate) fn pk_repeats(&self) -> bool {
         self.seg.pk_repeats
