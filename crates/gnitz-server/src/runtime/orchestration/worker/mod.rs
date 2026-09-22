@@ -783,17 +783,8 @@ impl WorkerProcess {
         }
     }
 
-    /// Base checkpoint round: flush every user relation's store + index
-    /// circuits (`SalReplay` publishes; rederived tables fold to RAM inline).
+    /// Base checkpoint round.
     fn handle_flush_all(&mut self) -> Result<(), String> {
-        // pending_deltas is intentionally NOT cleared here. A checkpoint can
-        // fire before buffered effective deltas are ticked into their views;
-        // discarding them would leave views diverged from the base tables until a
-        // restart rebuilds them. The checkpoint only persists base-table data —
-        // views are re-derived — so the buffered deltas must survive to be ticked
-        // by the next auto-tick or the scan barrier. Live entries drain on the
-        // next tick (bounded by the 10k-row auto-tick); a dropped table's entry is
-        // GC'd in the DdlSync arm (retain(has_id)).
         Ok(self.cat().registry.checkpoint_base()?)
     }
 

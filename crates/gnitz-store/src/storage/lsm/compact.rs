@@ -166,7 +166,7 @@ pub(super) fn merge_and_route(
             // `ENCODING_CONSTANT` — 8 bytes for the whole file.
             batch.null_bmp_data_mut().fill(0);
         }
-        let written = super::cstr(path.as_str()).and_then(|cpath| batch.write_as_shard(&cpath, opts));
+        let written = batch.write_as_shard(&path, opts);
         if let Err(e) = written {
             // Roll back this call's shards so a compaction that cannot finalize
             // leaves the source tier intact.

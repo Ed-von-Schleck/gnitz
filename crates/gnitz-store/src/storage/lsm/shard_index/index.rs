@@ -64,7 +64,7 @@ impl ShardIndex {
         let name = super::super::naming::compact_shard_name(self.compact_seq, 0);
         let path = format!("{}/{name}", self.output_dir);
         run.write_as_shard(
-            &super::super::cstr(path.as_str())?,
+            &path,
             ShardWriteOpts {
                 skip_pk_filter: self.skip_pk_filter,
                 ..ShardWriteOpts::COMPACTION
@@ -85,14 +85,12 @@ impl ShardIndex {
         self.l0.len() > L0_COMPACT_THRESHOLD
     }
 
-    /// The paths `flush_prepare` hands the barrier as its fdatasync sweep list:
-    /// every live shard an fdatasync has not yet reached.
+    /// Every live shard no published manifest names yet.
     pub(crate) fn unsynced_paths(&self) -> impl Iterator<Item = &str> {
         self.all_entries().filter(|e| !e.published).map(|e| e.filename.as_str())
     }
 
-    /// Mark every live shard published, once the barrier has fdatasync'd the
-    /// sweep list and renamed the manifest that references them.
+    /// Mark every live shard published.
     pub(crate) fn clear_unsynced(&mut self) {
         for e in self.all_entries_mut() {
             e.published = true;

@@ -1,8 +1,6 @@
 //! Shared shard file format constants, and the digest over the bytes that
 //! decide how the rest of a shard is read.
 
-use std::ffi::CStr;
-
 use super::super::error::StorageError;
 
 pub(crate) const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
@@ -167,8 +165,8 @@ pub(crate) const fn desc_len(file_npc: usize) -> usize {
 /// same-shaped neighbour's first sector — fails to validate. It separates names,
 /// not directories: the naming grammar has no directory component, so a spill
 /// name repeats across sibling partition directories and seeds identically.
-pub(crate) fn desc_digest(path: &CStr, prefix: &[u8]) -> u64 {
-    gnitz_wire::digest_with_hole(shard_basename(path.to_bytes()), prefix, OFF_DESC_CHECKSUM)
+pub(crate) fn desc_digest(path: &str, prefix: &[u8]) -> u64 {
+    gnitz_wire::digest_with_hole(shard_basename(path.as_bytes()), prefix, OFF_DESC_CHECKSUM)
 }
 
 /// A shard's manifest identity: the last component of its path. Every writer and

@@ -33,10 +33,10 @@ fn write_open_roundtrip() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("roundtrip.db");
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    let shard_path = path.to_str().unwrap().to_owned();
     let schema = make_schema_u64_i64();
     let rows = u64_rows(&pks, &vec![1; n], &vec![0; n], std::slice::from_ref(&vals));
-    write_i64_shard(&cpath, &schema, &rows, &[], ShardWriteOpts::default());
+    write_i64_shard(&shard_path, &schema, &rows, &[], ShardWriteOpts::default());
 
     let image = std::fs::read(&path).unwrap();
     assert_eq!(read_u64_le(&image, OFF_ROW_COUNT), n as u64);
@@ -47,7 +47,7 @@ fn write_open_roundtrip() {
 
     // `open` itself rejects a bad magic or version, so a successful open is
     // what pins those; the rest is the row data.
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&shard_path, &schema).unwrap();
     assert_eq!(shard.count, n);
     assert!(shard.has_shard_filter());
     for (i, (&pk, &val)) in pks.iter().zip(&vals).enumerate() {
@@ -72,7 +72,7 @@ fn no_false_negatives_through_write_open_probe() {
     const N: usize = 200_000;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fn.db");
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    let shard_path = path.to_str().unwrap().to_owned();
 
     // Members and non-members from one stream, split by parity of the draw,
     // so neither set is a range the other can be confused with.
@@ -87,8 +87,8 @@ fn no_false_negatives_through_write_open_probe() {
     let vals: Vec<i64> = members.iter().map(|&p| p as i64).collect();
     let schema = make_schema_u64_i64();
     let rows = u64_rows(&members, &vec![1; n], &vec![0; n], &[vals]);
-    write_i64_shard(&cpath, &schema, &rows, &[], ShardWriteOpts::default());
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    write_i64_shard(&shard_path, &schema, &rows, &[], ShardWriteOpts::default());
+    let shard = MappedShard::open(&shard_path, &schema).unwrap();
     assert!(shard.has_shard_filter());
 
     for &pk in &members {
@@ -112,8 +112,8 @@ fn encoding_selection_pins_all_roles() {
     let dir = tempfile::tempdir().unwrap();
     let write_and_read = |schema: &SchemaDescriptor, rows: &Rows, blob: &[u8], name: &str| -> Vec<u8> {
         let path = dir.path().join(name);
-        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        write_i64_shard(&cpath, schema, rows, blob, ShardWriteOpts::default());
+        let shard_path = path.to_str().unwrap().to_owned();
+        write_i64_shard(&shard_path, schema, rows, blob, ShardWriteOpts::default());
         std::fs::read(&path).unwrap()
     };
 

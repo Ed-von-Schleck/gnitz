@@ -192,7 +192,7 @@ impl ShardEntry {
         max_lsn: u64,
         published: bool,
     ) -> Result<Self, StorageError> {
-        let shard = Rc::new(MappedShard::open(&super::super::cstr(path)?, schema)?);
+        let shard = Rc::new(MappedShard::open(path, schema)?);
         let pk_min = PkBuf::from_bytes(shard.get_pk_bytes(0));
         let pk_max = PkBuf::from_bytes(shard.get_pk_bytes(shard.count - 1));
         Ok(ShardEntry {

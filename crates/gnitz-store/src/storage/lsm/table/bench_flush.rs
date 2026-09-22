@@ -124,7 +124,7 @@ fn start_compaction_sweep() -> crate::test_rng::Rng {
 
 /// The drain-cadence cost at production thresholds. See the module doc.
 ///
-/// `GNITZ_BENCH_FLUSH=0` drops the per-tick `flush()` and lets the memtable
+/// `GNITZ_BENCH_FLUSH=0` drops the per-tick `flush_to_ram()` and lets the memtable
 /// drain on its own budget — the two arms price one cadence against the other.
 ///
 /// ```text
@@ -154,7 +154,7 @@ fn flush_cadence_amplification_bench() {
         for batch in gen_distinct(&schema, 4, 50) {
             table.ingest_owned_batch(batch).unwrap();
             if per_tick_flush {
-                table.flush().unwrap();
+                table.flush_to_ram().unwrap();
             }
         }
     }
@@ -190,7 +190,7 @@ fn flush_cadence_amplification_bench() {
             let runs_before = table.ram_tier.len();
             table.ingest_owned_batch(batch).unwrap();
             if per_tick_flush {
-                table.flush().unwrap(); // Rederive → flush_prepare → flush_to_ram
+                table.flush_to_ram().unwrap();
             }
             // Only a fold shrinks the set, and it re-materializes the whole window
             // — so the post-fold row count is what that merge wrote.
@@ -268,7 +268,7 @@ fn compaction_amplification_bench() {
             false => scatter_tick(&schema, &mut rng, ROWS_PER_TICK, keyspace),
         };
         table.ingest_owned_batch(batch).unwrap();
-        table.flush().unwrap();
+        table.flush_to_ram().unwrap();
     }
 
     let phases = cstats::dump();

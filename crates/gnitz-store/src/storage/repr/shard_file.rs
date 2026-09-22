@@ -1,7 +1,6 @@
 //! Shard image encoding and atomic writing, reached through `Batch::write_as_shard`.
 
 use std::borrow::Cow;
-use std::ffi::CStr;
 use std::os::unix::fs::FileExt;
 
 use super::super::error::StorageError;
@@ -204,7 +203,7 @@ pub(in crate::storage) fn write_test_shard(
     schema: &SchemaDescriptor,
     rows: &[(Vec<u8>, i64, i64)],
     opts: ShardWriteOpts,
-) -> std::ffi::CString {
+) -> String {
     // One payload column is written, so a wider schema would leave later regions
     // short of `count` and produce a shard the reader cannot make sense of.
     debug_assert_eq!(
@@ -218,16 +217,16 @@ pub(in crate::storage) fn write_test_shard(
         b.extend_col(0, &v.to_le_bytes());
         b.commit_row(0);
     }
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    b.write_as_shard(&cpath, opts).unwrap();
-    cpath
+    let path = path.to_str().unwrap().to_owned();
+    b.write_as_shard(&path, opts).unwrap();
+    path
 }
 
 /// [`write_test_shard`] at any number of I64 payload columns, with explicit null
 /// words and a raw blob heap. Rows are `(opk_bytes, weight, null_word, payload)`.
 #[cfg(test)]
 pub(in crate::storage) fn write_i64_shard(
-    path: &CStr,
+    path: &str,
     schema: &SchemaDescriptor,
     rows: &[(Vec<u8>, i64, u64, Vec<i64>)],
     blob: &[u8],
@@ -247,10 +246,8 @@ pub(in crate::storage) fn write_i64_shard(
 }
 
 impl Batch {
-    /// Write this batch as a shard at `path`, staged as `<path>.tmp` and renamed
-    /// into place. Unsynced: the caller registers the shard with the flush
-    /// barrier, which fdatasyncs it and fsyncs its directory.
-    pub(crate) fn write_as_shard(&self, path: &CStr, opts: ShardWriteOpts) -> Result<(), StorageError> {
+    /// Write this batch as an unsynced shard at `path`, through a [`StagedFile`].
+    pub(crate) fn write_as_shard(&self, path: &str, opts: ShardWriteOpts) -> Result<(), StorageError> {
         let schema = self.schema();
         let n = self.count;
         assert!(n > 0, "every writer skips an empty output");
@@ -278,8 +275,7 @@ impl Batch {
                 Cow::Borrowed(filter.as_deref().unwrap_or(&[])),
             )));
 
-        let staged = StagedFile::create(path)?;
-        let file = staged.file();
+        let (staged, file) = StagedFile::create(path)?;
         let mut header = vec![0u8; desc_len(npc)];
         let mut body = gnitz_wire::RowHasher::default();
         let mut end = header.len();

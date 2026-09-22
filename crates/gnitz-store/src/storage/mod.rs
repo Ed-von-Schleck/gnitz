@@ -29,12 +29,8 @@ mod error;
 mod lsm;
 mod spill;
 
-use std::ffi::{CStr, CString};
-use std::fs::File;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
-
-use gnitz_foundation::posix_io;
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
 // L2 representation lives under `repr/`. It has no facade of its own; the leaf
 // items are re-exported below and the submodules aliased here so the LSM siblings
@@ -53,7 +49,7 @@ pub use batch::MAX_BATCH_REGIONS;
 pub(crate) use batch::{range_rows, RowMark};
 pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use error::{StorageError, StoreError};
-pub(crate) use lsm::flush_barrier::{flush_barrier, FlushRound};
+pub(crate) use lsm::flush_barrier::flush_barrier;
 pub(crate) use lsm::table::{RecoverySource, StoreBudgets, Table, DEFAULT_RAM_TIER_BYTES};
 pub use merge::MemBatch;
 pub(crate) use scatter::UnifiedSet;
@@ -88,62 +84,40 @@ pub(crate) use merge::BlobCacheGuard;
 pub(crate) use merge::{prorated_blob_cap, relocate_german_string_vec, run_merge, BlobCache};
 pub use spill::{KeyProducer, SpillSort};
 
-/// Convert a path string to a `CString`, mapping an interior NUL to
-/// `InvalidPath` — the one conversion every storage path takes.
-pub(super) fn cstr(s: impl Into<Vec<u8>>) -> Result<std::ffi::CString, error::StorageError> {
-    std::ffi::CString::new(s).map_err(|_| error::StorageError::InvalidPath)
-}
-
-/// Path strings as `CString`s.
-pub(super) fn to_cstrings<S: AsRef<str>>(
-    paths: impl IntoIterator<Item = S>,
-) -> Result<Vec<std::ffi::CString>, error::StorageError> {
-    paths.into_iter().map(|p| cstr(p.as_ref())).collect()
-}
-
-/// A file written as `<path>.tmp` and renamed onto `path` by [`commit`]. Dropped
-/// uncommitted — an error return, a panic, or an abandoned flush — it unlinks
-/// the `.tmp`, so a failed write leaves nothing behind.
+/// A file written as `<path>.tmp` and renamed onto `path` by [`commit`]; the
+/// `.tmp` is unlinked if the guard drops uncommitted.
 ///
 /// [`commit`]: StagedFile::commit
 pub(super) struct StagedFile {
-    file: File,
-    tmp_path: CString,
-    final_path: CString,
+    tmp_path: String,
+    final_path: String,
     committed: bool,
 }
 
 impl StagedFile {
-    pub(super) fn create(path: &CStr) -> Result<Self, error::StorageError> {
-        let tmp_path = cstr([path.to_bytes(), STAGING_SUFFIX.as_bytes()].concat())?;
-        let file = File::from(posix_io::open_owned(
-            &tmp_path,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-        )?);
-        Ok(StagedFile {
-            file,
+    /// The guard, and the `.tmp` opened for writing.
+    pub(super) fn create(path: &str) -> Result<(Self, File), error::StorageError> {
+        let tmp_path = format!("{path}{STAGING_SUFFIX}");
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(&tmp_path)?;
+        let staged = StagedFile {
             tmp_path,
             final_path: path.to_owned(),
             committed: false,
-        })
+        };
+        Ok((staged, file))
     }
 
-    pub(super) fn file(&self) -> &File {
-        &self.file
-    }
-
-    /// Raw because the flush barrier hands whole chunks of these to
-    /// `IORING_OP_FSYNC` at once.
-    pub(super) fn fd(&self) -> libc::c_int {
-        self.file.as_raw_fd()
-    }
-
-    pub(super) fn sync(&self) -> std::io::Result<()> {
-        self.file.sync_data()
+    pub(super) fn tmp_path(&self) -> &str {
+        &self.tmp_path
     }
 
     pub(super) fn commit(mut self) -> Result<(), error::StorageError> {
-        posix_io::renameat(libc::AT_FDCWD, &self.tmp_path, libc::AT_FDCWD, &self.final_path)?;
+        std::fs::rename(&self.tmp_path, &self.final_path)?;
         self.committed = true;
         Ok(())
     }
@@ -152,23 +126,16 @@ impl StagedFile {
 impl Drop for StagedFile {
     fn drop(&mut self) {
         if !self.committed {
-            unsafe { libc::unlink(self.tmp_path.as_ptr()) };
+            let _ = std::fs::remove_file(&self.tmp_path);
         }
     }
 }
 
-/// Publish `parts`, concatenated, as `<dir>/<filename>`: staged as a `.tmp`,
-/// `fdatasync`ed, renamed, and the directory fsynced after the rename.
-/// An uncommitted [`StagedFile`] unlinks itself, so a failure leaves no `.tmp`.
-/// Mode `0o644`.
-pub fn publish_file_sync(dir: &str, filename: &str, parts: &[&[u8]]) -> Result<(), StorageError> {
-    let staged = StagedFile::create(&cstr(format!("{dir}/{filename}"))?)?;
-    let mut offset = 0u64;
-    for part in parts {
-        staged.file().write_all_at(part, offset)?;
-        offset += part.len() as u64;
-    }
-    staged.sync()?;
+/// Durably publish `bytes` as `<dir>/<filename>`, through a [`StagedFile`].
+pub fn publish_file_sync(dir: &str, filename: &str, bytes: &[u8]) -> Result<(), StorageError> {
+    let (staged, file) = StagedFile::create(&format!("{dir}/{filename}"))?;
+    file.write_all_at(bytes, 0)?;
+    file.sync_data()?;
     staged.commit()?;
     fsync_dir(dir)
 }

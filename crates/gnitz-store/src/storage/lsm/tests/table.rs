@@ -1,6 +1,6 @@
 use super::*;
 
-use super::super::flush_barrier::FlushRound;
+use super::super::flush_barrier::flush_barrier;
 use super::super::run_set::FOLD_THRESHOLD;
 use super::super::shard_index::L0_COMPACT_THRESHOLD;
 use gnitz_expr::RowSource;
@@ -75,20 +75,10 @@ fn compaction_output_count(dir: &std::path::Path) -> usize {
     count_files(dir, |n| n.starts_with(shard) && is_compaction_output(n))
 }
 
-/// Count every on-disk shard/compaction-output file in `dir`.
-fn all_shard_file_count(dir: &std::path::Path) -> usize {
-    let shard = super::super::naming::SHARD_PREFIX;
-    count_files(dir, |n| n.starts_with(shard))
-}
-
-/// Run a full synchronous force-publish flush stamped at `generation` —
-/// the ephemeral checkpoint round's prepare + commit, minus the fsyncs the
-/// tests don't observe.
-fn flush_ephemeral_at(t: &mut Table, generation: u64) {
-    if let Some(work) = t.flush_prepare(FlushRound::Ephemeral(generation)).unwrap() {
-        let (_, bytes) = t.flush_commit(work).unwrap();
-        t.published_durably(bytes);
-    }
+/// The flush each recovery source's own round runs: a base-round publish for
+/// `SalReplay`, a RAM-tier fold for `Rederive`.
+fn flush_by_source(t: &mut Table) {
+    if t.is_rederived() { t.flush_to_ram() } else { t.flush() }.unwrap();
 }
 
 /// Materialize `open_cursor` into a (pk -> net_weight) map.
@@ -121,7 +111,7 @@ fn table_lifecycle_serves_rows_across_flush_and_reopen() {
         assert!(t.has_pk(20));
         assert!(!t.has_pk(99), "table {tid}: an absent key must not be found");
 
-        t.flush().unwrap();
+        flush_by_source(&mut t);
         assert!(t.has_pk(10), "table {tid}: row must survive the flush");
         assert!(t.has_pk(20));
 
@@ -303,7 +293,7 @@ fn flush_prepare_drop_cleans_tmp_files() {
     t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
 
     let work = t
-        .flush_prepare(FlushRound::Base)
+        .flush_prepare(0)
         .unwrap()
         .expect("expected a staged publish, got none");
     let dir_entries: Vec<String> = std::fs::read_dir(&tdir)
@@ -359,35 +349,6 @@ fn table_new_corrupted_manifest_preserves_stray_shard() {
     );
 }
 
-/// Non-durable `flush_prepare` consolidates the snapshot into the in-memory
-/// run set and stages nothing; the memtable is reset, no shard file is
-/// written, and the rows stay visible to subsequent reads.
-#[test]
-fn flush_prepare_non_durable_done_inline() {
-    let dir = tempfile::tempdir().unwrap();
-    let tdir = dir.path().join("done_inline_test");
-    let schema = make_schema_u64_i64();
-
-    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::Rederive { resume_at: None });
-
-    t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
-    assert!(
-        t.flush_prepare(FlushRound::Base).unwrap().is_none(),
-        "a rederived base round publishes nothing"
-    );
-    assert!(
-        t.memtable.is_empty(),
-        "memtable must be reset after non-durable flush_prepare"
-    );
-    assert!(!t.ram_tier.is_empty(), "snapshot must land in the RAM tier");
-    assert!(
-        shard_db_files(&tdir).is_empty(),
-        "Rederive flush must not write a shard file"
-    );
-    assert!(t.has_pk(10));
-    assert!(t.has_pk(20));
-}
-
 /// Wide (`pk_stride = 24`) PK in every tier its rows can live in.
 /// `has_pk_bytes`/`live_row_at` must resolve prefix-twins — keys sharing
 /// their OPK 16-byte prefix and differing only in the trailing column —
@@ -426,7 +387,7 @@ fn wide_pk_membership_and_retract_resolve_twins_in_every_tier() {
         assert!(!t.has_pk_bytes(&pk3(9, 9, 9)));
 
         // The same keys, now served out of whichever tier the flush chose.
-        t.flush().unwrap();
+        flush_by_source(&mut t);
         for k in [&twin_a, &twin_b, &other] {
             assert!(t.has_pk_bytes(k), "table {tid}: key must survive the flush");
         }
@@ -439,7 +400,7 @@ fn wide_pk_membership_and_retract_resolve_twins_in_every_tier() {
         assert!(t.has_pk_bytes(&twin_b), "table {tid}: the other twin must survive");
 
         // ...and still nets once the retraction is itself in a tier.
-        t.flush().unwrap();
+        flush_by_source(&mut t);
         assert!(!t.has_pk_bytes(&twin_a));
         assert!(t.has_pk_bytes(&twin_b));
 
@@ -490,7 +451,7 @@ fn signed_compound_pk_keeps_opk_order_in_every_tier() {
             // scrambled insertion order
             t.ingest_owned_batch(row(a, 1)).unwrap();
         }
-        t.flush().unwrap();
+        flush_by_source(&mut t);
 
         assert!(t.has_pk_bytes(&key(-5, 0, 0)), "table {tid}");
         assert!(t.has_pk_bytes(&key(3, 0, 0)));
@@ -519,7 +480,7 @@ fn signed_compound_pk_keeps_opk_order_in_every_tier() {
 
         // The row itself goes only via a DBSP -1 ingest, netting the +1 to zero.
         t.ingest_owned_batch(row(-5, -1)).unwrap();
-        t.flush().unwrap();
+        flush_by_source(&mut t);
         assert!(
             !t.has_pk_bytes(&key(-5, 0, 0)),
             "table {tid}: retracted signed key is gone"
@@ -529,8 +490,8 @@ fn signed_compound_pk_keeps_opk_order_in_every_tier() {
 
 // ── In-memory Rederive flush (RAM tier, no file I/O) ─────────────────
 
-/// A sub-ceiling Rederive flush writes no file at all; rows are served
-/// from the RAM tier via the cursor.
+/// A sub-ceiling RAM-tier fold writes no file at all; rows are served from
+/// the RAM tier via the cursor.
 #[test]
 fn nondurable_flush_writes_no_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -540,11 +501,12 @@ fn nondurable_flush_writes_no_file() {
 
     t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300)]))
         .unwrap();
-    assert!(t.flush_prepare(FlushRound::Base).unwrap().is_none());
+    t.flush_to_ram().unwrap();
+    assert!(t.memtable.is_empty(), "the fold resets the memtable");
 
     assert!(
         shard_db_files(&tdir).is_empty(),
-        "a sub-ceiling base-round flush must write no shard file"
+        "a sub-ceiling fold must write no shard file"
     );
     assert!(t.all_shard_arcs().is_empty());
     assert!(!t.ram_tier.is_empty());
@@ -570,7 +532,7 @@ fn nondurable_cross_flush_fold_nets_to_zero() {
     for i in 0..6 {
         let w = if i % 2 == 0 { 1 } else { -1 };
         t.ingest_owned_batch(make_batch(&[(7, w, 70)])).unwrap();
-        t.flush().unwrap();
+        t.flush_to_ram().unwrap();
     }
     assert!(!t.has_pk(7), "net-zero key must not be present");
     let weights = materialize_weights(&t);
@@ -594,7 +556,7 @@ fn nondurable_run_count_stays_bounded() {
     let n = FOLD_THRESHOLD as u64 + 4;
     for k in 0..n {
         t.ingest_owned_batch(make_batch(&[(k, 1, (k * 10) as i64)])).unwrap();
-        t.flush().unwrap();
+        t.flush_to_ram().unwrap();
         assert!(
             t.ram_tier.len() <= FOLD_THRESHOLD,
             "run count exceeded threshold after flush {k}",
@@ -618,7 +580,7 @@ fn nondurable_ceiling_spill_to_disk() {
 
     let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (k, 1, (k * 10) as i64)).collect();
     t.ingest_owned_batch(make_batch(&rows)).unwrap();
-    t.flush().unwrap();
+    t.flush_to_ram().unwrap();
 
     assert!(
         !shard_db_files(&tdir).is_empty(),
@@ -678,12 +640,12 @@ fn nondurable_has_pk_over_in_memory_runs() {
     let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::Rederive { resume_at: None });
 
     t.ingest_owned_batch(make_batch(&[(5, 1, 50)])).unwrap();
-    t.flush().unwrap();
+    t.flush_to_ram().unwrap();
     assert!(t.memtable.is_empty());
     assert!(t.has_pk(5), "in-memory positive-weight row must be found");
 
     t.ingest_owned_batch(make_batch(&[(5, -1, 50)])).unwrap();
-    t.flush().unwrap();
+    t.flush_to_ram().unwrap();
     assert!(!t.has_pk(5), "net-zero key across in-memory runs must be absent");
 }
 
@@ -701,7 +663,7 @@ fn nondurable_mixed_disk_and_heap_read() {
     t.ram_tier.set_budget(100);
     let disk_rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (k, 1, (k * 10) as i64)).collect();
     t.ingest_owned_batch(make_batch(&disk_rows)).unwrap();
-    t.flush().unwrap();
+    t.flush_to_ram().unwrap();
     assert!(!t.all_shard_arcs().is_empty(), "first flush must spill to disk");
     assert_eq!(t.ram_tier.len(), 0);
 
@@ -709,12 +671,12 @@ fn nondurable_mixed_disk_and_heap_read() {
     t.ram_tier.set_budget(usize::MAX);
     let heap_rows: Vec<(u64, i64, i64)> = (100..105).map(|k| (k, 1, (k * 10) as i64)).collect();
     t.ingest_owned_batch(make_batch(&heap_rows)).unwrap();
-    t.flush().unwrap();
+    t.flush_to_ram().unwrap();
     assert!(!t.ram_tier.is_empty(), "second flush stays in heap");
 
     // Cross-tier retraction: cancel disk key 3 (payload 30) from heap.
     t.ingest_owned_batch(make_batch(&[(3, -1, 30)])).unwrap();
-    t.flush().unwrap();
+    t.flush_to_ram().unwrap();
 
     assert!(!t.has_pk(3), "disk insert + heap retraction nets zero");
     let weights = materialize_weights(&t);
@@ -751,11 +713,11 @@ fn inmem_retract_multiple_payloads() {
 
     // Run 1: INSERT (PK=10, +1, val=100).
     t.ingest_owned_batch(make_batch(&[(10, 1, 100)])).unwrap();
-    t.flush().unwrap();
+    t.flush_to_ram().unwrap();
     // Run 2: UPDATE delta — retract val=100, insert val=200.
     t.ingest_owned_batch(make_batch(&[(10, -1, 100), (10, 1, 200)]))
         .unwrap();
-    t.flush().unwrap();
+    t.flush_to_ram().unwrap();
 
     assert!(t.memtable.is_empty());
     assert_eq!(t.ram_tier.len(), 2, "two sub-ceiling flushes → two L0 runs");
@@ -784,7 +746,7 @@ fn inmem_cross_tier_netting() {
 
     // RAM run: two payloads for PK=5 (val=50, val=60), each +1.
     t.ingest_owned_batch(make_batch(&[(5, 1, 50), (5, 1, 60)])).unwrap();
-    t.flush().unwrap();
+    t.flush_to_ram().unwrap();
     // Memtable (unflushed): retract val=50, leaving (5,60) globally live.
     t.ingest_owned_batch(make_batch(&[(5, -1, 50)])).unwrap();
     assert!(!t.memtable.is_empty(), "retraction stays in the memtable");
@@ -858,7 +820,7 @@ fn inmem_fold_rebuilds_run_bloom() {
     let n = FOLD_THRESHOLD as u64 + 2;
     for k in 0..n {
         t.ingest_owned_batch(make_batch(&[(k, 1, 100 + k as i64)])).unwrap();
-        t.flush().unwrap();
+        t.flush_to_ram().unwrap();
     }
     assert!(t.ram_tier.len() <= FOLD_THRESHOLD, "fold kept the run count bounded");
 
@@ -1194,7 +1156,7 @@ fn compact_then_quiet_barrier_publishes_compacted_index() {
 }
 
 /// The manifest generation is stamped from the value the publish path
-/// passes explicitly (`flush_prepare_ephemeral(generation)`), so a
+/// passes explicitly (`flush_barrier(tables, generation)`), so a
 /// compaction republish carries the caller's generation, and a later
 /// republish re-stamps a newer one.
 #[test]
@@ -1213,10 +1175,10 @@ fn generation_preserved_by_compaction_republish() {
     for r in 0..6u64 {
         let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
         t.ingest_owned_batch(make_batch(&rows)).unwrap();
-        flush_ephemeral_at(&mut t, 0x1111);
+        flush_barrier([&mut t], 0x1111).unwrap();
     }
     assert!(compaction_output_count(&tdir) > 0, "compaction ran");
-    flush_ephemeral_at(&mut t, 0x1111);
+    flush_barrier([&mut t], 0x1111).unwrap();
     assert_eq!(
         read_generation(&tdir),
         0x1111,
@@ -1225,7 +1187,7 @@ fn generation_preserved_by_compaction_republish() {
 
     // A later publish at a higher generation re-stamps the manifest.
     t.ingest_owned_batch(make_batch(&[(9999, 1, 1)])).unwrap();
-    flush_ephemeral_at(&mut t, 0x2222);
+    flush_barrier([&mut t], 0x2222).unwrap();
     assert_eq!(
         read_generation(&tdir),
         0x2222,
@@ -1247,7 +1209,7 @@ fn rederive_checkpointed_conditional_load() {
     {
         let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
         t.ingest_owned_batch(make_batch(&[(1, 1, 100), (2, 1, 200)])).unwrap();
-        flush_ephemeral_at(&mut t, 7);
+        flush_barrier([&mut t], 7).unwrap();
     }
     assert!(manifest_path.exists(), "manifest published at generation 7");
 
@@ -1289,7 +1251,7 @@ fn rederive_checkpointed_rebuilds_on_a_damaged_manifest() {
         let tdir = dir.path().join(name);
         let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
         t.ingest_owned_batch(make_batch(&[(1, 1, 100)])).unwrap();
-        flush_ephemeral_at(&mut t, 7);
+        flush_barrier([&mut t], 7).unwrap();
         assert_eq!(shard_db_files(&tdir).len(), 1, "{name}: shard published");
         let manifest = std::path::PathBuf::from(crate::storage::lsm::manifest::path(tdir.to_str().unwrap()));
         (tdir, manifest)
@@ -1358,11 +1320,11 @@ fn barrier_gate_matrix() {
         let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (k, 1, 1)).collect();
         t.ingest_owned_batch(make_batch(&rows)).unwrap();
         assert_eq!(t.ram_tier.len(), 0, "spilled");
-        let w = t
-            .flush_prepare(FlushRound::Base)
+        let _w = t
+            .flush_prepare(0)
             .unwrap()
             .expect("an unsynced spill must gate to a staged publish");
-        assert!(!w.sync_paths.is_empty(), "the unsynced spill must be in the sweep list");
+        assert!(t.unsynced_paths().next().is_some(), "the barrier must sync the spill");
     }
 
     // Arm 3 — a spill-driven compaction stages a publish and sweeps its own
@@ -1383,15 +1345,15 @@ fn barrier_gate_matrix() {
         assert!(compaction_output_count(&tdir) > 0, "the spills drove a compaction");
 
         let shards_before = shard_db_files(&tdir).len();
-        let w = t
-            .flush_prepare(FlushRound::Base)
+        let _w = t
+            .flush_prepare(0)
             .unwrap()
             .expect("unsynced compaction outputs must gate to a staged publish");
-        let swept: Vec<String> = w.sync_paths.iter().map(|c| c.to_string_lossy().into_owned()).collect();
+        let swept: Vec<String> = t.unsynced_paths().map(str::to_owned).collect();
         assert!(!swept.is_empty(), "the compaction outputs must be swept");
         assert!(
             swept.iter().all(|p| is_compaction_output(p)),
-            "the superseded inputs must have left the sweep list, got {swept:?}",
+            "only the compaction outputs are left to sync, got {swept:?}",
         );
         assert_eq!(
             shard_db_files(&tdir).len(),
@@ -1411,16 +1373,10 @@ fn an_idle_store_publishes_nothing() {
     let mut t = new_table(&tdir, make_schema_u64_i64(), 1 << 20, RecoverySource::SalReplay);
     t.flush().unwrap();
     assert!(tdir.join("manifest.bin").exists(), "the first barrier publishes");
-    assert!(
-        t.flush_prepare(FlushRound::Base).unwrap().is_none(),
-        "an idle store stages nothing"
-    );
+    assert!(t.flush_prepare(0).unwrap().is_none(), "an idle store stages nothing");
 
     t.ingest_owned_batch(make_batch(&[(1, 1, 1)])).unwrap();
-    assert!(
-        t.flush_prepare(FlushRound::Base).unwrap().is_some(),
-        "a written row publishes"
-    );
+    assert!(t.flush_prepare(0).unwrap().is_some(), "a written row publishes");
 }
 
 /// A manifest loaded at open may never have been made durable by the process
@@ -1436,7 +1392,7 @@ fn a_reopened_store_publishes_on_its_first_round() {
         t.flush().unwrap();
     }
     let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::SalReplay);
-    assert!(t.flush_prepare(FlushRound::Base).unwrap().is_some());
+    assert!(t.flush_prepare(0).unwrap().is_some());
 }
 
 /// An unlinked manifest is no longer durable, so the next round republishes.
@@ -1447,7 +1403,7 @@ fn an_unlinked_manifest_republishes() {
     let mut t = new_table(&tdir, make_schema_u64_i64(), 1 << 20, RecoverySource::SalReplay);
     t.flush().unwrap();
     t.unlink_manifest().unwrap();
-    assert!(t.flush_prepare(FlushRound::Base).unwrap().is_some());
+    assert!(t.flush_prepare(0).unwrap().is_some());
 }
 
 /// A push that retracts every row, spills, and compacts the whole L0 to nothing
@@ -1476,10 +1432,7 @@ fn a_compaction_to_nothing_publishes() {
     assert_eq!(t.ram_tier.len(), 0, "the retraction spilled");
     assert!(t.all_shard_arcs().is_empty(), "the compaction cancelled everything");
 
-    assert!(
-        t.flush_prepare(FlushRound::Base).unwrap().is_some(),
-        "an emptied index publishes"
-    );
+    assert!(t.flush_prepare(0).unwrap().is_some(), "an emptied index publishes");
     t.flush().unwrap();
     drop(t);
     let t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
@@ -1506,7 +1459,7 @@ fn assert_unpublished_inputs_gone(t: &Table, dir: &std::path::Path, published: &
 }
 
 /// F5. A `Rederive` table's published compaction input waits for the
-/// ephemeral round, which republishes; the base round drains nothing.
+/// ephemeral round, which republishes.
 #[test]
 fn rederive_ephemeral_flush_drains_deferred_compaction() {
     let dir = tempfile::tempdir().unwrap();
@@ -1517,7 +1470,7 @@ fn rederive_ephemeral_flush_drains_deferred_compaction() {
 
     // One published shard, so the churn below supersedes a file a manifest names.
     t.ingest_owned_batch(make_batch(&[(10_000, 1, 1)])).unwrap();
-    super::super::flush_barrier::flush_barrier([&mut t], FlushRound::Ephemeral(1)).unwrap();
+    flush_barrier([&mut t], 1).unwrap();
     let published = shard_db_files(&tdir);
     assert_eq!(published.len(), 1, "the publish wrote one shard");
 
@@ -1533,15 +1486,7 @@ fn rederive_ephemeral_flush_drains_deferred_compaction() {
         "the published input waits for the barrier"
     );
 
-    let files_before = all_shard_file_count(&tdir);
-    t.flush().unwrap();
-    assert_eq!(
-        all_shard_file_count(&tdir),
-        files_before,
-        "the base round must publish nothing for a Rederive table, so nothing drains"
-    );
-
-    super::super::flush_barrier::flush_barrier([&mut t], FlushRound::Ephemeral(2)).unwrap();
+    flush_barrier([&mut t], 2).unwrap();
     assert!(
         !tdir.join(&published[0]).exists(),
         "the ephemeral round republishes over the compacted index and drains the published input"

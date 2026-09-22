@@ -155,7 +155,7 @@ pub(crate) fn write_state(base_dir: &str, generation: u64, block: &[u8]) -> Resu
     let digest = digest_of(&bytes);
     write_u64_le(&mut bytes, OFF_DIGEST, digest);
 
-    gnitz_store::storage::publish_file_sync(base_dir, STATE_FILENAME, &[&bytes])
+    gnitz_store::storage::publish_file_sync(base_dir, STATE_FILENAME, &bytes)
         .map_err(|e| MirrorError::Engine(format!("mirror state file: {e}")))
 }
 

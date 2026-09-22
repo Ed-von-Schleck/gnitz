@@ -86,7 +86,7 @@ fn delta_ingest_bench() {
             table.ingest_owned_batch(b).unwrap();
             // Drain per tick, so this measures the RAM-tier fold rather than the
             // memtable absorbing the whole run. Not what the worker does.
-            table.flush().unwrap();
+            table.flush_to_ram().unwrap();
         }
         let ingest_ns = t1.elapsed().as_nanos() as f64;
         let runs = table.ram_tier.len();
@@ -133,7 +133,7 @@ fn delta_ingest_bench() {
         let t = Instant::now();
         for b in batches {
             table.ingest_owned_batch(b).unwrap();
-            table.flush().unwrap();
+            table.flush_to_ram().unwrap();
         }
         let ns = t.elapsed().as_nanos() as f64;
         black_box(&table);
@@ -191,7 +191,7 @@ fn delta_ingest_bench() {
         let t = Instant::now();
         for b in batches {
             table.ingest_owned_batch(b).unwrap();
-            table.flush().unwrap();
+            table.flush_to_ram().unwrap();
         }
         let ns = t.elapsed().as_nanos() as f64;
         black_box(&table);

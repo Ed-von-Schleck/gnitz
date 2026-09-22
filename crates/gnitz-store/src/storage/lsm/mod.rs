@@ -10,11 +10,8 @@
 //! `lsm/` has **no outward facade of its own** — `storage/mod.rs` curates the
 //! single combined storage surface and re-exports the public items from these
 //! submodules. The repr (L2) siblings live under `storage/repr/`; this module
-//! aliases the repr submodules and the few storage-level helpers (`error`,
-//! `cstr`, `StagedFile`) so the LSM files keep their `super::<mod>`
-//! paths unchanged after the move under `lsm/`. The `with_*` dispatch macros
-//! are not aliased here — `with_payload_cmp!` is reached through
-//! `crate::schema::payload_order`.
+//! aliases them and the storage-level helpers the LSM files name as
+//! `super::<mod>`.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
@@ -36,11 +33,8 @@ pub(super) mod run;
 mod run_set;
 mod shard_index;
 
-// Aliases so the LSM submodules keep their `super::<mod>` / `super::super::<mod>`
-// paths after the move: the repr (L2) submodules plus the storage-level helpers
-// that stay above `lsm/` (`error` and the `cstr` helpers, from the storage facade).
 use super::repr::{batch, bloom, heap, merge, scatter, seek, shard_file, shard_reader};
 // Shard-format constants: only the LSM test modules assert against the image.
 #[cfg(test)]
 use super::repr::layout;
-use super::{cstr, error, to_cstrings, StagedFile, STAGING_SUFFIX};
+use super::{error, StagedFile, STAGING_SUFFIX};

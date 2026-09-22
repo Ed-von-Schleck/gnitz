@@ -12,7 +12,6 @@ use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{make_schema_u64_i64, opk_pk, pk_payload_schema};
 use gnitz_expr::RowSource;
 use gnitz_wire::read_i64_le;
-use std::ffi::CStr;
 use std::fs;
 use TypeCode::{String as TYPE_STRING, I64 as TYPE_I64, U64 as TYPE_U64};
 
@@ -23,14 +22,8 @@ fn out(dir: &str, compact_seq: u64) -> Output<'_> {
 
 /// A one-payload-column shard of `pks` at `weights` (payload = pk), written to
 /// `dir/name`. Returns the path, so a caller can hand it straight to
-/// `compact_one` without restating it as a `CString`.
-fn write_shard(
-    dir: &std::path::Path,
-    name: &str,
-    pks: &[u64],
-    weights: &[i64],
-    schema: &SchemaDescriptor,
-) -> std::ffi::CString {
+/// `compact_one`.
+fn write_shard(dir: &std::path::Path, name: &str, pks: &[u64], weights: &[i64], schema: &SchemaDescriptor) -> String {
     let rows: Vec<(Vec<u8>, i64, i64)> = pks
         .iter()
         .zip(weights)
@@ -40,18 +33,13 @@ fn write_shard(
 }
 
 /// Open every input shard, as the index hands compaction its own handles.
-fn open_inputs(paths: &[&CStr], schema: &SchemaDescriptor) -> Vec<MappedShard> {
+fn open_inputs(paths: &[&str], schema: &SchemaDescriptor) -> Vec<MappedShard> {
     paths.iter().map(|p| MappedShard::open(p, schema).unwrap()).collect()
 }
 
 /// Single-guard compaction of `inputs` into `dir`. Returns the output
 /// shard's path, or `None` when every row cancelled (no shard is written).
-fn compact_one_opt(
-    dir: &std::path::Path,
-    inputs: &[&CStr],
-    schema: &SchemaDescriptor,
-    seq: u64,
-) -> Option<std::ffi::CString> {
+fn compact_one_opt(dir: &std::path::Path, inputs: &[&str], schema: &SchemaDescriptor, seq: u64) -> Option<String> {
     let anchor = PkBuf::zeroed(schema.pk_stride());
     let outs = merge_and_route(
         &open_inputs(inputs, schema),
@@ -60,10 +48,10 @@ fn compact_one_opt(
         out(dir.to_str().unwrap(), seq),
     )
     .unwrap();
-    outs.first().map(|(_, p)| std::ffi::CString::new(p.as_str()).unwrap())
+    outs.first().map(|(_, p)| p.clone())
 }
 
-fn compact_one(dir: &std::path::Path, inputs: &[&CStr], schema: &SchemaDescriptor, seq: u64) -> std::ffi::CString {
+fn compact_one(dir: &std::path::Path, inputs: &[&str], schema: &SchemaDescriptor, seq: u64) -> String {
     compact_one_opt(dir, inputs, schema, seq).expect("compaction produced no output shard")
 }
 
@@ -84,20 +72,20 @@ fn compaction_packs_eligible_int_payload() {
     let cs2 = write_shard(&dir, "s2.db", &pks2, &vec![1i64; 300], &schema);
     // L0 spill inputs stay Raw (policy: only compaction packs).
     assert_eq!(
-        region_dir(&fs::read(cs1.to_str().unwrap()).unwrap(), REG_PAYLOAD_START).1,
+        region_dir(&fs::read(cs1.as_str()).unwrap(), REG_PAYLOAD_START).1,
         ENCODING_RAW,
         "L0 input stays raw"
     );
     assert_eq!(
-        region_dir(&fs::read(cs2.to_str().unwrap()).unwrap(), REG_PAYLOAD_START).1,
+        region_dir(&fs::read(cs2.as_str()).unwrap(), REG_PAYLOAD_START).1,
         ENCODING_RAW
     );
 
-    let cout = compact_one(&dir, &[cs1.as_c_str(), cs2.as_c_str()], &schema, 1);
+    let cout = compact_one(&dir, &[cs1.as_str(), cs2.as_str()], &schema, 1);
 
     // Compaction output packs the eligible payload.
     assert_eq!(
-        region_dir(&fs::read(cout.to_str().unwrap()).unwrap(), REG_PAYLOAD_START).1,
+        region_dir(&fs::read(cout.as_str()).unwrap(), REG_PAYLOAD_START).1,
         ENCODING_FOR,
         "compaction packs payload"
     );
@@ -113,9 +101,9 @@ fn compaction_packs_eligible_int_payload() {
     }
 
     // Re-compaction of a packed input (decode → merge → re-encode).
-    let cout2 = compact_one(&dir, &[cout.as_c_str()], &schema, 2);
+    let cout2 = compact_one(&dir, &[cout.as_str()], &schema, 2);
     assert_eq!(
-        region_dir(&fs::read(cout2.to_str().unwrap()).unwrap(), REG_PAYLOAD_START).1,
+        region_dir(&fs::read(cout2.as_str()).unwrap(), REG_PAYLOAD_START).1,
         ENCODING_FOR,
         "re-compaction repacks"
     );
@@ -179,12 +167,12 @@ fn compaction_merges_inputs_and_drops_cancelled_rows() {
     for (name, shards, want) in cases {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
-        let paths: Vec<std::ffi::CString> = shards
+        let paths: Vec<String> = shards
             .iter()
             .enumerate()
             .map(|(i, (pks, ws))| write_shard(&dir, &format!("s{i}.db"), pks, ws, &schema))
             .collect();
-        let inputs: Vec<&CStr> = paths.iter().map(|p| p.as_c_str()).collect();
+        let inputs: Vec<&str> = paths.iter().map(String::as_str).collect();
 
         match (compact_one_opt(&dir, &inputs, &schema, 1), want) {
             (None, None) => {}
@@ -209,7 +197,6 @@ fn a_corrupt_input_body_fails_the_compaction() {
     for i in 0..5u64 {
         let pks: Vec<u64> = (0..20).map(|j| i * 100 + j).collect();
         let path = write_shard(dir, &format!("s{i}.db"), &pks, &vec![1; pks.len()], &schema);
-        let path = path.into_string().unwrap();
         idx.add_unsynced_shard(&path, i + 1).unwrap();
         paths.push(path);
     }
@@ -274,7 +261,7 @@ fn test_merge_and_route_basic() {
 
     // Shard with keys 10, 50, 150, 250
     let cs1 = write_shard(&dir, "s1.db", &[10, 50, 150, 250], &[1, 1, 1, 1], &schema);
-    let inputs = [cs1.as_c_str()];
+    let inputs = [cs1.as_str()];
 
     // Two guards: [0, 100)  and [100, ∞). A guard key is a whole OPK key, the
     // same bytes the router compares, so derive them from the OPK image of the
@@ -293,14 +280,14 @@ fn test_merge_and_route_basic() {
     assert_eq!(guard_outputs.len(), 2); // both guards should have rows
 
     // Guard 0 should have keys 10, 50
-    let cfn0 = std::ffi::CString::new(guard_outputs[0].1.as_str()).unwrap();
+    let cfn0 = guard_outputs[0].1.clone();
     let g0 = MappedShard::open(&cfn0, &schema).unwrap();
     assert_eq!(g0.count, 2);
     assert_eq!(g0.get_pk(0), 10);
     assert_eq!(g0.get_pk(1), 50);
 
     // Guard 1 should have keys 150, 250
-    let cfn1 = std::ffi::CString::new(guard_outputs[1].1.as_str()).unwrap();
+    let cfn1 = guard_outputs[1].1.clone();
     let g1 = MappedShard::open(&cfn1, &schema).unwrap();
     assert_eq!(g1.count, 2);
     assert_eq!(g1.get_pk(0), 150);
@@ -316,7 +303,7 @@ fn test_merge_and_route_cleanup_on_partial_finalize_failure() {
 
     let cs1 = write_shard(&dir, "in1.db", &[10, 50], &[1, 1], &schema);
     let cs2 = write_shard(&dir, "in2.db", &[150, 250], &[1, 1], &schema);
-    let inputs = [cs1.as_c_str(), cs2.as_c_str()];
+    let inputs = [cs1.as_str(), cs2.as_str()];
     let guards: [(PkBuf, bool); 2] = [
         (PkBuf::from_bytes(&0u64.to_be_bytes()), false),
         (PkBuf::from_bytes(&100u64.to_be_bytes()), false),
@@ -364,14 +351,12 @@ fn write_3col_shard(path: &str, rows: &[(u64, i64, i64, i64)], schema: &SchemaDe
         batch.extend_col(1, &c2.to_le_bytes());
         batch.count += 1;
     }
-    let cpath = std::ffi::CString::new(path).unwrap();
-    batch.write_as_shard(&cpath, ShardWriteOpts::default()).unwrap();
+    batch.write_as_shard(path, ShardWriteOpts::default()).unwrap();
 }
 
 /// Read all rows from a 3-col shard as (pk, weight, col1, col2).
 fn read_3col_shard(path: &str, schema: &SchemaDescriptor) -> Vec<(u64, i64, i64, i64)> {
-    let cpath = std::ffi::CString::new(path).unwrap();
-    let shard = MappedShard::open(&cpath, schema).unwrap();
+    let shard = MappedShard::open(path, schema).unwrap();
     let mut rows = Vec::new();
     for i in 0..shard.count {
         let pk = shard.get_pk(i) as u64;
@@ -405,13 +390,13 @@ fn test_compact_same_pk_different_payload_cancels() {
     let s3 = dir.join("s3.db");
     write_3col_shard(s3.to_str().unwrap(), &[(1, -1, 0, 10000), (1, 1, 0, 15000)], &schema);
 
-    let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-    let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
-    let cs3 = std::ffi::CString::new(s3.to_str().unwrap()).unwrap();
-    let inputs = [cs1.as_c_str(), cs2.as_c_str(), cs3.as_c_str()];
+    let cs1 = s1.to_str().unwrap().to_owned();
+    let cs2 = s2.to_str().unwrap().to_owned();
+    let cs3 = s3.to_str().unwrap().to_owned();
+    let inputs = [cs1.as_str(), cs2.as_str(), cs3.as_str()];
     let cout = compact_one(&dir, &inputs, &schema, 1);
 
-    let rows = read_3col_shard(cout.to_str().unwrap(), &schema);
+    let rows = read_3col_shard(cout.as_str(), &schema);
     assert_eq!(rows.len(), 1, "expected 1 surviving row, got {rows:?}");
     assert_eq!(rows[0], (1, 1, 0, 15000));
 }
@@ -449,13 +434,13 @@ fn test_compact_same_pk_nonadjacent_payload_interleave() {
     let s3 = dir.join("s3.db");
     write_3col_shard(s3.to_str().unwrap(), &[(1, -1, 0, 100)], &schema);
 
-    let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-    let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
-    let cs3 = std::ffi::CString::new(s3.to_str().unwrap()).unwrap();
-    let inputs = [cs1.as_c_str(), cs2.as_c_str(), cs3.as_c_str()];
+    let cs1 = s1.to_str().unwrap().to_owned();
+    let cs2 = s2.to_str().unwrap().to_owned();
+    let cs3 = s3.to_str().unwrap().to_owned();
+    let inputs = [cs1.as_str(), cs2.as_str(), cs3.as_str()];
     let cout = compact_one(&dir, &inputs, &schema, 1);
 
-    let rows = read_3col_shard(cout.to_str().unwrap(), &schema);
+    let rows = read_3col_shard(cout.as_str(), &schema);
     assert_eq!(
         rows.len(),
         1,
@@ -491,13 +476,13 @@ fn test_compact_multi_group_reduce_pattern() {
         &schema,
     );
 
-    let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-    let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
-    let cs3 = std::ffi::CString::new(s3.to_str().unwrap()).unwrap();
-    let inputs = [cs1.as_c_str(), cs2.as_c_str(), cs3.as_c_str()];
+    let cs1 = s1.to_str().unwrap().to_owned();
+    let cs2 = s2.to_str().unwrap().to_owned();
+    let cs3 = s3.to_str().unwrap().to_owned();
+    let inputs = [cs1.as_str(), cs2.as_str(), cs3.as_str()];
     let cout = compact_one(&dir, &inputs, &schema, 1);
 
-    let rows = read_3col_shard(cout.to_str().unwrap(), &schema);
+    let rows = read_3col_shard(cout.as_str(), &schema);
     assert_eq!(rows.len(), 2, "expected 2 surviving rows, got {rows:?}");
     assert_eq!(rows[0], (1, 1, 0, 600));
     assert_eq!(rows[1], (2, 1, 1, 800));
@@ -531,14 +516,11 @@ fn test_compact_10_tick_reduce_single_group() {
         shard_paths.push(p);
     }
 
-    let cstrs: Vec<_> = shard_paths
-        .iter()
-        .map(|p| std::ffi::CString::new(p.to_str().unwrap()).unwrap())
-        .collect();
-    let inputs: Vec<_> = cstrs.iter().map(|c| c.as_c_str()).collect();
+    let cstrs: Vec<_> = shard_paths.iter().map(|p| p.to_str().unwrap().to_owned()).collect();
+    let inputs: Vec<_> = cstrs.iter().map(|c| c.as_str()).collect();
     let cout = compact_one(&dir, &inputs, &schema, 1);
 
-    let rows = read_3col_shard(cout.to_str().unwrap(), &schema);
+    let rows = read_3col_shard(cout.as_str(), &schema);
     assert_eq!(
         rows.len(),
         1,
@@ -558,7 +540,7 @@ fn test_merge_and_route_keys_below_first_guard() {
 
     // Shard with keys 50, 100, 150, 250 — two are below guard key 200
     let cs1 = write_shard(&dir, "s1.db", &[50, 100, 150, 250], &[1, 1, 1, 1], &schema);
-    let inputs = [cs1.as_c_str()];
+    let inputs = [cs1.as_str()];
 
     // A single guard keyed at 200: everything below it is guard 0's tail.
     let guards = [(PkBuf::from_bytes(&200u64.to_be_bytes()), false)];
@@ -571,8 +553,8 @@ fn test_merge_and_route_keys_below_first_guard() {
     .unwrap();
     assert!(!guard_outputs.is_empty(), "merge_and_route should produce output");
 
-    let cpath = std::ffi::CString::new(guard_outputs[0].1.as_str()).unwrap();
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard_path = guard_outputs[0].1.clone();
+    let shard = MappedShard::open(&shard_path, &schema).unwrap();
     assert_eq!(shard.count, 4, "all 4 keys must be present in output");
 
     // Verify all keys readable
@@ -681,7 +663,7 @@ fn compaction_orders_and_folds_on_opk_bytes_at_every_pk_shape() {
         let schema = pk_payload_schema(case.pk_types);
         assert_eq!(schema.pk_stride(), case.stride, "{}: fixture stride", case.name);
 
-        let paths: Vec<std::ffi::CString> = case
+        let paths: Vec<String> = case
             .shards
             .iter()
             .enumerate()
@@ -691,7 +673,7 @@ fn compaction_orders_and_folds_on_opk_bytes_at_every_pk_shape() {
                 shard_file::write_test_shard(&dir.join(format!("s{i}.db")), &schema, &rows, ShardWriteOpts::default())
             })
             .collect();
-        let inputs: Vec<&CStr> = paths.iter().map(|p| p.as_c_str()).collect();
+        let inputs: Vec<&str> = paths.iter().map(String::as_str).collect();
 
         let cout = compact_one(&dir, &inputs, &schema, 1);
         let merged = MappedShard::open(&cout, &schema).unwrap();
@@ -775,15 +757,13 @@ fn write_diff_shard(path: &str, schema: &SchemaDescriptor, rows: &[DiffRow]) {
         batch.extend_col(2, &ic);
         batch.count += 1;
     }
-    let cpath = std::ffi::CString::new(path).unwrap();
-    batch.write_as_shard(&cpath, ShardWriteOpts::default()).unwrap();
+    batch.write_as_shard(path, ShardWriteOpts::default()).unwrap();
 }
 
 /// Read a compacted shard back to its rows, decoding strings to their
 /// content against the shard's own blob (never the raw struct bytes).
 fn decode_diff_shard(path: &str, schema: &SchemaDescriptor) -> Vec<DecodedRow> {
-    let cpath = std::ffi::CString::new(path).unwrap();
-    let shard = MappedShard::open(&cpath, schema).unwrap();
+    let shard = MappedShard::open(path, schema).unwrap();
     let blob = shard.blob();
     (0..shard.count)
         .map(|i| {
@@ -810,7 +790,7 @@ fn decode_diff_shard(path: &str, schema: &SchemaDescriptor) -> Vec<DecodedRow> {
 }
 
 /// Row-at-a-time oracle for the columnar compaction path.
-fn oracle_compact_row_at_a_time(input_files: &[&CStr], output_file: &CStr, schema: &SchemaDescriptor) {
+fn oracle_compact_row_at_a_time(input_files: &[&str], output_file: &str, schema: &SchemaDescriptor) {
     let shards = open_inputs(input_files, schema);
     let mut batch = Batch::with_capacity(schema, 1024);
     let mut blob_cache = BlobCacheGuard::acquire(schema, 1024);
@@ -832,19 +812,16 @@ fn assert_compact_paths_agree(
     for (rows, p) in shard_rows.iter().zip(&in_paths) {
         write_diff_shard(p.to_str().unwrap(), schema, rows);
     }
-    let in_cstrs: Vec<std::ffi::CString> = in_paths
-        .iter()
-        .map(|p| std::ffi::CString::new(p.to_str().unwrap()).unwrap())
-        .collect();
-    let inputs: Vec<&CStr> = in_cstrs.iter().map(|c| c.as_c_str()).collect();
+    let in_strs: Vec<String> = in_paths.iter().map(|p| p.to_str().unwrap().to_owned()).collect();
+    let inputs: Vec<&str> = in_strs.iter().map(String::as_str).collect();
 
     let out_old = dir.join("out_old.db");
-    let cold = std::ffi::CString::new(out_old.to_str().unwrap()).unwrap();
+    let cold = out_old.to_str().unwrap().to_owned();
 
     let cnew = compact_one(dir, &inputs, schema, 1);
     oracle_compact_row_at_a_time(&inputs, &cold, schema);
 
-    let rows_new = decode_diff_shard(cnew.to_str().unwrap(), schema);
+    let rows_new = decode_diff_shard(&cnew, schema);
     let rows_old = decode_diff_shard(out_old.to_str().unwrap(), schema);
 
     assert_eq!(rows_new, rows_old, "columnar vs row-at-a-time materialization diverged");
@@ -918,7 +895,7 @@ fn test_compact_columnar_matches_row_at_a_time() {
 /// `Batch` + `BlobCacheGuard` per guard). Returns `Some(path)` per non-empty
 /// guard, `None` for an empty one.
 fn oracle_merge_and_route_row_at_a_time(
-    input_files: &[&CStr],
+    input_files: &[&str],
     out_dir: &std::path::Path,
     guard_keys: &[PkBuf],
     schema: &SchemaDescriptor,
@@ -938,8 +915,10 @@ fn oracle_merge_and_route_row_at_a_time(
                 return None;
             }
             let path = out_dir.join(format!("oracle_G{g}.db"));
-            let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-            batches[g].write_as_shard(&cpath, ShardWriteOpts::COMPACTION).unwrap();
+            let shard_path = path.to_str().unwrap().to_owned();
+            batches[g]
+                .write_as_shard(&shard_path, ShardWriteOpts::COMPACTION)
+                .unwrap();
             Some(path.to_str().unwrap().to_string())
         })
         .collect()
@@ -976,9 +955,9 @@ fn test_merge_and_route_multi_guard_matches_row_at_a_time() {
     let p1 = dir.join("in1.db");
     write_diff_shard(p0.to_str().unwrap(), &schema, s0);
     write_diff_shard(p1.to_str().unwrap(), &schema, s1);
-    let c0 = std::ffi::CString::new(p0.to_str().unwrap()).unwrap();
-    let c1 = std::ffi::CString::new(p1.to_str().unwrap()).unwrap();
-    let inputs = [c0.as_c_str(), c1.as_c_str()];
+    let c0 = p0.to_str().unwrap().to_owned();
+    let c1 = p1.to_str().unwrap().to_owned();
+    let inputs = [c0.as_str(), c1.as_str()];
 
     // A guard key is a whole OPK key, so derive them from the boundary values'
     // OPK bytes.
@@ -1070,7 +1049,7 @@ fn the_routed_split_agrees_with_guard_slot_at_every_stride() {
             .collect();
         let dests: Vec<(PkBuf, bool)> = guard_keys.iter().map(|&k| (k, false)).collect();
         let routed = merge_and_route(
-            &open_inputs(&[path.as_c_str()], &schema),
+            &open_inputs(&[path.as_str()], &schema),
             &dests,
             &schema,
             out(dir.to_str().unwrap(), 7),
@@ -1089,7 +1068,7 @@ fn the_routed_split_agrees_with_guard_slot_at_every_stride() {
                 (None, true) => {}
                 (None, false) => panic!("stride {}: part {g} wrote no shard but owns {want:?}", pk_cols * 8),
                 (Some((_, path)), _) => {
-                    let shard = MappedShard::open(&std::ffi::CString::new(path.as_str()).unwrap(), &schema).unwrap();
+                    let shard = MappedShard::open(path, &schema).unwrap();
                     let got: Vec<Vec<u8>> = (0..shard.count).map(|r| shard.get_pk_bytes(r).to_vec()).collect();
                     assert_eq!(
                         got,
@@ -1118,7 +1097,7 @@ mod skeleton_tests {
     use gnitz_wire::{read_i64_le, read_u64_le};
 
     /// A `(PK, weight, payload)` shard, so one PK can carry several payloads.
-    fn write_shard(path: &std::path::Path, rows: &[(u64, i64, i64)], schema: &SchemaDescriptor) -> std::ffi::CString {
+    fn write_shard(path: &std::path::Path, rows: &[(u64, i64, i64)], schema: &SchemaDescriptor) -> String {
         let mut b = Batch::with_capacity(schema, rows.len().max(1));
         for &(pk, w, v) in rows {
             b.extend_pk(pk as u128);
@@ -1127,16 +1106,16 @@ mod skeleton_tests {
             b.extend_col(0, &v.to_le_bytes());
             b.count += 1;
         }
-        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let shard_path = path.to_str().unwrap().to_owned();
         b.into_consolidated(schema)
-            .write_as_shard(&cpath, ShardWriteOpts::default())
+            .write_as_shard(&shard_path, ShardWriteOpts::default())
             .unwrap();
-        cpath
+        shard_path
     }
 
     /// `(pk, weight)` of every row of an output shard, read under the view schema.
     fn read_rows(path: &str, schema: &SchemaDescriptor) -> Vec<(u128, i64)> {
-        let s = MappedShard::open(&std::ffi::CString::new(path).unwrap(), schema).unwrap();
+        let s = MappedShard::open(path, schema).unwrap();
         (0..s.count).map(|i| (s.get_pk(i), s.get_weight(i))).collect()
     }
 
@@ -1159,7 +1138,7 @@ mod skeleton_tests {
         let b = write_shard(&dir.join("b.db"), &[(1, 3, 50), (3, -4, 40)], &schema);
 
         let outs = merge_and_route(
-            &super::open_inputs(&[a.as_c_str(), b.as_c_str()], &schema),
+            &super::open_inputs(&[a.as_str(), b.as_str()], &schema),
             &[(crate::schema::key::PkBuf::zeroed(schema.pk_stride()), true)],
             &schema,
             super::out(dir.to_str().unwrap(), 1),
@@ -1191,14 +1170,14 @@ mod skeleton_tests {
         let g1 = crate::schema::key::PkBuf::from_bytes(&100u64.to_be_bytes());
 
         let mixed = merge_and_route(
-            &super::open_inputs(&[src.as_c_str()], &schema),
+            &super::open_inputs(&[src.as_str()], &schema),
             &[(g0, true), (g1, false)],
             &schema,
             super::out(dir.to_str().unwrap(), 1),
         )
         .unwrap();
         let all_hydrated = merge_and_route(
-            &super::open_inputs(&[src.as_c_str()], &schema),
+            &super::open_inputs(&[src.as_str()], &schema),
             &[(g0, false), (g1, false)],
             &schema,
             super::out(dir.to_str().unwrap(), 2),
@@ -1208,11 +1187,7 @@ mod skeleton_tests {
         assert_eq!(mixed.len(), 2);
         // Guard 0 dehydrated: its two payloads for PK 1 fold to one coarse row.
         assert_eq!(read_rows(&mixed[0].1, &schema), vec![(1, 3)]);
-        assert!(
-            MappedShard::open(&crate::storage::cstr(mixed[0].1.as_str()).unwrap(), &schema)
-                .unwrap()
-                .is_skeleton()
-        );
+        assert!(MappedShard::open(mixed[0].1.as_str(), &schema).unwrap().is_skeleton());
         // Guard 1 hydrated: identical bytes to the all-hydrated run, modulo the
         // compaction sequence in the filename.
         let hy = std::fs::read(&mixed[1].1).unwrap();
@@ -1220,7 +1195,7 @@ mod skeleton_tests {
         assert_eq!(hy.len(), ref_.len());
         assert_eq!(
             read_i64_le(
-                MappedShard::open(&crate::storage::cstr(mixed[1].1.as_str()).unwrap(), &schema)
+                MappedShard::open(mixed[1].1.as_str(), &schema)
                     .unwrap()
                     .get_col_ptr(0, 0, 8),
                 0

@@ -7,7 +7,6 @@
 //! `Rederive` ones.
 
 use std::cell::Cell;
-use std::ffi::CString;
 use std::rc::Rc;
 
 use super::batch::Batch;
@@ -106,20 +105,12 @@ pub(crate) enum RecoverySource {
 // Two-phase flush API
 // ---------------------------------------------------------------------------
 
-/// The deferred half of one barrier flush, owned by the worker between
-/// `flush_prepare` and `flush_commit`.
+/// A publish `flush_prepare` staged and `flush_commit` completes.
 pub(in crate::storage) struct FlushWork {
-    /// Full paths of every file written unsynced since the last publish — prior
-    /// spills plus this barrier's own folded shard.
-    pub(in crate::storage) sync_paths: Vec<CString>,
-    /// The staged manifest `.tmp`, its fd open from `manifest::prepare` until
-    /// `flush_commit` consumes the work.
     pub(in crate::storage) manifest: StagedFile,
-    /// The staged manifest's bytes.
     pub(in crate::storage) bytes: Vec<u8>,
-    /// On the store's first publish in this process, the directories whose
-    /// entries name its directory and its relation's.
-    pub(in crate::storage) entry_dirs: Vec<std::path::PathBuf>,
+    /// Fsynced once `manifest` is renamed.
+    pub(in crate::storage) dirs: Vec<std::path::PathBuf>,
 }
 
 /// Index of the first candidate in `pool` (pool order) whose payload group nets
@@ -273,10 +264,7 @@ impl Table {
         self.shard_index.has_skeleton_shard()
     }
 
-    /// True when this store is rebuilt from its sources at open. It is the whole
-    /// difference between the two checkpoint rounds: the base round publishes
-    /// the others and folds these to RAM, the ephemeral round publishes exactly
-    /// these.
+    /// True when this store is rebuilt from its sources at open.
     pub(crate) fn is_rederived(&self) -> bool {
         matches!(self.recovery_source, RecoverySource::Rederive { .. })
     }

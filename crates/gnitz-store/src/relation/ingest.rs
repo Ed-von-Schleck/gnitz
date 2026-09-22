@@ -188,73 +188,53 @@ impl RelationRegistry {
             .map_err(|e| StoreError::storage(format!("fold relation {id} to RAM"), e))
     }
 
-    /// Every **user** store this process owns and checkpoints: each relation's own
-    /// `Table` plus its index-circuit tables. The system families are excluded, so
-    /// a forked worker cannot flush its inherited copy.
-    ///
-    /// A fed view's delta store is deliberately absent, which is what keeps it out
-    /// of both checkpoint rounds. Both rounds start from this one set.
-    fn collect_base_flush_tables(&mut self) -> Vec<&mut Table> {
-        let mut out: Vec<&mut Table> = Vec::new();
-        for entry in self.tables.values_mut() {
-            if entry.kind == RelationKind::SystemCatalog {
-                continue;
-            }
-            if let Some(t) = entry.store.table_mut() {
-                out.push(t);
-            }
-            out.extend(entry.indexes.iter_mut().filter_map(|ix| ix.store.table_mut()));
-        }
-        out
+    /// Each user relation's own `Table` plus its index tables. System families
+    /// are excluded, so a forked worker cannot flush its inherited copy.
+    fn collect_user_tables(&mut self) -> impl Iterator<Item = &mut Table> {
+        self.tables
+            .values_mut()
+            .filter(|e| e.kind != RelationKind::SystemCatalog)
+            .flat_map(|e| {
+                e.store
+                    .table_mut()
+                    .into_iter()
+                    .chain(e.indexes.iter_mut().filter_map(|ix| ix.store.table_mut()))
+            })
     }
 
-    /// The system families' stores, all borrowed at once. The complement of
-    /// [`Self::collect_base_flush_tables`], on the same kind test.
-    fn collect_system_flush_tables(&mut self) -> Vec<&mut Table> {
+    /// The system families' stores: the complement of [`Self::collect_user_tables`].
+    fn collect_system_tables(&mut self) -> impl Iterator<Item = &mut Table> {
         self.tables
             .values_mut()
             .filter(|e| e.kind == RelationKind::SystemCatalog)
             .filter_map(|e| e.store.table_mut())
-            .collect()
-    }
-
-    /// The rederived stores the ephemeral round force-persists. A compiled view's
-    /// operator-trace tables are the DBSP layer's half of the round and go durable
-    /// first, so an output manifest at a generation implies its traces are too.
-    fn collect_ephemeral_output_tables(&mut self) -> Vec<&mut Table> {
-        self.collect_base_flush_tables()
-            .into_iter()
-            .filter(|t| t.is_rederived())
-            .collect()
     }
 
     // ── The checkpoint rounds ───────────────────────────────────────────
 
-    /// The base round: every user store this process owns and every secondary
-    /// index beneath it, in **one** barrier — a per-table loop would build an
-    /// io_uring and force a journal commit per table.
+    /// The base round: every user store that is not rederived, in one barrier.
     pub fn checkpoint_base(&mut self) -> Result<(), StoreError> {
-        crate::storage::flush_barrier(self.collect_base_flush_tables(), crate::storage::FlushRound::Base)
+        crate::storage::flush_barrier(self.collect_user_tables().filter(|t| !t.is_rederived()), 0)
             .map_err(|e| StoreError::storage("base flush", e))
     }
 
     /// The system round: every system family's store, in one barrier.
     pub fn checkpoint_system(&mut self) -> Result<(), StoreError> {
-        crate::storage::flush_barrier(self.collect_system_flush_tables(), crate::storage::FlushRound::Base)
+        crate::storage::flush_barrier(self.collect_system_tables(), 0)
             .map_err(|e| StoreError::storage("system catalog flush", e))
     }
 
     /// The ephemeral round at the resume generation: `state`'s operator traces,
-    /// then this registry's rederived output stores, in two barriers — so an
-    /// output manifest implies its view's traces are already durable.
+    /// then the rederived stores, so an output manifest implies durable traces.
     pub fn checkpoint_ephemeral<'s>(
         &mut self,
         state: impl IntoIterator<Item = &'s mut crate::relation::CircuitState>,
     ) -> Result<(), StoreError> {
-        let round = crate::storage::FlushRound::Ephemeral(self.resume_generation);
-        let traces: Vec<&mut Table> = state.into_iter().flat_map(|s| s.tables_mut()).collect();
-        crate::storage::flush_barrier(traces, round).map_err(|e| StoreError::storage("ephemeral trace flush", e))?;
-        crate::storage::flush_barrier(self.collect_ephemeral_output_tables(), round)
+        let generation = self.resume_generation;
+        let traces = state.into_iter().flat_map(|s| s.tables_mut());
+        crate::storage::flush_barrier(traces, generation)
+            .map_err(|e| StoreError::storage("ephemeral trace flush", e))?;
+        crate::storage::flush_barrier(self.collect_user_tables().filter(|t| t.is_rederived()), generation)
             .map_err(|e| StoreError::storage("ephemeral output flush", e))
     }
 }

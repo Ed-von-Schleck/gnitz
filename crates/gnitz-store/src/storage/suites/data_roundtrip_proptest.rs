@@ -169,7 +169,7 @@ proptest! {
         let (original, _) = arb_batch(&schema, rows, seed);
 
         table.ingest_owned_batch(original.clone_batch()).unwrap();
-        table.flush().unwrap();
+        if durable { table.flush() } else { table.flush_to_ram() }.unwrap();
 
         let expected = zset_of(&original, &schema);
 

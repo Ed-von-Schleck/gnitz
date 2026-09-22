@@ -55,7 +55,7 @@ fn open_patched(
     let mut data = base.to_vec();
     patch(&mut data);
     std::fs::write(path, &data).unwrap();
-    MappedShard::open(&std::ffi::CString::new(path).unwrap(), schema)
+    MappedShard::open(path, schema)
 }
 
 /// As [`open_patched`], with the descriptive digest re-stamped over `schema`'s
@@ -68,8 +68,7 @@ fn open_patched_restamped(
 ) -> Result<MappedShard, StorageError> {
     open_patched(path, schema, base, |data| {
         patch(data);
-        let cpath = std::ffi::CString::new(path).unwrap();
-        let cs = desc_digest(&cpath, &data[..desc_len(schema.num_payload_cols())]);
+        let cs = desc_digest(path, &data[..desc_len(schema.num_payload_cols())]);
         write_u64_le(data, OFF_DESC_CHECKSUM, cs);
     })
 }
@@ -92,9 +91,8 @@ fn open_and_read() {
     let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64 * 100)).collect();
     let path = build_test_shard(dir.path(), &rows);
     let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
 
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
     assert_eq!(shard.count, 10);
     assert_eq!(shard.get_pk(0), 1);
     assert_eq!(shard.get_pk(9), 10);
@@ -107,9 +105,8 @@ fn binary_search() {
     let rows: Vec<(u64, i64)> = (1..=100).map(|i| (i * 2, i as i64)).collect();
     let path = build_test_shard(dir.path(), &rows);
     let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
 
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
 
     // Present keys, absent keys, and both ends, against a linear scan.
     for probe in [0u64, 1, 3, 10, 100, 200, 201, u64::MAX] {
@@ -130,9 +127,8 @@ fn pk_and_payload_addressing() {
     let rows = vec![(1u64, 42i64), (2, 84)];
     let path = build_test_shard(dir.path(), &rows);
     let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
 
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
 
     // PK column holds OPK (big-endian) bytes at rest.
     assert_eq!(u64::from_be_bytes(shard.get_pk_bytes(0).try_into().unwrap()), 1);
@@ -162,8 +158,7 @@ fn open_widened(dir: &std::path::Path, name: &str, rows: &[(u64, i64)], tail: Ty
     let wts: Vec<i64> = rows.iter().map(|_| 1i64).collect();
     let vals: Vec<i64> = rows.iter().map(|&(_, v)| v).collect();
     let path = build_test_shard_weights(dir, name, &pks, &wts, &vals, false);
-    let cpath = std::ffi::CString::new(path).unwrap();
-    MappedShard::open(&cpath, &schema_with_appended(tail)).unwrap()
+    MappedShard::open(&path, &schema_with_appended(tail)).unwrap()
 }
 
 #[test]
@@ -176,7 +171,7 @@ fn file_npc_header_roundtrip() {
 
     // A shard read back at the width it was written pays nothing.
     let schema = make_schema_u64_i64();
-    let shard = MappedShard::open(&std::ffi::CString::new(path).unwrap(), &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
     assert_eq!(shard.null_pad_mask, 0);
     assert_eq!(shard.col_regions.len(), 1);
 }
@@ -283,11 +278,11 @@ fn shard_wider_than_reader_schema_opens() {
     let rows: Vec<_> = (1u64..=3)
         .map(|p| (p.to_be_bytes().to_vec(), 1, 0, vec![p as i64 * 10, p as i64 * 11]))
         .collect();
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    write_i64_shard(&cpath, &wide, &rows, &[], ShardWriteOpts::default());
+    let shard_path = path.to_str().unwrap().to_owned();
+    write_i64_shard(&shard_path, &wide, &rows, &[], ShardWriteOpts::default());
 
     let narrow = make_schema_u64_i64();
-    let shard = MappedShard::open(&cpath, &narrow).unwrap();
+    let shard = MappedShard::open(&shard_path, &narrow).unwrap();
     // Every column the reader's schema names is served; the surplus directory
     // entry is left unmapped and needs no pad.
     assert_eq!(shard.col_regions.len(), 1);
@@ -334,15 +329,15 @@ fn a_widened_all_pk_shard_is_not_a_skeleton() {
         ],
         &[0],
     );
-    let cpath = std::ffi::CString::new(dir.path().join("allpk.db").to_str().unwrap()).unwrap();
+    let shard_path = dir.path().join("allpk.db").to_str().unwrap().to_owned();
     write_i64_shard(
-        &cpath,
+        &shard_path,
         &all_pk,
         &[(1u64.to_be_bytes().to_vec(), 1, 0, vec![])],
         &[],
         ShardWriteOpts::default(),
     );
-    let shard = MappedShard::open(&cpath, &widened).unwrap();
+    let shard = MappedShard::open(&shard_path, &widened).unwrap();
     assert!(gnitz_wire::null_word_get(shard.get_null_word(0), 0));
     assert!(!shard.is_skeleton());
 }
@@ -353,11 +348,7 @@ fn skeleton_flag_is_covered_by_the_digest() {
     let path = build_test_shard(dir.path(), &[(1u64, 42i64)]);
     let schema = make_schema_u64_i64();
     let base = std::fs::read(&path).unwrap();
-    assert!(
-        !MappedShard::open(&std::ffi::CString::new(path.as_str()).unwrap(), &schema)
-            .unwrap()
-            .is_skeleton()
-    );
+    assert!(!MappedShard::open(&path, &schema).unwrap().is_skeleton());
 
     let forge = |d: &mut Vec<u8>| write_u64_le(d, OFF_FLAGS, SHARD_FLAG_SKELETON);
     assert_eq!(
@@ -376,14 +367,13 @@ fn rebind_matches_a_fresh_open() {
     let pks: Vec<u64> = (0..n as u64).collect();
     let vals: Vec<i64> = (0..n as i64).map(|i| 90_000 + (i % 150)).collect();
     let path = build_i64_shard(dir.path(), "rebind.db", &pks, &vals, true);
-    let cpath = std::ffi::CString::new(path).unwrap();
-    let narrow = MappedShard::open(&cpath, &make_schema_u64_i64()).unwrap();
+    let narrow = MappedShard::open(&path, &make_schema_u64_i64()).unwrap();
     // Decode the packed column on the narrow handle first.
     assert_eq!(read_i64_le(narrow.get_col_ptr(0, 0, 8), 0), vals[0]);
 
     let wide = schema_with_appended(TypeCode::I64);
     let rebound = narrow.rebind(&wide).unwrap();
-    let fresh = MappedShard::open(&cpath, &wide).unwrap();
+    let fresh = MappedShard::open(&path, &wide).unwrap();
     assert!(std::rc::Rc::ptr_eq(&narrow.mmap, &rebound.mmap));
     assert!(matches!(&rebound.col_regions[0], PayloadRegion::Packed(p) if p.decoded.get().is_none()));
     assert!(matches!(rebound.col_regions[1], PayloadRegion::Mapped(cp) if std::ptr::eq(cp.base, ZERO_CELL.as_ptr())));
@@ -428,18 +418,17 @@ fn checksum_validation() {
     let rows = vec![(1u64, 10i64)];
     let path = build_test_shard(dir.path(), &rows);
     let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
 
-    assert_eq!(MappedShard::open(&cpath, &schema).unwrap().verify_body(), Ok(()));
+    assert_eq!(MappedShard::open(&path, &schema).unwrap().verify_body(), Ok(()));
 
     // Open leaves the body unchecked.
-    let path_str = cpath.to_str().unwrap();
+    let path_str = path.as_str();
     let mut data = std::fs::read(path_str).unwrap();
     let pk_off = region_offset(&data, REG_PK);
     data[pk_off] ^= 0xFF;
     std::fs::write(path_str, &data).unwrap();
 
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
     assert_eq!(shard.verify_body(), Err(StorageError::Corrupt("body checksum")));
 }
 
@@ -466,9 +455,8 @@ fn constant_weight_roundtrip() {
     let vals: Vec<i64> = (1..=n).map(|i| i as i64 * 10).collect();
     let path = build_test_shard_weights(dir.path(), "const_w.db", &pks, &wts, &vals, false);
     let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path.clone()).unwrap();
 
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
     assert_eq!(shard.count, n as usize);
     for i in 0..n as usize {
         assert_eq!(shard.get_weight(i), 1);
@@ -489,9 +477,8 @@ fn two_value_weight_roundtrip() {
     let vals: Vec<i64> = (0..n).map(|i| i as i64 * 10).collect();
     let path = build_test_shard_weights(dir.path(), "twoval_w.db", &pks, &wts, &vals, false);
     let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
 
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
     assert_eq!(shard.count, n);
     for i in 0..n {
         let expected = if i % 2 == 0 { 1i64 } else { -1i64 };
@@ -507,9 +494,8 @@ fn three_value_weight_raw() {
     let vals: Vec<i64> = vec![10, 20, 30];
     let path = build_test_shard_weights(dir.path(), "raw_w.db", &pks, &wts, &vals, false);
     let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
 
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
     assert_eq!(shard.get_weight(0), 1);
     assert_eq!(shard.get_weight(1), -1);
     assert_eq!(shard.get_weight(2), 2);
@@ -521,9 +507,8 @@ fn constant_null_bmp() {
     let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64)).collect();
     let path = build_test_shard(dir.path(), &rows);
     let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
 
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
     for i in 0..10 {
         assert_eq!(shard.get_null_word(i), 0);
     }
@@ -538,9 +523,8 @@ fn constant_payload_column() {
     let vals: Vec<i64> = vec![42; n as usize]; // all same
     let path = build_test_shard_weights(dir.path(), "const_col.db", &pks, &wts, &vals, false);
     let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
 
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
     for i in 0..n as usize {
         // Every row reads the region's single element (stride 0).
         assert_eq!(read_i64_le(shard.get_col_ptr(i, 0, 8), 0), 42);
@@ -590,9 +574,8 @@ fn single_row_shard() {
     let rows: Vec<(u64, i64)> = vec![(42, 999)];
     let path = build_test_shard(dir.path(), &rows);
     let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
 
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
     assert_eq!(shard.count, 1);
     assert_eq!(shard.get_pk(0), 42);
     assert_eq!(shard.get_weight(0), 1);
@@ -607,9 +590,8 @@ fn whole_shard_slice_roundtrip() {
     let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64 * 100)).collect();
     let path = build_test_shard(dir.path(), &rows);
     let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
 
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
     let batch = shard.slice_to_owned_batch(0, shard.count, &schema);
 
     assert_eq!(batch.count, 10);
@@ -632,9 +614,8 @@ fn whole_shard_slice_constant_regions() {
     let vals: Vec<i64> = vec![42; n as usize]; // constant payload
     let path = build_test_shard_weights(dir.path(), "const_batch.db", &pks, &wts, &vals, false);
     let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
 
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
     let batch = shard.slice_to_owned_batch(0, shard.count, &schema);
 
     assert_eq!(batch.count, n as usize);
@@ -654,9 +635,8 @@ fn whole_shard_slice_two_value_weight() {
     let vals: Vec<i64> = (0..n).map(|i| i as i64 * 10).collect();
     let path = build_test_shard_weights(dir.path(), "twoval_batch.db", &pks, &wts, &vals, false);
     let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
 
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
     let batch = shard.slice_to_owned_batch(0, shard.count, &schema);
 
     assert_eq!(batch.count, n);
@@ -673,9 +653,8 @@ fn slice_to_owned_batch_with_offset() {
     let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64 * 100)).collect();
     let path = build_test_shard(dir.path(), &rows);
     let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
 
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
 
     // Slice rows 3..7 (0-indexed: PKs 4,5,6,7)
     let batch = shard.slice_to_owned_batch(3, 4, &schema);
@@ -692,9 +671,8 @@ fn slice_to_owned_batch_empty() {
     let rows: Vec<(u64, i64)> = (1..=5).map(|i| (i, i as i64)).collect();
     let path = build_test_shard(dir.path(), &rows);
     let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
 
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
     let batch = shard.slice_to_owned_batch(0, 0, &schema);
     assert_eq!(batch.count, 0);
 }
@@ -705,9 +683,8 @@ fn u64_pk_open_and_read() {
     let rows: Vec<(u64, i64)> = vec![(10, 100), (20, 200), (30, 300)];
     let path = build_test_shard(dir.path(), &rows);
     let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
 
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
     assert_eq!(shard.pk_stride, 8, "pk_stride must be 8 for U64 schema");
     assert_eq!(shard.count, 3);
     assert_eq!(shard.get_pk(0), 10u128);
@@ -724,9 +701,8 @@ fn u64_pk_slice_to_owned_batch() {
     let rows: Vec<(u64, i64)> = (1u64..=8).map(|i| (i * 10, i as i64 * 100)).collect();
     let path = build_test_shard(dir.path(), &rows);
     let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
 
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
     let batch = shard.slice_to_owned_batch(0, 8, &schema);
 
     assert_eq!(batch.count, 8);
@@ -755,8 +731,8 @@ fn build_test_shard_u128(dir: &std::path::Path, name: &str, pks: &[u128], vals: 
         .zip(vals)
         .map(|(&p, &v)| (p.to_be_bytes().to_vec(), 1, 0, vec![v]))
         .collect();
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    write_i64_shard(&cpath, &u128_pk_schema(), &rows, &[], ShardWriteOpts::default());
+    let shard_path = path.to_str().unwrap().to_owned();
+    write_i64_shard(&shard_path, &u128_pk_schema(), &rows, &[], ShardWriteOpts::default());
     path.to_str().unwrap().to_string()
 }
 
@@ -783,8 +759,7 @@ fn get_pk_bytes_returns_the_opk_image_for_every_region_shape() {
         let vals: Vec<i64> = (0..pks.len() as i64).collect();
         let path = build_test_shard_u128(dir.path(), &format!("{what}.db"), &pks, &vals);
         let schema = u128_pk_schema();
-        let cpath = std::ffi::CString::new(path).unwrap();
-        let shard = MappedShard::open(&cpath, &schema).unwrap();
+        let shard = MappedShard::open(&path, &schema).unwrap();
 
         assert_eq!(shard.pk.stride != 0, per_row, "{what}: region shape");
         assert_eq!(shard.pk_stride, 16, "{what}: stride");
@@ -836,9 +811,9 @@ fn find_lower_bound_bytes_wide_pk_distinct() {
     ];
     let rows: Vec<_> = pks.iter().map(|r| (r.to_vec(), 1, 0, vec![])).collect();
     let path = dir.path().join("wide_pk.db");
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    write_i64_shard(&cpath, &schema, &rows, &[], ShardWriteOpts::default());
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard_path = path.to_str().unwrap().to_owned();
+    write_i64_shard(&shard_path, &schema, &rows, &[], ShardWriteOpts::default());
+    let shard = MappedShard::open(&shard_path, &schema).unwrap();
     assert_eq!(shard.pk_stride, 24);
     assert!(shard.pk.stride != 0, "distinct PKs must keep the PK region per-row");
 
@@ -892,10 +867,8 @@ fn packed_roundtrip_all_surfaces() {
         ENCODING_RAW
     );
 
-    let pc = std::ffi::CString::new(packed_path).unwrap();
-    let rc = std::ffi::CString::new(raw_path).unwrap();
-    let packed = MappedShard::open(&pc, &schema).unwrap();
-    let raw = MappedShard::open(&rc, &schema).unwrap();
+    let packed = MappedShard::open(&packed_path, &schema).unwrap();
+    let raw = MappedShard::open(&raw_path, &schema).unwrap();
     assert!(matches!(packed.col_regions[0], PayloadRegion::Packed(_)));
     assert!(matches!(raw.col_regions[0], PayloadRegion::Mapped(_)));
 
@@ -969,10 +942,10 @@ fn packed_i32_mid_shard_slice() {
             b.extend_col(0, &(-70_000i32 + (i % 250) as i32).to_le_bytes());
             b.commit_row(0);
         }
-        let cpath = std::ffi::CString::new(dir.path().join(name).to_str().unwrap()).unwrap();
-        b.write_as_shard(&cpath, ShardWriteOpts { pack_ints: pack, ..Default::default() })
+        let shard_path = dir.path().join(name).to_str().unwrap().to_owned();
+        b.write_as_shard(&shard_path, ShardWriteOpts { pack_ints: pack, ..Default::default() })
             .unwrap();
-        MappedShard::open(&cpath, &schema).unwrap()
+        MappedShard::open(&shard_path, &schema).unwrap()
     };
     let packed = write("packed32.db", true);
     let raw = write("raw32.db", false);
@@ -1025,8 +998,7 @@ fn packed_bytes_stable() {
     let pks: Vec<u64> = (0..300).collect();
     let vals: Vec<i64> = (0..300).map(|i| 500 + (i % 100)).collect();
     let path = build_i64_shard(dir.path(), "stable.db", &pks, &vals, true);
-    let cpath = std::ffi::CString::new(path).unwrap();
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
     assert!(matches!(shard.col_regions[0], PayloadRegion::Packed(_)));
 
     let p1 = shard.get_col_ptr(0, 0, 8).as_ptr();
@@ -1086,9 +1058,8 @@ fn checksum_catches_corrupted_packed_region() {
     let roff = region_offset(&data, REG_PAYLOAD_START);
     data[roff + 16] ^= 0xFF; // past the 8-byte ref, into the offset bytes
     std::fs::write(&path, &data).unwrap();
-    let cpath = std::ffi::CString::new(path).unwrap();
     assert_eq!(
-        MappedShard::open(&cpath, &schema).unwrap().verify_body(),
+        MappedShard::open(&path, &schema).unwrap().verify_body(),
         Err(StorageError::Corrupt("body checksum")),
         "corrupted packed region caught by verify_body",
     );
@@ -1114,19 +1085,14 @@ fn write_string_shard(dir: &std::path::Path, name: &str, rows: &[(u64, [u8; 16])
         batch.count += 1;
     }
     let path = dir.join(name).to_str().unwrap().to_string();
-    batch
-        .write_as_shard(
-            &std::ffi::CString::new(path.as_str()).unwrap(),
-            ShardWriteOpts::default(),
-        )
-        .unwrap();
+    batch.write_as_shard(&path, ShardWriteOpts::default()).unwrap();
     path
 }
 
 /// Open a `(U64 PK | STRING payload)` shard written by [`write_string_shard`].
 fn open_string_shard(path: &str) -> MappedShard {
     let schema = make_schema_pk_u64_payload_string();
-    MappedShard::open(&std::ffi::CString::new(path).unwrap(), &schema).unwrap()
+    MappedShard::open(path, &schema).unwrap()
 }
 
 /// One distinct heap string per row — the blob-region shape the fixed-size
@@ -1353,7 +1319,7 @@ fn a_filterless_shard_has_an_empty_trailing_entry() {
     let schema = make_schema_u64_i64();
     let path = dir.path().join("nofilter.db");
     let rows = vec![(1u64.to_be_bytes().to_vec(), 1, 7)];
-    let cpath = super::super::shard_file::write_test_shard(
+    let shard_path = super::super::shard_file::write_test_shard(
         &path,
         &schema,
         &rows,
@@ -1367,7 +1333,7 @@ fn a_filterless_shard_has_an_empty_trailing_entry() {
         region_dir(&image, num_regions(schema.num_payload_cols())),
         (0, ENCODING_RAW)
     );
-    let shard = MappedShard::open(&cpath, &schema).unwrap();
+    let shard = MappedShard::open(&shard_path, &schema).unwrap();
     assert!(!shard.has_shard_filter());
     assert_eq!(shard.verify_body(), Ok(()));
 }
@@ -1382,7 +1348,7 @@ fn the_digest_seed_separates_names_not_directories() {
     let schema = make_schema_u64_i64();
     let rows: Vec<(u64, i64)> = (1..=4).map(|i| (i, i as i64)).collect();
     let path = build_test_shard(dir.path(), &rows);
-    let open = |p: &std::path::Path| MappedShard::open(&std::ffi::CString::new(p.to_str().unwrap()).unwrap(), &schema);
+    let open = |p: &std::path::Path| MappedShard::open(p.to_str().unwrap(), &schema);
 
     let sibling = dir.path().join("child");
     std::fs::create_dir(&sibling).unwrap();
@@ -1409,8 +1375,8 @@ fn sweep_shapes(dir: &std::path::Path) -> Vec<(&'static str, String, SchemaDescr
     // reader derives from the schema and checks the prefix length against.
     let all_pk = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false)], &[0]);
     let pk_only: Vec<_> = seq.iter().map(|&p| (p.to_be_bytes().to_vec(), 1, 0, vec![])).collect();
-    let cpath = std::ffi::CString::new(dir.join("sw_pkonly.db").to_str().unwrap()).unwrap();
-    write_i64_shard(&cpath, &all_pk, &pk_only, &[], ShardWriteOpts::default());
+    let shard_path = dir.join("sw_pkonly.db").to_str().unwrap().to_owned();
+    write_i64_shard(&shard_path, &all_pk, &pk_only, &[], ShardWriteOpts::default());
 
     vec![
         // One row: a repeated PK is not a consolidated run, so that is the only
@@ -1439,7 +1405,7 @@ fn sweep_shapes(dir: &std::path::Path) -> Vec<(&'static str, String, SchemaDescr
             build_string_shard(dir, "sw_string.db", 24, 48),
             make_schema_pk_u64_payload_string(),
         ),
-        ("all-pk (4 regions)", cpath.to_str().unwrap().to_string(), all_pk),
+        ("all-pk (4 regions)", shard_path, all_pk),
     ]
 }
 

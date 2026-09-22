@@ -93,7 +93,7 @@ fn a_flag_clear_arg1_names_no_index() {
     }
 }
 
-/// An index store is rederived, so a base round only folds it to RAM; the
+/// An index store is rederived, so the base round never visits it; the
 /// ephemeral round is what force-persists it, index circuits included.
 #[test]
 fn ephemeral_flush_includes_index_circuits() {

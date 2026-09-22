@@ -119,8 +119,9 @@ fn write_fat_shard(dir: &std::path::Path, name: &str, base: u64, n: u64, width: 
         b.count += 1;
     }
     let path = dir.join(name);
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    b.write_as_shard(&cpath, shard_file::ShardWriteOpts::default()).unwrap();
+    let shard_path = path.to_str().unwrap().to_owned();
+    b.write_as_shard(&shard_path, shard_file::ShardWriteOpts::default())
+        .unwrap();
     path.to_str().unwrap().to_string()
 }
 

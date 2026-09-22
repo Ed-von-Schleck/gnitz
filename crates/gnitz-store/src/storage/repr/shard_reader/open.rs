@@ -5,7 +5,6 @@
 //! Opening verifies the header and directory; the body is verified only by
 //! [`MappedShard::verify_body`].
 
-use std::ffi::CStr;
 use std::io::ErrorKind;
 use std::rc::Rc;
 
@@ -44,8 +43,8 @@ fn direct_region(data: &[u8], span: &Span, count: usize, width: usize) -> Result
 }
 
 impl MappedShard {
-    pub(crate) fn open(path: &CStr, schema: &SchemaDescriptor) -> Result<Self, StorageError> {
-        let mmap = Mmap::open_ro(path).map_err(|e| match e.kind() {
+    pub(crate) fn open(path: &str, schema: &SchemaDescriptor) -> Result<Self, StorageError> {
+        let mmap = Mmap::open_ro(std::path::Path::new(path)).map_err(|e| match e.kind() {
             ErrorKind::UnexpectedEof => Corrupt("empty file"),
             _ => e.into(),
         })?;

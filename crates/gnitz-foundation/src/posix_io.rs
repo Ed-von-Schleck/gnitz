@@ -2,8 +2,6 @@
 //! every call here returns `io::Result`, so the errno is captured at the
 //! syscall and no caller has to read it back out of ambient state.
 
-use std::os::fd::{FromRawFd, OwnedFd};
-
 use libc::c_int;
 
 /// Retry a raw syscall until it succeeds (`>= 0`) or fails with an error other
@@ -20,31 +18,6 @@ pub fn retry_eintr(mut f: impl FnMut() -> c_int) -> std::io::Result<c_int> {
             return Err(err);
         }
     }
-}
-
-/// `libc::openat` returning an `OwnedFd`.
-pub fn openat_owned(dirfd: c_int, name: &std::ffi::CStr, flags: c_int) -> std::io::Result<OwnedFd> {
-    let fd = unsafe { libc::openat(dirfd, name.as_ptr(), flags, 0o644 as libc::mode_t) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: fresh descriptor from `openat`; the `OwnedFd` is the sole closer.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// `libc::open` returning an `OwnedFd`, the `AT_FDCWD` case of [`openat_owned`].
-pub fn open_owned(path: &std::ffi::CStr, flags: c_int) -> std::io::Result<OwnedFd> {
-    openat_owned(libc::AT_FDCWD, path, flags)
-}
-
-/// `libc::renameat`, with the errno captured before any cleanup the caller
-/// runs on the failure path can overwrite it.
-pub fn renameat(olddirfd: c_int, old: &std::ffi::CStr, newdirfd: c_int, new: &std::ffi::CStr) -> std::io::Result<()> {
-    let rc = unsafe { libc::renameat(olddirfd, old.as_ptr(), newdirfd, new.as_ptr()) };
-    if rc < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// Raise the `RLIMIT_NOFILE` soft limit towards `target`, capped by the hard
@@ -197,13 +170,14 @@ impl Mmap {
     }
 
     /// Open `path` read-only and mmap the whole (non-empty) file.
-    pub fn open_ro(path: &std::ffi::CStr) -> std::io::Result<Self> {
-        let fd = open_owned(path, libc::O_RDONLY)?;
-        let len = fd_size(std::os::fd::AsRawFd::as_raw_fd(&fd))?;
+    pub fn open_ro(path: &std::path::Path) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        let len = fd_size(fd)?;
         if len == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
         }
-        let map = Self::from_fd(std::os::fd::AsRawFd::as_raw_fd(&fd), len)?;
+        let map = Self::from_fd(fd, len)?;
         madvise_hugepage(map.ptr, map.len);
         Ok(map)
     }

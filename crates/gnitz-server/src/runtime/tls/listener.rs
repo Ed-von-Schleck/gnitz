@@ -82,7 +82,7 @@ pub(crate) fn setup_tls_listener(data_dir: &str, cli: &TlsCli) -> Result<TlsList
     let (config, dev_pem) = super::config::server_crypto(cert_key, cli.client_ca.as_deref())?;
     if let Some(pem) = dev_pem {
         let path = format!("{data_dir}/tls_dev_cert.pem");
-        gnitz_store::storage::publish_file_sync(data_dir, "tls_dev_cert.pem", &[pem.as_bytes()])
+        gnitz_store::storage::publish_file_sync(data_dir, "tls_dev_cert.pem", pem.as_bytes())
             .map_err(|e| format!("failed to publish {path}: {e}"))?;
         gnitz_info!(
             "TLS: minted a self-signed dev certificate (identity is ephemeral, regenerated every boot); \
@@ -110,7 +110,7 @@ pub(crate) fn setup_tls_listener(data_dir: &str, cli: &TlsCli) -> Result<TlsList
     let bound = listener
         .local_addr()
         .map_err(|e| format!("failed to read the bound TLS address: {e}"))?;
-    gnitz_store::storage::publish_file_sync(data_dir, "tls_endpoint", &[format!("{bound}\n").as_bytes()])
+    gnitz_store::storage::publish_file_sync(data_dir, "tls_endpoint", format!("{bound}\n").as_bytes())
         .map_err(|e| format!("failed to publish {data_dir}/tls_endpoint: {e}"))?;
     gnitz_info!("Listening on tls://{}", bound);
     // A deliberately-unauthenticated non-loopback bind (escape hatch, no CA)

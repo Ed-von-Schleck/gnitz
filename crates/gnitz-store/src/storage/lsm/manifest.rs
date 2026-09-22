@@ -119,8 +119,8 @@ pub(crate) fn read(dir: &str) -> Result<Option<Manifest>, StorageError> {
 /// Stage `bytes` (an [`encode`]d manifest) as `dir`'s manifest. Does NOT
 /// fdatasync or rename.
 pub(crate) fn prepare(dir: &str, bytes: &[u8]) -> Result<StagedFile, StorageError> {
-    let staged = StagedFile::create(&super::cstr(path(dir))?)?;
-    staged.file().write_all_at(bytes, 0)?;
+    let (staged, file) = StagedFile::create(&path(dir))?;
+    file.write_all_at(bytes, 0)?;
     Ok(staged)
 }
 

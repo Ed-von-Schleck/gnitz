@@ -13,7 +13,7 @@ use std::fs;
 use super::batch::{Batch, Layout};
 use super::child_dir::{cluster_children, remove_child, subdir_names, ChildAddr, ChildKind, Slot};
 use super::error::{StorageError, StoreError};
-use super::flush_barrier::{flush_barrier, FlushRound};
+use super::flush_barrier::flush_barrier;
 use super::manifest;
 use super::read_cursor;
 use super::table::{RecoverySource, StoreBudgets, Table};
@@ -168,7 +168,7 @@ fn rewrite_targets(
             write_run(target, buffer)?;
         }
     }
-    flush_barrier(targets.iter_mut(), FlushRound::Base)
+    flush_barrier(targets.iter_mut(), 0)
 }
 
 /// `run` is ascending subsets of one consolidated cursor, appended in cursor

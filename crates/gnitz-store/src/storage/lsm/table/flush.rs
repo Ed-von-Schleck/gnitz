@@ -1,31 +1,20 @@
-//! Two-phase flush state machine for [`Table`].
-//!
-//! The flush/spill path carved off `Table`'s ingest/cursor/lookup surface: the
-//! ingest-overflow fold and its ceiling spill, the barrier's prepare/commit pair
-//! and the synchronous `flush` wrapper that drives one table through it, and the
-//! shard commit both the spill and the barrier share. `Table`'s fields are read
-//! directly here — `flush` is a child module of the `table` module that defines
-//! the struct.
+//! [`Table`]'s flush path: the overflow fold and spill, and the barrier's prepare/commit.
 
-use std::os::fd::OwnedFd;
+use std::path::Path;
 use std::rc::Rc;
 
 use super::super::batch::Batch;
 use super::super::error::StorageError;
-use super::super::flush_barrier::FlushRound;
 use super::super::manifest;
 use super::super::shard_file;
 use super::{FlushWork, Table};
 
 impl Table {
-    /// Synchronous flush of this one table through the shared barrier. It runs a
-    /// **base** round, so a `Rederive` table only folds into the RAM tier; a
-    /// `SalReplay` table folds memtable + RAM tier into one shard, syncs it and
-    /// the staged manifest, renames the manifest into place, fsyncs the
-    /// directory, and drains its deferred compaction cleanup.
+    /// The base round's barrier over this one table.
     #[cfg(test)]
     pub(crate) fn flush(&mut self) -> Result<(), StorageError> {
-        super::super::flush_barrier::flush_barrier([&mut *self], FlushRound::Base)
+        assert!(!self.is_rederived(), "the base round never visits a rederived table");
+        super::super::flush_barrier::flush_barrier([&mut *self], 0)
     }
 
     // ------------------------------------------------------------------
@@ -42,21 +31,8 @@ impl Table {
         self.memtable.clear();
     }
 
-    /// The ingest-overflow path for **every** table: fold the memtable into the
-    /// RAM tier, and spill that tier only if folding it to net state leaves it
-    /// still over the ceiling — churn routinely cancels back under. Durability
-    /// lives in the fsynced SAL until a barrier writes the durable shard, so
-    /// nothing here touches disk unless the ceiling really is breached.
-    ///
-    /// Spills are written **unsynced** and register as owing a sweep: a
-    /// `SalReplay` table's are fdatasync'd by the next barrier, a `Rederive`
-    /// table's by the ephemeral round, and the latter are erased and rebuilt at
-    /// open if no round reaches them.
-    ///
-    /// A spilled table then holds disk runs *and* heap runs, and churn across the
-    /// two never cancels — the RAM-tier fold is heap-only, `run_compact` is
-    /// disk-only. That costs disk footprint, not heap (which stays ≤ the ceiling
-    /// by construction), and the disk tier still self-compacts.
+    /// Fold the memtable into the RAM tier, spilling the tier to an unsynced
+    /// shard only if its net state is still over the ceiling.
     pub(crate) fn flush_to_ram(&mut self) -> Result<(), StorageError> {
         self.fold_memtable_into_ram_tier();
         if !self.ram_tier.is_full() {
@@ -75,72 +51,57 @@ impl Table {
     // Barrier / durable flush (two-phase)
     // ------------------------------------------------------------------
 
-    /// Phase 1 of the barrier flush: fold the memtable into the RAM tier, commit
-    /// one folded net-state shard, and stage the manifest unless it is the one
-    /// this process last made durable. The barrier fdatasyncs every unsynced
-    /// file; `flush_commit` renames the manifest.
-    ///
-    /// A rederived table on the base round only folds to RAM: a `Rederive` open
-    /// would resume from the generation-0 manifest it would publish.
-    pub(in crate::storage) fn flush_prepare(&mut self, round: FlushRound) -> Result<Option<FlushWork>, StorageError> {
-        if matches!(round, FlushRound::Base) && self.is_rederived() {
-            self.flush_to_ram()?;
-            return Ok(None);
-        }
-
+    /// Fold memtable and RAM tier into one shard and stage the manifest naming
+    /// it; `None` when that manifest is the one this process last made durable.
+    pub(in crate::storage) fn flush_prepare(&mut self, checkpoint_gen: u64) -> Result<Option<FlushWork>, StorageError> {
         // Fold-first, then one shard.
         self.fold_memtable_into_ram_tier();
         if let Some(run) = self.ram_tier.fold_to_single(&self.shard_index.schema) {
             self.persist_ram_tier(run)?;
         }
-        let bytes = manifest::encode(&self.shard_index.manifest(round.checkpoint_gen()));
-        let first_publish = self.durable_manifest.is_none();
-        self.durable_manifest.take_if(|durable| *durable != bytes);
-        if self.durable_manifest.is_some() {
+        let bytes = manifest::encode(&self.shard_index.manifest(checkpoint_gen));
+        if self.durable_manifest.as_deref() == Some(&bytes[..]) {
             debug_assert!(
-                self.shard_index.unsynced_paths().next().is_none(),
+                self.unsynced_paths().next().is_none(),
                 "a durable manifest names an unsynced shard"
             );
             return Ok(None);
         }
-        let sync_paths = super::super::to_cstrings(self.shard_index.unsynced_paths())?;
+        let first_publish = self.durable_manifest.is_none();
+        // Unknown until `published_durably`: a failed publish may have renamed.
+        self.durable_manifest = None;
         let manifest = manifest::prepare(&self.shard_index.output_dir, &bytes)?;
-        let entry_dirs = match first_publish {
-            false => Vec::new(),
-            true => std::path::Path::new(&self.shard_index.output_dir)
-                .ancestors()
-                .skip(1)
-                .take(2)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(std::path::Path::to_path_buf)
-                .collect(),
-        };
-        Ok(Some(FlushWork { sync_paths, manifest, bytes, entry_dirs }))
+        // A first publish also makes the store's and its relation's directory entries durable.
+        let entry_dirs = if first_publish { 2 } else { 0 };
+        let dirs = Path::new(&self.shard_index.output_dir)
+            .ancestors()
+            .take(1 + entry_dirs)
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .collect();
+        Ok(Some(FlushWork { manifest, bytes, dirs }))
     }
 
-    /// Commit the RAM tier's single folded net-state run to disk at its final
-    /// `shard_{lsn}.db` name, register it, drop it from heap, and compact
-    /// if it pushed the disk tier over its threshold. The shared commit point of
-    /// the spill and barrier paths.
-    ///
-    /// The name is unique for this `Table`: `current_lsn` bumps once per batch
-    /// pushed to the memtable and at most one shard is written per push, so a
-    /// directory needs a single writing process.
-    ///
-    /// Transactional. The run is borrowed — not removed — so a write failure
-    /// leaves heap intact for retry with nothing on disk; a registration
-    /// failure unlinks the just-written shard before returning. Heap is cleared
-    /// only once the shard is written and registered.
+    /// Every live shard no published manifest names yet.
+    pub(in crate::storage) fn unsynced_paths(&self) -> impl Iterator<Item = &str> {
+        self.shard_index.unsynced_paths()
+    }
+
+    /// Write the RAM tier's folded run as an unsynced shard and move it from heap
+    /// to the shard index.
     fn persist_ram_tier(&mut self, run: Rc<Batch>) -> Result<(), StorageError> {
         let shard_name = super::super::naming::spill_shard_name(self.current_lsn);
         let lsn_max = self.current_lsn - 1;
         // So a reopen seeds `current_lsn` above every spill name.
         let final_full = format!("{}/{}", self.shard_index.output_dir, shard_name);
-        let full_c = super::super::cstr(final_full.as_str())?;
+        debug_assert!(
+            !Path::new(&final_full).exists(),
+            "a second shard at one LSN would replace the first"
+        );
 
         // Write failed: heap still owns `run`; no on-disk residue.
         run.write_as_shard(
-            &full_c,
+            &final_full,
             // L0 spill/checkpoint shards stay plain (no FoR packing), and carry
             // a PK filter only where something point-probes this store.
             shard_file::ShardWriteOpts {
@@ -161,30 +122,14 @@ impl Table {
         // where the materialized scan stops being a copy of the row set.
         self.cached_full_scan.set(None);
 
-        // The only path that grows L0, so the only place its fan-in can cross
-        // `L0_COMPACT_THRESHOLD`. Publishes no manifest, so a barrier caller
-        // stages one describing the already-compacted index.
         self.compact_if_needed()?;
-
-        // The one capacity trigger, and it sits here rather than inside
-        // `compact_if_needed` because that one's `should_compact` early return
-        // would skip exactly the spills that did not also cross the file-count
-        // threshold. This is the only place a store's shard bytes can grow, so
-        // one trigger covers every store.
         self.shard_index.enforce_capacity()
     }
 
-    /// Phase 2: rename the staged manifest into place. Returns the directory fd
-    /// for the barrier to fsync, and the manifest's bytes.
-    pub(in crate::storage) fn flush_commit(&mut self, work: FlushWork) -> Result<(OwnedFd, Vec<u8>), StorageError> {
-        work.manifest.commit()?;
-
-        // The files the sweep list named were fdatasync'd by the barrier and are
-        // now referenced by the renamed manifest; clear so the next barrier does
-        // not re-sync already-durable files. No concurrent writer: single-threaded
-        // worker, and the master's checkpoint round holds its SAL writer.
+    /// Rename the staged manifest into place, marking every shard it names published.
+    pub(in crate::storage) fn flush_commit(&mut self, manifest: super::super::StagedFile) -> Result<(), StorageError> {
+        manifest.commit()?;
         self.shard_index.clear_unsynced();
-        let dir = std::fs::File::open(&self.shard_index.output_dir)?;
-        Ok((dir.into(), work.bytes))
+        Ok(())
     }
 }

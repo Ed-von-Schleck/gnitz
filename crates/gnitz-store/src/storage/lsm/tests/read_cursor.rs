@@ -677,13 +677,13 @@ pub(super) fn write_test_shard(
         .iter()
         .map(|&(pk, w, v)| (pk.to_be_bytes()[16 - stride..].to_vec(), w, v))
         .collect();
-    let cpath = super::super::shard_file::write_test_shard(
+    let shard_path = super::super::shard_file::write_test_shard(
         &dir.path().join(format!("rc{stride}_{idx}.db")),
         schema,
         &rows,
         super::super::shard_file::ShardWriteOpts::default(),
     );
-    Rc::new(MappedShard::open(&cpath, schema).unwrap())
+    Rc::new(MappedShard::open(&shard_path, schema).unwrap())
 }
 
 /// A `Multi` merge over several *shard* sources folds cross-source weights:
@@ -1095,11 +1095,11 @@ fn bounded_string_read_carries_only_its_own_rows() {
                 bb.put_string(&text(pk));
                 bb.end_row();
             }
-            let cpath = std::ffi::CString::new(dir.path().join(format!("s{s}.db")).to_str().unwrap()).unwrap();
+            let shard_path = dir.path().join(format!("s{s}.db")).to_str().unwrap().to_owned();
             bb.finish()
-                .write_as_shard(&cpath, super::super::shard_file::ShardWriteOpts::default())
+                .write_as_shard(&shard_path, super::super::shard_file::ShardWriteOpts::default())
                 .unwrap();
-            Rc::new(MappedShard::open(&cpath, &schema).unwrap())
+            Rc::new(MappedShard::open(&shard_path, &schema).unwrap())
         })
         .collect();
     assert_eq!(shards[1].blob().len() as u64, PER_SHARD * 40);
@@ -1141,14 +1141,14 @@ fn write_skeleton_shard(
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.count += 1;
     }
-    let cpath = std::ffi::CString::new(dir.join(name).to_str().unwrap()).unwrap();
+    let shard_path = dir.join(name).to_str().unwrap().to_owned();
     b.write_as_shard(
-        &cpath,
+        &shard_path,
         super::super::shard_file::ShardWriteOpts { skeleton: true, ..Default::default() },
     )
     .unwrap();
     // Opened under the *view* schema, which is how every reader sees it.
-    MappedShard::open(&cpath, schema).unwrap()
+    MappedShard::open(&shard_path, schema).unwrap()
 }
 
 /// `(U64 PK | nullable STRING)` — a `PayloadCmpKind::Generic` schema whose

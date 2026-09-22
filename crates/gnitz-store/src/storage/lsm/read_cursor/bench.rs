@@ -64,11 +64,11 @@ fn shard_merge_scan_bench() {
             }
             let batch = bb.finish();
             let path = dir.path().join(format!("ms_{s}.db"));
-            let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let path = path.to_str().unwrap();
             batch
-                .write_as_shard(&cpath, super::super::shard_file::ShardWriteOpts::default())
+                .write_as_shard(path, super::super::shard_file::ShardWriteOpts::default())
                 .unwrap();
-            Rc::new(MappedShard::open(&cpath, &schema).unwrap())
+            Rc::new(MappedShard::open(path, &schema).unwrap())
         })
         .collect();
 
@@ -320,13 +320,13 @@ fn adv_write_shard(
         .zip(weights.iter().zip(vals))
         .map(|(pk, (&w, &v))| (pk.to_vec(), w, v))
         .collect();
-    let cpath = super::super::shard_file::write_test_shard(
+    let shard_path = super::super::shard_file::write_test_shard(
         &dir.path().join(format!("{name}.db")),
         schema,
         &rows,
         super::super::shard_file::ShardWriteOpts::default(),
     );
-    Rc::new(MappedShard::open(&cpath, schema).unwrap())
+    Rc::new(MappedShard::open(&shard_path, schema).unwrap())
 }
 
 /// `n` shards whose keys interleave `[0, total)` round-robin (shard `s` owns keys

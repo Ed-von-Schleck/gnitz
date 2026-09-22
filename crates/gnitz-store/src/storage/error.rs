@@ -16,8 +16,6 @@ pub enum StorageError {
     Io(i32),
     /// An on-disk image failed a check; the reason names which one.
     Corrupt(&'static str),
-    /// CString conversion failed (path contained an interior NUL).
-    InvalidPath,
 }
 
 impl From<std::io::Error> for StorageError {
@@ -35,7 +33,6 @@ impl fmt::Display for StorageError {
             StorageError::Io(0) => f.write_str("io error"),
             StorageError::Io(e) => write!(f, "io error: {}", std::io::Error::from_raw_os_error(*e)),
             StorageError::Corrupt(reason) => write!(f, "corrupt: {reason}"),
-            StorageError::InvalidPath => f.write_str("invalid path"),
         }
     }
 }
