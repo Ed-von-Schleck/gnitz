@@ -170,7 +170,7 @@ impl Peer {
         assert!(self.waits(PATIENCE), "{what}: the poll never arrived");
         let frame = raw_read_frame(&self.0);
         let ctrl = peek_control_block(&frame).expect("a control header");
-        gnitz_wire::txn_frame::decode_delta_poll(&frame, &ctrl)
+        gnitz_wire::txn_frame::decode_delta_poll(&frame[ctrl.body])
             .expect("a delta poll")
             .into_iter()
             .map(|v| v.view_id)

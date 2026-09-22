@@ -40,8 +40,9 @@ pub struct ControlHeader {
 pub struct DecodedControl {
     pub hdr: ControlHeader,
     pub blob: Vec<u8>,
-    /// Header plus blob.
-    pub block_size: usize,
+    /// The bytes after the last declared section — blob, schema record, data
+    /// block — to the end of the frame: a multi-item frame's items.
+    pub body: Range<usize>,
     /// Where the frame's schema block sits in the peeked buffer.
     pub schema: Option<Range<usize>>,
     /// Where the frame's data block sits in the peeked buffer.
@@ -49,13 +50,24 @@ pub struct DecodedControl {
 }
 
 impl DecodedControl {
-    /// The verb a client frame names, refusing a data block on any verb but PUSH:
-    /// only a push carries rows.
+    /// The verb a client frame names, refusing a section that verb does not
+    /// carry.
     pub fn client_verb(&self) -> Result<ClientVerb, &'static str> {
-        if self.data.is_some() && self.hdr.flags.verb != ClientVerb::Push {
+        let verb = self.hdr.flags.verb;
+        if self.data.is_some() && verb != ClientVerb::Push {
             return Err("frame carries a data block on a verb other than PUSH");
         }
-        Ok(self.hdr.flags.verb)
+        let items = matches!(
+            verb,
+            ClientVerb::DdlTxn | ClientVerb::PushTxn | ClientVerb::ScanMulti | ClientVerb::DeltaPoll
+        );
+        if items && (!self.blob.is_empty() || self.schema.is_some()) {
+            return Err("a multi-item frame carries nothing but its items");
+        }
+        if !items && !self.body.is_empty() {
+            return Err("frame carries bytes past its last section");
+        }
+        Ok(verb)
     }
 
     /// The error a non-`Ok` frame carries: its status and its blob as text.
@@ -125,8 +137,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     let status = WireStatus::from_wire(read_u32_le(h, OFF_STATUS)).ok_or("control header names no status")?;
     let word = read_u64_le(h, OFF_FLAGS);
     let flags = WireFlags::unpack(word)?;
-    let block_size = CTRL_HEADER_SIZE + blob_len;
-    let mut off = block_size;
+    let mut off = CTRL_HEADER_SIZE + blob_len;
     let schema = if word & FLAG_HAS_SCHEMA != 0 {
         let r = crate::codec::bytes32_extent(data, off).ok_or("schema record runs past the frame")?;
         off = r.end;
@@ -135,8 +146,9 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         None
     };
     let data_block = if word & FLAG_HAS_DATA != 0 {
-        let len = crate::wal::block_slice_at(data, off)?.len();
-        Some(off..off + len)
+        let start = off;
+        off += crate::wal::block_slice_at(data, off)?.len();
+        Some(start..off)
     } else {
         None
     };
@@ -149,7 +161,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
             arg1: read_u64_le(h, OFF_ARG1),
         },
         blob: blob.to_vec(),
-        block_size,
+        body: off..data.len(),
         schema,
         data: data_block,
     })

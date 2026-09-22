@@ -2,6 +2,7 @@ use super::codec::encode_schema_block;
 use super::types::{Schema, ZSetBatch};
 use super::WireConflictMode;
 use gnitz_wire::control::{encode_frame_head, frame_head_size, ControlHeader};
+use gnitz_wire::txn_frame::PushTxnItem;
 use gnitz_wire::wal::WalBlock;
 
 /// One frame payload, without the 4-byte length prefix. An empty batch ships no
@@ -21,17 +22,33 @@ pub fn encode_frame(hdr: ControlHeader, blob: &[u8], schema: Option<&Schema>, da
     out
 }
 
+/// One family of a user-table push transaction: a batch into `tid` under
+/// `mode`.
+pub struct PushFamily<'a> {
+    pub tid: u64,
+    pub schema: &'a Schema,
+    pub batch: &'a ZSetBatch,
+    pub mode: WireConflictMode,
+    /// The transaction read `tid`: the commit fails if it was written after the
+    /// frame's basis.
+    pub reads: bool,
+}
+
 /// Encode an atomic user-table push transaction frame (`ClientVerb::PushTxn`) into
-/// wire bytes (without the 4-byte frame header).
-pub fn encode_push_txn(
-    families: &[(u64, &Schema, &ZSetBatch, WireConflictMode)],
-    preconditions: &[(u64, u64)],
-) -> Vec<u8> {
-    let families: Vec<(WireConflictMode, Vec<u8>, WalBlock<'_>)> = families
+/// wire bytes (without the 4-byte frame header), under the OCC `basis`.
+pub fn encode_push_txn(families: &[PushFamily<'_>], basis: u64) -> Vec<u8> {
+    let schemas: Vec<Vec<u8>> = families.iter().map(|f| encode_schema_block(f.schema)).collect();
+    let items: Vec<PushTxnItem<'_, WalBlock<'_>>> = families
         .iter()
-        .map(|(tid, schema, batch, mode)| (*mode, encode_schema_block(schema), batch.wal_block(*tid)))
+        .zip(&schemas)
+        .map(|(f, schema_block)| PushTxnItem {
+            mode: f.mode,
+            reads: f.reads,
+            schema_block,
+            data: f.batch.wal_block(f.tid),
+        })
         .collect();
-    gnitz_wire::txn_frame::encode_push_txn(&families, preconditions)
+    gnitz_wire::txn_frame::encode_push_txn(basis, &items)
 }
 
 /// Encode an atomic DDL transaction frame (`ClientVerb::DdlTxn`) into wire bytes

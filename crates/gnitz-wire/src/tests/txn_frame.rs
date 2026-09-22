@@ -24,30 +24,32 @@ fn block(tid: u32) -> Vec<u8> {
     buf
 }
 
-fn peeked<'a, T>(
-    frame: &'a [u8],
-    decode: impl Fn(&'a [u8], &DecodedControl) -> Result<T, String>,
-) -> Result<T, String> {
+fn peeked<'a, T>(frame: &'a [u8], decode: impl Fn(&'a [u8]) -> Result<T, String>) -> Result<T, String> {
     let ctrl = peek_control_block(frame).map_err(str::to_string)?;
-    decode(frame, &ctrl)
+    ctrl.client_verb().map_err(str::to_string)?;
+    decode(&frame[ctrl.body.clone()])
 }
 
-/// Every frame's control header carries only its verb, and a push's
-/// precondition count in `arg1`.
+fn family<D>(mode: WireConflictMode, reads: bool, schema_block: &[u8], data: D) -> PushTxnItem<'_, D> {
+    PushTxnItem { mode, reads, schema_block, data }
+}
+
+/// Every frame's control header carries only its verb, and a push's basis in
+/// `arg0`; its body starts right after the header.
 #[test]
 fn the_shared_prologue_carries_only_the_routing_flag() {
     let d = block(16);
     let frames = [
         (encode_ddl_txn(&[wal_block(16)]), ClientVerb::DdlTxn, 0),
         (
-            encode_push_txn(&[(WireConflictMode::Update, &d, wal_block(16))], &[(16, 1), (17, 2)]),
+            encode_push_txn(42, &[family(WireConflictMode::Update, true, &d, wal_block(16))]),
             ClientVerb::PushTxn,
-            2,
+            42,
         ),
         (encode_scan_multi(&[(7, 0)]), ClientVerb::ScanMulti, 0),
         (encode_delta_poll(&[item(7, 3, &[2])]), ClientVerb::DeltaPoll, 0),
     ];
-    for (frame, verb, arg1) in frames {
+    for (frame, verb, arg0) in frames {
         let c = peek_control_block(&frame).unwrap();
         assert_eq!(
             c.hdr.flags,
@@ -55,11 +57,12 @@ fn the_shared_prologue_carries_only_the_routing_flag() {
             "only the verb is set"
         );
         assert_eq!(c.hdr.target_id, 0);
-        assert_eq!(c.hdr.arg0, 0);
-        assert_eq!(c.hdr.arg1, arg1);
+        assert_eq!(c.hdr.arg0, arg0);
+        assert_eq!(c.hdr.arg1, 0);
         assert_eq!(c.hdr.status, WireStatus::Ok);
         assert!(c.blob.is_empty());
-        assert_eq!(c.block_size, CTRL_HEADER_SIZE);
+        assert_eq!(c.body, CTRL_HEADER_SIZE..frame.len());
+        assert_eq!(c.client_verb(), Ok(verb));
     }
 }
 
@@ -74,33 +77,37 @@ fn ddl_txn_roundtrips_every_family_in_order() {
 }
 
 #[test]
-fn push_txn_roundtrips_families_modes_and_preconditions() {
-    let (s0, d0, s1) = (block(16), block(16), block(17));
-    let pre = [(16u64, 42u64), (17, 43)];
+fn push_txn_roundtrips_families_modes_and_read_flags() {
+    let (s0, d0, s1, d1) = (block(16), block(16), block(17), block(17));
     let frame = encode_push_txn(
+        7,
         &[
-            (WireConflictMode::Error, &s0, wal_block(16)),
-            (WireConflictMode::Update, &s1, wal_block(17)),
+            family(WireConflictMode::Error, false, &s0, wal_block(16)),
+            family(WireConflictMode::Update, true, &s1, wal_block(17)),
         ],
-        &pre,
     );
-    let (fams, got_pre) = peeked(&frame, decode_push_txn).unwrap();
+    let fams = peeked(&frame, decode_push_txn).unwrap();
     assert_eq!(fams.len(), 2);
-    assert_eq!((fams[0].tid, fams[0].mode), (16, WireConflictMode::Error));
-    assert_eq!((fams[1].tid, fams[1].mode), (17, WireConflictMode::Update));
-    assert_eq!(fams[0].schema_block, &s0[..]);
-    assert_eq!(fams[0].wal_block, &d0[..]);
-    assert_eq!(got_pre, pre);
+    assert_eq!(
+        (fams[0].tid(), fams[0].mode, fams[0].reads),
+        (16, WireConflictMode::Error, false)
+    );
+    assert_eq!(
+        (fams[1].tid(), fams[1].mode, fams[1].reads),
+        (17, WireConflictMode::Update, true)
+    );
+    assert_eq!((fams[0].schema_block, fams[0].data), (&s0[..], &d0[..]));
+    assert_eq!((fams[1].schema_block, fams[1].data), (&s1[..], &d1[..]));
 }
 
+/// A reads byte is a flag: anything but `0` or `1` is a malformed frame.
 #[test]
-fn push_txn_with_no_preconditions_carries_no_section() {
+fn push_txn_refuses_a_reads_byte_that_is_not_a_flag() {
     let s = block(16);
-    let frame = encode_push_txn(&[(WireConflictMode::Update, &s, wal_block(16))], &[]);
-    let (fams, pre) = peeked(&frame, decode_push_txn).unwrap();
-    assert_eq!(fams.len(), 1);
-    assert!(pre.is_empty());
-    assert_eq!(frame.len(), CTRL_HEADER_SIZE + 1 + 4 + s.len() + wal_block(16).size());
+    let mut frame = encode_push_txn(0, &[family(WireConflictMode::Update, true, &s, wal_block(16))]);
+    frame[CTRL_HEADER_SIZE + 1] = 2;
+    let err = peeked(&frame, decode_push_txn).err().expect("a reads byte of 2");
+    assert!(err.contains("reads flag"), "{err:?}");
 }
 
 #[test]
@@ -121,24 +128,42 @@ fn delta_poll_roundtrips_every_view_in_order() {
     assert_eq!(peeked(&frame, decode_delta_poll).unwrap(), views);
 }
 
-/// The item rules both multi-item frames share, and the accepted lists that
-/// bracket them. The wording is the contract: client and server reject an
-/// identical list with identical text, so a caller reading one message is
-/// reading both.
+/// Every frame names at least one item; a delta poll names no view `0`; a
+/// repeated id is two positions, answered separately.
 #[test]
-fn a_multi_item_id_list_is_validated() {
-    for ctx in ["SCAN_MULTI", "DELTA_POLL"] {
-        assert!(validate_item_ids(ctx, &[4u64, 5, 6], |&id| id).is_ok());
-        let cases: &[(Vec<u64>, &str)] = &[
-            (vec![], "empty item list"),
-            (vec![4, 5, 4], "duplicate id 4"),
-            (vec![1, 0], "id 0 names no relation"),
-        ];
-        for (bad, want) in cases {
-            let err = validate_item_ids(ctx, bad, |&id| id).expect_err(want);
-            assert!(err.contains(want), "{err:?} does not name {want:?}");
-        }
+fn the_item_rules_are_the_decoders() {
+    let empty = |verb| {
+        let hdr = ControlHeader {
+            flags: WireFlags { verb, ..Default::default() },
+            ..Default::default()
+        };
+        let mut head = [0u8; CTRL_HEADER_SIZE];
+        encode_frame_head(&mut head, &hdr, &[], None, false);
+        head
+    };
+    let want = "empty item list";
+    let errs = [
+        peeked(&empty(ClientVerb::DdlTxn), decode_ddl_txn).err(),
+        peeked(&empty(ClientVerb::PushTxn), decode_push_txn).err(),
+        peeked(&empty(ClientVerb::ScanMulti), decode_scan_multi).err(),
+        peeked(&empty(ClientVerb::DeltaPoll), decode_delta_poll).err(),
+    ];
+    for err in errs {
+        let err = err.expect(want);
+        assert!(err.contains(want), "{err:?} does not name {want:?}");
     }
+
+    let err = peeked(
+        &encode_delta_poll(&[item(1, 0, b"b"), item(0, 0, b"b")]),
+        decode_delta_poll,
+    )
+    .expect_err("view id 0");
+    assert!(err.contains("view id 0"), "{err:?}");
+
+    let views = [item(4, 0, b"b"), item(4, 0, b"b")];
+    assert_eq!(peeked(&encode_delta_poll(&views), decode_delta_poll).unwrap(), views);
+    let rels = [(4u64, 0u16), (4, 0)];
+    assert_eq!(peeked(&encode_scan_multi(&rels), decode_scan_multi).unwrap(), rels);
 }
 
 /// A frame at its format's cap round-trips, and one past it is refused by the
@@ -171,38 +196,40 @@ fn a_frame_past_its_cap_is_refused_by_the_decoder() {
 /// well-formed frame, since items run to the frame's end.
 #[test]
 fn a_truncation_inside_an_item_is_a_decode_error() {
-    fn check<'a, T>(
-        name: &str,
-        frame: &'a [u8],
-        boundaries: &[usize],
-        decode: impl Fn(&'a [u8], &DecodedControl) -> Result<T, String> + Copy,
-    ) {
-        for cut in 1..frame.len() {
-            if !boundaries.contains(&cut) {
-                assert!(peeked(&frame[..cut], decode).is_err(), "{name} cut at {cut}");
+    /// `two` holds `one`'s item twice; no prefix of it decodes but `one`.
+    fn check<'a, T>(name: &str, one: &'a [u8], two: &'a [u8], decode: impl Fn(&'a [u8]) -> Result<T, String> + Copy) {
+        assert!(peeked(one, decode).is_ok(), "{name} single item");
+        for cut in 1..two.len() {
+            if cut != one.len() {
+                assert!(peeked(&two[..cut], decode).is_err(), "{name} cut at {cut}");
             }
         }
     }
-    let h = CTRL_HEADER_SIZE;
     let s = block(16);
-    let push = encode_push_txn(&[(WireConflictMode::Update, &s, wal_block(16))], &[(16, 1)]);
-    check("PUSH_TXN", &push, &[h + PRECONDITION_BYTES], decode_push_txn);
-    let ddl = encode_ddl_txn(&[wal_block(16)]);
-    check("DDL_TXN", &ddl, &[h], decode_ddl_txn);
-    let scan = encode_scan_multi(&[(7, 0), (8, 1)]);
-    check("SCAN_MULTI", &scan, &[h, h + RELATION_BYTES], decode_scan_multi);
-    let poll = encode_delta_poll(&[item(7, 3, &[4]), item(8, 5, &[6, 7])]);
-    check("DELTA_POLL", &poll, &[h, h + 21], decode_delta_poll);
-}
-
-/// A precondition count past what the frame can hold is rejected, never used to
-/// size an allocation.
-#[test]
-fn a_hostile_precondition_count_does_not_drive_the_allocation() {
-    let s = block(16);
-    let frame = encode_push_txn(&[(WireConflictMode::Update, &s, wal_block(16))], &[]);
-    let mut ctrl = peek_control_block(&frame).unwrap();
-    ctrl.hdr.arg1 = u64::MAX;
-    let err = decode_push_txn(&frame, &ctrl).err().expect("a hostile count");
-    assert!(err.contains("precondition section truncated"), "{err:?}");
+    let fam = || family(WireConflictMode::Update, true, &s, wal_block(16));
+    check(
+        "PUSH_TXN",
+        &encode_push_txn(1, &[fam()]),
+        &encode_push_txn(1, &[fam(), fam()]),
+        decode_push_txn,
+    );
+    check(
+        "DDL_TXN",
+        &encode_ddl_txn(&[wal_block(16)]),
+        &encode_ddl_txn(&[wal_block(16), wal_block(16)]),
+        decode_ddl_txn,
+    );
+    check(
+        "SCAN_MULTI",
+        &encode_scan_multi(&[(7, 0)]),
+        &encode_scan_multi(&[(7, 0), (7, 0)]),
+        decode_scan_multi,
+    );
+    let v = item(7, 3, &[4, 5]);
+    check(
+        "DELTA_POLL",
+        &encode_delta_poll(&[v]),
+        &encode_delta_poll(&[v, v]),
+        decode_delta_poll,
+    );
 }

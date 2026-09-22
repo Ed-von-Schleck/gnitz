@@ -153,3 +153,15 @@ def test_a_binary_bundle_validates_its_frames_in_order(client, schema_name, comm
     else:
         run()
     assert (bag(scanned(client, schema_name, "a")), bag(scanned(client, schema_name, "b"))) == after
+
+
+def test_a_bundle_into_a_table_dropped_before_commit_is_not_found(client, schema_name, server):
+    """The commit is validated against the catalog it reaches, not the one the
+    transaction began under, and the refusal names the relation it concerns."""
+    schema = gnitz.Schema(_KV)
+    tid = client.create_table(schema_name, "gone", _KV)
+    with pytest.raises(gnitz.GnitzNotFoundError, match=str(tid)):
+        with client.transaction() as txn:
+            txn.push(tid, gnitz.ZSetBatch(schema).extend([{"pk": 1, "val": 1}]), "update")
+            with gnitz.connect(server) as other:
+                other.execute_sql("DROP TABLE gone", schema_name=schema_name)

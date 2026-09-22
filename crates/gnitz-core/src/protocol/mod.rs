@@ -15,7 +15,7 @@ pub use error::ProtocolError;
 // The wire protocol's own vocabulary, re-exported at the module root so the
 // client's protocol code has one import path for it.
 pub use gnitz_wire::{ClientVerb, WireConflictMode, WireFlags, WireStatus, MAX_COLUMNS};
-pub use message::{encode_ddl_txn, encode_frame, encode_push_txn};
+pub use message::{encode_ddl_txn, encode_frame, encode_push_txn, PushFamily};
 // Only the `integration` suite drives a raw transport from outside; a shipped
 // build keeps it crate-private. The cfgs are complementary because two `use`
 // statements binding one name is `E0252` whatever their visibility.

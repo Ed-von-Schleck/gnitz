@@ -1,43 +1,24 @@
 //! The four **multi-item request frames** — `PUSH_TXN`, `DDL_TXN`, `SCAN_MULTI`
 //! and `DELTA_POLL` — in both directions.
 //!
-//! All four open with a control header naming only the frame's verb
-//! (`target_id = 0`), and run their items to the end of the frame. They differ
-//! only in what one item is:
+//! All four open with a control header naming the frame's verb (`target_id =
+//! 0`), and run their items to the end of the frame. They differ only in what
+//! one item is:
 //!
 //! ```text
-//! DDL_TXN     ctrl            | [data block]*
-//! PUSH_TXN    ctrl (arg1 = p) | p × [u64 tid][u64 basis_lsn] | ([u8 mode][u32 len][schema record][data block])*
-//! SCAN_MULTI  ctrl            | ([u64 tid][u16 schema_version])*
-//! DELTA_POLL  ctrl            | ([u64 view_id][u64 after_tick][u32 len][reply block])*
+//! DDL_TXN     ctrl                | [data block]*
+//! PUSH_TXN    ctrl (arg0 = basis) | ([u8 mode][u8 reads][u32 len][schema record][data block])*
+//! SCAN_MULTI  ctrl                | ([u64 tid][u16 schema_version])*
+//! DELTA_POLL  ctrl                | ([u64 view_id][u64 after_tick][u32 len][reply block])*
 //! ```
 //!
-//! Defining them here rather than once per crate is what keeps the item widths —
-//! the mode byte, the 10-byte relation record, the 16-byte precondition — from
-//! being restated on each side of the wire.
-//!
-//! What a schema record or data block contains belongs to `schema_block` and to
-//! each side's batch codec. A data block is self-sizing (its `WAL_OFF_SIZE`) and
-//! a schema record carries a length prefix, so the frame walk needs nothing
-//! beyond the bytes.
-//!
-//! **In the reply direction `target_id` says what a fault covers.** A fault at
-//! `0` — which [`validate_item_ids`] keeps out of every item list — rejects the
-//! whole frame; one naming an item ends that item's position and no other. Only
-//! `DELTA_POLL` answers per item; the other three fault at `0` alone.
+//! **A reply fault's `target_id`:** a `DELTA_POLL` fault naming one of its views
+//! ends that position alone; every other fault ends the request.
 
-use crate::codec::{bytes32_extent, Reader, Writer};
-use crate::control::{encode_frame_head, ControlHeader, DecodedControl, CTRL_HEADER_SIZE};
-use crate::wal::{self, WalBlock};
+use crate::codec::{Reader, Writer};
+use crate::control::{encode_frame_head, ControlHeader, CTRL_HEADER_SIZE};
+use crate::wal::WalBlock;
 use crate::{read_u32_le, ClientVerb, WireConflictMode, WireFlags, WAL_OFF_TID};
-
-/// Bytes one `SCAN_MULTI` relation record occupies: a `u64` tid and the client's
-/// `u16` cached schema version (`0` = none, so the server sends that relation's
-/// schema block).
-pub(crate) const RELATION_BYTES: usize = 8 + 2;
-
-/// Bytes one OCC precondition occupies: `[u64 tid][u64 basis_lsn]`.
-pub(crate) const PRECONDITION_BYTES: usize = 8 + 8;
 
 /// Maximum relations in one `SCAN_MULTI`. The master holds one scan lease and
 /// one reply train of bookkeeping per relation; a handful of related tables
@@ -49,40 +30,16 @@ pub const SCAN_MULTI_MAX_RELATIONS: usize = 16;
 /// a host past this chunks into a second request.
 pub const DELTA_POLL_MAX_VIEWS: usize = 64;
 
-/// The rules a multi-item frame's id list obeys that need the items themselves:
-/// non-empty, no duplicate — which would answer one position twice — and no id
-/// `0`, which names no relation and is the id a rejection of the frame carries.
-/// Run on the client encoder and again on the server, so both reject an
-/// identical list with identical text. The count cap is the decoders'.
-///
-/// A client that skipped the empty check would desync its connection: an empty
-/// frame's lone error frame is one the N=0 reply loop never consumes.
-pub fn validate_item_ids<T>(ctx: &str, items: &[T], id: impl Fn(&T) -> u64) -> Result<(), String> {
-    if items.is_empty() {
-        return Err(format!("{ctx}: empty item list"));
-    }
-    for (i, item) in items.iter().enumerate() {
-        let this = id(item);
-        if this == 0 {
-            return Err(format!("{ctx}: id 0 names no relation"));
-        }
-        if items[..i].iter().any(|other| id(other) == this) {
-            return Err(format!("{ctx}: duplicate id {this}"));
-        }
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Encode
 // ---------------------------------------------------------------------------
 
-/// The shared prologue: a control header naming `verb` and `arg1`, every other
+/// The shared prologue: a control header naming `verb` and `arg0`, every other
 /// field zero. Each encoder below appends its own body.
-fn prologue(verb: ClientVerb, arg1: u64, body_hint: usize) -> Writer {
+fn prologue(verb: ClientVerb, arg0: u64, body_hint: usize) -> Writer {
     let hdr = ControlHeader {
         flags: WireFlags { verb, ..Default::default() },
-        arg1,
+        arg0,
         ..Default::default()
     };
     let mut head = [0u8; CTRL_HEADER_SIZE];
@@ -92,15 +49,8 @@ fn prologue(verb: ClientVerb, arg1: u64, body_hint: usize) -> Writer {
     w
 }
 
-/// Encode an atomic **DDL transaction** frame (`ClientVerb::DdlTxn`), without the
-/// 4-byte frame header. Every system-table write — a `CREATE`'s N family
-/// batches, a `DROP`/`CREATE INDEX`/`CREATE SCHEMA`'s single batch — rides one
-/// such frame, so the server ingests the whole bundle under one durable SAL
-/// zone.
-///
-/// Each block embeds its own `table_id` and total size, so the server walks the
-/// list by header alone with no schema in hand and defers schema resolution to
-/// its catalog.
+/// Encode a `DDL_TXN` frame, without the 4-byte frame header: every
+/// system-table write of one DDL statement, ingested under one durable SAL zone.
 pub fn encode_ddl_txn(blocks: &[WalBlock<'_>]) -> Vec<u8> {
     let mut w = prologue(ClientVerb::DdlTxn, 0, blocks.iter().map(|b| b.size()).sum());
     for b in blocks {
@@ -109,48 +59,46 @@ pub fn encode_ddl_txn(blocks: &[WalBlock<'_>]) -> Vec<u8> {
     w.into_vec()
 }
 
-/// Encode an atomic **user-table push transaction** frame (`ClientVerb::PushTxn`),
-/// without the 4-byte frame header — the client-facing analogue of
-/// [`encode_ddl_txn`], which is exclusive to system families.
-///
-/// Each family is `(conflict mode, meta-schema block, data block)`. The schema
-/// block is **always present**, which is what lets the master validate the
-/// family against its catalog with no warm-cache version, exactly as the DDL
-/// frame does.
-///
-/// A `preconditions` entry `(tid, basis)` asserts "no commit has written `tid`
-/// with a zone LSN greater than `basis`". Their count rides `arg1`.
-pub fn encode_push_txn(
-    families: &[(WireConflictMode, impl AsRef<[u8]>, WalBlock<'_>)],
-    preconditions: &[(u64, u64)],
-) -> Vec<u8> {
-    let body: usize = families
-        .iter()
-        .map(|(_, s, d)| 1 + 4 + s.as_ref().len() + d.size())
-        .sum();
-    let mut w = prologue(
-        ClientVerb::PushTxn,
-        preconditions.len() as u64,
-        preconditions.len() * PRECONDITION_BYTES + body,
-    );
-    for (tid, basis) in preconditions {
-        w.u64(*tid).u64(*basis);
+/// One `PUSH_TXN` family, in both directions.
+pub struct PushTxnItem<'a, D> {
+    pub mode: WireConflictMode,
+    /// The transaction read this family's relation: the commit fails if the
+    /// relation was written after the frame's basis.
+    pub reads: bool,
+    pub schema_block: &'a [u8],
+    /// A `WalBlock` to encode; the framed block slice once decoded.
+    pub data: D,
+}
+
+impl PushTxnItem<'_, &[u8]> {
+    /// The target relation, read from the data block's `WAL_OFF_TID`.
+    pub fn tid(&self) -> u32 {
+        read_u32_le(self.data, WAL_OFF_TID)
     }
-    for (mode, schema_block, wal_block) in families {
-        w.u8(mode.as_wire()).bytes32(schema_block.as_ref()).block(wal_block);
+}
+
+/// Encode a `PUSH_TXN` frame, without the 4-byte frame header: user-table
+/// writes committed as one zone. Every family carries its schema block, so the
+/// master validates it with no warm-cache version.
+pub fn encode_push_txn(basis: u64, items: &[PushTxnItem<'_, WalBlock<'_>>]) -> Vec<u8> {
+    let body: usize = items
+        .iter()
+        .map(|f| 1 + 1 + 4 + f.schema_block.len() + f.data.size())
+        .sum();
+    let mut w = prologue(ClientVerb::PushTxn, basis, body);
+    for f in items {
+        w.u8(f.mode.as_wire())
+            .u8(f.reads as u8)
+            .bytes32(f.schema_block)
+            .block(&f.data);
     }
     w.into_vec()
 }
 
-/// Encode a **multi-relation scan** frame (`ClientVerb::ScanMulti`), without the
-/// 4-byte frame header: a consistent snapshot of N relations at one server-side
-/// SAL cut. The server answers with N reply trains in this exact order, which
-/// the caller reads positionally.
-///
-/// The control header's schema version stays zero; the per-relation versions
-/// ride the body.
+/// Encode a `SCAN_MULTI` frame, without the 4-byte frame header: N relations
+/// read at one SAL cut, each `(tid, cached schema version)`, answered in order.
 pub fn encode_scan_multi(relations: &[(u64, u16)]) -> Vec<u8> {
-    let mut w = prologue(ClientVerb::ScanMulti, 0, relations.len() * RELATION_BYTES);
+    let mut w = prologue(ClientVerb::ScanMulti, 0, relations.len() * (8 + 2));
     for (tid, version) in relations {
         w.u64(*tid).u16(*version);
     }
@@ -166,8 +114,7 @@ pub struct DeltaPollItem<'a> {
     pub reply_block: &'a [u8],
 }
 
-/// Encode a **delta poll** frame (`ClientVerb::DeltaPoll`), without the 4-byte frame
-/// header.
+/// Encode a `DELTA_POLL` frame, without the 4-byte frame header.
 pub fn encode_delta_poll(views: &[DeltaPollItem<'_>]) -> Vec<u8> {
     let body: usize = views.iter().map(|v| 8 + 8 + 4 + v.reply_block.len()).sum();
     let mut w = prologue(ClientVerb::DeltaPoll, 0, body);
@@ -181,120 +128,79 @@ pub fn encode_delta_poll(views: &[DeltaPollItem<'_>]) -> Vec<u8> {
 // Decode
 // ---------------------------------------------------------------------------
 
-/// Decode a `DDL_TXN` frame into its per-family `(table_id, wal-block
-/// slice)` list, in send order. Walks the concatenated blocks by header alone —
-/// `table_id` at `WAL_OFF_TID`, total size at `WAL_OFF_SIZE` — so the caller
-/// resolves each family's schema from its own catalog and decodes the slice
-/// itself.
-pub fn decode_ddl_txn<'a>(frame: &'a [u8], ctrl: &DecodedControl) -> Result<Vec<(u32, &'a [u8])>, String> {
-    const CTX: &str = "DDL_TXN";
-    let mut off = ctrl.block_size;
-    let mut families = Vec::new();
-    while off < frame.len() {
-        let block = wal::block_slice_at(frame, off).map_err(|e| format!("{CTX}: family block: {e}"))?;
-        families.push((read_u32_le(block, WAL_OFF_TID), block));
-        off += block.len();
+/// Walk a frame body item by item. A frame names at least one item and at most
+/// `cap`; `item` reads one.
+fn items<'a, T>(
+    body: &'a [u8],
+    ctx: &'static str,
+    cap: usize,
+    mut item: impl FnMut(&mut Reader<'a>) -> Result<T, String>,
+) -> Result<Vec<T>, String> {
+    if body.is_empty() {
+        return Err(format!("{ctx}: empty item list"));
     }
-    Ok(families)
-}
-
-/// One decoded `PUSH_TXN` family: the target `tid` (read from the data
-/// block's `WAL_OFF_TID`), the conflict `mode`, and the borrowed schema record
-/// and data WAL-block slices — same lifetime discipline as [`decode_ddl_txn`]'s
-/// `(u32, &[u8])`.
-pub struct TxnFamily<'a> {
-    pub tid: u32,
-    pub mode: WireConflictMode,
-    pub schema_block: &'a [u8],
-    pub wal_block: &'a [u8],
-}
-
-/// The two lists a `PUSH_TXN` frame decodes to: its per-family write bundle
-/// and its OCC preconditions (each `(tid, basis_lsn)`).
-pub type DecodedPushTxn<'a> = (Vec<TxnFamily<'a>>, Vec<(u64, u64)>);
-
-/// Decode a `PUSH_TXN` frame into its per-family list plus its OCC
-/// precondition list, in send order — the user-table analogue of
-/// [`decode_ddl_txn`]. Truncation at any field rejects the whole frame; the
-/// count/duplicate/tid-legality shape rules belong to the handler, so a
-/// well-formed but empty list decodes cleanly and is rejected there with a
-/// specific message.
-pub fn decode_push_txn<'a>(frame: &'a [u8], ctrl: &DecodedControl) -> Result<DecodedPushTxn<'a>, String> {
-    const CTX: &str = "PUSH_TXN";
-    let body = &frame[ctrl.block_size..];
-    // Bound by the bytes physically present, so a hostile count cannot force a
-    // giant pre-allocation before the reads reject it.
-    if ctrl.hdr.arg1 > (body.len() / PRECONDITION_BYTES) as u64 {
-        return Err(format!("{CTX}: precondition section truncated"));
-    }
-    let pre_count = ctrl.hdr.arg1 as usize;
-    let mut r = Reader::new(body, CTX);
-    let mut preconditions = Vec::with_capacity(pre_count);
-    for _ in 0..pre_count {
-        preconditions.push((r.u64()?, r.u64()?));
-    }
-
-    let mut off = ctrl.block_size + pre_count * PRECONDITION_BYTES;
-    let mut families = Vec::new();
-    while off < frame.len() {
-        let mode =
-            WireConflictMode::from_wire(frame[off]).ok_or_else(|| format!("{CTX}: unknown family conflict mode"))?;
-        off += 1;
-        let section = bytes32_extent(frame, off).ok_or_else(|| format!("{CTX}: schema record truncated"))?;
-        let schema_block = &frame[section.clone()];
-        off = section.end;
-        let wal_block = wal::block_slice_at(frame, off).map_err(|e| format!("{CTX}: data block: {e}"))?;
-        off += wal_block.len();
-        families.push(TxnFamily {
-            tid: read_u32_le(wal_block, WAL_OFF_TID),
-            mode,
-            schema_block,
-            wal_block,
-        });
-    }
-    Ok((families, preconditions))
-}
-
-/// Decode a `SCAN_MULTI` frame into its per-relation `(tid,
-/// client_schema_version)` list, in request order. A body that is not a whole
-/// number of records rejects the whole frame; the duplicate/tid-legality shape
-/// rules are the handler's.
-pub fn decode_scan_multi(frame: &[u8], ctrl: &DecodedControl) -> Result<Vec<(u64, u16)>, String> {
-    const CTX: &str = "SCAN_MULTI";
-    let body = &frame[ctrl.block_size..];
-    if !body.len().is_multiple_of(RELATION_BYTES) {
-        return Err(format!("{CTX}: relation record truncated"));
-    }
-    let count = body.len() / RELATION_BYTES;
-    if count > SCAN_MULTI_MAX_RELATIONS {
-        return Err(format!(
-            "{CTX}: too many items ({count}, max {SCAN_MULTI_MAX_RELATIONS})"
-        ));
-    }
-    let mut r = Reader::new(body, CTX);
-    let mut relations = Vec::with_capacity(count);
-    for _ in 0..count {
-        relations.push((r.u64()?, r.u16()?));
-    }
-    Ok(relations)
-}
-
-/// Decode a `DELTA_POLL` frame into its items, each block borrowed from `frame`.
-pub fn decode_delta_poll<'a>(frame: &'a [u8], ctrl: &DecodedControl) -> Result<Vec<DeltaPollItem<'a>>, String> {
-    const CTX: &str = "DELTA_POLL";
-    let mut r = Reader::new(&frame[ctrl.block_size..], CTX);
-    let mut views = Vec::new();
+    let mut r = Reader::new(body, ctx);
+    let mut out = Vec::new();
     while r.remaining() > 0 {
-        if views.len() == DELTA_POLL_MAX_VIEWS {
-            return Err(format!("{CTX}: too many items (max {DELTA_POLL_MAX_VIEWS})"));
+        if out.len() == cap {
+            return Err(format!("{ctx}: too many items (max {cap})"));
         }
-        views.push(DeltaPollItem {
-            view_id: r.u64()?,
+        out.push(item(&mut r)?);
+    }
+    Ok(out)
+}
+
+/// Decode a `DDL_TXN` frame body into `(table_id, block)` pairs, in send order;
+/// each block's schema is the caller's catalog's.
+pub fn decode_ddl_txn(body: &[u8]) -> Result<Vec<(u32, &[u8])>, String> {
+    items(body, "DDL_TXN", usize::MAX, |r| {
+        let b = r.block()?;
+        Ok((read_u32_le(b, WAL_OFF_TID), b))
+    })
+}
+
+/// Decode a `PUSH_TXN` frame body into its families, in send order, each block
+/// borrowed from `body`. The basis is the frame's `arg0`.
+pub fn decode_push_txn(body: &[u8]) -> Result<Vec<PushTxnItem<'_, &[u8]>>, String> {
+    items(body, "PUSH_TXN", usize::MAX, |r| {
+        let mode =
+            WireConflictMode::from_wire(r.u8()?).ok_or_else(|| "PUSH_TXN: unknown family conflict mode".to_string())?;
+        let reads = match r.u8()? {
+            0 => false,
+            1 => true,
+            b => return Err(format!("PUSH_TXN: reads flag {b} is neither 0 nor 1")),
+        };
+        Ok(PushTxnItem {
+            mode,
+            reads,
+            schema_block: r.bytes32()?,
+            data: r.block()?,
+        })
+    })
+}
+
+/// Decode a `SCAN_MULTI` frame body into its per-relation `(tid,
+/// client_schema_version)` list, in request order.
+pub fn decode_scan_multi(body: &[u8]) -> Result<Vec<(u64, u16)>, String> {
+    items(body, "SCAN_MULTI", SCAN_MULTI_MAX_RELATIONS, |r| {
+        Ok((r.u64()?, r.u16()?))
+    })
+}
+
+/// Decode a `DELTA_POLL` frame body into its items, each block borrowed from
+/// `body`. View id `0` is refused: it is the id of a fault ending the request.
+pub fn decode_delta_poll(body: &[u8]) -> Result<Vec<DeltaPollItem<'_>>, String> {
+    items(body, "DELTA_POLL", DELTA_POLL_MAX_VIEWS, |r| {
+        let view_id = r.u64()?;
+        if view_id == 0 {
+            return Err("DELTA_POLL: view id 0 names no view".to_string());
+        }
+        Ok(DeltaPollItem {
+            view_id,
             after_tick: r.u64()?,
             reply_block: r.bytes32()?,
-        });
-    }
-    Ok(views)
+        })
+    })
 }
 
 #[cfg(test)]

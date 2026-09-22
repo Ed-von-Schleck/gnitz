@@ -132,10 +132,10 @@ async def test_an_abandoned_operation_is_not_a_cancellation(aconn, table):
 
 @pytest.mark.asyncio
 async def test_an_error_surfaces_from_a_gather_and_the_connection_survives(aconn, table):
-    """A refused request leaves the connection usable, whether it is refused
-    client-side before any frame is sent (an empty `scan_many`, whose count=0
-    frame would draw a server error frame nothing reads) or by the server inside
-    a gathered group — where the good pushes must not swallow the bad one."""
+    """A refused request leaves the connection usable, whether it is a lone
+    request the server refuses whole (an empty `scan_many`, whose one error frame
+    answers a request with no position to fill) or one refused inside a gathered
+    group — where the good pushes must not swallow the bad one."""
     with pytest.raises(gnitz.GnitzError):
         await aconn.scan_many([])
 

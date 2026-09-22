@@ -74,11 +74,18 @@ fn net_folds_last_op_per_pk() {
         &schema,
         batch(&schema, &[(1, 10, 1), (2, 20, 1)]),
         WireConflictMode::Error,
+        false,
     );
     // Update pk=1 → v=11 [Update family].
-    buf.push(tid, &schema, batch(&schema, &[(1, 11, 1)]), WireConflictMode::Update);
+    buf.push(
+        tid,
+        &schema,
+        batch(&schema, &[(1, 11, 1)]),
+        WireConflictMode::Update,
+        false,
+    );
     // Delete pk=2 [coalesces with the Update family above].
-    buf.push(tid, &schema, del(&schema, 2), WireConflictMode::Update);
+    buf.push(tid, &schema, del(&schema, 2), WireConflictMode::Update, false);
 
     let net = net_of(&mut buf, tid);
     assert_eq!(net.len(), 2);
@@ -91,9 +98,21 @@ fn net_delete_then_reinsert_is_present() {
     let schema = two_col(TypeCode::I64);
     let tid = 7;
     let mut buf = TxnBuffer::default();
-    buf.push(tid, &schema, batch(&schema, &[(5, 50, 1)]), WireConflictMode::Error);
-    buf.push(tid, &schema, del(&schema, 5), WireConflictMode::Update);
-    buf.push(tid, &schema, batch(&schema, &[(5, 99, 1)]), WireConflictMode::Error);
+    buf.push(
+        tid,
+        &schema,
+        batch(&schema, &[(5, 50, 1)]),
+        WireConflictMode::Error,
+        false,
+    );
+    buf.push(tid, &schema, del(&schema, 5), WireConflictMode::Update, false);
+    buf.push(
+        tid,
+        &schema,
+        batch(&schema, &[(5, 99, 1)]),
+        WireConflictMode::Error,
+        false,
+    );
     let net = net_of(&mut buf, tid);
     assert_eq!(
         val_of(&net, 5),
@@ -106,10 +125,28 @@ fn net_delete_then_reinsert_is_present() {
 fn net_scopes_by_tid_and_skips_zero_weight() {
     let schema = two_col(TypeCode::I64);
     let mut buf = TxnBuffer::default();
-    buf.push(1, &schema, batch(&schema, &[(1, 10, 1)]), WireConflictMode::Error);
-    buf.push(2, &schema, batch(&schema, &[(2, 20, 1)]), WireConflictMode::Error);
+    buf.push(
+        1,
+        &schema,
+        batch(&schema, &[(1, 10, 1)]),
+        WireConflictMode::Error,
+        false,
+    );
+    buf.push(
+        2,
+        &schema,
+        batch(&schema, &[(2, 20, 1)]),
+        WireConflictMode::Error,
+        false,
+    );
     // w=0 contributes nothing
-    buf.push(1, &schema, batch(&schema, &[(3, 30, 0)]), WireConflictMode::Update);
+    buf.push(
+        1,
+        &schema,
+        batch(&schema, &[(3, 30, 0)]),
+        WireConflictMode::Update,
+        false,
+    );
     let net1 = net_of(&mut buf, 1);
     assert_eq!(net1.len(), 1);
     assert_eq!(val_of(&net1, 1), Some(10));
@@ -130,9 +167,21 @@ fn present_rows_keeps_overrides_and_born_rows_and_drops_tombstones() {
     let schema = two_col(TypeCode::I64);
     let tid = 7;
     let mut buf = TxnBuffer::default();
-    buf.push(tid, &schema, batch(&schema, &[(1, 99, 1)]), WireConflictMode::Update); // override committed 1
-    buf.push(tid, &schema, del(&schema, 2), WireConflictMode::Update); // delete committed 2
-    buf.push(tid, &schema, batch(&schema, &[(5, 50, 1)]), WireConflictMode::Update); // transaction-born
+    buf.push(
+        tid,
+        &schema,
+        batch(&schema, &[(1, 99, 1)]),
+        WireConflictMode::Update,
+        false,
+    ); // override committed 1
+    buf.push(tid, &schema, del(&schema, 2), WireConflictMode::Update, false); // delete committed 2
+    buf.push(
+        tid,
+        &schema,
+        batch(&schema, &[(5, 50, 1)]),
+        WireConflictMode::Update,
+        false,
+    ); // transaction-born
 
     let present = present_rows(&net_of(&mut buf, tid), &schema);
     assert_eq!(rows_of(&present), vec![(1, 99), (5, 50)]);
@@ -148,6 +197,7 @@ fn net_restricted_to_keys_excludes_untouched_and_unlisted() {
         &schema,
         batch(&schema, &[(1, 11, 1), (2, 22, 1)]),
         WireConflictMode::Update,
+        false,
     );
 
     // A key-pinned bound restricts the net to the keys it names: restricting

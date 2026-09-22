@@ -26,7 +26,7 @@ use gnitz_foundation::fault::Seam;
 
 use self::ddl::{commit_serial_range_durable, handle_ddl_txn, hold_relay_for_ddl, RELAY_HOLD_FOR_DDL};
 use super::TxnFamily;
-use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
+use crate::catalog::CatalogEngine;
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{
@@ -42,7 +42,7 @@ use gnitz_store::schema::key::seek_opk_bytes;
 use gnitz_store::schema::{SchemaDescriptor, SchemaFacts};
 use gnitz_store::storage::Batch;
 use gnitz_wire::control::DecodedControl;
-use gnitz_wire::txn_frame::{validate_item_ids, DeltaPollItem};
+use gnitz_wire::txn_frame::DeltaPollItem;
 use gnitz_wire::BackfillDecision;
 use gnitz_wire::{PkKeys, ReadBound, ReadSpec, WireFault, WireFlags, WireStatus};
 
@@ -862,12 +862,12 @@ async fn handle_message(peer: &Peer, buf: RecvBuf, shared: &Rc<Shared>) {
     };
 
     match verb {
-        // The bundle frames name no single relation in `target_id`: each carries
-        // its items after the control header and decodes its own body from `data`.
-        ClientVerb::DdlTxn => handle_ddl_txn(shared, peer, &ctrl, data).await,
+        // The multi-item frames name no single relation in `target_id`; each
+        // decodes its items from the frame's body.
+        ClientVerb::DdlTxn => handle_ddl_txn(shared, peer, &data[ctrl.body]).await,
         ClientVerb::PushTxn => handle_push_txn(shared, peer, &ctrl, buf).await,
-        ClientVerb::ScanMulti => handle_scan_multi(shared, peer, &ctrl, data).await,
-        ClientVerb::DeltaPoll => handle_delta_poll(shared, peer, &ctrl, data).await,
+        ClientVerb::ScanMulti => handle_scan_multi(shared, peer, &data[ctrl.body]).await,
+        ClientVerb::DeltaPoll => handle_delta_poll(shared, peer, &data[ctrl.body]).await,
 
         // `target_id` is the sequence key (= the owning table's id).
         ClientVerb::AllocSerialRange => match commit_serial_range_durable(shared, target_id, ctrl.hdr.arg1).await {
@@ -1157,65 +1157,49 @@ async fn handle_read(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::contro
     };
     let group = DirectGroup { template, ..DirectGroup::new(sal_kind) };
     let result = fan_out_scan(shared, peer, g, group).await;
-    finish_scan_fanout(peer, target_id, lsn, result);
+    finish_scan_fanout(peer, target_id, lsn, 0, result);
 }
 
-/// The two success shapes of `push_txn_body`. `Committed` carries the durable
-/// zone LSN; `Conflict` carries a fresh basis (`published()`) the client adopts
-/// for its retry. `push_txn_body` cannot send the reply itself (`peer` is not in
-/// its scope), so it returns the outcome and
-/// `handle_push_txn` renders it.
+/// What a committed or conflicting transaction is answered with.
 enum PushTxnOutcome {
+    /// The durable zone LSN.
     Committed(u64),
+    /// A fresh basis (`published()`) for the client's retry.
     Conflict(u64),
 }
 
-/// Handle an atomic user-table transaction (`PUSH_TXN`): decode + validate
-/// the bundle as a unit under the union of the involved table locks, run the OCC
-/// precondition check under those locks, then emit it as N `Push` groups
-/// inside one zone. Mirrors the plain-push arm's lock order
-/// (catalog read lock, then the per-table lock union ascending) and its late
-/// late drain check; both locks are held through the committer ACK. Every
-/// rejection is pre-SAL, so an `Err` reply — and a `Conflict` outcome — mean
-/// "nothing committed".
+/// PUSH_TXN: validate the bundle under the catalog read lock and its tables'
+/// lock union — the plain-push arm's order — check OCC, and commit it as one
+/// zone. Every rejection is pre-SAL, so a fault or a conflict commits nothing.
 async fn handle_push_txn(shared: &Rc<Shared>, peer: &Peer, ctrl: &DecodedControl, buf: RecvBuf) {
-    match push_txn_body(shared, ctrl, buf).await {
-        Ok(outcome) => {
-            let (arg0, status) = match outcome {
-                // Standard single-frame ACK (uncorrelated, as the DDL_TXN reply is).
-                PushTxnOutcome::Committed(lsn) => (lsn, WireStatus::Ok),
-                PushTxnOutcome::Conflict(fresh_basis) => (fresh_basis, WireStatus::TxnConflict),
-            };
-            send_msg(peer, ipc::WireMsg { arg0, status, ..Default::default() });
-        }
-        Err(fault) => send_fault(peer, 0, &fault),
-    }
+    let (arg0, status) = match push_txn_body(shared, ctrl, buf).await {
+        // Standard single-frame ACK (uncorrelated, as the DDL_TXN reply is).
+        Ok(PushTxnOutcome::Committed(lsn)) => (lsn, WireStatus::Ok),
+        Ok(PushTxnOutcome::Conflict(fresh_basis)) => (fresh_basis, WireStatus::TxnConflict),
+        Err(f) => return send_fault(peer, f.target_id, &f.fault),
+    };
+    send_msg(peer, ipc::WireMsg { arg0, status, ..Default::default() });
 }
 
-/// The body of `handle_push_txn`. Returns `Committed(zone_lsn)` on a durable
-/// commit or `Conflict(fresh_basis)` when the OCC precondition check fails.
-async fn push_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, buf: RecvBuf) -> Result<PushTxnOutcome, WireFault> {
+async fn push_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, buf: RecvBuf) -> Result<PushTxnOutcome, FaultAt> {
     // 1. Decode.
-    let (decoded, _charge) = buf.decode(|data| decode_push_txn_frame(data, ctrl));
-    let DecodedTxn { families, preconditions } = decoded?;
+    let (decoded, _charge) = buf.decode(|data| decode_push_txn_frame(&data[ctrl.body.clone()]));
+    let DecodedTxn { families, reads } = decoded?;
 
     // 2. Catalog read lock (excludes a concurrent DROP/DDL), then the
     //    catalog-dependent rules per family.
     let _cat = shared.catalog_rwlock.read().await;
     for fam in &families {
         let tid = fam.tid;
-        // Same existence + writability gate the plain-push arm applies, so a view
-        // target is rejected identically. Refusing a stream keeps every transaction
-        // family `recoverable`, so a transaction always opens a zone.
-        // The status is dropped on purpose: this reply names no relation, so only
-        // the text identifies the tid.
-        if target_kind(shared, tid, Access::Write).map_err(|f| f.text)? == RelationKind::Stream {
-            return Err(format!("table {tid} is a stream: a stream cannot be written inside a transaction").into());
+        // The plain-push arm's gate. Refusing a stream keeps every family
+        // `recoverable`, so a transaction always opens a zone.
+        let kind = target_kind(shared, tid, Access::Write).map_err(|f| FaultAt::relation(tid, f))?;
+        if kind == RelationKind::Stream {
+            let text = format!("table {tid} is a stream: a stream cannot be written inside a transaction");
+            return Err(FaultAt::relation(tid, text.into()));
         }
         validate_client_schema(shared, tid, fam.batch.schema())?;
     }
-    // Capture the family tids BEFORE `families` is moved into the commit request,
-    // for the precondition-membership check and the post-commit map bump.
     let family_tids: Vec<i64> = families.iter().map(|f| f.tid).collect();
 
     // 3. Acquire the per-table lock union ⋃ fk_lock_set(tid) exclusively.
@@ -1225,78 +1209,54 @@ async fn push_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, buf: RecvBuf)
     }
     let _tlocks = shared.lock_tables_exclusive(union).await;
 
-    // 3b. OCC precondition check, under the just-acquired lock union and BEFORE
-    //     validation. A precondition asserts "table `tid` has not been written
-    //     since `basis`". The lock union already covers every precondition tid
-    //     (preconditions ⊆ families, enforced here), so no lock-set extension.
-    //     Every writer to a family table holds some guard on that same lock
-    //     through its commit ACK and bumps the map before releasing; the write
-    //     guard held here excludes both guard kinds, so a passing check + this
-    //     commit are one atomic step. Reading the map borrow ends at each
-    //     statement; no borrow crosses an `.await`.
-    for &(tid, basis) in &preconditions {
-        let tid = tid as i64;
-        if !family_tids.contains(&tid) {
-            return Err(format!("TXN: precondition on {tid}: not a written table").into());
-        }
-        if shared.commit_lsn_of(tid) > basis {
-            return Ok(PushTxnOutcome::Conflict(shared.lsn_alloc.published()));
-        }
+    // 3b. OCC under `_tlocks`, which guards every read tid since each is a
+    //     family tid (see `table_commit_lsn`).
+    let basis = ctrl.hdr.arg0;
+    if reads.iter().any(|&tid| shared.commit_lsn_of(tid) > basis) {
+        return Ok(PushTxnOutcome::Conflict(shared.lsn_alloc.published()));
     }
 
     // 4. Distributed bundle validation (the four rules).
     shared.disp().validate_txn_distributed(&families).await?;
 
-    // 5. Route through the committer and wait for the zone ACK. `families` is
-    //    moved here; `family_tids` was captured above for the bump. The drain
-    //    check rides inside `enqueue_commit`, which is what makes it and the send
-    //    one step.
+    // 5. Commit.
     let (tx, rx) = oneshot::channel::<Result<u64, WireFault>>();
     shared.enqueue_commit(CommitRequest::Txn(PendingTxn { families, done: tx }))?;
-    // The bump below is reached ONLY on a successful commit.
     let lsn = rx.await?;
 
-    // 6. Record the commit LSN for every family tid while the table locks are
-    //    still held (`_tlocks` in scope), so a later same-tid txn cannot pass its
-    //    precondition against a pre-this-commit basis. Bump on `Ok` only. The
-    //    reply is sent by `handle_push_txn` after the locks drop, which is fine:
-    //    OCC needs only the bump under the lock, and a later same-tid txn cannot
-    //    acquire the lock until this one releases (after the bump).
+    // 6. Bump while `_tlocks` still holds every family tid.
     shared.record_commit_lsn(family_tids.iter().copied(), lsn);
     Ok(PushTxnOutcome::Committed(lsn))
 }
 
-/// A `PUSH_TXN` frame's families, their batches decoded, and its OCC
-/// preconditions (each `(tid, basis)`).
+/// A `PUSH_TXN` frame's families, their batches decoded, and the tids of the
+/// families flagged `reads`.
 struct DecodedTxn {
     families: Vec<TxnFamily>,
-    preconditions: Vec<(u64, u64)>,
+    reads: Vec<i64>,
 }
 
-/// Decode a `PUSH_TXN` frame, applying every rule that needs no catalog.
-fn decode_push_txn_frame(data: &[u8], ctrl: &DecodedControl) -> Result<DecodedTxn, WireFault> {
-    let (raw, preconditions) =
-        gnitz_wire::txn_frame::decode_push_txn(data, ctrl).map_err(|e| format!("decode error: {e}"))?;
-    if raw.is_empty() {
-        return Err("TXN: empty family bundle".into());
-    }
+/// Decode a `PUSH_TXN` frame body, applying every rule that needs no catalog.
+fn decode_push_txn_frame(body: &[u8]) -> Result<DecodedTxn, WireFault> {
+    let raw = gnitz_wire::txn_frame::decode_push_txn(body).map_err(|e| format!("decode error: {e}"))?;
     let mut families: Vec<TxnFamily> = Vec::with_capacity(raw.len());
+    let mut reads = Vec::new();
     for fam in &raw {
         // The wire carries the tid as u32; the catalog addresses it as i64.
-        let tid = fam.tid as i64;
-        if tid < FIRST_USER_TABLE_ID {
-            return Err(format!("TXN: {tid} is not a user table").into());
-        }
+        let tid = fam.tid() as i64;
         let wire_schema = gnitz_store::schema::decode_schema_block(fam.schema_block)
             .map_err(|e| format!("TXN family {tid} schema decode error: {e}"))?;
-        let batch = decode_client_batch(fam.wal_block, &wire_schema)
-            .map_err(|e| format!("TXN family {tid} decode error: {e}"))?;
+        let batch =
+            decode_client_batch(fam.data, &wire_schema).map_err(|e| format!("TXN family {tid} decode error: {e}"))?;
         if batch.is_empty() {
             return Err(format!("TXN: empty batch for table {tid}").into());
         }
+        if fam.reads {
+            reads.push(tid);
+        }
         families.push(TxnFamily { tid, mode: fam.mode, batch });
     }
-    Ok(DecodedTxn { families, preconditions })
+    Ok(DecodedTxn { families, reads })
 }
 
 /// Compare a client-supplied schema against the catalog's own descriptor for
@@ -1637,12 +1597,12 @@ async fn fan_out_scan(
     forward_scan(peer, &lease).await
 }
 
-/// Finish one scan-shaped fan-out: the terminal frame stamped with the
-/// pre-dispatch `lsn`, or the worker's own fault.
-fn finish_scan_fanout(peer: &Peer, target_id: i64, lsn: u64, result: Result<(), WireFault>) {
+/// Finish one scan-shaped fan-out: the terminal frame carrying `arg0` (the
+/// pre-dispatch LSN, or a delta read's round) and `arg1`, or the fault.
+fn finish_scan_fanout(peer: &Peer, target_id: i64, arg0: u64, arg1: u64, result: Result<(), WireFault>) {
     match result {
         // Corked, not sent: the terminal joins whatever the forward corked.
-        Ok(()) => send_msg(peer, terminal_scan_msg(target_id, lsn, 0)),
+        Ok(()) => send_msg(peer, terminal_scan_msg(target_id, arg0, arg1)),
         Err(f) => send_fault(peer, target_id, &f),
     }
 }
@@ -1666,7 +1626,7 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, target_id: i64, blob
         ..DirectGroup::new(SalMessageKind::ScanSpec)
     };
     let result = fan_out_scan(shared, peer, g, group).await;
-    finish_scan_fanout(peer, target_id, lsn, result);
+    finish_scan_fanout(peer, target_id, lsn, 0, result);
 }
 
 /// DELTA_POLL: advance N mirrored views in one request, one catalog lock and —
@@ -1677,9 +1637,9 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, target_id: i64, blob
 ///
 /// Never drains pending ticks: a delta read reports what has happened, and a
 /// round not yet ticked is one the next poll carries.
-async fn handle_delta_poll(shared: &Rc<Shared>, peer: &Peer, ctrl: &DecodedControl, data: &[u8]) {
+async fn handle_delta_poll(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) {
     // A frame-shape rejection, before any group was written.
-    if let Err(f) = delta_poll_body(shared, peer, ctrl, data).await {
+    if let Err(f) = delta_poll_body(shared, peer, body).await {
         send_fault(peer, 0, &f);
     }
 }
@@ -1696,14 +1656,8 @@ enum PollPosition {
 
 /// Body of [`handle_delta_poll`]. A per-view failure is not an `Err` — it goes out
 /// as that view's own fault frame and the rest of the poll continues.
-async fn delta_poll_body(
-    shared: &Rc<Shared>,
-    peer: &Peer,
-    ctrl: &DecodedControl,
-    data: &[u8],
-) -> Result<(), WireFault> {
-    let views = gnitz_wire::txn_frame::decode_delta_poll(data, ctrl).map_err(|e| format!("decode error: {e}"))?;
-    validate_item_ids("DELTA_POLL", &views, |v| v.view_id)?;
+async fn delta_poll_body(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Result<(), WireFault> {
+    let views = gnitz_wire::txn_frame::decode_delta_poll(body).map_err(|e| format!("decode error: {e}"))?;
 
     // ── Phase 1: classify under the catalog lock, dispatch one cut ─────────
     // No await between a view's gate test and the round its terminal reports, so
@@ -1758,21 +1712,18 @@ async fn delta_poll_body(
     let disp = shared.disp();
     let mut dispatches = dispatches.into_iter();
     for (tid, position) in positions {
-        let terminal = |round| terminal_scan_msg(tid, round, disp.delta_cursor_tag(tid));
-        match position {
-            PollPosition::Fault(fault) => send_fault(peer, tid, &fault),
-            PollPosition::UpToDate => send_msg(peer, terminal(up_to_date_round)),
+        let (round, result) = match position {
+            PollPosition::Fault(fault) => (0, Err(fault)),
+            PollPosition::UpToDate => (up_to_date_round, Ok(())),
             // Taken in step with the `Moved`s that were pushed. A dispatch left
             // undrained — an earlier return dropped it — discards the rest of
             // its train at the ring boundary.
             PollPosition::Moved => {
                 let lease = dispatches.next().expect("one dispatch per moved view");
-                match forward_scan(peer, &lease).await {
-                    Ok(()) => send_msg(peer, terminal(dispatch_round)),
-                    Err(fault) => send_fault(peer, tid, &fault),
-                }
+                (dispatch_round, forward_scan(peer, &lease).await)
             }
-        }
+        };
+        finish_scan_fanout(peer, tid, round, disp.delta_cursor_tag(tid), result);
         // Carry no more than the budget into the next view, and learn here
         // rather than at the end if the client is gone.
         if peer.flush_if_full().await.is_err() {
@@ -1814,28 +1765,18 @@ struct ScanMultiRelPlan {
 /// request order. The read-side completion of the atomic multi-table write
 /// story: an atomic commit is either wholly before the cut (visible in every
 /// train) or wholly after (visible in none), never torn across the result set.
-async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, ctrl: &DecodedControl, data: &[u8]) {
-    // A shape/tid rejection before any group was written, or a worker fault
-    // mid-stream: one error frame either way.
-    if let Err(f) = scan_multi_body(shared, peer, ctrl, data).await {
-        send_fault(peer, 0, &f);
+async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) {
+    if let Err(f) = scan_multi_body(shared, peer, body).await {
+        send_fault(peer, f.target_id, &f.fault);
     }
 }
 
 /// Body of `handle_scan_multi`. Every scan's lease lives in the `dispatches` vec
 /// and drops on return, so an early return removes every route and discards
 /// undrained frames at the ring boundary.
-async fn scan_multi_body(
-    shared: &Rc<Shared>,
-    peer: &Peer,
-    ctrl: &DecodedControl,
-    data: &[u8],
-) -> Result<(), WireFault> {
-    // ── Phase 0: decode + frame-local shape rules ──────────────────────────
-    // The authoritative run of the shared shape validator — a client may skip
-    // its own. tid legality is Phase 1's, under the catalog lock.
-    let relations = gnitz_wire::txn_frame::decode_scan_multi(data, ctrl).map_err(|e| format!("decode error: {e}"))?;
-    validate_item_ids("SCAN_MULTI", &relations, |r| r.0)?;
+async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Result<(), FaultAt> {
+    // ── Phase 0: decode; tid legality is Phase 1's, under the catalog lock ──
+    let relations = gnitz_wire::txn_frame::decode_scan_multi(body).map_err(|e| format!("decode error: {e}"))?;
 
     // Drain once if any target is a stale view — the same test `read_lock` runs
     // for a single target. Phase 1 resolves every tid's kind under the guard
@@ -1858,8 +1799,7 @@ async fn scan_multi_body(
             // Base tables AND views are legal; `UserRead` refuses a catalog
             // family, which stays on the plain path that serves it
             // master-locally.
-            // Status dropped for the reason `push_txn_body`'s is.
-            target_kind(shared, tid, Access::UserRead).map_err(|f| f.text)?;
+            target_kind(shared, tid, Access::UserRead).map_err(|f| FaultAt::relation(tid, f))?;
             // Capture (not emit) each relation's preliminary schema frame here so
             // Phase 2 can send it after the one-cut dispatch, in request order.
             let (block, server_version) = shared.cat().negotiated_schema_block(tid, client_ver);
@@ -2030,6 +1970,24 @@ fn send_status_frame(peer: &Peer, target_id: i64, status: WireStatus, text: &[u8
             ..Default::default()
         },
     )
+}
+
+/// A fault and the relation it concerns; `0` concerns none in particular.
+struct FaultAt {
+    target_id: i64,
+    fault: WireFault,
+}
+
+impl FaultAt {
+    fn relation(target_id: i64, fault: WireFault) -> Self {
+        FaultAt { target_id, fault }
+    }
+}
+
+impl<F: Into<WireFault>> From<F> for FaultAt {
+    fn from(fault: F) -> Self {
+        FaultAt::relation(0, fault.into())
+    }
 }
 
 /// A failure carrying its own status, master-minted or forwarded from a worker.

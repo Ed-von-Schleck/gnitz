@@ -57,7 +57,7 @@ fn encode_roundtrips() {
         let dec = peek_control_block(&buf).expect("decode");
         assert_eq!(dec.hdr, hdr);
         assert_eq!(dec.blob, blob);
-        assert_eq!(dec.block_size, CTRL_HEADER_SIZE + blob.len());
+        assert_eq!(dec.body, buf.len()..buf.len(), "nothing follows the blob");
         assert_eq!((dec.schema, dec.data), (None, None));
     }
 }
@@ -84,7 +84,13 @@ fn peek_locates_the_sections_the_head_announced() {
         assert_eq!(dec.hdr, hdr, "the section bits are not a flags field");
         assert_eq!(dec.schema, want_schema);
         assert_eq!(dec.data, want_data);
+        assert_eq!(dec.body, buf.len()..buf.len(), "the body starts past the last section");
     }
+    // Bytes past the last section are the body.
+    let mut buf = frame(&hdr, b"abc", Some(&sb), Some(&db));
+    let end = buf.len();
+    buf.extend_from_slice(b"items");
+    assert_eq!(peek_control_block(&buf).unwrap().body, end..end + 5);
     // A section the bits announce but the frame does not hold is refused, at
     // every length short of the whole.
     let buf = frame(&hdr, b"abc", Some(&sb), None);
@@ -115,6 +121,43 @@ fn client_verb_rejects_data_on_a_non_push_verb() {
             assert!(
                 ctrl(verb, Some(&db)).client_verb().is_err(),
                 "{verb:?} must not accept a data block"
+            );
+        }
+    }
+}
+
+/// A multi-item frame carries its items and nothing else, and every other frame
+/// ends at its last section.
+#[test]
+fn client_verb_refuses_sections_the_verb_does_not_carry() {
+    let multi = [
+        ClientVerb::DdlTxn,
+        ClientVerb::PushTxn,
+        ClientVerb::ScanMulti,
+        ClientVerb::DeltaPoll,
+    ];
+    let ctrl = |verb, blob: &[u8], schema: Option<&[u8]>, tail: &[u8]| {
+        let hdr = ControlHeader {
+            flags: WireFlags { verb, ..Default::default() },
+            ..Default::default()
+        };
+        let mut buf = frame(&hdr, blob, schema, None);
+        buf.extend_from_slice(tail);
+        peek_control_block(&buf).unwrap().client_verb()
+    };
+    for &verb in ClientVerb::ALL {
+        if multi.contains(&verb) {
+            assert_eq!(ctrl(verb, b"", None, b"items"), Ok(verb));
+            assert!(ctrl(verb, b"blob", None, b"items").is_err(), "{verb:?} with a blob");
+            assert!(
+                ctrl(verb, b"", Some(b"sch"), b"items").is_err(),
+                "{verb:?} with a schema"
+            );
+        } else {
+            assert_eq!(ctrl(verb, b"blob", Some(b"sch"), b""), Ok(verb));
+            assert!(
+                ctrl(verb, b"blob", None, b"tail").is_err(),
+                "{verb:?} with trailing bytes"
             );
         }
     }

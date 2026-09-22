@@ -203,7 +203,7 @@ fn ddl_txn_roundtrip_client_to_server() {
     let verify = |families: &[(u64, ZSetBatch)], check_pk: &[bool]| {
         let payload = gnitz_core::protocol::encode_ddl_txn(families);
         let ctrl = gnitz_wire::control::peek_control_block(&payload).expect("control header");
-        let decoded = decode_ddl_txn(&payload, &ctrl).expect("decode_ddl_txn");
+        let decoded = decode_ddl_txn(&payload[ctrl.body]).expect("decode_ddl_txn");
         assert_eq!(decoded.len(), families.len(), "family count");
         for (fi, ((exp_tid, exp_batch), (got_tid, slice))) in families.iter().zip(&decoded).enumerate() {
             assert_eq!(*got_tid, *exp_tid as u32, "family {fi} tid/order");

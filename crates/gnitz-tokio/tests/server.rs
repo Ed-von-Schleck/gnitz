@@ -140,11 +140,10 @@ fn cloned_handles_across_tasks_each_get_their_own_result() {
         rt.block_on(client.seek(tid, &7u64.to_le_bytes())).unwrap().batch.len(),
         1
     );
-    let many = rt.block_on(client.scan_many(&[tid, tid])).unwrap_err();
-    assert!(
-        matches!(many, gnitz_core::ClientError::ServerError(_)),
-        "a duplicate tid is refused locally and fails that one future"
-    );
+    // A repeated tid is two positions, each answered in full.
+    let many = rt.block_on(client.scan_many(&[tid, tid])).unwrap();
+    assert_eq!(many.len(), 2);
+    assert!(many.iter().all(|r| r.batch.len() == n * 10));
     let many = rt.block_on(client.scan_many(&[tid])).unwrap();
     assert_eq!(many.len(), 1);
     assert_eq!(many[0].batch.len(), n * 10);

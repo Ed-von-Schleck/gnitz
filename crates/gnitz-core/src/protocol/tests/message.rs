@@ -58,32 +58,33 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
         blob: vec![],
     };
 
-    let families: Vec<(u64, &Schema, &ZSetBatch, WireConflictMode)> = vec![
-        (16, &schema, &b0, WireConflictMode::Update),
-        (17, &schema, &b1, WireConflictMode::Error),
-        (16, &schema, &b2, WireConflictMode::Update),
+    let family = |tid, batch, mode, reads| PushFamily { tid, schema: &schema, batch, mode, reads };
+    let families = [
+        family(16, &b0, WireConflictMode::Update, true),
+        family(17, &b1, WireConflictMode::Error, false),
+        family(16, &b2, WireConflictMode::Update, false),
     ];
-    let payload = encode_push_txn(&families, &[(16, 42), (17, 42)]);
+    let payload = encode_push_txn(&families, 42);
 
     // The frame layout is `gnitz_wire::txn_frame`'s and is tested there; what
     // this pins is the adapter above it: each family's two blocks are built from
-    // *that* family's schema, batch and tid, in that order.
+    // *that* family's schema, batch and tid, in that order, under the basis.
     let ctrl = peek_control_block(&payload).unwrap();
-    let decoded = gnitz_wire::txn_frame::decode_push_txn(&payload, &ctrl).unwrap().0;
+    assert_eq!(ctrl.hdr.arg0, 42, "the basis rides arg0");
+    let decoded = gnitz_wire::txn_frame::decode_push_txn(&payload[ctrl.body]).unwrap();
     let expected = [
-        (16u32, WireConflictMode::Update, 2usize),
-        (17, WireConflictMode::Error, 1),
-        (16, WireConflictMode::Update, 1),
+        (16u32, WireConflictMode::Update, true, 2usize),
+        (17, WireConflictMode::Error, false, 1),
+        (16, WireConflictMode::Update, false, 1),
     ];
     assert_eq!(decoded.len(), expected.len());
-    for (fam, (exp_tid, exp_mode, exp_rows)) in decoded.iter().zip(expected) {
-        assert_eq!(fam.tid, exp_tid);
-        assert_eq!(fam.mode, exp_mode);
+    for (fam, (exp_tid, exp_mode, exp_reads, exp_rows)) in decoded.iter().zip(expected) {
+        assert_eq!((fam.tid(), fam.mode, fam.reads), (exp_tid, exp_mode, exp_reads));
         // The schema record is this family's.
         let block_schema = schema_from_block(fam.schema_block).unwrap();
         assert_eq!(block_schema, schema);
         // ... and the data block decodes against it, with this family's rows.
-        let (batch, _) = decode_wal_block(fam.wal_block, &block_schema).unwrap();
+        let (batch, _) = decode_wal_block(fam.data, &block_schema).unwrap();
         assert_eq!(batch.len(), exp_rows);
     }
 }

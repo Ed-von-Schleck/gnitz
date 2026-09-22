@@ -338,6 +338,34 @@ mod spine_tests {
         assert_eq!(r.lsn, Some(42));
     }
 
+    /// An empty list is the server's to refuse: its one frame-level fault ends a
+    /// slot that has no position to fill, and the connection keeps serving.
+    #[test]
+    fn an_empty_scan_multi_refused_by_the_server_fails_its_slot_alone() {
+        let (mut s, peer) = pair();
+        let sa = schema_a();
+        let slot = s.submit(Request::ScanMulti(&[])).unwrap();
+        s.step(Interest::WRITE);
+        peer.drain_request();
+        peer.send(&reply_status(WireStatus::Error, "SCAN_MULTI: empty item list", 0));
+        let r = drive(&mut s, slot);
+        assert!(
+            matches!(r, Err(ClientError::ServerError(ref m)) if m.contains("empty item list")),
+            "{r:?}"
+        );
+        assert!(!s.is_closed());
+        assert_eq!(s.interest(), Interest::NONE, "nothing left pending");
+
+        let slot = s.submit(Request::scan(3)).unwrap();
+        s.step(Interest::WRITE);
+        peer.drain_request();
+        peer.send(&reply_cold(3, 1, &sa, &batch_a(&[5]), 42, false));
+        let Reply::Scan(r) = drive(&mut s, slot).unwrap() else {
+            panic!("scan")
+        };
+        assert_eq!(r.lsn, Some(42));
+    }
+
     #[test]
     fn one_read_serves_two_slots_and_leaves_nothing_buffered() {
         let (mut s, peer) = pair();

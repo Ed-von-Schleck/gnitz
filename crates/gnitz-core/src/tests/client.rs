@@ -32,31 +32,32 @@ fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
     use WireConflictMode::{Error, Update};
     let s = kv_schema();
     let mut buf = TxnBuffer::default();
-    for (tid, batch, mode) in [
-        (16, ins(&s, 1), Update),         // family 0, row 0
-        (16, ZSetBatch::new(&s), Update), // empty: opens no family, indexes nothing
-        (16, ins(&s, 2), Update),         // extends family 0, row 1
-        (17, ins(&s, 1), Update),         // family 1 — a different tid
-        (16, ins(&s, 3), Error),          // family 2: the mode changed
-        (16, del(&s, 1), Update),         // family 3: back to Update, in call order
-        (16, ins(&s, 1), Error),          // family 4: the Error re-insert
+    for (tid, batch, mode, reads) in [
+        (16, ins(&s, 1), Update, false),        // family 0, row 0
+        (16, ZSetBatch::new(&s), Update, true), // empty: opens no family, indexes nothing
+        (16, ins(&s, 2), Update, true),         // extends family 0, row 1, and flags it
+        (17, ins(&s, 1), Update, false),        // family 1 — a different tid
+        (17, ZSetBatch::new(&s), Update, true), // empty: flags nothing
+        (16, ins(&s, 3), Error, false),         // family 2: the mode changed
+        (16, del(&s, 1), Update, true),         // family 3: back to Update, in call order
+        (16, ins(&s, 1), Error, false),         // family 4: the Error re-insert
     ] {
-        buf.push(tid, &s, batch, mode);
+        buf.push(tid, &s, batch, mode, reads);
     }
 
     let shape: Vec<_> = buf
         .families
         .iter()
-        .map(|f| (f.tid, f.mode, f.batch.weights.clone()))
+        .map(|f| (f.tid, f.mode, f.reads, f.batch.weights.clone()))
         .collect();
     assert_eq!(
         shape,
         vec![
-            (16, Update, vec![1, 1]),
-            (17, Update, vec![1]),
-            (16, Error, vec![1]),
-            (16, Update, vec![-1]),
-            (16, Error, vec![1]),
+            (16, Update, true, vec![1, 1]),
+            (17, Update, false, vec![1]),
+            (16, Error, false, vec![1]),
+            (16, Update, true, vec![-1]),
+            (16, Error, false, vec![1]),
         ]
     );
 
@@ -81,7 +82,7 @@ fn the_overlay_index_is_built_on_read_and_only_once() {
     let s = kv_schema();
     let mut buf = TxnBuffer::default();
     for pk in 1..=4u64 {
-        buf.push(16, &s, ins(&s, pk), WireConflictMode::Error);
+        buf.push(16, &s, ins(&s, pk), WireConflictMode::Error, false);
     }
     assert_eq!(buf.indexed_rows(), 0, "a blind transaction indexes nothing");
 
@@ -92,7 +93,7 @@ fn the_overlay_index_is_built_on_read_and_only_once() {
     assert_eq!(buf.indexed_rows(), 4);
 
     // A write after a read is picked up by the next read, and only it.
-    buf.push(16, &s, ins(&s, 9), WireConflictMode::Error);
+    buf.push(16, &s, ins(&s, 9), WireConflictMode::Error, false);
     assert_eq!(buf.indexed_rows(), 4, "the write itself indexes nothing");
     assert_eq!(buf.reads(16).last_ops().count(), 5);
     assert_eq!(buf.indexed_rows(), 5);

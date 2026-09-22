@@ -27,8 +27,8 @@ wire_enum! {
         Resolve = 5,
         /// System-table batches committed as one SAL zone.
         DdlTxn = 6,
-        /// User-table batches and their OCC preconditions, committed as one SAL
-        /// zone; `arg1` is the precondition count.
+        /// User-table batches committed as one SAL zone; `arg0` is the OCC
+        /// basis.
         PushTxn = 7,
         /// N relations read at one SAL cut.
         ScanMulti = 8,

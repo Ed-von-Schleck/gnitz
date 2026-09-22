@@ -5,13 +5,13 @@
 //! Each such statement resolves its target rows client-side, computes new rows
 //! client-side, then writes. This driver wraps that read+build so that:
 //!
-//! - **Autocommit** ships a one-family, one-precondition `PUSH_TXN` frame
+//! - **Autocommit** ships a `PUSH_TXN` frame of one read-flagged family
 //!   (`GnitzClient::commit_rmw`) asserting the table has not been written since
 //!   the basis. On a `TxnConflict` it adopts the server's fresh basis and re-runs
 //!   the build from scratch (re-reading fresh state — re-shipping the stale batch
 //!   would commit the very update it lost), bounded at [`RMW_MAX_ATTEMPTS`].
-//! - **Inside a transaction** it buffers the write and records the table in the
-//!   transaction's read-set, so COMMIT ships that table's OCC precondition; no
+//! - **Inside a transaction** it buffers the write as a read-flagged family, so
+//!   COMMIT fails if the table was written after the transaction's basis; no
 //!   per-statement retry (the buffered reads are stale by definition).
 
 use crate::error::GnitzSqlError;
@@ -38,14 +38,10 @@ pub(crate) fn commit_rmw_or_buffer<F>(
 where
     F: FnMut(&mut GnitzClient) -> Result<ZSetBatch, GnitzSqlError>,
 {
-    // An empty build buffers and records nothing, so the read-set stays a subset
-    // of the family tids.
     if client.txn_active() {
         let batch = build(client)?;
         let count = batch.len();
-        if count > 0 {
-            client.txn_push_rmw(tid, schema, batch);
-        }
+        client.txn_push_rmw(tid, schema, batch)?;
         return Ok(count);
     }
 

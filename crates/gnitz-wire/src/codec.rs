@@ -120,6 +120,14 @@ impl<'a> Reader<'a> {
         self.take(n)
     }
 
+    /// A self-sizing WAL block — the inverse of [`Writer::block`].
+    pub(crate) fn block(&mut self) -> Result<&'a [u8], String> {
+        let n = crate::wal::block_slice_at(self.buf, self.off)
+            .map_err(|e| format!("{}: {e}", self.ctx))?
+            .len();
+        self.take(n)
+    }
+
     /// The next byte without consuming it — used to compute a variable-length
     /// `RangeDescriptor`'s span from its leading `n_eq`.
     pub(crate) fn peek_u8(&self) -> Result<u8, String> {

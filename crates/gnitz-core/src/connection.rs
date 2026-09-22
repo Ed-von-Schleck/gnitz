@@ -18,7 +18,7 @@ use crate::protocol::wal_block::decode_wal_block_into;
 use crate::protocol::ReplySchema;
 use crate::protocol::{
     encode_ddl_txn, encode_frame, encode_push_txn, hello_handshake, ClientTransport, ClientVerb, FkTarget,
-    ProtocolError, Schema, WireConflictMode, WireFlags, WireStatus, ZSetBatch,
+    ProtocolError, PushFamily, Schema, WireConflictMode, WireFlags, WireStatus, ZSetBatch,
 };
 use gnitz_wire::control::{peek_control_block, ControlHeader, DecodedControl};
 use gnitz_wire::txn_frame;
@@ -184,12 +184,10 @@ pub enum Request<'a> {
     /// An atomic DDL transaction: system-table batches, each named by its table
     /// id, under one durable SAL zone. Completes as [`Reply::Lsn`].
     DdlTxn(&'a [(u64, ZSetBatch)]),
-    /// An atomic user-table push transaction, and the OCC `(tid, basis)`
-    /// preconditions the server asserts first. Completes as [`Reply::Lsn`].
-    PushTxn {
-        families: &'a [(u64, &'a Schema, &'a ZSetBatch, WireConflictMode)],
-        preconditions: &'a [(u64, u64)],
-    },
+    /// An atomic user-table push transaction under one OCC `basis`: the server
+    /// refuses it if a relation some family `reads` was written after `basis`.
+    /// Completes as [`Reply::Lsn`].
+    PushTxn { families: &'a [PushFamily<'a>], basis: u64 },
     /// A frame the caller encoded itself, for the scripted-peer tests that
     /// drive bytes the library would never build. Test-only, so no production
     /// path reaches an encoder behind `submit`'s back. Uncorrelated.
@@ -573,11 +571,11 @@ impl Session {
                 }
                 (encode_ddl_txn(families), SlotKind::Commit)
             }
-            Request::PushTxn { families, preconditions } => {
-                for (_, schema, batch, _) in families {
-                    batch.validate(schema)?;
+            Request::PushTxn { families, basis } => {
+                for f in families {
+                    f.batch.validate(f.schema)?;
                 }
-                (encode_push_txn(families, preconditions), SlotKind::Commit)
+                (encode_push_txn(families, basis), SlotKind::Commit)
             }
             #[cfg(test)]
             Request::RawFrame(frame) => (frame, SlotKind::Commit),
@@ -642,12 +640,6 @@ impl Session {
                 )
             }
             Request::ScanMulti(tids) => {
-                // Rejected here, in every build profile, before a frame exists.
-                // The case that matters is the empty list: it would encode a
-                // count=0 frame whose lone server error frame an N=0 accumulator
-                // never consumes, permanently shifting every later read on this
-                // connection by one frame.
-                txn_frame::validate_item_ids("SCAN_MULTI", tids, |&tid| tid)?;
                 let tids: Vec<(u64, Option<Hint>)> = tids.iter().map(|&tid| (tid, self.cached_hint(tid))).collect();
                 let relations: Vec<(u64, u16)> = tids
                     .iter()
@@ -663,7 +655,6 @@ impl Session {
     /// [`Self::step_polling`] drain — without which they are dropped, hence no [`Request`].
     pub(crate) fn submit_delta_poll(&mut self, views: &[txn_frame::DeltaPollItem<'_>]) -> Result<SlotId, ClientError> {
         self.check_open()?;
-        txn_frame::validate_item_ids("DELTA_POLL", views, |v| v.view_id)?;
         self.enqueue_slot(
             txn_frame::encode_delta_poll(views),
             SlotKind::DeltaPoll {
@@ -829,20 +820,20 @@ impl Session {
         // else `None` — what tells the paths below to fill one position rather
         // than end the request.
         let poll = match &head.kind {
-            SlotKind::DeltaPoll { views } => Some((views[accum.at], views.len())),
+            SlotKind::DeltaPoll { views } => views.get(accum.at).map(|&v| (v, views.len())),
             _ => None,
         };
         // The relation this frame must name.
         let correlate_tid = match &head.kind {
             SlotKind::Read { tid, .. } | SlotKind::Push { tid } => Some(*tid),
-            SlotKind::Multi { tids } => Some(tids[accum.at].0),
+            SlotKind::Multi { tids } => tids.get(accum.at).map(|t| t.0),
             SlotKind::DeltaPoll { .. } => poll.map(|(view, _)| view),
             SlotKind::Alloc | SlotKind::Commit | SlotKind::Resolve | SlotKind::ScanSpec { .. } => None,
         };
         // What a frame carrying no schema block of its own decodes under.
         let slot_hint: Option<Hint> = match &head.kind {
             SlotKind::Read { hint, .. } => hint.clone(),
-            SlotKind::Multi { tids } => tids[accum.at].1.clone(),
+            SlotKind::Multi { tids } => tids.get(accum.at).and_then(|t| t.1.clone()),
             // Client-authored: the server sends no block and stamps 0.
             SlotKind::ScanSpec { reply_schema, .. } => Some((Arc::clone(reply_schema), 0)),
             SlotKind::DeltaPoll { .. }

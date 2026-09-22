@@ -214,15 +214,24 @@ def test_every_refusal_leaves_the_server_serving(client, schema_name):
     for why, tids in [
         ("empty list", []),
         ("too many relations", [t + 1 + i for i in range(17)]),
-        ("duplicate tid", [t, t]),
-        # A fan-out read has no form for a system relation, and an unknown user
-        # tid resolves to no table — both refused server-side.
+        # A fan-out read has no form for a system relation — refused server-side.
         ("system tid", [gnitz.TABLE_TAB]),
-        ("unknown tid", [gnitz.FIRST_USER_TABLE_ID + 987654]),
     ]:
         with pytest.raises(gnitz.GnitzError):
             client.scan_many(tids)
         assert bag(client.scan_many([t])[0]) == {(1, 1): 1}, f"unhealthy after {why}"
+
+    # An unknown user tid resolves to no table, and the refusal names it.
+    missing = gnitz.FIRST_USER_TABLE_ID + 987654
+    with pytest.raises(gnitz.GnitzNotFoundError, match=str(missing)):
+        client.scan_many([t, missing])
+    assert bag(client.scan_many([t])[0]) == {(1, 1): 1}, "unhealthy after unknown tid"
+
+
+def test_a_repeated_tid_is_answered_at_each_position(client, schema_name):
+    t = _kv(client, schema_name, "t")
+    client.push(t, _batch([(1, 1), (2, 2)]))
+    assert [bag(r) for r in client.scan_many([t, t])] == [{(1, 1): 1, (2, 2): 1}] * 2
 
 
 def test_a_chunked_train_does_not_let_its_siblings_jump_it(reply_frame_budget_server):
