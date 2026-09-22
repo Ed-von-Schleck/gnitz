@@ -13,7 +13,7 @@
 //! module is glob-re-exported flat at the crate root (`gnitz_wire::FOO`), so
 //! callers need not track which module a symbol lives in; a module whose item
 //! names read relative to the module is public and referenced by path
-//! (`gnitz_wire::wal::WalBlock`). No item is reachable at two paths.
+//! (`gnitz_wire::wal::parse_block`). No item is reachable at two paths.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its

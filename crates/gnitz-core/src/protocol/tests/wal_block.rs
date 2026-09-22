@@ -1,18 +1,16 @@
 use super::*;
 use crate::protocol::types::{ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
-use crate::test_support::payload_of;
+use crate::test_support::{german_col, payload_of};
 use gnitz_expr::SchemaFacts;
-use gnitz_wire::wal::{body_start, dir_entry_offset, WAL_OFF_NUM_REGIONS, WAL_OFF_VERSION};
+use gnitz_wire::wal::{WAL_HEADER_SIZE, WAL_OFF_ROWS, WAL_OFF_VERSION};
 
-/// Region `region_idx`'s `(offset, size)`, walking the size-only directory the
-/// way the parser does.
-fn get_region_offset_size(block: &[u8], region_idx: usize) -> (usize, usize) {
-    let n = gnitz_wire::read_u32_le(block, WAL_OFF_NUM_REGIONS) as usize;
-    let size = |r: usize| gnitz_wire::read_u32_le(block, dir_entry_offset(r)) as usize;
-    assert!(region_idx < n, "region {region_idx} is not in the directory");
+/// Fixed region `region_idx`'s `(offset, size)` in a block over `schema`.
+fn get_region_offset_size(block: &[u8], schema: &Schema, region_idx: usize) -> (usize, usize) {
+    let rows = gnitz_wire::read_u32_le(block, WAL_OFF_ROWS) as usize;
+    let strides: Vec<usize> = fixed_strides(schema).collect();
     (
-        body_start(n) + (0..region_idx).map(size).sum::<usize>(),
-        size(region_idx),
+        WAL_HEADER_SIZE + rows * strides[..region_idx].iter().sum::<usize>(),
+        rows * strides[region_idx],
     )
 }
 
@@ -50,16 +48,6 @@ fn wide_vals(col: &[u8]) -> Vec<u128> {
         .collect()
 }
 
-/// A STRING/BLOB column region from its values, spilling into `blob`; `None` is
-/// a NULL cell, which the region zero-fills.
-fn german_col(vals: &[Option<&str>], blob: &mut Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(vals.len() * 16);
-    for v in vals {
-        out.extend_from_slice(&gnitz_wire::encode_german_string(v.unwrap_or("").as_bytes(), blob));
-    }
-    out
-}
-
 /// Read a STRING column region back out, `None` where the null bit is set.
 fn german_vals(batch: &ZSetBatch, pi: usize) -> Vec<Option<String>> {
     (0..batch.len())
@@ -82,12 +70,10 @@ fn u128_schema() -> Schema {
     }
 }
 
-/// A German cell whose blob offset overruns the arena must surface as a
-/// `DecodeError` from the production decode path, not a panic. The German
-/// codec itself is covered in `gnitz-wire`; what this pins is the client's
-/// mapping of its `None` onto a protocol error.
+/// A German cell whose heap offset overruns the heap is a `DecodeError`, and
+/// leaves the sink as it was although the block's rows were already appended.
 #[test]
-fn a_string_cell_pointing_past_the_blob_is_a_decode_error() {
+fn a_string_cell_pointing_past_the_blob_is_refused_whole() {
     let schema = str_schema();
     let mut blob = Vec::new();
     let batch = ZSetBatch {
@@ -96,19 +82,21 @@ fn a_string_cell_pointing_past_the_blob_is_a_decode_error() {
         nulls: vec![0],
         payload: payload_of(
             &schema,
-            vec![german_col(&[Some("a value well past the inline cell")], &mut blob)],
+            vec![german_col(&[Some(b"a value well past the inline cell")], &mut blob)],
         ),
         blob,
     };
-    let mut block = encode_wal_block(7, &batch);
-    // The lone payload region holds one 16-byte German cell; its bytes
-    // 8..16 are the blob offset. Push it past the arena.
-    let (off, _) = get_region_offset_size(&block, gnitz_wire::REG_PAYLOAD_START);
+    let mut block = encode_wal_block(&batch);
+    // A German cell's bytes 8..16 are its heap offset.
+    let (off, _) = get_region_offset_size(&block, &schema, gnitz_wire::REG_PAYLOAD_START);
     block[off + 8..off + 16].copy_from_slice(&u64::MAX.to_le_bytes());
+
+    let mut sink = batch.clone();
     assert!(matches!(
-        decode_wal_block(&block, &schema),
+        decode_wal_block_into(&mut sink, &block, &schema),
         Err(ProtocolError::DecodeError(_))
     ));
+    assert_eq!(sink, batch);
 }
 
 #[test]
@@ -132,10 +120,9 @@ fn test_encode_decode_fixed() {
         blob: vec![],
     };
 
-    let encoded = encode_wal_block(42, &batch);
-    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
+    let encoded = encode_wal_block(&batch);
+    let decoded = decode_wal_block(&encoded, &schema).unwrap();
 
-    assert_eq!(tid, 42);
     assert_eq!(decoded.pks.to_vec_u128(&schema), pks);
     assert_eq!(decoded.weights, weights);
     assert_eq!(decoded.nulls, nulls);
@@ -159,7 +146,7 @@ fn test_encode_decode_strings() {
         Some("abcdefghijkl".into()), // exactly 12 chars
     ];
 
-    let cells: Vec<Option<&str>> = vals.iter().map(|v| v.as_deref()).collect();
+    let cells: Vec<Option<&[u8]>> = vals.iter().map(|v| v.as_deref().map(str::as_bytes)).collect();
     let mut blob = Vec::new();
     let batch = ZSetBatch {
         pks: PkColumn::from_natives(&schema, 0..n as u128),
@@ -169,8 +156,8 @@ fn test_encode_decode_strings() {
         blob,
     };
 
-    let encoded = encode_wal_block(0, &batch);
-    let (decoded, _) = decode_wal_block(&encoded, &schema).unwrap();
+    let encoded = encode_wal_block(&batch);
+    let decoded = decode_wal_block(&encoded, &schema).unwrap();
 
     assert_eq!(decoded.nulls, nulls);
     assert_eq!(german_vals(&decoded, 0), vals);
@@ -190,9 +177,8 @@ fn test_encode_decode_u128() {
         blob: vec![],
     };
 
-    let encoded = encode_wal_block(1, &batch);
-    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
-    assert_eq!(tid, 1);
+    let encoded = encode_wal_block(&batch);
+    let decoded = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(wide_vals(&decoded.payload[0].bytes), vals);
 }
 
@@ -208,11 +194,8 @@ fn i128_schema() -> Schema {
     }
 }
 
-/// Wide single-column I128 PK + payload round-trip. Pre-fix, the PK decode took
-/// the raw `from_be_bytes` "always unsigned" shortcut, so a signed key came back
-/// off by 2^127 (e.g. -1 → 2^127 - 1). The §4.6.1 OPK round-trip fixes that; the
-/// payload arm grouping fixes the `Fixed`-fallthrough. Both must surface the
-/// exact signed bits across the sign and 2^63/2^64 width boundaries.
+/// Wide single-column I128 PK + payload round-trip: both surface the exact
+/// signed bits across the sign and 2^63/2^64 width boundaries.
 #[test]
 fn test_encode_decode_i128_signed_roundtrip() {
     let schema = i128_schema();
@@ -242,9 +225,8 @@ fn test_encode_decode_i128_signed_roundtrip() {
         blob: vec![],
     };
 
-    let encoded = encode_wal_block(3, &batch);
-    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
-    assert_eq!(tid, 3);
+    let encoded = encode_wal_block(&batch);
+    let decoded = decode_wal_block(&encoded, &schema).unwrap();
 
     // Each signed value survives — reinterpret the recovered bits as i128.
     let got_pk: Vec<i128> = (0..decoded.pks.len())
@@ -270,9 +252,8 @@ fn test_encode_decode_empty() {
         payload: payload_of(&schema, vec![vec![]]),
         blob: vec![],
     };
-    let encoded = encode_wal_block(7, &empty);
-    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
-    assert_eq!(tid, 7);
+    let encoded = encode_wal_block(&empty);
+    let decoded = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(decoded.len(), 0);
 }
 
@@ -286,7 +267,7 @@ fn test_bad_version() {
         payload: payload_of(&schema, vec![8u64.to_le_bytes().to_vec()]),
         blob: vec![],
     };
-    let mut encoded = encode_wal_block(0, &batch);
+    let mut encoded = encode_wal_block(&batch);
     // Set format_version = 1.
     encoded[WAL_OFF_VERSION..WAL_OFF_VERSION + 4].copy_from_slice(&1u32.to_le_bytes());
     let res = decode_wal_block(&encoded, &schema);
@@ -307,17 +288,16 @@ fn pk_stride_wal_roundtrip_u64() {
         payload: payload_of(&schema, vec![vec![0u8; n * 8]]),
         blob: vec![],
     };
-    let encoded = encode_wal_block(0, &batch);
+    let encoded = encode_wal_block(&batch);
 
-    // PK region is region 0 in the directory.
-    let (pk_off, pk_sz) = get_region_offset_size(&encoded, 0);
+    let (pk_off, pk_sz) = get_region_offset_size(&encoded, &schema, gnitz_wire::REG_PK);
     assert_eq!(pk_sz, n * 8, "U64 PK region must be 8B/row");
 
     // PK region is OPK-at-rest: an unsigned U64 encodes to big-endian.
     let expected_first = 1u64.to_be_bytes();
     assert_eq!(&encoded[pk_off..pk_off + 8], &expected_first);
 
-    let (decoded, _) = decode_wal_block(&encoded, &schema).unwrap();
+    let decoded = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(decoded.pks.to_vec_u128(&schema), pks);
 }
 
@@ -333,12 +313,12 @@ fn pk_stride_wal_roundtrip_u128() {
         payload: payload_of(&schema, vec![wide_col(&pks)]),
         blob: vec![],
     };
-    let encoded = encode_wal_block(0, &batch);
+    let encoded = encode_wal_block(&batch);
 
-    let (_, pk_sz) = get_region_offset_size(&encoded, 0);
+    let (_, pk_sz) = get_region_offset_size(&encoded, &schema, gnitz_wire::REG_PK);
     assert_eq!(pk_sz, n * 16, "U128 PK region must be 16B/row");
 
-    let (decoded, _) = decode_wal_block(&encoded, &schema).unwrap();
+    let decoded = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(decoded.pks.to_vec_u128(&schema), pks);
 }
 
@@ -355,9 +335,8 @@ fn wal_retraction_u64() {
         payload: payload_of(&schema, vec![vec![0u8; n * 8]]),
         blob: vec![],
     };
-    let encoded = encode_wal_block(5, &batch);
-    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
-    assert_eq!(tid, 5);
+    let encoded = encode_wal_block(&batch);
+    let decoded = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(decoded.pks.to_vec_u128(&schema), pks);
     assert_eq!(decoded.weights, weights, "negative weight must survive encode/decode");
 }
@@ -373,9 +352,8 @@ fn test_batch_appender_round_trip_u64_pk() {
         a.add_row(100u128, 1).i64_val(200);
         a.add_row((u32::MAX as u128) + 1, -1).i64_val(300);
     }
-    let encoded = encode_wal_block(7, &batch);
-    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
-    assert_eq!(tid, 7);
+    let encoded = encode_wal_block(&batch);
+    let decoded = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(decoded.pks.len(), 3);
     assert_eq!(decoded.pks.get(&schema, 0), 1u128);
     assert_eq!(decoded.pks.get(&schema, 1), 100u128);
@@ -394,9 +372,8 @@ fn test_batch_appender_round_trip_u128_pk() {
             a.add_row(pk, 1).u128_val(pk);
         }
     }
-    let encoded = encode_wal_block(9, &batch);
-    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
-    assert_eq!(tid, 9);
+    let encoded = encode_wal_block(&batch);
+    let decoded = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(decoded.pks.len(), pks.len());
     for (i, &expected) in pks.iter().enumerate() {
         assert_eq!(decoded.pks.get(&schema, i), expected);
@@ -464,14 +441,12 @@ fn pk_stride_wal_roundtrip_bytes_24() {
         blob: vec![],
     };
 
-    let encoded = encode_wal_block(77, &batch);
+    let encoded = encode_wal_block(&batch);
 
-    // PK region (region 0) must be count * 24 bytes.
-    let (_, pk_sz) = get_region_offset_size(&encoded, 0);
+    let (_, pk_sz) = get_region_offset_size(&encoded, &schema, gnitz_wire::REG_PK);
     assert_eq!(pk_sz, n * 24, "wide PK region must be 24B/row");
 
-    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
-    assert_eq!(tid, 77);
+    let decoded = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(decoded.weights, weights);
     assert_eq!(decoded.nulls, nulls);
     assert_eq!(decoded.pks.stride(), 24);
@@ -530,12 +505,11 @@ fn pk_stride_wal_roundtrip_bytes_64() {
         blob: vec![],
     };
 
-    let encoded = encode_wal_block(3, &batch);
-    let (_, pk_sz) = get_region_offset_size(&encoded, 0);
+    let encoded = encode_wal_block(&batch);
+    let (_, pk_sz) = get_region_offset_size(&encoded, &schema, gnitz_wire::REG_PK);
     assert_eq!(pk_sz, n * 64, "wide PK region must be 64B/row");
 
-    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
-    assert_eq!(tid, 3);
+    let decoded = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(decoded.pks.stride(), 64);
     assert_eq!(decoded.pks.region(), pk_region);
     {
@@ -584,35 +558,24 @@ fn a_null_bit_under_a_not_null_column_is_a_decode_error() {
     b.weights = vec![1, 1];
     b.nulls = vec![0, 1];
     b.payload[0].bytes = [7i64, 8].iter().flat_map(|v| v.to_le_bytes()).collect();
-    let block = encode_wal_block(3, &b);
+    let block = encode_wal_block(&b);
     match decode_wal_block(&block, &schema) {
         Err(ProtocolError::DecodeError(m)) => assert!(m.contains("NOT NULL column 'v'"), "{m}"),
         other => panic!("expected a NOT NULL decode error, got {other:?}"),
     }
 }
 
-/// Decoding a batch's own region list is decoding the block framed from it.
+/// A zero-row block's heap bytes reach no cell, so decoding one appends
+/// nothing — the heap included.
 #[test]
-fn decoding_regions_equals_decoding_the_framed_block() {
+fn a_zero_row_block_carrying_heap_bytes_appends_nothing() {
     let schema = str_schema();
-    let vals = [
-        Some("a string long enough to spill past the inline prefix"),
-        None,
-        Some("short"),
-        Some("another long string that spills into the heap"),
-    ];
-    let mut b = ZSetBatch::new(&schema);
-    b.pks = PkColumn::from_natives(&schema, 1u128..=4);
-    b.weights = vec![1, 2, 1, 3];
-    b.nulls = vals.iter().map(|v| v.is_none() as u64).collect();
-    let mut blob = Vec::new();
-    b.payload[0].bytes = german_col(&vals, &mut blob);
-    b.blob = blob;
+    let mut empty = ZSetBatch::new(&schema);
+    empty.blob = b"heap bytes no row references".to_vec();
+    let block = encode_wal_block(&empty);
 
-    let mut regions = gnitz_wire::Regions::new();
-    b.regions(&mut regions);
-    let mut local = ZSetBatch::new(&schema);
-    decode_regions_into(&mut local, &regions, b.len(), &schema).unwrap();
-    let (remote, _) = decode_wal_block(&encode_wal_block(9, &b), &schema).unwrap();
-    assert_eq!(local, remote);
+    let mut sink = ZSetBatch::new(&schema);
+    decode_wal_block_into(&mut sink, &block, &schema).unwrap();
+    assert_eq!(sink.len(), 0);
+    assert!(sink.blob.is_empty(), "a zero-row block carries no heap");
 }

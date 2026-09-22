@@ -252,7 +252,7 @@ pub(crate) fn execute_insert(
             if col_def.is_hidden {
                 // Logical-dropped column: a zero-filled NOT-NULL filler cell (null
                 // bit left unset), keeping the batch rectangular and the table on
-                // the FixedIntNonnull comparator. The value is unobservable (§6).
+                // the FixedIntNonnull comparator. The value is unobservable.
                 batch.payload[payload_idx].push_zero();
                 continue;
             }

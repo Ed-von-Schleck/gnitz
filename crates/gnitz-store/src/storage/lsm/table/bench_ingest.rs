@@ -51,7 +51,7 @@ fn delta_ingest_bench() {
         let mut blocks: Vec<Vec<u8>> = Vec::with_capacity(k);
         for j in 0..k {
             let b = make_delta(&schema, (j * n) as u64, n);
-            blocks.push(b.encode_to_wire_vec(7));
+            blocks.push(b.encode_to_wire_vec());
         }
         let wire_bytes: usize = blocks.iter().map(Vec::len).sum();
 

@@ -82,11 +82,9 @@ where
 /// paired with.
 ///
 /// A schema with no German-string column scatters straight into the destination
-/// slot ([`WireData::Scattered`]), skipping the intermediate `Batch`. One with a
-/// German string cannot: `encode_scattered_to_wire` writes the block header and
-/// directory before the scatter, so the blob region's size must be known up
-/// front, and it is data-dependent — two rows sharing a source span dedup to one
-/// copy. Those slots materialize a sub-`Batch` first.
+/// slot ([`WireData::Scattered`]). One with a German string materializes a
+/// sub-`Batch` first: the block header precedes the rows and carries the heap
+/// length, which depends on how the rows' spans dedup.
 pub(crate) fn with_group<R>(
     batch: &Batch,
     worker_indices: &[Vec<u32>],

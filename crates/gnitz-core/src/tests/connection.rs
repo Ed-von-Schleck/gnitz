@@ -658,7 +658,7 @@ mod spine_tests {
         let (blocks, _cursor) = c.delta_read_raw(9, 4, &reply_schema).unwrap();
         let _peer = h.join().unwrap();
         assert_eq!(blocks.len(), 2);
-        let (b0, _) = crate::protocol::wal_block::decode_wal_block(blocks[0].block(), &sa).unwrap();
+        let b0 = crate::protocol::wal_block::decode_wal_block(blocks[0].block(), &sa).unwrap();
         assert_eq!(b0.pks.to_vec_u128(&sa), vec![1, 2]);
         assert_eq!(stamped(&mut c.session, 9), 0, "a delta read absorbs nothing");
     }

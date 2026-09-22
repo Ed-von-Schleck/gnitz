@@ -34,11 +34,9 @@ fn frame(hdr: &ControlHeader, blob: &[u8], schema_block: Option<&[u8]>, data: Op
 }
 
 /// A stand-in WAL block of `body` region bytes.
-fn wal_block(tid: u32, body: &'static [u8]) -> Vec<u8> {
-    let mut b = crate::wal::WalBlock::new(tid, 1);
-    b.regions.push(body);
+fn wal_block(body: &'static [u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    b.append_to(&mut out);
+    crate::wal::append_block(1, &[body, &[]], &mut out);
     out
 }
 
@@ -69,7 +67,7 @@ fn encode_roundtrips() {
 fn peek_locates_the_sections_the_head_announced() {
     let hdr = probe_header();
     // Arbitrary bytes: the frame sizes the record from its prefix, never parses it.
-    let (sb, db) = (b"schema record bytes".to_vec(), wal_block(1, b"a data region"));
+    let (sb, db) = (b"schema record bytes".to_vec(), wal_block(b"a data region"));
     let head = CTRL_HEADER_SIZE + 3;
     let schema_at = head + 4..head + 4 + sb.len();
     let data_after_schema = schema_at.end..schema_at.end + db.len();
@@ -106,7 +104,7 @@ fn peek_locates_the_sections_the_head_announced() {
 /// would otherwise be answered with a streamed table dump.
 #[test]
 fn client_verb_rejects_data_on_a_non_push_verb() {
-    let db = wal_block(1, b"row");
+    let db = wal_block(b"row");
     let ctrl = |verb, data: Option<&[u8]>| {
         let hdr = ControlHeader {
             flags: WireFlags { verb, ..Default::default() },

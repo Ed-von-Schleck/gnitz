@@ -101,6 +101,16 @@ pub(crate) fn raw_read_frame(fd: &OwnedFd) -> Vec<u8> {
     payload
 }
 
+/// A STRING/BLOB column region from its values, spilling into `blob`; `None` is
+/// a NULL cell, which the region zero-fills.
+pub(crate) fn german_col(vals: &[Option<&[u8]>], blob: &mut Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() * 16);
+    for v in vals {
+        out.extend_from_slice(&gnitz_wire::encode_german_string(v.unwrap_or(&[]), blob));
+    }
+    out
+}
+
 /// `schema`'s payload regions holding `regions`, one per payload slot in slot
 /// order, each typed as its schema column.
 pub(crate) fn payload_of(

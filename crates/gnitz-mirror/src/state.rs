@@ -139,7 +139,7 @@ pub(crate) fn encode_records(records: &HashMap<u64, MirrorRecord>) -> Vec<u8> {
         bb.put_blob(&r.block);
         bb.end_row();
     }
-    bb.finish().encode_to_wire_vec(0)
+    bb.finish().encode_to_wire_vec()
 }
 
 /// Replace the state file atomically: [`encode_records`]'s output behind a

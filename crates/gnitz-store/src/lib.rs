@@ -29,9 +29,6 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-#[cfg(not(target_endian = "little"))]
-compile_error!("GnitzDB requires a little-endian target; the wire format is LE-only.");
-
 // Crate-wide scope for `gnitz_warn!` and its siblings; a plain `use` would
 // reach this module only.
 #[macro_use]

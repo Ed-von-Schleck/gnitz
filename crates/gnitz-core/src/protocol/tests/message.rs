@@ -3,7 +3,7 @@ use crate::protocol::codec::schema_from_block;
 use crate::protocol::types::{BatchAppender, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use crate::protocol::wal_block::decode_wal_block;
 use crate::protocol::{ClientVerb, WireConflictMode, WireFlags, WireStatus};
-use crate::test_support::payload_of;
+use crate::test_support::{german_col, payload_of};
 use gnitz_wire::control::peek_control_block;
 
 /// A plain push() request's flags.
@@ -25,7 +25,7 @@ fn frame_schema(buf: &[u8], ctrl: &gnitz_wire::control::DecodedControl) -> Optio
 fn frame_data(buf: &[u8], ctrl: &gnitz_wire::control::DecodedControl, schema: &Schema) -> Option<ZSetBatch> {
     ctrl.data
         .clone()
-        .map(|r| decode_wal_block(&buf[r], schema).expect("a data block decodes").0)
+        .map(|r| decode_wal_block(&buf[r], schema).expect("a data block decodes"))
 }
 
 // ── PUSH_TXN family assembly ──────────────────────────────────────
@@ -73,18 +73,18 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
     assert_eq!(ctrl.hdr.arg0, 42, "the basis rides arg0");
     let decoded = gnitz_wire::txn_frame::decode_push_txn(&payload[ctrl.body]).unwrap();
     let expected = [
-        (16u32, WireConflictMode::Update, true, 2usize),
+        (16u64, WireConflictMode::Update, true, 2usize),
         (17, WireConflictMode::Error, false, 1),
         (16, WireConflictMode::Update, false, 1),
     ];
     assert_eq!(decoded.len(), expected.len());
     for (fam, (exp_tid, exp_mode, exp_reads, exp_rows)) in decoded.iter().zip(expected) {
-        assert_eq!((fam.tid(), fam.mode, fam.reads), (exp_tid, exp_mode, exp_reads));
+        assert_eq!((fam.tid, fam.mode, fam.reads), (exp_tid, exp_mode, exp_reads));
         // The schema record is this family's.
         let block_schema = schema_from_block(fam.schema_block).unwrap();
         assert_eq!(block_schema, schema);
         // ... and the data block decodes against it, with this family's rows.
-        let (batch, _) = decode_wal_block(fam.data, &block_schema).unwrap();
+        let batch = decode_wal_block(fam.data, &block_schema).unwrap();
         assert_eq!(batch.len(), exp_rows);
     }
 }
@@ -135,7 +135,10 @@ fn string_columns_round_trip_through_a_frame() {
         nulls: nulls.clone(),
         payload: payload_of(
             &schema,
-            vec![german_col(&col1, &mut blob), german_col(&col2, &mut blob)],
+            vec![
+                german_col(&as_cells(&col1), &mut blob),
+                german_col(&as_cells(&col2), &mut blob),
+            ],
         ),
         blob,
     };
@@ -149,15 +152,9 @@ fn string_columns_round_trip_through_a_frame() {
     assert_eq!(german_vals(&data, 1), col2);
 }
 
-/// A STRING column region from its values, spilling into `blob`; `None` is a
-/// NULL cell, which the region zero-fills.
-fn german_col(vals: &[Option<String>], blob: &mut Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(vals.len() * 16);
-    for v in vals {
-        let bytes = v.as_deref().unwrap_or("").as_bytes();
-        out.extend_from_slice(&gnitz_wire::encode_german_string(bytes, blob));
-    }
-    out
+/// String values as the byte cells `german_col` takes.
+fn as_cells(vals: &[Option<String>]) -> Vec<Option<&[u8]>> {
+    vals.iter().map(|v| v.as_deref().map(str::as_bytes)).collect()
 }
 
 /// Read a STRING column region back out, `None` where null bit `pi` is set.

@@ -201,7 +201,7 @@ fn ddl_txn_roundtrip_client_to_server() {
         let decoded = decode_ddl_txn(&payload[ctrl.body]).expect("decode_ddl_txn");
         assert_eq!(decoded.len(), families.len(), "family count");
         for (fi, ((exp_tid, exp_batch), (got_tid, slice))) in families.iter().zip(&decoded).enumerate() {
-            assert_eq!(*got_tid, *exp_tid as u32, "family {fi} tid/order");
+            assert_eq!(*got_tid, *exp_tid, "family {fi} tid/order");
             let schema = crate::catalog::SysFamily::from_id(*got_tid as i64)
                 .expect("bundle family id must be a system family")
                 .schema();

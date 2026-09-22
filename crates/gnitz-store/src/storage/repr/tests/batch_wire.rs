@@ -1,19 +1,13 @@
-use super::super::batch::{REG_PAYLOAD_START, REG_WEIGHT};
+use super::super::batch::REG_PAYLOAD_START;
 use super::*;
 use crate::schema::{SchemaDescriptor, TypeCode};
 use crate::test_support::{make_batch_raw, pk_payload_schema};
-
-/// A one-row batch encoded to a WAL block, ready to have its directory forged.
-fn encoded_block(schema: &SchemaDescriptor) -> Vec<u8> {
-    make_batch_raw(schema, &[(42, 1, 7)]).encode_to_wire_vec(1)
-}
 
 /// Where region `r` of a `rows`-row block over `schema` starts.
 fn region_offset(schema: &SchemaDescriptor, rows: usize, r: usize) -> usize {
     let (strides, nr) = strides_from_schema(schema);
     let mut offsets = [0usize; MAX_BATCH_REGIONS];
-    let body = wal::body_start(num_regions(schema.num_payload_cols()));
-    wire_offsets(&strides, nr as usize, rows, body, &mut offsets);
+    wire_offsets(&strides, nr as usize, rows, &mut offsets);
     offsets[r]
 }
 
@@ -23,7 +17,7 @@ fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
     use crate::test_support::{make_batch_bytes, make_schema_pk_u64_payload_string};
     let schema = make_schema_pk_u64_payload_string();
     let long: &[u8] = b"a string long enough to spill";
-    let clean = make_batch_bytes(&schema, &[(1, 1, b"short"), (2, 1, long)]).encode_to_wire_vec(1);
+    let clean = make_batch_bytes(&schema, &[(1, 1, b"short"), (2, 1, long)]).encode_to_wire_vec();
     assert_eq!(
         Batch::decode_foreign_wal_block(&clean, &schema, &schema).map(|b| b.len()),
         Ok(2)
@@ -48,50 +42,30 @@ fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
     }
 }
 
-/// A fixed region whose directory size disagrees with what the schema implies
-/// for the row count is refused, rather than decoded against a mis-sized region.
-///
-/// The forgeries compensate — one region grows by what another loses — so the
-/// framer still sees a directory covering the block exactly, and the exact-size
-/// rule is the only thing left to reject them.
+/// A forged `ROWS` or `HEAP_LEN`, or a block cut short of its `SIZE`, is
+/// refused; a genuinely empty block decodes.
 #[test]
-fn decode_from_wal_block_rejects_mismatched_region_sizes() {
-    let schema = pk_payload_schema(&[TypeCode::U64]); // every region is 8B/row
-    for (grown, shrunk) in [(REG_PK, REG_WEIGHT), (REG_WEIGHT, REG_PK)] {
-        let mut buf = encoded_block(&schema);
-        gnitz_wire::write_u32_le(&mut buf, wal::dir_entry_offset(grown), 16);
-        gnitz_wire::write_u32_le(&mut buf, wal::dir_entry_offset(shrunk), 0);
-        let r = Batch::decode_from_wal_block(&buf, &schema);
-        assert_eq!(r.err(), Some("data WAL region size mismatch"), "region {grown} grown");
-    }
-}
-
-/// `COUNT` and `NUM_REGIONS` carry no redundancy of their own, so `n -> 0` is a
-/// single-bit flip whenever `n` is a power of two. Only the exact region-size
-/// relation rejects them. A genuinely empty block is the negative control:
-/// `count == 0` with regions to match decodes.
-#[test]
-fn decode_from_wal_block_rejects_header_count_forgeries() {
+fn decode_from_wal_block_rejects_header_forgeries() {
     let schema = pk_payload_schema(&[TypeCode::U64]);
-    let clean = make_batch_raw(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]).encode_to_wire_vec(7);
-    for forged in [0u32, 2, 1000] {
+    let clean = make_batch_raw(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]).encode_to_wire_vec();
+    let decode = |buf: &[u8]| {
+        let mut offsets = [0usize; MAX_BATCH_REGIONS];
+        decode_mem_batch_from_wal_block(buf, &schema, &mut offsets).err()
+    };
+    let mismatch = Some("block size does not match its rows and heap");
+    for (off, forged) in [
+        (wal::WAL_OFF_ROWS, 0),
+        (wal::WAL_OFF_ROWS, 2),
+        (wal::WAL_OFF_ROWS, 1000),
+        (wal::WAL_OFF_HEAP_LEN, 8),
+    ] {
         let mut buf = clean.clone();
-        gnitz_wire::write_u32_le(&mut buf, wal::WAL_OFF_COUNT, forged);
-        assert_eq!(
-            Batch::decode_from_wal_block(&buf, &schema).err(),
-            Some("data WAL region size mismatch"),
-            "COUNT 3 -> {forged} must be rejected by the exact region-size relation"
-        );
+        gnitz_wire::write_u32_le(&mut buf, off, forged);
+        assert_eq!(decode(&buf), mismatch, "header word at {off} forged to {forged}");
     }
+    assert_eq!(decode(&clean[..clean.len() - 1]), Some("declared size past buffer"));
 
-    let mut buf = clean.clone();
-    gnitz_wire::write_u32_le(&mut buf, wal::WAL_OFF_NUM_REGIONS, 4);
-    assert!(
-        Batch::decode_from_wal_block(&buf, &schema).is_err(),
-        "a forged region count must be rejected"
-    );
-
-    let empty = Batch::empty_with_schema(&schema).encode_to_wire_vec(7);
+    let empty = Batch::empty_with_schema(&schema).encode_to_wire_vec();
     let decoded = Batch::decode_from_wal_block(&empty, &schema).expect("an empty block decodes");
     assert_eq!(decoded.count, 0);
 }
@@ -104,29 +78,52 @@ fn a_zero_row_block_carrying_heap_bytes_decodes_to_an_empty_heap() {
     let schema = make_schema_pk_u64_payload_string();
     let mut empty = Batch::empty_with_schema(&schema);
     empty.blob.extend_from_slice(b"heap bytes no row references");
-    let block = empty.encode_to_wire_vec(7);
+    let block = empty.encode_to_wire_vec();
 
     let decoded = Batch::decode_from_wal_block(&block, &schema).expect("a zero-row block decodes");
     assert_eq!(decoded.len(), 0);
     assert!(decoded.blob.is_empty(), "a zero-row block carries no heap");
 }
 
-/// The variable-length blob region is the one whose extent the schema cannot
-/// predict. When it overruns the block, the decoder must never reach the point
-/// of resolving strings against a heap that is not there.
+/// Encode then decode 1-row and 100-row blocks of a (u64 PK, two i64 payload)
+/// schema: the per-block constant of the framer and the decoder.
 #[test]
-fn decode_mem_batch_rejects_blob_region_past_block() {
-    let schema = pk_payload_schema(&[TypeCode::U64]);
-    let mut buf = encoded_block(&schema);
-    gnitz_wire::write_u32_le(
-        &mut buf,
-        wal::dir_entry_offset(REG_PAYLOAD_START + schema.num_payload_cols()),
-        8,
+#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+fn wal_block_bench() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    const ITERS: usize = 1_000_000;
+    let schema = SchemaDescriptor::new(
+        &[
+            crate::schema::SchemaColumn::new(TypeCode::U64, false),
+            crate::schema::SchemaColumn::new(TypeCode::I64, false),
+            crate::schema::SchemaColumn::new(TypeCode::I64, false),
+        ],
+        &[0],
     );
+    for rows in [1usize, 100] {
+        let mut b = super::super::batch_builder::BatchBuilder::new(schema);
+        for i in 0..rows as u64 {
+            b.begin_row(i as u128, 1);
+            b.put_int(i as u128);
+            b.put_int((i * 3) as u128);
+            b.end_row();
+        }
+        let batch = b.finish();
+        let mut buf = vec![0u8; batch.wire_byte_size()];
+        let mut offsets = [0usize; MAX_BATCH_REGIONS];
 
-    let mut offsets = [0usize; MAX_BATCH_REGIONS];
-    let r = decode_mem_batch_from_wal_block(&buf, &schema, &mut offsets);
-    assert_eq!(r.err(), Some("data WAL block invalid"));
+        let t = Instant::now();
+        for _ in 0..ITERS {
+            let n = black_box(&batch).encode_to_wire(black_box(&mut buf), 0);
+            let mb = decode_mem_batch_from_wal_block(black_box(&buf[..n]), &schema, &mut offsets).unwrap();
+            black_box(mb.count);
+        }
+        println!(
+            "wal block {rows} rows: encode + decode {:.1} ns",
+            t.elapsed().as_nanos() as f64 / ITERS as f64
+        );
+    }
 }
 
 /// Rows the chunker takes from `start` under `budget`.

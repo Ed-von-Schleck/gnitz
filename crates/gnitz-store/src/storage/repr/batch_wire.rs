@@ -2,30 +2,21 @@
 //!
 //! Keeping the serialization cluster here rather than in `batch.rs` lets the
 //! pure in-memory repr name no wire module.
-//!
-//! These run per-flush / per-IPC, not per-row; the region-copy loops stay
-//! `#[inline]`-friendly and read every stride/offset off the `Batch` /
-//! `SchemaDescriptor` view.
 
 use super::batch::{strides_from_schema, string_mask, Batch, MAX_BATCH_REGIONS, REG_PK};
 use super::merge::{blob_span_key, BlobCache, BlobCacheGuard, DirectWriter, MemBatch};
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::wal;
-use gnitz_wire::{num_regions, Regions};
+use gnitz_wire::Regions;
 
-/// A block's size is affine in its row count: `base + rows · per_row`, plus the
-/// heap.
-fn block_terms(strides: &[u8]) -> (usize, usize) {
-    (
-        wal::body_start(strides.len() + 1),
-        strides.iter().map(|&s| s as usize).sum(),
-    )
+/// One row's bytes across the fixed regions of `strides`.
+fn row_width(strides: &[u8]) -> usize {
+    strides.iter().map(|&s| s as usize).sum()
 }
 
-/// Each fixed region's offset from the block start, given where the first one
-/// begins: they pack end to end from there.
-fn wire_offsets(strides: &[u8], nr: usize, rows: usize, start: usize, offsets: &mut [usize; MAX_BATCH_REGIONS]) {
-    let mut off = start;
+/// Each fixed region's offset in a `rows`-row block.
+fn wire_offsets(strides: &[u8], nr: usize, rows: usize, offsets: &mut [usize; MAX_BATCH_REGIONS]) {
+    let mut off = wal::WAL_HEADER_SIZE;
     for r in 0..nr {
         offsets[r] = off;
         off += rows * strides[r] as usize;
@@ -56,15 +47,13 @@ impl Batch {
 
     /// Byte count of the WAL-block encoding for this batch.
     pub fn wire_byte_size(&self) -> usize {
-        let (base, per_row) = block_terms(self.strides());
-        base + self.count * per_row + self.blob.len()
+        self.wire_byte_size_range(self.count) + self.blob.len()
     }
 
     /// Byte count of the WAL-block encoding for `count` rows from this batch,
     /// with an empty heap.
     pub fn wire_byte_size_range(&self, count: usize) -> usize {
-        let (base, per_row) = block_terms(self.strides());
-        base + count * per_row
+        wal::WAL_HEADER_SIZE + count * row_width(self.strides())
     }
 
     /// What one frame carries from `start` within `budget` bytes beside
@@ -113,15 +102,15 @@ impl Batch {
 
     /// Rows from `start` that fit `budget` by fixed width alone.
     fn rows_by_width(&self, start: usize, overhead: usize, budget: usize) -> usize {
-        let (base, slope) = block_terms(self.strides());
-        (self.count - start).min((budget.saturating_sub(overhead + base) / slope).max(1))
+        let slope = row_width(self.strides());
+        (self.count - start).min((budget.saturating_sub(overhead + wal::WAL_HEADER_SIZE) / slope).max(1))
     }
 
     /// Rows from `start` that fit `budget` once the heap bytes they relocate are
     /// charged. `slots` names the German-string payload slots.
     fn rows_with_heap(&self, start: usize, slots: u64, overhead: usize, budget: usize) -> usize {
-        let (base, slope) = block_terms(self.strides());
-        let base = overhead + base;
+        let slope = row_width(self.strides());
+        let base = overhead + wal::WAL_HEADER_SIZE;
         let remaining = self.count - start;
         let mut guard = BlobCacheGuard::acquire(self.schema(), remaining);
         let seen = guard.get_mut().expect("a German-string column implies a blob cache");
@@ -172,36 +161,29 @@ impl Batch {
     }
 
     /// Encode self into WAL wire format at out[offset..]. Returns bytes written.
-    pub fn encode_to_wire(&self, table_id: u32, out: &mut [u8], offset: usize) -> usize {
-        let mut block = wal::WalBlock::new(table_id, self.count as u32);
-        self.wire_regions(&mut block.regions);
-        block.write(&mut out[offset..offset + block.size()])
+    pub fn encode_to_wire(&self, out: &mut [u8], offset: usize) -> usize {
+        let mut r = Regions::new();
+        self.wire_regions(&mut r);
+        wal::write_block(self.count, &r, &mut out[offset..])
     }
 
     /// Rows `[start, start + rows)` as one WAL block at `out[offset..]`, framed
     /// off this batch with no heap. Returns bytes written.
-    pub fn encode_range_to_wire(
-        &self,
-        start: usize,
-        rows: usize,
-        table_id: u32,
-        out: &mut [u8],
-        offset: usize,
-    ) -> usize {
+    pub fn encode_range_to_wire(&self, start: usize, rows: usize, out: &mut [u8], offset: usize) -> usize {
         // A narrowed block carries no heap, so its trailing region is empty.
-        let mut block = wal::WalBlock::new(table_id, rows as u32);
-        self.fixed_regions(start, rows, &mut block.regions);
-        block.regions.push(&[]);
-        block.write(&mut out[offset..offset + block.size()])
+        let mut r = Regions::new();
+        self.fixed_regions(start, rows, &mut r);
+        r.push(&[]);
+        wal::write_block(rows, &r, &mut out[offset..])
     }
 
     /// [`Self::encode_to_wire`] into a buffer of its own, sized by
     /// [`Self::wire_byte_size`].
-    pub fn encode_to_wire_vec(&self, table_id: u32) -> Vec<u8> {
-        let mut block = wal::WalBlock::new(table_id, self.count as u32);
-        self.wire_regions(&mut block.regions);
+    pub fn encode_to_wire_vec(&self) -> Vec<u8> {
+        let mut r = Regions::new();
+        self.wire_regions(&mut r);
         let mut out = Vec::with_capacity(self.wire_byte_size());
-        block.append_to(&mut out);
+        wal::append_block(self.count, &r, &mut out);
         debug_assert_eq!(
             out.len(),
             self.wire_byte_size(),
@@ -212,7 +194,7 @@ impl Batch {
 
     /// Encode the rows `indices` selects, in order, as one WAL block of
     /// `wire_byte_size_range(indices.len())` bytes at `out[offset..]`.
-    pub fn encode_scattered_to_wire(&self, indices: &[u32], table_id: u32, out: &mut [u8], offset: usize) -> usize {
+    pub fn encode_scattered_to_wire(&self, indices: &[u32], out: &mut [u8], offset: usize) -> usize {
         debug_assert!(
             !self.schema().has_german_string(),
             "a row scatter writes no heap bytes, so it cannot carry a string column"
@@ -220,18 +202,11 @@ impl Batch {
         let count = indices.len();
         let strides = self.strides();
         let nr = strides.len();
-        // One entry per fixed region, then the empty blob heap.
-        let sizes = (0..nr + 1).map(|r| strides.get(r).map_or(0, |&s| (count * s as usize) as u32));
-        let (block, body_at) = wal::frame(&mut out[offset..], table_id, count as u32, sizes);
-        let total_size = block.len();
-        debug_assert_eq!(
-            total_size,
-            self.wire_byte_size_range(count),
-            "the frame must fill the slot its caller sized"
-        );
+        let total_size = wal::write_head(&mut out[offset..], count, count * row_width(strides), 0);
+        let block = &mut out[offset..offset + total_size];
 
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
-        wire_offsets(strides, nr, count, body_at, &mut offsets);
+        wire_offsets(strides, nr, count, &mut offsets);
         // No German-string columns here; `DirectWriter` still wants a blob arena,
         // so hand it a 0-cap stack local it must not grow.
         let mut empty_blob: Vec<u8> = Vec::new();
@@ -250,14 +225,8 @@ impl Batch {
     }
 
     /// [`Self::decode_from_wal_block`] for a block a peer wrote, refusing a
-    /// German-string cell not in canonical form: a heap extent past the blob, or
-    /// padding that would split one element's weight across two rows.
-    ///
-    /// The refusal lands on the borrowed view, so a corrupt block costs neither
-    /// the region copy nor the heap copy `from_mem_batch` would pay. `out_schema`
-    /// is what the rows land in — see `Batch::from_mem_batch` for what the two
-    /// schemas may differ in; a reader that wants the block as it stands passes
-    /// `in_schema` twice.
+    /// German-string cell not in canonical form. The rows land in `out_schema`,
+    /// as `Batch::from_mem_batch` maps them.
     pub fn decode_foreign_wal_block(
         data: &[u8],
         in_schema: &SchemaDescriptor,
@@ -288,10 +257,8 @@ fn validate_string_heap_extents(mb: &MemBatch<'_>, schema: &SchemaDescriptor) ->
     Ok(())
 }
 
-/// The one WAL-block parser: validate the block, check every fixed region's
-/// size is exactly `count * stride` for `schema` (every producer writes exact
-/// sizes; the blob region is variable), and return a borrowed `MemBatch` view
-/// over `data` and `offsets`.
+/// A WAL block validated under `schema`, as a `MemBatch` borrowing `data`, its
+/// region offsets in `offsets`.
 ///
 /// String cells are not canonicalized: relocate them on the way in
 /// (`Batch::append_mem_batch*`), validate them
@@ -301,37 +268,10 @@ pub fn decode_mem_batch_from_wal_block<'a>(
     schema: &SchemaDescriptor,
     offsets: &'a mut [usize; MAX_BATCH_REGIONS],
 ) -> Result<MemBatch<'a>, &'static str> {
-    // The writer↔reader region contract: `strides` is each fixed region's
-    // per-row width, `nr` the trailing blob region's index — the same
-    // derivation the shard writer and the shard reader's bind share.
     let (strides, nr) = strides_from_schema(schema);
     let nr = nr as usize;
-
-    let mut regions = Regions::new();
-    let n = wal::validate_and_parse(data, &mut regions).map_err(|_| "data WAL block invalid")? as usize;
-
-    if regions.len() != num_regions(schema.num_payload_cols()) {
-        return Err("data WAL block region count mismatch");
-    }
-
-    // Every fixed region exactly `n` rows at its schema stride. Holds at
-    // `n == 0` too, where it demands zero-size regions — so a block whose COUNT
-    // was flipped to 0 still carries its rows' bytes and fails here.
-    for r in 0..nr {
-        if regions[r].len() != n * strides[r] as usize {
-            return Err("data WAL region size mismatch");
-        }
-    }
-    wire_offsets(&strides, nr, n, wal::body_start(regions.len()), offsets);
-    debug_assert!(
-        (0..nr).all(|r| data
-            .get(offsets[r]..)
-            .is_some_and(|d| std::ptr::eq(regions[r].as_ptr(), d.as_ptr()))),
-        "the derived offsets must land on the regions the framer parsed"
-    );
-
-    // A zero-row block references no heap byte, so its declared heap is dropped.
-    let blob = if n == 0 { &[][..] } else { regions[nr] };
+    let (n, _, blob) = wal::parse_block(data, row_width(&strides[..nr]))?;
+    wire_offsets(&strides, nr, n, offsets);
 
     Ok(MemBatch {
         data,

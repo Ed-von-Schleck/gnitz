@@ -5,9 +5,6 @@
 //! `src/tests/` holds those; the crate-root `tests/` beside `src/` is the
 //! integration suite, gated on the `integration` feature.
 
-#[cfg(not(target_endian = "little"))]
-compile_error!("GnitzDB requires a little-endian target; the wire format is LE-only.");
-
 pub mod client;
 pub mod connection;
 pub mod error;

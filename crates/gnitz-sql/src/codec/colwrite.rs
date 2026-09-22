@@ -1,4 +1,4 @@
-//! Column value encoding: SQL literal → one §6 region cell.
+//! Column value encoding: SQL literal → one region cell, in the canonical region order.
 //!
 //! One encoder, [`append_value_to_col`], writes both an INSERT cell and a SET
 //! literal, so `300` means the same thing whichever verb writes it; and

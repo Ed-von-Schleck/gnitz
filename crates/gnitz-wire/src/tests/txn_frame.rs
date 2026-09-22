@@ -9,19 +9,28 @@ fn item(view_id: u64, after_tick: u64, reply_block: &[u8]) -> DeltaPollItem<'_> 
 /// The one region every stand-in block below carries.
 const REGION: &[u8] = &[7u8; 24];
 
-/// A minimal WAL block carrying `tid`, as the frame encoders take it.
-fn wal_block(tid: u32) -> WalBlock<'static> {
-    let mut b = WalBlock::new(tid, 1);
-    b.regions.push(REGION);
-    b
+/// A tid past `u32`: the item framing carries all 64 bits.
+const WIDE_TID: u64 = (1 << 40) | 16;
+
+/// A minimal one-row block, as the frame encoders take it.
+fn wal_block() -> (usize, Regions<'static>) {
+    let mut r = Regions::new();
+    r.push(REGION);
+    r.push(&[]);
+    (1, r)
 }
 
 /// The same block already framed — what a decode must hand back, and what a
 /// *schema* block (which the frame carries pre-encoded) is built from.
-fn block(tid: u32) -> Vec<u8> {
+fn block() -> Vec<u8> {
     let mut buf = Vec::new();
-    wal_block(tid).append_to(&mut buf);
+    crate::wal::append_block(1, &[REGION, &[]], &mut buf);
     buf
+}
+
+fn ddl_item(tid: u64) -> (u64, usize, Regions<'static>) {
+    let (rows, r) = wal_block();
+    (tid, rows, r)
 }
 
 fn peeked<'a, T>(frame: &'a [u8], decode: impl Fn(&'a [u8]) -> Result<T, String>) -> Result<T, String> {
@@ -30,19 +39,30 @@ fn peeked<'a, T>(frame: &'a [u8], decode: impl Fn(&'a [u8]) -> Result<T, String>
     decode(&frame[ctrl.body.clone()])
 }
 
-fn family<D>(mode: WireConflictMode, reads: bool, schema_block: &[u8], data: D) -> PushTxnItem<'_, D> {
-    PushTxnItem { mode, reads, schema_block, data }
+fn family(
+    tid: u64,
+    mode: WireConflictMode,
+    reads: bool,
+    schema_block: &[u8],
+) -> PushTxnItem<'_, (usize, Regions<'static>)> {
+    PushTxnItem {
+        tid,
+        mode,
+        reads,
+        schema_block,
+        data: wal_block(),
+    }
 }
 
 /// Every frame's control header carries only its verb, and a push's basis in
 /// `arg0`; its body starts right after the header.
 #[test]
 fn the_shared_prologue_carries_only_the_routing_flag() {
-    let d = block(16);
+    let d = block();
     let frames = [
-        (encode_ddl_txn(&[wal_block(16)]), ClientVerb::DdlTxn, 0),
+        (encode_ddl_txn(&[ddl_item(16)]), ClientVerb::DdlTxn, 0),
         (
-            encode_push_txn(42, &[family(WireConflictMode::Update, true, &d, wal_block(16))]),
+            encode_push_txn(42, &[family(16, WireConflictMode::Update, true, &d)]),
             ClientVerb::PushTxn,
             42,
         ),
@@ -68,44 +88,42 @@ fn the_shared_prologue_carries_only_the_routing_flag() {
 
 #[test]
 fn ddl_txn_roundtrips_every_family_in_order() {
-    let (a, b) = (block(4), block(2));
-    let frame = encode_ddl_txn(&[wal_block(4), wal_block(2)]);
+    let b = block();
+    let frame = encode_ddl_txn(&[ddl_item(WIDE_TID), ddl_item(2)]);
     let got = peeked(&frame, decode_ddl_txn).unwrap();
-    assert_eq!(got.len(), 2);
-    assert_eq!(got[0], (4, &a[..]));
-    assert_eq!(got[1], (2, &b[..]));
+    assert_eq!(got, [(WIDE_TID, &b[..]), (2, &b[..])]);
 }
 
 #[test]
 fn push_txn_roundtrips_families_modes_and_read_flags() {
-    let (s0, d0, s1, d1) = (block(16), block(16), block(17), block(17));
+    let (s0, s1, d) = (b"schema 0".to_vec(), b"schema one".to_vec(), block());
     let frame = encode_push_txn(
         7,
         &[
-            family(WireConflictMode::Error, false, &s0, wal_block(16)),
-            family(WireConflictMode::Update, true, &s1, wal_block(17)),
+            family(16, WireConflictMode::Error, false, &s0),
+            family(WIDE_TID, WireConflictMode::Update, true, &s1),
         ],
     );
     let fams = peeked(&frame, decode_push_txn).unwrap();
     assert_eq!(fams.len(), 2);
     assert_eq!(
-        (fams[0].tid(), fams[0].mode, fams[0].reads),
+        (fams[0].tid, fams[0].mode, fams[0].reads),
         (16, WireConflictMode::Error, false)
     );
     assert_eq!(
-        (fams[1].tid(), fams[1].mode, fams[1].reads),
-        (17, WireConflictMode::Update, true)
+        (fams[1].tid, fams[1].mode, fams[1].reads),
+        (WIDE_TID, WireConflictMode::Update, true)
     );
-    assert_eq!((fams[0].schema_block, fams[0].data), (&s0[..], &d0[..]));
-    assert_eq!((fams[1].schema_block, fams[1].data), (&s1[..], &d1[..]));
+    assert_eq!((fams[0].schema_block, fams[0].data), (&s0[..], &d[..]));
+    assert_eq!((fams[1].schema_block, fams[1].data), (&s1[..], &d[..]));
 }
 
 /// A reads byte is a flag: anything but `0` or `1` is a malformed frame.
 #[test]
 fn push_txn_refuses_a_reads_byte_that_is_not_a_flag() {
-    let s = block(16);
-    let mut frame = encode_push_txn(0, &[family(WireConflictMode::Update, true, &s, wal_block(16))]);
-    frame[CTRL_HEADER_SIZE + 1] = 2;
+    let s = block();
+    let mut frame = encode_push_txn(0, &[family(16, WireConflictMode::Update, true, &s)]);
+    frame[CTRL_HEADER_SIZE + 8 + 1] = 2;
     let err = peeked(&frame, decode_push_txn).err().expect("a reads byte of 2");
     assert!(err.contains("neither 0 nor 1"), "{err:?}");
 }
@@ -205,8 +223,8 @@ fn a_truncation_inside_an_item_is_a_decode_error() {
             }
         }
     }
-    let s = block(16);
-    let fam = || family(WireConflictMode::Update, true, &s, wal_block(16));
+    let s = block();
+    let fam = || family(16, WireConflictMode::Update, true, &s);
     check(
         "PUSH_TXN",
         &encode_push_txn(1, &[fam()]),
@@ -215,8 +233,8 @@ fn a_truncation_inside_an_item_is_a_decode_error() {
     );
     check(
         "DDL_TXN",
-        &encode_ddl_txn(&[wal_block(16)]),
-        &encode_ddl_txn(&[wal_block(16), wal_block(16)]),
+        &encode_ddl_txn(&[ddl_item(16)]),
+        &encode_ddl_txn(&[ddl_item(16), ddl_item(16)]),
         decode_ddl_txn,
     );
     check(

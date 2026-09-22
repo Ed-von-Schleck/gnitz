@@ -5,10 +5,9 @@
 pub mod codec;
 pub mod error;
 pub mod message;
-pub mod regions;
 pub(crate) mod transport;
 pub mod types;
-pub mod wal_block;
+pub(crate) mod wal_block;
 
 pub use codec::ReplySchema;
 pub use error::ProtocolError;

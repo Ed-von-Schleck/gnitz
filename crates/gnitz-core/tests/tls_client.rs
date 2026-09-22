@@ -343,7 +343,7 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
             let ctrl = peek_control_block(&buf).unwrap();
             assert_eq!(ctrl.hdr.status, WireStatus::Ok, "scan frame must be OK");
             if let Some(r) = ctrl.data {
-                rows += gnitz_wire::read_u32_le(&buf[r], gnitz_wire::wal::WAL_OFF_COUNT) as usize;
+                rows += gnitz_wire::read_u32_le(&buf[r], gnitz_wire::wal::WAL_OFF_ROWS) as usize;
             }
             if !ctrl.hdr.flags.continuation {
                 break;

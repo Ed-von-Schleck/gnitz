@@ -205,12 +205,11 @@ impl<'a> WireMsg<'a> {
         );
 
         if has_data {
-            let tid = self.target_id as u32;
             pos += match self.data {
                 WireData::None => unreachable!("has_data implies a batch"),
-                WireData::Whole(b) => b.encode_to_wire(tid, out, pos),
-                WireData::Range { batch, start, rows } => batch.encode_range_to_wire(start, rows, tid, out, pos),
-                WireData::Scattered { batch, indices } => batch.encode_scattered_to_wire(indices, tid, out, pos),
+                WireData::Whole(b) => b.encode_to_wire(out, pos),
+                WireData::Range { batch, start, rows } => batch.encode_range_to_wire(start, rows, out, pos),
+                WireData::Scattered { batch, indices } => batch.encode_scattered_to_wire(indices, out, pos),
             };
         }
 

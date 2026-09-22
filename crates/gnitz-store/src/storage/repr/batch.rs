@@ -60,13 +60,6 @@ pub(in crate::storage) fn compute_offsets_into(
     capacity: usize,
     offsets: &mut [usize; MAX_BATCH_REGIONS],
 ) -> usize {
-    // Offsets are `usize`, not `u32`: a single large batch (a wide multi-column
-    // join, a bulk full-scan/merge) can have a cumulative offset > 4 GB even
-    // though each individual region is still capped at 4 GB by the u32 wire
-    // region sizes. A `u32` store silently truncated the per-region offset, so
-    // `region_at` aliased an earlier region — silent corruption. Not a wire
-    // change: the WAL/exchange encoding serializes region *sizes* and recomputes
-    // offsets on receive, so offsets never cross a process boundary.
     let mut off = 0usize;
     for i in 0..num_regions {
         off = off.next_multiple_of(8);

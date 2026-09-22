@@ -59,8 +59,8 @@ impl Writer {
     }
 
     /// A WAL block, framed straight onto the end of the buffer.
-    pub(crate) fn block(&mut self, b: &crate::wal::WalBlock<'_>) -> &mut Self {
-        b.append_to(&mut self.0);
+    pub(crate) fn block(&mut self, rows: usize, regions: &[&[u8]]) -> &mut Self {
+        crate::wal::append_block(rows, regions, &mut self.0);
         self
     }
 

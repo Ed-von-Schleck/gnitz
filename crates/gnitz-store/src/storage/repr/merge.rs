@@ -564,7 +564,7 @@ impl<'a> DirectWriter<'a> {
     }
 
     /// One writable slice per fixed region, carved at `offsets[r]` from
-    /// `data`'s own start — so a wire block's header and directory come out as
+    /// `data`'s own start — so a wire block's header comes out as
     /// the first region's leading pad.
     pub(crate) fn over_regions(
         data: &'a mut [u8],

@@ -278,7 +278,7 @@ impl PkColumn {
         self.stride as usize
     }
 
-    /// The whole §6 PK region: `len()` rows of `stride` OPK bytes.
+    /// The whole PK region: `len()` rows of `stride` OPK bytes.
     #[inline]
     pub fn region(&self) -> &[u8] {
         &self.buf
@@ -380,8 +380,8 @@ impl PkColumn {
 }
 
 /// Append one zero-filled cell of wire type `tc` to a payload region — the NULL
-/// encoding and the non-null filler alike. The null bitmap is the NULL truth
-/// (§6), and a zeroed German cell *is* the empty value, which is what
+/// encoding and the non-null filler alike. The null bitmap is the NULL truth,
+/// and a zeroed German cell *is* the empty value, which is what
 /// `encode_german_string(&[], _)` writes.
 pub fn push_zero_cell(col: &mut Vec<u8>, tc: TypeCode) {
     col.extend(std::iter::repeat_n(0u8, tc.wire_stride()));
@@ -425,7 +425,7 @@ impl PayloadColumn {
     }
 }
 
-/// A batch in the §6 region shape: every payload slot is its own wire region,
+/// A batch in the canonical region order: every payload slot is its own wire region,
 /// and a STRING/BLOB slot holds 16-byte German-string cells against
 /// [`Self::blob`]. Nothing here is materialized — this is the form the wire
 /// carries and the shared evaluator reads.
@@ -624,14 +624,12 @@ impl ZSetBatch {
     }
 
     /// Every payload region is the length its type and the row count imply.
-    /// Split out of [`Self::validate`] because the region builder needs the same
-    /// rule for a batch that never went through the push path.
     pub(crate) fn check_columns(&self) -> Result<(), std::string::String> {
         let n = self.len();
         let regions = gnitz_wire::num_regions(self.payload.len());
         if regions > gnitz_wire::MAX_WIRE_REGIONS {
             return Err(format!(
-                "{regions} regions exceeds the {} a block directory holds",
+                "{regions} regions exceeds the {} a region list holds",
                 gnitz_wire::MAX_WIRE_REGIONS
             ));
         }

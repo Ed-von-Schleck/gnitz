@@ -1184,8 +1184,7 @@ fn decode_push_txn_frame(body: &[u8]) -> Result<DecodedTxn, WireFault> {
     let mut families: Vec<TxnFamily> = Vec::with_capacity(raw.len());
     let mut reads = Vec::new();
     for fam in &raw {
-        // The wire carries the tid as u32; the catalog addresses it as i64.
-        let tid = fam.tid() as i64;
+        let tid = fam.tid as i64;
         let wire_schema = gnitz_store::schema::decode_schema_block(fam.schema_block)
             .map_err(|e| format!("TXN family {tid} schema decode error: {e}"))?;
         let batch =
