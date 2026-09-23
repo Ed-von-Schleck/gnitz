@@ -30,4 +30,4 @@ pub(crate) use protocol::transport::ClientTransport;
 pub use protocol::types::{
     push_zero_cell, sys_schema, BatchAppender, BatchMark, PayloadColumn, PkColumn, Schema, ZSetBatch,
 };
-pub use protocol::wal_block::decode_regions_into;
+pub use protocol::wal_block::append_own_regions;

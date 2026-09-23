@@ -27,7 +27,8 @@ fn fixed_strides(schema: &Schema) -> impl Iterator<Item = usize> + '_ {
         .chain(schema.payload_columns().map(|(_, _, c)| c.ty.tc.wire_stride()))
 }
 
-/// Decode a WAL block under `schema`, appending its rows to `sink`.
+/// Decode a WAL block under `schema`, appending its rows to `sink`. On error
+/// `sink` is not usable.
 pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &Schema) -> Result<(), ProtocolError> {
     let (rows, fixed, heap, _) = gnitz_wire::wal::parse_block(data, fixed_strides(schema).sum())
         .map_err(|e| ProtocolError::DecodeError(format!("WAL {e}")))?;
@@ -38,13 +39,26 @@ pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &
         at += rows * s;
     }
     regions.push(heap);
-    decode_regions_into(sink, &regions, schema)
+    append_regions(sink, &regions, schema, true)
 }
 
-/// Decode the rows laid out as the canonical region list `regions` under
-/// `schema`, appending them to `sink`, a batch of `schema`. On error `sink` is
-/// not usable.
-pub fn decode_regions_into(sink: &mut ZSetBatch, regions: &[&[u8]], schema: &Schema) -> Result<(), ProtocolError> {
+/// Append to `sink`, a batch of `schema`, the rows of a canonical region list
+/// this process's own store produced. Its German cells are rebased and not
+/// checked, the store having checked them when it ingested them; the layout
+/// and NOT NULL are checked as for a block. On error `sink` is not usable.
+pub fn append_own_regions(sink: &mut ZSetBatch, regions: &[&[u8]], schema: &Schema) -> Result<(), ProtocolError> {
+    append_regions(sink, regions, schema, false)
+}
+
+/// Append the rows laid out as the canonical region list `regions` under
+/// `schema` to `sink`, a batch of `schema`. `foreign` regions crossed a trust
+/// boundary, so each German cell is checked for canonical form as it is copied.
+fn append_regions(
+    sink: &mut ZSetBatch,
+    regions: &[&[u8]],
+    schema: &Schema,
+    foreign: bool,
+) -> Result<(), ProtocolError> {
     debug_assert!(sink.layout_matches(schema).is_ok() && sink.check_columns().is_ok());
     let count = regions.get(REG_WEIGHT).map_or(0, |w| w.len() / 8);
     if regions.len() != gnitz_wire::num_regions(schema.num_payload_cols())
@@ -72,7 +86,7 @@ pub fn decode_regions_into(sink: &mut ZSetBatch, regions: &[&[u8]], schema: &Sch
         dst.extend_from_slice(regions[REG_PAYLOAD_START + pi]);
         if col.ty.tc.is_german_string() {
             for cell in dst[at..].as_chunks_mut::<16>().0 {
-                if !gnitz_wire::german_string_cell_ok(cell, block_blob) {
+                if foreign && !gnitz_wire::german_string_cell_ok(cell, block_blob) {
                     return Err(ProtocolError::DecodeError(format!(
                         "column {ci}: German string cell is not in canonical form"
                     )));
@@ -87,3 +101,7 @@ pub fn decode_regions_into(sink: &mut ZSetBatch, regions: &[&[u8]], schema: &Sch
 #[cfg(test)]
 #[path = "tests/wal_block.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/wal_block.rs"]
+mod benches;

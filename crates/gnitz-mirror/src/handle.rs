@@ -4,7 +4,7 @@
 use gnitz_zset::schema::SchemaFacts;
 use std::collections::HashMap;
 
-use gnitz_core::decode_regions_into;
+use gnitz_core::append_own_regions;
 use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, Refill, Schema, ZSetBatch};
 use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
@@ -272,8 +272,9 @@ impl Copies {
             .map_err(MirrorError::Engine)?;
         let regions = batch.wire_regions();
         let mut rows = ZSetBatch::new(reply_schema);
-        // The client's own block decoder: a local and a remote reply decode by one rule.
-        decode_regions_into(&mut rows, &regions, reply_schema).map_err(|e| MirrorError::Engine(e.to_string()))?;
+        // The client's own region append, so a local and a remote reply land in
+        // one row layout; the cells are this copy's, checked when it ingested them.
+        append_own_regions(&mut rows, &regions, reply_schema).map_err(|e| MirrorError::Engine(e.to_string()))?;
         Ok(rows)
     }
 

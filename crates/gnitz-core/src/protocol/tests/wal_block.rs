@@ -21,6 +21,34 @@ fn a_string_cell_pointing_past_the_blob_is_refused() {
     }
 }
 
+/// A process's own regions are appended behind the rows a batch already holds,
+/// each long cell reading its content at the heap's new place, and their layout
+/// is checked as a block's is.
+#[test]
+fn own_regions_are_appended_with_their_long_cells_rebased() {
+    let schema = kv_schema(TypeCode::String);
+    let mut batch = ZSetBatch::new(&schema);
+    BatchAppender::new(&mut batch)
+        .add_row(1, 1)
+        .str_val("ab")
+        .add_row(2, -1)
+        .str_val("a value well past the inline cell");
+    let regions = batch.wire_regions();
+
+    let mut sink = batch.clone();
+    append_own_regions(&mut sink, &regions, &schema).unwrap();
+    assert_eq!(sink.len(), 4);
+    assert_eq!(sink.weights, [1, -1, 1, -1]);
+    let cells = sink.payload[0].bytes.as_chunks::<16>().0;
+    let content = |i: usize| gnitz_wire::german_string_content(&cells[i], &sink.blob);
+    assert_eq!(content(1), content(3));
+    assert_eq!(content(3), b"a value well past the inline cell");
+    assert_eq!(content(2), b"ab");
+
+    let short = &regions[..regions.len() - 1];
+    assert!(append_own_regions(&mut ZSetBatch::new(&schema), short, &schema).is_err());
+}
+
 /// A block of zero rows is refused: an empty batch ships no block.
 #[test]
 fn a_zero_row_block_is_refused() {
@@ -39,7 +67,7 @@ fn a_region_list_that_does_not_lay_out_its_schema_is_refused() {
     let mut batch = ZSetBatch::new(&schema);
     BatchAppender::new(&mut batch).add_row(1, 1).i64_val(7);
     let regions = batch.wire_regions();
-    let decode = |regions: &[&[u8]]| decode_regions_into(&mut ZSetBatch::new(&schema), regions, &schema);
+    let decode = |regions: &[&[u8]]| append_regions(&mut ZSetBatch::new(&schema), regions, &schema, true);
     decode(&regions).expect("the batch's own regions decode");
 
     let short = &regions[..regions.len() - 1];

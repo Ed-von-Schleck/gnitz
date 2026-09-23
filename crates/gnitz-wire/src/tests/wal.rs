@@ -124,3 +124,58 @@ fn each_guard_rejects_its_forgery() {
         assert_eq!(parse_block(block, ROW_WIDTH).err(), *want, "{what}");
     }
 }
+
+/// The block layout, byte for byte: what a change to the header's words, a
+/// German cell's fields, the OPK byte order or a region's place would move
+/// without moving [`WAL_FORMAT_VERSION`].
+#[test]
+fn the_block_layout_is_pinned_byte_for_byte() {
+    // A compound (I16, U8) PK, an I32 column and a STRING column.
+    const ROW: usize = 3 + 8 + 8 + 4 + 16;
+    const LONG: &[u8] = b"a value past the inline cell";
+
+    let mut blob = Vec::new();
+    let short = crate::encode_german_string(b"ab", &mut blob);
+    let long = crate::encode_german_string(LONG, &mut blob);
+    let mut pk = Vec::new();
+    for (k, u) in [(-2i16, 3u8), (258, 6)] {
+        crate::push_opk(&mut pk, 2, k as u16 as u128, true);
+        crate::push_opk(&mut pk, 1, u as u128, false);
+    }
+    let regions: [&[u8]; 6] = [
+        &pk,
+        &[1i64.to_le_bytes(), (-2i64).to_le_bytes()].concat(),
+        // Row 1 is NULL in payload slot 0.
+        &[0u64.to_le_bytes(), 1u64.to_le_bytes()].concat(),
+        &[7i32.to_le_bytes(), [0; 4]].concat(),
+        &[short, long].concat(),
+        &blob,
+    ];
+    let block = encode_dead(&regions, 0);
+
+    let version = WAL_FORMAT_VERSION.to_le_bytes();
+    #[rustfmt::skip]
+    let want: &[u8] = &[
+        // Header: SIZE, VERSION, ROWS, HEAP_LEN, HEAP_DEAD, each u32 LE.
+        (20 + 2 * ROW + LONG.len()) as u8, 0, 0, 0,
+        version[0], version[1], version[2], version[3],
+        2, 0, 0, 0,
+        LONG.len() as u8, 0, 0, 0,
+        0, 0, 0, 0,
+        // PK: the I16 sign-flipped and big-endian, then the U8.
+        0x7F, 0xFE, 0x03, 0x81, 0x02, 0x06,
+        // Weights.
+        1, 0, 0, 0, 0, 0, 0, 0,
+        0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        // Null words.
+        0, 0, 0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0, 0, 0, 0, 0,
+        // The I32 column.
+        7, 0, 0, 0, 0, 0, 0, 0,
+        // The STRING column: length, prefix, then the inline suffix or the heap offset.
+        2, 0, 0, 0, b'a', b'b', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        LONG.len() as u8, 0, 0, 0, b'a', b' ', b'v', b'a', 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    assert_eq!(block, [want, LONG].concat(), "the block layout moved: bump `WAL_EPOCH`");
+    assert_eq!(parse_block(&block, ROW).map(|(rows, ..)| rows), Ok(2));
+}
