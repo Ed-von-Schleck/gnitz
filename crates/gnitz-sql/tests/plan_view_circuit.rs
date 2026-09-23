@@ -327,9 +327,9 @@ fn indexed_predicates_bound_the_backfill_scan() {
             .filter_map(|op| match op {
                 OpNode::ScanDelta { bound, .. } => match bound {
                     ReadBound::None => None,
-                    ReadBound::PkRange(_) => Some("pk range".to_string()),
+                    ReadBound::Range(r) if r.walks_pk(&[0]) => Some("pk range".to_string()),
                     ReadBound::PkSet(keys) => Some(format!("pk set {}", keys.len())),
-                    ReadBound::IndexRange(bound) => Some(format!("{:?}", bound.idx_cols.as_slice())),
+                    ReadBound::Range(r) => Some(format!("{:?}", r.cols().as_slice())),
                 },
                 _ => None,
             })

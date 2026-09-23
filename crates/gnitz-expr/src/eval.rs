@@ -171,8 +171,7 @@ impl RowFilter {
             false => LogicalProgram::from_blob(predicate, "filter")?.resolve_filter(schema)?,
         };
         f.walk = match unapplied {
-            ReadBound::PkRange(desc) => Some(RangeMembership::new(schema.pk_cols(), *desc, schema)?),
-            ReadBound::IndexRange(b) => Some(RangeMembership::new(b.idx_cols.as_slice(), b.desc, schema)?),
+            ReadBound::Range(r) => Some(RangeMembership::new(r, schema)?),
             ReadBound::None | ReadBound::PkSet(_) => None,
         };
         Ok(f)

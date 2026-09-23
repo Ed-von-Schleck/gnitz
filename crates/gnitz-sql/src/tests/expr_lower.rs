@@ -2081,8 +2081,13 @@ fn a_walk_and_a_residual_both_apply() {
             a.add_row(pk, 1).i64_val(v);
         }
     }
-    let desc = gnitz_wire::RangeDescriptor::new(&[], gnitz_wire::Cut::After(1), gnitz_wire::Cut::Before(9));
-    let walk = gnitz_wire::ReadBound::PkRange(desc);
+    let range = gnitz_wire::KeyRange::new(
+        gnitz_wire::PkColList::from_slice(&[0]),
+        &[],
+        gnitz_wire::Cut::after(1),
+        gnitz_wire::Cut::before(9),
+    );
+    let walk = gnitz_wire::ReadBound::Range(range);
     assert_eq!(residual_rows(&[], &walk, &batch, &schema), vec![1, 2]);
     let positive = BoundExpr::bin(BoundExpr::ColRef(1), BinOp::Gt, BoundExpr::LitInt(0));
     assert_eq!(residual_rows(&[&positive], &walk, &batch, &schema), vec![1]);

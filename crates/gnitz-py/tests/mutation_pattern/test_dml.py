@@ -111,6 +111,14 @@ _SCENARIOS = {
     "u64-max-key": _wide_key("BIGINT UNSIGNED", _U64_MAX, 1, 1),
     "i64-min-key": _wide_key("BIGINT", _I64_MIN, -1, -1),
     "uuid-key": _wide_key("UUID", f"'{_UUID_A}'", f"'{_UUID_B}'", _UUID_B),
+    # A UUID has no 16-byte VM register, so its range is applied by the PK walk alone.
+    "uuid-range": (
+        "CREATE TABLE {t} (id UUID NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+        f"('{_UUID_A}', 1), ('{_UUID_B}', 2)",
+        [("INSERT INTO {t} VALUES ('7c9e6679-7425-40de-944b-e07fc1f90ae7', 3)", 1),
+         (f"UPDATE {{t}} SET v = 9 WHERE id >= '{_UUID_B}'", 2),
+         (f"DELETE FROM {{t}} WHERE id > '{_UUID_A}'", 2)],
+        [(_UUID_A, 1)]),
     "u128-range": (
         "CREATE TABLE {t} (id DECIMAL(38,0) NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
         ", ".join(f"({i}, {i})" for i in range(1, 11)),

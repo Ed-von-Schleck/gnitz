@@ -12,6 +12,11 @@ the first failure only by luck and the second not at all.
 What this path refuses is pinned in the planner's `gnitz-sql/tests/plan_read.rs`.
 """
 
+import concurrent.futures
+import os
+import re
+import signal
+
 import gnitz
 import pytest
 from _read import bag, ordered, rows
@@ -93,6 +98,49 @@ def test_a_provably_empty_range_still_grounds_a_fold(client, kv):
     still owes its ground row, so COUNT(*) must answer 0, not nothing."""
     assert bag(rows(client, kv, "SELECT COUNT(*) AS c FROM t WHERE id > 10 AND id < 5")) == \
         {(0,): 1}
+
+
+def _worker_pids(master_pid):
+    """`{worker index: pid}`: each worker's stdout is its own `worker_<N>.log`."""
+    pids = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+            log = os.readlink(f"/proc/{name}/fd/1")
+        except (FileNotFoundError, ProcessLookupError, PermissionError, IndexError):
+            continue
+        m = re.search(r"worker_(\d+)\.log$", log)
+        if ppid == master_pid and m:
+            pids[int(m.group(1))] = int(name)
+    return pids
+
+
+def test_a_provably_empty_pk_range_is_answered_by_one_worker(own_server):
+    """With every worker but worker 0 stopped, only a read no other worker is asked
+    for can complete."""
+    own_server.start(workers=4)
+    with gnitz.connect(own_server.sock_path) as conn:
+        conn.execute_sql("CREATE TABLE t (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
+        insert(conn, "public", "t", [(i, i) for i in range(SPAN)])
+        pids = _worker_pids(own_server.proc.pid)
+        assert sorted(pids) == [0, 1, 2, 3], pids
+        stopped = [pid for w, pid in pids.items() if w != 0]
+        ex = concurrent.futures.ThreadPoolExecutor(1)
+        for pid in stopped:
+            os.kill(pid, signal.SIGSTOP)
+        try:
+            for q, want in [("SELECT id FROM t WHERE id = -1", {}),
+                            ("SELECT id FROM t WHERE id > 10 AND id < 5", {}),
+                            ("SELECT COUNT(*) AS c FROM t WHERE id < 0", {(0,): 1})]:
+                got = ex.submit(lambda: bag(rows(conn, "public", q))).result(timeout=30)
+                assert got == want, q
+        finally:
+            for pid in stopped:
+                os.kill(pid, signal.SIGCONT)
+            ex.shutdown()
 
 
 # ---------------------------------------------------------------------------

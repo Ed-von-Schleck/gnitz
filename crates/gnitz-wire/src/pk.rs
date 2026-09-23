@@ -64,20 +64,23 @@ pub fn encode_pk_tuple(cols: impl IntoIterator<Item = (usize, TypeCode)>, src: &
     out
 }
 
-/// OPK-encode one native value per `(src_tc, target_tc)` column, each promoted to
-/// `target_tc` and packed in order.
-pub fn encode_pk_natives(
-    cols: impl IntoIterator<Item = (TypeCode, TypeCode)>,
-    natives: impl IntoIterator<Item = u128>,
-) -> PkBuf {
+/// OPK-encode one image per `(src_tc, target_tc, image)` column, each truncated to
+/// `src_tc`'s width, promoted to `target_tc` and packed in order.
+pub fn encode_pk_images(cols: impl IntoIterator<Item = (TypeCode, TypeCode, u128)>) -> PkBuf {
     let mut out = PkBuf::zeroed(0);
-    for ((src_tc, target_tc), native) in cols.into_iter().zip(natives) {
+    for (src_tc, target_tc, image) in cols {
         let src_w = src_tc.wire_stride();
         out.append(target_tc.wire_stride(), |dst| {
-            store_opk_image(key_image(src_tc, native), src_tc, src_w, target_tc, dst)
+            store_opk_image(image & image_mask(src_w), src_tc, src_w, target_tc, dst)
         });
     }
     out
+}
+
+/// The mask of a `width`-byte column's images: its low `8·width` bits.
+#[inline(always)]
+pub const fn image_mask(width: usize) -> u128 {
+    u128::MAX >> (128 - 8 * width)
 }
 
 /// A native value's image in its column's key order: masked to the type's width, sign bit
@@ -85,12 +88,7 @@ pub fn encode_pk_natives(
 #[inline(always)]
 pub fn key_image(tc: TypeCode, native: u128) -> u128 {
     let w = tc.wire_stride();
-    let low = if w == 16 {
-        native
-    } else {
-        native & ((1u128 << (w * 8)) - 1)
-    };
-    low ^ opk_bias(tc, w)
+    (native & image_mask(w)) ^ opk_bias(tc, w)
 }
 
 /// The image of zero in a `width`-byte column of type `tc`: `2^(width·8−1)` if

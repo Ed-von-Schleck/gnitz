@@ -8,10 +8,10 @@ use std::rc::Rc;
 
 use super::SkeletonHydrator;
 use crate::relation::RelationRegistry;
-use crate::schema::key::compare_pk_bytes;
+use crate::schema::key::{compare_pk_bytes, IndexKeySpec};
 use crate::schema::{project_schema, ColumnLocator};
 use crate::storage::{Batch, BoundedIndexCursor, PkSetGather, SkeletonKeys, SourceCursor, StoreError};
-use gnitz_wire::{IndexBound, ReadBound};
+use gnitz_wire::{KeyRange, ReadBound};
 
 const INDEX_SCAN_RATIO: usize = 16;
 
@@ -111,9 +111,6 @@ impl RelationRegistry {
         let entry = self.relation_or_err(id)?;
         let cursor = match bound {
             ReadBound::None => SourceCursor::Full(Box::new(entry.cursor())),
-            ReadBound::PkRange(desc) => SourceCursor::Full(Box::new(
-                entry.store().pk_range_cursor(&desc).map_err(StoreError::rejected)?,
-            )),
             ReadBound::PkSet(keys) => {
                 let schema = entry.schema();
                 if keys.stride() != schema.pk_stride() {
@@ -127,31 +124,30 @@ impl RelationRegistry {
                 let gather = PkSetGather::open(keys.into_bytes(), schema, |s, e| entry.cursor_in_range(s, e));
                 SourceCursor::PkSet(Box::new(gather))
             }
-            ReadBound::IndexRange(bound) => return self.open_index_walk(id, bound),
+            ReadBound::Range(r) => return self.open_range(id, r),
         };
         Ok((cursor, ReadBound::None))
     }
 
-    /// The index walk `bound` names over `id`: through its index while the range covers at
-    /// most `1/INDEX_SCAN_RATIO` of the local slice, else a full scan and the walk it
-    /// leaves unapplied.
-    fn open_index_walk(&self, id: i64, bound: IndexBound) -> Result<(SourceCursor, ReadBound), StoreError> {
+    /// The walk `r` names over `id`, and the part of it the cursor leaves unapplied.
+    fn open_range(&self, id: i64, r: KeyRange) -> Result<(SourceCursor, ReadBound), StoreError> {
         let entry = self.relation_or_err(id)?;
-        let cols = self.bound_cols_against(id, bound.idx_cols, "open_bound")?;
+        let cols = self.bound_cols_against(id, r.cols(), "open_bound")?;
+        let schema = entry.schema();
+        if r.walks_pk(schema.pk_indices()) {
+            let (cursor, _) = entry.store().cursor_over(&IndexKeySpec::for_pk(&schema), &r);
+            return Ok((SourceCursor::Full(Box::new(cursor)), ReadBound::None));
+        }
         if let Some(ic) = entry.index_on(cols.as_slice()) {
             let spec = ic.key_spec();
-            let (idx, matches) = ic
-                .store()
-                .cursor_over(&spec, &bound.desc)
-                .map_err(StoreError::rejected)?;
+            let (idx, matches) = ic.store().cursor_over(&spec, &r);
             if matches <= entry.store().estimated_rows() / INDEX_SCAN_RATIO {
                 let rows = matches.min(self.config.scan_chunk_rows);
                 let walk = BoundedIndexCursor::new(idx, entry.cursor(), spec, rows);
                 return Ok((SourceCursor::Bounded(Box::new(walk)), ReadBound::None));
             }
         }
-        let unapplied = ReadBound::IndexRange(IndexBound { idx_cols: cols, desc: bound.desc });
-        Ok((SourceCursor::Full(Box::new(entry.cursor())), unapplied))
+        Ok((SourceCursor::Full(Box::new(entry.cursor())), ReadBound::Range(r)))
     }
 }
 

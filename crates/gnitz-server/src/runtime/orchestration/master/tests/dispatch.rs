@@ -255,7 +255,7 @@ fn a_checkpoint_bumps_the_generation_once_and_restamps_at_it() {
 fn read_route_reaches_the_owners_a_bound_names() {
     use super::super::route_read;
     use gnitz_store::schema::Placement;
-    use gnitz_wire::{Cut, PkKeys, RangeDescriptor, ReadBound, ReadSpec};
+    use gnitz_wire::{Cut, KeyRange, PkColList, PkKeys, ReadBound, ReadSpec};
 
     const NW: usize = 4;
     let keyed = crate::test_support::pk_only_schema(&[gnitz_wire::TypeCode::U64]);
@@ -273,16 +273,24 @@ fn read_route_reaches_the_owners_a_bound_names() {
         assert_eq!((r.set, r.per_worker.is_none()), (WorkerSet::one(0), true), "replicated");
     }
 
-    let point = ReadSpec::all_rows(ReadBound::PkRange(RangeDescriptor::new(
-        &[],
-        Cut::Before(42),
-        Cut::After(42),
-    )))
-    .encode(&block);
+    let range = |start, end| {
+        ReadSpec::all_rows(ReadBound::Range(KeyRange::new(
+            PkColList::from_slice(&[0]),
+            &[],
+            start,
+            end,
+        )))
+        .encode(&block)
+    };
     assert_eq!(
-        route_read(&keyed, Some(&point), NW).set,
+        route_read(&keyed, Some(&range(Cut::before(42), Cut::after(42))), NW).set,
         WorkerSet::one(owner(42)),
         "confined range"
+    );
+    assert_eq!(
+        route_read(&keyed, Some(&range(Cut::after(9), Cut::before(3))), NW).set,
+        WorkerSet::one(0),
+        "a provably empty range is answered by one worker"
     );
 
     assert_eq!(

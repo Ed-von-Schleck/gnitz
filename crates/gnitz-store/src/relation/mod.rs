@@ -658,7 +658,7 @@ impl RelationRegistry {
     /// owns the list, and only the registry holds a schema to bound it against,
     /// so every path taking one takes this test — [`Self::index_cols`] for a
     /// frame carrying the packed word, this for one whose wire decoder
-    /// (`IndexBound`) already unpacked it.
+    /// (`KeyRange`) already unpacked it.
     pub(crate) fn bound_cols_against(&self, id: i64, cols: PkColList, op: &str) -> Result<PkColList, StoreError> {
         match self.relation(id) {
             Some(e) if cols.as_slice().iter().all(|&c| (c as usize) < e.schema().num_columns()) => Ok(cols),

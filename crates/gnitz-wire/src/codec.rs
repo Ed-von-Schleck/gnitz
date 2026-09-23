@@ -163,15 +163,6 @@ impl<'a> Reader<'a> {
         self.take(n)
     }
 
-    /// The next byte without consuming it — used to compute a variable-length
-    /// `RangeDescriptor`'s span from its leading `n_eq`.
-    pub(crate) fn peek_u8(&self) -> Result<u8, String> {
-        self.buf
-            .get(self.off)
-            .copied()
-            .ok_or_else(|| format!("{}: truncated reading descriptor length", self.ctx))
-    }
-
     pub fn remaining(&self) -> usize {
         self.buf.len() - self.off
     }

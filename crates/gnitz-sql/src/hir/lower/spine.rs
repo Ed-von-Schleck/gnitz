@@ -274,7 +274,7 @@ fn source(
             // full scan, which it cannot do for a PK range.
             .min_by_key(|b| match b {
                 ReadBound::PkSet(_) => 0,
-                ReadBound::IndexRange(_) => 1,
+                ReadBound::Range(r) if !r.walks_pk(&frame.schema.pk_cols) => 1,
                 _ => 2,
             })
             .unwrap_or(ReadBound::None)

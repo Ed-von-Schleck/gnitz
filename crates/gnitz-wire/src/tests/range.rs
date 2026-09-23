@@ -1,79 +1,84 @@
-use super::Cut::{After, Before};
 use super::*;
+use crate::codec::{Reader, Writer};
 
-/// `write_range_descriptor` into a standalone buffer — the descriptor is only
-/// ever spliced into a larger blob, so the tests build that buffer themselves.
-fn enc(d: &RangeDescriptor) -> Vec<u8> {
-    let mut w = crate::codec::Writer::with_capacity(RangeDescriptor::encoded_len(d.eq_vals().len()));
-    write_range_descriptor(&mut w, d);
+fn enc(r: &KeyRange) -> Vec<u8> {
+    let mut w = Writer::with_capacity(0);
+    write_key_range(&mut w, r);
     w.into_vec()
+}
+
+fn dec(bytes: &[u8]) -> Result<KeyRange, String> {
+    let mut r = Reader::new(bytes, "range");
+    let range = read_key_range(&mut r)?;
+    r.expect_consumed()?;
+    Ok(range)
+}
+
+fn cols(c: &[u32]) -> PkColList {
+    PkColList::from_slice(c)
 }
 
 #[test]
 fn roundtrips_every_shape() {
-    let shapes: [(&[u128], Cut, Cut); 5] = [
-        (&[], After(10), After(u64::MAX as u128)), // pure x > 10
-        (&[], Before(0), After(20)),               // pure x <= 20
-        (&[7], Before(1), Before(u128::MAX)),      // a = 7 AND 1 <= b < MAX
-        (&[1, 2, 3], After(10), Before(50)),       // max arity, 82 bytes
-        (&[], After(5), After(5)),                 // zero-width (empty)
+    let shapes = [
+        KeyRange::new(cols(&[0]), &[], Cut::after(10), Cut::after(u64::MAX as u128)), // x > 10
+        KeyRange::new(cols(&[2]), &[], Cut::before(0), Cut::after(20)),               // x <= 20
+        KeyRange::new(cols(&[1, 2]), &[7], Cut::before(1), Cut::before(u128::MAX)),
+        KeyRange::new(cols(&[3, 0, 1, 2]), &[1, 2, 3], Cut::after(10), Cut::before(50)), // max arity
+        KeyRange::new(cols(&[0]), &[], Cut::after(5), Cut::after(5)),                    // empty
+        KeyRange::point(cols(&[4, 5]), &[u128::MAX], 0),
     ];
-    for (eq, start, end) in shapes {
-        let d = RangeDescriptor::new(eq, start, end);
-        let bytes = enc(&d);
-        assert_eq!(
-            bytes.len(),
-            RangeDescriptor::encoded_len(eq.len()),
-            "the writer must emit exactly what encoded_len promises"
-        );
-        assert_eq!(RangeDescriptor::decode(&bytes), Ok(d), "{eq:?} {start:?} {end:?}");
+    for r in shapes {
+        assert_eq!(dec(&enc(&r)), Ok(r), "{r:?}");
     }
-    // The one literal the module's own doc reasons about, against the 64-byte
-    // `PkBuf` cap the descriptor rides a control-block blob to clear.
-    assert_eq!(RangeDescriptor::encoded_len(PK_LIST_MAX_COLS - 1), 82);
+}
+
+#[test]
+fn cut_order_is_image_then_kind() {
+    assert!(Cut::before(5) < Cut::after(5));
+    assert!(Cut::after(5) < Cut::before(6));
+    assert!(Cut::after(u128::MAX - 1) < Cut::before(u128::MAX));
+}
+
+#[test]
+fn walks_pk_iff_the_list_leads_the_pk() {
+    let r = KeyRange::point(cols(&[2, 0]), &[1], 2);
+    assert!(r.walks_pk(&[2, 0]));
+    assert!(r.walks_pk(&[2, 0, 1]));
+    assert!(!r.walks_pk(&[0, 2]));
+    assert!(!r.walks_pk(&[2]));
 }
 
 #[test]
 fn decode_rejects_malformed() {
-    // Too short for the fixed header.
-    assert!(RangeDescriptor::decode(&[]).is_err());
-    assert!(RangeDescriptor::decode(&[0]).is_err());
-    // n_eq with no slot left for the range column.
-    let mut d = enc(&RangeDescriptor::new(&[1, 2, 3], Before(0), Before(1)));
-    d[0] = PK_LIST_MAX_COLS as u8;
-    assert!(RangeDescriptor::decode(&d).is_err());
+    let good = enc(&KeyRange::new(cols(&[1, 2]), &[7], Cut::before(1), Cut::after(2)));
+    assert!(dec(&good).is_ok());
+    // Truncation anywhere.
+    for n in 0..good.len() {
+        assert!(dec(&good[..n]).is_err(), "truncated to {n}");
+    }
     // Unknown flag bits.
-    let mut stray = enc(&RangeDescriptor::new(&[7], Before(1), After(2)));
-    stray[1] |= 1 << 4;
-    assert!(RangeDescriptor::decode(&stray).is_err());
-    // Length disagreeing with n_eq — both directions.
-    let good = enc(&RangeDescriptor::new(&[7], Before(1), After(2)));
-    assert!(RangeDescriptor::decode(&good[..good.len() - 1]).is_err());
+    let mut stray = good.clone();
+    stray[9] |= 1 << 4;
+    assert!(dec(&stray).is_err());
+    // An equality prefix leaving no range column, up to the byte's maximum.
+    for n_eq in [2u8, 3, 255] {
+        let mut bad = good.clone();
+        bad[8] = n_eq;
+        let err = dec(&bad).unwrap_err();
+        assert!(err.contains("leave no range column"), "{err}");
+    }
+    // An over-long column word, and one carrying no packed-list flag.
     let mut long = good.clone();
-    long.push(0);
-    assert!(RangeDescriptor::decode(&long).is_err());
+    long[..8].copy_from_slice(&(crate::PK_LIST_PACKED_FLAG | 7).to_le_bytes());
+    assert!(dec(&long).is_err());
+    let mut untagged = good.clone();
+    untagged[..8].copy_from_slice(&1u64.to_le_bytes());
+    assert!(dec(&untagged).is_err());
 }
 
-/// `Cut::type_edges` answers "what does an unconstrained side of a range on this
-/// column widen to?", and is the module's whole type dispatch. The edges must be
-/// the type's own representable ends — a narrower pair would clip real index
-/// entries out of an unbounded scan. `U128` carries edges while `UUID` does not,
-/// though both are 16-byte unsigned: a UUID has no ordered arithmetic a planner
-/// could saturate a literal against.
 #[test]
-fn type_edges_are_the_representable_ends_of_an_orderable_column() {
-    for &tc in TypeCode::ALL {
-        let edges = Cut::type_edges(tc);
-        let Some(fi) = FixedInt::from_type_code(tc) else {
-            let want = matches!(tc, TypeCode::U128).then_some((Before(0), After(u128::MAX)));
-            assert_eq!(edges, want, "{tc:?}");
-            continue;
-        };
-        let (min, max) = fi.range();
-        assert_eq!(
-            edges,
-            Some((Before(fi.pack(min)), After(fi.pack(max)))),
-            "{tc:?} must widen to its own representable ends"
-        );
-    }
+#[should_panic(expected = "leave no range column")]
+fn new_refuses_an_equality_prefix_over_every_column() {
+    KeyRange::new(cols(&[1, 2]), &[7, 8], Cut::before(0), Cut::after(0));
 }

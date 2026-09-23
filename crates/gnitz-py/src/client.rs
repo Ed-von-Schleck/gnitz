@@ -17,7 +17,7 @@ use gnitz_core::{
 };
 use gnitz_mirror::Mirror;
 use gnitz_sql::{SqlPlanner, SqlResult};
-use gnitz_wire::{IndexBound, PkColList, RangeDescriptor, ReadBound, ReadSpec};
+use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec};
 
 use crate::read::{scan_result, PyDeltaReply, PyScanResult};
 use crate::schema::{resolve_py_schema, rust_schema_to_py};
@@ -323,8 +323,14 @@ impl PyGnitzClient {
             .iter()
             .map(|item| py_scalar_key(&item))
             .collect::<PyResult<Vec<u128>>>()?;
-        gnitz_wire::validate_pk_col_list(&col_indices, gnitz_wire::PK_LIST_COL_LIMIT)
+        gnitz_wire::validate_pk_col_list(&col_indices, schema.columns.len())
             .map_err(|e| PyValueError::new_err(format!("seek_by_index: {e}")))?;
+        // Each value at its own column's type: a range carries key images.
+        let keys: Vec<u128> = col_indices
+            .iter()
+            .zip(&keys)
+            .map(|(&c, &v)| gnitz_wire::key_image(schema.columns[c as usize].ty.tc, v))
+            .collect();
         let (&last, eq) = keys
             .split_last()
             .filter(|_| keys.len() <= col_indices.len())
@@ -335,10 +341,8 @@ impl PyGnitzClient {
                     col_indices.len()
                 ))
             })?;
-        let spec = ReadSpec::all_rows(ReadBound::IndexRange(IndexBound {
-            idx_cols: PkColList::from_slice(&col_indices),
-            desc: RangeDescriptor::point(eq, last),
-        }));
+        let range = KeyRange::point(PkColList::from_slice(&col_indices), eq, last);
+        let spec = ReadSpec::all_rows(ReadBound::Range(range));
         let batch = self.call(py, |c| c.scan_spec(table_id, &spec, &schema))?;
         scan_result(py, ScanReply { schema, batch, lsn: None })
     }

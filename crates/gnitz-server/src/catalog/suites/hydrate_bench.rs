@@ -12,7 +12,7 @@ use super::*;
 use crate::query::{DagEngine, Drive};
 use gnitz_foundation::perf;
 use gnitz_store::read::SkeletonHydrator;
-use gnitz_wire::{Cut, RangeDescriptor, ReadBound, ReadSpec};
+use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec};
 
 /// Base rows, and so view rows.
 const ROWS: u64 = 1_000_000;
@@ -111,10 +111,10 @@ fn hydrate_seek_bench() {
     let (mut engine, view) = bounded_fixture("hydrate_seek", 64 << 10);
     let schema = engine.registry.relation(view).map(Relation::schema).unwrap();
     let key = (ROWS / 2) as u128;
-    let spec = ReadSpec::all_rows(ReadBound::PkRange(RangeDescriptor::new(
+    let spec = ReadSpec::all_rows(ReadBound::Range(KeyRange::point(
+        PkColList::from_slice(schema.pk_indices()),
         &[],
-        Cut::Before(key),
-        Cut::After(key),
+        key,
     )));
     cell("single-key seek", &mut engine, |registry, h| {
         registry.scan_spec(view, spec.clone(), &schema, Some(h)).unwrap().len()

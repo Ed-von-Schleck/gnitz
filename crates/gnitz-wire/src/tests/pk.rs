@@ -162,7 +162,7 @@ fn widen_pk_be_matches_the_general_form() {
 
 /// `v`, read at source type `tc`, OPK-encoded into a `target`-width slot.
 fn promote(v: i128, tc: TypeCode, target: TypeCode) -> [u8; 16] {
-    let key = encode_pk_natives([(tc, target)], [v as u128]);
+    let key = encode_pk_images([(tc, target, key_image(tc, v as u128))]);
     let mut out = [0u8; 16];
     out[..key.width()].copy_from_slice(key.pk_bytes());
     out

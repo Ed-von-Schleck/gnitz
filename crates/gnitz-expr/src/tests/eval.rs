@@ -1307,9 +1307,13 @@ fn v_gt_3_blob() -> Vec<u8> {
 
 /// `pk` in `[lo, hi]`, as the bound a PK range read carries.
 fn pk_between(lo: i128, hi: i128) -> gnitz_wire::ReadBound {
-    use gnitz_wire::{Cut, FixedInt, RangeDescriptor};
-    let p = |x| FixedInt::U64.pack(x);
-    gnitz_wire::ReadBound::PkRange(RangeDescriptor::new(&[], Cut::Before(p(lo)), Cut::After(p(hi))))
+    use gnitz_wire::{Cut, KeyRange, PkColList};
+    gnitz_wire::ReadBound::Range(KeyRange::new(
+        PkColList::from_slice(&[0]),
+        &[],
+        Cut::before(lo as u128),
+        Cut::after(hi as u128),
+    ))
 }
 
 /// The surviving rows of `mb` under `f`, flattened.
@@ -1361,31 +1365,33 @@ fn row_filter_intersects_its_predicate_and_its_walk() {
 /// columns, and nothing for a full scan or a key set.
 #[test]
 fn row_filter_for_read_walks_each_bound_variant() {
-    use gnitz_wire::{Cut, FixedInt, IndexBound, PkColList, PkKeys, RangeDescriptor, ReadBound};
+    use gnitz_wire::{key_image, Cut, FixedInt, KeyRange, PkColList, PkKeys, ReadBound, TypeCode};
     let n = 20;
     let (schema, mb) = row_filter_fixture(n);
-    let p = |x| FixedInt::I64.pack(x);
-    let index = ReadBound::IndexRange(IndexBound {
-        idx_cols: PkColList::from_slice(&[1]),
-        desc: RangeDescriptor::new(&[], Cut::Before(p(6)), Cut::Before(p(12))),
-    });
+    let p = |x| key_image(TypeCode::I64, FixedInt::I64.pack(x));
+    let over = |cols: &[u32], lo: i128, hi: i128| {
+        ReadBound::Range(KeyRange::new(
+            PkColList::from_slice(cols),
+            &[],
+            Cut::before(p(lo)),
+            Cut::before(p(hi)),
+        ))
+    };
+    let index = over(&[1], 6, 12);
     let key = 5u64.to_be_bytes();
     let set = ReadBound::PkSet(PkKeys::from_keys(8, [&key[..]]));
     for (label, bound, want) in [
         ("None", ReadBound::None, (0..n).collect::<Vec<_>>()),
-        ("PkRange", pk_between(3, 7), (2..7).collect()),
+        ("pk range", pk_between(3, 7), (2..7).collect()),
         // The index holds no NULL, so the walk drops row 10's.
-        ("IndexRange", index, vec![6, 7, 8, 9, 11]),
+        ("index range", index, vec![6, 7, 8, 9, 11]),
         ("PkSet", set, (0..n).collect()),
     ] {
         let mut f = crate::RowFilter::for_read(&[], &bound, &schema).unwrap();
         assert_eq!(surviving(&mut f, &mb), want, "{label}");
     }
     // A walk over a column the schema lacks is a rejected request, not a panic.
-    let bad = ReadBound::IndexRange(IndexBound {
-        idx_cols: PkColList::from_slice(&[9]),
-        desc: RangeDescriptor::new(&[], Cut::Before(p(0)), Cut::Before(p(1))),
-    });
+    let bad = over(&[9], 0, 1);
     assert!(matches!(
         crate::RowFilter::for_read(&[], &bad, &schema),
         Err(crate::ExprValidateErr::BadWalk(_))

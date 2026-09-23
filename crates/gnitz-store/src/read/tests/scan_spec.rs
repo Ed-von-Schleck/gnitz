@@ -3,7 +3,7 @@ use crate::relation::{RelationKind, RelationSpec, StoreConfig};
 use crate::schema::{SchemaColumn, TypeCode};
 use crate::storage::{BatchBuilder, Slot, StoreError};
 use gnitz_wire::ViewProps;
-use gnitz_wire::{AggDescriptor, AggReadSpec, IndexBound, OrderKey, PkColList, ReadSink};
+use gnitz_wire::{key_image, AggDescriptor, AggReadSpec, Cut, KeyRange, OrderKey, PkColList, ReadSink};
 
 // ── The executor — `scan_spec` over a registry built in-crate ────────
 //
@@ -158,34 +158,18 @@ fn an_out_of_range_order_key_is_rejected() {
 fn an_out_of_range_index_column_is_rejected_without_an_index() {
     let mut r = rows_fixture("index_oob", 4, 1);
     let spec = ReadSpec {
-        bound: ReadBound::IndexRange(IndexBound {
-            idx_cols: PkColList::from_slice(&[99]),
-            desc: RangeDescriptor::new(&[], Cut::Before(0), Cut::After(u64::MAX as u128)),
-        }),
+        bound: ReadBound::Range(KeyRange::new(
+            PkColList::from_slice(&[99]),
+            &[],
+            Cut::before(0),
+            Cut::after(u64::MAX as u128),
+        )),
         ..rows_spec(Vec::new(), 0)
     };
     let Err(err) = run(&mut r, &spec) else {
         panic!("an out-of-range index column must be rejected");
     };
     assert!(err.to_string().contains("invalid column list"), "{err}");
-}
-
-/// A walk may trade an index for a full scan, but a malformed range is not a
-/// decline: it names no range column, so it is refused.
-#[test]
-fn a_malformed_range_on_an_index_walk_is_rejected() {
-    let mut r = walk_fixture("index_malformed", true);
-    let spec = ReadSpec {
-        bound: ReadBound::IndexRange(IndexBound {
-            idx_cols: PkColList::from_slice(&[1]),
-            desc: RangeDescriptor::new(&[3], Cut::Before(0), Cut::After(9)),
-        }),
-        ..rows_spec(Vec::new(), 0)
-    };
-    let Err(err) = run(&mut r, &spec) else {
-        panic!("a range with no range column must be refused, not scanned");
-    };
-    assert!(err.to_string().contains("has no range column"), "{err}");
 }
 
 // ── Index walks are exact: the index, a full scan standing in for it ─
@@ -251,10 +235,7 @@ fn walk_fixture(name: &str, indexed: bool) -> RelationRegistry {
 
 fn index_walk(col: u32, start: Cut, end: Cut, order: Vec<OrderKey>, limit_k: u64) -> ReadSpec {
     ReadSpec {
-        bound: ReadBound::IndexRange(IndexBound {
-            idx_cols: PkColList::from_slice(&[col]),
-            desc: RangeDescriptor::new(&[], start, end),
-        }),
+        bound: ReadBound::Range(KeyRange::new(PkColList::from_slice(&[col]), &[], start, end)),
         ..rows_spec(order, limit_k)
     }
 }
@@ -280,17 +261,17 @@ fn walk_expect(keep: impl Fn(u64) -> bool) -> Vec<u128> {
 /// no NULL, a signed range across zero, a U128 range over its full width.
 #[test]
 fn an_index_walk_traded_for_a_scan_returns_exactly_the_walk() {
-    let p = |v: i64| gnitz_wire::FixedInt::I64.pack(v as i128);
-    let signed = index_walk(1, Cut::After(p(-10)), Cut::After(p(12)), Vec::new(), 0);
+    let p = |v: i64| key_image(TypeCode::I64, v as u64 as u128);
+    let signed = index_walk(1, Cut::after(p(-10)), Cut::after(p(12)), Vec::new(), 0);
     let want_signed = walk_expect(|id| walk_row(id).0.is_some_and(|v| v > -10 && v <= 12));
     let (lo, hi) = (3u128 << 70, 40u128 << 70);
-    let wide = index_walk(2, Cut::Before(lo), Cut::Before(hi), Vec::new(), 0);
+    let wide = index_walk(2, Cut::before(lo), Cut::before(hi), Vec::new(), 0);
     let want_wide = walk_expect(|id| walk_row(id).1.is_some_and(|b| b >= lo && b < hi));
-    let (all_lo, all_hi) = Cut::type_edges(gnitz_wire::TypeCode::I64).unwrap();
+    let (all_lo, all_hi) = (Cut::before(0), Cut::after(gnitz_wire::image_mask(8)));
     let everything = index_walk(1, all_lo, all_hi, Vec::new(), 0);
     let want_everything = walk_expect(|id| walk_row(id).0.is_some());
     // A point is selective enough that the indexed registry really walks.
-    let point = index_walk(1, Cut::Before(p(-31)), Cut::After(p(-31)), Vec::new(), 0);
+    let point = index_walk(1, Cut::before(p(-31)), Cut::after(p(-31)), Vec::new(), 0);
     for indexed in [true, false] {
         let mut r = walk_fixture(&format!("walk_exact_{indexed}"), indexed);
         assert_eq!(walk_ids(&mut r, &signed), want_signed, "indexed {indexed}");
@@ -303,27 +284,27 @@ fn an_index_walk_traded_for_a_scan_returns_exactly_the_walk() {
 /// A LIMIT cuts inside the walk's rows, never outside them, with or without an ORDER BY.
 #[test]
 fn a_limit_over_a_traded_walk_stays_inside_it() {
-    let p = |v: i64| gnitz_wire::FixedInt::I64.pack(v as i128);
+    let p = |v: i64| key_image(TypeCode::I64, v as u64 as u128);
     let inside = walk_expect(|id| walk_row(id).0.is_some_and(|v| (-20..20).contains(&v)));
     let by_val_desc = vec![OrderKey { col: 1, desc: true, nulls_first: false }];
     for indexed in [true, false] {
         let mut r = walk_fixture(&format!("walk_limit_{indexed}"), indexed);
         let got = walk_ids(
             &mut r,
-            &index_walk(1, Cut::Before(p(-20)), Cut::Before(p(20)), Vec::new(), 3),
+            &index_walk(1, Cut::before(p(-20)), Cut::before(p(20)), Vec::new(), 3),
         );
         assert_eq!(got.len(), 3, "indexed {indexed}");
         assert!(got.iter().all(|id| inside.contains(id)), "indexed {indexed}: {got:?}");
         let got = walk_ids(
             &mut r,
-            &index_walk(1, Cut::Before(p(-20)), Cut::Before(p(20)), by_val_desc.clone(), 3),
+            &index_walk(1, Cut::before(p(-20)), Cut::before(p(20)), by_val_desc.clone(), 3),
         );
         // The three largest non-NULL `val`s: 19, 17, 16 (id 50's `val` is NULL).
         assert_eq!(got, vec![48, 49, 51], "indexed {indexed}");
     }
 }
 
-/// A walk over a column no index can key is refused rather than scanned.
+/// A walk over a column with no key order is refused rather than scanned.
 #[test]
 fn a_walk_over_an_unindexable_column_is_refused() {
     let schema = SchemaDescriptor::new(
@@ -344,11 +325,56 @@ fn a_walk_over_an_unindexable_column_is_refused() {
         schema,
     })
     .unwrap();
-    let spec = index_walk(1, Cut::Before(0), Cut::After(9), Vec::new(), 0);
+    let spec = index_walk(1, Cut::before(0), Cut::after(9), Vec::new(), 0);
     let Err(err) = r.scan_spec(TID, spec, &schema, None) else {
         panic!("a walk over a float column must be refused");
     };
-    assert!(err.to_string().contains("not supported"), "{err}");
+    assert!(err.to_string().contains("no key order"), "{err}");
+}
+
+/// A range over a PK prefix walks the table's own store even when an index names the
+/// same columns: `INDEX(a)` under `PRIMARY KEY (a, b)` is never walked for `a`.
+#[test]
+fn a_pk_prefix_range_takes_the_pk_walk_over_a_matching_index() {
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+        ],
+        &[0, 1],
+    );
+    let mut r = RelationRegistry::new(
+        &crate::test_support::scratch_dir("read", "pk_prefix_walk"),
+        Slot::SOLO,
+        StoreConfig::default(),
+    );
+    r.register(RelationSpec {
+        id: TID,
+        kind: RelationKind::BaseTable,
+        schema,
+    })
+    .unwrap();
+    r.add_index(TID, TID + 1, &[0], false).unwrap();
+    let mut bb = BatchBuilder::new(schema);
+    for a in 0..8u64 {
+        for b in 0..3u64 {
+            bb.begin_row_opk(&[a as u128, b as u128], 1);
+            bb.end_row();
+        }
+    }
+    r.ingest(TID, bb.finish()).unwrap();
+
+    let range = KeyRange::point(PkColList::from_slice(&[0]), &[], 5);
+    let (cursor, unapplied) = r.open_bound(TID, ReadBound::Range(range)).unwrap();
+    assert!(
+        matches!(cursor, crate::storage::SourceCursor::Full(_)),
+        "a PK walk, not the index"
+    );
+    assert_eq!(unapplied, ReadBound::None, "a PK walk applies the whole range");
+    let got = ids(&r
+        .scan_spec(TID, ReadSpec::all_rows(ReadBound::Range(range)), &schema, None)
+        .unwrap());
+    assert_eq!(got.len(), 3);
 }
 
 /// A bounded view whose sweep has dehydrated everything on disk, plus fresh rows
@@ -391,10 +417,11 @@ fn ingest(registry: &mut RelationRegistry, ids: std::ops::Range<u64>) {
 
 fn pk_range(lo: u64, hi: u64) -> ReadSpec {
     ReadSpec {
-        bound: ReadBound::PkRange(RangeDescriptor::new(
+        bound: ReadBound::Range(KeyRange::new(
+            PkColList::from_slice(&[0]),
             &[],
-            Cut::Before(lo as u128),
-            Cut::After(hi as u128),
+            Cut::before(lo as u128),
+            Cut::after(hi as u128),
         )),
         ..rows_spec(Vec::new(), 0)
     }
@@ -633,14 +660,13 @@ fn survivors_membership_bench() {
     let passes: usize = std::env::var("GNITZ_BENCH_PASSES").map_or(1, |s| s.parse().unwrap());
     let hi = (N * sel / 100) as i64;
     let mut r = rows_fixture("survivors_bench", N, 1);
-    let walk = ReadBound::IndexRange(IndexBound {
-        idx_cols: PkColList::from_slice(&[1]),
-        desc: RangeDescriptor::new(
-            &[],
-            Cut::Before(0),
-            Cut::Before(gnitz_wire::FixedInt::I64.pack(hi as i128)),
-        ),
-    });
+    let img = |v: i64| key_image(TypeCode::I64, v as u64 as u128);
+    let walk = ReadBound::Range(KeyRange::new(
+        PkColList::from_slice(&[1]),
+        &[],
+        Cut::before(img(0)),
+        Cut::before(img(hi)),
+    ));
     // `lo <= val < hi` as the wire predicate; `hi = None` leaves the top open.
     let between = |lo: i64, hi: Option<i64>| {
         let mut eb = ExprBuilder::new();

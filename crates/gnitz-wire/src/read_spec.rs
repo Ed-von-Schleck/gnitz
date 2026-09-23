@@ -7,17 +7,15 @@
 use crate::circuit::{read_aggs, read_cols, read_compute_map, write_aggs, write_cols, write_compute_map};
 use crate::circuit::{read_order_keys, write_order_keys, AggDescriptor, ComputeMap};
 use crate::codec::{Reader, Writer};
-use crate::range::{read_index_bound, read_range_descriptor, write_index_bound, write_range_descriptor};
-use crate::range::{IndexBound, RangeDescriptor};
+use crate::range::{read_key_range, write_key_range, KeyRange};
 use crate::MAX_PK_BYTES;
 
 /// ORDER BY keys apply in sequence; a spec carries at most this many.
 pub const MAX_ORDER_KEYS: usize = 16;
 
 const BOUND_NONE: u8 = 0;
-const BOUND_PK_RANGE: u8 = 1;
-const BOUND_INDEX_RANGE: u8 = 2;
-const BOUND_PK_SET: u8 = 3;
+const BOUND_RANGE: u8 = 1;
+const BOUND_PK_SET: u8 = 2;
 
 const SINK_ROWS: u8 = 0;
 const SINK_FOLD: u8 = 1;
@@ -145,20 +143,14 @@ fn strictly_ascending(bytes: &[u8], stride: usize) -> bool {
     bytes.chunks_exact(stride).is_sorted_by(|a, b| a < b)
 }
 
-/// The bound a `ReadSpec` walks before the predicate and the sink. The range
-/// bounds' `RangeDescriptor` carries **native** values (packed LE `u128`), for
-/// which the worker is the sole OPK encoder; a `PkSet` carries OPK keys.
+/// The bound a `ReadSpec` walks before the predicate and the sink. A range carries
+/// key images; a `PkSet` carries OPK keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadBound {
     /// Full merged cursor — a plain scan with a server-side predicate.
     None,
-    /// Range over the PK column list (`RangeDescriptor` semantics). A full-PK
-    /// point lookup is `n_eq = pk_count − 1` with degenerate cuts. Exact — no
-    /// residual is needed for the bound itself.
-    PkRange(RangeDescriptor),
-    /// Secondary-index range walk, exact with or without the index. An index holds no
-    /// row with a NULL in any indexed column, so neither does the walk.
-    IndexRange(IndexBound),
+    /// Exact, and holds no row with a NULL in a listed column.
+    Range(KeyRange),
     /// An exact key set, at any PK arity — a `pk IN (…)` gather or one fully
     /// pinned key.
     PkSet(PkKeys),
@@ -278,13 +270,9 @@ pub(crate) fn write_read_bound(w: &mut Writer, b: &ReadBound) {
         ReadBound::None => {
             w.u8(BOUND_NONE);
         }
-        ReadBound::PkRange(desc) => {
-            w.u8(BOUND_PK_RANGE);
-            write_range_descriptor(w, desc);
-        }
-        ReadBound::IndexRange(bound) => {
-            w.u8(BOUND_INDEX_RANGE);
-            write_index_bound(w, bound);
+        ReadBound::Range(range) => {
+            w.u8(BOUND_RANGE);
+            write_key_range(w, range);
         }
         ReadBound::PkSet(keys) => {
             w.u8(BOUND_PK_SET)
@@ -300,8 +288,7 @@ pub(crate) fn write_read_bound(w: &mut Writer, b: &ReadBound) {
 pub(crate) fn read_read_bound(r: &mut Reader) -> Result<ReadBound, String> {
     Ok(match r.u8()? {
         BOUND_NONE => ReadBound::None,
-        BOUND_PK_RANGE => ReadBound::PkRange(read_range_descriptor(r)?),
-        BOUND_INDEX_RANGE => ReadBound::IndexRange(read_index_bound(r).map_err(|e| format!("read_spec: {e}"))?),
+        BOUND_RANGE => ReadBound::Range(read_key_range(r)?),
         BOUND_PK_SET => {
             let stride = r.u8()? as usize;
             if !(1..=MAX_PK_BYTES).contains(&stride) {
@@ -328,7 +315,7 @@ pub(crate) fn read_read_bound(r: &mut Reader) -> Result<ReadBound, String> {
 /// The bound of an encoded request that routing reads, without decoding the
 /// rest. [`ReadSpec::decode`] on the worker stays the trust boundary.
 pub enum BoundPeek<'a> {
-    PkRange(RangeDescriptor),
+    Range(KeyRange),
     PkSet(PkSetPeek<'a>),
 }
 
@@ -362,7 +349,7 @@ pub fn peek_bound(blob: &[u8]) -> Option<BoundPeek<'_>> {
     let mut r = Reader::new(blob, "read_spec");
     r.bytes32().ok()?;
     match r.u8().ok()? {
-        BOUND_PK_RANGE => read_range_descriptor(&mut r).ok().map(BoundPeek::PkRange),
+        BOUND_RANGE => read_key_range(&mut r).ok().map(BoundPeek::Range),
         BOUND_PK_SET => {
             let stride = r.u8().ok()? as usize;
             let count_at = blob.len() - r.remaining();

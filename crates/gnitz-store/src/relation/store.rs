@@ -74,30 +74,21 @@ impl Store {
         }
     }
 
-    /// A cursor positioned on the OPK range `[start, end)`, and the raw entry
+    /// A cursor positioned on the OPK key band `[start, end)`, and the raw entry
     /// count in it — an upper bound on the live groups the walk emits.
-    pub(crate) fn range_cursor(&self, start: &[u8], end: Option<&[u8]>) -> (ReadCursor, usize) {
-        let mut cursor = self.cursor_in_range(start, end);
-        let matches = cursor.seek_range_bytes(start, end);
+    pub(crate) fn range_cursor(&self, range: Option<(PkBuf, Option<PkBuf>)>) -> (ReadCursor, usize) {
+        let Some((start, end)) = range else {
+            return (crate::storage::empty_cursor(self.schema), 0);
+        };
+        let end = end.as_ref().map(PkBuf::pk_bytes);
+        let mut cursor = self.cursor_in_range(start.pk_bytes(), end);
+        let matches = cursor.seek_range_bytes(start.pk_bytes(), end);
         (cursor, matches)
     }
 
-    /// [`Self::range_cursor`] over the key range `range` names under `spec`; a
-    /// provably-empty range is an empty cursor.
-    pub(crate) fn cursor_over(
-        &self,
-        spec: &IndexKeySpec,
-        range: &gnitz_wire::RangeDescriptor,
-    ) -> Result<(ReadCursor, usize), String> {
-        let Some((start, end)) = spec.range_keys(self.schema.pk_stride(), range)? else {
-            return Ok((crate::storage::empty_cursor(self.schema), 0));
-        };
-        Ok(self.range_cursor(start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes)))
-    }
-
-    /// [`Self::cursor_over`] this store's own PK space.
-    pub(crate) fn pk_range_cursor(&self, range: &gnitz_wire::RangeDescriptor) -> Result<ReadCursor, String> {
-        Ok(self.cursor_over(&IndexKeySpec::for_pk(&self.schema), range)?.0)
+    /// [`Self::range_cursor`] over the key band `range` names under `spec`.
+    pub(crate) fn cursor_over(&self, spec: &IndexKeySpec, range: &gnitz_wire::KeyRange) -> (ReadCursor, usize) {
+        self.range_cursor(spec.range_keys(self.schema.pk_stride(), range))
     }
 
     /// Whether this store actually holds a skeleton row. Every read path branches

@@ -916,9 +916,7 @@ fn bind_quantifier_sub(
             "an ANY/ALL operator's right operand must be a subquery".into(),
         ));
     };
-    // `less` is whether the operator points at the low end, which decides the
-    // MIN/MAX below; the equality forms are IN/NOT IN and never reach it.
-    let (bop, less) = match (is_any, compare_op) {
+    let bop = match (is_any, compare_op) {
         (true, BinaryOperator::Eq) => return bind_exists_sub(cx, q, Some(left), false),
         (false, BinaryOperator::NotEq) => return bind_exists_sub(cx, q, Some(left), true),
         (true, BinaryOperator::NotEq) => {
@@ -929,10 +927,10 @@ fn bind_quantifier_sub(
         (false, BinaryOperator::Eq) => {
             return Err(GnitzSqlError::Unsupported("`= ALL (SELECT …)` is not supported".into()))
         }
-        (_, BinaryOperator::Lt) => (BinOp::Lt, true),
-        (_, BinaryOperator::LtEq) => (BinOp::Le, true),
-        (_, BinaryOperator::Gt) => (BinOp::Gt, false),
-        (_, BinaryOperator::GtEq) => (BinOp::Ge, false),
+        (_, BinaryOperator::Lt) => BinOp::Lt,
+        (_, BinaryOperator::LtEq) => BinOp::Le,
+        (_, BinaryOperator::Gt) => BinOp::Gt,
+        (_, BinaryOperator::GtEq) => BinOp::Ge,
         _ => {
             return Err(GnitzSqlError::Unsupported(
                 "only range (<, <=, >, >=), `= ANY`, and `<> ALL` quantified comparisons are supported".into(),
@@ -940,7 +938,12 @@ fn bind_quantifier_sub(
         }
     };
     // x < ANY ⟺ < MAX; x > ANY ⟺ > MIN; x < ALL ⟺ < MIN; x > ALL ⟺ > MAX.
-    let agg_func = if is_any == less { AggFunc::Max } else { AggFunc::Min };
+    let bounds_below = bop.as_range_rel().is_some_and(|r| r.bounds_below());
+    let agg_func = if is_any != bounds_below {
+        AggFunc::Max
+    } else {
+        AggFunc::Min
+    };
     let (ids, outer_env, outer_alias) = (cx.cx.ids, cx.outer_env, cx.outer_alias);
     let ir = resolve_inner(cx, q)?;
     let err = "a range ANY/ALL subquery must select a single non-nullable column";

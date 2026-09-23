@@ -315,7 +315,7 @@ impl RangePrologue<'_> {
     pub(crate) fn threshold(&self, cb: &mut Circuit) -> (NodeId, NodeId) {
         let left = &self.sides[0];
         let (k, n_eq) = (self.k(), self.n_eq() as u8);
-        let want_max = matches!(self.op, RangeRel::Lt | RangeRel::Le);
+        let want_max = !self.op.bounds_below();
         let agg_func = if want_max { WireAggFunc::Max } else { WireAggFunc::Min };
 
         // B's range keys alone: rows sharing one consolidate before the MIN/MAX reads it.

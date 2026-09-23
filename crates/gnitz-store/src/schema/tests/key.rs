@@ -2,7 +2,7 @@ use super::*;
 use crate::schema::{IndexKeySpec, Placement, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::BatchBuilder;
 use crate::test_support::pk_only_schema;
-use gnitz_wire::{read_signed_exact, read_unsigned_exact};
+use gnitz_wire::{read_signed_exact, read_unsigned_exact, Cut, KeyRange, PkColList};
 
 /// Independent typed reference comparator over native-LE PK bytes. This is
 /// the per-column column-walk that `compare_pk_bytes` used *before* the OPK
@@ -1355,7 +1355,8 @@ mod pack_proptest {
 
                     let mut native = [0u8; 16];
                     native[..src_w].copy_from_slice(&vals[i]);
-                    let want = gnitz_wire::encode_pk_natives([(tc, out_tc)], [u128::from_le_bytes(native)]);
+                    let image = gnitz_wire::key_image(tc, u128::from_le_bytes(native));
+                    let want = gnitz_wire::encode_pk_images([(tc, out_tc, image)]);
                     prop_assert_eq!(&pay_buf[off..off + w], want.pk_bytes(), "payload slot {}", i);
                     prop_assert_eq!(&pk_buf[off..off + w], want.pk_bytes(), "pk slot {}", i);
 
@@ -1468,13 +1469,18 @@ fn probe_key_distinguishes_spans_sharing_a_prefix() {
 }
 
 // ---------------------------------------------------------------------------
-// A range descriptor's cut pair as a base-PK key range
+// A key range's cut pair as a base-PK key range
 // ---------------------------------------------------------------------------
+
+/// A range over `schema`'s whole PK list.
+fn pk_range(schema: &SchemaDescriptor, eq: &[u128], start: Cut, end: Cut) -> KeyRange {
+    KeyRange::new(PkColList::from_slice(schema.pk_indices()), eq, start, end)
+}
 
 /// The base-PK key range, through the degenerate identity-promotion span. The
 /// expected bytes below predate `for_pk`, so they pin its promotion too.
-fn pk_range_keys(schema: &SchemaDescriptor, d: &RangeDescriptor) -> Result<Option<(PkBuf, Option<PkBuf>)>, String> {
-    IndexKeySpec::for_pk(schema).range_keys(schema.pk_stride(), d)
+fn pk_range_keys(schema: &SchemaDescriptor, r: &KeyRange) -> Option<(PkBuf, Option<PkBuf>)> {
+    IndexKeySpec::for_pk(schema).range_keys(schema.pk_stride(), r)
 }
 
 fn opk_u64(v: u64) -> Vec<u8> {
@@ -1486,8 +1492,8 @@ fn opk_u64(v: u64) -> Vec<u8> {
 #[test]
 fn pk_range_ge_unbounded_above() {
     let s = pk_only_schema(&[TypeCode::U64]);
-    let d = RangeDescriptor::new(&[], Cut::Before(5), Cut::After(u64::MAX as u128));
-    let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
+    let r = pk_range(&s, &[], Cut::before(5), Cut::after(u64::MAX as u128));
+    let (start, end) = pk_range_keys(&s, &r).unwrap();
     assert_eq!(start.pk_bytes(), opk_u64(5));
     assert!(end.is_none(), "unbounded above → end None");
 }
@@ -1496,8 +1502,8 @@ fn pk_range_ge_unbounded_above() {
 #[test]
 fn pk_range_gt_increments_whole_key() {
     let s = pk_only_schema(&[TypeCode::U64]);
-    let d = RangeDescriptor::new(&[], Cut::After(5), Cut::After(u64::MAX as u128));
-    let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
+    let r = pk_range(&s, &[], Cut::after(5), Cut::after(u64::MAX as u128));
+    let (start, end) = pk_range_keys(&s, &r).unwrap();
     assert_eq!(start.pk_bytes(), opk_u64(6));
     assert!(end.is_none());
 }
@@ -1506,8 +1512,8 @@ fn pk_range_gt_increments_whole_key() {
 #[test]
 fn pk_range_lt() {
     let s = pk_only_schema(&[TypeCode::U64]);
-    let d = RangeDescriptor::new(&[], Cut::Before(0), Cut::Before(10));
-    let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
+    let r = pk_range(&s, &[], Cut::before(0), Cut::before(10));
+    let (start, end) = pk_range_keys(&s, &r).unwrap();
     assert_eq!(start.pk_bytes(), opk_u64(0));
     assert_eq!(end.unwrap().pk_bytes(), opk_u64(10));
 }
@@ -1516,8 +1522,8 @@ fn pk_range_lt() {
 #[test]
 fn pk_range_point_lookup() {
     let s = pk_only_schema(&[TypeCode::U64]);
-    let d = RangeDescriptor::new(&[], Cut::Before(5), Cut::After(5));
-    let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
+    let r = pk_range(&s, &[], Cut::before(5), Cut::after(5));
+    let (start, end) = pk_range_keys(&s, &r).unwrap();
     assert_eq!(start.pk_bytes(), opk_u64(5));
     assert_eq!(end.unwrap().pk_bytes(), opk_u64(6));
 }
@@ -1526,18 +1532,18 @@ fn pk_range_point_lookup() {
 #[test]
 fn pk_range_inverted_is_empty() {
     let s = pk_only_schema(&[TypeCode::U64]);
-    let d = RangeDescriptor::new(&[], Cut::After(10), Cut::Before(3));
-    assert_eq!(pk_range_keys(&s, &d).unwrap(), None);
+    let r = pk_range(&s, &[], Cut::after(10), Cut::before(3));
+    assert_eq!(pk_range_keys(&s, &r), None);
 }
 
-/// A signed PK: `pk > -1` seeks to `OPK(0)` (sign-flip order); `After(i64::MAX)`
+/// A signed PK: `pk > -1` seeks to `OPK(0)` (sign-flip order); `after(image(i64::MAX))`
 /// overflows `succ` → unbounded above.
 #[test]
 fn pk_range_signed_i64() {
     let s = pk_only_schema(&[TypeCode::I64]);
-    let neg1 = (-1i64 as u64) as u128;
-    let d = RangeDescriptor::new(&[], Cut::After(neg1), Cut::After((i64::MAX as u64) as u128));
-    let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
+    let img = |v: i64| gnitz_wire::key_image(TypeCode::I64, v as u64 as u128);
+    let r = pk_range(&s, &[], Cut::after(img(-1)), Cut::after(img(i64::MAX)));
+    let (start, end) = pk_range_keys(&s, &r).unwrap();
     assert_eq!(start, s.opk_key(&0i64.to_le_bytes()));
     assert!(end.is_none());
 }
@@ -1547,32 +1553,23 @@ fn pk_range_signed_i64() {
 #[test]
 fn pk_range_compound_prefix_eq() {
     let s = pk_only_schema(&[TypeCode::U64, TypeCode::U64]);
-    let d = RangeDescriptor::new(&[5], Cut::After(3), Cut::After(u64::MAX as u128));
-    let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
+    let r = pk_range(&s, &[5], Cut::after(3), Cut::after(u64::MAX as u128));
+    let (start, end) = pk_range_keys(&s, &r).unwrap();
     // start = OPK(5,4) — the prefix `(5,3)` incremented on b.
-    let s54 = s.opk_key(&{
-        let mut v = Vec::new();
-        v.extend_from_slice(&5u64.to_le_bytes());
-        v.extend_from_slice(&4u64.to_le_bytes());
-        v
-    });
-    assert_eq!(start, s54);
+    assert_eq!(start.pk_bytes(), opk_pk(&s, &[5, 4]));
     // end = the successor of `(5, MAX)` — carries into `a`, i.e. OPK(6, 0).
-    let s60 = s.opk_key(&{
-        let mut v = Vec::new();
-        v.extend_from_slice(&6u64.to_le_bytes());
-        v.extend_from_slice(&0u64.to_le_bytes());
-        v
-    });
-    assert_eq!(end.unwrap(), s60);
+    assert_eq!(end.unwrap().pk_bytes(), opk_pk(&s, &[6, 0]));
 }
 
-/// `n_eq` at the PK arity leaves no range column — a trust-boundary reject.
+/// A range over a strict PK prefix bounds the leading column and leaves the rest
+/// of the key free: `a > 3` over `(a, b)` starts at `(4, 0)`.
 #[test]
-fn pk_range_no_range_column_errs() {
-    let s = pk_only_schema(&[TypeCode::U64]);
-    let d = RangeDescriptor::new(&[5], Cut::Before(0), Cut::After(0));
-    assert!(pk_range_keys(&s, &d).is_err());
+fn pk_prefix_range_leaves_the_trailing_column_free() {
+    let s = pk_only_schema(&[TypeCode::U64, TypeCode::U64]);
+    let r = KeyRange::new(PkColList::from_slice(&[0]), &[], Cut::after(3), Cut::before(9));
+    let (start, end) = pk_range_keys(&s, &r).unwrap();
+    assert_eq!(start.pk_bytes(), opk_pk(&s, &[4, 0]));
+    assert_eq!(end.unwrap().pk_bytes(), opk_pk(&s, &[9, 0]));
 }
 
 // ---------------------------------------------------------------------------
@@ -1586,20 +1583,20 @@ fn pk_range_no_range_column_errs() {
 fn confined_worker_confines_a_full_point() {
     let u64s = pk_only_schema(&[TypeCode::U64]);
     assert_eq!(
-        u64s.confined_worker(&RangeDescriptor::new(&[], Cut::Before(42), Cut::After(42)), NW),
+        u64s.confined_worker(&pk_range(&u64s, &[], Cut::before(42), Cut::after(42)), NW),
         Some(u64s.worker_for_pk(&opk_pk(&u64s, &[42]), NW))
     );
 
     let u128s = pk_only_schema(&[TypeCode::U128]);
     let wide = (1u128 << 100) | 7;
     assert_eq!(
-        u128s.confined_worker(&RangeDescriptor::new(&[], Cut::Before(wide), Cut::After(wide)), NW),
+        u128s.confined_worker(&pk_range(&u128s, &[], Cut::before(wide), Cut::after(wide)), NW),
         Some(u128s.worker_for_pk(&opk_pk(&u128s, &[wide]), NW))
     );
 
     let comp = pk_only_schema(&[TypeCode::U32, TypeCode::U64]);
     assert_eq!(
-        comp.confined_worker(&RangeDescriptor::new(&[9], Cut::Before(4), Cut::After(4)), NW),
+        comp.confined_worker(&pk_range(&comp, &[9], Cut::before(4), Cut::after(4)), NW),
         Some(comp.worker_for_pk(&opk_pk(&comp, &[9, 4]), NW))
     );
 }
@@ -1616,16 +1613,19 @@ fn confined_worker_follows_the_distribution_prefix() {
     ];
     let prefix = SchemaDescriptor::new_with_placement(&cols, &[0, 1], Placement::Keyed { prefix_len: 1 });
     // `a = 7 AND b > 3` — a whole trailing-column range inside one `a` group.
-    let ranged = RangeDescriptor::new(&[7], Cut::After(3), Cut::After(u64::MAX as u128));
+    let ranged = pk_range(&prefix, &[7], Cut::after(3), Cut::after(u64::MAX as u128));
     let want = prefix.worker_for_pk(&opk_pk(&prefix, &[7, 0]), NW);
     assert_eq!(prefix.confined_worker(&ranged, NW), Some(want));
     for b in [4u128, u64::MAX as u128] {
         assert_eq!(
-            prefix.confined_worker(&RangeDescriptor::new(&[7], Cut::Before(b), Cut::After(b)), NW),
+            prefix.confined_worker(&pk_range(&prefix, &[7], Cut::before(b), Cut::after(b)), NW),
             Some(want),
             "a full point on (7, {b}) shares the group's worker"
         );
     }
+    // `a = 7` alone, as a range over the PK prefix `[a]` the distribution covers.
+    let group = KeyRange::point(PkColList::from_slice(&[0]), &[], 7);
+    assert_eq!(prefix.confined_worker(&group, NW), Some(want));
 
     let full = SchemaDescriptor::new_with_placement(&cols, &[0, 1], Placement::Keyed { prefix_len: 2 });
     assert_eq!(
@@ -1647,13 +1647,15 @@ fn confined_worker_confines_a_maximal_point() {
         } else {
             i64::MAX as u128
         };
-        let d = RangeDescriptor::new(&[], Cut::Before(max), Cut::After(max));
-        assert!(
-            pk_range_keys(&s, &d).unwrap().unwrap().1.is_none(),
-            "After(max) carries out"
+        let r = pk_range(
+            &s,
+            &[],
+            Cut::before(gnitz_wire::key_image(tc, max)),
+            Cut::after(gnitz_wire::key_image(tc, max)),
         );
+        assert!(pk_range_keys(&s, &r).unwrap().1.is_none(), "after(max) carries out");
         assert_eq!(
-            s.confined_worker(&d, NW),
+            s.confined_worker(&r, NW),
             Some(s.worker_for_pk(&opk_pk(&s, &[max]), NW))
         );
     }
@@ -1661,33 +1663,24 @@ fn confined_worker_confines_a_maximal_point() {
 
 /// A range wider than one worker's key span is not confinable: owners are a
 /// hash of the key, not monotone in key order, so only a whole-range prefix
-/// match proves confinement. A provably-empty range is not confinable
-/// either — the worker answers it (a fold sink still owes its ground row) — and
-/// neither is a relation whose rows no key places.
+/// match proves confinement. Neither is a relation whose rows no key places, nor a
+/// range over anything but a PK prefix.
 #[test]
 fn confined_worker_declines_a_multi_key_range_and_an_unkeyed_relation() {
     let s = pk_only_schema(&[TypeCode::U64]);
     assert_eq!(
-        s.confined_worker(&RangeDescriptor::new(&[], Cut::Before(0), Cut::After(1000)), NW),
+        s.confined_worker(&pk_range(&s, &[], Cut::before(0), Cut::after(1000)), NW),
         None
-    );
-    assert_eq!(
-        s.confined_worker(&RangeDescriptor::new(&[], Cut::After(1000), Cut::Before(0)), NW),
-        None,
-        "an inverted range is provably empty"
     );
     // Unbounded above from a non-maximal start: the last key is 0xFF…FF.
     assert_eq!(
-        s.confined_worker(
-            &RangeDescriptor::new(&[], Cut::Before(5), Cut::After(u64::MAX as u128)),
-            NW
-        ),
+        s.confined_worker(&pk_range(&s, &[], Cut::before(5), Cut::after(u64::MAX as u128)), NW),
         None
     );
 
     // The same point that confines above names no owner once the rows are not
     // key-placed.
-    let point = RangeDescriptor::new(&[], Cut::Before(42), Cut::After(42));
+    let point = pk_range(&s, &[], Cut::before(42), Cut::after(42));
     assert!(s.confined_worker(&point, NW).is_some());
     let cols = [SchemaColumn::new(TypeCode::U64, false)];
     for p in [Placement::Replicated, Placement::Local] {
@@ -1695,6 +1688,29 @@ fn confined_worker_declines_a_multi_key_range_and_an_unkeyed_relation() {
             SchemaDescriptor::new_with_placement(&cols, &[0], p).confined_worker(&point, NW),
             None
         );
+    }
+
+    // A point over a column that does not lead the PK walks an index or a full scan.
+    let two = pk_only_schema(&[TypeCode::U64, TypeCode::U64]);
+    let off_pk = KeyRange::point(PkColList::from_slice(&[1]), &[], 42);
+    assert_eq!(two.confined_worker(&off_pk, NW), None);
+}
+
+/// A provably empty PK range is answered by worker 0 under every placement: an empty
+/// answer is correct from any worker.
+#[test]
+fn confined_worker_answers_an_empty_range_from_worker_zero() {
+    let cols = [SchemaColumn::new(TypeCode::U64, false)];
+    for p in [
+        Placement::Keyed { prefix_len: 1 },
+        Placement::Replicated,
+        Placement::Local,
+    ] {
+        let s = SchemaDescriptor::new_with_placement(&cols, &[0], p);
+        let inverted = pk_range(&s, &[], Cut::after(1000), Cut::before(0));
+        assert_eq!(s.confined_worker(&inverted, NW), Some(0), "{p:?}");
+        let past_top = pk_range(&s, &[], Cut::after(u64::MAX as u128), Cut::after(u64::MAX as u128));
+        assert_eq!(s.confined_worker(&past_top, NW), Some(0), "{p:?}");
     }
 }
 

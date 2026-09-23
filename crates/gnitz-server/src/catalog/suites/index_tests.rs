@@ -1,6 +1,6 @@
 use super::*;
 use gnitz_store::schema::{make_index_schema, IndexKeySpec};
-use gnitz_wire::MAX_PK_BYTES;
+use gnitz_wire::{key_image, MAX_PK_BYTES};
 
 // ── test_index_creation_and_fill ────────────────────────────────────────
 
@@ -1307,7 +1307,7 @@ fn test_seek_prefix_matches_projection() {
     let key_size = spec.key_size();
     let proj_key = &projected.get_pk_bytes(0)[..key_size];
 
-    let opk = spec.seek_prefix(&[(-5i32) as u32 as u128, 42u128]);
+    let opk = spec.seek_prefix(&[key_image(TypeCode::I32, (-5i32) as u32 as u128), 42u128]);
     assert_eq!(opk.pk_bytes().len(), key_size);
     assert_eq!(
         opk.pk_bytes(),
@@ -1370,10 +1370,9 @@ fn index_key_spec_equals_projected_leading_span() {
 // ── Signed secondary-index ordering (order-preserving signed leading key) ────
 
 /// Zero-extended native u128 (two's-complement low `sz` bytes) of a value — the
-/// form a `RangeDescriptor` carries.
+/// form `BatchBuilder` takes.
 fn native_u128_at(v: i64, sz: usize) -> u128 {
-    let mask = if sz >= 16 { u128::MAX } else { (1u128 << (sz * 8)) - 1 };
-    (v as u64 as u128) & mask
+    (v as u64 as u128) & gnitz_wire::image_mask(sz)
 }
 
 /// Project a single value (zero-extended native `u128`) through a one-column
@@ -1455,7 +1454,7 @@ fn write_span_reference(
         let native = loc.native_le_bytes(mb, row, &mut scratch);
         let mut wide = [0u8; 16];
         wide[..native.len()].copy_from_slice(native);
-        natives.push(u128::from_le_bytes(wide));
+        natives.push(key_image(loc.type_code(), u128::from_le_bytes(wide)));
     }
     Some(spec.seek_prefix(&natives))
 }
@@ -1562,7 +1561,9 @@ fn write_span_matches_seek_prefix_across_type_ladder() {
         for &v in values {
             let native = native_u128_at(v, sz);
             let write_span = project_leading_span(src, &idx, native);
-            let seek = IndexKeySpec::new(&[1], &src).unwrap().seek_prefix(&[native]);
+            let seek = IndexKeySpec::new(&[1], &src)
+                .unwrap()
+                .seek_prefix(&[key_image(t, native)]);
             assert_eq!(
                 &write_span[..],
                 seek.padded(idx_size),
@@ -1627,25 +1628,17 @@ fn composite_index_signed_leading_unsigned_tiebreak_orders() {
 
 // ── seek_by_index_range tests ────────────────────────────────────────────
 //
-// Ordered range scans over a secondary index, expressed as the half-open cut
-// interval `[start, end)` the SQL planner sends: `x > v` ⇒ start `After(v)`,
-// `x >= v` ⇒ start `Before(v)`, `x < v` ⇒ end `Before(v)`, `x <= v` ⇒ end
-// `After(v)`, and an unconstrained side ⇒ the column type's edge cut.
+// Ordered range scans over a secondary index. A U64's key image is its value.
 
-use gnitz_wire::{
-    Cut::{self, After, Before},
-    RangeDescriptor, TypeCode,
-};
+use gnitz_wire::{image_mask, Cut, TypeCode};
 
-/// The U64 type-edge cuts — what the planner sends for an unconstrained side
-/// on a U64 range column (`Cut::type_edges`, the planner's own mapping).
-const OPEN_BELOW: Cut = Cut::type_edges(TypeCode::U64).unwrap().0;
-const OPEN_ABOVE: Cut = Cut::type_edges(TypeCode::U64).unwrap().1;
+/// The edge cuts of an 8-byte range column.
+const OPEN_BELOW: Cut = Cut::before(0);
+const OPEN_ABOVE: Cut = Cut::after(image_mask(8));
 
 /// Collect the positive-weight source PKs returned by a range scan, sorted.
 fn range_pks(engine: &mut CatalogEngine, tid: i64, cols: &[u32], eq: &[u128], start: Cut, end: Cut) -> Vec<u128> {
-    let desc = RangeDescriptor::new(eq, start, end);
-    let r = seek_by_index_range(engine, tid, cols, desc).unwrap().0;
+    let r = seek_by_index_range(engine, tid, cols, eq, start, end).unwrap().0;
     let mut pks: Vec<u128> = match r {
         Some(b) => (0..b.len())
             .filter(|&i| b.get_weight(i) > 0)
@@ -1678,23 +1671,35 @@ fn test_seek_by_index_range_unsigned_pure_range() {
 
     let c = &[1u32];
     // x > 10  → {20,30} = PKs {3,4}
-    assert_eq!(range_pks(&mut engine, tid, c, &[], After(10), OPEN_ABOVE), vec![3, 4]);
+    assert_eq!(
+        range_pks(&mut engine, tid, c, &[], Cut::after(10), OPEN_ABOVE),
+        vec![3, 4]
+    );
     // x >= 10 → {10,20,30} = PKs {2,3,4}
     assert_eq!(
-        range_pks(&mut engine, tid, c, &[], Before(10), OPEN_ABOVE),
+        range_pks(&mut engine, tid, c, &[], Cut::before(10), OPEN_ABOVE),
         vec![2, 3, 4]
     );
     // x < 20  → {0,10} = PKs {1,2}
-    assert_eq!(range_pks(&mut engine, tid, c, &[], OPEN_BELOW, Before(20)), vec![1, 2]);
+    assert_eq!(
+        range_pks(&mut engine, tid, c, &[], OPEN_BELOW, Cut::before(20)),
+        vec![1, 2]
+    );
     // x <= 20 → {0,10,20} = PKs {1,2,3}
     assert_eq!(
-        range_pks(&mut engine, tid, c, &[], OPEN_BELOW, After(20)),
+        range_pks(&mut engine, tid, c, &[], OPEN_BELOW, Cut::after(20)),
         vec![1, 2, 3]
     );
     // 10 < x < 30 → {20} = PK {3}
-    assert_eq!(range_pks(&mut engine, tid, c, &[], After(10), Before(30)), vec![3]);
+    assert_eq!(
+        range_pks(&mut engine, tid, c, &[], Cut::after(10), Cut::before(30)),
+        vec![3]
+    );
     // 10 <= x <= 20 → {10,20} = PKs {2,3}
-    assert_eq!(range_pks(&mut engine, tid, c, &[], Before(10), After(20)), vec![2, 3]);
+    assert_eq!(
+        range_pks(&mut engine, tid, c, &[], Cut::before(10), Cut::after(20)),
+        vec![2, 3]
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -1719,23 +1724,23 @@ fn test_seek_by_index_range_signed_between() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
-    let pk = |v: i32| (v as u32) as u128;
+    let pk = |v: i32| key_image(TypeCode::I32, (v as u32) as u128);
     let c = &[1u32];
-    // The I32 type-edge cuts an unconstrained side widens to.
-    let (open_below, open_above) = Cut::type_edges(TypeCode::I32).unwrap();
+    // The I32 edge cuts an unconstrained side widens to.
+    let (open_below, open_above) = (Cut::before(0), Cut::after(image_mask(4)));
     // x BETWEEN -5 AND 5 → {-5,0,5} = PKs {2,3,4} (contiguous signed interval).
     assert_eq!(
-        range_pks(&mut engine, tid, c, &[], Before(pk(-5)), After(pk(5))),
+        range_pks(&mut engine, tid, c, &[], Cut::before(pk(-5)), Cut::after(pk(5))),
         vec![2, 3, 4]
     );
     // x > -5 → {0,5,10} = PKs {3,4,5}
     assert_eq!(
-        range_pks(&mut engine, tid, c, &[], After(pk(-5)), open_above),
+        range_pks(&mut engine, tid, c, &[], Cut::after(pk(-5)), open_above),
         vec![3, 4, 5]
     );
     // x < 0 → {-10,-5} = PKs {1,2}
     assert_eq!(
-        range_pks(&mut engine, tid, c, &[], open_below, Before(pk(0))),
+        range_pks(&mut engine, tid, c, &[], open_below, Cut::before(pk(0))),
         vec![1, 2]
     );
 
@@ -1770,16 +1775,22 @@ fn test_seek_by_index_range_composite_eq_prefix() {
     let c = &[1u32, 2u32]; // index (a, b)
                            // a = 7 AND b < 50 → {(7,10),(7,49)} = PKs {1,2}; (8,0) is absent (the end
                            // cut sits inside the a==7 group's key space).
-    assert_eq!(range_pks(&mut engine, tid, c, &[7], OPEN_BELOW, Before(50)), vec![1, 2]);
+    assert_eq!(
+        range_pks(&mut engine, tid, c, &[7], OPEN_BELOW, Cut::before(50)),
+        vec![1, 2]
+    );
     // a = 7 AND b <= 50 → {(7,10),(7,49),(7,50)} = PKs {1,2,3}
     assert_eq!(
-        range_pks(&mut engine, tid, c, &[7], OPEN_BELOW, After(50)),
+        range_pks(&mut engine, tid, c, &[7], OPEN_BELOW, Cut::after(50)),
         vec![1, 2, 3]
     );
-    // a = 7 AND b > 10 → {(7,49),(7,50)} = PKs {2,3}; the end cut After(u64::MAX)
+    // a = 7 AND b > 10 → {(7,49),(7,50)} = PKs {2,3}; the end cut after(u64::MAX)
     // carries into the equality prefix — the first a==8 key — so the scan stops
     // exactly at the group boundary.
-    assert_eq!(range_pks(&mut engine, tid, c, &[7], After(10), OPEN_ABOVE), vec![2, 3]);
+    assert_eq!(
+        range_pks(&mut engine, tid, c, &[7], Cut::after(10), OPEN_ABOVE),
+        vec![2, 3]
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -1805,9 +1816,15 @@ fn test_seek_by_index_range_open_ended() {
 
     let c = &[1u32];
     // x > 2 (unbounded above) → {3,4}
-    assert_eq!(range_pks(&mut engine, tid, c, &[], After(2), OPEN_ABOVE), vec![3, 4]);
+    assert_eq!(
+        range_pks(&mut engine, tid, c, &[], Cut::after(2), OPEN_ABOVE),
+        vec![3, 4]
+    );
     // x < 3 (unbounded below) → {1,2}
-    assert_eq!(range_pks(&mut engine, tid, c, &[], OPEN_BELOW, Before(3)), vec![1, 2]);
+    assert_eq!(
+        range_pks(&mut engine, tid, c, &[], OPEN_BELOW, Cut::before(3)),
+        vec![1, 2]
+    );
     // both edges (a saturated `x < HUGE`) → every indexed row.
     assert_eq!(
         range_pks(&mut engine, tid, c, &[], OPEN_BELOW, OPEN_ABOVE),
@@ -1845,15 +1862,15 @@ fn test_seek_by_index_range_exclusive_lower_large_dup_group() {
     engine.registry.checkpoint_base().unwrap();
 
     let c = &[1u32];
-    // x > 10: After(10) cuts past the whole duplicate group — including the
+    // x > 10: after(10) cuts past the whole duplicate group — including the
     // all-0xFF-source-PK member — in one O(log N) seek, no per-row skip.
     assert_eq!(
-        range_pks(&mut engine, tid, c, &[], After(10), OPEN_ABOVE),
+        range_pks(&mut engine, tid, c, &[], Cut::after(10), OPEN_ABOVE),
         vec![100, 101]
     );
-    // x >= 10: Before(10) keeps the whole group plus the greater rows.
+    // x >= 10: before(10) keeps the whole group plus the greater rows.
     assert_eq!(
-        range_pks(&mut engine, tid, c, &[], Before(10), OPEN_ABOVE),
+        range_pks(&mut engine, tid, c, &[], Cut::before(10), OPEN_ABOVE),
         vec![1, 2, 3, 4, 5, 100, 101, u64::MAX as u128]
     );
 
@@ -1891,7 +1908,10 @@ fn test_seek_by_index_range_retraction() {
 
     let c = &[1u32];
     // x > 0 → {5,25} = PKs {1,3}; PK 2 (retracted x=15) absent.
-    assert_eq!(range_pks(&mut engine, tid, c, &[], After(0), OPEN_ABOVE), vec![1, 3]);
+    assert_eq!(
+        range_pks(&mut engine, tid, c, &[], Cut::after(0), OPEN_ABOVE),
+        vec![1, 3]
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -1921,10 +1941,14 @@ fn test_seek_by_index_range_null_excluded() {
     engine.registry.checkpoint_base().unwrap();
 
     let c = &[1u32];
-    // The I64 type-edge cuts (the range column is I64 here, not U64).
-    let (open_below, open_above) = Cut::type_edges(TypeCode::I64).unwrap();
+    // The I64 edge cuts (the range column is I64 here, not U64), and its images.
+    let (open_below, open_above) = (OPEN_BELOW, OPEN_ABOVE);
+    let img = |v: i64| key_image(TypeCode::I64, v as u64 as u128);
     // x < 100 → {5,15} = PKs {1,3}; the NULL-x PK 2 never appears.
-    assert_eq!(range_pks(&mut engine, tid, c, &[], open_below, Before(100)), vec![1, 3]);
+    assert_eq!(
+        range_pks(&mut engine, tid, c, &[], open_below, Cut::before(img(100))),
+        vec![1, 3]
+    );
     // a full edge-to-edge scan also excludes NULL (index has no entry for it).
     assert_eq!(range_pks(&mut engine, tid, c, &[], open_below, open_above), vec![1, 3]);
 
@@ -1933,33 +1957,10 @@ fn test_seek_by_index_range_null_excluded() {
 }
 
 #[test]
-fn test_seek_by_index_range_no_range_column_errs() {
-    let (mut engine, tid, dir) = table_fixture(
-        "catalog_range_arity",
-        &[col_def("id", TypeCode::U64), col_def("x", TypeCode::U64)],
-    );
-    engine.create_index("public.t", &["x"], false).unwrap();
-
-    // n_eq == arity → no range column; the pub method must self-guard with Err,
-    // never panic indexing past the column list.
-    let r = seek_by_index_range(
-        &mut engine,
-        tid,
-        &[1],
-        RangeDescriptor::new(&[10], After(0), OPEN_ABOVE),
-    );
-    assert!(r.is_err(), "n_eq == index arity must be rejected");
-    assert!(r.err().unwrap().to_string().contains("no range column"));
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn test_seek_by_index_range_exclusive_lower_type_max() {
-    // Start-cut successor overflow: `x > u64::MAX` starts at After(MAX), the
+    // Start-cut successor overflow: `x > u64::MAX` starts at after(MAX), the
     // byte successor of the maximal group — which does not exist (`+∞`) →
-    // provably empty. `x >= u64::MAX` starts Before(MAX) and keeps the group.
+    // provably empty. `x >= u64::MAX` starts before(MAX) and keeps the group.
     let (mut engine, tid, dir) = table_fixture(
         "catalog_range_excl_lower_max",
         &[col_def("id", TypeCode::U64), col_def("x", TypeCode::U64)],
@@ -1980,11 +1981,14 @@ fn test_seek_by_index_range_exclusive_lower_type_max() {
     let max = u64::MAX as u128;
     // x > u64::MAX → nothing above the maximal group.
     assert_eq!(
-        range_pks(&mut engine, tid, c, &[], After(max), OPEN_ABOVE),
+        range_pks(&mut engine, tid, c, &[], Cut::after(max), OPEN_ABOVE),
         Vec::<u128>::new()
     );
     // x >= u64::MAX → exactly the two MAX rows.
-    assert_eq!(range_pks(&mut engine, tid, c, &[], Before(max), OPEN_ABOVE), vec![3, 4]);
+    assert_eq!(
+        range_pks(&mut engine, tid, c, &[], Cut::before(max), OPEN_ABOVE),
+        vec![3, 4]
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -1992,7 +1996,7 @@ fn test_seek_by_index_range_exclusive_lower_type_max() {
 
 #[test]
 fn test_seek_by_index_range_inclusive_upper_type_max() {
-    // End-cut successor overflow: `x <= u64::MAX` ends at After(MAX), the byte
+    // End-cut successor overflow: `x <= u64::MAX` ends at after(MAX), the byte
     // successor of the maximal group — which does not exist (`+∞`) → scan to
     // the table end (every row, including the MAX one).
     let (mut engine, tid, dir) = table_fixture(
@@ -2014,7 +2018,7 @@ fn test_seek_by_index_range_inclusive_upper_type_max() {
     let c = &[1u32];
     // x <= u64::MAX → every indexed row, the MAX row included.
     assert_eq!(
-        range_pks(&mut engine, tid, c, &[], OPEN_BELOW, After(u64::MAX as u128)),
+        range_pks(&mut engine, tid, c, &[], OPEN_BELOW, Cut::after(u64::MAX as u128)),
         vec![1, 2, 3]
     );
 
@@ -2024,7 +2028,7 @@ fn test_seek_by_index_range_inclusive_upper_type_max() {
 
 #[test]
 fn test_seek_by_index_range_carry_ripples_into_eq_prefix() {
-    // An After cut on a range slot at the type max carries the successor out of
+    // An after cut on a range slot at the type max carries the successor out of
     // the range slot and into the equality prefix. Index (a, b); the (8, 0) row
     // must never leak into an a==7 scan.
     let (mut engine, tid, dir) = table_fixture(
@@ -2050,15 +2054,18 @@ fn test_seek_by_index_range_carry_ripples_into_eq_prefix() {
 
     let c = &[1u32, 2u32]; // index (a, b)
     let max = u64::MAX as u128;
-    // a = 7 AND b > u64::MAX → empty: the start cut After(7, MAX) carries onto
+    // a = 7 AND b > u64::MAX → empty: the start cut after(7, MAX) carries onto
     // the first a==8 key, where the end cut already sits, so start == end. The
     // (8, 0) row must not leak in.
     assert_eq!(
-        range_pks(&mut engine, tid, c, &[7], After(max), OPEN_ABOVE),
+        range_pks(&mut engine, tid, c, &[7], Cut::after(max), OPEN_ABOVE),
         Vec::<u128>::new()
     );
     // a = 7 AND b <= u64::MAX → only (7, u64::MAX); (8, 0) is a different group.
-    assert_eq!(range_pks(&mut engine, tid, c, &[7], OPEN_BELOW, After(max)), vec![1]);
+    assert_eq!(
+        range_pks(&mut engine, tid, c, &[7], OPEN_BELOW, Cut::after(max)),
+        vec![1]
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -2119,7 +2126,7 @@ fn test_seek_by_index_range_multi_group_sorted_with_retraction() {
     engine.registry.checkpoint_base().unwrap();
 
     // x ∈ [10, 20] → all six rows, each at weight 1.
-    let r = seek_by_index_range(&mut engine, tid, &[1], RangeDescriptor::new(&[], Before(10), After(20)))
+    let r = seek_by_index_range(&mut engine, tid, &[1], &[], Cut::before(10), Cut::after(20))
         .unwrap()
         .0;
     assert_eq!(
@@ -2136,7 +2143,7 @@ fn test_seek_by_index_range_multi_group_sorted_with_retraction() {
     engine.ingest_to_family(tid, &rb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
-    let r = seek_by_index_range(&mut engine, tid, &[1], RangeDescriptor::new(&[], Before(10), After(20)))
+    let r = seek_by_index_range(&mut engine, tid, &[1], &[], Cut::before(10), Cut::after(20))
         .unwrap()
         .0;
     assert_eq!(
@@ -2229,7 +2236,7 @@ fn test_seek_by_index_range_empty_interval_short_circuits() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
-    let r = seek_by_index_range(&mut engine, tid, &[1], RangeDescriptor::new(&[], After(15), Before(25)))
+    let r = seek_by_index_range(&mut engine, tid, &[1], &[], Cut::after(15), Cut::before(25))
         .unwrap()
         .0;
     assert!(
@@ -2295,7 +2302,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     engine.registry.checkpoint_base().unwrap();
 
     // x ∈ [10, 30] → all three wide-PK rows, resolved by their full 24-byte key.
-    let r = seek_by_index_range(&mut engine, tid, &[3], RangeDescriptor::new(&[], Before(10), After(30)))
+    let r = seek_by_index_range(&mut engine, tid, &[3], &[], Cut::before(10), Cut::after(30))
         .unwrap()
         .0
         .expect("wide-PK range scan must resolve all three rows");
@@ -2446,7 +2453,7 @@ fn test_seek_by_index_multi_value_regression() {
     assert_eq!(result_triples(r), vec![(2, 20, 1)]);
 
     // val ∈ [10, 20]
-    let rr = seek_by_index_range(&mut engine, tid, &[1], RangeDescriptor::new(&[], Before(10), After(20)))
+    let rr = seek_by_index_range(&mut engine, tid, &[1], &[], Cut::before(10), Cut::after(20))
         .unwrap()
         .0;
     assert_eq!(result_triples(rr), vec![(1, 10, 1), (2, 20, 1)]);

@@ -58,7 +58,7 @@ wire_enum! {
 /// The `params` blob layout, folded into [`crate::SYS_SCHEMA_DIGEST`] rather
 /// than written into the blob: the digest is what refuses a stored
 /// `CIRCUIT_NODES` blob decoded under a new layout.
-pub(crate) const CIRCUIT_PARAMS_VERSION: u8 = 7;
+pub(crate) const CIRCUIT_PARAMS_VERSION: u8 = 8;
 
 // ---------------------------------------------------------------------------
 // Typed circuit-node representation (shared between gnitz-core and gnitz-server)
@@ -172,6 +172,16 @@ impl RangeRel {
             RangeRel::Gt => RangeRel::Lt,
             RangeRel::Ge => RangeRel::Le,
         }
+    }
+
+    /// Whether `x REL v` bounds `x` from below (`>`, `>=`).
+    pub fn bounds_below(self) -> bool {
+        matches!(self, RangeRel::Gt | RangeRel::Ge)
+    }
+
+    /// Whether `x REL v` admits `v` itself (`>=`, `<=`).
+    pub fn admits_equal(self) -> bool {
+        matches!(self, RangeRel::Ge | RangeRel::Le)
     }
 }
 

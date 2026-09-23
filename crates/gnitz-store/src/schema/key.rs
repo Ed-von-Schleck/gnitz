@@ -5,7 +5,7 @@
 //! leading-column span — to its order-preserving big-endian
 //! image, compare two such images with a raw `memcmp`, pack a narrow region
 //! into a sort key, carry a width-tagged PK byte buffer, and derive the
-//! half-open key range a `RangeDescriptor`'s cut pair denotes — and compose the
+//! half-open key range a `KeyRange`'s cut pair denotes — and compose the
 //! two multi-column OPK keys: a secondary index's leading span
 //! ([`IndexKeySpec`]) and a reindex's synthetic PK
 //! ([`ReindexPacker`](crate::schema::key::ReindexPacker)). None of them reaches
@@ -20,7 +20,7 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 
 use gnitz_expr::RowSource;
-use gnitz_wire::{Cut, RangeDescriptor, NARROW_PK_MAX_BYTES};
+use gnitz_wire::{KeyRange, NARROW_PK_MAX_BYTES};
 
 use crate::schema::{
     ColumnLocator, DerivedSchema, OpBuildErr, SchemaBound, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode,
@@ -501,18 +501,19 @@ impl IndexKeySpec {
         out.write(self.key_size(), |dst| self.write_span(mb, row, dst))
     }
 
-    /// The leading-key span of `natives`, one per leading spec column as a
-    /// `RangeDescriptor` carries them: what [`Self::write_span`] writes for those values.
-    /// Fewer values than columns give that prefix of the span.
-    pub fn seek_prefix(&self, natives: &[u128]) -> PkBuf {
-        let k = natives.len();
+    /// The leading-key span of one key image per leading spec column: what
+    /// [`Self::write_span`] writes for those values.
+    pub fn seek_prefix(&self, images: &[u128]) -> PkBuf {
+        let k = images.len();
         debug_assert!(
             k >= 1 && k <= self.n as usize,
-            "seek_prefix: one native value per leading spec column"
+            "seek_prefix: one image per leading spec column"
         );
-        gnitz_wire::encode_pk_natives(
-            self.cols[..k].iter().map(|c| (c.loc.type_code(), c.out.type_code)),
-            natives.iter().copied(),
+        gnitz_wire::encode_pk_images(
+            self.cols[..k]
+                .iter()
+                .zip(images)
+                .map(|(c, &v)| (c.loc.type_code(), c.out.type_code, v)),
         )
     }
 
@@ -520,44 +521,25 @@ impl IndexKeySpec {
     /// space, each key exactly `stride` bytes (the leading span plus, for a
     /// secondary index, the source-PK suffix).
     ///
-    /// `range` pins its leading `eq_vals()` columns and cut-bounds the next.
-    /// Each cut names the group [`Self::seek_prefix`] encodes for it — the same
-    /// baked spec `write_span` projects entries with.
-    ///
-    /// `Ok(None)` = provably empty; `Err` = every column pinned, no range column
-    /// left (which also keeps the group prefix narrower than `stride`).
-    pub(crate) fn range_keys(
-        &self,
-        stride: usize,
-        range: &RangeDescriptor,
-    ) -> Result<Option<(PkBuf, Option<PkBuf>)>, String> {
-        fn cut(c: Cut, group: &PkBuf) -> KeyCut<'_> {
-            match c {
-                Cut::Before(_) => KeyCut::min_of(group.pk_bytes()),
-                Cut::After(_) => KeyCut::above(group.pk_bytes()),
-            }
-        }
-        let eq_natives = range.eq_vals();
-        let n_eq = eq_natives.len();
-        // Written `n_eq >= arity`, never a `+ 1` that could overflow on an
-        // adversarial length.
-        if n_eq >= self.n as usize {
-            return Err(format!(
-                "key range: n_eq {n_eq} has no range column within arity {}",
-                self.n
-            ));
-        }
-        let mut natives = [0u128; MAX_PK_COLUMNS];
-        natives[..n_eq].copy_from_slice(eq_natives);
-        natives[n_eq] = range.start.value();
-        let start = self.seek_prefix(&natives[..=n_eq]);
-        natives[n_eq] = range.end.value();
-        let end = self.seek_prefix(&natives[..=n_eq]);
-        Ok(key_range_between_cuts(
-            cut(range.start, &start),
-            cut(range.end, &end),
+    /// `None` = provably empty.
+    pub(crate) fn range_keys(&self, stride: usize, range: &KeyRange) -> Option<(PkBuf, Option<PkBuf>)> {
+        debug_assert!(
+            range.cols().as_slice().len() <= self.n as usize,
+            "range_keys: the range lists more columns than the key space"
+        );
+        let eq = range.eq_vals();
+        let n_eq = eq.len();
+        let mut images = [0u128; MAX_PK_COLUMNS];
+        images[..n_eq].copy_from_slice(eq);
+        images[n_eq] = range.start.image;
+        let start = self.seek_prefix(&images[..=n_eq]);
+        images[n_eq] = range.end.image;
+        let end = self.seek_prefix(&images[..=n_eq]);
+        key_range_between_cuts(
+            KeyCut::new(start.pk_bytes(), range.start.after),
+            KeyCut::new(end.pk_bytes(), range.end.after),
             stride,
-        ))
+        )
     }
 }
 
@@ -601,15 +583,20 @@ pub(crate) struct KeyCut<'a> {
 }
 
 impl<'a> KeyCut<'a> {
+    /// [`Self::above`] when `above`, else [`Self::min_of`].
+    pub(crate) fn new(group: &'a [u8], above: bool) -> Self {
+        KeyCut { group, above }
+    }
+
     /// The group's own minimum key — below every member of it.
     pub(crate) fn min_of(group: &'a [u8]) -> Self {
-        KeyCut { group, above: false }
+        KeyCut::new(group, false)
     }
 
     /// The first key above every member of the group. A saturated group — and
     /// the zero-width group, which is the whole key space — has none.
     pub(crate) fn above(group: &'a [u8]) -> Self {
-        KeyCut { group, above: true }
+        KeyCut::new(group, true)
     }
 
     /// This cut as a `stride`-wide key; `None` when it lies above the whole key
@@ -637,15 +624,9 @@ pub(crate) fn key_range_between_cuts(start: KeyCut, end: KeyCut, stride: usize) 
     Some((start, end))
 }
 
-/// True when every key in a half-open `[start, end)` range from
-/// [`IndexKeySpec::range_keys`] shares its leading `prefix` bytes. Since OPK order IS
-/// byte order, it is enough that the range's first and last keys agree there.
-///
-/// The last key is `end - 1`, undoing the `After` successor (and any carry ripple)
-/// the cut derivation applied — `Some(end)` only ever comes back with
-/// `start < end`, so the decrement cannot borrow out. `end == None` means the end
-/// cut carried out and the range runs to the table end, whose last key is
-/// all-`0xFF`.
+/// Whether every key of a non-empty band `[start, end)` shares its leading `prefix`
+/// bytes — the bytes a worker owner hashes. OPK order is byte order, so the first and
+/// last keys decide; a band with no `end` runs to the all-`0xFF` key.
 fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: usize) -> bool {
     let last = match end {
         Some(e) => {
@@ -659,23 +640,18 @@ fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: usize) -> boo
 }
 
 impl SchemaDescriptor {
-    /// The one worker every row matching `range` can live on — the master's
-    /// confinement test, which turns a broadcast into a unicast. `None` whenever
-    /// nothing proves one: a placement under which no key names an owner at all,
-    /// a range spanning workers, a provably-empty range, or a forged descriptor
-    /// (left for the reader's own trust boundary).
-    ///
-    /// An owner is a hash of `key[..dist_stride]` and so not monotone in key
-    /// order, so the range is confined iff every key in it shares that prefix —
-    /// which `range_shares_prefix` decides from its first and last keys alone.
-    pub fn confined_worker(&self, range: &RangeDescriptor, num_workers: usize) -> Option<usize> {
+    /// The one worker that can answer `range`, when one provably can. Any worker
+    /// answers an empty range, so worker 0 does.
+    pub fn confined_worker(&self, range: &KeyRange, num_workers: usize) -> Option<usize> {
+        if !range.walks_pk(self.pk_indices()) {
+            return None;
+        }
+        let Some((start, end)) = IndexKeySpec::for_pk(self).range_keys(self.pk_stride(), range) else {
+            return Some(0);
+        };
         if !self.placement().is_key_routed() {
             return None;
         }
-        let (start, end) = IndexKeySpec::for_pk(self)
-            .range_keys(self.pk_stride(), range)
-            .ok()
-            .flatten()?;
         range_shares_prefix(&start, end.as_ref(), self.dist_stride())
             .then(|| self.worker_for_pk(start.pk_bytes(), num_workers))
     }

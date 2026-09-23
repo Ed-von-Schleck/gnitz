@@ -1,5 +1,6 @@
 use super::*;
-use crate::range::Cut::{After, Before};
+use crate::range::Cut;
+use crate::PkColList;
 use crate::TypeCode;
 use crate::{AggFunc, MAX_COLUMNS};
 
@@ -31,15 +32,19 @@ fn keys(stride: usize) -> PkKeys {
 fn roundtrips_every_bound_against_every_sink() {
     let bounds = [
         ReadBound::None,
-        ReadBound::PkRange(RangeDescriptor::new(&[], After(10), After(u64::MAX as u128))),
-        ReadBound::IndexRange(IndexBound {
-            idx_cols: crate::PkColList::from_slice(&[1, 2]),
-            desc: RangeDescriptor::new(&[7], Before(1), Before(u128::MAX)),
-        }),
-        ReadBound::IndexRange(IndexBound {
-            idx_cols: crate::PkColList::from_slice(&[3]),
-            desc: RangeDescriptor::point(&[], u128::MAX),
-        }),
+        ReadBound::Range(KeyRange::new(
+            PkColList::from_slice(&[0]),
+            &[],
+            Cut::after(10),
+            Cut::after(u64::MAX as u128),
+        )),
+        ReadBound::Range(KeyRange::new(
+            PkColList::from_slice(&[1, 2]),
+            &[7],
+            Cut::before(1),
+            Cut::before(u128::MAX),
+        )),
+        ReadBound::Range(KeyRange::point(PkColList::from_slice(&[3]), &[], u128::MAX)),
         ReadBound::PkSet(keys(8)),
         // A compound key wider than any scalar.
         ReadBound::PkSet(keys(24)),
@@ -91,23 +96,24 @@ fn roundtrips_every_bound_against_every_sink() {
     }
 }
 
-/// An index bound's equality prefix must leave its range column inside the index's
-/// own column list, so a prefix covering every column is refused at decode.
+/// An equality prefix covering every listed column is refused at decode.
 #[test]
-fn an_index_bound_pinning_every_column_is_refused_at_decode() {
-    let spec = |eq: &[u128]| {
-        ReadSpec::all_rows(ReadBound::IndexRange(IndexBound {
-            idx_cols: crate::PkColList::from_slice(&[1, 2]),
-            desc: RangeDescriptor::new(eq, Before(1), After(9)),
-        }))
-    };
+fn a_range_pinning_every_column_is_refused_at_decode() {
     let block = block();
-    let Err(err) = ReadSpec::decode(&spec(&[7, 8]).encode(&block)) else {
-        panic!("an equality prefix over every index column must be refused");
+    let ok = ReadSpec::all_rows(ReadBound::Range(KeyRange::new(
+        PkColList::from_slice(&[1, 2]),
+        &[7],
+        Cut::before(1),
+        Cut::after(9),
+    )));
+    let mut bytes = ok.encode(&block);
+    assert_eq!(ReadSpec::decode(&bytes), Ok((ok.clone(), &block[..])));
+    // `n_eq` sits after the reply block, the bound tag and the column word.
+    bytes[4 + block.len() + 1 + 8] = 2;
+    let Err(err) = ReadSpec::decode(&bytes) else {
+        panic!("an equality prefix over every key column must be refused");
     };
     assert!(err.contains("leave no range column"), "{err}");
-    let ok = spec(&[7]);
-    assert_eq!(ReadSpec::decode(&ok.encode(&block)), Ok((ok.clone(), &block[..])));
 }
 
 /// A worker orders only under a cut, so an order key with no cut is a frame no
@@ -274,8 +280,8 @@ fn each_decode_guard_rejects_its_own_forgery() {
     assert!(ReadSpec::decode(&truncated).is_err(), "truncated PkSet");
 }
 
-/// Routing reads a `PkRange`'s descriptor and a `PkSet`'s keys in place, and
-/// declines every other bound and any truncated prefix.
+/// Routing reads a `Range` and a `PkSet`'s keys in place, and declines every other
+/// bound and any truncated prefix.
 #[test]
 fn peek_bound_reads_only_the_routing_bounds() {
     let block = block();
@@ -288,10 +294,10 @@ fn peek_bound_reads_only_the_routing_bounds() {
         .encode(&block)
     };
 
-    let desc = RangeDescriptor::new(&[4], After(1), Before(9));
-    match peek_bound(&with(ReadBound::PkRange(desc))) {
-        Some(BoundPeek::PkRange(got)) => assert_eq!(got, desc),
-        _ => panic!("a PkRange peeks as its descriptor"),
+    let range = KeyRange::new(PkColList::from_slice(&[0, 1]), &[4], Cut::after(1), Cut::before(9));
+    match peek_bound(&with(ReadBound::Range(range))) {
+        Some(BoundPeek::Range(got)) => assert_eq!(got, range),
+        _ => panic!("a Range peeks as itself"),
     }
 
     let set = keys(8);
@@ -305,11 +311,6 @@ fn peek_bound_reads_only_the_routing_bounds() {
     }
 
     assert!(peek_bound(&with(ReadBound::None)).is_none());
-    let index = ReadBound::IndexRange(IndexBound {
-        idx_cols: crate::PkColList::from_slice(&[1]),
-        desc: RangeDescriptor::point(&[], 3),
-    });
-    assert!(peek_bound(&with(index)).is_none());
     // Cut inside the key list: the count names bytes the blob does not hold.
     let key_end = 4 + block.len() + 1 + 1 + 4 + set.as_bytes().len();
     assert!(peek_bound(&blob[..key_end - 1]).is_none());

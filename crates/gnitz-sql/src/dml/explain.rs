@@ -110,13 +110,13 @@ fn read_line(read: &SpecRead) -> String {
 fn access_line(bound: &ReadBound, schema: &Schema) -> String {
     match bound {
         ReadBound::None => "full scan".to_string(),
-        ReadBound::PkRange(_) => "pk range walk".to_string(),
+        ReadBound::Range(r) if r.walks_pk(&schema.pk_cols) => "pk range walk".to_string(),
         ReadBound::PkSet(keys) if keys.len() == 1 => "pk point lookup".to_string(),
         // The keys ship deduplicated, so this is the distinct key count.
         ReadBound::PkSet(keys) => format!("pk set gather ({} keys)", keys.len()),
-        ReadBound::IndexRange(bound) => {
-            let cols = bound
-                .idx_cols
+        ReadBound::Range(r) => {
+            let cols = r
+                .cols()
                 .as_slice()
                 .iter()
                 .map(|&c| schema.columns[c as usize].name.as_str())

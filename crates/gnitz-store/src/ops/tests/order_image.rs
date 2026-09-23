@@ -160,14 +160,15 @@ fn scalar_batch(tc: TypeCode, vals: &[u64], as_pk: bool) -> Batch {
     b.finish()
 }
 
-/// `order_bits`' integer half is the value's index key (`encode_pk_natives` at
+/// `order_bits`' integer half is the value's index key (`encode_pk_images` at
 /// `index_key_type`), on both arms, and `order_inverse` recovers the value from
 /// it.
 #[test]
 fn order_bits_matches_the_opk_promotion_on_both_arms() {
     fn oracle(native: u64, type_code: TypeCode) -> u64 {
         let target = gnitz_wire::index_key_type(type_code).unwrap();
-        let key = gnitz_wire::encode_pk_natives([(type_code, target)], [native as u128]);
+        let image = gnitz_wire::key_image(type_code, native as u128);
+        let key = gnitz_wire::encode_pk_images([(type_code, target, image)]);
         u64::from_be_bytes(key.pk_bytes().try_into().unwrap())
     }
 

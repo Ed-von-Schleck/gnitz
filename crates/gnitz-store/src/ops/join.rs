@@ -185,8 +185,8 @@ impl RangeProbe {
         };
         Ok(RangeProbe {
             eq_size,
-            above: matches!(rel, RangeRel::Gt | RangeRel::Ge),
-            cuts_below: matches!(rel, RangeRel::Ge | RangeRel::Lt),
+            above: rel.bounds_below(),
+            cuts_below: rel.bounds_below() == rel.admits_equal(),
         })
     }
 
@@ -194,10 +194,7 @@ impl RangeProbe {
     /// `pk` (`equality prefix ‖ range slot`). `None` when it is provably empty.
     fn cut_points(&self, pk: &[u8]) -> Option<(PkBuf, Option<PkBuf>)> {
         let group = &pk[..self.eq_size];
-        let slot = match self.cuts_below {
-            true => KeyCut::min_of(pk),
-            false => KeyCut::above(pk),
-        };
+        let slot = KeyCut::new(pk, !self.cuts_below);
         let (start, end) = match self.above {
             true => (slot, KeyCut::above(group)),
             false => (KeyCut::min_of(group), slot),

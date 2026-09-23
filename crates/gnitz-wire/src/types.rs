@@ -780,7 +780,7 @@ impl FixedInt {
     /// (the SQL layer's literal parsing routes through here).
     pub const fn pack(self, v: i128) -> u128 {
         debug_assert!(self.range().0 <= v && v <= self.range().1);
-        (v as u128) & (u128::MAX >> (128 - 8 * self.width()))
+        (v as u128) & crate::image_mask(self.width())
     }
 
     /// Inverse of [`Self::pack`]: `v`'s low `width()` bytes read as this type,

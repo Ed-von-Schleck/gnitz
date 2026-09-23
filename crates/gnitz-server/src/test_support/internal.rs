@@ -258,35 +258,51 @@ pub fn register_identity_view(engine: &mut CatalogEngine, source_tid: i64, name:
     try_register_identity_view(engine, source_tid, name, cols, 0, 0).unwrap()
 }
 
-/// The rows an `IndexRange` read of `range` over `cols` returns, or
-/// `None` when none match — the production read, through `open_bound`.
+/// The rows a range read over `cols` returns, or `None` when none match.
 pub fn seek_by_index_range(
     engine: &mut CatalogEngine,
     tid: i64,
     cols: &[u32],
-    range: gnitz_wire::RangeDescriptor,
+    eq: &[u128],
+    start: gnitz_wire::Cut,
+    end: gnitz_wire::Cut,
 ) -> Result<(Option<std::rc::Rc<Batch>>, gnitz_store::schema::SchemaDescriptor), gnitz_wire::WireFault> {
     let schema = engine
         .registry
         .relation_or_err(tid)
         .map_err(|e| gnitz_wire::WireFault::from(e.to_string()))?
         .schema();
-    let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::IndexRange(gnitz_wire::IndexBound {
-        idx_cols: gnitz_wire::PkColList::from_slice(cols),
-        desc: range,
-    }));
+    let range = gnitz_wire::KeyRange::new(gnitz_wire::PkColList::from_slice(cols), eq, start, end);
+    let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::Range(range));
     let rows = engine.scan_spec(tid, spec, &schema)?;
     Ok(((!rows.is_empty()).then_some(rows), schema))
 }
 
-/// [`seek_by_index_range`] at the point `natives` names: equality on every
-/// supplied value, fewer than `cols` for a prefix seek.
+/// [`seek_by_index_range`] at the point `natives` names, fewer than `cols` for a
+/// prefix seek.
 pub fn seek_by_index(
     engine: &mut CatalogEngine,
     tid: i64,
     cols: &[u32],
     natives: &[u128],
 ) -> Result<(Option<std::rc::Rc<Batch>>, gnitz_store::schema::SchemaDescriptor), gnitz_wire::WireFault> {
-    let (&last, eq) = natives.split_last().expect("at least one key value");
-    seek_by_index_range(engine, tid, cols, gnitz_wire::RangeDescriptor::point(eq, last))
+    let schema = engine
+        .registry
+        .relation_or_err(tid)
+        .map_err(|e| gnitz_wire::WireFault::from(e.to_string()))?
+        .schema();
+    let images: Vec<u128> = cols
+        .iter()
+        .zip(natives)
+        .map(|(&c, &v)| gnitz_wire::key_image(schema.columns[c as usize].type_code, v))
+        .collect();
+    let (&last, eq) = images.split_last().expect("at least one key value");
+    seek_by_index_range(
+        engine,
+        tid,
+        cols,
+        eq,
+        gnitz_wire::Cut::before(last),
+        gnitz_wire::Cut::after(last),
+    )
 }

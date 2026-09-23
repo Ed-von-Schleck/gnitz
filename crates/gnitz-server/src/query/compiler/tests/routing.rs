@@ -903,13 +903,10 @@ fn the_shard_walk_bails_at_a_fan_in() {
 /// shares one backfill cursor, so it keeps none even where one scan is bounded.
 #[test]
 fn a_source_scanned_once_keeps_its_backfill_bound() {
-    let bound = |col: u32| gnitz_wire::IndexBound {
-        idx_cols: gnitz_wire::PkColList::from_slice(&[col]),
-        desc: gnitz_wire::RangeDescriptor::new(&[], gnitz_wire::Cut::Before(0), gnitz_wire::Cut::After(0)),
-    };
-    let scan = |source: u64, b: Option<gnitz_wire::IndexBound>| OpNode::ScanDelta {
+    let bound = |col: u32| gnitz_wire::KeyRange::point(gnitz_wire::PkColList::from_slice(&[col]), &[], 0);
+    let scan = |source: u64, b: Option<gnitz_wire::KeyRange>| OpNode::ScanDelta {
         source,
-        bound: b.map_or(gnitz_wire::ReadBound::None, gnitz_wire::ReadBound::IndexRange),
+        bound: b.map_or(gnitz_wire::ReadBound::None, gnitz_wire::ReadBound::Range),
     };
     let bounds_of = |a: OpNode, b: OpNode| {
         let loaded = loaded_for_test(
@@ -921,7 +918,7 @@ fn a_source_scanned_once_keeps_its_backfill_bound() {
             .source_bounds
             .iter()
             .map(|(&s, b)| match b {
-                gnitz_wire::ReadBound::IndexRange(bound) => (s, bound.idx_cols.as_slice().to_vec()),
+                gnitz_wire::ReadBound::Range(r) => (s, r.cols().as_slice().to_vec()),
                 other => panic!("source {s}: unexpected bound {other:?}"),
             })
             .collect();

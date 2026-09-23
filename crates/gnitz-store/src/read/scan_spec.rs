@@ -2,7 +2,7 @@
 //! the bound, filter, map, then forward rows or fold them. A capacity-bounded
 //! view's rows hydrate chunk by chunk as the sink drains them.
 
-use gnitz_wire::{Cut, RangeDescriptor, ReadBound, ReadSpec, SinkKind};
+use gnitz_wire::{ReadBound, ReadSpec, SinkKind};
 
 use std::rc::Rc;
 
@@ -11,6 +11,7 @@ use super::SkeletonHydrator;
 use crate::expr::MapPlan;
 use crate::ops::AdhocFold;
 use crate::relation::RelationRegistry;
+use crate::schema::key::{key_range_between_cuts, KeyCut};
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, StoreError};
 use gnitz_expr::{cmp_order_keys, order_locators, OrderLocator, RowFilter};
@@ -108,11 +109,13 @@ impl RelationRegistry {
                      retained floor {dropped_through}; re-read at 0"
                 )));
             }
-            let desc = RangeDescriptor::new(&[], Cut::After(after_tick as u128), Cut::After(cut_tick as u128));
-            (
-                feed.pk_range_cursor(&desc).map_err(StoreError::rejected)?,
-                feed.schema(),
-            )
+            // The `_tick` U64 leads the delta PK, and its OPK is its big-endian bytes.
+            let band = key_range_between_cuts(
+                KeyCut::above(&after_tick.to_be_bytes()),
+                KeyCut::above(&cut_tick.to_be_bytes()),
+                feed.schema().pk_stride(),
+            );
+            (feed.range_cursor(band).0, feed.schema())
         };
         check_layout(reply_schema, &schema)?;
         Ok(cursor.materialize())

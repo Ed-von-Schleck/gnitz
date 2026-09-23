@@ -36,10 +36,12 @@ fn sample(op: Opcode) -> OpNode {
         // whole backing array, so a reordered list fails the round-trip.
         Opcode::ScanDelta => OpNode::ScanDelta {
             source: 42,
-            bound: crate::ReadBound::IndexRange(crate::IndexBound {
-                idx_cols: crate::PkColList::from_slice(&[9, 3, 5]),
-                desc: crate::RangeDescriptor::new(&[7, 11], crate::Cut::After(4), crate::Cut::Before(90)),
-            }),
+            bound: crate::ReadBound::Range(crate::KeyRange::new(
+                crate::PkColList::from_slice(&[9, 3, 5]),
+                &[7, 11],
+                crate::Cut::after(4),
+                crate::Cut::before(90),
+            )),
         },
         Opcode::ExchangeShard => OpNode::ExchangeShard { shard_cols: vec![0, 2] },
         Opcode::NullExtend => OpNode::NullExtend {
@@ -313,15 +315,19 @@ fn unbounded_scan_delta_encodes_identically() {
 /// Every kind of read bound survives as a backfill hint.
 #[test]
 fn every_scan_bound_kind_roundtrips() {
-    let desc = crate::RangeDescriptor::new(&[3], crate::Cut::Before(1), crate::Cut::After(9));
+    let range = |cols: &[u32]| {
+        crate::KeyRange::new(
+            crate::PkColList::from_slice(cols),
+            &[3],
+            crate::Cut::before(1),
+            crate::Cut::after(9),
+        )
+    };
     let keys = crate::PkKeys::from_keys(8, [&7u64.to_be_bytes()[..], &2u64.to_be_bytes()[..]]);
     for bound in [
-        crate::ReadBound::PkRange(desc),
+        crate::ReadBound::Range(range(&[0, 1])),
         crate::ReadBound::PkSet(keys),
-        crate::ReadBound::IndexRange(crate::IndexBound {
-            idx_cols: crate::PkColList::from_slice(&[2, 1]),
-            desc,
-        }),
+        crate::ReadBound::Range(range(&[2, 1])),
     ] {
         let node = OpNode::ScanDelta { source: 7, bound };
         assert_eq!(roundtrip(node.clone()).unwrap(), node);
@@ -333,31 +339,27 @@ fn every_scan_bound_kind_roundtrips() {
 /// widening the initial scan.
 #[test]
 fn a_malformed_scan_bound_is_rejected() {
-    let mut w = crate::codec::Writer::with_capacity(0);
-    crate::range::write_range_descriptor(
-        &mut w,
-        &crate::RangeDescriptor::new(&[1], crate::Cut::Before(0), crate::Cut::After(9)),
-    );
-    let desc = w.into_vec();
-    // An `IndexRange` cell: tag, column word, then `tail`.
-    let index_range = |word: u64, tail: &[u8]| {
-        let mut p = vec![2u8];
+    // A `Range` body after its column word: `n_eq = 0`, no flags, two cut images.
+    let desc = [0u8; 2 + 32];
+    // A `Range` cell: tag, column word, then `tail`.
+    let range = |word: u64, tail: &[u8]| {
+        let mut p = vec![1u8];
         p.extend_from_slice(&word.to_le_bytes());
         p.extend_from_slice(tail);
         p
     };
     // A `PkSet` cell: tag, stride, count, then the key bytes.
     let pk_set = |stride: u8, count: u32, keys: &[u8]| {
-        let mut p = vec![3u8, stride];
+        let mut p = vec![2u8, stride];
         p.extend_from_slice(&count.to_le_bytes());
         p.extend_from_slice(keys);
         p
     };
     let over_arity = {
         let n_eq = crate::catalog::PK_LIST_MAX_COLS;
-        let mut p = vec![1u8, n_eq as u8, 0];
-        p.resize(1 + 2 + 16 * (n_eq + 2), 0);
-        p
+        let mut body = vec![n_eq as u8, 0];
+        body.resize(2 + 16 * (n_eq + 2), 0);
+        range(crate::pack_pk_cols(&[0, 1, 2, 3]), &body)
     };
     let mut trailing = pk_set(1, 1, &[5]);
     trailing.push(0);
@@ -365,25 +367,25 @@ fn a_malformed_scan_bound_is_rejected() {
         ("unknown bound tag", vec![9]),
         // A column-list word whose count is past the arity cap — `as_slice` would
         // silently truncate it and `from_slice` would panic.
-        ("over-long list", index_range(crate::PK_LIST_PACKED_FLAG | 7, &desc)),
+        ("over-long list", range(crate::PK_LIST_PACKED_FLAG | 7, &desc)),
         // A word carrying no packed-list flag at all.
-        ("untagged word", index_range(1, &desc)),
-        // A bounded node whose descriptor never arrived.
-        ("missing descriptor", {
-            let mut p = vec![2u8];
+        ("untagged word", range(1, &desc)),
+        // A bounded node whose range never arrived.
+        ("missing range", {
+            let mut p = vec![1u8];
             p.extend_from_slice(&crate::pack_pk_cols(&[1]).to_le_bytes());
             p
         }),
-        // A descriptor that fails `RangeDescriptor::decode`'s validation.
+        // A range that fails `read_key_range`'s validation.
         (
-            "undecodable descriptor",
-            index_range(crate::pack_pk_cols(&[1]), &[0xff, 0xff, 0xff]),
+            "undecodable range",
+            range(crate::pack_pk_cols(&[1]), &[0xff, 0xff, 0xff]),
         ),
         ("zero stride", pk_set(0, 0, &[])),
         ("over-wide stride", pk_set(crate::MAX_PK_BYTES as u8 + 1, 0, &[])),
         ("count past the cell", pk_set(8, 2, &[0; 8])),
         ("unsorted keys", pk_set(1, 2, &[5, 4])),
-        ("pk range past the arity cap", over_arity),
+        ("range past the arity cap", over_arity),
         ("trailing bytes", trailing),
         // Nothing at all: a present but empty cell is damaged, not absent.
         ("empty cell", Vec::new()),

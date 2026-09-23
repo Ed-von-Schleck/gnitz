@@ -1,5 +1,5 @@
 //! `scan_spec` — the worker-side parameterized bounded read. The first
-//! group drives the bound walks (None / PkRange / PkSet) and the sink shapes
+//! group drives the bound walks (None / Range / PkSet) and the sink shapes
 //! (top-k / materialize / early-stop) with an **identity** spec (no predicate
 //! and no map, so `reply_schema == source schema`), isolating the cursor +
 //! reduction mechanics from the expression VM (which the e2e suite covers). The
@@ -10,7 +10,7 @@ use super::*;
 use gnitz_expr::SchemaFacts;
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::Batch;
-use gnitz_wire::{Cut, OrderKey, PkKeys, RangeDescriptor, ReadBound, ReadSpec};
+use gnitz_wire::{Cut, KeyRange, OrderKey, PkColList, PkKeys, ReadBound, ReadSpec};
 
 /// The `(id U64 PK | val I64)` schema both bases below use.
 fn id_val_cols() -> Vec<ColumnDef> {
@@ -93,7 +93,12 @@ fn full_scan_returns_all_rows_with_weights() {
 fn pk_range_ge_subsets() {
     let (mut e, tid) = fixture("ss_pkrange", 10, |i| i as i64);
     // pk >= 5
-    let bound = ReadBound::PkRange(RangeDescriptor::new(&[], Cut::Before(5), Cut::After(u64::MAX as u128)));
+    let bound = ReadBound::Range(KeyRange::new(
+        PkColList::from_slice(&[0]),
+        &[],
+        Cut::before(5),
+        Cut::after(u64::MAX as u128),
+    ));
     let mut got = run(&mut e, tid, &identity_spec(bound, vec![], 0));
     got.sort();
     let want: Vec<_> = (5..10u128).map(|i| (i, i as i64, 1)).collect();
@@ -104,7 +109,12 @@ fn pk_range_ge_subsets() {
 fn pk_range_point_lookup() {
     let (mut e, tid) = fixture("ss_point", 10, |i| i as i64);
     // pk = 5  →  [Before(5), After(5)]
-    let bound = ReadBound::PkRange(RangeDescriptor::new(&[], Cut::Before(5), Cut::After(5)));
+    let bound = ReadBound::Range(KeyRange::new(
+        PkColList::from_slice(&[0]),
+        &[],
+        Cut::before(5),
+        Cut::after(5),
+    ));
     let got = run(&mut e, tid, &identity_spec(bound, vec![], 0));
     assert_eq!(got, vec![(5u128, 5i64, 1)]);
 }
@@ -113,7 +123,12 @@ fn pk_range_point_lookup() {
 fn pk_range_bounded_above_truncates_at_end() {
     let (mut e, tid) = fixture("ss_between", 20, |i| i as i64);
     // 5 <= pk < 8  →  [Before(5), Before(8))
-    let bound = ReadBound::PkRange(RangeDescriptor::new(&[], Cut::Before(5), Cut::Before(8)));
+    let bound = ReadBound::Range(KeyRange::new(
+        PkColList::from_slice(&[0]),
+        &[],
+        Cut::before(5),
+        Cut::before(8),
+    ));
     let mut got = run(&mut e, tid, &identity_spec(bound, vec![], 0));
     got.sort();
     assert_eq!(got, vec![(5u128, 5, 1), (6u128, 6, 1), (7u128, 7, 1)]);
@@ -195,9 +210,9 @@ fn keyed_reads_over_a_replicated_table_find_every_key() {
     // The one-key set gather and the point PK range each find every key.
     for (id, val, _) in &want {
         assert_eq!(run_pk_set(&mut e, tid, [*id]), vec![(*id, *val, 1)]);
-        let point = RangeDescriptor::new(&[], Cut::Before(*id), Cut::After(*id));
+        let point = KeyRange::new(PkColList::from_slice(&[0]), &[], Cut::before(*id), Cut::after(*id));
         assert_eq!(
-            run(&mut e, tid, &identity_spec(ReadBound::PkRange(point), vec![], 0)),
+            run(&mut e, tid, &identity_spec(ReadBound::Range(point), vec![], 0)),
             vec![(*id, *val, 1)]
         );
     }
@@ -242,9 +257,9 @@ fn keyed_reads_over_a_view_return_the_whole_pk_group() {
     assert_eq!(full, [want.clone(), vec![(9u128, 900, 1)]].concat(), "ground truth");
 
     // The point PK range — what `WHERE pk = 7` compiles to.
-    let point = RangeDescriptor::new(&[], Cut::Before(7), Cut::After(7));
+    let point = KeyRange::new(PkColList::from_slice(&[0]), &[], Cut::before(7), Cut::after(7));
     assert_eq!(
-        run(&mut e, vid, &identity_spec(ReadBound::PkRange(point), vec![], 0)),
+        run(&mut e, vid, &identity_spec(ReadBound::Range(point), vec![], 0)),
         want
     );
 
@@ -336,14 +351,19 @@ fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
         out.sort();
         out
     };
-    let scan = |e: &mut CatalogEngine, desc: RangeDescriptor| {
-        let spec = identity_spec(ReadBound::PkRange(desc), vec![], 0);
+    let scan = |e: &mut CatalogEngine, r: KeyRange| {
+        let spec = identity_spec(ReadBound::Range(r), vec![], 0);
         decode(&e.scan_spec(tid, spec, &schema).unwrap())
     };
 
     // `a = 2 AND b >= 0` — a whole trailing-column range inside one `a` group,
     // which shares the distribution prefix and so routes to one worker.
-    let confined = RangeDescriptor::new(&[2], Cut::Before(0), Cut::After(u64::MAX as u128));
+    let confined = KeyRange::new(
+        PkColList::from_slice(&[0, 1]),
+        &[2],
+        Cut::before(0),
+        Cut::after(u64::MAX as u128),
+    );
     assert!(
         schema.confined_worker(&confined, 4).is_some(),
         "the fixture's confined range must be the routed shape"
@@ -356,7 +376,7 @@ fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
 
     // `1 <= a < 3` spans two `a` groups, so it is not confinable and stays a
     // broadcast.
-    let spanning = RangeDescriptor::new(&[], Cut::Before(1), Cut::Before(3));
+    let spanning = KeyRange::new(PkColList::from_slice(&[0, 1]), &[], Cut::before(1), Cut::before(3));
     assert!(schema.confined_worker(&spanning, 4).is_none());
     let mut want: Vec<(u64, u64, i64)> = Vec::new();
     for a in 1..3 {
@@ -759,12 +779,9 @@ fn reply_pk_stride_mismatch_errs() {
 fn an_index_walk_serves_exactly_its_range_with_or_without_the_index() {
     let (mut engine, tid) = fixture("spec_index_walk", 200, |id| id as i64 - 100);
     engine.create_index("public.t", &["val"], false).unwrap();
-    let p = |v: i64| gnitz_wire::FixedInt::I64.pack(v as i128);
+    let p = |v: i64| gnitz_wire::key_image(TypeCode::I64, v as u64 as u128);
     let walk = |start: Cut, end: Cut| {
-        let bound = ReadBound::IndexRange(gnitz_wire::IndexBound {
-            idx_cols: gnitz_wire::PkColList::from_slice(&[1]),
-            desc: RangeDescriptor::new(&[], start, end),
-        });
+        let bound = ReadBound::Range(KeyRange::new(PkColList::from_slice(&[1]), &[], start, end));
         identity_spec(bound, vec![], 0)
     };
     let sorted = |mut rows: Vec<(u128, i64, i64)>| {
@@ -773,8 +790,8 @@ fn an_index_walk_serves_exactly_its_range_with_or_without_the_index() {
     };
     let expect = |lo: i64, hi: i64| -> Vec<(u128, i64, i64)> { (lo..hi).map(|v| ((v + 100) as u128, v, 1)).collect() };
     // 60 of 200 rows, far past the 1/16 selectivity gate, across zero.
-    let wide = walk(Cut::Before(p(-10)), Cut::Before(p(50)));
-    let narrow = walk(Cut::After(p(-3)), Cut::After(p(1)));
+    let wide = walk(Cut::before(p(-10)), Cut::before(p(50)));
+    let narrow = walk(Cut::after(p(-3)), Cut::after(p(1)));
     assert_eq!(sorted(run(&mut engine, tid, &wide)), expect(-10, 50));
     assert_eq!(sorted(run(&mut engine, tid, &narrow)), expect(-2, 2));
     engine.drop_index("public__t__idx_val").unwrap();

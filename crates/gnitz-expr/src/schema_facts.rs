@@ -133,13 +133,10 @@ pub trait SchemaFacts: ColumnTable {
             self.pk_cols().len(),
             "opk_key_cols: one native value per PK column",
         );
-        gnitz_wire::encode_pk_natives(
-            self.pk_cols().iter().map(|&p| {
-                let tc = self.col_type_code(p as usize);
-                (tc, tc)
-            }),
-            natives.iter().copied(),
-        )
+        gnitz_wire::encode_pk_images(self.pk_cols().iter().zip(natives).map(|(&p, &v)| {
+            let tc = self.col_type_code(p as usize);
+            (tc, tc, gnitz_wire::key_image(tc, v))
+        }))
     }
 
     /// The inverse of [`Self::opk_key`]: `key`'s columns as native

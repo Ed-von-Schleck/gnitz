@@ -22,13 +22,13 @@ fn pinned_keys(plan: &AccessPlan) -> Option<usize> {
     }
 }
 
-/// The bound's discriminant name, for a shape assertion that does not care
-/// about the descriptor's contents.
-fn shape(bound: &ReadBound) -> &'static str {
+/// The bound's kind over `schema`, for a shape assertion that does not care about
+/// the range's contents: a range names the store it walks.
+fn shape(bound: &ReadBound, schema: &Schema) -> &'static str {
     match bound {
         ReadBound::None => "None",
-        ReadBound::PkRange(_) => "PkRange",
-        ReadBound::IndexRange(_) => "IndexRange",
+        ReadBound::Range(r) if r.walks_pk(&schema.pk_cols) => "PkRange",
+        ReadBound::Range(_) => "IndexRange",
         ReadBound::PkSet(_) => "PkSet",
     }
 }
@@ -65,7 +65,7 @@ fn the_ladder_maps_each_where_shape_to_its_bound() {
         let bound_where = sql.map(|s| bind_where(s, &schema)).unwrap_or_default();
         let plan = plan_of(&bound_where, &schema, idx);
         let label = sql.unwrap_or("<no WHERE>");
-        assert_eq!(shape(&plan.bound), want_shape, "{label}");
+        assert_eq!(shape(&plan.bound, &schema), want_shape, "{label}");
         assert_eq!(pinned_keys(&plan).unwrap_or(0), want_keys, "{label}: pinned keys");
         assert_eq!(
             plan.predicate,
@@ -87,7 +87,7 @@ fn a_long_in_list_plans_one_pk_set() {
         items: (0..n as i64).map(BoundExpr::LitInt).collect(),
     }];
     let plan = plan_of(&where_expr, &schema, &[]);
-    assert_eq!(shape(&plan.bound), "PkSet");
+    assert_eq!(shape(&plan.bound, &schema), "PkSet");
     assert_eq!(pinned_keys(&plan), Some(n));
     assert!(plan.predicate.is_empty());
 }
@@ -123,7 +123,7 @@ fn a_pk_bound_yields_only_to_a_unique_index_point() {
     ] {
         let where_expr = bind_where(sql, &schema);
         let plan = plan_of(&where_expr, &schema, idx);
-        assert_eq!(shape(&plan.bound), want, "{sql}: {why}");
+        assert_eq!(shape(&plan.bound, &schema), want, "{sql}: {why}");
     }
 
     // A descriptor pinning any PK column keeps the PK walk, unique point on
@@ -146,7 +146,7 @@ fn a_pk_bound_yields_only_to_a_unique_index_point() {
     ] {
         let where_expr = bind_where(sql, &compound);
         let plan = plan_of(&where_expr, &compound, email_uniq);
-        assert_eq!(shape(&plan.bound), "PkRange", "{sql}: {why}");
+        assert_eq!(shape(&plan.bound, &compound), "PkRange", "{sql}: {why}");
     }
 }
 
@@ -175,7 +175,7 @@ fn an_index_walk_ships_only_its_residual() {
     ] {
         let where_expr = bind_where(sql, schema);
         let plan = plan_of(&where_expr, schema, idx);
-        assert_eq!(shape(&plan.bound), "IndexRange", "{sql}");
+        assert_eq!(shape(&plan.bound, schema), "IndexRange", "{sql}");
         assert_eq!(plan.predicate, predicate_of(want_residual, schema), "{sql}: predicate");
     }
 }
@@ -192,7 +192,7 @@ fn an_uncompilable_pk_residual_falls_through_to_the_index() {
     ] {
         let where_expr = bind_where(sql, &schema);
         let plan = plan_of(&where_expr, &schema, &[(&[1], false)]);
-        assert_eq!(shape(&plan.bound), "IndexRange", "{sql}");
+        assert_eq!(shape(&plan.bound, &schema), "IndexRange", "{sql}");
         assert_eq!(
             plan.predicate,
             predicate_of(Some(pk_conjunct), &schema),

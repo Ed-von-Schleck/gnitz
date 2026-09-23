@@ -1,8 +1,8 @@
-//! Range membership: which rows of a batch lie in the walk a [`RangeDescriptor`]
-//! names over a key column list, decided on the columns' key images — the order an
-//! index or PK walk compares in — one column at a time into filter words.
+//! Range membership: which rows of a batch lie in the walk a [`KeyRange`] names over
+//! its key column list, decided on the columns' key images — the order an index or PK
+//! walk compares in — one column at a time into filter words.
 
-use gnitz_wire::{key_image, Cut, RangeDescriptor};
+use gnitz_wire::{image_mask, KeyRange};
 
 use crate::{BatchView, ColumnLocator, ExprValidateErr, SchemaFacts};
 
@@ -16,39 +16,37 @@ pub(crate) struct RangeMembership {
 }
 
 impl RangeMembership {
-    /// The walk `desc` names over `cols`; `Err` when a column is out of range or its
-    /// type has no key order, or `desc` leaves no range column in `cols`.
-    pub(crate) fn new(cols: &[u32], desc: RangeDescriptor, schema: &dyn SchemaFacts) -> Result<Self, ExprValidateErr> {
+    /// The walk `range` names; `Err` when a column is out of range or its type has no
+    /// key order.
+    pub(crate) fn new(range: &KeyRange, schema: &dyn SchemaFacts) -> Result<Self, ExprValidateErr> {
         let bad = |e: String| ExprValidateErr::BadWalk(format!("range walk: {e}"));
+        let cols = range.cols();
         let n = schema.num_columns();
-        if let Some(&c) = cols.iter().find(|&&c| c as usize >= n) {
+        if let Some(&c) = cols.as_slice().iter().find(|&&c| c as usize >= n) {
             return Err(bad(format!("column {c} is out of range for a {n}-column schema")));
         }
-        let locs: Vec<ColumnLocator> = cols.iter().map(|&c| schema.locate(c as usize)).collect();
-        for l in &locs {
-            gnitz_wire::index_key_type(l.type_code()).map_err(bad)?;
+        let locs: Vec<ColumnLocator> = cols.as_slice().iter().map(|&c| schema.locate(c as usize)).collect();
+        if let Some(l) = locs.iter().find(|l| !l.type_code().is_pk_eligible()) {
+            return Err(bad(format!("column type {} has no key order", l.type_code())));
         }
-        let range_col = *locs
-            .get(desc.eq_vals().len())
-            .ok_or_else(|| bad("the equality prefix leaves no range column".into()))?;
+        let range_col = locs[range.eq_vals().len()];
         let null_mask = locs.iter().fold(0, |m, l| match *l {
             ColumnLocator::Payload { slot, .. } => m | 1 << slot,
             ColumnLocator::Pk { .. } => m,
         });
-        let image = |c: Cut| key_image(range_col.type_code(), c.value());
-        let lo = match desc.start {
-            Cut::Before(_) => Some(image(desc.start)),
-            Cut::After(_) => image(desc.start).checked_add(1),
+        let mask = image_mask(range_col.size());
+        let (start, end) = (range.start.image & mask, range.end.image & mask);
+        let lo = if range.start.after {
+            start.checked_add(1)
+        } else {
+            Some(start)
         };
-        let hi = match desc.end {
-            Cut::Before(_) => image(desc.end).checked_sub(1),
-            Cut::After(_) => Some(image(desc.end)),
-        };
+        let hi = if range.end.after { Some(end) } else { end.checked_sub(1) };
         let bounds = match lo.zip(hi).filter(|(lo, hi)| lo <= hi) {
             Some((lo, hi)) => locs
                 .iter()
-                .zip(desc.eq_vals())
-                .map(|(&l, &v)| (l, key_image(l.type_code(), v), 0))
+                .zip(range.eq_vals())
+                .map(|(&l, &v)| (l, v & image_mask(l.size()), 0))
                 .chain([(range_col, lo, hi - lo)])
                 .collect(),
             None => Vec::new(),

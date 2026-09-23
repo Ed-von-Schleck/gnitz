@@ -125,9 +125,7 @@ fn route_read(schema: &SchemaDescriptor, blob: Option<&[u8]>, nw: usize) -> Read
     let whole = |set| ReadRoute { set, per_worker: None };
     match (schema.placement(), blob.and_then(gnitz_wire::peek_bound)) {
         (Placement::Replicated, _) => whole(WorkerSet::one(Placement::REPLICA_OWNER as usize)),
-        (_, Some(BoundPeek::PkRange(r))) => {
-            whole(schema.confined_worker(&r, nw).map_or(WorkerSet::ALL, WorkerSet::one))
-        }
+        (_, Some(BoundPeek::Range(r))) => whole(schema.confined_worker(&r, nw).map_or(WorkerSet::ALL, WorkerSet::one)),
         (Placement::Keyed { .. }, Some(BoundPeek::PkSet(s))) if s.stride == schema.pk_stride() => {
             let keys = || s.keys.chunks_exact(s.stride);
             let set = keys().fold(WorkerSet::EMPTY, |set, k| set.with(schema.worker_for_pk(k, nw)));
