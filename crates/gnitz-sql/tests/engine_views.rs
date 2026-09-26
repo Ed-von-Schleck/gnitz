@@ -603,3 +603,52 @@ fn bounded_views_hold_their_rows_and_survive_rename() {
         "capacity-bounded",
     );
 }
+
+/// Which bodies may be capacity-bounded, as a live server decides it.
+#[test]
+fn bounded_view_eligibility_is_the_engines() {
+    let (_srv, mut client, sn) = boot(4);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, tid BIGINT NOT NULL, w BIGINT NOT NULL)",
+    );
+    let bounded = |n: usize, body: &str| format!("CREATE VIEW b{n} WITH (capacity = '1 MB') AS {body}");
+
+    let accepted = [
+        "SELECT t.id, t.v + u.w AS z FROM t JOIN u ON t.id = u.tid",
+        "SELECT id, v FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = t.id)",
+        "SELECT id, v FROM t WHERE id IN (SELECT tid FROM u)",
+        "SELECT d.id FROM (SELECT id, v FROM t) d",
+    ];
+    for (n, body) in accepted.iter().enumerate() {
+        exec(&mut client, &sn, &bounded(n, body));
+    }
+
+    for (n, body) in [
+        "SELECT tid, SUM(w) AS s FROM u GROUP BY tid",
+        "SELECT id, v FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.tid = t.id)",
+        "SELECT DISTINCT v FROM t",
+        "SELECT id, v FROM t UNION ALL SELECT id, w FROM u",
+        "SELECT t.id, u.w FROM t LEFT JOIN u ON t.id = u.tid",
+        "SELECT t.id, u.w FROM t RIGHT JOIN u ON t.id = u.tid",
+        "SELECT t.id, u.w FROM t FULL JOIN u ON t.id = u.tid",
+        "SELECT t.id, u.w FROM t JOIN u ON t.id = u.tid AND t.v < u.w",
+        "SELECT t.id, u.w FROM t CROSS JOIN u",
+        "SELECT id FROM t ORDER BY v LIMIT 1",
+        "SELECT d.v FROM (SELECT DISTINCT v FROM t) d",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let sql = bounded(accepted.len() + n, body);
+        let err = try_exec(&mut client, &sn, &sql).expect_err(&sql);
+        let (_, msg) = variant_of(&err);
+        assert!(msg.contains("capacity"), "`{sql}`: {msg}");
+    }
+}

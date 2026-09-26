@@ -73,9 +73,8 @@ fn in_eval(kind: SalMessageKind) -> InEval {
         // An inline tick would re-enter the view with a different source and
         // emit schema-mismatched relays.
         SalMessageKind::Tick => InEval::DeferPostAck,
-        // Answered mid-wait, a delta read spans a half-ingested round, and a
-        // client that advanced its cursor over it would lose the rest silently.
-        SalMessageKind::DeltaRead => InEval::DeferPostAck,
+        // Answered mid-wait, a read would see a half-run tick.
+        SalMessageKind::Scan | SalMessageKind::ScanSpec | SalMessageKind::DeltaRead => InEval::DeferPostAck,
         // An inline catalog mutation races the in-flight evaluation.
         SalMessageKind::DdlSync => InEval::DeferPreAck,
         // Deferring deadlocks: `flush_round` holds a `SalExcl` across the ACK
@@ -85,13 +84,9 @@ fn in_eval(kind: SalMessageKind) -> InEval {
         // Correct to defer (`commit_pushes` drops its lock before the ACK wait),
         // but it would park the ingest ACK behind an exchange round-trip.
         SalMessageKind::Push => InEval::Inline,
-        // A read holding no cursor across calls has no stake in the exchange.
-        SalMessageKind::Scan
-        | SalMessageKind::ScanSpec
-        | SalMessageKind::HasPk
-        | SalMessageKind::UniquePreflight
-        | SalMessageKind::Backfill
-        | SalMessageKind::Shutdown => InEval::Inline,
+        // Probes of base-table keys, which a tick does not write.
+        SalMessageKind::HasPk | SalMessageKind::UniquePreflight => InEval::Inline,
+        SalMessageKind::Backfill | SalMessageKind::Shutdown => InEval::Inline,
         // Consumed above the split: dies at `dispatch_inner`.
         SalMessageKind::ExchangeRelay => InEval::Inline,
     }
@@ -156,7 +151,6 @@ pub struct WorkerProcess {
     sal_reader: SalReader,
     w2m_writer: W2mWriter,
     exchange: WorkerExchangeHandler,
-    pending_deltas: HashMap<i64, Batch>,
     /// Reply trains, one frame emitted per SAL drain, front first: the master
     /// reads one lease at a time and a ring frees only in order.
     pending_streams: VecDeque<PendingScan>,
@@ -177,18 +171,6 @@ use reply::PendingScan;
 /// leaves the catalog and unique-filter state untouched.
 static UNIQUE_PREFLIGHT_ERROR: Seam = Seam::new("GNITZ_INJECT_UNIQUE_PREFLIGHT_ERROR");
 
-/// Append-or-insert one base table's effective delta into a `pending_deltas`
-/// map — the single buffering shape shared by the live push path
-/// (`handle_push`) and boot SAL replay (`recover_from_sal`), which must agree
-/// so the recovery tick sweep drains exactly what a live tick would.
-pub(crate) fn buffer_pending_delta(pending: &mut HashMap<i64, Batch>, tid: i64, delta: Batch) {
-    if let Some(existing) = pending.get_mut(&tid) {
-        existing.append_batch(&delta, 0, delta.len());
-    } else {
-        pending.insert(tid, delta);
-    }
-}
-
 /// Where one reply goes and how, read off its request.
 #[derive(Clone, Copy)]
 struct ReplyRoute {
@@ -202,16 +184,7 @@ struct ReplyRoute {
 }
 
 impl WorkerProcess {
-    pub fn new(
-        catalog: *mut CatalogEngine,
-        sal_reader: SalReader,
-        w2m_writer: W2mWriter,
-        // Effective base-table deltas buffered during SAL replay (the
-        // un-checkpointed tail of every base feeding ≥1 view). The master's
-        // post-reset recovery tick sweep drains these into the views via
-        // `handle_tick`; not cleared on checkpoint, so it survives boot → sweep.
-        pending_deltas: HashMap<i64, Batch>,
-    ) -> Self {
+    pub fn new(catalog: *mut CatalogEngine, sal_reader: SalReader, w2m_writer: W2mWriter) -> Self {
         // Worker rank/count (and role) are latched in the fork child before any
         // catalog work — see `server_main`, not here: boot-compiled plans
         // would otherwise carry rank 0 / num_workers 1.
@@ -224,7 +197,6 @@ impl WorkerProcess {
                 deferred_replay: Vec::new(),
                 pending_relays: HashMap::new(),
             },
-            pending_deltas,
             pending_streams: VecDeque::new(),
             reply_frame_budget: gnitz_foundation::env::env_num("GNITZ_REPLY_FRAME_BUDGET", ipc::FRAME_CAP)
                 .min(ipc::FRAME_CAP),
@@ -409,15 +381,6 @@ impl WorkerProcess {
                 if let Some(batch) = batch {
                     if !batch.is_empty() {
                         self.cat().ddl_sync(target_id, batch)?;
-                        // A DROP retracts the table/view's catalog row, so its id is
-                        // no longer live. If a push landed between its last tick and
-                        // the drop, its pending_deltas entry would never tick again
-                        // (the master's tick loop filters dropped ids), so GC any
-                        // now-dead ids here — this is a dead entry's only reaper.
-                        // Raw reborrow: `self.cat()` would borrow all of self and
-                        // conflict with the `pending_deltas` field borrow.
-                        let cat = unsafe { &*self.catalog };
-                        self.pending_deltas.retain(|tid, _| cat.registry.has_id(*tid));
                         gnitz_debug!("ddl_sync tid={}", target_id);
                     }
                 }
@@ -516,8 +479,8 @@ impl WorkerProcess {
         }
         // A storage fault leaves an ACKed push unapplied. Only a restart replays
         // it; a fault reply would let the next checkpoint discard it.
-        let effective = match self.cat().registry.ingest_returning(target_id, batch) {
-            Ok(b) => b,
+        match self.cat().ingest_unticked(target_id, batch) {
+            Ok(()) => {}
             // An ingest never produces `DeltaExpired`; the or-pattern is what
             // keeps the match total without a third arm.
             Err(StoreError::Rejected(msg) | StoreError::DeltaExpired(msg)) => return Err(msg),
@@ -527,8 +490,7 @@ impl WorkerProcess {
                 target_id,
                 e,
             ),
-        };
-        buffer_pending_delta(&mut self.pending_deltas, target_id, effective);
+        }
         gnitz_debug!("push tid={} rows={}", target_id, row_count);
         Ok(())
     }
@@ -537,7 +499,7 @@ impl WorkerProcess {
     /// `round` is the tick round the master allocated for this group; every fed
     /// view's captured delta is stamped with it.
     fn handle_tick(&mut self, target_id: i64, round: u64) -> Result<(), String> {
-        let delta = if let Some(d) = self.pending_deltas.remove(&target_id) {
+        let delta = if let Some(d) = self.cat().dag.take_unticked(target_id) {
             d
         } else {
             match self.cat().registry.relation(target_id) {

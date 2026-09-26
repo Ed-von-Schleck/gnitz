@@ -68,7 +68,16 @@ impl CircuitState {
     }
 
     pub fn cursor_in_range(&self, idx: StateIdx, start: &[u8], end: Option<&[u8]>) -> ReadCursor {
-        self.at(idx).open_cursor_in_range(start, end)
+        self.at(idx).open_cursor_in_range(start, end, None)
+    }
+
+    /// A cursor over `idx` ranged to the PKs of `keys`, for probing at them.
+    pub fn cursor_for_keys(&self, idx: StateIdx, keys: &Batch) -> ReadCursor {
+        debug_assert!(keys.is_consolidated());
+        match keys.count {
+            0 => self.cursor(idx),
+            n => self.cursor_in_range(idx, keys.get_pk_bytes(0), Some(keys.get_pk_bytes(n - 1))),
+        }
     }
 
     pub fn ingest_owned(&mut self, idx: StateIdx, batch: Batch) -> Result<(), StorageError> {

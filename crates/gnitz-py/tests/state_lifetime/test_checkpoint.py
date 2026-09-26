@@ -198,7 +198,7 @@ def test_a_unique_constraint_holds_under_checkpoint_pressure(checkpoint_server):
 
 
 def test_a_view_created_over_committed_data_survives_a_checkpoint_window(checkpoint_client):
-    """Enough rows to cross the checkpoint threshold — draining pending_deltas —
+    """Enough rows to cross the checkpoint threshold — draining the unticked deltas —
     and then a CREATE of an exchange GROUP BY view whose only driver is the
     committed store. A flushed-snapshot under-count and a
     checkpoint-strands-exchange regression both surface as a wrong result.

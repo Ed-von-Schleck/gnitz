@@ -4,8 +4,8 @@
 use super::super::{ColId, HirExpr, JoinClass, JoinShape, JoinType, OutKey, ProjEntry, RelExpr};
 use super::exists;
 use super::joincore::{
-    emit_range_null_fill_tail, equi_prologue, join_pk_coldefs, join_terms, pair_pk_coldefs, range_prologue,
-    src_pk_coldefs, EquiTerms,
+    emit_range_null_fill_tail, equi_prologue, join_pk_coldefs, pair_pk_coldefs, range_prologue, src_pk_coldefs,
+    EquiTerms,
 };
 use super::prims::rekey_on_source_pk;
 use super::{emit_filter, emit_join_inputs, project_front, Demand, EmitPieces, JoinSide, ViewChain};
@@ -230,7 +230,7 @@ fn emit_cross(cb: &mut Circuit, [input_a, input_b]: [NodeId; 2], sides: &[JoinSi
     let trace_b = cb.integrate_trace(int_b);
     // A keyless term keys on `[left PK…, right PK…]`, which is the pair-PK itself,
     // so both terms already share one schema.
-    let inner = join_terms(cb, [reindex_a, reindex_b], [trace_a, trace_b], JoinKind::Cross);
+    let inner = cb.join_terms([reindex_a, reindex_b], [trace_a, trace_b], JoinKind::Cross);
     vec![(inner, None)] // [pair-PK, A, B]
 }
 

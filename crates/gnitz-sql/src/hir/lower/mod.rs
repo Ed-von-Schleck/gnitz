@@ -23,7 +23,7 @@ mod spine;
 mod topn;
 
 use super::physical::{self, Frame};
-use super::{as_col, slots_of, split_filter, AggCol, ColId, GetSource, HirCol, HirExpr, ProjEntry, RelExpr};
+use super::{slots_of, split_filter, AggCol, ColId, GetSource, HirCol, HirExpr, ProjEntry, RelExpr};
 use super::{JoinClass, JoinShape, JoinType};
 use crate::agg::group_pk_def;
 use crate::codec::project_schema::{payload_map, ProjItem};
@@ -201,75 +201,15 @@ pub(crate) fn project_front(
 
 /// Lower a bound view body to its bundle.
 pub(crate) fn lower(rel: Rc<RelExpr>, bounded: bool) -> Result<ViewBundle, GnitzSqlError> {
-    if let Some(shape) = bounded.then(|| capacity_ineligible_shape(&rel)).flatten() {
-        return Err(capacity_refusal(shape));
-    }
     let mut chain = ViewChain::default();
     let top = lower_body(&mut chain, &rel)?;
-    // An eligible root whose inputs cut a segment of their own.
+    // A body whose inputs cut a segment of their own bounds a view over unbounded copies.
     if bounded && chain.has_segments() {
-        return Err(capacity_refusal("a body that compiles to more than one view"));
+        return Err(GnitzSqlError::Unsupported(
+            "CREATE VIEW WITH (capacity …): a body that compiles to more than one view is not supported".into(),
+        ));
     }
     Ok(chain.finish(top))
-}
-
-fn capacity_refusal(shape: &str) -> GnitzSqlError {
-    GnitzSqlError::Unsupported(format!(
-        "CREATE VIEW WITH (capacity …): {shape} is not supported; \
-         only a filter/projection over one relation and an inner equi-join are"
-    ))
-}
-
-/// The root shape per-key hydration cannot replay, if `rel` has one: every shape
-/// but a filter/projection over one relation and an inner equi-join.
-fn capacity_ineligible_shape(rel: &RelExpr) -> Option<&'static str> {
-    let shape = match rel {
-        RelExpr::Project { input, items } => {
-            let (_, source) = split_filter(input);
-            // An alias reads what it aliases; the shape is the target's.
-            let mut source = source;
-            while let RelExpr::Alias { input, .. } = source.as_ref() {
-                source = input;
-            }
-            match source.as_ref() {
-                // Only a `Get` source can carry one: over a combine the projection
-                // either cuts (bounding a projection that sits on an unbounded copy
-                // of the same rows) or fuses into the join tail (leaving per-key
-                // hydration to replay a skeleton row through a compute map).
-                _ if items.iter().any(|it| as_col(&it.expr).is_none())
-                    && !matches!(source.as_ref(), RelExpr::Get { .. }) =>
-                {
-                    "a computed projection over a combine"
-                }
-                // Eligible: filter/projection over one relation.
-                RelExpr::Get { .. } => return None,
-                RelExpr::Join { kind: JoinType::Inner, on, .. } => match on.shape() {
-                    // A range/band join's null-fill threshold pipeline is not
-                    // replayable per key; a cross join has no key at all, so a
-                    // skeleton row names no trace group to replay.
-                    JoinShape::Band | JoinShape::PureRange => "a range or band join",
-                    JoinShape::Cross => "a cross join",
-                    // Eligible: plain inner equi-join.
-                    JoinShape::Equi => return None,
-                },
-                RelExpr::Join {
-                    kind: JoinType::Left | JoinType::Right | JoinType::Full,
-                    ..
-                } => "an outer join",
-                RelExpr::Join {
-                    kind: JoinType::Semi | JoinType::Anti, ..
-                } => "EXISTS / NOT EXISTS / IN",
-                RelExpr::Join { kind: JoinType::Mark(_), .. } => "a mark join (IN / ANY over a subquery)",
-                RelExpr::Reduce { .. } => "GROUP BY / an aggregate",
-                _ => "a derived table / DISTINCT / set-operation subquery",
-            }
-        }
-        RelExpr::Distinct { .. } => "a root DISTINCT",
-        RelExpr::SetOp { .. } => "a root set operation",
-        RelExpr::TopN { .. } => "ORDER BY … LIMIT",
-        _ => "this body",
-    };
-    Some(shape)
 }
 
 /// Lower a complete view body to circuit pieces.

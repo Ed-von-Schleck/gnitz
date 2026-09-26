@@ -287,10 +287,6 @@ pub(super) fn compile_view(
     bounded: bool,
 ) -> Result<(CompileOutput, StateLayout), String> {
     let carve = loaded.carve()?;
-    // A per-key replay of an exchanged plan would need the exchange to run too.
-    if bounded && !carve.sides.is_empty() {
-        return Err("bounded view: only a linear body and an inner equi-join are supported".into());
-    }
     let self_contained = view_schema.placement().is_replicated() || registry.slot().of <= 1;
     let mut layout = StateLayout::default();
     let mut side_plans = Vec::with_capacity(carve.sides.len());
@@ -341,7 +337,7 @@ pub(super) fn compile_view(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let hydration = bounded
-        .then(|| derive_hydration(loaded, &post, &post_regs))
+        .then(|| derive_hydration(loaded, registry, view_schema, &post, &post_regs))
         .transpose()?;
     Ok((CompileOutput { sides, post, hydration, self_contained }, layout))
 }

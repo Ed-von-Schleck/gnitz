@@ -658,7 +658,12 @@ fn compute_projection_writes_at_keeper_tail_across_chunks() {
         eb.build(None).expect("a well-formed program").to_blob_bytes()
     };
     // `keep = id * 10 < 1000` keeps ids 0..99, interleaved with the chunking.
-    let spec = rows_spec(pred_lt_blob(2, 1000), map_of(projection, &reply), vec![], 0);
+    let spec = rows_spec(
+        pred_cmp_blob(gnitz_expr::CmpOp::Lt, 2, 1000),
+        map_of(projection, &reply),
+        vec![],
+        0,
+    );
     let got = e.scan_spec(tid, spec, &reply).unwrap();
 
     let mut decoded: Vec<(u128, Option<i64>, i64)> = (0..got.len())
@@ -733,7 +738,12 @@ fn gather_limit_cuts_the_range_list_mid_chunk() {
         bb.put_u64(id % 2);
     });
     let reply = e.registry.relation(tid).map(Relation::schema).unwrap();
-    let spec = rows_spec(pred_lt_blob(1, 1), map_of(proj_blob(&[(1, 0)]), &reply), vec![], 5);
+    let spec = rows_spec(
+        pred_cmp_blob(gnitz_expr::CmpOp::Lt, 1, 1),
+        map_of(proj_blob(&[(1, 0)]), &reply),
+        vec![],
+        5,
+    );
     let got = e.scan_spec(tid, spec, &reply).unwrap();
     let total: i64 = (0..got.len()).map(|r| got.get_weight(r)).sum();
     assert!(total >= 5, "early-stop must cover the window weight, got {total}");

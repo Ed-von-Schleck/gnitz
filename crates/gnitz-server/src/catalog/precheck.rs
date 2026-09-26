@@ -599,9 +599,7 @@ impl CatalogEngine {
                 "catalog invariant violated: internal segment '{name}' (vid={vid}) carries a WITH option."
             ));
         }
-        // Both rules trace to skeleton rows being recomputed from the *source*
-        // store: a bounded view's own store is skeletonized, and a stream's holds
-        // nothing to recompute from.
+        // A capacity-bounded view is a leaf: its own store is skeletonized, so nothing may scan it.
         for &src in self.dag.sources_of(vid) {
             // Ids come from one ascending counter and a source exists before its view, so
             // ascending id order is a dependency order — which tick scheduling, backfill and
@@ -618,13 +616,6 @@ impl CatalogEngine {
                 return Err(format!(
                     "view '{name}' (vid={vid}) reads '{}', which is a \
                      capacity-bounded view; views cannot be created over one",
-                    self.qualified_name(src),
-                ));
-            }
-            if matches!(props, gnitz_wire::ViewProps::Bounded { .. }) && e.kind() == RelationKind::Stream {
-                return Err(format!(
-                    "view '{name}' (vid={vid}) reads '{}', which is a stream; \
-                     a capacity-bounded view cannot be created over one",
                     self.qualified_name(src),
                 ));
             }

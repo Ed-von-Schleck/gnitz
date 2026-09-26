@@ -766,7 +766,44 @@ fn a_replay_leaves_every_trace_as_it_found_it() {
     assert_eq!(before.len(), 2);
 
     let seed = (DeltaReg(0), make_batch_u128(&schema, &rows));
-    let replayed = vm.replay(0, seed).unwrap();
+    let replayed = vm.replay(seed).unwrap();
     assert_eq!(replayed.len(), 2, "the replay still produces the rows it recomputed");
     assert_eq!(trace_zset(&vm, trace, &schema), before, "and writes none of them back");
+}
+
+/// A replay may not enter before a state writer, nor before a write of its own
+/// seeded register.
+#[test]
+fn replay_entry_refuses_a_state_writer_past_the_entry() {
+    let schema = make_schema_u128_i64();
+    let dir = tempfile::tempdir().unwrap();
+    let registry = vm_registry(dir.path());
+
+    let mut p = TestPlan::default();
+    let hist = p.table("replay_entry_hist", schema);
+    p.push(
+        0,
+        1,
+        Op::WeightClamp {
+            hist,
+            preset: gnitz_store::ops::ClampPreset::Distinct,
+        },
+    );
+    p.push(1, 2, Op::WorkerFilter { slot: Slot::SOLO });
+    let vm = p.build_in(&registry, vec![schema; 3], 2);
+
+    assert!(
+        vm.program.replay_entry(DeltaReg(0)).is_err(),
+        "the clamp reads the seed"
+    );
+    assert_eq!(
+        vm.program.replay_entry(DeltaReg(1)).map(|e| e.reg()).ok(),
+        Some(DeltaReg(1))
+    );
+
+    let mut p = TestPlan::default();
+    p.push(0, 1, Op::WorkerFilter { slot: Slot::SOLO });
+    p.push(1, 0, Op::WorkerFilter { slot: Slot::SOLO });
+    let vm = p.build(vec![schema; 2], 0);
+    assert!(vm.program.replay_entry(DeltaReg(0)).is_err(), "the seed is overwritten");
 }

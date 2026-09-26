@@ -58,7 +58,12 @@ fn test_preflight_compile_verdict() {
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
 
     // A compilable circuit: a well-formed predicate over the base's own columns.
-    let ok_vid = register_filtered_view(&mut engine, base_tid, "vok", &pred_lt_blob(1, 100));
+    let ok_vid = register_filtered_view(
+        &mut engine,
+        base_tid,
+        "vok",
+        &pred_cmp_blob(gnitz_expr::CmpOp::Lt, 1, 100),
+    );
     assert!(
         crate::query::preflight_compile(&engine.registry, ok_vid).is_ok(),
         "a well-formed circuit must pass the pre-flight"
@@ -130,11 +135,21 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let base_cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
-    let old_vid = register_filtered_view(&mut engine, base_tid, "vw", &pred_lt_blob(1, 100));
+    let old_vid = register_filtered_view(
+        &mut engine,
+        base_tid,
+        "vw",
+        &pred_cmp_blob(gnitz_expr::CmpOp::Lt, 1, 100),
+    );
 
     // The replacement's own rows must exist before its VIEW_TAB row is checked.
     let new_vid = engine.next_id;
-    write_filtered_circuit(&mut engine, new_vid, base_tid, &pred_lt_blob(1, 50));
+    write_filtered_circuit(
+        &mut engine,
+        new_vid,
+        base_tid,
+        &pred_cmp_blob(gnitz_expr::CmpOp::Lt, 1, 50),
+    );
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     engine.write_column_records(new_vid, &cols).unwrap();
 
@@ -170,7 +185,12 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let base_cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
-    let old_vid = register_filtered_view(&mut engine, base_tid, "vw", &pred_lt_blob(1, 100));
+    let old_vid = register_filtered_view(
+        &mut engine,
+        base_tid,
+        "vw",
+        &pred_cmp_blob(gnitz_expr::CmpOp::Lt, 1, 100),
+    );
     let old_dir = engine
         .registry
         .relation_or_err(old_vid)
@@ -184,7 +204,12 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     // The replacing bundle: the new chain's own rows, then one VIEW_TAB batch
     // carrying the incumbent's `-1` and the replacement's `+1`.
     let new_vid = engine.next_id;
-    write_filtered_circuit(&mut engine, new_vid, base_tid, &pred_lt_blob(1, 50));
+    write_filtered_circuit(
+        &mut engine,
+        new_vid,
+        base_tid,
+        &pred_cmp_blob(gnitz_expr::CmpOp::Lt, 1, 50),
+    );
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     engine.write_column_records(new_vid, &cols).unwrap();
     let mut bb = BatchBuilder::new(*SysFamily::View.schema());

@@ -96,7 +96,10 @@ fn scan_spec_sinks_bench() {
     let src = e.registry.relation(tid).map(Relation::schema).unwrap();
     let n = NUMERIC_ROWS;
     // `c0 < 50` → contiguous 50-row runs; `cf < 1` → single-row ranges.
-    let (contiguous, fragmented) = (pred_lt_blob(1, 50), pred_lt_blob(2, 1));
+    let (contiguous, fragmented) = (
+        pred_cmp_blob(gnitz_expr::CmpOp::Lt, 1, 50),
+        pred_cmp_blob(gnitz_expr::CmpOp::Lt, 2, 1),
+    );
 
     // Gather 3 of the 4 payload columns, permuted: c2→0, c3→1, c0→2.
     let reply3 = i64_reply(3);
@@ -196,7 +199,7 @@ fn scan_spec_sinks_bench() {
     // accumulation dominates: `c3 = id / 7` below 60_000 names 60_000 groups.
     let spec = ReadSpec {
         bound: ReadBound::None,
-        predicate: pred_lt_blob(4, 60_000),
+        predicate: pred_cmp_blob(gnitz_expr::CmpOp::Lt, 4, 60_000),
         sink: ReadSink {
             map: None,
             kind: SinkKind::Fold(AggReadSpec {
@@ -247,7 +250,7 @@ fn scan_spec_string_gather_bench() {
         &[0],
     );
     let spec = rows_spec(
-        pred_lt_blob(2, 1),
+        pred_cmp_blob(gnitz_expr::CmpOp::Lt, 2, 1),
         map_of(proj_blob(&[(1, 0), (2, 1)]), &reply),
         vec![],
         0,

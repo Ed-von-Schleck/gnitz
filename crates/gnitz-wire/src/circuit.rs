@@ -662,6 +662,13 @@ impl Circuit {
         )
     }
 
+    /// `ΔA ⋈ z⁻¹I(B) + ΔB ⋈ z⁻¹I(A)`, both terms in side order `[key, A, B]`.
+    pub fn join_terms(&mut self, [da, db]: [NodeId; 2], [ta, tb]: [NodeId; 2], kind: JoinKind) -> NodeId {
+        let ab = self.join(da, tb, kind, false);
+        let ba = self.join(db, ta, kind, true);
+        self.union(ab, ba)
+    }
+
     /// [`OpNode::WorkerFilter`].
     pub fn worker_filter(&mut self, input: NodeId) -> NodeId {
         self.add(OpNode::WorkerFilter, NodeInputs::Unary(input))

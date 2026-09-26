@@ -1,134 +1,132 @@
-//! Hydration: how a capacity-bounded view replays one key's output rows.
-//!
-//! A bounded view's sweep can reduce a stored row to a PK and one summed weight,
-//! so a read that touches such a key recomputes it. This module resolves *where*
-//! that recomputation seeds — off the circuit graph, then against the plan the
-//! emitter produced.
+//! Where a capacity-bounded view's per-key replay seeds: resolved off the
+//! circuit graph, then against the plan the emitter produced.
 
 use super::*;
+use crate::query::vm::ReplayEntry;
+use gnitz_store::relation::RelationKind;
 
-/// Where a bounded view's per-key replay seeds: a register to feed, a store to
-/// feed it from, and the program offset to dispatch from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Where a bounded view's per-key replay seeds: the register it enters at, and
+/// the store that register is fed from.
+#[derive(Clone, Copy)]
 pub(in crate::query) struct Hydration {
-    /// The offset the replay enters at, past the prologue whose output the seed
-    /// replaces. `0` replays the whole program.
-    pub(in crate::query) start_pc: usize,
-    pub(in crate::query) in_reg: crate::query::vm::DeltaReg,
+    pub(in crate::query) entry: ReplayEntry,
     pub(in crate::query) seed: HydrationSeed,
 }
 
-/// The store a [`Hydration`] seeds from — the only axis the two eligible view
-/// bodies differ on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The store a [`Hydration`] seeds from.
+#[derive(Clone, Copy)]
 pub(in crate::query) enum HydrationSeed {
-    /// Linear (`ScanDelta → Filter? → Map? → IntegrateSink`): the source
-    /// relation's own store, feeding the `ScanDelta`'s register.
+    /// Linear (`ScanDelta → Filter/Map* → IntegrateSink`): the source relation's
+    /// own store, feeding the `ScanDelta`'s register.
     Relation(i64),
-    /// Inner equi-join: one branch's trace. The seed enters mid-program because
-    /// the join key is not the source PK, so a key-restricted feed at the
-    /// `ScanDelta` register would mean scanning the whole source.
-    Trace(gnitz_store::relation::StateIdx),
+    /// Inner equi-join: one branch's trace, feeding that branch's delta port.
+    Trace(StateIdx),
 }
 
-/// The graph half of a bounded view's hydration plan: which relation a linear
-/// body replays over, or which delta/trace node pair a join body seeds from.
-/// Read off the graph: which nodes emit instructions depends on the worker count.
-fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, String> {
-    use gnitz_wire::{JoinKind, OpNode};
+const UNSUPPORTED: &str =
+    "capacity-bounded view: only a filter/projection over one relation or over an inner equi-join is supported";
 
-    // 1. From the sink's input, walk back through the row-local Filter/Map nodes.
-    let (union, _) = row_local_origin(loaded, loaded.inputs(loaded.sink()?).unary());
-    match loaded.op(union) {
-        // The linear shape: the whole program replays over the source store,
-        // seeded at this `ScanDelta`'s own register.
-        OpNode::ScanDelta { source, .. } => return Ok(HydrationNodes::Relation { nid: union, source: *source as i64 }),
+/// One term `delta ⋈ trace` of an equi-join over an integral.
+struct Term {
+    delta: NodeId,
+    trace: NodeId,
+    /// The node `trace` integrates.
+    integrates: NodeId,
+    delta_is_right: bool,
+}
+
+impl Term {
+    fn of(loaded: &LoadedCircuit, join: NodeId) -> Option<Term> {
+        use gnitz_wire::{JoinKind, OpNode};
+        let OpNode::Join { kind: JoinKind::Equi, delta_is_right } = loaded.op(join) else {
+            return None;
+        };
+        let (delta, trace) = loaded.inputs(join).binary();
+        matches!(loaded.op(trace), OpNode::IntegrateTrace).then(|| Term {
+            delta,
+            trace,
+            integrates: loaded.inputs(trace).unary(),
+            delta_is_right: *delta_is_right,
+        })
+    }
+}
+
+/// The relations `node` reads, directly or transitively.
+fn sources(loaded: &LoadedCircuit, node: NodeId) -> Vec<u64> {
+    let reached = loaded.ancestors_inclusive(node);
+    loaded
+        .ops()
+        .filter_map(|(n, op)| match op {
+            gnitz_wire::OpNode::ScanDelta { source, .. } if reached[n] => Some(*source),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The node a bounded view's replay seeds from: the `ScanDelta` of a linear
+/// body, or the trace integrating one delta of an inner equi-join.
+fn seed_node(loaded: &LoadedCircuit) -> Result<NodeId, String> {
+    use gnitz_wire::OpNode;
+    // One replay seeds one register of one plan; an exchange splits the plan.
+    if loaded.exchange_shards().next().is_some() {
+        return Err(UNSUPPORTED.into());
+    }
+    let (origin, _) = row_local_origin(loaded, loaded.inputs(loaded.sink()?).unary());
+    match loaded.op(origin) {
+        OpNode::ScanDelta { .. } => return Ok(origin),
         OpNode::Union => {}
-        _ => return Err("bounded view: unsupported circuit shape".into()),
+        _ => return Err(UNSUPPORTED.into()),
     }
-
-    // 2. Both `Union` inputs must be `Join(Equi)`: each term writes its own side
-    //    order, so neither branch carries a reordering `Map`.
-    let (branch_a, branch_b) = loaded.inputs(union).binary();
-    let join_of = |nid: NodeId| -> Result<NodeId, String> {
-        matches!(loaded.op(nid), OpNode::Join { kind: JoinKind::Equi, .. })
-            .then_some(nid)
-            .ok_or_else(|| "bounded view: union input is not an inner delta/trace join".to_string())
+    let (j1, j2) = loaded.inputs(origin).binary();
+    let (Some(t1), Some(t2)) = (Term::of(loaded, j1), Term::of(loaded, j2)) else {
+        return Err(UNSUPPORTED.into());
     };
-    let trace_of = |j: NodeId| -> Option<NodeId> {
-        let t = loaded.inputs(j).binary().1;
-        matches!(loaded.op(t), OpNode::IntegrateTrace).then_some(t)
-    };
-    let (j_a, j_b) = (join_of(branch_a)?, join_of(branch_b)?);
-
-    // 3. Seed check, stated on the graph rather than through a register-identity
-    //    or schema-equality proxy: the trace `J_a` joins against must be the
-    //    integral of `J_a`'s *own* delta port. Either branch computes the same
-    //    product, so taking `J_a` needs no left/right inference, and the unchosen
-    //    one stays inert — the dispatch clears every delta register on entry, so
-    //    `D_b` is empty and `J_b` unions in nothing. `T_b` integrates the other
-    //    branch's delta, so the seed is the trace whose input node is `D_a`.
-    let d_a = loaded.inputs(j_a).binary().0;
-    trace_of(j_a).ok_or("bounded view: the seeded join's trace port is not an integral")?;
-    let t_a = trace_of(j_b).ok_or("bounded view: the sibling join's trace port is not an integral")?;
-    if loaded.inputs(t_a).unary() != d_a {
-        return Err("bounded view: the join's trace port is not the other branch's delta integral".into());
+    // Seeding `t1.delta` alone replays `I(t1.delta) ⋈ I(t2.delta)`, which is the
+    // maintained view only for the two-term form of one join.
+    let cross_wired = t1.integrates == t2.delta && t2.integrates == t1.delta;
+    let one_side_order = t1.delta_is_right != t2.delta_is_right;
+    let (s1, s2) = (sources(loaded, t1.delta), sources(loaded, t2.delta));
+    let single_source_per_epoch = !s1.iter().any(|s| s2.contains(s));
+    if !(cross_wired && one_side_order && single_source_per_epoch) {
+        return Err(UNSUPPORTED.into());
     }
-
-    Ok(HydrationNodes::Join { d_a, t_a })
+    let integrates_seeded_delta = t2.trace;
+    Ok(integrates_seeded_delta)
 }
 
-/// What [`hydration_nodes`] resolved out of the graph, before any program
-/// lookup: the seeding `ScanDelta` and its relation for a linear body, or the
-/// delta and trace nodes of the join branch a replay seeds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HydrationNodes {
-    Relation { nid: NodeId, source: i64 },
-    Join { d_a: NodeId, t_a: NodeId },
-}
-
-/// Resolve those nodes against the plan the emitter just produced.
-///
-/// Registers and offsets come from the emitter's own node-keyed maps, never from a
-/// node's index in `ordered`: the two agree only for a node that emitted — an
-/// identity `Map` vanishes, a `WorkerFilter` this worker cannot narrow aliases
-/// its input's register, and `Reduce` redirects.
+/// Resolve the seed against the plan the emitter produced for it.
 pub(super) fn derive_hydration(
     loaded: &LoadedCircuit,
+    registry: &RelationRegistry,
+    view_schema: &SchemaDescriptor,
     plan: &SubPlan,
-    out_reg_of: &[Option<OutReg>],
+    regs: &[Option<OutReg>],
 ) -> Result<Hydration, String> {
-    let reg_of =
-        |nid: NodeId| out_reg_of[nid].ok_or_else(|| "bounded view: a hydration node is not in the plan".to_string());
-
-    let hydration = match hydration_nodes(loaded)? {
-        HydrationNodes::Relation { nid, source } => Hydration {
-            start_pc: 0,
-            in_reg: reg_of(nid)?.delta()?,
-            seed: HydrationSeed::Relation(source),
-        },
-        HydrationNodes::Join { d_a, t_a } => {
-            let in_reg = reg_of(d_a)?.delta()?;
-            Hydration {
-                start_pc: plan.vm.program.first_read(in_reg),
-                in_reg,
-                seed: HydrationSeed::Trace(reg_of(t_a)?.trace()?),
+    use gnitz_wire::OpNode;
+    let node = seed_node(loaded)?;
+    let reg = |n: NodeId| regs[n].expect("an exchange-free plan emits every node");
+    let (in_node, seed) = match loaded.op(node) {
+        OpNode::ScanDelta { source, .. } => {
+            let source = *source as i64;
+            if registry
+                .relation(source)
+                .is_some_and(|r| r.kind() == RelationKind::Stream)
+            {
+                return Err(
+                    "capacity-bounded view: a filter/projection over a stream has no stored rows to recompute from"
+                        .into(),
+                );
             }
+            (node, HydrationSeed::Relation(source))
         }
+        _ => (loaded.inputs(node).unary(), HydrationSeed::Trace(reg(node).trace()?)),
     };
-    reject_state_writers(plan, hydration.start_pc)?;
-
-    Ok(hydration)
-}
-
-/// Trust boundary on the program the read-only dispatch will run from
-/// `start_pc`: it runs no integrate, so any *other* state writer would make a
-/// read mutate the state it reads.
-fn reject_state_writers(plan: &SubPlan, start_pc: usize) -> Result<(), String> {
-    if plan.vm.program.writes_state_from(start_pc) {
-        return Err("bounded view: the replayed program writes operator state".into());
+    let entry = plan.vm.program.replay_entry(reg(in_node).delta()?)?;
+    // The view's own keys gather the seed.
+    if plan.vm.program.schema_of(entry.reg()).pk_stride() != view_schema.pk_stride() {
+        return Err(UNSUPPORTED.into());
     }
-    Ok(())
+    Ok(Hydration { entry, seed })
 }
 
 // ---------------------------------------------------------------------------

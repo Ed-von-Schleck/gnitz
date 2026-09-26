@@ -54,6 +54,9 @@ pub(crate) struct DagEngine {
     /// Every registered view, from its registration to its drop. `plan` is `None`
     /// until its first compile.
     views: FxHashMap<i64, RegisteredView>,
+    /// Each relation's effective ingests since its last tick: what its store holds
+    /// beyond the state every view over it was last maintained at.
+    unticked: FxHashMap<i64, Batch>,
 }
 
 impl DagEngine {
@@ -76,6 +79,25 @@ impl DagEngine {
     /// Drop everything this layer holds for relation `id`.
     pub(crate) fn forget(&mut self, id: i64) {
         self.views.remove(&id);
+        self.unticked.remove(&id);
+    }
+
+    // ── Unticked deltas ─────────────────────────────────────────────────
+
+    /// Append `delta`, one effective ingest into `tid`, to what its next tick
+    /// drains.
+    pub(crate) fn buffer_unticked(&mut self, tid: i64, delta: Batch) {
+        match self.unticked.get_mut(&tid) {
+            Some(existing) => existing.append_batch(&delta, 0, delta.len()),
+            None => {
+                self.unticked.insert(tid, delta);
+            }
+        }
+    }
+
+    /// Everything buffered for `tid` since its last tick, removed.
+    pub(crate) fn take_unticked(&mut self, tid: i64) -> Option<Batch> {
+        self.unticked.remove(&tid)
     }
 
     /// Apply one `CircuitNodes` delta to the dependency map.
@@ -85,10 +107,10 @@ impl DagEngine {
 
     // ── Compilation ─────────────────────────────────────────────────────
 
-    /// [`Self::ensure_compiled`] for a caller that cannot name a compiled plan:
+    /// [`ensure_compiled`] for a caller that cannot name a compiled plan:
     /// compile `view_id` now and open its operator state.
     pub(crate) fn open_plan(&mut self, registry: &RelationRegistry, view_id: i64) -> Result<(), String> {
-        self.ensure_compiled(registry, view_id).map(drop)
+        ensure_compiled(&mut self.views, registry, view_id).map(drop)
     }
 
     /// The routing metadata derived when `view_id` registered. `Err` for an id
@@ -98,30 +120,6 @@ impl DagEngine {
             .get(&view_id)
             .map(|v| &v.meta)
             .ok_or_else(|| unregistered(view_id))
-    }
-
-    /// This view's metadata and its compiled plan, compiling and opening its
-    /// operator state on a miss.
-    fn ensure_compiled(
-        &mut self,
-        registry: &RelationRegistry,
-        view_id: i64,
-    ) -> Result<(&ViewMeta, &mut ViewPlan), String> {
-        let RegisteredView { meta, plan } = self.views.get_mut(&view_id).ok_or_else(|| unregistered(view_id))?;
-        if plan.is_none() {
-            let view = registry.relation_or_err(view_id)?;
-            let (code, layout) = compile(registry, view)
-                .map_err(|e| format!("view_id={view_id} does not compile from its durable circuit: {e}"))?;
-            let state = CircuitState::open(registry, view_id, layout).map_err(|e| {
-                format!(
-                    "view_id={view_id}: its derived state is corrupt or unreadable, or resources are \
-                     exhausted: {e}"
-                )
-            })?;
-            gnitz_debug!("dag: compiled view_id={}", view_id);
-            *plan = Some(ViewPlan { code, state });
-        }
-        Ok((meta, plan.as_mut().expect("filled above")))
     }
 
     /// `view_id`'s plan, if it is registered and compiled.
@@ -148,8 +146,36 @@ fn compile(registry: &RelationRegistry, view: &Relation) -> Result<(CompileOutpu
     compiler::compile_view(&loaded, registry, &view.schema(), view.is_bounded())
 }
 
+/// This view's metadata and its compiled plan, compiling and opening its
+/// operator state on a miss.
+fn ensure_compiled<'a>(
+    views: &'a mut FxHashMap<i64, RegisteredView>,
+    registry: &RelationRegistry,
+    view_id: i64,
+) -> Result<(&'a ViewMeta, &'a mut ViewPlan), String> {
+    let RegisteredView { meta, plan } = views.get_mut(&view_id).ok_or_else(|| unregistered(view_id))?;
+    if plan.is_none() {
+        let view = registry.relation_or_err(view_id)?;
+        let (code, layout) = compile(registry, view)
+            .map_err(|e| format!("view_id={view_id} does not compile from its durable circuit: {e}"))?;
+        let state = CircuitState::open(registry, view_id, layout).map_err(|e| {
+            format!(
+                "view_id={view_id}: its derived state is corrupt or unreadable, or resources are \
+                 exhausted: {e}"
+            )
+        })?;
+        gnitz_debug!("dag: compiled view_id={}", view_id);
+        *plan = Some(ViewPlan { code, state });
+    }
+    Ok((meta, plan.as_mut().expect("filled above")))
+}
+
 /// Whether registered view `view_id`'s circuit compiles. Keeps and opens
 /// nothing, so the master can ask before a DDL is durable.
 pub(crate) fn preflight_compile(registry: &RelationRegistry, view_id: i64) -> Result<(), String> {
     compile(registry, registry.relation_or_err(view_id)?).map(drop)
 }
+
+#[cfg(test)]
+#[path = "tests/dag.rs"]
+mod tests;

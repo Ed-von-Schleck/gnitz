@@ -34,14 +34,6 @@ fn side_reindex_key(cols: &[usize], coldefs: &[ColumnDef], slot_tcs: &[TypeCode]
         .collect()
 }
 
-/// `ΔA ⋈ z⁻¹I(B) + ΔB ⋈ z⁻¹I(A)`, both terms in side order `[key, A, B]`.
-/// Shared by the equi, range/band and cross builders.
-pub(super) fn join_terms(cb: &mut Circuit, [da, db]: [NodeId; 2], [ta, tb]: [NodeId; 2], kind: JoinKind) -> NodeId {
-    let ab = cb.join(da, tb, kind, false);
-    let ba = cb.join(db, ta, kind, true);
-    cb.union(ab, ba)
-}
-
 /// One join side as a prologue gated and reindexed it.
 pub(crate) struct EquiSide<'a> {
     side: &'a JoinSide,
@@ -172,7 +164,7 @@ pub(crate) fn equi_prologue<'a>(
     };
     let trace_a = cb.integrate_trace(a.reindex);
     let trace_b = cb.integrate_trace(b_delta);
-    let inner = join_terms(cb, [a.reindex, b_delta], [trace_a, trace_b], JoinKind::Equi);
+    let inner = cb.join_terms([a.reindex, b_delta], [trace_a, trace_b], JoinKind::Equi);
     Ok(EquiTerms { sides: [a, b], tcs, inner })
 }
 
@@ -307,7 +299,7 @@ impl RangePrologue<'_> {
         };
         let trace_b = cb.integrate_trace(int_b);
         let kind = JoinKind::Range { n_eq, rel: self.op };
-        join_terms(cb, [reindex_a, self.reindex_b], [self.trace_a, trace_b], kind)
+        cb.join_terms([reindex_a, self.reindex_b], [self.trace_a, trace_b], kind)
     }
 
     /// `(A_owned, matched)` for a pure range: A's owned slice and the rows of it
@@ -335,7 +327,7 @@ impl RangePrologue<'_> {
 
         // `m` carries no payload, so both terms are `[_join_pk × k, A]`.
         let kind = JoinKind::Range { n_eq, rel: self.op };
-        let matched_raw = join_terms(cb, [self.int_a, reindex_m], [self.trace_a, trace_m], kind);
+        let matched_raw = cb.join_terms([self.int_a, reindex_m], [self.trace_a, trace_m], kind);
         let owned = self.owned_a.expect("a pure range with a ν over A owns A first");
         (owned, rekey_payload_pk(cb, matched_raw, k, left))
     }

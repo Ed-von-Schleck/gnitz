@@ -14,9 +14,9 @@ observable both sides are obliged to agree on.
 These tests need the store to reach the *disk* regime, which `sweeping_server`
 reaches on a few thousand rows by shrinking the RAM-tier ceiling.
 
-What a `WITH (capacity = …)` clause *refuses* — the eligible-body list, the leaf
-rule and the option grammar — is planner-only, and lives beside the rule in
-`crates/gnitz-sql/tests/plan_view_rejections.rs`.
+What a `WITH (capacity = …)` clause *refuses*: the eligible-body rule is the
+engine's, tested in `crates/gnitz-sql/tests/engine_views.rs`. The leaf rule and
+the option grammar are the planner's, in `plan_view_rejections.rs`.
 """
 import os
 import struct
@@ -35,6 +35,9 @@ _SHARD_FLAG_SKELETON = 1
 # An inner equi-join whose right input is a filtered derived table, which fuses
 # into the join's own circuit rather than cutting a segment.
 DERIVED_JOIN = "SELECT t.id, t.body, d.w FROM t JOIN (SELECT tid, w FROM u WHERE w > 70) d ON t.id = d.tid"
+# A join whose projection computes a column, and an `EXISTS` semi-join.
+COMPUTED_JOIN = "SELECT t.id, t.body, t.v + u.w AS z FROM t JOIN u ON t.id = u.tid"
+EXISTS_JOIN = "SELECT id, body FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = t.id)"
 
 # A skeleton row is the PK plus one summed weight, so a store that has swept
 # everything it can still holds this much per live key. `pk_stride` is 8 for a
@@ -81,11 +84,13 @@ def _twin(client, sn, name, body, capacity="1 KB"):
         (LINEAR, "1 KB", True),
         (JOIN, "1 KB", True),
         (DERIVED_JOIN, "1 KB", True),
+        (COMPUTED_JOIN, "1 KB", True),
+        (EXISTS_JOIN, "1 KB", True),
         # A capacity nothing reaches: a bounded view under its cap must read
         # exactly like any other relation.
         (LINEAR, "1 GB", False),
     ],
-    ids=["linear", "join", "derived_join", "slack"],
+    ids=["linear", "join", "derived_join", "computed_join", "exists_join", "slack"],
 )
 def test_bounded_view_matches_its_unbounded_twin(sweeping_client, sweeping_server, body, capacity, sweeps):
     """Full scans, point seeks and the ad-hoc scan-spec path agree at every step
@@ -205,6 +210,39 @@ def test_a_compound_uuid_pk_with_one_leading_value_reads_like_its_twin(sweeping_
     for q in ["SELECT COUNT(*) AS n FROM {v}", "SELECT b FROM {v} ORDER BY b LIMIT 25"]:
         want = bag(rows(c, sn, q.format(v="p_u")))
         assert want and bag(rows(c, sn, q.format(v="b_u"))) == want, q
+
+
+def test_a_bounded_join_over_a_stream_reads_like_its_twin(sweeping_client, sweeping_server):
+    """A bounded join recomputes a skeleton row from its own traces, not from its
+    sources' stores, so it may read a stream, whose store holds nothing."""
+    c, sn = sweeping_client, "s" + _uid()
+    c.create_schema(sn)
+    c.execute_sql(
+        "CREATE TABLE s (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL, body TEXT NOT NULL) "
+        "WITH (stream = true)",
+        schema_name=sn,
+    )
+    c.execute_sql(
+        "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, tid BIGINT NOT NULL, w BIGINT NOT NULL)",
+        schema_name=sn,
+    )
+    n = 1200
+    c.execute_sql("INSERT INTO u VALUES " + ",".join(f"({i}, {i}, {i * 7})" for i in range(1, n + 1)),
+                  schema_name=sn)
+    bid, pid = _twin(c, sn, "sj", "SELECT s.id, s.body, u.w FROM s JOIN u ON s.id = u.tid")
+
+    for lo in range(1, n + 1, 100):
+        c.execute_sql(
+            "INSERT INTO s VALUES " + ",".join(f"({i}, {i * 3}, 'body-{i:0>20}')" for i in range(lo, lo + 100)),
+            schema_name=sn,
+        )
+
+    live = bag(c.scan(pid))
+    assert len(live) == n
+    assert _any_skeleton(sweeping_server.data_dir, bid), "the bounded store must have dehydrated"
+    assert bag(c.scan(bid)) == live, "full scan"
+    for pk in (1, 2, n // 2, n - 1, n):
+        assert bag(c.seek(bid, pk)) == bag(c.seek(pid, pk)), f"seek {pk}"
 
 
 # ── capacity across restarts ─────────────────────────────────────────────────

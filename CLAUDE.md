@@ -525,8 +525,9 @@ Capacity bounds the **registered on-disk shard bytes of that one store on one
 worker**, victim-ordered by *write* recency — nothing records that a row was
 read. Not the traces, not per-row residency, not cluster-wide, and not a bound on
 read peak: a read over hydrated keys materializes them, so peak is higher than
-the unbounded twin's, not lower. Eligible bodies are exactly two: filter/projection
-over one relation, and plain inner equi-join. Bounded views are **leaf** views:
+the unbounded twin's, not lower. Eligible bodies are a filter/projection over one
+relation or over one inner equi-join (an `EXISTS` / `IN` semi-join included); the
+engine decides when the view is compiled. Bounded views are **leaf** views:
 nothing may be created over one, and `ALTER VIEW … AS` cannot retarget one.
 
 Read paths branch on whether a store *holds* a skeleton row, never on whether it
@@ -583,7 +584,7 @@ circuit. So `INSERT INTO events VALUES (1, …)` twice yields one element at wei
 Rejected: reading a stream anywhere outside a view body (SQL or wire), `UPDATE`,
 `DELETE`, `CREATE INDEX`, `ALTER TABLE` column ops, `INSERT … ON CONFLICT`,
 `SERIAL`, a `FOREIGN KEY` to or from one, a write inside a transaction, and
-`WITH (capacity = …)` on a view over one. `DROP TABLE` and `ALTER TABLE … RENAME
+a capacity-bounded filter/projection over one (a bounded join over one is legal). `DROP TABLE` and `ALTER TABLE … RENAME
 TO` work.
 
 At boot, a view reaching a stream **returns to the value it would have if the

@@ -74,7 +74,7 @@ fn plan_of(host: &mut impl DriveHost, view_id: i64) -> &mut ViewPlan {
 fn run_view_epoch(host: &mut impl DriveHost, view_id: i64, input: Batch, src_id: i64) -> Result<Batch, String> {
     let (relay, routed) = {
         let (dag, registry) = host.parts();
-        let (meta, plan) = dag.ensure_compiled(registry, view_id)?;
+        let (meta, plan) = ensure_compiled(&mut dag.views, registry, view_id)?;
         let relay = Relay::new(
             registry,
             view_id,

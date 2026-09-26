@@ -131,16 +131,16 @@ fn pk24(a: u64, b: u64, c: u64) -> [u8; 24] {
         .expect("three U64 PK columns encode to 24 bytes")
 }
 
-/// A `col < lit` predicate blob over a fixed-int column — the program shape a
+/// A `col <op> lit` predicate blob over a fixed-int column — the program shape a
 /// `WHERE` conjunct compiles to. Built through the client's own `ExprBuilder`,
 /// so the test blobs are byte-identical to what the planner ships.
-fn pred_lt_blob(col: usize, lit: i64) -> Vec<u8> {
+fn pred_cmp_blob(op: gnitz_expr::CmpOp, col: usize, lit: i64) -> Vec<u8> {
     let mut eb = gnitz_expr::ExprBuilder::new();
     let (a, b) = (
         eb.emit(gnitz_expr::LogicalInstr::LoadColInt { col: col as u32 }),
         eb.emit(gnitz_expr::LogicalInstr::LoadConst { val: lit, unsigned: false }),
     );
-    let r = eb.emit(gnitz_expr::LogicalInstr::Cmp { op: gnitz_expr::CmpOp::Lt, a, b });
+    let r = eb.emit(gnitz_expr::LogicalInstr::Cmp { op, a, b });
     eb.build(Some(r)).expect("a well-formed program").to_blob_bytes()
 }
 
@@ -188,6 +188,20 @@ fn table_fixture(name: &str, cols: &[ColumnDef]) -> (CatalogEngine, i64, String)
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let tid = engine.create_table("public.t", cols, &[0]).unwrap();
     (engine, tid, dir)
+}
+
+/// Compile `view` and backfill it from each of `sources` in turn.
+fn backfill(engine: &mut CatalogEngine, view: i64, sources: &[i64]) {
+    engine.dag.open_plan(&engine.registry, view).unwrap();
+    let chunk_rows = engine.registry.scan_chunk_rows();
+    for &source in sources {
+        let mut cursor = engine.open_source_cursor(view, source).unwrap();
+        while let Some(chunk) = cursor.drain_chunk(chunk_rows) {
+            let what = crate::query::Drive::Backfill { view, source };
+            crate::query::drive(&mut LocalDrive(engine), what, chunk).unwrap();
+        }
+    }
+    engine.dag.finish_backfill(&mut engine.registry, view).unwrap();
 }
 
 /// [`table_fixture`] ingested in `rounds` PK-interleaved passes over ids `0..n`,

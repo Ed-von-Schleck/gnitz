@@ -85,8 +85,9 @@ impl TestVm {
         execute_epoch_multi(&mut self.vm, &mut self.state, inputs)
     }
 
-    pub(in crate::query) fn replay(&mut self, start_pc: usize, seed: (DeltaReg, Batch)) -> Result<Batch, StoreError> {
-        replay_chunk(&mut self.vm, &mut self.state, start_pc, seed)
+    pub(in crate::query) fn replay(&mut self, seed: (DeltaReg, Batch)) -> Result<Batch, StoreError> {
+        let entry = self.vm.program.replay_entry(seed.0).unwrap();
+        replay_chunk(&mut self.vm, &mut self.state, entry, seed.1)
     }
 }
 

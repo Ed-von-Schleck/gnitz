@@ -40,6 +40,13 @@ pub struct JoinProbe {
     t_slots: Slots,
 }
 
+impl JoinProbe {
+    /// Whether the walk reads the trace only at the delta's own PKs.
+    pub fn probes_delta_keys(&self) -> bool {
+        matches!(self.walk, Walk::Equi)
+    }
+}
+
 /// A half-open span of the output row: the payload slots one input fills, or
 /// the bytes its key occupies in the pair key.
 #[derive(Clone, Copy)]

@@ -7,21 +7,6 @@ use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::BatchBuilder;
 use gnitz_wire::TypeCode;
 
-/// `buffer_pending_delta` appends into an existing entry rather than
-/// replacing it — the shape the live push path and boot SAL replay share.
-#[test]
-fn pending_deltas_accumulate_per_relation() {
-    let schema = make_schema_u64_i64();
-    let mut pending: HashMap<i64, Batch> = HashMap::new();
-
-    buffer_pending_delta(&mut pending, 100, make_batch_raw(&schema, &[(1, 1, 10)]));
-    assert_eq!(pending[&100].len(), 1);
-    buffer_pending_delta(&mut pending, 100, make_batch_raw(&schema, &[(2, 1, 20)]));
-    assert_eq!(pending[&100].len(), 2, "a second delta appends to the same table");
-    buffer_pending_delta(&mut pending, 200, make_batch_raw(&schema, &[(3, 1, 30)]));
-    assert_eq!(pending[&200].len(), 1, "a different table gets its own entry");
-}
-
 /// Every reply helper (`send_ack`, `send_reply`, `send_fault`) publishes
 /// on the ring prefix of the request id it was handed.
 #[test]
@@ -51,7 +36,7 @@ fn send_helpers_publish_on_the_request_id() {
 /// budget is pinned rather than read from the environment, so a shell that
 /// exports `GNITZ_REPLY_FRAME_BUDGET` does not reshape these frames.
 fn make_test_worker(catalog: *mut CatalogEngine, writer: W2mWriter) -> WorkerProcess {
-    let mut wp = WorkerProcess::new(catalog, unsafe { std::mem::zeroed() }, writer, HashMap::new());
+    let mut wp = WorkerProcess::new(catalog, unsafe { std::mem::zeroed() }, writer);
     wp.reply_frame_budget = ipc::FRAME_CAP;
     wp
 }
@@ -134,40 +119,52 @@ fn tick_defers_inside_exchange() {
     );
 }
 
-/// A **delta** read inside an exchange wait must defer, carrying the whole
-/// request — `arg0` above all, which is where the master put the
-/// interval's upper cut. A replayed read that lost it would cut at `T = 0`,
-/// return nothing, and still be answered with a terminal frame reporting the
-/// real `T`: the client would advance its cursor over rounds it never
-/// received. It shares the tick's FIFO, so the replay order is SAL order.
+/// A read inside an exchange wait is parked with its whole request, in request
+/// order.
 #[test]
-fn delta_read_defers_inside_exchange_with_its_whole_request() {
+fn reads_defer_inside_exchange_in_request_order() {
     let mut wp = make_worker_for_matrix();
-    let frame = Box::leak(
-        ipc::WireMsg {
-            target_id: 77,
-            arg0: 4242,
-            arg1: 31,
-            blob: &[9, 8, 7],
-            ..Default::default()
-        }
-        .encode_to_vec()
-        .into_boxed_slice(),
+    let frame = |target_id: u64, arg0: u64| -> &'static [u8] {
+        Box::leak(
+            ipc::WireMsg {
+                target_id,
+                arg0,
+                arg1: 31,
+                blob: &[9, 8, 7],
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into_boxed_slice(),
+        )
+    };
+    let reads = [
+        (SalMessageKind::Scan, 75, 4240),
+        (SalMessageKind::ScanSpec, 76, 4241),
+        (SalMessageKind::DeltaRead, 77, 4242),
+    ];
+    for (kind, target, arg0) in reads {
+        assert!(wp
+            .dispatch_in_eval((100, 5), &bare_message(kind, target), frame(u64::from(target), arg0))
+            .is_none());
+    }
+    assert!(
+        wp.exchange.deferred.is_empty(),
+        "a read is replayed after the ACK, not before it"
     );
-    // A tick first, so the shared FIFO's insertion order is observable.
-    assert!(wp
-        .dispatch_in_eval((100, 5), &bare_message(SalMessageKind::Tick, 999), tick_frame(999, 3))
-        .is_none());
-    assert!(wp
-        .dispatch_in_eval((100, 5), &bare_message(SalMessageKind::DeltaRead, 77), frame)
-        .is_none());
-    assert_eq!(wp.exchange.deferred_replay.len(), 2, "one queue, in SAL order");
-    assert_eq!(wp.exchange.deferred_replay[0].kind, SalMessageKind::Tick);
-    let read = &wp.exchange.deferred_replay[1];
-    assert_eq!(read.kind, SalMessageKind::DeltaRead);
-    let ctrl = &read.wire.control;
-    assert_eq!((ctrl.hdr.target_id, ctrl.hdr.arg0, ctrl.hdr.arg1), (77, 4242, 31));
-    assert_eq!(ctrl.blob.as_slice(), &[9, 8, 7]);
+    assert_eq!(
+        wp.exchange.deferred_replay.len(),
+        reads.len(),
+        "one queue, in SAL order"
+    );
+    for (parked, (kind, target, arg0)) in wp.exchange.deferred_replay.iter().zip(reads) {
+        assert_eq!(parked.kind, kind);
+        let ctrl = &parked.wire.control;
+        assert_eq!(
+            (ctrl.hdr.target_id, ctrl.hdr.arg0, ctrl.hdr.arg1),
+            (u64::from(target), arg0, 31)
+        );
+        assert_eq!(ctrl.blob.as_slice(), &[9, 8, 7]);
+    }
 }
 
 /// Encode a header-only ExchangeRelay wire frame (schema, no data batch)

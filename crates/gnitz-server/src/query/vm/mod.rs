@@ -257,6 +257,20 @@ struct Integrate {
     take: bool,
 }
 
+/// Where a read-only replay enters a program: the register it seeds and the
+/// first instruction reading it.
+#[derive(Clone, Copy)]
+pub(in crate::query) struct ReplayEntry {
+    reg: DeltaReg,
+    pc: usize,
+}
+
+impl ReplayEntry {
+    pub(in crate::query) fn reg(self) -> DeltaReg {
+        self.reg
+    }
+}
+
 /// The pc of the first instruction reading `reg`, or `instructions.len()` when
 /// none does.
 fn first_read_of(instructions: &[Instr], reg: DeltaReg) -> usize {
@@ -272,17 +286,6 @@ impl Program {
     /// to copy.
     pub(in crate::query) fn schema_of(&self, reg: DeltaReg) -> &SchemaDescriptor {
         &self.delta_schemas[reg.at()]
-    }
-
-    /// The pc of the first instruction reading `reg`, or the program length when
-    /// none does. Each register has exactly one writer, strictly before this —
-    /// `push_delta_reg` mints a fresh one per emitting node — so a replay that
-    /// seeds `reg` may enter here and find its value intact.
-    ///
-    /// Only meaningful for a register some instruction reads: an integrate is
-    /// past the range this counts over.
-    pub(in crate::query) fn first_read(&self, reg: DeltaReg) -> usize {
-        first_read_of(&self.instructions, reg)
     }
 
     /// The schema of the register this program's output leaves in.
@@ -321,8 +324,16 @@ impl Program {
             .any(|i| matches!(i.op, Op::WorkerFilter { .. }))
     }
 
-    /// True iff any instruction from `start_pc` on writes operator state.
-    pub(in crate::query) fn writes_state_from(&self, start_pc: usize) -> bool {
-        self.instructions[start_pc..].iter().any(|i| facts(&i.op).writes_state)
+    /// Enter a read-only replay at `reg`'s first reader.
+    pub(in crate::query) fn replay_entry(&self, reg: DeltaReg) -> Result<ReplayEntry, String> {
+        let pc = first_read_of(&self.instructions, reg);
+        let rest = &self.instructions[pc..];
+        if rest.iter().any(|i| i.out_reg == reg) {
+            return Err("replay: the program overwrites the seeded register past its entry".into());
+        }
+        if rest.iter().any(|i| facts(&i.op).writes_state) {
+            return Err("replay: the program writes operator state past its entry".into());
+        }
+        Ok(ReplayEntry { reg, pc })
     }
 }

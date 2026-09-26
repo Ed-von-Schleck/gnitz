@@ -421,7 +421,14 @@ impl Table {
     ///
     /// Both bounds are exactly `pk_stride` OPK bytes. The gather over-approximates
     /// on both tiers, so a half-open `end` is safe to pass.
-    pub(crate) fn open_cursor_in_range(&self, start: &[u8], end: Option<&[u8]>) -> ReadCursor {
+    ///
+    /// `extra`, when present, is merged in as one more in-memory run.
+    pub(crate) fn open_cursor_in_range(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        extra: Option<Rc<Batch>>,
+    ) -> ReadCursor {
         let stride = self.shard_index.schema.pk_stride();
         debug_assert_eq!(start.len(), stride, "open_cursor_in_range: start is not pk_stride wide");
         debug_assert!(
@@ -432,10 +439,12 @@ impl Table {
             PkBuf::from_bytes(start),
             end.map_or_else(|| PkBuf::max(stride), PkBuf::from_bytes),
         );
+        debug_assert!(extra.as_ref().is_none_or(|b| b.is_consolidated()));
         let runs = self
             .mem_runs(Some((lo, hi)))
+            .chain(extra.filter(|b| !b.is_empty()).map(Run::Mem))
             .chain(self.shard_index.shard_arcs_in_range(lo, hi).map(Run::Shard));
-        read_cursor::from_runs_unpositioned(runs, self.shard_index.schema, self.mem_run_count())
+        read_cursor::from_runs_unpositioned(runs, self.shard_index.schema, self.mem_run_count() + 1)
     }
 
     /// Return the fully consolidated batch of all live rows, caching the result.

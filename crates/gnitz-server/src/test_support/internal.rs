@@ -92,24 +92,39 @@ pub fn negate_chain(source: i64, n: usize) -> Circuit {
     circuit
 }
 
+/// `source` scanned and reindexed on its column 1, keeping its column 0, which
+/// it states as its scatter key.
+pub fn reindexed_on_col1(circuit: &mut Circuit, source: i64) -> gnitz_wire::NodeId {
+    let key = [(1, None)];
+    let scan = circuit.input_delta(source as u64, gnitz_wire::ReadBound::None);
+    let role = gnitz_wire::ReindexRole::ScatterKey {
+        source: source as u64,
+        source_key: key.to_vec(),
+    };
+    circuit.map_reindex(scan, &key, &[0], role)
+}
+
 /// An equi-join of `a` and `b` on their column 1, each side stating its scatter
 /// key where `keyed` says so.
 pub fn equi_join_circuit(a: i64, b: i64, keyed: [bool; 2]) -> Circuit {
     let mut circuit = Circuit::default();
-    let key = [(1, None)];
-    let [ka, kb] = [(a, keyed[0]), (b, keyed[1])].map(|(source, keyed)| {
-        let scan = circuit.input_delta(source as u64, gnitz_wire::ReadBound::None);
-        let role = gnitz_wire::ReindexRole::ScatterKey {
-            source: source as u64,
-            source_key: key.to_vec(),
-        };
-        match keyed {
-            true => circuit.map_reindex(scan, &key, &[0], role),
-            false => scan,
-        }
+    let [ka, kb] = [(a, keyed[0]), (b, keyed[1])].map(|(source, keyed)| match keyed {
+        true => reindexed_on_col1(&mut circuit, source),
+        false => circuit.input_delta(source as u64, gnitz_wire::ReadBound::None),
     });
     let tb = circuit.integrate_trace(kb);
     let joined = circuit.join(ka, tb, gnitz_wire::JoinKind::Equi, false);
+    circuit.sink(joined);
+    circuit
+}
+
+/// A two-term inner equi-join of `a` and `b` on their column 1, output
+/// `[key, a.0, b.0]`.
+pub fn two_term_join_circuit(a: i64, b: i64) -> Circuit {
+    let mut circuit = Circuit::default();
+    let deltas = [a, b].map(|source| reindexed_on_col1(&mut circuit, source));
+    let traces = deltas.map(|d| circuit.integrate_trace(d));
+    let joined = circuit.join_terms(deltas, traces, gnitz_wire::JoinKind::Equi);
     circuit.sink(joined);
     circuit
 }

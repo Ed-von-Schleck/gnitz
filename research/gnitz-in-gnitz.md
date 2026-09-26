@@ -46,8 +46,8 @@ That is the complete list. The integral `I(A)` is a gnitz `Table`; a secondary
 index is a gnitz `Table`; the catalog is nine gnitz `Table`s. There is no
 long-lived, data-scaled structure in the engine that is not one.
 
-The transient exceptions are all correctly plain memory: `pending_deltas` /
-`pending_relays` (one tick of in-flight batches, `worker/mod.rs:135,176`),
+The transient exceptions are all correctly plain memory: the DAG's unticked
+deltas and the worker's `pending_relays` (one tick of in-flight batches),
 `AdhocFold::by_hash` (request-scoped, capped), the CREATE UNIQUE INDEX `seen`
 set and its `SpillSort`, and `enforce_unique_pk`'s per-batch state.
 

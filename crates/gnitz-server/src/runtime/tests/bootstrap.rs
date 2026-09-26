@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_store::storage::Batch;
 
 /// Which of a group's written slots this rank replays. A wrong range silently
 /// loses or doubles ACKed rows, so every case is pinned.

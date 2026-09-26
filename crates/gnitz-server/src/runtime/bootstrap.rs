@@ -6,7 +6,6 @@
 //! **Recovery order is a crash guard**: every step is placed so a crash at any
 //! point rebuilds a view rather than silently resuming a stale one.
 
-use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -23,9 +22,9 @@ use crate::runtime::sal::{sal_mmap_size, SalLog, SalMessage, SalMessageKind, Sal
 use crate::runtime::tls::{setup_tls_listener, TlsCli};
 use crate::runtime::w2m::{self, SalWake, W2mReceiver, W2mWriter, BOOT_READY_REQUEST_ID};
 use crate::runtime::wire as ipc;
-use crate::runtime::worker::{buffer_pending_delta, WorkerProcess};
+use crate::runtime::worker::WorkerProcess;
 use gnitz_store::relation::{Relation, Residency};
-use gnitz_store::storage::{Batch, Slot};
+use gnitz_store::storage::Slot;
 
 // ---------------------------------------------------------------------------
 // SAL recovery: both drivers below read the log through `sal::zone::CommittedTail`
@@ -129,8 +128,8 @@ fn replay_slots(written: u32, slot: Slot, replicated: bool) -> (Range<u32>, bool
 
 /// Per-worker post-fork user-table replay for `slot`, applying each Push group
 /// through `ingest_returning` — the exact call `handle_push` makes, so
-/// retractions cancel correctly. The returned map seeds the worker's
-/// `pending_deltas` for the master's tick sweep to drain into the views.
+/// retractions cancel correctly. Each swept base's effective delta is buffered as
+/// unticked, for the master's tick sweep to drain into the views.
 ///
 /// No LSN floor: `enforce_unique_pk` makes re-applying a group the shards
 /// already hold a no-op.
@@ -139,8 +138,7 @@ fn recover_from_sal(
     slot: Slot,
     swept_bases: &[i64],
     catalog: &mut CatalogEngine,
-) -> Result<HashMap<i64, Batch>, String> {
-    let mut pending: HashMap<i64, Batch> = HashMap::new();
+) -> Result<(), String> {
     // Groups that applied at least one slot, and the width a re-sliced tail was
     // written at — the boot record's re-slice marker. No boot writes at a
     // previously-used epoch, so every group a walk sees carries the same width.
@@ -183,16 +181,17 @@ fn recover_from_sal(
             if owned.schema().num_payload_cols() < schema.num_payload_cols() {
                 owned = owned.widened_with_nulls(&schema, false);
             }
-            let effective = catalog.registry.ingest_returning(tid, owned).map_err(|e| {
+            // `base_tables_reachable_from` returns them sorted and deduplicated.
+            let ingested = match swept_bases.binary_search(&tid) {
+                Ok(_) => catalog.ingest_unticked(tid, owned),
+                Err(_) => catalog.registry.ingest_returning(tid, owned).map(drop),
+            };
+            ingested.map_err(|e| {
                 format!(
                     "SAL replay apply failed (table_id={}, lsn={}): {e}",
                     msg.target_id, msg.lsn
                 )
             })?;
-            // `base_tables_reachable_from` returns them sorted and deduplicated.
-            if swept_bases.binary_search(&tid).is_ok() {
-                buffer_pending_delta(&mut pending, tid, effective);
-            }
             applied = true;
         }
         replayed += u32::from(applied);
@@ -204,7 +203,7 @@ fn recover_from_sal(
             None => gnitz_note!("SAL replay: replayed {replayed} group(s)"),
         }
     }
-    Ok(pending)
+    Ok(())
 }
 
 /// Worker-boot catalog recovery. The `Err` rides the startup ACK, which fails
@@ -215,14 +214,14 @@ fn worker_boot_recovery(
     tail: CommittedTail,
     slot: Slot,
     swept_bases: &[i64],
-) -> Result<HashMap<i64, Batch>, String> {
+) -> Result<(), String> {
     // Before any other catalog work, and before the replay below, which
     // projects the tail into each index exactly once.
     let rebuilt = catalog.registry.open_stores(slot.rank, Residency::Worker)?;
     // Resume-vs-rebuild marker, the index sibling of the invalid-view line: 0 ⇒
     // every index resumed from its checkpoint.
     gnitz_note!("recovery: rebuilding {rebuilt} index(es)");
-    let pending_deltas = recover_from_sal(tail, slot, swept_bases, catalog)?;
+    recover_from_sal(tail, slot, swept_bases, catalog)?;
     // Before the master's boot rewind puts the write cursor back to 0: these rows
     // still live only in SAL entries a second crash would then overwrite.
     debug_assert!(
@@ -236,7 +235,7 @@ fn worker_boot_recovery(
     if BOOT_FLUSH_ERROR.armed() {
         return Err("injected boot flush fault".to_string());
     }
-    Ok(pending_deltas)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -352,21 +351,18 @@ fn run_worker_child(
     let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w]);
     let catalog_ptr: *mut CatalogEngine = catalog;
 
-    let pending_deltas = match worker_boot_recovery(catalog, ipc.tail, slot, swept_bases) {
-        Ok(pd) => pd,
-        Err(e) => {
-            // The master reads this frame off the shared ring, which outlives the
-            // process that wrote it.
-            gnitz_error!("{e}");
-            w2m_writer.send_status(0, BOOT_READY_REQUEST_ID, gnitz_wire::WireStatus::Error, e.as_bytes());
-            unsafe { libc::_exit(1) };
-        }
-    };
+    if let Err(e) = worker_boot_recovery(catalog, ipc.tail, slot, swept_bases) {
+        // The master reads this frame off the shared ring, which outlives the
+        // process that wrote it.
+        gnitz_error!("{e}");
+        w2m_writer.send_status(0, BOOT_READY_REQUEST_ID, gnitz_wire::WireStatus::Error, e.as_bytes());
+        unsafe { libc::_exit(1) };
+    }
 
     gnitz_note!("Worker {} (pid {}) of {}", w, unsafe { libc::getpid() }, slot.of);
 
     let sal_reader = SalReader::new(ipc.sal, slot.rank, ipc.tail.live_epoch());
-    let mut worker = WorkerProcess::new(catalog_ptr, sal_reader, w2m_writer, pending_deltas);
+    let mut worker = WorkerProcess::new(catalog_ptr, sal_reader, w2m_writer);
     let rc = worker.run(BOOT_READY_REQUEST_ID);
 
     unsafe {

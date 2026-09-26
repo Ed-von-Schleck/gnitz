@@ -30,19 +30,20 @@ pub(in crate::query) fn execute_epoch_multi(
     Ok(take_output(vm))
 }
 
-/// One chunk of a capacity-bounded view's hydration replay: seed a register out
-/// of a store and run from `start_pc`, past the prologue that seed replaces.
-/// Runs no integrate; that the instructions write no state either is
-/// `reject_state_writers`'s to enforce.
+/// One chunk of a capacity-bounded view's hydration replay, which runs no
+/// integrate.
 pub(in crate::query) fn replay_chunk(
     vm: &mut VmHandle,
     state: &mut CircuitState,
-    start_pc: usize,
-    seed: (DeltaReg, Batch),
+    entry: ReplayEntry,
+    seed: Batch,
 ) -> Result<Batch, StoreError> {
-    seed_inputs(vm, std::iter::once(seed));
-    run_instructions(vm, state, start_pc)?;
-    Ok(take_output(vm))
+    seed_inputs(vm, std::iter::once((entry.reg, seed)));
+    run_instructions(vm, state, entry.pc)?;
+    let out = take_output(vm);
+    // Frees the seed, which no integrate took, before the next chunk is gathered.
+    vm.release();
+    Ok(out)
 }
 
 /// Clear the registers and move each seed into its own, reporting whether every
@@ -149,9 +150,9 @@ fn run_instructions(vm: &mut VmHandle, state: &mut CircuitState, start_pc: usize
 
                 Op::WeightClamp { hist, preset } => {
                     let schema = &delta_schemas[in_reg.at()];
-                    let delta = take_or_clone(batches, in_reg, instr.takes[0]);
                     // Opened before the ingest below: the clamp reads `z⁻¹(I)`.
-                    let mut cursor = state.cursor(*hist);
+                    let mut cursor = state.cursor_for_keys(*hist, &batches[in_reg.at()]);
+                    let delta = take_or_clone(batches, in_reg, instr.takes[0]);
                     let (output, consolidated) = ops::op_weight_clamp(delta, &mut cursor, schema, *preset);
                     drop(cursor);
                     state
@@ -160,12 +161,14 @@ fn run_instructions(vm: &mut VmHandle, state: &mut CircuitState, start_pc: usize
                     output
                 }
 
-                Op::JoinDT { trace, probe } => ops::op_join_delta_trace(
-                    &batches[in_reg.at()],
-                    &mut state.cursor(*trace),
-                    &delta_schemas[out_reg.at()],
-                    *probe,
-                ),
+                Op::JoinDT { trace, probe } => {
+                    let delta = &batches[in_reg.at()];
+                    let mut cursor = match probe.probes_delta_keys() {
+                        true => state.cursor_for_keys(*trace, delta),
+                        false => state.cursor(*trace),
+                    };
+                    ops::op_join_delta_trace(delta, &mut cursor, &delta_schemas[out_reg.at()], *probe)
+                }
 
                 Op::WorkerFilter { slot } => ops::op_worker_filter(&batches[in_reg.at()], *slot),
 

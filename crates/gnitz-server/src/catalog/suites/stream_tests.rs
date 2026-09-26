@@ -1,5 +1,5 @@
 //! Streams: the flag → `RelationKind::Stream` dispatch, the storeless
-//! registration it implies, and the two catalog rules that guard a view over one.
+//! registration it implies, and the rules that guard a view over one.
 
 use super::*;
 
@@ -49,34 +49,32 @@ fn stream_reads_no_committed_state() {
     fs::remove_dir_all(&dir).ok();
 }
 
-/// A `WITH (capacity = …)` view over a stream must be refused at registration: its
-/// skeleton rows are recomputed from the source store, which a stream answers with
-/// zero rows rather than an error. Driven from a registration the SQL planner cannot
-/// produce — the hand-built-circuit path is the one this rule exists to cover, and a
-/// test that only went through SQL would pass with the rule absent.
+/// A bounded filter/projection over a stream is refused at compile; over a table,
+/// and a bounded join over a stream, it compiles.
 #[test]
-fn bounded_view_over_a_stream_is_rejected() {
+fn a_bounded_linear_view_over_a_stream_is_rejected_at_compile() {
     let dir = temp_dir("bounded_view_over_stream");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("amount", TypeCode::I64)];
     let sid = create_flagged_table(&mut engine, "s", &cols, &[0], stream_flags());
     let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
 
-    let register_bounded = |engine: &mut CatalogEngine, src: i64, name: &str| {
-        try_register_identity_view(engine, src, name, &cols, 4 << 20, 0)
-    };
+    let linear = try_register_identity_view(&mut engine, sid, "bounded_over_stream", &cols, 4 << 20, 0).unwrap();
+    let err = crate::query::preflight_compile(&engine.registry, linear).expect_err("must be rejected");
+    assert!(err.contains("over a stream"), "got: {err}");
 
-    let err = register_bounded(&mut engine, sid, "bounded_over_stream").expect_err("must be rejected");
-    assert!(
-        err.contains("'public.s', which is a stream"),
-        "must name the source: {err}"
-    );
+    let over_table = try_register_identity_view(&mut engine, tid, "bounded_over_table", &cols, 4 << 20, 0).unwrap();
+    crate::query::preflight_compile(&engine.registry, over_table).expect("bounded view over a table");
 
-    // The same registration over a base table is accepted, so the rejection is
-    // about the source's kind and not about the capacity clause.
-    register_bounded(&mut engine, tid, "bounded_over_table").expect("bounded view over a table");
+    let join_cols = vec![
+        col_def("k", TypeCode::I64),
+        col_def("s_id", TypeCode::U64),
+        col_def("t_id", TypeCode::U64),
+    ];
+    let circuit = crate::test_support::two_term_join_circuit(sid, tid);
+    let join = try_register_view(&mut engine, circuit, "bounded_join", &join_cols, 4 << 20, 0).unwrap();
+    crate::query::preflight_compile(&engine.registry, join).expect("a bounded join over a stream compiles");
 
-    // An *unbounded* view over a stream is exactly what a stream is for.
     register_identity_view(&mut engine, sid, "unbounded_over_stream", &cols);
 
     fs::remove_dir_all(&dir).ok();

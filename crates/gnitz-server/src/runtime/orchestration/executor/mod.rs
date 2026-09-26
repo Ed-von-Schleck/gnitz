@@ -571,9 +571,9 @@ async fn watchdog(shared: Rc<Shared>) {
             // 2. One final full checkpoint through the committer. The Shutdown
             //    barrier forces the whole sequence and is deferred to its end,
             //    so `done` resolves only after the base + drain + ephemeral
-            //    rounds complete. A just-pushed delta may still sit in
-            //    `pending_deltas` (below the row threshold, so no `Auto` fired),
-            //    so the sequence's drain is what gets it into the views.
+            //    rounds complete. A just-pushed delta may still sit unticked
+            //    (below the row threshold, so no `Auto` fired), so the
+            //    sequence's drain is what gets it into the views.
             request_barrier(&shared, BarrierKind::Shutdown).await;
 
             // 3. Shut the workers down, then stop the reactor. The reactor/W2M

@@ -829,29 +829,6 @@ fn capacity_rules() {
                SELECT a.id AS aid, d.w FROM a JOIN (SELECT k, w FROM b WHERE w > 3) d ON a.k = d.k";
     plan(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
 
-    // Only a filter/projection over one relation and an inner equi-join may be
-    // bounded; every other shape compiles unbounded.
-    for body in [
-        "SELECT g, SUM(v) AS s FROM u GROUP BY g",
-        "SELECT id, v FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.g = t.id)",
-        "SELECT id, v FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.g = t.id)",
-        "SELECT DISTINCT v FROM t",
-        "SELECT id, v FROM t UNION ALL SELECT id, v FROM u",
-        "SELECT d.id FROM (SELECT id, v FROM t) d",
-        "SELECT d.v FROM (SELECT DISTINCT v FROM t) d",
-        "SELECT t.id, t.v + u.v AS z FROM t JOIN u ON t.id = u.g",
-        "SELECT t.id, u.v FROM t LEFT JOIN u ON t.id = u.g",
-        "SELECT t.id, u.v FROM t RIGHT JOIN u ON t.id = u.g",
-        "SELECT t.id, u.v FROM t FULL JOIN u ON t.id = u.g",
-        "SELECT t.id, u.v FROM t JOIN u ON t.id = u.g AND t.v < u.v",
-        "SELECT t.id, u.v FROM t CROSS JOIN u",
-        "SELECT id FROM t ORDER BY v LIMIT 1",
-    ] {
-        view(&cat, body);
-        let sql = format!("CREATE VIEW v WITH (capacity = '1 MB') AS {body}");
-        assert_rejects(&sql, plan(&cat, &sql), "Unsupported", "capacity");
-    }
-
     // An inner equi-join root whose sides cut a segment of their own: the root
     // shape is eligible, but the cut would hold an unbounded copy of its rows.
     for body in [

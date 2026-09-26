@@ -15,6 +15,11 @@ use crate::storage::{
 };
 use gnitz_wire::{PkColList, ViewProps};
 
+/// Ingests into one relation, undone: a cursor opened with it reads the store as
+/// it was before them. `Default` undoes nothing.
+#[derive(Clone, Default)]
+pub struct Rewind(Option<std::rc::Rc<Batch>>);
+
 mod build;
 mod circuit_state;
 mod dirs;
@@ -291,7 +296,24 @@ impl Relation {
     /// This relation's rows over `[start, end]` only — see
     /// `Table::open_cursor_in_range`.
     pub fn cursor_in_range(&self, start: &[u8], end: Option<&[u8]>) -> crate::storage::ReadCursor {
-        self.store.cursor_in_range(start, end)
+        self.store.cursor_in_range(start, end, None)
+    }
+
+    /// Undo `ingested`, rows this relation's store took in.
+    pub fn rewind(&self, ingested: &Batch) -> Rewind {
+        let mut undo = ingested.clone();
+        undo.map_weights(i64::wrapping_neg);
+        Rewind(Some(std::rc::Rc::new(undo.into_consolidated(&self.schema()))))
+    }
+
+    /// [`Self::cursor_in_range`] over the store as `rewind` leaves it.
+    pub fn cursor_in_range_rewound(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        rewind: &Rewind,
+    ) -> crate::storage::ReadCursor {
+        self.store.cursor_in_range(start, end, rewind.0.clone())
     }
 
     /// Visit every positive-weight row whose OPK key begins with `prefix`, through a

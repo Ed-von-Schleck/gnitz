@@ -157,11 +157,6 @@ struct Survivors<'a, 'h> {
 }
 
 impl Survivors<'_, '_> {
-    /// Whether every source row survives: nothing filters it.
-    fn keeps_every_row(&self) -> bool {
-        self.filter.keeps_every_row()
-    }
-
     /// The next source chunk and its surviving row ranges; `None` once the source is
     /// exhausted.
     fn next(&mut self, max_rows: usize) -> Result<Option<SurvivorChunk<'_>>, StoreError> {
@@ -220,9 +215,7 @@ fn stream_rows(
     window: i64,
 ) -> Result<Batch, StoreError> {
     let early_stop = window > 0;
-    // `window`-sized chunks stop in O(window), but a filtered one could survive no row
-    // and turn the drain row-at-a-time.
-    let drain_rows = match early_stop && rows.keeps_every_row() {
+    let first = match early_stop {
         true => (window as usize).clamp(1, chunk_rows),
         false => chunk_rows,
     };
@@ -230,7 +223,10 @@ fn stream_rows(
     let mut keeper = Batch::empty_with_schema(keeper_schema);
     let mut summed: i64 = 0;
 
-    while let Some((chunk, ranges)) = rows.next(drain_rows)? {
+    for drain_rows in drain_ramp(first, chunk_rows) {
+        let Some((chunk, ranges)) = rows.next(drain_rows)? else {
+            break;
+        };
         let mb = chunk.as_mem_batch();
         if early_stop {
             // Cut at the row whose weight reaches the window: a range, or a hydrated group, can
@@ -258,6 +254,18 @@ fn stream_rows(
         }
     }
     Ok(keeper)
+}
+
+/// Drain sizes doubling from `first`, each cut at the next multiple of
+/// `chunk_rows`, so the drain crosses every boundary a flat `chunk_rows` drain does.
+fn drain_ramp(first: usize, chunk_rows: usize) -> impl Iterator<Item = usize> {
+    let (mut step, mut drained) = (first, 0usize);
+    std::iter::from_fn(move || {
+        let rows = step.min(chunk_rows - drained % chunk_rows);
+        drained += rows;
+        step = step.saturating_mul(2);
+        Some(rows)
+    })
 }
 
 /// The rows sink with an ORDER BY and a `window > 0`: append every survivor and

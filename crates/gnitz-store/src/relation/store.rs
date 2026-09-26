@@ -65,11 +65,16 @@ impl Store {
         }
     }
 
-    /// [`Self::cursor`] over `[start, end]` only — see
+    /// [`Self::cursor`] over `[start, end]` only, with `extra` merged in — see
     /// [`Table::open_cursor_in_range`].
-    pub(crate) fn cursor_in_range(&self, start: &[u8], end: Option<&[u8]>) -> ReadCursor {
+    pub(crate) fn cursor_in_range(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        extra: Option<std::rc::Rc<Batch>>,
+    ) -> ReadCursor {
         match self.table() {
-            Some(t) => t.open_cursor_in_range(start, end),
+            Some(t) => t.open_cursor_in_range(start, end, extra),
             None => crate::storage::empty_cursor(self.schema),
         }
     }
@@ -81,7 +86,7 @@ impl Store {
             return (crate::storage::empty_cursor(self.schema), 0);
         };
         let end = end.as_ref().map(PkBuf::pk_bytes);
-        let mut cursor = self.cursor_in_range(start.pk_bytes(), end);
+        let mut cursor = self.cursor_in_range(start.pk_bytes(), end, None);
         let matches = cursor.seek_range_bytes(start.pk_bytes(), end);
         (cursor, matches)
     }

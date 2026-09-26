@@ -705,3 +705,27 @@ fn survivors_membership_bench() {
     }
     println!("survivors {shape} sel {sel}% passes {passes}");
 }
+
+/// A read whose window lies in its first `m` rows drains fewer than `2m + first`
+/// of them, and never more than a flat `chunk_rows` drain would.
+#[test]
+fn drain_ramp_doubles_onto_the_chunk_grid() {
+    let chunk = 1000;
+    let sizes: Vec<usize> = drain_ramp(1, chunk).take(14).collect();
+    assert_eq!(sizes, [1, 2, 4, 8, 16, 32, 64, 128, 256, 489, 1000, 1000, 1000, 1000]);
+    for m in 1..5 * chunk {
+        let mut drained = 0;
+        for rows in drain_ramp(1, chunk) {
+            drained += rows;
+            if drained >= m {
+                break;
+            }
+        }
+        assert!(drained < 2 * m + 1, "m = {m}: drained {drained}");
+        assert!(drained <= m.next_multiple_of(chunk), "m = {m}: drained {drained}");
+    }
+    assert!(
+        drain_ramp(chunk, chunk).take(4).all(|rows| rows == chunk),
+        "an unwindowed drain stays flat"
+    );
+}

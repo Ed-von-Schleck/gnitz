@@ -81,6 +81,14 @@ impl CatalogEngine {
         self.fire_hooks(family, &applied)
     }
 
+    /// Apply a push to ingestion point `tid`'s store, and hold its effect for
+    /// `tid`'s next tick.
+    pub(crate) fn ingest_unticked(&mut self, tid: i64, batch: Batch) -> Result<(), StoreError> {
+        let effective = self.registry.ingest_returning(tid, batch)?;
+        self.dag.buffer_unticked(tid, effective);
+        Ok(())
+    }
+
     /// Apply one DdlSync group. Never queues.
     pub(crate) fn ddl_sync(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
         let family = SysFamily::from_id(table_id).ok_or_else(|| "ddl_sync only for system tables".to_string())?;
