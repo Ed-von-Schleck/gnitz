@@ -63,19 +63,15 @@ pub(super) fn run_queue_len() -> usize {
 
 /// An op installed with no SQE behind it, so its CQE is whatever a test feeds
 /// through [`cqe`]: its id and its awaiter.
-pub(super) fn bare_op(r: &Reactor, carry: Option<SendBody>) -> (u64, oneshot::Receiver<OpResult>) {
-    let rx = r.submit_op(|_, _| {}, carry);
-    (r.inner.next_op_id.get() - 1, rx)
+pub(super) fn bare_op(r: &Reactor, carry: Option<conn::Outbound>) -> (u64, oneshot::Receiver<OpResult>) {
+    let (u, rx) = r.install_op(carry);
+    (udata_id(u), rx)
 }
 
 /// Drive `dispatch_cqe` with a synthetic completion tagged `kind`/`id`,
 /// carrying `rc` — the ring completions a test cannot make the kernel produce.
 pub(super) fn cqe(r: &Reactor, kind: u64, id: u64, rc: i32) {
-    r.dispatch_cqe(super::uring::Cqe {
-        user_data: udata(kind, id),
-        res: rc,
-        flags: 0,
-    });
+    r.dispatch_cqe(udata(kind, id), rc, 0);
 }
 
 /// Future that returns Pending exactly once, then Ready.
@@ -154,11 +150,8 @@ pub(super) fn poll_until(r: &Reactor, max: usize, mut cond: impl FnMut() -> bool
     })
 }
 
-/// A real, owned fd to stand in for a listener. These tests only prep accept
-/// SQEs (never submitting them), so nothing but the caller touches the fd — it
-/// must merely be a number no parallel test owns.
-pub(super) fn fake_listener() -> i32 {
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-    assert!(fd >= 0, "socket");
-    fd
+/// A listening socket no peer connects to, so an accept submitted on it stays
+/// pending until the reactor drops.
+pub(super) fn fake_listener() -> OwnedFd {
+    OwnedFd::from(std::net::TcpListener::bind("127.0.0.1:0").expect("bind"))
 }

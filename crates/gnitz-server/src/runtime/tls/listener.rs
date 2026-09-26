@@ -22,14 +22,9 @@ pub(crate) struct TlsCli {
 }
 
 /// TLS listener runtime inputs, threaded into `ServerExecutor::run` (hence
-/// `pub(crate)`): the bound listener, the rustls config, and this listener's
-/// admission policy — how many peers it admits, and how long an admitted one may
-/// stay unauthenticated.
+/// `pub(crate)`): the rustls config, and this listener's admission policy — how
+/// many peers it admits, and how long an admitted one may stay unauthenticated.
 pub(crate) struct TlsListener {
-    /// Owned rather than a raw fd, so the descriptor is closed on every path
-    /// out of [`setup_tls_listener`] — the bound address is published across
-    /// two fallible steps after the bind.
-    listener: TcpListener,
     pub cfg: std::sync::Arc<rustls::ServerConfig>,
     /// How long an admitted peer may stay unauthenticated
     /// (`GNITZ_TLS_HELLO_TIMEOUT_MS`, default 15 000 ms): HELLO must arrive within
@@ -41,12 +36,6 @@ pub(crate) struct TlsListener {
 }
 
 impl TlsListener {
-    /// The listen fd, for the reactor's multishot accept and the accept loop's
-    /// which-listener test.
-    pub(crate) fn fd(&self) -> i32 {
-        self.listener.as_raw_fd()
-    }
-
     pub(crate) fn max_conns(&self) -> usize {
         self.live.cap()
     }
@@ -66,7 +55,7 @@ impl TlsListener {
 /// `--allow-unauthenticated` aborts boot — an unauthenticated public bind is
 /// impossible by accident. `--allow-unauthenticated` is the single, loud
 /// escape hatch; the CA enables required mTLS.
-pub(crate) fn setup_tls_listener(data_dir: &str, cli: &TlsCli) -> Result<TlsListener, String> {
+pub(crate) fn setup_tls_listener(data_dir: &str, cli: &TlsCli) -> Result<(TcpListener, TlsListener), String> {
     // `is_loopback()` is the conservative test: `0.0.0.0`/`::` (bind-all),
     // IPv4-mapped `::ffff:127.0.0.1`, and any specific LAN/link-local IP are
     // all non-loopback → refused unless a CA or the escape hatch is present.
@@ -123,13 +112,13 @@ pub(crate) fn setup_tls_listener(data_dir: &str, cli: &TlsCli) -> Result<TlsList
             bound,
         );
     }
-    Ok(TlsListener {
-        listener,
+    let tl = TlsListener {
         cfg: config,
         pre_auth_window: std::time::Duration::from_millis(gnitz_foundation::env::env_num(
             "GNITZ_TLS_HELLO_TIMEOUT_MS",
             15_000,
         )),
         live: Budget::new(cli.max_conns as usize),
-    })
+    };
+    Ok((listener, tl))
 }

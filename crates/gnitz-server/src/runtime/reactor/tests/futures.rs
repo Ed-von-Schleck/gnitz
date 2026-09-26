@@ -1,6 +1,7 @@
 //! The reactor's futures: timers, fsync, a train lease's frame stream, and the
 //! `ops` entry every one-CQE op waits on.
 
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::time::Duration;
 
 use super::super::test_support::*;
@@ -48,18 +49,20 @@ fn a_dropped_timer_leaves_no_deadline() {
     assert!(!is_queued(999), "a dropped timer must not wake its original waker");
 }
 
-/// Submitting fdatasync on an fd that is not in the process's fd
-/// table returns a negative rc (typically -EBADF) from the kernel.
-///
-/// Uses `i32::MAX` rather than `close(real_fd); submit(real_fd)` so
-/// the test is race-free under the parallel test runner — a freshly
-/// closed fd number can be reallocated by another thread before our
-/// SQE reaches the kernel, masking the expected EBADF.
+/// `fd`, open for the rest of the process, as `Reactor::fsync` requires.
+fn leaked(fd: OwnedFd) -> BorrowedFd<'static> {
+    let fd: &'static OwnedFd = Box::leak(Box::new(fd));
+    fd.as_fd()
+}
+
+/// A failed fdatasync resolves to the kernel's negative errno: a socket, which
+/// fdatasync refuses with `EINVAL`.
 #[test]
-fn fsync_real_bad_fd_returns_negative() {
+fn fsync_error_returns_negative() {
     let r = make_reactor();
-    let rc = r.block_on(r.fsync(i32::MAX));
-    assert!(rc < 0, "fdatasync on a bogus fd must return rc<0, got {rc}");
+    let (sock, _) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    let rc = r.block_on(r.fsync(leaked(OwnedFd::from(sock))));
+    assert_eq!(rc, -libc::EINVAL, "fdatasync on a socket must fail with EINVAL");
 }
 
 /// `fsync` flushes the SQE to the kernel before returning.
@@ -69,7 +72,9 @@ fn fsync_real_bad_fd_returns_negative() {
 fn fsync_submit_flushes_sqe_before_returning() {
     let r = make_reactor();
     let fd = unsafe { libc::memfd_create(c"reactor_fsync_flush".as_ptr(), libc::MFD_CLOEXEC) };
-    let mut fut = std::pin::pin!(r.fsync(fd));
+    assert!(fd >= 0, "memfd_create failed: {}", std::io::Error::last_os_error());
+    // SAFETY: a fresh fd, owned by nothing else.
+    let mut fut = std::pin::pin!(r.fsync(leaked(unsafe { OwnedFd::from_raw_fd(fd) })));
 
     // Spin briefly (driving no tick from outside) until the CQE arrives in the
     // ring or we time out. The kernel completes fdatasync on a memfd in
@@ -82,9 +87,6 @@ fn fsync_submit_flushes_sqe_before_returning() {
             got = Some(rc);
             break;
         }
-    }
-    unsafe {
-        libc::close(fd);
     }
     assert_eq!(
         got,

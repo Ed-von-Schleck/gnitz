@@ -3,7 +3,7 @@
 
 use std::io::Read;
 use std::io::Write;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
 use std::time::Duration;
 
 use super::super::test_support::*;
@@ -13,7 +13,7 @@ use crate::runtime::test_support::try_poll_once;
 use gnitz_store::storage::batch_pool::PooledSendBuf;
 
 /// One whole-payload client send, with nothing racing it.
-async fn owned_send(r: &Reactor, conn: &ClientConn, payload: Vec<u8>) -> Result<(), PeerGone> {
+async fn owned_send(r: &Reactor, conn: &Rc<ClientConn>, payload: Vec<u8>) -> Result<(), PeerGone> {
     r.send_owned(conn, SendBody::Pooled(PooledSendBuf(payload))).await
 }
 
@@ -22,6 +22,15 @@ fn pooled(bytes: &[u8]) -> PooledSendBuf {
     let mut b = gnitz_store::storage::batch_pool::acquire_buf();
     b.extend_from_slice(bytes);
     PooledSendBuf(b)
+}
+
+/// A send's carry: `body`, over a connection of its own.
+fn outbound(r: &Reactor, body: SendBody) -> Outbound {
+    let (local, _) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    Outbound {
+        _conn: r.client_conn(OwnedFd::from(local)),
+        body,
+    }
 }
 
 /// Everything readable on `fd` right now, without blocking.
@@ -61,7 +70,7 @@ fn ring_slot(pad: usize) -> (W2mReceiver, W2mSlot) {
 #[test]
 fn send_cqe_wakes_its_waker_and_returns_the_body() {
     let r = make_reactor();
-    let (id, mut fut) = bare_op(&r, Some(SendBody::Pooled(pooled(&[0xAB; 16]))));
+    let (id, mut fut) = bare_op(&r, Some(outbound(&r, SendBody::Pooled(pooled(&[0xAB; 16])))));
     let mut fut = Pin::new(&mut fut);
     let waker = make_waker(11);
     let mut cx = Context::from_waker(&waker);
@@ -73,7 +82,7 @@ fn send_cqe_wakes_its_waker_and_returns_the_body() {
         Poll::Ready((rc, body)) => {
             assert_eq!(rc, 16, "KIND_OP must deliver the CQE rc verbatim");
             assert_eq!(
-                body.expect("a send carries its body").bytes(),
+                body.expect("a send carries its body").body.bytes(),
                 &[0xAB; 16],
                 "and hand the body back"
             );
@@ -83,18 +92,21 @@ fn send_cqe_wakes_its_waker_and_returns_the_body() {
     assert_eq!(r.inner.ops.borrow().len(), 0, "a resolved send must retire its entry");
 }
 
-/// A dropped send keeps its body until the late CQE — a ring slot here, whose
-/// `release_cursor` shows when it drops.
+/// A dropped send keeps its connection and body until the late CQE — a ring slot
+/// here, whose `release_cursor` shows when it drops.
 #[test]
 fn dropped_send_future_keeps_its_body_until_the_cqe() {
     let (receiver, slot) = ring_slot(0);
     let held = receiver.release_cursor(0);
 
     let r = make_reactor();
-    let (id, mut fut) = bare_op(&r, Some(SendBody::Slot(slot)));
+    let out = outbound(&r, SendBody::Slot(slot));
+    let conn = Rc::clone(&out._conn);
+    let (id, mut fut) = bare_op(&r, Some(out));
     assert!(try_poll_once(&mut fut).is_none());
     drop(fut);
     assert_eq!(r.inner.ops.borrow().len(), 1, "drop must leave the entry to its CQE");
+    assert_eq!(Rc::strong_count(&conn), 2, "the entry holds the connection");
     assert_eq!(
         receiver.release_cursor(0),
         held,
@@ -104,6 +116,7 @@ fn dropped_send_future_keeps_its_body_until_the_cqe() {
     cqe(&r, KIND_OP, id, 64);
     assert_eq!(r.inner.ops.borrow().len(), 0, "the late CQE must retire the entry");
     assert!(receiver.release_cursor(0) > held, "and free the body");
+    assert_eq!(Rc::strong_count(&conn), 1, "and release the connection");
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -353,15 +366,13 @@ fn dispatch_accept_queues_successes_and_wakes_the_awaiter() {
         "nor queue anything for the awaiter"
     );
 
-    let accepted = fake_listener();
+    let accepted = fake_listener().into_raw_fd();
     cqe(&r, KIND_ACCEPT, 0, accepted);
     assert!(is_queued(42), "res>=0 must wake the parked accept future");
     match fut.as_mut().poll(&mut Context::from_waker(&waker)) {
         Poll::Ready(fd) => assert_eq!(fd.as_raw_fd(), accepted, "carrying the accepted fd"),
         Poll::Pending => panic!("a queued fd must resolve"),
     }
-
-    unsafe { libc::close(listener) };
 }
 
 /// fd exhaustion cancels a listener's multishot accept, and the re-arm is
@@ -392,10 +403,6 @@ fn both_listeners_rearm_after_an_fd_exhaustion_backoff() {
         r.inner.tasks.borrow().is_empty(),
         "both backoff tasks must fire and re-arm their listener"
     );
-    unsafe {
-        libc::close(a);
-        libc::close(b);
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────

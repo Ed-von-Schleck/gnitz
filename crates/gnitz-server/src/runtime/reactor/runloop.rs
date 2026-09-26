@@ -3,6 +3,9 @@
 //! waker vtable the wakes land in.
 
 use std::collections::VecDeque;
+use std::mem::MaybeUninit;
+
+use io_uring::cqueue;
 
 use super::*;
 
@@ -77,7 +80,7 @@ impl Reactor {
             self.inner.ring.borrow_mut().submit()
         };
         if let Err(e) = rc {
-            gnitz_error!("reactor: submit failed (errno={})", e);
+            gnitz_error!("reactor: submit failed: {e}");
         }
     }
 
@@ -119,30 +122,29 @@ impl Reactor {
     /// Drain all CQEs pending in the ring and route each through
     /// `dispatch_cqe` (op / futex / accept / recv).
     pub(super) fn drain_cqes_into_wakers(&self) {
-        let mut buf = [Cqe::default(); 64];
+        let mut buf = [const { MaybeUninit::<cqueue::Entry>::uninit() }; 64];
         loop {
-            let n = self.inner.ring.borrow_mut().drain_cqes(&mut buf);
-            for cqe in &buf[..n] {
-                self.dispatch_cqe(*cqe);
+            // `fill`'s slice borrows `buf`, not the ring, so dispatch can re-borrow it.
+            let cqes = self.inner.ring.borrow_mut().fill(&mut buf);
+            for e in cqes {
+                self.dispatch_cqe(e.user_data(), e.result(), e.flags());
             }
-            // A short read proves the ring is empty, so the usual single-batch
-            // tick costs one `drain_cqes` rather than two.
-            if n < buf.len() {
+            // A short read proves the ring is empty.
+            if cqes.len() < 64 {
                 break;
             }
         }
     }
 
-    pub(super) fn dispatch_cqe(&self, cqe: Cqe) {
-        let kind = udata_kind(cqe.user_data);
-        let id = udata_id(cqe.user_data);
-        match kind {
+    pub(super) fn dispatch_cqe(&self, user_data: u64, res: i32, flags: u32) {
+        let id = udata_id(user_data);
+        match udata_kind(user_data) {
             KIND_FUTEX_WAITV => {
                 // No drain here: the tick's own drain follows CQE dispatch.
-                if cqe.res == -libc::ENOSYS || cqe.res == -libc::EINVAL {
+                if res == -libc::ENOSYS || res == -libc::EINVAL {
                     gnitz_fatal_abort!(
                         "reactor: io_uring IORING_OP_FUTEX_WAITV unsupported (res={}); Linux 6.7+ required",
-                        cqe.res
+                        res
                     );
                 }
                 self.inner.futex_waitv_armed.set(false);
@@ -151,16 +153,12 @@ impl Reactor {
             KIND_OP => {
                 let op = self.inner.ops.borrow_mut().remove(&id);
                 if let Some(PendingOp { done, carry }) = op {
-                    done.send((cqe.res, carry));
+                    done.send((res, carry));
                 }
             }
-            KIND_ACCEPT => self.handle_accept_cqe(id as usize, cqe.res, cqe.flags),
-            KIND_RECV => self.handle_recv_cqe(id as i32, cqe.res),
-            _ => gnitz_error!(
-                "reactor: CQE with unknown kind={} (user_data={:#x})",
-                kind,
-                cqe.user_data
-            ),
+            KIND_ACCEPT => self.handle_accept_cqe(id as usize, res, flags),
+            KIND_RECV => self.handle_recv_cqe(id as i32, res),
+            kind => unreachable!("CQE kind {kind} (user_data={user_data:#x}) was never issued"),
         }
     }
 }

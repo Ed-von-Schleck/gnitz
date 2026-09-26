@@ -1,3 +1,4 @@
+use std::os::fd::BorrowedFd;
 use std::rc::Rc;
 
 use crate::catalog::CatalogEngine;
@@ -65,7 +66,8 @@ fn inert_dispatcher(worker_pids: Vec<i32>, catalog: *mut CatalogEngine) -> (Mast
     let region = SharedRegion::new(ANCHOR_BYTES + SAL_SIZE);
     // SAFETY: leaked below, so mapped for the rest of the process.
     let sal = unsafe { SalLog::new(region.ptr(), region.size()) };
-    let fd = region.fd();
+    // SAFETY: the region is leaked below, so its fd stays open for the process's life.
+    let fd = unsafe { BorrowedFd::borrow_raw(region.fd()) };
     region.leak();
     let disp = MasterDispatcher::new(
         worker_pids,

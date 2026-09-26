@@ -7,15 +7,17 @@ use std::cell::{Cell, RefCell};
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::Instant;
 
 use io_uring::types::FutexWaitV;
+use io_uring::{opcode, types};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use self::uring::{Cqe, IoUringRing};
+use self::uring::IoUringRing;
 
 use crate::runtime::w2m::{W2mReceiver, W2mSlot, BOOT_READY_REQUEST_ID, W2M_EXCHANGE_RING_ID};
 use crate::runtime::wire::DecodedWire;
@@ -85,10 +87,10 @@ impl Limits {
 // ---------------------------------------------------------------------------
 
 /// A one-shot op whose CQE lands in `ops`.
-const KIND_OP: u64 = 3;
-const KIND_FUTEX_WAITV: u64 = 4;
-const KIND_ACCEPT: u64 = 5;
-const KIND_RECV: u64 = 6;
+const KIND_OP: u64 = 1;
+const KIND_FUTEX_WAITV: u64 = 2;
+const KIND_ACCEPT: u64 = 3;
+const KIND_RECV: u64 = 4;
 
 const KIND_SHIFT: u64 = 56;
 const ID_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
@@ -125,8 +127,7 @@ type Task = Pin<Box<dyn Future<Output = ()>>>;
 /// Field order is drop order, and both ends of it are fixed; see `ring` and
 /// `w2m`.
 struct ReactorShared {
-    /// First, so it closes before the memory its SQEs point into is freed. Closing
-    /// only queues their cancellation: drop no reactor whose recv a peer can still feed.
+    /// First, so it drops before the memory its SQEs point into.
     ring: RefCell<IoUringRing>,
     /// Live tasks keyed by a monotonically-increasing id. A task's future may
     /// spawn during its own poll, so `poll_task` takes the future out and puts
@@ -142,7 +143,8 @@ struct ReactorShared {
     /// In-flight one-shot ops, by op id.
     ops: RefCell<FxHashMap<u64, PendingOp>>,
     /// The array the `FUTEX_WAITV` SQE is prepped over, one entry per worker
-    /// ring. The kernel copies it at submit, so it need not outlive the SQE.
+    /// ring. Read by the kernel when the SQE is submitted, which a failed submit
+    /// defers to a later tick; hence a field.
     futex_waitv: RefCell<Box<[FutexWaitV]>>,
     /// A `FUTEX_WAITV` SQE is outstanding. Cleared by its CQE.
     futex_waitv_armed: Cell<bool>,
@@ -173,13 +175,13 @@ struct ReactorShared {
 }
 
 /// A one-shot op's CQE `res` and what it carried.
-type OpResult = (i32, Option<SendBody>);
+type OpResult = (i32, Option<conn::Outbound>);
 
 /// A submitted op awaiting its CQE.
 struct PendingOp {
     done: oneshot::Sender<OpResult>,
-    /// Memory the kernel may read until the CQE.
-    carry: Option<SendBody>,
+    /// What the SQE names, held until the CQE.
+    carry: Option<conn::Outbound>,
 }
 
 impl ReactorShared {
@@ -278,45 +280,37 @@ impl Reactor {
                 return false;
             }
             if let Some(armed) = w2m.arm_waitv(&mut waitv) {
-                // SAFETY: the kernel copies the array at submit, and it lives in
-                // `futex_waitv` for the reactor's life regardless; every `uaddr`
-                // is a word of a W2M mapping that is never unmapped.
-                unsafe {
-                    self.inner.ring.borrow_mut().prep_futex_waitv(
-                        armed.as_ptr(),
-                        armed.len() as u32,
-                        udata(KIND_FUTEX_WAITV, 0),
-                    );
-                }
+                let sqe = opcode::FutexWaitV::new(armed.as_ptr(), armed.len() as u32).build();
+                // SAFETY: the array lives in `futex_waitv`, which drops after
+                // `ring`; every `uaddr` is a word of a never-unmapped W2M mapping.
+                unsafe { self.inner.ring.borrow_mut().push(sqe, udata(KIND_FUTEX_WAITV, 0)) };
                 self.inner.futex_waitv_armed.set(true);
                 return true;
             }
         }
     }
 
-    /// Queue one op SQE, prepped by `prep` under its `user_data`. `carry` lives
-    /// until the CQE, which resolves the receiver with it.
-    fn submit_op(
-        &self,
-        prep: impl FnOnce(&mut IoUringRing, u64),
-        carry: Option<SendBody>,
-    ) -> oneshot::Receiver<OpResult> {
+    /// Register a one-shot op holding `carry`: the `user_data` its SQE must carry,
+    /// and the receiver its CQE resolves.
+    fn install_op(&self, carry: Option<conn::Outbound>) -> (u64, oneshot::Receiver<OpResult>) {
         let id = self.inner.alloc_op_id();
-        prep(&mut self.inner.ring.borrow_mut(), udata(KIND_OP, id));
         let (done, rx) = oneshot::channel();
         self.inner.ops.borrow_mut().insert(id, PendingOp { done, carry });
-        rx
+        (udata(KIND_OP, id), rx)
     }
 
-    /// Submit an fdatasync and flush it to the kernel now, so it runs while the
-    /// caller works on. The future yields the CQE `res`: 0, or a negative errno.
-    pub fn fsync(&self, fd: i32) -> impl Future<Output = i32> {
-        let op = self.submit_op(|ring, u| ring.prep_fsync(fd, u), None);
-        if let Err(e) = self.inner.ring.borrow_mut().submit() {
-            gnitz_error!(
-                "reactor: fsync SQE submit failed (errno={}); it goes out with the next tick",
-                e
-            );
+    /// Queue an fdatasync of `fd` and submit it now, so it runs while the caller
+    /// works on. The future yields the CQE `res`: 0, or a negative errno.
+    pub(crate) fn fsync(&self, fd: BorrowedFd<'static>) -> impl Future<Output = i32> {
+        let (u, op) = self.install_op(None);
+        let sqe = opcode::Fsync::new(types::Fd(fd.as_raw_fd()))
+            .flags(types::FsyncFlags::DATASYNC)
+            .build();
+        let mut ring = self.inner.ring.borrow_mut();
+        // SAFETY: `fd` is open for the process's life; the SQE names no memory.
+        unsafe { ring.push(sqe, u) };
+        if let Err(e) = ring.submit() {
+            gnitz_error!("reactor: fsync SQE submit failed ({e}); it goes out with the next tick");
         }
         async move { op.await.0 }
     }

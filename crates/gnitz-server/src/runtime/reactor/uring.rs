@@ -1,24 +1,10 @@
-//! The reactor's thin io_uring wrapper: SQE preparation, submit and CQE drain.
-//!
-//! Every `prep_*` is pure. Memory the kernel reads after submit must be kept
-//! alive by the caller until the SQE's CQE.
+//! The reactor's io_uring wrapper: queue, submit, wait, drain.
 
+use std::mem::MaybeUninit;
 use std::time::Duration;
 
-use io_uring::{opcode, squeue, types, IoUring};
+use io_uring::{cqueue, squeue, types, IoUring};
 
-/// Completion queue entry — the reactor's owned copy of an io_uring CQE.
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct Cqe {
-    pub(super) user_data: u64,
-    pub(super) res: i32,
-    pub(super) flags: u32,
-}
-
-/// The reactor's io_uring submission/completion interface.
-///
-/// All `prep_*` methods are **infallible** — if the SQ is full, the
-/// implementation auto-flushes pending SQEs to the kernel.
 pub(super) struct IoUringRing {
     ring: IoUring,
 }
@@ -28,67 +14,36 @@ impl IoUringRing {
         Ok(IoUringRing { ring: IoUring::new(entries)? })
     }
 
-    /// Queue one SQE, flushing the pending batch first if the ring is full.
-    /// Infallible: the only way `push` can fail is a full SQ, which the flush
-    /// clears. A full SQ therefore never reaches a caller as backpressure — it
-    /// costs one extra `submit()` and is invisible above this line.
-    #[inline]
-    fn push(&mut self, entry: squeue::Entry) {
-        if self.ring.submission().is_full() {
-            let _ = self.ring.submit();
-        }
-        // SAFETY: every caller keeps the memory an SQE points at alive until
-        // its CQE is drained — see the module doc.
-        unsafe {
-            self.ring.submission().push(&entry).expect("SQ full after flush");
-        }
-    }
-
-    pub(super) fn prep_recv(&mut self, fd: i32, buf: *mut u8, len: u32, user_data: u64) {
-        self.push(opcode::Recv::new(types::Fd(fd), buf, len).build().user_data(user_data));
-    }
-
-    pub(super) fn prep_send(&mut self, fd: i32, buf: *const u8, len: u32, user_data: u64) {
-        self.push(opcode::Send::new(types::Fd(fd), buf, len).build().user_data(user_data));
-    }
-
-    pub(super) fn prep_accept(&mut self, fd: i32, user_data: u64) {
-        self.push(opcode::AcceptMulti::new(types::Fd(fd)).build().user_data(user_data));
-    }
-
-    /// Submit an `Fsync` op with the `DATASYNC` flag on `fd`. One-shot: a
-    /// single CQE carrying the fdatasync return code.
-    pub(super) fn prep_fsync(&mut self, fd: i32, user_data: u64) {
-        self.push(
-            opcode::Fsync::new(types::Fd(fd))
-                .flags(types::FsyncFlags::DATASYNC)
-                .build()
-                .user_data(user_data),
-        );
-    }
-
-    /// One-shot `FUTEX_WAITV` over `nr` entries.
+    /// Queue `sqe` under `user_data`, first flushing the pending batch if the SQ
+    /// is full.
+    ///
     /// # Safety
-    /// Each entry's `uaddr` must point at a live atomic shared with the producer.
-    pub(super) unsafe fn prep_futex_waitv(&mut self, futexv: *const types::FutexWaitV, nr: u32, user_data: u64) {
-        self.push(opcode::FutexWaitV::new(futexv, nr).build().user_data(user_data));
+    /// Every buffer and fd `sqe` names stays valid until its CQE, or until the ring
+    /// drops.
+    pub(super) unsafe fn push(&mut self, sqe: squeue::Entry, user_data: u64) {
+        if self.ring.submission().is_full() {
+            if let Err(e) = self.ring.submit() {
+                gnitz_fatal_abort!("reactor: io_uring submit with a full SQ failed: {e}");
+            }
+        }
+        // SAFETY: forwarded to the caller.
+        unsafe { self.ring.submission().push(&sqe.user_data(user_data)) }.expect("the flush emptied the SQ");
     }
 
-    /// Submit pending SQEs without waiting. No syscall when the SQ is empty. On
-    /// failure the SQEs stay queued for the next submit.
-    pub(super) fn submit(&mut self) -> Result<(), i32> {
-        if self.ring.submission().is_empty() {
+    /// Submit pending SQEs without waiting. No syscall when the SQ is empty and no
+    /// completion overflowed; on failure the SQEs stay queued.
+    pub(super) fn submit(&mut self) -> std::io::Result<()> {
+        let sq = self.ring.submission();
+        if sq.is_empty() && !sq.cq_overflow() {
             return Ok(());
         }
-        self.ring
-            .submit()
-            .map(|_| ())
-            .map_err(|e| e.raw_os_error().unwrap_or(-1))
+        drop(sq);
+        self.ring.submit().map(drop)
     }
 
-    /// Submit pending SQEs and wait for one CQE, for at most `timeout` when one
-    /// is given. An expired timeout or a signal is not an error.
-    pub(super) fn wait(&mut self, timeout: Option<Duration>) -> Result<(), i32> {
+    /// Submit pending SQEs and wait for one CQE, for at most `timeout`. An expired
+    /// timeout or a signal is not an error.
+    pub(super) fn wait(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
         let rc = match timeout {
             None => self.ring.submitter().submit_and_wait(1),
             Some(d) => {
@@ -98,28 +53,25 @@ impl IoUringRing {
             }
         };
         match rc {
-            Ok(_) => Ok(()),
-            Err(e) if matches!(e.raw_os_error(), Some(libc::ETIME | libc::EINTR)) => Ok(()),
-            Err(e) => Err(e.raw_os_error().unwrap_or(-1)),
+            Err(e) if !matches!(e.raw_os_error(), Some(libc::ETIME | libc::EINTR)) => Err(e),
+            _ => Ok(()),
         }
     }
 
-    /// Drain up to `out.len()` completed CQEs into `out`, returning how many
-    /// were written. Reads the memory-mapped completion ring — no syscall.
-    ///
-    /// `take` bounds the iterator rather than breaking inside the loop:
-    /// `CompletionQueue::next` pops the entry and advances the ring head, so a
-    /// break *after* it has yielded discards that completion permanently.
-    pub(super) fn drain_cqes(&mut self, out: &mut [Cqe]) -> usize {
-        let mut count = 0;
-        for cqe in self.ring.completion().take(out.len()) {
-            out[count] = Cqe {
-                user_data: cqe.user_data(),
-                res: cqe.result(),
-                flags: cqe.flags(),
-            };
-            count += 1;
-        }
-        count
+    /// Pop up to `buf.len()` completed CQEs. No syscall.
+    pub(super) fn fill<'a>(&mut self, buf: &'a mut [MaybeUninit<cqueue::Entry>]) -> &'a [cqueue::Entry] {
+        self.ring.completion().fill(buf)
+    }
+}
+
+impl Drop for IoUringRing {
+    /// Cancel every submitted op. One already running in the kernel's worker pool
+    /// (an fsync) runs on, and names no memory.
+    fn drop(&mut self) {
+        // NotFound when nothing is in flight.
+        let _ = self
+            .ring
+            .submitter()
+            .register_sync_cancel(None, types::CancelBuilder::any());
     }
 }

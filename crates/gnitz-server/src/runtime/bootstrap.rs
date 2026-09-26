@@ -7,6 +7,7 @@
 //! point rebuilds a view rather than silently resuming a stale one.
 
 use std::ops::Range;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, UnreplayedCatalog};
@@ -263,7 +264,7 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli:
 /// Nothing here is reclaimed on error: the only response to a failed boot is to
 /// exit the process, which returns all of it to the kernel.
 struct SharedIpc {
-    sal_fd: i32,
+    sal_fd: BorrowedFd<'static>,
     sal: SalLog,
     /// The committed tail every recovery replays, and the epoch the next writer
     /// epoch starts above. Read once with the mapping, before the fork.
@@ -275,7 +276,7 @@ struct SharedIpc {
 fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
     // A fresh SAL file reads all-zero through O_CREAT + fallocate, which is
     // exactly the empty-SAL state recovery expects.
-    let sal_fd = {
+    let sal_file = {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .read(true)
@@ -284,13 +285,15 @@ fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
             .truncate(false)
             .mode(0o644)
             .open(format!("{data_dir}/wal.sal"))
-            .map(std::os::fd::IntoRawFd::into_raw_fd)
             .map_err(|e| format!("failed to open SAL file: {e}"))?
     };
+    // Leaked: the writer and the reactor's fsync SQEs name it for the process's life.
+    let sal_file: &'static std::fs::File = Box::leak(Box::new(sal_file));
+    let sal_fd = sal_file.as_fd();
     // The SAL is a real file, and reserving its blocks now is what keeps a later
     // write from failing for want of disk space.
     let sal_len = sal_mmap_size();
-    let sal_ptr = posix_io::map_file_reserved(sal_fd, sal_len)
+    let sal_ptr = posix_io::map_file_reserved(sal_fd.as_raw_fd(), sal_len)
         .map_err(|e| format!("failed to map SAL ({sal_len} bytes): {e}"))?;
     // SAFETY: the mapping above is `sal_len` bytes and outlives the process.
     let sal = unsafe { SalLog::new(sal_ptr, sal_len) };
@@ -505,7 +508,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
     gnitz_note!("Worker logs: {}/worker_N.log (N=0..{})", data_dir, num_workers - 1);
 
     let ipc = acquire_shared_ipc(data_dir, nw)?;
-    gnitz_debug!("SAL fd={}", ipc.sal_fd);
+    gnitz_debug!("SAL fd={}", ipc.sal_fd.as_raw_fd());
 
     stage_system_tail(ipc.tail, &mut opened)?;
     let catalog = opened.replay().map_err(|e| format!("failed to replay catalog: {e}"))?;
@@ -561,7 +564,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
     let server_fd = std::os::unix::net::UnixListener::bind(socket_path)
         .and_then(|l| {
             l.set_nonblocking(true)?;
-            Ok(std::os::fd::IntoRawFd::into_raw_fd(l))
+            Ok(OwnedFd::from(l))
         })
         .map_err(|e| format!("failed to create server socket: {e}"))?;
 

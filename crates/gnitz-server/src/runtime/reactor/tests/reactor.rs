@@ -315,3 +315,39 @@ fn arm_waitv_refuses_while_data_is_unread() {
         "an unread publish must refuse the arm — arming it would be a lost wake",
     );
 }
+
+/// A publish on a ring past the first wakes a reactor parked on all of them: the
+/// child answers on ring 0, waits until the reactor parks, then answers on ring 1.
+#[test]
+fn a_publish_on_a_later_ring_wakes_the_reactor() {
+    use crate::runtime::w2m::fixtures::{master_parked, test_ring};
+    use crate::runtime::w2m::W2mWriter;
+
+    const TIMEOUT: Duration = Duration::from_secs(30);
+
+    let r0 = unsafe { test_ring(64 * 1024) }.leak();
+    let r1 = unsafe { test_ring(64 * 1024) }.leak();
+
+    let child = || {
+        W2mWriter::new(r0).send_status(0, 1, WireStatus::Ok, &[]);
+        let deadline = Instant::now() + TIMEOUT;
+        while !unsafe { master_parked(r1) } {
+            assert!(Instant::now() < deadline, "the reactor never parked on ring 1");
+            std::thread::yield_now();
+        }
+        W2mWriter::new(r1).send_status(0, 1, WireStatus::Ok, &[]);
+    };
+    let pid = unsafe { fork_child(child) };
+
+    let r = Rc::new(make_reactor_over(W2mReceiver::new(vec![r0, r1])));
+    // Request id 1 is a fresh reactor's first.
+    let lease = r.lease_acks(1, "later ring");
+    let r2 = Rc::clone(&r);
+    let out = r.block_on(async move { select2(lease.acks(), r2.timer(Instant::now() + TIMEOUT)).await });
+    if let Either::B(()) = out {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        panic!("reactor stalled after {TIMEOUT:?}: ring 1's wake never reached it");
+    }
+    assert!(matches!(out, Either::A(Ok(()))), "both ACKs are OK");
+    unsafe { crate::runtime::test_support::assert_child_exited_ok(pid) };
+}

@@ -20,20 +20,13 @@
 //!
 //! Each side parks on the cursor whose advance is the condition it waits for:
 //! the worker on `release_cursor` (space freed), the master on `write_cursor`
-//! (a message published). [`ParkWord`] pairs each cursor with its own park flags
-//! and is the only way to reach either, so the read-modify-writes the protocol
-//! needs cannot be written any other way.
+//! (a message published). `sal_park` is the reverse channel's: the worker sleeps
+//! on it for a SAL group, and the master's [`SalWake`] ends the sleep.
 //!
-//! `sal_park` is the reverse channel's: the worker sleeps on it for a SAL group,
-//! and the master's [`SalWake`] ends the sleep.
-//!
-//! Who *clears* a flag differs by direction, and that asymmetry is load-bearing.
-//! [`wake_master`] takes the gate, so the publishes that follow until the master
-//! re-arms skip the syscall: a master parks only when the ring reads empty, so
-//! any publish after its snapshot fails the futex value-compare and returns
-//! without a wake. [`wake_writer`] must not — the writer waits for *enough
-//! room*, which a later retirement may be the first to give, so a bit cleared on
-//! its behalf is a wake nobody issues and a permanent hang.
+//! The master's armed bit lives in the `write_cursor` word ([`MasterPark`]), so a
+//! publish's `swap` takes it exactly when the master armed first. The writer's
+//! flag sits beside its cursor ([`ParkWord`]) and only the writer clears it: it
+//! waits for *enough* room, which a later retirement may be the first to give.
 
 use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
@@ -127,34 +120,22 @@ fn unpack_prefix(prefix: u64) -> (u32, u32) {
     ((prefix >> 32) as u32, prefix as u32)
 }
 
-/// Set by the worker while parked on `release_cursor`; cleared by the worker
-/// once its wait returns. The master reads it before spending a `FUTEX_WAKE`.
+/// The worker is parked on `release_cursor`.
 const FLAG_WRITER_PARKED: u32 = 1 << 0;
-/// Set by the reactor while its `FUTEX_WAITV` SQE is armed on `write_cursor` —
-/// the master's one park, and the worker's publish gate, taken by [`wake_master`].
-const FLAG_MASTER_WAITV: u32 = 1 << 1;
-/// Set by the worker while parked on `sal_park` for a SAL group; set and
-/// cleared by the worker only.
-const FLAG_SAL_PARKED: u32 = 1 << 2;
+/// The worker is parked on `sal_park` for a SAL group.
+const FLAG_SAL_PARKED: u32 = 1 << 1;
+/// Bit 63 of the `write_cursor` word: the reactor's `FUTEX_WAITV` is armed on
+/// it. Outside the low half the futex compares.
+const MASTER_ARMED: u64 = 1 << 63;
 
 // ---------------------------------------------------------------------------
 // Header layout (128 bytes, one cache line per writer)
 // ---------------------------------------------------------------------------
 
-/// One side's park: the cursor it sleeps on and the flags saying it is asleep.
-///
-/// Pairing them is what makes the protocol's ordering unwritable-wrong: nothing
-/// touches the flags except the three methods below, each of which does its
-/// locked read-modify-write *first*. [`Self::publish`] cannot hand back flags it
-/// did not read behind a `swap`, and [`Self::arm`] cannot hand back a cursor it
-/// did not read behind a `fetch_or`.
-///
-/// Both RMWs are load-bearing. Drop either and the store-buffer race is real:
-/// the peer reads a stale-clear flag and skips the wake while the parker reads a
-/// stale cursor and parks. A fence on one side does not help — it drains that
-/// side's store buffer, not the other's — and neither does the futex
-/// value-compare, which is a plain kernel read that a still-buffered store makes
-/// match spuriously.
+/// A park whose flags only the parker clears: the cursor it sleeps on and the
+/// flags saying it is asleep. Each side's read of the other's word sits behind
+/// its own RMW, so the peer cannot read a stale-clear flag while the parker
+/// reads a stale cursor.
 #[repr(C)]
 struct ParkWord {
     cursor: AtomicU64,
@@ -186,16 +167,68 @@ impl ParkWord {
     fn disarm(&self, bits: u32) {
         self.flags.fetch_and(!bits, Ordering::AcqRel);
     }
+
+    /// Publish `flag`, then sleep until a wake unless `still_waiting`, tested behind
+    /// that barrier, says otherwise. Disarms either way.
+    fn park(&self, flag: u32, site: &str, still_waiting: impl FnOnce() -> bool) {
+        let snap = self.arm(flag);
+        if still_waiting() {
+            futex_wait_u32(futex_word(&self.cursor), snap as u32, site);
+        }
+        self.disarm(flag);
+    }
 }
 
-/// Cross-process ring state, one cache line per writing side. Each [`ParkWord`]
-/// therefore sits on the line its own **clearer** already dirties, so taking or
-/// releasing a gate rides a coherence transaction that side was making anyway.
+/// The master's park on `write_cursor`, whose word also carries [`MASTER_ARMED`].
+#[repr(C)]
+struct MasterPark {
+    word: AtomicU64,
+    _pad: u64,
+}
+
+impl MasterPark {
+    #[inline]
+    fn cursor(&self) -> u64 {
+        self.word.load(Ordering::Acquire) & !MASTER_ARMED
+    }
+
+    /// Arm, returning the cursor the arm was taken at.
+    #[inline]
+    fn arm(&self) -> u64 {
+        self.word.fetch_or(MASTER_ARMED, Ordering::AcqRel) & !MASTER_ARMED
+    }
+
+    #[inline]
+    fn disarm(&self) {
+        self.word.fetch_and(!MASTER_ARMED, Ordering::AcqRel);
+    }
+
+    /// Publish `virt`, waking the master iff it armed before this publish. The
+    /// swap takes the arm, so later publishes spend no syscall until a re-arm.
+    #[inline]
+    fn publish(&self, virt: u64) {
+        debug_assert_eq!(virt & MASTER_ARMED, 0, "a cursor reached the armed bit");
+        if self.word.swap(virt, Ordering::AcqRel) & MASTER_ARMED != 0 {
+            futex_wake_u32(self.futex_word(), 1, "MasterPark::publish");
+        }
+    }
+
+    #[inline]
+    fn futex_word(&self) -> *const AtomicU32 {
+        futex_word(&self.word)
+    }
+
+    #[cfg(test)]
+    fn armed(&self) -> bool {
+        self.word.load(Ordering::Acquire) & MASTER_ARMED != 0
+    }
+}
+
+/// Cross-process ring state, one cache line per writing side.
 ///
 /// ```text
 /// line A — worker writes, master reads
-///    0   master_park.cursor   write_cursor: the message boundary
-///    8   master_park.flags    FLAG_MASTER_*, cleared by a publish
+///    0   master_park.word     write_cursor: the message boundary, | MASTER_ARMED
 /// line B — master writes, worker reads
 ///   64   writer_park.cursor   release_cursor: the reusable-bytes boundary
 ///   72   writer_park.flags    FLAG_WRITER_PARKED, cleared by the worker
@@ -205,7 +238,7 @@ impl ParkWord {
 /// ```
 #[repr(C, align(64))]
 struct W2mRingHeader {
-    master_park: ParkWord,
+    master_park: MasterPark,
     _pad_producer: [u8; 48],
 
     writer_park: ParkWord,
@@ -218,8 +251,7 @@ const _: () = assert!(std::mem::size_of::<W2mRingHeader>() == W2M_HEADER_SIZE);
 const _: () = assert!(std::mem::align_of::<W2mRingHeader>() == 64);
 // The layout above, asserted rather than described: each park whole inside one
 // line, and nothing else sharing the producer's.
-const _: () = assert!(std::mem::offset_of!(W2mRingHeader, master_park.cursor) == 0);
-const _: () = assert!(std::mem::offset_of!(W2mRingHeader, master_park.flags) == 8);
+const _: () = assert!(std::mem::offset_of!(W2mRingHeader, master_park.word) == 0);
 const _: () = assert!(std::mem::offset_of!(W2mRingHeader, writer_park.cursor) == 64);
 const _: () = assert!(std::mem::offset_of!(W2mRingHeader, writer_park.flags) == 72);
 const _: () = assert!(std::mem::offset_of!(W2mRingHeader, capacity) == 80);
@@ -263,10 +295,7 @@ impl RingCursor {
     /// # Safety
     /// `base` must be a live region initialized by [`init_region`].
     unsafe fn producer(base: *mut u8) -> Self {
-        Self::seed(
-            base,
-            W2mRingHeader::from_raw(base).master_park.cursor.load(Ordering::Acquire),
-        )
+        Self::seed(base, W2mRingHeader::from_raw(base).master_park.cursor())
     }
 
     /// The master's read cursor over the ring at `base`, seeded from
@@ -361,7 +390,7 @@ const FUTEX2_SIZE_U32: u32 = 2;
 
 /// One `futex_waitv` entry: sleep on `word` while it still reads `expected`.
 #[inline]
-pub(crate) fn futex_waitv_entry(word: *const AtomicU32, expected: u32) -> FutexWaitV {
+fn futex_waitv_entry(word: *const AtomicU32, expected: u32) -> FutexWaitV {
     FutexWaitV::new()
         .val(expected as u64)
         .uaddr(word as u64)
@@ -373,36 +402,6 @@ pub(crate) fn futex_waitv_entry(word: *const AtomicU32, expected: u32) -> FutexW
 #[inline]
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-}
-
-/// How a futex park ended. The wrappers below classify errno here, where it is
-/// still fresh, so no caller has to know which errnos the protocol tolerates.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Parked {
-    /// Woken, the value had already moved, or a signal cut the wait short — all
-    /// the same instruction to the caller: re-read the ring, which is
-    /// authoritative.
-    Retry,
-    /// The timeout elapsed with no wake.
-    TimedOut,
-    /// A failure the protocol has no answer to. Carries the errno.
-    Failed(i32),
-}
-
-impl Parked {
-    /// Classify a futex syscall's return, reading errno once, here.
-    #[inline]
-    fn from_rc(rc: i32) -> Parked {
-        if rc >= 0 {
-            return Parked::Retry;
-        }
-        let errno = errno();
-        match errno {
-            libc::EAGAIN | libc::EINTR => Parked::Retry,
-            libc::ETIMEDOUT => Parked::TimedOut,
-            _ => Parked::Failed(errno),
-        }
-    }
 }
 
 /// Wake at most `n_waiters` waiters parked on `ptr` (v1 `FUTEX_WAKE`, no
@@ -427,38 +426,27 @@ fn futex_wake_u32(ptr: *const AtomicU32, n_waiters: u32, site: &str) {
     }
 }
 
-/// Wait on one or more futex words (`SYS_futex_waitv`), returning when ANY
-/// differs from its expected value or is woken; `timeout_ms < 0` blocks forever.
-fn futex_waitv_u32(waiters: &[FutexWaitV], timeout_ms: i32) -> Parked {
-    if waiters.is_empty() {
-        return Parked::Retry;
-    }
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    let ts_ptr: *const libc::timespec = if timeout_ms < 0 {
-        std::ptr::null()
-    } else {
-        // `futex_waitv` takes an ABSOLUTE `CLOCK_MONOTONIC` deadline.
-        unsafe {
-            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
-        }
-        ts.tv_sec += (timeout_ms as i64) / 1000;
-        ts.tv_nsec += ((timeout_ms as i64) % 1000) * 1_000_000;
-        if ts.tv_nsec >= 1_000_000_000 {
-            ts.tv_sec += 1;
-            ts.tv_nsec -= 1_000_000_000;
-        }
-        &ts
-    };
-    Parked::from_rc(unsafe {
+/// Sleep on `word` while it reads `expected` (v1 `FUTEX_WAIT`, no
+/// `FUTEX_PRIVATE_FLAG` — W2M is shared). A wake, a moved value and a signal all
+/// return; anything else aborts.
+fn futex_wait_u32(word: *const AtomicU32, expected: u32, site: &str) {
+    let rc = unsafe {
         libc::syscall(
-            libc::SYS_futex_waitv,
-            waiters.as_ptr(),
-            waiters.len() as libc::c_uint,
-            0u32, // flags
-            ts_ptr,
-            libc::CLOCK_MONOTONIC,
+            libc::SYS_futex,
+            word as *const libc::c_void,
+            libc::FUTEX_WAIT,
+            expected as libc::c_int,
+            std::ptr::null::<libc::timespec>(),
+            std::ptr::null::<u32>(),
+            0u32,
         ) as i32
-    })
+    };
+    if rc < 0 {
+        let e = errno();
+        if e != libc::EAGAIN && e != libc::EINTR {
+            futex_failed(site, e);
+        }
+    }
 }
 
 /// Outlined so `site` is not spilled onto the stack on the paths that never
@@ -470,27 +458,12 @@ fn futex_failed(site: &str, errno: i32) -> ! {
 }
 
 /// Master→worker, given the flags a retirement's [`ParkWord::publish`] returned.
-///
-/// Leaves `FLAG_WRITER_PARKED` set — see the module docs: only the writer may
-/// clear it.
 #[inline]
 fn wake_writer(park: &ParkWord, flags: u32) {
     if flags & FLAG_WRITER_PARKED == 0 {
         return;
     }
     futex_wake_u32(futex_word(&park.cursor), 1, "wake_writer");
-}
-
-/// Worker→master, given the flags a publish's [`ParkWord::publish`] returned.
-/// Takes the gate, so the publishes that follow until the master re-arms skip
-/// the syscall.
-#[inline]
-fn wake_master(park: &ParkWord, flags: u32) {
-    if flags & FLAG_MASTER_WAITV == 0 {
-        return;
-    }
-    park.disarm(FLAG_MASTER_WAITV);
-    futex_wake_u32(futex_word(&park.cursor), 1, "wake_master");
 }
 
 // ---------------------------------------------------------------------------
@@ -529,14 +502,7 @@ impl SalPark {
     /// Sleep until the master's next wake, unless `still_empty` says otherwise.
     /// No timeout: `PR_SET_PDEATHSIG` kills the worker when the master dies.
     pub(crate) fn park(&self, still_empty: impl FnOnce() -> bool) {
-        let snap = self.park.arm(FLAG_SAL_PARKED);
-        if still_empty() {
-            let entry = futex_waitv_entry(futex_word(&self.park.cursor), snap as u32);
-            if let Parked::Failed(errno) = futex_waitv_u32(&[entry], -1) {
-                futex_failed("SalPark::park", errno);
-            }
-        }
-        self.park.disarm(FLAG_SAL_PARKED);
+        self.park.park(FLAG_SAL_PARKED, "SalPark::park", still_empty);
     }
 }
 
@@ -583,7 +549,7 @@ unsafe fn init_region(ptr: *mut u8, capacity: u64) {
     std::ptr::write_bytes(ptr, 0, W2M_HEADER_SIZE);
     let hdr = W2mRingHeader::from_raw(ptr);
     hdr.capacity.store(capacity, Ordering::Relaxed);
-    hdr.master_park.cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
+    hdr.master_park.word.store(W2M_HEADER_SIZE as u64, Ordering::Release);
     hdr.writer_park.cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
 }
 
@@ -675,16 +641,14 @@ unsafe fn try_reserve(wc: &RingCursor, sz: usize, internal_req_id: u32) -> Optio
 /// written since.
 unsafe fn commit(wc: &mut RingCursor, r: Reservation) {
     wc.advance(r.delta);
-    let park = &wc.header().master_park;
-    wake_master(park, park.publish(wc.virt));
+    wc.header().master_park.publish(wc.virt);
 }
 
 // ---------------------------------------------------------------------------
 // W2mWriter — the worker's write side
 // ---------------------------------------------------------------------------
 
-/// The full-ring path: publish `FLAG_WRITER_PARKED`, re-test below that barrier,
-/// then sleep on `release_cursor` until the master retires a slot.
+/// The full-ring path: park on `release_cursor` until a retirement makes room.
 ///
 /// # Safety
 /// The caller must be the sole producer on `wc`'s ring.
@@ -693,15 +657,11 @@ unsafe fn commit(wc: &mut RingCursor, r: Reservation) {
 unsafe fn park_for_room(wc: &RingCursor, sz: usize, req: u32) -> Reservation {
     let park = &wc.header().writer_park;
     loop {
-        let vrel = park.arm(FLAG_WRITER_PARKED);
-        let reserved = try_reserve(wc, sz, req);
-        if reserved.is_none() {
-            let entry = futex_waitv_entry(futex_word(&park.cursor), vrel as u32);
-            if let Parked::Failed(errno) = futex_waitv_u32(&[entry], -1) {
-                futex_failed("W2mWriter::park_for_room", errno);
-            }
-        }
-        park.disarm(FLAG_WRITER_PARKED);
+        let mut reserved = None;
+        park.park(FLAG_WRITER_PARKED, "W2mWriter::park_for_room", || {
+            reserved = try_reserve(wc, sz, req);
+            reserved.is_none()
+        });
         if let Some(r) = reserved {
             return r;
         }
@@ -927,7 +887,7 @@ impl WorkerRing {
         let state = self.in_flight.get();
         let st = &mut *state;
         let base: *const u8 = st.read.base;
-        let vwc = self.hdr.master_park.cursor.load(Ordering::Acquire);
+        let vwc = self.hdr.master_park.cursor();
         debug_assert!(
             st.read.virt <= vwc,
             "read cursor {} ahead of write cursor {vwc}",
@@ -1015,21 +975,20 @@ impl W2mReceiver {
     pub fn arm_waitv<'a>(&self, out: &'a mut [FutexWaitV]) -> Option<&'a [FutexWaitV]> {
         for (w, ring) in self.rings.iter().enumerate() {
             let park = &ring.hdr.master_park;
-            let vwc = park.arm(FLAG_MASTER_WAITV);
+            let vwc = park.arm();
             if vwc != ring.read_cursor() {
                 self.clear_waitv();
                 return None;
             }
-            out[w] = futex_waitv_entry(futex_word(&park.cursor), vwc as u32);
+            out[w] = futex_waitv_entry(park.futex_word(), vwc as u32);
         }
         Some(&out[..self.rings.len()])
     }
 
-    /// Drop the reactor's park. The flag is also cleared by any worker's publish,
-    /// so this only has to cover the rings no publish reached.
+    /// Drop the reactor's park on the rings no publish has taken it from.
     pub fn clear_waitv(&self) {
         for ring in self.rings.iter() {
-            ring.hdr.master_park.disarm(FLAG_MASTER_WAITV);
+            ring.hdr.master_park.disarm();
         }
     }
 
@@ -1051,7 +1010,7 @@ impl W2mReceiver {
     /// The worker's published boundary: everything below it is readable.
     #[cfg(test)]
     pub(crate) fn write_cursor(&self, worker: usize) -> u64 {
-        self.rings[worker].hdr.master_park.cursor.load(Ordering::Acquire)
+        self.rings[worker].hdr.master_park.cursor()
     }
 
     /// The master-local read cursor for `worker`.

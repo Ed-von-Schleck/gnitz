@@ -13,7 +13,8 @@
 mod ddl;
 
 use std::cell::{Cell, RefCell};
-use std::os::fd::AsRawFd;
+use std::net::TcpListener;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -339,13 +340,12 @@ pub struct ServerExecutor;
 
 impl ServerExecutor {
     /// `tls` is the optional TLS listener bootstrap from `server_main`:
-    /// the bound TCP listen fd, the rustls server configuration, and the
-    /// global live-connection cap.
+    /// the bound TCP listener, and its rustls configuration and admission policy.
     pub fn run(
         dispatcher: Rc<MasterDispatcher>,
         data_dir: &str,
-        server_fd: i32,
-        tls: Option<TlsListener>,
+        server_fd: OwnedFd,
+        tls: Option<(TcpListener, TlsListener)>,
         lsn_seed: u64,
     ) -> i32 {
         let reactor = Rc::clone(dispatcher.reactor());
@@ -379,8 +379,8 @@ impl ServerExecutor {
 
         reactor.spawn(committer::run(committer_rx, Rc::clone(&shared)));
         reactor.spawn(unix_accept_loop(Rc::clone(&shared), server_fd));
-        if let Some(tl) = tls {
-            reactor.spawn(tls_accept_loop(Rc::clone(&shared), tl));
+        if let Some((listener, tl)) = tls {
+            reactor.spawn(tls_accept_loop(Rc::clone(&shared), listener, tl));
         }
         reactor.spawn(tick_loop(Rc::clone(&shared), tick_rx));
         reactor.spawn(watchdog(Rc::clone(&shared)));
@@ -400,7 +400,7 @@ impl ServerExecutor {
 // Accept loop
 // ---------------------------------------------------------------------------
 
-async fn unix_accept_loop(shared: Rc<Shared>, listen_fd: i32) {
+async fn unix_accept_loop(shared: Rc<Shared>, listen_fd: OwnedFd) {
     let mut accepted = shared.disp().reactor().attach_listener(listen_fd);
     loop {
         let fd = accepted.recv().await;
@@ -413,8 +413,8 @@ async fn unix_accept_loop(shared: Rc<Shared>, listen_fd: i32) {
     }
 }
 
-async fn tls_accept_loop(shared: Rc<Shared>, tl: TlsListener) {
-    let mut accepted = shared.disp().reactor().attach_listener(tl.fd());
+async fn tls_accept_loop(shared: Rc<Shared>, listener: TcpListener, tl: TlsListener) {
+    let mut accepted = shared.disp().reactor().attach_listener(OwnedFd::from(listener));
     loop {
         let fd = accepted.recv().await;
         let raw = fd.as_raw_fd();
@@ -532,10 +532,7 @@ extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
 }
 
 /// Install async-signal-safe handlers for SIGTERM and SIGINT. The handler only
-/// flips `SHUTDOWN_REQUESTED`; all real work happens on the reactor thread in
-/// `watchdog`. `SA_RESTART` lets an interrupted `io_uring_enter` restart
-/// itself, so the signal never surfaces an EINTR error to the reactor — the
-/// watchdog's 100 ms timer picks up the flag.
+/// flips `SHUTDOWN_REQUESTED`; the watchdog's timer picks it up.
 fn install_shutdown_signal_handlers() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
@@ -552,8 +549,7 @@ fn install_shutdown_signal_handlers() {
 /// on SIGTERM/SIGINT — stop admitting pushes, run one final full checkpoint
 /// through the committer (drain + persist while the reactor is still live),
 /// then broadcast Shutdown and request reactor shutdown so `server_main`
-/// exits cleanly. A signalfd fd-await would need new reactor machinery; the
-/// timer poll is the established pattern.
+/// exits cleanly.
 async fn watchdog(shared: Rc<Shared>) {
     loop {
         shared.disp().reactor().timer(Instant::now() + WORKER_WATCH).await;

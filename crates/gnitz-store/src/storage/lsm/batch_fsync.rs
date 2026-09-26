@@ -5,6 +5,7 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::LazyLock;
 
 use io_uring::types::FsyncFlags;
 use io_uring::{opcode, types, IoUring};
@@ -16,13 +17,15 @@ const FD_CHUNK_THRESHOLD: usize = 256;
 
 const DATASYNC: FsyncFlags = FsyncFlags::DATASYNC;
 
-/// Set once this host has denied `io_uring_setup`.
-static IO_URING_DENIED: AtomicBool = AtomicBool::new(false);
+/// Blocking fsync instead of io_uring: `GNITZ_DISABLE_IO_URING`, read once per
+/// process, or a host that denied `io_uring_setup`.
+static BLOCKING: LazyLock<AtomicBool> =
+    LazyLock::new(|| AtomicBool::new(gnitz_foundation::env::env_flag("GNITZ_DISABLE_IO_URING", false)));
 
 /// The ring, or `None` for blocking fsync: where this host denies io_uring, or
 /// `GNITZ_DISABLE_IO_URING` is set.
 pub(super) fn new_ring() -> Result<Option<IoUring>, StorageError> {
-    if IO_URING_DENIED.load(Relaxed) || gnitz_foundation::env::env_flag("GNITZ_DISABLE_IO_URING", false) {
+    if BLOCKING.load(Relaxed) {
         return Ok(None);
     }
     match IoUring::new(FD_CHUNK_THRESHOLD as u32) {
@@ -30,7 +33,7 @@ pub(super) fn new_ring() -> Result<Option<IoUring>, StorageError> {
         // Docker's default seccomp profile and `kernel.io_uring_disabled=2` report one of these.
         Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM | libc::EACCES)) => {
             gnitz_warn!("io_uring unavailable ({e}); flushing through blocking fsync");
-            IO_URING_DENIED.store(true, Relaxed);
+            BLOCKING.store(true, Relaxed);
             Ok(None)
         }
         Err(e) => Err(e.into()),

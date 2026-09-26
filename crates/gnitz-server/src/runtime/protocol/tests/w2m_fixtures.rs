@@ -32,3 +32,11 @@ pub(crate) unsafe fn make_ring(msg_sz: usize, n_msgs: usize, slack: u64) -> Shar
 pub(crate) unsafe fn sal_wake_seq(ring: *mut u8) -> u64 {
     W2mRingHeader::from_raw(ring).sal_park.cursor.load(Ordering::Acquire)
 }
+
+/// The master has armed its `FUTEX_WAITV` park on `ring`.
+///
+/// # Safety
+/// As [`test_ring`]: `ring` is a live, initialized region.
+pub(crate) unsafe fn master_parked(ring: *mut u8) -> bool {
+    W2mRingHeader::from_raw(ring).master_park.armed()
+}

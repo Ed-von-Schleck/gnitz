@@ -4,6 +4,8 @@
 //! A child of `sal`, so it reaches `write_slots` and the cursor directly and
 //! no test-only writer path has to exist in production.
 
+use std::os::fd::BorrowedFd;
+
 use super::*;
 use crate::runtime::master::scatter::{with_commit_indices, with_group};
 use crate::runtime::test_support::SharedRegion;
@@ -19,8 +21,8 @@ use gnitz_store::storage::Batch;
 /// A SAL over its own file. Every group's framing, digest and cursor advance
 /// come from the code under test rather than from a reimplementation.
 pub(crate) struct TestLog {
-    /// The whole file, anchor page included.
-    file: SharedRegion,
+    /// The anchor page's first byte, the start of the whole (leaked) file.
+    anchor: *mut u8,
     pub(crate) writer: SalWriter,
     /// One W2M ring per worker, carrying the park the writer's wakes land on.
     /// Leaked, as the `'static` wakes require.
@@ -37,14 +39,16 @@ impl TestLog {
             .collect();
         // SAFETY: every ring is initialized above and leaked.
         let wakes = rings.iter().map(|&p| unsafe { SalWake::new(p) }).collect();
-        // SAFETY: the region outlives the writer.
+        // SAFETY: the region is leaked below, so it is mapped and its fd open for
+        // the rest of the process.
         let writer = SalWriter::new(
             unsafe { SalLog::new(file.ptr(), file.size()) },
-            file.fd(),
+            unsafe { BorrowedFd::borrow_raw(file.fd()) },
             workers,
             wakes,
         );
-        let log = TestLog { file, writer, rings };
+        let anchor = file.leak();
+        let log = TestLog { anchor, writer, rings };
         log.seek(0, epoch);
         log
     }
@@ -61,7 +65,7 @@ impl TestLog {
 
     /// The anchor page's first byte.
     pub(crate) fn anchor_ptr(&self) -> *mut u8 {
-        self.file.ptr()
+        self.anchor
     }
 
     pub(crate) fn log(&self) -> SalLog {

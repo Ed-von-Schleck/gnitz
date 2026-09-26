@@ -1,6 +1,6 @@
 use super::fixtures::make_ring;
 use super::*;
-use crate::runtime::test_support::{assert_child_exited_ok, fork_child, SharedRegion};
+use crate::runtime::test_support::{assert_child_exited_ok, fork_child, within, SharedRegion};
 use gnitz_wire::control::CTRL_HEADER_SIZE;
 use gnitz_wire::WireStatus;
 use std::sync::atomic::AtomicBool;
@@ -26,78 +26,6 @@ unsafe fn publish(
     encode(reservation.slot());
     commit(&mut wc, reservation);
     Some((wc.virt, wc.virt - before != slot_stride(sz)))
-}
-
-// -- futex primitives ----------------------------------------------------
-
-/// Pins the absence of `FUTEX_PRIVATE_FLAG`: a private futex hashes the word
-/// to a different key in each process, so the child's wake would never
-/// arrive — which no in-process test can catch.
-#[test]
-fn a_shared_futex_wake_crosses_a_process_boundary() {
-    let region = SharedRegion::new(4096);
-    let atomic_ptr = region.ptr() as *mut AtomicU32;
-    unsafe {
-        (*atomic_ptr).store(7, Ordering::Release);
-    }
-
-    let child = || {
-        // Bump the atomic, then wake the parent.
-        unsafe {
-            (*atomic_ptr).store(8, Ordering::Release);
-        }
-        futex_wake_u32(atomic_ptr as *const AtomicU32, 1, "test child");
-    };
-
-    let pid = unsafe { fork_child(child) };
-
-    // `Retry` covers both proofs: woken by the child, or the value had
-    // already moved. `TimedOut` is the failure this asserts against.
-    let rc = futex_waitv_u32(&[futex_waitv_entry(atomic_ptr as *const AtomicU32, 7)], 5000);
-    assert_eq!(rc, Parked::Retry, "the child's wake never reached the parent");
-    let final_val = unsafe { (*atomic_ptr).load(Ordering::Acquire) };
-    assert_eq!(final_val, 8);
-
-    unsafe { assert_child_exited_ok(pid) };
-}
-
-/// The raw multi-word wrapper: a value mismatch fast-returns, no wake times
-/// out, and a wake on a NON-FIRST word wakes the multi-word wait. The
-/// timeout case bounds wall-clock only from below — an upper bound would be
-/// asserting the machine is idle.
-#[test]
-fn futex_waitv_wakes_on_any_word() {
-    use std::time::Instant;
-    let region = SharedRegion::new(4096);
-    let ptr = region.ptr();
-    let w0 = ptr as *const AtomicU32;
-    let w1 = unsafe { ptr.add(64) } as *const AtomicU32;
-    unsafe {
-        (*w0).store(0, Ordering::Release);
-        (*w1).store(0, Ordering::Release);
-    }
-    let word = futex_waitv_entry;
-
-    let rc = futex_waitv_u32(&[word(w0, 0), word(w1, 999)], 2000);
-    assert_eq!(rc, Parked::Retry, "value mismatch must fast-return");
-
-    let t = Instant::now();
-    let rc = futex_waitv_u32(&[word(w0, 0), word(w1, 0)], 20);
-    assert_eq!(rc, Parked::TimedOut, "no wake must time out");
-    assert!(t.elapsed().as_millis() >= 15, "timed out before the deadline");
-
-    // Wake on the NON-FIRST word.
-    let child = || {
-        unsafe {
-            libc::usleep(5_000);
-            (*w1).fetch_add(1, Ordering::Release);
-        }
-        futex_wake_u32(w1, 1, "test child");
-    };
-    let pid = unsafe { fork_child(child) };
-    let rc = futex_waitv_u32(&[word(w0, 0), word(w1, 0)], 5000);
-    assert_eq!(rc, Parked::Retry, "a wake on the non-first word must not time out");
-    unsafe { assert_child_exited_ok(pid) };
 }
 
 // -- ring layout ---------------------------------------------------------
@@ -411,15 +339,23 @@ fn publish_takes_the_master_gate() {
         // Arm the reactor's park by hand; `arm_waitv` needs a quiet ring.
         let mut out = [FutexWaitV::new(); 1];
         assert!(receiver.arm_waitv(&mut out).is_some(), "an empty ring must arm");
-        assert_ne!(hdr.master_park.flags.load(Ordering::Acquire) & FLAG_MASTER_WAITV, 0);
+        assert!(hdr.master_park.armed());
 
         publish(ptr, 64, 0, |s| s[0] = 1).expect("an empty ring has room");
-        assert_eq!(
-            hdr.master_park.flags.load(Ordering::Acquire) & FLAG_MASTER_WAITV,
-            0,
-            "a publish must clear the master park bit",
-        );
+        assert!(!hdr.master_park.armed(), "a publish must take the master's arm");
     }
+}
+
+/// An arm taken after a publish sees it, and survives it: only a later publish
+/// takes the arm.
+#[test]
+fn a_publish_before_an_arm_leaves_it_armed() {
+    let park = MasterPark { word: AtomicU64::new(0), _pad: 0 };
+    park.publish(8);
+    assert_eq!(park.arm(), 8);
+    assert!(park.armed());
+    park.publish(16);
+    assert!(!park.armed());
 }
 
 /// Publish/drain throughput over one ring, and how many publishes spend a
@@ -427,9 +363,9 @@ fn publish_takes_the_master_gate() {
 ///
 /// A forked child publishes `N` control frames as fast as it can while the
 /// parent drains them, parking on the ring whenever it runs dry. Only the
-/// ratios carry meaning: absolute rates swing with machine load. The gate is
-/// sampled just before each publish, which is the predicate that publish's
-/// `wake_master` reads — so the count is a syscall count without `strace`.
+/// ratios carry meaning: absolute rates swing with machine load. The master's
+/// armed bit is sampled just before each publish's swap, so the wake count
+/// approximates the syscalls without `strace`.
 ///
 /// `cd crates && cargo test -p gnitz-server --release w2m_publish_drain_bench -- --ignored --nocapture --test-threads=1`
 #[test]
@@ -455,7 +391,7 @@ fn w2m_publish_drain_bench() {
         let t = Instant::now();
         let mut woke_master = 0u64;
         for req in 1..=N {
-            if hdr.master_park.flags.load(Ordering::Relaxed) & FLAG_MASTER_WAITV != 0 {
+            if hdr.master_park.armed() {
                 woke_master += 1;
             }
             writer.send_status(0, req as u32, gnitz_wire::WireStatus::Ok, &[]);
@@ -480,8 +416,13 @@ fn w2m_publish_drain_bench() {
             None => {
                 parks += 1;
                 let mut waitv = [FutexWaitV::new(); 1];
-                if let Some(armed) = receiver.arm_waitv(&mut waitv) {
-                    let _ = futex_waitv_u32(armed, 100);
+                // A successful arm means the armed value equals the read cursor.
+                if receiver.arm_waitv(&mut waitv).is_some() {
+                    futex_wait_u32(
+                        receiver.header(0).master_park.futex_word(),
+                        receiver.read_cursor(0) as u32,
+                        "bench",
+                    );
                 }
                 receiver.clear_waitv();
             }
@@ -638,15 +579,19 @@ fn a_sal_park_returns_at_once_when_its_retest_finds_a_group() {
 fn a_parked_worker_wakes_on_a_forked_masters_sal_wake() {
     let region = unsafe { make_ring(CTRL_HEADER_SIZE, 2, 8) };
     let ptr = region.ptr();
-    let seq = || unsafe { super::fixtures::sal_wake_seq(ptr) };
     let child = || {
         std::thread::sleep(Duration::from_millis(50));
         unsafe { SalWake::new(ptr) }.wake();
     };
     let pid = unsafe { fork_child(child) };
-    // "Empty" until the wake publishes: the condition a worker re-tests is the
-    // SAL's, and here the sequence stands in for it.
-    W2mWriter::new(ptr).sal_park().park(|| seq() == 0);
-    assert_eq!(seq(), 1, "the park ended on the wake");
+    let ring = ptr as usize;
+    within(Duration::from_secs(30), move || {
+        let ptr = ring as *mut u8;
+        let seq = || unsafe { super::fixtures::sal_wake_seq(ptr) };
+        // "Empty" until the wake publishes: the condition a worker re-tests is the
+        // SAL's, and here the sequence stands in for it.
+        W2mWriter::new(ptr).sal_park().park(|| seq() == 0);
+        assert_eq!(seq(), 1, "the park ended on the wake");
+    });
     unsafe { assert_child_exited_ok(pid) };
 }

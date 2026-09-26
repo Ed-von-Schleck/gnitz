@@ -115,7 +115,7 @@ pub const CHILD_OK: &str = "the child ran every assertion";
 ///
 /// The reason a test needs a child at all rather than setting the variable
 /// itself: a `Seam` — and the `io_uring` verdict — reads its variable once per
-/// process into a `OnceLock`, and the test runner runs a crate's tests as
+/// process, and the test runner runs a crate's tests as
 /// threads of one process, so an in-process `set_var` would race every other
 /// test and lose to whichever read first. A direct in-process fail-stop would
 /// also terminate the runner. `internal_test` must return early unless

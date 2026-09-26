@@ -14,6 +14,7 @@ pub(crate) mod zone;
 
 use std::cell::Cell;
 use std::future::Future;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::runtime::reactor::{AsyncRwLock, Reactor, WriteGuard};
@@ -840,7 +841,7 @@ pub(crate) struct Savepoint {
 
 pub(crate) struct SalWriter {
     log: SalLog,
-    fd: i32,
+    fd: BorrowedFd<'static>,
     write_cursor: Cell<u64>,
     epoch: Cell<u32>,
     /// The anchored synced offset of the live epoch.
@@ -865,7 +866,7 @@ pub(crate) struct SalWriter {
 impl SalWriter {
     /// Starts at epoch 0, which [`Self::write_slots`] refuses: nothing can be
     /// written before the boot [`SalExcl::boot_rewind`] sets the live epoch.
-    pub(crate) fn new(log: SalLog, fd: i32, num_workers: usize, wakes: Vec<SalWake>) -> Self {
+    pub(crate) fn new(log: SalLog, fd: BorrowedFd<'static>, num_workers: usize, wakes: Vec<SalWake>) -> Self {
         assert_eq!(wakes.len(), num_workers, "one SAL wake per worker");
         let checkpoint_threshold =
             gnitz_foundation::env::env_num("GNITZ_CHECKPOINT_BYTES", (log.ring_len as u64 * 3) >> 2);
@@ -1150,7 +1151,7 @@ impl SalWriter {
         self.refused_transient.set(false);
         unsafe { write_end_prefix(self.log.ring, 0) };
         self.write_anchor(epoch, 0);
-        if let Err(e) = posix_io::retry_eintr(|| unsafe { libc::fdatasync(self.fd) }) {
+        if let Err(e) = posix_io::retry_eintr(|| unsafe { libc::fdatasync(self.fd.as_raw_fd()) }) {
             gnitz_fatal_abort!("SAL fdatasync (rewind to epoch {epoch}) failed: {e}");
         }
     }
