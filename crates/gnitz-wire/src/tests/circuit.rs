@@ -436,8 +436,9 @@ fn for_group_cols_picks_the_output_key() {
         (&[0], &[1], (uuid, false), SingleNaturalCol),
         (&[0], &[1], (u128, false), SingleNaturalCol),
         (&[0], &[1], (i64, false), SyntheticFold),
-        (&[0], &[0], (i64, false), PkPermutation),
-        (&[0, 1], &[1, 0], (i64, false), PkPermutation),
+        (&[0], &[0], (i64, false), SourcePk),
+        (&[0, 1], &[0, 1], (i64, false), SourcePk),
+        (&[0, 1], &[1, 0], (i64, false), SyntheticFold),
         (&[0, 1], &[0], (u64, false), SingleNaturalCol),
         (&[0, 1], &[0, 1, 2], (u64, false), SyntheticFold),
         (&[0, 1], &[1, 2], (u64, false), SyntheticFold),
@@ -483,26 +484,26 @@ fn output_layout_is_the_key_region_then_the_unspelled_row() {
     // The fold key spells no input column, so the whole row rides behind it —
     // group columns included, since the synthetic key is not one of them.
     assert_eq!(
-        SyntheticFold.output_layout(&[0], &[2], 0..4),
+        SyntheticFold.output_layout(&[2], 0..4),
         vec![SyntheticKey, Carried(0), Carried(1), Carried(2), Carried(3)]
     );
     assert_eq!(
-        SyntheticFold.output_layout(&[0], &[], 0..3),
+        SyntheticFold.output_layout(&[], 0..3),
         vec![SyntheticKey, Carried(0), Carried(1), Carried(2)]
     );
     // A natural key column is in the PK region, so it is not carried again.
     assert_eq!(
-        SingleNaturalCol.output_layout(&[0], &[2], 0..4),
+        SingleNaturalCol.output_layout(&[2], 0..4),
         vec![Key(2), Carried(0), Carried(1), Carried(3)]
     );
-    // A permuted PK keys on every PK column whatever order the group set lists.
+    // The PK list keys on every PK column.
     assert_eq!(
-        PkPermutation.output_layout(&[0, 2], &[2, 0], 0..4),
+        SourcePk.output_layout(&[0, 2], 0..4),
         vec![Key(0), Key(2), Carried(1), Carried(3)]
     );
     // A fold's row is its group set, a repeated column carried once per occurrence.
     assert_eq!(
-        SyntheticFold.output_layout(&[0], &[1, 1], [1, 1]),
+        SyntheticFold.output_layout(&[1, 1], [1, 1]),
         vec![SyntheticKey, Carried(1), Carried(1)]
     );
 }

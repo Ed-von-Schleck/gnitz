@@ -1569,7 +1569,7 @@ fn make_batch_compound_2xu64(schema: &SchemaDescriptor, rows: &[(u64, u64, i64, 
 fn test_emit_reduce_row_compound_pk_bytes() {
     let in_schema = pk_payload_schema(&[TypeCode::U64; 2]);
 
-    // A PkPermutation grouping with a COUNT: 2 PK cols (U64,U64), then I64 count.
+    // A SourcePk grouping with a COUNT: 2 PK cols (U64,U64), then I64 count.
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
@@ -1616,7 +1616,7 @@ fn test_emit_reduce_row_compound_pk_bytes() {
 fn test_reduce_min_pk_col_compound_pk() {
     let in_schema = pk_payload_schema(&[TypeCode::U64; 2]);
 
-    // PkPermutation: the compound PK, then the I64 aggregate.
+    // SourcePk: the compound PK, then the I64 aggregate.
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
@@ -1691,51 +1691,6 @@ fn test_reduce_min_pk_col_single_pk_u64() {
     assert_eq!(out.count, 3);
     let mins: Vec<i64> = (0..out.count).map(|i| read_i64_le(out.col_data(0), i * 8)).collect();
     assert_eq!(mins, vec![7, 42, 99]);
-}
-
-/// Permuted group_by_cols on a compound PK must still emit rows in
-/// pk_indices order (the input is PK-sorted from consolidation; the
-/// fast path skips the sort and passes row order through).
-#[test]
-fn test_reduce_group_by_pk_permuted_preserves_pk_order() {
-    let in_schema = pk_payload_schema(&[TypeCode::U64; 2]);
-    let out_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, true),
-        ],
-        &[0, 1],
-    );
-
-    let mut to_ch = empty_trace(out_schema);
-
-    // Two PKs whose [0,1] and [1,0] orderings disagree: (1,2) vs (2,1).
-    // PK-sorted (pk_indices=[0,1]) order: (1,2) then (2,1).
-    let delta = make_batch_compound_2xu64(&in_schema, &[(1, 2, 1, 10), (2, 1, 1, 20)]);
-
-    let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Count };
-
-    // group_by_cols permuted to [1, 0] — a valid set permutation of pk_indices.
-    let out = op_reduce(&delta, &mut to_ch, &in_schema, &[1u32, 0u32], &[agg], None, false);
-
-    assert_eq!(out.count, 2);
-    let row0_pk = out.get_pk_bytes(0);
-    let row1_pk = out.get_pk_bytes(1);
-    let p0_col0 = u64::from_be_bytes(row0_pk[0..8].try_into().unwrap());
-    let p0_col1 = u64::from_be_bytes(row0_pk[8..16].try_into().unwrap());
-    let p1_col0 = u64::from_be_bytes(row1_pk[0..8].try_into().unwrap());
-    let p1_col1 = u64::from_be_bytes(row1_pk[8..16].try_into().unwrap());
-    assert_eq!(
-        (p0_col0, p0_col1),
-        (1, 2),
-        "first emitted row must be (1, 2) in pk_indices order"
-    );
-    assert_eq!(
-        (p1_col0, p1_col1),
-        (2, 1),
-        "second emitted row must be (2, 1) in pk_indices order"
-    );
 }
 
 // -----------------------------------------------------------------------
@@ -2282,7 +2237,7 @@ fn test_reduce_group_by_pk_unsorted_sorted_input_equivalence() {
 }
 
 #[test]
-fn test_reduce_group_by_pk_unsorted_compound_pk_permuted() {
+fn test_reduce_group_by_pk_unsorted_compound_pk() {
     let in_schema = pk_payload_schema(&[TypeCode::U64; 2]);
     let out_schema = SchemaDescriptor::new(
         &[
@@ -2301,8 +2256,7 @@ fn test_reduce_group_by_pk_unsorted_compound_pk_permuted() {
 
     let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Count };
 
-    // Permuted GROUP BY: [1, 0]. PkPermutation still holds.
-    let out = op_reduce(&delta, &mut to_ch, &in_schema, &[1u32, 0u32], &[agg], None, false);
+    let out = op_reduce(&delta, &mut to_ch, &in_schema, &[0u32, 1u32], &[agg], None, false);
 
     assert_eq!(out.count, 2);
     let pk0 = out.get_pk_bytes(0);
@@ -6537,9 +6491,8 @@ fn test_reduce_output_schema_compound_natural_pk() {
         &[0, 1],
     );
     let aggs = vec![AggDescriptor { col_idx: 2, agg_op: AggFunc::Count }];
-    // group_cols = [1, 0] — permuted; the set still equals pk_indices.
-    let out = out_schema_for(&input, &[1, 0], &aggs);
-    // 2 PK cols + 1 agg col; pk_indices in source's pk-list order [0, 1].
+    let out = out_schema_for(&input, &[0, 1], &aggs);
+    // 2 PK cols + 1 agg col.
     assert_eq!(out.num_columns(), 3);
     assert_eq!(out.pk_indices(), &[0, 1]);
     assert_eq!(out.columns[0].type_code, TypeCode::U64);
@@ -6657,7 +6610,7 @@ fn a_reduce_without_a_count_is_rejected() {
     }
 }
 
-/// col 0 = U64 PK and the whole group key (⇒ PkPermutation); col 1 = the
+/// col 0 = U64 PK and the whole group key (⇒ SourcePk); col 1 = the
 /// aggregate column, whose type is the only thing the two tests below vary.
 fn agg_over(tc: TypeCode) -> SchemaDescriptor {
     SchemaDescriptor::new(
@@ -6757,7 +6710,7 @@ fn op_reduce_bench() {
             Box::new(|s| grp_rows(s, &|i| i % 65_536)),
         ),
         (
-            "pk_permutation",
+            "source_pk",
             single_pk,
             vec![0],
             agg(1, AggFunc::Sum),

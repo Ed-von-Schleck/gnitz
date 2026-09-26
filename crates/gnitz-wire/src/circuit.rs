@@ -195,9 +195,9 @@ pub enum ReduceOutKey {
     /// group columns ride as payload. What every group set that is neither
     /// natural kind gets, including the empty (global) group set.
     SyntheticFold,
-    /// The group set is a permutation of the source PK; the output PK is the
-    /// source PK columns in pk-list order, verbatim.
-    PkPermutation,
+    /// The group set is the source PK list; the output PK is the source PK
+    /// region verbatim.
+    SourcePk,
     /// A single non-nullable U64/U128/UUID group column is the output PK
     /// directly.
     SingleNaturalCol,
@@ -208,8 +208,7 @@ impl ReduceOutKey {
     /// facts both sides already hold: the source's PK column list, the GROUP BY
     /// column list, and a `(type_code, nullable)` reader for a group column.
     pub fn for_group_cols(pk_cols: &[u32], group_cols: &[u32], col: impl Fn(u32) -> (TypeCode, bool)) -> Self {
-        // A permutation, not a prefix: the SQL may list PK columns in any order.
-        let eq_pk = group_cols.len() == pk_cols.len() && pk_cols.iter().all(|p| group_cols.contains(p));
+        let eq_pk = group_cols == pk_cols;
         let single_natural = match *group_cols {
             [c] => {
                 let (type_code, nullable) = col(c);
@@ -220,7 +219,7 @@ impl ReduceOutKey {
             _ => false,
         };
         if eq_pk {
-            ReduceOutKey::PkPermutation
+            ReduceOutKey::SourcePk
         } else if single_natural {
             ReduceOutKey::SingleNaturalCol
         } else {
@@ -228,32 +227,13 @@ impl ReduceOutKey {
         }
     }
 
-    /// The source columns spelling the output's PK region, in output PK order, or
-    /// `None` for the synthetic fold key.
-    pub fn key_region<'a>(self, pk_cols: &'a [u32], group_cols: &'a [u32]) -> Option<&'a [u32]> {
-        match self {
-            // The output PK region mirrors the source's PK byte layout, so it
-            // walks the PK list in order rather than `group_cols` order.
-            ReduceOutKey::PkPermutation => Some(pk_cols),
-            ReduceOutKey::SingleNaturalCol => Some(&group_cols[..1]),
-            ReduceOutKey::SyntheticFold => None,
-        }
-    }
-
     /// An output's layout ahead of its aggregates: the key region (or the synthetic
     /// key), then each `row` column the key region does not spell.
-    pub fn output_layout(
-        self,
-        pk_cols: &[u32],
-        group_cols: &[u32],
-        row: impl IntoIterator<Item = u32>,
-    ) -> Vec<ReduceOutSlot> {
-        let keys = self.key_region(pk_cols, group_cols);
-        let lead: Vec<ReduceOutSlot> = match keys {
-            Some(k) => k.iter().map(|&c| ReduceOutSlot::Key(c)).collect(),
-            None => vec![ReduceOutSlot::SyntheticKey],
+    pub fn output_layout(self, group_cols: &[u32], row: impl IntoIterator<Item = u32>) -> Vec<ReduceOutSlot> {
+        let (lead, spelled): (Vec<ReduceOutSlot>, &[u32]) = match self {
+            ReduceOutKey::SyntheticFold => (vec![ReduceOutSlot::SyntheticKey], &[]),
+            _ => (group_cols.iter().map(|&c| ReduceOutSlot::Key(c)).collect(), group_cols),
         };
-        let spelled = keys.unwrap_or_default();
         lead.into_iter()
             .chain(
                 row.into_iter()

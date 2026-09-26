@@ -1,12 +1,12 @@
 //! Exchange worker routing: `ScatterSpec`, `ScatterKey`, and the per-row
 //! routing-key helpers.
 
-use crate::schema::{worker_for_key, worker_for_pk_bytes};
-use crate::schema::{OpBuildErr, Placement, SchemaDescriptor};
-use crate::storage::{Batch, MemBatch, Slot};
+use crate::schema::key::{locate_key_col, FoldCols, ReindexPacker};
+use crate::schema::{worker_for_key, worker_for_pk_bytes, MAX_PK_BYTES};
+use crate::schema::{ColumnLocator, OpBuildErr, SchemaDescriptor};
+use crate::storage::{run_merge, Batch, MemBatch, Slot};
 
-use super::super::group_key::{single_col_canonical_group_key, GroupKeyCols};
-use crate::schema::key::ReindexPacker;
+use super::super::group_key::GroupKeyCols;
 
 /// Keep only the rows `slot` owns: those whose PK `worker_for_pk_bytes` routes
 /// to it, the hash the equality scatter routes a join key by. A broadcast delta
@@ -28,168 +28,213 @@ pub fn op_worker_filter(batch: &Batch, slot: Slot) -> Batch {
     batch.ascending_subset(&indices)
 }
 
-/// Which routing key a scatter uses, and the columns it reads. The two keys
-/// diverge for nullable and string columns, so the circuit states which it means
-/// rather than the scatter guessing — see `ScatterKind::Packed` / `::Fold` for
-/// the two contracts.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// What a scatter routes by. Either way a row goes to the owner of the PK its
+/// consumer gives it.
+#[derive(Clone, Copy, Debug)]
 pub enum ScatterSpec<'a> {
-    /// GROUP BY / set-op: the null-distinct group fold over these columns.
+    /// Rows grouped by these columns: the owner of the output PK a reduce over
+    /// them keys the row's group by.
     GroupKey(&'a [u32]),
-    /// Equi-join: the packed `_join_pk`, one slot per `(source column, promoted
-    /// key type)` — `None` derives the slot type from the source column.
+    /// An equi-join key: the owner of the `_join_pk` the reindex Map packs from
+    /// these `(source column, promotion target)` slots.
     JoinKey(&'a [gnitz_wire::ReindexSlot]),
 }
 
 impl ScatterSpec<'_> {
-    /// Refused exactly where `ScatterKey::new` would refuse it.
+    /// Refused exactly where the scatter would refuse it.
     pub fn check(self, schema: &SchemaDescriptor) -> Result<(), OpBuildErr> {
-        ScatterKey::new(self, schema, 1).map(drop)
+        ScatterKey::new(self, schema).map(drop)
     }
 
-    /// True iff the exchange this spec describes would move nothing: its columns
-    /// are exactly `schema`'s distribution prefix, and its `ScatterKind` hashes
-    /// them to the bytes `worker_for_pk` already placed the rows by.
+    /// True iff the exchange this spec describes would move nothing: it hashes
+    /// exactly the bytes `worker_for_pk` placed the rows by.
     pub fn routes_to_native_owner(self, schema: &SchemaDescriptor) -> bool {
-        let Placement::Keyed { prefix_len } = schema.placement() else {
-            return false;
-        };
-        let pk = schema.pk_indices();
-        let (cols, native_hash): (Vec<u32>, bool) = match self {
-            // `PkBytes` over the whole PK, or `Fold` over the one column's
-            // `opk_image`. A wider fold is Xxh3 over material no PK hash sees.
-            ScatterSpec::GroupKey(cols) => (
-                cols.to_vec(),
-                cols == pk || single_col_canonical_group_key(schema, cols),
-            ),
-            // `PkBytes` or `Packed`, both re-emitting the columns' own OPK bytes
-            // — unless a slot promotes, which packs wider than its source column.
-            ScatterSpec::JoinKey(slots) => (
-                slots.iter().map(|&(c, _)| c).collect(),
-                slots.iter().all(|&(_, t)| t.is_none()),
-            ),
-        };
-        native_hash && gnitz_wire::validate_dist_prefix(pk, &cols).is_ok_and(|n| n == prefix_len as usize)
+        schema.placement().is_key_routed()
+            && matches!(ScatterKey::new(self, schema), Ok(ScatterKey::PkPrefix(n)) if n == schema.dist_stride())
     }
 }
 
-/// Per-scatter row router, built once (out of the row loop — a packer's
-/// per-column schema classification is hoisted here) and applied per row. The
-/// variant is picked from circuit metadata, not per-query data:
-///
-/// - `PkBytes`: the key IS the schema's PK list with no promotion (see
-///   [`ScatterKey::new`]) — route by the row's native OPK bytes. Deliberately
-///   not the write-path fan-out's rule, which routes by the distribution prefix
-///   — a different hash domain with no promotion concept.
-/// - `Packed`: a `JoinKey` scatter packs the SAME OPK bytes the downstream
-///   reindex Map stamps as the `_join_pk`, so the delta scatter and the
-///   reindexed trace co-partition byte-for-byte. It is null-blind and
-///   value-preserving by design — a LEFT-join NULL-key bypass row reads its
-///   canonically-zeroed key slot and routes to the `_join_pk 0` owner, the
-///   same place the reindex Map stamps it. (Float columns, the only type whose
-///   OPK image would diverge from the routing hash, cannot be join keys — they
-///   are rejected at plan time — so packing every `JoinKey` is exact.)
-/// - `Fold`: a `GroupKey` (GROUP BY / set-op) scatter routes by the
-///   null-distinct group fold — the baked [`GroupKeyCols`], byte-identical to
-///   the group-key fold, which `op_reduce` also uses for the group's output
-///   PK — the two must agree or the result is mis-gathered. The fold keeps
-///   NULL distinct because a NULL group and a 0 group must not collide on one
-///   output PK.
-// One `ScatterKey` is built per scatter (a stack local) and read per row, so
-// the `ReindexPacker` and its scratch stay inline — boxing would add a heap
-// alloc and a per-row pointer chase for no benefit.
-#[allow(clippy::large_enum_variant)]
-pub(super) enum ScatterKind {
-    PkBytes,
-    Packed {
-        packer: ReindexPacker,
-        buf: [u8; crate::schema::MAX_PK_BYTES],
-    },
-    Fold {
-        keys: GroupKeyCols,
-    },
-}
-
-/// A [`ScatterKind`] bound to the worker count it routes into. The count is
-/// carried here rather than passed per row so a scatter cannot route two rows
-/// against different cluster shapes.
-pub(super) struct ScatterKey {
-    kind: ScatterKind,
-    num_workers: usize,
+/// A [`ScatterSpec`] resolved against one schema: what each row is hashed by.
+pub(super) enum ScatterKey {
+    /// The row's leading `n` PK bytes.
+    PkPrefix(usize),
+    /// One column's OPK image — what a single-column key packs to.
+    Image(ColumnLocator),
+    /// The `_join_pk` the reindex Map packs. Null-blind: a LEFT-join NULL-key
+    /// row routes by its zeroed slot, where the Map stamps it.
+    Packed(ReindexPacker),
+    /// The NULL-distinct XXH3 fold of the group columns.
+    Fold(FoldCols),
 }
 
 impl ScatterKey {
     /// Refused when `schema` cannot route by `spec`: a column it has not got, or
     /// one the group key or a reindex key refuses.
-    #[inline]
-    pub(super) fn new(
-        spec: ScatterSpec<'_>,
-        schema: &SchemaDescriptor,
-        num_workers: usize,
-    ) -> Result<Self, OpBuildErr> {
-        // Sequence equality, not set equality: `worker_for_pk_bytes` hashes OPK
-        // bytes in schema order, so a permuted compound PK routes differently.
-        // And no carried target throughout: a promoted key packs at the wider
-        // `T`, so its narrow source PK bytes must not route natively.
+    pub(super) fn new(spec: ScatterSpec<'_>, schema: &SchemaDescriptor) -> Result<Self, OpBuildErr> {
         let pk = schema.pk_indices();
-        let kind = match spec {
-            ScatterSpec::GroupKey(cols) if cols == pk => ScatterKind::PkBytes,
-            ScatterSpec::GroupKey(cols) => ScatterKind::Fold { keys: GroupKeyCols::new(schema, cols)? },
-            ScatterSpec::JoinKey(slots)
-                if slots.len() == pk.len() && slots.iter().zip(pk).all(|(&(c, tc), &p)| c == p && tc.is_none()) =>
-            {
-                ScatterKind::PkBytes
-            }
-            ScatterSpec::JoinKey(slots) => ScatterKind::Packed {
-                packer: ReindexPacker::new(schema, slots)?,
-                buf: [0u8; crate::schema::MAX_PK_BYTES],
+        Ok(match spec {
+            ScatterSpec::GroupKey(cols) if cols == pk => ScatterKey::PkPrefix(schema.pk_stride()),
+            ScatterSpec::GroupKey(cols) => match GroupKeyCols::new(schema, cols)? {
+                GroupKeyCols {
+                    canonical: Some(ColumnLocator::Pk { byte_off: 0, size, .. }),
+                    ..
+                } => ScatterKey::PkPrefix(size as usize),
+                GroupKeyCols { canonical: Some(loc), .. } => ScatterKey::Image(loc),
+                GroupKeyCols { cols: fold, .. } => ScatterKey::Fold(fold),
             },
-        };
-        Ok(ScatterKey { kind, num_workers })
-    }
-
-    /// Route one row to its owning worker.
-    #[inline]
-    pub(super) fn worker(&mut self, mb: &MemBatch, row: usize) -> usize {
-        let nw = self.num_workers;
-        match &mut self.kind {
-            ScatterKind::PkBytes => worker_for_pk_bytes(mb.get_pk_bytes(row), nw),
-            ScatterKind::Packed { packer, buf } => worker_for_pk_bytes(packer.pack_prefix(buf, mb, row), nw),
-            ScatterKind::Fold { keys } => worker_for_key(keys.key_row(mb, row), nw),
-        }
-    }
-
-    /// Route every row of one source into `slots`, dropping the weight-0 rows
-    /// an unconsolidated source may carry — not Z-set elements.
-    pub(super) fn route_into(&mut self, mb: &MemBatch, si: u32, slots: &mut [Vec<(u32, u32, i64)>]) {
-        let nw = self.num_workers;
-        match &mut self.kind {
-            ScatterKind::PkBytes => route_rows(mb, si, slots, |mb, row| worker_for_pk_bytes(mb.get_pk_bytes(row), nw)),
-            ScatterKind::Packed { packer, buf } => route_rows(mb, si, slots, |mb, row| {
-                worker_for_pk_bytes(packer.pack_prefix(buf, mb, row), nw)
-            }),
-            ScatterKind::Fold { keys } => {
-                route_rows(mb, si, slots, |mb, row| worker_for_key(keys.key_row(mb, row), nw))
+            // Slots pack in slot order, so only the PK's leading columns in PK
+            // order, unpromoted, pack the PK's own bytes.
+            ScatterSpec::JoinKey(slots)
+                if slots.len() <= pk.len() && slots.iter().zip(pk).all(|(&(c, t), &p)| c == p && t.is_none()) =>
+            {
+                ScatterKey::PkPrefix(
+                    slots
+                        .iter()
+                        .map(|&(c, _)| schema.columns[c as usize].size() as usize)
+                        .sum(),
+                )
             }
+            ScatterSpec::JoinKey(&[(c, None)])
+                if schema
+                    .column(c as usize)
+                    .is_some_and(|col| col.type_code.is_pk_eligible()) =>
+            {
+                ScatterKey::Image(locate_key_col(schema, c, "reindex key")?)
+            }
+            ScatterSpec::JoinKey(slots) => ScatterKey::Packed(ReindexPacker::new(schema, slots)?),
+        })
+    }
+
+    /// Route `mem` into `slots`, one per worker: with `merge`, each
+    /// (PK, payload) group once at its net weight; else every row of nonzero
+    /// weight — a weight-0 row is not a Z-set element.
+    pub(super) fn route(
+        &self,
+        mem: &[MemBatch],
+        schema: &SchemaDescriptor,
+        merge: bool,
+        slots: &mut [Vec<(u32, u32, i64)>],
+    ) {
+        let nw = slots.len();
+        match *self {
+            ScatterKey::PkPrefix(n) => walk(mem, schema, merge, slots, PrefixW { n, nw }),
+            ScatterKey::Image(loc @ ColumnLocator::Payload { .. }) => {
+                walk(mem, schema, merge, slots, ImageW::<true> { loc, nw })
+            }
+            ScatterKey::Image(loc) => walk(mem, schema, merge, slots, ImageW::<false> { loc, nw }),
+            ScatterKey::Packed(ref packer) => {
+                walk(mem, schema, merge, slots, PackedW { packer, n: packer.out_stride, nw })
+            }
+            ScatterKey::Fold(ref fold) => walk(mem, schema, merge, slots, FoldW { fold, nw }),
         }
     }
 }
 
-/// Generic in `worker`, and `#[inline(always)]`, so each [`ScatterKind`] arm
-/// monomorphizes its key derivation into the row loop.
+type Scratch = [u8; MAX_PK_BYTES];
+
+/// One kind's per-row route, forced inline into its walk (a closure cannot be).
+/// The walk owns the scratch: a worker holding it would reload every field per
+/// row, its address escaping into `pack_into`.
+trait RowWorker {
+    fn worker(&self, scratch: &mut Scratch, mb: &MemBatch, row: usize) -> usize;
+}
+
+struct PrefixW {
+    n: usize,
+    nw: usize,
+}
+
+impl RowWorker for PrefixW {
+    #[inline(always)]
+    fn worker(&self, _: &mut Scratch, mb: &MemBatch, row: usize) -> usize {
+        worker_for_pk_bytes(&mb.get_pk_bytes(row)[..self.n], self.nw)
+    }
+}
+
+/// `PAYLOAD` fixes the locator's variant for the walk, so `opk_image`'s region
+/// branch folds away.
+struct ImageW<const PAYLOAD: bool> {
+    loc: ColumnLocator,
+    nw: usize,
+}
+
+impl<const PAYLOAD: bool> RowWorker for ImageW<PAYLOAD> {
+    #[inline(always)]
+    fn worker(&self, _: &mut Scratch, mb: &MemBatch, row: usize) -> usize {
+        assert!(matches!(self.loc, ColumnLocator::Payload { .. }) == PAYLOAD);
+        worker_for_key(self.loc.opk_image(mb, row), self.nw)
+    }
+}
+
+struct PackedW<'a> {
+    packer: &'a ReindexPacker,
+    n: usize,
+    nw: usize,
+}
+
+impl RowWorker for PackedW<'_> {
+    #[inline(always)]
+    fn worker(&self, scratch: &mut Scratch, mb: &MemBatch, row: usize) -> usize {
+        let key = &mut scratch[..self.n];
+        self.packer.pack_into(key, mb, row);
+        worker_for_pk_bytes(key, self.nw)
+    }
+}
+
+struct FoldW<'a> {
+    fold: &'a FoldCols,
+    nw: usize,
+}
+
+impl RowWorker for FoldW<'_> {
+    #[inline(always)]
+    fn worker(&self, _: &mut Scratch, mb: &MemBatch, row: usize) -> usize {
+        worker_for_key(self.fold.key_row(mb, row, mb.get_null_word(row)), self.nw)
+    }
+}
+
 #[inline(always)]
-fn route_rows(
-    mb: &MemBatch,
-    si: u32,
+fn walk(
+    mem: &[MemBatch],
+    schema: &SchemaDescriptor,
+    merge: bool,
     slots: &mut [Vec<(u32, u32, i64)>],
-    mut worker: impl FnMut(&MemBatch, usize) -> usize,
+    w: impl RowWorker,
 ) {
-    for row in 0..mb.count {
-        let w = mb.get_weight(row);
-        if w == 0 {
-            continue;
+    if merge {
+        route_merge(mem, schema, slots, &w)
+    } else {
+        for (si, mb) in mem.iter().enumerate() {
+            route_source(mb, si as u32, slots, &w);
         }
-        slots[worker(mb, row)].push((si, row as u32, w));
+    }
+}
+
+/// One exemplar per (PK, payload) group, byte-equal to its members wherever a
+/// key can read, so it routes for all of them.
+#[inline(never)]
+fn route_merge<W: RowWorker>(mem: &[MemBatch], schema: &SchemaDescriptor, slots: &mut [Vec<(u32, u32, i64)>], w: &W) {
+    let mut scratch = [0u8; MAX_PK_BYTES];
+    run_merge(mem, schema, |si, row, wt| {
+        slots[merge_worker(w, &mut scratch, &mem[si], row)].push((si as u32, row as u32, wt))
+    });
+}
+
+/// Out of line: inlined into `run_merge`'s emit callback the route is slower on
+/// every kind.
+#[inline(never)]
+fn merge_worker<W: RowWorker>(w: &W, scratch: &mut Scratch, mb: &MemBatch, row: usize) -> usize {
+    w.worker(scratch, mb, row)
+}
+
+#[inline(never)]
+fn route_source<W: RowWorker>(mb: &MemBatch, si: u32, slots: &mut [Vec<(u32, u32, i64)>], w: &W) {
+    let mut scratch = [0u8; MAX_PK_BYTES];
+    for row in 0..mb.count {
+        let wt = mb.get_weight(row);
+        if wt != 0 {
+            slots[w.worker(&mut scratch, mb, row)].push((si, row as u32, wt));
+        }
     }
 }
 

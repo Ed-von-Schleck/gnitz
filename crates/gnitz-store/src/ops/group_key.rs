@@ -31,11 +31,11 @@ pub(super) struct GroupKeyCols {
     /// `None` when the key is the hash fold. `Some` is exactly "the key is
     /// injective and order-preserving on the group value". See
     /// [`single_col_canonical_group_key`].
-    canonical: Option<ColumnLocator>,
+    pub(super) canonical: Option<ColumnLocator>,
     /// The group columns in group-set order. Empty for a global (ungrouped)
     /// aggregate, whose key is `gnitz_wire::global_group_key()` — the fold of
     /// zero columns.
-    cols: FoldCols,
+    pub(super) cols: FoldCols,
 }
 
 impl GroupKeyCols {
@@ -86,7 +86,7 @@ impl OutPk<'_> {
 /// Where a group's output PK comes from.
 #[derive(Clone, Copy)]
 enum KeyRegion {
-    /// The source row's own PK: the group set is a permutation of it.
+    /// The source row's own PK: the group set is the PK list.
     SourcePk,
     /// The 128-bit group key, narrowed to this output PK width.
     Narrow(usize),
@@ -134,7 +134,7 @@ impl GroupOutKey {
         let over = |e: SchemaBound| OpBuildErr::shape(format!("group key: output {e}"));
         let mut b = DerivedSchema::new();
         let mut carried = Vec::new();
-        for slot in kind.output_layout(input.pk_indices(), group_cols, row) {
+        for slot in kind.output_layout(group_cols, row) {
             match slot {
                 ReduceOutSlot::SyntheticKey => b.push_pk(GROUP_PK_COL),
                 ReduceOutSlot::Key(c) => b.push_pk(input.columns[c as usize]),
@@ -146,7 +146,7 @@ impl GroupOutKey {
             .map_err(over)?;
         }
         let region = match kind {
-            ReduceOutKey::PkPermutation => KeyRegion::SourcePk,
+            ReduceOutKey::SourcePk => KeyRegion::SourcePk,
             _ => KeyRegion::Narrow(b.pk_bytes()),
         };
         Ok((GroupOutKey { group, region, carried }, b))
@@ -171,7 +171,7 @@ impl GroupOutKey {
     #[inline]
     pub(super) fn narrow_pk(&self, key: u128) -> NarrowPkOpk {
         let KeyRegion::Narrow(stride) = self.region else {
-            unreachable!("a permuted PK is the source's own")
+            unreachable!("a PK-keyed group's output PK is the source's own")
         };
         NarrowPkOpk::new(key, stride)
     }

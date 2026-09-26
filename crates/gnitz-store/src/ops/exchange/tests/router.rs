@@ -1,9 +1,21 @@
 use super::*;
-use crate::ops::group_key::GroupKeyCols;
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::{
-    make_batch, make_batch_bytes, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
-};
+use crate::ops::group_key::{GroupKeyCols, GroupOutKey};
+use crate::schema::{Placement, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::test_support::{make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64};
+
+/// The worker `key`'s linear walk sends each row of `mb` to, in row order.
+fn workers(key: &ScatterKey, schema: &SchemaDescriptor, mb: &MemBatch, nw: usize) -> Vec<usize> {
+    let mut pool = Vec::new();
+    let slots = crate::storage::reset_slots(&mut pool, nw);
+    key.route(std::slice::from_ref(mb), schema, false, slots);
+    let mut out = vec![usize::MAX; mb.count];
+    for (w, rows) in slots.iter().enumerate() {
+        for &(_, r, _) in rows {
+            out[r as usize] = w;
+        }
+    }
+    out
+}
 
 #[test]
 fn test_worker_filter_keeps_only_this_workers_rows() {
@@ -56,8 +68,8 @@ fn test_scatter_key_packed_matches_image_routing() {
     const NW: usize = 4;
     fn packed(schema: &SchemaDescriptor, cols: &[u32], mb: &MemBatch, row: usize) -> usize {
         let key: Vec<gnitz_wire::ReindexSlot> = cols.iter().map(|&c| (c, None)).collect();
-        let mut sk = ScatterKey::new(ScatterSpec::JoinKey(&key), schema, NW).expect("the fixture key routes");
-        sk.worker(mb, row)
+        let sk = ScatterKey::new(ScatterSpec::JoinKey(&key), schema).expect("the fixture key routes");
+        workers(&sk, schema, mb, NW)[row]
     }
 
     // (1) non-null I64 payload; (2) NULL I64 payload (nullable col).
@@ -179,26 +191,24 @@ fn scatter_key_refuses_a_key_this_schema_cannot_route() {
         ],
         &[0],
     );
-    let nw = 4;
     assert!(
-        ScatterKey::new(ScatterSpec::GroupKey(&[7]), &schema, nw).is_err(),
+        ScatterKey::new(ScatterSpec::GroupKey(&[7]), &schema).is_err(),
         "a group key naming a column the schema has not got"
     );
     assert!(
-        ScatterKey::new(ScatterSpec::JoinKey(&[(7, None)]), &schema, nw).is_err(),
+        ScatterKey::new(ScatterSpec::JoinKey(&[(7, None)]), &schema).is_err(),
         "a reindex key naming a column the schema has not got"
     );
     assert!(
-        ScatterKey::new(ScatterSpec::JoinKey(&[(1, None)]), &schema, nw).is_err(),
+        ScatterKey::new(ScatterSpec::JoinKey(&[(1, None)]), &schema).is_err(),
         "a reindex key over a float column, which no OPK packs"
     );
 }
 
 /// Run one `GroupKey` scatter's router over `row`.
 fn group_worker(schema: &SchemaDescriptor, cols: &[u32], b: &Batch, row: usize, nw: usize) -> usize {
-    ScatterKey::new(ScatterSpec::GroupKey(cols), schema, nw)
-        .expect("the fixture key routes")
-        .worker(&b.as_mem_batch(), row)
+    let key = ScatterKey::new(ScatterSpec::GroupKey(cols), schema).expect("the fixture key routes");
+    workers(&key, schema, &b.as_mem_batch(), nw)[row]
 }
 
 /// Rows sharing a `Fold` routing key land on one worker whatever their PKs — the
@@ -265,42 +275,6 @@ fn a_payload_group_key_routes_by_the_values_opk_image() {
     }
 }
 
-/// Every [`ScatterKey::route_into`] arm lands each row where
-/// [`ScatterKey::worker`] puts it, at that row's own weight, and drops weight-0.
-#[test]
-fn route_into_agrees_with_worker_on_every_scatter_kind() {
-    let schema = make_schema_u64_i64();
-    let nw = 4;
-    let b = make_batch_raw(&schema, &[(1, 1, 70), (9, 3, 70), (4, 0, 55), (6, -2, 13)]);
-    let mb = b.as_mem_batch();
-
-    for spec in [
-        ScatterSpec::GroupKey(&[0u32]),     // PkBytes: the key IS the PK list
-        ScatterSpec::GroupKey(&[1u32]),     // Fold: a payload group key
-        ScatterSpec::JoinKey(&[(1, None)]), // Packed: a non-PK reindex key
-    ] {
-        let mut pool: Vec<Vec<(u32, u32, i64)>> = Vec::new();
-        let slots = crate::storage::reset_slots(&mut pool, nw);
-        ScatterKey::new(spec, &schema, nw)
-            .expect("the fixture key routes")
-            .route_into(&mb, 3, slots);
-
-        let mut key = ScatterKey::new(spec, &schema, nw).expect("the fixture key routes");
-        let mut want: Vec<(usize, u32, u32, i64)> = (0..b.count)
-            .filter(|&r| mb.get_weight(r) != 0)
-            .map(|r| (key.worker(&mb, r), 3u32, r as u32, mb.get_weight(r)))
-            .collect();
-        let mut got: Vec<(usize, u32, u32, i64)> = slots
-            .iter()
-            .enumerate()
-            .flat_map(|(w, rows)| rows.iter().map(move |&(si, r, wt)| (w, si, r, wt)))
-            .collect();
-        want.sort();
-        got.sort();
-        assert_eq!(got, want, "{spec:?}: route_into must match worker row for row");
-    }
-}
-
 // ── routes_to_native_owner: the exchange-elision predicate ──────────────
 
 /// A 3-column compound PK `(U32, I32, U64)` + an I64 payload, so a distribution
@@ -357,10 +331,11 @@ fn every_accepted_spec_routes_each_row_to_its_tables_own_worker() {
                     continue;
                 }
                 accepted += 1;
-                let mut key = ScatterKey::new(spec, &schema, NW).expect("an accepted spec routes");
-                for row in 0..mb.count {
+                let key = ScatterKey::new(spec, &schema).expect("an accepted spec routes");
+                let got = workers(&key, &schema, &mb, NW);
+                for (row, &got) in got.iter().enumerate() {
                     assert_eq!(
-                        key.worker(&mb, row),
+                        got,
                         schema.worker_for_pk(mb.get_pk_bytes(row), NW),
                         "k={k}, {spec:?}, row {row}"
                     );
@@ -384,9 +359,10 @@ fn a_proper_prefix_group_key_is_refused_and_does_route_elsewhere() {
 
     let b = three_col_batch(&schema, 24);
     let mb = b.as_mem_batch();
-    let mut key = ScatterKey::new(ScatterSpec::GroupKey(&cols), &schema, NW).expect("the fixture key routes");
+    let key = ScatterKey::new(ScatterSpec::GroupKey(&cols), &schema).expect("the fixture key routes");
+    let got = workers(&key, &schema, &mb, NW);
     assert!(
-        (0..mb.count).any(|row| key.worker(&mb, row) != schema.worker_for_pk(mb.get_pk_bytes(row), NW)),
+        (0..mb.count).any(|row| got[row] != schema.worker_for_pk(mb.get_pk_bytes(row), NW)),
         "the fold must disagree with the prefix hash somewhere"
     );
 }
@@ -436,5 +412,167 @@ fn a_group_key_routes_natively_only_at_the_two_ends_of_the_prefix() {
     for (k, cols, want) in [(1u8, &[0u32][..], true), (2, &[0, 1], false), (3, &[0, 1, 2], true)] {
         let s = three_col_schema(Placement::Keyed { prefix_len: k });
         assert_eq!(ScatterSpec::GroupKey(cols).routes_to_native_owner(&s), want, "k={k}");
+    }
+}
+
+/// The routing invariant: a group scatter sends each row to the owner of the
+/// output PK the reduce keys its group by.
+#[test]
+fn a_group_scatter_routes_each_row_to_its_output_pks_owner() {
+    const NW: usize = 4;
+    let schema = three_col_schema(Placement::Keyed { prefix_len: 0 });
+    let b = three_col_batch(&schema, 24);
+    let mb = b.as_mem_batch();
+    for cols in [
+        &[][..],
+        &[3],
+        &[0],
+        &[1],
+        &[0, 1],
+        &[1, 0],
+        &[0, 1, 2],
+        &[2, 0, 1],
+        &[3, 0],
+    ] {
+        let (gk, _) = GroupOutKey::for_group_cols(&schema, cols, []).expect("the fixture group keys");
+        let key = ScatterKey::new(ScatterSpec::GroupKey(cols), &schema).expect("the fixture key routes");
+        let got = workers(&key, &schema, &mb, NW);
+        for (row, &got) in got.iter().enumerate() {
+            assert_eq!(
+                got,
+                worker_for_pk_bytes(gk.out_pk(&mb, row).bytes(), NW),
+                "{cols:?} row {row}"
+            );
+        }
+    }
+}
+
+/// Every PK-eligible type code.
+fn pk_eligible_types() -> impl Iterator<Item = TypeCode> {
+    TypeCode::ALL.iter().copied().filter(|t| t.is_pk_eligible())
+}
+
+/// `tc`'s min, 0 and max, as native little-endian cells of its width.
+fn extreme_cells(tc: TypeCode) -> [Vec<u8>; 3] {
+    let w = tc.wire_stride();
+    let (min, max) = if tc.is_signed_int() {
+        let mut min = vec![0u8; w];
+        min[w - 1] = 0x80;
+        let mut max = vec![0xffu8; w];
+        max[w - 1] = 0x7f;
+        (min, max)
+    } else {
+        (vec![0u8; w], vec![0xffu8; w])
+    };
+    [min, vec![0u8; w], max]
+}
+
+/// An unpromoted join key over the PK's leading columns hashes the row's own
+/// leading PK bytes, which is what the reindex Map packs for it.
+#[test]
+fn an_unpromoted_pk_prefix_join_key_hashes_the_bytes_the_map_packs() {
+    for tc in pk_eligible_types() {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(tc, false),
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(TypeCode::I64, false),
+            ],
+            &[0, 1],
+        );
+        let w = tc.wire_stride();
+        let mut b = Batch::with_capacity(&schema, 3);
+        for (i, cell) in extreme_cells(tc).iter().enumerate() {
+            let mut pk = vec![0u8; w + 8];
+            gnitz_wire::encode_pk_column(cell, tc, &mut pk[..w]);
+            gnitz_wire::encode_pk_column(&(i as u64 * 77).to_le_bytes(), TypeCode::U64, &mut pk[w..]);
+            b.extend_pk_bytes(&pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        let mb = b.as_mem_batch();
+        for k in [1usize, 2] {
+            let slots = slots_of(&[0, 1][..k]);
+            let key = ScatterKey::new(ScatterSpec::JoinKey(&slots), &schema).expect("the fixture key routes");
+            let ScatterKey::PkPrefix(n) = key else {
+                panic!("{tc:?} k={k}: not a PK prefix")
+            };
+            let packer = ReindexPacker::new(&schema, &slots).expect("the fixture key packs");
+            let mut buf = [0u8; MAX_PK_BYTES];
+            for row in 0..mb.count {
+                assert_eq!(
+                    packer.pack_prefix(&mut buf, &mb, row),
+                    &mb.get_pk_bytes(row)[..n],
+                    "{tc:?} k={k} row {row}"
+                );
+            }
+        }
+    }
+}
+
+/// A single unpromoted PK-eligible join column routes by its OPK image, landing
+/// each row where the reindex Map's packed bytes do — as a nullable payload
+/// column (NULL rows included) and as a non-leading PK column.
+#[test]
+fn a_single_column_join_key_routes_by_the_image_the_map_packs() {
+    const NW: usize = 4;
+    let check = |schema: &SchemaDescriptor, b: &Batch, c: u32| {
+        let mb = b.as_mem_batch();
+        let slots = [(c, None)];
+        let key = ScatterKey::new(ScatterSpec::JoinKey(&slots), schema).expect("the fixture key routes");
+        assert!(
+            matches!(key, ScatterKey::Image(_)),
+            "{:?}: not an image",
+            schema.columns[c as usize].type_code
+        );
+        let packer = ReindexPacker::new(schema, &slots).expect("the fixture key packs");
+        let got = workers(&key, schema, &mb, NW);
+        let mut buf = [0u8; MAX_PK_BYTES];
+        for (row, &got) in got.iter().enumerate() {
+            let want = worker_for_pk_bytes(packer.pack_prefix(&mut buf, &mb, row), NW);
+            assert_eq!(got, want, "{:?} row {row}", schema.columns[c as usize].type_code);
+        }
+    };
+    for tc in pk_eligible_types() {
+        let w = tc.wire_stride();
+        // A nullable payload column, then the same values plus a NULL.
+        let schema = SchemaDescriptor::new(
+            &[SchemaColumn::new(TypeCode::U64, false), SchemaColumn::new(tc, true)],
+            &[0],
+        );
+        let mut b = Batch::with_capacity(&schema, 4);
+        let cells = extreme_cells(tc);
+        for (i, cell) in cells.iter().chain([&vec![0u8; w]]).enumerate() {
+            b.extend_pk(i as u128 + 1);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&u64::from(i == cells.len()).to_le_bytes());
+            b.extend_col(0, cell);
+            b.count += 1;
+        }
+        check(&schema, &b, 1);
+
+        // A non-leading PK column.
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(tc, false),
+                SchemaColumn::new(TypeCode::I64, false),
+            ],
+            &[0, 1],
+        );
+        let mut b = Batch::with_capacity(&schema, 3);
+        for (i, cell) in cells.iter().enumerate() {
+            let mut pk = vec![0u8; 8 + w];
+            gnitz_wire::encode_pk_column(&(i as u64 + 1).to_le_bytes(), TypeCode::U64, &mut pk[..8]);
+            gnitz_wire::encode_pk_column(cell, tc, &mut pk[8..]);
+            b.extend_pk_bytes(&pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        check(&schema, &b, 1);
     }
 }

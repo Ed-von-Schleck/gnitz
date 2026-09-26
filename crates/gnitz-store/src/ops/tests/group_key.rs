@@ -89,7 +89,7 @@ fn visit_order(runs: &GroupRuns, n: usize) -> Vec<usize> {
     (0..n).map(|p| runs.row(p)).collect()
 }
 
-/// A `PkPermutation` key's runs over an unsorted batch must reproduce the
+/// A `SourcePk` key's runs over an unsorted batch must reproduce the
 /// authoritative `compare_pk_bytes` order. PKs are distinct, so the (unstable)
 /// sort yields a unique order, one run per row.
 fn assert_canonical_order(schema: &SchemaDescriptor, pk_rows: &[Vec<u8>]) {
@@ -254,7 +254,7 @@ fn bench_rows(n: usize, stride: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Regression guard — time `runs` under a `PkPermutation` key over a shuffled
+/// Regression guard — time `runs` under a `SourcePk` key over a shuffled
 /// ~1M-row batch at each keyed arm. `#[ignore]`; run release:
 ///   cargo test -p gnitz-store --release reduce_sort -- --ignored --nocapture --test-threads=1
 #[test]

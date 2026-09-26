@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 
 use crate::schema::{OpBuildErr, SchemaDescriptor};
-use crate::storage::{prorated_blob_cap, run_merge, Batch, Layout, MemBatch, UnifiedSet};
+use crate::storage::{prorated_blob_cap, Batch, Layout, MemBatch, UnifiedSet};
 
 use super::router::{ScatterKey, ScatterSpec};
 
@@ -45,24 +45,13 @@ pub fn op_relay_scatter(
             b.debug_verify_consolidated(schema);
         }
     }
-    let mut key = ScatterKey::new(spec, schema, num_workers)?;
+    let key = ScatterKey::new(spec, schema)?;
     let mem: Vec<MemBatch> = sources.iter().map(|b| b.as_mem_batch()).collect();
 
     Ok(WORKER_ROWS.with(|pool| {
         let mut pool = pool.borrow_mut();
         let slots = crate::storage::reset_slots(&mut pool, num_workers);
-
-        if consolidated && mem.len() >= 2 {
-            // One exemplar per (PK, payload) group, and its members are
-            // byte-equal wherever a key can read, so it routes for all of them.
-            run_merge(&mem, schema, |si, row, w| {
-                slots[key.worker(&mem[si], row)].push((si as u32, row as u32, w));
-            });
-        } else {
-            for (si, mb) in mem.iter().enumerate() {
-                key.route_into(mb, si as u32, slots);
-            }
-        }
+        key.route(&mem, schema, consolidated && mem.len() >= 2, slots);
 
         let mut out = worker_rows_to_batches(schema, &mem, slots);
         if consolidated {

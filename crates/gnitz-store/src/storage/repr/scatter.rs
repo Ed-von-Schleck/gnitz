@@ -38,6 +38,10 @@ pub fn route_rows_by_pk<'a>(
     num_workers: usize,
 ) -> &'a mut [Vec<u32>] {
     let slots = reset_slots(out, num_workers);
+    if num_workers == 1 {
+        slots[0].extend((0..mb.count).filter(|&i| mb.get_weight(i) != 0).map(|i| i as u32));
+        return slots;
+    }
     for i in 0..mb.count {
         if mb.get_weight(i) == 0 {
             continue;

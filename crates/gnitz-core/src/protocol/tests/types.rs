@@ -1344,3 +1344,22 @@ fn fixture_round_trips_through_encode_and_decode() {
         assert_eq!(decoded, batch, "batch must survive encode -> decode");
     }
 }
+
+/// A permutation of the PK is sent as the PK list and keyed by it; any other
+/// group set is sent as written.
+#[test]
+fn reduce_key_sends_a_pk_permutation_as_the_pk_list() {
+    let s = Schema::from_parts(
+        vec![
+            ColumnDef::new("a", TypeCode::U64, false),
+            ColumnDef::new("b", TypeCode::U64, false),
+            ColumnDef::new("c", TypeCode::I64, false),
+        ],
+        vec![0, 1],
+    )
+    .expect("client-valid schema");
+    assert_eq!(s.reduce_key(&[1, 0]), (ReduceOutKey::SourcePk, vec![0, 1]));
+    assert_eq!(s.reduce_key(&[0, 1]), (ReduceOutKey::SourcePk, vec![0, 1]));
+    assert_eq!(s.reduce_key(&[1]), (ReduceOutKey::SingleNaturalCol, vec![1]));
+    assert_eq!(s.reduce_key(&[2, 1]), (ReduceOutKey::SyntheticFold, vec![2, 1]));
+}

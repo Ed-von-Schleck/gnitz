@@ -153,11 +153,12 @@ impl Schema {
     }
 
     /// The output-key kind a reduce or top-N grouped by `group` gets (the engine
-    /// derives the same), and `group` in output-key order: sharding by it lands
-    /// each output row on the worker owning its PK.
+    /// derives the same), and the group list to send it: SQL's GROUP BY is
+    /// unordered, so a permutation of the PK is sent as the PK list itself.
     pub fn reduce_key(&self, group: &[u32]) -> (ReduceOutKey, Vec<u32>) {
-        let key = self.reduce_out_key(group);
-        (key, key.key_region(&self.pk_cols, group).unwrap_or(group).to_vec())
+        let is_pk = group.len() == self.pk_cols.len() && self.pk_cols.iter().all(|p| group.contains(p));
+        let group = if is_pk { &self.pk_cols[..] } else { group };
+        (self.reduce_out_key(group), group.to_vec())
     }
 
     /// The single definition of "this is an admissible schema": the

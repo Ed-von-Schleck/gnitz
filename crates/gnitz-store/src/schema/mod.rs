@@ -620,11 +620,7 @@ impl SchemaDescriptor {
     /// owning worker by hashing only the leading distribution prefix
     /// (`key[..dist_stride()]`), so the slicing rule lives in one place. `key` is
     /// the full PK, and for the full-PK default this is byte-identical to hashing
-    /// all of it.
-    ///
-    /// Not for **join-key** routing: the exchange relay scatters route an already
-    /// reindexed `_join_pk` over a derived schema and call `worker_for_pk_bytes`
-    /// directly (their key is the whole region, never a table prefix).
+    /// all of it. An exchange scatter resolves its own key in `ScatterKey`.
     #[inline]
     pub fn worker_for_pk(&self, key: &[u8], num_workers: usize) -> usize {
         worker_for_pk_bytes(&key[..self.dist_stride()], num_workers)

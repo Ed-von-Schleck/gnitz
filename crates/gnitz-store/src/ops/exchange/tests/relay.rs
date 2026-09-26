@@ -453,38 +453,164 @@ fn promoted_single_join_key_scatter_copartitions() {
     check_copartition(&pk_out, &pk_packer, num_workers, pk_rows.len(), None, "promoted PK key");
 }
 
-/// Release-only microbench of [`op_relay_scatter`] over 1M rows keyed by one I64
-/// payload column — the single-column `JoinKey` route.
-/// `cd crates && cargo test -p gnitz-store --release scatter_route_bench -- --ignored --nocapture --test-threads=1`
-#[test]
-#[ignore]
-fn scatter_route_bench() {
+/// A U64 PK plus two I64 payload columns: the multi-column payload key benches.
+fn make_schema_u64_2xi64() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+        ],
+        &[0],
+    )
+}
+
+/// `n` rows over a U64-PK, all-I64-payload `schema`, PKs `j, j + k, j + 2k, …`,
+/// each payload a spread function of the PK. Certified consolidated iff asked.
+fn bench_stripe(schema: &SchemaDescriptor, n: usize, j: usize, k: usize, consolidated: bool) -> Batch {
+    let mut b = crate::storage::BatchBuilder::new(*schema);
+    for i in 0..n {
+        let pk = (i * k + j) as u64;
+        b.begin_row(pk as u128, 1);
+        for c in 1..schema.columns.len() as i64 {
+            b.put_int((pk as i64).wrapping_mul(2_654_435_761 + c) as u128);
+        }
+        b.end_row();
+    }
+    let mut b = b.finish();
+    if consolidated {
+        b.certify_layout(Layout::Consolidated);
+    }
+    b
+}
+
+/// Release-only microbench of one [`ScatterSpec`]'s route through
+/// [`op_relay_scatter`], 1M rows to 4 workers: `merge` over 4 consolidated
+/// PK-disjoint stripes, else over one `Raw` source. Compare instructions retired:
+/// `perf stat -e instructions:u <test-bin> --exact <bench> --ignored --test-threads=1`.
+fn route_kind_bench(name: &str, spec: ScatterSpec<'_>, schema: &SchemaDescriptor, merge: bool) {
     use std::hint::black_box;
     use std::time::Instant;
 
-    let schema = make_schema_u64_i64();
     const N: usize = 1_000_000;
     const ITERS: usize = 20;
-    let rows: Vec<(u64, i64, i64)> = (0..N)
-        .map(|i| (i as u64, 1, (i as i64).wrapping_mul(2_654_435_761)))
-        .collect();
-    let cb = make_batch(&schema, &rows);
-    let sources = [&cb];
+    const WORKERS: usize = 4;
+    let k = if merge { 4 } else { 1 };
+    let batches: Vec<Batch> = (0..k).map(|j| bench_stripe(schema, N / k, j, k, merge)).collect();
+    let sources: Vec<&Batch> = batches.iter().collect();
 
-    // Warm up (and pin the invariant: the route must not drop rows).
-    let warm = scatter(&sources, ScatterSpec::JoinKey(&[(1, None)]), &schema, 4);
-    assert_eq!(total_rows(&warm), N, "scatter dropped rows");
+    let warm = scatter(&sources, spec, schema, WORKERS);
+    assert_eq!(total_rows(&warm), N, "{name}: scatter dropped rows");
 
     let t = Instant::now();
     let mut acc = 0usize;
     for _ in 0..ITERS {
-        let out = scatter(&sources, ScatterSpec::JoinKey(&[(1, None)]), &schema, 4);
-        acc += black_box(total_rows(&out));
+        acc += black_box(total_rows(&scatter(&sources, spec, schema, WORKERS)));
     }
     let secs = t.elapsed().as_secs_f64();
     println!(
-        "scatter_route_bench: {:.1} Mrows/s ({N} rows × {ITERS} iters in {secs:.3}s, checksum {acc})",
+        "{name}: {:.1} Mrows/s ({N} rows × {ITERS} iters in {secs:.3}s, checksum {acc})",
         (N * ITERS) as f64 / secs / 1e6,
+    );
+}
+
+#[test]
+#[ignore]
+fn scatter_route_pk_linear_bench() {
+    route_kind_bench("pk_linear", ScatterSpec::GroupKey(&[0]), &make_schema_u64_i64(), false);
+}
+
+#[test]
+#[ignore]
+fn scatter_route_pk_merge_bench() {
+    route_kind_bench("pk_merge", ScatterSpec::GroupKey(&[0]), &make_schema_u64_i64(), true);
+}
+
+#[test]
+#[ignore]
+fn scatter_route_image_join_linear_bench() {
+    route_kind_bench(
+        "image_join_linear",
+        ScatterSpec::JoinKey(&[(1, None)]),
+        &make_schema_u64_i64(),
+        false,
+    );
+}
+
+#[test]
+#[ignore]
+fn scatter_route_image_join_merge_bench() {
+    route_kind_bench(
+        "image_join_merge",
+        ScatterSpec::JoinKey(&[(1, None)]),
+        &make_schema_u64_i64(),
+        true,
+    );
+}
+
+#[test]
+#[ignore]
+fn scatter_route_image_group_linear_bench() {
+    route_kind_bench(
+        "image_group_linear",
+        ScatterSpec::GroupKey(&[1]),
+        &make_schema_u64_i64(),
+        false,
+    );
+}
+
+#[test]
+#[ignore]
+fn scatter_route_image_group_merge_bench() {
+    route_kind_bench(
+        "image_group_merge",
+        ScatterSpec::GroupKey(&[1]),
+        &make_schema_u64_i64(),
+        true,
+    );
+}
+
+#[test]
+#[ignore]
+fn scatter_route_packed_linear_bench() {
+    route_kind_bench(
+        "packed_linear",
+        ScatterSpec::JoinKey(&[(1, None), (2, None)]),
+        &make_schema_u64_2xi64(),
+        false,
+    );
+}
+
+#[test]
+#[ignore]
+fn scatter_route_packed_merge_bench() {
+    route_kind_bench(
+        "packed_merge",
+        ScatterSpec::JoinKey(&[(1, None), (2, None)]),
+        &make_schema_u64_2xi64(),
+        true,
+    );
+}
+
+#[test]
+#[ignore]
+fn scatter_route_fold_linear_bench() {
+    route_kind_bench(
+        "fold_linear",
+        ScatterSpec::GroupKey(&[1, 2]),
+        &make_schema_u64_2xi64(),
+        false,
+    );
+}
+
+#[test]
+#[ignore]
+fn scatter_route_fold_merge_bench() {
+    route_kind_bench(
+        "fold_merge",
+        ScatterSpec::GroupKey(&[1, 2]),
+        &make_schema_u64_2xi64(),
+        true,
     );
 }
 

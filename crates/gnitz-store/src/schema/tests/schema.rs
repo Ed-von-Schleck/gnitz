@@ -68,7 +68,7 @@ fn test_identity_map_detection() {
 
 /// A nullable single group column must NOT be promoted to the natural PK
 /// (the PK region has no null bitmap); a non-nullable one is. Grouping by
-/// the PK itself takes precedence as `PkPermutation`.
+/// the PK itself takes precedence as `SourcePk`.
 #[test]
 fn nullable_group_col_is_not_natural_reduce_key() {
     let nullable = SchemaDescriptor::new(
@@ -88,7 +88,7 @@ fn nullable_group_col_is_not_natural_reduce_key() {
         &[0],
     );
     assert_eq!(non_nullable.reduce_out_key(&[1]), ReduceOutKey::SingleNaturalCol);
-    assert_eq!(non_nullable.reduce_out_key(&[0]), ReduceOutKey::PkPermutation);
+    assert_eq!(non_nullable.reduce_out_key(&[0]), ReduceOutKey::SourcePk);
 }
 
 // ── Placement / distribution prefix (CLUSTER BY) ────────────────────────

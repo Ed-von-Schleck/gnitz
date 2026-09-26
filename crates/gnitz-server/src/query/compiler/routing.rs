@@ -33,7 +33,8 @@ pub(crate) struct ViewMeta {
     /// source table id → how the master routes the delta this source scatters.
     /// A source absent from it does not scatter.
     source_routes: FxHashMap<i64, RelayRoute>,
-    /// The view's own shard columns; its output relay routes by their group fold.
+    /// The view's own shard columns; its output relay routes each row to the
+    /// owner of the output PK `op_reduce` keys each group by.
     output_shard_cols: Box<[u32]>,
     /// The circuit's one `ExchangeShard` is a proven no-op: every row it would
     /// move already sits on the worker owning its distribution key.
@@ -147,8 +148,8 @@ impl ViewMeta {
         self.source_bounds.get(&source).cloned().unwrap_or(ReadBound::None)
     }
 
-    /// The columns a side's relayed output is routed by, under the null-distinct
-    /// group fold `op_reduce` keys its output with.
+    /// The columns a side's relayed output is routed by: to the owner of the
+    /// output PK `op_reduce` keys each group by.
     pub(crate) fn output_shard_cols(&self) -> &[u32] {
         &self.output_shard_cols
     }

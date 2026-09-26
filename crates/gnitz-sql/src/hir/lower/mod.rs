@@ -86,7 +86,7 @@ pub(crate) fn keyed_frame(
     tail: Vec<HirCol>,
 ) -> Result<Frame, GnitzSqlError> {
     let (mut layout, mut cols, mut npk) = (Vec::new(), Vec::new(), 0usize);
-    for slot in out_key.output_layout(&input.schema.pk_cols, group, row) {
+    for slot in out_key.output_layout(group, row) {
         let (id, def) = match slot {
             ReduceOutSlot::SyntheticKey => (ColId::NONE, group_pk_def()),
             ReduceOutSlot::Key(c) | ReduceOutSlot::Carried(c) => {
