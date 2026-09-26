@@ -213,6 +213,47 @@ fn a_global_aggregate_under_a_keyed_shard_is_rejected() {
     );
 }
 
+/// Under an empty-keyed shard, only the worker V₀ routes to seeds the ground row.
+#[test]
+fn only_the_ground_owner_seeds_the_ground_row() {
+    let schema = make_schema_u64_i64();
+    let loaded = loaded_for_test(
+        [
+            (0, scan_delta(10)),
+            (1, gnitz_wire::OpNode::ExchangeShard { shard_cols: vec![] }),
+            (
+                2,
+                gnitz_wire::OpNode::Reduce {
+                    group_cols: vec![],
+                    agg: vec![gnitz_wire::AggDescriptor::COUNT_STAR],
+                    global_ground: true,
+                },
+            ),
+            (3, gnitz_wire::OpNode::IntegrateSink),
+        ],
+        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_IN)],
+    );
+    for rank in 0..4u32 {
+        let mut registry = RelationRegistry::new("", gnitz_store::storage::Slot::new(rank, 4), Default::default());
+        register_sources(&mut registry, [(10, schema)]);
+        // The post phase: the shard is a seed register.
+        let (plan, _) = build(
+            &loaded,
+            &loaded.ordered_where(|n| n >= 2),
+            &registry,
+            false,
+            &[(1, schema)],
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.vm.pending_ground_row,
+            rank as usize == gnitz_store::schema::ground_owner(4),
+            "rank {rank}"
+        );
+    }
+}
+
 // ── Crafted raw-field guards: reject at compile, never abort at run ─────
 //
 // Each guard is proven by construction: the ONLY difference between the two

@@ -721,12 +721,6 @@ impl FoldCols {
         FoldCols { locs, inline }
     }
 
-    /// The folded columns, in key order.
-    #[inline]
-    pub(crate) fn locs(&self) -> &[ColumnLocator] {
-        &self.locs
-    }
-
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.locs.is_empty()
@@ -951,8 +945,7 @@ impl ReindexPacker {
 
     /// The output PK columns this packer's bytes fill, in key order. The
     /// promoters are the only derivation of that layout, so a schema built from
-    /// these describes what `pack_into` writes by construction —
-    /// [`Self::output_schema`] and `AviBake::new` both take theirs from here.
+    /// these describes what `pack_into` writes by construction.
     pub(crate) fn key_columns(&self) -> impl Iterator<Item = SchemaColumn> + '_ {
         let bitmap = self.has_bitmap.then_some(BITMAP_COL);
         let fold = (!self.fold.is_empty()).then_some(FOLD_COL);
@@ -987,10 +980,8 @@ impl ReindexPacker {
         Ok(b.finish())
     }
 
-    /// Build the packer for a **group** key over `group_cols`, leaving the PK
-    /// budget `reserve` needs for the suffix columns the caller appends behind
-    /// the key. Every slot is derived here and read back through
-    /// [`Self::key_columns`], so a group key's slots and its bytes agree.
+    /// Build the packer for a **group** key over `group_cols`, and the PK region
+    /// of an index keyed by it: [`Self::key_columns`], then `suffix`.
     ///
     /// Greedy: pack leading columns while the budget still leaves room for the
     /// fold slot the rest would need. Unlike a join key this is total over
@@ -999,35 +990,30 @@ impl ReindexPacker {
     pub(crate) fn new_group_key(
         schema: &SchemaDescriptor,
         group_cols: &[u32],
-        reserve: &[SchemaColumn],
-    ) -> Result<Self, OpBuildErr> {
-        // The reservation is the suffix columns themselves, so their count and
-        // their width are one fact rather than two that can drift.
-        let max_cols = MAX_PK_COLUMNS - reserve.len();
-        let max_bytes = MAX_PK_BYTES - reserve.iter().map(|c| c.size() as usize).sum::<usize>();
-        // Both bounds are functions of the reservation alone, so they are
-        // checked here rather than left to each caller to assert for itself.
+        suffix: &[SchemaColumn],
+    ) -> Result<(Self, DerivedSchema), OpBuildErr> {
+        let max_cols = MAX_PK_COLUMNS - suffix.len();
+        let max_bytes = MAX_PK_BYTES - suffix.iter().map(|c| c.size() as usize).sum::<usize>();
         assert!(
             max_cols >= 2 && max_bytes >= BITMAP_BYTES + FOLD_BYTES,
-            "group-key reservation must leave room for a bitmap byte and a fold slot",
+            "a group-key suffix must leave room for a bitmap byte and a fold slot",
         );
         assert!(max_cols <= 9, "the one bitmap byte addresses at most 8 packed columns");
-        // Over *all* group columns: narrowing it to the packed prefix would be
-        // circular, since the reservation is an input to the budget deciding it.
-        // The range test precedes it — every read below indexes the fixed array
-        // raw, where `[num_columns, 65)` reads back as a lying 8-byte column.
-        for &c in group_cols {
-            locate_key_col(schema, c, "group key")?;
-        }
-        let has_bitmap = group_cols.iter().any(|&c| schema.columns[c as usize].nullable);
+        let group: Vec<(SchemaColumn, ColumnLocator)> = group_cols
+            .iter()
+            .map(|&c| {
+                let loc = locate_key_col(schema, c, "group key")?;
+                Ok((schema.columns[c as usize], loc))
+            })
+            .collect::<Result<_, OpBuildErr>>()?;
+        let has_bitmap = group.iter().any(|(col, _)| col.nullable);
 
         // The bitmap occupies one leading slot, so both budgets start spent by it.
         let lead = usize::from(has_bitmap);
         let mut cols = [ColPromoter::PLACEHOLDER; MAX_PK_COLUMNS];
         let mut stride = lead * BITMAP_BYTES;
         let mut n_packed = 0usize;
-        for (i, &c) in group_cols.iter().enumerate() {
-            let col = schema.columns[c as usize];
+        for (i, &(col, loc)) in group.iter().enumerate() {
             // A group column takes the same slot a join key's would; the float
             // arm the two policies would differ on returned above.
             let out_tc = col.type_code.reindex_output_type();
@@ -1035,29 +1021,30 @@ impl ReindexPacker {
             // Room this column needs, plus the fold slot the columns behind it
             // would still require. Reserving it here is what keeps the greedy
             // walk from packing a column it would have to give back.
-            let tail_cols = usize::from(i + 1 < group_cols.len());
+            let tail_cols = usize::from(i + 1 < group.len());
             if lead + n_packed + 1 + tail_cols > max_cols || stride + w + tail_cols * FOLD_BYTES > max_bytes {
                 break;
             }
-            cols[n_packed] = ColPromoter::new(out_tc, col.nullable, classify_promote(schema.locate(c as usize)));
+            cols[n_packed] = ColPromoter::new(out_tc, col.nullable, classify_promote(loc));
             stride += w;
             n_packed += 1;
         }
-        let fold = FoldCols::new(
-            group_cols[n_packed..]
-                .iter()
-                .map(|&c| schema.locate(c as usize))
-                .collect(),
-        );
+        let fold = FoldCols::new(group[n_packed..].iter().map(|&(_, loc)| loc).collect());
         stride += if fold.is_empty() { 0 } else { FOLD_BYTES };
 
-        Ok(ReindexPacker {
+        let packer = ReindexPacker {
             cols,
             num_cols: n_packed,
             out_stride: stride,
             has_bitmap,
             fold,
-        })
+        };
+        let mut b = DerivedSchema::new();
+        for c in packer.key_columns().chain(suffix.iter().copied()) {
+            b.push_pk(c)
+                .expect("a group key packed inside the suffix's budget, plus the suffix, is non-null PK-eligible");
+        }
+        Ok((packer, b))
     }
 
     /// Pack the full reindex key (`out_stride` OPK bytes) for `row` into `dst`.

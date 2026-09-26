@@ -739,10 +739,7 @@ fn test_german_string_promote_key_empty_is_zero() {
 fn hash_fold_stack_arm_matches_the_scratch_arm() {
     /// The same columns folded the other way — the arm `FoldCols::new` did not pick.
     fn flipped(f: &FoldCols) -> FoldCols {
-        FoldCols {
-            locs: f.locs().to_vec(),
-            inline: !f.inline,
-        }
+        FoldCols { locs: f.locs.clone(), inline: !f.inline }
     }
 
     let schema = SchemaDescriptor::new(
@@ -1227,7 +1224,9 @@ fn test_group_key_bitmap_bit_positions() {
     }
     let mb = b.as_mem_batch();
 
-    let packer = ReindexPacker::new_group_key(&schema, &[1, 2], &[]).expect("integer group columns");
+    let packer = ReindexPacker::new_group_key(&schema, &[1, 2], &[])
+        .expect("integer group columns")
+        .0;
     assert_eq!(packer.out_stride, 1 + 8 + 4, "bitmap ++ I64 slot ++ U32 slot");
 
     let mut null_row = [0u8; crate::schema::MAX_PK_BYTES];
@@ -1428,7 +1427,9 @@ fn reindex_pack_bench() {
         gb.count += 1;
     }
     let gmb = gb.as_mem_batch();
-    let grp_packer = ReindexPacker::new_group_key(&grp_schema, &[1, 2], &[]).expect("integer group columns");
+    let grp_packer = ReindexPacker::new_group_key(&grp_schema, &[1, 2], &[])
+        .expect("integer group columns")
+        .0;
 
     for (name, packer, mb) in [("join3", &join_packer, &jmb), ("group2-nullable", &grp_packer, &gmb)] {
         let stride = packer.out_stride;

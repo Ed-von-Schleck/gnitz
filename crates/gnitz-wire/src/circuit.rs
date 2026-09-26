@@ -106,7 +106,7 @@ impl AggFunc {
 /// input. Carries no column *type* — that is `schema.columns[col_idx]`, which
 /// every consumer already holds. The one spelling on both wire paths: a
 /// `Reduce` node's parameters and an ad-hoc fold's `ReadSpec` ship this, and
-/// `ReducePlan::from_wire` consumes it.
+/// the reduce and the ad-hoc fold consume it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AggDescriptor {
     pub col_idx: u32,
@@ -229,13 +229,7 @@ impl ReduceOutKey {
     }
 
     /// The source columns spelling the output's PK region, in output PK order, or
-    /// `None` for the synthetic fold key. Borrowed from the caller's own lists —
-    /// no kind builds a region of its own.
-    ///
-    /// `SingleNaturalCol` names `group_cols[0]`, which [`Self::for_group_cols`]
-    /// only selects for a single-column group set — so the index is in range by
-    /// construction. The ad-hoc fold's hardcoded `SyntheticFold` never reaches
-    /// that arm.
+    /// `None` for the synthetic fold key.
     pub fn key_region<'a>(self, pk_cols: &'a [u32], group_cols: &'a [u32]) -> Option<&'a [u32]> {
         match self {
             // The output PK region mirrors the source's PK byte layout, so it
@@ -385,13 +379,8 @@ pub enum OpNode {
         /// Aggregate specs `(func, source column)`. Carries a `Count`;
         /// `ReducePlan::from_wire` refuses a list without one.
         agg: Vec<AggDescriptor>,
-        /// True only for the user's ungrouped (global) scalar aggregate — the
-        /// reduce that must emit exactly one row over an empty/fully-retracted
-        /// source (COUNT(*)=0, SUM/MIN/MAX/AVG=NULL). A **SQL-intent
-        /// discriminator**, not a Z-set property: the flag is false for any
-        /// group-less reduce that is not the user's scalar aggregate, so it
-        /// cannot be derived from `group_cols.is_empty()` and travels explicitly
-        /// from the planner.
+        /// The user's scalar aggregate, which emits one row over an empty source
+        /// (COUNT(*)=0, the rest NULL). Other group-less reduces leave it false.
         global_ground: bool,
     },
     /// The delta-trace join. `delta_is_right` says which SQL side the delta port
@@ -1066,6 +1055,10 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
         Opcode::Reduce => {
             let global_ground = r.bool()?;
             let group_cols = read_cols(&mut r)?;
+            // The ground row carries no group columns.
+            if global_ground && !group_cols.is_empty() {
+                return Err("REDUCE global-ground over a non-empty group set".to_string());
+            }
             let agg = read_aggs(&mut r)?;
             OpNode::Reduce { group_cols, agg, global_ground }
         }

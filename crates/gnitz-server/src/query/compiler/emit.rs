@@ -297,10 +297,10 @@ fn emit_reduce(
 ) -> Result<OutReg, String> {
     let in_reg = ctx.unary_delta_in(nid)?;
     let in_schema = ctx.reg_schema(in_reg);
-    let i_am_owner = global_ground && owns_ground(ctx, nid)?;
+    let seeds_ground = global_ground && owns_ground(ctx, nid)?;
     let plan = match ctx.reads_partials(nid) {
-        true => gnitz_store::ops::ReducePlan::combine(&in_schema, agg, global_ground, i_am_owner)?,
-        false => gnitz_store::ops::ReducePlan::from_wire(&in_schema, group_cols, agg, global_ground, i_am_owner)?,
+        true => gnitz_store::ops::ReducePlan::combine(&in_schema, agg, seeds_ground)?,
+        false => gnitz_store::ops::ReducePlan::from_wire(&in_schema, group_cols, agg, seeds_ground)?,
     };
     Ok(OutReg::Delta(push_reduce(ctx, nid, FUNNEL_REDUCE, in_reg, plan)))
 }
@@ -380,8 +380,9 @@ fn emit_partial(ctx: &mut EmitCtx, consumer: NodeId) -> Result<Option<DeltaReg>,
     Ok(match ctx.loaded.op(consumer) {
         gnitz_wire::OpNode::Reduce { agg, .. } => {
             // No ground row: a worker with no rows contributes no partial.
-            let plan = gnitz_store::ops::ReducePlan::from_wire(&in_schema, &[], agg, false, false)?;
-            plan.combines().then(|| push_reduce(ctx, shard, PARTIAL, in_reg, plan))
+            let plan = gnitz_store::ops::ReducePlan::from_wire(&in_schema, &[], agg, false)?;
+            plan.is_exact_linear()
+                .then(|| push_reduce(ctx, shard, PARTIAL, in_reg, plan))
         }
         gnitz_wire::OpNode::TopN { order, limit, offset, .. } => {
             let plan = gnitz_store::ops::TopNPlan::partial(&in_schema, order, *limit, *offset)?;

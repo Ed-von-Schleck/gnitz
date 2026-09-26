@@ -1,59 +1,13 @@
 //! `ReducePlan`, everything `op_reduce` needs baked at emit time, and the
 //! `ReduceShape` part of it the ad-hoc fold shares.
 
-use crate::schema::{
-    DerivedSchema, OpBuildErr, ReduceOutKey, SchemaBound, SchemaColumn, SchemaDescriptor, SchemaFacts,
-};
+use crate::schema::{DerivedSchema, OpBuildErr, SchemaBound, SchemaColumn, SchemaDescriptor};
 
 use super::super::group_key::GroupOutKey;
 use super::agg::Accumulator;
 use super::avi::AviBake;
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
-
-/// Every column index a reduce reads, bounded against the schema it indexes.
-fn check_cols(schema: &SchemaDescriptor, group_cols: &[u32], agg_descs: &[AggDescriptor]) -> Result<(), OpBuildErr> {
-    schema.check_cols(
-        group_cols
-            .iter()
-            .map(|&c| ("reduce: group column", c))
-            .chain(agg_descs.iter().map(|d| ("reduce: aggregate column", d.col_idx))),
-    )
-}
-
-/// Build the reduce output schema from `out_key`. `Err` for an aggregate its
-/// column's type does not admit, and for columns overflowing a schema bound.
-pub(super) fn build_reduce_output_schema(
-    input: &SchemaDescriptor,
-    group_cols: &[u32],
-    agg_descs: &[AggDescriptor],
-    out_key: ReduceOutKey,
-) -> Result<SchemaDescriptor, OpBuildErr> {
-    let over = |e: SchemaBound| OpBuildErr::shape(format!("reduce: output {e}"));
-    let mut b = DerivedSchema::new();
-    for slot in out_key.output_layout(input.pk_indices(), group_cols, group_cols.iter().copied()) {
-        match slot {
-            gnitz_wire::ReduceOutSlot::SyntheticKey => b.push_pk(super::super::group_key::GROUP_PK_COL),
-            gnitz_wire::ReduceOutSlot::Key(c) => b.push_pk(input.columns[c as usize]),
-            gnitz_wire::ReduceOutSlot::Carried(c) => b.push(input.columns[c as usize]),
-        }
-        .map_err(over)?;
-    }
-    // Nullability covers what `emit_agg_col` writes.
-    let ungrouped = group_cols.is_empty();
-    for ad in agg_descs {
-        let src = input.columns[ad.col_idx as usize];
-        let tc = gnitz_wire::agg_output_type(ad.agg_op, src.type_code).ok_or_else(|| {
-            OpBuildErr::shape(format!(
-                "reduce: {:?} is not defined over type code {}",
-                ad.agg_op, src.type_code
-            ))
-        })?;
-        let nullable = ad.agg_op.raw_output_nullable(src.nullable, ungrouped);
-        b.push(SchemaColumn::new(tc, nullable)).map_err(over)?;
-    }
-    Ok(b.finish())
-}
 
 /// What a reduce's rows look like, shared by the circuit reduce and the ad-hoc
 /// fold: the output layout, the group key, and the accumulator set.
@@ -65,51 +19,49 @@ pub struct ReduceShape {
 }
 
 impl ReduceShape {
-    /// A circuit reduce's shape: the output is keyed as `reduce_out_key` decides.
-    fn for_circuit(input: &SchemaDescriptor, group_cols: &[u32], aggs: &[AggDescriptor]) -> Result<Self, OpBuildErr> {
-        check_cols(input, group_cols, aggs)?;
-        Self::build(input, group_cols, aggs, input.reduce_out_key(group_cols))
-    }
-
-    /// The ad-hoc fold's shape: always keyed by the synthetic group key.
-    pub(super) fn for_fold(
+    /// `aggs` over `input`, behind `key`'s leading `prefix` columns. `Err` for an
+    /// aggregate column out of range or of a type its aggregate does not admit,
+    /// and for columns overflowing a schema bound.
+    pub(super) fn new(
         input: &SchemaDescriptor,
-        group_cols: &[u32],
+        key: GroupOutKey,
+        mut prefix: DerivedSchema,
         aggs: &[AggDescriptor],
     ) -> Result<Self, OpBuildErr> {
-        check_cols(input, group_cols, aggs)?;
-        Self::build(input, group_cols, aggs, ReduceOutKey::SyntheticFold)
+        let over = |e: SchemaBound| OpBuildErr::shape(format!("reduce: output {e}"));
+        // Nullability covers what `emit_agg_col` writes.
+        let ungrouped = key.group.cols.is_empty();
+        for d in aggs {
+            let src = input
+                .column(d.col_idx as usize)
+                .ok_or_else(|| OpBuildErr::oob_col("reduce: aggregate column", d.col_idx, input))?;
+            let tc = gnitz_wire::agg_output_type(d.agg_op, src.type_code).ok_or_else(|| {
+                OpBuildErr::shape(format!(
+                    "reduce: {:?} is not defined over type code {}",
+                    d.agg_op, src.type_code
+                ))
+            })?;
+            prefix
+                .push(SchemaColumn::new(
+                    tc,
+                    d.agg_op.raw_output_nullable(src.nullable, ungrouped),
+                ))
+                .map_err(over)?;
+        }
+        let output_schema = prefix.finish();
+        // The aggregates are the trailing output columns.
+        let cbase = output_schema.num_columns() - aggs.len();
+        let acc_template = aggs
+            .iter()
+            .zip(cbase..)
+            .map(|(d, c)| Accumulator::new(d.agg_op, input.locate(d.col_idx as usize), output_schema.locate(c)))
+            .collect();
+        Ok(ReduceShape { output_schema, key, acc_template })
     }
 
     /// Grouped by the empty set: one group, V₀.
     pub(super) fn is_global(&self) -> bool {
         self.key.group.cols.is_empty()
-    }
-
-    /// `Err` for an output [`build_reduce_output_schema`] refuses and a group
-    /// column the group key refuses.
-    fn build(
-        input: &SchemaDescriptor,
-        group_cols: &[u32],
-        aggs: &[AggDescriptor],
-        out_key: ReduceOutKey,
-    ) -> Result<Self, OpBuildErr> {
-        let output_schema = build_reduce_output_schema(input, group_cols, aggs, out_key)?;
-        // The aggregates are the trailing output columns.
-        let cbase = output_schema.num_columns() - aggs.len();
-        let acc_template = aggs
-            .iter()
-            .enumerate()
-            .map(|(k, d)| {
-                Accumulator::new(
-                    d.agg_op,
-                    input.locate(d.col_idx as usize),
-                    output_schema.locate(cbase + k),
-                )
-            })
-            .collect();
-        let key = GroupOutKey::new(input, group_cols, out_key, &output_schema)?;
-        Ok(ReduceShape { output_schema, key, acc_template })
     }
 }
 
@@ -120,100 +72,76 @@ pub struct ReducePlan {
     pub seeds_ground: bool,
     /// Position of the aggregate holding a group's net row count.
     pub(super) cardinality: usize,
-    /// The value index the non-linear aggregates read their history from;
-    /// `Some` iff there is one.
+    /// The value index the non-linear aggregates read their history from.
     pub avi: Option<AviBake>,
 }
 
 impl ReducePlan {
-    /// True iff the VM folds this reduce's input first: a value index reads net
-    /// weights, and a float sum depends on row order.
-    #[inline]
-    pub fn consolidates_input(&self) -> bool {
-        self.avi.is_some() || self.sums_float()
-    }
-
-    /// True iff per-worker partials of this global reduce [`Self::combine`] to
-    /// exactly its result.
-    pub fn combines(&self) -> bool {
-        self.avi.is_none() && !self.sums_float()
-    }
-
-    fn sums_float(&self) -> bool {
-        self.shape.acc_template.iter().any(Accumulator::sums_float)
-    }
-
-    /// `Err` for a shape `ReduceShape` refuses, a ground row over a group set,
-    /// and a reduce without a COUNT(*).
+    /// `Err` for a shape `ReduceShape` refuses and a reduce without a COUNT(*).
     pub fn from_wire(
-        input_schema: &SchemaDescriptor,
-        group_by_cols: &[u32],
-        agg_descs: &[AggDescriptor],
-        global_ground: bool,
-        i_am_owner: bool,
-    ) -> Result<Self, OpBuildErr> {
-        let cardinality = first_count(agg_descs);
-        Self::new(
-            input_schema,
-            group_by_cols,
-            agg_descs,
-            cardinality,
-            global_ground,
-            i_am_owner,
-        )
-    }
-
-    /// The global reduce over `partials`, the relayed outputs of [`Self::from_wire`]
-    /// over `aggs` and no group: each column merges by its [`AggFunc::merge_op`].
-    /// `Err` unless the output keeps the partials' layout.
-    pub fn combine(
-        partials: &SchemaDescriptor,
+        input: &SchemaDescriptor,
+        group_cols: &[u32],
         aggs: &[AggDescriptor],
-        global_ground: bool,
-        i_am_owner: bool,
+        seeds_ground: bool,
     ) -> Result<Self, OpBuildErr> {
-        let mismatch = || OpBuildErr::shape("reduce: the partials do not match the aggregates");
-        let cbase = (partials.num_columns() as u32)
-            .checked_sub(aggs.len() as u32)
-            .ok_or_else(mismatch)?;
-        let merged: Vec<AggDescriptor> = aggs
-            .iter()
-            .zip(cbase..)
-            .map(|(d, col_idx)| AggDescriptor { agg_op: d.agg_op.merge_op(), col_idx })
-            .collect();
-        let plan = Self::new(partials, &[], &merged, first_count(aggs), global_ground, i_am_owner)?;
-        if plan.shape.output_schema != *partials {
-            return Err(mismatch());
-        }
-        Ok(plan)
-    }
-
-    fn new(
-        input_schema: &SchemaDescriptor,
-        group_by_cols: &[u32],
-        agg_descs: &[AggDescriptor],
-        cardinality: Option<usize>,
-        global_ground: bool,
-        i_am_owner: bool,
-    ) -> Result<Self, OpBuildErr> {
-        // The ground row carries no group columns.
-        if global_ground && !group_by_cols.is_empty() {
-            return Err(OpBuildErr::shape("reduce: global-ground over a non-empty group set"));
-        }
-        let shape = ReduceShape::for_circuit(input_schema, group_by_cols, agg_descs)?;
-        // Only the net row count tells an emptied group from a live one.
-        let cardinality = cardinality.ok_or_else(|| OpBuildErr::shape("reduce: a circuit reduce needs a COUNT(*)"))?;
-        let avi = AviBake::new(input_schema, group_by_cols, &shape.acc_template)?;
+        debug_assert!(
+            !seeds_ground || group_cols.is_empty(),
+            "the ground row carries no group columns"
+        );
+        let (key, prefix) = GroupOutKey::for_group_cols(input, group_cols, group_cols.iter().copied())?;
+        let shape = ReduceShape::new(input, key, prefix, aggs)?;
+        let avi = AviBake::new(input, group_cols, &shape.acc_template)?;
         Ok(ReducePlan {
+            cardinality: cardinality(aggs)?,
             shape,
-            seeds_ground: global_ground && i_am_owner,
-            cardinality,
+            seeds_ground,
             avi,
         })
     }
+
+    /// The global reduce over the relayed outputs of an exact linear
+    /// [`Self::from_wire`] over `aggs` and no group: `[V₀ | aggregates…]`, each
+    /// aggregate folding into its own column by its [`AggFunc::merge_op`].
+    pub fn combine(
+        partials: &SchemaDescriptor,
+        aggs: &[AggDescriptor],
+        seeds_ground: bool,
+    ) -> Result<Self, OpBuildErr> {
+        debug_assert_eq!(partials.num_columns(), 1 + aggs.len());
+        let (key, _) = GroupOutKey::synthetic(partials, &[], [])?;
+        let acc_template = aggs
+            .iter()
+            .zip(1..)
+            .map(|(d, c)| {
+                let col = partials.locate(c);
+                Accumulator::new(d.agg_op.merge_op(), col, col)
+            })
+            .collect();
+        let plan = ReducePlan {
+            cardinality: cardinality(aggs)?,
+            shape: ReduceShape {
+                output_schema: *partials,
+                key,
+                acc_template,
+            },
+            seeds_ground,
+            avi: None,
+        };
+        debug_assert!(plan.is_exact_linear(), "only exact linear partials are split off");
+        Ok(plan)
+    }
+
+    /// True iff every aggregate is a count or an integer sum, whose value is the
+    /// same whatever the row order and the partition.
+    pub fn is_exact_linear(&self) -> bool {
+        self.shape.acc_template.iter().all(Accumulator::is_exact_linear)
+    }
 }
 
-/// The position of the first COUNT(*).
-fn first_count(aggs: &[AggDescriptor]) -> Option<usize> {
-    aggs.iter().position(|d| d.agg_op == AggFunc::Count)
+/// The position of the COUNT(*) holding a group's net row count: only it tells
+/// an emptied group from a live one.
+fn cardinality(aggs: &[AggDescriptor]) -> Result<usize, OpBuildErr> {
+    aggs.iter()
+        .position(|d| d.agg_op == AggFunc::Count)
+        .ok_or_else(|| OpBuildErr::shape("reduce: a circuit reduce needs a COUNT(*)"))
 }

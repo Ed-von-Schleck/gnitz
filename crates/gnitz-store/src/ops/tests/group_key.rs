@@ -84,17 +84,6 @@ fn group_key_refuses_a_float_column() {
 // Group runs
 // ---------------------------------------------------------------------------
 
-/// The group key of `cols` over `schema` under `kind`, into an output whose PK
-/// region is the one `kind` keys.
-fn out_key(schema: &SchemaDescriptor, cols: &[u32], kind: ReduceOutKey) -> GroupOutKey {
-    let output = match kind {
-        ReduceOutKey::PkPermutation => *schema,
-        ReduceOutKey::SingleNaturalCol => SchemaDescriptor::new(&[schema.columns[cols[0] as usize]], &[0]),
-        ReduceOutKey::SyntheticFold => SchemaDescriptor::new(&[GROUP_PK_COL], &[0]),
-    };
-    GroupOutKey::new(schema, cols, kind, &output).unwrap()
-}
-
 /// Every position's row, in visit order.
 fn visit_order(runs: &GroupRuns, n: usize) -> Vec<usize> {
     (0..n).map(|p| runs.row(p)).collect()
@@ -110,7 +99,7 @@ fn assert_canonical_order(schema: &SchemaDescriptor, pk_rows: &[Vec<u8>]) {
 
     let batch = batch_of_pk_bytes(schema, pk_rows);
     let mb = batch.as_mem_batch();
-    let key = out_key(schema, schema.pk_indices(), ReduceOutKey::PkPermutation);
+    let key = GroupOutKey::for_group_cols(schema, schema.pk_indices(), []).unwrap().0;
     let runs = key.runs(&batch);
     let got_keys: Vec<&[u8]> = visit_order(&runs, mb.count)
         .into_iter()
@@ -229,7 +218,7 @@ fn leading_pk_column_runs_in_place_over_a_consolidated_batch() {
     let raw = batch_of_pk_bytes(&schema, &[pk(1, 1), pk(1, 5), pk(2, 0), pk(7, 3), pk(7, 4), pk(7, 9)]);
     let mut consolidated = raw.clone_batch();
     consolidated.certify_layout(crate::storage::Layout::Consolidated);
-    let key = out_key(&schema, &[0], schema.reduce_out_key(&[0]));
+    let key = GroupOutKey::for_group_cols(&schema, &[0], []).unwrap().0;
     for batch in [&consolidated, &raw] {
         let runs = key.runs(batch);
         assert_eq!(visit_order(&runs, 6), vec![0, 1, 2, 3, 4, 5]);
@@ -242,7 +231,7 @@ fn leading_pk_column_runs_in_place_over_a_consolidated_batch() {
 fn empty_group_set_is_one_run() {
     let schema = pk_payload_schema(&[TypeCode::U64]);
     let batch = batch_of_pk_bytes(&schema, &[3u64.to_be_bytes(), 1u64.to_be_bytes(), 2u64.to_be_bytes()]);
-    let runs = out_key(&schema, &[], ReduceOutKey::SyntheticFold).runs(&batch);
+    let runs = GroupOutKey::synthetic(&schema, &[], []).unwrap().0.runs(&batch);
     assert_eq!(visit_order(&runs, 3), vec![0, 1, 2]);
     assert_eq!(runs.iter().collect::<Vec<_>>(), vec![0..3]);
 }
@@ -279,7 +268,7 @@ fn reduce_sort_argsort_bench() {
             _ => wide_pk_3xu64_schema(),
         };
         let batch = batch_of_pk_bytes(&schema, &bench_rows(n, stride));
-        let key = out_key(&schema, schema.pk_indices(), ReduceOutKey::PkPermutation);
+        let key = GroupOutKey::for_group_cols(&schema, schema.pk_indices(), []).unwrap().0;
 
         let t = std::time::Instant::now();
         let runs = key.runs(&batch);
@@ -309,7 +298,7 @@ fn reduce_sort_argsort_delta_bench() {
         ("digest 2-col", &multi, &[0u32, 1u32][..]),
     ] {
         let batch = batch_of_pk_bytes(schema, &bench_rows(n, schema.pk_stride()));
-        let key = out_key(schema, group_cols, ReduceOutKey::SyntheticFold);
+        let key = GroupOutKey::synthetic(schema, group_cols, []).unwrap().0;
 
         let t = std::time::Instant::now();
         let runs = key.runs(&batch);

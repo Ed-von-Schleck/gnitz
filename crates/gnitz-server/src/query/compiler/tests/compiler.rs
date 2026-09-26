@@ -311,7 +311,7 @@ fn side_output(op: OpNode, source: SchemaDescriptor, of: u32) -> SchemaDescripto
     register_sources(&mut registry, [(10, source)]);
     let view_schema = match &op {
         OpNode::Reduce { agg, .. } => {
-            gnitz_store::ops::ReducePlan::from_wire(&source, &[], agg, true, true)
+            gnitz_store::ops::ReducePlan::from_wire(&source, &[], agg, true)
                 .unwrap()
                 .shape
                 .output_schema
@@ -395,7 +395,7 @@ fn a_global_ground_reduce_with_no_exchange_is_refused_unless_self_contained() {
         let OpNode::Reduce { agg, .. } = &op else {
             unreachable!()
         };
-        let view_schema = gnitz_store::ops::ReducePlan::from_wire(&source, &[], agg, true, true)
+        let view_schema = gnitz_store::ops::ReducePlan::from_wire(&source, &[], agg, true)
             .unwrap()
             .shape
             .output_schema

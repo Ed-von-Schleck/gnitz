@@ -253,7 +253,7 @@ fn engine_with_every_plan_shape(name: &str) -> (CatalogEngine, i64, i64) {
     let base_schema = engine.registry.relation(base).map(Relation::schema).unwrap();
 
     let (group, aggs) = ([1u32], [gnitz_wire::AggDescriptor::COUNT_STAR]);
-    let grouped = gnitz_store::ops::ReducePlan::from_wire(&base_schema, &group, &aggs, false, true)
+    let grouped = gnitz_store::ops::ReducePlan::from_wire(&base_schema, &group, &aggs, false)
         .unwrap()
         .shape
         .output_schema;

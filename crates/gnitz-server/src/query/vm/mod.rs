@@ -158,7 +158,7 @@ fn facts(op: &Op) -> OpFacts {
         },
         Op::JoinDT { .. } => OpFacts { consolidates_in: true, ..linear },
         Op::Reduce { plan, .. } => OpFacts {
-            consolidates_in: plan.plan.consolidates_input(),
+            consolidates_in: !plan.plan.is_exact_linear(),
             writes_state: true,
             // A global-ground reduce mints V₀ from an empty delta.
             inert_on_empty: !plan.plan.seeds_ground,
@@ -218,7 +218,7 @@ pub(in crate::query) struct VmHandle {
     /// No epoch has been dispatched yet and the program carries a global-ground
     /// `Reduce` this worker owns — the one reason an all-empty epoch is worth
     /// dispatching.
-    pending_ground_row: bool,
+    pub(in crate::query) pending_ground_row: bool,
 }
 
 impl VmHandle {

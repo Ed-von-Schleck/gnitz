@@ -6,6 +6,7 @@ use crate::schema::payload_order::compare_rows;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, Layout, ReadCursor, RowMark};
 
+use super::agg::Accumulator;
 use super::emit::emit_reduce_row;
 use super::plan::ReducePlan;
 
@@ -19,7 +20,6 @@ pub fn op_reduce(
     delta: &Batch,
     trace_out_cursor: &mut ReadCursor,
     // Over the value index `plan.avi` describes, this epoch's entries included.
-    // `Some` whenever `plan.avi` is and the delta is non-empty.
     history: Option<&mut ReadCursor>,
     plan: &ReducePlan,
 ) -> Batch {
@@ -27,7 +27,7 @@ pub fn op_reduce(
     let output_schema = &shape.output_schema;
 
     // Folded by the VM at this register's first reader.
-    debug_assert!(!plan.consolidates_input() || delta.is_consolidated());
+    debug_assert!(plan.is_exact_linear() || delta.is_consolidated());
 
     if delta.count == 0 {
         // An empty source delivers only empty deltas, so the ground row is minted
@@ -52,6 +52,7 @@ pub fn op_reduce(
         let cursor = history.expect("a value-indexed reduce is handed a cursor over the index its plan describes");
         (bake, cursor)
     });
+    let fold_runs = avi.is_none() && runs.in_row_order() && 2 * runs.len() <= delta.count;
     for run in runs.iter() {
         let first = runs.row(run.start);
         let out_pk = shape.key.out_pk(&mb, first);
@@ -64,14 +65,18 @@ pub fn op_reduce(
         // extremes are its rows' and its stored row's: no probe.
         let prestep = avi.is_some() && run.len() <= SKIP_TRACK_CAP;
         let mut saw_negative = false;
-        for pos in run.clone() {
-            let row = runs.row(pos);
-            let w = mb.get_weight(row);
-            saw_negative |= w <= 0;
-            let extremes = prestep && !saw_negative;
-            for acc in accs.iter_mut() {
-                if acc.is_linear() || extremes {
-                    acc.step_from_batch(&mb, row, w);
+        if fold_runs {
+            Accumulator::fold_rows(&mut accs, &mb, run.clone());
+        } else {
+            for pos in run.clone() {
+                let row = runs.row(pos);
+                let w = mb.get_weight(row);
+                saw_negative |= w <= 0;
+                let extremes = prestep && !saw_negative;
+                for acc in accs.iter_mut() {
+                    if acc.is_linear() || extremes {
+                        acc.step_from_batch(&mb, row, w);
+                    }
                 }
             }
         }
@@ -97,12 +102,7 @@ pub fn op_reduce(
             "reduce input must be bag-positive: negative group cardinality",
         );
         if accs[plan.cardinality].count_value() > 0 {
-            emit_reduce_row(
-                &mut out,
-                Some((&mb, first, shape.key.exemplar_locs())),
-                out_pk_bytes,
-                &accs,
-            );
+            emit_reduce_row(&mut out, Some((&mb, first, shape.key.carried())), out_pk_bytes, &accs);
         } else if plan.seeds_ground {
             // An emptied global aggregate still publishes one row. The empty-key
             // scatter sends every row of a ground reduce to V₀'s owner.

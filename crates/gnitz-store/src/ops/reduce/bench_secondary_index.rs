@@ -99,7 +99,7 @@ fn build_wide_input(schema: &SchemaDescriptor) -> Batch {
 fn extreme_bake(schema: &SchemaDescriptor, col: u32, agg_op: AggFunc) -> AviBake {
     let group = [1u32];
     let aggs = [AggDescriptor { col_idx: col, agg_op }, AggDescriptor::COUNT_STAR];
-    ReducePlan::from_wire(schema, &group, &aggs, false, false)
+    ReducePlan::from_wire(schema, &group, &aggs, false)
         .unwrap()
         .avi
         .expect("a MIN/MAX reduce is value-indexed")

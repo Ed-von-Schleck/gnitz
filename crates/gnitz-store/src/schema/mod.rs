@@ -189,6 +189,12 @@ impl DerivedSchema {
         Ok(())
     }
 
+    /// The width of the PK columns pushed so far — the finished schema's
+    /// `pk_stride`.
+    pub(crate) fn pk_bytes(&self) -> usize {
+        self.pk_bytes
+    }
+
     /// Append `schema`'s PK columns in PK-list order — the shared prologue of
     /// every builder that inherits its input's key.
     pub(crate) fn push_pk_of(&mut self, schema: &SchemaDescriptor) -> Result<(), SchemaBound> {

@@ -285,8 +285,8 @@ _SHAPES = {
         {"gv": ["cnt", "lo"]},
         {"gv": {(0, None): 1}}),
 
-    # The replicated source takes the `i_am_owner` disjunct rather than the
-    # partition route, and must still seed exactly one ground row.
+    # A replicated source elects its ground-row owner without the partition
+    # route, and must still seed exactly one ground row.
     "global_agg_replicated": _shape(
         ["CREATE TABLE gt (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL) "
          "WITH (replicated = true)",

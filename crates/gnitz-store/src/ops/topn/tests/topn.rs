@@ -70,7 +70,7 @@ impl Harness {
 
     /// One epoch: populate, run, integrate the output. Returns the raw delta.
     fn tick(&mut self, delta: &Batch) -> Batch {
-        self.index.ingest_owned_batch(self.plan.index.batch(delta)).unwrap();
+        self.index.ingest_owned_batch(self.plan.index_batch(delta)).unwrap();
         let mut history = self.index.open_cursor();
         let mut trace_out = self.trace_out.open_cursor();
         let out = op_topn(delta, &mut trace_out, &mut history, &self.plan);

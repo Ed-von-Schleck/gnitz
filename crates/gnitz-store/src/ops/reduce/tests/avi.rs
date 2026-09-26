@@ -61,7 +61,7 @@ fn a_mixed_scalar_and_wide_bake_reads_both_ordinals_back() {
         AggDescriptor { col_idx: 3, agg_op: AggFunc::Max },
         AggDescriptor::COUNT_STAR,
     ];
-    let plan = ReducePlan::from_wire(&src, &[1], &descs, false, false).unwrap();
+    let plan = ReducePlan::from_wire(&src, &[1], &descs, false).unwrap();
 
     // One group. Every `b` is below 2^64, so the wide images share their leading
     // eight bytes — the collapse the sixteen-byte slot is there to avoid.
@@ -127,7 +127,7 @@ fn a_sixteen_byte_only_bake_keeps_its_image_in_the_key() {
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Min },
         AggDescriptor::COUNT_STAR,
     ];
-    let plan = ReducePlan::from_wire(&src, &[1], &descs, false, false).unwrap();
+    let plan = ReducePlan::from_wire(&src, &[1], &descs, false).unwrap();
     let schema = &plan.avi.as_ref().unwrap().schema;
     assert!(
         (0..schema.num_columns()).all(|c| schema.payload_slot(c).is_none()),
@@ -158,7 +158,7 @@ fn a_sixteen_byte_and_string_bake_reads_both_ordinals_back() {
         AggDescriptor { col_idx: 3, agg_op: AggFunc::Max },
         AggDescriptor::COUNT_STAR,
     ];
-    let plan = ReducePlan::from_wire(&src, &[1], &descs, false, false).unwrap();
+    let plan = ReducePlan::from_wire(&src, &[1], &descs, false).unwrap();
 
     const SLOT_WIDE: &str = "sixteen-byte-pre";
     assert_eq!(SLOT_WIDE.len(), 16);

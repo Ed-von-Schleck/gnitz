@@ -5,10 +5,14 @@
 
 use std::ops::Range;
 
-use crate::schema::key::{locate_key_col, pk_width_dispatch, FoldCols, NarrowPkOpk, PkSortKey, ReindexPacker};
-use crate::schema::{ColumnLocator, DerivedSchema, OpBuildErr, ReduceOutKey, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::key::{locate_key_col, pk_width_dispatch, FoldCols, NarrowPkOpk, PkSortKey};
+use crate::schema::{
+    ColumnLocator, DerivedSchema, OpBuildErr, ReduceOutKey, SchemaBound, SchemaColumn, SchemaDescriptor, SchemaFacts,
+    TypeCode,
+};
 use crate::storage::{Batch, MemBatch};
 use gnitz_expr::RowSource;
+use gnitz_wire::ReduceOutSlot;
 
 /// Whether the group key of `group_by_cols` is the single column's
 /// `ColumnLocator::opk_image` rather than the XXH3 fold: injective and
@@ -21,16 +25,10 @@ pub(super) fn single_col_canonical_group_key(schema: &SchemaDescriptor, group_by
 
 /// The 128-bit group key of a row: the single group column's OPK image where
 /// the group set is canonical, else an XXH3 fold of the per-column canonical
-/// material. Per-column locators are resolved once at bake time, so the per-row
-/// body is the fold alone.
-///
-/// The one implementation: the scatter's routing key and `op_reduce`'s output
-/// PK both come off it, so they cannot drift.
+/// material.
 pub(super) struct GroupKeyCols {
-    /// See [`single_col_canonical_group_key`]. Private, and read only through
-    /// [`GroupKeyCols::canonical_col`], so the flag and the single column it
-    /// promises can never be consulted apart.
-    canonical: bool,
+    /// See [`single_col_canonical_group_key`].
+    canonical: Option<ColumnLocator>,
     /// The group columns in group-set order. Empty for a global (ungrouped)
     /// aggregate, whose key is `gnitz_wire::global_group_key()` — the fold of
     /// zero columns.
@@ -39,12 +37,12 @@ pub(super) struct GroupKeyCols {
 
 impl GroupKeyCols {
     pub(crate) fn new(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> Result<Self, OpBuildErr> {
-        let cols = group_by_cols
+        let cols: Vec<ColumnLocator> = group_by_cols
             .iter()
             .map(|&c| locate_key_col(schema, c, "group key"))
             .collect::<Result<_, _>>()?;
         Ok(GroupKeyCols {
-            canonical: single_col_canonical_group_key(schema, group_by_cols),
+            canonical: single_col_canonical_group_key(schema, group_by_cols).then(|| cols[0]),
             cols: FoldCols::new(cols),
         })
     }
@@ -54,7 +52,7 @@ impl GroupKeyCols {
     /// injective and order-preserving on the group value".
     #[inline]
     pub(super) fn canonical_col(&self) -> Option<ColumnLocator> {
-        self.canonical.then(|| self.cols.locs()[0])
+        self.canonical
     }
 
     /// The 128-bit group key of `row`. Over an empty group set this is the fold
@@ -70,25 +68,10 @@ impl GroupKeyCols {
 }
 
 /// The synthetic `_group_pk` key — the whole PK region of an output whose group
-/// set has no natural key. One definition, so every operator keyed like a reduce
-/// keys its output at the same width.
-pub(super) const GROUP_PK_COL: SchemaColumn = SchemaColumn::new(TypeCode::U128, false);
+/// set has no natural key.
+const GROUP_PK_COL: SchemaColumn = SchemaColumn::new(TypeCode::U128, false);
 
-/// Push a group-keyed secondary index's PK region — the packed group key, then
-/// the `suffix` columns the packer reserved room for — onto `b`. Infallible by
-/// construction: `ReindexPacker::new_group_key` accepted this exact suffix, so
-/// every column it hands back is non-null and PK-eligible and the whole region
-/// fits.
-pub(super) fn push_group_index_key(b: &mut DerivedSchema, packer: &ReindexPacker, suffix: &[SchemaColumn]) {
-    for c in packer.key_columns().chain(suffix.iter().copied()) {
-        b.push_pk(c)
-            .expect("a group key packed inside the suffix reservation, plus the suffix, is non-null PK-eligible");
-    }
-}
-
-/// One row's group output PK: borrowed out of the batch, or held inline. A
-/// returned value rather than a caller's scratch, so the borrowed arm copies
-/// nothing.
+/// One row's group output PK: borrowed out of the batch, or held inline.
 pub(super) enum OutPk<'a> {
     Borrowed(&'a [u8]),
     Narrow(NarrowPkOpk),
@@ -105,47 +88,91 @@ impl OutPk<'_> {
     }
 }
 
+/// Where a group's output PK comes from.
+#[derive(Clone, Copy)]
+enum KeyRegion {
+    /// The source row's own PK: the group set is a permutation of it.
+    SourcePk,
+    /// The 128-bit group key, narrowed to this output PK width.
+    Narrow(usize),
+}
+
 /// How an operator keyed like a reduce (the reduce itself, the ad-hoc fold, the
 /// top-N) groups its input and keys its output. A group is its output PK.
 pub(super) struct GroupOutKey {
-    pub(super) kind: ReduceOutKey,
     pub(super) group: GroupKeyCols,
-    out_stride: usize,
+    region: KeyRegion,
+    /// The input columns the output carries after its key, as the input locates them.
+    carried: Vec<ColumnLocator>,
 }
 
 impl GroupOutKey {
-    /// `output` is the schema built for `kind`, whose PK region the key fills.
-    pub(super) fn new(
+    /// `group_cols` over `input`, keyed as [`ReduceOutKey::for_group_cols`] picks, and
+    /// the output's leading columns: the key region, then each `row` column the key
+    /// region does not spell.
+    pub(super) fn for_group_cols(
         input: &SchemaDescriptor,
         group_cols: &[u32],
-        kind: ReduceOutKey,
-        output: &SchemaDescriptor,
-    ) -> Result<Self, OpBuildErr> {
-        Ok(GroupOutKey {
-            kind,
-            group: GroupKeyCols::new(input, group_cols)?,
-            out_stride: output.pk_stride(),
-        })
+        row: impl IntoIterator<Item = u32>,
+    ) -> Result<(Self, DerivedSchema), OpBuildErr> {
+        Self::build(input, group_cols, row, || input.reduce_out_key(group_cols))
+    }
+
+    /// [`Self::for_group_cols`] under the synthetic `_group_pk` whatever the group set.
+    pub(super) fn synthetic(
+        input: &SchemaDescriptor,
+        group_cols: &[u32],
+        row: impl IntoIterator<Item = u32>,
+    ) -> Result<(Self, DerivedSchema), OpBuildErr> {
+        Self::build(input, group_cols, row, || ReduceOutKey::SyntheticFold)
+    }
+
+    /// `kind` runs over group columns [`GroupKeyCols::new`] has bounded.
+    fn build(
+        input: &SchemaDescriptor,
+        group_cols: &[u32],
+        row: impl IntoIterator<Item = u32>,
+        kind: impl FnOnce() -> ReduceOutKey,
+    ) -> Result<(Self, DerivedSchema), OpBuildErr> {
+        let group = GroupKeyCols::new(input, group_cols)?;
+        let kind = kind();
+        let over = |e: SchemaBound| OpBuildErr::shape(format!("group key: output {e}"));
+        let mut b = DerivedSchema::new();
+        let mut carried = Vec::new();
+        for slot in kind.output_layout(input.pk_indices(), group_cols, row) {
+            match slot {
+                ReduceOutSlot::SyntheticKey => b.push_pk(GROUP_PK_COL),
+                ReduceOutSlot::Key(c) => b.push_pk(input.columns[c as usize]),
+                ReduceOutSlot::Carried(c) => {
+                    carried.push(input.locate(c as usize));
+                    b.push(input.columns[c as usize])
+                }
+            }
+            .map_err(over)?;
+        }
+        let region = match kind {
+            ReduceOutKey::PkPermutation => KeyRegion::SourcePk,
+            _ => KeyRegion::Narrow(b.pk_bytes()),
+        };
+        Ok((GroupOutKey { group, region, carried }, b))
     }
 
     /// The output PK of `row`'s group.
     #[inline]
     pub(super) fn out_pk<'a>(&self, mb: &'a MemBatch, row: usize) -> OutPk<'a> {
-        if self.kind == ReduceOutKey::PkPermutation {
-            OutPk::Borrowed(mb.get_pk_bytes(row))
-        } else {
-            OutPk::Narrow(self.narrow_pk(self.group.key_row(mb, row)))
+        match self.region {
+            KeyRegion::SourcePk => OutPk::Borrowed(mb.get_pk_bytes(row)),
+            KeyRegion::Narrow(stride) => OutPk::Narrow(NarrowPkOpk::new(self.group.key_row(mb, row), stride)),
         }
     }
 
     /// The output PK of the group keyed `key`.
     #[inline]
     pub(super) fn narrow_pk(&self, key: u128) -> NarrowPkOpk {
-        debug_assert!(
-            self.kind != ReduceOutKey::PkPermutation,
-            "a permuted PK is the source's own"
-        );
-        NarrowPkOpk::new(key, self.out_stride)
+        let KeyRegion::Narrow(stride) = self.region else {
+            unreachable!("a permuted PK is the source's own")
+        };
+        NarrowPkOpk::new(key, stride)
     }
 
     /// `V₀`, the output PK of the empty group set's one group.
@@ -154,15 +181,10 @@ impl GroupOutKey {
         self.narrow_pk(gnitz_wire::global_group_key())
     }
 
-    /// The group columns the output carries as its leading payload. Only a
-    /// synthetic key has any: a natural key is the group value itself.
+    /// The input columns the output carries after its key.
     #[inline(always)]
-    pub(super) fn exemplar_locs(&self) -> &[ColumnLocator] {
-        if self.kind == ReduceOutKey::SyntheticFold {
-            self.group.cols.locs()
-        } else {
-            &[]
-        }
+    pub(super) fn carried(&self) -> &[ColumnLocator] {
+        &self.carried
     }
 
     /// `batch`'s groups as runs in ascending output-PK order.
@@ -173,7 +195,7 @@ impl GroupOutKey {
         if n <= 1 || self.group.cols.is_empty() {
             return GroupRuns::in_place(n, |_| ());
         }
-        let pk_keyed = self.kind == ReduceOutKey::PkPermutation;
+        let pk_keyed = matches!(self.region, KeyRegion::SourcePk);
         // A leading-PK-column key is that column's OPK bytes, widened.
         let leading_pk_col = matches!(self.group.canonical_col(), Some(ColumnLocator::Pk { byte_off: 0, .. }));
         if (pk_keyed || leading_pk_col) && batch.consolidated_verified(batch.schema()) {
@@ -228,6 +250,12 @@ impl GroupRuns {
     #[inline(always)]
     pub(super) fn row(&self, pos: usize) -> usize {
         self.order.as_ref().map_or(pos, |o| o[pos] as usize)
+    }
+
+    /// Whether positions are rows.
+    #[inline]
+    pub(super) fn in_row_order(&self) -> bool {
+        self.order.is_none()
     }
 
     /// The group count.

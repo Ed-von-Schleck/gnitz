@@ -74,9 +74,7 @@ impl AviBake {
         let has_wide = aggs.iter().any(|a| matches!(a.spec.kind, ImageKind::Wide(_)));
         let has_payload = aggs.iter().any(|a| !has_fixed_image(a.spec.kind));
         let suffix = [ORDINAL_COL, image_slot_col(has_wide)];
-        let key_packer = ReindexPacker::new_group_key(src, group_by_cols, &suffix)?;
-        let mut b = crate::schema::DerivedSchema::new();
-        super::super::group_key::push_group_index_key(&mut b, &key_packer, &suffix);
+        let (key_packer, mut b) = ReindexPacker::new_group_key(src, group_by_cols, &suffix)?;
         if has_payload {
             b.push(IMAGE_COL)
                 .expect("one payload column fits behind a PK-only schema");

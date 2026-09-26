@@ -210,6 +210,21 @@ fn decode_rejects_a_source_table_off_a_scan() {
         .contains("carries a source_table"));
 }
 
+/// A ground-seeding reduce groups on nothing.
+#[test]
+fn decode_rejects_a_global_ground_over_a_group_set() {
+    let reduce = |group_cols: Vec<u32>| OpNode::Reduce {
+        group_cols,
+        agg: vec![crate::AggDescriptor::COUNT_STAR],
+        global_ground: true,
+    };
+    assert_eq!(
+        roundtrip(reduce(vec![0])).unwrap_err(),
+        "REDUCE global-ground over a non-empty group set"
+    );
+    assert!(roundtrip(reduce(vec![])).is_ok(), "group-less ground");
+}
+
 /// An opcode outside the space is a corrupt circuit, not a node to skip.
 #[test]
 fn decode_rejects_an_unknown_opcode() {

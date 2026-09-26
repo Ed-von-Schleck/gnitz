@@ -60,15 +60,14 @@ fn a_folded_register_is_folded_by_its_first_reader() {
             AggDescriptor::COUNT_STAR,
         ],
         false,
-        true,
     )
     .unwrap();
-    assert!(avi_plan.consolidates_input());
+    assert!(!avi_plan.is_exact_linear());
     let avi_table = p.table("avi", avi_plan.avi.as_ref().unwrap().schema);
 
     let linear_plan =
-        gnitz_store::ops::ReducePlan::from_wire(&schema, &[], &[AggDescriptor::COUNT_STAR], false, true).unwrap();
-    assert!(!linear_plan.consolidates_input());
+        gnitz_store::ops::ReducePlan::from_wire(&schema, &[], &[AggDescriptor::COUNT_STAR], false).unwrap();
+    assert!(linear_plan.is_exact_linear());
 
     let probe = gnitz_store::ops::JoinPlan::from_wire(gnitz_wire::JoinKind::Equi, false, &schema, &schema)
         .unwrap()

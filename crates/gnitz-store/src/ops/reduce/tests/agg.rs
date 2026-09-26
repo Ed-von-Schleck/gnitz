@@ -30,7 +30,7 @@ fn f64_acc(agg_op: AggFunc) -> Accumulator {
         &[0],
     );
     let aggs = [AggDescriptor { col_idx: 1, agg_op }, AggDescriptor::COUNT_STAR];
-    let mut accs = super::super::plan::ReducePlan::from_wire(&schema, &[0], &aggs, false, false)
+    let mut accs = super::super::plan::ReducePlan::from_wire(&schema, &[0], &aggs, false)
         .unwrap()
         .shape
         .acc_template;
@@ -113,7 +113,7 @@ fn bulk_step_matches_step_from_batch() {
             AggFunc::Max,
         ] {
             let aggs = [AggDescriptor { col_idx: ci, agg_op }, AggDescriptor::COUNT_STAR];
-            let template = super::super::plan::ReducePlan::from_wire(&schema, &[0], &aggs, false, false)
+            let template = super::super::plan::ReducePlan::from_wire(&schema, &[0], &aggs, false)
                 .unwrap()
                 .shape
                 .acc_template;

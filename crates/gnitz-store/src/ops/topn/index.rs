@@ -16,12 +16,11 @@
 //! row-by-row equal-PK arm, exactly as the AVI's value column does.
 
 use crate::schema::key::ReindexPacker;
-use crate::schema::{ColumnLocator, OpBuildErr, SchemaDescriptor, MAX_PK_BYTES};
+use crate::schema::{ColumnLocator, OpBuildErr, SchemaDescriptor, SchemaFacts, MAX_PK_BYTES};
 use crate::storage::Batch;
 use gnitz_expr::{OrderLocator, RowSource};
 use gnitz_wire::OrderKey;
 
-use super::super::group_key::push_group_index_key;
 use super::super::order_image::{append_image, image_slot_col, write_image_slot, ImageKind, IMAGE_COL};
 
 /// One ORDER BY key, resolved against the input: the same `(loc, desc,
@@ -54,10 +53,7 @@ pub struct TopNIndex {
     pub schema: SchemaDescriptor,
     /// Never empty, so `order[0]` — whose image leads the PK — always exists.
     order: Vec<OrderSpec>,
-    /// The carried payload columns as the populate reads them, and as `op_topn`
-    /// reads them back — one bake each, so the image-column offset between the
-    /// two schemas is never re-spelled at a call site.
-    carried_in_input: Vec<ColumnLocator>,
+    /// The carried payload columns as `op_topn` reads them back.
     pub(super) carried_in_index: Vec<ColumnLocator>,
     /// Width of the lead slot this bake's suffix reserved, by `order[0]`'s kind.
     lead_bytes: usize,
@@ -68,7 +64,7 @@ impl TopNIndex {
         input: &SchemaDescriptor,
         group_cols: &[u32],
         order: &[OrderKey],
-        carried_cols: &[u32],
+        output: &SchemaDescriptor,
     ) -> Result<Self, OpBuildErr> {
         // Without a key the index orders a group's rows arbitrarily, so which rows
         // fill the window would not be a function of the Z-set.
@@ -78,30 +74,29 @@ impl TopNIndex {
         let order: Vec<OrderSpec> = order
             .iter()
             .map(|key| {
-                let loc = input.locate(key.col as usize);
-                OrderSpec {
+                let loc = input
+                    .try_locate(key.col as usize)
+                    .ok_or_else(|| OpBuildErr::oob_col("top-n: order column", key.col as u32, input))?;
+                Ok(OrderSpec {
                     key: OrderLocator::of(loc, key),
                     kind: ImageKind::of(loc.type_code()),
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_, OpBuildErr>>()?;
         let suffix = [image_slot_col(matches!(order[0].kind, ImageKind::Wide(_)))];
-        let key_packer = ReindexPacker::new_group_key(input, group_cols, &suffix)?;
-        let mut b = crate::schema::DerivedSchema::new();
-        push_group_index_key(&mut b, &key_packer, &suffix);
+        let (key_packer, mut b) = ReindexPacker::new_group_key(input, group_cols, &suffix)?;
         let over = |e| OpBuildErr::shape(format!("top-n: index {e}"));
         for _ in &order {
             b.push(IMAGE_COL).map_err(over)?;
         }
-        for &c in carried_cols {
-            b.push(input.columns[c as usize]).map_err(over)?;
+        for (_, &c) in output.payload_columns() {
+            b.push(c).map_err(over)?;
         }
         let schema = b.finish();
-        let tail = schema.num_columns() - carried_cols.len();
+        let tail = schema.num_columns() - output.num_payload_cols();
         Ok(TopNIndex {
             key_packer,
             order,
-            carried_in_input: carried_cols.iter().map(|&c| input.locate(c as usize)).collect(),
             carried_in_index: (tail..schema.num_columns()).map(|c| schema.locate(c)).collect(),
             schema,
             lead_bytes: suffix[0].size() as usize,
@@ -115,12 +110,9 @@ impl TopNIndex {
         self.key_packer.pack_prefix(buf, src, row)
     }
 
-    /// The index entries `delta` contributes, one per row, at the row's weight —
-    /// for the caller to put into the operator's own index store. Left `Raw`:
-    /// the ingest's consolidation is what sorts it. The *shape* rule is here;
-    /// the ordering rule — ingest, then compact, then open the cursor — is the
-    /// store's.
-    pub fn batch(&self, delta: &Batch) -> Batch {
+    /// The index entries `delta` contributes, one per row at its weight,
+    /// unsorted. `carried` locates the output's payload columns in `delta`.
+    pub(super) fn batch(&self, delta: &Batch, carried: &[ColumnLocator]) -> Batch {
         let mb = delta.as_mem_batch();
         // One entry per row, and every carried string plus every wide image lands
         // in this heap — so the source's own heap is the presize the crate's
@@ -149,7 +141,7 @@ impl TopNIndex {
                 out.extend_col_blob(i, &image);
             }
             let mut null_word = 0u64;
-            for (pi, loc) in self.carried_in_input.iter().enumerate() {
+            for (pi, loc) in carried.iter().enumerate() {
                 out.append_cell_from(k + pi, loc, &mb, row, &mut null_word);
             }
             out.commit_row(null_word);

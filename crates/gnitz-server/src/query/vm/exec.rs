@@ -198,7 +198,7 @@ fn run_instructions(vm: &mut VmHandle, state: &mut CircuitState, start_pc: usize
                 Op::TopN { out_trace, plan } => {
                     let idx = plan.index_table;
                     let mut history = state
-                        .ingest_then_cursor(idx, plan.plan.index.batch(&batches[in_reg.at()]))
+                        .ingest_then_cursor(idx, plan.plan.index_batch(&batches[in_reg.at()]))
                         .map_err(|e| ingest_err("topn index", idx, e))?;
                     let mut to_cursor = state.cursor(*out_trace);
                     ops::op_topn(&batches[in_reg.at()], &mut to_cursor, &mut history, &plan.plan)

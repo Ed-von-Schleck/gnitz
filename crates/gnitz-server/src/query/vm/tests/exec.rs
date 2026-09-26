@@ -25,10 +25,9 @@ fn push_reduce(
     gcols: &[u32],
     in_schema: SchemaDescriptor,
     out_trace: StateIdx,
-    global_ground: bool,
-    i_am_owner: bool,
+    seeds_ground: bool,
 ) -> SchemaDescriptor {
-    let plan = gnitz_store::ops::ReducePlan::from_wire(&in_schema, gcols, aggs, global_ground, i_am_owner).unwrap();
+    let plan = gnitz_store::ops::ReducePlan::from_wire(&in_schema, gcols, aggs, seeds_ground).unwrap();
     let out_schema = plan.shape.output_schema;
     let baked = Box::new(BakedReduce::new(plan, None));
     p.push(0, 1, Op::Reduce { out_trace, plan: baked });
@@ -415,7 +414,7 @@ fn test_reduce_groups_by_a_payload_column() {
     ];
     let group_cols = [1u32]; // schema col 1 = payload col 0 (group key)
 
-    push_reduce(&mut p, &agg_descs, &group_cols, in_schema, out_trace, false, false);
+    push_reduce(&mut p, &agg_descs, &group_cols, in_schema, out_trace, false);
     p.integrate(1, out_trace);
     let mut vm = p.build_in(&registry, vec![in_schema, out_schema], 1);
 
@@ -450,7 +449,7 @@ fn test_reduce_multi_agg() {
     // GROUP BY col 0 (= pk, schema col index 0)
     let group_cols = [0u32];
 
-    push_reduce(&mut p, &agg_descs, &group_cols, in_schema, out_trace, false, false);
+    push_reduce(&mut p, &agg_descs, &group_cols, in_schema, out_trace, false);
     p.integrate(1, out_trace);
     let mut vm = p.build_in(&registry, vec![in_schema, out_schema], 1);
 
@@ -476,7 +475,7 @@ fn an_empty_epoch_mints_the_ground_row_once() {
     let dir = tempfile::tempdir().unwrap();
     let registry = vm_registry(dir.path());
     let mut p = TestPlan::default();
-    let plan = gnitz_store::ops::ReducePlan::from_wire(&in_schema, &[], &aggs, true, true).unwrap();
+    let plan = gnitz_store::ops::ReducePlan::from_wire(&in_schema, &[], &aggs, true).unwrap();
     let out_schema = plan.shape.output_schema;
     let out_trace = p.table("ground_tr", out_schema);
     p.push(
@@ -515,7 +514,7 @@ fn a_non_empty_epoch_spends_the_ground_latch_too() {
     let dir = tempfile::tempdir().unwrap();
     let registry = vm_registry(dir.path());
     let mut p = TestPlan::default();
-    let plan = gnitz_store::ops::ReducePlan::from_wire(&in_schema, &[], &aggs, true, true).unwrap();
+    let plan = gnitz_store::ops::ReducePlan::from_wire(&in_schema, &[], &aggs, true).unwrap();
     let out_schema = plan.shape.output_schema;
     let out_trace = p.table("ground_tr", out_schema);
     p.push(
@@ -540,37 +539,6 @@ fn a_non_empty_epoch_spends_the_ground_latch_too() {
             .is_empty(),
         "the trace already holds V₀, so there is nothing left to mint",
     );
-}
-
-/// The latch is `global_ground && i_am_owner`, not `global_ground`: the workers
-/// that do not own V₀ have nothing to mint, so an empty epoch must not dispatch
-/// on them either.
-#[test]
-fn a_ground_reduce_this_worker_does_not_own_leaves_the_latch_clear() {
-    let in_schema = make_schema_u128_i64();
-    let aggs = [AggDescriptor { col_idx: 1, agg_op: AggFunc::Count }];
-    let dir = tempfile::tempdir().unwrap();
-    let registry = vm_registry(dir.path());
-    let mut p = TestPlan::default();
-    let out_schema = {
-        let plan = gnitz_store::ops::ReducePlan::from_wire(&in_schema, &[], &aggs, true, false).unwrap();
-        let s = plan.shape.output_schema;
-        let out_trace = p.table("unowned_tr", s);
-        p.push(
-            0,
-            1,
-            Op::Reduce {
-                out_trace,
-                plan: Box::new(BakedReduce::new(plan, None)),
-            },
-        );
-        s
-    };
-    let mut vm = p.build_in(&registry, vec![in_schema, out_schema], 1);
-    assert!(!vm.pending_ground_row);
-    assert!(execute_epoch(&mut vm, Batch::empty_with_schema(&in_schema), 0)
-        .unwrap()
-        .is_empty());
 }
 
 /// Without a ground row an empty epoch produces nothing and runs no dispatch —
@@ -705,7 +673,6 @@ fn a_second_epoch_retracts_the_first_ones_aggregate() {
             AggDescriptor { col_idx: 1, agg_op: AggFunc::Sum },
             AggDescriptor::COUNT_STAR,
         ],
-        false,
         false,
     )
     .unwrap();

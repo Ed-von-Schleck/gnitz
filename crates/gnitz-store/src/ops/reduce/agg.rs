@@ -106,8 +106,12 @@ impl Accumulator {
         !matches!(self.kind, StepKind::Extreme { .. })
     }
 
-    pub(super) fn sums_float(&self) -> bool {
-        matches!(self.kind, StepKind::Sum(ScalarKind::F32 | ScalarKind::F64))
+    /// A count or an integer sum: exact whatever the row order.
+    pub(super) fn is_exact_linear(&self) -> bool {
+        matches!(
+            self.kind,
+            StepKind::Count | StepKind::CountNonNull | StepKind::Sum(ScalarKind::Int(_))
+        )
     }
 
     /// Width of this aggregate's output column — the emitted value's truncation.
@@ -222,18 +226,23 @@ impl Accumulator {
         }
     }
 
-    /// This accumulator's [`BulkStep`]. A linear aggregate over a payload column
-    /// folds the column's value, weight and null regions in one loop; an
-    /// extreme, or a PK column, steps each row as [`Self::step_from_batch`] does.
-    /// Rows fold in row order, so a float sum matches stepping each row.
-    pub(super) fn bulk_step(&self) -> BulkStep {
-        let ColumnLocator::Payload { .. } = self.src else {
-            return Self::step_each;
-        };
+    /// Step `accs` over `rows`, each by its column kernel where one exists.
+    pub(super) fn fold_rows(accs: &mut [Self], mb: &MemBatch, rows: Range<usize>) {
+        for acc in accs {
+            let step = acc.bulk_step();
+            step(acc, mb, rows.clone());
+        }
+    }
+
+    /// This accumulator's [`BulkStep`]: a column kernel where one exists, else
+    /// [`Self::step_each`].
+    fn bulk_step(&self) -> BulkStep {
+        let payload = matches!(self.src, ColumnLocator::Payload { .. });
         match self.kind {
+            // Reads no column.
             StepKind::Count => Self::count_rows,
-            StepKind::CountNonNull => Self::count_non_null_rows,
-            StepKind::Sum(ScalarKind::Int(fi)) => match fi {
+            StepKind::CountNonNull if payload => Self::count_non_null_rows,
+            StepKind::Sum(ScalarKind::Int(fi)) if payload => match fi {
                 FixedInt::U8 => Self::sum_int_rows::<1, false>,
                 FixedInt::I8 => Self::sum_int_rows::<1, true>,
                 FixedInt::U16 => Self::sum_int_rows::<2, false>,
@@ -243,9 +252,9 @@ impl Accumulator {
                 // A wrapping 64-bit sum is the same bits signed or unsigned.
                 FixedInt::U64 | FixedInt::I64 => Self::sum_int_rows::<8, true>,
             },
-            StepKind::Sum(ScalarKind::F32) => Self::sum_float_rows::<4>,
-            StepKind::Sum(ScalarKind::F64) => Self::sum_float_rows::<8>,
-            StepKind::Extreme { .. } => Self::step_each,
+            StepKind::Sum(ScalarKind::F32) if payload => Self::sum_float_rows::<4>,
+            StepKind::Sum(ScalarKind::F64) if payload => Self::sum_float_rows::<8>,
+            _ => Self::step_each,
         }
     }
 
@@ -316,8 +325,8 @@ impl Accumulator {
 }
 
 /// One accumulator's step over a range of a batch's rows, each at its own
-/// weight. [`Accumulator::bulk_step`] picks it once per fold.
-pub(super) type BulkStep = fn(&mut Accumulator, &MemBatch, Range<usize>);
+/// weight.
+type BulkStep = fn(&mut Accumulator, &MemBatch, Range<usize>);
 
 /// Fold rows `rows` of `N`-byte payload column `src` as `(value, weight, is
 /// NULL)`, in row order. `N = 0` reads no value.
