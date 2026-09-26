@@ -30,14 +30,11 @@ pub enum ClientError {
     /// `WireStatus::IntegrityViolation`: the write would break a PK,
     /// unique-index or foreign-key constraint, which the message names.
     IntegrityViolation(String),
-    /// WireStatus::TxnConflict: a user-table TXN failed its OCC precondition — a table
-    /// it read was written since its basis. `fresh_basis` is the server's current
-    /// watermark, which the autocommit RMW retry adopts before re-reading. The
+    /// WireStatus::TxnConflict: a user-table TXN failed its OCC precondition — a
+    /// family's table was written after the read it was built from. The
     /// human-facing message is synthesized by the SQL/Python layer (it holds the
     /// tid→name binding).
-    TxnConflict {
-        fresh_basis: u64,
-    },
+    TxnConflict,
     /// A delta cursor that cannot be polled from. It named rounds a worker's
     /// retention sweep has already dropped (`WireStatus::DeltaExpired`); or it
     /// belongs to a different boot or a different relation, which `delta_poll`
@@ -100,9 +97,7 @@ impl fmt::Display for ClientError {
             ClientError::NotFound { noun, name } => write!(f, "{noun} '{name}' not found"),
             ClientError::SchemaMismatch => write!(f, "schema version mismatch"),
             ClientError::IntegrityViolation(s) => write!(f, "{s}"),
-            ClientError::TxnConflict { fresh_basis } => {
-                write!(f, "transaction conflict (fresh basis {fresh_basis}); retry")
-            }
+            ClientError::TxnConflict => write!(f, "transaction conflict; retry"),
             ClientError::DeltaExpired => write!(
                 f,
                 "delta cursor is not honourable — its rounds were dropped, or it names a \

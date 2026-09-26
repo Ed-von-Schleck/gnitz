@@ -92,7 +92,7 @@ fn drive_all(s: &mut Session, want: usize) -> (HashMap<SlotId, Result<Reply, gni
 /// slot completes, every scan sees every push submitted ahead of it.
 fn concurrent_pushes_and_scans(target: &str) {
     let (mut blocking, tid, schema) = table(target);
-    let (mut s, _lsn) = Session::connect(target).unwrap();
+    let mut s = Session::connect(target).unwrap();
     // Small socket buffers so the outbound queue is drained across several
     // steps rather than in one writev.
     set_sockopt_int(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 64 * 1024);
@@ -150,7 +150,7 @@ fn concurrent_pushes_and_scans_tls() {
 fn cap_raises_and_every_slot_below_it_completes() {
     let srv = ServerHandle::start_with_env(4, &[]);
     let (_blocking, tid, _schema) = table(srv.sock_path());
-    let (mut s, _) = Session::connect(srv.sock_path()).unwrap();
+    let mut s = Session::connect(srv.sock_path()).unwrap();
     let mut ids = Vec::new();
     for _ in 0..MAX_IN_FLIGHT {
         ids.push(s.submit(Request::scan(tid)).unwrap());
@@ -171,7 +171,7 @@ fn cap_raises_and_every_slot_below_it_completes() {
 fn abandoned_slot_does_not_desync_and_close_abandons_every_slot() {
     let srv = ServerHandle::start_with_env(4, &[]);
     let (_blocking, tid, schema) = table(srv.sock_path());
-    let (mut s, _) = Session::connect(srv.sock_path()).unwrap();
+    let mut s = Session::connect(srv.sock_path()).unwrap();
     let batch = rows(0, 10);
     // Submit a push and never wait for it: the driver walks away.
     let abandoned = s.submit(push_req(tid, &schema, &batch)).unwrap();

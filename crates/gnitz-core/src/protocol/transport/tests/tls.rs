@@ -99,7 +99,7 @@ impl Loopback {
                 let hello = read_frame(&mut end);
                 assert_eq!(hello.len(), gnitz_wire::HELLO_PAYLOAD_LEN);
                 // `encode_hello_ack` frames the ACK itself.
-                let ack = gnitz_wire::encode_hello_ack(0);
+                let ack = gnitz_wire::encode_hello_ack();
                 end.write_all(&ack).unwrap();
                 end.flush().unwrap();
             }

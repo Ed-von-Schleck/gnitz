@@ -5,24 +5,26 @@
 //! list (`bind_set_list`, `classify_set_rhs`, `apply_set`), so it behaves exactly
 //! like an `UPDATE ... SET`.
 
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::Arc;
 
 use crate::ast_util::{extract_object_name, single_part_ident};
+use crate::bind::find_unique_column;
 use crate::bind::structural::bind_constant;
-use crate::bind::{bind_single_table, find_unique_column};
 use crate::codec::colwrite::{append_value_to_col, check_not_null, native_value};
-use crate::dml::mutate::{apply_set, bind_set_list, classify_set_rhs, Scope, SetCol, SetRhs};
-use crate::dml::overlay::{Conflict, KeyProbe};
+use crate::dml::mutate::{apply_set, bind_set_list, SetClause, SetCol};
 use crate::dml::plan::{rows_reply, RowsReply};
-use crate::dml::rmw::commit_rmw_or_buffer;
+use crate::dml::rmw::{commit_rmw, TargetRead};
 use crate::error::GnitzSqlError;
 use crate::exec::client_map::ClientMap;
-use crate::ir::{BExpr, BoundExpr};
+use crate::ir::BExpr;
 use crate::validate::{reject_unhonored_insert_clauses, require_class, ClassWant};
 use crate::SqlResult;
 use gnitz_core::{FixedInt, GnitzClient, PkColumn, RelClass, Schema, TypeCode, WireConflictMode, ZSetBatch};
+use gnitz_expr::SchemaFacts;
+use gnitz_wire::{PkKeys, ReadBound};
 use sqlparser::ast::{
     ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query, SetExpr,
     TableObject, Values,
@@ -34,10 +36,10 @@ use sqlparser::ast::{
 enum ConflictPlan {
     /// Default SQL INSERT: push with WireConflictMode::Error.
     Error,
-    /// `ON CONFLICT ... DO NOTHING`: filter the conflicting rows out, push the rest.
-    DoNothing,
-    /// `ON CONFLICT ... DO UPDATE SET ...`: merge each conflicting row, push all.
-    DoUpdate { set: Vec<SetCol> },
+    /// `ON CONFLICT`: resolve each incoming row against the rows its key holds —
+    /// drop a conflicting row (`DO NOTHING`, no `set`) or merge it with the SET
+    /// list (`DO UPDATE`) — and push the rest.
+    Resolve { set: Option<Vec<SetCol>> },
 }
 
 /// A conflict target must name exactly the primary key — in any order, as
@@ -88,14 +90,14 @@ struct RowShape {
 /// visible non-SERIAL column in schema order. An unnamed column is written NULL —
 /// gnitz has no column DEFAULTs, and `check_not_null` catches the rest.
 fn insert_row_shape(columns: &[ObjectName], schema: &Schema) -> Result<RowShape, GnitzSqlError> {
+    // A SERIAL column is never hidden: it is the table's lone PK, which the engine
+    // refuses to hide.
+    let serial_ci = schema.columns.iter().position(|c| c.is_serial);
     let mut slot_of: Vec<Option<usize>> = vec![None; schema.columns.len()];
     if columns.is_empty() {
         let mut expected = 0usize;
-        let mut serial_ci = None;
-        for (ci, c) in schema.visible_columns() {
-            if c.is_serial {
-                serial_ci = Some(ci);
-            } else {
+        for (ci, _) in schema.visible_columns() {
+            if Some(ci) != serial_ci {
                 slot_of[ci] = Some(expected);
                 expected += 1;
             }
@@ -119,10 +121,6 @@ fn insert_row_shape(columns: &[ObjectName], schema: &Schema) -> Result<RowShape,
         }
         slot_of[ci] = Some(k);
     }
-    // The written list never names the SERIAL column, so its index still comes
-    // from a scan. A SERIAL column is never hidden: it is the table's lone PK,
-    // which the engine refuses to hide.
-    let serial_ci = schema.columns.iter().position(|c| c.is_serial);
     Ok(RowShape {
         slot_of,
         expected: columns.len(),
@@ -181,17 +179,15 @@ pub(crate) fn execute_insert(
             validate_conflict_target(conflict_target, schema)?;
 
             match action {
-                OnConflictAction::DoNothing => ConflictPlan::DoNothing,
+                OnConflictAction::DoNothing => ConflictPlan::Resolve { set: None },
                 OnConflictAction::DoUpdate(do_update) => {
                     if do_update.selection.is_some() {
                         return Err(GnitzSqlError::Unsupported(
                             "ON CONFLICT ... DO UPDATE WHERE not supported".to_string(),
                         ));
                     }
-                    let set = bind_set_list(&do_update.assignments, schema, "ON CONFLICT DO UPDATE SET", |e, ci| {
-                        bind_do_update_rhs(e, ci, schema, &table_name_str)
-                    })?;
-                    ConflictPlan::DoUpdate { set }
+                    let set = bind_set_list(&do_update.assignments, schema, &table_name_str, SetClause::DoUpdate)?;
+                    ConflictPlan::Resolve { set: Some(set) }
                 }
             }
         }
@@ -207,9 +203,9 @@ pub(crate) fn execute_insert(
     let mut batch = ZSetBatch::with_capacity(schema, n);
 
     let RowShape { slot_of, expected, serial_ci } = insert_row_shape(&insert.columns, schema)?;
-    // Built once: `payload_columns` filters on `is_pk_col`, itself a PK-list scan,
-    // so leaving it in the row loop pays that scan per row per column.
     let payload: Vec<_> = schema.payload_columns().collect();
+    // What a column the list left out reads as.
+    let null: BExpr<Infallible> = BExpr::LitNull;
     // One bound cell per VALUES slot, reused across rows and read by both
     // consumers below, so a row's PK slot and payload slot cannot disagree on
     // what a written constant is.
@@ -258,8 +254,8 @@ pub(crate) fn execute_insert(
             }
             // Read off the *bound* constant, so `+NULL` is the NULL it spells;
             // a column the list left out is NULL too.
-            let cell = slot_of[ci].map(|s| &cells[s]);
-            let is_null = cell.is_none_or(|c| matches!(c, BExpr::LitNull));
+            let cell = slot_of[ci].map_or(&null, |s| &cells[s]);
+            let is_null = matches!(cell, BExpr::LitNull);
             // The check is here for the *conflicting* row of an ON CONFLICT DO
             // UPDATE: its incoming NULL is consumed into the merged row and is
             // never pushed, so the wire boundary's own check never sees it.
@@ -268,11 +264,7 @@ pub(crate) fn execute_insert(
                 gnitz_wire::null_word_set(&mut null_bits, payload_idx, true);
             }
             let ZSetBatch { payload: cols, blob, .. } = &mut batch;
-            match cell {
-                Some(c) => append_value_to_col(&mut cols[payload_idx].bytes, blob, col_def, c)?,
-                // `append_value_to_col` encodes a written NULL as exactly this.
-                None => cols[payload_idx].push_zero(),
-            }
+            append_value_to_col(&mut cols[payload_idx].bytes, blob, col_def, cell)?;
         }
         batch.nulls.push(null_bits);
     }
@@ -319,134 +311,65 @@ pub(crate) fn execute_insert(
                 }
             }
         }
-        ConflictPlan::DoNothing => {
-            let probe = KeyProbe::keys(schema, &batch.pks)?;
+        ConflictPlan::Resolve { mut set } => {
             // The RMW driver pushes `Update`, not `Error`: its OCC precondition is
-            // what settles a stale filter, where `Error` would raise a duplicate-key
-            // error out of a statement spelled "do nothing".
-            let count = commit_rmw_or_buffer(client, &table_name_str, tid, schema, |client| {
-                client_side_filter_do_nothing(client, tid, schema, &probe, &batch)
-            })?;
-            Ok(SqlResult::RowsAffected { count })
-        }
-        ConflictPlan::DoUpdate { mut set } => {
-            // Re-merged per RMW retry, so `SET x = x + 1` reads the freshest `x`.
-            // Every row rides at +1 and the worker's `enforce_unique_pk` turns a
-            // merged one into the retract-and-insert.
-            let probe = KeyProbe::rows(schema, &batch.pks);
-            let count = commit_rmw_or_buffer(client, &table_name_str, tid, schema, |client| {
-                client_side_merge_do_update(client, tid, schema, &probe, &batch, &mut set)
+            // what settles a stale resolution, where `Error` would raise a
+            // duplicate-key error out of a statement spelled "do nothing". Re-resolved
+            // per retry, so `SET x = x + 1` reads the freshest `x`; every row rides
+            // at +1 and the worker's `enforce_unique_pk` turns a merged one into the
+            // retract-and-insert. DO NOTHING reads the held keys alone.
+            let keys = PkKeys::from_keys(schema.pk_stride(), (0..batch.len()).map(|i| batch.pks.get_bytes(i)));
+            let read = TargetRead::new(&target, ReadBound::PkSet(keys), Vec::new(), set.is_none())?;
+            let count = commit_rmw(client, &table_name_str, &read, |held| {
+                resolve_conflicts(&batch, held, set.as_deref_mut(), schema)
             })?;
             Ok(SqlResult::RowsAffected { count })
         }
     }
 }
 
-/// One `DO UPDATE SET` right-hand side. The incoming-row scope uses the
-/// pseudo-qualifier `EXCLUDED.<col>`; bare column names refer to the existing
-/// (stored) row.
-fn bind_do_update_rhs(expr: &Expr, target: usize, schema: &Schema, alias: &str) -> Result<SetRhs, GnitzSqlError> {
-    if let Some(col_name) = excluded_col(expr) {
-        let col_idx = find_unique_column(&schema.columns, col_name)?
-            .ok_or_else(|| GnitzSqlError::Bind(format!("EXCLUDED.{col_name}: column not found")))?;
-        // Through the same classifier as a bare RHS, so `SET int_col =
-        // EXCLUDED.str_col` is rejected here rather than per row.
-        return classify_set_rhs(&BoundExpr::ColRef(col_idx), Scope::Excluded, target, schema);
-    }
-    // `col + EXCLUDED.col`. The binder already rejects it (`EXCLUDED` names no
-    // relation in scope); this says why, which its message cannot.
-    if expr_contains_excluded(expr) {
-        return Err(GnitzSqlError::Unsupported(
-            "EXCLUDED column references inside compound expressions are not \
-             supported; use a simple `col = EXCLUDED.col` assignment"
-                .to_string(),
-        ));
-    }
-    classify_set_rhs(
-        &bind_single_table(expr, schema, alias)?,
-        Scope::Existing,
-        target,
-        schema,
-    )
-}
-
-/// The column an `EXCLUDED.<col>` reference names. Deliberately unpeeled: the
-/// binder resolves `(EXCLUDED.a)` as an ordinary reference, so accepting the
-/// parenthesized form here would bind it to the *existing* row's column.
-fn excluded_col(e: &Expr) -> Option<&str> {
-    match e {
-        Expr::CompoundIdentifier(p) if p.len() == 2 && p[0].value.eq_ignore_ascii_case("EXCLUDED") => {
-            Some(p[1].value.as_str())
-        }
-        _ => None,
-    }
-}
-
-/// True when `expr` references `EXCLUDED.<col>` anywhere the binder would reach.
-/// Recognized by [`excluded_col`], the same rule the accept path takes, so the
-/// guard cannot miss a form that path would have bound.
-fn expr_contains_excluded(expr: &Expr) -> bool {
-    crate::ast_util::expr_any(expr, &|e| excluded_col(e).is_some())
-}
-
-/// Drop incoming rows whose PK already exists, returning the filtered ZSetBatch.
-/// Intra-batch duplicate PKs keep only the first occurrence. `probe` reads `batch`'s keys.
-fn client_side_filter_do_nothing(
-    client: &mut GnitzClient,
-    tid: u64,
-    schema: &Arc<Schema>,
-    probe: &KeyProbe,
+/// The batch an ON CONFLICT pushes. A key no row holds passes through; a held key
+/// is dropped (DO NOTHING) or merged with the SET list (DO UPDATE); a key repeated
+/// within the batch is skipped (DO NOTHING) or refused (DO UPDATE, PostgreSQL's
+/// "cannot affect row a second time").
+fn resolve_conflicts(
     batch: &ZSetBatch,
+    held: ZSetBatch,
+    set: Option<&mut [SetCol]>,
+    schema: &Schema,
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    let (_, _, verdicts) = probe.resolve(client, tid, schema)?;
-    let mut out = ZSetBatch::with_capacity(schema, verdicts.len());
-    for (i, verdict) in verdicts.iter().enumerate() {
-        // `Repeat` and `Existing` alike mean the PK is already claimed.
-        if matches!(verdict, Conflict::Fresh) {
-            out.copy_row_at(batch, i, batch.weights[i]);
-        }
-    }
-    Ok(out)
-}
-
-/// The batch an ON CONFLICT DO UPDATE pushes: a conflicting row merged with its
-/// assignments, a fresh row passed through, a repeated PK rejected (PostgreSQL's
-/// "command cannot affect row a second time").
-fn client_side_merge_do_update(
-    client: &mut GnitzClient,
-    tid: u64,
-    schema: &Arc<Schema>,
-    probe: &KeyProbe,
-    batch: &ZSetBatch,
-    set: &mut [SetCol],
-) -> Result<ZSetBatch, GnitzSqlError> {
-    // `rows` is the `Existing` scope, so `SET x = x + 1` reads the row a
-    // transaction buffered.
-    let (mut rows, buffered, verdicts) = probe.resolve(client, tid, schema)?;
-    rows.extend_from_owned(buffered);
-    // The VALUES row each existing key collided with.
-    let mut src_of: HashMap<&[u8], usize> = HashMap::with_capacity(rows.len());
-    let mut out = ZSetBatch::with_capacity(schema, verdicts.len());
-    for (i, verdict) in verdicts.iter().enumerate() {
-        match *verdict {
-            Conflict::Repeat => {
+    let is_held: HashSet<&[u8]> = (0..held.len()).map(|r| held.pks.get_bytes(r)).collect();
+    // Each key's first incoming row: the dedup and the EXCLUDED source at once.
+    let mut first: HashMap<&[u8], usize> = HashMap::with_capacity(batch.len());
+    let mut out = ZSetBatch::with_capacity(schema, batch.len());
+    for i in 0..batch.len() {
+        let key = batch.pks.get_bytes(i);
+        match first.entry(key) {
+            Entry::Occupied(_) if set.is_some() => {
                 return Err(GnitzSqlError::Bind(
                     "ON CONFLICT DO UPDATE cannot affect row a second time \
                      (duplicate PK in the same batch)"
                         .to_string(),
-                ));
+                ))
             }
-            Conflict::Fresh => out.copy_row_at(batch, i, batch.weights[i]),
-            Conflict::Existing => {
-                src_of.insert(batch.pks.get_bytes(i), i);
+            Entry::Occupied(_) => continue,
+            Entry::Vacant(v) => {
+                v.insert(i);
             }
         }
+        if !is_held.contains(key) {
+            out.copy_row_at(batch, i, batch.weights[i]);
+        }
     }
-    let mut excluded = ZSetBatch::with_capacity(schema, rows.len());
-    for r in 0..rows.len() {
-        excluded.copy_row_at(batch, src_of[rows.pks.get_bytes(r)], 1);
+    if let Some(set) = set {
+        // `held` is the `Existing` scope, so `SET x = x + 1` reads the row a
+        // transaction buffered; `excluded` is the VALUES row each one collided with.
+        let mut excluded = ZSetBatch::with_capacity(schema, held.len());
+        for r in 0..held.len() {
+            excluded.copy_row_at(batch, first[held.pks.get_bytes(r)], 1);
+        }
+        out.extend_from_owned(apply_set(set, held, Some(&excluded), schema)?);
     }
-    out.extend_from_owned(apply_set(set, rows, Some(&excluded), schema)?);
     Ok(out)
 }
 

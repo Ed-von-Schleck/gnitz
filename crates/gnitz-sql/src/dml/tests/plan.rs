@@ -4,8 +4,16 @@ use crate::test_support::{bind_where, col_def, idx_metas_flagged, pk_schema, two
 use gnitz_core::TypeCode;
 
 /// The plan for `where_expr` against `lists` (the table's indexes).
+/// An access path's bound and compiled predicate.
+struct AccessPlan {
+    bound: ReadBound,
+    predicate: Vec<u8>,
+}
+
 fn plan_of(conjuncts: &[BoundExpr], schema: &Schema, lists: &[(&[u32], bool)]) -> AccessPlan {
-    bound_and_predicate(schema, conjuncts, &idx_metas_flagged(lists)).expect("the WHERE must plan")
+    let (bound, predicate) =
+        bound_and_predicate(schema, conjuncts, &idx_metas_flagged(lists)).expect("the WHERE must plan");
+    AccessPlan { bound, predicate }
 }
 
 /// The predicate the conjuncts of `residual` compile to; empty for none.

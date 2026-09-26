@@ -20,7 +20,7 @@ fn connect_to_peer(rt: &Runtime) -> (AsyncClient, Connection, UnixStream) {
     let peer = std::thread::spawn(move || {
         let (mut s, _) = listener.accept().expect("accept");
         read_frame(&mut s);
-        s.write_all(&gnitz_wire::encode_hello_ack(0)).expect("hello ack");
+        s.write_all(&gnitz_wire::encode_hello_ack()).expect("hello ack");
         s
     });
     let (client, conn) = rt

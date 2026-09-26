@@ -23,10 +23,7 @@ fn check_response_classifies_every_status() {
         ClientError::SchemaMismatch
     ));
     assert!(matches!(err(WireStatus::DeltaExpired, ""), ClientError::DeltaExpired));
-    assert!(matches!(
-        err(WireStatus::TxnConflict, ""),
-        ClientError::TxnConflict { fresh_basis: 77 }
-    ));
+    assert!(matches!(err(WireStatus::TxnConflict, ""), ClientError::TxnConflict));
 
     // The server formats real text for `SalFull`, and it must survive the
     // decode: gating the text on `Error` made `SalFull`'s payload dead.
@@ -391,8 +388,7 @@ mod spine_tests {
     #[test]
     fn a_status_frame_completes_its_slot_and_leaves_the_connection_usable() {
         // `check_response` owns the status → error table; what the spine adds is
-        // that a status frame completes its slot rather than erroring `step`,
-        // and carries the frame's `arg0` into the error it hands back.
+        // that a status frame completes its slot rather than erroring `step`.
         let (mut s, peer) = pair();
         let slot = s.submit(Request::RawFrame(reply_ctrl(0, 0))).unwrap();
         s.step(Interest::WRITE);
@@ -400,8 +396,8 @@ mod spine_tests {
         peer.send(&reply_status(WireStatus::TxnConflict, "", 77));
         let r = drive(&mut s, slot);
         assert!(
-            matches!(r, Err(ClientError::TxnConflict { fresh_basis: 77 })),
-            "the basis rides the frame: {r:?}"
+            matches!(r, Err(ClientError::TxnConflict)),
+            "the status picks the variant: {r:?}"
         );
         assert!(!s.is_closed());
         assert_eq!(s.interest(), Interest::NONE, "nothing left pending");

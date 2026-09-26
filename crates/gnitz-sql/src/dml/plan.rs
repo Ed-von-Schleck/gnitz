@@ -1,4 +1,4 @@
-//! WHERE → access path for every direct-read verb ([`bound_and_predicate`], over the
+//! WHERE → access path for every direct-read verb ([`access_path`], over the
 //! candidates [`crate::access`] recognizes), and the rows reply a projection produces
 //! ([`rows_reply`]).
 
@@ -13,53 +13,40 @@ use crate::tail::{order_exprs, parse_order_by, wire_keys};
 use gnitz_core::{ColumnDef, RelIndex, Schema};
 use gnitz_expr::LogicalProgram;
 use gnitz_wire::{OrderKey, ReadBound};
-use sqlparser::ast::{OrderBy, SelectItem};
+use sqlparser::ast::{Expr, OrderBy, SelectItem};
 
 // ---------------------------------------------------------------------------
 // The access-path ladder
 // ---------------------------------------------------------------------------
 
-/// A WHERE as a pushed-down [`ReadBound`] and the compiled server-side predicate of
-/// the conjuncts it does not apply.
-pub(crate) struct AccessPlan {
-    bound: ReadBound,
-    predicate: Vec<u8>,
-}
-
-impl AccessPlan {
-    /// The bound and the compiled predicate.
-    pub(crate) fn into_parts(self) -> (ReadBound, Vec<u8>) {
-        (self.bound, self.predicate)
-    }
-}
-
-/// Bind a single-table `WHERE` (or its absence) for [`bound_and_predicate`], as
-/// its conjunct list. `alias` is the relation's effective alias, which a written
-/// qualifier must name.
-pub(crate) fn bind_where(
+/// A single-table WHERE (or its absence) as a pushed-down bound and the compiled
+/// predicate of the conjuncts it does not apply. `alias` is what a qualifier must name.
+pub(super) fn access_path(
     schema: &Schema,
     alias: &str,
-    where_expr: Option<&sqlparser::ast::Expr>,
-) -> Result<Vec<BoundExpr>, GnitzSqlError> {
-    match where_expr {
-        Some(we) => crate::bind::bind_conjuncts(we, &crate::bind::SingleTable { schema, alias }),
-        None => Ok(Vec::new()),
-    }
+    selection: Option<&Expr>,
+    indexes: &[RelIndex],
+) -> Result<(ReadBound, Vec<u8>), GnitzSqlError> {
+    let conjuncts = match selection {
+        Some(we) => crate::bind::bind_conjuncts(we, &crate::bind::SingleTable { schema, alias })?,
+        None => Vec::new(),
+    };
+    bound_and_predicate(schema, &conjuncts, indexes)
 }
 
-/// Bind-once WHERE → the access plan that serves it: the first of [`candidates`]
+/// Bind-once WHERE → the access path that serves it: the first of [`candidates`]
 /// whose residual compiles, else an unbounded scan under the whole WHERE.
 /// `indexes` is the relation's declared secondary-index list.
-pub(crate) fn bound_and_predicate(
+fn bound_and_predicate(
     schema: &Schema,
     conjuncts: &[BoundExpr],
     indexes: &[RelIndex],
-) -> Result<AccessPlan, GnitzSqlError> {
+) -> Result<(ReadBound, Vec<u8>), GnitzSqlError> {
     let mut blocked = None;
     for Candidate { bound, consumed } in candidates(conjuncts, schema, indexes) {
         let residual = residual(conjuncts, &consumed);
         match compile_wire_conjuncts(residual.iter().copied(), &schema.columns) {
-            Ok(predicate) => return Ok(AccessPlan { bound, predicate }),
+            Ok(predicate) => return Ok((bound, predicate)),
             // A conjunct the VM cannot carry; a later candidate may consume it.
             Err(e @ GnitzSqlError::Unsupported(_)) => {
                 blocked.get_or_insert(e);
@@ -71,10 +58,7 @@ pub(crate) fn bound_and_predicate(
     if let Some(e) = blocked {
         return Err(e);
     }
-    Ok(AccessPlan {
-        bound: ReadBound::None,
-        predicate: compile_wire_conjuncts(conjuncts, &schema.columns)?,
-    })
+    Ok((ReadBound::None, compile_wire_conjuncts(conjuncts, &schema.columns)?))
 }
 
 // ---------------------------------------------------------------------------

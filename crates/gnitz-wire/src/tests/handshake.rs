@@ -25,13 +25,12 @@ fn hello_payload_layout_and_decode() {
 /// framed form (length prefix included); `decode_hello_ack` takes the payload.
 #[test]
 fn ack_frame_layout_and_decode() {
-    let ack = encode_hello_ack(0x0102_0304_0506_0708);
+    let ack = encode_hello_ack();
     assert_eq!(ack.len(), HELLO_ACK_FRAME_SIZE);
     assert_eq!(crate::read_u32_le(&ack, 0) as usize, HELLO_ACK_PAYLOAD_LEN);
     assert_eq!(crate::read_u32_le(&ack, 4), HELLO_MAGIC);
-    assert_eq!(crate::read_u64_le(&ack, 8), 0x0102_0304_0506_0708);
 
-    assert_eq!(decode_hello_ack(&ack[4..]), Ok(0x0102_0304_0506_0708));
+    assert_eq!(decode_hello_ack(&ack[4..]), Ok(()));
 
     let mut forged = ack;
     forged[4] ^= 1;

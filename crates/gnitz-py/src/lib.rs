@@ -59,7 +59,7 @@ pub(crate) fn client_err(e: ClientError) -> PyErr {
             Ok(py_err) => *py_err,
             Err(other) => gnitz_err(other),
         },
-        ClientError::TxnConflict { .. } => GnitzConflictError::new_err(e.to_string()),
+        ClientError::TxnConflict => GnitzConflictError::new_err(e.to_string()),
         ClientError::DeltaExpired => GnitzDeltaExpiredError::new_err(e.to_string()),
         ClientError::SalFull(_) => GnitzSalFullError::new_err(e.to_string()),
         ClientError::NotFound { .. } => GnitzNotFoundError::new_err(e.to_string()),

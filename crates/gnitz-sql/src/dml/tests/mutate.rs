@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{col_def, parse_stmt};
+use crate::test_support::{col_def, parse_expr_sql, parse_stmt};
 use gnitz_core::{BatchAppender, TypeCode};
 use sqlparser::ast::Statement;
 
@@ -15,9 +15,7 @@ fn compile(set: &str, schema: &Schema) -> Result<Vec<SetCol>, GnitzSqlError> {
     let Statement::Update(u) = parse_stmt(&format!("UPDATE t SET {set}")) else {
         panic!("not an UPDATE");
     };
-    bind_set_list(&u.assignments, schema, "UPDATE SET", |e, ci| {
-        classify_set_rhs(&bind_single_table(e, schema, "t")?, Scope::Existing, ci, schema)
-    })
+    bind_set_list(&u.assignments, schema, "t", SetClause::Update)
 }
 
 /// `rows` rewritten by `SET <set>`. A SET list that does not compile is a bug in
@@ -473,4 +471,41 @@ fn a_date_source_converts_into_a_timestamp_column() {
     rows.payload[1].bytes.extend_from_slice(&0i64.to_le_bytes());
     let out = run("ts = d", &schema, rows).unwrap();
     assert_eq!(i64_at(&out, 1, 0), 2 * 86_400_000_000);
+}
+
+/// An `EXCLUDED.col` reference anywhere the binder can reach — inside CASE,
+/// BETWEEN, function arguments, IN lists — must be detected, so the compound
+/// RHS is rejected rather than the qualifier being silently dropped and the
+/// reference bound to the existing row's column.
+#[test]
+fn excluded_detected_in_every_operand_position() {
+    for src in [
+        "EXCLUDED.a",
+        "val + EXCLUDED.a",
+        "-EXCLUDED.a",
+        "(EXCLUDED.a)",
+        "COALESCE(EXCLUDED.a, 0)",
+        "CASE WHEN EXCLUDED.a > 0 THEN 1 ELSE 0 END",
+        "CASE val WHEN 1 THEN EXCLUDED.a END",
+        "val BETWEEN EXCLUDED.a AND 10",
+        "val IN (1, EXCLUDED.a)",
+        "EXCLUDED.a IS NULL",
+        "CAST(EXCLUDED.a AS BIGINT)",
+        "EXCLUDED.a::BIGINT",
+        "CEIL(EXCLUDED.a)",
+        "FLOOR(EXCLUDED.a)",
+        "ABS(EXCLUDED.a)",
+        "GREATEST(val, EXCLUDED.a)",
+        // Both of LIKE's bound sub-expressions, which the binder reaches.
+        "EXCLUDED.s LIKE 'a%'",
+        "s ILIKE EXCLUDED.s",
+    ] {
+        assert!(
+            expr_contains_excluded(&parse_expr_sql(src)),
+            "must detect EXCLUDED in {src}"
+        );
+    }
+    for src in ["val + 1", "COALESCE(val, 0)", "t.a", "CASE WHEN val > 0 THEN 1 END"] {
+        assert!(!expr_contains_excluded(&parse_expr_sql(src)), "false positive on {src}");
+    }
 }

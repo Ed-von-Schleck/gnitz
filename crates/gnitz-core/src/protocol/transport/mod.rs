@@ -595,18 +595,17 @@ pub(crate) fn frame_len_prefix(len: usize) -> Result<[u8; gnitz_wire::FRAME_LEN_
     Ok((len as u32).to_le_bytes())
 }
 
-/// Send HELLO, parse the ACK, and mark the transport established. Returns the server's `published_lsn`, which seeds the client's
-/// OCC basis. `until` bounds the exchange as a whole — on TLS the handshake
-/// included — not each leg.
-pub fn hello_handshake(t: &mut ClientTransport, until: Option<Instant>) -> Result<u64, ProtocolError> {
+/// Send HELLO, check the ACK, and mark the transport established. `until` bounds
+/// the exchange as a whole — on TLS the handshake included — not each leg.
+pub fn hello_handshake(t: &mut ClientTransport, until: Option<Instant>) -> Result<(), ProtocolError> {
     let payload = gnitz_wire::encode_hello_payload(gnitz_wire::wal::WAL_FORMAT_VERSION);
     t.send_frame(payload.to_vec(), until)?;
 
     let buf = t.recv_framed(until)?;
     if buf.len() == gnitz_wire::HELLO_ACK_PAYLOAD_LEN {
-        let published_lsn = gnitz_wire::decode_hello_ack(&buf).map_err(|e| ProtocolError::DecodeError(e.into()))?;
+        gnitz_wire::decode_hello_ack(&buf).map_err(|e| ProtocolError::DecodeError(e.into()))?;
         t.mark_established();
-        return Ok(published_lsn);
+        return Ok(());
     }
 
     // Not an ACK — the server sent a `WireStatus::Error` control block. The frame is

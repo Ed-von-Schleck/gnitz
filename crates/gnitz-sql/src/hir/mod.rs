@@ -8,10 +8,6 @@
 //! logical IR carries no layout — physical positions are assigned by one
 //! positional pass (`physical.rs`) at lowering, the single home of the
 //! PK-front convention and the `ColId → ColRef(position)` substitution.
-//!
-//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
-//! they cover, so each stays that module's own `tests` child and reaches its
-//! private items.
 
 mod bind;
 mod chain;

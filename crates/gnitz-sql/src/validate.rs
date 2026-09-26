@@ -541,7 +541,7 @@ pub(crate) fn cte_body<'a>(
 /// conflict / overwrite / partition clause parsed under `GenericDialect` and
 /// silently reinterpreted as a plain append. The `source` is a full `Query` whose envelope (LIMIT,
 /// ORDER BY, FETCH, a `WITH`, …) an INSERT equally cannot honor, so it is routed through
-/// `reject_unhonored_query_clauses` here too — every INSERT-clause rejection lives in this one guard.
+/// `reject_unhonored_query_clauses` here too.
 ///
 /// Exhaustive destructure (no `..`): a future `sqlparser` `Insert` field stops the build here.
 pub(crate) fn reject_unhonored_insert_clauses(insert: &sqlparser::ast::Insert) -> Result<(), GnitzSqlError> {

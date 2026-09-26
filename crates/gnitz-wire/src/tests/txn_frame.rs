@@ -42,34 +42,33 @@ fn peeked<'a, T>(frame: &'a [u8], decode: impl Fn(&'a [u8]) -> Result<T, String>
 fn family(
     tid: u64,
     mode: WireConflictMode,
-    reads: bool,
+    basis: u64,
     schema_block: &[u8],
 ) -> PushTxnItem<'_, (usize, Regions<'static>)> {
     PushTxnItem {
         tid,
         mode,
-        reads,
+        basis,
         schema_block,
         data: wal_block(),
     }
 }
 
-/// Every frame's control header carries only its verb, and a push's basis in
-/// `arg0`; its body starts right after the header.
+/// Every frame's control header carries only its verb; its body starts right
+/// after the header.
 #[test]
 fn the_shared_prologue_carries_only_the_routing_flag() {
     let d = block();
     let frames = [
-        (encode_ddl_txn(&[ddl_item(16)]), ClientVerb::DdlTxn, 0),
+        (encode_ddl_txn(&[ddl_item(16)]), ClientVerb::DdlTxn),
         (
-            encode_push_txn(42, &[family(16, WireConflictMode::Update, true, &d)]),
+            encode_push_txn(&[family(16, WireConflictMode::Update, 42, &d)]),
             ClientVerb::PushTxn,
-            42,
         ),
-        (encode_scan_multi(&[(7, 0)]), ClientVerb::ScanMulti, 0),
-        (encode_delta_poll(&[item(7, 3, &[2])]), ClientVerb::DeltaPoll, 0),
+        (encode_scan_multi(&[(7, 0)]), ClientVerb::ScanMulti),
+        (encode_delta_poll(&[item(7, 3, &[2])]), ClientVerb::DeltaPoll),
     ];
-    for (frame, verb, arg0) in frames {
+    for (frame, verb) in frames {
         let c = peek_control_block(&frame).unwrap();
         assert_eq!(
             c.hdr.flags,
@@ -77,7 +76,7 @@ fn the_shared_prologue_carries_only_the_routing_flag() {
             "only the verb is set"
         );
         assert_eq!(c.hdr.target_id, 0);
-        assert_eq!(c.hdr.arg0, arg0);
+        assert_eq!(c.hdr.arg0, 0);
         assert_eq!(c.hdr.arg1, 0);
         assert_eq!(c.hdr.status, WireStatus::Ok);
         assert!(c.blob.is_empty());
@@ -95,37 +94,25 @@ fn ddl_txn_roundtrips_every_family_in_order() {
 }
 
 #[test]
-fn push_txn_roundtrips_families_modes_and_read_flags() {
+fn push_txn_roundtrips_families_modes_and_bases() {
     let (s0, s1, d) = (b"schema 0".to_vec(), b"schema one".to_vec(), block());
-    let frame = encode_push_txn(
-        7,
-        &[
-            family(16, WireConflictMode::Error, false, &s0),
-            family(WIDE_TID, WireConflictMode::Update, true, &s1),
-        ],
-    );
+    let w = 0x0102_0304_0506_0708;
+    let frame = encode_push_txn(&[
+        family(16, WireConflictMode::Error, BLIND, &s0),
+        family(WIDE_TID, WireConflictMode::Update, w, &s1),
+    ]);
     let fams = peeked(&frame, decode_push_txn).unwrap();
     assert_eq!(fams.len(), 2);
     assert_eq!(
-        (fams[0].tid, fams[0].mode, fams[0].reads),
-        (16, WireConflictMode::Error, false)
+        (fams[0].tid, fams[0].mode, fams[0].basis),
+        (16, WireConflictMode::Error, BLIND)
     );
     assert_eq!(
-        (fams[1].tid, fams[1].mode, fams[1].reads),
-        (WIDE_TID, WireConflictMode::Update, true)
+        (fams[1].tid, fams[1].mode, fams[1].basis),
+        (WIDE_TID, WireConflictMode::Update, w)
     );
     assert_eq!((fams[0].schema_block, fams[0].data), (&s0[..], &d[..]));
     assert_eq!((fams[1].schema_block, fams[1].data), (&s1[..], &d[..]));
-}
-
-/// A reads byte is a flag: anything but `0` or `1` is a malformed frame.
-#[test]
-fn push_txn_refuses_a_reads_byte_that_is_not_a_flag() {
-    let s = block();
-    let mut frame = encode_push_txn(0, &[family(16, WireConflictMode::Update, true, &s)]);
-    frame[CTRL_HEADER_SIZE + 8 + 1] = 2;
-    let err = peeked(&frame, decode_push_txn).err().expect("a reads byte of 2");
-    assert!(err.contains("neither 0 nor 1"), "{err:?}");
 }
 
 #[test]
@@ -224,11 +211,11 @@ fn a_truncation_inside_an_item_is_a_decode_error() {
         }
     }
     let s = block();
-    let fam = || family(16, WireConflictMode::Update, true, &s);
+    let fam = || family(16, WireConflictMode::Update, 1, &s);
     check(
         "PUSH_TXN",
-        &encode_push_txn(1, &[fam()]),
-        &encode_push_txn(1, &[fam(), fam()]),
+        &encode_push_txn(&[fam()]),
+        &encode_push_txn(&[fam(), fam()]),
         decode_push_txn,
     );
     check(

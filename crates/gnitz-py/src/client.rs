@@ -336,8 +336,7 @@ impl PyGnitzClient {
             })?;
         let range = KeyRange::point(PkColList::from_slice(&col_indices), eq, last);
         let spec = ReadSpec::all_rows(ReadBound::Range(range));
-        let batch = self.call(py, |c| c.scan_spec(table_id, &spec, &schema))?;
-        scan_result(py, ScanReply { schema, batch, lsn: None })
+        scan_result(py, self.call(py, |c| c.scan_spec(table_id, &spec, &schema))?)
     }
 
     /// execute_sql(sql, schema_name="public") -> list of result dicts

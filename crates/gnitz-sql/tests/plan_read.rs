@@ -42,7 +42,10 @@ fn cat() -> CatalogSnapshot {
 }
 
 fn explain(cat: &CatalogSnapshot, sql: &str) -> Vec<String> {
-    explain_lines(&read(cat, &format!("EXPLAIN {sql}")).unwrap_or_else(|e| panic!("`{sql}`: {e:?}")))
+    explain_lines(
+        &read(cat, &format!("EXPLAIN {sql}")).unwrap_or_else(|e| panic!("`{sql}`: {e:?}")),
+        false,
+    )
 }
 
 // ── EXPLAIN ──────────────────────────────────────────────────────────────────
@@ -388,7 +391,7 @@ fn explain_names_every_decision() {
         "DESC SELECT v FROM t WHERE id = 5",
         "DESCRIBE SELECT v FROM t WHERE id = 5",
     ] {
-        assert_eq!(explain_lines(&read(&cat, sql).unwrap()), want, "`{sql}`");
+        assert_eq!(explain_lines(&read(&cat, sql).unwrap(), false), want, "`{sql}`");
     }
 }
 
@@ -403,7 +406,11 @@ fn explain_plans_the_query_it_describes_and_shares_its_rejection() {
     ] {
         let direct = read(&cat, sql).unwrap();
         let described = read(&cat, &format!("EXPLAIN {sql}")).unwrap();
-        assert_eq!(explain_lines(&direct), explain_lines(&described), "`{sql}`");
+        assert_eq!(
+            explain_lines(&direct, false),
+            explain_lines(&described, false),
+            "`{sql}`"
+        );
         assert_eq!(direct.spec(), described.spec(), "`{sql}`");
     }
     for (sql, variant, msg) in [
@@ -473,7 +480,7 @@ fn every_read_shape_plans_to_its_sink() {
         ("WITH c AS (SELECT * FROM t) SELECT id FROM c", false, true),
     ] {
         let plan = read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
-        let lines = explain_lines(&plan);
+        let lines = explain_lines(&plan, false);
         assert_eq!(lines[0], "read table t", "`{sql}`: the relation it reads");
         let shape = if fold { "fold:" } else { "projection:" };
         assert!(lines[3].starts_with(shape), "`{sql}`: {}", lines[3]);
@@ -733,7 +740,7 @@ fn a_cte_expands_to_the_flat_query() {
     ] {
         let c = read(&cat, cte).unwrap_or_else(|e| panic!("`{cte}`: {e:?}"));
         let f = read(&cat, flat).unwrap_or_else(|e| panic!("`{flat}`: {e:?}"));
-        assert_eq!(explain_lines(&c), explain_lines(&f), "`{cte}`");
+        assert_eq!(explain_lines(&c, false), explain_lines(&f, false), "`{cte}`");
         assert_eq!(c.spec(), f.spec(), "`{cte}`");
         assert_eq!(visible(c.reply_schema()), visible(f.reply_schema()), "`{cte}`");
     }

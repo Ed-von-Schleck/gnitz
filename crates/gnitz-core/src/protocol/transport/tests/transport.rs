@@ -247,12 +247,11 @@ fn test_send_timeout_peer_never_drains_parses_no_torn_frame() {
 #[test]
 fn test_hello_handshake_establishes_the_frame_ceiling() {
     let (a, b) = make_socketpair();
-    raw_send(&b, &gnitz_wire::encode_hello_ack(7));
+    raw_send(&b, &gnitz_wire::encode_hello_ack());
     let mut t = ClientTransport::from_unix_fd(a);
     assert_eq!(t.max_payload_len(), gnitz_wire::MAX_FRAME_PAYLOAD_PRE_HANDSHAKE);
-    let lsn = hello_handshake(&mut t, None).unwrap();
+    hello_handshake(&mut t, None).unwrap();
     assert_eq!(t.max_payload_len(), gnitz_wire::MAX_FRAME_PAYLOAD);
-    assert_eq!(lsn, 7, "the ACK's published_lsn seeds the client basis");
 }
 
 #[test]

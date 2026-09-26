@@ -46,7 +46,7 @@ fn narrow(py: Python<'_>, reply: Reply) -> PyResult<Py<PyAny>> {
             let per_rel = replies.into_iter().map(|r| scan_result(py, r));
             Ok(build_pylist(py, per_rel)?.into_any().unbind())
         }
-        Reply::Resolve(_) | Reply::Id(_) | Reply::Rows(_) | Reply::Polled => {
+        Reply::Resolve(_) | Reply::Id(_) | Reply::Polled => {
             unreachable!("this transport submits no verb with another reply shape")
         }
     }
@@ -165,7 +165,7 @@ impl PyAsyncTransport {
             .import(intern!(py, "asyncio"))?
             .call_method0(intern!(py, "get_running_loop"))?
             .unbind();
-        let (session, _published_lsn) = py.detach(|| Session::connect(target)).map_err(client_err)?;
+        let session = py.detach(|| Session::connect(target)).map_err(client_err)?;
         let fd = session.as_raw_fd();
         let slf = Bound::new(
             py,

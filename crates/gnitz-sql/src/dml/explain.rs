@@ -7,19 +7,23 @@
 
 use crate::dml::select::{ReadCase, ReadPlan, SpecRead};
 use crate::SqlResult;
-use gnitz_core::{BatchAppender, ColumnDef, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{BatchAppender, ColumnDef, GnitzClient, Schema, TypeCode, ZSetBatch};
 use gnitz_wire::sys_rows::SysRowSink;
 use gnitz_wire::{AggFunc, AggReadSpec, ReadBound, SinkKind};
 
-/// Describe `plan` without running it: the EXPLAIN reply.
-pub(crate) fn execute_explain(plan: &ReadPlan) -> SqlResult {
-    plan_rows(&explain_lines(plan))
+/// Describe `plan` without running it: the EXPLAIN reply. A read of a relation
+/// `client` mirrors is described as the local read it is served as.
+pub(crate) fn execute_explain(client: &GnitzClient, plan: &ReadPlan) -> SqlResult {
+    let local = plan.spec_read().is_some_and(|read| client.mirrors(read.desc.tid));
+    plan_rows(&explain_lines(plan, local))
 }
 
 /// The five lines EXPLAIN renders for `plan`: what is read, the access path,
 /// where the predicate runs, the sink's shape, and the ORDER BY / LIMIT tail.
-pub fn explain_lines(plan: &ReadPlan) -> Vec<String> {
-    let order_limit = order_limit_line(plan);
+/// `local`: the read is served off the client's copy, which executes the same
+/// `ReadSpec` the server would.
+pub fn explain_lines(plan: &ReadPlan, local: bool) -> Vec<String> {
+    let order_limit = order_limit_line(plan, local);
     let (read, shape) = match &plan.case {
         ReadCase::Constant { schema, .. } => {
             return vec![
@@ -41,24 +45,22 @@ pub fn explain_lines(plan: &ReadPlan) -> Vec<String> {
             )
         }
     };
+    let predicate = match (read.spec.predicate.is_empty(), local) {
+        (true, _) => "none",
+        (false, true) => "local",
+        (false, false) => "server-side",
+    };
     vec![
-        read_line(read),
+        read_line(read, local),
         format!("access: {}", access_line(&read.spec.bound, &read.desc.schema)),
-        format!(
-            "predicate: {}",
-            if !read.spec.predicate.is_empty() {
-                "server-side"
-            } else {
-                "none"
-            }
-        ),
+        format!("predicate: {predicate}"),
         shape,
         order_limit,
     ]
 }
 
 /// Where the ORDER BY / LIMIT / OFFSET work happens.
-fn order_limit_line(plan: &ReadPlan) -> String {
+fn order_limit_line(plan: &ReadPlan, local: bool) -> String {
     if plan.window.limit == Some(0) {
         return "order/limit: no request (LIMIT 0)".to_string();
     }
@@ -68,10 +70,11 @@ fn order_limit_line(plan: &ReadPlan) -> String {
     if let ReadCase::Rows { read, .. } = &plan.case {
         if let SinkKind::Rows { limit_k, .. } = &read.spec.sink.kind {
             if *limit_k > 0 {
+                let at = if local { "local" } else { "server" };
                 facts.push(if plan.order.is_empty() {
-                    format!("server early-stop {limit_k}")
+                    format!("{at} early-stop {limit_k}")
                 } else {
-                    format!("server top-{limit_k}")
+                    format!("{at} top-{limit_k}")
                 });
             }
         }
@@ -93,13 +96,15 @@ fn order_limit_line(plan: &ReadPlan) -> String {
 // The line vocabulary
 // ---------------------------------------------------------------------------
 
-/// What is read. The view suffix is a real cost of the read: a view read whose
-/// source closure has a committed-but-unticked write drains the pending ticks
-/// before serving. EXPLAIN cannot know staleness at plan time, so it names the
-/// condition, not a verdict.
-fn read_line(read: &SpecRead) -> String {
+/// What is read. The view suffix is a real cost of the read: a server read of a
+/// view whose source closure has a committed-but-unticked write drains the
+/// pending ticks before serving. EXPLAIN cannot know staleness at plan time, so it
+/// names the condition, not a verdict. A local read drains nothing.
+fn read_line(read: &SpecRead, local: bool) -> String {
     let class = read.desc.class;
-    if class.is_view() {
+    if local {
+        format!("read view {} (local copy)", read.name)
+    } else if class.is_view() {
         format!("read view {} (drains pending ticks when stale)", read.name)
     } else {
         format!("read {} {}", class.noun(), read.name)

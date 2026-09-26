@@ -2,9 +2,10 @@
 
 Every SQL mutation that reads before it writes (UPDATE / DELETE with a resolving
 WHERE, INSERT ... ON CONFLICT) commits only if its table has not been written
-since the connection's basis; a racing write is refused with a retryable
-conflict. The grain is the table. Autocommit statements retry internally,
-adopting the server's fresh basis; BEGIN/COMMIT surfaces the conflict.
+since the read it was built from: the basis is that read's watermark. A racing
+write is refused with a retryable conflict; the grain is the table. Autocommit
+statements retry internally on a real conflict, re-reading each time;
+BEGIN/COMMIT surfaces the conflict.
 
 The writes that take no basis — a duplicate-key INSERT's pre-flight, and an FK
 check — hold their table guard instead, and their refusals must be exactly as
@@ -29,11 +30,7 @@ _BUMP_1 = "UPDATE {} SET val = val + 1 WHERE pk = 1"
 @pytest.fixture
 def occ(client, schema_name, server):
     """`ledger` seeded at (1, 0), (2, 0) and `u` at (1, 0), both `(pk, val)`, plus
-    a factory for extra connections closed at teardown. Yields `(schema, connect)`.
-
-    A factory rather than pre-opened handles: a connection's OCC basis is fixed
-    at connect, and the tests below turn on where that connect lands relative to
-    another connection's commit."""
+    a factory for extra connections closed at teardown. Yields `(schema, connect)`."""
     for sql in ("CREATE TABLE ledger (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
                 "CREATE TABLE u (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
                 "INSERT INTO ledger VALUES (1, 0), (2, 0)",
@@ -89,51 +86,41 @@ def test_racing_read_modify_writes_lose_no_update(client, occ):
      {(1, 1): 1, (2, 100): 1}),
     ("DELETE FROM ledger WHERE pk = 1", {(2, 100): 1}),
 ], ids=["update", "upsert", "delete"])
-def test_a_stale_basis_self_heals(occ, sql, want):
-    """A connects, then B commits to the same table, so A's statement conflicts on
-    its first attempt. The internal retry adopts the fresh basis and re-resolves:
-    no app-visible error, and B's write survives. Without that refresh A would
-    re-conflict until the bound exhausted."""
+def test_a_foreign_commit_costs_no_extra_round(occ, sql, want):
+    """A connects, then B commits to the same table, then A runs its statement. A's
+    read comes after B's ACK, so its watermark covers B's commit and the first
+    attempt commits: one RESOLVE, one read, one push — and B's write survives."""
     sn, connect = occ
     a, b = connect(), connect()
     b.execute_sql("UPDATE ledger SET val = val + 100 WHERE pk = 2", schema_name=sn)
+    before = a.requests_sent
     a.execute_sql(sql, schema_name=sn)
+    assert a.requests_sent - before == 3, "RESOLVE, SCAN_SPEC and PUSH_TXN"
     assert bag(scanned(a, sn, "ledger"), "pk", "val") == want
 
 
-def test_sustained_contention_surfaces_a_conflict_naming_the_table(occ):
-    """The internal retry is bounded: under three connections committing
-    continuously, some statement exhausts it and raises the typed conflict, which
-    names the table it lost on."""
+@pytest.mark.parametrize("between", [False, True], ids=["before-begin", "between-two-tables"])
+def test_a_transaction_commits_over_a_write_its_reads_saw(occ, between):
+    """B commits to `ledger` before A's transaction reads it — before BEGIN, or
+    after A has already written `u` inside the transaction. Each family's basis is
+    the watermark of its own read, which saw B's commit, so COMMIT passes and
+    every write survives."""
     sn, connect = occ
-    stop = threading.Event()
-    errors = []
+    a, b = connect(), connect()
 
-    def hammer(c):
-        try:
-            while not stop.is_set():
-                _retry(c, sn, _BUMP_1.format("ledger"))
-        except Exception as e:  # noqa: BLE001 — surfaced after the join
-            errors.append(e)
+    def b_commits():
+        b.execute_sql("UPDATE ledger SET val = val + 100 WHERE pk = 2", schema_name=sn)
 
-    hammers = [threading.Thread(target=hammer, args=(connect(),), daemon=True) for _ in range(3)]
-    for h in hammers:
-        h.start()
-    seen = None
-    try:
-        c = connect()
-        for _ in range(400):
-            try:
-                c.execute_sql(_BUMP_1.format("ledger"), schema_name=sn)
-            except gnitz.GnitzConflictError as e:
-                seen = str(e)
-                break
-    finally:
-        stop.set()
-        join_or_fail("a hammer thread hung", *hammers)
-    assert not errors, errors
-    assert seen is not None, "400 statements under sustained contention never surfaced a conflict"
-    assert "ledger" in seen, seen
+    if not between:
+        b_commits()
+    a.execute_sql("BEGIN", schema_name=sn)
+    a.execute_sql(_BUMP_1.format("u"), schema_name=sn)
+    if between:
+        b_commits()
+    a.execute_sql(_BUMP_1.format("ledger"), schema_name=sn)
+    a.execute_sql("COMMIT", schema_name=sn)
+    assert bag(scanned(a, sn, "u"), "pk", "val") == {(1, 1): 1}
+    assert bag(scanned(a, sn, "ledger"), "pk", "val") == {(1, 1): 1, (2, 100): 1}
 
 
 @pytest.mark.parametrize("via, ledger_read, rename", [

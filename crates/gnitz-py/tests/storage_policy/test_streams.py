@@ -237,11 +237,9 @@ def test_a_cluster_by_stream_routes_by_its_prefix(client, schema_name):
     assert _read(client, sn, "cv") == {(a, 300 * a + 6): 1 for a in range(1, 11)}
 
 
-def test_a_stream_push_does_not_advance_the_clients_occ_basis(client, schema_name):
-    """A stream push is not durable, so it replies LSN `0` and leaves the client's
-    read basis where the last durable write put it. Were it to hand out the zone
-    LSN it reserved instead — one that is never published — the read-modify-write
-    statement after it would cite a basis above anything published and conflict."""
+def test_a_stream_push_replies_lsn_zero(client, schema_name):
+    """An ACK reports an LSN only for a write a restart must recover: a base-table
+    push replies its zone LSN, and a stream push, which is not durable, `0`."""
     sn = schema_name
     client.execute_sql(f"CREATE TABLE t ({_EVENT_COLS})", schema_name=sn)
     _stream(client, sn)
@@ -254,6 +252,3 @@ def test_a_stream_push_does_not_advance_the_clients_occ_basis(client, schema_nam
     sb = gnitz.ZSetBatch(s_schema)
     sb.append(id=1, kind=1, amount=1, _weight=1)
     assert client.push(s_tid, sb) == 0, "a stream push is not durable"
-
-    client.execute_sql("UPDATE t SET amount = 11 WHERE id = 1", schema_name=sn)
-    assert bag(client.scan(t_tid)) == {(1, 1, 11): 1}

@@ -1,21 +1,17 @@
 //! UPDATE and DELETE, as one read-then-write flow: plan the WHERE through the
-//! shared access-path ladder (`dml::plan`), read the rows it matches in the
-//! transaction's effective state (`dml::overlay`), then write the rewritten rows
-//! (UPDATE) or the retraction of their keys (DELETE) under the RMW driver.
+//! shared access-path ladder (`dml::plan`), then, under the RMW driver
+//! (`dml::rmw`), read the rows it matches in the transaction's effective state and
+//! write the rewritten rows (UPDATE) or the retraction of their keys (DELETE).
 //!
 //! The SET list — [`bind_set_list`] binds the targets, [`classify_set_rhs`]
 //! compiles each value, [`apply_set`] rewrites a batch — is shared with INSERT's
 //! `ON CONFLICT DO UPDATE`.
 
-use std::sync::Arc;
-
 use crate::ast_util::{classify_from, extract_table_name_and_alias, single_part_ident, FromShape};
 use crate::bind::{bind_single_table, find_unique_column};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
-use crate::codec::project_schema::key_reply;
-use crate::dml::overlay::resolve_where_matches;
-use crate::dml::plan::{bind_where, bound_and_predicate};
-use crate::dml::rmw::commit_rmw_or_buffer;
+use crate::dml::plan::access_path;
+use crate::dml::rmw::{commit_rmw, TargetRead};
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::BoundExpr;
@@ -23,7 +19,7 @@ use crate::validate::{reject_unhonored_delete_clauses, reject_unhonored_update_c
 use crate::SqlResult;
 use gnitz_core::{retraction_batch, ColType, ColumnDef, FixedInt, GnitzClient, Schema, TypeCode, ZSetBatch};
 use gnitz_expr::{ExprResults, ScalarEval, SchemaFacts};
-use gnitz_wire::{encode_german_string, german_string_content, null_word_get, null_word_set, ReadSink, ReadSpec};
+use gnitz_wire::{encode_german_string, german_string_content, null_word_get, null_word_set};
 use sqlparser::ast::{Assignment, AssignmentTarget, Delete, Expr, FromTable, TableWithJoins, Update};
 
 // ---------------------------------------------------------------------------
@@ -76,41 +72,19 @@ fn execute_mutation(
     let (table_name, alias) = extract_table_name_and_alias(factor, schema_name, verb)?;
     let target = client.resolve_relation(schema_name, &table_name)?;
     require_class(&target, &table_name, ClassWant::BaseTable, verb)?;
-    let (tid, schema) = (target.tid, &target.schema);
+    let schema = &target.schema;
     // Before the read, so a bad SET list errors whether or not a row matches.
     let mut set = set
-        .map(|raw| {
-            bind_set_list(raw, schema, "UPDATE SET", |e, ci| {
-                classify_set_rhs(&bind_single_table(e, schema, &alias)?, Scope::Existing, ci, schema)
-            })
-        })
+        .map(|raw| bind_set_list(raw, schema, &alias, SetClause::Update))
         .transpose()?;
-    let where_expr = bind_where(schema, &alias, selection)?;
-    let (bound, predicate) = bound_and_predicate(schema, &where_expr, &target.indexes)?.into_parts();
-    // UPDATE reads whole rows; DELETE the source PK alone, with no blob heap.
-    let (reply_schema, sink) = if set.is_some() {
-        (Arc::clone(schema), ReadSink::all_rows())
-    } else {
-        let (reply, map) = key_reply(schema)?;
-        (Arc::new(reply), ReadSink { map: Some(map), ..ReadSink::all_rows() })
-    };
-    let spec = ReadSpec { bound, predicate, sink };
-    // The build re-runs per RMW retry, so a conflict re-reads fresh state. Both
+    let (bound, predicate) = access_path(schema, &alias, selection, &target.indexes)?;
+    // UPDATE reads whole rows; DELETE the source PK alone, with no blob heap. Both
     // writes are built under the catalog schema, so an in-transaction DELETE
     // buffers in the layout an INSERT does.
-    let count = commit_rmw_or_buffer(client, &table_name, tid, schema, |client| {
-        let (mut rows, buffered) = resolve_where_matches(client, tid, schema, &spec, &reply_schema)?;
-        Ok(match &mut set {
-            Some(set) => {
-                rows.extend_from_owned(buffered);
-                apply_set(set, rows, None, schema)?
-            }
-            None => {
-                let mut out = retraction_batch(schema, rows.pks);
-                out.extend_from_owned(retraction_batch(schema, buffered.pks));
-                out
-            }
-        })
+    let read = TargetRead::new(&target, bound, predicate, set.is_none())?;
+    let count = commit_rmw(client, &table_name, &read, |rows| match &mut set {
+        Some(set) => apply_set(set, rows, None, schema),
+        None => Ok(retraction_batch(schema, rows.pks)),
     })?;
     Ok(SqlResult::RowsAffected { count })
 }
@@ -142,36 +116,111 @@ pub(crate) enum SetRhs {
     Expr { scope: Scope, ev: Box<ScalarEval> },
 }
 
+/// Which statement a SET list belongs to: what its error messages name, and
+/// whether a value may read the incoming row as `EXCLUDED.<col>`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SetClause {
+    Update,
+    DoUpdate,
+}
+
+impl SetClause {
+    fn name(self) -> &'static str {
+        match self {
+            SetClause::Update => "UPDATE SET",
+            SetClause::DoUpdate => "ON CONFLICT DO UPDATE SET",
+        }
+    }
+}
+
 /// Each target is one plain identifier naming a non-PK column not already
-/// assigned; `rhs` compiles the value for column `ci`.
-pub(crate) fn bind_set_list(
+/// assigned; each value is bound against `schema` under `alias`, the qualifier a
+/// written column reference must name.
+pub(super) fn bind_set_list(
     raw: &[Assignment],
     schema: &Schema,
-    clause: &str,
-    mut rhs: impl FnMut(&Expr, usize) -> Result<SetRhs, GnitzSqlError>,
+    alias: &str,
+    clause: SetClause,
 ) -> Result<Vec<SetCol>, GnitzSqlError> {
+    let clause_name = clause.name();
     let mut set: Vec<SetCol> = Vec::with_capacity(raw.len());
     for a in raw {
         let name = match &a.target {
             AssignmentTarget::ColumnName(name) => single_part_ident(name),
             _ => None,
         }
-        .ok_or_else(|| GnitzSqlError::Plan(format!("{clause}: column must be a simple identifier")))?;
+        .ok_or_else(|| GnitzSqlError::Plan(format!("{clause_name}: column must be a simple identifier")))?;
         let ci = find_unique_column(&schema.columns, name)?
-            .ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found in {clause}")))?;
+            .ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found in {clause_name}")))?;
         if schema.is_pk_col(ci) {
             return Err(GnitzSqlError::Unsupported(format!(
-                "cannot assign to primary key column in {clause}"
+                "cannot assign to primary key column in {clause_name}"
             )));
         }
         if set.iter().any(|s| s.ci == ci) {
             return Err(GnitzSqlError::Bind(format!(
-                "multiple assignments to column '{name}' in {clause}"
+                "multiple assignments to column '{name}' in {clause_name}"
             )));
         }
-        set.push(SetCol { ci, rhs: rhs(&a.value, ci)? });
+        let rhs = bind_set_rhs(&a.value, ci, schema, alias, clause)?;
+        set.push(SetCol { ci, rhs });
     }
     Ok(set)
+}
+
+/// One SET right-hand side for column `target`. Under `DoUpdate` the incoming-row
+/// scope is the pseudo-qualifier `EXCLUDED.<col>`; a bare column name, as under
+/// `Update`, refers to the existing (stored) row.
+fn bind_set_rhs(
+    expr: &Expr,
+    target: usize,
+    schema: &Schema,
+    alias: &str,
+    clause: SetClause,
+) -> Result<SetRhs, GnitzSqlError> {
+    if clause == SetClause::DoUpdate {
+        if let Some(col_name) = excluded_col(expr) {
+            let col_idx = find_unique_column(&schema.columns, col_name)?
+                .ok_or_else(|| GnitzSqlError::Bind(format!("EXCLUDED.{col_name}: column not found")))?;
+            // Through the same classifier as a bare RHS, so `SET int_col =
+            // EXCLUDED.str_col` is rejected here rather than per row.
+            return classify_set_rhs(&BoundExpr::ColRef(col_idx), Scope::Excluded, target, schema);
+        }
+        // `col + EXCLUDED.col`. The binder already rejects it (`EXCLUDED` names no
+        // relation in scope); this says why, which its message cannot.
+        if expr_contains_excluded(expr) {
+            return Err(GnitzSqlError::Unsupported(
+                "EXCLUDED column references inside compound expressions are not \
+                 supported; use a simple `col = EXCLUDED.col` assignment"
+                    .to_string(),
+            ));
+        }
+    }
+    classify_set_rhs(
+        &bind_single_table(expr, schema, alias)?,
+        Scope::Existing,
+        target,
+        schema,
+    )
+}
+
+/// The column an `EXCLUDED.<col>` reference names. Deliberately unpeeled: the
+/// binder resolves `(EXCLUDED.a)` as an ordinary reference, so accepting the
+/// parenthesized form here would bind it to the *existing* row's column.
+fn excluded_col(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::CompoundIdentifier(p) if p.len() == 2 && p[0].value.eq_ignore_ascii_case("EXCLUDED") => {
+            Some(p[1].value.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// True when `expr` references `EXCLUDED.<col>` anywhere the binder would reach.
+/// Recognized by [`excluded_col`], the same rule the accept path takes, so the
+/// guard cannot miss a form that path would have bound.
+fn expr_contains_excluded(expr: &Expr) -> bool {
+    crate::ast_util::expr_any(expr, &|e| excluded_col(e).is_some())
 }
 
 /// Compile one SET right-hand side for column `target`, against the schema the

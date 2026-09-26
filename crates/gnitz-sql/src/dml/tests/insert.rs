@@ -109,43 +109,6 @@ fn insert_omitting_the_pk_is_rejected_by_the_pk_plan() {
     assert!(err.to_string().contains("PK column 'pk' missing"), "got {err}");
 }
 
-/// An `EXCLUDED.col` reference anywhere the binder can reach — inside CASE,
-/// BETWEEN, function arguments, IN lists — must be detected, so the compound
-/// RHS is rejected rather than the qualifier being silently dropped and the
-/// reference bound to the existing row's column.
-#[test]
-fn excluded_detected_in_every_operand_position() {
-    for src in [
-        "EXCLUDED.a",
-        "val + EXCLUDED.a",
-        "-EXCLUDED.a",
-        "(EXCLUDED.a)",
-        "COALESCE(EXCLUDED.a, 0)",
-        "CASE WHEN EXCLUDED.a > 0 THEN 1 ELSE 0 END",
-        "CASE val WHEN 1 THEN EXCLUDED.a END",
-        "val BETWEEN EXCLUDED.a AND 10",
-        "val IN (1, EXCLUDED.a)",
-        "EXCLUDED.a IS NULL",
-        "CAST(EXCLUDED.a AS BIGINT)",
-        "EXCLUDED.a::BIGINT",
-        "CEIL(EXCLUDED.a)",
-        "FLOOR(EXCLUDED.a)",
-        "ABS(EXCLUDED.a)",
-        "GREATEST(val, EXCLUDED.a)",
-        // Both of LIKE's bound sub-expressions, which the binder reaches.
-        "EXCLUDED.s LIKE 'a%'",
-        "s ILIKE EXCLUDED.s",
-    ] {
-        assert!(
-            expr_contains_excluded(&parse_expr_sql(src)),
-            "must detect EXCLUDED in {src}"
-        );
-    }
-    for src in ["val + 1", "COALESCE(val, 0)", "t.a", "CASE WHEN val > 0 THEN 1 END"] {
-        assert!(!expr_contains_excluded(&parse_expr_sql(src)), "false positive on {src}");
-    }
-}
-
 fn compound_schema_u64_u64_u128() -> Schema {
     Schema {
         columns: vec![

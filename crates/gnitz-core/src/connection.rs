@@ -108,7 +108,7 @@ fn check_response(ctrl: &DecodedControl) -> Result<(), ClientError> {
         }),
         WireStatus::SalFull => Err(ClientError::SalFull(text)),
         WireStatus::IntegrityViolation => Err(ClientError::IntegrityViolation(text)),
-        WireStatus::TxnConflict => Err(ClientError::TxnConflict { fresh_basis: ctrl.hdr.arg0 }),
+        WireStatus::TxnConflict => Err(ClientError::TxnConflict),
         WireStatus::Error if text.is_empty() => Err(ClientError::ServerError("unknown server error".into())),
         WireStatus::Error => Err(ClientError::ServerError(text)),
     }
@@ -183,10 +183,10 @@ pub enum Request<'a> {
     /// An atomic DDL transaction: system-table batches, each named by its table
     /// id, under one durable SAL zone. Completes as [`Reply::Lsn`].
     DdlTxn(&'a [(u64, ZSetBatch)]),
-    /// An atomic user-table push transaction under one OCC `basis`: the server
-    /// refuses it if a relation some family `reads` was written after `basis`.
-    /// Completes as [`Reply::Lsn`].
-    PushTxn { families: &'a [PushFamily<'a>], basis: u64 },
+    /// An atomic user-table push transaction: the server refuses it if some
+    /// family's relation was written after that family's `basis`. Completes as
+    /// [`Reply::Lsn`].
+    PushTxn { families: &'a [PushFamily<'a>] },
     /// A frame the caller encoded itself, for the scripted-peer tests that
     /// drive bytes the library would never build. Test-only, so no production
     /// path reaches an encoder behind `submit`'s back. Uncorrelated.
@@ -254,8 +254,6 @@ pub enum Reply {
     Resolve(Option<Arc<RelDescriptor>>),
     /// An id allocation's base id.
     Id(u64),
-    /// A decoded `scan_spec`: its rows under the slot's reply schema.
-    Rows(ZSetBatch),
     /// A delta poll: the slot is done, and every view's blocks went to the
     /// poll's own listener as that view's terminal arrived.
     Polled,
@@ -271,7 +269,6 @@ impl Reply {
             Reply::Lsn(_) => "Lsn",
             Reply::Resolve(_) => "Resolve",
             Reply::Id(_) => "Id",
-            Reply::Rows(_) => "Rows",
             Reply::Polled => "Polled",
         }
     }
@@ -323,16 +320,6 @@ impl Reply {
         match self {
             Reply::Id(id) => id,
             other => wrong_shape(other.kind(), "Id"),
-        }
-    }
-
-    /// A decoded `scan_spec`'s rows.
-    #[inline]
-    #[track_caller]
-    pub fn into_rows(self) -> ZSetBatch {
-        match self {
-            Reply::Rows(batch) => batch,
-            other => wrong_shape(other.kind(), "Rows"),
         }
     }
 }
@@ -466,17 +453,15 @@ pub struct Session {
 
 impl Session {
     /// `target` is an AF_UNIX socket path or a `tls://` target (see
-    /// `ClientTransport::connect`). Returns the session paired with
-    /// the server durability watermark from the HELLO ACK, which
-    /// `GnitzClient::connect` adopts as the seed for its OCC basis.
-    pub fn connect(target: &str) -> Result<(Self, u64), ClientError> {
+    /// `ClientTransport::connect`).
+    pub fn connect(target: &str) -> Result<Self, ClientError> {
         let until = Some(Instant::now() + CONNECT_TIMEOUT);
         let mut transport = ClientTransport::connect(target, until)?;
         // Run the HELLO handshake before any data flows. The server
         // accepts the first frame at an 8-byte limit, so this must
         // happen before a control block would be emitted.
-        let published_lsn = hello_handshake(&mut transport, until)?;
-        Ok((Self::over(transport), published_lsn))
+        hello_handshake(&mut transport, until)?;
+        Ok(Self::over(transport))
     }
 
     fn over(transport: ClientTransport) -> Self {
@@ -569,11 +554,11 @@ impl Session {
                 }
                 (encode_ddl_txn(families), SlotKind::Commit)
             }
-            Request::PushTxn { families, basis } => {
+            Request::PushTxn { families } => {
                 for f in families {
                     f.batch.validate(f.schema)?;
                 }
-                (encode_push_txn(families, basis), SlotKind::Commit)
+                (encode_push_txn(families), SlotKind::Commit)
             }
             #[cfg(test)]
             Request::RawFrame(frame) => (frame, SlotKind::Commit),
@@ -941,9 +926,11 @@ impl Session {
             SlotKind::Resolve => resolve_descriptor(ctrl, schema).map(Reply::Resolve),
             SlotKind::Alloc => Ok(Reply::Id(ctrl.hdr.target_id)),
             SlotKind::Commit => Ok(Reply::Lsn(ctrl.hdr.arg0)),
-            SlotKind::ScanSpec { reply_schema } => {
-                Ok(Reply::Rows(data.unwrap_or_else(|| ZSetBatch::new(reply_schema))))
-            }
+            SlotKind::ScanSpec { reply_schema } => Ok(Reply::Scan(scan_reply(
+                Some(Arc::clone(reply_schema)),
+                data,
+                ctrl.hdr.arg0,
+            )?)),
             SlotKind::Multi { tids } => {
                 accum.replies.push(scan_reply(schema, data, ctrl.hdr.arg0)?);
                 // This position's train is over; the next one starts clean.

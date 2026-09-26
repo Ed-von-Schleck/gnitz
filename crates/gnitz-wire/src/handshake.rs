@@ -39,7 +39,7 @@ pub const ALPN_GNITZ: &[u8] = b"gnitz/1";
 pub const HELLO_PAYLOAD_LEN: usize = 8;
 
 /// ACK payload length in bytes (excluding the 4-byte length prefix).
-pub const HELLO_ACK_PAYLOAD_LEN: usize = 12;
+pub const HELLO_ACK_PAYLOAD_LEN: usize = 4;
 
 /// Total wire size of an ACK frame (length prefix + payload).
 pub(crate) const HELLO_ACK_FRAME_SIZE: usize = FRAME_LEN_PREFIX_BYTES + HELLO_ACK_PAYLOAD_LEN;
@@ -70,33 +70,25 @@ pub fn decode_hello_payload(payload: &[u8]) -> Result<u32, &'static str> {
     Ok(crate::read_u32_le(payload, HELLO_OFF_VERSION))
 }
 
-/// ACK payload fields, relative to the payload (past the length prefix).
-const ACK_OFF_MAGIC: usize = 0;
-const ACK_OFF_LSN: usize = 4;
-
-/// Build an ACK frame ready to ship over the wire (length prefix + payload).
-/// `published_lsn` is the server's durability watermark at connect, seeding the
-/// client's OCC basis, so a connection needs no separate watermark read.
-pub fn encode_hello_ack(published_lsn: u64) -> [u8; HELLO_ACK_FRAME_SIZE] {
+/// Build an ACK frame ready to ship over the wire (length prefix + payload). The
+/// payload is the magic alone.
+pub fn encode_hello_ack() -> [u8; HELLO_ACK_FRAME_SIZE] {
     let mut out = [0u8; HELLO_ACK_FRAME_SIZE];
     crate::write_u32_le(&mut out, 0, HELLO_ACK_PAYLOAD_LEN as u32);
-    let payload = &mut out[FRAME_LEN_PREFIX_BYTES..];
-    crate::write_u32_le(payload, ACK_OFF_MAGIC, HELLO_MAGIC);
-    crate::write_u64_le(payload, ACK_OFF_LSN, published_lsn);
+    crate::write_u32_le(&mut out, FRAME_LEN_PREFIX_BYTES, HELLO_MAGIC);
     out
 }
 
-/// Decode an ACK payload (the bytes following the length prefix) to the
-/// server's durability watermark at connect — the client's initial OCC basis —
-/// rejecting a wrong size or magic.
-pub fn decode_hello_ack(payload: &[u8]) -> Result<u64, &'static str> {
+/// Check an ACK payload (the bytes following the length prefix), rejecting a
+/// wrong size or magic.
+pub fn decode_hello_ack(payload: &[u8]) -> Result<(), &'static str> {
     if payload.len() != HELLO_ACK_PAYLOAD_LEN {
         return Err("hello ack payload wrong size");
     }
-    if crate::read_u32_le(payload, ACK_OFF_MAGIC) != HELLO_MAGIC {
+    if crate::read_u32_le(payload, 0) != HELLO_MAGIC {
         return Err("hello magic mismatch");
     }
-    Ok(crate::read_u64_le(payload, ACK_OFF_LSN))
+    Ok(())
 }
 
 #[cfg(test)]

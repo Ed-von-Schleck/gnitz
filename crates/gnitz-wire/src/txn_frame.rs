@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! DDL_TXN     ctrl                | ([u64 tid][data block])*
-//! PUSH_TXN    ctrl (arg0 = basis) | ([u64 tid][u8 mode][u8 reads][u32 len][schema record][data block])*
+//! PUSH_TXN    ctrl                | ([u64 tid][u8 mode][u64 basis][u32 len][schema record][data block])*
 //! SCAN_MULTI  ctrl                | ([u64 tid][u16 schema_version])*
 //! DELTA_POLL  ctrl                | ([u64 view_id][u64 after_tick][u32 len][reply block])*
 //! ```
@@ -35,12 +35,11 @@ pub const DELTA_POLL_MAX_VIEWS: usize = 64;
 // Encode
 // ---------------------------------------------------------------------------
 
-/// The shared prologue: a control header naming `verb` and `arg0`, every other
-/// field zero. Each encoder below appends its own body.
-fn prologue(verb: ClientVerb, arg0: u64, body_hint: usize) -> Writer {
+/// The shared prologue: a control header naming `verb`, every other field zero.
+/// Each encoder below appends its own body.
+fn prologue(verb: ClientVerb, body_hint: usize) -> Writer {
     let hdr = ControlHeader {
         flags: WireFlags { verb, ..Default::default() },
-        arg0,
         ..Default::default()
     };
     let mut head = [0u8; CTRL_HEADER_SIZE];
@@ -55,21 +54,25 @@ fn prologue(verb: ClientVerb, arg0: u64, body_hint: usize) -> Writer {
 /// Each block is `(tid, rows, regions)`.
 pub fn encode_ddl_txn(blocks: &[(u64, usize, Regions<'_>)]) -> Vec<u8> {
     let body = blocks.iter().map(|(_, _, r)| 8 + block_size(r)).sum();
-    let mut w = prologue(ClientVerb::DdlTxn, 0, body);
+    let mut w = prologue(ClientVerb::DdlTxn, body);
     for (tid, rows, regions) in blocks {
         w.u64(*tid).block(*rows, regions);
     }
     w.into_vec()
 }
 
+/// The basis of a `PUSH_TXN` family built from no read. No read reports it, and
+/// no commit exceeds it.
+pub const BLIND: u64 = u64::MAX;
+
 /// One `PUSH_TXN` family, in both directions.
 pub struct PushTxnItem<'a, D> {
     /// The target relation.
     pub tid: u64,
     pub mode: WireConflictMode,
-    /// The transaction read this family's relation: the commit fails if the
-    /// relation was written after the frame's basis.
-    pub reads: bool,
+    /// The commit fails if `tid` was written after `basis`, the watermark of the
+    /// read this family was built from; [`BLIND`] for a family built from no read.
+    pub basis: u64,
     pub schema_block: &'a [u8],
     /// The rows and region list to encode; the framed block slice once decoded.
     pub data: D,
@@ -78,16 +81,16 @@ pub struct PushTxnItem<'a, D> {
 /// Encode a `PUSH_TXN` frame, without the 4-byte frame header: user-table
 /// writes committed as one zone. Every family carries its schema block, so the
 /// master validates it with no warm-cache version.
-pub fn encode_push_txn(basis: u64, items: &[PushTxnItem<'_, (usize, Regions<'_>)>]) -> Vec<u8> {
+pub fn encode_push_txn(items: &[PushTxnItem<'_, (usize, Regions<'_>)>]) -> Vec<u8> {
     let body: usize = items
         .iter()
-        .map(|f| 8 + 1 + 1 + 4 + f.schema_block.len() + block_size(&f.data.1))
+        .map(|f| 8 + 1 + 8 + 4 + f.schema_block.len() + block_size(&f.data.1))
         .sum();
-    let mut w = prologue(ClientVerb::PushTxn, basis, body);
+    let mut w = prologue(ClientVerb::PushTxn, body);
     for f in items {
         w.u64(f.tid)
             .u8(f.mode.as_wire())
-            .bool(f.reads)
+            .u64(f.basis)
             .bytes32(f.schema_block)
             .block(f.data.0, &f.data.1);
     }
@@ -97,7 +100,7 @@ pub fn encode_push_txn(basis: u64, items: &[PushTxnItem<'_, (usize, Regions<'_>)
 /// Encode a `SCAN_MULTI` frame, without the 4-byte frame header: N relations
 /// read at one SAL cut, each `(tid, cached schema version)`, answered in order.
 pub fn encode_scan_multi(relations: &[(u64, u16)]) -> Vec<u8> {
-    let mut w = prologue(ClientVerb::ScanMulti, 0, relations.len() * (8 + 2));
+    let mut w = prologue(ClientVerb::ScanMulti, relations.len() * (8 + 2));
     for (tid, version) in relations {
         w.u64(*tid).u16(*version);
     }
@@ -116,7 +119,7 @@ pub struct DeltaPollItem<'a> {
 /// Encode a `DELTA_POLL` frame, without the 4-byte frame header.
 pub fn encode_delta_poll(views: &[DeltaPollItem<'_>]) -> Vec<u8> {
     let body: usize = views.iter().map(|v| 8 + 8 + 4 + v.reply_block.len()).sum();
-    let mut w = prologue(ClientVerb::DeltaPoll, 0, body);
+    let mut w = prologue(ClientVerb::DeltaPoll, body);
     for v in views {
         w.u64(v.view_id).u64(v.after_tick).bytes32(v.reply_block);
     }
@@ -156,17 +159,17 @@ pub fn decode_ddl_txn(body: &[u8]) -> Result<Vec<(u64, &[u8])>, String> {
 }
 
 /// Decode a `PUSH_TXN` frame body into its families, in send order, each block
-/// borrowed from `body`. The basis is the frame's `arg0`.
+/// borrowed from `body`.
 pub fn decode_push_txn(body: &[u8]) -> Result<Vec<PushTxnItem<'_, &[u8]>>, String> {
     items(body, "PUSH_TXN", usize::MAX, |r| {
         let tid = r.u64()?;
         let mode =
             WireConflictMode::from_wire(r.u8()?).ok_or_else(|| "PUSH_TXN: unknown family conflict mode".to_string())?;
-        let reads = r.bool()?;
+        let basis = r.u64()?;
         Ok(PushTxnItem {
             tid,
             mode,
-            reads,
+            basis,
             schema_block: r.bytes32()?,
             data: r.block()?,
         })

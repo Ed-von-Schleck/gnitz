@@ -27,7 +27,7 @@ use crate::ast_util::{
 use crate::bind::{bind_single_table, output_column, probe_relation};
 use crate::codec::project_schema::compute_map;
 use crate::dml::cte::inline_ctes;
-use crate::dml::plan::{bind_where, bound_and_predicate, rows_reply, RowsReply};
+use crate::dml::plan::{access_path, rows_reply, RowsReply};
 use crate::error::{derivation, reject_if, GnitzSqlError};
 use crate::exec::agg_finish::FoldFinish;
 use crate::exec::order::{order_and_window, Window};
@@ -41,7 +41,7 @@ use crate::validate::{
 };
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, CatalogSnapshot, GnitzClient, RelDescriptor, Schema, ZSetBatch};
-use gnitz_wire::{ReadBound, ReadSink, ReadSpec, SinkKind};
+use gnitz_wire::{ReadSink, ReadSpec, SinkKind};
 use sqlparser::ast::{OrderBy, Query, Select, SetExpr, Statement};
 use std::sync::Arc;
 
@@ -99,8 +99,13 @@ impl ReadPlan {
 
     /// The `ReadSpec` this read ships; `None` for a constant row.
     pub fn spec(&self) -> Option<&ReadSpec> {
+        self.spec_read().map(|read| &read.spec)
+    }
+
+    /// The relation read and what ships; `None` for a constant row.
+    pub(super) fn spec_read(&self) -> Option<&SpecRead> {
         match &self.case {
-            ReadCase::Rows { read, .. } | ReadCase::Fold { read, .. } => Some(&read.spec),
+            ReadCase::Rows { read, .. } | ReadCase::Fold { read, .. } => Some(read),
             ReadCase::Constant { .. } => None,
         }
     }
@@ -189,9 +194,6 @@ fn plan_query(cat: &CatalogSnapshot, query: &Query, schema_name: &str) -> Result
     };
     let factor = match classify_from(&select.from) {
         FromShape::Empty => {
-            const CTX: &str = "SELECT without FROM";
-            reject_unhonored_select_clauses(select, HonoredClauses::PLAIN, CTX)?;
-            reject_if(select.selection.is_some(), CTX, "WHERE")?;
             let (schema, row) = plan_constant(query, select)?;
             return Ok(ReadPlan {
                 case: ReadCase::Constant { schema, row },
@@ -207,25 +209,40 @@ fn plan_query(cat: &CatalogSnapshot, query: &Query, schema_name: &str) -> Result
     // GROUP BY rejection.
     let distinct = select.distinct.is_some();
     let fold = distinct || body_is_grouped(select);
-    let ctx = match (distinct, fold) {
-        (true, _) => "SELECT DISTINCT",
-        (false, true) => "aggregate SELECT",
-        (false, false) => "direct SELECT",
+    let ctx = if distinct {
+        "SELECT DISTINCT"
+    } else if fold {
+        "aggregate SELECT"
+    } else {
+        "direct SELECT"
     };
     reject_unhonored_select_clauses(select, HonoredClauses::for_body(fold, distinct), ctx)?;
     let desc = probe_relation(cat, schema_name, &name)?;
     require_class(&desc, &name, ClassWant::Readable, ctx)?;
     // WHERE → access before either sink's shape, so a query unsupported on both axes names
     // the same one whichever sink it lands on.
-    let access = plan_access(&desc, &alias, select)?;
+    let (bound, predicate) = access_path(&desc.schema, &alias, select.selection.as_ref(), &desc.indexes)?;
+    let schema = Arc::clone(&desc.schema);
+    let read = move |sink| SpecRead {
+        name,
+        desc,
+        spec: ReadSpec { bound, predicate, sink },
+    };
     let (case, order) = if fold {
-        plan_fold(select, query.order_by.as_ref(), name, &alias, desc, access)?
+        let (sink, finish, reduce_schema, order) = plan_fold(select, query.order_by.as_ref(), &alias, &schema)?;
+        let case = ReadCase::Fold {
+            read: read(sink),
+            finish: Box::new(finish),
+            reduce_schema,
+            is_distinct: distinct,
+        };
+        (case, order)
     } else {
         // OFFSET+LIMIT logical rows; `0` = unbounded (an OFFSET with no LIMIT too).
         let limit_k = window.end().map_or(0, |e| e as u64);
         let RowsReply { schema: reply_schema, program, order } =
-            rows_reply(&select.projection, query.order_by.as_ref(), &desc.schema, &alias)?;
-        let k = desc.schema.pk_cols.len();
+            rows_reply(&select.projection, query.order_by.as_ref(), &schema, &alias)?;
+        let k = schema.pk_cols.len();
         let sink = ReadSink {
             map: program.map(|p| compute_map(p, &reply_schema.columns[k..])),
             kind: SinkKind::Rows {
@@ -233,38 +250,24 @@ fn plan_query(cat: &CatalogSnapshot, query: &Query, schema_name: &str) -> Result
                 limit_k,
             },
         };
-        let (bound, predicate) = access;
-        let read = SpecRead {
-            name,
-            desc,
-            spec: ReadSpec { bound, predicate, sink },
-        };
-        (ReadCase::Rows { read, reply_schema }, order)
+        (ReadCase::Rows { read: read(sink), reply_schema }, order)
     };
     Ok(ReadPlan { case, order, window })
 }
 
-/// The WHERE → access step: the bound and the compiled predicate.
-fn plan_access(desc: &RelDescriptor, alias: &str, select: &Select) -> Result<(ReadBound, Vec<u8>), GnitzSqlError> {
-    let bound_where = bind_where(&desc.schema, alias, select.selection.as_ref())?;
-    let (bound, predicate) = bound_and_predicate(&desc.schema, &bound_where, &desc.indexes)?.into_parts();
-    Ok((bound, predicate))
-}
-
 /// A GROUP BY / global aggregate / HAVING / DISTINCT read, bound by the front end a
-/// grouped `CREATE VIEW` body uses, and its ORDER BY over the finished output.
+/// grouped `CREATE VIEW` body uses: its sink, its client finish, the reduce input
+/// its columns index, and its ORDER BY over the finished output.
 fn plan_fold(
     select: &Select,
     order_by: Option<&OrderBy>,
-    name: String,
     alias: &str,
-    desc: Arc<RelDescriptor>,
-    (bound, predicate): (ReadBound, Vec<u8>),
-) -> Result<(ReadCase, Vec<gnitz_wire::OrderKey>), GnitzSqlError> {
+    schema: &Arc<Schema>,
+) -> Result<(ReadSink, FoldFinish, Arc<Schema>, Vec<gnitz_wire::OrderKey>), GnitzSqlError> {
     // The keys bind with the SELECT list, so one over a column the grouping does
     // not cover rejects before the fold is dispatched, as HAVING already does.
     let keys = parse_order_by(order_by)?;
-    let (pieces, order_cols) = bind_and_lower_fold(select, &desc.schema, alias, &order_exprs(&keys))?;
+    let (pieces, order_cols) = bind_and_lower_fold(select, schema, alias, &order_exprs(&keys))?;
     // Compiled here rather than at finish, so every rejection is pre-dispatch — and
     // the same one a view gives, the finalize being compiled as a view's map is.
     let finish = FoldFinish::new(
@@ -285,23 +288,15 @@ fn plan_fold(
         &finish.out_schema.columns,
         order_cols.iter().map(|&at| finish.out_schema.pk_cols.len() + at),
     )?;
-    let case = ReadCase::Fold {
-        read: SpecRead {
-            name,
-            desc,
-            spec: ReadSpec { bound, predicate, sink },
-        },
-        finish: Box::new(finish),
-        reduce_schema: pieces.reduce_schema,
-        is_distinct: select.distinct.is_some(),
-    };
-    Ok((case, order))
+    Ok((sink, finish, pieces.reduce_schema, order))
 }
 
 /// A FROM-less SELECT's one row, finished at plan time: each item is a constant
 /// expression, compiled as a fold's finalize item over the ground row.
 fn plan_constant(query: &Query, select: &Select) -> Result<(Arc<Schema>, ZSetBatch), GnitzSqlError> {
     const CTX: &str = "SELECT without FROM";
+    reject_unhonored_select_clauses(select, HonoredClauses::PLAIN, CTX)?;
+    reject_if(select.selection.is_some(), CTX, "WHERE")?;
     let ground = ground_partial_schema();
     // No relation is in scope: the ground row's one column is hidden, so every
     // written name is unresolvable, a qualified one included.
@@ -347,13 +342,17 @@ pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result
     let (schema, batch) = match case {
         ReadCase::Constant { schema, row } => (schema, row),
         ReadCase::Rows { read, reply_schema } => {
-            let batch = client.scan_spec_local_first(read.desc.tid, read.spec, &reply_schema)?;
+            let batch = client
+                .scan_spec_local_first(read.desc.tid, read.spec, &reply_schema)?
+                .batch;
             (reply_schema, batch)
         }
         ReadCase::Fold { read, mut finish, .. } => {
             // A wire error (the per-worker group cap included) is hard: the fold is
             // mid-flight on the workers and cannot fall back.
-            let partial = client.scan_spec_local_first(read.desc.tid, read.spec, &finish.partial_schema)?;
+            let partial = client
+                .scan_spec_local_first(read.desc.tid, read.spec, &finish.partial_schema)?
+                .batch;
             (Arc::clone(&finish.out_schema), finish.apply(finish.combine(partial)))
         }
     };

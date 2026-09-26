@@ -116,7 +116,8 @@ pub(crate) fn in_list_expr(col: &str, items: Vec<Expr>) -> Expr {
 /// the production shape, and the input of the `access` recognizers. The relation
 /// is `t`, which is what every qualified reference in these tests writes.
 pub(crate) fn bind_where(sql: &str, schema: &Schema) -> Vec<BoundExpr> {
-    crate::dml::plan::bind_where(schema, "t", Some(&parse_expr_sql(sql))).expect("bind WHERE")
+    crate::bind::bind_conjuncts(&parse_expr_sql(sql), &crate::bind::SingleTable { schema, alias: "t" })
+        .expect("bind WHERE")
 }
 
 /// [`bind_where`] for a predicate that is one conjunct — the input of the

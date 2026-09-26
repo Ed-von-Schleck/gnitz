@@ -505,6 +505,14 @@ fn a_mirrored_select_issues_no_request() {
     let before = m.requests_sent();
     let (_, plan) = query(m, "s", "EXPLAIN SELECT a, b, v FROM v_keyed WHERE a = 7");
     assert!(!plan.weights.is_empty(), "EXPLAIN must describe a plan");
+    // ... and it describes the read the copy serves, not a server read.
+    let lines: Vec<&[u8]> = (0..plan.len())
+        .map(|r| gnitz_wire::german_string_content(&plan.payload[0].bytes[r * 16..(r + 1) * 16], &plan.blob))
+        .collect();
+    assert!(
+        lines.contains(&&b"read view v_keyed (local copy)"[..]),
+        "the plan must name the local copy: {lines:?}",
+    );
     assert_eq!(
         m.requests_sent(),
         before,

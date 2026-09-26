@@ -108,7 +108,8 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
     };
     let reply = client
         .scan_spec(tid, &spec, &reply_schema)
-        .expect("a PK-only reply must not be rejected");
+        .expect("a PK-only reply must not be rejected")
+        .batch;
 
     // Weights reach the client unsummed: no top-k gate, one row per key.
     assert!(reply.weights.iter().all(|&w| w == 1), "per-row weights preserved");
@@ -175,7 +176,8 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     };
     let reply = client
         .scan_spec(tid, &spec, &reply_schema)
-        .expect("a compound PK-only reply must not be rejected");
+        .expect("a compound PK-only reply must not be rejected")
+        .batch;
 
     let mut got: Vec<Vec<u8>> = (0..reply.pks.len())
         .map(|i| reply.pks.get_tuple(i).pk_bytes().to_vec())
@@ -200,7 +202,8 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     // drops — the whole point of the projection.
     let full = client
         .scan_spec(tid, &ReadSpec::all_rows(ReadBound::None), &schema)
-        .unwrap();
+        .unwrap()
+        .batch;
     assert_eq!(
         full.payload[0].bytes.len(),
         rows.len() * 16,

@@ -85,7 +85,7 @@ pub(crate) fn plan_resolving<T>(
 ///
 /// A query and the `EXPLAIN` of one resolve and read **local-first**: a relation
 /// the client's own copy holds is described and read off it, which is what keeps
-/// a mirrored `SELECT` round-trip-free. Everything below the split is DDL, DML or
+/// a mirrored `SELECT` round-trip-free. Every other arm is DDL, DML or
 /// transaction control, which only a connection can serve — and what stops one of
 /// those planning against a binding only as fresh as the last poll is the resolve
 /// its handler uses, [`GnitzClient::resolve`] (directly or through
@@ -104,15 +104,11 @@ pub(crate) fn execute_statement(
             let plan = plan_resolving(client, GnitzClient::resolve_local_first, schema_name, |cat| {
                 crate::plan_read(stmt, cat, schema_name)
             })?;
-            return match stmt {
-                Statement::Explain { .. } => Ok(dml::execute_explain(&plan)),
+            match stmt {
+                Statement::Explain { .. } => Ok(dml::execute_explain(client, &plan)),
                 _ => dml::execute_select(client, plan),
-            };
+            }
         }
-        _ => {}
-    }
-
-    match stmt {
         // Transaction control is a pure client-state-machine transition, so the
         // arm is the whole consumer: `transaction already open` and `no
         // transaction open` come from the `client.txn_*` calls below.
@@ -151,7 +147,7 @@ pub(crate) fn execute_statement(
             // the application re-runs the whole transaction from BEGIN.
             match client.txn_commit() {
                 Ok(lsn) => Ok(SqlResult::TransactionCommitted { lsn }),
-                Err(ClientError::TxnConflict { .. }) => Err(GnitzSqlError::Conflict { table: None }),
+                Err(ClientError::TxnConflict) => Err(GnitzSqlError::Conflict { table: None }),
                 Err(e) => Err(GnitzSqlError::Exec(e)),
             }
         }

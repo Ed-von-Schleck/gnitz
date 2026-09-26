@@ -79,7 +79,7 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 pub async fn connect(target: &str) -> Result<(AsyncClient, Connection), ClientError> {
     let target: Arc<str> = Arc::from(target);
     let connect_to = Arc::clone(&target);
-    let (session, _published_lsn) = blocking(move || Session::connect(&connect_to)).await??;
+    let session = blocking(move || Session::connect(&connect_to)).await??;
     // A `dup`, so the reactor deregisters a descriptor whose life it owns
     // rather than a number the session may already have closed and the kernel
     // handed out again.

@@ -898,7 +898,7 @@ pub(crate) fn reject_foreign_qualifier(qual: Option<&str>, name: &str, alias: &s
     Ok(())
 }
 
-/// Leaf for a single-relation schema (WHERE, projections, set-ops, DML).
+/// Leaf for one relation's columns under one alias.
 pub(crate) struct SingleTable<'a> {
     pub schema: &'a Schema,
     /// The relation's effective alias — what a written qualifier must name.

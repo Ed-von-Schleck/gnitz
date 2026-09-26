@@ -1,67 +1,141 @@
-//! The read-modify-write commit driver shared by UPDATE, DELETE, and INSERT ...
-//! ON CONFLICT — every autocommit statement that reads a table before writing it,
-//! where a naive push is a silent lost-update race.
+//! The read-modify-write driver shared by UPDATE, DELETE, and INSERT ... ON
+//! CONFLICT — every statement that reads a table before writing it, where a naive
+//! push is a silent lost-update race.
 //!
-//! Each such statement resolves its target rows client-side, computes new rows
-//! client-side, then writes. This driver wraps that read+build so that:
+//! Each such statement reads its target rows ([`TargetRead`]), builds the rows to
+//! write client-side, and writes them conditioned on the read's watermark
+//! ([`commit_rmw`]):
 //!
-//! - **Autocommit** ships a `PUSH_TXN` frame of one read-flagged family
-//!   (`GnitzClient::commit_rmw`) asserting the table has not been written since
-//!   the basis. On a `TxnConflict` it adopts the server's fresh basis and re-runs
-//!   the build from scratch (re-reading fresh state — re-shipping the stale batch
-//!   would commit the very update it lost), bounded at [`RMW_MAX_ATTEMPTS`].
-//! - **Inside a transaction** it buffers the write as a read-flagged family, so
-//!   COMMIT fails if the table was written after the transaction's basis; no
-//!   per-statement retry (the buffered reads are stale by definition).
+//! - **Autocommit** ships the write at once. A conflict means a write landed after
+//!   the read, so the driver re-reads and rebuilds — re-shipping the stale batch
+//!   would commit the very update it lost — bounded at [`RMW_MAX_ATTEMPTS`], which
+//!   surfaces sustained contention to the caller.
+//! - **Inside a transaction** a non-empty write is buffered, and COMMIT checks its
+//!   condition; an empty one buffers nothing. The read sees the transaction's own
+//!   buffered writes over the committed rows.
 
+use std::sync::Arc;
+
+use crate::codec::project_schema::key_reply;
 use crate::error::GnitzSqlError;
-use gnitz_core::{ClientError, GnitzClient, Schema, ZSetBatch};
+use gnitz_core::{ClientError, GnitzClient, RelDescriptor, ScanReply, Schema, TxnReads, ZSetBatch};
+use gnitz_expr::RowFilter;
+use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
 
 /// Max autocommit RMW attempts before the conflict is surfaced to the caller for
-/// its own (application-level) retry. Forward progress each attempt comes from
-/// the adopted fresh basis + the master's table-lock serialization, not backoff.
+/// its own (application-level) retry. Each attempt re-reads, so each makes
+/// progress from a fresh read; there is no backoff.
 const RMW_MAX_ATTEMPTS: usize = 4;
 
-/// Commit an autocommit RMW with bounded OCC retry, or buffer it into the open
-/// transaction. `build` re-reads the target and produces the batch to write under
-/// the table's catalog `schema`; it is re-run on every retry (a conflict means the
-/// read was stale). Returns the written batch's row count. `tid` / `table_name`
-/// identify the single table the statement writes (DML is single-table);
-/// `table_name` names the conflict if the bound exhausts.
-pub(crate) fn commit_rmw_or_buffer<F>(
-    client: &mut GnitzClient,
-    table_name: &str,
+/// A read of the target's rows a bound and predicate match, in the transaction's
+/// effective state: committed rows the transaction has not written, plus its own
+/// live rows that match. `keys` narrows the reply to the PK.
+pub(super) struct TargetRead {
     tid: u64,
-    schema: &Schema,
-    mut build: F,
-) -> Result<usize, GnitzSqlError>
-where
-    F: FnMut(&mut GnitzClient) -> Result<ZSetBatch, GnitzSqlError>,
-{
-    if client.txn_active() {
-        let batch = build(client)?;
-        let count = batch.len();
-        client.txn_push_rmw(tid, schema, batch)?;
-        return Ok(count);
+    schema: Arc<Schema>,
+    spec: ReadSpec,
+    reply: Arc<Schema>,
+    keys: bool,
+}
+
+impl TargetRead {
+    pub(super) fn new(
+        target: &RelDescriptor,
+        bound: ReadBound,
+        predicate: Vec<u8>,
+        keys: bool,
+    ) -> Result<Self, GnitzSqlError> {
+        let (reply, sink) = if keys {
+            let (reply, map) = key_reply(&target.schema)?;
+            (Arc::new(reply), ReadSink { map: Some(map), ..ReadSink::all_rows() })
+        } else {
+            (Arc::clone(&target.schema), ReadSink::all_rows())
+        };
+        Ok(TargetRead {
+            tid: target.tid,
+            schema: Arc::clone(&target.schema),
+            spec: ReadSpec { bound, predicate, sink },
+            reply,
+            keys,
+        })
     }
 
-    // Autocommit: bounded OCC retry, adopting the server's fresh basis on each
-    // conflict (without it a warm connection would recompute the identical basis
-    // and deterministically re-conflict).
-    let mut basis = client.last_seen_lsn();
-    for _ in 0..RMW_MAX_ATTEMPTS {
-        let batch = build(client)?;
-        // The engine rejects an empty family batch.
-        if batch.is_empty() {
-            return Ok(0);
+    /// The matched rows under the reply schema, and the read's watermark.
+    fn resolve(&self, client: &mut GnitzClient) -> Result<(ZSetBatch, u64), GnitzSqlError> {
+        // A DML target is a base table, which is never mirrored.
+        let ScanReply { batch, lsn, .. } = client.scan_spec(self.tid, &self.spec, &self.reply)?;
+        let lsn = lsn.expect("a server read carries its watermark");
+        let rows = match client.txn_reads(self.tid) {
+            None => batch,
+            Some(txn) => self.merge(batch, &txn)?,
+        };
+        Ok((rows, lsn))
+    }
+
+    /// `committed` less every PK the transaction wrote, plus the transaction's live
+    /// rows (last op per PK, weight > 0) that the bound and predicate keep. A
+    /// `PkSet` bound restricts the buffered side to its keys, as the server does
+    /// the committed side.
+    fn merge(&self, committed: ZSetBatch, txn: &TxnReads<'_>) -> Result<ZSetBatch, GnitzSqlError> {
+        let keep: Vec<(usize, i64)> = (0..committed.len())
+            .filter(|&i| txn.last_op(committed.pks.get_bytes(i)).is_none())
+            .map(|i| (i, committed.weights[i]))
+            .collect();
+        // `gather` compacts the string arena the dropped rows carried.
+        let mut out = committed.gather(&keep);
+
+        let mut live = ZSetBatch::new(&self.schema);
+        let take = |(batch, row): (&ZSetBatch, usize)| {
+            if batch.weights[row] > 0 {
+                live.copy_row_at(batch, row, batch.weights[row]);
+            }
+        };
+        match &self.spec.bound {
+            ReadBound::PkSet(keys) => keys.iter().filter_map(|k| txn.last_op(k)).for_each(take),
+            _ => txn.last_ops().for_each(take),
         }
-        match client.commit_rmw(tid, schema, &batch, basis) {
-            Ok(_lsn) => return Ok(batch.len()),
-            Err(ClientError::TxnConflict { fresh_basis }) => basis = fresh_basis,
+        if live.is_empty() {
+            return Ok(out);
+        }
+
+        let mut ranges = Vec::new();
+        RowFilter::for_read(&self.spec.predicate, &self.spec.bound, &*self.schema)?.ranges(&live, &mut ranges);
+        for r in ranges.into_iter().flat_map(|(s, e)| s..e) {
+            if self.keys {
+                // The key reply has no payload: a key, its weight and a null word.
+                out.pks.push_from(&live.pks, r);
+                out.weights.push(live.weights[r]);
+                out.nulls.push(0);
+            } else {
+                out.copy_row_at(&live, r, live.weights[r]);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Commit an RMW statement with bounded OCC retry, or buffer it into the open
+/// transaction. Each attempt re-reads `read` and hands the rows to `build`; the
+/// write is conditioned on that read's watermark. Returns the written row count.
+pub(super) fn commit_rmw(
+    client: &mut GnitzClient,
+    table_name: &str,
+    read: &TargetRead,
+    mut build: impl FnMut(ZSetBatch) -> Result<ZSetBatch, GnitzSqlError>,
+) -> Result<usize, GnitzSqlError> {
+    for _ in 0..RMW_MAX_ATTEMPTS {
+        let (rows, basis) = read.resolve(client)?;
+        let batch = build(rows)?;
+        let count = batch.len();
+        match client.push_rmw(read.tid, &read.schema, batch, basis) {
+            Ok(()) => return Ok(count),
+            Err(ClientError::TxnConflict) => {}
             Err(e) => return Err(GnitzSqlError::Exec(e)),
         }
     }
-    // Exhausted the internal bound under sustained contention: surface a named
-    // conflict so the application can retry the whole statement.
     Err(GnitzSqlError::Conflict { table: Some(table_name.to_string()) })
 }
+
+#[cfg(test)]
+#[path = "tests/rmw.rs"]
+mod tests;

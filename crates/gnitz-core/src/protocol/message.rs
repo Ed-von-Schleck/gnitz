@@ -28,14 +28,14 @@ pub struct PushFamily<'a> {
     pub schema: &'a Schema,
     pub batch: &'a ZSetBatch,
     pub mode: WireConflictMode,
-    /// The transaction read `tid`: the commit fails if it was written after the
-    /// frame's basis.
-    pub reads: bool,
+    /// The commit fails if `tid` was written after `basis`, the watermark of the
+    /// read this family was built from; `BLIND` for a family built from no read.
+    pub basis: u64,
 }
 
 /// Encode an atomic user-table push transaction frame (`ClientVerb::PushTxn`) into
-/// wire bytes (without the 4-byte frame header), under the OCC `basis`.
-pub fn encode_push_txn(families: &[PushFamily<'_>], basis: u64) -> Vec<u8> {
+/// wire bytes (without the 4-byte frame header).
+pub fn encode_push_txn(families: &[PushFamily<'_>]) -> Vec<u8> {
     let schemas: Vec<Vec<u8>> = families.iter().map(|f| encode_schema_block(f.schema)).collect();
     let items: Vec<PushTxnItem<'_, (usize, Regions<'_>)>> = families
         .iter()
@@ -43,12 +43,12 @@ pub fn encode_push_txn(families: &[PushFamily<'_>], basis: u64) -> Vec<u8> {
         .map(|(f, schema_block)| PushTxnItem {
             tid: f.tid,
             mode: f.mode,
-            reads: f.reads,
+            basis: f.basis,
             schema_block,
             data: (f.batch.len(), f.batch.wire_regions()),
         })
         .collect();
-    gnitz_wire::txn_frame::encode_push_txn(basis, &items)
+    gnitz_wire::txn_frame::encode_push_txn(&items)
 }
 
 /// Encode an atomic DDL transaction frame (`ClientVerb::DdlTxn`) into wire bytes

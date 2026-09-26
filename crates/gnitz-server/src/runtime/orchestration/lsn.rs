@@ -10,8 +10,10 @@ use std::cell::Cell;
 /// reserves its zone LSN via [`reserve`](Self::reserve) — under
 /// a `SalExcl` (committer, SERIAL) or the catalog write lock with the
 /// committer quiesced (DDL), so reservation order == SAL write order — and
-/// publishes via [`publish`](Self::publish) only after its fsync completes, so
-/// readers never see an LSN whose data is not yet on disk.
+/// publishes via [`publish`](Self::publish) only after its fsync completes.
+///
+/// A read under a SAL hold sees every zone at or below `reserved`, fsynced or
+/// not, so `reserved` — not `published` — is the watermark of what it saw.
 pub struct ZoneLsnAllocator {
     reserved: Cell<u64>,
     published: Cell<u64>,
@@ -42,9 +44,15 @@ impl ZoneLsnAllocator {
         self.published.set(self.published.get().max(zone));
     }
 
-    /// The durability watermark SCAN/SEEK and tick emission report.
+    /// The durability watermark: every zone at or below it is fsynced.
     pub fn published(&self) -> u64 {
         self.published.get()
+    }
+
+    /// The allocation high-water: every zone at or below it was reserved, and
+    /// under the caller's SAL hold was laid out ahead of it or rolled back.
+    pub fn reserved(&self) -> u64 {
+        self.reserved.get()
     }
 }
 
