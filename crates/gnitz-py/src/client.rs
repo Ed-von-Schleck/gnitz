@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::{PyDict, PyList};
 
 use gnitz_core::{
     ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, ScanReply, Schema, TableProps, WireConflictMode,
@@ -20,7 +20,7 @@ use gnitz_sql::{SqlPlanner, SqlResult};
 use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec};
 
 use crate::read::{scan_result, PyDeltaReply, PyScanResult};
-use crate::schema::{resolve_py_schema, rust_schema_to_py};
+use crate::schema::{resolve_py_schema, PySchema};
 use crate::write::{pk_key_from_py, py_pks_to_column, py_scalar_key, PyZSetBatch};
 use crate::{build_pylist, client_err, connect_client, gnitz_err, sql_err, GnitzError};
 
@@ -149,19 +149,17 @@ impl PyGnitzClient {
         self.call(py, |c| c.drop_schema(name))
     }
 
-    /// create_table(schema_name, table_name, columns) — `columns` is a `Schema`
-    /// or a list of `ColumnDef`. Partitioned, default distribution; no inline
-    /// UNIQUE surface.
+    /// create_table(schema_name, table_name, schema). Partitioned, default
+    /// distribution; no inline UNIQUE surface.
     pub fn create_table(
         &mut self,
         py: Python<'_>,
         schema_name: &str,
         table_name: &str,
-        #[pyo3(from_py_with = resolve_py_schema)] columns: Arc<Schema>,
+        #[pyo3(from_py_with = resolve_py_schema)] schema: Arc<Schema>,
     ) -> PyResult<u64> {
-        let (cols, pk) = (&columns.columns, &columns.pk_cols);
-        self.call(py, move |c| {
-            c.create_table(schema_name, table_name, cols, &[], pk, TableProps::default(), &[])
+        self.call(py, |c| {
+            c.create_table(schema_name, table_name, &schema, &[], TableProps::default(), &[])
         })
     }
 
@@ -186,8 +184,7 @@ impl PyGnitzClient {
         self.call(py, move |c| c.push_with_mode(target_id, schema, b, m))
     }
 
-    /// delete(target_id, schema, pks) — `schema` may be a `Schema` or a list of
-    /// `ColumnDef`; `pks` is a list where each element is the key's value
+    /// delete(target_id, schema, pks) — `pks` is a list where each element is the key's value
     /// (single-column PK) or a tuple of its column values (compound PK).
     pub fn delete(
         &mut self,
@@ -216,19 +213,16 @@ impl PyGnitzClient {
 
     // ----- Views -----
 
-    /// `output_schema` may be a `Schema` or a list of `ColumnDef`.
+    /// create_view(schema_name, view_name, source_table_id) — a passthrough
+    /// view, whose schema is its source's.
     pub fn create_view(
         &mut self,
         py: Python<'_>,
         schema_name: &str,
         view_name: &str,
         source_table_id: u64,
-        #[pyo3(from_py_with = resolve_py_schema)] output_schema: Arc<Schema>,
     ) -> PyResult<u64> {
-        let cols = &output_schema.columns;
-        self.call(py, move |c| {
-            c.create_view(schema_name, view_name, source_table_id, cols)
-        })
+        self.call(py, |c| c.create_view(schema_name, view_name, source_table_id))
     }
 
     pub fn drop_view(&mut self, py: Python<'_>, schema_name: &str, view_name: &str) -> PyResult<()> {
@@ -236,11 +230,9 @@ impl PyGnitzClient {
     }
 
     /// resolve_table(schema_name, table_name) -> (tid: int, schema: Schema)
-    pub fn resolve_table(&mut self, py: Python<'_>, schema_name: &str, table_name: &str) -> PyResult<Py<PyAny>> {
-        let (tid, schema) = self.call(py, |c| c.resolve_table_or_view_id(schema_name, table_name))?;
-        let py_schema = rust_schema_to_py(py, &schema)?.into_any();
-        let tid_obj = tid.into_pyobject(py)?.into_any().unbind();
-        Ok(PyTuple::new(py, [tid_obj, py_schema])?.into_any().unbind())
+    pub fn resolve_table(&mut self, py: Python<'_>, schema_name: &str, table_name: &str) -> PyResult<(u64, PySchema)> {
+        let (tid, rust) = self.call(py, |c| c.resolve_table_or_view_id(schema_name, table_name))?;
+        Ok((tid, PySchema { rust }))
     }
 
     /// scan(target_id) -> ScanResult
@@ -264,14 +256,15 @@ impl PyGnitzClient {
         view_id: u64,
         #[pyo3(from_py_with = resolve_py_schema)] view_schema: Arc<Schema>,
     ) -> PyResult<Py<PyDeltaReply>> {
-        let (batch, cursor) = self.call(py, |c| c.delta_bootstrap(view_id, &view_schema))?;
-        PyDeltaReply::new(py, view_schema, batch, cursor)
+        let (reply, cursor) = self.call(py, |c| c.delta_bootstrap(view_id, &view_schema))?;
+        PyDeltaReply::new(py, reply, cursor)
     }
 
-    /// delta_poll(view_id, reply_schema, cursor) -> DeltaReply
+    /// delta_poll(view_id, view_schema, cursor) -> DeltaReply
     ///
-    /// Every delta the view emitted since `cursor`, in `delta_reply_schema`'s
-    /// shape. `cursor` is the `(tag, tick)` a previous reply handed back. Apply
+    /// Every delta the view emitted since `cursor`, in the delta shape derived
+    /// from the view's schema: a hidden `_tick` key column, then the view's PK
+    /// columns, then its payload columns. `cursor` is the `(tag, tick)` a previous reply handed back. Apply
     /// what comes back and keep the new cursor; there is nothing to filter and
     /// nothing to reconcile.
     ///
@@ -282,12 +275,12 @@ impl PyGnitzClient {
         &mut self,
         py: Python<'_>,
         view_id: u64,
-        #[pyo3(from_py_with = resolve_py_schema)] reply_schema: Arc<Schema>,
+        #[pyo3(from_py_with = resolve_py_schema)] view_schema: Arc<Schema>,
         cursor: (u64, u64),
     ) -> PyResult<Py<PyDeltaReply>> {
         let cursor = DeltaCursor { tag: cursor.0, tick: cursor.1 };
-        let (batch, cursor) = self.call(py, |c| c.delta_poll(view_id, cursor, &reply_schema))?;
-        PyDeltaReply::new(py, reply_schema, batch, cursor)
+        let (reply, cursor) = self.call(py, |c| c.delta_poll(view_id, cursor, &view_schema))?;
+        PyDeltaReply::new(py, reply, cursor)
     }
 
     /// scan_many(target_ids) -> list[ScanResult]
@@ -445,11 +438,8 @@ impl PyGnitzClient {
     /// valid copy. The tick is the master's global round counter, shared by every
     /// relation, so it advances over rounds that carried this view nothing —
     /// whether a copy changed is `PollResult.reseeded`, not this.
-    pub fn cursor(&mut self, py: Python<'_>, view_id: u64) -> PyResult<Py<PyAny>> {
-        match self.live()?.cursor_of(view_id) {
-            None => Ok(py.None()),
-            Some(DeltaCursor { tag, tick }) => Ok(PyTuple::new(py, [tag, tick])?.into_any().unbind()),
-        }
+    pub fn cursor(&mut self, view_id: u64) -> PyResult<Option<(u64, u64)>> {
+        Ok(self.live()?.cursor_of(view_id).map(|c| (c.tag, c.tick)))
     }
 
     /// The message that poisoned this client's copy, or `None`. Answers on a

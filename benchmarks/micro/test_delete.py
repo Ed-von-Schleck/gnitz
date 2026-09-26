@@ -1,7 +1,6 @@
 """DELETE benchmarks: PK seek, scan-based."""
 
 
-import gnitz
 from helpers.datagen import bulk_load
 from helpers.timing import rows_affected
 
@@ -12,12 +11,7 @@ def _setup(client, schema_name, num_rows):
         "val BIGINT NOT NULL, cat BIGINT NOT NULL)",
         schema_name=schema_name,
     )
-    cols = [
-        gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-        gnitz.ColumnDef("val", gnitz.TypeCode.I64),
-        gnitz.ColumnDef("cat", gnitz.TypeCode.I64),
-    ]
-    return bulk_load(client, schema_name, "t", cols, num_rows)
+    return bulk_load(client, schema_name, "t", num_rows)
 
 
 def test_delete_pk(client, schema_name, bench_timer, scale):

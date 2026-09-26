@@ -160,34 +160,34 @@ impl Schema {
         (key, key.key_region(&self.pk_cols, group).unwrap_or(group).to_vec())
     }
 
-    /// The single definition of "these parts form an admissible schema": the
+    /// The single definition of "this is an admissible schema": the
     /// `MAX_COLUMNS` cap (the region null bitmap is one u64 word), the
     /// structural PK rules (non-empty, ≤ `PK_LIST_MAX_COLS`, every index
     /// `< columns.len()`, no duplicates), and the per-column invariants the
     /// engine's `SchemaDescriptor::new` hard-asserts — each PK column
-    /// non-nullable and PK-eligible. Shared by [`Schema::from_parts`] and the
-    /// client's `create_table` / `create_view_chain` DDL gateways, so a
-    /// malformed spec is a clean client error rather than a server-side assert.
+    /// non-nullable and PK-eligible. Run by [`Schema::from_parts`] and the
+    /// client's DDL gateways, so a malformed spec is a clean client error
+    /// rather than a server-side assert.
     ///
     /// The arity cap is the persisted PK-list codec capacity, not the wider
     /// in-memory `MAX_PK_COLUMNS`: a client never builds the engine-internal
     /// secondary-index schema that uses the extra slot, so a PK it accepts must
     /// round-trip through the codec.
-    pub fn validate_parts(pk_cols: &[u32], columns: &[ColumnDef]) -> Result<(), String> {
-        if columns.len() > MAX_COLUMNS {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.columns.len() > MAX_COLUMNS {
             return Err(format!(
                 "column count {} exceeds MAX_COLUMNS ({MAX_COLUMNS})",
-                columns.len()
+                self.columns.len()
             ));
         }
-        if let Some(cd) = columns.iter().find(|cd| !cd.ty.is_admissible()) {
+        if let Some(cd) = self.columns.iter().find(|cd| !cd.ty.is_admissible()) {
             return Err(format!(
                 "column '{}' ({:?}) carries scale {}",
                 cd.name, cd.ty.tc, cd.ty.scale
             ));
         }
-        gnitz_wire::validate_pk_tuple(pk_cols, columns.len(), gnitz_wire::PK_LIST_MAX_COLS, |c| {
-            let cd = &columns[c as usize];
+        gnitz_wire::validate_pk_tuple(&self.pk_cols, self.columns.len(), gnitz_wire::PK_LIST_MAX_COLS, |c| {
+            let cd = &self.columns[c as usize];
             (cd.ty.tc, cd.is_nullable)
         })
         .map(|_stride| ())
@@ -195,11 +195,12 @@ impl Schema {
     }
 
     /// Fallible constructor for a schema assembled from untrusted parts — a
-    /// wire schema block or catalog rows. Runs [`Schema::validate_parts`],
+    /// wire schema block or catalog rows. Runs [`Schema::validate`],
     /// so every decode boundary applies the same rule set.
     pub fn from_parts(columns: Vec<ColumnDef>, pk_cols: Vec<u32>) -> Result<Schema, String> {
-        Self::validate_parts(&pk_cols, &columns)?;
-        Ok(Schema { columns, pk_cols })
+        let s = Schema { columns, pk_cols };
+        s.validate()?;
+        Ok(s)
     }
 
     /// Structural type-equality used by the warm-push guard. Mirrors the

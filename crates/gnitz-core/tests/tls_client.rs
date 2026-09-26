@@ -39,7 +39,14 @@ fn client_with_table(target: &str) -> (GnitzClient, String, u64, std::sync::Arc<
         ColumnDef::new("b", TypeCode::I64, false),
     ];
     client
-        .create_table(&sn, "t", &cols, &[], &[0], TableProps::default(), &[])
+        .create_table(
+            &sn,
+            "t",
+            &Schema { columns: cols, pk_cols: vec![0] },
+            &[],
+            TableProps::default(),
+            &[],
+        )
         .unwrap();
     let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
     (client, sn, tid, schema)

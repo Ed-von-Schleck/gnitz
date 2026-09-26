@@ -38,10 +38,10 @@ fn acked_pushes_survive_a_worker_counter_ahead_of_the_zone_seed() {
         ColumnDef::new("pk", TypeCode::U64, false),
         ColumnDef::new("v", TypeCode::I64, false),
     ];
-    let tid = client
-        .create_table(&sn, "t", &cols, &[], &[0], TableProps::default(), &[])
-        .unwrap();
     let schema = Schema { columns: cols, pk_cols: vec![0] };
+    let tid = client
+        .create_table(&sn, "t", &schema, &[], TableProps::default(), &[])
+        .unwrap();
     let keys = keys_on_worker_one(420);
 
     // Worker 1's shards will carry LSNs far above the master's zone numbering.

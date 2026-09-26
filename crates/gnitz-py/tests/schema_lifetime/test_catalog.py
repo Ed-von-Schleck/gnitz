@@ -8,13 +8,12 @@ The verdicts the catalog refuses live in `admissibility/test_errors.py`.
 import gnitz
 import pytest
 from _read import access, bag, rows
+from _schemas import KV
 
-_KV = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-       gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
 
 
 def _push(client, tid, *pairs):
-    batch = gnitz.ZSetBatch(gnitz.Schema(_KV))
+    batch = gnitz.ZSetBatch(KV)
     for pk, val in pairs:
         batch.append(pk=pk, val=val)
     client.push(tid, batch)
@@ -29,7 +28,7 @@ def test_create_table_hands_back_the_declared_columns_up_to_the_cap(client, sche
     The per-type value round trip is `value_domain/test_value_round_trip.py`'s.
     """
     cols = [gnitz.ColumnDef("val", gnitz.TypeCode.I64),
-            gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True)]
+            gnitz.ColumnDef("pk", gnitz.TypeCode.U64)]
     cols += [gnitz.ColumnDef(f"c_{tc.name.lower()}", tc, is_nullable=True)
              for tc in (gnitz.TypeCode.U8, gnitz.TypeCode.I8, gnitz.TypeCode.U16,
                         gnitz.TypeCode.I16, gnitz.TypeCode.U32, gnitz.TypeCode.I32,
@@ -37,7 +36,7 @@ def test_create_table_hands_back_the_declared_columns_up_to_the_cap(client, sche
                         gnitz.TypeCode.STRING)]
     cols += [gnitz.ColumnDef(f"pad{i}", gnitz.TypeCode.I64, is_nullable=True)
              for i in range(gnitz.MAX_COLUMNS - len(cols))]
-    tid = client.create_table(schema_name, "t", cols)
+    tid = client.create_table(schema_name, "t", gnitz.Schema(cols, [1]))
 
     resolved, schema = client.resolve_table(schema_name, "t")
     assert resolved == tid
@@ -49,10 +48,9 @@ def test_a_dropped_relation_stops_answering_while_its_siblings_serve(client, sch
     """Two views over one source both receive every push; dropping one retires
     exactly that id — it stops answering scans — and leaves the other
     maintained. A dropped populated table's id retires the same way."""
-    tid = client.create_table(schema_name, "src", _KV)
-    schema = gnitz.Schema(_KV)
-    va = client.create_view(schema_name, "va", tid, schema)
-    vb = client.create_view(schema_name, "vb", tid, schema)
+    tid = client.create_table(schema_name, "src", KV)
+    va = client.create_view(schema_name, "va", tid)
+    vb = client.create_view(schema_name, "vb", tid)
 
     _push(client, tid, (1, 10))
     for vid in (va, vb):

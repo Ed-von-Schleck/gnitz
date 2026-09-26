@@ -10,10 +10,9 @@ is a shipped client binding that validates nothing on the way in.
 import pytest
 import gnitz
 from _read import bag
+from _schemas import KV
 from _uid import uid
 
-_PK = gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True)
-_COLS = [_PK, gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
 _NOT_WRITABLE = "is not writable"
 
 
@@ -24,10 +23,10 @@ def test_a_push_whose_pk_type_disagrees_is_rejected(client, schema_name, warm):
     push can show is that the descriptor reaches it on the cold path AND on the
     warm path, where a cached schema once let the push skip validation and
     reinterpret a U64-encoded PK as I64, corrupting at rest."""
-    tid = client.create_table(schema_name, "t", _COLS)
+    tid = client.create_table(schema_name, "t", KV)
     if warm:
         client.scan(tid)   # caches the table schema client-side
-    signed_pk = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.I64, primary_key=True), _COLS[1]])
+    signed_pk = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.I64), KV.columns[1]], [0])
     with pytest.raises(gnitz.GnitzError):
         client.push(tid, gnitz.ZSetBatch(signed_pk).extend([{"pk": 1, "val": 42}]))
     assert bag(client.scan(tid)) == {}
@@ -69,7 +68,7 @@ def test_an_absent_relation_is_a_miss_not_a_writability_failure(client, schema_n
     """A genuinely absent tid reports 'not found' rather than 'not writable',
     and a name the client itself cannot resolve raises a catchable class, so a
     caller branches on absence without matching prose."""
-    batch = gnitz.ZSetBatch(gnitz.Schema([_PK])).extend([{"pk": 1}])
+    batch = gnitz.ZSetBatch(gnitz.Schema([KV.columns[0]], [0])).extend([{"pk": 1}])
     with pytest.raises(gnitz.GnitzError, match="not found"):
         client.push(99999999, batch)
     with pytest.raises(gnitz.GnitzError):
@@ -89,7 +88,7 @@ def test_an_absent_relation_is_a_miss_not_a_writability_failure(client, schema_n
     with pytest.raises(gnitz.GnitzError):
         client.drop_schema("nonexistent_schema_xyz")
     with pytest.raises(gnitz.GnitzError):
-        client.create_table("nonexistent_schema_xyz", "t", _COLS)
+        client.create_table("nonexistent_schema_xyz", "t", KV)
 
 
 def test_create_schema_rejects_a_leading_underscore(client):
@@ -126,8 +125,8 @@ def test_a_live_view_blocks_dropping_its_base_even_from_another_schema(client, s
     the view lifts both."""
     other = "s" + uid()
     client.create_schema(other)
-    tid = client.create_table(other, "t", _COLS)
-    client.create_view(schema_name, "v", tid, gnitz.Schema(_COLS))
+    tid = client.create_table(other, "t", KV)
+    client.create_view(schema_name, "v", tid)
 
     with pytest.raises(gnitz.GnitzError):
         client.drop_table(other, "t")

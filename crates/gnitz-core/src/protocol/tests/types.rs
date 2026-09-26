@@ -45,7 +45,7 @@ fn schema_column_table() {
 }
 
 #[test]
-fn validate_parts_enforces_full_rule_set() {
+fn validate_enforces_full_rule_set() {
     let cols = vec![
         ColumnDef::new("a", TypeCode::U64, false),    // 0: eligible, non-null
         ColumnDef::new("b", TypeCode::I32, false),    // 1: eligible, non-null
@@ -54,9 +54,14 @@ fn validate_parts_enforces_full_rule_set() {
         ColumnDef::new("f", TypeCode::F64, false),    // 4: ineligible type
     ];
 
+    let schema = |pk: &[u32], columns: &[ColumnDef]| Schema {
+        columns: columns.to_vec(),
+        pk_cols: pk.to_vec(),
+    };
+
     // Valid single and compound PKs (including the I128 join-key type).
-    assert!(Schema::validate_parts(&[0], &cols).is_ok());
-    assert!(Schema::validate_parts(&[0, 1], &cols).is_ok());
+    assert!(schema(&[0], &cols).validate().is_ok());
+    assert!(schema(&[0, 1], &cols).validate().is_ok());
 
     // Each rule rejects, and names itself. The wording is `PkRule`'s.
     for (pk, want) in [
@@ -68,7 +73,7 @@ fn validate_parts_enforces_full_rule_set() {
         (&[2][..], "only fixed-width integer"),       // STRING is ineligible
         (&[4][..], "only fixed-width integer"),       // F64 is ineligible
     ] {
-        let got = Schema::validate_parts(pk, &cols).unwrap_err();
+        let got = schema(pk, &cols).validate().unwrap_err();
         assert!(got.contains(want), "pk {pk:?}: {got:?} does not mention {want:?}");
     }
 
@@ -77,10 +82,10 @@ fn validate_parts_enforces_full_rule_set() {
         .map(|i| ColumnDef::new(format!("c{i}"), TypeCode::U64, i > 0))
         .collect();
     assert_eq!(
-        Schema::validate_parts(&[0], &wide).unwrap_err(),
+        schema(&[0], &wide).validate().unwrap_err(),
         format!("column count {} exceeds MAX_COLUMNS ({MAX_COLUMNS})", MAX_COLUMNS + 1)
     );
-    assert!(Schema::validate_parts(&[0], &wide[..MAX_COLUMNS]).is_ok());
+    assert!(schema(&[0], &wide[..MAX_COLUMNS]).validate().is_ok());
 }
 
 #[test]

@@ -2,7 +2,7 @@ from gnitz._native import (
     GnitzError, GnitzConflictError, GnitzDeltaExpiredError,
     GnitzSalFullError, GnitzMirrorPoisonedError, GnitzNotFoundError,
     GnitzIntegrityError, Row, ScanResult,
-    ColumnDef, Schema, ZSetBatch, GnitzClient, DeltaReply, delta_reply_schema,
+    ColumnDef, Schema, ZSetBatch, GnitzClient, DeltaReply,
     PollResult,
     SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, IDX_TAB,
     FIRST_USER_TABLE_ID, MAX_COLUMNS,

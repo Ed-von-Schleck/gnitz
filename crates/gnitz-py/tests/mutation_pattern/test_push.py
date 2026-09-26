@@ -15,10 +15,10 @@ import gnitz
 from _read import bag, scanned
 from _serverproc import join_or_fail
 
-_INT = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-        gnitz.ColumnDef("val", gnitz.TypeCode.I64, is_nullable=True)]
-_STR = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-        gnitz.ColumnDef("val", gnitz.TypeCode.STRING, is_nullable=True)]
+_INT = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
+                     gnitz.ColumnDef("val", gnitz.TypeCode.I64, is_nullable=True)], [0])
+_STR = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
+                     gnitz.ColumnDef("val", gnitz.TypeCode.STRING, is_nullable=True)], [0])
 
 # A STRING table's push takes its own encoding and relocation path, so every
 # case runs over both; the four values are indexed by the cases below. The
@@ -49,11 +49,10 @@ _FOLD = {
 @pytest.mark.parametrize("leg", _LEGS)
 @pytest.mark.parametrize("committed,pushed,survivors", _FOLD.values(), ids=_FOLD.keys())
 def test_a_push_folds_by_pk(client, schema_name, leg, committed, pushed, survivors):
-    cols, vals = _LEGS[leg]
+    schema, vals = _LEGS[leg]
     sn = schema_name
-    tid = client.create_table(sn, "t", cols)
+    tid = client.create_table(sn, "t", schema)
     client.execute_sql("CREATE VIEW v AS SELECT * FROM t", schema_name=sn)
-    schema = gnitz.Schema(cols)
 
     def batch(rows):
         return gnitz.ZSetBatch(schema).extend(
@@ -76,11 +75,10 @@ def test_an_empty_push_writes_nothing_and_keeps_the_connection_aligned(client, s
     reply. The pushes around it return real LSNs and land whole."""
     sn = schema_name
     tid = client.create_table(sn, "t", _INT)
-    schema = gnitz.Schema(_INT)
-    bulk = gnitz.ZSetBatch(schema).extend([{"pk": i, "val": i * 10} for i in range(1, 1001)])
+    bulk = gnitz.ZSetBatch(_INT).extend([{"pk": i, "val": i * 10} for i in range(1, 1001)])
     assert client.push(tid, bulk) > 0
-    assert client.push(tid, gnitz.ZSetBatch(schema)) == 0
-    assert client.push(tid, gnitz.ZSetBatch(schema).extend([{"pk": 1001, "val": 0}])) > 0
+    assert client.push(tid, gnitz.ZSetBatch(_INT)) == 0
+    assert client.push(tid, gnitz.ZSetBatch(_INT).extend([{"pk": 1001, "val": 0}])) > 0
     assert bag(scanned(client, sn, "t")) == {(i, i * 10): 1 for i in range(1, 1001)} | {(1001, 0): 1}
 
 
@@ -101,7 +99,6 @@ def test_concurrent_pushes_coalesce_into_shared_commits(server, client, schema_n
     conns, rounds, per = 8, 30, 4
     sn = schema_name
     tids = [client.create_table(sn, f"t{i}", _STR) for i in range(2)]
-    schema = gnitz.Schema(_STR)
 
     def value(pk):
         return f"v{pk}" if pk % 2 == 0 else f"long-payload-for-row-{pk}"
@@ -114,7 +111,7 @@ def test_concurrent_pushes_coalesce_into_shared_commits(server, client, schema_n
             with gnitz.connect(server) as c:
                 for r in range(rounds):
                     base = 1 + (w * rounds + r) * per
-                    batch = gnitz.ZSetBatch(schema).extend(
+                    batch = gnitz.ZSetBatch(_STR).extend(
                         [{"pk": pk, "val": value(pk)} for pk in range(base, base + per)]
                         + [{"pk": 0, "val": f"w{w}r{r}"}])
                     lsns[w].append(c.push(tids[w % 2], batch))

@@ -17,7 +17,7 @@ use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_wire::decimal::format_decimal;
 use gnitz_wire::format_uuid;
 
-use crate::schema::rust_schema_to_py;
+use crate::schema::PySchema;
 
 /// `subclass` because a result presents its rows as a synthesised subclass
 /// carrying its field names and one [`ColumnDescriptor`] per column
@@ -329,8 +329,8 @@ pub struct PyScanResult {
 #[pymethods]
 impl PyScanResult {
     #[getter]
-    fn schema(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        Ok(rust_schema_to_py(py, &self.data.schema)?.into_any())
+    fn schema(&self) -> PySchema {
+        PySchema { rust: Arc::clone(&self.data.schema) }
     }
 
     fn __iter__(&self) -> PyRowIterator {
@@ -405,15 +405,9 @@ pub struct PyDeltaReply {
 }
 
 impl PyDeltaReply {
-    /// A delta read's rows under `schema` — the reply carries no schema block,
-    /// the client authored it — and the cursor it returned.
-    pub(crate) fn new(
-        py: Python<'_>,
-        schema: Arc<Schema>,
-        batch: ZSetBatch,
-        cursor: gnitz_core::DeltaCursor,
-    ) -> PyResult<Py<PyDeltaReply>> {
-        let rows = scan_result(py, ScanReply { schema, batch, lsn: None })?;
+    /// A delta read's rows and the cursor it returned.
+    pub(crate) fn new(py: Python<'_>, reply: ScanReply, cursor: gnitz_core::DeltaCursor) -> PyResult<Py<PyDeltaReply>> {
+        let rows = scan_result(py, reply)?;
         Py::new(py, PyDeltaReply { rows, cursor: (cursor.tag, cursor.tick) })
     }
 }

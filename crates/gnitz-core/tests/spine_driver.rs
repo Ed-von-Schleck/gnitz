@@ -26,23 +26,22 @@ fn table(target: &str) -> (GnitzClient, u64, std::sync::Arc<Schema>) {
     let sn = unique_schema("spine");
     client.create_schema(&sn).unwrap();
     client
-        .create_table(&sn, "t", &cols(), &[], &[0], TableProps::default(), &[])
+        .create_table(&sn, "t", &local_schema(), &[], TableProps::default(), &[])
         .unwrap();
     let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
     (client, tid, schema)
 }
 
-fn cols() -> Vec<ColumnDef> {
-    vec![
-        ColumnDef::new("pk", TypeCode::I64, false),
-        ColumnDef::new("a", TypeCode::I64, false),
-    ]
-}
-
-/// The fixture table's schema, built locally — [`rows`] needs it to encode a
-/// key, and `table()`'s copy comes back from the server.
+/// The fixture table's schema, built locally — `table()` creates it, and
+/// [`rows`] needs it to encode a key.
 fn local_schema() -> Schema {
-    Schema { columns: cols(), pk_cols: vec![0] }
+    Schema {
+        columns: vec![
+            ColumnDef::new("pk", TypeCode::I64, false),
+            ColumnDef::new("a", TypeCode::I64, false),
+        ],
+        pk_cols: vec![0],
+    }
 }
 
 fn rows(start: i64, count: usize) -> ZSetBatch {

@@ -10,10 +10,9 @@ import threading
 import gnitz
 import pytest
 from _read import bag, rows, scanned
+from _schemas import KV
 from _serverproc import START_TIMEOUT, join_or_fail
 
-_COLS = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-         gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
 
 
 def test_every_insert_acked_across_an_add_column_reads_back(client, schema_name, server):
@@ -75,14 +74,14 @@ def test_a_warm_push_decoded_before_an_alter_is_refused(dedicated_server):
     target = dedicated_server({"GNITZ_INJECT_PUSH_HOLD_FOR_DDL": "1"}).target
     with gnitz.connect(target) as client:
         client.create_schema("s")
-        tid = client.create_table("s", "t", _COLS)
+        tid = client.create_table("s", "t", KV)
         outcome = {}
         pushing = threading.Event()
 
         def pusher():
             with gnitz.connect(target) as conn:
                 conn.scan(tid)  # warms the schema cache, so the push ships no schema block
-                batch = gnitz.ZSetBatch(gnitz.Schema(_COLS)).append(pk=1, val=7)
+                batch = gnitz.ZSetBatch(KV).append(pk=1, val=7)
                 pushing.set()
                 try:
                     outcome["lsn"] = conn.push(tid, batch)
@@ -173,8 +172,8 @@ def test_a_drop_does_not_race_a_worker_still_creating_the_table(seamed_server):
     client = seamed_server({"GNITZ_INJECT_TABLE_CREATE_DELAY_MS": "50"})
     client.create_schema("s")
     for i in range(3):
-        client.create_table("s", f"t{i}", _COLS)
+        client.create_table("s", f"t{i}", KV)
         client.drop_table("s", f"t{i}")
-    tid = client.create_table("s", "t", _COLS)
-    client.push(tid, gnitz.ZSetBatch(gnitz.Schema(_COLS)).append(pk=1, val=1))
+    tid = client.create_table("s", "t", KV)
+    client.push(tid, gnitz.ZSetBatch(KV).append(pk=1, val=1))
     assert bag(client.scan(tid)) == {(1, 1): 1}

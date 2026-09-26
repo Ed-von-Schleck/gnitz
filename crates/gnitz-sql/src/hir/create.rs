@@ -157,7 +157,7 @@ fn plan_segments<'a>(
     let mut chain = ViewChain::new(matches!(props, ViewProps::Bounded { .. }));
     let pieces = crate::hir::bind_and_lower(cat, schema_name, &mut chain, query, view)?;
     let final_view = chain.push_final(pieces)?;
-    apply_positional_aliases(aliases, final_view.output_columns.iter_mut(), view.stmt)?;
+    apply_positional_aliases(aliases, final_view.schema.columns.iter_mut(), view.stmt)?;
     Ok(chain.segments)
 }
 

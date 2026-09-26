@@ -10,9 +10,8 @@ per-frame conflict modes only the binding exposes.
 import pytest
 import gnitz
 from _read import bag, rows, scanned
+from _schemas import KV
 
-_KV = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-       gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
 _TU = ("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
        "CREATE TABLE u (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
 
@@ -126,11 +125,10 @@ _BUNDLES = {
 
 @pytest.mark.parametrize("committed,frames,after", _BUNDLES.values(), ids=_BUNDLES.keys())
 def test_a_binary_bundle_validates_its_frames_in_order(client, schema_name, committed, frames, after):
-    schema = gnitz.Schema(_KV)
-    tids = {n: client.create_table(schema_name, n, _KV) for n in "ab"}
+    tids = {n: client.create_table(schema_name, n, KV) for n in "ab"}
 
     def batch(rows):
-        return gnitz.ZSetBatch(schema).extend([{"pk": p, "val": v, "_weight": w} for p, v, w in rows])
+        return gnitz.ZSetBatch(KV).extend([{"pk": p, "val": v, "_weight": w} for p, v, w in rows])
 
     if committed:
         client.push(tids["a"], batch([(p, v, 1) for p, v in committed]))
@@ -142,7 +140,7 @@ def test_a_binary_bundle_validates_its_frames_in_order(client, schema_name, comm
                 if mode == "raise":
                     raise RuntimeError("abandon the bundle")
                 if mode == "delete":
-                    txn.delete(tid, schema, rows)
+                    txn.delete(tid, KV, rows)
                 else:
                     txn.push(tid, batch(rows), mode)
 
@@ -158,10 +156,9 @@ def test_a_binary_bundle_validates_its_frames_in_order(client, schema_name, comm
 def test_a_bundle_into_a_table_dropped_before_commit_is_not_found(client, schema_name, server):
     """The commit is validated against the catalog it reaches, not the one the
     transaction began under, and the refusal names the relation it concerns."""
-    schema = gnitz.Schema(_KV)
-    tid = client.create_table(schema_name, "gone", _KV)
+    tid = client.create_table(schema_name, "gone", KV)
     with pytest.raises(gnitz.GnitzNotFoundError, match=str(tid)):
         with client.transaction() as txn:
-            txn.push(tid, gnitz.ZSetBatch(schema).extend([{"pk": 1, "val": 1}]), "update")
+            txn.push(tid, gnitz.ZSetBatch(KV).extend([{"pk": 1, "val": 1}]), "update")
             with gnitz.connect(server) as other:
                 other.execute_sql("DROP TABLE gone", schema_name=schema_name)

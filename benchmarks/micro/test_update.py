@@ -1,7 +1,6 @@
 """UPDATE benchmarks: PK seek, index seek, full scan."""
 
 
-import gnitz
 from helpers.datagen import PROBE_BASE, DataGen, bulk_load, probe_val, seed_index_probes
 from helpers.timing import rows_affected
 
@@ -12,12 +11,7 @@ def _setup(client, schema_name, num_rows, with_index=False):
         "val BIGINT NOT NULL, cat BIGINT NOT NULL)",
         schema_name=schema_name,
     )
-    cols = [
-        gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-        gnitz.ColumnDef("val", gnitz.TypeCode.I64),
-        gnitz.ColumnDef("cat", gnitz.TypeCode.I64),
-    ]
-    pks = bulk_load(client, schema_name, "t", cols, num_rows)
+    pks = bulk_load(client, schema_name, "t", num_rows)
     if with_index:
         client.execute_sql("CREATE INDEX ON t(val)", schema_name=schema_name)
     return pks

@@ -13,8 +13,8 @@ use crate::validate::{
 };
 use crate::SqlResult;
 use gnitz_core::{
-    CatalogSnapshot, ColType, ColumnDef, FkTarget, GnitzClient, InlineForeignKey, InlineUniqueIndex, TableProps,
-    TypeCode,
+    CatalogSnapshot, ColType, ColumnDef, FkTarget, GnitzClient, InlineForeignKey, InlineUniqueIndex, Schema,
+    TableProps, TypeCode,
 };
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::TableDistribution;
@@ -486,9 +486,8 @@ pub enum TablePlan {
     /// Register the table and its inline unique indexes as one bundle.
     Create {
         name: String,
-        cols: Vec<ColumnDef>,
+        schema: Schema,
         fks: Vec<InlineForeignKey>,
-        pk_indices: Vec<u32>,
         props: TableProps,
         /// Each inline UNIQUE constraint's columns and the catalog name its index
         /// takes — auto-names already disambiguated within the bundle.
@@ -646,9 +645,8 @@ pub fn plan_create_table(
     let unique_indexes = name_unique_indexes(unique, &cols, schema_name, &table_name)?;
     Ok(TablePlan::Create {
         name: table_name,
-        cols,
+        schema: Schema { columns: cols, pk_cols: pk_indices },
         fks,
-        pk_indices,
         props,
         unique_indexes,
     })
@@ -661,16 +659,9 @@ pub(crate) fn execute_create_table(
     schema_name: &str,
     plan: TablePlan,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let (name, cols, fks, pk_indices, props, unique_indexes) = match plan {
+    let (name, schema, fks, props, unique_indexes) = match plan {
         TablePlan::Skip { existing_id } => return Ok(SqlResult::TableCreated { table_id: existing_id }),
-        TablePlan::Create {
-            name,
-            cols,
-            fks,
-            pk_indices,
-            props,
-            unique_indexes,
-        } => (name, cols, fks, pk_indices, props, unique_indexes),
+        TablePlan::Create { name, schema, fks, props, unique_indexes } => (name, schema, fks, props, unique_indexes),
     };
     let unique_indexes: Vec<InlineUniqueIndex> = unique_indexes
         .iter()
@@ -679,7 +670,7 @@ pub(crate) fn execute_create_table(
             name: name.as_str(),
         })
         .collect();
-    let tid = client.create_table(schema_name, &name, &cols, &fks, &pk_indices, props, &unique_indexes)?;
+    let tid = client.create_table(schema_name, &name, &schema, &fks, props, &unique_indexes)?;
     Ok(SqlResult::TableCreated { table_id: tid })
 }
 

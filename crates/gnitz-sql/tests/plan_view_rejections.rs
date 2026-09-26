@@ -727,7 +727,7 @@ fn top_n_rules() {
     );
     // An ORDER BY key a SELECT item already computes sorts on that item: the same
     // stored output as ordering by the item's name, DISTINCT included.
-    let cols = |body: &str| final_view(&view(&cat, body)).output_columns.clone();
+    let cols = |body: &str| final_view(&view(&cat, body)).schema.columns.clone();
     for (by_expr, by_name) in [
         (
             "SELECT id, v + 1 AS w FROM t ORDER BY v + 1 LIMIT 5",
@@ -874,7 +874,7 @@ fn a_retarget_never_reads_itself_nor_replaces_a_non_view() {
     let cat = cat();
     let chain = plan(&cat, "ALTER VIEW tv AS SELECT id, v FROM t").unwrap();
     assert_eq!(chain.name, "tv");
-    assert_eq!(final_view(&chain).output_columns.len(), 2);
+    assert_eq!(final_view(&chain).schema.columns.len(), 2);
     for verb in ["ALTER VIEW", "CREATE OR REPLACE VIEW"] {
         for (target, body, needle) in [
             ("tv", "SELECT id, v FROM tv", "itself"),

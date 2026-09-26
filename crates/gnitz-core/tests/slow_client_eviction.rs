@@ -37,10 +37,10 @@ fn slow_scan_client_is_evicted_after_deadline() {
         ColumnDef::new("a", TypeCode::I64, false),
         ColumnDef::new("b", TypeCode::I64, false),
     ];
-    let table_id = client
-        .create_table(&sn, "t", &cols, &[], &[0], TableProps::default(), &[])
-        .unwrap();
     let schema = Schema { columns: cols, pk_cols: vec![0] };
+    let table_id = client
+        .create_table(&sn, "t", &schema, &[], TableProps::default(), &[])
+        .unwrap();
     let mut batch = ZSetBatch::new(&schema);
     let mut app = BatchAppender::new(&mut batch, &schema);
     for pk in 0..40_000u128 {

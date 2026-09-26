@@ -2,12 +2,10 @@
 //! through, the connection factory that installs the Ctrl-C park hook, and the
 //! `_native` registration.
 
-use std::sync::Arc;
-
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use gnitz_core::{ClientError, GnitzClient, MirrorError, Schema, TypeCode};
+use gnitz_core::{ClientError, GnitzClient, MirrorError, TypeCode};
 
 mod async_transport;
 mod client;
@@ -18,7 +16,7 @@ mod write;
 use async_transport::PyAsyncTransport;
 use client::{PyGnitzClient, PyPollResult, PyTxn};
 use read::{PyDeltaReply, PyRow, PyRowIterator, PyScanResult};
-use schema::{resolve_py_schema, rust_schema_to_py, PyColumnDef, PySchema};
+use schema::{PyColumnDef, PySchema};
 use write::{install_append_method, PyZSetBatch};
 
 // ---------------------------------------------------------------------------
@@ -104,19 +102,6 @@ pub(crate) fn connect_client(py: Python<'_>, target: &str) -> PyResult<GnitzClie
     Ok(client)
 }
 
-/// The reply schema of an incremental delta poll, derived from a view's own
-/// schema: a `_tick` U64 key column, then the view's PK columns in PK order,
-/// then its payload columns in schema order. A bootstrap read is *not* in this
-/// shape — it comes back in the view's own schema.
-#[pyfunction]
-fn delta_reply_schema(
-    py: Python<'_>,
-    #[pyo3(from_py_with = resolve_py_schema)] view_schema: Arc<Schema>,
-) -> PyResult<Py<PySchema>> {
-    let derived = gnitz_core::delta_reply_schema(&view_schema).map_err(client_err)?;
-    rust_schema_to_py(py, &Arc::new(derived))
-}
-
 /// The `(name, code)` column-type table, straight off `TypeCode::ALL`, which
 /// `_types.py` builds its `TypeCode` IntEnum from.
 #[pyfunction]
@@ -171,7 +156,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // about them: `e2e-release` pairs a release server with a debug extension.
     m.add("debug_assertions", cfg!(debug_assertions))?;
     m.add_class::<PyDeltaReply>()?;
-    m.add_function(wrap_pyfunction!(delta_reply_schema, m)?)?;
     m.add_function(wrap_pyfunction!(type_codes, m)?)?;
     Ok(())
 }

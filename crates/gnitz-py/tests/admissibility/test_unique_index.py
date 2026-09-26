@@ -19,6 +19,7 @@ import threading
 import pytest
 import gnitz
 from _read import bag, rows as read_rows, scanned
+from _schemas import KV
 from _serverproc import NEEDS_MULTI, join_or_fail
 from _sql import insert
 
@@ -27,8 +28,6 @@ _T_NULLABLE = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT)"
 _TAB = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, b BIGINT)"
 _AB_PK = ("CREATE TABLE t (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL,"
           " payload BIGINT, PRIMARY KEY (a, b))")
-_RAW_COLS = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-             gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
 
 _CREATE_DUP = "contains duplicate values"
 _VIOLATION = "[Uu]nique index violation"
@@ -43,9 +42,9 @@ def _has_index(client, sn, table="t"):
 
 def _raw_table(client, sn):
     """Raw `t` + a SQL unique index on `val`. Returns `(tid, schema)`."""
-    tid = client.create_table(sn, "t", _RAW_COLS)
+    tid = client.create_table(sn, "t", KV)
     client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
-    return tid, gnitz.Schema(_RAW_COLS)
+    return tid, KV
 
 
 # ── CREATE over rows already present ─────────────────────────────────────────

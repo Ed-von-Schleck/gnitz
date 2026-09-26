@@ -11,11 +11,10 @@ import pytest
 import gnitz
 from gnitz import aio
 
-_COLS = [
-    gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+_SCHEMA = gnitz.Schema([
+    gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
     gnitz.ColumnDef("val", gnitz.TypeCode.I64),
-]
-_SCHEMA = gnitz.Schema(_COLS)
+], [0])
 _OPS = {"quick": 2_000, "full": 10_000}
 _WARMUP = 100
 
@@ -42,7 +41,7 @@ async def _push_loop(target, tid, n):
 
 @pytest.mark.parametrize("busy", [False, True], ids=["idle", "busy_thread"])
 def test_async_push_await_loop(client, schema_name, socket_path, bench_timer, scale_mode, busy):
-    tid = client.create_table(schema_name, "t", _COLS)
+    tid = client.create_table(schema_name, "t", _SCHEMA)
     n = _OPS[scale_mode]
     stop = threading.Event()
     spinner = threading.Thread(target=_spin, args=(stop,), daemon=True) if busy else None

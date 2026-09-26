@@ -3,8 +3,8 @@ writer both `append` and `extend` resolve their call shape through, the
 rollback contract they share, and value coercion at the binding boundary.
 
 The shared rule set lives in gnitz-core and is tested there; what is pinned here
-is only what the binding itself decides — the PK-defaulting ladder, the keyword
-plan, and how Python values become column bytes.
+is only what the binding itself decides — rejecting a bad column at
+construction, the keyword plan, and how Python values become column bytes.
 """
 import inspect
 import random
@@ -19,8 +19,8 @@ from gnitz import TypeCode, ColumnDef, Schema, ZSetBatch
 
 # The schema most cases here need. One object backs any number of batches, so a
 # per-test copy would say nothing a shared one does not.
-KV = Schema([ColumnDef("pk", TypeCode.U64, primary_key=True),
-             ColumnDef("val", TypeCode.I64)])
+KV = Schema([ColumnDef("pk", TypeCode.U64),
+             ColumnDef("val", TypeCode.I64)], [0])
 
 def _col(batch, name):
     """Column `name` of every row written so far."""
@@ -38,44 +38,41 @@ _EACH_WRITER = pytest.mark.parametrize("write", list(_WRITERS.values()), ids=lis
 
 
 # ---------------------------------------------------------------------------
-# Schema construction — the PK rules this binding owns
+# Schema construction
 # ---------------------------------------------------------------------------
 
 
 class TestSchemaConstruction:
 
-    def test_no_flagged_column_is_rejected(self):
+    def test_an_empty_pk_list_is_rejected(self):
         """A key-less schema is an error, as `CREATE TABLE` without a PRIMARY KEY
-        is. The binding infers the PK list from the flags and nothing else — it
-        does not invent one, which would key a table on whichever column the
-        caller happened to declare first."""
+        is."""
         with pytest.raises(ValueError):
-            Schema([ColumnDef("a", TypeCode.U64), ColumnDef("b", TypeCode.I64)])
+            Schema([ColumnDef("a", TypeCode.U64), ColumnDef("b", TypeCode.I64)], [])
 
-    def test_the_pk_list_is_inferred_from_the_flags_in_declaration_order(self):
-        assert Schema([ColumnDef("a", TypeCode.U64),
-                       ColumnDef("b", TypeCode.I64, primary_key=True),
-                       ColumnDef("c", TypeCode.U32, primary_key=True)]).pk_indices == [1, 2]
-
-    def test_explicit_pk_indices_override_the_flag_and_keep_their_order(self):
+    def test_pk_indices_keep_their_order(self):
         """pk_indices defines sort order — not just set membership."""
-        cols = [ColumnDef("a", TypeCode.U64, primary_key=True),
+        cols = [ColumnDef("a", TypeCode.U64),
                 ColumnDef("b", TypeCode.U32),
                 ColumnDef("v", TypeCode.I64)]
-        assert Schema(cols, pk_indices=[1, 0]).pk_indices == [1, 0]
+        assert Schema(cols, [1, 0]).pk_indices == [1, 0]
 
     def test_empty_column_list_rejected(self):
-        with pytest.raises(ValueError, match="at least 1 column"):
-            Schema([])
+        with pytest.raises(ValueError):
+            Schema([], [0])
 
     def test_core_rule_violation_surfaces_as_value_error(self):
         """The shared rule set is enforced in gnitz-core; what this pins is that
         its rejection reaches Python as a ValueError rather than a panic or a
         silently accepted schema."""
-        cols = [ColumnDef("pk", TypeCode.U64, is_nullable=True, primary_key=True),
+        cols = [ColumnDef("pk", TypeCode.U64, is_nullable=True),
                 ColumnDef("v",  TypeCode.I64)]
         with pytest.raises(ValueError, match="nullable"):
-            Schema(cols)
+            Schema(cols, [0])
+
+    def test_a_scale_on_a_type_that_takes_none_is_rejected_at_the_column(self):
+        with pytest.raises(ValueError):
+            ColumnDef("x", TypeCode.I64, scale=3)
 
 
 # ---------------------------------------------------------------------------
@@ -165,9 +162,9 @@ class TestAppendKeywordPlan:
         and a row carrying no `_weight` takes its writer's default rather than
         the previous row's weight. The two writers must also agree column for
         column over the same run."""
-        cols = [ColumnDef("pk", TypeCode.U64, primary_key=True)] + [
+        cols = [ColumnDef("pk", TypeCode.U64)] + [
             ColumnDef("c%d" % i, TypeCode.I64, is_nullable=True) for i in range(5)]
-        schema = Schema(cols)
+        schema = Schema(cols, [0])
         names = [c.name for c in cols[1:]]
 
         rng = random.Random(11)
@@ -198,9 +195,9 @@ class TestAppendKeywordPlan:
         """`_weight` names the row weight only when no column claims it. The
         schema is the authority, and both writers have to agree on that."""
         schema = Schema([
-            ColumnDef("pk", TypeCode.U64, primary_key=True),
+            ColumnDef("pk", TypeCode.U64),
             ColumnDef("_weight", TypeCode.I64),
-        ])
+        ], [0])
         got = ZSetBatch(schema).append(pk=1, _weight=5)
         ref = ZSetBatch(schema).extend([{"pk": 1, "_weight": 5}])
         assert _dump(got) == _dump(ref) == [((1, 5), 1)]
@@ -245,9 +242,9 @@ class TestRowErrors:
         still usable. `weight=` in particular must not slip past as a no-op that
         writes the row at +1.
         """
-        schema = Schema([ColumnDef("pk", TypeCode.U64, primary_key=True),
+        schema = Schema([ColumnDef("pk", TypeCode.U64),
                          ColumnDef("a", TypeCode.I64),
-                         ColumnDef("b", TypeCode.I64)])
+                         ColumnDef("b", TypeCode.I64)], [0])
         batch = ZSetBatch(schema)
         assert write(batch, {"pk": 1, "a": 1, "b": 1}) is batch      # chainable
 
@@ -348,8 +345,8 @@ class TestValueCoercion:
         presented back as canonical hyphenated text. Text that spells no UUID is
         refused."""
         canonical = "12345678-1234-5678-1234-567812345678"
-        schema = Schema([ColumnDef("id", TypeCode.UUID, primary_key=True),
-                         ColumnDef("v", TypeCode.UUID)])
+        schema = Schema([ColumnDef("id", TypeCode.UUID),
+                         ColumnDef("v", TypeCode.UUID)], [0])
         for form in (canonical, canonical.replace("-", ""), uuid.UUID(canonical)):
             batch = ZSetBatch(schema).append(id=form, v=form)
             assert _col(batch, "id") == [canonical]
@@ -363,8 +360,8 @@ class TestValueCoercion:
         error, so `append` must too, rather than accepting bare hex here alone.
         The same rule excludes a `uuid.UUID` object, which is a UUID, not a
         number."""
-        schema = Schema([ColumnDef("k", TypeCode.U128, primary_key=True),
-                         ColumnDef("v", TypeCode.U128, is_nullable=True)])
+        schema = Schema([ColumnDef("k", TypeCode.U128),
+                         ColumnDef("v", TypeCode.U128, is_nullable=True)], [0])
         for bad in ("f" * 32, uuid.uuid4()):
             for row in ({"k": bad, "v": 1}, {"k": 1, "v": bad}):
                 with pytest.raises(TypeError):
@@ -374,8 +371,8 @@ class TestValueCoercion:
         """A U128 value above `i128::MAX` is legal and must not be rejected as a
         signed overflow."""
         u128_max = (1 << 128) - 1
-        schema = Schema([ColumnDef("k", TypeCode.U128, primary_key=True),
-                         ColumnDef("v", TypeCode.U128)])
+        schema = Schema([ColumnDef("k", TypeCode.U128),
+                         ColumnDef("v", TypeCode.U128)], [0])
         batch = ZSetBatch(schema).append(k=u128_max, v=u128_max)
         assert _col(batch, "k") == [u128_max]
         assert _col(batch, "v") == [u128_max]
@@ -386,8 +383,8 @@ class TestValueCoercion:
         half of the 128-bit space is only addressable through this path. A key
         decoded as unsigned comes back as `2**128 - 1` where `-1` was written."""
         values = [-(2 ** 127), -1, 0, 1, (2 ** 127) - 1]
-        schema = Schema([ColumnDef("k", TypeCode.I128, primary_key=True),
-                         ColumnDef("v", TypeCode.I128)])
+        schema = Schema([ColumnDef("k", TypeCode.I128),
+                         ColumnDef("v", TypeCode.I128)], [0])
         batch = ZSetBatch(schema)
         for v in values:
             batch.append(k=v, v=v)
@@ -399,9 +396,9 @@ class TestValueCoercion:
         two kinds stay separate: BLOB takes bytes and refuses `str`; STRING takes
         `str` and refuses bytes — nothing downstream would reject non-UTF-8, so
         this is where TEXT stays text."""
-        schema = Schema([ColumnDef("pk", TypeCode.U64, primary_key=True),
+        schema = Schema([ColumnDef("pk", TypeCode.U64),
                          ColumnDef("payload", TypeCode.BLOB),
-                         ColumnDef("s", TypeCode.STRING)])
+                         ColumnDef("s", TypeCode.STRING)], [0])
         batch = ZSetBatch(schema).append(pk=1, payload=b"hello\x00world", s="hi")
         assert _col(batch, "payload") == [b"hello\x00world"]
         assert _col(batch, "s") == ["hi"]
@@ -437,8 +434,8 @@ class TestValueCoercion:
         The refusals are the two ways a value has no scaled image: text that is
         not a number, and a magnitude past the `i64` behind the scale.
         """
-        schema = Schema([ColumnDef("id", TypeCode.I64, primary_key=True),
-                         ColumnDef("v", TypeCode.DECIMAL, scale=3)])
+        schema = Schema([ColumnDef("id", TypeCode.I64),
+                         ColumnDef("v", TypeCode.DECIMAL, scale=3)], [0])
         assert schema.columns[1].scale == 3, "a client-authored schema carries the scale"
 
         batch = ZSetBatch(schema)
@@ -466,9 +463,9 @@ class TestValueCoercion:
         d = date(2024, 2, 29)
         ts = datetime(2024, 2, 29, 13, 45, 7, 250_000)
         epoch_days = (d - date(1970, 1, 1)).days
-        schema = Schema([ColumnDef("id", TypeCode.I64, primary_key=True),
+        schema = Schema([ColumnDef("id", TypeCode.I64),
                          ColumnDef("d", TypeCode.DATE),
-                         ColumnDef("ts", TypeCode.TIMESTAMP)])
+                         ColumnDef("ts", TypeCode.TIMESTAMP)], [0])
 
         batch = ZSetBatch(schema)
         batch.append(id=1, d=d, ts=ts)

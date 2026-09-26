@@ -2,7 +2,6 @@
 
 
 from helpers.datagen import PROBE_BASE, bulk_load, probe_val, seed_index_probes
-import gnitz
 
 
 def _setup_table(client, schema_name, num_rows):
@@ -11,12 +10,7 @@ def _setup_table(client, schema_name, num_rows):
         "val BIGINT NOT NULL, cat BIGINT NOT NULL)",
         schema_name=schema_name,
     )
-    cols = [
-        gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-        gnitz.ColumnDef("val", gnitz.TypeCode.I64),
-        gnitz.ColumnDef("cat", gnitz.TypeCode.I64),
-    ]
-    bulk_load(client, schema_name, "t", cols, num_rows)
+    bulk_load(client, schema_name, "t", num_rows)
     return num_rows
 
 

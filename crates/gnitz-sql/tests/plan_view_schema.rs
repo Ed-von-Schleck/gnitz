@@ -16,12 +16,12 @@ fn sh(cols: &[(&str, bool, bool)]) -> Shape {
 
 /// The final view's PK column set.
 fn pk(chain: &gnitz_sql::PlannedChain) -> Vec<u32> {
-    final_view(chain).pk_cols.clone()
+    final_view(chain).schema.pk_cols.clone()
 }
 
 /// The final view's output type codes.
 fn types(chain: &gnitz_sql::PlannedChain) -> Vec<TypeCode> {
-    final_view(chain).output_columns.iter().map(|c| c.ty.tc).collect()
+    final_view(chain).schema.columns.iter().map(|c| c.ty.tc).collect()
 }
 
 // ── linear projection ────────────────────────────────────────────────────────
@@ -803,7 +803,7 @@ fn a_chain_segment_keeps_only_its_live_columns() {
         "SELECT ja.id AS aid, jc.cv AS ccv FROM ja JOIN jb ON ja.k = jb.id JOIN jc ON ja.v = jc.id",
     );
     assert_eq!(chain.views.len(), 2);
-    let seg: Vec<&str> = chain.views[0].output_columns.iter().map(|c| c.name.as_str()).collect();
+    let seg: Vec<&str> = chain.views[0].schema.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(seg, ["_join_pk", "id", "v"]);
     assert_eq!(
         output_shape(&chain),
@@ -840,7 +840,7 @@ fn a_collision_segment_keeps_only_its_live_columns() {
         "SELECT e.nm AS emp, m.nm AS boss FROM emp e JOIN emp m ON e.mgr = m.id",
     );
     assert_eq!(chain.views.len(), 2);
-    let wrapper: Vec<&str> = chain.views[0].output_columns.iter().map(|c| c.name.as_str()).collect();
+    let wrapper: Vec<&str> = chain.views[0].schema.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(wrapper, ["id", "nm"]);
 
     // `t EXCEPT t` cuts nothing: a set operation reads one source on both sides.

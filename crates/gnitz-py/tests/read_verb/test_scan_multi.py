@@ -18,19 +18,18 @@ import gnitz
 import pytest
 from _read import bag
 from _serverproc import join_or_fail
+from _schemas import KV
 
 
-_KV = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-       gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
 
 
 def _kv(client, sn, name):
     """A `(pk U64 PK, val I64)` table's id."""
-    return client.create_table(sn, name, _KV)
+    return client.create_table(sn, name, KV)
 
 
 def _batch(values):
-    return gnitz.ZSetBatch(gnitz.Schema(_KV)).extend({"pk": pk, "val": val} for pk, val in values)
+    return gnitz.ZSetBatch(KV).extend({"pk": pk, "val": val} for pk, val in values)
 
 
 def test_the_results_line_up_with_the_requested_tids(client, schema_name):
@@ -267,11 +266,11 @@ def test_a_chunked_train_does_not_let_its_siblings_jump_it(reply_frame_budget_se
     # inline threshold, so every row points into the batch's string heap and
     # each frame carries a heap compacted to its own rows: 400 * ~230 B is
     # ~23 KiB per worker against the 16 KiB budget.
-    cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-            gnitz.ColumnDef("s", gnitz.TypeCode.STRING)]
-    dim = c.create_table(sn, "dim_text", cols)
+    dim_schema = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
+                               gnitz.ColumnDef("s", gnitz.TypeCode.STRING)], [0])
+    dim = c.create_table(sn, "dim_text", dim_schema)
     names = [f"name-{i}-" + "z" * 200 for i in range(400)]
-    c.push(dim, gnitz.ZSetBatch(gnitz.Schema(cols)).extend(
+    c.push(dim, gnitz.ZSetBatch(dim_schema).extend(
         {"pk": i, "s": nm} for i, nm in enumerate(names)))
     assert [bag(r) for r in c.scan_many([big, dim])] == \
         [want_big, {(i, nm): 1 for i, nm in enumerate(names)}]

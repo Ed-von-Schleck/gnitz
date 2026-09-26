@@ -15,13 +15,6 @@ use gnitz_mirror::Mirror;
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
 use tokio::runtime::Runtime;
 
-fn cols() -> Vec<ColumnDef> {
-    vec![
-        ColumnDef::new("pk", TypeCode::I64, false),
-        ColumnDef::new("a", TypeCode::I64, false),
-    ]
-}
-
 /// A `(pk BIGINT, a BIGINT)` table, the blocking client that made it, and the
 /// schema name it lives under.
 fn table(target: &str) -> (GnitzClient, u64, Arc<Schema>, String) {
@@ -29,16 +22,22 @@ fn table(target: &str) -> (GnitzClient, u64, Arc<Schema>, String) {
     let sn = unique_schema("tokio");
     client.create_schema(&sn).unwrap();
     client
-        .create_table(&sn, "t", &cols(), &[], &[0], TableProps::default(), &[])
+        .create_table(&sn, "t", &local_schema(), &[], TableProps::default(), &[])
         .unwrap();
     let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
     (client, tid, schema, sn)
 }
 
-/// The fixture table's schema, built locally — the batch builders below need it
-/// to encode a key, and `table()`'s copy comes back from the server.
+/// The fixture table's schema, built locally — `table()` creates it, and the
+/// batch builders below need it to encode a key.
 fn local_schema() -> Schema {
-    Schema { columns: cols(), pk_cols: vec![0] }
+    Schema {
+        columns: vec![
+            ColumnDef::new("pk", TypeCode::I64, false),
+            ColumnDef::new("a", TypeCode::I64, false),
+        ],
+        pk_cols: vec![0],
+    }
 }
 
 fn rows(start: i64, count: usize) -> ZSetBatch {
@@ -179,7 +178,7 @@ fn syscall_count_child() {
     };
     let tid: u64 = tid.parse().unwrap();
     let n: usize = n.parse().unwrap();
-    let schema = Arc::new(Schema { columns: cols(), pk_cols: vec![0] });
+    let schema = Arc::new(local_schema());
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -246,8 +245,7 @@ fn fed_view(client: &mut GnitzClient, sn: &str, tid: u64) -> u64 {
             "v",
             vec![gnitz_core::PlannedView {
                 circuit,
-                output_columns: cols(),
-                pk_cols: vec![0],
+                schema: local_schema(),
                 pk_repeats: false,
             }],
             gnitz_core::ViewProps::Fed { delta_bytes: 8 << 20 },

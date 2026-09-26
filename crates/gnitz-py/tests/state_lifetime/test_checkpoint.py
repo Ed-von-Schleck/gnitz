@@ -18,6 +18,7 @@ import time
 import pytest
 import gnitz
 from _read import bag, scanned
+from _schemas import KV
 from _serverproc import START_TIMEOUT, join_or_fail
 
 
@@ -32,9 +33,7 @@ def _setup(client, table="t"):
     pushing to it. Returns `(sn, tid, schema)`."""
     sn = "ck"
     client.create_schema(sn)
-    cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-            gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-    return sn, client.create_table(sn, table, cols), gnitz.Schema(cols)
+    return sn, client.create_table(sn, table, KV), KV
 
 
 def _push_loop(client, tid, schema, errors, started, n_batches=12, batch_size=400):

@@ -20,9 +20,10 @@ pub(crate) struct EmitPieces {
     pub pk_repeats: bool,
 }
 
-/// `Schema::validate_parts`, with a rejection naming the stage `what`.
+/// `Schema::validate`, with a rejection naming the stage `what`.
 pub(crate) fn admit(schema: &Schema, what: &str) -> Result<(), GnitzSqlError> {
-    Schema::validate_parts(&schema.pk_cols, &schema.columns)
+    schema
+        .validate()
         .map_err(|e| GnitzSqlError::Unsupported(format!("{what}: {e}")))
 }
 
@@ -55,12 +56,7 @@ impl ViewChain {
         what: &str,
     ) -> Result<&mut PlannedView, GnitzSqlError> {
         admit(&schema, what)?;
-        self.segments.push(PlannedView {
-            circuit,
-            output_columns: schema.columns,
-            pk_cols: schema.pk_cols,
-            pk_repeats,
-        });
+        self.segments.push(PlannedView { circuit, schema, pk_repeats });
         Ok(self.segments.last_mut().expect("just pushed"))
     }
 

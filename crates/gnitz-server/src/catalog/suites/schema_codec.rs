@@ -17,7 +17,7 @@ use proptest::test_runner::TestCaseError;
 /// `max_pk` bounds the generated PK arity: the engine's schemas run to
 /// `MAX_PK_COLUMNS` (5, the secondary-index schema width), but the persisted
 /// client codec caps at `PK_LIST_MAX_COLS` (4) — tests that decode through the
-/// client (`schema_from_block` → `Schema::validate_parts`) must stay within it.
+/// client (`schema_from_block` → `Schema::validate`) must stay within it.
 fn arb_schema(max_pk: usize) -> impl Strategy<Value = SchemaDescriptor> {
     // n_cols ≥ 1, so `1..=n_cols.min(max_pk)` is never empty.
     (1usize..=8)

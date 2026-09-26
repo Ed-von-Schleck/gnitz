@@ -145,7 +145,7 @@ impl DeltaCursor {
     /// Tick `0` is **refused**: it names no copy to protect and no tag to match,
     /// so it could only mean a bootstrap — and a bootstrap walks the view's own
     /// store and comes back in the view's schema, not the [`delta_reply_schema`]
-    /// shape a poll takes.
+    /// shape a poll derives.
     pub(crate) fn poll_after(self) -> Result<u64, ClientError> {
         (self.tick != 0).then_some(self.tick).ok_or(ClientError::DeltaExpired)
     }
@@ -172,7 +172,7 @@ impl DeltaCursor {
 ///
 /// A bootstrap read is **not** in this shape — it walks the view's own store and
 /// comes back in the view's own schema.
-pub fn delta_reply_schema(view: &Schema) -> Result<Schema, ClientError> {
+pub(crate) fn delta_reply_schema(view: &Schema) -> Result<Schema, ClientError> {
     // The one limit that can bind: the stamp is one column more than the view,
     // which is what the engine's `make_delta_schema` answers `None` for. Not
     // `Schema::from_parts` — its PK-arity cap is the *persisted* PK-list codec's,
@@ -213,8 +213,7 @@ pub fn segment_id(j: u64) -> u64 {
 /// One view in a [`GnitzClient::create_view_chain`] bundle.
 pub struct PlannedView {
     pub circuit: Circuit,
-    pub output_columns: Vec<ColumnDef>,
-    pub pk_cols: Vec<u32>,
+    pub schema: Schema,
     /// [`gnitz_wire::VIEW_FLAG_PK_REPEATS`], stated by the emitter that minted
     /// the key.
     pub pk_repeats: bool,
@@ -727,12 +726,14 @@ impl GnitzClient {
         &mut self,
         view_id: u64,
         view_schema: &Arc<Schema>,
-    ) -> Result<(ZSetBatch, DeltaCursor), ClientError> {
+    ) -> Result<(ScanReply, DeltaCursor), ClientError> {
         self.delta_read(view_id, 0, &ReplySchema::new(Arc::clone(view_schema)))
     }
 
     /// Poll a view's delta feed: every delta it emitted in `(cursor.tick, T]`,
-    /// in [`delta_reply_schema`]'s shape, with the cursor to poll from next.
+    /// with the cursor to poll from next. The reply comes back in the delta shape
+    /// this call derives from `view_schema`: a `_tick` key column, then the
+    /// view's PK columns, then its payload columns.
     /// Apply what comes back and store the new cursor; there is nothing to
     /// filter and nothing to reconcile.
     ///
@@ -749,9 +750,9 @@ impl GnitzClient {
         &mut self,
         view_id: u64,
         cursor: DeltaCursor,
-        reply_schema: &Arc<Schema>,
-    ) -> Result<(ZSetBatch, DeltaCursor), ClientError> {
-        let rs = ReplySchema::new(Arc::clone(reply_schema));
+        view_schema: &Arc<Schema>,
+    ) -> Result<(ScanReply, DeltaCursor), ClientError> {
+        let rs = ReplySchema::new(Arc::new(delta_reply_schema(view_schema)?));
         let (data, next) = self.delta_read(view_id, cursor.poll_after()?, &rs)?;
         Ok((data, cursor.advanced_to(next)?))
     }
@@ -777,14 +778,14 @@ impl GnitzClient {
         view_id: u64,
         after_tick: u64,
         reply_schema: &ReplySchema,
-    ) -> Result<(ZSetBatch, DeltaCursor), ClientError> {
+    ) -> Result<(ScanReply, DeltaCursor), ClientError> {
         let (blocks, cursor) = self.delta_read_raw(view_id, after_tick, reply_schema)?;
         let schema = reply_schema.schema();
-        let mut data = ZSetBatch::new(&schema);
+        let mut batch = ZSetBatch::new(&schema);
         for b in &blocks {
-            crate::protocol::wal_block::decode_wal_block_into(&mut data, b.block(), &schema)?;
+            crate::protocol::wal_block::decode_wal_block_into(&mut batch, b.block(), &schema)?;
         }
-        Ok((data, cursor))
+        Ok((ScanReply { schema, batch, lsn: None }, cursor))
     }
 
     /// [`Self::delta_read`] keeping the reply's raw blocks. The cursor comes back
@@ -1173,14 +1174,12 @@ impl GnitzClient {
 
     /// Register a table, its FOREIGN KEY columns and its inline UNIQUE indexes as
     /// one DDL bundle.
-    #[allow(clippy::too_many_arguments)]
     pub fn create_table(
         &mut self,
         schema_name: &str,
         table_name: &str,
-        columns: &[ColumnDef],
+        schema: &Schema,
         fks: &[InlineForeignKey],
-        pk_cols: &[u32],
         props: TableProps,
         unique_indexes: &[InlineUniqueIndex],
     ) -> Result<u64, ClientError> {
@@ -1194,25 +1193,27 @@ impl GnitzClient {
         // here so a caller that skipped the planner gets a clean error before
         // any id allocation instead of relying on the server-side reject (and
         // `pack_pk_cols` below can never panic).
-        Schema::validate_parts(pk_cols, columns).map_err(|e| ClientError::ServerError(format!("create_table: {e}")))?;
+        schema
+            .validate()
+            .map_err(|e| ClientError::ServerError(format!("create_table: {e}")))?;
         // The `Keyed` prefix is a leading-PK-prefix length (0 = default = full PK).
         // Shared with the engine's own TABLE_TAB decoder, which re-checks it: this
         // one catches the caller's mistake before any id is allocated.
         props
-            .validate_against_pk(pk_cols.len())
+            .validate_against_pk(schema.pk_cols.len())
             .map_err(|e| ClientError::ServerError(format!("create_table: {e}")))?;
 
-        // Column types come from `columns`, so a UNIQUE+FK column's
+        // Column types come from `schema.columns`, so a UNIQUE+FK column's
         // parent-rewritten type is used.
         for spec in unique_indexes {
             // Structural rules only (arity, in-range, no duplicates) — unlike a
             // PK, an indexed column may be nullable. In-range against the actual
-            // column list also keeps the `columns[c]` read panic-free.
-            gnitz_wire::validate_pk_col_list(spec.col_indices, columns.len()).map_err(|msg| {
+            // column list also keeps the `schema.columns[c]` read panic-free.
+            gnitz_wire::validate_pk_col_list(spec.col_indices, schema.columns.len()).map_err(|msg| {
                 ClientError::ServerError(format!("create_table: unique index '{}': {msg}", spec.name))
             })?;
             for &c in spec.col_indices {
-                gnitz_wire::index_key_type(columns[c as usize].ty.tc)?;
+                gnitz_wire::index_key_type(schema.columns[c as usize].ty.tc)?;
             }
         }
 
@@ -1223,13 +1224,18 @@ impl GnitzClient {
         // Encode the PK list using the shared wire packer so the engine
         // catalog decodes it identically. Single-PK callers still flow
         // through the same packer; there is no second form of the word.
-        let pk_packed = gnitz_wire::pack_pk_cols(pk_cols);
+        let pk_packed = gnitz_wire::pack_pk_cols(&schema.pk_cols);
 
         // COL_TAB family — the server sorts families by topo priority, so it
         // ingests columns before the TABLE_TAB register hook that reads them.
         let col_s = sys_schema(COL_TAB);
         let mut col_batch = ZSetBatch::new(col_s);
-        append_col_rows(&mut BatchAppender::new(&mut col_batch, col_s), new_tid, columns, fks);
+        append_col_rows(
+            &mut BatchAppender::new(&mut col_batch, col_s),
+            new_tid,
+            &schema.columns,
+            fks,
+        );
 
         // TABLE_TAB family.
         let tbl_schema = sys_schema(TABLE_TAB);
@@ -1284,8 +1290,10 @@ impl GnitzClient {
         schema_name: &str,
         view_name: &str,
         source_table_id: u64,
-        output_columns: &[ColumnDef],
     ) -> Result<u64, ClientError> {
+        // A passthrough's layout must equal its source's, so the whole output
+        // schema and its PK-repeat flag are the source's own.
+        let src = self.describe_by_id(source_table_id)?;
         // A minimal SCAN_DELTA → INTEGRATE_SINK circuit, built through the typed
         // builder so the row materialisation matches the stored layout exactly.
         let mut circuit = Circuit::default();
@@ -1297,10 +1305,8 @@ impl GnitzClient {
             view_name,
             vec![PlannedView {
                 circuit,
-                output_columns: output_columns.to_vec(),
-                // Minimal SCAN→SINK passthrough: single output PK at slot 0.
-                pk_cols: vec![0],
-                pk_repeats: false,
+                schema: Schema::clone(&src.schema),
+                pk_repeats: src.pk_repeats,
             }],
             ViewProps::default(),
             false,
@@ -1319,9 +1325,7 @@ impl GnitzClient {
     /// one all-`+1` VIEW_TAB batch in input order. A single `push_ddl_txn` then commits — or, via the engine's
     /// per-family precheck/compensate loop, rolls back — the whole chain.
     ///
-    /// `pk_cols` for each view is its physical PK column list — the leading `k`
-    /// output slots (`[0]` for a synthetic-PK view, `0..k` for a compound-PK
-    /// passthrough).
+    /// `schema.pk_cols` is each view's physical PK column list.
     ///
     /// **`views.last()` is the user-named view: it takes `view_name` and `props`**;
     /// every earlier element is an internal segment it owns — see [`segment_name`].
@@ -1359,7 +1363,8 @@ impl GnitzClient {
         // contract, so an out-of-range PK list would panic this client rather than
         // reach the wire.
         for (k, pv) in views.iter().enumerate() {
-            Schema::validate_parts(&pv.pk_cols, &pv.output_columns)
+            pv.schema
+                .validate()
                 .map_err(|e| ClientError::ServerError(format!("View '{view_name}' segment {k}: {e}")))?;
         }
 
@@ -1423,7 +1428,7 @@ impl GnitzClient {
                 };
 
                 // 1. Column records. A foreign key constrains a base table, not a view.
-                append_col_rows(&mut col_a, vid, &pv.output_columns, &[]);
+                append_col_rows(&mut col_a, vid, &pv.schema.columns, &[]);
 
                 // 2. Circuit node rows.
                 gnitz_wire::sys_rows::write_circuit_rows(&mut nodes_a, vid, &pv.circuit);
@@ -1437,7 +1442,7 @@ impl GnitzClient {
                         view_id: vid,
                         schema_id,
                         name: &name,
-                        pk_col_idx: gnitz_wire::pack_pk_cols(&pv.pk_cols),
+                        pk_col_idx: gnitz_wire::pack_pk_cols(&pv.schema.pk_cols),
                         props: row_props,
                         owner_view_id,
                         pk_repeats: pv.pk_repeats,

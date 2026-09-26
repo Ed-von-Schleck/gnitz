@@ -19,17 +19,13 @@ import pytest_asyncio
 import gnitz
 from gnitz import aio
 from _read import bag
+from _schemas import KV
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
-PK_VAL_COLS = [
-    gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-    gnitz.ColumnDef("val", gnitz.TypeCode.I64),
-]
-SCHEMA = gnitz.Schema(PK_VAL_COLS)
 
 
 @pytest_asyncio.fixture
@@ -41,11 +37,11 @@ async def aconn(server):
 @pytest.fixture
 def table(client, schema_name):
     """A disposable `(pk, val)` table; `schema_name` drops it with its schema."""
-    return client.create_table(schema_name, "t", PK_VAL_COLS)
+    return client.create_table(schema_name, "t", KV)
 
 
 def _batch(rows):
-    return gnitz.ZSetBatch(SCHEMA).extend(rows)
+    return gnitz.ZSetBatch(KV).extend(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -62,15 +58,15 @@ async def test_pipeline_mixes_operation_kinds(client, schema_name, aconn):
     answered with LSN 0, and must not shift the replies behind it.
     Run at W>1: replies leave the workers out of order and only the master's
     serialisation puts them back."""
-    a = client.create_table(schema_name, "ta", PK_VAL_COLS)
-    b = client.create_table(schema_name, "tb", PK_VAL_COLS)
+    a = client.create_table(schema_name, "ta", KV)
+    b = client.create_table(schema_name, "tb", KV)
     # Distinct per-relation payloads, so a mis-correlated reply is visible.
     await aconn.push(a, _batch([{"pk": i, "val": 100 + i} for i in range(1, 6)]))
     await aconn.push(b, _batch([{"pk": i, "val": 900 + i} for i in range(1, 4)]))
 
     push_lsn, empty_lsn, scan_a, scan_b, seek_a, seek_b, many = await asyncio.gather(
         aconn.push(a, _batch([{"pk": 42, "val": 4242}])),
-        aconn.push(b, gnitz.ZSetBatch(SCHEMA)),
+        aconn.push(b, gnitz.ZSetBatch(KV)),
         aconn.scan(a),
         aconn.scan(b),
         aconn.seek(a, 3),
@@ -139,7 +135,7 @@ async def test_an_error_surfaces_from_a_gather_and_the_connection_survives(aconn
     with pytest.raises(gnitz.GnitzError):
         await aconn.scan_many([])
 
-    bad = gnitz.ZSetBatch(gnitz.Schema([PK_VAL_COLS[0]])).extend([{"pk": 1}])
+    bad = gnitz.ZSetBatch(gnitz.Schema([KV.columns[0]], [0])).extend([{"pk": 1}])
     with pytest.raises(gnitz.GnitzError):
         await asyncio.gather(
             aconn.push(table, _batch([{"pk": 1, "val": 1}])),
@@ -245,7 +241,7 @@ async def test_stale_stamp_pushes_fail_and_the_connection_recovers(aconn, client
     already encoded at the stale stamp bounces. Each future fails with the
     mismatch, none of their rows is committed, and the connection stays usable:
     the eviction makes the next push cold, and it lands."""
-    tid = client.create_table(schema_name, "t", PK_VAL_COLS)
+    tid = client.create_table(schema_name, "t", KV)
     # Warm the async connection's cache under the current version.
     await aconn.push(tid, _batch([{"pk": 1, "val": 1}]))
 
@@ -293,9 +289,8 @@ from gnitz import aio
 import gnitz
 
 target, tid, n, mode = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
-cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-        gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-schema = gnitz.Schema(cols)
+schema = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
+                       gnitz.ColumnDef("val", gnitz.TypeCode.I64)], [0])
 
 def batch(pk):
     b = gnitz.ZSetBatch(schema)
@@ -352,7 +347,7 @@ def test_syscalls_per_operation(server, client, schema_name, tmp_path):
     reach zero on both: no thread left to wake."""
     if shutil.which("strace") is None:
         pytest.skip("strace not installed")
-    tid = client.create_table(schema_name, "t", PK_VAL_COLS)
+    tid = client.create_table(schema_name, "t", KV)
     script = tmp_path / "syscall_child.py"
     script.write_text(_SYSCALL_CHILD)
 

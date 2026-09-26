@@ -19,29 +19,15 @@ fn plan_table(cat: &gnitz_core::CatalogSnapshot, sql: &str) -> Result<TablePlan,
 
 /// The `Create` payload of a plan expected to succeed.
 struct Created {
-    cols: Vec<gnitz_core::ColumnDef>,
+    schema: gnitz_core::Schema,
     fks: Vec<InlineForeignKey>,
-    pk_indices: Vec<u32>,
     props: gnitz_core::TableProps,
     unique_indexes: Vec<(Vec<u32>, String)>,
 }
 
 fn created(cat: &gnitz_core::CatalogSnapshot, sql: &str) -> Created {
     match plan_table(cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}")) {
-        TablePlan::Create {
-            cols,
-            fks,
-            pk_indices,
-            props,
-            unique_indexes,
-            ..
-        } => Created {
-            cols,
-            fks,
-            pk_indices,
-            props,
-            unique_indexes,
-        },
+        TablePlan::Create { schema, fks, props, unique_indexes, .. } => Created { schema, fks, props, unique_indexes },
         TablePlan::Skip { .. } => panic!("`{sql}` planned a skip"),
     }
 }
@@ -100,7 +86,7 @@ fn primary_key_precedence() {
         &cat,
         "CREATE TABLE sref (refc BIGINT REFERENCES sref(id), id BIGINT PRIMARY KEY)",
     );
-    assert_eq!(c.pk_indices, vec![1]);
+    assert_eq!(c.schema.pk_cols, vec![1]);
     assert_eq!(
         c.fks,
         vec![InlineForeignKey {
@@ -326,7 +312,7 @@ fn an_fk_child_adopts_the_parent_type_before_the_index_is_checked() {
         &cat,
         "CREATE TABLE c (id BIGINT PRIMARY KEY, r INT UNIQUE REFERENCES p(id))",
     );
-    assert_eq!(c.cols[1].ty.tc, TypeCode::I64, "widened to the parent's type");
+    assert_eq!(c.schema.columns[1].ty.tc, TypeCode::I64, "widened to the parent's type");
     assert_eq!(
         c.fks,
         vec![InlineForeignKey {
@@ -418,5 +404,5 @@ fn a_cross_schema_qualifier_is_rejected_rather_than_dropped() {
     }
     // The same-schema spelling is the one a Postgres user writes.
     let c = created(&cat, &format!("CREATE TABLE {SN}.t (id BIGINT PRIMARY KEY)"));
-    assert_eq!(c.pk_indices, vec![0]);
+    assert_eq!(c.schema.pk_cols, vec![0]);
 }

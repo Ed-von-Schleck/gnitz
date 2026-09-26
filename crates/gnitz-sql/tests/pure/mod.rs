@@ -227,10 +227,7 @@ pub fn register(cat: &mut CatalogSnapshot, name: &str, tid: u64, chain: &Planned
             tid,
             class: chain.props.into(),
             pk_repeats: fv.pk_repeats,
-            schema: Arc::new(Schema {
-                columns: fv.output_columns.clone(),
-                pk_cols: fv.pk_cols.clone(),
-            }),
+            schema: Arc::new(fv.schema.clone()),
             indexes: Vec::new(),
         })),
     );
@@ -239,7 +236,8 @@ pub fn register(cat: &mut CatalogSnapshot, name: &str, tid: u64, chain: &Planned
 /// The final view's output columns as `(name, hidden, nullable)`.
 pub fn output_shape(chain: &PlannedChain) -> Vec<(String, bool, bool)> {
     final_view(chain)
-        .output_columns
+        .schema
+        .columns
         .iter()
         .map(|c| (c.name.clone(), c.is_hidden, c.is_nullable))
         .collect()

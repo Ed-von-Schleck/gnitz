@@ -7,7 +7,7 @@
 //! its qualified-name keys depend on are enforced at the master's trust boundary,
 //! and these tests drive that boundary directly with hand-built bundles.
 
-use gnitz_core::protocol::{BatchAppender, ColumnDef, TypeCode, ZSetBatch};
+use gnitz_core::protocol::{BatchAppender, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_core::types::sys_schema;
 use gnitz_core::{GnitzClient, TableProps};
 use gnitz_test_harness::ServerHandle;
@@ -107,22 +107,22 @@ fn index_rows(owner_id: u64, flags: u64, rows: &[(u64, i64)]) -> ZSetBatch {
     b
 }
 
+/// The `(id, v)` table schema these tests create.
+fn id_v() -> Schema {
+    Schema {
+        columns: vec![
+            ColumnDef::new("id", TypeCode::U64, false),
+            ColumnDef::new("v", TypeCode::I64, false),
+        ],
+        pk_cols: vec![0],
+    }
+}
+
 /// A `(schema, table)` under a fresh schema, through the ordinary client path.
 fn a_table(client: &mut GnitzClient, schema: &str) -> u64 {
     client.create_schema(schema).unwrap();
     client
-        .create_table(
-            schema,
-            "t",
-            &[
-                ColumnDef::new("id", TypeCode::U64, false),
-                ColumnDef::new("v", TypeCode::I64, false),
-            ],
-            &[],
-            &[0],
-            TableProps::default(),
-            &[],
-        )
+        .create_table(schema, "t", &id_v(), &[], TableProps::default(), &[])
         .unwrap()
 }
 
@@ -215,11 +215,14 @@ fn two_indexes_under_one_name_in_one_bundle_are_refused() {
     let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     client.create_schema("dupidx").unwrap();
-    let cols = [
-        ColumnDef::new("id", TypeCode::U64, false),
-        ColumnDef::new("b", TypeCode::I64, false),
-        ColumnDef::new("c", TypeCode::I64, false),
-    ];
+    let schema = Schema {
+        columns: vec![
+            ColumnDef::new("id", TypeCode::U64, false),
+            ColumnDef::new("b", TypeCode::I64, false),
+            ColumnDef::new("c", TypeCode::I64, false),
+        ],
+        pk_cols: vec![0],
+    };
     // The two constraint names fold to the same canonical name.
     let err = format!(
         "{:?}",
@@ -227,9 +230,8 @@ fn two_indexes_under_one_name_in_one_bundle_are_refused() {
             .create_table(
                 "dupidx",
                 "t",
-                &cols,
+                &schema,
                 &[],
-                &[0],
                 TableProps::default(),
                 &[
                     gnitz_core::InlineUniqueIndex { col_indices: &[1], name: "u" },
@@ -251,17 +253,19 @@ fn a_three_family_create_table_bundle_still_commits() {
     let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     client.create_schema("ok").unwrap();
-    let cols = [
-        ColumnDef::new("id", TypeCode::U64, false),
-        ColumnDef::new("b", TypeCode::I64, false),
-    ];
+    let schema = Schema {
+        columns: vec![
+            ColumnDef::new("id", TypeCode::U64, false),
+            ColumnDef::new("b", TypeCode::I64, false),
+        ],
+        pk_cols: vec![0],
+    };
     let tid = client
         .create_table(
             "ok",
             "t",
-            &cols,
+            &schema,
             &[],
-            &[0],
             TableProps::default(),
             &[gnitz_core::InlineUniqueIndex { col_indices: &[1], name: "u_b" }],
         )
@@ -309,14 +313,10 @@ fn drop_schema_retires_a_view_its_table_and_the_schema_in_one_bundle() {
     let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     client.create_schema("teardown").unwrap();
-    let cols = [
-        ColumnDef::new("id", TypeCode::U64, false),
-        ColumnDef::new("v", TypeCode::I64, false),
-    ];
     let tid = client
-        .create_table("teardown", "t", &cols, &[], &[0], TableProps::default(), &[])
+        .create_table("teardown", "t", &id_v(), &[], TableProps::default(), &[])
         .unwrap();
-    client.create_view("teardown", "v", tid, &cols).unwrap();
+    client.create_view("teardown", "v", tid).unwrap();
 
     client.drop_schema("teardown").unwrap();
 
@@ -336,14 +336,10 @@ fn a_rename_stores_the_new_name_for_a_table_and_for_a_view() {
     let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     client.create_schema("ren").unwrap();
-    let cols = [
-        ColumnDef::new("id", TypeCode::U64, false),
-        ColumnDef::new("v", TypeCode::I64, false),
-    ];
     let tid = client
-        .create_table("ren", "t", &cols, &[], &[0], TableProps::default(), &[])
+        .create_table("ren", "t", &id_v(), &[], TableProps::default(), &[])
         .unwrap();
-    let vid = client.create_view("ren", "v", tid, &cols).unwrap();
+    let vid = client.create_view("ren", "v", tid).unwrap();
 
     client.alter_rename_relation("ren", "t", "t2").unwrap();
     client.alter_rename_relation("ren", "v", "v2").unwrap();
@@ -362,7 +358,7 @@ fn a_rename_stores_the_new_name_for_a_table_and_for_a_view() {
     // anything but the name would have been refused, and the `+1` carries the
     // same payload.
     let t2 = client.resolve("ren", "t2").unwrap().unwrap();
-    assert_eq!(t2.schema.num_columns(), cols.len());
+    assert_eq!(t2.schema.num_columns(), id_v().num_columns());
 }
 
 /// A mixed-sign bundle keeps the ascending creation order: `ALTER VIEW … AS`
@@ -373,14 +369,10 @@ fn an_alter_view_bundle_still_applies_in_creation_order() {
     let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     client.create_schema("mixed").unwrap();
-    let cols = [
-        ColumnDef::new("id", TypeCode::U64, false),
-        ColumnDef::new("v", TypeCode::I64, false),
-    ];
     let tid = client
-        .create_table("mixed", "t", &cols, &[], &[0], TableProps::default(), &[])
+        .create_table("mixed", "t", &id_v(), &[], TableProps::default(), &[])
         .unwrap();
-    let first = client.create_view("mixed", "v", tid, &cols).unwrap();
+    let first = client.create_view("mixed", "v", tid).unwrap();
 
     let mut circuit = gnitz_core::Circuit::default();
     let scan = circuit.input_delta(tid, gnitz_wire::ReadBound::None);
@@ -391,8 +383,7 @@ fn an_alter_view_bundle_still_applies_in_creation_order() {
             "v",
             vec![gnitz_core::PlannedView {
                 circuit,
-                output_columns: cols.to_vec(),
-                pk_cols: vec![0],
+                schema: id_v(),
                 pk_repeats: false,
             }],
             gnitz_core::ViewProps::default(),
@@ -652,13 +643,7 @@ fn the_duplicate_visible_name_rule_holds_at_every_column_transition() {
 /// Push rows `(1, 5)` and `(2, 5)` into `a_table`'s table `tid`: column 1 holds
 /// a duplicate a unique pre-flight would report.
 fn push_equal_values(client: &mut GnitzClient, tid: u64) {
-    let schema = gnitz_core::protocol::Schema {
-        columns: vec![
-            ColumnDef::new("id", TypeCode::U64, false),
-            ColumnDef::new("v", TypeCode::I64, false),
-        ],
-        pk_cols: vec![0],
-    };
+    let schema = id_v();
     let mut batch = ZSetBatch::new(&schema);
     let mut app = BatchAppender::new(&mut batch, &schema);
     app.add_row(1, 1).i64_val(5);
@@ -673,12 +658,8 @@ fn a_unique_index_on_a_view_is_refused_for_its_owner() {
     let mut client = session(&srv);
     let tid = a_table(&mut client, "vown");
     push_equal_values(&mut client, tid);
-    let cols = [
-        ColumnDef::new("id", TypeCode::U64, false),
-        ColumnDef::new("v", TypeCode::I64, false),
-    ];
     // The backfill copies both rows into the view.
-    let vid = client.create_view("vown", "v", tid, &cols).unwrap();
+    let vid = client.create_view("vown", "v", tid).unwrap();
     let iid = client.alloc_id().unwrap();
     let unique = gnitz_wire::IndexProps { is_unique: true }.pack();
     let err = format!(

@@ -1397,7 +1397,14 @@ fn nullable_payloads_of_every_width_survive_the_copy() {
         gnitz_core::ColumnDef::new("b", gnitz_core::TypeCode::Blob, true),
     ];
     fx.direct
-        .create_table("nl", "blb", &cols, &[], &[0], gnitz_core::TableProps::default(), &[])
+        .create_table(
+            "nl",
+            "blb",
+            &Schema { columns: cols, pk_cols: vec![0] },
+            &[],
+            gnitz_core::TableProps::default(),
+            &[],
+        )
         .expect("a BLOB column is admissible through the binary API");
     let (blb_tid, blb_schema) = fx.direct.resolve_table_or_view_id("nl", "blb").unwrap();
     let mut batch = gnitz_core::ZSetBatch::new(&blb_schema);

@@ -500,8 +500,8 @@ pub(crate) fn install_append_method(py: Python<'_>) -> PyResult<()> {
 
 #[pymethods]
 impl PyZSetBatch {
-    /// Construct a batch for `schema` — a `Schema` or a bare list of
-    /// `ColumnDef`, resolved at the parameter through [`resolve_py_schema`].
+    /// Construct a batch for `schema`, resolved at the parameter through
+    /// [`resolve_py_schema`].
     #[new]
     #[pyo3(signature = (schema))]
     pub fn new(#[pyo3(from_py_with = resolve_py_schema)] schema: Arc<Schema>) -> PyResult<Self> {

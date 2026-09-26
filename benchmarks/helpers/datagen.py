@@ -211,7 +211,6 @@ def bulk_load(
     conn,
     schema_name: str,
     table_name: str,
-    columns: list,
     num_rows: int,
     seed: int = 42,
     *,
@@ -227,9 +226,14 @@ def bulk_load(
     """
     tid, schema = conn.resolve_table(schema_name, table_name)
     rng = random.Random(seed)
+    cols = schema.columns
+    # Keys are sequential integers, so the table has exactly one PK column.
+    (pk_i,) = schema.pk_indices
+    pk_name = cols[pk_i].name
     # Name and type code read once per column, not once per cell: both are pyo3
     # getters, and the row loop below runs one per (row x column).
-    spec = [(c.name, getattr(c, "is_nullable", False), c.type_code) for c in columns if c.name != "pk"]
+    spec = [(c.name, c.is_nullable, c.type_code)
+            for i, c in enumerate(cols) if i != pk_i and not c.is_hidden]
     pks = []
     i = 1
 
@@ -237,7 +241,7 @@ def bulk_load(
         # A generator, not a list: `extend` iterates it, so one row dict is alive
         # at a time where a materialized list would hold the whole chunk.
         for k in range(lo, hi):
-            row = {"pk": k}
+            row = {pk_name: k}
             for name, nullable, tc in spec:
                 if nullable and rng.random() < null_rate:
                     row[name] = None

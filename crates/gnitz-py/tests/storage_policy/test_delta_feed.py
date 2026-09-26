@@ -36,7 +36,6 @@ class Subscriber:
     def __init__(self, client, sn, name):
         self.client = client
         self.vid, self.schema = client.resolve_table(sn, name)
-        self.delta_schema = gnitz.delta_reply_schema(self.schema)
         self.copy = {}
         self.cursor = (0, 0)
 
@@ -49,7 +48,7 @@ class Subscriber:
     def poll(self):
         # No hand-written tag check: `delta_poll` refuses a foreign cursor
         # itself, so a reply that arrives here is one this copy may apply.
-        reply = self.client.delta_poll(self.vid, self.delta_schema, self.cursor)
+        reply = self.client.delta_poll(self.vid, self.schema, self.cursor)
         for k, w in _zset(reply.rows.including_hidden()).items():
             self.copy[k] = self.copy.get(k, 0) + w
             if self.copy[k] == 0:
@@ -298,7 +297,7 @@ def test_a_delta_read_of_a_relation_with_no_feed_is_an_error(client, schema_name
     vid, schema = client.resolve_table(sn, "plain")
     for verb in (
         lambda: client.delta_bootstrap(vid, schema),
-        lambda: client.delta_poll(vid, gnitz.delta_reply_schema(schema), (0, 1)),
+        lambda: client.delta_poll(vid, schema, (0, 1)),
     ):
         with pytest.raises(gnitz.GnitzError) as e:
             verb()

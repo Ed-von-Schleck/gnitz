@@ -49,10 +49,9 @@ def _setup(client):
         "INSERT INTO t VALUES (1, 1, 10, 100), (2, 1, 20, 200), (3, 2, 30, 300)",
         schema_name=sn)
 
-    cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-            gnitz.ColumnDef("pad", gnitz.TypeCode.STRING)]
-    filler = client.create_table(sn, "filler", cols)
-    schema = gnitz.Schema(cols)
+    schema = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
+                           gnitz.ColumnDef("pad", gnitz.TypeCode.STRING)], [0])
+    filler = client.create_table(sn, "filler", schema)
     for lo in range(0, _FILL_ROWS, _FILL_BATCH):
         batch = gnitz.ZSetBatch(schema)
         for i in range(lo, lo + _FILL_BATCH):

@@ -7,19 +7,18 @@ import uuid
 import pytest
 
 from gnitz import TypeCode, ColumnDef, Schema, Row, ZSetBatch
+from _schemas import KV
 
 
 _UUID = uuid.uuid4()
 _TABLES = {
-    "kv": ([ColumnDef("pk", TypeCode.U64, primary_key=True), ColumnDef("val", TypeCode.I64)],
-           [{"pk": 1, "val": 10}, {"pk": 2, "val": 20}, {"pk": 3, "val": 30}]),
-    "empty": ([ColumnDef("pk", TypeCode.U64, primary_key=True), ColumnDef("val", TypeCode.I64)],
-              []),
-    "uuid": ([ColumnDef("pk", TypeCode.U64, primary_key=True), ColumnDef("id", TypeCode.UUID)],
+    "kv": (KV, [{"pk": 1, "val": 10}, {"pk": 2, "val": 20}, {"pk": 3, "val": 30}]),
+    "empty": (KV, []),
+    "uuid": (Schema([ColumnDef("pk", TypeCode.U64), ColumnDef("id", TypeCode.UUID)], [0]),
              [{"pk": 1, "id": _UUID}]),
-    "under": ([ColumnDef("pk", TypeCode.U64, primary_key=True),
-               ColumnDef("weight", TypeCode.I64),
-               ColumnDef("_x", TypeCode.I64)],
+    "under": (Schema([ColumnDef("pk", TypeCode.U64),
+                      ColumnDef("weight", TypeCode.I64),
+                      ColumnDef("_x", TypeCode.I64)], [0]),
               [{"pk": 1, "weight": 77, "_x": 5}]),
 }
 
@@ -30,9 +29,9 @@ def scans(module_schema):
     its batch, so every test reads the same result objects."""
     conn, sn = module_schema
     out = {}
-    for name, (cols, rows) in _TABLES.items():
-        tid = conn.create_table(sn, name, cols)
-        conn.push(tid, ZSetBatch(Schema(cols)).extend(rows))
+    for name, (schema, rows) in _TABLES.items():
+        tid = conn.create_table(sn, name, schema)
+        conn.push(tid, ZSetBatch(schema).extend(rows))
         out[name] = conn.scan(tid)
     return out
 
