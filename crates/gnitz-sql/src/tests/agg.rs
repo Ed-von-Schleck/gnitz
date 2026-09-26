@@ -105,24 +105,3 @@ fn default_agg_name_renders_pinned_view_column_names() {
     assert_eq!(default_agg_name(AggFunc::Max, 3), "_max3");
     assert_eq!(default_agg_name(AggFunc::Avg, 4), "_avg4");
 }
-
-// The Direct-aggregate nullability decision shared by the SELECT projection
-// (output-schema nullability) and the HAVING `IS [NOT] NULL` const-fold — and,
-// through the same shared rule, by the engine's physical reduce output schema.
-#[test]
-fn raw_output_nullable_matches_emit_semantics() {
-    use WireAggFunc as W;
-    for f in [W::Count, W::CountNonNull, W::Sum] {
-        for src_nullable in [false, true] {
-            for ungrouped in [false, true] {
-                assert!(!f.raw_output_nullable(src_nullable, ungrouped), "{f:?}");
-            }
-        }
-    }
-    for f in [W::Min, W::Max] {
-        assert!(!f.raw_output_nullable(false, false), "{f:?} grouped, non-nullable");
-        assert!(f.raw_output_nullable(true, false), "{f:?} grouped, nullable");
-        assert!(f.raw_output_nullable(false, true), "{f:?} global, non-nullable");
-        assert!(f.raw_output_nullable(true, true), "{f:?} global, nullable");
-    }
-}

@@ -378,12 +378,8 @@ fn emit_partial(ctx: &mut EmitCtx, consumer: NodeId) -> Result<Option<DeltaReg>,
     let in_reg = ctx.unary_delta_in(shard)?;
     let in_schema = ctx.reg_schema(in_reg);
     Ok(match ctx.loaded.op(consumer) {
-        gnitz_wire::OpNode::Reduce { agg, .. } => {
-            // No ground row: a worker with no rows contributes no partial.
-            let plan = gnitz_store::ops::ReducePlan::from_wire(&in_schema, &[], agg, false)?;
-            plan.is_exact_linear()
-                .then(|| push_reduce(ctx, shard, PARTIAL, in_reg, plan))
-        }
+        gnitz_wire::OpNode::Reduce { agg, .. } => gnitz_store::ops::ReducePlan::partial(&in_schema, agg)?
+            .map(|plan| push_reduce(ctx, shard, PARTIAL, in_reg, plan)),
         gnitz_wire::OpNode::TopN { order, limit, offset, .. } => {
             let plan = gnitz_store::ops::TopNPlan::partial(&in_schema, order, *limit, *offset)?;
             Some(push_topn(ctx, shard, PARTIAL, in_reg, plan))

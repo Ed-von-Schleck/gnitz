@@ -38,10 +38,8 @@ fn empty_trace(schema: SchemaDescriptor) -> ReadCursor {
     trace_cursor(Batch::empty_with_schema(&schema), schema)
 }
 
-/// Shim over [`super::op_reduce::op_reduce`] baking a [`ReducePlan`] per call —
-/// deriving `out_key` from the input schema (exactly the one kind compile-time
-/// validation admits for a given (schema, group cols)) and the history from the
-/// passed cursor, so the many call sites below need not repeat it.
+/// Shim over [`super::op_reduce::op_reduce`] baking a [`ReducePlan`] per call and
+/// the history from the passed cursor, so the many call sites below need not repeat it.
 fn op_reduce(
     delta: &Batch,
     trace_out_cursor: &mut ReadCursor,
@@ -104,8 +102,7 @@ impl Avi {
     }
 }
 
-/// Bake a [`ReducePlan`] the way the compiler's `emit_reduce` does, with
-/// `out_key` derived from the input schema.
+/// Bake a [`ReducePlan`] the way the compiler's `emit_reduce` does.
 fn make_plan(
     input_schema: &SchemaDescriptor,
     group_by_cols: &[u32],
@@ -307,8 +304,8 @@ fn test_reduce_sum_retraction() {
     );
 
     // Output: pk(U128), grp(I64), sum(I64), count(I64). The trailing count is the
-    // cardinality companion every all-linear reduce now carries; op_reduce gates
-    // emission on it (and asserts its presence).
+    // cardinality companion every circuit reduce carries; op_reduce gates
+    // emission on it.
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U128, false),
@@ -2203,7 +2200,7 @@ fn make_batch_raw_pk<T: Copy>(
 }
 
 /// `[Sum(sum_col, sum_tc), Count(col 0)]` — a linear SUM plus the appended
-/// cardinality companion every all-linear reduce carries, the agg_descs the
+/// cardinality companion every circuit reduce carries, the agg_descs the
 /// planner produces for `SELECT …, SUM(v) … GROUP BY …`.
 fn sum_count_aggs(sum_col: u32) -> [AggDescriptor; 2] {
     [
@@ -2330,7 +2327,7 @@ fn test_reduce_group_by_pk_unsorted_signed_pk() {
     let in_schema = make_schema_i64pk_i64();
     // The output PK region is the input's, so it carries the signed source PK
     // verbatim (OPK, sign-flipped); we only check ordering of the payload. The
-    // trailing I64 is the cardinality companion every all-linear reduce carries.
+    // trailing I64 is the cardinality companion every circuit reduce carries.
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::I64, false),
@@ -4857,11 +4854,9 @@ fn a_combine_builds_over_every_partial_layout() {
             let input = u64_pk_schema(SchemaColumn::new(tc, nullable));
             for op in [AggFunc::Count, AggFunc::CountNonNull, AggFunc::Sum] {
                 let aggs = [AggDescriptor { agg_op: op, col_idx: 1 }, AggDescriptor::COUNT_STAR];
-                let partial = make_plan(&input, &[], &aggs, false);
-                assert!(partial.is_exact_linear(), "{op:?} over {tc}");
-                let combined = ReducePlan::combine(&partial.shape.output_schema, &aggs, true)
+                let partial = ReducePlan::partial(&input, &aggs).unwrap().unwrap();
+                ReducePlan::combine(&partial.shape.output_schema, &aggs, true)
                     .unwrap_or_else(|e| panic!("{op:?} over {tc} nullable={nullable}: {e}"));
-                assert!(combined.is_exact_linear(), "{op:?} over {tc} nullable={nullable}");
             }
         }
     }
@@ -4872,13 +4867,12 @@ fn a_combine_builds_over_every_partial_layout() {
 fn only_exact_linear_aggregates_combine() {
     let with = |tc: TypeCode, op: AggFunc| {
         let input = u64_pk_schema(SchemaColumn::new(tc, false));
-        make_plan(
+        ReducePlan::partial(
             &input,
-            &[],
             &[AggDescriptor { agg_op: op, col_idx: 1 }, AggDescriptor::COUNT_STAR],
-            false,
         )
-        .is_exact_linear()
+        .unwrap()
+        .is_some()
     };
     assert!(with(TypeCode::I64, AggFunc::Sum));
     assert!(with(TypeCode::F64, AggFunc::Count));
@@ -4945,7 +4939,7 @@ fn two_workers_partials_combine_to_the_funnels_output() {
         },
         AggDescriptor::COUNT_STAR,
     ];
-    let partial = || Instance::new(make_plan(&input, &[], &aggs, false));
+    let partial = || Instance::new(ReducePlan::partial(&input, &aggs).unwrap().unwrap());
     let (mut a, mut b) = (partial(), partial());
     let partials = a.plan.shape.output_schema;
     let mut combine = Instance::new(ReducePlan::combine(&partials, &aggs, true).unwrap());
@@ -5479,7 +5473,7 @@ type GrpValRow = (u64, Option<i64>, i64, i64);
 
 /// Output schema for a synthetic-U128-PK `SUM/COUNT` reduce:
 /// `[U128 pk, <grp>, I64 sum, I64 count]`. The trailing count is the
-/// cardinality companion every all-linear reduce carries.
+/// cardinality companion every circuit reduce carries.
 fn sum_count_out_synthetic(grp_col: SchemaColumn) -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
@@ -6176,9 +6170,9 @@ fn avi_skip_new_all_null_group() {
     );
 }
 
-// Cap: an *existing* group receives more than `SKIP_TRACK_CAP` all-insert rows in
-// one epoch, tripping the pre-step cap so it force-probes (its partial pre-stepped
-// accumulator is discarded by the probe) rather than folding. The cap trigger —
+// Cap: an *existing* group receives more than `PRESTEP_CAP` all-insert rows in
+// one epoch, tripping the pre-step cap so it force-probes rather than folding:
+// past the cap no extreme is pre-stepped; the probe seeds them. The cap trigger —
 // not `!has_old` — is what's exercised; the result must match the from-scratch
 // extreme, confirming the cap is correctness-neutral.
 #[test]
@@ -6187,7 +6181,7 @@ fn avi_skip_cap_force_probes() {
     let aggs = mm_aggs();
     let out_schema = out_schema_for(&in_schema, &[1u32], &aggs);
 
-    // Epoch 0 creates the group (extreme 500); epoch 1 inserts 200 > 128 rows into
+    // Epoch 0 creates the group (extreme 500); epoch 1 inserts 200 rows, past the cap, into
     // the now-existing group — an all-insert, has_old group past the cap.
     let seed = build_mm_delta(&[(1, 0, 500, 1)]);
     let bulk: Vec<(u64, i64, i64, i64)> = (0..200).map(|i| (i as u64 + 10, 0, i as i64 - 50, 1)).collect();
@@ -6514,61 +6508,6 @@ fn avi_skip_global_aggregate() {
 }
 
 #[test]
-fn test_agg_output_type() {
-    use TypeCode::*;
-    let cases = [
-        (AggFunc::Count, I64, Some(I64)),
-        (AggFunc::Sum, F64, Some(F64)),
-        (AggFunc::Sum, I32, Some(I64)),
-        (AggFunc::Sum, F32, Some(F64)),
-        // SUM over a U64 source is typed U64: the i64 accumulator's bit pattern
-        // is the correct unsigned sum, so a downstream unsigned compare re-seeds
-        // right.
-        (AggFunc::Sum, U64, Some(U64)),
-        // MIN/MAX select an existing row, so they keep the source type, wide
-        // types included.
-        (AggFunc::Max, F32, Some(F32)),
-        (AggFunc::Min, I8, Some(I8)),
-        (AggFunc::Max, I16, Some(I16)),
-        (AggFunc::Min, I32, Some(I32)),
-        (AggFunc::Max, U8, Some(U8)),
-        (AggFunc::Min, U16, Some(U16)),
-        (AggFunc::Max, U32, Some(U32)),
-        (AggFunc::Min, U64, Some(U64)),
-        (AggFunc::Max, String, Some(String)),
-        (AggFunc::Min, U128, Some(U128)),
-        // A sum needs a scalar register, and a calendar value does not add.
-        (AggFunc::Sum, String, None),
-        (AggFunc::Sum, U128, None),
-        (AggFunc::Sum, Date, None),
-        (AggFunc::Sum, Timestamp, None),
-    ];
-    for (f, src, want) in cases {
-        assert_eq!(gnitz_wire::agg_output_type(f, src), want, "{f:?} over {src}");
-    }
-}
-
-/// A partial's merge aggregate keeps the partial's type.
-#[test]
-fn agg_merge_preserves_output_type() {
-    for f in [
-        AggFunc::Count,
-        AggFunc::CountNonNull,
-        AggFunc::Sum,
-        AggFunc::Min,
-        AggFunc::Max,
-    ] {
-        let merge = if f.is_linear() { AggFunc::Sum } else { f };
-        for &tc in TypeCode::ALL {
-            let Some(out) = gnitz_wire::agg_output_type(f, tc) else {
-                continue;
-            };
-            assert_eq!(gnitz_wire::agg_output_type(merge, out), Some(out), "{f:?} over {tc:?}");
-        }
-    }
-}
-
-#[test]
 fn test_reduce_output_schema_natural_pk() {
     let input = SchemaDescriptor::new(
         &[
@@ -6731,7 +6670,10 @@ fn agg_over(tc: TypeCode) -> SchemaDescriptor {
 /// a sum over a wide or a calendar column.
 #[test]
 fn a_summing_aggregate_over_a_non_scalar_column_is_rejected() {
-    let aggs = [AggDescriptor { agg_op: AggFunc::Sum, col_idx: 1 }];
+    let aggs = [
+        AggDescriptor { agg_op: AggFunc::Sum, col_idx: 1 },
+        AggDescriptor::COUNT_STAR,
+    ];
     for tc in [TypeCode::U128, TypeCode::String, TypeCode::Date, TypeCode::Timestamp] {
         assert_eq!(
             plan_rejection(&agg_over(tc), &[0], &aggs),

@@ -45,7 +45,7 @@ pub(crate) fn agg_ops(
         AggFunc::Avg => (WireAggFunc::Sum, Some(count)),
     };
     if let Some(c) = arg {
-        if gnitz_core::agg_output_type(ops.0, c.ty.tc).is_none() {
+        if gnitz_wire::agg_output_type(ops.0, c.ty.tc).is_none() {
             return Err(GnitzSqlError::Unsupported(format!(
                 "{}: not supported on {:?} column '{}'",
                 agg_func_name(func).to_ascii_uppercase(),
@@ -60,7 +60,7 @@ pub(crate) fn agg_ops(
 /// The raw reduce column `op` over `src` produces, as the engine declares it.
 pub(crate) fn agg_col_def(op: WireAggFunc, src: Option<&ColumnDef>, ungrouped: bool) -> ColumnDef {
     let src_ty = src.map_or(ColType::of(TypeCode::I64), |c| c.ty);
-    let tc = gnitz_core::agg_output_type(op, src_ty.tc).expect("agg_ops admitted this aggregate");
+    let tc = gnitz_wire::agg_output_type(op, src_ty.tc).expect("agg_ops admitted this aggregate");
     let ty = ColType {
         tc,
         scale: if tc == TypeCode::Decimal { src_ty.scale } else { 0 },

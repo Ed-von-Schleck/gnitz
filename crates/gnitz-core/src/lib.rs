@@ -28,11 +28,11 @@ pub use connection::{
 };
 pub use error::ClientError;
 pub use gnitz_expr::{ColumnTable, SchemaFacts};
-pub use gnitz_wire::{agg_output_type, Circuit, MapKind, Node, NodeId, NodeInputs, OpNode, RangeRel, ReindexRole};
 pub use gnitz_wire::{
-    validate_dist_prefix, validate_user_identifier, PkColList, ReindexSlot, RelClass, RelIndex, TableProps, ViewProps,
-    FIRST_USER_TABLE_ID, TABLE_TAB,
+    validate_dist_prefix, PkColList, ReindexSlot, RelClass, RelIndex, TableProps, ViewProps, FIRST_USER_TABLE_ID,
+    TABLE_TAB,
 };
+pub use gnitz_wire::{Circuit, NodeId, OpNode, RangeRel, ReindexRole};
 pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult};
 pub use protocol::{
     push_zero_cell, BatchAppender, ColType, ColumnDef, FixedInt, FkTarget, PayloadColumn, PkBuf, PkColumn,

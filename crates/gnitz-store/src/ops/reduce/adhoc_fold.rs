@@ -49,7 +49,7 @@ impl AdhocFold {
         let mut groups = Batch::empty_with_schema(&prefix.finish());
         let shape = ReduceShape::new(src_schema, key, prefix, &agg.aggs).map_err(refuse)?;
         let mut accs = Vec::new();
-        if shape.is_global() {
+        if shape.key.is_global() {
             // A global fold's one group exists over no input: every worker emits it.
             emit_reduce_row(&mut groups, None, shape.key.ground_pk().bytes(), &[]);
             accs.extend_from_slice(&shape.acc_template);
@@ -82,7 +82,7 @@ impl AdhocFold {
             ..
         } = self;
         let mb = chunk.as_mem_batch();
-        if shape.is_global() {
+        if shape.key.is_global() {
             for &(s, e) in ranges {
                 Accumulator::fold_rows(accs, &mb, s..e);
             }

@@ -27,12 +27,15 @@ pub(super) fn single_col_canonical_group_key(schema: &SchemaDescriptor, group_by
 /// the group set is canonical, else an XXH3 fold of the per-column canonical
 /// material.
 pub(super) struct GroupKeyCols {
-    /// See [`single_col_canonical_group_key`].
+    /// The single column the group key is the canonical `opk_image` of, or
+    /// `None` when the key is the hash fold. `Some` is exactly "the key is
+    /// injective and order-preserving on the group value". See
+    /// [`single_col_canonical_group_key`].
     canonical: Option<ColumnLocator>,
     /// The group columns in group-set order. Empty for a global (ungrouped)
     /// aggregate, whose key is `gnitz_wire::global_group_key()` — the fold of
     /// zero columns.
-    pub(super) cols: FoldCols,
+    cols: FoldCols,
 }
 
 impl GroupKeyCols {
@@ -47,20 +50,12 @@ impl GroupKeyCols {
         })
     }
 
-    /// The single column the group key is the canonical `opk_image` of, or
-    /// `None` when the key is the hash fold. `Some` is exactly "the key is
-    /// injective and order-preserving on the group value".
-    #[inline]
-    pub(super) fn canonical_col(&self) -> Option<ColumnLocator> {
-        self.canonical
-    }
-
     /// The 128-bit group key of `row`. Over an empty group set this is the fold
     /// of nothing — `gnitz_wire::global_group_key()`, the V₀ every global
     /// aggregate keys its one row by.
     #[inline]
     pub(super) fn key_row<R: RowSource>(&self, src: &R, row: usize) -> u128 {
-        if let Some(col) = self.canonical_col() {
+        if let Some(col) = self.canonical {
             return col.opk_image(src, row);
         }
         self.cols.key_row(src, row, src.get_null_word(row))
@@ -157,6 +152,12 @@ impl GroupOutKey {
         Ok((GroupOutKey { group, region, carried }, b))
     }
 
+    /// Grouped by the empty set: one group, V₀.
+    #[inline]
+    pub(super) fn is_global(&self) -> bool {
+        self.group.cols.is_empty()
+    }
+
     /// The output PK of `row`'s group.
     #[inline]
     pub(super) fn out_pk<'a>(&self, mb: &'a MemBatch, row: usize) -> OutPk<'a> {
@@ -192,12 +193,12 @@ impl GroupOutKey {
         let mb = &batch.as_mem_batch();
         let n = mb.count;
         // One run, with no key to compute.
-        if n <= 1 || self.group.cols.is_empty() {
+        if n <= 1 || self.is_global() {
             return GroupRuns::in_place(n, |_| ());
         }
         let pk_keyed = matches!(self.region, KeyRegion::SourcePk);
         // A leading-PK-column key is that column's OPK bytes, widened.
-        let leading_pk_col = matches!(self.group.canonical_col(), Some(ColumnLocator::Pk { byte_off: 0, .. }));
+        let leading_pk_col = matches!(self.group.canonical, Some(ColumnLocator::Pk { byte_off: 0, .. }));
         if (pk_keyed || leading_pk_col) && batch.consolidated_verified(batch.schema()) {
             return match pk_keyed {
                 true => GroupRuns::in_place(n, |i| mb.get_pk_bytes(i)),
@@ -211,7 +212,7 @@ impl GroupOutKey {
         }
         // Exact, not a truncation: a canonical key over a ≤8-byte column fits 64
         // bits, and halves the sorted payload for `GROUP BY <BIGINT>`.
-        if self.group.canonical_col().is_some_and(|c| c.size() <= 8) {
+        if self.group.canonical.is_some_and(|c| c.size() <= 8) {
             GroupRuns::sorted(n, |i| self.group.key_row(mb, i) as u64)
         } else {
             GroupRuns::sorted(n, |i| self.group.key_row(mb, i))

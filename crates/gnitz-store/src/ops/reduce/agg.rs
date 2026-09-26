@@ -1,4 +1,4 @@
-//! Aggregate descriptors and accumulator state.
+//! Aggregate accumulator state.
 
 use std::cmp::Ordering;
 use std::ops::Range;

@@ -30,7 +30,6 @@ impl ReduceShape {
     ) -> Result<Self, OpBuildErr> {
         let over = |e: SchemaBound| OpBuildErr::shape(format!("reduce: output {e}"));
         // Nullability covers what `emit_agg_col` writes.
-        let ungrouped = key.group.cols.is_empty();
         for d in aggs {
             let src = input
                 .column(d.col_idx as usize)
@@ -44,7 +43,7 @@ impl ReduceShape {
             prefix
                 .push(SchemaColumn::new(
                     tc,
-                    d.agg_op.raw_output_nullable(src.nullable, ungrouped),
+                    d.agg_op.raw_output_nullable(src.nullable, key.is_global()),
                 ))
                 .map_err(over)?;
         }
@@ -57,11 +56,6 @@ impl ReduceShape {
             .map(|(d, c)| Accumulator::new(d.agg_op, input.locate(d.col_idx as usize), output_schema.locate(c)))
             .collect();
         Ok(ReduceShape { output_schema, key, acc_template })
-    }
-
-    /// Grouped by the empty set: one group, V₀.
-    pub(super) fn is_global(&self) -> bool {
-        self.key.group.cols.is_empty()
     }
 }
 
@@ -84,6 +78,44 @@ impl ReducePlan {
         aggs: &[AggDescriptor],
         seeds_ground: bool,
     ) -> Result<Self, OpBuildErr> {
+        Self::new(input, group_cols, aggs, cardinality(aggs)?, seeds_ground)
+    }
+
+    /// One worker's share of a global reduce over `aggs`, or `None` unless every
+    /// aggregate is a count or an integer sum, the aggregates [`Self::combine`]
+    /// folds.
+    pub fn partial(input: &SchemaDescriptor, aggs: &[AggDescriptor]) -> Result<Option<Self>, OpBuildErr> {
+        // No ground row: a worker with no rows contributes no partial.
+        let plan = Self::from_wire(input, &[], aggs, false)?;
+        Ok(plan.is_exact_linear().then_some(plan))
+    }
+
+    /// The global reduce over relayed [`Self::partial`] outputs `[V₀ | aggregates…]`,
+    /// each aggregate folding its own column by its [`AggFunc::merge_op`].
+    pub fn combine(
+        partials: &SchemaDescriptor,
+        aggs: &[AggDescriptor],
+        seeds_ground: bool,
+    ) -> Result<Self, OpBuildErr> {
+        let merged: Vec<AggDescriptor> = aggs
+            .iter()
+            .zip(1..)
+            .map(|(d, col_idx)| AggDescriptor { col_idx, agg_op: d.agg_op.merge_op() })
+            .collect();
+        // A COUNT merges as a SUM, so its position is read off `aggs`.
+        let plan = Self::new(partials, &[], &merged, cardinality(aggs)?, seeds_ground)?;
+        debug_assert_eq!(plan.shape.output_schema, *partials);
+        debug_assert!(plan.is_exact_linear(), "only exact linear partials are split off");
+        Ok(plan)
+    }
+
+    fn new(
+        input: &SchemaDescriptor,
+        group_cols: &[u32],
+        aggs: &[AggDescriptor],
+        cardinality: usize,
+        seeds_ground: bool,
+    ) -> Result<Self, OpBuildErr> {
         debug_assert!(
             !seeds_ground || group_cols.is_empty(),
             "the ground row carries no group columns"
@@ -91,44 +123,7 @@ impl ReducePlan {
         let (key, prefix) = GroupOutKey::for_group_cols(input, group_cols, group_cols.iter().copied())?;
         let shape = ReduceShape::new(input, key, prefix, aggs)?;
         let avi = AviBake::new(input, group_cols, &shape.acc_template)?;
-        Ok(ReducePlan {
-            cardinality: cardinality(aggs)?,
-            shape,
-            seeds_ground,
-            avi,
-        })
-    }
-
-    /// The global reduce over the relayed outputs of an exact linear
-    /// [`Self::from_wire`] over `aggs` and no group: `[V₀ | aggregates…]`, each
-    /// aggregate folding into its own column by its [`AggFunc::merge_op`].
-    pub fn combine(
-        partials: &SchemaDescriptor,
-        aggs: &[AggDescriptor],
-        seeds_ground: bool,
-    ) -> Result<Self, OpBuildErr> {
-        debug_assert_eq!(partials.num_columns(), 1 + aggs.len());
-        let (key, _) = GroupOutKey::synthetic(partials, &[], [])?;
-        let acc_template = aggs
-            .iter()
-            .zip(1..)
-            .map(|(d, c)| {
-                let col = partials.locate(c);
-                Accumulator::new(d.agg_op.merge_op(), col, col)
-            })
-            .collect();
-        let plan = ReducePlan {
-            cardinality: cardinality(aggs)?,
-            shape: ReduceShape {
-                output_schema: *partials,
-                key,
-                acc_template,
-            },
-            seeds_ground,
-            avi: None,
-        };
-        debug_assert!(plan.is_exact_linear(), "only exact linear partials are split off");
-        Ok(plan)
+        Ok(ReducePlan { shape, seeds_ground, cardinality, avi })
     }
 
     /// True iff every aggregate is a count or an integer sum, whose value is the

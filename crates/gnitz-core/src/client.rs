@@ -112,7 +112,7 @@ pub const MAX_CHAIN_SEGMENTS: usize = 64;
 /// How an internal chain segment is named, from its own allocated view id.
 ///
 /// Unique because vids are, and unspellable at every SQL surface because
-/// [`crate::validate_user_identifier`] rejects a leading `_`. Ownership is the
+/// [`gnitz_wire::validate_user_identifier`] rejects a leading `_`. Ownership is the
 /// `owner_view_id` column, not the name.
 fn segment_name(vid: u64) -> String {
     format!("_seg{vid}")

@@ -407,7 +407,7 @@ fn test_reduce_groups_by_a_payload_column() {
     let mut p = TestPlan::default();
     let out_trace = p.table("tr_out", out_schema);
     // SUM of payload col 1 (schema col 2), plus the trailing Count cardinality
-    // companion every all-linear reduce carries.
+    // companion every circuit reduce carries.
     let agg_descs = [
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Sum },
         AggDescriptor::COUNT_STAR,

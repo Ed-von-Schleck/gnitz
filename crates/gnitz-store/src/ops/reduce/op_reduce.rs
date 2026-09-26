@@ -11,8 +11,8 @@ use super::emit::emit_reduce_row;
 use super::plan::ReducePlan;
 
 /// A group with more delta rows than this skips the pre-step and probes the
-/// AVI: past it, stepping every row costs more than one seek.
-const SKIP_TRACK_CAP: usize = 128;
+/// value index: one seek in place of stepping every row.
+const PRESTEP_CAP: usize = 128;
 
 /// Incremental DBSP REDUCE: δ_out = Agg(history + δ_in) - Agg(history), emitted
 /// consolidated.
@@ -46,7 +46,9 @@ pub fn op_reduce(
     let mb = delta.as_mem_batch();
     let runs = shape.key.runs(delta);
 
-    let mut out = Batch::with_capacity(output_schema, 2 * runs.len());
+    // A group emits at most its retraction and its new row.
+    let reserved = 2 * runs.len();
+    let mut out = Batch::with_capacity(output_schema, reserved);
     let mut accs = shape.acc_template.clone();
     let mut avi = plan.avi.as_ref().map(|bake| {
         let cursor = history.expect("a value-indexed reduce is handed a cursor over the index its plan describes");
@@ -63,7 +65,7 @@ pub fn op_reduce(
         }
         // An extreme recedes only on a retraction, so an all-insert group's
         // extremes are its rows' and its stored row's: no probe.
-        let prestep = avi.is_some() && run.len() <= SKIP_TRACK_CAP;
+        let prestep = avi.is_some() && run.len() <= PRESTEP_CAP;
         let mut saw_negative = false;
         if fold_runs {
             Accumulator::fold_rows(&mut accs, &mb, run.clone());
@@ -113,8 +115,9 @@ pub fn op_reduce(
 
     gnitz_debug!("op_reduce: in={} groups={} out={}", delta.count, runs.len(), out.count);
 
-    // A consolidated batch reaches a view store by move, allocation included.
-    if out.count < runs.len() {
+    // The output moves on with its allocation, so a batch that used under half its
+    // reservation is copied down to size.
+    if out.count < reserved / 2 {
         out = out.clone_batch();
     }
     out.certify_layout(Layout::Consolidated);
