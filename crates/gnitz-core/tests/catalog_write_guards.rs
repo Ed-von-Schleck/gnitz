@@ -535,8 +535,8 @@ fn the_per_pk_shape_rules_reject_what_no_emitter_writes() {
     let tid = a_table(&mut client, "shapes");
     let mut s = session(&srv);
 
-    // A row above ±1: `retract_pk_list` emits a hard `-1`, so a row left at 2 is
-    // under-retracted and becomes a permanent live ghost.
+    // A row above ±1: a system store runs no `enforce_unique_pk`, so a weight
+    // outside {0, 1} is a duplicate live head or a persistent negative ghost.
     let sid = s.alloc_id().unwrap();
     let sc = sys_schema(SCHEMA_TAB);
     let mut heavy = ZSetBatch::new(sc);

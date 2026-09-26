@@ -123,7 +123,7 @@ fn test_failed_create_index_rolls_back() {
     let failed_idx_id = engine.next_id;
     // A file where this process's index store goes.
     let index = ChildAddr {
-        kind: ChildKind::Index(failed_idx_id),
+        kind: ChildKind::Index(gnitz_wire::PkColList::from_slice(&[1])),
         slot: engine.registry.slot(),
     };
     let blocker = index.dir(&relation_dir(&dir, RelationKind::BaseTable, tid));
@@ -482,10 +482,7 @@ fn test_drop_table_cascades_fk_index() {
     let engine2 = CatalogEngine::open(&dir, 1).unwrap();
     assert!(!engine2.registry.has_id(child_tid));
     assert!(
-        engine2
-            .ids_naming(SysFamily::Index, gnitz_wire::IDXTAB_PAY_OWNER_ID, &[child_tid])
-            .is_empty()
-            && !engine2.caches.index_by_name.values().any(|&id| id == child_tid),
+        engine2.index_ids_of(child_tid).is_empty() && !engine2.caches.index_by_name.values().any(|&id| id == child_tid),
         "no index row may exist for the dropped child"
     );
     engine2.close();
@@ -508,8 +505,7 @@ fn test_drop_table_cascades_multiple_indices() {
     engine.create_index("public.t", &["val1"], false).unwrap();
     engine.create_index("public.t", &["val2"], false).unwrap();
 
-    let owned_indices =
-        |engine: &CatalogEngine| engine.ids_naming(SysFamily::Index, gnitz_wire::IDXTAB_PAY_OWNER_ID, &[tid]);
+    let owned_indices = |engine: &CatalogEngine| engine.index_ids_of(tid);
     assert_eq!(
         owned_indices(&engine).len(),
         2,
@@ -805,12 +801,12 @@ fn test_fk_circuit_is_derived_and_survives_its_unique_index() {
     engine
         .register_table(child_tid, PUBLIC_SCHEMA_ID, "child", &cols, &[0])
         .unwrap();
-    let circuit_id = engine
+    let claims = engine
         .registry
         .relation(child_tid)
         .and_then(|e| e.index_on(&[1]))
-        .map(SecondaryIndex::id);
-    assert_eq!(circuit_id, Some(1));
+        .map(|ix| ix.claims().to_vec());
+    assert_eq!(claims, Some(vec![(1, false)]));
     assert_eq!(
         count_records(engine.sys_relation(SysFamily::Index).cursor()),
         idx_rows_before
@@ -852,6 +848,55 @@ fn test_promote_unique_index_over_fk_column_empty() {
         Some(true),
         "the UNIQUE index must promote the FK circuit to unique"
     );
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A shared circuit's directory is named by its column list, so compensating the
+/// drop of the last index on it re-opens the directory it already had — the one
+/// the workers, which never saw the compensated drop, still hold.
+#[test]
+fn compensated_drop_of_a_shared_index_keeps_its_directory() {
+    let (mut engine, tid, dir) = table_fixture(
+        "shared_index_dir_stable",
+        &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
+    );
+    let mut ids = Vec::new();
+    for name in ["public__t__a", "public__t__b"] {
+        let id = engine.allocate_ids(1).unwrap();
+        let idx = idx_tab_batch(
+            id,
+            tid,
+            pack_pk_cols(&[1]),
+            name,
+            gnitz_wire::IndexProps { is_unique: false },
+            1,
+        );
+        engine.submit(SysFamily::Index, idx).unwrap();
+        ids.push(id);
+    }
+    engine.submit_retraction(SysFamily::Index, ids[0]).unwrap();
+    let _ = engine.drain_pending_broadcasts();
+
+    let reldir = relation_dir(&dir, RelationKind::BaseTable, tid);
+    let index_dirs = || {
+        let mut names: Vec<String> = fs::read_dir(&reldir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("idx_"))
+            .collect();
+        names.sort();
+        names
+    };
+    let before = index_dirs();
+    assert_eq!(before.len(), 1, "{before:?}");
+
+    engine.submit_retraction(SysFamily::Index, ids[1]).unwrap();
+    engine.compensate_stage_a().unwrap();
+    assert_eq!(engine.index_ids_of(tid), vec![ids[1]]);
+    assert!(engine.registry.relation(tid).unwrap().index_on(&[1]).is_some());
+    assert_eq!(index_dirs(), before);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -2467,7 +2512,7 @@ fn compensated_drop_index_refills_the_restored_circuit() {
     let idx_id = engine.create_index("public.t", &["val"], false).unwrap();
     let _ = engine.drain_pending_broadcasts();
 
-    let drop = engine.retract_pk_list(SysFamily::Index, vec![idx_id as u128]);
+    let drop = engine.retract_under(SysFamily::Index, &[idx_id]);
     engine.submit(SysFamily::Index, drop).unwrap();
     assert!(engine.registry.relation(tid).unwrap().index_on(&[1]).is_none());
 

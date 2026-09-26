@@ -3,6 +3,8 @@
 
 use std::fs;
 
+use gnitz_wire::PkColList;
+
 use super::error::StorageError;
 use super::manifest;
 
@@ -15,8 +17,8 @@ pub enum ChildKind<'a> {
     Scratch(&'a str),
     /// A fed view's retained deltas.
     Delta,
-    /// Secondary index `id` over the relation.
-    Index(i64),
+    /// Secondary index over column list `cols` of the relation.
+    Index(PkColList),
 }
 
 /// One child directory of a relation: `kind`'s store for worker `slot`.
@@ -53,7 +55,10 @@ impl<'a> ChildAddr<'a> {
             ChildKind::Rows => format!("w{rank}of{of}"),
             ChildKind::Scratch(child) => format!("scratch_{child}_w{rank}of{of}"),
             ChildKind::Delta => format!("delta_w{rank}of{of}"),
-            ChildKind::Index(id) => format!("idx_{id}_w{rank}of{of}"),
+            ChildKind::Index(cols) => {
+                let list: Vec<String> = cols.as_slice().iter().map(u32::to_string).collect();
+                format!("idx_{}_w{rank}of{of}", list.join("-"))
+            }
         }
     }
 
@@ -86,7 +91,11 @@ impl<'a> ChildAddr<'a> {
             None => ChildKind::Rows,
             Some("delta") => ChildKind::Delta,
             Some(p) => match p.strip_prefix("idx_") {
-                Some(id) => ChildKind::Index(parse_id(id)?),
+                Some(list) => {
+                    let cols: Vec<u32> = list.split('-').map(parse_id).collect::<Option<_>>()?;
+                    gnitz_wire::validate_pk_col_list(&cols, gnitz_wire::PK_LIST_COL_LIMIT).ok()?;
+                    ChildKind::Index(PkColList::from_slice(&cols))
+                }
                 None => ChildKind::Scratch(p.strip_prefix("scratch_")?),
             },
         };

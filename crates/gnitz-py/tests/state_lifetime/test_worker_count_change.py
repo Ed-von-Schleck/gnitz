@@ -223,7 +223,7 @@ def test_an_index_rehomes_onto_the_launched_ranks(own_server):
         "every launched rank must re-derive its slice of the one index")
     table_dir = os.path.join(own_server.data_dir, "_relations", f"t_{tid}")
     idx_dirs = sorted(d for d in os.listdir(table_dir) if d.startswith("idx_"))
-    (idx_id,) = {d.split("_")[1] for d in idx_dirs}
     n = own_server.workers
-    assert idx_dirs == [f"idx_{idx_id}_w{k}of{n}" for k in range(n)], (
+    # An index child is named by its column list: `g` is column 1.
+    assert idx_dirs == [f"idx_1_w{k}of{n}" for k in range(n)], (
         f"only the launched ranks may keep an index child under {table_dir}, got {idx_dirs}")

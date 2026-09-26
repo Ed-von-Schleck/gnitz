@@ -48,20 +48,6 @@ fn table_rename_pair(engine: &CatalogEngine, tid: i64, new_name: &str) -> Batch 
     bb.finish()
 }
 
-/// Count live positive-weight rows for `tid` in the TABLE_TAB store — 1 for a
-/// clean rename, 2+ for a persistent ghost.
-fn live_rows_for(engine: &CatalogEngine, tid: i64) -> usize {
-    let mut c = engine.sys_relation(SysFamily::Table).cursor();
-    let mut n = 0;
-    while c.valid {
-        if c.current_key_narrow() as u64 == tid as u64 && c.current_weight > 0 {
-            n += 1;
-        }
-        c.advance();
-    }
-    n
-}
-
 // ── Reconciling hooks: a rename fires no teardown ───────────────────────────
 
 #[test]
@@ -83,7 +69,7 @@ fn rename_fires_no_cascade_and_leaves_dir_untouched() {
     assert!(engine.caches.entity_by_qname.contains_key("public.renamed"));
     assert!(!engine.caches.entity_by_qname.contains_key("public.orig"));
     assert_eq!(
-        live_rows_for(&engine, tid),
+        rows_under(&engine, SysFamily::Table, tid),
         1,
         "a rename must leave exactly one live row"
     );
@@ -174,7 +160,7 @@ fn stale_snapshot_rename_rejected_long_name() {
     );
     // The catalog is unchanged (still the original name, one live row).
     assert!(engine.caches.entity_by_qname.contains_key("public.original_long_name"));
-    assert_eq!(live_rows_for(&engine, tid), 1);
+    assert_eq!(rows_under(&engine, SysFamily::Table, tid), 1);
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -253,7 +239,10 @@ fn system_range_mutations_rejected() {
     // `_system._indices` away.
     let view_create = build_view_tab_row(IDX_TAB_ID, "v");
 
-    let members_before = engine.schema_members(PUBLIC_SCHEMA_ID).len();
+    let members = |engine: &CatalogEngine| {
+        [SysFamily::Table, SysFamily::View].map(|f| engine.schema_members(f, PUBLIC_SCHEMA_ID).len())
+    };
+    let members_before = members(&engine);
     for (family, batch, verb, noun) in [
         (SysFamily::Table, &table_drop, "DROP", "table"),
         (SysFamily::Table, &table_rename, "ALTER", "table"),
@@ -274,7 +263,7 @@ fn system_range_mutations_rejected() {
         "the system relation must still resolve under its own name"
     );
     assert_eq!(engine.caches.entity_by_qname.get("public.v"), None);
-    assert_eq!(engine.schema_members(PUBLIC_SCHEMA_ID).len(), members_before);
+    assert_eq!(members(&engine), members_before);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -371,7 +360,7 @@ fn column_rename_on_non_base_owner_rejected() {
     // bootstrap wrote so the `-1` cannot drift from it. A system owner packs a
     // COL_TAB PK below the family's first user id, so the id-space floor is what
     // catches this one, before the owner is ever resolved.
-    let sys_col = engine.read_column_defs(IDX_TAB_ID)[0].clone();
+    let sys_col = engine.read_column_defs(IDX_TAB_ID).unwrap()[0].clone();
     let err = engine
         .precheck_family(
             SysFamily::Column,
@@ -589,7 +578,11 @@ fn insert_first_rename_pair_lands_the_new_name() {
         engine.registry.has_id(tid),
         "a rename must not unregister the table, whatever the row order"
     );
-    assert_eq!(live_rows_for(&engine, tid), 1, "a rename leaves exactly one live row");
+    assert_eq!(
+        rows_under(&engine, SysFamily::Table, tid),
+        1,
+        "a rename leaves exactly one live row"
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

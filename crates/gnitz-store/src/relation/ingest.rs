@@ -34,16 +34,20 @@ pub(super) fn fill_indexes(
         assert_eq!(
             ix.store.held().estimated_rows(),
             0,
-            "index {} of relation {owner_id} is already populated",
-            ix.index_id
+            "index on columns {:?} of relation {owner_id} is already populated",
+            ix.cols.as_slice()
         );
     }
     let mut source = owner.held().open_cursor();
     while let Some(chunk) = source.drain_chunk(chunk_rows) {
         for ix in targets.iter_mut() {
-            let index_id = ix.index_id;
-            ix.project_and_ingest(&chunk)
-                .map_err(|e| StoreError::storage(format!("fill index {index_id} of relation {owner_id}"), e))?;
+            let cols = ix.cols;
+            ix.project_and_ingest(&chunk).map_err(|e| {
+                StoreError::storage(
+                    format!("fill index on columns {:?} of relation {owner_id}", cols.as_slice()),
+                    e,
+                )
+            })?;
         }
     }
     Ok(())
@@ -144,14 +148,18 @@ impl RelationRegistry {
         });
 
         for ix in entry.indexes.iter_mut() {
-            let index_id = ix.index_id;
+            let cols = ix.cols;
             let res = match ix.project_and_ingest(&effective) {
                 // The seam reports from a write that ran; an empty projection is none.
                 Ok(false) => continue,
                 other => other.map(drop),
             };
-            inject_ingest_apply_error("index", kind, res)
-                .map_err(|e| StoreError::storage(format!("ingest into index {index_id} of relation {id}"), e))?;
+            inject_ingest_apply_error("index", kind, res).map_err(|e| {
+                StoreError::storage(
+                    format!("ingest into index on columns {:?} of relation {id}", cols.as_slice()),
+                    e,
+                )
+            })?;
         }
 
         let store = entry.store.held_mut();

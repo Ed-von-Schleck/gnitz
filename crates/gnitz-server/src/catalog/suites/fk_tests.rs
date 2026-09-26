@@ -78,20 +78,20 @@ fn test_fk_drop_protections() {
     ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
-    // The FK column carries a derived circuit, id = its column index.
+    // The FK column carries a derived circuit, claimed under its column index.
     let fk_circuit = |engine: &CatalogEngine| {
         engine
             .registry
             .relation(child_tid)
             .and_then(|e| e.index_on(&[1]))
-            .map(SecondaryIndex::id)
+            .map(|ix| ix.claims().to_vec())
     };
-    assert_eq!(fk_circuit(&engine), Some(1));
+    assert_eq!(fk_circuit(&engine), Some(vec![(1, false)]));
 
     // Cannot drop parent (referenced by child), and the refusal leaves the
     // child's circuit in place.
     assert!(engine.drop_table("public.parent").is_err());
-    assert_eq!(fk_circuit(&engine), Some(1));
+    assert_eq!(fk_circuit(&engine), Some(vec![(1, false)]));
 
     // Drop child first, then parent succeeds
     engine.drop_table("public.child").unwrap();
@@ -145,7 +145,7 @@ fn co_dropped_fk_parent_and_child_leave_no_edge() {
 
     // One TABLE_TAB batch: the parent unregisters before the child's column rows
     // retract.
-    let drop = engine.retract_pk_list(SysFamily::Table, vec![parent_tid as u128, child_tid as u128]);
+    let drop = engine.retract_under(SysFamily::Table, &[parent_tid, child_tid]);
     engine.submit(SysFamily::Table, drop).unwrap();
 
     assert!(engine.fk_constraints_of(child_tid).is_empty());
@@ -178,7 +178,7 @@ fn creating_a_child_of_a_parent_the_same_delta_drops_is_refused() {
         )
         .unwrap();
 
-    let mut batch = engine.retract_pk_list(SysFamily::Table, vec![parent_tid as u128]);
+    let mut batch = engine.retract_under(SysFamily::Table, &[parent_tid]);
     batch.append_batch(&build_table_tab_row(child_tid, pack_pk_cols(&[0]), "child"), 0, 1);
     let err = engine
         .submit(SysFamily::Table, batch)

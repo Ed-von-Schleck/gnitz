@@ -32,7 +32,6 @@ mod registry;
 mod schema_block;
 mod sys_tables;
 mod types;
-mod utils;
 mod view_state;
 mod write_path;
 
@@ -80,8 +79,7 @@ pub(in crate::catalog) use gnitz_store::storage::{ChildAddr, ChildKind};
 // `BatchBuilder` holds no catalog state and lives in `storage`; re-export it
 // for the catalog's row builders.
 pub(in crate::catalog) use gnitz_store::storage::BatchBuilder;
-// The generic payload-cell readers every system-row decoder in this subsystem
-// reads a cell through, whatever the row's source.
+// The generic payload-cell readers, for the submodules' `use super::*`.
 pub(in crate::catalog) use gnitz_expr::{payload_string, payload_u64};
 
 // ---------------------------------------------------------------------------

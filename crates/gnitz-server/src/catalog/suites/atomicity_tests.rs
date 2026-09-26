@@ -366,7 +366,7 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
         "index_by_name must still point to the original index"
     );
     assert_eq!(
-        engine.ids_naming(SysFamily::Index, gnitz_wire::IDXTAB_PAY_OWNER_ID, &[tid]),
+        engine.index_ids_of(tid),
         vec![orig_idx_id],
         "the rejected index id must not appear under its owner"
     );
@@ -736,7 +736,7 @@ fn compensating_a_drop_keeps_the_restored_relation_directory() {
     engine.drain_pending_broadcasts();
 
     // The failed bundle's DROP: applied and enqueued, so compensation drains it.
-    let drop_batch = engine.retract_pk_list(SysFamily::Table, vec![tid as u128]);
+    let drop_batch = engine.retract_under(SysFamily::Table, &[tid]);
     assert_eq!(
         drop_batch.len(),
         1,
@@ -853,7 +853,7 @@ fn compensated_create_table_leaves_no_trace() {
 
     let reldir = relation_dir(&dir, RelationKind::BaseTable, tid);
     let blocker = ChildAddr {
-        kind: ChildKind::Index(idx_id),
+        kind: ChildKind::Index(gnitz_wire::PkColList::from_slice(&[2])),
         slot: engine.registry.slot(),
     }
     .dir(&reldir);
@@ -871,9 +871,7 @@ fn compensated_create_table_leaves_no_trace() {
 
     assert!(!engine.caches.relations.contains_key(&tid));
     assert!(!engine.registry.has_id(tid));
-    assert!(engine
-        .ids_naming(SysFamily::Index, gnitz_wire::IDXTAB_PAY_OWNER_ID, &[tid])
-        .is_empty());
+    assert!(engine.index_ids_of(tid).is_empty());
     assert!(
         !engine.fk_children_of(parent).iter().any(|e| e.child_tid == tid),
         "the parent must keep no edge from the uncreated child"

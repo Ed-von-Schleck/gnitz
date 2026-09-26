@@ -44,7 +44,7 @@ impl CatalogEngine {
             placement,
             pk_repeats,
         } = reg;
-        let col_defs = self.read_column_defs(id);
+        let col_defs = self.read_column_defs(id)?;
         let schema = build_schema_from_col_defs(kind, &col_defs, pk.as_slice(), placement)
             .map_err(|e| format!("{} '{name}' (id={id}) {e}", kind.noun()))?;
         gnitz_debug!(
@@ -211,7 +211,7 @@ impl CatalogEngine {
             let Some((kind, cur)) = self.registry.relation(owner).map(|e| (e.kind(), e.schema())) else {
                 continue;
             };
-            let defs = self.read_column_defs(owner);
+            let defs = self.read_column_defs(owner)?;
             let schema = if kind.is_base_table() {
                 let rebuilt =
                     build_schema_from_col_defs(RelationKind::BaseTable, &defs, cur.pk_indices(), cur.placement())
@@ -244,22 +244,9 @@ impl CatalogEngine {
                 self.registry
                     .add_index(owner_id, idx_id, cols.as_slice(), props.is_unique)?;
             } else {
-                self.unregister_index(owner_id, cols.as_slice());
+                self.registry.release_index(owner_id, idx_id);
             }
         }
         Ok(())
-    }
-
-    /// Demote or destroy `owner_id`'s circuit on `cols` after a `-1` IDX_TAB row. It
-    /// survives while another index row or the owner's FK columns still cover `cols`.
-    fn unregister_index(&mut self, owner_id: i64, cols: &[u32]) {
-        let survivors = self.indices_on_cols(owner_id, cols);
-        let fk_circuit = matches!(cols, [c] if self.fk_circuit_cols(owner_id).contains(&(*c as usize)));
-        if survivors.is_empty() && !fk_circuit {
-            self.registry.remove_index(owner_id, cols);
-        } else {
-            self.registry
-                .set_index_unique(owner_id, cols, survivors.iter().any(|&(_, u)| u));
-        }
     }
 }

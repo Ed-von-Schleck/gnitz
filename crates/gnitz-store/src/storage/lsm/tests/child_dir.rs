@@ -8,7 +8,8 @@ fn parse_inverts_name_for_every_grammar() {
             ChildKind::Scratch("_reduce_9_3"),
             ChildKind::Scratch("agg_w3"),
             ChildKind::Delta,
-            ChildKind::Index(7),
+            ChildKind::Index(PkColList::from_slice(&[7])),
+            ChildKind::Index(PkColList::from_slice(&[1, 3])),
         ] {
             let addr = ChildAddr { kind, slot };
             let name = addr.name();
@@ -37,6 +38,9 @@ fn parse_rejects_names_in_no_grammar() {
         "idx_x_w0of1",
         "idx_-3_w0of1",
         "idx_07_w0of1",
+        "idx_1-_w0of1",
+        "idx_1-1_w0of1",
+        "idx_-1_w0of1",
         "delta_w",
         "delta_wx",
         "delta_w0",

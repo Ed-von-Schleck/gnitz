@@ -44,8 +44,41 @@ fn test_add_remove_index_circuit() {
     registry.add_index(50, 999, &[2], false).unwrap();
     assert_eq!(registry.relation(50).unwrap().indexes().len(), 1);
 
-    registry.remove_index(50, &[2]);
+    registry.release_index(50, 999);
     assert_eq!(registry.relation(50).unwrap().indexes().len(), 0);
+}
+
+#[test]
+fn a_circuit_lives_while_one_claim_remains() {
+    let mut registry = solo_registry("idx_claims_owner");
+    let schema = SchemaDescriptor::new(
+        &[crate::schema::SchemaColumn::new(crate::schema::TypeCode::U64, false); 3],
+        &[0],
+    );
+    register_entry(&mut registry, 50, schema, RelationKind::BaseTable);
+    registry.add_index(50, 70, &[2], false).unwrap();
+    registry.add_index(50, 71, &[2], true).unwrap();
+    let circuit = |r: &RelationRegistry| r.relation(50).unwrap().index_on(&[2]).map(|ix| ix.is_unique());
+    assert_eq!(
+        registry.relation(50).unwrap().indexes().len(),
+        1,
+        "one circuit per column list"
+    );
+    assert_eq!(circuit(&registry), Some(true));
+
+    registry.release_index(50, 71);
+    assert_eq!(
+        circuit(&registry),
+        Some(false),
+        "the non-unique claim keeps the circuit"
+    );
+
+    registry.release_index(50, 12345);
+    registry.release_index(51, 70);
+    assert_eq!(circuit(&registry), Some(false), "an unknown claim or owner is a no-op");
+
+    registry.release_index(50, 70);
+    assert_eq!(circuit(&registry), None, "the last release drops the circuit");
 }
 
 #[test]
@@ -58,7 +91,7 @@ fn a_master_creates_no_index_directory() {
     let owner_dir = register_entry(&mut registry, 50, schema, RelationKind::BaseTable);
     registry.add_index(50, 999, &[1], false).unwrap();
     let index = ChildAddr {
-        kind: ChildKind::Index(999),
+        kind: ChildKind::Index(gnitz_wire::PkColList::from_slice(&[1])),
         slot: Slot::SOLO,
     };
     assert!(!std::path::Path::new(&index.dir(&owner_dir)).exists());
@@ -117,7 +150,7 @@ fn ephemeral_flush_includes_index_circuits() {
     registry.set_resume_generation(1);
     registry.checkpoint_ephemeral([]).unwrap();
     let store_dir = ChildAddr {
-        kind: ChildKind::Index(999),
+        kind: ChildKind::Index(gnitz_wire::PkColList::from_slice(&[1])),
         slot: Slot::SOLO,
     }
     .dir(&owner_dir);

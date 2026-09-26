@@ -37,7 +37,9 @@ impl CatalogEngine {
 
     pub(in crate::catalog) fn schema_is_empty(&self, schema_name: &str) -> bool {
         match self.caches.schema_by_name.get(schema_name) {
-            Some(&sid) => self.schema_members(sid).is_empty(),
+            Some(&sid) => [SysFamily::Table, SysFamily::View]
+                .into_iter()
+                .all(|f| self.schema_members(f, sid).is_empty()),
             None => true,
         }
     }
@@ -50,10 +52,18 @@ impl CatalogEngine {
         self.caches.index_by_name.contains_key(name)
     }
 
-    /// Retract the live row at `pk` in `family` through `submit`, which expands the
+    /// The ids of the live `sys_indices` rows `owner` owns.
+    pub(super) fn index_ids_of(&self, owner: i64) -> Vec<i64> {
+        let rows = self.sys_rows_where(SysFamily::Index, |s, i| {
+            payload_u64(s, i, gnitz_wire::IDXTAB_PAY_OWNER_ID) as i64 == owner
+        });
+        (0..rows.len()).map(|i| rows.get_pk(i) as i64).collect()
+    }
+
+    /// Retract the live row at `id` in `family` through `submit`, which expands the
     /// drop cascade.
-    pub(super) fn submit_retraction(&mut self, family: SysFamily, pk: u128) -> Result<(), String> {
-        let batch = self.retract_pk_list(family, vec![pk]);
+    pub(super) fn submit_retraction(&mut self, family: SysFamily, id: i64) -> Result<(), String> {
+        let batch = self.retract_under(family, &[id]);
         if batch.is_empty() {
             return Err("Entity does not exist in catalog".into());
         }
@@ -97,26 +107,16 @@ impl CatalogEngine {
         }
         let sid = self.schema_id(name).expect("the schema exists");
 
-        let members = self.schema_members(sid);
-        let (views, tables): (Vec<i64>, Vec<i64>) = members
-            .into_iter()
-            .partition(|id| self.registry.relation(*id).is_some_and(|e| e.kind().is_view()));
-        for vid in views {
-            self.submit_retraction(SysFamily::View, vid as u128)?;
-        }
-        for tid in tables {
-            self.submit_retraction(SysFamily::Table, tid as u128)?;
+        for family in [SysFamily::View, SysFamily::Table] {
+            let members = self.schema_members(family, sid);
+            for i in 0..members.len() {
+                self.submit_retraction(family, members.get_pk(i) as i64)?;
+            }
         }
 
         // The schema is empty now, so the engine's member-count guard accepts
         // this row.
-        let schema = SysFamily::Schema.schema();
-        let mut bb = BatchBuilder::new(*schema);
-        write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id: sid as u64, name }, -1);
-        let batch = bb.finish();
-
-        self.submit(SysFamily::Schema, batch)?;
-        Ok(())
+        self.submit_retraction(SysFamily::Schema, sid)
     }
 
     // -- DDL: CREATE/DROP TABLE --------------------------------------------
@@ -173,7 +173,7 @@ impl CatalogEngine {
             .get(&qualified)
             .ok_or_else(|| format!("Table does not exist: {qualified}"))?;
 
-        self.submit_retraction(SysFamily::Table, tid as u128)
+        self.submit_retraction(SysFamily::Table, tid)
     }
 
     // -- DDL: CREATE/DROP VIEW ---------------------------------------------
@@ -187,7 +187,7 @@ impl CatalogEngine {
             .get(&qualified)
             .ok_or_else(|| format!("View does not exist: {qualified}"))?;
 
-        self.submit_retraction(SysFamily::View, vid as u128)
+        self.submit_retraction(SysFamily::View, vid)
     }
 
     // -- DDL: CREATE/DROP INDEX --------------------------------------------
@@ -207,7 +207,7 @@ impl CatalogEngine {
             .ok_or_else(|| format!("Table does not exist: {qualified}"))?;
 
         // Resolve each column name to its index, in declared order.
-        let col_defs = self.read_column_defs(owner_id);
+        let col_defs = self.read_column_defs(owner_id).unwrap();
         let col_indices: Vec<u32> = col_names
             .iter()
             .map(|name| {
@@ -251,9 +251,8 @@ impl CatalogEngine {
             .ok_or_else(|| format!("Index does not exist: {index_name}"))?;
 
         // precheck_family enforces the FK-target uniqueness guard on the -1;
-        // the cascade (circuit demotion/deletion) is the applier's reaction in
-        // hook_index_register.
-        self.submit_retraction(SysFamily::Index, idx_id as u128)
+        // hook_index_register releases the index's claim on its circuit.
+        self.submit_retraction(SysFamily::Index, idx_id)
     }
 
     // -- Write helpers for system tables -----------------------------------

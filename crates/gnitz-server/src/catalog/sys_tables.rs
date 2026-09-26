@@ -41,8 +41,8 @@ pub(super) const SEQ_ID_CHECKPOINT_GEN: i64 = 2;
 pub(super) const SEQ_ID_TOPOLOGY: i64 = 3;
 
 pub(crate) const FIRST_USER_TABLE_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
-/// Above every column index, so a catalog index's `idx_<id>_…` children never
-/// collide with an FK circuit's, whose id is its column index.
+/// Above every column index, so a catalog index's claim on a circuit never
+/// equals an FK circuit's, whose claim id is its column index.
 pub(super) const FIRST_USER_INDEX_ID: i64 = MAX_COLUMNS as i64;
 /// The first id `allocate_ids` hands out.
 pub(super) const FIRST_ALLOCATED_ID: i64 = FIRST_USER_INDEX_ID;
@@ -82,8 +82,8 @@ pub(super) use gnitz_wire::PkColList;
 // instead.
 //
 // The two relation families decode a wire `Batch`, which is what every caller
-// holds; the other three stay generic over `RowSource`, which a `StoredRow` and
-// a positioned `ReadCursor` also satisfy.
+// holds; the rest are generic over `RowSource`, so a stored row or a positioned
+// cursor decodes too.
 // ---------------------------------------------------------------------------
 
 /// What `register_relation` needs to build and register one relation: the values

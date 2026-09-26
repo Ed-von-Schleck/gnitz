@@ -64,7 +64,7 @@ impl RelationRegistry {
         let entry = self.tables.get_mut(&tid).expect("entry read above");
         (entry.store, entry.delta) = stores;
         for ix in &mut entry.indexes {
-            ix.store = Self::open_index_store(slot, recovery, budgets, &entry.directory, ix.index_id, ix.schema())?;
+            ix.store = Self::open_index_store(slot, recovery, budgets, &entry.directory, ix.cols, ix.schema())?;
         }
         let mut targets: Vec<&mut SecondaryIndex> = entry.indexes.iter_mut().filter(|ix| !ix.resumed()).collect();
         super::ingest::fill_indexes(&entry.store, chunk_rows, tid, &mut targets)?;

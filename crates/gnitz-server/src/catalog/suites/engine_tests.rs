@@ -256,7 +256,7 @@ fn test_raised_counter_survives_drop_and_flush() {
             )
             .unwrap();
         assert!(engine.next_id > tid);
-        engine.submit_retraction(SysFamily::Table, tid as u128).unwrap();
+        engine.submit_retraction(SysFamily::Table, tid).unwrap();
         engine.flush_all_system_tables().unwrap();
         engine.close();
     }

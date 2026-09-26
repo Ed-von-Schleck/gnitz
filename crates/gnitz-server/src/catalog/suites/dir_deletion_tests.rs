@@ -39,7 +39,7 @@ fn sweep_declines_while_an_applied_change_is_queued() {
     let tbl_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
     let _ = engine.drain_pending_broadcasts();
 
-    engine.submit_retraction(SysFamily::Table, tid as u128).unwrap();
+    engine.submit_retraction(SysFamily::Table, tid).unwrap();
     engine.reclaim_orphan_dirs();
     assert!(
         Path::new(&tbl_dir).exists(),
@@ -150,22 +150,22 @@ fn gc_reclaims_orphan_index_dir() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let idx_id = engine.create_index("public.t", &["val"], false).unwrap();
+    engine.create_index("public.t", &["val"], false).unwrap();
 
     let tbl_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
-    let index_child = |id| {
+    let index_child = |cols: &[u32]| {
         ChildAddr {
-            kind: ChildKind::Index(id),
+            kind: ChildKind::Index(gnitz_wire::PkColList::from_slice(cols)),
             slot: Slot::SOLO,
         }
         .dir(&tbl_dir)
     };
-    let live_idx = index_child(idx_id);
+    let live_idx = index_child(&[1]);
     assert!(Path::new(&live_idx).exists(), "live index dir must exist");
 
-    // A fabricated orphan index dir, plus a non-index sub-dir the sweep must
-    // leave alone.
-    let ghost_idx = index_child(idx_id + 9999);
+    // A fabricated orphan index dir on a column list no circuit covers, plus a
+    // non-index sub-dir the sweep must leave alone.
+    let ghost_idx = index_child(&[0, 1]);
     std::fs::create_dir_all(&ghost_idx).unwrap();
     let non_idx = format!("{tbl_dir}/data_keep");
     std::fs::create_dir_all(&non_idx).unwrap();
@@ -197,7 +197,7 @@ fn gc_leaves_live_entities_untouched() {
     bb.end_row();
     engine.ingest_to_family(t1, &bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
-    let i1 = engine.create_index("public.flushed", &["val"], false).unwrap();
+    engine.create_index("public.flushed", &["val"], false).unwrap();
 
     let t2 = engine.create_table("public.empty", &cols, &[0]).unwrap();
 
@@ -208,7 +208,7 @@ fn gc_leaves_live_entities_untouched() {
     let dirs = [
         relation_dir(&dir, RelationKind::BaseTable, t1),
         ChildAddr {
-            kind: ChildKind::Index(i1),
+            kind: ChildKind::Index(gnitz_wire::PkColList::from_slice(&[1])),
             slot: Slot::SOLO,
         }
         .dir(&relation_dir(&dir, RelationKind::BaseTable, t1)),

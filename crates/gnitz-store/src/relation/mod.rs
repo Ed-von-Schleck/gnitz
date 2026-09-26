@@ -40,16 +40,14 @@ pub struct SecondaryIndex {
     /// single-column case. Dedup/lookup is exact ordered-list equality on
     /// `cols.as_slice()`; order is significant (it drives leading-prefix seeks).
     cols: PkColList,
-    /// The id this store's directory is named by — the creator's, even after a
-    /// second index promoted it.
-    index_id: i64,
     /// Full-arity span-encode plan, precomputed at registration so the per-push
     /// consumers do no per-call spec rebuild. It survives every column ALTER of
     /// the owner — [`RelationRegistry::swap_schema`] rejects any descriptor that
     /// would not leave it valid.
-    /// Excludes `is_unique`, which changes while the index lives.
     key_spec: crate::schema::IndexKeySpec,
-    is_unique: bool,
+    /// Every holder of this circuit: a catalog index's id, or an FK circuit's
+    /// column index; the circuit lives while one remains.
+    claims: Vec<(i64, bool)>,
     /// Whether `cols` covers the owner's PK, so the index can never collide.
     covers_pk: bool,
 }
@@ -61,10 +59,6 @@ impl SecondaryIndex {
         self.cols
     }
 
-    pub fn id(&self) -> i64 {
-        self.index_id
-    }
-
     pub fn schema(&self) -> SchemaDescriptor {
         *self.store.schema()
     }
@@ -74,7 +68,12 @@ impl SecondaryIndex {
     }
 
     pub fn is_unique(&self) -> bool {
-        self.is_unique
+        self.claims.iter().any(|&(_, u)| u)
+    }
+
+    /// `(claim id, unique)` of every holder of this circuit.
+    pub fn claims(&self) -> &[(i64, bool)] {
+        &self.claims
     }
 
     /// Non-compacting cursor over this index's store, in the index schema.
@@ -264,7 +263,7 @@ impl Relation {
     /// The unique secondary indexes a write must still check: one covering the
     /// PK cannot collide, so it is not among them.
     pub fn unique_indexes_to_check(&self) -> impl Iterator<Item = &SecondaryIndex> + '_ {
-        self.indexes.iter().filter(|ic| ic.is_unique && !ic.covers_pk)
+        self.indexes.iter().filter(|ic| ic.is_unique() && !ic.covers_pk)
     }
 
     /// Non-compacting cursor over this relation's store.
@@ -308,7 +307,7 @@ impl Relation {
         }
     }
 
-    /// Materialize every positive-weight row of this relation's store.
+    /// Materialize every row of this relation's store whose net weight is non-zero.
     pub fn full_scan(&self) -> std::rc::Rc<Batch> {
         self.store.held().full_scan()
     }
@@ -482,26 +481,31 @@ impl RelationRegistry {
     }
 
     /// Enter a secondary index on `owner` over `cols`, filled from this process's
-    /// slice of the owner, or promote the one already on `cols` to unique. On
-    /// `Err` nothing is entered. `is_unique` is trusted: a duplicate can straddle
-    /// two workers' slices, so only the caller can check it.
+    /// slice of the owner, or add a claim to the one already on `cols`. On
+    /// `Err` nothing is entered. `index_id` is the claim's id. `is_unique` is
+    /// trusted: a duplicate can straddle two workers' slices, so only the caller
+    /// can check it.
     pub fn add_index(&mut self, owner: i64, index_id: i64, cols: &[u32], is_unique: bool) -> Result<(), StoreError> {
         let (owner_schema, owner_dir) = {
             let e = self.index_owner(owner)?;
             (e.schema(), e.directory.clone())
         };
         if let Some(ix) = self.relation_mut(owner).and_then(|e| e.index_on_mut(cols)) {
-            ix.is_unique |= is_unique;
+            // The IDX_TAB net bound keeps one live row per id, applied once per process.
+            debug_assert!(
+                ix.claims.iter().all(|&(id, _)| id != index_id),
+                "index {index_id} claimed twice"
+            );
+            ix.claims.push((index_id, is_unique));
             return Ok(());
         }
         let (key_spec, index_schema) =
             crate::schema::index_spec_and_schema(cols, &owner_schema).map_err(StoreError::rejected)?;
         let mut ix = SecondaryIndex {
             cols: PkColList::from_slice(cols),
-            index_id,
             store: Store::Absent(Box::new(index_schema)),
             key_spec,
-            is_unique,
+            claims: vec![(index_id, is_unique)],
             covers_pk: owner_schema.covers_pk(cols),
         };
         if self.residency.owns_stores() {
@@ -510,7 +514,7 @@ impl RelationRegistry {
                 self.rederive_source(false),
                 self.store_budgets(),
                 &owner_dir,
-                index_id,
+                PkColList::from_slice(cols),
                 index_schema,
             )?;
             let owner_store = &self.tables[&owner].store;
@@ -520,34 +524,31 @@ impl RelationRegistry {
         Ok(())
     }
 
-    /// `slot`'s store of index `index_id` over the relation at `owner_dir`.
+    /// `slot`'s store of the index on `cols` over the relation at `owner_dir`.
     fn open_index_store(
         slot: Slot,
         recovery: RecoverySource,
         budgets: StoreBudgets,
         owner_dir: &str,
-        index_id: i64,
+        cols: PkColList,
         schema: SchemaDescriptor,
     ) -> Result<Store, StoreError> {
-        let dir = ChildAddr { kind: ChildKind::Index(index_id), slot }.dir(owner_dir);
+        let dir = ChildAddr { kind: ChildKind::Index(cols), slot }.dir(owner_dir);
         Table::new(&dir, schema, recovery, budgets)
             .map(|t| Store::Held(Box::new(t)))
-            .map_err(|e| StoreError::storage(format!("open index {index_id} (dir={dir})"), e))
+            .map_err(|e| StoreError::storage(format!("open index on columns {:?} (dir={dir})", cols.as_slice()), e))
     }
 
-    /// Remove `id`'s circuit on `cols`, dropping its store. A no-op when no such
-    /// circuit is registered.
-    pub fn remove_index(&mut self, id: i64, cols: &[u32]) {
-        if let Some(entry) = self.tables.get_mut(&id) {
-            entry.indexes.retain(|ix| ix.cols.as_slice() != cols);
+    /// Remove `claim` from whichever of `owner`'s circuits holds it, dropping a
+    /// circuit left with none. A no-op when the owner or claim is absent.
+    pub fn release_index(&mut self, owner: i64, claim: i64) {
+        let Some(entry) = self.tables.get_mut(&owner) else {
+            return;
+        };
+        for ix in &mut entry.indexes {
+            ix.claims.retain(|&(id, _)| id != claim);
         }
-    }
-
-    /// Set the uniqueness flag of the one circuit on `cols` in place.
-    pub fn set_index_unique(&mut self, id: i64, cols: &[u32], is_unique: bool) {
-        if let Some(ix) = self.relation_mut(id).and_then(|e| e.index_on_mut(cols)) {
-            ix.is_unique = is_unique;
-        }
+        entry.indexes.retain(|ix| !ix.claims.is_empty());
     }
 
     /// Publish a new column schema for a registered base table in place (any

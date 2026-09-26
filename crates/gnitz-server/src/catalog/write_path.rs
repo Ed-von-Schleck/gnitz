@@ -3,6 +3,7 @@
 //! orphan-directory sweep.
 
 use super::*;
+use gnitz_store::ops::op_negate;
 
 impl CatalogEngine {
     // -- The applied-delta entry points ----------------------------------------
@@ -36,29 +37,30 @@ impl CatalogEngine {
         }
         let mut owners = net_dead;
         // A view's segments drop in its own batch, unless the bundle already names them.
-        let segs: Vec<i64> = self
-            .ids_naming(SysFamily::View, gnitz_wire::VIEWTAB_PAY_OWNER_VIEW_ID, &owners)
-            .into_iter()
-            .filter(|s| owners.binary_search(s).is_err())
-            .collect();
-        if !segs.is_empty() {
-            let mut merged = self.retract_pk_list(SysFamily::View, segs.iter().map(|&s| s as u128).collect());
-            merged.append_batch(&batch, 0, batch.len());
-            batch = merged;
-            owners.extend(segs);
-            owners.sort_unstable();
+        if family == SysFamily::View {
+            let segs = self.sys_rows_where(SysFamily::View, |s, i| {
+                owners
+                    .binary_search(&(payload_u64(s, i, gnitz_wire::VIEWTAB_PAY_OWNER_VIEW_ID) as i64))
+                    .is_ok()
+                    && owners.binary_search(&(s.get_pk(i) as i64)).is_err()
+            });
+            if !segs.is_empty() {
+                owners.extend((0..segs.len()).map(|i| segs.get_pk(i) as i64));
+                owners.sort_unstable();
+                let mut merged = op_negate(segs);
+                merged.append_batch(&batch, 0, batch.len());
+                batch = merged;
+            }
         }
-        let indices = self.retract_pk_list(
-            SysFamily::Index,
-            self.ids_naming(SysFamily::Index, gnitz_wire::IDXTAB_PAY_OWNER_ID, &owners)
-                .into_iter()
-                .map(|id| id as u128)
-                .collect(),
-        );
+        let indices = op_negate(self.sys_rows_where(SysFamily::Index, |s, i| {
+            owners
+                .binary_search(&(payload_u64(s, i, gnitz_wire::IDXTAB_PAY_OWNER_ID) as i64))
+                .is_ok()
+        }));
         // A SERIAL row's key is its table id.
-        let sequences = self.retract_pk_list(SysFamily::Sequence, owners.iter().map(|&o| o as u128).collect());
-        let circuits = self.retract_bands(SysFamily::CircuitNodes, &owners);
-        let columns = self.retract_bands(SysFamily::Column, &owners);
+        let sequences = self.retract_under(SysFamily::Sequence, &owners);
+        let circuits = self.retract_under(SysFamily::CircuitNodes, &owners);
+        let columns = self.retract_under(SysFamily::Column, &owners);
         vec![
             (SysFamily::Index, indices),
             (SysFamily::Sequence, sequences),
@@ -66,6 +68,18 @@ impl CatalogEngine {
             (SysFamily::CircuitNodes, circuits),
             (SysFamily::Column, columns),
         ]
+    }
+
+    /// The negation of every live row of `family` whose leading key column is one of
+    /// `ids` (strictly ascending): each row for a single-column key, each owner's band
+    /// for a pair.
+    pub(in crate::catalog) fn retract_under(&self, family: SysFamily, ids: &[i64]) -> Batch {
+        debug_assert!(ids.windows(2).all(|w| w[0] < w[1]));
+        let mut batch = Batch::with_capacity(family.schema(), 0);
+        for &id in ids {
+            self.for_each_row_under(family, id, |c| c.copy_current_row_into(&mut batch, -c.current_weight));
+        }
+        batch
     }
 
     /// Ingest one delta into its family's store and fire its hooks.
@@ -93,15 +107,6 @@ impl CatalogEngine {
     pub(crate) fn ddl_sync(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
         let family = SysFamily::from_id(table_id).ok_or_else(|| "ddl_sync only for system tables".to_string())?;
         self.apply_family(family, batch)
-    }
-
-    // -- System table accessors ------------------------------------------------
-
-    /// This family's relation, from the registry that owns it.
-    pub(in crate::catalog) fn sys_relation(&self, family: SysFamily) -> &Relation {
-        self.registry
-            .relation(family.id())
-            .expect("every system family is registered at open")
     }
 
     // -- Broadcast queue, applied zone, directory sweep -------------------------
@@ -147,7 +152,7 @@ impl CatalogEngine {
         self.drain_pending_broadcasts()
             .into_iter()
             .rev()
-            .try_for_each(|(family, batch)| self.apply_family(family, gnitz_store::ops::op_negate(batch)))
+            .try_for_each(|(family, batch)| self.apply_family(family, op_negate(batch)))
             .map_err(|e| {
                 format!(
                     "Stage-A DDL compensation failed — catalog cannot be restored, \

@@ -161,13 +161,11 @@ impl RelationRegistry {
                 }
                 continue;
             };
-            // Matched on the circuit's own `index_id`, since a promoted circuit
-            // outlives the IDX_TAB row that named it.
             for child in subdir_names(&full).unwrap_or_default() {
-                let Some(ChildAddr { kind: ChildKind::Index(id), .. }) = ChildAddr::parse(&child) else {
+                let Some(ChildAddr { kind: ChildKind::Index(cols), .. }) = ChildAddr::parse(&child) else {
                     continue;
                 };
-                if entry.indexes().iter().any(|ix| ix.id() == id) {
+                if entry.index_on(cols.as_slice()).is_some() {
                     continue;
                 }
                 let child_full = format!("{full}/{child}");

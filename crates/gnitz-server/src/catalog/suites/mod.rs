@@ -88,6 +88,14 @@ fn idx_weights_for(engine: &CatalogEngine, idx_id: i64) -> Vec<i64> {
     v
 }
 
+/// Live rows of `family` whose leading key column is `leading` — for a table's
+/// TABLE_TAB row, 1 after a clean rename and 2+ for a persistent ghost.
+fn rows_under(engine: &CatalogEngine, family: SysFamily, leading: i64) -> usize {
+    let mut count = 0;
+    engine.for_each_row_under(family, leading, |_| count += 1);
+    count
+}
+
 fn count_records(mut c: ReadCursor) -> usize {
     let mut count = 0;
     while c.valid {

@@ -1,9 +1,9 @@
-//! Catalog id-registry: the `sys_columns` → `ColumnDef` readers, name lookups,
+//! Catalog id-registry: the system-table reads (point row, leading-key band,
+//! filtered scan), the `sys_columns` → `ColumnDef` readers, name lookups,
 //! catalog object-id allocation, and `_sequences` — the master scalars (next id,
 //! checkpoint generation, topology word) and user SERIAL ranges.
 
 use super::*;
-use gnitz_expr::payload_str;
 
 /// Operator-state format version. Bump on any change to an operator-state
 /// schema; a mismatch marks every Rederive view invalid at boot. Shard and
@@ -17,37 +17,68 @@ pub(in crate::catalog) fn topology_word(worker_count: u32) -> u64 {
     ((worker_count as u64) << 32) | STATE_FORMAT as u64
 }
 
-impl CatalogEngine {
-    // -- Read column definitions from sys_columns --------------------------
+/// The OPK of a U64 system id — also the leading-column prefix of a pair-keyed
+/// family's key. Every system PK column is U64 (asserted beside `SYS_FAMILIES`).
+fn sys_key(id: i64) -> [u8; 8] {
+    (id as u64).to_be_bytes()
+}
 
-    /// `owner_id`'s live column records must be keyed 0,1,2,… with no gap or
-    /// duplicate: `build_schema_from_col_defs` maps columns positionally.
-    pub(in crate::catalog) fn check_column_contiguity(&self, owner_id: i64) -> Result<(), String> {
-        let mut keyed = Vec::new();
-        self.for_each_row_under(SysFamily::Column, owner_id, |c| {
-            keyed.push(gnitz_wire::unpack_pair_pk(c.current_key_narrow()).1)
-        });
-        match keyed
-            .into_iter()
-            .zip(0u64..)
-            .find(|(actual, expected)| actual != expected)
-        {
-            Some((actual, expected)) => Err(format!(
-                "entity (owner_id={owner_id}): column records are non-contiguous; \
-                 expected index {expected}, got {actual}"
-            )),
-            None => Ok(()),
-        }
+impl CatalogEngine {
+    // -- System-table reads ---------------------------------------------------
+
+    /// This family's relation, from the registry that owns it.
+    pub(in crate::catalog) fn sys_relation(&self, family: SysFamily) -> &Relation {
+        self.registry
+            .relation(family.id())
+            .expect("every system family is registered at open")
     }
 
-    /// Column definitions for `owner_id`, in key order.
-    pub(in crate::catalog) fn read_column_defs(&self, owner_id: i64) -> Vec<ColumnDef> {
+    /// The live row of single-column-keyed `family` at `id`.
+    pub(in crate::catalog) fn live_sys_row(&self, family: SysFamily, id: i64) -> Option<StoredRow> {
+        self.sys_relation(family).live_row_at(&sys_key(id)).1
+    }
+
+    /// Visit every live row of `family` whose leading key column is `leading`: the
+    /// row itself for a single-column key, the owner's whole band for a pair.
+    pub(in crate::catalog) fn for_each_row_under(&self, family: SysFamily, leading: i64, f: impl FnMut(&ReadCursor)) {
+        self.sys_relation(family)
+            .for_each_positive_with_prefix(&sys_key(leading), f)
+    }
+
+    /// The live rows of `family` that `keep` selects, in key order.
+    pub(in crate::catalog) fn sys_rows_where(&self, family: SysFamily, keep: impl Fn(&Batch, usize) -> bool) -> Batch {
+        let scan = self.sys_relation(family).full_scan();
+        let hits: Vec<u32> = (0..scan.len() as u32).filter(|&i| keep(&scan, i as usize)).collect();
+        scan.ascending_subset(&hits)
+    }
+
+    // -- Read column definitions from sys_columns --------------------------
+
+    /// Column definitions for `owner_id`, in key order. Its records must be keyed
+    /// 0,1,2,… with no gap or duplicate: every consumer maps columns positionally.
+    pub(in crate::catalog) fn read_column_defs(&self, owner_id: i64) -> Result<Vec<ColumnDef>, String> {
         let mut defs = Vec::new();
+        let mut err = None;
         self.for_each_row_under(SysFamily::Column, owner_id, |c| {
+            if err.is_some() {
+                return;
+            }
+            let col_idx = gnitz_wire::unpack_pair_pk(c.current_key_narrow()).1;
+            if col_idx != defs.len() as u64 {
+                err = Some(format!(
+                    "entity (owner_id={owner_id}): column records are non-contiguous; \
+                     expected index {}, got {col_idx}",
+                    defs.len()
+                ));
+                return;
+            }
             let (src, row) = c.current_row_source();
-            defs.push(read_col_tab_row(src, row).expect("a stored COL_TAB row passed precheck_column_family"));
+            match read_col_tab_row(src, row) {
+                Ok(d) => defs.push(d),
+                Err(e) => err = Some(format!("entity (owner_id={owner_id}) column {col_idx}: {e}")),
+            }
         });
-        defs
+        err.map_or(Ok(defs), Err)
     }
 
     // -- Registry query methods -----------------------------------------------
@@ -56,11 +87,11 @@ impl CatalogEngine {
         self.caches.schema_by_name.contains_key(name)
     }
 
-    /// The ids of the live member relations (tables and views) of schema `sid`.
-    pub(in crate::catalog) fn schema_members(&self, sid: i64) -> Vec<i64> {
-        let mut ids = self.ids_naming(SysFamily::Table, gnitz_wire::RELTAB_PAY_SCHEMA_ID, &[sid]);
-        ids.extend(self.ids_naming(SysFamily::View, gnitz_wire::RELTAB_PAY_SCHEMA_ID, &[sid]));
-        ids
+    /// The live rows of relation family `family` (Table or View) in schema `sid`.
+    pub(in crate::catalog) fn schema_members(&self, family: SysFamily, sid: i64) -> Batch {
+        self.sys_rows_where(family, |s, i| {
+            payload_u64(s, i, gnitz_wire::RELTAB_PAY_SCHEMA_ID) as i64 == sid
+        })
     }
 
     /// Raise the id counter past the id leading each of `batch`'s `rows`, when
@@ -88,41 +119,31 @@ impl CatalogEngine {
         Ok(base)
     }
 
-    /// `table_id`'s live `sys_tables` or `sys_views` row and the name of the
-    /// schema it sits in (`"?"` for none).
-    fn relation_name_row(&self, table_id: i64) -> Option<(StoredRow, &str)> {
-        let row = self
-            .live_sys_row(SysFamily::Table, table_id)
-            .or_else(|| self.live_sys_row(SysFamily::View, table_id))?;
-        let (src, ri) = row.source();
-        let sid = payload_u64(src, ri, gnitz_wire::RELTAB_PAY_SCHEMA_ID) as i64;
-        let schema = self.caches.schema_by_id.get(&sid).map_or("?", String::as_str);
-        Some((row, schema))
-    }
-
-    /// The qualified `(schema, name)` of `table_id`, or `("?", "?")` when the
-    /// catalog has no entry.
+    /// The qualified `(schema, name)` of `table_id` from its live `sys_tables` or
+    /// `sys_views` row; `"?"` for a part the catalog has no entry for.
     pub(crate) fn qualified_name_or_unknown(&self, table_id: i64) -> (String, String) {
-        let Some((row, schema)) = self.relation_name_row(table_id) else {
+        let Some(row) = self
+            .live_sys_row(SysFamily::Table, table_id)
+            .or_else(|| self.live_sys_row(SysFamily::View, table_id))
+        else {
             return ("?".into(), "?".into());
         };
         let (src, ri) = row.source();
+        let sid = payload_u64(src, ri, gnitz_wire::RELTAB_PAY_SCHEMA_ID) as i64;
+        let schema = self.caches.schema_by_id.get(&sid).map_or("?", String::as_str);
         (schema.to_string(), payload_string(src, ri, gnitz_wire::RELTAB_PAY_NAME))
     }
 
     /// `table_id` as `schema.name`, or `?.?` when the catalog has no entry.
     pub(crate) fn qualified_name(&self, table_id: i64) -> String {
-        let Some((row, schema)) = self.relation_name_row(table_id) else {
-            return gnitz_wire::qualified_key("?", "?");
-        };
-        let (src, ri) = row.source();
-        gnitz_wire::qualified_key(schema, payload_str(src, ri, gnitz_wire::RELTAB_PAY_NAME))
+        let (schema, name) = self.qualified_name_or_unknown(table_id);
+        gnitz_wire::qualified_key(&schema, &name)
     }
 
     /// `table_id`'s column names at `col_indices`, `, `-joined; `?` for one the
     /// catalog does not hold.
     pub(crate) fn column_names(&self, table_id: i64, col_indices: &[u32]) -> String {
-        let defs = self.read_column_defs(table_id);
+        let defs = self.read_column_defs(table_id).unwrap_or_default();
         col_indices
             .iter()
             .map(|&ci| defs.get(ci as usize).map_or("?", |d| d.name.as_str()))

@@ -138,9 +138,8 @@ fn a_zero_weight_row_is_not_a_zset_element() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// `retract_bands` and `retract_pk_list` emit a hard `-1` after gating on
-/// the live weight, so a system row left above 1 is under-retracted by `w - 1`
-/// and leaves a permanent live ghost.
+/// A system store runs no `enforce_unique_pk`, so a weight outside `{0, 1}` is a
+/// duplicate live head or a persistent negative ghost.
 #[test]
 fn a_system_row_may_only_be_written_at_weight_one() {
     let (engine, dir) = open("precheck_weight_one");

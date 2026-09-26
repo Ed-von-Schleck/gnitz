@@ -443,7 +443,7 @@ impl CatalogEngine {
                         return Err("a column-ALTER may only set is_nullable 0→1 (DROP NOT NULL)".into());
                     }
                     let (hides, unnulls) = (new.is_hidden, new.is_nullable != old.is_nullable);
-                    let prospective = self.col_defs_with(owner_id, col_idx, new);
+                    let prospective = self.col_defs_with(owner_id, col_idx, new)?;
                     check_col_defs(RelationKind::BaseTable, &prospective)
                         .map_err(|e| format!("cannot ALTER COLUMN on table {owner_id}: {e}"))?;
                     let op = match (hides, unnulls) {
@@ -504,13 +504,13 @@ impl CatalogEngine {
     /// `owner_id`'s column records as this batch's `+1` row for `col_idx` leaves
     /// them: the decoded row replaces the live record at that index, or extends
     /// the set when the transition appends one.
-    fn col_defs_with(&self, owner_id: i64, col_idx: u64, row: ColumnDef) -> Vec<ColumnDef> {
-        let mut defs = self.read_column_defs(owner_id);
+    fn col_defs_with(&self, owner_id: i64, col_idx: u64, row: ColumnDef) -> Result<Vec<ColumnDef>, String> {
+        let mut defs = self.read_column_defs(owner_id)?;
         match defs.get_mut(col_idx as usize) {
             Some(live) => *live = row,
             None => defs.push(row),
         }
-        defs
+        Ok(defs)
     }
 
     /// ADD COLUMN: one unpaired `+1` appending a trailing nullable payload
@@ -536,7 +536,7 @@ impl CatalogEngine {
         }
         // The PK rules are not re-run: a trailing non-PK append cannot invalidate
         // an already-valid PK list.
-        let prospective = self.col_defs_with(owner_id, col_idx, appended.clone());
+        let prospective = self.col_defs_with(owner_id, col_idx, appended.clone())?;
         check_col_defs(RelationKind::BaseTable, &prospective)
             .map_err(|e| format!("cannot ADD COLUMN on table {owner_id}: {e}"))?;
         // A new column over existing rows is unconditionally nullable, carries
@@ -711,7 +711,10 @@ impl CatalogEngine {
             }
         }
         for &sid in net_dead {
-            let n = self.schema_members(sid).len();
+            let n: usize = [SysFamily::Table, SysFamily::View]
+                .into_iter()
+                .map(|f| self.schema_members(f, sid).len())
+                .sum();
             if n > 0 {
                 return Err(format!("Schema not empty: {n} relation(s) remain; drop them first"));
             }
@@ -754,16 +757,7 @@ impl CatalogEngine {
 
         for i in batch.live_rows() {
             let id = batch.get_pk(i) as i64;
-
-            // Reject any gap/duplicate in the column-index sequence, which would
-            // mismap columns downstream. Rejecting here — before the appliers
-            // mutate the caches — leaves clean state on a failed DDL. This is the
-            // only place the contiguity rule runs: the register hooks read the
-            // owner's defs positionally, so the paths that skip precheck (boot
-            // replay, worker ddl_sync) rely on it having held when the rows were
-            // first written.
-            self.check_column_contiguity(id)?;
-            let col_defs = self.read_column_defs(id);
+            let col_defs = self.read_column_defs(id)?;
             let (sid, name, pk, kind) = if is_table {
                 let r = read_table_tab_row(batch, i).map_err(|e| format!("{e} (tid={id})"))?;
                 (r.schema_id, r.name, r.pk, r.kind)
@@ -857,7 +851,7 @@ impl CatalogEngine {
                 self.qualified_name_or_unknown(owner_id).1
             )
         })?;
-        let defs = self.read_column_defs(owner_id);
+        let defs = self.read_column_defs(owner_id)?;
         if let Some(&c) = cols
             .iter()
             .find(|&&c| defs.get(c as usize).is_some_and(|d| d.is_hidden))
@@ -920,12 +914,16 @@ impl CatalogEngine {
             if is_lone_pk {
                 continue;
             }
-            // Scan sys_indices (pre-drop: the rows being dropped are still
-            // present) for another unique index on this column that survives.
+            // The claims are pre-drop: this batch has not been applied yet.
             let unique_remains = self
-                .indices_on_cols(owner_id, &[src_col as u32])
-                .iter()
-                .any(|&(id, u)| u && net_dead.binary_search(&id).is_err());
+                .registry
+                .relation(owner_id)
+                .and_then(|r| r.index_on(&[src_col as u32]))
+                .is_some_and(|ix| {
+                    ix.claims()
+                        .iter()
+                        .any(|&(id, u)| u && net_dead.binary_search(&id).is_err())
+                });
             if !unique_remains {
                 return Err(format!(
                     "Integrity violation: index on '{}' is referenced by a \

@@ -364,7 +364,7 @@ fn test_nonempty_schema_drop_rejected() {
     assert!(!engine.schema_is_empty("s"), "precondition: schema has a member");
 
     // A direct SCHEMA_TAB -1 (bypassing any cascade) is rejected by the guard.
-    let err = engine.submit_retraction(SysFamily::Schema, sid as u128).unwrap_err();
+    let err = engine.submit_retraction(SysFamily::Schema, sid).unwrap_err();
     assert!(
         err.contains("Schema not empty"),
         "expected a non-empty-schema rejection, got: {err}"
@@ -451,7 +451,7 @@ fn test_restart_long_strings() {
         assert!(engine.get_by_name("longtest", "tbl").is_some());
         // Verify column name survived out-of-line blob round-trip
         let tid = engine.get_by_name("longtest", "tbl").unwrap();
-        let col_defs = engine.read_column_defs(tid);
+        let col_defs = engine.read_column_defs(tid).unwrap();
         assert_eq!(col_defs.len(), 2);
         assert_eq!(col_defs[1].name, long_name, "Long column name corrupted after restart");
         engine.close();
@@ -766,7 +766,7 @@ fn drop_table_retracts_its_serial_sequence_row() {
     engine.submit(SysFamily::Sequence, delta).unwrap();
     assert_eq!(engine.sequence_value(tid), Some(64));
 
-    engine.submit_retraction(SysFamily::Table, tid as u128).unwrap();
+    engine.submit_retraction(SysFamily::Table, tid).unwrap();
     assert_eq!(engine.sequence_value(tid), None, "the drop must retract the SERIAL row");
 
     engine.close();
@@ -790,7 +790,7 @@ fn drop_cascade_broadcasts_index_owner_columns_in_order() {
 
     // Submit the table retraction; `submit` retracts the owned index (IDX) ahead
     // of it and the columns (COL) behind it.
-    engine.submit_retraction(SysFamily::Table, tid as u128).unwrap();
+    engine.submit_retraction(SysFamily::Table, tid).unwrap();
 
     // Collect the broadcast family-id sequence.
     let tids: Vec<i64> = engine.drain_pending_broadcasts().iter().map(|(f, _)| f.id()).collect();
@@ -1066,7 +1066,7 @@ fn set_based_table_drop_queues_one_batch_per_family() {
     }
     let _ = engine.drain_pending_broadcasts();
 
-    let drop = engine.retract_pk_list(SysFamily::Table, tids.iter().map(|&t| t as u128).collect());
+    let drop = engine.retract_under(SysFamily::Table, &tids);
     engine.submit(SysFamily::Table, drop).unwrap();
 
     let families: Vec<SysFamily> = engine.drain_pending_broadcasts().into_iter().map(|(f, _)| f).collect();
@@ -1100,13 +1100,6 @@ fn view_with_segment(engine: &mut CatalogEngine) -> (i64, i64) {
     (v, s)
 }
 
-/// Live rows of pair-keyed `family` under `leading`.
-fn band_rows(engine: &CatalogEngine, family: SysFamily, leading: i64) -> usize {
-    let mut count = 0;
-    engine.for_each_row_under(family, leading, |_| count += 1);
-    count
-}
-
 #[test]
 fn view_drop_retracts_its_segments() {
     let dir = temp_dir("view_drop_segments");
@@ -1114,14 +1107,14 @@ fn view_drop_retracts_its_segments() {
     let (v, s) = view_with_segment(&mut engine);
     let _ = engine.drain_pending_broadcasts();
 
-    engine.submit_retraction(SysFamily::View, v as u128).unwrap();
+    engine.submit_retraction(SysFamily::View, v).unwrap();
 
     let families: Vec<SysFamily> = engine.drain_pending_broadcasts().into_iter().map(|(f, _)| f).collect();
     assert_eq!(families, [SysFamily::View, SysFamily::CircuitNodes, SysFamily::Column]);
     for id in [v, s] {
         assert!(!engine.registry.has_id(id));
-        assert_eq!(band_rows(&engine, SysFamily::CircuitNodes, id), 0);
-        assert_eq!(band_rows(&engine, SysFamily::Column, id), 0);
+        assert_eq!(rows_under(&engine, SysFamily::CircuitNodes, id), 0);
+        assert_eq!(rows_under(&engine, SysFamily::Column, id), 0);
     }
 
     engine.close();
@@ -1134,7 +1127,7 @@ fn dropping_a_view_with_its_segment_retracts_the_segment_once() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let (v, s) = view_with_segment(&mut engine);
 
-    let drop = engine.retract_pk_list(SysFamily::View, vec![v as u128, s as u128]);
+    let drop = engine.retract_under(SysFamily::View, &[v, s]);
     engine.submit(SysFamily::View, drop).unwrap();
 
     assert!(!engine.registry.has_id(v) && !engine.registry.has_id(s));
