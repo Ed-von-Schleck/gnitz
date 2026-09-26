@@ -184,7 +184,6 @@ fn a_refused_recv_discards_its_queue_and_shuts_down() {
     let conn = r.client_conn(OwnedFd::from(local));
     let fd = conn.fd();
     r.register_conn(&conn, Box::new(Plain::new()));
-    conn.mark_established();
 
     let mut wire = framed(&[0x42u8; 100]);
     wire.extend_from_slice(&((gnitz_wire::MAX_FRAME_PAYLOAD + 1) as u32).to_le_bytes());
@@ -505,7 +504,6 @@ fn one_recv_completion_queues_a_whole_pipelined_run() {
     let r = make_reactor();
     let conn = r.client_conn(OwnedFd::from(local));
     r.register_conn(&conn, Box::new(Plain::new()));
-    conn.mark_established();
 
     const N: usize = 12;
     let wire: Vec<u8> = (0..N).flat_map(|i| framed(&vec![i as u8; 600])).collect();

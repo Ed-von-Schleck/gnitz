@@ -5,7 +5,7 @@ use super::*;
 
 use std::borrow::Borrow;
 
-use ipc::{WireData, WireMsg, FRAME_CAP};
+use ipc::{WireData, WireMsg};
 
 // ---------------------------------------------------------------------------
 // PendingScan
@@ -128,7 +128,7 @@ fn send_train_frame<'a>(
         return Ok(batch.len());
     }
     let (chunk, size) = batch.wire_chunk_within(start, frame(false).size(), budget);
-    if size > FRAME_CAP {
+    if size > gnitz_wire::MAX_FRAME_PAYLOAD {
         return Err(crate::runtime::wire::oversized_frame_message(size).into());
     }
     let end = start + chunk.rows();

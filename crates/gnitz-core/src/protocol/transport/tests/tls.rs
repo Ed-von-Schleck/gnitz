@@ -1,9 +1,10 @@
 use super::*;
 use crate::connection::{Interest, Reply, Request, Session};
-use crate::protocol::transport::{hello_handshake, poll_fd, CONNECT_TIMEOUT};
+use crate::protocol::transport::{hello_handshake, poll_fd};
 use crate::test_support::{framed, reply_ctrl};
 use crate::ClientError;
 use gnitz_foundation::posix_io::set_sockopt_int;
+use gnitz_wire::CONNECT_TIMEOUT;
 use std::io::Read;
 use std::net::TcpListener;
 use std::sync::mpsc;
@@ -26,8 +27,8 @@ type ServerEnd = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
 /// How far the loopback peer goes before its script runs.
 #[derive(Clone, Copy, PartialEq)]
 enum Peer {
-    /// Completes the TLS handshake and acknowledges the HELLO.
-    AckHello,
+    /// Completes the TLS handshake and exchanges HELLOs.
+    Hello,
     /// Completes the TLS handshake, then says nothing.
     SilentTls,
     /// Accepts the TCP connection and never starts TLS.
@@ -49,14 +50,14 @@ fn read_frame(end: &mut ServerEnd) -> Vec<u8> {
 
 impl Loopback {
     fn start(script: impl FnOnce(ServerEnd) + Send + 'static) -> Self {
-        Self::spawn(None, Peer::AckHello, |end| script(end.unwrap()))
+        Self::spawn(None, Peer::Hello, |end| script(end.unwrap()))
     }
 
     /// `rcvbuf` pins the accepted socket's `SO_RCVBUF` (inherited from
     /// the listener) so the peer's window bounds what the client can push
     /// unread.
     fn start_with_rcvbuf(rcvbuf: Option<libc::c_int>, script: impl FnOnce(ServerEnd) + Send + 'static) -> Self {
-        Self::spawn(rcvbuf, Peer::AckHello, |end| script(end.unwrap()))
+        Self::spawn(rcvbuf, Peer::Hello, |end| script(end.unwrap()))
     }
 
     /// A peer that goes as far as `peer` says and then never answers,
@@ -96,13 +97,9 @@ impl Loopback {
             while end.conn.is_handshaking() {
                 end.conn.complete_io(&mut end.sock).unwrap();
             }
-            if peer == Peer::AckHello {
-                let hello = read_frame(&mut end);
-                assert_eq!(hello.len(), gnitz_wire::HELLO_PAYLOAD_LEN);
-                // `encode_hello_ack` frames the ACK itself.
-                let ack = gnitz_wire::encode_hello_ack();
-                end.write_all(&ack).unwrap();
-                end.flush().unwrap();
+            if peer == Peer::Hello {
+                assert_eq!(read_frame(&mut end), gnitz_wire::HELLO);
+                write_frame(&mut end, &gnitz_wire::HELLO);
             }
             script(Some(end));
         });
@@ -117,7 +114,6 @@ impl Loopback {
         let until = Some(Instant::now() + CONNECT_TIMEOUT);
         let mut t = ClientTransport::connect(&self.target, until).unwrap();
         hello_handshake(&mut t, until).unwrap();
-        assert_eq!(t.max_payload_len(), gnitz_wire::MAX_FRAME_PAYLOAD);
         t
     }
 

@@ -6,7 +6,7 @@
 //! relay carries its own source's shard columns. It **completes** when every
 //! worker has sent its TERMINAL frame into it, yielding a [`PendingRelay`].
 //!
-//! A worker publishes its partition as a `FRAME_CAP`-bounded train (see
+//! A worker publishes its partition as a `MAX_FRAME_PAYLOAD`-bounded train (see
 //! `worker/exchange.rs`), so a worker's list holds several frames and only the
 //! terminal one — flagged `scan_last` — reports the worker.
 //!

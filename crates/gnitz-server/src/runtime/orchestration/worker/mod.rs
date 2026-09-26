@@ -154,9 +154,8 @@ pub struct WorkerProcess {
     /// Reply trains, one frame emitted per SAL drain, front first: the master
     /// reads one lease at a time and a ring frees only in order.
     pending_streams: VecDeque<PendingScan>,
-    /// Per-frame wire budget of every reply train: [`ipc::FRAME_CAP`], or less
-    /// under `GNITZ_REPLY_FRAME_BUDGET`, so tests reach multi-frame trains on
-    /// small tables.
+    /// Per-frame wire budget of every reply train. `GNITZ_REPLY_FRAME_BUDGET`
+    /// lowers it, so tests reach multi-frame trains on small tables.
     reply_frame_budget: usize,
 }
 
@@ -198,8 +197,11 @@ impl WorkerProcess {
                 pending_relays: HashMap::new(),
             },
             pending_streams: VecDeque::new(),
-            reply_frame_budget: gnitz_foundation::env::env_num("GNITZ_REPLY_FRAME_BUDGET", ipc::FRAME_CAP)
-                .min(ipc::FRAME_CAP),
+            reply_frame_budget: gnitz_foundation::env::env_num(
+                "GNITZ_REPLY_FRAME_BUDGET",
+                gnitz_wire::MAX_FRAME_PAYLOAD,
+            )
+            .min(gnitz_wire::MAX_FRAME_PAYLOAD),
         }
     }
 

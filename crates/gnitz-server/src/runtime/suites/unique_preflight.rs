@@ -7,7 +7,7 @@
 
 use crate::runtime::w2m::fixtures::make_ring;
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
-use crate::runtime::wire::{unique_preflight_wire_schema, FRAME_CAP};
+use crate::runtime::wire::unique_preflight_wire_schema;
 use crate::runtime::worker::send_unique_preflight_keys;
 use crate::test_support::pk_only_schema;
 use gnitz_store::schema::key::PkBuf;
@@ -124,7 +124,15 @@ fn preflight_train_multi_frame_key_roundtrip() {
     .collect();
     let frame_schema = u128_frame_schema();
     with_test_ring(|writer, receiver| {
-        send_unique_preflight_keys(writer, 77, &frame_schema, 9001, FRAME_CAP, 4, &mut producer_of(&keys));
+        send_unique_preflight_keys(
+            writer,
+            77,
+            &frame_schema,
+            9001,
+            gnitz_wire::MAX_FRAME_PAYLOAD,
+            4,
+            &mut producer_of(&keys),
+        );
         let (got, frames) = drain_train(receiver, &frame_schema, 9001);
         assert_eq!(frames, 3, "9 keys at 4 per chunk");
         assert_eq!(got, keys);
@@ -139,7 +147,15 @@ fn preflight_train_exact_frame_boundary() {
     let keys: Vec<PkBuf> = (0..8u128).map(span_u128).collect();
     let frame_schema = u128_frame_schema();
     with_test_ring(|writer, receiver| {
-        send_unique_preflight_keys(writer, 77, &frame_schema, 42, FRAME_CAP, 4, &mut producer_of(&keys));
+        send_unique_preflight_keys(
+            writer,
+            77,
+            &frame_schema,
+            42,
+            gnitz_wire::MAX_FRAME_PAYLOAD,
+            4,
+            &mut producer_of(&keys),
+        );
         let (got, frames) = drain_train(receiver, &frame_schema, 42);
         assert_eq!(frames, 2, "no trailing empty frame");
         assert_eq!(got, keys);
@@ -153,7 +169,15 @@ fn preflight_train_exact_frame_boundary() {
 fn preflight_train_empty_partition_single_terminal_frame() {
     let frame_schema = u128_frame_schema();
     with_test_ring(|writer, receiver| {
-        send_unique_preflight_keys(writer, 77, &frame_schema, 7, FRAME_CAP, 4, &mut producer_of(&[]));
+        send_unique_preflight_keys(
+            writer,
+            77,
+            &frame_schema,
+            7,
+            gnitz_wire::MAX_FRAME_PAYLOAD,
+            4,
+            &mut producer_of(&[]),
+        );
         let slot = receiver.try_read_slot(0).expect("terminal frame");
         let ctrl = slot.control();
         assert_eq!(ctrl.hdr.status, WireStatus::Ok);
@@ -197,7 +221,15 @@ fn preflight_train_composite_wide_span_roundtrip() {
     };
     let keys = vec![span(7, 1), span(7, 2), span(9, 1)];
     with_test_ring(|writer, receiver| {
-        send_unique_preflight_keys(writer, 5, &frame_schema, 3, FRAME_CAP, 2, &mut producer_of(&keys));
+        send_unique_preflight_keys(
+            writer,
+            5,
+            &frame_schema,
+            3,
+            gnitz_wire::MAX_FRAME_PAYLOAD,
+            2,
+            &mut producer_of(&keys),
+        );
         let (got, _) = drain_train(receiver, &frame_schema, 3);
         assert_eq!(got, keys);
         assert_eq!(got[0].pk_bytes().len(), 16, "composite span is the full 16 bytes");

@@ -56,9 +56,13 @@ impl WorkerProcess {
     /// Publish this worker's exchange partition as a train of frames.
     fn publish_exchange(&self, view_id: i64, batch: &Batch, source_id: i64, pad: bool) {
         let block = crate::catalog::encode_schema_block(batch.schema());
-        let sent = reply::send_train(&self.w2m_writer, W2M_EXCHANGE_RING_ID, batch, ipc::FRAME_CAP, |last| {
-            exchange_frame(view_id, source_id, &block, last, pad)
-        });
+        let sent = reply::send_train(
+            &self.w2m_writer,
+            W2M_EXCHANGE_RING_ID,
+            batch,
+            gnitz_wire::MAX_FRAME_PAYLOAD,
+            |last| exchange_frame(view_id, source_id, &block, last, pad),
+        );
         // An exchange has no client to fault.
         if let Err(fault) = sent {
             gnitz_fatal_abort!("worker: exchange partition of view_id={view_id}: {fault}");

@@ -21,16 +21,14 @@ pub(crate) struct TlsCli {
     pub max_conns: u32,
 }
 
-/// TLS listener runtime inputs, threaded into `ServerExecutor::run` (hence
-/// `pub(crate)`): the rustls config, and this listener's admission policy — how
-/// many peers it admits, and how long an admitted one may stay unauthenticated.
+/// TLS listener runtime inputs: the rustls config and this listener's admission
+/// policy.
 pub(crate) struct TlsListener {
     pub cfg: std::sync::Arc<rustls::ServerConfig>,
-    /// How long an admitted peer may stay unauthenticated
-    /// (`GNITZ_TLS_HELLO_TIMEOUT_MS`, default 15 000 ms): HELLO must arrive within
-    /// this of accept. Set above the client's own connect deadline, so a client is
-    /// reaped only once it has given up itself.
-    pub pre_auth_window: std::time::Duration,
+    /// How long the TLS handshake and HELLO may take after accept
+    /// (`GNITZ_TLS_HELLO_TIMEOUT_MS`). The default outlasts the client's own
+    /// `CONNECT_TIMEOUT`, so only a client that has given up is reaped.
+    pub hello_timeout: std::time::Duration,
     /// Live sessions under the connection cap; each holds one [`Charge`] of it.
     live: Rc<Budget>,
 }
@@ -114,9 +112,9 @@ pub(crate) fn setup_tls_listener(data_dir: &str, cli: &TlsCli) -> Result<(TcpLis
     }
     let tl = TlsListener {
         cfg: config,
-        pre_auth_window: std::time::Duration::from_millis(gnitz_foundation::env::env_num(
+        hello_timeout: std::time::Duration::from_millis(gnitz_foundation::env::env_num(
             "GNITZ_TLS_HELLO_TIMEOUT_MS",
-            15_000,
+            (gnitz_wire::CONNECT_TIMEOUT * 3 / 2).as_millis() as u64,
         )),
         live: Budget::new(cli.max_conns as usize),
     };

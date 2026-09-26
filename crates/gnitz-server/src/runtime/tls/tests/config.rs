@@ -5,9 +5,6 @@ use std::io::Write;
 fn dev_cert_mint_builds_server_config() {
     let (cfg, dev_pem) = server_crypto(None, None).expect("dev-cert mint must succeed");
     assert_eq!(cfg.alpn_protocols, vec![ALPN_GNITZ.to_vec()]);
-    // 0-RTT stays off: replayable early data would be replayable DML once an
-    // auth layer grants authority. `gnitz-core`'s transport tests assert the
-    // client-side mirror.
     assert_eq!(cfg.max_early_data_size, 0, "0-RTT early data must be disabled");
     assert_eq!(cfg.send_tls13_tickets, 0, "and no resumption ticket is issued");
     assert!(cfg

@@ -138,11 +138,6 @@ impl Peer {
         r
     }
 
-    /// Raise the inbound frame ceiling to the established one, after HELLO.
-    pub fn mark_established(&self) {
-        self.conn.mark_established();
-    }
-
     /// Discard what is queued and close the transport. Idempotent.
     pub fn close(&self) {
         self.conn.abort();

@@ -75,12 +75,10 @@ pub(super) fn server_crypto(
         .with_single_cert(chain, key)
         .map_err(|e| format!("tls cert/key rejected: {e}"))?;
     cfg.alpn_protocols = vec![ALPN_GNITZ.to_vec()];
-    // gnitz connections are long-lived, so resumption tickets buy nothing, and
-    // emitting none saves the post-handshake `NewSessionTicket`: one record, and
-    // one `send_lock` acquisition ahead of connection_loop's HELLO ACK.
-    // 0-RTT stays off (`max_early_data_size` defaults to 0): once a future auth
-    // layer gives a session DML authority, replayable early data is replayable DML.
+    // Connections are long-lived: resumption buys nothing.
     cfg.send_tls13_tickets = 0;
+    // Early data is replayable.
+    cfg.max_early_data_size = 0;
     Ok((Arc::new(cfg), dev_pem))
 }
 

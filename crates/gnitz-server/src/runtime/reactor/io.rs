@@ -11,10 +11,6 @@ use gnitz_wire::{Deframer, FrameLenError};
 
 use super::wake_queue::WakeQueue;
 
-/// A new connection's frame ceiling, until [`ClientConn::mark_established`] raises
-/// it: an unauthenticated first frame sizes no allocation past a HELLO.
-const HELLO_PRE_HANDSHAKE_LEN: usize = gnitz_wire::HELLO_PAYLOAD_LEN;
-
 /// Lower/upper bounds on the global inbound-memory cap (see
 /// [`resolve_inbound_cap`]). The floor guarantees even a tiny memory budget
 /// admits at least one max-size frame; the ceiling caps the default on a
@@ -135,7 +131,7 @@ pub(crate) enum RecvEnd {
     Closed,
     /// The recv itself failed (`-ECONNRESET`, `-EBADF`, …).
     Socket,
-    /// A declared frame payload above the connection's ceiling.
+    /// A declared frame payload above `MAX_FRAME_PAYLOAD`.
     Oversize,
     /// The declared frame's `want` bytes would push the inbound budget past its cap.
     CapBreach { want: usize },
@@ -188,16 +184,11 @@ pub(crate) struct RecvQueue {
 impl RecvQueue {
     pub(crate) fn new(budget: Rc<Budget>) -> Self {
         RecvQueue {
-            deframer: Deframer::new(HELLO_PRE_HANDSHAKE_LEN),
+            deframer: Deframer::default(),
             frames: WakeQueue::default(),
             closed: false,
             budget,
         }
-    }
-
-    /// Raise the frame ceiling to the established one, after HELLO.
-    pub(crate) fn mark_established(&mut self) {
-        self.deframer.set_max_payload_len(gnitz_wire::MAX_FRAME_PAYLOAD);
     }
 
     pub(crate) fn recv_closed(&self) -> bool {
@@ -283,11 +274,6 @@ impl ClientConn {
     /// queued right now, not that the peer is gone.
     pub(crate) fn try_recv(&self) -> Option<RecvBuf> {
         self.q.borrow_mut().try_recv()
-    }
-
-    /// Raise the frame ceiling to the established one, after HELLO.
-    pub(crate) fn mark_established(&self) {
-        self.q.borrow_mut().mark_established();
     }
 }
 

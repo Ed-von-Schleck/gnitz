@@ -37,7 +37,7 @@ fn send_helpers_publish_on_the_request_id() {
 /// exports `GNITZ_REPLY_FRAME_BUDGET` does not reshape these frames.
 fn make_test_worker(catalog: *mut CatalogEngine, writer: W2mWriter) -> WorkerProcess {
     let mut wp = WorkerProcess::new(catalog, unsafe { std::mem::zeroed() }, writer);
-    wp.reply_frame_budget = ipc::FRAME_CAP;
+    wp.reply_frame_budget = gnitz_wire::MAX_FRAME_PAYLOAD;
     wp
 }
 
@@ -677,11 +677,11 @@ fn pending_streams_drain_two_trains_fifo() {
 }
 
 /// An oversized result enqueues a train instead of emitting a frame past
-/// `ipc::FRAME_CAP`; nothing is emitted until drain_sal.
+/// `gnitz_wire::MAX_FRAME_PAYLOAD`; nothing is emitted until drain_sal.
 #[test]
 fn an_oversized_reply_enqueues_a_train() {
     let schema = make_schema_u64_i64(); // 32 B/row on the wire
-    let rows = (ipc::FRAME_CAP / 32) + 4096;
+    let rows = (gnitz_wire::MAX_FRAME_PAYLOAD / 32) + 4096;
     let batch = Batch::zeroed(&schema, rows);
 
     let (region, writer) = ring_and_writer();
@@ -698,10 +698,8 @@ fn an_oversized_reply_enqueues_a_train() {
     );
 }
 
-/// A single row wider than a shrunken `reply_frame_budget` still ships: the
-/// budget is a split point, not a limit, so the frame goes out over budget and
-/// no fault is raised. Only [`ipc::FRAME_CAP`] — what the client can read — is
-/// a refusal.
+/// A row wider than `reply_frame_budget` still ships, alone in an over-budget
+/// frame, with no fault.
 #[test]
 fn a_row_wider_than_the_budget_ships_one_over_budget_frame() {
     let schema = string_schema();
@@ -732,13 +730,13 @@ fn a_row_wider_than_the_budget_ships_one_over_budget_frame() {
     }
 }
 
-/// A single row wider than [`ipc::FRAME_CAP`] has nothing left to narrow: the
-/// train pops and the request is answered with the oversize fault.
+/// A row wider than [`gnitz_wire::MAX_FRAME_PAYLOAD`] answers the request with the
+/// oversize fault.
 #[test]
 fn a_row_wider_than_the_frame_cap_faults() {
     let schema = string_schema();
     // One row whose string alone exceeds what a client can read in one frame.
-    let batch = long_string_batch(&schema, &[(1, &"z".repeat(ipc::FRAME_CAP + 4096))]);
+    let batch = long_string_batch(&schema, &[(1, &"z".repeat(gnitz_wire::MAX_FRAME_PAYLOAD + 4096))]);
 
     let (region, writer) = ring_and_writer();
     let ptr = region.ptr();

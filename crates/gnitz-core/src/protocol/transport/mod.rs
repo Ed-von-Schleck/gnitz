@@ -26,18 +26,14 @@ use std::ops::Range;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use gnitz_wire::{Deframer, FrameLenError};
+use gnitz_wire::{Deframer, FrameLenError, HelloError};
 
 use super::error::ProtocolError;
 use crate::ClientError;
 
 mod tls;
-
-/// The one deadline over a connect: the TCP connect, then the TLS handshake and HELLO
-/// exchange, which run as one. Name resolution runs before it, unbounded.
-pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One connected client transport. All framed I/O goes through these
 /// methods; the wire bytes are identical across transports ("ZSets over the
@@ -200,7 +196,7 @@ impl ClientTransport {
     fn new(inner: Inner) -> Self {
         ClientTransport {
             inner,
-            reader: FrameReader::new(gnitz_wire::MAX_FRAME_PAYLOAD_PRE_HANDSHAKE),
+            reader: FrameReader::new(),
             queue: OutQueue::default(),
         }
     }
@@ -225,8 +221,7 @@ impl ClientTransport {
     }
 
     /// Wrap an already-connected AF_UNIX stream socket (the transport closes
-    /// it on drop). The payload ceiling stays at the pre-handshake bound until
-    /// `mark_established`.
+    /// it on drop).
     #[cfg(test)]
     pub(crate) fn from_unix_fd(fd: OwnedFd) -> Self {
         let stream = UnixStream::from(fd);
@@ -238,13 +233,6 @@ impl ClientTransport {
     /// `TcpStream` under TLS. Never used for framed I/O on the TLS variant.
     pub fn as_raw_fd(&self) -> RawFd {
         self.inner.as_fd().as_raw_fd()
-    }
-
-    /// The payload ceiling `recv_framed` enforces: the pre-handshake bound
-    /// until `mark_established`, then the established one.
-    #[cfg(test)]
-    pub(crate) fn max_payload_len(&self) -> usize {
-        self.reader.deframer.max_payload_len()
     }
 
     /// Send one owned frame — `[u32 LE payload_length][payload]` — blocking
@@ -361,12 +349,6 @@ impl ClientTransport {
     pub(crate) fn begin_read(&mut self) {
         self.reader.drained = false;
     }
-
-    /// The HELLO ACK is in hand: raise the inbound ceiling from the pre-handshake
-    /// bound to the established one.
-    pub(crate) fn mark_established(&mut self) {
-        self.reader.deframer.set_max_payload_len(gnitz_wire::MAX_FRAME_PAYLOAD);
-    }
 }
 
 // ── Framing: the reader ──────────────────────────────────────────────────────
@@ -400,11 +382,11 @@ struct FrameReader {
 }
 
 impl FrameReader {
-    fn new(max_payload_len: usize) -> Self {
+    fn new() -> Self {
         FrameReader {
             scratch: Box::new_uninit_slice(SCRATCH_BYTES),
             carry: 0..0,
-            deframer: Deframer::new(max_payload_len),
+            deframer: Deframer::default(),
             eof: false,
             drained: false,
         }
@@ -571,15 +553,16 @@ impl From<FrameLenError> for ProtocolError {
     fn from(e: FrameLenError) -> Self {
         match e {
             FrameLenError::Zero => ProtocolError::DecodeError("zero-length frame".into()),
-            FrameLenError::Oversize { len, max } => {
-                ProtocolError::DecodeError(format!("payload length {len} exceeds maximum {max} bytes"))
-            }
+            FrameLenError::Oversize { len } => ProtocolError::DecodeError(format!(
+                "payload length {len} exceeds maximum {} bytes",
+                gnitz_wire::MAX_FRAME_PAYLOAD
+            )),
         }
     }
 }
 
-/// Encode a frame's length prefix, refusing zero and anything past `u32::MAX`: where
-/// every framed send of this client is checked.
+/// Encode a frame's length prefix, refusing zero and anything past
+/// `MAX_FRAME_PAYLOAD`, which no peer reads.
 pub(crate) fn frame_len_prefix(len: usize) -> Result<[u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES], ProtocolError> {
     if len == 0 {
         return Err(std::io::Error::new(
@@ -588,35 +571,27 @@ pub(crate) fn frame_len_prefix(len: usize) -> Result<[u8; gnitz_wire::FRAME_LEN_
         )
         .into());
     }
-    if len > u32::MAX as usize {
+    if len > gnitz_wire::MAX_FRAME_PAYLOAD {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("frame size {len} exceeds u32::MAX wire limit"),
+            format!(
+                "frame size {len} exceeds the maximum frame payload {}",
+                gnitz_wire::MAX_FRAME_PAYLOAD
+            ),
         )
         .into());
     }
     Ok((len as u32).to_le_bytes())
 }
 
-/// Send HELLO, check the ACK, and mark the transport established. `until` bounds
-/// the exchange as a whole — on TLS the handshake included — not each leg.
+/// Exchange HELLOs, all within `until`.
 pub fn hello_handshake(t: &mut ClientTransport, until: Option<Instant>) -> Result<(), ClientError> {
-    let payload = gnitz_wire::encode_hello_payload(gnitz_wire::wal::WAL_FORMAT_VERSION);
-    t.send_frame(payload.to_vec(), until)?;
-
-    let buf = t.recv_framed(until)?;
-    if buf.len() == gnitz_wire::HELLO_ACK_PAYLOAD_LEN {
-        gnitz_wire::decode_hello_ack(&buf).map_err(|e| ProtocolError::DecodeError(e.into()))?;
-        t.mark_established();
-        return Ok(());
-    }
-
-    // Not an ACK: a refusal, classified like any other reply's.
-    let ctrl = gnitz_wire::control::peek_control_block(&buf).map_err(|e| ProtocolError::DecodeError(e.into()))?;
-    Err(ctrl.fault().map_or_else(
-        || ProtocolError::DecodeError("HELLO reply is neither an ACK nor a refusal".into()).into(),
-        ClientError::Refused,
-    ))
+    t.send_frame(gnitz_wire::HELLO.to_vec(), until)?;
+    let reply = t.recv_framed(until)?;
+    gnitz_wire::check_hello(&reply).map_err(|e| match e {
+        HelloError::Malformed => ProtocolError::DecodeError(e.to_string()).into(),
+        HelloError::Version { .. } => ClientError::from(e.to_string()),
+    })
 }
 
 #[cfg(test)]

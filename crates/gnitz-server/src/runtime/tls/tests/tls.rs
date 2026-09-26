@@ -52,12 +52,10 @@ fn handshaken_pair() -> (rustls::ClientConnection, rustls::ServerConnection) {
     (client, server)
 }
 
-/// The established queue a session deframes into, whose inbound budget is wide
-/// enough never to trip: the cap is the fd path's to test.
+/// The queue a session deframes into, whose inbound budget is wide enough never
+/// to trip: the cap is the fd path's to test.
 fn test_queue() -> RecvQueue {
-    let mut q = RecvQueue::new(Budget::new(usize::MAX));
-    q.mark_established();
-    q
+    RecvQueue::new(Budget::new(usize::MAX))
 }
 
 /// Client-side: buffer `frames` (each as [len:u32 LE][payload]) as

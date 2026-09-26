@@ -406,9 +406,7 @@ async fn unix_accept_loop(shared: Rc<Shared>, listen_fd: OwnedFd) {
         let fd = accepted.recv().await;
         let peer = Peer::unix(fd, Rc::clone(shared.disp().reactor()));
         let s = Rc::clone(&shared);
-        // No pre-auth deadline: access here is gated by the socket path's
-        // filesystem permissions, and whoever can open it already has full
-        // DDL/DML authority, so squatting gains nothing.
+        // The socket path's permissions are the gate: no HELLO deadline.
         shared.disp().reactor().spawn(connection_loop(peer, s, None));
     }
 }
@@ -440,22 +438,17 @@ async fn tls_accept_loop(shared: Rc<Shared>, listener: TcpListener, tl: TlsListe
         };
         let peer = Peer::tls(conn);
         let s = Rc::clone(&shared);
-        // Pre-auth first-frame deadline: HELLO must arrive within this window of
-        // accept, else the connection is torn down (covers a stalled handshake
-        // and a completed-handshake-no-HELLO squat alike).
-        let deadline = Instant::now() + tl.pre_auth_window;
-        shared.disp().reactor().spawn(connection_loop(peer, s, Some(deadline)));
+        let hello_deadline = Instant::now() + tl.hello_timeout;
+        shared
+            .disp()
+            .reactor()
+            .spawn(connection_loop(peer, s, Some(hello_deadline)));
     }
 }
 
-/// `first_frame_deadline` bounds the pre-auth window: `Some` where the transport
-/// has not authenticated this peer and HELLO must arrive within it, `None` where
-/// the socket's own permissions are the gate. Only the first recv is raced
-/// against it.
-async fn connection_loop(peer: Peer, shared: Rc<Shared>, first_frame_deadline: Option<Instant>) {
-    serve_connection(&peer, &shared, first_frame_deadline).await;
-    // The one exit: ship what is corked — a rejection is a corked reply like any
-    // other — then retire the fd.
+async fn connection_loop(peer: Peer, shared: Rc<Shared>, hello_deadline: Option<Instant>) {
+    serve_connection(&peer, &shared, hello_deadline).await;
+    // The one exit: ship what is corked, a refusal included, then retire the fd.
     let _ = peer.flush_egress().await;
     peer.close();
 }
@@ -466,18 +459,20 @@ async fn connection_loop(peer: Peer, shared: Rc<Shared>, first_frame_deadline: O
 /// `target_id`). Spawning `handle_message` to overlap requests would break that.
 ///
 /// Returns when the peer is gone or refused; the caller closes.
-async fn serve_connection(peer: &Peer, shared: &Rc<Shared>, first_frame_deadline: Option<Instant>) {
-    // No HELLO in time (`Either::B`) → `None`. `select2` drops the losing timer,
-    // which removes its deadline, so the happy path leaves no timer behind.
-    let first = match first_frame_deadline {
+async fn serve_connection(peer: &Peer, shared: &Rc<Shared>, hello_deadline: Option<Instant>) {
+    let hello = match hello_deadline {
         Some(deadline) => match select2(peer.recv(), shared.disp().reactor().timer(deadline)).await {
-            Either::A(opt) => opt,
+            Either::A(hello) => hello,
             Either::B(()) => None,
         },
         None => peer.recv().await,
     };
-    let Some(buf) = first else { return };
-    if !run_hello_handshake(peer, buf.as_slice()) {
+    let Some(hello) = hello else { return };
+    peer.cork_with(|out| {
+        out.extend_from_slice(&(gnitz_wire::HELLO.len() as u32).to_le_bytes());
+        out.extend_from_slice(&gnitz_wire::HELLO);
+    });
+    if gnitz_wire::check_hello(hello.as_slice()).is_err() {
         return;
     }
 
@@ -497,25 +492,6 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>, first_frame_deadline
             return;
         }
     }
-}
-
-/// Validate a HELLO frame, cork the ACK, and raise the connection to the
-/// established frame ceiling. `false` = refused.
-fn run_hello_handshake(peer: &Peer, data: &[u8]) -> bool {
-    let Ok(version) = gnitz_wire::decode_hello_payload(data) else {
-        return false;
-    };
-
-    let server_version = gnitz_wire::wal::WAL_FORMAT_VERSION;
-    if version != server_version {
-        let msg = format!("unsupported wire version: peer={version}, server={server_version}");
-        send_fault(peer, 0, &msg.into());
-        return false;
-    }
-
-    peer.cork(&gnitz_wire::encode_hello_ack());
-    peer.mark_established();
-    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1696,16 +1672,11 @@ fn encode_response_into(out: &mut Vec<u8>, msg: ipc::WireMsg<'_>) {
     msg.encode(&mut out[base + PFX..total]);
 }
 
-/// Cork `msg` for the client — and the one place a master-authored reply meets
-/// [`ipc::FRAME_CAP`]: the master-local system-family scan and seek have no other
-/// bound. The one reply not framed here is the fixed-size HELLO ACK.
-///
-/// Corking rather than sending is what lets a pipelined run of these leave
-/// together, and is sound because every reply through here is the last thing its
-/// handler writes. Nothing is awaited: the connection loop ships it.
+/// Cork `msg` for the client, or a fault in its place past `MAX_FRAME_PAYLOAD`.
+/// The connection loop ships it.
 fn send_msg(peer: &Peer, msg: ipc::WireMsg<'_>) {
     let sz = msg.size();
-    if sz > ipc::FRAME_CAP {
+    if sz > gnitz_wire::MAX_FRAME_PAYLOAD {
         send_fault(peer, msg.target_id as i64, &ipc::oversized_frame_message(sz).into());
         return;
     }

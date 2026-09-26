@@ -23,19 +23,10 @@ pub(crate) fn make_socketpair() -> (OwnedFd, OwnedFd) {
     }
 }
 
-/// A transport over `fd`, established — the shape every post-handshake
-/// connection has.
-pub(crate) fn established(fd: OwnedFd) -> ClientTransport {
-    let mut t = ClientTransport::from_unix_fd(fd);
-    t.mark_established();
-    t
-}
-
-/// [`make_socketpair`] as a transport pair, both ends established; dropping
-/// them closes the fds.
+/// [`make_socketpair`] as a transport pair; dropping them closes the fds.
 pub(crate) fn make_transport_pair() -> (ClientTransport, ClientTransport) {
     let (a, b) = make_socketpair();
-    (established(a), established(b))
+    (ClientTransport::from_unix_fd(a), ClientTransport::from_unix_fd(b))
 }
 
 /// A control-only reply frame carrying `lsn` in `arg0` — the terminal a

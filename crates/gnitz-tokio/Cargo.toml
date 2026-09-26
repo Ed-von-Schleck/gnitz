@@ -16,7 +16,7 @@ tokio = { version = "1", default-features = false, features = ["net", "rt", "syn
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 gnitz-test-harness = { path = "../gnitz-test-harness" }
-# The scripted peer's HELLO ACK, encoded by the definition both sides share
+# The scripted peer's HELLO, encoded by the definition both sides share
 # rather than re-typed as bytes in a test.
 gnitz-wire = { path = "../gnitz-wire" }
 # The store the mirroring integration test attaches. A dev-dependency, so the

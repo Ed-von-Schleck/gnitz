@@ -7,20 +7,12 @@ use gnitz_store::storage::{Batch, Layout, WireChunk, MAX_BATCH_REGIONS};
 use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::{WireFlags, WireStatus};
 
-/// The operative bound on **every** reply the server emits, forwarded or not:
-/// the established frame ceiling a client reads under. A worker frame reaches a client
-/// verbatim, so this is the only readable size there; for
-/// a reply the master consumes instead — `HasPk`, `Gather`, the
-/// unique pre-flight — it turns a would-be `try_reserve` abort into an error at
-/// the producer. It bounds the one non-reply a worker emits too, its exchange
-/// partition (`publish_exchange`), so nothing the engine sends is unbounded.
-pub(crate) const FRAME_CAP: usize = gnitz_wire::MAX_FRAME_PAYLOAD;
-
-/// The one text for a reply that cannot be framed within [`FRAME_CAP`].
+/// The error text for a reply past [`gnitz_wire::MAX_FRAME_PAYLOAD`].
 pub(crate) fn oversized_frame_message(sz: usize) -> String {
     format!(
-        "reply wire_size={sz} exceeds the maximum frame payload {FRAME_CAP}; \
-         one row wider than the cap cannot be returned at all"
+        "reply wire_size={sz} exceeds the maximum frame payload {}; \
+         one row wider than the cap cannot be returned at all",
+        gnitz_wire::MAX_FRAME_PAYLOAD
     )
 }
 

@@ -35,7 +35,7 @@ unsafe fn publish(
 /// protocol needs, so these tests model the production retirement.
 unsafe fn consume_one(recv: &W2mReceiver) -> Option<&'static [u8]> {
     let slot = recv.try_read_slot(0)?;
-    let bytes = &slot.frame[SLOT_LEN_PREFIX_BYTES..];
+    let bytes = &slot.frame[gnitz_wire::FRAME_LEN_PREFIX_BYTES..];
     drop(slot);
     Some(bytes)
 }

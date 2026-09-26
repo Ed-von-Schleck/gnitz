@@ -11,9 +11,9 @@
 use super::*;
 use crate::connection::{Request, Session};
 use crate::protocol::message::encode_frame;
-use crate::protocol::transport::poll_fd;
+use crate::protocol::transport::{poll_fd, ClientTransport};
 use crate::protocol::{ColumnDef, TypeCode, WireStatus};
-use crate::test_support::{established, framed, make_socketpair, raw_read_frame, raw_send};
+use crate::test_support::{framed, make_socketpair, raw_read_frame, raw_send};
 use gnitz_wire::control::peek_control_block;
 use gnitz_wire::control::ControlHeader;
 use gnitz_wire::RelDescriptorBlob;
@@ -240,7 +240,7 @@ fn view_schema() -> Schema {
 /// back.
 fn fixture_priming(views: &[(u64, &str, u64)], prime: impl FnOnce(&mut Session)) -> (GnitzClient, Peer, Log) {
     let (a, b) = make_socketpair();
-    let mut session = Session::from_transport(established(a));
+    let mut session = Session::from_transport(ClientTransport::from_unix_fd(a));
     prime(&mut session);
     let mut client = GnitzClient::from_session(session);
 

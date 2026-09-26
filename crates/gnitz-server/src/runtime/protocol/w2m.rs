@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use io_uring::types::FutexWaitV;
 
-use crate::runtime::wire::{decode_wire_ipc, DecodedWire, WireMsg, FRAME_CAP};
+use crate::runtime::wire::{decode_wire_ipc, DecodedWire, WireMsg};
 use gnitz_foundation::posix_io;
 use gnitz_wire::control::{peek_control_block, DecodedControl};
 
@@ -53,19 +53,17 @@ pub(crate) const BOOT_READY_REQUEST_ID: u32 = 1;
 /// Fixed header size at the start of every W2M mmap region.
 const W2M_HEADER_SIZE: usize = 128;
 
-/// [`FRAME_CAP`]-sized frames the ring holds at once: how far a worker streams
-/// ahead while the master drains another ring. The one policy choice here.
+/// Max-size frames the ring holds at once: how far a worker streams ahead while
+/// the master drains another ring.
 const W2M_WINDOW_FRAMES: u64 = 16;
 
-/// Capacity (header + data) of each per-worker W2M mmap region.
-///
-/// Mapped whole, so a ring sweeping all of `DCAP` every lap holds ~1 GiB of
-/// resident shmem per worker for a transport whose live occupancy is a few KiB.
-/// Both factors above are levers on that; the trade is unmeasured.
-const W2M_REGION_SIZE: usize = (W2M_HEADER_SIZE as u64 + W2M_WINDOW_FRAMES * slot_stride(FRAME_CAP)) as usize;
+/// Capacity (header + data) of each per-worker W2M mmap region. The ring sweeps
+/// all of it every lap, so all of it becomes resident whatever the live occupancy.
+const W2M_REGION_SIZE: usize =
+    (W2M_HEADER_SIZE as u64 + W2M_WINDOW_FRAMES * slot_stride(gnitz_wire::MAX_FRAME_PAYLOAD)) as usize;
 const _: () = assert!(
     W2M_WINDOW_FRAMES >= 2,
-    "a FRAME_CAP message must fit past a SKIP pad of nearly a whole slot, or `try_reserve` \
+    "a `MAX_FRAME_PAYLOAD` message must fit past a SKIP pad of nearly a whole slot, or `try_reserve` \
      accepts a reservation `publish_at` can never place and the writer parks forever",
 );
 // A peer's advance is capped by `publish_at`'s `used + total <= dcap` gate, not
@@ -81,10 +79,8 @@ const _: () = assert!(
 // `MAX_WORKERS` bump that outgrows it a build error.
 const _: () = assert!(super::sal::MAX_WORKERS <= 128);
 
-/// Bytes of the 8-byte slot prefix that carry the client's frame length prefix.
-const SLOT_LEN_PREFIX_BYTES: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES;
 const _: () = assert!(
-    2 * SLOT_LEN_PREFIX_BYTES as u64 == RING_PREFIX_BYTES,
+    2 * gnitz_wire::FRAME_LEN_PREFIX_BYTES as u64 == RING_PREFIX_BYTES,
     "the packed slot prefix is two client-prefix-sized halves"
 );
 const _: () = assert!(
@@ -816,7 +812,7 @@ pub struct W2mSlot {
 impl W2mSlot {
     /// The wire message alone, without the length prefix in front of it.
     pub fn bytes(&self) -> &[u8] {
-        &self.frame[SLOT_LEN_PREFIX_BYTES..]
+        &self.frame[gnitz_wire::FRAME_LEN_PREFIX_BYTES..]
     }
     /// The framed bytes ready for a client send: `[sz_as_u32_le | payload]`.
     pub(crate) fn frame_bytes(&self) -> &[u8] {
@@ -920,8 +916,8 @@ impl WorkerRing {
         }
         let payload_at = (st.read.phys + RING_PREFIX_BYTES) as usize;
         let frame = std::slice::from_raw_parts(
-            base.add(payload_at - SLOT_LEN_PREFIX_BYTES),
-            sz as usize + SLOT_LEN_PREFIX_BYTES,
+            base.add(payload_at - gnitz_wire::FRAME_LEN_PREFIX_BYTES),
+            sz as usize + gnitz_wire::FRAME_LEN_PREFIX_BYTES,
         );
         st.read.advance(slot_stride(sz as usize));
 

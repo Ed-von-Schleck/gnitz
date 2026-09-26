@@ -1,7 +1,8 @@
 use super::*;
-use crate::test_support::{established, framed, make_socketpair, make_transport_pair, raw_send};
+use crate::test_support::{framed, make_socketpair, make_transport_pair, raw_send};
 use gnitz_foundation::posix_io::set_sockopt_int;
 use std::os::fd::AsRawFd;
+use std::time::Duration;
 
 fn set_nonblocking(fd: &OwnedFd) {
     let s = UnixStream::from(fd.try_clone().unwrap());
@@ -32,24 +33,10 @@ fn test_transport_medium() {
 }
 
 #[test]
-fn test_pre_handshake_ceiling_admits_status_error_and_refuses_above() {
-    // The worst-case pre-ACK reject frame is a `WireStatus::Error` control block with
-    // a version text; it must pass the 4 KiB bound, and 4 KiB + 1 must not.
+fn test_recv_refuses_a_prefix_past_the_frame_ceiling() {
     let (fd_b, a) = make_socketpair();
     let mut b = ClientTransport::from_unix_fd(fd_b);
-    let hdr = gnitz_wire::control::ControlHeader {
-        status: gnitz_wire::WireStatus::Error,
-        ..Default::default()
-    };
-    let err =
-        super::super::message::encode_frame(hdr, b"unsupported wire version: peer=65535, server=65535", None, None);
-    assert!(err.len() <= gnitz_wire::MAX_FRAME_PAYLOAD_PRE_HANDSHAKE);
-    raw_send(&a, &framed(&err));
-    assert_eq!(b.recv_framed(None).unwrap(), err);
-    raw_send(
-        &a,
-        &((gnitz_wire::MAX_FRAME_PAYLOAD_PRE_HANDSHAKE + 1) as u32).to_le_bytes(),
-    );
+    raw_send(&a, &((gnitz_wire::MAX_FRAME_PAYLOAD + 1) as u32).to_le_bytes());
     assert!(matches!(b.recv_framed(None), Err(ProtocolError::DecodeError(_))));
 }
 
@@ -89,9 +76,8 @@ fn test_frame_len_prefix_rejects_empty_and_oversized() {
     assert!(
         matches!(frame_len_prefix(0), Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::InvalidInput)
     );
-    #[cfg(target_pointer_width = "64")]
     assert!(matches!(
-        frame_len_prefix((u32::MAX as usize) + 1),
+        frame_len_prefix(gnitz_wire::MAX_FRAME_PAYLOAD + 1),
         Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::InvalidInput
     ));
     assert_eq!(frame_len_prefix(1).unwrap(), 1u32.to_le_bytes());
@@ -244,14 +230,32 @@ fn test_send_timeout_peer_never_drains_parses_no_torn_frame() {
     );
 }
 
-#[test]
-fn test_hello_handshake_establishes_the_frame_ceiling() {
+/// A peer answering `reply` to the client's HELLO, which it reads first.
+fn handshake_against(reply: &[u8]) -> Result<(), ClientError> {
     let (a, b) = make_socketpair();
-    raw_send(&b, &gnitz_wire::encode_hello_ack());
+    raw_send(&b, &framed(reply));
     let mut t = ClientTransport::from_unix_fd(a);
-    assert_eq!(t.max_payload_len(), gnitz_wire::MAX_FRAME_PAYLOAD_PRE_HANDSHAKE);
-    hello_handshake(&mut t, None).unwrap();
-    assert_eq!(t.max_payload_len(), gnitz_wire::MAX_FRAME_PAYLOAD);
+    let r = hello_handshake(&mut t, None);
+    let mut peer = ClientTransport::from_unix_fd(b);
+    assert_eq!(peer.recv_framed(None).unwrap(), gnitz_wire::HELLO);
+    r
+}
+
+#[test]
+fn test_hello_handshake_checks_the_server_hello() {
+    handshake_against(&gnitz_wire::HELLO).unwrap();
+
+    let mut other = gnitz_wire::HELLO;
+    other[4] ^= 1;
+    match handshake_against(&other) {
+        Err(ClientError::Refused(f)) => assert!(f.text.contains("version mismatch"), "{}", f.text),
+        r => panic!("expected a version refusal, got {r:?}"),
+    }
+
+    assert!(matches!(
+        handshake_against(b"GNTX\0\0\0\0"),
+        Err(ClientError::Protocol(ProtocolError::DecodeError(_)))
+    ));
 }
 
 #[test]
@@ -286,7 +290,7 @@ fn reader_two_frame_stream_split_at_every_offset() {
     let mut stream = framed(&f1);
     stream.extend(framed(&f2));
     for cut in 0..=stream.len() {
-        let (peer, mut t) = make_socketpair_established();
+        let (peer, mut t) = make_socketpair_transport();
         raw_send(&peer, &stream[..cut]);
         // First half only: at most one frame may be complete.
         let mut got: Vec<Vec<u8>> = Vec::new();
@@ -307,15 +311,15 @@ fn reader_two_frame_stream_split_at_every_offset() {
     }
 }
 
-/// A peer fd and an established transport over the other end.
-fn make_socketpair_established() -> (OwnedFd, ClientTransport) {
+/// A peer fd and a transport over the other end.
+fn make_socketpair_transport() -> (OwnedFd, ClientTransport) {
     let (a, b) = make_socketpair();
-    (b, established(a))
+    (b, ClientTransport::from_unix_fd(a))
 }
 
 #[test]
 fn reader_serves_second_frame_from_carry_without_a_read() {
-    let (peer, mut t) = make_socketpair_established();
+    let (peer, mut t) = make_socketpair_transport();
     let mut stream = framed(b"one");
     stream.extend(framed(b"two"));
     raw_send(&peer, &stream);
@@ -329,7 +333,7 @@ fn reader_serves_second_frame_from_carry_without_a_read() {
 fn reader_large_payload_is_one_exact_allocation() {
     // A payload larger than the scratch lands in one Vec of exactly
     // payload_len capacity, filled by reads straight into it.
-    let (peer, mut t) = make_socketpair_established();
+    let (peer, mut t) = make_socketpair_transport();
     set_sockopt_int(peer.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 64 * 1024);
     let big: Vec<u8> = (0u8..=255).cycle().take(3 * SCRATCH_BYTES + 12345).collect();
     let stream = framed(&big);
@@ -350,7 +354,7 @@ fn reader_large_payload_is_one_exact_allocation() {
 
 #[test]
 fn reader_distinguishes_eagain_from_eof() {
-    let (peer, mut t) = make_socketpair_established();
+    let (peer, mut t) = make_socketpair_transport();
     // Idle: EAGAIN → Pending, no error.
     assert!(matches!(t.next_frame(true).unwrap(), Next::Pending));
     raw_send(&peer, &framed(b"x"));
@@ -372,7 +376,7 @@ fn reader_delivers_frame_before_eof_when_read_fills_scratch_exactly() {
     // one breath. The answering read is full — proving nothing — so the
     // reader reads again and sees the 0; the frame must come out first and
     // the EOF on the call after.
-    let (peer, mut t) = make_socketpair_established();
+    let (peer, mut t) = make_socketpair_transport();
     set_sockopt_int(peer.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 256 * 1024);
     let payload: Vec<u8> = vec![9u8; SCRATCH_BYTES - 4];
     raw_send(&peer, &framed(&payload));
@@ -394,7 +398,7 @@ fn reader_delivers_frame_before_eof_when_read_fills_scratch_exactly() {
 
 #[test]
 fn reader_eof_mid_payload_is_immediate() {
-    let (peer, mut t) = make_socketpair_established();
+    let (peer, mut t) = make_socketpair_transport();
     let mut stream = framed(&[1u8; 100]);
     stream.truncate(50);
     raw_send(&peer, &stream);
@@ -412,10 +416,10 @@ fn reader_eof_mid_payload_is_immediate() {
 }
 
 #[test]
-fn test_nonblocking_established_transport_reads_after_idle() {
-    // Once established, an idle connection still reads when data arrives:
+fn test_nonblocking_transport_reads_after_idle() {
+    // An idle connection still reads when data arrives:
     // the drained inference parks in poll, never in an EAGAIN error.
-    let (peer, mut t) = make_socketpair_established();
+    let (peer, mut t) = make_socketpair_transport();
     set_nonblocking(&peer);
     let h = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(100));

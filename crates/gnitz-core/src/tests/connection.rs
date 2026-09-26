@@ -5,9 +5,9 @@ mod spine_tests {
     use crate::connection::*;
     use crate::protocol::codec::encode_schema_block;
     use crate::protocol::message::encode_frame;
-    use crate::protocol::transport::poll_fd;
+    use crate::protocol::transport::{poll_fd, ClientTransport};
     use crate::protocol::{BatchAppender, ColumnDef, TypeCode};
-    use crate::test_support::{established, framed, make_socketpair, raw_read_frame, raw_send, reply_ctrl};
+    use crate::test_support::{framed, make_socketpair, raw_read_frame, raw_send, reply_ctrl};
     use crate::{GnitzClient, WireFault};
 
     /// The version a request for `tid` would stamp now; `0` = nothing cached.
@@ -35,7 +35,7 @@ mod spine_tests {
 
     fn pair() -> (Session, Peer) {
         let (a, b) = make_socketpair();
-        (Session::from_transport(established(a)), Peer(b))
+        (Session::from_transport(ClientTransport::from_unix_fd(a)), Peer(b))
     }
 
     fn schema_a() -> Schema {

@@ -1,55 +1,26 @@
 use super::*;
 
-/// The HELLO payload's byte layout and its decode are one contract: magic at
-/// 0..4, version at 4..8, and nothing else is a HELLO.
+/// A peer of any version reads the version from these bytes.
 #[test]
-fn hello_payload_layout_and_decode() {
-    let payload = encode_hello_payload(0x1234);
-    assert_eq!(payload.len(), HELLO_PAYLOAD_LEN);
-    assert_eq!(crate::read_u32_le(&payload, 0), HELLO_MAGIC);
-    assert_eq!(crate::read_u32_le(&payload, 4), 0x1234);
+fn hello_layout_is_version_independent() {
+    assert_eq!(HELLO[..4], *b"GNTZ");
+    assert_eq!(HELLO[4..], WAL_FORMAT_VERSION.to_le_bytes());
+}
 
-    assert_eq!(decode_hello_payload(&payload), Ok(0x1234));
+#[test]
+fn check_hello_accepts_its_own_and_classifies_the_rest() {
+    assert_eq!(check_hello(&HELLO), Ok(()));
 
-    let mut forged = payload;
+    let mut forged = HELLO;
     forged[0] ^= 1;
-    assert_eq!(decode_hello_payload(&forged), Err("hello magic mismatch"));
+    assert_eq!(check_hello(&forged), Err(HelloError::Malformed));
+    assert_eq!(check_hello(&HELLO[..7]), Err(HelloError::Malformed));
+    let mut long = HELLO.to_vec();
+    long.push(0);
+    assert_eq!(check_hello(&long), Err(HelloError::Malformed));
 
-    // The caller has already framed the payload by its length prefix, so any
-    // other width is a forged frame, not a short read.
-    assert!(decode_hello_payload(&[0u8; 7]).is_err());
-    assert!(decode_hello_payload(&[0u8; 9]).is_err());
-}
-
-/// The ACK's byte layout and its decode, likewise. `encode_hello_ack` emits the
-/// framed form (length prefix included); `decode_hello_ack` takes the payload.
-#[test]
-fn ack_frame_layout_and_decode() {
-    let ack = encode_hello_ack();
-    assert_eq!(ack.len(), HELLO_ACK_FRAME_SIZE);
-    assert_eq!(crate::read_u32_le(&ack, 0) as usize, HELLO_ACK_PAYLOAD_LEN);
-    assert_eq!(crate::read_u32_le(&ack, 4), HELLO_MAGIC);
-
-    assert_eq!(decode_hello_ack(&ack[4..]), Ok(()));
-
-    let mut forged = ack;
-    forged[4] ^= 1;
-    assert_eq!(decode_hello_ack(&forged[4..]), Err("hello magic mismatch"));
-
-    assert!(decode_hello_ack(&ack[4..ack.len() - 1]).is_err());
-}
-
-/// Before the handshake completes a reader has three frames to tell apart and
-/// only the length prefix to do it with: HELLO, ACK, and the one `WireStatus::Error`
-/// control block this path emits. That holds only while both handshake payloads
-/// are smaller than the smallest control block, and while the error block fits
-/// the pre-handshake ceiling — otherwise a rejected HELLO reads as a truncated
-/// frame instead of as its error.
-#[test]
-fn the_length_prefix_discriminates_the_pre_handshake_frames() {
-    let smallest_ctrl = crate::control::CTRL_HEADER_SIZE;
-    assert_ne!(HELLO_PAYLOAD_LEN, HELLO_ACK_PAYLOAD_LEN);
-    assert!(HELLO_PAYLOAD_LEN < smallest_ctrl);
-    assert!(HELLO_ACK_PAYLOAD_LEN < smallest_ctrl);
-    assert!(crate::control::frame_head_size(128, None) < MAX_FRAME_PAYLOAD_PRE_HANDSHAKE);
+    let mut other = HELLO;
+    other[4] ^= 1;
+    let peer = crate::read_u32_le(&other, 4);
+    assert_eq!(check_hello(&other), Err(HelloError::Version { peer }));
 }

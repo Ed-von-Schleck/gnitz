@@ -3,15 +3,20 @@
 
 use std::mem::MaybeUninit;
 
-use crate::FRAME_LEN_PREFIX_BYTES;
+/// The payload ceiling of every frame, in both directions.
+pub const MAX_FRAME_PAYLOAD: usize = 64 << 20;
+
+/// Width of the `u32` LE payload-length prefix in front of every frame. Zero is
+/// never a legal length.
+pub const FRAME_LEN_PREFIX_BYTES: usize = 4;
 
 /// Why a received length prefix was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameLenError {
     /// Zero: every frame carries a payload, so no sender emits one.
     Zero,
-    /// Past the reader's ceiling.
-    Oversize { len: usize, max: usize },
+    /// Past [`MAX_FRAME_PAYLOAD`].
+    Oversize { len: usize },
 }
 
 /// Turns a byte stream into frames, each a `B` the caller allocates at exactly
@@ -21,27 +26,19 @@ pub struct Deframer<B> {
     hdr_len: usize,
     /// The payload being filled, and how much of it has arrived.
     pending: Option<(B, usize)>,
-    max_payload_len: usize,
 }
 
-impl<B: AsMut<[MaybeUninit<u8>]>> Deframer<B> {
-    pub fn new(max_payload_len: usize) -> Self {
+impl<B: AsMut<[MaybeUninit<u8>]>> Default for Deframer<B> {
+    fn default() -> Self {
         Deframer {
             hdr: [0; FRAME_LEN_PREFIX_BYTES],
             hdr_len: 0,
             pending: None,
-            max_payload_len,
         }
     }
+}
 
-    pub fn max_payload_len(&self) -> usize {
-        self.max_payload_len
-    }
-
-    pub fn set_max_payload_len(&mut self, max: usize) {
-        self.max_payload_len = max;
-    }
-
+impl<B: AsMut<[MaybeUninit<u8>]>> Deframer<B> {
     /// Mid-frame: a split prefix or a partial payload is buffered.
     pub fn is_mid_frame(&self) -> bool {
         self.hdr_len > 0 || self.pending.is_some()
@@ -80,9 +77,7 @@ impl<B: AsMut<[MaybeUninit<u8>]>> Deframer<B> {
                 self.hdr_len = 0;
                 let len = match u32::from_le_bytes(self.hdr) as usize {
                     0 => return Err(FrameLenError::Zero.into()),
-                    len if len > self.max_payload_len => {
-                        return Err(FrameLenError::Oversize { len, max: self.max_payload_len }.into())
-                    }
+                    len if len > MAX_FRAME_PAYLOAD => return Err(FrameLenError::Oversize { len }.into()),
                     len => len,
                 };
                 self.pending = Some((alloc(len)?, 0));

@@ -1,94 +1,52 @@
-//! Frame size limits and the HELLO/ACK handshake codec.
+//! The HELLO both ends of a connection open with, and the TLS ALPN they pin.
 
-// ---------------------------------------------------------------------------
-// Frame size limits
-// ---------------------------------------------------------------------------
+use std::fmt;
+use std::time::Duration;
 
-/// The payload ceiling both ends apply once the HELLO ACK is in hand.
-pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024; // 64 MB
+use crate::wal::WAL_FORMAT_VERSION;
 
-/// Payload ceiling the client applies to a frame arriving **before** the HELLO
-/// ACK, when the peer has proved nothing yet: without it, four header bytes from
-/// an unauthenticated peer would size a 64 MB allocation. Both frames legal
-/// there — the ACK and a `WireStatus::Error` control block — fit it. The server
-/// bounds its own pre-handshake frame the same way (`HELLO_PAYLOAD_LEN`).
-pub const MAX_FRAME_PAYLOAD_PRE_HANDSHAKE: usize = 4 * 1024;
-
-/// Width of the length prefix in front of every framed payload, on every path
-/// that carries one: the client socket stream (`recv_framed` and its senders),
-/// the server's client ingress, and the W2M ring slot the master forwards to a
-/// client verbatim. A `u32` LE count of the payload bytes that follow. Zero is
-/// never a legal length.
-pub const FRAME_LEN_PREFIX_BYTES: usize = 4;
-
-// ---------------------------------------------------------------------------
-// HELLO handshake
-//
-// A payload's length alone tells HELLO and ACK apart from a control block. The
-// ACK is the success reply; a refusal is a `WireStatus::Error` control block.
-// ---------------------------------------------------------------------------
-
-/// Magic carried in HELLO and ACK payloads: ASCII "GNTZ" as a little-endian u32.
-pub(crate) const HELLO_MAGIC: u32 = u32::from_le_bytes(*b"GNTZ");
+/// A client's deadline over its connect, TLS handshake and HELLO exchange together.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// ALPN protocol both sides of the TLS transport pin; a mismatch fails the
 /// handshake.
 pub const ALPN_GNITZ: &[u8] = b"gnitz/1";
 
-/// HELLO payload length in bytes (excluding the 4-byte length prefix).
-pub const HELLO_PAYLOAD_LEN: usize = 8;
+/// The first frame's payload in each direction, in the one layout no version may change.
+pub const HELLO: [u8; 8] = {
+    let v = WAL_FORMAT_VERSION.to_le_bytes();
+    [b'G', b'N', b'T', b'Z', v[0], v[1], v[2], v[3]]
+};
 
-/// ACK payload length in bytes (excluding the 4-byte length prefix).
-pub const HELLO_ACK_PAYLOAD_LEN: usize = 4;
-
-/// Total wire size of an ACK frame (length prefix + payload).
-pub(crate) const HELLO_ACK_FRAME_SIZE: usize = FRAME_LEN_PREFIX_BYTES + HELLO_ACK_PAYLOAD_LEN;
-
-/// HELLO payload fields.
-const HELLO_OFF_MAGIC: usize = 0;
-const HELLO_OFF_VERSION: usize = 4;
-
-/// Build a HELLO payload (the bytes after the length prefix). Every sender
-/// frames it through its transport's standard framed send, which derives
-/// the identical 4-byte prefix.
-pub fn encode_hello_payload(version: u32) -> [u8; HELLO_PAYLOAD_LEN] {
-    let mut out = [0u8; HELLO_PAYLOAD_LEN];
-    crate::write_u32_le(&mut out, HELLO_OFF_MAGIC, HELLO_MAGIC);
-    crate::write_u32_le(&mut out, HELLO_OFF_VERSION, version);
-    out
+/// Why a peer's HELLO was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelloError {
+    /// Not 8 bytes opening with "GNTZ": the peer is not a gnitz endpoint.
+    Malformed,
+    /// A gnitz peer built at another wire version.
+    Version { peer: u32 },
 }
 
-/// Decode a HELLO payload (the bytes following the length prefix) to the
-/// client's protocol version, rejecting a wrong size or magic.
-pub fn decode_hello_payload(payload: &[u8]) -> Result<u32, &'static str> {
-    if payload.len() != HELLO_PAYLOAD_LEN {
-        return Err("hello payload wrong size");
+impl fmt::Display for HelloError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HelloError::Malformed => f.write_str("peer is not a gnitz endpoint (malformed HELLO)"),
+            HelloError::Version { peer } => {
+                write!(f, "wire version mismatch: peer={peer}, local={WAL_FORMAT_VERSION}")
+            }
+        }
     }
-    if crate::read_u32_le(payload, HELLO_OFF_MAGIC) != HELLO_MAGIC {
-        return Err("hello magic mismatch");
-    }
-    Ok(crate::read_u32_le(payload, HELLO_OFF_VERSION))
 }
 
-/// Build an ACK frame ready to ship over the wire (length prefix + payload). The
-/// payload is the magic alone.
-pub fn encode_hello_ack() -> [u8; HELLO_ACK_FRAME_SIZE] {
-    let mut out = [0u8; HELLO_ACK_FRAME_SIZE];
-    crate::write_u32_le(&mut out, 0, HELLO_ACK_PAYLOAD_LEN as u32);
-    crate::write_u32_le(&mut out, FRAME_LEN_PREFIX_BYTES, HELLO_MAGIC);
-    out
-}
-
-/// Check an ACK payload (the bytes following the length prefix), rejecting a
-/// wrong size or magic.
-pub fn decode_hello_ack(payload: &[u8]) -> Result<(), &'static str> {
-    if payload.len() != HELLO_ACK_PAYLOAD_LEN {
-        return Err("hello ack payload wrong size");
+/// Check a peer's HELLO payload against this build's.
+pub fn check_hello(payload: &[u8]) -> Result<(), HelloError> {
+    if payload.len() != HELLO.len() || payload[..4] != HELLO[..4] {
+        return Err(HelloError::Malformed);
     }
-    if crate::read_u32_le(payload, 0) != HELLO_MAGIC {
-        return Err("hello magic mismatch");
+    match crate::read_u32_le(payload, 4) {
+        WAL_FORMAT_VERSION => Ok(()),
+        peer => Err(HelloError::Version { peer }),
     }
-    Ok(())
 }
 
 #[cfg(test)]

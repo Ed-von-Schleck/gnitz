@@ -263,20 +263,14 @@ fn unix_and_tls_clients_share_a_table() {
 // ── 6. wire-version mismatch HELLO ─────────────────────────────────────────
 
 #[test]
-fn wire_version_mismatch_hello_gets_status_error() {
+fn wire_version_mismatch_is_refused() {
     let srv = ServerHandle::start_tls(1);
     let mut t = ClientTransport::connect(&srv.tls_target(), None).unwrap();
-    let payload = gnitz_wire::encode_hello_payload(gnitz_wire::wal::WAL_FORMAT_VERSION.wrapping_add(1));
-    t.send_frame(payload.to_vec(), None).unwrap();
-    let buf = t.recv_framed(None).unwrap();
-    let ctrl = peek_control_block(&buf).unwrap();
-    assert_eq!(ctrl.hdr.status, WireStatus::Error);
-    let text = ctrl.fault().map(|f| f.text).unwrap_or_default();
-    assert!(
-        text.contains("version"),
-        "a WireStatus::Error must name the version mismatch, got: {text}"
-    );
-    // Clean close follows the error frame.
+    let mut hello = gnitz_wire::HELLO;
+    hello[4] ^= 1;
+    t.send_frame(hello.to_vec(), None).unwrap();
+    // The server answers with its own HELLO, then closes.
+    assert_eq!(t.recv_framed(None).unwrap(), gnitz_wire::HELLO);
     assert!(t.recv_framed(None).is_err());
 }
 
@@ -427,17 +421,8 @@ fn inbound_cap_breach_closes_stalled_connection() {
 
 #[test]
 fn stalled_scan_client_is_evicted_by_send_deadline() {
-    // The client completes HELLO, asks for a big scan, then stops reading
-    // entirely — no recv-side death, no inbound-cap breach; ONLY the send
-    // deadline can fire. Holding the send lock across an unbounded send would
-    // wedge the connection forever; the deadline's shutdown must evict
-    // instead. This exercises the one guarded send primitive every TLS
-    // send shares (`Peer::send` → `send_bytes` → `send_owned`): a forwarded
-    // ring slot, a pooled reply, and the HELLO-ACK differ only in the byte
-    // source, so the eviction proven here is the eviction for all of them.
-    // (A separate pooled-reply stall scenario is not constructible
-    // deterministically: every such reply is a bounded control / schema
-    // frame that the kernel socket buffer absorbs without parking the send.)
+    // The client asks for a big scan and stops reading: only the send deadline
+    // can end the stall, and it must evict rather than wedge the send lock.
     let srv = ServerHandle::start_tls_with_env(4, &[("GNITZ_CLIENT_SEND_TIMEOUT_MS", "1500")]);
     let target = srv.tls_target();
     with_watchdog(120, move || {
@@ -573,7 +558,7 @@ fn global_connection_cap_closes_excess() {
     assert!(reconnected, "a cap slot must free after a connection closes");
 }
 
-// ── 17. pre-auth first-frame deadline ──────────────────────────────────────
+// ── 17. HELLO deadline ─────────────────────────────────────────────────────
 
 #[test]
 fn first_frame_deadline_reaps_silent_connections() {

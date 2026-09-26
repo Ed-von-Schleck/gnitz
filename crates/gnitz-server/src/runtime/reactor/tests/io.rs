@@ -15,21 +15,18 @@ fn capped_reactor(cap: usize) -> Reactor {
 }
 
 /// A registered connection over one end of a fresh socketpair, and the other end.
-fn registered(r: &Reactor, established: bool) -> (Rc<ClientConn>, UnixStream) {
+fn registered(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
     let (local, partner) = UnixStream::pair().expect("socketpair");
     let conn = r.client_conn(OwnedFd::from(local));
     r.register_conn(&conn, Box::new(Plain::new()));
-    if established {
-        conn.mark_established();
-    }
     (conn, partner)
 }
 
 /// `wire` into a fresh connection capped at `cap` ends its recv side without
 /// parking a reader or delivering a frame, and leaves nothing charged.
-fn assert_refused(cap: usize, established: bool, wire: &[u8], why: &str) {
+fn assert_refused(cap: usize, wire: &[u8], why: &str) {
     let r = capped_reactor(cap);
-    let (conn, partner) = registered(&r, established);
+    let (conn, partner) = registered(&r);
     let fd = conn.fd();
     (&partner).write_all(wire).expect("write");
 
@@ -45,35 +42,21 @@ fn assert_refused(cap: usize, established: bool, wire: &[u8], why: &str) {
     drop((conn, partner));
 }
 
-/// The four ways an inbound frame is refused at its header, before any payload
+/// The three ways an inbound frame is refused at its header, before any payload
 /// byte is allocated.
 #[test]
 fn inbound_frames_are_refused_at_the_header() {
     let repeat = |payload: &[u8], n: usize| -> Vec<u8> { (0..n).flat_map(|_| framed(payload)).collect() };
 
     // frame_weight(100) = 100. Two frames = 200 held; the 3rd pushes 300 > 250.
-    assert_refused(250, true, &repeat(&[0xAB; 100], 3), "cumulative weight over cap");
+    assert_refused(250, &repeat(&[0xAB; 100], 3), "cumulative weight over cap");
 
     // 1-byte payloads each weigh the 64-byte floor, so 64 frames = 4096 and the
     // 65th breaches. Without the floor 65 frames would weigh 65 B and never trip.
-    assert_refused(
-        4096,
-        false,
-        &repeat(&[0xCD], 65),
-        "tiny-frame flood via the weight floor",
-    );
-
-    // Not established: the ceiling is still the 8-byte HELLO payload.
-    assert_refused(
-        usize::MAX,
-        false,
-        &framed(&[0u8; io::HELLO_PRE_HANDSHAKE_LEN + 1]),
-        "first frame over the pre-handshake ceiling",
-    );
+    assert_refused(4096, &repeat(&[0xCD], 65), "tiny-frame flood via the weight floor");
 
     assert_refused(
         usize::MAX,
-        false,
         &0u32.to_le_bytes(),
         "a zero-length prefix is a protocol violation",
     );
@@ -86,7 +69,7 @@ fn inbound_frames_are_refused_at_the_header() {
 fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
     // Exactly one 10_000-byte in-flight buffer fits.
     let r = capped_reactor(10_000);
-    let (conn1, partner1) = registered(&r, true);
+    let (conn1, partner1) = registered(&r);
 
     // Header claims 10_000 bytes but only 100 are delivered: the buffer
     // is malloc'd and counted at header-parse time, yet no frame completes.
@@ -103,7 +86,7 @@ fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
     );
 
     // Second connection whose first frame would breach the now-full cap.
-    let (conn2, partner2) = registered(&r, true);
+    let (conn2, partner2) = registered(&r);
     let fd2 = conn2.fd();
     (&partner2).write_all(&framed(&[0x22u8; 100])).expect("write");
 
@@ -123,7 +106,7 @@ fn inbound_cap_accounting_balances_on_consume() {
     // One recv deframes a whole round and charges every frame in it, so the peak
     // is a round rather than a frame — and the cap below admits one.
     let r = capped_reactor(15_000);
-    let (conn, partner) = registered(&r, true);
+    let (conn, partner) = registered(&r);
 
     let payload = vec![0x7Eu8; 1_000]; // frame_weight = 1_000
     for _round in 0..2 {
@@ -166,7 +149,6 @@ impl Feeder {
     fn new() -> Feeder {
         let budget = io::Budget::new(usize::MAX);
         let mut q = io::RecvQueue::new(Rc::clone(&budget));
-        q.mark_established();
         let mut plain = io::Plain::new();
         let window = plain.window(&mut q);
         Feeder { q, plain, budget, window }
@@ -308,18 +290,4 @@ fn a_prefix_split_by_a_full_carry_resumes() {
 
     assert_eq!(f.feed(&wire[taken..]).expect("no refusal"), 1);
     assert_eq!(f.drain(), vec![c]);
-}
-
-/// The pre-handshake ceiling adjudicates every frame in the first read, not
-/// just the first: a frame over the HELLO size pipelined behind it is refused.
-#[test]
-fn nothing_may_ride_with_hello() {
-    let mut wire = framed(&[0u8; io::HELLO_PRE_HANDSHAKE_LEN]);
-    wire.extend_from_slice(&framed(&[0u8; io::HELLO_PRE_HANDSHAKE_LEN + 1]));
-    assert_refused(
-        usize::MAX,
-        false,
-        &wire,
-        "a frame pipelined behind HELLO is under the pre-handshake ceiling",
-    );
 }

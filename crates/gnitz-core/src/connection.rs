@@ -13,7 +13,7 @@ use std::time::Instant;
 use crate::client::DeltaCursor;
 use crate::error::ClientError;
 use crate::protocol::codec::schema_from_block;
-use crate::protocol::transport::{Next, CONNECT_TIMEOUT};
+use crate::protocol::transport::Next;
 use crate::protocol::wal_block::decode_wal_block_into;
 use crate::protocol::ReplySchema;
 use crate::protocol::{
@@ -22,6 +22,7 @@ use crate::protocol::{
 };
 use gnitz_wire::control::{peek_control_block, ControlHeader, DecodedControl};
 use gnitz_wire::txn_frame;
+use gnitz_wire::CONNECT_TIMEOUT;
 use gnitz_wire::{RelClass, RelDescriptorBlob, RelIndex};
 use lru::LruCache;
 
@@ -433,9 +434,6 @@ impl Session {
     pub fn connect(target: &str) -> Result<Self, ClientError> {
         let until = Some(Instant::now() + CONNECT_TIMEOUT);
         let mut transport = ClientTransport::connect(target, until)?;
-        // Run the HELLO handshake before any data flows. The server
-        // accepts the first frame at an 8-byte limit, so this must
-        // happen before a control block would be emitted.
         hello_handshake(&mut transport, until)?;
         Ok(Self::over(transport))
     }
@@ -451,8 +449,7 @@ impl Session {
         }
     }
 
-    /// A session over an already-established transport, for the scripted-peer
-    /// tests. Keeps whatever frame ceiling the transport holds.
+    /// A session over a transport, for the scripted-peer tests.
     #[cfg(test)]
     pub(crate) fn from_transport(transport: ClientTransport) -> Self {
         Self::over(transport)
