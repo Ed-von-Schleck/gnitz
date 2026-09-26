@@ -8,7 +8,10 @@
 use std::fs;
 
 use super::{Relation, RelationKind, RelationRegistry};
-use crate::storage::{create_dir, fsync_dir, remove_child, subdir_names, ChildAddr, ChildKind, StoreError};
+use crate::storage::{
+    caller_record_at, create_dir, fsync_dir, parse_id, remove_child, subdir_names, ChildAddr, ChildKind, StorageError,
+    StoreError,
+};
 
 /// `<base_dir>/LOCK` — the file whose `flock` makes a data directory
 /// single-writer.
@@ -20,11 +23,25 @@ pub fn relations_dir(base_dir: &str) -> String {
     format!("{base_dir}/_relations")
 }
 
+const VIEW_TAG: &str = "v_";
+const TABLE_TAG: &str = "t_";
+
 /// `<base_dir>/_relations/v_<id>` for a view, `.../t_<id>` otherwise. Id-only
 /// (no embedded name), so a RENAME never changes the path and never orphans data.
 pub fn relation_dir(base_dir: &str, kind: RelationKind, id: i64) -> String {
-    let tag = if kind.is_view() { 'v' } else { 't' };
-    format!("{}/{tag}_{id}", relations_dir(base_dir))
+    format!("{}/{}", relations_dir(base_dir), dir_name(kind.is_view(), id))
+}
+
+fn dir_name(is_view: bool, id: i64) -> String {
+    let tag = if is_view { VIEW_TAG } else { TABLE_TAG };
+    format!("{tag}{id}")
+}
+
+/// The view id `name` denotes, or `None` unless [`relation_dir`] gives that
+/// view exactly this name.
+fn parse_view_dir_name(name: &str) -> Option<i64> {
+    let id = parse_id(name.strip_prefix(VIEW_TAG)?)?;
+    (dir_name(true, id) == name).then_some(id)
 }
 
 pub(crate) fn ensure_dir(path: &str) -> Result<(), StoreError> {
@@ -88,7 +105,32 @@ pub fn lock_data_dir(base_dir: &str, retry: std::time::Duration) -> Result<fs::F
     }
 }
 
+/// One view directory's caller record, or the I/O error reading it failed with.
+type PersistedRecord = (i64, Result<Vec<u8>, StoreError>);
+
 impl RelationRegistry {
+    /// Each view directory's caller record for this slot, by id. A directory
+    /// whose manifest is absent or damaged holds none; a failed read is that
+    /// view's `Err`.
+    pub fn persisted_view_records(&self) -> Result<Vec<PersistedRecord>, StoreError> {
+        let root = relations_dir(&self.base_dir);
+        let names = subdir_names(&root).map_err(|e| StoreError::storage(format!("list '{root}'"), e))?;
+        let mut records = Vec::new();
+        for name in names {
+            let Some(id) = parse_view_dir_name(&name) else { continue };
+            let dir = format!("{root}/{name}");
+            match caller_record_at(&dir, self.slot) {
+                Ok(Some(record)) => records.push((id, Ok(record))),
+                Err(e @ StorageError::Io(_)) => records.push((
+                    id,
+                    Err(StoreError::storage(format!("read the manifest under '{dir}'"), e)),
+                )),
+                Ok(None) | Err(_) => {}
+            }
+        }
+        Ok(records)
+    }
+
     /// Drop `id`'s entry and erase this process's store for it.
     pub fn unregister_and_erase(&mut self, id: i64) -> Result<(), StoreError> {
         let Some(dir) = self.relation(id).map(|e| e.directory().to_string()) else {

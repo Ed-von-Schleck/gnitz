@@ -116,6 +116,13 @@ pub(crate) fn children_at_generation(rel_dir: &str, num_workers: u32, generation
         .all(|d| matches!(manifest::read(&d), Ok(Some(m)) if m.stamp.checkpoint_gen == generation))
 }
 
+/// The caller record of `slot`'s rows child under `rel_dir`; `Ok(None)` without
+/// a manifest.
+pub(crate) fn caller_record_at(rel_dir: &str, slot: Slot) -> Result<Option<Vec<u8>>, StorageError> {
+    let dir = ChildAddr { kind: ChildKind::Rows, slot }.dir(rel_dir);
+    Ok(manifest::read(&dir)?.map(|m| m.caller_record))
+}
+
 /// Immediate sub-directory names of `path`, none if it is missing. Collected
 /// before return, since callers remove entries from the directory they walk.
 pub(crate) fn subdir_names(path: &str) -> Result<Vec<String>, StorageError> {
@@ -135,7 +142,7 @@ pub(crate) fn subdir_names(path: &str) -> Result<Vec<String>, StorageError> {
 }
 
 /// A directory-name id component: ASCII digits only.
-fn parse_id<T: std::str::FromStr>(s: &str) -> Option<T> {
+pub(crate) fn parse_id<T: std::str::FromStr>(s: &str) -> Option<T> {
     s.bytes().all(|b| b.is_ascii_digit()).then(|| s.parse().ok())?
 }
 

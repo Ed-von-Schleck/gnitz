@@ -123,7 +123,7 @@ pub trait MirrorStore: Send {
 /// How far to tear a mirrored relation down. **A ladder: each level does
 /// everything the level above it does, and then more**, which is what makes "a
 /// cursor never outlives its copy" structural rather than a rule a caller has to
-/// remember. The hazard that costs is stated beside the implementation.
+/// remember.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Invalidate {
     /// The feed position only. The copy stands but stops answering reads, and

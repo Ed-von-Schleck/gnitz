@@ -13,7 +13,6 @@ use gnitz_core::{Invalidate, MirrorError, Schema};
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 
 use crate::handle::Mirror;
-use crate::state::MirrorRecord;
 
 impl Mirror {
     /// Reconcile the local registry against `tid`'s upstream layout: a record
@@ -30,10 +29,7 @@ impl Mirror {
         schema: &Schema,
     ) -> Result<Option<u64>, MirrorError> {
         let block = gnitz_core::protocol::codec::encode_schema_block(schema);
-        // Whatever the store holds under this name at another id was renamed or
-        // recreated upstream; its copy directory and state row outlive every
-        // checkpoint if nothing retracts them. Outside the match because a pure
-        // rename between two identically-shaped views takes the in-place arm.
+        // This name at another id was renamed or recreated upstream.
         let renamed = self
             .records
             .iter()
@@ -51,15 +47,7 @@ impl Mirror {
             }
             None => {
                 self.invalidate_inner(tid, Invalidate::Registration)?;
-                self.enter(
-                    tid,
-                    MirrorRecord {
-                        schema_name: schema_name.to_string(),
-                        name: name.to_string(),
-                        block,
-                        cursor: None,
-                    },
-                )?;
+                self.enter(tid, schema_name, name, block)?;
             }
         }
         Ok(renamed)

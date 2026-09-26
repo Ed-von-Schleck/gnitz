@@ -35,7 +35,7 @@
 mod apply;
 mod handle;
 mod reads;
+mod record;
 mod register;
-mod state;
 
 pub use handle::Mirror;

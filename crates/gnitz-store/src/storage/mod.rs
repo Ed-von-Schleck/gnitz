@@ -72,6 +72,7 @@ pub(crate) use lsm::child_dir::reclaim_retired_children;
 pub(crate) use lsm::child_dir::remove_child;
 pub(crate) use lsm::child_dir::subdir_names;
 pub use lsm::child_dir::Slot;
+pub(crate) use lsm::child_dir::{caller_record_at, parse_id};
 // Other crates' tests assert on the on-disk layout through these.
 pub use lsm::child_dir::{ChildAddr, ChildKind};
 pub(crate) use lsm::index_gather::BoundedIndexCursor;

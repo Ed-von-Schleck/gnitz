@@ -6,6 +6,8 @@ use std::sync::{Mutex, MutexGuard};
 use gnitz_core::{GnitzClient, Schema, ZSetBatch};
 use gnitz_sql::{SqlPlanner, SqlResult};
 
+pub mod copy_paths;
+
 /// Every test in this binary takes this lock.
 ///
 /// `cargo test` runs a target's tests as threads of one process, so the state a

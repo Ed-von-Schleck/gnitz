@@ -146,6 +146,9 @@ pub(crate) struct Table {
     /// The replay floor of the manifest this open loaded; 0 without one.
     replay_floor: u64,
 
+    /// What the next publish writes as the manifest's caller record.
+    caller_record: Vec<u8>,
+
     /// True when this open reloaded a generation-matching checkpointed manifest
     /// instead of starting empty.
     resumed_from_checkpoint: bool,
@@ -202,6 +205,7 @@ impl Table {
             shard_index: ShardIndex::new(dir, schema, budgets.shard, rederived),
             recovery_source,
             replay_floor: 0,
+            caller_record: Vec::new(),
             resumed_from_checkpoint: false,
             held_in_ram: false,
             retract_scratch: Cell::new(Vec::new()),
@@ -230,6 +234,7 @@ impl Table {
         }
         table.shard_index.install(loaded.as_ref())?;
         table.replay_floor = loaded.as_ref().map_or(0, |m| m.stamp.replay_floor);
+        table.caller_record = loaded.as_ref().map(|m| m.caller_record.clone()).unwrap_or_default();
         table.resumed_from_checkpoint = rederived && loaded.is_some();
 
         Ok(table)
@@ -341,6 +346,11 @@ impl Table {
     /// The replay floor of the manifest this open loaded; 0 without one.
     pub(crate) fn replay_floor(&self) -> u64 {
         self.replay_floor
+    }
+
+    /// The bytes this store's next published manifest carries for its owner.
+    pub(crate) fn set_caller_record(&mut self, record: Vec<u8>) {
+        self.caller_record = record;
     }
 
     // ------------------------------------------------------------------

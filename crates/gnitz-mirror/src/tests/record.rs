@@ -1,0 +1,71 @@
+//! The record codec: what a round trip preserves, and what bytes it refuses.
+
+use gnitz_core::{ColumnDef, Schema, TypeCode};
+
+use super::*;
+
+fn schema_block() -> Vec<u8> {
+    let schema = Schema {
+        columns: vec![
+            ColumnDef::new("id", TypeCode::U64, false),
+            ColumnDef::new("v", TypeCode::I64, true),
+        ],
+        pk_cols: vec![0],
+    };
+    gnitz_core::protocol::codec::encode_schema_block(&schema)
+}
+
+fn record(cursor: Option<DeltaCursor>) -> MirrorRecord {
+    MirrorRecord {
+        schema_name: "public".to_string(),
+        name: "recent".to_string(),
+        block: schema_block(),
+        cursor,
+    }
+}
+
+fn one_cursor() -> Option<DeltaCursor> {
+    Some(DeltaCursor { tag: 0xFEED, tick: 41 })
+}
+
+#[test]
+fn a_record_with_a_cursor_round_trips() {
+    let rec = record(one_cursor());
+    assert_eq!(MirrorRecord::decode(&rec.encode()), Some(rec));
+}
+
+/// A registration with no feed position comes back with none, rather than as a
+/// cursor at round 0 — which the next poll would answer off a copy the gate is
+/// there to refuse.
+#[test]
+fn a_record_without_a_cursor_reads_back_without_one() {
+    let rec = record(None);
+    assert_eq!(MirrorRecord::decode(&rec.encode()), Some(rec));
+}
+
+#[test]
+fn truncated_or_overlong_bytes_are_refused() {
+    let bytes = record(one_cursor()).encode();
+    for cut in 0..bytes.len() {
+        assert_eq!(MirrorRecord::decode(&bytes[..cut]), None, "bytes cut at {cut}");
+    }
+    let mut longer = bytes;
+    longer.push(0);
+    assert_eq!(MirrorRecord::decode(&longer), None);
+}
+
+#[test]
+fn an_unknown_cursor_flag_is_refused() {
+    let mut bytes = record(one_cursor()).encode();
+    bytes[0] = 2;
+    assert_eq!(MirrorRecord::decode(&bytes), None);
+}
+
+#[test]
+fn a_block_describing_no_layout_is_refused() {
+    let rec = MirrorRecord {
+        block: vec![0xAB; 20],
+        ..record(one_cursor())
+    };
+    assert_eq!(MirrorRecord::decode(&rec.encode()), None);
+}

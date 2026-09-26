@@ -709,15 +709,11 @@ impl RelationRegistry {
         StoreBudgets::new(self.config.ram_tier_bytes)
     }
 
-    /// The recovery policy for a rederived relation — a view's output store and
-    /// operator traces, a secondary index: resume from a manifest at this
-    /// registry's resume generation, and only while the host's own verdict
-    /// admits a resume at all. The one constructor of a generation-bearing
-    /// `RecoverySource`, so no consumer can sample a generation of its own at a
-    /// second moment.
-    pub(crate) fn rederive_source(&self) -> RecoverySource {
+    /// A rederived store's recovery: rebuilt, or with `resume` from a manifest at
+    /// this registry's resume generation.
+    pub(crate) fn rederive_source(&self, resume: bool) -> RecoverySource {
         RecoverySource::Rederive {
-            resume_at: self.resume_enabled.then_some(self.resume_generation),
+            resume_at: resume.then_some(self.resume_generation),
         }
     }
 }

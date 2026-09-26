@@ -20,11 +20,9 @@ mod support;
 use gnitz_core::{ClientError, GnitzClient, MirrorError, PollOutcome, PollResult, Schema, ZSetBatch};
 use gnitz_mirror::Mirror;
 use gnitz_sql::SqlPlanner;
-use gnitz_store::relation::{relation_dir, RelationKind};
-use gnitz_store::storage::{ChildAddr, ChildKind, Slot};
 use gnitz_store_testkit::{assert_child_ok, run_test_in_child, CHILD_OK};
 use gnitz_test_harness::ServerHandle;
-use gnitz_wire::ViewProps;
+use support::copy_paths::{copy_dir, has_manifest, manifest_path};
 use support::{assert_same_sequence, assert_same_zset, canonical, query, serial, sql, EnvVar};
 
 /// Four workers, because that is the only count that exercises the fan-out.
@@ -566,9 +564,6 @@ fn a_second_handle_on_one_directory_is_refused() {
 /// Two mirroring clients on two directories, in one process, each resuming its
 /// own copy.
 ///
-/// Nothing process-global decides what a store resumes from, so the two are
-/// independent: each reopens at the generation its own checkpoint published,
-/// advances rather than reseeds, and answers what the server answers.
 #[test]
 fn two_handles_on_two_directories_keep_their_own_state() {
     let _g = serial();
@@ -582,10 +577,6 @@ fn two_handles_on_two_directories_keep_their_own_state() {
     fx.quiesce();
     second.poll_mirror().expect("poll the second handle");
 
-    // Put the two directories at *different* generations, so a shared one would
-    // leave at least one of them looking for a generation its manifests never
-    // carried. The closes below checkpoint each again, first to 2, second to 1.
-    fx.mirror().checkpoint_mirror().expect("checkpoint the first copy");
     churn(&mut fx.direct, 81, 100);
     fx.quiesce();
 
@@ -610,21 +601,15 @@ fn two_handles_on_two_directories_keep_their_own_state() {
     assert_same_zset(sql_text, (&local.0, &local.1), (&remote.0, &remote.1));
 }
 
-/// A cursor naming a copy that is not there must not be honoured.
-///
-/// `forget_view` retracts the registration into the system memtable and removes
-/// the store directory at once, so an exit before the next checkpoint leaves the
-/// view replayed as registered over a store that never came back — with its
-/// cursor still in a file whose generation matches. Advancing on that cursor
-/// applies `(c, now]` onto nothing: reads answer short, and `reseeded` says
-/// `false`, so no subscriber is told.
+/// A view forgotten after its last checkpoint, then abandoned without another,
+/// bootstraps when mirrored again.
 #[test]
-fn a_cursor_naming_an_absent_copy_bootstraps() {
+fn a_view_forgotten_after_its_checkpoint_bootstraps() {
     let _g = serial();
     let (server, dir) = child_fixture();
 
     run_child(
-        "forgotten_view_leaves_its_cursor_child",
+        "forget_after_checkpoint_child",
         &server,
         &dir,
         &[],
@@ -644,12 +629,11 @@ fn a_cursor_naming_an_absent_copy_bootstraps() {
     assert_same_zset(sql_text, (&local.0, &local.1), (&remote.0, &remote.1));
 }
 
-/// Runs only in the child `a_cursor_naming_an_absent_copy_bootstraps` spawns.
+/// Runs only in the child `a_view_forgotten_after_its_checkpoint_bootstraps` spawns.
 ///
-/// What a crash or a `SIGKILL` leaves behind — a durable cursor file and a
-/// durable registration, both from the checkpoint, and no record of the forget.
+/// Checkpoints, forgets, and exits without checkpointing again.
 #[test]
-fn forgotten_view_leaves_its_cursor_child() {
+fn forget_after_checkpoint_child() {
     let Some((sock, dir)) = child_target() else { return };
     let mut mirror = mirroring_client(&sock, &dir);
     let tid = mirror.mirror_view("s", "v_keyed").expect("mirror v_keyed").view_id;
@@ -1045,59 +1029,6 @@ fn a_restart_resumes_rather_than_reseeds() {
     fx.differential("s", "SELECT * FROM v_keyed");
 }
 
-/// Both torn-checkpoint crash points reseed rather than corrupt.
-///
-/// Driven directly, against a **live** server whose tag still continues — which
-/// is the whole point: the continuing tag is what makes both failures silent
-/// without the generation header, so a test that restarted the server first
-/// would test nothing.
-///
-/// * A cursor file left at the previous checkpoint's generation beside copies
-///   published at the new one must not double any weight.
-/// * A durable generation advanced past every output manifest must not lose any
-///   row.
-#[test]
-fn a_torn_checkpoint_reseeds_rather_than_corrupts() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-
-    churn(&mut fx.direct, 1, 90);
-    fx.mirror_both();
-    fx.quiesce();
-    fx.mirror().checkpoint_mirror().expect("checkpoint");
-
-    // Case 1 — the copies moved on and were published; the cursor file did not.
-    // Snapshot the file, apply more rounds, checkpoint again, restore the old
-    // file: that is exactly a crash between the ephemeral round and the write.
-    let state_path = state_file(&fx.base_dir());
-    let stale = std::fs::read(&state_path).expect("a checkpoint writes the record file");
-    churn(&mut fx.direct, 91, 180);
-    fx.quiesce();
-    fx.mirror().checkpoint_mirror().expect("second checkpoint");
-    fx.mirror = None;
-    std::fs::write(&state_path, &stale).unwrap();
-
-    fx.open();
-    fx.mirror_both();
-    fx.quiesce();
-    fx.differential("s", "SELECT * FROM v_keyed");
-
-    // Case 2 — the generation the record file names is ahead of every output
-    // manifest, so each copy erases at open. That is the checkpoint's own
-    // generation bump with the flush round left out, which is the crash.
-    fx.mirror()
-        .checkpoint_mirror()
-        .expect("checkpoint before the torn bump");
-    fx.mirror = None;
-    patch_state_header(&fx.base_dir(), STATE_OFF_GENERATION, |g| g + 1);
-
-    fx.open();
-    fx.mirror_both();
-    fx.quiesce();
-    fx.differential("s", "SELECT * FROM v_keyed");
-    fx.differential("s", "SELECT * FROM v_repl");
-}
-
 /// An apply past the byte threshold checkpoints on its own — the 64 MB default
 /// puts it out of every other test's reach. The observable is the manifest, which
 /// only a checkpoint publishes, and this test calls none.
@@ -1117,21 +1048,11 @@ fn an_applied_delta_drives_its_own_checkpoint() {
         has_manifest(&fx.base_dir(), tid),
         "an apply past the threshold must publish the copy's manifest with no explicit checkpoint",
     );
-    assert!(
-        std::path::Path::new(&state_file(&fx.base_dir())).exists(),
-        "the same checkpoint must write the record file",
-    );
     fx.differential("s", "SELECT * FROM v_keyed");
 }
 
 /// A checkpoint by a handle that re-registered only some of its views keeps every
 /// cursor.
-///
-/// The flush round republishes every copy the store holds, so a cursor set
-/// gathered from the registrations alone strands the unclaimed one — published
-/// at the new generation with no cursor, and bootstrapped next session though it
-/// was intact.
-/// Checked by the manifest, before any further checkpoint republishes one.
 #[test]
 fn a_partially_registered_reopen_keeps_every_cursor() {
     let _g = serial();
@@ -1139,7 +1060,7 @@ fn a_partially_registered_reopen_keeps_every_cursor() {
 
     churn(&mut fx.direct, 1, 60);
     fx.mirror().mirror_view("s", "v_keyed").expect("mirror v_keyed");
-    let repl = fx.mirror().mirror_view("s", "v_repl").expect("mirror v_repl").view_id;
+    fx.mirror().mirror_view("s", "v_repl").expect("mirror v_repl");
     fx.quiesce();
     fx.mirror().checkpoint_mirror().expect("checkpoint");
 
@@ -1151,39 +1072,15 @@ fn a_partially_registered_reopen_keeps_every_cursor() {
         .expect("checkpoint with v_repl unclaimed");
 
     fx.reopen();
-    fx.mirror().mirror_view("s", "v_repl").expect("re-mirror v_repl");
+    let repl = fx.mirror().mirror_view("s", "v_repl").expect("re-mirror v_repl");
     assert!(
-        has_manifest(&fx.base_dir(), repl),
+        !repl.result.reseeded(),
         "the unclaimed view's cursor must survive the checkpoint that republished its copy",
     );
     fx.mirror().mirror_view("s", "v_keyed").expect("re-mirror v_keyed");
     fx.quiesce();
     fx.differential("s", "SELECT * FROM v_repl");
     fx.differential("s", "SELECT * FROM v_keyed");
-}
-
-/// The record file the crate writes beside the copies.
-fn state_file(base_dir: &str) -> String {
-    format!("{base_dir}/mirror_state")
-}
-
-/// Whether the mirrored copy of `view_id` currently has a published manifest —
-/// the on-disk difference between a resumed store and an erased one.
-///
-/// Built through the engine's own path grammar rather than by searching for a
-/// file of that name: it then names the copy's output store and nothing else
-/// under the tree, and it follows a change to the layout instead of quietly
-/// answering `false` forever. A copy is laid out for one worker, at the solo
-/// slot every mirror opens under.
-fn has_manifest(base_dir: &str, view_id: u64) -> bool {
-    std::path::Path::new(&ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO }.manifest(&copy_dir(base_dir, view_id)))
-        .exists()
-}
-
-/// The directory one mirrored copy lives in, through the engine's own path
-/// grammar — the same reason [`has_manifest`] builds its path that way.
-fn copy_dir(base_dir: &str, view_id: u64) -> String {
-    relation_dir(base_dir, RelationKind::View(ViewProps::Plain), view_id as i64)
 }
 
 /// A server restart erases the copy: the stored cursor tag no longer matches the
@@ -1209,22 +1106,6 @@ fn a_server_restart_reseeds_the_copy() {
     fx.quiesce();
     fx.differential("s", "SELECT * FROM v_keyed");
     fx.differential("s", "SELECT * FROM v_repl");
-}
-
-/// Byte offset of the `mirror_state` generation word the test above fabricates.
-/// The crate owns the layout; this is what a torn checkpoint is *expressible
-/// as*, so a layout change that moved it would fail that test rather than
-/// silently stop testing anything.
-const STATE_OFF_GENERATION: usize = 0;
-
-/// Rewrite one `u64` of the mirror's record-file header, to fabricate a durable
-/// state the handle would never write.
-fn patch_state_header(base_dir: &str, offset: usize, f: impl FnOnce(u64) -> u64) {
-    let path = state_file(base_dir);
-    let mut bytes = std::fs::read(&path).expect("a checkpoint wrote the record file");
-    let old = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
-    bytes[offset..offset + 8].copy_from_slice(&f(old).to_le_bytes());
-    std::fs::write(&path, &bytes).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -2480,34 +2361,25 @@ fn an_expired_cursor_reseeds_inside_the_poll() {
     fx.differential("s", "SELECT a, v FROM v_tiny WHERE a > 4000");
 }
 
-/// A reopen that changes nothing rewrites nothing.
-///
-/// The checkpoint decides by comparing the bytes it would write against the ones
-/// the file holds, so nothing has to be enumerated and no mutation site has to
-/// remember to mark anything dirty. The generation word is the observable: only a
-/// write advances it.
+/// A close that changes nothing publishes no manifest; a publish renames a fresh
+/// inode in.
 #[test]
-fn a_reopen_that_changes_nothing_elides_its_checkpoint() {
+fn a_close_that_changes_nothing_writes_nothing() {
     let _g = serial();
     let mut fx = Fixture::start();
     churn(&mut fx.direct, 1, 40);
-    fx.mirror_both();
+    let (keyed, repl) = fx.mirror_both();
     fx.quiesce();
     fx.mirror().checkpoint_mirror().expect("checkpoint");
-    let published = state_generation(&fx.base_dir());
+    let inodes = |base_dir: &str| [keyed, repl].map(|tid| manifest_inode(base_dir, tid));
+    let published = inodes(&fx.base_dir());
 
     // `reopen` is an exit checkpoint plus a fresh open on the same directory.
     fx.reopen();
     assert_eq!(
-        state_generation(&fx.base_dir()),
+        inodes(&fx.base_dir()),
         published,
-        "closing a store whose records did not move must write nothing",
-    );
-    fx.mirror().checkpoint_mirror().expect("an idle checkpoint");
-    assert_eq!(
-        state_generation(&fx.base_dir()),
-        published,
-        "and neither does an explicit one right after the open",
+        "closing a store whose copies did not move must write nothing",
     );
 
     fx.mirror_both();
@@ -2515,10 +2387,12 @@ fn a_reopen_that_changes_nothing_elides_its_checkpoint() {
     fx.differential("s", "SELECT * FROM v_keyed");
 }
 
-/// The generation word the state file's header carries.
-fn state_generation(base_dir: &str) -> u64 {
-    let bytes = std::fs::read(state_file(base_dir)).expect("a written state file");
-    u64::from_le_bytes(bytes[..8].try_into().unwrap())
+/// The inode of the mirrored copy of `view_id`'s manifest.
+fn manifest_inode(base_dir: &str, view_id: u64) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(manifest_path(base_dir, view_id))
+        .expect("a published manifest")
+        .ino()
 }
 
 /// A view another client renamed keeps its copy when this client re-mirrors it
@@ -2568,13 +2442,8 @@ fn a_view_renamed_upstream_survives_a_new_view_under_its_old_name() {
 }
 
 /// Two views cross-renamed upstream: `v_a → v_c`, then `v_b → v_a`. Mirroring
-/// the reused name must retract the copy that lost it, or its directory, its
-/// registry entry and its state row outlive every checkpoint with nothing left
-/// to poll them — the client has dropped the id.
-///
-/// Both views have the same column layout, so their schema blocks are
-/// byte-identical and the record at `v_b`'s id stands: the registration takes
-/// the rename-in-place arm, which is the one that used to retract nothing.
+/// the reused name retracts the copy that lost it. Both views share a layout, so
+/// the registration at `v_b`'s id takes the rename-in-place arm.
 #[test]
 fn a_cross_rename_retracts_the_copy_that_lost_its_name() {
     let _g = serial();

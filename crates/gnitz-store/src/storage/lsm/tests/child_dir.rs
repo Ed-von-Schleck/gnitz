@@ -67,6 +67,7 @@ fn stamp(dir: &str, generation: u64) {
             ..Default::default()
         },
         run_bytes: 0,
+        caller_record: Vec::new(),
         entries: Vec::new(),
     };
     manifest::prepare(dir, &manifest::encode(&m)).unwrap().commit().unwrap();

@@ -253,3 +253,59 @@ fn a_unique_index_covering_the_pk_has_nothing_left_to_check() {
         .collect();
     assert_eq!(cols, vec![vec![1u32]]);
 }
+
+/// Only a directory named exactly as a view's is read, and a damaged manifest
+/// holds no record.
+#[test]
+fn persisted_view_records_reads_well_formed_view_manifests() {
+    let mut registry = solo_registry("persisted_view_records");
+    registry.set_resume_enabled(true);
+    let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
+    let view = RelationKind::View(ViewProps::Plain);
+    let (good, damaged) = (123, 124);
+    let good_dir = register_entry(&mut registry, good, schema, view);
+    let damaged_dir = register_entry(&mut registry, damaged, schema, view);
+    registry.set_caller_record(good, b"good".to_vec()).unwrap();
+    registry.set_caller_record(damaged, b"damaged".to_vec()).unwrap();
+    registry.checkpoint_ephemeral([]).unwrap();
+
+    let rows = ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO };
+    let manifest = rows.manifest(&damaged_dir);
+    let mut bytes = std::fs::read(&manifest).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    std::fs::write(&manifest, bytes).unwrap();
+    // A name that parses to `good`'s id but is not the name its directory has.
+    let alias = format!("{}/v_0{good}", relations_dir(&registry.base_dir));
+    let alias_rows = rows.dir(&alias);
+    std::fs::create_dir_all(&alias_rows).unwrap();
+    std::fs::copy(rows.manifest(&good_dir), format!("{alias_rows}/manifest.bin")).unwrap();
+
+    let records: Vec<(i64, Vec<u8>)> = registry
+        .persisted_view_records()
+        .unwrap()
+        .into_iter()
+        .map(|(id, r)| (id, r.unwrap()))
+        .collect();
+    assert_eq!(records, vec![(good, b"good".to_vec())]);
+}
+
+/// `reopen_view` enters a view only when its rows open from the manifest.
+#[test]
+fn reopen_view_refuses_a_view_with_no_manifest() {
+    let mut registry = solo_registry("reopen_view");
+    let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
+    let spec = |id| RelationSpec {
+        id,
+        kind: RelationKind::View(ViewProps::Plain),
+        schema,
+    };
+    register_entry(&mut registry, 7, schema, RelationKind::View(ViewProps::Plain));
+    registry.checkpoint_ephemeral([]).unwrap();
+    registry.unregister(7);
+
+    registry.reopen_view(spec(7)).expect("a published view reopens");
+    assert!(registry.relation(7).is_some_and(Relation::resumed));
+    assert!(registry.reopen_view(spec(8)).is_err());
+    assert!(registry.relation(8).is_none(), "a refused view is not entered");
+}

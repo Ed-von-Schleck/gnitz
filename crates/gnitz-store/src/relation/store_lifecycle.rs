@@ -31,7 +31,7 @@ impl RelationRegistry {
         for tid in tids {
             self.rebuild_relation_store(tid, "open store")?;
         }
-        let (recovery, budgets) = (self.rederive_source(), self.store_budgets());
+        let (recovery, budgets) = (self.rederive_source(self.resume_enabled), self.store_budgets());
         let chunk_rows = self.config.scan_chunk_rows;
         let mut filled = 0usize;
         for entry in self.tables.values_mut() {
@@ -70,7 +70,7 @@ impl RelationRegistry {
             (e.directory().to_string(), e.schema(), e.kind())
         };
         let stores = self
-            .build_relation_store(kind, &dir, tid, schema)
+            .build_relation_store(kind, &dir, tid, schema, false)
             .map_err(|e| e.in_context(&format!("{what} tid={tid}")))?;
         self.tables.get_mut(&tid).expect("entry read above").set_stores(stores);
         Ok(())
@@ -116,6 +116,17 @@ impl RelationRegistry {
             .unlink_manifest()
             .map_err(|e| StoreError::storage(format!("reset_view: unlink manifest of {vid}"), e))?;
         self.rebuild_relation_store(vid, "reset view output")
+    }
+
+    /// The bytes `id`'s next published manifest carries beside its rows.
+    pub fn set_caller_record(&mut self, id: i64, record: Vec<u8>) -> Result<(), StoreError> {
+        self.relation_mut_or_err(id)
+            .map_err(|e| e.in_context("set_caller_record"))?
+            .store
+            .table_mut()
+            .ok_or_else(|| StoreError::rejected(format!("relation {id} holds no store in this process")))?
+            .set_caller_record(record);
+        Ok(())
     }
 
     /// Start rebuilding `vid` if it is non-resumable: remove the operator traces

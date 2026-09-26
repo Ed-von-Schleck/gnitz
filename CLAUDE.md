@@ -362,7 +362,7 @@ alone, and `gnitz-server` is a binary nothing can link.
 | `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `expr`, `mirror`, `sql`, `wire` |
 | `gnitz-store` | The Z-set store: columnar batches, the LSM, the DBSP operators, the relation registry, the `ReadSpec` executor | `foundation`, `wire`, `expr` |
 | `gnitz-server` | The multi-process server binary: the DBSP layer — circuit compiler, bytecode VM, epoch execution, system-table catalog — under the `runtime` rung that drives it | `foundation`, `store`, `wire`, `expr` |
-| `gnitz-mirror` | The mirror store: the local copy a client reads through, and the one implementor of `gnitz-core`'s `MirrorStore` — the one crate on both sides, and a leaf. Drives `gnitz-store` directly and links no DBSP layer | `foundation`, `core`, `expr`, `store`, `wire` |
+| `gnitz-mirror` | The mirror store: the local copy a client reads through, and the one implementor of `gnitz-core`'s `MirrorStore` — the one crate on both sides, and a leaf. Drives `gnitz-store` directly and links no DBSP layer | `foundation`, `core`, `store`, `wire` |
 | `gnitz-store-testkit` | Dev-only: `gnitz-store`'s test helpers, compiled as a library so other crates' tests reach them | `store`, `wire` |
 | `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests | — |
 

@@ -7,7 +7,7 @@ use crate::schema::MAX_PK_BYTES;
 use gnitz_wire::{Reader, Writer};
 
 const MAGIC: u64 = 0x4D414E49464E5447;
-const VERSION: u64 = 14;
+const VERSION: u64 = 15;
 
 const MANIFEST_FILE: &str = "manifest.bin";
 
@@ -29,6 +29,8 @@ pub(crate) struct Manifest {
     /// The shard index's `R`. Stored, not derived: a guard of one distinct key
     /// outgrows `R` and cannot be split, so no shard size recovers it.
     pub run_bytes: u64,
+    /// Bytes the store's owner publishes with its rows; opaque here.
+    pub caller_record: Vec<u8>,
     pub entries: Vec<ManifestEntry>,
 }
 
@@ -52,7 +54,8 @@ pub(crate) fn encode(m: &Manifest) -> Vec<u8> {
         .u64(VERSION)
         .u64(m.stamp.checkpoint_gen)
         .u64(m.stamp.replay_floor)
-        .u64(m.run_bytes);
+        .u64(m.run_bytes)
+        .bytes32(&m.caller_record);
     for e in &m.entries {
         w.u64(e.seq).u64(e.newest).u64(e.level).bytes32(e.guard_key.pk_bytes());
     }
@@ -86,6 +89,7 @@ fn decode_body(r: &mut Reader) -> Result<Manifest, String> {
             replay_floor: r.u64()?,
         },
         run_bytes: r.u64()?,
+        caller_record: r.bytes32()?.to_vec(),
         entries: Vec::new(),
     };
     while r.remaining() > 0 {

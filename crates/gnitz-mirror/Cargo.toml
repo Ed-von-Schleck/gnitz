@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 gnitz-foundation = { path = "../gnitz-foundation" }
 gnitz-core = { path = "../gnitz-core" }
-gnitz-expr = { path = "../gnitz-expr" }
 gnitz-store = { path = "../gnitz-store" }
 gnitz-wire = { path = "../gnitz-wire" }
 

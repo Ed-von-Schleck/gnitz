@@ -3,11 +3,13 @@ use crate::test_support::sweep_bit_flips;
 use gnitz_wire::write_u64_le;
 
 /// A manifest with `count` entries alternating L0 (empty guard key) and L1 (an
-/// 8-byte guard key), so every field shape round-trips.
+/// 8-byte guard key), and a `count`-byte caller record, so every field shape
+/// round-trips.
 fn sample(count: usize) -> Manifest {
     Manifest {
         stamp: ManifestStamp { checkpoint_gen: 5, replay_floor: 11 },
         run_bytes: 9 << 20,
+        caller_record: (0..count as u8).map(|b| b ^ 0xA5).collect(),
         entries: (0..count)
             .map(|i| {
                 let level = (i % 2) as u64;

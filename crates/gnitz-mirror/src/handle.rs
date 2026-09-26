@@ -7,11 +7,11 @@ use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RawBlock, Sc
 use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::gnitz_debug;
-use gnitz_store::relation::{lock_data_dir, Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
+use gnitz_store::relation::{lock_data_dir, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use gnitz_store::storage::{Slot, StoreError};
 use gnitz_wire::ViewProps;
 
-use crate::state::{encode_records, read_state, write_state, MirrorRecord};
+use crate::record::MirrorRecord;
 
 /// Applied delta bytes after which an apply drives a checkpoint of its own.
 /// `GNITZ_MIRROR_CHECKPOINT_BYTES` overrides it.
@@ -24,16 +24,11 @@ pub(crate) fn engine(e: StoreError) -> MirrorError {
 }
 
 /// `GNITZ_INJECT_MIRROR_CHECKPOINT_ERROR`: fail the next checkpoint once, before
-/// anything durable moved; the after-flush shape is the torn-checkpoint test's.
-/// Debug-only. It is the only way to reach [`Mirror::checkpoint`]'s
-/// report-rather-than-poison path without a disk fault.
+/// anything durable moved. Debug-only.
 static CHECKPOINT_ERROR: Seam = Seam::new("GNITZ_INJECT_MIRROR_CHECKPOINT_ERROR");
 
 /// `GNITZ_INJECT_MIRROR_BOOTSTRAP_ERROR`: fail the next `Invalidate::Copy` once,
 /// after the cursor is dropped and the copy erased. Debug-only.
-///
-/// Makes the window deterministic: copy gone, no cursor, registration standing.
-/// A transport failure reaches it too.
 static BOOTSTRAP_ERROR: Seam = Seam::new("GNITZ_INJECT_MIRROR_BOOTSTRAP_ERROR");
 
 /// `GNITZ_INJECT_MIRROR_INGEST_PANIC`: panic once on a poll's apply, idle polls
@@ -47,26 +42,13 @@ static INGEST_PANIC: Seam = Seam::new("GNITZ_INJECT_MIRROR_INGEST_PANIC");
 /// own server id in one data directory, under one lock and one checkpoint. Each
 /// carries its own cursor and is advanced independently.
 pub struct Mirror {
-    /// The relations this store holds and the stores behind them — the engine's
-    /// L4 rung and **nothing above it**. No compiler, no VM, no catalog: a copy
-    /// is fed by direct ingest of drained deltas and never by evaluating a
-    /// circuit, so the whole DBSP layer is unreachable from here.
     pub(crate) registry: RelationRegistry,
-    /// Key set equals the registry's: [`Mirror::enter`] and the
-    /// [`Invalidate::Registration`] arm are the two writers of both.
+    /// One per relation in `registry`.
     pub(crate) records: HashMap<u64, MirrorRecord>,
     base_dir: String,
-    /// The `flock`ed handle on `base_dir`'s lock file, held only to be dropped:
-    /// declared after `registry`, so field drop order releases it once every
-    /// store is gone, which is what makes the next open of this directory
-    /// succeed.
+    /// Declared after `registry`, so it is released once every store has closed.
     _dir_lock: std::fs::File,
     poison: Option<String>,
-    /// The state file's body as it was last written; a checkpoint that would
-    /// rewrite it unchanged is skipped. The bytes and not a dirty bit, so no
-    /// mutation site has to remember to set one — and a bit stuck false would
-    /// stop the store checkpointing for good.
-    published_block: Vec<u8>,
     applied_bytes: usize,
     checkpoint_bytes: usize,
 }
@@ -83,73 +65,56 @@ impl Mirror {
     /// store in this one. The store homes at `w0of1` whatever process it runs
     /// in, under a directory it locks itself.
     pub fn open(base_dir: &str) -> Result<Self, MirrorError> {
-        // No retry: a mirror directory is never inherited by a forked child of
-        // its previous holder, so a held lock is a live holder.
+        // No retry: no forked child inherits a mirror's lock, so a holder is live.
         let dir_lock = lock_data_dir(base_dir, std::time::Duration::ZERO).map_err(engine)?;
-
-        // The mirror's own knobs, under its own prefix.
-        let config = StoreConfig::from_env("GNITZ_MIRROR_");
-        let state = read_state(base_dir);
-        let mut registry = RelationRegistry::new(base_dir, Slot::SOLO, config);
-        // A copy holds no operator state, so only the generation decides a resume.
-        registry.set_resume_enabled(true);
-        if let Some((s, _)) = &state {
-            registry.set_resume_generation(s.generation);
-        }
-
+        let registry = RelationRegistry::new(base_dir, Slot::SOLO, StoreConfig::from_env("GNITZ_MIRROR_"));
+        let persisted = registry.persisted_view_records().map_err(engine)?;
         let mut mirror = Mirror {
             registry,
             records: HashMap::new(),
             base_dir: base_dir.to_string(),
             _dir_lock: dir_lock,
             poison: None,
-            published_block: Vec::new(),
             applied_bytes: 0,
             checkpoint_bytes: env_num("GNITZ_MIRROR_CHECKPOINT_BYTES", DEFAULT_CHECKPOINT_BYTES),
         };
-        // An unreadable or absent file leaves the generation at 0 with no record,
-        // so nothing is entered and every view bootstraps.
-        let mut entry_failed = false;
-        if let Some((state, body)) = state {
-            // Every record's store opens here, before any `mirror_view` supplies
-            // a schema — which is why the record carries the schema block.
-            for (tid, rec) in state.records.iter() {
-                // A failed `enter` inserts into neither map, so the record goes
-                // with it and that view bootstraps.
-                if let Err(e) = mirror.enter(*tid, rec.clone()) {
-                    gnitz_debug!("mirror: relation {} did not open, so it bootstraps: {}", tid, e);
-                    entry_failed = true;
-                }
-            }
-            mirror.published_block = body;
-            // A cursor naming a copy that did not come back is dropped, which
-            // makes its view bootstrap.
-            for (tid, r) in &mut mirror.records {
-                if !mirror.registry.relation(*tid as i64).is_some_and(Relation::resumed) {
-                    r.cursor = None;
-                }
+        let mut all_reopened = true;
+        for (id, record) in persisted {
+            let tid = id as u64;
+            let reopened = match record.map(|bytes| MirrorRecord::decode(&bytes)) {
+                Ok(Some(rec)) => mirror.reopen(tid, rec),
+                // Damage: the sweep below removes the directory.
+                Ok(None) => continue,
+                Err(e) => Err(engine(e)),
+            };
+            if let Err(e) = reopened {
+                gnitz_debug!("mirror: relation {} did not reopen, so it bootstraps: {}", tid, e);
+                all_reopened = false;
             }
         }
-        // With nothing entered — a lost `mirror_state` — this covers every
-        // directory, whose stale manifests the restarted generation would accept.
-        // Skipped after a failed `enter`: the fault may be transient.
-        if !entry_failed {
+        // A failure may be transient, and the sweep would delete that copy.
+        if all_reopened {
             mirror.registry.reclaim_orphan_relation_dirs();
         }
         Ok(mirror)
     }
 
-    /// Enter one relation: open its copy under `<base_dir>/_relations` and record
-    /// it.
-    pub(crate) fn enter(&mut self, tid: u64, rec: MirrorRecord) -> Result<(), MirrorError> {
-        let schema = crate::register::descriptor_of_block(&rec.block)?;
-        self.registry
-            .register(RelationSpec {
-                id: tid as i64,
-                kind: RelationKind::View(ViewProps::Plain),
-                schema,
-            })
-            .map_err(engine)?;
+    /// Open an empty copy of `tid`, registered with no feed position.
+    pub(crate) fn enter(&mut self, tid: u64, schema_name: &str, name: &str, block: Vec<u8>) -> Result<(), MirrorError> {
+        self.registry.register(copy_spec(tid, &block)?).map_err(engine)?;
+        let rec = MirrorRecord {
+            schema_name: schema_name.to_string(),
+            name: name.to_string(),
+            block,
+            cursor: None,
+        };
+        self.records.insert(tid, rec);
+        Ok(())
+    }
+
+    /// Reopen `tid`'s copy from the manifest `rec` was read from.
+    fn reopen(&mut self, tid: u64, rec: MirrorRecord) -> Result<(), MirrorError> {
+        self.registry.reopen_view(copy_spec(tid, &rec.block)?).map_err(engine)?;
         self.records.insert(tid, rec);
         Ok(())
     }
@@ -203,45 +168,25 @@ impl Mirror {
 
     // -- Checkpoint --------------------------------------------------------
 
-    /// Make every copy and the record of where its feed got to durable: raise
-    /// the generation fence, flush the copies to it, then write `mirror_state`
-    /// naming that generation — in that order, so a crash leaves the file
-    /// naming an older generation than the manifests and every view bootstraps.
-    /// A round that would rewrite the records unchanged is skipped: every
-    /// manifest is already at the named generation.
-    ///
-    /// **A failed checkpoint is reported, not poisoned** — the one `Err` here
-    /// that is not fatal. The flush writes shards and publishes manifests;
-    /// neither mutates what a store holds, so every copy is intact in the RAM
-    /// tier and retrying is sound.
+    /// Publish every copy with its record. A failure is reported, not poisoned:
+    /// a flush leaves every store holding what it held.
     fn checkpoint_inner(&mut self) -> Result<(), MirrorError> {
-        let block = encode_records(&self.records);
-        if block == self.published_block {
-            return Ok(());
-        }
-        // Cleared before the fallible work below: a failing checkpoint must not
-        // leave it over threshold, or every later ingest retries one.
         self.applied_bytes = 0;
         if CHECKPOINT_ERROR.take_once() {
             return Err(MirrorError::Engine("injected checkpoint failure".to_string()));
         }
-        let generation = self.registry.resume_generation() + 1;
-        self.registry.set_resume_generation(generation);
-        self.registry.checkpoint_ephemeral([]).map_err(engine)?;
-        write_state(&self.base_dir, generation, &block)?;
-        self.published_block = block;
-        Ok(())
+        for (&tid, rec) in &self.records {
+            self.registry
+                .set_caller_record(tid as i64, rec.encode())
+                .map_err(engine)?;
+        }
+        self.registry.checkpoint_ephemeral([]).map_err(engine)
     }
 
     // -- Teardown ----------------------------------------------------------
 
-    /// [`Invalidate`]'s ladder, as one body that stops where the caller asked.
-    ///
-    /// The cursor goes first at every level, and that is the whole reason the
-    /// three teardowns are one method: a cursor left standing over an erased copy
-    /// makes the next poll deliver `(T, …]` onto an empty store and lose
-    /// everything at or below `T` in silence, and no tag check can see it — a
-    /// local retraction leaves the server's tag identical.
+    /// [`Invalidate`]'s ladder, stopping where the caller asked. The cursor goes
+    /// first at every level.
     pub(crate) fn invalidate_inner(&mut self, tid: u64, level: Invalidate) -> Result<(), MirrorError> {
         let Some(rec) = self.records.get_mut(&tid) else {
             return Ok(());
@@ -250,10 +195,6 @@ impl Mirror {
         match level {
             Invalidate::Cursor => Ok(()),
             Invalidate::Copy => {
-                // The reset unlinks this worker's child manifest, so the rebuilt
-                // store's `Rederive` open reads `None` and *erases* the stale
-                // shards rather than reloading them, then rebuilds the handle
-                // empty. It is exactly the state transition a bootstrap needs.
                 self.registry
                     .reset_view(tid as i64)
                     .map_err(|e| self.poison(format!("erasing the copy of {tid} failed: {e}")))?;
@@ -264,8 +205,6 @@ impl Mirror {
             }
             Invalidate::Registration => {
                 self.records.remove(&tid);
-                // The directory goes now: a mirror re-registers ids within one
-                // session, so a later `enter` would reopen these shards.
                 self.registry
                     .unregister_and_erase(tid as i64)
                     .map_err(|e| self.poison(format!("erasing the copy of {tid} failed: {e}")))
@@ -357,4 +296,13 @@ impl MirrorStore for Mirror {
     fn poisoned(&self) -> Option<&str> {
         self.poison.as_deref()
     }
+}
+
+/// The registration of `tid`'s copy, in the layout `block` describes.
+fn copy_spec(tid: u64, block: &[u8]) -> Result<RelationSpec, MirrorError> {
+    Ok(RelationSpec {
+        id: tid as i64,
+        kind: RelationKind::View(ViewProps::Plain),
+        schema: crate::register::descriptor_of_block(block)?,
+    })
 }

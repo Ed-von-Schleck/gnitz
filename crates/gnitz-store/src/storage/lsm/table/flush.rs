@@ -114,7 +114,9 @@ impl Table {
         if let Some(run) = self.ram_tier.fold_to_single(&self.shard_index.schema) {
             self.spill_ram_tier(run)?;
         }
-        let bytes = manifest::encode(&self.shard_index.manifest(stamp));
+        let mut m = self.shard_index.manifest(stamp);
+        m.caller_record.clone_from(&self.caller_record);
+        let bytes = manifest::encode(&m);
         if self.durable_manifest.as_deref() == Some(&bytes[..]) {
             debug_assert!(
                 self.shard_index.unsynced_paths().next().is_none(),

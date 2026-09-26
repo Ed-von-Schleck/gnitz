@@ -12,9 +12,27 @@ static TABLE_CREATE_DELAY: Seam = Seam::new("GNITZ_INJECT_TABLE_CREATE_DELAY_MS"
 impl RelationRegistry {
     /// Enter a relation and open its stores.
     pub fn register(&mut self, spec: RelationSpec) -> Result<(), StoreError> {
+        self.enter(spec, false)
+    }
+
+    /// Enter a view whose rows open from the manifest already in its directory;
+    /// `Err`, entering nothing, otherwise.
+    pub fn reopen_view(&mut self, spec: RelationSpec) -> Result<(), StoreError> {
+        let id = spec.id;
+        self.enter(spec, true)?;
+        if self.relation(id).is_some_and(Relation::resumed) {
+            return Ok(());
+        }
+        self.unregister(id);
+        Err(StoreError::rejected(format!(
+            "view {id} did not reopen from its manifest"
+        )))
+    }
+
+    fn enter(&mut self, spec: RelationSpec, from_manifest: bool) -> Result<(), StoreError> {
         let RelationSpec { id, kind, schema } = spec;
         let directory = relation_dir(&self.base_dir, kind, id);
-        let (store, delta) = self.build_relation_store(kind, &directory, id, schema)?;
+        let (store, delta) = self.build_relation_store(kind, &directory, id, schema, from_manifest)?;
         let relation = Relation {
             id,
             store,
@@ -34,6 +52,7 @@ impl RelationRegistry {
         directory: &str,
         id: i64,
         schema: SchemaDescriptor,
+        from_manifest: bool,
     ) -> Result<(Store, Option<Box<Store>>), StoreError> {
         let props = match kind {
             RelationKind::View(p) => p,
@@ -56,8 +75,9 @@ impl RelationRegistry {
             RelationKind::Stream => return Ok((Store::detached(schema), None)),
             // A view's output store and its operator traces resume from the
             // manifest the ephemeral checkpoint round stamped, or are rebuilt.
-            RelationKind::View(_) if self.non_resumable.contains(&id) => RecoverySource::Rederive { resume_at: None },
-            RelationKind::View(_) => self.rederive_source(),
+            RelationKind::View(_) if from_manifest => self.rederive_source(true),
+            RelationKind::View(_) if self.non_resumable.contains(&id) => self.rederive_source(false),
+            RelationKind::View(_) => self.rederive_source(self.resume_enabled),
             RelationKind::SystemCatalog | RelationKind::BaseTable => RecoverySource::SalReplay,
         };
         ensure_dir(directory)?;

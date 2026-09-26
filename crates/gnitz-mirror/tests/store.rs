@@ -11,13 +11,17 @@ use std::sync::{Mutex, MutexGuard};
 
 use gnitz_core::{ColumnDef, DeltaCursor, Invalidate, MirrorError, MirrorStore, RawBlock, Schema, TypeCode, ZSetBatch};
 use gnitz_mirror::Mirror;
-use gnitz_store::relation::{relation_dir, RelationKind};
 use gnitz_store::schema::make_delta_schema;
-use gnitz_store::storage::{Batch, ChildAddr, ChildKind, Slot};
+use gnitz_store::storage::Batch;
 use gnitz_store_testkit::{
     assert_child_ok, in_child_test, make_batch, make_schema_u64_i64, run_test_in_child, scratch_dir, CHILD_OK,
 };
-use gnitz_wire::{ReadBound, ReadSpec, ViewProps};
+use gnitz_wire::{ReadBound, ReadSpec};
+
+#[path = "support/copy_paths.rs"]
+mod copy_paths;
+use copy_paths::{copy_dir, has_manifest, manifest_path};
+use gnitz_store::storage::{ChildAddr, ChildKind, Slot};
 
 /// Every test in this binary takes this lock: `cargo test` runs a target's tests
 /// as threads of one process, and a store open touches process-wide state — the
@@ -111,18 +115,6 @@ fn whole_copy(store: &mut Mirror, tid: u64) -> Result<ZSetBatch, MirrorError> {
     store.scan_spec(tid, ReadSpec::all_rows(ReadBound::None), &view_schema())
 }
 
-/// One copy's directory, through the engine's own path grammar.
-fn copy_dir(base_dir: &str, tid: u64) -> String {
-    relation_dir(base_dir, RelationKind::View(ViewProps::Plain), tid as i64)
-}
-
-/// Whether `tid`'s copy currently has a published manifest — the on-disk
-/// difference between a checkpointed store and one that never published.
-fn has_manifest(base_dir: &str, tid: u64) -> bool {
-    std::path::Path::new(&ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO }.manifest(&copy_dir(base_dir, tid)))
-        .exists()
-}
-
 /// Two registered copies, one row each at round 4, checkpointed and closed.
 /// Returns the directory.
 fn two_checkpointed_copies(name: &str) -> String {
@@ -136,13 +128,26 @@ fn two_checkpointed_copies(name: &str) -> String {
     dir
 }
 
-/// Make `tid`'s copy refuse to open: a regular file where its per-worker child
-/// directory belongs. The copy's own directory stays a directory, so a sweep can
-/// still remove it.
+/// Make `tid`'s copy refuse to open: its per-worker child directory moves out of
+/// the copies tree and a regular file takes its place. [`unblock_copy`] undoes it.
 fn block_copy(base_dir: &str, tid: u64) {
-    let child = ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO }.dir(&copy_dir(base_dir, tid));
-    std::fs::remove_dir_all(&child).expect("the copy's child directory");
+    let child = rows_dir(base_dir, tid);
+    std::fs::rename(&child, aside(base_dir, tid)).expect("the copy's child directory");
     std::fs::write(&child, b"not a directory").expect("block the child path");
+}
+
+fn unblock_copy(base_dir: &str, tid: u64) {
+    let child = rows_dir(base_dir, tid);
+    std::fs::remove_file(&child).unwrap();
+    std::fs::rename(aside(base_dir, tid), &child).unwrap();
+}
+
+fn rows_dir(base_dir: &str, tid: u64) -> String {
+    ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO }.dir(&copy_dir(base_dir, tid))
+}
+
+fn aside(base_dir: &str, tid: u64) -> String {
+    format!("{base_dir}/aside_{tid}")
 }
 
 /// The `MirrorStore` bound the client's `Box<dyn MirrorStore>` needs.
@@ -247,13 +252,7 @@ fn an_ingest_applies_before_it_advances() {
     );
 }
 
-/// A checkpoint covers every copy the store holds a position for — including one
-/// this session never re-registered.
-///
-/// The flush round republishes every copy the store holds, so a cursor set
-/// gathered from this session's registrations alone would strand the unclaimed
-/// one: published at the new generation with no cursor, and bootstrapped next
-/// session though it was intact.
+/// A checkpoint keeps the position of a copy this session never re-registered.
 #[test]
 fn a_checkpoint_covers_a_cursor_this_session_never_claimed() {
     let _g = serial();
@@ -360,6 +359,58 @@ fn an_unopenable_copy_bootstraps_and_its_siblings_resume() {
         BTreeMap::from([((9, 90), 1)]),
         "with the rows that went with it",
     );
+}
+
+/// A copy erased and refilled to its checkpointed cursor is published again.
+#[test]
+fn a_copy_erased_and_refilled_to_the_same_cursor_is_published() {
+    let _g = serial();
+    let (mut store, dir) = registered("erased_and_refilled");
+    store.ingest(TID, plain(&[(1, 1, 10)]), cursor(4)).unwrap();
+    store.checkpoint().unwrap();
+    store.invalidate(TID, Invalidate::Copy).unwrap();
+    store.ingest(TID, plain(&[(1, 1, 10)]), cursor(4)).unwrap();
+    store.checkpoint().unwrap();
+    drop(store);
+
+    let mut store = Mirror::open(&dir).expect("the store reopens");
+    assert_eq!(store.cursor_of(TID), Some(cursor(4)), "the refilled copy resumes");
+    assert_eq!(held(&mut store, TID), BTreeMap::from([((1, 10), 1)]));
+}
+
+/// A damaged manifest costs that copy alone.
+#[test]
+fn a_damaged_copy_manifest_costs_that_copy_alone() {
+    let _g = serial();
+    let dir = two_checkpointed_copies("damaged_manifest");
+    let manifest = manifest_path(&dir, TID);
+    let mut bytes = std::fs::read(&manifest).unwrap();
+    bytes[20] ^= 1;
+    std::fs::write(&manifest, bytes).unwrap();
+
+    let mut store = Mirror::open(&dir).expect("one damaged copy must not fail the open");
+    assert_eq!(store.cursor_of(TID), None, "the damaged copy bootstraps");
+    assert!(
+        !std::path::Path::new(&copy_dir(&dir, TID)).exists(),
+        "and its directory is swept",
+    );
+    assert_eq!(store.cursor_of(OTHER_TID), Some(cursor(4)), "its sibling resumes");
+    assert_eq!(held(&mut store, OTHER_TID), BTreeMap::from([((9, 90), 1)]));
+}
+
+/// A registration after the open starts empty, even over rows the open left.
+#[test]
+fn a_registration_after_the_open_starts_empty() {
+    let _g = serial();
+    let dir = two_checkpointed_copies("registration_after_open");
+    block_copy(&dir, TID);
+    let mut store = Mirror::open(&dir).expect("one unopenable copy must not fail the open");
+    assert_eq!(store.cursor_of(TID), None);
+    unblock_copy(&dir, TID);
+
+    store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
+    assert_eq!(store.cursor_of(TID), None, "a fresh registration has no position");
+    assert!(held(&mut store, TID).is_empty(), "and holds none of the old rows");
 }
 
 /// When every copy fails to open, the orphan sweep is skipped: the fault may be

@@ -28,6 +28,7 @@ impl ShardIndex {
         Manifest {
             stamp,
             run_bytes: self.l0_run_bytes,
+            caller_record: Vec::new(),
             entries,
         }
     }

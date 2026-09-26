@@ -1681,3 +1681,34 @@ fn repeated_flushes_compact_l0() {
         "L0 must be compacted: {shards} shards after {flushes} flushes"
     );
 }
+
+/// A caller record is read back with its manifest and republished when it
+/// changes.
+#[test]
+fn a_caller_record_is_published_with_the_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let tdir = dir.path().join("caller_record");
+    let schema = make_schema_u64_i64();
+    let resume = RecoverySource::Rederive { resume_at: Some(0) };
+    {
+        let mut t = new_table(&tdir, schema, 1 << 20, resume);
+        t.ingest_owned_batch(make_batch(&[(1, 1, 100)])).unwrap();
+        t.set_caller_record(b"first".to_vec());
+        flush_barrier([&mut t], ManifestStamp::default()).unwrap();
+    }
+    let mut t = new_table(&tdir, schema, 1 << 20, resume);
+    assert!(t.resumed_from_checkpoint());
+    assert_eq!(t.caller_record, b"first");
+    assert!(t.has_pk_bytes(&1u64.to_be_bytes()));
+
+    flush_barrier([&mut t], ManifestStamp::default()).unwrap();
+    assert!(
+        t.flush_prepare(ManifestStamp::default()).unwrap().is_none(),
+        "an unchanged record stages nothing"
+    );
+    t.set_caller_record(b"second".to_vec());
+    assert!(
+        t.flush_prepare(ManifestStamp::default()).unwrap().is_some(),
+        "a changed record republishes"
+    );
+}

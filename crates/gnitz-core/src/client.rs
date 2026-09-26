@@ -131,7 +131,7 @@ fn segment_name(vid: u64) -> String {
 ///
 /// The cursor lives here and nowhere else, so there is nothing to lose on a
 /// disconnect, nothing to forge, and no liveness for the server to detect.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct DeltaCursor {
     /// Identifies the boot and the relation this cursor belongs to.
     pub tag: u64,
