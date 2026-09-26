@@ -117,7 +117,7 @@ pub(crate) const VIEW_TAB_COLS: &[WireSysCol] = &[
     // validate it against a forger. Appended, not inserted: the `RELTAB_*`
     // constants below pin `name` to the same slot in TABLE_TAB and VIEW_TAB.
     col("owner_view_id", TypeCode::U64, false),
-    // See `VIEW_FLAG_PK_REPEATS` for the bit layout.
+    // See `ViewFlags` for the bit layout.
     col("flags", TypeCode::U64, false),
 ];
 
@@ -781,7 +781,36 @@ const TABLE_FLAGS_DEFINED: u64 =
 /// PK region identifies no row — a view over a stream, one keyed on a join key or
 /// a source-PK pair, or a top-N holding more than one slot per partition. The
 /// planner that compiled the view states it; the engine stores it verbatim.
-pub const VIEW_FLAG_PK_REPEATS: u64 = 1 << 0;
+const VIEW_FLAG_PK_REPEATS: u64 = 1 << 0;
+
+/// The logical content of `VIEW_TAB.flags`.
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
+pub struct ViewFlags {
+    pub pk_repeats: bool,
+}
+
+impl ViewFlags {
+    /// Pack the persisted `VIEW_TAB.flags` u64. Inverse of [`Self::from_flags`].
+    #[inline]
+    pub fn pack(self) -> u64 {
+        if self.pk_repeats {
+            VIEW_FLAG_PK_REPEATS
+        } else {
+            0
+        }
+    }
+
+    /// Decode a persisted `VIEW_TAB.flags` u64; a bit outside the defined set is
+    /// refused.
+    pub fn from_flags(flags: u64) -> Result<ViewFlags, String> {
+        if flags & !VIEW_FLAG_PK_REPEATS != 0 {
+            return Err(format!("flags {flags:#x} carry unknown bits"));
+        }
+        Ok(ViewFlags {
+            pk_repeats: flags & VIEW_FLAG_PK_REPEATS != 0,
+        })
+    }
+}
 
 /// `IDX_TAB.flags` bit 0: the index enforces uniqueness.
 const INDEX_FLAG_UNIQUE: u64 = 1 << 0;

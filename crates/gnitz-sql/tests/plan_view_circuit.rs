@@ -80,13 +80,11 @@ fn cat() -> CatalogSnapshot {
 
 /// `pred` over every node of every segment.
 fn total(chain: &PlannedChain, pred: impl Fn(&OpNode) -> bool) -> usize {
-    chain.views.iter().map(|pv| count(&pv.circuit, &pred)).sum()
+    all_views(chain).map(|pv| count(&pv.circuit, &pred)).sum()
 }
 
 fn exchanges(chain: &PlannedChain) -> Vec<Vec<u32>> {
-    let mut out: Vec<Vec<u32>> = chain
-        .views
-        .iter()
+    let mut out: Vec<Vec<u32>> = all_views(chain)
         .flat_map(|pv| pv.circuit.nodes().iter().map(|n| &n.op))
         .filter_map(|op| match op {
             OpNode::ExchangeShard { shard_cols } => Some(shard_cols.clone()),
@@ -231,10 +229,10 @@ fn every_shape_has_its_contract_nodes() {
         want.sort();
         let mut want_exch: Vec<Vec<u32>> = exch.iter().map(|e| e.to_vec()).collect();
         want_exch.sort();
-        if (chain.views.len(), exchanges(&chain), &got) != (segments, want_exch.clone(), &want) {
+        if (view_count(&chain), exchanges(&chain), &got) != (segments, want_exch.clone(), &want) {
             mismatches.push(format!(
                 "`{body}`\n     got {:?} {:?} {got:?}\n    want {segments:?} {want_exch:?} {want:?}",
-                chain.views.len(),
+                view_count(&chain),
                 exchanges(&chain),
             ));
         }
@@ -320,9 +318,7 @@ fn indexed_predicates_bound_the_backfill_scan() {
     ];
     for &(cat, body, want) in rows {
         let chain = view(cat, body);
-        let bounds: Vec<String> = chain
-            .views
-            .iter()
+        let bounds: Vec<String> = all_views(&chain)
             .flat_map(|pv| pv.circuit.nodes().iter().map(|n| &n.op))
             .filter_map(|op| match op {
                 OpNode::ScanDelta { bound, .. } => match bound {
@@ -356,9 +352,7 @@ fn a_having_without_a_group_by_is_the_whole_relation_group_on_both_surfaces() {
     // View: every reduce groups on nothing, one seeds the ground row, and none
     // carries a user aggregate.
     let chain = view(&cat, BODY);
-    let reduces: Vec<(Vec<u32>, Vec<gnitz_wire::AggFunc>, bool)> = chain
-        .views
-        .iter()
+    let reduces: Vec<(Vec<u32>, Vec<gnitz_wire::AggFunc>, bool)> = all_views(&chain)
         .flat_map(|pv| pv.circuit.nodes().iter().map(|n| &n.op))
         .filter_map(|op| match op {
             OpNode::Reduce { group_cols, agg, global_ground, .. } => Some((

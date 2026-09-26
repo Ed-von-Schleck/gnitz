@@ -577,7 +577,7 @@ fn bind_proj_expr<L: ItemLeaf>(
             d.ty,
             d.is_nullable,
         ),
-        None => crate::validate::computed_column(alias, idx, bound.infer_ty_with(&|r| leaf.type_of(r))),
+        None => crate::validate::computed_column(alias, idx, bound.infer_ty_with(&|r| leaf.type_of(r)))?,
     };
     Ok(ProjEntry {
         expr: bound,

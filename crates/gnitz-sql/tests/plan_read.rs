@@ -1002,8 +1002,8 @@ fn the_loop_resolves_only_what_the_planner_asks_for() {
                 let looped = looped.unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
                 assert_eq!(asked, want, "`{sql}`");
                 let single = plan(&known, sql).unwrap();
-                assert_eq!(looped.views.len(), single.views.len(), "`{sql}`");
-                for (a, b) in looped.views.iter().zip(&single.views) {
+                assert_eq!(view_count(&looped), view_count(&single), "`{sql}`");
+                for (a, b) in all_views(&looped).zip(all_views(&single)) {
                     assert_eq!(a.circuit, b.circuit, "`{sql}`");
                 }
             }

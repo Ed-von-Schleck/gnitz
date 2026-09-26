@@ -1,16 +1,16 @@
 //! The input spine every consumer opens its inputs with: the filters and
 //! projections over a relation read in place fuse into the consumer's circuit.
 
-use super::super::chain::{admit, EmitPieces, ViewChain};
 use super::super::physical::{self, Frame};
 use super::super::{as_col, ColId, HirExpr, ProjEntry, RelExpr};
 use super::{
-    collect_live_cols, cut_segment, filter, lowered_whole, project_front, resolve_in_place, CutMemo, SegInput,
+    collect_live_cols, cut_segment, filter, lowered_whole, project_front, resolve_in_place, EmitPieces, SegInput,
+    SegSource, ViewChain,
 };
 use crate::access::candidates;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use gnitz_core::{Circuit, NodeId, ReindexRole, ReindexSlot, RelDescriptor, Schema};
+use gnitz_core::{Circuit, NodeId, ReindexRole, ReindexSlot, Schema};
 use gnitz_wire::ReadBound;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -39,10 +39,10 @@ pub(crate) enum Top {
 }
 
 /// Where an opened input's columns come from in the relation the master
-/// scatters: its id, the source column behind each surviving column, and the
+/// scatters: the source, the source column behind each surviving column, and the
 /// source PK, which the levels carry verbatim at the front of the key region.
 pub(crate) struct SourceOrigin {
-    tid: u64,
+    pub(super) src: SegSource,
     /// Keyed by the id a column carries above the fused levels; a computed
     /// column is absent.
     cols: HashMap<ColId, u32>,
@@ -85,13 +85,13 @@ impl SourceOrigin {
             .iter()
             .map(|&(c, tc)| Some((self.slot(frame, c as usize)?, tc)))
             .collect::<Option<Vec<ReindexSlot>>>()?;
-        Some(ReindexRole::ScatterKey { source: self.tid, source_key })
+        Some(ReindexRole::ScatterKey { source: self.src.tid(), source_key })
     }
 
     /// The route of a re-key onto the source PK.
     pub(crate) fn scatter_pk(&self) -> ReindexRole {
         ReindexRole::ScatterKey {
-            source: self.tid,
+            source: self.src.tid(),
             source_key: self.pk.iter().map(|&c| (c, None)).collect(),
         }
     }
@@ -102,7 +102,6 @@ impl SourceOrigin {
 /// whatever its shell lowers whole, and only the levels above the cut fuse.
 pub(crate) fn open<'a>(
     chain: &mut ViewChain,
-    memo: &mut CutMemo,
     rel: &'a Rc<RelExpr>,
     live: &HashSet<ColId>,
 ) -> Result<Spine<'a>, GnitzSqlError> {
@@ -131,13 +130,13 @@ pub(crate) fn open<'a>(
         }
         read.push(below);
     }
-    let (seg, fused) = match resolve_in_place(chain, memo, nodes[bottom])? {
+    let (seg, fused) = match resolve_in_place(chain, nodes[bottom])? {
         Some(seg) => (seg, bottom),
         None => {
             let cut = (bottom.saturating_sub(2)..bottom)
                 .find(|&i| lowered_whole(nodes[i]))
                 .unwrap_or(bottom);
-            (cut_segment(chain, memo, nodes[cut], &read[cut])?, cut)
+            (cut_segment(chain, nodes[cut], &read[cut])?, cut)
         }
     };
     let levels = nodes[..fused]
@@ -159,12 +158,12 @@ pub(crate) fn open<'a>(
 
 impl Spine<'_> {
     pub(crate) fn tid(&self) -> u64 {
-        self.seg.tid
+        self.seg.src.tid()
     }
 
     /// The opened source's, since no fused level re-keys.
     pub(crate) fn pk_repeats(&self) -> bool {
-        self.seg.pk_repeats
+        self.seg.src.pk_repeats()
     }
 
     /// A hidden segment read whole, with nothing fused above it.
@@ -194,7 +193,7 @@ impl Spine<'_> {
                 .collect();
         }
         SourceOrigin {
-            tid: self.seg.tid,
+            src: self.seg.src.clone(),
             cols,
             pk: self.seg.frame.schema.pk_cols.clone(),
         }
@@ -207,11 +206,10 @@ impl Spine<'_> {
     }
 
     /// Emit the levels into `cb`. A rename-only projection relabels the frame
-    /// instead of emitting a node, except the outermost one under `Top::Output`;
-    /// `what` names an emitted projection whose schema is inadmissible.
-    pub(crate) fn emit(self, cb: &mut Circuit, top: Top, what: &str) -> Result<(NodeId, Frame), GnitzSqlError> {
+    /// instead of emitting a node, except the outermost one under `Top::Output`.
+    pub(crate) fn emit(self, cb: &mut Circuit, top: Top) -> Result<(NodeId, Frame), GnitzSqlError> {
         let Spine { seg, levels } = self;
-        let SegInput { tid, mut frame, desc, pk_repeats: _ } = seg;
+        let SegInput { src, mut frame } = seg;
         let output_at = match top {
             Top::Output => levels.iter().rposition(|(l, _)| matches!(l, Level::Project(_))),
             Top::Slots => None,
@@ -238,10 +236,9 @@ impl Spine<'_> {
                     }
                     let at = match node {
                         Some(at) => at,
-                        None => source(cb, tid, &desc, &frame, std::mem::take(&mut leading))?,
+                        None => source(cb, &src, &frame, std::mem::take(&mut leading))?,
                     };
                     let (at, out) = project_front(cb, at, &items, &frame)?;
-                    admit(&out.schema, what)?;
                     node = Some(at);
                     frame = out;
                 }
@@ -249,37 +246,39 @@ impl Spine<'_> {
         }
         let node = match node {
             Some(at) => at,
-            None => source(cb, tid, &desc, &frame, leading)?,
+            None => source(cb, &src, &frame, leading)?,
         };
         Ok((node, frame))
     }
 }
 
-/// `tid`'s delta node, bounded by what `leading` gives a catalog source, then one
+/// `src`'s delta node, bounded by what `leading` gives a catalog source, then one
 /// filter per leading WHERE.
 fn source(
     cb: &mut Circuit,
-    tid: u64,
-    desc: &Option<Arc<RelDescriptor>>,
+    src: &SegSource,
     frame: &Frame,
     leading: Vec<Vec<BoundExpr>>,
 ) -> Result<NodeId, GnitzSqlError> {
     // This path compiles no residual.
-    let bound = desc.as_ref().map_or(ReadBound::None, |d| {
-        let conjuncts = leading.concat();
-        candidates(&conjuncts, &frame.schema, &d.indexes)
-            .into_iter()
-            .map(|c| c.bound)
-            // A backfill never routes, and the engine may trade an index walk for the
-            // full scan, which it cannot do for a PK range.
-            .min_by_key(|b| match b {
-                ReadBound::PkSet(_) => 0,
-                ReadBound::Range(r) if !r.walks_pk(&frame.schema.pk_cols) => 1,
-                _ => 2,
-            })
-            .unwrap_or(ReadBound::None)
-    });
-    let mut node = cb.input_delta(tid, bound);
+    let bound = match src {
+        SegSource::Segment { .. } => ReadBound::None,
+        SegSource::Catalog(d) => {
+            let conjuncts = leading.concat();
+            candidates(&conjuncts, &frame.schema, &d.indexes)
+                .into_iter()
+                .map(|c| c.bound)
+                // A backfill never routes, and the engine may trade an index walk for the
+                // full scan, which it cannot do for a PK range.
+                .min_by_key(|b| match b {
+                    ReadBound::PkSet(_) => 0,
+                    ReadBound::Range(r) if !r.walks_pk(&frame.schema.pk_cols) => 1,
+                    _ => 2,
+                })
+                .unwrap_or(ReadBound::None)
+        }
+    };
+    let mut node = cb.input_delta(src.tid(), bound);
     for preds in &leading {
         node = filter(cb, node, preds, &frame.schema)?;
     }
@@ -313,15 +312,13 @@ fn relabel(frame: &Frame, items: &[ProjEntry]) -> Option<Frame> {
 /// map neither re-keys nor redistributes its source.
 pub(super) fn lower_linear(
     chain: &mut ViewChain,
-    memo: &mut CutMemo,
     rel: &Rc<RelExpr>,
     items: &[ProjEntry],
 ) -> Result<EmitPieces, GnitzSqlError> {
     let live = items.iter().map(|it| it.out.id).collect();
-    let spine = open(chain, memo, rel, &live)?;
+    let spine = open(chain, rel, &live)?;
     let mut cb = Circuit::default();
     let pk_repeats = spine.pk_repeats();
-    let (node, out) = spine.emit(&mut cb, Top::Output, "view output")?;
-    cb.sink(node);
-    Ok(EmitPieces { circuit: cb, out, pk_repeats })
+    let (node, out) = spine.emit(&mut cb, Top::Output)?;
+    Ok(EmitPieces { circuit: cb, top: node, out, pk_repeats })
 }

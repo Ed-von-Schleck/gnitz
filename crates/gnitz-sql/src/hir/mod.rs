@@ -10,7 +10,6 @@
 //! PK-front convention and the `ColId → ColRef(position)` substitution.
 
 mod bind;
-mod chain;
 mod create;
 mod decorrelate;
 mod guards;
@@ -26,28 +25,27 @@ use crate::agg::AggFunc;
 use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
-use chain::{EmitPieces, ViewChain};
-use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, RangeRel, RelDescriptor, Schema, TypeCode};
+use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, RangeRel, RelDescriptor, Schema, TypeCode, ViewBundle};
 use gnitz_wire::AggFunc as WireAggFunc;
 use std::rc::Rc;
 use std::sync::Arc;
 
 /// The one compiler core: bind a query — its CTEs, then its body — to one
-/// `RelExpr` tree, and lower it to circuit pieces. A CTE is a shared subtree of that one tree, read
-/// through an `Alias` wherever it is named, so nothing is compiled before the
-/// tree is whole; the lowering decides what each shared subtree becomes.
+/// `RelExpr` tree, and lower it to its view bundle. A CTE is a subtree of that
+/// tree shared by every `Alias` naming it, so nothing compiles before the tree is
+/// whole.
 pub(crate) fn bind_and_lower(
     cat: &CatalogSnapshot,
     schema_name: &str,
-    chain: &mut ViewChain,
     query: &sqlparser::ast::Query,
     view: bind::ViewBody,
-) -> Result<EmitPieces, GnitzSqlError> {
+    bounded: bool,
+) -> Result<ViewBundle, GnitzSqlError> {
     let ids = ColIdGen::new();
     let mut cx = bind::BindCx::new(cat, schema_name, &ids, view);
     bind::bind_ctes(&mut cx, query)?;
     let rel = bind::bind_query(&mut cx, query)?;
-    lower::lower(chain, rel)
+    lower::lower(rel, bounded)
 }
 
 /// The ad-hoc read path's entry to the same core: bind a single-relation grouped

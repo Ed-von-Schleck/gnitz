@@ -9,6 +9,7 @@ use super::super::{slot_of, HirRange, JoinClass, JoinType};
 use super::prims::{null_gate, rekey_on_source_pk, self_derived_key};
 use super::JoinSide;
 use crate::error::GnitzSqlError;
+use crate::validate::reject_column_overflow;
 
 use gnitz_core::{Circuit, ColumnDef, NodeId, RangeRel, ReindexRole, ReindexSlot, Schema, TypeCode};
 use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc, JoinKind};
@@ -377,6 +378,8 @@ pub(crate) fn range_prologue<'a>(
 ) -> Result<RangePrologue<'a>, GnitzSqlError> {
     let range = class.range.expect("range_prologue receives a range class");
     let all_tcs: Vec<TypeCode> = class.eq.iter().map(|p| p.tc).chain([range.tc]).collect();
+    // No frame covers the terms: the join frame's key may be narrower than theirs.
+    reject_column_overflow("range JOIN terms", all_tcs.len() + sides[0].n() + sides[1].n())?;
     let pure = class.eq.is_empty();
     let reindex = |cb: &mut Circuit, is_left: bool| -> Result<NodeId, GnitzSqlError> {
         let i = usize::from(!is_left);

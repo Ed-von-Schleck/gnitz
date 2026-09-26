@@ -303,7 +303,7 @@ fn a_cte_body_is_a_pass_through_only_when_it_is_the_identity() {
     ];
     for (body, segments, shape) in rows {
         let chain = view(&cat, body);
-        assert_eq!(chain.views.len(), *segments, "{body}");
+        assert_eq!(view_count(&chain), *segments, "{body}");
         assert_eq!(&output_shape(&chain), shape, "{body}");
     }
 }
@@ -314,7 +314,7 @@ fn a_cte_body_is_a_pass_through_only_when_it_is_the_identity() {
 #[test]
 fn a_cte_is_a_shared_subtree_read_through_aliases() {
     let cat = base();
-    let segments = |body: &str| view(&cat, body).views.len();
+    let segments = |body: &str| view_count(&view(&cat, body));
 
     // An identity body collapses to its table, read in place: no segment.
     assert_eq!(segments("WITH c AS (SELECT * FROM t) SELECT id, g FROM c"), 1);
@@ -349,7 +349,7 @@ fn a_cte_is_a_shared_subtree_read_through_aliases() {
         &cat,
         "WITH c(x, y) AS (SELECT id, g FROM t WHERE g > 0), e AS (SELECT * FROM c) SELECT y, x FROM e",
     );
-    assert_eq!(chain.views.len(), 2);
+    assert_eq!(view_count(&chain), 2);
     assert_eq!(&output_shape(&chain), &sh(&[("x", false, false), ("y", false, false)]));
 
     // A CTE is visible to a subquery's inner relation.
@@ -802,8 +802,13 @@ fn a_chain_segment_keeps_only_its_live_columns() {
         &cat,
         "SELECT ja.id AS aid, jc.cv AS ccv FROM ja JOIN jb ON ja.k = jb.id JOIN jc ON ja.v = jc.id",
     );
-    assert_eq!(chain.views.len(), 2);
-    let seg: Vec<&str> = chain.views[0].schema.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(view_count(&chain), 2);
+    let seg: Vec<&str> = chain.bundle.segments[0]
+        .schema
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
     assert_eq!(seg, ["_join_pk", "id", "v"]);
     assert_eq!(
         output_shape(&chain),
@@ -839,13 +844,18 @@ fn a_collision_segment_keeps_only_its_live_columns() {
         &cat,
         "SELECT e.nm AS emp, m.nm AS boss FROM emp e JOIN emp m ON e.mgr = m.id",
     );
-    assert_eq!(chain.views.len(), 2);
-    let wrapper: Vec<&str> = chain.views[0].schema.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(view_count(&chain), 2);
+    let wrapper: Vec<&str> = chain.bundle.segments[0]
+        .schema
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
     assert_eq!(wrapper, ["id", "nm"]);
 
     // `t EXCEPT t` cuts nothing: a set operation reads one source on both sides.
     let chain = view(&base(), "SELECT g FROM t EXCEPT SELECT g FROM t");
-    assert_eq!(chain.views.len(), 1);
+    assert!(chain.bundle.segments.is_empty());
 }
 
 /// `register` mirrors what the server records: a bounded view registers as

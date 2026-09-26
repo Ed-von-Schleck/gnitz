@@ -145,7 +145,7 @@ pub(super) struct ViewRegistration<'a> {
     /// The user view this row is an internal chain segment of; `0` for a user
     /// view.
     pub(super) owner_view_id: i64,
-    /// [`gnitz_wire::VIEW_FLAG_PK_REPEATS`].
+    /// [`gnitz_wire::ViewFlags::pk_repeats`].
     pub(super) pk_repeats: bool,
 }
 
@@ -159,19 +159,15 @@ pub(super) fn read_view_tab_row(batch: &Batch, row: usize) -> Result<ViewRegistr
         payload_u64(batch, row, VIEWTAB_PAY_DELTA),
     )
     .map_err(|e| format!("view '{name}': {e}"))?;
-    let flags = payload_u64(batch, row, VIEWTAB_PAY_FLAGS);
-    if flags & !gnitz_wire::VIEW_FLAG_PK_REPEATS != 0 {
-        return Err(format!(
-            "catalog invariant violated: view '{name}' flags {flags:#x} carry unknown bits"
-        ));
-    }
+    let flags = gnitz_wire::ViewFlags::from_flags(payload_u64(batch, row, VIEWTAB_PAY_FLAGS))
+        .map_err(|e| format!("catalog invariant violated: view '{name}' {e}"))?;
     Ok(ViewRegistration {
         schema_id: payload_u64(batch, row, RELTAB_PAY_SCHEMA_ID) as i64,
         name,
         pk,
         props,
         owner_view_id: payload_u64(batch, row, VIEWTAB_PAY_OWNER_VIEW_ID) as i64,
-        pk_repeats: flags & gnitz_wire::VIEW_FLAG_PK_REPEATS != 0,
+        pk_repeats: flags.pk_repeats,
     })
 }
 

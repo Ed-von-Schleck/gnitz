@@ -171,7 +171,10 @@ fn values_land_in_their_named_payload_slots() {
     assert_eq!(v[VIEWTAB_PAY_CAPACITY], Val::U64(0));
     assert_eq!(v[VIEWTAB_PAY_DELTA], Val::U64(1 << 20));
     assert_eq!(v[VIEWTAB_PAY_OWNER_VIEW_ID], Val::U64(21));
-    assert_eq!(v[VIEWTAB_PAY_FLAGS], Val::U64(crate::VIEW_FLAG_PK_REPEATS));
+    assert_eq!(
+        v[VIEWTAB_PAY_FLAGS],
+        Val::U64(crate::ViewFlags { pk_repeats: true }.pack())
+    );
 
     let mut r = Recorder::default();
     write_schema_tab_row(&mut r, &SchemaTabRow { schema_id: 3, name: "public" }, 1);

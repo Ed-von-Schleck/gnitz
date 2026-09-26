@@ -87,6 +87,14 @@ fn cat() -> CatalogSnapshot {
             "tt",
             table(52, vec![col("id", i), ncol("ts", TypeCode::Timestamp)], vec![0]),
         ),
+        (
+            "w64",
+            table(
+                53,
+                [vec![col("id", i)], (0..63).map(|n| col(&format!("c{n}"), i)).collect()].concat(),
+                vec![0],
+            ),
+        ),
     ] {
         cat.insert(SN, name, Some(desc));
     }
@@ -112,6 +120,16 @@ fn join_key_rules() {
     let over_cap = format!("SELECT * FROM wide_a JOIN wide_b ON {}", on.join(" AND "));
     let at_cap = format!("SELECT * FROM wide_a JOIN wide_b ON {}", on[..n - 1].join(" AND "));
     view(&cat, &at_cap);
+    // A 60-column output over a 66-column join frame: the WHERE reads six right
+    // columns the projection drops.
+    let (l, r) = (
+        (0..=30).map(|n| format!(", wl.c{n} AS l{n}")).collect::<String>(),
+        (0..=24).map(|n| format!(", wr.c{n} AS r{n}")).collect::<String>(),
+    );
+    let frame_over_cap = format!(
+        "SELECT wl.id, wl.fk AS lfk, wr.id AS rid{l}{r} FROM wl JOIN wr ON wl.fk = wr.fk \
+         WHERE (wl.c0 + wr.c25 + wr.c26 + wr.c27 + wr.c28 + wr.c29 + wr.c30) > 0"
+    );
     rejects(
         &cat,
         &[
@@ -171,6 +189,14 @@ fn join_key_rules() {
                 "SELECT * FROM wl JOIN wr ON wl.fk = wr.fk",
                 "Unsupported",
                 "MAX_COLUMNS",
+            ),
+            (&frame_over_cap, "Unsupported", "MAX_COLUMNS"),
+            // A range term leads with the eq prefix plus the range slot, one
+            // column past the join frame's source-PK key.
+            (
+                "SELECT * FROM w64 WHERE EXISTS (SELECT 1 FROM b WHERE b.k = w64.c0 AND b.w < w64.c1)",
+                "Unsupported",
+                "column limit",
             ),
             (
                 "SELECT a.v AS x, b.w AS x FROM a JOIN b ON a.k = b.k",
@@ -833,7 +859,10 @@ fn capacity_rules() {
         "SELECT t.id, u.v, a.k FROM t JOIN u ON t.id = u.g JOIN a ON a.id = t.id",
         "SELECT t.id, d.s FROM t JOIN (SELECT g, SUM(v) AS s FROM u GROUP BY g) d ON t.id = d.g",
     ] {
-        assert!(view(&cat, body).views.len() > 1, "`{body}` cuts a segment unbounded");
+        assert!(
+            !view(&cat, body).bundle.segments.is_empty(),
+            "`{body}` cuts a segment unbounded"
+        );
         let sql = format!("CREATE VIEW v WITH (capacity = '1 MB') AS {body}");
         assert_rejects(&sql, plan(&cat, &sql), "Unsupported", "more than one view");
     }

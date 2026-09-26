@@ -26,10 +26,8 @@ const NO_DEMAND: Demand<'static> = Demand { items: &[], where_preds: &[] };
 fn origins(left: &Frame, right: &Frame) -> [SourceOrigin; 2] {
     let opened = |tid, frame: &Frame| {
         super::spine::Spine::segment(SegInput {
-            tid,
+            src: SegSource::Segment { tid, pk_repeats: false },
             frame: frame.clone(),
-            desc: None,
-            pk_repeats: false,
         })
         .origin()
     };

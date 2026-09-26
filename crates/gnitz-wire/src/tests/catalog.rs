@@ -137,6 +137,20 @@ fn table_flags_roundtrip() {
     assert_eq!(keyed(true, 2).pack(), 0b10 | (2 << 8));
 }
 
+/// `VIEW_TAB.flags` round-trips, pins its persisted bit position, and refuses
+/// every other bit.
+#[test]
+fn view_flags_round_trip_and_refuse_reserved_bits() {
+    for pk_repeats in [false, true] {
+        let f = ViewFlags { pk_repeats };
+        assert_eq!(ViewFlags::from_flags(f.pack()).unwrap(), f);
+    }
+    assert_eq!(ViewFlags { pk_repeats: true }.pack(), 0b1);
+    for reserved in [1u64 << 1, 1 << 8, 1 << 63] {
+        assert!(ViewFlags::from_flags(reserved).is_err(), "bit {reserved:#x}");
+    }
+}
+
 /// A bit outside the defined set is refused, not ignored.
 #[test]
 fn table_flags_refuse_reserved_bits() {

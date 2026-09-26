@@ -34,11 +34,14 @@ fn a_computed_string_projection_declares_a_string_column() {
     };
     let nominal = e.infer_ty(&schema.columns);
     assert_eq!(nominal.tc, TypeCode::String);
-    let def = computed_column(None, 0, nominal);
+    let def = computed_column(None, 0, nominal).unwrap();
     assert_eq!(def.ty.tc, TypeCode::String);
     assert!(def.is_nullable);
     // A numeric expression still takes its register image.
-    assert_eq!(computed_column(None, 0, TypeCode::F32.into()).ty.tc, TypeCode::F64);
+    assert_eq!(
+        computed_column(None, 0, TypeCode::F32.into()).unwrap().ty.tc,
+        TypeCode::F64
+    );
 }
 
 /// A synthesized key list is capped by the PK-list width, whatever assembled it

@@ -124,7 +124,7 @@ pub struct ViewTabRow<'a> {
     /// The user view this row is an internal chain segment of; `0` is a user
     /// view.
     pub owner_view_id: u64,
-    /// [`crate::VIEW_FLAG_PK_REPEATS`].
+    /// [`crate::ViewFlags::pk_repeats`].
     pub pk_repeats: bool,
 }
 
@@ -137,7 +137,7 @@ pub fn write_view_tab_row(sink: &mut impl SysRowSink, r: &ViewTabRow, weight: i6
     sink.put_u64(capacity);
     sink.put_u64(delta);
     sink.put_u64(r.owner_view_id);
-    sink.put_u64(if r.pk_repeats { crate::VIEW_FLAG_PK_REPEATS } else { 0 });
+    sink.put_u64(crate::ViewFlags { pk_repeats: r.pk_repeats }.pack());
     sink.end_row();
 }
 

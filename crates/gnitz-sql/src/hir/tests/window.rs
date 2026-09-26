@@ -53,7 +53,7 @@ fn catalog() -> CatalogSnapshot {
 /// included) and the final view's output columns.
 fn plan(sql: &str) -> Result<(usize, Vec<ColumnDef>), GnitzSqlError> {
     let (n, last) = plan_in(&catalog(), sql)?;
-    Ok((n, last.schema.columns))
+    Ok((n, Arc::unwrap_or_clone(last.schema).columns))
 }
 
 /// [`plan`] against `cat`, returning the final view whole.
@@ -62,10 +62,7 @@ fn plan_in(cat: &CatalogSnapshot, sql: &str) -> Result<(usize, PlannedView), Gni
         panic!("not a CREATE VIEW");
     };
     match plan_create_view(&cv, cat, "public")? {
-        ViewPlan::Create { mut chain, .. } => {
-            let n = chain.views.len();
-            Ok((n, chain.views.pop().expect("a chain ends in the view")))
-        }
+        ViewPlan::Create { chain, .. } => Ok((chain.bundle.segments.len() + 1, chain.bundle.view)),
         ViewPlan::Skip { .. } => panic!("a free name is never skipped"),
     }
 }
@@ -345,7 +342,7 @@ fn register_view(cat: &mut CatalogSnapshot, tid: u64, name: &str, sql: &str) -> 
             tid,
             class: RelClass::View,
             pk_repeats: v.pk_repeats,
-            schema: Arc::new(v.schema),
+            schema: v.schema,
             indexes: Vec::new(),
         })),
     );
@@ -429,8 +426,8 @@ fn a_user_named_join_pk_column_is_a_row_key() {
         11,
         RelClass::View,
         aliased.pk_repeats,
-        aliased.schema.columns,
-        aliased.schema.pk_cols,
+        aliased.schema.columns.clone(),
+        aliased.schema.pk_cols.clone(),
     );
     cat.insert("public", "jv", jv);
     plan_in(&cat, "SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM jv").unwrap();

@@ -5,12 +5,13 @@
 //! The rules every shell obeys, one home each:
 //!
 //! * input spine — `spine::open` / `Spine::emit`;
-//! * segment cut — [`cut_segment`], through one [`CutMemo`];
+//! * segment cut — [`cut_segment`];
 //! * source collision — [`materialize`];
 //! * reduce derivation — [`resolve_reduce_specs`], [`keyed_frame`];
 //! * join keep — [`join_sides`];
 //! * addressing — `physical::Frame`, [`project_front`].
 
+mod chain;
 mod exists;
 pub(crate) mod fold;
 mod join;
@@ -21,7 +22,6 @@ mod setop;
 mod spine;
 mod topn;
 
-use super::chain::{admit, EmitPieces, ViewChain};
 use super::physical::{self, Frame};
 use super::{as_col, slots_of, split_filter, AggCol, ColId, GetSource, HirCol, HirExpr, ProjEntry, RelExpr};
 use super::{JoinClass, JoinShape, JoinType};
@@ -29,11 +29,12 @@ use crate::agg::group_pk_def;
 use crate::codec::project_schema::{payload_map, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use gnitz_core::{ColumnDef, ReduceOutKey, RelDescriptor, Schema};
+pub(crate) use chain::{EmitPieces, ViewChain};
+use gnitz_core::{ColumnDef, ReduceOutKey, RelDescriptor, Schema, ViewBundle};
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::{AggDescriptor, ReduceOutSlot};
 use spine::SourceOrigin;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -83,7 +84,6 @@ pub(crate) fn keyed_frame(
     group: &[u32],
     row: impl IntoIterator<Item = u32>,
     tail: Vec<HirCol>,
-    what: &str,
 ) -> Result<Frame, GnitzSqlError> {
     let (mut layout, mut cols, mut npk) = (Vec::new(), Vec::new(), 0usize);
     for slot in out_key.output_layout(&input.schema.pk_cols, group, row) {
@@ -99,9 +99,7 @@ pub(crate) fn keyed_frame(
     }
     layout.extend(tail.iter().map(|c| c.id));
     cols.extend(tail.into_iter().map(|c| c.def));
-    let frame = Frame::leading(layout, cols, npk);
-    admit(&frame.schema, what)?;
-    Ok(frame)
+    Frame::leading(layout, cols, npk)
 }
 
 /// The downstream demand on a combine's output: the final projection and the
@@ -119,24 +117,39 @@ impl Demand<'_> {
     }
 }
 
-/// A source a spine reads: a relation in place, or a subtree cut to its hidden
-/// segment via [`cut_segment`], with the frame its references resolve against.
+/// A source a spine reads, with the frame its references resolve against.
 #[derive(Clone)]
 pub(crate) struct SegInput {
-    pub tid: u64,
+    pub src: SegSource,
     pub frame: Frame,
-    /// The catalog descriptor `tid` resolved to, or `None` when `tid` is a
-    /// chain-minted segment, which has no catalog rows until the chain commits.
-    /// The lowering reads the scan-bound index list off this.
-    pub desc: Option<Arc<RelDescriptor>>,
-    /// Off `desc` for a catalog relation, off the pushed segment otherwise.
-    pub pk_repeats: bool,
 }
 
-/// The compilation-wide cut memo: a subtree reached twice (a CTE or window input
-/// read through several `Alias`es) is cut to one hidden segment, which is why
-/// bind shares such a subtree as one `Rc`. Every key is a node of the lowered tree.
-pub(crate) type CutMemo = HashMap<*const RelExpr, SegInput>;
+/// Where a [`SegInput`]'s rows come from.
+#[derive(Clone)]
+pub(crate) enum SegSource {
+    /// A relation read in place; its index list bounds the scan.
+    Catalog(Arc<RelDescriptor>),
+    /// A subtree cut to a hidden segment via [`cut_segment`], under a chain-minted
+    /// id, which has no catalog rows until the chain commits.
+    Segment { tid: u64, pk_repeats: bool },
+}
+
+impl SegSource {
+    pub(crate) fn tid(&self) -> u64 {
+        match self {
+            SegSource::Catalog(d) => d.tid,
+            SegSource::Segment { tid, .. } => *tid,
+        }
+    }
+
+    /// Whether two of the source's rows may share its leading key.
+    pub(crate) fn pk_repeats(&self) -> bool {
+        match self {
+            SegSource::Catalog(d) => d.pk_repeats,
+            SegSource::Segment { pk_repeats, .. } => *pk_repeats,
+        }
+    }
+}
 
 /// Insert every `ColId` referenced anywhere in `exprs` into `live` — the
 /// one home for "which columns does this expression set demand", used to prune a
@@ -186,19 +199,30 @@ pub(crate) fn project_front(
     Ok((node, proj.out))
 }
 
-/// Lower a bound `RelExpr` tree to circuit pieces.
-pub(crate) fn lower(chain: &mut ViewChain, rel: Rc<RelExpr>) -> Result<EmitPieces, GnitzSqlError> {
-    if chain.bounded {
-        reject_ineligible_capacity_body(&rel)?;
+/// Lower a bound view body to its bundle.
+pub(crate) fn lower(rel: Rc<RelExpr>, bounded: bool) -> Result<ViewBundle, GnitzSqlError> {
+    if let Some(shape) = bounded.then(|| capacity_ineligible_shape(&rel)).flatten() {
+        return Err(capacity_refusal(shape));
     }
-    let mut memo = CutMemo::new();
-    lower_body(chain, &mut memo, &rel)
+    let mut chain = ViewChain::default();
+    let top = lower_body(&mut chain, &rel)?;
+    // An eligible root whose inputs cut a segment of their own.
+    if bounded && chain.has_segments() {
+        return Err(capacity_refusal("a body that compiles to more than one view"));
+    }
+    Ok(chain.finish(top))
 }
 
-/// Reject a root shape per-key hydration cannot replay: every shape but a
-/// filter/projection over one relation and an inner equi-join. A cut below an
-/// eligible root is `ViewChain::add_segment`'s to refuse.
-fn reject_ineligible_capacity_body(rel: &RelExpr) -> Result<(), GnitzSqlError> {
+fn capacity_refusal(shape: &str) -> GnitzSqlError {
+    GnitzSqlError::Unsupported(format!(
+        "CREATE VIEW WITH (capacity …): {shape} is not supported; \
+         only a filter/projection over one relation and an inner equi-join are"
+    ))
+}
+
+/// The root shape per-key hydration cannot replay, if `rel` has one: every shape
+/// but a filter/projection over one relation and an inner equi-join.
+fn capacity_ineligible_shape(rel: &RelExpr) -> Option<&'static str> {
     let shape = match rel {
         RelExpr::Project { input, items } => {
             let (_, source) = split_filter(input);
@@ -218,7 +242,7 @@ fn reject_ineligible_capacity_body(rel: &RelExpr) -> Result<(), GnitzSqlError> {
                     "a computed projection over a combine"
                 }
                 // Eligible: filter/projection over one relation.
-                RelExpr::Get { .. } => return Ok(()),
+                RelExpr::Get { .. } => return None,
                 RelExpr::Join { kind: JoinType::Inner, on, .. } => match on.shape() {
                     // A range/band join's null-fill threshold pipeline is not
                     // replayable per key; a cross join has no key at all, so a
@@ -226,7 +250,7 @@ fn reject_ineligible_capacity_body(rel: &RelExpr) -> Result<(), GnitzSqlError> {
                     JoinShape::Band | JoinShape::PureRange => "a range or band join",
                     JoinShape::Cross => "a cross join",
                     // Eligible: plain inner equi-join.
-                    JoinShape::Equi => return Ok(()),
+                    JoinShape::Equi => return None,
                 },
                 RelExpr::Join {
                     kind: JoinType::Left | JoinType::Right | JoinType::Full,
@@ -245,26 +269,23 @@ fn reject_ineligible_capacity_body(rel: &RelExpr) -> Result<(), GnitzSqlError> {
         RelExpr::TopN { .. } => "ORDER BY … LIMIT",
         _ => "this body",
     };
-    Err(GnitzSqlError::Unsupported(format!(
-        "CREATE VIEW WITH (capacity …): {shape} is not supported; \
-         only a filter/projection over one relation and an inner equi-join are"
-    )))
+    Some(shape)
 }
 
 /// Lower a complete view body to circuit pieces.
-fn lower_body(chain: &mut ViewChain, memo: &mut CutMemo, rel: &Rc<RelExpr>) -> Result<EmitPieces, GnitzSqlError> {
+fn lower_body(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<EmitPieces, GnitzSqlError> {
     match rel.as_ref() {
         RelExpr::Project { input, items } => {
             let (fpreds, source) = split_filter(input);
             match source.as_ref() {
-                RelExpr::Join { .. } => join::lower_join_view(chain, memo, items, fpreds, source),
-                RelExpr::Reduce { .. } => reduce::lower_reduce(chain, memo, items, fpreds, source),
-                _ => spine::lower_linear(chain, memo, rel, items),
+                RelExpr::Join { .. } => join::lower_join_view(chain, items, fpreds, source),
+                RelExpr::Reduce { .. } => reduce::lower_reduce(chain, items, fpreds, source),
+                _ => spine::lower_linear(chain, rel, items),
             }
         }
-        RelExpr::Distinct { input } => setop::lower_distinct(chain, memo, input),
-        RelExpr::SetOp { out, .. } => setop::lower_setop(chain, memo, rel, out),
-        RelExpr::TopN { .. } => topn::lower_topn(chain, memo, rel),
+        RelExpr::Distinct { input } => setop::lower_distinct(chain, input),
+        RelExpr::SetOp { out, .. } => setop::lower_setop(chain, rel, out),
+        RelExpr::TopN { .. } => topn::lower_topn(chain, rel),
         _ => Err(GnitzSqlError::Internal(
             "HIR lowering has no body arm for this node".into(),
         )),
@@ -286,31 +307,25 @@ fn lowered_whole(rel: &RelExpr) -> bool {
 
 /// `input` read in place: a catalog `Get`, or an alias of its input's source (cut
 /// whole, since every alias reads that one segment) under the alias's ids.
-pub(crate) fn resolve_in_place(
-    chain: &mut ViewChain,
-    memo: &mut CutMemo,
-    input: &Rc<RelExpr>,
-) -> Result<Option<SegInput>, GnitzSqlError> {
+pub(crate) fn resolve_in_place(chain: &mut ViewChain, input: &Rc<RelExpr>) -> Result<Option<SegInput>, GnitzSqlError> {
     match input.as_ref() {
         RelExpr::Get {
             source: GetSource::Catalog { desc },
             schema,
             cols,
         } => Ok(Some(SegInput {
-            tid: desc.tid,
+            src: SegSource::Catalog(Arc::clone(desc)),
             frame: Frame {
                 layout: cols.iter().map(|c| c.id).collect(),
                 schema: Arc::clone(schema),
             },
-            pk_repeats: desc.pk_repeats,
-            desc: Some(Arc::clone(desc)),
         })),
         RelExpr::Alias { input: inner, cols } => {
             let inner_cols = inner.cols();
             let all: HashSet<ColId> = inner_cols.iter().map(|c| c.id).collect();
-            let SegInput { tid, frame, desc, pk_repeats } = match resolve_in_place(chain, memo, inner)? {
+            let SegInput { src, frame } = match resolve_in_place(chain, inner)? {
                 Some(seg) => seg,
-                None => cut_segment(chain, memo, inner, &all)?,
+                None => cut_segment(chain, inner, &all)?,
             };
             let layout = frame
                 .layout
@@ -323,41 +338,34 @@ pub(crate) fn resolve_in_place(
                 })
                 .collect();
             Ok(Some(SegInput {
-                tid,
+                src,
                 frame: Frame { layout, schema: frame.schema },
-                desc,
-                pk_repeats,
             }))
         }
         _ => Ok(None),
     }
 }
 
-/// Cut `rel` to a hidden segment pruned to `live`, bypassing the memo: the
-/// source-collision rule, which needs a second relation where the memo holds one.
-fn materialize(
-    chain: &mut ViewChain,
-    memo: &mut CutMemo,
-    rel: &Rc<RelExpr>,
-    live: &HashSet<ColId>,
-) -> Result<SegInput, GnitzSqlError> {
+/// Cut `rel` to a fresh hidden segment pruned to `live`, never one [`cut_segment`]
+/// already made.
+fn materialize(chain: &mut ViewChain, rel: &Rc<RelExpr>, live: &HashSet<ColId>) -> Result<SegInput, GnitzSqlError> {
     let body = as_body(rel, live);
-    chain.add_segment(|chain| lower_body(chain, memo, &body))
+    let pieces = lower_body(chain, &body)?;
+    Ok(chain.add_segment(pieces))
 }
 
 /// Cut a subtree to a hidden segment pruned to `live`, once per subtree.
 pub(crate) fn cut_segment(
     chain: &mut ViewChain,
-    memo: &mut CutMemo,
     subtree: &Rc<RelExpr>,
     live: &HashSet<ColId>,
 ) -> Result<SegInput, GnitzSqlError> {
     let key = Rc::as_ptr(subtree);
-    if let Some(cached) = memo.get(&key) {
+    if let Some(cached) = chain.cuts.get(&key) {
         return Ok(cached.clone());
     }
-    let seg = materialize(chain, memo, subtree, live)?;
-    memo.insert(key, seg.clone());
+    let seg = materialize(chain, subtree, live)?;
+    chain.cuts.insert(key, seg.clone());
     Ok(seg)
 }
 
@@ -416,17 +424,14 @@ pub(crate) fn emit_filter<'a>(
 
 /// A join's two inputs opened through the spine and emitted into `cb`, each
 /// carrying what `down` reads and its own keys, and kept under [`join_sides`].
-/// The trailing flag is the LEFT input's `pk_repeats`, which an `OuterPk` output
-/// carries over.
 pub(crate) fn emit_join_inputs(
     chain: &mut ViewChain,
-    memo: &mut CutMemo,
     cb: &mut gnitz_core::Circuit,
     down: Demand<'_>,
     [left, right]: [&Rc<RelExpr>; 2],
     kind: JoinType,
     class: &JoinClass,
-) -> Result<([gnitz_core::NodeId; 2], [JoinSide; 2], bool), GnitzSqlError> {
+) -> Result<([gnitz_core::NodeId; 2], [JoinSide; 2]), GnitzSqlError> {
     let live = |is_left: bool| {
         let mut live = HashSet::new();
         down.refs(&mut live);
@@ -434,30 +439,28 @@ pub(crate) fn emit_join_inputs(
         live
     };
     let (live_l, live_r) = (live(true), live(false));
-    let mut l = spine::open(chain, memo, left, &live_l)?;
-    let mut r = spine::open(chain, memo, right, &live_r)?;
+    let mut l = spine::open(chain, left, &live_l)?;
+    let mut r = spine::open(chain, right, &live_r)?;
     // A join reads two distinct sources, one delta per epoch: a right side over the
     // left's source is re-read as a second relation.
     if l.tid() == r.tid() {
-        r = spine::Spine::segment(materialize(chain, memo, right, &live_r)?);
+        r = spine::Spine::segment(materialize(chain, right, &live_r)?);
     }
     // A key the spine computes (`ON x.s = u.k` over `SELECT a + 1 AS s`) is no
     // column of the scanned relation, so nothing over that relation can state
     // where its delta scatters. Cut to a segment, the computed column is one.
     if !l.keys_reach_source(class.key_cols(true)) {
-        l = spine::Spine::segment(materialize(chain, memo, left, &live_l)?);
+        l = spine::Spine::segment(materialize(chain, left, &live_l)?);
     }
     if !r.keys_reach_source(class.key_cols(false)) {
-        r = spine::Spine::segment(materialize(chain, memo, right, &live_r)?);
+        r = spine::Spine::segment(materialize(chain, right, &live_r)?);
     }
     let (origin_l, origin_r) = (l.origin(), r.origin());
-    let left_pk_repeats = l.pk_repeats();
-    let (a, left_frame) = l.emit(cb, spine::Top::Slots, "join input")?;
-    let (b, right_frame) = r.emit(cb, spine::Top::Slots, "join input")?;
+    let (a, left_frame) = l.emit(cb, spine::Top::Slots)?;
+    let (b, right_frame) = r.emit(cb, spine::Top::Slots)?;
     Ok((
         [a, b],
         join_sides(down, class, kind, [left_frame, right_frame], [origin_l, origin_r]),
-        left_pk_repeats,
     ))
 }
 
@@ -498,6 +501,11 @@ impl JoinSide {
     /// payload.
     pub(crate) fn pa(&self) -> usize {
         self.pk_arity
+    }
+
+    /// Whether two of this side's source rows may share their leading key.
+    pub(crate) fn pk_repeats(&self) -> bool {
+        self.origin.src.pk_repeats()
     }
 
     /// The kept payload's `ColId`s, in keep order.

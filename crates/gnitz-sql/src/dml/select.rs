@@ -305,7 +305,7 @@ fn plan_constant(query: &Query, select: &Select) -> Result<(Arc<Schema>, ZSetBat
     for (idx, item) in select.projection.iter().enumerate() {
         let (expr, alias) = scalar_projection_item(item, CTX)?;
         let bound = bind(expr)?;
-        let def = computed_column(alias, idx, bound.infer_ty(&ground.columns));
+        let def = computed_column(alias, idx, bound.infer_ty(&ground.columns))?;
         items.push((bound, def));
     }
     reject_duplicate_projection_names(&select.projection, items.iter().map(|(_, d)| d), CTX)?;

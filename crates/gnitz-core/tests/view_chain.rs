@@ -1,9 +1,8 @@
 #![cfg(feature = "integration")]
 
-//! The raw `create_view_chain` contract: a bundle is one atomic zone, an element
-//! reads only elements before it, its last element is the user-named view, and
-//! the internal segments name that view as their owner — which is what the drop
-//! cascade keys on and a rename leaves alone.
+//! The raw `create_view_chain` contract: a bundle is one atomic zone, a view reads
+//! only segments before it, and every segment names the user-named view as its
+//! owner — which is what the drop cascade keys on and a rename leaves alone.
 //!
 //! Every segment here is a shard-free identity view, `input_delta → sink`.
 //! Nothing about that shape orders a backfill: it runs no exchange, so no
@@ -11,9 +10,11 @@
 //! entirely on the driver visiting a producer before its consumer.
 
 use gnitz_core::{
-    BatchAppender, Circuit, ColumnDef, GnitzClient, PlannedView, Schema, TableProps, TypeCode, ViewProps, ZSetBatch,
+    BatchAppender, Circuit, ColumnDef, GnitzClient, PlannedView, Schema, TableProps, TypeCode, ViewBundle, ViewProps,
+    ZSetBatch,
 };
 use gnitz_test_harness::{unique_schema, ServerHandle};
+use std::sync::Arc;
 
 const BASE_ROWS: [(i64, i64); 3] = [(1, 10), (2, 20), (3, 30)];
 
@@ -46,19 +47,18 @@ fn segment(source_id: u64, schema: &Schema) -> PlannedView {
     circuit.sink(inp);
     PlannedView {
         circuit,
-        schema: schema.clone(),
+        schema: Arc::new(schema.clone()),
         pk_repeats: false,
     }
 }
 
-/// A three-element bundle `[h, g, f]` in dependency order: `h` reads base, `g`
-/// reads `h`, and `f` (the user-named view) reads `g`.
-fn chain(base_tid: u64, schema: &Schema) -> Vec<PlannedView> {
-    vec![
-        segment(base_tid, schema),
-        segment(gnitz_core::segment_id(0), schema),
-        segment(gnitz_core::segment_id(1), schema),
-    ]
+/// A three-view bundle: segment `h` reads base, segment `g` reads `h`, and `f`
+/// (the user-named view) reads `g`.
+fn chain(base_tid: u64, schema: &Schema) -> ViewBundle {
+    ViewBundle {
+        segments: vec![segment(base_tid, schema), segment(gnitz_core::segment_id(0), schema)],
+        view: segment(gnitz_core::segment_id(1), schema),
+    }
 }
 
 /// The vids of every live VIEW_TAB row.
@@ -108,24 +108,20 @@ fn a_chain_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
     client.create_schema(&sn).unwrap();
     let (base_tid, schema) = make_base(&mut client, &sn);
 
-    let vids = client
+    let owner = client
         .create_view_chain(&sn, "f", chain(base_tid, &schema), ViewProps::default(), false)
         .unwrap();
-    let owner = *vids.last().unwrap();
     assert_eq!(
         owner,
         client.resolve_table_or_view_id(&sn, "f").unwrap().0,
-        "vids come back in input order, the user view last"
+        "the returned id is the user view's"
     );
     let mut segs = segment_vids_of(&mut client, owner);
     segs.sort();
-    assert_eq!(
-        segs,
-        vec![vids[0], vids[1]],
-        "both segments name the user view as owner"
-    );
+    assert_eq!(segs.len(), 2, "both segments name the user view as owner");
+    let vids: Vec<u64> = segs.iter().copied().chain([owner]).collect();
 
-    // Every element holds the base's rows at weight 1.
+    // Every view holds the base's rows at weight 1.
     for &vid in &vids {
         assert_eq!(weighted_rows(&mut client, vid), base_at_weight_one(), "view {vid}");
     }
@@ -137,7 +133,7 @@ fn a_chain_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
     client.alter_rename_relation(&sn, "f", "renamed").unwrap();
     let mut segs = segment_vids_of(&mut client, owner);
     segs.sort();
-    assert_eq!(segs, vec![vids[0], vids[1]], "a rename keeps the owner's segments");
+    assert_eq!(segs, vids[..2], "a rename keeps the owner's segments");
     assert_eq!(weighted_rows(&mut client, owner), base_at_weight_one());
 
     client.drop_view(&sn, &["renamed"], false).unwrap();
@@ -156,16 +152,14 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
     let (base_tid, schema) = make_base(&mut client, &sn);
 
     // A committed view whose name the bundle's user-named view reuses.
-    let taken = *client
+    let taken = client
         .create_view_chain(
             &sn,
             "taken",
-            vec![segment(base_tid, &schema)],
+            segment(base_tid, &schema).into(),
             ViewProps::default(),
             false,
         )
-        .unwrap()
-        .last()
         .unwrap();
 
     let err = client
@@ -179,12 +173,11 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
     assert_eq!(live_view_vids(&mut client), vec![taken]);
     assert_eq!(weighted_rows(&mut client, taken), base_at_weight_one());
 
-    // An element naming a later element scans a relation no older than itself.
-    let forward = vec![
-        segment(gnitz_core::segment_id(1), &schema),
-        segment(base_tid, &schema),
-        segment(gnitz_core::segment_id(0), &schema),
-    ];
+    // A segment naming a later segment scans a relation no older than itself.
+    let forward = ViewBundle {
+        segments: vec![segment(gnitz_core::segment_id(1), &schema), segment(base_tid, &schema)],
+        view: segment(gnitz_core::segment_id(0), &schema),
+    };
     let err = client
         .create_view_chain(&sn, "fwd", forward, ViewProps::default(), false)
         .unwrap_err()
@@ -201,12 +194,12 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
     let scan = wide.input_delta(base_tid, gnitz_wire::ReadBound::None);
     let proj = wide.map(scan, &vec![0; gnitz_core::MAX_COLUMNS + 1]);
     wide.sink(proj);
-    let planned = vec![PlannedView {
+    let planned = PlannedView {
         circuit: wide,
         ..segment(base_tid, &schema)
-    }];
+    };
     let err = client
-        .create_view_chain(&sn, "wide", planned, ViewProps::default(), false)
+        .create_view_chain(&sn, "wide", planned.into(), ViewProps::default(), false)
         .unwrap_err()
         .to_string();
     assert!(
@@ -220,7 +213,10 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
     );
 
     let over = gnitz_core::MAX_CHAIN_SEGMENTS + 1;
-    let planned: Vec<PlannedView> = (0..over).map(|_| segment(base_tid, &schema)).collect();
+    let planned = ViewBundle {
+        segments: (1..over).map(|_| segment(base_tid, &schema)).collect(),
+        view: segment(base_tid, &schema),
+    };
     let err = client
         .create_view_chain(&sn, "x", planned, ViewProps::default(), false)
         .unwrap_err()

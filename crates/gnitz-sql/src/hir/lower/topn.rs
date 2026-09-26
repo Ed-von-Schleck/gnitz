@@ -3,28 +3,23 @@
 
 use super::super::{slot_of, slots_of, ColId, RelExpr, TopNKey};
 use super::spine::{open, Top};
-use super::{keyed_frame, CutMemo};
+use super::{keyed_frame, EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
-use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::validate::reject_float_keys;
 use gnitz_core::Circuit;
 use gnitz_wire::OrderKey;
 use std::collections::HashSet;
 
 /// Lower a `TopN` body to circuit pieces.
-pub(super) fn lower_topn(
-    chain: &mut ViewChain,
-    memo: &mut CutMemo,
-    rel: &RelExpr,
-) -> Result<EmitPieces, GnitzSqlError> {
+pub(super) fn lower_topn(chain: &mut ViewChain, rel: &RelExpr) -> Result<EmitPieces, GnitzSqlError> {
     let RelExpr::TopN { input, partition, order, limit, offset } = rel else {
         unreachable!("lower_topn receives a TopN");
     };
 
     let live: HashSet<ColId> = input.cols().iter().map(|c| c.id).collect();
-    let spine = open(chain, memo, input, &live)?;
+    let spine = open(chain, input, &live)?;
     let mut cb = Circuit::default();
-    let (node, frame) = spine.emit(&mut cb, Top::Output, "ORDER BY … LIMIT input")?;
+    let (node, frame) = spine.emit(&mut cb, Top::Output)?;
     let (in_schema, in_layout) = (&frame.schema, &frame.layout);
 
     let written: Vec<u32> = slots_of(in_layout, partition)?.into_iter().map(|c| c as u32).collect();
@@ -64,10 +59,13 @@ pub(super) fn lower_topn(
         &group,
         0..frame.schema.columns.len() as u32,
         Vec::new(),
-        "ORDER BY … LIMIT output",
     )?;
     let node = cb.top_n(node, &group, &keys, *limit, *offset);
-    cb.sink(node);
     // Keyed by the partition, which holds `limit` slots.
-    Ok(EmitPieces { circuit: cb, out, pk_repeats: *limit > 1 })
+    Ok(EmitPieces {
+        circuit: cb,
+        top: node,
+        out,
+        pk_repeats: *limit > 1,
+    })
 }

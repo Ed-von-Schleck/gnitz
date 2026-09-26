@@ -1,18 +1,18 @@
 //! CREATE / ALTER VIEW front door: validate the query envelope, then drive the
 //! HIR pipeline — the CTE phase (`hir::bind::bind_ctes`) and then
-//! `bind_and_lower` of the body — into a `ViewChain` committed atomically.
+//! `bind_and_lower` of the body — into a view bundle committed atomically.
 
 use crate::bind::{apply_positional_aliases, probe, probe_relation};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::bind::ViewBody;
-use crate::hir::chain::ViewChain;
 use crate::validate::{
     kv_options, reject_unhonored_create_view_clauses, reject_unhonored_query_clauses, require_class, ClassWant,
     QueryEnvelope,
 };
 use crate::SqlResult;
-use gnitz_core::{CatalogSnapshot, GnitzClient, PlannedView, RelClass, ViewProps};
+use gnitz_core::{CatalogSnapshot, GnitzClient, RelClass, ViewBundle, ViewProps};
 use sqlparser::ast::{CreateTableOptions, CreateView, Ident, ObjectName, Query, Value, ValueWithSpan};
+use std::sync::Arc;
 
 /// Binary units accepted by a `WITH (<option> = '<uint><unit>')` size string.
 const SIZE_UNITS: [(&str, u64); 3] = [("KB", 1 << 10), ("MB", 1 << 20), ("GB", 1 << 30)];
@@ -78,10 +78,10 @@ pub enum ViewPlan {
     Skip { existing_id: u64 },
 }
 
-/// A planned view: its segment bundle, the user-named view last.
+/// A planned view: its segment bundle.
 pub struct PlannedChain {
     pub name: String,
-    pub views: Vec<PlannedView>,
+    pub bundle: ViewBundle,
     pub props: ViewProps,
 }
 
@@ -113,9 +113,9 @@ pub fn plan_create_view(cv: &CreateView, cat: &CatalogSnapshot, schema_name: &st
     let props = decode_view_options(&cv.options)?;
     let view = ViewBody { stmt: "CREATE VIEW", replacing };
     let aliases = cv.columns.iter().map(|c| &c.name);
-    let views = plan_segments(cat, schema_name, view, &cv.query, aliases, props)?;
+    let bundle = plan_segments(cat, schema_name, view, &cv.query, aliases, props)?;
     Ok(ViewPlan::Create {
-        chain: PlannedChain { name: view_name, views, props },
+        chain: PlannedChain { name: view_name, bundle, props },
         replace: replacing.is_some(),
     })
 }
@@ -139,12 +139,12 @@ pub fn plan_alter_view(
         replacing: Some(old_vid),
     };
     let props = ViewProps::Plain;
-    let views = plan_segments(cat, schema_name, view, query, columns.iter(), props)?;
-    Ok(PlannedChain { name: view_name, views, props })
+    let bundle = plan_segments(cat, schema_name, view, query, columns.iter(), props)?;
+    Ok(PlannedChain { name: view_name, bundle, props })
 }
 
-/// Compile a view body to its segment bundle, the user-named view last, its
-/// visible output columns renamed by `aliases`.
+/// Compile a view body to its segment bundle, the user-named view's visible
+/// output columns renamed by `aliases`.
 fn plan_segments<'a>(
     cat: &CatalogSnapshot,
     schema_name: &str,
@@ -152,13 +152,16 @@ fn plan_segments<'a>(
     query: &Query,
     aliases: impl ExactSizeIterator<Item = &'a Ident>,
     props: ViewProps,
-) -> Result<Vec<PlannedView>, GnitzSqlError> {
+) -> Result<ViewBundle, GnitzSqlError> {
     reject_unhonored_query_clauses(query, QueryEnvelope::WithAndTail, view.stmt)?;
-    let mut chain = ViewChain::new(matches!(props, ViewProps::Bounded { .. }));
-    let pieces = crate::hir::bind_and_lower(cat, schema_name, &mut chain, query, view)?;
-    let final_view = chain.push_final(pieces)?;
-    apply_positional_aliases(aliases, final_view.schema.columns.iter_mut(), view.stmt)?;
-    Ok(chain.segments)
+    let bounded = matches!(props, ViewProps::Bounded { .. });
+    let mut bundle = crate::hir::bind_and_lower(cat, schema_name, query, view, bounded)?;
+    apply_positional_aliases(
+        aliases,
+        Arc::make_mut(&mut bundle.view.schema).columns.iter_mut(),
+        view.stmt,
+    )?;
+    Ok(bundle)
 }
 
 /// Commit a planned `CREATE VIEW`; a skip answers with the id standing under the name.
@@ -171,8 +174,7 @@ pub(crate) fn execute_create_view(
         ViewPlan::Skip { existing_id } => return Ok(SqlResult::ViewCreated { view_id: existing_id }),
         ViewPlan::Create { chain, replace } => (chain, replace),
     };
-    let vids = client.create_view_chain(schema_name, &chain.name, chain.views, chain.props, replace)?;
-    let view_id = *vids.last().expect("a non-empty bundle");
+    let view_id = client.create_view_chain(schema_name, &chain.name, chain.bundle, chain.props, replace)?;
     Ok(SqlResult::ViewCreated { view_id })
 }
 
@@ -182,7 +184,7 @@ pub(crate) fn execute_alter_view(
     schema_name: &str,
     chain: PlannedChain,
 ) -> Result<SqlResult, GnitzSqlError> {
-    client.create_view_chain(schema_name, &chain.name, chain.views, chain.props, true)?;
+    client.create_view_chain(schema_name, &chain.name, chain.bundle, chain.props, true)?;
     Ok(SqlResult::Altered {
         object: "view".to_string(),
         name: chain.name,

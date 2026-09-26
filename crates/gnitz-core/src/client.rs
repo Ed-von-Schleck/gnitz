@@ -201,8 +201,8 @@ pub(crate) fn delta_reply_schema(view: &Schema) -> Result<Schema, ClientError> {
     Ok(Schema { columns, pk_cols })
 }
 
-/// The symbolic id naming element `j` of a view bundle from a later element's
-/// `ScanDelta`. Symbolic ids start at [`gnitz_wire::CATALOG_ID_CEILING`], which
+/// The symbolic id by which a [`ViewBundle`] circuit's `ScanDelta` names
+/// `segments[j]`. Symbolic ids start at [`gnitz_wire::CATALOG_ID_CEILING`], which
 /// no durable relation id reaches, so `create_view_chain` tells them apart from
 /// real relation ids and substitutes the id it allocated — a bundle reaches no
 /// server while it is built.
@@ -210,13 +210,27 @@ pub fn segment_id(j: u64) -> u64 {
     gnitz_wire::CATALOG_ID_CEILING + j
 }
 
-/// One view in a [`GnitzClient::create_view_chain`] bundle.
+/// One view in a [`ViewBundle`].
 pub struct PlannedView {
     pub circuit: Circuit,
-    pub schema: Schema,
-    /// [`gnitz_wire::VIEW_FLAG_PK_REPEATS`], stated by the emitter that minted
+    pub schema: Arc<Schema>,
+    /// [`gnitz_wire::ViewFlags::pk_repeats`], stated by the emitter that minted
     /// the key.
     pub pk_repeats: bool,
+}
+
+/// A [`GnitzClient::create_view_chain`] bundle: the user-named view and the
+/// hidden segments it owns, in dependency order. [`segment_id`]`(j)` names
+/// `segments[j]`.
+pub struct ViewBundle {
+    pub segments: Vec<PlannedView>,
+    pub view: PlannedView,
+}
+
+impl From<PlannedView> for ViewBundle {
+    fn from(view: PlannedView) -> Self {
+        ViewBundle { segments: Vec::new(), view }
+    }
 }
 
 /// What one statement has already read, dropped whole at `end_statement`.
@@ -1253,69 +1267,42 @@ impl GnitzClient {
         let scan = circuit.input_delta(source_table_id, gnitz_wire::ReadBound::None);
         circuit.sink(scan);
 
-        let vids = self.create_view_chain(
-            schema_name,
-            view_name,
-            vec![PlannedView {
-                circuit,
-                schema: Schema::clone(&src.schema),
-                pk_repeats: src.pk_repeats,
-            }],
-            ViewProps::default(),
-            false,
-        )?;
-        Ok(vids[0])
+        let view = PlannedView {
+            circuit,
+            schema: Arc::clone(&src.schema),
+            pk_repeats: src.pk_repeats,
+        };
+        self.create_view_chain(schema_name, view_name, view.into(), ViewProps::default(), false)
     }
 
-    /// Create every view in `views` in one atomic `DDL_TXN`. Row order carries no
-    /// meaning — the engine orders registration and backfill by the dependencies it
-    /// derives from the `ScanDelta` nodes of the circuit rows. Returns the vids in
-    /// input order.
-    ///
-    /// **One `BatchAppender` per family spans all views** — the engine *rejects* a
-    /// bundle carrying a second block for a family it has already seen, so a chain
-    /// must merge every view's COL/circuit rows into a single batch per family and
-    /// one all-`+1` VIEW_TAB batch in input order. A single `push_ddl_txn` then commits — or, via the engine's
-    /// per-family precheck/compensate loop, rolls back — the whole chain.
-    ///
-    /// `schema.pk_cols` is each view's physical PK column list.
-    ///
-    /// **`views.last()` is the user-named view: it takes `view_name` and `props`**;
-    /// every earlier element is an internal segment it owns — see [`segment_name`].
-    /// [`segment_id`]`(j)` inside `views[k]` names `views[j]`, which the engine
-    /// requires to precede it.
+    /// Create `bundle` in one atomic `DDL_TXN` and return the user-named view's id.
+    /// `bundle.view` takes `view_name` and `props`; each segment is named by
+    /// [`segment_name`] and owned by it.
     ///
     /// `replace` supersedes the view already holding this name: `false` leaves a
-    /// name collision to the engine, `true` makes a missing view an error. Its
-    /// `-1` rides the same VIEW_TAB batch, so a rejection anywhere in the zone
-    /// leaves the old view exactly as it was.
+    /// name collision to the engine, `true` makes a missing view an error. A
+    /// rejection anywhere in the zone leaves the old view as it was.
     pub fn create_view_chain(
         &mut self,
         schema_name: &str,
         view_name: &str,
-        views: Vec<PlannedView>,
+        bundle: ViewBundle,
         props: ViewProps,
         replace: bool,
-    ) -> Result<Vec<u64>, ClientError> {
+    ) -> Result<u64, ClientError> {
         let view_name = gnitz_wire::canonical_identifier(view_name)?;
         let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
-        // Reject a malformed chain before any allocation. An empty bundle names
-        // no view to create and would return no vid for the caller to use.
-        if views.is_empty() {
-            return Err(ClientError::ServerError("view chain has no segments".into()));
-        }
-        if views.len() > MAX_CHAIN_SEGMENTS {
+        // Reject a malformed chain before any allocation.
+        let n_views = bundle.segments.len() + 1;
+        if n_views > MAX_CHAIN_SEGMENTS {
             return Err(ClientError::ServerError(format!(
-                "view chain has {} segments, exceeding the {MAX_CHAIN_SEGMENTS}-segment limit",
-                views.len(),
+                "view chain has {n_views} segments, exceeding the {MAX_CHAIN_SEGMENTS}-segment limit",
             )));
         }
 
-        // Per-view pre-flight validation up front, before any id allocation, so a
-        // bad schema surfaces with no residue: `pack_pk_cols` below asserts its
-        // contract, so an out-of-range PK list would panic this client rather than
-        // reach the wire.
-        for (k, pv) in views.iter().enumerate() {
+        // Before any allocation, so a bad schema leaves no residue and never
+        // reaches `pack_pk_cols`, which asserts on one.
+        for (k, pv) in bundle.segments.iter().chain([&bundle.view]).enumerate() {
             pv.schema
                 .validate()
                 .map_err(|e| ClientError::ServerError(format!("View '{view_name}' segment {k}: {e}")))?;
@@ -1336,11 +1323,10 @@ impl GnitzClient {
         // The whole bundle is assigned in one allocation before any substitution
         // runs, because a downstream segment's `ScanDelta` names an upstream
         // segment by its position.
-        let base = self.alloc(IdRun::Ids(views.len() as u64))?;
-        let vids: Vec<u64> = (0..views.len() as u64).map(|k| base + k).collect();
-        // The user-named view is the bundle's last element, and every segment
-        // names it as owner.
-        let owner_vid = *vids.last().expect("a non-empty bundle");
+        let base = self.alloc(IdRun::Ids(n_views as u64))?;
+        // The user-named view takes the id after every segment's, and every
+        // segment names it as owner.
+        let owner_vid = base + bundle.segments.len() as u64;
 
         // One batch per family, spanning all views. COL_TAB and VIEW_TAB are
         // always non-empty; the circuit family is included only if some view
@@ -1363,8 +1349,9 @@ impl GnitzClient {
             let mut nodes_a = BatchAppender::new(&mut nodes_batch, nodes_s);
             let mut view_a = BatchAppender::new(&mut view_batch, view_s);
 
-            let last = views.len() - 1;
-            for (k, (mut pv, vid)) in views.into_iter().zip(vids.iter().copied()).enumerate() {
+            let ViewBundle { segments, view } = bundle;
+            let views = segments.into_iter().map(|pv| (pv, false)).chain([(view, true)]);
+            for ((mut pv, is_view), vid) in views.zip(base..) {
                 // 0.5. Substitute the bundle's symbolic ids. `base` is below the
                 // ceiling, so this cannot overflow; a forward or out-of-range tag
                 // becomes an id no lower than the view's own, which the engine
@@ -1374,7 +1361,7 @@ impl GnitzClient {
                         *src = base + (*src - gnitz_wire::CATALOG_ID_CEILING);
                     }
                 }
-                let (name, owner_view_id, row_props) = if k == last {
+                let (name, owner_view_id, row_props) = if is_view {
                     (view_name.clone(), 0, props)
                 } else {
                     (segment_name(vid), owner_vid, ViewProps::default())
@@ -1415,7 +1402,7 @@ impl GnitzClient {
         families.push((VIEW_TAB, view_batch));
 
         self.push_ddl_txn(&families)?;
-        Ok(vids)
+        Ok(owner_vid)
     }
 
     /// Drop views as one DDL zone; the engine cascades each one's hidden segments

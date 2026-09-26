@@ -206,9 +206,19 @@ pub fn read(cat: &CatalogSnapshot, sql: &str) -> Result<ReadPlan, GnitzSqlError>
     plan_read(&parse(sql), cat, SN)
 }
 
-/// The user-named view of a planned chain — always its last element.
+/// The user-named view of a planned chain.
 pub fn final_view(chain: &PlannedChain) -> &PlannedView {
-    chain.views.last().expect("a chain has a final view")
+    &chain.bundle.view
+}
+
+/// Every view of a planned chain, its segments first.
+pub fn all_views(chain: &PlannedChain) -> impl Iterator<Item = &PlannedView> {
+    chain.bundle.segments.iter().chain([&chain.bundle.view])
+}
+
+/// How many views a planned chain commits, the user-named view included.
+pub fn view_count(chain: &PlannedChain) -> usize {
+    chain.bundle.segments.len() + 1
 }
 
 /// `CREATE VIEW v AS <body>` planned against `cat`, unwrapped.
@@ -227,7 +237,7 @@ pub fn register(cat: &mut CatalogSnapshot, name: &str, tid: u64, chain: &Planned
             tid,
             class: chain.props.into(),
             pk_repeats: fv.pk_repeats,
-            schema: Arc::new(fv.schema.clone()),
+            schema: Arc::clone(&fv.schema),
             indexes: Vec::new(),
         })),
     );

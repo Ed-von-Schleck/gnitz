@@ -8,9 +8,8 @@ use super::joincore::{
     src_pk_coldefs, EquiTerms,
 };
 use super::prims::rekey_on_source_pk;
-use super::{emit_filter, emit_join_inputs, project_front, CutMemo, Demand, JoinSide};
+use super::{emit_filter, emit_join_inputs, project_front, Demand, EmitPieces, JoinSide, ViewChain};
 use crate::error::GnitzSqlError;
-use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::physical::Frame;
 use crate::ir::BExpr;
 use crate::validate::reject_pk_list_arity;
@@ -28,7 +27,6 @@ pub(super) type Branch = (NodeId, Option<i64>);
 /// order.
 pub(super) fn lower_join_view(
     chain: &mut ViewChain,
-    memo: &mut CutMemo,
     items: &[ProjEntry],
     where_preds: &[HirExpr],
     join: &RelExpr,
@@ -40,7 +38,7 @@ pub(super) fn lower_join_view(
     let down = Demand { items, where_preds };
 
     let mut cb = Circuit::default();
-    let (inputs, sides, left_pk_repeats) = emit_join_inputs(chain, memo, &mut cb, down, [left, right], kind, class)?;
+    let (inputs, sides) = emit_join_inputs(chain, &mut cb, down, [left, right], kind, class)?;
 
     let out_key = class.out_key(kind);
     let out_pk = match out_key {
@@ -68,7 +66,7 @@ pub(super) fn lower_join_view(
     };
 
     // The frame every branch filters and projects against.
-    let frame = join_frame(out_pk, &sides, kind);
+    let frame = join_frame(out_pk, &sides, kind)?;
     let mut acc: Option<(NodeId, Frame)> = None;
     for (node, mark) in branches {
         let (preds, items): (Cow<'_, [HirExpr]>, Cow<'_, [ProjEntry]>) = match (kind, mark) {
@@ -96,13 +94,12 @@ pub(super) fn lower_join_view(
         true => cb.shard(node, &(0..out.npk() as u32).collect::<Vec<_>>()),
         false => node,
     };
-    cb.sink(node);
     // A join key and a pair PK each identify a matched pair, not a row.
     let pk_repeats = match out_key {
         OutKey::JoinKey | OutKey::PairPk => true,
-        OutKey::OuterPk { .. } => left_pk_repeats,
+        OutKey::OuterPk { .. } => sides[0].pk_repeats(),
     };
-    Ok(EmitPieces { circuit: cb, out, pk_repeats })
+    Ok(EmitPieces { circuit: cb, top: node, out, pk_repeats })
 }
 
 /// Substitute `ColRef(mark_id)` with `LitInt(val)` throughout an expression —
@@ -242,7 +239,7 @@ fn emit_cross(cb: &mut Circuit, [input_a, input_b]: [NodeId; 2], sides: &[JoinSi
 /// The frame a join step's filters and projection read: `pk_cols`, then both
 /// sides' kept payload with the null-providing side widened per `kind`, through
 /// the same [`JoinType::widen_sides`] the logical join output uses.
-fn join_frame(pk_cols: Vec<ColumnDef>, sides: &[JoinSide; 2], kind: JoinType) -> Frame {
+fn join_frame(pk_cols: Vec<ColumnDef>, sides: &[JoinSide; 2], kind: JoinType) -> Result<Frame, GnitzSqlError> {
     let (mut l, mut r) = (sides[0].coldefs.clone(), sides[1].coldefs.clone());
     kind.widen_sides(l.iter_mut(), r.iter_mut());
     Frame::keyed(

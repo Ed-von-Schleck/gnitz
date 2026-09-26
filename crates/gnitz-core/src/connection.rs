@@ -57,7 +57,7 @@ pub type ScanResult = Result<ScanReply, ClientError>;
 pub struct RelDescriptor {
     pub tid: u64,
     pub class: RelClass,
-    /// A stream, or a view whose planner set [`gnitz_wire::VIEW_FLAG_PK_REPEATS`].
+    /// A stream, or a view whose planner set [`gnitz_wire::ViewFlags::pk_repeats`].
     pub pk_repeats: bool,
     pub schema: Arc<Schema>,
     pub indexes: Vec<RelIndex>,

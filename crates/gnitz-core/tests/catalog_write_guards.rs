@@ -377,21 +377,22 @@ fn an_alter_view_bundle_still_applies_in_creation_order() {
     let mut circuit = gnitz_core::Circuit::default();
     let scan = circuit.input_delta(tid, gnitz_wire::ReadBound::None);
     circuit.sink(scan);
-    let vids = client
+    let vid = client
         .create_view_chain(
             "mixed",
             "v",
-            vec![gnitz_core::PlannedView {
+            gnitz_core::PlannedView {
                 circuit,
-                schema: id_v(),
+                schema: std::sync::Arc::new(id_v()),
                 pk_repeats: false,
-            }],
+            }
+            .into(),
             gnitz_core::ViewProps::default(),
             true,
         )
         .expect("the replacement bundle applies");
-    assert_ne!(vids[0], first, "the replacement takes a fresh id");
-    assert_eq!(client.resolve("mixed", "v").unwrap().unwrap().tid, vids[0]);
+    assert_ne!(vid, first, "the replacement takes a fresh id");
+    assert_eq!(client.resolve("mixed", "v").unwrap().unwrap().tid, vid);
 }
 
 /// `_sequences` carries the durable object-id high-waters, the checkpoint

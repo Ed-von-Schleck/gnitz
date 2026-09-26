@@ -21,21 +21,21 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
-    /// `columns` behind a leading key region of `npk` slots.
-    pub(crate) fn leading(layout: Vec<ColId>, columns: Vec<ColumnDef>, npk: usize) -> Frame {
+    /// `columns` behind a leading key region of `npk` slots, admitted as a schema
+    /// the engine can hold.
+    pub(crate) fn leading(layout: Vec<ColId>, columns: Vec<ColumnDef>, npk: usize) -> Result<Frame, GnitzSqlError> {
         debug_assert_eq!(layout.len(), columns.len(), "a frame's two halves are parallel");
-        Frame {
-            layout,
-            schema: Arc::new(Schema {
-                columns,
-                pk_cols: (0..npk as u32).collect(),
-            }),
-        }
+        let schema = Schema::from_parts(columns, (0..npk as u32).collect())
+            .map_err(|e| GnitzSqlError::Unsupported(format!("planned relation: {e}")))?;
+        Ok(Frame { layout, schema: Arc::new(schema) })
     }
 
     /// `pk_cols` as the leading key region — identity-free slots nothing can
     /// reference — then one iterator of `(id, def)` driving both halves.
-    pub(crate) fn keyed(pk_cols: Vec<ColumnDef>, payload: impl IntoIterator<Item = (ColId, ColumnDef)>) -> Frame {
+    pub(crate) fn keyed(
+        pk_cols: Vec<ColumnDef>,
+        payload: impl IntoIterator<Item = (ColId, ColumnDef)>,
+    ) -> Result<Frame, GnitzSqlError> {
         let npk = pk_cols.len();
         let mut layout = vec![ColId::NONE; npk];
         let mut columns = pk_cols;
@@ -96,6 +96,6 @@ pub(crate) fn physicalize_projection(
         .collect();
     Ok(PhysProjection {
         items: proj_items,
-        out: Frame::leading(layout, out_cols, input_schema.pk_count()),
+        out: Frame::leading(layout, out_cols, input_schema.pk_count())?,
     })
 }

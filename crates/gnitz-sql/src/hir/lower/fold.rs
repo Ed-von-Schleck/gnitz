@@ -5,7 +5,7 @@
 use super::super::physical::{self, Frame};
 use super::super::{as_col, split_filter, AggCol, ColId, GetSource, HirExpr, ProjEntry, RelExpr};
 use super::{keyed_frame, resolve_reduce_specs, ReduceSpecs};
-use crate::codec::project_schema::read_reply_shape;
+use crate::codec::project_schema::payload_map;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr};
 use gnitz_core::{ColumnDef, ReduceOutKey, Schema};
@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 /// Everything an ad-hoc grouped read needs, in layout terms: what the workers
 /// fold, and what the client does with the partials. The counterpart of
-/// `chain::EmitPieces` for the fold sink.
+/// `lower::EmitPieces` for the fold sink.
 pub(crate) struct FoldPieces {
     /// The reduce input: the pre-map's output schema when there is one, else the
     /// source's. The schema `agg`'s columns index, and the one that names them
@@ -78,15 +78,7 @@ pub(crate) fn lower_fold(rel: &RelExpr) -> Result<FoldPieces, GnitzSqlError> {
                     out: e.out.clone(),
                 })
                 .collect();
-            fold(
-                base,
-                pre,
-                &group_cols,
-                &[],
-                &[],
-                &finalize,
-                "SELECT DISTINCT over a computed column",
-            )
+            fold(base, pre, &group_cols, &[], &[], &finalize)
         }
         RelExpr::Project { input, items } => {
             // HAVING is a Filter between the projection and the reduce.
@@ -98,15 +90,7 @@ pub(crate) fn lower_fold(rel: &RelExpr) -> Result<FoldPieces, GnitzSqlError> {
                 RelExpr::Project { input, items } => (Some(items.as_slice()), input),
                 _ => (None, input),
             };
-            fold(
-                base,
-                pre,
-                group_cols,
-                aggs,
-                having,
-                items,
-                "GROUP BY over a computed key or aggregate argument",
-            )
+            fold(base, pre, group_cols, aggs, having, items)
         }
         _ => Err(GnitzSqlError::Internal(
             "ad-hoc grouped body is not a projection".into(),
@@ -115,8 +99,7 @@ pub(crate) fn lower_fold(rel: &RelExpr) -> Result<FoldPieces, GnitzSqlError> {
 }
 
 /// The fold of `group_cols` / `aggs` over `pre` (or the source itself) applied to
-/// `base`, then `having` and `finalize` over the partial reply. `what` names a
-/// pre-map whose schema is inadmissible.
+/// `base`, then `having` and `finalize` over the partial reply.
 fn fold(
     base: &RelExpr,
     pre: Option<&[ProjEntry]>,
@@ -124,7 +107,6 @@ fn fold(
     aggs: &[AggCol],
     having: &[HirExpr],
     finalize: &[ProjEntry],
-    what: &str,
 ) -> Result<FoldPieces, GnitzSqlError> {
     let (source_schema, base_layout) = adhoc_get(base)?;
     // The pre-map, physicalized over the source — the same projection `lower_reduce`
@@ -140,15 +122,9 @@ fn fold(
         ),
         Some(items) => {
             let p = physical::physicalize_projection(items, &base_layout, source_schema)?;
-            let columns = Arc::unwrap_or_clone(p.out.schema).columns;
-            let (schema, map) = read_reply_shape(&p.items, columns, source_schema, what)?;
-            (
-                Frame {
-                    layout: p.out.layout,
-                    schema: Arc::new(schema),
-                },
-                Some(map),
-            )
+            let k = source_schema.pk_count();
+            let map = payload_map(&p.items[k..], &p.out.schema.columns[k..], source_schema)?;
+            (p.out, Some(map))
         }
     };
     let ReduceSpecs { group, specs, cols } = resolve_reduce_specs(group_cols, aggs, &reduce_in.layout)?;
@@ -160,7 +136,6 @@ fn fold(
         &group,
         group.iter().copied(),
         cols,
-        "aggregate SELECT partial-reply layout",
     )?;
     let having = physical::resolve_preds(having, &partial.layout)?;
     let finalize = finalize

@@ -239,20 +239,20 @@ fn fed_view(client: &mut GnitzClient, sn: &str, tid: u64) -> u64 {
     let mut circuit = gnitz_core::Circuit::default();
     let src = circuit.input_delta(tid, gnitz_wire::ReadBound::None);
     circuit.sink(src);
-    let vids = client
+    client
         .create_view_chain(
             sn,
             "v",
-            vec![gnitz_core::PlannedView {
+            gnitz_core::PlannedView {
                 circuit,
-                schema: local_schema(),
+                schema: Arc::new(local_schema()),
                 pk_repeats: false,
-            }],
+            }
+            .into(),
             gnitz_core::ViewProps::Fed { delta_bytes: 8 << 20 },
             false,
         )
-        .expect("create the fed view");
-    vids[0]
+        .expect("create the fed view")
 }
 
 /// `pk → summed weight`, so a comparison is weight-exact: a poll applied twice

@@ -18,6 +18,7 @@
 
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use gnitz_core::{ColType, ColumnDef, RelClass, RelDescriptor, TypeCode};
+use gnitz_wire::decimal::MAX_DECIMAL_SCALE;
 
 /// The column def of a *computed* projection item, from the expression's
 /// nominal type. One home for the three rules every computed column obeys, so
@@ -30,13 +31,26 @@ use gnitz_core::{ColType, ColumnDef, RelClass, RelDescriptor, TypeCode};
 ///   the nominal type: a narrowing integer cast types as its target and a window
 ///   placeholder as the narrow value it stands in for, yet each rides a full
 ///   8-byte register. STRING maps to itself, which `register_image` already
-///   accounts for.
-pub(crate) fn computed_column(alias: Option<String>, idx: usize, nominal: ColType) -> ColumnDef {
-    ColumnDef::typed(
+///   accounts for;
+/// - a DECIMAL scale a register can hold.
+pub(crate) fn computed_column(alias: Option<String>, idx: usize, nominal: ColType) -> Result<ColumnDef, GnitzSqlError> {
+    check_decimal_scale(nominal.scale)?;
+    Ok(ColumnDef::typed(
         alias.unwrap_or_else(|| computed_column_name(idx)),
         nominal.register_image(),
         true,
-    )
+    ))
+}
+
+/// A scale a DECIMAL register can hold: past `MAX_DECIMAL_SCALE`, `10^scale`
+/// overflows `i64`.
+pub(crate) fn check_decimal_scale(scale: u8) -> Result<(), GnitzSqlError> {
+    if scale > MAX_DECIMAL_SCALE {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "DECIMAL scale {scale} exceeds {MAX_DECIMAL_SCALE}; CAST an operand to a narrower scale"
+        )));
+    }
+    Ok(())
 }
 
 /// The name of the unaliased computed item at SELECT position `idx`.

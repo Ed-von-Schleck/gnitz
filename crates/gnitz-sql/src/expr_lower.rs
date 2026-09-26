@@ -12,23 +12,13 @@ use crate::ir::{
     blend_type, decimal_compute_type, operand_ty_pair, operand_tys, temporal_arith_type, BExpr, BinOp, BoundExpr,
     NumFunc, StrArg, StrFunc, TrimMode,
 };
+use crate::validate::check_decimal_scale;
 use gnitz_core::{ColType, ColumnDef, FixedInt, Schema, TypeCode};
 use gnitz_expr::{
     CalendarOp, CmpOp, ExprBuilder, FloatArithOp, FloatUnaryOp, IntArithOp, IntUnaryOp, LikePattern, LogicalInstr as L,
     LogicalProgram, Reg, ScalarEval,
 };
-use gnitz_wire::decimal::{format_decimal, parse_decimal, pow10, rescale, MAX_DECIMAL_SCALE};
-
-/// A scale a DECIMAL register can hold: past `MAX_DECIMAL_SCALE`, `10^scale`
-/// overflows `i64`.
-fn check_decimal_scale(scale: u8) -> Result<(), GnitzSqlError> {
-    if scale > MAX_DECIMAL_SCALE {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "DECIMAL scale {scale} exceeds {MAX_DECIMAL_SCALE}; CAST an operand to a narrower scale"
-        )));
-    }
-    Ok(())
-}
+use gnitz_wire::decimal::{format_decimal, parse_decimal, pow10, rescale};
 
 /// Compile a comparison between two German-string columns, or a column and a
 /// string literal, to the `StrCol*` opcodes, which read the 16-byte cells

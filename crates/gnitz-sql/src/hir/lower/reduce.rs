@@ -3,10 +3,9 @@
 
 use super::super::{ColId, HirCol, HirExpr, ProjEntry, RelExpr};
 use super::spine::{open, Top};
-use super::{emit_filter, keyed_frame, project_front, resolve_reduce_specs, CutMemo};
+use super::{emit_filter, keyed_frame, project_front, resolve_reduce_specs, EmitPieces, ViewChain};
 use crate::agg::agg_col_def;
 use crate::error::GnitzSqlError;
-use crate::hir::chain::{EmitPieces, ViewChain};
 use gnitz_core::Circuit;
 use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc};
 use std::collections::HashSet;
@@ -16,7 +15,6 @@ use std::collections::HashSet;
 /// the raw reduce output.
 pub(super) fn lower_reduce(
     chain: &mut ViewChain,
-    memo: &mut CutMemo,
     items: &[ProjEntry],
     having_preds: &[HirExpr],
     reduce: &RelExpr,
@@ -27,12 +25,12 @@ pub(super) fn lower_reduce(
 
     let mut live: HashSet<ColId> = group_cols.iter().copied().collect();
     live.extend(aggs.iter().filter_map(|c| c.arg));
-    let spine = open(chain, memo, input, &live)?;
+    let spine = open(chain, input, &live)?;
     let mut cb = Circuit::default();
     // The spine's output is what the reduce groups and aggregates over, so the
     // group/argument positions, the strategy and the reduce-output layout all
     // resolve against it.
-    let (node, reduce_in) = spine.emit(&mut cb, Top::Slots, "GROUP BY input")?;
+    let (node, reduce_in) = spine.emit(&mut cb, Top::Slots)?;
 
     let mut r = resolve_reduce_specs(group_cols, aggs, &reduce_in.layout)?;
     let (out_key, group) = reduce_in.schema.reduce_key(&r.group);
@@ -48,17 +46,14 @@ pub(super) fn lower_reduce(
     let reduced = cb.reduce_multi(node, &group, &r.specs, ungrouped);
 
     // HAVING over the raw reduce output, then the finalize projection.
-    let having_frame = keyed_frame(
-        &reduce_in,
-        out_key,
-        &group,
-        group.iter().copied(),
-        r.cols,
-        "GROUP BY output",
-    )?;
+    let having_frame = keyed_frame(&reduce_in, out_key, &group, group.iter().copied(), r.cols)?;
     let filtered = emit_filter(&mut cb, reduced, having_preds, &having_frame)?;
     let (node, out) = project_front(&mut cb, filtered, items, &having_frame)?;
-    cb.sink(node);
     // One row per group key, which the reduce output is keyed on.
-    Ok(EmitPieces { circuit: cb, out, pk_repeats: false })
+    Ok(EmitPieces {
+        circuit: cb,
+        top: node,
+        out,
+        pk_repeats: false,
+    })
 }
