@@ -23,7 +23,6 @@ use gnitz_expr::{ColumnLocator, RowFilter, SchemaFacts};
 use gnitz_wire::{read_u64_le, write_u64_le, AggFunc as WireAggFunc};
 use rustc_hash::FxHashMap;
 
-use crate::agg::group_pk_def;
 use crate::codec::project_schema::{reply_program, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::exec::client_map::ClientMap;
@@ -46,7 +45,7 @@ pub(crate) struct FoldFinish {
 
 impl FoldFinish {
     pub(crate) fn new(
-        partial_schema: Schema,
+        partial_schema: Arc<Schema>,
         ops: impl IntoIterator<Item = WireAggFunc>,
         having: &[BoundExpr],
         finalize: Vec<(BoundExpr, ColumnDef)>,
@@ -61,18 +60,16 @@ impl FoldFinish {
             })
             .collect();
         let having = compile_filter_program(having, &partial_schema.columns)?
-            .map(|p| p.resolve_filter(&partial_schema))
+            .map(|p| p.resolve_filter(partial_schema.as_ref()))
             .transpose()?;
-        let mut items = vec![ProjItem::PassThrough { src_col: 0 }];
-        let mut cols = vec![group_pk_def()];
-        for (expr, def) in finalize {
-            items.push(ProjItem::from_bound(expr));
-            cols.push(def);
-        }
+        let (items, cols): (Vec<ProjItem>, Vec<ColumnDef>) = finalize
+            .into_iter()
+            .map(|(expr, def)| (ProjItem::from_bound(expr), def))
+            .unzip();
         let (out_schema, program) = reply_program(&items, cols, &partial_schema, "aggregate SELECT output schema")?;
         let finalize = ClientMap::new(program, &partial_schema, Arc::new(out_schema))?;
         Ok(FoldFinish {
-            partial_schema: Arc::new(partial_schema),
+            partial_schema,
             out_schema: Arc::clone(finalize.out_schema()),
             merge,
             having,

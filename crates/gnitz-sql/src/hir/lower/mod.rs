@@ -23,7 +23,7 @@ mod spine;
 mod topn;
 
 use super::physical::{self, Frame};
-use super::{slots_of, split_filter, AggCol, ColId, GetSource, HirCol, HirExpr, ProjEntry, RelExpr};
+use super::{slots_of, split_filter, AggCol, ColId, HirCol, HirExpr, ProjEntry, RelExpr};
 use super::{JoinClass, JoinShape, JoinType};
 use crate::agg::group_pk_def;
 use crate::codec::project_schema::{payload_map, ProjItem};
@@ -179,7 +179,7 @@ fn emit_projection(
         .map(|i| i.passthrough_src().filter(|&c| !input.is_pk_col(c)).map(|c| c as u32))
         .collect();
     let Some(payload) = payload else {
-        return Ok(cb.map_expr(node, payload_map(&items[k..], &out.columns[k..], input)?));
+        return Ok(cb.map_expr(node, payload_map(items, out, input)?));
     };
     let identity =
         items.len() == input.columns.len() && items.iter().enumerate().all(|(i, it)| it.passthrough_src() == Some(i));
@@ -249,15 +249,11 @@ fn lowered_whole(rel: &RelExpr) -> bool {
 /// whole, since every alias reads that one segment) under the alias's ids.
 pub(crate) fn resolve_in_place(chain: &mut ViewChain, input: &Rc<RelExpr>) -> Result<Option<SegInput>, GnitzSqlError> {
     match input.as_ref() {
-        RelExpr::Get {
-            source: GetSource::Catalog { desc },
-            schema,
-            cols,
-        } => Ok(Some(SegInput {
+        RelExpr::Get { desc, cols } => Ok(Some(SegInput {
             src: SegSource::Catalog(Arc::clone(desc)),
             frame: Frame {
                 layout: cols.iter().map(|c| c.id).collect(),
-                schema: Arc::clone(schema),
+                schema: Arc::clone(&desc.schema),
             },
         })),
         RelExpr::Alias { input: inner, cols } => {

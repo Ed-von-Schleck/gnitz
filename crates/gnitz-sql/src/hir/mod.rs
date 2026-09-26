@@ -25,7 +25,7 @@ use crate::agg::AggFunc;
 use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
-use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, RangeRel, RelDescriptor, Schema, TypeCode, ViewBundle};
+use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, RangeRel, RelDescriptor, TypeCode, ViewBundle};
 use gnitz_wire::AggFunc as WireAggFunc;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -55,23 +55,19 @@ pub(crate) fn bind_and_lower(
 /// compute them the same way, DISTINCT included.
 ///
 /// Returns the fold's pieces and the finalize item each key of `order_exprs`
-/// sorts on.
-///
-/// The ad-hoc router rejects every subquery and join shape before a body reaches
-/// here, so the bound tree is one of the two shapes `lower_fold` expects.
+/// sorts on, or `None` when the DISTINCT was dropped because the rows are already
+/// a set. The bound tree is `Distinct(Project(Get))`, `Project(Get)` (the dropped
+/// DISTINCT) or `Project(Filter_having?(Reduce(…)))`: the ad-hoc router rejects
+/// every subquery and join shape first.
 pub(crate) fn bind_and_lower_fold(
     select: &sqlparser::ast::Select,
-    schema: &Arc<Schema>,
+    desc: &Arc<RelDescriptor>,
     alias: &str,
     order_exprs: &[&sqlparser::ast::Expr],
-) -> Result<(lower::fold::FoldPieces, Vec<usize>), GnitzSqlError> {
+) -> Result<Option<(lower::fold::FoldPieces, Vec<usize>)>, GnitzSqlError> {
     let ids = ColIdGen::new();
-    let (rel, order_cols) = if select.distinct.is_some() {
-        bind::bind_adhoc_distinct(&ids, select, Arc::clone(schema), alias, order_exprs)?
-    } else {
-        bind::bind_adhoc_grouped(&ids, select, Arc::clone(schema), alias, order_exprs)?
-    };
-    Ok((lower::fold::lower_fold(&rel)?, order_cols))
+    let (rel, order_cols) = bind::bind_adhoc_fold(&ids, select, Arc::clone(desc), alias, order_exprs)?;
+    Ok(lower::fold::lower_fold(&rel)?.map(|pieces| (pieces, order_cols)))
 }
 
 /// An ad-hoc rows read's reply items, as [`bind_adhoc_rows`] binds them.
@@ -88,12 +84,12 @@ pub(crate) struct AdhocRows {
 /// The ad-hoc rows read's entry to the same binder.
 pub(crate) fn bind_adhoc_rows(
     projection: &[sqlparser::ast::SelectItem],
-    schema: &Arc<Schema>,
+    desc: &Arc<RelDescriptor>,
     alias: &str,
     order_exprs: &[&sqlparser::ast::Expr],
 ) -> Result<AdhocRows, GnitzSqlError> {
     let ids = ColIdGen::new();
-    let bound = bind::bind_adhoc_projection(&ids, projection, Arc::clone(schema), alias, order_exprs)?;
+    let bound = bind::bind_adhoc_projection(&ids, projection, Arc::clone(desc), alias, order_exprs)?;
     let mut items = Vec::with_capacity(bound.items.len());
     let mut cols = Vec::with_capacity(bound.items.len());
     for entry in bound.items {
@@ -272,8 +268,7 @@ pub(crate) struct ProjEntry {
 /// output columns are derived on demand by [`RelExpr::cols`].
 pub(crate) enum RelExpr {
     Get {
-        source: GetSource,
-        schema: Arc<Schema>,
+        desc: Arc<RelDescriptor>,
         cols: Vec<HirCol>,
     },
     Filter {
@@ -352,24 +347,6 @@ pub(crate) struct TopNKey {
     pub col: ColId,
     pub desc: bool,
     pub nulls_first: bool,
-}
-
-/// Where a `Get`'s rows come from: a catalog relation, or the ad-hoc read's
-/// source, which names its relation in the `ReadSpec` instead — so it has no
-/// `tid` and no descriptor here, and never reaches the circuit lowering.
-pub(crate) enum GetSource {
-    Catalog { desc: Arc<RelDescriptor> },
-    AdHoc,
-}
-
-impl GetSource {
-    /// The relation's own answer; the ad-hoc source has no relation to ask.
-    fn pk_repeats(&self) -> bool {
-        match self {
-            GetSource::Catalog { desc } => desc.pk_repeats,
-            GetSource::AdHoc => true,
-        }
-    }
 }
 
 /// One physical reduce column: the op, the column it reads (`None` for COUNT(*)),
@@ -719,22 +696,13 @@ impl RelExpr {
     /// registered schema column, in schema order (so a `ColId`'s env position is
     /// its schema position).
     pub(crate) fn get(ids: &ColIdGen, desc: Arc<RelDescriptor>) -> Rc<RelExpr> {
-        let schema = Arc::clone(&desc.schema);
-        Self::get_of(ids, GetSource::Catalog { desc }, schema)
-    }
-
-    /// The ad-hoc read's source, under the same column minting.
-    pub(crate) fn get_adhoc(ids: &ColIdGen, schema: Arc<Schema>) -> Rc<RelExpr> {
-        Self::get_of(ids, GetSource::AdHoc, schema)
-    }
-
-    fn get_of(ids: &ColIdGen, source: GetSource, schema: Arc<Schema>) -> Rc<RelExpr> {
-        let cols = schema
+        let cols = desc
+            .schema
             .columns
             .iter()
             .map(|c| HirCol::new(ids.next(), c.clone()))
             .collect();
-        Rc::new(RelExpr::Get { source, schema, cols })
+        Rc::new(RelExpr::Get { desc, cols })
     }
 
     /// A projection item passing one column through to itself, keeping its
@@ -807,11 +775,11 @@ impl RelExpr {
             return mapped;
         }
         match self {
-            RelExpr::Get { source, schema, cols } => {
-                if source.pk_repeats() {
+            RelExpr::Get { desc, cols } => {
+                if desc.pk_repeats {
                     return None;
                 }
-                Some(schema.pk_cols.iter().map(|&i| cols[i as usize].id).collect())
+                Some(desc.schema.pk_cols.iter().map(|&i| cols[i as usize].id).collect())
             }
             RelExpr::Filter { .. } | RelExpr::Project { .. } | RelExpr::Alias { .. } => {
                 unreachable!("key_through maps a pass-through node")
@@ -846,12 +814,8 @@ impl RelExpr {
             return mapped;
         }
         match self {
-            RelExpr::Get {
-                source: GetSource::Catalog { desc },
-                schema,
-                cols,
-            } if desc.class == gnitz_core::RelClass::Table => {
-                Some(schema.pk_cols.iter().map(|&i| cols[i as usize].id).collect())
+            RelExpr::Get { desc, cols } if desc.class == gnitz_core::RelClass::Table => {
+                Some(desc.schema.pk_cols.iter().map(|&i| cols[i as usize].id).collect())
             }
             RelExpr::Reduce { group_cols, .. } => Some(group_cols.clone()),
             RelExpr::Distinct { input } => Some(input.cols().iter().map(|c| c.id).collect()),

@@ -16,7 +16,7 @@ use crate::ast_util::{
     aliased_def, body_is_grouped, classify_agg_call, classify_from, col_ref_parts, expand_wildcard_item,
     extract_table_name_and_alias, for_each_agg_call, group_by_exprs, group_by_target, has_exists_in_subquery,
     has_scalar_subquery, has_visible_column, is_agg_call, peel_nested, projection_item_expr, scalar_projection_item,
-    select_has_window, window_spec_keys, AggArg, FromShape,
+    select_has_window, select_is_distinct, window_spec_keys, AggArg, FromShape,
 };
 use crate::bind::apply_positional_aliases;
 use crate::bind::structural::maybe_negate;
@@ -31,7 +31,7 @@ use crate::validate::{
     as_plain_select, cte_body, non_recursive_ctes, reject_duplicate_projection_names, reject_float_key,
     reject_query_envelope_body, reject_unhonored_select_clauses, validate_user_name, HonoredClauses,
 };
-use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, RelClass, Schema, TypeCode};
+use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, RelClass, RelDescriptor, TypeCode};
 use sqlparser::ast::{
     BinaryOperator, Expr, Function, JoinConstraint, JoinOperator, NamedWindowExpr, Query, Select, SelectItem, SetExpr,
     SetOperator, SetQuantifier, TableFactor,
@@ -329,7 +329,7 @@ fn bind_select(
         )));
     };
     let grouped = body_is_grouped(select);
-    let distinct = select.distinct.is_some();
+    let distinct = select_is_distinct(select);
     // Below here the tail is only its expression keys, which every body shape
     // places like any other projection item; the wrap is this function's, at
     // whichever exit the body took.
@@ -387,7 +387,7 @@ fn bind_select(
         clause: cx.view.stmt,
         sub: SubPolicy::PerKind,
     };
-    let (rel, placed) = bind_body_suffix(cx.ids, select, left, &leaf, grouped, &order_exprs)?;
+    let (rel, placed) = bind_body_suffix(cx.ids, select, left, &leaf, Surface::ViewBody, &order_exprs)?;
     wrap_tail(tail, rel, &placed)
 }
 
@@ -401,8 +401,7 @@ fn wrap_tail(tail: Option<&QueryTail<'_>>, rel: Rc<RelExpr>, placed: &[usize]) -
 }
 
 /// WHERE, then the projection in whichever shape the body carries — the tail
-/// every single-table, subquery and join body shares once its source relation
-/// and leaf binder are resolved.
+/// every body shares once its source relation and leaf binder are resolved.
 ///
 /// DISTINCT outranks a grouped shape. The projection is bound in SELECT order
 /// (`place_pk_front` is physical, applied at lowering).
@@ -411,29 +410,30 @@ fn bind_body_suffix(
     select: &Select,
     source: Rc<RelExpr>,
     leaf: &ScopeLeaf<'_>,
-    grouped: bool,
+    surface: Surface,
     order_exprs: &[&Expr],
 ) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
     let ctx = &format!("{} projection", leaf.clause);
+    let distinct = select_is_distinct(select);
     let mut rel = source;
-    if let Some(where_expr) = &select.selection {
-        rel = RelExpr::filter(rel, bind_conjuncts(where_expr, leaf)?)?;
+    if surface == Surface::ViewBody {
+        if let Some(where_expr) = &select.selection {
+            rel = RelExpr::filter(rel, bind_conjuncts(where_expr, leaf)?)?;
+        }
     }
-    if grouped && select.distinct.is_none() {
-        // A view body admits window calls; the ad-hoc fold entries below do not,
-        // and reach `bind_grouped_suffix` with `windows: false`.
-        return bind_grouped_suffix(ids, select, rel, leaf, GroupedSurface::ViewBody, order_exprs);
+    if body_is_grouped(select) && !distinct {
+        return bind_grouped_suffix(ids, select, rel, leaf, surface, order_exprs);
     }
     // The window desugar owns its own projection (it must place the SELECT list
     // over the joined-in window values), so it hands back the projected relation.
-    let (projected, placed) = if select_has_window(select) {
+    let (projected, placed) = if surface == Surface::ViewBody && select_has_window(select) {
         super::window::bind_window_final(ids, select, rel, leaf, ctx, order_exprs)?
     } else {
         let mut items = bind_projection(&select.projection, leaf, ids, ctx)?;
         let placed = place_order_keys(order_exprs, &mut items, ids, leaf)?;
         (leaf.project(rel, items)?, placed)
     };
-    if select.distinct.is_none() {
+    if !distinct {
         return Ok((projected, placed));
     }
     reject_unselected_distinct_keys(&projected, &placed, ctx)?;
@@ -740,8 +740,7 @@ fn bind_linear_subquery_body(
         clause: stmt,
         sub: SubPolicy::Bind { bind: &bind_sub, subs: &subs },
     };
-    // The `!grouped && !distinct` guard is what routed the body here.
-    bind_body_suffix(ids, select, get, &leaf, false, order_exprs)
+    bind_body_suffix(ids, select, get, &leaf, Surface::ViewBody, order_exprs)
 }
 
 /// The resolved inner relation of a subquery: `Filter?(Get)` with the inner-local
@@ -1486,60 +1485,22 @@ fn distinct_arg(calls: &[AggKey]) -> Result<Option<ColId>, GnitzSqlError> {
     Ok(Some(arg))
 }
 
-/// Bind an ad-hoc single-relation grouped body to
-/// `Project(Filter_having?(Reduce(PreMap?(Get))))` — the same suffix, over the
-/// same leaf, that a grouped `CREATE VIEW` body binds. The fold lowering
-/// (`dml::select`) reads the result instead of running a second binder, which
-/// is what makes one written statement mean one thing on both paths.
-///
-/// The WHERE is deliberately *not* bound here: the ad-hoc read path carries it
-/// as the `ReadSpec` predicate, with its scan bound extracted, so binding it
-/// again would compile it twice. Nothing in the grouped suffix reads it.
-pub(crate) fn bind_adhoc_grouped(
+/// Bind an ad-hoc single-relation grouped or `SELECT DISTINCT` body through the suffix a
+/// view body binds through, so one written statement means one thing on both paths.
+pub(crate) fn bind_adhoc_fold(
     ids: &ColIdGen,
     select: &Select,
-    schema: Arc<Schema>,
+    desc: Arc<RelDescriptor>,
     alias: &str,
     order_exprs: &[&Expr],
 ) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
-    let (source, scope) = adhoc_source(ids, schema, alias);
+    let (source, scope) = adhoc_source(ids, desc, alias);
     let leaf = ScopeLeaf {
         scope: &scope,
         clause: "SELECT",
         sub: SubPolicy::PerKind,
     };
-    bind_grouped_suffix(ids, select, source, &leaf, GroupedSurface::AdhocRead, order_exprs)
-}
-
-/// Bind an ad-hoc single-relation `SELECT DISTINCT` body to `Distinct(Project(Get))`
-/// — the same tree, over the same leaf, that a `SELECT DISTINCT` `CREATE VIEW`
-/// body binds, so one written projection means one thing on both paths (a
-/// computed item included). The WHERE is not bound here, for the reason
-/// [`bind_adhoc_grouped`] states. An ORDER BY key must sort on a selected item: a
-/// hidden one would widen the set identity.
-pub(crate) fn bind_adhoc_distinct(
-    ids: &ColIdGen,
-    select: &Select,
-    schema: Arc<Schema>,
-    alias: &str,
-    order_exprs: &[&Expr],
-) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
-    let (source, scope) = adhoc_source(ids, schema, alias);
-    let leaf = ScopeLeaf {
-        scope: &scope,
-        clause: "SELECT DISTINCT",
-        sub: SubPolicy::PerKind,
-    };
-    let order_leaf = ScopeLeaf {
-        scope: &scope,
-        clause: "ORDER BY",
-        sub: SubPolicy::PerKind,
-    };
-    let mut items = bind_projection(&select.projection, &leaf, ids, "SELECT DISTINCT")?;
-    let placed = place_order_keys(order_exprs, &mut items, ids, &order_leaf)?;
-    let projected = RelExpr::project(source, items);
-    reject_unselected_distinct_keys(&projected, &placed, "SELECT DISTINCT")?;
-    Ok((RelExpr::distinct(projected)?, placed))
+    bind_body_suffix(ids, select, source, &leaf, Surface::AdhocRead, order_exprs)
 }
 
 /// An ad-hoc SELECT list bound by [`bind_adhoc_projection`].
@@ -1554,23 +1515,15 @@ pub(crate) struct AdhocProjection {
 /// Bind an ad-hoc single-relation SELECT list through the leaf a view body binds
 /// through: the source PK as hidden pass-through items, then the SELECT list, then
 /// each ORDER BY expression no item already computes. The WHERE is not bound here,
-/// for the reason [`bind_adhoc_grouped`] states.
+/// for the reason [`Surface::AdhocRead`] states.
 pub(crate) fn bind_adhoc_projection(
     ids: &ColIdGen,
     projection: &[SelectItem],
-    schema: Arc<Schema>,
+    desc: Arc<RelDescriptor>,
     alias: &str,
     order_exprs: &[&Expr],
 ) -> Result<AdhocProjection, GnitzSqlError> {
-    // The ids a `Get` would mint; this surface reads only the scope.
-    let scope = JoinScope::single(
-        alias,
-        schema
-            .columns
-            .iter()
-            .map(|c| HirCol::new(ids.next(), c.clone()))
-            .collect(),
-    );
+    let (_, scope) = adhoc_source(ids, Arc::clone(&desc), alias);
     let leaf = ScopeLeaf {
         scope: &scope,
         clause: "SELECT",
@@ -1580,7 +1533,8 @@ pub(crate) fn bind_adhoc_projection(
     let cols = &scope.combined;
     // Hidden, so no SELECT-list name resolves to one and no position counts one; an
     // ORDER BY key over an unselected PK column sorts on its slot.
-    let mut items: Vec<ProjEntry> = schema
+    let mut items: Vec<ProjEntry> = desc
+        .schema
         .pk_cols
         .iter()
         .map(|&pk| {
@@ -1604,19 +1558,21 @@ pub(crate) fn bind_adhoc_projection(
 
 /// The `Get` an ad-hoc body binds over and the one-relation scope its names
 /// resolve through.
-fn adhoc_source(ids: &ColIdGen, schema: Arc<Schema>, alias: &str) -> (Rc<RelExpr>, JoinScope) {
-    let source = RelExpr::get_adhoc(ids, schema);
+fn adhoc_source(ids: &ColIdGen, desc: Arc<RelDescriptor>, alias: &str) -> (Rc<RelExpr>, JoinScope) {
+    let source = RelExpr::get(ids, desc);
     let scope = JoinScope::single(alias, source.cols());
     (source, scope)
 }
 
-/// What a calling surface adds to — and withholds from — a grouped body. One or
-/// the other, never both: a view body admits window calls and DISTINCT
-/// aggregates, an ad-hoc read admits neither. Both bring ORDER BY keys, which
-/// ride as their own parameter.
-#[derive(PartialEq, Eq)]
-enum GroupedSurface {
+/// Which statement a body is bound for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    /// A `CREATE VIEW` body: binds its WHERE, and admits window calls and DISTINCT
+    /// aggregates.
     ViewBody,
+    /// An ad-hoc read, which lowers to one stateless fold over one scan: it admits
+    /// neither window calls nor DISTINCT aggregates. Its WHERE ships as the
+    /// `ReadSpec` predicate, bound by the access path, so it is not bound here.
     AdhocRead,
 }
 
@@ -1628,7 +1584,7 @@ fn bind_grouped_suffix(
     select: &Select,
     input: Rc<RelExpr>,
     leaf: &ScopeLeaf<'_>,
-    surface: GroupedSurface,
+    surface: Surface,
     order_exprs: &[&Expr],
 ) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
     let mut pre = PreMap::new(ids, leaf.env().to_vec());
@@ -1656,7 +1612,7 @@ fn bind_grouped_suffix(
     }
     // An ad-hoc read lowers to one stateless fold over one scan, which has no room
     // for the `Distinct` below the reduce.
-    if surface == GroupedSurface::AdhocRead && calls.iter().any(|c| matches!(c.arg, AggArg::Distinct(_))) {
+    if surface == Surface::AdhocRead && calls.iter().any(|c| matches!(c.arg, AggArg::Distinct(_))) {
         return Err(GnitzSqlError::Unsupported(
             "DISTINCT aggregates are supported in a CREATE VIEW body only".into(),
         ));
@@ -1707,7 +1663,7 @@ fn bind_grouped_suffix(
     }
 
     let select_leaf = grouped("GROUP BY SELECT");
-    if surface == GroupedSurface::ViewBody && select_has_window(select) {
+    if surface == Surface::ViewBody && select_has_window(select) {
         // The desugar owns its own projection.
         return super::window::bind_window_final(ids, select, rel, &select_leaf, "GROUP BY", order_exprs);
     }

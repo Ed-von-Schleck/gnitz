@@ -476,6 +476,14 @@ fn every_read_shape_plans_to_its_sink() {
         ("SELECT COUNT(*) FROM t", true, true),
         ("SELECT g, SUM(v) AS s FROM t GROUP BY g", true, true),
         ("SELECT DISTINCT g FROM t", true, true),
+        ("SELECT DISTINCT g, v FROM t", true, true),
+        ("SELECT DISTINCT id + 1 FROM t", true, true),
+        // Rows already a set: the DISTINCT drops, and they read as rows.
+        ("SELECT DISTINCT id, v FROM t", false, true),
+        ("SELECT DISTINCT v, id FROM t ORDER BY v LIMIT 3", false, true),
+        ("SELECT DISTINCT * FROM t", false, true),
+        ("SELECT ALL v FROM t", false, true),
+        ("SELECT ALL g, COUNT(*) FROM t GROUP BY g", true, true),
         ("SELECT COUNT(*) FROM t LIMIT 0", true, false),
         ("WITH c AS (SELECT * FROM t) SELECT id FROM c", false, true),
     ] {
@@ -491,6 +499,21 @@ fn every_read_shape_plans_to_its_sink() {
             lines[4]
         );
         assert!(plan.spec().is_some(), "`{sql}`: every relation read ships a spec");
+    }
+}
+
+/// A DISTINCT drops only over a base table read whole on its key: a compound key
+/// needs every column, and a view's key does not make its rows a set.
+#[test]
+fn a_distinct_reads_as_rows_only_over_a_tables_whole_key() {
+    let cat = cat();
+    for (sql, shape) in [
+        ("SELECT DISTINCT a, b FROM c", "projection:"),
+        ("SELECT DISTINCT a, x FROM c", "fold: distinct on (a, x)"),
+        ("SELECT DISTINCT * FROM tv", "fold: distinct on (id, v, w)"),
+    ] {
+        let line = &explain(&cat, sql)[3];
+        assert!(line.starts_with(shape), "`{sql}`: {line}");
     }
 }
 
@@ -910,7 +933,7 @@ fn an_order_by_key_binds_where_the_select_list_does() {
         (
             "SELECT DISTINCT v FROM t ORDER BY v + 1",
             "Unsupported",
-            "SELECT DISTINCT: an ORDER BY key under SELECT DISTINCT must be a selected column",
+            "SELECT projection: an ORDER BY key under SELECT DISTINCT must be a selected column",
         ),
         ("SELECT id FROM t ORDER BY nope + 1", "Bind", "column 'nope' not found"),
     ] {

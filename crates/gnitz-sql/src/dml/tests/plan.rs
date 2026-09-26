@@ -237,7 +237,14 @@ fn rows_reply_of(sql: &str, schema: &Arc<Schema>) -> RowsReply {
     let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() else {
         panic!("`{sql}` is not a plain SELECT");
     };
-    rows_reply(&sel.projection, q.order_by.as_ref(), schema, "t").unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
+    let desc = Arc::new(gnitz_core::RelDescriptor {
+        tid: 1,
+        class: gnitz_core::RelClass::Table,
+        pk_repeats: false,
+        schema: Arc::clone(schema),
+        indexes: Vec::new(),
+    });
+    rows_reply(&sel.projection, q.order_by.as_ref(), &desc, "t").unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
 }
 
 /// A projection reproducing the relation replies in its layout with no program, ORDER BY

@@ -429,6 +429,12 @@ pub(crate) fn body_is_grouped(select: &sqlparser::ast::Select) -> bool {
             .any(expr_has_aggregate)
 }
 
+/// True when a SELECT body deduplicates its rows. `SELECT ALL` parses as a
+/// quantifier too, and is the bag it spells.
+pub(crate) fn select_is_distinct(select: &sqlparser::ast::Select) -> bool {
+    matches!(select.distinct, Some(sqlparser::ast::Distinct::Distinct))
+}
+
 /// Whether `e` or any node beneath it satisfies `p` — the one recursive
 /// existence walk over the [`expr_operands`] node set, so a walker written
 /// against it inherits that set rather than re-spelling the recursion.

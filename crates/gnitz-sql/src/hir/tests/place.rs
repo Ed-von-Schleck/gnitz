@@ -1,6 +1,5 @@
 use super::*;
 use crate::hir::bind::tests::bound;
-use crate::hir::GetSource;
 
 /// The tree under a bound body's projection, a filter with its conjunct count,
 /// over `t` and `u` of the bind tests' catalog.
@@ -14,7 +13,7 @@ fn tree(sql: &str) -> String {
 
 fn render(rel: &RelExpr) -> String {
     match rel {
-        RelExpr::Get { source: GetSource::Catalog { desc }, .. } => if desc.tid == 1 { "t" } else { "u" }.to_string(),
+        RelExpr::Get { desc, .. } => if desc.tid == 1 { "t" } else { "u" }.to_string(),
         RelExpr::Filter { input, preds } => format!("Filter[{}]({})", preds.len(), render(input)),
         RelExpr::Project { input, .. } => format!("Project({})", render(input)),
         RelExpr::Join { left, right, on, .. } => format!(

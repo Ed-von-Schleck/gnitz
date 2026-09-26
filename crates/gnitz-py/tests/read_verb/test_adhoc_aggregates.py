@@ -487,6 +487,16 @@ def test_distinct_clamps_every_survivor_to_weight_one(client, schema_name):
         {(2,): 1, (3,): 1}
 
 
+def test_select_all_is_a_bag(client, schema_name):
+    """`SELECT ALL` spells the default quantifier: the bag, never a DISTINCT."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE a (pk BIGINT PRIMARY KEY, v BIGINT NOT NULL); "
+        "INSERT INTO a VALUES (1, 5), (2, 5)", schema_name=sn)
+    assert bag(_parity(client, sn, "SELECT ALL v FROM a")) == {(5,): 2}
+    assert bag(_parity(client, sn, "SELECT ALL v, COUNT(*) AS c FROM a GROUP BY v")) == {(5, 2): 1}
+
+
 def test_distinct_over_a_computed_key_and_a_duplicate_name(client, schema_name):
     """`SELECT DISTINCT <expr>` and `SELECT DISTINCT *` over a duplicate-name view
     both bind through the one front end, so each accepts exactly what the
@@ -583,6 +593,10 @@ def test_the_per_worker_group_cap_aborts_and_the_worker_keeps_serving(adhoc_grou
     with pytest.raises(gnitz.GnitzError, match="CREATE VIEW"):
         rows(client, sn, "SELECT g, COUNT(*) AS c FROM t GROUP BY g")
     assert bag(rows(client, sn, "SELECT COUNT(*) AS c FROM t")) == {(100,): 1}
+    # Rows already a set read as rows: no fold, so no cap.
+    every_row = {(i, i): 1 for i in range(1, 101)}
+    assert bag(rows(client, sn, "SELECT DISTINCT * FROM t")) == every_row
+    assert bag(rows(client, sn, "SELECT DISTINCT pk, g FROM t")) == every_row
 
 
 # ---------------------------------------------------------------------------

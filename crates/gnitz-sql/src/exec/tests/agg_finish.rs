@@ -1,6 +1,6 @@
 use super::*;
 use crate::agg::AggFunc;
-use crate::agg::{agg_col_def, finalize_agg_bexpr};
+use crate::agg::{agg_col_def, finalize_agg_bexpr, group_pk_def};
 use crate::ir::{BExpr, BinOp};
 use crate::test_support::col_def;
 use gnitz_core::{PkColumn, TypeCode};
@@ -77,7 +77,13 @@ fn finish_of(
     having: &[BoundExpr],
     finalize: Vec<(BoundExpr, ColumnDef)>,
 ) -> FoldFinish {
-    FoldFinish::new(partial.clone(), specs.iter().map(|d| d.agg_op), having, finalize).unwrap()
+    FoldFinish::new(
+        Arc::new(partial.clone()),
+        specs.iter().map(|d| d.agg_op),
+        having,
+        finalize,
+    )
+    .unwrap()
 }
 
 /// A concatenated partial reply over `schema`: one weight-1 row per

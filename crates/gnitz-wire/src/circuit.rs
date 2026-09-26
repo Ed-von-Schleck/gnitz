@@ -185,10 +185,11 @@ impl RangeRel {
     }
 }
 
-/// How a `Reduce` node keys its output. Derived, never transmitted: both sides
-/// call [`Self::for_group_cols`] over facts they already hold — the source PK
-/// column list and the GROUP BY column list — so there is one producer and
-/// nothing to disagree with.
+/// How a reduce keys its output. For a `Reduce` node it is derived, never
+/// transmitted: both sides call [`Self::for_group_cols`] over facts they already
+/// hold — the source PK column list and the GROUP BY column list. A fold sink's
+/// reply is always [`Self::SyntheticFold`], whose 16-byte key the client combine
+/// hashes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReduceOutKey {
     /// Leading synthetic `_group_pk` U128 = null-distinct group fold; the

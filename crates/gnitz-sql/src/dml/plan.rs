@@ -10,7 +10,7 @@ use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_wire_conjuncts;
 use crate::ir::BoundExpr;
 use crate::tail::{order_exprs, parse_order_by, wire_keys};
-use gnitz_core::{ColumnDef, RelIndex, Schema};
+use gnitz_core::{ColumnDef, RelDescriptor, RelIndex, Schema};
 use gnitz_expr::LogicalProgram;
 use gnitz_wire::{OrderKey, ReadBound};
 use sqlparser::ast::{Expr, OrderBy, SelectItem};
@@ -75,18 +75,21 @@ pub(crate) struct RowsReply {
     pub(crate) order: Vec<OrderKey>,
 }
 
-/// The rows reply `projection` produces over `schema`, ordered by `order_by`.
+/// The rows reply `projection` produces over `desc`, ordered by `order_by`.
 pub(crate) fn rows_reply(
     projection: &[SelectItem],
     order_by: Option<&OrderBy>,
-    schema: &Arc<Schema>,
+    desc: &Arc<RelDescriptor>,
     alias: &str,
 ) -> Result<RowsReply, GnitzSqlError> {
     let keys = parse_order_by(order_by)?;
-    let crate::hir::AdhocRows { items, cols: out_cols, placed } =
-        crate::hir::bind_adhoc_rows(projection, schema, alias, &order_exprs(&keys))?;
+    let crate::hir::AdhocRows { items, cols: mut out_cols, placed } =
+        crate::hir::bind_adhoc_rows(projection, desc, alias, &order_exprs(&keys))?;
+    let schema = &desc.schema;
     let mut order = wire_keys(&keys, &out_cols, placed)?;
-    if reproduces(schema, &items, &out_cols) {
+    // Past the PK prefix `bind_adhoc_rows` places for ORDER BY; the reply carries its own.
+    let k = schema.pk_count();
+    if reproduces(schema, &items[k..], &out_cols[k..]) {
         for key in &mut order {
             key.col = items[key.col as usize]
                 .passthrough_src()
@@ -98,7 +101,12 @@ pub(crate) fn rows_reply(
             order,
         });
     }
-    let (reply, program) = reply_program(&items, out_cols, schema, "read-spec reply schema is invalid")?;
+    let (reply, program) = reply_program(
+        &items[k..],
+        out_cols.split_off(k),
+        schema,
+        "read-spec reply schema is invalid",
+    )?;
     Ok(RowsReply {
         schema: Arc::new(reply),
         program: Some(program),
@@ -106,13 +114,12 @@ pub(crate) fn rows_reply(
     })
 }
 
-/// Whether the reply past its hidden PK prefix is the relation's visible columns, each
-/// copied in place, visible, under its own name.
+/// Whether a reply payload is the relation's visible columns, each copied in place,
+/// visible, under its own name.
 fn reproduces(schema: &Schema, items: &[ProjItem], out_cols: &[ColumnDef]) -> bool {
-    let k = schema.pk_cols.len();
-    let reply = items[k..]
+    let reply = items
         .iter()
-        .zip(&out_cols[k..])
+        .zip(out_cols)
         .map(|(item, col)| (item.passthrough_src(), col.is_hidden, col.name.as_str()));
     let relation = schema
         .visible_columns()

@@ -2,7 +2,8 @@
 //! the **parameterized bounded read** (a `ReadSpec` rows sink executed
 //! server-side: bound pushdown, predicate, projection, ORDER BY / LIMIT top-k)
 //! or, for aggregate / DISTINCT shapes, through the **fold sink** (a per-worker
-//! hash-fold + client finishing). A FROM-less SELECT reads nothing: its one
+//! hash-fold + client finishing) — except a DISTINCT over rows already a set,
+//! which reads as rows. A FROM-less SELECT reads nothing: its one
 //! constant row is the fold sink's client finish over the global ground row,
 //! computed at plan time.
 //!
@@ -22,7 +23,7 @@
 use crate::agg::ground_partial_schema;
 use crate::ast_util::{
     body_is_grouped, classify_from, extract_table_name_and_alias, has_exists_in_subquery, has_scalar_subquery,
-    reject_position_out_of_range, scalar_projection_item, FromShape,
+    reject_position_out_of_range, scalar_projection_item, select_is_distinct, FromShape,
 };
 use crate::bind::{bind_single_table, output_column, probe_relation};
 use crate::codec::project_schema::compute_map;
@@ -207,7 +208,7 @@ fn plan_query(cat: &CatalogSnapshot, query: &Query, schema_name: &str) -> Result
     let (name, alias) = extract_table_name_and_alias(factor, schema_name, "FROM")?;
     // DISTINCT wins the split: its fold does not group, so DISTINCT + GROUP BY keeps the
     // GROUP BY rejection.
-    let distinct = select.distinct.is_some();
+    let distinct = select_is_distinct(select);
     let fold = distinct || body_is_grouped(select);
     let ctx = if distinct {
         "SELECT DISTINCT"
@@ -222,52 +223,69 @@ fn plan_query(cat: &CatalogSnapshot, query: &Query, schema_name: &str) -> Result
     // WHERE → access before either sink's shape, so a query unsupported on both axes names
     // the same one whichever sink it lands on.
     let (bound, predicate) = access_path(&desc.schema, &alias, select.selection.as_ref(), &desc.indexes)?;
-    let schema = Arc::clone(&desc.schema);
-    let read = move |sink| SpecRead {
+    let folded = if fold {
+        plan_fold(select, query.order_by.as_ref(), &alias, &desc)?
+    } else {
+        None
+    };
+    let read = |sink| SpecRead {
         name,
-        desc,
+        desc: Arc::clone(&desc),
         spec: ReadSpec { bound, predicate, sink },
     };
-    let (case, order) = if fold {
-        let (sink, finish, reduce_schema, order) = plan_fold(select, query.order_by.as_ref(), &alias, &schema)?;
-        let case = ReadCase::Fold {
-            read: read(sink),
-            finish: Box::new(finish),
-            reduce_schema,
-            is_distinct: distinct,
-        };
-        (case, order)
-    } else {
-        // OFFSET+LIMIT logical rows; `0` = unbounded (an OFFSET with no LIMIT too).
-        let limit_k = window.end().map_or(0, |e| e as u64);
-        let RowsReply { schema: reply_schema, program, order } =
-            rows_reply(&select.projection, query.order_by.as_ref(), &schema, &alias)?;
-        let k = schema.pk_cols.len();
-        let sink = ReadSink {
-            map: program.map(|p| compute_map(p, &reply_schema.columns[k..])),
-            kind: SinkKind::Rows {
-                order: if limit_k > 0 { order.clone() } else { Vec::new() },
-                limit_k,
-            },
-        };
-        (ReadCase::Rows { read: read(sink), reply_schema }, order)
+    let (case, order) = match folded {
+        Some(FoldPlan { sink, finish, reduce_schema, order }) => {
+            let case = ReadCase::Fold {
+                read: read(sink),
+                finish: Box::new(finish),
+                reduce_schema,
+                is_distinct: distinct,
+            };
+            (case, order)
+        }
+        None => {
+            let RowsReply { schema: reply_schema, program, order } =
+                rows_reply(&select.projection, query.order_by.as_ref(), &desc, &alias)?;
+            // OFFSET+LIMIT logical rows; `0` = unbounded (an OFFSET with no LIMIT too).
+            let limit_k = window.end().map_or(0, |e| e as u64);
+            let sink = ReadSink {
+                map: program.map(|p| compute_map(p, &reply_schema)),
+                kind: SinkKind::Rows {
+                    order: if limit_k > 0 { order.clone() } else { Vec::new() },
+                    limit_k,
+                },
+            };
+            (ReadCase::Rows { read: read(sink), reply_schema }, order)
+        }
     };
     Ok(ReadPlan { case, order, window })
 }
 
+/// A planned fold read.
+struct FoldPlan {
+    sink: ReadSink,
+    finish: FoldFinish,
+    /// The reduce input the sink's columns index.
+    reduce_schema: Arc<Schema>,
+    /// ORDER BY over the finished output.
+    order: Vec<gnitz_wire::OrderKey>,
+}
+
 /// A GROUP BY / global aggregate / HAVING / DISTINCT read, bound by the front end a
-/// grouped `CREATE VIEW` body uses: its sink, its client finish, the reduce input
-/// its columns index, and its ORDER BY over the finished output.
+/// grouped `CREATE VIEW` body uses. `None` when the DISTINCT was dropped over rows
+/// already a set, which read as rows instead.
 fn plan_fold(
     select: &Select,
     order_by: Option<&OrderBy>,
     alias: &str,
-    schema: &Arc<Schema>,
-) -> Result<(ReadSink, FoldFinish, Arc<Schema>, Vec<gnitz_wire::OrderKey>), GnitzSqlError> {
+    desc: &Arc<RelDescriptor>,
+) -> Result<Option<FoldPlan>, GnitzSqlError> {
     // The keys bind with the SELECT list, so one over a column the grouping does
     // not cover rejects before the fold is dispatched, as HAVING already does.
     let keys = parse_order_by(order_by)?;
-    let (pieces, order_cols) = bind_and_lower_fold(select, schema, alias, &order_exprs(&keys))?;
+    let Some((pieces, order_cols)) = bind_and_lower_fold(select, desc, alias, &order_exprs(&keys))? else {
+        return Ok(None);
+    };
     // Compiled here rather than at finish, so every rejection is pre-dispatch — and
     // the same one a view gives, the finalize being compiled as a view's map is.
     let finish = FoldFinish::new(
@@ -282,13 +300,18 @@ fn plan_fold(
         map: pieces.pre,
         kind: SinkKind::Fold(pieces.agg),
     };
-    // The finalize items follow the hidden `_group_pk` `FoldFinish::new` prepends.
+    // The finalize items follow the output's key.
     let order = wire_keys(
         &keys,
         &finish.out_schema.columns,
         order_cols.iter().map(|&at| finish.out_schema.pk_cols.len() + at),
     )?;
-    Ok((sink, finish, pieces.reduce_schema, order))
+    Ok(Some(FoldPlan {
+        sink,
+        finish,
+        reduce_schema: pieces.reduce_schema,
+        order,
+    }))
 }
 
 /// A FROM-less SELECT's one row, finished at plan time: each item is a constant
@@ -320,7 +343,7 @@ fn plan_constant(query: &Query, select: &Select) -> Result<(Arc<Schema>, ZSetBat
             }
         }
     }
-    let mut finish = FoldFinish::new(ground, [], &[], items)?;
+    let mut finish = FoldFinish::new(Arc::new(ground), [], &[], items)?;
     let mut ground_row = ZSetBatch::with_capacity(&finish.partial_schema, 1);
     BatchAppender::new(&mut ground_row, &finish.partial_schema).add_row(gnitz_wire::global_group_key(), 1);
     Ok((Arc::clone(&finish.out_schema), finish.apply(ground_row)))

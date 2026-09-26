@@ -1,9 +1,10 @@
 //! HIR → fold lowering: the ad-hoc read's reduce — or `SELECT DISTINCT`, a fold
 //! with no aggregate — as layout for a stateless `SyntheticFold` the client
-//! finishes. It shares `lower::reduce`'s rules and builds no evaluator.
+//! finishes. It shares `lower::reduce`'s rules and builds no evaluator. A DISTINCT
+//! the binder dropped, over rows already a set, lowers to no fold at all.
 
 use super::super::physical::{self, Frame};
-use super::super::{as_col, split_filter, AggCol, ColId, GetSource, HirExpr, ProjEntry, RelExpr};
+use super::super::{as_col, split_filter, AggCol, ColId, HirExpr, ProjEntry, RelExpr};
 use super::{keyed_frame, resolve_reduce_specs, ReduceSpecs};
 use crate::codec::project_schema::payload_map;
 use crate::error::GnitzSqlError;
@@ -26,7 +27,7 @@ pub(crate) struct FoldPieces {
     /// The SyntheticFold partial-reply layout
     /// (`[_group_pk | group cols | agg partials]`) the workers emit and every
     /// `BoundExpr` below is written against.
-    pub(crate) partial_schema: Schema,
+    pub(crate) partial_schema: Arc<Schema>,
     /// The fold sink's pre-map over the source schema, `None` when the reduce
     /// groups and aggregates source columns directly.
     pub(crate) pre: Option<ComputeMap>,
@@ -41,21 +42,24 @@ pub(crate) struct FoldPieces {
     pub(crate) finalize: Vec<(BoundExpr, ColumnDef)>,
 }
 
-/// The ad-hoc source a bound fold body reads: its schema and the `ColId` at each
-/// of its slots, taken off the `Get` rather than through `cols()`, which clones a
-/// `ColumnDef` per column to hand back one id each.
-fn adhoc_get(base: &RelExpr) -> Result<(&Arc<Schema>, Vec<ColId>), GnitzSqlError> {
-    let RelExpr::Get { source: GetSource::AdHoc, schema, cols } = base else {
+/// The relation a bound fold body reads, as a frame.
+fn source_frame(base: &RelExpr) -> Result<Frame, GnitzSqlError> {
+    let RelExpr::Get { desc, cols } = base else {
         return Err(GnitzSqlError::Internal(
-            "an ad-hoc fold body does not read an ad-hoc source".into(),
+            "an ad-hoc fold body does not read a relation".into(),
         ));
     };
-    Ok((schema, cols.iter().map(|c| c.id).collect()))
+    Ok(Frame {
+        layout: cols.iter().map(|c| c.id).collect(),
+        schema: Arc::clone(&desc.schema),
+    })
 }
 
-/// Lower a bound ad-hoc grouped or `SELECT DISTINCT` body to its fold pieces.
-pub(crate) fn lower_fold(rel: &RelExpr) -> Result<FoldPieces, GnitzSqlError> {
+/// Lower a bound ad-hoc grouped or `SELECT DISTINCT` body to its fold pieces; `None`
+/// for a DISTINCT the binder dropped.
+pub(crate) fn lower_fold(rel: &RelExpr) -> Result<Option<FoldPieces>, GnitzSqlError> {
     match rel {
+        RelExpr::Project { input, .. } if matches!(input.as_ref(), RelExpr::Get { .. }) => Ok(None),
         RelExpr::Distinct { input } => {
             let RelExpr::Project { input: base, items } = input.as_ref() else {
                 return Err(GnitzSqlError::Internal(
@@ -78,7 +82,7 @@ pub(crate) fn lower_fold(rel: &RelExpr) -> Result<FoldPieces, GnitzSqlError> {
                     out: e.out.clone(),
                 })
                 .collect();
-            fold(base, pre, &group_cols, &[], &[], &finalize)
+            fold(base, pre, &group_cols, &[], &[], &finalize).map(Some)
         }
         RelExpr::Project { input, items } => {
             // HAVING is a Filter between the projection and the reduce.
@@ -90,7 +94,7 @@ pub(crate) fn lower_fold(rel: &RelExpr) -> Result<FoldPieces, GnitzSqlError> {
                 RelExpr::Project { input, items } => (Some(items.as_slice()), input),
                 _ => (None, input),
             };
-            fold(base, pre, group_cols, aggs, having, items)
+            fold(base, pre, group_cols, aggs, having, items).map(Some)
         }
         _ => Err(GnitzSqlError::Internal(
             "ad-hoc grouped body is not a projection".into(),
@@ -108,22 +112,14 @@ fn fold(
     having: &[HirExpr],
     finalize: &[ProjEntry],
 ) -> Result<FoldPieces, GnitzSqlError> {
-    let (source_schema, base_layout) = adhoc_get(base)?;
+    let src = source_frame(base)?;
     // The pre-map, physicalized over the source — the same projection `lower_reduce`
-    // fuses, so the reduce input's column order is identical on both paths. Only
-    // its payload slots are written: the PK region rides through verbatim.
+    // fuses, so the reduce input's column order is identical on both paths.
     let (reduce_in, map) = match pre {
-        None => (
-            Frame {
-                layout: base_layout,
-                schema: Arc::clone(source_schema),
-            },
-            None,
-        ),
+        None => (src, None),
         Some(items) => {
-            let p = physical::physicalize_projection(items, &base_layout, source_schema)?;
-            let k = source_schema.pk_count();
-            let map = payload_map(&p.items[k..], &p.out.schema.columns[k..], source_schema)?;
+            let p = physical::physicalize_projection(items, &src.layout, &src.schema)?;
+            let map = payload_map(&p.items, &p.out.schema, &src.schema)?;
             (p.out, Some(map))
         }
     };
@@ -145,7 +141,7 @@ fn fold(
     Ok(FoldPieces {
         reduce_schema: reduce_in.schema,
         agg: AggReadSpec { group_cols: group, aggs: specs },
-        partial_schema: Arc::unwrap_or_clone(partial.schema),
+        partial_schema: partial.schema,
         pre: map,
         having,
         finalize,

@@ -277,7 +277,7 @@ pub(crate) fn execute_insert(
                 .as_deref()
                 .map(|items| {
                     let RowsReply { schema: out_schema, program, .. } =
-                        rows_reply(items, None, schema, &table_name_str)?;
+                        rows_reply(items, None, &target, &table_name_str)?;
                     let map = program
                         .map(|p| ClientMap::new(p, schema, Arc::clone(&out_schema)))
                         .transpose()?;

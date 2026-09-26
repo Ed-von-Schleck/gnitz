@@ -30,7 +30,8 @@ pub struct OrderKey {
 }
 
 /// The fold sink's per-worker hash-fold. `aggs` is the physical reduce layout,
-/// not the SELECT list.
+/// not the SELECT list. Its reply is `[_group_pk | group cols | one partial per
+/// agg]`, keyed [`crate::ReduceOutKey::SyntheticFold`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AggReadSpec {
     pub group_cols: Vec<u32>,

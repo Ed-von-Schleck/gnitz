@@ -14,15 +14,10 @@ fn source() -> Schema {
 /// `SELECT v, k`'s reply map over [`source`]: the hidden key, then `v`, then `k`.
 fn v_then_k(src: &Schema) -> ClientMap {
     let items = vec![
-        ProjItem::PassThrough { src_col: 0 },
         ProjItem::PassThrough { src_col: 1 },
         ProjItem::PassThrough { src_col: 0 },
     ];
-    let cols = vec![
-        src.columns[0].clone().hidden(),
-        src.columns[1].clone(),
-        src.columns[0].clone(),
-    ];
+    let cols = vec![src.columns[1].clone(), src.columns[0].clone()];
     let (out, program) = reply_program(&items, cols, src, "test").unwrap();
     ClientMap::new(program, src, Arc::new(out)).unwrap()
 }
