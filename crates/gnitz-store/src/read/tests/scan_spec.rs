@@ -124,7 +124,7 @@ fn a_maximal_limit_k_neither_overflows_nor_trims() {
 #[test]
 fn a_whole_relation_spec_is_served_off_the_cached_snapshot() {
     let mut r = rows_fixture("whole_relation", 4, 1);
-    let snapshot = r.scan(TID, None).unwrap();
+    let snapshot = r.relation(TID).unwrap().full_scan();
     assert!(Rc::ptr_eq(&run(&mut r, &rows_spec(Vec::new(), 0)).unwrap(), &snapshot));
     let mismatched = SchemaDescriptor::new(
         &[
@@ -530,7 +530,13 @@ fn a_skeleton_store_hydrates_chunk_by_chunk() {
     let schema = id_val_schema();
     let mut h = Recompute::default();
 
-    assert_eq!(rows_of(&r.scan(TID, Some(&mut h)).unwrap()), ingested(|_| true));
+    assert_eq!(
+        rows_of(
+            &r.scan_spec(TID, rows_spec(Vec::new(), 0), &schema, Some(&mut h))
+                .unwrap()
+        ),
+        ingested(|_| true)
+    );
     for k in [2u64, 101] {
         let spec = ReadSpec {
             bound: pk_set(&[k]),
@@ -569,7 +575,14 @@ fn a_scan_chunk_boundary_inside_a_pk_group() {
     r.ingest(TID, bb.finish()).unwrap();
     // Groups: skeleton 0, skeleton 1, (100, 7) | (100, 100), (101, 101).
     r.set_scan_chunk_rows(3);
-    let got = r.scan(TID, Some(&mut Recompute::default())).unwrap();
+    let got = r
+        .scan_spec(
+            TID,
+            rows_spec(Vec::new(), 0),
+            &id_val_schema(),
+            Some(&mut Recompute::default()),
+        )
+        .unwrap();
     assert_eq!(
         rows_of(&got),
         vec![(0, 0, 1), (1, 1, 1), (100, 7, 1), (100, 100, 1), (101, 101, 1)]

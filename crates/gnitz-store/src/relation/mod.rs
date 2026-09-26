@@ -6,7 +6,7 @@
 use gnitz_foundation::env::env_num;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::schema::key::{key_range_between_cuts, KeyCut, PkBuf};
+use crate::schema::key::{compare_pk_bytes, key_range_between_cuts, KeyCut, PkBuf};
 use crate::schema::SchemaDescriptor;
 
 use crate::storage::{
@@ -277,13 +277,22 @@ impl Relation {
     pub fn gather(&self, keys: Vec<u8>, unticked: Option<&Batch>) -> PkSetGather {
         let schema = self.schema();
         let table = self.store.held();
-        PkSetGather::open(keys, schema, |s, e| {
+        PkSetGather::open(keys, schema, |start, end| {
             let undo = unticked.map(|b| {
-                let mut undo = b.to_consolidated(&schema);
+                let in_range: Vec<u32> = (0..b.len())
+                    .filter(|&i| {
+                        let pk = b.get_pk_bytes(i);
+                        b.get_weight(i) != 0
+                            && compare_pk_bytes(pk, start).is_ge()
+                            && end.is_none_or(|e| compare_pk_bytes(pk, e).is_le())
+                    })
+                    .map(|i| i as u32)
+                    .collect();
+                let mut undo = b.ascending_subset(&in_range).into_consolidated(&schema);
                 undo.map_weights(i64::wrapping_neg);
                 std::rc::Rc::new(undo)
             });
-            table.open_cursor_in_range(s, e, undo)
+            table.open_cursor_in_range(start, end, undo)
         })
     }
 

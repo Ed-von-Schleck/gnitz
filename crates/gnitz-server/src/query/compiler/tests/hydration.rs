@@ -26,17 +26,22 @@ fn a_linear_chain_seeds_at_its_scan() {
     let filtered = c.filter(scan, crate::query::compiler::fixtures::dummy_expr_blob());
     let mapped = c.map(filtered, &[0]);
     c.sink(mapped);
-    assert_eq!(seed_node(&loaded(c)), Ok(scan));
+    assert_eq!(seed_node(&loaded(c)), Ok(SeedAt::Scan { node: scan, source: 77 }));
 }
 
 /// The two-term join seeds from the trace integrating side A's reindex.
 #[test]
 fn a_two_term_join_seeds_from_side_as_trace() {
     let lc = loaded(two_term_join_circuit(100, 200));
-    let seed = seed_node(&lc).unwrap();
-    assert!(matches!(lc.op(seed), OpNode::IntegrateTrace));
-    let scan = lc.inputs(lc.inputs(seed).unary()).unary();
-    assert!(matches!(lc.op(scan), OpNode::ScanDelta { source: 100, .. }));
+    let Ok(SeedAt::Trace { delta, trace }) = seed_node(&lc) else {
+        panic!("a two-term join seeds at a trace");
+    };
+    assert!(matches!(lc.op(trace), OpNode::IntegrateTrace));
+    assert_eq!(lc.inputs(trace).unary(), delta);
+    assert!(matches!(
+        lc.op(lc.inputs(delta).unary()),
+        OpNode::ScanDelta { source: 100, .. }
+    ));
 }
 
 /// A semi-join's inner term, whose side-B delta is a `distinct`.
@@ -50,7 +55,7 @@ fn a_semi_join_term_is_accepted() {
     let tb = c.integrate_trace(db);
     let joined = c.join_terms([da, db], [ta, tb], JoinKind::Equi);
     c.sink(joined);
-    assert_eq!(seed_node(&loaded(c)), Ok(ta));
+    assert_eq!(seed_node(&loaded(c)), Ok(SeedAt::Trace { delta: da, trace: ta }));
 }
 
 /// Every broken clause of the two-term form, and every other shape, is refused.

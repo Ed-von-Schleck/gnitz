@@ -5,15 +5,20 @@
 
 use super::*;
 use gnitz_store::read::SourceCursor;
-use gnitz_wire::{ReadSpec, WireFault};
+use gnitz_wire::{ReadBound, ReadSpec, WireFault};
 use rustc_hash::FxHashSet;
 use std::rc::Rc;
 
 impl CatalogEngine {
-    /// [`RelationRegistry::scan`] with this engine's own circuit layer as
-    /// the hydrator.
+    /// Every row of `table_id`, with this engine's own circuit layer as the hydrator.
     pub(crate) fn scan(&mut self, table_id: i64) -> Result<Rc<Batch>, String> {
-        Ok(self.registry.scan(table_id, Some(&mut self.dag))?)
+        let schema = self.registry.relation_or_err(table_id)?.schema();
+        Ok(self.registry.scan_spec(
+            table_id,
+            ReadSpec::all_rows(ReadBound::None),
+            &schema,
+            Some(&mut self.dag),
+        )?)
     }
 
     /// [`RelationRegistry::scan_spec`], hydrating.

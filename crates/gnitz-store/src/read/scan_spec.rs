@@ -26,14 +26,17 @@ impl RelationRegistry {
         hydrator: Option<&mut dyn SkeletonHydrator>,
     ) -> Result<Rc<Batch>, StoreError> {
         let ReadSpec { bound, predicate, sink } = spec;
-        let src_schema = self.relation_or_err(target_id)?.schema();
-        // Nothing bounded, filtered, mapped or cut: the relation whole, off the
-        // store's cached snapshot.
+        let entry = self.relation_or_err(target_id)?;
+        let src_schema = entry.schema();
+        // Nothing bounded, filtered, mapped or cut, and nothing to hydrate: the
+        // relation whole, off the store's cached snapshot.
         if let (ReadBound::None, true, None, SinkKind::Rows { limit_k: 0, .. }) =
             (&bound, predicate.is_empty(), &sink.map, &sink.kind)
         {
-            check_layout(reply_schema, &src_schema)?;
-            return self.scan(target_id, hydrator);
+            if !entry.store().held().has_skeleton_rows() {
+                check_layout(reply_schema, &src_schema)?;
+                return Ok(entry.full_scan());
+            }
         }
         let (source, unapplied) = self.open_bound(target_id, bound)?;
         // A bad predicate and a bad walk are both a corrupt request: the client

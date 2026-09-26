@@ -1,10 +1,7 @@
 //! Read I/O on relation families. [`RelationRegistry::open_bound`] opens every
 //! source a bound can name; [`LiveSource`] drains one chunk by chunk, hydrating
-//! each capacity-bounded view's skeleton row it meets within that chunk. The verbs
-//! — whole-relation scan and the batched FK parent probe — sit on
-//! those two.
-
-use std::rc::Rc;
+//! each capacity-bounded view's skeleton row it meets within that chunk.
+//! [`RelationRegistry::gather_bytes`] is the batched FK parent probe.
 
 use super::SkeletonHydrator;
 use crate::relation::{Relation, RelationKind, RelationRegistry};
@@ -52,7 +49,9 @@ impl<'a, 'h> LiveSource<'a, 'h> {
         };
         let SkeletonKeys { keys, coarse } = skeletons;
         let expected = cfg!(debug_assertions).then(|| keys.clone());
-        let hydrated = hydrator.hydrate_keys(self.registry, self.id, keys)?;
+        let hydrated = hydrator
+            .hydrate_keys(self.registry, self.id, keys)
+            .map_err(|e| e.in_context(&format!("hydrate: view {}", self.id)))?;
         if let Some(keys) = expected {
             debug_assert_hydration_matches(&hydrated, &keys, &coarse);
         }
@@ -64,23 +63,6 @@ impl<'a, 'h> LiveSource<'a, 'h> {
 }
 
 impl RelationRegistry {
-    /// Scan all positive-weight rows from a relation. One registry lookup serves
-    /// every id — a system family is an ordinary entry, so the CIRCUIT_* tables
-    /// are SQL-introspectable like any other relation.
-    pub fn scan(&self, id: i64, hydrator: Option<&mut dyn SkeletonHydrator>) -> Result<Rc<Batch>, StoreError> {
-        let entry = self.relation_or_err(id)?;
-        // Asked of the store, not a cursor, so the common case keeps `full_scan`'s cached snapshot.
-        if !entry.store().held().has_skeleton_rows() {
-            return Ok(entry.full_scan());
-        }
-        let mut rows = LiveSource::new(self, id, SourceCursor::Full(Box::new(entry.cursor())), hydrator);
-        let mut out = Batch::empty_with_schema(&entry.schema());
-        while let Some(chunk) = rows.next_chunk(self.config.scan_chunk_rows)? {
-            out.append_above(chunk);
-        }
-        Ok(Rc::new(out))
-    }
-
     /// The FK parent probe: every live row of `keys` (flat OPK images, strictly ascending) at
     /// weight 1, projected to the payload column `ref_col`.
     pub fn gather_bytes(&self, id: i64, keys: Vec<u8>, ref_col: u8) -> Result<Batch, StoreError> {
@@ -160,28 +142,15 @@ fn open_range(entry: &Relation, r: KeyRange) -> Result<(SourceCursor, ReadBound)
 }
 
 /// Tripwire: the replay's per-PK weight sum must equal the coarse weight the
-/// skeleton row carried, by linearity of the PK projection.
-///
-/// One co-walk, not a scan per key: `keys` is ascending by construction and
-/// `into_consolidated` sorted `out` by (PK, payload), so the two run in step.
-/// That also catches a PK `out` holds rows for that `keys` never named, which a
-/// per-key lookup cannot see.
-///
-/// The `cfg!` return is what a `#[cfg(debug_assertions)]` on the function would
-/// not give: the assertions vanish in release either way, but the co-walk itself
-/// is O(rows) and would otherwise still run.
+/// skeleton row carried, by linearity of the PK projection. `keys` and `out` are
+/// both ascending, so one co-walk checks every key and catches a PK no key named.
 fn debug_assert_hydration_matches(out: &Batch, keys: &[u8], coarse: &[i64]) {
-    if !cfg!(debug_assertions) {
-        return;
-    }
     let stride = keys.len() / coarse.len();
     let mut ki = 0;
     let mut i = 0;
     while i < out.len() {
         let pk = out.get_pk_bytes(i);
-        // Every skeleton key carries a strictly positive coarse weight, so a key
-        // the replay produced nothing for is a bug — as is a key it produced rows
-        // for that no skeleton row named.
+        // Every skeleton key carries a strictly positive coarse weight.
         while ki < coarse.len() && compare_pk_bytes(&keys[ki * stride..(ki + 1) * stride], pk).is_lt() {
             debug_assert!(false, "hydration produced no rows for skeleton key {ki}");
             ki += 1;
@@ -195,11 +164,7 @@ fn debug_assert_hydration_matches(out: &Batch, keys: &[u8], coarse: &[i64]) {
             sum += out.get_weight(i);
             i += 1;
         }
-        debug_assert_eq!(
-            sum,
-            coarse.get(ki).copied().unwrap_or(0),
-            "hydration weight mismatch for key {pk:?}",
-        );
+        debug_assert_eq!(sum, coarse[ki], "hydration weight mismatch for key {pk:?}");
         ki += 1;
     }
     debug_assert_eq!(

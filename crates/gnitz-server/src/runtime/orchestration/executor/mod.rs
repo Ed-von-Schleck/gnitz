@@ -1020,42 +1020,44 @@ async fn handle_read(
     let target_id = ctrl.hdr.target_id as i64;
     let client_version = ctrl.hdr.flags.schema_version;
     let (g, kind) = read_lock(shared, target_id, Access::Read).await?;
-    let disp = shared.disp();
-    let seek = match verb {
+    let schema = shared.disp().schema_desc_for(target_id);
+    let bound = match verb {
         ClientVerb::Seek => {
-            let schema = disp.schema_desc_for(target_id);
             let opk = seek_opk_bytes(&schema, &ctrl.blob).map_err(|e| format!("seek: table {target_id}: {e}"))?;
-            let keys = PkKeys::from_keys(schema.pk_stride(), [opk.pk_bytes()]);
-            Some((ReadSpec::all_rows(ReadBound::PkSet(keys)), schema))
+            ReadBound::PkSet(PkKeys::from_keys(schema.pk_stride(), [opk.pk_bytes()]))
         }
-        _ => None,
+        _ => ReadBound::None,
     };
+    let spec = ReadSpec::all_rows(bound);
 
     if kind == RelationKind::SystemCatalog {
-        let Some((spec, schema)) = seek else {
-            return scan_system_family(shared, peer, target_id, client_version);
-        };
-        let rows = guard_panic("seek", || shared.cat_mut().scan_spec(target_id, spec, &schema))?;
+        let rows = guard_panic("read", || {
+            shared
+                .cat()
+                .registry
+                .scan_spec(target_id, spec, &schema, None)
+                .map_err(|e| WireFault::from(e.to_string()))
+        })?;
         send_ok_response(
             shared,
             peer,
             target_id,
-            Some(&rows),
+            (!rows.is_empty()).then_some(&*rows),
             shared.last_tick_lsn.get(),
             client_version,
         );
         return Ok(());
     }
 
-    let (sal_kind, blob) = match seek {
-        Some((spec, _)) => {
+    let (sal_kind, blob) = match verb {
+        ClientVerb::Seek => {
             let block = shared
                 .cat()
                 .schema_block(target_id)
                 .expect("a read target is registered under the catalog lock");
             (SalMessageKind::ScanSpec, spec.encode(&block))
         }
-        None => (SalMessageKind::Scan, Vec::new()),
+        _ => (SalMessageKind::Scan, Vec::new()),
     };
 
     let (prelim, server_version) = shared.cat().negotiated_schema_block(target_id, client_version);
@@ -1668,26 +1670,6 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
             return Ok(());
         }
     }
-    Ok(())
-}
-
-/// The master-local half of [`handle_read`]: a SCAN of a catalog family. The rows
-/// come from the catalog, never from the frame, so the frame is not a parameter.
-///
-/// Takes NO lock: the caller holds the catalog read guard, and the lock is
-/// writer-preferring, so a nested read parks forever the moment a DDL writer
-/// queues.
-fn scan_system_family(shared: &Rc<Shared>, peer: &Peer, target_id: i64, client_version: u16) -> Result<(), WireFault> {
-    let b = guard_panic::<_, String>("scan", || shared.cat_mut().scan(target_id))?;
-    let batch_ref = if !b.is_empty() { Some(b) } else { None };
-    send_ok_response(
-        shared,
-        peer,
-        target_id,
-        batch_ref.as_deref(),
-        shared.last_tick_lsn.get(),
-        client_version,
-    );
     Ok(())
 }
 

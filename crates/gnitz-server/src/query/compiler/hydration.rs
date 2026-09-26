@@ -63,9 +63,16 @@ fn sources(loaded: &LoadedCircuit, node: NodeId) -> Vec<u64> {
         .collect()
 }
 
-/// The node a bounded view's replay seeds from: the `ScanDelta` of a linear
-/// body, or the trace integrating one delta of an inner equi-join.
-fn seed_node(loaded: &LoadedCircuit) -> Result<NodeId, String> {
+/// Where a bounded view's replay seeds, as [`seed_node`] matched it.
+#[derive(Debug, PartialEq)]
+enum SeedAt {
+    /// The `ScanDelta` of a linear body.
+    Scan { node: NodeId, source: u64 },
+    /// The trace integrating `delta`, one delta of an inner equi-join's two-term form.
+    Trace { delta: NodeId, trace: NodeId },
+}
+
+fn seed_node(loaded: &LoadedCircuit) -> Result<SeedAt, String> {
     use gnitz_wire::OpNode;
     // One replay seeds one register of one plan; an exchange splits the plan.
     if loaded.exchange_shards().next().is_some() {
@@ -73,7 +80,7 @@ fn seed_node(loaded: &LoadedCircuit) -> Result<NodeId, String> {
     }
     let (origin, _) = row_local_origin(loaded, loaded.inputs(loaded.sink()?).unary());
     match loaded.op(origin) {
-        OpNode::ScanDelta { .. } => return Ok(origin),
+        OpNode::ScanDelta { source, .. } => return Ok(SeedAt::Scan { node: origin, source: *source }),
         OpNode::Union => {}
         _ => return Err(UNSUPPORTED.into()),
     }
@@ -90,8 +97,7 @@ fn seed_node(loaded: &LoadedCircuit) -> Result<NodeId, String> {
     if !(cross_wired && one_side_order && single_source_per_epoch) {
         return Err(UNSUPPORTED.into());
     }
-    let integrates_seeded_delta = t2.trace;
-    Ok(integrates_seeded_delta)
+    Ok(SeedAt::Trace { delta: t1.delta, trace: t2.trace })
 }
 
 /// Resolve the seed against the plan the emitter produced for it.
@@ -102,12 +108,10 @@ pub(super) fn derive_hydration(
     plan: &SubPlan,
     regs: &[Option<OutReg>],
 ) -> Result<Hydration, String> {
-    use gnitz_wire::OpNode;
-    let node = seed_node(loaded)?;
     let reg = |n: NodeId| regs[n].expect("an exchange-free plan emits every node");
-    let (in_node, seed) = match loaded.op(node) {
-        OpNode::ScanDelta { source, .. } => {
-            let source = *source as i64;
+    let (in_node, seed) = match seed_node(loaded)? {
+        SeedAt::Scan { node, source } => {
+            let source = source as i64;
             if registry
                 .relation(source)
                 .is_some_and(|r| r.kind() == RelationKind::Stream)
@@ -119,7 +123,7 @@ pub(super) fn derive_hydration(
             }
             (node, HydrationSeed::Relation(source))
         }
-        _ => (loaded.inputs(node).unary(), HydrationSeed::Trace(reg(node).trace()?)),
+        SeedAt::Trace { delta, trace } => (delta, HydrationSeed::Trace(reg(trace).trace()?)),
     };
     let entry = plan.vm.program.replay_entry(reg(in_node).delta()?)?;
     // The view's own keys gather the seed.

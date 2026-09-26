@@ -1201,30 +1201,24 @@ fn a_table_seed_reads_the_source_as_of_its_last_tick() {
     let view = try_register_identity_view(&mut engine, tid, "bounded", &cols, 1 << 20, 0).unwrap();
     backfill(&mut engine, view, &[tid]);
 
-    let push = make_batch(&schema, &[(3, -1, 30), (5, -1, 50), (5, 1, 55)]);
+    // Row 8 lies outside every gathered range below.
+    let push = make_batch(&schema, &[(3, -1, 30), (5, -1, 50), (5, 1, 55), (8, -1, 80)]);
     engine.ingest_unticked(tid, push).unwrap();
 
-    let keys: Vec<u8> = [3u64, 5].iter().flat_map(|k| k.to_be_bytes()).collect();
-    let hydrate = |engine: &mut CatalogEngine| {
-        let out = engine.dag.hydrate_keys(&engine.registry, view, keys.clone()).unwrap();
+    let hydrate = |engine: &mut CatalogEngine, ids: &[u64]| {
+        let keys: Vec<u8> = ids.iter().flat_map(|k| k.to_be_bytes()).collect();
+        let out = engine.dag.hydrate_keys(&engine.registry, view, keys).unwrap();
         zset_of(&out, &schema)
     };
-    let before = make_batch(&schema, &[(3, 1, 30), (5, 1, 50)]);
-    assert_eq!(
-        hydrate(&mut engine),
-        zset_of(&before, &schema),
-        "the rows the view last ticked over"
-    );
+    let expect = |rows: &[(u64, i64, i64)]| zset_of(&make_batch(&schema, rows), &schema);
+    assert_eq!(hydrate(&mut engine, &[3, 5]), expect(&[(3, 1, 30), (5, 1, 50)]));
+    assert_eq!(hydrate(&mut engine, &[5]), expect(&[(5, 1, 50)]));
 
     let delta = engine.dag.take_unticked(tid).unwrap();
     let what = crate::query::Drive::Tick { source: tid, round: 1 };
     crate::query::drive(&mut LocalDrive(&mut engine), what, delta).unwrap();
-    let after = make_batch(&schema, &[(5, 1, 55)]);
-    assert_eq!(
-        hydrate(&mut engine),
-        zset_of(&after, &schema),
-        "the pushed rows, once ticked"
-    );
+    assert_eq!(hydrate(&mut engine, &[3, 5]), expect(&[(5, 1, 55)]));
+    assert_eq!(hydrate(&mut engine, &[5]), expect(&[(5, 1, 55)]));
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

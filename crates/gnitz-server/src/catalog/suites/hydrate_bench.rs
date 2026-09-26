@@ -36,8 +36,9 @@ impl SkeletonHydrator for Counting<'_> {
 }
 
 /// An identity view over a `ROWS`-row base, bounded at `capacity` bytes and
-/// checkpointed, so the sweep has skeletonized it.
-fn bounded_fixture(name: &str, capacity: u64) -> (CatalogEngine, i64) {
+/// checkpointed, so the sweep has skeletonized it. Returns the engine, the base and
+/// the view.
+fn bounded_fixture(name: &str, capacity: u64) -> (CatalogEngine, i64, i64) {
     let mut cols = vec![col_def("id", TypeCode::U64)];
     cols.extend((0..PAYLOAD_COLS).map(|c| col_def(&format!("v{c}"), TypeCode::I64)));
     std::env::set_var("GNITZ_RAM_TIER_BYTES", RAM_TIER_BYTES.to_string());
@@ -52,7 +53,7 @@ fn bounded_fixture(name: &str, capacity: u64) -> (CatalogEngine, i64) {
     let view = try_register_view(&mut engine, circuit, "bounded", &cols, capacity, 0).unwrap();
     backfill(&mut engine, view, &[base]);
     checkpoint(&mut engine);
-    (engine, view)
+    (engine, base, view)
 }
 
 /// Checkpoint every store, so the sweep has skeletonized every bounded view.
@@ -81,7 +82,7 @@ fn cell(label: &str, engine: &mut CatalogEngine, read: impl Fn(&RelationRegistry
         "{label}: the read hydrated nothing, so it measured no hydration"
     );
     println!(
-        "{label:<20} rows {rows:>8}  hydrated {hydrated:>8}  peak +{:>7.1} MiB  {:>12} instr",
+        "{label:<30} rows {rows:>8}  hydrated {hydrated:>8}  peak +{:>7.1} MiB  {:>12} instr",
         peak as f64 / (1 << 20) as f64,
         instructions,
     );
@@ -93,29 +94,53 @@ fn cell(label: &str, engine: &mut CatalogEngine, read: impl Fn(&RelationRegistry
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn hydrate_full_scan_bench() {
     for (label, capacity) in [("full scan, L ≈ 0", 64 << 10), ("full scan, L ≈ H", 24 << 20)] {
-        let (mut engine, view) = bounded_fixture("hydrate_full_scan", capacity);
+        let (mut engine, _, view) = bounded_fixture("hydrate_full_scan", capacity);
+        let schema = engine.registry.relation(view).map(Relation::schema).unwrap();
         cell(label, &mut engine, |registry, h| {
-            registry.scan(view, Some(h)).unwrap().len()
+            let spec = ReadSpec::all_rows(ReadBound::None);
+            registry.scan_spec(view, spec, &schema, Some(h)).unwrap().len()
         });
         engine.close();
     }
 }
 
-/// One key through `scan_spec`: a single hydration chunk.
+/// Ids upserted into the base without a tick, centred on the sought key.
+const UNTICKED_IDS: u64 = 10_000;
+
+/// One key through `scan_spec`: a single hydration chunk, then the same seek with
+/// `UNTICKED_IDS` upserts of the base awaiting the view's next tick.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn hydrate_seek_bench() {
-    let (mut engine, view) = bounded_fixture("hydrate_seek", 64 << 10);
+    let (mut engine, base, view) = bounded_fixture("hydrate_seek", 64 << 10);
     let schema = engine.registry.relation(view).map(Relation::schema).unwrap();
-    let key = (ROWS / 2) as u128;
+    let key = ROWS / 2;
     let spec = ReadSpec::all_rows(ReadBound::Range(KeyRange::point(
         PkColList::from_slice(schema.pk_indices()),
         &[],
-        key,
+        key as u128,
     )));
-    cell("single-key seek", &mut engine, |registry, h| {
-        registry.scan_spec(view, spec.clone(), &schema, Some(h)).unwrap().len()
-    });
+    let seek = |registry: &RelationRegistry, h: &mut Counting| {
+        let out = registry.scan_spec(view, spec.clone(), &schema, Some(h)).unwrap();
+        assert_eq!(out.len(), 1, "one row at the sought key");
+        let v0 = u64::from_le_bytes(out.get_col_ptr(0, 0, 8).try_into().unwrap());
+        assert_eq!(v0, scramble(key), "the payload the view last ticked over");
+        out.len()
+    };
+    cell("single-key seek", &mut engine, seek);
+
+    // Each upsert takes effect as a retraction and an insert.
+    let mut bb = BatchBuilder::new(engine.registry.relation(base).map(Relation::schema).unwrap());
+    for id in key - UNTICKED_IDS / 2..key + UNTICKED_IDS / 2 {
+        bb.begin_row(id as u128, 1);
+        for c in 0..PAYLOAD_COLS {
+            bb.put_u64(scramble(id ^ c).wrapping_add(1));
+        }
+        bb.end_row();
+    }
+    engine.ingest_unticked(base, bb.finish()).unwrap();
+    let label = format!("single-key seek, {}k unticked", 2 * UNTICKED_IDS / 1000);
+    cell(&label, &mut engine, seek);
     engine.close();
 }
 
@@ -125,7 +150,7 @@ fn hydrate_seek_bench() {
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn hydrate_filtered_limit_bench() {
     const M: u64 = 1000;
-    let (mut engine, view) = bounded_fixture("hydrate_filtered_limit", 64 << 10);
+    let (mut engine, _, view) = bounded_fixture("hydrate_filtered_limit", 64 << 10);
     let schema = engine.registry.relation(view).map(Relation::schema).unwrap();
     let spec = ReadSpec {
         bound: ReadBound::None,
