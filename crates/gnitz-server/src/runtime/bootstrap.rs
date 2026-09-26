@@ -128,9 +128,9 @@ fn replay_slots(written: u32, slot: Slot, replicated: bool) -> (Range<u32>, bool
 }
 
 /// Per-worker post-fork user-table replay for `slot`, applying each Push group
-/// through `ingest_returning` — the exact call `handle_push` makes, so
-/// retractions cancel correctly. Each swept base's effective delta is buffered as
-/// unticked, for the master's tick sweep to drain into the views.
+/// through the registry's ingest, whose PK rule makes retractions cancel. Each
+/// swept base's effective delta is buffered as unticked, for the master's tick
+/// sweep to drain into the views.
 ///
 /// No LSN floor: `enforce_unique_pk` makes re-applying a group the shards
 /// already hold a no-op.
@@ -185,7 +185,7 @@ fn recover_from_sal(
             // `base_tables_reachable_from` returns them sorted and deduplicated.
             let ingested = match swept_bases.binary_search(&tid) {
                 Ok(_) => catalog.ingest_unticked(tid, owned),
-                Err(_) => catalog.registry.ingest_returning(tid, owned).map(drop),
+                Err(_) => catalog.registry.ingest(tid, owned),
             };
             ingested.map_err(|e| {
                 format!(

@@ -646,7 +646,7 @@ impl SchemaDescriptor {
         if !range.walks_pk(self.pk_indices()) {
             return None;
         }
-        let Some((start, end)) = IndexKeySpec::for_pk(self).range_keys(self.pk_stride(), range) else {
+        let Some((start, end)) = self.pk_range_keys(range) else {
             return Some(0);
         };
         if !self.placement().is_key_routed() {
@@ -654,6 +654,12 @@ impl SchemaDescriptor {
         }
         range_shares_prefix(&start, end.as_ref(), self.dist_stride())
             .then(|| self.worker_for_pk(start.pk_bytes(), num_workers))
+    }
+
+    /// The OPK key band `r` names over this schema's whole PK list; `None` when it
+    /// names no key.
+    pub fn pk_range_keys(&self, r: &KeyRange) -> Option<(PkBuf, Option<PkBuf>)> {
+        IndexKeySpec::for_pk(self).range_keys(self.pk_stride(), r)
     }
 }
 

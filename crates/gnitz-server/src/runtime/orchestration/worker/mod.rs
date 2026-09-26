@@ -730,7 +730,7 @@ impl WorkerProcess {
                 let mut result = Batch::empty_with_schema(batch.schema());
                 for i in 0..n {
                     let pkb = batch.get_pk_bytes(i);
-                    // `false` where this process holds no store.
+                    // `false` for an id this worker has not registered.
                     if relation.is_some_and(|r| r.has_pk(pkb)) {
                         result.push_key_row(pkb, 1);
                     }

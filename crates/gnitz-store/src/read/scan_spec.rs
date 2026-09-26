@@ -11,7 +11,7 @@ use super::SkeletonHydrator;
 use crate::expr::MapPlan;
 use crate::ops::AdhocFold;
 use crate::relation::RelationRegistry;
-use crate::schema::key::{key_range_between_cuts, KeyCut};
+use crate::schema::key::{key_range_between_cuts, leading_u64, KeyCut};
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, StoreError};
 use gnitz_expr::{cmp_order_keys, order_locators, OrderLocator, RowFilter};
@@ -101,21 +101,25 @@ impl RelationRegistry {
         let (cursor, schema) = if after_tick == 0 {
             (entry.cursor(), entry.schema())
         } else {
-            let feed = entry.delta_or_err()?;
-            let dropped_through = feed.dropped_through();
+            let feed = entry.delta().ok_or_else(|| {
+                StoreError::rejected(format!(
+                    "delta_read: this process holds no delta store for relation {id}"
+                ))
+            })?;
+            // `_tick` leads the delta PK.
+            let dropped_through = leading_u64(feed.dropped_max().pk_bytes());
             if delta_cursor_expired(after_tick, dropped_through) {
                 return Err(StoreError::DeltaExpired(format!(
                     "delta cursor {after_tick} of relation {id} is below the \
                      retained floor {dropped_through}; re-read at 0"
                 )));
             }
-            // The `_tick` U64 leads the delta PK, and its OPK is its big-endian bytes.
             let band = key_range_between_cuts(
                 KeyCut::above(&after_tick.to_be_bytes()),
                 KeyCut::above(&cut_tick.to_be_bytes()),
                 feed.schema().pk_stride(),
             );
-            (feed.range_cursor(band).0, feed.schema())
+            (feed.range_cursor(band).0, *feed.schema())
         };
         check_layout(reply_schema, &schema)?;
         Ok(cursor.materialize())

@@ -32,13 +32,13 @@ pub(super) fn fill_indexes(
     }
     for ix in targets.iter() {
         assert_eq!(
-            ix.store.estimated_rows(),
+            ix.store.held().estimated_rows(),
             0,
             "index {} of relation {owner_id} is already populated",
             ix.index_id
         );
     }
-    let mut source = owner.cursor();
+    let mut source = owner.held().open_cursor();
     while let Some(chunk) = source.drain_chunk(chunk_rows) {
         for ix in targets.iter_mut() {
             let index_id = ix.index_id;
@@ -98,7 +98,7 @@ impl RelationRegistry {
         // A pushed batch can carry a schema the registry has not caught up to.
         // Checked, not asserted: the append path sizes by the destination's region
         // count, so a mismatch would drop the extra column and ACK the push.
-        let want = entry.store.schema().num_payload_cols();
+        let want = entry.schema().num_payload_cols();
         if batch.num_payload_cols() != want {
             return Err(StoreError::rejected(format!(
                 "push for table_id={id} carries {} payload columns, table schema has {}",
@@ -122,18 +122,22 @@ impl RelationRegistry {
         needed: bool,
     ) -> Result<Option<Batch>, StoreError> {
         let (id, kind) = (entry.id(), entry.kind);
+        // A stream's rows exist only as the deltas they produce.
+        if kind == RelationKind::Stream {
+            return Ok(needed.then_some(batch));
+        }
         let effective = match kind.is_base_table() {
-            true => entry.store.enforce_unique_pk(batch),
+            true => super::unique_pk::enforce_unique_pk(entry.store.held(), batch),
             false => batch,
         };
         if effective.count == 0 {
             return Ok(needed.then_some(effective));
         }
 
-        let capture: Option<(SchemaDescriptor, u64)> = entry.delta.as_deref().map(|feed| feed.schema()).zip(round);
+        let capture: Option<(SchemaDescriptor, u64)> = entry.delta.as_deref().map(|t| *t.schema()).zip(round);
         // Folded once for both: a round keeps one net weight per element, and the
         // store then takes that fold by value instead of folding its own copy.
-        let folded = capture.and_then(|_| Batch::consolidate_if_needed(&effective, &entry.store.schema()));
+        let folded = capture.and_then(|_| Batch::consolidate_if_needed(&effective, entry.store.schema()));
         let pending = capture.map(|(delta_schema, r)| {
             let src = folded.as_ref().unwrap_or(&effective);
             (src.stamped_with_pk_prefix(&delta_schema, r), r)
@@ -150,10 +154,11 @@ impl RelationRegistry {
                 .map_err(|e| StoreError::storage(format!("ingest into index {index_id} of relation {id}"), e))?;
         }
 
+        let store = entry.store.held_mut();
         let (res, echo) = match folded {
-            Some(f) => (entry.store.ingest_owned_batch(f), needed.then_some(effective)),
-            None if needed => (entry.store.ingest_borrowed_batch(&effective), Some(effective)),
-            None => (entry.store.ingest_owned_batch(effective), None),
+            Some(f) => (store.ingest_owned_batch(f), needed.then_some(effective)),
+            None if needed => (store.ingest_borrowed_batch(&effective), Some(effective)),
+            None => (store.ingest_owned_batch(effective), None),
         };
         inject_ingest_apply_error("store", kind, res)
             .map_err(|e| StoreError::storage(format!("ingest into relation {id}"), e))?;
@@ -185,6 +190,7 @@ impl RelationRegistry {
         let entry = self.relation_mut_or_err(id)?;
         entry
             .store
+            .held_mut()
             .fold_to_ram()
             .map_err(|e| StoreError::storage(format!("fold relation {id} to RAM"), e))
     }

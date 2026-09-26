@@ -1,200 +1,66 @@
-//! `Store` — one store this process may hold, and the schema it is read in.
-//! Every question about one is answered here for the detached case too, so no
-//! caller decides what a process holding no store answers.
+//! `Store` — this process's store of one relation or index, or its absence.
+//! Every row verb is the `Table`'s own, reached through [`Store::held`].
 
-use crate::schema::key::{leading_u64, PkBuf};
-use crate::schema::{IndexKeySpec, SchemaDescriptor};
-use crate::storage::{Batch, ReadCursor, RecoverySource, StorageError, StoredRow, Table};
+use crate::schema::SchemaDescriptor;
+use crate::storage::{StorageError, Table};
 
-/// One store this process may hold, and the schema it is read in. A stream has
-/// one nowhere and the master opens no user store; both read empty and
-/// absorb nothing.
-///
-/// The schema is held beside the `Table` rather than read off it: a process
-/// holding no store has no `Table` to ask, and inlining the descriptor in the
-/// held case too keeps `Store` one size and every read one field access.
-/// [`Self::swap_schema`] is the only writer of either, so they cannot drift.
-pub(crate) struct Store {
-    table: Option<Box<Table>>,
-    schema: SchemaDescriptor,
+/// This process's store of one relation or index.
+pub(crate) enum Store {
+    Held(Box<Table>),
+    /// No store in this process; the schema stays readable.
+    Absent(Box<SchemaDescriptor>),
 }
 
 impl Store {
-    /// A store this process holds.
-    pub(crate) fn owned(table: Box<Table>, schema: SchemaDescriptor) -> Store {
-        Store { table: Some(table), schema }
-    }
-
-    /// A store this process does not hold: a stream's, which is nowhere, or one
-    /// another process owns.
-    pub(crate) fn detached(schema: SchemaDescriptor) -> Store {
-        Store { table: None, schema }
-    }
-
     /// The schema this store's rows are read in.
-    pub(crate) fn schema(&self) -> SchemaDescriptor {
-        self.schema
+    pub(crate) fn schema(&self) -> &SchemaDescriptor {
+        match self {
+            Store::Held(t) => t.schema(),
+            Store::Absent(s) => s,
+        }
     }
 
-    /// Publish a new schema for this store: here, and down into the `Table`,
-    /// which rebinds its shards if the region count grew.
+    /// Publish a new schema for this store, down into a held `Table`, which
+    /// rebinds its shards if the region count grew.
     pub(crate) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
-        if let Some(t) = self.table.as_mut() {
-            t.swap_schema(schema)?;
+        match self {
+            Store::Held(t) => t.swap_schema(schema),
+            Store::Absent(s) => {
+                **s = schema;
+                Ok(())
+            }
         }
-        self.schema = schema;
-        Ok(())
     }
 
-    /// This process's `Table`, or `None` when it holds none.
-    pub(in crate::relation) fn table(&self) -> Option<&Table> {
-        self.table.as_deref()
+    /// The `Table` this process holds; panics on [`Store::Absent`].
+    #[track_caller]
+    pub(crate) fn held(&self) -> &Table {
+        match self {
+            Store::Held(t) => t,
+            Store::Absent(_) => not_held(),
+        }
     }
 
-    /// [`Self::table`] as `&mut`, for a caller that needs the `Table` itself
-    /// rather than a verb here.
+    /// [`Self::held`] as `&mut`.
+    #[track_caller]
+    pub(crate) fn held_mut(&mut self) -> &mut Table {
+        match self {
+            Store::Held(t) => t,
+            Store::Absent(_) => not_held(),
+        }
+    }
+
+    /// The `Table`, if this process holds one.
     pub(in crate::relation) fn table_mut(&mut self) -> Option<&mut Table> {
-        self.table.as_deref_mut()
-    }
-
-    /// Non-compacting cursor; with no store here, an empty one of the schema.
-    pub(crate) fn cursor(&self) -> ReadCursor {
-        match self.table() {
-            Some(t) => t.open_cursor(),
-            None => crate::storage::empty_cursor(self.schema),
+        match self {
+            Store::Held(t) => Some(t),
+            Store::Absent(_) => None,
         }
     }
+}
 
-    /// [`Self::cursor`] over `[start, end]` only, with `extra` merged in — see
-    /// [`Table::open_cursor_in_range`].
-    pub(crate) fn cursor_in_range(
-        &self,
-        start: &[u8],
-        end: Option<&[u8]>,
-        extra: Option<std::rc::Rc<Batch>>,
-    ) -> ReadCursor {
-        match self.table() {
-            Some(t) => t.open_cursor_in_range(start, end, extra),
-            None => crate::storage::empty_cursor(self.schema),
-        }
-    }
-
-    /// A cursor positioned on the OPK key band `[start, end)`, and the raw entry
-    /// count in it — an upper bound on the live groups the walk emits.
-    pub(crate) fn range_cursor(&self, range: Option<(PkBuf, Option<PkBuf>)>) -> (ReadCursor, usize) {
-        let Some((start, end)) = range else {
-            return (crate::storage::empty_cursor(self.schema), 0);
-        };
-        let end = end.as_ref().map(PkBuf::pk_bytes);
-        let mut cursor = self.cursor_in_range(start.pk_bytes(), end, None);
-        let matches = cursor.seek_range_bytes(start.pk_bytes(), end);
-        (cursor, matches)
-    }
-
-    /// [`Self::range_cursor`] over the key band `range` names under `spec`.
-    pub(crate) fn cursor_over(&self, spec: &IndexKeySpec, range: &gnitz_wire::KeyRange) -> (ReadCursor, usize) {
-        self.range_cursor(spec.range_keys(self.schema.pk_stride(), range))
-    }
-
-    /// Whether this store actually holds a skeleton row. Every read path branches
-    /// on this rather than on the configured capacity.
-    pub(crate) fn has_skeleton_rows(&self) -> bool {
-        self.table().is_some_and(Table::has_skeleton_rows)
-    }
-
-    /// Every positive-weight row; with no store here, an empty batch.
-    pub(crate) fn full_scan(&self) -> std::rc::Rc<Batch> {
-        match self.table() {
-            Some(t) => t.full_scan(),
-            None => std::rc::Rc::new(Batch::empty_with_schema(&self.schema)),
-        }
-    }
-
-    /// The highest tick round this store's capacity sweep has dropped — the
-    /// `_tick` leading a delta store's highest dropped key; `0` if none.
-    pub(crate) fn dropped_through(&self) -> u64 {
-        self.table().map_or(0, |t| leading_u64(t.dropped_max().pk_bytes()))
-    }
-
-    /// Ingest a `Batch` by move — no copy, and the caller does not keep it.
-    /// `#[inline]` for [`Table::ingest_owned_batch`]'s reason.
-    #[inline]
-    pub(crate) fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
-        match self.table_mut() {
-            Some(t) => t.ingest_owned_batch(batch),
-            None => Ok(()),
-        }
-    }
-
-    /// Ingest a `Batch` the caller keeps reading; costs one copy.
-    pub(crate) fn ingest_borrowed_batch(&mut self, batch: &Batch) -> Result<(), StorageError> {
-        match self.table_mut() {
-            Some(t) => t.ingest_borrowed_batch(batch),
-            None => Ok(()),
-        }
-    }
-
-    /// Enforce unique-PK semantics against this store. With no store here there
-    /// is nothing to retract against, so the batch passes through.
-    pub(crate) fn enforce_unique_pk(&self, batch: Batch) -> Batch {
-        match self.table() {
-            Some(t) => super::unique_pk::enforce_unique_pk(t, &self.schema, batch),
-            None => batch,
-        }
-    }
-
-    /// Whether a live row carries this OPK key; a detached store holds no key.
-    pub(crate) fn has_pk_bytes(&self, key: &[u8]) -> bool {
-        self.table().is_some_and(|t| t.has_pk_bytes(key))
-    }
-
-    /// The net weight at `key` and the live row if there is one; a detached
-    /// store has neither.
-    pub(crate) fn live_row_at(&self, key: &[u8]) -> (i64, Option<StoredRow>) {
-        self.table().map_or((0, None), |t| t.live_row_at(key))
-    }
-
-    /// The policy this store was opened under, frozen at that open. A detached
-    /// store rederives: it publishes nothing a later open could resume from.
-    pub(crate) fn recovery_source(&self) -> RecoverySource {
-        self.table()
-            .map_or(RecoverySource::Rederive { resume_at: None }, Table::recovery_source)
-    }
-
-    /// Keep this store's shards in RAM, publishing none. A detached store holds
-    /// nothing to keep.
-    pub(crate) fn hold_in_ram(&mut self) {
-        if let Some(t) = self.table_mut() {
-            t.hold_in_ram();
-        }
-    }
-
-    /// Unlink this store's checkpoint manifest, so the next open reads `None`.
-    /// A detached store published none.
-    pub(crate) fn unlink_manifest(&mut self) -> Result<(), StorageError> {
-        match self.table_mut() {
-            Some(t) => t.unlink_manifest(),
-            None => Ok(()),
-        }
-    }
-
-    /// Dispatched [`Table::fold_to_ram`] — the fold, spill, compaction and
-    /// capacity sweep, with no manifest publish and no barrier.
-    pub(crate) fn fold_to_ram(&mut self) -> Result<(), StorageError> {
-        match self.table_mut() {
-            Some(t) => t.fold_to_ram(),
-            None => Ok(()),
-        }
-    }
-
-    /// Whether this process's store came back from a checkpoint manifest at its
-    /// open; `false` where it holds none.
-    pub(crate) fn resumed_from_checkpoint(&self) -> bool {
-        self.table().is_some_and(Table::resumed_from_checkpoint)
-    }
-
-    /// Rows this process's store estimates it holds; `0` where it holds none.
-    pub(crate) fn estimated_rows(&self) -> usize {
-        self.table().map_or(0, Table::estimated_rows)
-    }
+#[cold]
+#[track_caller]
+fn not_held() -> ! {
+    panic!("relation store is not held by this process")
 }

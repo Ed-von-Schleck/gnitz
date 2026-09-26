@@ -1,13 +1,13 @@
 //! Read I/O on relation families. [`RelationRegistry::open_bound`] opens every
 //! source a bound can name; [`LiveSource`] drains one chunk by chunk, hydrating
 //! each capacity-bounded view's skeleton row it meets within that chunk. The verbs
-//! — whole-relation scan, point seek, and the batched FK parent probe — sit on
+//! — whole-relation scan and the batched FK parent probe — sit on
 //! those two.
 
 use std::rc::Rc;
 
 use super::SkeletonHydrator;
-use crate::relation::RelationRegistry;
+use crate::relation::{Relation, RelationKind, RelationRegistry};
 use crate::schema::key::{compare_pk_bytes, sort_indices, IndexKeySpec};
 use crate::schema::{project_schema, ColumnLocator};
 use crate::storage::{Batch, PkSetGather, ReadCursor, SkeletonKeys, StoreError};
@@ -70,7 +70,7 @@ impl RelationRegistry {
     pub fn scan(&self, id: i64, hydrator: Option<&mut dyn SkeletonHydrator>) -> Result<Rc<Batch>, StoreError> {
         let entry = self.relation_or_err(id)?;
         // Asked of the store, not a cursor, so the common case keeps `full_scan`'s cached snapshot.
-        if !entry.store().has_skeleton_rows() {
+        if !entry.store().held().has_skeleton_rows() {
             return Ok(entry.full_scan());
         }
         let mut rows = LiveSource::new(self, id, SourceCursor::Full(Box::new(entry.cursor())), hydrator);
@@ -93,7 +93,7 @@ impl RelationRegistry {
             matches!(loc, ColumnLocator::Payload { .. }),
             "FK projection excludes PK columns"
         );
-        let mut gather = PkSetGather::open(keys, schema, |s, e| entry.cursor_in_range(s, e));
+        let mut gather = entry.gather(keys, None);
         let mut out = Batch::with_capacity(&out_schema, gather.remaining_keys());
         gather.for_each_live_row(usize::MAX, |c| {
             let (src, row) = c.current_row_source();
@@ -109,6 +109,12 @@ impl RelationRegistry {
     /// the source does not apply.
     pub fn open_bound(&self, id: i64, bound: ReadBound) -> Result<(SourceCursor, ReadBound), StoreError> {
         let entry = self.relation_or_err(id)?;
+        // A stream holds no rows, but a backfill over one still feeds an empty
+        // epoch: that is what mints a global aggregate's ground row.
+        if entry.kind() == RelationKind::Stream {
+            let empty = crate::storage::empty_cursor(entry.schema());
+            return Ok((SourceCursor::Full(Box::new(empty)), ReadBound::None));
+        }
         let cursor = match bound {
             ReadBound::None => SourceCursor::Full(Box::new(entry.cursor())),
             ReadBound::PkSet(keys) => {
@@ -121,39 +127,36 @@ impl RelationRegistry {
                     )));
                 }
                 // A key this worker holds no row for copies nothing.
-                let gather = PkSetGather::open(keys.into_bytes(), schema, |s, e| entry.cursor_in_range(s, e));
-                SourceCursor::PkSet(Box::new(gather))
+                SourceCursor::PkSet(Box::new(entry.gather(keys.into_bytes(), None)))
             }
-            ReadBound::Range(r) => return self.open_range(id, r),
+            ReadBound::Range(r) => return open_range(entry, r),
         };
         Ok((cursor, ReadBound::None))
     }
+}
 
-    /// The walk `r` names over `id`, and the part of it the cursor leaves unapplied.
-    fn open_range(&self, id: i64, r: KeyRange) -> Result<(SourceCursor, ReadBound), StoreError> {
-        let entry = self.relation_or_err(id)?;
-        let cols = self.bound_cols_against(id, r.cols(), "open_bound")?;
-        let schema = entry.schema();
-        if r.walks_pk(schema.pk_indices()) {
-            let (cursor, _) = entry.store().cursor_over(&IndexKeySpec::for_pk(&schema), &r);
-            return Ok((SourceCursor::Full(Box::new(cursor)), ReadBound::None));
-        }
-        if let Some(ic) = entry.index_on(cols.as_slice()) {
-            let spec = ic.key_spec();
-            let (idx, matches) = ic.store().cursor_over(&spec, &r);
-            if matches <= entry.store().estimated_rows() / INDEX_SCAN_RATIO {
-                let walk = BoundedIndexCursor {
-                    idx,
-                    src: PkSetGather::over(entry.cursor()),
-                    spec,
-                    pks: Vec::new(),
-                    order: Vec::new(),
-                };
-                return Ok((SourceCursor::Bounded(Box::new(walk)), ReadBound::None));
-            }
-        }
-        Ok((SourceCursor::Full(Box::new(entry.cursor())), ReadBound::Range(r)))
+/// The walk `r` names over `entry`, and the part of it the cursor leaves unapplied.
+fn open_range(entry: &Relation, r: KeyRange) -> Result<(SourceCursor, ReadBound), StoreError> {
+    let cols = entry.bound_cols(r.cols(), "open_bound")?;
+    let schema = entry.schema();
+    if r.walks_pk(schema.pk_indices()) {
+        let (cursor, _) = entry.store().held().range_cursor(schema.pk_range_keys(&r));
+        return Ok((SourceCursor::Full(Box::new(cursor)), ReadBound::None));
     }
+    if let Some(ic) = entry.index_on(cols.as_slice()) {
+        let (idx, matches) = ic.cursor_over(&r);
+        if matches <= entry.store().held().estimated_rows() / INDEX_SCAN_RATIO {
+            let walk = BoundedIndexCursor {
+                idx,
+                src: PkSetGather::over(entry.cursor()),
+                spec: ic.key_spec(),
+                pks: Vec::new(),
+                order: Vec::new(),
+            };
+            return Ok((SourceCursor::Bounded(Box::new(walk)), ReadBound::None));
+        }
+    }
+    Ok((SourceCursor::Full(Box::new(entry.cursor())), ReadBound::Range(r)))
 }
 
 /// Tripwire: the replay's per-PK weight sum must equal the coarse weight the

@@ -24,8 +24,13 @@ fn stream_flag_registers_storeless_with_no_directory() {
         "a stream gets no directory: {}",
         entry.directory()
     );
-    // Its reads are empty rather than erroring.
-    assert_eq!(entry.full_scan().len(), 0);
+    // A view backfill over it drains nothing.
+    let vid = register_identity_view(&mut engine, sid, "v_s", &cols);
+    let mut cursor = engine.open_source_cursor(vid, sid).unwrap();
+    assert!(
+        cursor.drain_chunk(64).is_none(),
+        "a stream's source cursor drains nothing"
+    );
 
     // The same word with the bit clear is still an ordinary base table with a
     // directory, so the assertions above are about the flag and not the fixture.

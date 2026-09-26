@@ -57,7 +57,7 @@ fn unique_pk_bench() {
         .unwrap();
         for p in 0..8u64 {
             let rows: Vec<(u64, i64, i64)> = (0..1000).map(|i| (p * 1000 + i, 1, i as i64)).collect();
-            let eff = enforce_unique_pk(&t, &schema, make_batch_raw(&schema, &rows));
+            let eff = enforce_unique_pk(&t, make_batch_raw(&schema, &rows));
             t.ingest_borrowed_batch(&eff).unwrap();
         }
     }
@@ -101,7 +101,7 @@ fn unique_pk_bench() {
         let mut eff_rows = 0usize;
         let t = Instant::now();
         for b in batches {
-            let eff = enforce_unique_pk(&table, &schema, b);
+            let eff = enforce_unique_pk(&table, b);
             eff_rows += eff.count;
             table.ingest_borrowed_batch(&eff).unwrap();
         }

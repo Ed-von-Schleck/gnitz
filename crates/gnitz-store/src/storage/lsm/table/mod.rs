@@ -247,6 +247,11 @@ impl Table {
         self.memtable.set_budget(budget);
     }
 
+    /// The schema this store's rows are read in.
+    pub(crate) fn schema(&self) -> &SchemaDescriptor {
+        &self.shard_index.schema
+    }
+
     /// The highest key this store's capacity sweep has dropped.
     /// See [`ShardIndex::dropped_max`].
     pub(crate) fn dropped_max(&self) -> PkBuf {
@@ -445,6 +450,18 @@ impl Table {
             .chain(extra.filter(|b| !b.is_empty()).map(Run::Mem))
             .chain(self.shard_index.shard_arcs_in_range(lo, hi).map(Run::Shard));
         read_cursor::from_runs_unpositioned(runs, self.shard_index.schema, self.mem_run_count() + 1)
+    }
+
+    /// A cursor positioned on the OPK key band `[start, end)` and its raw entry
+    /// count, an upper bound on the live groups; `None` opens empty.
+    pub(crate) fn range_cursor(&self, range: Option<(PkBuf, Option<PkBuf>)>) -> (ReadCursor, usize) {
+        let Some((start, end)) = range else {
+            return (read_cursor::empty(self.shard_index.schema), 0);
+        };
+        let end = end.as_ref().map(PkBuf::pk_bytes);
+        let mut cursor = self.open_cursor_in_range(start.pk_bytes(), end, None);
+        let matches = cursor.seek_range_bytes(start.pk_bytes(), end);
+        (cursor, matches)
     }
 
     /// Return the fully consolidated batch of all live rows, caching the result.

@@ -115,13 +115,6 @@ impl CatalogEngine {
     /// The cursor driving `source` through `view_id`'s circuit, under the bound the
     /// circuit carries for it; the circuit's `Filter` applies the WHERE.
     pub(crate) fn open_source_cursor(&mut self, view_id: i64, source: i64) -> Result<SourceCursor, String> {
-        // A store-less handle reads empty rather than erroring: correct for a
-        // stream, a wrong answer for a process whose store is elsewhere. Hard, not
-        // `debug_assert!` — release is a supported deployment.
-        assert!(
-            self.registry.residency().owns_stores(),
-            "source cursor in a process owning no base store (view {view_id}, source {source})",
-        );
         let bound = self.dag.view_meta(view_id)?.source_bound(source);
         self.registry
             .open_bound(source, bound)

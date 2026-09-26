@@ -147,10 +147,7 @@ impl CatalogEngine {
         self.drain_pending_broadcasts()
             .into_iter()
             .rev()
-            .try_for_each(|(family, mut batch)| {
-                batch.map_weights(i64::wrapping_neg);
-                self.apply_family(family, batch)
-            })
+            .try_for_each(|(family, batch)| self.apply_family(family, gnitz_store::ops::op_negate(batch)))
             .map_err(|e| {
                 format!(
                     "Stage-A DDL compensation failed — catalog cannot be restored, \

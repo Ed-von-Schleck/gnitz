@@ -1478,12 +1478,6 @@ fn pk_range(schema: &SchemaDescriptor, eq: &[u128], start: Cut, end: Cut) -> Key
     KeyRange::new(PkColList::from_slice(schema.pk_indices()), eq, start, end)
 }
 
-/// The base-PK key range, through the degenerate identity-promotion span. The
-/// expected bytes below predate `for_pk`, so they pin its promotion too.
-fn pk_range_keys(schema: &SchemaDescriptor, r: &KeyRange) -> Option<(PkBuf, Option<PkBuf>)> {
-    IndexKeySpec::for_pk(schema).range_keys(schema.pk_stride(), r)
-}
-
 fn opk_u64(v: u64) -> Vec<u8> {
     v.to_be_bytes().to_vec() // U64 OPK is plain big-endian
 }
@@ -1494,7 +1488,7 @@ fn opk_u64(v: u64) -> Vec<u8> {
 fn pk_range_ge_unbounded_above() {
     let s = pk_only_schema(&[TypeCode::U64]);
     let r = pk_range(&s, &[], Cut::before(5), Cut::after(u64::MAX as u128));
-    let (start, end) = pk_range_keys(&s, &r).unwrap();
+    let (start, end) = s.pk_range_keys(&r).unwrap();
     assert_eq!(start.pk_bytes(), opk_u64(5));
     assert!(end.is_none(), "unbounded above → end None");
 }
@@ -1504,7 +1498,7 @@ fn pk_range_ge_unbounded_above() {
 fn pk_range_gt_increments_whole_key() {
     let s = pk_only_schema(&[TypeCode::U64]);
     let r = pk_range(&s, &[], Cut::after(5), Cut::after(u64::MAX as u128));
-    let (start, end) = pk_range_keys(&s, &r).unwrap();
+    let (start, end) = s.pk_range_keys(&r).unwrap();
     assert_eq!(start.pk_bytes(), opk_u64(6));
     assert!(end.is_none());
 }
@@ -1514,7 +1508,7 @@ fn pk_range_gt_increments_whole_key() {
 fn pk_range_lt() {
     let s = pk_only_schema(&[TypeCode::U64]);
     let r = pk_range(&s, &[], Cut::before(0), Cut::before(10));
-    let (start, end) = pk_range_keys(&s, &r).unwrap();
+    let (start, end) = s.pk_range_keys(&r).unwrap();
     assert_eq!(start.pk_bytes(), opk_u64(0));
     assert_eq!(end.unwrap().pk_bytes(), opk_u64(10));
 }
@@ -1524,7 +1518,7 @@ fn pk_range_lt() {
 fn pk_range_point_lookup() {
     let s = pk_only_schema(&[TypeCode::U64]);
     let r = pk_range(&s, &[], Cut::before(5), Cut::after(5));
-    let (start, end) = pk_range_keys(&s, &r).unwrap();
+    let (start, end) = s.pk_range_keys(&r).unwrap();
     assert_eq!(start.pk_bytes(), opk_u64(5));
     assert_eq!(end.unwrap().pk_bytes(), opk_u64(6));
 }
@@ -1534,7 +1528,7 @@ fn pk_range_point_lookup() {
 fn pk_range_inverted_is_empty() {
     let s = pk_only_schema(&[TypeCode::U64]);
     let r = pk_range(&s, &[], Cut::after(10), Cut::before(3));
-    assert_eq!(pk_range_keys(&s, &r), None);
+    assert_eq!(s.pk_range_keys(&r), None);
 }
 
 /// A signed PK: `pk > -1` seeks to `OPK(0)` (sign-flip order); `after(image(i64::MAX))`
@@ -1544,7 +1538,7 @@ fn pk_range_signed_i64() {
     let s = pk_only_schema(&[TypeCode::I64]);
     let img = |v: i64| gnitz_wire::key_image(TypeCode::I64, v as u64 as u128);
     let r = pk_range(&s, &[], Cut::after(img(-1)), Cut::after(img(i64::MAX)));
-    let (start, end) = pk_range_keys(&s, &r).unwrap();
+    let (start, end) = s.pk_range_keys(&r).unwrap();
     assert_eq!(start, s.opk_key(&0i64.to_le_bytes()));
     assert!(end.is_none());
 }
@@ -1555,7 +1549,7 @@ fn pk_range_signed_i64() {
 fn pk_range_compound_prefix_eq() {
     let s = pk_only_schema(&[TypeCode::U64, TypeCode::U64]);
     let r = pk_range(&s, &[5], Cut::after(3), Cut::after(u64::MAX as u128));
-    let (start, end) = pk_range_keys(&s, &r).unwrap();
+    let (start, end) = s.pk_range_keys(&r).unwrap();
     // start = OPK(5,4) — the prefix `(5,3)` incremented on b.
     assert_eq!(start.pk_bytes(), opk_pk(&s, &[5, 4]));
     // end = the successor of `(5, MAX)` — carries into `a`, i.e. OPK(6, 0).
@@ -1568,7 +1562,7 @@ fn pk_range_compound_prefix_eq() {
 fn pk_prefix_range_leaves_the_trailing_column_free() {
     let s = pk_only_schema(&[TypeCode::U64, TypeCode::U64]);
     let r = KeyRange::new(PkColList::from_slice(&[0]), &[], Cut::after(3), Cut::before(9));
-    let (start, end) = pk_range_keys(&s, &r).unwrap();
+    let (start, end) = s.pk_range_keys(&r).unwrap();
     assert_eq!(start.pk_bytes(), opk_pk(&s, &[4, 0]));
     assert_eq!(end.unwrap().pk_bytes(), opk_pk(&s, &[9, 0]));
 }
@@ -1654,7 +1648,7 @@ fn confined_worker_confines_a_maximal_point() {
             Cut::before(gnitz_wire::key_image(tc, max)),
             Cut::after(gnitz_wire::key_image(tc, max)),
         );
-        assert!(pk_range_keys(&s, &r).unwrap().1.is_none(), "after(max) carries out");
+        assert!(s.pk_range_keys(&r).unwrap().1.is_none(), "after(max) carries out");
         assert_eq!(
             s.confined_worker(&r, NW),
             Some(s.worker_for_pk(&opk_pk(&s, &[max]), NW))

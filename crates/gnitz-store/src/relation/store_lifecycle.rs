@@ -2,7 +2,7 @@
 //! relayout and child-dir reclamation, view reset and rebuild start — and the
 //! system families' replay floors recovery reads.
 
-use super::{RelationKind, RelationRegistry, Residency, SecondaryIndex, Store};
+use super::{RelationKind, RelationRegistry, Residency, SecondaryIndex};
 use crate::storage::{reclaim_retired_children, remove_child, subdir_names, ChildAddr, ChildKind, Slot, StoreError};
 
 impl RelationRegistry {
@@ -19,8 +19,7 @@ impl RelationRegistry {
         );
         assert!(self.children_reconciled, "open_stores before reconcile_child_dirs");
         assert!(residency.owns_stores());
-        let slot = Slot::new(rank, self.slot.of);
-        self.slot = slot;
+        self.slot = Slot::new(rank, self.slot.of);
         self.residency = residency;
         let tids: Vec<i64> = self
             .tables
@@ -28,52 +27,48 @@ impl RelationRegistry {
             .filter(|(_, e)| e.kind() != RelationKind::SystemCatalog)
             .map(|(&tid, _)| tid)
             .collect();
-        for tid in tids {
-            self.rebuild_relation_store(tid, "open store")?;
-        }
-        let (recovery, budgets) = (self.rederive_source(self.resume_enabled), self.store_budgets());
-        let chunk_rows = self.config.scan_chunk_rows;
         let mut filled = 0usize;
-        for entry in self.tables.values_mut() {
-            let owner_dir = entry.directory().to_string();
-            for ix in &mut entry.indexes {
-                let (index_id, schema) = (ix.index_id, ix.store.schema());
-                ix.store = Store::owned(
-                    Self::open_index_table(slot, recovery, budgets, &owner_dir, index_id, schema)?,
-                    schema,
-                );
-            }
-            let owner_id = entry.id();
-            let mut targets: Vec<&mut SecondaryIndex> = entry.indexes.iter_mut().filter(|ix| !ix.resumed()).collect();
-            filled += targets.len();
-            super::ingest::fill_indexes(&entry.store, chunk_rows, owner_id, &mut targets)?;
+        for tid in tids {
+            filled += self.reopen_stores(tid, "open store")?;
         }
         // A worker applies the same catalog deltas as the master, but only the
         // master writes `_sys/` shards.
         if residency == Residency::Worker {
             for entry in self.tables.values_mut() {
                 if entry.kind() == RelationKind::SystemCatalog {
-                    entry.store.hold_in_ram();
+                    entry.store.held_mut().hold_in_ram();
                 }
             }
         }
         Ok(filled)
     }
 
-    /// Rebuild `tid`'s store handle from its registered spec and install it, homed
-    /// at whatever slot this process now runs as. The caller does any on-disk
-    /// preparation first. Both stores are rebuilt, so a fed view cannot come back
-    /// declaring a feed it has no store for.
-    pub(crate) fn rebuild_relation_store(&mut self, tid: i64, what: &str) -> Result<(), StoreError> {
-        let (dir, schema, kind) = {
+    /// Reopen every store of `tid` at this process's slot, and fill each index
+    /// that did not resume. Returns how many it filled.
+    fn reopen_stores(&mut self, tid: i64, what: &str) -> Result<usize, StoreError> {
+        assert!(self.residency.owns_stores(), "{what}: this process holds no user store");
+        let (schema, kind) = {
             let e = self.relation_or_err(tid).map_err(|e| e.in_context(what))?;
-            (e.directory().to_string(), e.schema(), e.kind())
+            (e.schema(), e.kind())
         };
+        let (slot, recovery, budgets) = (
+            self.slot,
+            self.rederive_source(self.resume_enabled),
+            self.store_budgets(),
+        );
+        let chunk_rows = self.config.scan_chunk_rows;
+        let entry = self.tables.get(&tid).expect("entry read above");
         let stores = self
-            .build_relation_store(kind, &dir, tid, schema, false)
+            .build_relation_store(kind, &entry.directory, tid, schema, false)
             .map_err(|e| e.in_context(&format!("{what} tid={tid}")))?;
-        self.tables.get_mut(&tid).expect("entry read above").set_stores(stores);
-        Ok(())
+        let entry = self.tables.get_mut(&tid).expect("entry read above");
+        (entry.store, entry.delta) = stores;
+        for ix in &mut entry.indexes {
+            ix.store = Self::open_index_store(slot, recovery, budgets, &entry.directory, ix.index_id, ix.schema())?;
+        }
+        let mut targets: Vec<&mut SecondaryIndex> = entry.indexes.iter_mut().filter(|ix| !ix.resumed()).collect();
+        super::ingest::fill_indexes(&entry.store, chunk_rows, tid, &mut targets)?;
+        Ok(targets.len())
     }
 
     /// Relay each base table's children onto this boot's worker count, then
@@ -113,9 +108,10 @@ impl RelationRegistry {
         self.relation_mut_or_err(vid)
             .map_err(|e| e.in_context("reset_view"))?
             .store
+            .held_mut()
             .unlink_manifest()
             .map_err(|e| StoreError::storage(format!("reset_view: unlink manifest of {vid}"), e))?;
-        self.rebuild_relation_store(vid, "reset view output")
+        self.reopen_stores(vid, "reset view output").map(drop)
     }
 
     /// The bytes `id`'s next published manifest carries beside its rows.
@@ -170,7 +166,7 @@ impl RelationRegistry {
         self.tables
             .iter()
             .filter(|(_, entry)| entry.kind() == RelationKind::SystemCatalog)
-            .map(|(&tid, entry)| (tid, entry.store.table().map_or(0, crate::storage::Table::replay_floor)))
+            .map(|(&tid, entry)| (tid, entry.store.held().replay_floor()))
             .collect()
     }
 }

@@ -1,7 +1,6 @@
 //! Opening a relation's stores and entering it in the registry.
 
 use super::*;
-use crate::schema::Placement;
 use crate::storage::ChildKind;
 use gnitz_foundation::fault::Seam;
 
@@ -53,7 +52,7 @@ impl RelationRegistry {
         id: i64,
         schema: SchemaDescriptor,
         from_manifest: bool,
-    ) -> Result<(Store, Option<Box<Store>>), StoreError> {
+    ) -> Result<(Store, Option<Box<Table>>), StoreError> {
         let props = match kind {
             RelationKind::View(p) => p,
             _ => ViewProps::Plain,
@@ -72,7 +71,7 @@ impl RelationRegistry {
             .transpose()?;
 
         let recovery = match kind {
-            RelationKind::Stream => return Ok((Store::detached(schema), None)),
+            RelationKind::Stream => return Ok((Store::Absent(Box::new(schema)), None)),
             // A view's output store and its operator traces resume from the
             // manifest the ephemeral checkpoint round stamped, or are rebuilt.
             RelationKind::View(_) if from_manifest => self.rederive_source(true),
@@ -82,7 +81,7 @@ impl RelationRegistry {
         };
         ensure_dir(directory)?;
         if kind != RelationKind::SystemCatalog && !self.residency.owns_stores() {
-            return Ok((Store::detached(schema), None));
+            return Ok((Store::Absent(Box::new(schema)), None));
         }
 
         // Widen the window where the table dir exists but its child subdir does
@@ -105,12 +104,12 @@ impl RelationRegistry {
             self.store_budgets().bounded(props.capacity_bytes()),
         )
         .map_err(|e| StoreError::storage(format!("open relation {id} (dir={directory})"), e))?;
-        let serves_feed = !schema.placement().is_replicated() || self.slot.rank == Placement::REPLICA_OWNER;
+        let serves_feed = schema.placement().counts_on(self.slot.rank);
         let delta = delta
             .filter(|_| serves_feed)
             .map(|(budget, s)| self.build_delta_store(directory, id, s, budget))
             .transpose()?;
-        Ok((Store::owned(Box::new(table), schema), delta))
+        Ok((Store::Held(Box::new(table)), delta))
     }
 
     /// This worker's delta store for a fed view. Erased at open: no delta
@@ -121,7 +120,7 @@ impl RelationRegistry {
         id: i64,
         delta_schema: SchemaDescriptor,
         budget: u64,
-    ) -> Result<Box<Store>, StoreError> {
+    ) -> Result<Box<Table>, StoreError> {
         let child = ChildAddr { kind: ChildKind::Delta, slot: self.slot };
         let table = Table::new(
             &child.dir(directory),
@@ -130,6 +129,6 @@ impl RelationRegistry {
             self.store_budgets().delta(budget),
         )
         .map_err(|e| StoreError::storage(format!("open delta store of view {id} (dir={directory})"), e))?;
-        Ok(Box::new(Store::owned(Box::new(table), delta_schema)))
+        Ok(Box::new(table))
     }
 }

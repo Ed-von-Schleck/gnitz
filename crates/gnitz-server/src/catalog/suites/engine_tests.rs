@@ -509,7 +509,10 @@ fn test_master_holds_no_user_store() {
 
     assert!(!engine.registry.residency().owns_stores());
     let entry = engine.registry.relation_or_err(tid).unwrap();
-    assert!(!entry.cursor().valid, "the master's copy of a user store reads empty");
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| entry.cursor())).is_err(),
+        "the master holds no user store to read"
+    );
     for family in [SysFamily::Schema, SysFamily::Table, SysFamily::Column] {
         assert!(
             engine.sys_relation(family).cursor().valid,

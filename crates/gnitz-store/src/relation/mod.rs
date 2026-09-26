@@ -10,15 +10,10 @@ use crate::schema::key::{key_range_between_cuts, KeyCut, PkBuf};
 use crate::schema::SchemaDescriptor;
 
 use crate::storage::{
-    Batch, ChildAddr, ChildKind, ReadCursor, RecoverySource, Slot, StorageError, StoreBudgets, StoreError, StoredRow,
-    Table,
+    Batch, ChildAddr, ChildKind, PkSetGather, ReadCursor, RecoverySource, Slot, StorageError, StoreBudgets, StoreError,
+    StoredRow, Table,
 };
 use gnitz_wire::{PkColList, ViewProps};
-
-/// Ingests into one relation, undone: a cursor opened with it reads the store as
-/// it was before them. `Default` undoes nothing.
-#[derive(Clone, Default)]
-pub struct Rewind(Option<std::rc::Rc<Batch>>);
 
 mod build;
 mod circuit_state;
@@ -71,7 +66,7 @@ impl SecondaryIndex {
     }
 
     pub fn schema(&self) -> SchemaDescriptor {
-        self.store.schema()
+        *self.store.schema()
     }
 
     pub fn key_spec(&self) -> crate::schema::IndexKeySpec {
@@ -82,39 +77,41 @@ impl SecondaryIndex {
         self.is_unique
     }
 
-    /// Non-compacting cursor over this index's store, in the index schema — a
-    /// process holding no store opens empty.
+    /// Non-compacting cursor over this index's store, in the index schema.
     pub fn cursor(&self) -> crate::storage::ReadCursor {
-        self.store.cursor()
+        self.store.held().open_cursor()
     }
 
-    /// This process's store of the index, for the crate's own read paths.
-    pub(crate) fn store(&self) -> &Store {
-        &self.store
+    /// A cursor positioned on the key band `r` names under this index's key spec,
+    /// and the raw entry count in it.
+    pub(crate) fn cursor_over(&self, r: &gnitz_wire::KeyRange) -> (ReadCursor, usize) {
+        let t = self.store.held();
+        t.range_cursor(self.key_spec.range_keys(t.schema().pk_stride(), r))
     }
 
     /// Write index rows directly, in the index's own layout — the one write that
     /// does not ride a projection of the owner. For tests that need an entry no
     /// projection of the owner could produce.
     pub fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
-        self.store.ingest_owned_batch(batch)
+        self.store.held_mut().ingest_owned_batch(batch)
     }
 
     /// Project `source` into this index's layout and ingest the result.
     /// `Ok(false)` when the projection was empty: the key spec rejects rows, so
     /// a non-empty `source` can still project to nothing.
     pub(crate) fn project_and_ingest(&mut self, source: &Batch) -> Result<bool, StorageError> {
-        let projected = source.project_index(&self.key_spec, &self.store.schema());
+        let table = self.store.held_mut();
+        let projected = source.project_index(&self.key_spec, table.schema());
         if projected.is_empty() {
             return Ok(false);
         }
-        self.store.ingest_owned_batch(projected).map(|()| true)
+        table.ingest_owned_batch(projected).map(|()| true)
     }
 
     /// Whether this process's store of the index came back from a checkpoint
     /// manifest at its open.
     pub fn resumed(&self) -> bool {
-        self.store.resumed_from_checkpoint()
+        self.store.held().resumed_from_checkpoint()
     }
 }
 
@@ -205,18 +202,14 @@ impl Residency {
 // ---------------------------------------------------------------------------
 
 /// One relation in this process: its identity, its shape, and this process's
-/// store for it. Every read below answers for a process that holds no store —
-/// empty cursor, empty scan, `false`, `0` — so no caller branches on residency
-/// to ask a question.
+/// store for it.
 pub struct Relation {
     /// The relation id — the key it is registered under, held here too so a
     /// borrowed `Relation` names itself: nothing that has one needs the id
     /// threaded in beside it to log or to phrase an error.
     id: i64,
     store: Store,
-    /// The delta store, on the ranks that serve this view's feed. Boxed: it embeds
-    /// a second `SchemaDescriptor`.
-    delta: Option<Box<Store>>,
+    delta: Option<Box<Table>>,
     indexes: Vec<SecondaryIndex>,
     kind: RelationKind,
     /// This relation's on-disk directory, parent of its `ChildAddr` subdirs. It
@@ -226,30 +219,16 @@ pub struct Relation {
 }
 
 impl Relation {
-    /// Install both stores at once. The only writer of either field after
-    /// construction, so nothing can replace one and leave the other — which for a
-    /// fed view is a `delta_bytes` in the catalog with no delta store anywhere.
-    pub(crate) fn set_stores(&mut self, stores: (Store, Option<Box<Store>>)) {
-        self.store = stores.0;
-        self.delta = stores.1;
-    }
-
-    /// This relation's delta feed, or the one message for "this process holds no
-    /// delta store" — so no two reads can render that answer differently.
-    pub(crate) fn delta_or_err(&self) -> Result<&Store, StoreError> {
-        self.delta.as_deref().ok_or_else(|| {
-            StoreError::rejected(format!(
-                "scan_spec: this process holds no delta store for relation {}",
-                self.id
-            ))
-        })
+    /// This relation's delta store, if this process serves its feed.
+    pub(crate) fn delta(&self) -> Option<&Table> {
+        self.delta.as_deref()
     }
 
     /// By value, for the reason [`SecondaryIndex::cols`] is: the `tables` borrow
     /// ends with the call, so the descriptor survives a later `&mut` on the
     /// registry.
     pub fn schema(&self) -> SchemaDescriptor {
-        self.store.schema()
+        *self.store.schema()
     }
 
     pub fn id(&self) -> i64 {
@@ -290,30 +269,22 @@ impl Relation {
 
     /// Non-compacting cursor over this relation's store.
     pub fn cursor(&self) -> crate::storage::ReadCursor {
-        self.store.cursor()
+        self.store.held().open_cursor()
     }
 
-    /// This relation's rows over `[start, end]` only — see
-    /// `Table::open_cursor_in_range`.
-    pub fn cursor_in_range(&self, start: &[u8], end: Option<&[u8]>) -> crate::storage::ReadCursor {
-        self.store.cursor_in_range(start, end, None)
-    }
-
-    /// Undo `ingested`, rows this relation's store took in.
-    pub fn rewind(&self, ingested: &Batch) -> Rewind {
-        let mut undo = ingested.clone();
-        undo.map_weights(i64::wrapping_neg);
-        Rewind(Some(std::rc::Rc::new(undo.into_consolidated(&self.schema()))))
-    }
-
-    /// [`Self::cursor_in_range`] over the store as `rewind` leaves it.
-    pub fn cursor_in_range_rewound(
-        &self,
-        start: &[u8],
-        end: Option<&[u8]>,
-        rewind: &Rewind,
-    ) -> crate::storage::ReadCursor {
-        self.store.cursor_in_range(start, end, rewind.0.clone())
+    /// Every live row of `keys` (flat OPK images, strictly ascending). With `unticked`,
+    /// the store is read as it was before those ingests.
+    pub fn gather(&self, keys: Vec<u8>, unticked: Option<&Batch>) -> PkSetGather {
+        let schema = self.schema();
+        let table = self.store.held();
+        PkSetGather::open(keys, schema, |s, e| {
+            let undo = unticked.map(|b| {
+                let mut undo = b.to_consolidated(&schema);
+                undo.map_weights(i64::wrapping_neg);
+                std::rc::Rc::new(undo)
+            });
+            table.open_cursor_in_range(s, e, undo)
+        })
     }
 
     /// Visit every positive-weight row whose OPK key begins with `prefix`, through a
@@ -321,29 +292,31 @@ impl Relation {
     pub fn for_each_positive_with_prefix(&self, prefix: &[u8], f: impl FnMut(&ReadCursor)) {
         let band = key_range_between_cuts(KeyCut::min_of(prefix), KeyCut::above(prefix), self.schema().pk_stride());
         if let Some((start, end)) = band {
-            self.cursor_in_range(start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes))
+            self.store
+                .held()
+                .open_cursor_in_range(start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes), None)
                 .for_each_positive_with_prefix(prefix, f);
         }
     }
 
     /// Materialize every positive-weight row of this relation's store.
     pub fn full_scan(&self) -> std::rc::Rc<Batch> {
-        self.store.full_scan()
+        self.store.held().full_scan()
     }
 
     /// Whether a live row carries this OPK key.
     pub fn has_pk(&self, key: &[u8]) -> bool {
-        self.store.has_pk_bytes(key)
+        self.store.held().has_pk_bytes(key)
     }
 
     /// The net weight at `key`, and the live row if there is one.
     pub fn live_row_at(&self, key: &[u8]) -> (i64, Option<StoredRow>) {
-        self.store.live_row_at(key)
+        self.store.held().live_row_at(key)
     }
 
     /// Whether this store came back from a checkpoint manifest at its open.
     pub fn resumed(&self) -> bool {
-        self.store.resumed_from_checkpoint()
+        self.store.held().resumed_from_checkpoint()
     }
 
     /// Every secondary index on this relation, in registration order.
@@ -365,6 +338,18 @@ impl Relation {
     /// This process's store, for the crate's own read and write paths.
     pub(crate) fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// `cols`, if each names a column of this relation.
+    pub(crate) fn bound_cols(&self, cols: PkColList, op: &str) -> Result<PkColList, StoreError> {
+        let schema = self.schema();
+        match cols.as_slice().iter().all(|&c| schema.column(c as usize).is_some()) {
+            true => Ok(cols),
+            false => Err(StoreError::rejected(format!(
+                "{op}: invalid column list for table {}",
+                self.id
+            ))),
+        }
     }
 }
 
@@ -502,46 +487,42 @@ impl RelationRegistry {
         }
         let (key_spec, index_schema) =
             crate::schema::index_spec_and_schema(cols, &owner_schema).map_err(StoreError::rejected)?;
-        let store = match self.residency.owns_stores() {
-            false => Store::detached(index_schema),
-            true => Store::owned(
-                Self::open_index_table(
-                    self.slot,
-                    RecoverySource::Rederive { resume_at: None },
-                    self.store_budgets(),
-                    &owner_dir,
-                    index_id,
-                    index_schema,
-                )?,
-                index_schema,
-            ),
-        };
         let mut ix = SecondaryIndex {
             cols: PkColList::from_slice(cols),
             index_id,
-            store,
+            store: Store::Absent(Box::new(index_schema)),
             key_spec,
             is_unique,
             covers_pk: owner_schema.covers_pk(cols),
         };
-        let entry = self.tables.get_mut(&owner).expect("resolved above");
-        ingest::fill_indexes(&entry.store, self.config.scan_chunk_rows, owner, &mut [&mut ix])?;
-        entry.indexes.push(ix);
+        if self.residency.owns_stores() {
+            ix.store = Self::open_index_store(
+                self.slot,
+                self.rederive_source(false),
+                self.store_budgets(),
+                &owner_dir,
+                index_id,
+                index_schema,
+            )?;
+            let owner_store = &self.tables[&owner].store;
+            ingest::fill_indexes(owner_store, self.config.scan_chunk_rows, owner, &mut [&mut ix])?;
+        }
+        self.tables.get_mut(&owner).expect("resolved above").indexes.push(ix);
         Ok(())
     }
 
     /// `slot`'s store of index `index_id` over the relation at `owner_dir`.
-    fn open_index_table(
+    fn open_index_store(
         slot: Slot,
         recovery: RecoverySource,
         budgets: StoreBudgets,
         owner_dir: &str,
         index_id: i64,
         schema: SchemaDescriptor,
-    ) -> Result<Box<Table>, StoreError> {
+    ) -> Result<Store, StoreError> {
         let dir = ChildAddr { kind: ChildKind::Index(index_id), slot }.dir(owner_dir);
         Table::new(&dir, schema, recovery, budgets)
-            .map(Box::new)
+            .map(|t| Store::Held(Box::new(t)))
             .map_err(|e| StoreError::storage(format!("open index {index_id} (dir={dir})"), e))
     }
 
@@ -567,7 +548,7 @@ impl RelationRegistry {
         let entry = self.relation_mut_or_err(id)?;
         // Checked, not asserted: what a stale `key_spec` produces is a silently
         // wrong index projection, which release codegen would not guard at all.
-        if !schema.is_trailing_append_of(&entry.store.schema()) {
+        if !schema.is_trailing_append_of(entry.store.schema()) {
             return Err(StoreError::rejected(format!(
                 "ALTER on table {id}: the new descriptor is not a trailing append, \
                  which every index circuit's baked key_spec requires"
@@ -666,28 +647,11 @@ impl RelationRegistry {
             .collect()
     }
 
-    /// The column list a frame's `pack_pk_cols` word names, admitted against
-    /// `id`'s schema. The one decode-and-admit for every frame carrying such a
-    /// word: the master applies it as an early client-facing reject, the worker
-    /// as its trust boundary, and both render the same error.
+    /// The column list a `pack_pk_cols` word names, admitted by [`Relation::bound_cols`].
     pub fn index_cols(&self, id: i64, packed: u64, op: &str) -> Result<PkColList, StoreError> {
         let cols = gnitz_wire::unpack_pk_cols(packed)
             .map_err(|_| StoreError::rejected(format!("{op}: invalid column list for table {id}")))?;
-        self.bound_cols_against(id, cols, op)
-    }
-
-    /// Admit an already-unpacked column list against `id`'s schema. The client
-    /// owns the list, and only the registry holds a schema to bound it against,
-    /// so every path taking one takes this test — [`Self::index_cols`] for a
-    /// frame carrying the packed word, this for one whose wire decoder
-    /// (`KeyRange`) already unpacked it.
-    pub(crate) fn bound_cols_against(&self, id: i64, cols: PkColList, op: &str) -> Result<PkColList, StoreError> {
-        match self.relation(id) {
-            Some(e) if cols.as_slice().iter().all(|&c| (c as usize) < e.schema().num_columns()) => Ok(cols),
-            _ => Err(StoreError::rejected(format!(
-                "{op}: invalid column list for table {id}"
-            ))),
-        }
+        self.relation_or_err(id)?.bound_cols(cols, op)
     }
 
     // ── The resume fence ────────────────────────────────────────────────

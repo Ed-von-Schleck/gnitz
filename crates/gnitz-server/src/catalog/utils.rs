@@ -70,7 +70,7 @@ impl CatalogEngine {
             keys.extend_from_slice(sys_opk(&schema, id).pk_bytes());
         }
         let mut batch = Batch::with_capacity(&schema, ids.len());
-        gnitz_store::storage::PkSetGather::open(keys, schema, |s, e| rel.cursor_in_range(s, e))
+        rel.gather(keys, None)
             .for_each_live_row(usize::MAX, |c| c.copy_current_row_into(&mut batch, -1));
         batch
     }

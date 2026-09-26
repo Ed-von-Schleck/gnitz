@@ -171,7 +171,7 @@ fn a_fed_view_retains_each_round_at_its_own_weight() {
     }
     assert_eq!(live, 0, "the output store's fold annihilates the pair");
 
-    let feed = entry.delta_or_err().expect("a fed view holds a delta store");
+    let feed = entry.delta().expect("a fed view holds a delta store");
     let stride = feed.schema().pk_stride();
     let mut rounds: Vec<(u64, i64)> = Vec::new();
     let floor = vec![0u8; stride];

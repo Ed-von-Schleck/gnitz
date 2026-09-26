@@ -73,7 +73,7 @@ fn enforce_unique_pk_holds_at_every_pk_shape() {
         let row = |pk: &[u8], w: i64, payload: i64| wide_row(&schema, pk, w, payload);
 
         // Fresh insert pushed at weight 2 lands exactly one live instance.
-        let eff = enforce_unique_pk(&pt, &schema, row(&k1, 2, 100));
+        let eff = enforce_unique_pk(&pt, row(&k1, 2, 100));
         assert_eq!(eff.count, 1, "{name}: fresh insert is one effective row");
         assert_eq!(eff.get_weight(0), 1, "{name}: insert weight normalized to 1");
         pt.ingest_owned_batch(eff).unwrap();
@@ -81,7 +81,7 @@ fn enforce_unique_pk_holds_at_every_pk_shape() {
 
         // Upsert: the stored payload is retracted at -1 on the key's full OPK
         // bytes, then the new payload is inserted.
-        let eff = enforce_unique_pk(&pt, &schema, row(&k1, 2, 200));
+        let eff = enforce_unique_pk(&pt, row(&k1, 2, 200));
         assert_eq!(eff.count, 2, "{name}: stored retraction + new insert");
         assert_eq!(eff.get_weight(0), -1, "{name}: stored-row retraction at -1");
         assert_eq!(eff.get_pk_bytes(0), &k1[..], "{name}: retraction keys on the full PK");
@@ -90,21 +90,21 @@ fn enforce_unique_pk_holds_at_every_pk_shape() {
         assert!(pt.has_pk_bytes(&k1), "{name}: row live after the upsert");
 
         // Delete pushed at weight -3 nets the store to exactly zero.
-        let eff = enforce_unique_pk(&pt, &schema, row(&k1, -3, 200));
+        let eff = enforce_unique_pk(&pt, row(&k1, -3, 200));
         assert_eq!(eff.count, 1, "{name}: one net retraction row");
         assert_eq!(eff.get_weight(0), -1, "{name}: retraction weight normalized to -1");
         pt.ingest_owned_batch(eff).unwrap();
         assert!(!pt.has_pk_bytes(&k1), "{name}: row fully gone after the delete");
 
         // Retracting the now-tombstoned key, and an absent one, emit nothing.
-        let eff = enforce_unique_pk(&pt, &schema, row(&k1, -1, 0));
+        let eff = enforce_unique_pk(&pt, row(&k1, -1, 0));
         assert_eq!(eff.count, 0, "{name}: tombstoned-key retraction emits no phantom");
-        let eff = enforce_unique_pk(&pt, &schema, row(&k2, -1, 0));
+        let eff = enforce_unique_pk(&pt, row(&k2, -1, 0));
         assert_eq!(eff.count, 0, "{name}: absent-key retraction emits no phantom");
 
         // Intra-batch +1, -1, +1 on a fresh key nets to one live row.
         let churn = make_batch_opk(&schema, &[(&k2, 1, 10), (&k2, -1, 10), (&k2, 1, 20)]);
-        let eff = enforce_unique_pk(&pt, &schema, churn);
+        let eff = enforce_unique_pk(&pt, churn);
         pt.ingest_owned_batch(eff).unwrap();
         assert!(pt.has_pk_bytes(&k2), "{name}: key survives +1,-1,+1 at net +1");
     }
@@ -134,12 +134,12 @@ fn enforce_unique_pk_lazy_build_matches_the_row_by_row_oracle() {
     // A store holding exactly one row, at k0.
     let dir = tempfile::tempdir().unwrap();
     let mut pt = scratch_table(dir.path().to_str().unwrap(), schema);
-    let seed = enforce_unique_pk(&pt, &schema, make_batch_opk(&schema, &[(&key(0), 1, 700)]));
+    let seed = enforce_unique_pk(&pt, make_batch_opk(&schema, &[(&key(0), 1, 700)]));
     pt.ingest_owned_batch(seed).unwrap();
 
     // No divergence: three fresh keys pass through in arrival order, unchanged.
     let fresh = make_batch_opk(&schema, &[(&key(10), 1, 1), (&key(11), 1, 2), (&key(12), 1, 3)]);
-    let eff = enforce_unique_pk(&pt, &schema, fresh);
+    let eff = enforce_unique_pk(&pt, fresh);
     assert_eq!(
         oracle(&eff),
         vec![(key(10), 1, 1), (key(11), 1, 2), (key(12), 1, 3)],
@@ -149,7 +149,7 @@ fn enforce_unique_pk_lazy_build_matches_the_row_by_row_oracle() {
     // First divergence in the middle: row 1 hits the stored row, so its
     // retraction lands between the two verbatim runs.
     let mid = make_batch_opk(&schema, &[(&key(20), 1, 1), (&key(0), 1, 2), (&key(21), 1, 3)]);
-    let eff = enforce_unique_pk(&pt, &schema, mid);
+    let eff = enforce_unique_pk(&pt, mid);
     assert_eq!(
         oracle(&eff),
         vec![(key(20), 1, 1), (key(0), -1, 700), (key(0), 1, 2), (key(21), 1, 3)],
@@ -158,7 +158,7 @@ fn enforce_unique_pk_lazy_build_matches_the_row_by_row_oracle() {
 
     // First divergence at row 0, with the run resuming behind it.
     let head = make_batch_opk(&schema, &[(&key(0), 1, 5), (&key(30), 1, 6)]);
-    let eff = enforce_unique_pk(&pt, &schema, head);
+    let eff = enforce_unique_pk(&pt, head);
     assert_eq!(
         oracle(&eff),
         vec![(key(0), -1, 700), (key(0), 1, 5), (key(30), 1, 6)],
@@ -170,7 +170,7 @@ fn enforce_unique_pk_lazy_build_matches_the_row_by_row_oracle() {
     // cut the run even though it emits no retraction. Returning it verbatim would
     // store a negative-weight base-table row.
     let phantom = make_batch_opk(&schema, &[(&key(40), 1, 1), (&key(99), -1, 0), (&key(41), 1, 2)]);
-    let eff = enforce_unique_pk(&pt, &schema, phantom);
+    let eff = enforce_unique_pk(&pt, phantom);
     assert_eq!(
         oracle(&eff),
         vec![(key(40), 1, 1), (key(41), 1, 2)],

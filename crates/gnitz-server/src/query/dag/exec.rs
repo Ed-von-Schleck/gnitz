@@ -36,8 +36,9 @@ struct Relay {
 impl Relay {
     /// The relay of `view_id`'s epoch over `src_id`'s delta.
     fn new(registry: &RelationRegistry, view_id: i64, src_id: i64, elide: bool) -> Relay {
-        let muted = registry.slot().rank != Placement::REPLICA_OWNER
-            && registry.relation(src_id).is_some_and(Relation::is_replicated);
+        let muted = registry
+            .relation(src_id)
+            .is_some_and(|r| !r.schema().placement().counts_on(registry.slot().rank));
         Relay { view_id, elide, muted }
     }
 

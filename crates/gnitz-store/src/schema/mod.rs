@@ -302,6 +302,13 @@ impl Placement {
     /// alone captures a replicated view's delta feed, and it answers reads.
     pub const REPLICA_OWNER: u32 = 0;
 
+    /// True iff worker `rank`'s copy is a counted one: every worker's for a
+    /// partitioned relation, [`Self::REPLICA_OWNER`]'s alone for a replicated one.
+    #[inline]
+    pub const fn counts_on(self, rank: u32) -> bool {
+        !self.is_replicated() || rank == Self::REPLICA_OWNER
+    }
+
     /// True iff a row's owning worker is derived from its key. A relation that
     /// is not key-routed still holds one store per worker; what differs is which
     /// rows arrive there — a broadcast copy (`Replicated`) or whatever that

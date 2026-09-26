@@ -45,7 +45,7 @@ impl CircuitState {
         let view = reg.relation_or_err(view_id)?;
         // The output store's policy, not the registry's current one: the traces
         // must resume from the generation the output they feed resumed from.
-        let recovery = view.store().recovery_source();
+        let recovery = view.store().held().recovery_source();
         let tables = layout
             .children
             .into_iter()
@@ -73,11 +73,8 @@ impl CircuitState {
 
     /// A cursor over `idx` ranged to the PKs of `keys`, for probing at them.
     pub fn cursor_for_keys(&self, idx: StateIdx, keys: &Batch) -> ReadCursor {
-        debug_assert!(keys.is_consolidated());
-        match keys.count {
-            0 => self.cursor(idx),
-            n => self.cursor_in_range(idx, keys.get_pk_bytes(0), Some(keys.get_pk_bytes(n - 1))),
-        }
+        debug_assert!(keys.is_consolidated() && keys.count > 0);
+        self.cursor_in_range(idx, keys.get_pk_bytes(0), Some(keys.get_pk_bytes(keys.count - 1)))
     }
 
     pub fn ingest_owned(&mut self, idx: StateIdx, batch: Batch) -> Result<(), StorageError> {

@@ -29,8 +29,7 @@ impl SkeletonHydrator for DagEngine {
                     .relation_or_err(source)
                     .map_err(|e| e.in_context(&format!("hydrate: view {view_id} source")))?;
                 // The view last saw the source at its last tick.
-                let rewind = unticked.get(&source).map(|d| entry.rewind(d)).unwrap_or_default();
-                PkSetGather::open(keys, seed_schema, |s, e| entry.cursor_in_range_rewound(s, e, &rewind))
+                entry.gather(keys, unticked.get(&source))
             }
             HydrationSeed::Trace(seed_table) => {
                 let state = &*state;

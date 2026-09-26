@@ -56,7 +56,8 @@ fn cut<'a>(
 /// which is bulk-copied; a push of fresh keys cuts nothing and comes back as it
 /// arrived. Arrival order survives either way — sorting first would turn
 /// intra-batch last-insert-wins into sorted-last-wins.
-pub(crate) fn enforce_unique_pk(store: &Table, schema: &SchemaDescriptor, mut batch: Batch) -> Batch {
+pub(crate) fn enforce_unique_pk(store: &Table, mut batch: Batch) -> Batch {
+    let schema = store.schema();
     // Empty-batch guard: nothing above filters `count == 0` before the PK rule.
     if batch.count == 0 {
         return batch;
@@ -126,9 +127,8 @@ pub(crate) fn enforce_unique_pk(store: &Table, schema: &SchemaDescriptor, mut ba
 
     match effective {
         None => {
-            // Nothing diverged, so the input *is* the effective batch. It still
-            // needs the caller's descriptor: `effective` would have been built
-            // with it, and it may be newer than the store's.
+            // Nothing diverged, so the input *is* the effective batch. It takes
+            // the store's descriptor, which `effective` would have been built with.
             batch.set_schema(schema);
             batch
         }

@@ -720,9 +720,7 @@ fn build(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor, cap: usi
     ReadCursor::new(sources, states, schema, position)
 }
 
-/// A cursor over nothing, in `schema`'s shape — what a relation this process
-/// holds no store for reads as, so a detached handle answers every read the way
-/// a store holding none of the requested rows does.
+/// A cursor over nothing, in `schema`'s shape.
 pub(crate) fn empty(schema: SchemaDescriptor) -> ReadCursor {
     from_runs(std::iter::empty(), schema, 0)
 }
