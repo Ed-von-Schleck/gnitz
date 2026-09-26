@@ -13,38 +13,34 @@ use crate::schema::SchemaDescriptor;
 use gnitz_wire::{read_i64_le, read_signed_exact, read_unsigned_exact, write_u64_le, FixedInt};
 use xorf::BinaryFuse8;
 
-/// Region `i`'s on-disk encoding and image. `blob` is the blob region's index;
-/// `pack_ints` admits FoR on fixed-int payload regions.
+/// Fixed-width region `i`'s on-disk encoding and image. `pack_ints` admits FoR
+/// on fixed-int payload regions.
 fn encode_region<'a>(
     schema: &SchemaDescriptor,
     i: usize,
     src: &'a [u8],
     n: usize,
-    blob: usize,
     pack_ints: bool,
-) -> (u8, Cow<'a, [u8]>) {
-    if i == blob {
-        return (ENCODING_RAW, Cow::Borrowed(src));
-    }
+) -> (Encoding, Cow<'a, [u8]>) {
     let width = src.len() / n;
     // Every element equals the next exactly when the region equals itself
     // shifted by one element: one `bcmp` for the whole region.
     if src[width..] == src[..src.len() - width] {
-        return (ENCODING_CONSTANT, Cow::Borrowed(&src[..width]));
+        return (Encoding::Constant, Cow::Borrowed(&src[..width]));
     }
     let packed = if i == REG_WEIGHT {
-        two_value_image(src).map(|image| (ENCODING_TWO_VALUE, image))
+        two_value_image(src).map(|image| (Encoding::TwoValue, image))
     } else if pack_ints && i >= REG_PAYLOAD_START {
         let col = &schema.columns[schema.payload_col_idx(i - REG_PAYLOAD_START)];
         col.fixed_int()
             .and_then(|fi| for_image(src, fi))
-            .map(|image| (ENCODING_FOR, image))
+            .map(|image| (Encoding::For, image))
     } else {
         None
     };
     match packed {
         Some((encoding, image)) => (encoding, Cow::Owned(image)),
-        None => (ENCODING_RAW, Cow::Borrowed(src)),
+        None => (Encoding::Raw, Cow::Borrowed(src)),
     }
 }
 
@@ -81,11 +77,6 @@ fn two_value_image(src: &[u8]) -> Option<Vec<u8>> {
     second.map(|(_, image)| image)
 }
 
-// Frame-of-reference + byte-width truncation (`ENCODING_FOR`): re-keyed ex-PK
-// columns and other narrow-range integers dominate compacted view payloads, so
-// framing on the region min and truncating offsets to whole bytes shrinks them
-// severalfold while keeping decode an add per row.
-
 /// The FoR image of a fixed-int region, or `None` when it would not shrink the
 /// 64-byte-aligned footprint. Dispatches once on the column type, so both scans
 /// run at a constant cell width and signedness.
@@ -103,8 +94,8 @@ fn for_image(src: &[u8], fi: FixedInt) -> Option<Vec<u8>> {
 }
 
 /// Frame on the typed minimum; each row's offset is written as a full 8-byte
-/// store at its `bw`-strided position — the next row overwrites the excess and
-/// the slack absorbs the last row's — then truncated.
+/// store at its `bw`-strided position — the next row overwrites the excess, and
+/// the image's zero slack holds the last row's.
 fn for_image_of<const W: usize, const SIGNED: bool>(src: &[u8]) -> Option<Vec<u8>> {
     let cells = src.as_chunks::<W>().0;
     let widen = |cell: &[u8; W]| {
@@ -129,16 +120,14 @@ fn for_image_of<const W: usize, const SIGNED: bool>(src: &[u8]) -> Option<Vec<u8
     let n = cells.len();
     // A raw-byte win that vanishes after alignment saves no disk and still costs
     // a decode. Implies `bw < W`.
-    if bw == 0 || for_image_len(n, bw).next_multiple_of(ALIGNMENT) >= src.len().next_multiple_of(ALIGNMENT) {
+    if bw == 0 || region_start(for_image_len(n, bw)) >= region_start(src.len()) {
         return None;
     }
-    let mut image = vec![0u8; for_image_len(n, bw) + (8 - bw)];
+    let mut image = vec![0u8; for_image_len(n, bw)];
     write_u64_le(&mut image, 0, reference);
     for (row, cell) in cells.iter().enumerate() {
-        let at = FOR_HEADER + row * bw;
-        write_u64_le(&mut image, at, widen(cell).wrapping_sub(reference));
+        write_u64_le(&mut image, for_cell_at(row, bw), widen(cell).wrapping_sub(reference));
     }
-    image.truncate(for_image_len(n, bw));
     Some(image)
 }
 
@@ -146,9 +135,9 @@ fn for_image_of<const W: usize, const SIGNED: bool>(src: &[u8]) -> Option<Vec<u8
 /// shard-format assertions here and in the compaction / shard-reader test
 /// modules. The entry shape itself lives in `layout`.
 #[cfg(test)]
-pub(crate) fn region_dir(image: &[u8], i: usize) -> (usize, u8) {
+pub(crate) fn region_dir(image: &[u8], i: usize) -> (usize, Encoding) {
     let e = DirEntry::read(image, i);
-    (e.size, e.encoding)
+    (e.size, Encoding::from_byte(e.encoding).unwrap())
 }
 
 fn build_shard_filter_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<BinaryFuse8> {
@@ -258,7 +247,6 @@ impl Batch {
         assert!(n > 0, "every writer skips an empty output");
         let mut regions = gnitz_wire::Regions::new();
         self.wire_regions(&mut regions);
-        let num_regions = regions.len();
         let npc = schema.num_payload_cols();
         #[cfg(debug_assertions)]
         self.debug_verify_consolidated(schema);
@@ -271,38 +259,42 @@ impl Batch {
             .then(|| build_shard_filter_from_pk_region(regions[REG_PK], schema.pk_stride()))
             .flatten()
             .map(|f| shard_filter::serialize(&f));
-        let images = regions
+        // Blob and filter are Raw; every other region is fixed-width.
+        let (blob, fixed) = regions.split_last().unwrap();
+        let images = fixed
             .iter()
             .enumerate()
-            .map(|(i, &src)| encode_region(schema, i, src, n, num_regions - 1, opts.pack_ints))
-            .chain(std::iter::once((
-                ENCODING_RAW,
-                Cow::Borrowed(filter.as_deref().unwrap_or(&[])),
-            )));
+            .map(|(i, &src)| encode_region(schema, i, src, n, opts.pack_ints))
+            .chain([
+                (Encoding::Raw, Cow::Borrowed(*blob)),
+                (Encoding::Raw, Cow::Borrowed(filter.as_deref().unwrap_or(&[]))),
+            ]);
 
+        static PAD: [u8; ALIGNMENT] = [0; ALIGNMENT];
         let (staged, file) = StagedFile::create(path)?;
         let mut header = vec![0u8; desc_len(npc)];
         let mut body = gnitz_wire::RowHasher::default();
         let mut end = header.len();
         for (i, (encoding, image)) in images.enumerate() {
-            let offset = region_start(end);
-            body.update(&image);
-            file.write_all_at(&image, offset as u64)?;
-            DirEntry { size: image.len(), encoding }.write(&mut header, i);
-            end = offset + image.len();
+            for bytes in [&PAD[..region_start(end) - end], &image] {
+                body.update(bytes);
+                file.write_all_at(bytes, end as u64)?;
+                end += bytes.len();
+            }
+            DirEntry {
+                size: image.len(),
+                encoding: encoding as u8,
+            }
+            .write(&mut header, i);
         }
-        file.set_len(end as u64)?;
 
-        write_u64_le(&mut header, OFF_MAGIC, SHARD_MAGIC);
-        write_u64_le(&mut header, OFF_VERSION, SHARD_VERSION);
-        write_u64_le(&mut header, OFF_ROW_COUNT, n as u64);
-        write_u64_le(&mut header, OFF_FILE_NPC, npc as u64);
-        write_u64_le(
-            &mut header,
-            OFF_FLAGS,
-            if opts.skeleton { SHARD_FLAG_SKELETON } else { 0 },
-        );
-        write_u64_le(&mut header, OFF_BODY_CHECKSUM, body.digest());
+        ShardHeader {
+            row_count: n,
+            file_npc: npc,
+            skeleton: opts.skeleton,
+            body_checksum: body.digest(),
+        }
+        .write(&mut header);
         let desc = desc_digest(path, &header);
         write_u64_le(&mut header, OFF_DESC_CHECKSUM, desc);
         file.write_all_at(&header, 0)?;

@@ -2,7 +2,7 @@
 //! the OPK binary searches — plus the bulk `*_owned_batch` materializers.
 
 use super::super::batch::{write_to_batch, Batch, Layout, FIXED_REGION_BYTES};
-use super::super::layout::{for_image_len, two_value_bit};
+use super::super::layout::two_value_bit;
 use super::super::merge::ColumnarSource;
 use super::super::merge::{prorated_blob_cap, should_relocate_blob, ColPtr, UnifiedSource};
 use super::{MappedShard, PackedRegion, PayloadRegion, WeightRegion};
@@ -27,9 +27,10 @@ impl MappedShard {
         region.decoded.get_or_init(|| {
             let mut out = vec![0u8; self.count * region.elem_width].into_boxed_slice();
             super::decode_for_region(
-                &self.data()[region.offset..][..for_image_len(self.count, region.bw)],
+                &self.data()[region.image.clone()],
                 region.bw,
                 region.elem_width,
+                0,
                 &mut out,
             );
             out
@@ -168,7 +169,25 @@ impl MappedShard {
                 }
             }
             for (pi, col) in schema.payload_columns() {
-                let cp = self.payload_col(pi);
+                let cp = match &self.col_regions[pi] {
+                    PayloadRegion::Mapped(cp) => *cp,
+                    PayloadRegion::Packed(p) => match p.decoded.get() {
+                        Some(decoded) => ColPtr {
+                            base: decoded.as_ptr(),
+                            stride: p.elem_width,
+                        },
+                        None => {
+                            super::decode_for_region(
+                                &self.data()[p.image.clone()],
+                                p.bw,
+                                p.elem_width,
+                                start,
+                                w.col_bufs[pi],
+                            );
+                            continue;
+                        }
+                    },
+                };
                 if relocate && col.type_code.is_german_string() {
                     for i in 0..row_count {
                         w.write_string_cell(pi, unsafe { cp.row(start + i, 16) }, self.blob(), i);

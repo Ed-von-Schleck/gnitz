@@ -132,7 +132,7 @@ pub(super) fn merge_and_route(
         if folded.is_some() {
             // The fused pass copied the *source's* payload null bits, which mean
             // nothing without a payload. Zeroing collapses the region to
-            // `ENCODING_CONSTANT` — 8 bytes for the whole file.
+            // `Encoding::Constant` — 8 bytes for the whole file.
             batch.null_bmp_data_mut().fill(0);
         }
         emit(dest, batch)?;

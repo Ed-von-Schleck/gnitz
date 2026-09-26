@@ -2,18 +2,18 @@
 //! decide how the rest of a shard is read.
 
 use super::super::error::StorageError;
+use gnitz_wire::{read_u64_le, write_u64_le};
+
+use StorageError::Corrupt;
 
 pub(crate) const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
-/// Bumped by hand for a header/region layout change.
-pub(crate) const SHARD_EPOCH: u64 = 20;
+/// Bumped by hand for any change to the bytes a writer produces;
+/// `shard_bytes_are_pinned` fails until it is.
+pub(crate) const SHARD_EPOCH: u64 = 21;
 
-/// Shard file format version, written into the header and compared for equality
-/// at open. A shard records only its payload-column count (`OFF_FILE_NPC`) and
-/// sizes every region from the live `SchemaDescriptor`, so a system-family shape
-/// change reinterprets an existing file rather than failing to parse it — hence
-/// the digest. Compared, never parsed, so any mixing function does.
+/// Compared for equality at open. A shard sizes its regions from the live
+/// schema, so a system-table shape change must refuse the file, not reinterpret it.
 pub(crate) const SHARD_VERSION: u64 = SHARD_EPOCH ^ gnitz_wire::SYS_SCHEMA_DIGEST;
-pub(crate) const HEADER_SIZE: usize = 56;
 pub(crate) const DIR_ENTRY_SIZE: usize = 16;
 pub(crate) const ALIGNMENT: usize = 64;
 
@@ -26,22 +26,61 @@ pub(crate) const OFF_DESC_CHECKSUM: usize = 24;
 pub(crate) const OFF_FILE_NPC: usize = 32;
 /// Flag bits (u64 LE); see [`SHARD_FLAG_SKELETON`].
 pub(crate) const OFF_FLAGS: usize = 40;
-/// XXH3-64 over every region image, in directory order.
+/// XXH3-64 over every byte after the descriptive prefix, alignment padding
+/// included.
 pub(crate) const OFF_BODY_CHECKSUM: usize = 48;
+pub(crate) const HEADER_SIZE: usize = OFF_BODY_CHECKSUM + 8;
 
 /// [`OFF_FLAGS`] bit: a capacity-bounded view's skeleton shard, one (PK, coarse
 /// weight) row per key.
 pub(crate) const SHARD_FLAG_SKELETON: u64 = 1;
 
-/// The shard filter's region is `[descriptor: DMA_LEN][fingerprints]`, split at
-/// a constant rather than at a framed length — so the dependency's descriptor
-/// width is part of the on-disk format, and a change to it would reinterpret
-/// every fingerprint byte of every existing shard. It has to fail the build
-/// instead: bump `SHARD_EPOCH` and paste the new width here.
-const _: () = assert!(
-    xorf::Descriptor::DMA_LEN == 20,
-    "BinaryFuse8 descriptor width changed: bump SHARD_EPOCH",
-);
+/// The header fields a reader acts on; [`read`](Self::read) checks magic and
+/// version.
+pub(crate) struct ShardHeader {
+    pub row_count: usize,
+    pub file_npc: usize,
+    pub skeleton: bool,
+    pub body_checksum: u64,
+}
+
+impl ShardHeader {
+    pub(crate) fn read(data: &[u8]) -> Result<Self, StorageError> {
+        if data.len() < HEADER_SIZE {
+            return Err(Corrupt("shorter than the header"));
+        }
+        if read_u64_le(data, OFF_MAGIC) != SHARD_MAGIC {
+            return Err(Corrupt("magic"));
+        }
+        if read_u64_le(data, OFF_VERSION) != SHARD_VERSION {
+            return Err(Corrupt("version"));
+        }
+        let file_npc = usize::try_from(read_u64_le(data, OFF_FILE_NPC))
+            .ok()
+            .filter(|&n| n <= gnitz_wire::MAX_COLUMNS)
+            .ok_or(Corrupt("payload arity"))?;
+        let row_count = match read_u64_le(data, OFF_ROW_COUNT) {
+            0 => return Err(Corrupt("no rows")),
+            n => n as usize,
+        };
+        Ok(ShardHeader {
+            row_count,
+            file_npc,
+            skeleton: read_u64_le(data, OFF_FLAGS) & SHARD_FLAG_SKELETON != 0,
+            body_checksum: read_u64_le(data, OFF_BODY_CHECKSUM),
+        })
+    }
+
+    /// Every field but the descriptor digest, which is stamped over the result.
+    pub(crate) fn write(&self, header: &mut [u8]) {
+        write_u64_le(header, OFF_MAGIC, SHARD_MAGIC);
+        write_u64_le(header, OFF_VERSION, SHARD_VERSION);
+        write_u64_le(header, OFF_ROW_COUNT, self.row_count as u64);
+        write_u64_le(header, OFF_FILE_NPC, self.file_npc as u64);
+        write_u64_le(header, OFF_FLAGS, if self.skeleton { SHARD_FLAG_SKELETON } else { 0 });
+        write_u64_le(header, OFF_BODY_CHECKSUM, self.body_checksum);
+    }
+}
 
 /// Byte offset of directory entry `i`. The directory follows the header
 /// immediately, so an entry's position is implied by its index — the file
@@ -60,14 +99,14 @@ impl DirEntry {
     pub(crate) fn read(image: &[u8], i: usize) -> Self {
         let d = dir_entry_off(i);
         DirEntry {
-            size: gnitz_wire::read_u64_le(image, d) as usize,
+            size: read_u64_le(image, d) as usize,
             encoding: image[d + 8],
         }
     }
 
     pub(crate) fn write(&self, image: &mut [u8], i: usize) {
         let d = dir_entry_off(i);
-        gnitz_wire::write_u64_le(image, d, self.size as u64);
+        write_u64_le(image, d, self.size as u64);
         image[d + 8] = self.encoding;
     }
 }
@@ -81,7 +120,7 @@ pub(crate) const fn region_start(end: usize) -> usize {
 pub(crate) struct Span {
     pub off: usize,
     pub size: usize,
-    pub encoding: u8,
+    pub encoding: Encoding,
 }
 
 impl Span {
@@ -95,29 +134,26 @@ impl Span {
 pub(crate) fn region_spans(image: &[u8], file_npc: usize) -> Result<Vec<Span>, StorageError> {
     let file_size = image.len();
     let mut end = desc_len(file_npc);
-    if end > file_size {
-        return Err(StorageError::Corrupt("shorter than its directory"));
-    }
     let spans = (0..=gnitz_wire::num_regions(file_npc))
         .map(|i| {
             let DirEntry { size, encoding } = DirEntry::read(image, i);
+            let encoding = Encoding::from_byte(encoding).ok_or(Corrupt("encoding"))?;
             let off = region_start(end);
             if off > file_size || size > file_size - off {
-                return Err(StorageError::Corrupt("region past the end"));
+                return Err(Corrupt("region past the end"));
             }
             end = off + size;
             Ok(Span { off, size, encoding })
         })
         .collect::<Result<Vec<_>, _>>()?;
     if end != file_size {
-        return Err(StorageError::Corrupt("directory does not span the file"));
+        return Err(Corrupt("directory does not span the file"));
     }
     Ok(spans)
 }
 
 /// A `TwoValue` region's image: `value_a` LE ‖ `value_b` LE ‖ a `count`-bit
-/// vector, bit *i* set ⇔ row *i* holds `value_b`. Encoder, open-time size check
-/// and both read paths state the geometry only through these three.
+/// vector, bit *i* set ⇔ row *i* holds `value_b`.
 pub(crate) const TWO_VALUE_HEADER: usize = 16;
 
 pub(crate) const fn two_value_image_len(count: usize) -> usize {
@@ -136,19 +172,25 @@ pub(crate) fn two_value_set_bit(bitvec: &mut [u8], row: usize) {
     bitvec[row / 8] |= 1 << (row % 8);
 }
 
-/// A FoR region's image: an 8-byte frame reference ‖ each row's offset from it in
-/// its low `bw` bytes, tightly packed. Encoder, open-time check and decoder state
-/// the geometry only through these three.
+/// A FoR region's image: an 8-byte frame reference (the region min's bit
+/// pattern) ‖ each row's `value − ref` in its low `bw` bytes, tightly packed ‖
+/// zero slack, so every row's offset is one unaligned 8-byte load.
 pub(crate) const FOR_HEADER: usize = 8;
+const FOR_SLACK: usize = size_of::<u64>() - 1;
+
+/// Where `row`'s offset starts in a FoR image.
+pub(crate) const fn for_cell_at(row: usize, bw: usize) -> usize {
+    FOR_HEADER + row * bw
+}
 
 pub(crate) const fn for_image_len(count: usize, bw: usize) -> usize {
-    FOR_HEADER + count * bw
+    for_cell_at(count, bw) + FOR_SLACK
 }
 
 /// The offset width an image of `size` bytes holds for `count ≥ 1` rows, or
 /// `None` unless some `bw` in `1..elem_width` gives exactly that size.
 pub(crate) fn for_image_bw(size: usize, count: usize, elem_width: usize) -> Option<usize> {
-    let bw = size.checked_sub(FOR_HEADER)? / count;
+    let bw = size.checked_sub(FOR_HEADER + FOR_SLACK)? / count;
     ((1..elem_width).contains(&bw) && size == for_image_len(count, bw)).then_some(bw)
 }
 
@@ -158,35 +200,35 @@ pub(crate) const fn desc_len(file_npc: usize) -> usize {
 }
 
 /// XXH3-64 over a shard's descriptive prefix (header + directory), its own eight
-/// bytes excluded, seeded with the shard's basename.
-///
-/// The seed binds a prefix to the name it was written under, so a prefix that
-/// arrives from elsewhere — a rename, or a misdirected write carrying a
-/// same-shaped neighbour's first sector — fails to validate. It separates names,
-/// not directories: the naming grammar has no directory component, so a spill
-/// name repeats across sibling partition directories and seeds identically.
+/// bytes excluded, seeded with the shard's basename so a prefix written under
+/// another name fails to validate.
 pub(crate) fn desc_digest(path: &str, prefix: &[u8]) -> u64 {
-    gnitz_wire::digest_with_hole(shard_basename(path.as_bytes()), prefix, OFF_DESC_CHECKSUM)
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    gnitz_wire::digest_with_hole(basename.as_bytes(), prefix, OFF_DESC_CHECKSUM)
 }
 
-/// A shard's manifest identity: the last component of its path. Every writer and
-/// the reader hold a full path; the manifest identity and the digest seed are
-/// its last component, so the name the manifest records is the name the digest
-/// is seeded with.
-pub(crate) fn shard_basename(path: &[u8]) -> &[u8] {
-    match path.iter().rposition(|&c| c == b'/') {
-        Some(i) => &path[i + 1..],
-        None => path,
+/// A directory entry's encoding byte.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub(crate) enum Encoding {
+    Raw = 0,
+    /// One element, read at stride 0.
+    Constant = 1,
+    /// A weight region; image described at [`TWO_VALUE_HEADER`].
+    TwoValue = 2,
+    /// Frame-of-reference: a payload column of a 2-, 4- or 8-byte integer type;
+    /// image described at [`FOR_HEADER`].
+    For = 3,
+}
+
+impl Encoding {
+    pub(crate) fn from_byte(b: u8) -> Option<Self> {
+        Some(match b {
+            0 => Encoding::Raw,
+            1 => Encoding::Constant,
+            2 => Encoding::TwoValue,
+            3 => Encoding::For,
+            _ => return None,
+        })
     }
 }
-
-pub(crate) const ENCODING_RAW: u8 = 0x00;
-pub(crate) const ENCODING_CONSTANT: u8 = 0x01;
-pub(crate) const ENCODING_TWO_VALUE: u8 = 0x02;
-/// Frame-of-reference + byte-width truncation for an integer payload region:
-/// an 8-byte frame reference (the region min's bit pattern) followed by each
-/// row's `value − ref` truncated to the fewest whole bytes (`bw`) that hold the
-/// region's offset range. Legal only on payload column directory entries, only
-/// where the writer packs integers (`ShardWriteOpts::pack_ints`), only on a
-/// ≤8-byte integer column.
-pub(crate) const ENCODING_FOR: u8 = 0x03;

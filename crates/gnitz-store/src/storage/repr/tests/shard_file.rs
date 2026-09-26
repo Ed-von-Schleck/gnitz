@@ -4,7 +4,6 @@ use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::make_schema_u64_i64;
 use gnitz_expr::RowSource;
-use gnitz_wire::read_u64_le;
 use xorf::Filter;
 
 /// `(opk, weight, null_word, payload)` rows over a U64 PK.
@@ -39,11 +38,11 @@ fn write_open_roundtrip() {
     write_i64_shard(&shard_path, &schema, &rows, &[], ShardWriteOpts::default());
 
     let image = std::fs::read(&path).unwrap();
-    assert_eq!(read_u64_le(&image, OFF_ROW_COUNT), n as u64);
+    assert_eq!(ShardHeader::read(&image).unwrap().row_count, n);
     // The filter is the trailing directory entry.
     let (filter_size, filter_encoding) = region_dir(&image, gnitz_wire::num_regions(1));
     assert!(filter_size > 0);
-    assert_eq!(filter_encoding, ENCODING_RAW);
+    assert_eq!(filter_encoding, Encoding::Raw);
 
     // `open` itself rejects a bad magic or version, so a successful open is
     // what pins those; the rest is the row data.
@@ -136,16 +135,16 @@ fn encoding_selection_pins_all_roles() {
         &[vec![42; n_a], (0..n_a as i64).collect()],
     );
     let img_a = write_and_read(&schema_a, &rows_a, &blob_a, "pin_a.db");
-    assert_eq!(region_dir(&img_a, 0), (8, ENCODING_CONSTANT), "A pk constant");
-    assert_eq!(region_dir(&img_a, 1), (8, ENCODING_CONSTANT), "A weight constant");
-    assert_eq!(region_dir(&img_a, 2), (8, ENCODING_CONSTANT), "A null constant");
-    assert_eq!(region_dir(&img_a, 3), (8, ENCODING_CONSTANT), "A payload constant");
+    assert_eq!(region_dir(&img_a, 0), (8, Encoding::Constant), "A pk constant");
+    assert_eq!(region_dir(&img_a, 1), (8, Encoding::Constant), "A weight constant");
+    assert_eq!(region_dir(&img_a, 2), (8, Encoding::Constant), "A null constant");
+    assert_eq!(region_dir(&img_a, 3), (8, Encoding::Constant), "A payload constant");
     assert_eq!(
         region_dir(&img_a, 4),
-        (n_a * 8, ENCODING_RAW),
+        (n_a * 8, Encoding::Raw),
         "A payload varying → raw"
     );
-    assert_eq!(region_dir(&img_a, 5), (blob_a.len(), ENCODING_RAW), "A blob raw");
+    assert_eq!(region_dir(&img_a, 5), (blob_a.len(), Encoding::Raw), "A blob raw");
 
     // --- Shard B (TwoValue weight, Raw nulls): distinct PKs, alternating
     // 1/-1 weights, a nullable column NULL on a subset so the null_bmp holds
@@ -165,13 +164,13 @@ fn encoding_selection_pins_all_roles() {
         &[vec![10, 20, 30, 40]],
     );
     let img_b = write_and_read(&schema_b, &rows_b, &[], "pin_b.db");
-    assert_eq!(region_dir(&img_b, 0), (n_b * 8, ENCODING_RAW), "B pk distinct → raw");
+    assert_eq!(region_dir(&img_b, 0), (n_b * 8, Encoding::Raw), "B pk distinct → raw");
     assert_eq!(
         region_dir(&img_b, 1),
-        (two_value_image_len(n_b), ENCODING_TWO_VALUE),
+        (two_value_image_len(n_b), Encoding::TwoValue),
         "B weight two-value"
     );
-    assert_eq!(region_dir(&img_b, 2), (n_b * 8, ENCODING_RAW), "B null mixed → raw");
+    assert_eq!(region_dir(&img_b, 2), (n_b * 8, Encoding::Raw), "B null mixed → raw");
 
     // --- Shard C (Raw weight): ≥3 distinct weight values. ---
     let schema_c = SchemaDescriptor::new(
@@ -186,8 +185,65 @@ fn encoding_selection_pins_all_roles() {
     let img_c = write_and_read(&schema_c, &rows_c, &[], "pin_c.db");
     assert_eq!(
         region_dir(&img_c, 1),
-        (n_c * 8, ENCODING_RAW),
+        (n_c * 8, Encoding::Raw),
         "C weight ≥3 distinct → raw"
+    );
+}
+
+/// Any change to the written bytes, the writer's own or a dependency's, needs a
+/// `SHARD_EPOCH` bump.
+#[test]
+fn shard_bytes_are_pinned() {
+    const PINNED: (u64, u64) = (21, 14026387432709276183);
+    let n = 64usize;
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false), // narrow range → FoR
+            SchemaColumn::new(TypeCode::I64, false), // full range → Raw
+        ],
+        &[0],
+    );
+    let rows = u64_rows(
+        &(0..n as u64).map(|i| i * 3 + 1).collect::<Vec<_>>(),
+        &(0..n).map(|i| 1 + (i % 2) as i64).collect::<Vec<_>>(),
+        &vec![0; n],
+        &[
+            (0..n as i64).map(|i| 1_000_000 + i * 3).collect(),
+            (0..n as i64)
+                .map(|i| i.wrapping_mul(0x0123_4567_89AB_CDEF) ^ (i << 60))
+                .collect(),
+        ],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("golden.db");
+    write_i64_shard(
+        path.to_str().unwrap(),
+        &schema,
+        &rows,
+        b"heap",
+        ShardWriteOpts::COMPACTION,
+    );
+    let mut bytes = std::fs::read(&path).unwrap();
+
+    let encodings: Vec<Encoding> = (0..=gnitz_wire::num_regions(2))
+        .map(|i| region_dir(&bytes, i).1)
+        .collect();
+    use Encoding::*;
+    assert_eq!(
+        encodings,
+        [Raw, TwoValue, Constant, For, Raw, Raw, Raw],
+        "the batch covers every encoding"
+    );
+    assert!(region_dir(&bytes, gnitz_wire::num_regions(2)).0 > 0, "and a PK filter");
+
+    // Both vary with things other than the writer: the system schema, the path.
+    write_u64_le(&mut bytes, OFF_VERSION, 0);
+    write_u64_le(&mut bytes, OFF_DESC_CHECKSUM, 0);
+    assert_eq!(
+        (SHARD_EPOCH, gnitz_wire::checksum(&bytes)),
+        PINNED,
+        "shard bytes changed: bump SHARD_EPOCH and re-pin"
     );
 }
 
@@ -237,8 +293,18 @@ mod for_codec_tests {
         let image = for_image(&raw, fi)?;
         let bw = for_image_bw(image.len(), n, fi.width()).expect("the encoder's image has FoR geometry");
         let mut decoded = vec![0u8; n * fi.width()];
-        decode_for_region(&image, bw, fi.width(), &mut decoded);
+        decode_for_region(&image, bw, fi.width(), 0, &mut decoded);
         assert_eq!(decoded, raw, "byte-exact roundtrip (bw={bw}, {fi:?})");
+        if n >= 10 {
+            let w = fi.width();
+            let mut window = vec![0u8; 7 * w];
+            decode_for_region(&image, bw, w, 3, &mut window);
+            assert_eq!(
+                window,
+                raw[3 * w..10 * w],
+                "rows [3, 10) decode alone (bw={bw}, {fi:?})"
+            );
+        }
         Some(bw)
     }
 
@@ -388,7 +454,7 @@ mod for_codec_tests {
         let start = Instant::now();
         let mut decoded = vec![0u8; n * 8];
         for _ in 0..iters {
-            decode_for_region(black_box(&image), bw, 8, &mut decoded);
+            decode_for_region(black_box(&image), bw, 8, 0, &mut decoded);
             black_box(&decoded);
         }
         let elapsed = start.elapsed();

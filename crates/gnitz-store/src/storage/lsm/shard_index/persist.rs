@@ -1,10 +1,7 @@
 //! The manifest a [`ShardIndex`] publishes, and the one it opens from.
 
-use std::collections::HashSet;
-
 use super::super::error::StorageError;
 use super::super::manifest::{Manifest, ManifestEntry, ManifestStamp};
-use super::super::naming;
 use super::{ShardEntry, ShardIndex};
 use crate::schema::key::PkBuf;
 
@@ -39,10 +36,9 @@ impl ShardIndex {
         if let Some(m) = m {
             self.l0_run_bytes = m.run_bytes;
             for e in &m.entries {
-                let path = naming::shard_path(&self.output_dir, e.seq);
                 // Published manifest ⇒ the barrier that renamed it fdatasync'd
                 // this file first, so it is durable and owes no sweep.
-                let entry = ShardEntry::open(&path, &self.schema, e.seq, e.newest, true)?;
+                let entry = ShardEntry::open(&self.output_dir, e.seq, &self.schema, e.newest, true)?;
                 if e.level == 0 {
                     self.l0.push(entry);
                 } else {
@@ -54,8 +50,7 @@ impl ShardIndex {
             }
         }
         self.shard_seq = self.all_entries().map(|e| e.seq).max().unwrap_or(0);
-        let live: HashSet<String> = self.all_entries().map(|e| naming::shard_name(e.seq)).collect();
-        naming::remove_stale_files(&self.output_dir, &live);
+        self.sweep_stale_files();
         Ok(())
     }
 }

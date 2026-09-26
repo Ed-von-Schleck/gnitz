@@ -9,8 +9,8 @@
 
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64, Xxh3Default};
 
-/// XXH3-64 over `b` — the wide-PK routing hash, and the engine's shard-region
-/// and filter checksums.
+/// XXH3-64 over `b` — the wide-PK routing hash, and the engine's shard body
+/// checksum.
 #[inline]
 pub fn checksum(b: &[u8]) -> u64 {
     xxh3_64(b)
@@ -50,8 +50,8 @@ pub fn digest_with_hole(seed: &[u8], buf: &[u8], hole: usize) -> u64 {
     h.digest()
 }
 
-/// Streaming XXH3-128 hasher for row and group identity, built column by
-/// column — 128 bits for the same reason [`checksum_128`] is.
+/// Streaming XXH3: `.digest()` over a sequence of updates equals [`checksum`]
+/// over their concatenation — the shard writer's body checksum.
 pub use xxhash_rust::xxh3::Xxh3Default as RowHasher;
 
 #[cfg(test)]

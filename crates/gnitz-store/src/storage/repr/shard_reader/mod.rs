@@ -6,17 +6,18 @@
 //! so both sub-modules read the (otherwise private) fields directly.
 
 use std::cell::OnceCell;
+use std::ops::Range;
 use std::rc::Rc;
 
 mod access;
 mod open;
 
-use super::layout::FOR_HEADER;
+use super::layout::for_cell_at;
 use super::merge::ColPtr;
 use gnitz_foundation::posix_io::Mmap;
 use gnitz_wire::read_u64_le;
 
-/// A payload-column region — the only role that may carry `ENCODING_FOR`.
+/// A payload-column region — the only role that may carry [`Encoding::For`].
 pub(crate) enum PayloadRegion {
     /// Readable in place: a Raw (stride = width) or Constant (stride 0) region
     /// of the mapping, or `ZERO_CELL` at stride 0 for a column the file predates
@@ -32,10 +33,10 @@ pub(crate) enum PayloadRegion {
 /// German-string struct).
 static ZERO_CELL: [u8; 16] = [0; 16];
 
-/// An `ENCODING_FOR` payload region at `offset` in the mapping, and its decoded
-/// image once a read has needed it.
+/// An [`Encoding::For`] payload region at `image` in the mapping, and its
+/// decoded image once a read has needed it.
 pub(crate) struct PackedRegion {
-    offset: usize,
+    image: Range<usize>,
     bw: usize,
     elem_width: usize,
     decoded: OnceCell<Box<[u8]>>,
@@ -89,39 +90,25 @@ impl MappedShard {
     }
 }
 
-/// Decode a FoR image back to its raw little-endian form, `out.len() / elem_width` rows.
-pub(crate) fn decode_for_region(image: &[u8], bw: usize, elem_width: usize, out: &mut [u8]) {
+/// Decode rows `first_row..` of a FoR image back to their raw little-endian
+/// form, `out.len() / elem_width` rows.
+pub(crate) fn decode_for_region(image: &[u8], bw: usize, elem_width: usize, first_row: usize, out: &mut [u8]) {
     match elem_width {
-        2 => decode_for_cells::<2>(image, bw, out),
-        4 => decode_for_cells::<4>(image, bw, out),
-        8 => decode_for_cells::<8>(image, bw, out),
+        2 => decode_for_cells::<2>(image, bw, first_row, out),
+        4 => decode_for_cells::<4>(image, bw, first_row, out),
+        8 => decode_for_cells::<8>(image, bw, first_row, out),
         _ => unreachable!("open admits FoR only on 2/4/8-byte integer columns"),
     }
 }
 
-fn decode_for_cells<const W: usize>(image: &[u8], bw: usize, out: &mut [u8]) {
+fn decode_for_cells<const W: usize>(image: &[u8], bw: usize, first_row: usize, out: &mut [u8]) {
     debug_assert!((1..W).contains(&bw), "open-time checks bound bw to 1..elem_width");
     let reference = read_u64_le(image, 0);
-    let mask = (1u64 << (8 * bw)) - 1;
+    let mask = gnitz_wire::low_bits_mask(8 * bw);
     let cells = out.as_chunks_mut::<W>().0;
-    // Rows whose offset can be read as one masked 8-byte load without passing the image end;
-    // the few after them are gathered byte by byte.
-    let loadable = match image.len().checked_sub(FOR_HEADER + 8) {
-        Some(room) => (room / bw + 1).min(cells.len()),
-        None => 0,
-    };
-    let (head, tail) = cells.split_at_mut(loadable);
-    for (i, cell) in head.iter_mut().enumerate() {
-        let v = (read_u64_le(image, FOR_HEADER + i * bw) & mask).wrapping_add(reference);
+    for (i, cell) in cells.iter_mut().enumerate() {
+        let v = (read_u64_le(image, for_cell_at(first_row + i, bw)) & mask).wrapping_add(reference);
         *cell = *v.to_le_bytes().first_chunk::<W>().unwrap();
-    }
-    for (i, cell) in tail.iter_mut().enumerate() {
-        let base = FOR_HEADER + (loadable + i) * bw;
-        let off = image[base..base + bw]
-            .iter()
-            .rev()
-            .fold(0u64, |acc, &b| (acc << 8) | b as u64);
-        *cell = *off.wrapping_add(reference).to_le_bytes().first_chunk::<W>().unwrap();
     }
 }
 

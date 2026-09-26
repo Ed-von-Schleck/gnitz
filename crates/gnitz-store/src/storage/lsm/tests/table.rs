@@ -1349,7 +1349,7 @@ fn barrier_gate_matrix() {
             .flush_prepare(ManifestStamp::default())
             .unwrap()
             .expect("unsynced compaction outputs must gate to a staged publish");
-        let swept: Vec<String> = t.shard_index.unsynced_paths().map(str::to_owned).collect();
+        let swept: Vec<String> = t.shard_index.unsynced_paths().collect();
         assert!(!swept.is_empty(), "the compaction outputs must be swept");
         assert!(
             swept.iter().all(|p| is_compaction_output(&t, p)),
@@ -1451,16 +1451,16 @@ fn a_compaction_to_nothing_publishes() {
 /// Every shard file on disk is either `published` or one the index still
 /// registers unpublished — no unpublished file outlives the entry naming it.
 fn assert_unpublished_inputs_gone(t: &Table, dir: &std::path::Path, published: &str) {
-    let live: Vec<&str> = t
+    let live: Vec<String> = t
         .shard_index
         .unsynced_paths()
-        .map(|p| p.rsplit('/').next().unwrap())
+        .map(|p| p.rsplit('/').next().unwrap().to_owned())
         .collect();
     for f in std::fs::read_dir(dir).unwrap().flatten() {
         let name = f.file_name().to_string_lossy().into_owned();
         if name.starts_with(super::super::naming::SHARD_PREFIX) {
             assert!(
-                name == published || live.contains(&name.as_str()),
+                name == published || live.contains(&name),
                 "superseded unpublished shard {name} is still on disk"
             );
         }

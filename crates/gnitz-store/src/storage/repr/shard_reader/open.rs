@@ -18,23 +18,17 @@ use super::super::shard_filter::ShardFilter;
 use super::{MappedShard, PackedRegion, PayloadRegion, WeightRegion, ZERO_CELL};
 use crate::schema::SchemaDescriptor;
 use gnitz_foundation::posix_io::Mmap;
-use gnitz_wire::num_regions;
 use gnitz_wire::{read_i64_le, read_u64_le};
 
 use StorageError::Corrupt;
-
-/// The payload arity of a mapping [`MappedShard::open`] accepted.
-fn file_npc(data: &[u8]) -> usize {
-    read_u64_le(data, OFF_FILE_NPC) as usize
-}
 
 /// A Raw (`count` elements) or Constant (one element, stride 0) region of
 /// `width`-byte elements.
 fn direct_region(data: &[u8], span: &Span, count: usize, width: usize) -> Result<ColPtr, StorageError> {
     let (stride, size) = match span.encoding {
-        ENCODING_RAW => (width, count * width),
-        ENCODING_CONSTANT => (0, width),
-        _ => return Err(Corrupt("encoding")),
+        Encoding::Raw => (width, count * width),
+        Encoding::Constant => (0, width),
+        Encoding::TwoValue | Encoding::For => return Err(Corrupt("encoding")),
     };
     if span.size != size {
         return Err(Corrupt("region size"));
@@ -49,49 +43,34 @@ impl MappedShard {
             _ => e.into(),
         })?;
         let data = mmap.as_slice();
-        if data.len() < HEADER_SIZE {
-            return Err(Corrupt("shorter than the header"));
-        }
-        if read_u64_le(data, OFF_MAGIC) != SHARD_MAGIC {
-            return Err(Corrupt("magic"));
-        }
-        if read_u64_le(data, OFF_VERSION) != SHARD_VERSION {
-            return Err(Corrupt("version"));
-        }
-        let file_npc = usize::try_from(read_u64_le(data, OFF_FILE_NPC))
-            .ok()
-            .filter(|&n| n <= gnitz_wire::MAX_COLUMNS)
-            .ok_or(Corrupt("payload arity"))?;
+        let header = ShardHeader::read(data)?;
         let prefix = data
-            .get(..desc_len(file_npc))
+            .get(..desc_len(header.file_npc))
             .ok_or(Corrupt("shorter than its directory"))?;
         if desc_digest(path, prefix) != read_u64_le(prefix, OFF_DESC_CHECKSUM) {
             return Err(Corrupt("descriptor digest"));
         }
-        Self::bind(Rc::new(mmap), schema)
+        Self::bind(Rc::new(mmap), &header, schema)
     }
 
     /// This shard's mapping bound to `schema`, with no file I/O.
     pub(crate) fn rebind(&self, schema: &SchemaDescriptor) -> Result<Self, StorageError> {
-        Self::bind(Rc::clone(&self.mmap), schema)
+        let header = ShardHeader::read(self.data())?;
+        Self::bind(Rc::clone(&self.mmap), &header, schema)
     }
 
     /// A handle on `mmap` under `schema`. Trusts the descriptive prefix
     /// [`open`](Self::open) checked.
-    fn bind(mmap: Rc<Mmap>, schema: &SchemaDescriptor) -> Result<Self, StorageError> {
+    fn bind(mmap: Rc<Mmap>, header: &ShardHeader, schema: &SchemaDescriptor) -> Result<Self, StorageError> {
         let data = mmap.as_slice();
-        let file_npc = file_npc(data);
-        let count = read_u64_le(data, OFF_ROW_COUNT) as usize;
-        if count == 0 {
-            return Err(Corrupt("no rows"));
-        }
+        let (file_npc, count) = (header.file_npc, header.row_count);
         let spans = region_spans(data, file_npc)?;
         let (strides, _) = strides_from_schema(schema);
 
         let pk = direct_region(data, &spans[REG_PK], count, strides[REG_PK] as usize)?;
         let w = &spans[REG_WEIGHT];
         let weight = match w.encoding {
-            ENCODING_TWO_VALUE => {
+            Encoding::TwoValue => {
                 if w.size != two_value_image_len(count) {
                     return Err(Corrupt("region size"));
                 }
@@ -113,14 +92,14 @@ impl MappedShard {
                     return Ok(PayloadRegion::Mapped(ColPtr { base: ZERO_CELL.as_ptr(), stride: 0 }));
                 }
                 let span = &spans[REG_PAYLOAD_START + pi];
-                if span.encoding != ENCODING_FOR {
+                if span.encoding != Encoding::For {
                     return direct_region(data, span, count, strides[REG_PAYLOAD_START + pi] as usize)
                         .map(PayloadRegion::Mapped);
                 }
                 let fi = col.fixed_int().ok_or(Corrupt("encoding"))?;
                 let bw = for_image_bw(span.size, count, fi.width()).ok_or(Corrupt("FoR width"))?;
                 Ok(PayloadRegion::Packed(PackedRegion {
-                    offset: span.off,
+                    image: span.off..span.off + span.size,
                     bw,
                     elem_width: fi.width(),
                     decoded: std::cell::OnceCell::new(),
@@ -131,9 +110,10 @@ impl MappedShard {
         let null_pad_mask =
             gnitz_wire::low_bits_mask(schema_npc) & !gnitz_wire::low_bits_mask(file_npc.min(schema_npc));
 
-        let blob = &spans[num_regions(file_npc) - 1];
-        let filter = &spans[num_regions(file_npc)];
-        if blob.encoding != ENCODING_RAW || filter.encoding != ENCODING_RAW {
+        let [.., blob, filter] = spans.as_slice() else {
+            unreachable!("region_spans yields every region plus the filter")
+        };
+        if blob.encoding != Encoding::Raw || filter.encoding != Encoding::Raw {
             return Err(Corrupt("encoding"));
         }
         let shard_filter = match filter.size {
@@ -156,7 +136,7 @@ impl MappedShard {
             blob_len: blob.size,
             shard_filter,
             pk_stride: schema.pk_stride(),
-            skeleton: read_u64_le(data, OFF_FLAGS) & SHARD_FLAG_SKELETON != 0,
+            skeleton: header.skeleton,
             mmap,
         })
     }
@@ -165,11 +145,8 @@ impl MappedShard {
     pub(crate) fn verify_body(&self) -> Result<(), StorageError> {
         self.mmap.advise_sequential();
         let data = self.data();
-        let mut body = gnitz_wire::RowHasher::default();
-        for span in region_spans(data, file_npc(data))? {
-            body.update(span.bytes(data));
-        }
-        (body.digest() == read_u64_le(data, OFF_BODY_CHECKSUM))
+        let h = ShardHeader::read(data)?;
+        (gnitz_wire::checksum(&data[desc_len(h.file_npc)..]) == h.body_checksum)
             .then_some(())
             .ok_or(Corrupt("body checksum"))
     }

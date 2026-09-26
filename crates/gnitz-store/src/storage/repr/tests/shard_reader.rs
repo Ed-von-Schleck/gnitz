@@ -8,7 +8,7 @@ use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, read_german_string};
 use gnitz_expr::RowSource;
 use gnitz_wire::num_regions;
-use gnitz_wire::{read_i64_le, read_u64_le, write_u64_le};
+use gnitz_wire::{read_i64_le, write_u64_le};
 
 /// Build a shard through `write_as_shard` (uses encoding selection).
 fn build_test_shard(dir: &std::path::Path, rows: &[(u64, i64)]) -> String {
@@ -82,7 +82,7 @@ fn patch_entry(data: &mut [u8], i: usize, patch: impl FnOnce(&mut DirEntry)) {
 
 /// The offset region `i` of `image` starts at.
 fn region_offset(image: &[u8], i: usize) -> usize {
-    region_spans(image, read_u64_le(image, OFF_FILE_NPC) as usize).unwrap()[i].off
+    region_spans(image, ShardHeader::read(image).unwrap().file_npc).unwrap()[i].off
 }
 
 #[test]
@@ -167,7 +167,7 @@ fn file_npc_header_roundtrip() {
     let path = build_test_shard(dir.path(), &[(1u64, 10i64)]);
     let data = std::fs::read(&path).unwrap();
     // The writer stamps its own descriptor's payload arity.
-    assert_eq!(read_u64_le(&data, OFF_FILE_NPC), 1);
+    assert_eq!(ShardHeader::read(&data).unwrap().file_npc, 1);
 
     // A shard read back at the width it was written pays nothing.
     let schema = make_schema_u64_i64();
@@ -430,6 +430,17 @@ fn checksum_validation() {
 
     let shard = MappedShard::open(&path, &schema).unwrap();
     assert_eq!(shard.verify_body(), Err(StorageError::Corrupt("body checksum")));
+
+    // The alignment padding between the directory and the first region is
+    // covered too.
+    let pad_off = desc_len(schema.num_payload_cols());
+    let mut data = std::fs::read(path_str).unwrap();
+    data[pk_off] ^= 0xFF;
+    assert!(pad_off < pk_off, "premise: the first region is preceded by padding");
+    data[pad_off] ^= 0xFF;
+    std::fs::write(path_str, &data).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
+    assert_eq!(shard.verify_body(), Err(StorageError::Corrupt("body checksum")));
 }
 
 #[test]
@@ -465,7 +476,7 @@ fn constant_weight_roundtrip() {
     // One weight value across every row must be stored as a single 8-byte
     // Constant region rather than n*8 raw bytes.
     let image = std::fs::read(&path).unwrap();
-    assert_eq!(region_dir(&image, REG_WEIGHT), (8, ENCODING_CONSTANT));
+    assert_eq!(region_dir(&image, REG_WEIGHT), (8, Encoding::Constant));
 }
 
 #[test]
@@ -547,14 +558,14 @@ fn an_encoding_a_role_may_not_carry_is_rejected() {
     // (region, forged encoding byte)
     let cases: &[(usize, u8)] = &[
         (REG_PK, 0x10), // not an encoding at all
-        (REG_PK, ENCODING_TWO_VALUE),
-        (REG_PK, ENCODING_FOR),
-        (REG_WEIGHT, ENCODING_FOR),
-        (REG_NULL_BMP, ENCODING_FOR),
-        (blob, ENCODING_FOR),
-        (REG_PAYLOAD_START, ENCODING_TWO_VALUE),
-        (blob, ENCODING_CONSTANT),
-        (filter, ENCODING_CONSTANT),
+        (REG_PK, Encoding::TwoValue as u8),
+        (REG_PK, Encoding::For as u8),
+        (REG_WEIGHT, Encoding::For as u8),
+        (REG_NULL_BMP, Encoding::For as u8),
+        (blob, Encoding::For as u8),
+        (REG_PAYLOAD_START, Encoding::TwoValue as u8),
+        (blob, Encoding::Constant as u8),
+        (filter, Encoding::Constant as u8),
     ];
     for &(region, enc) in cases {
         let opened = open_patched_restamped(&path, &schema, &base, |data| {
@@ -835,7 +846,7 @@ fn find_lower_bound_bytes_wide_pk_distinct() {
 }
 
 // -----------------------------------------------------------------------
-// FoR (ENCODING_FOR) packed-payload reader tests
+// FoR (Encoding::For) packed-payload reader tests
 // -----------------------------------------------------------------------
 
 /// Build a `(U64 PK | I64 payload)` shard with all-1 weights;
@@ -856,15 +867,15 @@ fn packed_roundtrip_all_surfaces() {
     let packed_path = build_i64_shard(dir.path(), "packed.db", &pks, &vals, true);
     let raw_path = build_i64_shard(dir.path(), "raw.db", &pks, &vals, false);
 
-    // Writer verdict: packed shard carries ENCODING_FOR on the payload,
+    // Writer verdict: packed shard carries Encoding::For on the payload,
     // control stays Raw.
     assert_eq!(
         region_dir(&std::fs::read(&packed_path).unwrap(), REG_PAYLOAD_START).1,
-        ENCODING_FOR
+        Encoding::For
     );
     assert_eq!(
         region_dir(&std::fs::read(&raw_path).unwrap(), REG_PAYLOAD_START).1,
-        ENCODING_RAW
+        Encoding::Raw
     );
 
     let packed = MappedShard::open(&packed_path, &schema).unwrap();
@@ -949,13 +960,21 @@ fn packed_i32_mid_shard_slice() {
     };
     let packed = write("packed32.db", true);
     let raw = write("raw32.db", false);
-    assert!(matches!(packed.col_regions[0], PayloadRegion::Packed(_)));
+    let PayloadRegion::Packed(region) = &packed.col_regions[0] else {
+        panic!("the payload must pack")
+    };
     assert!(matches!(raw.col_regions[0], PayloadRegion::Mapped(_)));
+    let slices_match = || {
+        assert_slices_match(&packed, &raw, 0, n, &schema);
+        assert_slices_match(&packed, &raw, 91, 233, &schema);
+    };
+    slices_match();
+    assert!(region.decoded.get().is_none(), "a slice decodes only its window");
     for r in 0..n {
         assert_eq!(packed.get_col_ptr(r, 0, 4), raw.get_col_ptr(r, 0, 4), "row {r}");
     }
-    assert_slices_match(&packed, &raw, 0, n, &schema);
-    assert_slices_match(&packed, &raw, 91, 233, &schema);
+    assert!(region.decoded.get().is_some());
+    slices_match();
 }
 
 /// A mid-shard, odd-length slice over constant weight and null regions and a
@@ -1015,7 +1034,7 @@ fn forged_for_payload_bad_size_rejected() {
     // Confirm it packed.
     assert_eq!(
         region_dir(&std::fs::read(&path).unwrap(), REG_PAYLOAD_START).1,
-        ENCODING_FOR
+        Encoding::For
     );
     let base = std::fs::read(&path).unwrap();
     let schema = make_schema_u64_i64();
@@ -1051,7 +1070,7 @@ fn checksum_catches_corrupted_packed_region() {
     let vals: Vec<i64> = (0..200).map(|i| 7000 + (i % 120)).collect();
     let path = build_i64_shard(dir.path(), "corrupt.db", &pks, &vals, true);
     let (_sz, enc) = region_dir(&std::fs::read(&path).unwrap(), REG_PAYLOAD_START);
-    assert_eq!(enc, ENCODING_FOR);
+    assert_eq!(enc, Encoding::For);
 
     // Flip a byte in the packed payload region's on-disk offset bytes.
     let mut data = std::fs::read(&path).unwrap();
@@ -1331,7 +1350,7 @@ fn a_filterless_shard_has_an_empty_trailing_entry() {
     let image = std::fs::read(&path).unwrap();
     assert_eq!(
         region_dir(&image, num_regions(schema.num_payload_cols())),
-        (0, ENCODING_RAW)
+        (0, Encoding::Raw)
     );
     let shard = MappedShard::open(&shard_path, &schema).unwrap();
     assert!(!shard.has_shard_filter());
@@ -1409,16 +1428,16 @@ fn sweep_shapes(dir: &std::path::Path) -> Vec<(&'static str, String, SchemaDescr
     ]
 }
 
-/// The verdicts a corruption at `off` inside the prefix may produce. Magic
-/// and version are checked ahead of the digest so a wrong-format or
-/// wrong-build file names its actual defect. `file_npc` is read ahead of it
-/// too — it sizes the digest span itself — so a flip that raises it is
-/// caught by the bound or the length check first. Every other byte is the
-/// digest's alone.
+/// The verdicts a corruption at `off` inside the prefix may produce: a header
+/// field `ShardHeader::read` checks can fail its own check before the digest.
 fn prefix_verdicts(off: usize) -> &'static [StorageError] {
     match off {
         o if o < OFF_VERSION => &[StorageError::Corrupt("magic")],
         o if o < OFF_ROW_COUNT => &[StorageError::Corrupt("version")],
+        OFF_ROW_COUNT..OFF_DESC_CHECKSUM => &[
+            StorageError::Corrupt("no rows"),
+            StorageError::Corrupt("descriptor digest"),
+        ],
         o if (OFF_FILE_NPC..OFF_FILE_NPC + 8).contains(&o) => &[
             StorageError::Corrupt("payload arity"),
             StorageError::Corrupt("shorter than its directory"),
@@ -1495,4 +1514,60 @@ fn a_region_size_that_disagrees_with_the_row_count_is_rejected() {
             }
         }
     }
+}
+
+/// Per-pass cost of slicing a FoR shard window by window.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn for_slice_bench() {
+    use gnitz_foundation::perf::Counter;
+    use std::hint::black_box;
+    const N: usize = 1_000_000;
+    const WINDOW: usize = 1024;
+    const HANDLES: usize = 20;
+    let schema = make_schema_u64_i64();
+    let dir = tempfile::tempdir().unwrap();
+    let rows: Vec<(Vec<u8>, i64, i64)> = (0..N)
+        .map(|i| ((i as u64).to_be_bytes().to_vec(), 1, 3_000_000_000 + (i % 4000) as i64))
+        .collect();
+    let path = super::super::shard_file::write_test_shard(
+        &dir.path().join("for_slice.db"),
+        &schema,
+        &rows,
+        ShardWriteOpts::COMPACTION,
+    );
+    let open = || MappedShard::open(&path, &schema).unwrap();
+    let decoded_bytes = |shard: &MappedShard| -> usize {
+        match &shard.col_regions[0] {
+            PayloadRegion::Packed(p) => p.decoded.get().map_or(0, |d| d.len()),
+            PayloadRegion::Mapped(_) => panic!("the payload must pack"),
+        }
+    };
+    let slice_all = |shard: &MappedShard| {
+        for start in (0..N).step_by(WINDOW) {
+            black_box(shard.slice_to_owned_batch(start, WINDOW.min(N - start), &schema));
+        }
+    };
+    let (cycles, instructions) = (Counter::cycles().unwrap(), Counter::instructions().unwrap());
+    let report = |label: &str, handles: &[MappedShard]| {
+        let (((), i), c) = cycles.measure(|| instructions.measure(|| handles.iter().for_each(slice_all)));
+        let decoded: usize = handles.iter().map(decoded_bytes).sum();
+        println!(
+            "{label}: {} cycles, {} instructions per pass; {decoded} decoded bytes retained",
+            c / handles.len() as u64,
+            i / handles.len() as u64,
+        );
+    };
+
+    let fresh: Vec<MappedShard> = (0..HANDLES).map(|_| open()).collect();
+    report("undecoded", &fresh);
+    report("undecoded, second pass", &fresh);
+    let cached: Vec<MappedShard> = (0..HANDLES)
+        .map(|_| {
+            let shard = open();
+            black_box(shard.to_unified(&schema, &mut Vec::new()));
+            shard
+        })
+        .collect();
+    report("decoded", &cached);
 }

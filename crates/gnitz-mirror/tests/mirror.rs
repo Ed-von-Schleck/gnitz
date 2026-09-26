@@ -920,7 +920,7 @@ fn blocking_fsync_fallback_child() {
 fn round_trip_cost_bench() {
     let _g = serial();
     let mut fx = Fixture::start();
-    let Some(counter) = gnitz_foundation::perf::Instructions::open() else {
+    let Some(counter) = gnitz_foundation::perf::Counter::instructions() else {
         println!("perf_event_open refused; skipping the instruction count");
         return;
     };
@@ -960,7 +960,7 @@ fn idle_poll_client_cost_bench() {
 
     let _g = serial();
     let mut fx = Fixture::start();
-    let Some(counter) = gnitz_foundation::perf::Instructions::open() else {
+    let Some(counter) = gnitz_foundation::perf::Counter::instructions() else {
         println!("perf_event_open refused; skipping the instruction count");
         return;
     };

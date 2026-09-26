@@ -289,7 +289,7 @@ fn tick(engine: &mut CatalogEngine, source: i64, round: u64, delta: Batch) {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn drive_tick_bench() {
-    let counter = gnitz_foundation::perf::Instructions::open().expect("instructions counter");
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
 
     let (mut engine, base, a) = engine_with_every_plan_shape("tick_bench_shapes");
     // Compiles every plan outside the measurement.

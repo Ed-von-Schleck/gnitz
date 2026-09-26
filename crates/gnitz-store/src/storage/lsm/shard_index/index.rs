@@ -4,6 +4,7 @@
 //! level's guard partition is held at, and the vertical drain into the terminal
 //! level.
 
+use std::collections::HashSet;
 use std::fs;
 use std::rc::Rc;
 
@@ -59,7 +60,7 @@ impl ShardIndex {
                 ..opts
             },
         )?;
-        ShardEntry::open(&path, &self.schema, seq, newest.unwrap_or(seq), false).inspect_err(|_| {
+        ShardEntry::open(&self.output_dir, seq, &self.schema, newest.unwrap_or(seq), false).inspect_err(|_| {
             let _ = fs::remove_file(&path);
         })
     }
@@ -101,15 +102,18 @@ impl ShardIndex {
     }
 
     /// Every live shard no published manifest names yet.
-    pub(crate) fn unsynced_paths(&self) -> impl Iterator<Item = &str> {
-        self.all_entries().filter(|e| !e.published).map(|e| e.filename.as_str())
+    pub(crate) fn unsynced_paths(&self) -> impl Iterator<Item = String> + '_ {
+        self.all_entries()
+            .filter(|e| !e.published)
+            .map(|e| naming::shard_path(&self.output_dir, e.seq))
     }
 
-    /// Mark every live shard published.
-    pub(crate) fn clear_unsynced(&mut self) {
+    /// A manifest naming exactly the live shards has been renamed into place.
+    pub(crate) fn mark_published(&mut self) {
         for e in self.all_entries_mut() {
             e.published = true;
         }
+        self.retired_published = false;
     }
 
     /// Every live shard's `Rc`, yielded lazily — callers `extend` without an
@@ -251,15 +255,14 @@ impl ShardIndex {
         Ok(written)
     }
 
-    /// Unlink `entries`, except that a file a published manifest names waits for
-    /// the checkpoint barrier's post-publish drain.
+    /// Unlink the unpublished `entries`; a published one's file waits for
+    /// [`sweep_stale_files`](Self::sweep_stale_files).
     fn retire(&mut self, entries: impl IntoIterator<Item = ShardEntry>) {
         for e in entries {
             if e.published {
-                self.pending_deletions.push(e.filename);
+                self.retired_published = true;
             } else {
-                // A leftover is an orphan the next open's `install` reclaims.
-                let _ = fs::remove_file(&e.filename);
+                let _ = fs::remove_file(naming::shard_path(&self.output_dir, e.seq));
             }
         }
     }
@@ -626,8 +629,13 @@ impl ShardIndex {
         Ok(())
     }
 
-    pub(crate) fn try_cleanup(&mut self) {
-        self.pending_deletions
-            .retain(|path| fs::remove_file(path).is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound));
+    /// Remove every shard and staging file in the directory no live entry names.
+    pub(crate) fn sweep_stale_files(&self) {
+        assert!(
+            !self.retired_published,
+            "a retired shard's file stays until a manifest without it is durable"
+        );
+        let live: HashSet<String> = self.all_entries().map(|e| naming::shard_name(e.seq)).collect();
+        naming::remove_stale_files(&self.output_dir, &live);
     }
 }

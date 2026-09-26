@@ -1,5 +1,5 @@
 use super::super::batch::{Batch, REG_PAYLOAD_START};
-use super::super::layout::{ENCODING_FOR, ENCODING_RAW};
+use super::super::layout::Encoding;
 use super::super::merge::ColumnarSource;
 use super::super::merge::{run_merge, BlobCacheGuard};
 use super::super::shard_file::{self, region_dir, ShardWriteOpts};
@@ -103,12 +103,12 @@ fn compaction_packs_eligible_int_payload() {
     // L0 spill inputs stay Raw (policy: only compaction packs).
     assert_eq!(
         region_dir(&fs::read(cs1.as_str()).unwrap(), REG_PAYLOAD_START).1,
-        ENCODING_RAW,
+        Encoding::Raw,
         "L0 input stays raw"
     );
     assert_eq!(
         region_dir(&fs::read(cs2.as_str()).unwrap(), REG_PAYLOAD_START).1,
-        ENCODING_RAW
+        Encoding::Raw
     );
 
     let cout = compact_one(&dir, &[cs1.as_str(), cs2.as_str()], &schema, 1);
@@ -116,7 +116,7 @@ fn compaction_packs_eligible_int_payload() {
     // Compaction output packs the eligible payload.
     assert_eq!(
         region_dir(&fs::read(cout.as_str()).unwrap(), REG_PAYLOAD_START).1,
-        ENCODING_FOR,
+        Encoding::For,
         "compaction packs payload"
     );
 
@@ -134,7 +134,7 @@ fn compaction_packs_eligible_int_payload() {
     let cout2 = compact_one(&dir, &[cout.as_str()], &schema, 2);
     assert_eq!(
         region_dir(&fs::read(cout2.as_str()).unwrap(), REG_PAYLOAD_START).1,
-        ENCODING_FOR,
+        Encoding::For,
         "re-compaction repacks"
     );
     let merged2 = MappedShard::open(&cout2, &schema).unwrap();
@@ -1058,12 +1058,12 @@ fn the_routed_split_agrees_with_guard_slot_at_every_stride() {
 mod skeleton_tests {
     use super::super::*;
     use crate::storage::repr::batch::{Batch, REG_NULL_BMP};
-    use crate::storage::repr::layout::{ENCODING_CONSTANT, OFF_FILE_NPC, OFF_FLAGS, SHARD_FLAG_SKELETON};
+    use crate::storage::repr::layout::{Encoding, ShardHeader};
     use crate::storage::repr::merge::ColumnarSource;
     use crate::storage::repr::shard_file::{region_dir, ShardWriteOpts};
     use crate::storage::repr::shard_reader::MappedShard;
     use crate::test_support::make_schema_u64_i64;
-    use gnitz_wire::{read_i64_le, read_u64_le};
+    use gnitz_wire::read_i64_le;
 
     /// A `(PK, weight, payload)` shard, so one PK can carry several payloads.
     fn write_shard(path: &std::path::Path, rows: &[(u64, i64, i64)], schema: &SchemaDescriptor) -> String {
@@ -1090,7 +1090,7 @@ mod skeleton_tests {
 
     /// A guard's *first* dehydration: survivors still hold several payloads per
     /// PK, and the output is exactly one `(PK, Σweight)` row per key. Its null
-    /// region collapses to `ENCODING_CONSTANT` (8 bytes for the whole file), and
+    /// region collapses to `Encoding::Constant` (8 bytes for the whole file), and
     /// the file declares itself skeleton with a zero payload arity.
     #[test]
     fn first_dehydration_folds_a_guard_to_one_row_per_pk() {
@@ -1119,9 +1119,10 @@ mod skeleton_tests {
         assert_eq!(read_rows(path, &schema), vec![(1, 6), (2, 5)], "PK 3 cancelled exactly");
 
         let raw = std::fs::read(path).unwrap();
-        assert_eq!(read_u64_le(&raw, OFF_FILE_NPC), 0, "zero payload arity");
-        assert_eq!(read_u64_le(&raw, OFF_FLAGS), SHARD_FLAG_SKELETON, "declared skeleton");
-        assert_eq!(region_dir(&raw, REG_NULL_BMP).1, ENCODING_CONSTANT);
+        let header = ShardHeader::read(&raw).unwrap();
+        assert_eq!(header.file_npc, 0, "zero payload arity");
+        assert!(header.skeleton, "declared skeleton");
+        assert_eq!(region_dir(&raw, REG_NULL_BMP).1, Encoding::Constant);
         assert_eq!(region_dir(&raw, REG_NULL_BMP).0, 8, "one element for the whole file");
     }
 

@@ -1,5 +1,5 @@
 use super::super::batch::REG_PK;
-use super::super::layout::ENCODING_CONSTANT;
+use super::super::layout::Encoding;
 use super::super::shard_file::region_dir;
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
@@ -212,7 +212,7 @@ fn test_scatter_constant_pk_shard() {
     let on_disk = dir.path().join(format!("rc{}_0.db", schema.pk_stride()));
     assert_eq!(
         region_dir(&std::fs::read(&on_disk).unwrap(), REG_PK).1,
-        ENCODING_CONSTANT,
+        Encoding::Constant,
         "fixture premise: a single-row PK region is Constant-encoded",
     );
 
@@ -1186,11 +1186,9 @@ fn skeleton_shard_opens_under_the_view_schema() {
     // The writer's own arity is zero, so the ALTER-widening decode reads every
     // schema payload column as one the file predates and pads it NULL.
     let raw = std::fs::read(dir.path().join("sk.db")).unwrap();
-    assert_eq!(gnitz_wire::read_u64_le(&raw, super::super::layout::OFF_FILE_NPC), 0);
-    assert_eq!(
-        gnitz_wire::read_u64_le(&raw, super::super::layout::OFF_FLAGS),
-        super::super::layout::SHARD_FLAG_SKELETON,
-    );
+    let header = super::super::layout::ShardHeader::read(&raw).unwrap();
+    assert_eq!(header.file_npc, 0);
+    assert!(header.skeleton);
     for (r, &(_, w)) in rows.iter().enumerate() {
         assert!(
             gnitz_wire::null_word_get(shard.get_null_word(r), 0),

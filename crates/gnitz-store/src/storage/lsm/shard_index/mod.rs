@@ -189,8 +189,7 @@ pub(super) struct CompactionInputs {
 
 pub(super) struct ShardEntry {
     shard: Rc<MappedShard>,
-    filename: String,
-    /// The seq that names this shard.
+    /// The seq that names this shard in its store's directory.
     seq: u64,
     /// The highest seq whose rows this shard holds: its write recency.
     newest: u64,
@@ -202,19 +201,19 @@ pub(super) struct ShardEntry {
 }
 
 impl ShardEntry {
+    /// Open the shard drawn at `seq` in the store at `dir`.
     pub(crate) fn open(
-        path: &str,
-        schema: &SchemaDescriptor,
+        dir: &str,
         seq: u64,
+        schema: &SchemaDescriptor,
         newest: u64,
         published: bool,
     ) -> Result<Self, StorageError> {
-        let shard = Rc::new(MappedShard::open(path, schema)?);
+        let shard = Rc::new(MappedShard::open(&super::naming::shard_path(dir, seq), schema)?);
         let pk_min = PkBuf::from_bytes(shard.get_pk_bytes(0));
         let pk_max = PkBuf::from_bytes(shard.get_pk_bytes(shard.count - 1));
         Ok(ShardEntry {
             shard,
-            filename: path.to_string(),
             seq,
             newest,
             pk_min,
@@ -403,7 +402,9 @@ pub(super) struct ShardIndex {
 
     /// The last seq drawn; a shard is named by its seq.
     shard_seq: u64,
-    pending_deletions: Vec<String>,
+    /// A shard the durable manifest names has left the index since it was
+    /// published, so a restart would still open its file.
+    retired_published: bool,
     /// `R`, the unit every byte target is stated in: the running max of the
     /// registered L0 bytes one `run_compact` consumed, floored at
     /// [`MIN_GUARD_BYTES`] and persisted in the manifest header.
@@ -436,7 +437,7 @@ impl ShardIndex {
             l0: Vec::new(),
             levels: std::array::from_fn(|_| FLSMLevel::new()),
             shard_seq: 0,
-            pending_deletions: Vec::new(),
+            retired_published: false,
             l0_run_bytes: MIN_GUARD_BYTES,
             budget,
             dropped_max: PkBuf::zeroed(schema.pk_stride()),

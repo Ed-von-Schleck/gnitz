@@ -41,7 +41,7 @@ pub(crate) fn flush_barrier<'a>(
     sync_paths(
         &mut ring,
         work.iter()
-            .flat_map(|(t, w)| t.shard_index.unsynced_paths().chain([w.manifest.tmp_path()])),
+            .flat_map(|(t, w)| t.shard_index.unsynced_paths().chain([w.manifest.tmp_path().to_owned()])),
         FsyncFlags::DATASYNC,
     )?;
     let mut dirs = BTreeSet::new();
@@ -49,7 +49,7 @@ pub(crate) fn flush_barrier<'a>(
     for (t, w) in work {
         // The rename publishes every shard the manifest names.
         w.manifest.commit()?;
-        t.shard_index.clear_unsynced();
+        t.shard_index.mark_published();
         dirs.extend(w.dirs);
         published.push((t, w.bytes));
     }
@@ -58,7 +58,7 @@ pub(crate) fn flush_barrier<'a>(
     // No durable manifest names a superseded shard any more.
     for (t, bytes) in published {
         t.durable_manifest = Some(bytes);
-        t.shard_index.try_cleanup();
+        t.shard_index.sweep_stale_files();
     }
     Ok(())
 }
