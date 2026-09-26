@@ -4,8 +4,8 @@
 //! The keys are visited in ascending OPK order, which is typed PK order, so the
 //! walk never seeks backward within a list: each key is settled against where the
 //! previous one left the cursor, and a key the store holds no live row for costs
-//! a comparison. Each group is visited whole, at net positive weights in (PK,
-//! payload) order, so a chunk boundary never splits one.
+//! a comparison. Each group is visited whole, at net weights in (PK, payload)
+//! order, so a chunk boundary never splits one.
 
 use super::super::batch::{Batch, Layout};
 use super::{ReadCursor, SkeletonKeys};
@@ -22,9 +22,7 @@ pub struct PkSetGather {
 }
 
 /// The key range a flat **ascending** OPK key list spans — its first and last
-/// key — or `None` for an empty list. `stride` is the schema's `pk_stride`. A
-/// list spread across the whole key space degenerates to the whole store, which
-/// is the case a whole-store open was right for anyway.
+/// key — or `None` for an empty list. `stride` is the schema's `pk_stride`.
 fn key_list_range(keys: &[u8], stride: usize) -> Option<(&[u8], &[u8])> {
     let first = keys.chunks_exact(stride).next()?;
     Some((first, &keys[keys.len() - stride..]))
@@ -59,12 +57,14 @@ impl PkSetGather {
         PkSetGather { cursor, keys: Vec::new(), next: 0 }
     }
 
-    /// Replace the key list (flat, strictly ascending) and end the sweep, so its first key
-    /// may sort below the last one visited. Returns the previous list's buffer.
-    pub(crate) fn reload(&mut self, keys: Vec<u8>) -> Vec<u8> {
+    /// Start a new key list over the same snapshot and end the sweep, so its first key
+    /// may sort below the last one visited. The caller fills the returned buffer, flat and
+    /// strictly ascending.
+    pub(crate) fn reload(&mut self) -> &mut Vec<u8> {
         self.next = 0;
         self.cursor.sweep_open = false;
-        std::mem::replace(&mut self.keys, keys)
+        self.keys.clear();
+        &mut self.keys
     }
 
     pub(crate) fn schema(&self) -> &SchemaDescriptor {
@@ -76,7 +76,7 @@ impl PkSetGather {
         self.keys.len() / self.cursor.schema.pk_stride() - self.next
     }
 
-    /// Call `f` on every positive-weight row of each remaining key's group, in ascending
+    /// Call `f` on every row of each remaining key's group, in ascending
     /// (PK, payload) order, until it has run `max_rows` times; returns how often it ran.
     /// The budget is tested before each key and each group is visited whole, so the count
     /// can overshoot to `max_rows - 1 + |largest group|`. `0` means the list is exhausted.
@@ -88,14 +88,9 @@ impl PkSetGather {
             let key = &self.keys[self.next * stride..(self.next + 1) * stride];
             self.next += 1;
             if self.cursor.seek_pk_group_ascending(key) {
-                // The weight gate is per row, not a presence test: a retracted member
-                // an uncompacted source still holds can head the group by payload
-                // order, and rejecting the key on it would drop the live rows behind it.
                 self.cursor.for_each_pk_group_row(key, |c| {
-                    if c.current_weight > 0 {
-                        visited += 1;
-                        f(c);
-                    }
+                    visited += 1;
+                    f(c);
                 });
             }
         }

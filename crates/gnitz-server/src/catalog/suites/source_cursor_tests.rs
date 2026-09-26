@@ -6,7 +6,7 @@
 
 use super::*;
 use gnitz_expr::SchemaFacts;
-use gnitz_store::storage::SourceCursor;
+use gnitz_store::read::SourceCursor;
 use gnitz_wire::{key_image, Cut, KeyRange, PkColList};
 
 const NBASE: u64 = 200;
@@ -300,10 +300,8 @@ fn bounded_cursor_backward_probe_across_exhausted_chunk() {
     engine.close();
 }
 
-/// A retracted row on a **single-source** cursor — the one shape where the full
-/// scan's verbatim single-source slice copy (no weight predicate) and the bounded
-/// gather's `current_weight > 0` gate could diverge. They agree because a base
-/// table accumulates every live group to exactly +1.
+/// A retracted row on a **single-source** cursor: the bounded gather must drop the
+/// row exactly as the full scan does.
 #[test]
 fn bounded_and_full_agree_with_a_retracted_row_single_source() {
     let (mut engine, tid, vid) = fixture(
@@ -334,7 +332,7 @@ fn bounded_and_full_agree_with_a_retracted_row_single_source() {
 
 /// An UPDATE of the indexed column retracts the old index entry and inserts the
 /// new one, so a range spanning both values must emit the row **once** at weight 1
-/// — the walk's gate is `> 0` on the consolidated group, not a presence test.
+/// — the old entry folds to net zero in the index and never surfaces.
 #[test]
 fn updated_indexed_column_emits_the_row_once() {
     // Range covers val ∈ [500, 600): ids 50..60 plus whatever moves in.
@@ -363,7 +361,7 @@ fn updated_indexed_column_emits_the_row_once() {
 }
 
 /// A range spanning an updated column's OLD and NEW value must still emit the row
-/// once: the old key surfaces at net weight 0 and the walk skips it.
+/// once: the old entry folds to net zero in the index and never surfaces.
 #[test]
 fn range_spanning_old_and_new_indexed_value_emits_once() {
     // val ∈ [500, 600) after moving id=51 from 510 → 590 — both inside the range.

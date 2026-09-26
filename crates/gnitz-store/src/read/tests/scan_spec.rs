@@ -367,7 +367,7 @@ fn a_pk_prefix_range_takes_the_pk_walk_over_a_matching_index() {
     let range = KeyRange::point(PkColList::from_slice(&[0]), &[], 5);
     let (cursor, unapplied) = r.open_bound(TID, ReadBound::Range(range)).unwrap();
     assert!(
-        matches!(cursor, crate::storage::SourceCursor::Full(_)),
+        matches!(cursor, crate::read::SourceCursor::Full(_)),
         "a PK walk, not the index"
     );
     assert_eq!(unapplied, ReadBound::None, "a PK walk applies the whole range");

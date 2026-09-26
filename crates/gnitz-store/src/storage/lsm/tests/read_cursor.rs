@@ -1020,9 +1020,7 @@ fn ascending_key_sweep_matches_per_key_fresh_seeks() {
         let mut fresh = create_read_cursor(&sources, &[], schema);
         fresh.seek_bytes(&key);
         fresh.for_each_pk_group_row(&key, |c| {
-            if c.current_weight > 0 {
-                c.copy_current_row_into(&mut want, c.current_weight);
-            }
+            c.copy_current_row_into(&mut want, c.current_weight);
         });
     }
 

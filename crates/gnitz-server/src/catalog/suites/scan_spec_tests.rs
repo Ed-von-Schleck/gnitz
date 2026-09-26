@@ -270,20 +270,6 @@ fn keyed_reads_over_a_view_return_the_whole_pk_group() {
     assert_eq!(run_pk_set(&mut e, vid, [8]), vec![]);
 }
 
-/// The keyed reader gates each row on a positive weight. That gate must be
-/// applied **per row of the group**, not as a presence test for the key: a
-/// retracted member an uncompacted source still holds sorts at the group head
-/// (payloads order within a PK), and testing the key by its head alone answers
-/// "no such row" for a key whose live rows sit right behind it.
-#[test]
-fn keyed_reads_skip_a_retracted_group_head_and_keep_the_live_rows() {
-    let rows = [(5u64, 10i64, -1i64), (5, 20, 1), (5, 30, 1)];
-    let (mut e, vid) = weighted_fixture("ss_view_head_ghost", rows.into_iter());
-    let want = vec![(5u128, 20i64, 1i64), (5, 30, 1)];
-
-    assert_eq!(run_pk_set(&mut e, vid, [5]), want);
-}
-
 /// A `PkSet` chunk tests the row budget before each key and then drains that
 /// key's whole group, so a group larger than the budget crosses it in one piece
 /// and the chunk overshoots. The sink must take that chunk whole and resume at

@@ -2071,14 +2071,11 @@ fn test_seek_by_index_range_carry_ripples_into_eq_prefix() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── collect-then-resolve: sorted source-PK resolution ────────────────────
+// ── index range reads: matched entries resolved to source rows ───────────
 //
-// `seek_by_index` (prefix) and `seek_by_index_range` collect the matched
-// source PKs, sort them (skipping the sort only for a full-arity equality
-// seek, whose single duplicate group is already ascending), then resolve in
-// one monotone forward sweep. These tests pin the observable contract: the
-// resolved multiset, net-weight handling, the wide-PK byte path, and the
-// sort-skip branch.
+// `seek_by_index` (prefix) and `seek_by_index_range` resolve each matched
+// index entry to its source row. These tests pin the observable contract: the
+// resolved multiset, net-weight handling, and the wide-PK byte path.
 
 /// Collect `(pk, payload_col0, weight)` for every positive-weight row of a
 /// narrow-PK result batch, sorted by PK — the order-insensitive reference form
@@ -2105,7 +2102,7 @@ fn result_triples(r: Option<Rc<Batch>>) -> Vec<(u128, u64, i64)> {
 fn test_seek_by_index_range_multi_group_sorted_with_retraction() {
     // A range spanning ≥ 2 duplicate groups, with source PKs deliberately
     // scrambled so the index-emission order (2,5,8,1,3,7) interleaves across
-    // groups and the resolve sort genuinely reorders to (1,2,3,5,7,8). The
+    // groups and differs from source-PK order (1,2,3,5,7,8). The
     // resolved multiset must match a scan-and-filter reference; a retraction in
     // one group must drop that row at net weight 0.
     let (mut engine, tid, dir) = table_fixture(
@@ -2214,10 +2211,7 @@ fn test_seek_by_index_prefix_multi_group_sorted() {
 #[test]
 fn test_seek_by_index_range_empty_interval_short_circuits() {
     // A non-degenerate `[start, end)` (start < end) that nonetheless straddles a
-    // value gap matches no row: the walk collects nothing, so the `pks.is_empty()`
-    // short-circuit returns `Ok(None)` without opening the base cursor. (The
-    // `start ≥ end` / `+∞` short-circuits fire *before* the walk and so do not
-    // exercise this path.)
+    // value gap matches no index entry, so the read returns `Ok(None)`.
     let (mut engine, tid, dir) = table_fixture(
         "catalog_range_empty_interval",
         &[col_def("id", TypeCode::U64), col_def("x", TypeCode::U64)],
@@ -2239,10 +2233,7 @@ fn test_seek_by_index_range_empty_interval_short_circuits() {
     let r = seek_by_index_range(&mut engine, tid, &[1], &[], Cut::after(15), Cut::before(25))
         .unwrap()
         .0;
-    assert!(
-        r.is_none(),
-        "an empty-but-valid interval returns Ok(None) via pks.is_empty()"
-    );
+    assert!(r.is_none(), "an empty-but-valid interval returns Ok(None)");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -2250,19 +2241,14 @@ fn test_seek_by_index_range_empty_interval_short_circuits() {
 
 #[test]
 fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
-    // Regression guard for dropping the `MAX_PK_BYTES` scratch-copy: a wide
-    // (`src_pk_stride` = 24 > 16) source PK must round-trip through
-    // collect → sort → resolve carrying its full width. Each PK varies past byte
-    // 16 (col c), so a 16-byte-truncated key would resolve the wrong row; `PkBuf`
-    // stores all 24 bytes inline and the resolve seeks the full key. The index
-    // emits the entries by indexed value x (collected order (3,_,1),(1,_,5),
-    // (2,_,9)), which is not source-PK order, so the resolve sort genuinely
-    // reorders by the full 24-byte key.
+    // A wide (`src_pk_stride` = 24 > 16) source PK must resolve at its full
+    // width. Each PK varies past byte 16 (col c), so a 16-byte-truncated key
+    // would resolve the wrong row. The index emits the entries by indexed value x
+    // ((3,_,1),(1,_,5),(2,_,9)), which is not source-PK order, so the resolve
+    // orders them by the full 24-byte key.
     //
     // Wide PKs are DDL-rejected for base tables, so this registers the relation
-    // and its index directly (as `wide_pk_validation.rs` does). The leading PK
-    // column is distinct per row, so the base flush orders the shard by the wide
-    // PK — which the resolve's binary-search seek relies on.
+    // and its index directly (as `wide_pk_validation.rs` does).
     use gnitz_store::relation::RelationKind;
     use gnitz_store::schema::SchemaDescriptor;
 

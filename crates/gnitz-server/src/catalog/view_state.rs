@@ -4,7 +4,7 @@
 //! status.
 
 use super::*;
-use gnitz_store::storage::SourceCursor;
+use gnitz_store::read::SourceCursor;
 use gnitz_wire::{ReadSpec, WireFault};
 use rustc_hash::FxHashSet;
 use std::rc::Rc;

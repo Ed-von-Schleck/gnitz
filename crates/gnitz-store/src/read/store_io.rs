@@ -8,9 +8,9 @@ use std::rc::Rc;
 
 use super::SkeletonHydrator;
 use crate::relation::RelationRegistry;
-use crate::schema::key::{compare_pk_bytes, IndexKeySpec};
+use crate::schema::key::{compare_pk_bytes, sort_indices, IndexKeySpec};
 use crate::schema::{project_schema, ColumnLocator};
-use crate::storage::{Batch, BoundedIndexCursor, PkSetGather, SkeletonKeys, SourceCursor, StoreError};
+use crate::storage::{Batch, PkSetGather, ReadCursor, SkeletonKeys, StoreError};
 use gnitz_wire::{KeyRange, ReadBound};
 
 const INDEX_SCAN_RATIO: usize = 16;
@@ -142,8 +142,13 @@ impl RelationRegistry {
             let spec = ic.key_spec();
             let (idx, matches) = ic.store().cursor_over(&spec, &r);
             if matches <= entry.store().estimated_rows() / INDEX_SCAN_RATIO {
-                let rows = matches.min(self.config.scan_chunk_rows);
-                let walk = BoundedIndexCursor::new(idx, entry.cursor(), spec, rows);
+                let walk = BoundedIndexCursor {
+                    idx,
+                    src: PkSetGather::over(entry.cursor()),
+                    spec,
+                    pks: Vec::new(),
+                    order: Vec::new(),
+                };
                 return Ok((SourceCursor::Bounded(Box::new(walk)), ReadBound::None));
             }
         }
@@ -199,4 +204,82 @@ fn debug_assert_hydration_matches(out: &Batch, keys: &[u8], coarse: &[i64]) {
         coarse.len(),
         "hydration produced no rows for a trailing skeleton key"
     );
+}
+
+/// A chunked source of `Batch`es over one relation, in every shape a bound can take.
+pub enum SourceCursor {
+    Full(Box<ReadCursor>),
+    Bounded(Box<BoundedIndexCursor>),
+    /// `pk IN (…)` gather over a listed key set.
+    PkSet(Box<PkSetGather>),
+}
+
+impl SourceCursor {
+    /// The next non-empty source chunk, or `None` once the source is exhausted.
+    /// `PkSet` exceeds `max_rows` rather than split a PK group.
+    pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
+        let mut skeletons = SkeletonKeys::default();
+        let chunk = self.drain_live_chunk(max_rows, &mut skeletons);
+        skeletons.assert_none();
+        chunk
+    }
+
+    /// [`Self::drain_chunk`] with skeleton rows split out; `Some` and empty means every
+    /// row of the chunk was a skeleton.
+    fn drain_live_chunk(&mut self, max_rows: usize, skeletons: &mut SkeletonKeys) -> Option<Batch> {
+        match self {
+            SourceCursor::Full(c) => c.drain_live_chunk(max_rows, skeletons),
+            SourceCursor::Bounded(c) => c.drain_live_chunk(max_rows, skeletons),
+            SourceCursor::PkSet(g) => g.next_live_chunk(max_rows, skeletons),
+        }
+    }
+}
+
+/// A walk of one secondary-index key range, gathering each entry's row from the base
+/// table it indexes, over one snapshot of each. The owner is a base table, so a source
+/// PK has one live row and at most one live index entry, at weight 1.
+pub struct BoundedIndexCursor {
+    /// Positioned on the index range and clamped at its end.
+    idx: ReadCursor,
+    src: PkSetGather,
+    spec: IndexKeySpec,
+    /// A refill's source PKs in index order, flat at `src`'s `pk_stride`.
+    pks: Vec<u8>,
+    order: Vec<u32>,
+}
+
+impl BoundedIndexCursor {
+    fn drain_live_chunk(&mut self, max_rows: usize, skeletons: &mut SkeletonKeys) -> Option<Batch> {
+        assert!(
+            max_rows > 0,
+            "BoundedIndexCursor::drain_live_chunk: max_rows must be positive"
+        );
+        let stride = self.src.schema().pk_stride();
+        loop {
+            if self.src.remaining_keys() == 0 {
+                // Refill the gather from the next `max_rows` entries, sorted into PK order.
+                self.pks.clear();
+                let mut taken = 0;
+                while taken < max_rows && self.idx.valid {
+                    debug_assert!(self.idx.current_weight > 0, "an index entry at a non-positive weight");
+                    self.pks
+                        .extend_from_slice(self.spec.split_entry(self.idx.current_pk_bytes()).1);
+                    self.idx.advance();
+                    taken += 1;
+                }
+                if taken == 0 {
+                    return None;
+                }
+                sort_indices(&self.pks, stride, &mut self.order);
+                let keys = self.src.reload();
+                for &i in &self.order {
+                    keys.extend_from_slice(&self.pks[i as usize * stride..][..stride]);
+                }
+            }
+            // `None` means every key left had no row (an orphaned entry): refill again.
+            if let Some(chunk) = self.src.next_live_chunk(max_rows, skeletons) {
+                return Some(chunk);
+            }
+        }
+    }
 }
