@@ -1,47 +1,3 @@
-use super::*;
-
-/// Every non-OK status maps to its own error, and an `Error` whose text
-/// is absent or blank falls back to the default rather than surfacing a blank
-/// one — the warm-push guard's rejection must stay legible.
-///
-/// Driven through a real encoded frame: a hand-built control can express a state
-/// the encoder never produces.
-#[test]
-fn check_response_classifies_every_status() {
-    use crate::protocol::message::encode_frame;
-
-    let classify = |status: WireStatus, text: &str| {
-        let hdr = ControlHeader { status, arg0: 77, ..Default::default() };
-        let frame = encode_frame(hdr, text.as_bytes(), None, None);
-        let ctrl = peek_control_block(&frame).expect("a control frame parses");
-        check_response(&ctrl)
-    };
-    let err = |status, text: &str| classify(status, text).expect_err("a non-OK status is an error");
-
-    assert!(matches!(
-        err(WireStatus::SchemaMismatch, ""),
-        ClientError::SchemaMismatch
-    ));
-    assert!(matches!(err(WireStatus::DeltaExpired, ""), ClientError::DeltaExpired));
-    assert!(matches!(err(WireStatus::TxnConflict, ""), ClientError::TxnConflict));
-
-    // The server formats real text for `SalFull`, and it must survive the
-    // decode: gating the text on `Error` made `SalFull`'s payload dead.
-    let sal = err(WireStatus::SalFull, "SAL full: Push group did not fit");
-    assert!(
-        matches!(&sal, ClientError::SalFull(m) if m == "SAL full: Push group did not fit"),
-        "{sal:?}"
-    );
-
-    for (text, want) in [("", "unknown server error"), ("real error", "real error")] {
-        assert!(
-            matches!(err(WireStatus::Error, text), ClientError::ServerError(m) if m == want),
-            "{text:?}"
-        );
-    }
-    assert!(classify(WireStatus::Ok, "").is_ok());
-}
-
 mod spine_tests {
     //! The spine under bytes only a test can arrange: a scripted peer on the far
     //! end of a socketpair feeds reply frames one `step` at a time.
@@ -52,7 +8,7 @@ mod spine_tests {
     use crate::protocol::transport::poll_fd;
     use crate::protocol::{BatchAppender, ColumnDef, TypeCode};
     use crate::test_support::{established, framed, make_socketpair, raw_read_frame, raw_send, reply_ctrl};
-    use crate::GnitzClient;
+    use crate::{GnitzClient, WireFault};
 
     /// The version a request for `tid` would stamp now; `0` = nothing cached.
     fn stamped(s: &mut Session, tid: u64) -> u16 {
@@ -302,9 +258,8 @@ mod spine_tests {
         peer.send(&reply_warm(t, 8, &batch_a(&[5]), false));
         let e = drive(&mut s, slot).expect_err("a stale stamp is a decode error");
         assert!(
-            matches!(&e, ClientError::ConnectionLost(c) if matches!(&**c,
-                ClientError::Protocol(ProtocolError::DecodeError(m))
-                    if m == "schema version mismatch: expected 7, server 8")),
+            matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(m))
+                if m == "schema version mismatch: expected 7, server 8"),
             "{e:?}"
         );
         assert!(s.is_closed());
@@ -321,7 +276,7 @@ mod spine_tests {
         // The second train is replaced by one error frame and nothing follows.
         peer.send(&reply_status(WireStatus::Error, "relation 2 vanished", 0));
         let r = drive(&mut s, slot);
-        assert!(matches!(r, Err(ClientError::ServerError(ref m)) if m == "relation 2 vanished"));
+        assert!(matches!(r, Err(ClientError::Refused(WireFault { text: ref m, .. })) if m == "relation 2 vanished"));
         assert_eq!(s.interest(), Interest::NONE, "nothing left pending");
 
         // The next request on the same connection completes normally.
@@ -347,7 +302,7 @@ mod spine_tests {
         peer.send(&reply_status(WireStatus::Error, "SCAN_MULTI: empty item list", 0));
         let r = drive(&mut s, slot);
         assert!(
-            matches!(r, Err(ClientError::ServerError(ref m)) if m.contains("empty item list")),
+            matches!(r, Err(ClientError::Refused(WireFault { text: ref m, .. })) if m.contains("empty item list")),
             "{r:?}"
         );
         assert!(!s.is_closed());
@@ -387,16 +342,18 @@ mod spine_tests {
 
     #[test]
     fn a_status_frame_completes_its_slot_and_leaves_the_connection_usable() {
-        // `check_response` owns the status → error table; what the spine adds is
-        // that a status frame completes its slot rather than erroring `step`.
+        // A status frame completes its slot rather than erroring `step`.
         let (mut s, peer) = pair();
         let slot = s.submit(Request::RawFrame(reply_ctrl(0, 0))).unwrap();
         s.step(Interest::WRITE);
         peer.drain_request();
-        peer.send(&reply_status(WireStatus::TxnConflict, "", 77));
+        peer.send(&reply_status(WireStatus::TxnConflict, "conflict", 77));
         let r = drive(&mut s, slot);
         assert!(
-            matches!(r, Err(ClientError::TxnConflict)),
+            matches!(
+                r,
+                Err(ClientError::Refused(WireFault { status: WireStatus::TxnConflict, .. }))
+            ),
             "the status picks the variant: {r:?}"
         );
         assert!(!s.is_closed());
@@ -411,7 +368,7 @@ mod spine_tests {
         peer.send(&reply_ctrl(6, 1));
         let r = c.scan(5);
         assert!(
-            matches!(&r, Err(ClientError::ConnectionLost(e)) if matches!(**e, ClientError::Protocol(_))),
+            matches!(&r, Err(ClientError::ConnectionLost(ProtocolError::DecodeError(_)))),
             "{r:?}"
         );
         assert_eq!(c.session.interest(), Interest::NONE);
@@ -444,7 +401,10 @@ mod spine_tests {
         assert!(matches!(done[0].1, Ok(Reply::Lsn(11))), "{:?}", done[0].1);
         assert_eq!(done[1].0, b);
         assert!(
-            matches!(&done[1].1, Err(ClientError::ConnectionLost(e)) if matches!(**e, ClientError::Protocol(_))),
+            matches!(
+                &done[1].1,
+                Err(ClientError::ConnectionLost(ProtocolError::DecodeError(_)))
+            ),
             "{:?}",
             done[1].1
         );
@@ -468,8 +428,7 @@ mod spine_tests {
         assert!(matches!(done[0].1, Ok(Reply::Lsn(11))), "{:?}", done[0].1);
         assert_eq!(done[1].0, b);
         assert!(
-            matches!(&done[1].1, Err(ClientError::ConnectionLost(e))
-                if matches!(**e, ClientError::Protocol(ProtocolError::IoError(_)))),
+            matches!(&done[1].1, Err(ClientError::ConnectionLost(ProtocolError::IoError(_)))),
             "{:?}",
             done[1].1
         );
@@ -495,8 +454,7 @@ mod spine_tests {
         assert_eq!(done.len(), 1, "{done:?}");
         assert_eq!(done[0].0, slot);
         assert!(
-            matches!(&done[0].1, Err(ClientError::ConnectionLost(e))
-                if matches!(**e, ClientError::Protocol(ProtocolError::IoError(_)))),
+            matches!(&done[0].1, Err(ClientError::ConnectionLost(ProtocolError::IoError(_)))),
             "{:?}",
             done[0].1
         );
@@ -547,7 +505,7 @@ mod spine_tests {
         assert!(s.queued_bytes() >= MAX_QUEUED_BYTES);
         let r = push(&mut s);
         assert!(
-            matches!(r, Err(ClientError::ServerError(ref m)) if m.contains("unwritten bytes queued")),
+            matches!(r, Err(ClientError::Refused(WireFault { text: ref m, .. })) if m.contains("unwritten bytes queued")),
             "the byte cap, not the count one: {r:?}"
         );
         assert!(s.interest().write, "nothing was flushed, so it is all still queued");
@@ -569,7 +527,7 @@ mod spine_tests {
             last = id;
         }
         let r = s.submit(Request::scan(1));
-        assert!(matches!(r, Err(ClientError::ServerError(ref m)) if m.contains("in flight")));
+        assert!(matches!(r, Err(ClientError::Refused(WireFault { text: ref m, .. })) if m.contains("in flight")));
     }
 
     /// Deliver `SIGUSR1` to the calling thread until `stop` is set, with a no-op
@@ -608,7 +566,7 @@ mod spine_tests {
             if std::mem::replace(&mut fired, true) {
                 Ok(())
             } else {
-                Err(ClientError::ServerError("interrupted".into()))
+                Err("interrupted".into())
             }
         })));
         let stop = Arc::new(AtomicBool::new(false));
@@ -617,7 +575,7 @@ mod spine_tests {
         // The peer never answers, so the scan parks; the signal makes the park
         // return `EINTR`, which is the one place the hook runs.
         let r = c.scan(1);
-        assert!(matches!(r, Err(ClientError::ServerError(ref m)) if m == "interrupted"));
+        assert!(matches!(r, Err(ClientError::Interrupted(ref e)) if e.to_string() == "interrupted"));
         stop.store(true, Ordering::Relaxed);
         sig.join().unwrap();
         assert_eq!(c.session.interest(), Interest::READ, "the abandoned slot stays pending");
@@ -669,7 +627,7 @@ mod spine_tests {
         // The server rejects the warm push; the blocking verb retries it cold.
         let h = std::thread::spawn(move || {
             peer.drain_request();
-            peer.send(&reply_status(WireStatus::SchemaMismatch, "", 0));
+            peer.send(&reply_status(WireStatus::SchemaMismatch, "stale", 0));
             peer.drain_request();
             peer.send(&reply_ctrl(4, 555));
             peer
@@ -707,12 +665,18 @@ mod spine_tests {
         assert_eq!(peer.drain_request().len(), warm_len, "both encoded at the stale stamp");
 
         // The first mismatch fails its own slot and evicts the entry.
-        peer.send(&reply_status(WireStatus::SchemaMismatch, "", 0));
+        peer.send(&reply_status(WireStatus::SchemaMismatch, "stale", 0));
         let mut done = s.step(Interest::READ);
         assert_eq!(done.len(), 1);
         let (id, r) = done.pop().unwrap();
         assert_eq!(id, a);
-        assert!(matches!(r, Err(ClientError::SchemaMismatch)));
+        assert!(matches!(
+            r,
+            Err(ClientError::Refused(WireFault {
+                status: WireStatus::SchemaMismatch,
+                ..
+            }))
+        ));
         assert!(!s.is_closed(), "a per-slot error leaves the connection usable");
         assert_eq!(stamped(&mut s, 4), 0, "the entry is gone");
 
@@ -728,12 +692,18 @@ mod spine_tests {
         );
 
         // The second stale push fails too — every push encoded at the stale stamp does.
-        peer.send(&reply_status(WireStatus::SchemaMismatch, "", 0));
+        peer.send(&reply_status(WireStatus::SchemaMismatch, "stale", 0));
         let mut done = s.step(Interest::READ);
         assert_eq!(done.len(), 1);
         let (id, r) = done.pop().unwrap();
         assert_eq!(id, c);
-        assert!(matches!(r, Err(ClientError::SchemaMismatch)));
+        assert!(matches!(
+            r,
+            Err(ClientError::Refused(WireFault {
+                status: WireStatus::SchemaMismatch,
+                ..
+            }))
+        ));
 
         // The cold push's ACK carries the block at the new version, which puts the
         // next push back on the warm path.

@@ -6,8 +6,8 @@
 
 mod common;
 use common::*;
-use gnitz_core::{GnitzClient, SchemaFacts, TypeCode};
-use gnitz_sql::SqlResult;
+use gnitz_core::{ClientError, GnitzClient, SchemaFacts, TypeCode, WireFault, WireStatus};
+use gnitz_sql::{GnitzSqlError, SqlResult};
 
 /// `Some(is_unique)` of the single-column index on `table.col`, `None` when the
 /// column carries no index.
@@ -319,7 +319,12 @@ fn an_absent_relation_is_one_not_found_everywhere() {
         ("INSERT INTO NoPe VALUES (1)", "NoPe"),
         ("DROP TABLE NoPe", "NoPe"),
     ] {
-        assert_rejects_variant(&mut client, &sn, sql, "Exec", &format!("{sn}.{name}"));
+        let e = try_exec(&mut client, &sn, sql).expect_err(sql);
+        assert!(
+            matches!(&e, GnitzSqlError::Exec(ClientError::Refused(WireFault { status: WireStatus::NotFound, text }))
+                if text.contains(&format!("{sn}.{name}"))),
+            "`{sql}`: {e:?}"
+        );
     }
 }
 

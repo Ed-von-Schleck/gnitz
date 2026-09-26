@@ -207,7 +207,7 @@ def test_insert_duplicate_key_raises_while_upserts_are_in_flight(server, client,
         p.start()
     try:
         for _ in range(20):
-            with pytest.raises(gnitz.GnitzError, match="(?i)duplicate key"):
+            with pytest.raises(gnitz.GnitzIntegrityError, match="(?i)duplicate key"):
                 client.execute_sql("INSERT INTO t VALUES (1, 20)", schema_name=sn)
     finally:
         stop.set()

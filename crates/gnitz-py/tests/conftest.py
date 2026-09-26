@@ -366,12 +366,15 @@ def mirror_dir(tmp_path):
 
 
 @pytest.fixture
-def mirror_on():
+def mirror_on(tmp_path):
     """Factory for a client with a copy directory attached — `mirror_on(base_dir,
     target)` — closed at teardown however the test left it.
 
     Closing is not tidiness: an unclosed client skips the exit checkpoint and
-    keeps its copy directory locked for the life of the interpreter.
+    keeps its copy directory locked for the life of the interpreter. The close
+    raises if that checkpoint fails, so it must run while the directory still
+    exists: depending on `tmp_path` tears this fixture down before the test's
+    temporary directory is reclaimed.
     """
     with contextlib.ExitStack() as stack:
         def make(base_dir, target):

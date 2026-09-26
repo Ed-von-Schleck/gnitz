@@ -143,13 +143,10 @@ pub(crate) fn execute_statement(
             reject_if(modifier.is_some(), CTX, "a COMMIT modifier (TRY / CATCH)")?;
             // A COMMIT-time OCC conflict is not auto-retried — the buffered reads
             // are stale by definition. `txn_commit` already took the buffer out
-            // (transaction closed), so surfacing `Conflict` leaves nothing open;
-            // the application re-runs the whole transaction from BEGIN.
-            match client.txn_commit() {
-                Ok(lsn) => Ok(SqlResult::TransactionCommitted { lsn }),
-                Err(ClientError::TxnConflict) => Err(GnitzSqlError::Conflict { table: None }),
-                Err(e) => Err(GnitzSqlError::Exec(e)),
-            }
+            // (transaction closed), so surfacing the `TxnConflict` refusal leaves
+            // nothing open; the application re-runs the whole transaction from
+            // BEGIN.
+            Ok(SqlResult::TransactionCommitted { lsn: client.txn_commit()? })
         }
         Statement::Rollback { chain, savepoint } => {
             const CTX: &str = "ROLLBACK";

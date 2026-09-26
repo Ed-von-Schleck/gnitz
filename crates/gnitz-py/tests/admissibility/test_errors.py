@@ -69,7 +69,7 @@ def test_an_absent_relation_is_a_miss_not_a_writability_failure(client, schema_n
     and a name the client itself cannot resolve raises a catchable class, so a
     caller branches on absence without matching prose."""
     batch = gnitz.ZSetBatch(gnitz.Schema([KV.columns[0]], [0])).extend([{"pk": 1}])
-    with pytest.raises(gnitz.GnitzError, match="not found"):
+    with pytest.raises(gnitz.GnitzNotFoundError, match="not found"):
         client.push(99999999, batch)
     with pytest.raises(gnitz.GnitzError):
         client.scan(99999999)

@@ -1,7 +1,7 @@
 from gnitz._native import (
     GnitzError, GnitzConflictError, GnitzDeltaExpiredError,
     GnitzSalFullError, GnitzMirrorPoisonedError, GnitzNotFoundError,
-    GnitzIntegrityError, Row, ScanResult,
+    GnitzIntegrityError, GnitzSchemaMismatchError, Row, ScanResult,
     ColumnDef, Schema, ZSetBatch, GnitzClient, DeltaReply,
     PollResult,
     SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, IDX_TAB,

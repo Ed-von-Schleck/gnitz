@@ -45,7 +45,7 @@ fn a_lease_routes_consecutive_ids_until_dropped() {
 fn an_ack_landing_before_its_awaiter_is_kept() {
     let (r, writers) = reactor_with_rings(1);
     let lease = r.lease_acks(1, "test");
-    writers[0].send_status(0, lease.id(0), WireStatus::Error, &[]);
+    writers[0].send_status(0, lease.id(0), WireStatus::Error, b"boom");
     r.drain_all_w2m();
 
     assert!(

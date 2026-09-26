@@ -232,8 +232,7 @@ fn encode_writes_exactly_the_predicted_size() {
 #[test]
 fn decode_wire_round_trips_error_text() {
     for text in [
-        b"".as_slice(),
-        b"boom",
+        b"boom".as_slice(),
         b"this error message is definitely longer than twelve bytes",
     ] {
         let wire = WireMsg {

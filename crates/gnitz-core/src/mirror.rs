@@ -27,6 +27,7 @@
 //! and the margin narrows as the walk grows until a full scan of a large view at
 //! high W is a loss. Narrowing the bound is the lever.
 
+use gnitz_wire::{WireFault, WireStatus};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
@@ -142,7 +143,7 @@ pub enum Invalidate {
 /// It lives here rather than beside [`ClientError`] because it is the
 /// [`MirrorStore`] seam's error channel and nothing else raises it;
 /// [`ClientError::Mirror`] is how it reaches a caller of the client.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum MirrorError {
     /// The local engine refused or failed: a storage fault, a registration the
     /// registry rejected, a read the spec could not express.
@@ -296,20 +297,22 @@ fn fail_range(
     unanswered: Range<usize>,
     cause: ClientError,
 ) {
-    let share = |c: &ClientError| match c {
-        ClientError::ConnectionLost(lost) => ClientError::ConnectionLost(Arc::clone(lost)),
-        other => ClientError::ServerError(other.to_string()),
-    };
     let mut ids = unanswered.map(|i| views[i].0);
     let Some(first) = ids.next() else { return };
-    let later: Vec<_> = ids.map(|tid| (tid, Err(share(&cause)))).collect();
+    let later: Vec<_> = ids.map(|tid| (tid, Err(cause.clone()))).collect();
     applied.push((first, Err(cause)));
     applied.extend(later);
 }
 
+/// A mirror verb on a client that never attached a store. The message names no
+/// method — each binding spells the attach differently.
+fn no_mirror_store() -> ClientError {
+    ClientError::from("this client mirrors nothing; attach a store before mirroring a view".to_string())
+}
+
 impl GnitzClient {
     fn mirror_state(&mut self) -> Result<&mut MirrorState, ClientError> {
-        self.mirror.as_deref_mut().ok_or(ClientError::NoMirrorStore)
+        self.mirror.as_deref_mut().ok_or_else(no_mirror_store)
     }
 
     /// The `(schema, name)` `tid` is registered under, for a re-resolve.
@@ -322,7 +325,7 @@ impl GnitzClient {
         self.mirror_state()?
             .views
             .get(&tid)
-            .ok_or_else(|| ClientError::ServerError(format!("relation {tid} is not mirrored")))
+            .ok_or_else(|| ClientError::from(format!("relation {tid} is not mirrored")))
     }
 
     /// Resolve `schema_name.name` upstream, check it can be mirrored, and bind
@@ -344,15 +347,15 @@ impl GnitzClient {
         let rel = self.resolve_relation(&schema_name, &name)?;
         match rel.class {
             RelClass::FedView => self.bind(&schema_name, &name, rel),
-            RelClass::Table | RelClass::Stream => Err(ClientError::ServerError(format!(
+            RelClass::Table | RelClass::Stream => Err(ClientError::from(format!(
                 "'{schema_name}.{name}' is a {}; only a view can be mirrored",
                 rel.class.noun()
             ))),
-            RelClass::BoundedView => Err(ClientError::ServerError(format!(
+            RelClass::BoundedView => Err(ClientError::from(format!(
                 "view '{schema_name}.{name}' is capacity-bounded, and a capacity and a feed \
                  are refused together, so it carries no feed to subscribe to"
             ))),
-            RelClass::View => Err(ClientError::ServerError(format!(
+            RelClass::View => Err(ClientError::from(format!(
                 "view '{schema_name}.{name}' keeps no delta feed; \
                  create it WITH (delta = '<size>') to mirror it"
             ))),
@@ -424,16 +427,18 @@ impl GnitzClient {
         match err {
             // The feed stopped continuing. Re-resolve, then re-read whole: a
             // foreign tag is how a relation recreated under the same name reads.
-            ClientError::DeltaExpired => self.reseed_by_name(tid),
+            ClientError::Refused(WireFault { status: WireStatus::DeltaExpired, .. }) => self.reseed_by_name(tid),
             // The id is gone, and only the client's own name binding says whether
             // the view moved or died. Died → `Failed` with the cursor untouched,
             // so the copy keeps answering until the host forgets it.
-            e @ ClientError::NotFound { .. } => match self.relation_id_moved(tid) {
-                Ok(true) => self.reseed_by_name(tid),
-                // Not recreated, or the probe failed too: either way the poll's
-                // own error is the one that says what happened to this view.
-                Ok(false) | Err(_) => Err(e),
-            },
+            e @ ClientError::Refused(WireFault { status: WireStatus::NotFound, .. }) => {
+                match self.relation_id_moved(tid) {
+                    Ok(true) => self.reseed_by_name(tid),
+                    // Not recreated, or the probe failed too: either way the poll's
+                    // own error is the one that says what happened to this view.
+                    Ok(false) | Err(_) => Err(e),
+                }
+            }
             e => Err(e),
         }
     }
@@ -549,7 +554,7 @@ impl GnitzClient {
     /// when the feed no longer covers them.
     pub fn attach_mirror(&mut self, store: impl MirrorStore + 'static) -> Result<(), ClientError> {
         if let Some(m) = &self.mirror {
-            return Err(ClientError::ServerError(format!(
+            return Err(ClientError::from(format!(
                 "this client already mirrors at '{}'; close_mirror before attaching another store",
                 m.store.base_dir()
             )));
@@ -613,7 +618,7 @@ impl GnitzClient {
         // disjoint fields, so both borrows hold.
         let Self { session, mirror, park_hook, .. } = self;
         let Some(mirror) = mirror.as_deref_mut() else {
-            return Err(ClientError::NoMirrorStore);
+            return Err(no_mirror_store());
         };
         // A cursor at round 0 names the bootstrap bound, which would read the
         // whole view in the wrong shape: the caller's bug, raised before
@@ -799,10 +804,11 @@ impl GnitzClient {
     ///
     /// It is the **only** recovery from a poisoned store, which cannot otherwise
     /// be cleared without discarding a working connection — so a poisoned store
-    /// declining the checkpoint is not a failure to close.
+    /// declining the checkpoint is not a failure to close. With no store
+    /// attached there is nothing to close, which is not a failure either.
     pub fn close_mirror(&mut self) -> Result<(), ClientError> {
         let Some(mut m) = self.mirror.take() else {
-            return Err(ClientError::NoMirrorStore);
+            return Ok(());
         };
         let out = match m.store.checkpoint() {
             Err(MirrorError::Poisoned(_)) => Ok(()),

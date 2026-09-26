@@ -2,7 +2,7 @@
 //! each read shape plans to, what EXPLAIN says about it, and which reads are
 //! rejected before any request could be issued.
 
-use gnitz_core::{CatalogSnapshot, RelClass, TypeCode};
+use gnitz_core::{CatalogSnapshot, ClientError, RelClass, TypeCode, WireFault, WireStatus};
 use gnitz_sql::sqlparser::ast::Statement;
 use gnitz_sql::{explain_lines, GnitzSqlError};
 
@@ -1019,7 +1019,10 @@ fn the_loop_resolves_only_what_the_planner_asks_for() {
     absent.insert(SN, "t", None);
     let e = err_of(read(&absent, "SELECT id FROM t"));
     assert!(
-        !matches!(e, GnitzSqlError::CatalogMiss(_)) && format!("{e}").contains("not found"),
+        matches!(
+            e,
+            GnitzSqlError::Exec(ClientError::Refused(WireFault { status: WireStatus::NotFound, .. }))
+        ),
         "got {e:?}"
     );
 

@@ -5,7 +5,7 @@
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use gnitz_core::{ClientError, GnitzClient, MirrorError, TypeCode};
+use gnitz_core::{ClientError, GnitzClient, MirrorError, TypeCode, WireStatus};
 
 mod async_transport;
 mod client;
@@ -28,42 +28,45 @@ pyo3::create_exception!(_native, GnitzError, pyo3::exceptions::PyException);
 // Every class below subclasses GnitzError, so `except GnitzError` catches them
 // all while a caller that branches on one can name it instead of matching prose.
 
-// WireStatus::TxnConflict: a table the transaction read was written concurrently.
-// Retryable.
+// WireStatus::TxnConflict.
 pyo3::create_exception!(_native, GnitzConflictError, GnitzError);
-// WireStatus::DeltaExpired: the cursor's rounds are gone, or it names another boot
-// or relation. Recovery is to bootstrap again.
+// WireStatus::DeltaExpired.
 pyo3::create_exception!(_native, GnitzDeltaExpiredError, GnitzError);
-// WireStatus::SalFull: the one server error that clears itself, so retryable.
+// WireStatus::SalFull.
 pyo3::create_exception!(_native, GnitzSalFullError, GnitzError);
-// A mirror store refuses every further call that touches a copy. Recovery is
-// `close_mirror()`, and nothing else.
+// MirrorError::Poisoned. Recovery is `close_mirror()`, and nothing else.
 pyo3::create_exception!(_native, GnitzMirrorPoisonedError, GnitzError);
-// A named relation, index or schema the catalog does not hold.
+// WireStatus::NotFound.
 pyo3::create_exception!(_native, GnitzNotFoundError, GnitzError);
-// WireStatus::IntegrityViolation: a PK, unique-index or foreign-key violation.
+// WireStatus::IntegrityViolation.
 pyo3::create_exception!(_native, GnitzIntegrityError, GnitzError);
+// WireStatus::SchemaMismatch.
+pyo3::create_exception!(_native, GnitzSchemaMismatchError, GnitzError);
 
-/// Wrap any `Display` error as a `GnitzError` PyErr. For the handful of
-/// failures that carry no retryability verdict (handshake).
+/// Wrap any `Display` error as a plain `GnitzError`.
 pub(crate) fn gnitz_err(e: impl std::fmt::Display) -> PyErr {
     GnitzError::new_err(e.to_string())
 }
 
 /// The class a [`ClientError`] raises as — the one place that decides, so a
-/// given failure is always the same Python class. `Interrupted` re-raises the
-/// `PyErr` it carries, keeping a `KeyboardInterrupt` one.
+/// given failure is always the same Python class. A refusal raises by its status;
+/// `Interrupted` re-raises the `PyErr` it carries, keeping a `KeyboardInterrupt`
+/// one.
 pub(crate) fn client_err(e: ClientError) -> PyErr {
     match e {
-        ClientError::Interrupted(inner) => match inner.downcast::<PyErr>() {
-            Ok(py_err) => *py_err,
-            Err(other) => gnitz_err(other),
+        ClientError::Refused(f) => match f.status {
+            WireStatus::TxnConflict => GnitzConflictError::new_err(f.text),
+            WireStatus::DeltaExpired => GnitzDeltaExpiredError::new_err(f.text),
+            WireStatus::SalFull => GnitzSalFullError::new_err(f.text),
+            WireStatus::NotFound => GnitzNotFoundError::new_err(f.text),
+            WireStatus::IntegrityViolation => GnitzIntegrityError::new_err(f.text),
+            WireStatus::SchemaMismatch => GnitzSchemaMismatchError::new_err(f.text),
+            WireStatus::Ok | WireStatus::Error => GnitzError::new_err(f.text),
         },
-        ClientError::TxnConflict => GnitzConflictError::new_err(e.to_string()),
-        ClientError::DeltaExpired => GnitzDeltaExpiredError::new_err(e.to_string()),
-        ClientError::SalFull(_) => GnitzSalFullError::new_err(e.to_string()),
-        ClientError::NotFound { .. } => GnitzNotFoundError::new_err(e.to_string()),
-        ClientError::IntegrityViolation(_) => GnitzIntegrityError::new_err(e.to_string()),
+        ClientError::Interrupted(inner) => match inner.downcast_ref::<PyErr>() {
+            Some(py_err) => Python::attach(|py| py_err.clone_ref(py)),
+            None => gnitz_err(inner),
+        },
         ClientError::Mirror(MirrorError::Poisoned(_)) => GnitzMirrorPoisonedError::new_err(e.to_string()),
         other => gnitz_err(other),
     }
@@ -73,7 +76,6 @@ pub(crate) fn client_err(e: ClientError) -> PyErr {
 pub(crate) fn sql_err(e: gnitz_sql::GnitzSqlError) -> PyErr {
     match e {
         gnitz_sql::GnitzSqlError::Exec(inner) => client_err(inner),
-        gnitz_sql::GnitzSqlError::Conflict { .. } => GnitzConflictError::new_err(e.to_string()),
         other => gnitz_err(other),
     }
 }
@@ -97,7 +99,7 @@ pub(crate) fn build_pylist<'py, T: IntoPyObject<'py>>(
 pub(crate) fn connect_client(py: Python<'_>, target: &str) -> PyResult<GnitzClient> {
     let mut client = py.detach(|| GnitzClient::connect(target)).map_err(client_err)?;
     client.set_park_hook(Some(Box::new(|| {
-        Python::attach(|py| py.check_signals()).map_err(|e| ClientError::Interrupted(Box::new(e)))
+        Python::attach(|py| py.check_signals()).map_err(Into::into)
     })));
     Ok(client)
 }
@@ -139,6 +141,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("GnitzNotFoundError", m.py().get_type::<GnitzNotFoundError>())?;
     m.add("GnitzIntegrityError", m.py().get_type::<GnitzIntegrityError>())?;
+    m.add(
+        "GnitzSchemaMismatchError",
+        m.py().get_type::<GnitzSchemaMismatchError>(),
+    )?;
     // System-table IDs — single-sourced from gnitz_wire (delegating codec, not
     // a re-typed copy), as is the table behind `type_codes()`.
     // Only the ids something addresses a relation by are exported.

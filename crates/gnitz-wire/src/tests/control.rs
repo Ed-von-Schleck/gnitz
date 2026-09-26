@@ -47,7 +47,7 @@ fn encode_roundtrips() {
     let hdr = probe_header();
     let err = ControlHeader { status: WireStatus::Error, ..hdr };
     for (hdr, blob) in [
-        (hdr, &b""[..]),
+        (ControlHeader { status: WireStatus::Ok, ..hdr }, &b""[..]),
         (hdr, b"a blob well past any inline threshold"),
         (err, b"table not found"),
     ] {
@@ -124,8 +124,8 @@ fn client_verb_rejects_data_on_a_non_push_verb() {
     }
 }
 
-/// A multi-item frame carries its items and nothing else, and every other frame
-/// ends at its last section.
+/// A multi-item frame carries its items and nothing else — no blob, no schema,
+/// no `target_id` — and every other frame ends at its last section.
 #[test]
 fn client_verb_refuses_sections_the_verb_does_not_carry() {
     let multi = [
@@ -134,8 +134,9 @@ fn client_verb_refuses_sections_the_verb_does_not_carry() {
         ClientVerb::ScanMulti,
         ClientVerb::DeltaPoll,
     ];
-    let ctrl = |verb, blob: &[u8], schema: Option<&[u8]>, tail: &[u8]| {
+    let ctrl_at = |target_id, verb, blob: &[u8], schema: Option<&[u8]>, tail: &[u8]| {
         let hdr = ControlHeader {
+            target_id,
             flags: WireFlags { verb, ..Default::default() },
             ..Default::default()
         };
@@ -143,6 +144,7 @@ fn client_verb_refuses_sections_the_verb_does_not_carry() {
         buf.extend_from_slice(tail);
         peek_control_block(&buf).unwrap().client_verb()
     };
+    let ctrl = |verb, blob: &[u8], schema: Option<&[u8]>, tail: &[u8]| ctrl_at(0, verb, blob, schema, tail);
     for &verb in ClientVerb::ALL {
         if multi.contains(&verb) {
             assert_eq!(ctrl(verb, b"", None, b"items"), Ok(verb));
@@ -150,6 +152,10 @@ fn client_verb_refuses_sections_the_verb_does_not_carry() {
             assert!(
                 ctrl(verb, b"", Some(b"sch"), b"items").is_err(),
                 "{verb:?} with a schema"
+            );
+            assert!(
+                ctrl_at(7, verb, b"", None, b"items").is_err(),
+                "{verb:?} naming a target"
             );
         } else {
             assert_eq!(ctrl(verb, b"blob", Some(b"sch"), b""), Ok(verb));
@@ -179,7 +185,7 @@ fn fault_reads_the_status_and_blob() {
 
 #[test]
 fn peek_rejects_a_truncated_header() {
-    let buf = encode(&probe_header(), b"");
+    let buf = encode(&probe_header(), b"gone");
     assert_eq!(
         peek_control_block(&buf[..CTRL_HEADER_SIZE - 1]).err(),
         Some("control header truncated")
@@ -204,14 +210,14 @@ fn peek_rejects_a_blob_past_the_frame() {
 /// reader has to branch past.
 #[test]
 fn peek_rejects_an_unknown_status() {
-    let mut buf = encode(&probe_header(), b"");
+    let mut buf = encode(&probe_header(), b"gone");
     buf[OFF_STATUS..OFF_STATUS + 4].copy_from_slice(&8u32.to_le_bytes());
     assert_eq!(peek_control_block(&buf).err(), Some("control header names no status"));
 }
 
 #[test]
 fn peek_rejects_reserved_flag_bits() {
-    let mut buf = encode(&probe_header(), b"");
+    let mut buf = encode(&probe_header(), b"gone");
     buf[OFF_FLAGS..OFF_FLAGS + 8].copy_from_slice(&(1u64 << 63).to_le_bytes());
     assert_eq!(peek_control_block(&buf).err(), Some("flags: reserved bits set"));
 }

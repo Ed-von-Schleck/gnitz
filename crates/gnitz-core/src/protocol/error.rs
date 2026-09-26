@@ -1,13 +1,10 @@
 use std::fmt;
+use std::sync::Arc;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ProtocolError {
     DecodeError(String),
-    IoError(std::io::Error),
-    /// The peer refused the connection itself and said why — the HELLO reject.
-    /// Its own variant because the frame that carries it is well-formed: a
-    /// `DecodeError` would attribute the server's refusal to this crate's parser.
-    ServerRejected(String),
+    IoError(Arc<std::io::Error>),
 }
 
 impl fmt::Display for ProtocolError {
@@ -15,7 +12,6 @@ impl fmt::Display for ProtocolError {
         match self {
             ProtocolError::DecodeError(msg) => write!(f, "decode error: {msg}"),
             ProtocolError::IoError(e) => write!(f, "io error: {e}"),
-            ProtocolError::ServerRejected(msg) => write!(f, "server rejected: {msg}"),
         }
     }
 }
@@ -24,6 +20,6 @@ impl std::error::Error for ProtocolError {}
 
 impl From<std::io::Error> for ProtocolError {
     fn from(e: std::io::Error) -> Self {
-        ProtocolError::IoError(e)
+        ProtocolError::IoError(Arc::new(e))
     }
 }

@@ -5,7 +5,7 @@ pub enum GnitzSqlError {
     Parse(sqlparser::parser::ParserError),
     /// The statement disagrees with a **catalog relation**: a column name that
     /// does not resolve, a value count against the schema, a nullability. A
-    /// relation that does not resolve is `Exec(NotFound)`.
+    /// relation that does not resolve is a `NotFound` refusal.
     Bind(String),
     /// Two parts of the **statement** disagree, or a literal is out of range —
     /// no catalog decides it. A set-op column-count mismatch is `Plan`; an arity
@@ -24,15 +24,6 @@ pub enum GnitzSqlError {
     /// the name and re-runs the pass; it never reaches a caller of
     /// `SqlPlanner::execute`.
     CatalogMiss(String),
-    /// An OCC precondition failed (a read table was written concurrently) and the
-    /// statement could not commit lose-update-free. `table` names the conflicting
-    /// table for an autocommit RMW statement; `None` for a `BEGIN`/`COMMIT`
-    /// transaction (the conflict spans statements). The Python binding maps this
-    /// to a dedicated retryable `GnitzConflictError`, distinct from a generic
-    /// `Exec` failure.
-    Conflict {
-        table: Option<String>,
-    },
 }
 
 impl fmt::Display for GnitzSqlError {
@@ -46,12 +37,6 @@ impl fmt::Display for GnitzSqlError {
             GnitzSqlError::Internal(s) => write!(f, "internal error: {s}"),
             GnitzSqlError::CatalogMiss(name) => {
                 write!(f, "internal error: relation '{name}' was not resolved before planning")
-            }
-            GnitzSqlError::Conflict { table: Some(t) } => {
-                write!(f, "transaction conflict on table '{t}'; retry the statement")
-            }
-            GnitzSqlError::Conflict { table: None } => {
-                write!(f, "transaction conflict; retry the transaction")
             }
         }
     }
@@ -69,8 +54,7 @@ impl std::error::Error for GnitzSqlError {
             | GnitzSqlError::Plan(_)
             | GnitzSqlError::Unsupported(_)
             | GnitzSqlError::Internal(_)
-            | GnitzSqlError::CatalogMiss(_)
-            | GnitzSqlError::Conflict { .. } => None,
+            | GnitzSqlError::CatalogMiss(_) => None,
         }
     }
 }

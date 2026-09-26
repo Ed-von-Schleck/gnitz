@@ -4,7 +4,7 @@
 //! the rejection leaves the connection usable.
 
 use gnitz_core::protocol::{ColumnDef, Schema, TypeCode};
-use gnitz_core::{ClientError, GnitzClient, TABLE_TAB};
+use gnitz_core::{ClientError, GnitzClient, WireFault, WireStatus, TABLE_TAB};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{ReadBound, ReadSpec};
 
@@ -25,7 +25,7 @@ fn scan_spec_at_a_system_tid_is_rejected_and_the_connection_survives() {
     let err = client
         .scan_spec(TABLE_TAB, &spec, &reply_schema)
         .expect_err("a ReadSpec at a system tid must be rejected");
-    let ClientError::ServerError(msg) = &err else {
+    let ClientError::Refused(WireFault { status: WireStatus::Error, text: msg }) = &err else {
         panic!("expected a WireStatus::Error reply, got {err:?}");
     };
     assert!(msg.contains("system catalog family"), "{msg}");

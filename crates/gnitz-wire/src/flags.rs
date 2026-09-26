@@ -27,8 +27,8 @@ wire_enum! {
         Resolve = 5,
         /// System-table batches committed as one SAL zone.
         DdlTxn = 6,
-        /// User-table batches committed as one SAL zone; `arg0` is the OCC
-        /// basis.
+        /// User-table batches committed as one SAL zone; each family carries
+        /// its own OCC basis.
         PushTxn = 7,
         /// N relations read at one SAL cut.
         ScanMulti = 8,
@@ -211,8 +211,7 @@ wire_enum! {
         Error = 1,
         /// A warm push's schema version is stale: evict the cached schema, push cold.
         SchemaMismatch = 2,
-        /// An OCC precondition failed; `arg0` carries the fresh basis. Nothing
-        /// was written, so it is retryable.
+        /// An OCC precondition failed. Nothing was written, so it is retryable.
         TxnConflict = 3,
         /// A delta cursor below a worker's retention floor: re-read at `after_tick = 0`.
         DeltaExpired = 4,
@@ -227,9 +226,9 @@ wire_enum! {
     }
 }
 
-/// A control header's `(status, blob text)` pair. A plain message converts in as
-/// [`WireStatus::Error`]; nothing converts back, so dropping a status is always
-/// a visible `.text`.
+/// A refusal's class and message: what a non-`Ok` control header carries, and
+/// what a client-side check raises in the same terms. A plain message converts in
+/// as [`WireStatus::Error`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireFault {
     pub status: WireStatus,

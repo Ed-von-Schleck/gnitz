@@ -320,7 +320,7 @@ pub(crate) fn execute_insert(
             // retract-and-insert. DO NOTHING reads the held keys alone.
             let keys = PkKeys::from_keys(schema.pk_stride(), (0..batch.len()).map(|i| batch.pks.get_bytes(i)));
             let read = TargetRead::new(&target, ReadBound::PkSet(keys), Vec::new(), set.is_none())?;
-            let count = commit_rmw(client, &table_name_str, &read, |held| {
+            let count = commit_rmw(client, &read, |held| {
                 resolve_conflicts(&batch, held, set.as_deref_mut(), schema)
             })?;
             Ok(SqlResult::RowsAffected { count })

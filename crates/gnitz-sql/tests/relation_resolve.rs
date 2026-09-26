@@ -9,7 +9,7 @@
 //! relation exactly once, and nothing is retained across statements to go
 //! stale under another client's DDL.
 
-use gnitz_core::GnitzClient;
+use gnitz_core::{ClientError, GnitzClient, WireFault, WireStatus};
 
 mod common;
 use common::*;
@@ -41,19 +41,24 @@ fn resolve_reports_found_absent_and_missing_schema() {
     assert_eq!(schema.pk_cols, vec![0]);
 
     // Relation absent under a live schema: `Ok(None)` from the optional probe,
-    // and the classified absence from the erroring one — the noun and the
-    // qualified name are carried, not formatted into a message.
+    // and a `NotFound` refusal naming the qualified relation from the erroring one.
     assert!(client.resolve(&sn, "nope").unwrap().is_none());
     let err = client.resolve_relation(&sn, "nope").unwrap_err();
     assert!(
-        matches!(&err, gnitz_core::ClientError::NotFound { noun, name }
-            if *noun == "relation" && name == &format!("{sn}.nope")),
+        matches!(&err, ClientError::Refused(WireFault { status: WireStatus::NotFound, text })
+            if text.contains(&format!("{sn}.nope"))),
         "got: {err:?}"
     );
 
     // A missing schema is an error, not an absent relation.
-    let err = client.resolve("no_such_schema", "t").unwrap_err().to_string();
-    assert!(err.contains("not found"), "got: {err}");
+    let err = client.resolve("no_such_schema", "t").unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ClientError::Refused(WireFault { status: WireStatus::NotFound, .. })
+        ),
+        "got: {err:?}"
+    );
 }
 
 /// A view resolves through the same path as a table and reports its class.
@@ -169,9 +174,14 @@ fn an_unregistered_id_is_a_clean_miss() {
     ] {
         let err = client
             .describe_by_id(tid)
-            .expect_err("an unregistered id must not resolve")
-            .to_string();
-        assert!(err.contains("not found"), "tid {tid}: got {err}");
+            .expect_err("an unregistered id must not resolve");
+        assert!(
+            matches!(
+                &err,
+                ClientError::Refused(WireFault { status: WireStatus::NotFound, .. })
+            ),
+            "tid {tid}: got {err:?}"
+        );
     }
 
     // The master neither aborted nor desynced.

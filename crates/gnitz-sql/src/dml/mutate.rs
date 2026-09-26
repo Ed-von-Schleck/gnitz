@@ -82,7 +82,7 @@ fn execute_mutation(
     // writes are built under the catalog schema, so an in-transaction DELETE
     // buffers in the layout an INSERT does.
     let read = TargetRead::new(&target, bound, predicate, set.is_none())?;
-    let count = commit_rmw(client, &table_name, &read, |rows| match &mut set {
+    let count = commit_rmw(client, &read, |rows| match &mut set {
         Some(set) => apply_set(set, rows, None, schema),
         None => Ok(retraction_batch(schema, rows.pks)),
     })?;

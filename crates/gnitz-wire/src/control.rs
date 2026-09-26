@@ -61,7 +61,7 @@ impl DecodedControl {
             verb,
             ClientVerb::DdlTxn | ClientVerb::PushTxn | ClientVerb::ScanMulti | ClientVerb::DeltaPoll
         );
-        if items && (!self.blob.is_empty() || self.schema.is_some()) {
+        if items && (!self.blob.is_empty() || self.schema.is_some() || self.hdr.target_id != 0) {
             return Err("a multi-item frame carries nothing but its items");
         }
         if !items && !self.body.is_empty() {
@@ -103,6 +103,10 @@ pub fn encode_frame_head(
     let (head, tail) = out
         .split_first_chunk_mut::<CTRL_HEADER_SIZE>()
         .expect("the caller sized `out` with frame_head_size");
+    debug_assert!(
+        hdr.status == WireStatus::Ok || !blob.is_empty(),
+        "a fault frame names its cause"
+    );
     let flags = hdr.flags.pack()
         | if schema_block.is_some() { FLAG_HAS_SCHEMA } else { 0 }
         | if has_data { FLAG_HAS_DATA } else { 0 };

@@ -33,6 +33,7 @@ pub use gnitz_wire::{
     TABLE_TAB,
 };
 pub use gnitz_wire::{Circuit, NodeId, OpNode, RangeRel, ReindexRole};
+pub use gnitz_wire::{WireFault, WireStatus};
 pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult};
 pub use protocol::{
     push_zero_cell, BatchAppender, ColType, ColumnDef, FixedInt, FkTarget, PayloadColumn, PkBuf, PkColumn,

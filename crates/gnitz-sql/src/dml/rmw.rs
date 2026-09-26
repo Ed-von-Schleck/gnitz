@@ -18,7 +18,9 @@ use std::sync::Arc;
 
 use crate::codec::project_schema::key_reply;
 use crate::error::GnitzSqlError;
-use gnitz_core::{ClientError, GnitzClient, RelDescriptor, ScanReply, Schema, TxnReads, ZSetBatch};
+use gnitz_core::{
+    ClientError, GnitzClient, RelDescriptor, ScanReply, Schema, TxnReads, WireFault, WireStatus, ZSetBatch,
+};
 use gnitz_expr::RowFilter;
 use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
 
@@ -119,21 +121,21 @@ impl TargetRead {
 /// write is conditioned on that read's watermark. Returns the written row count.
 pub(super) fn commit_rmw(
     client: &mut GnitzClient,
-    table_name: &str,
     read: &TargetRead,
     mut build: impl FnMut(ZSetBatch) -> Result<ZSetBatch, GnitzSqlError>,
 ) -> Result<usize, GnitzSqlError> {
-    for _ in 0..RMW_MAX_ATTEMPTS {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
         let (rows, basis) = read.resolve(client)?;
         let batch = build(rows)?;
         let count = batch.len();
         match client.push_rmw(read.tid, &read.schema, batch, basis) {
-            Ok(()) => return Ok(count),
-            Err(ClientError::TxnConflict) => {}
-            Err(e) => return Err(GnitzSqlError::Exec(e)),
+            Err(ClientError::Refused(WireFault { status: WireStatus::TxnConflict, .. }))
+                if attempt < RMW_MAX_ATTEMPTS => {}
+            r => return r.map(|()| count).map_err(GnitzSqlError::Exec),
         }
     }
-    Err(GnitzSqlError::Conflict { table: Some(table_name.to_string()) })
 }
 
 #[cfg(test)]

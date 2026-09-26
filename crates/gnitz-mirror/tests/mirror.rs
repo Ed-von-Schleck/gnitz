@@ -2058,7 +2058,7 @@ fn attaching_a_store_is_once_and_a_mirror_verb_needs_one() {
     let mut plain = GnitzClient::connect(fx.server.sock_path()).unwrap();
     let e = plain.mirror_view("s", "v_keyed").unwrap_err();
     assert!(
-        matches!(e, ClientError::NoMirrorStore),
+        matches!(&e, ClientError::Refused(f) if f.text.contains("mirrors nothing")),
         "a client with no store says so: {e}"
     );
 

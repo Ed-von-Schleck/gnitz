@@ -22,7 +22,7 @@ use crate::protocol::{
 };
 use gnitz_wire::control::{peek_control_block, ControlHeader, DecodedControl};
 use gnitz_wire::txn_frame;
-use gnitz_wire::{RelClass, RelDescriptorBlob, RelIndex, WireFault};
+use gnitz_wire::{RelClass, RelDescriptorBlob, RelIndex};
 use lru::LruCache;
 
 /// Per-connection schema LRU capacity. Sized to comfortably hold a session's
@@ -89,30 +89,6 @@ impl RawBlock {
 /// relation was snapshotted at the same server-side SAL cut, so an atomic
 /// multi-table commit is never torn across the result set.
 pub type MultiScanResult = Result<Vec<ScanReply>, ClientError>;
-
-/// Classify a reply frame's status. Every status but `Ok` is an error; one this
-/// build does not know was already refused by the control-header decode.
-fn check_response(ctrl: &DecodedControl) -> Result<(), ClientError> {
-    let Some(WireFault { status, text }) = ctrl.fault() else {
-        return Ok(());
-    };
-    match status {
-        WireStatus::Ok => unreachable!("fault() is None under Ok"),
-        WireStatus::SchemaMismatch => Err(ClientError::SchemaMismatch),
-        WireStatus::DeltaExpired => Err(ClientError::DeltaExpired),
-        // The frame's `target_id` is the relation the request named, so the id is
-        // the whole of what there is to say.
-        WireStatus::NotFound => Err(ClientError::NotFound {
-            noun: "relation",
-            name: ctrl.hdr.target_id.to_string(),
-        }),
-        WireStatus::SalFull => Err(ClientError::SalFull(text)),
-        WireStatus::IntegrityViolation => Err(ClientError::IntegrityViolation(text)),
-        WireStatus::TxnConflict => Err(ClientError::TxnConflict),
-        WireStatus::Error if text.is_empty() => Err(ClientError::ServerError("unknown server error".into())),
-        WireStatus::Error => Err(ClientError::ServerError(text)),
-    }
-}
 
 /// Which relation a RESOLVE request describes. The wire carries an id field and
 /// a name blob and lets the name win, but exactly one is ever meaningful — this
@@ -422,14 +398,14 @@ pub(crate) type PollSink<'a> = dyn FnMut(SlotId, PolledView) + 'a;
 /// Why a session refuses work.
 enum Ended {
     Closed,
-    Lost(Arc<ClientError>),
+    Lost(ProtocolError),
 }
 
 impl Ended {
     fn error(&self) -> ClientError {
         match self {
             Ended::Closed => ClientError::Closed,
-            Ended::Lost(cause) => ClientError::ConnectionLost(Arc::clone(cause)),
+            Ended::Lost(cause) => ClientError::ConnectionLost(cause.clone()),
         }
     }
 }
@@ -513,7 +489,7 @@ impl Session {
         // disagree; only the message re-derives which cap was hit.
         if self.at_capacity() {
             let queued = self.queued_bytes();
-            return Err(ClientError::ServerError(if self.pending.len() >= MAX_IN_FLIGHT {
+            return Err(ClientError::from(if self.pending.len() >= MAX_IN_FLIGHT {
                 format!("connection has {MAX_IN_FLIGHT} requests in flight")
             } else {
                 format!("connection has {queued} unwritten bytes queued, at the {MAX_QUEUED_BYTES}-byte cap")
@@ -657,7 +633,7 @@ impl Session {
         let total = frame.len();
         let limit = gnitz_wire::MAX_FRAME_PAYLOAD;
         if total > limit {
-            return Err(ClientError::ServerError(format!(
+            return Err(ClientError::from(format!(
                 "request frame is {total} bytes, exceeding the {limit}-byte server ingress cap; \
                  split the request"
             )));
@@ -695,11 +671,11 @@ impl Session {
                 // A peer gone after answering is still readable.
                 self.transport.begin_read();
                 let _ = self.read_frames(true, sink, &mut done);
-                result = Err(e.into());
+                result = Err(e);
             }
         }
         if let Err(e) = result {
-            self.end(Ended::Lost(Arc::new(e)), &mut done);
+            self.end(Ended::Lost(e), &mut done);
         }
         done
     }
@@ -711,7 +687,7 @@ impl Session {
         may_read: bool,
         mut sink: Option<&mut PollSink<'_>>,
         done: &mut Completions,
-    ) -> Result<(), ClientError> {
+    ) -> Result<(), ProtocolError> {
         while let Next::Frame(buf) = self.transport.next_frame(may_read)? {
             // The sink runs after `feed` has returned, so an unwind out of the
             // caller's code finds the session consistent. No sink is an
@@ -780,24 +756,22 @@ impl Session {
     /// Fail the session with `cause`, met outside `step`; returns every slot it
     /// abandoned, failed `ConnectionLost(cause)`.
     #[must_use]
-    pub fn abort(&mut self, cause: ClientError) -> Completions {
+    pub fn abort(&mut self, cause: ProtocolError) -> Completions {
         let mut done = Vec::new();
-        self.end(Ended::Lost(Arc::new(cause)), &mut done);
+        self.end(Ended::Lost(cause), &mut done);
         done
     }
 
     /// One reply frame for the head slot. A non-OK frame ends the whole request, so
-    /// status is classified before the continuation test.
+    /// its fault is read before the continuation test.
     ///
     /// Returns the delta-poll position this frame filled, if it filled one.
-    fn feed(&mut self, buf: Vec<u8>, done: &mut Completions) -> Result<Option<(SlotId, PolledView)>, ClientError> {
+    fn feed(&mut self, buf: Vec<u8>, done: &mut Completions) -> Result<Option<(SlotId, PolledView)>, ProtocolError> {
         // Destructured so the head slot stays borrowed for the whole function
         // while the cache and the accumulator are independent `&mut`s.
         let Session { pending, schema_cache, accum, .. } = self;
         let Some(head) = pending.front() else {
-            return Err(ClientError::Protocol(ProtocolError::DecodeError(
-                "reply frame with no request pending".into(),
-            )));
+            return Err(ProtocolError::DecodeError("reply frame with no request pending".into()));
         };
         // The view a DELTA_POLL slot is on and how many positions it answers,
         // else `None` — what tells the paths below to fill one position rather
@@ -833,7 +807,7 @@ impl Session {
             .map(|r| schema_from_block(&buf[r]))
             .transpose()?
             .map(Arc::new);
-        if let Err(e) = check_response(&ctrl) {
+        if let Some(fault) = ctrl.fault() {
             // A DELTA_POLL failure that names a view ends that view's position
             // alone; only one naming no relation fails the request.
             if let Some((view, positions)) = poll {
@@ -841,15 +815,16 @@ impl Session {
                     if ctrl.hdr.target_id != view {
                         return Err(out_of_order(view, ctrl.hdr.target_id));
                     }
-                    return Ok(Some(fill_poll_position(pending, accum, done, positions, Err(e))));
+                    let failed = Err(ClientError::Refused(fault));
+                    return Ok(Some(fill_poll_position(pending, accum, done, positions, failed)));
                 }
             }
             // A rejected warm stamp, and the mismatch reply carries no block to
             // refresh it with: evict, so the next push is cold.
-            if let (ClientError::SchemaMismatch, SlotKind::Push { tid }) = (&e, &head.kind) {
+            if let (WireStatus::SchemaMismatch, SlotKind::Push { tid }) = (fault.status, &head.kind) {
                 schema_cache.pop(tid);
             }
-            complete_head(pending, accum, Err(e), done);
+            complete_head(pending, accum, Err(ClientError::Refused(fault)), done);
             return Ok(None);
         }
         if let Some(tid) = correlate_tid {
@@ -879,9 +854,9 @@ impl Session {
         if frame_schema.is_none() && ctrl.data.is_some() {
             let (want, got) = (train.as_ref().map_or(0, |h| h.1), ctrl.hdr.flags.schema_version);
             if want != got {
-                return Err(ClientError::Protocol(ProtocolError::DecodeError(format!(
+                return Err(ProtocolError::DecodeError(format!(
                     "schema version mismatch: expected {want}, server {got}"
-                ))));
+                )));
             }
         }
 
@@ -890,9 +865,10 @@ impl Session {
         match ctrl.data.clone() {
             Some(r) if head.kind.keeps_blocks_raw() => accum.blocks.push(RawBlock { frame: buf, block: r }),
             Some(r) => {
-                let eff = train.as_ref().map(|h| &*h.0).ok_or_else(|| {
-                    ClientError::Protocol(ProtocolError::DecodeError("no schema for data block".into()))
-                })?;
+                let eff = train
+                    .as_ref()
+                    .map(|h| &*h.0)
+                    .ok_or_else(|| ProtocolError::DecodeError("no schema for data block".into()))?;
                 let sink = accum.data.get_or_insert_with(|| ZSetBatch::new(eff));
                 decode_wal_block_into(sink, &buf[r], eff)?;
             }
@@ -914,7 +890,7 @@ impl Session {
         }
         let scan_reply = |schema: Option<Arc<Schema>>, data: Option<ZSetBatch>, lsn: u64| {
             let schema = schema.ok_or_else(no_schema)?;
-            Ok::<_, ClientError>(ScanReply {
+            Ok::<_, ProtocolError>(ScanReply {
                 batch: data.unwrap_or_else(|| ZSetBatch::new(&schema)),
                 schema,
                 lsn: Some(lsn),
@@ -960,15 +936,13 @@ impl Session {
 
 /// A read train that terminated with neither a schema block nor a hint to
 /// decode under: the framing can no longer be trusted.
-fn no_schema() -> ClientError {
-    ClientError::Protocol(ProtocolError::DecodeError("read reply carries no schema".into()))
+fn no_schema() -> ProtocolError {
+    ProtocolError::DecodeError("read reply carries no schema".into())
 }
 
 /// A reply frame naming a relation the head slot's position does not expect.
-fn out_of_order(want: u64, got: u64) -> ClientError {
-    ClientError::Protocol(ProtocolError::DecodeError(format!(
-        "reply out of order: expected target {want}, got {got}"
-    )))
+fn out_of_order(want: u64, got: u64) -> ProtocolError {
+    ProtocolError::DecodeError(format!("reply out of order: expected target {want}, got {got}"))
 }
 
 /// Fill the delta-poll position the head slot is on, and complete the slot once
@@ -1011,8 +985,8 @@ fn resolve_descriptor(
     if ctrl.hdr.target_id == 0 {
         return Ok(None);
     }
-    let schema = schema.ok_or_else(|| ClientError::ServerError("resolve reply carried no schema block".to_string()))?;
-    let desc = RelDescriptorBlob::decode(&ctrl.blob)?;
+    let schema = schema.ok_or_else(no_schema)?;
+    let desc = RelDescriptorBlob::decode(&ctrl.blob).map_err(ProtocolError::DecodeError)?;
     Ok(Some(Arc::new(RelDescriptor {
         tid: ctrl.hdr.target_id,
         class: desc.class,

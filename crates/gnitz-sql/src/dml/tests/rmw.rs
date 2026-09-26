@@ -170,7 +170,7 @@ mod occ {
     use crate::dml::mutate::{apply_set, bind_set_list, SetClause};
     use crate::test_support::parse_stmt;
     use crate::SqlPlanner;
-    use gnitz_core::GnitzClient;
+    use gnitz_core::{ClientError, GnitzClient, WireFault, WireStatus};
     use gnitz_test_harness::ServerHandle;
 
     struct Fixture {
@@ -215,7 +215,7 @@ mod occ {
         let mut set = bind_set_list(&u.assignments, &s, "t", SetClause::Update).unwrap();
         let mut attempts = 0;
         let Fixture { a, b, target, .. } = f;
-        let result = commit_rmw(a, "t", &read, |rows| {
+        let result = commit_rmw(a, &read, |rows| {
             side(&mut *b, target, attempts);
             attempts += 1;
             apply_set(&mut set, rows, None, &s)
@@ -244,10 +244,13 @@ mod occ {
         let (result, attempts) = run_increment(&mut f, |b, t, i| commit(b, t, 2, i as i64));
         let err = result.expect_err("every attempt conflicts");
         assert!(
-            matches!(&err, GnitzSqlError::Conflict { table: Some(t) } if t == "t"),
+            matches!(
+                &err,
+                GnitzSqlError::Exec(ClientError::Refused(WireFault { status: WireStatus::TxnConflict, .. }))
+            ),
             "{err:?}"
         );
-        assert!(err.to_string().contains("'t'"), "{err}");
+        assert!(err.to_string().contains("'occ.t'"), "{err}");
         assert_eq!(attempts, RMW_MAX_ATTEMPTS);
     }
 

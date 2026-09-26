@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use gnitz_wire::{Deframer, FrameLenError};
 
 use super::error::ProtocolError;
+use crate::ClientError;
 
 mod tls;
 
@@ -141,7 +142,7 @@ fn recv_into(fd: RawFd, buf: &mut [MaybeUninit<u8>]) -> Result<ReadOutcome, Prot
             return match e.kind() {
                 std::io::ErrorKind::Interrupted => continue,
                 std::io::ErrorKind::WouldBlock => Ok(ReadOutcome::WouldBlock),
-                _ => Err(ProtocolError::IoError(e)),
+                _ => Err(e.into()),
             };
         }
         if n == 0 {
@@ -258,7 +259,7 @@ impl ClientTransport {
     fn park(&self, events: libc::c_short, until: Option<Instant>) -> Result<(), ProtocolError> {
         poll_fd(self.as_raw_fd(), events, until, true)
             .map(|_| ())
-            .map_err(ProtocolError::IoError)
+            .map_err(ProtocolError::from)
     }
 
     /// Queue an owned frame behind everything already queued. Nothing is
@@ -410,7 +411,7 @@ impl FrameReader {
     }
 
     fn eof_error(mid_frame: bool) -> ProtocolError {
-        ProtocolError::IoError(std::io::Error::new(
+        ProtocolError::from(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             if mid_frame {
                 "connection closed mid-frame"
@@ -581,23 +582,25 @@ impl From<FrameLenError> for ProtocolError {
 /// every framed send of this client is checked.
 pub(crate) fn frame_len_prefix(len: usize) -> Result<[u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES], ProtocolError> {
     if len == 0 {
-        return Err(ProtocolError::IoError(std::io::Error::new(
+        return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "empty frame (zero is never a legal length)",
-        )));
+        )
+        .into());
     }
     if len > u32::MAX as usize {
-        return Err(ProtocolError::IoError(std::io::Error::new(
+        return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("frame size {len} exceeds u32::MAX wire limit"),
-        )));
+        )
+        .into());
     }
     Ok((len as u32).to_le_bytes())
 }
 
 /// Send HELLO, check the ACK, and mark the transport established. `until` bounds
 /// the exchange as a whole — on TLS the handshake included — not each leg.
-pub fn hello_handshake(t: &mut ClientTransport, until: Option<Instant>) -> Result<(), ProtocolError> {
+pub fn hello_handshake(t: &mut ClientTransport, until: Option<Instant>) -> Result<(), ClientError> {
     let payload = gnitz_wire::encode_hello_payload(gnitz_wire::wal::WAL_FORMAT_VERSION);
     t.send_frame(payload.to_vec(), until)?;
 
@@ -608,14 +611,12 @@ pub fn hello_handshake(t: &mut ClientTransport, until: Option<Instant>) -> Resul
         return Ok(());
     }
 
-    // Not an ACK — the server sent a `WireStatus::Error` control block. The frame is
-    // well-formed, so its error is the peer's refusal, not a decode failure.
+    // Not an ACK: a refusal, classified like any other reply's.
     let ctrl = gnitz_wire::control::peek_control_block(&buf).map_err(|e| ProtocolError::DecodeError(e.into()))?;
-    let err = match ctrl.fault() {
-        Some(f) if !f.text.is_empty() => f.text,
-        _ => "HELLO rejected".into(),
-    };
-    Err(ProtocolError::ServerRejected(err))
+    Err(ctrl.fault().map_or_else(
+        || ProtocolError::DecodeError("HELLO reply is neither an ACK nor a refusal".into()).into(),
+        ClientError::Refused,
+    ))
 }
 
 #[cfg(test)]

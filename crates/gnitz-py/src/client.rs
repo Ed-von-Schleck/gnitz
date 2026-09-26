@@ -22,7 +22,7 @@ use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec};
 use crate::read::{scan_result, PyDeltaReply, PyScanResult};
 use crate::schema::{resolve_py_schema, PySchema};
 use crate::write::{pk_key_from_py, py_pks_to_column, py_scalar_key, PyZSetBatch};
-use crate::{build_pylist, client_err, connect_client, gnitz_err, sql_err, GnitzError};
+use crate::{build_pylist, client_err, connect_client, sql_err, GnitzError};
 
 /// What one view's poll did. `PollOutcome` flattened for Python, which has no
 /// cheap payload-carrying enum.
@@ -85,9 +85,7 @@ impl PyGnitzClient {
 
     /// The still-open client, or a `GnitzError` if `close()` already ran.
     fn live(&mut self) -> PyResult<&mut GnitzClient> {
-        self.slot()
-            .as_mut()
-            .ok_or_else(|| GnitzError::new_err("client already closed"))
+        self.slot().as_mut().ok_or_else(|| client_err(ClientError::Closed))
     }
 
     /// Run one blocking client call: check the client is open, and drop the GIL
@@ -118,25 +116,30 @@ impl PyGnitzClient {
         Ok(self.live()?.requests_sent())
     }
 
-    /// Close the connection, checkpointing and releasing the mirror store first.
-    /// Idempotent. The GIL goes down for it: the checkpoint is fsync-bound.
-    pub fn close(&mut self, py: Python<'_>) {
+    /// Close the connection, checkpointing and releasing the mirror store first,
+    /// and raise if that final checkpoint failed; the connection closes either
+    /// way. Idempotent. The GIL goes down for it: the checkpoint is fsync-bound.
+    pub fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         let taken = self.slot().take();
-        py.detach(move || {
-            if let Some(mut client) = taken {
-                // A `NoMirrorStore` error is the no-store case.
-                let _ = client.close_mirror();
-                drop(client);
-            }
-        });
+        py.detach(move || match taken {
+            Some(mut client) => client.close_mirror(),
+            None => Ok(()),
+        })
+        .map_err(client_err)
     }
 
     pub fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
-    pub fn __exit__(&mut self, py: Python<'_>, _exc_type: Py<PyAny>, _exc_val: Py<PyAny>, _exc_tb: Py<PyAny>) -> bool {
-        self.close(py);
-        false
+    pub fn __exit__(
+        &mut self,
+        py: Python<'_>,
+        _exc_type: Py<PyAny>,
+        _exc_val: Py<PyAny>,
+        _exc_tb: Py<PyAny>,
+    ) -> PyResult<bool> {
+        self.close(py)?;
+        Ok(false)
     }
 
     // ----- DDL -----
@@ -175,7 +178,7 @@ impl PyGnitzClient {
     /// semantics); `"error"` rejects the batch, as SQL `INSERT` does.
     #[pyo3(signature = (target_id, batch, mode = "update"))]
     pub fn push(&mut self, py: Python<'_>, target_id: u64, batch: PyRef<'_, PyZSetBatch>, mode: &str) -> PyResult<u64> {
-        let m: WireConflictMode = mode.parse().map_err(gnitz_err)?;
+        let m: WireConflictMode = mode.parse().map_err(|e: String| PyValueError::new_err(e))?;
         // Hold the `PyRef` guard here (it is `!Ungil`) and pass only the plain
         // `&Schema`/`&ZSetBatch` into the closure, so the GIL is free during
         // the blocking push without cloning the batch.

@@ -8,6 +8,7 @@ use crate::protocol::{
     BatchAppender, ColumnDef, FkTarget, PkBuf, PkColumn, ProtocolError, PushFamily, ReplySchema, Schema, TypeCode,
     WireConflictMode, ZSetBatch,
 };
+use gnitz_wire::{WireFault, WireStatus};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -31,12 +32,12 @@ use gnitz_wire::{
 /// too: the region carries bytes.
 fn col_str(batch: &ZSetBatch, pi: usize, i: usize) -> Result<&str, ClientError> {
     if payload_is_null(batch, i, pi) {
-        return Err(ClientError::ServerError(format!(
-            "col_str: NULL in a non-nullable system column at row {i}"
-        )));
+        return Err(
+            ProtocolError::DecodeError(format!("col_str: NULL in a non-nullable system column at row {i}")).into(),
+        );
     }
     std::str::from_utf8(payload_bytes(batch, i, pi))
-        .map_err(|e| ClientError::ServerError(format!("col_str: invalid UTF-8 at row {i}: {e}")))
+        .map_err(|e| ProtocolError::DecodeError(format!("col_str: invalid UTF-8 at row {i}: {e}")).into())
 }
 
 /// [`gnitz_wire::qualified_key`] from names that may still be raw user text.
@@ -52,10 +53,12 @@ pub fn qualified_name(schema_name: &str, name: &str) -> String {
 /// never a key, so it is reported as the caller spelled it: someone who wrote
 /// `MyTab` is told about `MyTab`.
 pub fn not_found(noun: &'static str, schema_name: &str, name: &str) -> ClientError {
-    ClientError::NotFound {
-        noun,
-        name: format!("{schema_name}.{name}"),
-    }
+    absent(format!("{noun} '{schema_name}.{name}' not found"))
+}
+
+/// A `WireStatus::NotFound` refusal raised on this side, worded by the caller.
+pub(crate) fn absent(text: String) -> ClientError {
+    ClientError::Refused(WireFault { status: WireStatus::NotFound, text })
 }
 
 /// Build the `-1` retraction batch for `pks`: the server's `retract_pk` matches
@@ -147,10 +150,12 @@ impl DeltaCursor {
     /// store and comes back in the view's schema, not the [`delta_reply_schema`]
     /// shape a poll derives.
     pub(crate) fn poll_after(self) -> Result<u64, ClientError> {
-        (self.tick != 0).then_some(self.tick).ok_or(ClientError::DeltaExpired)
+        (self.tick != 0)
+            .then_some(self.tick)
+            .ok_or_else(|| delta_expired("delta cursor 0 names no round to continue from; bootstrap"))
     }
 
-    /// `next` as this cursor's successor, or [`ClientError::DeltaExpired`].
+    /// `next` as this cursor's successor, or a `DeltaExpired` refusal.
     ///
     /// A tag the server did not echo back names a different boot or a different
     /// relation, and the rows such a read draws are unsafe to apply: they are the
@@ -158,8 +163,18 @@ impl DeltaCursor {
     /// enters a delta store at all. The recovery is the one a cursor that fell out
     /// of the retention window gets — discard the copy and bootstrap.
     pub(crate) fn advanced_to(self, next: DeltaCursor) -> Result<DeltaCursor, ClientError> {
-        (self.tag == next.tag).then_some(next).ok_or(ClientError::DeltaExpired)
+        (self.tag == next.tag)
+            .then_some(next)
+            .ok_or_else(|| delta_expired("delta cursor's tag names a different boot or relation; bootstrap"))
     }
+}
+
+/// A `WireStatus::DeltaExpired` refusal raised on this side.
+fn delta_expired(text: &str) -> ClientError {
+    ClientError::Refused(WireFault {
+        status: WireStatus::DeltaExpired,
+        text: text.into(),
+    })
 }
 
 /// The reply schema of an incremental delta read: a `_tick` U64 key column, then
@@ -178,7 +193,7 @@ pub(crate) fn delta_reply_schema(view: &Schema) -> Result<Schema, ClientError> {
     // `Schema::from_parts` — its PK-arity cap is the *persisted* PK-list codec's,
     // and a stamped key is one column past it by construction.
     if view.num_columns() >= gnitz_wire::MAX_COLUMNS {
-        return Err(ClientError::ServerError(format!(
+        return Err(ClientError::from(format!(
             "a view with {} columns cannot carry a delta feed: the `_tick` stamp would exceed the \
              {}-column limit",
             view.num_columns(),
@@ -282,7 +297,7 @@ impl CatalogSnapshot {
 
 /// Run when a signal interrupts a blocking call's wait; an `Err` aborts the call.
 /// The Python binding checks for Ctrl-C here.
-pub type ParkHook = Box<dyn FnMut() -> Result<(), ClientError> + Send>;
+pub type ParkHook = Box<dyn FnMut() -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send>;
 
 pub struct GnitzClient {
     pub(crate) session: Session,
@@ -509,7 +524,9 @@ impl GnitzClient {
     ) -> Result<u64, ClientError> {
         let push = || Request::Push { target_id, schema, batch, mode };
         let reply = match self.round_trip(push()) {
-            Err(ClientError::SchemaMismatch) => self.round_trip(push())?,
+            Err(ClientError::Refused(WireFault { status: WireStatus::SchemaMismatch, .. })) => {
+                self.round_trip(push())?
+            }
             other => other?,
         };
         Ok(reply.into_lsn())
@@ -518,9 +535,9 @@ impl GnitzClient {
     /// Write `batch`, built from a read of `table_id` served at watermark `basis`,
     /// on the condition that `table_id` was not written after that read. Inside a
     /// transaction it is buffered and COMMIT checks the condition; otherwise it
-    /// ships now as a one-family PUSH_TXN, and `TxnConflict` means a write landed
-    /// after the read. An empty batch writes nothing — the engine rejects an empty
-    /// family.
+    /// ships now as a one-family PUSH_TXN, and a `TxnConflict` refusal means a
+    /// write landed after the read. An empty batch writes nothing — the engine
+    /// rejects an empty family.
     pub fn push_rmw(
         &mut self,
         table_id: u64,
@@ -677,7 +694,7 @@ impl GnitzClient {
     /// poll re-resolves every view by name. A poisoned store crosses unchanged.
     pub fn reconnect(&mut self, target: &str) -> Result<(), ClientError> {
         if self.txn_active() {
-            return Err(ClientError::ServerError(
+            return Err(ClientError::from(
                 "reconnect inside a transaction; commit or roll back first".to_string(),
             ));
         }
@@ -713,7 +730,7 @@ impl GnitzClient {
     /// Both refusals a poll can answer with — a cursor at tick `0`, and a reply
     /// whose tag does not continue the cursor — are `DeltaCursor::poll_after`
     /// and `DeltaCursor::advanced_to`, which state the rule once for every
-    /// caller. Both surface as [`ClientError::DeltaExpired`], whose recovery is
+    /// caller. Both surface as a `DeltaExpired` refusal, whose recovery is
     /// to discard the copy and [`delta_bootstrap`](Self::delta_bootstrap) again.
     ///
     /// A poll does **not** drive a tick: a delta read answers "what has
@@ -812,7 +829,7 @@ impl GnitzClient {
         }
         self.round_trip(Request::Resolve(RelTarget::Id(tid)))
             .map(Reply::into_resolve)?
-            .ok_or_else(|| ClientError::NotFound { noun: "relation", name: tid.to_string() })
+            .ok_or_else(|| absent(format!("relation {tid} not found")))
     }
 
     /// Persist a secondary-index catalog row over an already-resolved base table.
@@ -838,9 +855,9 @@ impl GnitzClient {
         // Arity, 7-bit column range, duplicates — the Err form of the
         // pack_pk_cols contract, so the pack below can never panic.
         gnitz_wire::validate_pk_col_list(col_indices, gnitz_wire::PK_LIST_COL_LIMIT)
-            .map_err(|e| ClientError::ServerError(format!("create_index: {e}")))?;
+            .map_err(|e| ClientError::from(format!("create_index: {e}")))?;
         if col_types.len() != col_indices.len() {
-            return Err(ClientError::ServerError(
+            return Err(ClientError::from(
                 "create_index: col_indices and col_types length mismatch".to_string(),
             ));
         }
@@ -925,7 +942,7 @@ impl GnitzClient {
                     }
                 }
                 None if if_exists => {}
-                None => return Err(ClientError::NotFound { noun, name }),
+                None => return Err(absent(format!("{noun} '{name}' not found"))),
             }
         }
         // Every name skipped: no zone, so no barrier and no fdatasync.
@@ -943,7 +960,7 @@ impl GnitzClient {
         for i in idx_batch.live_rows() {
             let name = col_str(&idx_batch, IDXTAB_PAY_NAME, i)?.to_string();
             let cols = gnitz_wire::unpack_pk_cols(payload_u64(&idx_batch, i, IDXTAB_PAY_SOURCE_COLS))
-                .map_err(|rule| ClientError::ServerError(format!("index '{name}': {rule}")))?;
+                .map_err(|rule| ProtocolError::DecodeError(format!("index '{name}': {rule}")))?;
             out.push((idx_batch.pks.get(sys_schema(IDX_TAB), i) as u64, name, cols));
         }
         Ok(out)
@@ -977,7 +994,7 @@ impl GnitzClient {
     /// carries the basis of the read it was built from, which COMMIT checks.
     pub fn txn_begin(&mut self) -> Result<(), ClientError> {
         if self.txn.is_some() {
-            return Err(ClientError::ServerError("transaction already open".into()));
+            return Err(ClientError::from("transaction already open".to_string()));
         }
         self.txn = Some(TxnBuffer::default());
         Ok(())
@@ -1037,9 +1054,7 @@ impl GnitzClient {
     /// carrying a teardown of its own.
     pub fn push_ddl_txn(&mut self, families: &[(u64, ZSetBatch)]) -> Result<(), ClientError> {
         if self.txn.is_some() {
-            return Err(ClientError::ServerError(
-                "DDL is not allowed inside a transaction".into(),
-            ));
+            return Err(ClientError::from("DDL is not allowed inside a transaction".to_string()));
         }
         self.round_trip(Request::DdlTxn(families))?;
         self.forget_retired_views(families);
@@ -1153,8 +1168,8 @@ impl GnitzClient {
         let table_name = gnitz_wire::canonical_identifier(table_name)?;
         let index_names: Vec<String> = unique_indexes
             .iter()
-            .map(|spec| gnitz_wire::canonical_identifier(spec.name).map_err(ClientError::ServerError))
-            .collect::<Result<_, _>>()?;
+            .map(|spec| gnitz_wire::canonical_identifier(spec.name))
+            .collect::<Result<Vec<_>, String>>()?;
         let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
         // Full schema-admissibility rule set (column cap + PK rules), applied
         // here so a caller that skipped the planner gets a clean error before
@@ -1162,13 +1177,13 @@ impl GnitzClient {
         // `pack_pk_cols` below can never panic).
         schema
             .validate()
-            .map_err(|e| ClientError::ServerError(format!("create_table: {e}")))?;
+            .map_err(|e| ClientError::from(format!("create_table: {e}")))?;
         // The `Keyed` prefix is a leading-PK-prefix length (0 = default = full PK).
         // Shared with the engine's own TABLE_TAB decoder, which re-checks it: this
         // one catches the caller's mistake before any id is allocated.
         props
             .validate_against_pk(schema.pk_cols.len())
-            .map_err(|e| ClientError::ServerError(format!("create_table: {e}")))?;
+            .map_err(|e| ClientError::from(format!("create_table: {e}")))?;
 
         // Column types come from `schema.columns`, so a UNIQUE+FK column's
         // parent-rewritten type is used.
@@ -1176,9 +1191,8 @@ impl GnitzClient {
             // Structural rules only (arity, in-range, no duplicates) — unlike a
             // PK, an indexed column may be nullable. In-range against the actual
             // column list also keeps the `schema.columns[c]` read panic-free.
-            gnitz_wire::validate_pk_col_list(spec.col_indices, schema.columns.len()).map_err(|msg| {
-                ClientError::ServerError(format!("create_table: unique index '{}': {msg}", spec.name))
-            })?;
+            gnitz_wire::validate_pk_col_list(spec.col_indices, schema.columns.len())
+                .map_err(|msg| ClientError::from(format!("create_table: unique index '{}': {msg}", spec.name)))?;
             for &c in spec.col_indices {
                 gnitz_wire::index_key_type(schema.columns[c as usize].ty.tc)?;
             }
@@ -1295,7 +1309,7 @@ impl GnitzClient {
         // Reject a malformed chain before any allocation.
         let n_views = bundle.segments.len() + 1;
         if n_views > MAX_CHAIN_SEGMENTS {
-            return Err(ClientError::ServerError(format!(
+            return Err(ClientError::from(format!(
                 "view chain has {n_views} segments, exceeding the {MAX_CHAIN_SEGMENTS}-segment limit",
             )));
         }
@@ -1305,7 +1319,7 @@ impl GnitzClient {
         for (k, pv) in bundle.segments.iter().chain([&bundle.view]).enumerate() {
             pv.schema
                 .validate()
-                .map_err(|e| ClientError::ServerError(format!("View '{view_name}' segment {k}: {e}")))?;
+                .map_err(|e| ClientError::from(format!("View '{view_name}' segment {k}: {e}")))?;
         }
 
         let schema_id = self.lookup_schema_id(&schema_name)?;
@@ -1575,7 +1589,7 @@ impl GnitzClient {
         self.rewrite_sys_row(
             COL_TAB,
             tid as u128 | (col_idx as u128) << 64,
-            || ClientError::ServerError(format!("column index {col_idx} not found on table {tid}")),
+            || absent(format!("column index {col_idx} not found on table {tid}")),
             patch,
         )
     }
@@ -1640,13 +1654,10 @@ impl GnitzClient {
 
     /// Resolve `schema_name` (already canonicalized) to its SCHEMA_TAB id. A
     /// missing row — or an entirely empty SCHEMA_TAB — is a
-    /// [`ClientError::NotFound`], like every other catalog absence.
+    /// `NotFound` refusal, like every other catalog absence.
     pub(crate) fn lookup_schema_id(&mut self, schema_name: &str) -> Result<u64, ClientError> {
         let batch = checked_sys_rows(SCHEMA_TAB, self.scan(SCHEMA_TAB)?)?;
-        find_schema_id(&batch, schema_name)?.ok_or_else(|| ClientError::NotFound {
-            noun: "schema",
-            name: schema_name.to_string(),
-        })
+        find_schema_id(&batch, schema_name)?.ok_or_else(|| absent(format!("schema '{schema_name}' not found")))
     }
 
     /// The live system-catalog row with PK `key`, by one master-local SEEK: the
@@ -1673,10 +1684,10 @@ pub(crate) fn park(session: &Session, hook: &mut Option<ParkHook>) -> Result<Int
             Ok(revents) => return Ok(Interest::from_revents(revents)),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                 if let Some(hook) = hook.as_mut() {
-                    hook()?;
+                    hook().map_err(|e| ClientError::Interrupted(e.into()))?;
                 }
             }
-            Err(e) => return Err(ClientError::Protocol(ProtocolError::IoError(e))),
+            Err(e) => return Err(e.into()),
         }
     }
 }
@@ -1698,7 +1709,7 @@ struct BufferedFamily {
 }
 
 fn no_transaction() -> ClientError {
-    ClientError::ServerError("no transaction open".into())
+    ClientError::from("no transaction open".to_string())
 }
 
 /// The write side of an open transaction. `push` — its one write entry point —
@@ -1854,9 +1865,10 @@ fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<Option<u64>, ClientEr
 /// rather than a cross-crate assumption.
 fn checked_sys_rows(family: u64, reply: ScanReply) -> Result<ZSetBatch, ClientError> {
     if !reply.schema.types_match(sys_schema(family)) {
-        return Err(ClientError::ServerError(format!(
+        return Err(ProtocolError::DecodeError(format!(
             "system family {family} answered in a schema that is not its own"
-        )));
+        ))
+        .into());
     }
     Ok(reply.batch)
 }

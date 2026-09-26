@@ -17,7 +17,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use super::{decode_client_batch, guard_panic, park_until, request_barrier, send_fault, send_msg, Shared};
+use super::{decode_client_batch, guard_panic, park_until, request_barrier, send_msg, Shared};
 use crate::catalog::{family_pk_partition, idx_tab_partition, PkPartition, SysFamily};
 use crate::runtime::committer::BarrierKind;
 use crate::runtime::lsn::ZoneLsnAllocator;
@@ -107,34 +107,6 @@ fn decode_sys_family(tid: i64, slice: &[u8]) -> Result<(SysFamily, Batch), Strin
 /// write — a CREATE's N families or a DROP/CREATE INDEX/CREATE SCHEMA's single
 /// family — flows here, so there is one system-write code path end to end.
 ///
-/// The ACK is a header-only frame carrying the zone LSN in `arg0`, sent after
-/// [`ddl_txn_body`] returns — outside the catalog write guard, so a client stalled
-/// on its `GNITZ_CLIENT_SEND_TIMEOUT_MS` deadline cannot block every other reader
-/// for the length of the window. Sound outside the tick gate too: the gate
-/// exists to keep a worker from being mid-epoch at *broadcast* time, and the body
-/// returns only after the broadcast, its wake and the fsync.
-///
-/// No schema block: a `DDL_TXN` names no relation (its reply target is `0`), so
-/// one could only describe a relation that does not exist.
-pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) {
-    let t_ddl_start = Instant::now();
-    match ddl_txn_body(shared, body).await {
-        Ok((zone_lsn, family_count)) => {
-            send_msg(peer, ipc::WireMsg { arg0: zone_lsn, ..Default::default() });
-            let total = t_ddl_start.elapsed();
-            if total > Duration::from_millis(20) {
-                gnitz_debug!("DDL_TXN SLOW total={:?} families={}", total, family_count);
-            }
-        }
-        // `validate_unique_index_create`'s refusal keeps its own status; every
-        // other failure in the body is the untyped `WireStatus::Error` it already was.
-        Err(f) => send_fault(peer, 0, &f),
-    }
-}
-
-/// The body of [`handle_ddl_txn`]. Returns the durable zone LSN and the bundle's
-/// family count (which the caller's slow-DDL log line reports).
-///
 /// Families are ingested in topo order — ascending for a bundle that creates, so
 /// every register/index hook sees its dependencies already in the memtable;
 /// descending for one that only drops, so a dependent is retired first. The loop
@@ -143,7 +115,18 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
 /// SCHEMA bundle pass the empty-schema guard. On any failure the applied families
 /// are negated in master memory before broadcast, so neither a crash nor a
 /// precheck failure can strand an orphan row.
-async fn ddl_txn_body(shared: &Rc<Shared>, body: &[u8]) -> Result<(u64, usize), WireFault> {
+///
+/// The ACK is a header-only frame carrying the zone LSN in `arg0`, sent once the
+/// DDL guards have dropped — so a client stalled on its
+/// `GNITZ_CLIENT_SEND_TIMEOUT_MS` deadline cannot block every other reader for the
+/// length of the window. Sound outside the tick gate too: the gate exists to keep
+/// a worker from being mid-epoch at *broadcast* time, and the ACK goes out only
+/// after the broadcast, its wake and the fsync.
+///
+/// No schema block: a `DDL_TXN` names no relation (its reply target is `0`), so
+/// one could only describe a relation that does not exist.
+pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Result<(), WireFault> {
+    let t_ddl_start = Instant::now();
     // Decode the bundle and materialise each family's wal-block slice into an
     // owned Batch up front (before any lock) — see `decode_sys_family`.
     let raw_families = gnitz_wire::txn_frame::decode_ddl_txn(body).map_err(|e| format!("decode error: {e}"))?;
@@ -321,7 +304,13 @@ async fn ddl_txn_body(shared: &Rc<Shared>, body: &[u8]) -> Result<(u64, usize), 
             });
     }
 
-    Ok((zone_lsn, family_count))
+    drop(locks);
+    send_msg(peer, ipc::WireMsg { arg0: zone_lsn, ..Default::default() });
+    let total = t_ddl_start.elapsed();
+    if total > Duration::from_millis(20) {
+        gnitz_debug!("DDL_TXN SLOW total={:?} families={}", total, family_count);
+    }
+    Ok(())
 }
 
 /// Emit every queued family broadcast as one zone at `zone_lsn` and submit its

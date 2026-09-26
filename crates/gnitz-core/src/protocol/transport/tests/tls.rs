@@ -2,6 +2,7 @@ use super::*;
 use crate::connection::{Interest, Reply, Request, Session};
 use crate::protocol::transport::{hello_handshake, poll_fd, CONNECT_TIMEOUT};
 use crate::test_support::{framed, reply_ctrl};
+use crate::ClientError;
 use gnitz_foundation::posix_io::set_sockopt_int;
 use std::io::Read;
 use std::net::TcpListener;
@@ -312,7 +313,7 @@ fn loopback_silent_peer_fails_the_hello_at_the_deadline_once() {
     let mut t = ClientTransport::connect(&lb.target, until).unwrap();
     assert!(matches!(
         hello_handshake(&mut t, until),
-        Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock
+        Err(ClientError::Protocol(ProtocolError::IoError(ref e))) if e.kind() == std::io::ErrorKind::WouldBlock
     ));
     let took = t0.elapsed();
     assert!(
@@ -335,7 +336,7 @@ fn loopback_silent_tcp_peer_fails_the_hello_at_the_deadline() {
     let mut t = ClientTransport::connect(&lb.target, until).unwrap();
     assert!(matches!(
         hello_handshake(&mut t, until),
-        Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock
+        Err(ClientError::Protocol(ProtocolError::IoError(ref e))) if e.kind() == std::io::ErrorKind::WouldBlock
     ));
     let took = t0.elapsed();
     assert!(took >= deadline && took < Duration::from_secs(2), "{took:?}");

@@ -250,8 +250,7 @@ async def test_stale_stamp_pushes_fail_and_the_connection_recovers(aconn, client
     results = await asyncio.gather(
         *[aconn.push(tid, _batch([{"pk": 10 + i, "val": 100 + i}])) for i in range(3)],
         return_exceptions=True)
-    assert all(isinstance(r, gnitz.GnitzError) for r in results), results
-    assert all("schema version mismatch" in str(r) for r in results), results
+    assert all(isinstance(r, gnitz.GnitzSchemaMismatchError) for r in results), results
 
     # Nothing they carried was committed — a mismatched push returns before the
     # commit path. Same connection, no reconnect: the next push is cold and lands.
