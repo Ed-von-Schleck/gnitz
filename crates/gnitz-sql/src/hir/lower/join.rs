@@ -2,12 +2,10 @@
 //! circuit primitives in [`super::joincore`], its output key read off [`OutKey`].
 
 use super::super::{ColId, HirExpr, JoinClass, JoinShape, JoinType, OutKey, ProjEntry, RelExpr};
-use super::exists;
 use super::joincore::{
-    emit_range_null_fill_tail, equi_prologue, join_pk_coldefs, pair_pk_coldefs, range_prologue, src_pk_coldefs,
-    EquiTerms,
+    emit_range_null_fill_tail, equi_prologue, join_pk_coldefs, pair_pk_coldefs, range_prologue, rekey_on_source_pk,
+    src_pk_coldefs, unmatched,
 };
-use super::prims::rekey_on_source_pk;
 use super::{emit_filter, emit_join_inputs, project_front, Demand, EmitPieces, JoinSide, ViewChain};
 use crate::error::GnitzSqlError;
 use crate::hir::physical::Frame;
@@ -42,7 +40,7 @@ pub(super) fn lower_join_view(
 
     let out_key = class.out_key(kind);
     let out_pk = match out_key {
-        OutKey::JoinKey => join_pk_coldefs(&class.eq.iter().map(|p| p.tc).collect::<Vec<_>>()),
+        OutKey::JoinKey => join_pk_coldefs(&class.key_tcs()),
         OutKey::PairPk => {
             let surface = match class.shape() {
                 JoinShape::Cross => "CROSS JOIN output PK",
@@ -55,14 +53,11 @@ pub(super) fn lower_join_view(
     };
 
     let unique = [class.side_unique(left, true), class.side_unique(right, false)];
-    let branches = match (class.shape(), kind.is_decorrelated()) {
-        (JoinShape::Equi, false) => emit_equi(&mut cb, inputs, class, kind, &sides, unique)?,
-        (JoinShape::Band | JoinShape::PureRange, false) => emit_range(&mut cb, inputs, class, kind, &sides, unique)?,
-        (JoinShape::Cross, _) if kind == JoinType::Inner => emit_cross(&mut cb, inputs, &sides),
-        (JoinShape::Cross, _) => unreachable!("reject_join_shape refuses a keyless non-INNER join"),
-        (JoinShape::Equi, true) => exists::equi(&mut cb, inputs, class, kind, &sides, unique[1])?,
-        (JoinShape::Band, true) => exists::band(&mut cb, inputs, class, kind, &sides, unique[1])?,
-        (JoinShape::PureRange, true) => exists::pure_range(&mut cb, inputs, class, kind, &sides)?,
+    let branches = match class.shape() {
+        JoinShape::Equi => emit_equi(&mut cb, inputs, class, kind, &sides, unique)?,
+        JoinShape::Band | JoinShape::PureRange => emit_range(&mut cb, inputs, class, kind, &sides, unique)?,
+        JoinShape::Cross if kind == JoinType::Inner => emit_cross(&mut cb, inputs, &sides)?,
+        JoinShape::Cross => unreachable!("reject_join_shape refuses a keyless non-INNER join"),
     };
 
     // The frame every branch filters and projects against.
@@ -114,8 +109,31 @@ fn subst_mark_lit(e: &HirExpr, mark_id: ColId, val: i64) -> HirExpr {
     out
 }
 
+/// One half of the outer input split by match existence.
+#[derive(Clone, Copy)]
+enum Split {
+    Matched(NodeId),
+    Unmatched(NodeId),
+}
+
+/// A decorrelated `kind`'s branches, from one half of `all`; the other half is
+/// `all − known`.
+fn exists_branches(cb: &mut Circuit, kind: JoinType, split: Split, all: NodeId) -> Vec<Branch> {
+    let (Split::Matched(known) | Split::Unmatched(known)) = split;
+    let complement = |cb: &mut Circuit| cb.difference(all, known);
+    match (kind, split) {
+        (JoinType::Semi, Split::Matched(half)) | (JoinType::Anti, Split::Unmatched(half)) => vec![(half, None)],
+        (JoinType::Semi | JoinType::Anti, _) => vec![(complement(cb), None)],
+        (JoinType::Mark(_), Split::Matched(matched)) => vec![(matched, Some(1)), (complement(cb), Some(0))],
+        (JoinType::Mark(_), Split::Unmatched(unmatched)) => vec![(complement(cb), Some(1)), (unmatched, Some(0))],
+        _ => unreachable!("exists_branches receives a decorrelated kind"),
+    }
+}
+
 // ── Equi emission ───────────────────────────────────────────────────────────────
 
+/// `inner ∪ ν_A ∪ ν_B`, a union over each preserved side's null-fill; a
+/// decorrelated kind's branches split A by whether it matched B's key set.
 fn emit_equi(
     cb: &mut Circuit,
     inputs: [NodeId; 2],
@@ -124,51 +142,31 @@ fn emit_equi(
     sides: &[JoinSide; 2],
     unique: [bool; 2],
 ) -> Result<Vec<Branch>, GnitzSqlError> {
-    let terms = equi_prologue(cb, class, sides, inputs, kind, unique[1])?;
-    let inner_merged = terms.inner;
-    Ok(vec![(
-        emit_equi_null_fill(cb, inner_merged, kind, &terms, unique),
-        None,
-    )])
-}
-
-/// `inner ∪ ν_A ∪ ν_B` — the equi outer join's null-fill, unioned onto the inner
-/// output for each preserved side; `inner_merged` unchanged for INNER.
-///
-/// `inner_merged` feeds both `π_P` and these unions, so it rides the second
-/// union operand throughout — a cost choice, the VM's liveness pass deciding per
-/// operand which register a union may empty.
-fn emit_equi_null_fill(
-    cb: &mut Circuit,
-    inner_merged: NodeId,
-    kind: JoinType,
-    terms: &EquiTerms<'_>,
-    unique: [bool; 2],
-) -> NodeId {
-    if kind == JoinType::Inner {
-        return inner_merged;
+    let (all, inner) = equi_prologue(cb, class, sides, inputs, kind, unique[1])?;
+    if kind.is_decorrelated() {
+        return Ok(exists_branches(cb, kind, Split::Matched(inner), all[0]));
     }
-    // Each preserved side P: the other side supplies the NULL region, on its own
-    // side of the payload, so every branch is `[_join_pk, A, B]`. All are built
-    // before the first union, so each `π_P` reads `inner_merged` ahead of the
-    // union that could move it.
-    let branches: Vec<NodeId> = [true, false]
+    let k = class.eq.len();
+    // Each `[_join_pk, A, B]`, the other side's half all-NULL.
+    let nus: Vec<NodeId> = [true, false]
         .into_iter()
         .filter(|&preserved_is_left| kind.preserves(preserved_is_left))
         .map(|preserved_is_left| {
-            let other_unique = unique[usize::from(preserved_is_left)];
-            let nu_p = terms.nu(cb, inner_merged, preserved_is_left, other_unique);
+            let (p, o) = (usize::from(!preserved_is_left), usize::from(preserved_is_left));
+            let p0 = k + if preserved_is_left { 0 } else { sides[0].n() };
+            let proj: Vec<u32> = (p0..p0 + sides[p].n()).map(|c| c as u32).collect();
+            let pi = cb.map(inner, &proj); // π_P(inner) = [_join_pk, P]
+            let nu_p = unmatched(cb, all[p], pi, unique[o]);
             // A side that keeps nothing contributes no NULL region at all.
-            let o_tcs = terms.kept_type_codes(!preserved_is_left);
+            let o_tcs = sides[o].kept_type_codes();
             match o_tcs.is_empty() {
                 true => nu_p,
                 false => cb.null_extend(nu_p, &o_tcs, !preserved_is_left),
             }
         })
         .collect();
-    branches
-        .into_iter()
-        .fold(inner_merged, |merged, branch| cb.union(branch, merged))
+    let node = nus.into_iter().fold(inner, |merged, nu| cb.union(nu, merged));
+    Ok(vec![(node, None)])
 }
 
 // ── Range / band emission ───────────────────────────────────────────────────────
@@ -182,6 +180,22 @@ fn emit_range(
     unique: [bool; 2],
 ) -> Result<Vec<Branch>, GnitzSqlError> {
     let pro = range_prologue(cb, class, sides, inputs, kind)?;
+    if kind.is_decorrelated() {
+        return Ok(match class.shape() {
+            // The one-row threshold `m = MAX/MIN(b.range)` decides existence over
+            // A's owned slice, already on the worker owning its output key.
+            JoinShape::PureRange => {
+                let (owned, matched) = pro.threshold(cb);
+                exists_branches(cb, kind, Split::Matched(matched), owned)
+            }
+            // ν over A, keyed on A's source PK behind the output exchange.
+            _ => {
+                let merged = pro.merged(cb);
+                let (all, nu) = pro.nu(cb, merged, true, unique[1])?;
+                exists_branches(cb, kind, Split::Unmatched(nu), all)
+            }
+        });
+    }
     let merged = pro.merged(cb);
     // Every branch below lands on `[pair-PK, kept-A, kept-B]`.
     let rekey = pro.pair_keyed(cb, merged);
@@ -204,7 +218,7 @@ fn emit_range(
                 if !kind.preserves(preserved_is_left) {
                     continue;
                 }
-                let (_, nu) = pro.nu(cb, merged, preserved_is_left, unique[usize::from(preserved_is_left)]);
+                let (_, nu) = pro.nu(cb, merged, preserved_is_left, unique[usize::from(preserved_is_left)])?;
                 let branch = emit_range_null_fill_tail(cb, sides, nu, preserved_is_left);
                 acc = cb.union(branch, acc);
             }
@@ -219,11 +233,13 @@ fn emit_range(
 /// The keyless join `A × B`, INNER only. Each side keys its trace on its own
 /// source PK, which takes no part in the match — it only partitions the trace the
 /// broadcast delta is paired against.
-fn emit_cross(cb: &mut Circuit, [input_a, input_b]: [NodeId; 2], sides: &[JoinSide; 2]) -> Vec<Branch> {
-    let (left, right) = (&sides[0], &sides[1]);
-
-    let reindex_a = rekey_on_source_pk(cb, input_a, left, left.scatter_pk());
-    let reindex_b = rekey_on_source_pk(cb, input_b, right, right.scatter_pk());
+fn emit_cross(
+    cb: &mut Circuit,
+    [input_a, input_b]: [NodeId; 2],
+    sides: &[JoinSide; 2],
+) -> Result<Vec<Branch>, GnitzSqlError> {
+    let reindex_a = rekey_on_source_pk(cb, input_a, &sides[0], true)?;
+    let reindex_b = rekey_on_source_pk(cb, input_b, &sides[1], true)?;
     let int_a = cb.worker_filter(reindex_a);
     let int_b = cb.worker_filter(reindex_b);
     let trace_a = cb.integrate_trace(int_a);
@@ -231,7 +247,7 @@ fn emit_cross(cb: &mut Circuit, [input_a, input_b]: [NodeId; 2], sides: &[JoinSi
     // A keyless term keys on `[left PK…, right PK…]`, which is the pair-PK itself,
     // so both terms already share one schema.
     let inner = cb.join_terms([reindex_a, reindex_b], [trace_a, trace_b], JoinKind::Cross);
-    vec![(inner, None)] // [pair-PK, A, B]
+    Ok(vec![(inner, None)]) // [pair-PK, A, B]
 }
 
 // ── shared helpers ──────────────────────────────────────────────────────────────
@@ -240,7 +256,8 @@ fn emit_cross(cb: &mut Circuit, [input_a, input_b]: [NodeId; 2], sides: &[JoinSi
 /// sides' kept payload with the null-providing side widened per `kind`, through
 /// the same [`JoinType::widen_sides`] the logical join output uses.
 fn join_frame(pk_cols: Vec<ColumnDef>, sides: &[JoinSide; 2], kind: JoinType) -> Result<Frame, GnitzSqlError> {
-    let (mut l, mut r) = (sides[0].coldefs.clone(), sides[1].coldefs.clone());
+    let kept = |s: &JoinSide| s.kept_defs().cloned().collect::<Vec<_>>();
+    let (mut l, mut r) = (kept(&sides[0]), kept(&sides[1]));
     kind.widen_sides(l.iter_mut(), r.iter_mut());
     Frame::keyed(
         pk_cols,

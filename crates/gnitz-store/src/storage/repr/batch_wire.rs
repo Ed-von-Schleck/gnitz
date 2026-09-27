@@ -223,7 +223,22 @@ impl Batch {
         if gnitz_wire::first_not_null_violation(in_schema.not_null_payload_slots(), mb.null_bmp()).is_some() {
             return Err("a null bit on a NOT NULL column");
         }
+        validate_null_cells(&mb, in_schema)?;
         Ok(Batch::from_mem_batch(&mb, in_schema, out_schema))
+    }
+}
+
+/// Every NULL cell of `mb` is zeroed: a key reader packs or routes a cell
+/// whatever its null bit says, so a second encoding would key a row and its
+/// retraction apart.
+fn validate_null_cells(mb: &MemBatch<'_>, schema: &SchemaDescriptor) -> Result<(), &'static str> {
+    let col = |pi| {
+        let width = schema.columns[schema.payload_col_idx(pi)].size() as usize;
+        (mb.col_data(pi, width), width)
+    };
+    match gnitz_wire::first_valued_null(schema.nullable_payload_slots(), mb.null_bmp(), col) {
+        None => Ok(()),
+        Some(_) => Err("a non-zero cell under a NULL"),
     }
 }
 

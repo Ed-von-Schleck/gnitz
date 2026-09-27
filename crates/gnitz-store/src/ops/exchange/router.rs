@@ -60,8 +60,7 @@ pub(super) enum ScatterKey {
     PkPrefix(usize),
     /// One column's OPK image — what a single-column key packs to.
     Image(ColumnLocator),
-    /// The `_join_pk` the reindex Map packs. Null-blind: a LEFT-join NULL-key
-    /// row routes by its zeroed slot, where the Map stamps it.
+    /// The `_join_pk` the reindex Map packs.
     Packed(ReindexPacker),
     /// The NULL-distinct XXH3 fold of the group columns.
     Fold(FoldCols),
@@ -122,8 +121,13 @@ impl ScatterKey {
                 walk(mem, schema, merge, slots, ImageW::<true> { loc, nw })
             }
             ScatterKey::Image(loc) => walk(mem, schema, merge, slots, ImageW::<false> { loc, nw }),
-            ScatterKey::Packed(ref packer) => {
+            ScatterKey::Packed(ref packer) if merge => {
                 walk(mem, schema, merge, slots, PackedW { packer, n: packer.out_stride, nw })
+            }
+            ScatterKey::Packed(ref packer) => {
+                for (si, mb) in mem.iter().enumerate() {
+                    route_source_packed(mb, si as u32, slots, packer);
+                }
             }
             ScatterKey::Fold(ref fold) => walk(mem, schema, merge, slots, FoldW { fold, nw }),
         }
@@ -236,6 +240,18 @@ fn route_source<W: RowWorker>(mb: &MemBatch, si: u32, slots: &mut [Vec<(u32, u32
             slots[w.worker(&mut scratch, mb, row)].push((si, row as u32, wt));
         }
     }
+}
+
+/// [`route_source`] for a packed join key, packed a chunk of rows at a time.
+#[inline(never)]
+fn route_source_packed(mb: &MemBatch, si: u32, slots: &mut [Vec<(u32, u32, i64)>], packer: &ReindexPacker) {
+    let nw = slots.len();
+    packer.for_each_key(mb, packer.out_stride, |row, key| {
+        let wt = mb.get_weight(row);
+        if wt != 0 {
+            slots[worker_for_pk_bytes(key, nw)].push((si, row as u32, wt));
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

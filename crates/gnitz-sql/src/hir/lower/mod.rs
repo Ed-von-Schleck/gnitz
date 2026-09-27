@@ -12,11 +12,9 @@
 //! * addressing — `physical::Frame`, [`project_front`].
 
 mod chain;
-mod exists;
 pub(crate) mod fold;
 mod join;
 mod joincore;
-mod prims;
 mod reduce;
 mod setop;
 mod spine;
@@ -396,17 +394,17 @@ pub(crate) fn emit_join_inputs(
     let (b, right_frame) = r.emit(cb, spine::Top::Slots)?;
     Ok((
         [a, b],
-        join_sides(down, class, kind, [left_frame, right_frame], [origin_l, origin_r]),
+        join_sides(down, class, kind, [left_frame, right_frame], [origin_l, origin_r])?,
     ))
 }
 
-/// One side of a join as [`join_sides`] left it: the emitted input's frame, its
-/// reindex-payload keep list in emission order, those columns' defs, and the
-/// pinned source PK's arity (`0` when unpinned).
+/// One side of a join as [`join_sides`] left it.
 pub(crate) struct JoinSide {
     pub(crate) frame: Frame,
+    /// The reindex payload, in emission order.
     pub(crate) keep: Vec<u32>,
-    pub(crate) coldefs: Vec<ColumnDef>,
+    /// The join key columns, [`JoinClass::key_cols`] order, as `frame` slots.
+    pub(crate) key: Vec<usize>,
     pk_arity: usize,
     origin: SourceOrigin,
 }
@@ -421,11 +419,6 @@ impl JoinSide {
         self.origin.scatter_role(&self.frame, key).ok_or_else(|| {
             GnitzSqlError::Internal("a join key column is not a column of the relation it scatters".into())
         })
-    }
-
-    /// The scatter key of a re-key onto this side's source PK.
-    pub(crate) fn scatter_pk(&self) -> gnitz_core::ReindexRole {
-        self.origin.scatter_pk()
     }
 
     /// The kept payload width.
@@ -449,10 +442,15 @@ impl JoinSide {
         self.keep.iter().map(|&i| self.frame.layout[i as usize])
     }
 
+    /// The kept payload columns' defs, in keep order.
+    pub(crate) fn kept_defs(&self) -> impl Iterator<Item = &ColumnDef> + '_ {
+        self.keep.iter().map(|&i| &self.frame.schema.columns[i as usize])
+    }
+
     /// The type codes of the kept payload columns — what `null_extend` needs to
     /// synthesize this side's NULL region.
     pub(crate) fn kept_type_codes(&self) -> Vec<gnitz_core::TypeCode> {
-        self.coldefs.iter().map(|c| c.ty.tc).collect()
+        self.kept_defs().map(|c| c.ty.tc).collect()
     }
 }
 
@@ -466,9 +464,11 @@ pub(crate) fn join_sides(
     kind: JoinType,
     inputs: [Frame; 2],
     origins: [SourceOrigin; 2],
-) -> [JoinSide; 2] {
+) -> Result<[JoinSide; 2], GnitzSqlError> {
     let [left, right] = inputs;
     let [origin_l, origin_r] = origins;
+    let key = |frame: &Frame, is_left| slots_of(&frame.layout, &class.key_cols(is_left).collect::<Vec<_>>());
+    let keys = [key(&left, true)?, key(&right, false)?];
     let (left_layout, right_layout) = (&left.layout, &right.layout);
     // One keep list per side, so a rule cannot write into the region another rule
     // owns.
@@ -490,8 +490,9 @@ pub(crate) fn join_sides(
     }
     // Rule 3: a side with a ν keeps each key column its ν cannot do without.
     let keeps_key_col = |def: &ColumnDef, is_left: bool| match class.shape() {
-        // The gate after the re-key reads a nullable key column, and it keeps a
-        // NULL-keyed row apart from a 0-keyed one under the clamp.
+        // A NULL key packs from a zero cell, the same bytes as a real `0`, so the
+        // kept column holds a NULL-keyed row apart from a 0-keyed one under the
+        // clamp.
         JoinShape::Equi => def.is_nullable && kind.emits_unmatched(is_left),
         // A band ν is keyed by the source PK, which a bag-valued side repeats; a
         // pure range re-keys its owned A slice onto the range column.
@@ -502,10 +503,8 @@ pub(crate) fn join_sides(
         if !kind.has_nu(is_left) {
             continue;
         }
-        for id in class.key_cols(is_left) {
-            if let Some(pos) = frame.layout.iter().position(|c| *c == id) {
-                keep[side][pos] |= keeps_key_col(&frame.schema.columns[pos], is_left);
-            }
+        for &pos in &keys[side] {
+            keep[side][pos] |= keeps_key_col(&frame.schema.columns[pos], is_left);
         }
     }
     // Rule 4: a side whose source PK the output key packs out of the payload pins
@@ -524,17 +523,17 @@ pub(crate) fn join_sides(
     if !pins[0] && !keep[0].iter().any(|&b| b) && !keep[1].iter().any(|&b| b) {
         keep[0][0] = true;
     }
-    let [kl, kr] = keep;
-    [
-        one_side(left, origin_l, &kl, pins[0]),
-        one_side(right, origin_r, &kr, pins[1]),
-    ]
+    let ([kl, kr], [key_l, key_r]) = (keep, keys);
+    Ok([
+        one_side(left, origin_l, &kl, key_l, pins[0]),
+        one_side(right, origin_r, &kr, key_r, pins[1]),
+    ])
 }
 
 /// One side's keep list in emission order: its pinned PK columns first, then every
 /// other kept column in source order. A keep list need not ascend, and the PK at
 /// the front is what makes every pair-PK slot list a range.
-fn one_side(frame: Frame, origin: SourceOrigin, keep: &[bool], pin_pk: bool) -> JoinSide {
+fn one_side(frame: Frame, origin: SourceOrigin, keep: &[bool], key: Vec<usize>, pin_pk: bool) -> JoinSide {
     let pinned: Vec<u32> = if pin_pk {
         frame.schema.pk_cols.clone()
     } else {
@@ -542,12 +541,11 @@ fn one_side(frame: Frame, origin: SourceOrigin, keep: &[bool], pin_pk: bool) -> 
     };
     let mut cols = pinned.clone();
     cols.extend((0..keep.len() as u32).filter(|i| keep[*i as usize] && !pinned.contains(i)));
-    let coldefs = cols.iter().map(|&i| frame.schema.columns[i as usize].clone()).collect();
     JoinSide {
         pk_arity: pinned.len(),
         frame,
         keep: cols,
-        coldefs,
+        key,
         origin,
     }
 }

@@ -576,3 +576,45 @@ fn a_single_column_join_key_routes_by_the_image_the_map_packs() {
         check(&schema, &b, 1);
     }
 }
+
+/// A packed join key's linear walk, which packs a chunk of rows at a time, sends
+/// every row of nonzero weight where its own packed key hashes, across several
+/// chunks and over a promoted slot.
+#[test]
+fn a_packed_linear_route_hashes_each_rows_own_packed_key() {
+    const NW: usize = 4;
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::U16, false),
+        ],
+        &[0],
+    );
+    let n = 600;
+    let mut b = Batch::with_capacity(&schema, n);
+    for i in 0..n as u64 {
+        b.extend_pk(u128::from(i));
+        b.extend_weight(&i64::from(i % 7 != 3).to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &((i as i32) * -977).to_le_bytes());
+        b.extend_col(1, &((i * 13) as u16).to_le_bytes());
+        b.count += 1;
+    }
+    let mb = b.as_mem_batch();
+    let slots = [(1, Some(gnitz_wire::TypeCode::I64)), (2, None)];
+    let key = ScatterKey::new(ScatterSpec::JoinKey(&slots), &schema).unwrap();
+    let packer = ReindexPacker::new(&schema, &slots).unwrap();
+    let got = workers(&key, &schema, &mb, NW);
+    let mut buf = [0u8; MAX_PK_BYTES];
+    for (row, &got) in got.iter().enumerate() {
+        let want = match mb.get_weight(row) {
+            0 => usize::MAX,
+            _ => {
+                packer.pack_into(&mut buf[..packer.out_stride], &mb, row);
+                worker_for_pk_bytes(&buf[..packer.out_stride], NW)
+            }
+        };
+        assert_eq!(got, want, "row {row}");
+    }
+}

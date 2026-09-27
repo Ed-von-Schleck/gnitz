@@ -101,7 +101,7 @@ pub fn reindexed_on_col1(circuit: &mut Circuit, source: i64) -> gnitz_wire::Node
         source: source as u64,
         source_key: key.to_vec(),
     };
-    circuit.map_reindex(scan, &key, &[0], role)
+    circuit.map_reindex(scan, &key, &[0], role, gnitz_wire::NullKeys::Keep)
 }
 
 /// An equi-join of `a` and `b` on their column 1, each side stating its scatter

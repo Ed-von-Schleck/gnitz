@@ -19,7 +19,7 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 
-use gnitz_expr::RowSource;
+use gnitz_expr::{BatchView, RowSource};
 use gnitz_wire::{KeyRange, NARROW_PK_MAX_BYTES};
 
 use crate::schema::{
@@ -843,10 +843,8 @@ fn classify_promote(loc: ColumnLocator) -> PromoteKind {
 #[derive(Clone, Copy)]
 struct ColPromoter {
     out_col: SchemaColumn,
-    /// Group-key mode: the **source** column is nullable, so a NULL zeroes the
-    /// slot and the presence bitmap carries the NULL-ness instead. A stale or
-    /// arbitrary cell under a NULL would otherwise split one group in two.
-    /// Never set on a join key — those are NULL-gated upstream.
+    /// Group key only: the source column is nullable, so a NULL packs a zeroed
+    /// slot and sets its bit in the presence bitmap.
     nullable: bool,
     kind: PromoteKind,
 }
@@ -1099,6 +1097,161 @@ impl ReindexPacker {
         if !self.fold.is_empty() {
             let h = self.fold.key_row(batch, row, null_word);
             dst[off..off + FOLD_BYTES].copy_from_slice(&h.to_be_bytes());
+        }
+    }
+
+    /// Every row of `batch` with a `width`-byte buffer, its packed key at the front.
+    pub(crate) fn for_each_key<B: BatchView>(&self, batch: &B, width: usize, mut f: impl FnMut(usize, &mut [u8])) {
+        let rows = batch.row_count();
+        let mut bufs = vec![0u8; rows.min(KEY_CHUNK) * width];
+        for start in (0..rows).step_by(KEY_CHUNK) {
+            let n = (rows - start).min(KEY_CHUNK);
+            self.pack_rows(&mut bufs, width, batch, start, n);
+            for (i, buf) in bufs.chunks_exact_mut(width).take(n).enumerate() {
+                f(start + i, buf);
+            }
+        }
+    }
+
+    /// Whether [`Self::pack_rows`] packs a column at a time: every column a plain
+    /// integer, and no bitmap or fold.
+    fn packs_by_column(&self) -> bool {
+        !self.has_bitmap
+            && self.fold.is_empty()
+            && self.cols[..self.num_cols]
+                .iter()
+                .all(|cp| !cp.nullable && matches!(cp.kind, PromoteKind::Col(_)))
+    }
+
+    /// [`Self::pack_into`] for `n` rows from `start`, into the fronts of `dst`'s
+    /// `n` slots `stride` apart.
+    pub(crate) fn pack_rows<B: BatchView>(&self, dst: &mut [u8], stride: usize, batch: &B, start: usize, n: usize) {
+        let dst = &mut dst[..n * stride];
+        if !self.packs_by_column() {
+            for (i, key) in dst.chunks_exact_mut(stride).enumerate() {
+                self.pack_into(&mut key[..self.out_stride], batch, start + i);
+            }
+            return;
+        }
+        let cols = &self.cols[..self.num_cols];
+        let mut off = 0;
+        for cp in cols {
+            let PromoteKind::Col(loc) = cp.kind else {
+                unreachable!("a by-column key packs integer columns only")
+            };
+            let (sw, dw) = (loc.size(), cp.out_col.size() as usize);
+            let col = IntCol {
+                dst: &mut *dst,
+                stride,
+                off,
+                bias: gnitz_wire::opk_bias(cp.out_col.type_code, dw),
+            };
+            let signed = loc.type_code().is_signed_int();
+            match loc {
+                ColumnLocator::Pk { byte_off, .. } => {
+                    let (pk, pk_stride) = batch.pk_region();
+                    let src = &pk[start * pk_stride..(start + n) * pk_stride];
+                    col.dispatch::<true>(sw, dw, signed, src, pk_stride, byte_off as usize);
+                }
+                ColumnLocator::Payload { slot, .. } => {
+                    let src = &batch.col_data(slot as usize, sw)[start * sw..(start + n) * sw];
+                    col.dispatch::<false>(sw, dw, signed, src, sw, 0);
+                }
+            }
+            off += dw;
+        }
+    }
+}
+
+/// Rows [`ReindexPacker::for_each_key`] packs per [`ReindexPacker::pack_rows`] call.
+const KEY_CHUNK: usize = 256;
+
+/// One integer key column's slot, at `off` of each of `dst`'s keys.
+struct IntCol<'a> {
+    dst: &'a mut [u8],
+    stride: usize,
+    off: usize,
+    /// The slot type's OPK bias: a slot holds `value + bias`, big-endian.
+    bias: u128,
+}
+
+impl IntCol<'_> {
+    /// [`Self::pack`] monomorphized for a `sw`-byte source cell and a `dw`-byte
+    /// slot, so every shift and width in the row loop is a constant.
+    fn dispatch<const PK: bool>(
+        self,
+        sw: usize,
+        dw: usize,
+        signed: bool,
+        src: &[u8],
+        src_stride: usize,
+        src_off: usize,
+    ) {
+        macro_rules! arms {
+            ($(($s:literal, $d:literal)),*) => {
+                match (sw, dw, signed) {
+                    $(
+                        ($s, $d, false) => self.pack::<$s, $d, PK, false>(src, src_stride, src_off),
+                        ($s, $d, true) => self.pack::<$s, $d, PK, true>(src, src_stride, src_off),
+                    )*
+                    _ => unreachable!("a key slot is at least as wide as its 1/2/4/8/16-byte source"),
+                }
+            };
+        }
+        arms!(
+            (1, 1),
+            (1, 2),
+            (1, 4),
+            (1, 8),
+            (1, 16),
+            (2, 2),
+            (2, 4),
+            (2, 8),
+            (2, 16),
+            (4, 4),
+            (4, 8),
+            (4, 16),
+            (8, 8),
+            (8, 16),
+            (16, 16)
+        )
+    }
+
+    /// Each source row's `SW`-byte cell at `src_off` of its `src_stride` bytes of
+    /// `src` — a PK column's OPK image when `PK`, else a native value — as its
+    /// slot's `DW` bytes.
+    #[inline(always)]
+    fn pack<const SW: usize, const DW: usize, const PK: bool, const SIGNED: bool>(
+        self,
+        src: &[u8],
+        src_stride: usize,
+        src_off: usize,
+    ) {
+        let IntCol { dst, stride, off, bias } = self;
+        let encode = |cell: &[u8; SW], key: &mut [u8]| {
+            let mut b = [0u8; 16];
+            let raw = match PK {
+                true => {
+                    b[16 - SW..].copy_from_slice(cell);
+                    u128::from_be_bytes(b) ^ ((SIGNED as u128) << (8 * SW - 1))
+                }
+                false => {
+                    b[..SW].copy_from_slice(cell);
+                    u128::from_le_bytes(b)
+                }
+            };
+            let shift = if SIGNED { 128 - 8 * SW as u32 } else { 0 };
+            let v = (((raw << shift) as i128 >> shift) as u128).wrapping_add(bias);
+            let slot: &mut [u8; DW] = (&mut key[off..off + DW]).try_into().unwrap();
+            *slot = v.to_be_bytes()[16 - DW..].try_into().unwrap();
+        };
+        let keys = dst.chunks_exact_mut(stride);
+        match src_stride == SW {
+            true => src.as_chunks::<SW>().0.iter().zip(keys).for_each(|(c, k)| encode(c, k)),
+            false => src
+                .chunks_exact(src_stride)
+                .zip(keys)
+                .for_each(|(row, k)| encode(row[src_off..src_off + SW].try_into().unwrap(), k)),
         }
     }
 }

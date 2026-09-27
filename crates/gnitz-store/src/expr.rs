@@ -46,6 +46,10 @@ enum BlobMode<'a> {
 /// per range.
 const COMPACT_RUN_LEN: usize = 128;
 
+/// [`COMPACT_RUN_LEN`] for a copy-only map packing a reindex key, whose
+/// per-range setup is smaller.
+const PACK_COMPACT_RUN_LEN: usize = 24;
+
 /// Where a map's output PK region comes from. Owned by the plan rather than
 /// passed per call, so the region cannot be left unwritten between two
 /// statements and no caller can pair a plan with the wrong stamp.
@@ -213,7 +217,30 @@ pub struct MapPlan {
     /// The input has German-string columns and every one is carried by a copy,
     /// so its heap holds no bytes the output would adopt dead.
     keeps_every_string: bool,
+    /// A row with any of these null bits set is dropped: a
+    /// [`gnitz_wire::NullKeys::Drop`] reindex's nullable key columns.
+    null_key_mask: u64,
     out_schema: SchemaDescriptor,
+}
+
+/// The `[start, end)` runs of `batch`'s rows with no bit of `mask` set.
+fn key_defined_runs(batch: &Batch, mask: u64) -> Vec<(usize, usize)> {
+    let words = batch.null_bmp_data().as_chunks::<8>().0;
+    // A batch with no NULL key takes only this branch-free pass.
+    if words.iter().fold(0u64, |a, w| a | u64::from_le_bytes(*w)) & mask == 0 {
+        return vec![(0, batch.count)];
+    }
+    let defined: Vec<u64> = words
+        .chunks(64)
+        .map(|block| {
+            block.iter().enumerate().fold(0, |bits, (i, w)| {
+                bits | u64::from(u64::from_le_bytes(*w) & mask == 0) << i
+            })
+        })
+        .collect();
+    let mut runs = Vec::new();
+    gnitz_expr::scan_filter_bits(&defined, batch.count, &mut runs);
+    runs
 }
 
 /// Set every row's PK to the [`FoldCols`] digest of its payload columns, so equal
@@ -299,10 +326,11 @@ impl MapPlan {
     /// client-supplied column list clears. Every kind ends in the same
     /// [`Self::from_map`], so an elided map is validated like any other.
     pub fn from_wire(in_schema: &SchemaDescriptor, mk: &gnitz_wire::MapKind) -> Result<Self, OpBuildErr> {
+        let mut null_key_mask = 0;
         let (out_schema, prog, pk_source) = match mk {
             gnitz_wire::MapKind::Compute(map) => return Self::from_compute_map(in_schema, map),
 
-            gnitz_wire::MapKind::Reindex { keep, key, .. } => {
+            gnitz_wire::MapKind::Reindex { keep, key, nulls, .. } => {
                 // The packer is built first because it *is* the layout: its output
                 // schema reads the promoters the per-row pack writes through, so
                 // the reindexed `_join_pk` and the delta scatter co-partition by
@@ -310,6 +338,13 @@ impl MapPlan {
                 // circuit's own slots.
                 let packer = ReindexPacker::new(in_schema, key)?;
                 let out_schema = packer.output_schema(in_schema, keep)?;
+                if *nulls == gnitz_wire::NullKeys::Drop {
+                    null_key_mask = key
+                        .iter()
+                        .filter_map(|&(c, _)| in_schema.payload_slot(c as usize))
+                        .fold(0, |mask, slot| mask | 1u64 << slot)
+                        & in_schema.nullable_payload_slots();
+                }
                 (out_schema, LogicalProgram::copy_cols(keep), PkSource::Pack(packer))
             }
 
@@ -337,8 +372,9 @@ impl MapPlan {
                 (out_schema, LogicalProgram::copy_cols(cols), PkSource::Inherit)
             }
         };
-        Self::from_map(prog, in_schema, &out_schema, pk_source)
-            .map_err(|e| OpBuildErr::Program("map: program/schema mismatch", e))
+        let plan = Self::from_map(prog, in_schema, &out_schema, pk_source)
+            .map_err(|e| OpBuildErr::Program("map: program/schema mismatch", e))?;
+        Ok(MapPlan { null_key_mask, ..plan })
     }
 
     /// A computed projection: [`gnitz_wire::MapKind::Compute`]'s whole body, and
@@ -386,6 +422,7 @@ impl MapPlan {
             pk_source,
             copies_a_string,
             keeps_every_string,
+            null_key_mask: 0,
             out_schema: *out_schema,
         })
     }
@@ -411,12 +448,19 @@ impl MapPlan {
         self.map_ranges_into(src, keeper, ranges);
     }
 
-    /// Execute the map over a whole batch into a fresh output — the DBSP MAP
-    /// instruction's whole body. The result is `Raw`: a payload-reordering
-    /// projection over a duplicate-PK input can break (PK, payload) order (the
-    /// D1 fail-safe).
+    /// The map over `in_batch`, less a [`gnitz_wire::NullKeys::Drop`] reindex's
+    /// NULL-keyed rows, into a fresh `Raw` output.
     pub fn evaluate_map_batch(&mut self, in_batch: &Batch) -> Batch {
-        let n = in_batch.count;
+        let whole = [(0, in_batch.count)];
+        let runs;
+        let ranges: &[(usize, usize)] = match self.null_key_mask {
+            0 => &whole,
+            mask => {
+                runs = key_defined_runs(in_batch, mask);
+                &runs
+            }
+        };
+        let n = crate::storage::range_rows(ranges);
         if n == 0 {
             return Batch::empty_with_schema(&self.out_schema);
         }
@@ -429,7 +473,7 @@ impl MapPlan {
         if self.keeps_every_string {
             output.share_blob_from(in_batch);
         }
-        self.map_ranges_into(in_batch, &mut output, &[(0, n)]);
+        self.map_ranges_into(in_batch, &mut output, ranges);
         // The one source that keys on the finished output row.
         if let PkSource::HashRow = self.pk_source {
             reindex_hash_row(&mut output);
@@ -444,7 +488,12 @@ impl MapPlan {
             return;
         }
         let blob_cap = crate::storage::prorated_blob_cap(src.blob.len(), src.count, total);
-        let starves_kernel = self.ev.emits_anything() && ranges.len() > 1 && total < ranges.len() * COMPACT_RUN_LEN;
+        let compact_below = match (self.ev.emits_anything(), &self.pk_source) {
+            (true, _) => COMPACT_RUN_LEN,
+            (false, PkSource::Pack(_)) => PACK_COMPACT_RUN_LEN,
+            (false, _) => 0,
+        };
+        let starves_kernel = ranges.len() > 1 && total < ranges.len() * compact_below;
         let compacted;
         let (src, ranges) = if starves_kernel {
             compacted = Batch::from_ranges(src, ranges, src.schema(), 0);
@@ -506,13 +555,9 @@ impl MapPlan {
             }
             PkSource::Pack(packer) => {
                 debug_assert_eq!(output.pk_stride() as usize, packer.out_stride);
-                let src = in_batch.as_mem_batch();
                 let stride = packer.out_stride;
-                // `pack_into` overwrites the slot it is handed, so no staging buffer.
-                let pk = &mut output.pk_data_mut()[dst_base * stride..(dst_base + n) * stride];
-                for (i, dst) in pk.chunks_exact_mut(stride).enumerate() {
-                    packer.pack_into(dst, &src, src_start + i);
-                }
+                let pk = &mut output.pk_data_mut()[dst_base * stride..];
+                packer.pack_rows(pk, stride, &in_batch.as_mem_batch(), src_start, n);
                 // An in-place PK rewrite can break (PK, payload) order.
                 output.downgrade();
             }

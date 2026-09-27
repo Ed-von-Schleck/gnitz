@@ -87,14 +87,6 @@ impl SourceOrigin {
             .collect::<Option<Vec<ReindexSlot>>>()?;
         Some(ReindexRole::ScatterKey { source: self.src.tid(), source_key })
     }
-
-    /// The route of a re-key onto the source PK.
-    pub(crate) fn scatter_pk(&self) -> ReindexRole {
-        ReindexRole::ScatterKey {
-            source: self.src.tid(),
-            source_key: self.pk.iter().map(|&c| (c, None)).collect(),
-        }
-    }
 }
 
 /// Open `rel` for a consumer reading `live` of it. Its `Filter` / `Project` levels

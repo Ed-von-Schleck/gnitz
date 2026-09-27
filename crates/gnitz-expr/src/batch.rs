@@ -353,7 +353,7 @@ impl MorselOut<'_> {
 /// `rest` keeps the not-yet-scanned bits **in place** rather than shifting them
 /// down, so no shift can reach 64 and every mask below is well-defined — which
 /// is what lets an all-ones word and an empty one fall out of the same loop.
-pub(crate) fn scan_filter_bits(bits: &[u64], n: usize, out: &mut Vec<(usize, usize)>) {
+pub fn scan_filter_bits(bits: &[u64], n: usize, out: &mut Vec<(usize, usize)>) {
     // The start of a run that reached the top of the previous word. It continues
     // into this one only while the low bit is still set.
     let mut open: Option<usize> = None;

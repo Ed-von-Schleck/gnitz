@@ -51,7 +51,7 @@ fn a_pinned_side_keeps_its_pk_alone() {
     // A range conjunct alone: the key columns are not kept by the demand rules,
     // only the pinned PKs are.
     let o = origins(&left, &right);
-    let sides = join_sides(NO_DEMAND, &cls, JoinType::Inner, [left, right], o);
+    let sides = join_sides(NO_DEMAND, &cls, JoinType::Inner, [left, right], o).unwrap();
     assert_eq!((sides[0].keep.as_slice(), sides[0].pa()), (&[1u32][..], 1));
     assert_eq!((sides[1].keep.as_slice(), sides[1].pa()), (&[0u32][..], 1));
 }
@@ -73,13 +73,13 @@ fn an_unreferenced_equi_join_keeps_one_left_column() {
         None,
     );
     let o = origins(&left, &right);
-    let sides = join_sides(NO_DEMAND, &cls, JoinType::Inner, [left, right], o);
+    let sides = join_sides(NO_DEMAND, &cls, JoinType::Inner, [left, right], o).unwrap();
     assert_eq!((sides[0].keep.as_slice(), sides[0].pa()), (&[0u32][..], 0));
     assert!(sides[1].keep.is_empty());
 }
 
-/// A LEFT join's preserved side keeps its nullable equi key: `map_reindex`
-/// collapses a NULL key to synthetic PK 0, colliding with a real `k = 0` row.
+/// A LEFT join's preserved side keeps its nullable equi key: a NULL key packs
+/// from its zero cell, colliding with a real `k = 0` row.
 #[test]
 fn a_preserved_side_keeps_its_nullable_key() {
     let ids = ColIdGen::new();
@@ -94,7 +94,7 @@ fn a_preserved_side_keeps_its_nullable_key() {
         None,
     );
     let o = origins(&left, &right);
-    let sides = join_sides(NO_DEMAND, &cls, JoinType::Left, [left, right], o);
+    let sides = join_sides(NO_DEMAND, &cls, JoinType::Left, [left, right], o).unwrap();
     // Left has a ν and a nullable key at slot 1: that key, not the Rule 5 fallback.
     assert_eq!(sides[0].keep.as_slice(), &[1u32][..]);
     // The right side has no ν, so its equally-nullable key is not protected.
@@ -129,11 +129,12 @@ fn a_band_nu_keeps_its_key_columns() {
         JoinType::Left,
         [left.clone(), right.clone()],
         origins(&left, &right),
-    );
+    )
+    .unwrap();
     // The pinned PK, then both key columns; the payload `v` nothing reads is not kept.
     assert_eq!(sides[0].keep.as_slice(), &[0u32, 1, 2][..]);
     let o = origins(&left, &right);
-    let sides = join_sides(NO_DEMAND, &class(eq, None), JoinType::Left, [left, right], o);
+    let sides = join_sides(NO_DEMAND, &class(eq, None), JoinType::Left, [left, right], o).unwrap();
     // An equi ν over a NOT NULL key keeps nothing past the Rule 5 fallback.
     assert_eq!(sides[0].keep.as_slice(), &[0u32][..]);
 }

@@ -1,5 +1,5 @@
 //! The admission rules for a join step and for a decorrelated EXISTS/IN, shared
-//! by `bind`, `place`, `decorrelate` and `lower::join`.
+//! by `place` and `decorrelate`.
 
 use super::{HirExpr, JoinShape, JoinType, SubqueryKind, SubqueryRef};
 use crate::error::GnitzSqlError;

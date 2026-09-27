@@ -295,6 +295,18 @@ pub enum ReindexRole {
 const ROLE_AUXILIARY: u8 = 0;
 const ROLE_SCATTER_KEY: u8 = 1;
 
+/// What a reindex does with a row NULL in a key column. SQL 3VL: a NULL join key
+/// matches nothing, so a join's key re-key drops the row; a re-key whose NULL-keyed
+/// rows must survive (an outer side's unmatched minuend, a null-fill) keeps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NullKeys {
+    Keep,
+    Drop,
+}
+
+const NULL_KEYS_KEEP: u8 = 0;
+const NULL_KEYS_DROP: u8 = 1;
+
 /// One slot of a reindex or hash-row key list: a source column, and the
 /// promotion target the planner carried for it. What an absent target means is
 /// the field's rule, not this alias's — read [`MapKind::Reindex`] or
@@ -321,6 +333,7 @@ pub enum MapKind {
         keep: Vec<u32>,
         key: Vec<ReindexSlot>,
         role: ReindexRole,
+        nulls: NullKeys,
     },
     /// A projection of `cols`, each widened to its target (`None` keeps the
     /// source type), keyed by a hash of the row's content instead of the source
@@ -574,12 +587,20 @@ impl Circuit {
     }
 
     /// [`MapKind::Reindex`].
-    pub fn map_reindex(&mut self, input: NodeId, key: &[ReindexSlot], keep: &[u32], role: ReindexRole) -> NodeId {
+    pub fn map_reindex(
+        &mut self,
+        input: NodeId,
+        key: &[ReindexSlot],
+        keep: &[u32],
+        role: ReindexRole,
+        nulls: NullKeys,
+    ) -> NodeId {
         assert!(!key.is_empty(), "a reindex map must name its key columns");
         let op = OpNode::Map(MapKind::Reindex {
             keep: keep.to_vec(),
             key: key.to_vec(),
             role,
+            nulls,
         });
         self.add(op, NodeInputs::Unary(input))
     }
@@ -904,7 +925,7 @@ pub fn encode_op_node(op: &OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
             write_compute_map(&mut w, map);
             (Opcode::MapExpr, None, Some(w.into_vec()))
         }
-        OpNode::Map(MapKind::Reindex { keep, key, role }) => {
+        OpNode::Map(MapKind::Reindex { keep, key, role, nulls }) => {
             match role {
                 ReindexRole::Auxiliary => {
                     w.u8(ROLE_AUXILIARY);
@@ -914,6 +935,10 @@ pub fn encode_op_node(op: &OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
                     write_cols_with_tcs(&mut w, source_key);
                 }
             }
+            w.u8(match nulls {
+                NullKeys::Keep => NULL_KEYS_KEEP,
+                NullKeys::Drop => NULL_KEYS_DROP,
+            });
             write_cols_with_tcs(&mut w, key);
             write_cols(&mut w, keep);
             (Opcode::MapReindex, None, Some(w.into_vec()))
@@ -1020,11 +1045,17 @@ fn decode_params(r: &mut Reader, opcode: u64, src_tab: Option<u64>, params: Opti
                 }
                 other => return Err(format!("MAP_REINDEX unknown route-key role {other}")),
             };
+            // Decides which rows survive, so unknown is a refusal like the role.
+            let nulls = match r.u8()? {
+                NULL_KEYS_KEEP => NullKeys::Keep,
+                NULL_KEYS_DROP => NullKeys::Drop,
+                other => return Err(format!("MAP_REINDEX unknown NULL-key rule {other}")),
+            };
             let key = read_cols_with_tcs(r)?;
             if key.is_empty() {
                 return Err("MAP_REINDEX names no key columns".to_string());
             }
-            OpNode::Map(MapKind::Reindex { keep: read_cols(r)?, key, role })
+            OpNode::Map(MapKind::Reindex { keep: read_cols(r)?, key, role, nulls })
         }
         Opcode::MapHashRow => {
             // No target-domain gate here: `MapPlan::from_wire` types the output

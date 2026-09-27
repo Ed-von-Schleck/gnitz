@@ -665,6 +665,16 @@ impl JoinClass {
             .chain(self.range.iter().map(move |r| pick((r.left, r.right))))
     }
 
+    /// Each key slot's common type, in [`Self::key_cols`] order: the eq pairs',
+    /// then the range's.
+    pub(crate) fn key_tcs(&self) -> Vec<TypeCode> {
+        self.eq
+            .iter()
+            .map(|p| p.tc)
+            .chain(self.range.iter().map(|r| r.tc))
+            .collect()
+    }
+
     pub(crate) fn shape(&self) -> JoinShape {
         match (self.range.is_some(), self.eq.is_empty()) {
             (true, true) => JoinShape::PureRange,

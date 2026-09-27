@@ -42,6 +42,49 @@ fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
     }
 }
 
+/// The foreign decode refuses a NULL over a non-zero cell.
+#[test]
+fn a_foreign_decode_refuses_a_non_zero_cell_under_a_null() {
+    use crate::schema::SchemaColumn;
+    // `(U64 pk, I64 NOT NULL, I64 NULL)`: the nullable column is payload slot 1.
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+        ],
+        &[0],
+    );
+    let mut b = super::super::batch_builder::BatchBuilder::new(schema);
+    for pk in [1u128, 2] {
+        b.begin_row(pk, 1);
+        b.put_int(pk * 10);
+        b.put_null();
+        b.end_row();
+    }
+    let clean = encode_to_wire_vec(&b.finish());
+    assert_eq!(
+        Batch::decode_foreign_wal_block(&clean, &schema, &schema).map(|b| b.len()),
+        Ok(2)
+    );
+    let cell = region_offset(&schema, 2, REG_PAYLOAD_START + 1) + 8;
+    let mut forged = clean.clone();
+    forged[cell..cell + 8].fill(0xFF);
+    assert!(Batch::decode_from_wal_block(&forged, &schema).is_ok());
+    assert_eq!(
+        Batch::decode_foreign_wal_block(&forged, &schema, &schema).err(),
+        Some("a non-zero cell under a NULL")
+    );
+
+    // A NOT NULL-only schema carries no null bit to test under.
+    let not_null = pk_payload_schema(&[TypeCode::U64]);
+    let block = encode_to_wire_vec(&make_batch_raw(&not_null, &[(1, 1, -1), (2, 1, 0)]));
+    assert_eq!(
+        Batch::decode_foreign_wal_block(&block, &not_null, &not_null).map(|b| b.len()),
+        Ok(2)
+    );
+}
+
 /// A forged `ROWS` or `HEAP_LEN`, or a block cut short of its `SIZE`, is
 /// refused; a genuinely empty block decodes.
 #[test]

@@ -61,6 +61,7 @@ pub(in crate::query) fn scatter_reindex(source: u64, cols: &[u32]) -> gnitz_wire
         keep: vec![0],
         key: key.clone(),
         role: gnitz_wire::ReindexRole::ScatterKey { source, source_key: key },
+        nulls: gnitz_wire::NullKeys::Keep,
     })
 }
 

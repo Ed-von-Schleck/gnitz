@@ -316,6 +316,7 @@ fn a_join_operand_whose_source_states_no_route_is_rejected() {
         keep: vec![0],
         key: vec![(1, None)],
         role: gnitz_wire::ReindexRole::Auxiliary,
+        nulls: gnitz_wire::NullKeys::Keep,
     });
     let loaded = loaded_for_test(
         [
@@ -354,6 +355,7 @@ fn the_route_is_the_stated_one_not_the_reindex_nodes_own_key() {
         keep: vec![0],
         key: vec![(2, None)],
         role: gnitz_wire::ReindexRole::ScatterKey { source: 7, source_key: vec![(5, None)] },
+        nulls: gnitz_wire::NullKeys::Keep,
     });
     let loaded = loaded_for_test(
         [

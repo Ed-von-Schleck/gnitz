@@ -16,7 +16,7 @@
 //! row-by-row equal-PK arm, exactly as the AVI's value column does.
 
 use crate::schema::key::ReindexPacker;
-use crate::schema::{ColumnLocator, OpBuildErr, SchemaDescriptor, SchemaFacts, MAX_PK_BYTES};
+use crate::schema::{ColumnLocator, OpBuildErr, SchemaDescriptor, SchemaFacts};
 use crate::storage::Batch;
 use gnitz_expr::{OrderLocator, RowSource};
 use gnitz_wire::OrderKey;
@@ -120,20 +120,18 @@ impl TopNIndex {
         let mut out = Batch::with_capacity_blob(&self.schema, delta.count.max(1), delta.blob.len());
         let k = self.order.len();
         let stride = self.key_packer.out_stride;
-        let mut key = [0u8; MAX_PK_BYTES];
         let mut image = Vec::new();
-        for row in 0..delta.count {
+        self.key_packer.for_each_key(&mb, stride + self.lead_bytes, |row, key| {
             let weight = mb.get_weight(row);
             // A weight-0 row contributes nothing: consolidation would drop it.
             if weight == 0 {
-                continue;
+                return;
             }
-            self.group_prefix(&mut key, &mb, row);
             // `image_0` doubles as the PK's lead; every image is written once.
             image.clear();
             self.order[0].append_image(&mb, row, &mut image);
             write_image_slot(&mut key[stride..stride + self.lead_bytes], &image);
-            out.begin_row(&key[..stride + self.lead_bytes], weight);
+            out.begin_row(key, weight);
             out.extend_col_blob(0, &image);
             for (i, spec) in self.order.iter().enumerate().skip(1) {
                 image.clear();
@@ -145,7 +143,7 @@ impl TopNIndex {
                 out.append_cell_from(k + pi, loc, &mb, row, &mut null_word);
             }
             out.commit_row(null_word);
-        }
+        });
         out
     }
 }

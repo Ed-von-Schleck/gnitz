@@ -34,14 +34,8 @@ pub fn op_filter(batch: &Batch, pred: &mut RowFilter, schema: &SchemaDescriptor)
     Some(Batch::from_ranges(batch, &ranges, schema, 0))
 }
 
-/// `a`'s schema with each column's nullability OR-ed with `b`'s, so a
-/// null-carrying side forces the null-aware `Generic` row comparator instead of
-/// the null-blind `FixedIntNonnull` one, which would fail to coalesce two
-/// logically-NULL rows carrying different bytes under the null bit.
-///
-/// Not `DerivedSchema`, which forces `pk_indices = 0..pk_len`: a `Union`
-/// input's PK need not be a column prefix. `SchemaDescriptor::new`'s asserts fire
-/// in release but cannot here — matched layouts leave every PK column untouched.
+/// `a`'s schema with each column's nullability OR-ed with `b`'s: a NULL and a
+/// zero carry the same bytes, so only a nullable column's comparator parts them.
 pub fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Result<SchemaDescriptor, OpBuildErr> {
     if !a.same_physical_layout(b) {
         return Err(OpBuildErr::shape("union: inputs do not share a physical layout"));

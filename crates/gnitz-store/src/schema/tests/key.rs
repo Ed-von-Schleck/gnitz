@@ -1367,6 +1367,65 @@ mod pack_proptest {
                 prop_assert_eq!(&pay_buf[..stride], &pk_buf[..stride]);
             }
         }
+
+        /// `pack_rows` is `pack_into` row by row, over a window at an arbitrary
+        /// start, for both placements, self-derived and carried.
+        #[test]
+        fn pack_rows_is_pack_into_per_row(
+            (types, rows, bytes, start) in prop::collection::vec(arb_pk_type(), 1..=crate::schema::MAX_PK_COLUMNS)
+                .prop_flat_map(|types| {
+                    let width: usize = types.iter().map(|t| t.wire_stride()).sum();
+                    (Just(types), 1usize..600).prop_flat_map(move |(types, rows)| {
+                        (Just(types), Just(rows), prop::collection::vec(any::<u8>(), rows * width), 0..rows)
+                    })
+                })
+        ) {
+            let widths: Vec<usize> = types.iter().map(|t| t.wire_stride()).collect();
+            let row_width: usize = widths.iter().sum();
+            let cell = |r: usize, i: usize| {
+                let at = r * row_width + widths[..i].iter().sum::<usize>();
+                &bytes[at..at + widths[i]]
+            };
+            let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
+            cols.extend(types.iter().map(|&tc| SchemaColumn::new(tc, false)));
+            let pay_schema = SchemaDescriptor::new(&cols, &[0]);
+            let pk_schema = pk_only_schema(&types);
+            let (mut pb, mut kb) = (Batch::with_capacity(&pay_schema, rows), Batch::with_capacity(&pk_schema, rows));
+            for r in 0..rows {
+                pb.extend_pk(r as u128);
+                let mut opk = Vec::new();
+                for (i, &tc) in types.iter().enumerate() {
+                    pb.extend_col(i, cell(r, i));
+                    let mut slot = vec![0u8; widths[i]];
+                    gnitz_wire::encode_pk_column(cell(r, i), tc, &mut slot);
+                    opk.extend_from_slice(&slot);
+                }
+                kb.extend_pk_bytes(&opk);
+                for b in [&mut pb, &mut kb] {
+                    b.extend_weight(&1i64.to_le_bytes());
+                    b.extend_null_bmp(&0u64.to_le_bytes());
+                    b.count += 1;
+                }
+            }
+            let n = rows - start;
+            for carried in [false, true] {
+                let target = |tc| carried.then(|| carried_target(tc));
+                for (schema, batch, first) in [(&pay_schema, &pb, 1u32), (&pk_schema, &kb, 0)] {
+                    let key: Vec<gnitz_wire::ReindexSlot> =
+                        types.iter().enumerate().map(|(i, &tc)| (i as u32 + first, target(tc))).collect();
+                    let packer = ReindexPacker::new(schema, &key).unwrap();
+                    let stride = packer.out_stride;
+                    let mb = batch.as_mem_batch();
+                    let mut got = vec![0xA5u8; n * stride];
+                    packer.pack_rows(&mut got, stride, &mb, start, n);
+                    let mut want = vec![0u8; n * stride];
+                    for (i, key) in want.chunks_exact_mut(stride).enumerate() {
+                        packer.pack_into(key, &mb, start + i);
+                    }
+                    prop_assert_eq!(got, want);
+                }
+            }
+        }
     }
 }
 

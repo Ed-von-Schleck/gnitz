@@ -671,7 +671,7 @@ impl ZSetBatch {
     }
 
     /// Validate that all vectors are consistently sized for the given schema, and
-    /// that no NULL sits under a NOT NULL column.
+    /// that every NULL is a zeroed cell of a nullable column.
     pub fn validate(&self, schema: &Schema) -> Result<(), std::string::String> {
         // The PK buffer's own shape, checked before `PkColumn::len` divides by
         // the stride. A stride that disagrees with the schema would make every
@@ -695,7 +695,19 @@ impl ZSetBatch {
             return Err(format!("nulls length {} != row count {}", self.nulls.len(), n));
         }
         self.check_columns()?;
-        check_not_null(&self.nulls, schema)
+        check_not_null(&self.nulls, schema)?;
+        let col = |pi: usize| (self.payload[pi].bytes.as_slice(), self.payload[pi].stride());
+        match gnitz_wire::first_valued_null(
+            schema.nullable_payload_slots(),
+            gnitz_wire::as_le_bytes(&self.nulls),
+            col,
+        ) {
+            None => Ok(()),
+            Some((row, slot)) => Err(format!(
+                "row {row} holds a value under NULL in column '{}'",
+                schema.columns[schema.payload_col_idx(slot)].name
+            )),
+        }
     }
 
     /// The rows `rows` names, in order, at their paired weights; each row at most once.

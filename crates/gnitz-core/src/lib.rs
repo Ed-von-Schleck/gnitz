@@ -32,7 +32,7 @@ pub use gnitz_wire::{
     validate_dist_prefix, PkColList, ReindexSlot, RelClass, RelIndex, TableProps, ViewProps, FIRST_USER_TABLE_ID,
     TABLE_TAB,
 };
-pub use gnitz_wire::{Circuit, NodeId, OpNode, RangeRel, ReindexRole};
+pub use gnitz_wire::{Circuit, NodeId, NullKeys, OpNode, RangeRel, ReindexRole};
 pub use gnitz_wire::{WireFault, WireStatus};
 pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult};
 pub use protocol::{

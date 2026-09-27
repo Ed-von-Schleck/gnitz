@@ -152,14 +152,13 @@ fn avi_entries<const HAS_WIDE: bool>(delta: &Batch, bake: &AviBake) -> Batch {
     let mb = delta.as_mem_batch();
     let mut out = Batch::with_capacity(&bake.schema, (delta.count * bake.aggs.len()).max(1));
 
-    let mut key = [0u8; MAX_PK_BYTES];
+    let width = bake.key_packer.out_stride + ORDINAL_BYTES + bake.value_bytes;
     let mut image = Vec::new();
-    for row in 0..delta.count {
+    bake.key_packer.for_each_key(&mb, width, |row, key| {
         let weight = mb.get_weight(row);
         if weight == 0 {
-            continue;
+            return;
         }
-        bake.key_packer.pack_prefix(&mut key, &mb, row);
         for (j, a) in bake.aggs.iter().enumerate() {
             let ExtremeSpec { loc, kind, max } = a.spec;
             // A NULL has no image: MIN/MAX skips it.
@@ -169,7 +168,7 @@ fn avi_entries<const HAS_WIDE: bool>(delta: &Batch, bake: &AviBake) -> Batch {
             match kind {
                 ImageKind::Scalar(kind) => {
                     let image = scalar_image(&loc, kind, max, &mb, row).to_be_bytes();
-                    out.push_zero_filled_row(bake.entry(&mut key, j as u8, &image), weight, 0);
+                    out.push_zero_filled_row(bake.entry(key, j as u8, &image), weight, 0);
                 }
                 ImageKind::Wide(kind) => {
                     let entry = WideEntry {
@@ -183,14 +182,14 @@ fn avi_entries<const HAS_WIDE: bool>(delta: &Batch, bake: &AviBake) -> Batch {
                         weight,
                     };
                     if HAS_WIDE {
-                        entry.push(&mut out, &mut key, &mut image);
+                        entry.push(&mut out, key, &mut image);
                     } else {
-                        entry.push_outlined(&mut out, &mut key, &mut image);
+                        entry.push_outlined(&mut out, key, &mut image);
                     }
                 }
             }
         }
-    }
+    });
     out
 }
 

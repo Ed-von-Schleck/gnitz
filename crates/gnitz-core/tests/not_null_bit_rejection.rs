@@ -78,7 +78,9 @@ fn a_null_bit_on_a_not_null_column_is_rejected_at_the_client_boundary() {
         let mut batch = ZSetBatch::new(&schema);
         let mut app = BatchAppender::new(&mut batch, &schema);
         for i in 1u64..=4 {
-            app.add_row(i as u128, 1).i64_val(i as i64).i64_val(i as i64 * 10);
+            // Row 3's `w` cell is zero: the wire's NULL encoding, should its bit be set.
+            let w = if i == 3 { 0 } else { i as i64 * 10 };
+            app.add_row(i as u128, 1).i64_val(i as i64).i64_val(w);
         }
         batch
     };
@@ -95,10 +97,21 @@ fn a_null_bit_on_a_not_null_column_is_rejected_at_the_client_boundary() {
     clean.validate(&schema).expect("the honest batch is client-side valid");
     hostile_push(&mut raw, tid, &schema, &clean).expect("a conforming batch is accepted");
 
-    // A bit under the NULLABLE column `w` (payload slot 1) is also fine.
+    // A bit under the NULLABLE column `w` (payload slot 1) is also fine, over the
+    // zeroed cell that encodes NULL.
     let mut nullable_bit = build();
     nullable_bit.nulls[2] |= 1 << 1;
     hostile_push(&mut raw, tid, &schema, &nullable_bit).expect("a null bit on a nullable column is legal");
+
+    // The same bit over a cell holding a value is a second NULL encoding, refused.
+    let mut valued_null = build();
+    valued_null.nulls[1] |= 1 << 1;
+    assert!(
+        valued_null.validate(&schema).is_err(),
+        "the client-side validator catches it too"
+    );
+    let err = hostile_push(&mut raw, tid, &schema, &valued_null).expect_err("a valued NULL cell is refused");
+    assert!(err.contains("a non-zero cell under a NULL"), "got: {err}");
 
     // One bit under the NOT NULL column `v` (payload slot 0), on one row of four.
     let mut hostile = build();

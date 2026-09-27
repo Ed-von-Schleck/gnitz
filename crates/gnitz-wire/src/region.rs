@@ -91,6 +91,28 @@ pub fn first_not_null_violation(not_null: u64, null_bmp: &[u8]) -> Option<(usize
     })
 }
 
+/// The first `(row, payload slot)` whose null bit in `null_bmp`, among the
+/// `nullable` slots, sits over a non-zero cell: NULL encodes as a zeroed cell.
+/// `col(slot)` is that slot's region and its cell width.
+pub fn first_valued_null<'a>(
+    nullable: u64,
+    null_bmp: &[u8],
+    col: impl Fn(usize) -> (&'a [u8], usize),
+) -> Option<(usize, usize)> {
+    for (row, word) in null_bmp.as_chunks::<8>().0.iter().enumerate() {
+        let mut set = u64::from_le_bytes(*word) & nullable;
+        while set != 0 {
+            let slot = set.trailing_zeros() as usize;
+            set &= set - 1;
+            let (cells, width) = col(slot);
+            if cells[row * width..(row + 1) * width].iter().any(|&b| b != 0) {
+                return Some((row, slot));
+            }
+        }
+    }
+    None
+}
+
 /// A row's null word rebased onto output payload slot `at`; slot 64 and beyond
 /// hold no bit.
 #[inline(always)]

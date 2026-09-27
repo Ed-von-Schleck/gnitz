@@ -928,13 +928,19 @@ fn a_hash_row_map_carrying_every_column_is_not_an_identity() {
     assert!(inherit.is_identity(), "the same copy under the inherited PK is one");
 }
 
+/// An auxiliary reindex on `key`, keeping `keep`.
+fn reindex_on(key: &[u32], keep: Vec<u32>, nulls: gnitz_wire::NullKeys) -> gnitz_wire::MapKind {
+    gnitz_wire::MapKind::Reindex {
+        keep,
+        key: key.iter().map(|&c| (c, None)).collect(),
+        role: gnitz_wire::ReindexRole::Auxiliary,
+        nulls,
+    }
+}
+
 #[test]
 fn reindex_key_and_kept_column_lists_are_bounds_checked() {
-    let reindex = |keep: Vec<u32>, key_cols: Vec<u32>| gnitz_wire::MapKind::Reindex {
-        keep,
-        key: key_cols.into_iter().map(|c| (c, None)).collect(),
-        role: gnitz_wire::ReindexRole::Auxiliary,
-    };
+    let reindex = |keep, key: Vec<u32>| reindex_on(&key, keep, gnitz_wire::NullKeys::Keep);
     let three = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
@@ -966,6 +972,109 @@ fn reindex_key_and_kept_column_lists_are_bounds_checked() {
         wire_rejection(&wide, reindex(vec![0], (0..n as u32).collect())),
         format!("reindex key: {n} columns exceeds the {}-column PK limit", n - 1)
     );
+}
+
+/// Every region a map writes, for comparing two outputs row for row.
+fn regions(b: &Batch) -> Vec<Vec<u8>> {
+    let mut out = vec![
+        b.pk_data().to_vec(),
+        b.weight_data().to_vec(),
+        b.null_bmp_data().to_vec(),
+    ];
+    out.extend((0..b.num_payload_cols()).map(|pi| b.col_data(pi).to_vec()));
+    out
+}
+
+/// A `Drop` reindex over a nullable key is the filter-then-reindex it replaces:
+/// the same rows, weights and PK bytes. A `Keep` one re-keys the NULL rows too.
+#[test]
+fn a_drop_reindex_is_filter_then_reindex_and_keep_keeps_null_keys() {
+    // `(U64 pk, I64 NULL key, I64 NULL)`: the key is payload slot 0.
+    let s = make_schema(0, &[TypeCode::U64, TypeCode::I64, TypeCode::I64]);
+    let rows: &[(u64, i64, u64, &[i64])] = &[
+        (1, 1, 0b01, &[0, 10]),
+        (2, 2, 0, &[-5, 20]),
+        (3, 1, 0b10, &[7, 0]),
+        (4, 3, 0b11, &[0, 0]),
+        (5, 1, 0b01, &[0, 50]),
+        (6, -1, 0, &[9, 60]),
+    ];
+    let defined: Vec<_> = rows.iter().copied().filter(|r| r.2 & 1 == 0).collect();
+    let (batch, filtered) = (make_int_batch(&s, rows), make_int_batch(&s, &defined));
+    for keep in [vec![2], vec![1, 2]] {
+        let run = |nulls, b: &Batch| {
+            MapPlan::from_wire(&s, &reindex_on(&[1], keep.clone(), nulls))
+                .unwrap()
+                .evaluate_map_batch(b)
+        };
+        let dropped = run(gnitz_wire::NullKeys::Drop, &batch);
+        assert_eq!(dropped.count, defined.len());
+        assert_eq!(regions(&dropped), regions(&run(gnitz_wire::NullKeys::Keep, &filtered)));
+        assert_eq!(run(gnitz_wire::NullKeys::Keep, &batch).count, rows.len());
+    }
+    // Every row NULL-keyed: an empty output in the reindex's schema.
+    let all_null = make_int_batch(&s, &[(1, 1, 0b01, &[0, 1])]);
+    let plan = &mut MapPlan::from_wire(&s, &reindex_on(&[1], vec![2], gnitz_wire::NullKeys::Drop)).unwrap();
+    let out = plan.evaluate_map_batch(&all_null);
+    assert_eq!((out.count, out.schema()), (0, plan.out_schema()));
+}
+
+/// A `Drop` reindex's survivor runs are exact wherever its NULL runs start and
+/// end: across a 64-row block, at the batch's two ends, and one row long.
+#[test]
+fn a_drop_reindex_keeps_exactly_the_key_defined_rows_across_blocks() {
+    let s = make_schema(0, &[TypeCode::U64, TypeCode::I64, TypeCode::I64]);
+    let patterns: [&dyn Fn(usize) -> bool; 5] = [
+        &|i| i % 7 == 0,
+        &|i| (60..140).contains(&i),
+        &|i| !(64..190).contains(&i),
+        &|i| i % 2 == 1,
+        &|i| i != 127,
+    ];
+    for (p, is_null) in patterns.iter().enumerate() {
+        let cells: Vec<[i64; 2]> = (0..200)
+            .map(|i| [if is_null(i) { 0 } else { i as i64 }, -(i as i64)])
+            .collect();
+        let rows: Vec<(u64, i64, u64, &[i64])> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i as u64, 1, u64::from(is_null(i)), &c[..]))
+            .collect();
+        let dropped = MapPlan::from_wire(&s, &reindex_on(&[1], vec![2], gnitz_wire::NullKeys::Drop))
+            .unwrap()
+            .evaluate_map_batch(&make_int_batch(&s, &rows));
+        let got: Vec<i64> = dropped
+            .col_data(0)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| i64::from_le_bytes(*c))
+            .collect();
+        let want: Vec<i64> = (0..200).filter(|&i| !is_null(i)).map(|i| -(i as i64)).collect();
+        assert_eq!(got, want, "pattern {p}");
+    }
+}
+
+/// A `Drop` reindex whose key is NOT NULL has nothing to drop, so it takes the
+/// whole-batch path a `Keep` reindex does.
+#[test]
+fn a_drop_reindex_over_a_not_null_key_has_no_mask() {
+    let s = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+        ],
+        &[0],
+    );
+    let mask = |key| {
+        MapPlan::from_wire(&s, &reindex_on(&[key], vec![2], gnitz_wire::NullKeys::Drop))
+            .unwrap()
+            .null_key_mask
+    };
+    assert_eq!(mask(1), 0);
+    assert_eq!(mask(0), 0, "a PK column is never nullable");
+    assert_eq!(mask(2), 0b10);
 }
 
 /// The set-op full-row identity map: a synthetic U128 PK over the projected
@@ -1045,4 +1154,96 @@ fn compute_map_refuses_a_corrupt_program() {
         panic!("a corrupt compute map program must be refused");
     };
     assert!(err.to_string().contains("map: invalid program"), "{err}");
+}
+
+/// A `Drop` reindex against the `IS NOT NULL` filter it replaces, at NULL keys
+/// spread evenly so every survivor run is short.
+/// `cd crates && cargo test -p gnitz-store --release reindex_drop_null_keys_bench -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+fn reindex_drop_null_keys_bench() {
+    use gnitz_expr::LogicalInstr;
+    use gnitz_wire::NullKeys;
+    use std::hint::black_box;
+    const N: usize = 64 * 1024;
+    const ITERS: usize = 50;
+    let s = make_schema(0, &[TypeCode::U64, TypeCode::I64, TypeCode::I64, TypeCode::I64]);
+    let counters = [
+        gnitz_foundation::perf::Counter::instructions(),
+        gnitz_foundation::perf::Counter::cycles(),
+    ];
+    let plan = |nulls| MapPlan::from_wire(&s, &reindex_on(&[1], vec![1, 2, 3], nulls)).unwrap();
+    let mut not_null = LogicalProgram::new(
+        vec![LogicalInstr::IsNull { col: 1, invert: true }],
+        Output::Result(Reg(0)),
+        vec![],
+    )
+    .resolve_filter(&s)
+    .unwrap();
+
+    // A first pass that prints nothing: the allocator's first large batches pay
+    // for mapping fresh memory, which would land on whichever arm runs first.
+    for (warm, null_every) in [
+        (true, 10),
+        (false, 0usize),
+        (false, 100),
+        (false, 32),
+        (false, 16),
+        (false, 10),
+    ] {
+        // A NULL key's cell is zero, as ingest guarantees.
+        let is_null = |i: usize| null_every != 0 && i.is_multiple_of(null_every);
+        let cells: Vec<[i64; 3]> = (0..N)
+            .map(|i| {
+                [
+                    if is_null(i) { 0 } else { (i as i64 * 7919) % 4096 },
+                    i as i64,
+                    -(i as i64),
+                ]
+            })
+            .collect();
+        let rows: Vec<(u64, i64, u64, &[i64])> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i as u64, 1, u64::from(is_null(i)), &c[..]))
+            .collect();
+        let batch = make_int_batch(&s, &rows);
+        let (mut keep, mut drop) = (plan(NullKeys::Keep), plan(NullKeys::Drop));
+        let pct = if null_every == 0 {
+            0.0
+        } else {
+            100.0 / null_every as f64
+        };
+        let arm = |name: &str, f: &mut dyn FnMut()| {
+            if warm {
+                return f();
+            }
+            let t = crate::test_support::bench_time(ITERS, &mut *f);
+            let per_row = |v: f64| v / N as f64;
+            let [instrs, cycles] = counters.each_ref().map(|c| {
+                c.as_ref()
+                    .map_or("-".into(), |c| format!("{:.1}", per_row(c.measure(&mut *f).1 as f64)))
+            });
+            println!(
+                "{pct:>4.1}% NULL  {name:<28} {:>7.2} ns/row  {instrs:>7} instr/row  {cycles:>7} cycles/row",
+                per_row(t.as_nanos() as f64 / ITERS as f64),
+            );
+        };
+        arm("(a) filter + reindex", &mut || {
+            let filtered = crate::ops::op_filter(&batch, &mut not_null, &s);
+            black_box(keep.evaluate_map_batch(filtered.as_ref().unwrap_or(&batch)));
+        });
+        arm("(a) drop reindex", &mut || {
+            black_box(drop.evaluate_map_batch(&batch));
+        });
+        arm("(b) reindex + clone", &mut || {
+            let all = keep.evaluate_map_batch(&batch);
+            black_box(all.clone_batch());
+            black_box(all);
+        });
+        arm("(b) keep + drop reindex", &mut || {
+            black_box(drop.evaluate_map_batch(&batch));
+            black_box(keep.evaluate_map_batch(&batch));
+        });
+    }
 }

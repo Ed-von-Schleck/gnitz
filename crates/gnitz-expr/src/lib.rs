@@ -70,6 +70,7 @@ mod schema_facts;
 mod search;
 mod view;
 
+pub use batch::scan_filter_bits;
 pub use builder::*;
 pub use calendar::CalendarOp;
 pub use eval::*;

@@ -428,13 +428,18 @@ fn test_validate_allows_null_bit_on_nullable_column() {
     let mut batch = ZSetBatch::new(&schema);
     {
         let mut a = BatchAppender::new(&mut batch, &schema);
-        a.add_row(1u128, 1).i64_val(10);
+        a.add_row(1u128, 1).i64_val(0);
+        a.add_row(2u128, 1).i64_val(10);
     }
     batch.nulls[0] |= 1 << 0;
     assert!(
         batch.validate(&schema).is_ok(),
-        "a null bit on a nullable column must be accepted"
+        "a null bit over a zeroed cell of a nullable column must be accepted"
     );
+    // Over a cell holding a value, the bit is a second NULL encoding.
+    batch.nulls[1] |= 1 << 0;
+    let err = batch.validate(&schema).unwrap_err();
+    assert!(err.contains("holds a value under NULL"), "got: {err}");
 }
 
 /// A two-column wide-PK schema whose `Bytes` PK buffer is not a whole

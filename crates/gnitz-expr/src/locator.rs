@@ -137,8 +137,9 @@ impl ColumnLocator {
         gnitz_wire::store_opk_image(self.opk_image(mb, row), self.type_code(), self.size(), out_tc, dst);
     }
 
-    /// The value in `row`, **known non-NULL**, as its OPK bytes read as a
-    /// big-endian integer. A STRING/BLOB yields its cell, not its content.
+    /// The value in `row` as its OPK bytes read as a big-endian integer; a NULL
+    /// cell encodes as its zero value. A STRING/BLOB yields its cell, not its
+    /// content.
     #[inline(always)]
     pub fn opk_image(&self, mb: &impl RowSource, row: usize) -> u128 {
         let cell = self.bytes(mb, row);
