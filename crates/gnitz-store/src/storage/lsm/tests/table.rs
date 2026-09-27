@@ -1017,7 +1017,7 @@ fn salreplay_overflow_into_l0_retract() {
 /// manifest was published — must still barrier-flush to a staged publish and durably
 /// capture the spill. Without the unsynced-shard disjunct the barrier returns
 /// `Empty`, the spill is never manifested, and a
-/// reopen's `install` deletes it — acknowledged rows lost.
+/// reopen's `ShardIndex::open` deletes it — acknowledged rows lost.
 #[test]
 fn lone_spill_survives_checkpoint_barrier() {
     let dir = tempfile::tempdir().unwrap();
@@ -1050,7 +1050,7 @@ fn lone_spill_survives_checkpoint_barrier() {
 /// Deferred-cleanup crash simulation. After a mid-epoch compaction that did
 /// not republish (SalReplay defers), a crash (drop without a barrier) reopens
 /// from the *old* manifest: the cut state is intact, and the unreferenced
-/// compaction outputs + post-cut spills are orphans reclaimed by `install`.
+/// compaction outputs + post-cut spills are orphans reclaimed by `ShardIndex::open`.
 #[test]
 fn deferred_cleanup_crash_sim_reopens_from_old_manifest() {
     let dir = tempfile::tempdir().unwrap();
@@ -1287,14 +1287,13 @@ fn rederive_checkpointed_rebuilds_on_a_damaged_manifest() {
     assert_eq!(shard_files(&tdir).len(), 1, "a failed read must not erase the shards");
 }
 
-/// A `SalReplay` table's barrier gate: a lone unsynced spill lands in the sweep
-/// list, and compaction outputs are swept while the inputs they superseded are
-/// not.
+/// A `SalReplay` table's barrier gate: a lone unsynced spill is synced, and so
+/// are compaction outputs, but not the inputs they superseded.
 #[test]
 fn barrier_gate_matrix() {
     let schema = make_schema_u64_i64();
 
-    // Arm 2 — a lone unsynced spill stages a publish with the spill swept.
+    // Arm 2 — a lone unsynced spill stages a publish that syncs it.
     {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("gate_unsynced");
@@ -1313,16 +1312,13 @@ fn barrier_gate_matrix() {
         );
     }
 
-    // Arm 3 — a spill-driven compaction stages a publish and sweeps its own
-    // outputs: compaction writes them unsynced like any other shard, so the
-    // publish that makes them reachable is what makes them durable.
+    // Arm 3 — a spill-driven compaction stages a publish that syncs its outputs.
     {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("gate_pending");
         let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
         t.ram_tier.set_budget(100);
-        // Five spills put L0 over the threshold, and the fifth registration
-        // compacts — so the last thing to leave a file unswept is that compaction.
+        // Five spills put L0 over the threshold, so the fifth compacts.
         for r in 0..5u64 {
             let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
             t.ingest_owned_batch(make_batch(&rows)).unwrap();
@@ -1335,11 +1331,11 @@ fn barrier_gate_matrix() {
             .flush_prepare(ManifestStamp::default())
             .unwrap()
             .expect("unsynced compaction outputs must gate to a staged publish");
-        let swept: Vec<String> = t.shard_index.unsynced_paths().collect();
-        assert!(!swept.is_empty(), "the compaction outputs must be swept");
+        let unsynced: Vec<String> = t.shard_index.unsynced_paths().collect();
+        assert!(!unsynced.is_empty(), "the compaction outputs must be synced");
         assert!(
-            swept.iter().all(|p| is_compaction_output(&t, p)),
-            "only the compaction outputs are left to sync, got {swept:?}",
+            unsynced.iter().all(|p| is_compaction_output(&t, p)),
+            "only the compaction outputs are left to sync, got {unsynced:?}",
         );
         assert_eq!(
             shard_files(&tdir).len(),
@@ -1384,17 +1380,6 @@ fn a_reopened_store_publishes_on_its_first_round() {
         t.flush().unwrap();
     }
     let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::SalReplay);
-    assert!(t.flush_prepare(ManifestStamp::default()).unwrap().is_some());
-}
-
-/// An unlinked manifest is no longer durable, so the next round republishes.
-#[test]
-fn an_unlinked_manifest_republishes() {
-    let dir = tempfile::tempdir().unwrap();
-    let tdir = dir.path().join("unlinked");
-    let mut t = new_table(&tdir, make_schema_u64_i64(), 1 << 20, RecoverySource::SalReplay);
-    t.flush().unwrap();
-    t.unlink_manifest().unwrap();
     assert!(t.flush_prepare(ManifestStamp::default()).unwrap().is_some());
 }
 

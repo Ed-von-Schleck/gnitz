@@ -126,10 +126,10 @@ pub(crate) fn children_at_generation(rel_dir: &str, num_workers: u32, generation
 }
 
 /// The caller record of `slot`'s rows child under `rel_dir`; `Ok(None)` without
-/// a manifest.
+/// an intact manifest.
 pub(crate) fn caller_record_at(rel_dir: &str, slot: Slot) -> Result<Option<Vec<u8>>, StorageError> {
     let dir = ChildAddr { kind: ChildKind::Rows, slot }.dir(rel_dir);
-    Ok(manifest::read(&dir)?.map(|m| m.caller_record))
+    Ok(manifest::read_intact(&dir)?.map(|m| m.caller_record))
 }
 
 /// Immediate sub-directory names of `path`, none if it is missing. Collected

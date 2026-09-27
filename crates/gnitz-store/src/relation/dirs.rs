@@ -4,10 +4,9 @@ use std::fs::{self, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::{Relation, RelationRegistry};
+use super::{Relation, RelationRegistry, Store};
 use crate::storage::{
-    caller_record_at, create_dir, fsync_dir, parse_id, remove_children, subdir_names, ChildKind, StorageError,
-    StoreError,
+    caller_record_at, create_dir, fsync_dir, parse_id, remove_children, subdir_names, ChildKind, StoreError,
 };
 
 /// `<base_dir>/LOCK` — the file whose `flock` makes a data directory
@@ -103,11 +102,11 @@ impl RelationRegistry {
             let dir = format!("{root}/{name}");
             match caller_record_at(&dir, self.slot) {
                 Ok(Some(record)) => records.push((id, Ok(record))),
-                Err(e @ StorageError::Io(_)) => records.push((
+                Err(e) => records.push((
                     id,
                     Err(StoreError::storage(format!("read the manifest under '{dir}'"), e)),
                 )),
-                Ok(None) | Err(_) => {}
+                Ok(None) => {}
             }
         }
         Ok(records)
@@ -116,17 +115,16 @@ impl RelationRegistry {
     /// Drop `id`'s entry and erase its directory, every rank's children included.
     pub fn unregister_and_erase(&mut self, id: i64) -> Result<(), StoreError> {
         assert_eq!(self.slot.of, 1, "erasing a directory other ranks' stores live in");
-        let Some(Relation { mut store, .. }) = self.tables.remove(&id) else {
+        let Some(Relation { store, .. }) = self.tables.remove(&id) else {
             return Ok(());
         };
         let dir = relation_dir(&self.base_dir, id);
         // Durably first: the manifest carries the record a reopen would revive.
-        if let Some(table) = store.table_mut() {
+        if let Store::Held(table) = store {
             table
                 .unlink_manifest()
                 .map_err(|e| StoreError::storage(format!("erase relation {id} (dir={dir})"), e))?;
         }
-        drop(store);
         if let Err(e) = fs::remove_dir_all(&dir) {
             gnitz_debug!("relation: failed to erase relation dir {}: {}", dir, e);
         }

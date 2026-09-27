@@ -114,7 +114,7 @@ fn link_targets(rel_dir: &str, source: u32, launched: u32) -> Result<(), Storage
     for target in cluster_children(launched) {
         let dir = target.dir(rel_dir);
         crate::storage::create_dir(&dir)?;
-        for e in &m.entries {
+        for e in &m.shards.entries {
             let shard = |dir: &str| super::naming::shard_path(dir, e.seq);
             fs::hard_link(shard(&source_dir), shard(&dir))?;
         }

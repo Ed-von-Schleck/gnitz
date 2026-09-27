@@ -1,16 +1,13 @@
-//! FLSM Shard Index: the one shard writer — shard lifecycle, naming, the PK
-//! filter policy, compaction, and the manifest.
-//!
-//! Split into the in-memory index + compaction trigger ([`index`]) and the
-//! manifest serialize/load/recover path ([`persist`]). The shared types
-//! (`ShardEntry`, `LevelGuard`, `FLSMLevel`, `ShardIndex`), the guard-routing
-//! helper, the level constants, and the constructor live here so both
-//! sub-modules read the (private) fields and helpers directly.
+//! FLSM Shard Index: the one shard writer — shard lifecycle, the PK filter
+//! policy, compaction ([`index`]), and the shard set a manifest publishes.
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use super::error::StorageError;
+use super::manifest::{ManifestEntry, ShardSet};
 use super::merge::ColumnarSource;
+use super::naming;
 use super::shard_reader::MappedShard;
 use crate::schema::key::PkBuf;
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, pk_in_range};
@@ -18,7 +15,6 @@ use crate::schema::SchemaDescriptor;
 use gnitz_expr::RowSource;
 
 mod index;
-mod persist;
 
 /// Which trigger a compaction is serving. Only [`Dehydrate`](Self::Dehydrate)
 /// changes what is written; the rest buckets the byte accounting the
@@ -110,7 +106,7 @@ impl ShardIndex {
             .map(|li| {
                 format!(
                     "L{}={}B/{}g",
-                    Self::level_num(li),
+                    li + 1,
                     self.levels[li].bytes(),
                     self.levels[li].guards.len()
                 )
@@ -138,7 +134,7 @@ impl ShardIndex {
             .iter()
             .flat_map(|l| &l.guards)
             .flat_map(|g| &g.entries)
-            .map(|e| super::naming::shard_name(e.seq))
+            .map(|e| naming::shard_name(e.seq))
             .collect()
     }
 }
@@ -195,31 +191,15 @@ pub(super) struct ShardEntry {
     newest: u64,
     pk_min: PkBuf,
     pk_max: PkBuf,
-    /// Named by a published manifest, which the barrier fdatasyncs a file before
-    /// — so an unpublished file is exactly one that owes the sweep.
-    published: bool,
 }
 
 impl ShardEntry {
     /// Open the shard drawn at `seq` in the store at `dir`.
-    pub(crate) fn open(
-        dir: &str,
-        seq: u64,
-        schema: &SchemaDescriptor,
-        newest: u64,
-        published: bool,
-    ) -> Result<Self, StorageError> {
-        let shard = Rc::new(MappedShard::open(&super::naming::shard_path(dir, seq), schema)?);
+    pub(crate) fn open(dir: &str, seq: u64, schema: &SchemaDescriptor, newest: u64) -> Result<Self, StorageError> {
+        let shard = Rc::new(MappedShard::open(&naming::shard_path(dir, seq), schema)?);
         let pk_min = PkBuf::from_bytes(shard.get_pk_bytes(0));
         let pk_max = PkBuf::from_bytes(shard.get_pk_bytes(shard.count - 1));
-        Ok(ShardEntry {
-            shard,
-            seq,
-            newest,
-            pk_min,
-            pk_max,
-            published,
-        })
+        Ok(ShardEntry { shard, seq, newest, pk_min, pk_max })
     }
 
     /// Probe this shard for a PK by its OPK `key` bytes (exactly `pk_stride`
@@ -246,10 +226,6 @@ struct LevelGuard {
 }
 
 impl LevelGuard {
-    pub(crate) fn new(gk: PkBuf) -> Self {
-        LevelGuard { guard_key: gk, entries: Vec::new() }
-    }
-
     /// Whether this guard holds skeleton shards — the state a capacity sweep
     /// leaves behind, read off the shard headers. Only a terminal guard is ever
     /// dehydrated, and it holds one shard.
@@ -331,15 +307,12 @@ impl LevelGuard {
     }
 }
 
+#[derive(Default)]
 struct FLSMLevel {
     guards: Vec<LevelGuard>,
 }
 
 impl FLSMLevel {
-    pub(crate) fn new() -> Self {
-        FLSMLevel { guards: Vec::new() }
-    }
-
     /// The guard owning `key`: the last one `≤ key`, or 0 below the first — and
     /// 0 on an empty level, which callers bound against `guards.len()`.
     fn slot(&self, key: &[u8]) -> usize {
@@ -361,7 +334,8 @@ impl FLSMLevel {
         let pos = match self.guards.binary_search_by(|g| g.guard_key.cmp(&gk)) {
             Ok(pos) => pos,
             Err(pos) => {
-                self.guards.insert(pos, LevelGuard::new(gk));
+                self.guards
+                    .insert(pos, LevelGuard { guard_key: gk, entries: Vec::new() });
                 pos
             }
         };
@@ -402,9 +376,12 @@ pub(super) struct ShardIndex {
 
     /// The last seq drawn; a shard is named by its seq.
     shard_seq: u64,
-    /// A shard the durable manifest names has left the index since it was
-    /// published, so a restart would still open its file.
-    retired_published: bool,
+    /// The last seq the most recently renamed manifest could name; see
+    /// [`Self::published`].
+    published_through: u64,
+    /// Published shards the index has dropped, unlinked by
+    /// [`Self::unlink_retired`].
+    retired: Vec<u64>,
     /// `R`, the unit every byte target is stated in: the running max of the
     /// registered L0 bytes one `run_compact` consumed, floored at
     /// [`MIN_GUARD_BYTES`] and persisted in the manifest header.
@@ -415,34 +392,71 @@ pub(super) struct ShardIndex {
     budget: ShardBudget,
     /// The highest key any drop removed. Zero until the first drop.
     dropped_max: PkBuf,
-    /// Passed to every shard write. Held rather than derived from the input
-    /// shards: a derivation would let one filterless input turn the filter off
-    /// for this table's whole descendant line, permanently and invisibly.
+    /// Passed to every shard write.
     skip_pk_filter: bool,
 }
 
 impl ShardIndex {
-    /// The 1-based level *number* of a 0-based tier index — used only by the one
-    /// serde boundary that carries it, the manifest field.
-    pub(super) fn level_num(level_idx: usize) -> usize {
-        level_idx + 1
-    }
-
-    /// `skip_pk_filter` declares that nothing point-probes this store by PK, so
-    /// its shards need no PK filter.
-    pub(super) fn new(output_dir: &str, schema: SchemaDescriptor, budget: ShardBudget, skip_pk_filter: bool) -> Self {
-        ShardIndex {
+    /// Open the store at `output_dir` holding `shards`, unlinking every shard and
+    /// staging file there that `shards` does not name. `skip_pk_filter`: nothing
+    /// probes this store by PK.
+    pub(super) fn open(
+        output_dir: &str,
+        schema: SchemaDescriptor,
+        budget: ShardBudget,
+        skip_pk_filter: bool,
+        shards: Option<&ShardSet>,
+    ) -> Result<Self, StorageError> {
+        let mut idx = ShardIndex {
             output_dir: output_dir.to_string(),
             schema,
             l0: Vec::new(),
-            levels: std::array::from_fn(|_| FLSMLevel::new()),
+            levels: Default::default(),
             shard_seq: 0,
-            retired_published: false,
-            l0_run_bytes: MIN_GUARD_BYTES,
+            published_through: 0,
+            retired: Vec::new(),
+            l0_run_bytes: shards.map_or(MIN_GUARD_BYTES, |s| s.run_bytes),
             budget,
             dropped_max: PkBuf::zeroed(schema.pk_stride()),
             skip_pk_filter,
+        };
+        for e in shards.into_iter().flat_map(|s| &s.entries) {
+            let entry = ShardEntry::open(output_dir, e.seq, &idx.schema, e.newest)?;
+            match e.level {
+                0 => idx.l0.push(entry),
+                n => {
+                    let level = idx
+                        .levels
+                        .get_mut(n as usize - 1)
+                        .ok_or(StorageError::Corrupt("manifest level"))?;
+                    level.get_or_create_guard(e.guard_key).entries.push(entry);
+                }
+            }
         }
+        idx.shard_seq = idx.all_entries().map(|e| e.seq).max().unwrap_or(0);
+        idx.published_through = idx.shard_seq;
+        let live: HashSet<String> = idx.all_entries().map(|e| naming::shard_name(e.seq)).collect();
+        naming::remove_stale_files(output_dir, &live);
+        Ok(idx)
+    }
+
+    /// The shard set this index publishes.
+    pub(super) fn shard_set(&self) -> ShardSet {
+        let entry = |e: &ShardEntry, level: u64, guard_key: PkBuf| ManifestEntry {
+            seq: e.seq,
+            newest: e.newest,
+            level,
+            guard_key,
+        };
+        let mut entries: Vec<ManifestEntry> = self.l0.iter().map(|e| entry(e, 0, PkBuf::zeroed(0))).collect();
+        for (li, level) in self.levels.iter().enumerate() {
+            for guard in &level.guards {
+                for e in &guard.entries {
+                    entries.push(entry(e, li as u64 + 1, guard.guard_key));
+                }
+            }
+        }
+        ShardSet { run_bytes: self.l0_run_bytes, entries }
     }
 
     /// Test helper: flip the filter off for a store that would otherwise build

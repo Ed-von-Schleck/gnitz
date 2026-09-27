@@ -11,6 +11,7 @@ use std::rc::Rc;
 
 use super::batch::Batch;
 use super::error::StorageError;
+use super::manifest::Manifest;
 use super::merge::ColumnarSource;
 use super::read_cursor::{self, ReadCursor};
 use super::run::{Run, StoredRow};
@@ -195,49 +196,43 @@ impl Table {
         // flush.
         let created = crate::storage::create_dir(dir)?;
 
-        // `skip_pk_filter` is exactly "is rederived": only a `SalReplay` store is
-        // point-probed by PK, so only it needs the filters its shards would
-        // otherwise all carry.
         let rederived = matches!(recovery_source, RecoverySource::Rederive { .. });
-        let mut table = Table {
-            memtable: RunSet::new(MEMTABLE_BYTES),
-            ram_tier: RunSet::new(budgets.ram_tier_bytes),
-            shard_index: ShardIndex::new(dir, schema, budgets.shard, rederived),
-            recovery_source,
-            replay_floor: 0,
-            caller_record: Vec::new(),
-            resumed_from_checkpoint: false,
-            held_in_ram: false,
-            live_row_scratch: Cell::new(Vec::new()),
-            cached_full_scan: Cell::new(None),
-            durable_manifest: None,
-        };
-
         let loaded = match recovery_source {
             _ if created => None,
             // Erased at open, so it reads nothing: an I/O error on the file it is
             // about to unlink must not abort it.
             RecoverySource::Rederive { resume_at: None } => None,
             // Rebuilt from its sources, so damage is erased rather than fatal.
-            RecoverySource::Rederive { resume_at: Some(want) } => match super::manifest::read(dir) {
-                Ok(m) => m.filter(|m| m.stamp.checkpoint_gen == want),
-                Err(e @ StorageError::Io(_)) => return Err(e),
-                Err(_) => None,
-            },
+            RecoverySource::Rederive { resume_at: Some(want) } => {
+                super::manifest::read_intact(dir)?.filter(|m| m.stamp.checkpoint_gen == want)
+            }
             // Its shards are its only copy, so damage stops the open.
             RecoverySource::SalReplay => super::manifest::read(dir)?,
         };
-
         if loaded.is_none() && rederived && !created {
             // So a later re-open cannot reload what this one rejected.
-            table.unlink_manifest()?;
+            super::manifest::unlink(dir)?;
         }
-        table.shard_index.install(loaded.as_ref())?;
-        table.replay_floor = loaded.as_ref().map_or(0, |m| m.stamp.replay_floor);
-        table.caller_record = loaded.as_ref().map(|m| m.caller_record.clone()).unwrap_or_default();
-        table.resumed_from_checkpoint = rederived && loaded.is_some();
-
-        Ok(table)
+        let resumed_from_checkpoint = rederived && loaded.is_some();
+        let (replay_floor, caller_record, shards) = match loaded {
+            Some(Manifest { stamp, caller_record, shards }) => (stamp.replay_floor, caller_record, Some(shards)),
+            None => (0, Vec::new(), None),
+        };
+        // Only a `SalReplay` store is point-probed by PK.
+        let skip_pk_filter = rederived;
+        Ok(Table {
+            memtable: RunSet::new(MEMTABLE_BYTES),
+            ram_tier: RunSet::new(budgets.ram_tier_bytes),
+            shard_index: ShardIndex::open(dir, schema, budgets.shard, skip_pk_filter, shards.as_ref())?,
+            recovery_source,
+            replay_floor,
+            caller_record,
+            resumed_from_checkpoint,
+            held_in_ram: false,
+            live_row_scratch: Cell::new(Vec::new()),
+            cached_full_scan: Cell::new(None),
+            durable_manifest: None,
+        })
     }
 
     /// Shrink the memtable budget so a test outside `lsm` can drive the drain
@@ -281,10 +276,8 @@ impl Table {
         self.resumed_from_checkpoint
     }
 
-    /// Durably unlink this store's manifest, so the next `Rederive` open erases
-    /// its shards instead of reloading them.
-    pub(crate) fn unlink_manifest(&mut self) -> Result<(), StorageError> {
-        self.durable_manifest = None;
+    /// Durably unlink this store's manifest, so no reopen reloads its shards.
+    pub(crate) fn unlink_manifest(self) -> Result<(), StorageError> {
         super::manifest::unlink(&self.shard_index.output_dir)
     }
 

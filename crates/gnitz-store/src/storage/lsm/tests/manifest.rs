@@ -8,23 +8,25 @@ use gnitz_wire::write_u64_le;
 fn sample(count: usize) -> Manifest {
     Manifest {
         stamp: ManifestStamp { checkpoint_gen: 5, replay_floor: 11 },
-        run_bytes: 9 << 20,
         caller_record: (0..count as u8).map(|b| b ^ 0xA5).collect(),
-        entries: (0..count)
-            .map(|i| {
-                let level = (i % 2) as u64;
-                ManifestEntry {
-                    seq: 200 + i as u64,
-                    newest: 100 + i as u64,
-                    level,
-                    guard_key: if level == 0 {
-                        PkBuf::zeroed(0)
-                    } else {
-                        PkBuf::from_bytes(&(42 + i as u64).to_be_bytes())
-                    },
-                }
-            })
-            .collect(),
+        shards: ShardSet {
+            run_bytes: 9 << 20,
+            entries: (0..count)
+                .map(|i| {
+                    let level = (i % 2) as u64;
+                    ManifestEntry {
+                        seq: 200 + i as u64,
+                        newest: 100 + i as u64,
+                        level,
+                        guard_key: if level == 0 {
+                            PkBuf::zeroed(0)
+                        } else {
+                            PkBuf::from_bytes(&(42 + i as u64).to_be_bytes())
+                        },
+                    }
+                })
+                .collect(),
+        },
     }
 }
 

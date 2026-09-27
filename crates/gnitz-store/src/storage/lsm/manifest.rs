@@ -21,17 +21,23 @@ pub(crate) struct ManifestStamp {
     pub replay_floor: u64,
 }
 
+/// What a shard index publishes and reopens from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ShardSet {
+    /// The shard index's `R`. Stored, not derived: a guard of one distinct key
+    /// outgrows `R` and cannot be split, so no shard size recovers it.
+    pub run_bytes: u64,
+    pub entries: Vec<ManifestEntry>,
+}
+
 /// One store's published shard set and the counters that must survive a
 /// restart.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Manifest {
     pub stamp: ManifestStamp,
-    /// The shard index's `R`. Stored, not derived: a guard of one distinct key
-    /// outgrows `R` and cannot be split, so no shard size recovers it.
-    pub run_bytes: u64,
     /// Bytes the store's owner publishes with its rows; opaque here.
     pub caller_record: Vec<u8>,
-    pub entries: Vec<ManifestEntry>,
+    pub shards: ShardSet,
 }
 
 /// One live shard. Its PK bounds are re-derived at open, so not stored.
@@ -54,9 +60,9 @@ pub(crate) fn encode(m: &Manifest) -> Vec<u8> {
         .u64(VERSION)
         .u64(m.stamp.checkpoint_gen)
         .u64(m.stamp.replay_floor)
-        .u64(m.run_bytes)
+        .u64(m.shards.run_bytes)
         .bytes32(&m.caller_record);
-    for e in &m.entries {
+    for e in &m.shards.entries {
         w.u64(e.seq).u64(e.newest).u64(e.level).bytes32(e.guard_key.pk_bytes());
     }
     let mut buf = w.into_vec();
@@ -83,14 +89,14 @@ fn decode(buf: &[u8]) -> Result<Manifest, StorageError> {
 }
 
 fn decode_body(r: &mut Reader) -> Result<Manifest, String> {
+    let checkpoint_gen = r.u64()?;
+    let replay_floor = r.u64()?;
+    let run_bytes = r.u64()?;
+    let caller_record = r.bytes32()?.to_vec();
     let mut m = Manifest {
-        stamp: ManifestStamp {
-            checkpoint_gen: r.u64()?,
-            replay_floor: r.u64()?,
-        },
-        run_bytes: r.u64()?,
-        caller_record: r.bytes32()?.to_vec(),
-        entries: Vec::new(),
+        stamp: ManifestStamp { checkpoint_gen, replay_floor },
+        caller_record,
+        shards: ShardSet { run_bytes, entries: Vec::new() },
     };
     while r.remaining() > 0 {
         let (seq, newest, level) = (r.u64()?, r.u64()?, r.u64()?);
@@ -98,7 +104,7 @@ fn decode_body(r: &mut Reader) -> Result<Manifest, String> {
         if key.len() > MAX_PK_BYTES {
             return Err("guard key too wide".into());
         }
-        m.entries.push(ManifestEntry {
+        m.shards.entries.push(ManifestEntry {
             seq,
             newest,
             level,
@@ -124,6 +130,14 @@ pub(crate) fn read(dir: &str) -> Result<Option<Manifest>, StorageError> {
         Ok(buf) => decode(&buf).map(Some),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// [`read`], with damage read as absence: only a failed read is an error.
+pub(crate) fn read_intact(dir: &str) -> Result<Option<Manifest>, StorageError> {
+    match read(dir) {
+        Err(StorageError::Corrupt(_)) => Ok(None),
+        r => r,
     }
 }
 

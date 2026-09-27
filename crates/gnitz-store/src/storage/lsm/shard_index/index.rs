@@ -4,7 +4,6 @@
 //! level's guard partition is held at, and the vertical drain into the terminal
 //! level.
 
-use std::collections::HashSet;
 use std::fs;
 use std::rc::Rc;
 
@@ -60,9 +59,13 @@ impl ShardIndex {
                 ..opts
             },
         )?;
-        ShardEntry::open(&self.output_dir, seq, &self.schema, newest.unwrap_or(seq), false).inspect_err(|_| {
-            let _ = fs::remove_file(&path);
-        })
+        ShardEntry::open(&self.output_dir, seq, &self.schema, newest.unwrap_or(seq))
+            .inspect_err(|_| self.unlink_shard(seq))
+    }
+
+    /// Unlink the shard drawn at `seq`, best-effort.
+    fn unlink_shard(&self, seq: u64) {
+        let _ = fs::remove_file(naming::shard_path(&self.output_dir, seq));
     }
 
     /// Append `run` to L0 as one unpublished shard: the spill.
@@ -101,19 +104,27 @@ impl ShardIndex {
         Ok(())
     }
 
+    /// Whether the last renamed manifest names `e`.
+    fn published(&self, e: &ShardEntry) -> bool {
+        e.seq <= self.published_through
+    }
+
     /// Every live shard no published manifest names yet.
     pub(crate) fn unsynced_paths(&self) -> impl Iterator<Item = String> + '_ {
         self.all_entries()
-            .filter(|e| !e.published)
+            .filter(|e| !self.published(e))
             .map(|e| naming::shard_path(&self.output_dir, e.seq))
     }
 
-    /// A manifest naming exactly the live shards has been renamed into place.
-    pub(crate) fn mark_published(&mut self) {
-        for e in self.all_entries_mut() {
-            e.published = true;
-        }
-        self.retired_published = false;
+    /// The last seq drawn.
+    pub(crate) fn last_seq(&self) -> u64 {
+        self.shard_seq
+    }
+
+    /// The manifest built when [`Self::last_seq`] was `through` has been renamed
+    /// into place.
+    pub(crate) fn mark_published(&mut self, through: u64) {
+        self.published_through = through;
     }
 
     /// Every live shard's `Rc`, yielded lazily — callers `extend` without an
@@ -256,13 +267,13 @@ impl ShardIndex {
     }
 
     /// Unlink the unpublished `entries`; a published one's file waits for
-    /// [`sweep_stale_files`](Self::sweep_stale_files).
+    /// [`unlink_retired`](Self::unlink_retired).
     fn retire(&mut self, entries: impl IntoIterator<Item = ShardEntry>) {
         for e in entries {
-            if e.published {
-                self.retired_published = true;
+            if self.published(&e) {
+                self.retired.push(e.seq);
             } else {
-                let _ = fs::remove_file(naming::shard_path(&self.output_dir, e.seq));
+                self.unlink_shard(e.seq);
             }
         }
     }
@@ -525,7 +536,7 @@ impl ShardIndex {
     /// Merge one L1 band with the terminal guards its span overlaps — a run of
     /// exactly one once [`Self::vertical_fold`] has banded the source. The
     /// terminal level is the deepest destination: an L2→L3 fold would serialize a
-    /// level `install` rejects.
+    /// level `open` rejects.
     fn fold_band_into_terminal(&mut self, src_guard_idx: usize) -> Result<(), StorageError> {
         let src = &self.levels[0].guards[src_guard_idx];
         let src_guard_key = src.guard_key;
@@ -629,13 +640,10 @@ impl ShardIndex {
         Ok(())
     }
 
-    /// Remove every shard and staging file in the directory no live entry names.
-    pub(crate) fn sweep_stale_files(&self) {
-        assert!(
-            !self.retired_published,
-            "a retired shard's file stays until a manifest without it is durable"
-        );
-        let live: HashSet<String> = self.all_entries().map(|e| naming::shard_name(e.seq)).collect();
-        naming::remove_stale_files(&self.output_dir, &live);
+    /// Unlink every retired shard.
+    pub(crate) fn unlink_retired(&mut self) {
+        for seq in std::mem::take(&mut self.retired) {
+            self.unlink_shard(seq);
+        }
     }
 }

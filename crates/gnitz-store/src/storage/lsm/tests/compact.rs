@@ -221,7 +221,7 @@ fn a_corrupt_input_body_fails_the_compaction() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(dir.to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::open(dir.to_str().unwrap(), schema, ShardBudget::Unbounded, false, None).unwrap();
     for i in 0..5u64 {
         let rows: Vec<(Vec<u8>, i64, i64)> = (0..20)
             .map(|j| i * 100 + j)

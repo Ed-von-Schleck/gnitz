@@ -243,8 +243,8 @@ impl RelationRegistry {
             .map_err(|e| StoreError::storage("system catalog flush", e))
     }
 
-    /// The ephemeral round at the resume generation: `state`'s operator traces,
-    /// then the rederived stores, so an output manifest implies durable traces.
+    /// The ephemeral round at the resume generation: `state`'s operator traces and
+    /// every rederived store, in one barrier.
     pub fn checkpoint_ephemeral<'s>(
         &mut self,
         state: impl IntoIterator<Item = &'s mut crate::relation::CircuitState>,
@@ -253,9 +253,8 @@ impl RelationRegistry {
             checkpoint_gen: self.resume_generation,
             ..Default::default()
         };
-        let traces = state.into_iter().flat_map(|s| s.tables_mut());
-        crate::storage::flush_barrier(traces, stamp).map_err(|e| StoreError::storage("ephemeral trace flush", e))?;
-        crate::storage::flush_barrier(self.collect_user_tables().filter(|t| t.is_rederived()), stamp)
-            .map_err(|e| StoreError::storage("ephemeral output flush", e))
+        let mut tables: Vec<&mut Table> = state.into_iter().flat_map(|s| s.tables_mut()).collect();
+        tables.extend(self.collect_user_tables().filter(|t| t.is_rederived()));
+        crate::storage::flush_barrier(tables, stamp).map_err(|e| StoreError::storage("ephemeral flush", e))
     }
 }

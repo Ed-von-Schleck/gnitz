@@ -10,7 +10,7 @@ use io_uring::types::FsyncFlags;
 use super::super::batch::Batch;
 use super::super::batch_fsync::{new_ring, sync_paths};
 use super::super::error::StorageError;
-use super::super::manifest::{self, ManifestStamp};
+use super::super::manifest::{self, Manifest, ManifestStamp};
 use super::super::StagedFile;
 use super::Table;
 
@@ -18,6 +18,8 @@ use super::Table;
 pub(super) struct FlushWork {
     manifest: StagedFile,
     bytes: Vec<u8>,
+    /// The shard index's last seq when `manifest` was built.
+    names_through: u64,
     /// Fsynced once `manifest` is renamed.
     dirs: Vec<PathBuf>,
 }
@@ -49,7 +51,7 @@ pub(crate) fn flush_barrier<'a>(
     for (t, w) in work {
         // The rename publishes every shard the manifest names.
         w.manifest.commit()?;
-        t.shard_index.mark_published();
+        t.shard_index.mark_published(w.names_through);
         dirs.extend(w.dirs);
         published.push((t, w.bytes));
     }
@@ -58,7 +60,7 @@ pub(crate) fn flush_barrier<'a>(
     // No durable manifest names a superseded shard any more.
     for (t, bytes) in published {
         t.durable_manifest = Some(bytes);
-        t.shard_index.sweep_stale_files();
+        t.shard_index.unlink_retired();
     }
     Ok(())
 }
@@ -114,9 +116,12 @@ impl Table {
         if let Some(run) = self.ram_tier.fold_to_single(&self.shard_index.schema) {
             self.spill_ram_tier(run)?;
         }
-        let mut m = self.shard_index.manifest(stamp);
-        m.caller_record.clone_from(&self.caller_record);
-        let bytes = manifest::encode(&m);
+        let names_through = self.shard_index.last_seq();
+        let bytes = manifest::encode(&Manifest {
+            stamp,
+            caller_record: self.caller_record.clone(),
+            shards: self.shard_index.shard_set(),
+        });
         if self.durable_manifest.as_deref() == Some(&bytes[..]) {
             debug_assert!(
                 self.shard_index.unsynced_paths().next().is_none(),
@@ -136,7 +141,7 @@ impl Table {
             .filter(|d| !d.as_os_str().is_empty())
             .map(Path::to_path_buf)
             .collect();
-        Ok(Some(FlushWork { manifest, bytes, dirs }))
+        Ok(Some(FlushWork { manifest, bytes, names_through, dirs }))
     }
 
     /// Move the RAM tier's folded run to an unsynced L0 shard, then run the disk
