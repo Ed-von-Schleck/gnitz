@@ -9,8 +9,10 @@ use crate::runtime::test_support::{assert_child_exited_ok, fork_child, try_poll_
 use crate::runtime::w2m::fixtures::sal_wake_seq;
 use crate::runtime::w2m::{SalWake, W2mReceiver, W2mWriter};
 use crate::runtime::wire::WireMsg;
-use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, sweep_bit_flips};
+use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, sweep_bit_flips, zset_of, RowKey};
+use gnitz_store::schema::SchemaDescriptor;
 use gnitz_wire::control::CTRL_HEADER_SIZE;
+use std::collections::HashMap;
 
 #[test]
 fn sal_round_trip() {
@@ -669,8 +671,9 @@ fn an_uncommitted_scope_publishes_nothing() {
 /// block distinguishes them.
 #[test]
 fn footprint_equals_emitted_bytes() {
-    use crate::runtime::wire::{WireData, WireMsg};
+    use crate::runtime::wire::WireMsg;
     use crate::test_support::{make_batch, make_schema_u64_i64};
+    use gnitz_store::storage::Batch;
 
     let nw = 4;
     let schema = make_schema_u64_i64();
@@ -679,12 +682,12 @@ fn footprint_equals_emitted_bytes() {
 
     let log = TestLog::new(1 << 20, nw, 1);
 
-    // Slot 2 stays empty: the relay passes a dataless slot for a zero-row worker.
-    let worker_data = [
-        WireData::Whole(&batch),
-        WireData::Whole(&batch),
-        WireData::None,
-        WireData::Whole(&batch),
+    // Slot 2 stays empty: the relay passes an empty batch for a zero-row worker.
+    let slots = [
+        batch.clone_batch(),
+        batch.clone_batch(),
+        Batch::empty_with_schema(&schema),
+        batch.clone_batch(),
     ];
     let group = DirectGroup {
         template: WireMsg {
@@ -694,7 +697,7 @@ fn footprint_equals_emitted_bytes() {
             schema_block: Some(&block),
             ..Default::default()
         },
-        data: GroupData::PerWorker(&worker_data),
+        data: GroupData::Batches(&slots),
         ..DirectGroup::new(SalMessageKind::ExchangeRelay)
     };
 
@@ -746,12 +749,10 @@ fn a_group_with_per_worker_extras_writes_each_slot_its_own_blob() {
 }
 
 /// A schema with no German-string column takes the one-copy scatter, whatever
-/// its column widths: `with_group` hands the writer [`WireData::Scattered`]
-/// slots rather than per-worker sub-`Batch`es. A stride-4 payload column is the
-/// case that used to fall off it.
+/// its column widths: `with_routed` hands the writer a `GroupData::Scattered`
+/// group rather than per-worker sub-`Batch`es.
 #[test]
 fn a_narrow_fixed_width_schema_scatters_in_one_copy() {
-    use crate::runtime::wire::WireData;
     use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
     use gnitz_wire::TypeCode;
 
@@ -766,21 +767,194 @@ fn a_narrow_fixed_width_schema_scatters_in_one_copy() {
 
     let log = TestLog::new(1 << 20, 4, 1);
     log.push_group(16, schema, &batch, |g| {
-        let GroupData::PerWorker(slots) = g.data else {
-            panic!("a scatter group carries per-worker slots");
-        };
-        for (w, slot) in slots.iter().enumerate() {
-            assert!(
-                matches!(slot, WireData::Scattered { .. }),
-                "slot {w} must scatter straight into the SAL slot"
-            );
-        }
+        assert!(
+            matches!(g.data, GroupData::Scattered { .. }),
+            "the rows must scatter straight into the SAL slots"
+        );
         Ok(())
     });
 }
 
-/// A replicated push lays out one payload every worker is sent — a whole batch
-/// for a German-string schema, which cannot scatter in one copy — and every
+/// A STRING schema whose pushed cells are all inline has no heap, so it takes
+/// the one-copy scatter too, and the slots together decode to the pushed rows.
+#[test]
+fn an_inline_string_push_scatters_in_one_copy() {
+    use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
+    use gnitz_store::storage::BatchBuilder;
+    use gnitz_wire::TypeCode;
+
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::String, false),
+        ],
+        &[0],
+    );
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, weight, s) in [(1, 1, "a"), (2, 3, "twelve bytes"), (3, 1, "")] {
+        bb.begin_row(pk, weight);
+        bb.put_string(s);
+        bb.end_row();
+    }
+    let batch = bb.finish();
+
+    let log = TestLog::new(1 << 20, 4, 1);
+    log.push_group(16, schema, &batch, |g| {
+        assert!(
+            matches!(g.data, GroupData::Scattered { .. }),
+            "an inline-only string push must scatter straight into the SAL slots"
+        );
+        log.writer.write(g)
+    });
+    assert_eq!(group_zset(&log, &schema), zset_of(&batch, &schema));
+}
+
+/// A key-routed push whose cells reference a heap is sent as one sub-batch per
+/// worker, and the slots together decode to the pushed rows.
+#[test]
+fn a_heap_string_push_sends_each_worker_a_batch() {
+    use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
+    use gnitz_store::storage::BatchBuilder;
+    use gnitz_wire::TypeCode;
+
+    let nw = 4;
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::String, false),
+        ],
+        &[0],
+    );
+    let mut bb = BatchBuilder::new(schema);
+    for pk in 0..8 {
+        bb.begin_row(pk, 1);
+        bb.put_string(&format!("a string past the inline prefix {pk}"));
+        bb.end_row();
+    }
+    let batch = bb.finish();
+
+    let log = TestLog::new(1 << 20, nw, 1);
+    log.push_group(16, schema, &batch, |g| {
+        assert!(
+            matches!(g.data, GroupData::Batches(b) if b.len() == nw),
+            "a heap-referencing push must not scatter straight into the SAL slots"
+        );
+        log.writer.write(g)
+    });
+    assert_eq!(group_zset(&log, &schema), zset_of(&batch, &schema));
+}
+
+/// The Z-set the rows of every slot of the group at base 0 sum to.
+fn group_zset(log: &TestLog, schema: &SchemaDescriptor) -> HashMap<RowKey, i64> {
+    let mut z = HashMap::new();
+    for (_, bytes) in group_at(log.log(), 0).slots_written() {
+        let decoded = crate::runtime::wire::decode_sal_slot(bytes).expect("every written slot decodes");
+        for (k, w) in decoded.data_batch.iter().flat_map(|rows| zset_of(rows, schema)) {
+            *z.entry(k).or_insert(0) += w;
+        }
+    }
+    z
+}
+
+/// A replicated push of rows that are all live sends every worker the pushed
+/// batch itself: each slot is a region copy of it.
+#[test]
+fn a_replicated_push_of_live_rows_sends_the_batch_itself() {
+    use crate::runtime::wire::{decode_sal_slot, WireData};
+    use gnitz_store::schema::Placement;
+
+    let nw = 4;
+    let schema = make_schema_u64_i64().with_placement(Placement::Replicated);
+    let batch = make_batch(&schema, &[(1, 1, 10), (2, 2, 20), (3, -1, 30)]);
+
+    let log = TestLog::new(1 << 20, nw, 1);
+    log.push_group(16, schema, &batch, |g| {
+        assert!(
+            matches!(g.data, GroupData::Same(WireData::Whole(b)) if std::ptr::eq(b, &batch)),
+            "a replicated push of live rows sends the batch itself"
+        );
+        log.writer.write(g)
+    });
+
+    let msg = group_at(log.log(), 0);
+    let mut slots = 0;
+    for (w, bytes) in msg.slots_written() {
+        slots += 1;
+        let rows = decode_sal_slot(bytes)
+            .expect("every written slot decodes")
+            .data_batch
+            .expect("every slot carries rows");
+        let got: Vec<(u128, i64)> = (0..rows.len())
+            .map(|i| (gnitz_wire::widen_pk_be(rows.get_pk_bytes(i)), rows.get_weight(i)))
+            .collect();
+        assert_eq!(got, vec![(1, 1), (2, 2), (3, -1)], "worker {w} holds the batch");
+    }
+    assert_eq!(slots, nw, "every worker is sent the batch");
+}
+
+/// The master's encode of one pushed batch into a SAL group, per layout the
+/// scatter picks.
+///
+/// `cd crates && cargo test -p gnitz-server --release push_group_layout_bench -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore]
+fn push_group_layout_bench() {
+    use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
+    use gnitz_store::storage::BatchBuilder;
+    use gnitz_wire::TypeCode;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    const NW: usize = 4;
+    const ROWS: u128 = 250_000;
+    const ITERS: u32 = 50;
+
+    let fixed = make_schema_u64_i64();
+    let string = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::String, false),
+        ],
+        &[0],
+    );
+    let build = |schema: SchemaDescriptor| {
+        let mut bb = BatchBuilder::new(schema);
+        for pk in 0..ROWS {
+            bb.begin_row(pk, 1);
+            if schema.has_german_string() {
+                bb.put_string(&format!("s{:011}", pk % 100_000_000_000));
+            } else {
+                bb.put_int(pk);
+            }
+            bb.end_row();
+        }
+        bb.finish()
+    };
+    let cases = [
+        ("replicated (U64, I64)", fixed.with_placement(Placement::Replicated)),
+        (
+            "replicated (U64, String <= 12 B)",
+            string.with_placement(Placement::Replicated),
+        ),
+        ("keyed (U64, String <= 12 B)", string),
+    ];
+
+    let log = TestLog::new(64 << 20, NW, 1);
+    for (name, schema) in cases {
+        let batch = build(schema);
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            log.seek(0, 1);
+            log.push_group(16, schema, &batch, |g| log.writer.write(g));
+            black_box(log.cursor());
+        }
+        let per = start.elapsed() / ITERS;
+        eprintln!("push_group_layout_bench {name}: {per:?}/push of {ROWS} rows at NW={NW}");
+    }
+}
+
+/// A replicated push lays out one payload every worker is sent — its live rows
+/// materialized once — and every
 /// worker's slot decodes to the batch's live rows, a weight-0 row dropped.
 #[test]
 fn a_replicated_push_sends_every_worker_the_live_rows() {
@@ -841,8 +1015,9 @@ fn a_replicated_push_sends_every_worker_the_live_rows() {
 /// empty slot keeps its block — there the schema *is* the payload.
 #[test]
 fn a_rowless_push_slot_carries_no_schema_block() {
-    use crate::runtime::wire::{decode_sal_slot, WireData, WireMsg};
+    use crate::runtime::wire::{decode_sal_slot, WireMsg};
     use crate::test_support::{make_batch, make_schema_u64_i64};
+    use gnitz_store::storage::Batch;
 
     let nw = 4;
     let schema = make_schema_u64_i64();
@@ -872,7 +1047,12 @@ fn a_rowless_push_slot_carries_no_schema_block() {
 
     // The relay's own empty slot is the counter-case, on the same writer.
     let block = crate::catalog::encode_schema_block(&schema);
-    let worker_data = [WireData::None, WireData::None, WireData::None, WireData::None];
+    let empty = [
+        Batch::empty_with_schema(&schema),
+        Batch::empty_with_schema(&schema),
+        Batch::empty_with_schema(&schema),
+        Batch::empty_with_schema(&schema),
+    ];
     let base = log.cursor();
     log.writer
         .write(&DirectGroup {
@@ -881,7 +1061,7 @@ fn a_rowless_push_slot_carries_no_schema_block() {
                 schema_block: Some(&block),
                 ..Default::default()
             },
-            data: GroupData::PerWorker(&worker_data),
+            data: GroupData::Batches(&empty),
             ..DirectGroup::new(SalMessageKind::ExchangeRelay)
         })
         .expect("group fits");

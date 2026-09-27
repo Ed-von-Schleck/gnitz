@@ -42,9 +42,7 @@ pub(crate) use unique_filter::UniqueFilter;
 /// already scattered. Only the SAL write is left, which `emit_relay` does under
 /// a [`SalExcl`].
 pub(crate) struct RelayPrepared {
-    /// The view the relay targets, its schema block encoded once in
-    /// `prepare_relay`: the group is measured before the SAL lock and emitted
-    /// under it, and both passes read these same bytes.
+    /// The view the relay targets.
     view: wire::WireSchema,
     source_id: i64,
     /// One batch per worker (scatter), or a single batch every worker is sent
@@ -53,20 +51,18 @@ pub(crate) struct RelayPrepared {
 }
 
 impl RelayPrepared {
-    /// The relay's SAL group stamped with `decision`, handed to `f`: sizing and
-    /// emission both build it here, so the bytes checked are the bytes written.
-    /// `arg0` echoes `source_id`, so a join's wait cannot take another source's relay.
-    pub(crate) fn with_group<R>(&self, decision: BackfillDecision, f: impl FnOnce(&DirectGroup) -> R) -> R {
-        let slots: Vec<wire::WireData> = self.dest.iter().map(wire::WireData::Whole).collect();
-        f(&DirectGroup {
+    /// The relay's SAL group stamped with `decision`. `arg0` echoes `source_id`,
+    /// so a join's wait cannot take another source's relay.
+    pub(crate) fn group(&self, decision: BackfillDecision) -> DirectGroup<'_> {
+        DirectGroup {
             template: self.view.frame(wire::WireMsg {
                 arg0: self.source_id as u64,
                 flags: WireFlags { backfill: decision, ..Default::default() },
                 ..Default::default()
             }),
-            data: GroupData::of(&slots),
+            data: GroupData::batches(&self.dest),
             ..DirectGroup::new(SalMessageKind::ExchangeRelay)
-        })
+        }
     }
 }
 

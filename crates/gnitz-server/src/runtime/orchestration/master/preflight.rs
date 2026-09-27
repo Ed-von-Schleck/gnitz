@@ -15,7 +15,7 @@ use rustc_hash::FxHashSet;
 
 use super::*;
 
-use super::scatter::{with_group, with_worker_indices};
+use super::scatter::with_routed;
 use super::train::drain_rows;
 use crate::catalog::{FkEdge, RowConstraints};
 use crate::runtime::orchestration::TxnFamily;
@@ -106,14 +106,14 @@ impl PipelinedCheck {
     }
 }
 
-/// The PK-only image of `schema`, at the source relation's placement. A probe
-/// carries keys and nothing else, and it is routed by them: `project_schema`
-/// resets placement to the keyed default, which on a `CLUSTER BY` table is a
-/// different router width and so a different worker.
+/// The PK-only image of `schema`, routed to where its keys are held; every
+/// worker holds a replicated source, so its probe spreads over the full PK.
 fn probe_schema(schema: &SchemaDescriptor) -> SchemaDescriptor {
-    gnitz_store::schema::project_schema(schema, &[])
-        .expect("a PK-only projection fits MAX_COLUMNS")
-        .with_placement(schema.placement())
+    let pk_only = gnitz_store::schema::project_schema(schema, &[]).expect("a PK-only projection fits MAX_COLUMNS");
+    match schema.placement() {
+        Placement::Replicated => pk_only,
+        p => pk_only.with_placement(p),
+    }
 }
 
 /// A PK-sorted check batch whose row `j` carries `keys[j]` — an image at type
@@ -439,22 +439,22 @@ async fn execute_probe_burst(
                     flags: WireFlags { probe_mode, ..Default::default() },
                     ..Default::default()
                 });
-                let group = |targets| DirectGroup {
-                    template,
-                    targets,
-                    ..DirectGroup::new(SalMessageKind::HasPk)
-                };
                 match check.keyspace {
                     // Each worker is sent the keys it holds; one holding none is
                     // not sent the probe.
-                    Keyspace::OwnPk => with_worker_indices(&check.batch, check.schema.descriptor(), nw, |idx| {
-                        let holders = idx
+                    Keyspace::OwnPk => with_routed(&check.batch, &check.schema, nw, |rows, data| {
+                        let holders = rows
                             .iter()
                             .enumerate()
-                            .filter(|(_, rows)| !rows.is_empty())
+                            .filter(|(_, r)| !r.is_empty())
                             .fold(WorkerSet::EMPTY, |set, (w, _)| set.with(w));
-                        cut.push(SalMessageKind::HasPk, holders, |excl, t| {
-                            with_group(&check.batch, idx, &check.schema, group(t), |g| excl.write(g))
+                        cut.push(SalMessageKind::HasPk, holders, |excl, targets| {
+                            excl.write(&DirectGroup {
+                                template,
+                                data,
+                                targets,
+                                ..DirectGroup::new(SalMessageKind::HasPk)
+                            })
                         })
                     })?,
                     // Index entries are partitioned independently of the probe

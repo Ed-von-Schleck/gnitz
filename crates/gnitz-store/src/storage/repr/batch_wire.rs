@@ -81,7 +81,7 @@ impl Batch {
     }
 
     /// Payload slots whose cells can reference this batch's heap.
-    fn heap_referencing_slots(&self) -> u64 {
+    pub fn heap_referencing_slots(&self) -> u64 {
         if self.blob.is_empty() {
             0
         } else {
@@ -182,8 +182,8 @@ impl Batch {
     /// `wire_byte_size_range(indices.len())` bytes at the front of `out`.
     pub fn encode_scattered_to_wire(&self, indices: &[u32], out: &mut [u8]) -> usize {
         debug_assert!(
-            !self.schema().has_german_string(),
-            "a row scatter writes no heap bytes, so it cannot carry a string column"
+            self.heap_referencing_slots() == 0,
+            "a row scatter writes no heap bytes, so no cell may reference one"
         );
         let count = indices.len();
         let strides = self.strides();
@@ -193,11 +193,8 @@ impl Batch {
 
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
         wire_offsets(strides, nr, count, &mut offsets);
-        // No German-string columns here; `DirectWriter` still wants a blob arena,
-        // so hand it a 0-cap stack local it must not grow.
-        let mut empty_blob: Vec<u8> = Vec::new();
-        let mut writer =
-            DirectWriter::over_regions(block, &offsets, strides, nr, count, self.schema(), &mut empty_blob);
+        let mut no_heap: Vec<u8> = Vec::new();
+        let mut writer = DirectWriter::over_regions(block, &offsets, strides, nr, count, self.schema(), &mut no_heap);
         super::scatter::scatter_copy(&self.as_mem_batch(), indices, &mut writer);
         total_size
     }

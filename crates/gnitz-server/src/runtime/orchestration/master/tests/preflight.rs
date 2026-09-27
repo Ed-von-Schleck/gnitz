@@ -52,7 +52,8 @@ fn probe_schema_keeps_the_key_and_drops_every_payload_column() {
 /// table that resolves to a different router width, so probe rows would
 /// scatter to workers that do not store the key and every present key would
 /// read as absent. `PartialEq for SchemaDescriptor` ignores `placement`, so no
-/// schema guard downstream can catch it.
+/// schema guard downstream can catch it. A replicated source's probe is instead
+/// hash-spread over the full PK, since every worker holds it whole.
 #[test]
 fn probe_schema_carries_the_source_placement() {
     let cols = vec![
@@ -74,6 +75,18 @@ fn probe_schema_carries_the_source_placement() {
         pk_only.dist_stride(),
         pk_only.pk_stride(),
         "the fixture must actually be CLUSTER BY, or the test proves nothing"
+    );
+
+    let replicated = SchemaDescriptor::new(&cols, &[0, 1]).with_placement(gnitz_store::schema::Placement::Replicated);
+    let spread = probe_schema(&replicated);
+    assert!(
+        !spread.placement().is_replicated(),
+        "a replicated source's probe is spread, not sent to one worker"
+    );
+    assert_eq!(
+        spread.dist_stride(),
+        spread.pk_stride(),
+        "the spread hashes the full PK"
     );
 }
 

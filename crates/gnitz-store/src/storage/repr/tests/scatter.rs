@@ -162,6 +162,27 @@ fn route_rows_by_pk_follows_the_distribution_prefix() {
     );
 }
 
+/// A replicated relation is held whole by every worker, so the router sends it
+/// as one slot of every live row.
+#[test]
+fn route_rows_by_pk_sends_a_replicated_batch_whole() {
+    use crate::schema::Placement;
+    const NW: usize = 4;
+
+    let schema = make_schema_u64_i64().with_placement(Placement::Replicated);
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, weight) in [(1, 1), (2, 0), (3, 2)] {
+        bb.begin_row(pk, weight);
+        bb.put_int(pk);
+        bb.end_row();
+    }
+    let batch = bb.finish();
+
+    let mut rows = Vec::new();
+    let slots = route_rows_by_pk(&batch.as_mem_batch(), &schema, &mut rows, NW);
+    assert_eq!(slots, [vec![0, 2]], "one slot of the live rows");
+}
+
 // ---------------------------------------------------------------------------
 // The shard-backed source shapes. `mem_batch_to_unified` is always full-stride
 // and unpadded, so these build their `UnifiedSource` by hand.

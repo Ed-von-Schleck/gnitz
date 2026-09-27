@@ -22,6 +22,7 @@ use crate::runtime::w2m::SalWake;
 use crate::runtime::wire::{WireData, WireMsg};
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io;
+use gnitz_store::storage::Batch;
 use gnitz_wire::control::frame_head_size;
 use gnitz_wire::{low_bits_mask, read_u32_le, read_u64_le, write_u32_le, write_u64_le, BitIter};
 use gnitz_wire::{WireFault, WireStatus};
@@ -231,37 +232,36 @@ impl GroupTargets {
 pub(crate) enum GroupData<'a> {
     /// Every slot carries this payload.
     Same(WireData<'a>),
-    /// Slot `w` carries `d[w]`. `d.len()` must be `nw`.
-    PerWorker(&'a [WireData<'a>]),
+    /// Slot `w` carries `batches[w]`; one batch per worker.
+    Batches(&'a [Batch]),
+    /// Slot `w` carries the rows `rows[w]` of `batch`; one list per worker.
+    Scattered { batch: &'a Batch, rows: &'a [Vec<u32>] },
 }
 
 impl<'a> GroupData<'a> {
     /// A control-only group: every slot is a bare control block.
     pub(crate) const NONE: Self = Self::Same(WireData::None);
 
-    /// Worker `w`'s payload `slots[w]`, or — for a single slot — the one
-    /// payload every worker is sent.
-    pub(crate) fn of(slots: &'a [WireData<'a>]) -> Self {
-        match slots {
-            [one] => GroupData::Same(*one),
-            each => GroupData::PerWorker(each),
+    /// Slot `w` carries `b[w]`; a single batch is sent to every worker.
+    pub(crate) fn batches(b: &'a [Batch]) -> Self {
+        match b {
+            [one] => Self::Same(WireData::Whole(one)),
+            each => Self::Batches(each),
         }
     }
 
     /// True when no slot carries a row — the one shape allowed to omit a schema.
     fn is_dataless(&self) -> bool {
         match *self {
-            GroupData::Same(d) => d.row_count() == 0,
-            GroupData::PerWorker(d) => d.iter().all(|d| d.row_count() == 0),
+            Self::Same(d) => d.row_count() == 0,
+            Self::Batches(b) => b.iter().all(Batch::is_empty),
+            Self::Scattered { rows, .. } => rows.iter().all(Vec::is_empty),
         }
     }
 }
 
 /// One SAL group as [`SalWriter::write`] emits it: its header fields, the
 /// [`WireMsg`] every slot shares, plus what varies by worker.
-///
-/// [`SalWriter::footprint`] sizes the same value through the same
-/// [`DirectGroup::msg`], so a slot's size and its bytes cannot disagree.
 #[derive(Clone, Copy)]
 pub(crate) struct DirectGroup<'a> {
     pub(crate) kind: SalMessageKind,
@@ -301,7 +301,8 @@ impl<'a> DirectGroup<'a> {
         );
         let data = match self.data {
             GroupData::Same(d) => d,
-            GroupData::PerWorker(d) => d[w],
+            GroupData::Batches(b) => WireData::Whole(&b[w]),
+            GroupData::Scattered { batch, rows } => WireData::Scattered { batch, indices: &rows[w] },
         };
         let keeps_schema = data.row_count() > 0 || self.kind.schema_survives_a_rowless_slot();
         WireMsg {
@@ -1099,9 +1100,12 @@ impl SalWriter {
     /// encode path, for both writers above.
     fn lay_out(&self, g: &DirectGroup, lsn: u64) -> Result<usize, WireFault> {
         let nw = self.num_workers;
-        if let GroupData::PerWorker(d) = g.data {
-            assert_eq!(d.len(), nw, "worker_data.len()={} != num_workers={}", d.len(), nw);
-        }
+        let per_worker = match g.data {
+            GroupData::Same(_) => nw,
+            GroupData::Batches(b) => b.len(),
+            GroupData::Scattered { rows, .. } => rows.len(),
+        };
+        assert_eq!(per_worker, nw, "per-worker payloads={per_worker} != num_workers={nw}");
         debug_assert!(
             g.template.schema_block.is_some() || g.data.is_dataless(),
             "data without a schema — `decode_sal_slot` rejects a data block without a schema block",

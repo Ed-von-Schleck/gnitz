@@ -17,8 +17,8 @@ pub(crate) fn oversized_frame_message(sz: usize) -> String {
 }
 
 /// A relation's wire identity: the target id, the schema, and the encoded block
-/// describing that schema — one value, because the scatter writer needs all
-/// three and a slot sized from one shape but filled from another is corruption.
+/// describing that schema — one value, so the descriptor a slot is routed and
+/// sized by and the block it is framed with cannot disagree.
 ///
 /// Every constructor *derives* the block; none accepts one.
 pub(crate) struct WireSchema {
@@ -83,8 +83,8 @@ pub enum WireData<'a> {
         rows: usize,
     },
     /// The rows `indices` selects, in that order, encoded straight into the
-    /// destination — no per-worker sub-`Batch` in between. Valid only for a
-    /// schema with no German-string column.
+    /// destination — no per-worker sub-`Batch` in between. `batch` has no heap,
+    /// so no cell of those rows references one.
     Scattered {
         batch: &'a Batch,
         indices: &'a [u32],

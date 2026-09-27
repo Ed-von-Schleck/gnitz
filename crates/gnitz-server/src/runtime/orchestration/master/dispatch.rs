@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use super::exchange::{ExchangeAccumulator, PendingRelay};
-use super::scatter::{with_commit_indices, with_group};
+use super::scatter::with_routed;
 use super::*;
 use crate::query::{RelayRoute, OUTPUT_RELAY};
 use crate::runtime::orchestration::guard_panic;
@@ -161,8 +161,7 @@ impl MasterDispatcher {
                 };
                 let prep = self.prepare_relay(relay, lease.ctx());
                 if reclaim_allowed
-                    && (prep.with_group(decision, |g| self.sal.fit_relay(g)) != SalFit::Fits
-                        || BACKFILL_RELAY_SPACE_LOW.armed())
+                    && (self.sal.fit_relay(&prep.group(decision)) != SalFit::Fits || BACKFILL_RELAY_SPACE_LOW.armed())
                 {
                     self.reclaim_base(&mut excl).await?;
                 }
@@ -357,7 +356,7 @@ impl MasterDispatcher {
     /// Write a prepared relay stamped with `decision`. Aborts on failure, as
     /// [`Self::prepare_relay`] does.
     pub(crate) fn emit_relay(&self, excl: &SalExcl<'_>, prep: &RelayPrepared, decision: BackfillDecision) {
-        guard_panic("emit_relay", || prep.with_group(decision, |g| excl.write(g))).unwrap_or_else(|e| {
+        guard_panic("emit_relay", || excl.write(&prep.group(decision))).unwrap_or_else(|e| {
             gnitz_fatal_abort!("emit_relay: {e}; a lost relay wedges workers blocked in exchange wait")
         })
     }
@@ -608,15 +607,16 @@ impl MasterDispatcher {
             self.unflushed_pushes.set(true);
         }
         let relation = self.wire_schema(target_id);
-        let group = DirectGroup {
-            targets: GroupTargets::all(request_id),
-            ..DirectGroup::new(SalMessageKind::Push)
-        };
-        // A replicated relation broadcasts: the whole batch lands in every
-        // worker's ingest + SAL slot, so each worker durably logs the full table
-        // and enforces uniqueness against its identical full copy.
-        with_commit_indices(batch, relation.descriptor(), self.num_workers(), |worker_indices| {
-            with_group(batch, worker_indices, &relation, group, |g| scope.write(g, recoverable))
+        with_routed(batch, &relation, self.num_workers(), |_, data| {
+            scope.write(
+                &DirectGroup {
+                    template: relation.frame(wire::WireMsg::default()),
+                    data,
+                    targets: GroupTargets::all(request_id),
+                    ..DirectGroup::new(SalMessageKind::Push)
+                },
+                recoverable,
+            )
         })
     }
 

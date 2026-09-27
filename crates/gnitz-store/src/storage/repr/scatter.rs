@@ -28,17 +28,21 @@ macro_rules! width_dispatch {
     }};
 }
 
-/// Reset `out` to `num_workers` slots and fill each with the live rows of `mb`
-/// that worker owns: the one placement rule for a table key. Weight-0 rows are
-/// not Z-set elements and are dropped.
+/// Reset `out` to the live rows of `mb` each worker is sent: one slot per
+/// worker, or for a replicated relation one slot every worker is sent.
 pub fn route_rows_by_pk<'a>(
     mb: &MemBatch,
-    schema: &crate::schema::SchemaDescriptor,
+    schema: &SchemaDescriptor,
     out: &'a mut Vec<Vec<u32>>,
     num_workers: usize,
 ) -> &'a mut [Vec<u32>] {
-    let slots = reset_slots(out, num_workers);
-    if num_workers == 1 {
+    let nw = if schema.placement().is_replicated() {
+        1
+    } else {
+        num_workers
+    };
+    let slots = reset_slots(out, nw);
+    if nw == 1 {
         slots[0].extend((0..mb.count).filter(|&i| mb.get_weight(i) != 0).map(|i| i as u32));
         return slots;
     }
@@ -46,7 +50,7 @@ pub fn route_rows_by_pk<'a>(
         if mb.get_weight(i) == 0 {
             continue;
         }
-        slots[schema.worker_for_pk(mb.get_pk_bytes(i), num_workers)].push(i as u32);
+        slots[schema.worker_for_pk(mb.get_pk_bytes(i), nw)].push(i as u32);
     }
     slots
 }

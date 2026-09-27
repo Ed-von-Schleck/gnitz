@@ -672,7 +672,7 @@ async fn relay_steady(shared: &Shared, relay: PendingRelay) {
         {
             let disp = shared.disp();
             let excl = disp.sal().lock().await;
-            let mut fit = prep.with_group(BackfillDecision::Continue, |g| disp.sal().fit_relay(g));
+            let mut fit = disp.sal().fit_relay(&prep.group(BackfillDecision::Continue));
             if inject_low {
                 inject_low = false;
                 fit = SalFit::Transient;

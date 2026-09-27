@@ -7,7 +7,7 @@
 use std::os::fd::BorrowedFd;
 
 use super::*;
-use crate::runtime::master::scatter::{with_commit_indices, with_group};
+use crate::runtime::master::scatter::with_routed;
 use crate::runtime::test_support::SharedRegion;
 use crate::runtime::w2m::SalWake;
 use crate::runtime::wire as ipc;
@@ -137,12 +137,14 @@ impl TestLog {
         let base = self.cursor();
         let nw = self.writer.num_workers();
         let relation = ipc::WireSchema::encoded(tid as i64, schema);
-        let group = DirectGroup {
-            targets: GroupTargets::all(0),
-            ..DirectGroup::new(SalMessageKind::Push)
-        };
-        with_commit_indices(batch, &schema, nw, |wi| {
-            with_group(batch, wi, &relation, group, write).expect("group fits")
+        with_routed(batch, &relation, nw, |_, data| {
+            write(&DirectGroup {
+                template: relation.frame(WireMsg::default()),
+                data,
+                targets: GroupTargets::all(0),
+                ..DirectGroup::new(SalMessageKind::Push)
+            })
+            .expect("group fits")
         });
         base
     }
