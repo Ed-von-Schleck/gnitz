@@ -141,14 +141,20 @@ pub enum RelationKind {
 }
 
 impl RelationKind {
+    /// What a client is told this relation is.
+    #[inline]
+    pub fn class(self) -> gnitz_wire::RelClass {
+        match self {
+            RelationKind::Stream => gnitz_wire::RelClass::Stream,
+            RelationKind::View(props) => props.into(),
+            RelationKind::BaseTable | RelationKind::SystemCatalog => gnitz_wire::RelClass::Table,
+        }
+    }
+
     /// What to call this relation in a message to the user.
     #[inline]
     pub fn noun(self) -> &'static str {
-        match self {
-            RelationKind::SystemCatalog | RelationKind::BaseTable => "table",
-            RelationKind::View(_) => "view",
-            RelationKind::Stream => "stream",
-        }
+        self.class().noun()
     }
 
     /// True iff this is a user base table.

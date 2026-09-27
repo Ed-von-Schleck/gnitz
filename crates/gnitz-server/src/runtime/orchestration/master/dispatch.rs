@@ -106,12 +106,6 @@ impl MasterDispatcher {
         &self.sal
     }
 
-    /// `target_id`'s wire identity.
-    fn wire_schema(&self, target_id: i64) -> wire::WireSchema {
-        let descriptor = self.schema_desc_for(target_id);
-        wire::WireSchema::from_catalog(self.cat(), target_id, descriptor)
-    }
-
     // -----------------------------------------------------------------------
     // Core send/receive helpers
     // -----------------------------------------------------------------------
@@ -371,13 +365,13 @@ impl MasterDispatcher {
     /// double-count.
     ///
     async fn fan_out_backfill(&self, view_id: i64, source_id: i64) -> Result<(), WireFault> {
-        // Dataless, but it still carries a schema block: that block is what
-        // stamps `Batch.schema` on the worker side.
-        let source = wire::WireSchema::encoded(source_id, self.schema_desc_for(source_id));
-        let template = source.frame(wire::WireMsg {
+        // Dataless, and schema-less: the worker reads the source's schema off its
+        // own catalog.
+        let template = wire::WireMsg {
+            target_id: source_id as u64,
             arg0: view_id as u64,
             ..Default::default()
-        });
+        };
         self.broadcast_round("backfill relay", true, |excl, t| {
             excl.write(&DirectGroup {
                 template,
@@ -432,7 +426,7 @@ impl MasterDispatcher {
     /// across a DDL's broadcasts, so recovery groups them atomically. Publishes
     /// nothing; that is the scope's commit.
     pub(crate) fn broadcast_ddl(&self, scope: &SalScope, target_id: i64, batch: &Batch) -> Result<(), WireFault> {
-        let relation = self.wire_schema(target_id);
+        let relation = wire::WireSchema::from_catalog(self.cat(), target_id);
         scope.write(
             &DirectGroup {
                 template: relation.frame(wire::WireMsg::default()),
@@ -606,7 +600,7 @@ impl MasterDispatcher {
         if recoverable {
             self.unflushed_pushes.set(true);
         }
-        let relation = self.wire_schema(target_id);
+        let relation = wire::WireSchema::from_catalog(self.cat(), target_id);
         with_routed(batch, &relation, self.num_workers(), |_, data| {
             scope.write(
                 &DirectGroup {

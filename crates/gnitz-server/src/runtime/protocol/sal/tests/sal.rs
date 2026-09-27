@@ -678,7 +678,7 @@ fn footprint_equals_emitted_bytes() {
     let nw = 4;
     let schema = make_schema_u64_i64();
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-    let block = crate::catalog::encode_schema_block(&schema);
+    let block = gnitz_store::schema::encode_schema_block(&schema);
 
     let log = TestLog::new(1 << 20, nw, 1);
 
@@ -738,7 +738,7 @@ fn a_group_with_per_worker_extras_writes_each_slot_its_own_blob() {
     let msg = group_at(log.log(), before);
     for (w, extra) in extras.iter().enumerate() {
         let slot = msg.slot(w as u32).expect("every worker is written");
-        let decoded = decode_sal_slot(slot).expect("a slot decodes");
+        let decoded = decode_sal_slot(slot, |_, _| None).expect("a slot decodes");
         assert_eq!(decoded.blob, *extra, "worker {w}");
     }
     let sizes: Vec<usize> = (0..nw as u32).map(|w| msg.slot(w).unwrap().len()).collect();
@@ -848,7 +848,7 @@ fn a_heap_string_push_sends_each_worker_a_batch() {
 fn group_zset(log: &TestLog, schema: &SchemaDescriptor) -> HashMap<RowKey, i64> {
     let mut z = HashMap::new();
     for (_, bytes) in group_at(log.log(), 0).slots_written() {
-        let decoded = crate::runtime::wire::decode_sal_slot(bytes).expect("every written slot decodes");
+        let decoded = crate::runtime::wire::decode_sal_slot(bytes, |_, _| None).expect("every written slot decodes");
         for (k, w) in decoded.data_batch.iter().flat_map(|rows| zset_of(rows, schema)) {
             *z.entry(k).or_insert(0) += w;
         }
@@ -880,7 +880,7 @@ fn a_replicated_push_of_live_rows_sends_the_batch_itself() {
     let mut slots = 0;
     for (w, bytes) in msg.slots_written() {
         slots += 1;
-        let rows = decode_sal_slot(bytes)
+        let rows = decode_sal_slot(bytes, |_, _| None)
             .expect("every written slot decodes")
             .data_batch
             .expect("every slot carries rows");
@@ -997,7 +997,7 @@ fn a_replicated_push_sends_every_worker_the_live_rows() {
     let mut slots = 0;
     for (w, bytes) in msg.slots_written() {
         slots += 1;
-        let rows = decode_sal_slot(bytes)
+        let rows = decode_sal_slot(bytes, |_, _| None)
             .expect("every written slot decodes")
             .data_batch
             .expect("every slot carries rows");
@@ -1030,7 +1030,7 @@ fn a_rowless_push_slot_carries_no_schema_block() {
     let msg = group_at(log.log(), 0);
     let mut with_rows = 0;
     for (w, bytes) in msg.slots_written() {
-        let decoded = decode_sal_slot(bytes).expect("every written slot decodes");
+        let decoded = decode_sal_slot(bytes, |_, _| None).expect("every written slot decodes");
         match decoded.data_batch {
             Some(b) => {
                 with_rows += 1;
@@ -1046,7 +1046,7 @@ fn a_rowless_push_slot_carries_no_schema_block() {
     assert_eq!(with_rows, 1, "one row routes to exactly one worker");
 
     // The relay's own empty slot is the counter-case, on the same writer.
-    let block = crate::catalog::encode_schema_block(&schema);
+    let block = gnitz_store::schema::encode_schema_block(&schema);
     let empty = [
         Batch::empty_with_schema(&schema),
         Batch::empty_with_schema(&schema),
@@ -1067,7 +1067,7 @@ fn a_rowless_push_slot_carries_no_schema_block() {
         .expect("group fits");
     let relay = group_at(log.log(), base);
     for (w, bytes) in relay.slots_written() {
-        let decoded = decode_sal_slot(bytes).expect("every written slot decodes");
+        let decoded = decode_sal_slot(bytes, |_, _| None).expect("every written slot decodes");
         assert!(
             decoded.schema.is_some(),
             "relay slot {w} builds its empty batch from the block"

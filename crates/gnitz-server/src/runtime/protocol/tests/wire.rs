@@ -1,7 +1,6 @@
-use crate::catalog::encode_schema_block;
-use crate::runtime::wire::{decode_sal_slot, decode_wire_ipc, validate_schema_match, WireData, WireMsg};
+use crate::runtime::wire::{decode_sal_slot, decode_wire_ipc, WireData, WireMsg};
 use crate::test_support::{make_batch, make_batch_raw, u64_pk_schema};
-use gnitz_store::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
+use gnitz_store::schema::{encode_schema_block, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder, Layout, WireChunk};
 use gnitz_wire::control::CTRL_HEADER_SIZE;
 use gnitz_wire::try_decode_german_string;
@@ -47,7 +46,7 @@ fn encode_decode_roundtrip_with_schema() {
         ..Default::default()
     }
     .encode_to_vec();
-    let decoded = decode_sal_slot(&wire).unwrap();
+    let decoded = decode_sal_slot(&wire, |_, _| None).unwrap();
     assert!(decoded.schema.is_some());
     let s = decoded.schema.unwrap();
     assert_eq!(s.num_columns(), 2);
@@ -69,7 +68,7 @@ fn encode_decode_roundtrip_with_data() {
         ..Default::default()
     }
     .encode_to_vec();
-    let decoded = decode_sal_slot(&wire).unwrap();
+    let decoded = decode_sal_slot(&wire, |_, _| None).unwrap();
     assert!(decoded.schema.is_some());
     assert!(decoded.data_batch.is_some());
     let db = decoded.data_batch.as_ref().unwrap();
@@ -87,26 +86,6 @@ fn encode_decode_roundtrip_with_data() {
 /// catalog-restart peer of this — `schema_roundtrip_catalog_preserves_pk_order`
 /// in `catalog/suites/compound_pk_smoke.rs` — exercises the same property through
 /// the catalog API.
-#[test]
-fn schema_roundtrip_wire_preserves_pk_order() {
-    let u64c = SchemaColumn::new(TypeCode::U64, false);
-    let u32c = SchemaColumn::new(TypeCode::U32, false);
-    let cases: &[(&[SchemaColumn], &[u32])] = &[
-        (&[u64c, u64c], &[0, 1]),
-        (&[u64c, u64c], &[1, 0]),
-        (&[u32c, u32c, u32c, u32c], &[0, 1, 2, 3]),
-    ];
-    for &(cols, pk_indices) in cases {
-        let original = SchemaDescriptor::new(cols, pk_indices);
-        let block = crate::catalog::encode_schema_block(&original);
-        let decoded = decode_schema_block(&block).unwrap();
-        assert!(
-            original == decoded,
-            "pk_indices {pk_indices:?} did not survive wire round-trip",
-        );
-    }
-}
-
 #[test]
 fn encode_decode_string_column() {
     let sd = string_schema();
@@ -132,7 +111,7 @@ fn encode_decode_string_column() {
         ..Default::default()
     }
     .encode_to_vec();
-    let decoded = decode_sal_slot(&wire).unwrap();
+    let decoded = decode_sal_slot(&wire, |_, _| None).unwrap();
     let db = decoded.data_batch.as_ref().unwrap();
     assert_eq!(db.len(), 2);
 
@@ -178,7 +157,7 @@ fn every_truncation_of_a_frame_is_rejected() {
     for (shape, wire) in every_frame_shape().iter().enumerate() {
         for cut in 1..wire.len() {
             assert!(
-                decode_sal_slot(&wire[..cut]).is_err(),
+                decode_sal_slot(&wire[..cut], |_, _| None).is_err(),
                 "shape {shape}: prefix of {cut}/{} bytes must not decode",
                 wire.len()
             );
@@ -242,7 +221,7 @@ fn decode_wire_round_trips_error_text() {
             ..Default::default()
         }
         .encode_to_vec();
-        let decoded = decode_sal_slot(&wire).unwrap();
+        let decoded = decode_sal_slot(&wire, |_, _| None).unwrap();
         assert_eq!(decoded.control.hdr.target_id, 7);
         assert_eq!(decoded.control.hdr.status, WireStatus::Error);
         assert_eq!(decoded.blob, text);
@@ -267,7 +246,7 @@ fn decode_wire_round_trips_every_control_field() {
         ..Default::default()
     }
     .encode_to_vec();
-    let decoded = decode_sal_slot(&wire).unwrap();
+    let decoded = decode_sal_slot(&wire, |_, _| None).unwrap();
     assert_eq!(decoded.control.hdr.target_id, 0xDEAD);
     assert_eq!(decoded.control.hdr.flags, flags);
     assert_eq!(decoded.control.hdr.arg0, 0x1111_2222_3333_4444);
@@ -381,7 +360,7 @@ fn schemaless_command_slot_is_a_bare_control_block() {
 /// answer `is_consolidated()` structurally either way.
 #[test]
 fn decode_applies_batch_flags() {
-    let schema = two_col_schema(false);
+    let schema = u64_pk_schema(SchemaColumn::new(TypeCode::I64, false));
     let batch = make_batch(&schema, &[(1, 1, 42)]);
 
     let blk = encode_schema_block(&schema);
@@ -393,61 +372,9 @@ fn decode_applies_batch_flags() {
     }
     .encode_to_vec();
 
-    let decoded = decode_sal_slot(&wire).expect("decode");
+    let decoded = decode_sal_slot(&wire, |_, _| None).expect("decode");
     let b = decoded.data_batch.as_ref().expect("data batch present");
     assert_eq!(b.layout(), Layout::Consolidated, "decoder applies batch_consolidated");
-}
-
-fn two_col_schema(col1_nullable: bool) -> SchemaDescriptor {
-    u64_pk_schema(SchemaColumn::new(TypeCode::I64, col1_nullable))
-}
-
-/// Each mismatch family is rejected, and each names itself distinctly.
-///
-/// `wire == expected` is the verdict; the message only names the first
-/// differing column, and the executor and reply-train decoder surface it.
-/// Four `is_err()` assertions would still pass if the message collapsed to
-/// one constant string — pairwise distinctness is what tests it, without
-/// pinning the prose.
-#[test]
-fn validate_schema_match_names_each_mismatch_distinctly() {
-    let col = |tc, n| SchemaColumn::new(tc, n);
-    let expected = two_col_schema(false);
-    assert!(
-        validate_schema_match(&expected, &expected).is_ok(),
-        "a schema matches itself"
-    );
-    let cases = [
-        (
-            "count",
-            SchemaDescriptor::new(&[col(TypeCode::U64, false)], &[0]),
-            expected,
-        ),
-        (
-            "pk",
-            SchemaDescriptor::new(&[col(TypeCode::U64, false), col(TypeCode::I64, false)], &[1]),
-            expected,
-        ),
-        (
-            "type",
-            SchemaDescriptor::new(&[col(TypeCode::U64, false), col(TypeCode::F64, false)], &[0]),
-            expected,
-        ),
-        ("nullable", two_col_schema(false), two_col_schema(true)),
-    ];
-    let msgs: Vec<String> = cases
-        .iter()
-        .map(|(what, wire, exp)| validate_schema_match(wire, exp).expect_err(what))
-        .collect();
-    for i in 0..msgs.len() {
-        for j in (i + 1)..msgs.len() {
-            assert_ne!(
-                msgs[i], msgs[j],
-                "{} vs {} report the same message",
-                cases[i].0, cases[j].0
-            );
-        }
-    }
 }
 
 /// A 4-byte PK and stride-4 payload columns: the wire block pads between
@@ -485,7 +412,7 @@ fn scattered_roundtrips_over_a_padded_schema() {
         };
         let buf = msg.encode_to_vec();
 
-        let decoded = decode_sal_slot(&buf).expect("a scattered block decodes");
+        let decoded = decode_sal_slot(&buf, |_, _| None).expect("a scattered block decodes");
         let got = decoded.data_batch.expect("it carries rows");
         assert_eq!(got.len(), count);
         for (j, &src) in indices.iter().enumerate() {

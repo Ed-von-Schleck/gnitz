@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-use gnitz_store::schema::{decode_schema_block, SchemaDescriptor};
+use gnitz_store::schema::{decode_schema_block, encode_schema_block, SchemaDescriptor};
 use gnitz_store::storage::{Batch, Layout, WireChunk, MAX_BATCH_REGIONS};
 use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::{WireFlags, WireStatus};
@@ -19,34 +19,40 @@ pub(crate) fn oversized_frame_message(sz: usize) -> String {
 /// A relation's wire identity: the target id, the schema, and the encoded block
 /// describing that schema — one value, so the descriptor a slot is routed and
 /// sized by and the block it is framed with cannot disagree.
-///
-/// Every constructor *derives* the block; none accepts one.
 pub(crate) struct WireSchema {
     /// The relation id, as the catalog keys it. Narrowing to the block's and the
     /// frame's widths happens here and nowhere else.
     tid: i64,
     descriptor: SchemaDescriptor,
-    block: Rc<Vec<u8>>,
+    block: Rc<[u8]>,
 }
 
 impl WireSchema {
-    /// A one-off **anonymous** block, encoded here and cached nowhere: smaller in
-    /// every worker's SAL slot than [`Self::from_catalog`]'s *named* one,
-    /// and the only option for a schema no catalog entry describes.
+    /// A one-off **anonymous** block, encoded here from `descriptor` and cached
+    /// nowhere: the only option for a schema no catalog entry describes.
     pub(crate) fn encoded(tid: i64, descriptor: SchemaDescriptor) -> Self {
         WireSchema {
             tid,
-            block: Rc::new(crate::catalog::encode_schema_block(&descriptor)),
+            block: Rc::from(encode_schema_block(&descriptor)),
             descriptor,
         }
     }
 
-    /// `tid`'s catalog entry, with its *named* block.
-    pub(crate) fn from_catalog(cat: &crate::catalog::CatalogEngine, tid: i64, descriptor: SchemaDescriptor) -> Self {
-        let block = cat
-            .schema_block(tid)
-            .expect("a wire target is registered under the catalog lock");
-        WireSchema { tid, descriptor, block }
+    /// `tid`'s registry descriptor and its catalog entry's *named* block.
+    pub(crate) fn from_catalog(cat: &crate::catalog::CatalogEngine, tid: i64) -> Self {
+        let descriptor = cat
+            .registry
+            .relation(tid)
+            .expect("a wire target is registered under the catalog lock")
+            .schema();
+        WireSchema {
+            tid,
+            descriptor,
+            block: cat
+                .schema_record(tid)
+                .expect("a wire target is registered under the catalog lock")
+                .bytes,
+        }
     }
 
     pub(crate) fn descriptor(&self) -> &SchemaDescriptor {
@@ -213,18 +219,6 @@ impl<'a> WireMsg<'a> {
 // Decode
 // ---------------------------------------------------------------------------
 
-/// `Err` naming the first differing column unless `wire` is `expected`.
-pub(crate) fn validate_schema_match(wire: &SchemaDescriptor, expected: &SchemaDescriptor) -> Result<(), String> {
-    if wire == expected {
-        return Ok(());
-    }
-    let at = (wire.num_columns() == expected.num_columns())
-        .then(|| (0..wire.num_columns()).find(|&i| wire.columns[i] != expected.columns[i]))
-        .flatten()
-        .map_or(String::new(), |i| format!(" at column {i}"));
-    Err(format!("Schema mismatch{at}: expected {expected:?}, got {wire:?}"))
-}
-
 /// Wire schema of a unique pre-flight reply frame: the leading `n_promoted`
 /// columns of `idx_schema`, all PK, so a row's PK region is one indexed-key span.
 pub(crate) fn unique_preflight_wire_schema(idx_schema: &SchemaDescriptor, n_promoted: usize) -> SchemaDescriptor {
@@ -239,24 +233,44 @@ pub struct DecodedWire {
     /// The frame's blob, copied out of the buffer `control` indexes: a decoded
     /// request can outlive that buffer.
     pub blob: Vec<u8>,
-    /// The frame's own schema block, decoded; `None` when the frame carried none.
     pub schema: Option<SchemaDescriptor>,
     pub data_batch: Option<Batch>,
 }
 
-/// Decode a client frame. The batch stays `Raw`: a client's layout claim is not trusted.
+/// A `known` for a frame whose record is always decoded.
+pub fn unknown(_: &[u8]) -> Result<Option<SchemaDescriptor>, String> {
+    Ok(None)
+}
+
+/// Decode a client frame. The batch stays `Raw`: a client's layout claim is not
+/// trusted. `recordless` lays out a frame that carries no record; `known` answers
+/// what a record decodes to when that is already known (`Ok(None)`: decode it),
+/// or refuses the frame.
 pub fn decode_client_frame(
     data: &[u8],
     control: DecodedControl,
-    hint: Option<&SchemaDescriptor>,
+    recordless: Option<&SchemaDescriptor>,
+    known: impl FnOnce(&[u8]) -> Result<Option<SchemaDescriptor>, String>,
 ) -> Result<DecodedWire, String> {
-    decode_frame(data, control, hint, |b, s| Batch::decode_foreign_wal_block(b, s, s))
+    decode_frame(data, control, recordless, known, |b, s| {
+        Batch::decode_foreign_wal_block(b, s, s)
+    })
 }
 
-/// Decode one SAL slot.
-pub fn decode_sal_slot(data: &[u8]) -> Result<DecodedWire, String> {
+/// Decode one SAL slot; `known` is asked with the slot's target id.
+pub fn decode_sal_slot(
+    data: &[u8],
+    known: impl FnOnce(i64, &[u8]) -> Option<SchemaDescriptor>,
+) -> Result<DecodedWire, String> {
     let control = peek_control_block(data)?;
-    let mut decoded = decode_frame(data, control, None, Batch::decode_from_wal_block)?;
+    let tid = control.hdr.target_id as i64;
+    let mut decoded = decode_frame(
+        data,
+        control,
+        None,
+        |record: &[u8]| Ok(known(tid, record)),
+        Batch::decode_from_wal_block,
+    )?;
     certify_engine_frame(&mut decoded);
     Ok(decoded)
 }
@@ -266,7 +280,7 @@ pub fn decode_sal_slot(data: &[u8]) -> Result<DecodedWire, String> {
 /// is where it is compacted.
 pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, String> {
     let control = peek_control_block(data)?;
-    let mut decoded = decode_frame(data, control, None, |block, schema| {
+    let mut decoded = decode_frame(data, control, None, unknown, |block, schema| {
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
         let mb = gnitz_store::storage::decode_mem_batch_from_wal_block(block, schema, &mut offsets)?;
         let mut owned = Batch::with_capacity(schema, mb.len());
@@ -299,27 +313,32 @@ fn certify_engine_frame(decoded: &mut DecodedWire) {
 fn decode_frame(
     data: &[u8],
     control: DecodedControl,
-    hint: Option<&SchemaDescriptor>,
+    recordless: Option<&SchemaDescriptor>,
+    known: impl FnOnce(&[u8]) -> Result<Option<SchemaDescriptor>, String>,
     decode: impl FnOnce(&[u8], &SchemaDescriptor) -> Result<Batch, &'static str>,
 ) -> Result<DecodedWire, String> {
+    let schema = match &control.schema {
+        Some(r) => {
+            let record = &data[r.clone()];
+            Some(match known(record)? {
+                Some(s) => s,
+                None => decode_schema_block(record)?,
+            })
+        }
+        None => recordless.copied(),
+    };
     let mut out = DecodedWire {
         blob: data[control.blob.clone()].to_vec(),
         control,
-        schema: None,
+        schema,
         data_batch: None,
     };
-    if let Some(r) = &out.control.schema {
-        out.schema = Some(decode_schema_block(&data[r.clone()])?);
-    }
     let Some(r) = out.control.data.clone() else {
         return Ok(out);
     };
 
-    let (block_schema, batch) = (&out.schema, &mut out.data_batch);
-    let schema = block_schema
-        .as_ref()
-        .or(hint)
-        .ok_or("a data block without a schema block")?;
+    let (schema, batch) = (&out.schema, &mut out.data_batch);
+    let schema = schema.as_ref().ok_or("a data block without a schema block")?;
     *batch = Some(decode(&data[r], schema).map_err(str::to_string)?);
     Ok(out)
 }

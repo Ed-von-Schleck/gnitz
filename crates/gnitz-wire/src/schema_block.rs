@@ -84,11 +84,14 @@ fn take_col<'a>(r: &mut Reader<'a>) -> Result<SchemaBlockCol<'a>, String> {
     })
 }
 
-/// The record for `cols` keyed by `pk_cols`, in declared PK-tuple order.
-pub fn encode(cols: &[SchemaBlockCol], pk_cols: &[u32]) -> Vec<u8> {
-    let columns: usize = cols.iter().map(|c| COL_FIXED_BYTES + c.name.len()).sum();
+/// The record for `cols` keyed by `pk_cols`, in declared PK-tuple order. `cols`
+/// is walked twice: a clone sizes the record, the original writes it.
+pub fn encode<'a>(cols: impl Iterator<Item = SchemaBlockCol<'a>> + Clone, pk_cols: &[u32]) -> Vec<u8> {
+    let (count, columns) = cols.clone().fold((0usize, 0usize), |(n, b), c| {
+        (n + 1, b + COL_FIXED_BYTES + c.name.len())
+    });
     let mut w = Writer::with_capacity(4 + 1 + pk_cols.len() + columns);
-    w.u32(cols.len() as u32)
+    w.u32(count as u32)
         .u8(u8::try_from(pk_cols.len()).unwrap_or(PK_FIELD_OVERFLOW));
     for &c in pk_cols {
         debug_assert!(u8::try_from(c).is_ok(), "PK column index {c} does not fit the record");
@@ -125,23 +128,70 @@ pub fn decode<'a>(
     mut on_col: impl FnMut(SchemaBlockCol<'a>) -> Result<(), String>,
 ) -> Result<PkIndices, String> {
     decode_all(buf, "schema record", |r| {
-        let count = r.u32()? as usize;
-        if count == 0 || count > MAX_COLUMNS {
-            return Err(format!("column count {count} out of range 1..={MAX_COLUMNS}"));
-        }
-        let len = r.u8()? as usize;
-        if len > MAX_PK_COLUMNS {
-            return Err(format!("pk column count {len} exceeds {MAX_PK_COLUMNS}"));
-        }
-        let mut idx = [0u32; MAX_PK_COLUMNS];
-        for slot in &mut idx[..len] {
-            *slot = r.u8()? as u32;
-        }
+        let (count, pk) = take_header(r)?;
         for _ in 0..count {
             on_col(take_col(r)?)?;
         }
-        Ok(PkIndices { idx, len })
+        Ok(pk)
     })
+}
+
+/// The header both records open with: column count and PK list, validated as
+/// [`decode`] validates them.
+fn take_header(r: &mut Reader<'_>) -> Result<(usize, PkIndices), String> {
+    let count = r.u32()? as usize;
+    if count == 0 || count > MAX_COLUMNS {
+        return Err(format!("column count {count} out of range 1..={MAX_COLUMNS}"));
+    }
+    let len = r.u8()? as usize;
+    if len > MAX_PK_COLUMNS {
+        return Err(format!("pk column count {len} exceeds {MAX_PK_COLUMNS}"));
+    }
+    let mut idx = [0u32; MAX_PK_COLUMNS];
+    for slot in &mut idx[..len] {
+        *slot = r.u8()? as u32;
+    }
+    Ok((count, PkIndices { idx, len }))
+}
+
+/// `Err` naming the first difference unless `got` lays out the same columns as
+/// the well-formed record `want`: column count, PK list, and per column its type
+/// (scale included) and nullability. Names and the hidden flag are not compared.
+pub fn check_same_types(got: &[u8], want: &[u8]) -> Result<(), String> {
+    debug_assert!(decode(want, |_| Ok(())).is_ok(), "`want` is a well-formed record");
+    if got == want {
+        return Ok(());
+    }
+    let mut w = Reader::new(want);
+    let first_difference = decode_all(got, "schema record", |g| {
+        let (want_count, want_pk) = take_header(&mut w)?;
+        let (count, pk) = take_header(g)?;
+        if count != want_count {
+            return Ok(Some(format!("expected {want_count} columns, got {count}")));
+        }
+        if pk != want_pk {
+            return Ok(Some(format!(
+                "expected PK columns {:?}, got {:?}",
+                want_pk.as_slice(),
+                pk.as_slice()
+            )));
+        }
+        let null = |nullable: bool| if nullable { "NULL" } else { "NOT NULL" };
+        for ci in 0..count {
+            let (want_col, col) = (take_col(&mut w)?, take_col(g)?);
+            if col.ty != want_col.ty || col.meta.nullable != want_col.meta.nullable {
+                return Ok(Some(format!(
+                    "column {ci}: expected {} {}, got {} {}",
+                    want_col.ty,
+                    null(want_col.meta.nullable),
+                    col.ty,
+                    null(col.meta.nullable),
+                )));
+            }
+        }
+        Ok(None)
+    })?;
+    first_difference.map_or(Ok(()), |d| Err(format!("Schema mismatch: {d}")))
 }
 
 #[cfg(test)]

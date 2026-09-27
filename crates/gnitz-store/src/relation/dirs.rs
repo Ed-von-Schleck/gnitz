@@ -36,6 +36,10 @@ pub(crate) fn ensure_dir(path: &str) -> Result<(), StoreError> {
         .map_err(|e| StoreError::storage(format!("create directory '{path}'"), e))
 }
 
+/// How long [`lock_data_dir`] waits out a held lock: a forked child holds its
+/// parent's lock until it execs or exits, so a free directory can read as held.
+const DIR_LOCK_RETRY_FOR: Duration = Duration::from_secs(2);
+
 /// How long [`lock_data_dir`] sleeps between attempts.
 const DIR_LOCK_RETRY_EVERY: Duration = Duration::from_millis(20);
 
@@ -45,9 +49,9 @@ pub struct DirLock {
     _file: fs::File,
 }
 
-/// Create and lock `base_dir`, retrying a held lock for `retry`, then set NOCOW
-/// on it and create its [`relations_dir`].
-pub fn lock_data_dir(base_dir: &str, retry: Duration) -> Result<DirLock, StoreError> {
+/// Create and lock `base_dir`, retrying a held lock for [`DIR_LOCK_RETRY_FOR`],
+/// then set NOCOW on it and create its [`relations_dir`].
+pub fn lock_data_dir(base_dir: &str) -> Result<DirLock, StoreError> {
     ensure_dir(base_dir)?;
     let path = format!("{base_dir}/{DIR_LOCK_FILENAME}");
     let file = fs::OpenOptions::new()
@@ -57,7 +61,7 @@ pub fn lock_data_dir(base_dir: &str, retry: Duration) -> Result<DirLock, StoreEr
         .truncate(false)
         .open(&path)
         .map_err(|e| StoreError::storage(format!("open data-directory lock '{path}'"), e.into()))?;
-    let deadline = Instant::now() + retry;
+    let deadline = Instant::now() + DIR_LOCK_RETRY_FOR;
     loop {
         match file.try_lock() {
             Ok(()) => break,

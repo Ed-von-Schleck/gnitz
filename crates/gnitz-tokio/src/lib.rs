@@ -117,10 +117,6 @@ impl AsyncClient {
     }
 
     /// Push a batch and resolve to its ingest LSN.
-    ///
-    /// A `WireStatus::SchemaMismatch` refusal is not retried here as the blocking
-    /// client retries it: a re-submit would reorder the push behind everything
-    /// sent since, and the spine already evicted the stale cache entry.
     pub async fn push(&self, tid: u64, schema: Arc<Schema>, batch: ZSetBatch) -> Result<u64, ClientError> {
         self.call(move |s| {
             s.submit(Request::Push {

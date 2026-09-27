@@ -25,6 +25,7 @@ use crate::runtime::w2m::{self, SalWake, W2mReceiver, W2mWriter, BOOT_READY_REQU
 use crate::runtime::wire as ipc;
 use crate::runtime::worker::WorkerProcess;
 use gnitz_store::relation::{Relation, Residency};
+use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Slot;
 
 // ---------------------------------------------------------------------------
@@ -33,8 +34,12 @@ use gnitz_store::storage::Slot;
 // ---------------------------------------------------------------------------
 
 /// Decode one committed group slot; one that does not decode fails the boot.
-fn decode_group_slot(msg: &SalMessage, data: &[u8]) -> Result<ipc::DecodedWire, String> {
-    ipc::decode_sal_slot(data).map_err(|e| {
+fn decode_group_slot(
+    msg: &SalMessage,
+    data: &[u8],
+    known: impl FnOnce(i64, &[u8]) -> Option<SchemaDescriptor>,
+) -> Result<ipc::DecodedWire, String> {
+    ipc::decode_sal_slot(data, known).map_err(|e| {
         format!(
             "SAL replay: corrupt block at offset={} lsn={} target={}: {e}",
             msg.base, msg.lsn, msg.target_id
@@ -59,7 +64,7 @@ fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Re
                 msg.base, msg.lsn
             ));
         };
-        let decoded = decode_group_slot(&msg, data)?;
+        let decoded = decode_group_slot(&msg, data, |_, _| None)?;
         let Some(batch) = decoded.data_batch.filter(|b| !b.is_empty()) else {
             continue;
         };
@@ -161,7 +166,7 @@ fn recover_from_sal(
         }
         let mut applied = false;
         for (_, data) in msg.slots_written().filter(|(w, _)| wanted.contains(w)) {
-            let decoded = decode_group_slot(&msg, data)?;
+            let decoded = decode_group_slot(&msg, data, |tid, record| catalog.known_decode(tid, record))?;
             let Some(batch) = decoded.data_batch.filter(|b| !b.is_empty()) else {
                 continue;
             };

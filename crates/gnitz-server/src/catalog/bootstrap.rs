@@ -1,9 +1,5 @@
 use super::*;
 
-/// How long the master waits out a held data-directory lock: a forked worker
-/// can still hold the lock it inherited just after its master exits.
-const DIR_LOCK_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// A master catalog with only its system families registered, their stores open.
 /// [`Self::replay`] registers the rest.
 pub(crate) struct UnreplayedCatalog(CatalogEngine);
@@ -44,7 +40,7 @@ impl CatalogEngine {
     /// stores.
     pub(crate) fn open_master(base_dir: &str, num_workers: u32) -> Result<UnreplayedCatalog, String> {
         // Before any store opens.
-        let dir_lock = lock_data_dir(base_dir, DIR_LOCK_RETRY_FOR)?;
+        let dir_lock = lock_data_dir(base_dir)?;
 
         let mut engine = CatalogEngine {
             registry: RelationRegistry::master(base_dir, num_workers, StoreConfig::from_env("GNITZ_")),
@@ -68,7 +64,7 @@ impl CatalogEngine {
             engine.enter_relation(
                 family.id(),
                 RelationKind::SystemCatalog,
-                family.schema(),
+                family.schema().pk_indices(),
                 &family.column_defs(),
                 RelFacts::default(),
             );

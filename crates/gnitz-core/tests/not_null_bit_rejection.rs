@@ -25,7 +25,7 @@ use gnitz_wire::control::peek_control_block;
 
 /// Ship `batch` as a PUSH, bypassing the client-side `ZSetBatch::validate` that
 /// `Session::submit` runs by writing the encoded frame to the socket itself —
-/// byte for byte the one `submit` would have built for a cold push. A scripted
+/// byte for byte the one `submit` would have built. A scripted
 /// peer, so it needs no spine at all.
 fn hostile_push(t: &mut ClientTransport, tid: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, String> {
     let flags = WireFlags {

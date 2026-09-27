@@ -33,7 +33,7 @@ fn simple() -> Vec<u8> {
         col(TypeCode::U64, "id", false),
         col(TypeCode::String, "a_rather_long_column_name", true),
     ];
-    encode(&cols, &[0])
+    encode(cols.iter().copied(), &[0])
 }
 
 #[test]
@@ -44,7 +44,7 @@ fn roundtrips_shape_names_and_pk_order() {
         col(TypeCode::String, "payload_name_over_twelve", true),
     ];
     // Declared order `(a, b)`, not column order `(b, a)`.
-    let record = encode(&cols, &[1, 0]);
+    let record = encode(cols.iter().copied(), &[1, 0]);
     let (got, pk) = decode_cols(&record).unwrap();
     assert_eq!(got, cols.to_vec());
     assert_eq!(pk.as_slice(), &[1, 0]);
@@ -70,7 +70,7 @@ fn column_meta_survives_the_record() {
     }
     // Column 0 is the key, so it must not be nullable: swap it for a plain one.
     cols[0] = col(TypeCode::U64, "k", false);
-    let record = encode(&cols, &[0]);
+    let record = encode(cols.iter().copied(), &[0]);
     assert_eq!(decode_cols(&record).unwrap().0, cols);
 }
 
@@ -80,7 +80,7 @@ fn column_meta_survives_the_record() {
 fn a_five_column_pk_decodes_to_five_indices() {
     let cols = all_key_cols(MAX_PK_COLUMNS);
     let pk: Vec<u32> = (0..MAX_PK_COLUMNS as u32).collect();
-    let record = encode(&cols, &pk);
+    let record = encode(cols.iter().copied(), &pk);
     assert_eq!(decode_cols(&record).unwrap().1.as_slice(), pk.as_slice());
 }
 
@@ -89,7 +89,7 @@ fn a_five_column_pk_decodes_to_five_indices() {
 fn a_pk_wider_than_max_pk_columns_is_refused() {
     let wide_pk: Vec<u32> = (0..=MAX_PK_COLUMNS as u32).collect();
     assert_eq!(
-        decode_err(&encode(&all_key_cols(MAX_PK_COLUMNS + 1), &wide_pk)),
+        decode_err(&encode(all_key_cols(MAX_PK_COLUMNS + 1).into_iter(), &wide_pk)),
         format!(
             "schema record: pk column count {} exceeds {MAX_PK_COLUMNS}",
             MAX_PK_COLUMNS + 1
@@ -197,5 +197,76 @@ fn the_record_layout_is_fixed() {
         18, 0b11, 9, 25, 0, 0, 0,    // DECIMAL, nullable|hidden, scale 9
     ];
     want.extend_from_slice(long.as_bytes());
-    assert_eq!(encode(&cols, &[1, 0]), want);
+    assert_eq!(encode(cols.iter().copied(), &[1, 0]), want);
+}
+
+/// Each difference `check_same_types` compares is refused, and each names itself
+/// distinctly — pairwise distinctness tests the message without pinning prose.
+/// What it does not compare (names, the hidden flag) is admitted.
+#[test]
+fn check_same_types_names_each_mismatch_distinctly() {
+    let two_cols =
+        |second: SchemaBlockCol<'static>| encode([col(TypeCode::U64, "id", false), second].into_iter(), &[0]);
+    let want = two_cols(col(TypeCode::I64, "v", false));
+    assert_eq!(check_same_types(&want, &want), Ok(()), "a record matches itself");
+
+    let renamed_and_hidden = two_cols(SchemaBlockCol {
+        meta: ColMeta { nullable: false, hidden: true },
+        ..col(TypeCode::I64, "renamed", false)
+    });
+    assert_eq!(
+        check_same_types(&renamed_and_hidden, &want),
+        Ok(()),
+        "names and the hidden flag are not compared"
+    );
+
+    let cases = [
+        ("count", encode([col(TypeCode::U64, "id", false)].into_iter(), &[0])),
+        (
+            "pk",
+            encode(
+                [col(TypeCode::U64, "id", false), col(TypeCode::I64, "v", false)].into_iter(),
+                &[1],
+            ),
+        ),
+        ("type", two_cols(col(TypeCode::F64, "v", false))),
+        ("nullable", two_cols(col(TypeCode::I64, "v", true))),
+    ];
+    let mut msgs: Vec<String> = cases
+        .iter()
+        .map(|(what, got)| check_same_types(got, &want).expect_err(what))
+        .collect();
+
+    // Scale alone: the one difference a decoded descriptor cannot see.
+    let decimal = |scale| {
+        encode(
+            [
+                col(TypeCode::U64, "id", false),
+                SchemaBlockCol {
+                    ty: ColType::decimal(scale),
+                    ..col(TypeCode::U64, "d", false)
+                },
+            ]
+            .into_iter(),
+            &[0],
+        )
+    };
+    assert_eq!(check_same_types(&decimal(4), &decimal(4)), Ok(()));
+    msgs.push(check_same_types(&decimal(2), &decimal(4)).expect_err("scale"));
+
+    for i in 0..msgs.len() {
+        for j in (i + 1)..msgs.len() {
+            assert_ne!(msgs[i], msgs[j], "cases {i} and {j} report the same message");
+        }
+    }
+}
+
+/// A `got` that is not byte-equal to `want` is validated: a truncated one is a
+/// decode error, not a match.
+#[test]
+fn check_same_types_refuses_a_malformed_record() {
+    let want = simple();
+    let truncated = &want[..want.len() - 1];
+    let err = check_same_types(truncated, &want).expect_err("a truncated record");
+    assert!(err.starts_with("schema record: "), "{err}");
 }

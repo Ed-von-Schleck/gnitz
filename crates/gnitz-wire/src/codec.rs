@@ -68,29 +68,40 @@ impl<'a> Reader<'a> {
         Reader { buf, off: 0 }
     }
 
+    #[inline]
     pub fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        let end = self.off.checked_add(n).ok_or("length overflow")?;
-        if end > self.buf.len() {
-            return Err(format!(
-                "truncated (need {n} bytes at offset {}, {} remain)",
-                self.off,
-                self.buf.len() - self.off
-            ));
+        match self.buf.get(self.off..).and_then(|rest| rest.get(..n)) {
+            Some(s) => {
+                self.off += n;
+                Ok(s)
+            }
+            None => Err(self.truncated(n)),
         }
-        let s = &self.buf[self.off..end];
-        self.off = end;
-        Ok(s)
     }
 
+    #[cold]
+    #[inline(never)]
+    fn truncated(&self, n: usize) -> String {
+        format!(
+            "truncated (need {n} bytes at offset {}, {} remain)",
+            self.off,
+            self.buf.len() - self.off
+        )
+    }
+
+    #[inline]
     pub fn u8(&mut self) -> Result<u8, String> {
         Ok(self.take(1)?[0])
     }
+    #[inline]
     pub fn u16(&mut self) -> Result<u16, String> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
     }
+    #[inline]
     pub fn u32(&mut self) -> Result<u32, String> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
+    #[inline]
     pub fn u64(&mut self) -> Result<u64, String> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
@@ -108,6 +119,7 @@ impl<'a> Reader<'a> {
     }
 
     /// A flag byte whose bits all lie within `defined`.
+    #[inline]
     pub fn flags(&mut self, defined: u8) -> Result<u8, String> {
         let f = self.u8()?;
         if f & !defined != 0 {
@@ -119,6 +131,7 @@ impl<'a> Reader<'a> {
     /// A `u32`-length-prefixed byte section — the inverse of [`Writer::bytes32`].
     /// The length is bounds-checked by `take`, so a hostile prefix is a clean
     /// `Err` rather than an over-large allocation.
+    #[inline]
     pub fn bytes32(&mut self) -> Result<&'a [u8], String> {
         let n = self.u32()? as usize;
         self.take(n)

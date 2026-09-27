@@ -58,15 +58,13 @@ fn a_long_column_name_survives_the_record() {
 #[test]
 fn a_pk_wider_than_the_client_codec_is_rejected() {
     let n = PK_LIST_MAX_COLS + 1;
-    let cols: Vec<SchemaBlockCol> = (0..n)
-        .map(|_| SchemaBlockCol {
-            ty: gnitz_wire::ColType::of(TypeCode::U64),
-            meta: ColMeta::default(),
-            name: b"k",
-        })
-        .collect();
+    let cols = (0..n).map(|_| SchemaBlockCol {
+        ty: gnitz_wire::ColType::of(TypeCode::U64),
+        meta: ColMeta::default(),
+        name: b"k",
+    });
     let pk: Vec<u32> = (0..n as u32).collect();
-    let block = gnitz_wire::schema_block::encode(&cols, &pk);
+    let block = gnitz_wire::schema_block::encode(cols, &pk);
     assert!(
         gnitz_wire::schema_block::decode(&block, |_| Ok(())).is_ok(),
         "the codec admits it"
@@ -78,15 +76,13 @@ fn a_pk_wider_than_the_client_codec_is_rejected() {
 /// duplicate PK list is a schema rule, refused here.
 #[test]
 fn an_empty_out_of_range_or_duplicate_pk_is_rejected() {
-    let cols: Vec<SchemaBlockCol> = (0..3)
-        .map(|_| SchemaBlockCol {
-            ty: gnitz_wire::ColType::of(TypeCode::U64),
-            meta: ColMeta::default(),
-            name: b"k",
-        })
-        .collect();
+    let cols = (0..3).map(|_| SchemaBlockCol {
+        ty: gnitz_wire::ColType::of(TypeCode::U64),
+        meta: ColMeta::default(),
+        name: b"k",
+    });
     for pk in [&[][..], &[3], &[1, 1]] {
-        let block = gnitz_wire::schema_block::encode(&cols, pk);
+        let block = gnitz_wire::schema_block::encode(cols.clone(), pk);
         assert!(
             gnitz_wire::schema_block::decode(&block, |_| Ok(())).is_ok(),
             "{pk:?}: the codec admits it"

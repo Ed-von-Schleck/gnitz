@@ -44,8 +44,8 @@ fn client_with_table(target: &str) -> (GnitzClient, String, u64, std::sync::Arc<
     (client, sn, tid, schema)
 }
 
-/// Ship one cold PUSH frame over a raw transport, bypassing `Session`'s schema
-/// cache — these tests drive the wire, not the client's fast paths.
+/// Ship one PUSH frame over a raw transport, bypassing `Session` — these tests
+/// drive the wire, not the client.
 fn send_push(
     t: &mut ClientTransport,
     tid: u64,

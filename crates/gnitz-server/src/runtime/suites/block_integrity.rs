@@ -18,7 +18,7 @@ fn schema_record_4col() -> Vec<u8> {
         SchemaColumn::new(TypeCode::F64, true),
     ];
     let schema = SchemaDescriptor::new(&cols, &[0]);
-    crate::catalog::encode_schema_block(&schema)
+    gnitz_store::schema::encode_schema_block(&schema)
 }
 
 // ---------------------------------------------------------------------------

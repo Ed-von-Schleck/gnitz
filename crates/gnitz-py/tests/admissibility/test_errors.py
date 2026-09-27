@@ -7,6 +7,8 @@ The engine — not the SQL planner — has to hold these, because every path bel
 is a shipped client binding that validates nothing on the way in.
 """
 
+from decimal import Decimal
+
 import pytest
 import gnitz
 from _read import bag
@@ -16,20 +18,36 @@ from _uid import uid
 _NOT_WRITABLE = "is not writable"
 
 
-@pytest.mark.parametrize("warm", [False, True], ids=["cold", "warm"])
-def test_a_push_whose_pk_type_disagrees_is_rejected(client, schema_name, warm):
-    """`validate_schema_match` runs on every push carrying a schema descriptor;
-    which mismatches it distinguishes is pinned in Rust. What only an end-to-end
-    push can show is that the descriptor reaches it on the cold path AND on the
-    warm path, where a cached schema once let the push skip validation and
-    reinterpret a U64-encoded PK as I64, corrupting at rest."""
+def test_a_push_whose_pk_type_disagrees_is_rejected(client, schema_name):
+    """A push whose schema lays out a U64 PK as I64 is refused, not reinterpreted
+    at rest; which mismatches the gate distinguishes is pinned in Rust."""
     tid = client.create_table(schema_name, "t", KV)
-    if warm:
-        client.scan(tid)   # caches the table schema client-side
     signed_pk = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.I64), KV.columns[1]], [0])
     with pytest.raises(gnitz.GnitzError):
         client.push(tid, gnitz.ZSetBatch(signed_pk).extend([{"pk": 1, "val": 42}]))
     assert bag(client.scan(tid)) == {}
+
+
+def test_a_push_whose_decimal_scale_disagrees_is_rejected(client, schema_name):
+    """A DECIMAL's stored integer means a different number at every scale, so a
+    push encoded at scale 2 onto a scale-4 column would read `1.50` back as
+    `0.0150`. The gate compares the scale; the same push at scale 4 lands."""
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, d DECIMAL(10,4) NOT NULL)",
+        schema_name=schema_name)
+    tid, _ = client.resolve_table(schema_name, "t")
+
+    def at_scale(scale):
+        schema = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.I64),
+                               gnitz.ColumnDef("d", gnitz.TypeCode.DECIMAL, scale=scale)], [0])
+        return gnitz.ZSetBatch(schema).extend([{"pk": 1, "d": Decimal("1.50")}])
+
+    with pytest.raises(gnitz.GnitzError, match="Schema mismatch"):
+        client.push(tid, at_scale(2))
+    assert bag(client.scan(tid)) == {}
+
+    client.push(tid, at_scale(4))
+    assert bag(client.scan(tid), "pk", "d") == {(1, Decimal("1.5000")): 1}
 
 
 def test_writes_to_a_view_are_rejected_and_change_nothing(client, schema_name):
@@ -37,9 +55,9 @@ def test_writes_to_a_view_are_rejected_and_change_nothing(client, schema_name):
     or delete addressed to one would commit rows its circuit never produced. SQL
     refuses a view target in the binder; the raw API reaches only the server,
     since the client's schema cache carries no relation kind. It is one guard on
-    the cold path, the warm path (schema omitted after a scan) and the
-    empty-batch arm alike — so a client bug producing an empty batch fails
-    instead of being masked by the no-op ACK a base table still gives."""
+    every write, the empty-batch arm included — so a client bug producing an
+    empty batch fails instead of being masked by the no-op ACK a base table
+    still gives."""
     sn = schema_name
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
@@ -49,10 +67,6 @@ def test_writes_to_a_view_are_rejected_and_change_nothing(client, schema_name):
     vid, v_schema = client.resolve_table(sn, "v")
     batch = gnitz.ZSetBatch(v_schema).extend([{"pk": 999, "val": 999}])
 
-    with pytest.raises(gnitz.GnitzError, match=_NOT_WRITABLE):
-        client.push(vid, batch)
-    assert bag(client.scan(vid)) == {(1, 100): 1}
-    # Warm path: the scan above cached the view schema client-side.
     for write in (lambda: client.push(vid, batch),
                   lambda: client.delete(vid, v_schema, [1]),
                   lambda: client.push(vid, gnitz.ZSetBatch(v_schema))):

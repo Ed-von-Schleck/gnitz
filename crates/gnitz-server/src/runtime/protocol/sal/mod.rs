@@ -498,13 +498,14 @@ impl SalMessageKind {
     /// Whether a slot of this kind still needs the group's schema block when it
     /// carries no rows — the *handler's* behaviour on an empty slot decides, so
     /// this is per-kind and not per-writer: an `ExchangeRelay` builds its batch
-    /// from the block alone, a `Push` reaches a no-op, a `HasPk` never has one.
+    /// from the block alone, a `Push` reaches a no-op, a `HasPk` never has one,
+    /// and a `Backfill` reads its source's schema off its own catalog.
     fn schema_survives_a_rowless_slot(self) -> bool {
         use SalMessageKind::*;
         match self {
-            Push | HasPk => false,
-            Scan | Shutdown | Flush | FlushEph | DdlSync | ExchangeRelay | Backfill | UniquePreflight | Tick
-            | ScanSpec | DeltaRead => true,
+            Push | HasPk | Backfill => false,
+            Scan | Shutdown | Flush | FlushEph | DdlSync | ExchangeRelay | UniquePreflight | Tick | ScanSpec
+            | DeltaRead => true,
         }
     }
 

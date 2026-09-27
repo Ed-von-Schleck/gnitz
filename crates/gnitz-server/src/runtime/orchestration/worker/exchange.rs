@@ -55,7 +55,7 @@ impl WorkerProcess {
 
     /// Publish this worker's exchange partition as a train of frames.
     fn publish_exchange(&self, view_id: i64, batch: &Batch, source_id: i64, pad: bool) {
-        let block = crate::catalog::encode_schema_block(batch.schema());
+        let block = gnitz_store::schema::encode_schema_block(batch.schema());
         let sent = reply::send_train(
             &self.w2m_writer,
             W2M_EXCHANGE_RING_ID,

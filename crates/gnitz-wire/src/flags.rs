@@ -209,8 +209,6 @@ wire_enum! {
         #[default]
         Ok = 0,
         Error = 1,
-        /// A warm push's schema version is stale: evict the cached schema, push cold.
-        SchemaMismatch = 2,
         /// An OCC precondition failed. Nothing was written, so it is retryable.
         TxnConflict = 3,
         /// A delta cursor below a worker's retention floor: re-read at `after_tick = 0`.

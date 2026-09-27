@@ -62,15 +62,16 @@ def test_every_insert_acked_across_an_add_column_reads_back(client, schema_name,
         {(k, k, c): 1 for k, c in acked.items()}
 
 
-def test_a_warm_push_decoded_before_an_alter_is_refused(dedicated_server):
-    """A warm push decodes its batch against the catalog's descriptor before it
-    takes the catalog read lock, and the lock is writer-preferring, so an ALTER
-    queued in between is applied first and the push resumes holding a descriptor
-    laid out for the old width. It must be refused, not committed.
+def test_a_push_decoded_before_an_alter_is_refused(dedicated_server):
+    """A push matches its schema record against the catalog's and decodes its
+    batch before it takes the catalog read lock, and the lock is
+    writer-preferring, so an ALTER queued in between is applied first and the
+    push resumes holding a batch laid out for the old width. The re-check under
+    the lock must refuse it, not commit it.
 
-    `GNITZ_INJECT_PUSH_HOLD_FOR_DDL` parks the server's first push between its
-    decode and the lock, holding no lock, until a DDL moves its target's schema
-    version. The ALTER is issued once the pusher is at its push."""
+    `GNITZ_INJECT_PUSH_HOLD_FOR_DDL` parks the server's first matched push
+    between its decode and the lock, holding no lock, until a DDL replaces its
+    target's schema record. The ALTER is issued once the pusher is at its push."""
     target = dedicated_server({"GNITZ_INJECT_PUSH_HOLD_FOR_DDL": "1"}).target
     with gnitz.connect(target) as client:
         client.create_schema("s")
@@ -80,7 +81,6 @@ def test_a_warm_push_decoded_before_an_alter_is_refused(dedicated_server):
 
         def pusher():
             with gnitz.connect(target) as conn:
-                conn.scan(tid)  # warms the schema cache, so the push ships no schema block
                 batch = gnitz.ZSetBatch(KV).append(pk=1, val=7)
                 pushing.set()
                 try:

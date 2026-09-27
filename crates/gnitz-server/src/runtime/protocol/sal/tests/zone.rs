@@ -487,8 +487,12 @@ impl TestLog {
         (0..NW as u32)
             .rev()
             .find(|&w| {
-                msg.slot(w)
-                    .is_some_and(|b| crate::runtime::wire::decode_sal_slot(b).unwrap().data_batch.is_some())
+                msg.slot(w).is_some_and(|b| {
+                    crate::runtime::wire::decode_sal_slot(b, |_, _| None)
+                        .unwrap()
+                        .data_batch
+                        .is_some()
+                })
             })
             .expect("some slot carries rows")
     }

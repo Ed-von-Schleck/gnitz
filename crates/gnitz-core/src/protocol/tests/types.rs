@@ -247,7 +247,7 @@ fn test_schema_ne_type_code() {
     assert_ne!(a, b);
 }
 
-// --- types_match (warm-push guard) tests ---
+// --- types_match tests ---
 
 fn one_col(name: &str, tc: TypeCode, nullable: bool) -> Schema {
     Schema {
@@ -258,8 +258,7 @@ fn one_col(name: &str, tc: TypeCode, nullable: bool) -> Schema {
 
 #[test]
 fn types_match_false_on_pk_type_u64_vs_i64() {
-    // The core bug: a U64-pk batch against an I64 table must NOT take the
-    // warm path (different OPK image for the same logical value).
+    // Same width, different OPK image for the same logical value.
     let u = one_col("pk", TypeCode::U64, false);
     let i = one_col("pk", TypeCode::I64, false);
     assert!(!u.types_match(&i));
@@ -267,8 +266,6 @@ fn types_match_false_on_pk_type_u64_vs_i64() {
 
 #[test]
 fn types_match_ignores_column_names() {
-    // A name-only difference must still take the warm fast path: the
-    // server validator ignores names.
     let a = one_col("pk", TypeCode::U64, false);
     let b = one_col("id", TypeCode::U64, false);
     assert!(a.types_match(&b));

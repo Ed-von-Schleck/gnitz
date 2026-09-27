@@ -40,8 +40,6 @@ pyo3::create_exception!(_native, GnitzMirrorPoisonedError, GnitzError);
 pyo3::create_exception!(_native, GnitzNotFoundError, GnitzError);
 // WireStatus::IntegrityViolation.
 pyo3::create_exception!(_native, GnitzIntegrityError, GnitzError);
-// WireStatus::SchemaMismatch.
-pyo3::create_exception!(_native, GnitzSchemaMismatchError, GnitzError);
 
 /// Wrap any `Display` error as a plain `GnitzError`.
 pub(crate) fn gnitz_err(e: impl std::fmt::Display) -> PyErr {
@@ -60,7 +58,6 @@ pub(crate) fn client_err(e: ClientError) -> PyErr {
             WireStatus::SalFull => GnitzSalFullError::new_err(f.text),
             WireStatus::NotFound => GnitzNotFoundError::new_err(f.text),
             WireStatus::IntegrityViolation => GnitzIntegrityError::new_err(f.text),
-            WireStatus::SchemaMismatch => GnitzSchemaMismatchError::new_err(f.text),
             WireStatus::Ok | WireStatus::Error => GnitzError::new_err(f.text),
         },
         ClientError::Interrupted(inner) => match inner.downcast_ref::<PyErr>() {
@@ -141,10 +138,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("GnitzNotFoundError", m.py().get_type::<GnitzNotFoundError>())?;
     m.add("GnitzIntegrityError", m.py().get_type::<GnitzIntegrityError>())?;
-    m.add(
-        "GnitzSchemaMismatchError",
-        m.py().get_type::<GnitzSchemaMismatchError>(),
-    )?;
     // System-table IDs — single-sourced from gnitz_wire (delegating codec, not
     // a re-typed copy), as is the table behind `type_codes()`.
     // Only the ids something addresses a relation by are exported.

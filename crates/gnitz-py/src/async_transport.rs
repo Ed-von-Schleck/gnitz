@@ -186,9 +186,6 @@ impl PyAsyncTransport {
         Ok(slf)
     }
 
-    /// The batch packs warm against the session's own cache; a stale stamp's
-    /// mismatch fails this slot with `GnitzSchemaMismatchError`, and the caller
-    /// re-issues.
     fn push(slf: &Bound<'_, Self>, target_id: u64, batch: PyRef<'_, PyZSetBatch>) -> PyResult<Py<PyAny>> {
         Self::submit(
             slf,

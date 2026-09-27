@@ -17,7 +17,7 @@ use crate::protocol::transport::Next;
 use crate::protocol::wal_block::decode_wal_block_into;
 use crate::protocol::{
     encode_ddl_txn, encode_frame, encode_push_txn, hello_handshake, ClientTransport, ClientVerb, ProtocolError,
-    PushFamily, Schema, WireConflictMode, WireFlags, WireStatus, ZSetBatch,
+    PushFamily, Schema, WireConflictMode, WireFlags, ZSetBatch,
 };
 use gnitz_wire::control::{peek_control_block, ControlHeader, DecodedControl};
 use gnitz_wire::txn_frame;
@@ -174,10 +174,8 @@ pub enum Request<'a> {
     /// by-name resolve names no id, so nothing is absorbed under the *requested*
     /// target; the reply installs the schema under the live id it carries.
     Resolve(RelTarget<'a>),
-    /// PUSH — correlated like `Read`, and the one variant that chooses the
-    /// warm (schema-less) encoding against the cold one. The choice is the
-    /// cache's alone: a mismatch evicts the entry in `feed`, so a re-submit
-    /// finds nothing warm and encodes cold with no flag to carry it.
+    /// PUSH — correlated like `Read`. The frame always carries `schema`'s
+    /// record, so what the server admits depends on nothing this session caches.
     Push {
         target_id: u64,
         schema: &'a Schema,
@@ -414,7 +412,7 @@ impl Ended {
 
 /// A protocol session: the transport plus all per-connection protocol state
 /// (the schema LRU, the pending queue and reply accumulator, and
-/// the warm/cold packing, continuation reassembly, cache absorption, and
+/// the read stamps, continuation reassembly, cache absorption, and
 /// status→error policy that read/write them). Exactly one owner of that
 /// state — the sync [`crate::GnitzClient`] holds one, and so does each async
 /// executor. Because the session owns the cache, no `LruCache` is threaded as
@@ -557,30 +555,17 @@ impl Session {
                 // server checks the same things. Here so no driver has to
                 // remember to.
                 batch.validate(schema)?;
-                // A version proves the catalog has not changed, not that the
-                // caller encoded under the same types — and a schema-less frame
-                // under mismatched types is reinterpreted silently at rest.
-                let version = match self.cached_hint(target_id) {
-                    Some((cached, v)) if v != 0 && schema.types_match(&cached) => v,
-                    _ => 0,
-                };
                 // The push verb marks the frame as a push independent of data
                 // presence, so an empty batch (a legitimate empty Z-set delta)
                 // is ACKed as a no-op push instead of being mistaken for a scan.
                 let flags = WireFlags {
                     verb: ClientVerb::Push,
                     conflict_mode: mode,
-                    schema_version: version,
                     ..Default::default()
                 };
                 let hdr = ControlHeader { flags, target_id, ..Default::default() };
                 (
-                    encode_frame(
-                        hdr,
-                        &[],
-                        (version == 0).then(|| encode_schema_block(schema)).as_deref(),
-                        Some(batch),
-                    ),
+                    encode_frame(hdr, &[], Some(&encode_schema_block(schema)), Some(batch)),
                     SlotKind::Push { tid: target_id },
                 )
             }
@@ -825,11 +810,6 @@ impl Session {
                     let failed = Err(ClientError::Refused(fault));
                     return Ok(Some(fill_poll_position(pending, accum, done, positions, failed)));
                 }
-            }
-            // A rejected warm stamp, and the mismatch reply carries no block to
-            // refresh it with: evict, so the next push is cold.
-            if let (WireStatus::SchemaMismatch, SlotKind::Push { tid }) = (fault.status, &head.kind) {
-                schema_cache.pop(tid);
             }
             complete_head(pending, accum, Err(ClientError::Refused(fault)), done);
             return Ok(None);

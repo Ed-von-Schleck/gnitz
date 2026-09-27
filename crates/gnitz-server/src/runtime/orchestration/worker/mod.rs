@@ -256,8 +256,11 @@ impl WorkerProcess {
     /// Decode one SAL group's slot into an owned [`Request`]. The single decode
     /// point: both dispatchers and every parked request come through here.
     fn decode_request(&mut self, msg: &SalMessage, wire: &'static [u8]) -> Request {
+        // The kinds the master frames with their target's catalog record.
+        let catalog_record = matches!(msg.kind, SalMessageKind::Push | SalMessageKind::DdlSync);
+        let known = |tid, record: &[u8]| catalog_record.then(|| self.cat().known_decode(tid, record)).flatten();
         // Fail-stop: a dropped group diverges this worker from the master.
-        match ipc::decode_sal_slot(wire) {
+        match ipc::decode_sal_slot(wire, known) {
             Ok(w) => Request {
                 kind: msg.kind,
                 request_id: msg.request_id,

@@ -229,33 +229,22 @@ async def test_a_dropped_connection_frees_its_socket(server):
 
 
 # ---------------------------------------------------------------------------
-# The mismatch a stale stamp draws
-#
-# That an async push packs warm at all is what makes the mismatch below
-# reachable: a cold frame carries its own schema block and never draws one.
+# A rename between encode and ingest
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_stale_stamp_pushes_fail_and_the_connection_recovers(aconn, client, schema_name):
-    """A column rename bumps the relation's schema version, so every push
-    already encoded at the stale stamp bounces. Each future fails with the
-    mismatch, none of their rows is committed, and the connection stays usable:
-    the eviction makes the next push cold, and it lands."""
+async def test_pushes_encoded_before_a_rename_land(aconn, client, schema_name):
+    """A column rename changes names only, so a push encoded under the old names
+    still lays out the table's columns: every such push lands, and the rows read
+    back under the new name."""
     tid = client.create_table(schema_name, "t", KV)
-    # Warm the async connection's cache under the current version.
     await aconn.push(tid, _batch([{"pk": 1, "val": 1}]))
 
     client.execute_sql("ALTER TABLE t RENAME COLUMN val TO amount", schema_name=schema_name)
 
-    results = await asyncio.gather(
-        *[aconn.push(tid, _batch([{"pk": 10 + i, "val": 100 + i}])) for i in range(3)],
-        return_exceptions=True)
-    assert all(isinstance(r, gnitz.GnitzSchemaMismatchError) for r in results), results
-
-    # Nothing they carried was committed — a mismatched push returns before the
-    # commit path. Same connection, no reconnect: the next push is cold and lands.
-    await aconn.push(tid, _batch([{"pk": 20, "val": 200}]))
-    assert bag(await aconn.scan(tid), "pk", "amount") == {(1, 1): 1, (20, 200): 1}
+    await asyncio.gather(*[aconn.push(tid, _batch([{"pk": 10 + i, "val": 100 + i}])) for i in range(3)])
+    assert bag(await aconn.scan(tid), "pk", "amount") == \
+        {(1, 1): 1, (10, 100): 1, (11, 101): 1, (12, 102): 1}
 
 
 # ---------------------------------------------------------------------------

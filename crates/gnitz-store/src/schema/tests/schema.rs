@@ -511,7 +511,7 @@ fn decode_schema_block_rejects_a_nullable_or_ineligible_pk_column() {
         name: b"k",
     };
     for bad in [col(TypeCode::U64, true), col(TypeCode::F64, false)] {
-        let record = gnitz_wire::schema_block::encode(&[bad], &[0]);
+        let record = gnitz_wire::schema_block::encode([bad].into_iter(), &[0]);
         assert!(
             gnitz_wire::schema_block::decode(&record, |_| Ok(())).is_ok(),
             "the record itself is well-formed"
@@ -532,11 +532,31 @@ fn decode_schema_block_rejects_an_empty_out_of_range_or_duplicate_pk() {
         name: b"k",
     };
     for pk in [&[][..], &[3], &[1, 1]] {
-        let record = gnitz_wire::schema_block::encode(&[col; 3], pk);
+        let record = gnitz_wire::schema_block::encode([col; 3].into_iter(), pk);
         assert!(
             gnitz_wire::schema_block::decode(&record, |_| Ok(())).is_ok(),
             "{pk:?}: the record itself is well-formed"
         );
         assert!(decode_schema_block(&record).is_err(), "{pk:?}");
+    }
+}
+
+#[test]
+fn schema_roundtrip_wire_preserves_pk_order() {
+    let u64c = SchemaColumn::new(TypeCode::U64, false);
+    let u32c = SchemaColumn::new(TypeCode::U32, false);
+    let cases: &[(&[SchemaColumn], &[u32])] = &[
+        (&[u64c, u64c], &[0, 1]),
+        (&[u64c, u64c], &[1, 0]),
+        (&[u32c, u32c, u32c, u32c], &[0, 1, 2, 3]),
+    ];
+    for &(cols, pk_indices) in cases {
+        let original = SchemaDescriptor::new(cols, pk_indices);
+        let block = encode_schema_block(&original);
+        let decoded = decode_schema_block(&block).unwrap();
+        assert!(
+            original == decoded,
+            "pk_indices {pk_indices:?} did not survive wire round-trip",
+        );
     }
 }

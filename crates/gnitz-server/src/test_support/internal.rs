@@ -22,12 +22,6 @@ pub fn col_def(name: &str, type_code: TypeCode) -> ColumnDef {
     ColumnDef::new(name, ColType::of(type_code))
 }
 
-/// Column defs carrying just the names, for a test that needs a *named* schema
-/// block. Type and nullability come off the descriptor, so only `name` matters.
-pub fn named_col_defs<S: AsRef<str>>(names: &[S]) -> Vec<ColumnDef> {
-    names.iter().map(|n| col_def(n.as_ref(), TypeCode::U64)).collect()
-}
-
 /// A plain non-nullable UUID column.
 pub fn uuid_def(name: &str) -> ColumnDef {
     col_def(name, TypeCode::UUID)

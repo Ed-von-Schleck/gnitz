@@ -10,6 +10,9 @@
 
 use std::borrow::Cow;
 
+use gnitz_wire::schema_block::{ColMeta, SchemaBlockCol};
+use gnitz_wire::ColType;
+
 /// Why a store-side operator constructor refused the parameters it was handed —
 /// one vocabulary for all of them, so the constructor rather than each caller
 /// owns the wording of its own trust boundary.
@@ -857,6 +860,17 @@ pub fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, String> {
         Ok(())
     })?;
     SchemaDescriptor::try_new(&cols[..n], pk.as_slice())
+}
+
+/// Encode `schema`'s physical column shape — the inverse of
+/// [`decode_schema_block`]: no names, no hidden flag, every scale zero.
+pub fn encode_schema_block(schema: &SchemaDescriptor) -> Vec<u8> {
+    let cols = schema.columns[..schema.num_columns()].iter().map(|c| SchemaBlockCol {
+        ty: ColType::of(c.type_code),
+        meta: ColMeta { nullable: c.nullable, hidden: false },
+        name: b"",
+    });
+    gnitz_wire::schema_block::encode(cols, schema.pk_indices())
 }
 
 /// The delta store's stamp column: the `_tick` round number, leading the delta

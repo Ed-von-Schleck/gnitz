@@ -100,7 +100,7 @@ fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, B
             family.name()
         ));
     }
-    let batch = ipc::decode_client_frame(frame, ctrl, Some(family.schema()))
+    let batch = ipc::decode_client_frame(frame, ctrl, Some(family.schema()), ipc::unknown)
         .map_err(|e| format!("family {tid} decode error: {e}"))?
         .data_batch
         .expect("a DDL_TXN item carries a data block");

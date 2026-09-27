@@ -200,11 +200,9 @@ impl Schema {
         Ok(s)
     }
 
-    /// Structural type-equality used by the warm-push guard. Mirrors the
-    /// server's `validate_schema_match` field set: column count, per-column
-    /// `type_code`, `pk_cols`, and per-column nullability. Deliberately does
-    /// NOT compare column *names* (the server validator does not), so a
-    /// name-only difference still takes the warm fast path.
+    /// Whether `self` and `other` have the same physical layout: column count,
+    /// `pk_cols`, and per column its type code and nullability. Names, the
+    /// hidden flag and a DECIMAL's scale are not compared.
     pub fn types_match(&self, other: &Schema) -> bool {
         self.columns.len() == other.columns.len()
             && self.pk_cols == other.pk_cols

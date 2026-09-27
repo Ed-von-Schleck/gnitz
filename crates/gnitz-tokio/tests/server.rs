@@ -204,9 +204,9 @@ fn syscall_count_child() {
 fn one_writev_per_burst() {
     let srv = ServerHandle::start_with_env(1, &[]);
     let (_c, tid, _s, _sn) = table(srv.sock_path());
-    // Every push here is cold — the child connects fresh and never resolves — so
-    // the burst stays within one writev quantum; a larger `n`, or a warm or
-    // control-only burst, can legitimately move the count.
+    // Every push carries its schema record, which sizes the frames so the burst
+    // stays within one writev quantum; a larger `n`, or a control-only burst, can
+    // legitimately move the count.
     let n = 200usize;
     let Some(counts) = strace_test(
         "syscall_count_child",

@@ -10,7 +10,7 @@
 //! non-PK columns is served by the full scan narrowed to the walk's rows.
 
 use gnitz_core::{Invalidate, MirrorError, Schema};
-use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_store::schema::SchemaDescriptor;
 
 use crate::handle::Mirror;
 
@@ -59,17 +59,3 @@ pub(crate) fn descriptor_of_block(block: &[u8]) -> Result<SchemaDescriptor, Mirr
     gnitz_store::schema::decode_schema_block(block)
         .map_err(|e| MirrorError::Engine(format!("mirror: schema record: {e}")))
 }
-
-/// The engine descriptor a client `Schema` denotes.
-pub(crate) fn descriptor_of(schema: &Schema) -> Result<SchemaDescriptor, MirrorError> {
-    let cols: Vec<SchemaColumn> = schema
-        .columns
-        .iter()
-        .map(|c| SchemaColumn::new(c.ty.tc, c.is_nullable))
-        .collect();
-    SchemaDescriptor::try_new(&cols, &schema.pk_cols).map_err(|e| MirrorError::Engine(format!("mirror: schema: {e}")))
-}
-
-#[cfg(test)]
-#[path = "tests/register.rs"]
-mod tests;

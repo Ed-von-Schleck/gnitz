@@ -55,7 +55,7 @@ impl CatalogEngine {
             self.registry.slot().of
         );
         self.registry.register(RelationSpec { id, kind, schema })?;
-        self.enter_relation(id, kind, &schema, &col_defs, facts);
+        self.enter_relation(id, kind, schema.pk_indices(), &col_defs, facts);
         // Derived, not stored: every process builds the same FK circuits from the same
         // column records.
         for ci in self.fk_circuit_cols(id) {
@@ -72,7 +72,7 @@ impl CatalogEngine {
         &mut self,
         id: i64,
         kind: RelationKind,
-        schema: &SchemaDescriptor,
+        pk: &[u32],
         defs: &[ColumnDef],
         facts: RelFacts,
     ) {
@@ -92,7 +92,7 @@ impl CatalogEngine {
         }
         self.caches
             .relations
-            .insert(id, RelationEntry::new(schema, defs, fks, facts));
+            .insert(id, RelationEntry::new(pk, defs, fks, facts));
     }
 
     /// The FK columns of `id` that carry a derived index circuit: those outside its
@@ -212,7 +212,7 @@ impl CatalogEngine {
                 continue;
             };
             let defs = self.read_column_defs(owner)?;
-            let schema = if kind.is_base_table() {
+            if kind.is_base_table() {
                 let rebuilt =
                     build_schema_from_col_defs(RelationKind::BaseTable, &defs, cur.pk_indices(), cur.placement())
                         .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;
@@ -220,15 +220,12 @@ impl CatalogEngine {
                     self.reject_if_dependent_views(owner, "column ALTER")?;
                     self.registry.swap_schema(owner, rebuilt)?;
                 }
-                rebuilt
-            } else {
-                cur
-            };
+            }
             self.caches
                 .relations
                 .get_mut(&owner)
                 .expect("every registered relation has an entry")
-                .reschema(&schema, &defs);
+                .reschema(cur.pk_indices(), &defs);
         }
         Ok(())
     }

@@ -6,7 +6,7 @@ mod spine_tests {
     use crate::protocol::codec::encode_schema_block;
     use crate::protocol::message::encode_frame;
     use crate::protocol::transport::{poll_fd, ClientTransport};
-    use crate::protocol::{BatchAppender, ColumnDef, TypeCode};
+    use crate::protocol::{BatchAppender, ColumnDef, TypeCode, WireStatus};
     use crate::test_support::{framed, make_socketpair, raw_read_frame, raw_send, reply_ctrl};
     use crate::{GnitzClient, WireFault};
 
@@ -622,106 +622,5 @@ mod spine_tests {
         let b0 = crate::protocol::wal_block::decode_wal_block(blocks[0].block(), &sa).unwrap();
         assert_eq!(b0.pks.to_vec_u128(&sa), vec![1, 2]);
         assert_eq!(stamped(&mut c.session, 9), 0, "a delta read absorbs nothing");
-    }
-
-    #[test]
-    fn push_retries_cold_on_schema_mismatch() {
-        let (mut s, peer) = pair();
-        let sa = schema_a();
-        let b = batch_a(&[1]);
-        warm(&mut s, &peer, 4, 2, &sa);
-        let mut c = GnitzClient::from_session(s);
-        // The server rejects the warm push; the blocking verb retries it cold.
-        let h = std::thread::spawn(move || {
-            peer.drain_request();
-            peer.send(&reply_status(WireStatus::SchemaMismatch, "stale", 0));
-            peer.drain_request();
-            peer.send(&reply_ctrl(4, 555));
-            peer
-        });
-        let lsn = c.push(4, &sa, &b).unwrap();
-        assert_eq!(lsn, 555);
-        let _peer = h.join().unwrap();
-        assert_eq!(
-            c.session.requests_sent(),
-            3,
-            "scan, warm push, cold retry — one per frame"
-        );
-    }
-
-    #[test]
-    fn a_mismatch_evicts_the_cache_and_the_next_push_goes_out_cold() {
-        let (mut s, peer) = pair();
-        let sa = schema_a();
-        let b = batch_a(&[1]);
-        // Warm relation 4 at version 2, so both pushes below encode schema-less.
-        warm(&mut s, &peer, 4, 2, &sa);
-
-        let push = |s: &mut Session| {
-            s.submit(Request::Push {
-                target_id: 4,
-                schema: &sa,
-                batch: &b,
-                mode: WireConflictMode::Update,
-            })
-            .unwrap()
-        };
-        let (a, c) = (push(&mut s), push(&mut s));
-        s.step(Interest::WRITE);
-        let warm_len = peer.drain_request().len();
-        assert_eq!(peer.drain_request().len(), warm_len, "both encoded at the stale stamp");
-
-        // The first mismatch fails its own slot and evicts the entry.
-        peer.send(&reply_status(WireStatus::SchemaMismatch, "stale", 0));
-        let mut done = s.step(Interest::READ);
-        assert_eq!(done.len(), 1);
-        let (id, r) = done.pop().unwrap();
-        assert_eq!(id, a);
-        assert!(matches!(
-            r,
-            Err(ClientError::Refused(WireFault {
-                status: WireStatus::SchemaMismatch,
-                ..
-            }))
-        ));
-        assert!(!s.is_closed(), "a per-slot error leaves the connection usable");
-        assert_eq!(stamped(&mut s, 4), 0, "the entry is gone");
-
-        // Submitted after the eviction: cold, longer by the schema block.
-        let cold = push(&mut s);
-        s.step(Interest::WRITE);
-        let cold_len = peer.drain_request().len();
-        assert_eq!(
-            cold_len - warm_len,
-            4 + encode_schema_block(&sa).len(),
-            "the cold frame is longer by exactly the schema record the warm ones omitted, \
-             plus the length prefix that announces it"
-        );
-
-        // The second stale push fails too — every push encoded at the stale stamp does.
-        peer.send(&reply_status(WireStatus::SchemaMismatch, "stale", 0));
-        let mut done = s.step(Interest::READ);
-        assert_eq!(done.len(), 1);
-        let (id, r) = done.pop().unwrap();
-        assert_eq!(id, c);
-        assert!(matches!(
-            r,
-            Err(ClientError::Refused(WireFault {
-                status: WireStatus::SchemaMismatch,
-                ..
-            }))
-        ));
-
-        // The cold push's ACK carries the block at the new version, which puts the
-        // next push back on the warm path.
-        peer.send(&reply_cold(4, 5, &sa, &batch_a(&[]), 999, false));
-        let Reply::Lsn(lsn) = drive(&mut s, cold).unwrap() else {
-            panic!("push ACK")
-        };
-        assert_eq!(lsn, 999);
-        assert_eq!(stamped(&mut s, 4), 5);
-        push(&mut s);
-        s.step(Interest::WRITE);
-        assert_eq!(peer.drain_request().len(), warm_len, "warm again");
     }
 }

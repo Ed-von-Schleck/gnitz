@@ -86,9 +86,9 @@ fn tick_frame(target_id: u64, round: u64) -> &'static [u8] {
 }
 
 /// Build a worker that's safe for dispatch calls whose behavior
-/// does not enter the catalog (Tick/DdlSync/ExchangeRelay inside an
-/// exchange wait, plus ExchangeRelay at top-level which warns
-/// without touching the catalog).
+/// does not enter the catalog (Tick/ExchangeRelay inside an exchange wait,
+/// plus ExchangeRelay at top-level which warns without touching the catalog).
+/// A DdlSync slot's decode consults the catalog.
 ///
 /// The W2M ring is unused by these arms; sal_reader is also unused
 /// because we drive the dispatchers directly.
@@ -175,7 +175,7 @@ fn reads_defer_inside_exchange_in_request_order() {
 fn encode_relay_frame(target_id: u64, source_id: u64, schema: &SchemaDescriptor) -> &'static [u8] {
     // No data batch — a header-only relay. `arg0` echoes the source_id the
     // waiter matches on; the default `flags.backfill` is `Continue`.
-    let block = crate::catalog::encode_schema_block(schema);
+    let block = gnitz_store::schema::encode_schema_block(schema);
     let msg = ipc::WireMsg {
         target_id,
         arg0: source_id,
@@ -188,7 +188,7 @@ fn encode_relay_frame(target_id: u64, source_id: u64, schema: &SchemaDescriptor)
 /// Encode a wire frame carrying `batch` under `schema`. Leaked to `'static`
 /// for `dispatch`, which takes its payload from the SAL mapping.
 fn encode_data_frame(target_id: u64, schema: &SchemaDescriptor, batch: &Batch) -> &'static [u8] {
-    let block = crate::catalog::encode_schema_block(schema);
+    let block = gnitz_store::schema::encode_schema_block(schema);
     let msg = ipc::WireMsg {
         target_id,
         schema_block: Some(&block),
@@ -269,7 +269,9 @@ fn exchange_relay_top_level_warns_and_continues() {
 /// what needs a test is the defer decision itself.)
 #[test]
 fn ddl_sync_defers_inside_exchange() {
-    let mut wp = make_worker_for_matrix();
+    let dir = crate::test_support::scratch_dir("worker", "ddl_sync_defers");
+    let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
+    let mut wp = make_test_worker(&mut engine, unsafe { std::mem::zeroed() });
     let schema = make_schema_u64_i64();
 
     let frame = encode_data_frame(42, &schema, &make_batch_raw(&schema, &[(1, 1, 10)]));
@@ -286,6 +288,7 @@ fn ddl_sync_defers_inside_exchange() {
         wp.exchange.deferred_replay.is_empty(),
         "DdlSync must not touch the post-ACK replay queue"
     );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `Flush` and `Push` run INLINE inside an exchange wait — neither queue may

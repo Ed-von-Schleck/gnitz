@@ -252,6 +252,24 @@ fn an_ingest_applies_before_it_advances() {
     );
 }
 
+/// `Schema.columns` is a `Vec` behind a `pub` field, so a reply schema wider than
+/// the engine's column cap reaches a read and must come back as an `Err`.
+#[test]
+fn a_reply_schema_wider_than_the_engine_column_limit_is_an_error() {
+    let _g = serial();
+    let (mut store, _dir) = registered("wide_reply");
+    store.ingest(TID, plain(&[(1, 1, 10)]), cursor(4)).unwrap();
+    let wide = Schema {
+        columns: (0..=gnitz_wire::MAX_COLUMNS)
+            .map(|i| ColumnDef::new(format!("c{i}"), TypeCode::U64, false))
+            .collect(),
+        pk_cols: vec![0],
+    };
+    assert!(store
+        .scan_spec(TID, ReadSpec::all_rows(ReadBound::None), &wide)
+        .is_err());
+}
+
 /// A checkpoint keeps the position of a copy this session never re-registered.
 #[test]
 fn a_checkpoint_covers_a_cursor_this_session_never_claimed() {

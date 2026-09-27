@@ -13,19 +13,15 @@ use gnitz_wire::schema_block::{ColMeta, SchemaBlockCol};
 /// `pub` for `gnitz-mirror`, which uses the bytes as a view's schema identity,
 /// and for the engine's cross-side wire tests.
 pub fn encode_schema_block(schema: &Schema) -> Vec<u8> {
-    let cols: Vec<SchemaBlockCol> = schema
-        .columns
-        .iter()
-        .map(|col| SchemaBlockCol {
-            ty: col.ty,
-            meta: ColMeta {
-                nullable: col.is_nullable,
-                hidden: col.is_hidden,
-            },
-            name: col.name.as_bytes(),
-        })
-        .collect();
-    gnitz_wire::schema_block::encode(&cols, &schema.pk_cols)
+    let cols = schema.columns.iter().map(|col| SchemaBlockCol {
+        ty: col.ty,
+        meta: ColMeta {
+            nullable: col.is_nullable,
+            hidden: col.is_hidden,
+        },
+        name: col.name.as_bytes(),
+    });
+    gnitz_wire::schema_block::encode(cols, &schema.pk_cols)
 }
 
 /// Reconstruct a `Schema` from meta-schema record bytes.

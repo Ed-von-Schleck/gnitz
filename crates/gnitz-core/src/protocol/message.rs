@@ -33,7 +33,7 @@ pub struct PushFamily<'a> {
 
 /// Encode an atomic user-table push transaction frame (`ClientVerb::PushTxn`) into
 /// wire bytes (without the 4-byte frame header). Every family carries its schema
-/// record, so the master validates it with no warm-cache version.
+/// record, which the master validates it against.
 pub fn encode_push_txn(families: &[PushFamily<'_>]) -> Vec<u8> {
     let schemas: Vec<Vec<u8>> = families.iter().map(|f| encode_schema_block(f.schema)).collect();
     let items: Vec<FrameItem> = families

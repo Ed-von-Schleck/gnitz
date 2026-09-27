@@ -17,11 +17,9 @@
 
 use gnitz_core::protocol::decode_regions_into;
 use gnitz_core::{MirrorError, Schema, ZSetBatch};
-use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 
 use crate::handle::{engine, Mirror};
-use crate::register::descriptor_of;
 
 impl Mirror {
     /// Run the spec against the copy through the engine's own executor, and reply
@@ -35,23 +33,18 @@ impl Mirror {
         spec: gnitz_wire::ReadSpec,
         reply_schema: &Schema,
     ) -> Result<ZSetBatch, MirrorError> {
-        let reply_desc = descriptor_of(reply_schema)?;
         let keeper = self
             .registry
-            .scan_spec(table_id as i64, spec, reply_desc.layout_digest(), None)
+            .scan_spec(table_id as i64, spec, reply_schema.layout_digest(), None)
             .map_err(engine)?;
-        reply_batch(&keeper, &reply_desc, reply_schema)
+        reply_batch(&keeper, reply_schema)
     }
 }
 
 /// The engine batch as the `ZSetBatch` the client finishers consume, decoded from its own
-/// regions by the client's block decoder.
-fn reply_batch(batch: &Batch, desc: &SchemaDescriptor, schema: &Schema) -> Result<ZSetBatch, MirrorError> {
-    debug_assert_eq!(
-        desc.num_columns(),
-        schema.num_columns(),
-        "a local reply must be produced under the schema it is decoded against",
-    );
+/// regions by the client's block decoder. `scan_spec` produced it under
+/// `schema`'s layout digest.
+fn reply_batch(batch: &Batch, schema: &Schema) -> Result<ZSetBatch, MirrorError> {
     let mut regions = gnitz_wire::Regions::new();
     batch.wire_regions(&mut regions);
     let mut rows = ZSetBatch::new(schema);

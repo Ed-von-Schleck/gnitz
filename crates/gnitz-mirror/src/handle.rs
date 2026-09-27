@@ -60,8 +60,7 @@ impl Mirror {
     /// Open (or create) a store at `base_dir`. Fails if another store, in this
     /// process or another, holds it.
     pub fn open(base_dir: &str) -> Result<Self, MirrorError> {
-        // No retry: no forked child inherits a mirror's lock, so a holder is live.
-        let dir_lock = lock_data_dir(base_dir, std::time::Duration::ZERO).map_err(engine)?;
+        let dir_lock = lock_data_dir(base_dir).map_err(engine)?;
         let registry = RelationRegistry::new(base_dir, Slot::SOLO, StoreConfig::from_env("GNITZ_MIRROR_"));
         let persisted = registry.persisted_records().map_err(engine)?;
         let mut mirror = Mirror {

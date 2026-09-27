@@ -29,7 +29,6 @@ mod constraints;
 mod hooks;
 mod precheck;
 mod registry;
-mod schema_block;
 mod sys_tables;
 mod types;
 mod view_state;
@@ -57,8 +56,6 @@ pub(crate) use sys_tables::PUBLIC_SCHEMA_ID;
 pub(crate) use sys_tables::{family_pk_partition, idx_tab_partition, PkPartition};
 pub(crate) use sys_tables::{SysFamily, FIRST_USER_TABLE_ID};
 pub(crate) use types::{ColumnDef, FkEdge};
-// The anonymous schema-wire-block encoder, for a schema no catalog entry describes.
-pub(crate) use schema_block::encode_schema_block;
 
 // Import everything from sys_tables for internal use.
 use precheck::build_schema_from_col_defs;

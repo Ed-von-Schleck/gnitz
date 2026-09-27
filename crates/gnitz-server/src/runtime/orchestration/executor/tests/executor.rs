@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64};
+use crate::test_support::{col_def, make_batch_raw, make_schema_u64_i64};
 
 /// A batch whose rows carry `weights`, one distinct PK each.
 fn weighted(weights: &[i64]) -> Batch {
@@ -31,40 +31,85 @@ fn stream_push_rejects_error_conflict_mode() {
     assert!(e.contains("conflict mode 'error'"), "got: {e}");
 }
 
+use gnitz_core::protocol::types::{BatchAppender, ColumnDef, Schema, TypeCode, ZSetBatch};
+use gnitz_core::protocol::{encode_push_txn, PushFamily};
+
+/// A catalog holding `public.t1` and `public.t2`, both `(id U64 PK, v I64)`.
+fn two_table_catalog() -> (tempfile::TempDir, CatalogEngine, [u64; 2]) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cat = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
+    let cols = [col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
+    let tids = ["public.t1", "public.t2"].map(|name| cat.create_table(name, &cols, &[0]).unwrap() as u64);
+    (tmp, cat, tids)
+}
+
+/// The client schema `(id U64 PK, v <v>)`.
+fn client_schema(v: TypeCode) -> Schema {
+    Schema {
+        columns: vec![
+            ColumnDef::new("id", TypeCode::U64, false),
+            ColumnDef::new("v", v, false),
+        ],
+        pk_cols: vec![0],
+    }
+}
+
+/// A `PUSH_TXN` body holding, per `(tid, schema, rows)`, a family of `rows` rows.
+fn push_txn_body(families: &[(u64, &Schema, usize)]) -> Vec<u8> {
+    let batches: Vec<ZSetBatch> = families
+        .iter()
+        .map(|&(_, schema, rows)| {
+            let mut b = ZSetBatch::new(schema);
+            for pk in 0..rows as u128 {
+                BatchAppender::new(&mut b, schema).add_row(pk, 1).i64_val(10);
+            }
+            b
+        })
+        .collect();
+    let families: Vec<PushFamily> = families
+        .iter()
+        .zip(&batches)
+        .map(|(&(tid, schema, _), batch)| PushFamily {
+            tid,
+            schema,
+            batch,
+            mode: gnitz_wire::WireConflictMode::Update,
+            basis: gnitz_wire::txn_frame::BLIND,
+        })
+        .collect();
+    let frame = encode_push_txn(&families);
+    frame[gnitz_wire::control::peek_control_block(&frame).unwrap().body].to_vec()
+}
+
 /// A zero-row family block is a well-formed item, and still refused: an empty
 /// family would open a zone and bump its table's commit LSN.
 #[test]
 fn a_push_txn_family_with_no_rows_is_refused() {
-    use gnitz_core::protocol::types::{BatchAppender, ColumnDef, Schema, TypeCode, ZSetBatch};
-    use gnitz_core::protocol::{encode_push_txn, PushFamily};
-
-    let schema = Schema {
-        columns: vec![
-            ColumnDef::new("id", TypeCode::U64, false),
-            ColumnDef::new("v", TypeCode::I64, false),
-        ],
-        pk_cols: vec![0],
-    };
-    let mut one = ZSetBatch::new(&schema);
-    BatchAppender::new(&mut one, &schema).add_row(1, 1).i64_val(10);
-    let empty = ZSetBatch::new(&schema);
-    let family = |tid, batch| PushFamily {
-        tid,
-        schema: &schema,
-        batch,
-        mode: gnitz_wire::WireConflictMode::Update,
-        basis: gnitz_wire::txn_frame::BLIND,
-    };
-    let body = |frame: &[u8]| frame[gnitz_wire::control::peek_control_block(frame).unwrap().body].to_vec();
-
-    let ok = encode_push_txn(&[family(16, &one)]);
-    assert_eq!(
-        decode_push_txn_frame(&body(&ok)).map(|t| t.families.len()).ok(),
-        Some(1)
-    );
-    let bad = encode_push_txn(&[family(16, &one), family(17, &empty)]);
-    let Err(e) = decode_push_txn_frame(&body(&bad)) else {
+    let (_tmp, cat, [t1, t2]) = two_table_catalog();
+    let schema = client_schema(TypeCode::I64);
+    let ok = push_txn_body(&[(t1, &schema, 1)]);
+    assert_eq!(decode_push_txn_frame(&cat, &ok).map(|t| t.families.len()).ok(), Some(1));
+    let bad = push_txn_body(&[(t1, &schema, 1), (t2, &schema, 0)]);
+    let Err(e) = decode_push_txn_frame(&cat, &bad) else {
         panic!("an empty family must be refused");
     };
-    assert_eq!(e.text, "TXN: empty batch for table 17");
+    assert_eq!(e.text, format!("TXN: empty batch for table {t2}"));
+}
+
+/// A family is decoded against its target's catalog record: one laying out other
+/// columns is refused, and one naming no relation is `NotFound`.
+#[test]
+fn a_push_txn_family_is_decoded_against_its_target() {
+    let (_tmp, cat, [t1, _]) = two_table_catalog();
+    let floats = client_schema(TypeCode::F64);
+    let Err(e) = decode_push_txn_frame(&cat, &push_txn_body(&[(t1, &floats, 1)])) else {
+        panic!("a family under other column types must be refused");
+    };
+    assert!(e.text.contains("Schema mismatch"), "{}", e.text);
+
+    let ints = client_schema(TypeCode::I64);
+    let Err(e) = decode_push_txn_frame(&cat, &push_txn_body(&[(99_999, &ints, 1)])) else {
+        panic!("a family naming no relation must be refused");
+    };
+    assert_eq!(e.status, WireStatus::NotFound);
 }

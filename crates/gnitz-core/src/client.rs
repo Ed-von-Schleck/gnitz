@@ -513,8 +513,6 @@ impl GnitzClient {
         self.send_push(table_id, schema, &batch, mode)
     }
 
-    /// A push, retried once on a schema mismatch — which evicted the stale cache
-    /// entry, so the retry goes out cold.
     fn send_push(
         &mut self,
         target_id: u64,
@@ -522,14 +520,9 @@ impl GnitzClient {
         batch: &ZSetBatch,
         mode: WireConflictMode,
     ) -> Result<u64, ClientError> {
-        let push = || Request::Push { target_id, schema, batch, mode };
-        let reply = match self.round_trip(push()) {
-            Err(ClientError::Refused(WireFault { status: WireStatus::SchemaMismatch, .. })) => {
-                self.round_trip(push())?
-            }
-            other => other?,
-        };
-        Ok(reply.into_lsn())
+        Ok(self
+            .round_trip(Request::Push { target_id, schema, batch, mode })?
+            .into_lsn())
     }
 
     /// Write `batch`, built from a read of `table_id` served at watermark `basis`,
