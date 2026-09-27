@@ -314,11 +314,6 @@ impl Relation {
         self.store.held().live_row_at(key)
     }
 
-    /// Whether this store came back from a checkpoint manifest at its open.
-    pub fn resumed(&self) -> bool {
-        self.store.held().resumed_from_checkpoint()
-    }
-
     /// Every secondary index on this relation, in registration order.
     pub fn indexes(&self) -> &[SecondaryIndex] {
         &self.indexes

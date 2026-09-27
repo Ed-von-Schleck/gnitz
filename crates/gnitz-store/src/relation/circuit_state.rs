@@ -94,11 +94,6 @@ impl CircuitState {
         Ok(t.open_cursor())
     }
 
-    /// True iff this state holds a child and every child resumed from a manifest.
-    pub fn resumed(&self) -> bool {
-        !self.tables.is_empty() && self.tables.iter().all(Table::resumed_from_checkpoint)
-    }
-
     /// Every child store, for the checkpoint round that publishes them.
     pub(crate) fn tables_mut(&mut self) -> impl Iterator<Item = &mut Table> {
         self.tables.iter_mut()

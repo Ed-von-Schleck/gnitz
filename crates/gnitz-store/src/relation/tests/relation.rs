@@ -337,7 +337,6 @@ fn reopen_view_refuses_a_view_with_no_manifest() {
     registry.unregister(7);
 
     registry.reopen_view(spec(7)).expect("a published view reopens");
-    assert!(registry.relation(7).is_some_and(Relation::resumed));
     assert!(registry.reopen_view(spec(8)).is_err());
     assert!(registry.relation(8).is_none(), "a refused view is not entered");
 }

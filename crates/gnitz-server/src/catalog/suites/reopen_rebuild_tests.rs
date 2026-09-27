@@ -275,14 +275,11 @@ fn index_rebuild_forced_by_topology_change() {
 // registration, the traces at compile — so a checkpoint landing between them is
 // what these two tests put there.
 
-/// `public.vbase` plus a trace-bearing view over it. Returns the view id, with
-/// its output store and its operator traces both published at one generation and
-/// the engine closed — the state a worker reopens into, plan cache empty.
-///
-/// The `Distinct` node is what makes the compile create a scratch child at all
-/// (its clamp history); an identity circuit would leave nothing for either test
-/// to catch on.
-fn checkpointed_traced_view(dir: &str) -> i64 {
+/// `public.vbase` plus a backfilled `DISTINCT` view over it, whose operator trace
+/// is the clamp history. Returns `(table id, view id)`, with the view's output
+/// store and trace both published at one generation and the engine closed — the
+/// state a worker reopens into, plan cache empty.
+fn checkpointed_traced_view(dir: &str) -> (i64, i64) {
     let mut engine = CatalogEngine::open(dir, 1).unwrap();
     let (tid, cols) = seed_base(&mut engine, "public.vbase");
 
@@ -296,10 +293,7 @@ fn checkpointed_traced_view(dir: &str) -> i64 {
     engine
         .ingest_to_family(VIEW_TAB_ID, &build_view_tab_row(vid, "v_traced"))
         .unwrap();
-    assert!(
-        engine.dag.open_plan(&engine.registry, vid).is_ok(),
-        "the fixture view must compile"
-    );
+    backfill(&mut engine, vid, &[tid]);
 
     engine.record_topology(1).unwrap();
     let g = engine.bump_checkpoint_generation().unwrap();
@@ -307,38 +301,34 @@ fn checkpointed_traced_view(dir: &str) -> i64 {
     assert_eq!(engine.registry.resume_generation(), g);
 
     engine.close();
-    vid
+    (tid, vid)
 }
 
 // ── view_traces_resume_with_their_output_store ──────────────────────────
-// A compile must not sample the resume generation independently of the store it
-// is compiling for: it opens the traces against the generation the *output store*
-// accepted, not whatever the engine holds when the compile happens to run. A
-// generation bump between the two — which is all it takes — otherwise leaves the
-// compile looking for `g + 1` while the manifests say `g`, and `Table::new`
-// erases them: an empty integral under a full output store, and the view not
-// marked non-resumable.
+// A compile must open the traces against the generation the *output store*
+// accepted, not whatever the engine holds when the compile runs. After a bump
+// between the two, a trace looking for `g + 1` is erased: an empty integral
+// under a full output store, which re-inserting a present row exposes as a
+// second copy in the view.
 #[test]
 fn view_traces_resume_with_their_output_store() {
     let dir = temp_dir("view_traces_resume_with_output");
-    let vid = checkpointed_traced_view(&dir);
+    let (tid, vid) = checkpointed_traced_view(&dir);
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert!(
-        engine.registry.relation(vid).is_some_and(Relation::resumed),
-        "the fixture must leave a resumable output store"
-    );
+    let view_weight = |engine: &CatalogEngine| sum_weights(engine.registry.relation(vid).unwrap().cursor());
+    assert_eq!(view_weight(&engine), N, "the output store resumes");
     engine.bump_checkpoint_generation().unwrap();
-    assert!(engine.dag.open_plan(&engine.registry, vid).is_ok());
+    engine.dag.open_plan(&engine.registry, vid).unwrap();
 
-    // The compiled plan's own operator state — both the set the next ephemeral
-    // round would publish and the integral this view reads through. `resumed()`
-    // answers `false` for a state holding no child, so this also proves the
-    // fixture's view creates one.
-    assert!(
-        engine.dag.ephemeral_states().all(|s| s.resumed()),
-        "a trace opened against a generation its manifest never carried is erased"
-    );
+    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(0, 1);
+    bb.put_u64(0);
+    bb.end_row();
+    let what = crate::query::Drive::Tick { source: tid, round: 1 };
+    crate::query::drive(&mut LocalDrive(&mut engine), what, bb.finish()).unwrap();
+    assert_eq!(view_weight(&engine), N, "a resumed trace already holds the row");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -352,7 +342,7 @@ fn view_traces_resume_with_their_output_store() {
 #[test]
 fn uncompiled_view_traces_invalidate_the_view() {
     let dir = temp_dir("view_uncompiled_traces_invalidate");
-    let vid = checkpointed_traced_view(&dir);
+    let (_, vid) = checkpointed_traced_view(&dir);
 
     // A checkpoint with nothing in the plan cache — what a boot checkpoint is for
     // a view no tick sweep reaches.
