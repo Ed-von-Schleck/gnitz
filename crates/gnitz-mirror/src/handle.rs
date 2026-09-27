@@ -191,8 +191,10 @@ impl Mirror {
         match level {
             Invalidate::Cursor => Ok(()),
             Invalidate::Copy => {
+                let spec = copy_spec(tid, &rec.block)?;
                 self.registry
-                    .reset_view(tid as i64)
+                    .unregister_and_erase(tid as i64)
+                    .and_then(|()| self.registry.register(spec))
                     .map_err(|e| self.poison(format!("erasing the copy of {tid} failed: {e}")))?;
                 if BOOTSTRAP_ERROR.take_once() {
                     return Err(MirrorError::Engine("injected bootstrap failure".to_string()));

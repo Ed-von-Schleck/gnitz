@@ -61,21 +61,18 @@ fn the_schedule_names_every_edge_of_the_closure_in_id_order() {
     let (engine, base, a, b, deep) = engine_with_fanout("schedule");
     let step = |view, producer| Step { view, producer };
 
-    let (dag, registry) = (&engine.dag, &engine.registry);
+    let dag = &engine.dag;
     assert_eq!(
-        dag.tick_schedule(registry, base),
+        dag.tick_schedule(base),
         vec![step(a, base), step(b, base), step(deep, a)],
         "every edge of the closure, producers first",
     );
     assert_eq!(
-        dag.tick_schedule(registry, a),
+        dag.tick_schedule(a),
         vec![step(deep, a)],
         "a tick of an intermediate view runs only what it reaches",
     );
-    assert!(
-        dag.tick_schedule(registry, deep).is_empty(),
-        "a terminal view reaches nothing"
-    );
+    assert!(dag.tick_schedule(deep).is_empty(), "a terminal view reaches nothing");
 }
 
 // ── The drivers ─────────────────────────────────────────────────────────────
@@ -209,7 +206,6 @@ fn a_replicated_sources_relay_is_sent_by_worker_0_alone() {
         let keyed = engine.create_table("public.kt", &cols, &[0]).unwrap();
         engine.registry.reconcile_child_dirs().unwrap();
         engine
-            .registry
             .open_stores(rank, gnitz_store::relation::Residency::Worker)
             .unwrap();
 

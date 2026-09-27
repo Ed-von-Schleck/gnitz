@@ -7,8 +7,8 @@ use rustc_hash::FxHashSet;
 use super::*;
 use gnitz_expr::{RowSource, SchemaFacts};
 use gnitz_store::schema::make_index_schema;
-use gnitz_wire::MAX_COLUMNS;
 use gnitz_wire::{low_bits_mask, BitIter, TypeCode, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME};
+use gnitz_wire::{ViewProps, MAX_COLUMNS};
 
 /// The name rules a relation or index row must satisfy to be *stored*: non-empty
 /// `[A-Za-z0-9_]` and already canonical (every cache key here is compared
@@ -49,9 +49,18 @@ fn check_col_defs(kind: RelationKind, col_defs: &[ColumnDef]) -> Result<(), Stri
         return Err("has no column records".into());
     }
     // Reachable from a plain view as well as a wide CREATE TABLE: a compound-PK
-    // plain projection prepends the k source PK columns.
-    if col_defs.len() > MAX_COLUMNS {
-        return Err(format!("has {} columns (max {})", col_defs.len(), MAX_COLUMNS));
+    // plain projection prepends the k source PK columns. A fed view gets one
+    // column less, since its delta store stamps a `_tick` key column ahead of
+    // the view's own.
+    let fed = matches!(kind, RelationKind::View(ViewProps::Fed { .. }));
+    let max = MAX_COLUMNS - usize::from(fed);
+    if col_defs.len() > max {
+        let why = if fed {
+            " with a delta feed: its `_tick` stamp is one more"
+        } else {
+            ""
+        };
+        return Err(format!("has {} columns (max {max}{why})", col_defs.len()));
     }
     if kind.is_ingestion_point() {
         let mut seen = FxHashSet::default();

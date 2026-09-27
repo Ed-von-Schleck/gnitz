@@ -292,7 +292,6 @@ fn a_unique_index_covering_the_pk_has_nothing_left_to_check() {
 #[test]
 fn persisted_records_reads_well_formed_relation_manifests() {
     let mut registry = solo_registry("persisted_records");
-    registry.set_resume_enabled(true);
     let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
     let view = RelationKind::View(ViewProps::Plain);
     let (good, damaged) = (123, 124);

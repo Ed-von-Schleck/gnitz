@@ -146,11 +146,11 @@ impl DagEngine {
     /// One [`Step`] per dependency edge out of `source_id`'s forward closure, in
     /// execution order, skipping non-resumable views: their backfill fills them.
     /// Worker-identical, which keeps the workers in lockstep.
-    fn tick_schedule(&self, registry: &RelationRegistry, source_id: i64) -> Vec<Step> {
+    fn tick_schedule(&self, source_id: i64) -> Vec<Step> {
         let mut schedule: Vec<Step> = Vec::new();
         for producer in std::iter::once(source_id).chain(self.dependent_closure(vec![source_id])) {
             for &view in self.dependents_of(producer) {
-                if !registry.is_non_resumable(view) {
+                if !self.awaits_rebuild(view) {
                     schedule.push(Step { view, producer });
                 }
             }
@@ -178,8 +178,8 @@ impl DagEngine {
 pub(crate) fn drive(host: &mut impl DriveHost, what: Drive, delta: Batch) -> Result<(), String> {
     let (source, schedule, round) = match what {
         Drive::Tick { source, round } => {
-            let (dag, registry) = host.parts();
-            (source, dag.tick_schedule(registry, source), Some(round))
+            let (dag, _) = host.parts();
+            (source, dag.tick_schedule(source), Some(round))
         }
         Drive::Backfill { view, source } => (source, vec![Step { view, producer: source }], None),
     };

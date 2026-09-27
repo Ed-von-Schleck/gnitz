@@ -4,7 +4,7 @@
 //! Every relation enters through [`RelationRegistry::register`].
 
 use gnitz_foundation::env::env_num;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::schema::key::{compare_pk_bytes, key_range_between_cuts, KeyCut, PkBuf};
 use crate::schema::SchemaDescriptor;
@@ -358,6 +358,7 @@ impl Relation {
 // ---------------------------------------------------------------------------
 
 /// A relation to [`RelationRegistry::register`].
+#[derive(Clone, Copy)]
 pub struct RelationSpec {
     pub id: i64,
     pub kind: RelationKind,
@@ -432,10 +433,6 @@ pub struct RelationRegistry {
     pub(crate) children_reconciled: bool,
     /// The generation a manifest must carry to be resumed from.
     pub(crate) resume_generation: u64,
-    /// See [`RelationRegistry::set_resume_enabled`]. `false` until a host says
-    /// otherwise, so one that never answers rebuilds.
-    pub(crate) resume_enabled: bool,
-    pub(crate) non_resumable: FxHashSet<i64>,
 }
 
 impl RelationRegistry {
@@ -452,8 +449,6 @@ impl RelationRegistry {
             residency: Residency::Origin,
             children_reconciled: false,
             resume_generation: 0,
-            resume_enabled: false,
-            non_resumable: FxHashSet::default(),
         }
     }
 
@@ -498,34 +493,18 @@ impl RelationRegistry {
             covers_pk: owner_schema.covers_pk(cols),
         };
         if self.residency.owns_stores() {
-            ix.store = Self::open_index_store(
-                self.slot,
+            ix.store = Store::Held(Box::new(self.open_child(
+                owner,
+                ChildKind::Index(ix.cols),
+                index_schema,
                 self.rederive_source(false),
                 self.store_budgets(),
-                &relation_dir(&self.base_dir, owner),
-                PkColList::from_slice(cols),
-                index_schema,
-            )?;
+            )?));
             let owner_store = &self.tables[&owner].store;
             ingest::fill_indexes(owner_store, self.config.scan_chunk_rows, owner, &mut [&mut ix])?;
         }
         self.tables.get_mut(&owner).expect("resolved above").indexes.push(ix);
         Ok(())
-    }
-
-    /// `slot`'s store of the index on `cols` over the relation at `owner_dir`.
-    fn open_index_store(
-        slot: Slot,
-        recovery: RecoverySource,
-        budgets: StoreBudgets,
-        owner_dir: &str,
-        cols: PkColList,
-        schema: SchemaDescriptor,
-    ) -> Result<Store, StoreError> {
-        let dir = ChildAddr { kind: ChildKind::Index(cols), slot }.dir(owner_dir);
-        Table::new(&dir, schema, recovery, budgets)
-            .map(|t| Store::Held(Box::new(t)))
-            .map_err(|e| StoreError::storage(format!("open index on columns {:?} (dir={dir})", cols.as_slice()), e))
     }
 
     /// Remove `claim` from whichever of `owner`'s circuits holds it, dropping a
@@ -657,28 +636,6 @@ impl RelationRegistry {
     /// `FlushEph` header, with no verdict in hand.
     pub fn set_resume_generation(&mut self, g: u64) {
         self.resume_generation = g;
-    }
-
-    /// Whether persisted derived state may be resumed this boot. The host decides
-    /// what invalidates it.
-    pub fn set_resume_enabled(&mut self, enabled: bool) {
-        self.resume_enabled = enabled;
-    }
-
-    /// Replace the set of views whose persisted state must not be resumed: their
-    /// stores open empty.
-    pub fn set_non_resumable(&mut self, ids: &[i64]) {
-        self.non_resumable = ids.iter().copied().collect();
-    }
-
-    /// Whether `id` is marked by [`Self::set_non_resumable`] and not yet cleared.
-    pub fn is_non_resumable(&self, id: i64) -> bool {
-        self.non_resumable.contains(&id)
-    }
-
-    /// Every id [`Self::is_non_resumable`] holds for, in no defined order.
-    pub fn non_resumable_ids(&self) -> impl Iterator<Item = i64> + '_ {
-        self.non_resumable.iter().copied()
     }
 
     /// The generation a manifest must carry to be resumed from.

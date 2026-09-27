@@ -85,9 +85,7 @@ impl CatalogEngine {
     pub(crate) fn open(base_dir: &str, num_workers: u32) -> Result<Self, String> {
         let mut engine = Self::open_master(base_dir, num_workers)?.replay()?;
         engine.registry.reconcile_child_dirs()?;
-        engine
-            .registry
-            .open_stores(0, gnitz_store::relation::Residency::Origin)?;
+        engine.open_stores(0, gnitz_store::relation::Residency::Origin)?;
         Ok(engine)
     }
 

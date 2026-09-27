@@ -1,9 +1,9 @@
 //! The rederived operator state of one compiled circuit: the children its
 //! compile declares, and the stores it opens for them.
 
-use super::{relation_dir, RelationRegistry};
+use super::RelationRegistry;
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ChildAddr, ChildKind, ReadCursor, StorageError, StoreError, Table};
+use crate::storage::{Batch, ChildKind, ReadCursor, StorageError, StoreError, Table};
 
 /// A `u16` index into one [`CircuitState`], minted only by
 /// [`StateLayout::declare`].
@@ -50,14 +50,14 @@ impl CircuitState {
             .children
             .into_iter()
             .map(|(child, schema)| {
-                let dir = ChildAddr {
-                    kind: ChildKind::Scratch(&child),
-                    slot: reg.slot(),
-                }
-                .dir(&relation_dir(reg.base_dir(), view_id));
                 // Unbounded: a bounded view's hydration reads these traces back.
-                Table::new(&dir, schema, recovery, reg.store_budgets())
-                    .map_err(|e| StoreError::storage(format!("open child store '{dir}'"), e))
+                reg.open_child(
+                    view_id,
+                    ChildKind::Scratch(&child),
+                    schema,
+                    recovery,
+                    reg.store_budgets(),
+                )
             })
             .collect::<Result<_, _>>()?;
         Ok(CircuitState { tables })

@@ -1,18 +1,25 @@
 //! Per-process store lifecycle across the fork — the store open, the boot
-//! relayout and child-dir reclamation, view reset and rebuild start — and the
-//! system families' replay floors recovery reads.
+//! relayout and child-dir reclamation — and the system families' replay floors
+//! recovery reads.
 
 use super::relation_dir;
-use super::{RelationKind, RelationRegistry, Residency, SecondaryIndex};
-use crate::storage::{remove_children, ChildKind, Slot, StoreError};
+use super::{RelationKind, RelationRegistry, RelationSpec, Residency, SecondaryIndex, Store};
+use crate::storage::{ChildKind, Slot, StoreError};
 
 impl RelationRegistry {
     // -- Store management (for multi-worker fork) -----------------------------
 
     /// Take rank `rank` of the launched count as `residency`, open this process's
     /// store for every relation and index, and fill each index that did not resume.
-    /// Returns how many were filled.
-    pub fn open_stores(&mut self, rank: u32, residency: Residency) -> Result<usize, StoreError> {
+    /// Returns how many were filled. `resume(id)` says whether relation `id`'s
+    /// rederived stores — a view's rows and traces, a base table's indexes — may
+    /// resume from a checkpoint manifest.
+    pub fn open_stores(
+        &mut self,
+        rank: u32,
+        residency: Residency,
+        resume: impl Fn(i64) -> bool,
+    ) -> Result<usize, StoreError> {
         assert_eq!(
             self.residency,
             Residency::Master,
@@ -28,9 +35,40 @@ impl RelationRegistry {
             .filter(|(_, e)| e.kind() != RelationKind::SystemCatalog)
             .map(|(&tid, _)| tid)
             .collect();
+        let chunk_rows = self.config.scan_chunk_rows;
         let mut filled = 0usize;
         for tid in tids {
-            filled += self.reopen_stores(tid, "open store")?;
+            let e = &self.tables[&tid];
+            let may_resume = resume(tid);
+            let spec = RelationSpec {
+                id: tid,
+                kind: e.kind(),
+                schema: e.schema(),
+            };
+            let (store, delta) = self
+                .build_relation_store(spec, may_resume)
+                .map_err(|err| err.in_context(&format!("open store tid={tid}")))?;
+            let index_stores = e
+                .indexes
+                .iter()
+                .map(|ix| {
+                    self.open_child(
+                        tid,
+                        ChildKind::Index(ix.cols),
+                        ix.schema(),
+                        self.rederive_source(may_resume),
+                        self.store_budgets(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let entry = self.tables.get_mut(&tid).expect("listed above");
+            (entry.store, entry.delta) = (store, delta);
+            for (ix, t) in entry.indexes.iter_mut().zip(index_stores) {
+                ix.store = Store::Held(Box::new(t));
+            }
+            let mut targets: Vec<&mut SecondaryIndex> = entry.indexes.iter_mut().filter(|ix| !ix.resumed()).collect();
+            super::ingest::fill_indexes(&entry.store, chunk_rows, tid, &mut targets)?;
+            filled += targets.len();
         }
         // A worker applies the same catalog deltas as the master, but only the
         // master writes the system tables' shards.
@@ -42,34 +80,6 @@ impl RelationRegistry {
             }
         }
         Ok(filled)
-    }
-
-    /// Reopen every store of `tid` at this process's slot, and fill each index
-    /// that did not resume. Returns how many it filled.
-    fn reopen_stores(&mut self, tid: i64, what: &str) -> Result<usize, StoreError> {
-        assert!(self.residency.owns_stores(), "{what}: this process holds no user store");
-        let (schema, kind) = {
-            let e = self.relation_or_err(tid).map_err(|e| e.in_context(what))?;
-            (e.schema(), e.kind())
-        };
-        let (slot, recovery, budgets) = (
-            self.slot,
-            self.rederive_source(self.resume_enabled),
-            self.store_budgets(),
-        );
-        let chunk_rows = self.config.scan_chunk_rows;
-        let dir = relation_dir(&self.base_dir, tid);
-        let stores = self
-            .build_relation_store(kind, tid, schema, false)
-            .map_err(|e| e.in_context(&format!("{what} tid={tid}")))?;
-        let entry = self.tables.get_mut(&tid).expect("entry read above");
-        (entry.store, entry.delta) = stores;
-        for ix in &mut entry.indexes {
-            ix.store = Self::open_index_store(slot, recovery, budgets, &dir, ix.cols, ix.schema())?;
-        }
-        let mut targets: Vec<&mut SecondaryIndex> = entry.indexes.iter_mut().filter(|ix| !ix.resumed()).collect();
-        super::ingest::fill_indexes(&entry.store, chunk_rows, tid, &mut targets)?;
-        Ok(targets.len())
     }
 
     /// Relay each base table's children onto this boot's worker count, then
@@ -96,18 +106,6 @@ impl RelationRegistry {
         Ok(())
     }
 
-    /// Empty a view's output store: without its manifest, the reopen erases the
-    /// shards instead of resuming them.
-    pub fn reset_view(&mut self, vid: i64) -> Result<(), StoreError> {
-        self.relation_mut_or_err(vid)
-            .map_err(|e| e.in_context("reset_view"))?
-            .store
-            .held_mut()
-            .unlink_manifest()
-            .map_err(|e| StoreError::storage(format!("reset_view: unlink manifest of {vid}"), e))?;
-        self.reopen_stores(vid, "reset view output").map(drop)
-    }
-
     /// The bytes `id`'s next published manifest carries beside its rows.
     pub fn set_caller_record(&mut self, id: i64, record: Vec<u8>) -> Result<(), StoreError> {
         self.relation_mut_or_err(id)
@@ -116,21 +114,6 @@ impl RelationRegistry {
             .table_mut()
             .ok_or_else(|| StoreError::rejected(format!("relation {id} holds no store in this process")))?
             .set_caller_record(record);
-        Ok(())
-    }
-
-    /// Start rebuilding `vid` if it is non-resumable: remove the operator traces
-    /// a previous compile left on this worker, and unmark it.
-    pub fn begin_rebuild(&mut self, vid: i64) -> Result<(), StoreError> {
-        if !self.non_resumable.contains(&vid) {
-            return Ok(());
-        }
-        self.relation_or_err(vid).map_err(|e| e.in_context("begin_rebuild"))?;
-        let dir = relation_dir(&self.base_dir, vid);
-        let slot = self.slot;
-        let scratch_err = |e| StoreError::storage(format!("begin_rebuild: scratch of {vid}"), e);
-        remove_children(&dir, |c| matches!(c.kind, ChildKind::Scratch(_)) && c.slot == slot).map_err(scratch_err)?;
-        self.non_resumable.remove(&vid);
         Ok(())
     }
 

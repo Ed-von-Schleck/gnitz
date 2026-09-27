@@ -976,8 +976,8 @@ fn a_bounded_view_source_is_named() {
 }
 
 /// A fed view's delta store prepends a `_tick` key column, so a view already at
-/// `MAX_COLUMNS` cannot carry a feed. Refused at registration, on every process:
-/// the master opens no user store at all, so leaving it to the store
+/// `MAX_COLUMNS` cannot carry a feed. Refused by the precheck, before any row
+/// applies: the master opens no user store at all, so leaving it to the store
 /// open would be a worker-side fatal abort taken after the client was told the
 /// CREATE succeeded.
 #[test]

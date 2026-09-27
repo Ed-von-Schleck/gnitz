@@ -57,6 +57,8 @@ pub(crate) struct DagEngine {
     /// Each relation's effective ingests since its last tick: what its store holds
     /// beyond the state every view over it was last maintained at.
     unticked: FxHashMap<i64, Batch>,
+    /// Views the boot verdict rejected, until their rebuild backfill starts.
+    rebuild: FxHashSet<i64>,
 }
 
 impl DagEngine {
@@ -80,6 +82,29 @@ impl DagEngine {
     pub(crate) fn forget(&mut self, id: i64) {
         self.views.remove(&id);
         self.unticked.remove(&id);
+        self.rebuild.remove(&id);
+    }
+
+    // ── The boot rebuild set ────────────────────────────────────────────
+
+    /// Whether `id` awaits its rebuild backfill.
+    pub(crate) fn awaits_rebuild(&self, id: i64) -> bool {
+        self.rebuild.contains(&id)
+    }
+
+    /// Replace the set of views awaiting a rebuild backfill.
+    pub(crate) fn set_rebuild(&mut self, ids: FxHashSet<i64>) {
+        self.rebuild = ids;
+    }
+
+    /// Every view awaiting a rebuild backfill, removed.
+    pub(crate) fn take_rebuild(&mut self) -> FxHashSet<i64> {
+        std::mem::take(&mut self.rebuild)
+    }
+
+    /// `id`'s rebuild backfill has started: its ticks run from here.
+    pub(crate) fn rebuild_started(&mut self, id: i64) {
+        self.rebuild.remove(&id);
     }
 
     // ── Unticked deltas ─────────────────────────────────────────────────

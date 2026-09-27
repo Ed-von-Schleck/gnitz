@@ -5,6 +5,7 @@
 
 use super::*;
 use gnitz_store::read::SourceCursor;
+use gnitz_store::relation::Residency;
 use gnitz_wire::{ReadBound, ReadSpec, WireFault};
 use rustc_hash::FxHashSet;
 use std::rc::Rc;
@@ -81,7 +82,7 @@ impl CatalogEngine {
         // A worker-count or STATE_FORMAT change re-shapes every keyed store, so no
         // view resumes and nothing below need be read.
         if !topo_valid {
-            self.registry.set_non_resumable(&view_ids);
+            self.dag.set_rebuild(view_ids.into_iter().collect());
             return;
         }
 
@@ -113,8 +114,17 @@ impl CatalogEngine {
         let seeds = invalid.iter().copied().collect();
         let reached = self.dag.dependent_closure(seeds);
         invalid.extend(reached.into_iter().filter(|v| view_set.contains(v)));
-        self.registry
-            .set_non_resumable(&invalid.into_iter().collect::<Vec<_>>());
+        self.dag.set_rebuild(invalid);
+    }
+
+    /// Open this process's stores under the boot's resume verdict: a relation's
+    /// rederived state resumes iff the topology matches and the verdict kept it.
+    pub(crate) fn open_stores(&mut self, rank: u32, residency: Residency) -> Result<usize, String> {
+        let topology = self.topology_matches();
+        let dag = &self.dag;
+        Ok(self
+            .registry
+            .open_stores(rank, residency, |id| topology && !dag.awaits_rebuild(id))?)
     }
 
     /// The cursor driving `source` through `view_id`'s circuit, under the bound the

@@ -135,13 +135,10 @@ fn stream_fed_views_are_invalid_at_boot() {
     engine.registry.checkpoint_ephemeral([]).unwrap();
 
     engine.compute_invalid_views();
+    assert!(engine.dag.awaits_rebuild(direct), "a direct stream source invalidates");
+    assert!(engine.dag.awaits_rebuild(downstream), "and the verdict cascades");
     assert!(
-        engine.registry.is_non_resumable(direct),
-        "a direct stream source invalidates"
-    );
-    assert!(engine.registry.is_non_resumable(downstream), "and the verdict cascades");
-    assert!(
-        !engine.registry.is_non_resumable(over_table),
+        !engine.dag.awaits_rebuild(over_table),
         "a checkpointed view over a base table resumes, so the rejection is about the stream"
     );
 

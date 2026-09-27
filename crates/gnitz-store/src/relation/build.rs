@@ -1,7 +1,7 @@
 //! Opening a relation's stores and entering it in the registry.
 
 use super::*;
-use crate::storage::ChildKind;
+use crate::storage::{remove_children, ChildKind};
 use gnitz_foundation::fault::Seam;
 
 /// `GNITZ_INJECT_TABLE_CREATE_DELAY_MS`: stall a user table's create between its
@@ -9,124 +9,122 @@ use gnitz_foundation::fault::Seam;
 static TABLE_CREATE_DELAY: Seam = Seam::new("GNITZ_INJECT_TABLE_CREATE_DELAY_MS");
 
 impl RelationRegistry {
-    /// Enter a relation and open its stores.
+    /// Enter a relation, its stores opened fresh.
     pub fn register(&mut self, spec: RelationSpec) -> Result<(), StoreError> {
-        self.enter(spec, false)
+        let stores = self.build_relation_store(spec, false)?;
+        self.enter(spec, stores);
+        Ok(())
     }
 
     /// Enter a view whose rows open from the manifest already in its directory;
     /// `Err`, entering nothing, otherwise.
     pub fn reopen_view(&mut self, spec: RelationSpec) -> Result<(), StoreError> {
-        let id = spec.id;
-        self.enter(spec, true)?;
-        if self.relation(id).is_some_and(Relation::resumed) {
-            return Ok(());
+        let stores = self.build_relation_store(spec, true)?;
+        if !stores.0.held().resumed_from_checkpoint() {
+            return Err(StoreError::rejected(format!(
+                "view {} did not reopen from its manifest",
+                spec.id
+            )));
         }
-        self.unregister(id);
-        Err(StoreError::rejected(format!(
-            "view {id} did not reopen from its manifest"
-        )))
-    }
-
-    fn enter(&mut self, spec: RelationSpec, from_manifest: bool) -> Result<(), StoreError> {
-        let RelationSpec { id, kind, schema } = spec;
-        let (store, delta) = self.build_relation_store(kind, id, schema, from_manifest)?;
-        let relation = Relation {
-            id,
-            store,
-            delta,
-            indexes: Vec::new(),
-            kind,
-        };
-        self.tables.insert(id, relation);
+        self.enter(spec, stores);
         Ok(())
     }
 
-    /// This process's stores for a relation: its rows, and a fed view's deltas.
-    pub(crate) fn build_relation_store(
-        &self,
-        kind: RelationKind,
-        id: i64,
-        schema: SchemaDescriptor,
-        from_manifest: bool,
-    ) -> Result<(Store, Option<Box<Table>>), StoreError> {
-        let props = match kind {
-            RelationKind::View(p) => p,
-            _ => ViewProps::Plain,
-        };
-        // On every process, the master included: a limit first noticed on a
-        // worker would abort after the CREATE was acknowledged.
-        let delta = props
-            .delta_bytes()
-            .map(|budget| {
-                crate::schema::make_delta_schema(&schema)
-                    .map(|delta_schema| (budget, delta_schema))
-                    .ok_or_else(|| {
-                        StoreError::rejected(format!("view {id} has too many columns to carry a delta feed"))
-                    })
-            })
-            .transpose()?;
-
-        let recovery = match kind {
-            RelationKind::Stream => return Ok((Store::Absent(Box::new(schema)), None)),
-            // A view's output store and its operator traces resume from the
-            // manifest the ephemeral checkpoint round stamped, or are rebuilt.
-            RelationKind::View(_) if from_manifest => self.rederive_source(true),
-            RelationKind::View(_) if self.non_resumable.contains(&id) => self.rederive_source(false),
-            RelationKind::View(_) => self.rederive_source(self.resume_enabled),
-            RelationKind::SystemCatalog | RelationKind::BaseTable => RecoverySource::SalReplay,
-        };
-        let directory = &relation_dir(&self.base_dir, id);
-        ensure_dir(directory)?;
-        if kind != RelationKind::SystemCatalog && !self.residency.owns_stores() {
-            return Ok((Store::Absent(Box::new(schema)), None));
-        }
-
-        // Widen the window where the table dir exists but its child subdir does
-        // not, so a DROP of the table deterministically races this create. User
-        // tables only.
-        if kind.is_base_table() {
-            if let Some(ms) = TABLE_CREATE_DELAY.count() {
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-            }
-        }
-
-        let child_dir = match kind {
-            RelationKind::SystemCatalog => directory.to_string(),
-            _ => ChildAddr { kind: ChildKind::Rows, slot: self.slot }.dir(directory),
-        };
-        let table = Table::new(
-            &child_dir,
-            schema,
-            recovery,
-            self.store_budgets().bounded(props.capacity_bytes()),
-        )
-        .map_err(|e| StoreError::storage(format!("open relation {id} (dir={directory})"), e))?;
-        let serves_feed = schema.placement().counts_on(self.slot.rank);
-        let delta = delta
-            .filter(|_| serves_feed)
-            .map(|(budget, s)| self.build_delta_store(directory, id, s, budget))
-            .transpose()?;
-        Ok((Store::Held(Box::new(table)), delta))
+    fn enter(&mut self, spec: RelationSpec, (store, delta): (Store, Option<Box<Table>>)) {
+        let RelationSpec { id, kind, .. } = spec;
+        let prev = self.tables.insert(
+            id,
+            Relation {
+                id,
+                store,
+                delta,
+                indexes: Vec::new(),
+                kind,
+            },
+        );
+        debug_assert!(prev.is_none(), "relation {id} registered twice");
     }
 
-    /// This worker's delta store for a fed view. Erased at open: no delta
-    /// expresses what a boot does to a view, so every cursor restarts.
-    fn build_delta_store(
+    /// This process's stores for a relation: its rows, and a fed view's deltas. A
+    /// view's rows resume from a checkpoint manifest iff `resume`.
+    pub(super) fn build_relation_store(
         &self,
-        directory: &str,
+        spec: RelationSpec,
+        resume: bool,
+    ) -> Result<(Store, Option<Box<Table>>), StoreError> {
+        let RelationSpec { id, kind, schema } = spec;
+        let absent = || Ok((Store::Absent(Box::new(schema)), None));
+        let (recovery, budgets, feed) = match kind {
+            RelationKind::Stream => return absent(),
+            // Its store is the relation directory itself, outside the per-slot child
+            // layout that a worker-count change relays and reclaims.
+            RelationKind::SystemCatalog => {
+                let dir = relation_dir(&self.base_dir, id);
+                let table = Table::new(&dir, schema, RecoverySource::SalReplay, self.store_budgets())
+                    .map_err(|e| StoreError::storage(format!("open store '{dir}'"), e))?;
+                return Ok((Store::Held(Box::new(table)), None));
+            }
+            // The master opens no user store, but it still creates the relation's
+            // directory, so the directory exists by the time the DDL is acknowledged.
+            _ if !self.residency.owns_stores() => {
+                ensure_dir(&relation_dir(&self.base_dir, id))?;
+                return absent();
+            }
+            RelationKind::BaseTable => {
+                if let Some(ms) = TABLE_CREATE_DELAY.count() {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+                (RecoverySource::SalReplay, self.store_budgets(), None)
+            }
+            RelationKind::View(p) => {
+                if !resume {
+                    // The traces a previous compile left here are rebuilt with the rows they
+                    // integrate; one the next compile does not declare would never be erased.
+                    let slot = self.slot;
+                    remove_children(&relation_dir(&self.base_dir, id), |c| {
+                        matches!(c.kind, ChildKind::Scratch(_)) && c.slot == slot
+                    })
+                    .map_err(|e| StoreError::storage(format!("remove the operator traces of view {id}"), e))?;
+                }
+                (
+                    self.rederive_source(resume),
+                    self.store_budgets().bounded(p.capacity_bytes()),
+                    p.delta_bytes(),
+                )
+            }
+        };
+        let rows = self.open_child(id, ChildKind::Rows, schema, recovery, budgets)?;
+        let delta = match feed {
+            Some(budget) if schema.placement().counts_on(self.slot.rank) => {
+                // Admitted by the catalog precheck; a host registering outside it gets the refusal here.
+                let delta_schema = crate::schema::make_delta_schema(&schema).ok_or_else(|| {
+                    StoreError::rejected(format!("view {id} has too many columns to carry a delta feed"))
+                })?;
+                // Erased at open: no delta expresses what a boot does to a view, so every cursor restarts.
+                let table = self.open_child(
+                    id,
+                    ChildKind::Delta,
+                    delta_schema,
+                    self.rederive_source(false),
+                    self.store_budgets().delta(budget),
+                )?;
+                Some(Box::new(table))
+            }
+            _ => None,
+        };
+        Ok((Store::Held(Box::new(rows)), delta))
+    }
+
+    /// This process's `kind` child store of relation `id`.
+    pub(super) fn open_child(
+        &self,
         id: i64,
-        delta_schema: SchemaDescriptor,
-        budget: u64,
-    ) -> Result<Box<Table>, StoreError> {
-        let child = ChildAddr { kind: ChildKind::Delta, slot: self.slot };
-        let table = Table::new(
-            &child.dir(directory),
-            delta_schema,
-            RecoverySource::Rederive { resume_at: None },
-            self.store_budgets().delta(budget),
-        )
-        .map_err(|e| StoreError::storage(format!("open delta store of view {id} (dir={directory})"), e))?;
-        Ok(Box::new(table))
+        kind: ChildKind<'_>,
+        schema: SchemaDescriptor,
+        recovery: RecoverySource,
+        budgets: StoreBudgets,
+    ) -> Result<Table, StoreError> {
+        let dir = ChildAddr { kind, slot: self.slot }.dir(&relation_dir(&self.base_dir, id));
+        Table::new(&dir, schema, recovery, budgets).map_err(|e| StoreError::storage(format!("open store '{dir}'"), e))
     }
 }

@@ -365,7 +365,7 @@ fn uncompiled_view_traces_invalidate_the_view() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     engine.compute_invalid_views();
     assert!(
-        engine.registry.is_non_resumable(vid),
+        engine.dag.awaits_rebuild(vid),
         "an output store ahead of its traces must be rebuilt, not resumed"
     );
 

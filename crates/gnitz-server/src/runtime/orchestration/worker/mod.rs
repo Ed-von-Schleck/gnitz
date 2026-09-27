@@ -554,7 +554,7 @@ impl WorkerProcess {
     /// double-count. A view backfill runs stop-the-world (the DDL parks the
     /// reactor), so it never yields to live traffic between chunks.
     fn handle_backfill(&mut self, source_tid: i64, view_id: i64) -> Result<(), String> {
-        self.cat().registry.begin_rebuild(view_id)?;
+        self.cat().dag.rebuild_started(view_id);
         // Compiled before the first chunk: a failure here is an error reply, where the
         // same failure inside a chunk's epoch is a fatal abort mid-round.
         let cat = self.cat();

@@ -104,7 +104,7 @@ fn swept_base_tables(catalog: &CatalogEngine) -> Vec<i64> {
         .registry
         .view_ids()
         .into_iter()
-        .filter(|&vid| !catalog.registry.is_non_resumable(vid))
+        .filter(|&vid| !catalog.dag.awaits_rebuild(vid))
         .collect();
     catalog.dag.base_tables_reachable_from(&catalog.registry, keeps_state)
 }
@@ -218,7 +218,7 @@ fn worker_boot_recovery(
 ) -> Result<(), String> {
     // Before any other catalog work, and before the replay below, which
     // projects the tail into each index exactly once.
-    let rebuilt = catalog.registry.open_stores(slot.rank, Residency::Worker)?;
+    let rebuilt = catalog.open_stores(slot.rank, Residency::Worker)?;
     // Resume-vs-rebuild marker, the index sibling of the invalid-view line: 0 ⇒
     // every index resumed from its checkpoint.
     gnitz_note!("recovery: rebuilding {rebuilt} index(es)");
@@ -465,7 +465,7 @@ async fn master_post_fork_recovery(
 
     // Rebuild the views the boot verdict rejected, through the driver a live
     // CREATE VIEW uses; they opened empty and the sweep above skipped them.
-    let invalid: Vec<i64> = disp.cat().registry.non_resumable_ids().collect();
+    let invalid: Vec<i64> = disp.cat().dag.take_rebuild().into_iter().collect();
     // Resume-vs-rebuild marker (asserted by the "no backfill on clean restart"
     // E2E): 0 ⇒ every view resumed from its checkpoint.
     gnitz_note!("recovery: rebuilding {} invalid view(s)", invalid.len());

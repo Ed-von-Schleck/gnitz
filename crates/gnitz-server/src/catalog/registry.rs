@@ -219,12 +219,11 @@ impl CatalogEngine {
     }
 
     /// Load the next catalog id stored in `_sequences`, and latch the registry's
-    /// resume verdict and generation from the checkpoint rows beside it.
+    /// resume generation from the checkpoint rows beside it.
     pub(in crate::catalog) fn load_sequence_scalars(&mut self) {
         if let Some(v) = self.sequence_value(SEQ_ID_NEXT_ID) {
             self.next_id = self.next_id.max(v as i64);
         }
-        self.registry.set_resume_enabled(self.topology_matches());
         self.registry.set_resume_generation(self.durable_generation());
     }
 
@@ -256,12 +255,9 @@ impl CatalogEngine {
         Ok(self.registry.checkpoint_ephemeral(self.dag.ephemeral_states())?)
     }
 
-    /// Record the launched topology and latch the registry's resume verdict from
-    /// it. Durable at the next system flush.
+    /// Record the launched topology. Durable at the next system flush.
     pub(crate) fn record_topology(&mut self, worker_count: u32) -> Result<(), String> {
-        self.set_sequence(SEQ_ID_TOPOLOGY, topology_word(worker_count))?;
-        self.registry.set_resume_enabled(self.topology_matches());
-        Ok(())
+        self.set_sequence(SEQ_ID_TOPOLOGY, topology_word(worker_count))
     }
 }
 
