@@ -384,13 +384,6 @@ fn master_pre_fork_recovery(catalog: &mut CatalogEngine) -> Result<(Vec<i64>, u6
     }
     inject_recovery_panic("genbump");
 
-    // Reclaim every directory a committed DROP left behind. After the replay,
-    // so a committed-but-unflushed CREATE is not mistaken for an orphan, and
-    // before the fork, so no worker is applying a DdlSync the master emitted.
-    catalog.reclaim_orphan_dirs();
-
-    // Relay each base table onto this boot's worker count and drop the children
-    // it no longer owns, before any worker opens a store.
     catalog
         .registry
         .reconcile_child_dirs()

@@ -22,6 +22,7 @@ import os
 
 import pytest
 import gnitz
+from _paths import relation_dir
 from _read import bag, scanned
 
 
@@ -221,7 +222,7 @@ def test_an_index_rehomes_onto_the_launched_ranks(own_server):
 
     assert own_server.rebuilt_index_counts() == [1, 1], (
         "every launched rank must re-derive its slice of the one index")
-    table_dir = os.path.join(own_server.data_dir, "_relations", f"t_{tid}")
+    table_dir = relation_dir(own_server.data_dir, tid)
     idx_dirs = sorted(d for d in os.listdir(table_dir) if d.startswith("idx_"))
     n = own_server.workers
     # An index child is named by its column list: `g` is column 1.

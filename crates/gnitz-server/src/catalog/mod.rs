@@ -38,7 +38,6 @@ mod write_path;
 #[cfg(test)]
 mod suites;
 
-use std::fs;
 use std::rc::Rc;
 
 use crate::query::DagEngine;
@@ -71,7 +70,7 @@ use sys_tables::*;
 pub(in crate::catalog) use cache::{CatalogCacheSet, RelFacts};
 pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
 // Directory primitives the catalog consumes rather than owns.
-pub(in crate::catalog) use gnitz_store::relation::{lock_data_dir, DIR_LOCK_RETRY_FOR};
+pub(in crate::catalog) use gnitz_store::relation::{lock_data_dir, DirLock};
 #[cfg(test)]
 pub(in crate::catalog) use gnitz_store::relation::{relation_dir, relations_dir};
 #[cfg(test)]
@@ -95,9 +94,7 @@ pub(crate) struct CatalogEngine {
     pub(crate) registry: RelationRegistry,
     pub(crate) dag: DagEngine,
 
-    /// The `flock` keeping a second writer off `base_dir`. Declared after
-    /// `registry`, so it is released only once every store is closed.
-    _dir_lock: fs::File,
+    _dir_lock: DirLock,
 
     /// Every derived lookup the catalog maintains from system-table deltas and
     /// relation registrations.

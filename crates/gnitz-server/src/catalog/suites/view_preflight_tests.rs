@@ -191,12 +191,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
         "vw",
         &pred_cmp_blob(gnitz_expr::CmpOp::Lt, 1, 100),
     );
-    let old_dir = engine
-        .registry
-        .relation_or_err(old_vid)
-        .unwrap()
-        .directory()
-        .to_string();
+    let old_dir = relation_dir(&dir, old_vid);
 
     // The setup is not part of the bundle being compensated.
     let _ = engine.drain_pending_broadcasts();
@@ -216,12 +211,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     push_view_tab_row(&mut bb, -1, old_vid, "vw", 0, 0, 0);
     push_view_tab_row(&mut bb, 1, new_vid, "vw", 0, 0, 0);
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
-    let new_dir = engine
-        .registry
-        .relation_or_err(new_vid)
-        .unwrap()
-        .directory()
-        .to_string();
+    let new_dir = relation_dir(&dir, new_vid);
     assert!(!engine.registry.has_id(old_vid), "the bundle retires the incumbent");
 
     // The pre-flight rejects the replacement's circuit — the bundle fails after

@@ -1,12 +1,11 @@
 //! Where a mirrored copy lives on disk, through the engine's own path grammar.
 
-use gnitz_store::relation::{relation_dir, RelationKind};
+use gnitz_store::relation::relation_dir;
 use gnitz_store::storage::{ChildAddr, ChildKind, Slot};
-use gnitz_wire::ViewProps;
 
 /// The directory one mirrored copy lives in.
 pub fn copy_dir(base_dir: &str, tid: u64) -> String {
-    relation_dir(base_dir, RelationKind::View(ViewProps::Plain), tid as i64)
+    relation_dir(base_dir, tid as i64)
 }
 
 pub fn manifest_path(base_dir: &str, tid: u64) -> String {

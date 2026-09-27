@@ -30,15 +30,13 @@ impl RelationRegistry {
 
     fn enter(&mut self, spec: RelationSpec, from_manifest: bool) -> Result<(), StoreError> {
         let RelationSpec { id, kind, schema } = spec;
-        let directory = relation_dir(&self.base_dir, kind, id);
-        let (store, delta) = self.build_relation_store(kind, &directory, id, schema, from_manifest)?;
+        let (store, delta) = self.build_relation_store(kind, id, schema, from_manifest)?;
         let relation = Relation {
             id,
             store,
             delta,
             indexes: Vec::new(),
             kind,
-            directory,
         };
         self.tables.insert(id, relation);
         Ok(())
@@ -48,7 +46,6 @@ impl RelationRegistry {
     pub(crate) fn build_relation_store(
         &self,
         kind: RelationKind,
-        directory: &str,
         id: i64,
         schema: SchemaDescriptor,
         from_manifest: bool,
@@ -79,6 +76,7 @@ impl RelationRegistry {
             RelationKind::View(_) => self.rederive_source(self.resume_enabled),
             RelationKind::SystemCatalog | RelationKind::BaseTable => RecoverySource::SalReplay,
         };
+        let directory = &relation_dir(&self.base_dir, id);
         ensure_dir(directory)?;
         if kind != RelationKind::SystemCatalog && !self.residency.owns_stores() {
             return Ok((Store::Absent(Box::new(schema)), None));

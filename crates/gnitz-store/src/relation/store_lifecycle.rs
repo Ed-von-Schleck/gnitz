@@ -2,8 +2,9 @@
 //! relayout and child-dir reclamation, view reset and rebuild start — and the
 //! system families' replay floors recovery reads.
 
+use super::relation_dir;
 use super::{RelationKind, RelationRegistry, Residency, SecondaryIndex};
-use crate::storage::{reclaim_retired_children, remove_child, subdir_names, ChildAddr, ChildKind, Slot, StoreError};
+use crate::storage::{remove_children, ChildKind, Slot, StoreError};
 
 impl RelationRegistry {
     // -- Store management (for multi-worker fork) -----------------------------
@@ -32,7 +33,7 @@ impl RelationRegistry {
             filled += self.reopen_stores(tid, "open store")?;
         }
         // A worker applies the same catalog deltas as the master, but only the
-        // master writes `_sys/` shards.
+        // master writes the system tables' shards.
         if residency == Residency::Worker {
             for entry in self.tables.values_mut() {
                 if entry.kind() == RelationKind::SystemCatalog {
@@ -57,14 +58,14 @@ impl RelationRegistry {
             self.store_budgets(),
         );
         let chunk_rows = self.config.scan_chunk_rows;
-        let entry = self.tables.get(&tid).expect("entry read above");
+        let dir = relation_dir(&self.base_dir, tid);
         let stores = self
-            .build_relation_store(kind, &entry.directory, tid, schema, false)
+            .build_relation_store(kind, tid, schema, false)
             .map_err(|e| e.in_context(&format!("{what} tid={tid}")))?;
         let entry = self.tables.get_mut(&tid).expect("entry read above");
         (entry.store, entry.delta) = stores;
         for ix in &mut entry.indexes {
-            ix.store = Self::open_index_store(slot, recovery, budgets, &entry.directory, ix.cols, ix.schema())?;
+            ix.store = Self::open_index_store(slot, recovery, budgets, &dir, ix.cols, ix.schema())?;
         }
         let mut targets: Vec<&mut SecondaryIndex> = entry.indexes.iter_mut().filter(|ix| !ix.resumed()).collect();
         super::ingest::fill_indexes(&entry.store, chunk_rows, tid, &mut targets)?;
@@ -72,7 +73,7 @@ impl RelationRegistry {
     }
 
     /// Relay each base table's children onto this boot's worker count, then
-    /// reclaim every child directory that count no longer owns. Idempotent.
+    /// [`Self::reclaim_orphan_relation_dirs`]. Idempotent.
     pub fn reconcile_child_dirs(&mut self) -> Result<(), StoreError> {
         // A relay removes the set it read, and the reclaim deletes directories.
         assert_eq!(
@@ -80,24 +81,17 @@ impl RelationRegistry {
             Residency::Master,
             "reconcile_child_dirs runs on a process holding no user store"
         );
-        for entry in self.tables.values() {
-            // System tables are single-partition `Table`s with no children.
-            if entry.kind() == RelationKind::SystemCatalog {
-                continue;
-            }
-            // Only a base table carries rows across a worker-count change.
-            if entry.kind().is_base_table() {
-                crate::storage::repartition_relation(
-                    entry.directory(),
-                    &entry.schema(),
-                    self.slot.of,
-                    self.config.ram_tier_bytes,
-                    self.config.scan_chunk_rows,
-                )?;
-            }
-            reclaim_retired_children(entry.directory(), self.slot.of)
-                .map_err(|e| StoreError::storage(format!("reclaim children of {}", entry.directory()), e))?;
+        // Only a base table carries rows across a worker-count change.
+        for (&id, entry) in self.tables.iter().filter(|(_, e)| e.kind().is_base_table()) {
+            crate::storage::repartition_relation(
+                &relation_dir(&self.base_dir, id),
+                &entry.schema(),
+                self.slot.of,
+                self.config.ram_tier_bytes,
+                self.config.scan_chunk_rows,
+            )?;
         }
+        self.reclaim_orphan_relation_dirs()?;
         self.children_reconciled = true;
         Ok(())
     }
@@ -131,17 +125,11 @@ impl RelationRegistry {
         if !self.non_resumable.contains(&vid) {
             return Ok(());
         }
-        let dir = self
-            .relation_or_err(vid)
-            .map_err(|e| e.in_context("begin_rebuild"))?
-            .directory();
+        self.relation_or_err(vid).map_err(|e| e.in_context("begin_rebuild"))?;
+        let dir = relation_dir(&self.base_dir, vid);
         let slot = self.slot;
         let scratch_err = |e| StoreError::storage(format!("begin_rebuild: scratch of {vid}"), e);
-        for name in subdir_names(dir).map_err(scratch_err)? {
-            if ChildAddr::parse(&name).is_some_and(|c| matches!(c.kind, ChildKind::Scratch(_)) && c.slot == slot) {
-                remove_child(&format!("{dir}/{name}")).map_err(scratch_err)?;
-            }
-        }
+        remove_children(&dir, |c| matches!(c.kind, ChildKind::Scratch(_)) && c.slot == slot).map_err(scratch_err)?;
         self.non_resumable.remove(&vid);
         Ok(())
     }
@@ -155,9 +143,12 @@ impl RelationRegistry {
             matches!(self.residency, Residency::Master | Residency::Origin),
             "view_children_resumable reads every rank's children"
         );
-        self.relation(view_id).is_some_and(|e| {
-            crate::storage::children_at_generation(e.directory(), self.slot.of, self.resume_generation)
-        })
+        self.has_id(view_id)
+            && crate::storage::children_at_generation(
+                &relation_dir(&self.base_dir, view_id),
+                self.slot.of,
+                self.resume_generation,
+            )
     }
 
     /// The system families' `table id → replay floor` their stores opened with:

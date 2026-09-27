@@ -140,8 +140,11 @@ impl CatalogEngine {
     /// every worker has ACKed a round written after the last DdlSync, so it declines
     /// while an applied DDL's broadcasts are still queued.
     pub(crate) fn reclaim_orphan_dirs(&self) {
-        if self.pending_broadcasts.is_empty() {
-            self.registry.reclaim_orphan_relation_dirs();
+        if !self.pending_broadcasts.is_empty() {
+            return;
+        }
+        if let Err(e) = self.registry.reclaim_orphan_relation_dirs() {
+            gnitz_warn!("catalog: orphan directory sweep failed: {}", e);
         }
     }
 

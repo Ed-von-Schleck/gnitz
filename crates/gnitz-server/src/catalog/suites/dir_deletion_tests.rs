@@ -11,7 +11,7 @@ fn dropped_relation_dir_survives_until_the_sweep() {
     let tid = engine
         .create_table("public.t", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
-    let tbl_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
+    let tbl_dir = relation_dir(&dir, tid);
 
     engine.drop_table("public.t").unwrap();
     let _ = engine.drain_pending_broadcasts();
@@ -36,7 +36,7 @@ fn sweep_declines_while_an_applied_change_is_queued() {
     let tid = engine
         .create_table("public.t", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
-    let tbl_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
+    let tbl_dir = relation_dir(&dir, tid);
     let _ = engine.drain_pending_broadcasts();
 
     engine.submit_retraction(SysFamily::Table, tid).unwrap();
@@ -62,7 +62,7 @@ fn sweep_keeps_a_re_registered_id() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let tbl_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
+    let tbl_dir = relation_dir(&dir, tid);
 
     engine.drop_table("public.t").unwrap();
     let _ = engine.drain_pending_broadcasts();
@@ -98,7 +98,7 @@ fn gc_reclaims_orphan_table_dir() {
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
-    let live_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
+    let live_dir = relation_dir(&dir, tid);
     assert!(Path::new(&live_dir).exists());
 
     // Fabricate a sibling orphan dir no live entity owns — the residue of a DROP
@@ -120,22 +120,25 @@ fn gc_reclaims_orphan_table_dir() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// An orphaned view directory is reclaimed.
+// A well-formed relation directory whose id no relation holds is reclaimed.
 #[test]
-fn gc_reclaims_orphan_view_dir() {
-    let dir = temp_dir("gc_orphan_view");
+fn gc_reclaims_unregistered_relation_dir() {
+    let dir = temp_dir("gc_unregistered_relation");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let live_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
+    let live_dir = relation_dir(&dir, tid);
 
-    let ghost = relation_dir(&dir, RelationKind::View(gnitz_wire::ViewProps::Plain), 4242);
+    let ghost = relation_dir(&dir, 4242);
     std::fs::create_dir_all(&ghost).unwrap();
 
     let _ = engine.drain_pending_broadcasts();
     engine.reclaim_orphan_dirs();
 
-    assert!(!Path::new(&ghost).exists(), "orphan view dir must be reclaimed");
+    assert!(
+        !Path::new(&ghost).exists(),
+        "unregistered relation dir must be reclaimed"
+    );
     assert!(Path::new(&live_dir).exists(), "live table dir must survive");
 
     engine.close();
@@ -152,7 +155,7 @@ fn gc_reclaims_orphan_index_dir() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     engine.create_index("public.t", &["val"], false).unwrap();
 
-    let tbl_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
+    let tbl_dir = relation_dir(&dir, tid);
     let index_child = |cols: &[u32]| {
         ChildAddr {
             kind: ChildKind::Index(gnitz_wire::PkColList::from_slice(cols)),
@@ -204,16 +207,16 @@ fn gc_leaves_live_entities_untouched() {
     engine.create_schema("s2").unwrap();
     let t3 = engine.create_table("s2.t", &cols, &[0]).unwrap();
 
-    // Id-only directories: `t_{tid}`, regardless of the table name.
+    // Id-only directories: `{tid}`, regardless of the table name.
     let dirs = [
-        relation_dir(&dir, RelationKind::BaseTable, t1),
+        relation_dir(&dir, t1),
         ChildAddr {
             kind: ChildKind::Index(gnitz_wire::PkColList::from_slice(&[1])),
             slot: Slot::SOLO,
         }
-        .dir(&relation_dir(&dir, RelationKind::BaseTable, t1)),
-        relation_dir(&dir, RelationKind::BaseTable, t2),
-        relation_dir(&dir, RelationKind::BaseTable, t3),
+        .dir(&relation_dir(&dir, t1)),
+        relation_dir(&dir, t2),
+        relation_dir(&dir, t3),
     ];
     for d in &dirs {
         assert!(Path::new(d).exists(), "precondition: {d} exists");
@@ -242,7 +245,7 @@ fn gc_is_idempotent() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let live = relation_dir(&dir, RelationKind::BaseTable, tid);
+    let live = relation_dir(&dir, tid);
 
     let ghost = format!("{}/ghost_{}", relations_dir(&dir), tid + 5000);
     std::fs::create_dir_all(&ghost).unwrap();
@@ -273,7 +276,7 @@ fn replicated_table_with_a_shard(engine: &mut CatalogEngine, flush: bool) -> (i6
     let cols = vec![col_def("id", TypeCode::U64), col_def("x", TypeCode::I64)];
     let rt = create_flagged_table(engine, "rt", &cols, &[0], replicated_flags());
 
-    let rel_dir = engine.registry.relation_or_err(rt).unwrap().directory().to_string();
+    let rel_dir = relation_dir(engine.registry.base_dir(), rt);
     let mut bb = BatchBuilder::new(engine.registry.relation(rt).map(Relation::schema).unwrap());
     bb.begin_row(1u128, 1);
     bb.put_int(7);
@@ -400,7 +403,7 @@ fn set_rows(dir: &str, of: u32, schema: SchemaDescriptor, tid: i64) -> Vec<(u32,
 /// Replace the `of`-worker child set of `tid` with exactly `rows`, publishing
 /// every child — the empty ones too, as a checkpoint's base round does.
 fn seed_set(dir: &str, of: u32, schema: SchemaDescriptor, tid: i64, rows: &[(u128, i64)]) {
-    let rel = relation_dir(dir, RelationKind::BaseTable, tid);
+    let rel = relation_dir(dir, tid);
     for k in 0..of {
         fs::remove_dir_all(child_path(&rel, k, of)).ok();
         let mut registry = child_registry(dir, k, of, schema, tid);
@@ -414,7 +417,7 @@ fn retired_children_are_reclaimed() {
     let mut engine = CatalogEngine::open(&dir, 3).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("x", TypeCode::I64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
+    let rel = relation_dir(&dir, tid);
     engine.close();
 
     for k in 0..2 {
@@ -495,7 +498,7 @@ fn keyed_table_round_trips_across_worker_counts() {
 
         let mut engine = CatalogEngine::open(&dir, w_old).unwrap();
         let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-        let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
+        let rel = relation_dir(&dir, tid);
         let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
         engine.close();
 
@@ -532,7 +535,7 @@ fn repartition_handles_a_relation_with_empty_children() {
     let mut engine = CatalogEngine::open(&dir, 3).unwrap();
     // CLUSTER BY (a): every row shares `a = 1`, so all of them hash alike.
     let tid = create_flagged_table(&mut engine, "cb", &cols, &[0, 1], clustered_flags(1));
-    let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
+    let rel = relation_dir(&dir, tid);
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
@@ -570,7 +573,7 @@ fn two_complete_sets_left_by_a_crash_relay_either() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("x", TypeCode::I64)];
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
+    let rel = relation_dir(&dir, tid);
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
@@ -631,7 +634,7 @@ fn a_torn_set_at_the_launched_count_is_not_a_relayout() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("x", TypeCode::I64)];
     let mut engine = CatalogEngine::open(&dir, 3).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
+    let rel = relation_dir(&dir, tid);
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
@@ -660,7 +663,7 @@ fn repartition_refuses_an_unreadable_child_grammar() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("x", TypeCode::I64)];
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
+    let rel = relation_dir(&dir, tid);
     engine.close();
 
     fabricate_dir(&format!("{rel}/part_7"), "manifest.bin");
@@ -680,7 +683,7 @@ fn a_torn_foreign_set_moves_nothing() {
         let cols = vec![col_def("id", TypeCode::U64), col_def("x", TypeCode::I64)];
         let mut engine = CatalogEngine::open(&dir, 4).unwrap();
         let tid = create_flagged_table(&mut engine, "t", &cols, &[0], flags);
-        let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
+        let rel = relation_dir(&dir, tid);
         let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
         engine.close();
 
@@ -715,7 +718,7 @@ fn a_partial_target_at_the_launched_count_is_not_current() {
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("x", TypeCode::I64)];
     let rt = create_flagged_table(&mut engine, "rt", &cols, &[0], replicated_flags());
-    let rel = engine.registry.relation_or_err(rt).unwrap().directory().to_string();
+    let rel = relation_dir(&dir, rt);
     let schema = engine.registry.relation(rt).map(Relation::schema).unwrap();
     engine.close();
 
@@ -752,7 +755,7 @@ fn repartition_is_not_run_on_an_unchanged_restart() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("x", TypeCode::I64)];
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
+    let rel = relation_dir(&dir, tid);
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     engine.close();
 

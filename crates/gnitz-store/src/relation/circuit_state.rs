@@ -1,7 +1,7 @@
 //! The rederived operator state of one compiled circuit: the children its
 //! compile declares, and the stores it opens for them.
 
-use super::RelationRegistry;
+use super::{relation_dir, RelationRegistry};
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, ChildAddr, ChildKind, ReadCursor, StorageError, StoreError, Table};
 
@@ -54,7 +54,7 @@ impl CircuitState {
                     kind: ChildKind::Scratch(&child),
                     slot: reg.slot(),
                 }
-                .dir(view.directory());
+                .dir(&relation_dir(reg.base_dir(), view_id));
                 // Unbounded: a bounded view's hydration reads these traces back.
                 Table::new(&dir, schema, recovery, reg.store_budgets())
                     .map_err(|e| StoreError::storage(format!("open child store '{dir}'"), e))
@@ -94,11 +94,7 @@ impl CircuitState {
         Ok(t.open_cursor())
     }
 
-    /// True iff this state holds at least one child and every one came back from
-    /// a manifest at the generation it was opened for — the in-process twin of
-    /// [`RelationRegistry::view_children_resumable`]'s on-disk peek. A state
-    /// holding no child answers `false`, not the vacuous `true` of "every one of
-    /// zero resumed".
+    /// True iff this state holds a child and every child resumed from a manifest.
     pub fn resumed(&self) -> bool {
         !self.tables.is_empty() && self.tables.iter().all(Table::resumed_from_checkpoint)
     }

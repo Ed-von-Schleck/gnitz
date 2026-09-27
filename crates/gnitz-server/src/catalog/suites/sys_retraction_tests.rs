@@ -74,7 +74,7 @@ fn stale_schema_retraction_spares_the_live_schemas_directory() {
     let new_sid = engine.schema_id("s").expect("the schema exists");
     assert_ne!(old_sid, new_sid, "the recreate must allocate a fresh id");
     let tid = engine.create_table("s.t", &cols, &[0]).unwrap();
-    let tbl_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
+    let tbl_dir = relation_dir(&dir, tid);
     assert!(Path::new(&tbl_dir).exists());
 
     let err = engine
@@ -109,7 +109,7 @@ fn schema_retraction_under_another_schemas_name_rejected() {
     engine.create_schema("b").unwrap();
     let sid_a = engine.schema_id("a").expect("the schema exists");
     let tid = engine.create_table("b.t", &cols, &[0]).unwrap();
-    let b_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
+    let b_dir = relation_dir(&dir, tid);
 
     let err = engine
         .ingest_to_family(SCHEMA_TAB_ID, &schema_tab_batch(sid_a, -1, "b"))

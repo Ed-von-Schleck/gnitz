@@ -68,8 +68,7 @@ pub(crate) use seek::{pk_group_end, pk_prefix_group_end};
 // caller names `crate::schema::key::X`, so one byte-order rule has one import
 // path.
 pub(crate) use lsm::child_dir::children_at_generation;
-pub(crate) use lsm::child_dir::reclaim_retired_children;
-pub(crate) use lsm::child_dir::remove_child;
+pub(crate) use lsm::child_dir::remove_children;
 pub(crate) use lsm::child_dir::subdir_names;
 pub use lsm::child_dir::Slot;
 pub(crate) use lsm::child_dir::{caller_record_at, parse_id};

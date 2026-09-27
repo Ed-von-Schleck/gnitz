@@ -17,7 +17,7 @@ fn relation_test_dir(name: &str) -> String {
 fn register_entry(registry: &mut RelationRegistry, id: i64, schema: SchemaDescriptor, kind: RelationKind) -> String {
     let spec = RelationSpec { id, kind, schema };
     registry.register(spec).unwrap();
-    registry.relation(id).unwrap().directory().to_string()
+    relation_dir(registry.base_dir(), id)
 }
 
 #[test]
@@ -287,11 +287,11 @@ fn a_unique_index_covering_the_pk_has_nothing_left_to_check() {
     assert_eq!(cols, vec![vec![1u32]]);
 }
 
-/// Only a directory named exactly as a view's is read, and a damaged manifest
-/// holds no record.
+/// Only a directory named exactly as a relation's is read, and a damaged
+/// manifest holds no record.
 #[test]
-fn persisted_view_records_reads_well_formed_view_manifests() {
-    let mut registry = solo_registry("persisted_view_records");
+fn persisted_records_reads_well_formed_relation_manifests() {
+    let mut registry = solo_registry("persisted_records");
     registry.set_resume_enabled(true);
     let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
     let view = RelationKind::View(ViewProps::Plain);
@@ -309,13 +309,13 @@ fn persisted_view_records_reads_well_formed_view_manifests() {
     bytes[last] ^= 1;
     std::fs::write(&manifest, bytes).unwrap();
     // A name that parses to `good`'s id but is not the name its directory has.
-    let alias = format!("{}/v_0{good}", relations_dir(&registry.base_dir));
+    let alias = format!("{}/0{good}", relations_dir(&registry.base_dir));
     let alias_rows = rows.dir(&alias);
     std::fs::create_dir_all(&alias_rows).unwrap();
     std::fs::copy(rows.manifest(&good_dir), format!("{alias_rows}/manifest.bin")).unwrap();
 
     let records: Vec<(i64, Vec<u8>)> = registry
-        .persisted_view_records()
+        .persisted_records()
         .unwrap()
         .into_iter()
         .map(|(id, r)| (id, r.unwrap()))

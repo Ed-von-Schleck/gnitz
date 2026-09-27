@@ -18,12 +18,14 @@ What a `WITH (capacity = …)` clause *refuses*: the eligible-body rule is the
 engine's, tested in `crates/gnitz-sql/tests/engine_views.rs`. The leaf rule and
 the option grammar are the planner's, in `plan_view_rejections.rs`.
 """
+import glob
 import os
 import struct
 
 import pytest
 import gnitz
 from _feedviews import JOIN, LINEAR, _base_tables, _churn
+from _paths import relation_dir
 from _read import bag, rows
 from _uid import uid as _uid
 
@@ -46,14 +48,8 @@ _SKELETON_ROW_BYTES = 8 + 8
 
 
 def _shard_files(data_dir, view_id):
-    """Every `.db` shard of `view_id`'s *output* store (`w{k}of{n}`), on every
-    worker — not its operator traces (`scratch_*`), which the capacity does not
-    bound."""
-    out = []
-    for root, _dirs, files in os.walk(data_dir):
-        rel, child = os.path.split(root)
-        if rel.endswith(f"_{view_id}") and child.startswith("w") and "of" in child:
-            out += [os.path.join(root, f) for f in files if f.endswith(".db")]
+    """Every shard of `view_id`'s output store, on every worker."""
+    out = glob.glob(os.path.join(relation_dir(data_dir, view_id), "w*of*", "*.db"))
     assert out, f"no output shard of view {view_id} under {data_dir}"
     return out
 

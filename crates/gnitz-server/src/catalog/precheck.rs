@@ -17,7 +17,7 @@ use gnitz_wire::{low_bits_mask, BitIter, TypeCode, IDXTAB_PAY_NAME, SCHEMATAB_PA
 /// Deliberately **not** `validate_user_identifier`, whose leading-`_` reservation
 /// is client-side *policy*: the engine must accept the `_seg…` segment rows the
 /// client writes. The residual — a raw bundle naming a relation `_foo` — is
-/// unreferenceable from SQL and lives in a `t_<id>` directory.
+/// unreferenceable from SQL and lives in a directory named by its id.
 fn reject_unstorable_name(name: &str, noun: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err(format!("{noun} name cannot be empty"));

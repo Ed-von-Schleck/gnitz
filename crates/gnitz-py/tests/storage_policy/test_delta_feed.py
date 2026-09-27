@@ -24,6 +24,7 @@ from _feedviews import (
     FEED, GROUPBY, JOIN, LINEAR, SETOP,
     _base_tables, _churn, _flood, _mk_feed, _zset,
 )
+from _paths import relation_dir
 from _uid import uid as _uid
 from _serverproc import NEEDS_MULTI
 
@@ -407,6 +408,6 @@ def test_a_replicated_feed_lives_on_worker_zero_alone(own_server):
         assert sub.copy, "the feed carried the rounds the churn produced"
         vid = sub.vid
 
-    view_dir = os.path.join(own_server.data_dir, "_relations", f"v_{vid}")
+    view_dir = relation_dir(own_server.data_dir, vid)
     feeds = sorted(d for d in os.listdir(view_dir) if d.startswith("delta_w"))
     assert feeds == [f"delta_w0of{own_server.workers}"], f"only worker 0 serves this feed, found {feeds}"

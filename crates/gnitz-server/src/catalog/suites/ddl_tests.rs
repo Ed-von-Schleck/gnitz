@@ -133,10 +133,7 @@ fn family_weights(engine: &CatalogEngine, family: SysFamily) -> Vec<i64> {
 fn fresh_db_missing_manifest(name: &str, family: SysFamily) -> String {
     let dir = temp_dir(name);
     CatalogEngine::open(&dir, 1).unwrap().close();
-    let manifest = format!(
-        "{}/manifest.bin",
-        relation_dir(&dir, RelationKind::SystemCatalog, family.id())
-    );
+    let manifest = format!("{}/manifest.bin", relation_dir(&dir, family.id()));
     fs::remove_file(&manifest).unwrap();
     dir
 }
@@ -649,12 +646,7 @@ fn test_drop_view_removes_directory() {
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
 
     // The register hook created the physical view directory on disk.
-    let view_dir = engine
-        .registry
-        .relation_or_err(vid)
-        .expect("view registered in dag")
-        .directory()
-        .to_string();
+    let view_dir = relation_dir(&dir, vid);
     assert!(
         std::path::Path::new(&view_dir).exists(),
         "view dir should exist after create: {view_dir}"

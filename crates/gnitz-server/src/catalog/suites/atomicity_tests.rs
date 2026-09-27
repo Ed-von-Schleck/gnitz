@@ -583,7 +583,7 @@ fn ddl_txn_hook_failure_is_compensated() {
     let col_batch = col_tab_batch(new_tid, &cols, 1);
     engine.submit(SysFamily::Column, col_batch).unwrap();
 
-    let blocker = relation_dir(&dir, RelationKind::BaseTable, new_tid);
+    let blocker = relation_dir(&dir, new_tid);
     fs::write(&blocker, b"not a directory").unwrap();
 
     let table_batch = build_table_tab_row(new_tid, pack_pk_cols(&[0]), "hooktbl");
@@ -730,7 +730,7 @@ fn precheck_rejected_create_index_writes_no_ghost() {
 fn compensating_a_drop_keeps_the_restored_relation_directory() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let (mut engine, tid, dir) = table_fixture("compensate_drop_keeps_dir", &cols);
-    let reldir = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
+    let reldir = relation_dir(&dir, tid);
     // The fixture's own CREATE is a committed DDL; only the bundle below is the
     // one being compensated.
     engine.drain_pending_broadcasts();
@@ -851,7 +851,7 @@ fn compensated_create_table_leaves_no_trace() {
     }
     assert!(engine.registry.relation(tid).unwrap().index_on(&[1]).is_some());
 
-    let reldir = relation_dir(&dir, RelationKind::BaseTable, tid);
+    let reldir = relation_dir(&dir, tid);
     let blocker = ChildAddr {
         kind: ChildKind::Index(gnitz_wire::PkColList::from_slice(&[2])),
         slot: engine.registry.slot(),

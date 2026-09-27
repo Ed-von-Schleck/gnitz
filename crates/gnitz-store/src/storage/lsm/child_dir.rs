@@ -168,12 +168,12 @@ pub(crate) fn remove_child(dir: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Remove every child of `dir` laid out for a different worker count than
-/// `num_workers`; names in no child grammar are left alone.
-pub(crate) fn reclaim_retired_children(dir: &str, num_workers: u32) -> Result<(), StorageError> {
+/// Retire every child of `dir` that `dead` picks; names in no child grammar are
+/// left alone.
+pub(crate) fn remove_children(dir: &str, dead: impl Fn(&ChildAddr) -> bool) -> Result<(), StorageError> {
     for name in subdir_names(dir)? {
-        if ChildAddr::parse(&name).is_some_and(|c| c.slot.of != num_workers) {
-            gnitz_debug!("recovery: removing retired child dir {}/{}", dir, name);
+        if ChildAddr::parse(&name).is_some_and(|c| dead(&c)) {
+            gnitz_debug!("storage: removing child dir {}/{}", dir, name);
             remove_child(&format!("{dir}/{name}"))?;
         }
     }

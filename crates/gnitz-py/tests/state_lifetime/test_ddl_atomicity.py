@@ -17,6 +17,7 @@ import signal
 
 import pytest
 import gnitz
+from _paths import relation_dir
 from _read import bag, scanned
 
 
@@ -120,21 +121,17 @@ def test_the_boot_sweep_reclaims_exactly_the_dropped_directories(own_server):
         dropped_tid, _ = conn.resolve_table("dropped", "t")
         conn.drop_schema("dropped")
 
-    def rel_dir(tid):
-        # Named by id alone, so a name reused across a drop names a fresh dir.
-        return os.path.join(own_server.data_dir, "_relations", f"t_{tid}")
-
-    assert os.path.isdir(rel_dir(a_tid)), \
+    assert os.path.isdir(relation_dir(own_server.data_dir, a_tid)), \
         "dropped a's dir waits for the sweep (still on disk) pre-crash"
 
     own_server.restart()
     with gnitz.connect(own_server.sock_path) as conn:
         assert conn.resolve_table("after_replay", "b")[0] == b_tid
-        assert os.path.isdir(rel_dir(b_tid)), \
+        assert os.path.isdir(relation_dir(own_server.data_dir, b_tid)), \
             "b's SAL-only-created dir must survive recovery"
         conn.execute_sql("INSERT INTO b VALUES (1, 100)", schema_name="after_replay")
         assert bag(scanned(conn, "after_replay", "b"), "pk", "v") == {(1, 100): 1}
-        assert not os.path.exists(rel_dir(a_tid)), \
+        assert not os.path.exists(relation_dir(own_server.data_dir, a_tid)), \
             "dropped a's dir must be reclaimed on boot"
 
         # A dropped table in a live schema is resolved and missed client-side;
@@ -144,5 +141,5 @@ def test_the_boot_sweep_reclaims_exactly_the_dropped_directories(own_server):
         with pytest.raises(gnitz.GnitzError):
             conn.resolve_table("dropped", "t")
 
-    assert not os.path.exists(rel_dir(dropped_tid)), \
+    assert not os.path.exists(relation_dir(own_server.data_dir, dropped_tid)), \
         "the dropped schema's table dir must be gone"

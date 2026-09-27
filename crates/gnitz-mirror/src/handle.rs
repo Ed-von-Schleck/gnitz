@@ -7,7 +7,7 @@ use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RawBlock, Sc
 use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::gnitz_debug;
-use gnitz_store::relation::{lock_data_dir, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
+use gnitz_store::relation::{lock_data_dir, DirLock, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use gnitz_store::storage::{Slot, StoreError};
 use gnitz_wire::ViewProps;
 
@@ -45,9 +45,7 @@ pub struct Mirror {
     pub(crate) registry: RelationRegistry,
     /// One per relation in `registry`.
     pub(crate) records: HashMap<u64, MirrorRecord>,
-    base_dir: String,
-    /// Declared after `registry`, so it is released once every store has closed.
-    _dir_lock: std::fs::File,
+    _dir_lock: DirLock,
     poison: Option<String>,
     applied_bytes: usize,
     checkpoint_bytes: usize,
@@ -59,20 +57,16 @@ pub struct Mirror {
 unsafe impl Send for Mirror {}
 
 impl Mirror {
-    /// Open (or create) a store at `base_dir`.
-    ///
-    /// Fails if `base_dir` is already held — by another process, or by another
-    /// store in this one. The store homes at `w0of1` whatever process it runs
-    /// in, under a directory it locks itself.
+    /// Open (or create) a store at `base_dir`. Fails if another store, in this
+    /// process or another, holds it.
     pub fn open(base_dir: &str) -> Result<Self, MirrorError> {
         // No retry: no forked child inherits a mirror's lock, so a holder is live.
         let dir_lock = lock_data_dir(base_dir, std::time::Duration::ZERO).map_err(engine)?;
         let registry = RelationRegistry::new(base_dir, Slot::SOLO, StoreConfig::from_env("GNITZ_MIRROR_"));
-        let persisted = registry.persisted_view_records().map_err(engine)?;
+        let persisted = registry.persisted_records().map_err(engine)?;
         let mut mirror = Mirror {
             registry,
             records: HashMap::new(),
-            base_dir: base_dir.to_string(),
             _dir_lock: dir_lock,
             poison: None,
             applied_bytes: 0,
@@ -94,7 +88,9 @@ impl Mirror {
         }
         // A failure may be transient, and the sweep would delete that copy.
         if all_reopened {
-            mirror.registry.reclaim_orphan_relation_dirs();
+            if let Err(e) = mirror.registry.reclaim_orphan_relation_dirs() {
+                gnitz_debug!("mirror: orphan directory sweep failed: {}", e);
+            }
         }
         Ok(mirror)
     }
@@ -218,7 +214,7 @@ impl Mirror {
 /// poisoned store must still do.
 impl MirrorStore for Mirror {
     fn base_dir(&self) -> &str {
-        &self.base_dir
+        self.registry.base_dir()
     }
 
     fn register(

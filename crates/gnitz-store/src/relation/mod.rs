@@ -25,7 +25,7 @@ mod unique_pk;
 
 pub use circuit_state::{CircuitState, StateIdx, StateLayout};
 pub(crate) use dirs::ensure_dir;
-pub use dirs::{lock_data_dir, relation_dir, relations_dir, DIR_LOCK_RETRY_FOR};
+pub use dirs::{lock_data_dir, relation_dir, relations_dir, DirLock};
 pub(crate) use store::Store;
 
 // ---------------------------------------------------------------------------
@@ -211,10 +211,6 @@ pub struct Relation {
     delta: Option<Box<Table>>,
     indexes: Vec<SecondaryIndex>,
     kind: RelationKind,
-    /// This relation's on-disk directory, parent of its `ChildAddr` subdirs. It
-    /// exists once the relation is created, so it anchors an `O_TMPFILE` spill
-    /// onto the same disk as the relation's data.
-    directory: String,
 }
 
 impl Relation {
@@ -236,10 +232,6 @@ impl Relation {
 
     pub fn kind(&self) -> RelationKind {
         self.kind
-    }
-
-    pub fn directory(&self) -> &str {
-        &self.directory
     }
 
     /// Whether this relation keeps a delta feed, whether or not this process holds
@@ -486,10 +478,7 @@ impl RelationRegistry {
     /// trusted: a duplicate can straddle two workers' slices, so only the caller
     /// can check it.
     pub fn add_index(&mut self, owner: i64, index_id: i64, cols: &[u32], is_unique: bool) -> Result<(), StoreError> {
-        let (owner_schema, owner_dir) = {
-            let e = self.index_owner(owner)?;
-            (e.schema(), e.directory.clone())
-        };
+        let owner_schema = self.index_owner(owner)?.schema();
         if let Some(ix) = self.relation_mut(owner).and_then(|e| e.index_on_mut(cols)) {
             // The IDX_TAB net bound keeps one live row per id, applied once per process.
             debug_assert!(
@@ -513,7 +502,7 @@ impl RelationRegistry {
                 self.slot,
                 self.rederive_source(false),
                 self.store_budgets(),
-                &owner_dir,
+                &relation_dir(&self.base_dir, owner),
                 PkColList::from_slice(cols),
                 index_schema,
             )?;
@@ -576,6 +565,11 @@ impl RelationRegistry {
         self.tables.contains_key(&id)
     }
 
+    /// The data directory every relation's [`relation_dir`] sits under.
+    pub fn base_dir(&self) -> &str {
+        &self.base_dir
+    }
+
     pub fn slot(&self) -> Slot {
         self.slot
     }
@@ -634,13 +628,6 @@ impl RelationRegistry {
 
     fn unregistered(id: i64) -> StoreError {
         StoreError::rejected(format!("relation {id} is not registered"))
-    }
-
-    /// Every registered relation, in no defined order — what the boot orphan
-    /// sweep names its live table and index directories from. Each names its own
-    /// id, so the walk yields the relation alone.
-    pub fn relations(&self) -> impl Iterator<Item = &Relation> + '_ {
-        self.tables.values()
     }
 
     /// True iff at least one registered relation carries a delta feed.

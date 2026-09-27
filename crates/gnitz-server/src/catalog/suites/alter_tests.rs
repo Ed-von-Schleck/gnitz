@@ -56,7 +56,7 @@ fn rename_fires_no_cascade_and_leaves_dir_untouched() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
     let tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
-    let table_path = relation_dir(&dir, RelationKind::BaseTable, tid);
+    let table_path = relation_dir(&dir, tid);
     assert!(Path::new(&table_path).exists());
 
     let pair = table_rename_pair(&engine, tid, "renamed");
@@ -102,7 +102,7 @@ fn rename_then_reopen_resolves_flushed_data() {
         engine.close();
     }
 
-    // Reopen: boot replay re-registers at the id-only path `t_{tid}` (unchanged by
+    // Reopen: boot replay re-registers at the id-only path `{tid}` (unchanged by
     // the rename), so the flushed row still resolves under the new name.
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(

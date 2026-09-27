@@ -126,7 +126,7 @@ fn test_failed_create_index_rolls_back() {
         kind: ChildKind::Index(gnitz_wire::PkColList::from_slice(&[1])),
         slot: engine.registry.slot(),
     };
-    let blocker = index.dir(&relation_dir(&dir, RelationKind::BaseTable, tid));
+    let blocker = index.dir(&relation_dir(&dir, tid));
     fs::write(&blocker, b"not a directory").unwrap();
     let idx_name = make_secondary_index_name("public", "t", "val");
 
@@ -879,7 +879,7 @@ fn compensated_drop_of_a_shared_index_keeps_its_directory() {
     engine.submit_retraction(SysFamily::Index, ids[0]).unwrap();
     let _ = engine.drain_pending_broadcasts();
 
-    let reldir = relation_dir(&dir, RelationKind::BaseTable, tid);
+    let reldir = relation_dir(&dir, tid);
     let index_dirs = || {
         let mut names: Vec<String> = fs::read_dir(&reldir)
             .unwrap()

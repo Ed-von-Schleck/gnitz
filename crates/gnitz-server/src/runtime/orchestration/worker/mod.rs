@@ -604,7 +604,8 @@ impl WorkerProcess {
         // One resolve for all three — the cursor owns its sources by `Rc`, so it
         // outlives the entry borrow and pins the snapshot the DDL section froze.
         let e = self.cat().registry.relation_or_err(owner_id)?;
-        let (schema, dir, mut handle) = (e.schema(), e.directory().to_string(), e.cursor());
+        let (schema, mut handle) = (e.schema(), e.cursor());
+        let dir = gnitz_store::relation::relation_dir(self.cat().registry.base_dir(), owner_id);
         let (spec, idx_schema) = gnitz_store::schema::index_spec_and_schema(col_indices, &schema)?;
         let frame_schema = crate::runtime::wire::unique_preflight_wire_schema(&idx_schema, col_indices.len());
 

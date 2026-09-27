@@ -1,5 +1,9 @@
 use super::*;
 
+/// How long the master waits out a held data-directory lock: a forked worker
+/// can still hold the lock it inherited just after its master exits.
+const DIR_LOCK_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A master catalog with only its system families registered, their stores open.
 /// [`Self::replay`] registers the rest.
 pub(crate) struct UnreplayedCatalog(CatalogEngine);
