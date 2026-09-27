@@ -159,3 +159,25 @@ mod staging {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// The AF_UNIX bind replaces only a stale socket: a regular file at the path
+/// and a socket a live server answers on each refuse the boot, untouched.
+#[test]
+fn bind_unix_socket_replaces_only_a_stale_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.sock");
+    let path_str = path.to_str().unwrap();
+
+    std::fs::write(&path, b"data").unwrap();
+    let e = bind_unix_socket(path_str).expect_err("a regular file refuses");
+    assert!(e.contains("is not a socket"), "{e}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"data", "and survives");
+    std::fs::remove_file(&path).unwrap();
+
+    let live = bind_unix_socket(path_str).expect("a free path binds");
+    let e = bind_unix_socket(path_str).expect_err("a live socket refuses");
+    assert!(e.contains("running server"), "{e}");
+
+    drop(live);
+    bind_unix_socket(path_str).expect("a stale socket is replaced");
+}

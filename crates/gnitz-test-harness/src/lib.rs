@@ -10,10 +10,12 @@ use std::{env, fs, thread};
 
 use tempfile::TempDir;
 
-/// Wall-clock budget for the server to create its listening socket.
+/// Wall-clock budget for the server to log its readiness marker.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-/// Upper bound on the readiness poll interval; the poll backs off up to this.
-const POLL_MAX: Duration = Duration::from_millis(50);
+/// How often the boot is checked for readiness or an early exit.
+const POLL_INTERVAL: Duration = Duration::from_millis(2);
+/// What the server logs once every listener is bound and published.
+const READY_MARKER: &str = "GnitzDB ready";
 
 /// Server binary plus the tmpdir's data/socket/stderr paths — the spawn inputs
 /// every entry point passes together.
@@ -30,13 +32,13 @@ pub struct ServerHandle {
     paths: BootPaths,
     tmpdir: Option<TempDir>,
     workers: usize,
-    tls: bool,
+    /// The boot's TLS argv and server-side environment, replayed by
+    /// [`Self::restart`].
+    args: Vec<String>,
+    env: Vec<(String, String)>,
     /// mTLS client cert/key PEM paths (minted by `start_mtls`), for
     /// [`Self::mtls_target`]. `None` for non-mTLS servers.
     mtls_client: Option<(PathBuf, PathBuf)>,
-    /// `--tls-client-ca` PEM path, if this server requires mTLS. Stored so
-    /// [`Self::restart`] replays the flag on respawn.
-    client_ca: Option<PathBuf>,
 }
 
 impl ServerHandle {
@@ -53,20 +55,14 @@ impl ServerHandle {
         Self::start_with_env(workers, &[])
     }
 
-    /// Like [`Self::start_n`], but sets extra environment variables on the
-    /// server process only (not the test's own process env), so a test that
-    /// needs a server-side seam — e.g. `GNITZ_CLIENT_SEND_TIMEOUT_MS` — cannot
-    /// race a sibling test through the process-global env under parallel
-    /// `cargo test`.
+    /// [`Self::start_n`] with extra environment variables on the server
+    /// process alone.
     pub fn start_with_env(workers: usize, extra_env: &[(&str, &str)]) -> Self {
         Self::start_inner(workers, extra_env, None, false)
     }
 
-    /// Start with a TLS listener on `127.0.0.1:0` (ephemeral port — safe
-    /// under parallel `cargo test`). Opt-in: the default `start*`
-    /// constructors stay TLS-free so the ~270 AF_UNIX-only tests don't pay
-    /// per-boot cert minting + a TCP bind for zero coverage. Resolve the
-    /// bound address with [`Self::tls_target`].
+    /// Start with a TLS listener on an ephemeral loopback port, reached through
+    /// [`Self::tls_target`].
     pub fn start_tls(workers: usize) -> Self {
         Self::start_tls_with_env(workers, &[])
     }
@@ -82,10 +78,8 @@ impl ServerHandle {
         Self::start_inner(workers, &[], Some("[::1]:0"), false)
     }
 
-    /// Start with a TLS listener requiring **mTLS**: a client CA and a
-    /// CA-signed leaf are minted, the server boots with
-    /// `--tls-client-ca=<ca.pem>`, and [`Self::mtls_target`] presents the
-    /// leaf. Ephemeral loopback port.
+    /// [`Self::start_tls`] requiring mTLS against a freshly minted client CA,
+    /// whose signed leaf [`Self::mtls_target`] presents.
     pub fn start_mtls(workers: usize) -> Self {
         Self::start_mtls_with_env(workers, &[])
     }
@@ -95,67 +89,34 @@ impl ServerHandle {
         Self::start_inner(workers, extra_env, Some("127.0.0.1:0"), true)
     }
 
-    /// Spawn a server with a **raw** TLS argv (no client-CA minting), returning
-    /// the ready handle on success or the early-exit stderr tail on failure.
-    /// For tests that assert on a boot *refusal* (the non-loopback bind guard)
-    /// or that need custom TLS flags — an explicit listen address,
-    /// `--tls-max-conns=N`, `--allow-unauthenticated`.
+    /// Spawn a server with a raw TLS argv: the ready handle, or the stderr tail
+    /// of a server that exited during boot.
     pub fn try_start_tls(workers: usize, tls_args: &[&str]) -> Result<Self, String> {
         let scaffold = boot_scaffold();
-        let owned: Vec<String> = tls_args.iter().map(|s| s.to_string()).collect();
-        let has_listen = owned.iter().any(|a| a.starts_with("--tls-listen="));
+        let args: Vec<String> = tls_args.iter().map(|s| s.to_string()).collect();
         // On the failure path `scaffold` (with its tmpdir) drops here, cleaning up.
-        let process = spawn_and_wait_ready(&scaffold.paths, workers, &[], &owned)?;
-        Ok(Self::assemble(process, scaffold, workers, has_listen, None, None))
-    }
-
-    /// Spawn a server with a raw TLS argv and wait for it to EXIT during boot
-    /// — for asserting a boot *abort* (e.g. the non-loopback bind refusal).
-    /// Returns `(exited_zero, stderr_tail)`; panics if the server does NOT
-    /// exit within the startup budget (an unexpected successful boot).
-    ///
-    /// This does NOT use the readiness probe: the server binds+listens the
-    /// AF_UNIX socket BEFORE `setup_tls_listener` runs, so a probe connect
-    /// can succeed in the window before a refusal aborts — waiting on the
-    /// process itself is race-free.
-    pub fn boot_expecting_exit(workers: usize, tls_args: &[&str]) -> (bool, String) {
-        let scaffold = boot_scaffold();
-        let owned: Vec<String> = tls_args.iter().map(|s| s.to_string()).collect();
-        let mut proc = configure_command(&scaffold.paths, workers, &[], &owned)
-            .spawn()
-            .expect("failed to spawn server");
-        match poll_with_backoff(|| proc.try_wait().ok().flatten()) {
-            Some(status) => (status.success(), read_stderr_tail(&scaffold.paths.stderr_path)),
-            None => {
-                proc.kill().ok();
-                proc.wait().ok();
-                panic!(
-                    "server did not exit within {STARTUP_TIMEOUT:?}; expected a boot abort\nstderr tail:\n{}",
-                    read_stderr_tail(&scaffold.paths.stderr_path)
-                );
-            }
-        }
+        let process = spawn_and_wait_ready(&scaffold.paths, workers, &[], &args)?;
+        Ok(Self::assemble(process, scaffold, workers, args, Vec::new(), None))
     }
 
     fn start_inner(workers: usize, extra_env: &[(&str, &str)], tls_listen: Option<&str>, mtls: bool) -> Self {
         let scaffold = boot_scaffold();
+        let env: Vec<(String, String)> = extra_env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
 
         // Build the TLS argv. mTLS additionally mints a client CA + a
         // CA-signed leaf into the tmpdir and enables `--tls-client-ca`.
-        let mut tls_args: Vec<String> = Vec::new();
+        let mut args: Vec<String> = Vec::new();
         let mut mtls_client: Option<(PathBuf, PathBuf)> = None;
-        let mut client_ca: Option<PathBuf> = None;
         if let Some(addr) = tls_listen {
-            tls_args.push(format!("--tls-listen={addr}"));
+            args.push(format!("--tls-listen={addr}"));
             if mtls {
                 let (ca, leaf_cert, leaf_key) = mint_client_ca_and_leaf(scaffold.tmpdir.path());
-                tls_args.push(format!("--tls-client-ca={}", ca.display()));
-                client_ca = Some(ca);
+                args.push(format!("--tls-client-ca={}", ca.display()));
                 mtls_client = Some((leaf_cert, leaf_key));
             }
         }
 
-        let process = match spawn_and_wait_ready(&scaffold.paths, workers, extra_env, &tls_args) {
+        let process = match spawn_and_wait_ready(&scaffold.paths, workers, &env, &args) {
             Ok(p) => p,
             Err(msg) => {
                 let kept = scaffold.tmpdir.keep();
@@ -163,47 +124,43 @@ impl ServerHandle {
             }
         };
 
-        Self::assemble(process, scaffold, workers, tls_listen.is_some(), mtls_client, client_ca)
+        Self::assemble(process, scaffold, workers, args, env, mtls_client)
     }
 
-    /// Assemble a handle from a spawned child and its [`BootScaffold`] (taking
-    /// ownership of the tmpdir), recording the TLS/mTLS metadata the spawn
-    /// paths differ on. Called only on a successful spawn.
+    /// A handle owning `scaffold`'s tmpdir, recording the boot spec
+    /// [`Self::restart`] replays.
     fn assemble(
         process: Child,
         scaffold: BootScaffold,
         workers: usize,
-        tls: bool,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
         mtls_client: Option<(PathBuf, PathBuf)>,
-        client_ca: Option<PathBuf>,
     ) -> Self {
         ServerHandle {
             process,
             paths: scaffold.paths,
             tmpdir: Some(scaffold.tmpdir),
             workers,
-            tls,
+            args,
+            env,
             mtls_client,
-            client_ca,
         }
     }
 
-    /// The bound TLS endpoint (`IP:PORT`), read from the atomically-published
-    /// `<data_dir>/tls_endpoint` (rename makes existence imply complete
-    /// content). Polls with the same backoff as the socket wait — the file
-    /// is written between the AF_UNIX `listen()` and "GnitzDB ready".
+    fn is_tls(&self) -> bool {
+        self.args.iter().any(|a| a.starts_with("--tls-listen="))
+    }
+
+    /// The bound TLS endpoint (`IP:PORT`), read from `<data_dir>/tls_endpoint`,
+    /// which the server publishes before it logs readiness.
     pub fn tls_endpoint(&self) -> String {
-        assert!(self.tls, "tls_endpoint requires a start_tls server");
+        assert!(self.is_tls(), "tls_endpoint requires a start_tls server");
         let path = self.paths.data_dir.join("tls_endpoint");
-        let endpoint = poll_with_backoff(|| {
-            path.exists().then(|| {
-                fs::read_to_string(&path)
-                    .expect("tls_endpoint unreadable")
-                    .trim()
-                    .to_string()
-            })
-        });
-        endpoint.unwrap_or_else(|| panic!("server did not publish {} within {STARTUP_TIMEOUT:?}", path.display()))
+        fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
+            .trim()
+            .to_string()
     }
 
     /// `tls://IP:PORT?ca=<data_dir>/tls_dev_cert.pem` for the bound listener —
@@ -236,63 +193,36 @@ impl ServerHandle {
         format!("{}&cert={}&key={}", self.tls_target(), cert.display(), key.display())
     }
 
-    /// Kill the server and respawn it on the same data dir and socket path.
-    ///
-    /// A TLS server rebinds the SAME port (read back from `tls_endpoint` before
-    /// the kill), so clients holding the old target can observe fail-fast errors
-    /// and then reconnect; a plain server has no endpoint to preserve.
+    /// Kill the server and respawn it on the same data dir and socket path,
+    /// with every flag and environment variable of the first boot. A TLS server
+    /// rebinds the port it had.
     pub fn restart(&mut self) {
-        let endpoint = self.tls.then(|| self.tls_endpoint());
-        self.process.kill().ok();
-        self.process.wait().ok();
-        // Unlink the old socket path before respawning. `kill()` reaps the
-        // master, but its forked workers inherited the listening fd and die a
-        // moment later, so a connect by path can still be accepted into that
-        // dying listener's backlog — and `spawn_and_wait_ready`'s probe would
-        // take it as the new boot's readiness. Removing the path leaves the
-        // probe nothing to reach until the new server binds.
-        fs::remove_file(&self.paths.sock_path).ok();
-        // Remove the stale endpoint file so tls_endpoint() polling observes
-        // the NEW boot's publish (same content, but existence must imply the
-        // new listener is bound).
-        fs::remove_file(self.paths.data_dir.join("tls_endpoint")).ok();
-        let mut tls_args: Vec<String> = Vec::new();
-        if let Some(endpoint) = &endpoint {
-            tls_args.push(format!("--tls-listen={endpoint}"));
-            if let Some(ca) = &self.client_ca {
-                tls_args.push(format!("--tls-client-ca={}", ca.display()));
+        if self.is_tls() {
+            let listen = format!("--tls-listen={}", self.tls_endpoint());
+            for a in self.args.iter_mut().filter(|a| a.starts_with("--tls-listen=")) {
+                *a = listen.clone();
             }
         }
-        self.process = spawn_and_wait_ready(&self.paths, self.workers, &[], &tls_args)
+        self.process.kill().ok();
+        self.process.wait().ok();
+        // The killed master can still accept for a moment after `wait()`, and the
+        // new boot would refuse a socket something answers on.
+        fs::remove_file(&self.paths.sock_path).ok();
+        self.process = spawn_and_wait_ready(&self.paths, self.workers, &self.env, &self.args)
             // ServerHandle::Drop preserves the tmpdir during the unwind.
             .unwrap_or_else(|msg| panic!("restart failed: {msg}"));
-        // The AF_UNIX probe above proves `listen()` is live, but the TLS
-        // bind (and its endpoint publish) happens slightly later in boot —
-        // block until the new listener is up so a caller's immediate
-        // reconnect cannot race it.
-        if let Some(endpoint) = endpoint {
-            assert_eq!(
-                self.tls_endpoint(),
-                endpoint,
-                "restart must rebind the same TLS endpoint"
-            );
-        }
     }
 }
 
-/// A resolved server binary + a fresh tmpdir with the standard
-/// `data` / socket / stderr layout. Produced once by [`boot_scaffold`] and
-/// consumed by [`ServerHandle::assemble`] on a successful spawn (which takes
-/// ownership of the tmpdir); otherwise dropped, cleaning up.
+/// A server binary and a fresh tmpdir laid out for one server; the tmpdir is
+/// removed on drop unless a [`ServerHandle`] takes it.
 struct BootScaffold {
     paths: BootPaths,
     tmpdir: TempDir,
 }
 
-/// Resolve the server binary and mint a fresh tmpdir with the standard
-/// data/socket/stderr layout — the single source of the spawn preamble every
-/// `ServerHandle` entry point shares. A missing binary is a panic, never a
-/// skip: a suite that silently passes without a server tests nothing.
+/// A missing binary panics rather than skips: a suite passing without a server
+/// tests nothing.
 fn boot_scaffold() -> BootScaffold {
     let bin = env::var("GNITZ_SERVER_BIN")
         .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../gnitz-server").to_string());
@@ -339,112 +269,71 @@ fn mint_client_ca_and_leaf(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
     (ca_path, leaf_cert_path, leaf_key_path)
 }
 
-/// Build (but do not spawn) the server `Command`: positional args, captured
-/// stderr, the small-SAL cap, extra env, worker count, and TLS argv. Shared by
-/// [`spawn_and_wait_ready`] (readiness probe) and [`ServerHandle::boot_expecting_exit`]
-/// (wait-for-exit).
-fn configure_command(paths: &BootPaths, workers: usize, extra_env: &[(&str, &str)], tls_args: &[String]) -> Command {
-    // Append on restart so the first boot's stderr survives for post-mortem.
-    let stderr_file = fs::OpenOptions::new()
+/// Spawn the server and block until it logs [`READY_MARKER`]; `Err` carries the
+/// stderr tail of an early exit or a timeout.
+fn spawn_and_wait_ready(
+    paths: &BootPaths,
+    workers: usize,
+    extra_env: &[(String, String)],
+    args: &[String],
+) -> Result<Child, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    // Appended on restart so the first boot's stderr survives for post-mortem;
+    // this boot's marker is looked for past what is already there.
+    let mut stderr_file = fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .read(true)
         .open(&paths.stderr_path)
         .expect("failed to open server stderr log file");
+    let offset = stderr_file.metadata().expect("stderr log metadata").len();
 
     let mut cmd = Command::new(&paths.bin);
     cmd.arg(&paths.data_dir)
         .arg(&paths.sock_path)
         .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file)); // captured for post-mortem
+        .stderr(Stdio::from(stderr_file.try_clone().expect("dup stderr log fd")));
 
-    // Each server `fallocate`s its whole SAL at startup, so the 1 GiB production
-    // default would let a parallel `cargo test` run (one server per test) exhaust
-    // the shared tmpfs data_dir. Integration tests are functional (tiny writes),
-    // so cap the SAL small unless the caller already pinned a size.
+    // Each server fallocates its whole SAL, and a parallel `cargo test` runs one
+    // server per test; these tests write little.
     if env::var_os("GNITZ_SAL_BYTES").is_none() {
         cmd.env("GNITZ_SAL_BYTES", "134217728"); // 128 MiB
     }
 
-    // A parallel `cargo test` run is one server per test, and each would derive
-    // its placement from `sched_getaffinity` knowing nothing of the others, so
-    // the whole fleet pins onto the same cores. Unless the caller asked for it.
+    // Servers pinning independently would pile onto the same cores.
     if env::var_os("GNITZ_CPU_AFFINITY").is_none() {
         cmd.env("GNITZ_CPU_AFFINITY", "0");
     }
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
+    cmd.envs(extra_env.iter().map(|(k, v)| (k, v)));
     if workers > 1 {
         cmd.arg(format!("--workers={workers}"));
     }
-    for tls in tls_args {
-        cmd.arg(tls);
-    }
-    cmd
-}
+    cmd.args(args);
+    let mut proc = cmd.spawn().expect("failed to spawn server");
 
-/// Spawn the server and block until a probe connect on the AF_UNIX socket
-/// succeeds. `Err` (with the stderr tail embedded) on early exit or timeout;
-/// the caller decides how to preserve artifacts.
-fn spawn_and_wait_ready(
-    paths: &BootPaths,
-    workers: usize,
-    extra_env: &[(&str, &str)],
-    tls_args: &[String],
-) -> Result<Child, String> {
-    let mut proc = configure_command(paths, workers, extra_env, tls_args)
-        .spawn()
-        .expect("failed to spawn server");
-
-    // Readiness is "a client connect succeeds", NOT "the socket file
-    // exists". The AF_UNIX file appears at `bind()`, but connections are
-    // only accepted after the `listen()` that follows it; a client that
-    // races into that window (widened by CPU starvation when dozens of
-    // servers boot at once under a parallel `cargo test`) gets
-    // ECONNREFUSED, and the test's real `connect().unwrap()` then flakes.
-    // A successful probe connect proves `listen()` is live — every
-    // subsequent connect then queues in the backlog and succeeds. The
-    // probe stream is dropped immediately; the server treats the pre-HELLO
-    // EOF as a benign client disconnect.
-    let ready = poll_with_backoff(|| {
-        if paths.sock_path.exists() && std::os::unix::net::UnixStream::connect(&paths.sock_path).is_ok() {
-            return Some(Ok(()));
-        }
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let mut logged = Vec::new();
+    loop {
         if let Ok(Some(status)) = proc.try_wait() {
             let tail = read_stderr_tail(&paths.stderr_path);
-            return Some(Err(format!("server exited early ({status})\nstderr tail:\n{tail}")));
+            return Err(format!("server exited early ({status})\nstderr tail:\n{tail}"));
         }
-        None
-    });
-    match ready {
-        Some(Ok(())) => Ok(proc),
-        Some(Err(msg)) => Err(msg),
-        None => {
+        logged.clear();
+        stderr_file.seek(SeekFrom::Start(offset)).expect("seek stderr log");
+        stderr_file.read_to_end(&mut logged).expect("read stderr log");
+        if String::from_utf8_lossy(&logged).contains(READY_MARKER) {
+            return Ok(proc);
+        }
+        if Instant::now() >= deadline {
             proc.kill().ok();
             proc.wait().ok();
             let tail = read_stderr_tail(&paths.stderr_path);
-            Err(format!(
-                "server did not accept a connection within {STARTUP_TIMEOUT:?}\nstderr tail:\n{tail}"
-            ))
+            return Err(format!(
+                "server did not log {READY_MARKER:?} within {STARTUP_TIMEOUT:?}\nstderr tail:\n{tail}"
+            ));
         }
-    }
-}
-
-/// Poll `step` under the shared startup timing (exponential backoff up to
-/// `POLL_MAX`, bounded by `STARTUP_TIMEOUT`): `Some(v)` as soon as `step`
-/// produces one, `None` on timeout.
-fn poll_with_backoff<T>(mut step: impl FnMut() -> Option<T>) -> Option<T> {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    let mut backoff = Duration::from_millis(1);
-    loop {
-        if let Some(v) = step() {
-            return Some(v);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        thread::sleep(backoff);
-        backoff = (backoff * 2).min(POLL_MAX);
+        thread::sleep(POLL_INTERVAL);
     }
 }
 

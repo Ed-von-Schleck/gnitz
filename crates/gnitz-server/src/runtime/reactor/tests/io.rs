@@ -17,7 +17,7 @@ fn capped_reactor(cap: usize) -> Reactor {
 /// A registered connection over one end of a fresh socketpair, and the other end.
 fn registered(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
     let (local, partner) = UnixStream::pair().expect("socketpair");
-    let conn = r.client_conn(OwnedFd::from(local));
+    let conn = r.client_conn(OwnedFd::from(local)).expect("under the cap");
     r.register_conn(&conn, Box::new(Plain::new()));
     (conn, partner)
 }

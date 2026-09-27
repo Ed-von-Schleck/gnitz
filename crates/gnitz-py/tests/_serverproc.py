@@ -32,13 +32,10 @@ import pytest
 
 from _paths import REPO_ROOT
 
-# Boot-to-socket is ~36 ms, so a 50 ms poll spends most of a spawn asleep past
-# the event it is waiting for. Every loop using this is bounded by its own
-# deadline, so the interval buys nothing but granularity.
+# Every loop polling at this has its own deadline; the interval is granularity.
 _READY_POLL_S = 0.002
 
-# What the server prints once its listeners are up — the last line of boot.
-# See `ServerProc.start` for why the socket file is not the readiness signal.
+# What the server logs once every listener is bound and published.
 _READY_MARKER = "GnitzDB ready"
 
 _PR_SET_PDEATHSIG = 1
@@ -100,16 +97,8 @@ def kill_group(proc):
 
 
 def await_ready(proc, read_log, timeout):
-    """Block until `proc` prints the readiness marker, raising if it dies first.
-
-    Readiness is the server's own marker, not the socket file: `UnixListener::bind`
-    publishes that file several boot steps earlier, so a server that binds and then
-    dies leaves one behind, and waiting on it hands the caller a bare
-    `ECONNREFUSED` with the crash only in the log. Liveness is therefore checked
-    before readiness on every pass.
-
-    `read_log` returns this boot's output so far; the caller owns where that comes
-    from and what to do with a `proc` that never reported ready."""
+    """Block until `proc` logs the readiness marker, raising with the log tail if
+    it exits first. `read_log` returns this boot's output so far."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if proc.poll() is not None:
@@ -196,12 +185,13 @@ class ServerProc:
     earlier boot can never satisfy an assertion about this one.
     """
 
-    def __init__(self, data_dir, sock_path, *, workers=None, extra_env=None):
+    def __init__(self, data_dir, sock_path, *, workers=None, extra_env=None, log_path=None, args=()):
         self.data_dir = data_dir
         self.sock_path = sock_path
         self.workers = NUM_WORKERS if workers is None else workers
         self.extra_env = dict(extra_env or {})
-        self.log_path = data_dir.rstrip("/") + ".log"
+        self.log_path = log_path or data_dir.rstrip("/") + ".log"
+        self.args = list(args)
         self.proc = None
         self._log_start = 0
 
@@ -218,14 +208,16 @@ class ServerProc:
         seams = [k for k in env if k.startswith("GNITZ_INJECT_")]
         if seams and not is_debug_build():
             pytest.skip(f"injection seam requires a debug build: {', '.join(seams)}")
-        # A killed server leaves its socket behind and the next bind would fail.
-        self.clear_socket()
+        # A killed server's listener can still accept for a moment after it is
+        # reaped, and this boot would refuse a socket that answers.
+        if os.path.exists(self.sock_path):
+            os.unlink(self.sock_path)
         # Where this boot's output starts, so `log_text` can exclude the last.
         self._log_start = os.path.getsize(self.log_path) if os.path.exists(self.log_path) else 0
         log = open(self.log_path, "ab")
         try:
             return subprocess.Popen(
-                [server_binary(), self.data_dir, self.sock_path, f"--workers={self.workers}"],
+                [server_binary(), self.data_dir, self.sock_path, f"--workers={self.workers}", *self.args],
                 stdout=log, stderr=log, env=env,
                 start_new_session=True, preexec_fn=server_preexec,
             )
@@ -251,7 +243,7 @@ class ServerProc:
 
     def start_expecting_exit(self, *, workers=None, extra_env=None, timeout=20.0):
         """Spawn a server expected to die during boot. Returns its non-zero exit
-        code, having confirmed it never bound the socket."""
+        code, having confirmed it never became ready."""
         if workers is not None:
             self.workers = workers
         self.proc = self._popen(extra_env)
@@ -260,7 +252,7 @@ class ServerProc:
             rc = self.proc.poll()
             if rc is not None:
                 return rc
-            if os.path.exists(self.sock_path):
+            if _READY_MARKER in self.log_text():
                 self.stop()
                 raise RuntimeError("server became ready; expected a boot crash")
             time.sleep(_READY_POLL_S)
@@ -314,13 +306,7 @@ class ServerProc:
             self.stop_graceful()
         else:
             self.stop()
-        self.clear_socket()
         return self.start(workers=workers, extra_env=extra_env, timeout=timeout)
-
-    def clear_socket(self):
-        """Remove the stale socket a killed server left behind."""
-        if os.path.exists(self.sock_path):
-            os.unlink(self.sock_path)
 
     # ── output ───────────────────────────────────────────────────────────────
 

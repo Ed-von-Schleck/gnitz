@@ -28,7 +28,7 @@ fn pooled(bytes: &[u8]) -> PooledSendBuf {
 fn outbound(r: &Reactor, body: SendBody) -> Outbound {
     let (local, _) = std::os::unix::net::UnixStream::pair().expect("socketpair");
     Outbound {
-        _conn: r.client_conn(OwnedFd::from(local)),
+        _conn: r.client_conn(OwnedFd::from(local)).expect("under the cap"),
         body,
     }
 }
@@ -130,7 +130,7 @@ fn dropped_send_future_keeps_its_body_until_the_cqe() {
 fn a_closed_connection_drops_its_entry_and_closes_with_its_last_holder() {
     let (local, mut partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
     let r = make_reactor();
-    let conn = r.client_conn(OwnedFd::from(local));
+    let conn = r.client_conn(OwnedFd::from(local)).expect("under the cap");
     let fd = conn.fd();
     r.register_conn(&conn, Box::new(Plain::new()));
 
@@ -153,13 +153,33 @@ fn a_closed_connection_drops_its_entry_and_closes_with_its_last_holder() {
     assert_eq!(partner.read(&mut buf).ok(), Some(0), "and closes with its last holder");
 }
 
+/// A connection holds its slot under the cap for as long as it lives: at the
+/// cap an accepted fd is refused and closed, and a dropped connection frees
+/// its slot for the next.
+#[test]
+fn the_connection_cap_refuses_past_it_until_a_connection_drops() {
+    let r = make_reactor_with(Limits { max_conns: 1, ..Limits::TEST });
+    let (a, _a) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    let (b, mut b_partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    let (c, _c) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    let first = r.client_conn(OwnedFd::from(a)).expect("under the cap");
+    assert!(r.client_conn(OwnedFd::from(b)).is_none(), "the cap refuses a second");
+    let mut buf = [0u8; 1];
+    assert_eq!(b_partner.read(&mut buf).ok(), Some(0), "and closes the refused fd");
+    drop(first);
+    assert!(
+        r.client_conn(OwnedFd::from(c)).is_some(),
+        "a dropped connection frees its slot"
+    );
+}
+
 /// A local close ends an armed recv, even one not yet submitted, so a silent
 /// peer cannot pin the connection.
 #[test]
 fn close_ends_an_armed_recv() {
     let (local, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
     let r = make_reactor();
-    let conn = r.client_conn(OwnedFd::from(local));
+    let conn = r.client_conn(OwnedFd::from(local)).expect("under the cap");
     let fd = conn.fd();
     r.register_conn(&conn, Box::new(Plain::new()));
     conn.abort();
@@ -181,7 +201,7 @@ fn close_ends_an_armed_recv() {
 fn a_refused_recv_discards_its_queue_and_shuts_down() {
     let (local, mut partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
     let r = make_reactor();
-    let conn = r.client_conn(OwnedFd::from(local));
+    let conn = r.client_conn(OwnedFd::from(local)).expect("under the cap");
     let fd = conn.fd();
     r.register_conn(&conn, Box::new(Plain::new()));
 
@@ -212,7 +232,7 @@ fn a_refused_recv_discards_its_queue_and_shuts_down() {
 #[test]
 fn send_owned_loops_until_full_payload_sent_over_socketpair() {
     let (r, sender, receiver) = egress_pair(Limits::TEST, Some(8 * 1024));
-    let conn = r.client_conn(sender);
+    let conn = r.client_conn(sender).expect("under the cap");
     let payload = vec![0x5Au8; 200 * 1024];
     let payload_len = payload.len();
     let drain_t = spawn_drain(receiver, payload_len);
@@ -243,7 +263,7 @@ fn send_owned_evicts_a_client_that_never_drains() {
         ..Limits::TEST
     };
     let (r, sender, _receiver) = egress_pair(limits, Some(4 * 1024));
-    let conn = r.client_conn(sender);
+    let conn = r.client_conn(sender).expect("under the cap");
 
     // Far larger than both buffers, and nothing ever reads the other
     // end — the send stalls partway and only the deadline can end it.
@@ -287,7 +307,7 @@ fn fanout_coalesced_egress_bench() {
         for total in [4 * 1024usize, 32 * 1024, 64 * 1024, 128 * 1024] {
             let per_frame = total / w;
             let (r, sender, receiver) = egress_pair(Limits::TEST, None);
-            let conn = r.client_conn(sender);
+            let conn = r.client_conn(sender).expect("under the cap");
             // Both arms push `total` bytes per sample; the reader keeps
             // the socket buffers from ever stalling a send, so the timed
             // region is kernel-op cost, not backpressure.
@@ -414,7 +434,7 @@ fn both_listeners_rearm_after_an_fd_exhaustion_backoff() {
 fn corked_replies_leave_as_one_send() {
     let (r, sender, receiver) = egress_pair(Limits::TEST, None);
     let receiver = Rc::new(receiver);
-    let peer = Peer::unix(sender, Rc::clone(&r));
+    let peer = Peer::new(&r, r.client_conn(sender).expect("under the cap"), None);
     let frames: Vec<Vec<u8>> = (0..8u8).map(|i| vec![0xD0 | i; 200]).collect();
     let expected: Vec<u8> = frames.iter().flatten().copied().collect();
 
@@ -447,7 +467,7 @@ fn a_slot_forward_cannot_overtake_a_corked_reply() {
     assert!(slot_bytes.len() > COALESCE_MAX_BYTES, "the slot goes out alone");
 
     let (r, sender, receiver) = egress_pair(Limits::TEST, None);
-    let peer = Peer::unix(sender, Rc::clone(&r));
+    let peer = Peer::new(&r, r.client_conn(sender).expect("under the cap"), None);
     let corked = vec![0x5Au8; 128];
 
     let c = corked.clone();
@@ -473,7 +493,7 @@ fn a_small_slot_is_corked_behind_corked_bytes() {
 
     let (r, sender, receiver) = egress_pair(Limits::TEST, None);
     let receiver = Rc::new(receiver);
-    let peer = Peer::unix(sender, Rc::clone(&r));
+    let peer = Peer::new(&r, r.client_conn(sender).expect("under the cap"), None);
     let corked = vec![0x5Au8; 128];
 
     let (c, rx) = (corked.clone(), Rc::clone(&receiver));
@@ -502,7 +522,7 @@ fn a_small_slot_is_corked_behind_corked_bytes() {
 fn one_recv_completion_queues_a_whole_pipelined_run() {
     let (local, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
     let r = make_reactor();
-    let conn = r.client_conn(OwnedFd::from(local));
+    let conn = r.client_conn(OwnedFd::from(local)).expect("under the cap");
     r.register_conn(&conn, Box::new(Plain::new()));
 
     const N: usize = 12;
@@ -531,7 +551,7 @@ fn one_recv_completion_queues_a_whole_pipelined_run() {
 #[test]
 fn a_full_accumulator_ships_between_messages() {
     let (r, sender, receiver) = egress_pair(Limits::TEST, None);
-    let peer = Peer::unix(sender, Rc::clone(&r));
+    let peer = Peer::new(&r, r.client_conn(sender).expect("under the cap"), None);
     let drain = spawn_drain(receiver, COALESCE_MAX_BYTES);
     let frame = vec![0x3Cu8; 4096];
 

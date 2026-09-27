@@ -229,15 +229,19 @@ impl RecvQueue {
 /// closes with the last holder, and every SQE naming it is queued through one.
 pub(crate) struct ClientConn {
     fd: OwnedFd,
+    /// This connection's place under the connection cap, held exactly as long
+    /// as the fd.
+    _slot: Charge,
     /// Closed when the recv side ends, after which a completing recv never
     /// re-arms.
     pub(super) q: RefCell<RecvQueue>,
 }
 
 impl ClientConn {
-    pub(super) fn new(fd: OwnedFd, budget: Rc<Budget>) -> Self {
+    pub(super) fn new(fd: OwnedFd, slot: Charge, budget: Rc<Budget>) -> Self {
         ClientConn {
             fd,
+            _slot: slot,
             q: RefCell::new(RecvQueue::new(budget)),
         }
     }

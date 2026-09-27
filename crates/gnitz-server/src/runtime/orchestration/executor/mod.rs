@@ -2,7 +2,7 @@
 //! router and every read/push handler, and the reply-frame vocabulary. The
 //! catalog-zone write path is the child `ddl`.
 //!
-//! The master owns one `Reactor` driving the accept socket, a task per
+//! The master owns one `Reactor` driving the accept sockets, a task per
 //! connection, the committer (group commit + checkpoint + fsync), the tick task
 //! and the worker-crash watchdog. A tick relays its own exchange rounds while it
 //! awaits its ACKs.
@@ -13,15 +13,13 @@
 mod ddl;
 
 use std::cell::{Cell, RefCell};
-use std::net::TcpListener;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
 
 use super::guard_panic;
-use crate::runtime::tls::{TlsListener, TlsShared};
 use gnitz_foundation::fault::Seam;
 
 use self::ddl::{commit_serial_range_durable, handle_ddl_txn, hold_relay_for_ddl, RELAY_HOLD_FOR_DDL};
@@ -180,6 +178,10 @@ pub struct Shared {
     worker_crashed: Cell<bool>,
     /// The data directory, where each worker's log lives.
     data_dir: String,
+    /// How long a connection may take from accept to its HELLO, handshake
+    /// included (`GNITZ_HELLO_TIMEOUT_MS`). The default outlasts the client's own
+    /// `CONNECT_TIMEOUT`, so only a client that has already given up is reaped.
+    hello_timeout: Duration,
 }
 
 impl Shared {
@@ -340,13 +342,13 @@ impl Shared {
 pub struct ServerExecutor;
 
 impl ServerExecutor {
-    /// `tls` is the optional TLS listener bootstrap from `server_main`:
-    /// the bound TCP listener, and its rustls configuration and admission policy.
+    /// `tls` is the optional TLS listener from `server_main`: the bound TCP
+    /// listen fd and its rustls configuration.
     pub fn run(
         dispatcher: Rc<MasterDispatcher>,
         data_dir: &str,
-        server_fd: OwnedFd,
-        tls: Option<(TcpListener, TlsListener)>,
+        unix_fd: OwnedFd,
+        tls: Option<(OwnedFd, std::sync::Arc<rustls::ServerConfig>)>,
         lsn_seed: u64,
     ) -> i32 {
         let reactor = Rc::clone(dispatcher.reactor());
@@ -372,6 +374,10 @@ impl ServerExecutor {
             boot_seed: initial_lsn,
             worker_crashed: Cell::new(false),
             data_dir: data_dir.to_string(),
+            hello_timeout: Duration::from_millis(gnitz_foundation::env::env_num(
+                "GNITZ_HELLO_TIMEOUT_MS",
+                (gnitz_wire::CONNECT_TIMEOUT * 3 / 2).as_millis() as u64,
+            )),
         });
 
         // Catch SIGTERM/SIGINT so the watchdog can drive a final checkpoint
@@ -379,9 +385,9 @@ impl ServerExecutor {
         install_shutdown_signal_handlers();
 
         reactor.spawn(committer::run(committer_rx, Rc::clone(&shared)));
-        reactor.spawn(unix_accept_loop(Rc::clone(&shared), server_fd));
-        if let Some((listener, tl)) = tls {
-            reactor.spawn(tls_accept_loop(Rc::clone(&shared), listener, tl));
+        reactor.spawn(accept_loop(Rc::clone(&shared), unix_fd, None));
+        if let Some((fd, cfg)) = tls {
+            reactor.spawn(accept_loop(Rc::clone(&shared), fd, Some(cfg)));
         }
         reactor.spawn(tick_loop(Rc::clone(&shared), tick_rx));
         reactor.spawn(watchdog(Rc::clone(&shared)));
@@ -401,54 +407,20 @@ impl ServerExecutor {
 // Accept loop
 // ---------------------------------------------------------------------------
 
-async fn unix_accept_loop(shared: Rc<Shared>, listen_fd: OwnedFd) {
-    let mut accepted = shared.disp().reactor().attach_listener(listen_fd);
+async fn accept_loop(shared: Rc<Shared>, listen_fd: OwnedFd, tls: Option<std::sync::Arc<rustls::ServerConfig>>) {
+    let reactor = Rc::clone(shared.disp().reactor());
+    let mut accepted = reactor.attach_listener(listen_fd);
     loop {
-        let fd = accepted.recv().await;
-        let peer = Peer::unix(fd, Rc::clone(shared.disp().reactor()));
-        let s = Rc::clone(&shared);
-        // The socket path's permissions are the gate: no HELLO deadline.
-        shared.disp().reactor().spawn(connection_loop(peer, s, None));
-    }
-}
-
-async fn tls_accept_loop(shared: Rc<Shared>, listener: TcpListener, tl: TlsListener) {
-    let mut accepted = shared.disp().reactor().attach_listener(OwnedFd::from(listener));
-    loop {
-        let fd = accepted.recv().await;
-        let raw = fd.as_raw_fd();
-        // Global connection cap: close the freshly-accepted fd before any TLS
-        // work when the live count is at the cap.
-        let Some(guard) = tl.admit() else {
-            gnitz_warn!("tls: connection cap {} reached; closing fd={raw}", tl.max_conns());
+        let Some(conn) = reactor.client_conn(accepted.recv().await) else {
             continue;
         };
-        let conn = match TlsShared::start(
-            Rc::clone(shared.disp().reactor()),
-            fd,
-            std::sync::Arc::clone(&tl.cfg),
-            guard,
-        ) {
-            Ok(conn) => conn,
-            Err(e) => {
-                // `fd` and `guard` were moved into `start`; on the error path they
-                // already dropped (closing and decrementing) inside its frame.
-                gnitz_warn!("tls: session init failed for fd={raw}: {e}");
-                continue;
-            }
-        };
-        let peer = Peer::tls(conn);
-        let s = Rc::clone(&shared);
-        let hello_deadline = Instant::now() + tl.hello_timeout;
-        shared
-            .disp()
-            .reactor()
-            .spawn(connection_loop(peer, s, Some(hello_deadline)));
+        let peer = Peer::new(&reactor, conn, tls.as_ref());
+        reactor.spawn(connection_loop(peer, Rc::clone(&shared)));
     }
 }
 
-async fn connection_loop(peer: Peer, shared: Rc<Shared>, hello_deadline: Option<Instant>) {
-    serve_connection(&peer, &shared, hello_deadline).await;
+async fn connection_loop(peer: Peer, shared: Rc<Shared>) {
+    serve_connection(&peer, &shared).await;
     // The one exit: ship what is corked, a refusal included, then retire the fd.
     let _ = peer.flush_egress().await;
     peer.close();
@@ -460,13 +432,11 @@ async fn connection_loop(peer: Peer, shared: Rc<Shared>, hello_deadline: Option<
 /// `target_id`). Spawning `handle_message` to overlap requests would break that.
 ///
 /// Returns when the peer is gone or refused; the caller closes.
-async fn serve_connection(peer: &Peer, shared: &Rc<Shared>, hello_deadline: Option<Instant>) {
-    let hello = match hello_deadline {
-        Some(deadline) => match select2(peer.recv(), shared.disp().reactor().timer(deadline)).await {
-            Either::A(hello) => hello,
-            Either::B(()) => None,
-        },
-        None => peer.recv().await,
+async fn serve_connection(peer: &Peer, shared: &Rc<Shared>) {
+    let deadline = shared.disp().reactor().timer(Instant::now() + shared.hello_timeout);
+    let hello = match select2(peer.recv(), deadline).await {
+        Either::A(hello) => hello,
+        Either::B(()) => None,
     };
     let Some(hello) = hello else { return };
     peer.cork_with(|out| {

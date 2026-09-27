@@ -2,8 +2,8 @@
 //! [`ClientConn`]; only sending and closing dispatch on the transport.
 
 use std::cell::RefCell;
-use std::os::fd::OwnedFd;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::runtime::reactor::{ClientConn, PeerGone, Plain, Reactor, RecvBuf, SendBody};
 use crate::runtime::tls::TlsShared;
@@ -34,20 +34,19 @@ enum Transport {
 }
 
 impl Peer {
-    pub fn unix(fd: OwnedFd, reactor: Rc<Reactor>) -> Peer {
-        let conn = reactor.client_conn(fd);
-        reactor.register_conn(&conn, Box::new(Plain::new()));
+    /// Arm `conn`'s recv and start serving it: a TLS session under `tls`, the
+    /// socket's own bytes otherwise.
+    pub fn new(reactor: &Rc<Reactor>, conn: Rc<ClientConn>, tls: Option<&Arc<rustls::ServerConfig>>) -> Peer {
+        let transport = match tls {
+            None => {
+                reactor.register_conn(&conn, Box::new(Plain::new()));
+                Transport::Unix(Rc::clone(reactor))
+            }
+            Some(cfg) => Transport::Tls(TlsShared::start(Rc::clone(reactor), Rc::clone(&conn), Arc::clone(cfg))),
+        };
         Peer {
             conn,
-            transport: Transport::Unix(reactor),
-            egress: RefCell::new(None),
-        }
-    }
-
-    pub fn tls(tls: Rc<TlsShared>) -> Peer {
-        Peer {
-            conn: Rc::clone(tls.conn()),
-            transport: Transport::Tls(tls),
+            transport,
             egress: RefCell::new(None),
         }
     }

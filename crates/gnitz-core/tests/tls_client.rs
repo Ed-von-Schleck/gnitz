@@ -2,14 +2,6 @@
 
 //! End-to-end TLS transport tests against a real `gnitz-server` with a
 //! `--tls-listen` listener (self-signed dev cert, ephemeral port).
-//!
-//! Covers the full committed surface: verification modes (`?ca=`, default
-//! webpki roots, wrong CA, ALPN mismatch), data integrity
-//! and weights over TLS, big frames in both directions, UNIX+TLS
-//! coexistence, HELLO version rejection, restart fail-fast, pipelining
-//! liveness (the four-party deadlock shape), and the per-send eviction
-//! deadline that keeps a send holding the connection's send lock from
-//! wedging it against a TCP-alive non-reading peer.
 
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
@@ -503,17 +495,13 @@ fn mtls_server_rejects_untrusted_client_cert() {
 #[test]
 fn non_loopback_bind_refused_without_client_auth() {
     // `0.0.0.0` is non-loopback AND bindable everywhere. With neither a client
-    // CA nor the escape hatch, boot must abort with the refusal message.
-    // `boot_expecting_exit` waits for the process to exit (the AF_UNIX socket
-    // is already listening when the refusal fires, so a readiness probe would
-    // race it).
-    let (exited_zero, stderr) = ServerHandle::boot_expecting_exit(1, &["--tls-listen=0.0.0.0:0"]);
+    // CA nor the escape hatch, the server must refuse to start.
+    let stderr = match ServerHandle::try_start_tls(1, &["--tls-listen=0.0.0.0:0"]) {
+        Ok(_) => panic!("a non-loopback bind without client auth must not boot"),
+        Err(e) => e,
+    };
     assert!(
-        !exited_zero,
-        "a non-loopback bind without client auth must exit non-zero"
-    );
-    assert!(
-        stderr.to_lowercase().contains("refusing to bind"),
+        stderr.contains("refusing to bind"),
         "boot stderr must carry the bind refusal, got: {stderr}"
     );
 
@@ -527,14 +515,13 @@ fn non_loopback_bind_refused_without_client_auth() {
 
 #[test]
 fn global_connection_cap_closes_excess() {
-    let srv = ServerHandle::try_start_tls(1, &["--tls-listen=127.0.0.1:0", "--tls-max-conns=2"])
-        .expect("a server with --tls-max-conns must boot");
+    let srv = ServerHandle::start_tls_with_env(1, &[("GNITZ_MAX_CONNS", "2")]);
     let target = srv.tls_target();
 
-    // Hold two connections — each completes HELLO, so each counts against the
-    // cap for its whole lifetime.
+    // Hold two connections, one per transport: the cap counts both. Each
+    // counts for its whole lifetime.
     let _c1 = GnitzClient::connect(&target).expect("1st connection under the cap");
-    let c2 = GnitzClient::connect(&target).expect("2nd connection under the cap");
+    let c2 = GnitzClient::connect(srv.sock_path()).expect("2nd connection under the cap");
 
     // The 3rd is closed immediately (fd closed before any TLS work): its TCP
     // connect succeeds, and the handshake inside HELLO cannot complete.
@@ -542,6 +529,7 @@ fn global_connection_cap_closes_excess() {
         GnitzClient::connect(&target).is_err(),
         "a connection accepted past the cap must be closed"
     );
+    assert!(GnitzClient::connect(srv.sock_path()).is_err(), "on either transport");
 
     // Free a slot; a fresh connect then succeeds. Retry: the server-side
     // decrement lands after the close cascade completes.
@@ -560,38 +548,39 @@ fn global_connection_cap_closes_excess() {
 
 // ── 17. HELLO deadline ─────────────────────────────────────────────────────
 
-#[test]
-fn first_frame_deadline_reaps_silent_connections() {
-    use std::io::Read;
-    use std::net::TcpStream;
+const HELLO_DEADLINE: Duration = Duration::from_millis(500);
 
-    let srv = ServerHandle::start_tls_with_env(4, &[("GNITZ_TLS_HELLO_TIMEOUT_MS", "500")]);
-    // A raw TCP connection that sends NO bytes never starts the TLS handshake,
-    // so its first frame never deframes. The 500 ms deadline must close it —
-    // well before our 3 s read timeout (which, absent the deadline, is the
-    // only thing that would ever return).
-    let mut sock = TcpStream::connect(srv.tls_endpoint()).expect("tcp connect");
-    sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+/// Assert the server closes `sock`, fresh and silent, around [`HELLO_DEADLINE`]:
+/// by EOF, a TLS close alert or a reset, not by the read timing out.
+fn assert_reaped(transport: &str, sock: &mut impl std::io::Read) {
+    use std::io::ErrorKind::{TimedOut, WouldBlock};
     let t0 = Instant::now();
-    let mut buf = [0u8; 1];
-    // At the deadline the server runs `peer.close()`, which makes rustls emit a
-    // (plaintext, pre-handshake) close alert and then shut the socket down.
-    // So the read unblocks with EOF (`Ok(0)`), the alert byte (`Ok(n>0)`), or
-    // an RST (`Err`) — ALL of which mean the server reaped us at the deadline.
-    // Only a WouldBlock/TimedOut means the server never acted (no deadline).
-    match sock.read(&mut buf) {
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
-            panic!("server did not reap the silent connection within 3 s")
-        }
-        _ => {}
+    if let Err(e) = sock.read(&mut [0u8; 1]) {
+        assert!(!matches!(e.kind(), WouldBlock | TimedOut), "{transport}: never closed");
     }
     let elapsed = t0.elapsed();
     assert!(
-        (Duration::from_millis(300)..Duration::from_secs(3)).contains(&elapsed),
-        "the close must land near the 500 ms deadline, took {elapsed:?}"
+        elapsed >= HELLO_DEADLINE * 3 / 5,
+        "{transport}: closed after {elapsed:?}"
     );
+}
 
-    // A normal client (HELLO well within 500 ms) is unaffected.
+#[test]
+fn first_frame_deadline_reaps_silent_connections() {
+    use std::net::TcpStream;
+    use std::os::unix::net::UnixStream;
+
+    let deadline_ms = HELLO_DEADLINE.as_millis().to_string();
+    let srv = ServerHandle::start_tls_with_env(4, &[("GNITZ_HELLO_TIMEOUT_MS", &deadline_ms)]);
+    let timeout = Some(HELLO_DEADLINE * 6);
+    let mut tcp = TcpStream::connect(srv.tls_endpoint()).expect("tcp connect");
+    tcp.set_read_timeout(timeout).unwrap();
+    assert_reaped("tls", &mut tcp);
+    let mut unix = UnixStream::connect(srv.sock_path()).expect("unix connect");
+    unix.set_read_timeout(timeout).unwrap();
+    assert_reaped("unix", &mut unix);
+
+    // A client that sends its HELLO at once is unaffected.
     let mut client = GnitzClient::connect(&srv.tls_target()).expect("a normal client must connect");
     client.alloc_id().unwrap();
 }

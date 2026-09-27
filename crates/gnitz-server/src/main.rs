@@ -78,8 +78,6 @@ Options:
                        loopback bind trusts every local UID (like the always-on
                        AF_UNIX socket), gated only by network reachability and
                        filesystem permissions.
-  --tls-max-conns=N    Global cap on concurrent TLS connections (default 256).
-                       A connection accepted past the cap is closed immediately.
   --help, -h           Show this help message and exit
 
 Environment:
@@ -87,14 +85,19 @@ Environment:
   GNITZ_CHECKPOINT_BYTES   SAL checkpoint threshold in bytes (default: 75% of SAL size)
   GNITZ_CPU_AFFINITY       Pin the master and each worker to CPUs (default: on; 0 disables).
                            Set to 0 when servers share a host without per-server cpusets.
+  GNITZ_MAX_CONNS          Cap on open client connections, every transport together
+                           (default: 256). A connection accepted past it is closed at once.
+  GNITZ_HELLO_TIMEOUT_MS   How long a connection may take from accept to its HELLO, TLS
+                           handshake included, before it is closed (default: longer
+                           than a client waits for its own connect).
 ";
 
-fn parse_level(s: &str) -> u32 {
+fn parse_level(s: &str) -> Result<u32, String> {
     match s.to_ascii_lowercase().as_str() {
-        "quiet" | "0" => gnitz_foundation::log::QUIET,
-        "normal" | "1" => gnitz_foundation::log::NORMAL,
-        "verbose" | "debug" | "2" => gnitz_foundation::log::DEBUG,
-        _ => gnitz_foundation::log::QUIET,
+        "quiet" | "0" => Ok(gnitz_foundation::log::QUIET),
+        "normal" | "1" => Ok(gnitz_foundation::log::NORMAL),
+        "verbose" | "debug" | "2" => Ok(gnitz_foundation::log::DEBUG),
+        _ => Err(format!("invalid log level {s:?} (expected quiet, normal or verbose)")),
     }
 }
 
@@ -108,118 +111,85 @@ fn parse_workers(val: &str) -> Result<u32, String> {
     }
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
+/// What argv asks for, checked for syntax only.
+struct Args {
+    data_dir: String,
+    socket_path: String,
+    workers: u32,
+    level: u32,
+    tls: runtime::TlsArgs,
+}
 
-    let mut level = gnitz_foundation::log::QUIET;
-    if let Ok(env_level) = env::var("GNITZ_LOG_LEVEL") {
-        level = parse_level(&env_level);
-    }
-
-    let mut data_dir = String::new();
-    let mut socket_path = String::new();
-    let mut num_workers: u32 = 1;
-    let mut tls_listen: Option<std::net::SocketAddr> = None;
-    let mut tls_cert: Option<String> = None;
-    let mut tls_key: Option<String> = None;
-    let mut tls_client_ca: Option<String> = None;
-    let mut allow_unauthenticated = false;
-    // `Option` so "unset" is distinguishable from an explicit value; defaulted
-    // to 256 at construction.
-    let mut tls_max_conns: Option<u32> = None;
-    let mut pos = 0;
-
-    let mut i = 1;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "--help" || arg == "-h" {
-            eprint!("{HELP_TEXT}");
-            process::exit(0);
-        } else if let Some(val) = arg.strip_prefix("--log-level=") {
-            level = parse_level(val);
+/// Parse argv (program name excluded), with `GNITZ_LOG_LEVEL` as `env_level`.
+fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> {
+    let mut level = env_level
+        .map(parse_level)
+        .transpose()?
+        .unwrap_or(gnitz_foundation::log::QUIET);
+    let mut workers = 1;
+    let mut tls = runtime::TlsArgs::default();
+    let mut positional: Vec<&String> = Vec::new();
+    for arg in args {
+        if let Some(val) = arg.strip_prefix("--log-level=") {
+            level = parse_level(val)?;
         } else if let Some(val) = arg.strip_prefix("--workers=") {
-            match parse_workers(val) {
-                Ok(n) => num_workers = n,
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    process::exit(1);
-                }
-            }
+            workers = parse_workers(val)?;
         } else if let Some(val) = arg.strip_prefix("--tls-listen=") {
-            match val.parse::<std::net::SocketAddr>() {
-                Ok(a) => tls_listen = Some(a),
-                Err(_) => {
-                    eprintln!("Error: invalid --tls-listen address {val:?} (expected IP:PORT)");
-                    process::exit(1);
-                }
-            }
+            let addr = val
+                .parse()
+                .map_err(|_| format!("invalid --tls-listen address {val:?} (expected IP:PORT)"))?;
+            tls.listen = Some(addr);
         } else if let Some(val) = arg.strip_prefix("--tls-cert=") {
-            tls_cert = Some(val.to_string());
+            tls.cert = Some(val.to_string());
         } else if let Some(val) = arg.strip_prefix("--tls-key=") {
-            tls_key = Some(val.to_string());
+            tls.key = Some(val.to_string());
         } else if let Some(val) = arg.strip_prefix("--tls-client-ca=") {
-            tls_client_ca = Some(val.to_string());
+            tls.client_ca = Some(val.to_string());
         } else if arg == "--allow-unauthenticated" {
-            allow_unauthenticated = true;
-        } else if let Some(val) = arg.strip_prefix("--tls-max-conns=") {
-            match val.parse::<u32>() {
-                Ok(n) if n >= 1 => tls_max_conns = Some(n),
-                _ => {
-                    eprintln!("Error: --tls-max-conns must be a positive integer (got {val:?})");
-                    process::exit(1);
-                }
-            }
-        } else if pos == 0 {
-            data_dir = arg.clone();
-            pos += 1;
-        } else if pos == 1 {
-            socket_path = arg.clone();
-            pos += 1;
+            tls.allow_unauthenticated = true;
+        } else if arg.starts_with('-') {
+            return Err(format!("unknown option {arg:?}"));
+        } else if positional.len() == 2 {
+            return Err(format!("unexpected argument {arg:?}"));
+        } else {
+            positional.push(arg);
         }
-        i += 1;
     }
+    let [data_dir, socket_path] = positional[..] else {
+        return Err("missing required arguments <data_dir> <socket_path>".to_string());
+    };
+    Ok(Args {
+        data_dir: data_dir.clone(),
+        socket_path: socket_path.clone(),
+        workers,
+        level,
+        tls,
+    })
+}
 
-    if pos < 2 {
-        eprintln!("Error: missing required arguments");
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        eprint!("{HELP_TEXT}");
+        process::exit(0);
+    }
+    let env_level = env::var("GNITZ_LOG_LEVEL").ok();
+    let args = parse_args(&args, env_level.as_deref()).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
         eprintln!("Try 'gnitz-server --help' for usage information");
         process::exit(1);
-    }
-
-    let tls_cli = match tls_listen {
-        None => {
-            if tls_cert.is_some()
-                || tls_key.is_some()
-                || tls_client_ca.is_some()
-                || allow_unauthenticated
-                || tls_max_conns.is_some()
-            {
-                eprintln!("Error: --tls-* flags require --tls-listen");
-                process::exit(1);
-            }
-            None
-        }
-        Some(listen) => {
-            let cert_key = match (tls_cert, tls_key) {
-                (None, None) => None,
-                (Some(cert), Some(key)) => Some((cert, key)),
-                _ => {
-                    eprintln!("Error: --tls-cert and --tls-key must be given together");
-                    process::exit(1);
-                }
-            };
-            Some(runtime::TlsCli {
-                listen,
-                cert_key,
-                client_ca: tls_client_ca,
-                allow_unauthenticated,
-                max_conns: tls_max_conns.unwrap_or(256),
-            })
-        }
-    };
-
-    gnitz_foundation::log::init(level, b"M");
-    let rc = runtime::server_main(&data_dir, &socket_path, num_workers, tls_cli);
-    process::exit(rc);
+    });
+    gnitz_foundation::log::init(args.level, b"M");
+    let tls = args.tls.resolve().unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    });
+    process::exit(runtime::server_main(
+        &args.data_dir,
+        &args.socket_path,
+        args.workers,
+        tls,
+    ));
 }
 
 #[cfg(test)]

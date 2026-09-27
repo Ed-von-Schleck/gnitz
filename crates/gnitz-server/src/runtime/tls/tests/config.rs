@@ -68,3 +68,84 @@ fn missing_pem_paths_error_cleanly() {
     assert!(server_crypto(Some(("/nonexistent/cert.pem", "/nonexistent/key.pem")), None).is_err());
     assert!(server_crypto(None, Some("/nonexistent/ca.pem")).is_err());
 }
+
+fn args_on(listen: &str) -> TlsArgs {
+    TlsArgs {
+        listen: Some(listen.parse().unwrap()),
+        ..TlsArgs::default()
+    }
+}
+
+#[test]
+fn resolve_refuses_an_unauthenticated_public_bind() {
+    for public in ["0.0.0.0:0", "[::]:0", "[::ffff:127.0.0.1]:0"] {
+        let Err(e) = args_on(public).resolve() else {
+            panic!("{public} is refused")
+        };
+        assert!(e.contains("refusing to bind"), "{e}");
+    }
+    let hatch = TlsArgs {
+        allow_unauthenticated: true,
+        ..args_on("0.0.0.0:0")
+    };
+    assert!(hatch.resolve().expect("the escape hatch admits it").is_some());
+    assert!(args_on("127.0.0.1:0").resolve().expect("loopback is turnkey").is_some());
+}
+
+#[test]
+fn resolve_rejects_inconsistent_flags() {
+    let half = TlsArgs {
+        cert: Some("c.pem".into()),
+        ..args_on("127.0.0.1:0")
+    };
+    assert_eq!(
+        half.resolve().err().as_deref(),
+        Some("--tls-cert and --tls-key must be given together")
+    );
+    let no_listen = TlsArgs {
+        allow_unauthenticated: true,
+        ..TlsArgs::default()
+    };
+    assert_eq!(
+        no_listen.resolve().err().as_deref(),
+        Some("--tls-* flags require --tls-listen")
+    );
+    assert!(TlsArgs::default().resolve().unwrap().is_none());
+}
+
+/// `bind` publishes the bound endpoint and the dev PEM, and every accepted
+/// socket inherits the listening socket's options.
+#[test]
+fn bind_publishes_both_files_and_accepted_sockets_inherit_the_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap();
+    let tls = args_on("127.0.0.1:0").resolve().unwrap().unwrap();
+    let (fd, _cfg) = tls.bind(data_dir).expect("bind");
+
+    let endpoint = std::fs::read_to_string(dir.path().join("tls_endpoint")).unwrap();
+    let addr: SocketAddr = endpoint.trim().parse().expect("a connectable address");
+    assert_ne!(addr.port(), 0);
+    let pem = std::fs::read_to_string(dir.path().join("tls_dev_cert.pem")).unwrap();
+    assert!(pem.contains("BEGIN CERTIFICATE"));
+
+    let _client = std::net::TcpStream::connect(addr).unwrap();
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(unsafe { libc::poll(&mut pfd, 1, 5_000) }, 1, "the connect is pending");
+    let accepted = unsafe { libc::accept(fd.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut()) };
+    assert!(accepted >= 0, "accept: {}", std::io::Error::last_os_error());
+    // SAFETY: a fresh fd from `accept`, owned by nothing else.
+    let accepted = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(accepted) };
+    let opt = |level, name| {
+        let mut v: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe { libc::getsockopt(accepted.as_raw_fd(), level, name, (&raw mut v).cast(), &mut len) };
+        assert_eq!(rc, 0);
+        v
+    };
+    assert_eq!(opt(libc::IPPROTO_TCP, libc::TCP_NODELAY), 1);
+    assert_eq!(opt(libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
+}

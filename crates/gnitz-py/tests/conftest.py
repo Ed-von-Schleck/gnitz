@@ -2,22 +2,13 @@ import contextlib
 import itertools
 import os
 import shutil
-import subprocess
-import time
 import warnings
 
 import pytest
 import gnitz
 from _paths import REPO_ROOT
 from _uid import uid
-from _serverproc import (
-    NUM_WORKERS,
-    ServerProc,
-    is_debug_build,
-    server_binary,
-    server_preexec,
-    test_server_env,
-)
+from _serverproc import NUM_WORKERS, ServerProc
 
 _TMP_DIR = str(REPO_ROOT / "tmp")
 os.makedirs(_TMP_DIR, exist_ok=True)
@@ -47,52 +38,30 @@ _SUN_PATH_BUDGET = 100
 # ── server lifecycle ──────────────────────────────────────────────────────────
 
 class _Server:
-    """
-    Wraps a gnitz-server subprocess.
+    """A shared server run through a `ServerProc`, with a TLS listener. Its
+    socket path, TLS port and CA path stay fixed across restarts; every boot gets
+    a fresh data dir from `tmp_path_factory`, and so a clean catalog."""
 
-    The Unix socket path lives in a stable base directory and never changes
-    across restarts.  Only the data directory is replaced on each restart,
-    guaranteeing a clean catalog without invalidating any fixture that holds
-    the socket path.
-
-    Data directories come from `tmp_path_factory`, not the function-scoped
-    `tmp_path`: this server outlives any single test. They are named `d` to keep
-    the worker-log paths short.
-
-    This is the only server in the suite with a TLS listener and with a data dir
-    that is *replaced* on restart; a test that drives its own server uses
-    `ServerProc`, which reboots on the same data dir and skips the per-boot cert
-    minting and TCP bind.
-
-    The TLS target survives restarts: later boots rebind the first boot's port,
-    and every boot's dev cert is copied to one fixed CA path.
-
-    Lifecycle:
-        _Server(sock_path, factory)  → __init__ pins the socket path and CA path
-        .start()                     → spawns first process in a fresh data_dir
-        .restart()                   → kills process, discards data_dir, spawns again
-        .teardown()                  → copies worker logs, kills process, removes dirs
-    """
-
-    def __init__(self, sock_path: str, tmp_path_factory):
-        self._binary = server_binary()
+    def __init__(self, sock_path: str, tmp_path_factory, *, workers=None, extra_env=None):
         self._factory = tmp_path_factory
         self.sock_path = sock_path
         # 0 until the first boot publishes the port it bound.
         self.tls_port = 0
         self.tls_ca_path = sock_path + ".ca.pem"
-        self.proc = None
-        self._stderr_f = None
+        self._workers = workers
+        self._extra_env = extra_env
+        self._proc: ServerProc | None = None
         self._data_dir: str | None = None
-        # Read fresh on every spawn, not once here: the seam fixtures monkeypatch
-        # GNITZ_WORKERS around the construction. Recorded so teardown copies the
-        # logs of exactly the workers that ran.
-        self._workers = NUM_WORKERS
 
     # ── public ────────────────────────────────────────────────────────────────
 
     def start(self) -> None:
         self._spawn()
+
+    @property
+    def proc(self):
+        """The running server's `Popen`, or None before a boot succeeded."""
+        return self._proc.proc if self._proc else None
 
     @property
     def tls_target(self) -> str:
@@ -112,29 +81,21 @@ class _Server:
 
     def restart(self) -> None:
         """Kill the current process, discard its data dir, spawn fresh."""
-        if self.is_alive():
-            self.proc.kill()
-            self.proc.wait()
-        if self._stderr_f:
-            self._stderr_f.close()
-            self._stderr_f = None
+        if self._proc:
+            self._proc.stop()
         with open(_LOG_PATH, "a") as f:
             f.write("\n\n--- server restarted by _server_guard (crash above this line) ---\n\n")
         self._spawn()
 
     def teardown(self) -> None:
         """Copy worker logs to _TMP_DIR, then kill and clean up."""
-        if self._data_dir:
-            data = os.path.join(self._data_dir, "data")
-            for i in range(self._workers):
+        if self._proc:
+            data = self._proc.data_dir
+            for i in range(self._proc.workers):
                 src = os.path.join(data, f"worker_{i}.log")
                 if os.path.exists(src):
                     shutil.copy2(src, os.path.join(_TMP_DIR, f"last_worker_{i}.log"))
-        if self.is_alive():
-            self.proc.kill()
-            self.proc.wait()
-        if self._stderr_f:
-            self._stderr_f.close()
+            self._proc.stop()
         self._discard_data_dir()
 
     # ── private ───────────────────────────────────────────────────────────────
@@ -150,65 +111,19 @@ class _Server:
     def _spawn(self) -> None:
         """Start a new server process in a fresh data directory."""
         self._discard_data_dir()
+        self._proc = None
         self._data_dir = str(self._factory.mktemp("d"))
         data_dir = os.path.join(self._data_dir, "data")
-        if os.path.exists(self.sock_path):
-            os.unlink(self.sock_path)
-        self._workers = int(os.environ.get("GNITZ_WORKERS", NUM_WORKERS))
-        cmd = [self._binary, data_dir, self.sock_path,
-               f"--tls-listen=127.0.0.1:{self.tls_port}",
-               f"--workers={self._workers}"]
-        if ll := os.environ.get("GNITZ_LOG_LEVEL"):
-            cmd += [f"--log-level={ll}"]
-        # Append so a restart does not discard the log that contains the crash.
-        self._stderr_f = open(_LOG_PATH, "a")
-        env = test_server_env()
-        # preexec_fn ties the master's life to pytest's (PR_SET_PDEATHSIG): an
-        # interrupted run (Ctrl-C / SIGKILL / crash) can't orphan the server.
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=self._stderr_f,
-                                     env=env, preexec_fn=server_preexec)
-        # Readiness = socket file + TLS endpoint published (the endpoint file
-        # is rename-published after the TCP bind and the dev cert's write, just
-        # before "GnitzDB ready").
-        tls_endpoint = os.path.join(data_dir, "tls_endpoint")
-        for _ in range(10_000):
-            if os.path.exists(self.sock_path) and os.path.exists(tls_endpoint):
-                break
-            # Fail fast on a dead process (e.g. a restart's port was taken)
-            # instead of blind-waiting the full 10 s and cascading a generic
-            # error through the session.
-            if self.proc.poll() is not None:
-                self._stderr_f.close()
-                self._stderr_f = None
-                tail = _log_tail()
-                raise RuntimeError(
-                    f"Server exited during startup (rc={self.proc.returncode}).\n"
-                    f"stderr tail:\n{tail}"
-                )
-            time.sleep(0.001)
-        else:
-            self.proc.kill()
-            self.proc.communicate()
-            self._stderr_f.close()
-            self._stderr_f = None
-            raise RuntimeError("Server did not start within 10 s")
-        with open(tls_endpoint) as f:
+        self._proc = ServerProc(
+            data_dir, self.sock_path,
+            workers=self._workers or int(os.environ.get("GNITZ_WORKERS", NUM_WORKERS)),
+            extra_env=self._extra_env, log_path=_LOG_PATH,
+            args=[f"--tls-listen=127.0.0.1:{self.tls_port}"]).start()
+        with open(os.path.join(data_dir, "tls_endpoint")) as f:
             self.tls_port = int(f.read().strip().rsplit(":", 1)[1])
         tmp_ca = self.tls_ca_path + ".tmp"
         shutil.copyfile(os.path.join(data_dir, "tls_dev_cert.pem"), tmp_ca)
         os.replace(tmp_ca, self.tls_ca_path)
-
-
-def _log_tail(max_bytes: int = 8192) -> str:
-    """Last few KB of the shared server log, for fail-fast diagnostics."""
-    try:
-        with open(_LOG_PATH, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - max_bytes))
-            return f.read().decode(errors="replace")
-    except OSError:
-        return "<no server log>"
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
@@ -392,30 +307,16 @@ def mirror(mirror_on, server, mirror_dir):
 
 
 @pytest.fixture
-def dedicated_server(monkeypatch, tmp_path_factory, _sock_path):
-    """Factory for a server separate from the session one, torn down with the
-    test. Call it as `dedicated_server(env)` → the started `_Server`, whose
-    `.target` the test connects to and whose `.proc` it can assert is alive.
-
-    Forces >= 2 workers — the paths under test are distributed. monkeypatch
-    reverts the env vars at teardown; it is a dependency of this fixture, so it
-    does so only after the server is dead.
-
-    A `GNITZ_INJECT_*` var names a `#[cfg(debug_assertions)]` seam that a release
-    build folds away, leaving the test asserting against an ordinary healthy
-    run, so such a request skips on a release build. Read off the prefix, not
-    passed in, so it cannot be forgotten at a call site.
-    """
+def dedicated_server(tmp_path_factory, _sock_path):
+    """`dedicated_server(env)` starts a `_Server` torn down with the test, with
+    `env` set on the server process alone. It runs `GNITZ_WORKERS` workers, read
+    from `env` or else this process, or 4 when that is below 2."""
     started = []
 
     def make(env: dict[str, str]):
-        if not is_debug_build() and any(k.startswith("GNITZ_INJECT_") for k in env):
-            pytest.skip(f"injection seam requires a debug build: {', '.join(env)}")
-        for k, v in env.items():
-            monkeypatch.setenv(k, v)
-        if int(os.environ.get("GNITZ_WORKERS", NUM_WORKERS)) < 2:
-            monkeypatch.setenv("GNITZ_WORKERS", "4")
-        s = _Server(_sock_path(), tmp_path_factory)
+        workers = int(env.get("GNITZ_WORKERS", os.environ.get("GNITZ_WORKERS", NUM_WORKERS)))
+        s = _Server(_sock_path(), tmp_path_factory,
+                    workers=workers if workers >= 2 else 4, extra_env=env)
         started.append(s)
         s.start()
         return s
@@ -526,10 +427,7 @@ def tiny_sal_server(dedicated_server):
 
 @pytest.fixture
 def disposable_server(dedicated_server):
-    """A server the test alone owns, as `(target, proc)` so the test may kill it
-    mid-flight. The session server cannot be used for that — every other test
-    shares it. Teardown is kill-safe: `_Server.teardown` tolerates a process the
-    test already reaped."""
+    """A server the test alone owns and may kill, as `(target, proc)`."""
     srv = dedicated_server({})
     return srv.target, srv.proc
 

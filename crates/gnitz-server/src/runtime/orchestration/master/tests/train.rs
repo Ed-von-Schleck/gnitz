@@ -19,7 +19,10 @@ impl DrainFixture {
         let lease = reactor.lease_train(crate::runtime::sal::WorkerSet::ALL, SalMessageKind::Scan);
         let (peer_sock, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         drop(partner);
-        let peer = Peer::unix(std::os::fd::OwnedFd::from(peer_sock), Rc::clone(&reactor));
+        let conn = reactor
+            .client_conn(std::os::fd::OwnedFd::from(peer_sock))
+            .expect("under the cap");
+        let peer = Peer::new(&reactor, conn, None);
         (DrainFixture { reactor, peer, lease }, writers)
     }
 }

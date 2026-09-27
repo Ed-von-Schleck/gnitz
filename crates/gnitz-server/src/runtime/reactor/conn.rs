@@ -117,10 +117,19 @@ impl Reactor {
         });
     }
 
-    /// A connection over `fd`, charging the reactor's inbound budget. Nothing is
-    /// armed on it yet.
-    pub(crate) fn client_conn(&self, fd: OwnedFd) -> Rc<ClientConn> {
-        Rc::new(ClientConn::new(fd, Rc::clone(&self.inner.inbound)))
+    /// A connection over `fd`, taking one slot under the connection cap and
+    /// charging frames to the inbound budget; `None`, closing `fd`, at the cap.
+    /// Nothing is armed on it yet.
+    pub(crate) fn client_conn(&self, fd: OwnedFd) -> Option<Rc<ClientConn>> {
+        let Some(slot) = self.inner.conn_slots.charge(1) else {
+            gnitz_warn!(
+                "connection cap {} reached; closing fd={}",
+                self.inner.conn_slots.cap(),
+                fd.as_raw_fd()
+            );
+            return None;
+        };
+        Some(Rc::new(ClientConn::new(fd, slot, Rc::clone(&self.inner.inbound))))
     }
 
     /// Arm `conn`'s first recv into `filter`'s window, and hold the connection

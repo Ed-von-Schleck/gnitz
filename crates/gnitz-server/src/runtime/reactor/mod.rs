@@ -41,7 +41,9 @@ use futures::{AckRoute, TimerFuture, TrainRoute};
 use runloop::run_queue_is_empty;
 use wake_queue::WakeQueue;
 
-pub(crate) use io::{Budget, Charge, ClientConn, Plain, RecvBuf, RecvEnd, RecvFilter, RecvQueue};
+#[cfg(test)]
+pub(crate) use io::Budget;
+pub(crate) use io::{ClientConn, Plain, RecvBuf, RecvEnd, RecvFilter, RecvQueue};
 pub use sync::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, WriteGuard};
 
 /// The ceilings and deadlines a reactor is built with, fixed for its life.
@@ -59,6 +61,10 @@ pub(crate) struct Limits {
     /// exhaustion waits before re-arming, so closing connections get a window
     /// to free fds.
     pub accept_rearm_backoff: std::time::Duration,
+    /// Ceiling on open client connections, across every listener and
+    /// transport (`GNITZ_MAX_CONNS`). A connection accepted past it is closed
+    /// at once.
+    pub max_conns: usize,
 }
 
 impl Limits {
@@ -68,6 +74,7 @@ impl Limits {
             inbound_cap: io::resolve_inbound_cap(),
             client_send_timeout: conn::resolve_client_send_timeout(),
             accept_rearm_backoff: std::time::Duration::from_millis(50),
+            max_conns: gnitz_foundation::env::env_num("GNITZ_MAX_CONNS", 256),
         }
     }
 
@@ -79,6 +86,7 @@ impl Limits {
         inbound_cap: usize::MAX,
         client_send_timeout: std::time::Duration::from_secs(30),
         accept_rearm_backoff: std::time::Duration::from_millis(2),
+        max_conns: usize::MAX,
     };
 }
 
@@ -158,6 +166,9 @@ struct ReactorShared {
     conns: RefCell<FxHashMap<i32, conn::Armed>>,
     /// The OOM guard shared by every connection, charged per inbound frame.
     inbound: Rc<io::Budget>,
+    /// Open client connections under `Limits::max_conns`; each [`ClientConn`]
+    /// holds one charge of it.
+    conn_slots: Rc<io::Budget>,
     /// The deadlines and ceilings this reactor was built with.
     limits: Limits,
     /// Every attached listener, indexed by the id its accept SQEs carry. See
@@ -218,6 +229,7 @@ impl Reactor {
             next_op_id: Cell::new(1),
             conns: RefCell::new(FxHashMap::default()),
             inbound: io::Budget::new(limits.inbound_cap),
+            conn_slots: io::Budget::new(limits.max_conns),
             limits,
             listeners: RefCell::new(Vec::new()),
             shutdown: Cell::new(false),

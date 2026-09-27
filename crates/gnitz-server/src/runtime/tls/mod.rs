@@ -3,21 +3,19 @@
 //! [`TlsShared::flush_records`], so records reach the socket in emission order.
 
 mod config;
-mod listener;
 
-pub(crate) use listener::{setup_tls_listener, TlsCli, TlsListener};
+pub(crate) use config::{TlsArgs, TlsConfig};
 
 use std::cell::{Cell, RefCell};
 use std::io::{BufRead, ErrorKind, Write};
 use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gnitz_store::storage::batch_pool::{acquire_buf, PooledSendBuf};
 
 use crate::runtime::reactor::{
-    chan, AsyncRwLock, Charge, ClientConn, PeerGone, Reactor, RecvEnd, RecvFilter, RecvQueue, SendBody, WriteGuard,
+    chan, AsyncRwLock, ClientConn, PeerGone, Reactor, RecvEnd, RecvFilter, RecvQueue, SendBody, WriteGuard,
 };
 
 /// Size of the ciphertext window each recv lands in.
@@ -54,16 +52,13 @@ fn feed_decrypted(sess: &mut rustls::ServerConnection, q: &mut RecvQueue) -> Res
     }
 }
 
-/// Shared handle to one TLS connection. The recv filter holds one too, so
-/// the connection-count charge tracks the session until the socket closes.
+/// Shared handle to one TLS connection.
 pub(crate) struct TlsShared {
     reactor: Rc<Reactor>,
     /// The socket and its deframed frames; see `ClientConn` for the fd's lifetime.
     conn: Rc<ClientConn>,
     /// The codec state, and nothing else. Never borrowed across an await.
     state: RefCell<rustls::ServerConnection>,
-    /// This session's place under the listener's connection cap.
-    _conn_guard: Charge,
     /// This connection is finished, from whichever end: senders refuse and the
     /// flusher shuts the socket down and exits.
     closed: Cell<bool>,
@@ -73,44 +68,22 @@ pub(crate) struct TlsShared {
     flush_tx: chan::Sender<()>,
 }
 
-/// What every accepted TLS socket wants, set here so the accept loop needs no
-/// socket-option knowledge. Best-effort: a socket that refuses either works on.
-fn set_socket_options(fd: i32) {
-    use gnitz_foundation::posix_io::set_sockopt_int;
-    // Small control frames must not pay Nagle's 40 ms batching delay
-    // (AF_UNIX has none, so this restores latency parity).
-    set_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
-    // Untuned: a silently half-open connection is reaped by the kernel
-    // default probing (~2 h) rather than parking a recv forever.
-    set_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
-}
-
 impl TlsShared {
     /// Build the connection, arm its recv filter and spawn its flusher; between them
     /// they drive the handshake.
-    pub(crate) fn start(
-        reactor: Rc<Reactor>,
-        fd: OwnedFd,
-        cfg: Arc<rustls::ServerConfig>,
-        conn_guard: Charge,
-    ) -> Result<Rc<TlsShared>, rustls::Error> {
+    pub(crate) fn start(reactor: Rc<Reactor>, conn: Rc<ClientConn>, cfg: Arc<rustls::ServerConfig>) -> Rc<TlsShared> {
         /// rustls's outgoing-buffer limit: what one `writer().write()` accepts, and
         /// so how much ciphertext one encrypt-and-send turn carries.
         const SEND_BUFFER_BYTES: usize = 256 * 1024;
 
-        // `ServerConnection::new` runs first: on failure the moved-in `fd` and
-        // `conn_guard` drop here as this frame unwinds — closing the socket and
-        // refunding the count; on success both live in the returned `TlsShared`.
-        let mut sess = rustls::ServerConnection::new(cfg)?;
+        let mut sess =
+            rustls::ServerConnection::new(cfg).expect("server_crypto built a session from this config at boot");
         sess.set_buffer_limit(Some(SEND_BUFFER_BYTES));
-        set_socket_options(fd.as_raw_fd());
-        let conn = reactor.client_conn(fd);
         let (flush_tx, flush_rx) = chan::unbounded::<()>();
         let tls = Rc::new(TlsShared {
             reactor,
             conn,
             state: RefCell::new(sess),
-            _conn_guard: conn_guard,
             closed: Cell::new(false),
             send_lock: AsyncRwLock::default(),
             flush_tx,
@@ -121,12 +94,7 @@ impl TlsShared {
         };
         tls.reactor.register_conn(&tls.conn, Box::new(ingress));
         tls.reactor.spawn(flusher(Rc::clone(&tls), flush_rx));
-        Ok(tls)
-    }
-
-    /// The connection the reactor deframes this session's plaintext into.
-    pub(crate) fn conn(&self) -> &Rc<ClientConn> {
-        &self.conn
+        tls
     }
 
     fn notify_flusher(&self) {
