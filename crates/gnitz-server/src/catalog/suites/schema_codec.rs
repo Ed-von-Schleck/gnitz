@@ -161,7 +161,6 @@ fn ddl_txn_roundtrip_client_to_server() {
                     .u64_val(0) // is_nullable
                     .u64_val(0) // fk_table_id
                     .u64_val(0) // fk_col_idx
-                    .u64_val(0) // is_serial
                     .u64_val(0) // is_hidden
                     .u64_val(0); // scale
             }

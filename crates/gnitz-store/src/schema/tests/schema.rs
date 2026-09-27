@@ -156,10 +156,11 @@ fn dist_prefix_out_of_range_is_rejected_at_the_decode_boundary() {
     // the full PK here, which would route a corrupt row as if it were sound.
     let props = gnitz_wire::TableProps {
         stream: false,
+        serial: false,
         distribution: gnitz_wire::TableDistribution::Keyed { prefix_len: 99 },
     };
-    assert!(props.validate_against_pk(3).is_err(), "k=99 over a 3-column PK");
-    assert!(props.validate_against_pk(99).is_ok(), "k == |PK| is the full-PK route");
+    assert!(props.validate(3).is_err(), "k=99 over a 3-column PK");
+    assert!(props.validate(99).is_ok(), "k == |PK| is the full-PK route");
     // The descriptor's own prefix sum stays in range regardless: it walks the PK
     // columns it has, so a forged k cannot run `dist_stride` past `pk_stride`.
     assert_eq!(

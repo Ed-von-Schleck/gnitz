@@ -2,7 +2,7 @@
 //! table column lists and IDs, schema sizing caps, and the compound-PK
 //! column-list codec for the persisted `TABLE_TAB.pk_col_idx` u64.
 
-use crate::TypeCode;
+use crate::{ColType, TypeCode};
 
 // ---------------------------------------------------------------------------
 // System table column descriptors — shared single source of truth
@@ -131,10 +131,6 @@ pub(crate) const COL_TAB_COLS: &[WireSysCol] = &[
     col("is_nullable", TypeCode::U64, false),
     col("fk_table_id", TypeCode::U64, false),
     col("fk_col_idx", TypeCode::U64, false),
-    // is_serial marker: 1 for a SERIAL PK column, else 0. Lets a connection
-    // that only fetched the schema distinguish an auto-assigned SERIAL PK from
-    // a user-supplied non-null integer PK. Stored verbatim by the engine.
-    col("is_serial", TypeCode::U64, false),
     // is_hidden marker: 1 for a hidden key slot (synthetic view keys and
     // unprojected passthrough PKs), else 0. Echoed into reply schema blocks as
     // `ColMeta::hidden`; the engine never branches on it.
@@ -225,7 +221,6 @@ pub const RELTAB_PAY_NAME: usize = shared_pay_index(TABLE_TAB, VIEW_TAB, "name")
 
 pub const COLTAB_PAY_NAME: usize = pay_index_in_fam(COL_TAB, "name");
 pub const COLTAB_PAY_TYPE_CODE: usize = pay_index_in_fam(COL_TAB, "type_code");
-pub const COLTAB_PAY_IS_SERIAL: usize = pay_index_in_fam(COL_TAB, "is_serial");
 pub const COLTAB_PAY_FK_TABLE_ID: usize = pay_index_in_fam(COL_TAB, "fk_table_id");
 pub const COLTAB_PAY_FK_COL_IDX: usize = pay_index_in_fam(COL_TAB, "fk_col_idx");
 pub const COLTAB_PAY_IS_NULLABLE: usize = pay_index_in_fam(COL_TAB, "is_nullable");
@@ -754,6 +749,7 @@ pub fn unpack_pk_cols(packed: u64) -> Result<PkColList, crate::PkRule> {
 //
 //   bit 0        replicated (TABLE_FLAG_REPLICATED) — full copy on every worker
 //   bit 1        stream (TABLE_FLAG_STREAM) — storeless append-only ingestion point
+//   bit 2        serial (TABLE_FLAG_SERIAL) — INSERT draws the lone PK column from a sequence
 //   bits [8..16) distribution prefix length k (0 = default = full PK)
 //
 // Every other bit is refused on decode. `replicated` and a non-default `k` are
@@ -768,6 +764,9 @@ const TABLE_FLAG_REPLICATED: u64 = 1;
 /// Bit 1: the table is a **stream** — a storeless, append-only ingestion point.
 /// Independent of the distribution: a stream may be replicated or CLUSTER BY'd.
 const TABLE_FLAG_STREAM: u64 = 1 << 1;
+/// Bit 2: the table's single PK column is **SERIAL** — INSERT draws it from the
+/// table's sequence.
+const TABLE_FLAG_SERIAL: u64 = 1 << 2;
 /// Bit position of the distribution-prefix-length byte in `TABLE_TAB.flags`.
 const TABLE_FLAG_DIST_SHIFT: u32 = 8;
 /// Mask for the distribution-prefix-length byte (one byte: 0..=255). An
@@ -775,7 +774,7 @@ const TABLE_FLAG_DIST_SHIFT: u32 = 8;
 const TABLE_FLAG_DIST_MASK: u64 = 0xFF;
 /// Every bit a `TABLE_TAB.flags` word may carry.
 const TABLE_FLAGS_DEFINED: u64 =
-    TABLE_FLAG_REPLICATED | TABLE_FLAG_STREAM | (TABLE_FLAG_DIST_MASK << TABLE_FLAG_DIST_SHIFT);
+    TABLE_FLAG_REPLICATED | TABLE_FLAG_STREAM | TABLE_FLAG_SERIAL | (TABLE_FLAG_DIST_MASK << TABLE_FLAG_DIST_SHIFT);
 
 /// `VIEW_TAB.flags` bit 0: two of the view's rows may carry the same PK, so its
 /// PK region identifies no row — a view over a stream, one keyed on a join key or
@@ -860,16 +859,15 @@ impl Default for TableDistribution {
     }
 }
 
-/// The logical content of `TABLE_TAB.flags` — equivalently, the non-column
-/// properties of a `CREATE TABLE`. A struct rather than positional arguments
-/// because `stream` and the distribution are independent, and a transposed
-/// call that turned a durable table into a stream would discard its rows on
-/// restart.
+/// The logical content of `TABLE_TAB.flags`: the non-column properties of a
+/// `CREATE TABLE`.
 #[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
 pub struct TableProps {
     /// A storeless, append-only ingestion point rather than a table: it holds no
     /// rows and nothing it ingests survives a restart.
     pub stream: bool,
+    /// INSERT draws the table's single PK column from a sequence.
+    pub serial: bool,
     /// Where the rows live. A `Keyed` prefix is `CLUSTER BY` the PK's leading
     /// prefix; the SQL planner validates it against the PK before packing, and
     /// the schema constructor normalizes the default `0` to `|PK|`.
@@ -884,7 +882,7 @@ impl TableProps {
             TableDistribution::Keyed { prefix_len } => (prefix_len as u64) << TABLE_FLAG_DIST_SHIFT,
             TableDistribution::Replicated => TABLE_FLAG_REPLICATED,
         };
-        dist | if self.stream { TABLE_FLAG_STREAM } else { 0 }
+        dist | if self.stream { TABLE_FLAG_STREAM } else { 0 } | if self.serial { TABLE_FLAG_SERIAL } else { 0 }
     }
 
     /// Decode a persisted `TABLE_TAB.flags` u64, refusing a bit outside the
@@ -903,21 +901,38 @@ impl TableProps {
         };
         Ok(TableProps {
             stream: flags & TABLE_FLAG_STREAM != 0,
+            serial: flags & TABLE_FLAG_SERIAL != 0,
             distribution,
         })
     }
 
-    /// The rule the flags packing cannot make unrepresentable: a `Keyed` prefix
-    /// is a *leading PK prefix* length, so it cannot exceed `pk_len`.
-    /// `TABLE_FLAG_DIST_MASK` is `0xFF`, so a forged flags word can carry 255.
-    /// `0` is the persisted "default distribution" sentinel.
-    pub fn validate_against_pk(&self, pk_len: usize) -> Result<(), String> {
-        match self.distribution {
-            TableDistribution::Keyed { prefix_len } if prefix_len as usize > pk_len => Err(format!(
-                "distribution prefix length {prefix_len} exceeds PK column count {pk_len}"
-            )),
-            _ => Ok(()),
+    /// The rules against a PK of `pk_len` columns that the flags word cannot
+    /// encode.
+    pub fn validate(&self, pk_len: usize) -> Result<(), String> {
+        if let TableDistribution::Keyed { prefix_len } = self.distribution {
+            if prefix_len as usize > pk_len {
+                return Err(format!(
+                    "distribution prefix length {prefix_len} exceeds PK column count {pk_len}"
+                ));
+            }
         }
+        if self.serial && self.stream {
+            return Err("a stream cannot be SERIAL: it holds no rows to seed the generator from".to_string());
+        }
+        if self.serial && pk_len != 1 {
+            return Err("a SERIAL table's primary key is its one SERIAL column".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// The type rule on a SERIAL table's PK columns, given as `(name, type)`.
+pub fn validate_serial_key<'a>(pk: impl IntoIterator<Item = (&'a str, ColType)>) -> Result<(), String> {
+    match pk.into_iter().find(|(_, ty)| !ty.tc.is_serial_eligible()) {
+        Some((name, ty)) => Err(format!(
+            "SERIAL primary key column '{name}' is {ty}; SERIAL needs an integer of at most 8 bytes"
+        )),
+        None => Ok(()),
     }
 }
 

@@ -660,7 +660,7 @@ fn scalar_expression_rules() {
             "Unsupported",
             "18446744073709551616",
         ),
-        ("CAST('abc' AS DECIMAL(5, 2))", "Bind", "invalid DECIMAL literal"),
+        ("CAST('abc' AS DECIMAL(5, 2))", "Bind", "invalid DECIMAL("),
         // Each product adds its operands' scales, so a chain of them runs past
         // what the scaled integer can hold.
         (
@@ -680,7 +680,7 @@ fn scalar_expression_rules() {
         rejects(&cat, &[(&format!("SELECT id, {expr} AS y FROM x"), variant, needle)]);
     }
     // Summing day counts yields a number that is not a date.
-    rejects(&cat, &[("SELECT SUM(d) AS y FROM x", "Unsupported", "Date column")]);
+    rejects(&cat, &[("SELECT SUM(d) AS y FROM x", "Unsupported", "DATE column")]);
 }
 
 #[test]

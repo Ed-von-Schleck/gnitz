@@ -760,8 +760,7 @@ fn drop_table_retracts_its_serial_sequence_row() {
     let dir = temp_dir("drop_table_serial_row");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", TypeCode::U64)];
-    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let tid = engine.create_serial_table("public.t").unwrap();
     let (_base, delta) = engine.reserve_user_sequence(tid, 64).unwrap();
     engine.submit(SysFamily::Sequence, delta).unwrap();
     assert_eq!(engine.sequence_value(tid), Some(64));

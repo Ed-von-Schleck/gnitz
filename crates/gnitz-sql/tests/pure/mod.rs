@@ -90,6 +90,7 @@ pub fn rel_with(
         tid,
         class,
         pk_repeats: class == RelClass::Stream,
+        serial: false,
         schema: Arc::new(Schema { columns, pk_cols }),
         indexes: indexes
             .iter()
@@ -136,7 +137,7 @@ pub fn catalog(rels: Vec<(&str, Arc<RelDescriptor>)>) -> CatalogSnapshot {
 /// | `a` | `(id PK, k, v)` |
 /// | `b` | `(id PK, k, w)` |
 /// | `n` | `(id PK, k NULL, v NULL)` — nullable join keys and values |
-/// | `ty` | `(id PK, s TEXT, f DOUBLE, big DECIMAL(38,0), uid UUID, i32c INT, u8c U8, i16c SMALLINT)` |
+/// | `ty` | `(id PK, s TEXT, f DOUBLE, big UINT128, uid UUID, i32c INT, u8c U8, i16c SMALLINT)` |
 /// | `c` | `(a U64, b U64, v)` with `PRIMARY KEY (a, b)` |
 /// | `r` | `(id PK, v)` |
 /// | `tv` | a view with `t`'s columns |
@@ -237,6 +238,7 @@ pub fn register(cat: &mut CatalogSnapshot, name: &str, tid: u64, chain: &Planned
             tid,
             class: chain.props.into(),
             pk_repeats: fv.pk_repeats,
+            serial: false,
             schema: Arc::clone(&fv.schema),
             indexes: Vec::new(),
         })),

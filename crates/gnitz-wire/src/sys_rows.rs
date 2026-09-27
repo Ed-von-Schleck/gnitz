@@ -66,7 +66,6 @@ pub struct ColTabRow<'a> {
     pub is_nullable: bool,
     pub fk_table_id: u64,
     pub fk_col_idx: u64,
-    pub is_serial: bool,
     pub is_hidden: bool,
 }
 
@@ -79,7 +78,6 @@ pub fn write_col_tab_row(sink: &mut impl SysRowSink, r: &ColTabRow, weight: i64)
     sink.put_u64(r.is_nullable as u64);
     sink.put_u64(r.fk_table_id);
     sink.put_u64(r.fk_col_idx);
-    sink.put_u64(r.is_serial as u64);
     sink.put_u64(r.is_hidden as u64);
     sink.put_u64(r.ty.scale as u64);
     sink.end_row();

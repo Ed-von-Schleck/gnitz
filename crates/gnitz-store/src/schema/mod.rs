@@ -294,7 +294,7 @@ impl Placement {
     /// the full PK. Constructors normalize it against the schema's PK arity, so a
     /// `Keyed` prefix read back off a descriptor is never the sentinel — it is
     /// `pk_count` for the default and `1..pk_count` for a `CLUSTER BY` prefix.
-    /// An out-of-range prefix is not normalized here: `TableProps::validate_against_pk`
+    /// An out-of-range prefix is not normalized here: `TableProps::validate`
     /// rejects it at the decode boundary, where the corrupt row can be named.
     pub const KEYED_DEFAULT: Placement = Placement::Keyed { prefix_len: 0 };
 

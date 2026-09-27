@@ -6,7 +6,7 @@
 use crate::ast_util::extract_object_name;
 use crate::bind::{find_unique_column, require_column};
 use crate::error::{missing_relation, reject_if, unsupported_clause, GnitzSqlError};
-use crate::types::{serial_underlying, sql_col_type};
+use crate::types::column_def;
 use crate::validate::{
     reject_unhonored_alter_table_clauses, reject_unhonored_column_options, reject_unhonored_unique_fields,
     require_class, validate_user_name, ClassWant, ColumnOptionSite,
@@ -126,7 +126,7 @@ fn parse<'a>(operation: &'a AlterTableOperation, schema_name: &str) -> Result<Al
             // Inert: `ADD c INT` and `ADD COLUMN c INT` mean the same thing.
             column_keyword: _,
             if_not_exists,
-            column_def,
+            column_def: col,
             column_position,
         } => {
             const CTX: &str = "ALTER TABLE ADD COLUMN";
@@ -136,12 +136,10 @@ fn parse<'a>(operation: &'a AlterTableOperation, schema_name: &str) -> Result<Al
                 CTX,
                 "FIRST/AFTER (a column is always appended last)",
             )?;
-            reject_unhonored_column_options(column_def, ColumnOptionSite::AddColumn)?;
-            reject_if(serial_underlying(&column_def.data_type).is_some(), CTX, "SERIAL")?;
-            let col_name = column_def.name.value.clone();
-            let ty = sql_col_type(&column_def.data_type)?;
-            let def = gnitz_core::ColumnDef::typed(&col_name, ty, /* is_nullable */ true);
-            alter(CTX, "column", col_name, Action::AddColumn(def))
+            reject_unhonored_column_options(col, ColumnOptionSite::AddColumn)?;
+            let (def, serial) = column_def(col)?;
+            reject_if(serial, CTX, "SERIAL")?;
+            alter(CTX, "column", def.name.clone(), Action::AddColumn(def))
         }
         AlterTableOperation::DropColumn {
             // Inert: `DROP c` and `DROP COLUMN c` mean the same thing.

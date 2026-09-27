@@ -40,9 +40,7 @@ fn test_orphaned_metadata_recovery() {
 fn test_reserve_user_sequence_seed_and_contiguous() {
     let dir = temp_dir("reserve_user_seq");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let seq_id = engine
-        .create_table("public.t", &[col_def("id", TypeCode::U64)], &[0])
-        .unwrap();
+    let seq_id = engine.create_serial_table("public.t").unwrap();
 
     let (base1, delta1) = engine.reserve_user_sequence(seq_id, 64).unwrap();
     assert_eq!(base1, 1);
@@ -70,15 +68,14 @@ fn test_reserve_user_sequence_rejects_exhausted_range() {
     let dir = temp_dir("reserve_user_seq_exhausted");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = [col_def("id", TypeCode::U64)];
-    let full = engine.create_table("public.full", &cols, &[0]).unwrap();
+    let full = engine.create_serial_table("public.full").unwrap();
     engine
         .ingest_to_family(SEQ_TAB_ID, &engine.sequence_delta(full, (i64::MAX - 1) as u64))
         .unwrap();
     let err = engine.reserve_user_sequence(full, 64).err().unwrap();
     assert!(err.contains("invalid or exhausted"), "{err}");
     engine.reserve_user_sequence(full, 0).err().unwrap();
-    let edge = engine.create_table("public.edge", &cols, &[0]).unwrap();
+    let edge = engine.create_serial_table("public.edge").unwrap();
     engine.reserve_user_sequence(edge, 1 << 63).err().unwrap();
     engine.reserve_user_sequence(edge + 1000, 1).err().unwrap();
 
@@ -99,9 +96,7 @@ fn test_user_sequence_durable_roundtrip() {
     let user_seq;
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        user_seq = engine
-            .create_table("public.t", &[col_def("id", TypeCode::U64)], &[0])
-            .unwrap();
+        user_seq = engine.create_serial_table("public.t").unwrap();
         let (base, delta) = engine.reserve_user_sequence(user_seq, 64).unwrap();
         assert_eq!(base, 1);
         engine.ingest_to_family(SEQ_TAB_ID, &delta).unwrap();

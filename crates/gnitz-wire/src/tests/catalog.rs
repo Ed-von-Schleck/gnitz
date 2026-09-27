@@ -110,21 +110,23 @@ fn table_flags_roundtrip() {
     assert_eq!(TableProps::default().pack(), 0);
     let keyed = |stream, prefix_len| TableProps {
         stream,
+        serial: false,
         distribution: TableDistribution::Keyed { prefix_len },
     };
     let replicated = |stream| TableProps {
         stream,
+        serial: false,
         distribution: TableDistribution::Replicated,
     };
     // Every field combination survives, and k rides in byte 1 clear of the bits.
     for &stream in &[false, true] {
-        assert_eq!(
-            TableProps::from_flags(replicated(stream).pack()).unwrap(),
-            replicated(stream)
-        );
-        for prefix_len in 0..=PK_LIST_MAX_COLS as u8 {
-            let p = keyed(stream, prefix_len);
-            assert_eq!(TableProps::from_flags(p.pack()).unwrap(), p);
+        for serial in [false, true] {
+            let r = TableProps { serial, ..replicated(stream) };
+            assert_eq!(TableProps::from_flags(r.pack()).unwrap(), r);
+            for prefix_len in 0..=PK_LIST_MAX_COLS as u8 {
+                let p = TableProps { serial, ..keyed(stream, prefix_len) };
+                assert_eq!(TableProps::from_flags(p.pack()).unwrap(), p);
+            }
         }
     }
     // `TABLE_TAB.flags` is persisted, so the bit *positions* are a wire
@@ -135,6 +137,18 @@ fn table_flags_roundtrip() {
     assert_eq!(keyed(false, 2).pack(), 2 << 8);
     assert_eq!(replicated(true).pack(), 0b11);
     assert_eq!(keyed(true, 2).pack(), 0b10 | (2 << 8));
+    assert_eq!(TableProps { serial: true, ..keyed(false, 0) }.pack(), 0b100);
+}
+
+/// A SERIAL table is a table keyed by its one generated column: `validate`
+/// refuses the flag on a stream and over a compound PK.
+#[test]
+fn table_props_validate_refuses_a_serial_stream_and_a_compound_serial_pk() {
+    let serial = TableProps { serial: true, ..TableProps::default() };
+    assert_eq!(serial.validate(1), Ok(()));
+    assert!(serial.validate(2).unwrap_err().contains("one SERIAL column"));
+    let stream = TableProps { stream: true, ..serial };
+    assert!(stream.validate(1).unwrap_err().contains("a stream cannot be SERIAL"));
 }
 
 /// `VIEW_TAB.flags` round-trips, pins its persisted bit position, and refuses
@@ -154,7 +168,7 @@ fn view_flags_round_trip_and_refuse_reserved_bits() {
 /// A bit outside the defined set is refused, not ignored.
 #[test]
 fn table_flags_refuse_reserved_bits() {
-    for reserved in [1u64 << 2, 1 << 7, 1 << 16, 1 << 63] {
+    for reserved in [1u64 << 3, 1 << 7, 1 << 16, 1 << 63] {
         assert!(TableProps::from_flags(reserved).is_err(), "bit {reserved:#x}");
     }
 }

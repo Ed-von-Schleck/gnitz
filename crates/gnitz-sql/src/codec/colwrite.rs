@@ -4,7 +4,7 @@
 //! literal, so `300` means the same thing whichever verb writes it; and
 //! [`check_not_null`] is the NOT NULL verdict both DML write paths take.
 
-use crate::codec::literal::{place, Placed};
+use crate::codec::literal::{invalid_literal, place, Placed};
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
 use gnitz_core::{push_zero_cell, ColumnDef, TypeCode};
@@ -72,8 +72,10 @@ pub(crate) fn native_value<R>(lit: &BExpr<R>, def: &ColumnDef) -> Result<u128, G
             | Placed::Above { nearest: Some(v) },
         ) => Ok(v),
         Some(Placed::Below { .. } | Placed::Above { .. }) => Err(format!("{ty} value out of range: {}", text())),
-        None if matches!(lit, BExpr::LitStr(_)) => Err(format!("invalid {ty} literal: {}", text())),
-        None => Err(format!("{} is not a {ty} value", text())),
+        None => match lit {
+            BExpr::LitStr(s) => Err(invalid_literal(ty, s)),
+            _ => Err(format!("{} is not a {ty} value", text())),
+        },
     }
     .map_err(|m| GnitzSqlError::Bind(format!("column '{}': {m}", def.name)))
 }

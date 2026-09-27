@@ -281,10 +281,10 @@ pub(crate) fn classify_set_rhs(
     };
     if !admits {
         return Err(GnitzSqlError::Bind(format!(
-            "cannot assign {} value to column '{}' ({:?})",
+            "cannot assign {} value to column '{}' ({})",
             if str_valued { "a string" } else { "an integer" },
             col.name,
-            col.ty.tc,
+            col.ty,
         )));
     }
     Ok(SetRhs::Expr { scope, ev: Box::new(ev) })
@@ -348,7 +348,10 @@ pub(crate) fn apply_set(
                             set_null(w, pi, v.is_none(), def)?;
                             let v = v.unwrap_or(0);
                             if !(min..=max).contains(&v) {
-                                return Err(GnitzSqlError::Bind(format!("{tc:?} value out of range: {v}")));
+                                return Err(GnitzSqlError::Bind(format!(
+                                    "column '{}': {} value out of range: {v}",
+                                    def.name, def.ty
+                                )));
                             }
                             payload[pi]
                                 .bytes

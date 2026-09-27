@@ -190,7 +190,7 @@ def test_a_wide_key_round_trips_at_both_sides_of_the_u64_boundary(
     sn = schema_name
     keys = [0, 1, U64_MAX, 1 << 64, U128_MAX]
     client.execute_sql(
-        "CREATE TABLE t (k DECIMAL(38,0) NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+        "CREATE TABLE t (k UINT128 NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
         schema_name=sn)
     client.execute_sql(
         "INSERT INTO t VALUES " + ", ".join(f"({k}, {i})" for i, k in enumerate(keys)),
@@ -237,7 +237,7 @@ def test_a_uuid_round_trips_as_its_canonical_string(client, schema_name):
 _FAMILIES = [
     ("DOUBLE", "0.0", 0.0),
     ("TEXT", "''", ""),
-    ("DECIMAL(38,0)", "0", 0),
+    ("UINT128", "0", 0),
     ("UUID", "'00000000-0000-0000-0000-000000000000'",
      "00000000-0000-0000-0000-000000000000"),
     ("DATE", "'1970-01-01'", date(1970, 1, 1)),
@@ -284,8 +284,8 @@ def test_a_string_round_trips_at_each_length_class(client, schema_name):
 
 # (SQL type, four values in ascending order). The integer widths straddle the
 # sign and the byte boundaries; TEXT shares a prefix past the inline length;
-# UUID and DECIMAL(38,0) order on all 16 bytes, the UUIDs differing only past
-# byte 8.
+# UUID, UINT128 and INT128 order on all 16 bytes, the UUIDs differing only past
+# byte 8 and INT128 straddling its sign.
 _ORDERED = [
     ("TINYINT", [I8_MIN, -5, 0, I8_MAX]),
     ("SMALLINT", [I16_MIN, -1, 256, I16_MAX]),
@@ -295,7 +295,8 @@ _ORDERED = [
     ("TEXT", ["", "shared/prefix/a", "shared/prefix/ab", "shared/prefix/abd"]),
     ("UUID", ["550e8400-e29b-41d4-a716-446655430000", "550e8400-e29b-41d4-a716-446655440000",
               "550e8400-e29b-41d4-a716-446655440001", "ffffffff-ffff-ffff-ffff-ffffffffffff"]),
-    ("DECIMAL(38,0)", [0, 5, (1 << 64) + 1, 10 ** 38 - 1]),
+    ("UINT128", [0, 5, (1 << 64) + 1, 10 ** 38 - 1]),
+    ("INT128", [-(1 << 127), -5, 0, (1 << 127) - 1]),
 ]
 # Signed twins, so a group key compared without its sign reads a neighbour's.
 _GROUPS = [(-5, -7), (5, 7), (-5, 7), (5, -7)]

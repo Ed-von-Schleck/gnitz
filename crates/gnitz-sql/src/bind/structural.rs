@@ -3,16 +3,16 @@ use std::convert::Infallible;
 use super::resolve::require_column;
 use crate::ast_util::{
     bind_literal, classify_agg_call, col_ref_parts, function_positional_args, peel_nested, single_fn_name,
-    temporal_constant,
 };
+use crate::codec::literal::{invalid_literal, parse_temporal};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, NumFunc, StrArg, StrFunc, TrimMode};
-use crate::types::{is_cast_target, sql_col_type};
+use crate::types::sql_col_type;
 use gnitz_core::{ColumnDef, Schema};
 use gnitz_expr::{CalendarOp, LikePattern};
 use sqlparser::ast::{
-    BinaryOperator, CaseWhen, CeilFloorKind, DateTimeField, Expr, Function, TrimWhereField, UnaryOperator,
-    ValueWithSpan,
+    BinaryOperator, CaseWhen, CeilFloorKind, DataType, DateTimeField, Expr, Function, TrimWhereField, TypedString,
+    UnaryOperator, Value, ValueWithSpan,
 };
 
 /// Bind an expression against a single-relation schema (WHERE, projections,
@@ -102,17 +102,24 @@ pub(crate) fn unsupported_subquery(e: &Expr) -> GnitzSqlError {
     })
 }
 
+/// `CAST(e AS dt)`; a string literal cast to DATE/TIMESTAMP folds to its value.
+fn bind_cast<R>(e: BExpr<R>, dt: &DataType) -> Result<BExpr<R>, GnitzSqlError> {
+    let to = sql_col_type(dt)?;
+    Ok(match e {
+        BExpr::LitStr(s) if to.tc.is_temporal() => BExpr::LitTemporal {
+            tc: to.tc,
+            v: parse_temporal(to.tc, &s).ok_or_else(|| GnitzSqlError::Bind(invalid_literal(to, &s)))?,
+        },
+        e => BExpr::Cast { expr: Box::new(e), to },
+    })
+}
+
 /// The one structural recursion. Needs no schema — every schema-aware decision
 /// is a leaf method. Generic over `L` (static dispatch) so a leaf's
 /// `bind_function` can recurse via `bind_structural(arg, self)`.
 pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L) -> Result<BExpr<R>, GnitzSqlError> {
     if let Some(claimed) = leaf.bind_node(expr) {
         return Ok(claimed);
-    }
-    // The VM parses no calendar text, so a temporal literal is folded here and
-    // a non-literal string cast to DATE/TIMESTAMP is refused at lowering.
-    if let Some((tc, v)) = temporal_constant(expr)? {
-        return Ok(BExpr::LitTemporal { tc, v });
     }
     match expr {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => leaf.bind_column(expr),
@@ -140,10 +147,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         Expr::Ceil { expr: e, field } => bind_ceil_floor(FloatUnaryOp::Ceil, "CEIL", e, field, leaf),
         Expr::Floor { expr: e, field } => bind_ceil_floor(FloatUnaryOp::Floor, "FLOOR", e, field, leaf),
         Expr::Cast {
-            // Every kind is the same operation here: a failed cast is a NULL, which
-            // is exactly what TRY_CAST/SAFE_CAST are documented to mean, so the
-            // explicit spellings are accepted rather than rejected. Destructuring
-            // the rest exhaustively is what keeps a qualifier from being dropped.
+            // A failed cast is already NULL, which is what TRY_CAST/SAFE_CAST mean.
             kind: _,
             expr: e,
             data_type,
@@ -158,15 +162,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
             if format.is_some() {
                 return Err(GnitzSqlError::Unsupported("CAST … FORMAT is not supported".into()));
             }
-            let to = sql_col_type(data_type)?;
-            // The 16-byte wide integer types have no register at all.
-            if !is_cast_target(to.tc) {
-                return Err(GnitzSqlError::Unsupported(format!("CAST to {to} is not supported")));
-            }
-            Ok(BExpr::Cast {
-                expr: Box::new(bind_structural(e, leaf)?),
-                to,
-            })
+            bind_cast(bind_structural(e, leaf)?, data_type)
         }
         Expr::Extract { field, syntax: _, expr: e } => Ok(BExpr::Calendar {
             op: calendar_field(&field.to_string())
@@ -278,6 +274,13 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         Expr::IsNotNull(i) => Ok(null_test(bind_structural(i, leaf)?, false, leaf)),
         Expr::Nested(i) => bind_structural(i, leaf),
         Expr::Value(vws) => bind_literal(&vws.value),
+        // `DATE '…'` (and the ODBC `{d '…'}`) is `CAST('…' AS DATE)`.
+        Expr::TypedString(TypedString { data_type, value, uses_odbc_syntax: _ }) => match &value.value {
+            Value::SingleQuotedString(s) => bind_cast(BExpr::LitStr(s.clone()), data_type),
+            v => Err(GnitzSqlError::Unsupported(format!(
+                "{data_type} literal must be a single-quoted string, got {v}"
+            ))),
+        },
         // Searched CASE binds each `(condition, result)`; the simple-operand form
         // desugars each WHEN value `w` to `operand = w`. A missing ELSE is the
         // implicit ELSE NULL (`else_ = None`, lowered to `load_null`).

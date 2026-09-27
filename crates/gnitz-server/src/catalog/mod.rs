@@ -68,7 +68,7 @@ use sys_tables::*;
 // ── Catalog-internal re-exports — no out-of-catalog consumer (W8). These reach
 //    the submodules through their `use super::*` glob, so they stay re-exported
 //    but scoped to the catalog subtree rather than the crate-wide surface. ─────
-pub(in crate::catalog) use cache::CatalogCacheSet;
+pub(in crate::catalog) use cache::{CatalogCacheSet, RelFacts};
 pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
 // Directory primitives the catalog consumes rather than owns.
 pub(in crate::catalog) use gnitz_store::relation::{lock_data_dir, DIR_LOCK_RETRY_FOR};

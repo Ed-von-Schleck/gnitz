@@ -56,14 +56,19 @@ pub struct RelDescriptorBlob {
     pub class: RelClass,
     /// Whether two rows may share a PK.
     pub pk_repeats: bool,
+    /// [`crate::TableProps::serial`].
+    pub serial: bool,
     pub indexes: Vec<RelIndex>,
 }
 
 impl RelDescriptorBlob {
     pub fn encode(&self) -> Vec<u8> {
         let index_count = u16::try_from(self.indexes.len()).expect("a relation's index count fits a u16");
-        let mut w = Writer::with_capacity(1 + 1 + 2 + 16 * self.indexes.len());
-        w.u8(self.class.as_wire()).bool(self.pk_repeats).u16(index_count);
+        let mut w = Writer::with_capacity(1 + 1 + 1 + 2 + 16 * self.indexes.len());
+        w.u8(self.class.as_wire())
+            .bool(self.pk_repeats)
+            .bool(self.serial)
+            .u16(index_count);
         for ix in &self.indexes {
             w.u64(crate::pack_pk_cols(ix.cols.as_slice()))
                 .u64(IndexProps { is_unique: ix.is_unique }.pack());
@@ -77,6 +82,7 @@ impl RelDescriptorBlob {
         let class =
             RelClass::from_wire(class).ok_or_else(|| format!("rel descriptor: unknown relation class {class}"))?;
         let pk_repeats = r.bool()?;
+        let serial = r.bool()?;
         let indexes = (0..r.u16()?)
             .map(|_| {
                 let cols = unpack_pk_cols(r.u64()?)
@@ -88,7 +94,7 @@ impl RelDescriptorBlob {
             })
             .collect::<Result<Vec<_>, String>>()?;
         r.expect_consumed()?;
-        Ok(RelDescriptorBlob { class, pk_repeats, indexes })
+        Ok(RelDescriptorBlob { class, pk_repeats, serial, indexes })
     }
 }
 

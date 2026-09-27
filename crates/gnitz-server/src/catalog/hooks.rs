@@ -42,7 +42,7 @@ impl CatalogEngine {
             name,
             pk,
             placement,
-            pk_repeats,
+            facts,
         } = reg;
         let col_defs = self.read_column_defs(id)?;
         let schema = build_schema_from_col_defs(kind, &col_defs, pk.as_slice(), placement)
@@ -55,7 +55,7 @@ impl CatalogEngine {
             self.registry.slot().of
         );
         self.registry.register(RelationSpec { id, kind, schema })?;
-        self.enter_relation(id, kind, &schema, &col_defs, pk_repeats);
+        self.enter_relation(id, kind, &schema, &col_defs, facts);
         // Derived, not stored: every process builds the same FK circuits from the same
         // column records.
         for ci in self.fk_circuit_cols(id) {
@@ -74,7 +74,7 @@ impl CatalogEngine {
         kind: RelationKind,
         schema: &SchemaDescriptor,
         defs: &[ColumnDef],
-        pk_repeats: bool,
+        facts: RelFacts,
     ) {
         let fks: Vec<FkEdge> = defs
             .iter()
@@ -92,7 +92,7 @@ impl CatalogEngine {
         }
         self.caches
             .relations
-            .insert(id, RelationEntry::new(schema, defs, fks, pk_repeats));
+            .insert(id, RelationEntry::new(schema, defs, fks, facts));
     }
 
     /// The FK columns of `id` that carry a derived index circuit: those outside its
@@ -196,7 +196,7 @@ impl CatalogEngine {
             name,
             pk,
             placement,
-            pk_repeats,
+            facts: RelFacts { pk_repeats, serial: false },
         })
     }
 

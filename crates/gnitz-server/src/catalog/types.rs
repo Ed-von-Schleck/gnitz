@@ -14,11 +14,6 @@ pub(crate) struct ColumnDef {
     pub(crate) is_nullable: bool,
     pub(crate) fk_table_id: i64,
     pub(crate) fk_col_idx: u32,
-    /// SERIAL marker (COL_TAB `is_serial`). Like `is_hidden` the engine never
-    /// branches on it — it is echoed verbatim into reply schema blocks
-    /// (`ColMeta::serial`), which is what lets a client plan an INSERT into a
-    /// SERIAL table off a resolved schema instead of a COL_TAB scan.
-    pub(crate) is_serial: bool,
     /// Hidden key slot (COL_TAB `is_hidden`). The engine never branches on it —
     /// it is echoed verbatim into reply schema blocks (`ColMeta::hidden`) so
     /// clients can suppress the column in presentation.
@@ -35,7 +30,6 @@ impl ColumnDef {
             is_nullable: false,
             fk_table_id: 0,
             fk_col_idx: 0,
-            is_serial: false,
             is_hidden: false,
         }
     }

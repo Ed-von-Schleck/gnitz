@@ -17,8 +17,7 @@ use gnitz_wire::{ColType, RelClass, RelDescriptorBlob, RelIndex};
 use std::rc::Rc;
 
 /// One [`SchemaBlockCol`] per column: the physical shape from `schema`, and the
-/// per-column catalog facts (name, `ColMeta::hidden`, `ColMeta::serial`, the
-/// DECIMAL scale) from
+/// per-column catalog facts (name, `ColMeta::hidden`, the DECIMAL scale) from
 /// `defs`.
 ///
 /// `defs` is all-or-nothing, not per-column: a relation either has one COL_TAB
@@ -39,7 +38,6 @@ fn schema_block_cols<'a>(schema: &SchemaDescriptor, defs: Option<&'a [ColumnDef]
                 meta: ColMeta {
                     nullable: col.nullable,
                     hidden: def.is_some_and(|d| d.is_hidden),
-                    serial: def.is_some_and(|d| d.is_serial),
                 },
                 name: def.map_or(&b""[..], |d| d.name.as_bytes()),
             }
@@ -54,7 +52,7 @@ pub(crate) fn encode_schema_block(schema: &SchemaDescriptor) -> Vec<u8> {
 }
 
 /// [`encode_schema_block`] plus the per-column catalog facts the descriptor
-/// does not carry — name, `is_hidden`, `is_serial`. The record a *client*
+/// does not carry — name, `is_hidden`. The record a *client*
 /// decodes into a `Schema`, so it is the one that must be named.
 pub(in crate::catalog) fn encode_named_schema_block(schema: &SchemaDescriptor, defs: &[ColumnDef]) -> Vec<u8> {
     gnitz_wire::schema_block::encode(&schema_block_cols(schema, Some(defs)), schema.pk_indices())
@@ -100,7 +98,8 @@ impl CatalogEngine {
         };
         let desc = RelDescriptorBlob {
             class,
-            pk_repeats: entry.pk_repeats,
+            pk_repeats: entry.facts.pk_repeats,
+            serial: entry.facts.serial,
             indexes: rel
                 .indexes()
                 .iter()

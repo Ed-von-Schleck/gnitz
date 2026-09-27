@@ -48,17 +48,15 @@ fn column_meta_survives_the_record() {
     let mut cols = Vec::new();
     for nullable in [false, true] {
         for hidden in [false, true] {
-            for serial in [false, true] {
-                // Scale 0 is every non-DECIMAL column, and `MAX_DECIMAL_SCALE`
-                // the widest a DECIMAL admits — so neither edge may bleed into
-                // a neighbour.
-                for scale in [0u8, 7, crate::decimal::MAX_DECIMAL_SCALE] {
-                    cols.push(SchemaBlockCol {
-                        ty: ColType::decimal(scale),
-                        meta: ColMeta { nullable, hidden, serial },
-                        name: b"c",
-                    });
-                }
+            // Scale 0 is every non-DECIMAL column, and `MAX_DECIMAL_SCALE` the
+            // widest a DECIMAL admits — so neither edge may bleed into a
+            // neighbour.
+            for scale in [0u8, 7, crate::decimal::MAX_DECIMAL_SCALE] {
+                cols.push(SchemaBlockCol {
+                    ty: ColType::decimal(scale),
+                    meta: ColMeta { nullable, hidden },
+                    name: b"c",
+                });
             }
         }
     }
@@ -177,11 +175,7 @@ fn the_record_layout_is_fixed() {
         col(TypeCode::I32, "a", false),
         SchemaBlockCol {
             ty: ColType::decimal(9),
-            meta: ColMeta {
-                nullable: true,
-                hidden: true,
-                serial: true,
-            },
+            meta: ColMeta { nullable: true, hidden: true },
             name: long.as_bytes(),
         },
     ];
@@ -192,7 +186,7 @@ fn the_record_layout_is_fixed() {
         1, 0,                        // PK indices, in declared PK-tuple order
         8, 0, 0, 1, 0, 0, 0, b'b',   // U64, no flags, scale 0, name "b"
         6, 0, 0, 1, 0, 0, 0, b'a',   // I32, no flags, scale 0, name "a"
-        18, 0b111, 9, 25, 0, 0, 0,   // DECIMAL, nullable|hidden|serial, scale 9
+        18, 0b11, 9, 25, 0, 0, 0,    // DECIMAL, nullable|hidden, scale 9
     ];
     want.extend_from_slice(long.as_bytes());
     assert_eq!(encode(&cols, &[1, 0]), want);

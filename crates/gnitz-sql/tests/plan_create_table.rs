@@ -165,8 +165,7 @@ fn or_replace_is_rejected() {
 }
 
 /// A stream holds no rows, so it backs no index, enforces no referential action
-/// and seeds no SERIAL generator. The engine refuses all three by relation id;
-/// the planner names the column.
+/// and seeds no SERIAL generator.
 #[test]
 fn a_stream_refuses_serial_a_foreign_key_and_a_unique() {
     let cat = fk_catalog();
@@ -294,11 +293,23 @@ fn a_serial_column_must_be_the_single_column_pk() {
         ),
         (
             "CREATE TABLE c (id SERIAL PRIMARY KEY, id2 SERIAL)",
-            "at most one SERIAL column",
+            "single-column PRIMARY KEY",
         ),
     ] {
         assert_rejects(sql, plan_table(&cat, sql), "Unsupported", needle);
     }
+}
+
+/// SERIAL is the table's property, not a column's: the plan carries it on its
+/// props and the column is a plain NOT NULL signed integer.
+#[test]
+fn a_serial_table_carries_serial_on_its_props() {
+    let cat = catalog(vec![]);
+    let c = created(&cat, "CREATE TABLE s (id BIGSERIAL PRIMARY KEY, v BIGINT)");
+    assert!(c.props.serial);
+    assert_eq!(c.schema.columns[0].ty.tc, TypeCode::I64);
+    assert!(!c.schema.columns[0].is_nullable);
+    assert!(!created(&cat, "CREATE TABLE t (id BIGINT PRIMARY KEY)").props.serial);
 }
 
 // ── the bundle a plan carries ────────────────────────────────────────────────

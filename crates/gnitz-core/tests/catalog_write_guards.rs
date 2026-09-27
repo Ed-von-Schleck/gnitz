@@ -63,7 +63,7 @@ fn two_columns(owner_id: u64) -> ZSetBatch {
 
 /// One COL_TAB row of base table `owner_id`, as the wire struct rather than
 /// through `ColumnDef::col_tab_row`, so a column-transition test can vary `name`
-/// and `is_hidden` on their own. Never an FK and never SERIAL.
+/// and `is_hidden` on their own. Never an FK.
 fn col_tab_row(
     owner_id: u64,
     col_idx: u64,
@@ -80,7 +80,6 @@ fn col_tab_row(
         is_nullable,
         fk_table_id: 0,
         fk_col_idx: 0,
-        is_serial: false,
         is_hidden,
     }
 }
@@ -243,6 +242,35 @@ fn two_indexes_under_one_name_in_one_bundle_are_refused() {
     assert!(err.contains("Index already exists"), "{err}");
     // Nothing was written: the bundle is one DDL zone.
     assert!(client.resolve("dupidx", "t").unwrap().is_none());
+}
+
+/// The gateway refuses a U128 SERIAL PK before any id is allocated; an I64 one
+/// commits and says so on its descriptor.
+#[test]
+fn create_table_refuses_a_u128_serial_pk() {
+    let srv = ServerHandle::start();
+    let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
+    client.create_schema("ser").unwrap();
+    let serial = TableProps { serial: true, ..TableProps::default() };
+    let schema = |tc| Schema {
+        columns: vec![
+            ColumnDef::new("id", tc, false),
+            ColumnDef::new("v", TypeCode::I64, false),
+        ],
+        pk_cols: vec![0],
+    };
+    let err = format!(
+        "{:?}",
+        client
+            .create_table("ser", "t", &schema(TypeCode::U128), &[], serial, &[])
+            .unwrap_err()
+    );
+    assert!(err.contains("SERIAL needs an integer of at most 8 bytes"), "{err}");
+    assert!(client.resolve("ser", "t").unwrap().is_none());
+    client
+        .create_table("ser", "t", &schema(TypeCode::I64), &[], serial, &[])
+        .unwrap();
+    assert!(client.resolve("ser", "t").unwrap().expect("the table exists").serial);
 }
 
 /// The positive case the guards above must not have broken: a `CREATE TABLE`

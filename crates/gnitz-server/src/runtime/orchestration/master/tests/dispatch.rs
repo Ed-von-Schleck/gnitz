@@ -164,13 +164,7 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
     let user_seq;
     {
         let mut engine = CatalogEngine::open(dir, 1).unwrap();
-        user_seq = engine
-            .create_table(
-                "public.t",
-                &[crate::test_support::col_def("id", gnitz_wire::TypeCode::U64)],
-                &[0],
-            )
-            .unwrap();
+        user_seq = engine.create_serial_table("public.t").unwrap();
         // Reserve + ingest straight into the catalog — no SAL involved, so the
         // advance lands ONLY in the sys_sequences MemTable.
         let (_base, delta) = engine.reserve_user_sequence(user_seq, 64).unwrap();

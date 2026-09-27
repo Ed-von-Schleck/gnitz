@@ -2,10 +2,24 @@
 //! by seek keys, written cells and VM comparisons alike.
 
 use crate::ir::{BExpr, NumLit};
-use crate::types::temporal_literal;
 use gnitz_core::{ColType, FixedInt, TypeCode};
 use gnitz_expr::calendar::MICROS_PER_DAY;
 use gnitz_wire::decimal::parse_decimal_text;
+
+/// A DATE/TIMESTAMP spelling as the integer a column of type `tc` stores; `None`
+/// for text that spells no such value, and for any other type.
+pub(crate) fn parse_temporal(tc: TypeCode, s: &str) -> Option<i64> {
+    match tc {
+        TypeCode::Date => gnitz_expr::calendar::parse_date(s).map(i64::from),
+        TypeCode::Timestamp => gnitz_expr::calendar::parse_timestamp(s),
+        _ => None,
+    }
+}
+
+/// The refusal of string `s` as a spelling of type `ty`.
+pub(crate) fn invalid_literal(ty: impl std::fmt::Display, s: &str) -> String {
+    format!("invalid {ty} literal: '{s}'")
+}
 
 /// Where a literal falls among the values of a column type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +55,7 @@ pub(crate) fn place<R>(lit: &BExpr<R>, ty: ColType) -> Option<Placed> {
         (BExpr::LitStr(s), TypeCode::UUID) => gnitz_wire::parse_uuid(s).map(Placed::At),
         (BExpr::LitStr(s), TypeCode::Date | TypeCode::Timestamp) => {
             let fi = FixedInt::from_type_code(tc)?;
-            Some(place_ratio(fi, temporal_literal(tc, s).ok()?.into(), 1, Round::Floor))
+            Some(place_ratio(fi, parse_temporal(tc, s)?.into(), 1, Round::Floor))
         }
         (BExpr::LitTemporal { tc: TypeCode::Date, v }, TypeCode::Timestamp) => {
             Some(place_ratio(FixedInt::I64, i128::from(*v) * day, 1, Round::Floor))

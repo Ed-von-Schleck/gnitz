@@ -10,6 +10,14 @@ use std::num::NonZeroU16;
 // CatalogCacheSet — all typed caches for one CatalogEngine
 // ---------------------------------------------------------------------------
 
+/// What a RESOLVE reports of a relation beyond its schema and indexes.
+#[derive(Clone, Copy, Default)]
+pub(in crate::catalog) struct RelFacts {
+    pub(in crate::catalog) pk_repeats: bool,
+    /// [`gnitz_wire::TableProps::serial`].
+    pub(in crate::catalog) serial: bool,
+}
+
 /// What one registered relation's lifetime owns: entered by its registration,
 /// removed by its unregistration.
 pub(in crate::catalog) struct RelationEntry {
@@ -19,7 +27,7 @@ pub(in crate::catalog) struct RelationEntry {
     pub(in crate::catalog) schema_block: Rc<Vec<u8>>,
     /// The FK edges this relation declares as a child.
     pub(in crate::catalog) fks: Vec<FkEdge>,
-    pub(in crate::catalog) pk_repeats: bool,
+    pub(in crate::catalog) facts: RelFacts,
 }
 
 impl RelationEntry {
@@ -27,13 +35,13 @@ impl RelationEntry {
         schema: &SchemaDescriptor,
         defs: &[ColumnDef],
         fks: Vec<FkEdge>,
-        pk_repeats: bool,
+        facts: RelFacts,
     ) -> Self {
         RelationEntry {
             schema_version: NonZeroU16::MIN,
             schema_block: Rc::new(encode_named_schema_block(schema, defs)),
             fks,
-            pk_repeats,
+            facts,
         }
     }
 

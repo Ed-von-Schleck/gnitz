@@ -73,6 +73,6 @@ def test_u128_uuid_key(client, schema_name, bench_timer, scale_mode):
         rng = random.Random(pk)
         b.append(pk=pk, uid=rng.getrandbits(120), v=rng.randint(0, 1000), _weight=w)
     _run(client, schema_name, bench_timer, "t",
-         "CREATE TABLE t (pk DECIMAL(38,0) NOT NULL PRIMARY KEY, uid UUID NOT NULL, v BIGINT NOT NULL)",
+         "CREATE TABLE t (pk UINT128 NOT NULL PRIMARY KEY, uid UUID NOT NULL, v BIGINT NOT NULL)",
          "CREATE VIEW v AS SELECT pk, uid, v FROM t",
          "v", row, feature_sz(scale_mode))

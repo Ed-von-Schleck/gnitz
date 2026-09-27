@@ -15,6 +15,7 @@ fn with_options_carry_replicated_and_stream_independently() {
     let t = "CREATE TABLE t (id BIGINT PRIMARY KEY)";
     let props = |replicated, stream| TableProps {
         stream,
+        serial: false,
         distribution: match replicated {
             true => gnitz_wire::TableDistribution::Replicated,
             false => gnitz_wire::TableDistribution::default(),

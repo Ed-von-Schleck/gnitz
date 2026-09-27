@@ -1178,11 +1178,14 @@ impl GnitzClient {
         schema
             .validate()
             .map_err(|e| ClientError::from(format!("create_table: {e}")))?;
-        // The `Keyed` prefix is a leading-PK-prefix length (0 = default = full PK).
-        // Shared with the engine's own TABLE_TAB decoder, which re-checks it: this
-        // one catches the caller's mistake before any id is allocated.
+        // Before any id is allocated.
+        let pk_cols = schema.pk_cols.iter().map(|&c| &schema.columns[c as usize]);
         props
-            .validate_against_pk(schema.pk_cols.len())
+            .validate(schema.pk_cols.len())
+            .and_then(|()| match props.serial {
+                true => gnitz_wire::validate_serial_key(pk_cols.map(|cd| (cd.name.as_str(), cd.ty))),
+                false => Ok(()),
+            })
             .map_err(|e| ClientError::from(format!("create_table: {e}")))?;
 
         // Column types come from `schema.columns`, so a UNIQUE+FK column's

@@ -82,17 +82,16 @@ struct RowShape {
     slot_of: Vec<Option<usize>>,
     /// Values every VALUES row must supply.
     expected: usize,
-    /// The SERIAL PK's column, if the table has one.
-    serial_ci: Option<usize>,
 }
 
 /// A column list names the slots and the arity; without one a row supplies every
-/// visible non-SERIAL column in schema order. An unnamed column is written NULL —
+/// visible column but `serial_ci` in schema order. An unnamed column is written NULL —
 /// gnitz has no column DEFAULTs, and `check_not_null` catches the rest.
-fn insert_row_shape(columns: &[ObjectName], schema: &Schema) -> Result<RowShape, GnitzSqlError> {
-    // A SERIAL column is never hidden: it is the table's lone PK, which the engine
-    // refuses to hide.
-    let serial_ci = schema.columns.iter().position(|c| c.is_serial);
+fn insert_row_shape(
+    columns: &[ObjectName],
+    schema: &Schema,
+    serial_ci: Option<usize>,
+) -> Result<RowShape, GnitzSqlError> {
     let mut slot_of: Vec<Option<usize>> = vec![None; schema.columns.len()];
     if columns.is_empty() {
         let mut expected = 0usize;
@@ -102,14 +101,14 @@ fn insert_row_shape(columns: &[ObjectName], schema: &Schema) -> Result<RowShape,
                 expected += 1;
             }
         }
-        return Ok(RowShape { slot_of, expected, serial_ci });
+        return Ok(RowShape { slot_of, expected });
     }
     for (k, name) in columns.iter().enumerate() {
         let ident = single_part_ident(name)
             .ok_or_else(|| GnitzSqlError::Plan("INSERT column list: column must be a simple identifier".into()))?;
         let ci = find_unique_column(&schema.columns, ident)?
             .ok_or_else(|| GnitzSqlError::Bind(format!("column '{ident}' not found in the INSERT column list")))?;
-        if schema.columns[ci].is_serial {
+        if Some(ci) == serial_ci {
             return Err(GnitzSqlError::Unsupported(
                 "cannot supply a value for a SERIAL column; omit it from the INSERT".to_string(),
             ));
@@ -121,11 +120,7 @@ fn insert_row_shape(columns: &[ObjectName], schema: &Schema) -> Result<RowShape,
         }
         slot_of[ci] = Some(k);
     }
-    Ok(RowShape {
-        slot_of,
-        expected: columns.len(),
-        serial_ci,
-    })
+    Ok(RowShape { slot_of, expected: columns.len() })
 }
 
 pub(crate) fn execute_insert(
@@ -202,7 +197,8 @@ pub(crate) fn execute_insert(
     let n = rows.len();
     let mut batch = ZSetBatch::with_capacity(schema, n);
 
-    let RowShape { slot_of, expected, serial_ci } = insert_row_shape(&insert.columns, schema)?;
+    let serial_ci = schema.pk_index_single().filter(|_| target.serial).map(|c| c as usize);
+    let RowShape { slot_of, expected } = insert_row_shape(&insert.columns, schema, serial_ci)?;
     let payload: Vec<_> = schema.payload_columns().collect();
     // What a column the list left out reads as.
     let null: BExpr<Infallible> = BExpr::LitNull;
@@ -396,7 +392,7 @@ impl PkPlan {
     /// `n` rows drawn from `base`, refused when the last exceeds the type `tc`.
     pub(crate) fn serial(base: u64, n: usize, tc: TypeCode) -> Result<Self, GnitzSqlError> {
         let max = FixedInt::from_type_code(tc)
-            .expect("SERIAL underlying is a fixed int")
+            .expect("`validate_serial_key` admits only a fixed int")
             .range()
             .1;
         if i128::from(base) + n as i128 - 1 > max {

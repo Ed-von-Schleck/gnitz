@@ -241,6 +241,7 @@ fn rows_reply_of(sql: &str, schema: &Arc<Schema>) -> RowsReply {
         tid: 1,
         class: gnitz_core::RelClass::Table,
         pk_repeats: false,
+        serial: false,
         schema: Arc::clone(schema),
         indexes: Vec::new(),
     });

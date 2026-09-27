@@ -1922,6 +1922,59 @@ fn temporal_arithmetic_outside_the_allow_list_is_refused() {
     }
 }
 
+/// A typed string is `CAST('…' AS type)`, and a CAST to DATE of a non-string
+/// operand is the fixed-int cast any other operand of that type takes.
+#[test]
+fn a_typed_string_and_a_literal_cast_to_date_evaluate() {
+    let row = [vec![Some(1)]];
+    let bound = crate::bind::bind_single_table(
+        &crate::test_support::parse_expr_sql("CAST(NULL AS DATE)"),
+        &typed_schema(&[TypeCode::I64]),
+        "t",
+    )
+    .unwrap();
+    assert!(matches!(bound, BExpr::Cast { .. }), "{bound:?}");
+    for (sql, want) in [
+        ("CAST(NULL AS DATE)", None),
+        ("CAST(5 AS DATE)", Some(5)),
+        ("DECIMAL(10,2) '1.5'", Some(150)),
+        ("BIGINT '5'", Some(5)),
+    ] {
+        assert_eq!(eval_sql_rows(sql, &[TypeCode::I64], &row), vec![want], "{sql}");
+    }
+}
+
+/// A CAST to a 16-byte type is refused where it is lowered, whatever spelled it.
+#[test]
+fn a_cast_to_a_16_byte_type_is_refused_by_lowering() {
+    let schema = typed_schema(&[TypeCode::I64]);
+    for sql in [
+        "CAST(c1 AS UUID)",
+        "CAST(c1 AS UINT128)",
+        "UUID '00000000-0000-0000-0000-000000000001'",
+    ] {
+        let expr = crate::bind::bind_single_table(&crate::test_support::parse_expr_sql(sql), &schema, "t")
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let err = compile_bound_expr_to_program(&expr, &schema.columns).expect_err(sql);
+        assert!(err.to_string().contains("is not supported"), "{sql}: {err}");
+    }
+}
+
+/// A string compared with a column stored as an integer is that type's spelling
+/// or an error naming the type.
+#[test]
+fn a_string_that_spells_no_value_of_the_operand_type_is_refused() {
+    let schema = decimal_schema();
+    for (sql, needle) in [
+        ("p = 'abc'", "invalid DECIMAL(18, 2) literal: 'abc'"),
+        ("i = 'abc'", "invalid I64 literal: 'abc'"),
+    ] {
+        let expr = crate::bind::bind_single_table(&crate::test_support::parse_expr_sql(sql), &schema, "t").unwrap();
+        let err = compile_bound_expr_to_program(&expr, &schema.columns).expect_err(sql);
+        assert!(err.to_string().contains(needle), "{sql}: {err}");
+    }
+}
+
 // ------------------------------------------------------------------
 // A DML residual over the transaction's buffered rows
 // ------------------------------------------------------------------

@@ -7,7 +7,7 @@
 
 use rustc_hash::FxHashMap;
 
-use super::ColumnDef;
+use super::{ColumnDef, RelFacts};
 use gnitz_expr::RowSource;
 use gnitz_expr::{payload_str, payload_string, payload_u64};
 use gnitz_store::relation::RelationKind;
@@ -19,10 +19,10 @@ use gnitz_wire::sys_rows::{
 use gnitz_wire::MAX_COLUMNS;
 use gnitz_wire::{ColType, TableDistribution, ViewProps};
 use gnitz_wire::{
-    COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL,
-    COLTAB_PAY_NAME, COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_FLAGS, IDXTAB_PAY_OWNER_ID,
-    IDXTAB_PAY_SOURCE_COLS, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX,
-    VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_FLAGS, VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX,
+    COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME,
+    COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_FLAGS, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
+    RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY,
+    VIEWTAB_PAY_DELTA, VIEWTAB_PAY_FLAGS, VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX,
 };
 
 // ---------------------------------------------------------------------------
@@ -96,7 +96,7 @@ pub(super) struct RelationRegistration<'a> {
     pub(super) name: &'a str,
     pub(super) pk: PkColList,
     pub(super) placement: Placement,
-    pub(super) pk_repeats: bool,
+    pub(super) facts: RelFacts,
 }
 
 /// Decode TABLE_TAB `row` into the whole registration it describes, `id` off the
@@ -118,7 +118,7 @@ pub(super) fn read_table_tab_row(batch: &Batch, row: usize) -> Result<RelationRe
     let pk = unpack_pk_cols(payload_u64(batch, row, TABTAB_PAY_PK_COL_IDX))
         .map_err(|rule| format!("catalog invariant violated: {noun} '{name}' {rule}"))?;
     props
-        .validate_against_pk(pk.as_slice().len())
+        .validate(pk.as_slice().len())
         .map_err(|e| format!("catalog invariant violated: {noun} '{name}' {e}"))?;
     Ok(RelationRegistration {
         kind,
@@ -130,8 +130,11 @@ pub(super) fn read_table_tab_row(batch: &Batch, row: usize) -> Result<RelationRe
             TableDistribution::Replicated => Placement::Replicated,
             TableDistribution::Keyed { prefix_len } => Placement::Keyed { prefix_len },
         },
-        // A base table's PK is unique by `enforce_unique_pk`; a stream's is not.
-        pk_repeats: props.stream,
+        facts: RelFacts {
+            // A base table's PK is unique by `enforce_unique_pk`; a stream's is not.
+            pk_repeats: props.stream,
+            serial: props.serial,
+        },
     })
 }
 
@@ -209,7 +212,6 @@ pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> Result<Colu
         is_nullable: flag("is_nullable", COLTAB_PAY_IS_NULLABLE)?,
         fk_table_id: payload_u64(src, row, COLTAB_PAY_FK_TABLE_ID) as i64,
         fk_col_idx: word("fk_col_idx", COLTAB_PAY_FK_COL_IDX, u32::MAX as u64)? as u32,
-        is_serial: flag("is_serial", COLTAB_PAY_IS_SERIAL)?,
         is_hidden: flag("is_hidden", COLTAB_PAY_IS_HIDDEN)?,
     })
 }
@@ -226,7 +228,6 @@ impl ColumnDef {
             is_nullable: self.is_nullable,
             fk_table_id: self.fk_table_id as u64,
             fk_col_idx: self.fk_col_idx as u64,
-            is_serial: self.is_serial,
             is_hidden: self.is_hidden,
         }
     }

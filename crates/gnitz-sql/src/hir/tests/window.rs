@@ -22,6 +22,7 @@ fn catalog() -> CatalogSnapshot {
                 class,
                 // A stream's PK is a routing and sort key, never unique.
                 pk_repeats: class == RelClass::Stream,
+                serial: false,
                 schema,
                 indexes: Vec::new(),
             })),
@@ -271,7 +272,7 @@ fn frames_and_functions_outside_the_supported_set_are_rejected() {
         "DISTINCT: not supported on window functions",
     );
     rejects("SELECT id, SUM(a) FILTER (WHERE a > 1) OVER () FROM t", "FILTER");
-    rejects("SELECT id, SUM(s) OVER () FROM t", "SUM: not supported on String");
+    rejects("SELECT id, SUM(s) OVER () FROM t", "SUM: not supported on STRING");
 }
 
 #[test]
@@ -342,6 +343,7 @@ fn register_view(cat: &mut CatalogSnapshot, tid: u64, name: &str, sql: &str) -> 
             tid,
             class: RelClass::View,
             pk_repeats: v.pk_repeats,
+            serial: false,
             schema: v.schema,
             indexes: Vec::new(),
         })),
@@ -401,6 +403,7 @@ fn a_user_named_join_pk_column_is_a_row_key() {
             tid,
             class,
             pk_repeats,
+            serial: false,
             schema: Arc::new(Schema { columns, pk_cols }),
             indexes: Vec::new(),
         }))

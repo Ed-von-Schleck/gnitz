@@ -3,13 +3,13 @@ use crate::protocol::types::TypeCode;
 use gnitz_wire::PK_LIST_MAX_COLS;
 
 /// Every fact a `Schema` carries must survive the block round-trip: column
-/// types, nullability, names, the `hidden`/`serial` markers, and the
+/// types, nullability, names, the `hidden` marker, and the
 /// declared PK order (which is not column order here).
 #[test]
 fn schema_survives_the_block_roundtrip() {
     let original = Schema {
         columns: vec![
-            ColumnDef::new("id", TypeCode::U64, false).hidden().serial(),
+            ColumnDef::new("id", TypeCode::U64, false).hidden(),
             ColumnDef::new("name", TypeCode::String, true),
             ColumnDef::new("score", TypeCode::F64, false),
             ColumnDef::new("tag", TypeCode::I32, true),

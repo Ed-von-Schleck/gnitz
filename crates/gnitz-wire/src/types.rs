@@ -173,6 +173,23 @@ impl TypeCode {
         self.is_fixed_int() || self.is_wide_int()
     }
 
+    /// Whether a SERIAL primary key may have this type: the plain integers of at
+    /// most 8 bytes, which store a drawn id as itself.
+    #[inline(always)]
+    pub const fn is_serial_eligible(self) -> bool {
+        matches!(
+            self,
+            TypeCode::U8
+                | TypeCode::I8
+                | TypeCode::U16
+                | TypeCode::I16
+                | TypeCode::U32
+                | TypeCode::I32
+                | TypeCode::U64
+                | TypeCode::I64
+        )
+    }
+
     /// Whether a single non-nullable column of this type may serve as a reduce's
     /// output primary key directly, rather than a synthetic U128 group fold —
     /// the type half of [`crate::ReduceOutKey::for_group_cols`]'s
@@ -821,9 +838,8 @@ impl FixedInt {
 }
 
 /// The ≤8-byte scalar register image of a column type: the domain on which
-/// "read these native-LE bytes as a number" is total. THE shared rule — the SQL
-/// binder's cast and aggregate gates and the engine's reduce kernel and value
-/// index all resolve a column through it, so they cannot disagree about one.
+/// "read these native-LE bytes as a number" is total. THE shared rule: every
+/// consumer resolves a column through it, so no two can disagree about one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarKind {
     Int(FixedInt),

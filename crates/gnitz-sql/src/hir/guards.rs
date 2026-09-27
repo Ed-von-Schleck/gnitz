@@ -73,10 +73,7 @@ pub(crate) fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Res
     if lt.is_temporal() && rt.is_temporal() && lt != rt {
         return Err(GnitzSqlError::Unsupported(format!(
             "JOIN ON: join key columns '{}' ({}) and '{}' ({}) differ in unit (days vs microseconds)",
-            left.name,
-            lt.wire_name(),
-            right.name,
-            rt.wire_name()
+            left.name, left.ty, right.name, right.ty
         )));
     }
     // STRING/BLOB reindex to a 16-byte XXH3 content hash; U128/UUID reindex to the
@@ -85,17 +82,17 @@ pub(crate) fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Res
     // equals a native integer, so the join would silently match nothing.
     if left.ty.tc.is_german_string() != right.ty.tc.is_german_string() {
         return Err(GnitzSqlError::Unsupported(format!(
-            "JOIN ON: cannot equijoin string/blob column '{}' ({:?}) with non-string \
-             column '{}' ({:?}); a string content hash never matches a native key",
-            left.name, left.ty.tc, right.name, right.ty.tc
+            "JOIN ON: cannot equijoin string/blob column '{}' ({}) with non-string \
+             column '{}' ({}); a string content hash never matches a native key",
+            left.name, left.ty, right.name, right.ty
         )));
     }
     left.ty.tc.join_key_common_type(right.ty.tc).ok_or_else(|| {
         GnitzSqlError::Unsupported(format!(
-            "JOIN ON: join key columns '{}' ({:?}) and '{}' ({:?}) cannot co-partition; \
-             a cross-sign pair whose unsigned side is 128-bit (e.g. DECIMAL(38,0)/UUID \
+            "JOIN ON: join key columns '{}' ({}) and '{}' ({}) cannot co-partition; \
+             a cross-sign pair whose unsigned side is 128-bit (e.g. UINT128/UUID \
              joined with a signed integer) needs a signed-256 type that does not exist",
-            left.name, left.ty.tc, right.name, right.ty.tc
+            left.name, left.ty, right.name, right.ty
         ))
     })
 }

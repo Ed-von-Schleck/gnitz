@@ -214,7 +214,7 @@ fn a_fraction_into_a_date_column_names_the_literal() {
 /// A DATE literal into a TIMESTAMP column is its midnight.
 #[test]
 fn a_date_literal_into_a_timestamp_column_is_its_midnight() {
-    let days = crate::types::temporal_literal(TypeCode::Date, "2020-01-02").unwrap();
+    let days = crate::codec::literal::parse_temporal(TypeCode::Date, "2020-01-02").unwrap();
     assert_eq!(
         encoded(TypeCode::Timestamp, &expr("DATE '2020-01-02'")).unwrap(),
         (days * gnitz_expr::calendar::MICROS_PER_DAY).to_le_bytes()

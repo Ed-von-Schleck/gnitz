@@ -99,7 +99,7 @@ def test_a_range_join_is_the_product_its_predicate_admits_through_churn(client, 
 
 # `(x, y)` per side of the two pure-range pairs whose common type is 16 bytes: a
 # cross-sign BIGINT/BIGINT UNSIGNED pair promotes to a signed 128-bit slot, and a
-# DECIMAL(38,0) pair to an unsigned one. Both sides straddle the widths a narrower
+# UINT128 pair to an unsigned one. Both sides straddle the widths a narrower
 # slot would alias — the sign boundary, 2**63, and 2**64.
 _SIGNED_X = {1: -9, 2: 0, 3: 7, 4: 2 ** 62}
 _UNSIGNED_Y = {1: 0, 2: 8, 3: 2 ** 63, 4: 2 ** 64 - 1}
@@ -115,7 +115,7 @@ def test_a_pure_range_threshold_carries_a_sixteen_byte_range_column(client, sche
     """A pure-range LEFT JOIN and a pure-range EXISTS both decide per left row
     from `m = MIN/MAX(b.range)`, reindexed back onto the range slot. The slot
     holds the PAIR's common type, which is 16 bytes both for a cross-sign
-    BIGINT/BIGINT UNSIGNED pair and for a DECIMAL(38,0) one.
+    BIGINT/BIGINT UNSIGNED pair and for a UINT128 one.
 
     The right side starts empty and is emptied again, so each run passes through
     `A - 0 = A`, where the threshold has no ground row and every left row
@@ -124,8 +124,8 @@ def test_a_pure_range_threshold_carries_a_sixteen_byte_range_column(client, sche
     client.execute_sql(
         "CREATE TABLE sa (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL); "
         "CREATE TABLE sb (id BIGINT NOT NULL PRIMARY KEY, y BIGINT UNSIGNED NOT NULL); "
-        "CREATE TABLE wa (id BIGINT NOT NULL PRIMARY KEY, x DECIMAL(38,0) NOT NULL); "
-        "CREATE TABLE wb (id BIGINT NOT NULL PRIMARY KEY, y DECIMAL(38,0) NOT NULL); "
+        "CREATE TABLE wa (id BIGINT NOT NULL PRIMARY KEY, x UINT128 NOT NULL); "
+        "CREATE TABLE wb (id BIGINT NOT NULL PRIMARY KEY, y UINT128 NOT NULL); "
         "CREATE VIEW s_left AS SELECT sa.id AS aid, sb.id AS bid FROM sa LEFT JOIN sb ON sa.x < sb.y; "
         "CREATE VIEW s_ex AS SELECT sa.id AS aid FROM sa WHERE EXISTS (SELECT 1 FROM sb WHERE sb.y > sa.x); "
         "CREATE VIEW w_left AS SELECT wa.id AS aid, wb.id AS bid FROM wa LEFT JOIN wb ON wa.x < wb.y; "

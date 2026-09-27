@@ -60,6 +60,8 @@ pub struct RelDescriptor {
     pub class: RelClass,
     /// A stream, or a view whose planner set [`gnitz_wire::ViewFlags::pk_repeats`].
     pub pk_repeats: bool,
+    /// [`gnitz_wire::TableProps::serial`].
+    pub serial: bool,
     pub schema: Arc<Schema>,
     pub indexes: Vec<RelIndex>,
 }
@@ -988,6 +990,7 @@ fn resolve_descriptor(
         tid: ctrl.hdr.target_id,
         class: desc.class,
         pk_repeats: desc.pk_repeats,
+        serial: desc.serial,
         schema,
         indexes: desc.indexes,
     })))

@@ -6,7 +6,7 @@ use crate::agg::AggFunc;
 use crate::error::{reject_if, GnitzSqlError};
 use crate::ir::{BExpr, NumLit};
 use crate::validate::{first_duplicate, validate_user_name};
-use gnitz_core::{ColumnDef, TypeCode};
+use gnitz_core::ColumnDef;
 use gnitz_wire::decimal::decimal_of_number_text;
 use sqlparser::ast::{ExcludeSelectItem, Expr, RenameSelectItem, SelectItem, Value, WildcardAdditionalOptions};
 
@@ -131,37 +131,6 @@ pub(crate) fn bind_literal<R>(v: &Value) -> Result<BExpr<R>, GnitzSqlError> {
         Value::SingleQuotedString(s) => Ok(BExpr::LitStr(s.clone())),
         _ => Err(GnitzSqlError::Unsupported(format!(
             "value type not supported in expressions: {v:?}"
-        ))),
-    }
-}
-
-/// `DATE '…'`, `TIMESTAMP '…'` and `CAST('…' AS DATE)`: the literal spellings of
-/// a temporal value, as its type and storage integer. `None` for every other
-/// expression, a typed string or cast of a non-temporal type included.
-pub(crate) fn temporal_constant(e: &Expr) -> Result<Option<(TypeCode, i64)>, GnitzSqlError> {
-    let (dt, v) = match peel_nested(e) {
-        Expr::TypedString(ts) => (&ts.data_type, &ts.value.value),
-        // The qualifiers the general CAST arm rejects are left to it: an
-        // `ARRAY`/`FORMAT` cast is not a literal spelling and must not be
-        // claimed here, or it would ride through unchecked.
-        Expr::Cast {
-            expr,
-            data_type,
-            array: false,
-            format: None,
-            ..
-        } => match peel_nested(expr) {
-            Expr::Value(vws) => (data_type, &vws.value),
-            _ => return Ok(None),
-        },
-        _ => return Ok(None),
-    };
-    let tc = crate::types::sql_col_type(dt)?.tc;
-    match v {
-        _ if !tc.is_temporal() => Ok(None),
-        Value::SingleQuotedString(s) => Ok(Some((tc, crate::types::temporal_literal(tc, s)?))),
-        v => Err(GnitzSqlError::Unsupported(format!(
-            "{dt} literal must be a single-quoted string, got {v}"
         ))),
     }
 }

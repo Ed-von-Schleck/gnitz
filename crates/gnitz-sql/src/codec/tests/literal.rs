@@ -156,7 +156,7 @@ fn a_decimal_reads_a_literal_at_its_scale() {
 fn a_date_and_a_timestamp_convert_between_units() {
     use Placed::*;
     let day = i128::from(MICROS_PER_DAY);
-    let d = crate::types::temporal_literal(TypeCode::Date, "2020-01-02").unwrap();
+    let d = parse_temporal(TypeCode::Date, "2020-01-02").unwrap();
     assert_eq!(
         at(TypeCode::Timestamp, "DATE '2020-01-02'"),
         Some(At(packed(FixedInt::I64, i128::from(d) * day)))
@@ -174,7 +174,7 @@ fn a_date_and_a_timestamp_convert_between_units() {
         })
     );
     // Before 1970 the floor goes down, not toward zero.
-    let pre = crate::types::temporal_literal(TypeCode::Date, "1969-12-31").unwrap();
+    let pre = parse_temporal(TypeCode::Date, "1969-12-31").unwrap();
     assert_eq!(
         at(TypeCode::Date, "TIMESTAMP '1969-12-31 12:00:00'"),
         Some(Between {
@@ -191,4 +191,26 @@ fn a_date_and_a_timestamp_convert_between_units() {
     assert_eq!(at(TypeCode::Date, "7"), Some(At(7)));
     assert_eq!(at(TypeCode::Date, "1.5"), None);
     assert_eq!(at(TypeCode::Date, "'garbage'"), None);
+}
+
+/// The parsers themselves are `gnitz-expr`'s; what is this crate's is that each
+/// temporal type reaches its own one, and that every other type spells nothing.
+#[test]
+fn a_temporal_spelling_routes_to_its_parser() {
+    assert_eq!(
+        parse_temporal(TypeCode::Date, "2024-02-29"),
+        gnitz_expr::calendar::parse_date("2024-02-29").map(i64::from)
+    );
+    assert!(parse_temporal(TypeCode::Date, "2024-02-29").is_some());
+    assert_eq!(
+        parse_temporal(TypeCode::Timestamp, "2024-02-29 13:45:07"),
+        gnitz_expr::calendar::parse_timestamp("2024-02-29 13:45:07")
+    );
+    assert!(parse_temporal(TypeCode::Timestamp, "2024-02-29 13:45:07").is_some());
+    assert_eq!(
+        parse_temporal(TypeCode::Date, "2024-02-30"),
+        None,
+        "2024 has no 30th of February"
+    );
+    assert_eq!(parse_temporal(TypeCode::I64, "2024-02-29"), None);
 }

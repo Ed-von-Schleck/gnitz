@@ -120,14 +120,14 @@ _SCENARIOS = {
          (f"DELETE FROM {{t}} WHERE id > '{_UUID_A}'", 2)],
         [(_UUID_A, 1)]),
     "u128-range": (
-        "CREATE TABLE {t} (id DECIMAL(38,0) NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+        "CREATE TABLE {t} (id UINT128 NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
         ", ".join(f"({i}, {i})" for i in range(1, 11)),
         [("INSERT INTO {t} VALUES (20, 20), (0, 0)", 2),
          ("DELETE FROM {t} WHERE id = 1", 1),
          ("DELETE FROM {t} WHERE id > 5", 6)],
         [(0, 0), *((i, i) for i in range(2, 6))]),
     "u128-index-range": (
-        "CREATE TABLE {t} (id BIGINT NOT NULL PRIMARY KEY, u DECIMAL(38,0) NOT NULL, v BIGINT NOT NULL); "
+        "CREATE TABLE {t} (id BIGINT NOT NULL PRIMARY KEY, u UINT128 NOT NULL, v BIGINT NOT NULL); "
         "CREATE INDEX ON {t} (u)",
         "(1, 1, 0), (2, 100, 0), (3, 200, 0)",
         [("INSERT INTO {t} VALUES (4, 150, 0)", 1),

@@ -6,7 +6,7 @@
 //! projection expression it emits.
 
 use crate::bind::structural::str_func_name;
-use crate::codec::literal::{place, Placed};
+use crate::codec::literal::{invalid_literal, place, Placed};
 use crate::error::GnitzSqlError;
 use crate::ir::{
     blend_type, decimal_compute_type, operand_ty_pair, operand_tys, temporal_arith_type, BExpr, BinOp, BoundExpr,
@@ -152,16 +152,16 @@ impl OpcodeBackend<'_> {
         // a wide column on the integer load too, but names it by position only.
         if tc.is_wide_int() {
             return Err(GnitzSqlError::Unsupported(format!(
-                "column {:?} is {tc:?}; 128-bit columns cannot be used in expressions",
-                self.cols[idx].name,
+                "column {:?} is {}; 128-bit columns cannot be used in expressions",
+                self.cols[idx].name, self.cols[idx].ty,
             )));
         }
         Ok(match tc {
             TypeCode::Blob => {
                 return Err(GnitzSqlError::Unsupported(format!(
-                    "column {:?} is {tc:?}; blob columns support only =, <>, <, <=, >, >= \
+                    "column {:?} is {}; blob columns support only =, <>, <, <=, >, >= \
                      against another blob/string column or a string literal",
-                    self.cols[idx].name,
+                    self.cols[idx].name, self.cols[idx].ty,
                 )))
             }
             TypeCode::String => (self.eb.emit(L::LoadColStr { col }), ExprKind::Str),
@@ -298,8 +298,7 @@ impl OpcodeBackend<'_> {
         if src.is_temporal() && src != target.tc {
             if (src, target.tc) != (TypeCode::Date, TypeCode::Timestamp) {
                 return Err(GnitzSqlError::Unsupported(format!(
-                    "cannot mix {} with {target} in one CASE/COALESCE/GREATEST/LEAST",
-                    src.wire_name()
+                    "cannot mix {src} with {target} in one CASE/COALESCE/GREATEST/LEAST"
                 )));
             }
             let (a, _) = self.lower_num(e)?;
@@ -434,9 +433,8 @@ impl OpcodeBackend<'_> {
             TypeCode::Date => false,
             t => {
                 return Err(GnitzSqlError::Unsupported(format!(
-                    "a calendar function takes a DATE or TIMESTAMP; {} is {}",
-                    self.describe(arg),
-                    t.wire_name()
+                    "a calendar function takes a DATE or TIMESTAMP; {} is {t}",
+                    self.describe(arg)
                 )))
             }
         };
@@ -551,8 +549,7 @@ impl OpcodeBackend<'_> {
             match (kind, from, to) {
                 (ExprKind::Str, _, _) => {
                     return Err(GnitzSqlError::Unsupported(format!(
-                        "CAST of a string to {} is supported for a literal only",
-                        to.wire_name()
+                        "CAST of a string to {to} is supported for a literal only"
                     )))
                 }
                 (ExprKind::Int, TypeCode::Timestamp, TypeCode::Date)
@@ -588,9 +585,9 @@ impl OpcodeBackend<'_> {
             };
             return Ok((self.cast_float(f, to), ExprKind::Float));
         }
-        // Every remaining target is a `FixedInt`: the float and String branches
-        // above peeled the rest, and `is_cast_target` admits nothing else.
-        let fi = FixedInt::from_type_code(to).expect("is_cast_target admitted this");
+        let Some(fi) = FixedInt::from_type_code(to) else {
+            return Err(GnitzSqlError::Unsupported(format!("CAST to {to} is not supported")));
+        };
         let reg = match kind {
             ExprKind::Str => self.eb.emit(L::StrToInt { a: r, fi }),
             ExprKind::Float => self.eb.emit(L::FloatToInt { a: r, fi }),
@@ -640,9 +637,8 @@ impl OpcodeBackend<'_> {
     fn cast_to_decimal(&mut self, expr: &BoundExpr, scale: u8) -> Result<(Reg, ExprKind), GnitzSqlError> {
         let reg = match expr {
             BoundExpr::LitStr(text) => {
-                check_decimal_scale(scale)?;
                 let val = parse_decimal(text, scale)
-                    .ok_or_else(|| GnitzSqlError::Bind(format!("invalid DECIMAL literal: {text:?}")))?;
+                    .ok_or_else(|| GnitzSqlError::Bind(invalid_literal(ColType::decimal(scale), text)))?;
                 self.eb.emit(L::LoadConst { val, unsigned: false })
             }
             _ => self.lower_dec(expr, scale)?,
@@ -765,11 +761,9 @@ impl OpcodeBackend<'_> {
         };
         let Some(cmp) = op.as_cmp() else { return Ok(None) };
         let Some(p) = place(lit, ty) else {
-            // A string against a DATE/TIMESTAMP is that type's spelling, so text
-            // that spells no value is an error.
+            // A string `place` cannot read spells no value of the type.
             return match lit {
-                BExpr::LitStr(s) if ty.tc.is_temporal() => Err(crate::types::temporal_literal(ty.tc, s)
-                    .expect_err("`place` reads every temporal spelling `temporal_literal` parses")),
+                BExpr::LitStr(s) => Err(GnitzSqlError::Bind(invalid_literal(ty, s))),
                 _ => Ok(None),
             };
         };

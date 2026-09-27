@@ -129,6 +129,28 @@ impl CatalogEngine {
         col_defs: &[ColumnDef],
         pk_cols: &[u32],
     ) -> Result<i64, String> {
+        self.create_table_with(qualified_name, col_defs, pk_cols, gnitz_wire::TableProps::default())
+    }
+
+    /// A SERIAL table `(id U64 PRIMARY KEY)`.
+    pub(crate) fn create_serial_table(&mut self, qualified_name: &str) -> Result<i64, String> {
+        let serial = gnitz_wire::TableProps { serial: true, ..Default::default() };
+        self.create_table_with(
+            qualified_name,
+            &[crate::test_support::col_def("id", gnitz_wire::TypeCode::U64)],
+            &[0],
+            serial,
+        )
+    }
+
+    /// [`Self::create_table`] under `props`.
+    pub(crate) fn create_table_with(
+        &mut self,
+        qualified_name: &str,
+        col_defs: &[ColumnDef],
+        pk_cols: &[u32],
+        props: gnitz_wire::TableProps,
+    ) -> Result<i64, String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_name, "public");
         let raw_pk_cols = pack_pk_cols(pk_cols);
 
@@ -142,10 +164,7 @@ impl CatalogEngine {
             .ok_or_else(|| format!("Schema does not exist: {schema_name}"))?;
         let tid = self.allocate_ids(1).unwrap();
 
-        // This in-process test shortcut always builds a keyed, full-PK-distributed
-        // tables (`replicated = false`, `k = 0` = default). REPLICATED and CLUSTER BY
-        // routing are exercised through the catalog hook / SQL planner, not here.
-        let flags = gnitz_wire::TableProps::default().pack();
+        let flags = props.pack();
 
         // Write columns first (table hook reads them via sys_columns)
         self.write_column_records(tid, col_defs)?;

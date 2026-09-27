@@ -90,6 +90,21 @@ fn index_key_type_pins_the_whole_promotion_map() {
     assert!(T::I128.is_pk_eligible() && index_key_type(T::I128).is_err());
 }
 
+/// A SERIAL key is exactly the plain integers of at most 8 bytes: not a DATE's
+/// days, a DECIMAL's scaled units, nor a 16-byte type.
+#[test]
+fn serial_eligible_is_the_narrow_plain_integers() {
+    use TypeCode as T;
+    let want = [T::U8, T::I8, T::U16, T::I16, T::U32, T::I32, T::U64, T::I64];
+    for &tc in TypeCode::ALL {
+        assert_eq!(
+            tc.is_serial_eligible(),
+            want.contains(&tc),
+            "is_serial_eligible({tc:?})"
+        );
+    }
+}
+
 /// Membership and the discriminant round-trip are `wire_enum!`'s; only the
 /// names need a runtime compare.
 #[test]

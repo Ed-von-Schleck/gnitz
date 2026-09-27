@@ -9,6 +9,7 @@ fn multi_column_index_roundtrip() {
     let d = RelDescriptorBlob {
         class: RelClass::BoundedView,
         pk_repeats: true,
+        serial: true,
         indexes: vec![
             RelIndex {
                 cols: PkColList::from_slice(&[1]),
@@ -87,6 +88,7 @@ fn each_decode_guard_rejects_its_own_forgery() {
     let cases: &[(&str, Vec<u8>, &str)] = &[
         ("unknown class", with_byte(0, 5), "unknown relation class 5"),
         ("pk_repeats byte 2", with_byte(1, 2), "neither 0 nor 1"),
+        ("serial byte 2", with_byte(2, 2), "neither 0 nor 1"),
         ("trailing byte", trailing, "trailing"),
         ("index column count", bad_index_count, "out of range"),
     ];

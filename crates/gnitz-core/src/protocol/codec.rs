@@ -22,7 +22,6 @@ pub fn encode_schema_block(schema: &Schema) -> Vec<u8> {
             meta: ColMeta {
                 nullable: col.is_nullable,
                 hidden: col.is_hidden,
-                serial: col.is_serial,
             },
             name: col.name.as_bytes(),
         })
@@ -68,9 +67,6 @@ pub fn schema_from_block(block: &[u8]) -> Result<Schema, ProtocolError> {
         let mut col = ColumnDef::typed(name, c.ty, c.meta.nullable);
         if c.meta.hidden {
             col = col.hidden();
-        }
-        if c.meta.serial {
-            col = col.serial();
         }
         columns.push(col);
     }

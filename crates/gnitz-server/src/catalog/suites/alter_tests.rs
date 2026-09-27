@@ -466,31 +466,33 @@ fn hiding_or_unnulling_a_pk_column_rejected() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// INSERT writes a SERIAL draw into the PK region, so the engine holds a SERIAL
-/// column to being the table's lone PK column.
+/// The engine holds a SERIAL table to one PK column of a SERIAL-eligible type.
 #[test]
-fn a_serial_column_must_be_the_lone_pk() {
-    let dir = temp_dir("alter_serial_pk");
+fn a_serial_table_has_one_narrow_integer_pk() {
+    let dir = temp_dir("serial_pk");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let serial = |name: &str| ColumnDef {
-        is_serial: true,
-        ..col_def(name, TypeCode::I64)
-    };
+    let serial = gnitz_wire::TableProps { serial: true, ..Default::default() };
+    let cols = |pk_tc| vec![col_def("id", pk_tc), col_def("v", TypeCode::U64)];
 
-    for (i, (cols, pk)) in [
-        (vec![col_def("id", TypeCode::U64), serial("s")], vec![0u32]),
-        (vec![serial("a"), col_def("b", TypeCode::U64)], vec![0, 1]),
-        (vec![serial("id"), serial("s")], vec![0]),
-    ]
-    .into_iter()
-    .enumerate()
+    let err = engine
+        .create_table_with("public.compound", &cols(TypeCode::I64), &[0, 1], serial)
+        .unwrap_err();
+    assert!(err.contains("one SERIAL column"), "{err}");
+    for (i, tc) in [TypeCode::U128, TypeCode::Date, TypeCode::Decimal]
+        .into_iter()
+        .enumerate()
     {
-        let err = engine.create_table(&format!("public.bad{i}"), &cols, &pk).unwrap_err();
-        assert!(err.contains("must be the table's only SERIAL column"), "{err}");
+        let err = engine
+            .create_table_with(&format!("public.bad{i}"), &cols(tc), &[0], serial)
+            .unwrap_err();
+        assert!(
+            err.contains("SERIAL needs an integer of at most 8 bytes"),
+            "{tc:?}: {err}"
+        );
     }
     engine
-        .create_table("public.ok", &[serial("id"), col_def("v", TypeCode::U64)], &[0])
-        .expect("a lone SERIAL PK is legal");
+        .create_table_with("public.ok", &cols(TypeCode::I64), &[0], serial)
+        .expect("a lone I64 SERIAL PK is legal");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

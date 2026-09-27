@@ -202,11 +202,7 @@ pub(crate) fn reject_unbuildable_index_key(
 /// CREATE TABLE path can raise the identical message from the shared rule's
 /// verdict instead of re-testing eligibility itself.
 pub(crate) fn non_key_eligible_error(name: &str, tc: TypeCode, role: &str) -> GnitzSqlError {
-    GnitzSqlError::Unsupported(format!(
-        "{role} column '{name}' of type {tc:?} is not supported \
-         ({role} must be a fixed-width integer, U128, or UUID column; \
-         String, Blob, and float columns cannot be a {role} key)"
-    ))
+    GnitzSqlError::Unsupported(format!("{role} column '{name}' of type {tc} cannot be a {role} key"))
 }
 
 /// What a surface requires of the relation a name resolved to. The wording rides

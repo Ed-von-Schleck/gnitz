@@ -540,12 +540,12 @@ impl CatalogEngine {
         check_col_defs(RelationKind::BaseTable, &prospective)
             .map_err(|e| format!("cannot ADD COLUMN on table {owner_id}: {e}"))?;
         // A new column over existing rows is unconditionally nullable, carries
-        // no SERIAL/FK, and is visible.
+        // no FK, and is visible.
         if !appended.is_nullable {
             return Err("ADD COLUMN must append a nullable column".into());
         }
-        if appended.is_serial || appended.is_hidden || appended.fk_table_id != 0 {
-            return Err("ADD COLUMN must not append a SERIAL, hidden, or foreign-key column".into());
+        if appended.is_hidden || appended.fk_table_id != 0 {
+            return Err("ADD COLUMN must not append a hidden or foreign-key column".into());
         }
         // Last, as in the rewrite-pair arm: a malformed append is reported as
         // malformed whatever depends on the table.
@@ -758,9 +758,9 @@ impl CatalogEngine {
         for i in batch.live_rows() {
             let id = batch.get_pk(i) as i64;
             let col_defs = self.read_column_defs(id)?;
-            let (sid, name, pk, kind) = if is_table {
+            let (sid, name, pk, kind, serial) = if is_table {
                 let r = read_table_tab_row(batch, i).map_err(|e| format!("{e} (tid={id})"))?;
-                (r.schema_id, r.name, r.pk, r.kind)
+                (r.schema_id, r.name, r.pk, r.kind, r.facts.serial)
             } else {
                 let v = read_view_tab_row(batch, i).map_err(|e| format!("{e} (vid={id})"))?;
                 // `topo_priority` applies CircuitNodes (2) before View (6) in a
@@ -769,7 +769,7 @@ impl CatalogEngine {
                 // row to validate.
                 self.validate_view_options(id, v.name, v.props, v.owner_view_id)?;
                 self.validate_view_owner(id, v.name, v.owner_view_id, &view_creates)?;
-                (v.schema_id, v.name, v.pk, RelationKind::View(v.props))
+                (v.schema_id, v.name, v.pk, RelationKind::View(v.props), false)
             };
             check_col_defs(kind, &col_defs)
                 .and_then(|()| validate_pk_against_cols(&col_defs, pk.as_slice()))
@@ -777,28 +777,20 @@ impl CatalogEngine {
             reject_unstorable_name(name, kind.noun())?;
 
             if is_table {
-                // A stream push must stay a pure append: SERIAL would draw from a
-                // durable sequence and an FK would probe a parent store, putting a
-                // catalog write or a store read on every one.
+                // A stream push must stay a pure append: an FK would probe a
+                // parent store, putting a store read on every one.
                 if kind == RelationKind::Stream {
-                    if let Some(cd) = col_defs.iter().find(|cd| cd.is_serial || cd.fk_table_id != 0) {
+                    if let Some(cd) = col_defs.iter().find(|cd| cd.fk_table_id != 0) {
                         return Err(format!(
-                            "relation {id} is a stream: column '{}' may not be SERIAL or carry a FOREIGN KEY",
+                            "relation {id} is a stream: column '{}' may not carry a FOREIGN KEY",
                             cd.name
                         ));
                     }
                 }
-                // INSERT writes a SERIAL column's draw into the PK region, so it
-                // must be the table's lone PK column.
-                let mut serials = col_defs.iter().enumerate().filter(|(_, cd)| cd.is_serial);
-                if let Some((ci, cd)) = serials.next() {
-                    if serials.next().is_some() || pk.as_slice() != [ci as u32] {
-                        return Err(format!(
-                            "table '{name}' (id={id}): SERIAL column '{}' must be the table's only SERIAL \
-                             column and its single-column primary key",
-                            cd.name
-                        ));
-                    }
+                if serial {
+                    let pk_cols = pk.as_slice().iter().map(|&c| &col_defs[c as usize]);
+                    gnitz_wire::validate_serial_key(pk_cols.map(|cd| (cd.name.as_str(), cd.ty)))
+                        .map_err(|e| format!("table '{name}' (id={id}): {e}"))?;
                 }
                 // `validate_pk_against_cols` above proved the PK list non-empty
                 // and in range, which is what makes the self-reference type

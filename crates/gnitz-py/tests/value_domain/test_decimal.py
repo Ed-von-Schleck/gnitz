@@ -7,10 +7,7 @@ float would compare equal to the right number (`Decimal("12.50") == 12.5`) while
 having lost exactly the property the type exists for, which is why the rendered
 *type* is asserted alongside the value.
 
-Two precisions mean two different storage types: up to 18 digits the column is a
-scaled `I64` and carries a scale; `DECIMAL(38,0)` and `(39,0)` are the SQL
-spelling of a 128-bit unsigned integer and carry none. Only the first is a
-DECIMAL in the sense of this file.
+A DECIMAL is always a scaled `I64`.
 
 The per-row arithmetic over these columns is a program rather than a type, and
 lives in `scalar_expression/test_fixed_point.py`.

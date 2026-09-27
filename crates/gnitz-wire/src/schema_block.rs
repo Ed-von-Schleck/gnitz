@@ -38,27 +38,21 @@ pub struct ColMeta {
     /// value) that no presentation surface exposes. The PK region, routing, sort
     /// and consolidation are all blind to it.
     pub hidden: bool,
-    /// Values are assigned from a server-side sequence (SQL `SERIAL`).
-    pub serial: bool,
 }
 
 const NULLABLE: u8 = 1 << 0;
 const HIDDEN: u8 = 1 << 1;
-const SERIAL: u8 = 1 << 2;
-const DEFINED_FLAGS: u8 = NULLABLE | HIDDEN | SERIAL;
+const DEFINED_FLAGS: u8 = NULLABLE | HIDDEN;
 
 impl ColMeta {
     fn flags(self) -> u8 {
-        (if self.nullable { NULLABLE } else { 0 })
-            | (if self.hidden { HIDDEN } else { 0 })
-            | (if self.serial { SERIAL } else { 0 })
+        (if self.nullable { NULLABLE } else { 0 }) | (if self.hidden { HIDDEN } else { 0 })
     }
 
     fn from_flags(flags: u8) -> ColMeta {
         ColMeta {
             nullable: flags & NULLABLE != 0,
             hidden: flags & HIDDEN != 0,
-            serial: flags & SERIAL != 0,
         }
     }
 }

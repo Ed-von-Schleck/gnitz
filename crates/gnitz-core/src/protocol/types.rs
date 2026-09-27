@@ -17,14 +17,12 @@ pub struct ColumnDef {
     /// The column's logical type, a DECIMAL's scale included.
     pub ty: ColType,
     pub is_nullable: bool,
-    /// A SERIAL primary key: an id the client assigns and the user may not supply.
-    pub is_serial: bool,
     /// A physical column no name the user writes can reach.
     pub is_hidden: bool,
 }
 
 impl ColumnDef {
-    /// A visible, non-SERIAL column.
+    /// A visible column.
     pub fn new(name: impl Into<String>, type_code: TypeCode, is_nullable: bool) -> Self {
         Self::typed(name, ColType::of(type_code), is_nullable)
     }
@@ -36,7 +34,6 @@ impl ColumnDef {
             name: name.into(),
             ty,
             is_nullable,
-            is_serial: false,
             is_hidden: false,
         }
     }
@@ -62,15 +59,8 @@ impl ColumnDef {
             is_nullable: self.is_nullable,
             fk_table_id,
             fk_col_idx,
-            is_serial: self.is_serial,
             is_hidden: self.is_hidden,
         }
-    }
-
-    /// Mark this column a SERIAL primary key.
-    pub fn serial(mut self) -> Self {
-        self.is_serial = true;
-        self
     }
 
     /// Mark this column hidden.

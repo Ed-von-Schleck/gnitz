@@ -35,6 +35,7 @@ fn read(schema: &Arc<Schema>, bound: ReadBound, predicate: Option<&str>, keys: b
         tid: TID,
         class: RelClass::Table,
         pk_repeats: false,
+        serial: false,
         schema: Arc::clone(schema),
         indexes: Vec::new(),
     };

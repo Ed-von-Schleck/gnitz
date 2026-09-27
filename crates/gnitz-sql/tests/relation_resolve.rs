@@ -3,9 +3,7 @@
 //! The RESOLVE verb and the statement-scoped descriptor built from it.
 //!
 //! Two claims are pinned here. *Correctness*: one reply reproduces, field for
-//! field, what three whole-system-table scans produced — the physical column
-//! list including hidden slots, the SERIAL and FK markers, the relation kind,
-//! the placement, and the index list. *Cost*: a statement resolves each
+//! field, what whole-system-table scans produced. *Cost*: a statement resolves each
 //! relation exactly once, and nothing is retained across statements to go
 //! stale under another client's DDL.
 
@@ -96,8 +94,9 @@ fn a_long_relation_name_round_trips() {
 
 // ── The descriptor's contents ────────────────────────────────────────────
 
-/// The markers that are not column-layout facts — SERIAL, a dropped column's
-/// hidden slot at its physical position — all reach the resolved schema.
+/// The facts that are not column layout reach the client: a dropped column's
+/// hidden slot at its physical position on the resolved schema, and SERIAL on
+/// the table's descriptor.
 #[test]
 fn descriptor_fields_round_trip() {
     let (_srv, mut client, sn) = boot(1);
@@ -119,9 +118,8 @@ fn descriptor_fields_round_trip() {
          a BIGINT NOT NULL REFERENCES p(id), \
          b BIGINT NOT NULL REFERENCES p(other))",
     );
-    let (_, c) = client.resolve_table_or_view_id(&sn, "c").unwrap();
-    assert!(c.columns[0].is_serial);
-    assert!(!c.columns[1].is_serial);
+    assert!(client.resolve_relation(&sn, "c").unwrap().serial);
+    assert!(!client.resolve_relation(&sn, "p").unwrap().serial);
 }
 
 /// The index list is exact — an empty list means "no index", never "unchanged".

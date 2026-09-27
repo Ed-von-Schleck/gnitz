@@ -596,9 +596,9 @@ fn cast_accepts_every_numeric_target_and_rejects_the_rest() {
             other => panic!("{src}: expected Cast, got {other:?}"),
         }
     }
-    // The 16-byte integer-ish targets have no register at all.
-    for src in ["CAST(c AS UUID)", "CAST(c AS DECIMAL(38,0))"] {
-        assert_unsupported(bind_num(src), "is not supported");
+    // A 16-byte target binds; it is the lowering that refuses it.
+    for src in ["CAST(c AS UUID)", "CAST(c AS UINT128)"] {
+        assert!(matches!(bind_num(src).unwrap(), BoundExpr::Cast { .. }), "{src}");
     }
     // BOOLEAN has no gnitz type at all, so it rejects one level earlier.
     assert!(bind_num("CAST(c AS BOOLEAN)").is_err());
@@ -974,5 +974,14 @@ fn expr_operands_reaches_inside_substring_and_trim() {
         let e = parse_expr_sql(src);
         let found = expr_operands(&e).iter().any(|o| format!("{o}").contains("EXCLUDED"));
         assert!(found, "{src}: the walker must reach the EXCLUDED reference");
+    }
+}
+
+/// Only a quoted string is a typed literal: the parser fills a typed string
+/// with any value, and `DATE 5` / `DATE NULL` are no spelling of a date.
+#[test]
+fn a_typed_literal_must_be_a_quoted_string() {
+    for src in ["DATE 5", "DATE NULL"] {
+        assert_unsupported(bind_num(src), "must be a single-quoted string");
     }
 }

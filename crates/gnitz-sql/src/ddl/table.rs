@@ -4,7 +4,7 @@
 use crate::ast_util::{extract_index_name, extract_object_name, index_column_ident, simple_ident_expr};
 use crate::bind::{find_unique_column, probe, probe_relation};
 use crate::error::GnitzSqlError;
-use crate::types::{serial_underlying, sql_col_type};
+use crate::types::column_def;
 use crate::validate::{
     canonical_user_name, kv_options, non_key_eligible_error, reject_column_overflow, reject_duplicate_names,
     reject_repeated_object, reject_unbuildable_index_key, reject_unhonored_column_options,
@@ -242,6 +242,7 @@ fn parse_table_options(table_options: &CreateTableOptions) -> Result<TableProps,
     };
     Ok(TableProps {
         stream: flag("stream", stream)?,
+        serial: false,
         distribution,
     })
 }
@@ -277,6 +278,8 @@ fn push_unique(
 struct Declared<'a> {
     cols: Vec<ColumnDef>,
     pk: Vec<u32>,
+    /// The columns declared SERIAL.
+    serial: Vec<u32>,
     fk_sites: Vec<FkSite<'a>>,
     unique: Vec<UniqueDecl>,
 }
@@ -289,20 +292,15 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
     let mut inline_pk: Vec<u32> = Vec::new();
     let mut fk_sites: Vec<FkSite<'_>> = Vec::new();
     let mut unique: Vec<UniqueDecl> = Vec::new();
+    let mut serial: Vec<u32> = Vec::new();
 
-    // The column defs (name, type, nullability) and every site a column option
-    // declares. A SERIAL column resolves to its underlying signed int, is always
-    // NOT NULL, and carries the `is_serial` marker.
+    // The column defs and every site a column option declares.
     for (i, col) in create.columns.iter().enumerate() {
-        cols.push(if let Some(tc) = serial_underlying(&col.data_type) {
-            ColumnDef::new(col.name.value.clone(), tc, false).serial() // NOT NULL
-        } else {
-            ColumnDef::typed(
-                col.name.value.clone(),
-                sql_col_type(&col.data_type)?,
-                !col.options.iter().any(|o| matches!(o.option, ColumnOption::NotNull)),
-            )
-        });
+        let (def, is_serial) = column_def(col)?;
+        cols.push(def);
+        if is_serial {
+            serial.push(i as u32);
+        }
         for opt in &col.options {
             match &opt.option {
                 ColumnOption::PrimaryKey(_) => inline_pk.push(i as u32),
@@ -378,6 +376,7 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
     Ok(Declared {
         cols,
         pk: table_pk.unwrap_or(inline_pk),
+        serial,
         fk_sites,
         unique,
     })
@@ -393,16 +392,10 @@ fn pk_covered_unique(pk: &[u32]) -> &[u32] {
     }
 }
 
-/// A stream holds no rows: nothing to index, nothing to seed a SERIAL generator
-/// from, and nothing for a referential action to check against. The engine
-/// refuses all three naming the relation by id; this names the column.
+/// A stream holds no rows: nothing to index, and nothing for a referential action
+/// to check against. The engine refuses an index or an FK naming the relation by
+/// id; this names the column.
 fn reject_stream_constraints(d: &Declared<'_>) -> Result<(), GnitzSqlError> {
-    if let Some(c) = d.cols.iter().find(|c| c.is_serial) {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "a stream cannot carry a SERIAL column ('{}'): it holds no rows to seed the generator from",
-            c.name
-        )));
-    }
     if let Some(site) = d.fk_sites.first() {
         return Err(GnitzSqlError::Unsupported(format!(
             "a stream cannot carry a FOREIGN KEY (column '{}'): it holds no rows to check against",
@@ -542,6 +535,7 @@ pub fn plan_create_table(
     let Declared {
         mut cols,
         pk: pk_indices,
+        serial,
         fk_sites,
         mut unique,
     } = declared;
@@ -593,20 +587,15 @@ pub fn plan_create_table(
         other => GnitzSqlError::Unsupported(other.to_string()),
     })?;
 
-    // A SERIAL column must be the table's sole, single-column PRIMARY KEY: the
-    // INSERT path pushes the generated id as one native value
-    // (`PkColumn::push_u128`), which has no compound form.
-    let mut serials = cols.iter().enumerate().filter(|(_, c)| c.is_serial);
-    if let Some((sci, _)) = serials.next() {
-        if serials.next().is_some() {
-            return Err(GnitzSqlError::Unsupported("at most one SERIAL column per table".into()));
-        }
-        if pk_indices.as_slice() != [sci as u32] {
-            return Err(GnitzSqlError::Unsupported(
-                "a SERIAL column must be the table's single-column PRIMARY KEY".into(),
-            ));
-        }
+    // The generated id has no compound form: a column spelled SERIAL is the table's
+    // whole primary key.
+    if let Some(&c) = serial.iter().find(|&&c| pk_indices.as_slice() != [c]) {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "SERIAL column '{}' must be the table's only SERIAL column and its single-column PRIMARY KEY",
+            cols[c as usize].name
+        )));
     }
+    props.serial = !serial.is_empty();
 
     drop_unique_covered_by_pk(&mut unique, &cols, &pk_indices)?;
 
@@ -641,6 +630,7 @@ pub fn plan_create_table(
         }
         props.distribution = TableDistribution::Keyed { prefix_len };
     }
+    props.validate(pk_indices.len()).map_err(GnitzSqlError::Unsupported)?;
 
     let unique_indexes = name_unique_indexes(unique, &cols, schema_name, &table_name)?;
     Ok(TablePlan::Create {
