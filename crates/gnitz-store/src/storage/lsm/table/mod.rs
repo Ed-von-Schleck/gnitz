@@ -161,7 +161,7 @@ pub(crate) struct Table {
     /// handed back per call (dropping its `Rc`s) with capacity retained, so the
     /// path stops allocating once warmed up. In a `Cell` so the probe that fills
     /// it is a read.
-    retract_scratch: Cell<Vec<StoredRow>>,
+    live_row_scratch: Cell<Vec<StoredRow>>,
 
     /// Last `full_scan` result, held until the row set moves. In a `Cell` so
     /// `full_scan` stays `&self` — a read reborrowed as `&mut` would widen its
@@ -208,7 +208,7 @@ impl Table {
             caller_record: Vec::new(),
             resumed_from_checkpoint: false,
             held_in_ram: false,
-            retract_scratch: Cell::new(Vec::new()),
+            live_row_scratch: Cell::new(Vec::new()),
             cached_full_scan: Cell::new(None),
             durable_manifest: None,
         };
@@ -573,7 +573,7 @@ impl Table {
     /// weight is positive but whose full group nets ≤ 0 has been retracted by a
     /// later tier and must not be returned.
     pub(crate) fn live_row_at(&self, key: &[u8]) -> (i64, Option<StoredRow>) {
-        let mut pool = self.retract_scratch.take();
+        let mut pool = self.live_row_scratch.take();
 
         let mut total_w: i64 = 0;
         self.for_each_pk_candidate(key, |run, row| {
@@ -593,7 +593,7 @@ impl Table {
         }
 
         pool.clear();
-        self.retract_scratch.set(pool);
+        self.live_row_scratch.set(pool);
         (total_w, row)
     }
 }

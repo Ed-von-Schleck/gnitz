@@ -6,8 +6,8 @@ use crate::ops::op_negate;
 use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
 use crate::storage::{Batch, BatchBuilder, Layout, ReadCursor};
 use crate::test_support::{
-    make_batch_raw, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk_i64, pk_payload_schema, scratch_table,
-    trace_cursor, u64_pk_schema,
+    make_batch_raw, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk_i64, payload0_i64, pk_payload_schema,
+    scratch_table, trace_cursor, u64_pk_schema,
 };
 use gnitz_wire::{read_i64_le, read_u64_le};
 
@@ -1464,7 +1464,7 @@ fn test_group_runs_pk_in_group() {
     let mb = batch.as_mem_batch();
     assert_runs_are_groups(&schema, &[0, 1], &batch, |i| {
         let pk = gnitz_wire::widen_pk_be(mb.get_pk_bytes(i));
-        let other = i64::from_le_bytes(mb.get_col_ptr(i, 0, 8).try_into().unwrap());
+        let other = payload0_i64(&mb, i);
         (pk << 64) | (other as u64 as u128)
     });
 }
@@ -1522,7 +1522,7 @@ fn test_group_runs_nullable_group_col() {
         if is_null(i) {
             u128::MAX
         } else {
-            i64::from_le_bytes(mb.get_col_ptr(i, 0, 8).try_into().unwrap()) as u128
+            payload0_i64(&mb, i) as u128
         }
     });
     let null_positions: Vec<usize> = order

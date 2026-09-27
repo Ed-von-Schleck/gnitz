@@ -6,7 +6,7 @@ use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{BatchBuilder, Layout};
 use crate::test_support::{
     make_batch_u128, make_schema_i64pk_i64, make_schema_pk_u64_payload_string, make_schema_u128_i64,
-    make_schema_u64_i64, opk_pk, pk_payload_schema, wide_pk_3xu64_schema,
+    make_schema_u64_i64, opk_pk, payload0_i64, pk_payload_schema, wide_pk_3xu64_schema,
 };
 
 /// Build an `Rc<Batch>` with i64-payload rows.  Tests pre-sort their
@@ -557,7 +557,7 @@ fn drain_chunks(cursor: &mut ReadCursor, n: usize) -> Vec<(u128, i64, i64)> {
         assert!(chunk.count > 0, "drain_chunk returned an empty Some chunk");
         assert!(chunk.is_consolidated());
         for row in 0..chunk.count {
-            let val = i64::from_le_bytes(chunk.get_col_ptr(row, 0, 8).try_into().unwrap());
+            let val = payload0_i64(&chunk, row);
             rows.push((chunk.get_pk(row), chunk.get_weight(row), val));
         }
     }
@@ -570,7 +570,7 @@ fn materialize_rows(sources: &[Rc<Batch>]) -> Vec<(u128, i64, i64)> {
     let batch = cursor.materialize();
     (0..batch.count)
         .map(|row| {
-            let val = i64::from_le_bytes(batch.get_col_ptr(row, 0, 8).try_into().unwrap());
+            let val = payload0_i64(&*batch, row);
             (batch.get_pk(row), batch.get_weight(row), val)
         })
         .collect()
@@ -1027,7 +1027,7 @@ fn ascending_key_sweep_matches_per_key_fresh_seeks() {
     let rows = |b: &Batch| -> Vec<(u128, i64, i64)> {
         (0..b.count)
             .map(|r| {
-                let val = i64::from_le_bytes(b.get_col_ptr(r, 0, 8).try_into().unwrap());
+                let val = payload0_i64(b, r);
                 (b.get_pk(r), b.get_weight(r), val)
             })
             .collect()

@@ -447,7 +447,7 @@ impl MapPlan {
         let starves_kernel = self.ev.emits_anything() && ranges.len() > 1 && total < ranges.len() * COMPACT_RUN_LEN;
         let compacted;
         let (src, ranges) = if starves_kernel {
-            compacted = Batch::from_ranges(src, ranges, src.schema());
+            compacted = Batch::from_ranges(src, ranges, src.schema(), 0);
             (&compacted, &[(0, total)][..])
         } else {
             (src, ranges)

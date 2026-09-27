@@ -2,6 +2,7 @@ use super::*;
 use crate::relation::{RelationKind, RelationSpec, StoreConfig};
 use crate::schema::{SchemaColumn, TypeCode};
 use crate::storage::{BatchBuilder, Slot, StoreError};
+use crate::test_support::payload0_i64;
 use gnitz_wire::ViewProps;
 use gnitz_wire::{key_image, AggDescriptor, AggReadSpec, Cut, KeyRange, OrderKey, PkColList, ReadSink};
 
@@ -482,7 +483,7 @@ fn ingested(keep: impl Fn(u64) -> bool) -> Vec<(u128, i64, i64)> {
 fn rows_of(b: &Batch) -> Vec<(u128, i64, i64)> {
     let mut rows: Vec<_> = (0..b.count)
         .map(|i| {
-            let val = i64::from_le_bytes(b.get_col_ptr(i, 0, 8).try_into().unwrap());
+            let val = payload0_i64(b, i);
             (b.get_pk(i), val, b.get_weight(i))
         })
         .collect();

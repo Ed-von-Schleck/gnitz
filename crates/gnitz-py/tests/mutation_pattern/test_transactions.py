@@ -113,6 +113,16 @@ _BUNDLES = {
         ([], [("a", [(1, 10, 1)], "update"), ("a", [(1, 20, 1)], "error")], None),
     "a blind delete leaves an uncommitted key free for an error-mode insert":
         ([], [("a", [5], "delete"), ("a", [(5, 50, 1)], "error")], ({(5, 50): 1}, {})),
+    "an error-mode frame's own delete does not hide its insert of a committed key":
+        ([(1, 10)], [("a", [(1, 99, 1), (1, 98, -1)], "error")], None),
+    "an error-mode frame may delete a key and re-insert it":
+        ([(1, 10)], [("a", [(1, 98, -1), (1, 20, 1)], "error")], ({(1, 20): 1}, {})),
+    "an error-mode re-insert after its own delete is no duplicate":
+        ([], [("a", [(1, 10, 1), (1, 10, -1), (1, 20, 1)], "error")], ({(1, 20): 1}, {})),
+    "an error-mode frame's own delete does not hide an earlier frame's insert":
+        ([], [("a", [(1, 10, 1)], "update"), ("a", [(1, 20, 1), (1, 20, -1)], "error")], None),
+    "an error-mode row at weight 2 is a duplicate":
+        ([], [("a", [(1, 10, 2)], "error")], None),
     "a weight-0 row is no row":
         ([], [("a", [(1, 10, 1), (2, 20, 0)], "update"), ("b", [(3, 30, 1)], "update")],
          ({(1, 10): 1}, {(3, 30): 1})),

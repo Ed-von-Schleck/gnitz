@@ -1,6 +1,6 @@
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::{pk_payload_schema, u64_pk_schema, wide_pk_3xu64_schema};
+use crate::test_support::{payload0_i64, pk_payload_schema, u64_pk_schema, wide_pk_3xu64_schema};
 use gnitz_expr::payload_string;
 
 #[test]
@@ -98,7 +98,7 @@ fn into_consolidated_strip_forces_real_consolidation() {
     assert_eq!(clean.get_pk(1), 9);
     // PK 5: the non-adjacent duplicate summed to +2; value intact; not null.
     assert_eq!(clean.get_weight(0), 2, "duplicate (PK,payload) folds to +2");
-    assert_eq!(i64::from_le_bytes(clean.get_col_ptr(0, 0, 8).try_into().unwrap()), 100);
+    assert_eq!(payload0_i64(&clean, 0), 100);
     assert_eq!(clean.get_null_word(0) & 1, 0);
     // PK 9: the NULL cell still decodes as NULL (null bit preserved).
     assert_eq!(clean.get_weight(1), 1);
@@ -483,7 +483,7 @@ fn from_ranges_resolves_long_values_under_both_blob_arms() {
         !super::super::merge::should_relocate_blob(small.blob.len(), small.count, 1),
         "precondition: this shape takes the sharing arm",
     );
-    let shared = Batch::from_ranges(&small, &[(0, 1)], &schema);
+    let shared = Batch::from_ranges(&small, &[(0, 1)], &schema, 0);
     assert_eq!(shared.count, 1);
     assert_eq!(read_german_string(&shared, 0, 0), long);
     assert_eq!(
@@ -501,7 +501,7 @@ fn from_ranges_resolves_long_values_under_both_blob_arms() {
         super::super::merge::should_relocate_blob(wide.blob.len(), wide.count, 1),
         "precondition: this shape takes the relocating arm",
     );
-    let relocated = Batch::from_ranges(&wide, &[(7, 8)], &schema);
+    let relocated = Batch::from_ranges(&wide, &[(7, 8)], &schema, 0);
     assert_eq!(relocated.count, 1);
     assert_eq!(read_german_string(&relocated, 0, 0), vals[7]);
     assert!(
@@ -519,7 +519,7 @@ fn from_ranges_inherits_its_source_layout() {
     let src = crate::test_support::make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
     assert!(src.is_consolidated(), "precondition: the source claims consolidated");
 
-    let subset = Batch::from_ranges(&src, &[(0, 1), (2, 3)], &schema);
+    let subset = Batch::from_ranges(&src, &[(0, 1), (2, 3)], &schema, 0);
     assert_eq!(subset.count, 2);
     assert!(
         subset.is_consolidated(),

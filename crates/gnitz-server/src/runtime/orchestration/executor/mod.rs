@@ -290,7 +290,8 @@ impl Shared {
     pub(super) fn note_commit_rows(&self, rows: impl Iterator<Item = (i64, usize)>) {
         let crossed = {
             let mut pending = self.tick_rows.borrow_mut();
-            for (tid, n) in rows {
+            let dag = &self.cat().dag;
+            for (tid, n) in rows.filter(|&(tid, _)| dag.is_scanned(tid)) {
                 *pending.entry(tid).or_insert(0) += n;
             }
             pending.values().any(|&rows| rows >= TICK_COALESCE_ROWS)
@@ -1146,20 +1147,9 @@ fn decode_push_txn_frame(body: &[u8]) -> Result<DecodedTxn, WireFault> {
 }
 
 /// Compare a client-supplied schema against the catalog's own descriptor for
-/// `tid` and hand that descriptor back — the one place a claimed layout meets the
-/// registered one, so both write paths reject alike.
-///
-/// An absent descriptor is a rejection, not a pass: every caller has already
-/// proved the relation exists, so its absence is a bug, not an exemption.
-fn validate_client_schema(shared: &Shared, tid: i64, client: &SchemaDescriptor) -> Result<SchemaDescriptor, String> {
-    let expected = shared
-        .cat()
-        .registry
-        .relation(tid)
-        .map(Relation::schema)
-        .ok_or_else(|| format!("table {tid} has no registered schema"))?;
-    validate_schema_match(client, &expected)?;
-    Ok(expected)
+/// `tid`.
+fn validate_client_schema(shared: &Shared, tid: i64, client: &SchemaDescriptor) -> Result<(), String> {
+    validate_schema_match(client, &shared.cat().registry.relation_or_err(tid)?.schema())
 }
 
 /// Decode and validate a client frame.
@@ -1290,8 +1280,8 @@ fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, target_id: i64, name_bl
 /// transitively, through view sources — committed at or below the last completed
 /// tick's watermark.
 ///
-/// Sound because the committer marks a tid in `tick_rows` before publishing that
-/// commit's zone LSN, a contract stated at that mark; a *missing* map entry is
+/// Sound because the committer marks every scanned tid in `tick_rows` before
+/// publishing that commit's zone LSN, a contract stated at that mark; a *missing* map entry is
 /// the `boot_seed` argument. Erring towards false is harmless (one extra drain),
 /// which is where a stream lands: its reserved LSN is never published.
 ///

@@ -454,17 +454,8 @@ impl WorkerProcess {
     // ── Request handlers ───────────────────────────────────────────────
 
     fn handle_push(&mut self, target_id: i64, batch: Batch) -> Result<(), String> {
-        // The master's `with_commit_indices` sends a keyed table's worker exactly
-        // the rows `route_rows_by_pk` assigns it, and a replicated table's worker
-        // the whole batch, so the slot is what this worker ingests.
-        if batch.is_empty() {
-            return Ok(());
-        }
         let row_count = batch.len();
         if target_id < FIRST_USER_TABLE_ID {
-            // Master never sends Push for system tables; system-table
-            // changes arrive via DdlSync → ddl_sync. Reaching here
-            // means a protocol invariant was violated.
             return Err(format!(
                 "a Push group named system table_id={target_id}; a system family arrives as DdlSync"
             ));

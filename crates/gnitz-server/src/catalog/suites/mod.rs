@@ -9,6 +9,7 @@ mod engine_tests;
 mod fk_tests;
 mod hydrate_bench;
 mod index_tests;
+mod ingest_unticked_bench;
 mod reopen_rebuild_tests;
 mod scan_spec_bench;
 mod scan_spec_tests;

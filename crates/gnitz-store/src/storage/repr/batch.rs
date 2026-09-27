@@ -940,7 +940,7 @@ impl<'d> AppendSession<'d> {
 
     /// Append one row of `src` at an explicit weight, under the session's own
     /// blob dedup cache. A zero weight appends nothing.
-    pub(crate) fn push_row(&mut self, src: &MemBatch<'_>, row: usize, weight: i64) {
+    pub(crate) fn push_row<S: RowSource>(&mut self, src: &S, row: usize, weight: i64) {
         self.dst.append_row_from_source(weight, src, row, self.guard.get_mut());
     }
 }
@@ -1410,14 +1410,19 @@ impl Batch {
     }
 
     /// The rows of `src`'s disjoint ascending `[start, end)` ranges, inheriting its
-    /// layout.
-    pub(crate) fn from_ranges(src: &Batch, ranges: &[(usize, usize)], schema: &SchemaDescriptor) -> Batch {
+    /// layout, in an arena with room for `spare_rows` more.
+    pub(crate) fn from_ranges(
+        src: &Batch,
+        ranges: &[(usize, usize)],
+        schema: &SchemaDescriptor,
+        spare_rows: usize,
+    ) -> Batch {
         debug_assert!(
             ranges.windows(2).all(|w| w[0].1 <= w[1].0),
             "from_ranges: ranges must be disjoint and ascending",
         );
         let rows = range_rows(ranges);
-        let mut out = Batch::with_capacity(schema, rows);
+        let mut out = Batch::with_capacity(schema, rows + spare_rows);
         if !merge::should_relocate_blob(src.blob.len(), src.count, rows) {
             out.share_blob_from(src);
         }

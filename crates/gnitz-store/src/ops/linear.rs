@@ -31,7 +31,7 @@ pub fn op_filter(batch: &Batch, pred: &mut RowFilter, schema: &SchemaDescriptor)
     if ranges == [(0, batch.count)] {
         return None;
     }
-    Some(Batch::from_ranges(batch, &ranges, schema))
+    Some(Batch::from_ranges(batch, &ranges, schema, 0))
 }
 
 /// `a`'s schema with each column's nullability OR-ed with `b`'s, so a

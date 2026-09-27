@@ -6,14 +6,10 @@ use super::super::shard_index::L0_COMPACT_THRESHOLD;
 use super::flush_barrier;
 use gnitz_expr::RowSource;
 
-/// Payload column 0 (an 8-byte integer) of a located row — the one read
-/// every `retract_pk` assertion makes.
-fn row_val(fr: &StoredRow) -> i64 {
-    i64::from_le_bytes(RowSource::get_col_ptr(&fr.run, fr.row, 0, 8).try_into().unwrap())
-}
 use crate::schema::{SchemaDescriptor, SchemaFacts, TypeCode};
 use crate::test_support::{
-    make_batch_opk, make_batch_raw, make_schema_u64_i64, opk_pk, pk_payload_schema, wide_pk_3xu64_schema, wide_row,
+    make_batch_opk, make_batch_raw, make_schema_u64_i64, opk_pk, payload0_i64, pk_payload_schema, stored_payload0_i64,
+    wide_pk_3xu64_schema,
 };
 
 /// Unsorted `Raw` rows for the U64+I64 schema; the ingest path runs the
@@ -30,16 +26,14 @@ fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, budget: usize, rs:
     t
 }
 
-/// Native-`u128` oracles over the byte-keyed production entry points, which key
-/// on verbatim OPK bytes throughout: these `opk_key` the value first, so feeding
-/// one an already-encoded key would double the sign flip.
+/// Native-`u128` twins of the byte-keyed probes.
 impl Table {
     fn has_pk(&self, key: u128) -> bool {
         let opk = self.shard_index.schema.opk_key(&key.to_le_bytes());
         self.has_pk_bytes(opk.pk_bytes())
     }
 
-    fn retract_pk(&self, key: u128) -> (i64, Option<StoredRow>) {
+    fn live_row(&self, key: u128) -> (i64, Option<StoredRow>) {
         let opk = self.shard_index.schema.opk_key(&key.to_le_bytes());
         self.live_row_at(opk.pk_bytes())
     }
@@ -131,7 +125,7 @@ fn table_lifecycle_serves_rows_across_flush_and_reopen() {
 }
 
 #[test]
-fn table_retract_pk() {
+fn table_live_row() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("retract_test");
     let schema = make_schema_u64_i64();
@@ -140,24 +134,24 @@ fn table_retract_pk() {
 
     t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
 
-    let (w, found) = t.retract_pk(10);
+    let (w, found) = t.live_row(10);
     assert_eq!(w, 1);
     assert!(found.is_some());
     // The retracted row is the found row: a valid null word and an
     // accessible payload column, read through the RowSource view.
     let fr = found.expect("retracted row is the found row");
     assert_ne!(RowSource::get_null_word(&fr.run, fr.row), u64::MAX);
-    assert_eq!(row_val(&fr), 100);
+    assert_eq!(stored_payload0_i64(&fr), 100);
 
-    let (w, found) = t.retract_pk(99);
+    let (w, found) = t.live_row(99);
     assert_eq!(w, 0);
     assert!(found.is_none());
 }
 /// After INSERT then UPDATE (which adds a retraction for the old payload and
-/// an insertion for the new payload), `retract_pk` must return the NEW payload,
+/// an insertion for the new payload), `live_row` must return the NEW payload,
 /// not the cancelled old one.
 #[test]
-fn test_retract_pk_after_update() {
+fn test_live_row_after_update() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("retract_update_test");
     let schema = make_schema_u64_i64();
@@ -173,16 +167,16 @@ fn test_retract_pk_after_update() {
         .unwrap();
 
     // Net state: val=100 has weight 0 (cancelled), val=200 has weight 1
-    let (w, found) = t.retract_pk(10);
+    let (w, found) = t.live_row(10);
     assert_eq!(w, 1);
     assert!(found.is_some());
 
     // The found row must be val=200, not the cancelled val=100
     let fr = found.expect("retracted row is the found row");
-    let val = row_val(&fr);
+    let val = stored_payload0_i64(&fr);
     assert_eq!(
         val, 200,
-        "retract_pk must return the live (val=200) row, not the retracted val=100"
+        "live_row must return the live (val=200) row, not the retracted val=100"
     );
 }
 
@@ -248,17 +242,15 @@ fn test_memtable_overflow_auto_flush() {
     }
 }
 
-/// Bug 2: INSERT (PK=10, val=100) → flush → UPDATE delta → flush → retract_pk.
+/// Bug 2: INSERT (PK=10, val=100) → flush → UPDATE delta → flush → live_row.
 /// The shard fallback must pick the live payload (val=200), not the cancelled one.
 #[test]
-fn test_retract_pk_shard_fallback_multiple_payloads() {
+fn test_live_row_shard_fallback_multiple_payloads() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("retract_shard_fallback");
     let schema = make_schema_u64_i64();
 
-    // Durable: `retract_pk` is base-table-only (base tables are durable), so
-    // the flushed rows must land in a real shard for the shard-fallback path
-    // under test — not the RAM tier (which a non-durable flush would use).
+    // Durable, so its flushes land in shards rather than the RAM tier.
     let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::SalReplay);
 
     // Batch 1: INSERT (PK=10, weight=+1, val=100)
@@ -271,13 +263,13 @@ fn test_retract_pk_shard_fallback_multiple_payloads() {
     t.flush().unwrap();
 
     // Both batches are now in shards, memtable is empty.
-    // retract_pk must find val=200 (net weight 1), not val=100 (net weight 0).
-    let (w, found) = t.retract_pk(10);
+    // live_row must find val=200 (net weight 1), not val=100 (net weight 0).
+    let (w, found) = t.live_row(10);
     assert_eq!(w, 1);
     assert!(found.is_some());
 
     let fr = found.expect("retracted row is the found row");
-    let val = row_val(&fr);
+    let val = stored_payload0_i64(&fr);
     assert_eq!(
         val, 200,
         "shard fallback must pick live payload (val=200), not cancelled (val=100)"
@@ -411,7 +403,7 @@ fn wide_pk_membership_and_retract_resolve_twins_in_every_tier() {
         let (w, found) = t.live_row_at(&twin_b);
         assert_eq!(w, 1);
         assert_eq!(
-            row_val(&found.expect("live twin is the found row")),
+            stored_payload0_i64(&found.expect("live twin is the found row")),
             20,
             "found row must be the surviving twin's payload"
         );
@@ -450,7 +442,7 @@ fn signed_compound_pk_keeps_opk_order_in_every_tier() {
         // Payload marker == the signed leading value, so scan order is read
         // back without decoding the PK. `w` lets the same builder emit the
         // DBSP -1 retraction row below.
-        let row = |a: i64, w: i64| wide_row(&schema, &key(a, 0, 0), w, a);
+        let row = |a: i64, w: i64| make_batch_opk(&schema, &[(&key(a, 0, 0), w, a)]);
         for a in [3i64, -5, 0, -1] {
             // scrambled insertion order
             t.ingest_owned_batch(row(a, 1)).unwrap();
@@ -464,9 +456,7 @@ fn signed_compound_pk_keeps_opk_order_in_every_tier() {
         // full_scan returns rows in OPK (= typed signed) order: -5, -1, 0, 3.
         // A missing sign-flip would scan back as 0, 3, -5, -1 and fail here.
         let scanned = t.full_scan();
-        let payloads: Vec<i64> = (0..scanned.count)
-            .map(|r| i64::from_le_bytes(scanned.get_col_ptr(r, 0, 8).try_into().unwrap()))
-            .collect();
+        let payloads: Vec<i64> = (0..scanned.count).map(|r| payload0_i64(&*scanned, r)).collect();
         assert_eq!(
             payloads,
             vec![-5, -1, 0, 3],
@@ -477,7 +467,7 @@ fn signed_compound_pk_keeps_opk_order_in_every_tier() {
         let (w, found) = t.live_row_at(&key(-5, 0, 0));
         assert_eq!(w, 1);
         assert_eq!(
-            row_val(&found.expect("signed key is the found row")),
+            stored_payload0_i64(&found.expect("signed key is the found row")),
             -5,
             "found row payload marks the probed signed key"
         );
@@ -695,15 +685,11 @@ fn nondurable_mixed_disk_and_heap_read() {
     }
 }
 
-// ── RAM-tier (the RAM tier) found-row path ─────────────────────────
+// ── RAM-tier found-row path ────────────────────────────────────────
 //
-// Twins of the durable retract tests above, but the rows stay in
-// the RAM tier (non-durable flush, sub-ceiling) instead of on disk, so the
-// `retract_pk*` / `has_pk_bytes` / `for_each_pk_candidate` RAM-tier code
-// is what's exercised. `retract_pk*` is production-invoked only on durable
-// base tables, but the machinery is tier-agnostic and these drive it directly.
+// Twins of the durable live-row tests above, with the rows held in the RAM tier.
 
-/// Twin of `test_retract_pk_shard_fallback_multiple_payloads`, in RAM: an
+/// Twin of `test_live_row_shard_fallback_multiple_payloads`, in RAM: an
 /// UPDATE delta split across two in-memory runs. The multi-candidate
 /// global-net loop over the RAM tier must pick the live payload (200), not
 /// the cancelled one (100).
@@ -725,11 +711,11 @@ fn inmem_retract_multiple_payloads() {
     assert!(t.memtable.is_empty());
     assert_eq!(t.ram_tier.len(), 2, "two sub-ceiling flushes → two L0 runs");
 
-    let (w, found) = t.retract_pk(10);
+    let (w, found) = t.live_row(10);
     assert_eq!(w, 1, "net weight 1 across the RAM runs");
     assert!(found.is_some());
     let fr = found.expect("retracted row is the found row");
-    let val = row_val(&fr);
+    let val = stored_payload0_i64(&fr);
     assert_eq!(
         val, 200,
         "RAM-tier global-net must pick live payload 200, not cancelled 100"
@@ -756,11 +742,11 @@ fn inmem_cross_tier_netting() {
 
     assert!(t.has_pk(5), "PK 5 nets +1 across RAM (+2) and memtable (-1)");
 
-    let (w, found) = t.retract_pk(5);
+    let (w, found) = t.live_row(5);
     assert_eq!(w, 1, "global net weight is 1");
     assert!(found.is_some());
     let fr = found.expect("live row found");
-    let val = row_val(&fr);
+    let val = stored_payload0_i64(&fr);
     assert_eq!(
         val, 60,
         "global oracle rejects the cancelled val=50, arms live val=60 from RAM"
@@ -796,10 +782,10 @@ fn retract_groups_across_all_three_tiers() {
 
     // Global nets: val=70 → shard +1, memtable −1 = 0 (dead);
     //              val=80 → RAM +1 (live). Total = +1.
-    let (w, found) = t.retract_pk(7);
+    let (w, found) = t.live_row(7);
     assert_eq!(w, 1, "total net weight across all three tiers");
     let fr = found.expect("live row found");
-    let val = row_val(&fr);
+    let val = stored_payload0_i64(&fr);
     assert_eq!(
         val, 80,
         "grouping must net val=70 across shard+memtable to zero and arm the RAM-tier val=80"
@@ -831,16 +817,16 @@ fn inmem_fold_rebuilds_run_bloom() {
     for k in 0..n {
         assert!(t.has_pk(k as u128), "key {k} must survive fold + bloom rebuild");
     }
-    let (w, found) = t.retract_pk(0);
+    let (w, found) = t.live_row(0);
     assert_eq!(w, 1);
     assert!(found.is_some());
     let fr = found.expect("folded key is the found row");
-    let val = row_val(&fr);
+    let val = stored_payload0_i64(&fr);
     assert_eq!(val, 100, "found row payload survives the fold");
 
     // A PK absent from every run: bloom-miss path must equal the linear miss.
     assert!(!t.has_pk(9999), "absent PK reports absent (bloom miss)");
-    let (w_absent, found_absent) = t.retract_pk(9999);
+    let (w_absent, found_absent) = t.live_row(9999);
     assert_eq!(w_absent, 0, "absent PK retract nets zero");
     assert!(found_absent.is_none(), "absent PK retract finds no row");
 }
@@ -995,7 +981,7 @@ fn a_barriers_replay_floor_is_what_the_reopen_reports() {
 
 /// Twin of the RAM-tier retract tests on a real `SalReplay` table: ingest
 /// overflow lands in the RAM tier naturally (no artificial Rederive), and
-/// `has_pk`/`retract_pk` resolve the live row across the RAM tier.
+/// `has_pk`/`live_row` resolve the live row across the RAM tier.
 #[test]
 fn salreplay_overflow_into_l0_retract() {
     let dir = tempfile::tempdir().unwrap();
@@ -1016,11 +1002,11 @@ fn salreplay_overflow_into_l0_retract() {
     for k in 0..8u128 {
         assert!(t.has_pk(k), "row {k} readable from the RAM tier");
     }
-    let (w, found) = t.retract_pk(3);
+    let (w, found) = t.live_row(3);
     assert_eq!(w, 1, "retract resolves the live row in the RAM tier");
     assert!(found.is_some());
     let fr = found.expect("found row from RAM tier");
-    let val = row_val(&fr);
+    let val = stored_payload0_i64(&fr);
     assert_eq!(val, 30, "found-row payload matches the RAM-tier row");
 }
 

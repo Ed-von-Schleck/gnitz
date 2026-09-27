@@ -71,6 +71,11 @@ impl DagEngine {
         self.dep.forward.get(&id).map_or(&[], Vec::as_slice)
     }
 
+    /// Whether any view scans `id`.
+    pub(crate) fn is_scanned(&self, id: i64) -> bool {
+        !self.dependents_of(id).is_empty()
+    }
+
     /// The relations `view_id` scans directly. Empty when it scans none.
     pub(crate) fn sources_of(&self, view_id: i64) -> &[i64] {
         self.dep.reverse.get(&view_id).map_or(&[], Vec::as_slice)

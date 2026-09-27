@@ -51,7 +51,7 @@ impl Run {
     /// ghost-free by construction and certifies `Consolidated`.
     pub(crate) fn slice_to_owned_batch(&self, start: usize, row_count: usize, schema: &SchemaDescriptor) -> Batch {
         match self {
-            Run::Mem(b) => Batch::from_ranges(b, &[(start, start + row_count)], schema),
+            Run::Mem(b) => Batch::from_ranges(b, &[(start, start + row_count)], schema, 0),
             Run::Shard(s) => s.slice_to_owned_batch(start, row_count, schema),
         }
     }

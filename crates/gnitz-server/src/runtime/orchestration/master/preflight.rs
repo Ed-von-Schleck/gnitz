@@ -8,6 +8,7 @@
 //! `unique_preflight.rs`, which shares nothing with this file but the
 //! `UniqueFilter` it seeds.
 
+use std::collections::hash_map::Entry;
 use std::ops::Range;
 
 use rustc_hash::FxHashSet;
@@ -154,25 +155,15 @@ enum FoldOp {
 struct PkFold {
     /// The latest row op on the PK; once the bundle is folded, the op that survives.
     last: FoldOp,
-    /// The op the families before `fam` left, or `None` if none touched the PK.
-    before: Option<FoldOp>,
-    /// The bundle family whose rows are folding into `net` and `dups`.
-    fam: u32,
-    /// Summed weight of `fam`'s rows on the PK.
-    net: i64,
-    /// `fam`'s insertions, saturating at 2; a `+w` row counts as `w`.
-    dups: u32,
-    /// An Error family inserted the PK over an insert an earlier family left.
+    /// An Error family inserted the PK over another family's insert.
     exists_in_bundle: bool,
-    /// An Error family inserted the PK that no earlier family touched, so
-    /// committed state decides.
+    /// An Error family's insert was the first op on the PK.
     needs_probe: bool,
     /// U-PK's probe found the PK committed.
     committed: bool,
 }
 
-/// One table's fold, keyed by the row's OPK bytes borrowed from the family
-/// batch's PK region — the families outlive every bundle built over them.
+/// One table's fold, keyed by the row's OPK bytes.
 type Fold<'a> = FxHashMap<&'a [u8], PkFold>;
 
 /// What a key collided with.
@@ -282,10 +273,6 @@ impl<'a> TxnBundle<'a> {
             }
         }
         for t in &mut tables {
-            // Per TABLE, never per family: the client's "delete k; insert k"
-            // idiom is an `Update` family `[D(k)]` then an `Error` family
-            // `[I(k)]`, and a per-family gate would leave the Error family's
-            // prefix empty and reject the re-insert.
             let error_mode = t
                 .family_indices
                 .iter()
@@ -294,66 +281,50 @@ impl<'a> TxnBundle<'a> {
                 continue;
             }
             let (tid, schema) = (t.tid, t.schema);
-            // Close `e`'s fold over family `e.fam`: the within-family duplicate
-            // rule, then whether an Error family's net insert collides with the
-            // op the earlier families left.
-            let settle = |e: &mut PkFold, pk: &[u8]| -> Result<(), WireFault> {
-                if !matches!(families[e.fam as usize].mode, WireConflictMode::Error) {
-                    return Ok(());
-                }
-                if e.dups > 1 {
-                    return Err(pk_violation_err(disp.cat(), tid, &schema, pk, Clash::InBatch));
-                }
-                if e.net > 0 {
-                    match e.before {
-                        Some(FoldOp::Inserted(..)) => e.exists_in_bundle = true,
-                        Some(FoldOp::Deleted) => {}
-                        None => e.needs_probe = true,
-                    }
-                }
-                Ok(())
-            };
             let rows = t.family_indices.iter().map(|&fi| families[fi].batch.len()).sum();
             let mut fold: Fold<'a> = Fold::with_capacity_and_hasher(rows, Default::default());
             for &fi in &t.family_indices {
+                let error = matches!(families[fi].mode, WireConflictMode::Error);
                 let batch = &families[fi].batch;
                 for row in 0..batch.len() {
                     let w = batch.get_weight(row);
                     if w == 0 {
                         continue;
                     }
+                    let pk = batch.get_pk_bytes(row);
                     let op = if w > 0 {
                         FoldOp::Inserted(fi as u32, row as u32)
                     } else {
                         FoldOp::Deleted
                     };
-                    let pk = batch.get_pk_bytes(row);
-                    let e = fold.entry(pk).or_insert(PkFold {
-                        last: op,
-                        before: None,
-                        fam: fi as u32,
-                        net: 0,
-                        dups: 0,
-                        exists_in_bundle: false,
-                        needs_probe: false,
-                        committed: false,
-                    });
-                    if e.fam != fi as u32 {
-                        settle(e, pk)?;
-                        e.before = Some(e.last);
-                        e.fam = fi as u32;
-                        e.net = 0;
-                        e.dups = 0;
+                    let in_batch = || pk_violation_err(disp.cat(), tid, &schema, pk, Clash::InBatch);
+                    let inserts = error && w > 0;
+                    match fold.entry(pk) {
+                        Entry::Occupied(o) => {
+                            let e = o.into_mut();
+                            if inserts {
+                                match e.last {
+                                    FoldOp::Inserted(f, _) if f == fi as u32 => return Err(in_batch()),
+                                    FoldOp::Inserted(..) => e.exists_in_bundle = true,
+                                    FoldOp::Deleted => {}
+                                }
+                            }
+                            e.last = op;
+                        }
+                        Entry::Vacant(v) => {
+                            v.insert(PkFold {
+                                last: op,
+                                exists_in_bundle: false,
+                                needs_probe: inserts,
+                                committed: false,
+                            });
+                        }
                     }
-                    e.net += w;
-                    e.last = op;
-                    if w > 0 {
-                        e.dups = (e.dups + w.min(2) as u32).min(2);
+                    // `+w` is the row pushed `w` times: its second copy lands on its first.
+                    if inserts && w > 1 {
+                        return Err(in_batch());
                     }
                 }
-            }
-            for (&pk, e) in fold.iter_mut() {
-                settle(e, pk)?;
             }
             t.fold = Some(fold);
         }

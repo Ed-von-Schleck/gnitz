@@ -1,41 +1,70 @@
-//! The base-table write path: `enforce_unique_pk` followed by the
-//! `ingest_borrowed_batch` it feeds. Every client INSERT, UPDATE and DELETE goes
-//! through that pair, and no other bench in the tree reaches it — both table
-//! benches build `Rederive` stores, which are never base tables, never carry a
-//! shard PK filter and are never point-probed.
-//!
-//! Two arms, because the two shapes cost nothing alike:
-//!
-//!   insert : fresh keys, every probe a miss. The whole batch passes through
-//!            verbatim, so nothing is rebuilt and the cost is the probe.
-//!   update : a bounded key set drawn at random, so nearly every row finds a
-//!            stored row. Every such row emits a retraction and cuts the
-//!            verbatim run, and the probe walks a real LSM lookup.
-//!
-//! The update arm draws its keys at random on purpose: a monotone key stream
-//! would let each probe land on the page the last one warmed, which is the one
-//! thing production arrival order (`decode_client_wire`, arrival-ordered) does
-//! not do.
-//!
-//! Each arm names its rows per push, because the two batch sizes drain through
-//! different tiers: at 1000 rows (a bulk load) a push is ~32 KiB, so the memtable
-//! passes its 192 KiB budget after ~6 of them and never reaches `FOLD_THRESHOLD`
-//! — every fold is the RAM tier's. At 1 row (a single-statement DML) the
-//! memtable folds every 16 pushes and drains after ~4900 rows, so its own fold
-//! is what the arm prices.
-//!
-//! Report `ns/row`, not the wall clock of the whole run.
+//! The base-table write path — `enforce_unique_pk` and the store ingest it feeds
+//! — one arm per push shape. Report `ns/row` and instructions per row.
 
 use super::enforce_unique_pk;
-use crate::storage::Batch;
-use crate::storage::{RecoverySource, StoreBudgets, Table};
-use crate::test_support::{make_batch_raw, make_schema_u64_i64};
+use crate::schema::SchemaDescriptor;
+use crate::storage::{Batch, BatchBuilder, RecoverySource, StoreBudgets, Table};
+use crate::test_rng::Rng;
+use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64};
 
 /// Rows every arm pushes, however it splits them.
 const TOTAL_ROWS: usize = 500_000;
-/// Key set of the update arm. Large enough that the store spills and the probe
-/// crosses tiers, small enough that every push after the first few is an update.
+/// Few enough that nearly every push after the first few is an update, many
+/// enough that the store spills and a probe crosses tiers.
 const HOT_KEYS: u64 = 50_000;
+
+/// `rows_per_push`-row pushes of `row(seq) = (pk, weight, payload)` for `seq` in
+/// `0..TOTAL_ROWS`, timed over a store that already holds keys `0..held`.
+struct Arm {
+    label: &'static str,
+    strings: bool,
+    held: u64,
+    rows_per_push: usize,
+    row: Box<dyn FnMut(u64) -> (u64, i64, u64)>,
+}
+
+fn arm(label: &'static str, held: u64, rows_per_push: usize, row: impl FnMut(u64) -> (u64, i64, u64) + 'static) -> Arm {
+    Arm {
+        label,
+        strings: false,
+        held,
+        rows_per_push,
+        row: Box::new(row),
+    }
+}
+
+fn random_key(keys: u64) -> impl FnMut(u64) -> (u64, i64, u64) {
+    let mut rng = Rng::new(0x5EED_1234);
+    move |seq| (rng.gen_range(keys), 1, seq + 1)
+}
+
+/// Pushes of `per` rows each over `seqs`; a string payload is `v` spelled out
+/// long enough to live on the heap.
+fn pushes(
+    schema: &SchemaDescriptor,
+    strings: bool,
+    seqs: std::ops::Range<u64>,
+    per: usize,
+    mut row: impl FnMut(u64) -> (u64, i64, u64),
+) -> Vec<Batch> {
+    let seqs: Vec<u64> = seqs.collect();
+    seqs.chunks(per)
+        .map(|chunk| {
+            let mut bb = BatchBuilder::new(*schema);
+            for &seq in chunk {
+                let (pk, w, v) = row(seq);
+                bb.begin_row(pk as u128, w);
+                if strings {
+                    bb.put_string(&format!("a payload that lives on the heap #{v:>10}"));
+                } else {
+                    bb.put_int(v as u128);
+                }
+                bb.end_row();
+            }
+            bb.finish()
+        })
+        .collect()
+}
 
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
@@ -43,79 +72,97 @@ fn unique_pk_bench() {
     use std::hint::black_box;
     use std::time::Instant;
 
-    let schema = make_schema_u64_i64();
     let dir = tempfile::tempdir().unwrap();
-
-    // Untimed warmup: thread-local batch pool + arena.
-    {
-        let mut t = Table::new(
-            dir.path().join("warm").to_str().unwrap(),
-            schema,
-            RecoverySource::SalReplay,
-            StoreBudgets::default(),
-        )
-        .unwrap();
-        for p in 0..8u64 {
-            let rows: Vec<(u64, i64, i64)> = (0..1000).map(|i| (p * 1000 + i, 1, i as i64)).collect();
-            let eff = enforce_unique_pk(&t, make_batch_raw(&schema, &rows));
-            t.ingest_borrowed_batch(&eff).unwrap();
-        }
-    }
-
-    println!(
-        "{:>8} {:>10} {:>12} {:>12} {:>14}",
-        "arm", "rows", "eff_rows", "ns/row", "ms_total"
-    );
-
-    let arms = [
-        ("insert", 0u64, 1_000usize),
-        ("update", HOT_KEYS, 1_000),
-        ("insert1", 0, 1),
-    ];
-    for &(label, hot, rows_per_push) in arms.iter() {
-        let pushes = TOTAL_ROWS / rows_per_push;
-        // Untimed: build every push up front, so the timed region holds only the
-        // enforcement walk and the store ingest.
-        let mut rng = crate::test_rng::Rng::new(0x5EED_1234);
-        let batches: Vec<Batch> = (0..pushes)
-            .map(|p| {
-                let rows: Vec<(u64, i64, i64)> = (0..rows_per_push)
-                    .map(|i| {
-                        let seq = (p * rows_per_push + i) as u64;
-                        let pk = if hot == 0 { seq } else { rng.gen_range(hot) };
-                        (pk, 1, seq as i64)
-                    })
-                    .collect();
-                make_batch_raw(&schema, &rows)
-            })
-            .collect();
-
-        let mut table = Table::new(
+    let new_table = |label: &str, schema: SchemaDescriptor| {
+        Table::new(
             dir.path().join(label).to_str().unwrap(),
             schema,
             RecoverySource::SalReplay,
             StoreBudgets::default(),
         )
-        .unwrap();
+        .unwrap()
+    };
+    let apply = |t: &mut Table, batches: Vec<Batch>| {
+        for b in batches {
+            let eff = enforce_unique_pk(t, b);
+            t.ingest_borrowed_batch(&eff).unwrap();
+        }
+    };
+
+    // Untimed warmup: thread-local batch pool + arena.
+    let ints = make_schema_u64_i64();
+    apply(
+        &mut new_table("warm", ints),
+        pushes(&ints, false, 0..8000, 1000, |s| (s, 1, s)),
+    );
+
+    let mut shuffled: Vec<u64> = (0..TOTAL_ROWS as u64).collect();
+    let mut rng = Rng::new(0x5EED_1234);
+    for i in (1..shuffled.len()).rev() {
+        shuffled.swap(i, rng.gen_range(i as u64 + 1) as usize);
+    }
+    // Keys are random where they repeat: a monotone stream would warm each
+    // probe's page for the next, which production arrival order does not.
+    let arms = [
+        arm("insert", 0, 1000, |s| (s, 1, s)),
+        arm("insert1", 0, 1, |s| (s, 1, s)),
+        arm("update", 0, 1000, random_key(HOT_KEYS)),
+        arm("update1", HOT_KEYS, 1, random_key(HOT_KEYS)),
+        Arm {
+            strings: true,
+            ..arm("update_str", HOT_KEYS, 1000, random_key(HOT_KEYS))
+        },
+        arm("delete", TOTAL_ROWS as u64, 1000, move |s| {
+            (shuffled[s as usize], -1, 0)
+        }),
+        arm("dupkeys", 0, 1000, random_key(100)),
+        // Ascending blocks of the held keys, each revisit at a larger payload.
+        arm("monotone", HOT_KEYS, 1000, |s| (s % HOT_KEYS, 1, s / HOT_KEYS + 1)),
+    ];
+
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    println!(
+        "{:>10} {:>10} {:>12} {:>12} {:>12}",
+        "arm", "rows", "eff_rows", "ns/row", "instr/row"
+    );
+    for mut arm in arms {
+        let schema = match arm.strings {
+            true => make_schema_pk_u64_payload_string(),
+            false => ints,
+        };
+        let mut table = new_table(arm.label, schema);
+        apply(
+            &mut table,
+            pushes(&schema, arm.strings, 0..arm.held, 1000, |s| (s, 1, 0)),
+        );
+        let batches = pushes(
+            &schema,
+            arm.strings,
+            0..TOTAL_ROWS as u64,
+            arm.rows_per_push,
+            &mut arm.row,
+        );
 
         let mut eff_rows = 0usize;
         let t = Instant::now();
-        for b in batches {
-            let eff = enforce_unique_pk(&table, b);
-            eff_rows += eff.count;
-            table.ingest_borrowed_batch(&eff).unwrap();
-        }
+        let ((), instructions) = counter.measure(|| {
+            for b in batches {
+                let eff = enforce_unique_pk(&table, b);
+                eff_rows += eff.count;
+                table.ingest_borrowed_batch(&eff).unwrap();
+            }
+        });
         let ns = t.elapsed().as_nanos() as f64;
         black_box(&table);
 
-        let rows = (pushes * rows_per_push) as f64;
+        let rows = TOTAL_ROWS as f64;
         println!(
-            "{:>8} {:>10} {:>12} {:>12.1} {:>14.1}",
-            label,
-            rows as u64,
+            "{:>10} {:>10} {:>12} {:>12.1} {:>12.1}",
+            arm.label,
+            TOTAL_ROWS,
             eff_rows,
             ns / rows,
-            ns / 1e6
+            instructions as f64 / rows
         );
     }
 }

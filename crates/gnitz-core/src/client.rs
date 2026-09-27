@@ -61,8 +61,8 @@ pub(crate) fn absent(text: String) -> ClientError {
     ClientError::Refused(WireFault { status: WireStatus::NotFound, text })
 }
 
-/// Build the `-1` retraction batch for `pks`: the server's `retract_pk` matches
-/// by PK alone, so the payload columns are inert filler. Built directly rather
+/// Build the `-1` retraction batch for `pks`: the server's unique-PK rule
+/// retracts by PK alone, so the payload columns are inert filler. Built directly rather
 /// than through `BatchAppender`, which has no way to take a whole `PkColumn`.
 /// Shared by `GnitzClient::delete` and the SQL layer's DELETE RMW retry closure
 /// (which needs the batch without an immediate push).

@@ -90,12 +90,6 @@ pub fn trace_cursor(batch: Batch, schema: SchemaDescriptor) -> ReadCursor {
     ReadCursor::over_batches(&[std::rc::Rc::new(batch)], schema)
 }
 
-/// [`make_batch_opk`] for the single row wide-PK storage/dag tests ingest one
-/// at a time.
-pub fn wide_row(schema: &SchemaDescriptor, pk: &[u8], w: i64, val: i64) -> Batch {
-    make_batch_opk(schema, &[(pk, w, val)])
-}
-
 /// Read row `i`'s PK out of a raw `stride`-wide OPK region as its native
 /// unsigned value — the read-back twin of `Batch::extend_pk` for tests that
 /// inspect a scatter/merge destination buffer directly.
@@ -109,6 +103,16 @@ pub fn opk_pk_i64(opk_bytes: &[u8]) -> i64 {
     let mut le = [0u8; 8];
     gnitz_wire::decode_pk_column(&opk_bytes[..8], TypeCode::I64, &mut le);
     i64::from_le_bytes(le)
+}
+
+/// Payload column 0 of row `row`, an 8-byte integer.
+pub fn payload0_i64<S: gnitz_expr::RowSource>(src: &S, row: usize) -> i64 {
+    i64::from_le_bytes(src.get_col_ptr(row, 0, 8).try_into().unwrap())
+}
+
+/// [`payload0_i64`] of a located store row.
+pub fn stored_payload0_i64(fr: &crate::storage::StoredRow) -> i64 {
+    payload0_i64(&fr.run, fr.row)
 }
 
 /// Read a German-string payload cell (16-byte struct at payload `col`, `row`)
