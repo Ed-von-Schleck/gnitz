@@ -1,6 +1,6 @@
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::{payload0_i64, pk_payload_schema, u64_pk_schema, wide_pk_3xu64_schema};
+use crate::test_support::{pk_payload_schema, wide_pk_3xu64_schema};
 use gnitz_expr::payload_string;
 
 #[test]
@@ -51,58 +51,6 @@ fn write_to_batch_narrow_pk_odd_rowcount_round_trips() {
             );
         }
     }
-}
-
-// U64 PK + a *nullable* I64 payload, so a row can carry a set null bit over
-// non-zero bytes — the null-canonicalization case the trust strip protects.
-fn append_test_row(b: &mut Batch, pk: u128, w: i64, val: i64, null_word: u64) {
-    b.extend_pk(pk);
-    b.extend_weight(&w.to_le_bytes());
-    b.extend_null_bmp(&null_word.to_le_bytes());
-    b.extend_col(0, &val.to_le_bytes());
-    b.count += 1;
-}
-
-/// A deliberately corrupt, unsorted batch: a duplicate `(PK, payload)` pair
-/// and a `+1`/`-1` ghost pair at non-adjacent positions, plus a NULL payload
-/// cell whose underlying bytes are non-zero. Used to exercise both the strip
-/// (real consolidation) and the debug verifier that rejects a spoofed-flag
-/// version of it.
-fn build_corrupt_batch(schema: &SchemaDescriptor) -> Batch {
-    let mut b = Batch::with_capacity(schema, 5);
-    append_test_row(&mut b, 5, 1, 100, 0); // dup A
-    append_test_row(&mut b, 1, 1, 7, 0); // ghost +
-    append_test_row(&mut b, 9, 1, -1, 1); // NULL cell over non-zero (0xFF..) bytes
-    append_test_row(&mut b, 5, 1, 100, 0); // dup B (non-adjacent to A)
-    append_test_row(&mut b, 1, -1, 7, 0); // ghost - (non-adjacent to +)
-    b
-}
-
-/// The trust-boundary strip's mechanism, exercised directly on
-/// `into_consolidated` (no server). Clearing the flags — what `handle_message`
-/// does to every client batch — forces a real sort+fold: the duplicate sums to
-/// `+2`, the ghost is dropped, the output is `(PK, payload)`-sorted, and the
-/// NULL cell stays NULL. A spoof that instead *keeps* the flags set on this
-/// corrupt data is rejected by the debug consumer-side verifier.
-#[test]
-fn into_consolidated_strip_forces_real_consolidation() {
-    let schema = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
-    // `build_corrupt_batch` yields a `Raw` batch (the constructor default), so
-    // `into_consolidated` runs a real sort+fold — the strip's mechanism.
-    let clean = build_corrupt_batch(&schema);
-    let clean = clean.into_consolidated(&schema);
-
-    // Ghost eliminated and duplicate folded → 2 surviving rows, (PK,payload)-sorted.
-    assert_eq!(clean.count, 2, "ghost dropped, duplicate folded");
-    assert_eq!(clean.get_pk(0), 5);
-    assert_eq!(clean.get_pk(1), 9);
-    // PK 5: the non-adjacent duplicate summed to +2; value intact; not null.
-    assert_eq!(clean.get_weight(0), 2, "duplicate (PK,payload) folds to +2");
-    assert_eq!(payload0_i64(&clean, 0), 100);
-    assert_eq!(clean.get_null_word(0) & 1, 0);
-    // PK 9: the NULL cell still decodes as NULL (null bit preserved).
-    assert_eq!(clean.get_weight(1), 1);
-    assert_eq!(clean.get_null_word(1) & 1, 1, "null cell stays NULL");
 }
 
 #[test]
@@ -318,25 +266,27 @@ fn honest_sorted_consolidated_batch_passes_verifiers() {
     assert_eq!(cb.count, 3, "A: honest consolidated batch passes through");
 }
 
-// Layout lifecycle: constructors default `Raw`; `extend_*` never raises;
+// Layout lifecycle: constructors default `Raw`; appending rows never raises;
 // `certify_layout` raises; any append downgrades to `Raw`; `clear()`
 // resets to `Raw`.
 #[test]
 fn layout_lifecycle_default_raise_and_lower() {
-    let schema = crate::test_support::pk_payload_schema(&[TypeCode::U64]);
-    let mut b = Batch::with_capacity(&schema, 4);
-    assert_eq!(b.layout(), Layout::Raw, "constructor defaults Raw");
-    append_test_row(&mut b, 1, 1, 10, 0);
-    append_test_row(&mut b, 2, 1, 20, 0);
-    assert_eq!(b.layout(), Layout::Raw, "extend_* never raises the layout");
+    use crate::test_support::{make_batch_raw, make_schema_u64_i64};
+    let schema = make_schema_u64_i64();
+    assert_eq!(
+        Batch::with_capacity(&schema, 4).layout(),
+        Layout::Raw,
+        "constructor defaults Raw"
+    );
+    let mut b = make_batch_raw(&schema, &[(1, 1, 10), (2, 1, 20)]);
+    assert_eq!(b.layout(), Layout::Raw, "appending rows never raises the layout");
 
     // Genuinely (PK, payload)-sorted, ghost-free → certify Consolidated.
     b.certify_layout(Layout::Consolidated);
     assert!(b.is_consolidated());
 
     // Any append downgrades all the way to Raw (the W2M-class fail-safe).
-    let mut src = Batch::with_capacity(&schema, 1);
-    append_test_row(&mut src, 3, 1, 30, 0);
+    let src = make_batch_raw(&schema, &[(3, 1, 30)]);
     b.append_batch(&src, 0, 1);
     assert_eq!(b.layout(), Layout::Raw, "append downgrades to Raw");
 

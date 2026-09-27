@@ -168,7 +168,7 @@ fn avi_entries<const HAS_WIDE: bool>(delta: &Batch, bake: &AviBake) -> Batch {
             match kind {
                 ImageKind::Scalar(kind) => {
                     let image = scalar_image(&loc, kind, max, &mb, row).to_be_bytes();
-                    out.push_zero_filled_row(bake.entry(key, j as u8, &image), weight, 0);
+                    out.push_zero_filled_row(bake.entry(key, j as u8, &image), weight);
                 }
                 ImageKind::Wide(kind) => {
                     let entry = WideEntry {
@@ -221,7 +221,7 @@ impl WideEntry<'_> {
         match kind {
             WideKind::Fixed(_) => {
                 let image = int16_image(loc, max, mb, row);
-                out.push_zero_filled_row(bake.entry(key, ord, &image), weight, 0);
+                out.push_zero_filled_row(bake.entry(key, ord, &image), weight);
             }
             WideKind::Bytes => {
                 image.clear();

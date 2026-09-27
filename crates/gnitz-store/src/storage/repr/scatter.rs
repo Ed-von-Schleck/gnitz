@@ -100,9 +100,6 @@ pub(crate) fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut Direc
                 writer.write_string_cell(pi, src_struct, batch.blob, base + out);
             }
         } else {
-            // The null *bit* governs what a cell means, so the value bytes are
-            // copied unconditionally — no per-row null test, letting `gather_col`
-            // vectorize. A null cell's bytes are never read back as a value.
             let src_col = batch.col_data(pi, cs);
             let dst_col = &mut writer.col_bufs[pi][base * cs..];
             width_dispatch!(cs, gather_col, src_col, dst_col, indices);

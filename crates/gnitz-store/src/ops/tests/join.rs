@@ -733,11 +733,12 @@ fn make_range_batch(schema: &SchemaDescriptor, rows: &[(Vec<u64>, u64, i64, i64)
         vals.push(*range as u128);
         b.extend_pk_opk(&vals);
         b.extend_weight(&w.to_le_bytes());
-        let null_word = u64::from(wide && *val < 0) << 1;
-        b.extend_null_bmp(&null_word.to_le_bytes());
+        let null = wide && *val < 0;
+        b.extend_null_bmp(&(u64::from(null) << 1).to_le_bytes());
         b.extend_col(0, &val.to_le_bytes());
         if wide {
-            b.extend_col(1, &val.wrapping_mul(3).to_le_bytes());
+            let nullable = if null { 0 } else { val.wrapping_mul(3) };
+            b.extend_col(1, &nullable.to_le_bytes());
             let s = FIXTURE_STRINGS[val.rem_euclid(FIXTURE_STRINGS.len() as i64) as usize];
             b.extend_col_blob(2, s);
         }

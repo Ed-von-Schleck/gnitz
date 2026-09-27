@@ -31,7 +31,7 @@ pub fn op_reduce(
 
     if delta.count == 0 {
         // An empty source delivers only empty deltas, so the ground row is minted
-        // here: by the one worker owning V₀, and only while no V₀ row is stored.
+        // here, by a worker `seeds_ground` names, and only while no V₀ row is stored.
         if plan.seeds_ground {
             let v0 = shape.key.ground_pk();
             if !trace_out_cursor.seek_pk_group_ascending(v0.bytes()) {
@@ -106,8 +106,7 @@ pub fn op_reduce(
         if accs[plan.cardinality].count_value() > 0 {
             emit_reduce_row(&mut out, Some((&mb, first, shape.key.carried())), out_pk_bytes, &accs);
         } else if plan.seeds_ground {
-            // An emptied global aggregate still publishes one row. The empty-key
-            // scatter sends every row of a ground reduce to V₀'s owner.
+            // An emptied global aggregate still publishes one row.
             emit_reduce_row(&mut out, None, out_pk_bytes, &shape.acc_template);
         }
         consolidate_group(&mut out, output_schema, mark);

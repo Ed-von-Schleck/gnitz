@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::ops::Range;
 
 use crate::schema::{ColumnLocator, TypeCode};
-use crate::storage::MemBatch;
+use crate::storage::{Batch, MemBatch};
 use gnitz_expr::RowSource;
 use gnitz_wire::{AggFunc, FixedInt, ScalarKind};
 
@@ -112,12 +112,6 @@ impl Accumulator {
             self.kind,
             StepKind::Count | StepKind::CountNonNull | StepKind::Sum(ScalarKind::Int(_))
         )
-    }
-
-    /// Width of this aggregate's output column — the emitted value's truncation.
-    #[inline(always)]
-    pub(super) fn out_size(&self) -> usize {
-        self.out.size()
     }
 
     /// This aggregate's value-index parameters, or `None` for a linear one.
@@ -315,6 +309,25 @@ impl Accumulator {
     /// Fold in this aggregate's value from a previously-emitted output row.
     pub(super) fn fold_stored(&mut self, out_row: &impl RowSource, row: usize) {
         self.apply(self.merge, self.out, out_row, row, 1);
+    }
+
+    /// Write this aggregate into its column of the row `out` has open; `None` from
+    /// [`Self::value`] renders NULL.
+    #[inline]
+    pub(super) fn emit(&self, out: &mut Batch, null_word: &mut u64) {
+        let ColumnLocator::Payload { slot, size, .. } = self.out else {
+            unreachable!("an aggregate is a payload column")
+        };
+        let pi = slot as usize;
+        match self.value() {
+            None => {
+                gnitz_wire::null_word_set(null_word, pi, true);
+                out.fill_col_zero(pi);
+            }
+            Some(AggValue::Bits(bits)) => out.extend_col(pi, &bits.to_le_bytes()[..size as usize]),
+            Some(AggValue::Wide(WideKind::Bytes, v)) => out.extend_col_blob(pi, v),
+            Some(AggValue::Wide(WideKind::Fixed(_), v)) => out.extend_col(pi, v),
+        }
     }
 
     #[inline(always)]

@@ -294,8 +294,8 @@ pub fn op_join_delta_trace(
             output.begin_row(pk, w_out);
 
             let d_null = delta_mb.get_null_word(i);
-            output.append_payload_cols(d_slots.clone(), out_schema, &delta_mb, i, d_null, cache.get_mut());
-            output.append_payload_cols(t_slots.clone(), out_schema, t_src, t_row, t_null, cache.get_mut());
+            output.append_payload_cols(d_slots.clone(), &delta_mb, i, cache.get_mut());
+            output.append_payload_cols(t_slots.clone(), t_src, t_row, cache.get_mut());
             // Each half's null bits rebase onto the slot its columns landed at.
             output.commit_row(t_bits | null_word_at(d_null, d_slots.start));
         }

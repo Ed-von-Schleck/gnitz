@@ -2,10 +2,10 @@ use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::pk_only_schema;
 
-/// Two rows both NULL in an `I64` payload column, carrying DIFFERENT bytes under
-/// the null bit. [`compare_rows`] reads `null == null` and makes them one element;
-/// [`FixedIntNonnull`] never reads the null word and splits them by
-/// the garbage — which is why a nullable schema must resolve to `Generic`.
+/// A NULL and a non-null `0` in an `I64` payload column: the same bytes, since a
+/// NULL cell is zeroed. [`compare_rows`] reads the null bit and orders them apart;
+/// [`FixedIntNonnull`] never reads the null word and calls them one element —
+/// which is why a nullable schema must resolve to `Generic`.
 #[test]
 fn null_equality_separates_the_two_payload_comparators() {
     use crate::storage::Batch;
@@ -14,25 +14,24 @@ fn null_equality_separates_the_two_payload_comparators() {
     let nullable = SchemaDescriptor::new(&[pk, SchemaColumn::new(TypeCode::I64, true)], &[0]);
     let non_null = SchemaDescriptor::new(&[pk, SchemaColumn::new(TypeCode::I64, false)], &[0]);
 
-    // Same PK, both NULL, different bytes under the null bit.
     let mut pair = Batch::with_capacity(&nullable, 2);
-    for garbage in [0x5555_5555_5555_5555u64 as i64, 0xAAAA_AAAA_AAAA_AAAAu64 as i64] {
+    for null_word in [1u64, 0] {
         pair.extend_pk(0x1234_5678_9abc_def0);
         pair.extend_weight(&1i64.to_le_bytes());
-        pair.extend_null_bmp(&1u64.to_le_bytes()); // payload col 0 → NULL
-        pair.extend_col(0, &garbage.to_le_bytes());
+        pair.extend_null_bmp(&null_word.to_le_bytes());
+        pair.extend_col(0, &0i64.to_le_bytes());
         pair.count += 1;
     }
 
     assert_eq!(
         compare_rows(&nullable, &pair, 0, &pair, 1),
-        Ordering::Equal,
-        "null-aware: two NULL cells are one element whatever lies under the bit",
+        Ordering::Less,
+        "null-aware: NULL sorts before a non-null 0",
     );
-    assert_ne!(
+    assert_eq!(
         FixedIntNonnull.compare(&non_null, &pair, 0, &pair, 1),
         Ordering::Equal,
-        "null-blind: the fixed-int comparator orders by the garbage bytes",
+        "null-blind: the fixed-int comparator sees two zero cells",
     );
 }
 

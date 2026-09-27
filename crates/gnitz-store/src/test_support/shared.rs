@@ -235,7 +235,7 @@ pub fn pk_only_schema(types: &[TypeCode]) -> SchemaDescriptor {
 pub fn batch_of_pk_bytes(schema: &SchemaDescriptor, pks: &[impl AsRef<[u8]>]) -> Batch {
     let mut b = Batch::with_capacity(schema, pks.len().max(1));
     for pk in pks {
-        b.push_zero_filled_row(pk.as_ref(), 1, 0);
+        b.push_zero_filled_row(pk.as_ref(), 1);
     }
     b
 }

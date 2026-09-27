@@ -51,7 +51,7 @@ impl AdhocFold {
         let mut accs = Vec::new();
         if shape.key.is_global() {
             // A global fold's one group exists over no input: every worker emits it.
-            emit_reduce_row(&mut groups, None, shape.key.ground_pk().bytes(), &[]);
+            groups.push_key_row(shape.key.ground_pk().bytes(), 1);
             accs.extend_from_slice(&shape.acc_template);
         }
         Ok(AdhocFold {

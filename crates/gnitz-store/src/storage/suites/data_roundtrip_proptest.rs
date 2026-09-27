@@ -109,7 +109,7 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
         for (pi, col) in schema.payload_columns() {
             let cs = col.size() as usize;
             if gnitz_wire::null_word_get(nw, pi) {
-                batch.fill_col_zero(pi, cs); // null cell; zset_of won't read it
+                batch.fill_col_zero(pi);
             } else if col.type_code.is_german_string() {
                 batch.extend_col_blob(pi, &arb_string(&mut rng));
             } else {

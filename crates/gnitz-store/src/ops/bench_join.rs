@@ -97,14 +97,11 @@ fn build(schema: &SchemaDescriptor, p: Payload, rows: &[Row]) -> Batch {
     for (i, (pk, ord)) in rows.iter().enumerate() {
         b.extend_pk_opk(pk);
         b.extend_weight(&1i64.to_le_bytes());
-        let null_word = match p {
-            Payload::Nullable if i % 4 == 0 => 1u64 << 1,
-            _ => 0,
-        };
+        let null = matches!(p, Payload::Nullable) && i % 4 == 0;
         b.extend_col(0, &ord.to_le_bytes());
         match p {
             Payload::Int => {}
-            Payload::Nullable => b.extend_col(1, &(ord * 7).to_le_bytes()),
+            Payload::Nullable => b.extend_col(1, &if null { 0 } else { ord * 7 }.to_le_bytes()),
             Payload::Str => {
                 // Only a handful of distinct long strings, so the dedup cache
                 // has repeated spans to collapse — the shape a fan-out join
@@ -113,7 +110,7 @@ fn build(schema: &SchemaDescriptor, p: Payload, rows: &[Row]) -> Batch {
                 b.extend_col_blob(1, s.as_bytes());
             }
         }
-        b.commit_row(null_word);
+        b.commit_row(u64::from(null) << 1);
     }
     b.certify_layout(Layout::Consolidated);
     b

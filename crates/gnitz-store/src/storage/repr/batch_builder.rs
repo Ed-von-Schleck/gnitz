@@ -138,8 +138,7 @@ impl BatchBuilder {
 
     /// Put a NULL value for the current payload column.
     pub fn put_null(&mut self) {
-        let col_size = self.schema().columns[self.physical_col_idx()].size() as usize;
-        self.batch.fill_col_zero(self.curr_col, col_size);
+        self.batch.fill_col_zero(self.curr_col);
         gnitz_wire::null_word_set(&mut self.curr_null_word, self.curr_col, true);
         self.curr_col += 1;
     }

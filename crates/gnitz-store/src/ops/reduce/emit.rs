@@ -1,28 +1,8 @@
 //! The reduce output row emitter.
 
-use super::super::order_image::WideKind;
-use super::agg::{Accumulator, AggValue};
+use super::agg::Accumulator;
 use crate::schema::ColumnLocator;
 use crate::storage::{Batch, MemBatch};
-
-/// Emit one aggregate column: the value truncated to the column width, or NULL.
-#[inline]
-fn emit_agg_col(output: &mut Batch, acc: &Accumulator, out_pi: usize, null_word: &mut u64) {
-    let cs = acc.out_size();
-    let Some(value) = acc.value() else {
-        gnitz_wire::null_word_set(null_word, out_pi, true);
-        output.fill_col_zero(out_pi, cs);
-        return;
-    };
-    match value {
-        AggValue::Bits(bits) => output.extend_col(out_pi, &bits.to_le_bytes()[..cs]),
-        AggValue::Wide(WideKind::Bytes, v) => output.extend_col_blob(out_pi, v),
-        AggValue::Wide(WideKind::Fixed(_), v) => {
-            debug_assert_eq!(v.len(), cs, "a 16-byte extreme fills its output column");
-            output.extend_col(out_pi, v);
-        }
-    }
-}
 
 /// Emit one `[key…, group columns…, aggregates…]` row at weight +1, copying the
 /// group columns from `group`'s row at its locators; the ground row has none.
@@ -34,15 +14,11 @@ pub(super) fn emit_reduce_row(
 ) {
     output.begin_row(out_pk_bytes, 1);
     let mut null_word: u64 = 0;
-    let mut base = 0;
     if let Some((src, row, locs)) = group {
-        for (out_pi, loc) in locs.iter().enumerate() {
-            output.append_cell_from(out_pi, loc, src, row, &mut null_word);
-        }
-        base = locs.len();
+        output.append_cells_from(0, locs, src, row, &mut null_word);
     }
-    for (k, acc) in accs.iter().enumerate() {
-        emit_agg_col(output, acc, base + k, &mut null_word);
+    for acc in accs {
+        acc.emit(output, &mut null_word);
     }
     output.commit_row(null_word);
 }

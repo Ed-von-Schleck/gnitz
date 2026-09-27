@@ -643,13 +643,18 @@ impl Batch {
         self.capacity = new_cap;
     }
 
-    /// Write data into region `r` at the current row position.
-    /// Auto-grows capacity if needed.  Strides must be set at construction —
-    /// use `empty_with_schema` or `with_capacity`.
-    ///
-    /// Grows *before* it writes, and `count` moves only at `commit_row`, so
-    /// within one row only the first region write can grow — which is why no
-    /// appender pre-reserves and why a grow cannot strand a half-written row.
+    /// The current row's `len` bytes of region `r`, growing first if the row is
+    /// past capacity.
+    #[inline(always)]
+    fn row_cell_mut(&mut self, r: usize, len: usize) -> &mut [u8] {
+        if self.count >= self.capacity {
+            self.reserve_rows(1);
+        }
+        let off = self.offsets[r] + self.count * self.strides[r] as usize;
+        &mut self.data[off..off + len]
+    }
+
+    /// Write `src` into region `r` at the current row position.
     #[inline(always)]
     fn extend_region(&mut self, r: usize, src: &[u8]) {
         debug_assert_eq!(
@@ -660,11 +665,7 @@ impl Batch {
             self.strides[r],
             r
         );
-        if self.count >= self.capacity {
-            self.reserve_rows(1);
-        }
-        let off = self.offsets[r] + self.count * self.strides[r] as usize;
-        self.data[off..off + src.len()].copy_from_slice(src);
+        self.row_cell_mut(r, src.len()).copy_from_slice(src);
     }
 
     #[inline]
@@ -744,20 +745,19 @@ impl Batch {
             0,
             "push_key_row is the payload-free schema; use push_zero_filled_row or BatchBuilder",
         );
-        self.push_zero_filled_row(pk, weight, 0);
+        self.push_zero_filled_row(pk, weight);
     }
 
     /// Append one row whose payload carries no value: the PK region from `pk`
-    /// (exactly `pk_stride` OPK bytes), `weight`, `null_word`, then every payload
-    /// column zero-filled. The payload-free case is [`Self::push_key_row`].
+    /// (exactly `pk_stride` OPK bytes), `weight`, then every payload column
+    /// zero-filled. The payload-free case is [`Self::push_key_row`].
     #[inline(always)]
-    pub fn push_zero_filled_row(&mut self, pk: &[u8], weight: i64, null_word: u64) {
+    pub fn push_zero_filled_row(&mut self, pk: &[u8], weight: i64) {
         self.begin_row(pk, weight);
         for pi in 0..self.num_payload_cols() {
-            let width = self.strides[REG_PAYLOAD_START + pi] as usize;
-            self.fill_col_zero(pi, width);
+            self.fill_col_zero(pi);
         }
-        self.commit_row(null_word);
+        self.commit_row(0);
     }
 
     /// Append a row's PK from native per-column values, OPK-encoding them
@@ -774,15 +774,12 @@ impl Batch {
         self.extend_pk_bytes(self.schema.opk_key_cols(native_col_vals).pk_bytes());
     }
 
-    /// Fill `nbytes` of zeros at the current row position in a payload column.
+    /// Zero-fill payload column `pi` at the current row position.
     #[inline]
-    pub(crate) fn fill_col_zero(&mut self, pi: usize, nbytes: usize) {
+    pub(crate) fn fill_col_zero(&mut self, pi: usize) {
         let r = REG_PAYLOAD_START + pi;
-        if self.count >= self.capacity {
-            self.reserve_rows(1);
-        }
-        let off = self.offsets[r] + self.count * self.strides[r] as usize;
-        self.data[off..off + nbytes].fill(0);
+        let width = self.strides[r] as usize;
+        self.row_cell_mut(r, width).fill(0);
     }
 
     /// Bulk-copy a range of rows from `src_region_data` into region `r`.
@@ -1087,9 +1084,8 @@ impl Batch {
         self.layout = layout;
     }
 
-    /// Debug-only: no row sets a null bit under a payload column `schema`
-    /// declares NOT NULL. Release checks this only at client decode; readers
-    /// that trust the declaration rely on it for every batch the engine builds.
+    /// Debug-only: every null bit sits under a payload column `schema` declares
+    /// nullable, over a zeroed cell — what wire ingress checks in release.
     #[cfg(debug_assertions)]
     fn debug_verify_null_bits(&self, schema: &SchemaDescriptor) {
         let violation = gnitz_wire::first_not_null_violation(schema.not_null_payload_slots(), self.null_bmp_data());
@@ -1097,6 +1093,12 @@ impl Batch {
             violation.is_none(),
             "batch sets a null bit under a payload column the operating schema declares \
              NOT NULL: (row, payload slot) = {violation:?} of {} rows",
+            self.count,
+        );
+        let valued = super::batch_wire::first_valued_null_cell(&self.as_mem_batch(), schema);
+        debug_assert!(
+            valued.is_none(),
+            "batch holds a non-zero cell under a null bit: (row, payload slot) = {valued:?} of {} rows",
             self.count,
         );
     }
@@ -1282,9 +1284,7 @@ impl Batch {
         let mut output = self.shell_for(in_schema, out_schema, first_slot);
         output.pk_data_mut().copy_from_slice(self.pk_data());
 
-        // Zeroing just the appended columns keeps every counted row fully written
-        // without provisioning the whole arena zeroed (`Batch::with_capacity`).
-        // Nothing reads the value: every reader decides on the null bit.
+        // The appended columns are NULL, and a NULL cell is zeroed.
         let new_slots = match nulls_first {
             true => 0..n_new,
             false => in_npc..out_npc,
@@ -1546,110 +1546,78 @@ impl Batch {
         weight: i64,
         source: &S,
         row: usize,
-        mut blob_cache: Option<&mut BlobCache>,
+        blob_cache: Option<&mut BlobCache>,
     ) {
         if weight == 0 {
             return;
         }
         self.begin_row(source.get_pk_bytes(row), weight);
-        let null_word = source.get_null_word(row);
-        let src_blob = source.blob();
-        let num_payload = self.schema.num_payload_cols();
-        for pi in 0..num_payload {
-            let col = {
-                let s = &self.schema;
-                s.columns[s.payload_col_idx(pi)]
-            };
-            let cs = col.size() as usize;
-            let cell = (!gnitz_wire::null_word_get(null_word, pi)).then(|| source.get_col_ptr(row, pi, cs));
-            self.append_payload_cell(pi, col.type_code, cs, cell, src_blob, blob_cache.as_deref_mut());
-        }
-
-        self.commit_row(null_word);
+        self.append_payload_cols(0..self.schema.num_payload_cols(), source, row, blob_cache);
+        self.commit_row(source.get_null_word(row));
     }
 
-    /// Append one source row's payload columns into this batch's output slots
-    /// `out`, typed by `schema` and fed from source slot `out_pi - out.start`,
-    /// relocating German strings into `self.blob`. `null_word` is the
-    /// **source-side** null word; a null column zero-fills its slot. The join is
-    /// the sole caller, appending each half at that half's own slot range. Does
-    /// not bump `count` or touch the layout. `#[inline]` — no per-row cross-file
-    /// call boundary.
+    /// Append `src`'s row `row` payload columns into output slots `out`, fed from
+    /// source slot `out_pi - out.start`.
     #[inline]
     pub(crate) fn append_payload_cols<S: RowSource>(
         &mut self,
         out: Range<usize>,
-        schema: &SchemaDescriptor,
         src: &S,
         row: usize,
-        null_word: u64,
         mut blob_cache: Option<&mut BlobCache>,
     ) {
         let src_blob = src.blob();
         let base = out.start;
         for out_pi in out {
-            let col = schema.columns[schema.payload_col_idx(out_pi)];
-            let pi = out_pi - base;
-            let cs = col.size() as usize;
-            let is_null = gnitz_wire::null_word_get(null_word, pi);
-            let cell = (!is_null).then(|| src.get_col_ptr(row, pi, cs));
-            self.append_payload_cell(out_pi, col.type_code, cs, cell, src_blob, blob_cache.as_deref_mut());
+            let col = self.schema.columns[self.schema.payload_col_idx(out_pi)];
+            let cell = src.get_col_ptr(row, out_pi - base, col.size() as usize);
+            self.append_payload_cell(out_pi, col.type_code, cell, src_blob, blob_cache.as_deref_mut());
         }
     }
 
-    /// Append one payload cell into output slot `out_pi` — the single
-    /// null/German-string/plain copy body every payload-cell writer shares.
-    /// `src_cell` is the source cell's at-rest bytes (`size` wide; the 16-byte
-    /// struct for STRING/BLOB), or `None` for a NULL cell (zero-fills the
-    /// slot). STRING/BLOB structs are relocated into `self.blob` against
-    /// `src_blob`; everything else copies verbatim. Does not bump `count`,
-    /// touch the null word, or change the layout.
-    #[inline]
+    /// Append `cell` into output slot `out_pi`, relocating a STRING/BLOB struct
+    /// into `self.blob` against `src_blob`.
+    #[inline(always)]
     pub(crate) fn append_payload_cell(
         &mut self,
         out_pi: usize,
         type_code: TypeCode,
-        size: usize,
-        src_cell: Option<&[u8]>,
+        cell: &[u8],
         src_blob: &[u8],
         blob_cache: Option<&mut BlobCache>,
     ) {
-        match src_cell {
-            None => self.fill_col_zero(out_pi, size),
-            Some(cell) if type_code.is_german_string() => {
-                let dest = relocate_german_string_vec(cell, src_blob, &mut self.blob, blob_cache);
-                self.extend_col(out_pi, &dest);
-            }
-            Some(cell) => self.extend_col(out_pi, cell),
+        if type_code.is_german_string() {
+            let dest = relocate_german_string_vec(cell, src_blob, &mut self.blob, blob_cache);
+            self.extend_col(out_pi, &dest);
+        } else {
+            self.extend_col(out_pi, cell);
         }
     }
 
-    /// Append the column at `loc` of `src`'s row into output slot `out_pi`,
-    /// setting its bit in `null_word` when NULL. A PK source is *decoded* out of
-    /// its OPK window: a raw copy would carry the flipped sign bit and
-    /// big-endian order into the payload region.
-    #[inline]
-    pub(crate) fn append_cell_from<S: RowSource>(
+    /// Append the columns at `locs` of `src`'s row into output slots `first..`,
+    /// setting each NULL one's bit in `null_word`.
+    #[inline(always)]
+    pub(crate) fn append_cells_from<S: RowSource>(
         &mut self,
-        out_pi: usize,
-        loc: &ColumnLocator,
+        first: usize,
+        locs: &[ColumnLocator],
         src: &S,
         row: usize,
         null_word: &mut u64,
     ) {
-        match *loc {
-            ColumnLocator::Pk { .. } => {
-                let mut scratch = [0u8; 16];
-                self.extend_col(out_pi, loc.native_le_bytes(src, row, &mut scratch));
-            }
-            ColumnLocator::Payload { slot, size, type_code } => {
-                let cs = size as usize;
-                let is_null = loc.is_null(src, row);
-                if is_null {
-                    gnitz_wire::null_word_set(null_word, out_pi, true);
+        for (out_pi, loc) in (first..).zip(locs) {
+            match *loc {
+                ColumnLocator::Pk { .. } => {
+                    let mut scratch = [0u8; 16];
+                    self.extend_col(out_pi, loc.native_le_bytes(src, row, &mut scratch));
                 }
-                let cell = (!is_null).then(|| src.get_col_ptr(row, slot as usize, cs));
-                self.append_payload_cell(out_pi, type_code, cs, cell, src.blob(), None);
+                ColumnLocator::Payload { slot, size, type_code } => {
+                    if loc.is_null(src, row) {
+                        gnitz_wire::null_word_set(null_word, out_pi, true);
+                    }
+                    let cell = src.get_col_ptr(row, slot as usize, size as usize);
+                    self.append_payload_cell(out_pi, type_code, cell, src.blob(), None);
+                }
             }
         }
     }

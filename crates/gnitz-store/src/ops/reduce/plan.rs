@@ -29,7 +29,6 @@ impl ReduceShape {
         aggs: &[AggDescriptor],
     ) -> Result<Self, OpBuildErr> {
         let over = |e: SchemaBound| OpBuildErr::shape(format!("reduce: output {e}"));
-        // Nullability covers what `emit_agg_col` writes.
         for d in aggs {
             let src = input
                 .column(d.col_idx as usize)

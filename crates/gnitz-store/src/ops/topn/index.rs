@@ -139,9 +139,7 @@ impl TopNIndex {
                 out.extend_col_blob(i, &image);
             }
             let mut null_word = 0u64;
-            for (pi, loc) in carried.iter().enumerate() {
-                out.append_cell_from(k + pi, loc, &mb, row, &mut null_word);
-            }
+            out.append_cells_from(k, carried, &mb, row, &mut null_word);
             out.commit_row(null_word);
         });
         out

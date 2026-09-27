@@ -792,16 +792,13 @@ fn wide_consolidate_prefix_collision_and_identical_payload() {
 // `run_merge` + `scatter_unified_sources` is the tree's only column-at-a-time
 // materializer, and this is its adversarial exercise: a schema of two
 // German-string columns plus a nullable int, over runs carrying long / inline /
-// empty / duplicate strings, a null STRING cell, and garbage-under-null cells.
+// empty / duplicate strings, and null STRING and int cells.
 // The oracle is the same argsort-fold-drop-ghosts reference `consolidate_*`
 // checks against, generalized to this schema and run over the runs'
 // concatenation, so it shares no code with the merge it judges.
 //
-// The garbage-under-null cells are load-bearing: the columnar copy takes a null
-// cell's source bytes verbatim, so raw bytes legitimately differ from the
-// oracle's while the decoded value must not — the null bit governs. Every
-// assertion is therefore on decoded content, never on raw blob/struct bytes
-// (which also differ once two STRING columns spill into one heap).
+// Every assertion is on decoded content, never on raw blob/struct bytes: those
+// differ once two STRING columns spill into one heap.
 // -----------------------------------------------------------------------
 mod merge_materialize_vs_reference {
     use super::*;
@@ -810,19 +807,13 @@ mod merge_materialize_vs_reference {
     enum S {
         /// Non-null value with this content.
         V(Vec<u8>),
-        /// Null cell, zeroed struct (the normal in-tree shape).
         Null,
-        /// Null cell whose 16-byte struct carries these non-zero bytes — the
-        /// invariant-violating shape the columnar copy must still decode to
-        /// NULL via the null bit.
-        NullGarbage([u8; 16]),
     }
 
     /// A payload cell for the nullable fixed-width int column.
     enum I {
         V(i64),
         Null,
-        NullGarbage(i64),
     }
 
     struct RowSpec {
@@ -840,10 +831,6 @@ mod merge_materialize_vs_reference {
                 gnitz_wire::null_word_set(nw, pi, true);
                 [0u8; 16]
             }
-            S::NullGarbage(st) => {
-                gnitz_wire::null_word_set(nw, pi, true);
-                *st
-            }
         }
     }
 
@@ -853,10 +840,6 @@ mod merge_materialize_vs_reference {
             I::Null => {
                 gnitz_wire::null_word_set(nw, pi, true);
                 [0u8; 8]
-            }
-            I::NullGarbage(v) => {
-                gnitz_wire::null_word_set(nw, pi, true);
-                v.to_le_bytes()
             }
         }
     }
@@ -1027,13 +1010,6 @@ mod merge_materialize_vs_reference {
     /// same survivors drive both the stride-16 (single U128 PK) and stride-24
     /// (compound 3×U64 PK → scatter dynamic arm) schemas.
     fn build_dataset(schema: &SchemaDescriptor, pk: impl Fn(u64) -> Vec<u8>) -> Vec<Batch> {
-        // Inline-garbage struct under a null STRING cell: length 5, non-zero
-        // prefix — relocates inline (no blob touch), so the columnar copy carries
-        // the bytes through verbatim and the row must still decode NULL.
-        let mut sgarbage = [0u8; 16];
-        sgarbage[0..4].copy_from_slice(&5u32.to_le_bytes());
-        sgarbage[4..9].copy_from_slice(b"GARBG");
-
         let a = build_run(
             schema,
             vec![
@@ -1091,12 +1067,12 @@ mod merge_materialize_vs_reference {
                     w: 1,
                     c0: S::V(b"last".to_vec()),
                     c1: S::Null,
-                    c2: I::NullGarbage(0x7777_7777_7777_7777),
+                    c2: I::Null,
                 },
             ],
         );
-        // Run C carries the garbage-under-null cells; its pk=40 cancels Run A's
-        // (net zero → dropped).
+        // Run C carries the null STRING cell; its pk=40 cancels Run A's (net
+        // zero → dropped).
         let c = build_run(
             schema,
             vec![
@@ -1110,9 +1086,9 @@ mod merge_materialize_vs_reference {
                 RowSpec {
                     pk: pk(60),
                     w: 1,
-                    c0: S::NullGarbage(sgarbage),
+                    c0: S::Null,
                     c1: S::V(b"tail".to_vec()),
-                    c2: I::NullGarbage(0x1234_5678_9abc_def0),
+                    c2: I::Null,
                 },
             ],
         );

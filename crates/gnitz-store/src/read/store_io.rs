@@ -81,7 +81,7 @@ impl RelationRegistry {
             let (src, row) = c.current_row_source();
             let mut null_word = 0;
             out.begin_row(c.current_pk_bytes(), 1);
-            out.append_cell_from(0, &loc, src, row, &mut null_word);
+            out.append_cells_from(0, std::slice::from_ref(&loc), src, row, &mut null_word);
             out.commit_row(null_word);
         });
         Ok(out)

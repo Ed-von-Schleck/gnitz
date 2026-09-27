@@ -64,9 +64,7 @@ pub fn op_topn(delta: &Batch, trace_out: &mut ReadCursor, history: &mut ReadCurs
                 let (src, row) = history.current_row_source();
                 let mut null_word = 0u64;
                 out.begin_row(out_pk_bytes, take as i64);
-                for (pi, loc) in plan.index.carried_in_index.iter().enumerate() {
-                    out.append_cell_from(pi, loc, src, row, &mut null_word);
-                }
+                out.append_cells_from(0, &plan.index.carried_in_index, src, row, &mut null_word);
                 out.commit_row(null_word);
             }
             history.advance();

@@ -1569,25 +1569,15 @@ fn make_batch_compound_2xu64(schema: &SchemaDescriptor, rows: &[(u64, u64, i64, 
 fn test_emit_reduce_row_compound_pk_bytes() {
     let in_schema = pk_payload_schema(&[TypeCode::U64; 2]);
 
-    // A SourcePk grouping with a COUNT: 2 PK cols (U64,U64), then I64 count.
-    let out_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0, 1],
-    );
-
     let pk0: u64 = 0xAAAA_BBBB_CCCC_DDDDu64;
     let pk1: u64 = 0x1111_2222_3333_4444u64;
     let input = make_batch_compound_2xu64(&in_schema, &[(pk0, pk1, 1, 99)]);
     let mb = input.as_mem_batch();
 
-    let mut output = Batch::with_capacity(&out_schema, 1);
     let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Count };
     // Natural-PK grouping passes the source row's PK bytes; they're copied verbatim.
     let plan = make_plan(&in_schema, &[0u32, 1u32], std::slice::from_ref(&agg), false);
+    let mut output = Batch::with_capacity(&plan.shape.output_schema, 1);
     let accs = plan.shape.acc_template.clone();
     emit_reduce_row(
         &mut output,
@@ -4721,15 +4711,7 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
 
     // Emit the group row. Natural-PK grouping on the U64 PK col: output is
     // [U64 pk, I64 count_non_null, I64 count], no group-exemplar column.
-    let out_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0],
-    );
-    let mut output = Batch::with_capacity(&out_schema, 1);
+    let mut output = Batch::with_capacity(&plan.shape.output_schema, 1);
     emit_reduce_row(
         &mut output,
         Some((&mb, 0, plan.shape.key.carried())),
@@ -4757,15 +4739,6 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
 #[test]
 fn ground_row_renders_count_family_zero_null_clear() {
     let in_schema = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
-    // Global-aggregate output: [_group_pk:U128, count_star:I64, count_col:I64].
-    let out_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U128, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0],
-    );
     let descs = [
         AggDescriptor::COUNT_STAR,
         AggDescriptor {
@@ -4773,9 +4746,10 @@ fn ground_row_renders_count_family_zero_null_clear() {
             agg_op: AggFunc::CountNonNull,
         },
     ];
-    let mut raw_output = Batch::with_capacity(&out_schema, 1);
     let v0 = [0u8; 16]; // U128 ground PK (V₀)
     let plan = make_plan(&in_schema, &[], &descs, true);
+    // Global-aggregate output: [_group_pk:U128, count_star:I64, count_col:I64].
+    let mut raw_output = Batch::with_capacity(&plan.shape.output_schema, 1);
     emit_reduce_row(&mut raw_output, None, &v0, &plan.shape.acc_template);
 
     assert_eq!(raw_output.count, 1, "ground row emitted");
