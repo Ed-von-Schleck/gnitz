@@ -437,7 +437,6 @@ impl Table {
             PkBuf::from_bytes(start),
             end.map_or_else(|| PkBuf::max(stride), PkBuf::from_bytes),
         );
-        debug_assert!(extra.as_ref().is_none_or(|b| b.is_consolidated()));
         let runs = self
             .mem_runs(Some((lo, hi)))
             .chain(extra.filter(|b| !b.is_empty()).map(Run::Mem))

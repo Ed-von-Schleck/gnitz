@@ -5,7 +5,7 @@
 //! RAM tier accepts those folded runs and spills to a shard past its ceiling.
 //! The two are separate sets, not one, because the memtable's small budget is
 //! what keeps the RAM tier's big fold off the per-push path: the memtable
-//! absorbs many pushes per drain, so the tier below it re-merges its whole
+//! absorbs many pushes per drain, so the tier below it folds its whole
 //! window far less often than a single set folding every [`FOLD_THRESHOLD`]
 //! pushes would.
 
@@ -19,12 +19,8 @@ use super::scatter::UnifiedSet;
 use crate::schema::key::probe_key;
 use crate::schema::SchemaDescriptor;
 
-/// Runs to accumulate before folding them into one. Bounds the cost of cursor
-/// builds and PK probes, and cancels weight-cancelled rows early.
-///
-/// Measured by e2e ingest sweep: 125k rows/s at 4, 143k at 16, 133k at 32 — a
-/// smaller value folds too eagerly, a larger one leaves too many runs for the
-/// merge and the probe to walk.
+/// Runs to accumulate before folding them into one: bounds how many runs a
+/// cursor merges and a PK probe walks.
 pub(super) const FOLD_THRESHOLD: usize = 16;
 
 /// Rough bytes per row, used to size the bloom from a byte budget.
@@ -32,18 +28,8 @@ const EST_BYTES_PER_ROW: usize = 40;
 
 pub(super) struct RunSet {
     runs: Vec<Rc<Batch>>,
-    /// PK bloom over every live run, built **lazily on the first probe** and
-    /// maintained on later pushes. A set is written far more often than it is
-    /// point-probed — view and operator-trace tables never probe at all — so
-    /// hashing every ingested row up front would be pure overhead for the bulk
-    /// of ingest volume. Base tables probe once per DML row, so they build once
-    /// per fold window and amortize.
-    ///
-    /// A fold that cancelled rows drops it, so the next probe rebuilds without
-    /// their hashes; one that cancelled none keeps it (see [`Self::fold`]).
-    ///
-    /// A worker owns its partition single-threaded, so `OnceCell` needs no
-    /// synchronization.
+    /// PK bloom over every live run, built on the first probe: a set that is
+    /// never probed never hashes a row.
     bloom: OnceCell<BloomFilter>,
     /// Heap budget: [`is_full`](Self::is_full) reports crossing it, and the
     /// bloom's key capacity is derived from it. What crossing it *means* — fold
@@ -62,14 +48,8 @@ impl RunSet {
         }
     }
 
-    /// Append a run, folding the set when it gets crowded. Empty runs are never
-    /// stored, so `is_empty()` is exactly "no rows".
-    ///
-    /// The run must be consolidated — every consumer (the fold's N-way merge,
-    /// the PK probe's binary search) reads it as sorted and ghost-free. Producers
-    /// certify it via `into_consolidated`; the flag is re-checked against the
-    /// data here in debug builds, so a run that lies about its layout is caught
-    /// at the boundary rather than silently mis-merged.
+    /// Append a consolidated run, folding the set when it gets crowded. Empty
+    /// runs are never stored, so `is_empty()` is exactly "no rows".
     pub(crate) fn push(&mut self, run: Rc<Batch>, schema: &SchemaDescriptor) {
         debug_assert!(
             run.consolidated_verified(schema),
@@ -78,8 +58,6 @@ impl RunSet {
         if run.count == 0 {
             return;
         }
-        // Maintain the bloom only once built (first probe); an unprobed set pays
-        // nothing.
         if let Some(bloom) = self.bloom.get_mut() {
             bloom_add_batch(bloom, &run);
         }
@@ -133,11 +111,6 @@ impl RunSet {
 
     /// Widen every run narrower than `schema` to it, filling the appended
     /// trailing columns with NULL (`ALTER TABLE … ADD COLUMN`).
-    ///
-    /// Each widened run is a **new** `Rc`, never a mutation through the existing
-    /// one — a live `ReadCursor` may still hold it. Deliberately not `push`:
-    /// that folds at `FOLD_THRESHOLD`, which would collapse the set's runs as a
-    /// side effect of a schema swap.
     pub(super) fn widen_runs(&mut self, schema: &SchemaDescriptor) {
         let npc = schema.num_payload_cols();
         let mut bytes = 0;
@@ -153,26 +126,30 @@ impl RunSet {
             bytes += run.total_bytes();
         }
         self.bytes = bytes;
-        // The bloom hashes PK bytes alone (`bloom_add_batch`), which the widen
-        // copies verbatim, so it stays valid.
+        // The widen leaves PK bytes untouched, so the bloom stays valid.
     }
 
     /// Fold every run into one consolidated run, dropping net-zero
     /// (PK, payload) rows.
-    ///
-    /// An unchanged row count means nothing cancelled, so the bloom already
-    /// holds exactly the survivors' keys and is kept — rebuilding on every fold
-    /// is quadratic between clears, since fold *j* re-hashes what folds
-    /// 1..*j*−1 hashed.
     pub(super) fn fold(&mut self, schema: &SchemaDescriptor) {
         if self.runs.len() <= 1 {
             return;
         }
-        let sorted: Vec<MemBatch> = self.runs.iter().map(|r| r.as_mem_batch()).collect();
-        let input_rows: usize = sorted.iter().map(|b| b.count).sum();
-        let merged = consolidate_batches(&sorted, schema);
-        drop(sorted); // borrows self.runs; release before the mutable reborrow
+        let input_rows = self.row_count();
+        // A dominant run — usually the previous fold's output — is galloped
+        // against the fold of the rest, so its stretches are bulk-copied.
+        let big = (0..self.runs.len()).max_by_key(|&i| self.runs[i].count).unwrap();
+        let merged = if self.runs[big].count * 2 >= input_rows {
+            let dominant = self.runs.swap_remove(big);
+            match &self.runs[..] {
+                [one] => dominant.merged_consolidated(one, schema),
+                _ => dominant.merged_consolidated(&self.consolidate_all(schema), schema),
+            }
+        } else {
+            self.consolidate_all(schema)
+        };
         self.runs.clear();
+        // Keep the bloom only while it holds exactly the survivors' keys.
         if merged.count != input_rows {
             self.bloom.take();
         }
@@ -182,6 +159,19 @@ impl RunSet {
         } else {
             self.bytes = 0;
         }
+    }
+
+    /// Every run folded N-way into one consolidated batch.
+    fn consolidate_all(&self, schema: &SchemaDescriptor) -> Batch {
+        let views: Vec<MemBatch> = self.runs.iter().map(|r| r.as_mem_batch()).collect();
+        let total_blob: usize = views.iter().map(|b| b.blob.len()).sum();
+        let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(self.row_count());
+        merge::run_merge(&views, schema, |src, row, w| {
+            survivors.push((src as u32, row as u32, w))
+        });
+        let mut result = UnifiedSet::of(&views, schema).materialize(schema, &survivors, total_blob);
+        result.certify_layout(Layout::Consolidated);
+        result
     }
 
     /// Fold to a single run and return it, **retained** — a consumer whose write
@@ -196,17 +186,12 @@ impl RunSet {
     /// which probes both RAM tiers and every shard with the same key. The first
     /// probe builds the filter from all live runs.
     pub(super) fn may_contain(&self, probe_key: u64) -> bool {
-        // Before `get_or_init`, which would otherwise size a filter from the
-        // *budget* — a megabyte for the RAM tier — to answer a question an empty
-        // set already answers. An empty RAM tier is the normal state: it receives
-        // a run only once the memtable has drained.
+        // Answered without building a budget-sized filter.
         if self.runs.is_empty() {
             return false;
         }
         let bloom = self.bloom.get_or_init(|| {
-            // Sized to the budget's row capacity, NOT to the row count at first
-            // probe — a filter sized to first-probe contents would over-saturate
-            // as later pushes add incrementally.
+            // Sized to the budget, not the current rows: later pushes add to it.
             let mut bloom = BloomFilter::new((self.budget / EST_BYTES_PER_ROW).max(16) as u32);
             for run in &self.runs {
                 bloom_add_batch(&mut bloom, run);
@@ -217,25 +202,11 @@ impl RunSet {
     }
 }
 
-/// Insert every row's PK into `bloom`, keyed by [`probe_key`] — the same
-/// derivation the shard filter and this set's probe side use, so one PK maps to
-/// one key everywhere and no width or signedness produces a false negative.
+/// Insert every row's PK into `bloom`, keyed by [`probe_key`].
 fn bloom_add_batch(bloom: &mut BloomFilter, batch: &Batch) {
     for i in 0..batch.count {
         bloom.add(probe_key(batch.get_pk_bytes(i)));
     }
-}
-
-/// Merge N sorted MemBatch views into a single consolidated Batch.
-fn consolidate_batches(batches: &[MemBatch], schema: &SchemaDescriptor) -> Batch {
-    let total_blob: usize = batches.iter().map(|b| b.blob.len()).sum();
-    let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(batches.iter().map(|b| b.count).sum());
-    merge::run_merge(batches, schema, |src, row, w| {
-        survivors.push((src as u32, row as u32, w))
-    });
-    let mut result = UnifiedSet::of(batches, schema).materialize(schema, &survivors, total_blob);
-    result.certify_layout(Layout::Consolidated);
-    result
 }
 
 #[cfg(test)]

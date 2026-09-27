@@ -2,14 +2,10 @@
 //!
 //! Every tier of the LSM stores the same thing: a `(PK, payload)`-ordered,
 //! consolidated block of rows. Only the backing differs — an in-heap [`Batch`]
-//! for the memtable and RAM tiers, an mmap'd [`MappedShard`] on disk. `Run` is
-//! that one concept, so the merge engine, the point-lookup probe, and the
-//! located-row appender all read through a single type instead of one per tier.
+//! for the memtable and RAM tiers, an mmap'd [`MappedShard`] on disk.
 //!
-//! Both variants own their backing via `Rc`, so a `Run` (and anything holding
-//! one) is a self-contained owning value with no borrow lifetime — what lets a
-//! `ReadCursor` cross DAG/VM boundaries and a [`StoredRow`] outlive the table
-//! lookup that found it.
+//! Both variants own their backing via `Rc`, so a `ReadCursor` or [`StoredRow`]
+//! holding a `Run` carries no borrow of the table that produced it.
 
 use std::rc::Rc;
 
@@ -20,6 +16,7 @@ use super::shard_reader::MappedShard;
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::RowSource;
 
+#[derive(Clone)]
 pub(crate) enum Run {
     /// Rc-owned in-heap batch: a memtable or RAM-tier run.
     Mem(Rc<Batch>),
@@ -46,22 +43,11 @@ impl Run {
     }
 
     /// Bulk-copy `[start, start + row_count)` into an owned batch — one memcpy
-    /// per column. The arms differ only in the layout they may claim, which is a
-    /// property of the backing: `Mem` inherits the source's tag, a shard is
-    /// ghost-free by construction and certifies `Consolidated`.
+    /// per column.
     pub(crate) fn slice_to_owned_batch(&self, start: usize, row_count: usize, schema: &SchemaDescriptor) -> Batch {
         match self {
             Run::Mem(b) => Batch::from_ranges(b, &[(start, start + row_count)], schema, 0),
             Run::Shard(s) => s.slice_to_owned_batch(start, row_count, schema),
-        }
-    }
-}
-
-impl Clone for Run {
-    fn clone(&self) -> Self {
-        match self {
-            Run::Mem(b) => Run::Mem(Rc::clone(b)),
-            Run::Shard(s) => Run::Shard(Rc::clone(s)),
         }
     }
 }
@@ -88,9 +74,8 @@ impl StoredRow {
     }
 }
 
-/// `#[inline(always)]` on every forwarder, for the reason spelled out on
-/// [`gnitz_expr::BatchView`]: at `opt-level=0` the plain hint is a no-op, and the
-/// merge engine calls through here once per payload column of every row it emits.
+/// `#[inline(always)]` on every forwarder, as [`RowSource`] asks of its
+/// implementors.
 impl RowSource for Run {
     #[inline(always)]
     fn get_pk_bytes(&self, row: usize) -> &[u8] {
@@ -130,11 +115,6 @@ impl RowSource for Run {
 }
 
 impl ColumnarSource for Run {
-    /// Backed by either a `MemBatch`'s flat data buffer or a `MappedShard`: one
-    /// `ColPtr` per region.
-    ///
-    /// Infallible: `MappedShard::open` validates all encoding constraints and
-    /// region sizes at open time, so no arm here can fail.
     fn to_unified(&self, schema: &SchemaDescriptor, cols: &mut Vec<ColPtr>) -> UnifiedSource<'_> {
         match self {
             Run::Mem(b) => super::merge::mem_batch_to_unified(&b.as_mem_batch(), schema, cols),

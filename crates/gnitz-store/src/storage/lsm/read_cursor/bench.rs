@@ -679,10 +679,10 @@ fn adv_time_cursor_stationary(c: &mut ReadCursor, tier: Tier, scratch: &mut [u8]
 
 /// Bench 1 — the leaf galloping seek in isolation (no cursor, no loser tree): call
 /// `Batch`/`MappedShard::advance_to` directly. Reproduces the leaf gallop work the
-/// profile splits across `Run::advance_to` self-time (8.77%) and
-/// `lower_bound_by` (2.04%), plus — cold — the scattered `get_pk_bytes` mmap-load
-/// latency that dominates it. Both the RAM (`Batch`) and mmap (`Shard`) tiers,
-/// monotone (position-seeded skip) and point-lookup (`hint = 0`) drivers.
+/// profile attributes to `Run::advance_to` and `lower_bound_by`, plus — cold —
+/// the scattered `get_pk_bytes` mmap-load latency that dominates it. Both the RAM
+/// (`Batch`) and mmap (`Shard`) tiers, monotone (position-seeded skip) and
+/// point-lookup (`hint = 0`) drivers.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn advance_to_leaf_gallop_bench() {

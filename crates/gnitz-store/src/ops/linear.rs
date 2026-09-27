@@ -7,7 +7,7 @@
 use gnitz_expr::RowFilter;
 
 use crate::schema::{DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::storage::{Batch, Layout};
+use crate::storage::Batch;
 
 // ---------------------------------------------------------------------------
 // Linear operators
@@ -104,8 +104,7 @@ pub fn op_union(batch_a: Batch, batch_b: &Batch, out_schema: &SchemaDescriptor) 
     let (n_a, n_b) = (batch_a.count, batch_b.count);
 
     if batch_a.consolidated_verified(out_schema) && batch_b.consolidated_verified(out_schema) {
-        let mut output = batch_a.merged_consolidated(batch_b, out_schema);
-        output.certify_layout(Layout::Consolidated);
+        let output = batch_a.merged_consolidated(batch_b, out_schema);
         gnitz_debug!("op_union: a={n_a} b={n_b} out={} sorted_merge", output.count);
         return output;
     }

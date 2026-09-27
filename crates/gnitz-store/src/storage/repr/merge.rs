@@ -12,7 +12,7 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 use std::ops::ControlFlow;
 
-use super::batch::Batch;
+use super::batch::{Batch, Layout};
 use super::batch_pool::tls_pool;
 use super::heap::{HeapNode, LoserTree};
 use super::seek::pk_group_end;
@@ -87,9 +87,6 @@ pub(crate) struct UnifiedSource<'a> {
 /// arena is borrowed. Pure pointer arithmetic — no allocation,
 /// no scan. The payload `ColPtr`s are appended to `cols`, the flat table the
 /// scatter indexes through `UnifiedSource::cols_off`.
-///
-/// Shared by the read-cursor drain (shard-vs-MemBatch polymorphism) and the
-/// flush phase-2 scatter, which has only `MemBatch` runs.
 pub(crate) fn mem_batch_to_unified<'a>(
     mb: &MemBatch<'a>,
     schema: &SchemaDescriptor,
@@ -860,7 +857,7 @@ fn run_merge_body<S, P>(
 impl Batch {
     /// Z-Set `+` of two consolidated batches: both sides' rows in (PK, payload)
     /// order, equal elements' weights summed into one row, net-zero elements
-    /// dropped. The result is itself consolidated.
+    /// dropped.
     ///
     /// Only the shared-PK arm folds: a galloped run stops at the other side's
     /// head PK, so nothing in it can share a (PK, payload) across sides, and a
@@ -870,7 +867,9 @@ impl Batch {
             self.is_consolidated() && other.is_consolidated(),
             "merged_consolidated: both inputs must be consolidated",
         );
-        with_payload_cmp!(schema, merged_consolidated_body, self, other, schema)
+        let mut out = with_payload_cmp!(schema, merged_consolidated_body, self, other, schema);
+        out.certify_layout(Layout::Consolidated);
+        out
     }
 
     /// `other`'s rows appended onto this batch — Z-Set `+` where an input is

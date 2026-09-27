@@ -1,5 +1,6 @@
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::storage::Layout;
 use crate::test_support::{
     make_batch, make_batch_bytes, make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string,
     make_schema_u64_i64, opk_pk, pk_payload_schema,

@@ -58,9 +58,9 @@ impl SkeletonKeys {
 
 /// An N-way merge over one relation's runs, positioned on one group at a time.
 pub struct ReadCursor {
-    /// The runs the merge folds *across*. Folding *within* one is its producer's
-    /// job. One key clamps them all, so an identity two runs share cannot reach
-    /// single-source mode.
+    /// The runs the merge folds *across*; each is already folded within. One key
+    /// clamps them all, so an identity two runs share cannot reach single-source
+    /// mode.
     sources: Vec<Run>,
     states: Vec<PosCursor>,
     /// The N-way merge tournament, sized once from `sources.len()` — which never
@@ -90,17 +90,6 @@ pub struct ReadCursor {
 }
 
 impl ReadCursor {
-    /// A cursor over already-materialized batches, skipping empty ones — what a
-    /// caller with rows in hand uses when it needs the cursor interface, with no
-    /// backing `Table` and no scratch dir. Keeps [`Run`] inside the LSM layer.
-    ///
-    /// The one open whose runs did not come through `RunSet::push`, so each batch
-    /// is folded to whatever granularity its caller built it at.
-    #[cfg(test)]
-    pub(crate) fn over_batches(batches: &[Rc<Batch>], schema: SchemaDescriptor) -> ReadCursor {
-        from_runs(batches.iter().map(|b| Run::Mem(Rc::clone(b))), schema, batches.len())
-    }
-
     /// The one live source, or `None` for none or several. Re-derived rather than
     /// the source set being narrowed: a seek is backward-capable, so a later one
     /// at a lower key can re-liven a source an earlier range seek emptied.
@@ -612,8 +601,8 @@ impl ReadCursor {
     }
 
     /// Single-live-source bypass: no heap, no ghost filter. Every other source's
-    /// window is empty, and a run arrives already folded (see [`from_runs`]), so
-    /// the position is either emit-ready or past-end.
+    /// window is empty, and a run arrives already folded, so the position is either
+    /// emit-ready or past-end.
     #[inline]
     fn advance_single(&mut self, i: usize) {
         let state = &mut self.states[i];
@@ -683,14 +672,8 @@ impl ReadCursor {
 }
 
 /// Build a ReadCursor over `runs`, skipping empty ones, and position it on the
-/// first live PK group. Each `Run` owns its backing via `Rc`, so the cursor has
-/// no borrow lifetime and callers hand it a lazy iterator rather than
-/// materializing a slice per tier. `cap` is an allocation hint for the two
-/// source vectors; a wrong one costs a realloc, never a row.
-///
-/// A run is folded by whoever produced it — a shard by construction, a memtable
-/// run by `RunSet::push`'s check — which is what lets the single-source mode skip
-/// the fold entirely.
+/// first live PK group. Every run must be folded. `cap` is an allocation hint
+/// for the source vectors.
 pub(crate) fn from_runs(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor, cap: usize) -> ReadCursor {
     build(runs, schema, cap, true)
 }
@@ -711,6 +694,10 @@ fn build(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor, cap: usi
     let mut sources = Vec::with_capacity(cap);
     let mut states = Vec::with_capacity(cap);
     for run in runs {
+        debug_assert!(
+            !matches!(&run, Run::Mem(b) if !b.is_consolidated()),
+            "a cursor run must be folded"
+        );
         let count = run.row_count();
         if count > 0 {
             sources.push(run);
@@ -725,7 +712,8 @@ pub(crate) fn empty(schema: SchemaDescriptor) -> ReadCursor {
     from_runs(std::iter::empty(), schema, 0)
 }
 
-/// Test-only shorthand for [`from_runs`] over a batch slice and a shard slice.
+/// Test-only shorthand for [`from_runs`] over a batch slice and a shard slice,
+/// folding any batch that is not yet folded.
 #[cfg(test)]
 pub(crate) fn create_read_cursor(
     batches: &[Rc<Batch>],
@@ -735,8 +723,7 @@ pub(crate) fn create_read_cursor(
     from_runs(
         batches
             .iter()
-            .cloned()
-            .map(Run::Mem)
+            .map(|b| Run::Mem(Batch::consolidate_if_needed(b, &schema).map_or_else(|| Rc::clone(b), Rc::new)))
             .chain(shard_arcs.iter().cloned().map(Run::Shard)),
         schema,
         batches.len() + shard_arcs.len(),

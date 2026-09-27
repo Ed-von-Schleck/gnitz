@@ -260,12 +260,8 @@ fn bench_flush_batch(schema: &SchemaDescriptor, n: usize, key_fn: impl Fn(usize)
     b
 }
 
-/// One RAM-tier fold unit of work at its real skewed run shape: the
-/// full `consolidate_batches` composition (`write_to_batch` arena +
-/// `run_merge` + `scatter_unified_sources`) over **1 big run +
-/// 4 small runs**. Existing merge benches use balanced K=4 only; this is the
-/// per-delta-row price the tick-cadence amplification factor multiplies. Big
-/// run = `N` even keys; each small run = `d` odd keys uniformly interleaved
+/// The N-way merge over **1 big run + 4 small runs**, priced per small-run row.
+/// Big run = `N` even keys; each small run = `d` odd keys uniformly interleaved
 /// across the big range (distinct per run via a `+2j` offset), so no
 /// (PK,payload) ties and consolidation drops nothing.
 #[test]
@@ -635,10 +631,8 @@ fn writer_run(
         .collect()
 }
 
-/// One-shot flush merge into a writer whose arena is already sized to the
-/// Σ-input upper bound. Production runs the two kernels itself so it can size
-/// the arena to the survivor count instead (`run_set::consolidate_batches`), so
-/// this form exists for the tests and microbench that pre-size their writer.
+/// One-shot merge into a writer whose arena is already sized to the Σ-input
+/// upper bound, for the tests and microbench that pre-size their writer.
 fn merge_batches(batches: &[MemBatch], schema: &SchemaDescriptor, writer: &mut DirectWriter) {
     let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(batches.iter().map(|b| b.count).sum());
     run_merge(batches, schema, |src, row, w| {

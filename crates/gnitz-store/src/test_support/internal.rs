@@ -87,7 +87,7 @@ pub fn make_batch_opk(schema: &SchemaDescriptor, rows: &[(&[u8], i64, i64)]) -> 
 /// A [`ReadCursor`] over one in-memory batch: the integral an operator reads
 /// back as `z⁻¹(I(X))`, the shape every delta-against-trace unit test wants.
 pub fn trace_cursor(batch: Batch, schema: SchemaDescriptor) -> ReadCursor {
-    ReadCursor::over_batches(&[std::rc::Rc::new(batch)], schema)
+    crate::storage::create_read_cursor(&[std::rc::Rc::new(batch)], &[], schema)
 }
 
 /// Read row `i`'s PK out of a raw `stride`-wide OPK region as its native

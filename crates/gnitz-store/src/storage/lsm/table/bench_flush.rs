@@ -1,7 +1,6 @@
 //! End-to-end microbenchmark for the RAM-tier drain path at production
 //! thresholds: `fold_memtable_into_ram_tier`, the tier's own fold at
-//! `FOLD_THRESHOLD` (window re-merge + re-materialize) and the ceiling spill in
-//! `fold_to_ram`.
+//! `FOLD_THRESHOLD` and the ceiling spill in `fold_to_ram`.
 //!
 //! This is the bench a compaction-policy change must move, and the one whose
 //! `perf` profile must reproduce the e2e worker hot-symbol shape. As a child
@@ -46,7 +45,7 @@ fn gen_distinct(schema: &SchemaDescriptor, d: usize, ticks: usize) -> Vec<Batch>
 /// robin. Each update retracts the key's current payload (once it has one) and
 /// inserts a fresh unique payload — the retract+insert cancels the prior
 /// (PK,payload) row, so the steady-state net window is ≈ `h` rows (the
-/// UPDATE/re-aggregation shape where the same rows are re-merged forever).
+/// UPDATE/re-aggregation shape where the same rows are re-folded forever).
 fn gen_churn(schema: &SchemaDescriptor, h: usize, d: usize, ticks: usize) -> Vec<Batch> {
     let updates_per_tick = d / 2;
     let mut last: Vec<Option<i64>> = vec![None; h];

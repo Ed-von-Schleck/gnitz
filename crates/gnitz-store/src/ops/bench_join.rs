@@ -127,7 +127,7 @@ fn cursor_over(schema: &SchemaDescriptor, p: Payload, rows: &[Row], n: usize) ->
             Rc::new(build(schema, p, &part))
         })
         .collect();
-    ReadCursor::over_batches(&batches, *schema)
+    crate::storage::create_read_cursor(&batches, &[], *schema)
 }
 
 // ---------------------------------------------------------------------------

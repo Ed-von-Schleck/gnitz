@@ -276,7 +276,7 @@ fn equi_merge_walk_matches_the_reference_over_every_shape() {
     for (di, mi) in cases {
         let delta = walk_batch(di);
         let mb = walk_batch(mi);
-        let mut ch = ReadCursor::over_batches(std::slice::from_ref(&mb), s);
+        let mut ch = crate::storage::create_read_cursor(std::slice::from_ref(&mb), &[], s);
         assert_eq!(
             record_walk(&delta, &mut ch),
             naive_walk(&delta, &mb),
@@ -297,7 +297,7 @@ fn equi_merge_walk_skips_a_ghost_group_across_sources() {
     // Reference: a trace holding only pk 1 and 5.
     let live = walk_batch(&[(1, 1, 10), (5, 1, 50)]);
 
-    let mut ch = ReadCursor::over_batches(&[Rc::clone(&src_a), Rc::clone(&src_b)], s);
+    let mut ch = crate::storage::create_read_cursor(&[Rc::clone(&src_a), Rc::clone(&src_b)], &[], s);
     assert_eq!(
         record_walk(&delta, &mut ch),
         naive_walk(&delta, &live),
@@ -313,7 +313,7 @@ fn equi_merge_walk_self_positions_a_stale_cursor() {
     let mb = walk_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40), (5, 1, 50)]);
     let delta = walk_batch(&[(1, 1, 1), (3, 1, 3), (5, 1, 5)]);
 
-    let mut ch = ReadCursor::over_batches(std::slice::from_ref(&mb), s);
+    let mut ch = crate::storage::create_read_cursor(std::slice::from_ref(&mb), &[], s);
     ch.advance_to(&(4u128).to_be_bytes()[8..]);
     assert!(ch.valid && ch.current_key_narrow() == 4, "precondition: stale at pk=4");
 
@@ -535,18 +535,12 @@ fn range_join_fixtures_match_the_reference() {
             &[(&[1], 10, 1, 110), (&[1], 20, 1, 120), (&[2], 5, 1, 205)],
             3,
         ),
-        // A weight-0 row advances the monotone pointer but emits nothing; a
-        // negative-weight row emits at its product's sign.
+        // A negative-weight row emits at its product's sign.
         (
-            "tombstone and retraction in one trace group",
+            "retraction in one trace group",
             0,
             &[(&[], 40, -1, 400)],
-            &[
-                (&[], 10, 1, 110),
-                (&[], 20, 0, 120),
-                (&[], 25, -1, 125),
-                (&[], 30, 1, 130),
-            ],
+            &[(&[], 10, 1, 110), (&[], 25, -1, 125), (&[], 30, 1, 130)],
             6,
         ),
         // Duplicate `[eq‖d]` on both sides with distinct payloads: the full
@@ -641,10 +635,10 @@ fn owned(rows: RangeRows) -> Vec<(Vec<u64>, u64, i64, i64)> {
 
 /// Random `(eq.., range, weight, payload)` rows over a tiny key space, returned
 /// in `(eq.., range, payload)` order — the full (PK, payload) order the range
-/// join's walk reads them in. Weights span `{-2..=2}` so a trace
-/// carries tombstones and a delta retractions; the four-value key space forces
-/// dense eq groups, boundary equality (`d == s`) and non-matching groups, and
-/// the occasional `u64::MAX` slot reaches the maximal cuts.
+/// join's walk reads them in. Weights span `{-2..=2}` so a delta carries
+/// retractions and a trace cancelling pairs that fold away; the four-value key
+/// space forces dense eq groups, boundary equality (`d == s`) and non-matching
+/// groups, and the occasional `u64::MAX` slot reaches the maximal cuts.
 fn arb_range_rows(n_eq: usize) -> impl Strategy<Value = Vec<(Vec<u64>, u64, i64, i64)>> {
     let slot = prop_oneof![9 => 0u64..4, 1 => Just(u64::MAX)];
     let row = (prop::collection::vec(0u64..4, n_eq), slot, -2i64..=2i64, -2i64..2i64);
@@ -722,9 +716,6 @@ fn make_range_schema(n_eq: usize, wide: bool) -> SchemaDescriptor {
 /// wide schema the two extra cells are *derived* from `payload`, so equal
 /// payloads stay equal cell-for-cell and that sort order is the full
 /// (PK, payload) order.
-///
-/// Left `Raw`: these fixtures carry tombstones and multiset duplicates, so no
-/// layout claim holds over them.
 fn make_range_batch(schema: &SchemaDescriptor, rows: &[(Vec<u64>, u64, i64, i64)]) -> Batch {
     let wide = schema.num_payload_cols() > 1;
     let mut b = Batch::with_capacity(schema, rows.len().max(1));
@@ -840,9 +831,8 @@ fn reference(
 /// miss/spurious pair that the folded Z-Set alone hides. Returns it, so callers
 /// can assert non-vacuous coverage.
 ///
-/// The reference reads the *consolidated* delta, which is what the op joins; the
-/// trace needs no such step, since a single-source cursor emits every row
-/// verbatim.
+/// The reference reads both inputs consolidated: the delta by the op's contract,
+/// the trace by the cursor's.
 fn assert_matches_reference(
     kind: JoinKind,
     delta_is_right: bool,
@@ -854,6 +844,7 @@ fn assert_matches_reference(
 ) -> usize {
     let p = plan(kind, delta_is_right, &delta_schema, &trace_schema);
     let cs = Batch::consolidate_if_needed(delta, &delta_schema);
+    let trace = Batch::consolidate_if_needed(&trace, &trace_schema).unwrap_or(trace);
     let (want, want_rows) = reference(
         kind,
         delta_is_right,

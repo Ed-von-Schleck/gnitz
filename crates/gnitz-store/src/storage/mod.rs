@@ -74,6 +74,8 @@ pub use lsm::child_dir::Slot;
 pub(crate) use lsm::child_dir::{caller_record_at, parse_id};
 // Other crates' tests assert on the on-disk layout through these.
 pub use lsm::child_dir::{ChildAddr, ChildKind};
+#[cfg(test)]
+pub(crate) use lsm::read_cursor::create_read_cursor;
 pub(crate) use lsm::read_cursor::empty as empty_cursor;
 pub(crate) use lsm::read_cursor::SkeletonKeys;
 pub use lsm::read_cursor::{PkSetGather, ReadCursor};
