@@ -51,6 +51,18 @@ pub(crate) fn reactor_with_rings(n: usize) -> (Reactor, Vec<W2mWriter>) {
     (r, writers)
 }
 
+/// A fresh ring holding one frame whose error text is `pad` bytes, read back as a
+/// slot. The ring is leaked, so the slot outlives any test scope.
+pub(crate) fn ring_slot(pad: usize) -> (W2mReceiver, W2mSlot) {
+    let ptr = unsafe { crate::runtime::w2m::fixtures::test_ring(256 * 1024) }.leak();
+    let text = vec![0x42u8; pad];
+    let msg = crate::runtime::wire::WireMsg { blob: &text, ..Default::default() };
+    W2mWriter::new(ptr).send_msg(1, &msg);
+    let receiver = W2mReceiver::new(vec![ptr]);
+    let slot = receiver.try_read_slot(0).expect("a frame");
+    (receiver, slot)
+}
+
 /// Task `key` is in this thread's run queue.
 pub(super) fn is_queued(key: usize) -> bool {
     RUN_QUEUE.with(|q| q.borrow().is_queued(key))
@@ -100,7 +112,7 @@ impl Future for YieldOnce {
 
 /// A reactor built with `limits` and a socketpair `(sender, receiver)`, nothing
 /// registered. `sndbuf` shrinks both socket buffers.
-pub(super) fn egress_pair(limits: Limits, sndbuf: Option<i32>) -> (Rc<Reactor>, OwnedFd, OwnedFd) {
+pub(crate) fn egress_pair(limits: Limits, sndbuf: Option<i32>) -> (Rc<Reactor>, OwnedFd, OwnedFd) {
     let (sender, receiver) = std::os::unix::net::UnixStream::pair().expect("socketpair");
     let (sender, receiver) = (OwnedFd::from(sender), OwnedFd::from(receiver));
     if let Some(bytes) = sndbuf {
@@ -113,7 +125,7 @@ pub(super) fn egress_pair(limits: Limits, sndbuf: Option<i32>) -> (Rc<Reactor>, 
 
 /// Read `expect` bytes off `fd` and close it, so the send under test never
 /// stalls on a full socket buffer. Returns what it actually saw.
-pub(super) fn spawn_drain(fd: OwnedFd, expect: usize) -> std::thread::JoinHandle<usize> {
+pub(crate) fn spawn_drain(fd: OwnedFd, expect: usize) -> std::thread::JoinHandle<usize> {
     std::thread::spawn(move || {
         let mut seen = 0usize;
         let mut scratch = vec![0u8; 64 * 1024];
@@ -133,6 +145,19 @@ pub(super) fn spawn_drain(fd: OwnedFd, expect: usize) -> std::thread::JoinHandle
     })
 }
 
+/// One non-blocking read of up to `cap` bytes off `fd`: empty at EOF, `None` when
+/// nothing is readable yet.
+pub(crate) fn read_nonblocking(fd: &OwnedFd, cap: usize) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; cap];
+    let n = unsafe {
+        libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+        libc::read(fd.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, cap)
+    };
+    let n = usize::try_from(n).ok()?;
+    buf.truncate(n);
+    Some(buf)
+}
+
 /// Build a length-prefixed wire frame: LE payload length + payload.
 pub(super) fn framed(payload: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(gnitz_wire::FRAME_LEN_PREFIX_BYTES + payload.len());
@@ -143,7 +168,7 @@ pub(super) fn framed(payload: &[u8]) -> Vec<u8> {
 
 /// Drive the reactor up to `max` non-blocking ticks, returning `true` as
 /// soon as `cond` holds after a tick (and `false` if it never does).
-pub(super) fn poll_until(r: &Reactor, max: usize, mut cond: impl FnMut() -> bool) -> bool {
+pub(crate) fn poll_until(r: &Reactor, max: usize, mut cond: impl FnMut() -> bool) -> bool {
     (0..max).any(|_| {
         r.tick(false);
         cond()

@@ -1,7 +1,7 @@
 //! The inbound half of a client connection: the inbound-memory budget, the
 //! frame queue, and the [`ClientConn`] owning a socket and its [`RecvQueue`].
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
@@ -9,6 +9,7 @@ use std::task::Poll;
 
 use gnitz_wire::{Deframer, FrameLenError};
 
+use super::sync::chan;
 use super::wake_queue::WakeQueue;
 
 /// Lower/upper bounds on the global inbound-memory cap (see
@@ -169,15 +170,13 @@ impl From<FrameLenError> for RecvEnd {
 }
 
 /// The inbound half of one client connection: the deframer, the frames it has
-/// completed, the single task awaiting them, and whether the recv side has ended.
+/// completed, and the single task awaiting them.
 pub(crate) struct RecvQueue {
     deframer: Deframer<Payload>,
     /// Complete messages awaiting pickup by `recv().await`, and the one task
     /// awaiting them. A queue, not a slot: with one slot a pipelined client
     /// deadlocks once the kernel socket buffer fills.
     frames: WakeQueue<RecvBuf>,
-    /// No further frame will be queued. A drained queue then resolves to `None`.
-    closed: bool,
     budget: Rc<Budget>,
 }
 
@@ -186,13 +185,8 @@ impl RecvQueue {
         RecvQueue {
             deframer: Deframer::default(),
             frames: WakeQueue::default(),
-            closed: false,
             budget,
         }
-    }
-
-    pub(crate) fn recv_closed(&self) -> bool {
-        self.closed
     }
 
     /// Deframe `src`, queueing every frame it completes.
@@ -210,19 +204,17 @@ impl RecvQueue {
     pub(crate) fn try_recv(&mut self) -> Option<RecvBuf> {
         self.frames.pop()
     }
+}
 
-    /// No more frames will be queued; those already queued are still delivered.
-    pub(super) fn close(&mut self) {
-        self.closed = true;
-        self.frames.wake();
-    }
-
-    /// [`Self::close`], and discard every queued frame. The payload in progress
-    /// stays: an armed recv may still be writing into it.
-    fn abort(&mut self) {
-        self.frames.clear();
-        self.close();
-    }
+/// Where a connection is in its life.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Life {
+    Open,
+    /// The client closed its sending side: the frames it sent are still handed
+    /// out, and replies still go out.
+    RecvEnded,
+    /// Finished: no frame is handed out.
+    Gone,
 }
 
 /// One client connection: its socket and the frames deframed off it. The socket
@@ -232,9 +224,11 @@ pub(crate) struct ClientConn {
     /// This connection's place under the connection cap, held exactly as long
     /// as the fd.
     _slot: Charge,
-    /// Closed when the recv side ends, after which a completing recv never
-    /// re-arms.
     pub(super) q: RefCell<RecvQueue>,
+    life: Cell<Life>,
+    /// Wakes the task that sends on this socket outside requests, which then
+    /// owns the shutdown.
+    egress_owner: OnceCell<chan::Sender<()>>,
 }
 
 impl ClientConn {
@@ -243,6 +237,8 @@ impl ClientConn {
             fd,
             _slot: slot,
             q: RefCell::new(RecvQueue::new(budget)),
+            life: Cell::new(Life::Open),
+            egress_owner: OnceCell::new(),
         }
     }
 
@@ -256,16 +252,62 @@ impl ClientConn {
         let _ = gnitz_foundation::posix_io::retry_eintr(|| unsafe { libc::shutdown(self.fd(), libc::SHUT_RDWR) });
     }
 
-    /// End the recv side now and discard what it queued. Idempotent.
-    pub(crate) fn abort(&self) {
-        self.q.borrow_mut().abort();
+    pub(crate) fn life(&self) -> Life {
+        self.life.get()
     }
 
-    /// Next frame, or `None` once the recv side is closed and drained.
+    pub(crate) fn is_gone(&self) -> bool {
+        self.life.get() == Life::Gone
+    }
+
+    /// The client closed its sending side. Frames already queued are still delivered.
+    pub(super) fn end_recv(&self) {
+        if self.life.get() == Life::Open {
+            self.life.set(Life::RecvEnded);
+            self.q.borrow_mut().frames.wake();
+        }
+    }
+
+    /// Finish the connection and discard the frames it queued. The egress owner,
+    /// if any, shuts the socket down once it has shipped what it holds.
+    pub(crate) fn retire(&self) {
+        if self.life.replace(Life::Gone) == Life::Gone {
+            return;
+        }
+        {
+            let mut q = self.q.borrow_mut();
+            q.frames.clear();
+            q.frames.wake();
+        }
+        match self.egress_owner.get() {
+            Some(owner) => owner.send(()),
+            None => self.shutdown(),
+        }
+    }
+
+    /// [`Self::retire`], and shut the socket down now whoever owns egress.
+    pub(crate) fn fail(&self) {
+        self.retire();
+        self.shutdown();
+    }
+
+    /// Hand egress to the task behind `owner`.
+    pub(crate) fn set_egress_owner(&self, owner: chan::Sender<()>) {
+        debug_assert_eq!(self.life.get(), Life::Open, "egress handed over after the end");
+        assert!(self.egress_owner.set(owner).is_ok(), "egress has one owner");
+    }
+
+    pub(crate) fn wake_egress(&self) {
+        if let Some(owner) = self.egress_owner.get() {
+            owner.send(());
+        }
+    }
+
+    /// Next frame, or `None` once the recv side has ended and is drained.
     pub(crate) async fn recv(&self) -> Option<RecvBuf> {
         std::future::poll_fn(|cx| {
             let mut q = self.q.borrow_mut();
-            if q.closed {
+            if self.life.get() != Life::Open {
                 Poll::Ready(q.frames.pop())
             } else {
                 q.frames.poll(cx).map(Some)

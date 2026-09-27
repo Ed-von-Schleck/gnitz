@@ -6,7 +6,7 @@ mod config;
 
 pub(crate) use config::{TlsArgs, TlsConfig};
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::io::{BufRead, ErrorKind, Write};
 use std::mem::MaybeUninit;
 use std::rc::Rc;
@@ -59,13 +59,8 @@ pub(crate) struct TlsShared {
     conn: Rc<ClientConn>,
     /// The codec state, and nothing else. Never borrowed across an await.
     state: RefCell<rustls::ServerConnection>,
-    /// This connection is finished, from whichever end: senders refuse and the
-    /// flusher shuts the socket down and exits.
-    closed: Cell<bool>,
     /// Held across every ciphertext extraction and send. Teardown never takes it.
     send_lock: AsyncRwLock,
-    /// Wakes the flusher task.
-    flush_tx: chan::Sender<()>,
 }
 
 impl TlsShared {
@@ -84,10 +79,9 @@ impl TlsShared {
             reactor,
             conn,
             state: RefCell::new(sess),
-            closed: Cell::new(false),
             send_lock: AsyncRwLock::default(),
-            flush_tx,
         });
+        tls.conn.set_egress_owner(flush_tx);
         let ingress = TlsIngress {
             tls: Rc::clone(&tls),
             cipher: Box::new_uninit_slice(CIPHER_WINDOW_BYTES),
@@ -95,10 +89,6 @@ impl TlsShared {
         tls.reactor.register_conn(&tls.conn, Box::new(ingress));
         tls.reactor.spawn(flusher(Rc::clone(&tls), flush_rx));
         tls
-    }
-
-    fn notify_flusher(&self) {
-        self.flush_tx.send(());
     }
 
     /// Send everything rustls has queued. Callers hold `send_lock`, which is
@@ -114,6 +104,11 @@ impl TlsShared {
         self.reactor.send_owned(&self.conn, SendBody::Pooled(out)).await
     }
 
+    async fn flush_queued(&self) {
+        let send = self.send_lock.write().await;
+        let _ = self.flush_records(&send).await;
+    }
+
     /// Encrypt and send `body` under one `send_lock` hold; rustls sizes the chunks.
     pub(crate) async fn send(&self, body: SendBody) -> Result<(), PeerGone> {
         let send = self.send_lock.write().await;
@@ -122,14 +117,17 @@ impl TlsShared {
         while off < len {
             {
                 let mut sess = self.state.borrow_mut();
-                if self.closed.get() {
+                if self.conn.is_gone() {
                     return Err(PeerGone);
                 }
                 match sess.writer().write(&body.bytes()[off..]) {
                     Ok(n) if n > 0 => off += n,
                     // rustls short-writes only on a full outgoing buffer, which the
                     // previous turn's flush emptied: a zero here is a wedged session.
-                    _ => return Err(PeerGone),
+                    _ => {
+                        self.conn.fail();
+                        return Err(PeerGone);
+                    }
                 }
             }
             if off == len {
@@ -140,15 +138,6 @@ impl TlsShared {
         // rustls holds every byte now: release the body — a W2M slot — before the send.
         drop(body);
         self.flush_records(&send).await
-    }
-
-    /// Sync and idempotent: the first call queues a close_notify and wakes the flusher.
-    pub(crate) fn close(&self) {
-        if self.closed.replace(true) {
-            return;
-        }
-        self.state.borrow_mut().send_close_notify();
-        self.notify_flusher();
     }
 }
 
@@ -174,31 +163,25 @@ impl RecvFilter for TlsIngress {
         let cipher = unsafe { self.cipher[..n].assume_init_ref() };
         let result = ingest_cipher(&mut sess, cipher, q);
         if sess.wants_write() {
-            self.tls.notify_flusher();
+            self.tls.conn.wake_egress();
         }
         result
     }
 }
 
-/// Ships what rustls queues outside a send — handshake flights, alerts, a
-/// close_notify — and tears the socket down once either side has closed.
+/// Ships what rustls queues outside a send — handshake flights, alerts, the
+/// close_notify — and shuts the socket down once the connection is gone.
 async fn flusher(conn: Rc<TlsShared>, mut rx: chan::Receiver<()>) {
-    loop {
-        {
-            let send = conn.send_lock.write().await;
-            let _ = conn.flush_records(&send).await;
-        } // released before the teardown check and before parking on rx
-
-        // Whatever was queued is out, including a close_notify: finish the socket.
-        if conn.closed.get() {
-            conn.conn.shutdown();
-            return;
-        }
+    while !conn.conn.is_gone() {
+        conn.flush_queued().await;
         // The queue is a flag, not a stream: park on the next notification, then
         // drop whatever piled up behind it.
         rx.recv().await;
         while rx.try_recv().is_some() {}
     }
+    conn.state.borrow_mut().send_close_notify();
+    conn.flush_queued().await;
+    conn.conn.shutdown();
 }
 
 #[cfg(test)]

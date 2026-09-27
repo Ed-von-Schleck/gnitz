@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use super::super::test_support::*;
 use super::*;
-use crate::runtime::orchestration::peer::{Peer, COALESCE_MAX_BYTES};
 use crate::runtime::test_support::try_poll_once;
 use gnitz_store::storage::batch_pool::PooledSendBuf;
 
@@ -31,29 +30,6 @@ fn outbound(r: &Reactor, body: SendBody) -> Outbound {
         _conn: r.client_conn(OwnedFd::from(local)).expect("under the cap"),
         body,
     }
-}
-
-/// Everything readable on `fd` right now, without blocking.
-fn read_available(fd: &OwnedFd, cap: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; cap];
-    unsafe {
-        libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
-        let n = libc::read(fd.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, cap);
-        buf.truncate(n.max(0) as usize);
-    }
-    buf
-}
-
-/// A fresh ring holding one frame whose error text is `pad` bytes, read back as a
-/// slot. The ring is leaked, so the slot outlives any test scope.
-fn ring_slot(pad: usize) -> (W2mReceiver, W2mSlot) {
-    let ptr = unsafe { crate::runtime::w2m::fixtures::test_ring(256 * 1024) }.leak();
-    let text = vec![0x42u8; pad];
-    let msg = crate::runtime::wire::WireMsg { blob: &text, ..Default::default() };
-    crate::runtime::w2m::W2mWriter::new(ptr).send_msg(1, &msg);
-    let receiver = W2mReceiver::new(vec![ptr]);
-    let slot = receiver.try_read_slot(0).expect("a frame");
-    (receiver, slot)
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -139,7 +115,7 @@ fn a_closed_connection_drops_its_entry_and_closes_with_its_last_holder() {
         poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&fd)),
         "EOF must end the recv side and drop the reactor's entry"
     );
-    assert!(conn.q.borrow().recv_closed());
+    assert_eq!(conn.life(), Life::RecvEnded);
     assert!(matches!(try_poll_once(conn.recv()), Some(None)), "recv reports the end");
 
     partner.set_nonblocking(true).expect("nonblocking");
@@ -182,8 +158,7 @@ fn close_ends_an_armed_recv() {
     let conn = r.client_conn(OwnedFd::from(local)).expect("under the cap");
     let fd = conn.fd();
     r.register_conn(&conn, Box::new(Plain::new()));
-    conn.abort();
-    conn.shutdown();
+    conn.fail();
 
     // The peer neither writes nor closes: only the shutdown can complete the
     // recv.
@@ -213,6 +188,7 @@ fn a_refused_recv_discards_its_queue_and_shuts_down() {
         poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&fd)),
         "the oversize prefix ends the recv side"
     );
+    assert!(conn.is_gone(), "and finishes the connection");
     assert!(conn.try_recv().is_none(), "the frame ahead of the refusal is discarded");
     assert_eq!(
         r.inner.inbound.held(),
@@ -274,6 +250,7 @@ fn send_owned_evicts_a_client_that_never_drains() {
     let elapsed = start.elapsed();
 
     assert!(res.is_err(), "a client that never drains must be evicted");
+    assert!(conn.is_gone(), "eviction finishes the connection");
     assert!(
         elapsed >= TIMEOUT,
         "eviction must wait out the full deadline ({TIMEOUT:?}), took {elapsed:?}"
@@ -424,98 +401,6 @@ fn both_listeners_rearm_after_an_fd_exhaustion_backoff() {
     );
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Corked egress: what waits in `Peer`'s accumulator, and what it leaves behind.
-// ─────────────────────────────────────────────────────────────────
-
-/// Corked replies put nothing on the wire until something flushes, and then
-/// leave as one send: the far end reads the whole concatenation in one `read`.
-#[test]
-fn corked_replies_leave_as_one_send() {
-    let (r, sender, receiver) = egress_pair(Limits::TEST, None);
-    let receiver = Rc::new(receiver);
-    let peer = Peer::new(&r, r.client_conn(sender).expect("under the cap"), None);
-    let frames: Vec<Vec<u8>> = (0..8u8).map(|i| vec![0xD0 | i; 200]).collect();
-    let expected: Vec<u8> = frames.iter().flatten().copied().collect();
-
-    let rx = Rc::clone(&receiver);
-    r.block_on(async move {
-        for frame in &frames {
-            peer.cork(frame);
-        }
-        assert!(
-            read_available(&rx, 4096).is_empty(),
-            "corking must put nothing on the wire before a flush",
-        );
-        peer.flush_egress().await.expect("the flush must send");
-    });
-
-    assert_eq!(
-        read_available(&receiver, 4096),
-        expected,
-        "one flush is one send carrying every corked frame in order",
-    );
-    drop(receiver);
-}
-
-/// A slot too large to cork, sent with bytes corked, puts the corked bytes on the
-/// wire first: a zero-copy forward may not overtake a reply already written.
-#[test]
-fn a_slot_forward_cannot_overtake_a_corked_reply() {
-    let (_ring, slot) = ring_slot(COALESCE_MAX_BYTES);
-    let slot_bytes = slot.frame_bytes().to_vec();
-    assert!(slot_bytes.len() > COALESCE_MAX_BYTES, "the slot goes out alone");
-
-    let (r, sender, receiver) = egress_pair(Limits::TEST, None);
-    let peer = Peer::new(&r, r.client_conn(sender).expect("under the cap"), None);
-    let corked = vec![0x5Au8; 128];
-
-    let c = corked.clone();
-    r.block_on(async move {
-        peer.cork(&c);
-        peer.send(slot).await.expect("the slot forward must send");
-        assert_eq!(peer.corked_len(), 0, "the slot went out alone, not corked");
-    });
-
-    let seen = read_available(&receiver, 256 * 1024);
-    let mut expected = corked;
-    expected.extend_from_slice(&slot_bytes);
-    assert_eq!(seen, expected, "the corked bytes precede the forwarded slot");
-    drop(receiver);
-}
-
-/// A small slot sent with bytes corked joins them: nothing reaches the wire until
-/// a flush, and that one flush carries both.
-#[test]
-fn a_small_slot_is_corked_behind_corked_bytes() {
-    let (_ring, slot) = ring_slot(64);
-    let slot_bytes = slot.frame_bytes().to_vec();
-
-    let (r, sender, receiver) = egress_pair(Limits::TEST, None);
-    let receiver = Rc::new(receiver);
-    let peer = Peer::new(&r, r.client_conn(sender).expect("under the cap"), None);
-    let corked = vec![0x5Au8; 128];
-
-    let (c, rx) = (corked.clone(), Rc::clone(&receiver));
-    let both = corked.len() + slot_bytes.len();
-    r.block_on(async move {
-        peer.cork(&c);
-        peer.send(slot).await.expect("corking cannot fail");
-        assert_eq!(peer.corked_len(), both, "a small slot is corked, not sent");
-        assert!(read_available(&rx, 4096).is_empty(), "nothing is on the wire yet");
-        peer.flush_egress().await.expect("the flush must send");
-    });
-
-    let mut expected = corked;
-    expected.extend_from_slice(&slot_bytes);
-    assert_eq!(
-        read_available(&receiver, 4096),
-        expected,
-        "one flush carries both, in order"
-    );
-    drop(receiver);
-}
-
 /// N frames written in one `write` are all queued off a single recv completion:
 /// a pipelined run costs one read, not one per frame.
 #[test]
@@ -544,24 +429,4 @@ fn one_recv_completion_queues_a_whole_pipelined_run() {
     );
     assert_eq!(got[0].as_slice()[0], 0, "in order");
     drop(partner);
-}
-
-/// Corking is unbounded on its own; `flush_if_full` is what ships a long run,
-/// and it leaves nothing behind once it does.
-#[test]
-fn a_full_accumulator_ships_between_messages() {
-    let (r, sender, receiver) = egress_pair(Limits::TEST, None);
-    let peer = Peer::new(&r, r.client_conn(sender).expect("under the cap"), None);
-    let drain = spawn_drain(receiver, COALESCE_MAX_BYTES);
-    let frame = vec![0x3Cu8; 4096];
-
-    r.block_on(async move {
-        while peer.corked_len() < COALESCE_MAX_BYTES {
-            peer.cork(&frame);
-        }
-        peer.flush_if_full().await.expect("the flush must send");
-        assert_eq!(peer.corked_len(), 0, "the flush ships everything corked");
-    });
-
-    assert!(drain.join().expect("drain") >= COALESCE_MAX_BYTES);
 }

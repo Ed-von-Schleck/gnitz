@@ -4,12 +4,15 @@
 //! the per-frame ceiling, the inbound charge, the zero-length prefix — is
 //! covered once, on the fd path, in `reactor::tests`.
 //!
-//! No sockets: a rustls client+server pair is handshaken by shuttling
-//! ciphertext through memory, then client-written plaintext frames are fed
-//! into the server session and drained through `ingest_cipher`.
+//! The ingress tests use no sockets: a rustls client+server pair is handshaken
+//! by shuttling ciphertext through memory, then client-written plaintext frames
+//! are fed into the server session and drained through `ingest_cipher`. The
+//! teardown tests run a `TlsShared` over a socketpair.
+
+use std::os::fd::{AsRawFd, OwnedFd};
 
 use super::*;
-use crate::runtime::reactor::Budget;
+use crate::runtime::reactor::{egress_pair, poll_until, read_nonblocking, Budget, Limits};
 
 /// Handshake an in-memory client/server pair (dev-cert server config). The
 /// client verifies for real against the minted dev certificate's public
@@ -120,4 +123,61 @@ fn split_ciphertext_delivery_reassembles() {
         ingest_cipher(&mut server, chunk, &mut q).unwrap();
     }
     assert_eq!(frame_payloads(&mut q), vec![payload]);
+}
+
+/// A `TlsShared` over one end of a socketpair; the other end is the client.
+fn tls_over_socketpair() -> (Rc<Reactor>, Rc<ClientConn>, OwnedFd) {
+    let (r, sender, receiver) = egress_pair(Limits::TEST, None);
+    let conn = r.client_conn(sender).expect("under the cap");
+    let (cfg, _) = config::server_crypto(None, None).unwrap();
+    TlsShared::start(Rc::clone(&r), Rc::clone(&conn), cfg);
+    (r, conn, receiver)
+}
+
+/// Tick until the client end reads EOF, returning every byte before it; `None`
+/// if the EOF never comes.
+fn read_until_eof(r: &Reactor, fd: &OwnedFd) -> Option<Vec<u8>> {
+    let mut seen = Vec::new();
+    let eof = poll_until(r, 10_000, || {
+        while let Some(bytes) = read_nonblocking(fd, 4096) {
+            if bytes.is_empty() {
+                return true;
+            }
+            seen.extend_from_slice(&bytes);
+        }
+        false
+    });
+    eof.then_some(seen)
+}
+
+/// TLS record content type of an alert.
+const ALERT: u8 = 0x15;
+
+/// Bytes that are not TLS end the session with a fatal alert the client reads
+/// before the EOF.
+#[test]
+fn a_protocol_error_reaches_the_client_as_an_alert() {
+    let (r, _conn, client) = tls_over_socketpair();
+    let n = unsafe {
+        let req = b"GET / HTTP/1.1\r\n\r\n";
+        libc::write(client.as_raw_fd(), req.as_ptr() as *const libc::c_void, req.len())
+    };
+    assert!(n > 0, "write");
+
+    let seen = read_until_eof(&r, &client).expect("the session ends");
+    assert_eq!(seen.first(), Some(&ALERT), "an alert precedes the EOF, got {seen:?}");
+}
+
+/// A local close ships the close_notify, then shuts the socket down.
+#[test]
+fn a_tls_close_ships_close_notify_before_the_shutdown() {
+    let (r, conn, client) = tls_over_socketpair();
+    conn.retire();
+
+    let seen = read_until_eof(&r, &client).expect("the flusher shuts the socket down");
+    assert_eq!(
+        seen.first(),
+        Some(&ALERT),
+        "a close_notify precedes the EOF, got {seen:?}"
+    );
 }

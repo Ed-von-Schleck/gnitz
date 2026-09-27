@@ -30,7 +30,7 @@ mod sync;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
-pub(crate) use test_support::reactor_with_rings;
+pub(crate) use test_support::{egress_pair, poll_until, reactor_with_rings, read_nonblocking, ring_slot, spawn_drain};
 mod uring;
 mod wake_queue;
 

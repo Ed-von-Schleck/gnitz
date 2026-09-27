@@ -434,7 +434,7 @@ async fn connection_loop(peer: Peer, shared: Rc<Shared>) {
 /// Returns when the peer is gone or refused; the caller closes.
 async fn serve_connection(peer: &Peer, shared: &Rc<Shared>) {
     let deadline = shared.disp().reactor().timer(Instant::now() + shared.hello_timeout);
-    let hello = match select2(peer.recv(), deadline).await {
+    let hello = match select2(peer.next_request(), deadline).await {
         Either::A(hello) => hello,
         Either::B(()) => None,
     };
@@ -447,21 +447,8 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>) {
         return;
     }
 
-    loop {
-        // Never wait on the client holding corked bytes, and never hold more
-        // than the budget: between them these are the whole shipping rule.
-        let mut next = peer.try_recv();
-        if next.is_none() {
-            if peer.flush_egress().await.is_err() {
-                return;
-            }
-            next = peer.recv().await;
-        }
-        let Some(buf) = next else { return };
+    while let Some(buf) = peer.next_request().await {
         handle_message(peer, buf, shared).await;
-        if peer.flush_if_full().await.is_err() {
-            return;
-        }
     }
 }
 
@@ -873,12 +860,9 @@ async fn handle_push(
     let catalog = shared.catalog_rwlock.read().await;
     let kind = target_kind(shared, target_id, Access::Write)?;
 
-    // The guard drops before the empty-batch ACK: the reply is a socket write,
-    // and this lock is writer-preferring.
     let batch = match decoded.data_batch {
         Some(b) if !b.is_empty() => b,
         _ => {
-            drop(catalog);
             send_ok_response(shared, peer, target_id, None, 0, client_version);
             return Ok(());
         }

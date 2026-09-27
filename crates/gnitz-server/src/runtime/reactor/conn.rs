@@ -5,7 +5,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use gnitz_store::storage::batch_pool::PooledSendBuf;
 
-use super::io::{ClientConn, RecvEnd, RecvFilter};
+use super::io::{ClientConn, Life, RecvEnd, RecvFilter};
 use super::*;
 
 /// A connection with a recv armed on it — the reactor's whole per-connection
@@ -43,8 +43,7 @@ impl SendBody {
     }
 }
 
-/// This client's egress side is finished: a send failed, or the client was
-/// evicted for making no progress.
+/// This client's connection is finished.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct PeerGone;
 
@@ -148,7 +147,7 @@ impl Reactor {
         let mut conns = self.inner.conns.borrow_mut();
         let Some(armed) = conns.get_mut(&fd) else { return };
         let mut q = armed.conn.q.borrow_mut();
-        let next = if q.recv_closed() {
+        let next = if armed.conn.life() != Life::Open {
             Err(RecvEnd::Closed)
         } else if res < 0 {
             Err(RecvEnd::Socket)
@@ -165,15 +164,19 @@ impl Reactor {
                 drop(conns);
                 if end.is_clean() {
                     gnitz_debug!("reactor: fd={fd} recv side ended: {end}");
-                    armed.conn.q.borrow_mut().close();
+                    armed.conn.end_recv();
                 } else {
                     gnitz_warn!(
                         "reactor: fd={fd} recv side ended: {end} (res={res}, inbound held={} of {} B)",
                         self.inner.inbound.held(),
                         self.inner.inbound.cap(),
                     );
-                    armed.conn.abort();
-                    armed.conn.shutdown();
+                    match end {
+                        // The transport may owe the client a reply to the violation.
+                        RecvEnd::Protocol => armed.conn.retire(),
+                        // Owed nothing, and possibly not reading.
+                        _ => armed.conn.fail(),
+                    }
                 }
             } // `armed` drops: the reactor's hold on the connection ends
         }
@@ -181,7 +184,8 @@ impl Reactor {
 
     /// Send `body`'s whole byte range on `conn`. Loops on short sends; each kernel
     /// send has its own `Limits::client_send_timeout` deadline, past which the
-    /// client is evicted.
+    /// client is evicted. A failed or evicted send finishes the connection
+    /// ([`ClientConn::fail`]).
     pub(crate) async fn send_owned(&self, conn: &Rc<ClientConn>, body: SendBody) -> Result<(), PeerGone> {
         let mut out = Outbound { _conn: Rc::clone(conn), body };
         let len = out.body.bytes().len();
@@ -208,12 +212,13 @@ impl Reactor {
                     );
                     // The abandoned send completes only once the socket errors; its
                     // `ops` entry holds the connection and body until then.
-                    conn.shutdown();
+                    conn.fail();
                     return Err(PeerGone);
                 }
             };
             // A zero is the kernel accepting nothing, which is not progress either.
             if rc <= 0 {
+                conn.fail();
                 return Err(PeerGone);
             }
             sent += rc as usize;
