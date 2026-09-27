@@ -1,7 +1,7 @@
 //! The descriptive bytes a frame carries outside any checksum — a data block's
 //! WAL header and a schema record's arity prefix.
 
-use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
+use crate::test_support::{encode_to_wire_vec, make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_store::schema::decode_schema_block;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
@@ -71,7 +71,7 @@ fn no_flip_in_a_schema_records_arity_prefix_is_silently_inert() {
 #[test]
 fn single_bit_header_sweep_rejects_every_flip() {
     let schema = make_schema_u64_i64();
-    let clean_data = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]).encode_to_wire_vec();
+    let clean_data = encode_to_wire_vec(&make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]));
     Batch::decode_from_wal_block(&clean_data, &schema).expect("clean");
 
     let mut buf = clean_data.clone();

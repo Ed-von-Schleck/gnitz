@@ -6,7 +6,7 @@
 use gnitz_expr::SchemaFacts;
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use crate::protocol::transport::{frame_len_prefix, ClientTransport};
+use crate::protocol::transport::ClientTransport;
 
 /// Both ends of a connected Unix socketpair — the loopback every framing test
 /// runs over.
@@ -42,7 +42,7 @@ pub(crate) fn reply_ctrl(tid: u64, lsn: u64) -> Vec<u8> {
 
 /// `[u32 LE len][payload]`, what a peer writes.
 pub(crate) fn framed(payload: &[u8]) -> Vec<u8> {
-    let mut v = frame_len_prefix(payload.len()).unwrap().to_vec();
+    let mut v = gnitz_wire::frame_len_prefix(payload.len()).to_vec();
     v.extend_from_slice(payload);
     v
 }

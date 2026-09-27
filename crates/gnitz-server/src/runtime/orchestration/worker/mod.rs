@@ -303,7 +303,7 @@ impl WorkerProcess {
     /// Deliver a relay to the wait blocked on exactly its `(view_id, source_id)`
     /// pair, or park it in `pending_relays` for a later one.
     fn take_or_park_relay(&mut self, relay_wait: (i64, i64), req: Request) -> Option<RelayHit> {
-        let ipc::DecodedWire { control, schema, data_batch } = req.wire;
+        let ipc::DecodedWire { control, schema, data_batch, .. } = req.wire;
         let target_id = control.hdr.target_id as i64;
         let key = (target_id, control.hdr.arg0 as i64);
         let decision = control.hdr.flags.backfill;
@@ -341,12 +341,7 @@ impl WorkerProcess {
     }
 
     fn dispatch_inner(&mut self, req: Request) -> Result<(), gnitz_wire::WireFault> {
-        let Request {
-            kind,
-            request_id,
-            fifo,
-            wire: mut decoded,
-        } = req;
+        let Request { kind, request_id, fifo, wire: decoded } = req;
         let hdr = decoded.control.hdr;
         let target_id = hdr.target_id as i64;
         let route = ReplyRoute {
@@ -355,7 +350,7 @@ impl WorkerProcess {
             fifo,
             schema_version: hdr.flags.schema_version,
         };
-        let blob: Vec<u8> = std::mem::take(&mut decoded.control.blob);
+        let blob = decoded.blob;
         let batch = decoded.data_batch;
 
         match kind {
@@ -431,7 +426,7 @@ impl WorkerProcess {
                 Ok(())
             }
 
-            SalMessageKind::ScanSpec => self.answer_scan_spec(route, &blob),
+            SalMessageKind::ScanSpec => self.answer_scan_spec(route, &blob, hdr.arg0),
             SalMessageKind::DeltaRead => self.answer_delta_read(route, hdr.arg1, hdr.arg0, &blob),
 
             SalMessageKind::UniquePreflight => {
@@ -505,12 +500,15 @@ impl WorkerProcess {
     }
 
     /// Answer one `ReadSpec` read, streaming the keeper back.
-    fn answer_scan_spec(&mut self, route: ReplyRoute, blob: &[u8]) -> Result<(), gnitz_wire::WireFault> {
+    fn answer_scan_spec(
+        &mut self,
+        route: ReplyRoute,
+        blob: &[u8],
+        reply_layout: u64,
+    ) -> Result<(), gnitz_wire::WireFault> {
         let target_id = route.target_id as i64;
-        let (spec, reply_block) = gnitz_wire::ReadSpec::decode(blob).map_err(|e| format!("scan_spec: {e}"))?;
-        let reply_schema = gnitz_store::schema::decode_schema_block(reply_block)
-            .map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
-        let keeper = self.cat().scan_spec(target_id, spec, &reply_schema)?;
+        let spec = gnitz_wire::ReadSpec::decode(blob)?;
+        let keeper = self.cat().scan_spec(target_id, spec, reply_layout)?;
         self.send_reply(route, keeper);
         Ok(())
     }
@@ -521,12 +519,11 @@ impl WorkerProcess {
         route: ReplyRoute,
         after_tick: u64,
         cut_tick: u64,
-        reply_block: &[u8],
+        blob: &[u8],
     ) -> Result<(), gnitz_wire::WireFault> {
         let target_id = route.target_id as i64;
-        let reply_schema = gnitz_store::schema::decode_schema_block(reply_block)
-            .map_err(|e| format!("delta_read: reply schema block: {e}"))?;
-        let keeper = self.cat().delta_read(target_id, after_tick, cut_tick, &reply_schema)?;
+        let reply_layout = gnitz_wire::decode_all(blob, "delta read", |r| r.u64())?;
+        let keeper = self.cat().delta_read(target_id, after_tick, cut_tick, reply_layout)?;
         self.send_reply(route, keeper);
         Ok(())
     }

@@ -159,11 +159,12 @@ fn reads_defer_inside_exchange_in_request_order() {
     for (parked, (kind, target, arg0)) in wp.exchange.deferred_replay.iter().zip(reads) {
         assert_eq!(parked.kind, kind);
         let ctrl = &parked.wire.control;
+        let blob = &parked.wire.blob;
         assert_eq!(
             (ctrl.hdr.target_id, ctrl.hdr.arg0, ctrl.hdr.arg1),
             (u64::from(target), arg0, 31)
         );
-        assert_eq!(ctrl.blob.as_slice(), &[9, 8, 7]);
+        assert_eq!(blob.as_slice(), &[9, 8, 7]);
     }
 }
 
@@ -753,7 +754,7 @@ fn a_row_wider_than_the_frame_cap_faults() {
     let frames = walk_frames(ptr);
     assert_eq!(frames.len(), 1, "the fault is the whole reply");
     let ctrl = gnitz_wire::control::peek_control_block(&frames[0].1).unwrap();
-    let fault = ctrl.fault().expect("a fault frame");
+    let fault = ctrl.fault(&frames[0].1).expect("a fault frame");
     assert_eq!(fault.status, gnitz_wire::WireStatus::Error);
     assert_eq!(frames[0].0, 5);
     assert!(

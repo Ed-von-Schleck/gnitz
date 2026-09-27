@@ -4,7 +4,7 @@ use super::error::StorageError;
 use super::StagedFile;
 use crate::schema::key::PkBuf;
 use crate::schema::MAX_PK_BYTES;
-use gnitz_wire::{Reader, Writer};
+use gnitz_wire::{decode_all, Reader, Writer};
 
 const MAGIC: u64 = 0x4D414E49464E5447;
 const VERSION: u64 = 15;
@@ -49,7 +49,7 @@ pub(crate) struct ManifestEntry {
 
 /// Encode `m` as the file [`read`] decodes.
 pub(crate) fn encode(m: &Manifest) -> Vec<u8> {
-    let mut w = Writer::with_capacity(64 * (1 + m.entries.len()));
+    let mut w = Writer::new();
     w.u64(MAGIC)
         .u64(VERSION)
         .u64(m.stamp.checkpoint_gen)
@@ -69,7 +69,7 @@ fn decode(buf: &[u8]) -> Result<Manifest, StorageError> {
     const TRUNCATED: StorageError = StorageError::Corrupt("manifest truncated");
     let truncated = |_| TRUNCATED;
     let (covered, digest) = buf.split_last_chunk::<8>().ok_or(TRUNCATED)?;
-    let mut r = Reader::new(covered, "manifest");
+    let mut r = Reader::new(covered);
     if r.u64().map_err(truncated)? != MAGIC {
         return Err(StorageError::Corrupt("manifest magic"));
     }
@@ -79,7 +79,7 @@ fn decode(buf: &[u8]) -> Result<Manifest, StorageError> {
     if gnitz_wire::checksum(covered) != u64::from_le_bytes(*digest) {
         return Err(StorageError::Corrupt("manifest checksum"));
     }
-    decode_body(&mut r).map_err(|_| StorageError::Corrupt("manifest body"))
+    decode_all(&covered[r.pos()..], "manifest body", decode_body).map_err(|_| StorageError::Corrupt("manifest body"))
 }
 
 fn decode_body(r: &mut Reader) -> Result<Manifest, String> {

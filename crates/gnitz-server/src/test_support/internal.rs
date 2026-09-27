@@ -289,7 +289,7 @@ pub fn seek_by_index_range(
         .schema();
     let range = gnitz_wire::KeyRange::new(gnitz_wire::PkColList::from_slice(cols), eq, start, end);
     let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::Range(range));
-    let rows = engine.scan_spec(tid, spec, &schema)?;
+    let rows = engine.scan_spec(tid, spec, schema.layout_digest())?;
     Ok(((!rows.is_empty()).then_some(rows), schema))
 }
 

@@ -98,7 +98,10 @@ fn hydrate_full_scan_bench() {
         let schema = engine.registry.relation(view).map(Relation::schema).unwrap();
         cell(label, &mut engine, |registry, h| {
             let spec = ReadSpec::all_rows(ReadBound::None);
-            registry.scan_spec(view, spec, &schema, Some(h)).unwrap().len()
+            registry
+                .scan_spec(view, spec, schema.layout_digest(), Some(h))
+                .unwrap()
+                .len()
         });
         engine.close();
     }
@@ -121,7 +124,9 @@ fn hydrate_seek_bench() {
         key as u128,
     )));
     let seek = |registry: &RelationRegistry, h: &mut Counting| {
-        let out = registry.scan_spec(view, spec.clone(), &schema, Some(h)).unwrap();
+        let out = registry
+            .scan_spec(view, spec.clone(), schema.layout_digest(), Some(h))
+            .unwrap();
         assert_eq!(out.len(), 1, "one row at the sought key");
         let v0 = u64::from_le_bytes(out.get_col_ptr(0, 0, 8).try_into().unwrap());
         assert_eq!(v0, scramble(key), "the payload the view last ticked over");
@@ -161,7 +166,10 @@ fn hydrate_filtered_limit_bench() {
         },
     };
     cell("filtered LIMIT 1", &mut engine, |registry, h| {
-        let rows = registry.scan_spec(view, spec.clone(), &schema, Some(h)).unwrap().len();
+        let rows = registry
+            .scan_spec(view, spec.clone(), schema.layout_digest(), Some(h))
+            .unwrap()
+            .len();
         assert_eq!(rows, 1, "the predicate matches one row");
         rows
     });
@@ -291,7 +299,10 @@ fn hydrate_trace_probe_bench() {
         scramble(ROWS / 2) as u128,
     )));
     cell("join point seek", &mut engine, |registry, h| {
-        registry.scan_spec(join, spec.clone(), &schema, Some(h)).unwrap().len()
+        registry
+            .scan_spec(join, spec.clone(), schema.layout_digest(), Some(h))
+            .unwrap()
+            .len()
     });
 
     for (label, base) in [

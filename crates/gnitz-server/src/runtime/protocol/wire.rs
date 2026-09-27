@@ -199,9 +199,9 @@ impl<'a> WireMsg<'a> {
         if has_data {
             pos += match self.data {
                 WireData::None => unreachable!("has_data implies a batch"),
-                WireData::Whole(b) => b.encode_to_wire(out, pos),
-                WireData::Range { batch, start, rows } => batch.encode_range_to_wire(start, rows, out, pos),
-                WireData::Scattered { batch, indices } => batch.encode_scattered_to_wire(indices, out, pos),
+                WireData::Whole(b) => b.encode_to_wire(&mut out[pos..]),
+                WireData::Range { batch, start, rows } => batch.encode_range_to_wire(start, rows, &mut out[pos..]),
+                WireData::Scattered { batch, indices } => batch.encode_scattered_to_wire(indices, &mut out[pos..]),
             };
         }
 
@@ -236,6 +236,9 @@ pub(crate) fn unique_preflight_wire_schema(idx_schema: &SchemaDescriptor, n_prom
 /// Full decoded wire message.
 pub struct DecodedWire {
     pub control: DecodedControl,
+    /// The frame's blob, copied out of the buffer `control` indexes: a decoded
+    /// request can outlive that buffer.
+    pub blob: Vec<u8>,
     /// The frame's own schema block, decoded; `None` when the frame carried none.
     pub schema: Option<SchemaDescriptor>,
     pub data_batch: Option<Batch>,
@@ -299,7 +302,12 @@ fn decode_frame(
     hint: Option<&SchemaDescriptor>,
     decode: impl FnOnce(&[u8], &SchemaDescriptor) -> Result<Batch, &'static str>,
 ) -> Result<DecodedWire, String> {
-    let mut out = DecodedWire { control, schema: None, data_batch: None };
+    let mut out = DecodedWire {
+        blob: data[control.blob.clone()].to_vec(),
+        control,
+        schema: None,
+        data_batch: None,
+    };
     if let Some(r) = &out.control.schema {
         out.schema = Some(decode_schema_block(&data[r.clone()])?);
     }

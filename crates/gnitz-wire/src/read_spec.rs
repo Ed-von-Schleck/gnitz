@@ -6,7 +6,9 @@
 
 use crate::circuit::{read_aggs, read_cols, read_compute_map, write_aggs, write_cols, write_compute_map};
 use crate::circuit::{read_order_keys, write_order_keys, AggDescriptor, ComputeMap};
-use crate::codec::{Reader, Writer};
+use std::ops::Range;
+
+use crate::codec::{decode_all, Reader, Writer};
 use crate::range::{read_key_range, write_key_range, KeyRange};
 use crate::MAX_PK_BYTES;
 
@@ -178,15 +180,14 @@ impl ReadSpec {
         }
     }
 
-    /// The SCAN_SPEC request blob: `reply_block`, then this spec.
-    pub fn encode(&self, reply_block: &[u8]) -> Vec<u8> {
+    /// The SCAN_SPEC request blob.
+    pub fn encode(&self) -> Vec<u8> {
         let keys = match &self.bound {
             ReadBound::PkSet(k) => k.as_bytes().len(),
             _ => 0,
         };
         let map = self.sink.map.as_ref().map_or(0, |m| m.program.len());
-        let mut w = Writer::with_capacity(64 + reply_block.len() + self.predicate.len() + keys + map);
-        w.bytes32(reply_block);
+        let mut w = Writer::with_capacity(64 + self.predicate.len() + keys + map);
 
         write_read_bound(&mut w, &self.bound);
 
@@ -195,7 +196,7 @@ impl ReadSpec {
         match &self.sink.map {
             Some(m) => {
                 w.bool(true);
-                write_compute_map(&mut w, &m.out_cols, &m.program);
+                write_compute_map(&mut w, m);
             }
             None => {
                 w.bool(false);
@@ -216,52 +217,57 @@ impl ReadSpec {
         w.into_vec()
     }
 
-    /// Decode at the trust boundary: the spec, and the reply block it carries.
-    /// A malformed frame is an `Err`.
-    pub fn decode(buf: &[u8]) -> Result<(ReadSpec, &[u8]), String> {
-        let mut r = Reader::new(buf, "read_spec");
-        let block = r.bytes32()?;
+    /// Decode at the trust boundary. A malformed frame is an `Err`.
+    pub fn decode(buf: &[u8]) -> Result<ReadSpec, String> {
+        decode_all(buf, "read_spec", |r| {
+            let bound = read_read_bound(r)?;
 
-        let bound = read_read_bound(&mut r)?;
+            let predicate = r.bytes32()?.to_vec();
 
-        let predicate = r.bytes32()?.to_vec();
+            let map = if r.bool()? { Some(read_compute_map(r)?) } else { None };
 
-        let map = if r.bool()? {
-            Some(read_compute_map(&mut r).map_err(|e| format!("read_spec: {e}"))?)
-        } else {
-            None
-        };
-
-        let kind = match r.u8()? {
-            SINK_ROWS => {
-                let limit_k = r.u64()?;
-                let order = read_order_keys(&mut r).map_err(|e| format!("read_spec: {e}"))?;
-                if limit_k == 0 && !order.is_empty() {
-                    return Err("read_spec: an order key without a cut".into());
+            let kind = match r.u8()? {
+                SINK_ROWS => {
+                    let limit_k = r.u64()?;
+                    let order = read_order_keys(r)?;
+                    if limit_k == 0 && !order.is_empty() {
+                        return Err("an order key without a cut".into());
+                    }
+                    SinkKind::Rows { order, limit_k }
                 }
-                SinkKind::Rows { order, limit_k }
-            }
-            SINK_FOLD => {
-                // Both counted sections take the circuit codec's caps and
-                // domain checks.
-                let group_cols = read_cols(&mut r).map_err(|e| format!("read_spec: {e}"))?;
-                let aggs = read_aggs(&mut r).map_err(|e| format!("read_spec: {e}"))?;
-                SinkKind::Fold(AggReadSpec { group_cols, aggs })
-            }
-            other => return Err(format!("read_spec: unknown sink tag {other}")),
-        };
+                SINK_FOLD => {
+                    // Both counted sections take the circuit codec's caps and
+                    // domain checks.
+                    let group_cols = read_cols(r)?;
+                    let aggs = read_aggs(r)?;
+                    SinkKind::Fold(AggReadSpec { group_cols, aggs })
+                }
+                other => return Err(format!("unknown sink tag {other}")),
+            };
 
-        r.expect_consumed()?;
-
-        Ok((
-            ReadSpec {
+            Ok(ReadSpec {
                 bound,
                 predicate,
                 sink: ReadSink { map, kind },
-            },
-            block,
-        ))
+            })
+        })
     }
+}
+
+/// The one `PkSet` layout: stride, key count, then the keys.
+fn write_pk_set(w: &mut Writer, stride: usize, keys: &[u8]) {
+    w.u8(stride as u8).u32((keys.len() / stride) as u32).raw(keys);
+}
+
+/// [`write_pk_set`]'s inverse: the stride and the keys, not checked for order.
+fn read_pk_set<'a>(r: &mut Reader<'a>) -> Result<(usize, &'a [u8]), String> {
+    let stride = r.u8()? as usize;
+    if !(1..=MAX_PK_BYTES).contains(&stride) {
+        return Err(format!("PkSet stride {stride} outside 1..={MAX_PK_BYTES}"));
+    }
+    let count = r.u32()? as usize;
+    let keys = r.take(count.checked_mul(stride).ok_or("PkSet key count overflows")?)?;
+    Ok((stride, keys))
 }
 
 /// Splice a [`ReadBound`] into a larger blob: its kind tag, then that kind's
@@ -276,10 +282,8 @@ pub(crate) fn write_read_bound(w: &mut Writer, b: &ReadBound) {
             write_key_range(w, range);
         }
         ReadBound::PkSet(keys) => {
-            w.u8(BOUND_PK_SET)
-                .u8(keys.stride)
-                .u32(keys.len() as u32)
-                .raw(keys.as_bytes());
+            w.u8(BOUND_PK_SET);
+            write_pk_set(w, keys.stride(), keys.as_bytes());
         }
     }
 }
@@ -291,25 +295,16 @@ pub(crate) fn read_read_bound(r: &mut Reader) -> Result<ReadBound, String> {
         BOUND_NONE => ReadBound::None,
         BOUND_RANGE => ReadBound::Range(read_key_range(r)?),
         BOUND_PK_SET => {
-            let stride = r.u8()? as usize;
-            if !(1..=MAX_PK_BYTES).contains(&stride) {
-                return Err(format!("read_spec: PkSet stride {stride} outside 1..={MAX_PK_BYTES}"));
-            }
-            let count = r.u32()? as usize;
-            let bytes = r.take(
-                count
-                    .checked_mul(stride)
-                    .ok_or("read_spec: PkSet key count overflows")?,
-            )?;
+            let (stride, bytes) = read_pk_set(r)?;
             if !strictly_ascending(bytes, stride) {
-                return Err("read_spec: PkSet keys are not strictly ascending".to_string());
+                return Err("PkSet keys are not strictly ascending".to_string());
             }
             ReadBound::PkSet(PkKeys {
                 stride: stride as u8,
                 bytes: bytes.to_vec(),
             })
         }
-        other => return Err(format!("read_spec: unknown bound kind {other}")),
+        other => return Err(format!("unknown bound kind {other}")),
     })
 }
 
@@ -323,8 +318,8 @@ pub enum BoundPeek<'a> {
 /// A request's `PkSet` key list, borrowed in place from its blob.
 pub struct PkSetPeek<'a> {
     blob: &'a [u8],
-    /// Offset of the list's `u32` key count inside `blob`.
-    count_at: usize,
+    /// The list's whole encoding inside `blob`: stride, count and keys.
+    span: Range<usize>,
     pub stride: usize,
     pub keys: &'a [u8],
 }
@@ -334,29 +329,24 @@ impl PkSetPeek<'_> {
     /// [`Self::keys`] — so still strictly ascending — and every other byte
     /// copied verbatim: it decodes to the same spec over those keys.
     pub fn with_keys(&self, keys: &[u8]) -> Vec<u8> {
-        let tail = &self.blob[self.count_at + 4 + self.keys.len()..];
-        let mut w = Writer::with_capacity(self.count_at + 4 + keys.len() + tail.len());
-        w.raw(&self.blob[..self.count_at])
-            .u32((keys.len() / self.stride) as u32)
-            .raw(keys)
-            .raw(tail);
+        let mut w = Writer::with_capacity(self.blob.len() - self.keys.len() + keys.len());
+        w.raw(&self.blob[..self.span.start]);
+        write_pk_set(&mut w, self.stride, keys);
+        w.raw(&self.blob[self.span.end..]);
         w.into_vec()
     }
 }
 
 /// The routing bound of a SCAN_SPEC request blob. `None` for any other bound or
-/// a truncated prefix.
+/// a malformed prefix.
 pub fn peek_bound(blob: &[u8]) -> Option<BoundPeek<'_>> {
-    let mut r = Reader::new(blob, "read_spec");
-    r.bytes32().ok()?;
+    let mut r = Reader::new(blob);
     match r.u8().ok()? {
         BOUND_RANGE => read_key_range(&mut r).ok().map(BoundPeek::Range),
         BOUND_PK_SET => {
-            let stride = r.u8().ok()? as usize;
-            let count_at = blob.len() - r.remaining();
-            let count = r.u32().ok()? as usize;
-            let keys = r.take(count.checked_mul(stride)?).ok()?;
-            Some(BoundPeek::PkSet(PkSetPeek { blob, count_at, stride, keys }))
+            let start = r.pos();
+            let (stride, keys) = read_pk_set(&mut r).ok()?;
+            Some(BoundPeek::PkSet(PkSetPeek { blob, span: start..r.pos(), stride, keys }))
         }
         _ => None,
     }

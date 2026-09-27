@@ -1,5 +1,5 @@
 use super::*;
-use crate::protocol::codec::schema_from_block;
+use crate::protocol::codec::{encode_schema_block, schema_from_block};
 use crate::protocol::types::{BatchAppender, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use crate::protocol::wal_block::decode_wal_block;
 use crate::protocol::{ClientVerb, WireConflictMode, WireFlags, WireStatus};
@@ -71,20 +71,21 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
     // this pins is the adapter above it: each family's two blocks are built from
     // *that* family's schema, batch, tid and basis, in that order.
     let ctrl = peek_control_block(&payload).unwrap();
-    let decoded = gnitz_wire::txn_frame::decode_push_txn(&payload[ctrl.body]).unwrap();
+    let decoded = gnitz_wire::txn_frame::decode_items(&payload[ctrl.body], ClientVerb::PushTxn).unwrap();
     let expected = [
         (16u64, WireConflictMode::Update, 42, 2usize),
         (17, WireConflictMode::Error, blind, 1),
         (16, WireConflictMode::Update, blind, 1),
     ];
     assert_eq!(decoded.len(), expected.len());
-    for (fam, (exp_tid, exp_mode, exp_basis, exp_rows)) in decoded.iter().zip(expected) {
-        assert_eq!((fam.tid, fam.mode, fam.basis), (exp_tid, exp_mode, exp_basis));
+    for ((frame, fam), (exp_tid, exp_mode, exp_basis, exp_rows)) in decoded.iter().zip(expected) {
+        let got = (fam.hdr.target_id, fam.hdr.flags.conflict_mode, fam.hdr.arg0);
+        assert_eq!(got, (exp_tid, exp_mode, exp_basis));
         // The schema record is this family's.
-        let block_schema = schema_from_block(fam.schema_block).unwrap();
+        let block_schema = frame_schema(frame, fam).unwrap();
         assert_eq!(block_schema, schema);
         // ... and the data block decodes against it, with this family's rows.
-        let batch = decode_wal_block(fam.data, &block_schema).unwrap();
+        let batch = frame_data(frame, fam, &block_schema).unwrap();
         assert_eq!(batch.len(), exp_rows);
     }
 }
@@ -143,7 +144,12 @@ fn string_columns_round_trip_through_a_frame() {
         blob,
     };
 
-    let buf = encode_frame(header(0, push(), 0), &[], Some(&schema), Some(&batch));
+    let buf = encode_frame(
+        header(0, push(), 0),
+        &[],
+        Some(&encode_schema_block(&schema)),
+        Some(&batch),
+    );
     let ctrl = peek_control_block(&buf).unwrap();
     assert_eq!(frame_schema(&buf, &ctrl).as_ref(), Some(&schema));
     let data = frame_data(&buf, &ctrl, &schema).unwrap();
@@ -179,8 +185,8 @@ fn every_control_field_survives_the_encode() {
     let buf = encode_frame(hdr, b"a blob", None, None);
     let ctrl = peek_control_block(&buf).unwrap();
     assert_eq!(ctrl.hdr, hdr);
-    assert_eq!(ctrl.blob, b"a blob");
-    assert_eq!(ctrl.fault(), None);
+    assert_eq!(&buf[ctrl.blob.clone()], b"a blob");
+    assert_eq!(ctrl.fault(&buf), None);
 }
 
 /// Under a non-`Ok` status the blob is the error text.
@@ -193,7 +199,7 @@ fn a_non_ok_status_carries_its_text_as_the_blob() {
     let buf = encode_frame(err_hdr, b"something broke", None, None);
     let ctrl = peek_control_block(&buf).unwrap();
     assert_eq!(ctrl.hdr.status, WireStatus::Error);
-    assert_eq!(ctrl.fault().map(|f| f.text).as_deref(), Some("something broke"));
+    assert_eq!(ctrl.fault(&buf).map(|f| f.text).as_deref(), Some("something broke"));
 }
 
 #[test]
@@ -227,7 +233,12 @@ fn a_frame_with_a_schema_and_rows_round_trips() {
         blob: vec![],
     };
 
-    let buf = encode_frame(header(42, WireFlags::default(), 0), &[], Some(&schema), Some(&batch));
+    let buf = encode_frame(
+        header(42, WireFlags::default(), 0),
+        &[],
+        Some(&encode_schema_block(&schema)),
+        Some(&batch),
+    );
     let ctrl = peek_control_block(&buf).unwrap();
     assert_eq!(ctrl.hdr.target_id, 42);
     assert_eq!(frame_schema(&buf, &ctrl).as_ref(), Some(&schema));
@@ -244,7 +255,12 @@ fn an_empty_batch_ships_its_schema_and_no_data() {
     };
     let empty = ZSetBatch::new(&schema);
 
-    let buf = encode_frame(header(10, WireFlags::default(), 0), &[], Some(&schema), Some(&empty));
+    let buf = encode_frame(
+        header(10, WireFlags::default(), 0),
+        &[],
+        Some(&encode_schema_block(&schema)),
+        Some(&empty),
+    );
     let ctrl = peek_control_block(&buf).unwrap();
     // Schema sent, but no data (empty batch)
     assert!(ctrl.schema.is_some());

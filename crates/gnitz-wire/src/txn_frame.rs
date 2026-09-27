@@ -1,25 +1,22 @@
 //! The four **multi-item request frames** — `PUSH_TXN`, `DDL_TXN`, `SCAN_MULTI`
 //! and `DELTA_POLL` — in both directions.
 //!
-//! All four open with a control header naming the frame's verb (`target_id =
-//! 0`), and run their items to the end of the frame. They differ only in what
-//! one item is:
+//! A frame is a prologue header naming the verb (`target_id = 0`), then items to
+//! the end of the frame, each a control frame of that verb with no blob:
 //!
-//! ```text
-//! DDL_TXN     ctrl                | ([u64 tid][data block])*
-//! PUSH_TXN    ctrl                | ([u64 tid][u8 mode][u64 basis][u32 len][schema record][data block])*
-//! SCAN_MULTI  ctrl                | ([u64 tid][u16 schema_version])*
-//! DELTA_POLL  ctrl                | ([u64 view_id][u64 after_tick][u32 len][reply block])*
-//! ```
+//! | Verb         | Item header                                              | Sections                  |
+//! |--------------|----------------------------------------------------------|---------------------------|
+//! | `DDL_TXN`    | `target_id` = system family                              | data block                |
+//! | `PUSH_TXN`   | `target_id`; `flags.conflict_mode`; `arg0` = basis       | schema record, data block |
+//! | `SCAN_MULTI` | `target_id`; `flags.schema_version`                      | none                      |
+//! | `DELTA_POLL` | `target_id` = view (≠ 0); `arg0` = reply layout digest; `arg1` = after_tick | none   |
 //!
 //! **A reply fault's `target_id`:** a `DELTA_POLL` fault naming one of its views
 //! ends that position alone; every other fault ends the request.
 
-use crate::codec::{Reader, Writer};
-use crate::control::{encode_frame_head, ControlHeader, CTRL_HEADER_SIZE};
+use crate::control::{append_frame, frame_size, peek_control_block, ControlHeader, DecodedControl, CTRL_HEADER_SIZE};
 use crate::region::Regions;
-use crate::wal::block_size;
-use crate::{ClientVerb, WireConflictMode, WireFlags};
+use crate::{ClientVerb, WireFlags, WireStatus};
 
 /// Maximum relations in one `SCAN_MULTI`. The master holds one scan lease and
 /// one reply train of bookkeeping per relation; a handful of related tables
@@ -31,173 +28,161 @@ pub(crate) const SCAN_MULTI_MAX_RELATIONS: usize = 16;
 /// a host past this chunks into a second request.
 pub const DELTA_POLL_MAX_VIEWS: usize = 64;
 
-// ---------------------------------------------------------------------------
-// Encode
-// ---------------------------------------------------------------------------
-
-/// The shared prologue: a control header naming `verb`, every other field zero.
-/// Each encoder below appends its own body.
-fn prologue(verb: ClientVerb, body_hint: usize) -> Writer {
-    let hdr = ControlHeader {
-        flags: WireFlags { verb, ..Default::default() },
-        ..Default::default()
-    };
-    let mut head = [0u8; CTRL_HEADER_SIZE];
-    encode_frame_head(&mut head, &hdr, &[], None, false);
-    let mut w = Writer::with_capacity(CTRL_HEADER_SIZE + body_hint);
-    w.raw(&head);
-    w
-}
-
-/// Encode a `DDL_TXN` frame, without the 4-byte frame header: every
-/// system-table write of one DDL statement, ingested under one durable SAL zone.
-/// Each block is `(tid, rows, regions)`.
-pub fn encode_ddl_txn(blocks: &[(u64, usize, Regions<'_>)]) -> Vec<u8> {
-    let body = blocks.iter().map(|(_, _, r)| 8 + block_size(r)).sum();
-    let mut w = prologue(ClientVerb::DdlTxn, body);
-    for (tid, rows, regions) in blocks {
-        w.u64(*tid).block(*rows, regions);
-    }
-    w.into_vec()
-}
-
 /// The basis of a `PUSH_TXN` family built from no read. No read reports it, and
 /// no commit exceeds it.
 pub const BLIND: u64 = u64::MAX;
 
-/// One `PUSH_TXN` family, in both directions.
-pub struct PushTxnItem<'a, D> {
-    /// The target relation.
-    pub tid: u64,
-    pub mode: WireConflictMode,
-    /// The commit fails if `tid` was written after `basis`, the watermark of the
-    /// read this family was built from; [`BLIND`] for a family built from no read.
-    pub basis: u64,
-    pub schema_block: &'a [u8],
-    /// The rows and region list to encode; the framed block slice once decoded.
-    pub data: D,
+/// One item to encode: its header (the verb is the frame's) and its sections.
+pub struct FrameItem<'a> {
+    pub hdr: ControlHeader,
+    pub schema: Option<&'a [u8]>,
+    pub data: Option<Regions<'a>>,
 }
 
-/// Encode a `PUSH_TXN` frame, without the 4-byte frame header: user-table
-/// writes committed as one zone. Every family carries its schema block, so the
-/// master validates it with no warm-cache version.
-pub fn encode_push_txn(items: &[PushTxnItem<'_, (usize, Regions<'_>)>]) -> Vec<u8> {
-    let body: usize = items
-        .iter()
-        .map(|f| 8 + 1 + 8 + 4 + f.schema_block.len() + block_size(&f.data.1))
-        .sum();
-    let mut w = prologue(ClientVerb::PushTxn, body);
-    for f in items {
-        w.u64(f.tid)
-            .u8(f.mode.as_wire())
-            .u64(f.basis)
-            .bytes32(f.schema_block)
-            .block(f.data.0, &f.data.1);
+/// Encode a multi-item `verb` frame, without the 4-byte frame length prefix.
+pub fn encode_items(verb: ClientVerb, items: &[FrameItem<'_>]) -> Vec<u8> {
+    let size = CTRL_HEADER_SIZE
+        + items
+            .iter()
+            .map(|it| frame_size(&[], it.schema, it.data.as_deref()))
+            .sum::<usize>();
+    let mut out = Vec::with_capacity(size);
+    let prologue = ControlHeader {
+        flags: WireFlags { verb, ..Default::default() },
+        ..Default::default()
+    };
+    append_frame(&mut out, &prologue, &[], None, None);
+    for it in items {
+        let mut hdr = it.hdr;
+        hdr.flags.verb = verb;
+        append_frame(&mut out, &hdr, &[], it.schema, it.data.as_deref());
     }
-    w.into_vec()
+    debug_assert_eq!(out.len(), size);
+    out
 }
 
-/// Encode a `SCAN_MULTI` frame, without the 4-byte frame header: N relations
-/// read at one SAL cut, each `(tid, cached schema version)`, answered in order.
-pub fn encode_scan_multi(relations: &[(u64, u16)]) -> Vec<u8> {
-    let mut w = prologue(ClientVerb::ScanMulti, relations.len() * (8 + 2));
-    for (tid, version) in relations {
-        w.u64(*tid).u16(*version);
-    }
-    w.into_vec()
-}
-
-/// One DELTA_POLL item: every delta `view_id` recorded after round `after_tick`
-/// (`0` = the whole view), in `reply_block`'s layout.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeltaPollItem<'a> {
-    pub view_id: u64,
-    pub after_tick: u64,
-    pub reply_block: &'a [u8],
-}
-
-/// Encode a `DELTA_POLL` frame, without the 4-byte frame header.
-pub fn encode_delta_poll(views: &[DeltaPollItem<'_>]) -> Vec<u8> {
-    let body: usize = views.iter().map(|v| 8 + 8 + 4 + v.reply_block.len()).sum();
-    let mut w = prologue(ClientVerb::DeltaPoll, body);
-    for v in views {
-        w.u64(v.view_id).u64(v.after_tick).bytes32(v.reply_block);
-    }
-    w.into_vec()
-}
-
-// ---------------------------------------------------------------------------
-// Decode
-// ---------------------------------------------------------------------------
-
-/// Walk a frame body item by item. A frame names at least one item and at most
-/// `cap`; `item` reads one.
-fn items<'a, T>(
-    body: &'a [u8],
-    ctx: &'static str,
-    cap: usize,
-    mut item: impl FnMut(&mut Reader<'a>) -> Result<T, String>,
-) -> Result<Vec<T>, String> {
-    if body.is_empty() {
-        return Err(format!("{ctx}: empty item list"));
-    }
-    let mut r = Reader::new(body, ctx);
-    let mut out = Vec::new();
-    while r.remaining() > 0 {
-        if out.len() == cap {
-            return Err(format!("{ctx}: too many items (max {cap})"));
+/// Split a multi-item `verb` frame's body into its items, in send order: each
+/// item's own frame bytes and its peeked control. An item's `body` is the empty
+/// range at its end.
+pub fn decode_items(body: &[u8], verb: ClientVerb) -> Result<Vec<(&[u8], DecodedControl)>, String> {
+    let (schema, data, cap) = match verb {
+        ClientVerb::DdlTxn => (false, true, usize::MAX),
+        ClientVerb::PushTxn => (true, true, usize::MAX),
+        ClientVerb::ScanMulti => (false, false, SCAN_MULTI_MAX_RELATIONS),
+        ClientVerb::DeltaPoll => (false, false, DELTA_POLL_MAX_VIEWS),
+        other => return Err(format!("{other:?} is not a multi-item verb")),
+    };
+    let item = |rest: &[u8]| -> Result<DecodedControl, String> {
+        let ctrl = peek_control_block(rest)?;
+        if ctrl.hdr.status != WireStatus::Ok {
+            return Err(format!("an item carries status {:?}", ctrl.hdr.status));
         }
-        out.push(item(&mut r)?);
+        if ctrl.hdr.flags.verb != verb {
+            return Err(format!("an item names verb {:?}", ctrl.hdr.flags.verb));
+        }
+        if !ctrl.blob.is_empty() {
+            return Err("an item carries a blob".into());
+        }
+        if ctrl.schema.is_some() != schema {
+            return Err(format!(
+                "an item {} a schema record",
+                if schema { "lacks" } else { "carries" }
+            ));
+        }
+        if ctrl.data.is_some() != data {
+            return Err(format!(
+                "an item {} a data block",
+                if data { "lacks" } else { "carries" }
+            ));
+        }
+        Ok(ctrl)
+    };
+    if body.is_empty() {
+        return Err(format!("{verb:?}: empty item list"));
+    }
+    let mut rest = body;
+    let mut out = Vec::new();
+    while !rest.is_empty() {
+        if out.len() == cap {
+            return Err(format!("{verb:?}: too many items (max {cap})"));
+        }
+        let mut ctrl = item(rest).map_err(|e| format!("{verb:?} item {}: {e}", out.len()))?;
+        let end = ctrl.body.start;
+        ctrl.body = end..end;
+        out.push((&rest[..end], ctrl));
+        rest = &rest[end..];
     }
     Ok(out)
 }
 
-/// Decode a `DDL_TXN` frame body into `(table_id, block)` pairs, in send order;
-/// each block's schema is the caller's catalog's.
-pub fn decode_ddl_txn(body: &[u8]) -> Result<Vec<(u64, &[u8])>, String> {
-    items(body, "DDL_TXN", usize::MAX, |r| Ok((r.u64()?, r.block()?)))
-}
-
-/// Decode a `PUSH_TXN` frame body into its families, in send order, each block
-/// borrowed from `body`.
-pub fn decode_push_txn(body: &[u8]) -> Result<Vec<PushTxnItem<'_, &[u8]>>, String> {
-    items(body, "PUSH_TXN", usize::MAX, |r| {
-        let tid = r.u64()?;
-        let mode =
-            WireConflictMode::from_wire(r.u8()?).ok_or_else(|| "PUSH_TXN: unknown family conflict mode".to_string())?;
-        let basis = r.u64()?;
-        Ok(PushTxnItem {
-            tid,
-            mode,
-            basis,
-            schema_block: r.bytes32()?,
-            data: r.block()?,
+/// Encode a `SCAN_MULTI` frame of `(tid, client_schema_version)` relations,
+/// without the 4-byte frame length prefix.
+pub fn encode_scan_multi(relations: &[(u64, u16)]) -> Vec<u8> {
+    let items: Vec<FrameItem> = relations
+        .iter()
+        .map(|&(target_id, schema_version)| FrameItem {
+            hdr: ControlHeader {
+                target_id,
+                flags: WireFlags { schema_version, ..Default::default() },
+                ..Default::default()
+            },
+            schema: None,
+            data: None,
         })
-    })
+        .collect();
+    encode_items(ClientVerb::ScanMulti, &items)
 }
 
 /// Decode a `SCAN_MULTI` frame body into its per-relation `(tid,
 /// client_schema_version)` list, in request order.
 pub fn decode_scan_multi(body: &[u8]) -> Result<Vec<(u64, u16)>, String> {
-    items(body, "SCAN_MULTI", SCAN_MULTI_MAX_RELATIONS, |r| {
-        Ok((r.u64()?, r.u16()?))
-    })
+    Ok(decode_items(body, ClientVerb::ScanMulti)?
+        .into_iter()
+        .map(|(_, c)| (c.hdr.target_id, c.hdr.flags.schema_version))
+        .collect())
 }
 
-/// Decode a `DELTA_POLL` frame body into its items, each block borrowed from
-/// `body`. View id `0` is refused: it is the id of a fault ending the request.
-pub fn decode_delta_poll(body: &[u8]) -> Result<Vec<DeltaPollItem<'_>>, String> {
-    items(body, "DELTA_POLL", DELTA_POLL_MAX_VIEWS, |r| {
-        let view_id = r.u64()?;
-        if view_id == 0 {
-            return Err("DELTA_POLL: view id 0 names no view".to_string());
-        }
-        Ok(DeltaPollItem {
-            view_id,
-            after_tick: r.u64()?,
-            reply_block: r.bytes32()?,
+/// One DELTA_POLL item: every delta `view_id` recorded after round `after_tick`
+/// (`0` = the whole view), replied in the layout whose digest is `reply_layout`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeltaPollItem {
+    pub view_id: u64,
+    pub after_tick: u64,
+    pub reply_layout: u64,
+}
+
+/// Encode a `DELTA_POLL` frame, without the 4-byte frame length prefix.
+pub fn encode_delta_poll(views: &[DeltaPollItem]) -> Vec<u8> {
+    let items: Vec<FrameItem> = views
+        .iter()
+        .map(|v| FrameItem {
+            hdr: ControlHeader {
+                target_id: v.view_id,
+                arg0: v.reply_layout,
+                arg1: v.after_tick,
+                ..Default::default()
+            },
+            schema: None,
+            data: None,
         })
-    })
+        .collect();
+    encode_items(ClientVerb::DeltaPoll, &items)
+}
+
+/// Decode a `DELTA_POLL` frame body into its items. View id `0` is refused: it
+/// is the id of a fault ending the request.
+pub fn decode_delta_poll(body: &[u8]) -> Result<Vec<DeltaPollItem>, String> {
+    decode_items(body, ClientVerb::DeltaPoll)?
+        .into_iter()
+        .map(|(_, c)| match c.hdr.target_id {
+            0 => Err("DeltaPoll: view id 0 names no view".to_string()),
+            view_id => Ok(DeltaPollItem {
+                view_id,
+                after_tick: c.hdr.arg1,
+                reply_layout: c.hdr.arg0,
+            }),
+        })
+        .collect()
 }
 
 #[cfg(test)]

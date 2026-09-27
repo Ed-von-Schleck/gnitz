@@ -17,7 +17,7 @@ fn control(view_id: i64, source_id: i64, flags: WireFlags) -> DecodedControl {
             arg0: source_id as u64,
             ..Default::default()
         },
-        blob: Vec::new(),
+        blob: 0..0,
         body: 0..0,
         schema: None,
         data: None,
@@ -37,6 +37,7 @@ fn make_wire(view_id: i64, source_id: i64, pad: bool) -> DecodedWire {
                 ..WireFlags::train_frame(0, true)
             },
         ),
+        blob: Vec::new(),
         schema: Some(u64_pk_only()),
         data_batch: None,
     }
@@ -67,6 +68,7 @@ fn make_frame(view_id: i64, source_id: i64, keys: &[u64], last: bool) -> Decoded
                 ..WireFlags::train_frame(0, last)
             },
         ),
+        blob: Vec::new(),
         schema: Some(u64_pk_only()),
         data_batch: Some(chunk(keys)),
     }

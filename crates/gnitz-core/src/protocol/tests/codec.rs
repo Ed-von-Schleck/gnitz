@@ -67,7 +67,10 @@ fn a_pk_wider_than_the_client_codec_is_rejected() {
         .collect();
     let pk: Vec<u32> = (0..n as u32).collect();
     let block = gnitz_wire::schema_block::encode(&cols, &pk);
-    assert!(gnitz_wire::schema_block::decode(&block).is_ok(), "the codec admits it");
+    assert!(
+        gnitz_wire::schema_block::decode(&block, |_| Ok(())).is_ok(),
+        "the codec admits it"
+    );
     assert!(matches!(schema_from_block(&block), Err(ProtocolError::DecodeError(_))));
 }
 
@@ -85,7 +88,7 @@ fn an_empty_out_of_range_or_duplicate_pk_is_rejected() {
     for pk in [&[][..], &[3], &[1, 1]] {
         let block = gnitz_wire::schema_block::encode(&cols, pk);
         assert!(
-            gnitz_wire::schema_block::decode(&block).is_ok(),
+            gnitz_wire::schema_block::decode(&block, |_| Ok(())).is_ok(),
             "{pk:?}: the codec admits it"
         );
         assert!(

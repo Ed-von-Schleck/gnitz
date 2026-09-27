@@ -14,9 +14,9 @@ fn slices(regions: &[Vec<u8>]) -> Vec<&[u8]> {
 }
 
 /// Frame `regions` into a fresh buffer, as a SAL slot would.
-fn encode(rows: usize, regions: &[&[u8]]) -> Vec<u8> {
+fn encode(regions: &[&[u8]]) -> Vec<u8> {
     let mut buf = vec![0u8; block_size(regions)];
-    assert_eq!(write_block(rows, regions, &mut buf), buf.len());
+    assert_eq!(write_block(regions, &mut buf), buf.len());
     buf
 }
 
@@ -28,7 +28,7 @@ fn parse_block_returns_rows_fixed_bytes_and_heap() {
     let regions = slices(&f);
     let (heap, fixed_regions) = regions.split_last().unwrap();
 
-    let mut buf = encode(ROWS, &regions);
+    let mut buf = encode(&regions);
     assert_eq!(buf.len(), WAL_HEADER_SIZE + ROWS * ROW_WIDTH + heap.len());
     let (rows, fixed, got_heap) = parse_block(&buf, ROW_WIDTH).unwrap();
     assert_eq!(rows, ROWS);
@@ -36,9 +36,9 @@ fn parse_block_returns_rows_fixed_bytes_and_heap() {
     assert_eq!(got_heap, *heap);
 
     let end1 = buf.len();
-    buf.extend_from_slice(&encode(ROWS, &regions));
+    buf.extend_from_slice(&encode(&regions));
     for off in [0, end1] {
-        let block = block_slice_at(&buf, off).expect("a framed block");
+        let block = block_slice(&buf[off..]).expect("a framed block");
         assert_eq!(parse_block(block, ROW_WIDTH).unwrap().0, ROWS);
     }
 }
@@ -50,17 +50,18 @@ fn append_block_matches_write_block() {
     let with_heap = slices(&f);
     let mut no_heap = with_heap.clone();
     *no_heap.last_mut().unwrap() = &[];
-    for (rows, list) in [(ROWS, &with_heap[..]), (ROWS, &no_heap[..]), (0, &[&[][..]][..])] {
+    let empty: [&[u8]; 4] = [&[], &[], &[], &[]];
+    for list in [&with_heap[..], &no_heap[..], &empty[..]] {
         let mut appended = vec![0xAB];
-        append_block(rows, list, &mut appended);
-        assert_eq!(appended[1..], encode(rows, list), "{} regions", list.len());
+        append_block(list, &mut appended);
+        assert_eq!(appended[1..], encode(list), "{} regions", list.len());
     }
 }
 
 /// A zero-row block's heap is dropped: no cell can reference it.
 #[test]
 fn a_zero_row_blocks_heap_is_dropped() {
-    let buf = encode(0, &[b"orphan heap"]);
+    let buf = encode(&[&[], &[], &[], b"orphan heap"]);
     let (rows, fixed, heap) = parse_block(&buf, ROW_WIDTH).unwrap();
     assert_eq!((rows, fixed, heap), (0, &[][..], &[][..]));
 }
@@ -69,7 +70,7 @@ fn a_zero_row_blocks_heap_is_dropped() {
 /// counted field by one bit, and of `ROWS` by one row.
 #[test]
 fn each_guard_rejects_its_forgery() {
-    let clean = encode(ROWS, &slices(&fixture()));
+    let clean = encode(&slices(&fixture()));
     let forged = |off: usize, f: &dyn Fn(u32) -> u32| {
         let mut buf = clean.clone();
         let v = f(read_u32_le(&buf, off));

@@ -24,7 +24,7 @@ impl ZSetBatch {
 #[cfg(test)]
 pub(crate) fn encode_wal_block(batch: &ZSetBatch) -> Vec<u8> {
     let mut out = Vec::new();
-    gnitz_wire::wal::append_block(batch.len(), &batch.wire_regions(), &mut out);
+    gnitz_wire::wal::append_block(&batch.wire_regions(), &mut out);
     out
 }
 

@@ -80,6 +80,12 @@ pub struct Schema {
 }
 
 impl Schema {
+    /// The digest of this schema's physical layout — the one a read request
+    /// names its reply layout by.
+    pub fn layout_digest(&self) -> u64 {
+        gnitz_wire::layout_digest(&self.pk_cols, self.columns.iter().map(|c| c.ty.tc))
+    }
+
     /// Number of logical columns in this schema (PK + payload).
     #[inline]
     pub fn num_columns(&self) -> usize {

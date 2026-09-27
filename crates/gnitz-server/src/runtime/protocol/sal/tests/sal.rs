@@ -736,7 +736,7 @@ fn a_group_with_per_worker_extras_writes_each_slot_its_own_blob() {
     for (w, extra) in extras.iter().enumerate() {
         let slot = msg.slot(w as u32).expect("every worker is written");
         let decoded = decode_sal_slot(slot).expect("a slot decodes");
-        assert_eq!(decoded.control.blob, *extra, "worker {w}");
+        assert_eq!(decoded.blob, *extra, "worker {w}");
     }
     let sizes: Vec<usize> = (0..nw as u32).map(|w| msg.slot(w).unwrap().len()).collect();
     assert!(

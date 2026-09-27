@@ -151,7 +151,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             // A present-but-corrupt blob, or a rejected program, is catalog
             // corruption. Falling back to pass-all would silently turn a WHERE
             // into WHERE TRUE; fail the compile instead.
-            let pred = LogicalProgram::from_blob(blob, "filter")
+            let pred = LogicalProgram::from_blob(blob)
                 .and_then(|p| p.resolve_filter(&in_schema))
                 .map_err(|e| OpBuildErr::Program("filter: invalid predicate program", e))?;
             let out_reg = ctx.push_delta_reg(in_schema);

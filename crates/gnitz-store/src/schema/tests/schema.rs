@@ -513,7 +513,7 @@ fn decode_schema_block_rejects_a_nullable_or_ineligible_pk_column() {
     for bad in [col(TypeCode::U64, true), col(TypeCode::F64, false)] {
         let record = gnitz_wire::schema_block::encode(&[bad], &[0]);
         assert!(
-            gnitz_wire::schema_block::decode(&record).is_ok(),
+            gnitz_wire::schema_block::decode(&record, |_| Ok(())).is_ok(),
             "the record itself is well-formed"
         );
         assert!(decode_schema_block(&record).is_err());
@@ -534,7 +534,7 @@ fn decode_schema_block_rejects_an_empty_out_of_range_or_duplicate_pk() {
     for pk in [&[][..], &[3], &[1, 1]] {
         let record = gnitz_wire::schema_block::encode(&[col; 3], pk);
         assert!(
-            gnitz_wire::schema_block::decode(&record).is_ok(),
+            gnitz_wire::schema_block::decode(&record, |_| Ok(())).is_ok(),
             "{pk:?}: the record itself is well-formed"
         );
         assert!(decode_schema_block(&record).is_err(), "{pk:?}");

@@ -10,7 +10,7 @@ pub const WAL_HEADER_SIZE: usize = 16;
 
 /// Bumped by hand for a block-layout change or a change to any payload the client and
 /// the engine both decode.
-pub(crate) const WAL_EPOCH: u32 = 28;
+pub(crate) const WAL_EPOCH: u32 = 29;
 
 /// WAL/SAL block format version, and the client↔server HELLO version — the
 /// only thing that rejects a stale SAL frame or an old client's catalog write.
@@ -40,11 +40,24 @@ pub fn write_head(dst: &mut [u8], rows: usize, fixed_len: usize, heap_len: usize
     total
 }
 
-/// Frame `rows` rows laid out as the canonical region list `regions` into
-/// `dst`. Returns the bytes written.
-pub fn write_block(rows: usize, regions: &[&[u8]], dst: &mut [u8]) -> usize {
+/// The row count of the canonical region list `regions`, read off its weight
+/// region.
+fn region_rows(regions: &[&[u8]]) -> usize {
+    let w = regions[crate::REG_WEIGHT].len();
+    debug_assert_eq!(w % 8, 0, "a weight region holds whole i64s");
+    w / 8
+}
+
+/// Frame the canonical region list `regions` into `dst`. Returns the bytes
+/// written.
+pub fn write_block(regions: &[&[u8]], dst: &mut [u8]) -> usize {
     let (heap, fixed) = regions.split_last().expect("a region list ends with its heap");
-    let total = write_head(dst, rows, fixed.iter().map(|r| r.len()).sum(), heap.len());
+    let total = write_head(
+        dst,
+        region_rows(regions),
+        fixed.iter().map(|r| r.len()).sum(),
+        heap.len(),
+    );
     let mut at = WAL_HEADER_SIZE;
     for r in regions {
         dst[at..at + r.len()].copy_from_slice(r);
@@ -55,10 +68,15 @@ pub fn write_block(rows: usize, regions: &[&[u8]], dst: &mut [u8]) -> usize {
 }
 
 /// [`write_block`] onto the end of `out`.
-pub fn append_block(rows: usize, regions: &[&[u8]], out: &mut Vec<u8>) {
+pub fn append_block(regions: &[&[u8]], out: &mut Vec<u8>) {
     let (heap, fixed) = regions.split_last().expect("a region list ends with its heap");
     let mut head = [0u8; WAL_HEADER_SIZE];
-    let total = write_head(&mut head, rows, fixed.iter().map(|r| r.len()).sum(), heap.len());
+    let total = write_head(
+        &mut head,
+        region_rows(regions),
+        fixed.iter().map(|r| r.len()).sum(),
+        heap.len(),
+    );
     out.reserve(total);
     out.extend_from_slice(&head);
     for r in regions {
@@ -66,32 +84,27 @@ pub fn append_block(rows: usize, regions: &[&[u8]], out: &mut Vec<u8>) {
     }
 }
 
-/// The WAL block starting at `off`, sized by its own `SIZE` field.
-pub fn block_slice_at(data: &[u8], off: usize) -> Result<&[u8], &'static str> {
-    if off + WAL_HEADER_SIZE > data.len() {
+/// The WAL block at the front of `tail`, sized by its own `SIZE` field.
+pub fn block_slice(tail: &[u8]) -> Result<&[u8], &'static str> {
+    if tail.len() < WAL_HEADER_SIZE {
         return Err("block shorter than header");
     }
-    let size = read_u32_le(data, off + WAL_OFF_SIZE) as usize;
-    if size < WAL_HEADER_SIZE || off + size > data.len() {
+    let size = read_u32_le(tail, WAL_OFF_SIZE) as usize;
+    if size < WAL_HEADER_SIZE || size > tail.len() {
         return Err("declared size past buffer");
     }
-    Ok(&data[off..off + size])
+    Ok(&tail[..size])
 }
 
 /// Validate a block whose rows are `row_width` bytes of fixed regions each,
 /// and return its row count, its fixed-region bytes and its heap. A zero-row
 /// block's heap is dropped: no cell can reference it.
 pub fn parse_block(block: &[u8], row_width: usize) -> Result<(usize, &[u8], &[u8]), &'static str> {
-    if block.len() < WAL_HEADER_SIZE {
-        return Err("block shorter than header");
-    }
+    let block = block_slice(block)?;
     if read_u32_le(block, WAL_OFF_VERSION) != WAL_FORMAT_VERSION {
         return Err("unknown block version");
     }
-    let size = read_u32_le(block, WAL_OFF_SIZE) as usize;
-    if size > block.len() {
-        return Err("declared size past buffer");
-    }
+    let size = block.len();
     let rows = read_u32_le(block, WAL_OFF_ROWS) as usize;
     let heap_len = read_u32_le(block, WAL_OFF_HEAP_LEN) as usize;
     let fixed_end = rows.checked_mul(row_width).and_then(|f| f.checked_add(WAL_HEADER_SIZE));

@@ -12,10 +12,9 @@ use std::time::Instant;
 
 use crate::client::DeltaCursor;
 use crate::error::ClientError;
-use crate::protocol::codec::schema_from_block;
+use crate::protocol::codec::{encode_schema_block, schema_from_block};
 use crate::protocol::transport::Next;
 use crate::protocol::wal_block::decode_wal_block_into;
-use crate::protocol::ReplySchema;
 use crate::protocol::{
     encode_ddl_txn, encode_frame, encode_push_txn, hello_handshake, ClientTransport, ClientVerb, ProtocolError,
     PushFamily, Schema, WireConflictMode, WireFlags, WireStatus, ZSetBatch,
@@ -185,13 +184,13 @@ pub enum Request<'a> {
         batch: &'a ZSetBatch,
         mode: WireConflictMode,
     },
-    /// SCAN_SPEC, carrying the caller's reply schema — the decode hint for
-    /// every frame of the train, since the server sends none back. Uncorrelated
-    /// and off the cache in both directions.
+    /// SCAN_SPEC: the request names `reply_schema`'s layout digest, and
+    /// `reply_schema` decodes every frame of the train. Uncorrelated and off the
+    /// cache in both directions.
     ScanSpec {
         target_id: u64,
         spec: &'a gnitz_wire::ReadSpec,
-        reply_schema: &'a ReplySchema,
+        reply_schema: &'a Arc<Schema>,
     },
     /// SCAN_MULTI: N trains in request order, each decoded under its own
     /// relation.
@@ -576,25 +575,30 @@ impl Session {
                 };
                 let hdr = ControlHeader { flags, target_id, ..Default::default() };
                 (
-                    encode_frame(hdr, &[], (version == 0).then_some(schema), Some(batch)),
+                    encode_frame(
+                        hdr,
+                        &[],
+                        (version == 0).then(|| encode_schema_block(schema)).as_deref(),
+                        Some(batch),
+                    ),
                     SlotKind::Push { tid: target_id },
                 )
             }
             Request::ScanSpec { target_id, spec, reply_schema } => {
-                // The reply schema rides the request blob and stays with the slot
-                // as the decode hint.
-                let blob = spec.encode(reply_schema.block());
+                // The reply layout's digest rides the header; the schema stays
+                // with the slot as the decode hint.
                 let hdr = ControlHeader {
                     flags: WireFlags {
                         verb: ClientVerb::ScanSpec,
                         ..Default::default()
                     },
                     target_id,
+                    arg0: reply_schema.layout_digest(),
                     ..Default::default()
                 };
                 (
-                    encode_frame(hdr, &blob, None, None),
-                    SlotKind::ScanSpec { reply_schema: reply_schema.schema() },
+                    encode_frame(hdr, &spec.encode(), None, None),
+                    SlotKind::ScanSpec { reply_schema: Arc::clone(reply_schema) },
                 )
             }
             Request::ScanMulti(tids) => {
@@ -611,7 +615,7 @@ impl Session {
 
     /// DELTA_POLL: one train per item, in order, delivered to the [`PollSink`] of a
     /// [`Self::step_polling`] drain — without which they are dropped, hence no [`Request`].
-    pub(crate) fn submit_delta_poll(&mut self, views: &[txn_frame::DeltaPollItem<'_>]) -> Result<SlotId, ClientError> {
+    pub(crate) fn submit_delta_poll(&mut self, views: &[txn_frame::DeltaPollItem]) -> Result<SlotId, ClientError> {
         self.check_open()?;
         self.enqueue_slot(
             txn_frame::encode_delta_poll(views),
@@ -637,7 +641,7 @@ impl Session {
                  split the request"
             )));
         }
-        self.transport.enqueue(frame)?;
+        self.transport.enqueue(frame);
         let id = SlotId(self.next_slot);
         self.next_slot += 1;
         self.pending.push_back(Slot { id, kind });
@@ -765,7 +769,11 @@ impl Session {
     /// its fault is read before the continuation test.
     ///
     /// Returns the delta-poll position this frame filled, if it filled one.
-    fn feed(&mut self, buf: Vec<u8>, done: &mut Completions) -> Result<Option<(SlotId, PolledView)>, ProtocolError> {
+    fn feed(
+        &mut self,
+        mut buf: Vec<u8>,
+        done: &mut Completions,
+    ) -> Result<Option<(SlotId, PolledView)>, ProtocolError> {
         // Destructured so the head slot stays borrowed for the whole function
         // while the cache and the accumulator are independent `&mut`s.
         let Session { pending, schema_cache, accum, .. } = self;
@@ -799,14 +807,14 @@ impl Session {
             | SlotKind::Resolve => None,
         };
 
-        let ctrl = peek_control_block(&buf).map_err(|e| ProtocolError::DecodeError(e.into()))?;
+        let ctrl = peek_control_block(&buf).map_err(ProtocolError::DecodeError)?;
         let frame_schema = ctrl
             .schema
             .clone()
             .map(|r| schema_from_block(&buf[r]))
             .transpose()?
             .map(Arc::new);
-        if let Some(fault) = ctrl.fault() {
+        if let Some(fault) = ctrl.fault(&buf) {
             // A DELTA_POLL failure that names a view ends that view's position
             // alone; only one naming no relation fails the request.
             if let Some((view, positions)) = poll {
@@ -862,7 +870,10 @@ impl Session {
         // Decoded straight into the accumulator: a train carries one data frame
         // per worker, and a per-frame batch would be copied in and dropped.
         match ctrl.data.clone() {
-            Some(r) if head.kind.keeps_blocks_raw() => accum.blocks.push(RawBlock { frame: buf, block: r }),
+            Some(r) if head.kind.keeps_blocks_raw() => accum.blocks.push(RawBlock {
+                frame: std::mem::take(&mut buf),
+                block: r,
+            }),
             Some(r) => {
                 let eff = train
                     .as_ref()
@@ -898,7 +909,7 @@ impl Session {
         let reply = match &head.kind {
             SlotKind::Read { .. } => Ok(Reply::Scan(scan_reply(schema, data, ctrl.hdr.arg0)?)),
             SlotKind::Push { .. } => Ok(Reply::Lsn(ctrl.hdr.arg0)),
-            SlotKind::Resolve => resolve_descriptor(ctrl, schema).map(Reply::Resolve),
+            SlotKind::Resolve => resolve_descriptor(&ctrl, &buf, schema).map(Reply::Resolve),
             SlotKind::Alloc => Ok(Reply::Id(ctrl.hdr.target_id)),
             SlotKind::Commit => Ok(Reply::Lsn(ctrl.hdr.arg0)),
             SlotKind::ScanSpec { reply_schema } => Ok(Reply::Scan(scan_reply(
@@ -978,14 +989,15 @@ fn complete_head(
 
 /// A RESOLVE train as its descriptor; `None` when the reply names no relation.
 fn resolve_descriptor(
-    ctrl: DecodedControl,
+    ctrl: &DecodedControl,
+    frame: &[u8],
     schema: Option<Arc<Schema>>,
 ) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
     if ctrl.hdr.target_id == 0 {
         return Ok(None);
     }
     let schema = schema.ok_or_else(no_schema)?;
-    let desc = RelDescriptorBlob::decode(&ctrl.blob).map_err(ProtocolError::DecodeError)?;
+    let desc = RelDescriptorBlob::decode(&frame[ctrl.blob.clone()]).map_err(ProtocolError::DecodeError)?;
     Ok(Some(Arc::new(RelDescriptor {
         tid: ctrl.hdr.target_id,
         class: desc.class,

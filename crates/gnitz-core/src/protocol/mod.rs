@@ -9,7 +9,6 @@ pub(crate) mod transport;
 pub mod types;
 pub(crate) mod wal_block;
 
-pub use codec::ReplySchema;
 pub use error::ProtocolError;
 // The wire protocol's own vocabulary, re-exported at the module root so the
 // client's protocol code has one import path for it.

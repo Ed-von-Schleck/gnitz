@@ -38,7 +38,7 @@ impl Mirror {
         let reply_desc = descriptor_of(reply_schema)?;
         let keeper = self
             .registry
-            .scan_spec(table_id as i64, spec, &reply_desc, None)
+            .scan_spec(table_id as i64, spec, reply_desc.layout_digest(), None)
             .map_err(engine)?;
         reply_batch(&keeper, &reply_desc, reply_schema)
     }

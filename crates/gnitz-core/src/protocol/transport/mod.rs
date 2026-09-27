@@ -238,7 +238,7 @@ impl ClientTransport {
     /// Send one owned frame — `[u32 LE payload_length][payload]` — blocking
     /// behind anything still queued, and no longer than `until`.
     pub fn send_frame(&mut self, payload: Vec<u8>, until: Option<Instant>) -> Result<(), ProtocolError> {
-        self.enqueue(payload)?;
+        self.enqueue(payload);
         self.flush_blocking(until)
     }
 
@@ -252,10 +252,8 @@ impl ClientTransport {
 
     /// Queue an owned frame behind everything already queued. Nothing is
     /// written here; `flush` / `flush_blocking` ship the queue.
-    pub(crate) fn enqueue(&mut self, payload: Vec<u8>) -> Result<(), ProtocolError> {
-        let prefix = frame_len_prefix(payload.len())?;
-        self.queue.push(prefix, payload);
-        Ok(())
+    pub(crate) fn enqueue(&mut self, payload: Vec<u8>) {
+        self.queue.push(gnitz_wire::frame_len_prefix(payload.len()), payload);
     }
 
     /// Write what the fd accepts from the queue cursor and report whether
@@ -559,29 +557,6 @@ impl From<FrameLenError> for ProtocolError {
             )),
         }
     }
-}
-
-/// Encode a frame's length prefix, refusing zero and anything past
-/// `MAX_FRAME_PAYLOAD`, which no peer reads.
-pub(crate) fn frame_len_prefix(len: usize) -> Result<[u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES], ProtocolError> {
-    if len == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "empty frame (zero is never a legal length)",
-        )
-        .into());
-    }
-    if len > gnitz_wire::MAX_FRAME_PAYLOAD {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "frame size {len} exceeds the maximum frame payload {}",
-                gnitz_wire::MAX_FRAME_PAYLOAD
-            ),
-        )
-        .into());
-    }
-    Ok((len as u32).to_le_bytes())
 }
 
 /// Exchange HELLOs, all within `until`.

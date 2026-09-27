@@ -482,10 +482,7 @@ fn concurrent_publish_drains_in_order(case: &str, ring_frames: usize, n: u64, pa
                         id as u64, next_expected,
                         "{case}: frames arrived out of order at req_id={next_expected}"
                     );
-                    assert_eq!(
-                        decoded.control.blob, pad,
-                        "{case}: payload corrupted at req_id={next_expected}"
-                    );
+                    assert_eq!(decoded.blob, pad, "{case}: payload corrupted at req_id={next_expected}");
                     next_expected += 1;
                 }
                 None if writer_done => panic!(

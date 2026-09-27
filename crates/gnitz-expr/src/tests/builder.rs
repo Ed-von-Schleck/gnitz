@@ -16,7 +16,7 @@ fn the_blob_round_trips_through_the_wire_decoder() {
     let sel = b.emit(L::Select { cond, a: col, b: c });
     let prog = b.build(Some(sel)).expect("a well-formed program");
 
-    let decoded = LogicalProgram::from_blob(&prog.to_blob_bytes(), "test").expect("the blob must decode");
+    let decoded = LogicalProgram::from_blob(&prog.to_blob_bytes()).expect("the blob must decode");
     assert_eq!(decoded.instrs(), prog.instrs());
 }
 

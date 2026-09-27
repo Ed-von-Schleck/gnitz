@@ -17,7 +17,7 @@ impl CatalogEngine {
         Ok(self.registry.scan_spec(
             table_id,
             ReadSpec::all_rows(ReadBound::None),
-            &schema,
+            schema.layout_digest(),
             Some(&mut self.dag),
         )?)
     }
@@ -27,10 +27,10 @@ impl CatalogEngine {
         &mut self,
         target_id: i64,
         spec: ReadSpec,
-        reply_schema: &SchemaDescriptor,
+        reply_layout: u64,
     ) -> Result<Rc<Batch>, WireFault> {
         self.registry
-            .scan_spec(target_id, spec, reply_schema, Some(&mut self.dag))
+            .scan_spec(target_id, spec, reply_layout, Some(&mut self.dag))
             .map_err(|e| WireFault::from(e.to_string()))
     }
 
@@ -42,10 +42,10 @@ impl CatalogEngine {
         target_id: i64,
         after_tick: u64,
         cut_tick: u64,
-        reply_schema: &SchemaDescriptor,
+        reply_layout: u64,
     ) -> Result<Rc<Batch>, WireFault> {
         self.registry
-            .delta_read(target_id, after_tick, cut_tick, reply_schema)
+            .delta_read(target_id, after_tick, cut_tick, reply_layout)
             .map_err(|e| match e {
                 StoreError::DeltaExpired(text) => WireFault {
                     status: gnitz_wire::WireStatus::DeltaExpired,

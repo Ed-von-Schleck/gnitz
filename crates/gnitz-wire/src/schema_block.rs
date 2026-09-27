@@ -8,17 +8,15 @@
 //! u8 × pk_count    PK column indices, in declared PK-tuple order
 //! per column:
 //!   u8             type_code
-//!   u8             flags        NULLABLE | HIDDEN | SERIAL
+//!   u8             flags        NULLABLE | HIDDEN
 //!   u8             scale
 //!   u32 + bytes    name
 //! ```
 //!
 //! The record carries no length of its own; every carrier length-prefixes it.
 
-use crate::codec::{Reader, Writer};
+use crate::codec::{decode_all, Reader, Writer};
 use crate::{ColType, MAX_COLUMNS, MAX_PK_COLUMNS};
-
-const CTX: &str = "schema record";
 
 /// One column as the record carries it. `name` borrows the record's own bytes on
 /// decode; on encode it is whatever the caller has (an empty slice for the
@@ -77,7 +75,7 @@ fn take_col<'a>(r: &mut Reader<'a>) -> Result<SchemaBlockCol<'a>, String> {
     let code = r.u8()?;
     let flags = r.flags(DEFINED_FLAGS)?;
     let scale = r.u8()?;
-    let ty = ColType::from_wire(code, scale).ok_or_else(|| format!("{CTX}: invalid column type {code}/{scale}"))?;
+    let ty = ColType::from_wire(code, scale).ok_or_else(|| format!("invalid column type {code}/{scale}"))?;
     let name = r.bytes32()?;
     Ok(SchemaBlockCol {
         ty,
@@ -105,59 +103,45 @@ pub fn encode(cols: &[SchemaBlockCol], pk_cols: &[u32]) -> Vec<u8> {
     w.into_vec()
 }
 
-/// A well-formed meta-schema record, borrowing the bytes it was decoded from.
-pub struct SchemaBlock<'a> {
-    count: usize,
-    cols: &'a [u8],
-    pk_indices: [u32; MAX_PK_COLUMNS],
-    pk_count: usize,
+/// A record's PK column indices, in declared PK-tuple order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PkIndices {
+    idx: [u32; MAX_PK_COLUMNS],
+    len: usize,
 }
 
-/// Decode and validate `buf`.
-pub fn decode(buf: &[u8]) -> Result<SchemaBlock<'_>, String> {
-    let mut r = Reader::new(buf, CTX);
-    let count = r.u32()? as usize;
-    if count == 0 || count > MAX_COLUMNS {
-        return Err(format!("{CTX}: column count {count} out of range 1..={MAX_COLUMNS}"));
+impl PkIndices {
+    /// Not yet checked against the columns.
+    #[inline]
+    pub fn as_slice(&self) -> &[u32] {
+        &self.idx[..self.len]
     }
-    let pk_count = r.u8()? as usize;
-    if pk_count > MAX_PK_COLUMNS {
-        return Err(format!("{CTX}: pk column count {pk_count} exceeds {MAX_PK_COLUMNS}"));
-    }
-    let mut pk_indices = [0u32; MAX_PK_COLUMNS];
-    for slot in &mut pk_indices[..pk_count] {
-        *slot = r.u8()? as u32;
-    }
-
-    let rest = r.remaining();
-    let cols = r.take(rest)?;
-    let mut cr = Reader::new(cols, CTX);
-    for _ in 0..count {
-        take_col(&mut cr)?;
-    }
-    cr.expect_consumed()?;
-
-    Ok(SchemaBlock { count, cols, pk_indices, pk_count })
 }
 
-impl<'a> SchemaBlock<'a> {
-    #[inline]
-    pub fn num_columns(&self) -> usize {
-        self.count
-    }
-
-    /// Every column in physical order.
-    pub fn columns(&self) -> impl Iterator<Item = SchemaBlockCol<'a>> {
-        let mut r = Reader::new(self.cols, CTX);
-        (0..self.count).map(move |_| take_col(&mut r).expect("decode walked this section"))
-    }
-
-    /// The PK column indices, in declared PK-tuple order, not yet checked
-    /// against the columns.
-    #[inline]
-    pub fn pk_indices(&self) -> &[u32] {
-        &self.pk_indices[..self.pk_count]
-    }
+/// Decode and validate `buf`, handing each column to `on_col` in physical order
+/// once the column count is known to lie within [`MAX_COLUMNS`].
+pub fn decode<'a>(
+    buf: &'a [u8],
+    mut on_col: impl FnMut(SchemaBlockCol<'a>) -> Result<(), String>,
+) -> Result<PkIndices, String> {
+    decode_all(buf, "schema record", |r| {
+        let count = r.u32()? as usize;
+        if count == 0 || count > MAX_COLUMNS {
+            return Err(format!("column count {count} out of range 1..={MAX_COLUMNS}"));
+        }
+        let len = r.u8()? as usize;
+        if len > MAX_PK_COLUMNS {
+            return Err(format!("pk column count {len} exceeds {MAX_PK_COLUMNS}"));
+        }
+        let mut idx = [0u32; MAX_PK_COLUMNS];
+        for slot in &mut idx[..len] {
+            *slot = r.u8()? as u32;
+        }
+        for _ in 0..count {
+            on_col(take_col(r)?)?;
+        }
+        Ok(PkIndices { idx, len })
+    })
 }
 
 #[cfg(test)]

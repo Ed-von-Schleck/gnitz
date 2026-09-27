@@ -12,7 +12,7 @@
 use crate::calendar::CalendarOp;
 use crate::like::LikeMatcher;
 use crate::{ColumnLocator, SchemaFacts};
-use gnitz_wire::{encode_german_string, FixedInt, Reader, TypeCode, Writer};
+use gnitz_wire::{decode_all, encode_german_string, FixedInt, TypeCode, Writer};
 use std::fmt;
 
 /// The register file is capped at 64: the `BoolBinary` 3VL paths, the
@@ -1402,49 +1402,47 @@ impl LogicalProgram {
 
     /// A program blob: the header walked, then the regions lowered into the
     /// typed logical form — the inverse of [`encode_expr_blob`]. The output word
-    /// says which profile it is, so there is one entry point; `label` names the
-    /// call site in a `CorruptBlob`, ahead of the framing's own message.
+    /// says which profile it is, so there is one entry point.
     ///
     /// Every count is bounded against the bytes present before any cap applies,
     /// so a forged count reports truncation rather than a limit it never reached.
-    pub fn from_blob(blob: &[u8], label: &'static str) -> Result<Self, ExprValidateErr> {
-        use ExprValidateErr as E;
-        let corrupt = |msg: String| E::CorruptBlob(format!("{label}: {msg}"));
-        let mut r = Reader::new(blob, "expr blob");
-        // Bounded before the `as u16`: `0x1_0000` would truncate to register 0,
-        // which `written_before(1)` accepts.
-        let result_reg = match r.u32().map_err(corrupt)? {
-            MAP_OUTPUT => None,
-            w if w as usize > MAX_REGS => {
-                return Err(corrupt(format!(
-                    "result register {w} exceeds the {MAX_REGS}-register file"
-                )))
+    pub fn from_blob(blob: &[u8]) -> Result<Self, ExprValidateErr> {
+        let (result_reg, code, sinks, const_strings) = decode_all(blob, "expr blob", |r| {
+            // Bounded before the `as u16`: `0x1_0000` would truncate to register
+            // 0, which `written_before(1)` accepts.
+            let result_reg = match r.u32()? {
+                MAP_OUTPUT => None,
+                w if w as usize > MAX_REGS => {
+                    return Err(format!("result register {w} exceeds the {MAX_REGS}-register file"))
+                }
+                w => Some(Reg(w as u16)),
+            };
+            let n = r.u32()? as usize;
+            let code = r.take(n * INSTR_BYTES)?;
+            let m = r.u32()? as usize;
+            let sinks = r.take(m * SINK_BYTES)?;
+            if m > gnitz_wire::MAX_COLUMNS {
+                return Err(format!("sink count {m} exceeds {}", gnitz_wire::MAX_COLUMNS));
             }
-            w => Some(Reg(w as u16)),
-        };
-        let n = r.u32().map_err(corrupt)? as usize;
-        let code = r.take(n * INSTR_BYTES).map_err(corrupt)?;
+            // No fixed-stride region to bound this count, so it is capped as
+            // declared.
+            let s = r.u32()? as usize;
+            if s > MAX_CONST_POOL {
+                return Err(format!("declared const-pool count {s} exceeds {MAX_CONST_POOL}"));
+            }
+            // Never pre-sized: no allocation here is sized by a number the
+            // sender chose.
+            let mut const_strings: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..s {
+                const_strings.push(r.bytes32()?.to_vec());
+            }
+            Ok((result_reg, code, sinks, const_strings))
+        })
+        .map_err(ExprValidateErr::CorruptBlob)?;
+        let n = code.len() / INSTR_BYTES;
         if n > MAX_REGS {
-            return Err(E::TooManyRegs(n as u32));
+            return Err(ExprValidateErr::TooManyRegs(n as u32));
         }
-        let m = r.u32().map_err(corrupt)? as usize;
-        let sinks = r.take(m * SINK_BYTES).map_err(corrupt)?;
-        if m > gnitz_wire::MAX_COLUMNS {
-            return Err(corrupt(format!("sink count {m} exceeds {}", gnitz_wire::MAX_COLUMNS)));
-        }
-        // No fixed-stride region to bound this count, so it is capped as declared.
-        let s = r.u32().map_err(corrupt)? as usize;
-        if s > MAX_CONST_POOL {
-            return Err(corrupt(format!(
-                "declared const-pool count {s} exceeds {MAX_CONST_POOL}"
-            )));
-        }
-        // Never pre-sized: no allocation here is sized by a number the sender chose.
-        let mut const_strings: Vec<Vec<u8>> = Vec::new();
-        for _ in 0..s {
-            const_strings.push(r.bytes32().map_err(corrupt)?.to_vec());
-        }
-        r.expect_consumed().map_err(corrupt)?;
 
         // Each region was taken at a multiple of its stride, so no tail remains.
         let instrs = code

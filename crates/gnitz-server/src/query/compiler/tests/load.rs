@@ -110,7 +110,7 @@ fn a_malformed_row_aborts_the_load_and_names_the_check() {
     c.put_nodes(|bb| CircuitTables::raw_row(bb, CircuitTables::VIEW_ID, 0, 9999, None, None, None));
     assert_eq!(
         rejection(c.load()),
-        "unknown opcode 9999",
+        "circuit params: unknown opcode 9999",
         "the decoder's own rejection must reach the caller",
     );
 

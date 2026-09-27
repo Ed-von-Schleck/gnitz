@@ -888,7 +888,7 @@ fn from_blob_bench() {
 
     let mut acc = 0usize;
     for _ in 0..passes {
-        let prog = LogicalProgram::from_blob(std::hint::black_box(&blob), "bench").expect("decodes");
+        let prog = LogicalProgram::from_blob(std::hint::black_box(&blob)).expect("decodes");
         acc += prog.resolve_filter(&schema).expect("resolves").prog().int_sets[0].len();
     }
     println!(

@@ -46,15 +46,6 @@ fn spawn_reader(mut t: ClientTransport, count: usize) -> std::thread::JoinHandle
 }
 
 #[test]
-fn test_send_empty_frame_returns_invalid_input() {
-    // Zero is never a legal length prefix, so no empty frame can be sent.
-    let (mut a, _b) = make_transport_pair();
-    let r = a.send_frame(Vec::new(), None);
-    assert!(matches!(r, Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::InvalidInput));
-    assert!(!a.wants_write(), "a rejected frame leaves nothing queued");
-}
-
-#[test]
 fn test_flush_with_nothing_queued_touches_no_fd() {
     // An empty queue returns Ok(false) without a syscall: the peer is gone,
     // so any write would surface EPIPE.
@@ -62,7 +53,7 @@ fn test_flush_with_nothing_queued_touches_no_fd() {
     drop(b);
     assert!(!a.flush().unwrap());
     assert!(!a.wants_write());
-    assert!(a.enqueue(b"x".to_vec()).is_ok());
+    a.enqueue(b"x".to_vec());
     assert!(
         a.flush().is_err(),
         "with a frame queued the write does reach the dead peer"
@@ -70,28 +61,11 @@ fn test_flush_with_nothing_queued_touches_no_fd() {
 }
 
 #[test]
-fn test_frame_len_prefix_rejects_empty_and_oversized() {
-    // The two lengths that would corrupt the stream are refused at enqueue,
-    // before any queue entry exists — the "no writev" half is structural.
-    assert!(
-        matches!(frame_len_prefix(0), Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::InvalidInput)
-    );
-    assert!(matches!(
-        frame_len_prefix(gnitz_wire::MAX_FRAME_PAYLOAD + 1),
-        Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::InvalidInput
-    ));
-    assert_eq!(frame_len_prefix(1).unwrap(), 1u32.to_le_bytes());
-    let (mut a, _b) = make_transport_pair();
-    assert!(a.enqueue(Vec::new()).is_err());
-    assert!(!a.wants_write());
-}
-
-#[test]
 fn test_queue_single_frame() {
     let (mut a, b) = make_transport_pair();
     let data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
     let reader = spawn_reader(b, 1);
-    a.enqueue(data.to_vec()).unwrap();
+    a.enqueue(data.to_vec());
     a.flush_blocking(None).unwrap();
     drop(a);
     let frames = reader.join().unwrap();
@@ -105,7 +79,7 @@ fn test_queue_many_small_frames_in_order() {
     let expected: Vec<Vec<u8>> = (0..n).map(|i| format!("frame-{i}").into_bytes()).collect();
     let reader = spawn_reader(b, n);
     for f in &expected {
-        a.enqueue(f.to_vec()).unwrap();
+        a.enqueue(f.to_vec());
     }
     a.flush_blocking(None).unwrap();
     drop(a);
@@ -121,7 +95,7 @@ fn test_queue_forces_multiple_writev() {
     let expected: Vec<Vec<u8>> = (0..n).map(|i| format!("f{i:04}").into_bytes()).collect();
     let reader = spawn_reader(b, n);
     for f in &expected {
-        a.enqueue(f.to_vec()).unwrap();
+        a.enqueue(f.to_vec());
     }
     a.flush_blocking(None).unwrap();
     drop(a);
@@ -144,7 +118,7 @@ fn test_queue_partial_writes_small_sndbuf_nonblocking() {
         })
         .collect();
     for f in &expected {
-        a.enqueue(f.to_vec()).unwrap();
+        a.enqueue(f.to_vec());
     }
     // Drive it by hand: flush → true means park. With nobody reading yet the
     // first flush must stop at EAGAIN with the cursor mid-batch.
@@ -166,7 +140,7 @@ fn test_send_timeout_leaves_cursor_and_resumes_mid_frame() {
     let (mut a, b) = make_transport_pair();
     set_sockopt_int(a.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 4096);
     let big: Vec<u8> = (0u8..=255).cycle().take(300 * 1024).collect();
-    a.enqueue(big.to_vec()).unwrap();
+    a.enqueue(big.to_vec());
     let r = a.flush_blocking(deadline(Duration::from_millis(100)));
     assert!(
         matches!(r, Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock),
@@ -175,7 +149,7 @@ fn test_send_timeout_leaves_cursor_and_resumes_mid_frame() {
     assert!(a.wants_write(), "the remainder stays queued");
     // A later send queues behind the torn frame.
     let small = b"after".to_vec();
-    a.enqueue(small.to_vec()).unwrap();
+    a.enqueue(small.to_vec());
     let reader = spawn_reader(b, 2);
     // Now the peer drains; the caller re-enters exactly as
     // `eviction_observed_within` does.
@@ -220,7 +194,7 @@ fn test_send_timeout_peer_never_drains_parses_no_torn_frame() {
     let (mut a, b) = make_transport_pair();
     set_sockopt_int(a.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 4096);
     let big: Vec<u8> = vec![7u8; 400 * 1024];
-    a.enqueue(big.to_vec()).unwrap();
+    a.enqueue(big.to_vec());
     assert!(a.flush_blocking(deadline(Duration::from_millis(50))).is_err());
     assert!(a.flush_blocking(deadline(Duration::from_millis(50))).is_err());
     drop(a);

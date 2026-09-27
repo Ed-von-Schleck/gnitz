@@ -5,8 +5,8 @@ use crate::connection::{
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
 use crate::protocol::{
-    BatchAppender, ColumnDef, FkTarget, PkBuf, PkColumn, ProtocolError, PushFamily, ReplySchema, Schema, TypeCode,
-    WireConflictMode, ZSetBatch,
+    BatchAppender, ColumnDef, FkTarget, PkBuf, PkColumn, ProtocolError, PushFamily, Schema, TypeCode, WireConflictMode,
+    ZSetBatch,
 };
 use gnitz_wire::{WireFault, WireStatus};
 use std::collections::{BTreeMap, HashMap};
@@ -569,13 +569,8 @@ impl GnitzClient {
     /// Run a parameterized bounded read — the ad-hoc SELECT access path — decoding
     /// every reply frame under `reply_schema`, since the server sends no schema block.
     pub fn scan_spec(&mut self, table_id: u64, spec: &gnitz_wire::ReadSpec, reply_schema: &Arc<Schema>) -> ScanResult {
-        let reply_schema = ReplySchema::new(Arc::clone(reply_schema));
-        self.round_trip(Request::ScanSpec {
-            target_id: table_id,
-            spec,
-            reply_schema: &reply_schema,
-        })
-        .map(Reply::into_scan)
+        self.round_trip(Request::ScanSpec { target_id: table_id, spec, reply_schema })
+            .map(Reply::into_scan)
     }
 
     // ── The read seam ──────────────────────────────────────────────────────
@@ -717,7 +712,7 @@ impl GnitzClient {
         view_id: u64,
         view_schema: &Arc<Schema>,
     ) -> Result<(ScanReply, DeltaCursor), ClientError> {
-        self.delta_read(view_id, 0, &ReplySchema::new(Arc::clone(view_schema)))
+        self.delta_read(view_id, 0, view_schema)
     }
 
     /// Poll a view's delta feed: every delta it emitted in `(cursor.tick, T]`,
@@ -742,7 +737,7 @@ impl GnitzClient {
         cursor: DeltaCursor,
         view_schema: &Arc<Schema>,
     ) -> Result<(ScanReply, DeltaCursor), ClientError> {
-        let rs = ReplySchema::new(Arc::new(delta_reply_schema(view_schema)?));
+        let rs = Arc::new(delta_reply_schema(view_schema)?);
         let (data, next) = self.delta_read(view_id, cursor.poll_after()?, &rs)?;
         Ok((data, cursor.advanced_to(next)?))
     }
@@ -756,7 +751,7 @@ impl GnitzClient {
     pub(crate) fn delta_bootstrap_raw(
         &mut self,
         view_id: u64,
-        view_schema: &ReplySchema,
+        view_schema: &Arc<Schema>,
     ) -> Result<(Vec<RawBlock>, DeltaCursor), ClientError> {
         self.delta_read_raw(view_id, 0, view_schema)
     }
@@ -767,10 +762,10 @@ impl GnitzClient {
         &mut self,
         view_id: u64,
         after_tick: u64,
-        reply_schema: &ReplySchema,
+        reply_schema: &Arc<Schema>,
     ) -> Result<(ScanReply, DeltaCursor), ClientError> {
         let (blocks, cursor) = self.delta_read_raw(view_id, after_tick, reply_schema)?;
-        let schema = reply_schema.schema();
+        let schema = Arc::clone(reply_schema);
         let mut batch = ZSetBatch::new(&schema);
         for b in &blocks {
             crate::protocol::wal_block::decode_wal_block_into(&mut batch, b.block(), &schema)?;
@@ -785,12 +780,12 @@ impl GnitzClient {
         &mut self,
         view_id: u64,
         after_tick: u64,
-        reply_schema: &ReplySchema,
+        reply_schema: &Arc<Schema>,
     ) -> Result<(Vec<RawBlock>, DeltaCursor), ClientError> {
         let item = DeltaPollItem {
             view_id,
             after_tick,
-            reply_block: reply_schema.block(),
+            reply_layout: reply_schema.layout_digest(),
         };
         let slot = self.session.submit_delta_poll(&[item])?;
         let mut got: Option<PolledView> = None;

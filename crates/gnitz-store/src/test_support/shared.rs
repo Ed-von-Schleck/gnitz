@@ -291,3 +291,14 @@ pub fn zset_of(batch: &Batch, schema: &SchemaDescriptor) -> std::collections::Ha
     z.retain(|_, w| *w != 0);
     z
 }
+
+/// `batch` framed as one WAL block in a buffer of its own.
+pub fn encode_to_wire_vec(batch: &Batch) -> Vec<u8> {
+    let mut out = vec![0u8; batch.wire_byte_size()];
+    assert_eq!(
+        batch.encode_to_wire(&mut out),
+        out.len(),
+        "wire_byte_size must size its own encode"
+    );
+    out
+}

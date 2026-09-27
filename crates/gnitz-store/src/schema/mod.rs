@@ -589,6 +589,14 @@ impl SchemaDescriptor {
         true
     }
 
+    /// [`Self::same_physical_layout`]'s layout as one word.
+    pub fn layout_digest(&self) -> u64 {
+        gnitz_wire::layout_digest(
+            self.pk_indices(),
+            self.columns[..self.num_columns()].iter().map(|c| c.type_code),
+        )
+    }
+
     /// Iterate over PK columns in pk-list order, yielding `(col_idx,
     /// &SchemaColumn)`. Mirror of `payload_columns()`. The pk-list position is
     /// the iteration index, so callers that need it use `.enumerate()`.
@@ -841,12 +849,14 @@ pub fn index_spec_and_schema(
 /// Rebuild a [`SchemaDescriptor`] from a meta-schema record. Column names are
 /// carried on the wire but nothing engine-side reads one.
 pub fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, String> {
-    let sb = gnitz_wire::schema_block::decode(data)?;
     let mut cols = [SchemaColumn::EMPTY; MAX_COLUMNS];
-    for (col, c) in cols[..sb.num_columns()].iter_mut().zip(sb.columns()) {
-        *col = SchemaColumn::new(c.ty.tc, c.meta.nullable);
-    }
-    SchemaDescriptor::try_new(&cols[..sb.num_columns()], sb.pk_indices())
+    let mut n = 0;
+    let pk = gnitz_wire::schema_block::decode(data, |c| {
+        cols[n] = SchemaColumn::new(c.ty.tc, c.meta.nullable);
+        n += 1;
+        Ok(())
+    })?;
+    SchemaDescriptor::try_new(&cols[..n], pk.as_slice())
 }
 
 /// The delta store's stamp column: the `_tick` round number, leading the delta

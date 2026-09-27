@@ -633,7 +633,7 @@ fn from_regions(
         sinks.iter().copied(),
         &pool,
     );
-    LogicalProgram::from_blob(&blob, "test")
+    LogicalProgram::from_blob(&blob)
 }
 
 /// [`from_regions`]' `Ok` value (`LogicalProgram`) is not `Debug`/`PartialEq`, so
@@ -665,14 +665,14 @@ fn a_program_round_trips_through_its_blob() {
         },
     ];
     let prog = LogicalProgram::new(instrs.clone(), Output::Result(Reg(1)), pool.clone());
-    let back = LogicalProgram::from_blob(&prog.to_blob_bytes(), "round trip").expect("its own blob decodes");
+    let back = LogicalProgram::from_blob(&prog.to_blob_bytes()).expect("its own blob decodes");
     assert_eq!(back.instrs(), instrs.as_slice());
     assert_eq!(back.const_strings(), pool.as_slice());
     assert!(matches!(back.output, Output::Result(Reg(1))));
 
     // The degenerate program is a valid one, not an absence.
     let empty = LogicalProgram::new(Vec::new(), Output::Slots(Vec::new()), Vec::new());
-    let back = LogicalProgram::from_blob(&empty.to_blob_bytes(), "round trip").expect("a valid empty program decodes");
+    let back = LogicalProgram::from_blob(&empty.to_blob_bytes()).expect("a valid empty program decodes");
     assert!(back.instrs().is_empty() && back.const_strings().is_empty());
     assert!(matches!(back.output, Output::Slots(ref s) if s.is_empty()));
 }
@@ -760,18 +760,18 @@ fn each_framing_guard_rejects_its_own_forgery() {
         ),
         ("a pool entry declared but absent", count(12, 1), "truncated"),
         ("truncated mid pool entry", short_entry, "truncated"),
-        // The trailing-garbage guard: `expect_consumed`, which no truncation
-        // case reaches — those trip the reader first.
+        // The trailing-bytes guard, which no truncation case reaches — those
+        // trip the reader first.
         ("trailing bytes", trailing, "trailing"),
     ];
     for (what, blob, want) in cases {
-        let err = LogicalProgram::from_blob(blob, "table").expect_err(&format!("{what} must be rejected"));
+        let err = LogicalProgram::from_blob(blob).expect_err(&format!("{what} must be rejected"));
         let ExprValidateErr::CorruptBlob(msg) = &err else {
             panic!("{what}: expected a CorruptBlob, got {err:?}");
         };
         assert!(
-            msg.starts_with("table: ") && msg.contains(want),
-            "{what}: the message must carry the call site and name the fault, got: {msg}"
+            msg.starts_with("expr blob: ") && msg.matches("expr blob").count() == 1 && msg.contains(want),
+            "{what}: the message must be labelled once and name the fault, got: {msg}"
         );
     }
 }
@@ -790,7 +790,7 @@ fn a_const_pool_at_the_cap_is_accepted_and_one_past_it_is_not() {
     // Refused off the declared count alone, so the blob need carry no entry.
     let mut b = valid_empty_blob();
     gnitz_wire::write_u32_le(&mut b, 12, MAX_CONST_POOL as u32 + 1);
-    let err = LogicalProgram::from_blob(&b, "cap").expect_err("an over-cap pool must be refused");
+    let err = LogicalProgram::from_blob(&b).expect_err("an over-cap pool must be refused");
     let ExprValidateErr::CorruptBlob(msg) = &err else {
         panic!("expected a CorruptBlob, got {err:?}");
     };
@@ -2313,7 +2313,7 @@ fn a_map_blob_is_not_accepted_as_a_filter() {
     let mut b = crate::ExprBuilder::new();
     b.emit(LogicalInstr::LoadColInt { col: 1 });
     let blob = b.build(None).expect("a well-formed program").to_blob_bytes();
-    let prog = LogicalProgram::from_blob(&blob, "filter").expect("the framing is well-formed");
+    let prog = LogicalProgram::from_blob(&blob).expect("the framing is well-formed");
     assert_eq!(
         prog.resolve_filter(&schema).err(),
         Some(ExprValidateErr::OutputRoleMismatch)
@@ -2327,14 +2327,14 @@ fn a_forged_output_register_above_the_cap_is_rejected() {
     let mut b = crate::ExprBuilder::new();
     let r = b.emit(LogicalInstr::LoadColInt { col: 1 });
     let mut blob = b.build(Some(r)).expect("a well-formed program").to_blob_bytes();
-    assert!(LogicalProgram::from_blob(&blob, "filter").is_ok());
+    assert!(LogicalProgram::from_blob(&blob).is_ok());
     // 0x1_0000 is neither the map sentinel nor a register, and truncates to 0.
     gnitz_wire::write_u32_le(&mut blob, 0, 0x1_0000);
-    let err = LogicalProgram::from_blob(&blob, "filter").expect_err("a forged output word is rejected");
+    let err = LogicalProgram::from_blob(&blob).expect_err("a forged output word is rejected");
     let ExprValidateErr::CorruptBlob(msg) = &err else {
         panic!("expected a CorruptBlob, got {err:?}");
     };
-    assert!(msg.contains("filter: ") && msg.contains("65536"), "got: {msg}");
+    assert!(msg.starts_with("expr blob: ") && msg.contains("65536"), "got: {msg}");
 }
 
 /// A blob naming a result register *and* an output slot answers one question

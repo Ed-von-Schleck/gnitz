@@ -80,7 +80,7 @@ fn ids(b: &Batch) -> Vec<(u128, i64)> {
 
 fn run(registry: &mut RelationRegistry, spec: &ReadSpec) -> Result<Rc<Batch>, StoreError> {
     let schema = id_val_schema();
-    registry.scan_spec(TID, spec.clone(), &schema, None)
+    registry.scan_spec(TID, spec.clone(), schema.layout_digest(), None)
 }
 
 /// The reply is trimmed to the window, not to the mid-scan residency cap: five
@@ -134,7 +134,7 @@ fn a_whole_relation_spec_is_served_off_the_cached_snapshot() {
         ],
         &[0],
     );
-    let Err(err) = r.scan_spec(TID, rows_spec(Vec::new(), 0), &mismatched, None) else {
+    let Err(err) = r.scan_spec(TID, rows_spec(Vec::new(), 0), mismatched.layout_digest(), None) else {
         panic!("a reply layout off the relation's must be refused on the snapshot path");
     };
     assert!(err.to_string().contains("reply schema does not match"), "{err}");
@@ -242,13 +242,15 @@ fn index_walk(col: u32, start: Cut, end: Cut, order: Vec<OrderKey>, limit_k: u64
 }
 
 fn walk_ids(registry: &mut RelationRegistry, spec: &ReadSpec) -> Vec<u128> {
-    let mut got: Vec<u128> = ids(&registry.scan_spec(TID, spec.clone(), &walk_schema(), None).unwrap())
-        .into_iter()
-        .map(|(id, w)| {
-            assert_eq!(w, 1);
-            id
-        })
-        .collect();
+    let mut got: Vec<u128> = ids(&registry
+        .scan_spec(TID, spec.clone(), walk_schema().layout_digest(), None)
+        .unwrap())
+    .into_iter()
+    .map(|(id, w)| {
+        assert_eq!(w, 1);
+        id
+    })
+    .collect();
     got.sort_unstable();
     got
 }
@@ -327,7 +329,7 @@ fn a_walk_over_an_unindexable_column_is_refused() {
     })
     .unwrap();
     let spec = index_walk(1, Cut::before(0), Cut::after(9), Vec::new(), 0);
-    let Err(err) = r.scan_spec(TID, spec, &schema, None) else {
+    let Err(err) = r.scan_spec(TID, spec, schema.layout_digest(), None) else {
         panic!("a walk over a float column must be refused");
     };
     assert!(err.to_string().contains("no key order"), "{err}");
@@ -373,7 +375,12 @@ fn a_pk_prefix_range_takes_the_pk_walk_over_a_matching_index() {
     );
     assert_eq!(unapplied, ReadBound::None, "a PK walk applies the whole range");
     let got = ids(&r
-        .scan_spec(TID, ReadSpec::all_rows(ReadBound::Range(range)), &schema, None)
+        .scan_spec(
+            TID,
+            ReadSpec::all_rows(ReadBound::Range(range)),
+            schema.layout_digest(),
+            None,
+        )
         .unwrap());
     assert_eq!(got.len(), 3);
 }
@@ -533,7 +540,7 @@ fn a_skeleton_store_hydrates_chunk_by_chunk() {
 
     assert_eq!(
         rows_of(
-            &r.scan_spec(TID, rows_spec(Vec::new(), 0), &schema, Some(&mut h))
+            &r.scan_spec(TID, rows_spec(Vec::new(), 0), schema.layout_digest(), Some(&mut h))
                 .unwrap()
         ),
         ingested(|_| true)
@@ -543,12 +550,14 @@ fn a_skeleton_store_hydrates_chunk_by_chunk() {
             bound: pk_set(&[k]),
             ..rows_spec(Vec::new(), 0)
         };
-        let hit = r.scan_spec(TID, spec, &schema, Some(&mut h)).unwrap();
+        let hit = r.scan_spec(TID, spec, schema.layout_digest(), Some(&mut h)).unwrap();
         assert_eq!(rows_of(&hit), ingested(|i| i == k));
     }
 
     h.calls.clear();
-    let got = r.scan_spec(TID, pk_range(0, 104), &schema, Some(&mut h)).unwrap();
+    let got = r
+        .scan_spec(TID, pk_range(0, 104), schema.layout_digest(), Some(&mut h))
+        .unwrap();
     assert_eq!(rows_of(&got), ingested(|i| i <= 104));
     assert_eq!(
         h.calls,
@@ -560,7 +569,7 @@ fn a_skeleton_store_hydrates_chunk_by_chunk() {
         bound: pk_set(&[1, 4, 102]),
         ..rows_spec(Vec::new(), 0)
     };
-    let got = r.scan_spec(TID, spec, &schema, Some(&mut h)).unwrap();
+    let got = r.scan_spec(TID, spec, schema.layout_digest(), Some(&mut h)).unwrap();
     assert_eq!(rows_of(&got), ingested(|i| [1, 4, 102].contains(&i)));
 }
 
@@ -580,7 +589,7 @@ fn a_scan_chunk_boundary_inside_a_pk_group() {
         .scan_spec(
             TID,
             rows_spec(Vec::new(), 0),
-            &id_val_schema(),
+            id_val_schema().layout_digest(),
             Some(&mut Recompute::default()),
         )
         .unwrap();
@@ -600,7 +609,9 @@ fn a_limit_stops_at_the_row_inside_a_hydrated_group() {
         bound: pk_set(&[2]),
         ..rows_spec(Vec::new(), 1)
     };
-    let got = r.scan_spec(TID, spec, &id_val_schema(), Some(&mut h)).unwrap();
+    let got = r
+        .scan_spec(TID, spec, id_val_schema().layout_digest(), Some(&mut h))
+        .unwrap();
     assert_eq!(got.count, 1);
 }
 
@@ -639,10 +650,10 @@ fn a_fold_reply_schema_not_matching_its_partial_layout_is_rejected() {
     // The derived partial itself is accepted, which is what makes the two
     // refusals below about the layout rather than about the spec.
     assert!(r
-        .scan_spec(TID, spec.clone(), &partial(Some(TypeCode::I64)), None)
+        .scan_spec(TID, spec.clone(), partial(Some(TypeCode::I64)).layout_digest(), None)
         .is_ok());
     for bad in [partial(None), partial(Some(TypeCode::F64))] {
-        let Err(err) = r.scan_spec(TID, spec.clone(), &bad, None) else {
+        let Err(err) = r.scan_spec(TID, spec.clone(), bad.layout_digest(), None) else {
             panic!("a reply schema off the partial layout must be rejected");
         };
         assert!(err.to_string().contains("reply schema does not match"), "{err}");

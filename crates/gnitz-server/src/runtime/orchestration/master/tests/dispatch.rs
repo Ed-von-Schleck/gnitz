@@ -253,11 +253,10 @@ fn read_route_reaches_the_owners_a_bound_names() {
 
     const NW: usize = 4;
     let keyed = crate::test_support::pk_only_schema(&[gnitz_wire::TypeCode::U64]);
-    let block = crate::catalog::encode_schema_block(&keyed);
     let key = |k: u64| k.to_be_bytes();
     let set_blob = |keys: &[u64]| {
         let keys: Vec<[u8; 8]> = keys.iter().map(|&k| key(k)).collect();
-        ReadSpec::all_rows(ReadBound::PkSet(PkKeys::from_keys(8, keys.iter().map(|k| &k[..])))).encode(&block)
+        ReadSpec::all_rows(ReadBound::PkSet(PkKeys::from_keys(8, keys.iter().map(|k| &k[..])))).encode()
     };
     let owner = |k: u64| keyed.worker_for_pk(&key(k), NW);
 
@@ -274,7 +273,7 @@ fn read_route_reaches_the_owners_a_bound_names() {
             start,
             end,
         )))
-        .encode(&block)
+        .encode()
     };
     assert_eq!(
         route_read(&keyed, Some(&range(Cut::before(42), Cut::after(42))), NW).set,

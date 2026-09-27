@@ -100,12 +100,12 @@ pub(crate) fn write_key_range(w: &mut Writer, r: &KeyRange) {
 }
 
 pub(crate) fn read_key_range(r: &mut Reader) -> Result<KeyRange, String> {
-    let cols = unpack_pk_cols(r.u64()?).map_err(|e| format!("range bound: {}", e.for_role(PkListRole::ColumnList)))?;
+    let cols = unpack_pk_cols(r.u64()?).map_err(|e| e.for_role(PkListRole::ColumnList))?;
     let n_eq = r.u8()? as usize;
     let flags = r.flags(START_AFTER | END_AFTER)?;
     if n_eq >= cols.as_slice().len() {
         return Err(format!(
-            "range bound: {n_eq} equality values leave no range column within its {} key columns",
+            "{n_eq} equality values leave no range column within its {} key columns",
             cols.as_slice().len()
         ));
     }

@@ -57,7 +57,7 @@ fn cursor(tick: u64) -> DeltaCursor {
 
 /// One wire block holding `batch`, as a reply frame would have carried it.
 fn block_of(batch: &Batch) -> RawBlock {
-    RawBlock::from_block(batch.encode_to_wire_vec())
+    RawBlock::from_block(gnitz_store_testkit::encode_to_wire_vec(batch))
 }
 
 /// A bootstrap's train: the view's own rows, in the view's own schema.
@@ -333,6 +333,22 @@ fn a_failed_ingest_erases_that_copy_and_spares_the_rest() {
         BTreeMap::from([((1, 10), 1), ((2, 20), 1)]),
         "the re-bootstrapped copy holds exactly one materialisation",
     );
+}
+
+/// A delta setting a null bit under the NOT NULL payload column is refused, and
+/// the copy it was for is erased.
+#[test]
+fn a_null_bit_on_a_not_null_column_is_refused() {
+    let _g = serial();
+    let (mut store, _dir) = registered("not_null");
+    let mut block = gnitz_store_testkit::encode_to_wire_vec(&make_batch(&make_schema_u64_i64(), &[(1, 1, 10)]));
+    // Row 0's null word, past the header, the one PK and the one weight.
+    block[gnitz_wire::wal::WAL_HEADER_SIZE + 8 + 8] = 1;
+    let err = store
+        .ingest(TID, vec![RawBlock::from_block(block)], cursor(4))
+        .expect_err("the bit must be refused");
+    assert!(err.to_string().contains("NOT NULL"), "{err}");
+    assert_eq!(store.cursor_of(TID), None);
 }
 
 /// One copy that will not open costs that copy; the store still opens.

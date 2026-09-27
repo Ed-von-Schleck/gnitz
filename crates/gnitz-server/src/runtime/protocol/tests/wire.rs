@@ -245,7 +245,7 @@ fn decode_wire_round_trips_error_text() {
         let decoded = decode_sal_slot(&wire).unwrap();
         assert_eq!(decoded.control.hdr.target_id, 7);
         assert_eq!(decoded.control.hdr.status, WireStatus::Error);
-        assert_eq!(decoded.control.blob, text);
+        assert_eq!(decoded.blob, text);
     }
 }
 
@@ -272,7 +272,7 @@ fn decode_wire_round_trips_every_control_field() {
     assert_eq!(decoded.control.hdr.flags, flags);
     assert_eq!(decoded.control.hdr.arg0, 0x1111_2222_3333_4444);
     assert_eq!(decoded.control.hdr.arg1, 0x5555);
-    assert!(decoded.control.blob.is_empty(), "no blob means no blob");
+    assert!(decoded.blob.is_empty(), "no blob means no blob");
     assert_eq!(
         decoded.control.hdr.status,
         WireStatus::Ok,

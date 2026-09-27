@@ -1,17 +1,14 @@
 use super::*;
-use crate::codec::{Reader, Writer};
+use crate::codec::{decode_all, Writer};
 
 fn enc(r: &KeyRange) -> Vec<u8> {
-    let mut w = Writer::with_capacity(0);
+    let mut w = Writer::new();
     write_key_range(&mut w, r);
     w.into_vec()
 }
 
 fn dec(bytes: &[u8]) -> Result<KeyRange, String> {
-    let mut r = Reader::new(bytes, "range");
-    let range = read_key_range(&mut r)?;
-    r.expect_consumed()?;
-    Ok(range)
+    decode_all(bytes, "range", read_key_range)
 }
 
 fn cols(c: &[u32]) -> PkColList {

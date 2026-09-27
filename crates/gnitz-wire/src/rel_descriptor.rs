@@ -1,6 +1,6 @@
 //! The relation-descriptor blob a RESOLVE reply carries beside the schema block.
 
-use crate::codec::{Reader, Writer};
+use crate::codec::{decode_all, Writer};
 use crate::{unpack_pk_cols, IndexProps, PkColList, PkListRole, ViewProps};
 
 wire_enum! {
@@ -64,7 +64,7 @@ pub struct RelDescriptorBlob {
 impl RelDescriptorBlob {
     pub fn encode(&self) -> Vec<u8> {
         let index_count = u16::try_from(self.indexes.len()).expect("a relation's index count fits a u16");
-        let mut w = Writer::with_capacity(1 + 1 + 1 + 2 + 16 * self.indexes.len());
+        let mut w = Writer::new();
         w.u8(self.class.as_wire())
             .bool(self.pk_repeats)
             .bool(self.serial)
@@ -77,24 +77,21 @@ impl RelDescriptorBlob {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, String> {
-        let mut r = Reader::new(buf, "rel descriptor");
-        let class = r.u8()?;
-        let class =
-            RelClass::from_wire(class).ok_or_else(|| format!("rel descriptor: unknown relation class {class}"))?;
-        let pk_repeats = r.bool()?;
-        let serial = r.bool()?;
-        let indexes = (0..r.u16()?)
-            .map(|_| {
-                let cols = unpack_pk_cols(r.u64()?)
-                    .map_err(|rule| format!("rel descriptor: index {}", rule.for_role(PkListRole::ColumnList)))?;
-                let is_unique = IndexProps::from_flags(r.u64()?)
-                    .map_err(|e| format!("rel descriptor: {e}"))?
-                    .is_unique;
-                Ok(RelIndex { cols, is_unique })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        r.expect_consumed()?;
-        Ok(RelDescriptorBlob { class, pk_repeats, serial, indexes })
+        decode_all(buf, "rel descriptor", |r| {
+            let class = r.u8()?;
+            let class = RelClass::from_wire(class).ok_or_else(|| format!("unknown relation class {class}"))?;
+            let pk_repeats = r.bool()?;
+            let serial = r.bool()?;
+            let indexes = (0..r.u16()?)
+                .map(|_| {
+                    let cols = unpack_pk_cols(r.u64()?)
+                        .map_err(|rule| format!("index {}", rule.for_role(PkListRole::ColumnList)))?;
+                    let is_unique = IndexProps::from_flags(r.u64()?)?.is_unique;
+                    Ok(RelIndex { cols, is_unique })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(RelDescriptorBlob { class, pk_repeats, serial, indexes })
+        })
     }
 }
 

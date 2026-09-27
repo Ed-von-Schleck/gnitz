@@ -38,7 +38,9 @@ fn pk_group(engine: &mut CatalogEngine, tid: i64, opk: &[u8]) -> std::rc::Rc<gni
         .expect("a registered relation");
     let keys = gnitz_wire::PkKeys::from_keys(schema.pk_stride(), [opk]);
     let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::PkSet(keys));
-    engine.scan_spec(tid, spec, &schema).expect("a point read")
+    engine
+        .scan_spec(tid, spec, schema.layout_digest())
+        .expect("a point read")
 }
 
 /// [`pk_group`] by a narrow native key.

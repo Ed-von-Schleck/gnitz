@@ -50,6 +50,20 @@ pub fn digest_with_hole(seed: &[u8], buf: &[u8], hole: usize) -> u64 {
     h.digest()
 }
 
+/// The digest of a physical row layout — its PK list and every column's type
+/// code — that a read's reply layout is checked by.
+pub fn layout_digest(pk_indices: &[u32], type_codes: impl IntoIterator<Item = crate::TypeCode>) -> u64 {
+    let mut h = Xxh3Default::default();
+    h.update(&[pk_indices.len() as u8]);
+    for &i in pk_indices {
+        h.update(&i.to_le_bytes());
+    }
+    for tc in type_codes {
+        h.update(&[tc.as_wire()]);
+    }
+    h.digest()
+}
+
 /// Streaming XXH3: `.digest()` over a sequence of updates equals [`checksum`]
 /// over their concatenation — the shard writer's body checksum.
 pub use xxhash_rust::xxh3::Xxh3Default as RowHasher;

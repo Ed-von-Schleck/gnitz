@@ -132,7 +132,29 @@ proptest! {
     }
 }
 
-/// Client `encode_ddl_txn` → server `decode_ddl_txn` → `Batch::decode_from_wal_block`
+proptest! {
+    /// The client's digest of a table equals the engine's, and two layouts share
+    /// a digest iff `same_physical_layout` holds — probed against an unrelated
+    /// schema and against `a` with every payload column's nullability flipped.
+    #[test]
+    fn layout_digest_agrees_with_same_physical_layout(
+        a in arb_schema(gnitz_wire::PK_LIST_MAX_COLS),
+        b in arb_schema(gnitz_wire::PK_LIST_MAX_COLS),
+    ) {
+        prop_assert_eq!(descriptor_to_client_schema(&a).layout_digest(), a.layout_digest());
+        let flipped: Vec<SchemaColumn> = a.columns[..a.num_columns()]
+            .iter()
+            .enumerate()
+            .map(|(i, c)| SchemaColumn::new(c.type_code, !a.pk_indices().contains(&(i as u32)) && !c.nullable))
+            .collect();
+        let twin = SchemaDescriptor::new(&flipped, a.pk_indices());
+        for other in [&b, &twin] {
+            prop_assert_eq!(a.same_physical_layout(other), a.layout_digest() == other.layout_digest());
+        }
+    }
+}
+
+/// Client `encode_ddl_txn` → server `decode_items` → `Batch::decode_from_wal_block`
 /// against each family's own schema, for 1-, 2-, 3-, and 5-family bundles.
 ///
 /// The frame layout itself is `gnitz_wire::txn_frame`'s, round-tripped in that
@@ -145,7 +167,7 @@ proptest! {
 fn ddl_txn_roundtrip_client_to_server() {
     use gnitz_core::protocol::types::{BatchAppender, ZSetBatch};
     use gnitz_core::types::sys_schema;
-    use gnitz_wire::txn_frame::decode_ddl_txn;
+    use gnitz_wire::txn_frame::decode_items;
     use gnitz_wire::{CIRCUIT_NODES_TAB, COL_TAB, IDX_TAB, TABLE_TAB, VIEW_TAB};
 
     // Build a small COL_TAB batch for `oid` with `n` U64 columns.
@@ -197,9 +219,11 @@ fn ddl_txn_roundtrip_client_to_server() {
     let verify = |families: &[(u64, ZSetBatch)], check_pk: &[bool]| {
         let payload = gnitz_core::protocol::encode_ddl_txn(families);
         let ctrl = gnitz_wire::control::peek_control_block(&payload).expect("control header");
-        let decoded = decode_ddl_txn(&payload[ctrl.body]).expect("decode_ddl_txn");
+        let decoded = decode_items(&payload[ctrl.body], gnitz_wire::ClientVerb::DdlTxn).expect("decode_items");
         assert_eq!(decoded.len(), families.len(), "family count");
-        for (fi, ((exp_tid, exp_batch), (got_tid, slice))) in families.iter().zip(&decoded).enumerate() {
+        for (fi, ((exp_tid, exp_batch), (frame, item))) in families.iter().zip(&decoded).enumerate() {
+            let got_tid = &item.hdr.target_id;
+            let slice = &frame[item.data.clone().expect("a DDL_TXN item carries a block")];
             assert_eq!(*got_tid, *exp_tid, "family {fi} tid/order");
             let schema = crate::catalog::SysFamily::from_id(*got_tid as i64)
                 .expect("bundle family id must be a system family")

@@ -10,6 +10,12 @@ pub const MAX_FRAME_PAYLOAD: usize = 64 << 20;
 /// never a legal length.
 pub const FRAME_LEN_PREFIX_BYTES: usize = 4;
 
+/// The length prefix of a `len`-byte payload, `len` in `1..=MAX_FRAME_PAYLOAD`.
+pub fn frame_len_prefix(len: usize) -> [u8; FRAME_LEN_PREFIX_BYTES] {
+    debug_assert!((1..=MAX_FRAME_PAYLOAD).contains(&len), "frame payload of {len} bytes");
+    (len as u32).to_le_bytes()
+}
+
 /// Why a received length prefix was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameLenError {

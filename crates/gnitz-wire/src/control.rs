@@ -4,6 +4,7 @@
 
 use std::ops::Range;
 
+use crate::codec::Reader;
 use crate::flags::{FLAG_HAS_DATA, FLAG_HAS_SCHEMA};
 use crate::{read_u32_le, read_u64_le, write_u32_le, write_u64_le, ClientVerb, WireFault, WireFlags, WireStatus};
 
@@ -37,9 +38,11 @@ pub struct ControlHeader {
     pub arg1: u64,
 }
 
+#[derive(Debug)]
 pub struct DecodedControl {
     pub hdr: ControlHeader,
-    pub blob: Vec<u8>,
+    /// Where the frame's blob sits in the peeked buffer.
+    pub blob: Range<usize>,
     /// The bytes after the last declared section — blob, schema record, data
     /// block — to the end of the frame: a multi-item frame's items.
     pub body: Range<usize>,
@@ -70,11 +73,12 @@ impl DecodedControl {
         Ok(verb)
     }
 
-    /// The error a non-`Ok` frame carries: its status and its blob as text.
-    pub fn fault(&self) -> Option<WireFault> {
+    /// The error a non-`Ok` frame carries: its status and its blob, read out of
+    /// the peeked `frame`, as text.
+    pub fn fault(&self, frame: &[u8]) -> Option<WireFault> {
         (self.hdr.status != WireStatus::Ok).then(|| WireFault {
             status: self.hdr.status,
-            text: String::from_utf8_lossy(&self.blob).into_owned(),
+            text: String::from_utf8_lossy(&frame[self.blob.clone()]).into_owned(),
         })
     }
 }
@@ -88,6 +92,29 @@ pub const fn frame_head_size(blob_len: usize, schema_len: Option<usize>) -> usiz
             Some(n) => 4 + n,
             None => 0,
         }
+}
+
+/// Bytes of one frame with these sections.
+pub fn frame_size(blob: &[u8], schema: Option<&[u8]>, data: Option<&[&[u8]]>) -> usize {
+    frame_head_size(blob.len(), schema.map(<[u8]>::len)) + data.map_or(0, crate::wal::block_size)
+}
+
+/// Append one frame — header, blob, optional schema record, optional data block
+/// over a canonical region list — to `out`.
+pub fn append_frame(
+    out: &mut Vec<u8>,
+    hdr: &ControlHeader,
+    blob: &[u8],
+    schema: Option<&[u8]>,
+    data: Option<&[&[u8]]>,
+) {
+    out.reserve(frame_size(blob, schema, data));
+    let at = out.len();
+    out.resize(at + frame_head_size(blob.len(), schema.map(<[u8]>::len)), 0);
+    encode_frame_head(&mut out[at..], hdr, blob, schema, data.is_some());
+    if let Some(regions) = data {
+        crate::wal::append_block(regions, out);
+    }
 }
 
 /// Write the control header, `blob` and the length-prefixed `schema_block` into
@@ -129,27 +156,29 @@ pub fn encode_frame_head(
 
 /// Decode the control header at the front of the whole frame `data`, and locate
 /// the blocks behind it.
-pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
-    let (h, rest) = data
-        .split_first_chunk::<CTRL_HEADER_SIZE>()
-        .ok_or("control header truncated")?;
+pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, String> {
+    let mut r = Reader::new(data);
+    let h: &[u8; CTRL_HEADER_SIZE] = r
+        .take(CTRL_HEADER_SIZE)
+        .map_err(|_| "control header truncated")?
+        .try_into()
+        .unwrap();
     let blob_len = read_u32_le(h, OFF_BLOB_LEN) as usize;
-    let blob = rest.get(..blob_len).ok_or("control blob runs past the frame")?;
+    r.take(blob_len).map_err(|_| "control blob runs past the frame")?;
+    let blob = CTRL_HEADER_SIZE..r.pos();
     let status = WireStatus::from_wire(read_u32_le(h, OFF_STATUS)).ok_or("control header names no status")?;
     let word = read_u64_le(h, OFF_FLAGS);
     let flags = WireFlags::unpack(word)?;
-    let mut off = CTRL_HEADER_SIZE + blob_len;
     let schema = if word & FLAG_HAS_SCHEMA != 0 {
-        let r = crate::codec::bytes32_extent(data, off).ok_or("schema record runs past the frame")?;
-        off = r.end;
-        Some(r)
+        let s = r.bytes32().map_err(|e| format!("schema record: {e}"))?;
+        Some(r.pos() - s.len()..r.pos())
     } else {
         None
     };
     let data_block = if word & FLAG_HAS_DATA != 0 {
-        let start = off;
-        off += crate::wal::block_slice_at(data, off)?.len();
-        Some(start..off)
+        let at = r.pos();
+        r.take(crate::wal::block_slice(&data[at..])?.len())?;
+        Some(at..r.pos())
     } else {
         None
     };
@@ -161,8 +190,8 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
             arg0: read_u64_le(h, OFF_ARG0),
             arg1: read_u64_le(h, OFF_ARG1),
         },
-        blob: blob.to_vec(),
-        body: off..data.len(),
+        blob,
+        body: r.pos()..data.len(),
         schema,
         data: data_block,
     })

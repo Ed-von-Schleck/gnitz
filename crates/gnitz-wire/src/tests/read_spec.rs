@@ -4,11 +4,6 @@ use crate::PkColList;
 use crate::TypeCode;
 use crate::{AggFunc, MAX_COLUMNS};
 
-/// A stand-in reply block: the codec carries it opaquely.
-fn block() -> Vec<u8> {
-    vec![9u8; 40]
-}
-
 fn sample_order() -> Vec<OrderKey> {
     vec![
         OrderKey { col: 3, desc: false, nulls_first: true },
@@ -78,7 +73,6 @@ fn roundtrips_every_bound_against_every_sink() {
             aggs: vec![AggDescriptor { agg_op: AggFunc::Min, col_idx: 4 }],
         }),
     ];
-    let block = block();
     for (i, bound) in bounds.iter().enumerate() {
         for map in &maps {
             for kind in &kinds {
@@ -89,8 +83,8 @@ fn roundtrips_every_bound_against_every_sink() {
                     predicate: if i % 2 == 0 { vec![1, 2, 3, 4] } else { vec![] },
                     sink: ReadSink { map: map.clone(), kind: kind.clone() },
                 };
-                let bytes = spec.encode(&block);
-                assert_eq!(ReadSpec::decode(&bytes), Ok((spec.clone(), &block[..])), "{spec:?}");
+                let bytes = spec.encode();
+                assert_eq!(ReadSpec::decode(&bytes), Ok(spec.clone()), "{spec:?}");
             }
         }
     }
@@ -99,17 +93,16 @@ fn roundtrips_every_bound_against_every_sink() {
 /// An equality prefix covering every listed column is refused at decode.
 #[test]
 fn a_range_pinning_every_column_is_refused_at_decode() {
-    let block = block();
     let ok = ReadSpec::all_rows(ReadBound::Range(KeyRange::new(
         PkColList::from_slice(&[1, 2]),
         &[7],
         Cut::before(1),
         Cut::after(9),
     )));
-    let mut bytes = ok.encode(&block);
-    assert_eq!(ReadSpec::decode(&bytes), Ok((ok.clone(), &block[..])));
-    // `n_eq` sits after the reply block, the bound tag and the column word.
-    bytes[4 + block.len() + 1 + 8] = 2;
+    let mut bytes = ok.encode();
+    assert_eq!(ReadSpec::decode(&bytes), Ok(ok.clone()));
+    // `n_eq` sits after the bound tag and the column word.
+    bytes[1 + 8] = 2;
     let Err(err) = ReadSpec::decode(&bytes) else {
         panic!("an equality prefix over every key column must be refused");
     };
@@ -128,13 +121,12 @@ fn an_order_key_without_a_cut_is_refused_at_decode() {
             kind: SinkKind::Rows { order: sample_order(), limit_k },
         },
     };
-    let block = block();
-    let Err(err) = ReadSpec::decode(&spec(0).encode(&block)) else {
+    let Err(err) = ReadSpec::decode(&spec(0).encode()) else {
         panic!("an order key without a cut must be refused");
     };
     assert!(err.contains("an order key without a cut"), "{err}");
     let ok = spec(1);
-    assert_eq!(ReadSpec::decode(&ok.encode(&block)), Ok((ok.clone(), &block[..])));
+    assert_eq!(ReadSpec::decode(&ok.encode()), Ok(ok.clone()));
 }
 
 /// `from_keys` is the one sort: duplicates collapse and the list comes out
@@ -171,27 +163,23 @@ fn a_long_wide_pk_set_round_trips_whole() {
         stride,
         raw.iter().map(Vec::as_slice),
     )));
-    let block = block();
-    let bytes = spec.encode(&block);
-    assert_eq!(ReadSpec::decode(&bytes), Ok((spec, &block[..])));
+    let bytes = spec.encode();
+    assert_eq!(ReadSpec::decode(&bytes), Ok(spec));
 }
 
-/// Empty reply block, no bound, empty predicate, absent map and the fold tag of
-/// a hand-built fold-sink blob.
+/// No bound, empty predicate, absent map and the fold tag of a hand-built
+/// fold-sink blob.
 fn fold_header() -> Vec<u8> {
-    let mut bytes = 0u32.to_le_bytes().to_vec(); // reply block len
-    bytes.push(BOUND_NONE);
+    let mut bytes = vec![BOUND_NONE];
     bytes.extend_from_slice(&0u32.to_le_bytes()); // predicate len
     bytes.push(0); // no map
     bytes.push(SINK_FOLD);
     bytes
 }
 
-/// A hand-built `PkSet` bound after an empty reply block: stride, count, then
-/// `keys` verbatim.
+/// A hand-built `PkSet` bound: stride, count, then `keys` verbatim.
 fn pk_set_blob(stride: u8, count: u32, keys: &[u8]) -> Vec<u8> {
-    let mut bytes = 0u32.to_le_bytes().to_vec();
-    bytes.extend_from_slice(&[BOUND_PK_SET, stride]);
+    let mut bytes = vec![BOUND_PK_SET, stride];
     bytes.extend_from_slice(&count.to_le_bytes());
     bytes.extend_from_slice(keys);
     bytes
@@ -202,11 +190,10 @@ fn pk_set_blob(stride: u8, count: u32, keys: &[u8]) -> Vec<u8> {
 /// on the wrong one.
 #[test]
 fn each_decode_guard_rejects_its_own_forgery() {
-    // Layout of the empty Rows spec behind an empty reply block: block len
-    // 0..4 | bound tag 4 | predicate len 5..9 | map presence 9 | sink tag 10 |
-    // limit_k 11..19 | order key count 19..21.
+    // Layout of the empty Rows spec: bound tag 0 | predicate len 1..5 | map
+    // presence 5 | sink tag 6 | limit_k 7..15 | order key count 15..17.
     let poke = |off: usize, val: u8| {
-        let mut bytes = empty_spec().encode(&[]);
+        let mut bytes = empty_spec().encode();
         bytes[off] = val;
         bytes
     };
@@ -221,13 +208,13 @@ fn each_decode_guard_rejects_its_own_forgery() {
     let unsorted = pk_set_blob(1, 2, &[5, 3]);
     let duplicate = pk_set_blob(1, 2, &[5, 5]);
     let trailing = {
-        let mut bytes = empty_spec().encode(&[]);
+        let mut bytes = empty_spec().encode();
         bytes.push(0);
         bytes
     };
     let truncated = {
         // Chop the last PkSet key's bytes off.
-        let bytes = ReadSpec::all_rows(ReadBound::PkSet(keys(8))).encode(&[]);
+        let bytes = ReadSpec::all_rows(ReadBound::PkSet(keys(8))).encode();
         bytes[..bytes.len() - 4].to_vec()
     };
     let bad_agg_op = {
@@ -251,13 +238,13 @@ fn each_decode_guard_rejects_its_own_forgery() {
     };
 
     let cases: &[(&str, Vec<u8>, &str)] = &[
-        ("bound kind", poke(4, 9), "bound kind"),
-        ("sink tag", poke(10, 9), "sink tag"),
-        ("map presence", poke(9, 2), "boolean byte 2"),
+        ("bound kind", poke(0, 9), "bound kind"),
+        ("sink tag", poke(6, 9), "sink tag"),
+        ("map presence", poke(5, 2), "boolean byte 2"),
         (
             "order key cap",
-            poke(19, (MAX_ORDER_KEYS + 1) as u8),
-            "order keys: 17 exceeds cap",
+            poke(15, (MAX_ORDER_KEYS + 1) as u8),
+            "order keys: 17 entries exceeds cap",
         ),
         ("zero stride", zero_stride, "PkSet stride"),
         ("over-wide stride", over_wide_stride, "PkSet stride"),
@@ -276,22 +263,23 @@ fn each_decode_guard_rejects_its_own_forgery() {
         let err = ReadSpec::decode(bytes).expect_err(name);
         assert!(err.contains(want), "{name}: {err:?} does not name {want:?}");
     }
-    // Truncation trips the reader itself, which words its own message.
-    assert!(ReadSpec::decode(&truncated).is_err(), "truncated PkSet");
+    // Truncation trips the reader itself, and the format labels it once.
+    let err = ReadSpec::decode(&truncated).expect_err("truncated PkSet");
+    assert!(err.starts_with("read_spec: truncated"), "{err:?}");
+    assert_eq!(err.matches("read_spec").count(), 1, "{err:?}");
 }
 
 /// Routing reads a `Range` and a `PkSet`'s keys in place, and declines every other
 /// bound and any truncated prefix.
 #[test]
 fn peek_bound_reads_only_the_routing_bounds() {
-    let block = block();
     let with = |bound: ReadBound| {
         ReadSpec {
             bound,
             predicate: vec![1, 2],
             sink: ReadSink::all_rows(),
         }
-        .encode(&block)
+        .encode()
     };
 
     let range = KeyRange::new(PkColList::from_slice(&[0, 1]), &[4], Cut::after(1), Cut::before(9));
@@ -312,7 +300,7 @@ fn peek_bound_reads_only_the_routing_bounds() {
 
     assert!(peek_bound(&with(ReadBound::None)).is_none());
     // Cut inside the key list: the count names bytes the blob does not hold.
-    let key_end = 4 + block.len() + 1 + 1 + 4 + set.as_bytes().len();
+    let key_end = 1 + 1 + 4 + set.as_bytes().len();
     assert!(peek_bound(&blob[..key_end - 1]).is_none());
     assert!(peek_bound(&[]).is_none());
 }
@@ -321,7 +309,6 @@ fn peek_bound_reads_only_the_routing_bounds() {
 /// same spec over the subsequence, the empty one included.
 #[test]
 fn a_pk_set_with_fewer_keys_decodes_to_the_same_spec() {
-    let block = block();
     let maps = [
         None,
         Some(ComputeMap {
@@ -347,7 +334,7 @@ fn a_pk_set_with_fewer_keys_decodes_to_the_same_spec() {
                     predicate: vec![1, 2, 3],
                     sink: ReadSink { map: map.clone(), kind: kind.clone() },
                 };
-                let blob = spec.encode(&block);
+                let blob = spec.encode();
                 let Some(BoundPeek::PkSet(peek)) = peek_bound(&blob) else {
                     panic!("a PkSet peeks as its keys");
                 };
@@ -357,7 +344,7 @@ fn a_pk_set_with_fewer_keys_decodes_to_the_same_spec() {
                         ..spec.clone()
                     };
                     let rekeyed = peek.with_keys(&sub.concat());
-                    assert_eq!(ReadSpec::decode(&rekeyed), Ok((want, &block[..])), "{sub:?}");
+                    assert_eq!(ReadSpec::decode(&rekeyed), Ok(want), "{sub:?}");
                 }
             }
         }

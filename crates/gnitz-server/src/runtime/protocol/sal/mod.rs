@@ -484,10 +484,11 @@ gnitz_wire::wire_enum! {
         Push = 9,
         /// Drive one view-maintenance tick: `arg0` = the tick round.
         Tick = 10,
-        /// A parameterized bounded read (`ReadSpec`).
+        /// A parameterized bounded read: the blob = the encoded `ReadSpec`,
+        /// `arg0` = the reply layout digest.
         ScanSpec = 11,
         /// One DELTA_POLL view: `arg1` = `after_tick`, `arg0` = the cut round, the
-        /// blob = the reply block.
+        /// blob = the reply layout digest, `u64` LE.
         DeltaRead = 12,
     }
 }

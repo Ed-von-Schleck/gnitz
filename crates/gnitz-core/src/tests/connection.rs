@@ -97,7 +97,12 @@ mod spine_tests {
     /// A reply frame carrying its schema block at `version`, data, and `lsn` in
     /// `arg0`; `cont` sets `continuation`.
     fn reply_cold(tid: u64, version: u16, schema: &Schema, batch: &ZSetBatch, lsn: u64, cont: bool) -> Vec<u8> {
-        encode_frame(reply_header(tid, version, lsn, cont), &[], Some(schema), Some(batch))
+        encode_frame(
+            reply_header(tid, version, lsn, cont),
+            &[],
+            Some(&encode_schema_block(schema)),
+            Some(batch),
+        )
     }
 
     /// A hint-only reply frame: data, no schema block, `version` in the flags.
@@ -599,11 +604,13 @@ mod spine_tests {
         let (s, peer) = pair();
         let mut c = GnitzClient::from_session(s);
         let sa = schema_a();
-        let reply_schema = crate::protocol::ReplySchema::new(std::sync::Arc::new(sa.clone()));
-        let block_len = encode_schema_block(&sa).len();
+        let reply_schema = Arc::new(sa.clone());
+        let want = sa.layout_digest();
         let h = std::thread::spawn(move || {
             let req = peer.drain_request();
-            assert!(req.len() >= block_len, "the reply schema rides the request");
+            let ctrl = peek_control_block(&req).unwrap();
+            let items = gnitz_wire::txn_frame::decode_delta_poll(&req[ctrl.body]).unwrap();
+            assert_eq!(items[0].reply_layout, want, "the reply layout rides the request");
             // Two hint-only frames: the server sends no schema block for a delta read.
             peer.send(&reply_warm(9, 0, &batch_a(&[1, 2]), true));
             peer.send(&reply_warm(9, 0, &batch_a(&[3]), false));

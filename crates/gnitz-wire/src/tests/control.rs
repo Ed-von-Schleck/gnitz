@@ -33,10 +33,10 @@ fn frame(hdr: &ControlHeader, blob: &[u8], schema_block: Option<&[u8]>, data: Op
     buf
 }
 
-/// A stand-in WAL block of `body` region bytes.
-fn wal_block(body: &'static [u8]) -> Vec<u8> {
+/// A one-row WAL block whose PK region is `pk`.
+fn wal_block(pk: &'static [u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    crate::wal::append_block(1, &[body, &[]], &mut out);
+    crate::wal::append_block(&[pk, &1i64.to_le_bytes(), &[0; 8], &[]], &mut out);
     out
 }
 
@@ -54,7 +54,7 @@ fn encode_roundtrips() {
         let buf = encode(&hdr, blob);
         let dec = peek_control_block(&buf).expect("decode");
         assert_eq!(dec.hdr, hdr);
-        assert_eq!(dec.blob, blob);
+        assert_eq!(&buf[dec.blob], blob);
         assert_eq!(dec.body, buf.len()..buf.len(), "nothing follows the blob");
         assert_eq!((dec.schema, dec.data), (None, None));
     }
@@ -171,9 +171,11 @@ fn client_verb_refuses_sections_the_verb_does_not_carry() {
 #[test]
 fn fault_reads_the_status_and_blob() {
     let ok = ControlHeader::default();
-    assert_eq!(peek_control_block(&encode(&ok, b"payload")).unwrap().fault(), None);
+    let buf = encode(&ok, b"payload");
+    assert_eq!(peek_control_block(&buf).unwrap().fault(&buf), None);
     let err = ControlHeader { status: WireStatus::SalFull, ..ok };
-    let f = peek_control_block(&encode(&err, b"full \xFF")).unwrap().fault();
+    let buf = encode(&err, b"full \xFF");
+    let f = peek_control_block(&buf).unwrap().fault(&buf);
     assert_eq!(
         f,
         Some(WireFault {
@@ -187,7 +189,7 @@ fn fault_reads_the_status_and_blob() {
 fn peek_rejects_a_truncated_header() {
     let buf = encode(&probe_header(), b"gone");
     assert_eq!(
-        peek_control_block(&buf[..CTRL_HEADER_SIZE - 1]).err(),
+        peek_control_block(&buf[..CTRL_HEADER_SIZE - 1]).err().as_deref(),
         Some("control header truncated")
     );
 }
@@ -199,7 +201,7 @@ fn peek_rejects_a_blob_past_the_frame() {
     for len in [5u32, u32::MAX] {
         buf[OFF_BLOB_LEN..OFF_BLOB_LEN + 4].copy_from_slice(&len.to_le_bytes());
         assert_eq!(
-            peek_control_block(&buf).err(),
+            peek_control_block(&buf).err().as_deref(),
             Some("control blob runs past the frame"),
             "BLOB_LEN {len}"
         );
@@ -212,12 +214,18 @@ fn peek_rejects_a_blob_past_the_frame() {
 fn peek_rejects_an_unknown_status() {
     let mut buf = encode(&probe_header(), b"gone");
     buf[OFF_STATUS..OFF_STATUS + 4].copy_from_slice(&8u32.to_le_bytes());
-    assert_eq!(peek_control_block(&buf).err(), Some("control header names no status"));
+    assert_eq!(
+        peek_control_block(&buf).err().as_deref(),
+        Some("control header names no status")
+    );
 }
 
 #[test]
 fn peek_rejects_reserved_flag_bits() {
     let mut buf = encode(&probe_header(), b"gone");
     buf[OFF_FLAGS..OFF_FLAGS + 8].copy_from_slice(&(1u64 << 63).to_le_bytes());
-    assert_eq!(peek_control_block(&buf).err(), Some("flags: reserved bits set"));
+    assert_eq!(
+        peek_control_block(&buf).err().as_deref(),
+        Some("flags: reserved bits set")
+    );
 }

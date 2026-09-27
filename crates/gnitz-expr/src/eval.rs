@@ -168,7 +168,7 @@ impl RowFilter {
                 walk: None,
                 words: Vec::new(),
             },
-            false => LogicalProgram::from_blob(predicate, "filter")?.resolve_filter(schema)?,
+            false => LogicalProgram::from_blob(predicate)?.resolve_filter(schema)?,
         };
         f.walk = match unapplied {
             ReadBound::Range(r) => Some(RangeMembership::new(r, schema)?),

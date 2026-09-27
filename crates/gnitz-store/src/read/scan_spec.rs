@@ -17,12 +17,13 @@ use crate::storage::{Batch, StoreError};
 use gnitz_expr::{cmp_order_keys, order_locators, OrderLocator, RowFilter};
 
 impl RelationRegistry {
-    /// Execute `spec` on this worker's slice, replying in `reply_schema`'s layout.
+    /// Execute `spec` on this worker's slice, replying in the layout whose
+    /// [`SchemaDescriptor::layout_digest`] is `reply_layout`.
     pub fn scan_spec(
         &self,
         target_id: i64,
         spec: ReadSpec,
-        reply_schema: &SchemaDescriptor,
+        reply_layout: u64,
         hydrator: Option<&mut dyn SkeletonHydrator>,
     ) -> Result<Rc<Batch>, StoreError> {
         let ReadSpec { bound, predicate, sink } = spec;
@@ -34,7 +35,7 @@ impl RelationRegistry {
             (&bound, predicate.is_empty(), &sink.map, &sink.kind)
         {
             if !entry.store().held().has_skeleton_rows() {
-                check_layout(reply_schema, &src_schema)?;
+                check_layout(reply_layout, &src_schema)?;
                 return Ok(entry.full_scan());
             }
         }
@@ -59,11 +60,11 @@ impl RelationRegistry {
         Ok(Rc::new(match &sink.kind {
             SinkKind::Fold(agg) => {
                 let fold = AdhocFold::new(&sink_in, agg, self.config.adhoc_group_cap)?;
-                check_layout(reply_schema, fold.output_schema())?;
+                check_layout(reply_layout, fold.output_schema())?;
                 run_fold_sink(&mut rows, chunk_rows, map.as_mut(), fold)?
             }
             SinkKind::Rows { order, limit_k } => {
-                check_layout(reply_schema, &sink_in)?;
+                check_layout(reply_layout, &sink_in)?;
                 let window = saturated_window(*limit_k);
                 if order.is_empty() {
                     stream_rows(&mut rows, chunk_rows, map.as_mut(), &sink_in, window)?
@@ -92,7 +93,7 @@ impl RelationRegistry {
         id: i64,
         after_tick: u64,
         cut_tick: u64,
-        reply_schema: &SchemaDescriptor,
+        reply_layout: u64,
     ) -> Result<Rc<Batch>, StoreError> {
         let entry = self.relation_or_err(id)?;
         if !entry.has_delta_feed() {
@@ -124,15 +125,15 @@ impl RelationRegistry {
             );
             (feed.range_cursor(band).0, *feed.schema())
         };
-        check_layout(reply_schema, &schema)?;
+        check_layout(reply_layout, &schema)?;
         Ok(cursor.materialize())
     }
 }
 
 /// The reply guard's refusal: a keeper built in any other layout would ship its
 /// regions under the client's strides.
-fn check_layout(reply: &SchemaDescriptor, produced: &SchemaDescriptor) -> Result<(), StoreError> {
-    if !reply.same_physical_layout(produced) {
+fn check_layout(reply_layout: u64, produced: &SchemaDescriptor) -> Result<(), StoreError> {
+    if reply_layout != produced.layout_digest() {
         return Err(StoreError::rejected("reply schema does not match the output layout"));
     }
     Ok(())

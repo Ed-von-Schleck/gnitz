@@ -61,3 +61,16 @@ fn checksum_matches_c_xxh3_64bits() {
         "xxhash-rust and C XXH3_64bits disagree: got 0x{computed:016X}"
     );
 }
+
+/// A layout digest moves with the column count, the PK list and any type code.
+#[test]
+fn layout_digest_separates_every_layout_axis() {
+    use crate::TypeCode::{String as Str, I64, U64};
+    let base = layout_digest(&[0], [U64, I64]);
+    assert_eq!(base, layout_digest(&[0], [U64, I64]));
+    assert_ne!(base, layout_digest(&[0], [U64, I64, I64]), "column count");
+    assert_ne!(base, layout_digest(&[0], [U64]), "column count");
+    assert_ne!(base, layout_digest(&[1], [U64, I64]), "PK index");
+    assert_ne!(base, layout_digest(&[0, 1], [U64, I64]), "PK arity");
+    assert_ne!(base, layout_digest(&[0], [U64, Str]), "type code");
+}

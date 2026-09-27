@@ -1,7 +1,7 @@
 use super::super::batch::REG_PAYLOAD_START;
 use super::*;
 use crate::schema::{SchemaDescriptor, TypeCode};
-use crate::test_support::{make_batch_raw, pk_payload_schema};
+use crate::test_support::{encode_to_wire_vec, make_batch_raw, pk_payload_schema};
 
 /// Where region `r` of a `rows`-row block over `schema` starts.
 fn region_offset(schema: &SchemaDescriptor, rows: usize, r: usize) -> usize {
@@ -17,7 +17,7 @@ fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
     use crate::test_support::{make_batch_bytes, make_schema_pk_u64_payload_string};
     let schema = make_schema_pk_u64_payload_string();
     let long: &[u8] = b"a string long enough to spill";
-    let clean = make_batch_bytes(&schema, &[(1, 1, b"short"), (2, 1, long)]).encode_to_wire_vec();
+    let clean = encode_to_wire_vec(&make_batch_bytes(&schema, &[(1, 1, b"short"), (2, 1, long)]));
     assert_eq!(
         Batch::decode_foreign_wal_block(&clean, &schema, &schema).map(|b| b.len()),
         Ok(2)
@@ -47,7 +47,7 @@ fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
 #[test]
 fn decode_from_wal_block_rejects_header_forgeries() {
     let schema = pk_payload_schema(&[TypeCode::U64]);
-    let clean = make_batch_raw(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]).encode_to_wire_vec();
+    let clean = encode_to_wire_vec(&make_batch_raw(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]));
     let decode = |buf: &[u8]| {
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
         decode_mem_batch_from_wal_block(buf, &schema, &mut offsets).err()
@@ -65,7 +65,7 @@ fn decode_from_wal_block_rejects_header_forgeries() {
     }
     assert_eq!(decode(&clean[..clean.len() - 1]), Some("declared size past buffer"));
 
-    let empty = Batch::empty_with_schema(&schema).encode_to_wire_vec();
+    let empty = encode_to_wire_vec(&Batch::empty_with_schema(&schema));
     let decoded = Batch::decode_from_wal_block(&empty, &schema).expect("an empty block decodes");
     assert_eq!(decoded.count, 0);
 }
@@ -78,7 +78,7 @@ fn a_zero_row_block_carrying_heap_bytes_decodes_to_an_empty_heap() {
     let schema = make_schema_pk_u64_payload_string();
     let mut empty = Batch::empty_with_schema(&schema);
     empty.blob.extend_from_slice(b"heap bytes no row references");
-    let block = empty.encode_to_wire_vec();
+    let block = encode_to_wire_vec(&empty);
 
     let decoded = Batch::decode_from_wal_block(&block, &schema).expect("a zero-row block decodes");
     assert_eq!(decoded.len(), 0);
@@ -115,7 +115,7 @@ fn wal_block_bench() {
 
         let t = Instant::now();
         for _ in 0..ITERS {
-            let n = black_box(&batch).encode_to_wire(black_box(&mut buf), 0);
+            let n = black_box(&batch).encode_to_wire(black_box(&mut buf));
             let mb = decode_mem_batch_from_wal_block(black_box(&buf[..n]), &schema, &mut offsets).unwrap();
             black_box(mb.count);
         }

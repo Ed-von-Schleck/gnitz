@@ -82,7 +82,7 @@ impl ReactorShared {
             let Some(r) = acks.get_mut(&id) else {
                 return;
             };
-            r.record(w, slot.control().fault());
+            r.record(w, slot.control().fault(slot.bytes()));
             if !r.answered.covers(self.w2m.num_workers()) {
                 return;
             }
@@ -285,7 +285,7 @@ impl TrainLease {
         while self.left.get().contains(w) {
             let slot = self.next_slot(w).await;
             let ctrl = slot.control();
-            if let Some(f) = ctrl.fault() {
+            if let Some(f) = ctrl.fault(slot.bytes()) {
                 return Err(worker_fault(w, &format!("{:?}", self.kind), f));
             }
             debug_assert!(

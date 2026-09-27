@@ -30,3 +30,41 @@ fn stream_push_rejects_error_conflict_mode() {
     let e = stream_push_error(7, &weighted(&[1]), gnitz_wire::WireConflictMode::Error).expect("must be rejected");
     assert!(e.contains("conflict mode 'error'"), "got: {e}");
 }
+
+/// A zero-row family block is a well-formed item, and still refused: an empty
+/// family would open a zone and bump its table's commit LSN.
+#[test]
+fn a_push_txn_family_with_no_rows_is_refused() {
+    use gnitz_core::protocol::types::{BatchAppender, ColumnDef, Schema, TypeCode, ZSetBatch};
+    use gnitz_core::protocol::{encode_push_txn, PushFamily};
+
+    let schema = Schema {
+        columns: vec![
+            ColumnDef::new("id", TypeCode::U64, false),
+            ColumnDef::new("v", TypeCode::I64, false),
+        ],
+        pk_cols: vec![0],
+    };
+    let mut one = ZSetBatch::new(&schema);
+    BatchAppender::new(&mut one, &schema).add_row(1, 1).i64_val(10);
+    let empty = ZSetBatch::new(&schema);
+    let family = |tid, batch| PushFamily {
+        tid,
+        schema: &schema,
+        batch,
+        mode: gnitz_wire::WireConflictMode::Update,
+        basis: gnitz_wire::txn_frame::BLIND,
+    };
+    let body = |frame: &[u8]| frame[gnitz_wire::control::peek_control_block(frame).unwrap().body].to_vec();
+
+    let ok = encode_push_txn(&[family(16, &one)]);
+    assert_eq!(
+        decode_push_txn_frame(&body(&ok)).map(|t| t.families.len()).ok(),
+        Some(1)
+    );
+    let bad = encode_push_txn(&[family(16, &one), family(17, &empty)]);
+    let Err(e) = decode_push_txn_frame(&body(&bad)) else {
+        panic!("an empty family must be refused");
+    };
+    assert_eq!(e.text, "TXN: empty batch for table 17");
+}

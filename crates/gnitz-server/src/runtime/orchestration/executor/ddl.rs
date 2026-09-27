@@ -17,7 +17,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use super::{decode_client_batch, guard_panic, park_until, request_barrier, send_msg, Shared};
+use super::{guard_panic, park_until, request_barrier, send_msg, Shared};
 use crate::catalog::{family_pk_partition, idx_tab_partition, PkPartition, SysFamily};
 use crate::runtime::committer::BarrierKind;
 use crate::runtime::lsn::ZoneLsnAllocator;
@@ -29,7 +29,8 @@ use crate::runtime::sal::SalExcl;
 use crate::runtime::wire as ipc;
 use gnitz_foundation::fault::Seam;
 use gnitz_store::storage::Batch;
-use gnitz_wire::{PkColList, WireFault};
+use gnitz_wire::control::DecodedControl;
+use gnitz_wire::{ClientVerb, PkColList, WireFault};
 
 /// `GNITZ_INJECT_RELAY_HOLD_FOR_DDL`: see `hold_relay_for_ddl`.
 pub(super) static RELAY_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_RELAY_HOLD_FOR_DDL");
@@ -88,9 +89,10 @@ fn partition_of(families: &[Option<Batch>; SysFamily::COUNT], family: SysFamily)
         .unwrap_or_default()
 }
 
-/// Decode a client wal-block slice against family `tid`'s own schema. The sole
-/// client → family boundary, so the [`SysFamily::client_writable`] allowlist is here.
-fn decode_sys_family(tid: i64, slice: &[u8]) -> Result<(SysFamily, Batch), String> {
+/// Decode one `DDL_TXN` item's block under its family's own schema, behind the
+/// [`SysFamily::client_writable`] allowlist.
+fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, Batch), String> {
+    let tid = ctrl.hdr.target_id as i64;
     let family = SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?;
     if !family.client_writable() {
         return Err(format!(
@@ -98,7 +100,10 @@ fn decode_sys_family(tid: i64, slice: &[u8]) -> Result<(SysFamily, Batch), Strin
             family.name()
         ));
     }
-    let batch = decode_client_batch(slice, family.schema()).map_err(|e| format!("family {tid} decode error: {e}"))?;
+    let batch = ipc::decode_client_frame(frame, ctrl, Some(family.schema()))
+        .map_err(|e| format!("family {tid} decode error: {e}"))?
+        .data_batch
+        .expect("a DDL_TXN item carries a data block");
     Ok((family, batch))
 }
 
@@ -129,14 +134,15 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
     let t_ddl_start = Instant::now();
     // Decode the bundle and materialise each family's wal-block slice into an
     // owned Batch up front (before any lock) — see `decode_sys_family`.
-    let raw_families = gnitz_wire::txn_frame::decode_ddl_txn(body).map_err(|e| format!("decode error: {e}"))?;
-    let family_count = raw_families.len();
+    let items =
+        gnitz_wire::txn_frame::decode_items(body, ClientVerb::DdlTxn).map_err(|e| format!("decode error: {e}"))?;
+    let family_count = items.len();
     // One slot per family: every list derived below reads one block of each.
     let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
-    for &(tid, slice) in &raw_families {
-        let (family, batch) = decode_sys_family(tid as i64, slice).map_err(|e| format!("DDL_TXN: {e}"))?;
+    for (frame, ctrl) in items {
+        let (family, batch) = decode_sys_family(frame, ctrl).map_err(|e| format!("DDL_TXN: {e}"))?;
         if families[family.index()].replace(batch).is_some() {
-            return Err(format!("DDL_TXN: bundle carries two blocks for family {tid}").into());
+            return Err(format!("DDL_TXN: bundle carries two blocks for family {}", family.id()).into());
         }
     }
 

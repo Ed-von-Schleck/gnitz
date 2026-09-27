@@ -220,7 +220,7 @@ fn decode_rejects_a_global_ground_over_a_group_set() {
     };
     assert_eq!(
         roundtrip(reduce(vec![0])).unwrap_err(),
-        "REDUCE global-ground over a non-empty group set"
+        "circuit params: REDUCE global-ground over a non-empty group set"
     );
     assert!(roundtrip(reduce(vec![])).is_ok(), "group-less ground");
 }

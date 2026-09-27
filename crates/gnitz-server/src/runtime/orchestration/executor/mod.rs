@@ -37,7 +37,7 @@ use crate::runtime::sal::{DirectGroup, GroupTargets, SalFit, SalMessageKind};
 use crate::runtime::wire::{self as ipc, validate_schema_match};
 use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_store::schema::key::seek_opk_bytes;
-use gnitz_store::schema::{SchemaDescriptor, SchemaFacts};
+use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 use gnitz_wire::control::DecodedControl;
 use gnitz_wire::txn_frame::DeltaPollItem;
@@ -440,7 +440,7 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>) {
     };
     let Some(hello) = hello else { return };
     peer.cork_with(|out| {
-        out.extend_from_slice(&(gnitz_wire::HELLO.len() as u32).to_le_bytes());
+        out.extend_from_slice(&gnitz_wire::frame_len_prefix(gnitz_wire::HELLO.len()));
         out.extend_from_slice(&gnitz_wire::HELLO);
     });
     if gnitz_wire::check_hello(hello.as_slice()).is_err() {
@@ -773,19 +773,23 @@ async fn dispatch_request(
         // a scan of that id.
         ClientVerb::AllocIds => reply_allocation(peer, shared.cat_mut().allocate_ids(ctrl.hdr.arg1)),
 
-        ClientVerb::ScanSpec => handle_scan_spec(shared, peer, target_id, &ctrl.blob).await,
+        ClientVerb::ScanSpec => {
+            handle_scan_spec(shared, peer, target_id, &data[ctrl.blob.clone()], ctrl.hdr.arg0).await
+        }
 
         // A plain read guard, not `read_lock`: a resolve answers catalog shape,
         // and a view tick moves a view's rows, never its shape — so the tick
         // drain `read_lock` waits for buys nothing here.
         ClientVerb::Resolve => {
             let _g = shared.catalog_rwlock.read().await;
-            build_resolve_reply(shared, peer, target_id, &ctrl.blob)
+            build_resolve_reply(shared, peer, target_id, &data[ctrl.blob.clone()])
         }
 
         ClientVerb::Push => handle_push(shared, peer, buf, ctrl).await,
 
-        verb @ (ClientVerb::Scan | ClientVerb::Seek) => handle_read(shared, peer, &ctrl, verb).await,
+        verb @ (ClientVerb::Scan | ClientVerb::Seek) => {
+            handle_read(shared, peer, &ctrl, &data[ctrl.blob.clone()], verb).await
+        }
     }
 }
 
@@ -838,7 +842,7 @@ fn decode_push_frame(
     } else {
         None
     };
-    decode_client_wire(data, ctrl, catalog_schema.as_ref()).map_err(|e| format!("decode error: {e}").into())
+    ipc::decode_client_frame(data, ctrl, catalog_schema.as_ref()).map_err(|e| format!("decode error: {e}").into())
 }
 
 /// Handle a client push: decode the frame, then commit it under the catalog read
@@ -894,7 +898,7 @@ async fn handle_push(
 
     let mode = flags.conflict_mode;
 
-    // Not at the decode boundary: `validate_client_batch` runs there without a
+    // Not at the decode boundary: the block validator runs there without a
     // relation kind, and must keep admitting a base table's retractions.
     if kind == RelationKind::Stream {
         if let Some(e) = stream_push_error(target_id, &batch, mode) {
@@ -962,6 +966,7 @@ async fn handle_read(
     shared: &Rc<Shared>,
     peer: &Peer,
     ctrl: &gnitz_wire::control::DecodedControl,
+    blob: &[u8],
     verb: ClientVerb,
 ) -> Result<(), WireFault> {
     let target_id = ctrl.hdr.target_id as i64;
@@ -970,7 +975,7 @@ async fn handle_read(
     let schema = shared.disp().schema_desc_for(target_id);
     let bound = match verb {
         ClientVerb::Seek => {
-            let opk = seek_opk_bytes(&schema, &ctrl.blob).map_err(|e| format!("seek: table {target_id}: {e}"))?;
+            let opk = seek_opk_bytes(&schema, blob).map_err(|e| format!("seek: table {target_id}: {e}"))?;
             ReadBound::PkSet(PkKeys::from_keys(schema.pk_stride(), [opk.pk_bytes()]))
         }
         _ => ReadBound::None,
@@ -982,7 +987,7 @@ async fn handle_read(
             shared
                 .cat()
                 .registry
-                .scan_spec(target_id, spec, &schema, None)
+                .scan_spec(target_id, spec, schema.layout_digest(), None)
                 .map_err(|e| WireFault::from(e.to_string()))
         })?;
         send_ok_response(
@@ -996,15 +1001,9 @@ async fn handle_read(
         return Ok(());
     }
 
-    let (sal_kind, blob) = match verb {
-        ClientVerb::Seek => {
-            let block = shared
-                .cat()
-                .schema_block(target_id)
-                .expect("a read target is registered under the catalog lock");
-            (SalMessageKind::ScanSpec, spec.encode(&block))
-        }
-        _ => (SalMessageKind::Scan, Vec::new()),
+    let (sal_kind, blob, reply_layout) = match verb {
+        ClientVerb::Seek => (SalMessageKind::ScanSpec, spec.encode(), schema.layout_digest()),
+        _ => (SalMessageKind::Scan, Vec::new(), 0),
     };
 
     let (prelim, server_version) = shared.cat().negotiated_schema_block(target_id, client_version);
@@ -1018,6 +1017,7 @@ async fn handle_read(
             schema_version: server_version,
             ..Default::default()
         },
+        arg0: reply_layout,
         blob: &blob,
         ..Default::default()
     };
@@ -1098,20 +1098,23 @@ struct DecodedTxn {
 
 /// Decode a `PUSH_TXN` frame body, applying every rule that needs no catalog.
 fn decode_push_txn_frame(body: &[u8]) -> Result<DecodedTxn, WireFault> {
-    let raw = gnitz_wire::txn_frame::decode_push_txn(body).map_err(|e| format!("decode error: {e}"))?;
-    let mut families: Vec<TxnFamily> = Vec::with_capacity(raw.len());
-    let mut bases = Vec::with_capacity(raw.len());
-    for fam in &raw {
-        let tid = fam.tid as i64;
-        let wire_schema = gnitz_store::schema::decode_schema_block(fam.schema_block)
-            .map_err(|e| format!("TXN family {tid} schema decode error: {e}"))?;
-        let batch =
-            decode_client_batch(fam.data, &wire_schema).map_err(|e| format!("TXN family {tid} decode error: {e}"))?;
+    let items =
+        gnitz_wire::txn_frame::decode_items(body, ClientVerb::PushTxn).map_err(|e| format!("decode error: {e}"))?;
+    let mut families: Vec<TxnFamily> = Vec::with_capacity(items.len());
+    let mut bases = Vec::with_capacity(items.len());
+    for (frame, ctrl) in items {
+        let (tid, mode, basis) = (ctrl.hdr.target_id as i64, ctrl.hdr.flags.conflict_mode, ctrl.hdr.arg0);
+        let batch = ipc::decode_client_frame(frame, ctrl, None)
+            .map_err(|e| format!("TXN family {tid} decode error: {e}"))?
+            .data_batch
+            .expect("a PUSH_TXN item carries a data block");
+        // A zero-row block passes the item shape check, and an empty family
+        // would open a zone and bump its tables' commit LSN.
         if batch.is_empty() {
             return Err(format!("TXN: empty batch for table {tid}").into());
         }
-        bases.push((tid, fam.basis));
-        families.push(TxnFamily { tid, mode: fam.mode, batch });
+        bases.push((tid, basis));
+        families.push(TxnFamily { tid, mode, batch });
     }
     Ok(DecodedTxn { families, bases })
 }
@@ -1120,35 +1123,6 @@ fn decode_push_txn_frame(body: &[u8]) -> Result<DecodedTxn, WireFault> {
 /// `tid`.
 fn validate_client_schema(shared: &Shared, tid: i64, client: &SchemaDescriptor) -> Result<(), String> {
     validate_schema_match(client, &shared.cat().registry.relation_or_err(tid)?.schema())
-}
-
-/// Decode and validate a client frame.
-fn decode_client_wire(
-    data: &[u8],
-    ctrl: gnitz_wire::control::DecodedControl,
-    hint: Option<&SchemaDescriptor>,
-) -> Result<ipc::DecodedWire, String> {
-    let decoded = ipc::decode_client_frame(data, ctrl, hint)?;
-    if let Some(b) = decoded.data_batch.as_ref() {
-        validate_client_batch(b)?;
-    }
-    Ok(decoded)
-}
-
-/// Decode and validate one family block of a client `DDL_TXN` or `PUSH_TXN`.
-fn decode_client_batch(slice: &[u8], schema: &SchemaDescriptor) -> Result<Batch, &'static str> {
-    let b = Batch::decode_foreign_wal_block(slice, schema, schema)?;
-    validate_client_batch(&b)?;
-    Ok(b)
-}
-
-/// Refuses a null bit on a NOT NULL column, which the null-aware readers and the
-/// schema-trusting ones would read differently.
-fn validate_client_batch(b: &Batch) -> Result<(), &'static str> {
-    if gnitz_wire::first_not_null_violation(b.schema().not_null_payload_slots(), b.null_bmp_data()).is_some() {
-        return Err("client batch sets a null bit on a NOT NULL column");
-    }
-    Ok(())
 }
 
 /// Which end of a relation a request wants — the discriminator of [`target_kind`].
@@ -1382,12 +1356,19 @@ fn finish_scan_fanout(peer: &Peer, target_id: i64, arg1: u64, result: Result<u64
 
 /// SCAN_SPEC: the scan pipeline under a client-authored reply schema, so no schema
 /// block goes back, routed by the request's bound.
-async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, target_id: i64, blob: &[u8]) -> Result<(), WireFault> {
+async fn handle_scan_spec(
+    shared: &Rc<Shared>,
+    peer: &Peer,
+    target_id: i64,
+    blob: &[u8],
+    reply_layout: u64,
+) -> Result<(), WireFault> {
     // `UserRead`: a `ReadSpec` has only a fan-out realization, which a catalog
     // family has no form of.
     let (g, kind) = read_lock(shared, target_id, Access::UserRead).await?;
     let template = ipc::WireMsg {
         target_id: target_id as u64,
+        arg0: reply_layout,
         blob,
         ..Default::default()
     };
@@ -1453,12 +1434,13 @@ async fn handle_delta_poll(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
             disp.scan_cut(moved.len(), |cut| {
                 round = disp.last_tick_round();
                 for item in &moved {
+                    let reply_layout = item.reply_layout.to_le_bytes();
                     cut.read(DirectGroup {
                         template: ipc::WireMsg {
                             target_id: item.view_id,
                             arg0: round,
                             arg1: item.after_tick,
-                            blob: item.reply_block,
+                            blob: &reply_layout,
                             ..Default::default()
                         },
                         ..DirectGroup::new(SalMessageKind::DeltaRead)
@@ -1628,7 +1610,7 @@ fn encode_response_into(out: &mut Vec<u8>, msg: ipc::WireMsg<'_>) {
     unsafe {
         out.set_len(total);
     }
-    gnitz_wire::write_u32_le(out, base, sz as u32);
+    out[base..base + PFX].copy_from_slice(&gnitz_wire::frame_len_prefix(sz));
     msg.encode(&mut out[base + PFX..total]);
 }
 

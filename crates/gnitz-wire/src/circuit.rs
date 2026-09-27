@@ -3,7 +3,7 @@
 //! gnitz-core and gnitz-server — plus the `params` codec that carries each
 //! node's per-opcode parameters as one blob.
 
-use crate::codec::{Reader, Writer};
+use crate::codec::{decode_all, Reader, Writer};
 use crate::TypeCode;
 
 // ---------------------------------------------------------------------------
@@ -740,23 +740,19 @@ impl Circuit {
 // The list codecs below are `pub(crate)` so `read_spec`'s sinks ship the same
 // shapes through them, never a second spelling of their widths or domains.
 
-const PARAMS_CTX: &str = "circuit params";
-
-/// Write a counted list's length. A count past `u16::MAX` saturates rather than
-/// truncating into a valid shorter list, so every over-long list encodes a count
-/// [`read_count`] (≤ [`crate::MAX_COLUMNS`]) or [`read_order_keys`]
-/// (≤ [`crate::MAX_ORDER_KEYS`]) refuses before reading the body.
+/// Write a counted list's length, saturating: an over-long list encodes a count
+/// its reader's cap refuses.
 fn write_count(w: &mut Writer, n: usize) {
     w.u16(u16::try_from(n).unwrap_or(u16::MAX));
 }
 
-/// Read a counted list's length, bounded before anything sizes a `Vec` off it.
-/// This decoder holds no schema, so [`crate::MAX_COLUMNS`] is the only bound
-/// available; the compiler bounds each index against the register schema.
-fn read_count(r: &mut Reader, what: &str) -> Result<usize, String> {
+/// Read a counted list's length, refusing one past `cap` before anything sizes a
+/// `Vec` off it.
+fn read_count(r: &mut Reader, what: &str, cap: usize) -> Result<usize, String> {
+    debug_assert!(cap < u16::MAX as usize, "a saturated count must stay refusable");
     let n = r.u16()? as usize;
-    if n > crate::MAX_COLUMNS {
-        return Err(format!("{what}: {n} entries exceeds cap {}", crate::MAX_COLUMNS));
+    if n > cap {
+        return Err(format!("{what}: {n} entries exceeds cap {cap}"));
     }
     Ok(n)
 }
@@ -769,7 +765,7 @@ pub(crate) fn write_cols(w: &mut Writer, cols: &[u32]) {
 }
 
 pub(crate) fn read_cols(r: &mut Reader) -> Result<Vec<u32>, String> {
-    let n = read_count(r, "column list")?;
+    let n = read_count(r, "column list", crate::MAX_COLUMNS)?;
     let mut cols = Vec::with_capacity(n);
     for _ in 0..n {
         cols.push(r.u32()?);
@@ -781,7 +777,7 @@ pub(crate) fn read_cols(r: &mut Reader) -> Result<Vec<u32>, String> {
 /// "no target". `TypeCode::from_wire` is the whole domain check here — which
 /// targets a particular node admits is that arm's own business.
 fn read_cols_with_tcs(r: &mut Reader) -> Result<Vec<ReindexSlot>, String> {
-    let n = read_count(r, "slot list")?;
+    let n = read_count(r, "slot list", crate::MAX_COLUMNS)?;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let col = r.u32()?;
@@ -837,10 +833,7 @@ pub(crate) fn write_order_keys(w: &mut Writer, keys: &[crate::OrderKey]) {
 }
 
 pub(crate) fn read_order_keys(r: &mut Reader) -> Result<Vec<crate::OrderKey>, String> {
-    let n = read_count(r, "order keys")?;
-    if n > crate::MAX_ORDER_KEYS {
-        return Err(format!("order keys: {n} exceeds cap {}", crate::MAX_ORDER_KEYS));
-    }
+    let n = read_count(r, "order keys", crate::MAX_ORDER_KEYS)?;
     (0..n).map(|_| read_order_key(r)).collect()
 }
 
@@ -852,7 +845,7 @@ pub(crate) fn write_aggs(w: &mut Writer, aggs: &[AggDescriptor]) {
 }
 
 pub(crate) fn read_aggs(r: &mut Reader) -> Result<Vec<AggDescriptor>, String> {
-    let n = read_count(r, "aggregate list")?;
+    let n = read_count(r, "aggregate list", crate::MAX_COLUMNS)?;
     let mut aggs = Vec::with_capacity(n);
     for _ in 0..n {
         let func_byte = r.u8()?;
@@ -862,22 +855,25 @@ pub(crate) fn read_aggs(r: &mut Reader) -> Result<Vec<AggDescriptor>, String> {
     Ok(aggs)
 }
 
-/// The declared payload slots, then the program. Taken as parts rather than as a
-/// `&ComputeMap` because the `ReadSpec` fold spells "no pre-map" as an empty
-/// program and holds no struct to borrow.
-pub(crate) fn write_compute_map(w: &mut Writer, out_cols: &[(TypeCode, bool)], program: &[u8]) {
-    write_count(w, out_cols.len());
-    for &(tc, nullable) in out_cols {
-        w.type_code(tc).bool(nullable);
+/// The declared payload slots, then the program.
+pub(crate) fn write_compute_map(w: &mut Writer, map: &ComputeMap) {
+    write_count(w, map.out_cols.len());
+    for &(tc, nullable) in &map.out_cols {
+        w.u8(tc.as_wire()).bool(nullable);
     }
-    w.bytes32(program);
+    w.bytes32(&map.program);
+}
+
+fn read_type_code(r: &mut Reader) -> Result<TypeCode, String> {
+    let v = r.u8()?;
+    TypeCode::from_wire(v).ok_or_else(|| format!("invalid type code {v}"))
 }
 
 pub(crate) fn read_compute_map(r: &mut Reader) -> Result<ComputeMap, String> {
-    let n = read_count(r, "compute map")?;
+    let n = read_count(r, "compute map", crate::MAX_COLUMNS)?;
     let mut out_cols = Vec::with_capacity(n);
     for _ in 0..n {
-        let tc = r.type_code()?;
+        let tc = read_type_code(r)?;
         out_cols.push((tc, r.bool()?));
     }
     Ok(ComputeMap { program: r.bytes32()?.to_vec(), out_cols })
@@ -887,7 +883,7 @@ pub(crate) fn read_compute_map(r: &mut Reader) -> Result<ComputeMap, String> {
 /// [`decode_op_node`]. The expression blob is carried opaquely (each crate
 /// encodes it with its own encoder before building the `OpNode`).
 pub fn encode_op_node(op: &OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
-    let mut w = Writer::with_capacity(32);
+    let mut w = Writer::new();
     match op {
         // An unbounded `ScanDelta` carries no params at all: the common shape
         // costs nothing, and "absent" and "empty" stay distinguishable.
@@ -905,7 +901,7 @@ pub fn encode_op_node(op: &OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
             (Opcode::MapProj, None, Some(w.into_vec()))
         }
         OpNode::Map(MapKind::Compute(map)) => {
-            write_compute_map(&mut w, &map.out_cols, &map.program);
+            write_compute_map(&mut w, map);
             (Opcode::MapExpr, None, Some(w.into_vec()))
         }
         OpNode::Map(MapKind::Reindex { keep, key, role }) => {
@@ -959,7 +955,7 @@ pub fn encode_op_node(op: &OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
             w.bool(*nulls_first);
             write_count(&mut w, type_codes.len());
             for &tc in type_codes {
-                w.type_code(tc);
+                w.u8(tc.as_wire());
             }
             (Opcode::NullExtend, None, Some(w.into_vec()))
         }
@@ -977,6 +973,14 @@ pub fn encode_op_node(op: &OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
 /// cell as stored: `None` is "this opcode carries no parameters", and a present
 /// but empty cell is damaged — no layout here encodes to zero bytes.
 pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) -> Result<OpNode, String> {
+    // One reader for every layout. A parameterless opcode reads nothing from it,
+    // so a blob it should not carry is refused as trailing bytes.
+    decode_all(params.unwrap_or(&[]), "circuit params", |r| {
+        decode_params(r, opcode, src_tab, params)
+    })
+}
+
+fn decode_params(r: &mut Reader, opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) -> Result<OpNode, String> {
     let op = Opcode::from_wire(opcode).ok_or_else(|| format!("unknown opcode {opcode}"))?;
     if src_tab.is_some() && !matches!(op, Opcode::ScanDelta) {
         return Err(format!("{op:?} carries a source_table"));
@@ -984,15 +988,12 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
     if params.is_some_and(<[u8]>::is_empty) {
         return Err(format!("{op:?} carries an empty parameter cell"));
     }
-    // One reader for every layout. A parameterless opcode reads nothing from it,
-    // so a blob it should not carry falls out of `expect_consumed` below.
-    let mut r = Reader::new(params.unwrap_or(&[]), PARAMS_CTX);
-    let node = match op {
+    Ok(match op {
         Opcode::ScanDelta => OpNode::ScanDelta {
             source: src_tab.ok_or_else(|| "SCAN_DELTA missing source_table".to_string())?,
             bound: match params {
                 None => crate::ReadBound::None,
-                Some(_) => match crate::read_spec::read_read_bound(&mut r)? {
+                Some(_) => match crate::read_spec::read_read_bound(r)? {
                     crate::ReadBound::None => {
                         return Err("a ScanDelta with no bound carries no params cell".to_string());
                     }
@@ -1001,8 +1002,8 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
             },
         },
         Opcode::Filter => OpNode::Filter(r.bytes32()?.to_vec()),
-        Opcode::MapProj => OpNode::Map(MapKind::Projection(read_cols(&mut r)?)),
-        Opcode::MapExpr => OpNode::Map(MapKind::Compute(read_compute_map(&mut r)?)),
+        Opcode::MapProj => OpNode::Map(MapKind::Projection(read_cols(r)?)),
+        Opcode::MapExpr => OpNode::Map(MapKind::Compute(read_compute_map(r)?)),
         Opcode::MapReindex => {
             // The role decides which worker a row lands on, so an unknown value is
             // a refusal — unlike a `ScanDelta` bound, which only decides scan speed.
@@ -1011,7 +1012,7 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
                 ROLE_AUXILIARY => ReindexRole::Auxiliary,
                 ROLE_SCATTER_KEY => {
                     let source = r.u64()?;
-                    let source_key = read_cols_with_tcs(&mut r)?;
+                    let source_key = read_cols_with_tcs(r)?;
                     if source_key.is_empty() {
                         return Err("MAP_REINDEX scatter key names no source columns".to_string());
                     }
@@ -1019,16 +1020,16 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
                 }
                 other => return Err(format!("MAP_REINDEX unknown route-key role {other}")),
             };
-            let key = read_cols_with_tcs(&mut r)?;
+            let key = read_cols_with_tcs(r)?;
             if key.is_empty() {
                 return Err("MAP_REINDEX names no key columns".to_string());
             }
-            OpNode::Map(MapKind::Reindex { keep: read_cols(&mut r)?, key, role })
+            OpNode::Map(MapKind::Reindex { keep: read_cols(r)?, key, role })
         }
         Opcode::MapHashRow => {
             // No target-domain gate here: `MapPlan::from_wire` types the output
             // column at the target, so `check_copy_types` sees the promotion.
-            let cols = read_cols_with_tcs(&mut r)?;
+            let cols = read_cols_with_tcs(r)?;
             // An empty list hashes no bytes, collapsing every row onto one PK —
             // the same self-consistency refusal `MAP_REINDEX` gets above.
             if cols.is_empty() {
@@ -1042,12 +1043,12 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
         Opcode::PositivePart => OpNode::PositivePart,
         Opcode::Reduce => {
             let global_ground = r.bool()?;
-            let group_cols = read_cols(&mut r)?;
+            let group_cols = read_cols(r)?;
             // The ground row carries no group columns.
             if global_ground && !group_cols.is_empty() {
                 return Err("REDUCE global-ground over a non-empty group set".to_string());
             }
-            let agg = read_aggs(&mut r)?;
+            let agg = read_aggs(r)?;
             OpNode::Reduce { group_cols, agg, global_ground }
         }
         Opcode::JoinEqui => OpNode::Join {
@@ -1070,24 +1071,22 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
         },
         Opcode::IntegrateSink => OpNode::IntegrateSink,
         Opcode::IntegrateTrace => OpNode::IntegrateTrace,
-        Opcode::ExchangeShard => OpNode::ExchangeShard { shard_cols: read_cols(&mut r)? },
+        Opcode::ExchangeShard => OpNode::ExchangeShard { shard_cols: read_cols(r)? },
         Opcode::NullExtend => {
             let nulls_first = r.bool()?;
-            let n = read_count(&mut r, "NULL_EXTEND")?;
-            let type_codes = (0..n).map(|_| r.type_code()).collect::<Result<_, _>>()?;
+            let n = read_count(r, "NULL_EXTEND", crate::MAX_COLUMNS)?;
+            let type_codes = (0..n).map(|_| read_type_code(r)).collect::<Result<_, _>>()?;
             OpNode::NullExtend { type_codes, nulls_first }
         }
         Opcode::WorkerFilter => OpNode::WorkerFilter,
         Opcode::TopN => {
             let limit = r.u64()?;
             let offset = r.u64()?;
-            let group_cols = read_cols(&mut r)?;
-            let order = read_order_keys(&mut r)?;
+            let group_cols = read_cols(r)?;
+            let order = read_order_keys(r)?;
             OpNode::TopN { group_cols, order, limit, offset }
         }
-    };
-    r.expect_consumed()?;
-    Ok(node)
+    })
 }
 
 #[cfg(test)]

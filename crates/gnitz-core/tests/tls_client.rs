@@ -58,7 +58,8 @@ fn send_push(
         target_id: tid,
         ..Default::default()
     };
-    t.send_frame(encode_frame(hdr, &[], Some(schema), Some(batch)), None)
+    let block = gnitz_core::protocol::codec::encode_schema_block(schema);
+    t.send_frame(encode_frame(hdr, &[], Some(&block), Some(batch)), None)
 }
 
 /// Rows `(start + i, (start + i) * 3, 7)` for `count` rows.

@@ -9,9 +9,18 @@ fn col(tc: TypeCode, name: &str, nullable: bool) -> SchemaBlockCol<'_> {
     }
 }
 
-/// The decode error `record` yields, without needing `SchemaBlock: Debug`.
+/// Every column `record` holds, and its PK indices.
+fn decode_cols(record: &[u8]) -> Result<(Vec<SchemaBlockCol<'_>>, PkIndices), String> {
+    let mut cols = Vec::new();
+    let pk = decode(record, |c| {
+        cols.push(c);
+        Ok(())
+    })?;
+    Ok((cols, pk))
+}
+
 fn decode_err(record: &[u8]) -> String {
-    decode(record).err().expect("expected a rejection")
+    decode_cols(record).expect_err("expected a rejection")
 }
 
 /// `n` U64 key columns, all of them in the PK, in column order.
@@ -36,10 +45,9 @@ fn roundtrips_shape_names_and_pk_order() {
     ];
     // Declared order `(a, b)`, not column order `(b, a)`.
     let record = encode(&cols, &[1, 0]);
-    let sb = decode(&record).unwrap();
-    assert_eq!(sb.num_columns(), 3);
-    assert_eq!(sb.columns().collect::<Vec<_>>(), cols.to_vec());
-    assert_eq!(sb.pk_indices(), &[1, 0]);
+    let (got, pk) = decode_cols(&record).unwrap();
+    assert_eq!(got, cols.to_vec());
+    assert_eq!(pk.as_slice(), &[1, 0]);
 }
 
 /// Every `ColMeta` field and the column type's scale survive the record.
@@ -63,7 +71,7 @@ fn column_meta_survives_the_record() {
     // Column 0 is the key, so it must not be nullable: swap it for a plain one.
     cols[0] = col(TypeCode::U64, "k", false);
     let record = encode(&cols, &[0]);
-    assert_eq!(decode(&record).unwrap().columns().collect::<Vec<_>>(), cols);
+    assert_eq!(decode_cols(&record).unwrap().0, cols);
 }
 
 /// The record's arity cap is `MAX_PK_COLUMNS`, which the engine's intermediate
@@ -73,7 +81,7 @@ fn a_five_column_pk_decodes_to_five_indices() {
     let cols = all_key_cols(MAX_PK_COLUMNS);
     let pk: Vec<u32> = (0..MAX_PK_COLUMNS as u32).collect();
     let record = encode(&cols, &pk);
-    assert_eq!(decode(&record).unwrap().pk_indices(), pk.as_slice());
+    assert_eq!(decode_cols(&record).unwrap().1.as_slice(), pk.as_slice());
 }
 
 /// The one PK rule decode keeps: the arity bound on its own `pk_indices` array.
@@ -139,9 +147,9 @@ fn each_column_guard_rejects_its_own_forgery() {
 fn a_record_truncated_anywhere_is_an_error() {
     let record = simple();
     for cut in 0..record.len() {
-        assert!(decode(&record[..cut]).is_err(), "cut at {cut}");
+        assert!(decode_cols(&record[..cut]).is_err(), "cut at {cut}");
     }
-    assert!(decode(&record).is_ok(), "the whole record still decodes");
+    assert!(decode_cols(&record).is_ok(), "the whole record still decodes");
 }
 
 /// Bytes past the last column mean the sender and this decoder disagree about

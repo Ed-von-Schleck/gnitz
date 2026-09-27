@@ -5,7 +5,7 @@
 
 use super::batch::{strides_from_schema, string_mask, Batch, MAX_BATCH_REGIONS, REG_PK};
 use super::merge::{blob_span_key, BlobCache, BlobCacheGuard, DirectWriter, MemBatch};
-use crate::schema::SchemaDescriptor;
+use crate::schema::{SchemaDescriptor, SchemaFacts};
 use gnitz_wire::wal;
 use gnitz_wire::Regions;
 
@@ -160,41 +160,27 @@ impl Batch {
         out.push(&self.blob);
     }
 
-    /// Encode self into WAL wire format at out[offset..]. Returns bytes written.
-    pub fn encode_to_wire(&self, out: &mut [u8], offset: usize) -> usize {
+    /// Encode self into WAL wire format at the front of `out`. Returns bytes
+    /// written.
+    pub fn encode_to_wire(&self, out: &mut [u8]) -> usize {
         let mut r = Regions::new();
         self.wire_regions(&mut r);
-        wal::write_block(self.count, &r, &mut out[offset..])
+        wal::write_block(&r, out)
     }
 
-    /// Rows `[start, start + rows)` as one WAL block at `out[offset..]`, framed
-    /// off this batch with no heap. Returns bytes written.
-    pub fn encode_range_to_wire(&self, start: usize, rows: usize, out: &mut [u8], offset: usize) -> usize {
+    /// Rows `[start, start + rows)` as one WAL block at the front of `out`,
+    /// framed off this batch with no heap. Returns bytes written.
+    pub fn encode_range_to_wire(&self, start: usize, rows: usize, out: &mut [u8]) -> usize {
         // A narrowed block carries no heap, so its trailing region is empty.
         let mut r = Regions::new();
         self.fixed_regions(start, rows, &mut r);
         r.push(&[]);
-        wal::write_block(rows, &r, &mut out[offset..])
-    }
-
-    /// [`Self::encode_to_wire`] into a buffer of its own, sized by
-    /// [`Self::wire_byte_size`].
-    pub fn encode_to_wire_vec(&self) -> Vec<u8> {
-        let mut r = Regions::new();
-        self.wire_regions(&mut r);
-        let mut out = Vec::with_capacity(self.wire_byte_size());
-        wal::append_block(self.count, &r, &mut out);
-        debug_assert_eq!(
-            out.len(),
-            self.wire_byte_size(),
-            "wire_byte_size must size its own encode"
-        );
-        out
+        wal::write_block(&r, out)
     }
 
     /// Encode the rows `indices` selects, in order, as one WAL block of
-    /// `wire_byte_size_range(indices.len())` bytes at `out[offset..]`.
-    pub fn encode_scattered_to_wire(&self, indices: &[u32], out: &mut [u8], offset: usize) -> usize {
+    /// `wire_byte_size_range(indices.len())` bytes at the front of `out`.
+    pub fn encode_scattered_to_wire(&self, indices: &[u32], out: &mut [u8]) -> usize {
         debug_assert!(
             !self.schema().has_german_string(),
             "a row scatter writes no heap bytes, so it cannot carry a string column"
@@ -202,8 +188,8 @@ impl Batch {
         let count = indices.len();
         let strides = self.strides();
         let nr = strides.len();
-        let total_size = wal::write_head(&mut out[offset..], count, count * row_width(strides), 0);
-        let block = &mut out[offset..offset + total_size];
+        let total_size = wal::write_head(out, count, count * row_width(strides), 0);
+        let block = &mut out[..total_size];
 
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
         wire_offsets(strides, nr, count, &mut offsets);
@@ -224,9 +210,8 @@ impl Batch {
         Ok(Batch::from_mem_batch(&mb, schema, schema))
     }
 
-    /// [`Self::decode_from_wal_block`] for a block a peer wrote, refusing a
-    /// German-string cell not in canonical form. The rows land in `out_schema`,
-    /// as `Batch::from_mem_batch` maps them.
+    /// [`Self::decode_from_wal_block`] for a block a peer wrote: validated
+    /// under `in_schema`, then mapped into `out_schema`.
     pub fn decode_foreign_wal_block(
         data: &[u8],
         in_schema: &SchemaDescriptor,
@@ -235,6 +220,9 @@ impl Batch {
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
         let mb = decode_mem_batch_from_wal_block(data, in_schema, &mut offsets)?;
         validate_string_heap_extents(&mb, in_schema)?;
+        if gnitz_wire::first_not_null_violation(in_schema.not_null_payload_slots(), mb.null_bmp()).is_some() {
+            return Err("a null bit on a NOT NULL column");
+        }
         Ok(Batch::from_mem_batch(&mb, in_schema, out_schema))
     }
 }

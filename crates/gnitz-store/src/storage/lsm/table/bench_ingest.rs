@@ -10,7 +10,7 @@
 
 use super::super::batch::Batch;
 use crate::schema::SchemaDescriptor;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, scratch_table};
+use crate::test_support::{encode_to_wire_vec, make_batch_raw, make_schema_u64_i64, scratch_table};
 
 /// One delta of `n` rows at consecutive PKs from `base`, all weight +1. Raw, not
 /// `Consolidated`: certifying it would short-circuit `into_consolidated` and the
@@ -51,7 +51,7 @@ fn delta_ingest_bench() {
         let mut blocks: Vec<Vec<u8>> = Vec::with_capacity(k);
         for j in 0..k {
             let b = make_delta(&schema, (j * n) as u64, n);
-            blocks.push(b.encode_to_wire_vec());
+            blocks.push(encode_to_wire_vec(&b));
         }
         let wire_bytes: usize = blocks.iter().map(Vec::len).sum();
 
