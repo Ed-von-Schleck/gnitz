@@ -59,18 +59,18 @@ mod staging {
         vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)]
     }
 
-    fn col_tab(owner: i64, weight: i64) -> Batch {
+    fn col_tab(owner: u64, weight: i64) -> Batch {
         col_tab_batch(owner, &cols(), weight)
     }
 
-    fn table_tab(tid: i64, name: &str, props: gnitz_wire::TableProps, weight: i64) -> Batch {
+    fn table_tab(tid: u64, name: &str, props: gnitz_wire::TableProps, weight: i64) -> Batch {
         let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
         let pk = gnitz_wire::pack_pk_cols(&[0]);
         push_table_tab_row(&mut bb, tid, PUBLIC_SCHEMA_ID, name, pk, props.pack(), weight);
         bb.finish()
     }
 
-    fn group(family: SysFamily, batch: &Batch) -> (i64, gnitz_store::schema::SchemaDescriptor, &Batch) {
+    fn group(family: SysFamily, batch: &Batch) -> (u64, gnitz_store::schema::SchemaDescriptor, &Batch) {
         (family.id(), *family.schema(), batch)
     }
 
@@ -101,11 +101,7 @@ mod staging {
         push_view_tab_row(&mut view_tab, 1, v, "v", 0, 0, 0);
         let view_tab = view_tab.finish();
         let mut circuit = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
-        write_circuit_rows(
-            &mut circuit,
-            v as u64,
-            &identity_circuit(r, gnitz_wire::ReadBound::None),
-        );
+        write_circuit_rows(&mut circuit, v, &identity_circuit(r, gnitz_wire::ReadBound::None));
         let circuit = circuit.finish();
 
         let mut opened = CatalogEngine::open_master(&dir, 1).unwrap();
@@ -140,7 +136,7 @@ mod staging {
         let dir = scratch_dir("bootstrap", "tail_id_not_reissued");
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         // Above the id counter this session flushes.
-        let t: i64 = 10_000;
+        let t: u64 = 10_000;
         engine.registry.ingest(SysFamily::Column.id(), col_tab(t, 1)).unwrap();
         let created = table_tab(t, "t", Default::default(), 1);
         engine.registry.ingest(SysFamily::Table.id(), created).unwrap();

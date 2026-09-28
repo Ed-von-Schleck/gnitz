@@ -40,7 +40,7 @@ mod suites;
 use std::rc::Rc;
 
 use crate::query::DagEngine;
-use gnitz_store::relation::{Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
+use gnitz_store::relation::{IndexClaim, Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, ReadCursor, StoreError, StoredRow};
 
@@ -51,10 +51,10 @@ pub(crate) use bootstrap::UnreplayedCatalog;
 pub(crate) use constraints::RowConstraints;
 #[cfg(test)]
 pub(crate) use sys_tables::write_col_tab_rows;
+pub(crate) use sys_tables::SysFamily;
 #[cfg(test)]
 pub(crate) use sys_tables::PUBLIC_SCHEMA_ID;
 pub(crate) use sys_tables::{family_pk_partition, idx_tab_partition, PkPartition};
-pub(crate) use sys_tables::{SysFamily, FIRST_USER_TABLE_ID};
 pub(crate) use types::{ColumnDef, FkEdge};
 
 // Import everything from sys_tables for internal use.
@@ -99,7 +99,7 @@ pub(crate) struct CatalogEngine {
 
     /// The next catalog object id (schema, relation or index) `allocate_ids`
     /// hands out. Every applied id-bearing row raises it past its own id.
-    pub(in crate::catalog) next_id: i64,
+    pub(in crate::catalog) next_id: u64,
     /// The master's applied families in apply order, each queued before its ingest:
     /// the zone's broadcast and the undo log `compensate_stage_a` replays.
     /// `ddl_sync` never enqueues.

@@ -8,7 +8,6 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
-use std::sync::{Mutex, MutexGuard};
 
 use gnitz_core::{ColumnDef, DeltaCursor, Invalidate, MirrorError, MirrorStore, RawBlock, Schema, TypeCode, ZSetBatch};
 use gnitz_mirror::Mirror;
@@ -18,21 +17,11 @@ use gnitz_store_testkit::{
 };
 use gnitz_wire::{ReadBound, ReadSpec};
 
-#[path = "support/copy_paths.rs"]
-mod copy_paths;
-use copy_paths::{copy_dir, has_manifest, manifest_path};
+#[path = "support/common.rs"]
+mod common;
+use common::{copy_dir, has_manifest, manifest_path, serial};
 use gnitz_store::relation::{ChildAddr, ChildKind};
 use gnitz_store::schema::Slot;
-
-/// Every test in this binary takes this lock: `cargo test` runs a target's tests
-/// as threads of one process, and a store open touches process-wide state — the
-/// one-shot fault seams, the `io_uring` verdict latched once per process, and the
-/// environment variables an open re-reads.
-static SERIAL: Mutex<()> = Mutex::new(());
-
-fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 const SCHEMA: &str = "s";
 const TID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
@@ -142,16 +131,6 @@ fn rows_dir(base_dir: &str, tid: u64) -> String {
 
 fn aside(base_dir: &str, tid: u64) -> String {
     format!("{base_dir}/aside_{tid}")
-}
-
-/// The `MirrorStore` bound the client's `Box<dyn MirrorStore>` needs.
-///
-/// Passes while the `unsafe impl` exists, whatever is behind it: a later
-/// `pub fn` returning an `Rc` breaks soundness and still compiles here.
-#[test]
-fn the_store_is_send() {
-    fn assert_send<T: Send>() {}
-    assert_send::<Mirror>();
 }
 
 /// A registration stands while the id and the layout do; a *different* id under

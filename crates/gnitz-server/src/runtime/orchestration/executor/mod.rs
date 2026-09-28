@@ -81,7 +81,7 @@ async fn park_until(shared: &Shared, polls: u32, what: &str, ready: impl Fn() ->
 /// Hold one decoded push, before its catalog read lock, until a DDL has replaced
 /// the schema record `seen` its decode matched — the window a queued `ALTER TABLE`
 /// writer opens between that match and the gate.
-async fn hold_push_for_ddl(shared: &Shared, target_id: i64, seen: &Rc<[u8]>) {
+async fn hold_push_for_ddl(shared: &Shared, target_id: u64, seen: &Rc<[u8]>) {
     park_until(shared, PUSH_HOLD_MAX_POLLS, "push hold", || {
         shared
             .cat()
@@ -141,12 +141,12 @@ pub struct Shared {
     last_tick_lsn: Cell<u64>,
     /// Tables with a pending delta, each with the row count feeding the tick
     /// threshold.
-    tick_rows: RefCell<FxHashMap<i64, usize>>,
+    tick_rows: RefCell<FxHashMap<u64, usize>>,
     /// Per-table write serialization. A push whose validation reads committed
     /// state (`push_reads_committed_state`) and every transaction take the write
     /// guard; a push that reads no committed state takes the read guard, so
     /// same-table pushes reach the committer concurrently and share one fsync.
-    table_locks: RefCell<FxHashMap<i64, AsyncRwLock>>,
+    table_locks: RefCell<FxHashMap<u64, AsyncRwLock>>,
     /// Set true by the graceful-shutdown watcher before it sends the final
     /// Shutdown barrier. Read only by [`Shared::enqueue_commit`], which is what
     /// makes the test and the send one step.
@@ -159,7 +159,7 @@ pub struct Shared {
     /// check under the *write* guard on that lock, which excludes every bumper. A missing entry reads as
     /// `boot_seed`. Single-threaded reactor — a plain `RefCell`, and no borrow
     /// is ever held across an `.await`.
-    table_commit_lsn: RefCell<FxHashMap<i64, u64>>,
+    table_commit_lsn: RefCell<FxHashMap<u64, u64>>,
     /// The default for a `table_commit_lsn` miss (a table not written this boot),
     /// seeded to the catalog's system zone — the value `lsn_alloc.published()`
     /// also starts at. Within a boot every live OCC basis is ≥ it and every
@@ -201,7 +201,7 @@ impl Shared {
         &self.dispatcher
     }
 
-    fn table_lock(&self, tid: i64) -> AsyncRwLock {
+    fn table_lock(&self, tid: u64) -> AsyncRwLock {
         self.table_locks.borrow_mut().entry(tid).or_default().clone()
     }
 
@@ -211,7 +211,7 @@ impl Shared {
     /// would re-guard a lock this task holds and hang forever.
     ///
     /// Owned, because the set is read out of the catalog and this loop awaits.
-    async fn lock_tables_exclusive(&self, mut tids: Vec<i64>) -> Vec<WriteGuard> {
+    async fn lock_tables_exclusive(&self, mut tids: Vec<u64>) -> Vec<WriteGuard> {
         tids.sort_unstable();
         tids.dedup();
         let mut guards = Vec::with_capacity(tids.len());
@@ -229,7 +229,7 @@ impl Shared {
     /// `max`, not overwrite: shared-guard pushes to one table resume from their
     /// commit awaits in an order the guard does not enforce, so the watermark
     /// must never regress — a precondition check would then false-pass.
-    fn record_commit_lsn(&self, tids: impl IntoIterator<Item = i64>, lsn: u64) {
+    fn record_commit_lsn(&self, tids: impl IntoIterator<Item = u64>, lsn: u64) {
         let mut map = self.table_commit_lsn.borrow_mut();
         for tid in tids {
             let e = map.entry(tid).or_default();
@@ -260,7 +260,7 @@ impl Shared {
     /// read freshness because `boot_seed` is the same `initial_lsn` `last_tick_lsn`
     /// is seeded to, so an unwritten table compares as absorbed — which it is,
     /// boot finishing its recovery tick sweep first.
-    fn commit_lsn_of(&self, tid: i64) -> u64 {
+    fn commit_lsn_of(&self, tid: u64) -> u64 {
         self.table_commit_lsn
             .borrow()
             .get(&tid)
@@ -275,7 +275,7 @@ impl Shared {
     ///
     /// Every per-relation master state a drop must reclaim is cleared here: ids
     /// are never reused, so nothing else would ever reclaim it.
-    fn forget_relation(&self, _catalog_write: &WriteGuard, id: i64) {
+    fn forget_relation(&self, _catalog_write: &WriteGuard, id: u64) {
         self.table_locks.borrow_mut().remove(&id);
         self.table_commit_lsn.borrow_mut().remove(&id);
         self.disp().forget_delta_round(id);
@@ -285,7 +285,7 @@ impl Shared {
     /// Credit `rows` against each tid's pending-tick count and fire the auto-tick
     /// if any tid now stands at or above the coalesce threshold. Below it a push
     /// only accumulates, and nothing ticks until a read asks for a drain.
-    pub(super) fn note_commit_rows(&self, rows: impl Iterator<Item = (i64, usize)>) {
+    pub(super) fn note_commit_rows(&self, rows: impl Iterator<Item = (u64, usize)>) {
         let crossed = {
             let mut pending = self.tick_rows.borrow_mut();
             let dag = &self.cat().dag;
@@ -307,7 +307,7 @@ impl Shared {
     /// The liveness filter is part of the drain rather than a separate step at
     /// each call site: both callers need it, and a third that forgot it would tick
     /// a dropped relation.
-    fn drain_live_tick_rows_into(&self, out: &mut Vec<i64>) {
+    fn drain_live_tick_rows_into(&self, out: &mut Vec<u64>) {
         out.clear();
         let mut rows = self.tick_rows.borrow_mut();
         out.extend(
@@ -323,7 +323,7 @@ impl Shared {
     /// them alone and a repeatedly-refused emit (a full SAL) is retried only
     /// when the next push or read asks for a tick. A tid a mid-tick push
     /// already re-queued keeps that push's real count.
-    fn requeue_tick_tids(&self, tids: &[i64]) {
+    fn requeue_tick_tids(&self, tids: &[u64]) {
         let mut rows = self.tick_rows.borrow_mut();
         for &tid in tids {
             rows.entry(tid).or_insert(1);
@@ -542,7 +542,7 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
     let mut dones: Vec<oneshot::Sender<Result<(), WireFault>>> = Vec::new();
     // Reused across every tick; `drain_live_tick_rows_into` clears it before
     // refilling so capacity is retained.
-    let mut tids_scratch: Vec<i64> = Vec::new();
+    let mut tids_scratch: Vec<u64> = Vec::new();
     loop {
         triggers.push(rx.recv().await);
 
@@ -577,7 +577,7 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
 
 /// Emit Tick groups for every `tid` and await the per-worker ACKs, relaying each
 /// exchange round the tick opens as it completes.
-async fn run_tick(shared: &Rc<Shared>, tids: &[i64]) -> Result<(), WireFault> {
+async fn run_tick(shared: &Rc<Shared>, tids: &[u64]) -> Result<(), WireFault> {
     // Snapshot before any .await: a concurrent push can advance the published LSN
     // while we wait for tick ACKs, and setting last_tick_lsn to that
     // higher value would report an LSN that this tick never processed.
@@ -701,7 +701,7 @@ async fn handle_message(peer: &Peer, buf: RecvBuf, shared: &Rc<Shared>) {
             return;
         }
     };
-    let target_id = ctrl.hdr.target_id as i64;
+    let target_id = ctrl.hdr.target_id;
     if let Err(f) = dispatch_request(peer, buf, ctrl, shared).await {
         send_fault(peer, target_id, &f);
     }
@@ -717,7 +717,7 @@ async fn dispatch_request(
     shared: &Rc<Shared>,
 ) -> Result<(), WireFault> {
     let data = buf.as_slice();
-    let target_id = ctrl.hdr.target_id as i64;
+    let target_id = ctrl.hdr.target_id;
     match ctrl.client_verb()? {
         // The multi-item frames name no single relation in `target_id`; each
         // decodes its items from the frame's body.
@@ -730,7 +730,7 @@ async fn dispatch_request(
         ClientVerb::AllocSerialRange => {
             send_id(
                 peer,
-                commit_serial_range_durable(shared, target_id, ctrl.hdr.arg1).await?,
+                commit_serial_range_durable(shared, target_id, ctrl.hdr.arg1).await? as u64,
             );
             Ok(())
         }
@@ -762,7 +762,7 @@ async fn dispatch_request(
 
 /// Reply to an id allocation. The new id rides back as the reply's *target* id —
 /// that id is the whole answer, so the frame carries no schema and no data.
-fn reply_allocation(peer: &Peer, alloc: Result<i64, String>) -> Result<(), WireFault> {
+fn reply_allocation(peer: &Peer, alloc: Result<u64, String>) -> Result<(), WireFault> {
     send_id(peer, alloc.map_err(|e| format!("id allocation failed: {e}"))?);
     Ok(())
 }
@@ -777,7 +777,7 @@ fn decode_push_frame(
     data: &[u8],
     ctrl: DecodedControl,
 ) -> Result<(ipc::DecodedWire, Rc<[u8]>), WireFault> {
-    let tid = ctrl.hdr.target_id as i64;
+    let tid = ctrl.hdr.target_id;
     let target = cat.schema_record(tid).ok_or_else(|| not_found(tid))?;
     let wire = ipc::decode_client_frame(data, ctrl, None, |record| target.decode_of(record).map(Some))
         .map_err(|e| format!("decode error: {e}"))?;
@@ -798,7 +798,7 @@ async fn handle_push(
     buf: RecvBuf,
     ctrl: gnitz_wire::control::DecodedControl,
 ) -> Result<(), WireFault> {
-    let target_id = ctrl.hdr.target_id as i64;
+    let target_id = ctrl.hdr.target_id;
     let flags = ctrl.hdr.flags;
 
     let (decoded, _charge) = buf.decode(|data| decode_push_frame(shared.cat(), data, ctrl));
@@ -838,7 +838,7 @@ async fn handle_push(
     let _tlocks = if !reads_committed {
         (Some(shared.table_lock(target_id).read().await), Vec::new())
     } else {
-        let lock_set: Vec<i64> = shared.cat().fk_lock_set(target_id).collect();
+        let lock_set: Vec<u64> = shared.cat().fk_lock_set(target_id).collect();
         (None, shared.lock_tables_exclusive(lock_set).await)
     };
 
@@ -892,7 +892,7 @@ async fn handle_read(
     blob: &[u8],
     verb: ClientVerb,
 ) -> Result<(), WireFault> {
-    let target_id = ctrl.hdr.target_id as i64;
+    let target_id = ctrl.hdr.target_id;
     let client_version = ctrl.hdr.flags.schema_version;
     let (g, kind) = read_lock(shared, target_id, Access::Read).await?;
     let schema = shared.disp().schema_desc_for(target_id);
@@ -917,7 +917,7 @@ async fn handle_read(
         send_msg(
             peer,
             ipc::WireMsg {
-                target_id: target_id as u64,
+                target_id,
                 flags: WireFlags {
                     schema_version: server_version,
                     ..Default::default()
@@ -946,7 +946,7 @@ async fn handle_read(
     }
 
     let template = ipc::WireMsg {
-        target_id: target_id as u64,
+        target_id,
         flags: WireFlags {
             schema_version: server_version,
             ..Default::default()
@@ -987,10 +987,10 @@ async fn handle_push_txn(
         }
         shared.cat().recheck_record(tid, &head.seen)?;
     }
-    let family_tids: Vec<i64> = families.iter().map(|f| f.tid).collect();
+    let family_tids: Vec<u64> = families.iter().map(|f| f.tid).collect();
 
     // 3. Acquire the per-table lock union ⋃ fk_lock_set(tid) exclusively.
-    let mut union: Vec<i64> = Vec::new();
+    let mut union: Vec<u64> = Vec::new();
     for fam in &families {
         union.extend(shared.cat().fk_lock_set(fam.tid));
     }
@@ -1031,7 +1031,7 @@ struct DecodedTxn {
 
 /// What the gate and the OCC check read of one `PUSH_TXN` family.
 struct TxnHead {
-    tid: i64,
+    tid: u64,
     basis: u64,
     seen: Rc<[u8]>,
 }
@@ -1043,7 +1043,7 @@ fn decode_push_txn_frame(cat: &CatalogEngine, body: &[u8]) -> Result<DecodedTxn,
     let mut families: Vec<TxnFamily> = Vec::with_capacity(items.len());
     let mut heads = Vec::with_capacity(items.len());
     for (frame, ctrl) in items {
-        let (tid, mode, basis) = (ctrl.hdr.target_id as i64, ctrl.hdr.flags.conflict_mode, ctrl.hdr.arg0);
+        let (tid, mode, basis) = (ctrl.hdr.target_id, ctrl.hdr.flags.conflict_mode, ctrl.hdr.arg0);
         let (wire, seen) = decode_push_frame(cat, frame, ctrl).map_err(|e| WireFault {
             text: format!("TXN family {tid}: {}", e.text),
             ..e
@@ -1060,7 +1060,7 @@ fn decode_push_txn_frame(cat: &CatalogEngine, body: &[u8]) -> Result<DecodedTxn,
     Ok(DecodedTxn { families, heads })
 }
 
-fn not_found(tid: i64) -> WireFault {
+fn not_found(tid: u64) -> WireFault {
     WireFault {
         status: WireStatus::NotFound,
         text: format!("relation {tid} not found"),
@@ -1090,7 +1090,7 @@ enum Access {
 /// **Only the absent-relation arm carries a status of its own**
 /// ([`WireStatus::NotFound`]): the arms below name a relation that exists, which a
 /// client must not recover from the way it recovers from a vanished one.
-fn target_kind(shared: &Shared, target_id: i64, access: Access) -> Result<RelationKind, WireFault> {
+fn target_kind(shared: &Shared, target_id: u64, access: Access) -> Result<RelationKind, WireFault> {
     let Some(kind) = shared.cat().registry.relation(target_id).map(Relation::kind) else {
         return Err(not_found(target_id));
     };
@@ -1110,7 +1110,7 @@ fn target_kind(shared: &Shared, target_id: i64, access: Access) -> Result<Relati
 
 /// The relation id a RESOLVE names, unvalidated when the client sent an id; `None`
 /// when its qualified name names none. `Err` when the name's schema does not exist.
-fn resolve_request_target(shared: &Rc<Shared>, target_id: i64, name_blob: &[u8]) -> Result<Option<i64>, WireFault> {
+fn resolve_request_target(shared: &Rc<Shared>, target_id: u64, name_blob: &[u8]) -> Result<Option<u64>, WireFault> {
     let candidate = if name_blob.is_empty() {
         target_id
     } else {
@@ -1135,7 +1135,7 @@ fn resolve_request_target(shared: &Rc<Shared>, target_id: i64, name_blob: &[u8])
 }
 
 /// Answer a RESOLVE with the relation's schema block and descriptor.
-fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, target_id: i64, name_blob: &[u8]) -> Result<(), WireFault> {
+fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, target_id: u64, name_blob: &[u8]) -> Result<(), WireFault> {
     let answer = resolve_request_target(shared, target_id, name_blob)?
         .and_then(|tid| shared.cat().resolve_answer(tid).map(|a| (tid, a)));
     let Some((tid, (desc, schema_block, version))) = answer else {
@@ -1146,7 +1146,7 @@ fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, target_id: i64, name_bl
     send_msg(
         peer,
         ipc::WireMsg {
-            target_id: tid as u64,
+            target_id: tid,
             flags: WireFlags {
                 schema_version: version,
                 ..Default::default()
@@ -1170,7 +1170,7 @@ fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, target_id: i64, name_bl
 ///
 /// A non-view target is vacuously fresh and answers before the closure walk.
 /// Caller holds the catalog read lock.
-fn read_is_fresh(shared: &Rc<Shared>, target: i64) -> bool {
+fn read_is_fresh(shared: &Rc<Shared>, target: u64) -> bool {
     if !shared
         .cat()
         .registry
@@ -1211,7 +1211,7 @@ async fn drain_and_relock(shared: &Rc<Shared>, guard: ReadGuard) -> Result<ReadG
 /// after the drain, since a DDL may have dropped it meanwhile.
 async fn read_lock(
     shared: &Rc<Shared>,
-    target_id: i64,
+    target_id: u64,
     access: Access,
 ) -> Result<(ReadGuard, RelationKind), WireFault> {
     let g = shared.catalog_rwlock.read().await;
@@ -1227,9 +1227,9 @@ async fn read_lock(
 /// The preliminary schema-only frame — carrying `continuation`, the
 /// `server_version`, and the captured wire block — that precedes a scan's data
 /// frames on a schema-cache miss.
-fn prelim_schema_msg(tid: i64, server_version: u16, block: &[u8]) -> ipc::WireMsg<'_> {
+fn prelim_schema_msg(tid: u64, server_version: u16, block: &[u8]) -> ipc::WireMsg<'_> {
     ipc::WireMsg {
-        target_id: tid as u64,
+        target_id: tid,
         flags: WireFlags::train_frame(server_version, false),
         schema_block: Some(block),
         ..Default::default()
@@ -1239,9 +1239,9 @@ fn prelim_schema_msg(tid: i64, server_version: u16, block: &[u8]) -> ipc::WireMs
 /// A reply train's terminal frame. `arg0` is the read's watermark (see
 /// [`read_watermark`]), or a DELTA_POLL position's tick round, whose cursor tag
 /// rides `arg1`; `arg1` is `0` for every other read.
-fn terminal_scan_msg(target_id: i64, arg0: u64, arg1: u64) -> ipc::WireMsg<'static> {
+fn terminal_scan_msg(target_id: u64, arg0: u64, arg1: u64) -> ipc::WireMsg<'static> {
     ipc::WireMsg {
-        target_id: target_id as u64,
+        target_id,
         arg0,
         arg1,
         ..Default::default()
@@ -1285,7 +1285,7 @@ async fn fan_out_scan(
 
 /// Finish one scan-shaped fan-out: the terminal frame carrying the `Ok`'s `arg0`
 /// (the read's watermark, or a delta read's round) and `arg1`, or the fault.
-fn finish_scan_fanout(peer: &Peer, target_id: i64, arg1: u64, result: Result<u64, WireFault>) {
+fn finish_scan_fanout(peer: &Peer, target_id: u64, arg1: u64, result: Result<u64, WireFault>) {
     match result {
         // Corked, not sent: the terminal joins whatever the forward corked.
         Ok(arg0) => send_msg(peer, terminal_scan_msg(target_id, arg0, arg1)),
@@ -1298,7 +1298,7 @@ fn finish_scan_fanout(peer: &Peer, target_id: i64, arg1: u64, result: Result<u64
 async fn handle_scan_spec(
     shared: &Rc<Shared>,
     peer: &Peer,
-    target_id: i64,
+    target_id: u64,
     blob: &[u8],
     reply_layout: u64,
 ) -> Result<(), WireFault> {
@@ -1306,7 +1306,7 @@ async fn handle_scan_spec(
     // family has no form of.
     let (g, kind) = read_lock(shared, target_id, Access::UserRead).await?;
     let template = ipc::WireMsg {
-        target_id: target_id as u64,
+        target_id,
         arg0: reply_layout,
         blob,
         ..Default::default()
@@ -1354,7 +1354,7 @@ async fn handle_delta_poll(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
         let mut positions = Vec::with_capacity(views.len());
         let mut moved: Vec<DeltaPollItem> = Vec::with_capacity(views.len());
         for &item in &views {
-            let tid = item.view_id as i64;
+            let tid = item.view_id;
             let position = match target_kind(shared, tid, Access::UserRead) {
                 Err(f) => PollPosition::Fault(f),
                 Ok(_) if delta_up_to_date(shared, tid, item.after_tick) => PollPosition::UpToDate,
@@ -1423,7 +1423,7 @@ async fn handle_delta_poll(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
 ///
 /// `false` at `after_tick = 0` (the bootstrap bound) and for a relation with no
 /// feed: both must reach the store, the second to be refused there.
-fn delta_up_to_date(shared: &Shared, target_id: i64, after_tick: u64) -> bool {
+fn delta_up_to_date(shared: &Shared, target_id: u64, after_tick: u64) -> bool {
     after_tick > 0
         && shared
             .cat()
@@ -1436,7 +1436,7 @@ fn delta_up_to_date(shared: &Shared, target_id: i64, after_tick: u64) -> bool {
 /// One relation's Phase-1 capture for `handle_scan_multi`: exactly what
 /// [`CatalogEngine::negotiated_schema_block`] answered, carried to the deferred Phase-2 emit.
 struct ScanMultiRelPlan {
-    tid: i64,
+    tid: u64,
     /// Stamped into the preliminary frame and onto the read, whose frames echo it.
     server_version: u16,
     kind: RelationKind,
@@ -1464,7 +1464,7 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
     // handed back, so a DDL during the drain is caught there and an unknown tid
     // is rejected there rather than here.
     let mut cat = shared.catalog_rwlock.read().await;
-    if relations.iter().any(|&(tid, _)| !read_is_fresh(shared, tid as i64)) {
+    if relations.iter().any(|&(tid, _)| !read_is_fresh(shared, tid)) {
         cat = drain_and_relock(shared, cat).await?;
     }
 
@@ -1474,7 +1474,7 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
         let _cat = cat;
         let mut plans: Vec<ScanMultiRelPlan> = Vec::with_capacity(relations.len());
         for &(tid_u, client_ver) in &relations {
-            let tid = tid_u as i64;
+            let tid = tid_u;
             // Base tables AND views are legal; `UserRead` refuses a catalog
             // family, which stays on the plain path that serves it
             // master-locally.
@@ -1491,7 +1491,7 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
                     plan.lsn = read_watermark(shared, plan.kind);
                     cut.read(DirectGroup {
                         template: ipc::WireMsg {
-                            target_id: plan.tid as u64,
+                            target_id: plan.tid,
                             flags: WireFlags {
                                 schema_version: plan.server_version,
                                 ..Default::default()
@@ -1558,18 +1558,18 @@ fn encode_response_into(out: &mut Vec<u8>, msg: ipc::WireMsg<'_>) {
 fn send_msg(peer: &Peer, msg: ipc::WireMsg<'_>) {
     let sz = msg.size();
     if sz > gnitz_wire::MAX_FRAME_PAYLOAD {
-        send_fault(peer, msg.target_id as i64, &ipc::oversized_frame_message(sz).into());
+        send_fault(peer, msg.target_id, &ipc::oversized_frame_message(sz).into());
         return;
     }
     peer.cork_with(|out| encode_response_into(out, msg));
 }
 
 /// A push's ACK: the target and the LSN the write reports, and no schema.
-fn send_push_ack(peer: &Peer, target_id: i64, lsn: u64) {
+fn send_push_ack(peer: &Peer, target_id: u64, lsn: u64) {
     send_msg(
         peer,
         ipc::WireMsg {
-            target_id: target_id as u64,
+            target_id,
             arg0: lsn,
             ..Default::default()
         },
@@ -1577,23 +1577,17 @@ fn send_push_ack(peer: &Peer, target_id: i64, lsn: u64) {
 }
 
 /// A successful control-only reply whose answer is the target id.
-fn send_id(peer: &Peer, id: i64) {
-    send_msg(
-        peer,
-        ipc::WireMsg {
-            target_id: id as u64,
-            ..Default::default()
-        },
-    )
+fn send_id(peer: &Peer, id: u64) {
+    send_msg(peer, ipc::WireMsg { target_id: id, ..Default::default() })
 }
 
 /// A failure carrying its own status, master-minted or forwarded from a worker.
 /// A failure describes no rows, so it carries no schema block.
-fn send_fault(peer: &Peer, target_id: i64, fault: &WireFault) {
+fn send_fault(peer: &Peer, target_id: u64, fault: &WireFault) {
     send_msg(
         peer,
         ipc::WireMsg {
-            target_id: target_id as u64,
+            target_id,
             status: fault.status,
             blob: fault.text.as_bytes(),
             ..Default::default()
@@ -1605,7 +1599,7 @@ fn send_fault(peer: &Peer, target_id: i64, fault: &WireFault) {
 /// what a stream lacks — a unique primary key, and any retraction at all — and
 /// rejecting `Error` mode is what keeps `push_reads_committed_state` false, and
 /// with it the shared table lock and the unread mode field.
-fn stream_push_error(target_id: i64, batch: &Batch, mode: gnitz_wire::WireConflictMode) -> Option<String> {
+fn stream_push_error(target_id: u64, batch: &Batch, mode: gnitz_wire::WireConflictMode) -> Option<String> {
     if mode == gnitz_wire::WireConflictMode::Error {
         return Some(format!(
             "table {target_id} is a stream: conflict mode 'error' asserts a primary-key \

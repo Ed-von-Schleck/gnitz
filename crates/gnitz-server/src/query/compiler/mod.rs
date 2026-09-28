@@ -229,7 +229,7 @@ impl LoadedCircuit {
 pub(super) struct SubPlan {
     pub(in crate::query) vm: Vm,
     /// source table id → the input register its delta seeds.
-    pub(in crate::query) source_reg_map: FxHashMap<i64, DeltaReg>,
+    pub(in crate::query) source_reg_map: FxHashMap<u64, DeltaReg>,
 }
 
 /// One exchanged side: a sub-plan whose output is relayed into `seed_reg` of the

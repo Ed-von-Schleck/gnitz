@@ -178,7 +178,7 @@ enum Clash {
 /// The PG-style PK-uniqueness rejection for the key `pk_bytes` of `schema`.
 fn pk_violation_err(
     cat: &CatalogEngine,
-    tid: i64,
+    tid: u64,
     schema: &SchemaDescriptor,
     pk_bytes: &[u8],
     clash: Clash,
@@ -197,7 +197,7 @@ fn pk_violation_err(
 }
 
 /// The rejection of a write colliding on the unique index over `col_indices`.
-fn unique_violation_err(cat: &CatalogEngine, tid: i64, col_indices: &[u32], clash: Clash) -> WireFault {
+fn unique_violation_err(cat: &CatalogEngine, tid: u64, col_indices: &[u32], clash: Clash) -> WireFault {
     let (name, cols) = (cat.qualified_name(tid), cat.column_names(tid, col_indices));
     let text = match clash {
         Clash::InBatch => format!("Unique index violation on '{name}' column '{cols}': duplicate in batch"),
@@ -227,17 +227,17 @@ type ParentDelta = (FxHashMap<u128, RetireVerb>, FxHashSet<u128>);
 
 /// `(parent tid, referenced col)` → its delta. Resolved once per key and shared
 /// by rules F1 and F2, which both turn on it.
-type ParentDeltas = FxHashMap<(i64, usize), ParentDelta>;
+type ParentDeltas = FxHashMap<(u64, usize), ParentDelta>;
 
 /// The [`ParentDeltas`] key `e`'s referenced value lives under.
-fn delta_key(e: &FkEdge) -> (i64, usize) {
+fn delta_key(e: &FkEdge) -> (u64, usize) {
     (e.parent_tid, e.parent_col)
 }
 
 /// One table of the bundle: its families in frame order, its catalog schema,
 /// its constraints, and its fold.
 struct TxnTable<'a> {
-    tid: i64,
+    tid: u64,
     schema: SchemaDescriptor,
     /// Indices into the bundle's family list, in frame order.
     family_indices: Vec<usize>,
@@ -335,19 +335,19 @@ impl<'a> TxnBundle<'a> {
     }
 
     /// Is `tid` one of the bundle's tables?
-    fn has(&self, tid: i64) -> bool {
+    fn has(&self, tid: u64) -> bool {
         self.tables.iter().any(|t| t.tid == tid)
     }
 
-    fn table(&self, tid: i64) -> &TxnTable<'a> {
+    fn table(&self, tid: u64) -> &TxnTable<'a> {
         self.tables.iter().find(|t| t.tid == tid).expect("a bundled table")
     }
 
-    fn schema(&self, tid: i64) -> &SchemaDescriptor {
+    fn schema(&self, tid: u64) -> &SchemaDescriptor {
         &self.table(tid).schema
     }
 
-    fn fold(&self, tid: i64) -> &Fold<'a> {
+    fn fold(&self, tid: u64) -> &Fold<'a> {
         self.table(tid).fold.as_ref().expect("a folded table")
     }
 
@@ -359,7 +359,7 @@ impl<'a> TxnBundle<'a> {
     /// The rows of `tid` that survive the whole bundle: `(pk, family, row)` —
     /// the `Inserted` projection of its fold. Walked, never materialized: every
     /// reader consumes it in one pass, so a list would be a second copy.
-    fn surviving(&self, tid: i64) -> impl Iterator<Item = (&'a [u8], u32, u32)> + '_ {
+    fn surviving(&self, tid: u64) -> impl Iterator<Item = (&'a [u8], u32, u32)> + '_ {
         self.fold(tid).iter().filter_map(|(pk, e)| match e.last {
             FoldOp::Inserted(f, r) => Some((*pk, f, r)),
             FoldOp::Deleted => None,
@@ -368,12 +368,12 @@ impl<'a> TxnBundle<'a> {
 
     /// The touched PKs of `tid` that exist in committed state — the only ones
     /// with an old referenced value to retire.
-    fn touched_committed(&self, tid: i64) -> impl Iterator<Item = &'a [u8]> + '_ {
+    fn touched_committed(&self, tid: u64) -> impl Iterator<Item = &'a [u8]> + '_ {
         self.fold(tid).iter().filter(|(_, e)| e.committed).map(|(pk, _)| *pk)
     }
 
     /// The fold of `tid`, for U-PK's burst to record its answers into.
-    fn fold_mut(&mut self, tid: i64) -> &mut Fold<'a> {
+    fn fold_mut(&mut self, tid: u64) -> &mut Fold<'a> {
         self.tables
             .iter_mut()
             .find(|t| t.tid == tid)
@@ -386,7 +386,7 @@ impl<'a> TxnBundle<'a> {
     /// Whether the bundle retires `holder`'s claim on `span` in `tid`'s index
     /// `spec`: its surviving state is deleted, or holds a NULL or another span
     /// there. A holder the bundle does not touch keeps its claim.
-    fn retires(&self, tid: i64, spec: &IndexKeySpec, holder: &[u8], span: &[u8], buf: &mut PkBuf) -> bool {
+    fn retires(&self, tid: u64, spec: &IndexKeySpec, holder: &[u8], span: &[u8], buf: &mut PkBuf) -> bool {
         match self.fold(tid).get(holder).map(|e| e.last) {
             None => false,
             Some(FoldOp::Deleted) => true,
@@ -407,7 +407,7 @@ struct FkProbePlan {
 /// encoder that splits a reply entry into `[span ‖ holder]`, and each check
 /// batch row's surviving claimant PK, in row order.
 struct UniquePlan<'a> {
-    tid: i64,
+    tid: u64,
     col_indices: PkColList,
     spec: IndexKeySpec,
     holders: Vec<&'a [u8]>,
@@ -590,8 +590,8 @@ impl MasterDispatcher {
 /// The in-batch duplicate rule needs no probe, so the fold fires it — before the
 /// round trip, and before any existence check on the table, which is what makes
 /// "duplicate in batch" win over "already exists" rather than race it.
-fn plan_pk_checks(b: &TxnBundle<'_>, checks: &mut Vec<PipelinedCheck>) -> Vec<i64> {
-    let mut probed: Vec<i64> = Vec::new();
+fn plan_pk_checks(b: &TxnBundle<'_>, checks: &mut Vec<PipelinedCheck>) -> Vec<u64> {
+    let mut probed: Vec<u64> = Vec::new();
     for t in &b.tables {
         let Some(fold) = t.fold.as_ref() else {
             continue;
@@ -845,7 +845,7 @@ async fn resolve_parent_deltas(
     constraints: &[FkEdge],
     children: &[FkEdge],
 ) -> Result<ParentDeltas, WireFault> {
-    let mut needed: Vec<(i64, usize)> = constraints
+    let mut needed: Vec<(u64, usize)> = constraints
         .iter()
         .filter(|e| b.has(e.parent_tid))
         .chain(children.iter())
@@ -935,7 +935,7 @@ async fn resolve_parent_deltas(
 /// their surviving state no longer holds.
 fn parent_retired_added(
     b: &TxnBundle<'_>,
-    parent_tid: i64,
+    parent_tid: u64,
     ref_col: usize,
     old_value: impl Fn(&[u8]) -> Option<u128>,
 ) -> ParentDelta {

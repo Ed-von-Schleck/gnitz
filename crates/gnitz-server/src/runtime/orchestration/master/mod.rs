@@ -42,7 +42,7 @@ pub(crate) use unique_filter::UniqueFilter;
 pub(crate) struct RelayPrepared {
     /// The view the relay targets.
     view: wire::WireSchema,
-    source_id: i64,
+    source_id: u64,
     /// One batch per worker (scatter), or a single batch every worker is sent
     /// (broadcast).
     dest: Vec<Batch>,
@@ -55,7 +55,7 @@ impl RelayPrepared {
     pub(crate) fn group(&self) -> DirectGroup<'_> {
         DirectGroup {
             template: self.view.frame(wire::WireMsg {
-                arg0: self.source_id as u64,
+                arg0: self.source_id,
                 flags: WireFlags {
                     drained: self.drained,
                     ..Default::default()
@@ -83,7 +83,7 @@ pub struct MasterDispatcher {
     /// occupancy broadcasts. Keyed by the decoded list, so a composite index is
     /// identified by its whole column list and dropping `(a, b)` never touches
     /// a distinct single-column filter on `a`.
-    unique_filters: RefCell<FxHashMap<(i64, PkColList), UniqueFilter>>,
+    unique_filters: RefCell<FxHashMap<(u64, PkColList), UniqueFilter>>,
 
     /// The generation the last ephemeral round stamped. Set unconditionally, so
     /// `derived_needs_restamp` reads it in release builds too.
@@ -97,7 +97,7 @@ pub struct MasterDispatcher {
 
     /// Feed-enabled view id → the last round that reached it, absent reading as 1.
     /// May name a round that left the view no rows; never misses one that did.
-    last_delta_round: RefCell<FxHashMap<i64, u64>>,
+    last_delta_round: RefCell<FxHashMap<u64, u64>>,
 
     /// A `u64` taken from the OS at boot, mixed into every delta reply's cursor
     /// tag; `MasterDispatcher::delta_cursor_tag` states what the tag answers.
@@ -181,7 +181,7 @@ impl<'d> ScanCut<'d> {
     /// own key set when the bound splits one.
     pub(crate) fn read(&mut self, group: DirectGroup<'_>) -> Result<(), WireFault> {
         let bound = group.kind.carries_read_bound().then_some(group.template.blob);
-        let schema = self.disp.schema_desc_for(group.template.target_id as i64);
+        let schema = self.disp.schema_desc_for(group.template.target_id);
         let route = route_read(&schema, bound, self.disp.num_workers());
         self.push(group.kind, route.set, |excl, targets| {
             excl.write(&DirectGroup {

@@ -36,7 +36,7 @@ pub fn nullable_def(name: &str, type_code: TypeCode) -> ColumnDef {
 }
 
 /// A column of `type_code` carrying an FK onto `(parent_tid, parent_col)`.
-pub fn fk_def(name: &str, type_code: TypeCode, parent_tid: i64, parent_col: u32) -> ColumnDef {
+pub fn fk_def(name: &str, type_code: TypeCode, parent_tid: u64, parent_col: u32) -> ColumnDef {
     ColumnDef {
         fk_table_id: parent_tid,
         fk_col_idx: parent_col,
@@ -62,24 +62,24 @@ pub fn sum_weights(mut c: ReadCursor) -> i64 {
 
 /// Write `vid`'s circuit through the applied-delta path, through the row writer
 /// the client commits with.
-pub fn write_circuit(engine: &mut CatalogEngine, vid: i64, circuit: Circuit) {
+pub fn write_circuit(engine: &mut CatalogEngine, vid: u64, circuit: Circuit) {
     let mut bb = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
-    write_circuit_rows(&mut bb, vid as u64, &circuit);
+    write_circuit_rows(&mut bb, vid, &circuit);
     engine.submit(SysFamily::CircuitNodes, bb.finish()).unwrap();
 }
 
 /// The minimal identity circuit `ScanDelta(source, bound) → Integrate`.
-pub fn identity_circuit(source_tid: i64, bound: gnitz_wire::ReadBound) -> Circuit {
+pub fn identity_circuit(source_tid: u64, bound: gnitz_wire::ReadBound) -> Circuit {
     let mut circuit = Circuit::default();
-    let scan = circuit.input_delta(source_tid as u64, bound);
+    let scan = circuit.input_delta(source_tid, bound);
     circuit.sink(scan);
     circuit
 }
 
 /// `ScanDelta(source)` then `n - 1` `Negate`s: an `n`-node circuit.
-pub fn negate_chain(source: i64, n: usize) -> Circuit {
+pub fn negate_chain(source: u64, n: usize) -> Circuit {
     let mut circuit = Circuit::default();
-    let mut tip = circuit.input_delta(source as u64, gnitz_wire::ReadBound::None);
+    let mut tip = circuit.input_delta(source, gnitz_wire::ReadBound::None);
     for _ in 1..n {
         tip = circuit.negate(tip);
     }
@@ -88,23 +88,20 @@ pub fn negate_chain(source: i64, n: usize) -> Circuit {
 
 /// `source` scanned and reindexed on its column 1, keeping its column 0, which
 /// it states as its scatter key.
-pub fn reindexed_on_col1(circuit: &mut Circuit, source: i64) -> gnitz_wire::NodeId {
+pub fn reindexed_on_col1(circuit: &mut Circuit, source: u64) -> gnitz_wire::NodeId {
     let key = [(1, None)];
-    let scan = circuit.input_delta(source as u64, gnitz_wire::ReadBound::None);
-    let role = gnitz_wire::ReindexRole::ScatterKey {
-        source: source as u64,
-        source_key: key.to_vec(),
-    };
+    let scan = circuit.input_delta(source, gnitz_wire::ReadBound::None);
+    let role = gnitz_wire::ReindexRole::ScatterKey { source, source_key: key.to_vec() };
     circuit.map_reindex(scan, &key, &[0], role, gnitz_wire::NullKeys::Keep)
 }
 
 /// An equi-join of `a` and `b` on their column 1, each side stating its scatter
 /// key where `keyed` says so.
-pub fn equi_join_circuit(a: i64, b: i64, keyed: [bool; 2]) -> Circuit {
+pub fn equi_join_circuit(a: u64, b: u64, keyed: [bool; 2]) -> Circuit {
     let mut circuit = Circuit::default();
     let [ka, kb] = [(a, keyed[0]), (b, keyed[1])].map(|(source, keyed)| match keyed {
         true => reindexed_on_col1(&mut circuit, source),
-        false => circuit.input_delta(source as u64, gnitz_wire::ReadBound::None),
+        false => circuit.input_delta(source, gnitz_wire::ReadBound::None),
     });
     let tb = circuit.integrate_trace(kb);
     let joined = circuit.join(ka, tb, gnitz_wire::JoinKind::Equi, false);
@@ -114,7 +111,7 @@ pub fn equi_join_circuit(a: i64, b: i64, keyed: [bool; 2]) -> Circuit {
 
 /// A two-term inner equi-join of `a` and `b` on their column 1, output
 /// `[key, a.0, b.0]`.
-pub fn two_term_join_circuit(a: i64, b: i64) -> Circuit {
+pub fn two_term_join_circuit(a: u64, b: u64) -> Circuit {
     let mut circuit = Circuit::default();
     let deltas = [a, b].map(|source| reindexed_on_col1(&mut circuit, source));
     let traces = deltas.map(|d| circuit.integrate_trace(d));
@@ -136,13 +133,13 @@ impl crate::query::DriveHost for LocalDrive<'_> {
         (&mut self.0.dag, &mut self.0.registry)
     }
 
-    fn exchange(&mut self, view_id: i64, _batch: Batch, _key: i64) -> Batch {
+    fn exchange(&mut self, view_id: u64, _batch: Batch, _key: u64) -> Batch {
         panic!("view {view_id} relayed: this host serves exchange-free circuits only");
     }
 }
 
 /// [`identity_circuit`] written as `vid`'s circuit.
-pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, source_tid: i64, bound: gnitz_wire::ReadBound) {
+pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: u64, source_tid: u64, bound: gnitz_wire::ReadBound) {
     write_circuit(engine, vid, identity_circuit(source_tid, bound));
 }
 
@@ -154,8 +151,8 @@ pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, source_tid: 
 /// Append one TABLE_TAB row at `weight`.
 pub fn push_table_tab_row(
     bb: &mut BatchBuilder,
-    tid: i64,
-    schema_id: i64,
+    tid: u64,
+    schema_id: u64,
     name: &str,
     pk_col_idx: u64,
     flags: u64,
@@ -164,8 +161,8 @@ pub fn push_table_tab_row(
     write_table_tab_row(
         bb,
         &TableTabRow {
-            table_id: tid as u64,
-            schema_id: schema_id as u64,
+            table_id: tid,
+            schema_id,
             name,
             pk_col_idx,
             flags,
@@ -175,7 +172,7 @@ pub fn push_table_tab_row(
 }
 
 /// `defs` as `owner_id`'s COL_TAB batch at `weight`, numbered by position.
-pub fn col_tab_batch(owner_id: i64, defs: &[ColumnDef], weight: i64) -> Batch {
+pub fn col_tab_batch(owner_id: u64, defs: &[ColumnDef], weight: i64) -> Batch {
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
     crate::catalog::write_col_tab_rows(&mut bb, owner_id, defs, weight);
     bb.finish()
@@ -184,8 +181,8 @@ pub fn col_tab_batch(owner_id: i64, defs: &[ColumnDef], weight: i64) -> Batch {
 /// The one-row IDX_TAB batch at `weight`. A `-1` must reproduce its `+1`'s
 /// payload exactly — the retraction CAS rejects a mismatch.
 pub fn idx_tab_batch(
-    index_id: i64,
-    owner_id: i64,
+    index_id: u64,
+    owner_id: u64,
     packed_cols: u64,
     name: &str,
     props: gnitz_wire::IndexProps,
@@ -195,8 +192,8 @@ pub fn idx_tab_batch(
     write_idx_tab_row(
         &mut bb,
         &IdxTabRow {
-            index_id: index_id as u64,
-            owner_id: owner_id as u64,
+            index_id,
+            owner_id,
             source_col_idx: packed_cols,
             name,
             flags: props.pack(),
@@ -211,20 +208,20 @@ pub fn idx_tab_batch(
 pub fn push_view_tab_row(
     bb: &mut BatchBuilder,
     weight: i64,
-    vid: i64,
+    vid: u64,
     view_name: &str,
     capacity_bytes: u64,
     delta_bytes: u64,
-    owner_view_id: i64,
+    owner_view_id: u64,
 ) {
     let sink: &mut dyn SysRowSink = bb;
     sink.begin_row(&[vid as u128], weight);
-    sink.put_u64(PUBLIC_SCHEMA_ID as u64);
+    sink.put_u64(PUBLIC_SCHEMA_ID);
     sink.put_string(view_name);
     sink.put_u64(gnitz_wire::pack_pk_cols(&[0]));
     sink.put_u64(capacity_bytes);
     sink.put_u64(delta_bytes);
-    sink.put_u64(owner_view_id as u64);
+    sink.put_u64(owner_view_id);
     sink.put_u64(gnitz_wire::ViewFlags::default().pack());
     sink.end_row();
 }
@@ -239,7 +236,7 @@ pub fn try_register_view(
     cols: &[ColumnDef],
     capacity_bytes: u64,
     delta_bytes: u64,
-) -> Result<i64, String> {
+) -> Result<u64, String> {
     let vid = engine.allocate_ids(1).unwrap();
     write_circuit(engine, vid, circuit);
     engine.write_column_records(vid, cols).unwrap();
@@ -252,25 +249,25 @@ pub fn try_register_view(
 /// [`try_register_view`] for an identity view over `source_tid`.
 pub fn try_register_identity_view(
     engine: &mut CatalogEngine,
-    source_tid: i64,
+    source_tid: u64,
     name: &str,
     cols: &[ColumnDef],
     capacity_bytes: u64,
     delta_bytes: u64,
-) -> Result<i64, String> {
+) -> Result<u64, String> {
     let circuit = identity_circuit(source_tid, gnitz_wire::ReadBound::None);
     try_register_view(engine, circuit, name, cols, capacity_bytes, delta_bytes)
 }
 
 /// [`try_register_identity_view`] for an unbounded view that must succeed.
-pub fn register_identity_view(engine: &mut CatalogEngine, source_tid: i64, name: &str, cols: &[ColumnDef]) -> i64 {
+pub fn register_identity_view(engine: &mut CatalogEngine, source_tid: u64, name: &str, cols: &[ColumnDef]) -> u64 {
     try_register_identity_view(engine, source_tid, name, cols, 0, 0).unwrap()
 }
 
 /// The rows a range read over `cols` returns, or `None` when none match.
 pub fn seek_by_index_range(
     engine: &mut CatalogEngine,
-    tid: i64,
+    tid: u64,
     cols: &[u32],
     eq: &[u128],
     start: gnitz_wire::Cut,
@@ -291,7 +288,7 @@ pub fn seek_by_index_range(
 /// prefix seek.
 pub fn seek_by_index(
     engine: &mut CatalogEngine,
-    tid: i64,
+    tid: u64,
     cols: &[u32],
     natives: &[u128],
 ) -> Result<(Option<std::rc::Rc<Batch>>, gnitz_store::schema::SchemaDescriptor), gnitz_wire::WireFault> {

@@ -44,22 +44,22 @@ fn only_an_ascii_uppercase_byte_makes_a_name_non_canonical() {
 // ── Contract fixtures ───────────────────────────────────────────────────────
 
 /// A SCHEMA_TAB batch of `(schema_id, name, weight)` rows.
-fn schema_batch(rows: &[(i64, &str, i64)]) -> Batch {
+fn schema_batch(rows: &[(u64, &str, i64)]) -> Batch {
     let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
     for &(schema_id, name, weight) in rows {
-        write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id: schema_id as u64, name }, weight);
+        write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id, name }, weight);
     }
     bb.finish()
 }
 
 /// An IDX_TAB batch of `(index_id, weight)` rows over one owner and column.
-fn idx_batch(rows: &[(i64, i64)]) -> Batch {
+fn idx_batch(rows: &[(u64, i64)]) -> Batch {
     let mut bb = BatchBuilder::new(*SysFamily::Index.schema());
     for &(index_id, weight) in rows {
         write_idx_tab_row(
             &mut bb,
             &IdxTabRow {
-                index_id: index_id as u64,
+                index_id,
                 owner_id: 16,
                 source_col_idx: gnitz_wire::pack_pk_cols(&[1]),
                 name: "ix",
@@ -72,13 +72,13 @@ fn idx_batch(rows: &[(i64, i64)]) -> Batch {
 }
 
 /// A CIRCUIT_NODES batch of `(view_id, node_id, weight)` rows.
-fn circuit_batch(rows: &[(i64, u64, i64)]) -> Batch {
+fn circuit_batch(rows: &[(u64, u64, i64)]) -> Batch {
     let mut bb = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
     for &(view_id, node_id, weight) in rows {
         write_circuit_node_row(
             &mut bb,
             &CircuitNodeRow {
-                view_id: view_id as u64,
+                view_id,
                 node_id,
                 opcode: gnitz_wire::Opcode::IntegrateSink.as_wire(),
                 source_table: None,
@@ -92,7 +92,7 @@ fn circuit_batch(rows: &[(i64, u64, i64)]) -> Batch {
 }
 
 /// A one-row SEQ_TAB batch.
-fn seq_batch(seq_id: i64, value: u64, weight: i64) -> Batch {
+fn seq_batch(seq_id: u64, value: u64, weight: i64) -> Batch {
     let mut bb = BatchBuilder::new(*SysFamily::Sequence.schema());
     bb.begin_row(seq_id as u128, weight);
     bb.put_u64(value);
@@ -102,7 +102,7 @@ fn seq_batch(seq_id: i64, value: u64, weight: i64) -> Batch {
 
 /// A TABLE_TAB row reproducing what `create_table` writes for `tid` — so a `-1`
 /// built from it satisfies the CAS and a `+1` differs only where the test says.
-fn table_row(bb: &mut BatchBuilder, tid: i64, sid: i64, name: &str, weight: i64) {
+fn table_row(bb: &mut BatchBuilder, tid: u64, sid: u64, name: &str, weight: i64) {
     push_table_tab_row(
         bb,
         tid,
@@ -246,7 +246,7 @@ fn an_id_below_a_familys_first_user_id_is_rejected_whatever_its_sign() {
     }
 
     let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-    table_row(&mut bb, IDX_TAB_ID, SYSTEM_SCHEMA_ID, "_indices", 1);
+    table_row(&mut bb, gnitz_wire::IDX_TAB, SYSTEM_SCHEMA_ID, "_indices", 1);
     let err = contract_err(&engine, SysFamily::Table, &bb.finish());
     assert!(err.contains("a system table"), "{err}");
 
@@ -261,10 +261,17 @@ fn an_id_below_a_familys_first_user_id_is_rejected_whatever_its_sign() {
     // COL_TAB packs the owner into its PK, so its floor is the packed word —
     // and the message renders both halves rather than that word.
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    write_col_tab_row(&mut bb, &col_def("id", TypeCode::U64).col_tab_row(IDX_TAB_ID, 0), 1);
+    write_col_tab_row(
+        &mut bb,
+        &col_def("id", TypeCode::U64).col_tab_row(gnitz_wire::IDX_TAB, 0),
+        1,
+    );
     let err = contract_err(&engine, SysFamily::Column, &bb.finish());
     assert!(err.contains("a system column"), "{err}");
-    assert!(err.contains(&format!("column 0 of owner {IDX_TAB_ID}")), "{err}");
+    assert!(
+        err.contains(&format!("column 0 of owner {}", gnitz_wire::IDX_TAB)),
+        "{err}"
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -274,7 +281,7 @@ fn an_id_below_a_familys_first_user_id_is_rejected_whatever_its_sign() {
 #[test]
 fn an_id_at_or_above_a_familys_ceiling_is_rejected() {
     let (engine, dir) = open("precheck_id_ceiling");
-    let ceiling = sys_tables::CATALOG_ID_CEILING;
+    let ceiling = gnitz_wire::CATALOG_ID_CEILING;
 
     for id in [ceiling, ceiling + 4096] {
         let err = contract_err(&engine, SysFamily::Schema, &schema_batch(&[(id, "s", 1)]));
@@ -298,7 +305,7 @@ fn an_id_at_or_above_a_familys_ceiling_is_rejected() {
 fn a_retraction_needs_a_live_row_that_content_equals_it() {
     let (mut engine, dir) = open("precheck_cas");
     engine
-        .ingest_to_family(SCHEMA_TAB_ID, &schema_batch(&[(20, "live", 1)]))
+        .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_batch(&[(20, "live", 1)]))
         .unwrap();
 
     let err = contract_err(&engine, SysFamily::Schema, &schema_batch(&[(21, "absent", -1)]));
@@ -320,7 +327,7 @@ fn a_retraction_needs_a_live_row_that_content_equals_it() {
 fn a_write_may_not_leave_a_pk_outside_net_weight_zero_or_one() {
     let (mut engine, dir) = open("precheck_net");
     engine
-        .ingest_to_family(SCHEMA_TAB_ID, &schema_batch(&[(20, "live", 1)]))
+        .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_batch(&[(20, "live", 1)]))
         .unwrap();
 
     let err = contract_err(&engine, SysFamily::Schema, &schema_batch(&[(20, "live", 1)]));

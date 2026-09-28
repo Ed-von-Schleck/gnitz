@@ -33,6 +33,15 @@ pub(crate) use store::Store;
 // Secondary index
 // ---------------------------------------------------------------------------
 
+/// Who holds a secondary-index circuit; it lives while one remains.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IndexClaim {
+    /// An FK circuit on the owner's column list.
+    ForeignKey,
+    /// A catalog index.
+    Index { id: u64, unique: bool },
+}
+
 /// A secondary index on a column list of one relation. Owns this process's store
 /// for it — dropping the index drops the store.
 pub struct SecondaryIndex {
@@ -46,9 +55,8 @@ pub struct SecondaryIndex {
     /// the owner — [`RelationRegistry::swap_schema`] rejects any descriptor that
     /// would not leave it valid.
     key_spec: crate::schema::IndexKeySpec,
-    /// Every holder of this circuit: a catalog index's id, or an FK circuit's
-    /// column index; the circuit lives while one remains.
-    claims: Vec<(i64, bool)>,
+    /// Every holder of this circuit.
+    claims: Vec<IndexClaim>,
     /// Whether `cols` covers the owner's PK, so the index can never collide.
     covers_pk: bool,
 }
@@ -69,11 +77,13 @@ impl SecondaryIndex {
     }
 
     pub fn is_unique(&self) -> bool {
-        self.claims.iter().any(|&(_, u)| u)
+        self.claims
+            .iter()
+            .any(|c| matches!(c, IndexClaim::Index { unique: true, .. }))
     }
 
-    /// `(claim id, unique)` of every holder of this circuit.
-    pub fn claims(&self) -> &[(i64, bool)] {
+    /// Every holder of this circuit.
+    pub fn claims(&self) -> &[IndexClaim] {
         &self.claims
     }
 
@@ -213,7 +223,7 @@ pub struct Relation {
     /// The relation id — the key it is registered under, held here too so a
     /// borrowed `Relation` names itself: nothing that has one needs the id
     /// threaded in beside it to log or to phrase an error.
-    id: i64,
+    id: u64,
     store: Store,
     delta: Option<Box<Table>>,
     indexes: Vec<SecondaryIndex>,
@@ -233,7 +243,7 @@ impl Relation {
         *self.store.schema()
     }
 
-    pub fn id(&self) -> i64 {
+    pub fn id(&self) -> u64 {
         self.id
     }
 
@@ -362,7 +372,7 @@ impl Relation {
 /// A relation to [`RelationRegistry::register`].
 #[derive(Clone, Copy)]
 pub struct RelationSpec {
-    pub id: i64,
+    pub id: u64,
     pub kind: RelationKind,
     pub schema: SchemaDescriptor,
 }
@@ -422,7 +432,7 @@ impl StoreConfig {
 /// `Rc`-bearing value it handed out is still alive outside it: those refcounts
 /// are non-atomic.
 pub struct RelationRegistry {
-    pub(crate) tables: FxHashMap<i64, Relation>,
+    pub(crate) tables: FxHashMap<u64, Relation>,
     /// The data directory every relation's [`relation_dir`] sits under.
     pub(crate) base_dir: String,
     /// Which worker this process is, of how many: names the `w{k}of{n}` child
@@ -465,24 +475,20 @@ impl RelationRegistry {
     // ── Relation registry ───────────────────────────────────────────────
 
     /// Drop `id`'s entry, and with it its owned stores and fds.
-    pub fn unregister(&mut self, id: i64) {
+    pub fn unregister(&mut self, id: u64) {
         self.tables.remove(&id);
     }
 
     /// Enter a secondary index on `owner` over `cols`, filled from this process's
     /// slice of the owner, or add a claim to the one already on `cols`. On
-    /// `Err` nothing is entered. `index_id` is the claim's id. `is_unique` is
-    /// trusted: a duplicate can straddle two workers' slices, so only the caller
-    /// can check it.
-    pub fn add_index(&mut self, owner: i64, index_id: i64, cols: &[u32], is_unique: bool) -> Result<(), StoreError> {
+    /// `Err` nothing is entered. A claim's `unique` is trusted: a duplicate can
+    /// straddle two workers' slices, so only the caller can check it.
+    pub fn add_index(&mut self, owner: u64, claim: IndexClaim, cols: &[u32]) -> Result<(), StoreError> {
         let owner_schema = self.index_owner(owner)?.schema();
         if let Some(ix) = self.relation_mut(owner).and_then(|e| e.index_on_mut(cols)) {
             // The IDX_TAB net bound keeps one live row per id, applied once per process.
-            debug_assert!(
-                ix.claims.iter().all(|&(id, _)| id != index_id),
-                "index {index_id} claimed twice"
-            );
-            ix.claims.push((index_id, is_unique));
+            debug_assert!(!ix.claims.contains(&claim), "{claim:?} claimed twice");
+            ix.claims.push(claim);
             return Ok(());
         }
         let (key_spec, index_schema) =
@@ -491,7 +497,7 @@ impl RelationRegistry {
             cols: PkColList::from_slice(cols),
             store: Store::Absent(Box::new(index_schema)),
             key_spec,
-            claims: vec![(index_id, is_unique)],
+            claims: vec![claim],
             covers_pk: owner_schema.covers_pk(cols),
         };
         if self.residency.owns_stores() {
@@ -509,14 +515,16 @@ impl RelationRegistry {
         Ok(())
     }
 
-    /// Remove `claim` from whichever of `owner`'s circuits holds it, dropping a
-    /// circuit left with none. A no-op when the owner or claim is absent.
-    pub fn release_index(&mut self, owner: i64, claim: i64) {
+    /// Remove catalog index `index_id`'s claim from whichever of `owner`'s
+    /// circuits holds it, dropping a circuit left with none. A no-op when the
+    /// owner or claim is absent.
+    pub fn release_index(&mut self, owner: u64, index_id: u64) {
         let Some(entry) = self.tables.get_mut(&owner) else {
             return;
         };
         for ix in &mut entry.indexes {
-            ix.claims.retain(|&(id, _)| id != claim);
+            ix.claims
+                .retain(|c| !matches!(*c, IndexClaim::Index { id, .. } if id == index_id));
         }
         entry.indexes.retain(|ix| !ix.claims.is_empty());
     }
@@ -524,7 +532,7 @@ impl RelationRegistry {
     /// Publish a new column schema for a registered base table in place (any
     /// column ALTER): update the registry copy and push the same value down into
     /// the owned `Table`, which rebinds its shards if the region count grew.
-    pub fn swap_schema(&mut self, id: i64, schema: SchemaDescriptor) -> Result<(), StoreError> {
+    pub fn swap_schema(&mut self, id: u64, schema: SchemaDescriptor) -> Result<(), StoreError> {
         let entry = self.relation_mut_or_err(id)?;
         // Checked, not asserted: what a stale `key_spec` produces is a silently
         // wrong index projection, which release codegen would not guard at all.
@@ -542,7 +550,7 @@ impl RelationRegistry {
 
     // ── Registry reads ──────────────────────────────────────────────────
 
-    pub fn has_id(&self, id: i64) -> bool {
+    pub fn has_id(&self, id: u64) -> bool {
         self.tables.contains_key(&id)
     }
 
@@ -573,25 +581,25 @@ impl RelationRegistry {
 
     /// The relation `id` names, or `None` for an unknown id — the shape every
     /// probing caller wants.
-    pub fn relation(&self, id: i64) -> Option<&Relation> {
+    pub fn relation(&self, id: u64) -> Option<&Relation> {
         self.tables.get(&id)
     }
 
     /// [`Self::relation`] as `&mut` — the one mutable route into a relation, so
     /// navigation reads the same in both directions.
-    pub fn relation_mut(&mut self, id: i64) -> Option<&mut Relation> {
+    pub fn relation_mut(&mut self, id: u64) -> Option<&mut Relation> {
         self.tables.get_mut(&id)
     }
 
     /// [`Self::relation`] plus the one "not registered" sentence — spelled the
     /// same by the mutating paths, so which verb asked cannot change what a
     /// client reads.
-    pub fn relation_or_err(&self, id: i64) -> Result<&Relation, StoreError> {
+    pub fn relation_or_err(&self, id: u64) -> Result<&Relation, StoreError> {
         self.relation(id).ok_or_else(|| Self::unregistered(id))
     }
 
     /// `owner`, if it may carry a secondary index: only a base table can.
-    pub fn index_owner(&self, owner: i64) -> Result<&Relation, StoreError> {
+    pub fn index_owner(&self, owner: u64) -> Result<&Relation, StoreError> {
         let e = self.relation_or_err(owner)?;
         if !e.kind().is_base_table() {
             return Err(StoreError::rejected(format!(
@@ -603,11 +611,11 @@ impl RelationRegistry {
     }
 
     /// [`Self::relation_or_err`] as `&mut`.
-    pub fn relation_mut_or_err(&mut self, id: i64) -> Result<&mut Relation, StoreError> {
+    pub fn relation_mut_or_err(&mut self, id: u64) -> Result<&mut Relation, StoreError> {
         self.relation_mut(id).ok_or_else(|| Self::unregistered(id))
     }
 
-    fn unregistered(id: i64) -> StoreError {
+    fn unregistered(id: u64) -> StoreError {
         StoreError::rejected(format!("relation {id} is not registered"))
     }
 
@@ -617,7 +625,7 @@ impl RelationRegistry {
     }
 
     /// Every registered view id.
-    pub fn view_ids(&self) -> Vec<i64> {
+    pub fn view_ids(&self) -> Vec<u64> {
         self.tables
             .iter()
             .filter(|(_, e)| e.kind.is_view())
@@ -626,7 +634,7 @@ impl RelationRegistry {
     }
 
     /// The column list a `pack_pk_cols` word names, admitted by [`Relation::bound_cols`].
-    pub fn index_cols(&self, id: i64, packed: u64, op: &str) -> Result<PkColList, StoreError> {
+    pub fn index_cols(&self, id: u64, packed: u64, op: &str) -> Result<PkColList, StoreError> {
         let cols = gnitz_wire::unpack_pk_cols(packed)
             .map_err(|_| StoreError::rejected(format!("{op}: invalid column list for table {id}")))?;
         self.relation_or_err(id)?.bound_cols(cols, op)

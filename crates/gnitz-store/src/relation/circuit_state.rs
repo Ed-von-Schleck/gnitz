@@ -42,7 +42,7 @@ pub struct CircuitState {
 impl CircuitState {
     /// Open every child `layout` declares, in registered view `view_id`'s
     /// directory at this registry's rank.
-    pub fn open(reg: &RelationRegistry, view_id: i64, layout: StateLayout) -> Result<Self, StoreError> {
+    pub fn open(reg: &RelationRegistry, view_id: u64, layout: StateLayout) -> Result<Self, StoreError> {
         let view = reg.relation_or_err(view_id)?;
         // The output store's policy, not the registry's current one: the traces
         // must resume from the generation the output they feed resumed from.

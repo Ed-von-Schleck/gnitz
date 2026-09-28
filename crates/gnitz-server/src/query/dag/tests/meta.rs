@@ -2,7 +2,7 @@ use super::*;
 
 /// Install `edges` (source → view) into the dep map, the same entries
 /// `DepMap::apply` writes per `ScanDelta` node.
-fn dag_with_deps(edges: &[(i64, i64)]) -> DagEngine {
+fn dag_with_deps(edges: &[(u64, u64)]) -> DagEngine {
     let mut dag = DagEngine::default();
     for &(src, view) in edges {
         dag.dep.forward.entry(src).or_default().push(view);
@@ -20,16 +20,16 @@ fn test_source_closure_walks_sources_transitively() {
     let dag = dag_with_deps(&[(1, 2), (2, 3), (10, 11), (10, 12), (11, 13), (12, 13), (20, 21)]);
 
     assert!(dag.source_closure(vec![]).is_empty());
-    assert_eq!(dag.source_closure(vec![3]), [1i64, 2].into_iter().collect());
-    assert_eq!(dag.source_closure(vec![13]), [10i64, 11, 12].into_iter().collect());
-    assert_eq!(dag.source_closure(vec![21]), [20i64].into_iter().collect());
+    assert_eq!(dag.source_closure(vec![3]), [1u64, 2].into_iter().collect());
+    assert_eq!(dag.source_closure(vec![13]), [10u64, 11, 12].into_iter().collect());
+    assert_eq!(dag.source_closure(vec![21]), [20u64].into_iter().collect());
     assert!(dag.source_closure(vec![1]).is_empty());
     assert!(dag.source_closure(vec![99]).is_empty());
     // The other direction over the same edges, so a walk that read the wrong
     // half of `DepMap` cannot pass both.
     assert_eq!(
         DepMap::closure(&dag.dep.forward, vec![1]),
-        [2i64, 3].into_iter().collect::<rustc_hash::FxHashSet<i64>>()
+        [2u64, 3].into_iter().collect::<rustc_hash::FxHashSet<u64>>()
     );
 }
 
@@ -84,10 +84,10 @@ fn a_retraction_unlinks_only_its_own_view() {
     let mut dag = DagEngine::default();
     dag.apply_circuit_delta(&five);
     dag.apply_circuit_delta(&six);
-    assert_eq!(dag.dependents_of(1), &[5i64, 6][..]);
+    assert_eq!(dag.dependents_of(1), &[5u64, 6][..]);
 
     dag.apply_circuit_delta(&drop_five);
-    assert_eq!(dag.dependents_of(1), &[6i64][..]);
+    assert_eq!(dag.dependents_of(1), &[6u64][..]);
     assert!(dag.sources_of(5).is_empty());
-    assert_eq!(dag.sources_of(6), &[1i64][..]);
+    assert_eq!(dag.sources_of(6), &[1u64][..]);
 }

@@ -27,13 +27,13 @@ pub(in crate::query) fn read_circuit_node_row<S: RowSource>(src: &S, row: usize)
 
 /// Read the `CircuitNodes` rows under `view_id`, in `node_id` order, into a
 /// `LoadedCircuit`. The first row `Circuit::push_row` refuses aborts the whole load.
-pub(in crate::query) fn load_circuit(registry: &RelationRegistry, view_id: i64) -> Result<LoadedCircuit, String> {
+pub(in crate::query) fn load_circuit(registry: &RelationRegistry, view_id: u64) -> Result<LoadedCircuit, String> {
     let mut circuit = gnitz_wire::Circuit::default();
     let mut pushed = Ok(0);
     registry
-        .relation(gnitz_wire::CIRCUIT_NODES_TAB as i64)
+        .relation(gnitz_wire::CIRCUIT_NODES_TAB)
         .expect("the catalog registers every system family at open")
-        .for_each_positive_with_prefix(&(view_id as u64).to_be_bytes(), |c| {
+        .for_each_positive_with_prefix(&view_id.to_be_bytes(), |c| {
             if pushed.is_ok() {
                 let (src, row) = c.current_row_source();
                 pushed = circuit.push_row(&read_circuit_node_row(src, row));

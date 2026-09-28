@@ -16,7 +16,7 @@ const INDEX_SCAN_RATIO: usize = 16;
 /// rows recomputed through `hydrator`.
 pub(super) struct LiveSource<'a, 'h> {
     registry: &'a RelationRegistry,
-    id: i64,
+    id: u64,
     source: SourceCursor,
     hydrator: Option<&'h mut dyn SkeletonHydrator>,
 }
@@ -24,7 +24,7 @@ pub(super) struct LiveSource<'a, 'h> {
 impl<'a, 'h> LiveSource<'a, 'h> {
     pub(super) fn new(
         registry: &'a RelationRegistry,
-        id: i64,
+        id: u64,
         source: SourceCursor,
         hydrator: Option<&'h mut dyn SkeletonHydrator>,
     ) -> Self {
@@ -65,7 +65,7 @@ impl<'a, 'h> LiveSource<'a, 'h> {
 impl RelationRegistry {
     /// The FK parent probe: every live row of `keys` (flat OPK images, strictly ascending) at
     /// weight 1, projected to the payload column `ref_col`.
-    pub fn gather_bytes(&self, id: i64, keys: Vec<u8>, ref_col: u8) -> Result<Batch, StoreError> {
+    pub fn gather_bytes(&self, id: u64, keys: Vec<u8>, ref_col: u8) -> Result<Batch, StoreError> {
         let entry = self.relation_or_err(id)?;
         let schema = entry.schema();
         let out_schema = project_schema(&schema, &[ref_col as u32]).expect("a one-column projection fits MAX_COLUMNS");
@@ -89,7 +89,7 @@ impl RelationRegistry {
 
     /// Open `bound`'s source over `id`, without walking it, and the part of `bound`
     /// the source does not apply.
-    pub fn open_bound(&self, id: i64, bound: ReadBound) -> Result<(SourceCursor, ReadBound), StoreError> {
+    pub fn open_bound(&self, id: u64, bound: ReadBound) -> Result<(SourceCursor, ReadBound), StoreError> {
         let entry = self.relation_or_err(id)?;
         // A stream holds no rows, but a backfill over one still feeds an empty
         // epoch: that is what mints a global aggregate's ground row.

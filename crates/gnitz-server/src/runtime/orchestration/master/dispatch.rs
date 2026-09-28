@@ -215,7 +215,7 @@ impl MasterDispatcher {
 
     /// Re-stamp derived state at the durable generation. `pending`: the tables
     /// with un-ticked deltas.
-    pub(crate) async fn restamp_derived(&self, pending: &[i64]) -> Result<(), WireFault> {
+    pub(crate) async fn restamp_derived(&self, pending: &[u64]) -> Result<(), WireFault> {
         if self.unflushed_pushes.get() {
             self.flush(FlushRound::Base).await?;
         }
@@ -355,12 +355,12 @@ impl MasterDispatcher {
     /// rebuild next to resumed siblings) that a closure re-drive would
     /// double-count.
     ///
-    async fn fan_out_backfill(&self, view_id: i64, source_id: i64) -> Result<(), WireFault> {
+    async fn fan_out_backfill(&self, view_id: u64, source_id: u64) -> Result<(), WireFault> {
         // Dataless, and schema-less: the worker reads the source's schema off its
         // own catalog.
         let template = wire::WireMsg {
-            target_id: source_id as u64,
-            arg0: view_id as u64,
+            target_id: source_id,
+            arg0: view_id,
             ..Default::default()
         };
         self.broadcast_round("backfill relay", true, |excl, t| {
@@ -387,7 +387,7 @@ impl MasterDispatcher {
     /// barrier and `fan_out_backfill` accommodates that — no relay arrives, so
     /// each worker stops on its own drain exhaustion — which is why one driver
     /// serves every shape.
-    pub(crate) async fn backfill_views_in_dep_order(&self, view_ids: &[i64]) -> Result<(), WireFault> {
+    pub(crate) async fn backfill_views_in_dep_order(&self, view_ids: &[u64]) -> Result<(), WireFault> {
         let mut ordered = view_ids.to_vec();
         ordered.sort_unstable();
         ordered.dedup();
@@ -406,7 +406,7 @@ impl MasterDispatcher {
 
     /// Tick `source_id` in a [`Self::broadcast_round`], relaying its exchange
     /// rounds inline without reclaiming.
-    pub(crate) async fn drain_tick(&self, source_id: i64) -> Result<(), WireFault> {
+    pub(crate) async fn drain_tick(&self, source_id: u64) -> Result<(), WireFault> {
         self.broadcast_round("view tick drain", false, |excl, t| {
             self.write_tick_group(excl, source_id, t)
         })
@@ -416,7 +416,7 @@ impl MasterDispatcher {
     /// Broadcast a DDL batch to every worker inside `scope`'s zone — one LSN
     /// across a DDL's broadcasts, so recovery groups them atomically. Publishes
     /// nothing; that is the scope's commit.
-    pub(crate) fn broadcast_ddl(&self, scope: &SalScope, target_id: i64, batch: &Batch) -> Result<(), WireFault> {
+    pub(crate) fn broadcast_ddl(&self, scope: &SalScope, target_id: u64, batch: &Batch) -> Result<(), WireFault> {
         let relation = wire::WireSchema::from_catalog(self.cat(), target_id);
         scope.write(
             &DirectGroup {
@@ -439,7 +439,7 @@ impl MasterDispatcher {
     pub(crate) fn write_tick_group(
         &self,
         excl: &SalExcl<'_>,
-        tid: i64,
+        tid: u64,
         targets: GroupTargets,
     ) -> Result<(), WireFault> {
         let round = self.tick_round.get() + 1;
@@ -447,7 +447,7 @@ impl MasterDispatcher {
         self.record_delta_round(tid, round);
         excl.write(&DirectGroup {
             template: wire::WireMsg {
-                target_id: tid as u64,
+                target_id: tid,
                 arg0: round,
                 ..Default::default()
             },
@@ -463,7 +463,7 @@ impl MasterDispatcher {
     /// At **emit** time, not at ACK time: a round emitted but not yet ACKed has
     /// already reached the view's workers, and an ACK-time update would let the
     /// gate answer "nothing changed" over a round whose rows are already in flight.
-    fn record_delta_round(&self, tid: i64, round: u64) {
+    fn record_delta_round(&self, tid: u64, round: u64) {
         let cat = self.cat();
         if !cat.registry.any_delta_feed() {
             return;
@@ -486,13 +486,13 @@ impl MasterDispatcher {
 
     /// The cursor tag a delta reply carries: distinct for every (boot, view), so a
     /// cursor from another boot or from a dropped view is recognizably foreign.
-    pub(crate) fn delta_cursor_tag(&self, view_id: i64) -> u64 {
+    pub(crate) fn delta_cursor_tag(&self, view_id: u64) -> u64 {
         // splitmix64's finalizer: the view id is a small dense integer, and an
         // unmixed XOR would make neighbouring ids' tags differ in one bit. It is
         // a **bijection** on u64 — `x ^ (x >> k)` is invertible and both
         // multipliers are odd — so distinct view ids cannot collide within a
         // boot, which a general hash (XXH3 over 8 bytes) would not guarantee.
-        let mut z = (view_id as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = view_id.wrapping_add(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         self.boot_nonce ^ (z ^ (z >> 31))
@@ -501,14 +501,14 @@ impl MasterDispatcher {
     /// The last round that reached `view_id`, or `1` for a view no round has
     /// reached — the boot round, which is never emitted and stamps nothing, so a
     /// bootstrap at `after_tick = 0` always falls through to the store.
-    pub(crate) fn last_delta_round(&self, view_id: i64) -> u64 {
+    pub(crate) fn last_delta_round(&self, view_id: u64) -> u64 {
         self.last_delta_round.borrow().get(&view_id).copied().unwrap_or(1)
     }
 
     /// Drop a dropped relation's gate entry. Ids are never reused, so nothing else
     /// would ever reclaim it, and a per-DDL leak on the master is not a leak that
     /// stops.
-    pub(crate) fn forget_delta_round(&self, id: i64) {
+    pub(crate) fn forget_delta_round(&self, id: u64) {
         self.last_delta_round.borrow_mut().remove(&id);
     }
 
@@ -583,7 +583,7 @@ impl MasterDispatcher {
     pub(crate) fn write_commit_group(
         &self,
         scope: &SalScope,
-        target_id: i64,
+        target_id: u64,
         batch: &Batch,
         request_id: u32,
         recoverable: bool,
@@ -646,7 +646,7 @@ impl MasterDispatcher {
     /// The descriptor `target_id` is registered with. Panics on an unregistered
     /// id: every caller reaches it holding the catalog lock the registry's own
     /// writers take, so a miss is broken lock discipline, not a bad client id.
-    pub(crate) fn schema_desc_for(&self, target_id: i64) -> SchemaDescriptor {
+    pub(crate) fn schema_desc_for(&self, target_id: u64) -> SchemaDescriptor {
         self.cat()
             .registry
             .relation(target_id)

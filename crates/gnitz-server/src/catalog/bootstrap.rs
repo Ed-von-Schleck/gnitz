@@ -6,12 +6,12 @@ pub(crate) struct UnreplayedCatalog(CatalogEngine);
 
 impl UnreplayedCatalog {
     /// Each system family's replay floor.
-    pub(crate) fn system_replay_floors(&self) -> std::collections::HashMap<i64, u64> {
+    pub(crate) fn system_replay_floors(&self) -> std::collections::HashMap<u64, u64> {
         self.0.registry.system_replay_floors()
     }
 
     /// Ingest one recovered DdlSync group into `table_id`'s store, firing no hook.
-    pub(crate) fn stage(&mut self, table_id: i64, lsn: u64, batch: Batch) -> Result<(), String> {
+    pub(crate) fn stage(&mut self, table_id: u64, lsn: u64, batch: Batch) -> Result<(), String> {
         let family = SysFamily::from_id(table_id).ok_or_else(|| format!("{table_id} is not a system table"))?;
         let engine = &mut self.0;
         engine.raise_next_id(family, &batch, 0..batch.len());

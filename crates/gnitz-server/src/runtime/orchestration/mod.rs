@@ -23,7 +23,7 @@ use gnitz_wire::WireConflictMode;
 /// only owner, already names the master module, so hosting it there would close
 /// that edge into a cycle.
 pub(crate) struct TxnFamily {
-    pub tid: i64,
+    pub tid: u64,
     pub mode: WireConflictMode,
     pub batch: Batch,
 }

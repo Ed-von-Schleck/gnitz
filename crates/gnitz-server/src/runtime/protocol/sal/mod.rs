@@ -46,12 +46,11 @@ const PREFIX_BYTES: usize = std::mem::size_of::<AtomicU64>();
 //   [8]     KIND
 //   [9]     FLAGS
 //   [10,12) 0
-//   [12,16) TARGET_ID
+//   [12,16) REQUEST_ID
 //   [16,20) SLOT_COUNT
 //   [20,24) EPOCH
 //   [24,32) DIGEST
-//   [32,36) REQUEST_ID
-//   [36,40) 0
+//   [32,40) TARGET_ID
 //   [40,..) DIRECTORY, 8-byte-padded
 
 /// The zone LSN of a zone member, `0` outside every zone.
@@ -65,13 +64,13 @@ const FLAG_ZONE_END: u8 = 1;
 /// Each reply must reach the ring in request order.
 const FLAG_IN_REQUEST_ORDER: u8 = 2;
 const KNOWN_FLAGS: u8 = FLAG_ZONE_END | FLAG_IN_REQUEST_ORDER;
-const OFF_TARGET_ID: usize = 12;
+/// `0` = unaddressed.
+const OFF_REQUEST_ID: usize = 12;
 const OFF_SLOT_COUNT: usize = 16;
 const OFF_EPOCH: usize = 20;
 /// The digest's own eight bytes, excluded from the span it covers.
 const OFF_DIGEST: usize = 24;
-/// `0` = unaddressed.
-const OFF_REQUEST_ID: usize = 32;
+const OFF_TARGET_ID: usize = 32;
 const OFF_DIRECTORY: usize = 40;
 
 /// One directory entry: `[u32 size][u64 slot checksum]`. The checksum is 0 outside
@@ -565,7 +564,7 @@ pub(crate) struct SalMessage {
     pub(crate) kind: SalMessageKind,
     /// Whether this group is its zone's last member, the one that closes it.
     zone_end: bool,
-    pub(crate) target_id: u32,
+    pub(crate) target_id: u64,
     /// The group's byte offset in the ring — what a recovery error names.
     pub(crate) base: u64,
     /// The offset past the group.
@@ -654,7 +653,7 @@ struct GroupHeader {
     kind: SalMessageKind,
     /// `FLAG_*` bits, none outside [`KNOWN_FLAGS`].
     flags: u8,
-    target_id: u32,
+    target_id: u64,
     epoch: u32,
     request_id: u32,
     /// One `DIR_ENTRY_BYTES` entry per slot.
@@ -763,7 +762,7 @@ impl SalLog {
             lsn,
             kind,
             flags,
-            target_id: read_u32_le(prefix, OFF_TARGET_ID),
+            target_id: read_u64_le(prefix, OFF_TARGET_ID),
             epoch: read_u32_le(prefix, OFF_EPOCH),
             request_id: read_u32_le(prefix, OFF_REQUEST_ID),
             dir: &hdr[OFF_DIRECTORY..OFF_DIRECTORY + slots * DIR_ENTRY_BYTES],
@@ -950,7 +949,7 @@ impl SalWriter {
     #[allow(clippy::too_many_arguments)]
     fn write_slots(
         &self,
-        target_id: u32,
+        target_id: u64,
         lsn: u64,
         kind: SalMessageKind,
         flags: u8,
@@ -997,11 +996,10 @@ impl SalWriter {
         let hdr = unsafe { std::slice::from_raw_parts_mut(self.log.ring.add(hdr_off), hdr_size) };
         write_u64_le(hdr, OFF_LSN, lsn);
         hdr[OFF_KIND..OFF_KIND + 4].copy_from_slice(&[kind.as_wire(), flags, 0, 0]);
-        write_u32_le(hdr, OFF_TARGET_ID, target_id);
+        write_u32_le(hdr, OFF_REQUEST_ID, request_id);
         write_u32_le(hdr, OFF_SLOT_COUNT, sizes.len() as u32);
         write_u32_le(hdr, OFF_EPOCH, epoch);
-        write_u32_le(hdr, OFF_REQUEST_ID, request_id);
-        write_u32_le(hdr, OFF_REQUEST_ID + 4, 0);
+        write_u64_le(hdr, OFF_TARGET_ID, target_id);
         // Every entry is written, empty ones included, and the 8-byte pad
         // behind them zeroed: `wal.sal` is never truncated, so an unwritten byte
         // inside the digested span would read as whatever group last occupied
@@ -1117,7 +1115,7 @@ impl SalWriter {
         let (request_id, flags) = g.targets.request();
         let laid_out = self
             .write_slots(
-                g.template.target_id as u32,
+                g.template.target_id,
                 lsn,
                 g.kind,
                 flags,

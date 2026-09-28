@@ -204,10 +204,10 @@ fn check_pair_fields(family: SysFamily, batch: &Batch, sig: &PkSignature) -> Res
 /// A circuit `+1` may only name a view this same transaction creates — one under
 /// a foreign `view_id` would pin its source table's drop or rewrite a running
 /// circuit.
-fn check_circuit_rows(batch: &Batch, new_view_ids: &[i64]) -> Result<(), String> {
+fn check_circuit_rows(batch: &Batch, new_view_ids: &[u64]) -> Result<(), String> {
     // Sorted once: this runs per row of a client-supplied block bounded only by
     // the 64 MB frame.
-    let mut created: Vec<i64> = new_view_ids.to_vec();
+    let mut created: Vec<u64> = new_view_ids.to_vec();
     created.sort_unstable();
     for i in batch.live_rows() {
         let view_id = SysFamily::CircuitNodes.leading_id(batch.get_pk(i));
@@ -227,10 +227,10 @@ impl CatalogEngine {
     /// same TABLE_TAB delta drops.
     pub(super) fn validate_fk_columns(
         &self,
-        tid: i64,
+        tid: u64,
         col_defs: &[ColumnDef],
         pk: &[u32],
-        net_dead: &[i64],
+        net_dead: &[u64],
     ) -> Result<(), String> {
         let self_pk_type = col_defs[pk[0] as usize].ty.tc;
         for cd in col_defs.iter().filter(|cd| cd.fk_table_id != 0) {
@@ -242,10 +242,10 @@ impl CatalogEngine {
     fn validate_fk_column(
         &self,
         col: &ColumnDef,
-        self_table_id: i64,
+        self_table_id: u64,
         self_pk: &[u32],
         self_pk_type: TypeCode,
-        net_dead: &[i64],
+        net_dead: &[u64],
     ) -> Result<(), String> {
         // `col.fk_col_idx` here is the PARENT's referenced column index (the
         // planner sets the child column's fk_col_idx to it). The target is a
@@ -316,10 +316,10 @@ impl CatalogEngine {
     /// the name to the outgoing id.
     fn precheck_qname_unique(
         &self,
-        sid: i64,
+        sid: u64,
         name: &str,
-        self_id: i64,
-        net_dead: &[i64],
+        self_id: u64,
+        net_dead: &[u64],
         claimed: &mut FxHashSet<String>,
     ) -> Result<(), String> {
         let schema_name = self
@@ -379,10 +379,10 @@ impl CatalogEngine {
     /// drops, which the drop guards key on so a rename pair's net-live `-1` is
     /// never read as one — a list only the single-column-key arms read, so it
     /// carries the whole key rather than [`PkSignature::leading`].
-    fn check_family_contract(&self, family: SysFamily, batch: &Batch) -> Result<(Vec<PkSignature>, Vec<i64>), String> {
+    fn check_family_contract(&self, family: SysFamily, batch: &Batch) -> Result<(Vec<PkSignature>, Vec<u64>), String> {
         check_row_weights(family, batch)?;
         let sigs = pk_signatures(family, batch);
-        let mut net_dead: Vec<i64> = Vec::new();
+        let mut net_dead: Vec<u64> = Vec::new();
         for sig in &sigs {
             check_pk_multiplicity(family, sig)?;
             if family.retracts_with_owner() && sig.pos.is_none() && sig.neg.is_some() {
@@ -394,7 +394,7 @@ impl CatalogEngine {
             }
             check_id_range(family, sig)?;
             if self.check_cas_and_net(family, batch, sig)? <= 0 {
-                net_dead.push(sig.pk as i64);
+                net_dead.push(sig.pk as u64);
             }
             check_pair_fields(family, batch, sig)?;
         }
@@ -495,7 +495,7 @@ impl CatalogEngine {
     /// compiled circuit's `ScanDelta` register schema is baked from the base
     /// descriptor and its operator traces hold re-keyed base rows at the old
     /// shape.
-    pub(in crate::catalog) fn reject_if_dependent_views(&self, owner_id: i64, op: &str) -> Result<(), String> {
+    pub(in crate::catalog) fn reject_if_dependent_views(&self, owner_id: u64, op: &str) -> Result<(), String> {
         // Name the table and one blocking view: the recovery is to drop that
         // view, which a bare id leaves the author to go and look up.
         let blockers = self.dag.dependents_of(owner_id);
@@ -513,7 +513,7 @@ impl CatalogEngine {
     /// `owner_id`'s column records as this batch's `+1` row for `col_idx` leaves
     /// them: the decoded row replaces the live record at that index, or extends
     /// the set when the transition appends one.
-    fn col_defs_with(&self, owner_id: i64, col_idx: u64, row: ColumnDef) -> Result<Vec<ColumnDef>, String> {
+    fn col_defs_with(&self, owner_id: u64, col_idx: u64, row: ColumnDef) -> Result<Vec<ColumnDef>, String> {
         let mut defs = self.read_column_defs(owner_id)?;
         match defs.get_mut(col_idx as usize) {
             Some(live) => *live = row,
@@ -527,7 +527,7 @@ impl CatalogEngine {
     fn precheck_column_append(
         &mut self,
         appended: ColumnDef,
-        owner_id: i64,
+        owner_id: u64,
         col_idx: u64,
         owner_schema: &SchemaDescriptor,
     ) -> Result<(), String> {
@@ -569,10 +569,10 @@ impl CatalogEngine {
     /// renames a view that already exists, so it falls through to the registry.
     fn validate_view_owner(
         &self,
-        vid: i64,
+        vid: u64,
         name: &str,
-        owner_view_id: i64,
-        sorted_creates: &[i64],
+        owner_view_id: u64,
+        sorted_creates: &[u64],
     ) -> Result<(), String> {
         if owner_view_id == 0 {
             return Ok(());
@@ -596,10 +596,10 @@ impl CatalogEngine {
     /// second run meaningful.
     pub(in crate::catalog) fn validate_view_options(
         &self,
-        vid: i64,
+        vid: u64,
         name: &str,
         props: gnitz_wire::ViewProps,
-        owner_view_id: i64,
+        owner_view_id: u64,
     ) -> Result<(), String> {
         // An internal chain segment is a relation the planner mints, never
         // something an option clause may name.
@@ -638,7 +638,7 @@ impl CatalogEngine {
     /// Exhaustive over `SysFamily` (like `fire_hooks`): a newly-added family must
     /// decide here whether it carries guards beyond the contract, rather than
     /// falling into a silent `_` arm.
-    pub(in crate::catalog) fn precheck_family(&mut self, family: SysFamily, batch: &Batch) -> Result<Vec<i64>, String> {
+    pub(in crate::catalog) fn precheck_family(&mut self, family: SysFamily, batch: &Batch) -> Result<Vec<u64>, String> {
         let (sigs, net_dead) = self.check_family_contract(family, batch)?;
         match family {
             SysFamily::Schema => self.precheck_schema_family(batch, &net_dead),
@@ -657,7 +657,7 @@ impl CatalogEngine {
     pub(crate) fn precheck_bundle(
         &self,
         families: &[Option<Batch>; SysFamily::COUNT],
-        new_view_ids: &[i64],
+        new_view_ids: &[u64],
     ) -> Result<(), String> {
         if let Some(cols) = families[SysFamily::Column.index()].as_ref() {
             self.check_column_owners(cols, families)?;
@@ -671,13 +671,13 @@ impl CatalogEngine {
     /// Every column record must name an owner this bundle creates or the registry
     /// holds: a phantom owner is never dropped, so nothing would ever retract the row.
     fn check_column_owners(&self, cols: &Batch, families: &[Option<Batch>; SysFamily::COUNT]) -> Result<(), String> {
-        let mut created: FxHashSet<i64> = FxHashSet::default();
+        let mut created: FxHashSet<u64> = FxHashSet::default();
         for family in [SysFamily::Table, SysFamily::View] {
             if let Some(b) = families[family.index()].as_ref() {
-                created.extend(b.live_rows().map(|i| b.get_pk(i) as i64));
+                created.extend(b.live_rows().map(|i| b.get_pk(i) as u64));
             }
         }
-        let mut altered: Option<i64> = None;
+        let mut altered: Option<u64> = None;
         for i in cols.live_rows() {
             let owner_id = SysFamily::Column.leading_id(cols.get_pk(i));
             // An ALTER must be its bundle's only change, on one owner: nothing can undo
@@ -699,9 +699,9 @@ impl CatalogEngine {
 
     /// SCHEMA_TAB: a CREATE must not collide with a live schema name — nor with one
     /// this batch already claims — and a DROP must find the schema empty. Schema ids
-    /// share an i64 space with relation ids, so the member count, not the
+    /// share one id space with relation ids, so the member count, not the
     /// relation-keyed dep map, is the whole drop guard.
-    fn precheck_schema_family(&mut self, batch: &Batch, net_dead: &[i64]) -> Result<(), String> {
+    fn precheck_schema_family(&mut self, batch: &Batch, net_dead: &[u64]) -> Result<(), String> {
         // Two `+1` rows under one name both pass the cache check below and both
         // apply: `schema_by_name` keeps the second, leaving the first id live and
         // unreachable.
@@ -743,12 +743,12 @@ impl CatalogEngine {
         family: SysFamily,
         batch: &Batch,
         sigs: &[PkSignature],
-        net_dead: &[i64],
+        net_dead: &[u64],
     ) -> Result<(), String> {
         let is_table = family == SysFamily::Table;
         let mut claimed: FxHashSet<String> = FxHashSet::default();
         // Sorted for `validate_view_owner`'s probe, which runs per `+1` row.
-        let mut view_creates: Vec<i64> = if is_table {
+        let mut view_creates: Vec<u64> = if is_table {
             Vec::new()
         } else {
             sigs.iter()
@@ -765,7 +765,7 @@ impl CatalogEngine {
         }
 
         for i in batch.live_rows() {
-            let id = batch.get_pk(i) as i64;
+            let id = batch.get_pk(i) as u64;
             let col_defs = self.read_column_defs(id)?;
             let (sid, name, pk, kind, serial) = if is_table {
                 let r = read_table_tab_row(batch, i).map_err(|e| format!("{e} (tid={id})"))?;
@@ -844,7 +844,7 @@ impl CatalogEngine {
 
     /// The owner and column rules of a CREATE INDEX on `owner_id`, and the
     /// index schema they admit.
-    pub(crate) fn validate_index_create(&self, owner_id: i64, cols: &[u32]) -> Result<SchemaDescriptor, String> {
+    pub(crate) fn validate_index_create(&self, owner_id: u64, cols: &[u32]) -> Result<SchemaDescriptor, String> {
         let entry = self.registry.index_owner(owner_id)?;
         let idx_schema = make_index_schema(cols, &entry.schema()).map_err(|e| {
             format!(
@@ -867,7 +867,7 @@ impl CatalogEngine {
     /// depends on. The drop guards read the batch row rather than probing: the
     /// contract's CAS proved every `-1` content-equals the live one, `name` and
     /// `source_cols` included.
-    fn precheck_index_family(&mut self, batch: &Batch, net_dead: &[i64]) -> Result<(), String> {
+    fn precheck_index_family(&mut self, batch: &Batch, net_dead: &[u64]) -> Result<(), String> {
         // The names this batch has already claimed, as `precheck_qname_unique`
         // threads one for relations. Without it two rows under one name both pass
         // the persisted-cache check and the second overwrites the first in
@@ -923,7 +923,7 @@ impl CatalogEngine {
                 .is_some_and(|ix| {
                     ix.claims()
                         .iter()
-                        .any(|&(id, u)| u && net_dead.binary_search(&id).is_err())
+                        .any(|c| matches!(*c, IndexClaim::Index { id, unique: true } if net_dead.binary_search(&id).is_err()))
                 });
             if !unique_remains {
                 return Err(format!(

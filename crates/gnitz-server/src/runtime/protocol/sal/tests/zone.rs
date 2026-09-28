@@ -8,7 +8,7 @@ use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 
 const SIZE: usize = 1 << 20;
 const NW: usize = 4;
-const TID: u32 = 16;
+const TID: u64 = 16;
 
 /// The zone LSNs a quiescent log commits, in log order.
 fn committed(log: SalLog) -> Result<Vec<u64>, String> {
@@ -19,7 +19,7 @@ fn committed(log: SalLog) -> Result<Vec<u64>, String> {
 
 /// The `(lsn, target_id)` of each group read from 0, and the corrupt offset
 /// the walk stops on, if any.
-fn walk(log: SalLog) -> (Vec<(u64, u32)>, Option<u64>) {
+fn walk(log: SalLog) -> (Vec<(u64, u64)>, Option<u64>) {
     let epoch = log.anchor().expect("the anchor verifies").0;
     let msgs: Vec<SalMessage> = log.walk(epoch).collect();
     let stop = msgs.last().map_or(0, |m| m.end);
@@ -386,7 +386,7 @@ fn slot_damage_in_an_unzoned_group_does_not_stop_the_walk() {
     assert!(scope.commit(), "the zone was open");
     log.damage_slot(stream, log.a_slot_with_rows(stream));
 
-    let members: Vec<(u64, u32)> = CommittedTail::read(log.log())
+    let members: Vec<(u64, u64)> = CommittedTail::read(log.log())
         .unwrap()
         .groups()
         .map(|m| (m.lsn, m.target_id))
@@ -402,7 +402,7 @@ fn slot_damage_in_an_unzoned_group_does_not_stop_the_walk() {
 impl TestLog {
     /// One group with a 64-byte slot and the given header, outside any scope.
     /// Returns its base.
-    fn group(&self, target: u32, lsn: u64, kind: SalMessageKind, flags: u8) -> u64 {
+    fn group(&self, target: u64, lsn: u64, kind: SalMessageKind, flags: u8) -> u64 {
         self.try_write(target, lsn, kind, flags, &[&[0u8; 64]])
             .expect("group fits")
     }
@@ -441,7 +441,7 @@ impl TestLog {
 
     /// A committed zone of one PK-partitioned `Push` group per target over `NW`
     /// workers. Returns every member's base.
-    fn push_zone(&self, lsn: u64, targets: &[u32]) -> Vec<u64> {
+    fn push_zone(&self, lsn: u64, targets: &[u64]) -> Vec<u64> {
         let schema = make_schema_u64_i64();
         let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
         let scope = self.writer.begin(lsn, "test");

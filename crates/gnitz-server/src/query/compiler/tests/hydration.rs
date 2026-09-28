@@ -8,7 +8,7 @@ fn loaded(circuit: Circuit) -> LoadedCircuit {
 
 /// Sides reindexed from `sources`, each integrated, with `terms` building the
 /// sink's input out of `[da, db]` and `[ta, tb]`.
-fn join_with(sources: [i64; 2], terms: impl FnOnce(&mut Circuit, [NodeId; 2], [NodeId; 2]) -> NodeId) -> LoadedCircuit {
+fn join_with(sources: [u64; 2], terms: impl FnOnce(&mut Circuit, [NodeId; 2], [NodeId; 2]) -> NodeId) -> LoadedCircuit {
     let mut c = Circuit::default();
     let deltas = sources.map(|s| reindexed_on_col1(&mut c, s));
     let traces = deltas.map(|d| c.integrate_trace(d));

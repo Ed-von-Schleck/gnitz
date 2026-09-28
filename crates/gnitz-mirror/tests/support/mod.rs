@@ -1,26 +1,12 @@
 //! Fixtures shared by the mirror's integration tests.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard};
 
 use gnitz_core::{GnitzClient, Schema, ZSetBatch};
 use gnitz_sql::SqlResult;
 
-pub mod copy_paths;
-
-/// Every test in this binary takes this lock.
-///
-/// `cargo test` runs a target's tests as threads of one process, so the state a
-/// mirror open touches process-wide is shared between them: the one-shot fault
-/// seams, the `io_uring` verdict latched once per process, and the environment
-/// variables an open re-reads. A parallel test would be racing all three.
-static SERIAL: Mutex<()> = Mutex::new(());
-
-pub fn serial() -> MutexGuard<'static, ()> {
-    // A test that panics while holding it must not fail every later test with a
-    // poisoned lock; the state it protects is re-established by the next open.
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-}
+pub mod common;
+pub use common::serial;
 
 /// Run `sql` for effect, panicking with the statement on failure.
 pub fn sql(client: &mut GnitzClient, schema: &str, statements: &str) {

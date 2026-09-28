@@ -33,8 +33,6 @@
 //! fresh file description, which `flock` treats as a conflict.
 
 mod handle;
-mod reads;
 mod record;
-mod register;
 
 pub use handle::Mirror;

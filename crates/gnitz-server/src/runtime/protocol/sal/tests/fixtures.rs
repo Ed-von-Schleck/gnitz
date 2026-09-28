@@ -89,7 +89,7 @@ impl TestLog {
     }
 
     /// Append one group whose slots are `payloads` verbatim; returns its base.
-    pub(crate) fn write(&self, target: u32, lsn: u64, kind: SalMessageKind, payloads: &[&[u8]]) -> u64 {
+    pub(crate) fn write(&self, target: u64, lsn: u64, kind: SalMessageKind, payloads: &[&[u8]]) -> u64 {
         self.try_write(target, lsn, kind, 0, payloads).expect("group fits")
     }
 
@@ -97,7 +97,7 @@ impl TestLog {
     /// reported.
     pub(crate) fn try_write(
         &self,
-        target: u32,
+        target: u64,
         lsn: u64,
         kind: SalMessageKind,
         flags: u8,
@@ -112,7 +112,7 @@ impl TestLog {
     /// base, as [`SalWriter::write_slots`] does.
     fn lay_out(
         &self,
-        target: u32,
+        target: u64,
         lsn: u64,
         kind: SalMessageKind,
         flags: u8,
@@ -129,14 +129,14 @@ impl TestLog {
     /// where it goes — the writer's publishes, a scope's defers. Returns its base.
     pub(crate) fn push_group(
         &self,
-        tid: u32,
+        tid: u64,
         schema: SchemaDescriptor,
         batch: &Batch,
         write: impl FnOnce(&DirectGroup) -> Result<(), WireFault>,
     ) -> u64 {
         let base = self.cursor();
         let nw = self.writer.num_workers();
-        let relation = ipc::WireSchema::encoded(tid as i64, schema);
+        let relation = ipc::WireSchema::encoded(tid, schema);
         with_routed(batch, &relation, nw, |_, data| {
             write(&DirectGroup {
                 template: relation.frame(WireMsg::default()),
@@ -152,7 +152,7 @@ impl TestLog {
 
 impl TestLog {
     /// One committed, synced zone at `lsn` of whole-batch DdlSync groups.
-    pub(crate) fn ddl_zone(&self, lsn: u64, groups: &[(i64, SchemaDescriptor, &Batch)]) {
+    pub(crate) fn ddl_zone(&self, lsn: u64, groups: &[(u64, SchemaDescriptor, &Batch)]) {
         let scope = self.writer.begin(lsn, "test");
         for &(tid, schema, batch) in groups {
             let relation = ipc::WireSchema::encoded(tid, schema);
@@ -182,7 +182,7 @@ pub(crate) fn group_at(log: SalLog, base: u64) -> SalMessage {
 }
 
 /// A payload-less group outside every zone.
-pub(crate) fn bare_message(kind: SalMessageKind, target_id: u32) -> SalMessage {
+pub(crate) fn bare_message(kind: SalMessageKind, target_id: u64) -> SalMessage {
     SalMessage {
         lsn: 0,
         kind,

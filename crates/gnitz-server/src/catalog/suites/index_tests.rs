@@ -774,7 +774,7 @@ fn test_create_unique_index_on_string_blob_rejected() {
 // demotes the circuit rather than destroying it.
 
 /// Uniqueness of the index circuit on `col`, or `None` if no circuit exists.
-fn circuit_unique(engine: &CatalogEngine, tid: i64, col: u32) -> Option<bool> {
+fn circuit_unique(engine: &CatalogEngine, tid: u64, col: u32) -> Option<bool> {
     engine
         .registry
         .relation(tid)
@@ -806,7 +806,7 @@ fn test_fk_circuit_is_derived_and_survives_its_unique_index() {
         .relation(child_tid)
         .and_then(|e| e.index_on(&[1]))
         .map(|ix| ix.claims().to_vec());
-    assert_eq!(claims, Some(vec![(1, false)]));
+    assert_eq!(claims, Some(vec![IndexClaim::ForeignKey]));
     assert_eq!(
         count_records(engine.sys_relation(SysFamily::Index).cursor()),
         idx_rows_before
@@ -1682,7 +1682,7 @@ const OPEN_BELOW: Cut = Cut::before(0);
 const OPEN_ABOVE: Cut = Cut::after(image_mask(8));
 
 /// Collect the positive-weight source PKs returned by a range scan, sorted.
-fn range_pks(engine: &mut CatalogEngine, tid: i64, cols: &[u32], eq: &[u128], start: Cut, end: Cut) -> Vec<u128> {
+fn range_pks(engine: &mut CatalogEngine, tid: u64, cols: &[u32], eq: &[u128], start: Cut, end: Cut) -> Vec<u128> {
     let r = seek_by_index_range(engine, tid, cols, eq, start, end).unwrap().0;
     let mut pks: Vec<u128> = match r {
         Some(b) => (0..b.len())
@@ -2326,7 +2326,10 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
             schema,
         })
         .unwrap();
-    engine.registry.add_index(tid, tid + 1, &[3], false).unwrap();
+    engine
+        .registry
+        .add_index(tid, IndexClaim::Index { id: tid + 1, unique: false }, &[3])
+        .unwrap();
     // The registry projects the index itself, from the same `key_spec` and index
     // schema a hand-written projection would use.
     engine.registry.ingest(tid, bb).unwrap();

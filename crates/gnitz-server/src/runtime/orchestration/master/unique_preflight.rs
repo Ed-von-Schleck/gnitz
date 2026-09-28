@@ -145,7 +145,7 @@ impl MasterDispatcher {
     /// index covers the owner's PK and so can never collide.
     pub async fn validate_unique_index_create(
         &self,
-        owner_id: i64,
+        owner_id: u64,
         col_indices: &[u32],
     ) -> Result<Option<UniqueFilter>, WireFault> {
         let (idx_schema, packed) = {
@@ -179,7 +179,7 @@ impl MasterDispatcher {
         let lease = self
             .scan(DirectGroup {
                 template: wire::WireMsg {
-                    target_id: owner_id as u64,
+                    target_id: owner_id,
                     arg1: packed,
                     ..Default::default()
                 },

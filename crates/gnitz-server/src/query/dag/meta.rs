@@ -8,9 +8,9 @@ use std::collections::hash_map::Entry;
 #[derive(Default)]
 pub(super) struct DepMap {
     /// source_table_id → [view_ids]
-    pub(super) forward: FxHashMap<i64, Vec<i64>>,
+    pub(super) forward: FxHashMap<u64, Vec<u64>>,
     /// view_id → [source_table_ids]
-    pub(super) reverse: FxHashMap<i64, Vec<i64>>,
+    pub(super) reverse: FxHashMap<u64, Vec<u64>>,
 }
 
 impl DepMap {
@@ -21,7 +21,7 @@ impl DepMap {
     /// when that batch's ingest failed before its hook ran.
     pub(super) fn apply(&mut self, batch: &Batch) {
         for i in batch.retracted_rows() {
-            let view = compiler::read_circuit_node_row(batch, i).view_id as i64;
+            let view = compiler::read_circuit_node_row(batch, i).view_id;
             for source in self.reverse.remove(&view).into_iter().flatten() {
                 if let Entry::Occupied(mut views) = self.forward.entry(source) {
                     views.get_mut().retain(|&v| v != view);
@@ -33,10 +33,10 @@ impl DepMap {
         }
         for i in batch.live_rows() {
             let row = compiler::read_circuit_node_row(batch, i);
-            let Some(source) = row.scan_source().map(|s| s as i64) else {
+            let Some(source) = row.scan_source() else {
                 continue;
             };
-            let view = row.view_id as i64;
+            let view = row.view_id;
             let srcs = self.reverse.entry(view).or_default();
             if !srcs.contains(&source) {
                 srcs.push(source);
@@ -49,8 +49,8 @@ impl DepMap {
     /// Both directions are this one walk, so they cannot drift: `forward` reaches
     /// a source's dependents, `reverse` reaches a view's sources, and
     /// `apply` writes both halves from the same `ScanDelta` node.
-    pub(super) fn closure(edges: &FxHashMap<i64, Vec<i64>>, seeds: Vec<i64>) -> FxHashSet<i64> {
-        let mut reachable: FxHashSet<i64> = FxHashSet::default();
+    pub(super) fn closure(edges: &FxHashMap<u64, Vec<u64>>, seeds: Vec<u64>) -> FxHashSet<u64> {
+        let mut reachable: FxHashSet<u64> = FxHashSet::default();
         let mut stack = seeds;
         while let Some(id) = stack.pop() {
             for &next in edges.get(&id).into_iter().flatten() {
@@ -67,38 +67,38 @@ impl DagEngine {
     // ── Dependency map ──────────────────────────────────────────────────
 
     /// The views that scan `id` directly. Empty when none do.
-    pub(crate) fn dependents_of(&self, id: i64) -> &[i64] {
+    pub(crate) fn dependents_of(&self, id: u64) -> &[u64] {
         self.dep.forward.get(&id).map_or(&[], Vec::as_slice)
     }
 
     /// Whether any view scans `id`.
-    pub(crate) fn is_scanned(&self, id: i64) -> bool {
+    pub(crate) fn is_scanned(&self, id: u64) -> bool {
         !self.dependents_of(id).is_empty()
     }
 
     /// The relations `view_id` scans directly. Empty when it scans none.
-    pub(crate) fn sources_of(&self, view_id: i64) -> &[i64] {
+    pub(crate) fn sources_of(&self, view_id: u64) -> &[u64] {
         self.dep.reverse.get(&view_id).map_or(&[], Vec::as_slice)
     }
 
     /// Every relation reachable from `seeds` by following `view → sources` edges
     /// — through view sources, down to the bases — with the seeds themselves
     /// excluded.
-    pub(crate) fn source_closure(&self, seeds: Vec<i64>) -> FxHashSet<i64> {
+    pub(crate) fn source_closure(&self, seeds: Vec<u64>) -> FxHashSet<u64> {
         DepMap::closure(&self.dep.reverse, seeds)
     }
 
     /// The other direction over the same edges: every view reachable from
     /// `seeds` by following `source → dependents`, with the seeds excluded — which
     /// views a tick of these sources reaches.
-    pub(crate) fn dependent_closure(&self, seeds: Vec<i64>) -> FxHashSet<i64> {
+    pub(crate) fn dependent_closure(&self, seeds: Vec<u64>) -> FxHashSet<u64> {
         DepMap::closure(&self.dep.forward, seeds)
     }
 
     /// The base tables — not streams — that `seeds`' source chains reach through
     /// view sources, sorted.
-    pub(crate) fn base_tables_reachable_from(&self, registry: &RelationRegistry, seeds: Vec<i64>) -> Vec<i64> {
-        let mut bases: Vec<i64> = self
+    pub(crate) fn base_tables_reachable_from(&self, registry: &RelationRegistry, seeds: Vec<u64>) -> Vec<u64> {
+        let mut bases: Vec<u64> = self
             .source_closure(seeds)
             .into_iter()
             .filter(|&s| {

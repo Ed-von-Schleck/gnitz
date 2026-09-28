@@ -88,7 +88,7 @@ impl RelationEntry {
 }
 
 impl CatalogEngine {
-    fn relation_entry(&self, tid: i64) -> &RelationEntry {
+    fn relation_entry(&self, tid: u64) -> &RelationEntry {
         self.caches
             .relations
             .get(&tid)
@@ -96,17 +96,17 @@ impl CatalogEngine {
     }
 
     /// `tid`'s record; `None` for an unregistered id.
-    pub(crate) fn schema_record(&self, tid: i64) -> Option<CatalogRecord> {
+    pub(crate) fn schema_record(&self, tid: u64) -> Option<CatalogRecord> {
         self.caches.relations.get(&tid).map(|e| e.record.clone())
     }
 
     /// What `frame_record` decodes to, when it lays out `tid`'s columns.
-    pub(crate) fn known_decode(&self, tid: i64, frame_record: &[u8]) -> Option<SchemaDescriptor> {
+    pub(crate) fn known_decode(&self, tid: u64, frame_record: &[u8]) -> Option<SchemaDescriptor> {
         self.caches.relations.get(&tid)?.record.decode_of(frame_record).ok()
     }
 
     /// Whether a frame whose record matched `seen` still lays out `tid`'s columns.
-    pub(crate) fn recheck_record(&self, tid: i64, seen: &Rc<[u8]>) -> Result<(), String> {
+    pub(crate) fn recheck_record(&self, tid: u64, seen: &Rc<[u8]>) -> Result<(), String> {
         let current = &self.relation_entry(tid).record.bytes;
         if Rc::ptr_eq(seen, current) {
             return Ok(());
@@ -116,7 +116,7 @@ impl CatalogEngine {
 
     /// The schema record a reply to a client at `client_version` carries, and the
     /// version its flags report.
-    pub(crate) fn negotiated_schema_block(&self, tid: i64, client_version: u16) -> (Option<Rc<[u8]>>, u16) {
+    pub(crate) fn negotiated_schema_block(&self, tid: u64, client_version: u16) -> (Option<Rc<[u8]>>, u16) {
         let entry = self.relation_entry(tid);
         let version = entry.schema_version.get();
         let block = (client_version != version).then(|| entry.record.bytes.clone());
@@ -125,7 +125,7 @@ impl CatalogEngine {
 
     /// What a RESOLVE of `tid` answers: its descriptor, and its named record with
     /// that record's version. `None` for an unregistered id.
-    pub(crate) fn resolve_answer(&self, tid: i64) -> Option<(RelDescriptorBlob, Rc<[u8]>, u16)> {
+    pub(crate) fn resolve_answer(&self, tid: u64) -> Option<(RelDescriptorBlob, Rc<[u8]>, u16)> {
         let rel = self.registry.relation(tid)?;
         let entry = self.relation_entry(tid);
         let desc = RelDescriptorBlob {
@@ -147,13 +147,13 @@ impl CatalogEngine {
 
 #[derive(Default)]
 pub(in crate::catalog) struct CatalogCacheSet {
-    pub(in crate::catalog) schema_by_name: FxHashMap<String, i64>,
-    pub(in crate::catalog) schema_by_id: FxHashMap<i64, String>,
-    pub(in crate::catalog) entity_by_qname: FxHashMap<String, i64>,
-    pub(in crate::catalog) index_by_name: FxHashMap<String, i64>,
-    pub(in crate::catalog) relations: FxHashMap<i64, RelationEntry>,
+    pub(in crate::catalog) schema_by_name: FxHashMap<String, u64>,
+    pub(in crate::catalog) schema_by_id: FxHashMap<u64, String>,
+    pub(in crate::catalog) entity_by_qname: FxHashMap<String, u64>,
+    pub(in crate::catalog) index_by_name: FxHashMap<String, u64>,
+    pub(in crate::catalog) relations: FxHashMap<u64, RelationEntry>,
     /// Every [`RelationEntry::fks`] edge, keyed by its parent.
-    pub(in crate::catalog) fk_by_parent: FxHashMap<i64, Vec<FkEdge>>,
+    pub(in crate::catalog) fk_by_parent: FxHashMap<u64, Vec<FkEdge>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +175,7 @@ fn apply_map_delta<K: Eq + Hash, V>(map: &mut FxHashMap<K, V>, batch: &Batch, ro
 impl CatalogEngine {
     pub(in crate::catalog) fn apply_schema_caches(&mut self, batch: &Batch) {
         let name = |i| payload_string(batch, i, SCHEMATAB_PAY_NAME);
-        let sid = |i| batch.get_pk(i) as i64;
+        let sid = |i| batch.get_pk(i) as u64;
         apply_map_delta(&mut self.caches.schema_by_name, batch, |i| (name(i), sid(i)));
         apply_map_delta(&mut self.caches.schema_by_id, batch, |i| (sid(i), name(i)));
     }
@@ -184,16 +184,16 @@ impl CatalogEngine {
     pub(in crate::catalog) fn apply_entity_caches(&mut self, batch: &Batch) {
         let CatalogCacheSet { schema_by_id, entity_by_qname, .. } = &mut self.caches;
         apply_map_delta(entity_by_qname, batch, |i| {
-            let sid = payload_u64(batch, i, RELTAB_PAY_SCHEMA_ID) as i64;
+            let sid = payload_u64(batch, i, RELTAB_PAY_SCHEMA_ID);
             let schema = schema_by_id.get(&sid).expect("a relation row names a live schema");
             let qualified = gnitz_wire::qualified_key(schema, payload_str(batch, i, RELTAB_PAY_NAME));
-            (qualified, batch.get_pk(i) as i64)
+            (qualified, batch.get_pk(i) as u64)
         });
     }
 
     pub(in crate::catalog) fn apply_index_caches(&mut self, batch: &Batch) {
         apply_map_delta(&mut self.caches.index_by_name, batch, |i| {
-            (payload_string(batch, i, IDXTAB_PAY_NAME), batch.get_pk(i) as i64)
+            (payload_string(batch, i, IDXTAB_PAY_NAME), batch.get_pk(i) as u64)
         });
     }
 }

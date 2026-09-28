@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 impl CatalogEngine {
     /// Every row of `table_id`, with this engine's own circuit layer as the hydrator.
-    pub(crate) fn scan(&mut self, table_id: i64) -> Result<Rc<Batch>, String> {
+    pub(crate) fn scan(&mut self, table_id: u64) -> Result<Rc<Batch>, String> {
         let schema = self.registry.relation_or_err(table_id)?.schema();
         Ok(self.registry.scan_spec(
             table_id,
@@ -25,7 +25,7 @@ impl CatalogEngine {
     /// [`RelationRegistry::scan_spec`], hydrating.
     pub(crate) fn scan_spec(
         &mut self,
-        target_id: i64,
+        target_id: u64,
         spec: ReadSpec,
         reply_layout: u64,
     ) -> Result<Rc<Batch>, WireFault> {
@@ -39,7 +39,7 @@ impl CatalogEngine {
     /// everything else is `WireStatus::Error`.
     pub(crate) fn delta_read(
         &self,
-        target_id: i64,
+        target_id: u64,
         after_tick: u64,
         cut_tick: u64,
         reply_layout: u64,
@@ -93,7 +93,7 @@ impl CatalogEngine {
         // An unreadable manifest reads as a mismatch, which is the verdict a child
         // whose manifest a previous open erased must get: its siblings may still
         // be at `g`.
-        let mut invalid: FxHashSet<i64> = FxHashSet::default();
+        let mut invalid: FxHashSet<u64> = FxHashSet::default();
         for &vid in &view_ids {
             let stream_fed = self
                 .dag
@@ -110,7 +110,7 @@ impl CatalogEngine {
         }
 
         // Phase 2: every registered view downstream of an invalid one.
-        let view_set: FxHashSet<i64> = view_ids.iter().copied().collect();
+        let view_set: FxHashSet<u64> = view_ids.iter().copied().collect();
         let seeds = invalid.iter().copied().collect();
         let reached = self.dag.dependent_closure(seeds);
         invalid.extend(reached.into_iter().filter(|v| view_set.contains(v)));
@@ -129,7 +129,7 @@ impl CatalogEngine {
 
     /// The cursor driving `source` through `view_id`'s circuit, under the bound the
     /// circuit carries for it; the circuit's `Filter` applies the WHERE.
-    pub(crate) fn open_source_cursor(&mut self, view_id: i64, source: i64) -> Result<SourceCursor, String> {
+    pub(crate) fn open_source_cursor(&mut self, view_id: u64, source: u64) -> Result<SourceCursor, String> {
         let bound = self.dag.view_meta(view_id)?.source_bound(source);
         self.registry
             .open_bound(source, bound)

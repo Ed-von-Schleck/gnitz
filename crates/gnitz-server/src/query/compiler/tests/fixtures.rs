@@ -86,7 +86,7 @@ pub(in crate::query) fn rejection<T>(r: Result<T, String>) -> String {
 /// enters the schemas a compile looks up without opening a store.
 pub(in crate::query) fn register_sources(
     registry: &mut RelationRegistry,
-    rows: impl IntoIterator<Item = (i64, SchemaDescriptor)>,
+    rows: impl IntoIterator<Item = (u64, SchemaDescriptor)>,
 ) {
     for (id, schema) in rows {
         let spec = RelationSpec { id, kind: RelationKind::Stream, schema };
@@ -95,7 +95,7 @@ pub(in crate::query) fn register_sources(
 }
 
 /// A fresh single-worker registry holding only `rows`.
-pub(in crate::query) fn sources(rows: impl IntoIterator<Item = (i64, SchemaDescriptor)>) -> RelationRegistry {
+pub(in crate::query) fn sources(rows: impl IntoIterator<Item = (u64, SchemaDescriptor)>) -> RelationRegistry {
     let mut registry = RelationRegistry::new("", Slot::SOLO, StoreConfig::default());
     register_sources(&mut registry, rows);
     registry

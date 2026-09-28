@@ -37,7 +37,7 @@ use gnitz_store::schema::Slot;
 fn decode_group_slot(
     msg: &SalMessage,
     data: &[u8],
-    known: impl FnOnce(i64, &[u8]) -> Option<SchemaDescriptor>,
+    known: impl FnOnce(u64, &[u8]) -> Option<SchemaDescriptor>,
 ) -> Result<ipc::DecodedWire, String> {
     ipc::decode_sal_slot(data, known).map_err(|e| {
         format!(
@@ -52,7 +52,7 @@ fn decode_group_slot(
 fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Result<(), String> {
     let floors = catalog.system_replay_floors();
     let mine = |msg: &SalMessage| {
-        msg.kind == SalMessageKind::DdlSync && floors.get(&(msg.target_id as i64)).is_some_and(|&f| msg.lsn > f)
+        msg.kind == SalMessageKind::DdlSync && floors.get(&{ msg.target_id }).is_some_and(|&f| msg.lsn > f)
     };
 
     let mut replayed: u32 = 0;
@@ -69,7 +69,7 @@ fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Re
             continue;
         };
         // Master-validated rows that already carry a drop's children.
-        catalog.stage(msg.target_id as i64, msg.lsn, batch).map_err(|e| {
+        catalog.stage(msg.target_id, msg.lsn, batch).map_err(|e| {
             format!(
                 "SAL system-table recovery apply failed (table_id={}, lsn={}): {e}",
                 msg.target_id, msg.lsn
@@ -104,8 +104,8 @@ fn inject_recovery_panic(stage: &str) {
 /// for a reproducible drive order. Keyed on the boot verdict and not on what the
 /// tail contained, because the sweep is also what compiles a view at boot, and
 /// the boot checkpoint publishes traces only for compiled views.
-fn swept_base_tables(catalog: &CatalogEngine) -> Vec<i64> {
-    let keeps_state: Vec<i64> = catalog
+fn swept_base_tables(catalog: &CatalogEngine) -> Vec<u64> {
+    let keeps_state: Vec<u64> = catalog
         .registry
         .view_ids()
         .into_iter()
@@ -142,7 +142,7 @@ fn replay_slots(written: u32, slot: Slot, replicated: bool) -> (Range<u32>, bool
 fn recover_from_sal(
     tail: CommittedTail,
     slot: Slot,
-    swept_bases: &[i64],
+    swept_bases: &[u64],
     catalog: &mut CatalogEngine,
 ) -> Result<(), String> {
     // Groups that applied at least one slot, and the width a re-sliced tail was
@@ -152,7 +152,7 @@ fn recover_from_sal(
     let mut resliced_from: Option<u32> = None;
     let mut rows: Vec<Vec<u32>> = Vec::new();
     for msg in tail.groups().filter(|m| m.kind == SalMessageKind::Push) {
-        let tid = msg.target_id as i64;
+        let tid = msg.target_id;
         // The catalog's schema, not the wire's: only the catalog stamps the
         // `replicated` bit the branch below reads. `SchemaDescriptor` is `Copy`, so
         // this holds no borrow on `catalog` across the `&mut` ingest. A table
@@ -219,7 +219,7 @@ fn worker_boot_recovery(
     catalog: &mut CatalogEngine,
     tail: CommittedTail,
     slot: Slot,
-    swept_bases: &[i64],
+    swept_bases: &[u64],
 ) -> Result<(), String> {
     // Before any other catalog work, and before the replay below, which
     // projects the tail into each index exactly once.
@@ -320,7 +320,7 @@ fn run_worker_child(
     master_pid: i32,
     catalog: &mut CatalogEngine,
     ipc: &SharedIpc,
-    swept_bases: &[i64],
+    swept_bases: &[u64],
 ) -> ! {
     let w = slot.rank as usize;
 
@@ -380,7 +380,7 @@ fn run_worker_child(
 
 /// The master's half of recovery before any worker exists: the sweep set every
 /// worker inherits, and the zone-LSN seed: the newest zone the system families hold.
-fn master_pre_fork_recovery(catalog: &mut CatalogEngine) -> Result<(Vec<i64>, u64), String> {
+fn master_pre_fork_recovery(catalog: &mut CatalogEngine) -> Result<(Vec<u64>, u64), String> {
     // G → G+1, the resume generation left at G: until `boot_checkpoint`
     // restamps at G+1, a crash rebuilds every view instead of resuming it.
     catalog.advance_durable_generation()?;
@@ -409,7 +409,7 @@ fn fork_workers(
     data_dir: &str,
     num_workers: u32,
     ipc: &SharedIpc,
-    swept_bases: &[i64],
+    swept_bases: &[u64],
     pinning: Option<&affinity::Pinning>,
 ) -> Result<Vec<i32>, String> {
     let master_pid = unsafe { libc::getpid() };
@@ -445,7 +445,7 @@ async fn master_post_fork_recovery(
     disp: Rc<MasterDispatcher>,
     ready: AckLease,
     live_epoch: u32,
-    swept_bases: Vec<i64>,
+    swept_bases: Vec<u64>,
 ) -> Result<(), String> {
     // Wait for all workers to complete recovery and signal readiness.
     disp.collect_round(&ready, false)
@@ -470,7 +470,7 @@ async fn master_post_fork_recovery(
 
     // Rebuild the views the boot verdict rejected, through the driver a live
     // CREATE VIEW uses; they opened empty and the sweep above skipped them.
-    let invalid: Vec<i64> = disp.cat().dag.take_rebuild().into_iter().collect();
+    let invalid: Vec<u64> = disp.cat().dag.take_rebuild().into_iter().collect();
     // Resume-vs-rebuild marker (asserted by the "no backfill on clean restart"
     // E2E): 0 ⇒ every view resumed from its checkpoint.
     gnitz_note!("recovery: rebuilding {} invalid view(s)", invalid.len());

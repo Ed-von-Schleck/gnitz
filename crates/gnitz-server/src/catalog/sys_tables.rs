@@ -29,45 +29,19 @@ use gnitz_wire::{
 // Constants
 // ---------------------------------------------------------------------------
 
-pub(super) const SYSTEM_SCHEMA_ID: i64 = 1;
-pub(crate) const PUBLIC_SCHEMA_ID: i64 = 2;
-pub(super) const FIRST_USER_SCHEMA_ID: i64 = gnitz_wire::FIRST_USER_SCHEMA_ID as i64;
+pub(super) const SYSTEM_SCHEMA_ID: u64 = 1;
+pub(crate) const PUBLIC_SCHEMA_ID: u64 = 2;
 
 /// The next catalog object id to allocate.
-pub(super) const SEQ_ID_NEXT_ID: i64 = 1;
+pub(super) const SEQ_ID_NEXT_ID: u64 = 1;
 /// Committed checkpoint generation (monotonic).
-pub(super) const SEQ_ID_CHECKPOINT_GEN: i64 = 2;
+pub(super) const SEQ_ID_CHECKPOINT_GEN: u64 = 2;
 /// Cluster topology: `(worker_count as u64) << 32 | STATE_FORMAT as u64`.
-pub(super) const SEQ_ID_TOPOLOGY: i64 = 3;
+pub(super) const SEQ_ID_TOPOLOGY: u64 = 3;
 
-pub(crate) const FIRST_USER_TABLE_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
-/// Above every column index, so a catalog index's claim on a circuit never
-/// equals an FK circuit's, whose claim id is its column index.
-pub(super) const FIRST_USER_INDEX_ID: i64 = MAX_COLUMNS as i64;
 /// The first id `allocate_ids` hands out.
-pub(super) const FIRST_ALLOCATED_ID: i64 = FIRST_USER_INDEX_ID;
-const _: () = assert!(FIRST_ALLOCATED_ID >= FIRST_USER_SCHEMA_ID && FIRST_ALLOCATED_ID >= FIRST_USER_TABLE_ID);
-
-/// [`gnitz_wire::CATALOG_ID_CEILING`] in this crate's `i64` id width.
-pub(super) const CATALOG_ID_CEILING: i64 = gnitz_wire::CATALOG_ID_CEILING as i64;
-
-// The families' table ids in the catalog's `i64` width. Production code names
-// the family — [`SysFamily::id`] *is* the wire id, by discriminant — so these
-// only spell what a test batch's `ingest_to_family` argument needs.
-#[cfg(test)]
-pub(super) const SCHEMA_TAB_ID: i64 = gnitz_wire::SCHEMA_TAB as i64;
-#[cfg(test)]
-pub(super) const TABLE_TAB_ID: i64 = gnitz_wire::TABLE_TAB as i64;
-#[cfg(test)]
-pub(super) const VIEW_TAB_ID: i64 = gnitz_wire::VIEW_TAB as i64;
-#[cfg(test)]
-pub(super) const COL_TAB_ID: i64 = gnitz_wire::COL_TAB as i64;
-#[cfg(test)]
-pub(super) const IDX_TAB_ID: i64 = gnitz_wire::IDX_TAB as i64;
-#[cfg(test)]
-pub(super) const SEQ_TAB_ID: i64 = gnitz_wire::SEQ_TAB as i64;
-#[cfg(test)]
-pub(super) const CIRCUIT_NODES_TAB_ID: i64 = gnitz_wire::CIRCUIT_NODES_TAB as i64;
+pub(super) const FIRST_ALLOCATED_ID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
+const _: () = assert!(FIRST_ALLOCATED_ID >= gnitz_wire::FIRST_USER_SCHEMA_ID);
 
 // PK list encoding lives in gnitz-wire so the client and engine cannot drift on
 // the on-disk format. Every site spells the packers `gnitz_wire::…`, or reaches
@@ -91,8 +65,8 @@ pub(super) use gnitz_wire::PkColList;
 /// derives.
 pub(super) struct RelationRegistration<'a> {
     pub(super) kind: RelationKind,
-    pub(super) id: i64,
-    pub(super) schema_id: i64,
+    pub(super) id: u64,
+    pub(super) schema_id: u64,
     pub(super) name: &'a str,
     pub(super) pk: PkColList,
     pub(super) placement: Placement,
@@ -122,8 +96,8 @@ pub(super) fn read_table_tab_row(batch: &Batch, row: usize) -> Result<RelationRe
         .map_err(|e| format!("catalog invariant violated: {noun} '{name}' {e}"))?;
     Ok(RelationRegistration {
         kind,
-        id: batch.get_pk(row) as i64,
-        schema_id: payload_u64(batch, row, RELTAB_PAY_SCHEMA_ID) as i64,
+        id: batch.get_pk(row) as u64,
+        schema_id: payload_u64(batch, row, RELTAB_PAY_SCHEMA_ID),
         name,
         pk,
         placement: match props.distribution {
@@ -141,13 +115,13 @@ pub(super) fn read_table_tab_row(batch: &Batch, row: usize) -> Result<RelationRe
 /// A VIEW_TAB row as decoded. Not yet a [`RelationRegistration`]: a view's
 /// placement is a fold over its sources, which this reader cannot see.
 pub(super) struct ViewRegistration<'a> {
-    pub(super) schema_id: i64,
+    pub(super) schema_id: u64,
     pub(super) name: &'a str,
     pub(super) pk: PkColList,
     pub(super) props: ViewProps,
     /// The user view this row is an internal chain segment of; `0` for a user
     /// view.
-    pub(super) owner_view_id: i64,
+    pub(super) owner_view_id: u64,
     /// [`gnitz_wire::ViewFlags::pk_repeats`].
     pub(super) pk_repeats: bool,
 }
@@ -165,11 +139,11 @@ pub(super) fn read_view_tab_row(batch: &Batch, row: usize) -> Result<ViewRegistr
     let flags = gnitz_wire::ViewFlags::from_flags(payload_u64(batch, row, VIEWTAB_PAY_FLAGS))
         .map_err(|e| format!("catalog invariant violated: view '{name}' {e}"))?;
     Ok(ViewRegistration {
-        schema_id: payload_u64(batch, row, RELTAB_PAY_SCHEMA_ID) as i64,
+        schema_id: payload_u64(batch, row, RELTAB_PAY_SCHEMA_ID),
         name,
         pk,
         props,
-        owner_view_id: payload_u64(batch, row, VIEWTAB_PAY_OWNER_VIEW_ID) as i64,
+        owner_view_id: payload_u64(batch, row, VIEWTAB_PAY_OWNER_VIEW_ID),
         pk_repeats: flags.pk_repeats,
     })
 }
@@ -179,9 +153,9 @@ pub(super) fn read_view_tab_row(batch: &Batch, row: usize) -> Result<ViewRegistr
 pub(super) fn read_idx_tab_row<S: RowSource>(
     src: &S,
     row: usize,
-) -> Result<(i64, PkColList, gnitz_wire::IndexProps), String> {
+) -> Result<(u64, PkColList, gnitz_wire::IndexProps), String> {
     Ok((
-        payload_u64(src, row, IDXTAB_PAY_OWNER_ID) as i64,
+        payload_u64(src, row, IDXTAB_PAY_OWNER_ID),
         unpack_pk_cols(payload_u64(src, row, IDXTAB_PAY_SOURCE_COLS)).map_err(|rule| format!("column list {rule}"))?,
         gnitz_wire::IndexProps::from_flags(payload_u64(src, row, IDXTAB_PAY_FLAGS))?,
     ))
@@ -210,7 +184,7 @@ pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> Result<Colu
         name: payload_string(src, row, COLTAB_PAY_NAME),
         ty,
         is_nullable: flag("is_nullable", COLTAB_PAY_IS_NULLABLE)?,
-        fk_table_id: payload_u64(src, row, COLTAB_PAY_FK_TABLE_ID) as i64,
+        fk_table_id: payload_u64(src, row, COLTAB_PAY_FK_TABLE_ID),
         fk_col_idx: word("fk_col_idx", COLTAB_PAY_FK_COL_IDX, u32::MAX as u64)? as u32,
         is_hidden: flag("is_hidden", COLTAB_PAY_IS_HIDDEN)?,
     })
@@ -219,14 +193,14 @@ pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> Result<Colu
 impl ColumnDef {
     /// This column as COL_TAB row `(owner_id, col_idx)` — the inverse of
     /// [`read_col_tab_row`].
-    pub(super) fn col_tab_row(&self, owner_id: i64, col_idx: usize) -> ColTabRow<'_> {
+    pub(super) fn col_tab_row(&self, owner_id: u64, col_idx: usize) -> ColTabRow<'_> {
         ColTabRow {
-            owner_id: owner_id as u64,
+            owner_id,
             col_idx: col_idx as u64,
             name: &self.name,
             ty: self.ty,
             is_nullable: self.is_nullable,
-            fk_table_id: self.fk_table_id as u64,
+            fk_table_id: self.fk_table_id,
             fk_col_idx: self.fk_col_idx as u64,
             is_hidden: self.is_hidden,
         }
@@ -234,7 +208,7 @@ impl ColumnDef {
 }
 
 /// `defs` as `owner_id`'s COL_TAB rows, keyed by position, at `weight`.
-pub(crate) fn write_col_tab_rows(bb: &mut BatchBuilder, owner_id: i64, defs: &[ColumnDef], weight: i64) {
+pub(crate) fn write_col_tab_rows(bb: &mut BatchBuilder, owner_id: u64, defs: &[ColumnDef], weight: i64) {
     for (i, cd) in defs.iter().enumerate() {
         write_col_tab_row(bb, &cd.col_tab_row(owner_id, i), weight);
     }
@@ -248,7 +222,7 @@ pub(crate) fn write_col_tab_rows(bb: &mut BatchBuilder, owner_id: i64, defs: &[C
 pub(super) struct PkSignature {
     pub(super) pk: u128,
     /// [`SysFamily::leading_id`] of `pk`, so no consumer re-derives it.
-    pub(super) leading: i64,
+    pub(super) leading: u64,
     /// First row index carrying this PK; its OPK bytes address the live row.
     pub(super) row: usize,
     /// First `-1` / `+1` row index for this PK.
@@ -313,8 +287,8 @@ pub(super) fn pk_signatures(family: SysFamily, batch: &Batch) -> Vec<PkSignature
 /// arrive as one batch on every path.
 #[derive(Default)]
 pub(crate) struct PkPartition {
-    pub(crate) creates: Vec<i64>,
-    pub(crate) drops: Vec<i64>,
+    pub(crate) creates: Vec<u64>,
+    pub(crate) drops: Vec<u64>,
 }
 
 pub(crate) fn family_pk_partition(family: SysFamily, batch: &Batch) -> PkPartition {
@@ -338,8 +312,8 @@ pub(crate) fn family_pk_partition(family: SysFamily, batch: &Batch) -> PkPartiti
 /// list does not decode is skipped; the precheck rejects the batch over it.
 #[derive(Default)]
 pub(crate) struct IdxPartition {
-    pub(crate) creates: Vec<(i64, PkColList, gnitz_wire::IndexProps)>,
-    pub(crate) drops: Vec<(i64, PkColList)>,
+    pub(crate) creates: Vec<(u64, PkColList, gnitz_wire::IndexProps)>,
+    pub(crate) drops: Vec<(u64, PkColList)>,
 }
 
 pub(crate) fn idx_tab_partition(batch: &Batch) -> IdxPartition {
@@ -399,22 +373,22 @@ static SCHEMAS: [SchemaDescriptor; SysFamily::COUNT] = {
 // ---------------------------------------------------------------------------
 
 /// A catalog system-table family (every id below `FIRST_USER_TABLE_ID`). Used
-/// at the applier's mutation API in place of a bare `i64`, so the `fire_hooks`
+/// at the applier's mutation API in place of a bare `u64`, so the `fire_hooks`
 /// dispatch is an exhaustive `match` a newly-added family cannot silently skip.
-/// Convert to/from `i64` only at the storage edge.
 ///
 /// **The discriminant is the wire table id**, so `SysFamily::Table` *is*
 /// `TABLE_TAB` and no mapping can disagree. Declaration order here carries
 /// nothing; the per-family arrays are indexed by [`Self::index`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u64)]
 pub(crate) enum SysFamily {
-    Schema = gnitz_wire::SCHEMA_TAB as isize,
-    Table = gnitz_wire::TABLE_TAB as isize,
-    View = gnitz_wire::VIEW_TAB as isize,
-    Column = gnitz_wire::COL_TAB as isize,
-    Index = gnitz_wire::IDX_TAB as isize,
-    Sequence = gnitz_wire::SEQ_TAB as isize,
-    CircuitNodes = gnitz_wire::CIRCUIT_NODES_TAB as isize,
+    Schema = gnitz_wire::SCHEMA_TAB,
+    Table = gnitz_wire::TABLE_TAB,
+    View = gnitz_wire::VIEW_TAB,
+    Column = gnitz_wire::COL_TAB,
+    Index = gnitz_wire::IDX_TAB,
+    Sequence = gnitz_wire::SEQ_TAB,
+    CircuitNodes = gnitz_wire::CIRCUIT_NODES_TAB,
 }
 
 impl SysFamily {
@@ -451,11 +425,10 @@ impl SysFamily {
         &gnitz_wire::SYS_FAMILIES[self.index()]
     }
 
-    /// This family's table id — the discriminant itself — in the `i64` the
-    /// catalog storage edge and every `sys_*` signature use.
+    /// This family's table id — the discriminant itself.
     #[inline]
-    pub(crate) const fn id(self) -> i64 {
-        self as i64
+    pub(crate) const fn id(self) -> u64 {
+        self as u64
     }
 
     /// This family's name.
@@ -490,14 +463,14 @@ impl SysFamily {
         match self {
             SysFamily::Schema => {
                 for (schema_id, name) in [(SYSTEM_SCHEMA_ID, "_system"), (PUBLIC_SCHEMA_ID, "public")] {
-                    write_schema_tab_row(bb, &SchemaTabRow { schema_id: schema_id as u64, name }, 1);
+                    write_schema_tab_row(bb, &SchemaTabRow { schema_id, name }, 1);
                 }
             }
             SysFamily::Table => {
                 for family in SysFamily::ALL {
                     let row = TableTabRow {
-                        table_id: family.id() as u64,
-                        schema_id: SYSTEM_SCHEMA_ID as u64,
+                        table_id: family.id(),
+                        schema_id: SYSTEM_SCHEMA_ID,
                         name: family.name(),
                         pk_col_idx: gnitz_wire::pack_pk_cols(family.wire().pk_cols),
                         flags: 0,
@@ -532,14 +505,14 @@ impl SysFamily {
     }
 
     /// The leading id of one of this family's PKs: the whole key where it is one
-    /// column, its high half where the key is a pair — where `pk as i64` would
+    /// column, its high half where the key is a pair — where `pk as u64` would
     /// take the trailing half instead (a column index, or a node id).
     #[inline]
-    pub(super) fn leading_id(self, pk: u128) -> i64 {
+    pub(super) fn leading_id(self, pk: u128) -> u64 {
         match self {
-            SysFamily::Column | SysFamily::CircuitNodes => gnitz_wire::unpack_pair_pk(pk).0 as i64,
+            SysFamily::Column | SysFamily::CircuitNodes => gnitz_wire::unpack_pair_pk(pk).0,
             SysFamily::Schema | SysFamily::Table | SysFamily::View | SysFamily::Index | SysFamily::Sequence => {
-                pk as i64
+                pk as u64
             }
         }
     }
@@ -547,19 +520,20 @@ impl SysFamily {
     /// The lowest id a client may write in this family's id space; everything
     /// below is bootstrap-owned. Read against [`Self::leading_id`], so Column's
     /// floor is its owner's. `None` where the PK is no id space at all.
-    pub(super) fn first_user_id(self) -> Option<i64> {
+    pub(super) fn first_user_id(self) -> Option<u64> {
         match self {
-            SysFamily::Schema => Some(FIRST_USER_SCHEMA_ID),
-            SysFamily::Table | SysFamily::View | SysFamily::Column | SysFamily::Sequence => Some(FIRST_USER_TABLE_ID),
-            SysFamily::Index => Some(FIRST_USER_INDEX_ID),
+            SysFamily::Schema => Some(gnitz_wire::FIRST_USER_SCHEMA_ID),
+            SysFamily::Table | SysFamily::View | SysFamily::Column | SysFamily::Sequence | SysFamily::Index => {
+                Some(gnitz_wire::FIRST_USER_TABLE_ID)
+            }
             SysFamily::CircuitNodes => None,
         }
     }
 
     /// The exclusive upper bound on an id a client may write: the ceiling
     /// `allocate_ids` allocates under.
-    pub(super) fn id_ceiling(self) -> Option<i64> {
-        self.allocates_ids().then_some(CATALOG_ID_CEILING)
+    pub(super) fn id_ceiling(self) -> Option<u64> {
+        self.allocates_ids().then_some(gnitz_wire::CATALOG_ID_CEILING)
     }
 
     /// Does this family's PK draw from the catalog object-id counter?
@@ -634,11 +608,8 @@ impl SysFamily {
     }
 
     /// Inverse of [`Self::id`]; `None` for any id that is not a system family.
-    pub(crate) const fn from_id(id: i64) -> Option<Self> {
-        if id < 0 {
-            return None;
-        }
-        match gnitz_wire::sys_family_index(id as u64) {
+    pub(crate) const fn from_id(id: u64) -> Option<Self> {
+        match gnitz_wire::sys_family_index(id) {
             Some(i) => Some(Self::ALL[i]),
             None => None,
         }

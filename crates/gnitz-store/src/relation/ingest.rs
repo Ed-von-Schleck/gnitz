@@ -24,7 +24,7 @@ fn inject_ingest_apply_error(which: &str, kind: RelationKind, r: Result<(), Stor
 pub(super) fn fill_indexes(
     owner: &Store,
     chunk_rows: usize,
-    owner_id: i64,
+    owner_id: u64,
     targets: &mut [&mut SecondaryIndex],
 ) -> Result<(), StoreError> {
     if targets.is_empty() {
@@ -62,13 +62,13 @@ impl RelationRegistry {
     ///
     /// `Rejected` means nothing was applied and the request is at fault;
     /// `Storage` means committed data did not reach the store.
-    pub fn ingest(&mut self, id: i64, batch: Batch) -> Result<(), StoreError> {
+    pub fn ingest(&mut self, id: u64, batch: Batch) -> Result<(), StoreError> {
         self.ingest_at(id, batch, None, false).map(drop)
     }
 
     /// [`Self::ingest`], handing back the batch as the store saw it, after PK
     /// enforcement — what a caller that must forward the applied rows takes.
-    pub fn ingest_returning(&mut self, id: i64, batch: Batch) -> Result<Batch, StoreError> {
+    pub fn ingest_returning(&mut self, id: u64, batch: Batch) -> Result<Batch, StoreError> {
         self.ingest_at(id, batch, None, true)
             .map(|b| b.expect("`needed` is set, so the effective batch comes back"))
     }
@@ -82,7 +82,7 @@ impl RelationRegistry {
     /// net-zero rows, and a round has to keep both sides of one.
     pub fn ingest_view_delta(
         &mut self,
-        view_id: i64,
+        view_id: u64,
         batch: Batch,
         round: Option<u64>,
         needed: bool,
@@ -93,7 +93,7 @@ impl RelationRegistry {
     /// Resolve `id`, admit the batch's shape against the store's, and apply it.
     fn ingest_at(
         &mut self,
-        id: i64,
+        id: u64,
         batch: Batch,
         round: Option<u64>,
         needed: bool,
@@ -194,7 +194,7 @@ impl RelationRegistry {
     /// Fold `id`'s store memtable into its RAM tier, which past its ceiling also
     /// spills it, compacts and runs the capacity sweep: no manifest publish, no
     /// barrier, and nothing of the relation's indexes. Unregistered is an `Err`.
-    pub fn fold_to_ram(&mut self, id: i64) -> Result<(), StoreError> {
+    pub fn fold_to_ram(&mut self, id: u64) -> Result<(), StoreError> {
         let entry = self.relation_mut_or_err(id)?;
         entry
             .store

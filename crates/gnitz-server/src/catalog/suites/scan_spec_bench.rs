@@ -62,7 +62,7 @@ fn cell(label: &str, scanned: u64, mut f: impl FnMut() -> Rc<Batch>) {
 
 /// `id U64 PK | c0 I64 | cf I64 | c2 I64 | c3 I64` at weight 1. `c0 = id % 100`
 /// is the contiguous-run selectivity dial, `cf = id % 2` the fragmenting one.
-fn numeric_fixture(name: &str, n: u64) -> (CatalogEngine, i64) {
+fn numeric_fixture(name: &str, n: u64) -> (CatalogEngine, u64) {
     let cols = vec![
         col_def("id", TypeCode::U64),
         col_def("c0", TypeCode::I64),

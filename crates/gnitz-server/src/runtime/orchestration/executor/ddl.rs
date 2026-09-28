@@ -92,7 +92,7 @@ fn partition_of(families: &[Option<Batch>; SysFamily::COUNT], family: SysFamily)
 /// Decode one `DDL_TXN` item's block under its family's own schema, behind the
 /// [`SysFamily::client_writable`] allowlist.
 fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, Batch), String> {
-    let tid = ctrl.hdr.target_id as i64;
+    let tid = ctrl.hdr.target_id;
     let family = SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?;
     if !family.client_writable() {
         return Err(format!(
@@ -170,7 +170,7 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
     // Pre-flight global uniqueness for every unique secondary index in this
     // bundle before reserving the zone LSN or mutating the catalog, so a
     // violation needs no rollback.
-    let mut filter_seeds: Vec<(i64, PkColList, UniqueFilter)> = Vec::new();
+    let mut filter_seeds: Vec<(u64, PkColList, UniqueFilter)> = Vec::new();
     for (owner_id, cols) in indices
         .creates
         .into_iter()
@@ -366,7 +366,7 @@ async fn publish_after_fsync(alloc: &ZoneLsnAllocator, zone: u64, synced: impl F
 /// is synchronous, so catalog readers never block across an `fdatasync`.
 /// `handle_ddl_txn` holds its write guard past the fsync instead, needing it for
 /// its post-fsync catalog cleanup and the backfill.
-pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64, count: u64) -> Result<i64, String> {
+pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: u64, count: u64) -> Result<i64, String> {
     let (base, zone_lsn, synced) = {
         // Lock order catalog -> SAL, matching INSERT/SEEK, so acquiring SAL under
         // catalog.write cannot deadlock. Both guards drop at the end of this block.

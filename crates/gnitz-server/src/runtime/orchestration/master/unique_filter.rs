@@ -120,7 +120,7 @@ impl MasterDispatcher {
     /// `(table_id, cols)`.
     pub(super) fn unique_filter_all_absent<'k>(
         &self,
-        table_id: i64,
+        table_id: u64,
         cols: PkColList,
         spans: impl Iterator<Item = &'k [u8]>,
     ) -> bool {
@@ -133,7 +133,7 @@ impl MasterDispatcher {
     /// Record every indexed span of a successfully-flushed `batch` on
     /// `table_id`. A filter that is not yet warm is ingested into too, so a span
     /// committed during a warm-up window is not lost.
-    pub(crate) fn unique_filter_ingest_batch(&self, table_id: i64, batch: &Batch) {
+    pub(crate) fn unique_filter_ingest_batch(&self, table_id: u64, batch: &Batch) {
         let Some(relation) = self.cat().registry.relation(table_id) else {
             return;
         };
@@ -148,18 +148,18 @@ impl MasterDispatcher {
     }
 
     /// Drop every filter entry for `table_id`; lazy warm-up rebuilds them.
-    pub(crate) fn unique_filter_invalidate_table(&self, table_id: i64) {
+    pub(crate) fn unique_filter_invalidate_table(&self, table_id: u64) {
         self.unique_filters.borrow_mut().retain(|&(t, _), _| t != table_id);
     }
 
     /// Drop the filter for one index, leaving the table's other filters.
-    pub(crate) fn unique_filter_remove(&self, owner_id: i64, cols: PkColList) {
+    pub(crate) fn unique_filter_remove(&self, owner_id: u64, cols: PkColList) {
         self.unique_filters.borrow_mut().remove(&(owner_id, cols));
     }
 
     /// Publish the filter the CREATE-time pre-flight built: it scanned every
     /// worker under the catalog write lock, so the set is complete.
-    pub(crate) fn unique_filter_seed(&self, table_id: i64, cols: PkColList, mut filter: UniqueFilter) {
+    pub(crate) fn unique_filter_seed(&self, table_id: u64, cols: PkColList, mut filter: UniqueFilter) {
         filter.mark_warm();
         self.unique_filters.borrow_mut().insert((table_id, cols), filter);
     }
@@ -168,7 +168,7 @@ impl MasterDispatcher {
     /// to `table_id` checks, from a scan of the table, one reply frame at a time.
     pub(super) async fn ensure_unique_filters_warm(
         &self,
-        table_id: i64,
+        table_id: u64,
         uniques: &[(PkColList, SchemaDescriptor, IndexKeySpec)],
     ) -> Result<(), WireFault> {
         let missing: Vec<(PkColList, IndexKeySpec)> = {
@@ -191,7 +191,7 @@ impl MasterDispatcher {
         let lease = self
             .scan(DirectGroup {
                 template: wire::WireMsg {
-                    target_id: table_id as u64,
+                    target_id: table_id,
                     ..Default::default()
                 },
                 ..DirectGroup::new(SalMessageKind::Scan)

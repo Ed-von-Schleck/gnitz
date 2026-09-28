@@ -18,7 +18,7 @@ fn id_val_cols() -> Vec<ColumnDef> {
 }
 
 /// An `id_val_cols` base of `n` rows, `val = val_of(id)`, each at weight 1.
-fn fixture(name: &str, n: u64, val_of: impl Fn(u64) -> i64) -> (CatalogEngine, i64) {
+fn fixture(name: &str, n: u64, val_of: impl Fn(u64) -> i64) -> (CatalogEngine, u64) {
     ingest_fixture(name, &id_val_cols(), n, 1, |bb, id| bb.put_u64(val_of(id) as u64))
 }
 
@@ -26,7 +26,7 @@ fn fixture(name: &str, n: u64, val_of: impl Fn(u64) -> i64) -> (CatalogEngine, i
 /// triples. A view runs no `enforce_unique_pk`, so weights above 1 are admitted
 /// verbatim — a base table would clamp every accumulated PK weight to 1.
 /// Returns the view id; the scan verb reads a view exactly like a base table.
-fn weighted_fixture(name: &str, rows: impl Iterator<Item = (u64, i64, i64)>) -> (CatalogEngine, i64) {
+fn weighted_fixture(name: &str, rows: impl Iterator<Item = (u64, i64, i64)>) -> (CatalogEngine, u64) {
     let cols = id_val_cols();
     let (mut engine, tid, _dir) = table_fixture(name, &cols);
 
@@ -61,7 +61,7 @@ fn identity_spec(bound: ReadBound, order: Vec<OrderKey>, limit_k: u64) -> ReadSp
     }
 }
 
-fn run(engine: &mut CatalogEngine, tid: i64, spec: &ReadSpec) -> Vec<(u128, i64, i64)> {
+fn run(engine: &mut CatalogEngine, tid: u64, spec: &ReadSpec) -> Vec<(u128, i64, i64)> {
     let reply_schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     let keeper = engine
         .scan_spec(tid, spec.clone(), reply_schema.layout_digest())
@@ -70,14 +70,14 @@ fn run(engine: &mut CatalogEngine, tid: i64, spec: &ReadSpec) -> Vec<(u128, i64,
 }
 
 /// A `pk IN (…)` bound naming `keys` (native values) as `id`'s own OPK images.
-fn pk_set(engine: &CatalogEngine, id: i64, keys: impl IntoIterator<Item = u128>) -> ReadBound {
+fn pk_set(engine: &CatalogEngine, id: u64, keys: impl IntoIterator<Item = u128>) -> ReadBound {
     let schema = engine.registry.relation(id).map(Relation::schema).unwrap();
     let opk: Vec<_> = keys.into_iter().map(|k| opk_pk(&schema, &[k])).collect();
     ReadBound::PkSet(PkKeys::from_keys(schema.pk_stride(), opk.iter().map(Vec::as_slice)))
 }
 
 /// [`run`] over an identity spec gathering `keys`.
-fn run_pk_set(engine: &mut CatalogEngine, id: i64, keys: impl IntoIterator<Item = u128>) -> Vec<(u128, i64, i64)> {
+fn run_pk_set(engine: &mut CatalogEngine, id: u64, keys: impl IntoIterator<Item = u128>) -> Vec<(u128, i64, i64)> {
     let bound = pk_set(engine, id, keys);
     run(engine, id, &identity_spec(bound, vec![], 0))
 }
@@ -152,9 +152,15 @@ fn pk_set_gathers_named_keys() {
 #[test]
 fn pk_set_over_a_system_table_keeps_every_key() {
     let (mut e, tid, _dir) = table_fixture("ss_pkset_sys", &id_val_cols());
-    let sys_schema = e.registry.relation(TABLE_TAB_ID).map(Relation::schema).unwrap();
-    let spec = identity_spec(pk_set(&e, TABLE_TAB_ID, [tid as u128]), vec![], 0);
-    let keeper = e.scan_spec(TABLE_TAB_ID, spec, sys_schema.layout_digest()).unwrap();
+    let sys_schema = e
+        .registry
+        .relation(gnitz_wire::TABLE_TAB)
+        .map(Relation::schema)
+        .unwrap();
+    let spec = identity_spec(pk_set(&e, gnitz_wire::TABLE_TAB, [tid as u128]), vec![], 0);
+    let keeper = e
+        .scan_spec(gnitz_wire::TABLE_TAB, spec, sys_schema.layout_digest())
+        .unwrap();
     assert_eq!(
         (0..keeper.len()).map(|i| keeper.get_pk(i)).collect::<Vec<_>>(),
         vec![tid as u128],
@@ -484,7 +490,7 @@ fn proj_fixture(
     n: u64,
     chunk_rows: usize,
     put_row: impl FnMut(&mut BatchBuilder, u64),
-) -> (CatalogEngine, i64) {
+) -> (CatalogEngine, u64) {
     let (mut engine, tid) = ingest_fixture(name, cols, n, 1, put_row);
     engine.registry.set_scan_chunk_rows(chunk_rows);
     (engine, tid)

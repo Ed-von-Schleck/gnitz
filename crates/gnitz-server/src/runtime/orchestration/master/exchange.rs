@@ -13,8 +13,8 @@ use gnitz_store::storage::Batch;
 /// The open exchange round, keyed by `(view_id, source_id)`: a two-source view opens
 /// one round per source, and a relay carries its own source's shard columns.
 pub(crate) struct ExchangeRound {
-    pub(crate) view_id: i64,
-    pub(crate) source_id: i64,
+    pub(crate) view_id: u64,
+    pub(crate) source_id: u64,
     pub(crate) schema: SchemaDescriptor,
     /// One frame list per worker, in frame order, so the relay's row order does not
     /// depend on arrival order.
@@ -28,7 +28,7 @@ impl ExchangeRound {
     /// The round `frame` opens, among `nw` workers.
     pub(crate) fn open(frame: &DecodedWire, nw: usize) -> Self {
         let hdr = &frame.control.hdr;
-        let (view_id, source_id) = (hdr.target_id as i64, hdr.arg0 as i64);
+        let (view_id, source_id) = (hdr.target_id, hdr.arg0);
         let schema = frame.schema.unwrap_or_else(|| {
             gnitz_fatal_abort!(
                 "exchange: (view_id={view_id}, source_id={source_id}) frame has no schema block — ring corrupt"
@@ -47,7 +47,7 @@ impl ExchangeRound {
     /// Take worker `w`'s `frame`; true once every worker's terminal frame is in.
     pub(crate) fn accept(&mut self, w: usize, frame: DecodedWire) -> bool {
         let hdr = &frame.control.hdr;
-        let key = (hdr.target_id as i64, hdr.arg0 as i64);
+        let key = (hdr.target_id, hdr.arg0);
         if key != (self.view_id, self.source_id) {
             gnitz_fatal_abort!(
                 "exchange: worker {w} sent (view_id, source_id)={key:?} while ({}, {}) is open — workers diverged",

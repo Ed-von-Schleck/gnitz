@@ -40,14 +40,14 @@ fn sal_multiple_groups() {
     let log = TestLog::new(1 << 20, 1, 1);
     for g in 0..3u64 {
         let buf = vec![(g + 1) as u8; 64];
-        log.write(g as u32, g * 10, SalMessageKind::Scan, &[&buf, &[]]);
+        log.write(g, g * 10, SalMessageKind::Scan, &[&buf, &[]]);
     }
 
     let groups: Vec<_> = log.log().walk(1).collect();
     assert_eq!(groups.len(), 3);
     for (g, msg) in (0..3u64).zip(&groups) {
         assert_eq!(msg.lsn, g * 10);
-        assert_eq!(msg.target_id, g as u32);
+        assert_eq!(msg.target_id, g);
         assert_eq!(msg.slot(0).expect("data slot"), vec![(g + 1) as u8; 64].as_slice());
     }
 }

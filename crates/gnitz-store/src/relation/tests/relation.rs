@@ -14,7 +14,7 @@ fn relation_test_dir(name: &str) -> String {
 
 /// Enter `id` and open its store; returns its relation directory, which
 /// `add_index` also opens its index children under.
-fn register_entry(registry: &mut RelationRegistry, id: i64, schema: SchemaDescriptor, kind: RelationKind) -> String {
+fn register_entry(registry: &mut RelationRegistry, id: u64, schema: SchemaDescriptor, kind: RelationKind) -> String {
     let spec = RelationSpec { id, kind, schema };
     registry.register(spec).unwrap();
     relation_dir(registry.base_dir(), id)
@@ -41,7 +41,9 @@ fn test_add_remove_index_circuit() {
         &[0],
     );
     register_entry(&mut registry, 50, schema, RelationKind::BaseTable);
-    registry.add_index(50, 999, &[2], false).unwrap();
+    registry
+        .add_index(50, IndexClaim::Index { id: 999, unique: false }, &[2])
+        .unwrap();
     assert_eq!(registry.relation(50).unwrap().indexes().len(), 1);
 
     registry.release_index(50, 999);
@@ -56,8 +58,12 @@ fn a_circuit_lives_while_one_claim_remains() {
         &[0],
     );
     register_entry(&mut registry, 50, schema, RelationKind::BaseTable);
-    registry.add_index(50, 70, &[2], false).unwrap();
-    registry.add_index(50, 71, &[2], true).unwrap();
+    registry
+        .add_index(50, IndexClaim::Index { id: 70, unique: false }, &[2])
+        .unwrap();
+    registry
+        .add_index(50, IndexClaim::Index { id: 71, unique: true }, &[2])
+        .unwrap();
     let circuit = |r: &RelationRegistry| r.relation(50).unwrap().index_on(&[2]).map(|ix| ix.is_unique());
     assert_eq!(
         registry.relation(50).unwrap().indexes().len(),
@@ -89,7 +95,9 @@ fn a_master_creates_no_index_directory() {
         &[0],
     );
     let owner_dir = register_entry(&mut registry, 50, schema, RelationKind::BaseTable);
-    registry.add_index(50, 999, &[1], false).unwrap();
+    registry
+        .add_index(50, IndexClaim::Index { id: 999, unique: false }, &[1])
+        .unwrap();
     let index = ChildAddr {
         kind: ChildKind::Index(gnitz_wire::PkColList::from_slice(&[1])),
         slot: Slot::SOLO,
@@ -108,7 +116,9 @@ fn a_flag_clear_arg1_names_no_index() {
         &[0],
     );
     register_entry(&mut registry, 50, schema, RelationKind::BaseTable);
-    registry.add_index(50, 999, &[2], false).unwrap();
+    registry
+        .add_index(50, IndexClaim::Index { id: 999, unique: false }, &[2])
+        .unwrap();
 
     assert!(registry
         .index_cols(50, gnitz_wire::pack_pk_cols(&[2]), "unique pre-flight")
@@ -133,7 +143,9 @@ fn ephemeral_flush_includes_index_circuits() {
         &[0],
     );
     let owner_dir = register_entry(&mut registry, 70, parent_schema, RelationKind::BaseTable);
-    registry.add_index(70, 999, &[1], false).unwrap();
+    registry
+        .add_index(70, IndexClaim::Index { id: 999, unique: false }, &[1])
+        .unwrap();
 
     // Put one row in the index table's memtable.
     {
@@ -173,7 +185,7 @@ fn ephemeral_flush_includes_index_circuits() {
 fn a_fed_view_retains_each_round_at_its_own_weight() {
     let mut registry = solo_registry("fed_view_delta");
     let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
-    let vid = gnitz_wire::FIRST_USER_TABLE_ID as i64;
+    let vid = gnitz_wire::FIRST_USER_TABLE_ID;
     registry
         .register(RelationSpec {
             id: vid,
@@ -245,7 +257,7 @@ fn ingest_apply_error_returned_internal() {
     }
     let mut registry = solo_registry("seam_abort");
     let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
-    let tid = gnitz_wire::FIRST_USER_TABLE_ID as i64;
+    let tid = gnitz_wire::FIRST_USER_TABLE_ID;
     register_entry(&mut registry, tid, schema, RelationKind::View(ViewProps::Plain));
     let mut batch = Batch::with_capacity(&schema, 1);
     batch.extend_pk(1u128);
@@ -274,10 +286,18 @@ fn a_unique_index_covering_the_pk_has_nothing_left_to_check() {
         &[0],
     );
     register_entry(&mut registry, 60, schema, RelationKind::BaseTable);
-    registry.add_index(60, 901, &[0], true).unwrap(); // exactly the PK
-    registry.add_index(60, 902, &[2, 0], true).unwrap(); // the PK plus a payload column
-    registry.add_index(60, 903, &[1], true).unwrap(); // the only real check
-    registry.add_index(60, 904, &[2], false).unwrap(); // not unique at all
+    registry
+        .add_index(60, IndexClaim::Index { id: 901, unique: true }, &[0])
+        .unwrap(); // exactly the PK
+    registry
+        .add_index(60, IndexClaim::Index { id: 902, unique: true }, &[2, 0])
+        .unwrap(); // the PK plus a payload column
+    registry
+        .add_index(60, IndexClaim::Index { id: 903, unique: true }, &[1])
+        .unwrap(); // the only real check
+    registry
+        .add_index(60, IndexClaim::Index { id: 904, unique: false }, &[2])
+        .unwrap(); // not unique at all
 
     let r = registry.relation(60).unwrap();
     let cols: Vec<Vec<u32>> = r
@@ -313,7 +333,7 @@ fn persisted_records_reads_well_formed_relation_manifests() {
     std::fs::create_dir_all(&alias_rows).unwrap();
     std::fs::copy(rows.manifest(&good_dir), rows.manifest(&alias)).unwrap();
 
-    let records: Vec<(i64, Vec<u8>)> = registry
+    let records: Vec<(u64, Vec<u8>)> = registry
         .persisted_records()
         .unwrap()
         .into_iter()

@@ -28,5 +28,5 @@ pub trait SkeletonHydrator {
     /// Every row of `view_id` at `keys` — flat OPK images at the view's
     /// `pk_stride`, strictly ascending, each held by the view's store as a skeleton
     /// row — consolidated, each key's weights summing to its skeleton row's weight.
-    fn hydrate_keys(&mut self, registry: &RelationRegistry, view_id: i64, keys: Vec<u8>) -> Result<Batch, StoreError>;
+    fn hydrate_keys(&mut self, registry: &RelationRegistry, view_id: u64, keys: Vec<u8>) -> Result<Batch, StoreError>;
 }

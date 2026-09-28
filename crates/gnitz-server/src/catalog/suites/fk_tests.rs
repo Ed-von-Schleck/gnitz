@@ -3,8 +3,8 @@ use super::*;
 // ── test_fk_lock_set ─────────────────────────────────────────────────
 
 /// `tid`'s lock set as `lock_tables_exclusive` acquires it: sorted and deduped.
-fn lock_set(engine: &CatalogEngine, tid: i64) -> Vec<i64> {
-    let mut set: Vec<i64> = engine.fk_lock_set(tid).collect();
+fn lock_set(engine: &CatalogEngine, tid: u64) -> Vec<u64> {
+    let mut set: Vec<u64> = engine.fk_lock_set(tid).collect();
     set.sort_unstable();
     set.dedup();
     set
@@ -86,12 +86,12 @@ fn test_fk_drop_protections() {
             .and_then(|e| e.index_on(&[1]))
             .map(|ix| ix.claims().to_vec())
     };
-    assert_eq!(fk_circuit(&engine), Some(vec![(1, false)]));
+    assert_eq!(fk_circuit(&engine), Some(vec![IndexClaim::ForeignKey]));
 
     // Cannot drop parent (referenced by child), and the refusal leaves the
     // child's circuit in place.
     assert!(engine.drop_table("public.parent").is_err());
-    assert_eq!(fk_circuit(&engine), Some(vec![(1, false)]));
+    assert_eq!(fk_circuit(&engine), Some(vec![IndexClaim::ForeignKey]));
 
     // Drop child first, then parent succeeds
     engine.drop_table("public.child").unwrap();
@@ -393,7 +393,7 @@ fn test_fk_multiple_children_same_parent() {
         .create_table("public.parent", &[col_def("pid", TypeCode::U64)], &[0])
         .unwrap();
 
-    let mk_child = |engine: &mut CatalogEngine, name: &str| -> i64 {
+    let mk_child = |engine: &mut CatalogEngine, name: &str| -> u64 {
         let cols = vec![
             col_def("cid", TypeCode::U64),
             fk_def("fk", TypeCode::U64, parent_tid, 0),

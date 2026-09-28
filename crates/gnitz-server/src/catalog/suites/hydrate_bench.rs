@@ -28,7 +28,7 @@ struct Counting<'a> {
 }
 
 impl SkeletonHydrator for Counting<'_> {
-    fn hydrate_keys(&mut self, registry: &RelationRegistry, view_id: i64, keys: Vec<u8>) -> Result<Batch, StoreError> {
+    fn hydrate_keys(&mut self, registry: &RelationRegistry, view_id: u64, keys: Vec<u8>) -> Result<Batch, StoreError> {
         let out = self.dag.hydrate_keys(registry, view_id, keys)?;
         self.hydrated += out.len();
         Ok(out)
@@ -38,7 +38,7 @@ impl SkeletonHydrator for Counting<'_> {
 /// An identity view over a `ROWS`-row base, bounded at `capacity` bytes and
 /// checkpointed, so the sweep has skeletonized it. Returns the engine, the base and
 /// the view.
-fn bounded_fixture(name: &str, capacity: u64) -> (CatalogEngine, i64, i64) {
+fn bounded_fixture(name: &str, capacity: u64) -> (CatalogEngine, u64, u64) {
     let mut cols = vec![col_def("id", TypeCode::U64)];
     cols.extend((0..PAYLOAD_COLS).map(|c| col_def(&format!("v{c}"), TypeCode::I64)));
     std::env::set_var("GNITZ_RAM_TIER_BYTES", RAM_TIER_BYTES.to_string());
@@ -180,7 +180,7 @@ fn hydrate_filtered_limit_bench() {
 
 /// A `[id, k]` base of `ROWS` rows, `k` a bijective scramble of `id`, so two such
 /// bases join one-to-one on `k`.
-fn join_base(engine: &mut CatalogEngine, name: &str) -> i64 {
+fn join_base(engine: &mut CatalogEngine, name: &str) -> u64 {
     let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
     let tid = engine.create_table(&format!("public.{name}"), &cols, &[0]).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -203,9 +203,9 @@ fn scramble(id: u64) -> u64 {
 struct ProbeFixture {
     engine: CatalogEngine,
     dir: String,
-    join: i64,
-    join_bases: [i64; 2],
-    distinct_base: i64,
+    join: u64,
+    join_bases: [u64; 2],
+    distinct_base: u64,
 }
 
 fn probe_fixture() -> ProbeFixture {
@@ -226,7 +226,7 @@ fn probe_fixture() -> ProbeFixture {
 
     let distinct_base = join_base(&mut engine, "c");
     let mut circuit = gnitz_wire::Circuit::default();
-    let scan = circuit.input_delta(distinct_base as u64, ReadBound::None);
+    let scan = circuit.input_delta(distinct_base, ReadBound::None);
     let distinct = circuit.distinct(scan);
     circuit.sink(distinct);
     let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
@@ -265,7 +265,7 @@ fn print_shards(dir: &str) {
 
 /// One tick of `base` over a one-row push of a fresh `id`, keyed onto an existing
 /// `k` so every probe finds a match; its instructions, ingest excluded.
-fn push_epoch(engine: &mut CatalogEngine, base: i64, id: u64) -> u64 {
+fn push_epoch(engine: &mut CatalogEngine, base: u64, id: u64) -> u64 {
     let schema = engine.registry.relation(base).map(Relation::schema).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(id as u128, 1);

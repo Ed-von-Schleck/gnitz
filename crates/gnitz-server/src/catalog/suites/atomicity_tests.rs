@@ -5,7 +5,7 @@ use std::fs;
 // Helpers (supplement the shared helpers in mod.rs)
 // ---------------------------------------------------------------------------
 
-fn build_schema_tab_row(sid: i64, name: &str) -> Batch {
+fn build_schema_tab_row(sid: u64, name: &str) -> Batch {
     let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
     bb.begin_row(sid as u128, 1);
     bb.put_string(name);
@@ -17,7 +17,7 @@ fn build_schema_tab_row(sid: i64, name: &str) -> Batch {
 /// name/id cache entry, no DAG registration, and no orphaned row in the
 /// family's memtable. `init_rows` is the family's row count taken before the
 /// attempt.
-fn assert_no_relation_residue(engine: &mut CatalogEngine, family: SysFamily, id: i64, qname: &str, init_rows: usize) {
+fn assert_no_relation_residue(engine: &mut CatalogEngine, family: SysFamily, id: u64, qname: &str, init_rows: usize) {
     let noun = family.row_noun();
     assert!(
         !engine.caches.entity_by_qname.contains_key(qname),
@@ -42,10 +42,10 @@ fn assert_no_relation_residue(engine: &mut CatalogEngine, family: SysFamily, id:
 /// Write one column record at an arbitrary `col_idx` — the gap and
 /// out-of-order shapes `col_tab_batch`, which numbers columns by position,
 /// cannot produce.
-fn write_col_at_index(engine: &mut CatalogEngine, owner_id: i64, col_idx: i64, cd: &ColumnDef) -> Result<(), String> {
+fn write_col_at_index(engine: &mut CatalogEngine, owner_id: u64, col_idx: i64, cd: &ColumnDef) -> Result<(), String> {
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
     write_col_tab_row(&mut bb, &cd.col_tab_row(owner_id, col_idx as usize), 1);
-    engine.ingest_to_family(COL_TAB_ID, &bb.finish())
+    engine.ingest_to_family(gnitz_wire::COL_TAB, &bb.finish())
 }
 
 // ---------------------------------------------------------------------------
@@ -67,7 +67,7 @@ fn test_table_tab_no_cols_leaves_clean_state() {
     let tid = engine.allocate_ids(1).unwrap();
     // No column records written — TABLE_TAB ingestion must fail.
     let batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "badtable");
-    let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
+    let result = engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch);
     assert!(result.is_err(), "expected error for TABLE_TAB with no column records");
 
     assert_no_relation_residue(&mut engine, SysFamily::Table, tid, "public.badtable", init_rows);
@@ -92,7 +92,7 @@ fn test_table_tab_invalid_pk_col_type_leaves_clean_state() {
     engine.write_column_records(tid, &cols).unwrap();
 
     let batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "badpktable");
-    let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
+    let result = engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch);
     assert!(
         result.is_err(),
         "expected error for TABLE_TAB with non-pk-eligible PK column"
@@ -121,7 +121,7 @@ fn test_table_tab_dup_name_leaves_clean_state() {
     engine.write_column_records(new_tid, &cols).unwrap();
 
     let batch = build_table_tab_row(new_tid, pack_pk_cols(&[0]), "dupname");
-    let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
+    let result = engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch);
     assert!(
         result.is_err(),
         "expected error: qualified name 'public.dupname' already exists"
@@ -163,7 +163,7 @@ fn test_table_tab_col_contiguity_gap_rejected() {
     write_col_at_index(&mut engine, tid, 2, &col_def("gapped", TypeCode::U64)).unwrap();
 
     let batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "gaptable");
-    let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
+    let result = engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch);
     assert!(
         result.is_err(),
         "expected error for TABLE_TAB with non-contiguous column indices"
@@ -187,7 +187,7 @@ fn test_view_tab_no_cols_leaves_clean_state() {
     let vid = engine.allocate_ids(1).unwrap();
     // No column records for vid.
     let batch = build_view_tab_row(vid, "badview");
-    let result = engine.ingest_to_family(VIEW_TAB_ID, &batch);
+    let result = engine.ingest_to_family(gnitz_wire::VIEW_TAB, &batch);
     assert!(result.is_err(), "expected error for VIEW_TAB with no column records");
 
     assert_no_relation_residue(&mut engine, SysFamily::View, vid, "public.badview", init_rows);
@@ -216,7 +216,7 @@ fn test_view_tab_too_many_cols_rejected() {
     }
     let batch = build_view_tab_row(vid, "wideview");
     let err = engine
-        .ingest_to_family(VIEW_TAB_ID, &batch)
+        .ingest_to_family(gnitz_wire::VIEW_TAB, &batch)
         .expect_err("expected error for over-wide view");
     assert!(
         err.contains("columns") && err.contains("max"),
@@ -248,7 +248,7 @@ fn test_idx_tab_bad_owner_leaves_clean_state() {
         gnitz_wire::IndexProps { is_unique: false },
         1,
     );
-    let result = engine.ingest_to_family(IDX_TAB_ID, &batch);
+    let result = engine.ingest_to_family(gnitz_wire::IDX_TAB, &batch);
     assert!(result.is_err(), "expected error for IDX_TAB with non-existent owner");
 
     assert!(
@@ -287,7 +287,7 @@ fn test_idx_tab_view_owner_rejected() {
         .write_column_records(vid, &[col_def("id", TypeCode::U64)])
         .unwrap();
     let batch = build_view_tab_row(vid, "vowner");
-    engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
+    engine.ingest_to_family(gnitz_wire::VIEW_TAB, &batch).unwrap();
     assert!(engine.registry.has_id(vid), "view registered");
 
     let init_rows = count_records(engine.sys_relation(SysFamily::Index).cursor());
@@ -301,7 +301,7 @@ fn test_idx_tab_view_owner_rejected() {
         1,
     );
     let err = engine
-        .ingest_to_family(IDX_TAB_ID, &batch)
+        .ingest_to_family(gnitz_wire::IDX_TAB, &batch)
         .expect_err("IDX_TAB row naming a view owner must be rejected");
     assert!(
         err.contains("is a view") && err.contains("only a base table can be indexed"),
@@ -354,7 +354,7 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
         gnitz_wire::IndexProps { is_unique: false },
         1,
     );
-    let result = engine.ingest_to_family(IDX_TAB_ID, &batch);
+    let result = engine.ingest_to_family(gnitz_wire::IDX_TAB, &batch);
     assert!(
         result.is_err(),
         "expected error: index name '{orig_name}' already exists"
@@ -401,7 +401,7 @@ fn test_next_id_advances_on_index_register() {
         gnitz_wire::IndexProps { is_unique: false },
         1,
     );
-    engine.ingest_to_family(IDX_TAB_ID, &batch).unwrap();
+    engine.ingest_to_family(gnitz_wire::IDX_TAB, &batch).unwrap();
 
     assert!(
         engine.next_id > large_idx_id,
@@ -421,7 +421,7 @@ fn test_next_id_advances_on_schema_register() {
 
     let large_sid = engine.next_id + 500;
     let batch = build_schema_tab_row(large_sid, "recovered_schema");
-    engine.ingest_to_family(SCHEMA_TAB_ID, &batch).unwrap();
+    engine.ingest_to_family(gnitz_wire::SCHEMA_TAB, &batch).unwrap();
 
     assert!(
         engine.next_id > large_sid,
@@ -489,8 +489,8 @@ fn precheck_rejects_relation_id_at_or_above_ceiling() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     for (label, tid) in [
-        ("at the ceiling", sys_tables::CATALOG_ID_CEILING),
-        ("above the ceiling", sys_tables::CATALOG_ID_CEILING + 4096),
+        ("at the ceiling", gnitz_wire::CATALOG_ID_CEILING),
+        ("above the ceiling", gnitz_wire::CATALOG_ID_CEILING + 4096),
     ] {
         let table_batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "banded");
         let err = engine
@@ -507,7 +507,7 @@ fn precheck_rejects_relation_id_at_or_above_ceiling() {
 
     // A ceiling, not a blanket ban: an ordinary durable id below it still passes
     // this guard (it fails later for unrelated reasons, if at all).
-    let ok_batch = build_table_tab_row(sys_tables::CATALOG_ID_CEILING - 1, pack_pk_cols(&[0]), "just_below");
+    let ok_batch = build_table_tab_row(gnitz_wire::CATALOG_ID_CEILING - 1, pack_pk_cols(&[0]), "just_below");
     let err = engine
         .precheck_family(SysFamily::Table, &ok_batch)
         .err()
@@ -642,7 +642,7 @@ fn two_creates_of_one_name_in_one_batch_rejected() {
         push_table_tab_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "twins", pack_pk_cols(&[0]), 0, 1);
     }
     let err = engine
-        .ingest_to_family(TABLE_TAB_ID, &bb.finish())
+        .ingest_to_family(gnitz_wire::TABLE_TAB, &bb.finish())
         .expect_err("two rows claiming public.twins must be rejected");
     assert!(err.contains("already exists"), "{err}");
 

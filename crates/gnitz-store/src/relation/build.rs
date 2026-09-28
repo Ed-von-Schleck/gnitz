@@ -118,7 +118,7 @@ impl RelationRegistry {
     /// This process's `kind` child store of relation `id`.
     pub(super) fn open_child(
         &self,
-        id: i64,
+        id: u64,
         kind: ChildKind<'_>,
         schema: SchemaDescriptor,
         recovery: RecoverySource,

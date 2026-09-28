@@ -19,8 +19,8 @@ pub(in crate::catalog) fn topology_word(worker_count: u32) -> u64 {
 
 /// The OPK of a U64 system id — also the leading-column prefix of a pair-keyed
 /// family's key. Every system PK column is U64 (asserted beside `SYS_FAMILIES`).
-fn sys_key(id: i64) -> [u8; 8] {
-    (id as u64).to_be_bytes()
+fn sys_key(id: u64) -> [u8; 8] {
+    id.to_be_bytes()
 }
 
 impl CatalogEngine {
@@ -34,13 +34,13 @@ impl CatalogEngine {
     }
 
     /// The live row of single-column-keyed `family` at `id`.
-    pub(in crate::catalog) fn live_sys_row(&self, family: SysFamily, id: i64) -> Option<StoredRow> {
+    pub(in crate::catalog) fn live_sys_row(&self, family: SysFamily, id: u64) -> Option<StoredRow> {
         self.sys_relation(family).live_row_at(&sys_key(id)).1
     }
 
     /// Visit every live row of `family` whose leading key column is `leading`: the
     /// row itself for a single-column key, the owner's whole band for a pair.
-    pub(in crate::catalog) fn for_each_row_under(&self, family: SysFamily, leading: i64, f: impl FnMut(&ReadCursor)) {
+    pub(in crate::catalog) fn for_each_row_under(&self, family: SysFamily, leading: u64, f: impl FnMut(&ReadCursor)) {
         self.sys_relation(family)
             .for_each_positive_with_prefix(&sys_key(leading), f)
     }
@@ -56,7 +56,7 @@ impl CatalogEngine {
 
     /// Column definitions for `owner_id`, in key order. Its records must be keyed
     /// 0,1,2,… with no gap or duplicate: every consumer maps columns positionally.
-    pub(in crate::catalog) fn read_column_defs(&self, owner_id: i64) -> Result<Vec<ColumnDef>, String> {
+    pub(in crate::catalog) fn read_column_defs(&self, owner_id: u64) -> Result<Vec<ColumnDef>, String> {
         let mut defs = Vec::new();
         let mut err = None;
         self.for_each_row_under(SysFamily::Column, owner_id, |c| {
@@ -88,9 +88,9 @@ impl CatalogEngine {
     }
 
     /// The live rows of relation family `family` (Table or View) in schema `sid`.
-    pub(in crate::catalog) fn schema_members(&self, family: SysFamily, sid: i64) -> Batch {
+    pub(in crate::catalog) fn schema_members(&self, family: SysFamily, sid: u64) -> Batch {
         self.sys_rows_where(family, |s, i| {
-            payload_u64(s, i, gnitz_wire::RELTAB_PAY_SCHEMA_ID) as i64 == sid
+            payload_u64(s, i, gnitz_wire::RELTAB_PAY_SCHEMA_ID) == sid
         })
     }
 
@@ -111,9 +111,9 @@ impl CatalogEngine {
     }
 
     /// Allocate `count` contiguous catalog object ids and return the first.
-    pub(crate) fn allocate_ids(&mut self, count: u64) -> Result<i64, String> {
+    pub(crate) fn allocate_ids(&mut self, count: u64) -> Result<u64, String> {
         let base = self.next_id;
-        let last = validated_run_last(base, count, CATALOG_ID_CEILING)
+        let last = validated_run_last(base, count, gnitz_wire::CATALOG_ID_CEILING)
             .ok_or_else(|| format!("id run length {count} is invalid (base {base})"))?;
         self.next_id = last + 1;
         Ok(base)
@@ -121,7 +121,7 @@ impl CatalogEngine {
 
     /// The qualified `(schema, name)` of `table_id` from its live `sys_tables` or
     /// `sys_views` row; `"?"` for a part the catalog has no entry for.
-    pub(crate) fn qualified_name_or_unknown(&self, table_id: i64) -> (String, String) {
+    pub(crate) fn qualified_name_or_unknown(&self, table_id: u64) -> (String, String) {
         let Some(row) = self
             .live_sys_row(SysFamily::Table, table_id)
             .or_else(|| self.live_sys_row(SysFamily::View, table_id))
@@ -129,20 +129,20 @@ impl CatalogEngine {
             return ("?".into(), "?".into());
         };
         let (src, ri) = row.source();
-        let sid = payload_u64(src, ri, gnitz_wire::RELTAB_PAY_SCHEMA_ID) as i64;
+        let sid = payload_u64(src, ri, gnitz_wire::RELTAB_PAY_SCHEMA_ID);
         let schema = self.caches.schema_by_id.get(&sid).map_or("?", String::as_str);
         (schema.to_string(), payload_string(src, ri, gnitz_wire::RELTAB_PAY_NAME))
     }
 
     /// `table_id` as `schema.name`, or `?.?` when the catalog has no entry.
-    pub(crate) fn qualified_name(&self, table_id: i64) -> String {
+    pub(crate) fn qualified_name(&self, table_id: u64) -> String {
         let (schema, name) = self.qualified_name_or_unknown(table_id);
         gnitz_wire::qualified_key(&schema, &name)
     }
 
     /// `table_id`'s column names at `col_indices`, `, `-joined; `?` for one the
     /// catalog does not hold.
-    pub(crate) fn column_names(&self, table_id: i64, col_indices: &[u32]) -> String {
+    pub(crate) fn column_names(&self, table_id: u64, col_indices: &[u32]) -> String {
         let defs = self.read_column_defs(table_id).unwrap_or_default();
         col_indices
             .iter()
@@ -152,7 +152,7 @@ impl CatalogEngine {
     }
 
     /// The entity id registered under a canonical `"schema.relation"` key.
-    pub(crate) fn entity_id_by_qname(&self, qname: &str) -> Option<i64> {
+    pub(crate) fn entity_id_by_qname(&self, qname: &str) -> Option<u64> {
         self.caches.entity_by_qname.get(qname).copied()
     }
 
@@ -169,7 +169,7 @@ impl CatalogEngine {
     }
 
     /// The live value of `_sequences` row `seq_id`, if one is stored.
-    pub(crate) fn sequence_value(&self, seq_id: i64) -> Option<u64> {
+    pub(crate) fn sequence_value(&self, seq_id: u64) -> Option<u64> {
         let row = self.live_sys_row(SysFamily::Sequence, seq_id)?;
         let (src, ri) = row.source();
         Some(payload_u64(src, ri, gnitz_wire::SEQTAB_PAY_VALUE))
@@ -177,7 +177,7 @@ impl CatalogEngine {
 
     /// The delta moving `_sequences` row `seq_id` from its live value to `new`;
     /// empty when it already holds `new`.
-    pub(in crate::catalog) fn sequence_delta(&self, seq_id: i64, new: u64) -> Batch {
+    pub(in crate::catalog) fn sequence_delta(&self, seq_id: u64, new: u64) -> Batch {
         let old = self.sequence_value(seq_id);
         let mut bb = BatchBuilder::new(*SysFamily::Sequence.schema());
         if old != Some(new) {
@@ -192,19 +192,22 @@ impl CatalogEngine {
 
     /// The base of the next `count` SERIAL ids of table `seq_id`, and the
     /// `_sequences` delta recording them.
-    pub(crate) fn reserve_user_sequence(&self, seq_id: i64, count: u64) -> Result<(i64, Batch), String> {
+    pub(crate) fn reserve_user_sequence(&self, seq_id: u64, count: u64) -> Result<(i64, Batch), String> {
         if !self.caches.relations.get(&seq_id).is_some_and(|e| e.facts.serial) {
             return Err(format!("relation {seq_id} is not a SERIAL table"));
         }
         let invalid = || format!("SERIAL range of {count} on sequence {seq_id} is invalid or exhausted");
-        let high_water = i64::try_from(self.sequence_value(seq_id).unwrap_or(0)).map_err(|_| invalid())?;
-        let base = high_water.checked_add(1).ok_or_else(invalid)?;
-        let last = validated_run_last(base, count, i64::MAX).ok_or_else(invalid)?;
-        Ok((base, self.sequence_delta(seq_id, last as u64)))
+        let base = self
+            .sequence_value(seq_id)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(invalid)?;
+        let last = validated_run_last(base, count, i64::MAX as u64).ok_or_else(invalid)?;
+        Ok((base as i64, self.sequence_delta(seq_id, last)))
     }
 
     /// Move `_sequences` row `seq_id` to `value`.
-    fn set_sequence(&mut self, seq_id: i64, value: u64) -> Result<(), String> {
+    fn set_sequence(&mut self, seq_id: u64, value: u64) -> Result<(), String> {
         let delta = self.sequence_delta(seq_id, value);
         self.registry
             .ingest(SysFamily::Sequence.id(), delta)
@@ -214,7 +217,7 @@ impl CatalogEngine {
     /// Write the next catalog id to `_sequences`, then flush every system table
     /// in one barrier.
     pub(crate) fn flush_all_system_tables(&mut self) -> Result<(), String> {
-        self.set_sequence(SEQ_ID_NEXT_ID, self.next_id as u64)?;
+        self.set_sequence(SEQ_ID_NEXT_ID, self.next_id)?;
         Ok(self.registry.checkpoint_system(self.system_zone)?)
     }
 
@@ -222,7 +225,7 @@ impl CatalogEngine {
     /// resume generation from the checkpoint rows beside it.
     pub(in crate::catalog) fn load_sequence_scalars(&mut self) {
         if let Some(v) = self.sequence_value(SEQ_ID_NEXT_ID) {
-            self.next_id = self.next_id.max(v as i64);
+            self.next_id = self.next_id.max(v);
         }
         self.registry.set_resume_generation(self.durable_generation());
     }
@@ -262,11 +265,10 @@ impl CatalogEngine {
 }
 
 /// The last id of a `count`-long run starting at `base`, or `None` if `count`
-/// is zero, doesn't fit an `i64`, overflows against `base`, or reaches `ceiling`.
+/// is zero, overflows against `base`, or reaches `ceiling`.
 #[inline]
-fn validated_run_last(base: i64, count: u64, ceiling: i64) -> Option<i64> {
-    let count = i64::try_from(count).ok().filter(|&c| c > 0)?;
-    let last = base.checked_add(count)?.checked_sub(1)?;
+fn validated_run_last(base: u64, count: u64, ceiling: u64) -> Option<u64> {
+    let last = base.checked_add(count.checked_sub(1)?)?;
     (last < ceiling).then_some(last)
 }
 

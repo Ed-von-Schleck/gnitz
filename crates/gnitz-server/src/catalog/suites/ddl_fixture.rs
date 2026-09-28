@@ -31,7 +31,7 @@ pub(super) fn make_secondary_index_name(schema_name: &str, table_name: &str, col
 impl CatalogEngine {
     /// The id this catalog holds for schema `name`, or `None` when it holds no
     /// such schema.
-    pub(in crate::catalog) fn schema_id(&self, name: &str) -> Option<i64> {
+    pub(in crate::catalog) fn schema_id(&self, name: &str) -> Option<u64> {
         self.caches.schema_by_name.get(name).copied()
     }
 
@@ -44,7 +44,7 @@ impl CatalogEngine {
         }
     }
 
-    pub(in crate::catalog) fn get_by_name(&self, schema_name: &str, table_name: &str) -> Option<i64> {
+    pub(in crate::catalog) fn get_by_name(&self, schema_name: &str, table_name: &str) -> Option<u64> {
         self.entity_id_by_qname(&gnitz_wire::qualified_key(schema_name, table_name))
     }
 
@@ -53,16 +53,16 @@ impl CatalogEngine {
     }
 
     /// The ids of the live `sys_indices` rows `owner` owns.
-    pub(super) fn index_ids_of(&self, owner: i64) -> Vec<i64> {
+    pub(super) fn index_ids_of(&self, owner: u64) -> Vec<u64> {
         let rows = self.sys_rows_where(SysFamily::Index, |s, i| {
-            payload_u64(s, i, gnitz_wire::IDXTAB_PAY_OWNER_ID) as i64 == owner
+            payload_u64(s, i, gnitz_wire::IDXTAB_PAY_OWNER_ID) == owner
         });
-        (0..rows.len()).map(|i| rows.get_pk(i) as i64).collect()
+        (0..rows.len()).map(|i| rows.get_pk(i) as u64).collect()
     }
 
     /// Retract the live row at `id` in `family` through `submit`, which expands the
     /// drop cascade.
-    pub(super) fn submit_retraction(&mut self, family: SysFamily, id: i64) -> Result<(), String> {
+    pub(super) fn submit_retraction(&mut self, family: SysFamily, id: u64) -> Result<(), String> {
         let batch = self.retract_under(family, &[id]);
         if batch.is_empty() {
             return Err("Entity does not exist in catalog".into());
@@ -82,7 +82,7 @@ impl CatalogEngine {
         // Write schema record
         let schema = SysFamily::Schema.schema();
         let mut bb = BatchBuilder::new(*schema);
-        write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id: sid as u64, name }, 1);
+        write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id: sid, name }, 1);
         let batch = bb.finish();
 
         // Submit the schemas-family delta (triggers hook).
@@ -110,7 +110,7 @@ impl CatalogEngine {
         for family in [SysFamily::View, SysFamily::Table] {
             let members = self.schema_members(family, sid);
             for i in 0..members.len() {
-                self.submit_retraction(family, members.get_pk(i) as i64)?;
+                self.submit_retraction(family, members.get_pk(i) as u64)?;
             }
         }
 
@@ -128,12 +128,12 @@ impl CatalogEngine {
         qualified_name: &str,
         col_defs: &[ColumnDef],
         pk_cols: &[u32],
-    ) -> Result<i64, String> {
+    ) -> Result<u64, String> {
         self.create_table_with(qualified_name, col_defs, pk_cols, gnitz_wire::TableProps::default())
     }
 
     /// A SERIAL table `(id U64 PRIMARY KEY)`.
-    pub(crate) fn create_serial_table(&mut self, qualified_name: &str) -> Result<i64, String> {
+    pub(crate) fn create_serial_table(&mut self, qualified_name: &str) -> Result<u64, String> {
         let serial = gnitz_wire::TableProps { serial: true, ..Default::default() };
         self.create_table_with(
             qualified_name,
@@ -150,7 +150,7 @@ impl CatalogEngine {
         col_defs: &[ColumnDef],
         pk_cols: &[u32],
         props: gnitz_wire::TableProps,
-    ) -> Result<i64, String> {
+    ) -> Result<u64, String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_name, "public");
         let raw_pk_cols = pack_pk_cols(pk_cols);
 
@@ -216,7 +216,7 @@ impl CatalogEngine {
         qualified_owner: &str,
         col_names: &[&str],
         is_unique: bool,
-    ) -> Result<i64, String> {
+    ) -> Result<u64, String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_owner, "public");
         let qualified = format!("{schema_name}.{table_name}");
         let owner_id = *self
@@ -276,15 +276,15 @@ impl CatalogEngine {
 
     // -- Write helpers for system tables -----------------------------------
 
-    pub(crate) fn write_column_records(&mut self, owner_id: i64, col_defs: &[ColumnDef]) -> Result<(), String> {
+    pub(crate) fn write_column_records(&mut self, owner_id: u64, col_defs: &[ColumnDef]) -> Result<(), String> {
         let batch = col_tab_batch(owner_id, col_defs, 1);
         self.submit(SysFamily::Column, batch)
     }
 
     /// Ingest into any relation by raw id: a system family through
     /// [`CatalogEngine::submit`], a user table through the registry's DML path.
-    pub(in crate::catalog) fn ingest_to_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
-        if table_id < FIRST_USER_TABLE_ID {
+    pub(in crate::catalog) fn ingest_to_family(&mut self, table_id: u64, batch: &Batch) -> Result<(), String> {
+        if table_id < gnitz_wire::FIRST_USER_TABLE_ID {
             let family = SysFamily::from_id(table_id).ok_or_else(|| format!("Unknown system family {table_id}"))?;
             self.submit(family, batch.clone())
         } else {
@@ -301,8 +301,8 @@ impl CatalogEngine {
     /// counter past `tid`, so a later engine-side allocation cannot collide.
     pub(crate) fn register_table(
         &mut self,
-        tid: i64,
-        schema_id: i64,
+        tid: u64,
+        schema_id: u64,
         name: &str,
         cols: &[ColumnDef],
         pk: &[u32],

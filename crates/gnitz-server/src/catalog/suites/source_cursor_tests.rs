@@ -14,7 +14,7 @@ const NBASE: u64 = 200;
 /// A `(id U64 PK | val I64)` base of `NBASE` rows with `val = val_of(id)`,
 /// indexed on `val`, plus a registered identity view carrying `bound`. Returns
 /// `(engine, base tid, view id)`.
-fn fixture_with(name: &str, bound: Option<KeyRange>, val_of: impl Fn(u64) -> u64) -> (CatalogEngine, i64, i64) {
+fn fixture_with(name: &str, bound: Option<KeyRange>, val_of: impl Fn(u64) -> u64) -> (CatalogEngine, u64, u64) {
     let dir = temp_dir(name);
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
@@ -35,12 +35,12 @@ fn fixture_with(name: &str, bound: Option<KeyRange>, val_of: impl Fn(u64) -> u64
     write_identity_circuit(&mut engine, vid, tid, bound);
     engine.write_column_records(vid, &cols).unwrap();
     let batch = build_view_tab_row(vid, "v_base");
-    engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
+    engine.ingest_to_family(gnitz_wire::VIEW_TAB, &batch).unwrap();
     (engine, tid, vid)
 }
 
 /// [`fixture_with`] at `val = id * 10` — correlated, the default shape.
-fn fixture(name: &str, bound: Option<KeyRange>) -> (CatalogEngine, i64, i64) {
+fn fixture(name: &str, bound: Option<KeyRange>) -> (CatalogEngine, u64, u64) {
     fixture_with(name, bound, |i| i * 10)
 }
 
@@ -51,7 +51,7 @@ fn fixture(name: &str, bound: Option<KeyRange>) -> (CatalogEngine, i64, i64) {
 /// cursor, and the next chunk's first probe is a lower id — a backward re-seek
 /// from an invalid cursor, which `val = id * 10` (strictly monotone in the PK)
 /// can never produce.
-fn anticorrelated_fixture(name: &str, bound: Option<KeyRange>) -> (CatalogEngine, i64, i64) {
+fn anticorrelated_fixture(name: &str, bound: Option<KeyRange>) -> (CatalogEngine, u64, u64) {
     fixture_with(name, bound, |i| (NBASE - i) * 10)
 }
 
@@ -81,7 +81,7 @@ fn drain_all(cur: &mut SourceCursor, chunk: usize) -> Vec<(u128, i64)> {
 
 /// The full-scan drain of `source`, as the reference every bounded drain is
 /// compared against.
-fn full_drain(engine: &mut CatalogEngine, source: i64) -> Vec<(u128, i64)> {
+fn full_drain(engine: &mut CatalogEngine, source: u64) -> Vec<(u128, i64)> {
     let mut cur = SourceCursor::Full(Box::new(engine.registry.relation(source).map(|r| r.cursor()).unwrap()));
     drain_all(&mut cur, 64)
 }

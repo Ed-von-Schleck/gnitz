@@ -296,19 +296,16 @@ impl MirrorState {
 /// One poll's per-view outcomes, `(view id, that view's own result)`.
 type ViewPollResults = Vec<(u64, Result<PollResult, ClientError>)>;
 
-/// A whole request failed: its first unanswered view gets `cause`, each later
-/// one a copy of it.
+/// Every unanswered view of the request fails with `cause`.
 fn fail_range(
     applied: &mut ViewPollResults,
     views: &[(DeltaCursor, DeltaPollItem)],
     unanswered: Range<usize>,
     cause: ClientError,
 ) {
-    let mut ids = unanswered.map(|i| views[i].1.view_id);
-    let Some(first) = ids.next() else { return };
-    let later: Vec<_> = ids.map(|tid| (tid, Err(cause.clone()))).collect();
-    applied.push((first, Err(cause)));
-    applied.extend(later);
+    for i in unanswered {
+        applied.push((views[i].1.view_id, Err(cause.clone())));
+    }
 }
 
 /// A mirror verb on a client that never attached a store. The message names no

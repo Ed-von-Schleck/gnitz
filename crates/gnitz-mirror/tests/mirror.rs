@@ -22,7 +22,7 @@ use gnitz_mirror::Mirror;
 use gnitz_sql::GnitzSqlError;
 use gnitz_store_testkit::{assert_child_ok, run_test_in_child, CHILD_OK};
 use gnitz_test_harness::ServerHandle;
-use support::copy_paths::{copy_dir, has_manifest, manifest_path};
+use support::common::{copy_dir, has_manifest, manifest_path};
 use support::{assert_same_sequence, assert_same_zset, canonical, query, serial, sql, EnvVar};
 
 /// Four workers, because that is the only count that exercises the fan-out.

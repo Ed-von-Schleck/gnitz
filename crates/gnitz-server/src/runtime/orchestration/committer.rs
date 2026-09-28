@@ -96,7 +96,7 @@ pub enum BarrierKind {
 /// One buffered single push awaiting commit. `done` resolves to `Ok(zone_lsn)` or
 /// `Err(error_message)`.
 pub struct PendingPush {
-    pub tid: i64,
+    pub tid: u64,
     pub batch: Batch,
     /// Whether these rows are something a restart must recover, i.e. whether this
     /// group may join the zone the commit and fdatasync close. False only for a
@@ -307,7 +307,7 @@ async fn await_servicing<T>(
 /// One single-tid SAL group: a merged run of single pushes, or one transaction
 /// family.
 struct GroupInfo {
-    tid: i64,
+    tid: u64,
     /// See `CommitRequest::Push::recoverable`. A merged run is homogeneous in
     /// `tid`, so one flag per group is exact.
     recoverable: bool,

@@ -29,7 +29,7 @@ fn wide_val_batch(schema: &SchemaDescriptor, rows: &[([u8; 24], u64, i64)]) -> B
 /// Register a wide-PK table owning a UNIQUE secondary index on col 3, seeded
 /// with `base_rows`. Bypasses `create_table`'s stride gate and
 /// `ingest_to_family`, so it does not exercise the enforcement path.
-fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, base_rows: &[([u8; 24], u64, i64)]) {
+fn setup_wide_unique(engine: &mut CatalogEngine, tid: u64, base_rows: &[([u8; 24], u64, i64)]) {
     let schema = wide_unique_schema();
     engine
         .registry
@@ -39,7 +39,10 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, base_rows: &[([u8; 24
             schema,
         })
         .unwrap();
-    engine.registry.add_index(tid, tid + 1, &[3], true).unwrap();
+    engine
+        .registry
+        .add_index(tid, IndexClaim::Index { id: tid + 1, unique: true }, &[3])
+        .unwrap();
     // The registry projects the index itself, from the same `key_spec` and index
     // schema a hand-written projection would use.
     engine.registry.ingest(tid, wide_val_batch(&schema, base_rows)).unwrap();

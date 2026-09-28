@@ -12,7 +12,7 @@ use gnitz_wire::IDXTAB_PAY_NAME;
 use std::path::Path;
 
 /// A one-row SCHEMA_TAB batch (the family's only payload column is the name).
-fn schema_tab_batch(sid: i64, weight: i64, name: &str) -> Batch {
+fn schema_tab_batch(sid: u64, weight: i64, name: &str) -> Batch {
     let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
     bb.begin_row(sid as u128, weight);
     bb.put_string(name);
@@ -25,13 +25,13 @@ fn schema_tab_batch(sid: i64, weight: i64, name: &str) -> Batch {
 /// positional `.2` makes silently easy to get wrong.
 #[derive(Clone)]
 struct IdxRow {
-    owner_id: i64,
+    owner_id: u64,
     source_cols: u64,
     name: String,
     props: gnitz_wire::IndexProps,
 }
 
-fn live_index_row(engine: &CatalogEngine, idx_id: i64) -> IdxRow {
+fn live_index_row(engine: &CatalogEngine, idx_id: u64) -> IdxRow {
     let sr = engine
         .live_sys_row(SysFamily::Index, idx_id)
         .unwrap_or_else(|| panic!("live IDX_TAB row for index {idx_id} missing"));
@@ -52,7 +52,7 @@ fn live_index_row(engine: &CatalogEngine, idx_id: i64) -> IdxRow {
 
 /// A one-row IDX_TAB batch at `weight` reproducing `row` — what a client's
 /// read-then-push drop helper builds.
-fn idx_row_batch(idx_id: i64, weight: i64, row: &IdxRow) -> Batch {
+fn idx_row_batch(idx_id: u64, weight: i64, row: &IdxRow) -> Batch {
     idx_tab_batch(idx_id, row.owner_id, row.source_cols, &row.name, row.props, weight)
 }
 
@@ -78,7 +78,7 @@ fn stale_schema_retraction_spares_the_live_schemas_directory() {
     assert!(Path::new(&tbl_dir).exists());
 
     let err = engine
-        .ingest_to_family(SCHEMA_TAB_ID, &schema_tab_batch(old_sid, -1, "s"))
+        .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_tab_batch(old_sid, -1, "s"))
         .unwrap_err();
     assert!(
         err.contains("catalog changed concurrently"),
@@ -112,7 +112,7 @@ fn schema_retraction_under_another_schemas_name_rejected() {
     let b_dir = relation_dir(&dir, tid);
 
     let err = engine
-        .ingest_to_family(SCHEMA_TAB_ID, &schema_tab_batch(sid_a, -1, "b"))
+        .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_tab_batch(sid_a, -1, "b"))
         .unwrap_err();
     assert!(
         err.contains("catalog changed concurrently"),
@@ -171,7 +171,7 @@ fn stale_index_retraction_leaves_no_ghost_row() {
     engine.drop_index(&row.name).unwrap();
 
     let err = engine
-        .ingest_to_family(IDX_TAB_ID, &idx_row_batch(idx, -1, &row))
+        .ingest_to_family(gnitz_wire::IDX_TAB, &idx_row_batch(idx, -1, &row))
         .unwrap_err();
     assert!(
         err.contains("catalog changed concurrently"),
@@ -203,7 +203,7 @@ fn stale_index_retraction_after_recreate_keeps_the_live_index_nameable() {
     assert_ne!(idx1, idx2, "the recreate must allocate a fresh index id");
 
     let err = engine
-        .ingest_to_family(IDX_TAB_ID, &idx_row_batch(idx1, -1, &row1))
+        .ingest_to_family(gnitz_wire::IDX_TAB, &idx_row_batch(idx1, -1, &row1))
         .unwrap_err();
     assert!(
         err.contains("catalog changed concurrently"),
@@ -244,7 +244,7 @@ fn index_retraction_under_another_indexs_name_rejected() {
     let mut mismatched = row1.clone();
     mismatched.name = row2.name.clone();
     let err = engine
-        .ingest_to_family(IDX_TAB_ID, &idx_row_batch(i1, -1, &mismatched))
+        .ingest_to_family(gnitz_wire::IDX_TAB, &idx_row_batch(i1, -1, &mismatched))
         .unwrap_err();
     assert!(
         err.contains("catalog changed concurrently"),
@@ -272,7 +272,7 @@ fn duplicate_live_head_rejected_for_index_and_schema() {
     let idx = engine.create_index("public.t", &["val"], false).unwrap();
     let row = live_index_row(&engine, idx);
     let err = engine
-        .ingest_to_family(IDX_TAB_ID, &idx_row_batch(idx, 1, &row))
+        .ingest_to_family(gnitz_wire::IDX_TAB, &idx_row_batch(idx, 1, &row))
         .unwrap_err();
     assert!(
         err.contains("net weight 2"),
@@ -283,7 +283,7 @@ fn duplicate_live_head_rejected_for_index_and_schema() {
     engine.create_schema("s").unwrap();
     let sid = engine.schema_id("s").expect("the schema exists");
     let err = engine
-        .ingest_to_family(SCHEMA_TAB_ID, &schema_tab_batch(sid, 1, "s"))
+        .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_tab_batch(sid, 1, "s"))
         .unwrap_err();
     assert!(
         err.contains("net weight 2"),

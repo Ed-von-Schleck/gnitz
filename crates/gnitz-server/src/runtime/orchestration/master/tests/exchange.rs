@@ -9,12 +9,12 @@ fn u64_pk_only() -> SchemaDescriptor {
 }
 
 /// An exchange frame's control header, as a worker stamps it.
-fn control(view_id: i64, source_id: i64, flags: WireFlags) -> DecodedControl {
+fn control(view_id: u64, source_id: u64, flags: WireFlags) -> DecodedControl {
     DecodedControl {
         hdr: ControlHeader {
-            target_id: view_id as u64,
+            target_id: view_id,
             flags,
-            arg0: source_id as u64,
+            arg0: source_id,
             ..Default::default()
         },
         blob: 0..0,
@@ -27,7 +27,7 @@ fn control(view_id: i64, source_id: i64, flags: WireFlags) -> DecodedControl {
 /// One worker's TERMINAL exchange frame — the whole report when the partition
 /// fits one frame. `drained` is the worker's drained bit (steady-state exchanges
 /// leave it clear).
-fn make_wire(view_id: i64, source_id: i64, drained: bool) -> DecodedWire {
+fn make_wire(view_id: u64, source_id: u64, drained: bool) -> DecodedWire {
     DecodedWire {
         control: control(
             view_id,
@@ -59,7 +59,7 @@ fn chunk(keys: &[u64]) -> Batch {
 /// One frame of a worker's exchange train, carrying `keys`. Every frame carries
 /// the schema block (the ring decode takes no hint) and its own layout claim;
 /// only the terminal one carries the round's bookkeeping.
-fn make_frame(view_id: i64, source_id: i64, keys: &[u64], last: bool) -> DecodedWire {
+fn make_frame(view_id: u64, source_id: u64, keys: &[u64], last: bool) -> DecodedWire {
     DecodedWire {
         control: control(
             view_id,

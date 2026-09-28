@@ -385,10 +385,6 @@ pub const FIRST_USER_SCHEMA_ID: u64 = 3;
 /// A tripwire on catalog object-id allocation, not a live limit: reaching it
 /// needs 2^31 durable CREATEs. Schema, relation and index ids all live below it,
 /// and the engine rejects any id at or above it where one enters the catalog.
-///
-/// A relation id narrows to a `u32` at every physical boundary (the SAL group
-/// header, a store's `table_id`, a wire batch, a shard file name). `1<<31` sits
-/// short of that ceiling, so an id below it round-trips all of them exactly.
 pub const CATALOG_ID_CEILING: u64 = 1 << 31;
 
 // ---------------------------------------------------------------------------

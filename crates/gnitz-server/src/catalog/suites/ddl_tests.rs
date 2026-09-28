@@ -100,7 +100,7 @@ fn assert_self_description(engine: &CatalogEngine) {
     // added later is covered without touching this test.
     for family in SysFamily::ALL {
         let mut rows = described
-            .remove(&(family.id() as u64))
+            .remove(&{ family.id() })
             .unwrap_or_else(|| panic!("family {} describes no columns", family.name()));
         rows.sort_by_key(|(idx, _)| *idx);
         let names: Vec<&str> = rows.iter().map(|(_, n)| n.as_str()).collect();
@@ -533,7 +533,7 @@ fn test_hook_relation_register_rejects_malformed_pk() {
 
     let mut assert_rejects = |raw_pk_cols: u64, snippet: &str| {
         let batch = build_table_tab_row(tid, raw_pk_cols, "bad_table");
-        let res = engine.ingest_to_family(TABLE_TAB_ID, &batch);
+        let res = engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch);
         let err = res.expect_err(&format!("expected Err containing '{snippet}', got Ok"));
         assert!(err.contains(snippet), "expected '{snippet}', got: {err}");
     };
@@ -643,7 +643,7 @@ fn test_drop_view_removes_directory() {
     engine.write_column_records(vid, &view_cols).unwrap();
 
     let batch = build_view_tab_row(vid, "myview");
-    engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
+    engine.ingest_to_family(gnitz_wire::VIEW_TAB, &batch).unwrap();
 
     // The register hook created the physical view directory on disk.
     let view_dir = relation_dir(&dir, vid);
@@ -694,7 +694,7 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
     engine.write_column_records(vid, &view_cols).unwrap();
 
     let batch = build_view_tab_row(vid, "depview");
-    engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
+    engine.ingest_to_family(gnitz_wire::VIEW_TAB, &batch).unwrap();
 
     assert!(
         count_records(engine.sys_relation(SysFamily::Column).cursor()) > base_cols,
@@ -784,12 +784,15 @@ fn drop_cascade_broadcasts_index_owner_columns_in_order() {
     engine.submit_retraction(SysFamily::Table, tid).unwrap();
 
     // Collect the broadcast family-id sequence.
-    let tids: Vec<i64> = engine.drain_pending_broadcasts().iter().map(|(f, _)| f.id()).collect();
+    let tids: Vec<u64> = engine.drain_pending_broadcasts().iter().map(|(f, _)| f.id()).collect();
 
-    let pos = |id: i64| tids.iter().position(|&t| t == id);
-    let idx_pos = pos(IDX_TAB_ID).unwrap_or_else(|| panic!("IDX_TAB retraction must be broadcast; seq={tids:?}"));
-    let col_pos = pos(COL_TAB_ID).unwrap_or_else(|| panic!("COL_TAB retraction must be broadcast; seq={tids:?}"));
-    let tab_pos = pos(TABLE_TAB_ID).unwrap_or_else(|| panic!("TABLE_TAB retraction must be broadcast; seq={tids:?}"));
+    let pos = |id: u64| tids.iter().position(|&t| t == id);
+    let idx_pos =
+        pos(gnitz_wire::IDX_TAB).unwrap_or_else(|| panic!("IDX_TAB retraction must be broadcast; seq={tids:?}"));
+    let col_pos =
+        pos(gnitz_wire::COL_TAB).unwrap_or_else(|| panic!("COL_TAB retraction must be broadcast; seq={tids:?}"));
+    let tab_pos =
+        pos(gnitz_wire::TABLE_TAB).unwrap_or_else(|| panic!("TABLE_TAB retraction must be broadcast; seq={tids:?}"));
 
     assert!(
         idx_pos < tab_pos,
@@ -892,10 +895,10 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     ] {
         push_view_tab_row(&mut bb, 1, vid, name, 0, 0, 0);
     }
-    engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
+    engine.ingest_to_family(gnitz_wire::VIEW_TAB, &bb.finish()).unwrap();
 
     // Whether a registered relation is stamped replicated.
-    let stamp = |e: &mut CatalogEngine, id: i64| e.registry.relation_or_err(id).expect("registered").is_replicated();
+    let stamp = |e: &mut CatalogEngine, id: u64| e.registry.relation_or_err(id).expect("registered").is_replicated();
     let assert_stamps = |e: &mut CatalogEngine, when: &str| {
         assert!(stamp(e, rt), "replicated base table ({when})");
         assert!(stamp(e, r_producer), "view over a replicated table ({when})");
@@ -1046,7 +1049,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
         engine.write_column_records(tid, &col_defs).unwrap();
         let batch = build_table_tab_row_flags(tid, pack_pk_cols(&[0]), name, flags);
         let err = engine
-            .ingest_to_family(TABLE_TAB_ID, &batch)
+            .ingest_to_family(gnitz_wire::TABLE_TAB, &batch)
             .expect_err("a duplicate visible column name must be refused");
         assert!(err.contains("duplicate column name"), "{name}: {err}");
     }
@@ -1063,7 +1066,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
     let tid = engine.allocate_ids(1).unwrap();
     engine.write_column_records(tid, &col_defs).unwrap();
     let batch = build_table_tab_row_flags(tid, pack_pk_cols(&[0]), "hidden_dup", 0);
-    engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
+    engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch).unwrap();
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -1098,12 +1101,12 @@ fn set_based_table_drop_queues_one_batch_per_family() {
 
 /// Register view `V` over a fresh base table, then segment `S` whose VIEW_TAB
 /// row names `V` as its owner. Returns `(V, S)`.
-fn view_with_segment(engine: &mut CatalogEngine) -> (i64, i64) {
+fn view_with_segment(engine: &mut CatalogEngine) -> (u64, u64) {
     let base = engine
         .create_table("public.base", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
     let cols = vec![col_def("id", TypeCode::U64)];
-    let register = |engine: &mut CatalogEngine, name: &str, owner: i64| {
+    let register = |engine: &mut CatalogEngine, name: &str, owner: u64| {
         let vid = engine.next_id;
         write_identity_circuit(engine, vid, base, gnitz_wire::ReadBound::None);
         engine.write_column_records(vid, &cols).unwrap();

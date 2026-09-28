@@ -9,7 +9,7 @@ use gnitz_store::storage::StoreError;
 use gnitz_wire::ViewProps;
 
 /// The view id every plan below is compiled for.
-pub(in crate::query) const VIEW_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
+pub(in crate::query) const VIEW_ID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
 
 /// A registry over the base directory `dir` holding one view, whose output store
 /// `CircuitState::open` reads its recovery policy from.

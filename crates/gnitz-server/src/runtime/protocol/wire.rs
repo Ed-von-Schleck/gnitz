@@ -22,7 +22,7 @@ pub(crate) fn oversized_frame_message(sz: usize) -> String {
 pub(crate) struct WireSchema {
     /// The relation id, as the catalog keys it. Narrowing to the block's and the
     /// frame's widths happens here and nowhere else.
-    tid: i64,
+    tid: u64,
     descriptor: SchemaDescriptor,
     block: Rc<[u8]>,
 }
@@ -30,7 +30,7 @@ pub(crate) struct WireSchema {
 impl WireSchema {
     /// A one-off **anonymous** block, encoded here from `descriptor` and cached
     /// nowhere: the only option for a schema no catalog entry describes.
-    pub(crate) fn encoded(tid: i64, descriptor: SchemaDescriptor) -> Self {
+    pub(crate) fn encoded(tid: u64, descriptor: SchemaDescriptor) -> Self {
         WireSchema {
             tid,
             block: Rc::from(encode_schema_block(&descriptor)),
@@ -39,7 +39,7 @@ impl WireSchema {
     }
 
     /// `tid`'s registry descriptor and its catalog entry's *named* block.
-    pub(crate) fn from_catalog(cat: &crate::catalog::CatalogEngine, tid: i64) -> Self {
+    pub(crate) fn from_catalog(cat: &crate::catalog::CatalogEngine, tid: u64) -> Self {
         let descriptor = cat
             .registry
             .relation(tid)
@@ -63,7 +63,7 @@ impl WireSchema {
     /// the caller's own header fields kept.
     pub(crate) fn frame<'a>(&'a self, rest: WireMsg<'a>) -> WireMsg<'a> {
         WireMsg {
-            target_id: self.tid as u64,
+            target_id: self.tid,
             schema_block: Some(&self.block),
             ..rest
         }
@@ -260,10 +260,10 @@ pub fn decode_client_frame(
 /// Decode one SAL slot; `known` is asked with the slot's target id.
 pub fn decode_sal_slot(
     data: &[u8],
-    known: impl FnOnce(i64, &[u8]) -> Option<SchemaDescriptor>,
+    known: impl FnOnce(u64, &[u8]) -> Option<SchemaDescriptor>,
 ) -> Result<DecodedWire, String> {
     let control = peek_control_block(data)?;
-    let tid = control.hdr.target_id as i64;
+    let tid = control.hdr.target_id;
     let mut decoded = decode_frame(
         data,
         control,

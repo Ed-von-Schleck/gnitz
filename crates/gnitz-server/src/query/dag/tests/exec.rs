@@ -13,7 +13,7 @@ fn view_cols() -> Vec<ColumnDef> {
 }
 
 /// A base table `(id U64 PK, v I64)` in a fresh catalog.
-fn engine_with_base(name: &str) -> (CatalogEngine, i64) {
+fn engine_with_base(name: &str) -> (CatalogEngine, u64) {
     let mut engine = CatalogEngine::open(&scratch_dir("dag_exec", name), 1).unwrap();
     let base = engine.create_table("public.base", &view_cols(), &[0]).unwrap();
     (engine, base)
@@ -21,7 +21,7 @@ fn engine_with_base(name: &str) -> (CatalogEngine, i64) {
 
 /// [`engine_with_base`] plus `base → {va, vb}` and `va → vdeep`: a two-wide
 /// fan-out and a second rung over one of its arms.
-fn engine_with_fanout(name: &str) -> (CatalogEngine, i64, i64, i64, i64) {
+fn engine_with_fanout(name: &str) -> (CatalogEngine, u64, u64, u64, u64) {
     let (mut engine, base) = engine_with_base(name);
     let cols = view_cols();
     let a = register_identity_view(&mut engine, base, "va", &cols);
@@ -31,7 +31,7 @@ fn engine_with_fanout(name: &str) -> (CatalogEngine, i64, i64, i64, i64) {
 }
 
 /// `(pk, weight, payload)` rows in `tid`'s own registered schema.
-fn delta_for(engine: &CatalogEngine, tid: i64, rows: &[(u64, i64, i64)]) -> Batch {
+fn delta_for(engine: &CatalogEngine, tid: u64, rows: &[(u64, i64, i64)]) -> Batch {
     let schema = engine
         .registry
         .relation(tid)
@@ -41,7 +41,7 @@ fn delta_for(engine: &CatalogEngine, tid: i64, rows: &[(u64, i64, i64)]) -> Batc
 }
 
 /// The net weight a relation's own store holds.
-fn live_weight(engine: &CatalogEngine, tid: i64) -> i64 {
+fn live_weight(engine: &CatalogEngine, tid: u64) -> i64 {
     sum_weights(
         engine
             .registry
@@ -110,8 +110,8 @@ fn a_two_producer_view_feeds_its_reader_the_union() {
     let a = register_identity_view(&mut engine, base, "va", &cols);
     let b = register_identity_view(&mut engine, base, "vb", &cols);
     let mut circuit = gnitz_wire::Circuit::default();
-    let left = circuit.input_delta(a as u64, gnitz_wire::ReadBound::None);
-    let right = circuit.input_delta(b as u64, gnitz_wire::ReadBound::None);
+    let left = circuit.input_delta(a, gnitz_wire::ReadBound::None);
+    let right = circuit.input_delta(b, gnitz_wire::ReadBound::None);
     let merged = circuit.union(left, right);
     circuit.sink(merged);
     let u = try_register_view(&mut engine, circuit, "vu", &cols, 0, 0).unwrap();
@@ -170,7 +170,7 @@ impl DriveHost for Recorder<'_> {
         (&mut self.cat.dag, &mut self.cat.registry)
     }
 
-    fn exchange(&mut self, _view_id: i64, batch: Batch, _key: i64) -> Batch {
+    fn exchange(&mut self, _view_id: u64, batch: Batch, _key: u64) -> Batch {
         self.sent.push(batch.len());
         batch
     }
@@ -244,7 +244,7 @@ fn cols_of(schema: &gnitz_store::schema::SchemaDescriptor) -> Vec<ColumnDef> {
 
 /// [`engine_with_fanout`] plus a `Unary` plan (GROUP BY) and a `Pair` plan
 /// (UNION ALL of two exchanged scans) over the base.
-fn engine_with_every_plan_shape(name: &str) -> (CatalogEngine, i64, i64) {
+fn engine_with_every_plan_shape(name: &str) -> (CatalogEngine, u64, u64) {
     let (mut engine, base, a, ..) = engine_with_fanout(name);
     let base_schema = engine.registry.relation(base).map(Relation::schema).unwrap();
 
@@ -254,14 +254,14 @@ fn engine_with_every_plan_shape(name: &str) -> (CatalogEngine, i64, i64) {
         .shape
         .output_schema;
     let mut circuit = gnitz_wire::Circuit::default();
-    let scan = circuit.input_delta(base as u64, gnitz_wire::ReadBound::None);
+    let scan = circuit.input_delta(base, gnitz_wire::ReadBound::None);
     let reduced = circuit.reduce_multi(scan, &group, &aggs, false);
     circuit.sink(reduced);
     try_register_view(&mut engine, circuit, "vgroup", &cols_of(&grouped), 0, 0).unwrap();
 
     let mut circuit = gnitz_wire::Circuit::default();
     let sides = [0, 1].map(|_| {
-        let scan = circuit.input_delta(base as u64, gnitz_wire::ReadBound::None);
+        let scan = circuit.input_delta(base, gnitz_wire::ReadBound::None);
         circuit.shard(scan, &[0])
     });
     let merged = circuit.union(sides[0], sides[1]);
@@ -271,7 +271,7 @@ fn engine_with_every_plan_shape(name: &str) -> (CatalogEngine, i64, i64) {
 }
 
 /// One tick of `source` over `delta`.
-fn tick(engine: &mut CatalogEngine, source: i64, round: u64, delta: Batch) {
+fn tick(engine: &mut CatalogEngine, source: u64, round: u64, delta: Batch) {
     drive(&mut LocalDrive(engine), Drive::Tick { source, round }, delta).unwrap();
 }
 

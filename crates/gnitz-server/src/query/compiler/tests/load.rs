@@ -29,7 +29,7 @@ impl CircuitTables {
         // directory, the shape `bootstrap.rs` gives every family.
         registry
             .register(RelationSpec {
-                id: gnitz_wire::CIRCUIT_NODES_TAB as i64,
+                id: gnitz_wire::CIRCUIT_NODES_TAB,
                 kind: RelationKind::SystemCatalog,
                 schema: Self::schema(),
             })
@@ -41,7 +41,7 @@ impl CircuitTables {
         let mut bb = gnitz_store::storage::BatchBuilder::new(Self::schema());
         f(&mut bb);
         self.registry
-            .ingest(gnitz_wire::CIRCUIT_NODES_TAB as i64, bb.finish())
+            .ingest(gnitz_wire::CIRCUIT_NODES_TAB, bb.finish())
             .unwrap();
         self
     }
@@ -96,7 +96,7 @@ impl CircuitTables {
     /// Loaded straight off the registry the engine loads through, so the fixture
     /// exercises the same lookup production does.
     fn load(&mut self) -> Result<LoadedCircuit, String> {
-        load_circuit(&self.registry, Self::VIEW_ID as i64)
+        load_circuit(&self.registry, Self::VIEW_ID)
     }
 }
 

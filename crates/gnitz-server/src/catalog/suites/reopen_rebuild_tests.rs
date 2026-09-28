@@ -18,7 +18,7 @@ const N: i64 = 7;
 
 /// A `(id, val)` table named `name`, holding `N` rows at `val = id * 10`.
 /// Returns its id and the column defs, which every caller needs again.
-fn seed_base(engine: &mut CatalogEngine, name: &str) -> (i64, Vec<ColumnDef>) {
+fn seed_base(engine: &mut CatalogEngine, name: &str) -> (u64, Vec<ColumnDef>) {
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table(name, &cols, &[0]).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -34,7 +34,7 @@ fn seed_base(engine: &mut CatalogEngine, name: &str) -> (i64, Vec<ColumnDef>) {
 
 /// `public.base` seeded and flushed to shards, plus one non-unique secondary
 /// index on `val`. Returns the table id.
-fn base_with_index(engine: &mut CatalogEngine) -> i64 {
+fn base_with_index(engine: &mut CatalogEngine) -> u64 {
     let (tid, _) = seed_base(engine, "public.base");
     engine.registry.checkpoint_base().unwrap();
     engine.create_index("public.base", &["val"], false).unwrap();
@@ -42,7 +42,7 @@ fn base_with_index(engine: &mut CatalogEngine) -> i64 {
 }
 
 /// Net weight of `tid`'s single index circuit.
-fn index_weight(engine: &mut CatalogEngine, tid: i64) -> i64 {
+fn index_weight(engine: &mut CatalogEngine, tid: u64) -> i64 {
     let entry = engine.registry.relation_or_err(tid).unwrap();
     assert_eq!(entry.indexes().len(), 1, "index circuit replayed");
     sum_weights(entry.indexes()[0].cursor())
@@ -187,7 +187,7 @@ fn index_rebuilds_across_chunk_boundary() {
 // ── Index checkpoint resume ─────────────────────────────────────────────
 
 /// Whether `tid`'s index on `val` came back from its checkpoint.
-fn index_resumed(engine: &CatalogEngine, tid: i64) -> bool {
+fn index_resumed(engine: &CatalogEngine, tid: u64) -> bool {
     engine
         .registry
         .relation(tid)
@@ -200,7 +200,7 @@ fn index_resumed(engine: &CatalogEngine, tid: i64) -> bool {
 /// the recorded topology — at `recorded_workers` workers — and generation the
 /// resume gate compares against, and the index published through an ephemeral
 /// round stamped at that generation. Returns `(table id, generation)`.
-fn checkpointed_table_with_index(dir: &str, recorded_workers: u32) -> (i64, u64) {
+fn checkpointed_table_with_index(dir: &str, recorded_workers: u32) -> (u64, u64) {
     let mut engine = CatalogEngine::open(dir, 1).unwrap();
     let tid = base_with_index(&mut engine);
 
@@ -279,19 +279,19 @@ fn index_rebuild_forced_by_topology_change() {
 /// is the clamp history. Returns `(table id, view id)`, with the view's output
 /// store and trace both published at one generation and the engine closed — the
 /// state a worker reopens into, plan cache empty.
-fn checkpointed_traced_view(dir: &str) -> (i64, i64) {
+fn checkpointed_traced_view(dir: &str) -> (u64, u64) {
     let mut engine = CatalogEngine::open(dir, 1).unwrap();
     let (tid, cols) = seed_base(&mut engine, "public.vbase");
 
     let vid = engine.allocate_ids(1).unwrap();
     let mut circuit = gnitz_wire::Circuit::default();
-    let scan = circuit.input_delta(tid as u64, gnitz_wire::ReadBound::None);
+    let scan = circuit.input_delta(tid, gnitz_wire::ReadBound::None);
     let distinct = circuit.distinct(scan);
     circuit.sink(distinct);
     write_circuit(&mut engine, vid, circuit);
     engine.write_column_records(vid, &cols).unwrap();
     engine
-        .ingest_to_family(VIEW_TAB_ID, &build_view_tab_row(vid, "v_traced"))
+        .ingest_to_family(gnitz_wire::VIEW_TAB, &build_view_tab_row(vid, "v_traced"))
         .unwrap();
     backfill(&mut engine, vid, &[tid]);
 

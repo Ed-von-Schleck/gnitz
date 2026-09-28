@@ -3,16 +3,19 @@
 
 use std::collections::HashMap;
 
+use gnitz_core::protocol::decode_regions_into;
 use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RawBlock, Schema, ZSetBatch};
 use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::{gnitz_debug, gnitz_error};
-use gnitz_store::relation::{lock_data_dir, DirLock, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
-use gnitz_store::schema::Slot;
+use gnitz_store::relation::{
+    lock_data_dir, DirLock, Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig,
+};
+use gnitz_store::schema::{SchemaDescriptor, Slot};
 use gnitz_store::storage::{Batch, StoreError};
 use gnitz_wire::ViewProps;
 
-use crate::record::MirrorRecord;
+use crate::record::{descriptor_of_block, MirrorRecord};
 
 /// Applied delta bytes after which an apply drives a checkpoint of its own.
 /// `GNITZ_MIRROR_CHECKPOINT_BYTES` overrides it.
@@ -20,7 +23,7 @@ const DEFAULT_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 
 /// A store error as the host sees it. `gnitz-core` does not depend on
 /// `gnitz-store`, so this cannot be a `From` impl.
-pub(crate) fn engine(e: StoreError) -> MirrorError {
+fn engine(e: StoreError) -> MirrorError {
     MirrorError::Engine(e.to_string())
 }
 
@@ -39,13 +42,17 @@ static INGEST_PANIC: Seam = Seam::new("GNITZ_INJECT_MIRROR_INGEST_PANIC");
 
 /// A maintained local copy of one or more views.
 ///
-/// One store holds many: the registry holds relations, so each lives under its
-/// own server id in one data directory, under one lock and one checkpoint. Each
-/// carries its own cursor and is advanced independently.
+/// One store holds many, in one data directory, under one lock and one
+/// checkpoint; each carries its own cursor and is advanced independently.
+///
+/// Each copy lives under the **server's** relation id; the store mints none of
+/// its own. Every copy is registered as a plain view — no capacity budget, no
+/// index — so no copy holds a skeleton row, and a `Range` bound over non-PK
+/// columns is served by the full scan narrowed to the walk's rows.
 pub struct Mirror {
-    pub(crate) registry: RelationRegistry,
+    registry: RelationRegistry,
     /// One per relation in `registry`.
-    pub(crate) records: HashMap<u64, MirrorRecord>,
+    records: HashMap<u64, MirrorRecord>,
     _dir_lock: DirLock,
     poison: Option<String>,
     applied_bytes: usize,
@@ -73,10 +80,14 @@ impl Mirror {
             checkpoint_bytes: env_num("GNITZ_MIRROR_CHECKPOINT_BYTES", DEFAULT_CHECKPOINT_BYTES),
         };
         let mut all_reopened = true;
-        for (id, record) in persisted {
-            let tid = id as u64;
+        for (tid, record) in persisted {
             let reopened = match record.map(|bytes| MirrorRecord::decode(&bytes)) {
-                Ok(Some(rec)) => mirror.reopen(tid, rec),
+                // Reopened from the manifest `rec` was read from.
+                Ok(Some(rec)) => descriptor_of_block(&rec.block).and_then(|schema| {
+                    mirror.registry.reopen_view(copy_spec(tid, schema)).map_err(engine)?;
+                    mirror.records.insert(tid, rec);
+                    Ok(())
+                }),
                 // Damage: the sweep below removes the directory.
                 Ok(None) => continue,
                 Err(e) => Err(engine(e)),
@@ -95,34 +106,12 @@ impl Mirror {
         Ok(mirror)
     }
 
-    /// Open an empty copy of `tid`, registered with no feed position.
-    pub(crate) fn enter(&mut self, tid: u64, schema_name: &str, name: &str, block: Vec<u8>) -> Result<(), MirrorError> {
-        self.registry.register(copy_spec(tid, &block)?).map_err(engine)?;
-        let rec = MirrorRecord {
-            schema_name: schema_name.to_string(),
-            name: name.to_string(),
-            block,
-            cursor: None,
-        };
-        self.records.insert(tid, rec);
-        Ok(())
-    }
-
-    /// Reopen `tid`'s copy from the manifest `rec` was read from.
-    fn reopen(&mut self, tid: u64, rec: MirrorRecord) -> Result<(), MirrorError> {
-        self.registry.reopen_view(copy_spec(tid, &rec.block)?).map_err(engine)?;
-        self.records.insert(tid, rec);
-        Ok(())
-    }
-
     /// `tid`'s open copy.
-    fn copy(&self, tid: u64) -> &gnitz_store::relation::Relation {
+    fn copy(&self, tid: u64) -> &Relation {
         self.registry
-            .relation(tid as i64)
+            .relation(tid)
             .expect("a mirrored relation's copy is registered unless the store is poisoned")
     }
-
-    // -- Apply -------------------------------------------------------------
 
     /// Apply `blocks`, set the cursor to `next`, then checkpoint if due. A failed
     /// apply erases the copy; a failed auto-checkpoint is logged, and the next
@@ -135,17 +124,17 @@ impl Mirror {
                 .map_err(|e| format!("decoding a delta for {tid}: {e}"))
                 .and_then(|b| {
                     self.registry
-                        .ingest(tid as i64, b)
+                        .ingest(tid, b)
                         .map_err(|e| format!("applying a delta to {tid}: {e}"))
                 });
             if let Err(why) = applied {
-                self.erase(tid)?;
+                self.invalidate(tid, Invalidate::Copy)?;
                 return Err(MirrorError::Engine(why));
             }
         }
         self.records.get_mut(&tid).expect("checked by the caller").cursor = Some(next);
         if self.applied_bytes >= self.checkpoint_bytes {
-            if let Err(e) = self.checkpoint_inner() {
+            if let Err(e) = self.checkpoint() {
                 gnitz_error!(
                     "mirror: auto-checkpoint failed: {} — the copies stand; the next checkpoint retries",
                     e
@@ -155,27 +144,11 @@ impl Mirror {
         Ok(())
     }
 
-    /// Drop `tid`'s cursor and rows, leaving it registered and empty. A failed
-    /// erase poisons: the registry may then hold no relation for the record.
-    fn erase(&mut self, tid: u64) -> Result<(), MirrorError> {
-        let Some(rec) = self.records.get_mut(&tid) else {
-            return Ok(());
-        };
-        rec.cursor = None;
-        let spec = copy_spec(tid, &rec.block)?;
-        self.registry
-            .unregister_and_erase(tid as i64)
-            .and_then(|()| self.registry.register(spec))
-            .map_err(|e| self.poison(format!("erasing the copy of {tid} failed: {e}")))
-    }
-
-    // -- Poison ------------------------------------------------------------
-
     /// Poison the store and report why.
     ///
-    /// Raised for an erase that itself failed, and for a panic caught by
+    /// Raised for a teardown that itself failed, and for a panic caught by
     /// [`Self::touching`].
-    pub(crate) fn poison(&mut self, why: String) -> MirrorError {
+    fn poison(&mut self, why: String) -> MirrorError {
         if self.poison.is_none() {
             self.poison = Some(why.clone());
         }
@@ -183,9 +156,9 @@ impl Mirror {
     }
 
     /// **The one way to touch a copy**: refuse a poisoned store, run `f`, and
-    /// poison on a panic before letting the unwind continue. Every `MirrorStore`
-    /// method below goes through it, so neither half can be forgotten at a call
-    /// site.
+    /// poison on a panic before letting the unwind continue. A verb reused
+    /// inside another is called through its `MirrorStore` method, so it passes
+    /// the guard too.
     ///
     /// The panic arm covers bugs; a poisoned store then refuses to publish a torn
     /// copy at the next checkpoint or `close_mirror`.
@@ -205,50 +178,6 @@ impl Mirror {
             }
         }
     }
-
-    // -- Checkpoint --------------------------------------------------------
-
-    /// Publish every copy with its record. A failure is reported, not poisoned:
-    /// a flush leaves every store holding what it held.
-    fn checkpoint_inner(&mut self) -> Result<(), MirrorError> {
-        self.applied_bytes = 0;
-        if CHECKPOINT_ERROR.take_once() {
-            return Err(MirrorError::Engine("injected checkpoint failure".to_string()));
-        }
-        for (&tid, rec) in &self.records {
-            self.registry
-                .set_caller_record(tid as i64, rec.encode())
-                .map_err(engine)?;
-        }
-        self.registry.checkpoint_ephemeral([]).map_err(engine)
-    }
-
-    // -- Teardown ----------------------------------------------------------
-
-    /// [`Invalidate`]'s ladder, stopping where the caller asked. The cursor goes
-    /// first at every level.
-    pub(crate) fn invalidate_inner(&mut self, tid: u64, level: Invalidate) -> Result<(), MirrorError> {
-        let Some(rec) = self.records.get_mut(&tid) else {
-            return Ok(());
-        };
-        rec.cursor = None;
-        match level {
-            Invalidate::Cursor => Ok(()),
-            Invalidate::Copy => {
-                self.erase(tid)?;
-                if BOOTSTRAP_ERROR.take_once() {
-                    return Err(MirrorError::Engine("injected bootstrap failure".to_string()));
-                }
-                Ok(())
-            }
-            Invalidate::Registration => {
-                self.records.remove(&tid);
-                self.registry
-                    .unregister_and_erase(tid as i64)
-                    .map_err(|e| self.poison(format!("erasing the copy of {tid} failed: {e}")))
-            }
-        }
-    }
 }
 
 /// Every method that touches a copy runs inside [`Mirror::touching`]. The state
@@ -259,6 +188,12 @@ impl MirrorStore for Mirror {
         self.registry.base_dir()
     }
 
+    /// Reconcile the local registry against `tid`'s upstream layout: a record
+    /// holding `tid` under the same schema record stands, cursor and all, and
+    /// takes the upstream name; anything else at this id or this name is a
+    /// relation that changed identity, whose copy is retracted. Returns the id
+    /// whose registration that retracted, so the caller can drop its own
+    /// binding under the same name.
     fn register(
         &mut self,
         tid: u64,
@@ -267,12 +202,68 @@ impl MirrorStore for Mirror {
         schema: &Schema,
     ) -> Result<Option<u64>, MirrorError> {
         self.touching("registering a view", |m| {
-            m.register_inner(tid, schema_name, name, schema)
+            let block = gnitz_core::protocol::codec::encode_schema_block(schema);
+            // This name at another id was renamed or recreated upstream.
+            let renamed = m
+                .records
+                .iter()
+                .find(|(&t, r)| t != tid && r.schema_name == schema_name && r.name == name)
+                .map(|(&t, _)| t);
+            if let Some(old) = renamed {
+                m.invalidate(old, Invalidate::Registration)?;
+            }
+            match m.records.get_mut(&tid).filter(|r| r.block == block) {
+                // A rename upstream keeps the id; a stale name here would match a
+                // later view created under it.
+                Some(r) => {
+                    r.schema_name = schema_name.to_string();
+                    r.name = name.to_string();
+                }
+                None => {
+                    m.invalidate(tid, Invalidate::Registration)?;
+                    m.registry
+                        .register(copy_spec(tid, descriptor_of_block(&block)?))
+                        .map_err(engine)?;
+                    let rec = MirrorRecord {
+                        schema_name: schema_name.to_string(),
+                        name: name.to_string(),
+                        block,
+                        cursor: None,
+                    };
+                    m.records.insert(tid, rec);
+                }
+            }
+            Ok(renamed)
         })
     }
 
+    /// [`Invalidate`]'s ladder, stopping where the caller asked. The cursor goes
+    /// first at every level.
     fn invalidate(&mut self, tid: u64, level: Invalidate) -> Result<(), MirrorError> {
-        self.touching("invalidating a copy", |m| m.invalidate_inner(tid, level))
+        self.touching("invalidating a copy", |m| {
+            let Some(rec) = m.records.get_mut(&tid) else {
+                return Ok(());
+            };
+            rec.cursor = None;
+            let erased = match level {
+                Invalidate::Cursor => return Ok(()),
+                Invalidate::Copy => {
+                    let spec = copy_spec(tid, m.copy(tid).schema());
+                    m.registry
+                        .unregister_and_erase(tid)
+                        .and_then(|()| m.registry.register(spec))
+                }
+                Invalidate::Registration => {
+                    m.records.remove(&tid);
+                    m.registry.unregister_and_erase(tid)
+                }
+            };
+            erased.map_err(|e| m.poison(format!("erasing the copy of {tid} failed: {e}")))?;
+            if level == Invalidate::Copy && BOOTSTRAP_ERROR.take_once() {
+                return Err(MirrorError::Engine("injected bootstrap failure".to_string()));
+            }
+            Ok(())
+        })
     }
 
     fn reseed(&mut self, tid: u64, blocks: Vec<RawBlock>, cursor: DeltaCursor) -> Result<(), MirrorError> {
@@ -309,7 +300,20 @@ impl MirrorStore for Mirror {
         spec: gnitz_wire::ReadSpec,
         reply_schema: &Schema,
     ) -> Result<ZSetBatch, MirrorError> {
-        self.touching("running a read spec", |m| m.scan_spec_inner(tid, spec, reply_schema))
+        self.touching("running a read spec", |m| {
+            // No copy holds a skeleton row, so no hydrator is needed.
+            let batch = m
+                .registry
+                .scan_spec(tid, spec, reply_schema.layout_digest(), None)
+                .map_err(engine)?;
+            let mut regions = gnitz_wire::Regions::new();
+            batch.wire_regions(&mut regions);
+            let mut rows = ZSetBatch::new(reply_schema);
+            // The client's own block decoder: a local and a remote reply decode by one rule.
+            decode_regions_into(&mut rows, &regions, batch.len(), reply_schema)
+                .map_err(|e| MirrorError::Engine(e.to_string()))?;
+            Ok(rows)
+        })
     }
 
     fn cursor_of(&self, tid: u64) -> Option<DeltaCursor> {
@@ -322,8 +326,19 @@ impl MirrorStore for Mirror {
         }
     }
 
+    /// Publish every copy with its record. A failure is reported, not poisoned:
+    /// a flush leaves every store holding what it held.
     fn checkpoint(&mut self) -> Result<(), MirrorError> {
-        self.touching("checkpointing", |m| m.checkpoint_inner())
+        self.touching("checkpointing", |m| {
+            m.applied_bytes = 0;
+            if CHECKPOINT_ERROR.take_once() {
+                return Err(MirrorError::Engine("injected checkpoint failure".to_string()));
+            }
+            for (&tid, rec) in &m.records {
+                m.registry.set_caller_record(tid, rec.encode()).map_err(engine)?;
+            }
+            m.registry.checkpoint_ephemeral([]).map_err(engine)
+        })
     }
 
     fn poisoned(&self) -> Option<&str> {
@@ -331,11 +346,11 @@ impl MirrorStore for Mirror {
     }
 }
 
-/// The registration of `tid`'s copy, in the layout `block` describes.
-fn copy_spec(tid: u64, block: &[u8]) -> Result<RelationSpec, MirrorError> {
-    Ok(RelationSpec {
-        id: tid as i64,
+/// The registration of `tid`'s copy: a plain view in `schema`'s layout.
+fn copy_spec(tid: u64, schema: SchemaDescriptor) -> RelationSpec {
+    RelationSpec {
+        id: tid,
         kind: RelationKind::View(ViewProps::Plain),
-        schema: crate::register::descriptor_of_block(block)?,
-    })
+        schema,
+    }
 }

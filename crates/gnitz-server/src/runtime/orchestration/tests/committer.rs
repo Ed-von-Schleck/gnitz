@@ -41,7 +41,7 @@ fn txn_of(family_rows: &[usize]) -> CommitRequest {
             .iter()
             .enumerate()
             .map(|(i, &rows)| TxnFamily {
-                tid: i as i64 + 1,
+                tid: i as u64 + 1,
                 mode: WireConflictMode::Update,
                 batch: batch_of(rows),
             })
@@ -130,7 +130,7 @@ fn a_leading_barrier_ends_the_batch_alone() {
     assert!(rx.try_recv().is_some(), "the push behind it rides the next batch");
 }
 
-fn group_of(reactor: &Reactor, tid: i64, write_err: Option<WireFault>) -> GroupInfo {
+fn group_of(reactor: &Reactor, tid: u64, write_err: Option<WireFault>) -> GroupInfo {
     GroupInfo {
         tid,
         recoverable: true,

@@ -255,7 +255,7 @@ fn ddl_txn_roundtrip_client_to_server() {
             let got_tid = &item.hdr.target_id;
             let slice = &frame[item.data.clone().expect("a DDL_TXN item carries a block")];
             assert_eq!(*got_tid, *exp_tid, "family {fi} tid/order");
-            let schema = crate::catalog::SysFamily::from_id(*got_tid as i64)
+            let schema = crate::catalog::SysFamily::from_id(*got_tid)
                 .expect("bundle family id must be a system family")
                 .schema();
             let batch = Batch::decode_from_wal_block(slice, schema).expect("decode family batch");

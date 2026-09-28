@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use crate::catalog::{CatalogEngine, SysFamily, FIRST_USER_TABLE_ID};
+use crate::catalog::{CatalogEngine, SysFamily};
 use crate::query::{DagEngine, Drive, DriveHost};
 use crate::runtime::sal::{SalMessage, SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
@@ -126,7 +126,7 @@ impl DriveHost for DagExchangeCtx<'_> {
         (&mut cat.dag, &mut cat.registry)
     }
 
-    fn exchange(&mut self, view_id: i64, batch: Batch, key: i64) -> Batch {
+    fn exchange(&mut self, view_id: u64, batch: Batch, key: u64) -> Batch {
         let hit = self.worker.do_exchange_wait(view_id, batch, key, self.pad);
         self.drained = hit.drained;
         hit.batch
@@ -274,7 +274,7 @@ impl WorkerProcess {
     /// Dispatch a group drained while blocked in `do_exchange_wait` for the
     /// relay keyed `relay_wait = (view_id, source_id)`. Returns that relay when
     /// this group is it; everything else runs or is deferred per [`in_eval`].
-    fn dispatch_in_eval(&mut self, relay_wait: (i64, i64), msg: &SalMessage, wire: &'static [u8]) -> Option<RelayHit> {
+    fn dispatch_in_eval(&mut self, relay_wait: (u64, u64), msg: &SalMessage, wire: &'static [u8]) -> Option<RelayHit> {
         let req = self.decode_request(msg, wire);
         match in_eval(req.kind) {
             InEval::Inline => self.handle_request(req),
@@ -287,10 +287,10 @@ impl WorkerProcess {
 
     /// Deliver a relay to the wait blocked on exactly its `(view_id, source_id)`
     /// pair; a relay for any other pair means this worker diverged from the master.
-    fn take_relay(&mut self, relay_wait: (i64, i64), req: Request) -> RelayHit {
+    fn take_relay(&mut self, relay_wait: (u64, u64), req: Request) -> RelayHit {
         let ipc::DecodedWire { control, schema, data_batch, .. } = req.wire;
-        let target_id = control.hdr.target_id as i64;
-        let key = (target_id, control.hdr.arg0 as i64);
+        let target_id = control.hdr.target_id;
+        let key = (target_id, control.hdr.arg0);
         let drained = control.hdr.flags.drained;
         let batch = match (data_batch, schema) {
             (Some(b), _) => b,
@@ -325,7 +325,7 @@ impl WorkerProcess {
     fn dispatch_inner(&mut self, req: Request) -> Result<(), gnitz_wire::WireFault> {
         let Request { kind, request_id, fifo, wire: decoded } = req;
         let hdr = decoded.control.hdr;
-        let target_id = hdr.target_id as i64;
+        let target_id = hdr.target_id;
         let route = ReplyRoute {
             target_id: hdr.target_id,
             request_id,
@@ -368,8 +368,8 @@ impl WorkerProcess {
 
             SalMessageKind::Backfill => {
                 // Stop-the-world (the DDL parks the reactor): no yield.
-                self.handle_backfill(target_id, hdr.arg0 as i64)?;
-                self.send_ack(target_id as u64, request_id);
+                self.handle_backfill(target_id, hdr.arg0)?;
+                self.send_ack(target_id, request_id);
                 Ok(())
             }
 
@@ -392,13 +392,13 @@ impl WorkerProcess {
                         self.handle_push(target_id, batch)?;
                     }
                 }
-                self.send_ack(target_id as u64, request_id);
+                self.send_ack(target_id, request_id);
                 Ok(())
             }
 
             SalMessageKind::Tick => {
                 self.handle_tick(target_id, hdr.arg0)?;
-                self.send_ack(target_id as u64, request_id);
+                self.send_ack(target_id, request_id);
                 Ok(())
             }
 
@@ -428,9 +428,9 @@ impl WorkerProcess {
 
     // ── Request handlers ───────────────────────────────────────────────
 
-    fn handle_push(&mut self, target_id: i64, batch: Batch) -> Result<(), String> {
+    fn handle_push(&mut self, target_id: u64, batch: Batch) -> Result<(), String> {
         let row_count = batch.len();
-        if target_id < FIRST_USER_TABLE_ID {
+        if target_id < gnitz_wire::FIRST_USER_TABLE_ID {
             return Err(format!(
                 "a Push group named system table_id={target_id}; a system family arrives as DdlSync"
             ));
@@ -466,7 +466,7 @@ impl WorkerProcess {
     /// Drive one view-maintenance tick of `target_id`'s dependent closure.
     /// `round` is the tick round the master allocated for this group; every fed
     /// view's captured delta is stamped with it.
-    fn handle_tick(&mut self, target_id: i64, round: u64) -> Result<(), String> {
+    fn handle_tick(&mut self, target_id: u64, round: u64) -> Result<(), String> {
         let delta = if let Some(d) = self.cat().dag.take_unticked(target_id) {
             d
         } else {
@@ -486,7 +486,7 @@ impl WorkerProcess {
         blob: &[u8],
         reply_layout: u64,
     ) -> Result<(), gnitz_wire::WireFault> {
-        let target_id = route.target_id as i64;
+        let target_id = route.target_id;
         let spec = gnitz_wire::ReadSpec::decode(blob)?;
         let keeper = self.cat().scan_spec(target_id, spec, reply_layout)?;
         self.send_reply(route, keeper);
@@ -501,7 +501,7 @@ impl WorkerProcess {
         cut_tick: u64,
         blob: &[u8],
     ) -> Result<(), gnitz_wire::WireFault> {
-        let target_id = route.target_id as i64;
+        let target_id = route.target_id;
         let reply_layout = gnitz_wire::decode_all(blob, "delta read", |r| r.u64())?;
         let keeper = self.cat().delta_read(target_id, after_tick, cut_tick, reply_layout)?;
         self.send_reply(route, keeper);
@@ -519,7 +519,7 @@ impl WorkerProcess {
     /// step-4 rebuild next to resumed siblings) that a closure re-drive would
     /// double-count. A view backfill runs stop-the-world (the DDL parks the
     /// reactor), so it never yields to live traffic between chunks.
-    fn handle_backfill(&mut self, source_tid: i64, view_id: i64) -> Result<(), String> {
+    fn handle_backfill(&mut self, source_tid: u64, view_id: u64) -> Result<(), String> {
         self.cat().dag.rebuild_started(view_id);
         // Compiled before the first chunk: a failure here is an error reply, where the
         // same failure inside a chunk's epoch is a fatal abort mid-round.
@@ -557,7 +557,7 @@ impl WorkerProcess {
     /// key spans of every non-NULL row of this worker's committed partition of
     /// `owner_id` to the master, whose merge finds the duplicates. A spill
     /// fault is an `Err` before the first frame.
-    fn handle_unique_preflight(&mut self, owner_id: i64, col_indices: &[u32], request_id: u32) -> Result<(), String> {
+    fn handle_unique_preflight(&mut self, owner_id: u64, col_indices: &[u32], request_id: u32) -> Result<(), String> {
         if UNIQUE_PREFLIGHT_ERROR.armed() {
             return Err("injected unique pre-flight fault".to_string());
         }
@@ -588,7 +588,7 @@ impl WorkerProcess {
         debug_assert!(self.pending_streams.is_empty(), "pre-flight train behind a scan train");
         send_unique_preflight_keys(
             &self.w2m_writer,
-            owner_id as u64,
+            owner_id,
             &frame_schema,
             request_id,
             self.reply_frame_budget,
@@ -608,7 +608,7 @@ impl WorkerProcess {
         mode: gnitz_wire::WireProbeMode,
         mode_param: usize,
     ) -> Result<(), gnitz_wire::WireFault> {
-        let target_id = route.target_id as i64;
+        let target_id = route.target_id;
         let n = batch.len();
         if let gnitz_wire::WireProbeMode::Project = mode {
             // `arg1` is the PK sentinel here, so the column to project rides the

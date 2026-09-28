@@ -1,5 +1,5 @@
 use super::*;
-use crate::relation::{RelationKind, RelationSpec, StoreConfig};
+use crate::relation::{IndexClaim, RelationKind, RelationSpec, StoreConfig};
 use crate::schema::Slot;
 use crate::schema::{SchemaColumn, TypeCode};
 use crate::storage::{BatchBuilder, StoreError};
@@ -14,7 +14,7 @@ use gnitz_wire::{key_image, AggDescriptor, AggReadSpec, Cut, KeyRange, OrderKey,
 // projection and predicate paths are covered where one exists.
 
 /// The relation every executor test below reads.
-const TID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
+const TID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
 
 /// `(id U64 PK | val I64)`, `val == id`.
 fn id_val_schema() -> SchemaDescriptor {
@@ -214,8 +214,12 @@ fn walk_fixture(name: &str, indexed: bool) -> RelationRegistry {
         })
         .unwrap();
     if indexed {
-        registry.add_index(TID, TID + 1, &[1], false).unwrap();
-        registry.add_index(TID, TID + 2, &[2], false).unwrap();
+        registry
+            .add_index(TID, IndexClaim::Index { id: TID + 1, unique: false }, &[1])
+            .unwrap();
+        registry
+            .add_index(TID, IndexClaim::Index { id: TID + 2, unique: false }, &[2])
+            .unwrap();
     }
     let mut bb = BatchBuilder::new(schema);
     for id in 0..WALK_ROWS {
@@ -358,7 +362,8 @@ fn a_pk_prefix_range_takes_the_pk_walk_over_a_matching_index() {
         schema,
     })
     .unwrap();
-    r.add_index(TID, TID + 1, &[0], false).unwrap();
+    r.add_index(TID, IndexClaim::Index { id: TID + 1, unique: false }, &[0])
+        .unwrap();
     let mut bb = BatchBuilder::new(schema);
     for a in 0..8u64 {
         for b in 0..3u64 {
@@ -507,7 +512,7 @@ struct Recompute {
 }
 
 impl SkeletonHydrator for Recompute {
-    fn hydrate_keys(&mut self, _: &RelationRegistry, _: i64, keys: Vec<u8>) -> Result<Batch, StoreError> {
+    fn hydrate_keys(&mut self, _: &RelationRegistry, _: u64, keys: Vec<u8>) -> Result<Batch, StoreError> {
         let schema = id_val_schema();
         let ks: Vec<u64> = keys
             .chunks_exact(schema.pk_stride())

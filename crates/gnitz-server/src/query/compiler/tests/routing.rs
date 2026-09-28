@@ -585,7 +585,7 @@ fn a_band_join_skips_beside_a_replicated_partner() {
 #[test]
 fn a_broadcast_join_relays_a_co_partitioned_source_that_an_equi_join_would_skip() {
     let keyed_by_pk = |kind| {
-        let ext = sources([(7i64, make_schema_u64_i64()), (9, make_schema_u64_i64())]);
+        let ext = sources([(7u64, make_schema_u64_i64()), (9, make_schema_u64_i64())]);
         join_meta_in(kind, &[0], [false; 2], ext).source_route(7).is_some()
     };
     assert!(!keyed_by_pk(JoinKind::Equi), "the equi join skips the relay");
@@ -916,7 +916,7 @@ fn a_source_scanned_once_keeps_its_backfill_bound() {
             vec![(0, 2, SLOT_IN), (1, 2, SLOT_B), (2, 3, SLOT_IN)],
         );
         let meta = derive(&loaded, &sources([(10, wide_schema()), (11, wide_schema())])).unwrap();
-        let mut got: Vec<(i64, Vec<u32>)> = meta
+        let mut got: Vec<(u64, Vec<u32>)> = meta
             .source_bounds
             .iter()
             .map(|(&s, b)| match b {

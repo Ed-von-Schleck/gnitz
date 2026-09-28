@@ -34,7 +34,7 @@ pub(super) struct EmitCtx<'a> {
     integrates: Vec<(DeltaReg, StateIdx)>,
     delta_schemas: Vec<SchemaDescriptor>,
     out_reg_of: Vec<Option<OutReg>>,
-    source_reg_map: FxHashMap<i64, DeltaReg>,
+    source_reg_map: FxHashMap<u64, DeltaReg>,
 }
 
 /// What a node's emission left its value in — the one place a delta and a trace
@@ -141,13 +141,13 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             // registers every source before shipping the circuit.
             let schema = ctx
                 .registry
-                .relation(*tid as i64)
+                .relation(*tid)
                 .map(Relation::schema)
                 .ok_or("scan-delta: unknown source table")?;
             let reg = ctx.push_delta_reg(schema);
             // The driver seeds one register per source, so a second scan would
             // silently see nothing.
-            if ctx.source_reg_map.insert(*tid as i64, reg).is_some() {
+            if ctx.source_reg_map.insert(*tid, reg).is_some() {
                 return Err("scan-delta: a plan scans one source twice".into());
             }
             Ok(OutReg::Delta(reg))

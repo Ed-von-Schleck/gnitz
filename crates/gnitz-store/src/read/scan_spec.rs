@@ -21,7 +21,7 @@ impl RelationRegistry {
     /// [`SchemaDescriptor::layout_digest`] is `reply_layout`.
     pub fn scan_spec(
         &self,
-        target_id: i64,
+        target_id: u64,
         spec: ReadSpec,
         reply_layout: u64,
         hydrator: Option<&mut dyn SkeletonHydrator>,
@@ -90,7 +90,7 @@ impl RelationRegistry {
     /// view's schema whatever `after_tick`; `0` walks the view's own output store.
     pub fn delta_read(
         &self,
-        id: i64,
+        id: u64,
         after_tick: u64,
         cut_tick: u64,
         reply_layout: u64,

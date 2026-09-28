@@ -60,7 +60,7 @@ impl CatalogEngine {
         // column records.
         for ci in self.fk_circuit_cols(id) {
             self.registry
-                .add_index(id, ci as i64, &[ci as u32], false)
+                .add_index(id, IndexClaim::ForeignKey, &[ci as u32])
                 .map_err(|e| format!("{} '{name}' (id={id}) FK index on column {ci}: {e}", kind.noun()))?;
         }
         Ok(())
@@ -70,7 +70,7 @@ impl CatalogEngine {
     /// declares by parent. Only a base table's column records declare one.
     pub(in crate::catalog) fn enter_relation(
         &mut self,
-        id: i64,
+        id: u64,
         kind: RelationKind,
         pk: &[u32],
         defs: &[ColumnDef],
@@ -97,7 +97,7 @@ impl CatalogEngine {
 
     /// The FK columns of `id` that carry a derived index circuit: those outside its
     /// PK, whose region already stores them.
-    fn fk_circuit_cols(&self, id: i64) -> Vec<usize> {
+    fn fk_circuit_cols(&self, id: u64) -> Vec<usize> {
         let Some(schema) = self.registry.relation(id).map(Relation::schema) else {
             return Vec::new();
         };
@@ -111,7 +111,7 @@ impl CatalogEngine {
     /// Tear relation `id` out of the registry. Its owned system rows are retracted by
     /// the rows that dropped it (see `submit`), never from here; its directory is
     /// left to the orphan sweep.
-    fn unregister_relation(&mut self, id: i64) {
+    fn unregister_relation(&mut self, id: u64) {
         // The DAG can hold a view whose store failed to register.
         self.dag.forget(id);
         if !self.registry.has_id(id) {
@@ -134,7 +134,7 @@ impl CatalogEngine {
     /// The TABLE_TAB / VIEW_TAB register hook: a PK carrying one sign is a drop or a
     /// create; a rename pair carries both and is neither.
     fn hook_relation_register(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
-        let mut creates: Vec<(i64, usize)> = Vec::new();
+        let mut creates: Vec<(u64, usize)> = Vec::new();
         for sig in pk_signatures(family, batch) {
             match (sig.neg, sig.pos) {
                 (Some(_), None) => self.unregister_relation(sig.leading),
@@ -172,7 +172,7 @@ impl CatalogEngine {
         &mut self,
         batch: &'a Batch,
         i: usize,
-        vid: i64,
+        vid: u64,
     ) -> Result<RelationRegistration<'a>, String> {
         let ViewRegistration {
             schema_id,
@@ -202,7 +202,7 @@ impl CatalogEngine {
 
     /// Apply a column ALTER (or its compensation) to every registered owner.
     fn hook_column_change(&mut self, batch: &Batch) -> Result<(), String> {
-        let mut owners: Vec<i64> = (0..batch.len())
+        let mut owners: Vec<u64> = (0..batch.len())
             .map(|i| SysFamily::Column.leading_id(batch.get_pk(i)))
             .collect();
         owners.sort_unstable();
@@ -235,11 +235,14 @@ impl CatalogEngine {
     /// `IDXTAB_PAY_NAME`, so neither half below reads that string.
     fn hook_index_register(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.len() {
-            let idx_id = batch.get_pk(i) as i64;
+            let idx_id = batch.get_pk(i) as u64;
             let (owner_id, cols, props) = read_idx_tab_row(batch, i).map_err(|e| format!("index {idx_id}: {e}"))?;
             if batch.get_weight(i) > 0 {
-                self.registry
-                    .add_index(owner_id, idx_id, cols.as_slice(), props.is_unique)?;
+                self.registry.add_index(
+                    owner_id,
+                    IndexClaim::Index { id: idx_id, unique: props.is_unique },
+                    cols.as_slice(),
+                )?;
             } else {
                 self.registry.release_index(owner_id, idx_id);
             }

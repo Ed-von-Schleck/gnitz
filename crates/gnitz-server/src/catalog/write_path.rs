@@ -30,7 +30,7 @@ impl CatalogEngine {
         &self,
         family: SysFamily,
         mut batch: Batch,
-        net_dead: Vec<i64>,
+        net_dead: Vec<u64>,
     ) -> Vec<(SysFamily, Batch)> {
         if !matches!(family, SysFamily::Table | SysFamily::View) || net_dead.is_empty() {
             return vec![(family, batch)];
@@ -40,12 +40,12 @@ impl CatalogEngine {
         if family == SysFamily::View {
             let segs = self.sys_rows_where(SysFamily::View, |s, i| {
                 owners
-                    .binary_search(&(payload_u64(s, i, gnitz_wire::VIEWTAB_PAY_OWNER_VIEW_ID) as i64))
+                    .binary_search(&(payload_u64(s, i, gnitz_wire::VIEWTAB_PAY_OWNER_VIEW_ID)))
                     .is_ok()
-                    && owners.binary_search(&(s.get_pk(i) as i64)).is_err()
+                    && owners.binary_search(&(s.get_pk(i) as u64)).is_err()
             });
             if !segs.is_empty() {
-                owners.extend((0..segs.len()).map(|i| segs.get_pk(i) as i64));
+                owners.extend((0..segs.len()).map(|i| segs.get_pk(i) as u64));
                 owners.sort_unstable();
                 let mut merged = op_negate(segs);
                 merged.append_batch(&batch, 0, batch.len());
@@ -54,7 +54,7 @@ impl CatalogEngine {
         }
         let indices = op_negate(self.sys_rows_where(SysFamily::Index, |s, i| {
             owners
-                .binary_search(&(payload_u64(s, i, gnitz_wire::IDXTAB_PAY_OWNER_ID) as i64))
+                .binary_search(&(payload_u64(s, i, gnitz_wire::IDXTAB_PAY_OWNER_ID)))
                 .is_ok()
         }));
         // A SERIAL row's key is its table id.
@@ -73,7 +73,7 @@ impl CatalogEngine {
     /// The negation of every live row of `family` whose leading key column is one of
     /// `ids` (strictly ascending): each row for a single-column key, each owner's band
     /// for a pair.
-    pub(in crate::catalog) fn retract_under(&self, family: SysFamily, ids: &[i64]) -> Batch {
+    pub(in crate::catalog) fn retract_under(&self, family: SysFamily, ids: &[u64]) -> Batch {
         debug_assert!(ids.windows(2).all(|w| w[0] < w[1]));
         let mut batch = Batch::with_capacity(family.schema(), 0);
         for &id in ids {
@@ -97,7 +97,7 @@ impl CatalogEngine {
 
     /// Apply a push to ingestion point `tid`'s store, and hold its effect for the
     /// next tick of the views that scan `tid`.
-    pub(crate) fn ingest_unticked(&mut self, tid: i64, batch: Batch) -> Result<(), StoreError> {
+    pub(crate) fn ingest_unticked(&mut self, tid: u64, batch: Batch) -> Result<(), StoreError> {
         if !self.dag.is_scanned(tid) {
             return self.registry.ingest(tid, batch);
         }
@@ -107,7 +107,7 @@ impl CatalogEngine {
     }
 
     /// Apply one DdlSync group. Never queues.
-    pub(crate) fn ddl_sync(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
+    pub(crate) fn ddl_sync(&mut self, table_id: u64, batch: Batch) -> Result<(), String> {
         let family = SysFamily::from_id(table_id).ok_or_else(|| "ddl_sync only for system tables".to_string())?;
         self.apply_family(family, batch)
     }

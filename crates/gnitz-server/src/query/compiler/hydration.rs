@@ -18,7 +18,7 @@ pub(in crate::query) struct Hydration {
 pub(in crate::query) enum HydrationSeed {
     /// Linear (`ScanDelta → Filter/Map* → IntegrateSink`): the source relation's
     /// own store, feeding the `ScanDelta`'s register.
-    Relation(i64),
+    Relation(u64),
     /// Inner equi-join: one branch's trace, feeding that branch's delta port.
     Trace(StateIdx),
 }
@@ -111,7 +111,6 @@ pub(super) fn derive_hydration(
     let reg = |n: NodeId| regs[n].expect("an exchange-free plan emits every node");
     let (in_node, seed) = match seed_node(loaded)? {
         SeedAt::Scan { node, source } => {
-            let source = source as i64;
             if registry
                 .relation(source)
                 .is_some_and(|r| r.kind() == RelationKind::Stream)

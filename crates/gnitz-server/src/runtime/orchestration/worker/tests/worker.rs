@@ -143,7 +143,7 @@ fn reads_defer_inside_exchange_in_request_order() {
     ];
     for (kind, target, arg0) in reads {
         assert!(wp
-            .dispatch_in_eval((100, 5), &bare_message(kind, target), frame(u64::from(target), arg0))
+            .dispatch_in_eval((100, 5), &bare_message(kind, target), frame(target, arg0))
             .is_none());
     }
     assert!(
@@ -159,10 +159,7 @@ fn reads_defer_inside_exchange_in_request_order() {
         assert_eq!(parked.kind, kind);
         let ctrl = &parked.wire.control;
         let blob = &parked.wire.blob;
-        assert_eq!(
-            (ctrl.hdr.target_id, ctrl.hdr.arg0, ctrl.hdr.arg1),
-            (u64::from(target), arg0, 31)
-        );
+        assert_eq!((ctrl.hdr.target_id, ctrl.hdr.arg0, ctrl.hdr.arg1), (target, arg0, 31));
         assert_eq!(blob.as_slice(), &[9, 8, 7]);
     }
 }

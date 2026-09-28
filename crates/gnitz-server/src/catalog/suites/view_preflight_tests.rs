@@ -23,9 +23,9 @@ fn over_cap_pred_blob() -> Vec<u8> {
 
 /// `ScanDelta(base_tid) → Filter(pred) → Distinct → Integrate` for `vid`. The
 /// filter blob is what decides whether the view compiles.
-fn write_filtered_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, pred: &[u8]) {
+fn write_filtered_circuit(engine: &mut CatalogEngine, vid: u64, base_tid: u64, pred: &[u8]) {
     let mut circuit = gnitz_wire::Circuit::default();
-    let scan = circuit.input_delta(base_tid as u64, gnitz_wire::ReadBound::None);
+    let scan = circuit.input_delta(base_tid, gnitz_wire::ReadBound::None);
     let filter = circuit.filter(scan, pred.to_vec());
     let distinct = circuit.distinct(filter);
     circuit.sink(distinct);
@@ -35,13 +35,13 @@ fn write_filtered_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, p
 /// Register `vid` as a view over `base_tid` whose filter is `pred`, exactly as
 /// the DDL ingest loop does: circuit and columns first, then the VIEW_TAB row
 /// (the hook invariant).
-fn register_filtered_view(engine: &mut CatalogEngine, base_tid: i64, name: &str, pred: &[u8]) -> i64 {
+fn register_filtered_view(engine: &mut CatalogEngine, base_tid: u64, name: &str, pred: &[u8]) -> u64 {
     let vid = engine.next_id;
     write_filtered_circuit(engine, vid, base_tid, pred);
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     engine.write_column_records(vid, &cols).unwrap();
     engine
-        .ingest_to_family(VIEW_TAB_ID, &build_view_tab_row(vid, name))
+        .ingest_to_family(gnitz_wire::VIEW_TAB, &build_view_tab_row(vid, name))
         .unwrap();
     vid
 }
@@ -210,7 +210,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     let mut bb = BatchBuilder::new(*SysFamily::View.schema());
     push_view_tab_row(&mut bb, -1, old_vid, "vw", 0, 0, 0);
     push_view_tab_row(&mut bb, 1, new_vid, "vw", 0, 0, 0);
-    engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
+    engine.ingest_to_family(gnitz_wire::VIEW_TAB, &bb.finish()).unwrap();
     let new_dir = relation_dir(&dir, new_vid);
     assert!(!engine.registry.has_id(old_vid), "the bundle retires the incumbent");
 

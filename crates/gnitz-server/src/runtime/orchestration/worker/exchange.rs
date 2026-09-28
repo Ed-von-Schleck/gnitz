@@ -21,7 +21,7 @@ impl WorkerProcess {
     /// dispatched per [`in_eval`].
     ///
     /// `pad` marks this worker's partition exhausted; a steady tick passes `false`.
-    pub(super) fn do_exchange_wait(&mut self, view_id: i64, batch: Batch, source_id: i64, pad: bool) -> RelayHit {
+    pub(super) fn do_exchange_wait(&mut self, view_id: u64, batch: Batch, source_id: u64, pad: bool) -> RelayHit {
         self.publish_exchange(view_id, &batch, source_id, pad);
         // Before the park, so this worker never holds its own partition and the
         // relayed one at once.
@@ -40,7 +40,7 @@ impl WorkerProcess {
     }
 
     /// Publish this worker's exchange partition as a train of frames.
-    pub(super) fn publish_exchange(&self, view_id: i64, batch: &Batch, source_id: i64, pad: bool) {
+    pub(super) fn publish_exchange(&self, view_id: u64, batch: &Batch, source_id: u64, pad: bool) {
         let block = gnitz_store::schema::encode_schema_block(batch.schema());
         let sent = reply::send_train(
             &self.w2m_writer,
@@ -58,15 +58,15 @@ impl WorkerProcess {
 
 /// One frame of a worker's exchange train, but for its payload. Every frame
 /// carries the schema block: the master decodes a ring slot with no hint.
-fn exchange_frame<'a>(view_id: i64, source_id: i64, schema_block: &'a [u8], last: bool, pad: bool) -> ipc::WireMsg<'a> {
+fn exchange_frame<'a>(view_id: u64, source_id: u64, schema_block: &'a [u8], last: bool, pad: bool) -> ipc::WireMsg<'a> {
     ipc::WireMsg {
-        target_id: view_id as u64,
+        target_id: view_id,
         flags: WireFlags {
             scan_last: last,
             drained: pad,
             ..Default::default()
         },
-        arg0: source_id as u64,
+        arg0: source_id,
         schema_block: Some(schema_block),
         ..Default::default()
     }

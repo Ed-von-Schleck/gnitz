@@ -195,7 +195,7 @@ fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
         )
         .unwrap();
     // One identity view per source, `ScanDelta(source) → IntegrateSink`.
-    let view_over = |engine: &mut CatalogEngine, source: i64| {
+    let view_over = |engine: &mut CatalogEngine, source: u64| {
         let vid = engine.allocate_ids(1).unwrap();
         write_identity_circuit(engine, vid, source, gnitz_wire::ReadBound::None);
         vid
@@ -214,7 +214,7 @@ fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
         ],
         &[0],
     );
-    let against = |view_schema: &SchemaDescriptor, vid: i64| {
+    let against = |view_schema: &SchemaDescriptor, vid: u64| {
         let loaded = load_circuit(&engine.registry, vid)?;
         compile_view(&loaded, &engine.registry, view_schema, false).map(drop)
     };
@@ -257,7 +257,7 @@ fn a_float_shard_column_is_rejected() {
     let compile = |engine: &mut CatalogEngine, shard_col: u32| {
         let vid = engine.allocate_ids(1).unwrap();
         let mut circuit = gnitz_wire::Circuit::default();
-        let scan = circuit.input_delta(source as u64, gnitz_wire::ReadBound::None);
+        let scan = circuit.input_delta(source, gnitz_wire::ReadBound::None);
         let shard = circuit.shard(scan, &[shard_col]);
         circuit.sink(shard);
         write_circuit(engine, vid, circuit);

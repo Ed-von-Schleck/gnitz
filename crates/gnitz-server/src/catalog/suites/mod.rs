@@ -30,7 +30,7 @@ use gnitz_wire::{pack_pk_cols, TypeCode, PK_LIST_PACKED_FLAG};
 use std::fs;
 
 /// Every live row of `opk`'s PK group, read as a one-key `PkSet`.
-fn pk_group(engine: &mut CatalogEngine, tid: i64, opk: &[u8]) -> std::rc::Rc<gnitz_store::storage::Batch> {
+fn pk_group(engine: &mut CatalogEngine, tid: u64, opk: &[u8]) -> std::rc::Rc<gnitz_store::storage::Batch> {
     let schema = engine
         .registry
         .relation(tid)
@@ -44,7 +44,7 @@ fn pk_group(engine: &mut CatalogEngine, tid: i64, opk: &[u8]) -> std::rc::Rc<gni
 }
 
 /// [`pk_group`] by a narrow native key.
-fn pk_group_native(engine: &mut CatalogEngine, tid: i64, key: u128) -> std::rc::Rc<gnitz_store::storage::Batch> {
+fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> std::rc::Rc<gnitz_store::storage::Batch> {
     let schema = engine
         .registry
         .relation(tid)
@@ -79,11 +79,11 @@ fn count_negative_records(mut c: ReadCursor) -> usize {
 /// Every stored weight under `idx_id` in IDX_TAB: empty once a `(+1, -1)` pair
 /// has cancelled, `[1]` for a live index, `[-1]` for a durable ghost — which
 /// [`count_records`], gating on `current_weight > 0`, cannot see at all.
-fn idx_weights_for(engine: &CatalogEngine, idx_id: i64) -> Vec<i64> {
+fn idx_weights_for(engine: &CatalogEngine, idx_id: u64) -> Vec<i64> {
     let mut c = engine.sys_relation(SysFamily::Index).cursor();
     let mut v = Vec::new();
     while c.valid {
-        if c.current_key_narrow() as i64 == idx_id {
+        if c.current_key_narrow() as u64 == idx_id {
             v.push(c.current_weight);
         }
         c.advance();
@@ -93,7 +93,7 @@ fn idx_weights_for(engine: &CatalogEngine, idx_id: i64) -> Vec<i64> {
 
 /// Live rows of `family` whose leading key column is `leading` — for a table's
 /// TABLE_TAB row, 1 after a clean rename and 2+ for a persistent ghost.
-fn rows_under(engine: &CatalogEngine, family: SysFamily, leading: i64) -> usize {
+fn rows_under(engine: &CatalogEngine, family: SysFamily, leading: u64) -> usize {
     let mut count = 0;
     engine.for_each_row_under(family, leading, |_| count += 1);
     count
@@ -112,7 +112,7 @@ fn count_records(mut c: ReadCursor) -> usize {
 
 /// A single-row unbounded-VIEW_TAB batch for tests that register a view via the
 /// raw system-table path.
-fn build_view_tab_row(vid: i64, view_name: &str) -> Batch {
+fn build_view_tab_row(vid: u64, view_name: &str) -> Batch {
     let mut bb = BatchBuilder::new(*SysFamily::View.schema());
     push_view_tab_row(&mut bb, 1, vid, view_name, 0, 0, 0);
     bb.finish()
@@ -194,7 +194,7 @@ fn rows_spec(
 
 /// An empty `public.t` with `cols` (PK = column 0) in a fresh temp dir. Returns
 /// the dir too, so a test that inspects or removes it does not re-derive it.
-fn table_fixture(name: &str, cols: &[ColumnDef]) -> (CatalogEngine, i64, String) {
+fn table_fixture(name: &str, cols: &[ColumnDef]) -> (CatalogEngine, u64, String) {
     let dir = temp_dir(name);
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let tid = engine.create_table("public.t", cols, &[0]).unwrap();
@@ -202,7 +202,7 @@ fn table_fixture(name: &str, cols: &[ColumnDef]) -> (CatalogEngine, i64, String)
 }
 
 /// Compile `view` and backfill it from each of `sources` in turn.
-fn backfill(engine: &mut CatalogEngine, view: i64, sources: &[i64]) {
+fn backfill(engine: &mut CatalogEngine, view: u64, sources: &[u64]) {
     engine.dag.open_plan(&engine.registry, view).unwrap();
     let chunk_rows = engine.registry.scan_chunk_rows();
     for &source in sources {
@@ -227,7 +227,7 @@ fn ingest_fixture(
     n: u64,
     rounds: u64,
     mut put_row: impl FnMut(&mut BatchBuilder, u64),
-) -> (CatalogEngine, i64) {
+) -> (CatalogEngine, u64) {
     let (mut engine, tid, _dir) = table_fixture(name, cols);
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     for round in 0..rounds {
@@ -246,7 +246,7 @@ fn ingest_fixture(
 
 /// Build a raw TABLE_TAB row for tests that drive the catalog applier or
 /// hook layer directly (bypassing `create_table`).
-fn build_table_tab_row(tid: i64, raw_pk_cols: u64, table_name: &str) -> Batch {
+fn build_table_tab_row(tid: u64, raw_pk_cols: u64, table_name: &str) -> Batch {
     build_table_tab_row_flags(tid, raw_pk_cols, table_name, 0)
 }
 
@@ -254,7 +254,7 @@ fn build_table_tab_row(tid: i64, raw_pk_cols: u64, table_name: &str) -> Batch {
 /// routing shapes `create_table` cannot make. Writes through the production row
 /// builder, so a fixture cannot drift from the layout the engine registers
 /// tables with.
-fn build_table_tab_row_flags(tid: i64, raw_pk_cols: u64, table_name: &str, flags: u64) -> Batch {
+fn build_table_tab_row_flags(tid: u64, raw_pk_cols: u64, table_name: &str, flags: u64) -> Batch {
     let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
     push_table_tab_row(&mut bb, tid, PUBLIC_SCHEMA_ID, table_name, raw_pk_cols, flags, 1);
     bb.finish()
@@ -270,11 +270,11 @@ fn create_flagged_table(
     cols: &[ColumnDef],
     pk_cols: &[u32],
     flags: u64,
-) -> i64 {
+) -> u64 {
     let tid = engine.allocate_ids(1).unwrap();
     engine.write_column_records(tid, cols).unwrap();
     let batch = build_table_tab_row_flags(tid, pack_pk_cols(pk_cols), table_name, flags);
-    engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
+    engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch).unwrap();
     tid
 }
 
@@ -304,7 +304,7 @@ fn stream_flags() -> u64 {
 /// A COL_TAB rewrite pair on column `col_idx` of `owner_id`: `mutate` produces
 /// the `+1` row from a clone of `old`, while the `-1` reproduces `old`
 /// byte-for-byte — so only the guard under test can reject it.
-fn col_alter_pair(owner_id: i64, col_idx: i64, old: &ColumnDef, mutate: impl FnOnce(&mut ColumnDef)) -> Batch {
+fn col_alter_pair(owner_id: u64, col_idx: i64, old: &ColumnDef, mutate: impl FnOnce(&mut ColumnDef)) -> Batch {
     let mut altered = old.clone();
     mutate(&mut altered);
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());

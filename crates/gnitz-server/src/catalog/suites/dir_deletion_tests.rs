@@ -272,7 +272,7 @@ fn gc_is_idempotent() {
 
 /// Register a REPLICATED base table with one row, and return
 /// `(tid, relation_directory)`.
-fn replicated_table_with_a_shard(engine: &mut CatalogEngine, flush: bool) -> (i64, String) {
+fn replicated_table_with_a_shard(engine: &mut CatalogEngine, flush: bool) -> (u64, String) {
     let cols = vec![col_def("id", TypeCode::U64), col_def("x", TypeCode::I64)];
     let rt = create_flagged_table(engine, "rt", &cols, &[0], replicated_flags());
 
@@ -324,7 +324,7 @@ fn rows_child(k: u32, of: u32) -> ChildAddr<'static> {
 
 /// Rank `k` of `of`'s registry over the engine's base directory `dir`, holding
 /// base table `tid`: a `CatalogEngine` is rank 0 alone.
-fn child_registry(dir: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64) -> RelationRegistry {
+fn child_registry(dir: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: u64) -> RelationRegistry {
     let mut registry = RelationRegistry::new(dir, Slot::new(k, of), StoreConfig::default());
     registry
         .register(RelationSpec {
@@ -337,7 +337,7 @@ fn child_registry(dir: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64
 }
 
 /// Every row of one child, as `(pk, weight)`.
-fn child_rows(dir: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64) -> Vec<(u128, i64)> {
+fn child_rows(dir: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: u64) -> Vec<(u128, i64)> {
     let registry = child_registry(dir, k, of, schema, tid);
     let batch = registry.relation_or_err(tid).unwrap().cursor().materialize();
     (0..batch.len())
@@ -373,7 +373,7 @@ fn expected(schema: &SchemaDescriptor, rows: &[(u128, i64)], of: u32) -> Vec<(u3
 /// Ingest `rows` into one child's registry and publish it. The base-table PK rule
 /// runs, which changes nothing here: every seed writes distinct keys into a child
 /// the same call just created, so the rule finds nothing to retract.
-fn fill_child(registry: &mut RelationRegistry, tid: i64, schema: SchemaDescriptor, rows: &[(u128, i64)]) {
+fn fill_child(registry: &mut RelationRegistry, tid: u64, schema: SchemaDescriptor, rows: &[(u128, i64)]) {
     if !rows.is_empty() {
         let mut bb = BatchBuilder::new(schema);
         for &(pk, x) in rows {
@@ -387,7 +387,7 @@ fn fill_child(registry: &mut RelationRegistry, tid: i64, schema: SchemaDescripto
 }
 
 /// Sorted `(worker, pk, weight)` triples across every child of the `of`-worker set.
-fn set_rows(dir: &str, of: u32, schema: SchemaDescriptor, tid: i64) -> Vec<(u32, u128, i64)> {
+fn set_rows(dir: &str, of: u32, schema: SchemaDescriptor, tid: u64) -> Vec<(u32, u128, i64)> {
     let mut v = Vec::new();
     for k in 0..of {
         v.extend(
@@ -402,7 +402,7 @@ fn set_rows(dir: &str, of: u32, schema: SchemaDescriptor, tid: i64) -> Vec<(u32,
 
 /// Replace the `of`-worker child set of `tid` with exactly `rows`, publishing
 /// every child — the empty ones too, as a checkpoint's base round does.
-fn seed_set(dir: &str, of: u32, schema: SchemaDescriptor, tid: i64, rows: &[(u128, i64)]) {
+fn seed_set(dir: &str, of: u32, schema: SchemaDescriptor, tid: u64, rows: &[(u128, i64)]) {
     let rel = relation_dir(dir, tid);
     for k in 0..of {
         fs::remove_dir_all(child_path(&rel, k, of)).ok();

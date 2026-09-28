@@ -12,7 +12,7 @@ pub(crate) struct ColumnDef {
     /// into reply schema blocks; the engine never branches on it.
     pub(crate) ty: ColType,
     pub(crate) is_nullable: bool,
-    pub(crate) fk_table_id: i64,
+    pub(crate) fk_table_id: u64,
     pub(crate) fk_col_idx: u32,
     /// Hidden key slot (COL_TAB `is_hidden`). The engine never branches on it —
     /// it is echoed verbatim into reply schema blocks (`ColMeta::hidden`) so
@@ -46,11 +46,11 @@ impl ColumnDef {
 #[derive(Clone, Copy)]
 pub(crate) struct FkEdge {
     /// Referencing child table id.
-    pub(crate) child_tid: i64,
+    pub(crate) child_tid: u64,
     /// Child column position.
     pub(crate) fk_col: usize,
     /// Referenced parent table id.
-    pub(crate) parent_tid: i64,
+    pub(crate) parent_tid: u64,
     /// Referenced parent column position.
     pub(crate) parent_col: usize,
 }

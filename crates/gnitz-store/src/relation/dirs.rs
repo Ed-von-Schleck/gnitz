@@ -165,14 +165,14 @@ pub fn relations_dir(base_dir: &str) -> String {
 }
 
 /// `<base_dir>/_relations/<id>`.
-pub fn relation_dir(base_dir: &str, id: i64) -> String {
+pub fn relation_dir(base_dir: &str, id: u64) -> String {
     format!("{}/{id}", relations_dir(base_dir))
 }
 
 /// The relation id `name` denotes, or `None` unless [`relation_dir`] gives that
 /// id exactly this name.
-fn parse_relation_dir_name(name: &str) -> Option<i64> {
-    parse_id(name).filter(|id: &i64| id.to_string() == name)
+fn parse_relation_dir_name(name: &str) -> Option<u64> {
+    parse_id(name).filter(|id: &u64| id.to_string() == name)
 }
 
 pub(crate) fn ensure_dir(path: &str) -> Result<(), StoreError> {
@@ -234,7 +234,7 @@ pub fn lock_data_dir(base_dir: &str) -> Result<DirLock, StoreError> {
 }
 
 /// One relation directory's caller record, or the I/O error reading it failed with.
-type PersistedRecord = (i64, Result<Vec<u8>, StoreError>);
+type PersistedRecord = (u64, Result<Vec<u8>, StoreError>);
 
 impl RelationRegistry {
     /// Each relation directory's caller record for this slot, by id. A directory
@@ -262,7 +262,7 @@ impl RelationRegistry {
     }
 
     /// Drop `id`'s entry and erase its directory, every rank's children included.
-    pub fn unregister_and_erase(&mut self, id: i64) -> Result<(), StoreError> {
+    pub fn unregister_and_erase(&mut self, id: u64) -> Result<(), StoreError> {
         assert_eq!(self.slot.of, 1, "erasing a directory other ranks' stores live in");
         let Some(Relation { store, .. }) = self.tables.remove(&id) else {
             return Ok(());

@@ -46,7 +46,7 @@ fn test_reserve_user_sequence_seed_and_contiguous() {
     assert_eq!(base1, 1);
     assert_eq!(delta1.len(), 1, "first use inserts, retracts nothing");
     assert_eq!(delta1.get_weight(0), 1);
-    engine.ingest_to_family(SEQ_TAB_ID, &delta1).unwrap();
+    engine.ingest_to_family(gnitz_wire::SEQ_TAB, &delta1).unwrap();
     assert_eq!(engine.sequence_value(seq_id), Some(64));
 
     let (base2, delta2) = engine.reserve_user_sequence(seq_id, 64).unwrap();
@@ -56,7 +56,7 @@ fn test_reserve_user_sequence_seed_and_contiguous() {
     assert_eq!(payload_u64(&delta2, 0, 0), 64, "the -1 must carry the live high-water");
     assert_eq!(delta2.get_weight(1), 1);
     assert_eq!(payload_u64(&delta2, 1, 0), 128);
-    engine.ingest_to_family(SEQ_TAB_ID, &delta2).unwrap();
+    engine.ingest_to_family(gnitz_wire::SEQ_TAB, &delta2).unwrap();
     assert_eq!(engine.sequence_value(seq_id), Some(128));
 
     engine.close();
@@ -70,7 +70,7 @@ fn test_reserve_user_sequence_rejects_exhausted_range() {
 
     let full = engine.create_serial_table("public.full").unwrap();
     engine
-        .ingest_to_family(SEQ_TAB_ID, &engine.sequence_delta(full, (i64::MAX - 1) as u64))
+        .ingest_to_family(gnitz_wire::SEQ_TAB, &engine.sequence_delta(full, (i64::MAX - 1) as u64))
         .unwrap();
     let err = engine.reserve_user_sequence(full, 64).err().unwrap();
     assert!(err.contains("invalid or exhausted"), "{err}");
@@ -80,7 +80,10 @@ fn test_reserve_user_sequence_rejects_exhausted_range() {
     engine.reserve_user_sequence(edge + 1000, 1).err().unwrap();
 
     engine
-        .ingest_to_family(SEQ_TAB_ID, &engine.sequence_delta(edge, (i64::MAX - 65) as u64))
+        .ingest_to_family(
+            gnitz_wire::SEQ_TAB,
+            &engine.sequence_delta(edge, (i64::MAX - 65) as u64),
+        )
         .unwrap();
     let (base, delta) = engine.reserve_user_sequence(edge, 64).unwrap();
     assert_eq!(base, i64::MAX - 64);
@@ -99,7 +102,7 @@ fn test_user_sequence_durable_roundtrip() {
         user_seq = engine.create_serial_table("public.t").unwrap();
         let (base, delta) = engine.reserve_user_sequence(user_seq, 64).unwrap();
         assert_eq!(base, 1);
-        engine.ingest_to_family(SEQ_TAB_ID, &delta).unwrap();
+        engine.ingest_to_family(gnitz_wire::SEQ_TAB, &delta).unwrap();
         assert_eq!(engine.sequence_value(user_seq), Some(64));
         let _ = engine.registry.checkpoint_system(engine.system_zone);
         engine.close();
@@ -282,11 +285,11 @@ fn point_read_resolves_system_table_row() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     assert_eq!(
-        pk_group_native(&mut engine, TABLE_TAB_ID, tid as u128).len(),
+        pk_group_native(&mut engine, gnitz_wire::TABLE_TAB, tid as u128).len(),
         1,
         "the TABLE_TAB row of the created table"
     );
-    assert!(pk_group_native(&mut engine, TABLE_TAB_ID, 9_999_999).is_empty());
+    assert!(pk_group_native(&mut engine, gnitz_wire::TABLE_TAB, 9_999_999).is_empty());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -345,7 +348,7 @@ fn test_ddl_sync() {
     bb.begin_row(100u128, 1); // sid=100
     bb.put_string("synced");
     bb.end_row();
-    engine.ddl_sync(SCHEMA_TAB_ID, bb.finish()).unwrap();
+    engine.ddl_sync(gnitz_wire::SCHEMA_TAB, bb.finish()).unwrap();
 
     // Hooks should have registered the schema
     assert!(engine.has_schema("synced"));
@@ -360,8 +363,6 @@ fn test_ddl_sync() {
 /// not move a floor.
 #[test]
 fn the_newest_applied_zone_is_every_familys_replay_floor() {
-    use crate::catalog::sys_tables::TABLE_TAB_ID;
-
     let dir = temp_dir("catalog_zone_lsn");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
@@ -380,8 +381,8 @@ fn the_newest_applied_zone_is_every_familys_replay_floor() {
     engine.close();
     let engine = CatalogEngine::open(&dir, 1).unwrap();
     let map = engine.registry.system_replay_floors();
-    assert!(map.contains_key(&TABLE_TAB_ID));
-    assert!(map.keys().all(|&t| t < FIRST_USER_TABLE_ID));
+    assert!(map.contains_key(&gnitz_wire::TABLE_TAB));
+    assert!(map.keys().all(|&t| t < gnitz_wire::FIRST_USER_TABLE_ID));
     assert!(
         map.values().all(|&floor| floor == 9),
         "every family flushed zone 9: {map:?}"
@@ -405,11 +406,11 @@ fn replayed_ddl_sync_group_is_not_replayed_after_a_flush() {
     bb.begin_row(100u128, 1);
     bb.put_string("synced");
     bb.end_row();
-    unreplayed.stage(SCHEMA_TAB_ID, 500, bb.finish()).unwrap();
+    unreplayed.stage(gnitz_wire::SCHEMA_TAB, 500, bb.finish()).unwrap();
 
     unreplayed.replay().unwrap().close();
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    let flushed = engine.registry.system_replay_floors()[&SCHEMA_TAB_ID];
+    let flushed = engine.registry.system_replay_floors()[&gnitz_wire::SCHEMA_TAB];
     assert_eq!(flushed, 500, "the flushed SCHEMA_TAB must dedup the group at lsn 500");
     assert!(engine.has_schema("synced"));
 
@@ -524,12 +525,12 @@ fn test_dep_map_is_the_scan_delta_nodes() {
 
     assert_eq!(
         engine.dag.dependents_of(100),
-        &[400i64][..],
+        &[400u64][..],
         "the repeated source yields one edge"
     );
     assert_eq!(
         engine.dag.dependents_of(200),
-        &[400i64][..],
+        &[400u64][..],
         "table 200 must feed view 400"
     );
     assert!(
@@ -555,16 +556,16 @@ fn test_dep_map_view_on_view_chain() {
     write_identity_circuit(&mut engine, 107, 100, gnitz_wire::ReadBound::None);
     write_identity_circuit(&mut engine, 108, 107, gnitz_wire::ReadBound::None);
 
-    assert_eq!(engine.dag.dependents_of(100), &[107i64][..], "base 100 feeds view 107");
-    assert_eq!(engine.dag.dependents_of(107), &[108i64][..], "view 107 feeds view 108");
-    assert_eq!(engine.dag.sources_of(107), &[100i64][..]);
-    assert_eq!(engine.dag.sources_of(108), &[107i64][..]);
+    assert_eq!(engine.dag.dependents_of(100), &[107u64][..], "base 100 feeds view 107");
+    assert_eq!(engine.dag.dependents_of(107), &[108u64][..], "view 107 feeds view 108");
+    assert_eq!(engine.dag.sources_of(107), &[100u64][..]);
+    assert_eq!(engine.dag.sources_of(108), &[107u64][..]);
     engine.close();
 
     // Boot replays the circuit rows into the map.
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert_eq!(engine.dag.sources_of(107), &[100i64][..]);
-    assert_eq!(engine.dag.sources_of(108), &[107i64][..]);
+    assert_eq!(engine.dag.sources_of(107), &[100u64][..]);
+    assert_eq!(engine.dag.sources_of(108), &[107u64][..]);
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -590,7 +591,7 @@ fn test_dep_map_drops_a_retired_views_edges() {
     let mut bb = BatchBuilder::new(*SysFamily::View.schema());
     push_view_tab_row(&mut bb, -1, v1, "v1", 0, 0, 0);
     push_view_tab_row(&mut bb, 1, v2, "v1", 0, 0, 0);
-    engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
+    engine.ingest_to_family(gnitz_wire::VIEW_TAB, &bb.finish()).unwrap();
     assert_eq!(
         engine.dag.dependents_of(tid),
         &[v2][..],
@@ -646,12 +647,12 @@ fn test_circuit_table_surface_introspectable() {
 
     // The new schema is SQL-introspectable — `SELECT * FROM CircuitNodes`
     // must return what we just inserted (full-scan path, used by SQL planner).
-    let scan = engine.scan(CIRCUIT_NODES_TAB_ID).unwrap();
+    let scan = engine.scan(gnitz_wire::CIRCUIT_NODES_TAB).unwrap();
     assert_eq!(scan.len(), 1, "scan must expose CircuitNodes rows");
 
     // Compound PK: a point read by the 16-byte at-rest `(view_id, node_id)` OPK region.
     let pk_bytes = opk_pk(SysFamily::CircuitNodes.schema(), &[107, 0]);
-    let found = pk_group(&mut engine, CIRCUIT_NODES_TAB_ID, &pk_bytes);
+    let found = pk_group(&mut engine, gnitz_wire::CIRCUIT_NODES_TAB, &pk_bytes);
     assert_eq!(found.len(), 1, "the CircuitNodes row by PK");
 
     engine.close();

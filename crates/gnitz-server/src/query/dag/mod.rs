@@ -29,7 +29,7 @@ pub(crate) trait DriveHost {
     fn parts(&mut self) -> (&mut DagEngine, &mut RelationRegistry);
     /// This worker's `batch` for `view_id`, repartitioned under `key`: the rows
     /// it owns.
-    fn exchange(&mut self, view_id: i64, batch: Batch, key: i64) -> Batch;
+    fn exchange(&mut self, view_id: u64, batch: Batch, key: u64) -> Batch;
 }
 
 // ---------------------------------------------------------------------------
@@ -53,12 +53,12 @@ pub(crate) struct DagEngine {
     dep: DepMap,
     /// Every registered view, from its registration to its drop. `plan` is `None`
     /// until its first compile.
-    views: FxHashMap<i64, RegisteredView>,
+    views: FxHashMap<u64, RegisteredView>,
     /// Each relation's effective ingests since its last tick: what its store holds
     /// beyond the state every view over it was last maintained at.
-    unticked: FxHashMap<i64, Batch>,
+    unticked: FxHashMap<u64, Batch>,
     /// Views the boot verdict rejected, until their rebuild backfill starts.
-    rebuild: FxHashSet<i64>,
+    rebuild: FxHashSet<u64>,
 }
 
 impl DagEngine {
@@ -69,7 +69,7 @@ impl DagEngine {
     pub(crate) fn register_view(
         &mut self,
         registry: &RelationRegistry,
-        view_id: i64,
+        view_id: u64,
         pk_arity: usize,
     ) -> Result<Placement, String> {
         let loaded = compiler::load_circuit(registry, view_id)?;
@@ -79,7 +79,7 @@ impl DagEngine {
     }
 
     /// Drop everything this layer holds for relation `id`.
-    pub(crate) fn forget(&mut self, id: i64) {
+    pub(crate) fn forget(&mut self, id: u64) {
         self.views.remove(&id);
         self.unticked.remove(&id);
         self.rebuild.remove(&id);
@@ -88,22 +88,22 @@ impl DagEngine {
     // ── The boot rebuild set ────────────────────────────────────────────
 
     /// Whether `id` awaits its rebuild backfill.
-    pub(crate) fn awaits_rebuild(&self, id: i64) -> bool {
+    pub(crate) fn awaits_rebuild(&self, id: u64) -> bool {
         self.rebuild.contains(&id)
     }
 
     /// Replace the set of views awaiting a rebuild backfill.
-    pub(crate) fn set_rebuild(&mut self, ids: FxHashSet<i64>) {
+    pub(crate) fn set_rebuild(&mut self, ids: FxHashSet<u64>) {
         self.rebuild = ids;
     }
 
     /// Every view awaiting a rebuild backfill, removed.
-    pub(crate) fn take_rebuild(&mut self) -> FxHashSet<i64> {
+    pub(crate) fn take_rebuild(&mut self) -> FxHashSet<u64> {
         std::mem::take(&mut self.rebuild)
     }
 
     /// `id`'s rebuild backfill has started: its ticks run from here.
-    pub(crate) fn rebuild_started(&mut self, id: i64) {
+    pub(crate) fn rebuild_started(&mut self, id: u64) {
         self.rebuild.remove(&id);
     }
 
@@ -111,7 +111,7 @@ impl DagEngine {
 
     /// Append `delta`, one effective ingest into `tid`, to what its next tick
     /// drains.
-    pub(crate) fn buffer_unticked(&mut self, tid: i64, delta: Batch) {
+    pub(crate) fn buffer_unticked(&mut self, tid: u64, delta: Batch) {
         match self.unticked.get_mut(&tid) {
             Some(existing) => existing.append_batch(&delta, 0, delta.len()),
             None => {
@@ -121,7 +121,7 @@ impl DagEngine {
     }
 
     /// Everything buffered for `tid` since its last tick, removed.
-    pub(crate) fn take_unticked(&mut self, tid: i64) -> Option<Batch> {
+    pub(crate) fn take_unticked(&mut self, tid: u64) -> Option<Batch> {
         self.unticked.remove(&tid)
     }
 
@@ -134,13 +134,13 @@ impl DagEngine {
 
     /// [`ensure_compiled`] for a caller that cannot name a compiled plan:
     /// compile `view_id` now and open its operator state.
-    pub(crate) fn open_plan(&mut self, registry: &RelationRegistry, view_id: i64) -> Result<(), String> {
+    pub(crate) fn open_plan(&mut self, registry: &RelationRegistry, view_id: u64) -> Result<(), String> {
         ensure_compiled(&mut self.views, registry, view_id).map(drop)
     }
 
     /// The routing metadata derived when `view_id` registered. `Err` for an id
     /// that is not a registered view.
-    pub(crate) fn view_meta(&self, view_id: i64) -> Result<&ViewMeta, String> {
+    pub(crate) fn view_meta(&self, view_id: u64) -> Result<&ViewMeta, String> {
         self.views
             .get(&view_id)
             .map(|v| &v.meta)
@@ -148,7 +148,7 @@ impl DagEngine {
     }
 
     /// `view_id`'s plan, if it is registered and compiled.
-    fn plan_mut(&mut self, view_id: i64) -> Option<&mut ViewPlan> {
+    fn plan_mut(&mut self, view_id: u64) -> Option<&mut ViewPlan> {
         self.views.get_mut(&view_id).and_then(|v| v.plan.as_mut())
     }
 
@@ -161,7 +161,7 @@ impl DagEngine {
     }
 }
 
-fn unregistered(view_id: i64) -> String {
+fn unregistered(view_id: u64) -> String {
     format!("view {view_id} is not registered")
 }
 
@@ -174,9 +174,9 @@ fn compile(registry: &RelationRegistry, view: &Relation) -> Result<(CompileOutpu
 /// This view's metadata and its compiled plan, compiling and opening its
 /// operator state on a miss.
 fn ensure_compiled<'a>(
-    views: &'a mut FxHashMap<i64, RegisteredView>,
+    views: &'a mut FxHashMap<u64, RegisteredView>,
     registry: &RelationRegistry,
-    view_id: i64,
+    view_id: u64,
 ) -> Result<(&'a ViewMeta, &'a mut ViewPlan), String> {
     let RegisteredView { meta, plan } = views.get_mut(&view_id).ok_or_else(|| unregistered(view_id))?;
     if plan.is_none() {
@@ -197,7 +197,7 @@ fn ensure_compiled<'a>(
 
 /// Whether registered view `view_id`'s circuit compiles. Keeps and opens
 /// nothing, so the master can ask before a DDL is durable.
-pub(crate) fn preflight_compile(registry: &RelationRegistry, view_id: i64) -> Result<(), String> {
+pub(crate) fn preflight_compile(registry: &RelationRegistry, view_id: u64) -> Result<(), String> {
     compile(registry, registry.relation_or_err(view_id)?).map(drop)
 }
 

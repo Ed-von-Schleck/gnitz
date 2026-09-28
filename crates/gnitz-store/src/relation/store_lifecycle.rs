@@ -21,7 +21,7 @@ impl RelationRegistry {
         &mut self,
         rank: u32,
         residency: Residency,
-        resume: impl Fn(i64) -> bool,
+        resume: impl Fn(u64) -> bool,
     ) -> Result<usize, StoreError> {
         assert_eq!(
             self.residency,
@@ -32,7 +32,7 @@ impl RelationRegistry {
         assert!(residency.owns_stores());
         self.slot = Slot::new(rank, self.slot.of);
         self.residency = residency;
-        let tids: Vec<i64> = self
+        let tids: Vec<u64> = self
             .tables
             .iter()
             .filter(|(_, e)| e.kind() != RelationKind::SystemCatalog)
@@ -110,7 +110,7 @@ impl RelationRegistry {
     }
 
     /// The bytes `id`'s next published manifest carries beside its rows.
-    pub fn set_caller_record(&mut self, id: i64, record: Vec<u8>) -> Result<(), StoreError> {
+    pub fn set_caller_record(&mut self, id: u64, record: Vec<u8>) -> Result<(), StoreError> {
         self.relation_mut_or_err(id)
             .map_err(|e| e.in_context("set_caller_record"))?
             .store
@@ -123,7 +123,7 @@ impl RelationRegistry {
     /// Whether every checkpointed child of `view_id`, on **every launched rank**,
     /// carries a manifest at this registry's resume generation — the store half
     /// of the resume verdict. `false` for an id this registry does not hold.
-    pub fn view_children_resumable(&self, view_id: i64) -> bool {
+    pub fn view_children_resumable(&self, view_id: u64) -> bool {
         // A worker cannot speak for its peers.
         assert!(
             matches!(self.residency, Residency::Master | Residency::Origin),
@@ -139,7 +139,7 @@ impl RelationRegistry {
 
     /// The system families' `table id → replay floor` their stores opened with:
     /// the floors of the master's pre-fork SAL walk.
-    pub fn system_replay_floors(&self) -> std::collections::HashMap<i64, u64> {
+    pub fn system_replay_floors(&self) -> std::collections::HashMap<u64, u64> {
         self.tables
             .iter()
             .filter(|(_, entry)| entry.kind() == RelationKind::SystemCatalog)

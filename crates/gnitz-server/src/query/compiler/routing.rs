@@ -24,7 +24,7 @@ pub(crate) enum RelayRoute {
 
 /// The source id a round carries when it is not a source's own scatter: a
 /// side's relayed output, which routes by the view's own shard columns.
-pub(crate) const OUTPUT_RELAY: i64 = 0;
+pub(crate) const OUTPUT_RELAY: u64 = 0;
 
 /// Per-view circuit metadata, derived from one circuit load — the master's relay
 /// key and the worker's scatter set together, so the two processes cannot derive
@@ -32,7 +32,7 @@ pub(crate) const OUTPUT_RELAY: i64 = 0;
 pub(crate) struct ViewMeta {
     /// source table id → how the master routes the delta this source scatters.
     /// A source absent from it does not scatter.
-    source_routes: FxHashMap<i64, RelayRoute>,
+    source_routes: FxHashMap<u64, RelayRoute>,
     /// The view's own shard columns; its output relay routes each row to the
     /// owner of the output PK `op_reduce` keys each group by.
     output_shard_cols: Box<[u32]>,
@@ -41,7 +41,7 @@ pub(crate) struct ViewMeta {
     pub(in crate::query) skips_exchange: bool,
     /// source table id → the bound its backfill scan narrows by. Absent for a
     /// source scanned more than once, whose one backfill cursor feeds every scan.
-    source_bounds: FxHashMap<i64, ReadBound>,
+    source_bounds: FxHashMap<u64, ReadBound>,
 }
 
 impl ViewMeta {
@@ -82,7 +82,7 @@ impl ViewMeta {
             [.., (_, cols)] => (false, Box::from(cols)),
         };
 
-        let replicated = |tid: i64| schemas[&tid].placement().is_replicated();
+        let replicated = |tid: u64| schemas[&tid].placement().is_replicated();
         let keyed = || uses.iter().filter_map(|(&tid, u)| Some((tid, u, u.key.as_deref()?)));
         // A replicated partner holds every row on every worker, so each match is
         // made once, on the other side's own worker — unless the circuit also
@@ -91,7 +91,7 @@ impl ViewMeta {
         let has_replicated_partner =
             keyed().any(|(tid, ..)| replicated(tid)) && keyed().all(|(tid, u, _)| !replicated(tid) || !u.outside_join);
 
-        let mut source_routes: FxHashMap<i64, RelayRoute> = FxHashMap::default();
+        let mut source_routes: FxHashMap<u64, RelayRoute> = FxHashMap::default();
         for (tid, use_, key) in keyed() {
             // An owner-trimmed source routes by the whole key it states, because
             // that is the key its filter keeps rows on.
@@ -138,13 +138,13 @@ impl ViewMeta {
     /// How the master relay routes `source_id`'s delta into this view, `None`
     /// when that source does not scatter: its rows are already where the view
     /// needs them, and a route would name a key they were never stored under.
-    pub(crate) fn source_route(&self, source_id: i64) -> Option<&RelayRoute> {
+    pub(crate) fn source_route(&self, source_id: u64) -> Option<&RelayRoute> {
         self.source_routes.get(&source_id)
     }
 
     /// The bound `source`'s backfill scan narrows by: `ReadBound::None` unless the
     /// circuit carries one.
-    pub(crate) fn source_bound(&self, source: i64) -> ReadBound {
+    pub(crate) fn source_bound(&self, source: u64) -> ReadBound {
         self.source_bounds.get(&source).cloned().unwrap_or(ReadBound::None)
     }
 
@@ -157,7 +157,7 @@ impl ViewMeta {
 
 /// The relation whose PK region the view's output PK region is, byte for byte.
 /// `None` unless a walk back from the sink proves it.
-fn pk_source(loaded: &LoadedCircuit) -> Option<i64> {
+fn pk_source(loaded: &LoadedCircuit) -> Option<u64> {
     loaded
         .sink()
         .ok()
@@ -168,7 +168,7 @@ fn pk_source(loaded: &LoadedCircuit) -> Option<i64> {
 /// The key whose owner a view's rows sit on.
 enum RowHome {
     /// The PK region of this source, byte for byte.
-    SourcePk(i64),
+    SourcePk(u64),
     /// The view's own key.
     OwnKey,
     /// None: they stay on the worker that produced them.
@@ -178,10 +178,10 @@ enum RowHome {
 /// The schema of each source `uses` names: every one a scanned, registered
 /// relation.
 fn scanned_schemas(
-    uses: &FxHashMap<i64, SourceUse>,
+    uses: &FxHashMap<u64, SourceUse>,
     registry: &RelationRegistry,
-) -> Result<FxHashMap<i64, SchemaDescriptor>, String> {
-    let mut ids: Vec<i64> = uses.keys().copied().collect();
+) -> Result<FxHashMap<u64, SchemaDescriptor>, String> {
+    let mut ids: Vec<u64> = uses.keys().copied().collect();
     // Ascending, so every process reports the same offender.
     ids.sort_unstable();
     ids.into_iter()
@@ -199,7 +199,7 @@ fn scanned_schemas(
 
 /// Where a view's rows live, folded from its sources' placements and where its
 /// circuit leaves its `rows`.
-fn placement(sources: &FxHashMap<i64, SchemaDescriptor>, rows: RowHome, pk_arity: usize) -> Placement {
+fn placement(sources: &FxHashMap<u64, SchemaDescriptor>, rows: RowHome, pk_arity: usize) -> Placement {
     if sources.is_empty() {
         return Placement::KEYED_DEFAULT;
     }
@@ -242,7 +242,7 @@ fn skips_output_exchange(
     loaded: &LoadedCircuit,
     enid: NodeId,
     shard_cols: &[u32],
-    schemas: &FxHashMap<i64, SchemaDescriptor>,
+    schemas: &FxHashMap<u64, SchemaDescriptor>,
 ) -> bool {
     let Some((tid, mapped)) = scan_through_row_local(loaded, enid) else {
         return false;
@@ -303,15 +303,15 @@ impl Default for SourceUse {
 
 /// One forward pass over the circuit: what it does with each source's delta, and
 /// the relay its joins call for — `None` for a circuit without a join.
-fn source_uses(loaded: &LoadedCircuit) -> Result<(FxHashMap<i64, SourceUse>, Option<JoinRelay>), String> {
+fn source_uses(loaded: &LoadedCircuit) -> Result<(FxHashMap<u64, SourceUse>, Option<JoinRelay>), String> {
     use gnitz_wire::{MapKind, OpNode, ReindexRole};
 
-    let mut uses: FxHashMap<i64, SourceUse> = FxHashMap::default();
+    let mut uses: FxHashMap<u64, SourceUse> = FxHashMap::default();
     let mut circuit_relay: Option<JoinRelay> = None;
     // Whose scan's delta flows into each node — propagated along the way — and
     // which node IS that source's `ScatterKey` Map, read by its readers alone.
-    let mut owner: Vec<Option<i64>> = vec![None; loaded.len()];
-    let mut states_key: Vec<Option<i64>> = vec![None; loaded.len()];
+    let mut owner: Vec<Option<u64>> = vec![None; loaded.len()];
+    let mut states_key: Vec<Option<u64>> = vec![None; loaded.len()];
 
     for (nid, op) in loaded.ops() {
         let propagates = matches!(
@@ -336,7 +336,7 @@ fn source_uses(loaded: &LoadedCircuit) -> Result<(FxHashMap<i64, SourceUse>, Opt
         }
         match op {
             OpNode::ScanDelta { source, bound } => {
-                let tid = *source as i64;
+                let tid = *source;
                 let use_ = uses.entry(tid).or_default();
                 use_.bound = Some(match use_.bound {
                     None => bound.clone(),
@@ -348,7 +348,7 @@ fn source_uses(loaded: &LoadedCircuit) -> Result<(FxHashMap<i64, SourceUse>, Opt
                 role: ReindexRole::ScatterKey { source, source_key },
                 ..
             }) => {
-                let tid = *source as i64;
+                let tid = *source;
                 let key = uses
                     .entry(tid)
                     .or_default()
@@ -379,10 +379,10 @@ fn source_uses(loaded: &LoadedCircuit) -> Result<(FxHashMap<i64, SourceUse>, Opt
 
 /// The `ScanDelta` the row-local walk back from `enid`'s input ends at: `(table
 /// id, whether a Map was crossed)`.
-fn scan_through_row_local(loaded: &LoadedCircuit, enid: NodeId) -> Option<(i64, bool)> {
+fn scan_through_row_local(loaded: &LoadedCircuit, enid: NodeId) -> Option<(u64, bool)> {
     let (origin, mapped) = row_local_origin(loaded, loaded.inputs(enid).unary());
     match loaded.op(origin) {
-        gnitz_wire::OpNode::ScanDelta { source, .. } => Some((*source as i64, mapped)),
+        gnitz_wire::OpNode::ScanDelta { source, .. } => Some(((*source), mapped)),
         _ => None,
     }
 }

@@ -13,8 +13,6 @@ gnitz-wire = { path = "../gnitz-wire" }
 gnitz-store-testkit = { path = "../gnitz-store-testkit" }
 gnitz-sql = { path = "../gnitz-sql" }
 gnitz-test-harness = { path = "../gnitz-test-harness" }
-libc.workspace = true
-proptest.workspace = true
 tempfile.workspace = true
 
 [lints]
