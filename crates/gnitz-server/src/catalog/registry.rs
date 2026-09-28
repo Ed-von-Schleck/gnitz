@@ -1,5 +1,5 @@
 //! Catalog id-registry: the system-table reads (point row, leading-key band,
-//! filtered scan), the `sys_columns` → `ColumnDef` readers, name lookups,
+//! filtered scan), the `sys_columns` → `CatalogColumn` readers, name lookups,
 //! catalog object-id allocation, and `_sequences` — the master scalars (next id,
 //! checkpoint generation, topology word) and user SERIAL ranges.
 
@@ -56,7 +56,7 @@ impl CatalogEngine {
 
     /// Column definitions for `owner_id`, in key order. Its records must be keyed
     /// 0,1,2,… with no gap or duplicate: every consumer maps columns positionally.
-    pub(in crate::catalog) fn read_column_defs(&self, owner_id: u64) -> Result<Vec<ColumnDef>, String> {
+    pub(in crate::catalog) fn read_column_defs(&self, owner_id: u64) -> Result<Vec<CatalogColumn>, String> {
         let mut defs = Vec::new();
         let mut err = None;
         self.for_each_row_under(SysFamily::Column, owner_id, |c| {
@@ -146,7 +146,7 @@ impl CatalogEngine {
         let defs = self.read_column_defs(table_id).unwrap_or_default();
         col_indices
             .iter()
-            .map(|&ci| defs.get(ci as usize).map_or("?", |d| d.name.as_str()))
+            .map(|&ci| defs.get(ci as usize).map_or("?", |d| d.def.name.as_str()))
             .collect::<Vec<_>>()
             .join(", ")
     }

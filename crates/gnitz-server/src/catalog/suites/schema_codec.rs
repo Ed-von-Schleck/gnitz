@@ -1,29 +1,28 @@
-//! The meta-schema record across the two adapters that build it: this catalog's
-//! (`ColumnDef`s → record) and `gnitz-core`'s (client `Schema` → record).
+//! The meta-schema record as this catalog builds and decodes it, and the client
+//! halves the engine is paired with: the layout digest and the DDL bundle.
 //!
 //! It lives on this side because nothing links this crate, so the client is the
-//! half that can be pulled in — as a dev-dependency. The two must agree byte for
-//! byte: each encodes what the other decodes on every schema-bearing frame.
+//! half that can be pulled in — as a dev-dependency.
 
-use crate::catalog::cache::{named_record, CatalogRecord};
-use crate::catalog::ColumnDef;
+use crate::catalog::cache::CatalogRecord;
+use crate::catalog::CatalogColumn;
 use crate::test_support::arb_type_code;
 use gnitz_store::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::Batch;
-use gnitz_wire::{ColType, TypeCode, MAX_PK_COLUMNS};
+use gnitz_wire::{ColumnDef, TypeCode, MAX_PK_COLUMNS};
 use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 
 /// One generated schema — per column its type and nullability, and the PK list
-/// in declared order — from which every adapter below is fed, so each encodes
+/// in declared order — from which every builder below is fed, so each describes
 /// the same columns.
 type Cols = (Vec<TypeCode>, Vec<bool>, Vec<u32>);
 
 /// `max_pk` bounds the generated PK arity: the engine's schemas run to
 /// `MAX_PK_COLUMNS` (5, the secondary-index schema width), but the persisted
-/// client codec caps at `PK_LIST_MAX_COLS` (4) — tests that decode through the
-/// client (`schema_from_block` → `Schema::validate`) must stay within it.
+/// client codec caps at `PK_LIST_MAX_COLS` (4) — tests that go through the
+/// client (`Schema::from_block` → `Schema::validate`) must stay within it.
 fn arb_schema(max_pk: usize) -> impl Strategy<Value = Cols> {
     // n_cols ≥ 1, so `1..=n_cols.min(max_pk)` is never empty.
     (1usize..=8)
@@ -43,7 +42,7 @@ fn arb_schema(max_pk: usize) -> impl Strategy<Value = Cols> {
             idx.sort_by_key(|&i| weights[i as usize]);
             let pk: Vec<u32> = idx[..k].to_vec();
             // PK columns must be PK-eligible and non-nullable; remap ineligible
-            // draws to U64 so every adapter accepts the schema.
+            // draws to U64 so every builder accepts the schema.
             let is_pk = |i: usize| pk.contains(&(i as u32));
             let types = (0..n_cols)
                 .map(|i| {
@@ -69,28 +68,24 @@ fn descriptor((types, nullables, pk): &Cols) -> SchemaDescriptor {
 }
 
 /// The catalog's column records, named `c{i}`.
-fn catalog_defs((types, nullables, _): &Cols) -> Vec<ColumnDef> {
+fn catalog_defs((types, nullables, _): &Cols) -> Vec<CatalogColumn> {
     types
         .iter()
         .zip(nullables)
         .enumerate()
-        .map(|(i, (&tc, &is_nullable))| ColumnDef {
-            is_nullable,
-            ..ColumnDef::new(format!("c{i}"), ColType::of(tc))
-        })
+        .map(|(i, (&tc, &nullable))| ColumnDef::new(format!("c{i}"), tc, nullable).into())
         .collect()
 }
 
 /// The client's schema, named `c{i}`.
 fn client_schema((types, nullables, pk): &Cols) -> gnitz_core::protocol::types::Schema {
-    use gnitz_core::protocol::types::{ColumnDef, Schema};
     let columns = types
         .iter()
         .zip(nullables)
         .enumerate()
         .map(|(i, (&tc, &nullable))| ColumnDef::new(format!("c{i}"), tc, nullable))
         .collect();
-    Schema { columns, pk_cols: pk.clone() }
+    gnitz_core::protocol::types::Schema { columns, pk_cols: pk.clone() }
 }
 
 fn assert_descriptor_eq(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Result<(), TestCaseError> {
@@ -121,20 +116,10 @@ proptest! {
     /// Catalog encoder → catalog decoder.
     #[test]
     fn schema_roundtrip_catalog_codec(cols in arb_schema(MAX_PK_COLUMNS)) {
-        let wire = named_record(&catalog_defs(&cols), &cols.2);
+        let wire = CatalogRecord::new(&cols.2, &catalog_defs(&cols)).bytes;
         let decoded = decode_schema_block(&wire)
             .expect("decode must succeed for any valid schema");
         assert_descriptor_eq(&descriptor(&cols), &decoded)?;
-    }
-
-    /// Client encoder → client decoder.
-    #[test]
-    fn schema_roundtrip_client_codec(cols in arb_schema(gnitz_wire::PK_LIST_MAX_COLS)) {
-        use gnitz_core::protocol::codec::{encode_schema_block, schema_from_block};
-
-        let client = client_schema(&cols);
-        let wire = encode_schema_block(&client);
-        prop_assert_eq!(schema_from_block(&wire).unwrap(), client);
     }
 
     /// A record the catalog admits for a relation — names and hidden flags free
@@ -142,22 +127,13 @@ proptest! {
     #[test]
     fn an_admitted_record_decodes_as_itself(cols in arb_schema(MAX_PK_COLUMNS), hidden in any::<bool>()) {
         let catalog = CatalogRecord::new(&cols.2, &catalog_defs(&cols));
-        let frame_defs: Vec<ColumnDef> = catalog_defs(&cols)
-            .into_iter()
-            .map(|d| ColumnDef { name: format!("renamed_{}", d.name), is_hidden: hidden, ..d })
-            .collect();
-        let frame = named_record(&frame_defs, &cols.2);
+        let mut client = client_schema(&cols);
+        for c in &mut client.columns {
+            c.name = format!("renamed_{}", c.name);
+            c.is_hidden = hidden;
+        }
+        let frame = client.to_block();
         prop_assert_eq!(catalog.decode_of(&frame).unwrap(), decode_schema_block(&frame).unwrap());
-    }
-
-    /// Both crates' adapters emit the same bytes for the same schema.
-    #[test]
-    fn schema_block_bytes_agree_across_the_two_adapters(cols in arb_schema(gnitz_wire::PK_LIST_MAX_COLS)) {
-        use gnitz_core::protocol::codec::encode_schema_block;
-
-        let catalog = named_record(&catalog_defs(&cols), &cols.2);
-        let client = encode_schema_block(&client_schema(&cols));
-        prop_assert_eq!(catalog, client);
     }
 }
 
@@ -185,60 +161,67 @@ proptest! {
 }
 
 /// Client `encode_ddl_txn` → server `decode_items` → `Batch::decode_from_wal_block`
-/// against each family's own schema, for 1-, 2-, 3-, and 5-family bundles.
+/// against each family's own schema, for 1-, 2- and 3-family bundles.
 ///
 /// The frame layout itself is `gnitz_wire::txn_frame`'s, round-tripped in that
 /// crate, and both ends derive their system schemas from `gnitz_wire::SYS_FAMILIES`
 /// rather than hand-keeping them. What is only covered here is the pairing:
-/// a client-built WAL block per family, decoded by the engine against the
-/// catalog's own schema for that family — over seven real system schemas, with
-/// STRING columns and compound PKs.
+/// a client-built WAL block per family, written by the shared row writers the
+/// client uses, decoded by the engine against the catalog's own schema for that
+/// family — with STRING columns and compound PKs.
 #[test]
 fn ddl_txn_roundtrip_client_to_server() {
     use gnitz_core::protocol::types::{BatchAppender, ZSetBatch};
     use gnitz_core::types::sys_schema;
+    use gnitz_wire::sys_rows::{
+        write_circuit_node_row, write_col_tab_row, write_idx_tab_row, write_table_tab_row, write_view_tab_row,
+        CircuitNodeRow, ColTabRow, IdxTabRow, TableTabRow, ViewTabRow,
+    };
     use gnitz_wire::txn_frame::decode_items;
     use gnitz_wire::{CIRCUIT_NODES_TAB, COL_TAB, IDX_TAB, TABLE_TAB, VIEW_TAB};
 
-    // Build a small COL_TAB batch for `oid` with `n` U64 columns.
+    // A COL_TAB batch for `oid` with `n` U64 columns.
     let col_batch = |oid: u64, n: usize| -> ZSetBatch {
         let s = sys_schema(COL_TAB);
         let mut b = ZSetBatch::new(s);
-        {
-            let mut a = BatchAppender::new(&mut b, s);
-            for i in 0..n {
-                a.add_row_cols(&[oid as u128, i as u128], 1)
-                    .str_val(&format!("c{i}"))
-                    .u64_val(4) // type_code U64
-                    .u64_val(0) // is_nullable
-                    .u64_val(0) // fk_table_id
-                    .u64_val(0) // fk_col_idx
-                    .u64_val(0) // is_hidden
-                    .u64_val(0); // scale
-            }
+        let mut a = BatchAppender::new(&mut b, s);
+        for i in 0..n {
+            let col = ColumnDef::new(format!("c{i}"), TypeCode::U64, false);
+            let row = ColTabRow {
+                owner_id: oid,
+                col_idx: i as u64,
+                col: &col,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            };
+            write_col_tab_row(&mut a, &row, 1);
         }
         b
     };
     let table_batch = |tid: u64, weight: i64| -> ZSetBatch {
         let s = sys_schema(TABLE_TAB);
         let mut b = ZSetBatch::new(s);
-        BatchAppender::new(&mut b, s)
-            .add_row(tid as u128, weight)
-            .u64_val(3) // schema_id
-            .str_val("t")
-            .u64_val(0)
-            .u64_val(0);
+        let row = TableTabRow {
+            table_id: tid,
+            schema_id: 3,
+            name: "t",
+            pk_col_idx: 0,
+            flags: 0,
+        };
+        write_table_tab_row(&mut BatchAppender::new(&mut b, s), &row, weight);
         b
     };
     let idx_batch = |idx_id: u64, owner: u64| -> ZSetBatch {
         let s = sys_schema(IDX_TAB);
         let mut b = ZSetBatch::new(s);
-        BatchAppender::new(&mut b, s)
-            .add_row(idx_id as u128, 1)
-            .u64_val(owner)
-            .u64_val(gnitz_wire::pack_pk_cols(&[1]))
-            .str_val("idx_t_b")
-            .u64_val(1); // flags: unique, not internal
+        let row = IdxTabRow {
+            index_id: idx_id,
+            owner_id: owner,
+            source_col_idx: gnitz_wire::pack_pk_cols(&[1]),
+            name: "idx_t_b",
+            flags: 1, // unique, not internal
+        };
+        write_idx_tab_row(&mut BatchAppender::new(&mut b, s), &row, 1);
         b
     };
 
@@ -296,47 +279,47 @@ fn ddl_txn_roundtrip_client_to_server() {
         &[false, true, true],
     );
 
-    // 5-family: CREATE VIEW (COL + 3 circuit + VIEW). The compound-PK
-    // families are built with the client's exact low/high u128 packing.
+    // 3-family: CREATE VIEW (COL_TAB + circuit nodes + VIEW_TAB).
     let vid: u64 = 20;
     let src: u64 = 16;
-    // Compound-PK family: `pk = view_id (low) | node_id (high)`, matching the
-    // client's low/high packing. `check_pk` is false for it, so the exact node
-    // ids are arbitrary — pick non-trivial ones (clippy `identity_op`).
     let nodes = {
         let s = sys_schema(CIRCUIT_NODES_TAB);
         let mut b = ZSetBatch::new(s);
-        {
-            let mut a = BatchAppender::new(&mut b, s);
-            // ScanDelta(src), unwired and parameterless.
-            a.add_row((vid as u128) | (1u128 << 64), 1)
-                .u64_val(gnitz_wire::Opcode::ScanDelta.as_wire())
-                .u64_val(src)
-                .null()
-                .null()
-                .null();
-            // Integrate, fed by node 1.
-            a.add_row((vid as u128) | (2u128 << 64), 1)
-                .u64_val(gnitz_wire::Opcode::IntegrateSink.as_wire())
-                .null()
-                .u64_val(1)
-                .null()
-                .null();
-        }
+        let mut a = BatchAppender::new(&mut b, s);
+        // ScanDelta(src), unwired and parameterless.
+        let scan = CircuitNodeRow {
+            view_id: vid,
+            node_id: 1,
+            opcode: gnitz_wire::Opcode::ScanDelta.as_wire(),
+            source_table: Some(src),
+            inputs: [None, None],
+            params: None,
+        };
+        write_circuit_node_row(&mut a, &scan, 1);
+        // Integrate, fed by node 1.
+        let sink = CircuitNodeRow {
+            node_id: 2,
+            opcode: gnitz_wire::Opcode::IntegrateSink.as_wire(),
+            source_table: None,
+            inputs: [Some(1), None],
+            ..scan
+        };
+        write_circuit_node_row(&mut a, &sink, 1);
         b
     };
     let view = {
         let s = sys_schema(VIEW_TAB);
         let mut b = ZSetBatch::new(s);
-        BatchAppender::new(&mut b, s)
-            .add_row(vid as u128, 1)
-            .u64_val(3)
-            .str_val("v")
-            .u64_val(0) // pk_col_idx
-            .u64_val(0) // capacity_bytes
-            .u64_val(0) // delta_bytes
-            .u64_val(0) // owner_view_id
-            .u64_val(0); // flags
+        let row = ViewTabRow {
+            view_id: vid,
+            schema_id: 3,
+            name: "v",
+            pk_col_idx: 0,
+            props: gnitz_wire::ViewProps::default(),
+            owner_view_id: 0,
+            pk_repeats: false,
+        };
+        write_view_tab_row(&mut BatchAppender::new(&mut b, s), &row, 1);
         b
     };
     verify(

@@ -95,7 +95,7 @@ padding at the wire boundary never moves a key.
 
 **Hidden key slots.** Synthetic view keys (`_join_pk`, `_set_pk`, `_group_pk`, …)
 and unprojected passthrough PK columns are real schema columns flagged hidden
-(`ColMeta::hidden` on the wire, `COL_TAB.is_hidden` in the catalog). They are excluded from wildcard expansion, name resolution,
+(the schema record's `hidden` flag on the wire, `COL_TAB.is_hidden` in the catalog). They are excluded from wildcard expansion, name resolution,
 duplicate-name checks and client rows; PK region, routing, sort and consolidation
 are unaffected.
 

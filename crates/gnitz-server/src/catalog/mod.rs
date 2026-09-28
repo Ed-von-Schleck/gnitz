@@ -55,7 +55,7 @@ pub(crate) use sys_tables::SysFamily;
 #[cfg(test)]
 pub(crate) use sys_tables::PUBLIC_SCHEMA_ID;
 pub(crate) use sys_tables::{family_pk_partition, idx_tab_partition, PkPartition};
-pub(crate) use types::{ColumnDef, FkEdge};
+pub(crate) use types::{CatalogColumn, FkEdge};
 
 // Import everything from sys_tables for internal use.
 use precheck::build_schema_from_col_defs;

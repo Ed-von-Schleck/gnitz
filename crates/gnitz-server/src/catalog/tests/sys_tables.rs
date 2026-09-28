@@ -65,12 +65,9 @@ fn a_column_records_at_rest_pk_leads_with_the_owner() {
         &gnitz_wire::sys_rows::ColTabRow {
             owner_id: 0x1122,
             col_idx: 0xAABB,
-            name: "c",
-            ty: gnitz_wire::ColType::of(gnitz_wire::TypeCode::U64),
-            is_nullable: false,
+            col: &gnitz_wire::ColumnDef::new("c", gnitz_wire::TypeCode::U64, false),
             fk_table_id: 0,
             fk_col_idx: 0,
-            is_hidden: false,
         },
         1,
     );

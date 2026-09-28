@@ -44,7 +44,7 @@ fn reject_non_canonical(name: &str, noun: &str) -> Result<(), String> {
 /// list in hand; messages are bare predicates, and callers add the context. The
 /// duplicate-name rule is ingestion points only — a view segment legitimately
 /// carries two visible columns of one name (a join chain's output).
-fn check_col_defs(kind: RelationKind, col_defs: &[ColumnDef]) -> Result<(), String> {
+fn check_col_defs(kind: RelationKind, col_defs: &[CatalogColumn]) -> Result<(), String> {
     if col_defs.is_empty() {
         return Err("has no column records".into());
     }
@@ -66,20 +66,20 @@ fn check_col_defs(kind: RelationKind, col_defs: &[ColumnDef]) -> Result<(), Stri
         let mut seen = FxHashSet::default();
         if let Some(cd) = col_defs
             .iter()
-            .filter(|c| !c.is_hidden)
-            .find(|c| !seen.insert(c.name.to_ascii_lowercase()))
+            .filter(|c| !c.def.is_hidden)
+            .find(|c| !seen.insert(c.def.name.to_ascii_lowercase()))
         {
-            return Err(format!("has duplicate column name '{}'", cd.name));
+            return Err(format!("has duplicate column name '{}'", cd.def.name));
         }
     }
     Ok(())
 }
 
 /// `gnitz-wire`'s PK rule set, in wire's own wording.
-fn validate_pk_against_cols(col_defs: &[ColumnDef], pk_cols: &[u32]) -> Result<(), String> {
+fn validate_pk_against_cols(col_defs: &[CatalogColumn], pk_cols: &[u32]) -> Result<(), String> {
     gnitz_wire::validate_pk_tuple(pk_cols, col_defs.len(), gnitz_wire::PK_LIST_MAX_COLS, |c| {
         let cd = &col_defs[c as usize];
-        (cd.ty.tc, cd.is_nullable)
+        (cd.def.ty.tc, cd.def.is_nullable)
     })
     .map(|_stride| ())
     .map_err(|rule| rule.to_string())
@@ -89,7 +89,7 @@ fn validate_pk_against_cols(col_defs: &[ColumnDef], pk_cols: &[u32]) -> Result<(
 /// rule they break.
 pub(in crate::catalog) fn build_schema_from_col_defs(
     kind: RelationKind,
-    col_defs: &[ColumnDef],
+    col_defs: &[CatalogColumn],
     pk_cols: &[u32],
     placement: Placement,
 ) -> Result<SchemaDescriptor, String> {
@@ -97,7 +97,7 @@ pub(in crate::catalog) fn build_schema_from_col_defs(
     validate_pk_against_cols(col_defs, pk_cols)?;
     let cols: Vec<SchemaColumn> = col_defs
         .iter()
-        .map(|cd| SchemaColumn::new(cd.ty.tc, cd.is_nullable))
+        .map(|cd| SchemaColumn::new(cd.def.ty.tc, cd.def.is_nullable))
         .collect();
     Ok(SchemaDescriptor::new_with_placement(&cols, pk_cols, placement))
 }
@@ -228,11 +228,11 @@ impl CatalogEngine {
     pub(super) fn validate_fk_columns(
         &self,
         tid: u64,
-        col_defs: &[ColumnDef],
+        col_defs: &[CatalogColumn],
         pk: &[u32],
         net_dead: &[u64],
     ) -> Result<(), String> {
-        let self_pk_type = col_defs[pk[0] as usize].ty.tc;
+        let self_pk_type = col_defs[pk[0] as usize].def.ty.tc;
         for cd in col_defs.iter().filter(|cd| cd.fk_table_id != 0) {
             self.validate_fk_column(cd, tid, pk, self_pk_type, net_dead)?;
         }
@@ -241,7 +241,7 @@ impl CatalogEngine {
 
     fn validate_fk_column(
         &self,
-        col: &ColumnDef,
+        col: &CatalogColumn,
         self_table_id: u64,
         self_pk: &[u32],
         self_pk_type: TypeCode,
@@ -296,10 +296,10 @@ impl CatalogEngine {
         // The preflight compares child and parent values as the referenced
         // column's key image, so both columns carry one type; SQL adopts the
         // parent's type before the engine sees the column.
-        if col.ty.tc != target_type {
+        if col.def.ty.tc != target_type {
             return Err(format!(
                 "FK type mismatch: child type code {} cannot reference target type code {target_type}",
-                col.ty.tc
+                col.def.ty.tc
             ));
         }
         Ok(())
@@ -445,13 +445,13 @@ impl CatalogEngine {
                 Some(old) => {
                     // A dropped column is gone from every surface: nothing may
                     // rename, re-show or re-null it.
-                    if old.is_hidden {
+                    if old.def.is_hidden {
                         return Err(format!("cannot ALTER dropped column {col_idx} of table {owner_id}"));
                     }
-                    if new.is_nullable != old.is_nullable && !new.is_nullable {
+                    if new.def.is_nullable != old.def.is_nullable && !new.def.is_nullable {
                         return Err("a column-ALTER may only set is_nullable 0→1 (DROP NOT NULL)".into());
                     }
-                    let (hides, unnulls) = (new.is_hidden, new.is_nullable != old.is_nullable);
+                    let (hides, unnulls) = (new.def.is_hidden, new.def.is_nullable != old.def.is_nullable);
                     let prospective = self.col_defs_with(owner_id, col_idx, new)?;
                     check_col_defs(RelationKind::BaseTable, &prospective)
                         .map_err(|e| format!("cannot ALTER COLUMN on table {owner_id}: {e}"))?;
@@ -462,7 +462,7 @@ impl CatalogEngine {
                         // views, which bind columns by ordinal.
                         (false, false) => continue,
                     };
-                    let name = &old.name;
+                    let name = &old.def.name;
                     if owner_schema.is_pk_col(col_idx as usize) {
                         return Err(format!("cannot {op} '{name}': it is a primary-key column"));
                     }
@@ -513,7 +513,7 @@ impl CatalogEngine {
     /// `owner_id`'s column records as this batch's `+1` row for `col_idx` leaves
     /// them: the decoded row replaces the live record at that index, or extends
     /// the set when the transition appends one.
-    fn col_defs_with(&self, owner_id: u64, col_idx: u64, row: ColumnDef) -> Result<Vec<ColumnDef>, String> {
+    fn col_defs_with(&self, owner_id: u64, col_idx: u64, row: CatalogColumn) -> Result<Vec<CatalogColumn>, String> {
         let mut defs = self.read_column_defs(owner_id)?;
         match defs.get_mut(col_idx as usize) {
             Some(live) => *live = row,
@@ -526,7 +526,7 @@ impl CatalogEngine {
     /// column to registered base table `owner_id`.
     fn precheck_column_append(
         &mut self,
-        appended: ColumnDef,
+        appended: CatalogColumn,
         owner_id: u64,
         col_idx: u64,
         owner_schema: &SchemaDescriptor,
@@ -550,10 +550,10 @@ impl CatalogEngine {
             .map_err(|e| format!("cannot ADD COLUMN on table {owner_id}: {e}"))?;
         // A new column over existing rows is unconditionally nullable, carries
         // no FK, and is visible.
-        if !appended.is_nullable {
+        if !appended.def.is_nullable {
             return Err("ADD COLUMN must append a nullable column".into());
         }
-        if appended.is_hidden || appended.fk_table_id != 0 {
+        if appended.def.is_hidden || appended.fk_table_id != 0 {
             return Err("ADD COLUMN must not append a hidden or foreign-key column".into());
         }
         // Last, as in the rewrite-pair arm: a malformed append is reported as
@@ -792,13 +792,13 @@ impl CatalogEngine {
                     if let Some(cd) = col_defs.iter().find(|cd| cd.fk_table_id != 0) {
                         return Err(format!(
                             "relation {id} is a stream: column '{}' may not carry a FOREIGN KEY",
-                            cd.name
+                            cd.def.name
                         ));
                     }
                 }
                 if serial {
                     let pk_cols = pk.as_slice().iter().map(|&c| &col_defs[c as usize]);
-                    gnitz_wire::validate_serial_key(pk_cols.map(|cd| (cd.name.as_str(), cd.ty)))
+                    gnitz_wire::validate_serial_key(pk_cols.map(|cd| (cd.def.name.as_str(), cd.def.ty)))
                         .map_err(|e| format!("table '{name}' (id={id}): {e}"))?;
                 }
                 // `validate_pk_against_cols` above proved the PK list non-empty
@@ -855,7 +855,7 @@ impl CatalogEngine {
         let defs = self.read_column_defs(owner_id)?;
         if let Some(&c) = cols
             .iter()
-            .find(|&&c| defs.get(c as usize).is_some_and(|d| d.is_hidden))
+            .find(|&&c| defs.get(c as usize).is_some_and(|d| d.def.is_hidden))
         {
             return Err(format!("Index: column {c} of table {owner_id} is dropped"));
         }

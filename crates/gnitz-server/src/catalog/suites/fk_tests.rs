@@ -270,9 +270,10 @@ fn test_fk_self_reference() {
     let next_tid = engine.next_id;
     let emp_cols = vec![
         col_def("emp_id", TypeCode::U64),
-        ColumnDef {
-            is_nullable: true,
-            ..fk_def("mgr_id", TypeCode::U64, next_tid, 0)
+        CatalogColumn {
+            fk_table_id: next_tid,
+            fk_col_idx: 0,
+            ..nullable_def("mgr_id", TypeCode::U64)
         },
     ];
     let emp_tid = engine.create_table("public.employees", &emp_cols, &[0]).unwrap();
@@ -366,9 +367,10 @@ fn test_push_reads_committed_state() {
     let next_tid = engine.next_id;
     let tree_cols = vec![
         col_def("id", TypeCode::U64),
-        ColumnDef {
-            is_nullable: true,
-            ..fk_def("parent_id", TypeCode::U64, next_tid, 0)
+        CatalogColumn {
+            fk_table_id: next_tid,
+            fk_col_idx: 0,
+            ..nullable_def("parent_id", TypeCode::U64)
         },
     ];
     let tree_tid = engine.create_table("public.tree", &tree_cols, &[0]).unwrap();

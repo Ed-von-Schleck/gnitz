@@ -12,7 +12,7 @@ use gnitz_wire::{decode_all, Reader, Writer};
 pub(crate) struct MirrorRecord {
     pub(crate) schema_name: String,
     pub(crate) name: String,
-    /// The wire schema block `gnitz-core`'s codec produced; the copy's layout.
+    /// The view's schema record; the copy's layout.
     pub(crate) block: Vec<u8>,
     /// Where the copy's feed got to; `None` says the copy is not valid to read.
     pub(crate) cursor: Option<DeltaCursor>,
@@ -32,9 +32,9 @@ impl MirrorRecord {
         w.into_vec()
     }
 
-    /// `None` for bytes [`Self::encode`] did not produce, or whose block
-    /// describes no layout.
-    pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
+    /// The record and the layout its block describes; `None` for bytes
+    /// [`Self::encode`] did not produce, or whose block describes no layout.
+    pub(crate) fn decode(bytes: &[u8]) -> Option<(Self, SchemaDescriptor)> {
         let rec = decode_all(bytes, "mirror record", |r| {
             let cursor = match r.bool()? {
                 false => None,
@@ -53,8 +53,8 @@ impl MirrorRecord {
             })
         })
         .ok()?;
-        descriptor_of_block(&rec.block).ok()?;
-        Some(rec)
+        let schema = descriptor_of_block(&rec.block).ok()?;
+        Some((rec, schema))
     }
 }
 

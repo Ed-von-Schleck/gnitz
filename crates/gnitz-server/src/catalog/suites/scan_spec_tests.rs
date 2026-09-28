@@ -13,7 +13,7 @@ use gnitz_store::storage::Batch;
 use gnitz_wire::{Cut, KeyRange, OrderKey, PkColList, PkKeys, ReadBound, ReadSpec};
 
 /// The `(id U64 PK | val I64)` schema both bases below use.
-fn id_val_cols() -> Vec<ColumnDef> {
+fn id_val_cols() -> Vec<CatalogColumn> {
     vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)]
 }
 
@@ -490,7 +490,7 @@ fn huge_limit_does_not_truncate_the_early_stop() {
 /// keeper arena grows `Fill::Uninit`.
 fn proj_fixture(
     name: &str,
-    cols: &[ColumnDef],
+    cols: &[CatalogColumn],
     n: u64,
     chunk_rows: usize,
     put_row: impl FnMut(&mut BatchBuilder, u64),

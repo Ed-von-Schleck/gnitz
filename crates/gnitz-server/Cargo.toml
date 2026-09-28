@@ -19,9 +19,9 @@ rustls.workspace = true
 rcgen.workspace = true
 
 [dev-dependencies]
-# Dev-only, and deliberately not a real dependency: the schema-codec suite
-# asserts the catalog's block encoder against the *client's*, which is the one
-# thing on the far side of the wire this crate must agree with byte for byte.
+# Dev-only, and deliberately not a real dependency: the client half of the
+# DDL-bundle client→server pairing and of the layout-digest agreement (the
+# schema-codec suite), and the client batches the executor tests push.
 gnitz-core = { path = "../gnitz-core" }
 proptest.workspace = true
 tempfile.workspace = true

@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_wire::COLTAB_PAY_NAME;
+use gnitz_wire::{ColumnDef, COLTAB_PAY_NAME};
 use std::collections::HashMap;
 
 // ── test_identifiers ─────────────────────────────────────────────────
@@ -279,7 +279,7 @@ fn test_edge_cases() {
         .is_err());
 
     // 10. Too many columns (> MAX_COLUMNS = 65)
-    let many: Vec<ColumnDef> = (0..66).map(|i| col_def(&format!("c{i}"), TypeCode::U64)).collect();
+    let many: Vec<CatalogColumn> = (0..66).map(|i| col_def(&format!("c{i}"), TypeCode::U64)).collect();
     assert!(engine.create_table("public.too_many", &many, &[0]).is_err());
 
     // 11. Drop system schema
@@ -450,7 +450,10 @@ fn test_restart_long_strings() {
         let tid = engine.get_by_name("longtest", "tbl").unwrap();
         let col_defs = engine.read_column_defs(tid).unwrap();
         assert_eq!(col_defs.len(), 2);
-        assert_eq!(col_defs[1].name, long_name, "Long column name corrupted after restart");
+        assert_eq!(
+            col_defs[1].def.name, long_name,
+            "Long column name corrupted after restart"
+        );
         engine.close();
     }
     let _ = fs::remove_dir_all(&dir);
@@ -987,7 +990,7 @@ fn a_bounded_view_source_is_named() {
 fn a_view_at_the_column_limit_cannot_carry_a_feed() {
     let dir = temp_dir("fed_view_at_the_column_limit");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols: Vec<ColumnDef> = (0..gnitz_wire::MAX_COLUMNS)
+    let cols: Vec<CatalogColumn> = (0..gnitz_wire::MAX_COLUMNS)
         .map(|i| crate::test_support::col_def(&format!("c{i}"), gnitz_wire::TypeCode::U64))
         .collect();
     let tid = create_flagged_table(&mut engine, "wide", &cols, &[0], 0);
@@ -1058,10 +1061,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
     let col_defs = vec![
         col_def("id", TypeCode::U64),
         col_def("a", TypeCode::I64),
-        ColumnDef {
-            is_hidden: true,
-            ..col_def("a", TypeCode::I64)
-        },
+        ColumnDef::new("a", TypeCode::I64, false).hidden().into(),
     ];
     let tid = engine.allocate_ids(1).unwrap();
     engine.write_column_records(tid, &col_defs).unwrap();

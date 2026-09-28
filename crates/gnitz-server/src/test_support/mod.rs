@@ -1,7 +1,7 @@
 //! Test helpers: this crate's own, plus two of `gnitz-store`'s compiled in.
 //!
 //! [`internal`] is this crate's own — the helpers that name `CatalogEngine` and
-//! `ColumnDef`, and reach crate-internals as `crate::`. [`store`] is
+//! `CatalogColumn`, and reach crate-internals as `crate::`. [`store`] is
 //! `gnitz-store`'s `shared` file, compiled here a second time from that one
 //! source so a fixture is not two independent Z-set batch builders free to
 //! drift; [`ladder`] is its rung-guard walk, so the two crates' guards cannot

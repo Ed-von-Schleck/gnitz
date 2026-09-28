@@ -73,7 +73,7 @@ impl CatalogEngine {
         id: u64,
         kind: RelationKind,
         pk: &[u32],
-        defs: &[ColumnDef],
+        defs: &[CatalogColumn],
         facts: RelFacts,
     ) {
         let fks: Vec<FkEdge> = defs

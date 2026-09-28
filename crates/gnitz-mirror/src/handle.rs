@@ -83,11 +83,15 @@ impl Mirror {
         for (tid, record) in persisted {
             let reopened = match record.map(|bytes| MirrorRecord::decode(&bytes)) {
                 // Reopened from the manifest `rec` was read from.
-                Ok(Some(rec)) => descriptor_of_block(&rec.block).and_then(|schema| {
-                    mirror.registry.reopen_view(copy_spec(tid, schema)).map_err(engine)?;
-                    mirror.records.insert(tid, rec);
-                    Ok(())
-                }),
+                Ok(Some((rec, schema))) => {
+                    mirror
+                        .registry
+                        .reopen_view(copy_spec(tid, schema))
+                        .map_err(engine)
+                        .map(|()| {
+                            mirror.records.insert(tid, rec);
+                        })
+                }
                 // Damage: the sweep below removes the directory.
                 Ok(None) => continue,
                 Err(e) => Err(engine(e)),
@@ -202,7 +206,7 @@ impl MirrorStore for Mirror {
         schema: &Schema,
     ) -> Result<Option<u64>, MirrorError> {
         self.touching("registering a view", |m| {
-            let block = gnitz_core::protocol::codec::encode_schema_block(schema);
+            let block = schema.to_block();
             // This name at another id was renamed or recreated upstream.
             let renamed = m
                 .records

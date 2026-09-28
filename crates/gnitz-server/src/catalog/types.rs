@@ -1,37 +1,22 @@
-use gnitz_wire::ColType;
+use gnitz_wire::ColumnDef;
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Column definition for create_table.
+/// A catalog column: the logical column plus its FK, already resolved.
 #[derive(Clone, Debug)]
-pub(crate) struct ColumnDef {
-    pub(crate) name: String,
-    /// The column's type. A DECIMAL's scale (COL_TAB `scale`) is echoed verbatim
-    /// into reply schema blocks; the engine never branches on it.
-    pub(crate) ty: ColType,
-    pub(crate) is_nullable: bool,
+pub(crate) struct CatalogColumn {
+    pub(crate) def: ColumnDef,
+    /// The referenced parent table; `0` means "no FK".
     pub(crate) fk_table_id: u64,
     pub(crate) fk_col_idx: u32,
-    /// Hidden key slot (COL_TAB `is_hidden`). The engine never branches on it —
-    /// it is echoed verbatim into reply schema blocks (`ColMeta::hidden`) so
-    /// clients can suppress the column in presentation.
-    pub(crate) is_hidden: bool,
 }
 
-impl ColumnDef {
-    /// The plain column of type `ty` — no nullability, no FK, no marker flags —
-    /// so a construction site names only what it actually varies.
-    pub(crate) fn new(name: impl Into<String>, ty: ColType) -> Self {
-        ColumnDef {
-            name: name.into(),
-            ty,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-            is_hidden: false,
-        }
+/// A column with no FK.
+impl From<ColumnDef> for CatalogColumn {
+    fn from(def: ColumnDef) -> Self {
+        CatalogColumn { def, fk_table_id: 0, fk_col_idx: 0 }
     }
 }
 

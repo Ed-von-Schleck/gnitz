@@ -1,6 +1,6 @@
 use gnitz_expr::{ColumnTable, SchemaFacts};
 
-pub use gnitz_wire::{ColType, FixedInt, PkBuf, ScalarKind, TypeCode};
+pub use gnitz_wire::{ColType, ColumnDef, FixedInt, PkBuf, ScalarKind, TypeCode};
 pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS};
 
 /// The relation and column a FOREIGN KEY column references. `SelfTable` names the
@@ -9,65 +9,6 @@ pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS};
 pub enum FkTarget {
     Table { id: u64, col: u32 },
     SelfTable { col: u32 },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ColumnDef {
-    pub name: std::string::String,
-    /// The column's logical type, a DECIMAL's scale included.
-    pub ty: ColType,
-    pub is_nullable: bool,
-    /// A physical column no name the user writes can reach.
-    pub is_hidden: bool,
-}
-
-impl ColumnDef {
-    /// A visible column.
-    pub fn new(name: impl Into<String>, type_code: TypeCode, is_nullable: bool) -> Self {
-        Self::typed(name, ColType::of(type_code), is_nullable)
-    }
-
-    /// [`ColumnDef::new`] from a logical type, which is how a DECIMAL column,
-    /// or a column declared from a computed expression, states its scale.
-    pub fn typed(name: impl Into<String>, ty: ColType, is_nullable: bool) -> Self {
-        Self {
-            name: name.into(),
-            ty,
-            is_nullable,
-            is_hidden: false,
-        }
-    }
-
-    /// This column as the `COL_TAB` row recording it: column `col_idx` of
-    /// `owner_id`, referencing `fk`.
-    pub fn col_tab_row(
-        &self,
-        owner_id: u64,
-        col_idx: usize,
-        fk: Option<FkTarget>,
-    ) -> gnitz_wire::sys_rows::ColTabRow<'_> {
-        let (fk_table_id, fk_col_idx) = match fk {
-            None => (0, 0),
-            Some(FkTarget::SelfTable { col }) => (owner_id, col as u64),
-            Some(FkTarget::Table { id, col }) => (id, col as u64),
-        };
-        gnitz_wire::sys_rows::ColTabRow {
-            owner_id,
-            col_idx: col_idx as u64,
-            name: &self.name,
-            ty: self.ty,
-            is_nullable: self.is_nullable,
-            fk_table_id,
-            fk_col_idx,
-            is_hidden: self.is_hidden,
-        }
-    }
-
-    /// Mark this column hidden.
-    pub fn hidden(mut self) -> Self {
-        self.is_hidden = true;
-        self
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -199,6 +140,27 @@ impl Schema {
         let s = Schema { columns, pk_cols };
         s.validate()?;
         Ok(s)
+    }
+
+    /// This schema's meta-schema record — the bytes a schema-bearing push embeds.
+    pub fn to_block(&self) -> Vec<u8> {
+        gnitz_wire::schema_block::encode(self.columns.iter().map(ColumnDef::block_col), &self.pk_cols)
+    }
+
+    /// The schema a meta-schema record describes.
+    pub fn from_block(block: &[u8]) -> Result<Schema, String> {
+        let mut columns = Vec::new();
+        let pk = gnitz_wire::schema_block::decode(block, |c| {
+            let name = std::str::from_utf8(c.name).map_err(|e| format!("utf8 in column name: {e}"))?;
+            columns.push(ColumnDef {
+                name: name.to_owned(),
+                ty: c.ty,
+                is_nullable: c.nullable,
+                is_hidden: c.hidden,
+            });
+            Ok(())
+        })?;
+        Schema::from_parts(columns, pk.as_slice().to_vec())
     }
 
     /// Whether `self` and `other` have the same physical layout: column count,

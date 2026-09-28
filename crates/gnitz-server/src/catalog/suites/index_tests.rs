@@ -718,7 +718,7 @@ fn drop_table_removes_the_relation_entry() {
     engine.create_index("public.t", &["val"], false).unwrap();
 
     // A column rename bumps the registered table's version.
-    let rename = col_alter_pair(tid, 1, &col_def("val", TypeCode::I64), |c| c.name = "val2".into());
+    let rename = col_alter_pair(tid, 1, &col_def("val", TypeCode::I64), |c| c.def.name = "val2".into());
     engine.submit(SysFamily::Column, rename).unwrap();
 
     assert!(

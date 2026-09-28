@@ -70,39 +70,34 @@ fn assert_col_tab_slots(r: &ColTabRow, weight: i64) {
     assert_eq!(rec.pk, [r.owner_id as u128, r.col_idx as u128]);
     assert_eq!(rec.weight, weight);
     let v = rec.row(COL_TAB_COLS, 2); // compound PK: two key columns
-    assert_eq!(v[COLTAB_PAY_NAME], Val::Str(r.name.into()));
-    assert_eq!(v[COLTAB_PAY_TYPE_CODE], Val::U64(r.ty.tc.as_wire() as u64));
-    assert_eq!(v[COLTAB_PAY_IS_NULLABLE], Val::U64(r.is_nullable as u64));
+    assert_eq!(v[COLTAB_PAY_NAME], Val::Str(r.col.name.clone()));
+    assert_eq!(v[COLTAB_PAY_TYPE_CODE], Val::U64(r.col.ty.tc.as_wire() as u64));
+    assert_eq!(v[COLTAB_PAY_IS_NULLABLE], Val::U64(r.col.is_nullable as u64));
     assert_eq!(v[COLTAB_PAY_FK_TABLE_ID], Val::U64(r.fk_table_id));
     assert_eq!(v[COLTAB_PAY_FK_COL_IDX], Val::U64(r.fk_col_idx));
-    assert_eq!(v[COLTAB_PAY_IS_HIDDEN], Val::U64(r.is_hidden as u64));
-    assert_eq!(v[COLTAB_PAY_SCALE], Val::U64(r.ty.scale as u64));
+    assert_eq!(v[COLTAB_PAY_IS_HIDDEN], Val::U64(r.col.is_hidden as u64));
+    assert_eq!(v[COLTAB_PAY_SCALE], Val::U64(r.col.ty.scale as u64));
 }
 
 /// Each value must land in the payload slot the readers look for it in.
 #[test]
 fn values_land_in_their_named_payload_slots() {
     // Distinct values per u64 field.
+    let score = crate::ColumnDef::typed("score", crate::ColType::decimal(5), true);
     let witness = ColTabRow {
         owner_id: 16,
         col_idx: 2,
-        name: "score",
-        ty: crate::ColType::decimal(5),
-        is_nullable: true,
+        col: &score,
         fk_table_id: 17,
         fk_col_idx: 3,
-        is_hidden: false,
     };
     assert_col_tab_slots(&witness, -1);
     // Both booleans flipped, so a transposed pair fails one of the two rows.
-    assert_col_tab_slots(
-        &ColTabRow {
-            is_nullable: false,
-            is_hidden: true,
-            ..witness
-        },
-        1,
-    );
+    let flipped = crate::ColumnDef {
+        is_nullable: false,
+        ..score.clone().hidden()
+    };
+    assert_col_tab_slots(&ColTabRow { col: &flipped, ..witness }, 1);
 
     let mut r = Recorder::default();
     write_idx_tab_row(

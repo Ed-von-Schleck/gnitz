@@ -3,7 +3,6 @@ mod spine_tests {
     //! end of a socketpair feeds reply frames one `step` at a time.
 
     use crate::connection::*;
-    use crate::protocol::codec::encode_schema_block;
     use crate::protocol::message::encode_frame;
     use crate::protocol::transport::{poll_fd, ClientTransport};
     use crate::protocol::{BatchAppender, ColumnDef, TypeCode, WireStatus};
@@ -100,7 +99,7 @@ mod spine_tests {
         encode_frame(
             reply_header(tid, version, lsn, cont),
             &[],
-            Some(&encode_schema_block(schema)),
+            Some(&schema.to_block()),
             Some(batch),
         )
     }

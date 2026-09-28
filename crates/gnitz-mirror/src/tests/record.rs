@@ -12,7 +12,7 @@ fn schema_block() -> Vec<u8> {
         ],
         pk_cols: vec![0],
     };
-    gnitz_core::protocol::codec::encode_schema_block(&schema)
+    schema.to_block()
 }
 
 fn record(cursor: Option<DeltaCursor>) -> MirrorRecord {
@@ -34,7 +34,7 @@ fn one_cursor() -> Option<DeltaCursor> {
 #[test]
 fn a_record_with_a_cursor_round_trips() {
     let rec = record(one_cursor());
-    assert_eq!(MirrorRecord::decode(&rec.encode()), Some(rec));
+    assert_eq!(MirrorRecord::decode(&rec.encode()).map(|(r, _)| r), Some(rec));
 }
 
 /// A registration with no feed position comes back with none, rather than as a
@@ -43,25 +43,29 @@ fn a_record_with_a_cursor_round_trips() {
 #[test]
 fn a_record_without_a_cursor_reads_back_without_one() {
     let rec = record(None);
-    assert_eq!(MirrorRecord::decode(&rec.encode()), Some(rec));
+    assert_eq!(MirrorRecord::decode(&rec.encode()).map(|(r, _)| r), Some(rec));
 }
 
 #[test]
 fn truncated_or_overlong_bytes_are_refused() {
     let bytes = record(one_cursor()).encode();
     for cut in 0..bytes.len() {
-        assert_eq!(MirrorRecord::decode(&bytes[..cut]), None, "bytes cut at {cut}");
+        assert_eq!(
+            MirrorRecord::decode(&bytes[..cut]).map(|(r, _)| r),
+            None,
+            "bytes cut at {cut}"
+        );
     }
     let mut longer = bytes;
     longer.push(0);
-    assert_eq!(MirrorRecord::decode(&longer), None);
+    assert_eq!(MirrorRecord::decode(&longer).map(|(r, _)| r), None);
 }
 
 #[test]
 fn an_unknown_cursor_flag_is_refused() {
     let mut bytes = record(one_cursor()).encode();
     bytes[0] = 2;
-    assert_eq!(MirrorRecord::decode(&bytes), None);
+    assert_eq!(MirrorRecord::decode(&bytes).map(|(r, _)| r), None);
 }
 
 #[test]
@@ -70,7 +74,7 @@ fn a_block_describing_no_layout_is_refused() {
         block: vec![0xAB; 20],
         ..record(one_cursor())
     };
-    assert_eq!(MirrorRecord::decode(&rec.encode()), None);
+    assert_eq!(MirrorRecord::decode(&rec.encode()).map(|(r, _)| r), None);
 }
 
 #[test]
@@ -78,5 +82,5 @@ fn a_cursor_at_round_0_is_refused() {
     let mut bytes = record(one_cursor()).encode();
     // The flag byte, then the tag, then the tick.
     bytes[9..17].fill(0);
-    assert_eq!(MirrorRecord::decode(&bytes), None);
+    assert_eq!(MirrorRecord::decode(&bytes).map(|(r, _)| r), None);
 }

@@ -214,7 +214,7 @@ fn test_sequence_gap_recovery() {
 
         // Inject column record for tid=250
         let mut cbb = BatchBuilder::new(*SysFamily::Column.schema());
-        write_col_tab_row(&mut cbb, &col_def("id", TypeCode::U64).col_tab_row(250, 0), 1);
+        col_def("id", TypeCode::U64).write_col_tab_row(&mut cbb, 250, 0, 1);
         engine.registry.ingest(SysFamily::Column.id(), cbb.finish()).unwrap();
 
         let _ = engine.registry.checkpoint_system(engine.system_zone);
@@ -623,10 +623,10 @@ fn test_dependent_view_restricts_fire_from_circuit_rows() {
 
     // DROP NOT NULL on `val` — an `is_nullable 0→1` rewrite pair.
     let mut nullable = cols[1].clone();
-    nullable.is_nullable = true;
+    nullable.def.is_nullable = true;
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    write_col_tab_row(&mut bb, &cols[1].col_tab_row(tid, 1), -1);
-    write_col_tab_row(&mut bb, &nullable.col_tab_row(tid, 1), 1);
+    cols[1].write_col_tab_row(&mut bb, tid, 1, -1);
+    nullable.write_col_tab_row(&mut bb, tid, 1, 1);
     let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
     assert!(err.contains("dependent views"), "DROP NOT NULL RESTRICT: {err}");
 

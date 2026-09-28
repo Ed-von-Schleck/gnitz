@@ -60,7 +60,6 @@ use crate::test_support::{
     seek_by_index_range, sum_weights, try_register_identity_view, try_register_view, uuid_def, write_circuit,
     write_identity_circuit, LocalDrive,
 };
-use gnitz_wire::sys_rows::write_col_tab_row;
 
 /// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table
 /// (system families included) must hold none. A `-1` that retracts a row nothing
@@ -194,7 +193,7 @@ fn rows_spec(
 
 /// An empty `public.t` with `cols` (PK = column 0) in a fresh temp dir. Returns
 /// the dir too, so a test that inspects or removes it does not re-derive it.
-fn table_fixture(name: &str, cols: &[ColumnDef]) -> (CatalogEngine, u64, String) {
+fn table_fixture(name: &str, cols: &[CatalogColumn]) -> (CatalogEngine, u64, String) {
     let dir = temp_dir(name);
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let tid = engine.create_table("public.t", cols, &[0]).unwrap();
@@ -223,7 +222,7 @@ fn backfill(engine: &mut CatalogEngine, view: u64, sources: &[u64]) {
 /// bulk-drain would skip entirely.
 fn ingest_fixture(
     name: &str,
-    cols: &[ColumnDef],
+    cols: &[CatalogColumn],
     n: u64,
     rounds: u64,
     mut put_row: impl FnMut(&mut BatchBuilder, u64),
@@ -267,7 +266,7 @@ fn build_table_tab_row_flags(tid: u64, raw_pk_cols: u64, table_name: &str, flags
 fn create_flagged_table(
     engine: &mut CatalogEngine,
     table_name: &str,
-    cols: &[ColumnDef],
+    cols: &[CatalogColumn],
     pk_cols: &[u32],
     flags: u64,
 ) -> u64 {
@@ -304,11 +303,11 @@ fn stream_flags() -> u64 {
 /// A COL_TAB rewrite pair on column `col_idx` of `owner_id`: `mutate` produces
 /// the `+1` row from a clone of `old`, while the `-1` reproduces `old`
 /// byte-for-byte — so only the guard under test can reject it.
-fn col_alter_pair(owner_id: u64, col_idx: i64, old: &ColumnDef, mutate: impl FnOnce(&mut ColumnDef)) -> Batch {
+fn col_alter_pair(owner_id: u64, col_idx: i64, old: &CatalogColumn, mutate: impl FnOnce(&mut CatalogColumn)) -> Batch {
     let mut altered = old.clone();
     mutate(&mut altered);
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    write_col_tab_row(&mut bb, &old.col_tab_row(owner_id, col_idx as usize), -1);
-    write_col_tab_row(&mut bb, &altered.col_tab_row(owner_id, col_idx as usize), 1);
+    old.write_col_tab_row(&mut bb, owner_id, col_idx as usize, -1);
+    altered.write_col_tab_row(&mut bb, owner_id, col_idx as usize, 1);
     bb.finish()
 }

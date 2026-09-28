@@ -10,7 +10,7 @@
 
 use std::borrow::Cow;
 
-use gnitz_wire::schema_block::{ColMeta, SchemaBlockCol};
+use gnitz_wire::schema_block::SchemaBlockCol;
 use gnitz_wire::ColType;
 
 /// Why a store-side operator constructor refused the parameters it was handed —
@@ -849,7 +849,7 @@ pub fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, String> {
     let mut cols = [SchemaColumn::EMPTY; MAX_COLUMNS];
     let mut n = 0;
     let pk = gnitz_wire::schema_block::decode(data, |c| {
-        cols[n] = SchemaColumn::new(c.ty.tc, c.meta.nullable);
+        cols[n] = SchemaColumn::new(c.ty.tc, c.nullable);
         n += 1;
         Ok(())
     })?;
@@ -861,7 +861,8 @@ pub fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, String> {
 pub fn encode_schema_block(schema: &SchemaDescriptor) -> Vec<u8> {
     let cols = schema.columns[..schema.num_columns()].iter().map(|c| SchemaBlockCol {
         ty: ColType::of(c.type_code),
-        meta: ColMeta { nullable: c.nullable, hidden: false },
+        nullable: c.nullable,
+        hidden: false,
         name: b"",
     });
     gnitz_wire::schema_block::encode(cols, schema.pk_indices())

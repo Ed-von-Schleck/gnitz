@@ -1,14 +1,14 @@
 //! The tick schedule and the one driver over it.
 
 use super::*;
-use crate::catalog::{CatalogEngine, ColumnDef};
+use crate::catalog::{CatalogColumn, CatalogEngine};
 use crate::test_support::{
     col_def, make_batch, register_identity_view, scratch_dir, sum_weights, try_register_view, LocalDrive,
 };
 use gnitz_store::relation::Relation;
-use gnitz_wire::TypeCode;
+use gnitz_wire::{ColumnDef, TypeCode};
 
-fn view_cols() -> Vec<ColumnDef> {
+fn view_cols() -> Vec<CatalogColumn> {
     vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)]
 }
 
@@ -230,14 +230,11 @@ fn a_replicated_sources_relay_is_sent_by_worker_0_alone() {
 const BENCH_TICKS: u64 = 10_000;
 
 /// Column records for a view whose output is `schema`.
-fn cols_of(schema: &gnitz_store::schema::SchemaDescriptor) -> Vec<ColumnDef> {
+fn cols_of(schema: &gnitz_store::schema::SchemaDescriptor) -> Vec<CatalogColumn> {
     (0..schema.num_columns())
         .map(|ci| {
             let c = schema.column(ci).expect("in range");
-            ColumnDef {
-                is_nullable: c.nullable,
-                ..col_def(&format!("c{ci}"), c.type_code)
-            }
+            ColumnDef::new(format!("c{ci}"), c.type_code, c.nullable).into()
         })
         .collect()
 }

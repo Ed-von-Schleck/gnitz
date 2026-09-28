@@ -18,7 +18,7 @@ const N: i64 = 7;
 
 /// A `(id, val)` table named `name`, holding `N` rows at `val = id * 10`.
 /// Returns its id and the column defs, which every caller needs again.
-fn seed_base(engine: &mut CatalogEngine, name: &str) -> (u64, Vec<ColumnDef>) {
+fn seed_base(engine: &mut CatalogEngine, name: &str) -> (u64, Vec<CatalogColumn>) {
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table(name, &cols, &[0]).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();

@@ -133,7 +133,7 @@ pub(crate) const COL_TAB_COLS: &[WireSysCol] = &[
     col("fk_col_idx", TypeCode::U64, false),
     // is_hidden marker: 1 for a hidden key slot (synthetic view keys and
     // unprojected passthrough PKs), else 0. Echoed into reply schema blocks as
-    // `ColMeta::hidden`; the engine never branches on it.
+    // the record's `hidden` flag.
     col("is_hidden", TypeCode::U64, false),
     // A DECIMAL column's scale, else 0. Echoed into a reply schema block's
     // column type; the engine never branches on it.

@@ -1368,3 +1368,39 @@ fn reduce_group_sends_a_pk_permutation_as_the_pk_list() {
         gnitz_wire::ReduceOutKey::Natural
     );
 }
+
+/// Every fact a `Schema` carries must survive the block round-trip: column
+/// types, nullability, names, the `hidden` marker, and the declared PK order
+/// (which is not column order here).
+#[test]
+fn schema_survives_the_block_roundtrip() {
+    let original = Schema {
+        columns: vec![
+            ColumnDef::new("id", TypeCode::U64, false).hidden(),
+            ColumnDef::new("name", TypeCode::String, true),
+            ColumnDef::new("score", TypeCode::F64, false),
+            ColumnDef::new("tag", TypeCode::I32, true),
+            ColumnDef::new("uuid", TypeCode::U128, false),
+        ],
+        pk_cols: vec![4, 0],
+    };
+    assert_eq!(Schema::from_block(&original.to_block()).unwrap(), original);
+}
+
+/// The client's PK arity cap is `PK_LIST_MAX_COLS` — a key it accepts must
+/// round-trip through the persisted PK-list word — so it must refuse a record
+/// the shared codec, capped wider, admits.
+#[test]
+fn a_pk_wider_than_the_client_codec_is_rejected() {
+    let n = PK_LIST_MAX_COLS + 1;
+    let wide = Schema {
+        columns: (0..n).map(|_| ColumnDef::new("k", TypeCode::U64, false)).collect(),
+        pk_cols: (0..n as u32).collect(),
+    };
+    let block = wide.to_block();
+    assert!(
+        gnitz_wire::schema_block::decode(&block, |_| Ok(())).is_ok(),
+        "the codec admits it"
+    );
+    assert!(Schema::from_block(&block).is_err());
+}

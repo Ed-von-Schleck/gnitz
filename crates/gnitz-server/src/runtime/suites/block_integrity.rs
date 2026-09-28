@@ -25,26 +25,6 @@ fn schema_record_4col() -> Vec<u8> {
 // The header's forgeable fields, through the real consumers
 // ---------------------------------------------------------------------------
 
-/// A forged lower `column_count` leaves every field it does read well-formed,
-/// so only the trailing-bytes rule rejects it.
-#[test]
-fn schema_record_column_count_forgeries_are_rejected() {
-    let clean = schema_record_4col();
-    assert_eq!(
-        decode_schema_block(&clean).expect("clean schema record").num_columns(),
-        4
-    );
-    for forged_count in [3u32, 2, 1] {
-        let mut buf = clean.clone();
-        gnitz_wire::write_u32_le(&mut buf, 0, forged_count);
-        let err = decode_schema_block(&buf).expect_err("column_count 4 -> {forged_count}");
-        assert!(
-            err.contains("trailing bytes"),
-            "column_count 4 -> {forged_count}: {err}"
-        );
-    }
-}
-
 /// The arity prefix carries no redundancy of its own, so every flip in it must
 /// either be refused or change the descriptor.
 #[test]

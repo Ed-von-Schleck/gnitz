@@ -7,17 +7,17 @@
 
 use rustc_hash::FxHashMap;
 
-use super::{ColumnDef, RelFacts};
+use super::{CatalogColumn, RelFacts};
 use gnitz_expr::RowSource;
 use gnitz_expr::{payload_str, payload_string, payload_u64};
 use gnitz_store::relation::RelationKind;
 use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder};
 use gnitz_wire::sys_rows::{
-    write_col_tab_row, write_schema_tab_row, write_table_tab_row, ColTabRow, SchemaTabRow, TableTabRow,
+    write_col_tab_row, write_schema_tab_row, write_table_tab_row, ColTabRow, SchemaTabRow, SysRowSink, TableTabRow,
 };
 use gnitz_wire::MAX_COLUMNS;
-use gnitz_wire::{ColType, TableDistribution, ViewProps};
+use gnitz_wire::{ColType, ColumnDef, TableDistribution, ViewProps};
 use gnitz_wire::{
     COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME,
     COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_FLAGS, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
@@ -161,11 +161,11 @@ pub(super) fn read_idx_tab_row<S: RowSource>(
     ))
 }
 
-/// Decode COL_TAB `row` into the `ColumnDef` the schema builder consumes. Every
+/// Decode COL_TAB `row` into the `CatalogColumn` the schema builder consumes. Every
 /// word must fit the width it is stored at and decode to a value
 /// `write_col_tab_row` could emit: an overflowing one would leave a stored row no
 /// client can reproduce, and so no later `-1` can retract.
-pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> Result<ColumnDef, String> {
+pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> Result<CatalogColumn, String> {
     let word = |field: &str, pi: usize, max: u64| {
         let w = payload_u64(src, row, pi);
         if w > max {
@@ -180,37 +180,37 @@ pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> Result<Colu
     let scale = word("scale", COLTAB_PAY_SCALE, u8::MAX as u64)? as u8;
     let ty = ColType::from_wire(code, scale)
         .ok_or_else(|| format!("column record carries an invalid column type {code}/{scale}"))?;
-    Ok(ColumnDef {
-        name: payload_string(src, row, COLTAB_PAY_NAME),
-        ty,
-        is_nullable: flag("is_nullable", COLTAB_PAY_IS_NULLABLE)?,
+    Ok(CatalogColumn {
+        def: ColumnDef {
+            name: payload_string(src, row, COLTAB_PAY_NAME),
+            ty,
+            is_nullable: flag("is_nullable", COLTAB_PAY_IS_NULLABLE)?,
+            is_hidden: flag("is_hidden", COLTAB_PAY_IS_HIDDEN)?,
+        },
         fk_table_id: payload_u64(src, row, COLTAB_PAY_FK_TABLE_ID),
         fk_col_idx: word("fk_col_idx", COLTAB_PAY_FK_COL_IDX, u32::MAX as u64)? as u32,
-        is_hidden: flag("is_hidden", COLTAB_PAY_IS_HIDDEN)?,
     })
 }
 
-impl ColumnDef {
-    /// This column as COL_TAB row `(owner_id, col_idx)` — the inverse of
+impl CatalogColumn {
+    /// Write this column as COL_TAB row `(owner_id, col_idx)` — the inverse of
     /// [`read_col_tab_row`].
-    pub(super) fn col_tab_row(&self, owner_id: u64, col_idx: usize) -> ColTabRow<'_> {
-        ColTabRow {
+    pub(crate) fn write_col_tab_row(&self, sink: &mut impl SysRowSink, owner_id: u64, col_idx: usize, weight: i64) {
+        let row = ColTabRow {
             owner_id,
             col_idx: col_idx as u64,
-            name: &self.name,
-            ty: self.ty,
-            is_nullable: self.is_nullable,
+            col: &self.def,
             fk_table_id: self.fk_table_id,
             fk_col_idx: self.fk_col_idx as u64,
-            is_hidden: self.is_hidden,
-        }
+        };
+        write_col_tab_row(sink, &row, weight);
     }
 }
 
 /// `defs` as `owner_id`'s COL_TAB rows, keyed by position, at `weight`.
-pub(crate) fn write_col_tab_rows(bb: &mut BatchBuilder, owner_id: u64, defs: &[ColumnDef], weight: i64) {
+pub(crate) fn write_col_tab_rows(bb: &mut BatchBuilder, owner_id: u64, defs: &[CatalogColumn], weight: i64) {
     for (i, cd) in defs.iter().enumerate() {
-        write_col_tab_row(bb, &cd.col_tab_row(owner_id, i), weight);
+        cd.write_col_tab_row(bb, owner_id, i, weight);
     }
 }
 
@@ -447,14 +447,11 @@ impl SysFamily {
 
     /// This family's column definitions, from the same wire slice its schema is
     /// built from — compile-time data, never read back from COL_TAB.
-    pub(in crate::catalog) fn column_defs(self) -> Vec<ColumnDef> {
+    pub(in crate::catalog) fn column_defs(self) -> Vec<CatalogColumn> {
         self.wire()
             .cols
             .iter()
-            .map(|c| ColumnDef {
-                is_nullable: c.nullable,
-                ..ColumnDef::new(c.name, ColType::of(c.type_code))
-            })
+            .map(|c| ColumnDef::new(c.name, c.type_code, c.nullable).into())
             .collect()
     }
 

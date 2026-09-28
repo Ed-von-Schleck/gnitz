@@ -42,9 +42,14 @@ fn assert_no_relation_residue(engine: &mut CatalogEngine, family: SysFamily, id:
 /// Write one column record at an arbitrary `col_idx` — the gap and
 /// out-of-order shapes `col_tab_batch`, which numbers columns by position,
 /// cannot produce.
-fn write_col_at_index(engine: &mut CatalogEngine, owner_id: u64, col_idx: i64, cd: &ColumnDef) -> Result<(), String> {
+fn write_col_at_index(
+    engine: &mut CatalogEngine,
+    owner_id: u64,
+    col_idx: i64,
+    cd: &CatalogColumn,
+) -> Result<(), String> {
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    write_col_tab_row(&mut bb, &cd.col_tab_row(owner_id, col_idx as usize), 1);
+    cd.write_col_tab_row(&mut bb, owner_id, col_idx as usize, 1);
     engine.ingest_to_family(gnitz_wire::COL_TAB, &bb.finish())
 }
 

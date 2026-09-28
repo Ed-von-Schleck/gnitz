@@ -2,7 +2,6 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-pub mod codec;
 pub mod error;
 pub mod message;
 pub(crate) mod transport;

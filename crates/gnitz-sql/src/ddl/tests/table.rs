@@ -152,8 +152,8 @@ fn site<'a>(
 fn self_fk_resolves_to_the_self_target_not_a_table_id() {
     let cols = tree_cols();
     // `parent_id BIGINT REFERENCES tree(id)`. The table has no id yet, so the
-    // planner names the target as the table being created; `col_tab_row`
-    // substitutes the owner id.
+    // planner names the target as the table being created; the client
+    // substitutes the owner id when it writes the COL_TAB row.
     let (fk, parent_type) =
         resolve_fk_target_inline(&cols, &[0], "tree", &site(&obj("tree"), &[ident("id")], 1)).unwrap();
     assert_eq!(fk, FkTarget::SelfTable { col: 0 });

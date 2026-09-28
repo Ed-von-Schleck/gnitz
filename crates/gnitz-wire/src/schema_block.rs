@@ -24,36 +24,17 @@ use crate::{ColType, MAX_COLUMNS, MAX_PK_COLUMNS};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchemaBlockCol<'a> {
     pub ty: ColType,
-    pub meta: ColMeta,
-    pub name: &'a [u8],
-}
-
-/// One column's catalog facts as the record carries them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ColMeta {
     pub nullable: bool,
     /// A hidden key slot: a physical schema column (it holds a real PK/routing
     /// value) that no presentation surface exposes. The PK region, routing, sort
     /// and consolidation are all blind to it.
     pub hidden: bool,
+    pub name: &'a [u8],
 }
 
 const NULLABLE: u8 = 1 << 0;
 const HIDDEN: u8 = 1 << 1;
 const DEFINED_FLAGS: u8 = NULLABLE | HIDDEN;
-
-impl ColMeta {
-    fn flags(self) -> u8 {
-        (if self.nullable { NULLABLE } else { 0 }) | (if self.hidden { HIDDEN } else { 0 })
-    }
-
-    fn from_flags(flags: u8) -> ColMeta {
-        ColMeta {
-            nullable: flags & NULLABLE != 0,
-            hidden: flags & HIDDEN != 0,
-        }
-    }
-}
 
 /// Bytes one column occupies before its name: type code, flags, scale, and the
 /// name's own length prefix.
@@ -79,7 +60,8 @@ fn take_col<'a>(r: &mut Reader<'a>) -> Result<SchemaBlockCol<'a>, String> {
     let name = r.bytes32()?;
     Ok(SchemaBlockCol {
         ty,
-        meta: ColMeta::from_flags(flags),
+        nullable: flags & NULLABLE != 0,
+        hidden: flags & HIDDEN != 0,
         name,
     })
 }
@@ -99,7 +81,7 @@ pub fn encode<'a>(cols: impl Iterator<Item = SchemaBlockCol<'a>> + Clone, pk_col
     }
     for c in cols {
         w.u8(c.ty.tc.as_wire())
-            .u8(c.meta.flags())
+            .u8((if c.nullable { NULLABLE } else { 0 }) | (if c.hidden { HIDDEN } else { 0 }))
             .u8(c.ty.scale)
             .bytes32(c.name);
     }
@@ -179,13 +161,13 @@ pub fn check_same_types(got: &[u8], want: &[u8]) -> Result<(), String> {
         let null = |nullable: bool| if nullable { "NULL" } else { "NOT NULL" };
         for ci in 0..count {
             let (want_col, col) = (take_col(&mut w)?, take_col(g)?);
-            if col.ty != want_col.ty || col.meta.nullable != want_col.meta.nullable {
+            if col.ty != want_col.ty || col.nullable != want_col.nullable {
                 return Ok(Some(format!(
                     "column {ci}: expected {} {}, got {} {}",
                     want_col.ty,
-                    null(want_col.meta.nullable),
+                    null(want_col.nullable),
                     col.ty,
-                    null(col.meta.nullable),
+                    null(col.nullable),
                 )));
             }
         }

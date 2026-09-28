@@ -58,7 +58,7 @@ fn send_push(
         target_id: tid,
         ..Default::default()
     };
-    let block = gnitz_core::protocol::codec::encode_schema_block(schema);
+    let block = schema.to_block();
     t.send_frame(encode_frame(hdr, &[], Some(&block), Some(batch)), None)
 }
 

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use crate::mirror::{MirrorState, MirrorStore, MirroredView};
 use crate::types::sys_schema;
 use gnitz_expr::{payload_bytes, payload_is_null, payload_u64};
-use gnitz_wire::sys_rows::{IdxTabRow, TableTabRow, ViewTabRow};
+use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::txn_frame::{DeltaPollItem, BLIND};
 use gnitz_wire::Circuit;
 use gnitz_wire::{
@@ -1337,7 +1337,14 @@ impl GnitzClient {
         let mut cb = ZSetBatch::new(col_s);
         {
             let mut a = BatchAppender::new(&mut cb, col_s);
-            gnitz_wire::sys_rows::write_col_tab_row(&mut a, &def.col_tab_row(tid, col_idx, None), 1);
+            let row = ColTabRow {
+                owner_id: tid,
+                col_idx: col_idx as u64,
+                col: def,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            };
+            gnitz_wire::sys_rows::write_col_tab_row(&mut a, &row, 1);
         }
         self.push_ddl_txn(&[(COL_TAB, cb)])?;
         Ok(())
@@ -1668,8 +1675,19 @@ fn checked_sys_rows(family: u64, reply: ScanReply) -> Result<ZSetBatch, ClientEr
 /// Append one `COL_TAB` row per column of `owner_id`, at `+1`.
 fn append_col_rows(a: &mut BatchAppender<'_>, owner_id: u64, columns: &[ColumnDef], fks: &[InlineForeignKey]) {
     for (i, cd) in columns.iter().enumerate() {
-        let fk = fks.iter().find(|fk| fk.col_idx as usize == i).map(|fk| fk.target);
-        gnitz_wire::sys_rows::write_col_tab_row(a, &cd.col_tab_row(owner_id, i, fk), 1);
+        let (fk_table_id, fk_col_idx) = match fks.iter().find(|fk| fk.col_idx as usize == i).map(|fk| fk.target) {
+            None => (0, 0),
+            Some(FkTarget::SelfTable { col }) => (owner_id, col as u64),
+            Some(FkTarget::Table { id, col }) => (id, col as u64),
+        };
+        let row = ColTabRow {
+            owner_id,
+            col_idx: i as u64,
+            col: cd,
+            fk_table_id,
+            fk_col_idx,
+        };
+        gnitz_wire::sys_rows::write_col_tab_row(a, &row, 1);
     }
 }
 

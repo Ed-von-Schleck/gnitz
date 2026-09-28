@@ -10,7 +10,6 @@
 
 use super::*;
 use crate::connection::{Request, Session};
-use crate::protocol::codec::encode_schema_block;
 use crate::protocol::message::encode_frame;
 use crate::protocol::transport::{poll_fd, ClientTransport};
 use crate::protocol::{ColumnDef, TypeCode, WireStatus};
@@ -233,7 +232,7 @@ impl Peer {
         self.send(&encode_frame(
             hdr,
             &blob.encode(),
-            Some(&encode_schema_block(&schema)),
+            Some(&schema.to_block()),
             Some(&empty),
         ));
     }

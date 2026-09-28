@@ -126,7 +126,7 @@ impl CatalogEngine {
     pub(crate) fn create_table(
         &mut self,
         qualified_name: &str,
-        col_defs: &[ColumnDef],
+        col_defs: &[CatalogColumn],
         pk_cols: &[u32],
     ) -> Result<u64, String> {
         self.create_table_with(qualified_name, col_defs, pk_cols, gnitz_wire::TableProps::default())
@@ -147,7 +147,7 @@ impl CatalogEngine {
     pub(crate) fn create_table_with(
         &mut self,
         qualified_name: &str,
-        col_defs: &[ColumnDef],
+        col_defs: &[CatalogColumn],
         pk_cols: &[u32],
         props: gnitz_wire::TableProps,
     ) -> Result<u64, String> {
@@ -232,7 +232,7 @@ impl CatalogEngine {
             .map(|name| {
                 col_defs
                     .iter()
-                    .position(|cd| cd.name == *name)
+                    .position(|cd| cd.def.name == *name)
                     .map(|p| p as u32)
                     .ok_or_else(|| format!("Column not found in owner: {name}"))
             })
@@ -276,7 +276,7 @@ impl CatalogEngine {
 
     // -- Write helpers for system tables -----------------------------------
 
-    pub(crate) fn write_column_records(&mut self, owner_id: u64, col_defs: &[ColumnDef]) -> Result<(), String> {
+    pub(crate) fn write_column_records(&mut self, owner_id: u64, col_defs: &[CatalogColumn]) -> Result<(), String> {
         let batch = col_tab_batch(owner_id, col_defs, 1);
         self.submit(SysFamily::Column, batch)
     }
@@ -304,7 +304,7 @@ impl CatalogEngine {
         tid: u64,
         schema_id: u64,
         name: &str,
-        cols: &[ColumnDef],
+        cols: &[CatalogColumn],
         pk: &[u32],
     ) -> Result<(), String> {
         let col_batch = col_tab_batch(tid, cols, 1);

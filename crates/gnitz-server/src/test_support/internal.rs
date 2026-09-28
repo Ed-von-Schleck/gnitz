@@ -4,40 +4,34 @@
 //! This file is compiled once, and only inside this crate, so it names
 //! crate-internals as `crate::` and widens no API — nothing links this crate.
 
-use crate::catalog::{CatalogEngine, ColumnDef, SysFamily, PUBLIC_SCHEMA_ID};
+use crate::catalog::{CatalogColumn, CatalogEngine, SysFamily, PUBLIC_SCHEMA_ID};
 use gnitz_store::storage::{Batch, BatchBuilder, ReadCursor};
 use gnitz_wire::sys_rows::{
     write_circuit_rows, write_idx_tab_row, write_table_tab_row, IdxTabRow, SysRowSink, TableTabRow,
 };
 use gnitz_wire::Circuit;
-use gnitz_wire::{ColType, TypeCode};
+use gnitz_wire::{ColumnDef, TypeCode};
 
-// ── Catalog ColumnDef fixtures ────────────────────────────────────────────
-//
-// `ColumnDef::new` is the plain column, so each builder names only what it
-// varies and a new field costs no construction site anything.
+// ── Catalog column fixtures ─────────────────────────────────────────────────
 
 /// A plain non-nullable, non-FK, non-hidden column of the given type.
-pub fn col_def(name: &str, type_code: TypeCode) -> ColumnDef {
-    ColumnDef::new(name, ColType::of(type_code))
+pub fn col_def(name: &str, type_code: TypeCode) -> CatalogColumn {
+    ColumnDef::new(name, type_code, false).into()
 }
 
 /// A plain non-nullable UUID column.
-pub fn uuid_def(name: &str) -> ColumnDef {
+pub fn uuid_def(name: &str) -> CatalogColumn {
     col_def(name, TypeCode::UUID)
 }
 
 /// A nullable column of the given type.
-pub fn nullable_def(name: &str, type_code: TypeCode) -> ColumnDef {
-    ColumnDef {
-        is_nullable: true,
-        ..col_def(name, type_code)
-    }
+pub fn nullable_def(name: &str, type_code: TypeCode) -> CatalogColumn {
+    ColumnDef::new(name, type_code, true).into()
 }
 
 /// A column of `type_code` carrying an FK onto `(parent_tid, parent_col)`.
-pub fn fk_def(name: &str, type_code: TypeCode, parent_tid: u64, parent_col: u32) -> ColumnDef {
-    ColumnDef {
+pub fn fk_def(name: &str, type_code: TypeCode, parent_tid: u64, parent_col: u32) -> CatalogColumn {
+    CatalogColumn {
         fk_table_id: parent_tid,
         fk_col_idx: parent_col,
         ..col_def(name, type_code)
@@ -172,7 +166,7 @@ pub fn push_table_tab_row(
 }
 
 /// `defs` as `owner_id`'s COL_TAB batch at `weight`, numbered by position.
-pub fn col_tab_batch(owner_id: u64, defs: &[ColumnDef], weight: i64) -> Batch {
+pub fn col_tab_batch(owner_id: u64, defs: &[CatalogColumn], weight: i64) -> Batch {
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
     crate::catalog::write_col_tab_rows(&mut bb, owner_id, defs, weight);
     bb.finish()
@@ -233,7 +227,7 @@ pub fn try_register_view(
     engine: &mut CatalogEngine,
     circuit: Circuit,
     name: &str,
-    cols: &[ColumnDef],
+    cols: &[CatalogColumn],
     capacity_bytes: u64,
     delta_bytes: u64,
 ) -> Result<u64, String> {
@@ -251,7 +245,7 @@ pub fn try_register_identity_view(
     engine: &mut CatalogEngine,
     source_tid: u64,
     name: &str,
-    cols: &[ColumnDef],
+    cols: &[CatalogColumn],
     capacity_bytes: u64,
     delta_bytes: u64,
 ) -> Result<u64, String> {
@@ -260,7 +254,7 @@ pub fn try_register_identity_view(
 }
 
 /// [`try_register_identity_view`] for an unbounded view that must succeed.
-pub fn register_identity_view(engine: &mut CatalogEngine, source_tid: u64, name: &str, cols: &[ColumnDef]) -> u64 {
+pub fn register_identity_view(engine: &mut CatalogEngine, source_tid: u64, name: &str, cols: &[CatalogColumn]) -> u64 {
     try_register_identity_view(engine, source_tid, name, cols, 0, 0).unwrap()
 }
 

@@ -512,11 +512,12 @@ fn try_new_rejects_what_the_panicking_constructor_aborts_on() {
 /// admits such a record and this decode is what refuses it.
 #[test]
 fn decode_schema_block_rejects_a_nullable_or_ineligible_pk_column() {
-    use gnitz_wire::schema_block::{ColMeta, SchemaBlockCol};
+    use gnitz_wire::schema_block::SchemaBlockCol;
 
     let col = |tc, nullable| SchemaBlockCol {
         ty: gnitz_wire::ColType::of(tc),
-        meta: ColMeta { nullable, ..Default::default() },
+        nullable,
+        hidden: false,
         name: b"k",
     };
     for bad in [col(TypeCode::U64, true), col(TypeCode::F64, false)] {
@@ -533,11 +534,12 @@ fn decode_schema_block_rejects_a_nullable_or_ineligible_pk_column() {
 /// duplicate PK list is a schema rule, refused here.
 #[test]
 fn decode_schema_block_rejects_an_empty_out_of_range_or_duplicate_pk() {
-    use gnitz_wire::schema_block::{ColMeta, SchemaBlockCol};
+    use gnitz_wire::schema_block::SchemaBlockCol;
 
     let col = SchemaBlockCol {
         ty: gnitz_wire::ColType::of(TypeCode::U64),
-        meta: ColMeta::default(),
+        nullable: false,
+        hidden: false,
         name: b"k",
     };
     for pk in [&[][..], &[3], &[1, 1]] {

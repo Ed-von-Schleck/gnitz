@@ -1,5 +1,4 @@
 use super::*;
-use crate::protocol::codec::{encode_schema_block, schema_from_block};
 use crate::protocol::types::{BatchAppender, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use crate::protocol::wal_block::decode_wal_block;
 use crate::protocol::{ClientVerb, WireConflictMode, WireFlags, WireStatus};
@@ -18,7 +17,7 @@ fn push() -> WireFlags {
 fn frame_schema(buf: &[u8], ctrl: &gnitz_wire::control::DecodedControl) -> Option<Schema> {
     ctrl.schema
         .clone()
-        .map(|r| schema_from_block(&buf[r]).expect("a schema block decodes"))
+        .map(|r| Schema::from_block(&buf[r]).expect("a schema block decodes"))
 }
 
 /// A frame's data block, decoded under `schema`.
@@ -144,12 +143,7 @@ fn string_columns_round_trip_through_a_frame() {
         blob,
     };
 
-    let buf = encode_frame(
-        header(0, push(), 0),
-        &[],
-        Some(&encode_schema_block(&schema)),
-        Some(&batch),
-    );
+    let buf = encode_frame(header(0, push(), 0), &[], Some(&schema.to_block()), Some(&batch));
     let ctrl = peek_control_block(&buf).unwrap();
     assert_eq!(frame_schema(&buf, &ctrl).as_ref(), Some(&schema));
     let data = frame_data(&buf, &ctrl, &schema).unwrap();
@@ -236,7 +230,7 @@ fn a_frame_with_a_schema_and_rows_round_trips() {
     let buf = encode_frame(
         header(42, WireFlags::default(), 0),
         &[],
-        Some(&encode_schema_block(&schema)),
+        Some(&schema.to_block()),
         Some(&batch),
     );
     let ctrl = peek_control_block(&buf).unwrap();
@@ -258,7 +252,7 @@ fn an_empty_batch_ships_its_schema_and_no_data() {
     let buf = encode_frame(
         header(10, WireFlags::default(), 0),
         &[],
-        Some(&encode_schema_block(&schema)),
+        Some(&schema.to_block()),
         Some(&empty),
     );
     let ctrl = peek_control_block(&buf).unwrap();

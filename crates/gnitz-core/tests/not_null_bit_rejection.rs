@@ -14,7 +14,6 @@
 //! comparator believe the schema. This test drives the frame the client library
 //! would never build.
 
-use gnitz_core::protocol::codec::encode_schema_block;
 use gnitz_core::protocol::{
     encode_frame, hello_handshake, ClientTransport, ClientVerb, ColumnDef, Schema, TypeCode, WireFlags,
 };
@@ -37,7 +36,7 @@ fn hostile_push(t: &mut ClientTransport, tid: u64, schema: &Schema, batch: &ZSet
         target_id: tid,
         ..Default::default()
     };
-    let block = encode_schema_block(schema);
+    let block = schema.to_block();
     let frame = encode_frame(hdr, &[], Some(&block), Some(batch));
     t.send_frame(frame, None).map_err(|e| e.to_string())?;
     let buf = t.recv_framed(None).map_err(|e| e.to_string())?;

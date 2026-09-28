@@ -313,11 +313,7 @@ fn stale_column_rename_rejected_and_drop_cascade_passes() {
     // > 12 bytes — the Column precheck arm must reject it via the CAS.
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
     for (weight, name) in [(-1i64, "stale_wrong_column_x"), (1i64, "new_column_name_here")] {
-        write_col_tab_row(
-            &mut bb,
-            &col_def(name, TypeCode::U64).col_tab_row(tid, col_idx as usize),
-            weight,
-        );
+        col_def(name, TypeCode::U64).write_col_tab_row(&mut bb, tid, col_idx as usize, weight);
     }
     let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
     assert!(
@@ -342,8 +338,8 @@ fn stale_column_rename_rejected_and_drop_cascade_passes() {
 
 // ── The column-ALTER owner guard covers every rewrite pair ──────────────────
 
-fn rename_to(new_name: &str) -> impl FnOnce(&mut ColumnDef) + '_ {
-    move |c: &mut ColumnDef| c.name = new_name.to_string()
+fn rename_to(new_name: &str) -> impl FnOnce(&mut CatalogColumn) + '_ {
+    move |c: &mut CatalogColumn| c.def.name = new_name.to_string()
 }
 
 /// RENAME COLUMN on a view and on a system table — neither is a user base
@@ -410,12 +406,12 @@ fn column_rename_on_pk_column_and_with_dependent_views_accepted() {
 
 // ── The column-ALTER arm owns every drop guard ──────────────────────────────
 
-fn hide(c: &mut ColumnDef) {
-    c.is_hidden = true;
+fn hide(c: &mut CatalogColumn) {
+    c.def.is_hidden = true;
 }
 
-fn unnull(c: &mut ColumnDef) {
-    c.is_nullable = true;
+fn unnull(c: &mut CatalogColumn) {
+    c.def.is_nullable = true;
 }
 
 /// A column an FK binds cannot be hidden.
@@ -461,7 +457,7 @@ fn hiding_or_unnulling_a_pk_column_rejected() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
     let (mut engine, tid, dir) = table_fixture("alter_pk_col", &cols);
 
-    for mutate in [hide as fn(&mut ColumnDef), unnull] {
+    for mutate in [hide as fn(&mut CatalogColumn), unnull] {
         let err = engine
             .precheck_family(SysFamily::Column, &col_alter_pair(tid, 0, &cols[0], mutate))
             .unwrap_err();
@@ -513,7 +509,7 @@ fn a_duplicate_add_column_is_named_before_dependent_views() {
     register_identity_view(&mut engine, tid, "vw", &cols);
 
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    write_col_tab_row(&mut bb, &nullable_def("v", TypeCode::U64).col_tab_row(tid, 2), 1);
+    nullable_def("v", TypeCode::U64).write_col_tab_row(&mut bb, tid, 2, 1);
     let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
     assert!(err.contains("duplicate column name"), "{err}");
 
@@ -530,7 +526,8 @@ fn a_dropped_column_cannot_be_renamed_or_indexed() {
     engine
         .ingest_to_family(gnitz_wire::COL_TAB, &col_alter_pair(tid, 1, &cols[1], hide))
         .unwrap();
-    let hidden = ColumnDef { is_hidden: true, ..cols[1].clone() };
+    let mut hidden = cols[1].clone();
+    hidden.def.is_hidden = true;
 
     let err = engine
         .precheck_family(SysFamily::Column, &col_alter_pair(tid, 1, &hidden, rename_to("z")))
@@ -612,7 +609,7 @@ fn a_column_alter_must_be_its_bundles_only_change() {
         )
         .unwrap();
     let append = |owner: u64, bb: &mut BatchBuilder| {
-        write_col_tab_row(bb, &nullable_def("w", TypeCode::I64).col_tab_row(owner, 2), 1);
+        nullable_def("w", TypeCode::I64).write_col_tab_row(bb, owner, 2, 1);
     };
 
     // An append bundled with an index family.

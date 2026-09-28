@@ -1,7 +1,7 @@
 use super::*;
 use gnitz_expr::payload_str;
 use gnitz_store::schema::decode_schema_block;
-use gnitz_wire::schema_block::{check_same_types, ColMeta, SchemaBlockCol};
+use gnitz_wire::schema_block::check_same_types;
 use gnitz_wire::{RelDescriptorBlob, RelIndex};
 use gnitz_wire::{IDXTAB_PAY_NAME, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME};
 use rustc_hash::FxHashMap;
@@ -32,22 +32,6 @@ pub(in crate::catalog) struct RelationEntry {
     pub(in crate::catalog) facts: RelFacts,
 }
 
-/// The named record for columns `defs` keyed by `pk`: every column's type, scale,
-/// nullability, hidden flag and name.
-pub(in crate::catalog) fn named_record(defs: &[ColumnDef], pk: &[u32]) -> Vec<u8> {
-    gnitz_wire::schema_block::encode(
-        defs.iter().map(|d| SchemaBlockCol {
-            ty: d.ty,
-            meta: ColMeta {
-                nullable: d.is_nullable,
-                hidden: d.is_hidden,
-            },
-            name: d.name.as_bytes(),
-        }),
-        pk,
-    )
-}
-
 /// A relation's named record — the one every client-bound reply and every
 /// push/DDL SAL slot carries — and its decode.
 #[derive(Clone)]
@@ -57,8 +41,8 @@ pub(crate) struct CatalogRecord {
 }
 
 impl CatalogRecord {
-    pub(in crate::catalog) fn new(pk: &[u32], defs: &[ColumnDef]) -> Self {
-        let bytes = named_record(defs, pk);
+    pub(in crate::catalog) fn new(pk: &[u32], defs: &[CatalogColumn]) -> Self {
+        let bytes = gnitz_wire::schema_block::encode(defs.iter().map(|c| c.def.block_col()), pk);
         let decode = decode_schema_block(&bytes)
             .expect("a catalog relation's columns were admitted by the bounds its record's decode checks");
         CatalogRecord { bytes: Rc::from(bytes), decode }
@@ -71,7 +55,7 @@ impl CatalogRecord {
 }
 
 impl RelationEntry {
-    pub(in crate::catalog) fn new(pk: &[u32], defs: &[ColumnDef], fks: Vec<FkEdge>, facts: RelFacts) -> Self {
+    pub(in crate::catalog) fn new(pk: &[u32], defs: &[CatalogColumn], fks: Vec<FkEdge>, facts: RelFacts) -> Self {
         RelationEntry {
             schema_version: NonZeroU16::MIN,
             record: CatalogRecord::new(pk, defs),
@@ -81,7 +65,7 @@ impl RelationEntry {
     }
 
     /// Re-encode the record for a changed column set, under a new version.
-    pub(in crate::catalog) fn reschema(&mut self, pk: &[u32], defs: &[ColumnDef]) {
+    pub(in crate::catalog) fn reschema(&mut self, pk: &[u32], defs: &[CatalogColumn]) {
         self.schema_version = self.schema_version.checked_add(1).unwrap_or(NonZeroU16::MIN);
         self.record = CatalogRecord::new(pk, defs);
     }

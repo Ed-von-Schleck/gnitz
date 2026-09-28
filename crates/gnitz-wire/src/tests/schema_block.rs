@@ -4,7 +4,8 @@ use crate::{ColType, TypeCode};
 fn col(tc: TypeCode, name: &str, nullable: bool) -> SchemaBlockCol<'_> {
     SchemaBlockCol {
         ty: ColType::of(tc),
-        meta: ColMeta { nullable, ..Default::default() },
+        nullable,
+        hidden: false,
         name: name.as_bytes(),
     }
 }
@@ -50,7 +51,7 @@ fn roundtrips_shape_names_and_pk_order() {
     assert_eq!(pk.as_slice(), &[1, 0]);
 }
 
-/// Every `ColMeta` field and the column type's scale survive the record.
+/// Both column flags and the column type's scale survive the record.
 #[test]
 fn column_meta_survives_the_record() {
     let mut cols = Vec::new();
@@ -62,7 +63,8 @@ fn column_meta_survives_the_record() {
             for scale in [0u8, 7, crate::decimal::MAX_DECIMAL_SCALE] {
                 cols.push(SchemaBlockCol {
                     ty: ColType::decimal(scale),
-                    meta: ColMeta { nullable, hidden },
+                    nullable,
+                    hidden,
                     name: b"c",
                 });
             }
@@ -130,7 +132,7 @@ fn each_column_guard_rejects_its_own_forgery() {
     let cases: [(&str, usize, u8); 3] = [
         // No valid type code.
         ("schema record: invalid column type 0/0", COL0, 0),
-        // A flags byte outside the three defined bits.
+        // A flags byte outside the two defined bits.
         ("schema record: unknown flag bits 0x08", COL0 + 1, 1 << 3),
         // A scale on a type that carries none.
         ("schema record: invalid column type 8/3", COL0 + 2, 3),
@@ -172,9 +174,8 @@ fn a_forged_name_length_is_rejected() {
 }
 
 /// The exact bytes of a compound-PK schema whose last column carries every flag
-/// and a long name. The two adapters that build a record are pinned against each
-/// other elsewhere, which a shift in both would pass; this pins the format
-/// itself, which `gnitz-mirror` relies on as a view's schema identity.
+/// and a long name — the one pin of the format, which `gnitz-mirror` relies on
+/// as a view's schema identity.
 #[test]
 fn the_record_layout_is_fixed() {
     let long = "a_rather_long_column_name";
@@ -183,7 +184,8 @@ fn the_record_layout_is_fixed() {
         col(TypeCode::I32, "a", false),
         SchemaBlockCol {
             ty: ColType::decimal(9),
-            meta: ColMeta { nullable: true, hidden: true },
+            nullable: true,
+            hidden: true,
             name: long.as_bytes(),
         },
     ];
@@ -211,7 +213,7 @@ fn check_same_types_names_each_mismatch_distinctly() {
     assert_eq!(check_same_types(&want, &want), Ok(()), "a record matches itself");
 
     let renamed_and_hidden = two_cols(SchemaBlockCol {
-        meta: ColMeta { nullable: false, hidden: true },
+        hidden: true,
         ..col(TypeCode::I64, "renamed", false)
     });
     assert_eq!(

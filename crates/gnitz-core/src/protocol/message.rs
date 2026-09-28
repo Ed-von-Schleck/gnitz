@@ -1,4 +1,3 @@
-use super::codec::encode_schema_block;
 use super::types::{Schema, ZSetBatch};
 use super::WireConflictMode;
 use gnitz_wire::control::{append_frame, ControlHeader};
@@ -35,7 +34,7 @@ pub struct PushFamily<'a> {
 /// wire bytes (without the 4-byte frame header). Every family carries its schema
 /// record, which the master validates it against.
 pub fn encode_push_txn(families: &[PushFamily<'_>]) -> Vec<u8> {
-    let schemas: Vec<Vec<u8>> = families.iter().map(|f| encode_schema_block(f.schema)).collect();
+    let schemas: Vec<Vec<u8>> = families.iter().map(|f| f.schema.to_block()).collect();
     let items: Vec<FrameItem> = families
         .iter()
         .zip(&schemas)

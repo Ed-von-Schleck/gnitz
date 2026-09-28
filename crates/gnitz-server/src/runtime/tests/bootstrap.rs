@@ -55,7 +55,7 @@ mod staging {
     /// Above every family's replay floor after a one-DDL session.
     const ZONE_LSN: u64 = 1_000;
 
-    fn cols() -> Vec<crate::catalog::ColumnDef> {
+    fn cols() -> Vec<crate::catalog::CatalogColumn> {
         vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)]
     }
 

@@ -56,31 +56,30 @@ fn two_columns(owner_id: u64) -> ZSetBatch {
     .iter()
     .enumerate()
     {
-        write_col_tab_row(&mut a, &cd.col_tab_row(owner_id, i, None), 1);
+        write_col_tab_row(&mut a, &col_tab_row(owner_id, i as u64, cd), 1);
     }
     b
 }
 
-/// One COL_TAB row of base table `owner_id`, as the wire struct rather than
-/// through `ColumnDef::col_tab_row`, so a column-transition test can vary `name`
-/// and `is_hidden` on their own. Never an FK.
-fn col_tab_row(
-    owner_id: u64,
-    col_idx: u64,
-    name: &str,
-    type_code: TypeCode,
-    is_nullable: bool,
-    is_hidden: bool,
-) -> ColTabRow<'_> {
+/// A column of `type_code`, so a column-transition test can vary `name` and
+/// `is_hidden` on their own.
+fn column(name: &str, type_code: TypeCode, is_nullable: bool, is_hidden: bool) -> ColumnDef {
+    let cd = ColumnDef::new(name, type_code, is_nullable);
+    if is_hidden {
+        cd.hidden()
+    } else {
+        cd
+    }
+}
+
+/// Column `col_idx` of base table `owner_id` as its COL_TAB row. Never an FK.
+fn col_tab_row(owner_id: u64, col_idx: u64, col: &ColumnDef) -> ColTabRow<'_> {
     ColTabRow {
         owner_id,
         col_idx,
-        name,
-        ty: gnitz_wire::ColType::of(type_code),
-        is_nullable,
+        col,
         fk_table_id: 0,
         fk_col_idx: 0,
-        is_hidden,
     }
 }
 
@@ -646,7 +645,7 @@ fn the_duplicate_visible_name_rule_holds_at_every_column_transition() {
     let mut appended = ZSetBatch::new(sc);
     write_col_tab_row(
         &mut BatchAppender::new(&mut appended, sc),
-        &col_tab_row(tid, 2, "v", TypeCode::I64, true, false),
+        &col_tab_row(tid, 2, &column("v", TypeCode::I64, true, false)),
         1,
     );
     let err = format!("{:?}", s.push_ddl_txn(&[(COL_TAB, appended)]).unwrap_err());
@@ -656,8 +655,16 @@ fn the_duplicate_visible_name_rule_holds_at_every_column_transition() {
     // `name`, so it clears the pair mask and the retraction CAS.
     let mut renamed = ZSetBatch::new(sc);
     let mut a = BatchAppender::new(&mut renamed, sc);
-    write_col_tab_row(&mut a, &col_tab_row(tid, 1, "v", TypeCode::I64, false, false), -1);
-    write_col_tab_row(&mut a, &col_tab_row(tid, 1, "id", TypeCode::I64, false, false), 1);
+    write_col_tab_row(
+        &mut a,
+        &col_tab_row(tid, 1, &column("v", TypeCode::I64, false, false)),
+        -1,
+    );
+    write_col_tab_row(
+        &mut a,
+        &col_tab_row(tid, 1, &column("id", TypeCode::I64, false, false)),
+        1,
+    );
     let err = format!("{:?}", s.push_ddl_txn(&[(COL_TAB, renamed)]).unwrap_err());
     assert!(err.contains("duplicate column name"), "{err}");
 
@@ -666,8 +673,16 @@ fn the_duplicate_visible_name_rule_holds_at_every_column_transition() {
     // because it is the one case that applies.
     let mut dropped = ZSetBatch::new(sc);
     let mut a = BatchAppender::new(&mut dropped, sc);
-    write_col_tab_row(&mut a, &col_tab_row(tid, 1, "v", TypeCode::I64, false, false), -1);
-    write_col_tab_row(&mut a, &col_tab_row(tid, 1, "v", TypeCode::I64, false, true), 1);
+    write_col_tab_row(
+        &mut a,
+        &col_tab_row(tid, 1, &column("v", TypeCode::I64, false, false)),
+        -1,
+    );
+    write_col_tab_row(
+        &mut a,
+        &col_tab_row(tid, 1, &column("v", TypeCode::I64, false, true)),
+        1,
+    );
     s.push_ddl_txn(&[(COL_TAB, dropped)]).unwrap();
 }
 

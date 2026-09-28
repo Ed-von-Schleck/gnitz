@@ -13,7 +13,6 @@ use std::time::Instant;
 
 use crate::client::DeltaCursor;
 use crate::error::ClientError;
-use crate::protocol::codec::{encode_schema_block, schema_from_block};
 use crate::protocol::transport::Next;
 use crate::protocol::wal_block::decode_wal_block_into;
 use crate::protocol::{
@@ -567,7 +566,7 @@ impl Session {
                 };
                 let hdr = ControlHeader { flags, target_id, ..Default::default() };
                 (
-                    encode_frame(hdr, &[], Some(&encode_schema_block(schema)), Some(batch)),
+                    encode_frame(hdr, &[], Some(&schema.to_block()), Some(batch)),
                     SlotKind::Push { tid: target_id },
                 )
             }
@@ -798,8 +797,9 @@ impl Session {
         let frame_schema = ctrl
             .schema
             .clone()
-            .map(|r| schema_from_block(&buf[r]))
-            .transpose()?
+            .map(|r| Schema::from_block(&buf[r]))
+            .transpose()
+            .map_err(ProtocolError::DecodeError)?
             .map(Arc::new);
         if let Some(fault) = ctrl.fault(&buf) {
             // A DELTA_POLL failure that names a view ends that view's position
