@@ -8,7 +8,7 @@ use crate::relation::{Relation, RelationKind, RelationRegistry};
 use crate::schema::key::{compare_pk_bytes, sort_indices, IndexKeySpec};
 use crate::schema::{project_schema, ColumnLocator};
 use crate::storage::{pk_group_end, Batch, PkSetGather, ReadCursor, SkeletonKeys, StoreError};
-use gnitz_wire::{KeyRange, ReadBound};
+use gnitz_wire::{KeyRange, PkKeys, ReadBound};
 
 const INDEX_SCAN_RATIO: usize = 16;
 
@@ -48,6 +48,7 @@ impl<'a, 'h> LiveSource<'a, 'h> {
             )));
         };
         let SkeletonKeys { keys, coarse } = skeletons;
+        let keys = PkKeys::from_sorted(live.schema().pk_stride(), keys);
         let expected = cfg!(debug_assertions).then(|| keys.clone());
         let hydrated = hydrator
             .hydrate_keys(self.registry, self.id, keys)
@@ -63,9 +64,9 @@ impl<'a, 'h> LiveSource<'a, 'h> {
 }
 
 impl RelationRegistry {
-    /// The FK parent probe: every live row of `keys` (flat OPK images, strictly ascending) at
-    /// weight 1, projected to the payload column `ref_col`.
-    pub fn gather_bytes(&self, id: u64, keys: Vec<u8>, ref_col: u8) -> Result<Batch, StoreError> {
+    /// The FK parent probe: every live row of `keys` at weight 1, projected to the payload
+    /// column `ref_col`.
+    pub fn gather_bytes(&self, id: u64, keys: PkKeys, ref_col: u8) -> Result<Batch, StoreError> {
         let entry = self.relation_or_err(id)?;
         let schema = entry.schema();
         let out_schema = project_schema(&schema, &[ref_col as u32]).expect("a one-column projection fits MAX_COLUMNS");
@@ -75,8 +76,9 @@ impl RelationRegistry {
             matches!(loc, ColumnLocator::Payload { .. }),
             "FK projection excludes PK columns"
         );
+        let n = keys.len();
         let mut gather = entry.gather(keys, None);
-        let mut out = Batch::with_capacity(&out_schema, gather.remaining_keys());
+        let mut out = Batch::with_capacity(&out_schema, n);
         gather.for_each_live_row(usize::MAX, |c| {
             let (src, row) = c.current_row_source();
             let mut null_word = 0;
@@ -109,7 +111,7 @@ impl RelationRegistry {
                     )));
                 }
                 // A key this worker holds no row for copies nothing.
-                SourceCursor::PkSet(Box::new(entry.gather(keys.into_bytes(), None)))
+                SourceCursor::PkSet(Box::new(entry.gather(keys, None)))
             }
             ReadBound::Range(r) => return open_range(entry, r),
         };
@@ -130,7 +132,7 @@ fn open_range(entry: &Relation, r: KeyRange) -> Result<(SourceCursor, ReadBound)
         if matches <= entry.store().held().estimated_rows() / INDEX_SCAN_RATIO {
             let walk = BoundedIndexCursor {
                 idx,
-                src: PkSetGather::over(entry.cursor()),
+                src: PkSetGather::new(entry.cursor(), PkKeys::from_sorted(schema.pk_stride(), Vec::new())),
                 spec: ic.key_spec(),
                 pks: Vec::new(),
                 order: Vec::new(),
@@ -144,30 +146,30 @@ fn open_range(entry: &Relation, r: KeyRange) -> Result<(SourceCursor, ReadBound)
 /// Tripwire: the replay's per-PK weight sum must equal the coarse weight the
 /// skeleton row carried, by linearity of the PK projection. `keys` and `out` are
 /// both ascending, so one co-walk checks every key and catches a PK no key named.
-fn debug_assert_hydration_matches(out: &Batch, keys: &[u8], coarse: &[i64]) {
-    let stride = keys.len() / coarse.len();
-    let mut ki = 0;
+fn debug_assert_hydration_matches(out: &Batch, keys: &PkKeys, coarse: &[i64]) {
+    debug_assert_eq!(keys.len(), coarse.len());
+    let mut expected = keys.iter().zip(coarse).peekable();
     let mut i = 0;
     while i < out.len() {
         let pk = out.get_pk_bytes(i);
         // Every skeleton key carries a strictly positive coarse weight.
-        while ki < coarse.len() && compare_pk_bytes(&keys[ki * stride..(ki + 1) * stride], pk).is_lt() {
-            debug_assert!(false, "hydration produced no rows for skeleton key {ki}");
-            ki += 1;
+        while let Some((key, _)) = expected.next_if(|(key, _)| compare_pk_bytes(key, pk).is_lt()) {
+            debug_assert!(false, "hydration produced no rows for skeleton key {key:?}");
         }
+        let named = expected.next().filter(|(key, _)| *key == pk);
         debug_assert!(
-            ki < coarse.len() && keys[ki * stride..(ki + 1) * stride] == *pk,
-            "hydration produced rows for a PK no skeleton row named",
+            named.is_some(),
+            "hydration produced rows for a PK no skeleton row named"
         );
         let j = pk_group_end(out, i);
         let sum = out.as_mem_batch().sum_weights(i, j);
         i = j;
-        debug_assert_eq!(sum, coarse[ki], "hydration weight mismatch for key {pk:?}");
-        ki += 1;
+        if let Some((_, &weight)) = named {
+            debug_assert_eq!(sum, weight, "hydration weight mismatch for key {pk:?}");
+        }
     }
-    debug_assert_eq!(
-        ki,
-        coarse.len(),
+    debug_assert!(
+        expected.next().is_none(),
         "hydration produced no rows for a trailing skeleton key"
     );
 }
@@ -196,7 +198,7 @@ impl SourceCursor {
         match self {
             SourceCursor::Full(c) => c.drain_live_chunk(max_rows, skeletons),
             SourceCursor::Bounded(c) => c.drain_live_chunk(max_rows, skeletons),
-            SourceCursor::PkSet(g) => g.next_live_chunk(max_rows, skeletons),
+            SourceCursor::PkSet(g) => g.drain_live_chunk(max_rows, skeletons),
         }
     }
 }
@@ -220,32 +222,38 @@ impl BoundedIndexCursor {
             max_rows > 0,
             "BoundedIndexCursor::drain_live_chunk: max_rows must be positive"
         );
-        let stride = self.src.schema().pk_stride();
         loop {
-            if self.src.remaining_keys() == 0 {
-                // Refill the gather from the next `max_rows` entries, sorted into PK order.
-                self.pks.clear();
-                let mut taken = 0;
-                while taken < max_rows && self.idx.valid {
-                    debug_assert!(self.idx.current_weight > 0, "an index entry at a non-positive weight");
-                    self.pks
-                        .extend_from_slice(self.spec.split_entry(self.idx.current_pk_bytes()).1);
-                    self.idx.advance();
-                    taken += 1;
-                }
-                if taken == 0 {
-                    return None;
-                }
-                sort_indices(&self.pks, stride, &mut self.order);
-                let keys = self.src.reload();
-                for &i in &self.order {
-                    keys.extend_from_slice(&self.pks[i as usize * stride..][..stride]);
-                }
-            }
-            // `None` means every key left had no row (an orphaned entry): refill again.
-            if let Some(chunk) = self.src.next_live_chunk(max_rows, skeletons) {
+            if let Some(chunk) = self.src.drain_live_chunk(max_rows, skeletons) {
                 return Some(chunk);
             }
+            if !self.refill(max_rows) {
+                return None;
+            }
         }
+    }
+
+    /// Reload the gather with the source PKs of the next `max_rows` index entries;
+    /// `false` once the index range is spent.
+    fn refill(&mut self, max_rows: usize) -> bool {
+        let stride = self.src.schema().pk_stride();
+        self.pks.clear();
+        let mut taken = 0;
+        while taken < max_rows && self.idx.valid {
+            debug_assert!(self.idx.current_weight > 0, "an index entry at a non-positive weight");
+            self.pks
+                .extend_from_slice(self.spec.split_entry(self.idx.current_pk_bytes()).1);
+            self.idx.advance();
+            taken += 1;
+        }
+        if taken == 0 {
+            return false;
+        }
+        sort_indices(&self.pks, stride, &mut self.order);
+        let mut keys = Vec::with_capacity(self.pks.len());
+        for &i in &self.order {
+            keys.extend_from_slice(&self.pks[i as usize * stride..][..stride]);
+        }
+        self.src.reload(PkKeys::from_sorted(stride, keys));
+        true
     }
 }

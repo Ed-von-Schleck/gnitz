@@ -1219,7 +1219,7 @@ fn a_table_seed_reads_the_source_as_of_its_last_tick() {
     engine.ingest_unticked(tid, push).unwrap();
 
     let hydrate = |engine: &mut CatalogEngine, ids: &[u64]| {
-        let keys: Vec<u8> = ids.iter().flat_map(|k| k.to_be_bytes()).collect();
+        let keys = gnitz_wire::PkKeys::from_sorted(8, ids.iter().flat_map(|k| k.to_be_bytes()).collect());
         let out = engine.dag.hydrate_keys(&engine.registry, view, keys).unwrap();
         zset_of(&out, &schema)
     };

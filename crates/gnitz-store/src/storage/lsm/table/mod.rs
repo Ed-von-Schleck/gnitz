@@ -10,9 +10,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gnitz_foundation::posix_io::create_dir;
+use gnitz_wire::PkKeys;
 
 use super::manifest::Manifest;
-use super::read_cursor::{self, ReadCursor};
+use super::read_cursor::{self, PkSetGather, ReadCursor};
 use super::run::{Run, StoredRow};
 use super::run_set::RunSet;
 use super::shard_index::{ShardBudget, ShardIndex};
@@ -415,25 +416,27 @@ impl Table {
         read_cursor::from_runs(self.runs(), self.shard_index.schema, cap)
     }
 
-    /// A cursor that can answer only about keys in `[start, end]`, `end` `None`
-    /// meaning the top of the key space, and **unpositioned** — every caller
-    /// seeks or probes within the bound it named.
-    ///
-    /// Both bounds are exactly `pk_stride` OPK bytes. The gather over-approximates
-    /// on both tiers, so a half-open `end` is safe to pass.
-    ///
-    /// `extra`, when present, is merged in as one more in-memory run.
-    pub(crate) fn open_cursor_in_range(
-        &self,
+    /// A cursor over the keys in `[first, last]`, positioned on the first live row
+    /// `>= first`.
+    pub(crate) fn open_cursor_in_range(&self, first: &[u8], last: &[u8]) -> ReadCursor {
+        let (runs, cap) = self.runs_in_range(first, Some(last), None);
+        read_cursor::from_runs_at(runs, self.shard_index.schema, cap, first)
+    }
+
+    /// The runs that can hold a key in `[start, end]`, `end` `None` meaning the top of
+    /// the key space, and a capacity hint for a cursor over them. The pruning
+    /// over-approximates, so a half-open `end` is safe to pass.
+    fn runs_in_range<'a>(
+        &'a self,
         start: &[u8],
         end: Option<&[u8]>,
         extra: Option<Rc<Batch>>,
-    ) -> ReadCursor {
+    ) -> (impl Iterator<Item = Run> + 'a, usize) {
         let stride = self.shard_index.schema.pk_stride();
-        debug_assert_eq!(start.len(), stride, "open_cursor_in_range: start is not pk_stride wide");
+        debug_assert_eq!(start.len(), stride, "runs_in_range: start is not pk_stride wide");
         debug_assert!(
             end.is_none_or(|e| e.len() == stride),
-            "open_cursor_in_range: end is not pk_stride wide",
+            "runs_in_range: end is not pk_stride wide",
         );
         let (lo, hi) = (
             PkBuf::from_bytes(start),
@@ -443,7 +446,7 @@ impl Table {
             .mem_runs(Some((lo, hi)))
             .chain(extra.filter(|b| !b.is_empty()).map(Run::Mem))
             .chain(self.shard_index.shard_arcs_in_range(lo, hi).map(Run::Shard));
-        read_cursor::from_runs_unpositioned(runs, self.shard_index.schema, self.mem_run_count() + 1)
+        (runs, self.mem_run_count() + 1 + self.shard_index.narrow_range_shards())
     }
 
     /// A cursor positioned on the OPK key band `[start, end)` and its raw entry
@@ -453,9 +456,20 @@ impl Table {
             return (read_cursor::empty_cursor(self.shard_index.schema), 0);
         };
         let end = end.as_ref().map(PkBuf::pk_bytes);
-        let mut cursor = self.open_cursor_in_range(start.pk_bytes(), end, None);
-        let matches = cursor.seek_range_bytes(start.pk_bytes(), end);
-        (cursor, matches)
+        let (runs, cap) = self.runs_in_range(start.pk_bytes(), end, None);
+        read_cursor::from_runs_in_band(runs, self.shard_index.schema, cap, start.pk_bytes(), end)
+    }
+
+    /// Every live row of `keys`, over the runs the span they cover can reach.
+    pub(crate) fn gather(&self, keys: PkKeys, extra: Option<Rc<Batch>>) -> PkSetGather {
+        let cursor = match keys.bounds() {
+            Some((first, last)) => {
+                let (runs, cap) = self.runs_in_range(first, Some(last), extra);
+                read_cursor::from_runs_unpositioned(runs, self.shard_index.schema, cap)
+            }
+            None => read_cursor::empty_cursor(self.shard_index.schema),
+        };
+        PkSetGather::new(cursor, keys)
     }
 
     /// Return the fully consolidated batch of all live rows, caching the result.

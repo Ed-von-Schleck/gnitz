@@ -6,14 +6,14 @@
 use gnitz_foundation::env::env_num;
 use rustc_hash::FxHashMap;
 
-use crate::schema::key::{compare_pk_bytes, key_range_between_cuts, KeyCut, PkBuf};
+use crate::schema::key::{key_range_between_cuts, pk_in_range, KeyCut};
 use crate::schema::SchemaDescriptor;
 
 use crate::schema::Slot;
 use crate::storage::{
     Batch, PkSetGather, ReadCursor, RecoverySource, StorageError, StoreBudgets, StoreError, StoredRow, Table,
 };
-use gnitz_wire::{PkColList, ViewProps};
+use gnitz_wire::{PkColList, PkKeys, ViewProps};
 
 mod build;
 mod circuit_state;
@@ -280,40 +280,31 @@ impl Relation {
         self.store.held().open_cursor()
     }
 
-    /// Every live row of `keys` (flat OPK images, strictly ascending). With `unticked`,
-    /// the store is read as it was before those ingests.
-    pub fn gather(&self, keys: Vec<u8>, unticked: Option<&Batch>) -> PkSetGather {
-        let schema = self.schema();
+    /// Every live row of `keys`. With `unticked`, the store is read as it was before
+    /// those ingests.
+    pub fn gather(&self, keys: PkKeys, unticked: Option<&Batch>) -> PkSetGather {
         let table = self.store.held();
-        PkSetGather::open(keys, schema, |start, end| {
-            let undo = unticked.map(|b| {
-                let in_range: Vec<u32> = (0..b.len())
-                    .filter(|&i| {
-                        let pk = b.get_pk_bytes(i);
-                        b.get_weight(i) != 0
-                            && compare_pk_bytes(pk, start).is_ge()
-                            && end.is_none_or(|e| compare_pk_bytes(pk, e).is_le())
-                    })
-                    .map(|i| i as u32)
-                    .collect();
-                let mut undo = b.ascending_subset(&in_range).into_consolidated(&schema);
-                undo.map_weights(i64::wrapping_neg);
-                std::rc::Rc::new(undo)
-            });
-            table.open_cursor_in_range(start, end, undo)
-        })
+        let undo = unticked.zip(keys.bounds()).map(|(b, (first, last))| {
+            let in_range: Vec<u32> = (0..b.len())
+                .filter(|&i| b.get_weight(i) != 0 && pk_in_range(first, last, b.get_pk_bytes(i)))
+                .map(|i| i as u32)
+                .collect();
+            let mut undo = b.ascending_subset(&in_range).into_consolidated(table.schema());
+            undo.map_weights(i64::wrapping_neg);
+            std::rc::Rc::new(undo)
+        });
+        table.gather(keys, undo)
     }
 
-    /// Visit every positive-weight row whose OPK key begins with `prefix`, through a
-    /// cursor that gathers only the runs overlapping that key band.
+    /// Visit every positive-weight row whose OPK key begins with `prefix`.
     pub fn for_each_positive_with_prefix(&self, prefix: &[u8], f: impl FnMut(&ReadCursor)) {
-        let band = key_range_between_cuts(KeyCut::min_of(prefix), KeyCut::above(prefix), self.schema().pk_stride());
-        if let Some((start, end)) = band {
-            self.store
-                .held()
-                .open_cursor_in_range(start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes), None)
-                .for_each_positive_with_prefix(prefix, f);
-        }
+        let table = self.store.held();
+        let band = key_range_between_cuts(
+            KeyCut::min_of(prefix),
+            KeyCut::above(prefix),
+            table.schema().pk_stride(),
+        );
+        table.range_cursor(band).0.for_each_positive_while(|_| true, f);
     }
 
     /// Materialize every row of this relation's store whose net weight is non-zero.

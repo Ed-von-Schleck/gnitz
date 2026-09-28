@@ -617,10 +617,7 @@ impl WorkerProcess {
                 return Err("has_pk: a projecting probe reads the table's own PK store".into());
             }
             let ref_col = mode_param as u8;
-            let mut keys = Vec::with_capacity(n * batch.schema().pk_stride());
-            for i in 0..n {
-                keys.extend_from_slice(batch.get_pk_bytes(i));
-            }
+            let keys = gnitz_wire::PkKeys::from_sorted(batch.schema().pk_stride(), batch.pk_data().to_vec());
             let result = self.cat().registry.gather_bytes(target_id, keys, ref_col)?;
             self.send_reply(route, result);
             return Ok(());

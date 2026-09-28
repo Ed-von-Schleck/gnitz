@@ -4,7 +4,8 @@
 use super::ChildKind;
 use super::RelationRegistry;
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ReadCursor, StorageError, StoreError, Table};
+use crate::storage::{Batch, PkSetGather, ReadCursor, StorageError, StoreError, Table};
+use gnitz_wire::PkKeys;
 
 /// A `u16` index into one [`CircuitState`], minted only by
 /// [`StateLayout::declare`].
@@ -68,14 +69,16 @@ impl CircuitState {
         self.at(idx).open_cursor()
     }
 
-    pub fn cursor_in_range(&self, idx: StateIdx, start: &[u8], end: Option<&[u8]>) -> ReadCursor {
-        self.at(idx).open_cursor_in_range(start, end, None)
+    /// Every live row of `keys` in `idx`.
+    pub fn gather(&self, idx: StateIdx, keys: PkKeys) -> PkSetGather {
+        self.at(idx).gather(keys, None)
     }
 
     /// A cursor over `idx` ranged to the PKs of `keys`, for probing at them.
     pub fn cursor_for_keys(&self, idx: StateIdx, keys: &Batch) -> ReadCursor {
         debug_assert!(keys.is_consolidated() && keys.count > 0);
-        self.cursor_in_range(idx, keys.get_pk_bytes(0), Some(keys.get_pk_bytes(keys.count - 1)))
+        self.at(idx)
+            .open_cursor_in_range(keys.get_pk_bytes(0), keys.get_pk_bytes(keys.count - 1))
     }
 
     pub fn ingest_owned(&mut self, idx: StateIdx, batch: Batch) -> Result<(), StorageError> {

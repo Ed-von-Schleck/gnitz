@@ -376,7 +376,7 @@ impl Batch {
     }
 
     #[inline]
-    pub(crate) fn pk_data(&self) -> &[u8] {
+    pub fn pk_data(&self) -> &[u8] {
         self.region_at(REG_PK)
     }
     #[inline]

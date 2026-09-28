@@ -324,28 +324,21 @@ struct PairKey {
 // The equi walk
 // ---------------------------------------------------------------------------
 
-/// Equal-key merge walk. Both pointers galloping-skip to catch up, so the cost
-/// is bounded by the smaller side's matches whichever side that is. A fresh
-/// cursor sits on the trace's first live group, which can lie above `delta[0]`,
-/// so the opening seek is the backward-capable one.
+/// Equal-key merge walk over a fresh cursor. Both pointers galloping-skip to catch
+/// up, so the cost is bounded by the smaller side's matches whichever side that is.
 fn equi_merge_walk(delta: &Batch, m: &mut ReadCursor, mut emit: impl FnMut(usize, usize, &ReadCursor)) {
     let n = delta.count;
-    if n == 0 {
-        return;
-    }
-    m.advance_to(delta.get_pk_bytes(0));
     let mut i = 0;
-    while i < n && m.valid {
+    while i < n {
         let dk = delta.get_pk_bytes(i);
-        match compare_pk_ordering(dk, m.current_pk_bytes()) {
-            Ordering::Less => i = delta.advance_to(m.current_pk_bytes(), i), // skip delta
-            // The comparison above IS the forward gallop's precondition.
-            Ordering::Greater => m.advance_to_forward(dk), // skip trace
-            Ordering::Equal => {
-                let j = pk_group_end(delta, i); // delta group
-                m.for_each_pk_group_row(dk, |c| emit(i, j, c));
-                i = j;
-            }
+        if m.seek_pk_group_ascending(dk) {
+            let j = pk_group_end(delta, i); // delta group
+            m.for_each_pk_group_row(dk, |c| emit(i, j, c));
+            i = j;
+        } else if m.valid {
+            i = delta.advance_to(m.current_pk_bytes(), i); // skip delta
+        } else {
+            break;
         }
     }
 }

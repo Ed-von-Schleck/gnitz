@@ -305,25 +305,6 @@ fn equi_merge_walk_skips_a_ghost_group_across_sources() {
     );
 }
 
-/// A pre-advanced trace cursor must still produce the full walk: the merge walk
-/// self-positions rather than assuming a fresh cursor.
-#[test]
-fn equi_merge_walk_self_positions_a_stale_cursor() {
-    let s = make_schema_u64_i64();
-    let mb = walk_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40), (5, 1, 50)]);
-    let delta = walk_batch(&[(1, 1, 1), (3, 1, 3), (5, 1, 5)]);
-
-    let mut ch = crate::storage::create_read_cursor(std::slice::from_ref(&mb), &[], s);
-    ch.advance_to(&(4u128).to_be_bytes()[8..]);
-    assert!(ch.valid && ch.current_key_narrow() == 4, "precondition: stale at pk=4");
-
-    assert_eq!(
-        record_walk(&delta, &mut ch),
-        naive_walk(&delta, &mb),
-        "stale cursor must be reset by self-positioning",
-    );
-}
-
 // -----------------------------------------------------------------------
 // Cross delta-trace
 // -----------------------------------------------------------------------

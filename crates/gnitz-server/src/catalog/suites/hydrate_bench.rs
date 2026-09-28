@@ -28,7 +28,12 @@ struct Counting<'a> {
 }
 
 impl SkeletonHydrator for Counting<'_> {
-    fn hydrate_keys(&mut self, registry: &RelationRegistry, view_id: u64, keys: Vec<u8>) -> Result<Batch, StoreError> {
+    fn hydrate_keys(
+        &mut self,
+        registry: &RelationRegistry,
+        view_id: u64,
+        keys: gnitz_wire::PkKeys,
+    ) -> Result<Batch, StoreError> {
         let out = self.dag.hydrate_keys(registry, view_id, keys)?;
         self.hydrated += out.len();
         Ok(out)

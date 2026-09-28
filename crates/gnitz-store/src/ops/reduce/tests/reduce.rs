@@ -5391,7 +5391,7 @@ fn reduce_multi_avi_global_emptied() {
 // what its one retraction probe, `seek_pk_group_ascending`, is sound under. These
 // tests drive it across multi-epoch retraction (incl. sign-flip boundaries) and
 // over the nullable/hash arm, force a multi-source trace cursor so the merge-mode
-// gallop and the ascending tripwire run at scale, and pin the classifier.
+// gallop runs at scale, and pin the classifier.
 // ===========================================================================
 
 /// One input row over a `[U64 pk, <grp>, I64 val]` schema: `(pk, grp, val,
@@ -5712,8 +5712,7 @@ fn single_col_canonical_group_key_predicate() {
 // flip (-100..99), six epochs each touching every group (insert / update /
 // delete). One flush after epoch 0 plus accumulating memtable runs pushes the
 // trace_out cursor into merge mode (≥ 3 sources, all live at open) from epoch 3 on, so the
-// multi-source gallop (`seek_forward_multi`) and the debug ascending tripwire
-// both execute across hundreds of monotone probes. Construction makes every
+// merge-mode gallop executes across hundreds of monotone probes. Construction makes every
 // group's final aggregate identical (SUM=10, COUNT=3), so any mis-landed
 // retraction shows up as a wrong sum or an un-cancelled duplicate.
 #[test]
@@ -6754,4 +6753,55 @@ fn op_reduce_bench() {
 
         println!("op_reduce {label}: empty trace {cold:?}, populated trace {warm:?}");
     }
+}
+
+/// `op_reduce` over a three-run trace_out whose two older runs lie wholly below the
+/// delta's first output key: the delta touches every group of the newest run and
+/// adds a new group between each pair. `#[ignore]`; run release:
+///   cargo test -p gnitz-store --release op_reduce_multi_run_bench -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn op_reduce_multi_run_bench() {
+    const G: u64 = 1 << 14;
+    const ITERS: usize = 200;
+    let schema = pk_payload_schema(&[TypeCode::U64]);
+    let group = [0u32];
+    let aggs = [
+        AggDescriptor { col_idx: 1, agg_op: AggFunc::Sum },
+        AggDescriptor::COUNT_STAR,
+    ];
+    let plan = ReducePlan::from_wire(&schema, &group, &aggs, false).unwrap();
+    let out_schema = out_schema_for(&schema, &group, &aggs);
+    let rows = |keys: &[u64]| {
+        let mut bb = BatchBuilder::new(schema);
+        for &k in keys {
+            bb.begin_row(k as u128, 1);
+            bb.put_int(k as u128);
+            bb.end_row();
+        }
+        let mut b = bb.finish();
+        b.certify_layout(Layout::Consolidated);
+        b
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let mut trace = crate::test_support::scratch_table(tmp.path().to_str().unwrap(), out_schema);
+    let runs: [Vec<u64>; 3] = [
+        (0..2 * G).step_by(2).collect(),
+        (1..2 * G).step_by(2).collect(),
+        (2 * G..4 * G).step_by(2).collect(),
+    ];
+    for keys in &runs {
+        let out = super::op_reduce::op_reduce(&rows(keys), &mut trace.open_cursor(), None, &plan);
+        trace.ingest_owned_batch(out).unwrap();
+    }
+    let delta = rows(&(2 * G..4 * G).collect::<Vec<_>>());
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let mut instructions = 0;
+    for _ in 0..ITERS {
+        let mut cursor = trace.open_cursor();
+        let (out, n) = counter.measure(|| super::op_reduce::op_reduce(&delta, &mut cursor, None, &plan));
+        std::hint::black_box(out);
+        instructions += n;
+    }
+    println!("op_reduce multi-run: {} instr/iter", instructions / ITERS as u64);
 }

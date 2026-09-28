@@ -23,7 +23,7 @@ use std::time::Duration;
 use super::{op_join_delta_trace, JoinPlan};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, Layout, ReadCursor};
-use crate::test_support::bench_time;
+use crate::test_support::bench_time_each;
 use gnitz_wire::{JoinKind, RangeRel};
 
 /// Rows on the larger side of every fixture. Big enough that the per-call
@@ -134,20 +134,20 @@ fn cursor_over(schema: &SchemaDescriptor, p: Payload, rows: &[Row], n: usize) ->
 // Timing
 // ---------------------------------------------------------------------------
 
-/// Time `ITERS` calls of one join kind and print the row. The plan is built
-/// outside the timed region, as the compiler bakes it.
+/// Time `ITERS` calls of one join kind and print the row. The plan and each
+/// call's fresh `cursor()` are built outside the timed region, as an epoch gets them.
 fn time_join(
     name: String,
     kind: JoinKind,
     delta_is_right: bool,
     schema: &SchemaDescriptor,
     delta: &Batch,
-    cursor: &mut ReadCursor,
+    cursor: impl FnMut() -> ReadCursor,
 ) {
     let plan = JoinPlan::from_wire(kind, delta_is_right, schema, schema).expect("bench join plan is well-formed");
     let mut out_rows = 0;
-    let elapsed = bench_time(ITERS, || {
-        let out = op_join_delta_trace(delta, cursor, &plan.out_schema, plan.probe);
+    let elapsed = bench_time_each(ITERS, cursor, |mut cursor| {
+        let out = op_join_delta_trace(delta, &mut cursor, &plan.out_schema, plan.probe);
         out_rows = out.count;
         std::hint::black_box(&out);
     });
@@ -241,14 +241,13 @@ fn join_equi_dt_bench() {
             let delta = build(&schema, p, &delta_rows);
             for srcs in SOURCE_COUNTS {
                 for right in SIDES {
-                    let mut cursor = cursor_over(&schema, p, &trace_rows, srcs);
                     time_join(
                         format!("equi {:<24} {:<8} src={srcs} right={right}", shape.name, p.tag()),
                         JoinKind::Equi,
                         right,
                         &schema,
                         &delta,
-                        &mut cursor,
+                        || cursor_over(&schema, p, &trace_rows, srcs),
                     );
                 }
             }
@@ -275,14 +274,13 @@ fn join_cross_dt_bench() {
             let delta = build(&schema, p, &rows(d));
             for srcs in SOURCE_COUNTS {
                 for right in SIDES {
-                    let mut cursor = cursor_over(&schema, p, &rows(t), srcs);
                     time_join(
                         format!("cross {name:<23} {:<8} src={srcs} right={right}", p.tag()),
                         JoinKind::Cross,
                         right,
                         &schema,
                         &delta,
-                        &mut cursor,
+                        || cursor_over(&schema, p, &rows(t), srcs),
                     );
                 }
             }
@@ -416,7 +414,6 @@ fn join_range_dt_bench() {
             for &rel in RangeRel::ALL {
                 for srcs in SOURCE_COUNTS {
                     for right in SIDES {
-                        let mut cursor = cursor_over(&schema, p, &trace_rows, srcs);
                         time_join(
                             format!(
                                 "range {:<32} {:<8} {rel:?} src={srcs} right={right}",
@@ -427,7 +424,7 @@ fn join_range_dt_bench() {
                             right,
                             &schema,
                             &delta,
-                            &mut cursor,
+                            || cursor_over(&schema, p, &trace_rows, srcs),
                         );
                     }
                 }

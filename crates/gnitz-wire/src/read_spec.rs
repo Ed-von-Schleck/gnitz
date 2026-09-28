@@ -139,6 +139,12 @@ impl PkKeys {
     pub fn iter(&self) -> std::slice::ChunksExact<'_, u8> {
         self.bytes.chunks_exact(self.stride())
     }
+
+    /// The first and last key, or `None` for an empty list.
+    pub fn bounds(&self) -> Option<(&[u8], &[u8])> {
+        let first = self.iter().next()?;
+        Some((first, &self.bytes[self.bytes.len() - self.stride()..]))
+    }
 }
 
 /// Whether `bytes`, read as keys of `stride`, strictly ascend.

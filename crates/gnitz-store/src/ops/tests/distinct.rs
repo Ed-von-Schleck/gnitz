@@ -217,3 +217,40 @@ fn distinct_compares_payloads_through_the_schema_selected_comparator() {
         "blob payload",
     );
 }
+
+/// `op_weight_clamp` over a four-run trace with a 4096-group delta, half of it held
+/// by the trace, opening its ranged cursor inside the timed region as an epoch does.
+/// `#[ignore]`; run release:
+///   cargo test -p gnitz-store --release weight_clamp_bench -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn weight_clamp_bench() {
+    const ITERS: usize = 500;
+    let schema = make_schema_u64_i64();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut trace = crate::test_support::scratch_table(tmp.path().to_str().unwrap(), schema);
+    for r in 0..4u64 {
+        let rows: Vec<(u64, i64, i64)> = (0..16_384u64).map(|k| (k * 8 + 2 * r, 1, 0)).collect();
+        trace.ingest_owned_batch(make_batch(&schema, &rows)).unwrap();
+    }
+    let rows: Vec<(u64, i64, i64)> = (0..4096u64).map(|k| (16_384 + 3 * k, 1, 0)).collect();
+    let delta = make_batch(&schema, &rows);
+    let (first, last) = (
+        delta.get_pk_bytes(0).to_vec(),
+        delta.get_pk_bytes(delta.count - 1).to_vec(),
+    );
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let mut instructions = 0;
+    for _ in 0..ITERS {
+        let (out, n) = counter.measure(|| {
+            let mut cursor = trace.open_cursor_in_range(&first, &last);
+            op_weight_clamp(&delta, &mut cursor, &schema, ClampPreset::Distinct)
+        });
+        std::hint::black_box(out);
+        instructions += n;
+    }
+    println!(
+        "op_weight_clamp 4 runs, 4096 groups: {} instr/iter",
+        instructions / ITERS as u64
+    );
+}

@@ -152,6 +152,12 @@ impl ShardIndex {
         l0.chain(deep)
     }
 
+    /// A capacity hint for a cursor over a narrow key range: every L0 shard and one
+    /// per deeper level.
+    pub(crate) fn narrow_range_shards(&self) -> usize {
+        self.l0.len() + FLSM_LEVELS
+    }
+
     /// Registered shards across every tier — one cursor source each, which is
     /// what an unbounded cursor open sizes its vectors to.
     pub(crate) fn shard_count(&self) -> usize {

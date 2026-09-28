@@ -291,3 +291,31 @@ fn scan_spec_global_sum_bench() {
         e.scan_spec(tid, spec.clone(), reply.layout_digest()).unwrap()
     });
 }
+
+/// An index-range read through the bounded index cursor at a chunk size that makes
+/// it refill four times; `c2` is uncorrelated with the PK, so every gathered key seeks.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn scan_spec_index_range_bench() {
+    use gnitz_wire::{key_image, Cut, KeyRange, PkColList};
+    let (mut e, tid) = numeric_fixture("ss_index_range_bench", NUMERIC_ROWS);
+    e.create_index("public.t", &["c2"], false).unwrap();
+    e.registry.set_scan_chunk_rows(16_384);
+    let src = e.registry.relation(tid).map(Relation::schema).unwrap();
+    // `c2 = id ^ 0xa5a5_a5a5` over `id < 2^21`: a 2^16-wide value band holds at most
+    // 2^16 rows, inside the index gate.
+    let lo = 0xa5a5_a5a5u64 & !((1 << 21) - 1);
+    let img = |v: u64| key_image(TypeCode::I64, v as u128);
+    let band = KeyRange::new(
+        PkColList::from_slice(&[3]),
+        &[],
+        Cut::before(img(lo)),
+        Cut::before(img(lo + (1 << 16))),
+    );
+    let spec = ReadSpec::all_rows(ReadBound::Range(band));
+    let rows = e.scan_spec(tid, spec.clone(), src.layout_digest()).unwrap().len();
+    assert!(rows >= 4 * 16_384, "the band spans several refills: {rows} rows");
+    cell("index range, 16K-row chunks", rows as u64, || {
+        e.scan_spec(tid, spec.clone(), src.layout_digest()).unwrap()
+    });
+}

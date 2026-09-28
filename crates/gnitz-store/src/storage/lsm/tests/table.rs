@@ -1513,10 +1513,62 @@ fn a_range_opened_cursor_sees_every_row_the_whole_index_would() {
         let (lo_b, hi_b) = (lo.to_be_bytes(), hi.to_be_bytes());
         let mut whole = t.open_cursor();
         whole.seek_range_bytes(&lo_b, Some(&hi_b));
-        let mut ranged = t.open_cursor_in_range(&lo_b, Some(&hi_b), None);
-        ranged.seek_range_bytes(&lo_b, Some(&hi_b));
+        let (mut ranged, _) = t.range_cursor(Some((PkBuf::from_bytes(&lo_b), Some(PkBuf::from_bytes(&hi_b)))));
         assert_eq!(drain(&mut ranged), drain(&mut whole), "range [{lo}, {hi})");
     }
+}
+
+/// `Table::gather` over shards and RAM runs holding rows below the first key, above
+/// the last and between keys yields what a fresh full cursor's per-key seek does.
+#[test]
+fn gather_matches_per_key_fresh_seeks() {
+    let schema = make_schema_u64_i64();
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = new_table(dir.path(), schema, 96, RecoverySource::SalReplay);
+    t.ram_tier.set_budget(100);
+    for r in 0..8u64 {
+        let mut rows: Vec<(u64, i64, i64)> = (0..40).map(|k| (k * 8 + r, 1, (k * 8 + r) as i64)).collect();
+        rows.push((500 + r, 1, (500 + r) as i64));
+        t.ingest_owned_batch(make_batch(&rows)).unwrap();
+    }
+    // A late run: 120 folds to net zero, 121 gains a second payload, 400 is new.
+    t.ingest_owned_batch(make_batch(&[(120, -1, 120), (121, 1, 9999), (400, 1, 400)]))
+        .unwrap();
+    assert!(t.shard_index.shard_count() > 0, "the rows reached the shard tier");
+    assert!(t.mem_run_count() > 0, "the late run stays in RAM");
+
+    // Absent (330, 350), the ghost (120) and the multi-payload key (121) between
+    // present ones; rows lie below 50, between keys, and above 400 (500..508).
+    let keys: &[u64] = &[50, 51, 99, 120, 121, 200, 330, 350, 400];
+    let key_bytes: Vec<[u8; 8]> = keys.iter().map(|k| k.to_be_bytes()).collect();
+    let pk_keys = PkKeys::from_keys(8, key_bytes.iter().map(|k| &k[..]));
+
+    let row = |c: &crate::storage::ReadCursor| {
+        let (src, r) = c.current_row_source();
+        (c.current_pk_bytes().to_vec(), c.current_weight, payload0_i64(src, r))
+    };
+    let mut got = Vec::new();
+    for chunk in [1usize, 3, usize::MAX] {
+        let mut gather = t.gather(pk_keys.clone(), None);
+        got.clear();
+        while gather.for_each_live_row(chunk, |c| got.push(row(c))) > 0 {}
+        let mut want = Vec::new();
+        for key in &key_bytes {
+            let mut fresh = t.open_cursor();
+            fresh.seek_bytes(key);
+            fresh.for_each_pk_group_row(key, |c| want.push(row(c)));
+        }
+        assert_eq!(got, want, "chunk={chunk}");
+    }
+    let got_pks: Vec<u64> = got
+        .iter()
+        .map(|(pk, _, _)| u64::from_be_bytes(pk[..].try_into().unwrap()))
+        .collect();
+    assert_eq!(
+        got_pks,
+        [50, 51, 99, 121, 121, 200, 400],
+        "the ghost and the absent keys contribute nothing"
+    );
 }
 
 /// Only base-table paths point-probe a store by PK, and they are the only

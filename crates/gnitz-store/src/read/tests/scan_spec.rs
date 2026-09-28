@@ -4,8 +4,8 @@ use crate::schema::Slot;
 use crate::schema::{SchemaColumn, TypeCode};
 use crate::storage::{BatchBuilder, StoreError};
 use crate::test_support::payload0_i64;
-use gnitz_wire::ViewProps;
 use gnitz_wire::{key_image, AggDescriptor, AggReadSpec, Cut, KeyRange, OrderKey, PkColList, ReadSink};
+use gnitz_wire::{PkKeys, ViewProps};
 
 // ── The executor — `scan_spec` over a registry built in-crate ────────
 //
@@ -512,12 +512,9 @@ struct Recompute {
 }
 
 impl SkeletonHydrator for Recompute {
-    fn hydrate_keys(&mut self, _: &RelationRegistry, _: u64, keys: Vec<u8>) -> Result<Batch, StoreError> {
+    fn hydrate_keys(&mut self, _: &RelationRegistry, _: u64, keys: PkKeys) -> Result<Batch, StoreError> {
         let schema = id_val_schema();
-        let ks: Vec<u64> = keys
-            .chunks_exact(schema.pk_stride())
-            .map(|k| u64::from_be_bytes(k.try_into().unwrap()))
-            .collect();
+        let ks: Vec<u64> = keys.iter().map(|k| u64::from_be_bytes(k.try_into().unwrap())).collect();
         let mut bb = BatchBuilder::new(schema);
         for &k in &ks {
             for val in std::iter::once(k).chain((k == 2).then_some(7)) {
@@ -533,7 +530,7 @@ impl SkeletonHydrator for Recompute {
 
 fn pk_set(ids: &[u64]) -> ReadBound {
     let keys: Vec<[u8; 8]> = ids.iter().map(|k| k.to_be_bytes()).collect();
-    ReadBound::PkSet(gnitz_wire::PkKeys::from_keys(8, keys.iter().map(|k| &k[..])))
+    ReadBound::PkSet(PkKeys::from_keys(8, keys.iter().map(|k| &k[..])))
 }
 
 /// Every read verb over a skeleton store answers exactly the ingested rows, and a

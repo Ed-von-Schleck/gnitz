@@ -23,7 +23,7 @@ use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::IndexKeySpec;
 use gnitz_store::storage::MemBatch;
-use gnitz_wire::{WireConflictMode, WireProbeMode, WireStatus};
+use gnitz_wire::{PkKeys, WireConflictMode, WireProbeMode, WireStatus};
 
 // ---------------------------------------------------------------------------
 // Pipelined validation checks
@@ -868,15 +868,13 @@ async fn resolve_parent_deltas(
             check_of.push(None);
             continue;
         }
-        // Sorted so each worker's sublist reaches its cursor ascending: the
-        // scatter preserves per-worker relative order, so one global sort does
-        // it.
-        let mut keys: Vec<&[u8]> = b.touched_committed(ptid).collect();
+        // The scatter preserves per-worker relative order, so each worker's
+        // sublist of an ascending list is ascending.
+        let keys = PkKeys::from_keys(schema.pk_stride(), b.touched_committed(ptid));
         if keys.is_empty() {
             check_of.push(None);
             continue;
         }
-        keys.sort_unstable();
         let pk_only = probe_schema(&schema);
         // The constructor the worker's projection uses, so a matching reply
         // validates by construction.
@@ -889,7 +887,7 @@ async fn resolve_parent_deltas(
         checks.push(PipelinedCheck {
             keyspace: Keyspace::OwnPk,
             probe: Probe::Project { col: pcol, reply: Box::new(reply) },
-            batch: build_check_batch_pk_bytes(&pk_only, keys.into_iter()),
+            batch: build_check_batch_pk_bytes(&pk_only, keys.iter()),
             schema: wire::WireSchema::encoded(ptid, pk_only),
         });
         check_of.push(Some(checks.len() - 1));

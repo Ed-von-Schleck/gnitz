@@ -8,6 +8,7 @@ use crate::test_support::{
     make_batch_u128, make_schema_i64pk_i64, make_schema_pk_u64_payload_string, make_schema_u128_i64,
     make_schema_u64_i64, opk_pk, payload0_i64, pk_payload_schema, wide_pk_3xu64_schema,
 };
+use gnitz_wire::PkKeys;
 
 /// Build an `Rc<Batch>` with i64-payload rows.  Tests pre-sort their
 /// inputs and have at most one row per (PK, payload), so the batch is
@@ -1010,8 +1011,8 @@ fn ascending_key_sweep_matches_per_key_fresh_seeks() {
     let keys: &[u128] = &[5, 10, 15, 20, 30, 40, 50, 70, 90, 95];
 
     let flat: Vec<u8> = keys.iter().flat_map(|k| k.to_be_bytes()).collect();
-    let got = PkSetGather::open(flat, schema, |_, _| create_read_cursor(&sources, &[], schema))
-        .next_chunk(usize::MAX)
+    let got = PkSetGather::new(create_read_cursor(&sources, &[], schema), PkKeys::from_sorted(16, flat))
+        .drain_chunk(usize::MAX)
         .expect("the list names present keys");
 
     let mut want = Batch::with_capacity(&schema, 8);
@@ -1047,7 +1048,7 @@ fn ascending_key_sweep_matches_per_key_fresh_seeks() {
     );
 }
 
-/// `next_chunk` stops on the row budget mid-list and resumes at the key it has not
+/// `drain_chunk` stops on the row budget mid-list and resumes at the key it has not
 /// consumed: a chunk boundary must not skip the next chunk's first key, and an
 /// absent key inside a chunk must not shift the ones behind it.
 #[test]
@@ -1060,11 +1061,12 @@ fn pk_set_gather_spans_chunk_boundaries() {
     let flat: Vec<u8> = asked.iter().flat_map(|k| k.to_be_bytes()).collect();
 
     for chunk in [1usize, 3, 7, 100] {
-        let mut gather = PkSetGather::open(flat.clone(), schema, |_, _| {
-            create_read_cursor(std::slice::from_ref(&batch), &[], schema)
-        });
+        let mut gather = PkSetGather::new(
+            create_read_cursor(std::slice::from_ref(&batch), &[], schema),
+            PkKeys::from_sorted(16, flat.clone()),
+        );
         let mut got: Vec<u128> = Vec::new();
-        while let Some(out) = gather.next_chunk(chunk) {
+        while let Some(out) = gather.drain_chunk(chunk) {
             assert!(out.count > 0, "an empty chunk must be reported as None");
             got.extend((0..out.count).map(|r| out.get_pk(r)));
         }

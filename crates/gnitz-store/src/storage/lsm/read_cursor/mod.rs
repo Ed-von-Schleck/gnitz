@@ -42,8 +42,8 @@ impl SkeletonKeys {
         }
     }
 
-    /// The raw drains' guard: the bulk scatter reads every payload column, and a
-    /// skeleton run has none.
+    /// The raw drains' guard: a raw drain has no hydrator to recompute a skeleton
+    /// row's payload.
     pub(crate) fn assert_none(&self) {
         assert!(
             self.keys.is_empty(),
@@ -78,12 +78,6 @@ pub struct ReadCursor {
     merge_order: Vec<(u32, u32, i64)>,
     /// The drain's per-source row windows, reused across chunks.
     drain_windows: Vec<Range<usize>>,
-    /// Whether an ascending sweep has positioned this cursor — see
-    /// [`Self::seek_pk_group_ascending`]. Cleared by every absolute reposition.
-    sweep_open: bool,
-    /// That sweep's last key, for the strict-ascent tripwire.
-    #[cfg(debug_assertions)]
-    sweep_prev: Vec<u8>,
     // Current row state
     pub valid: bool,
     pub current_weight: i64,
@@ -106,7 +100,15 @@ impl ReadCursor {
         }
     }
 
-    fn new(sources: Vec<Run>, states: Vec<PosCursor>, schema: SchemaDescriptor, position: bool) -> Self {
+    /// Positioned by `position` before it is returned, so no caller moves a cursor it
+    /// has to mutate first.
+    #[inline]
+    fn new(
+        sources: Vec<Run>,
+        states: Vec<PosCursor>,
+        schema: SchemaDescriptor,
+        position: impl FnOnce(&mut ReadCursor),
+    ) -> Self {
         debug_assert_eq!(sources.len(), states.len());
         let any_skeleton = sources.iter().any(ColumnarSource::is_skeleton);
         let mut cursor = ReadCursor {
@@ -117,9 +119,6 @@ impl ReadCursor {
             states,
             merge_order: Vec::new(),
             drain_windows: Vec::new(),
-            sweep_open: false,
-            #[cfg(debug_assertions)]
-            sweep_prev: Vec::new(),
             mode: None,
             schema,
             valid: false,
@@ -127,9 +126,7 @@ impl ReadCursor {
             current_entry_idx: 0,
             current_row: 0,
         };
-        if position {
-            cursor.rebuild_and_advance();
-        }
+        position(&mut cursor);
         cursor
     }
 
@@ -176,7 +173,6 @@ impl ReadCursor {
     /// source at `end` is what makes every walk exhaust at the cut with no per-row
     /// boundary check; the bound only narrows, and `rewind` keeps it.
     pub(crate) fn seek_range_bytes(&mut self, start: &[u8], end: Option<&[u8]>) -> usize {
-        self.sweep_open = false;
         debug_assert_eq!(start.len(), self.schema.pk_stride());
         debug_assert!(end.is_none_or(|e| e.len() == self.schema.pk_stride()));
         let mut raw = 0usize;
@@ -197,7 +193,6 @@ impl ReadCursor {
     /// row in storage order — by row index, so no key has to be spelled. The
     /// keyless join probe opens with it, having no key to seek by.
     pub(crate) fn rewind(&mut self) {
-        self.sweep_open = false;
         for state in self.states.iter_mut() {
             state.position = 0;
         }
@@ -210,9 +205,9 @@ impl ReadCursor {
     /// width and signedness — the search and the tree both order by the raw OPK
     /// bytes.
     ///
-    /// `Self::advance_to` lands identically and is never slower, so prefer it;
-    /// this one's landing owes nothing to where the cursor stood, which is what
-    /// makes it the tests' and benches' independent oracle.
+    /// `Self::advance_to` lands identically, galloping from where the cursor
+    /// stands; this one's landing owes nothing to where the cursor stood, which
+    /// is what makes it the tests' and benches' independent oracle.
     pub fn seek_bytes(&mut self, key: &[u8]) {
         self.seek_range_bytes(key, None);
     }
@@ -223,7 +218,6 @@ impl ReadCursor {
     /// out-of-order probe forfeits only the speedup. `key` must be exactly
     /// `pk_stride` OPK bytes.
     pub(crate) fn advance_to(&mut self, key: &[u8]) {
-        self.sweep_open = false;
         // Mode before the comparison, so a single-source cursor — with no tree to
         // gallop — does not pay for one that cannot change what it does. `valid`
         // before both: `current_pk_cmp_bytes` reads the positioned row.
@@ -237,7 +231,7 @@ impl ReadCursor {
     /// [`Self::advance_to`] with its forward precondition already established:
     /// positioned, and below `key`. Skipping that comparison is the whole reason
     /// the two are separate.
-    pub(crate) fn advance_to_forward(&mut self, key: &[u8]) {
+    fn advance_to_forward(&mut self, key: &[u8]) {
         // Only the merge mode has a tournament an in-place gallop can maintain.
         if self.mode.is_none() {
             self.seek_forward_merge(key);
@@ -303,49 +297,20 @@ impl ReadCursor {
         }
     }
 
-    /// Position on `key`'s PK group during an ascending sweep; `true` when the
-    /// cursor stands on it. The sweep's first key repositions absolutely, so no
-    /// caller owes this a starting position; each later one is settled against the
-    /// cursor's own, where `current_pk > key` proves `key` absent — the merge
-    /// emits ascending, and a group that folded to net zero folds to zero again.
-    ///
-    /// Keys must strictly increase until something repositions the cursor, which
-    /// `Self::note_sweep_key` enforces.
+    /// Position on `key`'s PK group; `true` when the cursor stands on it. Across calls,
+    /// keys must strictly ascend, the first at or above where the cursor was positioned.
     pub(crate) fn seek_pk_group_ascending(&mut self, key: &[u8]) -> bool {
-        if !self.note_sweep_key(key) {
-            self.reposition_to(key);
-        } else if self.valid {
-            match self.current_pk_cmp_bytes(key) {
-                Ordering::Greater => return false,
-                Ordering::Equal => return true,
-                // That comparison IS the gallop's precondition; going through
-                // `advance_to` would only take it a second time.
-                Ordering::Less => self.advance_to_forward(key),
-            }
-        } else {
+        if !self.valid {
             return false;
         }
-        self.valid && self.current_pk_eq(key)
-    }
-
-    /// Open or extend the ascending sweep at `key`, returning whether one was
-    /// already open. Debug-asserts the strict ascent the gate above reads as proof
-    /// of absence — the one way to misuse it, so it fails a test rather than
-    /// quietly under-reporting a group.
-    // `key` feeds the tripwire alone, which a release build compiles out.
-    #[cfg_attr(not(debug_assertions), allow(unused_variables))]
-    fn note_sweep_key(&mut self, key: &[u8]) -> bool {
-        let open = std::mem::replace(&mut self.sweep_open, true);
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(
-                !open || self.sweep_prev.as_slice() < key,
-                "an ascending sweep's keys must strictly increase",
-            );
-            self.sweep_prev.clear();
-            self.sweep_prev.extend_from_slice(key);
+        match self.current_pk_cmp_bytes(key) {
+            Ordering::Greater => false,
+            Ordering::Equal => true,
+            Ordering::Less => {
+                self.advance_to_forward(key);
+                self.valid && self.current_pk_eq(key)
+            }
         }
-        open
     }
 
     /// PK region of the current row as raw bytes, without copying. The single PK
@@ -395,10 +360,7 @@ impl ReadCursor {
     }
 
     /// Walk the equal-`key` PK group from wherever the cursor stands, invoking
-    /// `f` at each emitted row; on return the cursor sits past the group. Seek-free
-    /// — the equi walk's `Equal` arm has just located `key` through the merge, and
-    /// everyone else positions first ([`Self::seek_pk_group_ascending`] under a
-    /// sorted key list, [`Self::advance_to`] otherwise).
+    /// `f` at each emitted row; on return the cursor sits past the group.
     ///
     /// Not [`Self::for_each_row_while`] with an equality `cont`: `gnitz-store`
     /// builds at `opt-level = 0` in dev, where that closure is a real call per row.
@@ -530,10 +492,8 @@ impl ReadCursor {
     }
 
     /// Visit every positive-weight row whose PK begins with `prefix`, invoking
-    /// `f(&*self)` at each (the callback reads the committed `current_*` row
-    /// state; it must not re-enter the cursor). The seek/advance/walk loop the
-    /// system-table readers (circuit load, view-row retraction) share.
-    pub fn for_each_positive_with_prefix<F: FnMut(&ReadCursor)>(&mut self, prefix: &[u8], f: F) {
+    /// `f(&*self)` at each.
+    pub(crate) fn for_each_positive_with_prefix<F: FnMut(&ReadCursor)>(&mut self, prefix: &[u8], f: F) {
         if !self.seek_first_positive_with_prefix(prefix) {
             return;
         }
@@ -562,7 +522,7 @@ impl ReadCursor {
 
     /// [`Self::for_each_row_while`] with the weight gate applied — the one place
     /// the two positive-row walks below spell `current_weight > 0`.
-    fn for_each_positive_while<C: Fn(&[u8]) -> bool, F: FnMut(&ReadCursor)>(&mut self, cont: C, mut f: F) {
+    pub(crate) fn for_each_positive_while<C: Fn(&[u8]) -> bool, F: FnMut(&ReadCursor)>(&mut self, cont: C, mut f: F) {
         self.for_each_row_while(cont, |c| {
             if c.current_weight > 0 {
                 f(c);
@@ -678,22 +638,50 @@ impl ReadCursor {
 /// first live PK group. Every run must be folded. `cap` is an allocation hint
 /// for the source vectors.
 pub(crate) fn from_runs(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor, cap: usize) -> ReadCursor {
-    build(runs, schema, cap, true)
+    build(runs, schema, cap, ReadCursor::rebuild_and_advance)
 }
 
-/// [`from_runs`] without the initial positioning: the cursor comes back invalid,
-/// for a caller that seeks or probes before reading. Positioning stays the
-/// default because an unpositioned cursor nobody repositions walks nothing,
-/// silently.
+/// [`from_runs`] positioned on the first live row `>= key`.
+pub(crate) fn from_runs_at(
+    runs: impl IntoIterator<Item = Run>,
+    schema: SchemaDescriptor,
+    cap: usize,
+    key: &[u8],
+) -> ReadCursor {
+    build(runs, schema, cap, |c| c.reposition_to(key))
+}
+
+/// [`from_runs`] positioned on the OPK band `[start, end)`, and its raw entry count
+/// as [`ReadCursor::seek_range_bytes`] reports it.
+pub(crate) fn from_runs_in_band(
+    runs: impl IntoIterator<Item = Run>,
+    schema: SchemaDescriptor,
+    cap: usize,
+    start: &[u8],
+    end: Option<&[u8]>,
+) -> (ReadCursor, usize) {
+    let mut raw = 0;
+    let cursor = build(runs, schema, cap, |c| raw = c.seek_range_bytes(start, end));
+    (cursor, raw)
+}
+
+/// [`from_runs`] without the initial positioning: the cursor stays invalid until
+/// something seeks it.
 pub(crate) fn from_runs_unpositioned(
     runs: impl IntoIterator<Item = Run>,
     schema: SchemaDescriptor,
     cap: usize,
 ) -> ReadCursor {
-    build(runs, schema, cap, false)
+    build(runs, schema, cap, |_| {})
 }
 
-fn build(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor, cap: usize, position: bool) -> ReadCursor {
+#[inline]
+fn build(
+    runs: impl IntoIterator<Item = Run>,
+    schema: SchemaDescriptor,
+    cap: usize,
+    position: impl FnOnce(&mut ReadCursor),
+) -> ReadCursor {
     let mut sources = Vec::with_capacity(cap);
     let mut states = Vec::with_capacity(cap);
     for run in runs {

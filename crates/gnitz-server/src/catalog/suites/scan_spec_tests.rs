@@ -229,7 +229,11 @@ fn keyed_reads_over_a_replicated_table_find_every_key() {
     let pks: Vec<_> = (0..N).map(|id| schema.opk_key(&id.to_le_bytes())).collect();
     let gathered = e
         .registry
-        .gather_bytes(tid, pks.iter().flat_map(|p| p.pk_bytes()).copied().collect(), 1)
+        .gather_bytes(
+            tid,
+            PkKeys::from_keys(schema.pk_stride(), pks.iter().map(|p| p.pk_bytes())),
+            1,
+        )
         .unwrap();
     assert_eq!(gathered.len(), N as usize, "every parent key must dereference");
 
