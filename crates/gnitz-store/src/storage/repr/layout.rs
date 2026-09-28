@@ -310,8 +310,20 @@ fn for_decode_cells<const W: usize>(image: &[u8], bw: usize, first_row: usize, o
     let reference = read_u64_le(image, FOR_REFERENCE_AT);
     let mask = gnitz_wire::low_bits_mask(8 * bw);
     let cells = out.as_chunks_mut::<W>().0;
+    let Some(last) = cells.len().checked_sub(1) else {
+        return;
+    };
+    assert!(for_cell_at(first_row + last, bw) + size_of::<u64>() <= image.len());
     for (i, cell) in cells.iter_mut().enumerate() {
-        let v = (read_u64_le(image, for_cell_at(first_row + i, bw)) & mask).wrapping_add(reference);
+        // SAFETY: row `first_row + i` is at most `first_row + last`, whose load the assert bounds.
+        let packed = unsafe {
+            image
+                .as_ptr()
+                .add(for_cell_at(first_row + i, bw))
+                .cast::<u64>()
+                .read_unaligned()
+        };
+        let v = (u64::from_le(packed) & mask).wrapping_add(reference);
         *cell = *v.to_le_bytes().first_chunk::<W>().unwrap();
     }
 }
