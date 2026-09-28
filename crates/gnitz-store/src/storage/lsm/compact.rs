@@ -4,17 +4,16 @@
 //! [`merge_and_route`] orchestrates — verify → merge → route → column-first
 //! scatter → one output batch per guard run, handed to the caller to write.
 //! The merge kernel itself is the shared
-//! [`run_merge`](super::merge::run_merge), which owns the (PK, payload) total
+//! [`run_merge`](crate::storage::repr::merge::run_merge), which owns the (PK, payload) total
 //! order; this module only drives it and materializes survivors.
 
-use super::batch::Batch;
-use super::error::StorageError;
-use super::merge::prorated_blob_cap;
-use super::merge::run_merge;
-use super::scatter::UnifiedSet;
-use super::shard_reader::MappedShard;
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, PkBuf};
 use crate::schema::SchemaDescriptor;
+use crate::storage::error::StorageError;
+use crate::storage::repr::batch::Batch;
+use crate::storage::repr::merge::run_merge;
+use crate::storage::repr::scatter::UnifiedSet;
+use crate::storage::repr::shard_reader::MappedShard;
 use gnitz_expr::RowSource;
 
 /// The PK-only projection of `schema`: the same PK columns in the same PK-list
@@ -73,7 +72,6 @@ pub(super) fn merge_and_route(
         s.verify_body()?;
     }
     let total_rows: usize = shards.iter().map(|s| s.row_count()).sum(); // survivor upper bound
-    let total_blob: usize = shards.iter().map(|s| s.blob().len()).sum();
 
     // Phase 1 — merge into survivors, sorted (PK, payload). The merge order is
     // the guard order, so each guard's survivors are one contiguous run and the
@@ -119,19 +117,17 @@ pub(super) fn merge_and_route(
         if folded.as_ref().is_some_and(|f| f.is_empty()) {
             continue;
         }
-        let (set, rows, blob_cap) = match &folded {
+        let (set, rows) = match &folded {
             Some(rows) => (
                 skeletal.as_ref().expect("a skeleton guard built the skeleton set"),
                 rows.as_slice(),
-                0,
             ),
             None => (
                 hydrated.as_ref().expect("a hydrated guard built the hydrated set"),
                 bucket,
-                prorated_blob_cap(total_blob, nsurv, bucket.len()),
             ),
         };
-        let mut batch = set.materialize(rows, blob_cap);
+        let mut batch = set.materialize(rows, nsurv);
         if folded.is_some() {
             // The fused pass copied the *source's* payload null bits, which mean
             // nothing without a payload. Zeroing collapses the region to

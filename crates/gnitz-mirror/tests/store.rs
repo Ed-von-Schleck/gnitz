@@ -21,7 +21,8 @@ use gnitz_wire::{ReadBound, ReadSpec};
 #[path = "support/copy_paths.rs"]
 mod copy_paths;
 use copy_paths::{copy_dir, has_manifest, manifest_path};
-use gnitz_store::storage::{ChildAddr, ChildKind, Slot};
+use gnitz_store::relation::{ChildAddr, ChildKind};
+use gnitz_store::schema::Slot;
 
 /// Every test in this binary takes this lock: `cargo test` runs a target's tests
 /// as threads of one process, and a store open touches process-wide state — the

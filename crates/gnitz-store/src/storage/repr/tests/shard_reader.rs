@@ -1,12 +1,12 @@
 use super::super::batch::{Batch, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::super::batch_builder::BatchBuilder;
-use super::super::error::StorageError;
 use super::super::layout::*;
 use super::super::merge::ColumnarSource;
 use super::super::scatter::UnifiedSet;
 use super::super::shard_file::{region_dir, write_i64_shard, ShardWriteOpts};
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::storage::error::StorageError;
 use crate::test_support::{make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, read_german_string};
 use gnitz_expr::RowSource;
 use gnitz_wire::num_regions;
@@ -148,7 +148,8 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
     }
     for w in [0..n, mid] {
         let rows: Vec<(u32, u32, i64)> = w.clone().map(|r| (0, r as u32, want.get_weight(r))).collect();
-        let b = UnifiedSet::of(std::slice::from_ref(shard), schema, std::iter::once(w.clone())).materialize(&rows, 0);
+        let b = UnifiedSet::of(std::slice::from_ref(shard), schema, std::iter::once(w.clone()))
+            .materialize(&rows, rows.len());
         assert_eq!(
             rows_of(&b, |r| b.get_weight(r), schema),
             want_rows[w.clone()],
@@ -395,7 +396,7 @@ fn a_slice_and_a_materialize_decode_no_block() {
     let n = shard.row_count();
     std::hint::black_box(shard.slice_to_owned_batch(100, n - 200));
     let rows: Vec<(u32, u32, i64)> = (0..n as u32).map(|r| (0, r, 1)).collect();
-    std::hint::black_box(UnifiedSet::whole(std::slice::from_ref(&shard), &schema).materialize(&rows, 0));
+    std::hint::black_box(UnifiedSet::whole(std::slice::from_ref(&shard), &schema).materialize(&rows, rows.len()));
     assert_eq!(shard.decoded_blocks(0), 0);
 }
 

@@ -684,10 +684,10 @@ fn footprint_equals_emitted_bytes() {
 
     // Slot 2 stays empty: the relay passes an empty batch for a zero-row worker.
     let slots = [
-        batch.clone_batch(),
-        batch.clone_batch(),
+        Batch::clone(&batch),
+        Batch::clone(&batch),
         Batch::empty_with_schema(&schema),
-        batch.clone_batch(),
+        Batch::clone(&batch),
     ];
     let group = DirectGroup {
         template: WireMsg {

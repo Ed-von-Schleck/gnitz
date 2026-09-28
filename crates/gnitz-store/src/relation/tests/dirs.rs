@@ -1,4 +1,6 @@
 use super::*;
+use crate::storage::{flush_barrier, RecoverySource, StoreBudgets, Table};
+use crate::test_support::make_schema_u64_i64;
 
 #[test]
 fn parse_inverts_name_for_every_grammar() {
@@ -63,17 +65,16 @@ fn ownership_follows_the_launched_count() {
     }
 }
 
+/// Publish an empty store at `dir` under checkpoint mark `generation`.
 fn stamp(dir: &str, generation: u64) {
-    std::fs::create_dir_all(dir).unwrap();
-    let m = manifest::Manifest {
-        stamp: manifest::ManifestStamp {
-            checkpoint_gen: generation,
-            ..Default::default()
-        },
-        caller_record: Vec::new(),
-        shards: manifest::ShardSet { run_bytes: 0, entries: Vec::new() },
-    };
-    manifest::prepare(dir, &manifest::encode(&m)).unwrap().commit().unwrap();
+    let mut t = Table::new(
+        dir,
+        make_schema_u64_i64(),
+        RecoverySource::Rederive { resume_at: None },
+        StoreBudgets::default(),
+    )
+    .unwrap();
+    flush_barrier([&mut t], generation).unwrap();
 }
 
 #[test]

@@ -1,7 +1,5 @@
-//! Wire serialization for `Batch`.
-//!
-//! Keeping the serialization cluster here rather than in `batch.rs` lets the
-//! pure in-memory repr name no wire module.
+//! Wire serialization for `Batch`: wire sizing and chunking, encoding, and
+//! WAL-block decoding with the validation it runs.
 
 use super::batch::{strides_from_schema, string_mask, Batch, MAX_BATCH_REGIONS, REG_PK};
 use super::merge::{blob_span_key, BlobCache, BlobCacheGuard, DirectWriter, MemBatch};

@@ -1238,7 +1238,7 @@ fn reindex_drop_null_keys_bench() {
         });
         arm("(b) reindex + clone", &mut || {
             let all = keep.evaluate_map_batch(&batch);
-            black_box(all.clone_batch());
+            black_box(Batch::clone(&all));
             black_box(all);
         });
         arm("(b) keep + drop reindex", &mut || {

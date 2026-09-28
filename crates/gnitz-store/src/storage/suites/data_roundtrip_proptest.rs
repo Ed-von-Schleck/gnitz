@@ -165,7 +165,7 @@ proptest! {
         let mut table = new_table(&dir.path().join("rt"), schema, durable);
         let (original, _) = arb_batch(&schema, rows, seed);
 
-        table.ingest_owned_batch(original.clone_batch()).unwrap();
+        table.ingest_owned_batch(Batch::clone(&original)).unwrap();
         if durable { table.flush() } else { table.fold_to_ram() }.unwrap();
 
         let expected = zset_of(&original, &schema);
@@ -206,7 +206,7 @@ proptest! {
         absent_vals.push(rows as u128);
         let absent = crate::test_support::opk_pk(&schema, &absent_vals);
 
-        table.ingest_owned_batch(original.clone_batch()).unwrap();
+        table.ingest_owned_batch(Batch::clone(&original)).unwrap();
 
         for i in 0..rows {
             prop_assert!(table.has_pk_bytes(original.get_pk_bytes(i)));
@@ -229,7 +229,7 @@ proptest! {
         let mut table = new_table(&dir.path().join("rx"), schema, true);
         let (original, _) = arb_batch(&schema, rows, seed);
 
-        table.ingest_owned_batch(original.clone_batch()).unwrap();
+        table.ingest_owned_batch(Batch::clone(&original)).unwrap();
         table.flush().unwrap(); // rows now live in one on-disk shard
 
         let half = rows / 2; // retract rows [0, half)

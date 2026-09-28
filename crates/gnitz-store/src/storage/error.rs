@@ -1,9 +1,7 @@
 //! Domain-specific error type for the storage subsystem.
 //!
-//! The mapping is intentionally coarse: the engine treats almost all
-//! storage failures as fatal (it `unwrap`s or `let _ =`s them), so the value
-//! of the type is in being *unambiguous and grep-able*, not in carrying rich
-//! context.  Add variants when a caller actually needs to discriminate.
+//! The mapping is coarse: an errno or a named corruption check. Add variants
+//! when a caller actually needs to discriminate.
 
 use std::fmt;
 

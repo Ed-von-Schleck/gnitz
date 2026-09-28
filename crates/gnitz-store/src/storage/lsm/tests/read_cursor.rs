@@ -1,8 +1,8 @@
-use super::super::batch::REG_PK;
-use super::super::layout::Encoding;
-use super::super::shard_file::region_dir;
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::storage::repr::batch::REG_PK;
+use crate::storage::repr::layout::Encoding;
+use crate::storage::repr::shard_file::region_dir;
 use crate::storage::{BatchBuilder, Layout};
 use crate::test_support::{
     make_batch_u128, make_schema_i64pk_i64, make_schema_pk_u64_payload_string, make_schema_u128_i64,
@@ -381,7 +381,7 @@ fn advance_to_forward_exhausts_source_mid_sweep() {
 fn test_scatter_many_sources_beyond_old_cap() {
     let schema = make_schema_u128_i64();
     let n = 33usize;
-    let batches: Vec<Rc<super::super::batch::Batch>> = (0..n)
+    let batches: Vec<Rc<crate::storage::repr::batch::Batch>> = (0..n)
         .map(|i| make_batch(&[(i as u128, 1i64, (i * 100) as i64)]))
         .collect();
     let cursor = create_read_cursor(&batches, &[], schema);
@@ -677,11 +677,11 @@ pub(super) fn write_test_shard(
         .iter()
         .map(|&(pk, w, v)| (pk.to_be_bytes()[16 - stride..].to_vec(), w, v))
         .collect();
-    let shard_path = super::super::shard_file::write_test_shard(
+    let shard_path = crate::storage::repr::shard_file::write_test_shard(
         &dir.path().join(format!("rc{stride}_{idx}.db")),
         schema,
         &rows,
-        super::super::shard_file::ShardWriteOpts::default(),
+        crate::storage::repr::shard_file::ShardWriteOpts::default(),
     );
     Rc::new(MappedShard::open(&shard_path, schema).unwrap())
 }
@@ -1095,7 +1095,7 @@ fn bounded_string_read_carries_only_its_own_rows() {
             }
             let shard_path = dir.path().join(format!("s{s}.db")).to_str().unwrap().to_owned();
             bb.finish()
-                .write_as_shard(&shard_path, super::super::shard_file::ShardWriteOpts::default())
+                .write_as_shard(&shard_path, crate::storage::repr::shard_file::ShardWriteOpts::default())
                 .unwrap();
             Rc::new(MappedShard::open(&shard_path, &schema).unwrap())
         })
@@ -1142,7 +1142,7 @@ fn write_skeleton_shard(
     let shard_path = dir.join(name).to_str().unwrap().to_owned();
     b.write_as_shard(
         &shard_path,
-        super::super::shard_file::ShardWriteOpts { skeleton: true, ..Default::default() },
+        crate::storage::repr::shard_file::ShardWriteOpts { skeleton: true, ..Default::default() },
     )
     .unwrap();
     // Opened under the *view* schema, which is how every reader sees it.
@@ -1186,7 +1186,7 @@ fn skeleton_shard_opens_under_the_view_schema() {
     // The writer's own arity is zero, so the ALTER-widening decode reads every
     // schema payload column as one the file predates and pads it NULL.
     let raw = std::fs::read(dir.path().join("sk.db")).unwrap();
-    let header = super::super::layout::ShardHeader::read(&raw).unwrap();
+    let header = crate::storage::repr::layout::ShardHeader::read(&raw).unwrap();
     assert_eq!(header.file_npc, 0);
     assert!(header.skeleton);
     for (r, &(_, w)) in rows.iter().enumerate() {

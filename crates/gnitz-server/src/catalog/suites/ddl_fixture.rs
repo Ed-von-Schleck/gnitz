@@ -289,7 +289,7 @@ impl CatalogEngine {
             self.submit(family, batch.clone())
         } else {
             self.registry
-                .ingest(table_id, batch.clone_batch())
+                .ingest(table_id, Batch::clone(batch))
                 .map_err(|e| format!("ingest failed for table_id={table_id}: {e}"))
         }
     }

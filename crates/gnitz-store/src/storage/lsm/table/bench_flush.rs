@@ -7,10 +7,10 @@
 //! module of `table` it reaches `Table`'s ingest/flush API and the
 //! `FOLD_THRESHOLD` const directly.
 
-use super::super::batch::Batch;
 use super::super::run_set::FOLD_THRESHOLD;
 use super::{RecoverySource, StoreBudgets, Table, DEFAULT_RAM_TIER_BYTES};
 use crate::schema::SchemaDescriptor;
+use crate::storage::repr::batch::Batch;
 use crate::test_support::pk_u64_two_i64_schema;
 
 /// Append one row `(pk, payload, payload, weight)` to `b` (both I64 payload

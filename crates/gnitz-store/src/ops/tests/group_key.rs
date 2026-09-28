@@ -216,7 +216,7 @@ fn leading_pk_column_runs_in_place_over_a_consolidated_batch() {
     let schema = pk_payload_schema(&[TypeCode::U64, TypeCode::U64]);
     let pk = |a: u64, b: u64| [a.to_be_bytes(), b.to_be_bytes()].concat();
     let raw = batch_of_pk_bytes(&schema, &[pk(1, 1), pk(1, 5), pk(2, 0), pk(7, 3), pk(7, 4), pk(7, 9)]);
-    let mut consolidated = raw.clone_batch();
+    let mut consolidated = Batch::clone(&raw);
     consolidated.certify_layout(crate::storage::Layout::Consolidated);
     let key = GroupOutKey::for_group_cols(&schema, &[0], []).unwrap().0;
     for batch in [&consolidated, &raw] {

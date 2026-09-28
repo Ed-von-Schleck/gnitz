@@ -3,9 +3,9 @@
 //! (`batch_wire`), TLS buffer recycling (`batch_pool`), the OPK lower-bound
 //! search (`seek`), sort-merge consolidation (`merge`), the row-selecting and
 //! row-copying passes — PK routing and the column-first scatter
-//! (`scatter`) —, the N-way min-merge tournament (`heap`), the PK-probe filters
-//! (`bloom`, `shard_filter`), the shard-image encoder and its atomic writer
-//! (`shard_file`), and the shard-format constants (`layout`). The low-level
+//! (`scatter`) —, the N-way min-merge tournament (`heap`), the shard PK-probe
+//! filter (`shard_filter`), the shard-image encoder and writer (`shard_file`),
+//! and the shard-format constants (`layout`). The low-level
 //! WAL-block framer lives in `gnitz_wire::wal` (the one definition client and
 //! engine share); `batch_wire` and the SAL scatter writer call it. The
 //! row-at-a-time system-table writer over a batch is `batch_builder`.
@@ -15,20 +15,13 @@
 //! both call. L3 reaches down for `MappedShard`; nothing here reaches up.
 //!
 //! `repr/` has **no outward facade of its own** — `storage/mod.rs` curates the
-//! single combined storage surface and reaches into these submodules, re-exporting
-//! each leaf's items and aliasing the submodules so the L3/LSM siblings keep their
-//! `super::<mod>` / `crate::storage::<mod>` paths. Every production edge points
-//! downward (schema) or sideways within this layer.
-//!
-//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
-//! they cover, so each stays that module's own `tests` child and reaches its
-//! private items.
+//! single combined storage surface and re-exports each leaf's items. Every
+//! production edge points downward (schema) or sideways within this layer.
 
 pub(super) mod batch;
 pub(super) mod batch_builder;
-pub mod batch_pool;
+pub(super) mod batch_pool;
 pub(super) mod batch_wire;
-pub(super) mod bloom;
 pub(super) mod heap;
 pub(super) mod layout;
 pub(super) mod merge;
@@ -37,7 +30,3 @@ pub(super) mod seek;
 pub(super) mod shard_file;
 pub(super) mod shard_filter;
 pub(in crate::storage) mod shard_reader;
-
-// The one storage-level helper the shard reader names (`StorageError`), aliased
-// so its files keep their `super::super::<mod>` paths.
-use super::error;

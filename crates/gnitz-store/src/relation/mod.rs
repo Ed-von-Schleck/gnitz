@@ -9,9 +9,9 @@ use rustc_hash::FxHashMap;
 use crate::schema::key::{compare_pk_bytes, key_range_between_cuts, KeyCut, PkBuf};
 use crate::schema::SchemaDescriptor;
 
+use crate::schema::Slot;
 use crate::storage::{
-    Batch, ChildAddr, ChildKind, PkSetGather, ReadCursor, RecoverySource, Slot, StorageError, StoreBudgets, StoreError,
-    StoredRow, Table,
+    Batch, PkSetGather, ReadCursor, RecoverySource, StorageError, StoreBudgets, StoreError, StoredRow, Table,
 };
 use gnitz_wire::{PkColList, ViewProps};
 
@@ -19,13 +19,14 @@ mod build;
 mod circuit_state;
 mod dirs;
 mod ingest;
+mod repartition;
 mod store;
 mod store_lifecycle;
 mod unique_pk;
 
 pub use circuit_state::{CircuitState, StateIdx, StateLayout};
 pub(crate) use dirs::ensure_dir;
-pub use dirs::{lock_data_dir, relation_dir, relations_dir, DirLock};
+pub use dirs::{lock_data_dir, relation_dir, relations_dir, ChildAddr, ChildKind, DirLock};
 pub(crate) use store::Store;
 
 // ---------------------------------------------------------------------------

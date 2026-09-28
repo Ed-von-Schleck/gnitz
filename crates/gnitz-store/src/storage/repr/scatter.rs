@@ -10,7 +10,7 @@ use std::ops::Range;
 
 use super::batch::{write_to_batch, Batch, FIXED_REGION_BYTES};
 use super::batch_pool::PooledBuf;
-use super::merge::{ColPtr, ColumnarSource, DirectWriter, MemBatch, UnifiedSource};
+use super::merge::{prorated_blob_cap, ColPtr, ColumnarSource, DirectWriter, MemBatch, UnifiedSource};
 use crate::schema::SchemaDescriptor;
 
 /// Instantiate `$f` at the const width matching `$w`, which is also passed on.
@@ -59,7 +59,7 @@ pub fn route_rows_by_pk<'a>(
 }
 
 /// Reset `out` to `num_workers` empty slots, keeping their allocations.
-pub fn reset_slots<T>(out: &mut Vec<Vec<T>>, num_workers: usize) -> &mut [Vec<T>] {
+pub(crate) fn reset_slots<T>(out: &mut Vec<Vec<T>>, num_workers: usize) -> &mut [Vec<T>] {
     if out.len() < num_workers {
         out.resize_with(num_workers, Vec::new);
     }
@@ -276,6 +276,9 @@ pub(crate) struct UnifiedSet<'a> {
     sources: Vec<UnifiedSource<'a>>,
     cols: Vec<ColPtr>,
     schema: SchemaDescriptor,
+    /// Heap bytes and rows of the whole sources, windows notwithstanding.
+    src_blob: usize,
+    src_rows: usize,
     _decoded: DecodedColumns,
     #[cfg(debug_assertions)]
     windows: Vec<Range<usize>>,
@@ -308,6 +311,8 @@ impl<'a> UnifiedSet<'a> {
             sources: views,
             cols,
             schema: *schema,
+            src_blob: sources.iter().map(|s| s.blob().len()).sum(),
+            src_rows: sources.iter().map(|s| s.row_count()).sum(),
             _decoded: decoded,
             #[cfg(debug_assertions)]
             windows,
@@ -319,10 +324,16 @@ impl<'a> UnifiedSet<'a> {
         Self::of(sources, schema, sources.iter().map(|s| 0..s.row_count()))
     }
 
+    /// Rows across the whole sources.
+    pub(crate) fn src_rows(&self) -> usize {
+        self.src_rows
+    }
+
     /// Copy the rows `rows` names, in the order given, each at the weight its
     /// triple carries, into a fresh batch under the set's schema claiming no
-    /// layout.
-    pub(crate) fn materialize(&self, rows: &[(u32, u32, i64)], blob_cap: usize) -> Batch {
+    /// layout. `of_rows` is the row count of the whole output `rows` is a share
+    /// of; it sizes the heap reserved.
+    pub(crate) fn materialize(&self, rows: &[(u32, u32, i64)], of_rows: usize) -> Batch {
         #[cfg(debug_assertions)]
         for &(si, ri, _) in rows {
             debug_assert!(
@@ -331,6 +342,11 @@ impl<'a> UnifiedSet<'a> {
                 self.windows[si as usize],
             );
         }
+        let blob_cap = if self.schema.has_german_string() {
+            prorated_blob_cap(self.src_blob, of_rows, rows.len())
+        } else {
+            0
+        };
         write_to_batch(&self.schema, rows.len(), blob_cap, |writer| {
             scatter_unified_sources(&self.sources, &self.cols, rows, writer);
         })

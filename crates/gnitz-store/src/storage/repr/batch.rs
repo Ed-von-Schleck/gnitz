@@ -250,7 +250,7 @@ impl Batch {
     /// [`Self::with_capacity`] with the blob heap pre-sized. For the callers that
     /// know the byte count up front; `with_capacity` leaves it empty because most
     /// writers do not.
-    pub fn with_capacity_blob(schema: &SchemaDescriptor, rows: usize, blob_bytes: usize) -> Self {
+    pub(crate) fn with_capacity_blob(schema: &SchemaDescriptor, rows: usize, blob_bytes: usize) -> Self {
         let mut b = Self::with_capacity(schema, rows);
         b.reserve_blob(blob_bytes);
         b
@@ -384,7 +384,7 @@ impl Batch {
         self.region_at(REG_WEIGHT)
     }
     #[inline]
-    pub fn null_bmp_data(&self) -> &[u8] {
+    pub(crate) fn null_bmp_data(&self) -> &[u8] {
         self.region_at(REG_NULL_BMP)
     }
     #[inline]
@@ -1104,7 +1104,7 @@ impl Batch {
 
     /// The rows `indices` names, in that order, at their own weights; none may be
     /// weight 0.
-    pub fn from_indexed_rows(batch: &MemBatch, indices: &[u32], schema: &SchemaDescriptor) -> Self {
+    pub(crate) fn from_indexed_rows(batch: &MemBatch, indices: &[u32], schema: &SchemaDescriptor) -> Self {
         let blob_cap = merge::prorated_blob_cap(batch.blob.len(), batch.count, indices.len());
         write_to_batch(schema, indices.len(), blob_cap, |writer| {
             super::scatter::scatter_copy(batch, indices, writer);
@@ -1161,15 +1161,16 @@ impl Batch {
     }
 
     /// A fresh `out_schema` batch of this batch's rows carrying everything but
-    /// the PK and NULL regions: blob heap, weights, and every payload column of
-    /// `in_schema`, landed at output slot `first_slot + pi`.
+    /// the PK and NULL regions: blob heap, weights, and every payload column,
+    /// landed at output slot `first_slot + pi`.
     ///
     /// **`count` is published while the PK and NULL regions are unwritten** — the
     /// caller must write both, or a release build reads uninitialized arena bytes.
-    fn shell_for(&self, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor, first_slot: usize) -> Batch {
+    fn shell_for(&self, out_schema: &SchemaDescriptor, first_slot: usize) -> Batch {
+        let in_schema = &self.schema;
         debug_assert!(
             out_schema.num_payload_cols() >= first_slot + in_schema.num_payload_cols(),
-            "shell_for copies every payload column of in_schema at first_slot + its own index",
+            "shell_for copies every payload column at first_slot + its own index",
         );
         let n = self.count;
         let mut out = Self::with_capacity(out_schema, n);
@@ -1203,7 +1204,7 @@ impl Batch {
         let stamp_bytes = DELTA_TICK_COL.size() as usize;
         debug_assert_eq!(out_stride, in_stride + stamp_bytes);
         debug_assert_eq!(out_schema.num_payload_cols(), in_schema.num_payload_cols());
-        let mut output = self.shell_for(in_schema, out_schema, 0);
+        let mut output = self.shell_for(out_schema, 0);
         output.null_bmp_data_mut().copy_from_slice(self.null_bmp_data());
 
         let stamp = prefix.to_be_bytes();
@@ -1234,7 +1235,7 @@ impl Batch {
         let stamp_bytes = DELTA_TICK_COL.size() as usize;
         debug_assert_eq!(in_stride, out_stride + stamp_bytes);
         debug_assert_eq!(out_schema.num_payload_cols(), in_schema.num_payload_cols());
-        let mut output = self.shell_for(in_schema, out_schema, 0);
+        let mut output = self.shell_for(out_schema, 0);
         output.null_bmp_data_mut().copy_from_slice(self.null_bmp_data());
         let src_pk = self.pk_data();
         for (dst, src) in output
@@ -1263,7 +1264,7 @@ impl Batch {
         let n_new = out_npc - in_npc;
 
         let first_slot = if nulls_first { n_new } else { 0 };
-        let mut output = self.shell_for(in_schema, out_schema, first_slot);
+        let mut output = self.shell_for(out_schema, first_slot);
         output.pk_data_mut().copy_from_slice(self.pk_data());
 
         // The appended columns are NULL, and a NULL cell is zeroed.
@@ -1286,21 +1287,6 @@ impl Batch {
 
         output.inherit_layout(self);
         output
-    }
-
-    /// Clone all buffers into a new independent Batch (2 allocations).
-    pub fn clone_batch(&self) -> Self {
-        // Rebuilt rather than copied through two pooled arenas holding zero bytes.
-        // `empty_like` mints a fresh `blob_id` and drops the layout tag; neither
-        // is observable on a batch holding no rows and no heap.
-        if self.holds_nothing() {
-            return self.empty_like();
-        }
-        // Only the used portion of data (count-based, not capacity-based).
-        let mut b = Self::from_mem_batch(&self.as_mem_batch(), &self.schema);
-        b.layout = self.layout;
-        b.blob_id = self.blob_id;
-        b
     }
 
     /// The PK region as a uniform [`ColPtr`] view (always Raw for an owned
@@ -1428,7 +1414,7 @@ impl Batch {
     }
 
     /// No rows and no string heap — so this batch already *is* its own cleared
-    /// and its own copied form, and `clear`/`clone_batch` can hand back what
+    /// and its own copied form, and `clear`/`clone` can hand back what
     /// they were given. Both keep `blob_id`: `shares_blob_with` also requires
     /// equal blob lengths, so a kept id can only ever match another empty heap.
     #[inline]
@@ -1483,7 +1469,7 @@ impl Batch {
     /// the same on both sides) instead of relocating each cell.
     ///
     /// Equal `blob_id` alone is not enough: it is minted per construction and
-    /// propagated by [`Self::share_blob_from`] / `clone_batch`, but a *relocating*
+    /// propagated by [`Self::share_blob_from`] / `clone`, but a *relocating*
     /// append from some other source afterwards grows `self.blob` past `src`'s.
     /// Blobs only ever grow by appending, so length equality closes exactly that
     /// gap and the pair is an exact test.
@@ -1653,7 +1639,7 @@ impl Batch {
         match Self::consolidate_if_needed(self, schema) {
             Some(folded) => folded,
             None => {
-                let mut c = self.clone_batch();
+                let mut c = Batch::clone(self);
                 c.layout = Layout::Consolidated;
                 c
             }
@@ -1673,7 +1659,7 @@ impl Batch {
         let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(batch.count);
         merge::consolidate_groups(&mb, schema, &mut survivors);
         let set = super::scatter::UnifiedSet::whole(std::slice::from_ref(&mb), schema);
-        let mut result = set.materialize(&survivors, mb.blob.len());
+        let mut result = set.materialize(&survivors, survivors.len());
         result.certify_layout(Layout::Consolidated);
         result
     }
@@ -1692,8 +1678,19 @@ impl Drop for Batch {
 }
 
 impl Clone for Batch {
+    /// Clone all buffers into a new independent Batch (2 allocations).
     fn clone(&self) -> Self {
-        self.clone_batch()
+        // Rebuilt rather than copied through two pooled arenas holding zero bytes.
+        // `empty_like` mints a fresh `blob_id` and drops the layout tag; neither
+        // is observable on a batch holding no rows and no heap.
+        if self.holds_nothing() {
+            return self.empty_like();
+        }
+        // Only the used portion of data (count-based, not capacity-based).
+        let mut b = Self::from_mem_batch(&self.as_mem_batch(), &self.schema);
+        b.layout = self.layout;
+        b.blob_id = self.blob_id;
+        b
     }
 }
 

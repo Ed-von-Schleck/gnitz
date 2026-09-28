@@ -112,7 +112,7 @@ mod staging {
         // The part of the bundle whose families published before the crash.
         opened.stage(SysFamily::Column.id(), ZONE_LSN, col_tab(v, 1)).unwrap();
         opened
-            .stage(SysFamily::View.id(), ZONE_LSN, view_tab.clone_batch())
+            .stage(SysFamily::View.id(), ZONE_LSN, Batch::clone(&view_tab))
             .unwrap();
         let log = TestLog::new(SAL_SIZE, 1, 1);
         let columns = col_tab(v, 1);

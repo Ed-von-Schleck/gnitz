@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 use io_uring::types::FsyncFlags;
 use io_uring::{opcode, types, IoUring};
 
-use super::super::error::StorageError;
+use crate::storage::error::StorageError;
 
 /// The fds one sync batch opens, and the ring's SQ size.
 const FD_CHUNK_THRESHOLD: usize = 256;

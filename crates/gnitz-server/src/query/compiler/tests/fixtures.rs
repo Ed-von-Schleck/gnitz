@@ -4,7 +4,7 @@
 
 use super::*;
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
-use gnitz_store::storage::Slot;
+use gnitz_store::schema::Slot;
 
 // Input slots reach the compiler only in hand-written fixtures; every production
 // read of an operand goes through `NodeInputs`. Slot 0 is a unary operator's

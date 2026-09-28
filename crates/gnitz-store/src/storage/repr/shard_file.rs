@@ -1,15 +1,15 @@
-//! Shard image encoding and atomic writing, reached through `Batch::write_as_shard`.
+//! Shard image encoding and writing, reached through `Batch::write_as_shard`.
 
 use std::borrow::Cow;
-use std::os::unix::fs::FileExt;
+use std::fs::OpenOptions;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
-use super::super::error::StorageError;
-use super::super::StagedFile;
 use super::batch::{Batch, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::layout::*;
 use super::shard_filter;
 use crate::schema::key::probe_key;
 use crate::schema::SchemaDescriptor;
+use crate::storage::error::StorageError;
 use gnitz_wire::write_u64_le;
 use xorf::BinaryFuse8;
 
@@ -137,7 +137,7 @@ pub(in crate::storage) fn write_i64_shard(
 }
 
 impl Batch {
-    /// Write this batch as an unsynced shard at `path`, through a [`StagedFile`].
+    /// Write this batch as a new, unsynced shard at `path`; `Err` if `path` exists.
     pub(crate) fn write_as_shard(&self, path: &str, opts: ShardWriteOpts) -> Result<(), StorageError> {
         let schema = self.schema();
         let n = self.count;
@@ -168,7 +168,7 @@ impl Batch {
             ]);
 
         static PAD: [u8; ALIGNMENT] = [0; ALIGNMENT];
-        let (staged, file) = StagedFile::create(path)?;
+        let file = OpenOptions::new().write(true).create_new(true).mode(0o644).open(path)?;
         let mut header = vec![0u8; desc_len(npc)];
         let mut body = gnitz_wire::RowHasher::default();
         let mut end = header.len();
@@ -195,7 +195,7 @@ impl Batch {
         let desc = desc_digest(path, &header);
         write_u64_le(&mut header, OFF_DESC_CHECKSUM, desc);
         file.write_all_at(&header, 0)?;
-        staged.commit()
+        Ok(())
     }
 }
 

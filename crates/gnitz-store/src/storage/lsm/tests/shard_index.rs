@@ -1,9 +1,9 @@
-use super::super::batch::Batch;
 use super::super::naming;
-use super::super::shard_file;
 use super::*;
 use crate::schema::key::probe_key;
 use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
+use crate::storage::repr::batch::Batch;
+use crate::storage::repr::shard_file;
 use crate::test_support::{
     make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, opk_pk, pk_payload_schema,
 };
@@ -180,14 +180,12 @@ fn assert_all_found(idx: &ShardIndex, keys: impl IntoIterator<Item = u64>) {
 fn rename_manifest(idx: &mut ShardIndex) {
     let through = idx.last_seq();
     let bytes = super::super::manifest::encode(&super::super::manifest::Manifest {
-        stamp: Default::default(),
+        checkpoint_mark: 0,
         caller_record: Vec::new(),
         shards: idx.shard_set(),
     });
-    super::super::manifest::prepare(&idx.output_dir, &bytes)
-        .unwrap()
-        .commit()
-        .unwrap();
+    super::super::manifest::prepare(&idx.output_dir, &bytes).unwrap();
+    super::super::manifest::commit(&idx.output_dir).unwrap();
     idx.mark_published(through);
 }
 
@@ -882,9 +880,7 @@ fn open_removes_exactly_the_unreferenced_files() {
     for seq in [99, 7] {
         write_test_shard(dir.path(), &naming::shard_name(seq), &[seq], &[1]);
     }
-    for name in [format!("{}.tmp", naming::shard_name(5)), "manifest.bin.tmp".to_string()] {
-        std::fs::write(dir.path().join(name), b"x").unwrap();
-    }
+    std::fs::write(dir.path().join("manifest.bin.tmp"), b"x").unwrap();
     std::fs::write(dir.path().join("other"), b"x").unwrap();
 
     let idx = reopen(d, make_schema_u64_i64());

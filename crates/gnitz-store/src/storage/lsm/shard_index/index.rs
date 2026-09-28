@@ -7,18 +7,18 @@
 use std::fs;
 use std::rc::Rc;
 
-use super::super::batch::Batch;
 use super::super::compact;
-use super::super::error::StorageError;
-use super::super::merge::ColumnarSource;
 use super::super::naming;
-use super::super::shard_file::ShardWriteOpts;
-use super::super::shard_reader::MappedShard;
 use super::{
     CompactionInputs, CompactionKind, LevelGuard, ShardBudget, ShardEntry, ShardIndex, FLSM_LEVELS,
     GUARD_FILE_THRESHOLD, L0_COMPACT_THRESHOLD, MIN_GUARD_BYTES, SWEEP_STEPS, TERMINAL_LEVEL_IDX,
 };
 use crate::schema::key::{pack_pk_be, pk_ranges_overlap, PkBuf};
+use crate::storage::error::StorageError;
+use crate::storage::repr::batch::Batch;
+use crate::storage::repr::merge::ColumnarSource;
+use crate::storage::repr::shard_file::ShardWriteOpts;
+use crate::storage::repr::shard_reader::MappedShard;
 use gnitz_expr::RowSource;
 
 impl ShardIndex {
@@ -52,14 +52,15 @@ impl ShardIndex {
         self.shard_seq += 1;
         let seq = self.shard_seq;
         let path = naming::shard_path(&self.output_dir, seq);
-        batch.write_as_shard(
-            &path,
-            ShardWriteOpts {
-                skip_pk_filter: self.skip_pk_filter,
-                ..opts
-            },
-        )?;
-        ShardEntry::open(&self.output_dir, seq, &self.schema, newest.unwrap_or(seq))
+        batch
+            .write_as_shard(
+                &path,
+                ShardWriteOpts {
+                    skip_pk_filter: self.skip_pk_filter,
+                    ..opts
+                },
+            )
+            .and_then(|()| ShardEntry::open(&self.output_dir, seq, &self.schema, newest.unwrap_or(seq)))
             .inspect_err(|_| self.unlink_shard(seq))
     }
 

@@ -11,9 +11,8 @@
 //! The six public module roots below are the API. They form a layer ladder,
 //! each naming only those beneath it — `tests/rungs.rs` states that table and
 //! enforces it. The submodules under each root are private; what a root
-//! re-exports is what it publishes, plus the two named as modules
-//! (`schema::key` and
-//! `storage::batch_pool`). An item is `pub` because another crate names it;
+//! re-exports is what it publishes, plus `schema::key`, named as a
+//! module. An item is `pub` because another crate names it;
 //! everything else is `pub(crate)`.
 //!
 //! There is no crate-root re-export façade: a type's rung is part of what its

@@ -7,7 +7,7 @@ use super::SkeletonHydrator;
 use crate::relation::{Relation, RelationKind, RelationRegistry};
 use crate::schema::key::{compare_pk_bytes, sort_indices, IndexKeySpec};
 use crate::schema::{project_schema, ColumnLocator};
-use crate::storage::{Batch, PkSetGather, ReadCursor, SkeletonKeys, StoreError};
+use crate::storage::{pk_group_end, Batch, PkSetGather, ReadCursor, SkeletonKeys, StoreError};
 use gnitz_wire::{KeyRange, ReadBound};
 
 const INDEX_SCAN_RATIO: usize = 16;
@@ -159,11 +159,9 @@ fn debug_assert_hydration_matches(out: &Batch, keys: &[u8], coarse: &[i64]) {
             ki < coarse.len() && keys[ki * stride..(ki + 1) * stride] == *pk,
             "hydration produced rows for a PK no skeleton row named",
         );
-        let mut sum = 0i64;
-        while i < out.len() && out.get_pk_bytes(i) == pk {
-            sum += out.get_weight(i);
-            i += 1;
-        }
+        let j = pk_group_end(out, i);
+        let sum = out.as_mem_batch().sum_weights(i, j);
+        i = j;
         debug_assert_eq!(sum, coarse[ki], "hydration weight mismatch for key {pk:?}");
         ki += 1;
     }

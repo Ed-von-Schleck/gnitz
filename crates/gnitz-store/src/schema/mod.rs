@@ -93,7 +93,7 @@ pub use key::IndexKeySpec;
 
 mod route;
 pub(crate) use route::worker_for_key;
-pub use route::{ground_owner, worker_for_pk_bytes};
+pub use route::{ground_owner, worker_for_pk_bytes, Slot};
 
 /// Which fixed bound a [`DerivedSchema`] push hit. Callers prefix it with what
 /// they were building.

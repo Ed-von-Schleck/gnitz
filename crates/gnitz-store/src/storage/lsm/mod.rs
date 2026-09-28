@@ -1,39 +1,26 @@
 //! L3 storage LSM — the on-disk half of the storage subsystem: the in-memory
-//! shard index + compaction trigger
-//! (`shard_index`), the N-way compaction kernel (`compact`), the sorted run
-//! (`run`) and the RAM-tier run sets built from it (`run_set`), the opaque read
-//! cursor (`read_cursor`), the manifest serde (`manifest`), the filename grammar
-//! (`naming`), the boot relayout (`repartition`), and the `Table` facade. The
+//! shard index + compaction trigger (`shard_index`), the N-way compaction kernel
+//! (`compact`), the sorted run (`run`) and the RAM-tier run sets built from it
+//! (`run_set`), the RAM tier's PK-probe filter (`bloom`), the opaque read cursor
+//! (`read_cursor`), the manifest serde and the store-directory primitives over it
+//! (`manifest`), the filename grammar (`naming`), and the `Table` facade. The
 //! shard image — its encoder, its mmap'd reader and the format rules both call —
 //! lives one layer down in `repr/`, as does the WAL block codec.
 //!
 //! `lsm/` has **no outward facade of its own** — `storage/mod.rs` curates the
 //! single combined storage surface and re-exports the public items from these
-//! submodules. The repr (L2) siblings live under `storage/repr/`; this module
-//! aliases them and the storage-level helpers the LSM files name as
-//! `super::<mod>`.
-//!
-//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
-//! they cover, so each stays that module's own `tests` child and reaches its
-//! private items.
+//! submodules.
 
 // Re-exported from storage/mod.rs.
-pub(super) mod child_dir;
 pub(super) mod manifest;
 pub(super) mod read_cursor;
-pub(super) mod repartition;
+pub(super) mod run;
 pub(super) mod table;
 
 // LSM-internal only.
 mod batch_fsync;
+mod bloom;
 mod compact;
 mod naming;
-pub(super) mod run;
 mod run_set;
 mod shard_index;
-
-use super::repr::{batch, bloom, heap, merge, scatter, seek, shard_file, shard_reader};
-// Shard-format constants: only the LSM test modules assert against the image.
-#[cfg(test)]
-use super::repr::layout;
-use super::{error, StagedFile, STAGING_SUFFIX};

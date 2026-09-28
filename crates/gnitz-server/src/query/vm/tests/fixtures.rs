@@ -4,7 +4,7 @@
 
 use super::*;
 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StateLayout, StoreConfig};
-use gnitz_store::storage::Slot;
+use gnitz_store::schema::Slot;
 use gnitz_store::storage::StoreError;
 use gnitz_wire::ViewProps;
 

@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use super::STAGING_SUFFIX;
+use super::manifest::STAGING_SUFFIX;
 
 /// Every shard basename's prefix.
 pub(super) const SHARD_PREFIX: &str = "shard_";

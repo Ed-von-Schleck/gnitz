@@ -87,7 +87,7 @@ fn take_or_clone(batches: &mut [Batch], reg: DeltaReg, take: bool) -> Batch {
     let batch = &mut batches[reg.at()];
     match take {
         true => batch.take(),
-        false => batch.clone_batch(),
+        false => Batch::clone(batch),
     }
 }
 

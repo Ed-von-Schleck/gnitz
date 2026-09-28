@@ -66,7 +66,7 @@ fn shard_merge_scan_bench() {
             let path = dir.path().join(format!("ms_{s}.db"));
             let path = path.to_str().unwrap();
             batch
-                .write_as_shard(path, super::super::shard_file::ShardWriteOpts::default())
+                .write_as_shard(path, crate::storage::repr::shard_file::ShardWriteOpts::default())
                 .unwrap();
             Rc::new(MappedShard::open(path, &schema).unwrap())
         })
@@ -320,11 +320,11 @@ fn adv_write_shard(
         .zip(weights.iter().zip(vals))
         .map(|(pk, (&w, &v))| (pk.to_vec(), w, v))
         .collect();
-    let shard_path = super::super::shard_file::write_test_shard(
+    let shard_path = crate::storage::repr::shard_file::write_test_shard(
         &dir.path().join(format!("{name}.db")),
         schema,
         &rows,
-        super::super::shard_file::ShardWriteOpts::default(),
+        crate::storage::repr::shard_file::ShardWriteOpts::default(),
     );
     Rc::new(MappedShard::open(&shard_path, schema).unwrap())
 }
@@ -872,12 +872,12 @@ fn for_range_drain_bench() {
                     )
                 })
                 .collect();
-            super::super::shard_file::write_i64_shard(
+            crate::storage::repr::shard_file::write_i64_shard(
                 &path,
                 &schema,
                 &rows,
                 &[],
-                super::super::shard_file::ShardWriteOpts::COMPACTION,
+                crate::storage::repr::shard_file::ShardWriteOpts::COMPACTION,
             );
             Rc::new(MappedShard::open(&path, &schema).unwrap())
         })

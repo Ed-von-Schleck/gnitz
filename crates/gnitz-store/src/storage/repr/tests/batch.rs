@@ -388,7 +388,7 @@ fn batch_region_access() {
 /// clone owns its own buffers — dropping both must not double-free.
 #[test]
 fn drop_recycles_buffers() {
-    use crate::storage::batch_pool::{acquire_buf, recycle_buf};
+    use crate::storage::repr::batch_pool::{acquire_buf, recycle_buf};
     while acquire_buf().capacity() > 0 {}
 
     let schema = crate::test_support::make_schema_u64_i64();
@@ -564,7 +564,7 @@ fn empty_constructors_carry_the_schema_pk_stride() {
 
 #[test]
 fn empty_batch_drop_is_noop() {
-    use crate::storage::batch_pool::acquire_buf;
+    use crate::storage::repr::batch_pool::acquire_buf;
     while acquire_buf().capacity() > 0 {}
 
     let batch = Batch::empty_with_schema(&crate::test_support::pk_only_schema(&[TypeCode::U64]));

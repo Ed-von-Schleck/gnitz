@@ -1,7 +1,8 @@
 //! Where a mirrored copy lives on disk, through the engine's own path grammar.
 
 use gnitz_store::relation::relation_dir;
-use gnitz_store::storage::{ChildAddr, ChildKind, Slot};
+use gnitz_store::relation::{ChildAddr, ChildKind};
+use gnitz_store::schema::Slot;
 
 /// The directory one mirrored copy lives in.
 pub fn copy_dir(base_dir: &str, tid: u64) -> String {

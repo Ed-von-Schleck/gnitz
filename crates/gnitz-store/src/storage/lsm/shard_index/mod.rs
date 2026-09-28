@@ -4,14 +4,14 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use super::error::StorageError;
 use super::manifest::{ManifestEntry, ShardSet};
-use super::merge::ColumnarSource;
 use super::naming;
-use super::shard_reader::MappedShard;
 use crate::schema::key::PkBuf;
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, pk_in_range};
 use crate::schema::SchemaDescriptor;
+use crate::storage::error::StorageError;
+use crate::storage::repr::merge::ColumnarSource;
+use crate::storage::repr::shard_reader::MappedShard;
 use gnitz_expr::RowSource;
 
 mod index;

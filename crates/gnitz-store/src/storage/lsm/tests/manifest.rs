@@ -7,7 +7,7 @@ use gnitz_wire::write_u64_le;
 /// round-trips.
 fn sample(count: usize) -> Manifest {
     Manifest {
-        stamp: ManifestStamp { checkpoint_gen: 5, replay_floor: 11 },
+        checkpoint_mark: 11,
         caller_record: (0..count as u8).map(|b| b ^ 0xA5).collect(),
         shards: ShardSet {
             run_bytes: 9 << 20,
@@ -111,7 +111,8 @@ fn read_roundtrips_a_prepared_manifest() {
         let m = sample(count);
         // The barrier's publish step, minus the fsyncs a round-trip does
         // not observe.
-        prepare(d, &encode(&m)).unwrap().commit().unwrap();
+        prepare(d, &encode(&m)).unwrap();
+        commit(d).unwrap();
         assert_eq!(read(d).unwrap(), Some(m), "count={count}");
     }
 }

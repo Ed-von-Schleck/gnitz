@@ -9,6 +9,25 @@ fn bucket(h: u64, num_workers: usize) -> usize {
     ((h as u128 * num_workers as u128) >> 64) as usize
 }
 
+/// Which worker this process is, of how many: the one input that decides which
+/// `w{k}of{n}` child every store of this process opens.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Slot {
+    pub rank: u32,
+    pub of: u32,
+}
+
+impl Slot {
+    /// A one-worker process: the mirror, and every unit test.
+    pub const SOLO: Slot = Slot { rank: 0, of: 1 };
+
+    /// Panics unless `rank < of`.
+    pub fn new(rank: u32, of: u32) -> Slot {
+        assert!(rank < of, "slot {rank} of {of}");
+        Slot { rank, of }
+    }
+}
+
 /// Which of `num_workers` workers owns `key`.
 #[inline(always)]
 pub(crate) fn worker_for_key(pk: u128, num_workers: usize) -> usize {

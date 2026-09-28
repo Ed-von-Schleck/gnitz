@@ -1,6 +1,5 @@
 use super::*;
 
-use super::super::manifest::ManifestStamp;
 use super::super::run_set::FOLD_THRESHOLD;
 use super::super::shard_index::L0_COMPACT_THRESHOLD;
 use super::flush_barrier;
@@ -276,45 +275,6 @@ fn test_live_row_shard_fallback_multiple_payloads() {
     );
 }
 
-/// Dropping a staged `FlushWork` unlinks its staged manifest, leaving no `.tmp`
-/// behind.
-#[test]
-fn flush_prepare_drop_cleans_tmp_files() {
-    let dir = tempfile::tempdir().unwrap();
-    let tdir = dir.path().join("drop_clean_test");
-    let schema = make_schema_u64_i64();
-
-    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::SalReplay);
-
-    t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
-
-    let work = t
-        .flush_prepare(ManifestStamp::default())
-        .unwrap()
-        .expect("expected a staged publish, got none");
-    let dir_entries: Vec<String> = std::fs::read_dir(&tdir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
-    assert!(
-        dir_entries.iter().any(|n| n == "manifest.bin.tmp"),
-        "the staged manifest .tmp must exist before Drop, got {dir_entries:?}"
-    );
-    drop(work);
-
-    let leftover_tmp: Vec<String> = std::fs::read_dir(&tdir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| n.ends_with(".tmp"))
-        .collect();
-    assert!(
-        leftover_tmp.is_empty(),
-        "Drop must unlink all .tmp files, found: {leftover_tmp:?}"
-    );
-}
-
 /// Table::new on a corrupted manifest must return Err and must not run
 /// the orphan sweep — any stray shard files must survive untouched.
 #[test]
@@ -325,7 +285,7 @@ fn table_new_corrupted_manifest_preserves_stray_shard() {
     let schema = make_schema_u64_i64();
 
     // Write a corrupted manifest (wrong magic).
-    let manifest_path = tdir.join("manifest.bin");
+    let manifest_path = super::super::manifest::manifest_path(tdir.to_str().unwrap());
     std::fs::write(&manifest_path, b"not a valid manifest").unwrap();
 
     // Drop a stray shard file.
@@ -897,11 +857,11 @@ fn salreplay_spills_are_named_by_seq() {
 
     // A barrier folds the live memtable into the third shard and publishes.
     t.ingest_owned_batch(make_batch(&[(500, 1, 5000)])).unwrap();
-    flush_barrier([&mut t], ManifestStamp { replay_floor: 42, ..Default::default() }).unwrap();
+    flush_barrier([&mut t], 42).unwrap();
     assert_eq!(shard_files(&tdir), vec![name(1), name(2), name(3)]);
 
     let t2 = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
-    assert_eq!(t2.replay_floor(), 42, "the reopen reports the barrier's floor");
+    assert_eq!(t2.checkpoint_mark(), 42, "the reopen reports the barrier's mark");
     for k in (0..10u128).chain(100..110) {
         assert!(t2.has_pk(k), "spilled row {k} survives reopen");
     }
@@ -957,26 +917,26 @@ fn salreplay_barrier_folds_memtable_and_l0_then_spill_writes_one_shard() {
     }
 }
 
-/// A reopen reports the last published replay floor; no manifest reports 0.
+/// A reopen reports the last published checkpoint mark; no manifest reports 0.
 #[test]
-fn a_barriers_replay_floor_is_what_the_reopen_reports() {
+fn a_barriers_checkpoint_mark_is_what_the_reopen_reports() {
     let dir = tempfile::tempdir().unwrap();
-    let tdir = dir.path().join("replay_floor");
+    let tdir = dir.path().join("checkpoint_mark");
     let schema = make_schema_u64_i64();
     let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::SalReplay);
-    assert_eq!(t.replay_floor(), 0, "a fresh store carries no floor");
+    assert_eq!(t.checkpoint_mark(), 0, "a fresh store carries no mark");
 
     t.ingest_owned_batch(make_batch(&[(1, 1, 10)])).unwrap();
-    flush_barrier([&mut t], ManifestStamp { replay_floor: 9, ..Default::default() }).unwrap();
+    flush_barrier([&mut t], 9).unwrap();
     for k in 2..6u64 {
         t.ingest_owned_batch(make_batch(&[(k, 1, 10)])).unwrap();
     }
-    flush_barrier([&mut t], ManifestStamp { replay_floor: 7, ..Default::default() }).unwrap();
-    assert_eq!(t.replay_floor(), 0, "the open's floor is read-only");
+    flush_barrier([&mut t], 7).unwrap();
+    assert_eq!(t.checkpoint_mark(), 0, "the open's mark is read-only");
     drop(t);
 
     let t = new_table(&tdir, schema, 1 << 20, RecoverySource::SalReplay);
-    assert_eq!(t.replay_floor(), 7, "the last published floor, not the highest");
+    assert_eq!(t.checkpoint_mark(), 7, "the last published mark, not the highest");
 }
 
 /// Twin of the RAM-tier retract tests on a real `SalReplay` table: ingest
@@ -1122,7 +1082,7 @@ fn compact_then_quiet_barrier_publishes_compacted_index() {
 }
 
 /// The manifest generation is stamped from the value the publish path
-/// passes explicitly (`flush_barrier(tables, stamp)`), so a
+/// passes explicitly (`flush_barrier(tables, checkpoint_mark)`), so a
 /// compaction republish carries the caller's generation, and a later
 /// republish re-stamps a newer one.
 #[test]
@@ -1133,7 +1093,7 @@ fn generation_preserved_by_compaction_republish() {
     let tdir = dir.path().join("gen_republish");
     let schema = make_schema_u64_i64();
     let read_generation =
-        |dir: &std::path::Path| -> u64 { read(dir.to_str().unwrap()).unwrap().unwrap().stamp.checkpoint_gen };
+        |dir: &std::path::Path| -> u64 { read(dir.to_str().unwrap()).unwrap().unwrap().checkpoint_mark };
 
     // Publish at generation G1 with a compaction pending.
     let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
@@ -1141,24 +1101,10 @@ fn generation_preserved_by_compaction_republish() {
     for r in 0..6u64 {
         let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
         t.ingest_owned_batch(make_batch(&rows)).unwrap();
-        flush_barrier(
-            [&mut t],
-            ManifestStamp {
-                checkpoint_gen: 0x1111,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        flush_barrier([&mut t], 0x1111).unwrap();
     }
     assert!(compaction_output_count(&t) > 0, "compaction ran");
-    flush_barrier(
-        [&mut t],
-        ManifestStamp {
-            checkpoint_gen: 0x1111,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    flush_barrier([&mut t], 0x1111).unwrap();
     assert_eq!(
         read_generation(&tdir),
         0x1111,
@@ -1167,14 +1113,7 @@ fn generation_preserved_by_compaction_republish() {
 
     // A later publish at a higher generation re-stamps the manifest.
     t.ingest_owned_batch(make_batch(&[(9999, 1, 1)])).unwrap();
-    flush_barrier(
-        [&mut t],
-        ManifestStamp {
-            checkpoint_gen: 0x2222,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    flush_barrier([&mut t], 0x2222).unwrap();
     assert_eq!(
         read_generation(&tdir),
         0x2222,
@@ -1190,13 +1129,13 @@ fn rederive_checkpointed_conditional_load() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("cond_load");
     let schema = make_schema_u64_i64();
-    let manifest_path = tdir.join("manifest.bin");
+    let manifest_path = std::path::PathBuf::from(super::super::manifest::manifest_path(tdir.to_str().unwrap()));
 
     // Publish a durable shard + manifest stamped at generation 7.
     {
         let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
         t.ingest_owned_batch(make_batch(&[(1, 1, 100), (2, 1, 200)])).unwrap();
-        flush_barrier([&mut t], ManifestStamp { checkpoint_gen: 7, ..Default::default() }).unwrap();
+        flush_barrier([&mut t], 7).unwrap();
     }
     assert!(manifest_path.exists(), "manifest published at generation 7");
 
@@ -1238,9 +1177,9 @@ fn rederive_checkpointed_rebuilds_on_a_damaged_manifest() {
         let tdir = dir.path().join(name);
         let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
         t.ingest_owned_batch(make_batch(&[(1, 1, 100)])).unwrap();
-        flush_barrier([&mut t], ManifestStamp { checkpoint_gen: 7, ..Default::default() }).unwrap();
+        flush_barrier([&mut t], 7).unwrap();
         assert_eq!(shard_files(&tdir).len(), 1, "{name}: shard published");
-        let manifest = std::path::PathBuf::from(crate::storage::lsm::manifest::path(tdir.to_str().unwrap()));
+        let manifest = std::path::PathBuf::from(super::super::manifest::manifest_path(tdir.to_str().unwrap()));
         (tdir, manifest)
     };
     let reopen = |tdir: &std::path::Path| {
@@ -1303,7 +1242,7 @@ fn barrier_gate_matrix() {
         t.ingest_owned_batch(make_batch(&rows)).unwrap();
         assert_eq!(t.ram_tier.len(), 0, "spilled");
         let _w = t
-            .flush_prepare(ManifestStamp::default())
+            .flush_prepare(0)
             .unwrap()
             .expect("an unsynced spill must gate to a staged publish");
         assert!(
@@ -1328,7 +1267,7 @@ fn barrier_gate_matrix() {
 
         let shards_before = shard_files(&tdir).len();
         let _w = t
-            .flush_prepare(ManifestStamp::default())
+            .flush_prepare(0)
             .unwrap()
             .expect("unsynced compaction outputs must gate to a staged publish");
         let unsynced: Vec<String> = t.shard_index.unsynced_paths().collect();
@@ -1354,17 +1293,14 @@ fn an_idle_store_publishes_nothing() {
     let tdir = dir.path().join("idle");
     let mut t = new_table(&tdir, make_schema_u64_i64(), 1 << 20, RecoverySource::SalReplay);
     t.flush().unwrap();
-    assert!(tdir.join("manifest.bin").exists(), "the first barrier publishes");
     assert!(
-        t.flush_prepare(ManifestStamp::default()).unwrap().is_none(),
-        "an idle store stages nothing"
+        std::fs::exists(super::super::manifest::manifest_path(tdir.to_str().unwrap())).unwrap(),
+        "the first barrier publishes"
     );
+    assert!(t.flush_prepare(0).unwrap().is_none(), "an idle store stages nothing");
 
     t.ingest_owned_batch(make_batch(&[(1, 1, 1)])).unwrap();
-    assert!(
-        t.flush_prepare(ManifestStamp::default()).unwrap().is_some(),
-        "a written row publishes"
-    );
+    assert!(t.flush_prepare(0).unwrap().is_some(), "a written row publishes");
 }
 
 /// A manifest loaded at open may never have been made durable by the process
@@ -1380,7 +1316,7 @@ fn a_reopened_store_publishes_on_its_first_round() {
         t.flush().unwrap();
     }
     let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::SalReplay);
-    assert!(t.flush_prepare(ManifestStamp::default()).unwrap().is_some());
+    assert!(t.flush_prepare(0).unwrap().is_some());
 }
 
 /// A push that retracts every row, spills, and compacts the whole L0 to nothing
@@ -1409,10 +1345,7 @@ fn a_compaction_to_nothing_publishes() {
     assert_eq!(t.ram_tier.len(), 0, "the retraction spilled");
     assert!(t.all_shard_arcs().is_empty(), "the compaction cancelled everything");
 
-    assert!(
-        t.flush_prepare(ManifestStamp::default()).unwrap().is_some(),
-        "an emptied index publishes"
-    );
+    assert!(t.flush_prepare(0).unwrap().is_some(), "an emptied index publishes");
     t.flush().unwrap();
     drop(t);
     let t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
@@ -1450,7 +1383,7 @@ fn rederive_ephemeral_flush_drains_deferred_compaction() {
 
     // One published shard, so the churn below supersedes a file a manifest names.
     t.ingest_owned_batch(make_batch(&[(10_000, 1, 1)])).unwrap();
-    flush_barrier([&mut t], ManifestStamp { checkpoint_gen: 1, ..Default::default() }).unwrap();
+    flush_barrier([&mut t], 1).unwrap();
     let published = shard_files(&tdir);
     assert_eq!(published.len(), 1, "the publish wrote one shard");
 
@@ -1466,7 +1399,7 @@ fn rederive_ephemeral_flush_drains_deferred_compaction() {
         "the published input waits for the barrier"
     );
 
-    flush_barrier([&mut t], ManifestStamp { checkpoint_gen: 2, ..Default::default() }).unwrap();
+    flush_barrier([&mut t], 2).unwrap();
     assert!(
         !tdir.join(&published[0]).exists(),
         "the ephemeral round republishes over the compacted index and drains the published input"
@@ -1665,21 +1598,18 @@ fn a_caller_record_is_published_with_the_rows() {
         let mut t = new_table(&tdir, schema, 1 << 20, resume);
         t.ingest_owned_batch(make_batch(&[(1, 1, 100)])).unwrap();
         t.set_caller_record(b"first".to_vec());
-        flush_barrier([&mut t], ManifestStamp::default()).unwrap();
+        flush_barrier([&mut t], 0).unwrap();
     }
     let mut t = new_table(&tdir, schema, 1 << 20, resume);
     assert!(t.resumed_from_checkpoint());
     assert_eq!(t.caller_record, b"first");
     assert!(t.has_pk_bytes(&1u64.to_be_bytes()));
 
-    flush_barrier([&mut t], ManifestStamp::default()).unwrap();
+    flush_barrier([&mut t], 0).unwrap();
     assert!(
-        t.flush_prepare(ManifestStamp::default()).unwrap().is_none(),
+        t.flush_prepare(0).unwrap().is_none(),
         "an unchanged record stages nothing"
     );
     t.set_caller_record(b"second".to_vec());
-    assert!(
-        t.flush_prepare(ManifestStamp::default()).unwrap().is_some(),
-        "a changed record republishes"
-    );
+    assert!(t.flush_prepare(0).unwrap().is_some(), "a changed record republishes");
 }

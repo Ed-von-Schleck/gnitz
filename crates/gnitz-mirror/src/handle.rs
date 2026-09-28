@@ -8,7 +8,8 @@ use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::{gnitz_debug, gnitz_error};
 use gnitz_store::relation::{lock_data_dir, DirLock, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
-use gnitz_store::storage::{Batch, Slot, StoreError};
+use gnitz_store::schema::Slot;
+use gnitz_store::storage::{Batch, StoreError};
 use gnitz_wire::ViewProps;
 
 use crate::record::MirrorRecord;

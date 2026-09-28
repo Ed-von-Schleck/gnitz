@@ -307,7 +307,7 @@ fn global_circuit(op: OpNode, exchanged: bool) -> LoadedCircuit {
 /// view placed as `source` is.
 fn side_output(op: OpNode, source: SchemaDescriptor, of: u32) -> SchemaDescriptor {
     let loaded = global_circuit(op.clone(), true);
-    let mut registry = RelationRegistry::new("", gnitz_store::storage::Slot::new(0, of), Default::default());
+    let mut registry = RelationRegistry::new("", gnitz_store::schema::Slot::new(0, of), Default::default());
     register_sources(&mut registry, [(10, source)]);
     let view_schema = match &op {
         OpNode::Reduce { agg, .. } => {
@@ -400,7 +400,7 @@ fn a_global_ground_reduce_with_no_exchange_is_refused_unless_self_contained() {
             .shape
             .output_schema
             .with_placement(placement);
-        let mut registry = RelationRegistry::new("", gnitz_store::storage::Slot::new(0, of), Default::default());
+        let mut registry = RelationRegistry::new("", gnitz_store::schema::Slot::new(0, of), Default::default());
         register_sources(&mut registry, [(10, source)]);
         compile_view(&global_circuit(op, false), &registry, &view_schema, false).map(drop)
     };

@@ -12,12 +12,12 @@ use super::batch::{
     write_to_batch, Batch, Layout, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
 };
 use super::batch_pool::{acquire_arena, Fill};
-use super::error::StorageError;
 use super::layout::*;
 use super::merge::{prorated_blob_cap, should_relocate_blob, ColPtr, ColumnarSource, UnifiedSource};
 use super::scatter::DecodedColumns;
 use super::shard_filter;
 use crate::schema::SchemaDescriptor;
+use crate::storage::error::StorageError;
 use gnitz_expr::RowSource;
 use gnitz_foundation::posix_io::Mmap;
 use gnitz_wire::{read_i64_le, read_u64_le};

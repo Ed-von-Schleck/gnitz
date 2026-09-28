@@ -9,20 +9,22 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use super::batch::Batch;
-use super::error::StorageError;
+use gnitz_foundation::posix_io::create_dir;
+
 use super::manifest::Manifest;
-use super::merge::ColumnarSource;
 use super::read_cursor::{self, ReadCursor};
 use super::run::{Run, StoredRow};
 use super::run_set::RunSet;
-use super::seek::pk_group_end;
 use super::shard_index::{ShardBudget, ShardIndex};
-#[cfg(test)]
-use super::shard_reader::MappedShard;
 use crate::schema::key::{pk_bytes_eq, pk_in_range, pk_ranges_overlap, probe_key, PkBuf};
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
+use crate::storage::error::StorageError;
+use crate::storage::repr::batch::Batch;
+use crate::storage::repr::merge::ColumnarSource;
+use crate::storage::repr::seek::pk_group_end;
+#[cfg(test)]
+use crate::storage::repr::shard_reader::MappedShard;
 
 /// Ingest runs fold into the RAM tier once they pass this. 192 KiB and 768 KiB
 /// are indistinguishable in total stall (btrfs, W=4, 4 views, 200k rows, ×3:
@@ -144,8 +146,8 @@ pub(crate) struct Table {
 
     recovery_source: RecoverySource,
 
-    /// The replay floor of the manifest this open loaded; 0 without one.
-    replay_floor: u64,
+    /// The checkpoint mark of the manifest this open loaded; 0 without one.
+    checkpoint_mark: u64,
 
     /// What the next publish writes as the manifest's caller record.
     caller_record: Vec<u8>,
@@ -194,7 +196,7 @@ impl Table {
     ) -> Result<Self, StorageError> {
         // First, so an unusable directory fails the open rather than the first
         // flush.
-        let created = crate::storage::create_dir(dir)?;
+        let created = create_dir(dir)?;
 
         let rederived = matches!(recovery_source, RecoverySource::Rederive { .. });
         let loaded = match recovery_source {
@@ -204,7 +206,7 @@ impl Table {
             RecoverySource::Rederive { resume_at: None } => None,
             // Rebuilt from its sources, so damage is erased rather than fatal.
             RecoverySource::Rederive { resume_at: Some(want) } => {
-                super::manifest::read_intact(dir)?.filter(|m| m.stamp.checkpoint_gen == want)
+                super::manifest::read_intact(dir)?.filter(|m| m.checkpoint_mark == want)
             }
             // Its shards are its only copy, so damage stops the open.
             RecoverySource::SalReplay => super::manifest::read(dir)?,
@@ -214,8 +216,8 @@ impl Table {
             super::manifest::unlink(dir)?;
         }
         let resumed_from_checkpoint = rederived && loaded.is_some();
-        let (replay_floor, caller_record, shards) = match loaded {
-            Some(Manifest { stamp, caller_record, shards }) => (stamp.replay_floor, caller_record, Some(shards)),
+        let (checkpoint_mark, caller_record, shards) = match loaded {
+            Some(Manifest { checkpoint_mark, caller_record, shards }) => (checkpoint_mark, caller_record, Some(shards)),
             None => (0, Vec::new(), None),
         };
         // Only a `SalReplay` store is point-probed by PK.
@@ -225,7 +227,7 @@ impl Table {
             ram_tier: RunSet::new(budgets.ram_tier_bytes),
             shard_index: ShardIndex::open(dir, schema, budgets.shard, skip_pk_filter, shards.as_ref())?,
             recovery_source,
-            replay_floor,
+            checkpoint_mark,
             caller_record,
             resumed_from_checkpoint,
             held_in_ram: false,
@@ -341,9 +343,9 @@ impl Table {
         Ok(())
     }
 
-    /// The replay floor of the manifest this open loaded; 0 without one.
-    pub(crate) fn replay_floor(&self) -> u64 {
-        self.replay_floor
+    /// The checkpoint mark of the manifest this open loaded; 0 without one.
+    pub(crate) fn checkpoint_mark(&self) -> u64 {
+        self.checkpoint_mark
     }
 
     /// The bytes this store's next published manifest carries for its owner.
@@ -448,7 +450,7 @@ impl Table {
     /// count, an upper bound on the live groups; `None` opens empty.
     pub(crate) fn range_cursor(&self, range: Option<(PkBuf, Option<PkBuf>)>) -> (ReadCursor, usize) {
         let Some((start, end)) = range else {
-            return (read_cursor::empty(self.shard_index.schema), 0);
+            return (read_cursor::empty_cursor(self.shard_index.schema), 0);
         };
         let end = end.as_ref().map(PkBuf::pk_bytes);
         let mut cursor = self.open_cursor_in_range(start.pk_bytes(), end, None);

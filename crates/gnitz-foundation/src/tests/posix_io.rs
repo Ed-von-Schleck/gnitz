@@ -42,3 +42,27 @@ fn the_fd_limit_is_raised_to_the_requested_soft_ceiling() {
         "child {pid} did not exit cleanly (status {status:#x})"
     );
 }
+
+#[test]
+fn create_dir_makes_parents_and_reports_whether_it_created() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("a/b/c");
+    let dir = dir.to_str().unwrap();
+    assert!(create_dir(dir).unwrap());
+    assert!(std::path::Path::new(dir).is_dir());
+    assert!(!create_dir(dir).unwrap());
+    let file = root.path().join("f");
+    std::fs::write(&file, b"x").unwrap();
+    assert!(create_dir(file.to_str().unwrap()).is_err());
+}
+
+#[test]
+fn fsync_dir_syncs_a_directory_and_refuses_a_missing_one() {
+    let root = tempfile::tempdir().unwrap();
+    fsync_dir(root.path().to_str().unwrap()).unwrap();
+    let missing = root.path().join("absent");
+    assert_eq!(
+        fsync_dir(missing.to_str().unwrap()).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+}

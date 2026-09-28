@@ -7,31 +7,31 @@ use std::rc::Rc;
 
 use io_uring::types::FsyncFlags;
 
-use super::super::batch::Batch;
 use super::super::batch_fsync::{new_ring, sync_paths};
-use super::super::error::StorageError;
-use super::super::manifest::{self, Manifest, ManifestStamp};
-use super::super::StagedFile;
+use super::super::manifest::{self, Manifest};
 use super::Table;
+use crate::storage::error::StorageError;
+use crate::storage::repr::batch::Batch;
 
 /// A publish [`Table::flush_prepare`] staged and [`flush_barrier`] completes.
 pub(super) struct FlushWork {
-    manifest: StagedFile,
+    manifest_tmp: String,
     bytes: Vec<u8>,
-    /// The shard index's last seq when `manifest` was built.
+    /// The shard index's last seq when the manifest was built.
     names_through: u64,
-    /// Fsynced once `manifest` is renamed.
+    /// Fsynced once the manifest is renamed.
     dirs: Vec<PathBuf>,
 }
 
-/// Durably publish every table in `tables`, each manifest carrying `stamp`.
+/// Durably publish every table in `tables`, each manifest carrying
+/// `checkpoint_mark`.
 pub(crate) fn flush_barrier<'a>(
     tables: impl IntoIterator<Item = &'a mut Table>,
-    stamp: ManifestStamp,
+    checkpoint_mark: u64,
 ) -> Result<(), StorageError> {
     let mut work: Vec<(&'a mut Table, FlushWork)> = Vec::new();
     for t in tables {
-        if let Some(w) = t.flush_prepare(stamp)? {
+        if let Some(w) = t.flush_prepare(checkpoint_mark)? {
             work.push((t, w));
         }
     }
@@ -43,14 +43,14 @@ pub(crate) fn flush_barrier<'a>(
     sync_paths(
         &mut ring,
         work.iter()
-            .flat_map(|(t, w)| t.shard_index.unsynced_paths().chain([w.manifest.tmp_path().to_owned()])),
+            .flat_map(|(t, w)| t.shard_index.unsynced_paths().chain([w.manifest_tmp.clone()])),
         FsyncFlags::DATASYNC,
     )?;
     let mut dirs = BTreeSet::new();
     let mut published = Vec::with_capacity(work.len());
     for (t, w) in work {
         // The rename publishes every shard the manifest names.
-        w.manifest.commit()?;
+        manifest::commit(&t.shard_index.output_dir)?;
         t.shard_index.mark_published(w.names_through);
         dirs.extend(w.dirs);
         published.push((t, w.bytes));
@@ -70,7 +70,7 @@ impl Table {
     #[cfg(test)]
     pub(crate) fn flush(&mut self) -> Result<(), StorageError> {
         assert!(!self.is_rederived(), "the base round never visits a rederived table");
-        flush_barrier([&mut *self], ManifestStamp::default())
+        flush_barrier([&mut *self], 0)
     }
 
     // ------------------------------------------------------------------
@@ -110,7 +110,7 @@ impl Table {
 
     /// Fold memtable and RAM tier into one shard and stage the manifest naming
     /// it; `None` when that manifest is the one this process last made durable.
-    pub(super) fn flush_prepare(&mut self, stamp: ManifestStamp) -> Result<Option<FlushWork>, StorageError> {
+    pub(super) fn flush_prepare(&mut self, checkpoint_mark: u64) -> Result<Option<FlushWork>, StorageError> {
         // Fold-first, then one shard.
         self.fold_memtable_into_ram_tier();
         if let Some(run) = self.ram_tier.fold_to_single(&self.shard_index.schema) {
@@ -118,7 +118,7 @@ impl Table {
         }
         let names_through = self.shard_index.last_seq();
         let bytes = manifest::encode(&Manifest {
-            stamp,
+            checkpoint_mark,
             caller_record: self.caller_record.clone(),
             shards: self.shard_index.shard_set(),
         });
@@ -132,7 +132,7 @@ impl Table {
         let first_publish = self.durable_manifest.is_none();
         // Unknown until the barrier records it: a failed publish may have renamed.
         self.durable_manifest = None;
-        let manifest = manifest::prepare(&self.shard_index.output_dir, &bytes)?;
+        let manifest_tmp = manifest::prepare(&self.shard_index.output_dir, &bytes)?;
         // A first publish also makes the store's and its relation's directory entries durable.
         let entry_dirs = if first_publish { 2 } else { 0 };
         let dirs = Path::new(&self.shard_index.output_dir)
@@ -141,7 +141,7 @@ impl Table {
             .filter(|d| !d.as_os_str().is_empty())
             .map(Path::to_path_buf)
             .collect();
-        Ok(Some(FlushWork { manifest, bytes, names_through, dirs }))
+        Ok(Some(FlushWork { manifest_tmp, bytes, names_through, dirs }))
     }
 
     /// Move the RAM tier's folded run to an unsynced L0 shard, then run the disk

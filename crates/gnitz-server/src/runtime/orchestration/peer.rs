@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::runtime::reactor::{ClientConn, PeerGone, Plain, Reactor, RecvBuf, SendBody};
 use crate::runtime::tls::TlsShared;
 use crate::runtime::w2m::W2mSlot;
-use gnitz_store::storage::batch_pool::{acquire_buf, PooledBuf};
+use gnitz_store::storage::{acquire_buf, PooledBuf};
 
 /// Ceiling on a concatenation of client-bound frames (coalesced scan heads, corked
 /// replies): the copy paid to save per-frame sends. `fanout_coalesced_egress_bench`

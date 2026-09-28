@@ -117,7 +117,7 @@ pub fn op_reduce(
     // The output moves on with its allocation, so a batch that used under half its
     // reservation is copied down to size.
     if out.count < reserved / 2 {
-        out = out.clone_batch();
+        out = Batch::clone(&out);
     }
     out.certify_layout(Layout::Consolidated);
     out

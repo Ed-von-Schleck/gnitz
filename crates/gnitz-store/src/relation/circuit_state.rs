@@ -1,9 +1,10 @@
 //! The rederived operator state of one compiled circuit: the children its
 //! compile declares, and the stores it opens for them.
 
+use super::ChildKind;
 use super::RelationRegistry;
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ChildKind, ReadCursor, StorageError, StoreError, Table};
+use crate::storage::{Batch, ReadCursor, StorageError, StoreError, Table};
 
 /// A `u16` index into one [`CircuitState`], minted only by
 /// [`StateLayout::declare`].

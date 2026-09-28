@@ -8,16 +8,16 @@ use std::ops::Range;
 #[cfg(test)]
 use std::rc::Rc;
 
-#[cfg(test)]
-use super::batch::Batch;
-use super::heap::{HeapNode, LoserTree};
-use super::merge::MemBatch;
-use super::merge::{self, ColumnarSource, PosCursor};
-#[cfg(test)]
-use super::shard_reader::MappedShard;
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, PkBuf};
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
+#[cfg(test)]
+use crate::storage::repr::batch::Batch;
+use crate::storage::repr::heap::{HeapNode, LoserTree};
+use crate::storage::repr::merge::MemBatch;
+use crate::storage::repr::merge::{self, ColumnarSource, PosCursor};
+#[cfg(test)]
+use crate::storage::repr::shard_reader::MappedShard;
 
 mod gather;
 mod output;
@@ -175,7 +175,7 @@ impl ReadCursor {
     /// being the byproduct of the searches the seek runs anyway. Clamping each
     /// source at `end` is what makes every walk exhaust at the cut with no per-row
     /// boundary check; the bound only narrows, and `rewind` keeps it.
-    pub fn seek_range_bytes(&mut self, start: &[u8], end: Option<&[u8]>) -> usize {
+    pub(crate) fn seek_range_bytes(&mut self, start: &[u8], end: Option<&[u8]>) -> usize {
         self.sweep_open = false;
         debug_assert_eq!(start.len(), self.schema.pk_stride());
         debug_assert!(end.is_none_or(|e| e.len() == self.schema.pk_stride()));
@@ -311,7 +311,7 @@ impl ReadCursor {
     ///
     /// Keys must strictly increase until something repositions the cursor, which
     /// `Self::note_sweep_key` enforces.
-    pub fn seek_pk_group_ascending(&mut self, key: &[u8]) -> bool {
+    pub(crate) fn seek_pk_group_ascending(&mut self, key: &[u8]) -> bool {
         if !self.note_sweep_key(key) {
             self.reposition_to(key);
         } else if self.valid {
@@ -668,7 +668,7 @@ impl ReadCursor {
     /// walk fills wants. The per-source windows (so a range seek's clamp is in
     /// it) PLUS the row the cursor sits on: a drive CONSUMES the group it emits,
     /// so `position` is already past a row still to be visited.
-    pub fn estimated_length(&self) -> usize {
+    pub(crate) fn estimated_length(&self) -> usize {
         let ahead: usize = self.states.iter().map(|s| s.count.saturating_sub(s.position)).sum();
         ahead + usize::from(self.valid)
     }
@@ -711,7 +711,7 @@ fn build(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor, cap: usi
 }
 
 /// A cursor over nothing, in `schema`'s shape.
-pub(crate) fn empty(schema: SchemaDescriptor) -> ReadCursor {
+pub(crate) fn empty_cursor(schema: SchemaDescriptor) -> ReadCursor {
     from_runs(std::iter::empty(), schema, 0)
 }
 

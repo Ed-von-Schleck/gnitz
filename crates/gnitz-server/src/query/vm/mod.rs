@@ -8,7 +8,8 @@ use gnitz_store::expr::MapPlan;
 use gnitz_store::ops;
 use gnitz_store::relation::{CircuitState, StateIdx};
 use gnitz_store::schema::SchemaDescriptor;
-use gnitz_store::storage::{Batch, Slot};
+use gnitz_store::schema::Slot;
+use gnitz_store::storage::Batch;
 
 mod builder;
 mod exec;

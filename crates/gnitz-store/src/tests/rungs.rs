@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::test_support::assert_ladder;
+use crate::test_support::{assert_ladder, rung_files};
 
 /// Each rung and the rungs it may name — the table `CLAUDE.md` and the `mod.rs`
 /// headers state in prose.
@@ -26,4 +26,14 @@ const LADDER: &[(&str, &[&str])] = &[
 #[test]
 fn every_rung_names_only_the_rungs_beneath_it() {
     assert_ladder(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")), LADDER);
+}
+
+/// Inside `storage`, the representation layer never names the LSM above it.
+#[test]
+fn storage_repr_never_names_the_lsm() {
+    let src = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+    for f in rung_files(src, "storage/repr") {
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert!(!text.contains("lsm::"), "{} names the LSM", f.display());
+    }
 }

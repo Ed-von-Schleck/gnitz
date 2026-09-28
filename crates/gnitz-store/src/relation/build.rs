@@ -1,7 +1,7 @@
 //! Opening a relation's stores and entering it in the registry.
 
+use super::dirs::remove_children;
 use super::*;
-use crate::storage::{remove_children, ChildKind};
 use gnitz_foundation::fault::Seam;
 
 /// `GNITZ_INJECT_TABLE_CREATE_DELAY_MS`: stall a user table's create between its

@@ -1,7 +1,8 @@
 use super::*;
 use crate::relation::{RelationKind, RelationSpec, StoreConfig};
+use crate::schema::Slot;
 use crate::schema::{SchemaColumn, TypeCode};
-use crate::storage::{BatchBuilder, Slot, StoreError};
+use crate::storage::{BatchBuilder, StoreError};
 use crate::test_support::payload0_i64;
 use gnitz_wire::ViewProps;
 use gnitz_wire::{key_image, AggDescriptor, AggReadSpec, Cut, KeyRange, OrderKey, PkColList, ReadSink};

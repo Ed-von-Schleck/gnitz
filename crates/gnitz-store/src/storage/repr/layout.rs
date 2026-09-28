@@ -1,7 +1,7 @@
 //! Shared shard file format constants, and the digest over the bytes that
 //! decide how the rest of a shard is read.
 
-use super::super::error::StorageError;
+use crate::storage::error::StorageError;
 use gnitz_wire::{read_i64_le, read_signed_exact, read_u64_le, read_unsigned_exact, write_u64_le, FixedInt};
 
 use StorageError::Corrupt;

@@ -12,7 +12,7 @@ use std::mem::MaybeUninit;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gnitz_store::storage::batch_pool::{acquire_buf, PooledBuf};
+use gnitz_store::storage::{acquire_buf, PooledBuf};
 
 use crate::runtime::reactor::{
     chan, AsyncRwLock, ClientConn, PeerGone, Reactor, RecvEnd, RecvFilter, RecvQueue, SendBody, WriteGuard,

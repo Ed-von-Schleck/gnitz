@@ -253,7 +253,7 @@ fn only_the_ground_owner_seeds_the_ground_row() {
         vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_IN)],
     );
     for rank in 0..4u32 {
-        let mut registry = RelationRegistry::new("", gnitz_store::storage::Slot::new(rank, 4), Default::default());
+        let mut registry = RelationRegistry::new("", gnitz_store::schema::Slot::new(rank, 4), Default::default());
         register_sources(&mut registry, [(10, schema)]);
         // The post phase: the shard is a seed register.
         let (plan, _) = build(

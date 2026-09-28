@@ -266,3 +266,23 @@ fn a_filter_built_from_a_pk_region_has_no_false_negatives_at_any_stride() {
         }
     }
 }
+
+/// A replicated relayout hard-links one shard inode into several stores, so a
+/// write at an existing name must leave that file untouched.
+#[test]
+fn write_refuses_an_existing_path_and_leaves_it_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("taken.db");
+    let path = path.to_str().unwrap();
+    let schema = make_schema_u64_i64();
+    let rows = u64_rows(&[1], &[1], &[0], &[vec![10]]);
+    write_i64_shard(path, &schema, &rows, &[], ShardWriteOpts::default());
+    let before = std::fs::read(path).unwrap();
+
+    let other = crate::test_support::make_batch_opk(&schema, &[(&2u64.to_be_bytes()[..], 1, 20)]);
+    assert_eq!(
+        other.write_as_shard(path, ShardWriteOpts::default()),
+        Err(StorageError::Io(libc::EEXIST))
+    );
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}

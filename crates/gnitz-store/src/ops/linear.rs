@@ -99,7 +99,7 @@ pub fn op_union(batch_a: Batch, batch_b: &Batch, out_schema: &SchemaDescriptor) 
         return batch_a;
     }
     if batch_a.count == 0 {
-        return batch_b.clone_batch();
+        return Batch::clone(batch_b);
     }
     let (n_a, n_b) = (batch_a.count, batch_b.count);
 

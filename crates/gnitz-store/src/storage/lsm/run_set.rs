@@ -12,12 +12,12 @@
 use std::cell::OnceCell;
 use std::rc::Rc;
 
-use super::batch::{Batch, Layout};
 use super::bloom::BloomFilter;
-use super::merge::{self, MemBatch};
-use super::scatter::UnifiedSet;
 use crate::schema::key::probe_key;
 use crate::schema::SchemaDescriptor;
+use crate::storage::repr::batch::{Batch, Layout};
+use crate::storage::repr::merge::{self, MemBatch};
+use crate::storage::repr::scatter::UnifiedSet;
 
 /// Runs to accumulate before folding them into one: bounds how many runs a
 /// cursor merges and a PK probe walks.
@@ -164,12 +164,11 @@ impl RunSet {
     /// Every run folded N-way into one consolidated batch.
     fn consolidate_all(&self, schema: &SchemaDescriptor) -> Batch {
         let views: Vec<MemBatch> = self.runs.iter().map(|r| r.as_mem_batch()).collect();
-        let total_blob: usize = views.iter().map(|b| b.blob.len()).sum();
         let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(self.row_count());
         merge::run_merge(&views, schema, |src, row, w| {
             survivors.push((src as u32, row as u32, w))
         });
-        let mut result = UnifiedSet::whole(&views, schema).materialize(&survivors, total_blob);
+        let mut result = UnifiedSet::whole(&views, schema).materialize(&survivors, survivors.len());
         result.certify_layout(Layout::Consolidated);
         result
     }

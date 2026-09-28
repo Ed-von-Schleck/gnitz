@@ -1,7 +1,7 @@
 use super::*;
 use crate::query::compiler::fixtures::*;
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
-use gnitz_store::storage::Slot;
+use gnitz_store::schema::Slot;
 use gnitz_wire::OpNode;
 
 // ── load_circuit against the real system tables ─────────────────────────

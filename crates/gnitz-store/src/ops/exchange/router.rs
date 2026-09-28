@@ -2,9 +2,10 @@
 //! routing-key helpers.
 
 use crate::schema::key::{locate_key_col, FoldCols, ReindexPacker};
+use crate::schema::Slot;
 use crate::schema::{worker_for_key, worker_for_pk_bytes, MAX_PK_BYTES};
 use crate::schema::{ColumnLocator, OpBuildErr, SchemaDescriptor};
-use crate::storage::{run_merge, Batch, MemBatch, Slot};
+use crate::storage::{run_merge, Batch, MemBatch};
 
 use super::super::group_key::GroupKeyCols;
 
@@ -14,7 +15,7 @@ use super::super::group_key::GroupKeyCols;
 pub fn op_worker_filter(batch: &Batch, slot: Slot) -> Batch {
     let n = batch.count;
     if n == 0 {
-        return batch.clone_batch();
+        return Batch::clone(batch);
     }
     let nw = slot.of as usize;
     let wid = slot.rank as usize;

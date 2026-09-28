@@ -214,8 +214,8 @@ fn a_replicated_sources_relay_is_sent_by_worker_0_alone() {
         let over_replicated = Relay::new(&engine.registry, 99, replicated, false);
         let over_keyed = Relay::new(&engine.registry, 99, keyed, false);
         let mut host = Recorder { cat: &mut engine, sent: Vec::new() };
-        over_replicated.send(&mut host, delta.clone_batch(), replicated, true);
-        over_keyed.send(&mut host, delta.clone_batch(), keyed, true);
+        over_replicated.send(&mut host, Batch::clone(&delta), replicated, true);
+        over_keyed.send(&mut host, Batch::clone(&delta), keyed, true);
         // A single-side round is not single-sourced, so it is sent by every rank.
         over_replicated.round(&mut host, delta, false);
 
@@ -314,7 +314,7 @@ fn drive_tick_bench() {
     tick(&mut engine, base, 1, warm);
     let rows: Vec<(u64, i64, i64)> = (1..=BENCH_TICKS).map(|i| (i, 1, i as i64)).collect();
     let delta = delta_for(&engine, base, &rows);
-    let (copies, clone_instr) = counter.measure(|| (0..7).map(|_| delta.clone_batch()).collect::<Vec<_>>());
+    let (copies, clone_instr) = counter.measure(|| (0..7).map(|_| Batch::clone(&delta)).collect::<Vec<_>>());
     drop(copies);
     let ((), instr) = counter.measure(|| tick(&mut engine, base, 2, delta));
     let last = engine.dag.dependents_of(base).last().copied().unwrap();

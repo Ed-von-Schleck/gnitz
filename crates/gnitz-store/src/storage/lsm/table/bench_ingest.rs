@@ -8,8 +8,8 @@
 //! row than many small ones" — which is what sizes a per-subscription
 //! accumulator cap.
 
-use super::super::batch::Batch;
 use crate::schema::SchemaDescriptor;
+use crate::storage::repr::batch::Batch;
 use crate::test_support::{encode_to_wire_vec, make_batch_raw, make_schema_u64_i64, scratch_table};
 
 /// One delta of `n` rows at consecutive PKs from `base`, all weight +1. Raw, not

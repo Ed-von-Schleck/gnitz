@@ -10,15 +10,15 @@
 use std::collections::BTreeSet;
 use std::fs;
 
-use super::batch::{Batch, Layout};
-use super::child_dir::{cluster_children, remove_child, subdir_names, ChildAddr, ChildKind, Slot};
-use super::error::{StorageError, StoreError};
-use super::manifest;
-use super::read_cursor;
-use super::table::flush_barrier;
-use super::table::{RecoverySource, StoreBudgets, Table};
-use crate::schema::SchemaDescriptor;
-use crate::storage::fsync_dir;
+use gnitz_foundation::posix_io::fsync_dir;
+
+use super::dirs::{cluster_children, subdir_names};
+use super::{ChildAddr, ChildKind};
+use crate::schema::{SchemaDescriptor, Slot};
+use crate::storage::{
+    flush_barrier, from_runs, link_store, retire_store, route_rows_by_pk, Batch, Layout, RecoverySource, StorageError,
+    StoreBudgets, StoreError, Table,
+};
 
 /// The worker count of the complete child set to relay onto `launched`; `None`
 /// when nothing moves. A set missing a rank's manifest never finished a
@@ -64,7 +64,7 @@ fn relay_source(rel_dir: &str, launched: u32) -> Result<Option<u32>, StoreError>
 
 /// Bring `rel_dir`'s children onto `launched` workers. `ram_tier_bytes` and
 /// `chunk_rows` are the registry's own store tuning.
-pub(crate) fn repartition_relation(
+pub(super) fn repartition_relation(
     rel_dir: &str,
     schema: &SchemaDescriptor,
     launched: u32,
@@ -99,7 +99,7 @@ fn relay(
 }
 
 fn remove_set(rel_dir: &str, of: u32) -> Result<(), StorageError> {
-    cluster_children(of).try_for_each(|c| remove_child(&c.dir(rel_dir)))
+    cluster_children(of).try_for_each(|c| retire_store(&c.dir(rel_dir)))
 }
 
 /// Replicated relations: every child is a copy, so each target hard-links rank
@@ -110,20 +110,7 @@ fn link_targets(rel_dir: &str, source: u32, launched: u32) -> Result<(), Storage
         slot: Slot::new(0, source),
     }
     .dir(rel_dir);
-    let m = manifest::read(&source_dir)?.ok_or(StorageError::Io(libc::ENOENT))?;
-    for target in cluster_children(launched) {
-        let dir = target.dir(rel_dir);
-        crate::storage::create_dir(&dir)?;
-        for e in &m.shards.entries {
-            let shard = |dir: &str| super::naming::shard_path(dir, e.seq);
-            fs::hard_link(shard(&source_dir), shard(&dir))?;
-        }
-        // The shards are durable before a manifest names them.
-        fsync_dir(&dir)?;
-        fs::hard_link(manifest::path(&source_dir), manifest::path(&dir))?;
-        fsync_dir(&dir)?;
-    }
-    Ok(())
+    cluster_children(launched).try_for_each(|target| link_store(&source_dir, &target.dir(rel_dir)))
 }
 
 /// Key-routed relations: scatter the merged source set to its owners, cutting
@@ -146,13 +133,12 @@ fn rewrite_targets(
     for t in &sources {
         t.verify_shards()?;
     }
-    let mut cursor = read_cursor::from_runs(sources.iter().flat_map(Table::runs), *schema, 0);
+    let mut cursor = from_runs(sources.iter().flat_map(Table::runs), *schema, 0);
     let mut targets = open(launched)?;
     let mut buffers: Vec<Batch> = targets.iter().map(|_| Batch::empty_with_schema(schema)).collect();
     let mut rows: Vec<Vec<u32>> = Vec::new();
     while let Some(chunk) = cursor.drain_chunk(chunk_rows) {
-        let slots =
-            super::super::scatter::route_rows_by_pk(&chunk.as_mem_batch(), schema, &mut rows, launched as usize);
+        let slots = route_rows_by_pk(&chunk.as_mem_batch(), schema, &mut rows, launched as usize);
         for ((target, buffer), idx) in targets.iter_mut().zip(&mut buffers).zip(slots.iter()) {
             if idx.is_empty() {
                 continue;
@@ -169,7 +155,7 @@ fn rewrite_targets(
             write_run(target, buffer)?;
         }
     }
-    flush_barrier(targets.iter_mut(), Default::default())
+    flush_barrier(targets.iter_mut(), 0)
 }
 
 /// `run` is ascending subsets of one consolidated cursor, appended in cursor

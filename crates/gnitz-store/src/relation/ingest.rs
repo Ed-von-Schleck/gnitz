@@ -3,7 +3,7 @@
 
 use super::{Relation, RelationKind, RelationRegistry, SecondaryIndex, Store};
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ManifestStamp, StorageError, StoreError, Table};
+use crate::storage::{Batch, StorageError, StoreError, Table};
 
 /// `GNITZ_INJECT_INGEST_APPLY_ERROR=store|index`: report `Err(Io)` from the
 /// matching ingest below, which has already run — so what fires is the error
@@ -229,17 +229,13 @@ impl RelationRegistry {
 
     /// The base round: every user store that is not rederived, in one barrier.
     pub fn checkpoint_base(&mut self) -> Result<(), StoreError> {
-        crate::storage::flush_barrier(
-            self.collect_user_tables().filter(|t| !t.is_rederived()),
-            Default::default(),
-        )
-        .map_err(|e| StoreError::storage("base flush", e))
+        crate::storage::flush_barrier(self.collect_user_tables().filter(|t| !t.is_rederived()), 0)
+            .map_err(|e| StoreError::storage("base flush", e))
     }
 
     /// The system round: every system family's store, in one barrier.
     pub fn checkpoint_system(&mut self, replay_floor: u64) -> Result<(), StoreError> {
-        let stamp = ManifestStamp { replay_floor, ..Default::default() };
-        crate::storage::flush_barrier(self.collect_system_tables(), stamp)
+        crate::storage::flush_barrier(self.collect_system_tables(), replay_floor)
             .map_err(|e| StoreError::storage("system catalog flush", e))
     }
 
@@ -249,12 +245,9 @@ impl RelationRegistry {
         &mut self,
         state: impl IntoIterator<Item = &'s mut crate::relation::CircuitState>,
     ) -> Result<(), StoreError> {
-        let stamp = ManifestStamp {
-            checkpoint_gen: self.resume_generation,
-            ..Default::default()
-        };
+        let generation = self.resume_generation;
         let mut tables: Vec<&mut Table> = state.into_iter().flat_map(|s| s.tables_mut()).collect();
         tables.extend(self.collect_user_tables().filter(|t| t.is_rederived()));
-        crate::storage::flush_barrier(tables, stamp).map_err(|e| StoreError::storage("ephemeral flush", e))
+        crate::storage::flush_barrier(tables, generation).map_err(|e| StoreError::storage("ephemeral flush", e))
     }
 }

@@ -2,9 +2,12 @@
 //! relayout and child-dir reclamation — and the system families' replay floors
 //! recovery reads.
 
+use super::dirs::children_at_generation;
 use super::relation_dir;
+use super::ChildKind;
 use super::{RelationKind, RelationRegistry, RelationSpec, Residency, SecondaryIndex, Store};
-use crate::storage::{ChildKind, Slot, StoreError};
+use crate::schema::Slot;
+use crate::storage::StoreError;
 
 impl RelationRegistry {
     // -- Store management (for multi-worker fork) -----------------------------
@@ -93,7 +96,7 @@ impl RelationRegistry {
         );
         // Only a base table carries rows across a worker-count change.
         for (&id, entry) in self.tables.iter().filter(|(_, e)| e.kind().is_base_table()) {
-            crate::storage::repartition_relation(
+            super::repartition::repartition_relation(
                 &relation_dir(&self.base_dir, id),
                 &entry.schema(),
                 self.slot.of,
@@ -127,7 +130,7 @@ impl RelationRegistry {
             "view_children_resumable reads every rank's children"
         );
         self.has_id(view_id)
-            && crate::storage::children_at_generation(
+            && children_at_generation(
                 &relation_dir(&self.base_dir, view_id),
                 self.slot.of,
                 self.resume_generation,
@@ -140,7 +143,7 @@ impl RelationRegistry {
         self.tables
             .iter()
             .filter(|(_, entry)| entry.kind() == RelationKind::SystemCatalog)
-            .map(|(&tid, entry)| (tid, entry.store.held().replay_floor()))
+            .map(|(&tid, entry)| (tid, entry.store.held().checkpoint_mark()))
             .collect()
     }
 }

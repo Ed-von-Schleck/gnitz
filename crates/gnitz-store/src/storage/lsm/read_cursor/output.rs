@@ -2,12 +2,12 @@
 
 use std::rc::Rc;
 
-use super::super::batch::{Batch, Layout};
-use super::super::merge::{prorated_blob_cap, ColumnarSource};
 use super::super::run::Run;
-use super::super::scatter::UnifiedSet;
 use super::{ReadCursor, SkeletonKeys};
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
+use crate::storage::repr::batch::{Batch, Layout};
+use crate::storage::repr::merge::ColumnarSource;
+use crate::storage::repr::scatter::UnifiedSet;
 use gnitz_expr::RowSource;
 
 impl ReadCursor {
@@ -60,11 +60,8 @@ impl ReadCursor {
                 !src.is_skeleton()
             });
         }
-        let src_rows: usize = self.sources.iter().map(Run::row_count).sum();
-        let src_blob: usize = self.sources.iter().map(|s| s.blob().len()).sum();
-        let blob_cap = prorated_blob_cap(src_blob, src_rows, order.len());
-        let mut batch =
-            UnifiedSet::of(&self.sources, &self.schema, windows.iter().cloned()).materialize(&order, blob_cap);
+        let set = UnifiedSet::of(&self.sources, &self.schema, windows.iter().cloned());
+        let mut batch = set.materialize(&order, set.src_rows());
         batch.certify_layout(Layout::Consolidated);
         self.merge_order = order;
         self.drain_windows = windows;

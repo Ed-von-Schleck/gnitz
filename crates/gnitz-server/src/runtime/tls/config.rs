@@ -90,14 +90,13 @@ impl TlsConfig {
             .map_err(|e| format!("failed to read the bound TLS address: {e}"))?;
         if let Some(pem) = self.dev_pem {
             let path = format!("{data_dir}/tls_dev_cert.pem");
-            gnitz_store::storage::publish_file_sync(data_dir, "tls_dev_cert.pem", pem.as_bytes())
-                .map_err(|e| format!("failed to publish {path}: {e}"))?;
+            std::fs::write(&path, pem.as_bytes()).map_err(|e| format!("failed to publish {path}: {e}"))?;
             gnitz_info!(
                 "TLS: minted a self-signed dev certificate (identity is ephemeral, regenerated every boot); \
                  public PEM at {path}"
             );
         }
-        gnitz_store::storage::publish_file_sync(data_dir, "tls_endpoint", format!("{bound}\n").as_bytes())
+        std::fs::write(format!("{data_dir}/tls_endpoint"), format!("{bound}\n"))
             .map_err(|e| format!("failed to publish {data_dir}/tls_endpoint: {e}"))?;
         gnitz_info!("Listening on tls://{}", bound);
         Ok((OwnedFd::from(listener), self.cfg))

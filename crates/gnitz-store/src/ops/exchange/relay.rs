@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 
 use crate::schema::{OpBuildErr, SchemaDescriptor};
-use crate::storage::{prorated_blob_cap, Batch, Layout, MemBatch, UnifiedSet};
+use crate::storage::{Batch, Layout, MemBatch, UnifiedSet};
 
 use super::router::{ScatterKey, ScatterSpec};
 
@@ -17,11 +17,10 @@ fn worker_rows_to_batches(
     worker_rows: &[Vec<(u32, u32, i64)>],
 ) -> Vec<Batch> {
     let set = UnifiedSet::whole(mem, schema);
-    let total_blob: usize = mem.iter().map(|mb| mb.blob.len()).sum();
     let total_rows: usize = worker_rows.iter().map(|v| v.len()).sum();
     worker_rows
         .iter()
-        .map(|rows| set.materialize(rows, prorated_blob_cap(total_blob, total_rows, rows.len())))
+        .map(|rows| set.materialize(rows, total_rows))
         .collect()
 }
 

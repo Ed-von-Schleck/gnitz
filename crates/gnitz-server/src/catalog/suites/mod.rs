@@ -24,7 +24,7 @@ mod wide_pk_validation;
 use super::sys_tables::*;
 use super::*;
 use gnitz_store::relation::SecondaryIndex;
-use gnitz_store::storage::Slot;
+use gnitz_store::schema::Slot;
 use gnitz_wire::{pack_pk_cols, TypeCode, PK_LIST_PACKED_FLAG};
 
 use std::fs;

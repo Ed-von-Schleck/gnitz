@@ -311,7 +311,7 @@ fn persisted_records_reads_well_formed_relation_manifests() {
     let alias = format!("{}/0{good}", relations_dir(&registry.base_dir));
     let alias_rows = rows.dir(&alias);
     std::fs::create_dir_all(&alias_rows).unwrap();
-    std::fs::copy(rows.manifest(&good_dir), format!("{alias_rows}/manifest.bin")).unwrap();
+    std::fs::copy(rows.manifest(&good_dir), rows.manifest(&alias)).unwrap();
 
     let records: Vec<(i64, Vec<u8>)> = registry
         .persisted_records()

@@ -2,19 +2,8 @@
 //! level structure it registers.
 
 use super::*;
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::BatchBuilder;
-
-/// `(id U64 PK | x I64)`, keyed.
-fn schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0],
-    )
-}
+use crate::test_support::make_schema_u64_i64;
 
 /// A `w{k}of{of}` child of `rel`, opened as the durable ingest path opens one.
 fn open_child(rel: &str, k: u32, of: u32) -> Table {
@@ -24,7 +13,7 @@ fn open_child(rel: &str, k: u32, of: u32) -> Table {
             slot: Slot::new(k, of),
         }
         .dir(rel),
-        schema(),
+        make_schema_u64_i64(),
         RecoverySource::SalReplay,
         StoreBudgets::default(),
     )
@@ -34,7 +23,7 @@ fn open_child(rel: &str, k: u32, of: u32) -> Table {
 /// Write `rel`'s complete 1-worker set holding `rows`, published.
 fn seed_set(rel: &str, rows: &[(u128, i64)]) {
     let mut t = open_child(rel, 0, 1);
-    let mut bb = BatchBuilder::new(schema());
+    let mut bb = BatchBuilder::new(make_schema_u64_i64());
     for &(pk, x) in rows {
         bb.begin_row(pk, 1);
         bb.put_int(x as u128);
@@ -55,7 +44,7 @@ fn a_relayout_writes_filtered_terminal_runs() {
     let rows: Vec<(u128, i64)> = (0..400u128).map(|id| (id, id as i64)).collect();
     seed_set(rel, &rows);
     // Each target passes the 4 KiB RAM tier only after several 64-row chunks.
-    repartition_relation(rel, &schema(), 2, 4096, 64).unwrap();
+    repartition_relation(rel, &make_schema_u64_i64(), 2, 4096, 64).unwrap();
 
     let mut keys = Vec::new();
     for k in 0..2 {
@@ -89,19 +78,13 @@ fn a_corrupt_source_body_fails_the_relayout_and_keeps_the_source_set() {
     let shards: Vec<_> = std::fs::read_dir(&source)
         .unwrap()
         .map(|e| e.unwrap().path())
-        .filter(|p| {
-            p.file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with(super::super::naming::SHARD_PREFIX)
-        })
+        .filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with("shard_"))
         .collect();
     assert_eq!(shards.len(), 1, "the seeded set flushed one shard");
     crate::test_support::flip_last_byte_in_place(&shards[0]);
 
     assert!(matches!(
-        repartition_relation(rel, &schema(), 2, 4096, 64),
+        repartition_relation(rel, &make_schema_u64_i64(), 2, 4096, 64),
         Err(StoreError::Storage {
             err: StorageError::Corrupt("body checksum"),
             ..

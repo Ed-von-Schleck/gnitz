@@ -298,7 +298,7 @@ fn union_merge_bench() {
         let t = Instant::now();
         let mut acc = 0usize;
         for _ in 0..ITERS {
-            acc += black_box(op_union(a.clone_batch(), &b, &schema).count);
+            acc += black_box(op_union(Batch::clone(&a), &b, &schema).count);
         }
         let secs = t.elapsed().as_secs_f64();
         println!(

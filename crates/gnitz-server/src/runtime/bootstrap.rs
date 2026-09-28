@@ -26,7 +26,7 @@ use crate::runtime::wire as ipc;
 use crate::runtime::worker::WorkerProcess;
 use gnitz_store::relation::{Relation, Residency};
 use gnitz_store::schema::SchemaDescriptor;
-use gnitz_store::storage::Slot;
+use gnitz_store::schema::Slot;
 
 // ---------------------------------------------------------------------------
 // SAL recovery: both drivers below read the log through `sal::zone::CommittedTail`

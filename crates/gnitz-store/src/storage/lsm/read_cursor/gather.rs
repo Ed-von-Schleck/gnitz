@@ -7,9 +7,9 @@
 //! a comparison. Each group is visited whole, at net weights in (PK, payload)
 //! order, so a chunk boundary never splits one.
 
-use super::super::batch::{Batch, Layout};
 use super::{ReadCursor, SkeletonKeys};
 use crate::schema::SchemaDescriptor;
+use crate::storage::repr::batch::{Batch, Layout};
 
 pub struct PkSetGather {
     cursor: ReadCursor,
@@ -46,7 +46,7 @@ impl PkSetGather {
         let cursor = match key_list_range(&keys, stride) {
             Some((lo, hi)) => open(lo, Some(hi)),
             // No key to gather, so nothing to open over.
-            None => super::empty(src_schema),
+            None => super::empty_cursor(src_schema),
         };
         PkSetGather { cursor, keys, next: 0 }
     }

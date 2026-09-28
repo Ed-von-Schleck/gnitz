@@ -83,6 +83,24 @@ pub(crate) fn fd_size(fd: c_int) -> std::io::Result<usize> {
     Ok(st.st_size as usize)
 }
 
+/// Create `dir` and any missing parent; whether this call created `dir`.
+pub fn create_dir(dir: &str) -> std::io::Result<bool> {
+    let path = std::path::Path::new(dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// `fsync` a directory so its entries are durable.
+pub fn fsync_dir(dir: &str) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
 /// Hint the kernel to back [ptr, ptr+size) with transparent hugepages.
 /// Best-effort: ignores errors and is a no-op for null ptr or size 0.
 /// For anonymous private memory: requires `enabled` = `madvise` or `always`.

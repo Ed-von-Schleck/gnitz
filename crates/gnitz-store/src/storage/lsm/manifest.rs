@@ -1,25 +1,20 @@
-use std::os::unix::fs::FileExt;
+use std::fs;
 
-use super::error::StorageError;
-use super::StagedFile;
+use super::naming::shard_path;
 use crate::schema::key::PkBuf;
 use crate::schema::MAX_PK_BYTES;
+use crate::storage::error::StorageError;
+use gnitz_foundation::posix_io::{create_dir, fsync_dir};
 use gnitz_wire::{decode_all, Reader, Writer};
 
 const MAGIC: u64 = 0x4D414E49464E5447;
-const VERSION: u64 = 15;
+const VERSION: u64 = 16;
 
 const MANIFEST_FILE: &str = "manifest.bin";
 
-/// The words a publish writes beside the shard set, for its caller to read back
-/// at the next open.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub(crate) struct ManifestStamp {
-    /// The ephemeral round's resume generation.
-    pub checkpoint_gen: u64,
-    /// The system round's SAL replay floor.
-    pub replay_floor: u64,
-}
+/// The suffix a manifest is staged under before its rename — also how startup
+/// GC names a stray one.
+pub(super) const STAGING_SUFFIX: &str = ".tmp";
 
 /// What a shard index publishes and reopens from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,7 +29,8 @@ pub(crate) struct ShardSet {
 /// restart.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Manifest {
-    pub stamp: ManifestStamp,
+    /// The owner's word for this publish, read back at the next open.
+    pub checkpoint_mark: u64,
     /// Bytes the store's owner publishes with its rows; opaque here.
     pub caller_record: Vec<u8>,
     pub shards: ShardSet,
@@ -58,8 +54,7 @@ pub(crate) fn encode(m: &Manifest) -> Vec<u8> {
     let mut w = Writer::new();
     w.u64(MAGIC)
         .u64(VERSION)
-        .u64(m.stamp.checkpoint_gen)
-        .u64(m.stamp.replay_floor)
+        .u64(m.checkpoint_mark)
         .u64(m.shards.run_bytes)
         .bytes32(&m.caller_record);
     for e in &m.shards.entries {
@@ -89,12 +84,11 @@ fn decode(buf: &[u8]) -> Result<Manifest, StorageError> {
 }
 
 fn decode_body(r: &mut Reader) -> Result<Manifest, String> {
-    let checkpoint_gen = r.u64()?;
-    let replay_floor = r.u64()?;
+    let checkpoint_mark = r.u64()?;
     let run_bytes = r.u64()?;
     let caller_record = r.bytes32()?.to_vec();
     let mut m = Manifest {
-        stamp: ManifestStamp { checkpoint_gen, replay_floor },
+        checkpoint_mark,
         caller_record,
         shards: ShardSet { run_bytes, entries: Vec::new() },
     };
@@ -115,18 +109,22 @@ fn decode_body(r: &mut Reader) -> Result<Manifest, String> {
 }
 
 // ---------------------------------------------------------------------------
-// File I/O (read + atomic write)
+// File I/O
 // ---------------------------------------------------------------------------
 
-/// `dir`'s manifest path.
-pub(crate) fn path(dir: &str) -> String {
-    format!("{dir}/{MANIFEST_FILE}")
+/// The manifest path of the store at `store_dir`.
+pub(crate) fn manifest_path(store_dir: &str) -> String {
+    format!("{store_dir}/{MANIFEST_FILE}")
+}
+
+fn staging_path(dir: &str) -> String {
+    format!("{}{STAGING_SUFFIX}", manifest_path(dir))
 }
 
 /// Read and decode `dir`'s manifest. `Ok(None)` when it does not exist yet;
 /// `Err` on damage or a failed read.
 pub(crate) fn read(dir: &str) -> Result<Option<Manifest>, StorageError> {
-    match std::fs::read(path(dir)) {
+    match fs::read(manifest_path(dir)) {
         Ok(buf) => decode(&buf).map(Some),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
@@ -141,23 +139,72 @@ pub(crate) fn read_intact(dir: &str) -> Result<Option<Manifest>, StorageError> {
     }
 }
 
-/// Stage `bytes` (an [`encode`]d manifest) as `dir`'s manifest. Does NOT
-/// fdatasync or rename.
-pub(crate) fn prepare(dir: &str, bytes: &[u8]) -> Result<StagedFile, StorageError> {
-    let (staged, file) = StagedFile::create(&path(dir))?;
-    file.write_all_at(bytes, 0)?;
-    Ok(staged)
+/// What the store at `store_dir` last published for its owner.
+pub(crate) struct Published {
+    pub checkpoint_mark: u64,
+    pub caller_record: Vec<u8>,
+}
+
+/// [`read_intact`], narrowed to what the store's owner published.
+pub(crate) fn published(store_dir: &str) -> Result<Option<Published>, StorageError> {
+    read_intact(store_dir).map(|o| {
+        o.map(|m| Published {
+            checkpoint_mark: m.checkpoint_mark,
+            caller_record: m.caller_record,
+        })
+    })
+}
+
+/// Stage `bytes` (an [`encode`]d manifest) beside `dir`'s manifest, returning
+/// the staged file's path. Does NOT fdatasync or rename.
+pub(crate) fn prepare(dir: &str, bytes: &[u8]) -> Result<String, StorageError> {
+    let tmp = staging_path(dir);
+    fs::write(&tmp, bytes)?;
+    Ok(tmp)
+}
+
+/// Rename the manifest [`prepare`] staged onto `dir`'s manifest path.
+pub(crate) fn commit(dir: &str) -> Result<(), StorageError> {
+    fs::rename(staging_path(dir), manifest_path(dir))?;
+    Ok(())
 }
 
 /// Durably unlink `dir`'s manifest; an absent manifest or directory is already
 /// unlinked.
 pub(crate) fn unlink(dir: &str) -> Result<(), StorageError> {
-    let absent_ok = |r: Result<(), StorageError>| match r {
-        Err(StorageError::Io(libc::ENOENT)) => Ok(()),
+    let absent_ok = |r: std::io::Result<()>| match r {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         r => r,
     };
-    absent_ok(std::fs::remove_file(path(dir)).map_err(StorageError::from))?;
-    absent_ok(crate::storage::fsync_dir(dir))
+    absent_ok(fs::remove_file(manifest_path(dir)))?;
+    Ok(absent_ok(fsync_dir(dir))?)
+}
+
+/// Retire the store at `store_dir`: once this returns `Ok`, no crash brings its
+/// manifest back. Removing the directory itself is best-effort.
+pub(crate) fn retire_store(store_dir: &str) -> Result<(), StorageError> {
+    unlink(store_dir)?;
+    // Without its manifest the directory holds no reachable rows.
+    match fs::remove_dir_all(store_dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            gnitz_warn!("storage: failed to remove retired store dir {}: {}", store_dir, e)
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Make `dst_dir` a durable hard-linked copy of the published store at `src_dir`.
+pub(crate) fn link_store(src_dir: &str, dst_dir: &str) -> Result<(), StorageError> {
+    let m = read(src_dir)?.ok_or(StorageError::Io(libc::ENOENT))?;
+    create_dir(dst_dir)?;
+    for e in &m.shards.entries {
+        fs::hard_link(shard_path(src_dir, e.seq), shard_path(dst_dir, e.seq))?;
+    }
+    // The shards are durable before a manifest names them.
+    fsync_dir(dst_dir)?;
+    fs::hard_link(manifest_path(src_dir), manifest_path(dst_dir))?;
+    Ok(fsync_dir(dst_dir)?)
 }
 
 // ---------------------------------------------------------------------------

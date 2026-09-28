@@ -4836,7 +4836,7 @@ impl Instance {
         let trace = Batch::concat(&schema, self.emitted.iter()).into_consolidated(&schema);
         let out = super::op_reduce::op_reduce(delta, &mut trace_cursor(trace, schema), None, &self.plan)
             .into_consolidated(&schema);
-        self.emitted.push(out.clone_batch());
+        self.emitted.push(Batch::clone(&out));
         out
     }
 }

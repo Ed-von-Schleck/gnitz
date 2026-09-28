@@ -10,12 +10,12 @@
 use std::ops::Range;
 use std::rc::Rc;
 
-use super::batch::Batch;
-use super::merge::ColumnarSource;
-use super::merge::{ColPtr, UnifiedSource};
-use super::scatter::DecodedColumns;
-use super::shard_reader::MappedShard;
 use crate::schema::SchemaDescriptor;
+use crate::storage::repr::batch::Batch;
+use crate::storage::repr::merge::ColumnarSource;
+use crate::storage::repr::merge::{ColPtr, UnifiedSource};
+use crate::storage::repr::scatter::DecodedColumns;
+use crate::storage::repr::shard_reader::MappedShard;
 use gnitz_expr::RowSource;
 
 #[derive(Clone)]
@@ -127,7 +127,7 @@ impl ColumnarSource for Run {
         decoded: &mut DecodedColumns,
     ) -> UnifiedSource<'_> {
         match self {
-            Run::Mem(b) => super::merge::mem_batch_to_unified(&b.as_mem_batch(), schema, cols),
+            Run::Mem(b) => crate::storage::repr::merge::mem_batch_to_unified(&b.as_mem_batch(), schema, cols),
             Run::Shard(s) => s.to_unified(schema, cols, window, decoded),
         }
     }

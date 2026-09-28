@@ -105,7 +105,7 @@ fn run_plan(host: &mut impl DriveHost, relay: &Relay, input: Batch, src_id: i64)
     let mut seeds = Vec::with_capacity(scanning.len());
     if let Some((&last, rest)) = scanning.split_last() {
         for &i in rest {
-            seeds.push(run_side(host, relay, i, input.clone_batch(), src_id)?);
+            seeds.push(run_side(host, relay, i, Batch::clone(&input), src_id)?);
         }
         seeds.push(run_side(host, relay, last, input, src_id)?);
     }
@@ -197,7 +197,7 @@ pub(crate) fn drive(host: &mut impl DriveHost, what: Drive, delta: Batch) -> Res
         // most two copies are live.
         let input = match *left {
             0 => outputs.remove(&step.producer),
-            _ => outputs.get(&step.producer).map(Batch::clone_batch),
+            _ => outputs.get(&step.producer).cloned(),
         }
         .expect("the schedule runs every producer before the steps it feeds");
         let needed = readers.contains_key(&step.view);

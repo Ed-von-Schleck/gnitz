@@ -1,4 +1,7 @@
-//! In-memory merge for run-set consolidation, and the two-way batch merge.
+//! The borrowed batch view [`MemBatch`], the columnar source abstraction and
+//! the direct row writer over it, German-string blob relocation, and the merges
+//! built on them: the N-way run merge, in-batch consolidation, and the two-way
+//! batch merge.
 //!
 //! Operates on flat columnar buffers: pk[OPK big-endian, `pk_stride` B/row],
 //! weight[i64 LE], null_bitmap[u64 LE], payload columns, blob arena.

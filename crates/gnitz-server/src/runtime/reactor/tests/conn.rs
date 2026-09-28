@@ -9,7 +9,7 @@ use std::time::Duration;
 use super::super::test_support::*;
 use super::*;
 use crate::runtime::test_support::try_poll_once;
-use gnitz_store::storage::batch_pool::PooledBuf;
+use gnitz_store::storage::PooledBuf;
 
 /// One whole-payload client send, with nothing racing it.
 async fn owned_send(r: &Reactor, conn: &Rc<ClientConn>, payload: Vec<u8>) -> Result<(), PeerGone> {
@@ -18,7 +18,7 @@ async fn owned_send(r: &Reactor, conn: &Rc<ClientConn>, payload: Vec<u8>) -> Res
 
 /// A pooled send buffer holding `bytes`.
 fn pooled(bytes: &[u8]) -> PooledBuf {
-    let mut b = gnitz_store::storage::batch_pool::acquire_buf();
+    let mut b = gnitz_store::storage::acquire_buf();
     b.extend_from_slice(bytes);
     PooledBuf(b)
 }
@@ -275,7 +275,7 @@ fn send_owned_evicts_a_client_that_never_drains() {
 #[test]
 #[ignore]
 fn fanout_coalesced_egress_bench() {
-    use gnitz_store::storage::batch_pool::acquire_buf;
+    use gnitz_store::storage::acquire_buf;
     use std::hint::black_box;
 
     const ITERS: usize = 3000;
