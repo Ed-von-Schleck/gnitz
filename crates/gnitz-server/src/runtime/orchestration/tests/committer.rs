@@ -119,7 +119,7 @@ fn a_barrier_ends_the_batch_and_leaves_what_is_behind_it() {
 #[test]
 fn a_leading_barrier_ends_the_batch_alone() {
     let (tx, mut rx) = chan::unbounded::<CommitRequest>();
-    tx.send(barrier_of(BarrierKind::Reclaim { forced: true }));
+    tx.send(barrier_of(BarrierKind::Shutdown));
     tx.send(push_of(1));
 
     let first = rx.try_recv().expect("queued");
@@ -134,7 +134,7 @@ fn group_of(reactor: &Reactor, tid: u64, write_err: Option<WireFault>) -> GroupI
     GroupInfo {
         tid,
         recoverable: true,
-        req_ids: reactor.lease_acks(1, "commit"),
+        lease: reactor.lease_acks("commit"),
         merged: Batch::empty_with_schema(&make_schema_u64_i64()),
         write_err,
     }

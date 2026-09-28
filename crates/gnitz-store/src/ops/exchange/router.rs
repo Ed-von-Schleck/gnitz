@@ -3,9 +3,9 @@
 
 use crate::schema::key::{locate_key_col, FoldCols, ReindexPacker};
 use crate::schema::Slot;
-use crate::schema::{worker_for_key, worker_for_pk_bytes, MAX_PK_BYTES};
+use crate::schema::{worker_for_key, worker_for_pk_bytes};
 use crate::schema::{ColumnLocator, OpBuildErr, SchemaDescriptor};
-use crate::storage::{run_merge, Batch, MemBatch};
+use crate::storage::{Batch, MemBatch};
 
 use super::super::group_key::GroupKey;
 
@@ -107,43 +107,24 @@ impl ScatterKey {
         })
     }
 
-    /// Route `mem` into `slots`, one per worker: with `merge`, each
-    /// (PK, payload) group once at its net weight; else every row of nonzero
-    /// weight — a weight-0 row is not a Z-set element.
-    pub(super) fn route(
-        &self,
-        mem: &[MemBatch],
-        schema: &SchemaDescriptor,
-        merge: bool,
-        slots: &mut [Vec<(u32, u32, i64)>],
-    ) {
+    /// Route every live row of `mb` — a weight-0 row is not a Z-set element —
+    /// into `slots`, one ascending row list per worker.
+    pub(super) fn route(&self, mb: &MemBatch, slots: &mut [Vec<u32>]) {
         let nw = slots.len();
         match *self {
-            ScatterKey::PkPrefix(n) => walk(mem, schema, merge, slots, PrefixW { n, nw }),
-            ScatterKey::Image(loc @ ColumnLocator::Payload { .. }) => {
-                walk(mem, schema, merge, slots, ImageW::<true> { loc, nw })
-            }
-            ScatterKey::Image(loc) => walk(mem, schema, merge, slots, ImageW::<false> { loc, nw }),
-            ScatterKey::Packed(ref packer) if merge => {
-                walk(mem, schema, merge, slots, PackedW { packer, n: packer.out_stride, nw })
-            }
-            ScatterKey::Packed(ref packer) => {
-                for (si, mb) in mem.iter().enumerate() {
-                    route_source_packed(mb, si as u32, slots, packer);
-                }
-            }
-            ScatterKey::Fold(ref fold) => walk(mem, schema, merge, slots, FoldW { fold, nw }),
+            ScatterKey::PkPrefix(n) => route_rows(mb, slots, PrefixW { n, nw }),
+            ScatterKey::Image(loc @ ColumnLocator::Payload { .. }) => route_rows(mb, slots, ImageW::<true> { loc, nw }),
+            ScatterKey::Image(loc) => route_rows(mb, slots, ImageW::<false> { loc, nw }),
+            ScatterKey::Packed(ref packer) => route_rows_packed(mb, slots, packer),
+            ScatterKey::Fold(ref fold) => route_rows(mb, slots, FoldW { fold, nw }),
         }
     }
 }
 
-type Scratch = [u8; MAX_PK_BYTES];
-
-/// One kind's per-row route, forced inline into its walk (a closure cannot be).
-/// The walk owns the scratch: a worker holding it would reload every field per
-/// row, its address escaping into `pack_into`.
+/// One kind's per-row route, forced inline into [`route_rows`] (a closure
+/// cannot be).
 trait RowWorker {
-    fn worker(&self, scratch: &mut Scratch, mb: &MemBatch, row: usize) -> usize;
+    fn worker(&self, mb: &MemBatch, row: usize) -> usize;
 }
 
 struct PrefixW {
@@ -153,7 +134,7 @@ struct PrefixW {
 
 impl RowWorker for PrefixW {
     #[inline(always)]
-    fn worker(&self, _: &mut Scratch, mb: &MemBatch, row: usize) -> usize {
+    fn worker(&self, mb: &MemBatch, row: usize) -> usize {
         worker_for_pk_bytes(&mb.get_pk_bytes(row)[..self.n], self.nw)
     }
 }
@@ -167,24 +148,9 @@ struct ImageW<const PAYLOAD: bool> {
 
 impl<const PAYLOAD: bool> RowWorker for ImageW<PAYLOAD> {
     #[inline(always)]
-    fn worker(&self, _: &mut Scratch, mb: &MemBatch, row: usize) -> usize {
+    fn worker(&self, mb: &MemBatch, row: usize) -> usize {
         assert!(matches!(self.loc, ColumnLocator::Payload { .. }) == PAYLOAD);
         worker_for_key(self.loc.opk_image(mb, row), self.nw)
-    }
-}
-
-struct PackedW<'a> {
-    packer: &'a ReindexPacker,
-    n: usize,
-    nw: usize,
-}
-
-impl RowWorker for PackedW<'_> {
-    #[inline(always)]
-    fn worker(&self, scratch: &mut Scratch, mb: &MemBatch, row: usize) -> usize {
-        let key = &mut scratch[..self.n];
-        self.packer.pack_into(key, mb, row);
-        worker_for_pk_bytes(key, self.nw)
     }
 }
 
@@ -195,64 +161,27 @@ struct FoldW<'a> {
 
 impl RowWorker for FoldW<'_> {
     #[inline(always)]
-    fn worker(&self, _: &mut Scratch, mb: &MemBatch, row: usize) -> usize {
+    fn worker(&self, mb: &MemBatch, row: usize) -> usize {
         worker_for_key(self.fold.key_row(mb, row, mb.get_null_word(row)), self.nw)
     }
 }
 
-#[inline(always)]
-fn walk(
-    mem: &[MemBatch],
-    schema: &SchemaDescriptor,
-    merge: bool,
-    slots: &mut [Vec<(u32, u32, i64)>],
-    w: impl RowWorker,
-) {
-    if merge {
-        route_merge(mem, schema, slots, &w)
-    } else {
-        for (si, mb) in mem.iter().enumerate() {
-            route_source(mb, si as u32, slots, &w);
-        }
-    }
-}
-
-/// One exemplar per (PK, payload) group, byte-equal to its members wherever a
-/// key can read, so it routes for all of them.
 #[inline(never)]
-fn route_merge<W: RowWorker>(mem: &[MemBatch], schema: &SchemaDescriptor, slots: &mut [Vec<(u32, u32, i64)>], w: &W) {
-    let mut scratch = [0u8; MAX_PK_BYTES];
-    run_merge(mem, schema, |si, row, wt| {
-        slots[merge_worker(w, &mut scratch, &mem[si], row)].push((si as u32, row as u32, wt))
-    });
-}
-
-/// Out of line: inlined into `run_merge`'s emit callback the route is slower on
-/// every kind.
-#[inline(never)]
-fn merge_worker<W: RowWorker>(w: &W, scratch: &mut Scratch, mb: &MemBatch, row: usize) -> usize {
-    w.worker(scratch, mb, row)
-}
-
-#[inline(never)]
-fn route_source<W: RowWorker>(mb: &MemBatch, si: u32, slots: &mut [Vec<(u32, u32, i64)>], w: &W) {
-    let mut scratch = [0u8; MAX_PK_BYTES];
+fn route_rows<W: RowWorker>(mb: &MemBatch, slots: &mut [Vec<u32>], w: W) {
     for row in 0..mb.count {
-        let wt = mb.get_weight(row);
-        if wt != 0 {
-            slots[w.worker(&mut scratch, mb, row)].push((si, row as u32, wt));
+        if mb.get_weight(row) != 0 {
+            slots[w.worker(mb, row)].push(row as u32);
         }
     }
 }
 
-/// [`route_source`] for a packed join key, packed a chunk of rows at a time.
+/// [`route_rows`] for a packed join key, packed a chunk of rows at a time.
 #[inline(never)]
-fn route_source_packed(mb: &MemBatch, si: u32, slots: &mut [Vec<(u32, u32, i64)>], packer: &ReindexPacker) {
+fn route_rows_packed(mb: &MemBatch, slots: &mut [Vec<u32>], packer: &ReindexPacker) {
     let nw = slots.len();
     packer.for_each_key(mb, packer.out_stride, |row, key| {
-        let wt = mb.get_weight(row);
-        if wt != 0 {
-            slots[worker_for_pk_bytes(key, nw)].push((si, row as u32, wt));
+        if mb.get_weight(row) != 0 {
+            slots[worker_for_pk_bytes(key, nw)].push(row as u32);
         }
     });
 }

@@ -19,8 +19,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use self::uring::IoUringRing;
 
-use crate::runtime::w2m::{W2mReceiver, W2mSlot, BOOT_READY_REQUEST_ID, W2M_EXCHANGE_RING_ID};
-use crate::runtime::wire::DecodedWire;
+use crate::runtime::w2m::{W2mReceiver, W2mSlot, BOOT_READY_REQUEST_ID};
 
 mod conn;
 mod futures;
@@ -176,10 +175,6 @@ struct ReactorShared {
     listeners: RefCell<Vec<conn::Listener>>,
     /// Shutdown flag. `block_until_shutdown` polls until this is set.
     shutdown: Cell<bool>,
-    /// Exchange frames, as `(worker, frame)`, awaiting their round's driver. The
-    /// queue exists from `Reactor::new`, so a frame published before the driver
-    /// awaits is delivered rather than dropped.
-    exchanges: RefCell<WakeQueue<(usize, DecodedWire)>>,
     /// Last: every `W2mSlot` the reactor holds, in a field or in a task, releases
     /// through it on drop.
     w2m: W2mReceiver,
@@ -233,7 +228,6 @@ impl Reactor {
             limits,
             listeners: RefCell::new(Vec::new()),
             shutdown: Cell::new(false),
-            exchanges: RefCell::new(WakeQueue::default()),
             w2m,
         });
         runloop::claim_thread();
@@ -249,24 +243,6 @@ impl Reactor {
     /// Future that completes at `deadline`.
     pub fn timer(&self, deadline: Instant) -> impl Future<Output = ()> {
         TimerFuture::new(deadline, Rc::clone(&self.inner))
-    }
-
-    /// The next exchange frame a worker published, as `(worker, frame)`. Rounds
-    /// are orchestration policy, assembled by the consumer. One awaiter at a time.
-    pub async fn next_exchange(&self) -> (usize, DecodedWire) {
-        struct Unpark<'a>(&'a RefCell<WakeQueue<(usize, DecodedWire)>>);
-        impl Drop for Unpark<'_> {
-            fn drop(&mut self) {
-                self.0.borrow_mut().unpark();
-            }
-        }
-        let _unpark = Unpark(&self.inner.exchanges);
-        std::future::poll_fn(|cx| {
-            let mut q = self.inner.exchanges.borrow_mut();
-            debug_assert!(!q.parked_elsewhere(cx.waker()), "two tasks await the exchange queue");
-            q.poll(cx)
-        })
-        .await
     }
 
     /// Route every unread slot of every worker's ring.

@@ -1,16 +1,16 @@
 use super::*;
 use crate::ops::group_key::GroupOutKey;
-use crate::schema::{Placement, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{Placement, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
 use crate::test_support::{make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64};
 
 /// The worker `key`'s linear walk sends each row of `mb` to, in row order.
-fn workers(key: &ScatterKey, schema: &SchemaDescriptor, mb: &MemBatch, nw: usize) -> Vec<usize> {
+fn workers(key: &ScatterKey, mb: &MemBatch, nw: usize) -> Vec<usize> {
     let mut pool = Vec::new();
     let slots = crate::storage::reset_slots(&mut pool, nw);
-    key.route(std::slice::from_ref(mb), schema, false, slots);
+    key.route(mb, slots);
     let mut out = vec![usize::MAX; mb.count];
     for (w, rows) in slots.iter().enumerate() {
-        for &(_, r, _) in rows {
+        for &r in rows {
             out[r as usize] = w;
         }
     }
@@ -69,7 +69,7 @@ fn test_scatter_key_packed_matches_image_routing() {
     fn packed(schema: &SchemaDescriptor, cols: &[u32], mb: &MemBatch, row: usize) -> usize {
         let key: Vec<gnitz_wire::ReindexSlot> = cols.iter().map(|&c| (c, None)).collect();
         let sk = ScatterKey::new(ScatterSpec::JoinKey(&key), schema).expect("the fixture key routes");
-        workers(&sk, schema, mb, NW)[row]
+        workers(&sk, mb, NW)[row]
     }
 
     // (1) non-null I64 payload; (2) NULL I64 payload (nullable col).
@@ -208,7 +208,7 @@ fn scatter_key_refuses_a_key_this_schema_cannot_route() {
 /// Run one `GroupKey` scatter's router over `row`.
 fn group_worker(schema: &SchemaDescriptor, cols: &[u32], b: &Batch, row: usize, nw: usize) -> usize {
     let key = ScatterKey::new(ScatterSpec::GroupKey(cols), schema).expect("the fixture key routes");
-    workers(&key, schema, &b.as_mem_batch(), nw)[row]
+    workers(&key, &b.as_mem_batch(), nw)[row]
 }
 
 /// Rows sharing a `Fold` routing key land on one worker whatever their PKs — the
@@ -332,7 +332,7 @@ fn every_accepted_spec_routes_each_row_to_its_tables_own_worker() {
                 }
                 accepted += 1;
                 let key = ScatterKey::new(spec, &schema).expect("an accepted spec routes");
-                let got = workers(&key, &schema, &mb, NW);
+                let got = workers(&key, &mb, NW);
                 for (row, &got) in got.iter().enumerate() {
                     assert_eq!(
                         got,
@@ -360,7 +360,7 @@ fn a_proper_prefix_group_key_is_refused_and_does_route_elsewhere() {
     let b = three_col_batch(&schema, 24);
     let mb = b.as_mem_batch();
     let key = ScatterKey::new(ScatterSpec::GroupKey(&cols), &schema).expect("the fixture key routes");
-    let got = workers(&key, &schema, &mb, NW);
+    let got = workers(&key, &mb, NW);
     assert!(
         (0..mb.count).any(|row| got[row] != schema.worker_for_pk(mb.get_pk_bytes(row), NW)),
         "the fold must disagree with the prefix hash somewhere"
@@ -436,7 +436,7 @@ fn a_group_scatter_routes_each_row_to_its_output_pks_owner() {
     ] {
         let (gk, _) = GroupOutKey::new(&schema, cols, []).expect("the fixture group keys");
         let key = ScatterKey::new(ScatterSpec::GroupKey(cols), &schema).expect("the fixture key routes");
-        let got = workers(&key, &schema, &mb, NW);
+        let got = workers(&key, &mb, NW);
         for (row, &got) in got.iter().enumerate() {
             assert_eq!(
                 got,
@@ -528,7 +528,7 @@ fn a_single_column_join_key_routes_by_the_image_the_map_packs() {
             schema.columns[c as usize].type_code
         );
         let packer = ReindexPacker::new(schema, &slots).expect("the fixture key packs");
-        let got = workers(&key, schema, &mb, NW);
+        let got = workers(&key, &mb, NW);
         let mut buf = [0u8; MAX_PK_BYTES];
         for (row, &got) in got.iter().enumerate() {
             let want = worker_for_pk_bytes(packer.pack_prefix(&mut buf, &mb, row), NW);
@@ -605,7 +605,7 @@ fn a_packed_linear_route_hashes_each_rows_own_packed_key() {
     let slots = [(1, Some(gnitz_wire::TypeCode::I64)), (2, None)];
     let key = ScatterKey::new(ScatterSpec::JoinKey(&slots), &schema).unwrap();
     let packer = ReindexPacker::new(&schema, &slots).unwrap();
-    let got = workers(&key, &schema, &mb, NW);
+    let got = workers(&key, &mb, NW);
     let mut buf = [0u8; MAX_PK_BYTES];
     for (row, &got) in got.iter().enumerate() {
         let want = match mb.get_weight(row) {

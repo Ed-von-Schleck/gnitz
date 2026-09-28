@@ -13,7 +13,6 @@ Hang detection is `thread.join` against the shared ceilings in `_serverproc`,
 which are deadlock detectors rather than performance budgets.
 """
 import threading
-import time
 
 import pytest
 import gnitz
@@ -218,51 +217,3 @@ def test_a_view_created_over_committed_data_survives_a_checkpoint_window(checkpo
                      schema_name="ckv")
     vid, _ = conn.resolve_table("ckv", "v")
     assert bag(conn.scan(vid), "g", "c") == {(g, n // 10): 1 for g in range(10)}
-
-
-def test_a_low_space_relay_reclaims_without_aborting_the_master(relay_lowspace_server):
-    """When SAL space runs low before an exchange relay, `relay_loop` fires a
-    committer barrier to reclaim via a checkpoint, rechecks, and fatally aborts
-    the master if space is still low. A barrier-only committer batch that
-    short-circuits without checkpointing never bumps the epoch, so the recheck
-    still reads low and the master aborts — an availability bug, since workers
-    self-exit via getppid().
-
-    The GROUP BY forces an exchange, and a few hundred rows from one serial
-    client stay well under TICK_COALESCE_ROWS, so the tick fires from the idle
-    timer with no push in flight: the reclaim barrier reaches the committer as a
-    barrier-only batch, which is exactly the path that used to abort."""
-    target, proc = relay_lowspace_server
-    with gnitz.connect(target) as client:
-        sn = "rls"
-        client.create_schema(sn)
-        client.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, "
-            "val BIGINT NOT NULL)", schema_name=sn)
-        client.execute_sql(
-            "CREATE VIEW v AS SELECT grp, SUM(val) AS total FROM t GROUP BY grp",
-            schema_name=sn)
-        vid, _ = client.resolve_table(sn, "v")
-
-        n = 300
-        client.execute_sql(
-            "INSERT INTO t VALUES " + ", ".join(f"({i}, 1, {i})" for i in range(1, n + 1)),
-            schema_name=sn)
-        expected = {(1, sum(range(1, n + 1))): 1}
-
-        # The exchange completes only once the relay is delivered, which requires
-        # the low-space barrier to have reclaimed via a checkpoint. Poll rather
-        # than read once: the injected relay failure is what the recovery here has
-        # to work around, so the first drain may legitimately not carry it.
-        got = None
-        deadline = time.time() + 30
-        while time.time() < deadline and proc.poll() is None:
-            got = bag(client.scan(vid), "grp", "total")
-            if got == expected:
-                break
-            time.sleep(0.1)
-
-        assert proc.poll() is None, (
-            "master aborted on a low-space exchange relay — the barrier-only "
-            "committer batch never checkpointed to reclaim SAL space")
-        assert got == expected, f"view never converged: {got} != {expected}"

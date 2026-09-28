@@ -21,18 +21,16 @@
 //!   `checkpoint_warranted` is the one statement of when.
 //! - **Barrier.**  A `Barrier` request flushes any in-flight batch and
 //!   signals via a oneshot — used by DDL to drain the committer before
-//!   catalog mutation, by a tick's relay to reclaim SAL space, and by the
-//!   graceful-shutdown watchdog (see `BarrierKind`).
+//!   catalog mutation, and by graceful shutdown (see `BarrierKind`).
 
 use super::executor::{request_drain, Shared};
 use super::guard_panic;
 use super::TxnFamily;
 use crate::runtime::master::FlushRound;
-use crate::runtime::reactor::{chan, oneshot, select2, AckLease, Either};
+use crate::runtime::reactor::{chan, oneshot, AckLease};
 use crate::runtime::sal::SalScope;
 use gnitz_store::storage::Batch;
 use gnitz_wire::WireFault;
-use std::future::Future;
 use std::rc::Rc;
 
 /// Row ceiling on one committer batch. Tested before the receive, so a batch is
@@ -50,12 +48,14 @@ pub enum CommitRequest {
     /// whole bundle. Validated and lock-guarded by the executor before it
     /// reaches here.
     Txn(PendingTxn),
-    /// Drain any in-flight batch and signal via `done`. `kind` decides how
-    /// the barrier interacts with a checkpoint sequence (see `BarrierKind`).
+    /// Drain any in-flight batch and signal via `done`. `kind` decides whether
+    /// the batch runs a checkpoint sequence (see `BarrierKind`).
     Barrier {
         kind: BarrierKind,
         done: oneshot::Sender<()>,
     },
+    /// Wake the committer so it re-tests `checkpoint_warranted`.
+    Reclaim,
 }
 
 /// One buffered atomic transaction awaiting commit: its families in frame order
@@ -67,29 +67,17 @@ pub struct PendingTxn {
     pub done: oneshot::Sender<Result<u64, WireFault>>,
 }
 
-/// Who issued a `CommitRequest::Barrier`, and therefore how the committer
-/// services it while a checkpoint sequence is in flight.
+/// Who issued a `CommitRequest::Barrier`, and therefore whether its batch runs a
+/// checkpoint sequence.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BarrierKind {
-    /// Relay-space barrier: serviced mid-sequence by a reclaim-only base round
-    /// (no gen re-bump) and signaled right after step 1, so the tick waiting on it
-    /// resumes before the drain it must serve.
-    ///
-    /// `forced` means the requester has a concrete byte requirement the
-    /// committer's own space test cannot see — a tick's relay sends it when the
-    /// relay it holds does not fit. The watchdog sends `false`: it fires on a
-    /// timer off the ambient watermark, which the committer re-reads itself.
-    Reclaim { forced: bool },
-    /// DDL drain from `handle_ddl_txn`: deferred to the end of a checkpoint
-    /// sequence (servicing it mid-sequence would interleave a CREATE VIEW's
-    /// exclusive backfill rounds).
+    /// DDL drain from `handle_ddl_txn`.
     Ddl,
     /// Graceful shutdown: forces the full checkpoint sequence on the batch it
-    /// arrives in regardless of SAL fullness, and resolves only at sequence
-    /// end (deferred like `Ddl`) — so its `done` implies the base + drain +
-    /// ephemeral rounds were all attempted. The drain's own failure path skips
-    /// the ephemeral round rather than aborting, precisely because Shutdown runs
-    /// here.
+    /// arrives in regardless of SAL fullness, so its `done` implies the base +
+    /// drain + ephemeral rounds were all attempted. The drain's own failure path
+    /// skips the ephemeral round rather than aborting, precisely because Shutdown
+    /// runs here.
     Shutdown,
 }
 
@@ -118,13 +106,13 @@ pub async fn run(mut rx: chan::Receiver<CommitRequest>, shared: Rc<Shared>) {
         // Drain any additional requests already queued — no timer wait.
         // Pipelined clients still get batched; serial clients don't pay
         // a latency tax.
-        let mut batch = drain_ready_batch(&mut rx, first);
+        let batch = drain_ready_batch(&mut rx, first);
 
         // Before this batch's groups, never after: workers bump their
         // expected_epoch on Flush, so a group written behind one in the same
         // epoch is silently skipped.
         if checkpoint_warranted(&shared, &batch) {
-            run_checkpoint_sequence(&mut rx, &shared, &mut batch).await;
+            run_checkpoint_sequence(&shared).await;
         }
 
         let PendingBatch { pushes, txns, barriers } = batch;
@@ -138,16 +126,9 @@ pub async fn run(mut rx: chan::Receiver<CommitRequest>, shared: Rc<Shared>) {
     }
 }
 
-/// Whether this batch warrants the full checkpoint sequence — barrier-only
-/// batches included, since a tick relay's low-space barrier arrives precisely to
-/// reclaim SAL space.
+/// Whether this batch warrants the full checkpoint sequence.
 fn checkpoint_warranted(shared: &Shared, batch: &PendingBatch) -> bool {
-    let forced = batch
-        .barriers
-        .iter()
-        .any(|(k, _)| matches!(k, BarrierKind::Shutdown | BarrierKind::Reclaim { forced: true }));
-    let sal = shared.disp().sal();
-    forced || sal.needs_checkpoint() || sal.below_reclaim_margin()
+    batch.barriers.iter().any(|(k, _)| matches!(k, BarrierKind::Shutdown)) || shared.disp().sal().needs_checkpoint()
 }
 
 /// One committer batch: the single pushes to group-commit, the atomic
@@ -156,10 +137,8 @@ fn checkpoint_warranted(shared: &Shared, batch: &PendingBatch) -> bool {
 struct PendingBatch {
     pushes: Vec<PendingPush>,
     txns: Vec<PendingTxn>,
-    /// The batch's barriers on the way in. `run_checkpoint_sequence` partitions
-    /// them — it signals the reclaim ones itself right after the base round —
-    /// so from that point on this holds only the barriers still owed a signal,
-    /// which the caller sends once the batch has committed.
+    /// The barriers to signal once the batch — and any checkpoint sequence —
+    /// has committed.
     barriers: Vec<(BarrierKind, oneshot::Sender<()>)>,
 }
 
@@ -195,6 +174,7 @@ fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitReques
                 b.barriers.push((kind, done));
                 break;
             }
+            CommitRequest::Reclaim => {}
         }
         next = (row_count < MAX_PENDING_ROWS).then(|| rx.try_recv()).flatten();
     }
@@ -212,96 +192,32 @@ async fn flush_round(shared: &Rc<Shared>, round: FlushRound) {
 }
 
 /// The full steady-state checkpoint sequence: gen bump → base round → drain →
-/// tick gate → ephemeral round. Signals the reclaim barriers right after step 1,
-/// and leaves `batch` holding the pushes it held across the sequence — folded
-/// with any that arrived mid-drain — plus the deferred DDL/Shutdown barriers,
-/// for the caller to commit and signal.
-async fn run_checkpoint_sequence(
-    rx: &mut chan::Receiver<CommitRequest>,
-    shared: &Rc<Shared>,
-    batch: &mut PendingBatch,
-) {
+/// tick gate → ephemeral round. Requests arriving meanwhile wait in the channel,
+/// so the pushes `batch` holds are the only ones the sequence runs ahead of.
+async fn run_checkpoint_sequence(shared: &Rc<Shared>) {
     // A DDL holding the tick gate has uncommitted families step 1 must not flush.
     if shared.tick_gate.is_write_held() {
         drop(shared.tick_gate.read().await);
     }
-    {
-        let disp = shared.disp();
-        let mut excl = disp.sal().lock().await;
-        disp.reclaim_base(&mut excl)
-            .await
-            .unwrap_or_else(|e| gnitz_fatal_abort!("{e}"));
-    }
+    shared
+        .disp()
+        .checkpoint_base()
+        .await
+        .unwrap_or_else(|e| gnitz_fatal_abort!("{e}"));
 
-    // Release the reclaim barriers now: step 1's reset already reclaimed space, and
-    // a tick waiting on one must finish before the tick loop can take the drain
-    // below. Deferring them past the drain would deadlock it. DDL/Shutdown
-    // barriers stay deferred to sequence end.
-    let (reclaim, deferred): (Vec<_>, Vec<_>) = std::mem::take(&mut batch.barriers)
-        .into_iter()
-        .partition(|(k, _)| matches!(k, BarrierKind::Reclaim { .. }));
-    batch.barriers = deferred;
-    for (_, b) in reclaim {
-        b.send(());
-    }
-
-    // Step 2 — DRAIN (lock released). One Drain suffices: the tick loop walks the
-    // source's full dependent closure with inline exchange rounds, and pushes are
-    // held so the pending-tick counts cannot grow. Mirrors the SCAN drain.
-    let drained = await_servicing(request_drain(shared), rx, batch, shared).await;
-    // Stamping now would make the views' missing deltas generation-valid; left
-    // behind step 1's generation, they are rebuilt at the next boot. Not an
-    // abort: this path also serves the Shutdown barrier.
-    if let Err(e) = drained {
+    // Step 2 — DRAIN (lock released). One Drain suffices: pushes are held, so the
+    // pending-tick counts cannot grow.
+    // Stamping after a failed drain would make the views' missing deltas
+    // generation-valid; left behind step 1's generation, they are rebuilt at the
+    // next boot. Not an abort: this path also serves the Shutdown barrier.
+    if let Err(e) = request_drain(shared).await {
         gnitz_warn!("checkpoint drain failed, skipping the ephemeral round: {}", e);
         return;
     }
 
-    // Step 3 — EPHEMERAL ROUND, with no tick running. A DDL since step 1 may
-    // have restamped already.
-    let _park = await_servicing(shared.tick_gate.write(), rx, batch, shared).await;
-    if shared.disp().derived_needs_restamp() {
-        flush_round(shared, FlushRound::Ephemeral).await;
-    }
-}
-
-/// Await `target` (a Drain `done` or the tick gate's write guard) while keeping
-/// the committer responsive: a reclaim barrier is serviced by a reclaim-only base
-/// round (so a draining tick's relay gets SAL space), DDL/Shutdown barriers are
-/// deferred to sequence end, and pushes are held for the folded commit. The
-/// target is re-polled after each serviced request, so no wakeup is lost.
-///
-/// Returns the target's payload. The Drain target carries the tick's verdict,
-/// which decides whether the sequence's ephemeral round may run.
-async fn await_servicing<T>(
-    mut target: impl Future<Output = T> + Unpin,
-    rx: &mut chan::Receiver<CommitRequest>,
-    batch: &mut PendingBatch,
-    shared: &Rc<Shared>,
-) -> T {
-    loop {
-        // `target` is `Unpin`, so `&mut target` is itself a Future.
-        match select2(&mut target, rx.recv()).await {
-            // Target fired: drain done, or the tick gate's write guard.
-            Either::A(v) => return v,
-            Either::B(CommitRequest::Barrier {
-                kind: BarrierKind::Reclaim { forced },
-                done,
-            }) => {
-                // Reclaim-only base round: no gen re-bump. Only for want of space,
-                // since step 1 already reset the SAL, and never under a DDL's tick
-                // gate, whose uncommitted families it would flush.
-                let ddl_inside = shared.tick_gate.is_write_held();
-                if !ddl_inside && (forced || shared.disp().sal().below_reclaim_margin()) {
-                    flush_round(shared, FlushRound::Base).await;
-                }
-                done.send(());
-            }
-            Either::B(CommitRequest::Barrier { kind, done }) => batch.barriers.push((kind, done)),
-            Either::B(CommitRequest::Push(p)) => batch.pushes.push(p),
-            Either::B(CommitRequest::Txn(txn)) => batch.txns.push(txn),
-        }
-    }
+    // Step 3 — EPHEMERAL ROUND, with no tick running.
+    let _park = shared.tick_gate.write().await;
+    flush_round(shared, FlushRound::Ephemeral).await;
 }
 
 /// One single-tid SAL group: a merged run of single pushes, or one transaction
@@ -311,7 +227,7 @@ struct GroupInfo {
     /// See `CommitRequest::Push::recoverable`. A merged run is homogeneous in
     /// `tid`, so one flag per group is exact.
     recoverable: bool,
-    req_ids: AckLease,
+    lease: AckLease,
     merged: Batch,
     write_err: Option<WireFault>,
 }
@@ -370,7 +286,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
     pushes.sort_by_key(|p| p.tid);
 
     let mut units: Vec<CommitUnit> = Vec::with_capacity(txns.len());
-    let alloc_req_ids = || shared.disp().reactor().lease_acks(1, "commit");
+    let lease_acks = || shared.disp().reactor().lease_acks("commit");
 
     // ------------------------------------------------------------------
     // Phase A (no lock): build merged batches + req_id allocations.
@@ -384,7 +300,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
                 .map(|fam| GroupInfo {
                     tid: fam.tid,
                     recoverable: true,
-                    req_ids: alloc_req_ids(),
+                    lease: lease_acks(),
                     merged: fam.batch,
                     write_err: None,
                 })
@@ -441,7 +357,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
             groups: vec![GroupInfo {
                 tid,
                 recoverable,
-                req_ids: alloc_req_ids(),
+                lease: lease_acks(),
                 merged,
                 write_err: None,
             }],
@@ -501,7 +417,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
     // ------------------------------------------------------------------
     {
         for g in units.iter().flat_map(|u| u.live()) {
-            if let Err(e) = g.req_ids.acks().await {
+            if let Err(e) = g.lease.acks().await {
                 // The group is durable and the other workers applied it: answering it
                 // would leave the SAL and this worker's partition disagreeing.
                 gnitz_fatal_abort!("worker rejected a committed group (tid={}): {}", g.tid, e);
@@ -561,7 +477,7 @@ fn lay_out_group(shared: &Rc<Shared>, scope: &SalScope, g: &GroupInfo) -> Result
     guard_panic("commit_write", || {
         shared
             .disp()
-            .write_commit_group(scope, g.tid, &g.merged, g.req_ids.id(0), g.recoverable)
+            .write_commit_group(scope, g.tid, &g.merged, g.lease.id(), g.recoverable)
     })
 }
 

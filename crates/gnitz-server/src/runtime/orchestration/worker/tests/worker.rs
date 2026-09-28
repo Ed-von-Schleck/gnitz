@@ -36,7 +36,8 @@ fn send_helpers_publish_on_the_request_id() {
 /// budget is pinned rather than read from the environment, so a shell that
 /// exports `GNITZ_REPLY_FRAME_BUDGET` does not reshape these frames.
 fn make_test_worker(catalog: *mut CatalogEngine, writer: W2mWriter) -> WorkerProcess {
-    let mut wp = WorkerProcess::new(catalog, unsafe { std::mem::zeroed() }, writer);
+    let mesh = crate::runtime::mesh::fixtures::meshes(1).pop().unwrap();
+    let mut wp = WorkerProcess::new(catalog, unsafe { std::mem::zeroed() }, writer, mesh);
     wp.reply_frame_budget = gnitz_wire::MAX_FRAME_PAYLOAD;
     wp
 }
@@ -71,13 +72,14 @@ fn control_frame(target_id: u64) -> &'static [u8] {
     )
 }
 
-/// A tick's control block: `target_id` and its round in `arg0`, as
-/// `write_tick_group` stamps them.
-fn tick_frame(target_id: u64, round: u64) -> &'static [u8] {
+/// A Tick group's slot: the first round in `arg0`, the tids in the blob, as
+/// `write_tick_group` lays them out.
+fn tick_frame(tids: &[u64], round: u64) -> &'static [u8] {
+    let blob: Vec<u8> = tids.iter().flat_map(|t| t.to_le_bytes()).collect();
     Box::leak(
         ipc::WireMsg {
-            target_id,
             arg0: round,
+            blob: &blob,
             ..Default::default()
         }
         .encode_to_vec()
@@ -86,8 +88,7 @@ fn tick_frame(target_id: u64, round: u64) -> &'static [u8] {
 }
 
 /// Build a worker that's safe for dispatch calls whose behavior
-/// does not enter the catalog (Tick/ExchangeRelay inside an exchange wait).
-/// A DdlSync slot's decode consults the catalog.
+/// does not enter the catalog. A DdlSync slot's decode consults the catalog.
 ///
 /// The W2M ring is unused by these arms; sal_reader is also unused
 /// because we drive the dispatchers directly.
@@ -95,27 +96,11 @@ fn make_worker_for_matrix() -> WorkerProcess {
     make_test_worker(std::ptr::null_mut(), unsafe { std::mem::zeroed() })
 }
 
-/// Tick inside an exchange wait MUST defer to `deferred_replay`,
-/// not run inline. Cited bug: an inline tick eval re-enters `view_id`
-/// with a different source and produces schema-mismatched relays.
-#[test]
-fn tick_defers_inside_exchange() {
-    let mut wp = make_worker_for_matrix();
-    assert!(wp.exchange.deferred_replay.is_empty());
-    assert!(wp
-        .dispatch_in_eval((100, 5), &bare_message(SalMessageKind::Tick, 999), tick_frame(999, 7))
-        .is_none());
-    assert_eq!(wp.exchange.deferred_replay.len(), 1);
-    let parked = &wp.exchange.deferred_replay[0];
-    assert_eq!(
-        (
-            parked.kind,
-            parked.wire.control.hdr.target_id,
-            parked.wire.control.hdr.arg0
-        ),
-        (SalMessageKind::Tick, 999, 7),
-        "the Tick's target and its round must both be carried into the replay queue"
-    );
+/// Decode `frame` as a `kind` group aimed at `target` and dispatch it as a
+/// group drained inside an exchange wait.
+fn dispatch_in_eval(wp: &mut WorkerProcess, kind: SalMessageKind, target: u64, frame: &'static [u8]) {
+    let req = wp.decode_request(&bare_message(kind, target), frame);
+    wp.dispatch_in_eval(req);
 }
 
 /// A read inside an exchange wait is parked with its whole request, in request
@@ -142,20 +127,10 @@ fn reads_defer_inside_exchange_in_request_order() {
         (SalMessageKind::DeltaRead, 77, 4242),
     ];
     for (kind, target, arg0) in reads {
-        assert!(wp
-            .dispatch_in_eval((100, 5), &bare_message(kind, target), frame(target, arg0))
-            .is_none());
+        dispatch_in_eval(&mut wp, kind, target, frame(target, arg0));
     }
-    assert!(
-        wp.exchange.deferred.is_empty(),
-        "a read is replayed after the ACK, not before it"
-    );
-    assert_eq!(
-        wp.exchange.deferred_replay.len(),
-        reads.len(),
-        "one queue, in SAL order"
-    );
-    for (parked, (kind, target, arg0)) in wp.exchange.deferred_replay.iter().zip(reads) {
+    assert_eq!(wp.deferred.len(), reads.len(), "one queue, in SAL order");
+    for (parked, (kind, target, arg0)) in wp.deferred.iter().zip(reads) {
         assert_eq!(parked.kind, kind);
         let ctrl = &parked.wire.control;
         let blob = &parked.wire.blob;
@@ -164,58 +139,9 @@ fn reads_defer_inside_exchange_in_request_order() {
     }
 }
 
-/// Encode a header-only ExchangeRelay wire frame (schema, no data batch)
-/// whose control header echoes `source_id` in `arg0`, as the master's
-/// `emit_relay` does. Leaked to `'static` for `dispatch`, which
-/// fail-stops on a frame that does not decode.
-fn encode_relay_frame(target_id: u64, source_id: u64, schema: &SchemaDescriptor, drained: bool) -> &'static [u8] {
-    // No data batch — a header-only relay. `arg0` echoes the source_id the
-    // waiter matches on; the default `flags.drained` is false.
-    let block = gnitz_store::schema::encode_schema_block(schema);
-    let msg = ipc::WireMsg {
-        target_id,
-        arg0: source_id,
-        flags: WireFlags { drained, ..Default::default() },
-        schema_block: Some(&block),
-        ..Default::default()
-    };
-    Box::leak(msg.encode_to_vec().into_boxed_slice())
-}
-
-/// Encode a wire frame carrying `batch` under `schema`. Leaked to `'static`
-/// for `dispatch`, which takes its payload from the SAL mapping.
-fn encode_data_frame(target_id: u64, schema: &SchemaDescriptor, batch: &Batch) -> &'static [u8] {
-    let block = gnitz_store::schema::encode_schema_block(schema);
-    let msg = ipc::WireMsg {
-        target_id,
-        schema_block: Some(&block),
-        data: ipc::WireData::Whole(batch),
-        ..Default::default()
-    };
-    Box::leak(msg.encode_to_vec().into_boxed_slice())
-}
-
-/// An ExchangeRelay inside an exchange wait whose `(view_id, source_id)` matches
-/// the wait comes back as a [`RelayHit`], carrying the relay's drained bit.
-#[test]
-fn a_matching_relay_ends_the_exchange_wait() {
-    let mut wp = make_worker_for_matrix();
-    let schema = make_schema_u64_i64();
-    let want_key = (100, 0);
-
-    for drained in [false, true] {
-        let frame = encode_relay_frame(100, 0, &schema, drained);
-        let hit = wp
-            .dispatch_in_eval(want_key, &bare_message(SalMessageKind::ExchangeRelay, 100), frame)
-            .expect("a key-matching relay must short-circuit out of the dispatcher with its batch");
-        assert_eq!(hit.drained, drained);
-        assert_eq!(hit.batch.len(), 0, "a header-only relay is an empty batch");
-    }
-}
-
 /// A request dispatched inside an exchange wait leaves a queued train unsent: a
-/// slow client can fill the ring, and a worker blocked on it would never read
-/// the relay it waits for.
+/// slow client can fill the ring, and a worker blocked on it would stall the
+/// round every peer waits on.
 #[test]
 fn a_queued_train_is_not_emitted_inside_an_exchange_wait() {
     let (region, writer) = ring_and_writer();
@@ -223,48 +149,30 @@ fn a_queued_train_is_not_emitted_inside_an_exchange_wait() {
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.send_reply(fifo_route(1, 5), make_n_row_batch(make_schema_u64_i64(), 3));
 
-    assert!(wp
-        .dispatch_in_eval((100, 5), &bare_message(SalMessageKind::Tick, 999), tick_frame(999, 7))
-        .is_none());
+    dispatch_in_eval(&mut wp, SalMessageKind::Scan, 999, control_frame(999));
 
     assert_eq!(wp.pending_streams.front().map(|t| t.next_row), Some(0));
     assert!(walk_frames(ptr).is_empty());
 }
 
-/// DdlSync inside an exchange wait MUST stage its batch in
-/// `exchange.deferred` rather than applying it: an inline catalog mutation
-/// races the in-flight DAG evaluation. (Adding a `SalMessageKind` without
-/// deciding its cell is already a compile error — `in_eval` is total — so
-/// what needs a test is the defer decision itself.)
+/// A `_sequences` DdlSync runs inline inside an exchange wait: dropped, queued
+/// nowhere, answered never.
 #[test]
-fn ddl_sync_defers_inside_exchange() {
-    let dir = crate::test_support::scratch_dir("worker", "ddl_sync_defers");
+fn a_sequences_ddl_sync_runs_inline_inside_an_exchange_wait() {
+    let dir = crate::test_support::scratch_dir("worker", "sequences_ddl_sync_inline");
     let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
-    let mut wp = make_test_worker(&mut engine, unsafe { std::mem::zeroed() });
-    let schema = make_schema_u64_i64();
+    let (region, writer) = ring_and_writer();
+    let mut wp = make_test_worker(&mut engine, writer);
+    let tid = SysFamily::Sequence.id();
 
-    let frame = encode_data_frame(42, &schema, &make_batch_raw(&schema, &[(1, 1, 10)]));
-    assert!(wp
-        .dispatch_in_eval((0, 0), &bare_message(SalMessageKind::DdlSync, 42), frame)
-        .is_none());
-    assert_eq!(
-        wp.exchange.deferred.len(),
-        1,
-        "DdlSync must stage its batch, not apply it"
-    );
-    assert_eq!(wp.exchange.deferred[0].wire.control.hdr.target_id, 42);
-    assert!(
-        wp.exchange.deferred_replay.is_empty(),
-        "DdlSync must not touch the post-ACK replay queue"
-    );
+    dispatch_in_eval(&mut wp, SalMessageKind::DdlSync, tid, control_frame(tid));
+    assert!(wp.deferred.is_empty(), "a `_sequences` DdlSync must not park");
+    assert!(walk_frames(region.ptr()).is_empty(), "a DdlSync is never answered");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `Flush` and `Push` run INLINE inside an exchange wait — neither queue may
-/// grow, and both must ACK from inside the wait. Flush is the deadlock cell: it
-/// would never ACK, so `flush_round` would hold its `SalExcl` forever and
-/// the tick's relay could never be written for the exchange this worker is
-/// parked on.
+/// `Flush` and `Push` run inline inside an exchange wait: neither parks, and
+/// both ACK from inside the wait.
 #[test]
 fn flush_and_push_run_inline_inside_exchange() {
     const SAL_SIZE: usize = 1 << 20;
@@ -284,11 +192,9 @@ fn flush_and_push_run_inline_inside_exchange() {
     // slot carries no rows, so the arm ACKs without reaching the store. What is
     // under test is the disposition, not the ingest.
     for kind in [SalMessageKind::Flush, SalMessageKind::Push] {
-        assert!(wp
-            .dispatch_in_eval((100, 5), &bare_message(kind, 7), control_frame(7))
-            .is_none());
+        dispatch_in_eval(&mut wp, kind, 7, control_frame(7));
         assert!(
-            wp.exchange.deferred.is_empty() && wp.exchange.deferred_replay.is_empty(),
+            wp.deferred.is_empty(),
             "{kind:?} must run inline inside an exchange wait, not park"
         );
     }
@@ -297,6 +203,34 @@ fn flush_and_push_run_inline_inside_exchange() {
         2,
         "each inline arm answers from inside the wait"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One Tick group carrying two tids ticks both — each drains its buffered
+/// delta — and ACKs once.
+#[test]
+fn a_two_tid_tick_group_ticks_both_and_acks_once() {
+    let dir = crate::test_support::scratch_dir("worker", "two_tid_tick");
+    let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
+    let schema = make_schema_u64_i64();
+    for tid in [500, 501] {
+        engine
+            .dag
+            .buffer_unticked(tid, make_batch_raw(&schema, &[(tid, 1, 10)]));
+    }
+    let (region, writer) = ring_and_writer();
+    let mut wp = make_test_worker(&mut engine, writer);
+
+    let req = wp.decode_request(&bare_message(SalMessageKind::Tick, 0), tick_frame(&[500, 501], 7));
+    wp.handle_request(req);
+
+    for tid in [500, 501] {
+        assert!(wp.cat().dag.take_unticked(tid).is_none(), "tid {tid} was ticked");
+    }
+    let frames = walk_frames(region.ptr());
+    assert_eq!(frames.len(), 1, "the group ACKs once");
+    let ctrl = gnitz_wire::control::peek_control_block(&frames[0].1).unwrap();
+    assert_eq!(ctrl.hdr.status, WireStatus::Ok);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -465,50 +399,23 @@ fn train_frames_fill_the_budget_to_within_one_row() {
     }
 }
 
-/// An exchange partition past the worker's frame budget goes out as a train on
-/// the exchange ring: every frame carries the round's ids and the drained bit,
-/// only the last is terminal, and the frames' rows are the partition in order.
+/// `fifo` is the whole difference between a splittable reply emitting inline
+/// and the same reply queueing through `pending_streams` — which is what puts a
+/// multi-scan's relations on the ring in request order. Either way its lone
+/// chunk is byte-shaped the same.
 #[test]
-fn an_exchange_partition_past_the_budget_is_a_multi_frame_train() {
-    let (region, writer) = ring_and_writer();
-    let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    wp.reply_frame_budget = 1024;
-    wp.publish_exchange(7, &make_n_row_batch(make_schema_u64_i64(), 200), 3, true);
-
-    let frames = walk_frames(region.ptr());
-    assert!(frames.len() > 1, "200 rows at a 1 KiB budget must span several frames");
-    let mut pks = Vec::new();
-    for (i, (ring_id, bytes)) in frames.iter().enumerate() {
-        assert_eq!(*ring_id, crate::runtime::w2m::W2M_EXCHANGE_RING_ID, "frame {i}");
-        let decoded = ipc::decode_wire_ipc(bytes).expect("an exchange frame decodes");
-        let hdr = &decoded.control.hdr;
-        assert_eq!((hdr.target_id, hdr.arg0), (7, 3), "frame {i}");
-        assert!(hdr.flags.drained, "frame {i}");
-        assert_eq!(hdr.flags.scan_last, i + 1 == frames.len(), "frame {i}");
-        if let Some(b) = decoded.data_batch {
-            pks.extend((0..b.len()).map(|r| b.get_pk(r)));
-        }
-    }
-    assert_eq!(pks, (0..200u128).collect::<Vec<_>>());
-}
-
-/// `force_fifo` is the whole difference between a splittable reply emitting
-/// inline and the same reply queueing through `pending_streams` — which is what
-/// puts a multi-scan's relations on the ring in request order. Either way its
-/// lone chunk is byte-shaped the same.
-#[test]
-fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
+fn fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
     let schema = make_schema_u64_i64();
-    for force_fifo in [false, true] {
+    for fifo in [false, true] {
         let (region, writer) = ring_and_writer();
         let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
 
-        let r = if force_fifo { fifo_route(1, 3) } else { route(1, 3) };
+        let r = if fifo { fifo_route(1, 3) } else { route(1, 3) };
         wp.send_reply(r, Rc::new(make_n_row_batch(schema, 5)));
 
-        if force_fifo {
-            assert_eq!(wp.pending_streams.len(), 1, "force_fifo must enqueue, not emit");
+        if fifo {
+            assert_eq!(wp.pending_streams.len(), 1, "fifo must enqueue, not emit");
             assert_eq!(wp.pending_streams.front().unwrap().next_row, 0);
             wp.emit_pending_scan_chunk();
         }
@@ -534,13 +441,13 @@ fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
     }
 }
 
-/// A `force_fifo` reply that fits goes out as ONE frame over the SOURCE batch —
+/// A `fifo` reply that fits goes out as ONE frame over the SOURCE batch —
 /// no sub-batch, so no copy and no heap relocation on the path every `scan_many`
 /// relation takes. The source carries dead heap bytes (what a blob-sharing
 /// filter produces), which a sub-batch would compact away: the frame's byte size
 /// is what tells the two paths apart.
 #[test]
-fn force_fifo_emits_a_fitting_reply_over_the_source_batch() {
+fn fifo_emits_a_fitting_reply_over_the_source_batch() {
     let schema = string_schema();
     let mut batch = long_string_batch(&schema, &[(1, "a long enough value"), (2, "another long value")]);
     batch.blob.extend_from_slice(&[0u8; 4096]);
@@ -558,7 +465,7 @@ fn force_fifo_emits_a_fitting_reply_over_the_source_batch() {
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.send_reply(fifo_route(1, 5), Rc::clone(&batch));
-    assert_eq!(wp.pending_streams.len(), 1, "force_fifo queues even a fitting reply");
+    assert_eq!(wp.pending_streams.len(), 1, "fifo queues even a fitting reply");
     assert!(walk_frames(ptr).is_empty(), "nothing is emitted at enqueue time");
 
     wp.emit_pending_scan_chunk();

@@ -272,7 +272,7 @@ pub enum ReindexRole {
     /// A re-key of rows a `ScatterKey` already placed.
     Auxiliary,
     /// The join key of `source`, in `source`'s own column indices, which is
-    /// what the master's relay scatters that delta by. The Map's own `key` is
+    /// what each worker scatters that delta by. The Map's own `key` is
     /// that key in this node's input layout; a `Map` in between moves one and
     /// not the other.
     ///

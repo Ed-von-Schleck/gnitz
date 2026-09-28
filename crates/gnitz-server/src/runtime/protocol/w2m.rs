@@ -20,8 +20,9 @@
 //!
 //! Each side parks on the cursor whose advance is the condition it waits for:
 //! the worker on `release_cursor` (space freed), the master on `write_cursor`
-//! (a message published). `sal_park` is the reverse channel's: the worker sleeps
-//! on it for a SAL group, and the master's [`SalWake`] ends the sleep.
+//! (a message published). `sal_park` is where a worker sleeps for a SAL group or
+//! an exchange round; a [`SalWake`] from the master, or from the peer that
+//! completes the round, ends the sleep.
 //!
 //! The master's armed bit lives in the `write_cursor` word ([`MasterPark`]), so a
 //! publish's `swap` takes it exactly when the master armed first. The writer's
@@ -34,14 +35,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use io_uring::types::FutexWaitV;
 
-use crate::runtime::wire::{decode_wire_ipc, DecodedWire, WireMsg};
+use crate::runtime::wire::WireMsg;
 use gnitz_foundation::posix_io;
 use gnitz_wire::control::{peek_control_block, DecodedControl};
-
-/// The ring id every worker exchange frame rides. The master's request-id
-/// counter never hands it out, so a ring prefix alone tells an exchange frame
-/// from a reply before anything decodes it.
-pub(crate) const W2M_EXCHANGE_RING_ID: u32 = u32::MAX;
 
 /// The request id every worker's boot verdict answers on.
 pub(crate) const BOOT_READY_REQUEST_ID: u32 = 1;
@@ -118,7 +114,7 @@ fn unpack_prefix(prefix: u64) -> (u32, u32) {
 
 /// The worker is parked on `release_cursor`.
 const FLAG_WRITER_PARKED: u32 = 1 << 0;
-/// The worker is parked on `sal_park` for a SAL group.
+/// The worker is parked on `sal_park` for a SAL group or an exchange round.
 const FLAG_SAL_PARKED: u32 = 1 << 1;
 /// Bit 63 of the `write_cursor` word: the reactor's `FUTEX_WAITV` is armed on
 /// it. Outside the low half the futex compares.
@@ -146,6 +142,14 @@ impl ParkWord {
     #[inline]
     fn publish(&self, virt: u64) -> u32 {
         self.cursor.swap(virt, Ordering::AcqRel);
+        self.flags.load(Ordering::Acquire)
+    }
+
+    /// [`Self::publish`] for a wake sequence any number of processes advance:
+    /// +1 always moves the low 32 bits.
+    #[inline]
+    fn bump(&self) -> u32 {
+        self.cursor.fetch_add(1, Ordering::AcqRel);
         self.flags.load(Ordering::Acquire)
     }
 
@@ -229,7 +233,7 @@ impl MasterPark {
 ///   64   writer_park.cursor   release_cursor: the reusable-bytes boundary
 ///   72   writer_park.flags    FLAG_WRITER_PARKED, cleared by the worker
 ///   80   capacity             immutable after init_region
-///   88   sal_park.cursor      a wake sequence, written by the master's SalWake
+///   88   sal_park.cursor      a wake sequence, bumped by every SalWake
 ///   96   sal_park.flags       FLAG_SAL_PARKED, set and cleared by the worker
 /// ```
 #[repr(C, align(64))]
@@ -466,7 +470,8 @@ fn wake_writer(park: &ParkWord, flags: u32) {
 // The SAL park: master→worker, on the worker's own ring
 // ---------------------------------------------------------------------------
 
-/// The master's wake for one worker parked on the SAL.
+/// A wake for one worker parked on its `sal_park`: the master's for a SAL group,
+/// a peer's for a completed exchange round.
 pub(crate) struct SalWake {
     park: &'static ParkWord,
 }
@@ -480,22 +485,20 @@ impl SalWake {
         }
     }
 
-    /// The master is the word's only writer; +1 always moves its low 32 bits.
     pub(crate) fn wake(&self) {
-        let seq = self.park.cursor.load(Ordering::Relaxed) + 1;
-        if self.park.publish(seq) & FLAG_SAL_PARKED != 0 {
+        if self.park.bump() & FLAG_SAL_PARKED != 0 {
             futex_wake_u32(futex_word(&self.park.cursor), 1, "SalWake::wake");
         }
     }
 }
 
-/// A worker's park on the SAL, ended by the master's [`SalWake`].
+/// A worker's park on the SAL and its exchange rounds, ended by a [`SalWake`].
 pub(crate) struct SalPark {
     park: &'static ParkWord,
 }
 
 impl SalPark {
-    /// Sleep until the master's next wake, unless `still_empty` says otherwise.
+    /// Sleep until the next wake, unless `still_empty` says otherwise.
     /// No timeout: `PR_SET_PDEATHSIG` kills the worker when the master dies.
     pub(crate) fn park(&self, still_empty: impl FnOnce() -> bool) {
         self.park.park(FLAG_SAL_PARKED, "SalPark::park", still_empty);
@@ -819,16 +822,8 @@ impl W2mSlot {
         self.frame
     }
 
-    /// Decode the slot's frame, aborting on failure: the ring is a trusted
+    /// The slot's control header, aborting on failure: the ring is a trusted
     /// mapping, so a malformed slot is corruption.
-    pub(crate) fn decode(&self) -> DecodedWire {
-        match decode_wire_ipc(self.bytes()) {
-            Ok(decoded) => decoded,
-            Err(e) => gnitz_fatal_abort!("w2m: worker={} slot decode failed: {:?} — ring corrupt", self.worker, e),
-        }
-    }
-
-    /// The slot's control header alone, aborting on failure as `decode` does.
     pub(crate) fn control(&self) -> DecodedControl {
         match peek_control_block(self.bytes()) {
             Ok(ctrl) => ctrl,

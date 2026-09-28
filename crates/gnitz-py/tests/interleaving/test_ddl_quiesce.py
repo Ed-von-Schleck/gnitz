@@ -1,10 +1,10 @@
 """A DDL issued while a tick is in flight waits for that tick, and what it changes
 is in force on every worker by the next statement.
 
-`GNITZ_INJECT_RELAY_HOLD_FOR_DDL` holds the server's first exchange relay, every
-worker parked in its exchange wait, until a DDL is waiting on the tick loop — so
-each DDL here provably lands on a mid-epoch tick. The seam is one-shot, so each
-case gets its own server.
+`GNITZ_INJECT_TICK_HOLD_FOR_DDL` holds the server's first tick in flight — its
+group written, the tick gate held, its ACKs outstanding — until a DDL is waiting
+on the tick gate, so each DDL here provably lands on a mid-epoch tick. The seam
+is one-shot, so each case gets its own server.
 """
 
 import gnitz
@@ -32,7 +32,7 @@ def test_a_ddl_during_an_in_flight_tick(seamed_server, before, ddl, after, read)
     show it; and a view created over the parked source must neither miss nor
     double-count the parked rows. The view the parked tick was maintaining still
     holds every source row once."""
-    c = seamed_server({"GNITZ_INJECT_RELAY_HOLD_FOR_DDL": "1"})
+    c = seamed_server({"GNITZ_INJECT_TICK_HOLD_FOR_DDL": "1"})
     c.create_schema("s")
     for sql in [*before,
                 "CREATE TABLE src (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",

@@ -47,16 +47,6 @@ impl<T> WakeQueue<T> {
         }
     }
 
-    /// Drop the parked waker, for an awaiter leaving before its value.
-    pub(super) fn unpark(&mut self) {
-        self.waker = None;
-    }
-
-    /// A waker other than `waker` is parked.
-    pub(super) fn parked_elsewhere(&self, waker: &Waker) -> bool {
-        self.waker.as_ref().is_some_and(|w| !w.will_wake(waker))
-    }
-
     /// Take the next value without parking. For a caller that must not await.
     pub(super) fn pop(&mut self) -> Option<T> {
         let v = self.queue.pop_front();

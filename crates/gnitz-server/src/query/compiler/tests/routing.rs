@@ -385,8 +385,8 @@ fn the_route_is_the_stated_one_not_the_reindex_nodes_own_key() {
     assert_eq!(join_cols(meta.source_route(7)), Some(vec![5]));
 }
 
-/// The relay scatters by the stated key mid-round, where a refusal aborts the
-/// master. A circuit is client-supplied, so a key the relation cannot route by —
+/// Workers scatter by the stated key mid-round, where a refusal is fatal. A
+/// circuit is client-supplied, so a key the relation cannot route by —
 /// here a column it has not got — is refused at derive instead.
 #[test]
 fn a_stated_route_the_relation_cannot_route_by_is_rejected() {

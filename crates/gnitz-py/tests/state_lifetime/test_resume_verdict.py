@@ -13,8 +13,6 @@ the view's Z-set. That marker is the only observable the distinction has.
 import pytest
 import gnitz
 from _read import bag, scanned
-from _schemas import KV
-from _serverproc import NEEDS_MULTI
 
 
 def _checkpoint_cut(srv, schema, workers=None):
@@ -194,49 +192,6 @@ def test_a_changed_worker_count_rebuilds_the_cut_plus_tail_exactly(own_server):
     with gnitz.connect(own_server.sock_path) as conn:
         assert bag(scanned(conn, "cc", "t"), "pk", "val") == {
             (k, k * 10): 1 for k in range(1, 11)}
-
-
-_ROWS = 40
-
-
-@NEEDS_MULTI  # a single worker's backfill never relays, so it never reclaims
-def test_a_backfill_reclaim_restamps_the_state_it_invalidated(own_server):
-    """A CREATE VIEW whose backfill reclaims the SAL invalidates every
-    checkpointed view and index; the window re-stamps them before it returns, so
-    an idle server killed right after resumes all of them."""
-    own_server.extra_env["GNITZ_LOG_LEVEL"] = "normal"
-
-    own_server.start()
-    with gnitz.connect(own_server.sock_path) as conn:
-        conn.create_schema("stale")
-        tid = conn.create_table("stale", "t", KV)
-        conn.execute_sql("CREATE INDEX ON t(val)", schema_name="stale")
-        conn.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t", schema_name="stale")
-    own_server.stop_graceful()
-
-    own_server.start(extra_env={"GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW": "1"})
-    with gnitz.connect(own_server.sock_path) as conn:
-        batch = gnitz.ZSetBatch(KV)
-        for i in range(_ROWS):
-            batch.append(pk=i, val=i * 10)
-        conn.push(tid, batch)
-        before = own_server.sal_checkpoints()
-        conn.execute_sql("CREATE VIEW v2 AS SELECT val, COUNT(*) AS c FROM t GROUP BY val",
-                         schema_name="stale")
-    assert own_server.sal_checkpoints() > before, "the backfill must have reclaimed"
-
-    own_server.stop()
-    own_server.start()
-    assert own_server.rebuilt_view_count() == 0, (
-        "the CREATE VIEW window must re-stamp the derived state it invalidated, "
-        "so every view resumes from its checkpoint")
-    assert own_server.rebuilt_index_counts() == [0] * own_server.workers, (
-        "the index the same reclaim invalidated must resume too")
-
-    with gnitz.connect(own_server.sock_path) as conn:
-        assert bag(scanned(conn, "stale", "v"), "pk", "val") == {
-            (i, i * 10): 1 for i in range(_ROWS)}, (
-            "the resumed view must hold every base row exactly once")
 
 
 def test_a_replaced_view_resumes_with_its_new_body(own_server):

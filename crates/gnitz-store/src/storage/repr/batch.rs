@@ -1345,8 +1345,8 @@ impl Batch {
         self.append_session(rows).push_ranges(src, ranges);
     }
 
-    /// All of `src` — the full-range decode/accumulate entry point (W2M ingest,
-    /// the master's index-scan merge).
+    /// All of `src` — the full-range decode/accumulate entry point (an exchange
+    /// gather, the master's index-scan merge).
     pub fn append_mem_batch(&mut self, src: &MemBatch<'_>) {
         self.append_ranges(src, &[(0, src.count)]);
     }

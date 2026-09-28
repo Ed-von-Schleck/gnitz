@@ -159,11 +159,11 @@ def second_schema(client):
 @NEEDS_MULTI
 def test_a_second_schemas_ddl_does_not_disturb_a_ticking_schema(
         client, schema_name, second_schema):
-    """Each schema's exchange relay stays bound to its own operand schema, and
+    """Each schema's exchange rounds stay bound to their own operand schema, and
     one table name in two schemas addresses two relations.
 
     The two facts differ in width (4 columns against 3) and the two view chains
-    in depth, so a relay that labelled its batches with the wrong side's schema
+    in depth, so an exchange that labelled its batches with the wrong side's schema
     would cross the two and produce wrong aggregates rather than none. Schema A
     is asserted once before B exists and again after B is fully live, with a
     further insert in between — that last insert is what makes A tick while B's
@@ -228,7 +228,7 @@ def test_a_second_schemas_ddl_does_not_disturb_a_ticking_schema(
     assert bag(scanned(client, b, "v3"), "label", "total", "cnt") == b3
     assert bag(scanned(client, b, "v5"), "label") == b5
 
-    # A ticks while B's chain is live: the relay must still be A's own.
+    # A ticks while B's chain is live: its exchange rounds must still be A's own.
     client.execute_sql(fact_rows(_NFACT + 1, _NFACT + 21), schema_name=a)
     assert bag(scanned(client, a, "v_agg"), "region", "total") == want_a(_NFACT + 21), "A after B"
 

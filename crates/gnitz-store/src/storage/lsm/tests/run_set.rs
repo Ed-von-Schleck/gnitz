@@ -124,7 +124,7 @@ fn lying_consolidated_run_is_rejected() {
     let mut set = RunSet::new(1 << 20);
 
     let mut bad = desc_two_row_batch(&schema);
-    bad.set_layout_unchecked(Layout::Consolidated);
+    bad.set_layout_unchecked(crate::storage::Layout::Consolidated);
     set.push(Rc::new(bad), &schema);
 }
 

@@ -323,10 +323,7 @@ fn a_leased_group_writes_only_its_set_on_one_id() {
         },
         ..DirectGroup::new(SalMessageKind::Scan)
     };
-    let predicted = log.writer.footprint(&group);
-    let before = log.cursor();
     log.writer.write(&group).expect("group fits");
-    assert_eq!((log.cursor() - before) as usize, predicted);
     log.writer
         .write(&DirectGroup::new(SalMessageKind::Scan))
         .expect("group fits");
@@ -580,7 +577,7 @@ fn a_rolled_back_transaction_publishes_nothing() {
         ..DirectGroup::new(SalMessageKind::DdlSync)
     };
     let head = [0u8; 64];
-    let need = TestLog::new(1 << 20, 1, 1).writer.footprint(&family(2));
+    let need = TestLog::new(1 << 20, 1, 1).footprint(&family(2));
     let head_size = PREFIX_BYTES + group_header_size(1) + head.len().next_multiple_of(8);
     let log = TestLog::new(PREFIX_BYTES + CHECKPOINT_RESERVE + head_size + need + need / 2, 1, 1);
 
@@ -657,60 +654,6 @@ fn an_uncommitted_scope_publishes_nothing() {
     assert!(matches!(log.log().read_at(before, EpochGate::Live(1)), SalStep::Absent));
 }
 
-// ---------------------------------------------------------------------------
-// Footprint exactness: the exchange relay sizes its group before taking the SAL
-// lock and writes it after.
-// ---------------------------------------------------------------------------
-
-/// `footprint` must equal what `write` consumes: a prediction below the truth
-/// turns a reclaim-and-retry into a fatal refusal on a relay no worker can go
-/// without.
-///
-/// Both an empty slot and a populated one are covered: a dataless
-/// `ExchangeRelay` slot still carries the group's schema block, so only the data
-/// block distinguishes them.
-#[test]
-fn footprint_equals_emitted_bytes() {
-    use crate::runtime::wire::WireMsg;
-    use crate::test_support::{make_batch, make_schema_u64_i64};
-    use gnitz_store::storage::Batch;
-
-    let nw = 4;
-    let schema = make_schema_u64_i64();
-    let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-    let block = gnitz_store::schema::encode_schema_block(&schema);
-
-    let log = TestLog::new(1 << 20, nw, 1);
-
-    // Slot 2 stays empty: the relay passes an empty batch for a zero-row worker.
-    let slots = [
-        Batch::clone(&batch),
-        Batch::clone(&batch),
-        Batch::empty_with_schema(&schema),
-        Batch::clone(&batch),
-    ];
-    let group = DirectGroup {
-        template: WireMsg {
-            target_id: 16,
-            arg0: 7,
-            arg1: 1,
-            schema_block: Some(&block),
-            ..Default::default()
-        },
-        data: GroupData::Batches(&slots),
-        ..DirectGroup::new(SalMessageKind::ExchangeRelay)
-    };
-
-    let predicted = log.writer.footprint(&group);
-    let before = log.cursor();
-    log.writer.write(&group).expect("group fits");
-    assert_eq!(
-        (log.cursor() - before) as usize,
-        predicted,
-        "footprint must equal emitted bytes"
-    );
-}
-
 /// A group carrying per-worker extras writes each slot its own blob,
 /// sized to that blob rather than to the template's.
 #[test]
@@ -730,10 +673,8 @@ fn a_group_with_per_worker_extras_writes_each_slot_its_own_blob() {
         ..DirectGroup::new(SalMessageKind::ScanSpec)
     };
 
-    let predicted = log.writer.footprint(&group);
     let before = log.cursor();
     log.writer.write(&group).expect("group fits");
-    assert_eq!((log.cursor() - before) as usize, predicted);
 
     let msg = group_at(log.log(), before);
     for (w, extra) in extras.iter().enumerate() {
@@ -1011,13 +952,11 @@ fn a_replicated_push_sends_every_worker_the_live_rows() {
 
 /// A `Push` slot the scatter gave no rows carries a control block and nothing
 /// else: the schema block would describe data the slot does not hold, and every
-/// consumer reaches its own no-op before asking for one. An `ExchangeRelay`'s
-/// empty slot keeps its block — there the schema *is* the payload.
+/// consumer reaches its own no-op before asking for one.
 #[test]
 fn a_rowless_push_slot_carries_no_schema_block() {
-    use crate::runtime::wire::{decode_sal_slot, WireMsg};
+    use crate::runtime::wire::decode_sal_slot;
     use crate::test_support::{make_batch, make_schema_u64_i64};
-    use gnitz_store::storage::Batch;
 
     let nw = 4;
     let schema = make_schema_u64_i64();
@@ -1044,35 +983,6 @@ fn a_rowless_push_slot_carries_no_schema_block() {
         }
     }
     assert_eq!(with_rows, 1, "one row routes to exactly one worker");
-
-    // The relay's own empty slot is the counter-case, on the same writer.
-    let block = gnitz_store::schema::encode_schema_block(&schema);
-    let empty = [
-        Batch::empty_with_schema(&schema),
-        Batch::empty_with_schema(&schema),
-        Batch::empty_with_schema(&schema),
-        Batch::empty_with_schema(&schema),
-    ];
-    let base = log.cursor();
-    log.writer
-        .write(&DirectGroup {
-            template: WireMsg {
-                target_id: 16,
-                schema_block: Some(&block),
-                ..Default::default()
-            },
-            data: GroupData::Batches(&empty),
-            ..DirectGroup::new(SalMessageKind::ExchangeRelay)
-        })
-        .expect("group fits");
-    let relay = group_at(log.log(), base);
-    for (w, bytes) in relay.slots_written() {
-        let decoded = decode_sal_slot(bytes, |_, _| None).expect("every written slot decodes");
-        assert!(
-            decoded.schema.is_some(),
-            "relay slot {w} builds its empty batch from the block"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------

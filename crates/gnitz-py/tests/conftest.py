@@ -390,19 +390,6 @@ def unique_preflight_spill_server(seamed_server):
 
 
 @pytest.fixture
-def relay_lowspace_server(dedicated_server):
-    """Server with the one-shot low-relay-space seam (GNITZ_INJECT_RELAY_SPACE_LOW)
-    armed, for the barrier-only-checkpoint reclaim test. Unlike the other seam
-    fixtures it yields `(target, proc)` so the test can assert the master is
-    still alive after the low-space relay.
-
-    No GNITZ_CHECKPOINT_BYTES override — the only checkpoint in the green run is
-    the injected one, keeping the view results reliable."""
-    srv = dedicated_server({"GNITZ_INJECT_RELAY_SPACE_LOW": "1"})
-    return srv.target, srv.proc
-
-
-@pytest.fixture
 def tick_emit_fault_server(seamed_server):
     """Server whose first *replied* master-side tick emission fails, reproducing
     what a full SAL does to a tick. The CREATE's own view-seeding drain writes a
@@ -413,11 +400,10 @@ def tick_emit_fault_server(seamed_server):
 
 @pytest.fixture
 def tiny_sal_server(dedicated_server):
-    """SAL pinned to its 16 MiB floor with the checkpoint threshold above the
-    watchdog's 1/8-free line, so the watchdog is the ONLY thing that can reclaim
-    — a committer checkpoint at the default 3/4 threshold would otherwise reset
-    the cursor first and the test would pass with the watchdog deleted. Both are
-    real config knobs honoured in every build."""
+    """SAL pinned to its 16 MiB floor with the checkpoint threshold at 15 MiB,
+    high enough that the test's pushes stop short of it and only its reads cross
+    it — so the watchdog, which fires at the threshold, is the ONLY thing that
+    can reclaim. Both are real config knobs honoured in every build."""
     srv = dedicated_server({
         "GNITZ_SAL_BYTES": str(16 * 1024 * 1024),
         "GNITZ_CHECKPOINT_BYTES": str(15 * 1024 * 1024),

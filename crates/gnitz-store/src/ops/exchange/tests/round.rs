@@ -9,8 +9,17 @@ use crate::test_support::{
 use gnitz_wire::TypeCode;
 use std::cmp::Ordering;
 
-fn scatter(sources: &[&Batch], spec: ScatterSpec<'_>, schema: &SchemaDescriptor, num_workers: usize) -> Vec<Batch> {
-    op_relay_scatter(sources, spec, schema, num_workers).expect("the fixture key routes")
+/// `batch` routed by `spec`, each worker's rows copied out.
+fn scatter(batch: &Batch, spec: ScatterSpec<'_>, num_workers: usize) -> Vec<Batch> {
+    let mut pool = Vec::new();
+    let rows = op_exchange_route(batch, spec, &mut pool, num_workers).expect("the fixture key routes");
+    rows.iter().map(|r| batch.ascending_subset(r)).collect()
+}
+
+/// [`op_exchange_gather`] over owned slices.
+fn gather(slices: &[&Batch], schema: &SchemaDescriptor) -> Batch {
+    let mem: Vec<MemBatch> = slices.iter().map(|b| b.as_mem_batch()).collect();
+    op_exchange_gather(&mem, schema, slices.iter().all(|b| b.is_consolidated()))
 }
 
 fn total_rows(batches: &[Batch]) -> usize {
@@ -30,19 +39,17 @@ fn consolidated_opk(schema: &SchemaDescriptor, rows: &[(&[u8], i64, i64)]) -> Ba
     b
 }
 
-/// A label, the schema and routing columns, the sources, and whether they are
+/// A label, the routing columns, the sources, and whether they are
 /// consolidated.
-type PkCase<'a> = (&'a str, &'a SchemaDescriptor, &'a [u32], Vec<Batch>, bool);
+type PkCase<'a> = (&'a str, &'a [u32], Vec<Batch>, bool);
 
-/// Routing and the layout claim across the PK widths whose orderings disagree:
+/// Routing across the PK widths whose orderings disagree, and a consolidated
+/// batch's slices keeping its order:
 /// a (U64, U64) read as one u128 reverses column priority, a native I64 sorts
 /// negatives last without the encoder's sign flip, and the 3×U64 sources share
 /// a 16-byte OPK prefix and carry a byte-equal PK at two payloads.
-///
-/// One consolidated source is the replicated / muted shape, where only one
-/// worker publishes rows.
 #[test]
-fn pk_routed_scatter_routes_and_claims_by_the_gate() {
+fn pk_routed_scatter_routes_every_row_to_its_owner() {
     let nw = 4;
 
     let u64_s = make_schema_u64_i64();
@@ -64,7 +71,6 @@ fn pk_routed_scatter_routes_and_claims_by_the_gate() {
     let cases: Vec<PkCase> = vec![
         (
             "u64 pk, one consolidated source",
-            &u64_s,
             &[0],
             vec![make_batch(
                 &u64_s,
@@ -81,7 +87,6 @@ fn pk_routed_scatter_routes_and_claims_by_the_gate() {
         ),
         (
             "u64 pk, two consolidated sources",
-            &u64_s,
             &[0],
             vec![
                 make_batch(&u64_s, &[(1, 1, 10), (5, 1, 50), (9, 1, 90)]),
@@ -91,7 +96,6 @@ fn pk_routed_scatter_routes_and_claims_by_the_gate() {
         ),
         (
             "u64 pk, two raw sources",
-            &u64_s,
             &[0],
             vec![
                 make_batch_raw(&u64_s, &[(5, 1, 50), (1, 1, 10)]),
@@ -101,7 +105,6 @@ fn pk_routed_scatter_routes_and_claims_by_the_gate() {
         ),
         (
             "u128 pk, one consolidated source",
-            &u128_s,
             &[0],
             vec![make_batch_u128(
                 &u128_s,
@@ -116,7 +119,6 @@ fn pk_routed_scatter_routes_and_claims_by_the_gate() {
         ),
         (
             "i64 pk, two consolidated sources",
-            &i64_s,
             &[0],
             vec![
                 make_batch_i64pk(&i64_s, &[(-100, 1, 10), (-1, 1, 11), (5, 1, 12)]),
@@ -126,7 +128,6 @@ fn pk_routed_scatter_routes_and_claims_by_the_gate() {
         ),
         (
             "2xu64 compound pk, three consolidated sources",
-            &comp_s,
             &[0, 1],
             vec![
                 consolidated_opk(&comp_s, &[(&c1_10, 1, 11), (&c2_0, 1, 12), (&c5_9, 1, 13)]),
@@ -137,7 +138,6 @@ fn pk_routed_scatter_routes_and_claims_by_the_gate() {
         ),
         (
             "3xu64 wide pk, three consolidated sources",
-            &wide_s,
             &[0, 1, 2],
             vec![
                 make_wide_batch(&wide_s, &[(0, 0, 0, 1, 10), (1, 1, 1, 1, 11), (1, 1, 256, 1, 12)]),
@@ -156,77 +156,56 @@ fn pk_routed_scatter_routes_and_claims_by_the_gate() {
         ),
     ];
 
-    for (label, schema, cols, srcs, consolidated) in cases {
-        let refs: Vec<&Batch> = srcs.iter().collect();
+    for (label, cols, srcs, consolidated) in cases {
         assert_eq!(
-            refs.iter().all(|b| b.is_consolidated()),
+            srcs.iter().all(|b| b.is_consolidated()),
             consolidated,
-            "{label}: the fixture must reach the arm it is written for"
+            "{label}: the fixture must carry the claim it is written for"
         );
-        let out = scatter(&refs, ScatterSpec::GroupKey(cols), schema, nw);
-        assert_eq!(out.len(), nw, "{label}: one batch per worker");
-        assert_eq!(
-            total_rows(&out),
-            srcs.iter().map(|b| b.count).sum::<usize>(),
-            "{label}: no dropped or duplicated rows"
-        );
+        for src in &srcs {
+            let out = scatter(src, ScatterSpec::GroupKey(cols), nw);
+            assert_eq!(out.len(), nw, "{label}: one batch per worker");
+            assert_eq!(total_rows(&out), src.count, "{label}: no dropped or duplicated rows");
 
-        for (w, sb) in out.iter().enumerate() {
-            for r in 0..sb.count {
-                assert_eq!(
-                    worker_for_pk_bytes(sb.get_pk_bytes(r), nw),
-                    w,
-                    "{label}: row {r} on the wrong worker"
-                );
-            }
-            if sb.count == 0 {
-                continue;
-            }
-            // The tag, not `is_consolidated()`, which is vacuous under two rows.
-            let want = if consolidated {
-                Layout::Consolidated
-            } else {
-                Layout::Raw
-            };
-            assert_eq!(sb.layout(), want, "{label}: worker {w} layout");
-            if !consolidated {
-                // Per-source concatenated, so only routing and conservation hold.
-                continue;
-            }
-            for r in 1..sb.count {
-                let by_pk = compare_pk_bytes(sb.get_pk_bytes(r - 1), sb.get_pk_bytes(r));
-                let strictly_up =
-                    by_pk == Ordering::Less || (by_pk == Ordering::Equal && payload(sb, r - 1) < payload(sb, r));
-                assert!(
-                    strictly_up,
-                    "{label}: worker {w} row {r} not strictly (PK, payload)-ascending"
-                );
+            for (w, sb) in out.iter().enumerate() {
+                for r in 0..sb.count {
+                    assert_eq!(
+                        worker_for_pk_bytes(sb.get_pk_bytes(r), nw),
+                        w,
+                        "{label}: row {r} on the wrong worker"
+                    );
+                }
+                if sb.count == 0 || !consolidated {
+                    continue;
+                }
+                // The tag, not `is_consolidated()`, which is vacuous under two rows.
+                assert_eq!(sb.layout(), Layout::Consolidated, "{label}: worker {w} layout");
+                for r in 1..sb.count {
+                    let by_pk = compare_pk_bytes(sb.get_pk_bytes(r - 1), sb.get_pk_bytes(r));
+                    let strictly_up =
+                        by_pk == Ordering::Less || (by_pk == Ordering::Equal && payload(sb, r - 1) < payload(sb, r));
+                    assert!(
+                        strictly_up,
+                        "{label}: worker {w} row {r} not strictly (PK, payload)-ascending"
+                    );
+                }
             }
         }
     }
 }
 
-/// The linear arm drops weight-0 rows and claims nothing. The fixture is
-/// multi-row and out of order because `is_consolidated` answers `true` for any
-/// batch of under two live rows, certified or not.
+/// A weight-0 row is not a Z-set element, so no worker is sent it.
 #[test]
-fn the_linear_arm_drops_weight_zero_rows_and_claims_nothing() {
+fn the_route_drops_weight_zero_rows() {
     let schema = make_schema_u64_i64();
-    let nw = 4;
-    let b0 = make_batch_raw(&schema, &[(5, 1, 50), (1, 1, 10), (3, 0, 30)]);
-    let b1 = make_batch_raw(&schema, &[(9, 1, 90), (2, 1, 20), (7, 0, 70)]);
-    assert!(
-        !b0.is_consolidated() && !b1.is_consolidated(),
-        "the fixture must reach the linear arm"
+    let b = make_batch_raw(
+        &schema,
+        &[(5, 1, 50), (1, 1, 10), (3, 0, 30), (9, 1, 90), (2, 1, 20), (7, 0, 70)],
     );
-
-    let out = scatter(&[&b0, &b1], ScatterSpec::GroupKey(&[0u32]), &schema, nw);
+    let out = scatter(&b, ScatterSpec::GroupKey(&[0u32]), 4);
     assert_eq!(total_rows(&out), 4, "both weight-0 rows are dropped");
     let mut keys: Vec<u64> = Vec::new();
     for (w, sb) in out.iter().enumerate() {
-        if sb.count > 0 {
-            assert_eq!(sb.layout(), Layout::Raw, "worker {w}: the linear arm claims nothing");
-        }
         for r in 0..sb.count {
             assert_ne!(sb.get_weight(r), 0, "worker {w} row {r}: a ghost reached the output");
             keys.push(sb.get_pk(r) as u64);
@@ -243,64 +222,106 @@ fn a_keyless_group_scatter_routes_every_row_to_the_ground_owner() {
     let schema = make_schema_u64_i64();
     let b = make_batch_raw(&schema, &[(5, 1, 50), (1, 1, 10), (9, -1, 90)]);
     for nw in [1, 2, 3, 4, 7, 16, 64] {
-        let out = scatter(&[&b], ScatterSpec::GroupKey(&[]), &schema, nw);
+        let out = scatter(&b, ScatterSpec::GroupKey(&[]), nw);
         let owner = ground_owner(nw);
         assert_eq!(out[owner].count, 3, "nw={nw}: every row reaches worker {owner}");
         assert_eq!(total_rows(&out), 3, "nw={nw}: no row reaches another worker");
     }
 }
 
-/// An empty round still yields one batch per worker, and still refuses a spec
-/// this schema cannot route — the key is built before any row is read.
+/// An empty round still yields one row list per worker, and still refuses a
+/// spec this schema cannot route — the key is built before any row is read.
 #[test]
-fn an_empty_round_yields_one_empty_batch_per_worker_and_still_refuses() {
+fn an_empty_round_yields_one_empty_list_per_worker_and_still_refuses() {
     let schema = make_schema_u64_i64();
-    let out = scatter(&[], ScatterSpec::GroupKey(&[0u32]), &schema, 4);
+    let empty = Batch::empty_with_schema(&schema);
+    let out = scatter(&empty, ScatterSpec::GroupKey(&[0u32]), 4);
     assert_eq!(out.len(), 4);
     assert_eq!(total_rows(&out), 0);
     assert!(
-        op_relay_scatter(&[], ScatterSpec::GroupKey(&[7u32]), &schema, 4).is_err(),
+        op_exchange_route(&empty, ScatterSpec::GroupKey(&[7u32]), &mut Vec::new(), 4).is_err(),
         "a column the schema has not got is refused on an empty round too"
     );
 }
 
-/// Z-Set `+` across the sources, not a PK-ordered concatenation: a retraction
+/// Z-Set `+` across the slices, not a PK-ordered concatenation: a retraction
 /// cancels its insert, a repeated (PK, payload) sums, and two payloads at one
-/// key stay two elements.
+/// key stay two elements, in payload order.
 #[test]
-fn the_merge_arm_folds_across_sources() {
+fn the_gather_folds_across_consolidated_slices() {
     let schema = make_schema_u64_i64();
-    let nw = 4;
-    // pk=1 cancels outright; pk=2 sums to 3; pk=3 carries two payloads at one
-    // key, which stay two elements; pk=4 is single-sided.
     let b0 = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 31)]);
     let b1 = make_batch(&schema, &[(1, -1, 10), (2, 2, 20), (3, 1, 30), (4, 1, 40)]);
 
-    let out = scatter(&[&b0, &b1], ScatterSpec::GroupKey(&[0u32]), &schema, nw);
-
-    let mut got: Vec<(u64, i64, i64)> = Vec::new();
-    for sb in out.iter().filter(|s| s.count > 0) {
-        assert_eq!(sb.layout(), Layout::Consolidated, "each slice is consolidated");
-        for r in 0..sb.count {
-            got.push((sb.get_pk(r) as u64, payload(sb, r), sb.get_weight(r)));
-        }
-        // The two pk=3 elements co-locate (equal PK → equal partition) and emit
-        // in payload order, not in source order.
-        for r in 1..sb.count {
-            let by_pk = compare_pk_bytes(sb.get_pk_bytes(r - 1), sb.get_pk_bytes(r));
-            assert!(
-                by_pk == Ordering::Less || (by_pk == Ordering::Equal && payload(sb, r - 1) < payload(sb, r)),
-                "row {r} not strictly (PK, payload)-ascending",
-            );
-        }
-    }
-    got.sort();
-    assert_eq!(got, vec![(2, 20, 3), (3, 30, 1), (3, 31, 1), (4, 40, 1)]);
+    let got = gather(&[&b0, &b1], &schema);
+    assert_eq!(got.layout(), Layout::Consolidated);
+    let rows: Vec<(u64, i64, i64)> = (0..got.count)
+        .map(|r| (got.get_pk(r) as u64, payload(&got, r), got.get_weight(r)))
+        .collect();
+    assert_eq!(rows, vec![(2, 20, 3), (3, 30, 1), (3, 31, 1), (4, 40, 1)]);
 }
 
 // -----------------------------------------------------------------------
 // Join-key scatter co-partition
 // -----------------------------------------------------------------------
+
+/// `(pk, weight, payload)` of every row, in order.
+fn rows_of(b: &Batch) -> Vec<(u128, i64, i64)> {
+    (0..b.count)
+        .map(|i| (b.get_pk(i), b.get_weight(i), payload(b, i)))
+        .collect()
+}
+
+/// Per receiver, [`op_exchange_gather`] over the slice each sender's own
+/// [`op_exchange_route`] routed it equals that receiver's share of every sender's
+/// partition summed, with (PK, payload) pairs repeated across senders and
+/// retractions that cancel across them. Consolidated partitions agree row for row
+/// and on the claim; raw ones as Z-sets.
+#[test]
+fn gathering_each_senders_slices_equals_routing_the_summed_partitions() {
+    let schema = make_schema_u64_i64();
+    let spec = ScatterSpec::GroupKey(&[0]);
+    let mut rng = crate::test_rng::Rng::new(0x9a7e);
+    for nw in [1usize, 2, 4] {
+        for consolidated in [true, false] {
+            for case in 0..40 {
+                let parts: Vec<Batch> = (0..nw)
+                    .map(|_| {
+                        let rows: Vec<(u64, i64, i64)> = (0..rng.gen_range(12))
+                            .map(|_| {
+                                (
+                                    rng.gen_range(16),
+                                    [-1, 1, 2][rng.gen_range(3) as usize],
+                                    rng.gen_range(3) as i64,
+                                )
+                            })
+                            .collect();
+                        let raw = make_batch_raw(&schema, &rows);
+                        if consolidated {
+                            raw.into_consolidated(&schema)
+                        } else {
+                            raw
+                        }
+                    })
+                    .collect();
+                let summed = Batch::concat(&schema, parts.iter()).into_consolidated(&schema);
+                let want = scatter(&summed, spec, nw);
+                let per_sender: Vec<Vec<Batch>> = parts.iter().map(|p| scatter(p, spec, nw)).collect();
+                for (r, want) in want.iter().enumerate() {
+                    let slices: Vec<&Batch> = per_sender.iter().map(|s| &s[r]).collect();
+                    let got = gather(&slices, &schema);
+                    let label = format!("W={nw} consolidated={consolidated} case {case} receiver {r}");
+                    if consolidated {
+                        assert_eq!(rows_of(&got), rows_of(want), "{label}");
+                        assert!(got.count < 2 || got.layout() == Layout::Consolidated, "{label}");
+                    } else {
+                        assert_eq!(rows_of(&got.into_consolidated(&schema)), rows_of(want), "{label}");
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Every output row landed on the worker its packed `_join_pk` bytes dictate, no
 /// row was dropped, and the `twins` rows — which share a join key — co-located.
@@ -362,7 +383,7 @@ fn make_join_key_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u128)]) -> 
 
 /// A compound join key routes by the packed OPK bytes the reindex Map writes as
 /// `_join_pk`, not by the group key — signed-negative and >16-byte
-/// composites, through both arms of the gate.
+/// composites.
 #[test]
 fn compound_join_key_scatter_copartitions() {
     let schema = make_join_key_schema();
@@ -382,17 +403,8 @@ fn compound_join_key_scatter_copartitions() {
     let key: Vec<gnitz_wire::ReindexSlot> = cols.iter().map(|&c| (c, None)).collect();
     let packer = ReindexPacker::new(&schema, &key).unwrap();
 
-    // One contributing source: the linear arm.
-    let one = scatter(&[&cb], ScatterSpec::JoinKey(&key), &schema, num_workers);
-    check_copartition(&one, &packer, num_workers, rows.len(), Some((1, 3)), "one source");
-
-    // Two: the N-way merge, which routes a folded group by its exemplar row.
-    // Split the PK-ascending rows by parity so the walk genuinely interleaves
-    // them; pk=1 and pk=3 both live in the odd source yet must still co-locate.
-    let odd = make_join_key_batch(&schema, &[rows[0], rows[2], rows[4]]);
-    let even = make_join_key_batch(&schema, &[rows[1], rows[3], rows[5]]);
-    let two = scatter(&[&odd, &even], ScatterSpec::JoinKey(&key), &schema, num_workers);
-    check_copartition(&two, &packer, num_workers, rows.len(), Some((1, 3)), "two sources");
+    let out = scatter(&cb, ScatterSpec::JoinKey(&key), num_workers);
+    check_copartition(&out, &packer, num_workers, rows.len(), Some((1, 3)), "compound key");
 }
 
 /// The packer fires on promotion too, not only on a compound key: an I32 → I64
@@ -423,7 +435,7 @@ fn promoted_single_join_key_scatter_copartitions() {
     b.certify_layout(Layout::Consolidated);
     let key = [(1u32, Some(TypeCode::I64))];
     let packer = ReindexPacker::new(&schema, &key).unwrap();
-    let out = scatter(&[&b], ScatterSpec::JoinKey(&key), &schema, num_workers);
+    let out = scatter(&b, ScatterSpec::JoinKey(&key), num_workers);
     check_copartition(&out, &packer, num_workers, rows.len(), Some((1, 4)), "payload key");
 
     // ---- (2) PK key: [I32 PK, U64 payload], reindex col0 → I64. ----
@@ -449,7 +461,7 @@ fn promoted_single_join_key_scatter_copartitions() {
     pb.certify_layout(Layout::Consolidated);
     let pk_key = [(0u32, Some(TypeCode::I64))];
     let pk_packer = ReindexPacker::new(&pk_schema, &pk_key).unwrap();
-    let pk_out = scatter(&[&pb], ScatterSpec::JoinKey(&pk_key), &pk_schema, num_workers);
+    let pk_out = scatter(&pb, ScatterSpec::JoinKey(&pk_key), num_workers);
     check_copartition(&pk_out, &pk_packer, num_workers, pk_rows.len(), None, "promoted PK key");
 }
 
@@ -465,12 +477,12 @@ fn make_schema_u64_2xi64() -> SchemaDescriptor {
     )
 }
 
-/// `n` rows over a U64-PK, all-I64-payload `schema`, PKs `j, j + k, j + 2k, …`,
-/// each payload a spread function of the PK. Certified consolidated iff asked.
-fn bench_stripe(schema: &SchemaDescriptor, n: usize, j: usize, k: usize, consolidated: bool) -> Batch {
+/// `n` rows over a U64-PK, all-I64-payload `schema`, PKs `0..n`, each payload a
+/// spread function of the PK. Certified consolidated iff asked.
+fn bench_stripe(schema: &SchemaDescriptor, n: usize, consolidated: bool) -> Batch {
     let mut b = crate::storage::BatchBuilder::new(*schema);
     for i in 0..n {
-        let pk = (i * k + j) as u64;
+        let pk = i as u64;
         b.begin_row(pk as u128, 1);
         for c in 1..schema.columns.len() as i64 {
             b.put_int((pk as i64).wrapping_mul(2_654_435_761 + c) as u128);
@@ -485,27 +497,27 @@ fn bench_stripe(schema: &SchemaDescriptor, n: usize, j: usize, k: usize, consoli
 }
 
 /// Release-only microbench of one [`ScatterSpec`]'s route through
-/// [`op_relay_scatter`], 1M rows to 4 workers: `merge` over 4 consolidated
-/// PK-disjoint stripes, else over one `Raw` source. Compare instructions retired:
+/// [`op_exchange_route`], 1M rows to 4 workers. Compare instructions retired:
 /// `perf stat -e instructions:u <test-bin> --exact <bench> --ignored --test-threads=1`.
-fn route_kind_bench(name: &str, spec: ScatterSpec<'_>, schema: &SchemaDescriptor, merge: bool) {
+fn route_kind_bench(name: &str, spec: ScatterSpec<'_>, schema: &SchemaDescriptor) {
     use std::hint::black_box;
     use std::time::Instant;
 
     const N: usize = 1_000_000;
     const ITERS: usize = 20;
     const WORKERS: usize = 4;
-    let k = if merge { 4 } else { 1 };
-    let batches: Vec<Batch> = (0..k).map(|j| bench_stripe(schema, N / k, j, k, merge)).collect();
-    let sources: Vec<&Batch> = batches.iter().collect();
-
-    let warm = scatter(&sources, spec, schema, WORKERS);
-    assert_eq!(total_rows(&warm), N, "{name}: scatter dropped rows");
+    let batch = bench_stripe(schema, N, false);
+    let mut pool = Vec::new();
+    let routed = |pool: &mut Vec<Vec<u32>>| -> usize {
+        let rows = op_exchange_route(&batch, spec, pool, WORKERS).expect("the bench key routes");
+        rows.iter().map(Vec::len).sum()
+    };
+    assert_eq!(routed(&mut pool), N, "{name}: the route dropped rows");
 
     let t = Instant::now();
     let mut acc = 0usize;
     for _ in 0..ITERS {
-        acc += black_box(total_rows(&scatter(&sources, spec, schema, WORKERS)));
+        acc += black_box(routed(&mut pool));
     }
     let secs = t.elapsed().as_secs_f64();
     println!(
@@ -516,115 +528,50 @@ fn route_kind_bench(name: &str, spec: ScatterSpec<'_>, schema: &SchemaDescriptor
 
 #[test]
 #[ignore]
-fn scatter_route_pk_linear_bench() {
-    route_kind_bench("pk_linear", ScatterSpec::GroupKey(&[0]), &make_schema_u64_i64(), false);
+fn scatter_route_pk_bench() {
+    route_kind_bench("pk", ScatterSpec::GroupKey(&[0]), &make_schema_u64_i64());
 }
 
 #[test]
 #[ignore]
-fn scatter_route_pk_merge_bench() {
-    route_kind_bench("pk_merge", ScatterSpec::GroupKey(&[0]), &make_schema_u64_i64(), true);
+fn scatter_route_image_join_bench() {
+    route_kind_bench("image_join", ScatterSpec::JoinKey(&[(1, None)]), &make_schema_u64_i64());
 }
 
 #[test]
 #[ignore]
-fn scatter_route_image_join_linear_bench() {
+fn scatter_route_image_group_bench() {
+    route_kind_bench("image_group", ScatterSpec::GroupKey(&[1]), &make_schema_u64_i64());
+}
+
+#[test]
+#[ignore]
+fn scatter_route_packed_bench() {
     route_kind_bench(
-        "image_join_linear",
-        ScatterSpec::JoinKey(&[(1, None)]),
-        &make_schema_u64_i64(),
-        false,
-    );
-}
-
-#[test]
-#[ignore]
-fn scatter_route_image_join_merge_bench() {
-    route_kind_bench(
-        "image_join_merge",
-        ScatterSpec::JoinKey(&[(1, None)]),
-        &make_schema_u64_i64(),
-        true,
-    );
-}
-
-#[test]
-#[ignore]
-fn scatter_route_image_group_linear_bench() {
-    route_kind_bench(
-        "image_group_linear",
-        ScatterSpec::GroupKey(&[1]),
-        &make_schema_u64_i64(),
-        false,
-    );
-}
-
-#[test]
-#[ignore]
-fn scatter_route_image_group_merge_bench() {
-    route_kind_bench(
-        "image_group_merge",
-        ScatterSpec::GroupKey(&[1]),
-        &make_schema_u64_i64(),
-        true,
-    );
-}
-
-#[test]
-#[ignore]
-fn scatter_route_packed_linear_bench() {
-    route_kind_bench(
-        "packed_linear",
+        "packed",
         ScatterSpec::JoinKey(&[(1, None), (2, None)]),
         &make_schema_u64_2xi64(),
-        false,
     );
 }
 
 #[test]
 #[ignore]
-fn scatter_route_packed_merge_bench() {
-    route_kind_bench(
-        "packed_merge",
-        ScatterSpec::JoinKey(&[(1, None), (2, None)]),
-        &make_schema_u64_2xi64(),
-        true,
-    );
+fn scatter_route_fold_bench() {
+    route_kind_bench("fold", ScatterSpec::GroupKey(&[1, 2]), &make_schema_u64_2xi64());
 }
 
-#[test]
-#[ignore]
-fn scatter_route_fold_linear_bench() {
-    route_kind_bench(
-        "fold_linear",
-        ScatterSpec::GroupKey(&[1, 2]),
-        &make_schema_u64_2xi64(),
-        false,
-    );
-}
-
-#[test]
-#[ignore]
-fn scatter_route_fold_merge_bench() {
-    route_kind_bench(
-        "fold_merge",
-        ScatterSpec::GroupKey(&[1, 2]),
-        &make_schema_u64_2xi64(),
-        true,
-    );
-}
-
-/// Release-only microbench of the relay's two walks over both arms of the gate.
-/// `raw` is the production default: a base-table delta reaches the relay `Raw`,
-/// and an output relay ends at a reindex `Map` that downgrades. K is the
-/// contributing *worker* count — K=1 (replicated, or single-worker) and K=4 are
-/// the reachable range, K=16 the headroom point — and each source is a disjoint
-/// stripe of one ascending key space, so the merge genuinely interleaves them.
+/// Release-only microbench of [`op_exchange_gather`] over one receiver's slice
+/// from each of K senders, over both arms: `raw` is the production default, a
+/// base-table delta reaching the round `Raw` and an output round ending at a
+/// reindex `Map` that downgrades. K=1 (replicated, or single-worker) and K=4
+/// are the reachable range, K=16 the headroom point; each sender holds a
+/// disjoint stripe of one ascending key space, so the merge genuinely
+/// interleaves them.
 ///
-/// `cd crates && cargo test -p gnitz-store --release relay_scatter_merge_bench -- --ignored --nocapture --test-threads=1`
+/// `cd crates && cargo test -p gnitz-store --release exchange_gather_bench -- --ignored --nocapture --test-threads=1`
 #[test]
 #[ignore]
-fn relay_scatter_merge_bench() {
+fn exchange_gather_bench() {
     use std::hint::black_box;
     use std::time::Instant;
 
@@ -637,79 +584,59 @@ fn relay_scatter_merge_bench() {
     for (arm, build) in [("consolidated", make_batch as Build), ("raw", make_batch_raw as Build)] {
         for k in [1usize, 4, 16] {
             let per = N / k;
-            let batches: Vec<Batch> = (0..k)
+            // Sender j's slice for receiver 0 of its own stripe.
+            let slices: Vec<Batch> = (0..k)
                 .map(|j| {
                     let rows: Vec<(u64, i64, i64)> = (0..per).map(|i| ((i * k + j) as u64, 1, i as i64)).collect();
-                    build(&schema, &rows)
+                    let stripe = build(&schema, &rows);
+                    scatter(&stripe, ScatterSpec::GroupKey(&[0u32]), WORKERS).swap_remove(0)
                 })
                 .collect();
-            let sources: Vec<&Batch> = batches.iter().collect();
+            let refs: Vec<&Batch> = slices.iter().collect();
+            let rows: usize = slices.iter().map(|b| b.count).sum();
 
-            // Warm up, and pin the invariants the timing would otherwise hide:
-            // the stripes are PK-disjoint, so nothing folds and no row is
-            // dropped, and the fixture reaches the arm it is labelled for.
-            let warm = scatter(&sources, ScatterSpec::GroupKey(&[0u32]), &schema, WORKERS);
-            assert_eq!(total_rows(&warm), per * k, "{arm}/K={k}: scatter dropped rows");
+            let warm = gather(&refs, &schema);
+            assert_eq!(warm.count, rows, "{arm}/K={k}: gather dropped rows");
             assert_eq!(
-                sources.iter().all(|b| b.is_consolidated()),
+                warm.layout() == Layout::Consolidated,
                 arm == "consolidated",
                 "{arm}/K={k}: fixture on the wrong arm"
             );
 
-            // Two timings: the scatter alone, and the scatter plus the
-            // `into_consolidated` a receiving reader that needs net weights runs
-            // on its slice. A certified slice returns by move where a `Raw` one
-            // pays a full argsort into a fresh arena.
-            for (label, consolidate) in [("scatter", false), ("scatter+consolidate", true)] {
-                let t = Instant::now();
-                let mut acc = 0usize;
-                for _ in 0..ITERS {
-                    let out = scatter(&sources, ScatterSpec::GroupKey(&[0u32]), &schema, WORKERS);
-                    acc += if consolidate {
-                        black_box(
-                            out.into_iter()
-                                .map(|b| b.into_consolidated(&schema).count)
-                                .sum::<usize>(),
-                        )
-                    } else {
-                        black_box(total_rows(&out))
-                    };
-                }
-                let secs = t.elapsed().as_secs_f64();
-                println!(
-                    "relay_scatter_merge/{arm}/K{k}/{label}: {:.1} Mrows/s ({} rows × {ITERS} iters in {secs:.3}s, checksum {acc})",
-                    (per * k * ITERS) as f64 / secs / 1e6,
-                    per * k,
-                );
+            let t = Instant::now();
+            let mut acc = 0usize;
+            for _ in 0..ITERS {
+                acc += black_box(gather(&refs, &schema).count);
             }
+            let secs = t.elapsed().as_secs_f64();
+            println!(
+                "exchange_gather/{arm}/K{k}: {:.1} Mrows/s ({rows} rows × {ITERS} iters in {secs:.3}s, checksum {acc})",
+                (rows * ITERS) as f64 / secs / 1e6,
+            );
         }
     }
 }
 
-/// Instructions per [`op_relay_scatter`] call on small consolidated deltas —
-/// the per-call fixed cost the source-side view build adds — at
-/// (sources, rows per source, workers).
+/// Instructions per [`op_exchange_route`] call on small deltas — the per-call
+/// fixed cost a round adds — at (rows, workers).
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn relay_small_delta_bench() {
+fn exchange_route_small_delta_bench() {
     use gnitz_foundation::perf::Counter;
     use std::hint::black_box;
     const ITERS: u64 = 10_000;
     let schema = make_schema_u64_i64();
     let instructions = Counter::instructions().unwrap();
-    for (k, n, workers) in [(1, 1, 4), (4, 16, 16), (16, 64, 16)] {
-        let batches: Vec<Batch> = (0..k).map(|j| bench_stripe(&schema, n, j, k, true)).collect();
-        let sources: Vec<&Batch> = batches.iter().collect();
-        let spec = ScatterSpec::GroupKey(&[0]);
-        black_box(scatter(&sources, spec, &schema, workers));
+    let spec = ScatterSpec::GroupKey(&[0]);
+    for (n, workers) in [(1, 4), (64, 16), (1024, 16)] {
+        let batch = bench_stripe(&schema, n, true);
+        let mut pool = Vec::new();
+        black_box(op_exchange_route(&batch, spec, &mut pool, workers).unwrap());
         let ((), i) = instructions.measure(|| {
             for _ in 0..ITERS {
-                black_box(scatter(&sources, spec, &schema, workers));
+                black_box(op_exchange_route(&batch, spec, &mut pool, workers).unwrap());
             }
         });
-        println!(
-            "{k} sources x {n} rows -> {workers} workers: {} instructions per call",
-            i / ITERS
-        );
+        println!("{n} rows -> {workers} workers: {} instructions per call", i / ITERS);
     }
 }

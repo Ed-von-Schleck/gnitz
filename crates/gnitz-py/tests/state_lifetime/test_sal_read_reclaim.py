@@ -1,13 +1,13 @@
 """A read-only workload must not exhaust the SAL.
 
 Every read verb writes a SAL command group and nothing on a read path rewinds the
-write cursor, so reads alone march it to the end of the mapping. Only the
-watchdog's reclaim barrier — fired once less than 1/8 of the mapping is free —
-can free it without a write.
+write cursor, so reads alone march it to the end of the mapping. The committer
+checks its checkpoint threshold only when something is sent to it, which a
+read-only workload never does, so only the watchdog's reclaim barrier — fired
+once the cursor crosses that threshold — can free it without a write.
 
-`tiny_sal_server` puts the committer's own checkpoint threshold ABOVE the
-watchdog's line, so the watchdog is the only thing that can reclaim: with it
-removed, the read loops below wedge.
+`tiny_sal_server`'s threshold is high enough that the pushes below stop short of
+it and only the reads cross it: with the watchdog removed, the read loops wedge.
 """
 import threading
 import time
@@ -16,17 +16,16 @@ import gnitz
 from _read import bag
 from _serverproc import join_or_fail
 
-# Most of the 14 MiB to the watchdog's line is bought with wide rows, which is
-# far cheaper than ~1 KB scan groups. Sized to stay under the committer's own
-# 15 MiB threshold: a committer checkpoint reclaims on its own, and these tests
-# would then pass with the watchdog deleted.
-_FILL_ROWS, _FILL_BATCH = 1_600, 800
+# Most of the 15 MiB to the checkpoint threshold is bought with wide rows, which
+# is far cheaper than ~1 KB scan groups. Sized to stop short of the threshold: a
+# push past it would let the committer reclaim on its own, and these tests would
+# then pass with the watchdog deleted.
+_FILL_ROWS, _FILL_BATCH = 1_700, 850
 _FILL_PAD = "x" * 8_000
 
-# The rest of the distance, in scans. Measured: the cursor crosses at ~3 200 scans
-# (W=2) and ~2 000 (W=4). The reclaim rewinds the cursor to 0, so there is no
-# second crossing to buy — the surplus is pressure held on the margin, not more
-# distance.
+# The rest of the distance, in scans, with a wide surplus. The reclaim rewinds
+# the cursor to 0, so there is no second crossing to buy — the surplus is
+# pressure held on the threshold, not more distance.
 SCANS = 8_000
 
 # A reader's ceiling on an UNBROKEN run of SAL-full refusals. The reclaim that
@@ -38,7 +37,7 @@ _EXPECTED = {(1, 10): 1, (2, 20): 1, (3, 30): 1}
 
 def _setup(client):
     """`t` with three rows to read back, and `filler` pre-loaded with the wide
-    rows that put the SAL write cursor near the watchdog's line."""
+    rows that put the SAL write cursor just short of the checkpoint threshold."""
     sn = "sal"
     client.create_schema(sn)
     client.execute_sql(
@@ -67,8 +66,8 @@ def _rows(client, tid):
 
 
 def _served(client, tid):
-    """One scan, retried past the SAL-full refusals a cursor past the watchdog's
-    line legitimately produces — matched by exception class, not message text.
+    """One scan, retried past the SAL-full refusals a cursor past the threshold
+    legitimately produces — matched by exception class, not message text.
     Raises once the refusals outlast `SAL_FULL_GRACE_S`."""
     give_up_at = None
     while True:
@@ -136,8 +135,8 @@ def test_concurrent_read_only_clients_survive_reclaim(tiny_sal_server):
 
 
 def test_a_ddl_concurrent_with_reclaim_does_not_deadlock(tiny_sal_server):
-    """Two CREATE VIEWs while the read loops hold the SAL past the watchdog's
-    line. The watchdog's barrier must not start a checkpoint sequence while a
+    """Two CREATE VIEWs while the read loops hold the SAL past the checkpoint
+    threshold. The watchdog's barrier must not start a checkpoint sequence while a
     DDL holds the tick gate — the drain would wait on a tick the DDL keeps out,
     against a barrier that resolves only at sequence end.
 
@@ -147,7 +146,7 @@ def test_a_ddl_concurrent_with_reclaim_does_not_deadlock(tiny_sal_server):
     with gnitz.connect(target) as client:
         sn, tid = _setup(client)
 
-        # Cross the line before the DDLs, so a reclaim barrier is in flight for
+        # Cross the threshold before the DDLs, so a reclaim barrier is in flight for
         # the whole window. Counted, not slept: the crossing is a number of scan
         # groups, which no machine speed can under-shoot.
         errors = []

@@ -1,4 +1,4 @@
-use crate::runtime::wire::{decode_sal_slot, decode_wire_ipc, WireData, WireMsg};
+use crate::runtime::wire::{decode_sal_slot, WireData, WireMsg};
 use crate::test_support::{make_batch, make_batch_raw, u64_pk_schema};
 use gnitz_store::schema::{encode_schema_block, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder, Layout, WireChunk};
@@ -305,7 +305,7 @@ fn a_range_chunk_frames_identically_to_the_same_rows_whole() {
 
     // Every region must be sliced by the same range: PK, weight and payload are
     // distinct per row, so a range applied to one region and not another shows up.
-    let decoded = decode_wire_ipc(&buf).expect("decode_wire_ipc");
+    let decoded = decode_sal_slot(&buf, |_, _| None).expect("decode_sal_slot");
     let b = decoded.data_batch.expect("data_batch");
     assert_eq!(b.len(), 3);
     for i in 0..3usize {
@@ -336,10 +336,9 @@ fn continuation_frame_does_not_decode_without_a_schema() {
     let mut buf = vec![0u8; msg.size()];
     msg.encode(&mut buf);
 
-    // decode_wire_ipc must fail (no schema in frame, no hint).
     assert!(
-        decode_wire_ipc(&buf).is_err(),
-        "decode_wire_ipc should fail for continuation frame without schema"
+        decode_sal_slot(&buf, |_, _| None).is_err(),
+        "a continuation frame without a schema must not decode"
     );
 }
 

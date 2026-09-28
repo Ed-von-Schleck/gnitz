@@ -242,7 +242,7 @@ fn run_integrates(vm: &mut Vm, state: &mut CircuitState) -> Result<(), String> {
 /// Extract the output, labelled with the output register's own schema. An
 /// operator's identity path can hand an input batch straight back (see
 /// `op_union`), so the label on it may be an operand's; downstream — the
-/// exchange wire, `prepare_relay`, the dag driver — cannot re-derive it.
+/// exchange mesh, the dag driver — cannot re-derive it.
 fn take_output(vm: &mut Vm) -> Batch {
     let Vm { program, batches, .. } = vm;
     let want = program.out_schema();

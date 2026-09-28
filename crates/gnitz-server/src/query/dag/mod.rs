@@ -10,7 +10,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::query::compiler::{self, CompileOutput, SubPlan, ViewMeta};
 use crate::query::vm;
-use gnitz_store::ops;
+use gnitz_store::ops::{self, ScatterSpec};
 use gnitz_store::relation::{CircuitState, Relation, RelationRegistry, StateLayout};
 use gnitz_store::schema::Placement;
 use gnitz_store::storage::Batch;
@@ -27,9 +27,9 @@ use meta::DepMap;
 /// the other workers.
 pub(crate) trait DriveHost {
     fn parts(&mut self) -> (&mut DagEngine, &mut RelationRegistry);
-    /// This worker's `batch` for `view_id`, repartitioned under `key`: the rows
-    /// it owns.
-    fn exchange(&mut self, view_id: u64, batch: Batch, key: u64) -> Batch;
+    /// This worker's `batch` for `view_id`, repartitioned by `spec` in the round
+    /// `key` names — with no spec, every worker's whole batch: the rows it owns.
+    fn exchange(&mut self, view_id: u64, batch: Batch, key: u64, spec: Option<ScatterSpec<'_>>) -> Batch;
 }
 
 // ---------------------------------------------------------------------------

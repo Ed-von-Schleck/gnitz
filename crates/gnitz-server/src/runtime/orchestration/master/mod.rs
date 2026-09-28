@@ -2,7 +2,6 @@
 //! via the shared append-only log (SAL) and collects responses via per-worker
 //! W2M regions, whose headers also carry each worker's park on the SAL.
 
-mod exchange;
 pub(crate) mod scatter;
 
 mod dispatch;
@@ -35,40 +34,6 @@ pub(crate) use train::forward_scan;
 pub(crate) use unique_filter::UniqueFilter;
 
 // ---------------------------------------------------------------------------
-// RelayPrepared — output of prepare_relay, input of emit_relay
-// ---------------------------------------------------------------------------
-
-/// An exchange round scattered into its relay; only the SAL write is left.
-pub(crate) struct RelayPrepared {
-    /// The view the relay targets.
-    view: wire::WireSchema,
-    source_id: u64,
-    /// One batch per worker (scatter), or a single batch every worker is sent
-    /// (broadcast).
-    dest: Vec<Batch>,
-    /// Every worker's source partition is drained: a backfill's stop signal.
-    drained: bool,
-}
-
-impl RelayPrepared {
-    /// The relay's SAL group; `arg0` echoes `source_id`.
-    pub(crate) fn group(&self) -> DirectGroup<'_> {
-        DirectGroup {
-            template: self.view.frame(wire::WireMsg {
-                arg0: self.source_id,
-                flags: WireFlags {
-                    drained: self.drained,
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
-            data: GroupData::batches(&self.dest),
-            ..DirectGroup::new(SalMessageKind::ExchangeRelay)
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // MasterDispatcher
 // ---------------------------------------------------------------------------
 
@@ -85,13 +50,13 @@ pub struct MasterDispatcher {
     /// a distinct single-column filter on `a`.
     unique_filters: RefCell<FxHashMap<(u64, PkColList), UniqueFilter>>,
 
-    /// The generation the last ephemeral round stamped. Set unconditionally, so
-    /// `derived_needs_restamp` reads it in release builds too.
+    /// The generation the last ephemeral round stamped, which every base round
+    /// must publish past.
     last_ephemeral_gen: Cell<u64>,
     /// A push group was written since the last base round.
     unflushed_pushes: Cell<bool>,
 
-    /// The last tick round allocated, one per tick group. Starts at 1, which is
+    /// The last tick round allocated, one per tid a tick group carries. Starts at 1, which is
     /// never emitted, so `after_tick = 0` names no round.
     tick_round: Cell<u64>,
 

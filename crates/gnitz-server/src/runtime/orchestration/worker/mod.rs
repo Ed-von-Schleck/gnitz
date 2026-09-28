@@ -2,13 +2,15 @@
 //!
 //! Owns one store per user relation — this worker's slice of it. Receives requests from
 //! the master via the SAL (shared append-only log), sends responses via a
-//! per-worker W2M shared region.
+//! per-worker W2M shared region, and trades exchange rounds with its peers on
+//! the mesh.
 
 use std::collections::VecDeque;
 use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, SysFamily};
 use crate::query::{DagEngine, Drive, DriveHost};
+use crate::runtime::mesh::Mesh;
 use crate::runtime::sal::{SalMessage, SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{self as ipc};
@@ -19,25 +21,19 @@ use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 use gnitz_wire::{WireFlags, WireStatus};
 
-// ---------------------------------------------------------------------------
-// WorkerExchangeHandler
-// ---------------------------------------------------------------------------
-
 /// Lookup target for HasPk requests.
 enum HasPkLookup {
     /// Check the table's primary-key store.
     PrimaryKey,
     /// Check a secondary index on the carried column list (single- or
     /// multi-column; a composite index is located by its exact list). Unique and
-    /// non-unique alike — rule F2 probes a child's FK auto-index, which is never
-    /// unique.
+    /// non-unique alike — the FK parent-delete check probes a child's FK
+    /// auto-index, which is never unique.
     SecondaryIndex { cols: gnitz_wire::PkColList },
 }
 
 /// One dispatched request. Fully owned — a parked request must not borrow the
-/// SAL mapping, which an inline `Flush` resets. No `target_id`: the group header
-/// and every slot's control block come off one `WireMsg` template, so `wire`
-/// already carries it.
+/// SAL mapping, which an inline `Flush` resets.
 struct Request {
     kind: SalMessageKind,
     /// The group's request id, which every reply answers on.
@@ -48,91 +44,6 @@ struct Request {
 }
 
 // ---------------------------------------------------------------------------
-// The inline-vs-defer decision
-// ---------------------------------------------------------------------------
-
-/// Where a request of some kind runs when the worker is blocked inside an
-/// evaluation. At top level every kind runs inline, so this is the whole matrix.
-enum InEval {
-    /// Run it where it arrives, in the middle of the wait.
-    Inline,
-    /// Replayed at top level after the outer epoch's ACK.
-    DeferPostAck,
-    /// Applied when the DAG returns, before the ACK that implies it.
-    DeferPreAck,
-    /// Ends the wait.
-    Relay,
-}
-
-/// The one classifier for the inline-vs-defer decision — a worker policy, hence
-/// a free function here rather than a method on the protocol enum. Total, so a
-/// new `SalMessageKind` cannot compile without a decision; the behavioural
-/// matrix tests pin the non-trivial cells.
-fn in_eval(kind: SalMessageKind) -> InEval {
-    match kind {
-        // An inline tick would re-enter the view with a different source and
-        // emit schema-mismatched relays.
-        SalMessageKind::Tick => InEval::DeferPostAck,
-        // Answered mid-wait, a read would see a half-run tick.
-        SalMessageKind::Scan | SalMessageKind::ScanSpec | SalMessageKind::DeltaRead => InEval::DeferPostAck,
-        // An inline catalog mutation races the in-flight evaluation.
-        SalMessageKind::DdlSync => InEval::DeferPreAck,
-        // Deferring deadlocks: `flush_round` holds a `SalExcl` across the ACK
-        // wait, and the tick's relay needs one to write the relay this worker is
-        // parked on — so a flush that waits for the relay waits forever.
-        SalMessageKind::Flush | SalMessageKind::FlushEph => InEval::Inline,
-        // Correct to defer (`commit_pushes` drops its lock before the ACK wait),
-        // but it would park the ingest ACK behind an exchange round-trip.
-        SalMessageKind::Push => InEval::Inline,
-        // Probes of base-table keys, which a tick does not write.
-        SalMessageKind::HasPk | SalMessageKind::UniquePreflight => InEval::Inline,
-        SalMessageKind::Backfill | SalMessageKind::Shutdown => InEval::Inline,
-        SalMessageKind::ExchangeRelay => InEval::Relay,
-    }
-}
-
-/// A relay delivered to the wait blocked on it: the relayed batch, and whether
-/// every worker's partition was drained.
-struct RelayHit {
-    batch: Batch,
-    drained: bool,
-}
-
-struct WorkerExchangeHandler {
-    /// [`InEval::DeferPreAck`]: drained inside `drive_dag`, so a catalog
-    /// mutation lands before the ACK that implies it.
-    deferred: Vec<Request>,
-    /// [`InEval::DeferPostAck`]: drained at top level, so a replayed tick cannot
-    /// re-enter a view whose outer exchange is still awaiting its relay.
-    ///
-    /// Both queues drain in insertion order, which is SAL order.
-    deferred_replay: Vec<Request>,
-}
-
-/// The worker as a drive's [`DriveHost`].
-struct DagExchangeCtx<'a> {
-    worker: &'a mut WorkerProcess,
-    /// This worker's source partition is already drained, so its rounds are empty
-    /// pads. Only a backfill chunk sets it.
-    pad: bool,
-    /// `pad` until a relay comes back, then the relay's `drained`: every worker's.
-    drained: bool,
-}
-
-impl DriveHost for DagExchangeCtx<'_> {
-    fn parts(&mut self) -> (&mut DagEngine, &mut RelationRegistry) {
-        let cat = self.worker.cat();
-        (&mut cat.dag, &mut cat.registry)
-    }
-
-    fn exchange(&mut self, view_id: u64, batch: Batch, key: u64) -> Batch {
-        let hit = self.worker.do_exchange_wait(view_id, batch, key, self.pad);
-        self.drained = hit.drained;
-        hit.batch
-    }
-}
-
-// ---------------------------------------------------------------------------
 // WorkerProcess
 // ---------------------------------------------------------------------------
 
@@ -140,7 +51,11 @@ pub struct WorkerProcess {
     catalog: *mut CatalogEngine,
     sal_reader: SalReader,
     w2m_writer: W2mWriter,
-    exchange: WorkerExchangeHandler,
+    /// Where this worker trades its exchange rounds with its peers.
+    mesh: Mesh,
+    /// Requests an exchange wait deferred, in SAL order: replayed at top level
+    /// right after the request whose drive deferred them.
+    deferred: Vec<Request>,
     /// Reply trains, one frame emitted per SAL drain, front first: the master
     /// reads one lease at a time and a ring frees only in order.
     pending_streams: VecDeque<PendingScan>,
@@ -152,6 +67,7 @@ pub struct WorkerProcess {
 mod exchange;
 mod reply;
 
+use exchange::DagExchangeCtx;
 pub(crate) use reply::send_unique_preflight_keys;
 use reply::PendingScan;
 
@@ -173,7 +89,7 @@ struct ReplyRoute {
 }
 
 impl WorkerProcess {
-    pub fn new(catalog: *mut CatalogEngine, sal_reader: SalReader, w2m_writer: W2mWriter) -> Self {
+    pub fn new(catalog: *mut CatalogEngine, sal_reader: SalReader, w2m_writer: W2mWriter, mesh: Mesh) -> Self {
         // Worker rank/count (and role) are latched in the fork child before any
         // catalog work — see `server_main`, not here: boot-compiled plans
         // would otherwise carry rank 0 / num_workers 1.
@@ -181,10 +97,8 @@ impl WorkerProcess {
             catalog,
             sal_reader,
             w2m_writer,
-            exchange: WorkerExchangeHandler {
-                deferred: Vec::new(),
-                deferred_replay: Vec::new(),
-            },
+            mesh,
+            deferred: Vec::new(),
             pending_streams: VecDeque::new(),
             reply_frame_budget: gnitz_foundation::env::env_num(
                 "GNITZ_REPLY_FRAME_BUDGET",
@@ -221,29 +135,19 @@ impl WorkerProcess {
         // One frame per pass, so requests keep being served between frames.
         self.emit_pending_scan_chunk();
         while let Some((msg, wire)) = self.sal_reader.next() {
-            self.dispatch_top_level(&msg, wire);
-            // Replay whatever an exchange wait deferred — a tick or a delta read
-            // — now that the outer tick's ACK has been sent.
-            if !self.exchange.deferred_replay.is_empty() {
-                self.replay_deferred();
-            }
-        }
-    }
-
-    /// Replay whatever a blocking evaluation poll deferred, at top level and in
-    /// SAL arrival order. Drained into a scratch vec first — a replayed tick may
-    /// itself reach an exchange wait and defer more entries into a fresh
-    /// `deferred_replay` — and looped until the queue stays empty.
-    fn replay_deferred(&mut self) {
-        while !self.exchange.deferred_replay.is_empty() {
-            for req in std::mem::take(&mut self.exchange.deferred_replay) {
+            let req = self.decode_request(&msg, wire);
+            self.handle_request(req);
+            // Before the next group, so a deferred read sees the state it was
+            // sent against.
+            for req in std::mem::take(&mut self.deferred) {
                 self.handle_request(req);
             }
+            assert!(self.deferred.is_empty(), "a replayed request deferred another");
         }
     }
 
     /// Decode one SAL group's slot into an owned [`Request`]. The single decode
-    /// point: both dispatchers and every parked request come through here.
+    /// point: both drain loops and every parked request come through here.
     fn decode_request(&mut self, msg: &SalMessage, wire: &'static [u8]) -> Request {
         // The kinds the master frames with their target's catalog record.
         let catalog_record = matches!(msg.kind, SalMessageKind::Push | SalMessageKind::DdlSync);
@@ -258,45 +162,6 @@ impl WorkerProcess {
             },
             Err(e) => gnitz_fatal_abort!("failed to decode {:?} for tid={}: {e}", msg.kind, msg.target_id),
         }
-    }
-
-    /// Dispatch a group drained by the main run loop, with no DAG evaluation in
-    /// flight: every kind runs where it arrives.
-    fn dispatch_top_level(&mut self, msg: &SalMessage, wire: &'static [u8]) {
-        let req = self.decode_request(msg, wire);
-        self.handle_request(req);
-    }
-
-    /// Dispatch a group drained while blocked in `do_exchange_wait` for the
-    /// relay keyed `relay_wait = (view_id, source_id)`. Returns that relay when
-    /// this group is it; everything else runs or is deferred per [`in_eval`].
-    fn dispatch_in_eval(&mut self, relay_wait: (u64, u64), msg: &SalMessage, wire: &'static [u8]) -> Option<RelayHit> {
-        let req = self.decode_request(msg, wire);
-        match in_eval(req.kind) {
-            InEval::Inline => self.handle_request(req),
-            InEval::DeferPostAck => self.exchange.deferred_replay.push(req),
-            InEval::DeferPreAck => self.exchange.deferred.push(req),
-            InEval::Relay => return Some(self.take_relay(relay_wait, req)),
-        }
-        None
-    }
-
-    /// Deliver a relay to the wait blocked on exactly its `(view_id, source_id)`
-    /// pair; a relay for any other pair means this worker diverged from the master.
-    fn take_relay(&mut self, relay_wait: (u64, u64), req: Request) -> RelayHit {
-        let ipc::DecodedWire { control, schema, data_batch, .. } = req.wire;
-        let target_id = control.hdr.target_id;
-        let key = (target_id, control.hdr.arg0);
-        let drained = control.hdr.flags.drained;
-        let batch = match (data_batch, schema) {
-            (Some(b), _) => b,
-            (None, Some(s)) => Batch::empty_with_schema(&s),
-            (None, None) => gnitz_fatal_abort!("ExchangeRelay for tid={target_id} carries no schema"),
-        };
-        if key != relay_wait {
-            gnitz_fatal_abort!("ExchangeRelay for {key:?} while waiting on {relay_wait:?} — diverged from the master");
-        }
-        RelayHit { batch, drained }
     }
 
     /// Run one request, with a failure sent back on its own request id — the one
@@ -391,7 +256,16 @@ impl WorkerProcess {
             }
 
             SalMessageKind::Tick => {
-                self.handle_tick(target_id, hdr.arg0)?;
+                let tids = gnitz_wire::decode_all(&blob, "tick", |r| {
+                    let mut tids = Vec::with_capacity(r.remaining() / 8);
+                    while r.remaining() > 0 {
+                        tids.push(r.u64()?);
+                    }
+                    Ok(tids)
+                })?;
+                for (i, &tid) in tids.iter().enumerate() {
+                    self.handle_tick(tid, hdr.arg0 + i as u64);
+                }
                 self.send_ack(target_id, request_id);
                 Ok(())
             }
@@ -412,10 +286,6 @@ impl WorkerProcess {
                     .index_cols(target_id, hdr.arg1, "unique pre-flight")?;
                 self.handle_unique_preflight(target_id, cols.as_slice(), request_id)?;
                 Ok(())
-            }
-
-            SalMessageKind::ExchangeRelay => {
-                gnitz_fatal_abort!("ExchangeRelay for tid={target_id} outside an exchange wait")
             }
         }
     }
@@ -446,19 +316,18 @@ impl WorkerProcess {
     }
 
     /// Drive one view-maintenance tick of `target_id`'s dependent closure.
-    /// `round` is the tick round the master allocated for this group; every fed
+    /// `round` is the tick round the master allocated for this tid; every fed
     /// view's captured delta is stamped with it.
-    fn handle_tick(&mut self, target_id: u64, round: u64) -> Result<(), String> {
+    fn handle_tick(&mut self, target_id: u64, round: u64) {
         let delta = if let Some(d) = self.cat().dag.take_unticked(target_id) {
             d
         } else {
             match self.cat().registry.relation(target_id) {
                 Some(r) => Batch::empty_with_schema(&r.schema()),
-                None => return Ok(()),
+                None => return,
             }
         };
         self.drive_dag(Drive::Tick { source: target_id, round }, delta, false);
-        Ok(())
     }
 
     /// Answer one `ReadSpec` read, streaming the keeper back.
@@ -498,12 +367,7 @@ impl WorkerProcess {
     /// worker whose slice is drained drives empty pad chunks, so every worker runs
     /// the same exchange rounds, until [`Self::drive_dag`] reports the backfill done.
     ///
-    /// **View-scoped.** Drives ONLY `view_id` ([`Drive::Backfill`]), never the
-    /// source's whole dependent closure: the source may already have populated
-    /// dependents (live CREATE VIEW over a source with prior views; recovery
-    /// step-4 rebuild next to resumed siblings) that a closure re-drive would
-    /// double-count. A view backfill runs stop-the-world (the DDL parks the
-    /// reactor), so it never yields to live traffic between chunks.
+    /// View-scoped: see [`Drive::Backfill`].
     fn handle_backfill(&mut self, source_tid: u64, view_id: u64) -> Result<(), String> {
         self.cat().dag.rebuild_started(view_id);
         // Compiled before the first chunk: a failure here is an error reply, where the
@@ -518,10 +382,10 @@ impl WorkerProcess {
         let mut handle = self.cat().open_source_cursor(view_id, source_tid)?;
 
         loop {
-            let drained = handle.drain_chunk(chunk_rows);
-            let pad = drained.is_none();
-            let chunk = drained.unwrap_or_else(|| Batch::empty_with_schema(&schema));
-            if self.drive_dag(Drive::Backfill { view: view_id, source: source_tid }, chunk, pad) {
+            let chunk = handle.drain_chunk(chunk_rows);
+            let drained = chunk.is_none();
+            let chunk = chunk.unwrap_or_else(|| Batch::empty_with_schema(&schema));
+            if self.drive_dag(Drive::Backfill { view: view_id, source: source_tid }, chunk, drained) {
                 break;
             }
         }
@@ -683,13 +547,15 @@ impl WorkerProcess {
     }
 
     /// Run one DAG drive with the exchange context, returning its
-    /// [`DagExchangeCtx::drained`].
-    fn drive_dag(&mut self, what: Drive, delta: Batch, pad: bool) -> bool {
-        let mut ctx = DagExchangeCtx { worker: self, pad, drained: pad };
+    /// [`DagExchangeCtx::all_drained`]. `drained`: this worker's partition is.
+    fn drive_dag(&mut self, what: Drive, delta: Batch, drained: bool) -> bool {
+        let mut ctx = DagExchangeCtx {
+            worker: self,
+            own_drained: drained,
+            all_drained: drained,
+        };
         let res = crate::query::drive(&mut ctx, what, delta);
-        let drained = ctx.drained;
-        // DDL_SYNC messages deferred during exchange waits land before the ACK.
-        self.dispatch_deferred();
+        let all_drained = ctx.all_drained;
         // The one site that answers a storage fault during view maintenance:
         // restart re-derives every view from its durable base tables.
         if let Err(e) = res {
@@ -699,7 +565,7 @@ impl WorkerProcess {
                 e,
             );
         }
-        drained
+        all_drained
     }
 }
 

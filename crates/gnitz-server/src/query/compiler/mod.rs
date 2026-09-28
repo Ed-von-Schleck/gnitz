@@ -32,7 +32,7 @@ pub(super) use hydration::{Hydration, HydrationSeed};
 // a `pub(crate)` would publish it to the catalog and runtime rungs too.
 pub(super) use load::{load_circuit, read_circuit_node_row};
 pub(super) use routing::ViewMeta;
-pub(crate) use routing::{RelayRoute, OUTPUT_RELAY};
+pub(crate) use routing::OUTPUT_RELAY;
 
 /// The most nodes one view's circuit may hold.
 pub(crate) const MAX_CIRCUIT_NODES: usize = 16_384;
@@ -255,7 +255,7 @@ fn emits_replica(plan: &SubPlan, registry: &RelationRegistry) -> bool {
 /// plan.
 ///
 /// It carries no routing: that lives once on the `ViewMeta` derived at the
-/// view's registration, which the worker dispatch and the master relay both read.
+/// view's registration.
 pub(super) struct CompileOutput {
     /// One per `ExchangeShard`, in circuit order, each relayed into `post`.
     pub(in crate::query) sides: Vec<Side>,
@@ -300,7 +300,7 @@ pub(super) fn compile_view(
         let Built { plan, partial, .. } =
             build_plan(loaded, &side.nodes, registry, &mut layout, self_contained, &[], out)?;
         let schema = *plan.vm.program.out_schema();
-        // The relay routes by this spec mid-round, where a refusal aborts the master.
+        // Workers route by this spec mid-round, where a refusal is fatal.
         ScatterSpec::GroupKey(side.cols).check(&schema)?;
         seeds.push(Seed {
             shard: side.shard,

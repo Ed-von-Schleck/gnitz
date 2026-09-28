@@ -5,7 +5,7 @@
 //! statically false/`None` in a release build, so the guarded branch is dead
 //! code the optimizer drops: no call site needs its own `#[cfg]`, and a seam
 //! cannot leak into a release binary. The variable is read once per process —
-//! it cannot change mid-run, and several seams sit on per-push or per-relay
+//! it cannot change mid-run, and several seams sit on per-push or per-tick
 //! paths where a fresh `std::env::var` would allocate every call.
 //!
 //! Which build decides is *this* crate's: the `cfg!(debug_assertions)` below is

@@ -25,7 +25,7 @@ pub(crate) unsafe fn make_ring(msg_sz: usize, n_msgs: usize, slack: u64) -> Shar
     test_ring(capacity as usize)
 }
 
-/// The wake sequence the master's `SalWake` has published on `ring`.
+/// The wake sequence every `SalWake` on `ring` has bumped.
 ///
 /// # Safety
 /// As [`test_ring`]: `ring` is a live, initialized region.

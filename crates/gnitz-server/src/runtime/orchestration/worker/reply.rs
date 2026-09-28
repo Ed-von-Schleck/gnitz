@@ -32,10 +32,7 @@ fn reply_frame(route: ReplyRoute, last: bool) -> WireMsg<'static> {
 impl PendingScan {
     /// Emit this train's next frame, returning whether more remain.
     fn emit_next(&mut self, w2m: &W2mWriter, budget: usize) -> Result<bool, gnitz_wire::WireFault> {
-        let route = self.route;
-        let end = send_train_frame(w2m, route.request_id, &self.batch, self.next_row, budget, |last| {
-            reply_frame(route, last)
-        })?;
+        let end = send_train_frame(w2m, self.route, &self.batch, self.next_row, budget, true)?;
         self.next_row = end;
         Ok(end < self.batch.len())
     }
@@ -57,15 +54,7 @@ impl WorkerProcess {
     /// Reply with `batch`: one frame now when it fits and `route.fifo` is clear,
     /// else a train queued behind the others.
     pub(super) fn send_reply(&mut self, route: ReplyRoute, batch: impl Borrow<Batch> + Into<Rc<Batch>>) {
-        if !route.fifo
-            && emit_whole_if_fits(
-                &self.w2m_writer,
-                route.request_id,
-                batch.borrow(),
-                self.reply_frame_budget,
-                |last| reply_frame(route, last),
-            )
-        {
+        if !route.fifo && emit_whole_if_fits(&self.w2m_writer, route, batch.borrow(), self.reply_frame_budget, true) {
             return;
         }
         self.pending_streams
@@ -92,71 +81,48 @@ impl WorkerProcess {
     }
 }
 
-/// Emit `batch` whole as one terminal frame if it fits `budget` — heap and all,
-/// over the source batch, so no sub-batch is built. `frame(last)` builds all but
-/// the payload.
-fn emit_whole_if_fits<'a>(
-    w2m: &W2mWriter,
-    req: u32,
-    batch: &'a Batch,
-    budget: usize,
-    frame: impl Fn(bool) -> WireMsg<'a>,
-) -> bool {
+/// Emit `batch` whole as one frame if it fits `budget` — heap and all, over the
+/// source batch, so no sub-batch is built. `ends_train`: its last frame is the
+/// train's.
+fn emit_whole_if_fits(w2m: &W2mWriter, route: ReplyRoute, batch: &Batch, budget: usize, ends_train: bool) -> bool {
     let msg = WireMsg {
         data: WireData::Whole(batch),
-        ..frame(true)
+        ..reply_frame(route, ends_train)
     };
     if !batch.is_empty() && msg.size() > budget {
         return false;
     }
-    w2m.send_msg(req, &msg);
+    w2m.send_msg(route.request_id, &msg);
     true
 }
 
 /// Send the frame of `batch` that starts at row `start`, flagged last when it
-/// reaches the end; `Ok` is the row after it. `Err` is a row too wide for any
-/// frame.
-fn send_train_frame<'a>(
+/// reaches the end and `ends_train`; `Ok` is the row after it. `Err` is a row
+/// too wide for any frame.
+fn send_train_frame(
     w2m: &W2mWriter,
-    req: u32,
-    batch: &'a Batch,
+    route: ReplyRoute,
+    batch: &Batch,
     start: usize,
     budget: usize,
-    frame: impl Fn(bool) -> WireMsg<'a>,
+    ends_train: bool,
 ) -> Result<usize, gnitz_wire::WireFault> {
-    if start == 0 && emit_whole_if_fits(w2m, req, batch, budget, &frame) {
+    if start == 0 && emit_whole_if_fits(w2m, route, batch, budget, ends_train) {
         return Ok(batch.len());
     }
-    let (chunk, size) = batch.wire_chunk_within(start, frame(false).size(), budget);
+    let (chunk, size) = batch.wire_chunk_within(start, reply_frame(route, false).size(), budget);
     if size > gnitz_wire::MAX_FRAME_PAYLOAD {
         return Err(crate::runtime::wire::oversized_frame_message(size).into());
     }
     let end = start + chunk.rows();
     w2m.send_msg(
-        req,
+        route.request_id,
         &WireMsg {
             data: WireData::of_chunk(batch, start, &chunk),
-            ..frame(end == batch.len())
+            ..reply_frame(route, ends_train && end == batch.len())
         },
     );
     Ok(end)
-}
-
-/// Send all of `batch` now, as frames within `budget`.
-pub(super) fn send_train<'a>(
-    w2m: &W2mWriter,
-    req: u32,
-    batch: &'a Batch,
-    budget: usize,
-    frame: impl Fn(bool) -> WireMsg<'a>,
-) -> Result<(), gnitz_wire::WireFault> {
-    let mut start = 0;
-    loop {
-        start = send_train_frame(w2m, req, batch, start, budget, &frame)?;
-        if start == batch.len() {
-            return Ok(());
-        }
-    }
 }
 
 /// Send `keys` to the master as one train over `frame_schema`, a span per row's
@@ -184,10 +150,16 @@ pub(crate) fn send_unique_preflight_keys(
             chunk.push_key_row(keys.next().expect("producer lends `remaining` spans"), 1);
         }
         let drained = keys.remaining() == 0;
-        send_train(w2m_writer, request_id, &chunk, budget, |last| {
-            reply_frame(route, drained && last)
-        })
-        .expect("a key span fits a frame");
+        // Every chunk sends at least one frame, so an empty key set still ends
+        // its train.
+        let mut start = 0;
+        loop {
+            start =
+                send_train_frame(w2m_writer, route, &chunk, start, budget, drained).expect("a key span fits a frame");
+            if start == chunk.len() {
+                break;
+            }
+        }
         if drained {
             break;
         }

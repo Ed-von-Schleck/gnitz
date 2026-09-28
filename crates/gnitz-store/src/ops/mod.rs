@@ -7,7 +7,7 @@
 //!   - `topn`      — per-group top-N over an ordered index of every input row
 //!   - `order_image` — the byte images both indexes order by
 //!   - `distinct`  — the weight clamps every set operation is built from
-//!   - `exchange`  — repartition, relay and broadcast across workers
+//!   - `exchange`  — repartition and broadcast across workers
 //!   - `group_key` — the shared key machinery
 //!
 //! Every operator kernel is `pub`, because the VM that dispatches to them is in
@@ -35,7 +35,7 @@ mod bench_join;
 
 pub use distinct::{op_weight_clamp, ClampPreset};
 pub use exchange::op_worker_filter;
-pub use exchange::{op_relay_scatter, ScatterSpec};
+pub use exchange::{op_exchange_gather, op_exchange_route, ScatterSpec};
 pub use join::{op_join_delta_trace, JoinPlan, JoinProbe};
 pub use linear::{null_extend_output_schema, op_union, union_nullability_merge};
 pub use linear::{op_filter, op_negate};

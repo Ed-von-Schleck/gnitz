@@ -476,13 +476,16 @@ fn concurrent_publish_drains_in_order(case: &str, ring_frames: usize, n: u64, pa
             // everything the writer published was already consumed. Reading it
             // after would blame a frame the writer had not published yet.
             let writer_done = done.load(Ordering::Acquire);
-            match receiver.try_read_slot(0).map(|s| (s.internal_req_id, s.decode())) {
-                Some((id, decoded)) => {
+            match receiver
+                .try_read_slot(0)
+                .map(|s| (s.internal_req_id, s.bytes()[s.control().blob].to_vec()))
+            {
+                Some((id, blob)) => {
                     assert_eq!(
                         id as u64, next_expected,
                         "{case}: frames arrived out of order at req_id={next_expected}"
                     );
-                    assert_eq!(decoded.blob, pad, "{case}: payload corrupted at req_id={next_expected}");
+                    assert_eq!(blob, pad, "{case}: payload corrupted at req_id={next_expected}");
                     next_expected += 1;
                 }
                 None if writer_done => panic!(
@@ -505,7 +508,7 @@ fn concurrent_publish_drains_in_order(case: &str, ring_frames: usize, n: u64, pa
     // finishes rather than unwinding straight into `join`.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(drain));
     while !done.load(Ordering::Acquire) {
-        while receiver.try_read_slot(0).map(|s| s.decode()).is_some() {}
+        while receiver.try_read_slot(0).map(|s| s.control()).is_some() {}
         std::thread::yield_now();
     }
     writer_thread.join().expect("writer thread");
@@ -538,8 +541,8 @@ fn w2m_control_only_reply_has_no_backing() {
     let slot = receiver.try_read_slot(0).expect("an ACK");
     assert_eq!(slot.internal_req_id, 42);
     assert!(
-        slot.decode().data_batch.is_none(),
-        "control-only ACK must have no data_batch"
+        slot.control().data.is_none(),
+        "control-only ACK must have no data block"
     );
 }
 
@@ -591,4 +594,15 @@ fn a_parked_worker_wakes_on_a_forked_masters_sal_wake() {
         assert_eq!(seq(), 1, "the park ended on the wake");
     });
     unsafe { assert_child_exited_ok(pid) };
+}
+
+/// Every `SalWake` on one ring advances the same sequence: the master's wake and
+/// an exchange peer's both count, whichever lands first.
+#[test]
+fn every_sal_wake_on_a_ring_advances_its_sequence() {
+    let region = unsafe { make_ring(CTRL_HEADER_SIZE, 2, 8) };
+    let (master, peer) = unsafe { (SalWake::new(region.ptr()), SalWake::new(region.ptr())) };
+    master.wake();
+    peer.wake();
+    assert_eq!(unsafe { super::fixtures::sal_wake_seq(region.ptr()) }, 2);
 }

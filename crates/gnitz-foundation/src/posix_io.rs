@@ -115,6 +115,15 @@ pub fn madvise_hugepage(ptr: *mut u8, size: usize) {
     }
 }
 
+/// Free the pages of [ptr, ptr+size) in a shared mapping (`MADV_REMOVE`), in
+/// every process that maps them; they read back as zeros. Best-effort: an error
+/// only leaves the pages resident.
+pub fn madvise_remove(ptr: *mut u8, size: usize) {
+    unsafe {
+        libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_REMOVE);
+    }
+}
+
 /// An anonymous read-write mapping shared with every `fork()`ed child. Not
 /// commit-charged (`MAP_NORESERVE`), so a mapping sized far above its live
 /// occupancy does not fail under `vm.overcommit_memory=2`.

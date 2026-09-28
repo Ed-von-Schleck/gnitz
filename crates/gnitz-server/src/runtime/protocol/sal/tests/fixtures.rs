@@ -88,6 +88,15 @@ impl TestLog {
         self.writer.mark_synced(self.writer.epoch(), offset);
     }
 
+    /// The exact number of SAL bytes [`SalWriter::write`] consumes for `g`; the
+    /// checkpoint band is not included.
+    pub(crate) fn footprint(&self, g: &DirectGroup) -> usize {
+        let nw = self.writer.num_workers();
+        let mut sizes = vec![0u32; nw];
+        g.slot_sizes_into(&mut sizes);
+        group_total_size(nw, sizes.iter().copied())
+    }
+
     /// Append one group whose slots are `payloads` verbatim; returns its base.
     pub(crate) fn write(&self, target: u64, lsn: u64, kind: SalMessageKind, payloads: &[&[u8]]) -> u64 {
         self.try_write(target, lsn, kind, 0, payloads).expect("group fits")
@@ -95,14 +104,14 @@ impl TestLog {
 
     /// [`Self::write`] with the flag byte given and the writer's verdict
     /// reported.
-    pub(crate) fn try_write(
+    pub(super) fn try_write(
         &self,
         target: u64,
         lsn: u64,
         kind: SalMessageKind,
         flags: u8,
         payloads: &[&[u8]],
-    ) -> Result<u64, SalFit> {
+    ) -> Result<u64, WireFault> {
         let base = self.lay_out(target, lsn, kind, flags, payloads)?;
         self.writer.publish(base);
         Ok(base as u64)
@@ -117,7 +126,7 @@ impl TestLog {
         kind: SalMessageKind,
         flags: u8,
         payloads: &[&[u8]],
-    ) -> Result<usize, SalFit> {
+    ) -> Result<usize, WireFault> {
         let sizes: Vec<u32> = payloads.iter().map(|p| p.len() as u32).collect();
         self.writer.write_slots(target, lsn, kind, flags, 0, &sizes, |w, slot| {
             slot.copy_from_slice(payloads[w])

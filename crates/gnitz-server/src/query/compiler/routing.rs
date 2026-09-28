@@ -1,14 +1,14 @@
 //! The plan-free facts of a view's circuit: how each source's delta is routed
 //! into it, the placement its store registers under, and the shape facts the
-//! worker dispatch and the backfill cursor read. Nothing here emits, so the
-//! master can ask without compiling.
+//! worker dispatch and the backfill cursor read. Nothing here emits, so it can
+//! be read without compiling.
 
 use super::*;
 use gnitz_store::schema::Placement;
 use gnitz_wire::ReadBound;
 
-/// How the master relay routes one source's delta into a view.
-#[derive(Debug, PartialEq)]
+/// How each worker routes its partition of one source's delta into a view.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum RelayRoute {
     /// Pure range join (`n_eq == 0`) or cross join: the matches are spread over
     /// the whole other side, so every worker needs the full delta and trims to
@@ -22,15 +22,24 @@ pub(crate) enum RelayRoute {
     JoinKey(Box<[gnitz_wire::ReindexSlot]>),
 }
 
+impl RelayRoute {
+    /// The scatter this route splits a partition by; `None` for a broadcast.
+    pub(crate) fn spec(&self) -> Option<ScatterSpec<'_>> {
+        match self {
+            RelayRoute::Broadcast => None,
+            RelayRoute::JoinKey(slots) => Some(ScatterSpec::JoinKey(slots)),
+        }
+    }
+}
+
 /// The source id a round carries when it is not a source's own scatter: a
 /// side's relayed output, which routes by the view's own shard columns.
 pub(crate) const OUTPUT_RELAY: u64 = 0;
 
-/// Per-view circuit metadata, derived from one circuit load — the master's relay
-/// key and the worker's scatter set together, so the two processes cannot derive
-/// disagreeing halves.
+/// Per-view circuit metadata, derived from one circuit load: every worker routes
+/// its own partitions by it, so no two workers can route one round differently.
 pub(crate) struct ViewMeta {
-    /// source table id → how the master routes the delta this source scatters.
+    /// source table id → how a worker routes the delta this source scatters.
     /// A source absent from it does not scatter.
     source_routes: FxHashMap<u64, RelayRoute>,
     /// The view's own shard columns; its output relay routes each row to the
@@ -116,8 +125,8 @@ impl ViewMeta {
             if skips {
                 continue;
             }
-            // The relay scatters by this key mid-round, where a refusal aborts
-            // the master.
+            // Every worker scatters by this key mid-round, where a refusal aborts
+            // it.
             if let RelayRoute::JoinKey(slots) = &route {
                 ScatterSpec::JoinKey(slots)
                     .check(&schema)
@@ -135,7 +144,7 @@ impl ViewMeta {
         Ok((meta, placement))
     }
 
-    /// How the master relay routes `source_id`'s delta into this view, `None`
+    /// How a worker routes `source_id`'s delta into this view, `None`
     /// when that source does not scatter: its rows are already where the view
     /// needs them, and a route would name a key they were never stored under.
     pub(crate) fn source_route(&self, source_id: u64) -> Option<&RelayRoute> {
@@ -385,9 +394,8 @@ fn scan_through_row_local(loaded: &LoadedCircuit, enid: NodeId) -> Option<(u64, 
     }
 }
 
-/// How a view's join, if it has one, needs its inputs placed — what the master
-/// relay routes a source's delta by, and whether any source can skip the
-/// scatter.
+/// How a view's join, if it has one, needs its inputs placed — what a worker
+/// routes a source's delta by, and whether any source can skip the scatter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JoinRelay {
     /// An equi join, whose matches share a key — as a GROUP BY's groups do.

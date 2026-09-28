@@ -696,6 +696,15 @@ pub(crate) fn run_merge<S: ColumnarSource>(
     with_payload_cmp!(schema, run_merge_body, sources, &mut cursors, schema, emit)
 }
 
+/// Z-set `+` of `sources`, each consolidated, as one consolidated batch.
+pub(crate) fn merge_consolidated<S: ColumnarSource>(sources: &[S], schema: &SchemaDescriptor) -> Batch {
+    let mut rows: Vec<(u32, u32, i64)> = Vec::with_capacity(sources.iter().map(|s| s.row_count()).sum());
+    run_merge(sources, schema, |src, row, w| rows.push((src as u32, row as u32, w)));
+    let mut out = super::scatter::UnifiedSet::whole(sources, schema).materialize(&rows, rows.len());
+    out.certify_layout(Layout::Consolidated);
+    out
+}
+
 /// A `RowSource` that also carries the Z-set weight: a storage row the N-way
 /// merge folds.
 pub(crate) trait ColumnarSource: RowSource {

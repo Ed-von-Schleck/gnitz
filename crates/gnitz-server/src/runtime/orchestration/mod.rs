@@ -43,8 +43,8 @@ pub(super) mod worker;
 /// propagates through `tick` and takes the process down. Two kinds of call site
 /// wrap against that, and they want opposite things from the `Err`: a request
 /// handler returns it to the client as `WireStatus::Error` and stays live, while a
-/// site whose panic would leave master and workers inconsistent — relay
-/// emission, DDL compensation, view backfill and re-stamp — turns it into
+/// site whose panic would leave master and workers inconsistent — DDL
+/// compensation, view backfill — turns it into
 /// `gnitz_fatal_abort!`. Which one a site is, is in its `Err` arm, not here.
 ///
 /// Debug and test builds only: release is `panic = "abort"` (`crates/Cargo.toml`),

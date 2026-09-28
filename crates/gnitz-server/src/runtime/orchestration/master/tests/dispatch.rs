@@ -66,19 +66,20 @@ fn check_workers_keeps_reporting_a_dead_worker() {
 /// the worker and the caller's own phase — not wait on the ACK.
 #[test]
 fn ack_collection_errors_when_a_worker_is_dead() {
-    for ctx in ["checkpoint base round", "backfill relay"] {
+    for ctx in ["checkpoint base round", "backfill"] {
         let disp = Rc::new(test_dispatcher(vec![spawn_and_reap_dead()], std::ptr::null_mut()));
         let d = Rc::clone(&disp);
         let err = disp
             .reactor()
-            .block_on(async move { d.broadcast_round(ctx, false, |_, _| Ok(())).await })
+            .block_on(async move { d.broadcast_round(ctx, |_, _| Ok(())).await })
             .expect_err("a dead worker must fail ack collection");
         assert!(err.text.contains("worker 0") && err.text.contains(ctx), "{err}");
     }
 }
 
-/// A worker that fails before it joins a round leaves the others in their
-/// exchange wait, never ACKing: the error ends the round without their ACKs.
+/// A worker that fails before it joins an exchange round leaves the others in
+/// their exchange wait, never ACKing: the error ends the round without their
+/// ACKs.
 #[test]
 fn a_round_fails_on_a_worker_error_without_the_other_acks() {
     let (disp, writers) = test_dispatcher_with_writers(vec![0, 0]);
@@ -87,7 +88,7 @@ fn a_round_fails_on_a_worker_error_without_the_other_acks() {
     let err = disp
         .reactor()
         .block_on(async move {
-            d.broadcast_round("backfill relay", false, |_, targets| {
+            d.broadcast_round("backfill", |_, targets| {
                 let GroupTargets::Leased { request_id, .. } = targets else {
                     unreachable!("a round broadcasts")
                 };
@@ -111,7 +112,7 @@ fn a_round_keeps_its_write_refusals_status() {
     let err = disp
         .reactor()
         .block_on(async move {
-            d.broadcast_round("view tick drain", false, |_, _| {
+            d.broadcast_round("view tick drain", |_, _| {
                 Err(gnitz_wire::WireFault {
                     status: WireStatus::SalFull,
                     text: "SAL full".into(),
@@ -140,7 +141,7 @@ fn a_round_lets_other_tasks_run() {
         let d = Rc::clone(&disp);
         disp.reactor()
             .block_on(async move {
-                d.broadcast_round("view tick drain", false, |_, targets| {
+                d.broadcast_round("view tick drain", |_, targets| {
                     let GroupTargets::Leased { request_id, .. } = targets else {
                         unreachable!("a round broadcasts")
                     };
@@ -191,9 +192,9 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
     engine.close();
 }
 
-/// A whole checkpoint is `reclaim_base` + `restamp_derived`: the base round owns
-/// the one generation bump that invalidates every checkpointed view, and the
-/// ephemeral round re-stamps the derived state at that same generation, so
+/// A whole checkpoint is `checkpoint_base` + an ephemeral round: the base round
+/// owns the one generation bump that invalidates every checkpointed view, and
+/// the ephemeral round re-stamps the derived state at that same generation, so
 /// nothing is left rebuild-on-boot.
 #[test]
 fn a_checkpoint_bumps_the_generation_once_and_restamps_at_it() {
@@ -204,11 +205,12 @@ fn a_checkpoint_bumps_the_generation_once_and_restamps_at_it() {
     // Epoch 0 is the empty-slot sentinel, so the region needs a boot reset
     // before any group is written — what `server_main` does after worker ACKs.
     try_poll_once(disp.sal().lock()).expect("uncontended").boot_rewind(1);
+    let stale = |d: &super::MasterDispatcher| d.cat().durable_generation() > d.last_ephemeral_gen.get();
 
     let gen = disp.cat().durable_generation();
     let d = Rc::clone(&disp);
     disp.reactor()
-        .block_on(async move { d.reclaim_base(&mut d.sal().lock().await).await })
+        .block_on(async move { d.checkpoint_base().await })
         .unwrap();
     assert_eq!(
         disp.cat().durable_generation(),
@@ -216,17 +218,16 @@ fn a_checkpoint_bumps_the_generation_once_and_restamps_at_it() {
         "the base round bumps exactly once"
     );
     assert!(
-        disp.derived_needs_restamp(),
+        stale(&disp),
         "the base round alone leaves every derived manifest behind the new generation"
     );
 
-    // Empty drain set: zero workers hold no pending deltas.
     let d = Rc::clone(&disp);
     disp.reactor()
-        .block_on(async move { d.restamp_derived(&[]).await })
+        .block_on(async move { d.flush(super::FlushRound::Ephemeral).await })
         .unwrap();
     assert!(
-        !disp.derived_needs_restamp(),
+        !stale(&disp),
         "the ephemeral round re-validates the derived state at the durable generation"
     );
 
@@ -239,7 +240,7 @@ fn a_checkpoint_bumps_the_generation_once_and_restamps_at_it() {
         gen + 1,
         "boot_checkpoint restamps at the reserved generation without a bump",
     );
-    assert!(!disp.derived_needs_restamp());
+    assert!(!stale(&disp));
 
     drop(disp);
     engine.close();

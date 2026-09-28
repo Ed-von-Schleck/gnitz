@@ -3,7 +3,7 @@
 use std::rc::Rc;
 
 use gnitz_store::schema::{decode_schema_block, encode_schema_block, SchemaDescriptor};
-use gnitz_store::storage::{Batch, Layout, WireChunk, MAX_BATCH_REGIONS};
+use gnitz_store::storage::{Batch, Layout, WireChunk};
 use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::{WireFlags, WireStatus};
 
@@ -125,12 +125,23 @@ impl<'a> WireData<'a> {
         }
     }
 
-    fn wire_byte_size(&self) -> usize {
+    /// Bytes [`Self::encode`] writes.
+    pub(crate) fn wire_byte_size(&self) -> usize {
         match *self {
             WireData::None => 0,
             WireData::Whole(b) => b.wire_byte_size(),
             WireData::Range { batch, rows, .. } => batch.wire_byte_size_range(rows),
             WireData::Scattered { batch, indices } => batch.wire_byte_size_range(indices.len()),
+        }
+    }
+
+    /// The rows as one WAL block at the front of `out`; returns bytes written.
+    pub(crate) fn encode(&self, out: &mut [u8]) -> usize {
+        match *self {
+            WireData::None => 0,
+            WireData::Whole(b) => b.encode_to_wire(out),
+            WireData::Range { batch, start, rows } => batch.encode_range_to_wire(start, rows, out),
+            WireData::Scattered { batch, indices } => batch.encode_scattered_to_wire(indices, out),
         }
     }
 }
@@ -203,12 +214,7 @@ impl<'a> WireMsg<'a> {
         );
 
         if has_data {
-            pos += match self.data {
-                WireData::None => unreachable!("has_data implies a batch"),
-                WireData::Whole(b) => b.encode_to_wire(&mut out[pos..]),
-                WireData::Range { batch, start, rows } => batch.encode_range_to_wire(start, rows, &mut out[pos..]),
-                WireData::Scattered { batch, indices } => batch.encode_scattered_to_wire(indices, &mut out[pos..]),
-            };
+            pos += self.data.encode(&mut out[pos..]);
         }
 
         assert_eq!(pos, out.len(), "WireMsg::size and encode disagree");
@@ -271,22 +277,6 @@ pub fn decode_sal_slot(
         |record: &[u8]| Ok(known(tid, record)),
         Batch::decode_from_wal_block,
     )?;
-    certify_engine_frame(&mut decoded);
-    Ok(decoded)
-}
-
-/// Decode one W2M ring frame into an owned `DecodedWire`. The append relocates
-/// the blob heap: an exchange frame can carry a whole unfiltered heap, and this
-/// is where it is compacted.
-pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, String> {
-    let control = peek_control_block(data)?;
-    let mut decoded = decode_frame(data, control, None, unknown, |block, schema| {
-        let mut offsets = [0usize; MAX_BATCH_REGIONS];
-        let mb = gnitz_store::storage::decode_mem_batch_from_wal_block(block, schema, &mut offsets)?;
-        let mut owned = Batch::with_capacity(schema, mb.len());
-        owned.append_mem_batch(&mb);
-        Ok(owned)
-    })?;
     certify_engine_frame(&mut decoded);
     Ok(decoded)
 }

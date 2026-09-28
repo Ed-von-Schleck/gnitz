@@ -265,8 +265,7 @@ impl<'a> GroupData<'a> {
 pub(crate) struct DirectGroup<'a> {
     pub(crate) kind: SalMessageKind,
     /// Every slot's message; `msg` fills in `data` per slot, and drops
-    /// `schema_block` from a rowless one unless
-    /// [`SalMessageKind::schema_survives_a_rowless_slot`].
+    /// `schema_block` from a slot that carries no rows.
     pub(crate) template: WireMsg<'a>,
     pub(crate) data: GroupData<'a>,
     /// Slot `w`'s blob in place of the template's, when every worker is sent
@@ -303,10 +302,9 @@ impl<'a> DirectGroup<'a> {
             GroupData::Batches(b) => WireData::Whole(&b[w]),
             GroupData::Scattered { batch, rows } => WireData::Scattered { batch, indices: &rows[w] },
         };
-        let keeps_schema = data.row_count() > 0 || self.kind.schema_survives_a_rowless_slot();
         WireMsg {
             data,
-            schema_block: self.template.schema_block.filter(|_| keeps_schema),
+            schema_block: self.template.schema_block.filter(|_| data.row_count() > 0),
             blob: self.extras.map_or(self.template.blob, |e| &e[w]),
             ..self.template
         }
@@ -395,38 +393,6 @@ fn effective_max(kind: SalMessageKind, ring_len: usize) -> usize {
     ring_len.saturating_sub(held_back(kind))
 }
 
-/// Whether a group of a given size can be written, and if not, whether a
-/// checkpoint would change that.
-///
-/// A **pre-write** verdict, and the only place the distinction is visible: a
-/// group already handed to the writer comes back as a [`WireFault`], so no write
-/// path can tell "retry in pieces" from "checkpoint and retry whole".
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum SalFit {
-    /// Fits the remaining space — emit it.
-    Fits,
-    /// Fits an empty SAL but not the current remainder: a checkpoint reclaims
-    /// enough space, so a retry can succeed.
-    Transient,
-    /// Exceeds the SAL outright — no checkpoint can help; retrying is futile.
-    Terminal,
-}
-
-impl SalFit {
-    /// The client-facing refusal for a group of `kind` that did not fit. Carries
-    /// [`WireStatus::SalFull`], which is what a caller matches to tell this refusal
-    /// from a real failure; the transient/terminal distinction stays typed and is
-    /// not spelled into the text. The write cursor is deliberately absent — this
-    /// reaches clients verbatim — and goes to the operator log instead.
-    fn refusal(self, kind: SalMessageKind) -> WireFault {
-        debug_assert_ne!(self, SalFit::Fits, "a fitting group has no refusal");
-        WireFault {
-            status: WireStatus::SalFull,
-            text: format!("SAL full: {kind:?} group did not fit"),
-        }
-    }
-}
-
 /// Floor for a `GNITZ_SAL_BYTES` override — must comfortably exceed one DDL zone
 /// plus the checkpoint headroom.
 const MIN_SAL_BYTES: usize = 16 << 20;
@@ -444,10 +410,6 @@ pub(in crate::runtime) fn sal_mmap_size() -> usize {
     }
     size
 }
-
-/// The fraction of the mapping the relay reclaim margin is: `mmap >> 3`, one
-/// eighth. How much must be **free**.
-const RECLAIM_FRACTION_SHIFT: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Group kinds
@@ -468,8 +430,6 @@ gnitz_wire::wire_enum! {
         FlushEph = 3,
         /// Catalog mutation.
         DdlSync = 4,
-        /// `arg0` = the source relation.
-        ExchangeRelay = 5,
         /// Initial full-source scan feeding a newly created view: `target_id` =
         /// the source, `arg0` = the view.
         Backfill = 6,
@@ -482,7 +442,8 @@ gnitz_wire::wire_enum! {
         /// column list in `arg1` for the master's merge.
         UniquePreflight = 8,
         Push = 9,
-        /// Drive one view-maintenance tick: `arg0` = the tick round.
+        /// Drive one view-maintenance tick per tid: `arg0` = the first tid's
+        /// round; the blob = the tids, `u64` LE, rounds consecutive.
         Tick = 10,
         /// A parameterized bounded read: the blob = the encoded `ReadSpec`,
         /// `arg0` = the reply layout digest.
@@ -494,20 +455,6 @@ gnitz_wire::wire_enum! {
 }
 
 impl SalMessageKind {
-    /// Whether a slot of this kind still needs the group's schema block when it
-    /// carries no rows — the *handler's* behaviour on an empty slot decides, so
-    /// this is per-kind and not per-writer: an `ExchangeRelay` builds its batch
-    /// from the block alone, a `Push` reaches a no-op, a `HasPk` never has one,
-    /// and a `Backfill` reads its source's schema off its own catalog.
-    fn schema_survives_a_rowless_slot(self) -> bool {
-        use SalMessageKind::*;
-        match self {
-            Push | HasPk | Backfill => false,
-            Scan | Shutdown | Flush | FlushEph | DdlSync | ExchangeRelay | UniquePreflight | Tick | ScanSpec
-            | DeltaRead => true,
-        }
-    }
-
     /// Whether the template's blob is a `ReadSpec` whose bound routes the read.
     pub(crate) const fn carries_read_bound(self) -> bool {
         matches!(self, SalMessageKind::ScanSpec)
@@ -849,9 +796,9 @@ pub(crate) struct SalWriter {
     /// The anchored synced offset of the live epoch.
     synced: Cell<u64>,
     checkpoint_threshold: u64,
-    /// A group was refused as [`SalFit::Transient`] since the last reset: a
-    /// checkpoint would admit it, so one is warranted whatever the write cursor
-    /// says. Cleared by [`Self::rewind`].
+    /// A group was refused since the last reset that an empty log would admit,
+    /// so a checkpoint is warranted whatever the write cursor says. Cleared by
+    /// [`Self::rewind`].
     refused_transient: Cell<bool>,
     /// Slots per group: the group header's `slot_count`, the directory's length
     /// and every slot offset are all this. It is the log's framing, so it is the
@@ -900,52 +847,12 @@ impl SalWriter {
         self.num_workers
     }
 
-    /// Classify `need` bytes against `cap` and the live cursor: past the cap
-    /// outright no checkpoint can help, past what is left of it one can. The one
-    /// spelling of the rule — [`Self::write_slots`] admits a group by it, and
-    /// [`Self::fit_relay`] answers for a caller that has not written one yet.
-    fn fit_within(&self, cap: usize, need: usize) -> SalFit {
-        if need > cap {
-            SalFit::Terminal
-        } else if need > cap.saturating_sub(self.write_cursor.get() as usize) {
-            SalFit::Transient
-        } else {
-            SalFit::Fits
-        }
-    }
-
-    /// Whether relay group `g` may be written, refusing also while less than the
-    /// reclaim margin is free, so a reclaim lands on a writer with room to spare.
-    pub(crate) fn fit_relay(&self, g: &DirectGroup) -> SalFit {
-        self.fit_relay_bytes(self.footprint(g))
-    }
-
-    /// [`Self::fit_relay`] for a relay of `need` bytes.
-    fn fit_relay_bytes(&self, need: usize) -> SalFit {
-        self.fit_within(
-            effective_max(SalMessageKind::ExchangeRelay, self.log.ring_len),
-            need.max(self.reclaim_margin()),
-        )
-    }
-
-    /// Less than the reclaim margin is free, so a relay-sized group would be
-    /// refused.
-    pub(crate) fn below_reclaim_margin(&self) -> bool {
-        self.fit_relay_bytes(0) != SalFit::Fits
-    }
-
-    /// The margin below which the SAL is "running low": one eighth of the
-    /// mapping. The single name for it — a relay is refused below it so the
-    /// reclaim lands on a writer with room to spare rather than on one that has
-    /// run out.
-    fn reclaim_margin(&self) -> usize {
-        self.log.ring_len >> RECLAIM_FRACTION_SHIFT
-    }
-
     /// Lay one group out at the write cursor, `fill(worker, slot)` per non-empty
     /// slot, and return its base — the group is complete on the log but not yet
-    /// published, which [`Self::publish`] does. A refused group
-    /// leaves the log untouched. A zone member (`lsn != 0`) checksums every slot.
+    /// published, which [`Self::publish`] does. A group that does not fit is
+    /// refused with [`WireStatus::SalFull`] and leaves the log untouched; the
+    /// refusal reaches clients verbatim, so the cursor goes to the operator log
+    /// instead. A zone member (`lsn != 0`) checksums every slot.
     #[allow(clippy::too_many_arguments)]
     fn write_slots(
         &self,
@@ -956,7 +863,7 @@ impl SalWriter {
         request_id: u32,
         sizes: &[u32],
         mut fill: impl FnMut(usize, &mut [u8]),
-    ) -> Result<usize, SalFit> {
+    ) -> Result<usize, WireFault> {
         assert!(
             sizes.len() <= MAX_WORKERS,
             "a SAL group cannot carry more than MAX_WORKERS slots"
@@ -969,22 +876,26 @@ impl SalWriter {
 
         let hdr_size = group_header_size(sizes.len());
         let total = group_total_size(sizes.len(), sizes.iter().copied());
-        let fit = self.fit_within(effective_max(kind, self.log.ring_len), total);
-        if fit != SalFit::Fits {
+        let cap = effective_max(kind, self.log.ring_len);
+        if total > cap.saturating_sub(self.write_cursor.get() as usize) {
             // On the writer, not on the scope: the group did not fit whether or
-            // not a rolled-back transaction contained it.
-            if fit == SalFit::Transient {
+            // not a rolled-back transaction contained it. One that fits an empty
+            // log is a checkpoint away from fitting.
+            if total <= cap {
                 self.refused_transient.set(true);
             }
             gnitz_debug!(
-                "SAL group refused as {:?}: cursor={} mmap={} epoch={} need={}",
-                fit,
+                "SAL group refused: cursor={} mmap={} epoch={} need={} cap={}",
                 self.write_cursor.get(),
                 self.log.ring_len,
                 epoch,
-                total
+                total,
+                cap
             );
-            return Err(fit);
+            return Err(WireFault {
+                status: WireStatus::SalFull,
+                text: format!("SAL full: {kind:?} group did not fit"),
+            });
         }
 
         let base = self.write_cursor.get() as usize;
@@ -1113,34 +1024,23 @@ impl SalWriter {
         let mut sizes = [0u32; MAX_WORKERS];
         g.slot_sizes_into(&mut sizes[..nw]);
         let (request_id, flags) = g.targets.request();
-        let laid_out = self
-            .write_slots(
-                g.template.target_id,
-                lsn,
-                g.kind,
-                flags,
-                request_id,
-                &sizes[..nw],
-                |w, slot| g.msg(w).encode(slot),
-            )
-            .map_err(|fit| fit.refusal(g.kind))?;
+        let laid_out = self.write_slots(
+            g.template.target_id,
+            lsn,
+            g.kind,
+            flags,
+            request_id,
+            &sizes[..nw],
+            |w, slot| g.msg(w).encode(slot),
+        )?;
         self.reached.set(self.reached.get() | g.targets.set().0);
         Ok(laid_out)
     }
 
-    /// The exact number of SAL bytes [`Self::write`] will consume for `g`. The
-    /// checkpoint band is not included; the fit check holds it back.
-    fn footprint(&self, g: &DirectGroup) -> usize {
-        let nw = self.num_workers;
-        let mut sizes = [0u32; MAX_WORKERS];
-        g.slot_sizes_into(&mut sizes[..nw]);
-        group_total_size(nw, sizes[..nw].iter().copied())
-    }
-
     /// Whether a checkpoint is warranted: the write cursor has crossed the
-    /// configured threshold, or a group has been refused as
-    /// [`SalFit::Transient`] since the last reset — one a checkpoint would admit,
-    /// on a log whose cursor may still sit below the threshold.
+    /// configured threshold, or a group a checkpoint would admit has been refused
+    /// since the last reset, on a log whose cursor may still sit below the
+    /// threshold.
     pub(crate) fn needs_checkpoint(&self) -> bool {
         self.write_cursor.get() >= self.checkpoint_threshold || self.refused_transient.get()
     }

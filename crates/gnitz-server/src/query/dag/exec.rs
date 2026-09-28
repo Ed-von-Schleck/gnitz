@@ -18,8 +18,18 @@ struct Step {
 /// alone, which captures no delta.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Drive {
-    Tick { source: u64, round: u64 },
-    Backfill { view: u64, source: u64 },
+    Tick {
+        source: u64,
+        round: u64,
+    },
+    /// **View-scoped.** Drives `view` alone, never `source`'s whole dependent
+    /// closure: the source may already have populated dependents (a live CREATE
+    /// VIEW over a source with prior views, a boot rebuild beside resumed
+    /// siblings) that a closure re-drive would double-count.
+    Backfill {
+        view: u64,
+        source: u64,
+    },
 }
 
 /// How one view's epoch reaches the other workers.
@@ -30,15 +40,23 @@ struct Relay {
     /// This epoch's source is replicated and another worker holds its counted
     /// copy, so that worker sends the single-sourced rounds.
     muted: bool,
+    /// What a side's output round routes by: the view's shard columns.
+    shard_cols: Box<[u32]>,
 }
 
 impl Relay {
-    /// The relay of `view_id`'s epoch over `src_id`'s delta.
-    fn new(registry: &RelationRegistry, view_id: u64, src_id: u64, elide: bool) -> Relay {
+    /// The relay of `view_id`'s epoch over `src_id`'s delta, its output rounds
+    /// routed by `shard_cols`.
+    fn new(registry: &RelationRegistry, view_id: u64, src_id: u64, elide: bool, shard_cols: &[u32]) -> Relay {
         let muted = registry
             .relation(src_id)
             .is_some_and(|r| !r.schema().placement().counts_on(registry.slot().rank));
-        Relay { view_id, elide, muted }
+        Relay {
+            view_id,
+            elide,
+            muted,
+            shard_cols: shard_cols.into(),
+        }
     }
 
     /// One repartition round of a side's output. Run even for an empty batch, so
@@ -46,20 +64,34 @@ impl Relay {
     fn round(&self, host: &mut impl DriveHost, batch: Batch, emits_replica: bool) -> Batch {
         match self.elide {
             true => batch,
-            false => self.send(host, batch, OUTPUT_RELAY, emits_replica),
+            false => self.send(
+                host,
+                batch,
+                OUTPUT_RELAY,
+                Some(ScatterSpec::GroupKey(&self.shard_cols)),
+                emits_replica,
+            ),
         }
     }
 
-    /// Publish `batch` under `key` and take back what this worker owns. A muted
-    /// round publishes an empty batch instead: under `replica` every worker holds
-    /// the same rows, so sending them all would relay each one `W` times.
-    fn send(&self, host: &mut impl DriveHost, batch: Batch, key: u64, replica: bool) -> Batch {
+    /// Publish `batch` under `key`, split by `spec` or whole to every worker, and
+    /// take back what this worker owns. A muted round publishes an empty batch
+    /// instead: under `replica` every worker holds the same rows, so sending them
+    /// all would relay each one `W` times.
+    fn send(
+        &self,
+        host: &mut impl DriveHost,
+        batch: Batch,
+        key: u64,
+        spec: Option<ScatterSpec<'_>>,
+        replica: bool,
+    ) -> Batch {
         if self.muted && replica {
             let empty = Batch::empty_with_schema(batch.schema());
             drop(batch);
-            return host.exchange(self.view_id, empty, key);
+            return host.exchange(self.view_id, empty, key, spec);
         }
-        host.exchange(self.view_id, batch, key)
+        host.exchange(self.view_id, batch, key, spec)
     }
 }
 
@@ -72,7 +104,7 @@ fn plan_of(host: &mut impl DriveHost, view_id: u64) -> &mut ViewPlan {
 
 /// Run one view's epoch over `src_id`'s delta.
 fn run_view_epoch(host: &mut impl DriveHost, view_id: u64, input: Batch, src_id: u64) -> Result<Batch, String> {
-    let (relay, routed) = {
+    let (relay, route) = {
         let (dag, registry) = host.parts();
         let (meta, plan) = ensure_compiled(&mut dag.views, registry, view_id)?;
         let relay = Relay::new(
@@ -80,12 +112,17 @@ fn run_view_epoch(host: &mut impl DriveHost, view_id: u64, input: Batch, src_id:
             view_id,
             src_id,
             plan.code.self_contained || meta.skips_exchange,
+            meta.output_shard_cols(),
         );
-        (relay, !plan.code.self_contained && meta.source_route(src_id).is_some())
+        let route = match plan.code.self_contained {
+            true => None,
+            false => meta.source_route(src_id).cloned(),
+        };
+        (relay, route)
     };
-    let input = match routed {
-        true => relay.send(host, input, src_id, true),
-        false => input,
+    let input = match &route {
+        Some(route) => relay.send(host, input, src_id, route.spec(), true),
+        None => input,
     };
     run_plan(host, &relay, input, src_id)
 }

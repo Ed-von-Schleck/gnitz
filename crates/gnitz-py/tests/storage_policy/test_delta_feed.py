@@ -22,63 +22,11 @@ import pytest
 import gnitz
 from _feedviews import (
     FEED, GROUPBY, JOIN, LINEAR, SETOP,
-    _base_tables, _churn, _flood, _mk_feed, _zset,
+    Subscriber, _base_tables, _churn, _flood, _mk_feed,
 )
 from _paths import relation_dir
 from _uid import uid as _uid
 from _serverproc import NEEDS_MULTI
-
-
-class Subscriber:
-    """A client-side copy of a view, maintained the way the feed intends: one
-    bootstrap, then polls, applying weights. It is deliberately not a set — the
-    whole content of a delta row is its weight."""
-
-    def __init__(self, client, sn, name):
-        self.client = client
-        self.vid, self.schema = client.resolve_table(sn, name)
-        self.copy = {}
-        self.cursor = (0, 0)
-
-    def bootstrap(self):
-        reply = self.client.delta_bootstrap(self.vid, self.schema)
-        # A bootstrap replaces state; it does not add to it.
-        self.copy = _zset(reply.rows.including_hidden())
-        self.cursor = reply.cursor
-
-    def poll(self):
-        # No hand-written tag check: `delta_poll` refuses a foreign cursor
-        # itself, so a reply that arrives here is one this copy may apply.
-        reply = self.client.delta_poll(self.vid, self.schema, self.cursor)
-        for k, w in _zset(reply.rows.including_hidden()).items():
-            self.copy[k] = self.copy.get(k, 0) + w
-            if self.copy[k] == 0:
-                del self.copy[k]
-        self.cursor = reply.cursor
-        return reply
-
-    def drain(self):
-        """Poll until a poll comes back empty."""
-        for _ in range(12):
-            if len(self.poll().rows) == 0:
-                return
-        raise AssertionError("feed did not settle in 12 polls")
-
-    def scan(self):
-        return _zset(self.client.scan(self.vid).including_hidden())
-
-    def assert_converged(self, what=""):
-        """Quiesce, then require the copy to equal the view as a multiset.
-
-        The order matters: a poll does **not** drive a tick and a scan does, so
-        a push ACKed but not yet ticked is in the scan and not in the copy — a
-        real and intended divergence that the next poll heals. Scanning first
-        drains, so the rounds exist before the polls that collect them.
-        """
-        live = self.scan()
-        self.drain()
-        assert live or self.copy, f"{what}: both sides are empty, so they agree about nothing"
-        assert self.copy == live, what
 
 
 # ── convergence ──────────────────────────────────────────────────────────────

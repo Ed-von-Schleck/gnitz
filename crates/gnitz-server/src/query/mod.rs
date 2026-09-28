@@ -8,5 +8,4 @@ mod vm;
 
 #[cfg(test)]
 pub(crate) use compiler::MAX_CIRCUIT_NODES;
-pub(crate) use compiler::{RelayRoute, OUTPUT_RELAY};
 pub(crate) use dag::{drive, preflight_compile, DagEngine, Drive, DriveHost};

@@ -32,10 +32,10 @@ use gnitz_store::storage::Batch;
 use gnitz_wire::control::DecodedControl;
 use gnitz_wire::{ClientVerb, PkColList, WireFault};
 
-/// `GNITZ_INJECT_RELAY_HOLD_FOR_DDL`: see `hold_relay_for_ddl`.
-pub(super) static RELAY_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_RELAY_HOLD_FOR_DDL");
+/// `GNITZ_INJECT_TICK_HOLD_FOR_DDL`: see `hold_tick_for_ddl`.
+pub(super) static TICK_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_TICK_HOLD_FOR_DDL");
 
-/// DDLs waiting for the tick gate, counted only while [`RELAY_HOLD_FOR_DDL`] is
+/// DDLs waiting for the tick gate, counted only while [`TICK_HOLD_FOR_DDL`] is
 /// armed: its one reader.
 static DDL_GATE_WAITERS: AtomicU64 = AtomicU64::new(0);
 
@@ -53,7 +53,7 @@ struct DdlLocks {
 async fn enter_ddl(shared: &Shared) -> DdlLocks {
     request_barrier(shared, BarrierKind::Ddl).await;
     let catalog = shared.catalog_rwlock.write().await;
-    let counted = RELAY_HOLD_FOR_DDL.armed();
+    let counted = TICK_HOLD_FOR_DDL.armed();
     if counted {
         DDL_GATE_WAITERS.fetch_add(1, Ordering::Relaxed);
     }
@@ -65,16 +65,13 @@ async fn enter_ddl(shared: &Shared) -> DdlLocks {
     DdlLocks { catalog, _ticks: ticks }
 }
 
-/// Poll bound for [`RELAY_HOLD_FOR_DDL`], in 1 ms ticks.
-const HOLD_RELAY_MAX_POLLS: u32 = 10_000;
+/// Poll bound for [`TICK_HOLD_FOR_DDL`], in 1 ms ticks.
+const HOLD_TICK_MAX_POLLS: u32 = 10_000;
 
-/// Hold the FIRST steady-state exchange relay until a DDL is waiting on the tick
-/// gate, keeping every worker parked in `do_exchange_wait` while that
-/// DDL is already issued — so the DDL provably lands on a mid-epoch tick, whether
-/// its request came before or after this relay. One-shot: the rest of the run
-/// relays at full speed.
-pub(super) async fn hold_relay_for_ddl(shared: &Shared) {
-    park_until(shared, HOLD_RELAY_MAX_POLLS, "relay hold", || {
+/// Hold the first steady-state tick in flight until a DDL waits on the tick gate,
+/// so that DDL provably lands mid-tick. One-shot.
+pub(super) async fn hold_tick_for_ddl(shared: &Shared) {
+    park_until(shared, HOLD_TICK_MAX_POLLS, "tick hold", || {
         DDL_GATE_WAITERS.load(Ordering::Relaxed) > 0
     })
     .await
@@ -231,9 +228,7 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
                     let cat = shared.cat();
                     cat.dag.base_tables_reachable_from(&cat.registry, new_view_ids.clone())
                 };
-                for src in sources {
-                    shared.disp().drain_tick(src).await?;
-                }
+                shared.disp().drain_tick(&sources).await?;
                 drained_sources = true;
             }
             shared.cat_mut().submit(family, fbatch)?;
@@ -296,19 +291,6 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
             e
         );
     });
-
-    // A backfill reclaim leaves the derived state behind the durable generation:
-    // restamp it now rather than leave it rebuild-on-boot until the next
-    // checkpoint.
-    if shared.disp().derived_needs_restamp() {
-        let mut pending = Vec::new();
-        shared.drain_live_tick_rows_into(&mut pending);
-        guard_panic_async("view-restamp", shared.disp().restamp_derived(&pending))
-            .await
-            .unwrap_or_else(|e| {
-                gnitz_fatal_abort!("re-stamping derived state after a CREATE VIEW reclaim failed: {}", e);
-            });
-    }
 
     drop(locks);
     send_msg(peer, ipc::WireMsg { arg0: zone_lsn, ..Default::default() });

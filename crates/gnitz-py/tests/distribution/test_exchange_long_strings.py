@@ -1,7 +1,7 @@
-"""Exchange partitions past the fixture's frame budget: the views'
-exchanged rows carry `t.body`, so each worker publishes a multi-frame train per
-round. Views created before the insert run the tick path, after it the backfill
-path, pad rounds included.
+"""Exchange rounds whose rows carry a string heap: the views' exchanged rows
+carry `t.body`, a string past the inline threshold, so every partition a worker
+publishes and every slice it gathers carries heap bytes. Views created before
+the insert run the tick path, after it the backfill path, pad rounds included.
 """
 
 from _read import bag, rows
@@ -45,16 +45,16 @@ def _assert_views(client, sn):
         assert bag(rows(client, sn, f"SELECT * FROM {name}")) == expected, name
 
 
-def test_a_tick_relays_multi_frame_exchange_trains(reply_frame_budget_server):
-    client, sn = reply_frame_budget_server, "public"
+def test_a_tick_exchanges_long_string_rows(client, schema_name):
+    sn = schema_name
     _create_tables(client, sn)
     _create_views(client, sn)
     _fill(client, sn)
     _assert_views(client, sn)
 
 
-def test_a_backfill_relays_multi_frame_exchange_trains(reply_frame_budget_server):
-    client, sn = reply_frame_budget_server, "public"
+def test_a_backfill_exchanges_long_string_rows(client, schema_name):
+    sn = schema_name
     _create_tables(client, sn)
     _fill(client, sn)
     _create_views(client, sn)

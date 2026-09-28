@@ -18,6 +18,7 @@ use crate::runtime::affinity;
 use crate::runtime::executor::ServerExecutor;
 use crate::runtime::listen;
 use crate::runtime::master::MasterDispatcher;
+use crate::runtime::mesh::{self, Mesh};
 use crate::runtime::reactor::{AckLease, Limits, Reactor};
 use crate::runtime::sal::zone::CommittedTail;
 use crate::runtime::sal::{sal_mmap_size, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
@@ -276,9 +277,11 @@ struct SharedIpc {
     /// epoch starts above. Read once with the mapping, before the fork.
     tail: CommittedTail,
     w2m_ptrs: Vec<*mut u8>,
+    /// The workers' exchange mesh.
+    mesh: *mut u8,
 }
 
-/// Open and map the SAL, and one W2M ring per worker.
+/// Open and map the SAL, one W2M ring per worker, and the exchange mesh.
 fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
     // A fresh SAL file reads all-zero through O_CREAT + fallocate, which is
     // exactly the empty-SAL state recovery expects.
@@ -308,8 +311,9 @@ fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
     let w2m_ptrs = (0..nw)
         .map(|w| w2m::create_region().map_err(|e| format!("failed to map W2M region for W{w}: {e}")))
         .collect::<Result<Vec<_>, _>>()?;
+    let mesh = mesh::create_region(nw).map_err(|e| format!("failed to map the exchange mesh: {e}"))?;
 
-    Ok(SharedIpc { sal_fd, sal, tail, w2m_ptrs })
+    Ok(SharedIpc { sal_fd, sal, tail, w2m_ptrs, mesh })
 }
 
 /// The forked child's whole life: latch its rank, redirect its logs to
@@ -371,7 +375,13 @@ fn run_worker_child(
     gnitz_note!("Worker {} (pid {}) of {}", w, unsafe { libc::getpid() }, slot.of);
 
     let sal_reader = SalReader::new(ipc.sal, slot.rank, ipc.tail.live_epoch());
-    let mut worker = WorkerProcess::new(catalog_ptr, sal_reader, w2m_writer);
+    // SAFETY: every ring was initialized by `create_region` and the mesh mapped
+    // for `slot.of` workers, all before the fork, and none is ever unmapped.
+    let mesh = unsafe {
+        let wakes = ipc.w2m_ptrs.iter().map(|&p| SalWake::new(p)).collect();
+        Mesh::new(ipc.mesh, w, wakes)
+    };
+    let mut worker = WorkerProcess::new(catalog_ptr, sal_reader, w2m_writer, mesh);
     let rc = worker.run(BOOT_READY_REQUEST_ID);
 
     unsafe {
@@ -449,7 +459,7 @@ async fn master_post_fork_recovery(
     swept_bases: Vec<u64>,
 ) -> Result<(), String> {
     // Wait for all workers to complete recovery and signal readiness.
-    disp.collect_round(&ready, false)
+    disp.collect_round(&ready)
         .await
         .map_err(|e| format!("Error collecting worker acks: {e}"))?;
     drop(ready);
@@ -459,13 +469,11 @@ async fn master_post_fork_recovery(
     inject_recovery_panic("reset");
 
     // Drive the tail each worker buffered during replay into the views, one
-    // blocking tick per swept base. An empty source ticks too, so exchange views
-    // stay in lockstep and every view this reaches is compiled.
-    for &src in &swept_bases {
-        disp.drain_tick(src)
-            .await
-            .map_err(|e| format!("recovery tick sweep failed: {e}"))?;
-    }
+    // tick group over every swept base. An empty source ticks too, so exchange views stay in
+    // lockstep and every view this reaches is compiled.
+    disp.drain_tick(&swept_bases)
+        .await
+        .map_err(|e| format!("recovery tick sweep failed: {e}"))?;
 
     inject_recovery_panic("sweep");
 
@@ -523,7 +531,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: TlsArgs)
     let worker_pids = fork_workers(catalog, data_dir, num_workers, &ipc, &swept_bases, pinning.as_ref())?;
 
     // --- Parent process ---
-    let SharedIpc { sal_fd, sal, tail, w2m_ptrs } = ipc;
+    let SharedIpc { sal_fd, sal, tail, w2m_ptrs, .. } = ipc;
 
     // Pre-fork recovery has already advanced the generation, so this is the floor
     // every base round must publish past.
@@ -545,9 +553,9 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: TlsArgs)
 
     // The workers' ready ACKs. Leased before the first tick, which drops every
     // W2M frame no lease routes.
-    let ready = dispatcher.reactor().lease_acks(1, "recovery sync");
+    let ready = dispatcher.reactor().lease_acks("recovery sync");
     assert_eq!(
-        ready.id(0),
+        ready.id(),
         BOOT_READY_REQUEST_ID,
         "the ready ACKs name the reactor's first lease"
     );

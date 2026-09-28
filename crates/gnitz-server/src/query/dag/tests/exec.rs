@@ -170,7 +170,7 @@ impl DriveHost for Recorder<'_> {
         (&mut self.cat.dag, &mut self.cat.registry)
     }
 
-    fn exchange(&mut self, _view_id: u64, batch: Batch, _key: u64) -> Batch {
+    fn exchange(&mut self, _view_id: u64, batch: Batch, _key: u64, _spec: Option<ScatterSpec<'_>>) -> Batch {
         self.sent.push(batch.len());
         batch
     }
@@ -211,11 +211,11 @@ fn a_replicated_sources_relay_is_sent_by_worker_0_alone() {
 
         let delta = delta_for(&engine, replicated, &[(1, 1, 10), (2, 1, 20)]);
         // One relay per source: muting is bound at construction.
-        let over_replicated = Relay::new(&engine.registry, 99, replicated, false);
-        let over_keyed = Relay::new(&engine.registry, 99, keyed, false);
+        let over_replicated = Relay::new(&engine.registry, 99, replicated, false, &[]);
+        let over_keyed = Relay::new(&engine.registry, 99, keyed, false, &[]);
         let mut host = Recorder { cat: &mut engine, sent: Vec::new() };
-        over_replicated.send(&mut host, Batch::clone(&delta), replicated, true);
-        over_keyed.send(&mut host, Batch::clone(&delta), keyed, true);
+        over_replicated.send(&mut host, Batch::clone(&delta), replicated, None, true);
+        over_keyed.send(&mut host, Batch::clone(&delta), keyed, None, true);
         // A single-side round is not single-sourced, so it is sent by every rank.
         over_replicated.round(&mut host, delta, false);
 

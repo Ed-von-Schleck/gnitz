@@ -255,8 +255,8 @@ _SHAPES = {
         {"cbv": {r: 1 for r in _CB}}),
 
     # A contiguous low-id range fails the predicate on every worker's first
-    # chunks, so the relayed pre-phase payload for those rounds is empty.
-    # Inferring "done" from an empty relay truncates the view; the drained bit tracks
+    # chunks, so the exchanged pre-phase payload for those rounds is empty.
+    # Inferring "done" from an empty round truncates the view; the drained bit tracks
     # the raw drain instead, so the later passing rows still arrive.
     "filtered_groupby": _shape(
         ["CREATE TABLE ft (id BIGINT NOT NULL PRIMARY KEY, "
@@ -405,61 +405,6 @@ def test_a_recovered_view_still_ticks_from_every_source(own_server):
         conn.execute_sql(f"INSERT INTO cbt VALUES {values(more)}", schema_name="tick")
         assert bag(conn.scan(cbv), "a", "b", "v") == {r: 1 for r in _CB + more}, \
             "the post-restart insert must reach the view"
-
-
-def test_a_backfill_that_reclaims_the_sal_every_round_still_rebuilds_exactly(own_server):
-    """The worst-case relay — a pure range join, which broadcasts because it has
-    no eq prefix to scatter on — with the reclaim seam forcing a base round and
-    SAL reset before every non-pad backfill round. Workers must flush inline in
-    their exchange wait and find the relay at cursor 0 of the new epoch; if any
-    of that is wrong the backfill deadlocks or the view is short.
-    """
-    own_server.extra_env.update({"GNITZ_SCAN_CHUNK_ROWS": "3",
-                                 "GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW": "1"})
-    own_server.start(workers=_MULTI)
-    sh = _SHAPES["range_join"]
-    with gnitz.connect(own_server.sock_path) as conn:
-        conn.create_schema("rr")
-        for stmt in sh["ddl"] + sh["rows"]:
-            conn.execute_sql(stmt, schema_name="rr")
-
-    # Both boots run under the seam: the restart's backfill is what has to
-    # survive it.
-    own_server.restart()
-    with gnitz.connect(own_server.sock_path) as conn:
-        vid, _ = conn.resolve_table("rr", "rv")
-        assert bag(conn.scan(vid), "x", "y") == sh["want"]["rv"]
-
-
-def test_a_live_backfill_reclaim_keeps_every_acked_write_across_a_crash(own_server):
-    """Every write ACKed before a live backfill's SAL reclaim survives a crash:
-    the view's sources, a bystander table, and the view's own DDL."""
-    own_server.extra_env.update({"GNITZ_SCAN_CHUNK_ROWS": "3",
-                                 "GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW": "1",
-                                 "GNITZ_LOG_LEVEL": "normal"})
-    own_server.start(workers=_MULTI)
-    sh = _SHAPES["range_join"]
-    tables, view = sh["ddl"][:2], sh["ddl"][2]
-    bystander = [(pk, pk * 3) for pk in range(10)]
-    with gnitz.connect(own_server.sock_path) as conn:
-        conn.create_schema("lr")
-        for stmt in tables + sh["rows"] + [
-                "CREATE TABLE u (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-                f"INSERT INTO u VALUES {values(bystander)}"]:
-            conn.execute_sql(stmt, schema_name="lr")
-        before = own_server.sal_checkpoints()
-        conn.execute_sql(view, schema_name="lr")
-        assert own_server.sal_checkpoints() > before, "the backfill must have reclaimed"
-
-    own_server.restart()
-    with gnitz.connect(own_server.sock_path) as conn:
-        for name, cols, rows in [("ra", ("id", "x"), _RA),
-                                 ("rb", ("id", "y"), _RA),
-                                 ("u", ("pk", "v"), bystander)]:
-            tid, _ = conn.resolve_table("lr", name)
-            assert bag(conn.scan(tid), *cols) == {r: 1 for r in rows}, name
-        vid, _ = conn.resolve_table("lr", "rv")
-        assert bag(conn.scan(vid), "x", "y") == sh["want"]["rv"]
 
 
 def test_a_min_max_view_decodes_back_to_the_same_value_after_a_restart(own_server):

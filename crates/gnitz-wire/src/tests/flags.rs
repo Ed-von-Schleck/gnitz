@@ -22,7 +22,6 @@ fn wire_flags_roundtrip() {
         WireFlags { continuation: true, ..base },
         WireFlags { batch_consolidated: true, ..base },
         WireFlags { scan_last: true, ..base },
-        WireFlags { drained: true, ..base },
     ]);
     cases.push(WireFlags {
         verb: ClientVerb::AllocIds,
@@ -32,7 +31,6 @@ fn wire_flags_roundtrip() {
         batch_consolidated: true,
         scan_last: true,
         probe_mode: WireProbeMode::Project,
-        drained: true,
     });
     for f in cases {
         assert_eq!(WireFlags::unpack(f.pack()), Ok(f), "{f:?}");
@@ -44,7 +42,7 @@ fn wire_flags_roundtrip() {
 /// mode the server does not implement into a silent upsert on a client's push.
 #[test]
 fn wire_flags_reject_unknown() {
-    assert!(WireFlags::unpack(1 << 40).is_err());
+    assert!(WireFlags::unpack(1 << 39).is_err());
     // Bits 32/33 are the control codec's, so the flags word neither refuses nor
     // carries them.
     assert_eq!(WireFlags::unpack(3 << 32), Ok(WireFlags::default()));
