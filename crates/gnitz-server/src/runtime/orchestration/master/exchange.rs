@@ -1,123 +1,71 @@
-//! Exchange rounds: turning per-worker exchange frames into the relays
-//! the master writes back.
+//! Exchange rounds. A worker publishes its partition as a train of frames; a round
+//! completes once every worker's terminal frame — flagged `scan_last` — is in.
 //!
-//! A **round** is one `(view_id, source_id)` pair's frames from every worker —
-//! keyed by the pair because a two-source view opens one round per source and a
-//! relay carries its own source's shard columns. It **completes** when every
-//! worker has sent its TERMINAL frame into it, yielding a [`PendingRelay`].
-//!
-//! A worker publishes its partition as a `MAX_FRAME_PAYLOAD`-bounded train (see
-//! `worker/exchange.rs`), so a worker's list holds several frames and only the
-//! terminal one — flagged `scan_last` — reports the worker.
-//!
-//! Rounds are orchestration policy, which is why this sits here rather than in
-//! the reactor that delivers the frames.
+//! Every worker runs the same sequence of rounds and publishes the next only after
+//! this one's relay comes back, so at most one round is open: a frame for another
+//! `(view_id, source_id)` means the workers diverged.
 
-use rustc_hash::FxHashMap;
-
-use crate::runtime::sal::{WorkerSet, MAX_WORKERS};
+use crate::runtime::sal::WorkerSet;
 use crate::runtime::wire::DecodedWire;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 
-/// Per-view accumulator for exchange frames, keyed by `(view_id, source_id)`.
-///
-/// A worker dying mid-round leaves its entries here and a steady tick's wait
-/// parked forever unless something probes for the death.
-pub struct ExchangeAccumulator {
-    rounds: FxHashMap<(i64, i64), ExchangeRound>,
-    nw: usize,
-}
-
-struct ExchangeRound {
-    /// One frame list per live worker — sized `nw`, not `MAX_WORKERS`: `Batch` is
-    /// ~1 KB, so a fixed 64-slot array would build and move ~70 KB per round to
-    /// use a handful of slots. A worker's list accumulates its train in frame
-    /// order, which is source-row order.
-    payloads: Vec<Vec<Batch>>,
-    /// The workers that have reported. A set rather than a counter, so a worker
-    /// reporting twice cannot complete the round while another worker's slot is
-    /// still empty.
+/// The open exchange round, keyed by `(view_id, source_id)`: a two-source view opens
+/// one round per source, and a relay carries its own source's shard columns.
+pub(crate) struct ExchangeRound {
+    pub(crate) view_id: i64,
+    pub(crate) source_id: i64,
+    pub(crate) schema: SchemaDescriptor,
+    /// One frame list per worker, in frame order, so the relay's row order does not
+    /// depend on arrival order.
+    pub(crate) frames: Vec<Vec<Batch>>,
     reported: WorkerSet,
-    schema: Option<SchemaDescriptor>,
-    /// AND of the workers' `flags.backfill_pad`: true on a backfill's final round.
-    all_pad: bool,
+    /// AND of the workers' `flags.drained`: true on a backfill's final round.
+    pub(crate) drained: bool,
 }
 
-/// One completed exchange ready for relay. The relay driver owns this: the
-/// steady relay prepares with no SAL hold and emits under one; `collect_round`
-/// does both under one hold.
-pub struct PendingRelay {
-    pub view_id: i64,
-    pub payloads: Vec<Vec<Batch>>,
-    pub schema: SchemaDescriptor,
-    pub source_id: i64,
-    /// True iff every worker reported a backfill pad for this round (the final,
-    /// all-pad round): a backfill's stop signal. A tick round never pads.
-    pub all_pad: bool,
-}
-
-impl ExchangeAccumulator {
-    pub fn new(nw: usize) -> Self {
-        debug_assert!(
-            nw <= MAX_WORKERS,
-            "ExchangeAccumulator: nw={nw} exceeds MAX_WORKERS={MAX_WORKERS}"
-        );
-        ExchangeAccumulator { rounds: FxHashMap::default(), nw }
-    }
-
-    /// Accept one exchange frame.  Returns `Some(PendingRelay)` once
-    /// every worker has reported for the same `(view_id, source_id)`
-    /// pair; `None` while the round is still accumulating.  Logs (and
-    /// drops) an exchange wire missing its schema instead of producing a
-    /// malformed relay.
-    pub fn process(&mut self, w: usize, decoded: DecodedWire) -> Option<PendingRelay> {
-        let vid = decoded.control.hdr.target_id as i64;
-        let source_id = decoded.control.hdr.arg0 as i64;
-        let key = (vid, source_id);
-        let nw = self.nw;
-
-        let round = self.rounds.entry(key).or_insert_with(|| ExchangeRound {
-            payloads: (0..nw).map(|_| Vec::new()).collect(),
-            reported: WorkerSet::EMPTY,
-            schema: None,
-            all_pad: true,
-        });
-
-        // Every exchange frame carries its own schema block (the ring decode
-        // takes no hint), so this is last-wins over identical values.
-        if let Some(schema) = decoded.schema {
-            round.schema = Some(schema);
-        }
-        if let Some(b) = decoded.data_batch {
-            round.payloads[w].push(b);
-        }
-        // Bookkeeping rides the terminal frame alone, so a partial train cannot
-        // complete the round.
-        if !decoded.control.hdr.flags.scan_last {
-            return None;
-        }
-        // AND this worker's per-chunk backfill pad bit. Clear for steady-state
-        // exchanges, which clears all_pad harmlessly (the relay path ignores it).
-        round.all_pad &= decoded.control.hdr.flags.backfill_pad;
-        round.reported = round.reported.with(w);
-
-        if !round.reported.covers(nw) {
-            return None;
-        }
-        let round = self.rounds.remove(&key).unwrap();
-        let schema = round.schema.unwrap_or_else(|| {
+impl ExchangeRound {
+    /// The round `frame` opens, among `nw` workers.
+    pub(crate) fn open(frame: &DecodedWire, nw: usize) -> Self {
+        let hdr = &frame.control.hdr;
+        let (view_id, source_id) = (hdr.target_id as i64, hdr.arg0 as i64);
+        let schema = frame.schema.unwrap_or_else(|| {
             gnitz_fatal_abort!(
-                "exchange: (view_id={vid}, source_id={source_id}) completed with no schema block — ring corrupt"
+                "exchange: (view_id={view_id}, source_id={source_id}) frame has no schema block — ring corrupt"
             )
         });
-        Some(PendingRelay {
-            view_id: vid,
-            payloads: round.payloads,
-            schema,
+        ExchangeRound {
+            view_id,
             source_id,
-            all_pad: round.all_pad,
-        })
+            schema,
+            frames: (0..nw).map(|_| Vec::new()).collect(),
+            reported: WorkerSet::EMPTY,
+            drained: true,
+        }
+    }
+
+    /// Take worker `w`'s `frame`; true once every worker's terminal frame is in.
+    pub(crate) fn accept(&mut self, w: usize, frame: DecodedWire) -> bool {
+        let hdr = &frame.control.hdr;
+        let key = (hdr.target_id as i64, hdr.arg0 as i64);
+        if key != (self.view_id, self.source_id) {
+            gnitz_fatal_abort!(
+                "exchange: worker {w} sent (view_id, source_id)={key:?} while ({}, {}) is open — workers diverged",
+                self.view_id,
+                self.source_id
+            );
+        }
+        let flags = hdr.flags;
+        if let Some(b) = frame.data_batch {
+            self.frames[w].push(b);
+        }
+        if !flags.scan_last {
+            return false;
+        }
+        debug_assert!(!self.reported.contains(w), "worker {w} ended two trains in one round");
+        self.drained &= flags.drained;
+        self.reported = self.reported.with(w);
+        self.reported.covers(self.frames.len())
     }
 }
 

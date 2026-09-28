@@ -25,16 +25,17 @@ fn control(view_id: i64, source_id: i64, flags: WireFlags) -> DecodedControl {
 }
 
 /// One worker's TERMINAL exchange frame — the whole report when the partition
-/// fits one frame. `pad` is the backfill pad bit (steady-state exchanges leave `flags.backfill_pad`
-/// clear).
-fn make_wire(view_id: i64, source_id: i64, pad: bool) -> DecodedWire {
+/// fits one frame. `drained` is the worker's drained bit (steady-state exchanges
+/// leave it clear).
+fn make_wire(view_id: i64, source_id: i64, drained: bool) -> DecodedWire {
     DecodedWire {
         control: control(
             view_id,
             source_id,
             WireFlags {
-                backfill_pad: pad,
-                ..WireFlags::train_frame(0, true)
+                scan_last: true,
+                drained,
+                ..Default::default()
             },
         ),
         blob: Vec::new(),
@@ -64,8 +65,9 @@ fn make_frame(view_id: i64, source_id: i64, keys: &[u64], last: bool) -> Decoded
             view_id,
             source_id,
             WireFlags {
+                scan_last: last,
                 batch_consolidated: true,
-                ..WireFlags::train_frame(0, last)
+                ..Default::default()
             },
         ),
         blob: Vec::new(),
@@ -74,66 +76,40 @@ fn make_frame(view_id: i64, source_id: i64, keys: &[u64], last: bool) -> Decoded
     }
 }
 
-/// A round completes on the last worker of its `(view, source)` and not before,
-/// carrying that round's ids; `all_pad` is the AND of the workers' pad bits, so
-/// one unpadded worker keeps the backfill going.
+/// A round completes on the last worker and not before, carrying that round's
+/// ids; `drained` is the AND of the workers' bits, so one undrained worker keeps
+/// the backfill going.
 #[test]
-fn round_completes_on_the_last_worker_with_all_pad_anded() {
-    for (pads, want_all_pad) in [([true, true], true), ([true, false], false), ([false, false], false)] {
-        let mut acc = ExchangeAccumulator::new(2);
-        assert!(acc.process(0, make_wire(7, 3, pads[0])).is_none(), "one of two workers");
-        let relay = acc
-            .process(1, make_wire(7, 3, pads[1]))
-            .expect("the last worker completes the round");
-        assert_eq!((relay.view_id, relay.source_id, relay.all_pad), (7, 3, want_all_pad));
+fn round_completes_on_the_last_worker_with_drained_anded() {
+    for (bits, want_drained) in [([true, true], true), ([true, false], false), ([false, false], false)] {
+        let (f0, f1) = (make_wire(7, 3, bits[0]), make_wire(7, 3, bits[1]));
+        let mut r = ExchangeRound::open(&f0, 2);
+        assert!(!r.accept(0, f0), "one of two workers");
+        assert!(r.accept(1, f1), "the last worker completes the round");
+        assert_eq!((r.view_id, r.source_id, r.drained), (7, 3, want_drained));
     }
-}
-
-/// A view with two sources opens one round per source: worker 0 reporting for
-/// source A and worker 1 for source B completes neither.
-#[test]
-fn rounds_are_keyed_by_source_id() {
-    let mut acc = ExchangeAccumulator::new(2);
-    assert!(acc.process(0, make_wire(42, 100, false)).is_none());
-    assert!(
-        acc.process(1, make_wire(42, 200, false)).is_none(),
-        "a different source's worker must not complete source 100's round"
-    );
-    assert_eq!(
-        acc.process(1, make_wire(42, 100, false))
-            .expect("source 100's round completes on its second worker")
-            .source_id,
-        100
-    );
-    assert_eq!(
-        acc.process(0, make_wire(42, 200, false))
-            .expect("source 200's round was still open")
-            .source_id,
-        200
-    );
 }
 
 /// Only a train's terminal frame counts: intermediate frames add payload and
 /// leave the round open, and the worker's list keeps them in frame order.
 #[test]
 fn a_workers_train_completes_only_on_its_terminal_frame() {
-    let mut acc = ExchangeAccumulator::new(2);
+    let first = make_frame(7, 3, &[1, 2], false);
+    let mut r = ExchangeRound::open(&first, 2);
+    assert!(!r.accept(0, first), "an intermediate frame must not report the worker");
     assert!(
-        acc.process(0, make_frame(7, 3, &[1, 2], false)).is_none(),
-        "an intermediate frame must not report the worker"
-    );
-    assert!(
-        acc.process(1, make_frame(7, 3, &[10, 11], true)).is_none(),
+        !r.accept(1, make_frame(7, 3, &[10, 11], true)),
         "worker 1 is done, but worker 0's train is still open"
     );
-    let relay = acc
-        .process(0, make_frame(7, 3, &[5, 6], true))
-        .expect("worker 0's terminal frame completes the round");
+    assert!(
+        r.accept(0, make_frame(7, 3, &[5, 6], true)),
+        "worker 0's terminal frame completes the round"
+    );
 
-    let keys: Vec<u64> = relay.payloads[0]
+    let keys: Vec<u64> = r.frames[0]
         .iter()
         .flat_map(|f| (0..f.len()).map(|i| u64::from_be_bytes(f.get_pk_bytes(i).try_into().unwrap())))
         .collect();
-    assert_eq!(relay.payloads[0].len(), 2, "both frames land in the worker's list");
+    assert_eq!(r.frames[0].len(), 2, "both frames land in the worker's list");
     assert_eq!(keys, vec![1, 2, 5, 6], "in frame order, which is source-row order");
 }

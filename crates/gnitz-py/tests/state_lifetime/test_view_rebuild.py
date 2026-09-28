@@ -256,7 +256,7 @@ _SHAPES = {
 
     # A contiguous low-id range fails the predicate on every worker's first
     # chunks, so the relayed pre-phase payload for those rounds is empty.
-    # Inferring "done" from an empty relay truncates the view; the pad bit tracks
+    # Inferring "done" from an empty relay truncates the view; the drained bit tracks
     # the raw drain instead, so the later passing rows still arrive.
     "filtered_groupby": _shape(
         ["CREATE TABLE ft (id BIGINT NOT NULL PRIMARY KEY, "

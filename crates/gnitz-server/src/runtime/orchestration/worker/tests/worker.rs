@@ -86,8 +86,7 @@ fn tick_frame(target_id: u64, round: u64) -> &'static [u8] {
 }
 
 /// Build a worker that's safe for dispatch calls whose behavior
-/// does not enter the catalog (Tick/ExchangeRelay inside an exchange wait,
-/// plus ExchangeRelay at top-level which warns without touching the catalog).
+/// does not enter the catalog (Tick/ExchangeRelay inside an exchange wait).
 /// A DdlSync slot's decode consults the catalog.
 ///
 /// The W2M ring is unused by these arms; sal_reader is also unused
@@ -172,13 +171,14 @@ fn reads_defer_inside_exchange_in_request_order() {
 /// whose control header echoes `source_id` in `arg0`, as the master's
 /// `emit_relay` does. Leaked to `'static` for `dispatch`, which
 /// fail-stops on a frame that does not decode.
-fn encode_relay_frame(target_id: u64, source_id: u64, schema: &SchemaDescriptor) -> &'static [u8] {
+fn encode_relay_frame(target_id: u64, source_id: u64, schema: &SchemaDescriptor, drained: bool) -> &'static [u8] {
     // No data batch — a header-only relay. `arg0` echoes the source_id the
-    // waiter matches on; the default `flags.backfill` is `Continue`.
+    // waiter matches on; the default `flags.drained` is false.
     let block = gnitz_store::schema::encode_schema_block(schema);
     let msg = ipc::WireMsg {
         target_id,
         arg0: source_id,
+        flags: WireFlags { drained, ..Default::default() },
         schema_block: Some(&block),
         ..Default::default()
     };
@@ -198,32 +198,22 @@ fn encode_data_frame(target_id: u64, schema: &SchemaDescriptor, batch: &Batch) -
     Box::leak(msg.encode_to_vec().into_boxed_slice())
 }
 
-/// ExchangeRelay inside an exchange wait whose `(view_id, source_id)`
-/// matches `want_key` comes back as a [`RelayHit`]; a non-matching pair is
-/// parked in `pending_relays`.
+/// An ExchangeRelay inside an exchange wait whose `(view_id, source_id)` matches
+/// the wait comes back as a [`RelayHit`], carrying the relay's drained bit.
 #[test]
-fn exchange_relay_inside_exchange() {
+fn a_matching_relay_ends_the_exchange_wait() {
     let mut wp = make_worker_for_matrix();
     let schema = make_schema_u64_i64();
     let want_key = (100, 0);
 
-    // Mismatched view (target_id=200 ≠ want 100): parked under (200, 0).
-    let frame = encode_relay_frame(200, 0, &schema);
-    assert!(wp
-        .dispatch_in_eval(want_key, &bare_message(SalMessageKind::ExchangeRelay, 200), frame)
-        .is_none());
-    assert!(
-        wp.exchange.pending_relays.contains_key(&(200, 0)),
-        "non-matching relay must be parked in pending_relays"
-    );
-
-    // Matching key (target_id=100, source_id=0 == want_key): returns the batch.
-    let frame = encode_relay_frame(100, 0, &schema);
-    assert!(
-        wp.dispatch_in_eval(want_key, &bare_message(SalMessageKind::ExchangeRelay, 100), frame)
-            .is_some(),
-        "a key-matching relay must short-circuit out of the dispatcher with its batch"
-    );
+    for drained in [false, true] {
+        let frame = encode_relay_frame(100, 0, &schema, drained);
+        let hit = wp
+            .dispatch_in_eval(want_key, &bare_message(SalMessageKind::ExchangeRelay, 100), frame)
+            .expect("a key-matching relay must short-circuit out of the dispatcher with its batch");
+        assert_eq!(hit.drained, drained);
+        assert_eq!(hit.batch.len(), 0, "a header-only relay is an empty batch");
+    }
 }
 
 /// A request dispatched inside an exchange wait leaves a queued train unsent: a
@@ -236,30 +226,12 @@ fn a_queued_train_is_not_emitted_inside_an_exchange_wait() {
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.send_reply(fifo_route(1, 5), make_n_row_batch(make_schema_u64_i64(), 3));
 
-    let relay = encode_relay_frame(200, 0, &make_schema_u64_i64());
-    assert!(wp
-        .dispatch_in_eval((100, 5), &bare_message(SalMessageKind::ExchangeRelay, 200), relay)
-        .is_none());
     assert!(wp
         .dispatch_in_eval((100, 5), &bare_message(SalMessageKind::Tick, 999), tick_frame(999, 7))
         .is_none());
 
     assert_eq!(wp.pending_streams.front().map(|t| t.next_row), Some(0));
     assert!(walk_frames(ptr).is_empty());
-}
-
-/// ExchangeRelay at TopLevel is a protocol bug — it can only arrive
-/// while the worker is blocked in `do_exchange_wait`. The dispatcher
-/// warns and continues; no observable state change.
-#[test]
-fn exchange_relay_top_level_warns_and_continues() {
-    let mut wp = make_worker_for_matrix();
-    let frame = encode_relay_frame(100, 0, &make_schema_u64_i64());
-    wp.dispatch_top_level(&bare_message(SalMessageKind::ExchangeRelay, 100), frame);
-    assert!(
-        wp.exchange.pending_relays.is_empty(),
-        "TopLevel must NOT park relays — they belong to do_exchange_wait"
-    );
 }
 
 /// DdlSync inside an exchange wait MUST stage its batch in
@@ -494,6 +466,33 @@ fn train_frames_fill_the_budget_to_within_one_row() {
             }
         }
     }
+}
+
+/// An exchange partition past the worker's frame budget goes out as a train on
+/// the exchange ring: every frame carries the round's ids and the drained bit,
+/// only the last is terminal, and the frames' rows are the partition in order.
+#[test]
+fn an_exchange_partition_past_the_budget_is_a_multi_frame_train() {
+    let (region, writer) = ring_and_writer();
+    let mut wp = make_test_worker(std::ptr::null_mut(), writer);
+    wp.reply_frame_budget = 1024;
+    wp.publish_exchange(7, &make_n_row_batch(make_schema_u64_i64(), 200), 3, true);
+
+    let frames = walk_frames(region.ptr());
+    assert!(frames.len() > 1, "200 rows at a 1 KiB budget must span several frames");
+    let mut pks = Vec::new();
+    for (i, (ring_id, bytes)) in frames.iter().enumerate() {
+        assert_eq!(*ring_id, crate::runtime::w2m::W2M_EXCHANGE_RING_ID, "frame {i}");
+        let decoded = ipc::decode_wire_ipc(bytes).expect("an exchange frame decodes");
+        let hdr = &decoded.control.hdr;
+        assert_eq!((hdr.target_id, hdr.arg0), (7, 3), "frame {i}");
+        assert!(hdr.flags.drained, "frame {i}");
+        assert_eq!(hdr.flags.scan_last, i + 1 == frames.len(), "frame {i}");
+        if let Some(b) = decoded.data_batch {
+            pks.extend((0..b.len()).map(|r| b.get_pk(r)));
+        }
+    }
+    assert_eq!(pks, (0..200u128).collect::<Vec<_>>());
 }
 
 /// `force_fifo` is the whole difference between a splittable reply emitting

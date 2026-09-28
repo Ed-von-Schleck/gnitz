@@ -4,7 +4,7 @@
 //! the master via the SAL (shared append-only log), sends responses via a
 //! per-worker W2M shared region.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, SysFamily, FIRST_USER_TABLE_ID};
@@ -18,7 +18,6 @@ use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 use gnitz_store::storage::StoreError;
-use gnitz_wire::BackfillDecision;
 use gnitz_wire::{WireFlags, WireStatus};
 
 // ---------------------------------------------------------------------------
@@ -62,6 +61,8 @@ enum InEval {
     DeferPostAck,
     /// Applied when the DAG returns, before the ACK that implies it.
     DeferPreAck,
+    /// Ends the wait.
+    Relay,
 }
 
 /// The one classifier for the inline-vs-defer decision — a worker policy, hence
@@ -87,16 +88,15 @@ fn in_eval(kind: SalMessageKind) -> InEval {
         // Probes of base-table keys, which a tick does not write.
         SalMessageKind::HasPk | SalMessageKind::UniquePreflight => InEval::Inline,
         SalMessageKind::Backfill | SalMessageKind::Shutdown => InEval::Inline,
-        // Consumed above the split: dies at `dispatch_inner`.
-        SalMessageKind::ExchangeRelay => InEval::Inline,
+        SalMessageKind::ExchangeRelay => InEval::Relay,
     }
 }
 
-/// A relay delivered to the wait blocked on it: the relayed batch, and the
-/// collective backfill decision the master stamped onto it.
+/// A relay delivered to the wait blocked on it: the relayed batch, and whether
+/// every worker's partition was drained.
 struct RelayHit {
     batch: Batch,
-    decision: BackfillDecision,
+    drained: bool,
 }
 
 struct WorkerExchangeHandler {
@@ -108,25 +108,16 @@ struct WorkerExchangeHandler {
     ///
     /// Both queues drain in insertion order, which is SAL order.
     deferred_replay: Vec<Request>,
-    /// ExchangeRelay messages whose `(view_id, source_id)` does not match the
-    /// active wait, with the backfill decision (`flags.backfill`) that rode them.
-    /// Keyed by the pair, not the view: a relay for one source of a join view
-    /// must not satisfy a wait for another, which would drive the DAG with the
-    /// wrong sharding columns. Nothing in production parks one — a worker has a
-    /// single outstanding exchange report — so this only catches a mismatch if
-    /// that stops holding.
-    pending_relays: HashMap<(i64, i64), (Batch, BackfillDecision)>,
 }
 
 /// The worker as a drive's [`DriveHost`].
 struct DagExchangeCtx<'a> {
     worker: &'a mut WorkerProcess,
-    /// This worker's source partition is already drained, so its rounds are
-    /// empty pads. The master ANDs it across workers. Only a backfill pads.
+    /// This worker's source partition is already drained, so its rounds are empty
+    /// pads. Only a backfill chunk sets it.
     pad: bool,
-    /// The last exchange round's backfill verdict; `None` when the drive issued
-    /// no exchange.
-    verdict: Option<BackfillDecision>,
+    /// `pad` until a relay comes back, then the relay's `drained`: every worker's.
+    drained: bool,
 }
 
 impl DriveHost for DagExchangeCtx<'_> {
@@ -136,9 +127,9 @@ impl DriveHost for DagExchangeCtx<'_> {
     }
 
     fn exchange(&mut self, view_id: i64, batch: Batch, key: i64) -> Batch {
-        let (batch, decision) = self.worker.do_exchange_wait(view_id, batch, key, self.pad);
-        self.verdict = Some(decision);
-        batch
+        let hit = self.worker.do_exchange_wait(view_id, batch, key, self.pad);
+        self.drained = hit.drained;
+        hit.batch
     }
 }
 
@@ -154,7 +145,7 @@ pub struct WorkerProcess {
     /// Reply trains, one frame emitted per SAL drain, front first: the master
     /// reads one lease at a time and a ring frees only in order.
     pending_streams: VecDeque<PendingScan>,
-    /// Per-frame wire budget of every reply train. `GNITZ_REPLY_FRAME_BUDGET`
+    /// Per-frame wire budget of every W2M train. `GNITZ_REPLY_FRAME_BUDGET`
     /// lowers it, so tests reach multi-frame trains on small tables.
     reply_frame_budget: usize,
 }
@@ -194,7 +185,6 @@ impl WorkerProcess {
             exchange: WorkerExchangeHandler {
                 deferred: Vec::new(),
                 deferred_replay: Vec::new(),
-                pending_relays: HashMap::new(),
             },
             pending_streams: VecDeque::new(),
             reply_frame_budget: gnitz_foundation::env::env_num(
@@ -277,53 +267,42 @@ impl WorkerProcess {
     /// Dispatch a group drained by the main run loop, with no DAG evaluation in
     /// flight: every kind runs where it arrives.
     fn dispatch_top_level(&mut self, msg: &SalMessage, wire: &'static [u8]) {
-        // A relay is an exchange wait's completion signal; it can only arrive
-        // while the worker is blocked in one.
-        if msg.kind == SalMessageKind::ExchangeRelay {
-            gnitz_warn!("unexpected ExchangeRelay at top-level dispatch tid={}", msg.target_id);
-            return;
-        }
         let req = self.decode_request(msg, wire);
         self.handle_request(req);
     }
 
     /// Dispatch a group drained while blocked in `do_exchange_wait` for the
     /// relay keyed `relay_wait = (view_id, source_id)`. Returns that relay when
-    /// this group is it; everything else runs or parks per [`in_eval`].
+    /// this group is it; everything else runs or is deferred per [`in_eval`].
     fn dispatch_in_eval(&mut self, relay_wait: (i64, i64), msg: &SalMessage, wire: &'static [u8]) -> Option<RelayHit> {
         let req = self.decode_request(msg, wire);
-        if req.kind == SalMessageKind::ExchangeRelay {
-            return self.take_or_park_relay(relay_wait, req);
-        }
         match in_eval(req.kind) {
             InEval::Inline => self.handle_request(req),
             InEval::DeferPostAck => self.exchange.deferred_replay.push(req),
             InEval::DeferPreAck => self.exchange.deferred.push(req),
+            InEval::Relay => return Some(self.take_relay(relay_wait, req)),
         }
         None
     }
 
     /// Deliver a relay to the wait blocked on exactly its `(view_id, source_id)`
-    /// pair, or park it in `pending_relays` for a later one.
-    fn take_or_park_relay(&mut self, relay_wait: (i64, i64), req: Request) -> Option<RelayHit> {
+    /// pair; a relay for any other pair means this worker diverged from the master.
+    fn take_relay(&mut self, relay_wait: (i64, i64), req: Request) -> RelayHit {
         let ipc::DecodedWire { control, schema, data_batch, .. } = req.wire;
         let target_id = control.hdr.target_id as i64;
         let key = (target_id, control.hdr.arg0 as i64);
-        let decision = control.hdr.flags.backfill;
-        // Header-only relay: the master stamps a schema block onto every slot of
-        // a relay group, so an empty batch built from the relayed schema is the
-        // correct payload. A schema-less relay would leave no way to build it
-        // without silently guessing the shape.
+        let drained = control.hdr.flags.drained;
         let batch = match (data_batch, schema) {
             (Some(b), _) => b,
             (None, Some(s)) => Batch::empty_with_schema(&s),
             (None, None) => self.fatal_shutdown(&format!("ExchangeRelay for tid={target_id} carries no schema")),
         };
-        if relay_wait == key {
-            return Some(RelayHit { batch, decision });
+        if key != relay_wait {
+            self.fatal_shutdown(&format!(
+                "ExchangeRelay for {key:?} while waiting on {relay_wait:?} — diverged from the master"
+            ));
         }
-        self.exchange.pending_relays.insert(key, (batch, decision));
-        None
+        RelayHit { batch, drained }
     }
 
     /// Run one request, with a failure sent back on its own request id — the one
@@ -441,10 +420,8 @@ impl WorkerProcess {
                 Ok(())
             }
 
-            // `dispatch` consumes ExchangeRelay itself in both contexts and
-            // never routes it here.
             SalMessageKind::ExchangeRelay => {
-                unreachable!("{kind:?} never reaches dispatch_inner")
+                self.fatal_shutdown(&format!("ExchangeRelay for tid={target_id} outside an exchange wait"))
             }
         }
     }
@@ -531,21 +508,10 @@ impl WorkerProcess {
         Ok(())
     }
 
-    /// Distributed CREATE-VIEW backfill, worker side. Streams this worker's
-    /// committed slice of `source_tid` through the incremental plan one chunk at
-    /// a time (peak RAM ~O(chunk), not O(slice)), driving an exchange round
-    /// per chunk per exchanging view across the cross-worker barrier.
-    ///
-    /// All workers must issue the SAME number of rounds, but slices are
-    /// unequal — so a worker that has drained its own keeps issuing EMPTY
-    /// (pad) rounds to stay in lockstep, until the master signals stop. The stop
-    /// decision is collective: each worker stamps a per-chunk pad bit onto every
-    /// exchange frame it issues (`do_exchange_wait`), the master ANDs them and
-    /// stamps the verdict back onto each relay, and the worker records it into a
-    /// single per-chunk slot read here.
-    ///
-    /// A view that runs NO exchange has no barrier: no relay arrives, the slot
-    /// stays `None`, and the worker self-terminates on local drain exhaustion.
+    /// Distributed CREATE-VIEW backfill, worker side: drives this worker's
+    /// committed slice of `source_tid` through the plan one chunk at a time. A
+    /// worker whose slice is drained drives empty pad chunks, so every worker runs
+    /// the same exchange rounds, until [`Self::drive_dag`] reports the backfill done.
     ///
     /// **View-scoped.** Drives ONLY `view_id` ([`Drive::Backfill`]), never the
     /// source's whole dependent closure: the source may already have populated
@@ -567,16 +533,10 @@ impl WorkerProcess {
         let mut handle = self.cat().open_source_cursor(view_id, source_tid)?;
 
         loop {
-            // `None` ⇒ partition exhausted: this round is an empty PAD. The
-            // master ANDs the pad bit across workers and stamps the collective
-            // stop/continue/checkpoint decision back onto each relay.
             let drained = handle.drain_chunk(chunk_rows);
             let pad = drained.is_none();
             let chunk = drained.unwrap_or_else(|| Batch::empty_with_schema(&schema));
-            let signal = self.drive_dag(Drive::Backfill { view: view_id, source: source_tid }, chunk, pad);
-            // Stop on the master's collective verdict, or — with no barrier,
-            // hence no verdict — on local drain exhaustion.
-            if signal == Some(BackfillDecision::Stop) || (signal.is_none() && pad) {
+            if self.drive_dag(Drive::Backfill { view: view_id, source: source_tid }, chunk, pad) {
                 break;
             }
         }
@@ -740,13 +700,12 @@ impl WorkerProcess {
         Ok(self.cat().registry.checkpoint_base()?)
     }
 
-    /// Run one DAG drive with the exchange context, returning the collective
-    /// backfill verdict its rounds carried. `pad` marks this worker's source
-    /// partition already drained, which only a backfill chunk sets.
-    fn drive_dag(&mut self, what: Drive, delta: Batch, pad: bool) -> Option<BackfillDecision> {
-        let mut ctx = DagExchangeCtx { worker: self, pad, verdict: None };
+    /// Run one DAG drive with the exchange context, returning its
+    /// [`DagExchangeCtx::drained`].
+    fn drive_dag(&mut self, what: Drive, delta: Batch, pad: bool) -> bool {
+        let mut ctx = DagExchangeCtx { worker: self, pad, drained: pad };
         let res = crate::query::drive(&mut ctx, what, delta);
-        let verdict = ctx.verdict;
+        let drained = ctx.drained;
         // DDL_SYNC messages deferred during exchange waits land before the ACK.
         self.dispatch_deferred();
         // The one site that answers a storage fault during view maintenance:
@@ -758,7 +717,7 @@ impl WorkerProcess {
                 e,
             );
         }
-        verdict
+        drained
     }
 
     /// Unrecoverable worker fault. The master's watchdog turns the dead worker

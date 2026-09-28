@@ -27,10 +27,7 @@ use super::TxnFamily;
 use crate::catalog::CatalogEngine;
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
-use crate::runtime::master::{
-    exchange::{ExchangeAccumulator, PendingRelay},
-    forward_scan, MasterDispatcher, WORKER_WATCH,
-};
+use crate::runtime::master::{forward_scan, MasterDispatcher, RelayPrepared, WORKER_WATCH};
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, RecvBuf, WriteGuard};
 use crate::runtime::sal::{DirectGroup, GroupTargets, SalFit, SalMessageKind};
@@ -40,7 +37,6 @@ use gnitz_store::schema::key::seek_opk_bytes;
 use gnitz_store::storage::Batch;
 use gnitz_wire::control::DecodedControl;
 use gnitz_wire::txn_frame::DeltaPollItem;
-use gnitz_wire::BackfillDecision;
 use gnitz_wire::{PkKeys, ReadBound, ReadSpec, WireFault, WireFlags, WireStatus};
 
 const TICK_COALESCE_ROWS: usize = 10_000;
@@ -541,16 +537,12 @@ async fn watchdog(shared: Rc<Shared>) {
 /// A failure in one trigger fails only that trigger; SAL emission is further
 /// guarded by `guard_panic` inside `run_tick`.
 async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
-    let nw = shared.disp().num_workers();
     let mut triggers: Vec<TickTrigger> = Vec::new();
     // The batch's `Drain` repliers, held across the tick they are waiting on.
     let mut dones: Vec<oneshot::Sender<Result<(), WireFault>>> = Vec::new();
     // Reused across every tick; `drain_live_tick_rows_into` clears it before
     // refilling so capacity is retained.
     let mut tids_scratch: Vec<i64> = Vec::new();
-    // Rounds complete within the tick that opened them, so this is empty between
-    // ticks; kept to reuse its map.
-    let mut acc = ExchangeAccumulator::new(nw);
     loop {
         triggers.push(rx.recv().await);
 
@@ -573,7 +565,7 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
         // Run the tick. Errors are reported in logs AND handed to every Drain
         // trigger's `done`: the waiting reader's view is stale, so reporting
         // success would serve stale rows under `WireStatus::Ok`.
-        let tick_result = run_tick(&shared, &tids_scratch, &mut acc).await;
+        let tick_result = run_tick(&shared, &tids_scratch).await;
         if let Err(e) = &tick_result {
             gnitz_warn!("tick error: {}", e);
         }
@@ -585,7 +577,7 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
 
 /// Emit Tick groups for every `tid` and await the per-worker ACKs, relaying each
 /// exchange round the tick opens as it completes.
-async fn run_tick(shared: &Rc<Shared>, tids: &[i64], acc: &mut ExchangeAccumulator) -> Result<(), WireFault> {
+async fn run_tick(shared: &Rc<Shared>, tids: &[i64]) -> Result<(), WireFault> {
     // Snapshot before any .await: a concurrent push can advance the published LSN
     // while we wait for tick ACKs, and setting last_tick_lsn to that
     // higher value would report an LSN that this tick never processed.
@@ -633,8 +625,8 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64], acc: &mut ExchangeAccumulat
     shared.requeue_tick_tids(&tids[n..]);
 
     let worker_err = loop {
-        match shared.disp().next_relay(&req_ids, acc).await {
-            Ok(Some(relay)) => relay_steady(shared, relay).await,
+        match shared.disp().next_relay(&req_ids).await {
+            Ok(Some(prep)) => relay_steady(shared, prep).await,
             Ok(None) => break Ok(()),
             Err(e) => break Err(e),
         }
@@ -651,41 +643,29 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64], acc: &mut ExchangeAccumulat
 // ---------------------------------------------------------------------------
 
 /// Write one completed steady-state exchange round back as an ExchangeRelay
-/// group. A tick round never pads, so its `flags.backfill` verdict is `Continue`.
+/// group.
 ///
 /// A lost relay wedges every worker in exchange wait, so every failure aborts.
-async fn relay_steady(shared: &Shared, relay: PendingRelay) {
+async fn relay_steady(shared: &Shared, prep: RelayPrepared) {
     if RELAY_HOLD_FOR_DDL.take_once() {
         hold_relay_for_ddl(shared).await;
     }
 
-    // Phase 1: CPU work — no SAL hold.
-    let prep = shared.disp().prepare_relay(relay, "steady relay");
-
-    // Phase 2: fit and emit under one SAL hold.
     let mut reclaimed = false;
-    // Spent here, not inside the retry: a genuinely low first iteration must
-    // not leave the latch to fire after the reclaim, where `reclaimed` turns
-    // it into the fatal "exhausted even after a forced checkpoint".
-    let mut inject_low = RELAY_SPACE_LOW.take_once();
+    let mut injected_fit = RELAY_SPACE_LOW.take_once().then_some(SalFit::Transient);
     loop {
         {
             let disp = shared.disp();
             let excl = disp.sal().lock().await;
-            let mut fit = disp.sal().fit_relay(&prep.group(BackfillDecision::Continue));
-            if inject_low {
-                inject_low = false;
-                fit = SalFit::Transient;
-            }
+            let fit = injected_fit
+                .take()
+                .unwrap_or_else(|| disp.sal().fit_relay(&prep.group()));
             match fit {
-                // Written whole. Chunking it as the W2M up-leg is chunked
-                // would not help: a parked worker cannot consume a partial
-                // train, so every chunk would be SAL-resident at once.
                 SalFit::Terminal => {
                     gnitz_fatal_abort!("exchange relay exceeds the SAL outright; no checkpoint can deliver it")
                 }
                 SalFit::Fits => {
-                    disp.emit_relay(&excl, &prep, BackfillDecision::Continue);
+                    disp.emit_relay(&excl, &prep);
                     break;
                 }
                 SalFit::Transient if reclaimed => {

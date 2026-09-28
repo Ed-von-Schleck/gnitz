@@ -2,7 +2,7 @@
 //! via the shared append-only log (SAL) and collects responses via per-worker
 //! W2M regions, whose headers also carry each worker's park on the SAL.
 
-pub(crate) mod exchange;
+mod exchange;
 pub(crate) mod scatter;
 
 mod dispatch;
@@ -28,7 +28,7 @@ use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalExcl, SalMess
 use crate::runtime::wire;
 use gnitz_store::schema::{Placement, SchemaDescriptor};
 use gnitz_store::storage::Batch;
-use gnitz_wire::{BackfillDecision, BoundPeek, PkColList, WireFault, WireFlags};
+use gnitz_wire::{BoundPeek, PkColList, WireFault, WireFlags};
 
 pub(crate) use dispatch::{FlushRound, WORKER_WATCH};
 pub(crate) use train::forward_scan;
@@ -38,9 +38,7 @@ pub(crate) use unique_filter::UniqueFilter;
 // RelayPrepared — output of prepare_relay, input of emit_relay
 // ---------------------------------------------------------------------------
 
-/// Materialised exchange relay: shard columns already resolved, payloads
-/// already scattered. Only the SAL write is left, which `emit_relay` does under
-/// a [`SalExcl`].
+/// An exchange round scattered into its relay; only the SAL write is left.
 pub(crate) struct RelayPrepared {
     /// The view the relay targets.
     view: wire::WireSchema,
@@ -48,16 +46,20 @@ pub(crate) struct RelayPrepared {
     /// One batch per worker (scatter), or a single batch every worker is sent
     /// (broadcast).
     dest: Vec<Batch>,
+    /// Every worker's source partition is drained: a backfill's stop signal.
+    drained: bool,
 }
 
 impl RelayPrepared {
-    /// The relay's SAL group stamped with `decision`. `arg0` echoes `source_id`,
-    /// so a join's wait cannot take another source's relay.
-    pub(crate) fn group(&self, decision: BackfillDecision) -> DirectGroup<'_> {
+    /// The relay's SAL group; `arg0` echoes `source_id`.
+    pub(crate) fn group(&self) -> DirectGroup<'_> {
         DirectGroup {
             template: self.view.frame(wire::WireMsg {
                 arg0: self.source_id as u64,
-                flags: WireFlags { backfill: decision, ..Default::default() },
+                flags: WireFlags {
+                    drained: self.drained,
+                    ..Default::default()
+                },
                 ..Default::default()
             }),
             data: GroupData::batches(&self.dest),

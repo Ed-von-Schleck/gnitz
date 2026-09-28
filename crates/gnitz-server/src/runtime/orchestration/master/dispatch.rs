@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::exchange::{ExchangeAccumulator, PendingRelay};
+use super::exchange::ExchangeRound;
 use super::scatter::with_routed;
 use super::*;
 use crate::query::{RelayRoute, OUTPUT_RELAY};
@@ -46,7 +46,7 @@ impl FlushRound {
 pub(crate) const WORKER_WATCH: Duration = Duration::from_millis(100);
 
 /// `GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW`: report SAL relay space as low for the
-/// backfill on every non-stop round, so tests drive the reclamation protocol over
+/// backfill on every round, so tests drive the reclamation protocol over
 /// a small table. The steady-state relay's equivalent is `executor`'s own
 /// `RELAY_SPACE_LOW`, beside the loop it perturbs.
 static BACKFILL_RELAY_SPACE_LOW: Seam = Seam::new("GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW");
@@ -119,21 +119,24 @@ impl MasterDispatcher {
         self.sal.num_workers()
     }
 
-    /// The next exchange round `lease`'s ids wait on, or `None` once all have
-    /// answered. A worker ACKs a tick or backfill only after its relays are written, so
-    /// `None` leaves no partial round in `acc`.
-    pub(crate) async fn next_relay(
-        &self,
-        lease: &AckLease,
-        acc: &mut ExchangeAccumulator,
-    ) -> Result<Option<PendingRelay>, WireFault> {
+    /// The next exchange round `lease`'s ids wait on, scattered into its relay, or
+    /// `None` once all have answered.
+    pub(crate) async fn next_relay(&self, lease: &AckLease) -> Result<Option<RelayPrepared>, WireFault> {
         let mut acks = std::pin::pin!(lease.acks());
+        let mut open: Option<ExchangeRound> = None;
         loop {
             match select2(acks.as_mut(), self.reactor.next_exchange()).await {
-                Either::A(r) => return r.map(|()| None),
+                Either::A(r) => {
+                    return r.map(|()| {
+                        debug_assert!(open.is_none(), "every worker ACKed inside an open round");
+                        None
+                    })
+                }
                 Either::B((w, frame)) => {
-                    if let Some(relay) = acc.process(w, frame) {
-                        return Ok(Some(relay));
+                    let round = open.get_or_insert_with(|| ExchangeRound::open(&frame, self.num_workers()));
+                    if round.accept(w, frame) {
+                        let round = open.take().expect("the round just accepted");
+                        return Ok(Some(self.prepare_relay(round, lease.ctx())));
                     }
                 }
             }
@@ -145,21 +148,14 @@ impl MasterDispatcher {
     /// not fit runs [`Self::reclaim_base`] first.
     pub(crate) async fn collect_round(&self, lease: &AckLease, reclaim_allowed: bool) -> Result<(), WireFault> {
         let collect = async {
-            let mut acc = ExchangeAccumulator::new(self.num_workers());
-            while let Some(relay) = self.next_relay(lease, &mut acc).await? {
+            while let Some(prep) = self.next_relay(lease).await? {
                 let mut excl = self.sal.lock().await;
-                let decision = if relay.all_pad {
-                    BackfillDecision::Stop
-                } else {
-                    BackfillDecision::Continue
-                };
-                let prep = self.prepare_relay(relay, lease.ctx());
                 if reclaim_allowed
-                    && (self.sal.fit_relay(&prep.group(decision)) != SalFit::Fits || BACKFILL_RELAY_SPACE_LOW.armed())
+                    && (self.sal.fit_relay(&prep.group()) != SalFit::Fits || BACKFILL_RELAY_SPACE_LOW.armed())
                 {
                     self.reclaim_base(&mut excl).await?;
                 }
-                self.emit_relay(&excl, &prep, decision);
+                self.emit_relay(&excl, &prep);
             }
             Ok::<(), WireFault>(())
         };
@@ -286,30 +282,27 @@ impl MasterDispatcher {
 
     /// Scatter a completed round into the group [`Self::emit_relay`] writes.
     /// Aborts on failure, naming `ctx`: every worker is parked on this relay.
-    pub(crate) fn prepare_relay(&self, relay: PendingRelay, ctx: &str) -> RelayPrepared {
-        guard_panic("prepare_relay", || self.build_relay(relay)).unwrap_or_else(|e: String| {
+    fn prepare_relay(&self, round: ExchangeRound, ctx: &str) -> RelayPrepared {
+        guard_panic("prepare_relay", || self.build_relay(round)).unwrap_or_else(|e: String| {
             gnitz_fatal_abort!("{ctx}: {e}; a lost relay wedges workers blocked in exchange wait")
         })
     }
 
-    fn build_relay(&self, relay: PendingRelay) -> Result<RelayPrepared, String> {
-        // `all_pad` is the backfill stop signal, read by the caller before
-        // `prepare_relay`; the relay scatter itself does not depend on it.
-        let PendingRelay {
+    fn build_relay(&self, round: ExchangeRound) -> Result<RelayPrepared, String> {
+        let ExchangeRound {
             view_id,
-            payloads,
-            schema,
             source_id,
-            all_pad: _,
-        } = relay;
+            schema,
+            frames,
+            drained,
+            ..
+        } = round;
 
         let cat = self.cat();
-        let sources: Vec<&Batch> = payloads.iter().flatten().collect();
+        let sources: Vec<&Batch> = frames.iter().flatten().collect();
         let num_workers = self.num_workers();
 
         let meta = cat.dag.view_meta(view_id)?;
-        // `prepare_relay` turns this `Err` into a cluster abort, taken over
-        // scattering under a key the rows were never stored under.
         let dest = match source_id {
             OUTPUT_RELAY => op_relay_scatter(
                 &sources,
@@ -330,8 +323,6 @@ impl MasterDispatcher {
                 }
             },
         };
-        // The scatter key's own reason, not a restatement: it names the column
-        // and the bound it missed.
         let dest = dest.map_err(|e| {
             let round = match source_id {
                 OUTPUT_RELAY => "output relay key".to_string(),
@@ -344,13 +335,13 @@ impl MasterDispatcher {
             view: wire::WireSchema::encoded(view_id, schema),
             source_id,
             dest,
+            drained,
         })
     }
 
-    /// Write a prepared relay stamped with `decision`. Aborts on failure, as
-    /// [`Self::prepare_relay`] does.
-    pub(crate) fn emit_relay(&self, excl: &SalExcl<'_>, prep: &RelayPrepared, decision: BackfillDecision) {
-        guard_panic("emit_relay", || excl.write(&prep.group(decision))).unwrap_or_else(|e| {
+    /// Write a prepared relay. Aborts on failure, as [`Self::prepare_relay`] does.
+    pub(crate) fn emit_relay(&self, excl: &SalExcl<'_>, prep: &RelayPrepared) {
+        guard_panic("emit_relay", || excl.write(&prep.group())).unwrap_or_else(|e| {
             gnitz_fatal_abort!("emit_relay: {e}; a lost relay wedges workers blocked in exchange wait")
         })
     }

@@ -68,19 +68,18 @@ pub struct WireFlags {
     pub scan_last: bool,
     /// Bits 37-38: what a `HasPk` probe answers a matched key with.
     pub probe_mode: WireProbeMode,
-    /// Bits 39-40: an ExchangeRelay's round verdict.
-    pub backfill: BackfillDecision,
-    /// Bit 41: this worker's source partition is exhausted; its exchange is an empty pad.
-    pub backfill_pad: bool,
+    /// Bit 39: on an exchange frame, this worker's source partition is drained; on an
+    /// ExchangeRelay, every worker's is — a backfill's stop signal.
+    pub drained: bool,
 }
 
 pub(crate) const FLAG_HAS_SCHEMA: u64 = 1 << 32;
 pub(crate) const FLAG_HAS_DATA: u64 = 1 << 33;
 
-const RESERVED_BITS: u64 = !crate::low_bits_mask(42);
+const RESERVED_BITS: u64 = !crate::low_bits_mask(40);
 
 impl WireFlags {
-    /// A frame of a worker train: `continuation` always, since the master's terminal
+    /// A frame of a worker's reply train: `continuation` always, since the master's terminal
     /// frame ends the client's reply; `scan_last` on the train's last frame.
     pub const fn train_frame(schema_version: u16, last: bool) -> Self {
         WireFlags {
@@ -91,8 +90,7 @@ impl WireFlags {
             batch_consolidated: false,
             scan_last: last,
             probe_mode: WireProbeMode::Exists,
-            backfill: BackfillDecision::Continue,
-            backfill_pad: false,
+            drained: false,
         }
     }
 
@@ -104,8 +102,7 @@ impl WireFlags {
             | (self.batch_consolidated as u64) << 35
             | (self.scan_last as u64) << 36
             | (self.probe_mode as u64) << 37
-            | (self.backfill as u64) << 39
-            | (self.backfill_pad as u64) << 41
+            | (self.drained as u64) << 39
     }
 
     /// Rejects a word naming a verb or mode this build does not define, or setting a
@@ -123,8 +120,7 @@ impl WireFlags {
             batch_consolidated: bit(35),
             scan_last: bit(36),
             probe_mode: WireProbeMode::from_wire(((w >> 37) & 3) as u8).ok_or("flags: unknown probe mode")?,
-            backfill: BackfillDecision::from_wire(((w >> 39) & 3) as u8).ok_or("flags: unknown backfill decision")?,
-            backfill_pad: bit(41),
+            drained: bit(39),
         })
     }
 }
@@ -168,17 +164,6 @@ wire_enum! {
         /// Answer each matched key with that key plus ONE of the stored row's
         /// columns, named by `arg0`. PK store only.
         Project = 3,
-    }
-}
-
-wire_enum! {
-    /// A distributed backfill round's verdict, stamped on every relay of the round.
-    /// `Stop` ends every worker's loop on the same all-pad round.
-    #[derive(Default)]
-    pub enum BackfillDecision: u8 {
-        #[default]
-        Continue = 0,
-        Stop = 1,
     }
 }
 
