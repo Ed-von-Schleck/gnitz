@@ -18,6 +18,7 @@ use proptest::prelude::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES, MAX_PK_COLUMNS};
 use crate::storage::{Batch, RecoverySource, StoreBudgets, Table};
 use crate::test_support::{arb_pk_type, arb_type_code, row_key, zset_of};
+use gnitz_expr::RowSource;
 
 // ---------------------------------------------------------------------------
 // Strategies
@@ -180,7 +181,7 @@ proptest! {
             // A durable flush synchronously commits exactly one on-disk shard.
             prop_assert_eq!(shards.len(), 1);
             // Direct shard decode: on-disk region layout + wide-PK Raw guard.
-            let owned = shards[0].slice_to_owned_batch(0, shards[0].count, &schema);
+            let owned = shards[0].slice_to_owned_batch(0, shards[0].row_count());
             prop_assert_eq!(&expected, &zset_of(&owned, &schema));
         } else {
             // A sub-ceiling ephemeral flush writes no shard; rows live in

@@ -169,7 +169,7 @@ impl RunSet {
         merge::run_merge(&views, schema, |src, row, w| {
             survivors.push((src as u32, row as u32, w))
         });
-        let mut result = UnifiedSet::of(&views, schema).materialize(schema, &survivors, total_blob);
+        let mut result = UnifiedSet::whole(&views, schema).materialize(&survivors, total_blob);
         result.certify_layout(Layout::Consolidated);
         result
     }

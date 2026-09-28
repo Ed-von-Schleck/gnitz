@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::runtime::reactor::{ClientConn, PeerGone, Plain, Reactor, RecvBuf, SendBody};
 use crate::runtime::tls::TlsShared;
 use crate::runtime::w2m::W2mSlot;
-use gnitz_store::storage::batch_pool::{acquire_buf, PooledSendBuf};
+use gnitz_store::storage::batch_pool::{acquire_buf, PooledBuf};
 
 /// Ceiling on a concatenation of client-bound frames (coalesced scan heads, corked
 /// replies): the copy paid to save per-frame sends. `fanout_coalesced_egress_bench`
@@ -24,7 +24,7 @@ pub struct Peer {
     transport: Transport,
     /// Replies written but not yet sent, concatenated so a run of pipelined
     /// requests leaves as one send. `None` when nothing is pending.
-    egress: RefCell<Option<PooledSendBuf>>,
+    egress: RefCell<Option<PooledBuf>>,
 }
 
 enum Transport {
@@ -68,7 +68,7 @@ impl Peer {
     /// of it and release it before any await.
     pub fn cork_with(&self, write: impl FnOnce(&mut Vec<u8>)) {
         let mut e = self.egress.borrow_mut();
-        let acc = e.get_or_insert_with(|| PooledSendBuf(acquire_buf()));
+        let acc = e.get_or_insert_with(|| PooledBuf(acquire_buf()));
         write(&mut acc.0);
     }
 

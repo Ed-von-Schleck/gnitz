@@ -9,7 +9,7 @@ use super::super::shard_reader::MappedShard;
 use super::*;
 use crate::schema::key::PkBuf;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::{make_schema_u64_i64, opk_pk, pk_payload_schema};
+use crate::test_support::{make_batch_raw, make_schema_u64_i64, opk_pk, pk_payload_schema};
 use gnitz_expr::RowSource;
 use gnitz_wire::read_i64_le;
 use std::fs;
@@ -22,7 +22,8 @@ fn route(
     schema: &SchemaDescriptor,
 ) -> Result<Vec<(PkBuf, Batch, bool)>, StorageError> {
     let mut out = Vec::new();
-    merge_and_route(shards, guards, schema, |&(gk, skeleton), batch| {
+    let inputs: Vec<&MappedShard> = shards.iter().collect();
+    merge_and_route(&inputs, guards, schema, |&(gk, skeleton), batch| {
         out.push((gk, batch, skeleton));
         Ok(())
     })?;
@@ -122,8 +123,8 @@ fn compaction_packs_eligible_int_payload() {
 
     // Content: every merged row's decoded payload == its PK, weight 1.
     let merged = MappedShard::open(&cout, &schema).unwrap();
-    assert_eq!(merged.count, 600);
-    for r in 0..merged.count {
+    assert_eq!(merged.row_count(), 600);
+    for r in 0..merged.row_count() {
         let pk = merged.get_pk(r);
         let pay = read_i64_le(merged.get_col_ptr(r, 0, 8), 0);
         assert_eq!(pay as u128, pk, "row {r} payload == pk");
@@ -138,8 +139,8 @@ fn compaction_packs_eligible_int_payload() {
         "re-compaction repacks"
     );
     let merged2 = MappedShard::open(&cout2, &schema).unwrap();
-    assert_eq!(merged2.count, merged.count);
-    for r in 0..merged2.count {
+    assert_eq!(merged2.row_count(), merged.row_count());
+    for r in 0..merged2.row_count() {
         assert_eq!(merged2.get_pk(r), merged.get_pk(r));
         assert_eq!(
             read_i64_le(merged2.get_col_ptr(r, 0, 8), 0),
@@ -208,7 +209,7 @@ fn compaction_merges_inputs_and_drops_cancelled_rows() {
             (None, None) => {}
             (Some(cout), Some(want)) => {
                 let merged = MappedShard::open(&cout, &schema).unwrap();
-                let got: Vec<u64> = (0..merged.count).map(|i| merged.get_pk(i) as u64).collect();
+                let got: Vec<u64> = (0..merged.row_count()).map(|i| merged.get_pk(i) as u64).collect();
                 assert_eq!(got, want, "{name}");
             }
             (got, want) => panic!("{name}: wrote a shard = {}, wanted {}", got.is_some(), want.is_some()),
@@ -223,11 +224,8 @@ fn a_corrupt_input_body_fails_the_compaction() {
     let schema = make_schema_u64_i64();
     let mut idx = ShardIndex::open(dir.to_str().unwrap(), schema, ShardBudget::Unbounded, false, None).unwrap();
     for i in 0..5u64 {
-        let rows: Vec<(Vec<u8>, i64, i64)> = (0..20)
-            .map(|j| i * 100 + j)
-            .map(|p| (opk_pk(&schema, &[p as u128]), 1, p as i64))
-            .collect();
-        idx.append_l0_run(&shard_file::test_batch(&schema, &rows)).unwrap();
+        let rows: Vec<(u64, i64, i64)> = (0..20).map(|j| i * 100 + j).map(|p| (p, 1, p as i64)).collect();
+        idx.append_l0_run(&make_batch_raw(&schema, &rows)).unwrap();
     }
     let listing = || {
         let mut names: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -331,23 +329,18 @@ fn make_3col_schema() -> SchemaDescriptor {
 
 /// Write a shard with 3-column rows: (pk, weight, col1_val, col2_val).
 fn write_3col_shard(path: &str, rows: &[(u64, i64, i64, i64)], schema: &SchemaDescriptor) {
-    let mut batch = Batch::with_capacity(schema, rows.len());
-    for &(pk, w, c1, c2) in rows {
-        batch.extend_pk(pk as u128);
-        batch.extend_weight(&w.to_le_bytes());
-        batch.extend_null_bmp(&0u64.to_le_bytes());
-        batch.extend_col(0, &c1.to_le_bytes());
-        batch.extend_col(1, &c2.to_le_bytes());
-        batch.count += 1;
-    }
-    batch.write_as_shard(path, ShardWriteOpts::default()).unwrap();
+    let rows: Vec<_> = rows
+        .iter()
+        .map(|&(pk, w, c1, c2)| (pk.to_be_bytes().to_vec(), w, 0, vec![c1, c2]))
+        .collect();
+    shard_file::write_i64_shard(path, schema, &rows, &[], ShardWriteOpts::default());
 }
 
 /// Read all rows from a 3-col shard as (pk, weight, col1, col2).
 fn read_3col_shard(path: &str, schema: &SchemaDescriptor) -> Vec<(u64, i64, i64, i64)> {
     let shard = MappedShard::open(path, schema).unwrap();
     let mut rows = Vec::new();
-    for i in 0..shard.count {
+    for i in 0..shard.row_count() {
         let pk = shard.get_pk(i) as u64;
         let w = shard.get_weight(i);
         let c1 = read_i64_le(shard.get_col_ptr(i, 0, 8), 0);
@@ -538,13 +531,13 @@ fn test_merge_and_route_keys_below_first_guard() {
 
     let shard_path = guard_outputs[0].1.clone();
     let shard = MappedShard::open(&shard_path, &schema).unwrap();
-    assert_eq!(shard.count, 4, "all 4 keys must be present in output");
+    assert_eq!(shard.row_count(), 4, "all 4 keys must be present in output");
 
     // Verify all keys readable
     for &pk in &[50u64, 100, 150, 250] {
         let at = shard.find_lower_bound_bytes(&pk.to_be_bytes());
         assert!(
-            at < shard.count && shard.get_pk(at) == pk as u128,
+            at < shard.row_count() && shard.get_pk(at) == pk as u128,
             "key {pk} not found in output shard"
         );
     }
@@ -553,7 +546,7 @@ fn test_merge_and_route_keys_below_first_guard() {
 // -- Wide / compound / signed PK compaction (OPK ordering) ---------------
 
 fn assert_compare_pk_bytes_sorted(shard: &MappedShard) {
-    for i in 1..shard.count {
+    for i in 1..shard.row_count() {
         assert_ne!(
             crate::schema::key::compare_pk_bytes(shard.get_pk_bytes(i - 1), shard.get_pk_bytes(i)),
             std::cmp::Ordering::Greater,
@@ -662,7 +655,9 @@ fn compaction_orders_and_folds_on_opk_bytes_at_every_pk_shape() {
         let merged = MappedShard::open(&cout, &schema).unwrap();
         assert_compare_pk_bytes_sorted(&merged);
 
-        let got: Vec<Vec<u8>> = (0..merged.count).map(|i| merged.get_pk_bytes(i).to_vec()).collect();
+        let got: Vec<Vec<u8>> = (0..merged.row_count())
+            .map(|i| merged.get_pk_bytes(i).to_vec())
+            .collect();
         let want: Vec<Vec<u8>> = case.want.iter().map(|pk| opk_pk(&schema, pk)).collect();
         assert_eq!(got, want, "{}", case.name);
     }
@@ -732,13 +727,11 @@ fn write_diff_shard(path: &str, schema: &SchemaDescriptor, rows: &[DiffRow]) {
                 [0u8; 8]
             }
         };
-        batch.extend_pk(pk as u128);
-        batch.extend_weight(&w.to_le_bytes());
-        batch.extend_null_bmp(&nw.to_le_bytes());
+        batch.begin_row(&pk.to_be_bytes(), w);
         batch.extend_col(0, &st0);
         batch.extend_col(1, &st1);
         batch.extend_col(2, &ic);
-        batch.count += 1;
+        batch.commit_row(nw);
     }
     batch.write_as_shard(path, ShardWriteOpts::default()).unwrap();
 }
@@ -748,7 +741,7 @@ fn write_diff_shard(path: &str, schema: &SchemaDescriptor, rows: &[DiffRow]) {
 fn decode_diff_shard(path: &str, schema: &SchemaDescriptor) -> Vec<DecodedRow> {
     let shard = MappedShard::open(path, schema).unwrap();
     let blob = shard.blob();
-    (0..shard.count)
+    (0..shard.row_count())
         .map(|i| {
             let pk = shard.get_pk_bytes(i).to_vec();
             let w = shard.get_weight(i);
@@ -1057,7 +1050,7 @@ fn the_routed_split_agrees_with_guard_slot_at_every_stride() {
 
 mod skeleton_tests {
     use super::super::*;
-    use crate::storage::repr::batch::{Batch, REG_NULL_BMP};
+    use crate::storage::repr::batch::REG_NULL_BMP;
     use crate::storage::repr::layout::{Encoding, ShardHeader};
     use crate::storage::repr::merge::ColumnarSource;
     use crate::storage::repr::shard_file::{region_dir, ShardWriteOpts};
@@ -1067,16 +1060,9 @@ mod skeleton_tests {
 
     /// A `(PK, weight, payload)` shard, so one PK can carry several payloads.
     fn write_shard(path: &std::path::Path, rows: &[(u64, i64, i64)], schema: &SchemaDescriptor) -> String {
-        let mut b = Batch::with_capacity(schema, rows.len().max(1));
-        for &(pk, w, v) in rows {
-            b.extend_pk(pk as u128);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &v.to_le_bytes());
-            b.count += 1;
-        }
         let shard_path = path.to_str().unwrap().to_owned();
-        b.into_consolidated(schema)
+        crate::test_support::make_batch_raw(schema, rows)
+            .into_consolidated(schema)
             .write_as_shard(&shard_path, ShardWriteOpts::default())
             .unwrap();
         shard_path
@@ -1085,7 +1071,7 @@ mod skeleton_tests {
     /// `(pk, weight)` of every row of an output shard, read under the view schema.
     fn read_rows(path: &str, schema: &SchemaDescriptor) -> Vec<(u128, i64)> {
         let s = MappedShard::open(path, schema).unwrap();
-        (0..s.count).map(|i| (s.get_pk(i), s.get_weight(i))).collect()
+        (0..s.row_count()).map(|i| (s.get_pk(i), s.get_weight(i))).collect()
     }
 
     /// A guard's *first* dehydration: survivors still hold several payloads per
@@ -1172,6 +1158,53 @@ mod skeleton_tests {
             ),
             30,
             "the hydrated guard keeps its payload"
+        );
+    }
+}
+
+/// Compaction over packed inputs that all hold the same keys, so the merge breaks
+/// every PK tie on the payload, at several source × guard counts; then with every
+/// guard a skeleton.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn for_compaction_bench() {
+    use crate::test_support::{pk_u64_two_i64_schema, settled_rss};
+    use gnitz_foundation::perf::Counter;
+    use std::hint::black_box;
+    const TOTAL: usize = 1 << 20;
+    let schema = pk_u64_two_i64_schema();
+    let dir = tempfile::tempdir().unwrap();
+    let (cycles, instructions) = (Counter::cycles().unwrap(), Counter::instructions().unwrap());
+    for (sources, guards, skeleton) in [(4, 1, false), (32, 32, false), (64, 64, false), (32, 32, true)] {
+        let per = TOTAL / sources;
+        let inputs: Vec<MappedShard> = (0..sources)
+            .map(|s| {
+                let name = format!("in_{sources}_{guards}_{skeleton}_{s}.db");
+                let path = dir.path().join(name).to_str().unwrap().to_owned();
+                let rows: Vec<_> = (0..per)
+                    .map(|i| ((i as u64).to_be_bytes().to_vec(), 1, 0, vec![s as i64, 3 * i as i64]))
+                    .collect();
+                shard_file::write_i64_shard(&path, &schema, &rows, &[], ShardWriteOpts::COMPACTION);
+                MappedShard::open(&path, &schema).unwrap()
+            })
+            .collect();
+        let guard_keys: Vec<(PkBuf, bool)> = (0..guards)
+            .map(|g| (PkBuf::from_bytes(&((g * per / guards) as u64).to_be_bytes()), skeleton))
+            .collect();
+        let rss0 = settled_rss();
+        let (((), i), c) = cycles.measure(|| {
+            instructions.measure(|| {
+                merge_and_route(&inputs.iter().collect::<Vec<_>>(), &guard_keys, &schema, |_, batch| {
+                    black_box(batch);
+                    Ok(())
+                })
+                .unwrap()
+            })
+        });
+        println!(
+            "{sources} sources x {guards} guards{}: {i} instructions, {c} cycles; {} bytes retained",
+            if skeleton { ", all skeleton" } else { "" },
+            settled_rss().saturating_sub(rss0),
         );
     }
 }

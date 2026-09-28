@@ -846,3 +846,65 @@ fn read_cursor_advance_to_rebuild_bench() {
         }
     }
 }
+
+/// Range reads over two packed shards with interleaved keys under one cursor: a
+/// seek plus a small drain, then two full drains, reporting what stays resident
+/// once the cursor drops.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn for_range_drain_bench() {
+    use crate::test_support::{pk_u64_two_i64_schema, settled_rss};
+    use gnitz_foundation::perf::Counter;
+    use std::hint::black_box;
+    const N: usize = 1_000_000;
+    let schema = pk_u64_two_i64_schema();
+    let dir = tempfile::tempdir().unwrap();
+    let shards: Vec<Rc<MappedShard>> = (0..2u64)
+        .map(|s| {
+            let path = dir.path().join(format!("range_{s}.db")).to_str().unwrap().to_owned();
+            let rows: Vec<_> = (0..N)
+                .map(|i| {
+                    (
+                        (2 * i as u64 + s).to_be_bytes().to_vec(),
+                        1,
+                        0,
+                        vec![(i % 1000) as i64, 3 * i as i64],
+                    )
+                })
+                .collect();
+            super::super::shard_file::write_i64_shard(
+                &path,
+                &schema,
+                &rows,
+                &[],
+                super::super::shard_file::ShardWriteOpts::COMPACTION,
+            );
+            Rc::new(MappedShard::open(&path, &schema).unwrap())
+        })
+        .collect();
+    let (cycles, instructions) = (Counter::cycles().unwrap(), Counter::instructions().unwrap());
+    let rss0 = settled_rss();
+    let key = (N as u64).to_be_bytes();
+    let (((), i), c) = cycles.measure(|| {
+        instructions.measure(|| {
+            let mut cur = create_read_cursor(&[], &shards, schema);
+            cur.seek_bytes(&key);
+            black_box(cur.drain_chunk(100));
+        })
+    });
+    println!(
+        "seek + drain_chunk(100): {i} instructions, {c} cycles; {} bytes retained",
+        settled_rss().saturating_sub(rss0)
+    );
+    for pass in 1..=2 {
+        let (((), i), c) = cycles.measure(|| {
+            instructions.measure(|| {
+                black_box(create_read_cursor(&[], &shards, schema).materialize());
+            })
+        });
+        println!(
+            "full drain {pass}: {i} instructions, {c} cycles; {} bytes retained after the cursor drops",
+            settled_rss().saturating_sub(rss0)
+        );
+    }
+}

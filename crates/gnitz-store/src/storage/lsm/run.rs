@@ -7,11 +7,13 @@
 //! Both variants own their backing via `Rc`, so a `ReadCursor` or [`StoredRow`]
 //! holding a `Run` carries no borrow of the table that produced it.
 
+use std::ops::Range;
 use std::rc::Rc;
 
 use super::batch::Batch;
 use super::merge::ColumnarSource;
 use super::merge::{ColPtr, UnifiedSource};
+use super::scatter::DecodedColumns;
 use super::shard_reader::MappedShard;
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::RowSource;
@@ -42,12 +44,14 @@ impl Run {
         }
     }
 
-    /// Bulk-copy `[start, start + row_count)` into an owned batch — one memcpy
-    /// per column.
+    /// Bulk-copy `[start, start + row_count)` into an owned batch under `schema`.
     pub(crate) fn slice_to_owned_batch(&self, start: usize, row_count: usize, schema: &SchemaDescriptor) -> Batch {
         match self {
             Run::Mem(b) => Batch::from_ranges(b, &[(start, start + row_count)], schema, 0),
-            Run::Shard(s) => s.slice_to_owned_batch(start, row_count, schema),
+            Run::Shard(s) => {
+                debug_assert!(*s.schema() == *schema, "a shard slices under the schema it is bound to");
+                s.slice_to_owned_batch(start, row_count)
+            }
         }
     }
 }
@@ -109,16 +113,22 @@ impl RowSource for Run {
     fn row_count(&self) -> usize {
         match self {
             Run::Mem(b) => b.count,
-            Run::Shard(s) => s.count,
+            Run::Shard(s) => s.row_count(),
         }
     }
 }
 
 impl ColumnarSource for Run {
-    fn to_unified(&self, schema: &SchemaDescriptor, cols: &mut Vec<ColPtr>) -> UnifiedSource<'_> {
+    fn to_unified(
+        &self,
+        schema: &SchemaDescriptor,
+        cols: &mut Vec<ColPtr>,
+        window: Range<usize>,
+        decoded: &mut DecodedColumns,
+    ) -> UnifiedSource<'_> {
         match self {
             Run::Mem(b) => super::merge::mem_batch_to_unified(&b.as_mem_batch(), schema, cols),
-            Run::Shard(s) => s.to_unified(schema, cols),
+            Run::Shard(s) => s.to_unified(schema, cols, window, decoded),
         }
     }
 

@@ -41,7 +41,7 @@ pub(super) fn skeleton_schema(schema: &SchemaDescriptor) -> SchemaDescriptor {
 /// the prefix and the sum is never negative. `debug_assert!(w > 0)` is the
 /// tripwire: a future *partial* compaction that broke fold totality would trip
 /// it instead of silently corrupting bounded views.
-fn fold_bucket_per_pk(shards: &[MappedShard], bucket: &[(u32, u32, i64)]) -> Vec<(u32, u32, i64)> {
+fn fold_bucket_per_pk(shards: &[&MappedShard], bucket: &[(u32, u32, i64)]) -> Vec<(u32, u32, i64)> {
     let pk_of = |&(src, row, _): &(u32, u32, i64)| shards[src as usize].get_pk_bytes(row as usize);
     bucket
         .chunk_by(|a, b| pk_bytes_eq(pk_of(a), pk_of(b)))
@@ -60,7 +60,7 @@ fn fold_bucket_per_pk(shards: &[MappedShard], bucket: &[(u32, u32, i64)]) -> Vec
 /// destination's batch is one `(PK, Σweight)` row per key, under
 /// [`skeleton_schema`].
 pub(super) fn merge_and_route(
-    shards: &[MappedShard],
+    shards: &[&MappedShard],
     guards: &[(PkBuf, bool)],
     schema: &SchemaDescriptor,
     mut emit: impl FnMut(&(PkBuf, bool), Batch) -> Result<(), StorageError>,
@@ -72,7 +72,7 @@ pub(super) fn merge_and_route(
     for s in shards {
         s.verify_body()?;
     }
-    let total_rows: usize = shards.iter().map(|s| s.count).sum(); // survivor upper bound
+    let total_rows: usize = shards.iter().map(|s| s.row_count()).sum(); // survivor upper bound
     let total_blob: usize = shards.iter().map(|s| s.blob().len()).sum();
 
     // Phase 1 — merge into survivors, sorted (PK, payload). The merge order is
@@ -99,12 +99,15 @@ pub(super) fn merge_and_route(
 
     // Phase 2 — one batch per guard, each scattered column-at-a-time from its
     // contiguous survivor slice.
-    let set = UnifiedSet::of(shards, schema);
+    let hydrated = guards
+        .iter()
+        .any(|&(_, s)| !s)
+        .then(|| UnifiedSet::whole(shards, schema));
+    let skeletal = guards
+        .iter()
+        .any(|&(_, s)| s)
+        .then(|| UnifiedSet::whole(shards, &skeleton_schema(schema)));
     let nsurv = survivors.len();
-
-    // Only built when some destination guard is dehydrated; a hydrated store
-    // never derives it.
-    let skel_schema = guards.iter().any(|&(_, s)| s).then(|| skeleton_schema(schema));
 
     for (g, dest @ &(_, skeleton)) in guards.iter().enumerate() {
         let bucket = &survivors[bounds[g]..bounds[g + 1]];
@@ -116,19 +119,19 @@ pub(super) fn merge_and_route(
         if folded.as_ref().is_some_and(|f| f.is_empty()) {
             continue;
         }
-        // A skeleton guard writes its folded rows under the PK-only schema; a
-        // hydrated one writes the bucket at full width.
-        let (wschema, rows, blob_cap) = match &folded {
+        let (set, rows, blob_cap) = match &folded {
             Some(rows) => (
-                skel_schema
-                    .as_ref()
-                    .expect("a skeleton guard derived a skeleton schema"),
+                skeletal.as_ref().expect("a skeleton guard built the skeleton set"),
                 rows.as_slice(),
                 0,
             ),
-            None => (schema, bucket, prorated_blob_cap(total_blob, nsurv, bucket.len())),
+            None => (
+                hydrated.as_ref().expect("a hydrated guard built the hydrated set"),
+                bucket,
+                prorated_blob_cap(total_blob, nsurv, bucket.len()),
+            ),
         };
-        let mut batch = set.materialize(wschema, rows, blob_cap);
+        let mut batch = set.materialize(rows, blob_cap);
         if folded.is_some() {
             // The fused pass copied the *source's* payload null bits, which mean
             // nothing without a payload. Zeroing collapses the region to

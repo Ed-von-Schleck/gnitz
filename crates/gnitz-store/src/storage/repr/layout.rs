@@ -2,7 +2,7 @@
 //! decide how the rest of a shard is read.
 
 use super::super::error::StorageError;
-use gnitz_wire::{read_u64_le, write_u64_le};
+use gnitz_wire::{read_i64_le, read_signed_exact, read_u64_le, read_unsigned_exact, write_u64_le, FixedInt};
 
 use StorageError::Corrupt;
 
@@ -37,6 +37,7 @@ pub(crate) const SHARD_FLAG_SKELETON: u64 = 1;
 
 /// The header fields a reader acts on; [`read`](Self::read) checks magic and
 /// version.
+#[derive(Clone, Copy)]
 pub(crate) struct ShardHeader {
     pub row_count: usize,
     pub file_npc: usize,
@@ -152,35 +153,83 @@ pub(crate) fn region_spans(image: &[u8], file_npc: usize) -> Result<Vec<Span>, S
     Ok(spans)
 }
 
-/// A `TwoValue` region's image: `value_a` LE ‖ `value_b` LE ‖ a `count`-bit
-/// vector, bit *i* set ⇔ row *i* holds `value_b`.
-pub(crate) const TWO_VALUE_HEADER: usize = 16;
+// A TwoValue image: `value_a`, `value_b` (i64 LE), then one bit per row.
+const TWO_VALUE_A_AT: usize = 0;
+const TWO_VALUE_B_AT: usize = 8;
+const TWO_VALUE_BITS_AT: usize = 16;
 
 pub(crate) const fn two_value_image_len(count: usize) -> usize {
-    TWO_VALUE_HEADER + count.div_ceil(8)
+    TWO_VALUE_BITS_AT + count.div_ceil(8)
 }
 
-/// True when `row` holds `value_b`. `bitvec` starts at the image's
-/// [`TWO_VALUE_HEADER`] offset.
 #[inline]
-pub(crate) fn two_value_bit(bitvec: &[u8], row: usize) -> bool {
+fn two_value_bit(bitvec: &[u8], row: usize) -> bool {
     (bitvec[row / 8] >> (row % 8)) & 1 != 0
 }
 
 #[inline]
-pub(crate) fn two_value_set_bit(bitvec: &mut [u8], row: usize) {
+fn two_value_set_bit(bitvec: &mut [u8], row: usize) {
     bitvec[row / 8] |= 1 << (row % 8);
 }
 
-/// A FoR region's image: an 8-byte frame reference (the region min's bit
-/// pattern) ‖ each row's `value − ref` in its low `bw` bytes, tightly packed ‖
-/// zero slack, so every row's offset is one unaligned 8-byte load.
-pub(crate) const FOR_HEADER: usize = 8;
+/// A weight region's TwoValue image, bit *i* set ⇔ row *i* holds `value_b`; or
+/// `None` at a third distinct weight.
+pub(crate) fn two_value_encode(src: &[u8]) -> Option<Vec<u8>> {
+    let n = src.len() / 8;
+    let first = read_i64_le(src, 0);
+    // Rows before the first second value hold `first`: their bits start 0.
+    let mut second: Option<(i64, Vec<u8>)> = None;
+    for i in 1..n {
+        let v = read_i64_le(src, i * 8);
+        if v == first {
+            continue;
+        }
+        match &mut second {
+            None => {
+                let mut image = vec![0u8; two_value_image_len(n)];
+                write_u64_le(&mut image, TWO_VALUE_A_AT, first as u64);
+                write_u64_le(&mut image, TWO_VALUE_B_AT, v as u64);
+                two_value_set_bit(&mut image[TWO_VALUE_BITS_AT..], i);
+                second = Some((v, image));
+            }
+            Some((b, image)) => {
+                if v != *b {
+                    return None;
+                }
+                two_value_set_bit(&mut image[TWO_VALUE_BITS_AT..], i);
+            }
+        }
+    }
+    second.map(|(_, image)| image)
+}
+
+/// A TwoValue image's `(value_a, value_b, bit vector)`.
+pub(crate) fn two_value_decode(image: &[u8]) -> (i64, i64, &[u8]) {
+    (
+        read_i64_le(image, TWO_VALUE_A_AT),
+        read_i64_le(image, TWO_VALUE_B_AT),
+        &image[TWO_VALUE_BITS_AT..],
+    )
+}
+
+/// Row `row`'s weight, from a [`two_value_decode`]d image.
+#[inline(always)]
+pub(crate) fn two_value_at(a: i64, b: i64, bits: &[u8], row: usize) -> i64 {
+    if two_value_bit(bits, row) {
+        b
+    } else {
+        a
+    }
+}
+
+// A FoR image: the frame reference (u64 LE), then each row's `value − reference`
+// in `bw` bytes, then zero slack so the last row also loads as one u64.
+const FOR_REFERENCE_AT: usize = 0;
+const FOR_CELLS_AT: usize = 8;
 const FOR_SLACK: usize = size_of::<u64>() - 1;
 
-/// Where `row`'s offset starts in a FoR image.
-pub(crate) const fn for_cell_at(row: usize, bw: usize) -> usize {
-    FOR_HEADER + row * bw
+const fn for_cell_at(row: usize, bw: usize) -> usize {
+    FOR_CELLS_AT + row * bw
 }
 
 pub(crate) const fn for_image_len(count: usize, bw: usize) -> usize {
@@ -190,8 +239,81 @@ pub(crate) const fn for_image_len(count: usize, bw: usize) -> usize {
 /// The offset width an image of `size` bytes holds for `count ≥ 1` rows, or
 /// `None` unless some `bw` in `1..elem_width` gives exactly that size.
 pub(crate) fn for_image_bw(size: usize, count: usize, elem_width: usize) -> Option<usize> {
-    let bw = size.checked_sub(FOR_HEADER + FOR_SLACK)? / count;
+    let bw = size.checked_sub(FOR_CELLS_AT + FOR_SLACK)? / count;
     ((1..elem_width).contains(&bw) && size == for_image_len(count, bw)).then_some(bw)
+}
+
+/// The FoR image of a fixed-int region, framed on its minimum; or `None` when it
+/// would not shrink the region's aligned footprint.
+pub(crate) fn for_encode(src: &[u8], fi: FixedInt) -> Option<Vec<u8>> {
+    match fi {
+        // A 1-byte cell has no narrower offset width.
+        FixedInt::U8 | FixedInt::I8 => None,
+        FixedInt::U16 => for_encode_cells::<2, false>(src),
+        FixedInt::I16 => for_encode_cells::<2, true>(src),
+        FixedInt::U32 => for_encode_cells::<4, false>(src),
+        FixedInt::I32 => for_encode_cells::<4, true>(src),
+        FixedInt::U64 => for_encode_cells::<8, false>(src),
+        FixedInt::I64 => for_encode_cells::<8, true>(src),
+    }
+}
+
+fn for_encode_cells<const W: usize, const SIGNED: bool>(src: &[u8]) -> Option<Vec<u8>> {
+    let cells = src.as_chunks::<W>().0;
+    let widen = |cell: &[u8; W]| {
+        if SIGNED {
+            read_signed_exact(cell) as u64
+        } else {
+            read_unsigned_exact(cell)
+        }
+    };
+    // XOR with the sign bit maps i64 order onto u64 order, so one unsigned
+    // min/max serves both signednesses.
+    let bias = if SIGNED { 1u64 << 63 } else { 0 };
+    let (mut min, mut max) = (u64::MAX, 0u64);
+    for cell in cells {
+        let b = widen(cell) ^ bias;
+        min = min.min(b);
+        max = max.max(b);
+    }
+    let reference = min ^ bias;
+    let max_offset = (max ^ bias).wrapping_sub(reference);
+    let bw = ((u64::BITS - max_offset.leading_zeros()) as usize).div_ceil(8);
+    let n = cells.len();
+    // A raw-byte win that vanishes after alignment saves no disk and still costs
+    // a decode. Implies `bw < W`.
+    if bw == 0 || region_start(for_image_len(n, bw)) >= region_start(src.len()) {
+        return None;
+    }
+    let mut image = vec![0u8; for_image_len(n, bw)];
+    write_u64_le(&mut image, FOR_REFERENCE_AT, reference);
+    // A whole u64 per row: the next row overwrites the excess, the slack takes the last row's.
+    for (row, cell) in cells.iter().enumerate() {
+        write_u64_le(&mut image, for_cell_at(row, bw), widen(cell).wrapping_sub(reference));
+    }
+    Some(image)
+}
+
+/// Decode rows `first_row..` of a FoR image back to their raw little-endian
+/// form, `out.len() / elem_width` rows.
+pub(crate) fn for_decode(image: &[u8], bw: usize, elem_width: usize, first_row: usize, out: &mut [u8]) {
+    match elem_width {
+        2 => for_decode_cells::<2>(image, bw, first_row, out),
+        4 => for_decode_cells::<4>(image, bw, first_row, out),
+        8 => for_decode_cells::<8>(image, bw, first_row, out),
+        _ => unreachable!("open admits FoR only on 2/4/8-byte integer columns"),
+    }
+}
+
+fn for_decode_cells<const W: usize>(image: &[u8], bw: usize, first_row: usize, out: &mut [u8]) {
+    debug_assert!((1..W).contains(&bw), "open-time checks bound bw to 1..elem_width");
+    let reference = read_u64_le(image, FOR_REFERENCE_AT);
+    let mask = gnitz_wire::low_bits_mask(8 * bw);
+    let cells = out.as_chunks_mut::<W>().0;
+    for (i, cell) in cells.iter_mut().enumerate() {
+        let v = (read_u64_le(image, for_cell_at(first_row + i, bw)) & mask).wrapping_add(reference);
+        *cell = *v.to_le_bytes().first_chunk::<W>().unwrap();
+    }
 }
 
 /// Header plus directory, by the file's own payload arity.
@@ -214,10 +336,9 @@ pub(crate) enum Encoding {
     Raw = 0,
     /// One element, read at stride 0.
     Constant = 1,
-    /// A weight region; image described at [`TWO_VALUE_HEADER`].
+    /// A weight region of exactly two distinct weights.
     TwoValue = 2,
-    /// Frame-of-reference: a payload column of a 2-, 4- or 8-byte integer type;
-    /// image described at [`FOR_HEADER`].
+    /// Frame-of-reference: a payload column of a 2-, 4- or 8-byte integer type.
     For = 3,
 }
 
@@ -232,3 +353,7 @@ impl Encoding {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "tests/layout.rs"]
+mod tests;

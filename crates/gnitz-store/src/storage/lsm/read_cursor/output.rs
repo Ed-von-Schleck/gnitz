@@ -40,8 +40,16 @@ impl ReadCursor {
         if let Some(i) = self.mode {
             return Some(self.drain_single(i, max_rows, skeletons));
         }
+        // Per source, the rows this drain can emit: its current row on to where the drive stops.
+        let mut windows = std::mem::take(&mut self.drain_windows);
+        windows.clear();
+        windows.extend(self.states.iter().map(|s| s.position..s.position));
+        windows[self.current_entry_idx].start = self.current_row;
         let mut order = std::mem::take(&mut self.merge_order);
         self.drain_sorted_into(max_rows, &mut order);
+        for (w, s) in windows.iter_mut().zip(&self.states) {
+            w.end = s.position;
+        }
         if self.any_skeleton {
             let sources = &self.sources;
             order.retain(|&(e, r, w)| {
@@ -55,9 +63,11 @@ impl ReadCursor {
         let src_rows: usize = self.sources.iter().map(Run::row_count).sum();
         let src_blob: usize = self.sources.iter().map(|s| s.blob().len()).sum();
         let blob_cap = prorated_blob_cap(src_blob, src_rows, order.len());
-        let mut batch = UnifiedSet::of(&self.sources, &self.schema).materialize(&self.schema, &order, blob_cap);
+        let mut batch =
+            UnifiedSet::of(&self.sources, &self.schema, windows.iter().cloned()).materialize(&order, blob_cap);
         batch.certify_layout(Layout::Consolidated);
         self.merge_order = order;
+        self.drain_windows = windows;
         Some(batch)
     }
 

@@ -19,7 +19,7 @@ use super::{
     GUARD_FILE_THRESHOLD, L0_COMPACT_THRESHOLD, MIN_GUARD_BYTES, SWEEP_STEPS, TERMINAL_LEVEL_IDX,
 };
 use crate::schema::key::{pack_pk_be, pk_ranges_overlap, PkBuf};
-use crate::schema::SchemaDescriptor;
+use gnitz_expr::RowSource;
 
 impl ShardIndex {
     pub(super) fn all_entries(&self) -> impl Iterator<Item = &ShardEntry> {
@@ -161,7 +161,7 @@ impl ShardIndex {
     /// cross-shard duplicates and ghosts are counted, so it is an upper bound on
     /// the live rows a walk would emit — the shape the selectivity gate wants.
     pub(crate) fn total_rows(&self) -> usize {
-        self.all_entries().map(|e| e.shard.count).sum()
+        self.all_entries().map(|e| e.shard.row_count()).sum()
     }
 
     /// Whether any registered shard is a skeleton — i.e. whether a read of this
@@ -205,19 +205,16 @@ impl ShardIndex {
         }
     }
 
-    /// One compaction's input set: a handle on each entry's mapping under
-    /// `schema`, their newest stamp, and their registered bytes.
-    fn compaction_inputs<'a>(
-        entries: impl IntoIterator<Item = &'a ShardEntry>,
-        schema: &SchemaDescriptor,
-    ) -> Result<CompactionInputs, StorageError> {
+    /// One compaction's input set: each entry's live handle, their newest stamp,
+    /// and their registered bytes.
+    fn compaction_inputs<'a>(entries: impl IntoIterator<Item = &'a ShardEntry>) -> CompactionInputs {
         let mut inputs = CompactionInputs::default();
         for e in entries {
-            inputs.shards.push(e.shard.rebind(schema)?);
+            inputs.shards.push(Rc::clone(&e.shard));
             inputs.newest = inputs.newest.max(e.newest);
             inputs.bytes += e.shard.file_len();
         }
-        Ok(inputs)
+        inputs
     }
 
     /// The one compaction driver: merge `inputs` into `dest_idx`, routed across
@@ -236,7 +233,8 @@ impl ShardIndex {
         let CompactionInputs { shards, newest, bytes: in_bytes } = inputs;
         let schema = self.schema;
         let mut opened: Vec<(PkBuf, ShardEntry)> = Vec::with_capacity(guards.len());
-        let merged = compact::merge_and_route(&shards, guards, &schema, |&(guard_key, skeleton), batch| {
+        let inputs: Vec<&MappedShard> = shards.iter().map(|s| &**s).collect();
+        let merged = compact::merge_and_route(&inputs, guards, &schema, |&(guard_key, skeleton), batch| {
             let opts = ShardWriteOpts { skeleton, ..ShardWriteOpts::COMPACTION };
             opened.push((guard_key, self.write_shard(&batch, opts, Some(newest))?));
             Ok(())
@@ -282,7 +280,7 @@ impl ShardIndex {
     /// targets, then drain L1 down to its own. Observing `R` first is what makes
     /// those targets reflect the fold this call is about to perform.
     pub(crate) fn run_compact(&mut self) -> Result<(), StorageError> {
-        let inputs = Self::compaction_inputs(&self.l0, &self.schema)?;
+        let inputs = Self::compaction_inputs(&self.l0);
         self.l0_run_bytes = self.l0_run_bytes.max(inputs.bytes);
         let guards: Vec<(PkBuf, bool)> = self.l1_guard_keys().into_iter().map(|k| (k, false)).collect();
         self.compact_into(inputs, &guards, 0, CompactionKind::L0Fold, |s| {
@@ -402,7 +400,7 @@ impl ShardIndex {
         );
         let sources = &self.levels[level_idx].guards[range.clone()];
         let skeleton = kind == CompactionKind::Dehydrate || sources.iter().any(LevelGuard::dehydrated);
-        let inputs = Self::compaction_inputs(sources.iter().flat_map(|g| g.entries.iter()), &self.schema)?;
+        let inputs = Self::compaction_inputs(sources.iter().flat_map(|g| g.entries.iter()));
         let guards: Vec<(PkBuf, bool)> = keys.iter().map(|&k| (k, skeleton)).collect();
         self.compact_into(inputs, &guards, level_idx, kind, |s| {
             s.levels[level_idx]
@@ -551,8 +549,7 @@ impl ShardIndex {
                     .iter()
                     .flat_map(|g| g.entries.iter()),
             ),
-            &self.schema,
-        )?;
+        );
 
         // Each destination keeps the representation it already has: ordinary
         // compaction never re-hydrates what the sweep evicted, and the sweep

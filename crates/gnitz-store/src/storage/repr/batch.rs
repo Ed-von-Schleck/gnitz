@@ -1690,8 +1690,8 @@ impl Batch {
         let mb = batch.as_mem_batch();
         let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(batch.count);
         merge::consolidate_groups(&mb, schema, &mut survivors);
-        let set = super::scatter::UnifiedSet::of(std::slice::from_ref(&mb), schema);
-        let mut result = set.materialize(schema, &survivors, mb.blob.len());
+        let set = super::scatter::UnifiedSet::whole(std::slice::from_ref(&mb), schema);
+        let mut result = set.materialize(&survivors, mb.blob.len());
         result.certify_layout(Layout::Consolidated);
         result
     }

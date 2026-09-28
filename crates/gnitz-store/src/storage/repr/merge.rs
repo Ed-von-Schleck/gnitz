@@ -10,11 +10,12 @@
 
 use std::cell::Cell;
 use std::cmp::Ordering;
-use std::ops::ControlFlow;
+use std::ops::{ControlFlow, Range};
 
 use super::batch::{Batch, Layout};
 use super::batch_pool::tls_pool;
 use super::heap::{HeapNode, LoserTree};
+use super::scatter::DecodedColumns;
 use super::seek::pk_group_end;
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, pk_width_dispatch, PkSortKey};
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
@@ -26,11 +27,11 @@ use rustc_hash::FxHashMap;
 // ---------------------------------------------------------------------------
 // ColPtr / UnifiedSource: type-erased column accessors, one `(base, stride)`
 // `ColPtr` per region, for in-memory `MemBatch` and shard sources alike.
-// Stride 0 makes `base.add(ri * stride) == base` for every row, so a region
-// holding one shared element reads the same bytes for every output row without
-// any branch in the hot loop.
 // ---------------------------------------------------------------------------
 
+/// A column as `base + row * stride`. Stride 0 reads one shared element for
+/// every row. `base` itself need not lie inside the column: a decoded window is
+/// rebased so that its first row lands on its first cell.
 #[derive(Clone, Copy)]
 pub(crate) struct ColPtr {
     pub base: *const u8,
@@ -38,26 +39,17 @@ pub(crate) struct ColPtr {
 }
 
 impl ColPtr {
-    /// Raw pointer to row `i`'s value: `base + i*stride`. A `stride == 0`
-    /// (Constant) region yields `base` for every row.
-    ///
-    /// # Safety
-    /// The caller must keep the backing region alive for the borrow and pass an
-    /// in-bounds `i`. For shard/`MemBatch` regions this holds because open-time
-    /// validation guarantees `offset + count*stride <= len` (the same invariant
-    /// `to_unified` / `mem_batch_to_unified` already rely on).
+    /// Row `i`'s address.
     #[inline(always)]
-    pub(crate) unsafe fn row_ptr(self, i: usize) -> *const u8 {
-        self.base.add(i * self.stride)
+    pub(crate) fn row_ptr(self, i: usize) -> *const u8 {
+        self.base.wrapping_add(i * self.stride)
     }
 
-    /// Row `i` as a `len`-byte slice over the backing region; a `stride == 0`
-    /// (Constant) region reads its first `len` bytes for every row. Same
-    /// aliasing/in-bounds contract as [`row_ptr`](Self::row_ptr).
+    /// Row `i`'s first `len` bytes.
     ///
     /// # Safety
-    /// See [`row_ptr`](Self::row_ptr); additionally `len` must not exceed the
-    /// region's element width.
+    /// Row `i` is a row of a live column this addresses, and `len` does not
+    /// exceed its element width.
     #[inline(always)]
     pub(crate) unsafe fn row<'a>(self, i: usize, len: usize) -> &'a [u8] {
         std::slice::from_raw_parts(self.row_ptr(i), len)
@@ -68,11 +60,7 @@ impl ColPtr {
 pub(crate) struct UnifiedSource<'a> {
     pub pk: ColPtr,
     pub null_bmp: ColPtr,
-    /// Payload-column null bits this source cannot answer for, OR'd into every
-    /// null word the scatter copies out. Non-zero only for a shard written
-    /// before an `ALTER TABLE … ADD COLUMN` (`MappedShard::null_pad_mask`); an
-    /// in-memory batch always matches its schema, so `mem_batch_to_unified`
-    /// sets `0`.
+    /// Null bits OR'd into every null word the scatter copies out.
     pub null_pad_mask: u64,
     /// Index of this source's first payload `ColPtr` in the caller-owned table
     /// the scatter reads through: column `pi` is `cols[cols_off + pi]`. Out of
@@ -460,8 +448,19 @@ impl<'a> ColumnarSource for MemBatch<'a> {
         MemBatch::get_weight(self, row)
     }
 
-    fn to_unified(&self, schema: &SchemaDescriptor, cols: &mut Vec<ColPtr>) -> UnifiedSource<'_> {
+    fn to_unified(
+        &self,
+        schema: &SchemaDescriptor,
+        cols: &mut Vec<ColPtr>,
+        _window: Range<usize>,
+        _decoded: &mut DecodedColumns,
+    ) -> UnifiedSource<'_> {
         mem_batch_to_unified(self, schema, cols)
+    }
+
+    #[inline(always)]
+    fn is_skeleton(&self) -> bool {
+        false
     }
 }
 
@@ -693,17 +692,43 @@ pub(crate) trait ColumnarSource: RowSource {
     /// The row's signed Z-set weight / multiplicity (region[1]).
     fn get_weight(&self, row: usize) -> i64;
 
-    /// A [`UnifiedSource`] over this source's regions, its payload `ColPtr`s
-    /// appended to `cols`. A backing carrying its own column directory ignores
-    /// `schema`.
-    fn to_unified(&self, schema: &SchemaDescriptor, cols: &mut Vec<ColPtr>) -> UnifiedSource<'_>;
+    /// A [`UnifiedSource`] over this source's regions, readable at rows in
+    /// `window`, with one payload `ColPtr` per payload column of `schema`
+    /// appended to `cols`.
+    fn to_unified(
+        &self,
+        schema: &SchemaDescriptor,
+        cols: &mut Vec<ColPtr>,
+        window: Range<usize>,
+        decoded: &mut DecodedColumns,
+    ) -> UnifiedSource<'_>;
 
     /// Whether this source's rows are (PK, coarse weight) pairs with no payload —
-    /// a capacity-bounded view's skeleton shard. `false` for every in-memory
-    /// source, which always carries its payload.
+    /// a capacity-bounded view's skeleton shard.
+    fn is_skeleton(&self) -> bool;
+}
+
+/// A borrowed source reads as the source it borrows.
+impl<T: ColumnarSource + ?Sized> ColumnarSource for &T {
+    #[inline(always)]
+    fn get_weight(&self, row: usize) -> i64 {
+        (**self).get_weight(row)
+    }
+
+    #[inline(always)]
+    fn to_unified(
+        &self,
+        schema: &SchemaDescriptor,
+        cols: &mut Vec<ColPtr>,
+        window: Range<usize>,
+        decoded: &mut DecodedColumns,
+    ) -> UnifiedSource<'_> {
+        (**self).to_unified(schema, cols, window, decoded)
+    }
+
     #[inline(always)]
     fn is_skeleton(&self) -> bool {
-        false
+        (**self).is_skeleton()
     }
 }
 

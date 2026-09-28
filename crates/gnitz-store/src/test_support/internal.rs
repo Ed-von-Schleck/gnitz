@@ -263,3 +263,11 @@ pub(crate) fn flip_last_byte_in_place(path: &std::path::Path) {
     file.read_exact_at(&mut byte, last).unwrap();
     file.write_all_at(&[byte[0] ^ 0x01], last).unwrap();
 }
+
+/// This process's resident set once the allocator has handed its free memory
+/// back, so a later delta counts what is still referenced.
+pub fn settled_rss() -> u64 {
+    // SAFETY: `malloc_trim` only releases memory the allocator holds free.
+    unsafe { libc::malloc_trim(0) };
+    gnitz_foundation::perf::rss_bytes()
+}

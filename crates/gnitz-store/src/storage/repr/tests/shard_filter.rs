@@ -9,12 +9,11 @@ fn build_u128(pks: &[u128]) -> Option<BinaryFuse8> {
     build(pks.iter().copied().map(key_u128).collect())
 }
 
-/// A built filter as the reader sees it: its region bytes, and the
-/// [`ShardFilter`] parsed back out of them.
-fn through_the_region(pks: &[u128]) -> (Vec<u8>, ShardFilter) {
+/// A built filter as the reader sees it: its region bytes, checked valid.
+fn through_the_region(pks: &[u128]) -> Vec<u8> {
     let region = serialize(&build_u128(pks).unwrap());
-    let filter = ShardFilter::parse(&region).expect("a freshly built filter parses back");
-    (region, filter)
+    assert!(is_valid(&region), "a freshly built filter parses back");
+    region
 }
 
 /// No key set may produce a false negative through its serialized region. The
@@ -33,14 +32,10 @@ fn no_key_set_produces_a_false_negative_through_its_region() {
     ] {
         let built = build_u128(&pks).unwrap();
         let region = serialize(&built);
-        let filter = ShardFilter::parse(&region).expect("a freshly built filter parses back");
-        assert_eq!(
-            filter.region_len,
-            Descriptor::DMA_LEN + built.fingerprints.len(),
-            "{what}"
-        );
+        assert!(is_valid(&region), "{what}: a freshly built filter parses back");
+        assert_eq!(region.len(), Descriptor::DMA_LEN + built.fingerprints.len(), "{what}");
         for &pk in &pks {
-            assert!(filter.may_contain(&region, key_u128(pk)), "{what}: {pk:#034x}");
+            assert!(may_contain(&region, key_u128(pk)), "{what}: {pk:#034x}");
         }
     }
 }
@@ -48,18 +43,18 @@ fn no_key_set_produces_a_false_negative_through_its_region() {
 #[test]
 fn false_positive_rate() {
     let pks: Vec<u128> = (0u128..2000).collect();
-    let (region, filter) = through_the_region(&pks);
+    let region = through_the_region(&pks);
     let fp = (10_000u128..20_000)
-        .filter(|&i| filter.may_contain(&region, key_u128(i)))
+        .filter(|&i| may_contain(&region, key_u128(i)))
         .count();
     // BinaryFuse8 theoretical FPR ~0.39%. Allow up to 2%.
     assert!(fp < 200, "FPR too high: {fp}/10000");
 }
 
 #[test]
-fn parse_rejects_a_region_shorter_than_the_descriptor() {
-    assert!(ShardFilter::parse(&[]).is_none());
-    assert!(ShardFilter::parse(&[0u8; Descriptor::DMA_LEN - 1]).is_none());
+fn a_region_shorter_than_the_descriptor_is_invalid() {
+    assert!(!is_valid(&[]));
+    assert!(!is_valid(&[0u8; Descriptor::DMA_LEN - 1]));
 }
 
 /// Every rule, one forged descriptor each. `{sl:4, mask:3, scl:5}` is the
@@ -125,11 +120,4 @@ fn validate_rejects_each_way_a_descriptor_can_be_wrong() {
     for (name, d, len) in cases {
         assert!(validate(&d, len).is_none(), "{name} must be rejected");
     }
-}
-
-#[test]
-#[should_panic(expected = "a filter probes the region it was parsed from")]
-fn a_filter_refuses_a_region_of_another_length() {
-    let (region, filter) = through_the_region(&[1, 2, 3]);
-    filter.may_contain(&region[..region.len() - 1], key_u128(1));
 }

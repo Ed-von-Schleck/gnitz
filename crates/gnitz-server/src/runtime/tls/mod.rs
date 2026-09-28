@@ -12,7 +12,7 @@ use std::mem::MaybeUninit;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gnitz_store::storage::batch_pool::{acquire_buf, PooledSendBuf};
+use gnitz_store::storage::batch_pool::{acquire_buf, PooledBuf};
 
 use crate::runtime::reactor::{
     chan, AsyncRwLock, ClientConn, PeerGone, Reactor, RecvEnd, RecvFilter, RecvQueue, SendBody, WriteGuard,
@@ -94,7 +94,7 @@ impl TlsShared {
     /// Send everything rustls has queued. Callers hold `send_lock`, which is
     /// what keeps records in emission order.
     async fn flush_records(&self, _: &WriteGuard) -> Result<(), PeerGone> {
-        let mut out = PooledSendBuf(acquire_buf());
+        let mut out = PooledBuf(acquire_buf());
         {
             let mut sess = self.state.borrow_mut();
             while sess.wants_write() {

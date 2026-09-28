@@ -16,12 +16,12 @@ fn worker_rows_to_batches(
     mem: &[MemBatch],
     worker_rows: &[Vec<(u32, u32, i64)>],
 ) -> Vec<Batch> {
-    let set = UnifiedSet::of(mem, schema);
+    let set = UnifiedSet::whole(mem, schema);
     let total_blob: usize = mem.iter().map(|mb| mb.blob.len()).sum();
     let total_rows: usize = worker_rows.iter().map(|v| v.len()).sum();
     worker_rows
         .iter()
-        .map(|rows| set.materialize(schema, rows, prorated_blob_cap(total_blob, total_rows, rows.len())))
+        .map(|rows| set.materialize(rows, prorated_blob_cap(total_blob, total_rows, rows.len())))
         .collect()
 }
 

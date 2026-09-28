@@ -161,10 +161,10 @@ pub(super) fn acquire_arena(size: usize, fill: Fill) -> Vec<u8> {
     buf
 }
 
-/// A pooled send buffer that returns itself to the pool on drop.
-pub struct PooledSendBuf(pub Vec<u8>);
+/// A pooled buffer that returns itself to the pool on drop.
+pub struct PooledBuf(pub Vec<u8>);
 
-impl Drop for PooledSendBuf {
+impl Drop for PooledBuf {
     fn drop(&mut self) {
         recycle_buf(std::mem::take(&mut self.0));
     }

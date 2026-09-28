@@ -685,3 +685,31 @@ fn relay_scatter_merge_bench() {
         }
     }
 }
+
+/// Instructions per [`op_relay_scatter`] call on small consolidated deltas —
+/// the per-call fixed cost the source-side view build adds — at
+/// (sources, rows per source, workers).
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn relay_small_delta_bench() {
+    use gnitz_foundation::perf::Counter;
+    use std::hint::black_box;
+    const ITERS: u64 = 10_000;
+    let schema = make_schema_u64_i64();
+    let instructions = Counter::instructions().unwrap();
+    for (k, n, workers) in [(1, 1, 4), (4, 16, 16), (16, 64, 16)] {
+        let batches: Vec<Batch> = (0..k).map(|j| bench_stripe(&schema, n, j, k, true)).collect();
+        let sources: Vec<&Batch> = batches.iter().collect();
+        let spec = ScatterSpec::GroupKey(&[0]);
+        black_box(scatter(&sources, spec, &schema, workers));
+        let ((), i) = instructions.measure(|| {
+            for _ in 0..ITERS {
+                black_box(scatter(&sources, spec, &schema, workers));
+            }
+        });
+        println!(
+            "{k} sources x {n} rows -> {workers} workers: {} instructions per call",
+            i / ITERS
+        );
+    }
+}

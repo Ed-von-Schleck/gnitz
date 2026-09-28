@@ -40,6 +40,30 @@ pub trait RowSource {
     fn row_count(&self) -> usize;
 }
 
+/// A borrowed source reads as the source it borrows.
+impl<T: RowSource + ?Sized> RowSource for &T {
+    #[inline(always)]
+    fn get_pk_bytes(&self, row: usize) -> &[u8] {
+        (**self).get_pk_bytes(row)
+    }
+    #[inline(always)]
+    fn get_null_word(&self, row: usize) -> u64 {
+        (**self).get_null_word(row)
+    }
+    #[inline(always)]
+    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
+        (**self).get_col_ptr(row, payload_col, col_size)
+    }
+    #[inline(always)]
+    fn blob(&self) -> &[u8] {
+        (**self).blob()
+    }
+    #[inline(always)]
+    fn row_count(&self) -> usize {
+        (**self).row_count()
+    }
+}
+
 /// A [`RowSource`] that can additionally hand out whole regions — the shape the
 /// vectorized expression kernels need, and the one a flat region-based batch
 /// (or an adapter that materializes one) can satisfy.

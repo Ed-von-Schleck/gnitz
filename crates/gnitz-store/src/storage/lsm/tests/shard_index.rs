@@ -4,7 +4,9 @@ use super::super::shard_file;
 use super::*;
 use crate::schema::key::probe_key;
 use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
-use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, opk_pk, pk_payload_schema};
+use crate::test_support::{
+    make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, opk_pk, pk_payload_schema,
+};
 
 /// Test-only adapters: production budgets a store at construction and reads its
 /// manifest in `Table::new`, where a case here does both against a live index.
@@ -81,12 +83,8 @@ fn gk(v: u64) -> PkBuf {
 
 /// A `(U64 PK | I64 payload)` batch at weight 1.
 fn test_batch(pks: &[u64], values: &[i64]) -> Batch {
-    let rows: Vec<(Vec<u8>, i64, i64)> = pks
-        .iter()
-        .zip(values)
-        .map(|(&p, &v)| (p.to_be_bytes().to_vec(), 1, v))
-        .collect();
-    shard_file::test_batch(&make_schema_u64_i64(), &rows)
+    let rows: Vec<(u64, i64, i64)> = pks.iter().zip(values).map(|(&p, &v)| (p, 1, v)).collect();
+    make_batch_raw(&make_schema_u64_i64(), &rows)
 }
 
 /// [`test_batch`] written to `dir/name`, outside any index.
@@ -539,6 +537,39 @@ fn reload_and_widen_leave_nothing_unsynced() {
         "a payload widen rebinds every shard: the appended column reads NULL"
     );
     assert!(idx.unsynced_paths().next().is_none(), "a rebind moves no durability");
+}
+
+/// A schema change that keeps the payload arity — `DROP NOT NULL` — still
+/// rebinds every shard, so what a shard slices out carries the new schema.
+#[test]
+fn a_nullability_change_rebinds_every_shard() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    let mut idx = ShardIndex::open(
+        dir.path().to_str().unwrap(),
+        schema,
+        ShardBudget::Unbounded,
+        false,
+        None,
+    )
+    .unwrap();
+    for i in 0..3u64 {
+        idx.append_l0_run(&test_batch(&[i * 10 + 1], &[i as i64])).unwrap();
+    }
+    let nullable = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+        ],
+        &[0],
+    );
+    assert!(nullable != schema && nullable.num_payload_cols() == schema.num_payload_cols());
+    idx.swap_schema(nullable).unwrap();
+    assert!(
+        idx.all_entries()
+            .all(|e| *e.shard.slice_to_owned_batch(0, 1).schema() == nullable),
+        "every shard is bound to the published schema"
+    );
 }
 
 /// A compaction that cannot write its output leaves L0 exactly as it was, so
@@ -1086,6 +1117,7 @@ fn a_wide_pk_sharing_its_leading_sixteen_bytes_still_splits() {
             (pk, 1, i as i64)
         })
         .collect();
+    let rows: Vec<(&[u8], i64, i64)> = rows.iter().map(|(pk, w, v)| (pk.as_slice(), *w, *v)).collect();
     let mut idx = ShardIndex::open(
         tmp.path().to_str().unwrap(),
         schema,
@@ -1094,13 +1126,7 @@ fn a_wide_pk_sharing_its_leading_sixteen_bytes_still_splits() {
         None,
     )
     .unwrap();
-    seed_guard(
-        &mut idx,
-        0,
-        PkBuf::zeroed(24),
-        &shard_file::test_batch(&schema, &rows),
-        1,
-    );
+    seed_guard(&mut idx, 0, PkBuf::zeroed(24), &make_batch_opk(&schema, &rows), 1);
     let target = idx.guard_target_bytes(0);
     let before = idx.levels[0].guards[0].bytes();
     assert!(before > target, "premise: {before} B is not over the {target} B target");
@@ -1130,10 +1156,13 @@ fn trailing_gk(pk_cols: usize, i: u64) -> PkBuf {
 
 /// One batch of rows `base..base + n` at [`trailing_gk`]'s keys.
 fn trailing_key_batch(pk_cols: usize, base: u64, n: u64) -> Batch {
-    let rows: Vec<(Vec<u8>, i64, i64)> = (base..base + n)
-        .map(|i| (trailing_gk(pk_cols, i).pk_bytes().to_vec(), 1, i as i64))
+    let keys: Vec<PkBuf> = (base..base + n).map(|i| trailing_gk(pk_cols, i)).collect();
+    let rows: Vec<(&[u8], i64, i64)> = keys
+        .iter()
+        .zip(base..)
+        .map(|(k, i)| (k.pk_bytes(), 1, i as i64))
         .collect();
-    shard_file::test_batch(&stride_schema(pk_cols), &rows)
+    make_batch_opk(&stride_schema(pk_cols), &rows)
 }
 
 /// The byte target bounds a guard at every PK stride, and a split holds. Swept
@@ -1283,13 +1312,13 @@ fn a_guard_whose_rows_all_cancel_is_removed() {
     // one more insert that its own pair cancels.
     for i in 0..5u64 {
         let w = if i % 2 == 0 { 1 } else { -1 };
-        let rows: Vec<(Vec<u8>, i64, i64)> = (0..4u64).map(|k| (k.to_be_bytes().to_vec(), w, k as i64)).collect();
-        seed_guard(&mut idx, 0, gk(0), &shard_file::test_batch(&schema, &rows), i + 1);
+        let rows: Vec<(u64, i64, i64)> = (0..4u64).map(|k| (k, w, k as i64)).collect();
+        seed_guard(&mut idx, 0, gk(0), &make_batch_raw(&schema, &rows), i + 1);
     }
     // Weights sum to +1 per key over five entries, so one more retraction
     // takes every key to zero.
-    let rows: Vec<(Vec<u8>, i64, i64)> = (0..4u64).map(|k| (k.to_be_bytes().to_vec(), -1, k as i64)).collect();
-    seed_guard(&mut idx, 0, gk(0), &shard_file::test_batch(&schema, &rows), 6);
+    let rows: Vec<(u64, i64, i64)> = (0..4u64).map(|k| (k, -1, k as i64)).collect();
+    seed_guard(&mut idx, 0, gk(0), &make_batch_raw(&schema, &rows), 6);
 
     idx.split_overfull_guards(0).unwrap();
     assert!(
@@ -1792,7 +1821,7 @@ fn ordinary_compaction_of_a_delta_store_keeps_its_rows() {
         before,
         idx.resident_bytes()
     );
-    let live: usize = idx.all_entries().map(|e| e.shard.count).sum();
+    let live: usize = idx.all_entries().map(|e| e.shard.row_count()).sum();
     assert_eq!(live, 4 * 40, "every row survived the folds");
 }
 
@@ -1941,7 +1970,7 @@ fn a_drop_removes_nothing_above_the_floor_it_raises() {
     }
 
     let floor = idx.dropped_max();
-    let retained: usize = idx.all_entries().map(|e| e.shard.count).sum();
+    let retained: usize = idx.all_entries().map(|e| e.shard.row_count()).sum();
     assert!(
         floor > PkBuf::zeroed(8),
         "the sweep dropped nothing — nothing is being tested"
@@ -1987,7 +2016,7 @@ fn dehydration_takes_the_oldest_written_terminal_guard_first() {
     let live_before: Vec<(u128, i64)> = {
         let g = &idx.levels[TERMINAL_LEVEL_IDX].guards[oldest];
         let s = &g.entries[0].shard;
-        (0..s.count).map(|i| (s.get_pk(i), s.get_weight(i))).collect()
+        (0..s.row_count()).map(|i| (s.get_pk(i), s.get_weight(i))).collect()
     };
 
     // A capacity just under the current size dehydrates exactly one guard,
@@ -2002,7 +2031,7 @@ fn dehydration_takes_the_oldest_written_terminal_guard_first() {
     );
     let g = &idx.levels[TERMINAL_LEVEL_IDX].guards[dehy[0]];
     let s = &g.entries[0].shard;
-    let live_after: Vec<(u128, i64)> = (0..s.count).map(|i| (s.get_pk(i), s.get_weight(i))).collect();
+    let live_after: Vec<(u128, i64)> = (0..s.row_count()).map(|i| (s.get_pk(i), s.get_weight(i))).collect();
     assert_eq!(live_after, live_before, "keys and coarse weights survive dehydration");
 }
 

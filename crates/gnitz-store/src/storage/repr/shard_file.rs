@@ -10,7 +10,7 @@ use super::layout::*;
 use super::shard_filter;
 use crate::schema::key::probe_key;
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::{read_i64_le, read_signed_exact, read_unsigned_exact, write_u64_le, FixedInt};
+use gnitz_wire::write_u64_le;
 use xorf::BinaryFuse8;
 
 /// Fixed-width region `i`'s on-disk encoding and image. `pack_ints` admits FoR
@@ -29,11 +29,11 @@ fn encode_region<'a>(
         return (Encoding::Constant, Cow::Borrowed(&src[..width]));
     }
     let packed = if i == REG_WEIGHT {
-        two_value_image(src).map(|image| (Encoding::TwoValue, image))
+        two_value_encode(src).map(|image| (Encoding::TwoValue, image))
     } else if pack_ints && i >= REG_PAYLOAD_START {
         let col = &schema.columns[schema.payload_col_idx(i - REG_PAYLOAD_START)];
         col.fixed_int()
-            .and_then(|fi| for_image(src, fi))
+            .and_then(|fi| for_encode(src, fi))
             .map(|image| (Encoding::For, image))
     } else {
         None
@@ -42,93 +42,6 @@ fn encode_region<'a>(
         Some((encoding, image)) => (encoding, Cow::Owned(image)),
         None => (Encoding::Raw, Cow::Borrowed(src)),
     }
-}
-
-/// A weight region's TwoValue image (`value_a` ‖ `value_b` ‖ bitvec, bit set ⇔
-/// `value_b`), or `None` at a third distinct weight. Allocated at the first
-/// second value.
-fn two_value_image(src: &[u8]) -> Option<Vec<u8>> {
-    let n = src.len() / 8;
-    let first = read_i64_le(src, 0);
-    // Every row before the first second value equals `first`, so its bit is
-    // already 0 when the image is allocated.
-    let mut second: Option<(i64, Vec<u8>)> = None;
-    for i in 1..n {
-        let v = read_i64_le(src, i * 8);
-        if v == first {
-            continue;
-        }
-        match &mut second {
-            None => {
-                let mut image = vec![0u8; two_value_image_len(n)];
-                write_u64_le(&mut image, 0, first as u64);
-                write_u64_le(&mut image, 8, v as u64);
-                two_value_set_bit(&mut image[TWO_VALUE_HEADER..], i);
-                second = Some((v, image));
-            }
-            Some((b, image)) => {
-                if v != *b {
-                    return None;
-                }
-                two_value_set_bit(&mut image[TWO_VALUE_HEADER..], i);
-            }
-        }
-    }
-    second.map(|(_, image)| image)
-}
-
-/// The FoR image of a fixed-int region, or `None` when it would not shrink the
-/// 64-byte-aligned footprint. Dispatches once on the column type, so both scans
-/// run at a constant cell width and signedness.
-fn for_image(src: &[u8], fi: FixedInt) -> Option<Vec<u8>> {
-    match fi {
-        // A 1-byte cell has no narrower offset width.
-        FixedInt::U8 | FixedInt::I8 => None,
-        FixedInt::U16 => for_image_of::<2, false>(src),
-        FixedInt::I16 => for_image_of::<2, true>(src),
-        FixedInt::U32 => for_image_of::<4, false>(src),
-        FixedInt::I32 => for_image_of::<4, true>(src),
-        FixedInt::U64 => for_image_of::<8, false>(src),
-        FixedInt::I64 => for_image_of::<8, true>(src),
-    }
-}
-
-/// Frame on the typed minimum; each row's offset is written as a full 8-byte
-/// store at its `bw`-strided position — the next row overwrites the excess, and
-/// the image's zero slack holds the last row's.
-fn for_image_of<const W: usize, const SIGNED: bool>(src: &[u8]) -> Option<Vec<u8>> {
-    let cells = src.as_chunks::<W>().0;
-    let widen = |cell: &[u8; W]| {
-        if SIGNED {
-            read_signed_exact(cell) as u64
-        } else {
-            read_unsigned_exact(cell)
-        }
-    };
-    // XOR with the sign bit maps i64 order onto u64 order, so one unsigned
-    // min/max serves both signednesses.
-    let bias = if SIGNED { 1u64 << 63 } else { 0 };
-    let (mut min, mut max) = (u64::MAX, 0u64);
-    for cell in cells {
-        let b = widen(cell) ^ bias;
-        min = min.min(b);
-        max = max.max(b);
-    }
-    let reference = min ^ bias;
-    let max_offset = (max ^ bias).wrapping_sub(reference);
-    let bw = ((u64::BITS - max_offset.leading_zeros()) as usize).div_ceil(8);
-    let n = cells.len();
-    // A raw-byte win that vanishes after alignment saves no disk and still costs
-    // a decode. Implies `bw < W`.
-    if bw == 0 || region_start(for_image_len(n, bw)) >= region_start(src.len()) {
-        return None;
-    }
-    let mut image = vec![0u8; for_image_len(n, bw)];
-    write_u64_le(&mut image, 0, reference);
-    for (row, cell) in cells.iter().enumerate() {
-        write_u64_le(&mut image, for_cell_at(row, bw), widen(cell).wrapping_sub(reference));
-    }
-    Some(image)
 }
 
 /// The `(size, encoding)` projection of a region's [`DirEntry`], for the
@@ -182,28 +95,9 @@ impl ShardWriteOpts {
     };
 }
 
-/// The single-payload-column test batch: built through the typed row API, so
-/// region *order* has a single owner. Rows are `(opk_bytes, weight, i64_payload)`.
-#[cfg(test)]
-pub(in crate::storage) fn test_batch(schema: &SchemaDescriptor, rows: &[(Vec<u8>, i64, i64)]) -> Batch {
-    // One payload column is written, so a wider schema would leave later regions
-    // short of `count` and produce a shard the reader cannot make sense of.
-    debug_assert_eq!(
-        schema.num_payload_cols(),
-        1,
-        "test_batch fills exactly one payload column"
-    );
-    let mut b = Batch::with_capacity(schema, rows.len().max(1));
-    for (pk, w, v) in rows {
-        b.begin_row(pk, *w);
-        b.extend_col(0, &v.to_le_bytes());
-        b.commit_row(0);
-    }
-    b
-}
-
-/// [`test_batch`] handed to the production [`Batch::write_as_shard`]. Several I64
-/// payload columns go through [`write_i64_shard`].
+/// A single-I64-payload shard of `(opk_bytes, weight, payload)` rows, written by
+/// the production [`Batch::write_as_shard`]. Several I64 payload columns go
+/// through [`write_i64_shard`].
 #[cfg(test)]
 pub(in crate::storage) fn write_test_shard(
     path: &std::path::Path,
@@ -212,7 +106,10 @@ pub(in crate::storage) fn write_test_shard(
     opts: ShardWriteOpts,
 ) -> String {
     let path = path.to_str().unwrap().to_owned();
-    test_batch(schema, rows).write_as_shard(&path, opts).unwrap();
+    let rows: Vec<(&[u8], i64, i64)> = rows.iter().map(|(pk, w, v)| (pk.as_slice(), *w, *v)).collect();
+    crate::test_support::make_batch_opk(schema, &rows)
+        .write_as_shard(&path, opts)
+        .unwrap();
     path
 }
 

@@ -6,7 +6,10 @@
 //! so the triple is the only channel for a merge fold's net weight — which is
 //! not any one source row's weight.
 
+use std::ops::Range;
+
 use super::batch::{write_to_batch, Batch, FIXED_REGION_BYTES};
+use super::batch_pool::PooledBuf;
 use super::merge::{ColPtr, ColumnarSource, DirectWriter, MemBatch, UnifiedSource};
 use crate::schema::SchemaDescriptor;
 
@@ -225,14 +228,12 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
     for (out, &(si, ri, w)) in rows.iter().enumerate() {
         let src = unsafe { sources.get_unchecked(si as usize) };
         let dst_row = base + out;
-        let pk_ptr = unsafe { src.pk.row_ptr(ri as usize) };
-        let nbm_ptr = unsafe { src.null_bmp.row_ptr(ri as usize) };
+        let pk_ptr = src.pk.row_ptr(ri as usize);
+        let nbm_ptr = src.null_bmp.row_ptr(ri as usize);
         let wb = w.to_le_bytes();
         unsafe {
             std::ptr::copy_nonoverlapping(pk_ptr, pk_dst.add(dst_row * pks), pks);
             std::ptr::copy_nonoverlapping(wb.as_ptr(), wt_dst.add(dst_row * FB), FB);
-            // A shard predating an `ALTER … ADD COLUMN` carries no bits for the
-            // appended columns; `null_pad_mask` forces them NULL.
             let nbm = (nbm_ptr as *const u64).read_unaligned() | src.null_pad_mask;
             (nbm_dst.add(dst_row * FB) as *mut u64).write_unaligned(nbm);
         }
@@ -256,41 +257,81 @@ fn gather_unified_col<const N: usize>(
     }
 }
 
+/// The columns a [`UnifiedSet`]'s sources decoded to be viewed, freed with the set.
+pub(crate) struct DecodedColumns(Vec<PooledBuf>);
+
+impl DecodedColumns {
+    /// Hold `column` for the set's lifetime; its first byte's address.
+    pub(crate) fn hold(&mut self, column: Vec<u8>) -> *const u8 {
+        let base = column.as_ptr();
+        self.0.push(PooledBuf(column));
+        base
+    }
+}
+
 /// [`scatter_unified_sources`]'s source side: the per-source [`UnifiedSource`]
-/// views and the flat payload-`ColPtr` table they index into, so the two cannot
-/// be paired wrongly.
+/// views, the flat payload-`ColPtr` table they index into, and the columns they
+/// decoded.
 pub(crate) struct UnifiedSet<'a> {
     sources: Vec<UnifiedSource<'a>>,
     cols: Vec<ColPtr>,
-    payload_cols: usize,
+    schema: SchemaDescriptor,
+    _decoded: DecodedColumns,
+    #[cfg(debug_assertions)]
+    windows: Vec<Range<usize>>,
 }
 
 impl<'a> UnifiedSet<'a> {
-    pub(crate) fn of<S: ColumnarSource>(sources: &'a [S], schema: &SchemaDescriptor) -> Self {
-        let payload_cols = schema.num_payload_cols();
-        let mut cols = Vec::with_capacity(sources.len() * payload_cols);
-        let sources = sources.iter().map(|s| s.to_unified(schema, &mut cols)).collect();
-        UnifiedSet { sources, cols, payload_cols }
+    /// Views over `sources` under `schema`, source `si` readable at rows in the
+    /// `si`-th window.
+    pub(crate) fn of<S: ColumnarSource>(
+        sources: &'a [S],
+        schema: &SchemaDescriptor,
+        windows: impl IntoIterator<Item = Range<usize>>,
+    ) -> Self {
+        let mut cols = Vec::with_capacity(sources.len() * schema.num_payload_cols());
+        let mut decoded = DecodedColumns(Vec::new());
+        #[cfg(debug_assertions)]
+        let (windows, each) = {
+            let windows: Vec<Range<usize>> = windows.into_iter().collect();
+            assert_eq!(windows.len(), sources.len(), "UnifiedSet::of: one window per source");
+            (windows.clone(), windows)
+        };
+        #[cfg(not(debug_assertions))]
+        let each = windows;
+        let views = sources
+            .iter()
+            .zip(each)
+            .map(|(s, w)| s.to_unified(schema, &mut cols, w, &mut decoded))
+            .collect();
+        UnifiedSet {
+            sources: views,
+            cols,
+            schema: *schema,
+            _decoded: decoded,
+            #[cfg(debug_assertions)]
+            windows,
+        }
+    }
+
+    /// [`of`](Self::of) with every source readable at every row.
+    pub(crate) fn whole<S: ColumnarSource>(sources: &'a [S], schema: &SchemaDescriptor) -> Self {
+        Self::of(sources, schema, sources.iter().map(|s| 0..s.row_count()))
     }
 
     /// Copy the rows `rows` names, in the order given, each at the weight its
-    /// triple carries, into a fresh batch claiming no layout.
-    ///
-    /// `out_schema` may be narrower than the one the views were built against,
-    /// which writes fewer payload columns than the sources carry.
-    pub(crate) fn materialize(
-        &self,
-        out_schema: &SchemaDescriptor,
-        rows: &[(u32, u32, i64)],
-        blob_cap: usize,
-    ) -> Batch {
-        assert!(
-            out_schema.num_payload_cols() <= self.payload_cols,
-            "UnifiedSet::materialize: out_schema has {} payload columns, the views carry {}",
-            out_schema.num_payload_cols(),
-            self.payload_cols,
-        );
-        write_to_batch(out_schema, rows.len(), blob_cap, |writer| {
+    /// triple carries, into a fresh batch under the set's schema claiming no
+    /// layout.
+    pub(crate) fn materialize(&self, rows: &[(u32, u32, i64)], blob_cap: usize) -> Batch {
+        #[cfg(debug_assertions)]
+        for &(si, ri, _) in rows {
+            debug_assert!(
+                self.windows[si as usize].contains(&(ri as usize)),
+                "UnifiedSet::materialize: row {ri} of source {si} outside its window {:?}",
+                self.windows[si as usize],
+            );
+        }
+        write_to_batch(&self.schema, rows.len(), blob_cap, |writer| {
             scatter_unified_sources(&self.sources, &self.cols, rows, writer);
         })
     }

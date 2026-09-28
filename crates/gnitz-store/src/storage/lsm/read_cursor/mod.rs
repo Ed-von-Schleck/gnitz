@@ -76,6 +76,8 @@ pub struct ReadCursor {
     any_skeleton: bool,
     /// The drain's merge-order scratch, reused across chunks.
     merge_order: Vec<(u32, u32, i64)>,
+    /// The drain's per-source row windows, reused across chunks.
+    drain_windows: Vec<Range<usize>>,
     /// Whether an ascending sweep has positioned this cursor — see
     /// [`Self::seek_pk_group_ascending`]. Cleared by every absolute reposition.
     sweep_open: bool,
@@ -114,6 +116,7 @@ impl ReadCursor {
             any_skeleton,
             states,
             merge_order: Vec::new(),
+            drain_windows: Vec::new(),
             sweep_open: false,
             #[cfg(debug_assertions)]
             sweep_prev: Vec::new(),

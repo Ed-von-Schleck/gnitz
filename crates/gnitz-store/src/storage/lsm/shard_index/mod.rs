@@ -174,8 +174,8 @@ pub(super) fn guard_slot<T>(guards: &[T], key: &[u8], gk: impl Fn(&T) -> &[u8]) 
 /// One compaction's input set, as [`ShardIndex::compaction_inputs`] gathers it.
 #[derive(Default)]
 pub(super) struct CompactionInputs {
-    /// This compaction's own handles on the inputs' mappings.
-    shards: Vec<MappedShard>,
+    /// The inputs' live handles.
+    shards: Vec<Rc<MappedShard>>,
     /// The highest `newest` over the inputs, which every output inherits.
     newest: u64,
     /// Registered bytes of the inputs — the amplification bench's read side,
@@ -198,7 +198,7 @@ impl ShardEntry {
     pub(crate) fn open(dir: &str, seq: u64, schema: &SchemaDescriptor, newest: u64) -> Result<Self, StorageError> {
         let shard = Rc::new(MappedShard::open(&naming::shard_path(dir, seq), schema)?);
         let pk_min = PkBuf::from_bytes(shard.get_pk_bytes(0));
-        let pk_max = PkBuf::from_bytes(shard.get_pk_bytes(shard.count - 1));
+        let pk_max = PkBuf::from_bytes(shard.get_pk_bytes(shard.row_count() - 1));
         Ok(ShardEntry { shard, seq, newest, pk_min, pk_max })
     }
 
@@ -213,7 +213,7 @@ impl ShardEntry {
             return None;
         }
         let idx = self.shard.find_lower_bound_bytes(key);
-        if idx < self.shard.count && pk_bytes_eq(self.shard.get_pk_bytes(idx), key) {
+        if idx < self.shard.row_count() && pk_bytes_eq(self.shard.get_pk_bytes(idx), key) {
             return Some((Rc::clone(&self.shard), idx));
         }
         None
@@ -282,12 +282,12 @@ impl LevelGuard {
     /// shard is already sorted and its PK region is fixed-stride, so a key is one
     /// O(1) read.
     fn sample_keys(&self) -> Vec<PkBuf> {
-        let rows: usize = self.entries.iter().map(|e| e.shard.count).sum();
+        let rows: usize = self.entries.iter().map(|e| e.shard.row_count()).sum();
         let step = (rows / SPLIT_SAMPLES).max(1);
         let mut sample: Vec<PkBuf> = Vec::with_capacity(SPLIT_SAMPLES + self.entries.len());
         for e in &self.entries {
             sample.extend(
-                (0..e.shard.count)
+                (0..e.shard.row_count())
                     .step_by(step)
                     .map(|r| PkBuf::from_bytes(e.shard.get_pk_bytes(r))),
             );
@@ -471,10 +471,10 @@ impl ShardIndex {
         self.dropped_max
     }
 
-    /// Publish `schema`, rebinding every registered shard when its payload arity
-    /// changed. A failure on any shard leaves the index on the old schema.
+    /// Publish `schema`, rebinding every registered shard to it. A failure on any
+    /// shard leaves the index on the old schema.
     pub(super) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
-        if schema.num_payload_cols() != self.schema.num_payload_cols() {
+        if schema != self.schema {
             let rebound: Vec<Rc<MappedShard>> = self
                 .all_entries()
                 .map(|e| e.shard.rebind(&schema).map(Rc::new))

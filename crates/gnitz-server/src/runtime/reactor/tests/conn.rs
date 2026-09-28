@@ -9,18 +9,18 @@ use std::time::Duration;
 use super::super::test_support::*;
 use super::*;
 use crate::runtime::test_support::try_poll_once;
-use gnitz_store::storage::batch_pool::PooledSendBuf;
+use gnitz_store::storage::batch_pool::PooledBuf;
 
 /// One whole-payload client send, with nothing racing it.
 async fn owned_send(r: &Reactor, conn: &Rc<ClientConn>, payload: Vec<u8>) -> Result<(), PeerGone> {
-    r.send_owned(conn, SendBody::Pooled(PooledSendBuf(payload))).await
+    r.send_owned(conn, SendBody::Pooled(PooledBuf(payload))).await
 }
 
 /// A pooled send buffer holding `bytes`.
-fn pooled(bytes: &[u8]) -> PooledSendBuf {
+fn pooled(bytes: &[u8]) -> PooledBuf {
     let mut b = gnitz_store::storage::batch_pool::acquire_buf();
     b.extend_from_slice(bytes);
-    PooledSendBuf(b)
+    PooledBuf(b)
 }
 
 /// A send's carry: `body`, over a connection of its own.
@@ -299,8 +299,8 @@ fn fanout_coalesced_egress_bench() {
                     // Source buffers are filled outside the timed region
                     // on both arms except the concatenation itself,
                     // which is the copy under test.
-                    let bufs: Vec<PooledSendBuf> = (0..w).map(|_| pooled(&frame)).collect();
-                    let run_per_frame = async |bufs: Vec<PooledSendBuf>| {
+                    let bufs: Vec<PooledBuf> = (0..w).map(|_| pooled(&frame)).collect();
+                    let run_per_frame = async |bufs: Vec<PooledBuf>| {
                         let t = Instant::now();
                         for buf in bufs {
                             let _ = black_box(r2.send_owned(&conn, SendBody::Pooled(buf)).await);
@@ -314,7 +314,7 @@ fn fanout_coalesced_egress_bench() {
                         for _ in 0..w {
                             buf.extend_from_slice(&frame);
                         }
-                        let _ = black_box(r2.send_owned(&conn, SendBody::Pooled(PooledSendBuf(buf))).await);
+                        let _ = black_box(r2.send_owned(&conn, SendBody::Pooled(PooledBuf(buf))).await);
                         t.elapsed()
                     };
                     if i % 2 == 0 {

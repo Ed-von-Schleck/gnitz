@@ -3,7 +3,7 @@
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use gnitz_store::storage::batch_pool::PooledSendBuf;
+use gnitz_store::storage::batch_pool::PooledBuf;
 
 use super::io::{ClientConn, Life, RecvEnd, RecvFilter};
 use super::*;
@@ -30,7 +30,7 @@ pub(super) struct Outbound {
 
 /// An owned client-bound payload whose bytes stay in place when it moves.
 pub(crate) enum SendBody {
-    Pooled(PooledSendBuf),
+    Pooled(PooledBuf),
     Slot(W2mSlot),
 }
 
