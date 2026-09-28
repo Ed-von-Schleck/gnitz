@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{col_def, parse_query};
+use crate::test_support::{col, parse_query};
 use gnitz_core::TypeCode;
 use sqlparser::ast::Expr;
 
@@ -11,10 +11,10 @@ fn keys_of(q: &sqlparser::ast::Query) -> Vec<OrderKey<'_>> {
 /// A hidden leading key, then `a`, `b`, `c`.
 fn hidden_led() -> Vec<ColumnDef> {
     vec![
-        col_def("_group_pk", TypeCode::U128, false).hidden(),
-        col_def("a", TypeCode::I64, false),
-        col_def("b", TypeCode::I64, false),
-        col_def("c", TypeCode::I64, false),
+        col("_group_pk", TypeCode::U128).hidden(),
+        col("a", TypeCode::I64),
+        col("b", TypeCode::I64),
+        col("c", TypeCode::I64),
     ]
 }
 

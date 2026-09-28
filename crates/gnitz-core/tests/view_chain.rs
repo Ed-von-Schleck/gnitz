@@ -109,7 +109,7 @@ fn a_chain_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
     let (base_tid, schema) = make_base(&mut client, &sn);
 
     let owner = client
-        .create_view_chain(&sn, "f", chain(base_tid, &schema), ViewProps::default(), false)
+        .create_view_chain(&sn, "f", chain(base_tid, &schema), ViewProps::default(), None)
         .unwrap();
     assert_eq!(
         owner,
@@ -130,7 +130,8 @@ fn a_chain_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
     assert!(err.contains("View dependency"), "got: {err}");
 
     // A rename is a net-live rewrite of the owner's row: the cascade must not fire.
-    client.alter_rename_relation(&sn, "f", "renamed").unwrap();
+    let f = client.resolve_relation(&sn, "f").unwrap();
+    client.alter_rename_relation(&sn, &f, "renamed").unwrap();
     let mut segs = segment_vids_of(&mut client, owner);
     segs.sort();
     assert_eq!(segs, vids[..2], "a rename keeps the owner's segments");
@@ -158,12 +159,12 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
             "taken",
             segment(base_tid, &schema).into(),
             ViewProps::default(),
-            false,
+            None,
         )
         .unwrap();
 
     let err = client
-        .create_view_chain(&sn, "taken", chain(base_tid, &schema), ViewProps::default(), false)
+        .create_view_chain(&sn, "taken", chain(base_tid, &schema), ViewProps::default(), None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("already exists"), "got: {err}");
@@ -179,7 +180,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
         view: segment(gnitz_core::segment_id(0), &schema),
     };
     let err = client
-        .create_view_chain(&sn, "fwd", forward, ViewProps::default(), false)
+        .create_view_chain(&sn, "fwd", forward, ViewProps::default(), None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("not older"), "got: {err}");
@@ -199,7 +200,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
         ..segment(base_tid, &schema)
     };
     let err = client
-        .create_view_chain(&sn, "wide", planned.into(), ViewProps::default(), false)
+        .create_view_chain(&sn, "wide", planned.into(), ViewProps::default(), None)
         .unwrap_err()
         .to_string();
     assert!(
@@ -218,7 +219,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
         view: segment(base_tid, &schema),
     };
     let err = client
-        .create_view_chain(&sn, "x", planned, ViewProps::default(), false)
+        .create_view_chain(&sn, "x", planned, ViewProps::default(), None)
         .unwrap_err()
         .to_string();
     assert!(

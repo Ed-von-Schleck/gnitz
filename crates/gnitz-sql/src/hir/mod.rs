@@ -18,14 +18,15 @@ mod physical;
 mod place;
 mod window;
 
-pub(crate) use create::{execute_alter_view, execute_create_view};
-pub use create::{plan_alter_view, plan_create_view, PlannedChain, ViewPlan};
+#[cfg(test)]
+pub(crate) use create::PlannedChain;
+pub(crate) use create::{execute_view_chain, plan_alter_view, plan_create_view};
 
 use crate::agg::AggFunc;
 use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
-use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, RangeRel, RelDescriptor, TypeCode, ViewBundle};
+use gnitz_core::{ColType, ColumnDef, RangeRel, RelDescriptor, TypeCode, ViewBundle};
 use gnitz_wire::AggFunc as WireAggFunc;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -35,14 +36,13 @@ use std::sync::Arc;
 /// tree shared by every `Alias` naming it, so nothing compiles before the tree is
 /// whole.
 pub(crate) fn bind_and_lower(
-    cat: &CatalogSnapshot,
-    schema_name: &str,
+    cat: &crate::bind::Catalog<'_>,
     query: &sqlparser::ast::Query,
     view: bind::ViewBody,
     bounded: bool,
 ) -> Result<ViewBundle, GnitzSqlError> {
     let ids = ColIdGen::new();
-    let mut cx = bind::BindCx::new(cat, schema_name, &ids, view);
+    let mut cx = bind::BindCx::new(cat, &ids, view);
     bind::bind_ctes(&mut cx, query)?;
     let rel = bind::bind_query(&mut cx, query)?;
     lower::lower(rel, bounded)

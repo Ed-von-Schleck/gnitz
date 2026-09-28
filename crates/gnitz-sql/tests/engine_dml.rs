@@ -227,6 +227,56 @@ fn transaction_control_refuses_what_it_cannot_honour() {
     );
 }
 
+/// A transaction a failing call began is rolled back, even when that call first
+/// committed one an earlier call opened; one an earlier call began is the
+/// caller's to end.
+#[test]
+fn a_failing_call_rolls_back_only_the_transaction_it_began() {
+    let (_srv, mut client, sn) = boot(1);
+    exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
+    exec(&mut client, &sn, "BEGIN");
+    exec(&mut client, &sn, "INSERT INTO t VALUES (1, 10)");
+    try_exec(
+        &mut client,
+        &sn,
+        "COMMIT; BEGIN; INSERT INTO t VALUES (2, 20); INSERT INTO nope VALUES (1, 1)",
+    )
+    .expect_err("`nope` does not exist");
+    assert!(!client.txn_active(), "the transaction this call began is rolled back");
+    assert_eq!(
+        rows(&mut client, &sn, "SELECT * FROM t", &["id", "v"]),
+        at_weight_one(&[vec![1, 10]])
+    );
+
+    exec(&mut client, &sn, "BEGIN");
+    try_exec(&mut client, &sn, "INSERT INTO nope VALUES (1, 1)").expect_err("`nope` does not exist");
+    assert!(client.txn_active(), "a transaction an earlier call began stays open");
+    exec(&mut client, &sn, "ROLLBACK");
+}
+
+/// Another client's `ADD COLUMN` inside a transaction fails its COMMIT cleanly,
+/// writing nothing.
+#[test]
+fn a_concurrent_add_column_fails_the_commit_cleanly() {
+    let (srv, mut a, sn) = boot(1);
+    let mut b = GnitzClient::connect(srv.sock_path()).unwrap();
+    exec(&mut a, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
+    exec(&mut a, &sn, "INSERT INTO t VALUES (1, 10)");
+
+    exec(&mut a, &sn, "BEGIN");
+    exec(&mut a, &sn, "INSERT INTO t VALUES (2, 20)");
+    exec(&mut b, &sn, "ALTER TABLE t ADD COLUMN c BIGINT");
+    exec(&mut a, &sn, "INSERT INTO t (id, v) VALUES (3, 30)");
+    let e = try_exec(&mut a, &sn, "COMMIT").expect_err("the table's layout changed");
+    assert_eq!(variant_of(&e).0, "Exec", "{e:?}");
+    assert!(!a.txn_active());
+
+    assert_eq!(
+        rows(&mut a, &sn, "SELECT id, v FROM t", &["id", "v"]),
+        at_weight_one(&[vec![1, 10]])
+    );
+}
+
 // ── Reply framing past one frame ─────────────────────────────────────────────
 //
 // A reply of any schema splits across frames, a TEXT column included: each frame

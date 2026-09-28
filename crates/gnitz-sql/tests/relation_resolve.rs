@@ -1,6 +1,6 @@
 #![cfg(feature = "integration")]
 
-//! The RESOLVE verb and the statement-scoped descriptor built from it.
+//! The RESOLVE verb, and a statement resolves each relation once.
 //!
 //! Two claims are pinned here. *Correctness*: one reply reproduces, field for
 //! field, what whole-system-table scans produced. *Cost*: a statement resolves each
@@ -244,6 +244,61 @@ fn one_statement_resolves_a_relation_once() {
         assert_rejects_variant(c, &sn, "INSERT INTO nope (id) VALUES (1)", "Exec", "nope");
     });
     assert_eq!(n, 1, "an absent target costs one resolve");
+}
+
+/// A DDL verb acts on the descriptor its statement resolved rather than
+/// resolving the name again, and a replaced view's row carries its schema id.
+#[test]
+fn a_ddl_statement_resolves_its_target_once() {
+    let (_srv, mut client, sn) = boot(1);
+    exec(&mut client, &sn, T_ID_V);
+    exec(&mut client, &sn, "CREATE TABLE w (id BIGINT NOT NULL PRIMARY KEY)");
+    exec(&mut client, &sn, "CREATE VIEW v AS SELECT id, v FROM t");
+
+    for (sql, want, what) in [
+        ("ALTER TABLE t RENAME TO u", 3, "resolve, seek, push"),
+        // A table with a dependent view refuses a new column.
+        ("ALTER TABLE w ADD COLUMN c BIGINT", 2, "resolve, push"),
+        ("ALTER VIEW v AS SELECT id FROM u", 5, "two resolves, seek, alloc, push"),
+        (
+            "CREATE OR REPLACE VIEW v AS SELECT id, v FROM u",
+            5,
+            "two resolves, seek, alloc, push",
+        ),
+    ] {
+        assert_eq!(requests_for_sql(&mut client, &sn, sql), want, "`{sql}`: {what}");
+    }
+}
+
+/// A transaction binds each table's name once: after its first statement on a
+/// table, an INSERT sends nothing until COMMIT, and an UPDATE sends only its
+/// read. A view takes no writes, so it is resolved afresh each statement.
+#[test]
+fn a_transaction_resolves_each_relation_once() {
+    let (_srv, mut client, sn) = boot(1);
+    exec(&mut client, &sn, T_ID_V);
+
+    let n = requests_for_sql(
+        &mut client,
+        &sn,
+        "BEGIN; INSERT INTO t VALUES (1, 10); INSERT INTO t VALUES (2, 20); COMMIT",
+    );
+    assert_eq!(n, 2, "one resolve, one PUSH_TXN");
+
+    let n = requests_for_sql(
+        &mut client,
+        &sn,
+        "BEGIN; UPDATE t SET v = v + 1 WHERE id = 1; UPDATE t SET v = v + 1 WHERE id = 2; COMMIT",
+    );
+    assert_eq!(n, 4, "one resolve, two reads, one PUSH_TXN");
+
+    exec(&mut client, &sn, "CREATE VIEW v AS SELECT id, v FROM t");
+    let n = requests_for_sql(&mut client, &sn, "BEGIN; SELECT * FROM v; SELECT * FROM v; ROLLBACK");
+    assert_eq!(n, 4, "a resolve and a read per SELECT");
+    assert_eq!(
+        rows(&mut client, &sn, "SELECT id, v FROM t", &["id", "v"]),
+        vec![vec![1, 11, 1], vec![2, 21, 1]]
+    );
 }
 
 /// `DROP SCHEMA` is one bundle whatever the member count: the SCHEMA_TAB probe,

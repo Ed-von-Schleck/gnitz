@@ -1,7 +1,9 @@
 use crate::ast_util::col_ref_parts;
 use crate::error::GnitzSqlError;
-use gnitz_core::{CatalogSnapshot, ColumnDef, RelDescriptor};
+use gnitz_core::{qualified_name, ColumnDef, RelDescriptor};
 use sqlparser::ast::{Expr, Ident};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The one visible column of `columns` named `col_name`, matched
@@ -56,25 +58,57 @@ pub(crate) fn output_column<'a>(
     }
 }
 
-/// The relation `name` a statement reads: [`probe`], with absence an error.
-pub(crate) fn probe_relation(
-    cat: &CatalogSnapshot,
-    schema_name: &str,
-    name: &str,
-) -> Result<Arc<RelDescriptor>, GnitzSqlError> {
-    probe(cat, schema_name, name)?.ok_or_else(|| crate::error::missing_relation(schema_name, name))
+/// What a statement's resolver answers for one relation name.
+pub(crate) type Resolve<'r> = &'r dyn Fn(&str) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError>;
+
+/// The relations one statement's plan reads under `schema_name`: each name is
+/// resolved on its first probe and remembered, absence included.
+pub(crate) struct Catalog<'r> {
+    schema_name: &'r str,
+    resolve: Resolve<'r>,
+    known: RefCell<HashMap<String, Option<Arc<RelDescriptor>>>>,
 }
 
-/// The relation `name` resolves to in the statement's snapshot, `None` for a free
-/// name, and [`GnitzSqlError::CatalogMiss`] for one the snapshot has not probed —
-/// the signal `dispatch::plan_resolving` answers by resolving and re-running.
-pub(crate) fn probe(
-    cat: &CatalogSnapshot,
-    schema_name: &str,
-    name: &str,
-) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
-    cat.get(schema_name, name)
-        .ok_or_else(|| GnitzSqlError::CatalogMiss(name.to_string()))
+impl<'r> Catalog<'r> {
+    pub(crate) fn new(schema_name: &'r str, resolve: Resolve<'r>) -> Self {
+        Catalog {
+            schema_name,
+            resolve,
+            known: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// The schema every name of the statement resolves under.
+    pub(crate) fn schema_name(&self) -> &'r str {
+        self.schema_name
+    }
+
+    /// The relation `name` resolves to, `None` for a free name.
+    pub(crate) fn probe(&self, name: &str) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
+        let key = qualified_name(self.schema_name, name);
+        let hit = self.known.borrow().get(&key).cloned();
+        if let Some(hit) = hit {
+            return Ok(hit);
+        }
+        let found = (self.resolve)(name)?;
+        self.known.borrow_mut().insert(key, found.clone());
+        Ok(found)
+    }
+
+    /// The relation `name` a statement reads: [`Self::probe`], with absence an
+    /// error.
+    pub(crate) fn probe_relation(&self, name: &str) -> Result<Arc<RelDescriptor>, GnitzSqlError> {
+        self.probe(name)?
+            .ok_or_else(|| crate::error::missing_relation(self.schema_name, name))
+    }
+
+    /// Record `name`'s verdict without asking the resolver.
+    #[cfg(test)]
+    pub(crate) fn insert(&self, name: &str, desc: Option<Arc<RelDescriptor>>) {
+        self.known
+            .borrow_mut()
+            .insert(qualified_name(self.schema_name, name), desc);
+    }
 }
 
 /// Apply positional column aliases (`WITH d(a, b) AS …` / `(subquery) AS d(a, b)`

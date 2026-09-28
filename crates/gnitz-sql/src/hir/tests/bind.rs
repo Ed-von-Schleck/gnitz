@@ -1,46 +1,25 @@
 use super::*;
-use crate::test_support::{col_def, parse_stmt};
-use gnitz_core::{RelClass, RelDescriptor, Schema, TypeCode};
+use crate::test_support::{col, ncol, parse_stmt, table};
+use gnitz_core::TypeCode;
 use sqlparser::ast::Statement;
 use std::rc::Rc;
-use std::sync::Arc;
 
 /// `t(id BIGINT PK, a BIGINT, b BIGINT NULL, f DOUBLE NULL)` and
-/// `u(uid BIGINT PK, a BIGINT)` — one snapshot both a linear and a join body
+/// `u(uid BIGINT PK, a BIGINT)` — one catalog both a linear and a join body
 /// bind against.
-fn catalog() -> CatalogSnapshot {
-    let mut cat = CatalogSnapshot::default();
-    let mut add = |tid: u64, name: &str, columns: Vec<ColumnDef>| {
-        let schema = Arc::new(Schema { columns, pk_cols: vec![0] });
-        cat.insert(
-            "public",
-            name,
-            Some(Arc::new(RelDescriptor {
-                tid,
-                class: RelClass::Table,
-                pk_repeats: false,
-                serial: false,
-                schema,
-                indexes: Vec::new(),
-            })),
-        );
-    };
-    add(
-        1,
-        "t",
-        vec![
-            col_def("id", TypeCode::I64, false),
-            col_def("a", TypeCode::I64, false),
-            col_def("b", TypeCode::I64, true),
-            col_def("f", TypeCode::F64, true),
-        ],
-    );
-    add(
-        2,
-        "u",
-        vec![col_def("uid", TypeCode::I64, false), col_def("a", TypeCode::I64, false)],
-    );
-    cat
+fn catalog() -> Catalog<'static> {
+    let i = TypeCode::I64;
+    crate::test_support::catalog(vec![
+        (
+            "t",
+            table(
+                1,
+                vec![col("id", i), col("a", i), ncol("b", i), ncol("f", TypeCode::F64)],
+                vec![0],
+            ),
+        ),
+        ("u", table(2, vec![col("uid", i), col("a", i)], vec![0])),
+    ])
 }
 
 /// Bind one `CREATE VIEW` body.
@@ -52,7 +31,7 @@ pub(in crate::hir) fn bound(sql: &str) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let ids = ColIdGen::new();
     let body = crate::validate::reject_query_envelope_body(&cv.query, "view body")?;
     let view = crate::hir::bind::ViewBody { stmt: "CREATE VIEW", replacing: None };
-    let mut cx = BindCx::new(&cat, "public", &ids, view);
+    let mut cx = BindCx::new(&cat, &ids, view);
     bind_body(&mut cx, body)
 }
 

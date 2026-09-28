@@ -1,11 +1,11 @@
 use super::*;
 use crate::bind::bind_single_table;
 use crate::test_support::{
-    bind_conjunct, bind_where, col_def, compound_schema_u64_u64, eq_expr, extract_pk_value, idx_metas,
-    idx_metas_flagged, in_list_expr, neg_num_expr, num_expr, parse_expr_sql, pk_schema, two_col, uuid_schema_payload,
+    bind_conjunct, bind_where, col, compound_schema_u64_u64, eq_expr, extract_pk_value, idx_metas, idx_metas_flagged,
+    in_list_expr, ncol, neg_num_expr, num_expr, parse_expr_sql, pk_schema, two_col, uuid_schema_payload,
     uuid_schema_pk,
 };
-use gnitz_core::PkBuf;
+use gnitz_core::{ColumnDef, PkBuf};
 use sqlparser::ast::Expr;
 
 /// `v`'s key image in a `tc` column.
@@ -28,9 +28,9 @@ fn bind1(e: &Expr, schema: &gnitz_core::Schema) -> Result<crate::ir::BoundExpr, 
 fn schema3(tc: TypeCode, b_nullable: bool) -> Schema {
     Schema {
         columns: vec![
-            col_def("id", TypeCode::U64, false),
-            col_def("a", tc, false),
-            col_def("b", tc, b_nullable),
+            col("id", TypeCode::U64),
+            col("a", tc),
+            ColumnDef::new("b", tc, b_nullable),
         ],
         pk_cols: vec![0],
     }
@@ -299,10 +299,10 @@ fn a_float_column_is_never_an_index_key() {
 fn every_leaf_of_the_and_tree_is_reached() {
     let schema = Schema {
         columns: vec![
-            col_def("pk", TypeCode::U64, false),
-            col_def("a", TypeCode::U64, true),
-            col_def("b", TypeCode::U64, true),
-            col_def("c", TypeCode::U64, true),
+            col("pk", TypeCode::U64),
+            ncol("a", TypeCode::U64),
+            ncol("b", TypeCode::U64),
+            ncol("c", TypeCode::U64),
         ],
         pk_cols: vec![0],
     };
@@ -321,11 +321,11 @@ fn every_leaf_of_the_and_tree_is_reached() {
 fn seek_rank_schema() -> Schema {
     Schema {
         columns: vec![
-            col_def("id", TypeCode::U64, false),
-            col_def("x", TypeCode::U64, false),
-            col_def("a", TypeCode::U64, false),
-            col_def("b", TypeCode::U64, false),
-            col_def("c", TypeCode::U64, false),
+            col("id", TypeCode::U64),
+            col("x", TypeCode::U64),
+            col("a", TypeCode::U64),
+            col("b", TypeCode::U64),
+            col("c", TypeCode::U64),
         ],
         pk_cols: vec![0],
     }
@@ -424,7 +424,7 @@ fn a_list_product_past_the_cap_is_no_set() {
 #[test]
 fn crossed_keys_ascend_in_pk_list_order() {
     let schema = Schema {
-        columns: vec![col_def("a", TypeCode::I32, false), col_def("b", TypeCode::U16, false)],
+        columns: vec![col("a", TypeCode::I32), col("b", TypeCode::U16)],
         pk_cols: vec![1, 0],
     };
     let where_expr = bind_where("a IN (2, -1, -3) AND b IN (5, 1)", &schema);
@@ -721,7 +721,7 @@ fn an_out_of_range_end_saturates_to_the_type_edge() {
 #[test]
 fn a_date_string_range_end_bounds_its_index() {
     let schema = Schema {
-        columns: vec![col_def("id", TypeCode::U64, false), col_def("d", TypeCode::Date, false)],
+        columns: vec![col("id", TypeCode::U64), col("d", TypeCode::Date)],
         pk_cols: vec![0],
     };
     let (cols, desc) = picked("d >= '2024-01-01'", &schema, &[&[1]]).expect("the string end bounds INDEX(d)");
@@ -803,9 +803,9 @@ fn a_pk_equality_bounds_the_index_that_names_it() {
 fn an_index_over_a_compound_pk_column_bounds_like_any_other() {
     let sch = Schema {
         columns: vec![
-            col_def("a", TypeCode::U64, false),
-            col_def("b", TypeCode::U64, false),
-            col_def("v", TypeCode::U64, false),
+            col("a", TypeCode::U64),
+            col("b", TypeCode::U64),
+            col("v", TypeCode::U64),
         ],
         pk_cols: vec![0, 1],
     };
@@ -911,10 +911,10 @@ fn a_partial_prefix_of_a_unique_index_is_not_a_unique_point() {
     // candidate is rejected outright by the nullable trailing-column guard.
     let sch = Schema {
         columns: vec![
-            col_def("id", TypeCode::U64, false),
-            col_def("a", TypeCode::I64, false),
-            col_def("b", TypeCode::I64, false),
-            col_def("c", TypeCode::I64, false),
+            col("id", TypeCode::U64),
+            col("a", TypeCode::I64),
+            col("b", TypeCode::I64),
+            col("c", TypeCode::I64),
         ],
         pk_cols: vec![0],
     };
@@ -1035,7 +1035,7 @@ fn a_decimal_pk_against_a_finer_literal() {
     let schema = Schema {
         columns: vec![
             gnitz_core::ColumnDef::typed("d", gnitz_core::ColType::decimal(2), false),
-            col_def("v", TypeCode::I64, false),
+            col("v", TypeCode::I64),
         ],
         pk_cols: vec![0],
     };

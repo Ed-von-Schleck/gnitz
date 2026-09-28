@@ -21,8 +21,7 @@ use crate::ast_util::{
 use crate::bind::apply_positional_aliases;
 use crate::bind::structural::maybe_negate;
 use crate::bind::{
-    bind_conjuncts, bind_structural, find_unique_column, output_column, probe_relation, single_relation_col_idx,
-    LeafBinder,
+    bind_conjuncts, bind_structural, find_unique_column, output_column, single_relation_col_idx, Catalog, LeafBinder,
 };
 use crate::error::{reject_if, GnitzSqlError};
 use crate::ir::{BExpr, BinOp};
@@ -31,7 +30,7 @@ use crate::validate::{
     as_plain_select, cte_body, non_recursive_ctes, reject_duplicate_projection_names, reject_float_key,
     reject_query_envelope_body, reject_unhonored_select_clauses, validate_user_name, HonoredClauses,
 };
-use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, RelClass, RelDescriptor, TypeCode};
+use gnitz_core::{ColType, ColumnDef, RelClass, RelDescriptor, TypeCode};
 use sqlparser::ast::{
     BinaryOperator, Expr, Function, JoinConstraint, JoinOperator, NamedWindowExpr, Query, Select, SelectItem, SetExpr,
     SetOperator, SetQuantifier, TableFactor,
@@ -113,8 +112,7 @@ pub(crate) struct ViewBody {
 
 /// One view body's bind state, threaded through the recursion.
 pub(crate) struct BindCx<'c> {
-    pub(crate) cat: &'c CatalogSnapshot,
-    pub(crate) schema_name: &'c str,
+    pub(crate) cat: &'c Catalog<'c>,
     pub(crate) ids: &'c ColIdGen,
     pub(crate) view: ViewBody,
     /// The CTEs bound so far, by canonical (ASCII-lowercase) name.
@@ -122,14 +120,8 @@ pub(crate) struct BindCx<'c> {
 }
 
 impl<'c> BindCx<'c> {
-    pub(crate) fn new(cat: &'c CatalogSnapshot, schema_name: &'c str, ids: &'c ColIdGen, view: ViewBody) -> Self {
-        BindCx {
-            cat,
-            schema_name,
-            ids,
-            view,
-            ctes: HashMap::new(),
-        }
+    pub(crate) fn new(cat: &'c Catalog<'c>, ids: &'c ColIdGen, view: ViewBody) -> Self {
+        BindCx { cat, ids, view, ctes: HashMap::new() }
     }
 }
 
@@ -139,12 +131,13 @@ fn resolve_relation(cx: &mut BindCx<'_>, name: &str) -> Result<Rc<RelExpr>, Gnit
     if let Some(cte) = cx.ctes.get(&name.to_ascii_lowercase()) {
         return Ok(RelExpr::alias_as(cx.ids, Rc::clone(&cte.rel), &cte.defs));
     }
-    let rel = probe_relation(cx.cat, cx.schema_name, name)?;
+    let rel = cx.cat.probe_relation(name)?;
     // The replaced view is retracted in the same bundle, taking the body's input with it.
     if cx.view.replacing == Some(rel.tid) {
         return Err(GnitzSqlError::Unsupported(format!(
             "{} '{}.{name}' AS a query referencing the view itself is not supported",
-            cx.view.stmt, cx.schema_name
+            cx.view.stmt,
+            cx.cat.schema_name()
         )));
     }
     // Leaf rule: a bounded view's skeleton rows hydrate by replaying its sources,
@@ -274,7 +267,7 @@ pub(crate) fn bind_body(cx: &mut BindCx<'_>, body: &SetExpr) -> Result<Rc<RelExp
 /// segment — single-use and non-LATERAL, so uncorrelated) whose `AS d(col…)`
 /// aliases are applied to the returned cols (same `ColId`s, overridden names) the
 /// caller pushes into its scope/env. The subtree itself keeps its own names; a
-/// derived alias resolves through the caller's scope, never the catalog snapshot.
+/// derived alias resolves through the caller's scope, never the statement catalog.
 fn resolve_table_factor(
     cx: &mut BindCx<'_>,
     factor: &TableFactor,
@@ -303,7 +296,7 @@ fn resolve_table_factor(
         )?;
         return Ok((subtree, alias.name.value.clone(), cols));
     }
-    let (name, alias) = extract_table_name_and_alias(factor, cx.schema_name, cx.view.stmt)?;
+    let (name, alias) = extract_table_name_and_alias(factor, cx.cat.schema_name(), cx.view.stmt)?;
     let rel = resolve_relation(cx, &name)?;
     let cols = rel.cols();
     Ok((rel, alias, cols))
@@ -770,7 +763,7 @@ fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_>, subquery: &'e Query) -> Result<Inn
             "EXISTS/IN subquery: only a single FROM table without JOINs is supported; compose via views".into(),
         ));
     };
-    let (inner_name, inner_alias) = extract_table_name_and_alias(factor, cx.cx.schema_name, "subquery")?;
+    let (inner_name, inner_alias) = extract_table_name_and_alias(factor, cx.cx.cat.schema_name(), "subquery")?;
     if outer_alias.eq_ignore_ascii_case(&inner_alias) {
         return Err(GnitzSqlError::Bind(format!(
             "relation alias '{outer_alias}' is used by both the view FROM and its subquery; rename one"

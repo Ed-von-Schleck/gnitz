@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::col_def;
+use crate::test_support::{col, ncol};
 use gnitz_core::TypeCode;
 use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_wire::OrderKey;
@@ -78,9 +78,9 @@ const UNCUT: Window = Window { offset: 0, limit: None };
 fn kv_schema() -> Schema {
     Schema {
         columns: vec![
-            col_def("id", TypeCode::U64, false),
-            col_def("v", TypeCode::I64, true),
-            col_def("s", TypeCode::String, true),
+            col("id", TypeCode::U64),
+            ncol("v", TypeCode::I64),
+            ncol("s", TypeCode::String),
         ],
         pk_cols: vec![0],
     }
@@ -246,7 +246,7 @@ fn a_null_u128_is_read_from_the_bitmap() {
     // A NULL U128 payload is zero-filled filler; NULL must be read from the
     // bitmap, not off the value.
     let schema = Schema {
-        columns: vec![col_def("id", TypeCode::U64, false), col_def("u", TypeCode::U128, true)],
+        columns: vec![col("id", TypeCode::U64), ncol("u", TypeCode::U128)],
         pk_cols: vec![0],
     };
     let mut b = ZSetBatch::new(&schema);
@@ -269,9 +269,9 @@ fn a_second_signed_pk_column_orders_by_value() {
     // signed column order by value.
     let schema = Schema {
         columns: vec![
-            col_def("a", TypeCode::U16, false),
-            col_def("b", TypeCode::I16, false),
-            col_def("w", TypeCode::I64, true),
+            col("a", TypeCode::U16),
+            col("b", TypeCode::I16),
+            ncol("w", TypeCode::I64),
         ],
         pk_cols: vec![0, 1],
     };

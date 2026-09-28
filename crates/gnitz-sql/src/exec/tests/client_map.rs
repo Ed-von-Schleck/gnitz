@@ -1,12 +1,12 @@
 use super::*;
 use crate::codec::project_schema::{reply_program, ProjItem};
-use crate::test_support::col_def;
+use crate::test_support::{col, ncol};
 use gnitz_core::TypeCode;
 
 /// `(k I64 PK, v I64 NULL)`.
 fn source() -> Schema {
     Schema {
-        columns: vec![col_def("k", TypeCode::I64, false), col_def("v", TypeCode::I64, true)],
+        columns: vec![col("k", TypeCode::I64), ncol("v", TypeCode::I64)],
         pk_cols: vec![0],
     }
 }

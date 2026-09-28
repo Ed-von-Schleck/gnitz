@@ -42,7 +42,7 @@ fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
         (16, del(&s, 1), Update, 9),         // family 3: back to Update, in call order
         (16, ins(&s, 1), Error, BLIND),      // family 4: the Error re-insert
     ] {
-        buf.push(tid, &s, batch, mode, basis);
+        buf.push(tid, &s, batch, mode, basis).unwrap();
     }
 
     let shape: Vec<_> = buf
@@ -62,7 +62,8 @@ fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
     );
 
     let mut op = |tid, pk: u64| {
-        buf.reads(tid)?
+        buf.reads(tid, &kv_schema())
+            .unwrap()?
             .last_op(kv_schema().opk_key_cols(&[pk as u128]).pk_bytes())
             .map(|(b, row)| (b.weights[row], row))
     };
@@ -71,7 +72,7 @@ fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
     assert_eq!(op(16, 3), Some((1, 0)), "row 0 of the mode-split family");
     assert_eq!(op(16, 9), None, "an untouched PK");
     assert_eq!(op(17, 2), None, "another tid's PK");
-    assert_eq!(buf.reads(16).unwrap().last_ops().count(), 3);
+    assert_eq!(buf.reads(16, &s).unwrap().unwrap().last_ops().count(), 3);
 }
 
 /// A family extended by batches read at different watermarks keeps the oldest:
@@ -81,9 +82,9 @@ fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
 fn an_extended_family_keeps_its_oldest_basis() {
     let s = kv_schema();
     let mut buf = TxnBuffer::default();
-    buf.push(16, &s, ins(&s, 1), WireConflictMode::Update, 20);
-    buf.push(16, &s, ins(&s, 2), WireConflictMode::Update, 10);
-    buf.push(16, &s, ins(&s, 3), WireConflictMode::Update, BLIND);
+    buf.push(16, &s, ins(&s, 1), WireConflictMode::Update, 20).unwrap();
+    buf.push(16, &s, ins(&s, 2), WireConflictMode::Update, 10).unwrap();
+    buf.push(16, &s, ins(&s, 3), WireConflictMode::Update, BLIND).unwrap();
     let bases: Vec<_> = buf.families.iter().map(|f| (f.tid, f.basis)).collect();
     assert_eq!(bases, [(16, 10)]);
 }
@@ -94,15 +95,15 @@ fn an_extended_family_keeps_its_oldest_basis() {
 fn reads_is_none_without_a_live_op() {
     let s = kv_schema();
     let mut buf = TxnBuffer::default();
-    assert!(buf.reads(16).is_none(), "an untouched relation");
+    assert!(buf.reads(16, &s).unwrap().is_none(), "an untouched relation");
 
     let mut zero = ins(&s, 1);
     zero.weights[0] = 0;
-    buf.push(16, &s, zero, WireConflictMode::Update, BLIND);
-    assert!(buf.reads(16).is_none(), "only a weight-0 op");
+    buf.push(16, &s, zero, WireConflictMode::Update, BLIND).unwrap();
+    assert!(buf.reads(16, &s).unwrap().is_none(), "only a weight-0 op");
 
-    buf.push(16, &s, ins(&s, 2), WireConflictMode::Update, BLIND);
-    assert!(buf.reads(16).is_some());
+    buf.push(16, &s, ins(&s, 2), WireConflictMode::Update, BLIND).unwrap();
+    assert!(buf.reads(16, &s).unwrap().is_some());
 }
 
 /// The read-your-own-writes index is built on read, from a per-family
@@ -113,25 +114,49 @@ fn the_read_index_is_built_on_read_and_only_once() {
     let s = kv_schema();
     let mut buf = TxnBuffer::default();
     for pk in 1..=4u64 {
-        buf.push(16, &s, ins(&s, pk), WireConflictMode::Error, BLIND);
+        buf.push(16, &s, ins(&s, pk), WireConflictMode::Error, BLIND).unwrap();
     }
     assert_eq!(buf.indexed_rows(), 0, "a blind transaction indexes nothing");
 
-    assert_eq!(buf.reads(16).unwrap().last_ops().count(), 4);
+    assert_eq!(buf.reads(16, &s).unwrap().unwrap().last_ops().count(), 4);
     assert_eq!(buf.indexed_rows(), 4);
     // A second read folds nothing further — the watermark already covers them.
-    assert_eq!(buf.reads(16).unwrap().last_ops().count(), 4);
+    assert_eq!(buf.reads(16, &s).unwrap().unwrap().last_ops().count(), 4);
     assert_eq!(buf.indexed_rows(), 4);
 
     // A write after a read is picked up by the next read, and only it.
-    buf.push(16, &s, ins(&s, 9), WireConflictMode::Error, BLIND);
+    buf.push(16, &s, ins(&s, 9), WireConflictMode::Error, BLIND).unwrap();
     assert_eq!(buf.indexed_rows(), 4, "the write itself indexes nothing");
-    assert_eq!(buf.reads(16).unwrap().last_ops().count(), 5);
+    assert_eq!(buf.reads(16, &s).unwrap().unwrap().last_ops().count(), 5);
     assert_eq!(buf.indexed_rows(), 5);
 
     // An untouched relation is not indexed by another's read.
-    assert!(buf.reads(17).is_none());
+    assert!(buf.reads(17, &s).unwrap().is_none());
     assert_eq!(buf.indexed_rows(), 5);
+}
+
+/// Every family of a tid shares one layout: a batch in another is refused and
+/// leaves the buffer as it was, and a read under another layout is refused too.
+#[test]
+fn a_tid_refuses_a_second_layout() {
+    let s = kv_schema();
+    let mut wide = kv_schema();
+    wide.columns.push(ColumnDef::new("w", TypeCode::I64, false));
+    let mut buf = TxnBuffer::default();
+    buf.push(16, &s, ins(&s, 1), WireConflictMode::Update, BLIND).unwrap();
+
+    let mut b = ZSetBatch::new(&wide);
+    BatchAppender::new(&mut b, &wide).add_row(2, 1).i64_val(20).i64_val(30);
+    let err = buf.push(16, &wide, b, WireConflictMode::Error, BLIND).unwrap_err();
+    assert!(err.to_string().contains("changed layout"), "{err}");
+    let shape: Vec<_> = buf.families.iter().map(|f| (f.tid, f.batch.len())).collect();
+    assert_eq!(shape, [(16, 1)], "the refused batch left no trace");
+    assert!(buf.reads(16, &wide).is_err());
+
+    // Another tid is independent.
+    let mut b = ZSetBatch::new(&wide);
+    BatchAppender::new(&mut b, &wide).add_row(2, 1).i64_val(20).i64_val(30);
+    buf.push(17, &wide, b, WireConflictMode::Error, BLIND).unwrap();
 }
 
 /// The rename pair every catalog retraction is built from: a verbatim copy at

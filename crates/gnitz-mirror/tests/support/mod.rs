@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
 use gnitz_core::{GnitzClient, Schema, ZSetBatch};
-use gnitz_sql::{SqlPlanner, SqlResult};
+use gnitz_sql::SqlResult;
 
 pub mod copy_paths;
 
@@ -24,17 +24,13 @@ pub fn serial() -> MutexGuard<'static, ()> {
 
 /// Run `sql` for effect, panicking with the statement on failure.
 pub fn sql(client: &mut GnitzClient, schema: &str, statements: &str) {
-    SqlPlanner::new(client, schema)
-        .execute(statements)
-        .unwrap_or_else(|e| panic!("{statements}: {e}"));
+    gnitz_sql::execute(client, schema, statements).unwrap_or_else(|e| panic!("{statements}: {e}"));
 }
 
 /// Run one `SELECT` and return `(schema, rows)`. Local-first: a client holding a
 /// valid copy of the relation answers off it.
 pub fn query(client: &mut GnitzClient, schema: &str, s: &str) -> (std::sync::Arc<Schema>, ZSetBatch) {
-    let mut results = SqlPlanner::new(client, schema)
-        .execute(s)
-        .unwrap_or_else(|e| panic!("{s}: {e}"));
+    let mut results = gnitz_sql::execute(client, schema, s).unwrap_or_else(|e| panic!("{s}: {e}"));
     assert_eq!(results.len(), 1, "{s} is not one statement");
     match results.remove(0) {
         SqlResult::Rows { schema, batch } => (schema, batch),

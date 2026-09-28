@@ -1,7 +1,7 @@
 use super::*;
 use crate::expr_lower::compile_wire_conjuncts;
-use crate::test_support::{bind_where, pk_schema};
-use gnitz_core::{retraction_batch, BatchAppender, PkColumn, RelClass, TxnBuffer, TypeCode, WireConflictMode};
+use crate::test_support::{bind_where, pk_schema, table};
+use gnitz_core::{retraction_batch, BatchAppender, PkColumn, TxnBuffer, TypeCode, WireConflictMode};
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::PkKeys;
 
@@ -31,20 +31,16 @@ fn read(schema: &Arc<Schema>, bound: ReadBound, predicate: Option<&str>, keys: b
     let predicate = predicate.map_or_else(Vec::new, |sql| {
         compile_wire_conjuncts(&bind_where(sql, schema), &schema.columns).expect("the predicate compiles")
     });
-    let target = RelDescriptor {
-        tid: TID,
-        class: RelClass::Table,
-        pk_repeats: false,
-        serial: false,
-        schema: Arc::clone(schema),
-        indexes: Vec::new(),
-    };
+    let target = table(TID, schema.columns.clone(), schema.pk_cols.clone());
     TargetRead::new(&target, bound, predicate, keys).unwrap()
 }
 
 /// `read`'s merge of `committed` with `buf`'s ops on `TID`.
 fn merged(read: &TargetRead, committed: ZSetBatch, buf: &mut TxnBuffer) -> ZSetBatch {
-    let txn = buf.reads(TID).expect("the transaction wrote TID");
+    let txn = buf
+        .reads(TID, &read.schema)
+        .unwrap()
+        .expect("the transaction wrote TID");
     read.merge(committed, &txn).unwrap()
 }
 
@@ -64,8 +60,10 @@ fn contents(schema: &Schema, b: &ZSetBatch) -> Vec<(u128, i64, i64)> {
 fn the_last_buffered_op_on_a_key_wins() {
     let s = schema();
     let mut buf = TxnBuffer::default();
-    buf.push(TID, &s, rows(&s, &[(1, 11, 1)]), WireConflictMode::Update, 3);
-    buf.push(TID, &s, rows(&s, &[(1, 12, 1)]), WireConflictMode::Update, 3);
+    buf.push(TID, &s, rows(&s, &[(1, 11, 1)]), WireConflictMode::Update, 3)
+        .unwrap();
+    buf.push(TID, &s, rows(&s, &[(1, 12, 1)]), WireConflictMode::Update, 3)
+        .unwrap();
     let committed = rows(&s, &[(1, 10, 1), (2, 20, 1)]);
     let out = merged(&read(&s, ReadBound::None, None, false), committed, &mut buf);
     assert_eq!(contents(&s, &out), [(1, 12, 1), (2, 20, 1)]);
@@ -75,8 +73,9 @@ fn the_last_buffered_op_on_a_key_wins() {
 fn a_delete_then_reinsert_is_present() {
     let s = schema();
     let mut buf = TxnBuffer::default();
-    buf.push(TID, &s, del(&s, 5), WireConflictMode::Update, 3);
-    buf.push(TID, &s, rows(&s, &[(5, 99, 1)]), WireConflictMode::Error, 3);
+    buf.push(TID, &s, del(&s, 5), WireConflictMode::Update, 3).unwrap();
+    buf.push(TID, &s, rows(&s, &[(5, 99, 1)]), WireConflictMode::Error, 3)
+        .unwrap();
     let committed = rows(&s, &[(5, 50, 1)]);
     let out = merged(&read(&s, ReadBound::None, None, false), committed, &mut buf);
     assert_eq!(contents(&s, &out), [(5, 99, 1)]);
@@ -86,8 +85,10 @@ fn a_delete_then_reinsert_is_present() {
 fn a_tid_scopes_its_ops() {
     let s = schema();
     let mut buf = TxnBuffer::default();
-    buf.push(TID, &s, rows(&s, &[(1, 10, 1)]), WireConflictMode::Update, 3);
-    buf.push(TID + 1, &s, rows(&s, &[(2, 20, 1)]), WireConflictMode::Update, 3);
+    buf.push(TID, &s, rows(&s, &[(1, 10, 1)]), WireConflictMode::Update, 3)
+        .unwrap();
+    buf.push(TID + 1, &s, rows(&s, &[(2, 20, 1)]), WireConflictMode::Update, 3)
+        .unwrap();
     let out = merged(&read(&s, ReadBound::None, None, false), ZSetBatch::new(&s), &mut buf);
     assert_eq!(contents(&s, &out), [(1, 10, 1)], "another tid's row stays out");
 }
@@ -96,7 +97,7 @@ fn a_tid_scopes_its_ops() {
 fn a_tombstone_drops_the_committed_row() {
     let s = schema();
     let mut buf = TxnBuffer::default();
-    buf.push(TID, &s, del(&s, 2), WireConflictMode::Update, 3);
+    buf.push(TID, &s, del(&s, 2), WireConflictMode::Update, 3).unwrap();
     let committed = rows(&s, &[(1, 10, 1), (2, 20, 1)]);
     let out = merged(&read(&s, ReadBound::None, None, false), committed, &mut buf);
     assert_eq!(contents(&s, &out), [(1, 10, 1)]);
@@ -112,7 +113,8 @@ fn a_pk_set_restricts_the_buffered_side_to_its_keys() {
         rows(&s, &[(1, 11, 1), (2, 22, 1)]),
         WireConflictMode::Update,
         3,
-    );
+    )
+    .unwrap();
     let keys = PkKeys::from_keys(s.pk_stride(), [s.opk_key_cols(&[1]).pk_bytes()]);
     let out = merged(
         &read(&s, ReadBound::PkSet(keys), None, false),
@@ -132,7 +134,8 @@ fn the_predicate_filters_buffered_rows() {
         rows(&s, &[(1, 10, 1), (2, 20, 1)]),
         WireConflictMode::Update,
         3,
-    );
+    )
+    .unwrap();
     let out = merged(
         &read(&s, ReadBound::None, Some("v > 15"), false),
         ZSetBatch::new(&s),
@@ -146,7 +149,8 @@ fn the_predicate_filters_buffered_rows() {
 fn a_keys_reply_appends_keys_only() {
     let s = schema();
     let mut buf = TxnBuffer::default();
-    buf.push(TID, &s, rows(&s, &[(3, 30, 1)]), WireConflictMode::Update, 3);
+    buf.push(TID, &s, rows(&s, &[(3, 30, 1)]), WireConflictMode::Update, 3)
+        .unwrap();
     let read = read(&s, ReadBound::None, None, true);
     let mut committed = ZSetBatch::new(&read.reply);
     committed.pks.push_natives(&read.reply, &[1]);
@@ -170,7 +174,6 @@ mod occ {
     use super::*;
     use crate::dml::mutate::{apply_set, bind_set_list, SetClause};
     use crate::test_support::parse_stmt;
-    use crate::SqlPlanner;
     use gnitz_core::{ClientError, GnitzClient, WireFault, WireStatus};
     use gnitz_test_harness::ServerHandle;
 
@@ -186,9 +189,12 @@ mod occ {
         let mut a = GnitzClient::connect(srv.sock_path()).unwrap();
         let b = GnitzClient::connect(srv.sock_path()).unwrap();
         a.create_schema("occ").unwrap();
-        SqlPlanner::new(&mut a, "occ")
-            .execute("CREATE TABLE t (pk BIGINT PRIMARY KEY, val BIGINT NOT NULL); INSERT INTO t VALUES (1, 0)")
-            .unwrap();
+        crate::execute(
+            &mut a,
+            "occ",
+            "CREATE TABLE t (pk BIGINT PRIMARY KEY, val BIGINT NOT NULL); INSERT INTO t VALUES (1, 0)",
+        )
+        .unwrap();
         let target = a.resolve_relation("occ", "t").unwrap();
         Fixture { _srv: srv, a, b, target }
     }

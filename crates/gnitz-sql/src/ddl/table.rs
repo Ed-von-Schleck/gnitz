@@ -2,7 +2,7 @@
 //! and CREATE INDEX. The compile side's only non-view surface.
 
 use crate::ast_util::{extract_index_name, extract_object_name, index_column_ident, simple_ident_expr};
-use crate::bind::{find_unique_column, probe, probe_relation};
+use crate::bind::{find_unique_column, Catalog};
 use crate::error::GnitzSqlError;
 use crate::types::column_def;
 use crate::validate::{
@@ -13,8 +13,7 @@ use crate::validate::{
 };
 use crate::SqlResult;
 use gnitz_core::{
-    CatalogSnapshot, ColType, ColumnDef, FkTarget, GnitzClient, InlineForeignKey, InlineUniqueIndex, Schema,
-    TableProps, TypeCode,
+    ColType, ColumnDef, FkTarget, GnitzClient, InlineForeignKey, InlineUniqueIndex, Schema, TableProps, TypeCode,
 };
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::TableDistribution;
@@ -173,14 +172,13 @@ fn resolve_fk_target_inline(
 /// child's type is compatible with the referenced column's and returns that
 /// type so the caller can widen the child column.
 fn resolve_fk_target(
-    cat: &CatalogSnapshot,
-    schema_name: &str,
+    cat: &Catalog<'_>,
     site: &FkSite<'_>,
     current_table_name: &str,
     current_cols: &[ColumnDef],
     current_pk_cols: &[u32],
 ) -> Result<(FkTarget, ColType), GnitzSqlError> {
-    let ref_table = extract_object_name(site.foreign_table, schema_name, "REFERENCES")?;
+    let ref_table = extract_object_name(site.foreign_table, cat.schema_name(), "REFERENCES")?;
 
     // Self-referencing FK: the table being created is not yet in the catalog,
     // so resolve the referenced column against the in-flight column list.
@@ -188,7 +186,7 @@ fn resolve_fk_target(
         return resolve_fk_target_inline(current_cols, current_pk_cols, &ref_table, site);
     }
 
-    let ref_rel = probe_relation(cat, schema_name, &ref_table)?;
+    let ref_rel = cat.probe_relation(&ref_table)?;
     let ref_schema = &ref_rel.schema;
     // The PK/UNIQUE tests below read only the schema, and both a view's and a
     // stream's PK look exactly like a base table's without being the unique, stored
@@ -444,7 +442,7 @@ fn name_unique_indexes(
     cols: &[ColumnDef],
     schema_name: &str,
     table_name: &str,
-) -> Result<Vec<(Vec<u32>, String)>, GnitzSqlError> {
+) -> Result<Vec<InlineUniqueIndex>, GnitzSqlError> {
     // Written names first: they are the fixed points auto-names route around.
     let mut taken: HashSet<String> = HashSet::new();
     for u in &unique {
@@ -467,39 +465,31 @@ fn name_unique_indexes(
                     name
                 }
             };
-            Ok((u.cols, name))
+            Ok(InlineUniqueIndex { col_indices: u.cols, name })
         })
         .collect()
 }
 
-/// What a `CREATE TABLE` statement asks the connection to do — the two shapes
-/// [`crate::ViewPlan`] carries, and for the same reason: `IF NOT EXISTS` tests
-/// the name, and a name already standing ends the statement.
-pub enum TablePlan {
-    /// Register the table and its inline unique indexes as one bundle.
-    Create {
-        name: String,
-        schema: Schema,
-        fks: Vec<InlineForeignKey>,
-        props: TableProps,
-        /// Each inline UNIQUE constraint's columns and the catalog name its index
-        /// takes — auto-names already disambiguated within the bundle.
-        unique_indexes: Vec<(Vec<u32>, String)>,
-    },
-    /// `IF NOT EXISTS`, and the name is taken: nothing to register. Carries the
-    /// id of the relation already standing there.
-    Skip { existing_id: u64 },
+/// A `CREATE TABLE`'s bundle: the table and its inline unique indexes.
+pub(crate) struct TablePlan {
+    pub(crate) name: String,
+    pub(crate) schema: Schema,
+    pub(crate) fks: Vec<InlineForeignKey>,
+    pub(crate) props: TableProps,
+    /// Each inline UNIQUE constraint's columns and the catalog name its index
+    /// takes — auto-names already disambiguated within the bundle.
+    pub(crate) unique_indexes: Vec<InlineUniqueIndex>,
 }
 
-/// Plan a `CREATE TABLE` into the bundle its commit writes: a pure function of
-/// `(create, cat)`, reaching no server. [`collect_declarations`] reads the
-/// statement; everything below it resolves, admits and names.
-pub fn plan_create_table(
+/// Plan a `CREATE TABLE` into the bundle its commit writes; `None` when
+/// `IF NOT EXISTS` finds the name taken. [`collect_declarations`] reads the statement; everything below it
+/// resolves, admits and names.
+pub(crate) fn plan_create_table(
     create: &sqlparser::ast::CreateTable,
-    cat: &CatalogSnapshot,
-    schema_name: &str,
-) -> Result<TablePlan, GnitzSqlError> {
+    cat: &Catalog<'_>,
+) -> Result<Option<TablePlan>, GnitzSqlError> {
     reject_unhonored_create_table_clauses(create)?;
+    let schema_name = cat.schema_name();
     let table_name = extract_object_name(&create.name, schema_name, "CREATE TABLE")?;
 
     // The `WITH (…)` keys and values are decidable from the statement's own text.
@@ -510,10 +500,8 @@ pub fn plan_create_table(
     // `IF NOT EXISTS` tests the NAME, not the definition — no dialect compares the
     // two — so any relation standing under it ends the statement, whatever its
     // kind. Probed only under the clause, so a plain CREATE TABLE resolves nothing.
-    if create.if_not_exists {
-        if let Some(rel) = probe(cat, schema_name, &table_name)? {
-            return Ok(TablePlan::Skip { existing_id: rel.tid });
-        }
+    if create.if_not_exists && cat.probe(&table_name)?.is_some() {
+        return Ok(None);
     }
 
     // The column cap is O(1) over the AST; the fold below is per column.
@@ -550,7 +538,7 @@ pub fn plan_create_table(
                 cols[site.col_idx].name
             )));
         }
-        let (fk, parent_pk_type) = resolve_fk_target(cat, schema_name, site, &table_name, &cols, &pk_indices)?;
+        let (fk, parent_pk_type) = resolve_fk_target(cat, site, &table_name, &cols, &pk_indices)?;
         fks.push(InlineForeignKey { col_idx: site.col_idx as u32, target: fk });
         cols[site.col_idx].ty = parent_pk_type;
     }
@@ -633,35 +621,24 @@ pub fn plan_create_table(
     props.validate(pk_indices.len()).map_err(GnitzSqlError::Unsupported)?;
 
     let unique_indexes = name_unique_indexes(unique, &cols, schema_name, &table_name)?;
-    Ok(TablePlan::Create {
+    Ok(Some(TablePlan {
         name: table_name,
         schema: Schema { columns: cols, pk_cols: pk_indices },
         fks,
         props,
         unique_indexes,
-    })
+    }))
 }
 /// Commit a planned `CREATE TABLE`: one bundle carrying the table, its columns
-/// and its inline unique indexes. A `Skip` answers with the id already standing
-/// under the name, since that is the name the caller asked to be taken.
+/// and its inline unique indexes.
 pub(crate) fn execute_create_table(
     client: &mut GnitzClient,
     schema_name: &str,
     plan: TablePlan,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let (name, schema, fks, props, unique_indexes) = match plan {
-        TablePlan::Skip { existing_id } => return Ok(SqlResult::TableCreated { table_id: existing_id }),
-        TablePlan::Create { name, schema, fks, props, unique_indexes } => (name, schema, fks, props, unique_indexes),
-    };
-    let unique_indexes: Vec<InlineUniqueIndex> = unique_indexes
-        .iter()
-        .map(|(col_indices, name)| InlineUniqueIndex {
-            col_indices: col_indices.as_slice(),
-            name: name.as_str(),
-        })
-        .collect();
-    let tid = client.create_table(schema_name, &name, &schema, &fks, props, &unique_indexes)?;
-    Ok(SqlResult::TableCreated { table_id: tid })
+    let TablePlan { name, schema, fks, props, unique_indexes } = plan;
+    client.create_table(schema_name, &name, &schema, &fks, props, &unique_indexes)?;
+    Ok(SqlResult::Ddl)
 }
 
 pub(crate) fn execute_drop(
@@ -695,7 +672,7 @@ pub(crate) fn execute_drop(
         ObjectType::Index => client.drop_indexes_by_name(&targets, if_exists)?,
         _ => client.drop_table(schema_name, &targets, if_exists)?,
     }
-    Ok(SqlResult::Dropped)
+    Ok(SqlResult::Ddl)
 }
 
 /// Which surface asked for the index, and the options only that surface can
@@ -801,15 +778,8 @@ pub(crate) fn create_index_core(
             // Index names are globally unique, so a name already standing — on
             // this table or any other — means this CREATE would fail; the clause
             // says skip it. Without it the collision errors in `create_index`.
-            if req.site.if_not_exists() {
-                let standing = client
-                    .index_rows()?
-                    .into_iter()
-                    .find(|(_, n, _)| n == &name)
-                    .map(|(id, _, _)| id);
-                if let Some(index_id) = standing {
-                    return Ok(SqlResult::IndexCreated { index_id });
-                }
+            if req.site.if_not_exists() && client.index_rows()?.iter().any(|(_, n, _)| n == &name) {
+                return Ok(SqlResult::Ddl);
             }
             name
         }
@@ -832,9 +802,8 @@ pub(crate) fn create_index_core(
         }
     };
 
-    let index_id = client.create_index(table_id, &col_indices, &col_types, &index_name, req.site.is_unique())?;
-
-    Ok(SqlResult::IndexCreated { index_id })
+    client.create_index(table_id, &col_indices, &index_name, req.site.is_unique())?;
+    Ok(SqlResult::Ddl)
 }
 
 #[cfg(test)]

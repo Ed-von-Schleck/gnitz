@@ -2,18 +2,17 @@
 //! each read shape plans to, what EXPLAIN says about it, and which reads are
 //! rejected before any request could be issued.
 
-use gnitz_core::{CatalogSnapshot, ClientError, RelClass, TypeCode, WireFault, WireStatus};
-use gnitz_sql::sqlparser::ast::Statement;
-use gnitz_sql::{explain_lines, GnitzSqlError};
+use crate::dml::explain_lines;
+use gnitz_core::{ClientError, RelClass, TypeCode, WireFault, WireStatus};
+use sqlparser::ast::Statement;
 
-mod pure;
-use pure::*;
+use super::*;
 
 /// `t(id U64 PK, v U64, w U64)` with an index on each of `v` and `w` — every
 /// access rung is reachable from it, and two indexes make their arbitration
 /// observable. `wide` carries a 128-bit indexed column, `c` a compound PK, `tv`
 /// is a view over `t`'s columns, and `tw` has a 128-bit payload column.
-fn cat() -> CatalogSnapshot {
+fn cat() -> Catalog<'static> {
     let u = TypeCode::U64;
     let tvw = || vec![col("id", u), col("v", u), col("w", u)];
     catalog(vec![
@@ -41,7 +40,7 @@ fn cat() -> CatalogSnapshot {
     ])
 }
 
-fn explain(cat: &CatalogSnapshot, sql: &str) -> Vec<String> {
+fn explain(cat: &Catalog<'static>, sql: &str) -> Vec<String> {
     explain_lines(
         &read(cat, &format!("EXPLAIN {sql}")).unwrap_or_else(|e| panic!("`{sql}`: {e:?}")),
         false,
@@ -574,16 +573,16 @@ fn a_reads_reply_schema_hides_the_source_pk_behind_the_select_list() {
 /// Reads rejected at plan time, each with the guard that owns it.
 #[test]
 fn a_read_the_planner_rejects_names_its_rule() {
-    let mut cat = cat();
+    let cat = cat();
     // A join view whose two sides both carry `id` and `val`.
     let l = table(30, vec![col("id", TypeCode::I64), col("val", TypeCode::I64)], vec![0]);
     let r = table(31, vec![col("id", TypeCode::I64), col("val", TypeCode::I64)], vec![0]);
-    cat.insert(SN, "l", Some(l));
-    cat.insert(SN, "r", Some(r));
+    cat.insert("l", Some(l));
+    cat.insert("r", Some(r));
     let jv = view(&cat, "SELECT * FROM l JOIN r ON l.val = r.val");
-    register(&mut cat, "jv", 32, &jv);
+    register(&cat, "jv", 32, jv.props.into(), final_view(&jv));
     let st = rel(33, RelClass::Stream, vec![col("id", TypeCode::I64)], vec![0], &[]);
-    cat.insert(SN, "st", Some(st));
+    cat.insert("st", Some(st));
 
     for (sql, variant, msg) in [
         // A query deriving a new relation is refused from the AST alone, naming
@@ -991,14 +990,13 @@ fn a_from_less_select_plans_a_constant_row() {
     }
 }
 
-// ── The resolve loop ─────────────────────────────────────────────────────────
+// ── Resolution ───────────────────────────────────────────────────────────────
 
-/// The loop resolves one name per distinct relation the planner asks for, none
-/// for a name only the AST mentions, and re-running a pass over the completed
-/// snapshot plans the identical circuit. A recorded absence is not-found, not a
-/// miss; a rejection raised before the first resolve costs nothing.
+/// A plan resolves one name per distinct relation it reads, and none for a name
+/// only the AST mentions. An absent name is not-found; a rejection raised before
+/// the first resolve costs nothing.
 #[test]
-fn the_loop_resolves_only_what_the_planner_asks_for() {
+fn a_plan_resolves_only_the_relations_it_reads() {
     let known = base();
     for (sql, want) in [
         ("SELECT id FROM t", vec!["t"]),
@@ -1018,17 +1016,12 @@ fn the_loop_resolves_only_what_the_planner_asks_for() {
             vec!["t", "u"],
         ),
     ] {
-        let stmt = parse(sql);
+        let stmt = parse_stmt(sql);
         match &stmt {
             Statement::CreateView(_) => {
-                let (looped, asked) = resolving(&known, |c| plan(c, sql));
-                let looped = looped.unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+                let (plan, asked) = resolving(&known, |c| plan(c, sql).map(|_| ()));
+                plan.unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
                 assert_eq!(asked, want, "`{sql}`");
-                let single = plan(&known, sql).unwrap();
-                assert_eq!(view_count(&looped), view_count(&single), "`{sql}`");
-                for (a, b) in all_views(&looped).zip(all_views(&single)) {
-                    assert_eq!(a.circuit, b.circuit, "`{sql}`");
-                }
             }
             _ => {
                 let (plan, asked) = resolving(&known, |c| read(c, sql).map(|_| ()));
@@ -1038,9 +1031,7 @@ fn the_loop_resolves_only_what_the_planner_asks_for() {
         }
     }
 
-    let mut absent = CatalogSnapshot::default();
-    absent.insert(SN, "t", None);
-    let e = err_of(read(&absent, "SELECT id FROM t"));
+    let e = err_of(read(&catalog(vec![]), "SELECT id FROM t"));
     assert!(
         matches!(
             e,
@@ -1054,50 +1045,12 @@ fn the_loop_resolves_only_what_the_planner_asks_for() {
         ("SELECT id FROM _seg4096", "Plan"),
         ("CREATE VIEW v AS SELECT * FROM _seg4096", "Plan"),
     ] {
-        let stmt = parse(sql);
+        let stmt = parse_stmt(sql);
         let (plan, asked) = resolving(&known, |c| match &stmt {
             Statement::CreateView(_) => plan(c, sql).map(|_| ()),
             _ => read(c, sql).map(|_| ()),
         });
         assert_eq!(variant_of(&err_of(plan)).0, variant, "`{sql}`");
         assert!(asked.is_empty(), "`{sql}` costs no resolve, asked: {asked:?}");
-    }
-}
-
-/// No statement shape lets a `CatalogMiss` or an `Internal` out of the loop —
-/// the shapes that reach a relation name only from a deep position, where a pass
-/// that forgot to report would surface as an invariant break instead.
-#[test]
-fn no_shape_leaks_a_control_signal_out_of_the_loop() {
-    let cat = base();
-    let bodies = [
-        "WITH c AS (SELECT id, v FROM t) SELECT c.id FROM c JOIN u ON c.id = u.id",
-        "WITH u AS (SELECT id, g, v FROM t) SELECT id FROM u",
-        "SELECT d.id FROM (SELECT id, v FROM t WHERE v > 2) d",
-        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.g = t.g)",
-        "SELECT id FROM t WHERE g IN (SELECT g FROM u)",
-        "SELECT id, (SELECT MAX(v) FROM u WHERE u.g = t.g) AS m FROM t",
-        "SELECT g FROM t UNION ALL SELECT g FROM u",
-        "SELECT t.id FROM t JOIN u ON t.g = u.g JOIN t AS t2 ON t2.id = t.id",
-        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM nope WHERE nope.g = t.g)",
-        "SELECT d.id FROM (SELECT id FROM nope) d",
-        "WITH c AS (SELECT id FROM nope) SELECT id FROM c",
-    ];
-    for body in bodies {
-        for sql in [
-            format!("CREATE VIEW vw AS {body}"),
-            format!("SELECT * FROM ({body}) x"),
-            format!("EXPLAIN {body}"),
-            body.to_string(),
-        ] {
-            let stmt = parse(&sql);
-            let (out, _) = resolving(&cat, |c| match &stmt {
-                Statement::CreateView(_) => plan(c, &sql).map(|_| ()),
-                _ => gnitz_sql::plan_read(&stmt, c, SN).map(|_| ()),
-            });
-            if let Err(e @ (GnitzSqlError::CatalogMiss(_) | GnitzSqlError::Internal(_))) = out {
-                panic!("`{sql}` leaked a control signal: {e:?}");
-            }
-        }
     }
 }

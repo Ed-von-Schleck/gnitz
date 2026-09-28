@@ -152,9 +152,8 @@ impl AsyncClient {
             .map(|r| r.into_multi())
     }
 
-    /// Describe one relation. Always a round trip — an async handle has no
-    /// statement bracket to scope a catalog snapshot to. On the surface because
-    /// every other verb takes a `tid` and nothing else here can produce one.
+    /// Describe one relation. Always a round trip. On the surface because every
+    /// other verb takes a `tid` and nothing else here can produce one.
     pub async fn resolve(&self, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
         let qname = qualified_name(schema_name, name);
         self.call(move |s| s.submit(Request::Resolve(RelTarget::Name(&qname))))

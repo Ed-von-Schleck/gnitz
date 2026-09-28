@@ -2,10 +2,8 @@
 //! Each test is one guard family as a table of `(sql, variant, substring)`:
 //! the substring names the rule, never the sentence.
 
-mod pure;
-
-use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, RelClass, TypeCode, PK_LIST_MAX_COLS};
-use pure::*;
+use super::*;
+use gnitz_core::{ColType, ColumnDef, RelClass, TypeCode, PK_LIST_MAX_COLS};
 
 /// [`base`] plus the shapes the rejections need: `w` (a second typed table),
 /// `m` (integer and float payloads for grouped bodies), `p3` (a three-column
@@ -13,9 +11,9 @@ use pure::*;
 /// columns each), `st` (a stream), `x` (a DATE and two DECIMAL columns beside an
 /// integer, a float and a string), `tt` (a TIMESTAMP), and two join views over duplicated names —
 /// `jv`, where `id` and `v` each appear twice, and `ju`, where only `v` does.
-fn cat() -> CatalogSnapshot {
+fn cat() -> Catalog<'static> {
     let i = TypeCode::I64;
-    let mut cat = base();
+    let cat = base();
     let keys = || (0..=PK_LIST_MAX_COLS).map(|n| col(&format!("c{n}"), i)).collect();
     let wide = || {
         let mut cols = vec![col("id", i), col("fk", i)];
@@ -96,17 +94,17 @@ fn cat() -> CatalogSnapshot {
             ),
         ),
     ] {
-        cat.insert(SN, name, Some(desc));
+        cat.insert(name, Some(desc));
     }
     let jv = view(&cat, "SELECT * FROM t JOIN u ON t.v = u.v");
-    register(&mut cat, "jv", 47, &jv);
+    register(&cat, "jv", 47, jv.props.into(), final_view(&jv));
     let ju = view(&cat, "SELECT * FROM t JOIN c ON t.v = c.v");
-    register(&mut cat, "ju", 48, &ju);
+    register(&cat, "ju", 48, ju.props.into(), final_view(&ju));
     cat
 }
 
 /// Assert each `(body, variant, substring)` row rejects as `CREATE VIEW v AS body`.
-fn rejects(cat: &CatalogSnapshot, rows: &[(&str, &str, &str)]) {
+fn rejects(cat: &Catalog<'static>, rows: &[(&str, &str, &str)]) {
     for (body, variant, needle) in rows {
         assert_rejects(body, plan(cat, &format!("CREATE VIEW v AS {body}")), variant, needle);
     }
@@ -770,11 +768,11 @@ fn top_n_rules() {
 
 #[test]
 fn ambiguous_and_hidden_column_rules() {
-    let mut cat = cat();
+    let cat = cat();
     // A merged name is one column, so a third step can pair with it.
     view(&cat, "SELECT t.id AS x FROM t JOIN u USING (v) JOIN a USING (v)");
     let sv = view(&cat, "SELECT v FROM t");
-    register(&mut cat, "sv", 50, &sv);
+    register(&cat, "sv", 50, sv.props.into(), final_view(&sv));
     rejects(
         &cat,
         &[

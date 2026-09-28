@@ -4,8 +4,7 @@
 
 use gnitz_core::{RelClass, TypeCode, PK_LIST_MAX_COLS};
 
-mod pure;
-use pure::*;
+use super::*;
 
 type Shape = Vec<(String, bool, bool)>;
 
@@ -15,12 +14,12 @@ fn sh(cols: &[(&str, bool, bool)]) -> Shape {
 }
 
 /// The final view's PK column set.
-fn pk(chain: &gnitz_sql::PlannedChain) -> Vec<u32> {
+fn pk(chain: &PlannedChain) -> Vec<u32> {
     final_view(chain).schema.pk_cols.clone()
 }
 
 /// The final view's output type codes.
-fn types(chain: &gnitz_sql::PlannedChain) -> Vec<TypeCode> {
+fn types(chain: &PlannedChain) -> Vec<TypeCode> {
     final_view(chain).schema.columns.iter().map(|c| c.ty.tc).collect()
 }
 
@@ -147,7 +146,7 @@ fn a_projection_places_the_source_pk_first() {
 #[test]
 fn a_view_over_a_compound_pk_view_keeps_its_pk() {
     let i = TypeCode::I64;
-    let mut cat = catalog(vec![(
+    let cat = catalog(vec![(
         "base",
         table(
             30,
@@ -157,7 +156,7 @@ fn a_view_over_a_compound_pk_view_keeps_its_pk() {
     )]);
     let v1 = view(&cat, "SELECT b, c, a FROM base");
     assert_eq!(pk(&v1), [0, 1]);
-    register(&mut cat, "v1", 40, &v1);
+    register(&cat, "v1", 40, v1.props.into(), final_view(&v1));
     let v2 = view(&cat, "SELECT a, b FROM v1");
     assert_eq!(output_shape(&v2), sh(&[("a", false, false), ("b", false, false)]));
     assert_eq!(pk(&v2), [0, 1]);
@@ -621,7 +620,7 @@ fn an_aggregate_output_column_is_typed_by_its_argument_and_grouping() {
 fn a_join_view_is_keyed_on_its_join_key() {
     let i = TypeCode::I64;
     let key_cols = |n: usize| (0..n).map(|k| col(&format!("c{k}"), i)).collect::<Vec<_>>();
-    let mut cat = catalog(vec![
+    let cat = catalog(vec![
         ("a32", table(30, vec![col("id", i), col("fk", TypeCode::U32)], vec![0])),
         ("a8", table(31, vec![col("id", i), col("fk", TypeCode::U8)], vec![0])),
         ("a64", table(32, vec![col("id", i), col("fk", TypeCode::U64)], vec![0])),
@@ -655,7 +654,7 @@ fn a_join_view_is_keyed_on_its_join_key() {
         ("pq", table(48, vec![col("id", i), col("p", i), col("q", i)], vec![0])),
     ]);
     let uv = view(&cat, "SELECT k, lo FROM t1 UNION ALL SELECT k, lo FROM t2");
-    register(&mut cat, "uv", 60, &uv);
+    register(&cat, "uv", 60, uv.props.into(), final_view(&uv));
     let on = (0..PK_LIST_MAX_COLS)
         .map(|k| format!("ka.c{k} = kb.c{k}"))
         .collect::<Vec<_>>()
@@ -862,8 +861,8 @@ fn a_collision_segment_keeps_only_its_live_columns() {
 /// one, so the leaf rule can be planned against it.
 #[test]
 fn a_registered_bounded_view_carries_its_class() {
-    let mut cat = base();
+    let cat = base();
     let bounded = plan(&cat, "CREATE VIEW v WITH (capacity = '1 MB') AS SELECT id, v FROM t").unwrap();
-    register(&mut cat, "bnd", 60, &bounded);
-    assert_eq!(cat.get(SN, "bnd").flatten().unwrap().class, RelClass::BoundedView);
+    register(&cat, "bnd", 60, bounded.props.into(), final_view(&bounded));
+    assert_eq!(cat.probe("bnd").unwrap().unwrap().class, RelClass::BoundedView);
 }

@@ -74,7 +74,7 @@ fn index_key_type_pins_the_whole_promotion_map() {
     for &tc in TypeCode::ALL {
         match map.iter().find(|&&(src, _)| src == tc) {
             Some(&(_, want)) => {
-                assert_eq!(index_key_type(tc), Ok(want), "tc={tc}");
+                assert_eq!(index_key_type(tc), Some(want), "tc={tc}");
                 // The promoted slot must hold every value of the source: a
                 // promotion may widen or rename, never narrow or cross sign.
                 assert!(
@@ -82,12 +82,12 @@ fn index_key_type_pins_the_whole_promotion_map() {
                     "tc={tc}: the promoted key {want} cannot hold it",
                 );
             }
-            None => assert!(index_key_type(tc).is_err(), "tc={tc} must be index-ineligible"),
+            None => assert!(index_key_type(tc).is_none(), "tc={tc} must be index-ineligible"),
         }
     }
     // I128 is PK-eligible (produced only as a cross-sign equijoin `_join_pk`)
     // yet has no index promotion — the one type on both sides of that line.
-    assert!(T::I128.is_pk_eligible() && index_key_type(T::I128).is_err());
+    assert!(T::I128.is_pk_eligible() && index_key_type(T::I128).is_none());
 }
 
 /// A SERIAL key is exactly the plain integers of at most 8 bytes: not a DATE's

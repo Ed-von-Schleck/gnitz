@@ -1,6 +1,6 @@
 use super::*;
 use crate::bind::structural::bind_constant;
-use crate::test_support::{col_def, num_expr, uuid_schema_payload, uuid_str_expr};
+use crate::test_support::{ncol, num_expr, uuid_schema_payload, uuid_str_expr};
 use sqlparser::ast::Expr;
 
 /// The lone UUID cell of a column region, from its 16 LE bytes.
@@ -11,7 +11,7 @@ fn uuid_cell(col: &[u8]) -> u128 {
 /// Encode one written constant into a fresh column region, the way INSERT does.
 fn encoded(tc: TypeCode, e: &Expr) -> Result<Vec<u8>, GnitzSqlError> {
     let mut col = Vec::new();
-    append_value_to_col(&mut col, &mut Vec::new(), &col_def("c", tc, true), &bind_constant(e)?)?;
+    append_value_to_col(&mut col, &mut Vec::new(), &ncol("c", tc), &bind_constant(e)?)?;
     Ok(col)
 }
 
@@ -36,7 +36,7 @@ fn a_null_cell_is_a_zeroed_cell_of_the_type_stride() {
         append_value_to_col(
             &mut col,
             &mut blob,
-            &col_def("c", tc, true),
+            &ncol("c", tc),
             &bind_constant(&expr("NULL")).unwrap(),
         )
         .unwrap();

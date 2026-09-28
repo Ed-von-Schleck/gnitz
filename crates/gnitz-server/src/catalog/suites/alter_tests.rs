@@ -4,7 +4,7 @@
 //! exercised with names longer than 12 bytes so the German-string blob heap is on
 //! the CAS path, and the id-only directory resume
 //! across a reopen. The end-to-end SQL surface is in
-//! `crates/gnitz-sql/tests/planner_alter.rs`.
+//! `crates/gnitz-sql/tests/engine_ddl.rs`.
 
 use super::*;
 use gnitz_wire::{RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX};

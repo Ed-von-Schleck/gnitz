@@ -8,5 +8,6 @@ mod alter;
 mod table;
 
 pub(crate) use alter::execute_alter_table;
-pub(crate) use table::{execute_create_index, execute_create_table, execute_drop};
-pub use table::{plan_create_table, TablePlan};
+#[cfg(test)]
+pub(crate) use table::TablePlan;
+pub(crate) use table::{execute_create_index, execute_create_table, execute_drop, plan_create_table};

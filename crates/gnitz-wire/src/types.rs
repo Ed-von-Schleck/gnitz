@@ -467,24 +467,19 @@ pub fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], tc: Type
 /// signed ≤8-byte integer (I8..I64) to `I64`, and a temporal or decimal type as
 /// its storage integer does — so a `DATE` index key is the exercised 8-byte
 /// signed one, not the only 4-byte key in the system; `U128`/`UUID` keep their
-/// 16-byte width; STRING/BLOB/float/I128 are index-ineligible and return `Err`.
+/// 16-byte width; STRING/BLOB/float/I128 are index-ineligible and return `None`.
 /// Signed columns keep a *signed* promoted type so the OPK leading key is
 /// order-preserving (`encode_pk_column` sign-flips only signed types);
 /// `wire_stride(I64) == wire_stride(U64) == 8`, so the sign the promotion picks
-/// never moves the index record's arity or stride. The single source of truth
-/// for index-key promotion, shared by the engine's `make_index_schema` and the
-/// SQL planner's CREATE INDEX limit pre-check so the nice SQL error and the
-/// engine backstop can never disagree on a column's promoted width.
-pub fn index_key_type(field_type: TypeCode) -> Result<TypeCode, String> {
+/// never moves the index record's arity or stride.
+pub fn index_key_type(field_type: TypeCode) -> Option<TypeCode> {
     use TypeCode as T;
     match field_type.storage_type() {
-        T::U128 => Ok(T::U128),
-        T::UUID => Ok(T::UUID),
-        T::U64 | T::U32 | T::U16 | T::U8 => Ok(T::U64),
-        T::I64 | T::I32 | T::I16 | T::I8 => Ok(T::I64),
-        T::F32 | T::F64 | T::String | T::Blob | T::I128 | T::Date | T::Timestamp | T::Decimal => {
-            Err(format!("Secondary index on column type {field_type} not supported"))
-        }
+        T::U128 => Some(T::U128),
+        T::UUID => Some(T::UUID),
+        T::U64 | T::U32 | T::U16 | T::U8 => Some(T::U64),
+        T::I64 | T::I32 | T::I16 | T::I8 => Some(T::I64),
+        T::F32 | T::F64 | T::String | T::Blob | T::I128 | T::Date | T::Timestamp | T::Decimal => None,
     }
 }
 
@@ -505,8 +500,8 @@ pub fn index_key_types(
     let mut promoted: Vec<TypeCode> = Vec::with_capacity(col_types.len());
     for (col, &t) in col_types.iter().enumerate() {
         // Indexed by position, so the layer above can name the SQL column that
-        // failed; `index_key_type`'s own string says only the type code.
-        let p = index_key_type(t).map_err(|_| IndexKeyRule::NotEligible { col, type_code: t })?;
+        // failed.
+        let p = index_key_type(t).ok_or(IndexKeyRule::NotEligible { col, type_code: t })?;
         promoted.push(p);
     }
     let n = promoted.len();

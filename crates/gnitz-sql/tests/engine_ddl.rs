@@ -23,11 +23,11 @@ fn unique_on(client: &mut GnitzClient, sn: &str, table: &str, col: &str) -> Opti
         .map(|m| m.is_unique)
 }
 
-/// Assert `sql` returns `Altered { object, name }`.
-fn assert_altered(client: &mut GnitzClient, sn: &str, sql: &str, object: &str, name: &str) {
+/// Assert `sql` returns `Ddl`.
+fn assert_ddl(client: &mut GnitzClient, sn: &str, sql: &str) {
     match try_exec(client, sn, sql).unwrap().pop().unwrap() {
-        SqlResult::Altered { object: o, name: n } => assert_eq!((o.as_str(), n.as_str()), (object, name), "`{sql}`"),
-        other => panic!("`{sql}`: expected Altered, got {other:?}"),
+        SqlResult::Ddl => {}
+        other => panic!("`{sql}`: expected Ddl, got {other:?}"),
     }
 }
 
@@ -431,7 +431,7 @@ fn alter_results_and_if_exists_no_ops() {
     );
     exec(&mut client, &sn, "CREATE VIEW vw AS SELECT id, v FROM t WHERE v >= 20");
 
-    assert_altered(&mut client, &sn, "ALTER TABLE t RENAME TO t2", "table", "t2");
+    assert_ddl(&mut client, &sn, "ALTER TABLE t RENAME TO t2");
     assert_rejects_variant(&mut client, &sn, "SELECT * FROM t", "Exec", "not found");
     assert_eq!(
         view_rows(&mut client, &sn, "t2", &["id", "v"]),
@@ -439,21 +439,14 @@ fn alter_results_and_if_exists_no_ops() {
     );
     // RENAME COLUMN is allowed under a dependent view: views bind columns by
     // ordinal.
-    assert_altered(&mut client, &sn, "ALTER TABLE t2 RENAME COLUMN v TO w", "column", "w");
+    assert_ddl(&mut client, &sn, "ALTER TABLE t2 RENAME COLUMN v TO w");
     assert_eq!(
         visible_names(&read_sql(&mut client, &sn, "SELECT * FROM t2").0),
         ["id", "w", "a", "b"]
     );
-    assert_altered(&mut client, &sn, "ALTER TABLE vw RENAME TO vw2", "view", "vw2");
+    assert_ddl(&mut client, &sn, "ALTER TABLE vw RENAME TO vw2");
 
-    match try_exec(&mut client, &sn, "ALTER TABLE t2 ADD CONSTRAINT uq UNIQUE (b)")
-        .unwrap()
-        .pop()
-        .unwrap()
-    {
-        SqlResult::IndexCreated { .. } => {}
-        other => panic!("ADD CONSTRAINT UNIQUE returns IndexCreated, got {other:?}"),
-    }
+    assert_ddl(&mut client, &sn, "ALTER TABLE t2 ADD CONSTRAINT uq UNIQUE (b)");
     assert_rejects_variant(
         &mut client,
         &sn,
@@ -461,29 +454,17 @@ fn alter_results_and_if_exists_no_ops() {
         "Exec",
         "Unique index violation",
     );
-    assert_altered(
-        &mut client,
-        &sn,
-        "ALTER TABLE t2 DROP CONSTRAINT uq",
-        "constraint",
-        "uq",
-    );
+    assert_ddl(&mut client, &sn, "ALTER TABLE t2 DROP CONSTRAINT uq");
     exec(&mut client, &sn, "INSERT INTO t2 VALUES (4, 40, 4, 100)");
 
-    assert_altered(
-        &mut client,
-        &sn,
-        "ALTER VIEW vw2 AS SELECT id, w FROM t2 WHERE w >= 30",
-        "view",
-        "vw2",
-    );
+    assert_ddl(&mut client, &sn, "ALTER VIEW vw2 AS SELECT id, w FROM t2 WHERE w >= 30");
     assert_eq!(
         view_rows(&mut client, &sn, "vw2", &["id", "w"]),
         at_weight_one(&[vec![3, 30], vec![4, 40]])
     );
     exec(&mut client, &sn, "DROP VIEW vw2");
 
-    assert_altered(&mut client, &sn, "ALTER TABLE t2 DROP COLUMN b", "column", "b");
+    assert_ddl(&mut client, &sn, "ALTER TABLE t2 DROP COLUMN b");
     assert_eq!(
         visible_names(&read_sql(&mut client, &sn, "SELECT * FROM t2").0),
         ["id", "w", "a"]
@@ -500,13 +481,7 @@ fn alter_results_and_if_exists_no_ops() {
     );
     assert_rejects_variant(&mut client, &sn, "SELECT b FROM t2", "Bind", "not found");
 
-    assert_altered(
-        &mut client,
-        &sn,
-        "ALTER TABLE t2 ALTER COLUMN a DROP NOT NULL",
-        "column",
-        "a",
-    );
+    assert_ddl(&mut client, &sn, "ALTER TABLE t2 ALTER COLUMN a DROP NOT NULL");
     exec(&mut client, &sn, "INSERT INTO t2 VALUES (6, 60, NULL)");
     assert_eq!(
         rows(&mut client, &sn, "SELECT id FROM t2 WHERE a IS NULL", &["id"]),
@@ -519,7 +494,7 @@ fn alter_results_and_if_exists_no_ops() {
         &sn,
         "CREATE VIEW bv WITH (capacity = '1 MB') AS SELECT id, w FROM t2",
     );
-    assert_altered(&mut client, &sn, "ALTER TABLE bv RENAME TO bv2", "view", "bv2");
+    assert_ddl(&mut client, &sn, "ALTER TABLE bv RENAME TO bv2");
     assert_rejects_variant(
         &mut client,
         &sn,
@@ -528,17 +503,13 @@ fn alter_results_and_if_exists_no_ops() {
         "capacity-bounded",
     );
 
-    for (sql, object, name) in [
-        ("ALTER TABLE IF EXISTS nope RENAME TO x", "table", "x"),
-        ("ALTER TABLE IF EXISTS nope DROP COLUMN a", "column", "a"),
-        (
-            "ALTER TABLE IF EXISTS nope ADD CONSTRAINT cq UNIQUE (v)",
-            "constraint",
-            "cq",
-        ),
-        ("ALTER TABLE t2 DROP CONSTRAINT IF EXISTS nope", "constraint", "nope"),
+    for sql in [
+        "ALTER TABLE IF EXISTS nope RENAME TO x",
+        "ALTER TABLE IF EXISTS nope DROP COLUMN a",
+        "ALTER TABLE IF EXISTS nope ADD CONSTRAINT cq UNIQUE (v)",
+        "ALTER TABLE t2 DROP CONSTRAINT IF EXISTS nope",
     ] {
-        assert_altered(&mut client, &sn, sql, object, name);
+        assert_ddl(&mut client, &sn, sql);
     }
 }
 

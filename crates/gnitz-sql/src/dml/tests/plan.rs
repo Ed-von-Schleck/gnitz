@@ -1,6 +1,6 @@
 use super::*;
 use crate::expr_lower::compile_wire_conjuncts;
-use crate::test_support::{bind_where, col_def, idx_metas_flagged, pk_schema, two_col};
+use crate::test_support::{bind_where, col, idx_metas_flagged, pk_schema, two_col};
 use gnitz_core::TypeCode;
 
 /// The plan for `where_expr` against `lists` (the table's indexes).
@@ -139,9 +139,9 @@ fn a_pk_bound_yields_only_to_a_unique_index_point() {
     // bets on the `CLUSTER BY` unicast rather than measuring it.
     let compound = Schema {
         columns: vec![
-            col_def("tenant", TypeCode::U64, false),
-            col_def("id", TypeCode::U64, false),
-            col_def("email", TypeCode::U64, false),
+            col("tenant", TypeCode::U64),
+            col("id", TypeCode::U64),
+            col("email", TypeCode::U64),
         ],
         pk_cols: vec![0, 1],
     };
@@ -166,9 +166,9 @@ fn an_index_walk_ships_only_its_residual() {
     // which would otherwise take the PK-range rung ahead of any index.
     let narrow = Schema {
         columns: vec![
-            col_def("id", TypeCode::U64, false),
-            col_def("v", TypeCode::U64, false),
-            col_def("w", TypeCode::U64, false),
+            col("id", TypeCode::U64),
+            col("v", TypeCode::U64),
+            col("w", TypeCode::U64),
         ],
         pk_cols: vec![0],
     };
@@ -214,10 +214,7 @@ fn an_uncompilable_pk_residual_falls_through_to_the_index() {
 #[test]
 fn an_unsupported_residual_reports_the_best_candidates_blocker() {
     let schema = Schema {
-        columns: vec![
-            col_def("id", TypeCode::U128, false),
-            col_def("name", TypeCode::String, false),
-        ],
+        columns: vec![col("id", TypeCode::U128), col("name", TypeCode::String)],
         pk_cols: vec![0],
     };
     let where_expr = bind_where("id = 7 AND name + 1 > 0", &schema);
@@ -231,21 +228,13 @@ fn an_unsupported_residual_reports_the_best_candidates_blocker() {
     assert_eq!(err.to_string(), want.to_string());
 }
 
-/// `rows_reply` over `sql` against `schema`, read as relation `t`.
-fn rows_reply_of(sql: &str, schema: &Arc<Schema>) -> RowsReply {
+/// `rows_reply` over `sql` against `desc`, read as relation `t`.
+fn rows_reply_of(sql: &str, desc: &Arc<RelDescriptor>) -> RowsReply {
     let q = crate::test_support::parse_query(sql);
     let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() else {
         panic!("`{sql}` is not a plain SELECT");
     };
-    let desc = Arc::new(gnitz_core::RelDescriptor {
-        tid: 1,
-        class: gnitz_core::RelClass::Table,
-        pk_repeats: false,
-        serial: false,
-        schema: Arc::clone(schema),
-        indexes: Vec::new(),
-    });
-    rows_reply(&sel.projection, q.order_by.as_ref(), &desc, "t").unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
+    rows_reply(&sel.projection, q.order_by.as_ref(), desc, "t").unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
 }
 
 /// A projection reproducing the relation replies in its layout with no program, ORDER BY
@@ -253,12 +242,8 @@ fn rows_reply_of(sql: &str, schema: &Arc<Schema>) -> RowsReply {
 #[test]
 fn only_a_reproducing_projection_ships_no_map() {
     let u = TypeCode::U64;
-    let schema = |cols: [&str; 3], pk: u32| {
-        Arc::new(Schema {
-            columns: cols.iter().map(|n| col_def(n, u, false)).collect(),
-            pk_cols: vec![pk],
-        })
-    };
+    let schema =
+        |cols: [&str; 3], pk: u32| crate::test_support::table(1, cols.iter().map(|n| col(n, u)).collect(), vec![pk]);
     let t = schema(["id", "v", "w"], 0);
     for (sql, keys) in [
         ("SELECT * FROM t", vec![]),
@@ -266,13 +251,13 @@ fn only_a_reproducing_projection_ships_no_map() {
         ("SELECT * FROM t ORDER BY w", vec![2u16]),
     ] {
         let RowsReply { schema: reply, program, order } = rows_reply_of(sql, &t);
-        assert!(Arc::ptr_eq(&reply, &t), "`{sql}`: the source schema itself");
+        assert!(Arc::ptr_eq(&reply, &t.schema), "`{sql}`: the source schema itself");
         assert!(program.is_none(), "`{sql}`");
         assert_eq!(order.iter().map(|k| k.col).collect::<Vec<_>>(), keys, "`{sql}`");
     }
     let mid = schema(["v", "id", "w"], 1);
     let RowsReply { schema: reply, program, order } = rows_reply_of("SELECT * FROM t ORDER BY id", &mid);
-    assert!(Arc::ptr_eq(&reply, &mid) && program.is_none());
+    assert!(Arc::ptr_eq(&reply, &mid.schema) && program.is_none());
     assert_eq!(order.iter().map(|k| k.col).collect::<Vec<_>>(), [1u16]);
     for sql in [
         "SELECT v, id, w FROM t",
@@ -283,6 +268,6 @@ fn only_a_reproducing_projection_ships_no_map() {
     ] {
         let RowsReply { schema: reply, program, .. } = rows_reply_of(sql, &t);
         assert!(program.is_some(), "`{sql}`");
-        assert!(!Arc::ptr_eq(&reply, &t), "`{sql}`");
+        assert!(!Arc::ptr_eq(&reply, &t.schema), "`{sql}`");
     }
 }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{
-    col_def, compound_schema_u64_u64, extract_pk_value, neg_num_expr, num_expr, parse_expr_sql, pk_schema, two_col,
+    col, compound_schema_u64_u64, extract_pk_value, ncol, neg_num_expr, num_expr, parse_expr_sql, pk_schema, two_col,
     uuid_schema_pk, uuid_str_expr,
 };
 use gnitz_core::TypeCode;
@@ -115,10 +115,10 @@ fn insert_omitting_the_pk_is_rejected_by_the_pk_plan() {
 fn compound_schema_u64_u64_u128() -> Schema {
     Schema {
         columns: vec![
-            col_def("a", TypeCode::U64, false),
-            col_def("b", TypeCode::U64, false),
-            col_def("c", TypeCode::U128, false),
-            col_def("v", TypeCode::I64, true),
+            col("a", TypeCode::U64),
+            col("b", TypeCode::U64),
+            col("c", TypeCode::U128),
+            ncol("v", TypeCode::I64),
         ],
         pk_cols: vec![0, 1, 2],
     }

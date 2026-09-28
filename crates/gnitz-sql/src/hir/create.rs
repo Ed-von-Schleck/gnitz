@@ -2,7 +2,7 @@
 //! HIR pipeline — the CTE phase (`hir::bind::bind_ctes`) and then
 //! `bind_and_lower` of the body — into a view bundle committed atomically.
 
-use crate::bind::{apply_positional_aliases, probe, probe_relation};
+use crate::bind::{apply_positional_aliases, Catalog};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::bind::ViewBody;
 use crate::validate::{
@@ -10,7 +10,7 @@ use crate::validate::{
     QueryEnvelope,
 };
 use crate::SqlResult;
-use gnitz_core::{CatalogSnapshot, GnitzClient, RelClass, ViewBundle, ViewProps};
+use gnitz_core::{GnitzClient, RelClass, ViewBundle, ViewProps};
 use sqlparser::ast::{CreateTableOptions, CreateView, Ident, ObjectName, Query, Value, ValueWithSpan};
 use std::sync::Arc;
 
@@ -69,36 +69,29 @@ fn parse_size(option: &str, text: &str) -> Result<u64, GnitzSqlError> {
     }
 }
 
-/// What a `CREATE VIEW` statement asks the connection to do.
-pub enum ViewPlan {
-    /// Register `chain`, superseding the view that already holds its name when
-    /// `replace` says so.
-    Create { chain: PlannedChain, replace: bool },
-    /// As [`crate::TablePlan::Skip`].
-    Skip { existing_id: u64 },
+/// A planned view: its segment bundle, and the view it supersedes.
+pub(crate) struct PlannedChain {
+    pub(crate) name: String,
+    pub(crate) bundle: ViewBundle,
+    pub(crate) props: ViewProps,
+    /// The id of the view this chain replaces, retracted in the same bundle.
+    pub(crate) replacing: Option<u64>,
 }
 
-/// A planned view: its segment bundle.
-pub struct PlannedChain {
-    pub name: String,
-    pub bundle: ViewBundle,
-    pub props: ViewProps,
-}
-
-/// Plan a `CREATE VIEW`: a pure function of `(cv, cat)`, reaching no server.
-pub fn plan_create_view(cv: &CreateView, cat: &CatalogSnapshot, schema_name: &str) -> Result<ViewPlan, GnitzSqlError> {
+/// Plan a `CREATE VIEW`; `None` when `IF NOT EXISTS` finds the name taken.
+pub(crate) fn plan_create_view(cv: &CreateView, cat: &Catalog<'_>) -> Result<Option<PlannedChain>, GnitzSqlError> {
     reject_unhonored_create_view_clauses(cv)?;
-    let view_name = crate::ast_util::extract_object_name(&cv.name, schema_name, "CREATE VIEW")?;
+    let view_name = crate::ast_util::extract_object_name(&cv.name, cat.schema_name(), "CREATE VIEW")?;
 
     // Each clause tests the name alone: a view's catalog rows hold its circuit, not its text.
     let replacing = if cv.if_not_exists {
         // Any relation under the name ends the statement, whatever its kind.
-        if let Some(rel) = probe(cat, schema_name, &view_name)? {
-            return Ok(ViewPlan::Skip { existing_id: rel.tid });
+        if cat.probe(&view_name)?.is_some() {
+            return Ok(None);
         }
         None
     } else if cv.or_replace {
-        match probe(cat, schema_name, &view_name)? {
+        match cat.probe(&view_name)? {
             Some(rel) => {
                 require_class(&rel, &view_name, ClassWant::View, "CREATE OR REPLACE VIEW")?;
                 Some(rel.tid)
@@ -113,41 +106,46 @@ pub fn plan_create_view(cv: &CreateView, cat: &CatalogSnapshot, schema_name: &st
     let props = decode_view_options(&cv.options)?;
     let view = ViewBody { stmt: "CREATE VIEW", replacing };
     let aliases = cv.columns.iter().map(|c| &c.name);
-    let bundle = plan_segments(cat, schema_name, view, &cv.query, aliases, props)?;
-    Ok(ViewPlan::Create {
-        chain: PlannedChain { name: view_name, bundle, props },
-        replace: replacing.is_some(),
-    })
+    let bundle = plan_segments(cat, view, &cv.query, aliases, props)?;
+    Ok(Some(PlannedChain {
+        name: view_name,
+        bundle,
+        props,
+        replacing,
+    }))
 }
 
 /// Plan an `ALTER VIEW <name> [(columns)] AS <query>`: the chain that replaces the
 /// view under a fresh id.
-pub fn plan_alter_view(
+pub(crate) fn plan_alter_view(
     name: &ObjectName,
     columns: &[Ident],
     query: &Query,
     with_options: &[sqlparser::ast::SqlOption],
-    cat: &CatalogSnapshot,
-    schema_name: &str,
+    cat: &Catalog<'_>,
 ) -> Result<PlannedChain, GnitzSqlError> {
     // Only `CREATE OR REPLACE VIEW` states a view's options.
     reject_if(!with_options.is_empty(), "ALTER VIEW", "WITH options")?;
-    let view_name = crate::ast_util::extract_object_name(name, schema_name, "ALTER VIEW")?;
-    let old_vid = resolve_view_id(cat, schema_name, &view_name)?;
+    let view_name = crate::ast_util::extract_object_name(name, cat.schema_name(), "ALTER VIEW")?;
+    let old_vid = resolve_view_id(cat, &view_name)?;
     let view = ViewBody {
         stmt: "ALTER VIEW",
         replacing: Some(old_vid),
     };
     let props = ViewProps::Plain;
-    let bundle = plan_segments(cat, schema_name, view, query, columns.iter(), props)?;
-    Ok(PlannedChain { name: view_name, bundle, props })
+    let bundle = plan_segments(cat, view, query, columns.iter(), props)?;
+    Ok(PlannedChain {
+        name: view_name,
+        bundle,
+        props,
+        replacing: Some(old_vid),
+    })
 }
 
 /// Compile a view body to its segment bundle, the user-named view's visible
 /// output columns renamed by `aliases`.
 fn plan_segments<'a>(
-    cat: &CatalogSnapshot,
-    schema_name: &str,
+    cat: &Catalog<'_>,
     view: ViewBody,
     query: &Query,
     aliases: impl ExactSizeIterator<Item = &'a Ident>,
@@ -155,7 +153,7 @@ fn plan_segments<'a>(
 ) -> Result<ViewBundle, GnitzSqlError> {
     reject_unhonored_query_clauses(query, QueryEnvelope::WithAndTail, view.stmt)?;
     let bounded = matches!(props, ViewProps::Bounded { .. });
-    let mut bundle = crate::hir::bind_and_lower(cat, schema_name, query, view, bounded)?;
+    let mut bundle = crate::hir::bind_and_lower(cat, query, view, bounded)?;
     apply_positional_aliases(
         aliases,
         Arc::make_mut(&mut bundle.view.schema).columns.iter_mut(),
@@ -164,36 +162,19 @@ fn plan_segments<'a>(
     Ok(bundle)
 }
 
-/// Commit a planned `CREATE VIEW`; a skip answers with the id standing under the name.
-pub(crate) fn execute_create_view(
-    client: &mut GnitzClient,
-    schema_name: &str,
-    plan: ViewPlan,
-) -> Result<SqlResult, GnitzSqlError> {
-    let (chain, replace) = match plan {
-        ViewPlan::Skip { existing_id } => return Ok(SqlResult::ViewCreated { view_id: existing_id }),
-        ViewPlan::Create { chain, replace } => (chain, replace),
-    };
-    let view_id = client.create_view_chain(schema_name, &chain.name, chain.bundle, chain.props, replace)?;
-    Ok(SqlResult::ViewCreated { view_id })
-}
-
-/// Commit a planned `ALTER VIEW … AS`.
-pub(crate) fn execute_alter_view(
+/// Commit a planned `CREATE VIEW` or `ALTER VIEW … AS`.
+pub(crate) fn execute_view_chain(
     client: &mut GnitzClient,
     schema_name: &str,
     chain: PlannedChain,
 ) -> Result<SqlResult, GnitzSqlError> {
-    client.create_view_chain(schema_name, &chain.name, chain.bundle, chain.props, true)?;
-    Ok(SqlResult::Altered {
-        object: "view".to_string(),
-        name: chain.name,
-    })
+    client.create_view_chain(schema_name, &chain.name, chain.bundle, chain.props, chain.replacing)?;
+    Ok(SqlResult::Ddl)
 }
 
 /// Resolve `name` to the id of a VIEW `ALTER VIEW … AS` may retarget.
-fn resolve_view_id(cat: &CatalogSnapshot, schema_name: &str, name: &str) -> Result<u64, GnitzSqlError> {
-    let rel = probe_relation(cat, schema_name, name)?;
+fn resolve_view_id(cat: &Catalog<'_>, name: &str) -> Result<u64, GnitzSqlError> {
+    let rel = cat.probe_relation(name)?;
     require_class(&rel, name, ClassWant::View, "ALTER VIEW")?;
     // `ALTER VIEW` states no options, so it would drop these.
     let option = match rel.class {

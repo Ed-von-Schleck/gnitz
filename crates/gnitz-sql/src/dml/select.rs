@@ -25,7 +25,7 @@ use crate::ast_util::{
     body_is_grouped, classify_from, extract_table_name_and_alias, has_exists_in_subquery, has_scalar_subquery,
     reject_position_out_of_range, scalar_projection_item, select_is_distinct, FromShape,
 };
-use crate::bind::{bind_single_table, output_column, probe_relation};
+use crate::bind::{bind_single_table, output_column, Catalog};
 use crate::codec::project_schema::compute_map;
 use crate::dml::cte::inline_ctes;
 use crate::dml::plan::{access_path, rows_reply, RowsReply};
@@ -41,7 +41,7 @@ use crate::validate::{
     reject_unhonored_select_clauses, require_class, ClassWant, HonoredClauses, QueryEnvelope,
 };
 use crate::SqlResult;
-use gnitz_core::{BatchAppender, CatalogSnapshot, GnitzClient, RelDescriptor, Schema, ZSetBatch};
+use gnitz_core::{BatchAppender, GnitzClient, RelDescriptor, Schema, ZSetBatch};
 use gnitz_wire::{ReadSink, ReadSpec, SinkKind};
 use sqlparser::ast::{OrderBy, Query, Select, SetExpr, Statement};
 use std::sync::Arc;
@@ -51,7 +51,7 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 
 /// A finished ad-hoc read: what it reads and the client finish over the result.
-pub struct ReadPlan {
+pub(crate) struct ReadPlan {
     pub(super) case: ReadCase,
     /// ORDER BY over the finished result's columns; empty for a constant row, which one row
     /// sorts to itself.
@@ -90,7 +90,8 @@ pub(super) struct SpecRead {
 impl ReadPlan {
     /// The schema of the batch the read produces before client finishing: the rows reply,
     /// the fold's partial reply, or the constant row.
-    pub fn reply_schema(&self) -> &Schema {
+    #[cfg(test)]
+    pub(crate) fn reply_schema(&self) -> &Schema {
         match &self.case {
             ReadCase::Rows { reply_schema, .. } => reply_schema,
             ReadCase::Fold { finish, .. } => &finish.partial_schema,
@@ -99,7 +100,8 @@ impl ReadPlan {
     }
 
     /// The `ReadSpec` this read ships; `None` for a constant row.
-    pub fn spec(&self) -> Option<&ReadSpec> {
+    #[cfg(test)]
+    pub(crate) fn spec(&self) -> Option<&ReadSpec> {
         self.spec_read().map(|read| &read.spec)
     }
 
@@ -121,10 +123,9 @@ impl ReadPlan {
     }
 }
 
-/// Plan a `SELECT`, or the `EXPLAIN` of one, into the read it runs: a pure
-/// function of `(stmt, cat)`, reaching no server. Both statement forms yield the
-/// same plan, down to the rejection a query unsupported on two axes reports.
-pub fn plan_read(stmt: &Statement, cat: &CatalogSnapshot, schema_name: &str) -> Result<ReadPlan, GnitzSqlError> {
+/// Plan a `SELECT`, or the `EXPLAIN` of one, into the read it runs. Both
+/// statement forms yield the same plan.
+pub(crate) fn plan_read(stmt: &Statement, cat: &Catalog<'_>) -> Result<ReadPlan, GnitzSqlError> {
     let query = match stmt {
         Statement::Query(q) => q.as_ref(),
         // EXPLAIN describes the plan a query *would* take, so it consumes only
@@ -167,13 +168,13 @@ pub fn plan_read(stmt: &Statement, cat: &CatalogSnapshot, schema_name: &str) -> 
             ))
         }
     };
-    let flat = inline_ctes(cat, schema_name, query)?;
-    plan_query(cat, flat.as_ref().unwrap_or(query), schema_name)
+    let flat = inline_ctes(cat, query)?;
+    plan_query(cat, flat.as_ref().unwrap_or(query))
 }
 
 /// Validate an ad-hoc SELECT's shape, resolve the one relation it reads, and
 /// decide its access and sink.
-fn plan_query(cat: &CatalogSnapshot, query: &Query, schema_name: &str) -> Result<ReadPlan, GnitzSqlError> {
+fn plan_query(cat: &Catalog<'_>, query: &Query) -> Result<ReadPlan, GnitzSqlError> {
     // ORDER BY / LIMIT / OFFSET are the client finish's; any other query clause is refused.
     reject_unhonored_query_clauses(query, QueryEnvelope::WithAndTail, "direct SELECT")?;
     let select = match query.body.as_ref() {
@@ -205,7 +206,7 @@ fn plan_query(cat: &CatalogSnapshot, query: &Query, schema_name: &str) -> Result
         FromShape::SinglePlainRelation(f) => f,
         FromShape::Derived(construct) => return Err(derivation(construct)),
     };
-    let (name, alias) = extract_table_name_and_alias(factor, schema_name, "FROM")?;
+    let (name, alias) = extract_table_name_and_alias(factor, cat.schema_name(), "FROM")?;
     // DISTINCT wins the split: its fold does not group, so DISTINCT + GROUP BY keeps the
     // GROUP BY rejection.
     let distinct = select_is_distinct(select);
@@ -218,7 +219,7 @@ fn plan_query(cat: &CatalogSnapshot, query: &Query, schema_name: &str) -> Result
         "direct SELECT"
     };
     reject_unhonored_select_clauses(select, HonoredClauses::for_body(fold, distinct), ctx)?;
-    let desc = probe_relation(cat, schema_name, &name)?;
+    let desc = cat.probe_relation(&name)?;
     require_class(&desc, &name, ClassWant::Readable, ctx)?;
     // WHERE → access before either sink's shape, so a query unsupported on both axes names
     // the same one whichever sink it lands on.

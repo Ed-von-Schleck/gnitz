@@ -1,15 +1,15 @@
 use super::*;
-use crate::test_support::col_def;
+use crate::test_support::{col, ncol};
 
 // Columns: 0=pk(U64), 1=n(I64), 2=b(Blob), 3=u(UUID), 4=s(String).
 fn schema() -> Schema {
     Schema {
         columns: vec![
-            col_def("pk", TypeCode::U64, false),
-            col_def("n", TypeCode::I64, true),
-            col_def("b", TypeCode::Blob, true),
-            col_def("u", TypeCode::UUID, true),
-            col_def("s", TypeCode::String, true),
+            col("pk", TypeCode::U64),
+            ncol("n", TypeCode::I64),
+            ncol("b", TypeCode::Blob),
+            ncol("u", TypeCode::UUID),
+            ncol("s", TypeCode::String),
         ],
         pk_cols: vec![0],
     }
@@ -50,8 +50,8 @@ fn agg_ops_accepts_valid_arg_types() {
 #[test]
 fn agg_ops_shares_the_row_count_over_a_not_null_argument() {
     use WireAggFunc as W;
-    let nullable = col_def("x", TypeCode::I64, true);
-    let not_null = col_def("y", TypeCode::I64, false);
+    let nullable = ncol("x", TypeCode::I64);
+    let not_null = col("y", TypeCode::I64);
     let ops = |f, c| agg_ops(f, Some(c), false).unwrap();
     assert_eq!(ops(AggFunc::Count, &nullable), (W::CountNonNull, None));
     assert_eq!(ops(AggFunc::Count, &not_null), (W::Count, None));
@@ -72,11 +72,11 @@ fn agg_ops_shares_the_row_count_over_a_not_null_argument() {
 fn agg_result_type_sum_preserves_u64() {
     let s = Schema {
         columns: vec![
-            col_def("pk", TypeCode::U64, false),
-            col_def("u", TypeCode::U64, true),
-            col_def("w", TypeCode::U32, true),
-            col_def("i", TypeCode::I64, true),
-            col_def("f", TypeCode::F64, true),
+            col("pk", TypeCode::U64),
+            ncol("u", TypeCode::U64),
+            ncol("w", TypeCode::U32),
+            ncol("i", TypeCode::I64),
+            ncol("f", TypeCode::F64),
         ],
         pk_cols: vec![0],
     };

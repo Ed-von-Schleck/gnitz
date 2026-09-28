@@ -2,7 +2,7 @@ use super::*;
 use crate::agg::AggFunc;
 use crate::agg::{agg_col_def, finalize_agg_bexpr, group_pk_def};
 use crate::ir::{BExpr, BinOp};
-use crate::test_support::col_def;
+use crate::test_support::{col, ncol};
 use gnitz_core::{PkColumn, TypeCode};
 use gnitz_wire::AggDescriptor;
 
@@ -25,12 +25,12 @@ use self::Cell::{Int, Null, Str, F64};
 fn source_schema() -> Schema {
     Schema {
         columns: vec![
-            col_def("pk", TypeCode::U64, false),
-            col_def("g", TypeCode::I64, true),
-            col_def("s", TypeCode::String, true),
-            col_def("sm", TypeCode::I16, true),
-            col_def("x", TypeCode::I64, true),
-            col_def("f", TypeCode::F64, true),
+            col("pk", TypeCode::U64),
+            ncol("g", TypeCode::I64),
+            ncol("s", TypeCode::String),
+            ncol("sm", TypeCode::I16),
+            ncol("x", TypeCode::I64),
+            ncol("f", TypeCode::F64),
         ],
         pk_cols: vec![0],
     }
@@ -337,7 +337,7 @@ fn a_projecting_finalize_runs_the_map() {
 /// `(sum bits, count)` through the whole finish and reads the AVG cell back.
 fn finish_avg(sum_bits: i64, cnt: i64) -> Option<f64> {
     let src = Schema {
-        columns: vec![col_def("pk", TypeCode::U64, false), col_def("u", TypeCode::U64, true)],
+        columns: vec![col("pk", TypeCode::U64), ncol("u", TypeCode::U64)],
         pk_cols: vec![0],
     };
     let specs = [
@@ -352,7 +352,7 @@ fn finish_avg(sum_bits: i64, cnt: i64) -> Option<f64> {
         &[],
         vec![(
             finalize_agg_bexpr(BExpr::ColRef(1), Some(BExpr::ColRef(2)), AggFunc::Avg),
-            col_def("a", TypeCode::F64, true),
+            ncol("a", TypeCode::F64),
         )],
     );
     let reply = batch(

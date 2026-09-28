@@ -2,52 +2,33 @@
 //! bind *and* lower to a segment chain, and every rejection must name the
 //! clause the user wrote.
 
+use crate::bind::Catalog;
 use crate::error::GnitzSqlError;
-use crate::hir::{plan_create_view, ViewPlan};
-use crate::test_support::{col_def, parse_stmt};
-use gnitz_core::{CatalogSnapshot, ColumnDef, PlannedView, RelClass, RelDescriptor, Schema, TypeCode};
+use crate::hir::plan_create_view;
+use crate::test_support::{col, ncol, parse_stmt, register, rel, table};
+use gnitz_core::{ColumnDef, PlannedView, RelClass, TypeCode};
 use std::sync::Arc;
 
 /// `t(id BIGINT PK, k BIGINT, a BIGINT, b BIGINT NULL, s TEXT, f DOUBLE)`,
 /// `u(uid BIGINT PK, k BIGINT)`, and `st`, a stream with `t`'s columns.
-fn catalog() -> CatalogSnapshot {
-    let mut cat = CatalogSnapshot::default();
-    let mut add = |tid: u64, name: &str, class: RelClass, columns: Vec<ColumnDef>| {
-        let schema = Arc::new(Schema { columns, pk_cols: vec![0] });
-        cat.insert(
-            "public",
-            name,
-            Some(Arc::new(RelDescriptor {
-                tid,
-                class,
-                // A stream's PK is a routing and sort key, never unique.
-                pk_repeats: class == RelClass::Stream,
-                serial: false,
-                schema,
-                indexes: Vec::new(),
-            })),
-        );
-    };
+fn catalog() -> Catalog<'static> {
+    let i = TypeCode::I64;
     let t_cols = || {
         vec![
-            col_def("id", TypeCode::I64, false),
-            col_def("k", TypeCode::I64, false),
-            col_def("a", TypeCode::I64, false),
-            col_def("b", TypeCode::I64, true),
-            col_def("s", TypeCode::String, false),
-            col_def("f", TypeCode::F64, false),
+            col("id", i),
+            col("k", i),
+            col("a", i),
+            ncol("b", i),
+            col("s", TypeCode::String),
+            col("f", TypeCode::F64),
         ]
     };
-    add(1, "t", RelClass::Table, t_cols());
-    add(
-        2,
-        "u",
-        RelClass::Table,
-        vec![col_def("uid", TypeCode::I64, false), col_def("k", TypeCode::I64, false)],
-    );
-    add(3, "st", RelClass::Stream, t_cols());
-    cat.insert("public", "v", None);
-    cat
+    crate::test_support::catalog(vec![
+        ("t", table(1, t_cols(), vec![0])),
+        ("u", table(2, vec![col("uid", i), col("k", i)], vec![0])),
+        // A stream's PK is a routing and sort key, never unique.
+        ("st", rel(3, RelClass::Stream, t_cols(), vec![0], &[])),
+    ])
 }
 
 /// Plan `CREATE VIEW v AS <sql>`: the chain's segment count (the final view
@@ -58,14 +39,12 @@ fn plan(sql: &str) -> Result<(usize, Vec<ColumnDef>), GnitzSqlError> {
 }
 
 /// [`plan`] against `cat`, returning the final view whole.
-fn plan_in(cat: &CatalogSnapshot, sql: &str) -> Result<(usize, PlannedView), GnitzSqlError> {
+fn plan_in(cat: &Catalog<'_>, sql: &str) -> Result<(usize, PlannedView), GnitzSqlError> {
     let sqlparser::ast::Statement::CreateView(cv) = parse_stmt(&format!("CREATE VIEW v AS {sql}")) else {
         panic!("not a CREATE VIEW");
     };
-    match plan_create_view(&cv, cat, "public")? {
-        ViewPlan::Create { chain, .. } => Ok((chain.bundle.segments.len() + 1, chain.bundle.view)),
-        ViewPlan::Skip { .. } => panic!("a free name is never skipped"),
-    }
+    let chain = plan_create_view(&cv, cat)?.expect("a free name is never skipped");
+    Ok((chain.bundle.segments.len() + 1, chain.bundle.view))
 }
 
 fn visible(cols: &[ColumnDef]) -> Vec<(String, TypeCode, bool)> {
@@ -332,50 +311,32 @@ fn row_number_needs_a_unique_row_key() {
     plan("SELECT a, ROW_NUMBER() OVER (ORDER BY a) FROM (SELECT id, a, k FROM t) d").unwrap();
 }
 
-/// Plan `sql` as a view body and register it under `name`, carrying the
-/// `pk_repeats` its own lowering stated. Returns that bit.
-fn register_view(cat: &mut CatalogSnapshot, tid: u64, name: &str, sql: &str) -> bool {
-    let (_, v) = plan_in(cat, sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
-    cat.insert(
-        "public",
-        name,
-        Some(Arc::new(RelDescriptor {
-            tid,
-            class: RelClass::View,
-            pk_repeats: v.pk_repeats,
-            serial: false,
-            schema: v.schema,
-            indexes: Vec::new(),
-        })),
-    );
-    v.pk_repeats
-}
-
 /// `ROW_NUMBER` reads the row key off the relation, so a view whose own lowering
 /// said its PK repeats loses it: over a stream, over a join key, or over a
 /// partition holding more than one slot.
 #[test]
 fn row_number_reads_the_row_key_off_the_view_that_states_it() {
-    let mut cat = catalog();
-    let reg = |cat: &mut CatalogSnapshot, tid, name, sql| register_view(cat, tid, name, sql);
-    assert!(reg(&mut cat, 20, "sv", "SELECT id, a FROM st"));
-    assert!(reg(
-        &mut cat,
-        21,
-        "jv2",
-        "SELECT t.id AS id, t.a AS a FROM t JOIN u ON t.k = u.k"
-    ));
-    assert!(reg(&mut cat, 22, "tv2", "SELECT id, a FROM t ORDER BY a LIMIT 2"));
-    assert!(!reg(&mut cat, 23, "pv", "SELECT id, a FROM t"));
-    assert!(!reg(&mut cat, 24, "tv1", "SELECT id, a FROM t ORDER BY a LIMIT 1"));
+    let cat = catalog();
+    // Plan `sql` as a view body and register it under `name`, carrying the
+    // `pk_repeats` its own lowering stated. Returns that bit.
+    let reg = |tid, name, sql: &str| {
+        let (_, v) = plan_in(&cat, sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        register(&cat, name, tid, RelClass::View, &v);
+        v.pk_repeats
+    };
+    assert!(reg(20, "sv", "SELECT id, a FROM st"));
+    assert!(reg(21, "jv2", "SELECT t.id AS id, t.a AS a FROM t JOIN u ON t.k = u.k"));
+    assert!(reg(22, "tv2", "SELECT id, a FROM t ORDER BY a LIMIT 2"));
+    assert!(!reg(23, "pv", "SELECT id, a FROM t"));
+    assert!(!reg(24, "tv1", "SELECT id, a FROM t ORDER BY a LIMIT 1"));
 
-    let over = |cat: &CatalogSnapshot, name: &str| {
+    let over = |cat: &Catalog<'_>, name: &str| {
         plan_in(
             cat,
             &format!("SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM {name}"),
         )
     };
-    let refusal = |cat: &CatalogSnapshot, name: &str| {
+    let refusal = |cat: &Catalog<'_>, name: &str| {
         let Err(err) = over(cat, name) else {
             panic!("{name}: ROW_NUMBER must be refused");
         };
@@ -397,22 +358,9 @@ fn row_number_reads_the_row_key_off_the_view_that_states_it() {
 /// alias, and keep its row key.
 #[test]
 fn a_user_named_join_pk_column_is_a_row_key() {
-    let mut cat = catalog();
-    let rel = |tid, class, pk_repeats, columns, pk_cols| {
-        Some(Arc::new(RelDescriptor {
-            tid,
-            class,
-            pk_repeats,
-            serial: false,
-            schema: Arc::new(Schema { columns, pk_cols }),
-            indexes: Vec::new(),
-        }))
-    };
-    let jt_cols = vec![
-        col_def("_join_pk", TypeCode::I64, false),
-        col_def("a", TypeCode::I64, false),
-    ];
-    cat.insert("public", "jt", rel(10, RelClass::Table, false, jt_cols, vec![0]));
+    let cat = catalog();
+    let jt_cols = vec![col("_join_pk", TypeCode::I64), col("a", TypeCode::I64)];
+    cat.insert("jt", Some(table(10, jt_cols, vec![0])));
     plan_in(&cat, "SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM jt").unwrap();
 
     let (_, aliased) = plan_in(&cat, "SELECT id AS _join_pk, a FROM t").unwrap();
@@ -425,14 +373,7 @@ fn a_user_named_join_pk_column_is_a_row_key() {
     // Carrying the bit that view's own lowering stated — a projection passing a
     // table's PK through.
     assert!(!aliased.pk_repeats);
-    let jv = rel(
-        11,
-        RelClass::View,
-        aliased.pk_repeats,
-        aliased.schema.columns.clone(),
-        aliased.schema.pk_cols.clone(),
-    );
-    cat.insert("public", "jv", jv);
+    register(&cat, "jv", 11, RelClass::View, &aliased);
     plan_in(&cat, "SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM jv").unwrap();
 }
 

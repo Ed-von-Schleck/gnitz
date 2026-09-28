@@ -233,8 +233,8 @@ fn two_indexes_under_one_name_in_one_bundle_are_refused() {
                 &[],
                 TableProps::default(),
                 &[
-                    gnitz_core::InlineUniqueIndex { col_indices: &[1], name: "u" },
-                    gnitz_core::InlineUniqueIndex { col_indices: &[2], name: "U" },
+                    gnitz_core::InlineUniqueIndex { col_indices: vec![1], name: "u".into() },
+                    gnitz_core::InlineUniqueIndex { col_indices: vec![2], name: "U".into() },
                 ],
             )
             .unwrap_err()
@@ -295,7 +295,7 @@ fn a_three_family_create_table_bundle_still_commits() {
             &schema,
             &[],
             TableProps::default(),
-            &[gnitz_core::InlineUniqueIndex { col_indices: &[1], name: "u_b" }],
+            &[gnitz_core::InlineUniqueIndex { col_indices: vec![1], name: "u_b".into() }],
         )
         .unwrap();
     let desc = client.resolve("ok", "t").unwrap().expect("the table exists");
@@ -369,8 +369,10 @@ fn a_rename_stores_the_new_name_for_a_table_and_for_a_view() {
         .unwrap();
     let vid = client.create_view("ren", "v", tid).unwrap();
 
-    client.alter_rename_relation("ren", "t", "t2").unwrap();
-    client.alter_rename_relation("ren", "v", "v2").unwrap();
+    let t = client.resolve_relation("ren", "t").unwrap();
+    let v = client.resolve_relation("ren", "v").unwrap();
+    client.alter_rename_relation("ren", &t, "t2").unwrap();
+    client.alter_rename_relation("ren", &v, "v2").unwrap();
 
     assert!(
         client.resolve("ren", "t").unwrap().is_none(),
@@ -416,7 +418,7 @@ fn an_alter_view_bundle_still_applies_in_creation_order() {
             }
             .into(),
             gnitz_core::ViewProps::default(),
-            true,
+            Some(first),
         )
         .expect("the replacement bundle applies");
     assert_ne!(vid, first, "the replacement takes a fresh id");

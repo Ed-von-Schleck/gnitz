@@ -9,7 +9,7 @@ use crate::protocol::{
     ZSetBatch,
 };
 use gnitz_wire::{WireFault, WireStatus};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::mirror::{MirrorState, MirrorStore, MirroredView};
@@ -19,8 +19,8 @@ use gnitz_wire::sys_rows::{IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::txn_frame::{DeltaPollItem, BLIND};
 use gnitz_wire::Circuit;
 use gnitz_wire::{
-    TableProps, ViewProps, CIRCUIT_NODES_TAB, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, COL_TAB,
-    IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB, RELTAB_PAY_NAME,
+    RelClass, TableProps, ViewProps, CIRCUIT_NODES_TAB, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME,
+    COL_TAB, IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB, RELTAB_PAY_NAME,
     RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
 };
 
@@ -81,10 +81,10 @@ pub fn retraction_batch(schema: &Schema, pks: PkColumn) -> ZSetBatch {
 
 /// One inline `UNIQUE` constraint of a `CREATE TABLE`. `name` is the catalog
 /// index name `DROP INDEX` matches.
-#[derive(Clone, Copy, Debug)]
-pub struct InlineUniqueIndex<'a> {
-    pub col_indices: &'a [u32],
-    pub name: &'a str,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineUniqueIndex {
+    pub col_indices: Vec<u32>,
+    pub name: String,
 }
 
 /// One FOREIGN KEY column of a `CREATE TABLE`.
@@ -248,53 +248,6 @@ impl From<PlannedView> for ViewBundle {
     }
 }
 
-/// What one statement has already read, dropped whole at `end_statement`.
-///
-/// One entry per resolved canonical `"schema.name"`, absent verdicts included,
-/// so `plan_resolving`'s re-run reads a miss back instead of asking again.
-/// [`Self::get`] and [`Self::insert`] build the key through [`qualified_name`]
-/// themselves, so a case-varying reference cannot split into two entries.
-///
-/// `BTreeMap` rather than `HashMap` because `BTreeMap::new()` is `const`, which
-/// [`EMPTY_CATALOG`] needs to be a `static`.
-#[derive(Default)]
-pub struct CatalogSnapshot {
-    relations: BTreeMap<String, Option<Arc<RelDescriptor>>>,
-}
-
-/// What a planning pass sees outside a statement bracket: nothing, because every
-/// read issued between statements hits the wire.
-static EMPTY_CATALOG: CatalogSnapshot = CatalogSnapshot { relations: BTreeMap::new() };
-
-impl CatalogSnapshot {
-    /// This statement's verdict for `schema_name.name`: `None` if the statement
-    /// has not resolved that name at all, `Some(None)` for a recorded absence.
-    pub fn get(&self, schema_name: &str, name: &str) -> Option<Option<Arc<RelDescriptor>>> {
-        self.get_qname(&qualified_name(schema_name, name))
-    }
-
-    /// [`Self::get`] for a caller that already built the key.
-    pub(crate) fn get_qname(&self, qname: &str) -> Option<Option<Arc<RelDescriptor>>> {
-        self.relations.get(qname).cloned()
-    }
-
-    /// Record a verdict, replacing any entry already under the same key.
-    pub fn insert(&mut self, schema_name: &str, name: &str, desc: Option<Arc<RelDescriptor>>) {
-        self.insert_qname(qualified_name(schema_name, name), desc);
-    }
-
-    /// [`Self::insert`] for a caller that already built the key.
-    pub(crate) fn insert_qname(&mut self, qname: String, desc: Option<Arc<RelDescriptor>>) {
-        self.relations.insert(qname, desc);
-    }
-
-    /// The descriptor this statement resolved for `tid`. A linear scan with no
-    /// wire fallback; a statement resolves a handful of relations.
-    pub(crate) fn by_tid(&self, tid: u64) -> Option<Arc<RelDescriptor>> {
-        self.relations.values().flatten().find(|d| d.tid == tid).map(Arc::clone)
-    }
-}
-
 /// Run when a signal interrupts a blocking call's wait; an `Err` aborts the call.
 /// The Python binding checks for Ctrl-C here.
 pub type ParkHook = Box<dyn FnMut() -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send>;
@@ -303,22 +256,8 @@ pub struct GnitzClient {
     pub(crate) session: Session,
     pub(crate) park_hook: Option<ParkHook>,
     serial_cache: HashMap<u64, SerialRange>,
-    /// What the current statement has resolved and scanned; `None` outside a
-    /// statement, so a read issued between statements always hits the wire.
-    scope: Option<CatalogSnapshot>,
-    /// Open transaction, if any. `Some` between `txn_begin` and its
-    /// `txn_commit`/`txn_rollback`: **every** user-table write on this client
-    /// (`push`, `push_with_mode`, `delete` — and so every SQL DML statement, C
-    /// and Python binary push alike) buffers here instead of going to the wire,
-    /// and [`Self::txn_reads`] reads it back for read-your-own-writes. `None` is
-    /// autocommit. The buffer keys families by resolved tid, so a `schema_name`
-    /// change between `execute_sql` calls cannot corrupt it. Dropping the client
-    /// with an open transaction discards `txn` by plain `Drop` — identical to
-    /// ROLLBACK, nothing was ever sent.
-    ///
-    /// Catalog writes never route here: DDL has its own atomic commit and is
-    /// rejected inside a transaction at the client's `push_ddl_txn` choke point (and,
-    /// earlier and friendlier, by the SQL front end).
+    /// Open transaction, if any; `None` is autocommit. Every user-table write
+    /// buffers here while it is open, and dropping it is ROLLBACK.
     txn: Option<TxnBuffer>,
     /// The local copy this client reads through, if a host attached one. Boxed,
     /// so a client that never mirrors pays one `None` and no allocation.
@@ -355,7 +294,6 @@ impl GnitzClient {
             session,
             park_hook: None,
             serial_cache: HashMap::new(),
-            scope: None,
             txn: None,
             mirror: None,
         })
@@ -370,7 +308,6 @@ impl GnitzClient {
             session,
             park_hook: None,
             serial_cache: HashMap::new(),
-            scope: None,
             txn: None,
             mirror: None,
         }
@@ -403,36 +340,6 @@ impl GnitzClient {
                 return done.swap_remove(i).1;
             }
             ready = park(&self.session, &mut self.park_hook)?;
-        }
-    }
-
-    /// Open a statement scope: every relation this statement resolves is
-    /// remembered in it and dropped at [`Self::end_statement`], so nothing
-    /// survives a catalog write and there is no cross-statement state to
-    /// invalidate. The SQL planner brackets each statement with begin/end.
-    pub fn begin_statement(&mut self) {
-        self.scope = Some(CatalogSnapshot::default());
-    }
-
-    /// Close the statement scope. The next statement opens a fresh one, so a DDL
-    /// write in this statement is visible to the next.
-    pub fn end_statement(&mut self) {
-        self.scope = None;
-    }
-
-    /// What this statement has resolved: the whole catalog input a pure planning
-    /// pass reads. Empty outside a statement bracket.
-    pub fn catalog(&self) -> &CatalogSnapshot {
-        self.scope.as_ref().unwrap_or(&EMPTY_CATALOG)
-    }
-
-    /// Record a resolve this client performed itself, which
-    /// [`Self::resolve_local_first`] must do: the planner's resolve loop reads
-    /// the statement snapshot back rather than the return value, and that is its
-    /// termination proof. A no-op outside a statement bracket.
-    fn record_relation(&mut self, qname: String, desc: Option<Arc<RelDescriptor>>) {
-        if let Some(scope) = &mut self.scope {
-            scope.insert_qname(qname, desc);
         }
     }
 
@@ -489,7 +396,7 @@ impl GnitzClient {
         mode: WireConflictMode,
     ) -> Result<u64, ClientError> {
         if let Some(txn) = &mut self.txn {
-            txn.push(table_id, schema, batch.clone(), mode, BLIND);
+            txn.push(table_id, schema, batch.clone(), mode, BLIND)?;
             return Ok(0);
         }
         self.send_push(table_id, schema, batch, mode)
@@ -507,7 +414,7 @@ impl GnitzClient {
         mode: WireConflictMode,
     ) -> Result<u64, ClientError> {
         if let Some(txn) = &mut self.txn {
-            txn.push(table_id, schema, batch, mode, BLIND);
+            txn.push(table_id, schema, batch, mode, BLIND)?;
             return Ok(0);
         }
         self.send_push(table_id, schema, &batch, mode)
@@ -539,7 +446,7 @@ impl GnitzClient {
         basis: u64,
     ) -> Result<(), ClientError> {
         if let Some(txn) = &mut self.txn {
-            txn.push(table_id, schema, batch, WireConflictMode::Update, basis);
+            txn.push(table_id, schema, batch, WireConflictMode::Update, basis)?;
             return Ok(());
         }
         if batch.is_empty() {
@@ -575,9 +482,7 @@ impl GnitzClient {
     // exactly like a client without for every relation the copy does not hold.
 
     /// [`Self::resolve`], answered off a mirrored registration when there is one
-    /// — which is what keeps a mirrored `SELECT` round-trip-free, since the
-    /// statement scope is dropped whole and delegating would cost one RESOLVE per
-    /// statement.
+    /// — which is what keeps a mirrored `SELECT` round-trip-free.
     ///
     /// The trade is a name → id binding as stale as the copy itself; the feed
     /// detects it (the next poll's tag stops continuing) and the recovery
@@ -603,10 +508,7 @@ impl GnitzClient {
                 .map(|(_, v)| Arc::clone(&v.desc))
         });
         match local {
-            Some(desc) => {
-                self.record_relation(qualified_name(schema_name, name), Some(Arc::clone(&desc)));
-                Ok(Some(desc))
-            }
+            Some(desc) => Ok(Some(desc)),
             None => self.resolve(schema_name, name),
         }
     }
@@ -672,8 +574,8 @@ impl GnitzClient {
     ///
     /// Refused while a transaction is open. Otherwise the client is rebuilt
     /// through [`Self::connect`] rather than reset field by field, which keeps
-    /// the statement scope, the transaction slot and the SERIAL cache from being
-    /// enumerated here and drifting. Nothing is taken out of
+    /// the transaction slot and the SERIAL cache from being enumerated here and
+    /// drifting. Nothing is taken out of
     /// `self` until the new session exists, so a failed connect leaves this
     /// client exactly as it was.
     ///
@@ -807,35 +709,20 @@ impl GnitzClient {
         self.round_trip(Request::seek(table_id, key)).map(Reply::into_scan)
     }
 
-    /// The statement's descriptor for `tid` — the by-id twin of [`Self::resolve`].
-    /// A tid usually comes from resolving the same relation by name earlier in the
-    /// statement, which makes this a scope hit; a tid from anywhere else falls back
-    /// to a by-id round trip rather than reporting an empty index list.
+    /// The descriptor for `tid` — the by-id twin of [`Self::resolve`], one round
+    /// trip.
     pub fn describe_by_id(&mut self, tid: u64) -> Result<Arc<RelDescriptor>, ClientError> {
-        if let Some(d) = self.catalog().by_tid(tid) {
-            return Ok(d);
-        }
         self.round_trip(Request::Resolve(RelTarget::Id(tid)))
             .map(Reply::into_resolve)?
             .ok_or_else(|| absent(format!("relation {tid} not found")))
     }
 
-    /// Persist a secondary-index catalog row over an already-resolved base table.
-    ///
-    /// Resolution and view-rejection are the caller's responsibility: an index
-    /// may only back a base table — a view is a read-only derived relation whose
-    /// store is maintained solely by its circuit, so indexing a snapshot of
-    /// derived data has no defined semantics — and the SQL layer rejects a view
-    /// target with a precise error before reaching here. `col_indices`/`col_types`
-    /// identify the indexed columns within the resolved table, in declared order;
-    /// `index_name` is the final catalog name (auto-generated or user-supplied)
-    /// that `DROP INDEX` resolves against. A 1-element list is the single-column
-    /// case; the persisted `source_cols` slot always carries `pack_pk_cols`.
+    /// Index `col_indices` of table `table_id`, in that order, under the catalog
+    /// name `index_name`.
     pub fn create_index(
         &mut self,
         table_id: u64,
         col_indices: &[u32],
-        col_types: &[TypeCode],
         index_name: &str,
         is_unique: bool,
     ) -> Result<u64, ClientError> {
@@ -844,22 +731,7 @@ impl GnitzClient {
         // pack_pk_cols contract, so the pack below can never panic.
         gnitz_wire::validate_pk_col_list(col_indices, gnitz_wire::PK_LIST_COL_LIMIT)
             .map_err(|e| ClientError::from(format!("create_index: {e}")))?;
-        if col_types.len() != col_indices.len() {
-            return Err(ClientError::from(
-                "create_index: col_indices and col_types length mismatch".to_string(),
-            ));
-        }
-        // The engine's own promotion rule, so this gateway admits exactly what
-        // `make_index_schema` will. The singular: the plural's arity/stride caps
-        // need the source relation's PK, which this raw-binary entry point would
-        // have to fetch and which `precheck_index_family` enforces anyway.
-        for &ct in col_types {
-            gnitz_wire::index_key_type(ct)?;
-        }
 
-        // No client-side name probe: the engine rejects a duplicate against both
-        // the persisted `index_by_name` and the rest of this bundle. A rejected
-        // bundle burns this index_id, which costs nothing — ids are never reused.
         let index_id = self.alloc_id()?;
 
         let idx_schema = sys_schema(IDX_TAB);
@@ -1019,27 +891,19 @@ impl GnitzClient {
             .map(Reply::into_lsn)
     }
 
-    /// The open transaction's buffered ops on `tid`. `None` in autocommit and for
-    /// a table the transaction has not written.
-    pub fn txn_reads(&mut self, tid: u64) -> Option<TxnReads<'_>> {
-        self.txn.as_mut()?.reads(tid)
+    /// The open transaction's buffered ops on `tid`, read in `schema`'s layout.
+    /// `None` in autocommit and for a table the transaction has not written.
+    pub fn txn_reads(&mut self, tid: u64, schema: &Schema) -> Result<Option<TxnReads<'_>>, ClientError> {
+        match self.txn.as_mut() {
+            Some(txn) => txn.reads(tid, schema),
+            None => Ok(None),
+        }
     }
 
     // --- DDL ---
 
-    /// Catalog write choke point. DDL commits atomically on its own and never
-    /// joins an open transaction's buffered user-table writes — a batch buffered
-    /// under the old schema would guarantee a commit-time mismatch. Reject it here
-    /// at the state owner, mirroring `push_with_mode`'s single branch for data
-    /// writes; the SQL front end's own rejection is then a friendlier early error,
-    /// not the sole enforcement.
-    /// The zone LSN is dropped rather than returned: `record_commit_lsn` is
-    /// reached only from the push and user-transaction handlers, never from the
-    /// DDL one, so a DDL never raises a user table's commit LSN.
-    ///
-    /// Being the choke point is also what lets it retire this client's own
-    /// copies, in [`Self::forget_retired_views`], rather than each DDL verb
-    /// carrying a teardown of its own.
+    /// Every catalog write goes through here, so this is where DDL is refused
+    /// inside a transaction and where a retired view's copy is dropped.
     pub fn push_ddl_txn(&mut self, families: &[(u64, ZSetBatch)]) -> Result<(), ClientError> {
         if self.txn.is_some() {
             return Err(ClientError::from("DDL is not allowed inside a transaction".to_string()));
@@ -1156,7 +1020,7 @@ impl GnitzClient {
         let table_name = gnitz_wire::canonical_identifier(table_name)?;
         let index_names: Vec<String> = unique_indexes
             .iter()
-            .map(|spec| gnitz_wire::canonical_identifier(spec.name))
+            .map(|spec| gnitz_wire::canonical_identifier(&spec.name))
             .collect::<Result<Vec<_>, String>>()?;
         let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
         // Full schema-admissibility rule set (column cap + PK rules), applied
@@ -1176,17 +1040,12 @@ impl GnitzClient {
             })
             .map_err(|e| ClientError::from(format!("create_table: {e}")))?;
 
-        // Column types come from `schema.columns`, so a UNIQUE+FK column's
-        // parent-rewritten type is used.
         for spec in unique_indexes {
             // Structural rules only (arity, in-range, no duplicates) — unlike a
-            // PK, an indexed column may be nullable. In-range against the actual
-            // column list also keeps the `schema.columns[c]` read panic-free.
-            gnitz_wire::validate_pk_col_list(spec.col_indices, schema.columns.len())
+            // PK, an indexed column may be nullable. They are `pack_pk_cols`'s
+            // precondition.
+            gnitz_wire::validate_pk_col_list(&spec.col_indices, schema.columns.len())
                 .map_err(|msg| ClientError::from(format!("create_table: unique index '{}': {msg}", spec.name)))?;
-            for &c in spec.col_indices {
-                gnitz_wire::index_key_type(schema.columns[c as usize].ty.tc)?;
-            }
         }
 
         // The table's id, then one per inline UNIQUE index.
@@ -1236,7 +1095,7 @@ impl GnitzClient {
                         &IdxTabRow {
                             index_id: new_tid + 1 + k as u64,
                             owner_id: new_tid,
-                            source_col_idx: gnitz_wire::pack_pk_cols(spec.col_indices),
+                            source_col_idx: gnitz_wire::pack_pk_cols(&spec.col_indices),
                             name: &index_names[k],
                             flags: gnitz_wire::IndexProps { is_unique: true }.pack(),
                         },
@@ -1277,23 +1136,21 @@ impl GnitzClient {
             schema: Arc::clone(&src.schema),
             pk_repeats: src.pk_repeats,
         };
-        self.create_view_chain(schema_name, view_name, view.into(), ViewProps::default(), false)
+        self.create_view_chain(schema_name, view_name, view.into(), ViewProps::default(), None)
     }
 
     /// Create `bundle` in one atomic `DDL_TXN` and return the user-named view's id.
     /// `bundle.view` takes `view_name` and `props`; each segment is named by
     /// [`segment_name`] and owned by it.
     ///
-    /// `replace` supersedes the view already holding this name: `false` leaves a
-    /// name collision to the engine, `true` makes a missing view an error. A
-    /// rejection anywhere in the zone leaves the old view as it was.
+    /// `replace` is the id of the view this one supersedes in the same zone.
     pub fn create_view_chain(
         &mut self,
         schema_name: &str,
         view_name: &str,
         bundle: ViewBundle,
         props: ViewProps,
-        replace: bool,
+        replace: Option<u64>,
     ) -> Result<u64, ClientError> {
         let view_name = gnitz_wire::canonical_identifier(view_name)?;
         let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
@@ -1313,17 +1170,17 @@ impl GnitzClient {
                 .map_err(|e| ClientError::from(format!("View '{view_name}' segment {k}: {e}")))?;
         }
 
-        let schema_id = self.lookup_schema_id(&schema_name)?;
-
-        // The outgoing view's row, resolved before any id is allocated so a
-        // missing view surfaces with no residue. Only the user-named view: the
-        // engine cascades its segments off `owner_view_id`.
-        let replaced = replace
-            .then(|| {
-                self.relation_retraction(VIEW_TAB, "view", &schema_name, &view_name)?
-                    .ok_or_else(|| not_found("view", &schema_name, &view_name))
-            })
-            .transpose()?;
+        // Only the user-named view: the engine cascades its segments.
+        let replaced = match replace {
+            Some(vid) => {
+                Some(self.seek_sys_row(VIEW_TAB, vid as u128, || not_found("view", &schema_name, &view_name))?)
+            }
+            None => None,
+        };
+        let schema_id = match &replaced {
+            Some((row, i)) => payload_u64(row, *i, RELTAB_PAY_SCHEMA_ID),
+            None => self.lookup_schema_id(&schema_name)?,
+        };
 
         // The whole bundle is assigned in one allocation before any substitution
         // runs, because a downstream segment's `ScanDelta` names an upstream
@@ -1488,49 +1345,42 @@ impl GnitzClient {
             .map(Some)
     }
 
-    /// Rename a table or view: a `(-1, +1)` rewrite pair on TABLE_TAB / VIEW_TAB,
-    /// same id, the live row at `-1` and the same row with a new `name` at `+1`.
-    /// The resolved descriptor picks the family, so the kind cannot disagree with
-    /// the id. A rename changes no comparator or layout, so the DDL zone's write
-    /// lock is the whole quiesce it needs.
+    /// Rename `rel`: a `(-1, +1)` rewrite pair of its TABLE_TAB / VIEW_TAB row.
     pub fn alter_rename_relation(
         &mut self,
         schema_name: &str,
-        current_name: &str,
+        rel: &Arc<RelDescriptor>,
         new_name: &str,
     ) -> Result<(), ClientError> {
         let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
-        let current_name = gnitz_wire::canonical_identifier(current_name)?;
         let new_name = gnitz_wire::canonical_identifier(new_name)?;
-        let missing = || not_found("relation", &schema_name, &current_name);
-        // Key the family lookup on the resolved id — the family's own PK — rather
-        // than on `(schema_id, name)`, which would need a SCHEMA_TAB probe first.
-        let desc = self.resolve(&schema_name, &current_name)?.ok_or_else(missing)?;
-
-        let family = if desc.class.is_view() { VIEW_TAB } else { TABLE_TAB };
-        let name_pi = RELTAB_PAY_NAME;
-        self.rewrite_sys_row(family, desc.tid as u128, missing, |b, row| {
-            b.set_string_cell(row, name_pi, &new_name)
-        })?;
-        if desc.class.is_view() {
+        let tid = rel.tid;
+        let family = if rel.class.is_view() { VIEW_TAB } else { TABLE_TAB };
+        self.rewrite_sys_row(
+            family,
+            tid as u128,
+            || absent(format!("relation {tid} not found")),
+            |b, row| b.set_string_cell(row, RELTAB_PAY_NAME, &new_name),
+        )?;
+        if rel.class.is_view() {
             // The id, the layout and the rows are unchanged, so the copy is
             // renamed rather than destroyed. Both probes resolve before either
             // arm runs, because the arms need `&mut self`.
             let (claimed, held) = self.mirror.as_deref().map_or((false, false), |m| {
-                (m.views.contains_key(&desc.tid), m.store.cursor_of(desc.tid).is_some())
+                (m.views.contains_key(&tid), m.store.cursor_of(tid).is_some())
             });
             if claimed {
                 // Post-commit, so this must not fail the rename. The only way it
                 // refuses is a poisoned store, which then refuses every read of
                 // the copy too and drops this binding with itself at
                 // `close_mirror` — so the stale name it leaves cannot be acted on.
-                let _ = self.bind(&schema_name, &new_name, Arc::clone(&desc));
+                let _ = self.bind(&schema_name, &new_name, Arc::clone(rel));
             } else if held {
                 // A previous session's copy, replayed by the store's open and
                 // never claimed here. Binding it would mirror a view the host did
                 // not ask for; leaving it would leave the store's record naming
                 // the freed name, for a later registration's scan to match.
-                self.invalidate_own_copy(desc.tid);
+                self.invalidate_own_copy(tid);
             }
         }
         Ok(())
@@ -1555,10 +1405,10 @@ impl GnitzClient {
         self.alter_col_pair(tid, col_idx, |b, row| b.set_u64_cell(row, COLTAB_PAY_IS_NULLABLE, 1))
     }
 
-    /// `ALTER TABLE … ADD COLUMN`: `def` appended after every physical column,
-    /// dropped ones included.
-    pub fn alter_add_column(&mut self, tid: u64, def: &ColumnDef) -> Result<(), ClientError> {
-        let col_idx = self.describe_by_id(tid)?.schema.num_columns();
+    /// `ALTER TABLE … ADD COLUMN`: `def` appended to `rel` after every physical
+    /// column, dropped ones included.
+    pub fn alter_add_column(&mut self, rel: &RelDescriptor, def: &ColumnDef) -> Result<(), ClientError> {
+        let (tid, col_idx) = (rel.tid, rel.schema.num_columns());
 
         let col_s = sys_schema(COL_TAB);
         let mut cb = ZSetBatch::new(col_s);
@@ -1621,23 +1471,22 @@ impl GnitzClient {
 
     // --- Relation resolution ---
 
-    /// The statement's descriptor for `schema_name.name`, or `None` when no such
-    /// relation exists. Every relation lookup routes through here: the SQL write
-    /// targets, ALTER's target resolution, the planner's resolve loop. One round
-    /// trip per relation per statement — the scope holds the absent verdict too,
-    /// so `plan_resolving`'s re-run reads a miss back instead of asking again.
-    /// `Err` is a missing schema or a decode error, not a miss.
+    /// The descriptor for `schema_name.name`, or `None` when no such relation
+    /// exists; `Err` is a missing schema or a decode error. Inside a transaction a
+    /// table's name resolves once, so every statement writes it under one layout.
     pub fn resolve(&mut self, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
-        // Built once and reused as the memo key, the wire target and the memo
-        // write.
         let qname = qualified_name(schema_name, name);
-        if let Some(hit) = self.catalog().get_qname(&qname) {
-            return Ok(hit);
+        if let Some(bound) = self.txn.as_ref().and_then(|t| t.bound.get(&qname)) {
+            return Ok(Some(Arc::clone(bound)));
         }
         let found = self
             .round_trip(Request::Resolve(RelTarget::Name(&qname)))
             .map(Reply::into_resolve)?;
-        self.record_relation(qname, found.clone());
+        if let (Some(txn), Some(desc)) = (self.txn.as_mut(), &found) {
+            if desc.class == RelClass::Table {
+                txn.bound.insert(qname, Arc::clone(desc));
+            }
+        }
         Ok(found)
     }
 
@@ -1736,6 +1585,8 @@ pub struct TxnBuffer {
     /// pushes a new one. Weight-0 rows are not indexed — they are inert, exactly
     /// as the engine's fold treats them.
     last_op_of: HashMap<u64, HashMap<PkBuf, (usize, usize)>>,
+    /// Qualified name → the descriptor [`GnitzClient::resolve`] found for it.
+    bound: HashMap<String, Arc<RelDescriptor>>,
 }
 
 impl TxnBuffer {
@@ -1750,10 +1601,20 @@ impl TxnBuffer {
     /// and earlier families. A delete is a batch of `-1` rows in `Update` mode, so
     /// "delete k; insert k" emits an Update family `[D(k)]` then an Error family
     /// `[I(k)]`, in that order.
-    pub fn push(&mut self, tid: u64, schema: &Schema, batch: ZSetBatch, mode: WireConflictMode, basis: u64) {
+    ///
+    /// Refused when `batch` is not in the layout `tid` already holds.
+    pub fn push(
+        &mut self,
+        tid: u64,
+        schema: &Schema,
+        batch: ZSetBatch,
+        mode: WireConflictMode,
+        basis: u64,
+    ) -> Result<(), ClientError> {
         if batch.is_empty() {
-            return;
+            return Ok(());
         }
+        self.check_layout(tid, |held| batch.layout_matches(&held.schema))?;
         // Copied out, so no borrow of `families_of` spans the `families` read.
         let last = self.families_of.get(&tid).and_then(|v| v.last().copied());
         match last.filter(|&i| self.families[i].mode == mode) {
@@ -1774,6 +1635,20 @@ impl TxnBuffer {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// `matches` over `tid`'s first family; every later one shares its layout.
+    fn check_layout(
+        &self,
+        tid: u64,
+        matches: impl FnOnce(&BufferedFamily) -> Result<(), String>,
+    ) -> Result<(), ClientError> {
+        let Some(&first) = self.families_of.get(&tid).and_then(|v| v.first()) else {
+            return Ok(());
+        };
+        matches(&self.families[first])
+            .map_err(|e| ClientError::from(format!("relation {tid} changed layout during this transaction: {e}")))
     }
 
     /// Fold every row `tid` has buffered since the last catch-up into
@@ -1805,10 +1680,13 @@ impl TxnBuffer {
 
     /// This buffer's ops on `tid`, with that relation's index caught up first;
     /// `None` when the transaction holds no live op on `tid`.
-    pub fn reads(&mut self, tid: u64) -> Option<TxnReads<'_>> {
+    pub fn reads(&mut self, tid: u64, schema: &Schema) -> Result<Option<TxnReads<'_>>, ClientError> {
+        self.check_layout(tid, |held| held.batch.layout_matches(schema))?;
         self.index_tid(tid);
-        let index = self.last_op_of.get(&tid).filter(|m| !m.is_empty())?;
-        Some(TxnReads { families: &self.families, index })
+        let Some(index) = self.last_op_of.get(&tid).filter(|m| !m.is_empty()) else {
+            return Ok(None);
+        };
+        Ok(Some(TxnReads { families: &self.families, index }))
     }
 }
 

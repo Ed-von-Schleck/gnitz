@@ -19,7 +19,6 @@ mod support;
 
 use gnitz_core::{ClientError, GnitzClient, MirrorError, PollOutcome, PollResult, Schema, ZSetBatch};
 use gnitz_mirror::Mirror;
-use gnitz_sql::SqlPlanner;
 use gnitz_store_testkit::{assert_child_ok, run_test_in_child, CHILD_OK};
 use gnitz_test_harness::ServerHandle;
 use support::copy_paths::{copy_dir, has_manifest, manifest_path};
@@ -461,11 +460,8 @@ fn a_view_created_over_a_mirrored_view_binds_the_servers_id() {
     {
         let m = fx.mirror.as_mut().unwrap();
         let before = m.requests_sent();
-        let mut planner = gnitz_sql::SqlPlanner::new(m, "s");
-        planner
-            .execute("CREATE VIEW over_mirror AS SELECT a, b FROM v_keyed")
+        gnitz_sql::execute(m, "s", "CREATE VIEW over_mirror AS SELECT a, b FROM v_keyed")
             .expect("a view over the recreated relation");
-        drop(planner);
         assert!(m.requests_sent() > before, "a DDL statement must resolve upstream");
     }
 
@@ -479,9 +475,7 @@ fn a_view_created_over_a_mirrored_view_binds_the_servers_id() {
 ///
 /// The first covers the local `describe_relation`: a delegated resolve would show
 /// up as one request per statement and nothing else in this suite would notice.
-/// The second pins the statement bracket — without it the descriptor-by-id lookup
-/// misses the scope and the index probe issues a second RESOLVE, so the count
-/// reads two.
+/// The second pins that a statement resolves each relation once.
 ///
 /// Both are counts, not clocks.
 #[test]
@@ -521,14 +515,11 @@ fn a_mirrored_select_issues_no_request() {
 
     // An unmirrored relation read through the same call: one RESOLVE plus the
     // read itself is two frames, so assert the delta rather than a bare zero —
-    // what this pins is that the bracket kept the resolve to *one*.
+    // what this pins is that the resolve is *one*.
     let before = m.requests_sent();
     let _ = query(m, "s", "SELECT a, b, v FROM t WHERE a = 7");
     let delegated = m.requests_sent() - before;
-    assert_eq!(
-        delegated, 2,
-        "a delegated read costs one RESOLVE and one read; a missing statement bracket makes it three",
-    );
+    assert_eq!(delegated, 2, "a delegated read costs one RESOLVE and one read",);
 }
 
 // ---------------------------------------------------------------------------
@@ -1904,8 +1895,7 @@ fn a_mirrored_group_by_honours_the_group_cap() {
         fx.open();
         fx.mirror_both();
         fx.quiesce();
-        let err = SqlPlanner::new(fx.mirror.as_mut().unwrap(), "s")
-            .execute(grouped)
+        let err = gnitz_sql::execute(fx.mirror.as_mut().unwrap(), "s", grouped)
             .expect_err("seven groups must not fit a cap of three");
         assert!(!err.to_string().is_empty(), "the refusal must say something: {err}");
     }
@@ -2106,9 +2096,12 @@ fn ddl_through_the_mirroring_client_retires_its_own_copy() {
 
     // A mirrored view cannot be retargeted, so no copy is ever left behind one.
     fx.mirror().mirror_view("s", "v_keyed").expect("mirror v_keyed");
-    let e = SqlPlanner::new(fx.mirror(), "s")
-        .execute("ALTER VIEW v_keyed AS SELECT a, b, v FROM t WHERE v > 1")
-        .expect_err("a fed view cannot be retargeted");
+    let e = gnitz_sql::execute(
+        fx.mirror(),
+        "s",
+        "ALTER VIEW v_keyed AS SELECT a, b, v FROM t WHERE v > 1",
+    )
+    .expect_err("a fed view cannot be retargeted");
     assert!(e.to_string().contains("delta feed"), "{e}");
 }
 
@@ -2129,9 +2122,7 @@ fn a_rename_through_the_mirroring_client_keeps_the_copy() {
     fx.drain("s", &["v_keyed"]);
     let before = fx.mirror().cursor_of(tid).expect("a round to answer at");
 
-    fx.mirror()
-        .alter_rename_relation("s", "v_keyed", "v_moved")
-        .expect("rename");
+    sql(fx.mirror(), "s", "ALTER TABLE v_keyed RENAME TO v_moved");
 
     assert!(
         fx.mirror().mirrors(tid),
@@ -2145,9 +2136,7 @@ fn a_rename_through_the_mirroring_client_keeps_the_copy() {
     fx.differential("s", "SELECT * FROM v_moved");
     // The old name is gone rather than answering off the copy.
     assert!(
-        SqlPlanner::new(fx.mirror(), "s")
-            .execute("SELECT * FROM v_keyed")
-            .is_err(),
+        gnitz_sql::execute(fx.mirror(), "s", "SELECT * FROM v_keyed").is_err(),
         "a renamed view must not keep answering under its old name",
     );
 
@@ -2189,9 +2178,7 @@ fn a_rename_by_a_client_that_never_claimed_the_copy_retracts_the_record() {
         "but the store still holds the replayed copy",
     );
 
-    fx.mirror()
-        .alter_rename_relation("s", "v_keyed", "v_moved")
-        .expect("rename");
+    sql(fx.mirror(), "s", "ALTER TABLE v_keyed RENAME TO v_moved");
     assert!(
         !std::path::Path::new(&dir).exists(),
         "an unclaimed record is retracted with its directory, not left naming the old name",
@@ -2296,9 +2283,7 @@ fn a_drop_and_a_rename_into_the_freed_name_report_once_each() {
     // reply when `A`'s poll comes back refused.
     churn(&mut fx.direct, 61, 120);
     sql(&mut fx.direct, "s", "DROP VIEW v_a");
-    fx.direct
-        .alter_rename_relation("s", "v_b", "v_a")
-        .expect("rename into the freed name");
+    sql(&mut fx.direct, "s", "ALTER TABLE v_b RENAME TO v_a");
     let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_a");
 
     let report = fx
@@ -2414,9 +2399,7 @@ fn a_view_renamed_upstream_survives_a_new_view_under_its_old_name() {
     let renamed = fx.mirror().mirror_view("s", "v_keyed").expect("mirror v_keyed").view_id;
     fx.quiesce();
 
-    fx.direct
-        .alter_rename_relation("s", "v_keyed", "v_moved")
-        .expect("rename through the other client");
+    sql(&mut fx.direct, "s", "ALTER TABLE v_keyed RENAME TO v_moved");
     sql(
         &mut fx.direct,
         "s",
@@ -2470,12 +2453,8 @@ fn a_cross_rename_retracts_the_copy_that_lost_its_name() {
     let a_dir = copy_dir(&fx.base_dir(), a);
     assert!(std::path::Path::new(&a_dir).exists(), "v_a's copy is on disk");
 
-    fx.direct
-        .alter_rename_relation("s", "v_a", "v_c")
-        .expect("rename v_a out of the way");
-    fx.direct
-        .alter_rename_relation("s", "v_b", "v_a")
-        .expect("rename v_b into the freed name");
+    sql(&mut fx.direct, "s", "ALTER TABLE v_a RENAME TO v_c");
+    sql(&mut fx.direct, "s", "ALTER TABLE v_b RENAME TO v_a");
     let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_a");
 
     let out = fx.mirror().mirror_view("s", "v_a").expect("re-mirror");
@@ -2662,8 +2641,7 @@ fn poisoned_read_child() {
     // The copy is still gated in — cursor and registration both stand — so this
     // is a read the store would otherwise have answered.
     assert!(mirror.mirrors(tid));
-    let err = SqlPlanner::new(&mut mirror, "s")
-        .execute("SELECT * FROM v_keyed")
+    let err = gnitz_sql::execute(&mut mirror, "s", "SELECT * FROM v_keyed")
         .expect_err("a poisoned copy must refuse the read it would answer");
     assert!(err.to_string().contains("poisoned"), "the refusal must say why: {err}",);
 
@@ -2680,8 +2658,7 @@ fn poisoned_read_child() {
     // A DDL that retires the mirrored view must not fail because the store
     // refuses the teardown: the client-side gate is what stops the copy
     // answering, and everything past it is reclamation.
-    SqlPlanner::new(&mut mirror, "s")
-        .execute("DROP VIEW v_keyed")
+    gnitz_sql::execute(&mut mirror, "s", "DROP VIEW v_keyed")
         .expect("a poisoned store must not fail a DDL that already committed");
     assert!(!mirror.mirrors(tid), "and the copy stops answering all the same");
 

@@ -1,11 +1,11 @@
 use super::*;
-use crate::test_support::{col_def, parse_expr_sql, parse_stmt};
+use crate::test_support::{col, ncol, parse_expr_sql, parse_stmt};
 use gnitz_core::{BatchAppender, TypeCode};
 use sqlparser::ast::Statement;
 
 /// `(pk U64 PK, cols…)`.
 fn table(cols: Vec<ColumnDef>) -> Schema {
-    let mut columns = vec![col_def("pk", TypeCode::U64, false)];
+    let mut columns = vec![col("pk", TypeCode::U64)];
     columns.extend(cols);
     Schema { columns, pk_cols: vec![0] }
 }
@@ -74,7 +74,7 @@ fn bind_err(r: Result<impl Sized, GnitzSqlError>) -> String {
 
 #[test]
 fn a_column_assigned_twice_is_rejected() {
-    let schema = table(vec![col_def("val", TypeCode::I64, true)]);
+    let schema = table(vec![ncol("val", TypeCode::I64)]);
     let m = bind_err(compile("val = 1, val = 2", &schema));
     assert!(m.contains("multiple assignments to column 'val'"), "{m}");
 }
@@ -82,7 +82,7 @@ fn a_column_assigned_twice_is_rejected() {
 /// PostgreSQL refuses `SET t.val = …`; a qualifier must not be dropped.
 #[test]
 fn a_qualified_target_is_rejected() {
-    let schema = table(vec![col_def("val", TypeCode::I64, true)]);
+    let schema = table(vec![ncol("val", TypeCode::I64)]);
     match compile("t.val = 1", &schema) {
         Err(GnitzSqlError::Plan(m)) => assert!(m.contains("column must be a simple identifier"), "{m}"),
         Err(e) => panic!("expected Plan, got {e:?}"),
@@ -98,7 +98,7 @@ fn a_qualified_target_is_rejected() {
 /// read; one that fits classifies as a constant.
 #[test]
 fn a_constant_set_value_is_range_checked_at_bind() {
-    let schema = table(vec![col_def("val", TypeCode::U8, true)]);
+    let schema = table(vec![ncol("val", TypeCode::U8)]);
     let m = bind_err(compile("val = 300", &schema));
     assert!(m.contains("out of range"), "{m}");
     let set = compile("val = 255", &schema).unwrap();
@@ -109,7 +109,7 @@ fn a_constant_set_value_is_range_checked_at_bind() {
 /// string that spells no integer is refused, naming it.
 #[test]
 fn a_float_or_string_literal_into_an_integer_column() {
-    let schema = table(vec![col_def("i", TypeCode::I64, true)]);
+    let schema = table(vec![ncol("i", TypeCode::I64)]);
     let set = compile("i = 1.5", &schema).unwrap();
     assert!(matches!(&set[0].rhs, SetRhs::Const { cell, .. } if cell == &2i64.to_le_bytes()));
     let m = bind_err(compile("i = 'abc'", &schema));
@@ -118,7 +118,7 @@ fn a_float_or_string_literal_into_an_integer_column() {
 
 #[test]
 fn a_non_null_assignment_clears_the_null_bit() {
-    let schema = table(vec![col_def("val", TypeCode::I64, true)]);
+    let schema = table(vec![ncol("val", TypeCode::I64)]);
     let rows = rows_of(&schema, 1, |a, _| {
         a.null();
     });
@@ -130,10 +130,7 @@ fn a_non_null_assignment_clears_the_null_bit() {
 
 #[test]
 fn unassigned_columns_carry_their_null_bits() {
-    let schema = table(vec![
-        col_def("a", TypeCode::I64, true),
-        col_def("b", TypeCode::I64, true),
-    ]);
+    let schema = table(vec![ncol("a", TypeCode::I64), ncol("b", TypeCode::I64)]);
     let rows = rows_of(&schema, 1, |a, _| {
         a.i64_val(5).null();
     });
@@ -159,11 +156,11 @@ fn a_decimal_literal_rounds_to_the_column_scale() {
 #[test]
 fn a_wide_negative_literal_keeps_its_sign() {
     for tc in [TypeCode::U64, TypeCode::U128] {
-        let schema = table(vec![col_def("u", tc, true)]);
+        let schema = table(vec![ncol("u", tc)]);
         let m = bind_err(compile("u = -18446744073709551615", &schema));
         assert!(m.contains("out of range"), "{tc:?}: {m}");
     }
-    let schema = table(vec![col_def("f", TypeCode::F64, true)]);
+    let schema = table(vec![ncol("f", TypeCode::F64)]);
     let rows = rows_of(&schema, 1, |a, _| {
         a.f64_val(0.0);
     });
@@ -173,7 +170,7 @@ fn a_wide_negative_literal_keeps_its_sign() {
 
 #[test]
 fn a_float_literal_writes_a_double_column() {
-    let schema = table(vec![col_def("f", TypeCode::F64, true)]);
+    let schema = table(vec![ncol("f", TypeCode::F64)]);
     let rows = rows_of(&schema, 1, |a, _| {
         a.null();
     });
@@ -186,7 +183,7 @@ fn a_float_literal_writes_a_double_column() {
 /// take it, and the arena holds nothing else.
 #[test]
 fn a_long_string_literal_spills_once() {
-    let schema = table(vec![col_def("s", TypeCode::String, true)]);
+    let schema = table(vec![ncol("s", TypeCode::String)]);
     let rows = rows_of(&schema, 3, |a, _| {
         a.str_val("a");
     });
@@ -204,10 +201,7 @@ fn a_long_string_literal_spills_once() {
 
 #[test]
 fn a_copy_from_a_null_source_sets_the_null_bit() {
-    let schema = table(vec![
-        col_def("a", TypeCode::I64, true),
-        col_def("b", TypeCode::I64, true),
-    ]);
+    let schema = table(vec![ncol("a", TypeCode::I64), ncol("b", TypeCode::I64)]);
     let rows = rows_of(&schema, 1, |a, _| {
         a.i64_val(5).null();
     });
@@ -221,10 +215,7 @@ fn a_copy_from_a_null_source_sets_the_null_bit() {
 /// Every right-hand side reads the rows as they were.
 #[test]
 fn a_swap_reads_the_old_row() {
-    let schema = table(vec![
-        col_def("a", TypeCode::I64, true),
-        col_def("b", TypeCode::I64, true),
-    ]);
+    let schema = table(vec![ncol("a", TypeCode::I64), ncol("b", TypeCode::I64)]);
     let rows = rows_of(&schema, 1, |a, _| {
         a.i64_val(1).i64_val(2);
     });
@@ -235,10 +226,10 @@ fn a_swap_reads_the_old_row() {
 #[test]
 fn same_type_copies_work_for_float_and_uuid_columns() {
     let schema = table(vec![
-        col_def("f", TypeCode::F64, true),
-        col_def("g", TypeCode::F64, true),
-        col_def("u", TypeCode::UUID, true),
-        col_def("w", TypeCode::UUID, true),
+        ncol("f", TypeCode::F64),
+        ncol("g", TypeCode::F64),
+        ncol("u", TypeCode::UUID),
+        ncol("w", TypeCode::UUID),
     ]);
     let rows = rows_of(&schema, 1, |a, _| {
         a.f64_val(0.0).f64_val(2.5).u128_val(0).u128_val(u128::MAX - 7);
@@ -255,10 +246,7 @@ fn same_type_copies_work_for_float_and_uuid_columns() {
 /// cells still point into it.
 #[test]
 fn a_non_string_set_leaves_the_arena_unchanged() {
-    let schema = table(vec![
-        col_def("b", TypeCode::Blob, true),
-        col_def("v", TypeCode::I64, true),
-    ]);
+    let schema = table(vec![ncol("b", TypeCode::Blob), ncol("v", TypeCode::I64)]);
     let long = [7u8; 30];
     let rows = rows_of(&schema, 1, |a, _| {
         a.bytes_val(&long).i64_val(7);
@@ -274,10 +262,7 @@ fn a_non_string_set_leaves_the_arena_unchanged() {
 /// replaced cell's spill does not survive.
 #[test]
 fn a_text_assignment_leaves_only_referenced_spill() {
-    let schema = table(vec![
-        col_def("s", TypeCode::String, true),
-        col_def("t", TypeCode::String, true),
-    ]);
+    let schema = table(vec![ncol("s", TypeCode::String), ncol("t", TypeCode::String)]);
     let (old, kept) = ("o".repeat(30), "k".repeat(20));
     let rows = rows_of(&schema, 1, |a, _| {
         a.str_val(&old).str_val(&kept);
@@ -296,10 +281,7 @@ fn a_text_assignment_leaves_only_referenced_spill() {
 /// than reading the filler zeros as a real `0`.
 #[test]
 fn a_computed_value_over_a_nullable_column() {
-    let schema = table(vec![
-        col_def("a", TypeCode::I64, true),
-        col_def("b", TypeCode::I64, true),
-    ]);
+    let schema = table(vec![ncol("a", TypeCode::I64), ncol("b", TypeCode::I64)]);
     let rows = rows_of(&schema, 2, |a, r| {
         a.i64_val(0);
         if r == 0 {
@@ -316,7 +298,7 @@ fn a_computed_value_over_a_nullable_column() {
 
 #[test]
 fn set_reads_the_pk_column() {
-    let schema = table(vec![col_def("val", TypeCode::I64, true)]);
+    let schema = table(vec![ncol("val", TypeCode::I64)]);
     for (set, want) in [("val = pk + 1", 2), ("val = pk", 1)] {
         let rows = rows_of(&schema, 1, |a, _| {
             a.i64_val(0);
@@ -329,10 +311,7 @@ fn set_reads_the_pk_column() {
 /// bit pattern would otherwise commit as a nonsense integer.
 #[test]
 fn set_int_column_from_float_expression_rejects() {
-    let schema = table(vec![
-        col_def("n", TypeCode::I64, true),
-        col_def("f", TypeCode::F64, true),
-    ]);
+    let schema = table(vec![ncol("n", TypeCode::I64), ncol("f", TypeCode::F64)]);
     let Err(err) = compile("n = f", &schema) else {
         panic!("SET int = float must reject");
     };
@@ -343,7 +322,7 @@ fn set_int_column_from_float_expression_rejects() {
 
 #[test]
 fn a_computed_string_evaluates_to_a_string() {
-    let schema = table(vec![col_def("val", TypeCode::String, true)]);
+    let schema = table(vec![ncol("val", TypeCode::String)]);
     let mut set = compile("val = UPPER(val)", &schema).unwrap();
     assert!(matches!(&set[0].rhs, SetRhs::Expr { ev, .. } if ev.result_is_str()));
     let rows = rows_of(&schema, 1, |a, _| {
@@ -357,7 +336,7 @@ fn a_computed_string_evaluates_to_a_string() {
 
 #[test]
 fn a_string_rhs_against_an_integer_column_is_rejected() {
-    let schema = table(vec![col_def("val", TypeCode::I64, true)]);
+    let schema = table(vec![ncol("val", TypeCode::I64)]);
     let concat = BoundExpr::ConcatN { args: vec![BoundExpr::LitInt(1)] };
     bind_err(classify_set_rhs(&concat, Scope::Existing, 1, &schema));
 }
@@ -376,7 +355,7 @@ fn a_computed_value_is_range_checked_and_encodes_natively() {
         (TypeCode::U32, -1),
         (TypeCode::U64, -1),
     ] {
-        let schema = table(vec![col_def("src", TypeCode::I64, true), col_def("dst", tc, true)]);
+        let schema = table(vec![ncol("src", TypeCode::I64), ncol("dst", tc)]);
         let rows = rows_of(&schema, 1, |a, _| {
             a.i64_val(v).null();
         });
@@ -413,7 +392,7 @@ fn a_computed_value_is_range_checked_and_encodes_natively() {
             i64::MIN.to_le_bytes().to_vec(),
         ),
     ] {
-        let schema = table(vec![col_def("src", src_tc, true), col_def("dst", tc, true)]);
+        let schema = table(vec![ncol("src", src_tc), ncol("dst", tc)]);
         let rows = rows_of(&schema, 1, |a, _| {
             a.u64_val(v).null();
         });
@@ -424,7 +403,7 @@ fn a_computed_value_is_range_checked_and_encodes_natively() {
 
 #[test]
 fn a_u64_value_past_i64_max_writes() {
-    let schema = table(vec![col_def("u", TypeCode::U64, true)]);
+    let schema = table(vec![ncol("u", TypeCode::U64)]);
     let rows = rows_of(&schema, 1, |a, _| {
         a.u64_val(1 << 63);
     });
@@ -433,10 +412,7 @@ fn a_u64_value_past_i64_max_writes() {
 
 #[test]
 fn a_u64_value_past_i64_max_is_out_of_range_for_i64() {
-    let schema = table(vec![
-        col_def("i", TypeCode::I64, true),
-        col_def("u", TypeCode::U64, true),
-    ]);
+    let schema = table(vec![ncol("i", TypeCode::I64), ncol("u", TypeCode::U64)]);
     let rows = rows_of(&schema, 1, |a, _| {
         a.i64_val(0).u64_val(1 << 63);
     });
@@ -447,7 +423,7 @@ fn a_u64_value_past_i64_max_is_out_of_range_for_i64() {
 #[test]
 fn a_decimal_source_rounds_into_an_integer_column() {
     let schema = table(vec![
-        col_def("i", TypeCode::I64, true),
+        ncol("i", TypeCode::I64),
         ColumnDef::typed("d", ColType::decimal(2), true),
     ]);
     let rows = rows_of(&schema, 2, |a, r| {
@@ -459,10 +435,7 @@ fn a_decimal_source_rounds_into_an_integer_column() {
 
 #[test]
 fn a_date_source_converts_into_a_timestamp_column() {
-    let schema = table(vec![
-        col_def("d", TypeCode::Date, true),
-        col_def("ts", TypeCode::Timestamp, true),
-    ]);
+    let schema = table(vec![ncol("d", TypeCode::Date), ncol("ts", TypeCode::Timestamp)]);
     let mut rows = ZSetBatch::new(&schema);
     rows.pks.push_u128(&schema, 1);
     rows.weights.push(1);

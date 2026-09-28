@@ -1,6 +1,8 @@
+//! The SQL front end: parses, plans and runs statements against a `GnitzClient`.
+//!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
-//! private items.
+//! private items; tests no single module owns live in `suites/`.
 
 #![warn(unreachable_pub)]
 
@@ -17,50 +19,31 @@ mod exec;
 mod expr_lower;
 mod hir;
 mod ir;
+#[cfg(test)]
+mod suites;
 mod tail;
 #[cfg(test)]
 mod test_support;
 mod types;
 mod validate;
 
-pub use ddl::{plan_create_table, TablePlan};
-pub use dml::{explain_lines, plan_read, ReadPlan};
 pub use error::GnitzSqlError;
-pub use hir::{plan_alter_view, plan_create_view, PlannedChain, ViewPlan};
-// The planning entry points take `sqlparser::ast` nodes, so a caller must
-// be able to build one with the same pinned parser the planner matches on.
-pub use sqlparser;
 
 use gnitz_core::{GnitzClient, Schema, ZSetBatch};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use std::sync::Arc;
 
 /// Result of executing a single SQL statement.
 #[derive(Debug)]
 pub enum SqlResult {
-    TableCreated {
-        table_id: u64,
-    },
-    ViewCreated {
-        view_id: u64,
-    },
-    IndexCreated {
-        index_id: u64,
-    },
-    Dropped,
-    /// `ALTER TABLE/VIEW` (rename table/view/column, DROP CONSTRAINT, ALTER VIEW
-    /// AS). `object` is the altered kind (`"table"` / `"view"` / `"column"` /
-    /// `"constraint"`) and `name` its new/affected name. (`ADD CONSTRAINT UNIQUE`
-    /// maps to CREATE UNIQUE INDEX and returns `IndexCreated` instead.)
-    Altered {
-        object: String,
-        name: String,
-    },
+    /// A CREATE, DROP or ALTER succeeded — or, under `IF [NOT] EXISTS`, had nothing to do.
+    Ddl,
     RowsAffected {
         count: usize,
     },
     Rows {
-        schema: std::sync::Arc<Schema>,
+        schema: Arc<Schema>,
         batch: ZSetBatch,
     },
     /// `BEGIN` / `START TRANSACTION`: a client-side transaction buffer opened.
@@ -74,57 +57,27 @@ pub enum SqlResult {
     TransactionRolledBack,
 }
 
-/// High-level SQL execution planner.
-///
-/// It plans against one [`GnitzClient`]. A `SELECT` and the `EXPLAIN` of one are
-/// answered off that client's local copy where it holds the relation and over
-/// the wire where it does not; everything else is the connection's. Which of the
-/// two a statement's arm asks for is named by the resolve and read functions it
-/// passes down, not by which object it borrows.
-pub struct SqlPlanner<'a> {
-    client: &'a mut GnitzClient,
-    schema_name: String,
-}
-
-impl<'a> SqlPlanner<'a> {
-    pub fn new(client: &'a mut GnitzClient, schema_name: impl Into<String>) -> Self {
-        SqlPlanner { client, schema_name: schema_name.into() }
-    }
-
-    /// Parse `sql` and execute each statement, returning one `SqlResult` per statement.
-    ///
-    /// Each statement plans against a **statement-scoped snapshot** memoising
-    /// relation resolves by qualified name, absent verdicts included. It is
-    /// dropped at the end of each statement, so the next one sees this one's DDL
-    /// writes.
-    pub fn execute(&mut self, sql: &str) -> Result<Vec<SqlResult>, GnitzSqlError> {
-        let dialect = GenericDialect {};
-        let stmts = Parser::parse_sql(&dialect, sql)?;
-        // If THIS call opens a transaction (was inactive at entry) and then errors
-        // with the transaction still open, roll it back before returning —
-        // otherwise the stranded open buffer would silently swallow the caller's
-        // subsequent autocommit statements. A transaction opened by an *earlier*
-        // call is left open (the caller owns its lifecycle). On a COMMIT failure
-        // `txn_commit` already took the buffer out, so `txn_active()` is false
-        // here — no double-rollback.
-        let txn_was_active = self.client.txn_active();
-        let mut results = Vec::with_capacity(stmts.len());
-        for stmt in &stmts {
-            // The snapshot lives on the client whether the read is local or
-            // delegated: the planner's resolve loop fills it by name.
-            self.client.begin_statement();
-            let r = dispatch::execute_statement(self.client, &self.schema_name, stmt);
-            self.client.end_statement();
-            match r {
-                Ok(res) => results.push(res),
-                Err(e) => {
-                    if !txn_was_active && self.client.txn_active() {
-                        let _ = self.client.txn_rollback();
-                    }
-                    return Err(e);
+/// Parse `sql` and run each statement, one `SqlResult` per statement. A `SELECT`
+/// (and its `EXPLAIN`) over a relation the client's local copy holds is answered
+/// off that copy; everything else runs on the connection.
+pub fn execute(client: &mut GnitzClient, schema_name: &str, sql: &str) -> Result<Vec<SqlResult>, GnitzSqlError> {
+    let stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
+    let mut results = Vec::with_capacity(stmts.len());
+    // One begun by an earlier call is the caller's to end.
+    let mut began_here = false;
+    for stmt in &stmts {
+        match dispatch::execute_statement(client, schema_name, stmt) {
+            Ok(r) => {
+                began_here |= matches!(r, SqlResult::TransactionStarted);
+                results.push(r);
+            }
+            Err(e) => {
+                if began_here && client.txn_active() {
+                    let _ = client.txn_rollback();
                 }
+                return Err(e);
             }
         }
-        Ok(results)
     }
+    Ok(results)
 }

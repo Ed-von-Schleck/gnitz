@@ -11,13 +11,13 @@ use crate::ast_util::{
     body_is_grouped, classify_from, col_ref_parts, expand_wildcard_item, expr_node_count, expr_operands_mut,
     extract_table_name_and_alias, is_bare_wildcard_projection, object_name_ident, scalar_projection_item, FromShape,
 };
-use crate::bind::{apply_positional_aliases, probe_relation, reject_foreign_qualifier, single_relation_col_idx};
+use crate::bind::{apply_positional_aliases, reject_foreign_qualifier, single_relation_col_idx, Catalog};
 use crate::error::{derivation, unsupported_clause, GnitzSqlError};
 use crate::validate::{
     as_plain_select, computed_column_name, cte_body, non_recursive_ctes, reject_duplicate_projection_names,
     reject_unhonored_select_clauses, require_class, validate_user_name, ClassWant, HonoredClauses,
 };
-use gnitz_core::{CatalogSnapshot, ColumnDef, TypeCode};
+use gnitz_core::{ColumnDef, TypeCode};
 use sqlparser::ast::{
     BinaryOperator, Expr, GroupByExpr, Ident, OrderBy, OrderByKind, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, TableWithJoins, WildcardAdditionalOptions,
@@ -40,11 +40,8 @@ struct Cte {
 }
 
 /// Expand `query`'s CTEs into its body. `None` when it has no `WITH`.
-pub(super) fn inline_ctes(
-    cat: &CatalogSnapshot,
-    schema_name: &str,
-    query: &Query,
-) -> Result<Option<Query>, GnitzSqlError> {
+pub(super) fn inline_ctes(cat: &Catalog<'_>, query: &Query) -> Result<Option<Query>, GnitzSqlError> {
+    let schema_name = cat.schema_name();
     let ctes = non_recursive_ctes(query)?;
     if ctes.is_empty() {
         return Ok(None);
@@ -64,7 +61,7 @@ pub(super) fn inline_ctes(
         let cols = if is_bare_wildcard_projection(&body.projection) && cte.alias.columns.is_empty() {
             None
         } else {
-            let mut cols = cte_columns(cat, schema_name, &body, &ctx)?;
+            let mut cols = cte_columns(cat, &body, &ctx)?;
             apply_positional_aliases(
                 cte.alias.columns.iter().map(|a| &a.name),
                 cols.iter_mut().map(|(d, _)| d),
@@ -95,12 +92,7 @@ pub(super) fn inline_ctes(
 /// A CTE body's output columns by name. A wildcard needs the source schema, so
 /// the FROM must be one relation; any other FROM derives and is rejected as the
 /// route would reject it.
-fn cte_columns(
-    cat: &CatalogSnapshot,
-    schema_name: &str,
-    body: &Select,
-    ctx: &str,
-) -> Result<Vec<(ColumnDef, Expr)>, GnitzSqlError> {
+fn cte_columns(cat: &Catalog<'_>, body: &Select, ctx: &str) -> Result<Vec<(ColumnDef, Expr)>, GnitzSqlError> {
     let mut cols = Vec::new();
     for (idx, item) in body.projection.iter().enumerate() {
         let SelectItem::Wildcard(o) = item else {
@@ -116,8 +108,8 @@ fn cte_columns(
             FromShape::Empty => return Err(unsupported_clause(ctx, "SELECT * without FROM")),
             FromShape::Derived(c) => return Err(derivation(c)),
         };
-        let (table, _) = extract_table_name_and_alias(tf, schema_name, ctx)?;
-        let desc = probe_relation(cat, schema_name, &table)?;
+        let (table, _) = extract_table_name_and_alias(tf, cat.schema_name(), ctx)?;
+        let desc = cat.probe_relation(&table)?;
         require_class(&desc, &table, ClassWant::Readable, ctx)?;
         for (i, def) in expand_wildcard_item(o, &desc.schema.columns, ctx)? {
             cols.push((def, Expr::Identifier(Ident::new(desc.schema.columns[i].name.clone()))));

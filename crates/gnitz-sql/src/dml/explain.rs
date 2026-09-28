@@ -22,7 +22,7 @@ pub(crate) fn execute_explain(client: &GnitzClient, plan: &ReadPlan) -> SqlResul
 /// where the predicate runs, the sink's shape, and the ORDER BY / LIMIT tail.
 /// `local`: the read is served off the client's copy, which executes the same
 /// `ReadSpec` the server would.
-pub fn explain_lines(plan: &ReadPlan, local: bool) -> Vec<String> {
+pub(crate) fn explain_lines(plan: &ReadPlan, local: bool) -> Vec<String> {
     let order_limit = order_limit_line(plan, local);
     let (read, shape) = match &plan.case {
         ReadCase::Constant { schema, .. } => {

@@ -3,19 +3,108 @@
 //! single source of truth so the canonical schemas (PK widths, UUID columns,
 //! compound PKs) and the literal-expression shapes can't drift between modules.
 
+use crate::bind::Catalog;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use gnitz_core::{ColumnDef, PkBuf, PkColumn, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{
+    ColumnDef, PkBuf, PkColList, PkColumn, PlannedView, RelClass, RelDescriptor, RelIndex, Schema, TypeCode, ZSetBatch,
+};
 use sqlparser::ast::{BinaryOperator, Expr, Ident, UnaryOperator, Value};
+use std::sync::Arc;
 
-pub(crate) fn col_def(name: &str, tc: TypeCode, nullable: bool) -> ColumnDef {
-    ColumnDef::new(name, tc, nullable)
+/// The schema every test catalog resolves under.
+pub(crate) const SN: &str = "s";
+
+/// A NOT NULL column.
+pub(crate) fn col(name: &str, tc: TypeCode) -> ColumnDef {
+    ColumnDef::new(name, tc, false)
+}
+
+/// A nullable column.
+pub(crate) fn ncol(name: &str, tc: TypeCode) -> ColumnDef {
+    ColumnDef::new(name, tc, true)
+}
+
+/// A relation descriptor over `indexes`.
+fn descriptor(
+    tid: u64,
+    class: RelClass,
+    columns: Vec<ColumnDef>,
+    pk_cols: Vec<u32>,
+    indexes: Vec<RelIndex>,
+) -> Arc<RelDescriptor> {
+    Arc::new(RelDescriptor {
+        tid,
+        class,
+        pk_repeats: class == RelClass::Stream,
+        serial: false,
+        schema: Arc::new(Schema { columns, pk_cols }),
+        indexes,
+    })
+}
+
+/// A relation descriptor. `indexes` lists secondary indexes as
+/// `(column indices, is_unique)`.
+pub(crate) fn rel_with(
+    tid: u64,
+    class: RelClass,
+    columns: Vec<ColumnDef>,
+    pk_cols: Vec<u32>,
+    indexes: &[(&[u32], bool)],
+) -> Arc<RelDescriptor> {
+    descriptor(tid, class, columns, pk_cols, idx_metas_flagged(indexes))
+}
+
+/// [`rel_with`], every index non-unique — what a read plan cares about.
+pub(crate) fn rel(
+    tid: u64,
+    class: RelClass,
+    columns: Vec<ColumnDef>,
+    pk_cols: Vec<u32>,
+    indexes: &[&[u32]],
+) -> Arc<RelDescriptor> {
+    descriptor(tid, class, columns, pk_cols, idx_metas(indexes))
+}
+
+/// A plain, partitioned, unindexed base table.
+pub(crate) fn table(tid: u64, columns: Vec<ColumnDef>, pk_cols: Vec<u32>) -> Arc<RelDescriptor> {
+    rel(tid, RelClass::Table, columns, pk_cols, &[])
+}
+
+/// A resolver that knows no relation.
+fn absent(_: &str) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
+    Ok(None)
+}
+
+/// A catalog holding `rels` under [`SN`]; any other name is absent.
+pub(crate) fn catalog(rels: Vec<(&str, Arc<RelDescriptor>)>) -> Catalog<'static> {
+    let cat = Catalog::new(SN, &absent);
+    for (name, desc) in rels {
+        cat.insert(name, Some(desc));
+    }
+    cat
+}
+
+/// Register `view` under `name` as a `class` relation, as the server would after
+/// `CREATE VIEW`.
+pub(crate) fn register(cat: &Catalog<'_>, name: &str, tid: u64, class: RelClass, view: &PlannedView) {
+    cat.insert(
+        name,
+        Some(Arc::new(RelDescriptor {
+            tid,
+            class,
+            pk_repeats: view.pk_repeats,
+            serial: false,
+            schema: Arc::clone(&view.schema),
+            indexes: Vec::new(),
+        })),
+    );
 }
 
 /// `(pk pk_tc, v I64)` — single-column PK of a chosen type plus one payload.
 pub(crate) fn pk_schema(pk_tc: TypeCode) -> Schema {
     Schema {
-        columns: vec![col_def("id", pk_tc, false), col_def("v", TypeCode::I64, false)],
+        columns: vec![col("id", pk_tc), col("v", TypeCode::I64)],
         pk_cols: vec![0],
     }
 }
@@ -23,7 +112,7 @@ pub(crate) fn pk_schema(pk_tc: TypeCode) -> Schema {
 /// `(pk U64, val val_tc nullable)` — single-PK schema with one nullable payload.
 pub(crate) fn two_col(val_tc: TypeCode) -> Schema {
     Schema {
-        columns: vec![col_def("pk", TypeCode::U64, false), col_def("val", val_tc, true)],
+        columns: vec![col("pk", TypeCode::U64), ncol("val", val_tc)],
         pk_cols: vec![0],
     }
 }
@@ -42,7 +131,7 @@ pub(crate) fn batch_2col(val_bytes: Vec<u8>, val_tc: TypeCode, null_bits: u64) -
 /// A single UUID PK column.
 pub(crate) fn uuid_schema_pk() -> Schema {
     Schema {
-        columns: vec![col_def("id", TypeCode::UUID, false)],
+        columns: vec![col("id", TypeCode::UUID)],
         pk_cols: vec![0],
     }
 }
@@ -50,10 +139,7 @@ pub(crate) fn uuid_schema_pk() -> Schema {
 /// `(pk U64, uid UUID nullable)` — a UUID in a non-PK (payload) slot.
 pub(crate) fn uuid_schema_payload() -> Schema {
     Schema {
-        columns: vec![
-            col_def("pk", TypeCode::U64, false),
-            col_def("uid", TypeCode::UUID, true),
-        ],
+        columns: vec![col("pk", TypeCode::U64), ncol("uid", TypeCode::UUID)],
         pk_cols: vec![0],
     }
 }
@@ -63,9 +149,9 @@ pub(crate) fn uuid_schema_payload() -> Schema {
 pub(crate) fn compound_schema_u64_u64() -> Schema {
     Schema {
         columns: vec![
-            col_def("a", TypeCode::U64, false),
-            col_def("b", TypeCode::U64, false),
-            col_def("v", TypeCode::I64, true),
+            col("a", TypeCode::U64),
+            col("b", TypeCode::U64),
+            ncol("v", TypeCode::I64),
         ],
         pk_cols: vec![0, 1],
     }
@@ -160,17 +246,17 @@ pub(crate) fn parse_query(sql: &str) -> sqlparser::ast::Query {
 }
 
 /// Non-unique `RelIndex` list from raw column-index lists.
-pub(crate) fn idx_metas(col_lists: &[&[u32]]) -> Vec<gnitz_core::RelIndex> {
+pub(crate) fn idx_metas(col_lists: &[&[u32]]) -> Vec<RelIndex> {
     let flagged: Vec<(&[u32], bool)> = col_lists.iter().map(|cols| (*cols, false)).collect();
     idx_metas_flagged(&flagged)
 }
 
 /// `RelIndex` list from raw column-index lists, each with its `is_unique` flag.
-pub(crate) fn idx_metas_flagged(col_lists: &[(&[u32], bool)]) -> Vec<gnitz_core::RelIndex> {
+pub(crate) fn idx_metas_flagged(col_lists: &[(&[u32], bool)]) -> Vec<RelIndex> {
     col_lists
         .iter()
-        .map(|(cols, is_unique)| gnitz_core::RelIndex {
-            cols: gnitz_core::PkColList::from_slice(cols),
+        .map(|(cols, is_unique)| RelIndex {
+            cols: PkColList::from_slice(cols),
             is_unique: *is_unique,
         })
         .collect()

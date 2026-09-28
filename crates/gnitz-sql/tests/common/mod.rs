@@ -8,7 +8,7 @@
 //! duplicated one as the same result.
 
 use gnitz_core::{GnitzClient, Schema, ZSetBatch};
-use gnitz_sql::{GnitzSqlError, SqlPlanner, SqlResult};
+use gnitz_sql::{GnitzSqlError, SqlResult};
 use gnitz_test_harness::ServerHandle;
 
 /// A private `workers`-worker server, a client on it, and a fresh schema.
@@ -24,14 +24,12 @@ pub fn boot(workers: usize) -> (ServerHandle, GnitzClient, String) {
 
 /// Execute `sql`, asserting it succeeds.
 pub fn exec(client: &mut GnitzClient, sn: &str, sql: &str) {
-    SqlPlanner::new(client, sn)
-        .execute(sql)
-        .unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+    gnitz_sql::execute(client, sn, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
 }
 
 /// Execute `sql`, returning the planner's result.
 pub fn try_exec(client: &mut GnitzClient, sn: &str, sql: &str) -> Result<Vec<SqlResult>, GnitzSqlError> {
-    SqlPlanner::new(client, sn).execute(sql)
+    gnitz_sql::execute(client, sn, sql)
 }
 
 /// The error's variant name and message.
@@ -42,7 +40,7 @@ pub fn variant_of(e: &GnitzSqlError) -> (&'static str, String) {
         GnitzSqlError::Plan(m) => ("Plan", m.clone()),
         GnitzSqlError::Exec(m) => ("Exec", m.to_string()),
         GnitzSqlError::Unsupported(m) => ("Unsupported", m.clone()),
-        other => ("other", format!("{other:?}")),
+        GnitzSqlError::Internal(m) => ("Internal", m.clone()),
     }
 }
 

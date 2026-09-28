@@ -250,7 +250,7 @@ fn fed_view(client: &mut GnitzClient, sn: &str, tid: u64) -> u64 {
             }
             .into(),
             gnitz_core::ViewProps::Fed { delta_bytes: 8 << 20 },
-            false,
+            None,
         )
         .expect("create the fed view")
 }

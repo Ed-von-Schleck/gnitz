@@ -6,12 +6,10 @@
 //! worker-filter / filter node counts. Projection lists, map counts, union
 //! counts and node numbering are free to change.
 
-use gnitz_core::{CatalogSnapshot, OpNode, TypeCode};
-use gnitz_sql::PlannedChain;
+use gnitz_core::{OpNode, TypeCode};
 use gnitz_wire::{JoinKind, ReadBound};
 
-mod pure;
-use pure::*;
+use super::*;
 
 /// One row of the shape matrix: body, segment count, the exchanges (shard cols
 /// per `ExchangeShard`, any order), and the node kinds the body must compile to,
@@ -66,12 +64,11 @@ impl Node {
     }
 }
 
-/// [`pure::base`] plus `m`, a second table with nullable join keys.
-fn cat() -> CatalogSnapshot {
-    let mut cat = base();
+/// [`base`] plus `m`, a second table with nullable join keys.
+fn cat() -> Catalog<'static> {
+    let cat = base();
     let i = TypeCode::I64;
     cat.insert(
-        SN,
         "m",
         Some(table(30, vec![col("id", i), ncol("k", i), ncol("v", i)], vec![0])),
     );
@@ -271,7 +268,7 @@ fn a_keyless_step_keys_its_output_by_the_hidden_pair_pk() {
 
 /// `t(pk, g, ind, other)` with `u(pk, val)`; `indexes` lists `t`'s secondary
 /// indexes by column.
-fn indexed(indexes: &[&[u32]]) -> CatalogSnapshot {
+fn indexed(indexes: &[&[u32]]) -> Catalog<'static> {
     let i = TypeCode::I64;
     catalog(vec![
         (
@@ -297,7 +294,7 @@ fn indexed_predicates_bound_the_backfill_scan() {
     let on_ind_other = indexed(&[&[2, 3]]);
     let unindexed = indexed(&[]);
     #[rustfmt::skip]
-    let rows: &[(&CatalogSnapshot, &str, &[&str])] = &[
+    let rows: &[(&Catalog<'static>, &str, &[&str])] = &[
         (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 GROUP BY g", &["[2]"]),
         (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE ind BETWEEN 5 AND 9 GROUP BY g", &["[2]"]),
         (&on_ind_other, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 AND other > 10 GROUP BY g", &["[2, 3]"]),
@@ -346,7 +343,7 @@ fn a_having_without_a_group_by_is_the_whole_relation_group_on_both_surfaces() {
 
     // Ad-hoc: the fold sink, over no group columns and no aggregate.
     assert_eq!(
-        gnitz_sql::explain_lines(&read(&cat, &format!("EXPLAIN {BODY}")).unwrap(), false)[3],
+        crate::dml::explain_lines(&read(&cat, &format!("EXPLAIN {BODY}")).unwrap(), false)[3],
         "fold: global aggregate: ; HAVING applied client-side"
     );
 

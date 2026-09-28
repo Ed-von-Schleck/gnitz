@@ -67,7 +67,7 @@ impl TargetRead {
         // A DML target is a base table, which is never mirrored.
         let ScanReply { batch, lsn, .. } = client.scan_spec(self.tid, &self.spec, &self.reply)?;
         let lsn = lsn.expect("a server read carries its watermark");
-        let rows = match client.txn_reads(self.tid) {
+        let rows = match client.txn_reads(self.tid, &self.schema)? {
             None => batch,
             Some(txn) => self.merge(batch, &txn)?,
         };

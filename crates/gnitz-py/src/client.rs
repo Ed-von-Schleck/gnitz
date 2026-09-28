@@ -16,7 +16,7 @@ use gnitz_core::{
     ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, ScanReply, Schema, TableProps, WireConflictMode,
 };
 use gnitz_mirror::Mirror;
-use gnitz_sql::{SqlPlanner, SqlResult};
+use gnitz_sql::SqlResult;
 use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec};
 
 use crate::read::{scan_result, PyDeltaReply, PyScanResult};
@@ -351,9 +351,7 @@ impl PyGnitzClient {
     pub fn execute_sql(&mut self, py: Python<'_>, sql: &str, schema_name: &str) -> PyResult<Py<PyAny>> {
         // Plan + execute (all wire I/O, no Python) with the GIL released.
         let c = self.live()?;
-        let results = py
-            .detach(|| SqlPlanner::new(c, schema_name).execute(sql))
-            .map_err(sql_err)?;
+        let results = py.detach(|| gnitz_sql::execute(c, schema_name, sql)).map_err(sql_err)?;
         sql_results_to_py(py, results)
     }
 
@@ -474,25 +472,8 @@ fn sql_results_to_py(py: Python<'_>, results: Vec<SqlResult>) -> PyResult<Py<PyA
     let dicts = results.into_iter().map(|r| {
         let d = PyDict::new(py);
         match r {
-            SqlResult::TableCreated { table_id } => {
-                d.set_item(k_type, pyo3::intern!(py, "TableCreated"))?;
-                d.set_item(pyo3::intern!(py, "table_id"), table_id)?;
-            }
-            SqlResult::ViewCreated { view_id } => {
-                d.set_item(k_type, pyo3::intern!(py, "ViewCreated"))?;
-                d.set_item(pyo3::intern!(py, "view_id"), view_id)?;
-            }
-            SqlResult::IndexCreated { index_id } => {
-                d.set_item(k_type, pyo3::intern!(py, "IndexCreated"))?;
-                d.set_item(pyo3::intern!(py, "index_id"), index_id)?;
-            }
-            SqlResult::Dropped => {
-                d.set_item(k_type, pyo3::intern!(py, "Dropped"))?;
-            }
-            SqlResult::Altered { object, name } => {
-                d.set_item(k_type, pyo3::intern!(py, "Altered"))?;
-                d.set_item(pyo3::intern!(py, "object"), object)?;
-                d.set_item(pyo3::intern!(py, "name"), name)?;
+            SqlResult::Ddl => {
+                d.set_item(k_type, pyo3::intern!(py, "Ddl"))?;
             }
             SqlResult::RowsAffected { count } => {
                 d.set_item(k_type, pyo3::intern!(py, "RowsAffected"))?;

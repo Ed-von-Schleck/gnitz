@@ -19,11 +19,6 @@ pub enum GnitzSqlError {
     /// SQL a user can write, which is what makes it worth its own variant — a
     /// `Plan` string prefix cannot be asserted on.
     Internal(String),
-    /// A planning pass asked for a relation the statement's catalog snapshot does
-    /// not hold. A control signal for `dispatch::plan_resolving`, which resolves
-    /// the name and re-runs the pass; it never reaches a caller of
-    /// `SqlPlanner::execute`.
-    CatalogMiss(String),
 }
 
 impl fmt::Display for GnitzSqlError {
@@ -35,9 +30,6 @@ impl fmt::Display for GnitzSqlError {
             GnitzSqlError::Exec(e) => write!(f, "exec error: {e}"),
             GnitzSqlError::Unsupported(s) => write!(f, "unsupported: {s}"),
             GnitzSqlError::Internal(s) => write!(f, "internal error: {s}"),
-            GnitzSqlError::CatalogMiss(name) => {
-                write!(f, "internal error: relation '{name}' was not resolved before planning")
-            }
         }
     }
 }
@@ -53,8 +45,7 @@ impl std::error::Error for GnitzSqlError {
             GnitzSqlError::Bind(_)
             | GnitzSqlError::Plan(_)
             | GnitzSqlError::Unsupported(_)
-            | GnitzSqlError::Internal(_)
-            | GnitzSqlError::CatalogMiss(_) => None,
+            | GnitzSqlError::Internal(_) => None,
         }
     }
 }
@@ -96,7 +87,7 @@ pub(crate) fn derivation(construct: &str) -> GnitzSqlError {
     ))
 }
 
-/// A relation miss read from the statement's snapshot: the snapshot-side twin of
+/// A relation miss read from the statement's catalog: the planner's twin of
 /// `GnitzClient::resolve_relation`'s miss, so both report the same `ClientError`.
 pub(crate) fn missing_relation(schema: &str, name: &str) -> GnitzSqlError {
     GnitzSqlError::Exec(gnitz_core::not_found("relation", schema, name))

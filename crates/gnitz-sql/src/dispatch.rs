@@ -2,107 +2,43 @@
 //! (`ddl` and the `hir` view compiler) and the execute side (`dml`). Routes a
 //! `Statement` to the matching handler.
 
+use crate::bind::Catalog;
 use crate::error::reject_if;
 use crate::error::GnitzSqlError;
 use crate::SqlResult;
-use crate::{ddl, dml};
-use gnitz_core::CatalogSnapshot;
+use crate::{ddl, dml, hir};
 use gnitz_core::{ClientError, GnitzClient, RelDescriptor};
 use sqlparser::ast::Statement;
+use std::cell::RefCell;
 use std::sync::Arc;
 
-/// Inside a transaction, only DML and transaction control may run. Everything
-/// else — today's DDL, and every statement added later — is rejected by default:
-/// DDL has its own atomic commit mechanism and cannot interleave with a
-/// transaction's buffered user-table writes (a batch buffered under the old
-/// schema would guarantee a commit-time schema-mismatch). A non-poisoning
-/// statement error: the transaction stays open.
-fn reject_in_transaction(client: &GnitzClient, stmt: &Statement) -> Result<(), GnitzSqlError> {
-    let allowed = matches!(
-        stmt,
-        Statement::Insert(_)
-            | Statement::Query(_)
-            // EXPLAIN issues strictly less than the `Query` above: catalog
-            // lookups and no data-path request.
-            | Statement::Explain { .. }
-            | Statement::Update(_)
-            | Statement::Delete(_)
-            // A nested BEGIN is allowed through to `txn_begin`, which raises
-            // "transaction already open" — the accurate error.
-            | Statement::StartTransaction { .. }
-            | Statement::Commit { .. }
-            | Statement::Rollback { .. }
-    );
-    if client.txn_active() && !allowed {
-        return Err(GnitzSqlError::Unsupported(
-            "this statement is not allowed inside a transaction".to_string(),
-        ));
-    }
-    Ok(())
-}
+/// A client's resolve of one relation name under a schema.
+type ClientResolve = fn(&mut GnitzClient, &str, &str) -> Result<Option<Arc<RelDescriptor>>, ClientError>;
 
-/// The two spellings of "describe one relation" a statement can plan against:
-/// [`GnitzClient::resolve_local_first`], which answers off a mirrored
-/// registration, and [`GnitzClient::resolve`], which always asks the server.
-type Resolve = fn(&mut GnitzClient, &str, &str) -> Result<Option<Arc<RelDescriptor>>, ClientError>;
-
-/// Run `plan` against the statement's catalog snapshot, resolving each name it
-/// reports missing through `resolve` and re-running.
-///
-/// A planning pass has no side effects — it reads the snapshot and builds owned
-/// values, minting segment ids symbolically — so a discarded pass costs CPU over
-/// an already-parsed AST, not a round trip. One resolve per name the planner
-/// asks for, and none for a name it does not.
-///
-/// **`resolve` is a parameter and not a fixed choice**, because two of the four
-/// call sites are `CREATE VIEW` and `ALTER VIEW`: routing those through a local
-/// copy would compile a shipped circuit, or an `ALTER`'s outgoing view id,
-/// against a name → id binding only as fresh as the last poll.
-pub(crate) fn plan_resolving<T>(
+/// Plan against a catalog that resolves each name through `resolve` on first use.
+fn planned<T>(
     client: &mut GnitzClient,
-    resolve: Resolve,
     schema_name: &str,
-    mut plan: impl FnMut(&CatalogSnapshot) -> Result<T, GnitzSqlError>,
+    resolve: ClientResolve,
+    plan: impl FnOnce(&Catalog<'_>) -> Result<T, GnitzSqlError>,
 ) -> Result<T, GnitzSqlError> {
-    loop {
-        let missing = match plan(client.catalog()) {
-            Err(GnitzSqlError::CatalogMiss(name)) => name,
-            other => return other,
-        };
-        // Progress, and so termination: both resolves record their answer, and
-        // `CatalogSnapshot` keys both sides through `qualified_name`, so a repeat
-        // ask is a broken invariant rather than a second round trip.
-        if client.catalog().get(schema_name, &missing).is_some() {
-            return Err(GnitzSqlError::Internal(format!(
-                "planning re-asked for relation '{missing}', which the statement's snapshot already holds"
-            )));
-        }
-        resolve(client, schema_name, &missing)?;
-    }
+    let client = RefCell::new(client);
+    let ask = |name: &str| Ok(resolve(&mut client.borrow_mut(), schema_name, name)?);
+    plan(&Catalog::new(schema_name, &ask))
 }
 
-/// Route one statement.
-///
-/// A query and the `EXPLAIN` of one resolve and read **local-first**: a relation
-/// the client's own copy holds is described and read off it, which is what keeps
-/// a mirrored `SELECT` round-trip-free. Every other arm is DDL, DML or
-/// transaction control, which only a connection can serve — and what stops one of
-/// those planning against a binding only as fresh as the last poll is the resolve
-/// its handler uses, [`GnitzClient::resolve`] (directly or through
-/// `resolve_relation`).
+/// Route one statement. Only a read resolves local-first.
 pub(crate) fn execute_statement(
     client: &mut GnitzClient,
     schema_name: &str,
     stmt: &Statement,
 ) -> Result<SqlResult, GnitzSqlError> {
-    reject_in_transaction(client, stmt)?;
-
     match stmt {
         // Bare `DESC t` is `Statement::ExplainTable`, table introspection, and falls to
         // the catch-all below; `plan_read` rejects the EXPLAIN of a non-SELECT.
         Statement::Query(_) | Statement::Explain { .. } => {
-            let plan = plan_resolving(client, GnitzClient::resolve_local_first, schema_name, |cat| {
-                crate::plan_read(stmt, cat, schema_name)
+            let plan = planned(client, schema_name, GnitzClient::resolve_local_first, |cat| {
+                dml::plan_read(stmt, cat)
             })?;
             match stmt {
                 Statement::Explain { .. } => Ok(dml::execute_explain(client, &plan)),
@@ -155,11 +91,20 @@ pub(crate) fn execute_statement(
             client.txn_rollback()?;
             Ok(SqlResult::TransactionRolledBack)
         }
+        Statement::Insert(insert) => dml::execute_insert(client, schema_name, insert),
+        Statement::Update(update) => dml::execute_update(client, schema_name, update),
+        Statement::Delete(del) => dml::execute_delete(client, schema_name, del),
+        // Refused, not failed: the transaction stays open.
+        _ if client.txn_active() => Err(GnitzSqlError::Unsupported(
+            "this statement is not allowed inside a transaction".to_string(),
+        )),
         Statement::CreateTable(create) => {
-            let plan = plan_resolving(client, GnitzClient::resolve, schema_name, |cat| {
-                crate::plan_create_table(create, cat, schema_name)
-            })?;
-            ddl::execute_create_table(client, schema_name, plan)
+            match planned(client, schema_name, GnitzClient::resolve, |cat| {
+                ddl::plan_create_table(create, cat)
+            })? {
+                Some(plan) => ddl::execute_create_table(client, schema_name, plan),
+                None => Ok(SqlResult::Ddl),
+            }
         }
         // The one statement whose clause rejections live in the router: sqlparser
         // gives `Drop` no payload struct, so `execute_drop` could destructure it
@@ -183,21 +128,20 @@ pub(crate) fn execute_statement(
             ddl::execute_drop(client, schema_name, object_type, names, *if_exists)
         }
         Statement::CreateView(cv) => {
-            let plan = plan_resolving(client, GnitzClient::resolve, schema_name, |cat| {
-                crate::plan_create_view(cv, cat, schema_name)
-            })?;
-            crate::hir::execute_create_view(client, schema_name, plan)
+            match planned(client, schema_name, GnitzClient::resolve, |cat| {
+                hir::plan_create_view(cv, cat)
+            })? {
+                Some(chain) => hir::execute_view_chain(client, schema_name, chain),
+                None => Ok(SqlResult::Ddl),
+            }
         }
-        Statement::Insert(insert) => dml::execute_insert(client, schema_name, insert),
         Statement::CreateIndex(ci) => ddl::execute_create_index(client, schema_name, ci),
-        Statement::Update(update) => dml::execute_update(client, schema_name, update),
-        Statement::Delete(del) => dml::execute_delete(client, schema_name, del),
         Statement::AlterTable(a) => ddl::execute_alter_table(client, schema_name, a),
         Statement::AlterView { name, query, columns, with_options } => {
-            let plan = plan_resolving(client, GnitzClient::resolve, schema_name, |cat| {
-                crate::plan_alter_view(name, columns, query, with_options, cat, schema_name)
+            let chain = planned(client, schema_name, GnitzClient::resolve, |cat| {
+                hir::plan_alter_view(name, columns, query, with_options, cat)
             })?;
-            crate::hir::execute_alter_view(client, schema_name, plan)
+            hir::execute_view_chain(client, schema_name, chain)
         }
         _ => Err(GnitzSqlError::Unsupported(format!("unsupported SQL statement: {stmt}"))),
     }

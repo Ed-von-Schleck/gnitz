@@ -2,44 +2,42 @@
 //! precedence between the passes, the constraint spellings that are rejected,
 //! and the bundle a plan carries.
 
-use gnitz_core::{FkTarget, InlineForeignKey, RelClass, TypeCode};
+use gnitz_core::{FkTarget, InlineForeignKey, InlineUniqueIndex, RelClass, TypeCode};
 
-mod pure;
-use pure::*;
+use super::*;
 
-use gnitz_sql::{plan_create_table, GnitzSqlError, TablePlan};
+use crate::ddl::{plan_create_table, TablePlan};
 
 /// Plan `sql` against `cat`. The statement must parse as a `CREATE TABLE`.
-fn plan_table(cat: &gnitz_core::CatalogSnapshot, sql: &str) -> Result<TablePlan, GnitzSqlError> {
-    match parse(sql) {
-        gnitz_sql::sqlparser::ast::Statement::CreateTable(c) => plan_create_table(&c, cat, SN),
+fn plan_table(cat: &Catalog<'_>, sql: &str) -> Result<Option<TablePlan>, GnitzSqlError> {
+    match parse_stmt(sql) {
+        sqlparser::ast::Statement::CreateTable(c) => plan_create_table(&c, cat),
         other => panic!("`{sql}` is not a CREATE TABLE: {other}"),
     }
 }
 
-/// The `Create` payload of a plan expected to succeed.
-struct Created {
-    schema: gnitz_core::Schema,
-    fks: Vec<InlineForeignKey>,
-    props: gnitz_core::TableProps,
-    unique_indexes: Vec<(Vec<u32>, String)>,
+/// The bundle of a plan expected to create.
+fn created(cat: &Catalog<'_>, sql: &str) -> TablePlan {
+    plan_table(cat, sql)
+        .unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
+        .unwrap_or_else(|| panic!("`{sql}` planned nothing"))
 }
 
-fn created(cat: &gnitz_core::CatalogSnapshot, sql: &str) -> Created {
-    match plan_table(cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}")) {
-        TablePlan::Create { schema, fks, props, unique_indexes, .. } => Created { schema, fks, props, unique_indexes },
-        TablePlan::Skip { .. } => panic!("`{sql}` planned a skip"),
+/// An inline UNIQUE index on `cols`, named `name`.
+fn unique(cols: &[u32], name: &str) -> InlineUniqueIndex {
+    InlineUniqueIndex {
+        col_indices: cols.to_vec(),
+        name: name.to_string(),
     }
 }
 
 /// `p (id BIGINT PK, u BIGINT)` with a **unique** index on `u`, and `q` with the
 /// same shape and a non-unique one — so only `p.u` is a legal non-PK FK target.
-fn fk_catalog() -> gnitz_core::CatalogSnapshot {
+fn fk_catalog() -> Catalog<'static> {
     let i = TypeCode::I64;
     let cols = || vec![col("id", i), col("u", i)];
-    let mut cat = catalog(vec![("q", rel(40, RelClass::Table, cols(), vec![0], &[&[1]]))]);
+    let cat = catalog(vec![("q", rel(40, RelClass::Table, cols(), vec![0], &[&[1]]))]);
     cat.insert(
-        SN,
         "p",
         Some(rel_with(41, RelClass::Table, cols(), vec![0], &[(&[1], true)])),
     );
@@ -141,7 +139,7 @@ fn a_named_unique_equal_to_the_lone_pk_is_rejected() {
         &cat,
         "CREATE TABLE c (a BIGINT UNSIGNED, b BIGINT UNSIGNED, PRIMARY KEY (a, b), CONSTRAINT uq UNIQUE(a))",
     );
-    assert_eq!(c.unique_indexes, vec![(vec![0], "uq".to_string())]);
+    assert_eq!(c.unique_indexes, vec![unique(&[0], "uq")]);
 }
 
 /// The engine's whole schema-admissibility rule is the column cap plus the PK
@@ -200,16 +198,16 @@ fn a_stream_refuses_serial_a_foreign_key_and_a_unique() {
 /// target must be one stored, individually unique column.
 #[test]
 fn an_unhonoured_clause_or_fk_target_is_named() {
-    let mut known = fk_catalog();
+    let known = fk_catalog();
     let u = TypeCode::U64;
     let cp = table(
         42,
         vec![col("a", u), col("b", u), ncol("payload", TypeCode::I64)],
         vec![0, 1],
     );
-    known.insert(SN, "cp", Some(cp));
+    known.insert("cp", Some(cp));
     let st = rel(43, RelClass::Stream, vec![col("id", TypeCode::I64)], vec![0], &[]);
-    known.insert(SN, "st", Some(st));
+    known.insert("st", Some(st));
     for (sql, variant, needle) in [
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY) AS SELECT id FROM p",
@@ -331,7 +329,7 @@ fn an_fk_child_adopts_the_parent_type_before_the_index_is_checked() {
             target: FkTarget::Table { id: 41, col: 0 }
         }]
     );
-    assert_eq!(c.unique_indexes, vec![(vec![1], format!("{SN}__c__idx_r"))]);
+    assert_eq!(c.unique_indexes, vec![unique(&[1], &format!("{SN}__c__idx_r"))]);
 
     // A non-PK parent column is a legal target only with a single-column UNIQUE
     // index on it.
@@ -356,8 +354,8 @@ fn colliding_auto_names_are_disambiguated_within_the_bundle() {
     assert_eq!(
         c.unique_indexes,
         vec![
-            (vec![1, 2], format!("{SN}__t__idx_d_e_f")),
-            (vec![3, 4], format!("{SN}__t__idx_d_e_f_2")),
+            unique(&[1, 2], &format!("{SN}__t__idx_d_e_f")),
+            unique(&[3, 4], &format!("{SN}__t__idx_d_e_f_2")),
         ]
     );
     // Two constraint names folding to one canonical name would write two IDX_TAB
@@ -373,17 +371,16 @@ fn colliding_auto_names_are_disambiguated_within_the_bundle() {
 fn if_not_exists_plans_a_skip_but_a_bad_with_key_still_errors() {
     let cat = base();
     match plan_table(&cat, "CREATE TABLE IF NOT EXISTS tv (id BIGINT PRIMARY KEY)") {
-        Ok(TablePlan::Skip { existing_id }) => assert_eq!(existing_id, 24, "the standing view's id"),
-        other => panic!("expected a skip, got {:?}", other.map(|_| "a create")),
+        Ok(None) => {}
+        other => panic!("expected nothing planned, got {:?}", other.map(|_| "a create")),
     }
     let sql = "CREATE TABLE IF NOT EXISTS tv (id BIGINT PRIMARY KEY) WITH (bogus = true)";
     assert_rejects(sql, plan_table(&cat, sql), "Unsupported", "bogus");
 }
 
-/// A name the snapshot has not probed is the control signal `plan_resolving`
-/// answers, and the planner asks for exactly the names it needs.
+/// The planner asks for exactly the names it needs.
 #[test]
-fn the_loop_resolves_only_the_fk_targets_and_the_if_not_exists_name() {
+fn a_plan_resolves_only_the_fk_targets_and_the_if_not_exists_name() {
     let known = fk_catalog();
     let (plan, asked) = resolving(&known, |c| {
         plan_table(c, "CREATE TABLE c (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p(id))").map(|_| ())

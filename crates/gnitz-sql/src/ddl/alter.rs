@@ -18,30 +18,30 @@ use sqlparser::ast::{
     TableConstraint,
 };
 
-/// One ALTER TABLE operation with every check that needs no catalog already run.
-/// `object`/`name` are what the statement reports altering.
-struct Alter<'a> {
-    ctx: &'static str,
-    object: &'static str,
-    name: String,
-    action: Action<'a>,
-}
-
+/// One ALTER TABLE operation with every check that needs no catalog already run,
+/// carrying the operands it uses.
 enum Action<'a> {
-    RenameRelation,
+    RenameRelation {
+        new_name: String,
+    },
     RenameColumn {
         old: &'a str,
+        new: &'a str,
     },
     AddColumn(gnitz_core::ColumnDef),
     DropColumn {
+        name: &'a str,
         if_exists: bool,
     },
-    DropNotNull,
+    DropNotNull {
+        name: &'a str,
+    },
     AddUnique {
         columns: &'a [IndexColumn],
         explicit_name: Option<String>,
     },
     DropConstraint {
+        name: &'a str,
         if_exists: bool,
     },
 }
@@ -59,32 +59,29 @@ pub(crate) fn execute_alter_table(
         ));
     };
     let source_name = extract_object_name(&alter.name, schema_name, "ALTER TABLE")?;
-    let Alter { ctx, object, name, action } = parse(operation, schema_name)?;
+    let (ctx, action) = parse(operation, schema_name)?;
 
     let Some(rel) = client.resolve(schema_name, &source_name)? else {
         return if alter.if_exists {
-            Ok(altered(object, name))
+            Ok(SqlResult::Ddl)
         } else {
             Err(missing_relation(schema_name, &source_name))
         };
     };
     // `RENAME TO` accepts a view too, as Postgres does: views bind sources by id
     // and columns by ordinal, so a rename is safe under any class.
-    if !matches!(action, Action::RenameRelation) {
+    if !matches!(action, Action::RenameRelation { .. }) {
         require_class(&rel, &source_name, ClassWant::BaseTable, ctx)?;
     }
 
     let cols = &rel.schema.columns;
     match action {
-        Action::RenameRelation => {
-            client.alter_rename_relation(schema_name, &source_name, &name)?;
-            return Ok(altered(rel.class.noun(), name));
-        }
-        Action::RenameColumn { old } => client.alter_rename_column(rel.tid, require_column(cols, old)?, &name)?,
-        Action::AddColumn(def) => client.alter_add_column(rel.tid, &def)?,
-        Action::DropColumn { if_exists: true } if find_unique_column(cols, &name)?.is_none() => {}
-        Action::DropColumn { .. } => client.alter_drop_column(rel.tid, require_column(cols, &name)?)?,
-        Action::DropNotNull => client.alter_drop_not_null(rel.tid, require_column(cols, &name)?)?,
+        Action::RenameRelation { new_name } => client.alter_rename_relation(schema_name, &rel, &new_name)?,
+        Action::RenameColumn { old, new } => client.alter_rename_column(rel.tid, require_column(cols, old)?, new)?,
+        Action::AddColumn(def) => client.alter_add_column(&rel, &def)?,
+        Action::DropColumn { name, if_exists: true } if find_unique_column(cols, name)?.is_none() => {}
+        Action::DropColumn { name, .. } => client.alter_drop_column(rel.tid, require_column(cols, name)?)?,
+        Action::DropNotNull { name } => client.alter_drop_not_null(rel.tid, require_column(cols, name)?)?,
         Action::AddUnique { columns, explicit_name } => {
             return super::table::create_index_core(
                 client,
@@ -98,30 +95,32 @@ pub(crate) fn execute_alter_table(
                 },
             );
         }
-        Action::DropConstraint { if_exists } => {
-            client.drop_unique_constraint(rel.tid, &name, if_exists)?;
-        }
+        Action::DropConstraint { name, if_exists } => client.drop_unique_constraint(rel.tid, name, if_exists)?,
     }
-    Ok(altered(object, name))
+    Ok(SqlResult::Ddl)
 }
 
-/// The operation as an [`Alter`], or the rejection the statement alone earns.
-fn parse<'a>(operation: &'a AlterTableOperation, schema_name: &str) -> Result<Alter<'a>, GnitzSqlError> {
-    let alter = |ctx, object, name, action| Ok(Alter { ctx, object, name, action });
+/// The operation's context and [`Action`], or the rejection the statement alone
+/// earns.
+fn parse<'a>(
+    operation: &'a AlterTableOperation,
+    schema_name: &str,
+) -> Result<(&'static str, Action<'a>), GnitzSqlError> {
     match operation {
         AlterTableOperation::RenameTable { table_name } => {
             const CTX: &str = "ALTER TABLE RENAME TO";
             // `RENAME TO` and (some dialects') `RENAME AS` both mean rename-to.
             let (RenameTableNameKind::To(target) | RenameTableNameKind::As(target)) = table_name;
             let new_name = extract_object_name(target, schema_name, "ALTER TABLE")?;
-            alter(CTX, "table", new_name, Action::RenameRelation)
+            Ok((CTX, Action::RenameRelation { new_name }))
         }
-        AlterTableOperation::RenameColumn { old_column_name, new_column_name } => alter(
+        AlterTableOperation::RenameColumn { old_column_name, new_column_name } => Ok((
             "ALTER TABLE RENAME COLUMN",
-            "column",
-            new_column_name.value.clone(),
-            Action::RenameColumn { old: &old_column_name.value },
-        ),
+            Action::RenameColumn {
+                old: &old_column_name.value,
+                new: &new_column_name.value,
+            },
+        )),
         AlterTableOperation::AddColumn {
             // Inert: `ADD c INT` and `ADD COLUMN c INT` mean the same thing.
             column_keyword: _,
@@ -139,7 +138,7 @@ fn parse<'a>(operation: &'a AlterTableOperation, schema_name: &str) -> Result<Al
             reject_unhonored_column_options(col, ColumnOptionSite::AddColumn)?;
             let (def, serial) = column_def(col)?;
             reject_if(serial, CTX, "SERIAL")?;
-            alter(CTX, "column", def.name.clone(), Action::AddColumn(def))
+            Ok((CTX, Action::AddColumn(def)))
         }
         AlterTableOperation::DropColumn {
             // Inert: `DROP c` and `DROP COLUMN c` mean the same thing.
@@ -157,23 +156,16 @@ fn parse<'a>(operation: &'a AlterTableOperation, schema_name: &str) -> Result<Al
                     column_names.len()
                 )));
             };
-            alter(
-                CTX,
-                "column",
-                col.value.clone(),
-                Action::DropColumn { if_exists: *if_exists },
-            )
+            Ok((CTX, Action::DropColumn { name: &col.value, if_exists: *if_exists }))
         }
         AlterTableOperation::AlterColumn { column_name, op } => {
             use AlterColumnOperation as Op;
             let msg = match op {
                 Op::DropNotNull => {
-                    return alter(
+                    return Ok((
                         "ALTER TABLE ALTER COLUMN DROP NOT NULL",
-                        "column",
-                        column_name.value.clone(),
-                        Action::DropNotNull,
-                    )
+                        Action::DropNotNull { name: &column_name.value },
+                    ))
                 }
                 Op::SetNotNull => "ALTER COLUMN SET NOT NULL is not supported (needs a full-table validation scan)",
                 Op::SetDataType { .. } => "ALTER COLUMN SET DATA TYPE is not supported",
@@ -196,33 +188,22 @@ fn parse<'a>(operation: &'a AlterTableOperation, schema_name: &str) -> Result<Al
             // Same field rejections as an inline CREATE TABLE … UNIQUE.
             reject_unhonored_unique_fields(u, "ADD CONSTRAINT")?;
             // The CONSTRAINT name becomes the index's; `None` auto-generates one.
-            let explicit_name = u.name.as_ref().map(|n| n.value.clone());
-            alter(
+            Ok((
                 CTX,
-                "constraint",
-                explicit_name.clone().unwrap_or_default(),
-                Action::AddUnique { columns: &u.columns, explicit_name },
-            )
+                Action::AddUnique {
+                    columns: &u.columns,
+                    explicit_name: u.name.as_ref().map(|n| n.value.clone()),
+                },
+            ))
         }
         AlterTableOperation::DropConstraint { if_exists, name, drop_behavior } => {
             const CTX: &str = "ALTER TABLE DROP CONSTRAINT";
             reject_if(matches!(drop_behavior, Some(DropBehavior::Cascade)), CTX, "CASCADE")?;
             validate_user_name(&name.value)?;
-            alter(
-                CTX,
-                "constraint",
-                name.value.clone(),
-                Action::DropConstraint { if_exists: *if_exists },
-            )
+            Ok((CTX, Action::DropConstraint { name: &name.value, if_exists: *if_exists }))
         }
         _ => Err(GnitzSqlError::Unsupported(
             "this ALTER TABLE operation is not supported".to_string(),
         )),
     }
-}
-
-/// The `Altered` result — also the IF-EXISTS no-op success (nothing to alter,
-/// but the statement succeeds), carrying the intended name.
-fn altered(object: &str, name: String) -> SqlResult {
-    SqlResult::Altered { object: object.to_string(), name }
 }
