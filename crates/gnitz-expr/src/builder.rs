@@ -1,19 +1,13 @@
 //! [`ExprBuilder`]: the emitter that turns a client-side expression into a
-//! [`LogicalProgram`].
-//!
-//! It holds the three things a program is made of — the instruction list, the
-//! const pool, and the output sinks — and hands them to
-//! [`LogicalProgram::from_instrs`] in [`ExprBuilder::build`], its one exit. The
-//! structural rules (register limit, operand order, const-pool bounds) are
-//! decided there, so a caller emits first and is told what is unsupported once.
+//! [`LogicalProgram`]. A caller emits freely; [`ExprBuilder::build`] is where it
+//! is told, once, what is unsupported.
 
-use crate::{CalendarOp, ConstIdx, ExprValidateErr, LogicalInstr, LogicalProgram, Output, Reg, Sink, MAX_REGS};
+use crate::{CalendarOp, ConstIdx, ExprValidateErr, LogicalInstr, LogicalProgram, Reg, Sink, MAX_REGS};
 
-/// Accumulates the instructions, sinks and constants of one expression program.
+/// Accumulates the instructions and constants of one expression program.
 #[derive(Default)]
 pub struct ExprBuilder {
     instrs: Vec<LogicalInstr>,
-    sinks: Vec<Sink>,
     const_strings: Vec<Vec<u8>>,
 }
 
@@ -40,10 +34,9 @@ impl ExprBuilder {
         let instr = match instr {
             // `get`, not an index: an out-of-range operand is `build`'s to reject.
             LogicalInstr::IntToFloat { a } => match self.instrs.get(a.0 as usize) {
-                Some(&LogicalInstr::LoadConst { val, unsigned }) => LogicalInstr::LoadConst {
-                    val: crate::batch::encode_f64(if unsigned { val as u64 as f64 } else { val as f64 }),
-                    unsigned: false,
-                },
+                Some(&LogicalInstr::LoadConst { val, unsigned }) => {
+                    return self.const_f64(if unsigned { val as u64 as f64 } else { val as f64 })
+                }
                 _ => instr,
             },
             // An overflowing day count stays the kernel, which makes it NULL.
@@ -60,14 +53,11 @@ impl ExprBuilder {
             },
             // A range check of a value already range-checked into the same type is
             // that value: it is whole in the target and carries the same U64 tracking.
-            LogicalInstr::IntCast { a, fi } => match self.instrs.get(a.0 as usize) {
-                Some(
-                    &LogicalInstr::IntCast { fi: g, .. }
-                    | &LogicalInstr::FloatToInt { fi: g, .. }
-                    | &LogicalInstr::StrToInt { fi: g, .. },
-                ) if g == fi => return a,
-                _ => instr,
-            },
+            LogicalInstr::IntCast { a, fi }
+                if self.instrs.get(a.0 as usize).and_then(LogicalInstr::range_check) == Some(fi) =>
+            {
+                return a
+            }
             _ => instr,
         };
         if self.within_reg_cap() {
@@ -78,12 +68,6 @@ impl ExprBuilder {
         let reg = Reg(self.instrs.len() as u16);
         self.instrs.push(instr);
         reg
-    }
-
-    /// Append an output payload slot. Slots are filled in call order, so the
-    /// n-th call writes output payload column n.
-    pub fn sink(&mut self, sink: Sink) {
-        self.sinks.push(sink);
     }
 
     /// The const-pool index of `bytes`, shared with an earlier equal entry. The
@@ -111,28 +95,19 @@ impl ExprBuilder {
         })
     }
 
-    /// Push an i64 value pool for `IntInSet`, packed as `N × 8-byte LE`, and
-    /// return its const index. Sorting is not a wire contract: the engine's
-    /// `resolve` sorts the decoded pool before binary-searching it, because set
-    /// membership does not depend on order and trusting the client here would
-    /// turn a skewed pool into a wrong answer. Callers still sort (and dedup) to
-    /// keep the pool small.
-    pub fn add_const_int_set(&mut self, values: &[i64]) -> ConstIdx {
-        self.add_const_bytes(gnitz_wire::as_le_bytes(values))
+    /// The const index of `values` as an `IntInSet` pool: strictly ascending,
+    /// packed `N × 8-byte LE`.
+    pub fn add_const_int_set(&mut self, mut values: Vec<i64>) -> ConstIdx {
+        values.sort_unstable();
+        values.dedup();
+        self.add_const_bytes(gnitz_wire::as_le_bytes(&values))
     }
 
-    /// The builder's one exit: the typed program, held to every structural rule
-    /// a schema is not needed for. A caller resolving in-process goes straight
-    /// on to `resolve_filter` / `resolve_scalar`; one shipping the program to
-    /// the engine calls [`LogicalProgram::to_blob_bytes`] on it. Neither pays a
-    /// wire round trip to be validated.
-    ///
-    /// `result_reg` is `None` for a map, which reads its output off the sinks.
-    /// The two are exclusive, and `Output::new` is where a caller that named
-    /// both is told so.
-    pub fn build(self, result_reg: Option<Reg>) -> Result<LogicalProgram, ExprValidateErr> {
-        let output = Output::new(result_reg, self.sinks)?;
-        LogicalProgram::from_instrs(self.instrs, output, self.const_strings)
+    /// The typed program, held to every structural rule a schema is not needed
+    /// for. `sinks` is its output — one `Sink::Reg` for a filter or scalar, one
+    /// sink per output payload slot for a map.
+    pub fn build(self, sinks: Vec<Sink>) -> Result<LogicalProgram, ExprValidateErr> {
+        LogicalProgram::from_instrs(self.instrs, sinks, self.const_strings)
     }
 }
 

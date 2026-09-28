@@ -151,17 +151,15 @@ fn pred_cmp_blob(op: gnitz_expr::CmpOp, col: usize, lit: i64) -> Vec<u8> {
         eb.emit(gnitz_expr::LogicalInstr::LoadConst { val: lit, unsigned: false }),
     );
     let r = eb.emit(gnitz_expr::LogicalInstr::Cmp { op, a, b });
-    eb.build(Some(r)).expect("a well-formed program").to_blob_bytes()
+    eb.build(vec![gnitz_expr::Sink::Reg(r)])
+        .expect("a well-formed program")
+        .to_blob_bytes()
 }
 
-/// A pure-gather projection program: `(src_col, out_payload_slot)` CopyCols and
-/// nothing else.
-fn proj_blob(copies: &[(u32, u32)]) -> Vec<u8> {
-    let mut eb = gnitz_expr::ExprBuilder::new();
-    for &(src, _) in copies {
-        eb.sink(gnitz_expr::Sink::Col(src));
-    }
-    eb.build(None).expect("a well-formed program").to_blob_bytes()
+/// A pure-gather projection program: `srcs[i]` copied into output payload slot
+/// `i`, and nothing else.
+fn proj_blob(srcs: &[u32]) -> Vec<u8> {
+    gnitz_expr::LogicalProgram::copy_cols(srcs).to_blob_bytes()
 }
 
 /// `program` as a sink map declaring `reply`'s payload columns — the slots a

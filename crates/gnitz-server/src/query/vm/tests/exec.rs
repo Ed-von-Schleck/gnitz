@@ -110,7 +110,7 @@ fn test_filter_negate_pipeline() {
             b: Reg(1),
         }, // r2 = r0 > r1
     ];
-    let pred_prog = gnitz_expr::LogicalProgram::new(pred_instrs, gnitz_expr::Output::Result(Reg(2)), vec![]);
+    let pred_prog = gnitz_expr::LogicalProgram::new(pred_instrs, vec![gnitz_expr::Sink::Reg(Reg(2))], vec![]);
     let mut p = TestPlan::default();
     p.push(0, 1, Op::Filter(Box::new(pred_prog.resolve_filter(&schema).unwrap())));
     p.push(1, 2, Op::Negate);

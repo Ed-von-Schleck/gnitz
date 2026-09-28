@@ -13,7 +13,7 @@
 
 use gnitz_core::protocol::{ColumnDef, Schema, TypeCode};
 use gnitz_core::{key_reply, BatchAppender, GnitzClient, SchemaFacts, TableProps, ZSetBatch};
-use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr as L};
+use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr as L, Sink};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 use gnitz_wire::{ReadBound, ReadSpec};
 
@@ -24,7 +24,9 @@ fn gt_predicate(col: usize, threshold: i64) -> Vec<u8> {
     let c = b.emit(L::LoadColInt { col: col as u32 });
     let k = b.emit(L::LoadConst { val: threshold, unsigned: false });
     let cond = b.emit(L::Cmp { op: CmpOp::Gt, a: c, b: k });
-    b.build(Some(cond)).expect("a well-formed program").to_blob_bytes()
+    b.build(vec![Sink::Reg(cond)])
+        .expect("a well-formed program")
+        .to_blob_bytes()
 }
 
 /// No payload data crossed the wire: the reply has no payload slot, and there is

@@ -45,6 +45,26 @@ impl Placed {
     }
 }
 
+/// The value an assignment of `lit` into `ty` stores, as its native image: the
+/// placed value, or the nearest one when rounding lands inside the type.
+pub(crate) fn assign<R>(lit: &BExpr<R>, ty: ColType) -> Result<u128, String> {
+    match place(lit, ty) {
+        Some(
+            Placed::At(v)
+            | Placed::Between { nearest: v, .. }
+            | Placed::Below { nearest: Some(v) }
+            | Placed::Above { nearest: Some(v) },
+        ) => Ok(v),
+        Some(Placed::Below { .. } | Placed::Above { .. }) => {
+            Err(format!("{ty} value out of range: {}", lit.literal_text()))
+        }
+        None => Err(match lit {
+            BExpr::LitStr(s) => invalid_literal(ty, s),
+            _ => format!("{} is not a {ty} value", lit.literal_text()),
+        }),
+    }
+}
+
 /// `lit` among the values of `ty`; `None` when it spells no value of the type:
 /// NULL, a string that is not one of the type's spellings, a fraction for a
 /// DATE/TIMESTAMP or a 16-byte type.

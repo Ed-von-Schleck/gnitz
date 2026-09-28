@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 // module — one import line rather than three spellings of it.
 use super::{
     ColKind, ExprOp, FloatUnaryOp, IntOrder, IntUnaryOp, ProgramFacts, ReadAs, TrimMode, INSTR_BYTES, INSTR_WORDS,
-    MAP_OUTPUT, MAX_CONST_POOL, SINK_WORDS,
+    MAX_CONST_POOL, SINK_WORDS,
 };
 use crate::batch::{decode_f64, encode_f64};
 use crate::eval::Resolved;
@@ -20,7 +20,7 @@ use crate::test_support::{
 use crate::CalendarOp;
 use crate::{
     CmpOp, ColumnLocator, ConstIdx, ExprValidateErr, FloatArithOp, Instr, IntArithOp, LogicalInstr, LogicalProgram,
-    MapEval, NullPerm, Output, Reg, ScalarEval, Sink,
+    MapEval, NullPerm, Reg, ScalarEval, Sink,
 };
 
 /// The phrase a `ColKindMismatch` renders for `kind`, read from its one source
@@ -294,7 +294,7 @@ fn emit_of_a_null_result_sets_the_slot_bit_and_stores_zero() {
 fn a_register_free_program_is_rejected() {
     let schema = schema_pk_ints(1, true);
     // One column copy: input col 1 → payload slot 0 (source type derived in resolve)
-    let prog = || LogicalProgram::new(Vec::new(), Output::Slots(vec![Sink::Col(1)]), vec![]);
+    let prog = || LogicalProgram::new(Vec::new(), vec![Sink::Col(1)], vec![]);
     // A scalar reads its result out of a register, so a program writing output
     // slots is not one — whether it writes one slot or none.
     assert_eq!(
@@ -302,7 +302,7 @@ fn a_register_free_program_is_rejected() {
         Some(ExprValidateErr::OutputRoleMismatch),
     );
     assert_eq!(
-        LogicalProgram::new(Vec::new(), Output::Slots(Vec::new()), vec![])
+        LogicalProgram::new(Vec::new(), Vec::new(), vec![])
             .resolve_scalar(&schema)
             .err(),
         Some(ExprValidateErr::OutputRoleMismatch),
@@ -526,8 +526,8 @@ fn select_classification_of_cond_and_result() {
     ];
     // `analyze` runs off the assembled program, and the same one must be a
     // legal filter.
-    let prog = LogicalProgram::new(instrs.clone(), Output::Result(Reg(5)), vec![]);
-    let ProgramFacts { bit_only, bool_pack, .. } = prog.analyze(&schema, Some(ReadAs::Bool));
+    let prog = LogicalProgram::new(instrs.clone(), vec![Sink::Reg(Reg(5))], vec![]);
+    let ProgramFacts { bit_only, bool_pack, .. } = prog.analyze(&schema, ReadAs::Bool);
     filter_prog(&schema, instrs, Reg(5), vec![]);
     // Neither r0 nor r3 is bool-produced, so neither can be bit_only and their
     // `bool_pack` bits can only come from the bool_input half.
@@ -619,20 +619,13 @@ fn one(op: ExprOp, sel: u32, ops: &[u32]) -> Vec<[u32; INSTR_WORDS]> {
     code(&[(op, sel, ops)])
 }
 
-/// Encode the regions as a blob and decode it back — the one place a test needs
-/// to know how the `output` word is spelled.
+/// Encode the regions as a blob and decode it back.
 fn from_regions(
     code: &[[u32; INSTR_WORDS]],
     sinks: &[[u32; SINK_WORDS]],
-    out: Option<Reg>,
     pool: Vec<Vec<u8>>,
 ) -> Result<LogicalProgram, ExprValidateErr> {
-    let blob = crate::encode_expr_blob(
-        out.map_or(MAP_OUTPUT, |r| r.0 as u32),
-        code.iter().copied(),
-        sinks.iter().copied(),
-        &pool,
-    );
+    let blob = crate::encode_expr_blob(code.iter().copied(), sinks.iter().copied(), &pool);
     LogicalProgram::from_blob(&blob)
 }
 
@@ -664,17 +657,17 @@ fn a_program_round_trips_through_its_blob() {
             const_idx: ConstIdx(2),
         },
     ];
-    let prog = LogicalProgram::new(instrs.clone(), Output::Result(Reg(1)), pool.clone());
+    let prog = LogicalProgram::new(instrs.clone(), vec![Sink::Reg(Reg(1))], pool.clone());
     let back = LogicalProgram::from_blob(&prog.to_blob_bytes()).expect("its own blob decodes");
     assert_eq!(back.instrs(), instrs.as_slice());
     assert_eq!(back.const_strings(), pool.as_slice());
-    assert!(matches!(back.output, Output::Result(Reg(1))));
+    assert_eq!(back.sinks, vec![Sink::Reg(Reg(1))]);
 
     // The degenerate program is a valid one, not an absence.
-    let empty = LogicalProgram::new(Vec::new(), Output::Slots(Vec::new()), Vec::new());
+    let empty = LogicalProgram::new(Vec::new(), Vec::new(), Vec::new());
     let back = LogicalProgram::from_blob(&empty.to_blob_bytes()).expect("a valid empty program decodes");
     assert!(back.instrs().is_empty() && back.const_strings().is_empty());
-    assert!(matches!(back.output, Output::Slots(ref s) if s.is_empty()));
+    assert!(back.sinks.is_empty());
 }
 
 /// The layout and its version word in one assertion, so neither can be repasted
@@ -685,12 +678,11 @@ fn the_blob_layout_is_pinned_to_its_version_word() {
     // One instruction, both sink kinds, one pool entry — every region non-empty.
     let prog = LogicalProgram::new(
         vec![LogicalInstr::LoadColInt { col: 1 }],
-        Output::Slots(vec![Sink::Col(1), Sink::Reg(Reg(0))]),
+        vec![Sink::Col(1), Sink::Reg(Reg(0))],
         vec![b"ab".to_vec()],
     );
     #[rustfmt::skip]
     let want: Vec<u8> = vec![
-        0xFF, 0xFF, 0xFF, 0xFF, // output: the MAP_OUTPUT sentinel
         1, 0, 0, 0,             // instruction count
         1, 0, 0, 0,             // LoadColInt: opcode
         0, 0, 0, 0,             //   selector
@@ -708,7 +700,7 @@ fn the_blob_layout_is_pinned_to_its_version_word() {
     ];
     assert_eq!(
         (prog.to_blob_bytes(), gnitz_wire::EXPR_BLOB_VERSION),
-        (want, 5),
+        (want, 6),
         "the expr-blob layout changed: bump EXPR_BLOB_VERSION before pasting the bytes reported here"
     );
 }
@@ -716,7 +708,7 @@ fn the_blob_layout_is_pinned_to_its_version_word() {
 /// A valid empty program's blob; the guard table below mutates a clone, so each
 /// case differs from a decodable blob by exactly one flaw.
 fn valid_empty_blob() -> Vec<u8> {
-    crate::encode_expr_blob(MAP_OUTPUT, std::iter::empty(), std::iter::empty(), &[])
+    crate::encode_expr_blob(std::iter::empty(), std::iter::empty(), &[])
 }
 
 /// Every framing guard in [`LogicalProgram::from_blob`], against the forgery
@@ -724,15 +716,15 @@ fn valid_empty_blob() -> Vec<u8> {
 /// diagnosable from the log alone.
 #[test]
 fn each_framing_guard_rejects_its_own_forgery() {
-    // An empty program's three counts: instructions at [4..8], sinks at [8..12],
-    // the const pool at [12..16].
+    // An empty program's three counts: instructions at [0..4], sinks at [4..8],
+    // the const pool at [8..12].
     let count = |off: usize, n: u32| {
         let mut b = valid_empty_blob();
         gnitz_wire::write_u32_le(&mut b, off, n);
         b
     };
     let short_entry = {
-        let mut b = count(12, 1);
+        let mut b = count(8, 1);
         b.extend_from_slice(&5u32.to_le_bytes());
         b.extend_from_slice(&[0xAA, 0xBB]); // only 2 of the 5 declared bytes
         b
@@ -745,20 +737,20 @@ fn each_framing_guard_rejects_its_own_forgery() {
     let cases: &[(&str, Vec<u8>, &str)] = &[
         // Bytes before cap: an over-cap count with nothing behind it reports
         // the truncation.
-        ("truncated before the code region", count(4, 5), "truncated"),
-        ("truncated before the sink region", count(8, 2), "truncated"),
+        ("truncated before the code region", count(0, 5), "truncated"),
+        ("truncated before the sink region", count(4, 2), "truncated"),
         (
             "an over-cap instruction count with no bytes",
-            count(4, u32::MAX),
+            count(0, u32::MAX),
             "truncated",
         ),
         // The pool is the one count whose cap comes first: no region to bound it.
         (
             "a huge declared pool count",
-            count(12, u32::MAX),
+            count(8, u32::MAX),
             "declared const-pool count",
         ),
-        ("a pool entry declared but absent", count(12, 1), "truncated"),
+        ("a pool entry declared but absent", count(8, 1), "truncated"),
         ("truncated mid pool entry", short_entry, "truncated"),
         // The trailing-bytes guard, which no truncation case reaches — those
         // trip the reader first.
@@ -785,11 +777,11 @@ fn a_const_pool_at_the_cap_is_accepted_and_one_past_it_is_not() {
         .map(|i| LogicalInstr::LoadConstStr { const_idx: ConstIdx(i) }.to_wire())
         .collect();
     let last = Reg(MAX_CONST_POOL as u16 - 1);
-    assert!(from_regions(&code, &[], Some(last), pool).is_ok());
+    assert!(from_regions(&code, &[[1, last.0 as u32]], pool).is_ok());
 
     // Refused off the declared count alone, so the blob need carry no entry.
     let mut b = valid_empty_blob();
-    gnitz_wire::write_u32_le(&mut b, 12, MAX_CONST_POOL as u32 + 1);
+    gnitz_wire::write_u32_le(&mut b, 8, MAX_CONST_POOL as u32 + 1);
     let err = LogicalProgram::from_blob(&b).expect_err("an over-cap pool must be refused");
     let ExprValidateErr::CorruptBlob(msg) = &err else {
         panic!("expected a CorruptBlob, got {err:?}");
@@ -803,15 +795,15 @@ fn from_blob_rejects_an_unknown_opcode() {
     // current maximum": that couples the test to every opcode addition while
     // adding no coverage a new opcode's own decode test does not already give.
     assert_eq!(
-        wire_err(from_regions(&[[0, 0, 0, 0, 0]], &[], None, vec![])),
+        wire_err(from_regions(&[[0, 0, 0, 0, 0]], &[], vec![])),
         ExprValidateErr::UnknownOpcode(0)
     );
     assert_eq!(
-        wire_err(from_regions(&[[u32::MAX, 0, 0, 0, 0]], &[], None, vec![])),
+        wire_err(from_regions(&[[u32::MAX, 0, 0, 0, 0]], &[], vec![])),
         ExprValidateErr::UnknownOpcode(u32::MAX)
     );
     // A valid opcode lowers (control): LOAD_COL_INT col0.
-    assert!(from_regions(&one(ExprOp::LoadColInt, 0, &[0]), &[], None, vec![]).is_ok());
+    assert!(from_regions(&one(ExprOp::LoadColInt, 0, &[0]), &[], vec![]).is_ok());
 }
 
 /// The sink forgeries the split into a code and a sink region makes possible.
@@ -821,12 +813,12 @@ fn from_blob_rejects_an_unknown_opcode() {
 fn from_blob_rejects_a_malformed_sink() {
     // A sink naming a register no instruction writes.
     assert_eq!(
-        wire_err(from_regions(&[], &[[1, 3]], None, vec![])),
+        wire_err(from_regions(&[], &[[1, 3]], vec![])),
         ExprValidateErr::RegOutOfRange { reg: 3, num_regs: 0 }
     );
     // A sink kind outside the two the encoder writes.
     assert_eq!(
-        wire_err(from_regions(&[], &[[7, 0]], None, vec![])),
+        wire_err(from_regions(&[], &[[7, 0]], vec![])),
         ExprValidateErr::BadSinkKind(7)
     );
 }
@@ -872,14 +864,26 @@ fn from_blob_rejects_a_bad_register_file() {
     let load_const = one(ExprOp::LoadConst, 0, &[0]);
     let over_cap = load_const.repeat(crate::MAX_REGS + 1);
     assert_eq!(
-        wire_err(from_regions(&over_cap, &[], None, vec![])),
+        wire_err(from_regions(&over_cap, &[], vec![])),
         ExprValidateErr::TooManyRegs(65)
     );
-    // A result register no instruction writes — the same out-of-range rejection
-    // an operand or a sink draws.
+    // A register sink no instruction writes.
     assert_eq!(
-        wire_err(from_regions(&load_const, &[], Some(Reg(3)), vec![])),
+        wire_err(from_regions(&load_const, &[[1, 3]], vec![])),
         ExprValidateErr::RegOutOfRange { reg: 3, num_regs: 1 }
+    );
+    // A register word past `u16` whose low half names a written register.
+    assert_eq!(
+        wire_err(from_regions(&load_const, &[[1, 0x1_0000]], vec![])),
+        ExprValidateErr::RegOutOfRange { reg: u16::MAX, num_regs: 1 }
+    );
+    let neg = code(&[
+        (ExprOp::LoadConst, 0, &[0]),
+        (ExprOp::IntUnary, IntUnaryOp::Neg.as_wire(), &[0x1_0000]),
+    ]);
+    assert_eq!(
+        wire_err(from_regions(&neg, &[], vec![])),
+        ExprValidateErr::RegReadBeforeWrite { reg: u16::MAX }
     );
 }
 
@@ -892,7 +896,7 @@ fn from_blob_rejects_a_forward_register_reference() {
     let add = IntArithOp::Add.as_wire();
     // IntAdd a5 b1 as the first instruction: no register exists yet.
     assert_eq!(
-        wire_err(from_regions(&one(ExprOp::IntArith, add, &[5, 1]), &[], None, vec![])),
+        wire_err(from_regions(&one(ExprOp::IntArith, add, &[5, 1]), &[], vec![])),
         ExprValidateErr::RegReadBeforeWrite { reg: 5 }
     );
     // LoadConst then IntAdd reading its own register.
@@ -900,7 +904,6 @@ fn from_blob_rejects_a_forward_register_reference() {
         wire_err(from_regions(
             &code(&[(ExprOp::LoadConst, 0, &[0]), (ExprOp::IntArith, add, &[1, 0])]),
             &[],
-            None,
             vec![]
         )),
         ExprValidateErr::RegReadBeforeWrite { reg: 1 }
@@ -914,7 +917,6 @@ fn from_blob_rejects_an_out_of_range_const_idx() {
         wire_err(from_regions(
             &one(ExprOp::StrColConst, CmpOp::Eq.as_wire(), &[0, 9]),
             &[],
-            None,
             vec![b"x".to_vec()]
         )),
         ExprValidateErr::ConstIdxOutOfRange { const_idx: 9, n: 1 }
@@ -925,7 +927,7 @@ fn from_blob_rejects_an_out_of_range_const_idx() {
 fn validate_rejects_an_out_of_range_column() {
     // LOAD_COL_INT col=200 against a 3-column schema.
     let s3 = schema_pk_ints(2, true);
-    let prog = from_regions(&one(ExprOp::LoadColInt, 0, &[200]), &[], None, vec![]).unwrap();
+    let prog = from_regions(&one(ExprOp::LoadColInt, 0, &[200]), &[], vec![]).unwrap();
     assert_eq!(
         prog.validate(&s3, None),
         Err(ExprValidateErr::ColOutOfRange { col: 200, num_columns: 3 })
@@ -944,7 +946,7 @@ fn validate_rejects_a_pk_column_for_a_payload_only_opcode() {
         (ExprOp::StrColConst, eq, &[0, 0]),
         (ExprOp::StrColCol, eq, &[0, 1]),
     ] {
-        let prog = from_regions(&one(op, sel, ops), &[], None, pool.clone()).unwrap();
+        let prog = from_regions(&one(op, sel, ops), &[], pool.clone()).unwrap();
         assert_eq!(
             prog.validate(&s_pk, None),
             Err(ExprValidateErr::ColNotPayload { col: 0 }),
@@ -958,7 +960,7 @@ fn validate_rejects_a_wide_column_register_load() {
     // LOAD_COL_INT on a 16-byte U128 column: a register holds 8 bytes, so the
     // load is rejected at validation rather than silently truncating.
     let schema = TestSchema::new(&[(TypeCode::U64, false), (TypeCode::U128, true)], &[0]);
-    let prog = from_regions(&one(ExprOp::LoadColInt, 0, &[1]), &[], None, vec![]).unwrap();
+    let prog = from_regions(&one(ExprOp::LoadColInt, 0, &[1]), &[], vec![]).unwrap();
     assert_eq!(
         prog.validate(&schema, None),
         Err(ExprValidateErr::ColKindMismatch {
@@ -977,7 +979,7 @@ fn validate_rejects_a_wide_column_register_load() {
 fn load_col_int_requires_a_fixed_int_column() {
     for tc in [TypeCode::F64, TypeCode::F32, TypeCode::String] {
         let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, tc]);
-        let prog = from_regions(&one(ExprOp::LoadColInt, 0, &[1]), &[], None, vec![]).unwrap();
+        let prog = from_regions(&one(ExprOp::LoadColInt, 0, &[1]), &[], vec![]).unwrap();
         assert_eq!(
             prog.validate(&schema, None),
             Err(ExprValidateErr::ColKindMismatch {
@@ -1000,7 +1002,7 @@ fn load_col_int_requires_a_fixed_int_column() {
         TypeCode::I64,
     ] {
         let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, tc]);
-        let prog = from_regions(&one(ExprOp::LoadColInt, 0, &[1]), &[], None, vec![]).unwrap();
+        let prog = from_regions(&one(ExprOp::LoadColInt, 0, &[1]), &[], vec![]).unwrap();
         assert_eq!(prog.validate(&schema, None), Ok(()), "type code {tc}");
     }
 }
@@ -1012,7 +1014,7 @@ fn load_col_int_requires_a_fixed_int_column() {
 fn load_col_float_requires_a_float_column() {
     let case = |tc: TypeCode| {
         let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, tc]);
-        from_regions(&one(ExprOp::LoadColFloat, 0, &[1]), &[], None, vec![])
+        from_regions(&one(ExprOp::LoadColFloat, 0, &[1]), &[], vec![])
             .unwrap()
             .validate(&schema, None)
     };
@@ -1041,7 +1043,6 @@ fn str_opcodes_require_a_german_string_column() {
         from_regions(
             &one(ExprOp::StrColConst, CmpOp::Eq.as_wire(), &[1, 0]),
             &[],
-            None,
             vec![b"x".to_vec()],
         )
         .unwrap()
@@ -1060,7 +1061,7 @@ fn str_opcodes_require_a_german_string_column() {
 
     // STR_COL_COL col_a=1 col_b=2 — both operands are checked.
     let vs_col = |a: TypeCode, b: TypeCode| {
-        from_regions(&one(ExprOp::StrColCol, CmpOp::Eq.as_wire(), &[1, 2]), &[], None, vec![])
+        from_regions(&one(ExprOp::StrColCol, CmpOp::Eq.as_wire(), &[1, 2]), &[], vec![])
             .unwrap()
             .validate(&schema(a, b), None)
     };
@@ -1091,7 +1092,7 @@ fn null_tests_accept_any_payload_column() {
     for tc in [TypeCode::U128, TypeCode::String, TypeCode::F32] {
         let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, tc]);
         for invert in [0u32, 1] {
-            let prog = from_regions(&one(ExprOp::IsNull, invert, &[1]), &[], None, vec![]).unwrap();
+            let prog = from_regions(&one(ExprOp::IsNull, invert, &[1]), &[], vec![]).unwrap();
             assert_eq!(prog.validate(&schema, None), Ok(()), "invert {invert} type {tc}");
         }
     }
@@ -1152,7 +1153,7 @@ fn a_register_sink_slot_must_be_eight_bytes() {
     let case = |tc: TypeCode| {
         let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, tc]);
         // LOAD_CONST into reg 0, stored into output slot 0.
-        from_regions(&one(ExprOp::LoadConst, 0, &[0]), &[[1, 0]], None, vec![])
+        from_regions(&one(ExprOp::LoadConst, 0, &[0]), &[[1, 0]], vec![])
             .unwrap()
             .validate(&schema, Some(&schema))
     };
@@ -1185,7 +1186,7 @@ fn a_register_sink_slot_must_be_eight_bytes() {
 fn validate_rejects_a_sink_list_that_does_not_cover_the_output() {
     // in/out: [U64 PK, I64, I64] — two output payload slots.
     let schema = schema_pk_ints(2, false);
-    let map = |sinks: &[[u32; SINK_WORDS]]| from_regions(&[], sinks, None, vec![]).unwrap();
+    let map = |sinks: &[[u32; SINK_WORDS]]| from_regions(&[], sinks, vec![]).unwrap();
 
     // Both slots written — accepted.
     assert_eq!(map(&[[0, 1], [0, 2]]).validate(&schema, Some(&schema)), Ok(()));
@@ -1211,7 +1212,7 @@ fn new_panics_on_a_forward_register_reference() {
             a: Reg(0),
             b: Reg(1),
         }],
-        Output::Slots(Vec::new()),
+        Vec::new(),
         vec![],
     );
 }
@@ -1305,36 +1306,30 @@ fn not_in_set_excludes_a_null_operand() {
     }
 }
 
-/// The wire pool order is not trusted: `resolve` sorts it, because the kernel
-/// binary-searches it and the only sort otherwise happens in the client planner.
 #[test]
-fn an_unsorted_in_set_pool_is_sorted_at_resolve() {
-    let (schema, mut prog) = in_set_prog(TypeCode::I64, &[42, -1, 7, 3]);
-    assert_eq!(prog.prog().int_sets[0], vec![-1, 3, 7, 42]);
-    // A binary search over the raw descending-ish order would miss 7 (it sits
-    // past the first probe's `42 > 7` left turn).
-    for v in [-1i64, 3, 7, 42] {
-        let mb = make_int_view(&schema, &[(1, 0, &[v])]);
-        assert_eq!(row_values(&mut prog, &mb)[0], Some(1), "value {v} must be found");
+fn a_non_canonical_in_set_pool_is_rejected() {
+    for pool in [&[42i64, 7, 3][..], &[1, 3, 3, 7]] {
+        assert_eq!(
+            wire_err(from_regions(
+                &one(ExprOp::IntInSet, 0, &[0, 0]),
+                &[],
+                vec![gnitz_wire::as_le_bytes(pool).to_vec()]
+            )),
+            ExprValidateErr::IntSetNotCanonical { set_idx: 0 },
+            "pool {pool:?}"
+        );
     }
-    let mb = make_int_view(&schema, &[(1, 0, &[8])]);
-    assert_eq!(row_values(&mut prog, &mb)[0], Some(0));
 }
 
 #[test]
 fn validate_rejects_a_misaligned_in_set_pool() {
-    // A pool whose length is not a multiple of 8 is a clean IntSetNotAligned,
-    // not a silent chunks_exact tail-drop at resolve. `from_blob` runs the
-    // structure-only validate, so it rejects here.
-    // Instruction: [IntInSet=24, selector 0, value_reg=0, set_idx=0], pool of 5 bytes.
     assert_eq!(
         wire_err(from_regions(
             &one(ExprOp::IntInSet, 0, &[0, 0]),
             &[],
-            None,
             vec![vec![0u8; 5]]
         )),
-        ExprValidateErr::IntSetNotAligned { set_idx: 0, len: 5 }
+        ExprValidateErr::IntSetNotCanonical { set_idx: 0 }
     );
 }
 
@@ -1345,7 +1340,6 @@ fn validate_rejects_an_out_of_range_set_idx() {
         wire_err(from_regions(
             &one(ExprOp::IntInSet, 0, &[0, 9]),
             &[],
-            None,
             vec![vec![0u8; 8]]
         )),
         ExprValidateErr::ConstIdxOutOfRange { const_idx: 9, n: 1 }
@@ -1360,8 +1354,8 @@ fn classifier_pure_conjunction_filter() {
     let instrs = conjunction_over_two_cols();
     // `analyze` runs off the assembled program, and the same one must be a
     // legal filter.
-    let prog = LogicalProgram::new(instrs.clone(), Output::Result(Reg(5)), vec![]);
-    let ProgramFacts { bit_only, bool_pack, .. } = prog.analyze(&schema, Some(ReadAs::Bool));
+    let prog = LogicalProgram::new(instrs.clone(), vec![Sink::Reg(Reg(5))], vec![]);
+    let ProgramFacts { bit_only, bool_pack, .. } = prog.analyze(&schema, ReadAs::Bool);
     filter_prog(&schema, instrs, Reg(5), vec![]);
     // Bool producers: r2 (`Cmp` Gt), r4 (`Cmp` Gt), r5 (`BoolBinary`).
     // Non-bool readers consume r0/r1/r3 (CMPs read them as i64), so those
@@ -1403,7 +1397,7 @@ fn decode_rejects_a_forged_cast_target() {
         ] {
             let c = code(&[(ExprOp::LoadColInt, 0, &[1]), (op, tc, &[0])]);
             assert_eq!(
-                wire_err(from_regions(&c, &[], None, vec![])),
+                wire_err(from_regions(&c, &[], vec![])),
                 ExprValidateErr::BadSelector { op: op.as_wire(), selector: tc },
                 "{op:?} tc {tc}"
             );
@@ -1420,10 +1414,7 @@ fn decode_rejects_a_forged_cast_target() {
             TypeCode::U64,
         ] {
             let c = code(&[(ExprOp::LoadColInt, 0, &[1]), (op, tc as u32, &[0])]);
-            assert!(
-                from_regions(&c, &[], None, vec![]).is_ok(),
-                "{op:?} tc {tc} must be accepted"
-            );
+            assert!(from_regions(&c, &[], vec![]).is_ok(), "{op:?} tc {tc} must be accepted");
         }
     }
 }
@@ -1445,7 +1436,7 @@ fn validate_bounds_checks_every_register_operand() {
         // rejection whether it is the opcode's own index or one past the end.
         for a in [0u32, 9] {
             assert!(matches!(
-                wire_err(from_regions(&one(op, sel, &[a]), &[], None, vec![])),
+                wire_err(from_regions(&one(op, sel, &[a]), &[], vec![])),
                 ExprValidateErr::RegReadBeforeWrite { .. }
             ));
         }
@@ -1461,7 +1452,6 @@ fn validate_bounds_checks_every_register_operand() {
             wire_err(from_regions(
                 &code(&[(ExprOp::LoadConst, 0, &[0]), (op, sel, &[0, 9])]),
                 &[],
-                None,
                 vec![]
             )),
             ExprValidateErr::RegReadBeforeWrite { reg: 9 }
@@ -1650,7 +1640,7 @@ fn int_cast_records_the_source_signedness() {
 /// schema-free, so this is where a forged program meets them — before any schema
 /// is in hand.
 fn from_code(code: &[[u32; INSTR_WORDS]]) -> Result<(), ExprValidateErr> {
-    from_regions(code, &[], None, vec![]).map(|_| ())
+    from_regions(code, &[], vec![]).map(|_| ())
 }
 
 /// A mixed-class register operand is refused whichever way round it goes: a
@@ -1758,13 +1748,13 @@ fn a_register_sink_must_match_its_destination_column() {
     let in_str = TestSchema::with_pk_at(0, &[TypeCode::U64, TypeCode::String]);
     let store_r0: &[[u32; SINK_WORDS]] = &[[1, 0]]; // Sink::Reg(0)
 
-    let scalar_src = from_regions(&one(ExprOp::LoadConst, 0, &[7]), store_r0, None, vec![]).unwrap();
+    let scalar_src = from_regions(&one(ExprOp::LoadConst, 0, &[7]), store_r0, vec![]).unwrap();
     assert_eq!(
         scalar_src.validate(&in_str, Some(&str_out)),
         Err(ExprValidateErr::EmitClassMismatch { out: 0, type_code: TypeCode::String })
     );
 
-    let str_src = from_regions(&one(ExprOp::LoadColStr, 0, &[1]), store_r0, None, vec![]).unwrap();
+    let str_src = from_regions(&one(ExprOp::LoadColStr, 0, &[1]), store_r0, vec![]).unwrap();
     assert_eq!(
         str_src.validate(&in_str, Some(&int_out)),
         Err(ExprValidateErr::EmitClassMismatch { out: 0, type_code: TypeCode::I64 })
@@ -1783,7 +1773,7 @@ fn a_register_sink_must_match_its_destination_column() {
 #[test]
 fn a_string_result_register_resolves_as_a_scalar_but_not_as_a_filter() {
     let schema = schema_pk_strings(1, true);
-    let prog = || from_regions(&one(ExprOp::LoadColStr, 0, &[1]), &[], Some(Reg(0)), vec![]).unwrap();
+    let prog = || from_regions(&one(ExprOp::LoadColStr, 0, &[1]), &[[1, 0]], vec![]).unwrap();
     assert_eq!(
         prog().resolve_filter(&schema).err(),
         Some(ExprValidateErr::RegClassMismatch { reg: 0 })
@@ -1795,7 +1785,7 @@ fn a_string_result_register_resolves_as_a_scalar_but_not_as_a_filter() {
 fn load_col_str_requires_a_german_string_column() {
     let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, TypeCode::I64]);
     assert_eq!(
-        from_regions(&one(ExprOp::LoadColStr, 0, &[1]), &[], None, vec![])
+        from_regions(&one(ExprOp::LoadColStr, 0, &[1]), &[], vec![])
             .unwrap()
             .validate(&schema, None),
         Err(ExprValidateErr::ColKindMismatch {
@@ -1812,7 +1802,6 @@ fn trim_mode_and_cast_target_are_narrowed_at_decode() {
         from_regions(
             &code(&[(ExprOp::LoadColStr, 0, &[1]), (ExprOp::StrTrim, mode, &[0, 0])]),
             &[],
-            None,
             vec![b" ".to_vec()],
         )
         .map(|_| ())
@@ -1843,7 +1832,7 @@ fn like_rejects_a_forged_operand() {
     let load_like =
         |ci: u32, pat_idx: u32| code(&[(ExprOp::LoadColStr, 0, &[1]), (ExprOp::StrLike, ci, &[0, pat_idx])]);
     let pool = || vec![b"a\xFF".to_vec()];
-    let decode = |c: Vec<[u32; INSTR_WORDS]>, pool: Vec<Vec<u8>>| from_regions(&c, &[], None, pool).map(|_| ());
+    let decode = |c: Vec<[u32; INSTR_WORDS]>, pool: Vec<Vec<u8>>| from_regions(&c, &[], pool).map(|_| ());
 
     assert!(decode(load_like(0, 0), pool()).is_ok());
     assert!(decode(load_like(1, 0), pool()).is_ok());
@@ -2294,75 +2283,43 @@ fn load_const_round_trips() {
         0x0000_0001_0000_0000,
         -0x0000_0001_0000_0000,
     ] {
-        let (a1, a2) = crate::encode_load_const(v);
-        assert_eq!(crate::decode_load_const(a1, a2), v, "load_const round-trip for {v}");
+        let (a1, a2) = super::encode_load_const(v);
+        assert_eq!(super::decode_load_const(a1, a2), v, "load_const round-trip for {v}");
     }
 }
 
-/// `build(None)` with instructions and no sinks is a map over a zero-payload
-/// output, not a predicate: the filter path rejects it rather than reading
-/// register 0 as a verdict nobody wrote.
+/// A filter's output is exactly one register sink: none, two, or a column sink
+/// is no verdict.
 #[test]
 fn a_map_blob_is_not_accepted_as_a_filter() {
     let schema = schema_pk_ints(1, true);
-    let mut b = crate::ExprBuilder::new();
-    b.emit(LogicalInstr::LoadColInt { col: 1 });
-    let blob = b.build(None).expect("a well-formed program").to_blob_bytes();
-    let prog = LogicalProgram::from_blob(&blob).expect("the framing is well-formed");
-    assert_eq!(
-        prog.resolve_filter(&schema).err(),
-        Some(ExprValidateErr::OutputRoleMismatch)
-    );
+    let outputs = [vec![], vec![Sink::Reg(Reg(0)), Sink::Reg(Reg(0))], vec![Sink::Col(1)]];
+    for sinks in outputs {
+        let mut b = crate::ExprBuilder::new();
+        b.emit(LogicalInstr::LoadColInt { col: 1 });
+        let blob = b.build(sinks.clone()).expect("a well-formed program").to_blob_bytes();
+        let prog = LogicalProgram::from_blob(&blob).expect("the framing is well-formed");
+        assert_eq!(
+            prog.resolve_filter(&schema).err(),
+            Some(ExprValidateErr::OutputRoleMismatch),
+            "sinks {sinks:?}"
+        );
+    }
 }
 
-/// A forged output word above the register file would truncate into a register
-/// `written_before` accepts, so it is bounded at decode instead.
-#[test]
-fn a_forged_output_register_above_the_cap_is_rejected() {
-    let mut b = crate::ExprBuilder::new();
-    let r = b.emit(LogicalInstr::LoadColInt { col: 1 });
-    let mut blob = b.build(Some(r)).expect("a well-formed program").to_blob_bytes();
-    assert!(LogicalProgram::from_blob(&blob).is_ok());
-    // 0x1_0000 is neither the map sentinel nor a register, and truncates to 0.
-    gnitz_wire::write_u32_le(&mut blob, 0, 0x1_0000);
-    let err = LogicalProgram::from_blob(&blob).expect_err("a forged output word is rejected");
-    let ExprValidateErr::CorruptBlob(msg) = &err else {
-        panic!("expected a CorruptBlob, got {err:?}");
-    };
-    assert!(msg.starts_with("expr blob: ") && msg.contains("65536"), "got: {msg}");
-}
-
-/// A blob naming a result register *and* an output slot answers one question
-/// twice, so it is no program — rejected where the two halves meet.
-#[test]
-fn a_blob_naming_its_output_twice_is_rejected() {
-    let err = wire_err(from_regions(
-        &one(ExprOp::LoadColInt, 0, &[1]),
-        &[[1, 0]],
-        Some(Reg(0)),
-        vec![],
-    ));
-    let ExprValidateErr::CorruptBlob(msg) = &err else {
-        panic!("expected a CorruptBlob, got {err:?}");
-    };
-    assert!(msg.contains("names its output once"), "got: {msg}");
-}
-
-/// One pool index is decoded once. `add_const_bytes` dedups by byte equality and
-/// the lowerer sorts each list before interning, so two IN lists over the same
-/// values share an index — which without a slot table would retain two identical
-/// sorted vectors for the plan's life.
+/// Two IN lists over the same values, in any order, share one pool entry and one
+/// decoded pool.
 #[test]
 fn two_in_sets_over_one_pool_index_share_one_decoded_pool() {
     let schema = schema_pk_ints(2, true);
     let mut b = crate::ExprBuilder::new();
-    let set = b.add_const_int_set(&[1, 2, 3]);
+    let set = b.add_const_int_set(vec![3, 1, 2, 1]);
     let a = b.emit(LogicalInstr::LoadColInt { col: 1 });
     let a_in = b.emit(LogicalInstr::IntInSet { value_reg: a, set_idx: set });
     let c = b.emit(LogicalInstr::LoadColInt { col: 2 });
     let c_in = b.emit(LogicalInstr::IntInSet { value_reg: c, set_idx: set });
     let or = b.emit(LogicalInstr::BoolBinary { a: a_in, b: c_in, is_or: true });
-    let prog = b.build(Some(or)).expect("a well-formed program");
+    let prog = b.build(vec![Sink::Reg(or)]).expect("a well-formed program");
     assert_eq!(prog.const_strings().len(), 1, "the two lists intern to one pool entry");
 
     let ev = prog.resolve_filter(&schema).expect("resolves");
@@ -2387,7 +2344,7 @@ fn scalar_lanes_covers_every_scalar_register_and_no_more() {
             LogicalInstr::LoadColStr { col: 1 },
             LogicalInstr::StrCase { a: Reg(0), upper: true },
         ],
-        Output::Result(Reg(1)),
+        vec![Sink::Reg(Reg(1))],
         Vec::new(),
     );
     assert_eq!(lanes(all_str, &str_schema), (0, 2));
@@ -2407,7 +2364,7 @@ fn scalar_lanes_covers_every_scalar_register_and_no_more() {
             LogicalInstr::LoadColStr { col: 2 },
             LogicalInstr::StrLen { a: Reg(2), chars: false },
         ],
-        Output::Result(Reg(3)),
+        vec![Sink::Reg(Reg(3))],
         Vec::new(),
     );
     assert_eq!(lanes(interleaved, &str_schema), (4, 3));
@@ -2426,7 +2383,7 @@ fn sequential_copy_projection() {
     // One computed register breaks the block copy, whatever the copies do.
     let computed = LogicalProgram::new(
         vec![LogicalInstr::LoadColInt { col: 2 }],
-        Output::Slots(vec![Sink::Col(1), Sink::Reg(Reg(0))]),
+        vec![Sink::Col(1), Sink::Reg(Reg(0))],
         vec![],
     );
     assert_eq!(computed.sequential_copy_base(), None);
@@ -2447,7 +2404,7 @@ fn is_identity_map_requires_an_in_order_copy_over_one_layout() {
     );
     let computed = LogicalProgram::new(
         vec![LogicalInstr::LoadColInt { col: 2 }],
-        Output::Slots(vec![Sink::Col(1), Sink::Reg(Reg(0))]),
+        vec![Sink::Col(1), Sink::Reg(Reg(0))],
         vec![],
     );
     assert!(!computed.is_identity_map(&schema, &schema), "computed sink");

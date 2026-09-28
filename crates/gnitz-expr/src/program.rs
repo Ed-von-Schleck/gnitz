@@ -35,9 +35,6 @@ const SINK_WORDS: usize = 2;
 /// and the arrays they frame cannot disagree.
 const INSTR_BYTES: usize = INSTR_WORDS * 4;
 const SINK_BYTES: usize = SINK_WORDS * 4;
-/// The blob's `output` word for a program that writes output slots. `u32::MAX`,
-/// which no register index can be — the register file is 64 deep.
-const MAP_OUTPUT: u32 = u32::MAX;
 
 /// Why a client-authored expr program was rejected at compile. A variant's payload
 /// is there for its `Display` to name the offending operand.
@@ -45,8 +42,7 @@ const MAP_OUTPUT: u32 = u32::MAX;
 pub enum ExprValidateErr {
     UnknownOpcode(u32),
     TooManyRegs(u32),
-    /// A register named by an instruction operand, a sink, or the result — one
-    /// variant, because the condition is one: `reg` is not below `num_regs`.
+    /// A sink's register is not below `num_regs`.
     RegOutOfRange {
         reg: u16,
         num_regs: u32,
@@ -61,9 +57,8 @@ pub enum ExprValidateErr {
         const_idx: u32,
         n: usize,
     },
-    IntSetNotAligned {
+    IntSetNotCanonical {
         set_idx: u32,
-        len: usize,
     },
     ColOutOfRange {
         col: u32,
@@ -95,8 +90,7 @@ pub enum ExprValidateErr {
         sinks: usize,
         num_payload_cols: usize,
     },
-    /// The program's output is not the shape its consumer reads: a filter or
-    /// scalar writing output slots, or a map naming a result register.
+    /// A filter or scalar whose output is not exactly one register sink.
     OutputRoleMismatch,
     /// Framing or region bytes that describe no program — the decoder's own
     /// message, prefixed with the call site that read them.
@@ -218,7 +212,7 @@ gnitz_wire::wire_enum! {
     /// opcode with no family, which the decoder enforces. The three operand
     /// words are whole `u32`s, one operand each; unused ones are 0 and ignored.
     /// The one operand spanning two words is `LoadConst`'s `i64`, through
-    /// [`encode_load_const`] / [`decode_load_const`].
+    /// `encode_load_const` / `decode_load_const`.
     ///
     /// A wire enum so [`LogicalProgram::decode_instr`] matches exhaustively: a
     /// new opcode is a compile error there until it gets a decode arm — which
@@ -287,11 +281,11 @@ gnitz_wire::wire_enum! {
 /// `ExprOp::LoadConst`'s `i64` across two operand words (`a1` = low 32 bits,
 /// `a2` = high 32 bits) — the one operand wider than a word.
 #[inline]
-pub const fn encode_load_const(v: i64) -> (u32, u32) {
+const fn encode_load_const(v: i64) -> (u32, u32) {
     (v as u32, (v >> 32) as u32)
 }
 #[inline]
-pub const fn decode_load_const(a1: u32, a2: u32) -> i64 {
+const fn decode_load_const(a1: u32, a2: u32) -> i64 {
     ((a2 as i64) << 32) | (a1 as i64 & 0xFFFF_FFFF)
 }
 
@@ -431,6 +425,13 @@ impl Reg {
     fn written_before(self, i: usize) -> bool {
         (self.0 as usize) < i
     }
+
+    /// A wire register word, saturating past `u16` to a register the file never
+    /// holds rather than wrapping into one it does.
+    fn from_wire(w: u32) -> Self {
+        const { assert!(MAX_REGS < u16::MAX as usize) };
+        Reg(u16::try_from(w).unwrap_or(u16::MAX))
+    }
 }
 
 /// An index into a program's const pool.
@@ -461,49 +462,6 @@ impl Sink {
         match self {
             Sink::Col(_) => None,
             Sink::Reg(r) => Some(r),
-        }
-    }
-}
-
-/// Where a program's result goes: one register for a filter or scalar, one
-/// output payload slot per sink for a map. Exclusive by construction.
-#[derive(Debug)]
-pub enum Output {
-    /// The register a filter's verdict or a scalar's value is read out of.
-    Result(Reg),
-    /// The output payload slots, in slot order; empty for a zero-payload map.
-    Slots(Vec<Sink>),
-}
-
-impl Output {
-    /// The one place a `(result_reg, sinks)` pair becomes an `Output`, so a
-    /// program naming its output twice is rejected once — for
-    /// [`ExprBuilder::build`](crate::ExprBuilder::build) and the wire alike.
-    pub(crate) fn new(result_reg: Option<Reg>, sinks: Vec<Sink>) -> Result<Self, ExprValidateErr> {
-        match result_reg {
-            Some(r) if sinks.is_empty() => Ok(Output::Result(r)),
-            Some(_) => Err(ExprValidateErr::CorruptBlob(format!(
-                "a result register and {} output slots: a program names its output once",
-                sinks.len()
-            ))),
-            None => Ok(Output::Slots(sinks)),
-        }
-    }
-
-    /// The output slots — empty for a result register, so every walk over a
-    /// program's sinks reads one accessor rather than matching.
-    pub(crate) fn slots(&self) -> &[Sink] {
-        match self {
-            Output::Result(_) => &[],
-            Output::Slots(s) => s,
-        }
-    }
-
-    /// The result register, `None` for a map.
-    fn result(&self) -> Option<Reg> {
-        match self {
-            Output::Result(r) => Some(*r),
-            Output::Slots(_) => None,
         }
     }
 }
@@ -644,10 +602,9 @@ pub enum LogicalInstr {
         col_a: u32,
         col_b: u32,
     },
-    /// Integer set membership: `value_reg ∈ set[set_idx]`, over the pool of
-    /// packed `N × 8-byte LE` values at const index `set_idx`, decoded once at
-    /// `resolve`. NULL input propagates to NULL. The pool's wire order is not a
-    /// contract — `resolve` sorts it and binary-searches the sorted copy.
+    /// Integer set membership: `value_reg ∈ set[set_idx]`, over the strictly
+    /// ascending pool of packed `N × 8-byte LE` values at const index `set_idx`,
+    /// decoded once at `resolve`. NULL input propagates to NULL.
     IntInSet {
         value_reg: Reg,
         set_idx: ConstIdx,
@@ -963,9 +920,8 @@ pub(crate) enum Instr {
         pi_a: u8,
         pi_b: u8,
     },
-    /// Integer set membership: `dst = value_reg ∈ int_sets[set_idx]`. The pool is
-    /// decoded once at `resolve` into `ResolvedProgram.int_sets` (sorted
-    /// ascending, signed i64); `set_idx` indexes that vector, not the const pool.
+    /// Integer set membership: `dst = value_reg ∈ int_sets[set_idx]`. `set_idx`
+    /// indexes `ResolvedProgram.int_sets`, not the const pool.
     IntInSet {
         dst: u16,
         value_reg: u16,
@@ -1096,16 +1052,16 @@ pub(crate) struct IntReg {
 }
 
 impl LogicalInstr {
-    /// The width this instruction range-checks its result into, for the casts
-    /// that do — a value they produce is whole in that many low bytes, which is
+    /// The type this instruction range-checks its result into, for the casts
+    /// that do — a value they produce is whole in that type's low bytes, which is
     /// what lets [`check_emit_slot`] admit a slot narrower than the register.
     /// `None` for every other instruction: a register is otherwise the full
     /// 8-byte image and narrowing it would truncate.
-    fn range_checked_width(&self) -> Option<usize> {
+    pub(crate) fn range_check(&self) -> Option<FixedInt> {
         match *self {
             LogicalInstr::IntCast { fi, .. }
             | LogicalInstr::FloatToInt { fi, .. }
-            | LogicalInstr::StrToInt { fi, .. } => Some(fi.width()),
+            | LogicalInstr::StrToInt { fi, .. } => Some(fi),
             _ => None,
         }
     }
@@ -1214,9 +1170,8 @@ impl Sink {
 /// Serialise an expr program. Layout (all little-endian):
 ///
 /// ```text
-/// 0   4   output (u32)
-/// 4   4   instruction count N
-/// 8   20N instruction words
+/// 0   4   instruction count N
+/// 4   20N instruction words
 /// ..  4   sink count M
 /// ..  8M  sink words
 /// ..  4   const-pool count S
@@ -1225,11 +1180,7 @@ impl Sink {
 ///
 /// The register count is not carried: a register is the index of the
 /// instruction that writes it, so N *is* the register file's size.
-///
-/// `output` is the register a filter's or scalar's result is read out of, or the
-/// `MAP_OUTPUT` sentinel for a program that writes output slots.
 pub fn encode_expr_blob(
-    output: u32,
     code: impl ExactSizeIterator<Item = [u32; INSTR_WORDS]>,
     sinks: impl ExactSizeIterator<Item = [u32; SINK_WORDS]>,
     const_strings: &[Vec<u8>],
@@ -1237,9 +1188,9 @@ pub fn encode_expr_blob(
     let (n, m) = (code.len(), sinks.len());
     // The exact encoded length, so nothing reallocates.
     let mut w = Writer::with_capacity(
-        16 + n * INSTR_BYTES + m * SINK_BYTES + const_strings.iter().map(|s| 4 + s.len()).sum::<usize>(),
+        12 + n * INSTR_BYTES + m * SINK_BYTES + const_strings.iter().map(|s| 4 + s.len()).sum::<usize>(),
     );
-    w.u32(output).u32(n as u32);
+    w.u32(n as u32);
     for instr in code {
         for word in instr {
             w.u32(word);
@@ -1267,8 +1218,9 @@ pub struct LogicalProgram {
     /// The compute instructions. Instruction `i` writes register `i`, so this is
     /// the register file too, and its length is the register count.
     instrs: Vec<LogicalInstr>,
-    /// Where the result goes: one register, or the output slots — never both.
-    pub(crate) output: Output,
+    /// The output: one `Sink::Reg` for a filter or scalar, one sink per output
+    /// payload slot for a map.
+    pub(crate) sinks: Vec<Sink>,
     const_strings: Vec<Vec<u8>>,
     /// Bit `r` set iff register `r` holds a string rather than a scalar, as
     /// [`Self::from_instrs`] finished it.
@@ -1280,11 +1232,9 @@ pub struct LogicalProgram {
 }
 
 impl LogicalProgram {
-    /// Build from typed instructions. The compiler and test builders trust their
-    /// own construction, so a structural failure here is a compiler bug, not
-    /// client input — `Self::from_instrs` panics rather than returns.
-    pub fn new(instrs: Vec<LogicalInstr>, output: Output, const_strings: Vec<Vec<u8>>) -> Self {
-        Self::from_instrs(instrs, output, const_strings)
+    /// [`Self::from_instrs`], panicking on a structural failure.
+    pub fn new(instrs: Vec<LogicalInstr>, sinks: Vec<Sink>, const_strings: Vec<Vec<u8>>) -> Self {
+        Self::from_instrs(instrs, sinks, const_strings)
             .unwrap_or_else(|e| panic!("compiler-built LogicalProgram is invalid: {e:?}"))
     }
 
@@ -1292,16 +1242,10 @@ impl LogicalProgram {
     /// is not needed for. Every constructor routes through here and the type is
     /// immutable, so the walk below establishes the register-valid invariant
     /// `regs_split`'s raw split borrows depend on, and [`Self::str_class`], for
-    /// every `LogicalProgram` in every profile.
-    ///
-    /// The fallible entry point: [`Self::new`] unwraps it (a failure is a
-    /// compiler bug), [`Self::from_blob`] propagates it (bad client input), and
-    /// [`ExprBuilder::build`](crate::ExprBuilder::build) hands its instructions
-    /// straight here rather than encoding them to a blob for [`Self::from_blob`]
-    /// to decode back.
+    /// every `LogicalProgram`.
     pub(crate) fn from_instrs(
         instrs: Vec<LogicalInstr>,
-        output: Output,
+        sinks: Vec<Sink>,
         const_strings: Vec<Vec<u8>>,
     ) -> Result<Self, ExprValidateErr> {
         use ExprValidateErr as E;
@@ -1312,11 +1256,6 @@ impl LogicalProgram {
         // shift out of range.
         if instrs.len() > MAX_REGS {
             return Err(E::TooManyRegs(instrs.len() as u32));
-        }
-        if let Some(r) = output.result() {
-            if !r.written_before(instrs.len()) {
-                return Err(E::RegOutOfRange { reg: r.0, num_regs: instrs.len() as u32 });
-            }
         }
         for (i, instr) in instrs.iter().enumerate() {
             // Bound every operand off the one per-opcode operand table, so no
@@ -1345,7 +1284,7 @@ impl LogicalProgram {
         }
         // A sink's source register is bounded but not ordered: sinks run after
         // every instruction, so any of them is readable.
-        for reg in output.slots().iter().filter_map(|s| s.reg()) {
+        for reg in sinks.iter().filter_map(|s| s.reg()) {
             if !reg.written_before(instrs.len()) {
                 return Err(E::RegOutOfRange {
                     reg: reg.0,
@@ -1353,19 +1292,16 @@ impl LogicalProgram {
                 });
             }
         }
-        Ok(LogicalProgram { instrs, output, const_strings, str_class })
+        Ok(LogicalProgram { instrs, sinks, const_strings, str_class })
     }
 
     /// A pure projection: `copies[i] = src_col` copies logical input column
     /// `src_col` into output payload slot `i`. The source type is derived in
     /// `resolve` from the schema. The instruction-free shape a map consumer
-    /// turns into verbatim column moves and nothing else. The one wire-free
-    /// constructor a *production* caller uses — the circuit compiler builds
-    /// projections with it; [`LogicalProgram::new`] is reached only from
-    /// hand-written test programs.
+    /// turns into verbatim column moves and nothing else.
     pub fn copy_cols(copies: &[u32]) -> Self {
         let sinks = copies.iter().map(|&src_col| Sink::Col(src_col)).collect();
-        LogicalProgram::new(Vec::new(), Output::Slots(sinks), Vec::new())
+        LogicalProgram::new(Vec::new(), sinks, Vec::new())
     }
 
     /// The typed instructions, in emission order — instruction `i` writing
@@ -1380,34 +1316,22 @@ impl LogicalProgram {
     }
 
     /// Serialise to the wire blob — the inverse of [`Self::from_blob`], and the
-    /// one encode: `ExprBuilder` never produces wire words, so a blob can only
-    /// come from a program already validated here.
+    /// one encode.
     pub fn to_blob_bytes(&self) -> Vec<u8> {
         encode_expr_blob(
-            self.output.result().map_or(MAP_OUTPUT, |r| r.0 as u32),
             self.instrs.iter().copied().map(LogicalInstr::to_wire),
-            self.output.slots().iter().copied().map(Sink::to_wire),
+            self.sinks.iter().copied().map(Sink::to_wire),
             &self.const_strings,
         )
     }
 
     /// A program blob: the header walked, then the regions lowered into the
-    /// typed logical form — the inverse of [`encode_expr_blob`]. The output word
-    /// says which profile it is, so there is one entry point.
+    /// typed logical form — the inverse of [`encode_expr_blob`].
     ///
     /// Every count is bounded against the bytes present before any cap applies,
     /// so a forged count reports truncation rather than a limit it never reached.
     pub fn from_blob(blob: &[u8]) -> Result<Self, ExprValidateErr> {
-        let (result_reg, code, sinks, const_strings) = decode_all(blob, "expr blob", |r| {
-            // Bounded before the `as u16`: `0x1_0000` would truncate to register
-            // 0, which `written_before(1)` accepts.
-            let result_reg = match r.u32()? {
-                MAP_OUTPUT => None,
-                w if w as usize > MAX_REGS => {
-                    return Err(format!("result register {w} exceeds the {MAX_REGS}-register file"))
-                }
-                w => Some(Reg(w as u16)),
-            };
+        let (code, sinks, const_strings) = decode_all(blob, "expr blob", |r| {
             let n = r.u32()? as usize;
             let code = r.take(n * INSTR_BYTES)?;
             let m = r.u32()? as usize;
@@ -1427,7 +1351,7 @@ impl LogicalProgram {
             for _ in 0..s {
                 const_strings.push(r.bytes32()?.to_vec());
             }
-            Ok((result_reg, code, sinks, const_strings))
+            Ok((code, sinks, const_strings))
         })
         .map_err(ExprValidateErr::CorruptBlob)?;
         let n = code.len() / INSTR_BYTES;
@@ -1448,7 +1372,7 @@ impl LogicalProgram {
             .iter()
             .map(Self::decode_sink)
             .collect::<Result<Vec<_>, _>>()?;
-        Self::from_instrs(instrs, Output::new(result_reg, sinks)?, const_strings)
+        Self::from_instrs(instrs, sinks, const_strings)
     }
 
     /// Decode one sink pair `[kind, value]` — the inverse of [`Sink::to_wire`].
@@ -1458,7 +1382,7 @@ impl LogicalProgram {
         let (kind, value) = (gnitz_wire::read_u32_le(p, 0), gnitz_wire::read_u32_le(p, 4));
         match SinkKind::from_wire(kind).ok_or(ExprValidateErr::BadSinkKind(kind))? {
             SinkKind::Col => Ok(Sink::Col(value)),
-            SinkKind::Reg => Ok(Sink::Reg(Reg(value as u16))),
+            SinkKind::Reg => Ok(Sink::Reg(Reg::from_wire(value))),
         }
     }
 
@@ -1471,16 +1395,13 @@ impl LogicalProgram {
     /// through `no_sel`. Together that makes the accepted `(op, selector)` set
     /// computable from the enums instead of from a hand-synced table.
     ///
-    /// Not a bijection: unused operand words are ignored, and a register operand
-    /// truncates to `u16`. Safe because every register is bounded afterwards
-    /// against the register file — an operand by [`operands`] through
-    /// `Reg::written_before`, the result and every sink by [`Self::from_instrs`].
+    /// Not a bijection: unused operand words are ignored.
     pub(crate) fn decode_instr(t: &[u8; INSTR_BYTES]) -> Result<LogicalInstr, ExprValidateErr> {
         use LogicalInstr as L;
         let w = |i: usize| gnitz_wire::read_u32_le(t, i * 4);
         let op = ExprOp::from_wire(w(0)).ok_or(ExprValidateErr::UnknownOpcode(w(0)))?;
         let (opw, sel) = (w(0), w(1));
-        let (a, b, c) = (Reg(w(2) as u16), Reg(w(3) as u16), Reg(w(4) as u16));
+        let (a, b, c) = (Reg::from_wire(w(2)), Reg::from_wire(w(3)), Reg::from_wire(w(4)));
         // One statement of the one thing a selector can be wrong about: it names
         // no member of this opcode's family.
         let bad_sel = || ExprValidateErr::BadSelector { op: opw, selector: sel };
@@ -1541,8 +1462,6 @@ impl LogicalProgram {
                 const_idx: ConstIdx(w(3)),
             },
             ExprOp::StrColCol => L::StrColCol { op: cmp_op()?, col_a: w(2), col_b: w(3) },
-            // `set_idx` takes a whole u32 const index, never truncated to a
-            // register's u16.
             ExprOp::IntInSet => no_sel(L::IntInSet { value_reg: a, set_idx: ConstIdx(w(3)) })?,
             ExprOp::LoadColStr => no_sel(L::LoadColStr { col: w(2) })?,
             ExprOp::LoadConstStr => no_sel(L::LoadConstStr { const_idx: ConstIdx(w(2)) })?,
@@ -1594,11 +1513,10 @@ impl LogicalProgram {
         if !self.instrs.is_empty() {
             return None;
         }
-        let slots = self.output.slots();
-        let Sink::Col(base) = *slots.first()? else {
+        let Sink::Col(base) = *self.sinks.first()? else {
             return None;
         };
-        slots
+        self.sinks
             .iter()
             .enumerate()
             .all(|(i, s)| matches!(*s, Sink::Col(c) if c == base + i as u32))
@@ -1615,11 +1533,11 @@ impl LogicalProgram {
             && self.sequential_copy_base() == Some(in_schema.pk_cols().len())
     }
 
-    /// Lower to the resolved form, with `result_as` how the result register is
-    /// read (`None` for a map); also returns the per-register U64 mask.
+    /// Lower to the resolved form, with `sink_read` how the consumer reads each
+    /// sink's register; also returns the per-register U64 mask.
     ///
     /// Every "decoded once" below means **once per compile**, never per row.
-    pub(crate) fn resolve_program(self, schema: &dyn SchemaFacts, result_as: Option<ReadAs>) -> (ResolvedProgram, u64) {
+    pub(crate) fn resolve_program(self, schema: &dyn SchemaFacts, sink_read: ReadAs) -> (ResolvedProgram, u64) {
         use gnitz_wire::TypeCode;
         use Instr as I;
         use LogicalInstr as L;
@@ -1666,7 +1584,7 @@ impl LogicalProgram {
         // one column region per set bit.
         let mut str_cols: u64 = 0;
         // Resolution keeps every register's number, so the masks carry over.
-        let ProgramFacts { bit_only, bool_pack, no_nulls, reg_u64 } = self.analyze(schema, result_as);
+        let ProgramFacts { bit_only, bool_pack, no_nulls, reg_u64 } = self.analyze(schema, sink_read);
         // Answered once per register by `analyze`, off each opcode's `U64Rule`,
         // so no arm below restates the rule.
         let is_u64 = |r: u16| (reg_u64 >> r) & 1 != 0;
@@ -1683,7 +1601,7 @@ impl LogicalProgram {
             // A register is the index of the instruction that writes it.
             let dst = i as u16;
             // One logical instruction, one resolved instruction — bar the
-            // constants (the two loads, and a lift or PK null test over one),
+            // constants (the two loads, and a PK null test over one),
             // which leave the stream for their own tables.
             let resolved = match li {
                 L::LoadColInt { col } => {
@@ -1805,18 +1723,7 @@ impl LogicalProgram {
                     // Keyed by the index over an immutable pool, so a forged
                     // shared index is inert.
                     let new_idx = *set_slots[set_idx as usize].get_or_insert_with(|| {
-                        let mut set = decode_int_set(&self.const_strings[set_idx as usize]);
-                        // The kernel binary-searches this, so ascending order is a
-                        // precondition. Sorted rather than rejected: membership does not
-                        // depend on order, so a skewed pool has a right answer.
-                        //
-                        // Guarded because the client always ships sorted, and `is_sorted`
-                        // short-circuits at the first inversion — so the shipped shape
-                        // never pays the sort, which dominates the resolve when it runs.
-                        // `from_blob_bench` prices both shapes.
-                        if !set.is_sorted() {
-                            set.sort_unstable();
-                        }
+                        let set = decode_int_set(&self.const_strings[set_idx as usize]);
                         let slot = int_sets.len() as u32;
                         int_sets.push(set);
                         slot
@@ -1932,10 +1839,9 @@ impl LogicalProgram {
     /// over the same per-opcode operand table [`Self::from_instrs`] walks — so a
     /// new opcode cannot silently bypass a bound here either.
     ///
-    /// `out_schema` is `None` for the consumers that write no output slots — a
-    /// filter and a scalar, whose sink list is empty. With one, this also
-    /// decides **output coverage**: sink `i` writes slot `i`, so covering every
-    /// declared payload slot is a count.
+    /// `out_schema` is `None` for a filter and a scalar, whose one register sink
+    /// its resolver checks. With one, this also decides **output coverage**: sink
+    /// `i` writes slot `i`, so covering every declared payload slot is a count.
     pub(crate) fn validate(
         &self,
         in_schema: &dyn SchemaFacts,
@@ -1950,7 +1856,7 @@ impl LogicalProgram {
             // Ahead of the per-sink rules, which address `out_schema` by sink
             // position: covering the output exactly is what keeps every position
             // in range.
-            let sinks = self.output.slots();
+            let sinks = &self.sinks;
             if sinks.len() != os.num_payload_cols() {
                 return Err(ExprValidateErr::OutputSlotCountMismatch {
                     sinks: sinks.len(),
@@ -1981,8 +1887,8 @@ impl LogicalProgram {
     /// pass over the one operand table:
     ///
     /// * **Register roles** — which registers are produced as booleans, and which
-    ///   are read as something other than a truth bit. `result_as` classifies the
-    ///   result register's read; a map has none.
+    ///   are read as something other than a truth bit. A sink is one more read
+    ///   of its register, as `sink_read`.
     /// * **Strict non-nullability**, against the schema the program is about to be
     ///   resolved against, the only schema for which the answer means anything. A PK
     ///   column operand never contributes: the null bitmap is payload-indexed, so the
@@ -1990,8 +1896,14 @@ impl LogicalProgram {
     ///
     /// Every `1u64 << reg` below is in range: `from_instrs` caps the instruction
     /// count at `MAX_REGS` and bounds every register operand by it.
-    fn analyze(&self, schema: &dyn SchemaFacts, result_as: Option<ReadAs>) -> ProgramFacts {
+    fn analyze(&self, schema: &dyn SchemaFacts, sink_read: ReadAs) -> ProgramFacts {
         let (mut bool_produced, mut non_bool_read, mut bool_input) = (0u64, 0u64, 0u64);
+        let mut read_as = |reg: Reg, read: ReadAs| match read {
+            ReadAs::Bool => bool_input |= 1u64 << reg.0,
+            // A null-lane read needs neither the value nor the truth bit.
+            ReadAs::NullBit => {}
+            ReadAs::Value | ReadAs::Str => non_bool_read |= 1u64 << reg.0,
+        };
         let mut no_nulls = true;
         let mut reg_u64 = 0u64;
         for (i, li) in self.instrs.iter().enumerate() {
@@ -2012,30 +1924,11 @@ impl LogicalProgram {
                     kind.type_test().is_some() && !schema.is_pk_col(col as usize) && schema.col_nullable(col as usize)
                 });
             for &(reg, read) in ops.reads.iter().flatten() {
-                let bit = 1u64 << reg.0;
-                match read {
-                    ReadAs::Bool => bool_input |= bit,
-                    // A null-lane read needs neither the value nor the truth bit.
-                    ReadAs::NullBit => {}
-                    ReadAs::Value | ReadAs::Str => non_bool_read |= bit,
-                }
+                read_as(reg, read);
             }
         }
-        // A sink stores a register's **value**, never its truth bit: that is what
-        // keeps an emitted boolean out of `bit_only`, where its producer would skip
-        // the unpack and the map would ship the previous morsel's lane.
-        for reg in self.output.slots().iter().filter_map(|s| s.reg()) {
-            non_bool_read |= 1u64 << reg.0;
-        }
-        // A filter's result register is forced to be a bool input: the filter's
-        // nullable arm consumes the result as packed bits, so its producer must
-        // populate `bool_bits` whatever opcode it is. A scalar's is read as a value
-        // (`reg_values`), so a boolean producer there must unpack into the lane.
-        if let (Some(r), Some(read)) = (self.output.result(), result_as) {
-            match read {
-                ReadAs::Bool => bool_input |= 1u64 << r.0,
-                _ => non_bool_read |= 1u64 << r.0,
-            }
+        for reg in self.sinks.iter().filter_map(|s| s.reg()) {
+            read_as(reg, sink_read);
         }
         ProgramFacts {
             bit_only: bool_produced & !non_bool_read,
@@ -2050,17 +1943,15 @@ impl LogicalProgram {
 }
 
 /// Bound the const-pool index an opcode carries rather than names as an
-/// operand, and hold an `IntInSet` pool to whole i64s — a truncating entry is
-/// a clean rejection rather than a silent `chunks_exact` tail-drop.
+/// operand, and hold an `IntInSet` pool to its canonical form.
 fn check_extra(extra: Extra, const_strings: &[Vec<u8>]) -> Result<(), ExprValidateErr> {
     match extra {
         Extra::ConstIdx(const_idx) => check_const_idx(const_idx.0, const_strings.len()),
         Extra::IntSet(set_idx) => {
             check_const_idx(set_idx.0, const_strings.len())?;
-            let len = const_strings[set_idx.0 as usize].len();
-            match int_set_len_ok(len) {
+            match int_set_is_canonical(&const_strings[set_idx.0 as usize]) {
                 true => Ok(()),
-                false => Err(ExprValidateErr::IntSetNotAligned { set_idx: set_idx.0, len }),
+                false => Err(ExprValidateErr::IntSetNotCanonical { set_idx: set_idx.0 }),
             }
         }
         Extra::None => Ok(()),
@@ -2172,7 +2063,7 @@ enum Extra {
     None,
     /// A const-pool index.
     ConstIdx(ConstIdx),
-    /// An `IntInSet` value pool: a const index whose entry must be whole i64s.
+    /// An `IntInSet` value pool.
     IntSet(ConstIdx),
 }
 
@@ -2482,7 +2373,7 @@ fn check_emit_slot(
     // A narrower slot takes the register's low bytes, which are the whole value
     // exactly when the producer range-checked it to that width and the slot
     // holds an integer — a float or a wide code would be sheared.
-    let narrowed = type_code.is_fixed_int() && src.range_checked_width() == Some(stride);
+    let narrowed = type_code.is_fixed_int() && src.range_check().map(FixedInt::width) == Some(stride);
     if stride != 8 && !narrowed {
         return Err(ExprValidateErr::EmitSlotWidth { out, type_code });
     }
@@ -2494,16 +2385,19 @@ fn slot_type_code(os: &dyn SchemaFacts, out: u32) -> TypeCode {
     os.col_type_code(os.payload_col_idx(out as usize))
 }
 
-/// The `ExprOp::IntInSet` const-pool layout, `N × 8-byte LE`, stated once for
-/// [`LogicalProgram::from_instrs`] and the decoder below.
-/// [`ExprOp::IntInSet`] owns the wire contract; the emitter writes it
-/// with `gnitz_wire::as_le_bytes`.
-fn int_set_len_ok(len: usize) -> bool {
-    len.is_multiple_of(8)
+/// The `ExprOp::IntInSet` const-pool form: `N × 8-byte LE` i64s, strictly
+/// ascending.
+fn int_set_is_canonical(bytes: &[u8]) -> bool {
+    bytes.len().is_multiple_of(8)
+        && bytes
+            .as_chunks::<8>()
+            .0
+            .windows(2)
+            .all(|w| i64::from_le_bytes(w[0]) < i64::from_le_bytes(w[1]))
 }
 
 fn decode_int_set(bytes: &[u8]) -> Vec<i64> {
-    debug_assert!(int_set_len_ok(bytes.len()), "construction rejects a misaligned pool");
+    debug_assert!(int_set_is_canonical(bytes), "construction rejects a non-canonical pool");
     let mut v = Vec::new();
     gnitz_wire::extend_from_le_bytes(&mut v, bytes);
     v
@@ -2655,7 +2549,7 @@ impl LogicalProgram {
             scalar_emits: Vec::new(),
             str_emits: Vec::new(),
         };
-        for (slot, sink) in self.output.slots().iter().enumerate() {
+        for (slot, sink) in self.sinks.iter().enumerate() {
             let width = slot_type_code(out_schema, slot as u32).wire_stride();
             match *sink {
                 Sink::Col(c) => sinks.copies.push(ColCopy {
@@ -2698,10 +2592,8 @@ pub(crate) struct ResolvedProgram {
     /// `resolve` hands it back from the same push, not because anything bounds
     /// it: it is not a const-pool index and no validating pass sees it.
     pub(crate) const_cells: Vec<[u8; 16]>,
-    /// Decoded `IntInSet` value pools, indexed by the resolved `set_idx`. Each
-    /// pool is sorted ascending in signed-i64 `Ord` by `resolve` — the wire order
-    /// is not trusted — so `eval_batch` binary-searches it directly. Duplicates
-    /// are left in place; `binary_search` is correct over them.
+    /// Decoded `IntInSet` value pools, strictly ascending, indexed by the
+    /// resolved `set_idx`.
     pub(crate) int_sets: Vec<Vec<i64>>,
     /// Decoded `StrTrim` byte sets as 256-bit membership tables, indexed by the
     /// resolved `set_idx`. Held here rather than inlined into `Instr` — 32 bytes

@@ -682,7 +682,7 @@ fn a_delta_cursor_expires_below_the_floor_and_not_at_it() {
 #[test]
 #[ignore]
 fn survivors_membership_bench() {
-    use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr};
+    use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr, Sink};
     use std::hint::black_box;
 
     const N: u64 = 1_000_000;
@@ -709,7 +709,7 @@ fn survivors_membership_bench() {
             let lt = eb.emit(LogicalInstr::Cmp { op: CmpOp::Lt, a: v, b: hi_c });
             keep = eb.emit(LogicalInstr::BoolBinary { a: keep, b: lt, is_or: false });
         }
-        eb.build(Some(keep)).unwrap().to_blob_bytes()
+        eb.build(vec![Sink::Reg(keep)]).unwrap().to_blob_bytes()
     };
     let (spec, want) = match shape.as_str() {
         "membership" => (ReadSpec { bound: walk, ..rows_spec(Vec::new(), 0) }, hi),

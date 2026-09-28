@@ -103,7 +103,7 @@ fn scan_spec_sinks_bench() {
 
     // Gather 3 of the 4 payload columns, permuted: c2→0, c3→1, c0→2.
     let reply3 = i64_reply(3);
-    let gather3 = map_of(proj_blob(&[(3, 0), (4, 1), (1, 2)]), &reply3);
+    let gather3 = map_of(proj_blob(&[3, 4, 1]), &reply3);
     for (label, pred) in [("contiguous", &contiguous), ("fragmented", &fragmented)] {
         let spec = rows_spec(pred.clone(), gather3.clone(), vec![], 0);
         cell(&format!("rows, sel~50% {label}, 3-col gather"), n, || {
@@ -126,9 +126,9 @@ fn scan_spec_sinks_bench() {
             eb.emit(gnitz_expr::LogicalInstr::LoadColInt { col: 4 }),
         );
         let sum = eb.emit(gnitz_expr::LogicalInstr::IntArith { op: gnitz_expr::IntArithOp::Add, a, b });
-        eb.sink(gnitz_expr::Sink::Reg(sum));
-        eb.sink(gnitz_expr::Sink::Col(1));
-        eb.build(None).expect("a well-formed program").to_blob_bytes()
+        eb.build(vec![gnitz_expr::Sink::Reg(sum), gnitz_expr::Sink::Col(1)])
+            .expect("a well-formed program")
+            .to_blob_bytes()
     };
     let reply2 = i64_reply(2);
     let spec = rows_spec(fragmented.clone(), map_of(compute_proj, &reply2), vec![], 0);
@@ -248,7 +248,7 @@ fn scan_spec_string_gather_bench() {
     );
     let spec = rows_spec(
         pred_cmp_blob(gnitz_expr::CmpOp::Lt, 2, 1),
-        map_of(proj_blob(&[(1, 0), (2, 1)]), &reply),
+        map_of(proj_blob(&[1, 2]), &reply),
         vec![],
         0,
     );

@@ -87,23 +87,25 @@ fn compile_projection_map(
 ) -> Result<LogicalProgram, GnitzSqlError> {
     debug_assert_eq!(items.len(), out_cols.len(), "one declared column per projection item");
     let mut eb = ExprBuilder::new();
-    for (item, col) in items.iter().zip(out_cols) {
-        match item {
-            ProjItem::PassThrough { src_col } => eb.sink(Sink::Col(*src_col as u32)),
-            ProjItem::Computed { bound_expr } => {
-                let mut reg = compile_bound_expr(bound_expr, &schema.columns, &mut eb)?;
-                // A DATE slot is narrower than the 8-byte register it is emitted
-                // from, so the value is range-checked into those low bytes
-                // first. The width comes from the declaration this program is
-                // paired with, never re-inferred: the two must not drift.
-                if let Some(fi) = FixedInt::from_type_code(col.ty.tc).filter(|fi| fi.width() < 8) {
-                    reg = eb.emit(LogicalInstr::IntCast { a: reg, fi });
+    let sinks = items
+        .iter()
+        .zip(out_cols)
+        .map(|(item, col)| -> Result<Sink, GnitzSqlError> {
+            match item {
+                ProjItem::PassThrough { src_col } => Ok(Sink::Col(*src_col as u32)),
+                ProjItem::Computed { bound_expr } => {
+                    let mut reg = compile_bound_expr(bound_expr, &schema.columns, &mut eb)?;
+                    // A slot narrower than the register takes a value range-checked
+                    // into the slot's declared type.
+                    if let Some(fi) = FixedInt::from_type_code(col.ty.tc).filter(|fi| fi.width() < 8) {
+                        reg = eb.emit(LogicalInstr::IntCast { a: reg, fi });
+                    }
+                    Ok(Sink::Reg(reg))
                 }
-                eb.sink(Sink::Reg(reg));
             }
-        }
-    }
-    Ok(eb.build(None)?)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(eb.build(sinks)?)
 }
 
 /// The `(schema, payload program)` a projection over `source` produces: `source`'s PK,

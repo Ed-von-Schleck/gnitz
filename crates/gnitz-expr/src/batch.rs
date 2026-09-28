@@ -1847,14 +1847,8 @@ pub(crate) fn eval_batch(
             // ----------------------------------------------------------------
             // Integer set membership (col IN (…) as one opcode)
             // ----------------------------------------------------------------
-            // Binary-search each row's i64 register image in the pool `resolve`
-            // sorted (duplicates left in place — `binary_search` is correct over
-            // them). `LoadPayloadInt` writes every row's register
-            // (NULL rows too, tracked in `null_bits`), so the search reads a real
-            // i64 for all rows and the NULL-row result is masked by `null_copy1`
-            // — exactly how the int negate handles a NULL row.
             Instr::IntInSet { dst, value_reg, set_idx } => {
-                let set = &prog.int_sets[set_idx as usize]; // decoded once, sorted ascending
+                let set = &prog.int_sets[set_idx as usize];
                 un_op(scratch, &mo, dst, value_reg, |x| set.binary_search(&x).is_ok() as i64)
             }
 

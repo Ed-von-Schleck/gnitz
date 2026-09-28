@@ -14,7 +14,7 @@ fn the_blob_round_trips_through_the_wire_decoder() {
     let _ = b.emit(L::StrColConst { op: CmpOp::Eq, col: 1, const_idx: s_idx });
     let _ = b.add_const_bytes(b"");
     let sel = b.emit(L::Select { cond, a: col, b: c });
-    let prog = b.build(Some(sel)).expect("a well-formed program");
+    let prog = b.build(vec![Sink::Reg(sel)]).expect("a well-formed program");
 
     let decoded = LogicalProgram::from_blob(&prog.to_blob_bytes()).expect("the blob must decode");
     assert_eq!(decoded.instrs(), prog.instrs());
@@ -36,7 +36,7 @@ fn the_builder_folds_identical_instructions_and_pool_entries() {
     assert_eq!(b.add_const_bytes(b"x"), s1);
     let l1 = b.emit(L::LoadConstStr { const_idx: s1 });
     assert_eq!(b.emit(L::LoadConstStr { const_idx: s1 }), l1);
-    let prog = b.build(Some(sum)).expect("a well-formed program");
+    let prog = b.build(vec![Sink::Reg(sum)]).expect("a well-formed program");
     assert_eq!(prog.instrs().len(), 4);
     assert_eq!(prog.const_strings().len(), 1);
 }
@@ -49,7 +49,7 @@ fn a_lift_over_a_constant_folds_to_a_float_constant() {
     let mut b = ExprBuilder::new();
     let c = b.emit(L::LoadConst { val: -7, unsigned: false });
     let lifted = b.emit(L::IntToFloat { a: c });
-    let prog = b.build(Some(lifted)).expect("a well-formed program");
+    let prog = b.build(vec![Sink::Reg(lifted)]).expect("a well-formed program");
     assert!(matches!(
         prog.instrs(),
         [L::LoadConst { val: -7, unsigned: false }, L::LoadConst { val, unsigned: false }] if f64::from_bits(*val as u64) == -7.0
@@ -59,7 +59,7 @@ fn a_lift_over_a_constant_folds_to_a_float_constant() {
     let mut b = ExprBuilder::new();
     let col = b.emit(L::LoadColInt { col: 1 });
     let lifted = b.emit(L::IntToFloat { a: col });
-    let prog = b.build(Some(lifted)).expect("a well-formed program");
+    let prog = b.build(vec![Sink::Reg(lifted)]).expect("a well-formed program");
     assert!(matches!(prog.instrs(), [L::LoadColInt { .. }, L::IntToFloat { .. }]));
 }
 
@@ -75,7 +75,7 @@ fn a_range_check_over_the_same_range_check_folds() {
     assert_eq!(b.emit(L::IntCast { a: narrow, fi: FixedInt::I16 }), narrow);
     let narrower = b.emit(L::IntCast { a: narrow, fi: FixedInt::I8 });
     assert_ne!(narrower, narrow);
-    let prog = b.build(Some(narrower)).expect("a well-formed program");
+    let prog = b.build(vec![Sink::Reg(narrower)]).expect("a well-formed program");
     assert_eq!(prog.instrs().len(), 3);
 }
 
@@ -85,7 +85,7 @@ fn a_lift_over_an_unsigned_constant_reads_it_unsigned() {
     let mut b = ExprBuilder::new();
     let c = b.emit(L::LoadConst { val: -1, unsigned: true });
     let lifted = b.emit(L::IntToFloat { a: c });
-    let prog = b.build(Some(lifted)).expect("a well-formed program");
+    let prog = b.build(vec![Sink::Reg(lifted)]).expect("a well-formed program");
     assert!(matches!(
         prog.instrs(),
         [_, L::LoadConst { val, unsigned: false }] if f64::from_bits(*val as u64) == 1.8446744073709552e19
@@ -104,7 +104,10 @@ fn a_to_micros_over_a_constant_folds_unless_it_overflows() {
             a: c,
             micros: false,
         });
-        b.build(Some(r)).expect("a well-formed program").instrs().to_vec()
+        b.build(vec![Sink::Reg(r)])
+            .expect("a well-formed program")
+            .instrs()
+            .to_vec()
     };
     assert!(matches!(
         to_micros(2)[..],

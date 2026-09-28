@@ -284,7 +284,7 @@ fn the_predicate_filters_buffered_rows() {
     let c = b.emit(gnitz_expr::LogicalInstr::LoadColInt { col: 1 });
     let k = b.emit(gnitz_expr::LogicalInstr::LoadConst { val: 15, unsigned: false });
     let cond = b.emit(gnitz_expr::LogicalInstr::Cmp { op: gnitz_expr::CmpOp::Gt, a: c, b: k });
-    let predicate = b.build(Some(cond)).unwrap().to_blob_bytes();
+    let predicate = b.build(vec![gnitz_expr::Sink::Reg(cond)]).unwrap().to_blob_bytes();
     let out = overlay_of(&mut buf, ReadBound::None, predicate, ZSetBatch::new(&s));
     assert_eq!(out, [(2, 20, 1)]);
 }

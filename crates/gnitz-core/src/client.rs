@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use crate::mirror::{MirrorState, MirrorStore, MirroredView};
 use crate::types::sys_schema;
-use gnitz_expr::{payload_bytes, payload_is_null, payload_u64, ExprBuilder, RowFilter};
+use gnitz_expr::{payload_bytes, payload_is_null, payload_u64, LogicalProgram, RowFilter};
 use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::txn_frame::{DeltaPollItem, BLIND};
 use gnitz_wire::{Circuit, ComputeMap, ReadBound, ReadSink, ReadSpec};
@@ -82,10 +82,7 @@ pub fn key_reply(schema: &Schema) -> (Arc<Schema>, ReadSink) {
         columns: schema.hidden_key_columns().collect(),
         pk_cols: (0..schema.pk_count() as u32).collect(),
     };
-    let program = ExprBuilder::new()
-        .build(None)
-        .expect("the empty program is well-formed")
-        .to_blob_bytes();
+    let program = LogicalProgram::copy_cols(&[]).to_blob_bytes();
     let map = ComputeMap { program, out_cols: Vec::new() };
     (Arc::new(reply), ReadSink { map: Some(map), ..ReadSink::all_rows() })
 }

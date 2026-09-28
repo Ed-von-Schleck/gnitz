@@ -2,7 +2,7 @@ use super::*;
 use crate::ir::NumLit;
 use crate::test_support::lit;
 use gnitz_core::{ColumnDef, Schema, TypeCode};
-use gnitz_expr::{CmpOp, ExprValidateErr, FloatArithOp, IntUnaryOp, LogicalInstr, LogicalInstr as L};
+use gnitz_expr::{CmpOp, ExprValidateErr, FloatArithOp, IntUnaryOp, LogicalInstr, LogicalInstr as L, Sink};
 
 fn col(name: &str, tc: TypeCode) -> ColumnDef {
     ColumnDef::new(name, tc, true)
@@ -22,9 +22,13 @@ fn str_schema() -> Schema {
 
 fn compile(left: &BoundExpr, op: BinOp, right: &BoundExpr, schema: &Schema) -> Vec<LogicalInstr> {
     let mut eb = ExprBuilder::new();
-    let reg =
-        try_compile_string_cmp(left, op, right, &schema.columns, &mut eb).expect("recognized as a string comparison");
-    eb.build(Some(reg)).expect("a well-formed program").instrs().to_vec()
+    let reg = OpcodeBackend { cols: &schema.columns, eb: &mut eb }
+        .string_cmp(left, op, right)
+        .expect("recognized as a string comparison");
+    eb.build(vec![Sink::Reg(reg)])
+        .expect("a well-formed program")
+        .instrs()
+        .to_vec()
 }
 
 fn cast_schema() -> Schema {
@@ -48,7 +52,7 @@ fn lower_instrs_kind(expr: &BoundExpr, schema: &Schema) -> (Vec<LogicalInstr>, E
     let (reg, kind) = OpcodeBackend { cols: &schema.columns, eb: &mut eb }
         .lower(expr)
         .expect("lowers");
-    let prog = eb.build(Some(reg)).expect("a well-formed program");
+    let prog = eb.build(vec![Sink::Reg(reg)]).expect("a well-formed program");
     (prog.instrs().to_vec(), kind)
 }
 
@@ -338,7 +342,7 @@ fn min_max_n_rotates_a_u64_argument_to_the_fold_head() {
         let (reg, _) = OpcodeBackend { cols: &s.columns, eb: &mut eb }
             .lower(&min_max(true, args))
             .expect("lowers");
-        let prog = eb.build(Some(reg)).expect("a well-formed program");
+        let prog = eb.build(vec![Sink::Reg(reg)]).expect("a well-formed program");
         match prog.instrs().first().expect("non-empty") {
             &LogicalInstr::LoadColInt { col, .. } => col,
             other => panic!("the fold must open with a column load, got {other:?}"),
@@ -383,7 +387,7 @@ fn min_max_n_arity_is_bounded_by_the_register_file() {
     let (reg, _) = OpcodeBackend { cols: &s.columns, eb: &mut eb }
         .lower(&min_max(true, args))
         .expect("lowering itself does not bound arity");
-    match eb.build(Some(reg)).map_err(GnitzSqlError::from).err() {
+    match eb.build(vec![Sink::Reg(reg)]).map_err(GnitzSqlError::from).err() {
         Some(GnitzSqlError::Rejected(msg)) => assert!(msg.contains("reg"), "got {msg:?}"),
         other => panic!("expected a register-budget rejection, got {other:?}"),
     }
@@ -449,9 +453,11 @@ fn string_cmp_interception_declines_non_comparisons() {
     let s = BoundExpr::ColRef(1);
     let lit = BoundExpr::LitStr("x".to_string());
     let mut eb = ExprBuilder::new();
-    assert!(try_compile_string_cmp(&lit, BinOp::Add, &s, &schema.columns, &mut eb).is_none());
+    assert!(OpcodeBackend { cols: &schema.columns, eb: &mut eb }
+        .string_cmp(&lit, BinOp::Add, &s)
+        .is_none());
     assert!(
-        eb.build(None).expect("a well-formed program").instrs().is_empty(),
+        eb.build(vec![]).expect("a well-formed program").instrs().is_empty(),
         "a declined shape must emit nothing"
     );
 

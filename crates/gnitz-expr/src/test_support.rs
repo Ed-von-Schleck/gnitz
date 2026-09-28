@@ -11,7 +11,7 @@ use gnitz_wire::TypeCode;
 
 use crate::eval::Resolved;
 use crate::{
-    BatchView, ColumnLocator, ColumnTable, ExprResults, LogicalInstr, LogicalProgram, MapEval, MapTarget, Output, Reg,
+    BatchView, ColumnLocator, ColumnTable, ExprResults, LogicalInstr, LogicalProgram, MapEval, MapTarget, Reg,
     RowFilter, RowSource, ScalarEval, SchemaFacts, Sink,
 };
 
@@ -260,7 +260,7 @@ pub fn scalar_prog(
     result_reg: Reg,
     const_strings: Vec<Vec<u8>>,
 ) -> ScalarEval {
-    LogicalProgram::new(instrs, Output::Result(result_reg), const_strings)
+    LogicalProgram::new(instrs, vec![Sink::Reg(result_reg)], const_strings)
         .resolve_scalar(schema)
         .expect("test program must validate")
 }
@@ -276,7 +276,7 @@ pub fn filter_prog(
     result_reg: Reg,
     const_strings: Vec<Vec<u8>>,
 ) -> RowFilter {
-    LogicalProgram::new(instrs, Output::Result(result_reg), const_strings)
+    LogicalProgram::new(instrs, vec![Sink::Reg(result_reg)], const_strings)
         .resolve_filter(schema)
         .expect("test predicate must validate")
 }
@@ -303,7 +303,7 @@ pub fn map_prog(
     sinks: Vec<Sink>,
     const_strings: Vec<Vec<u8>>,
 ) -> MapEval {
-    LogicalProgram::new(instrs, Output::Slots(sinks), const_strings)
+    LogicalProgram::new(instrs, sinks, const_strings)
         .resolve_map(in_schema, out_schema)
         .expect("test map must validate")
 }

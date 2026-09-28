@@ -1299,7 +1299,7 @@ fn v_gt_3_blob() -> Vec<u8> {
             LogicalInstr::LoadConst { val: 3, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         ],
-        crate::Output::Result(Reg(2)),
+        vec![Sink::Reg(Reg(2))],
         vec![],
     )
     .to_blob_bytes()

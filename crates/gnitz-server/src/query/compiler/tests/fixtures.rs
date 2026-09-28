@@ -70,10 +70,7 @@ pub(in crate::query) fn scatter_reindex(source: u64, cols: &[u32]) -> gnitz_wire
 /// ever executing it. Built through the real encoder rather than spelled as a
 /// byte literal, so it stays decodable when the blob header changes.
 pub(in crate::query) fn dummy_expr_blob() -> Vec<u8> {
-    gnitz_expr::ExprBuilder::new()
-        .build(None)
-        .expect("a well-formed program")
-        .to_blob_bytes()
+    gnitz_expr::LogicalProgram::copy_cols(&[]).to_blob_bytes()
 }
 
 /// The guard that rejected a build. Naming it is what makes a guard test

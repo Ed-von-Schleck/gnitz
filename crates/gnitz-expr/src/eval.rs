@@ -9,7 +9,7 @@ use gnitz_wire::ReadBound;
 use crate::batch::{eval_batch, scan_filter_bits, with_str_bufs, EvalScratch, MorselOut, MORSEL};
 use crate::program::{ColCopy, MapSinks, ReadAs};
 use crate::{
-    BatchView, ExprValidateErr, LogicalProgram, MapTarget, Output, RangeMembership, ResolvedProgram, SchemaFacts,
+    BatchView, ExprValidateErr, LogicalProgram, MapTarget, RangeMembership, ResolvedProgram, SchemaFacts, Sink,
 };
 
 /// One program's result for every row of a batch, in the shape its result
@@ -37,14 +37,14 @@ pub(crate) struct Evaluator {
 impl LogicalProgram {
     /// A filter predicate; its result must not be a string.
     pub fn resolve_filter(self, schema: &dyn SchemaFacts) -> Result<RowFilter, ExprValidateErr> {
-        let Output::Result(r) = self.output else {
+        let [Sink::Reg(r)] = self.sinks[..] else {
             return Err(ExprValidateErr::OutputRoleMismatch);
         };
         if (self.str_class >> r.0) & 1 != 0 {
             return Err(ExprValidateErr::RegClassMismatch { reg: r.0 });
         }
         self.validate(schema, None)?;
-        let (prog, _) = self.resolve_program(schema, Some(ReadAs::Bool));
+        let (prog, _) = self.resolve_program(schema, ReadAs::Bool);
         let pred = FilterEval {
             ev: Evaluator::new(prog),
             result_reg: r.0 as usize,
@@ -58,12 +58,12 @@ impl LogicalProgram {
 
     /// A scalar expression, one value per row.
     pub fn resolve_scalar(self, schema: &dyn SchemaFacts) -> Result<ScalarEval, ExprValidateErr> {
-        let Output::Result(r) = self.output else {
+        let [Sink::Reg(r)] = self.sinks[..] else {
             return Err(ExprValidateErr::OutputRoleMismatch);
         };
         self.validate(schema, None)?;
         let is_str = (self.str_class >> r.0) & 1 != 0;
-        let (prog, reg_u64) = self.resolve_program(schema, Some(ReadAs::Value));
+        let (prog, reg_u64) = self.resolve_program(schema, ReadAs::Value);
         let class = match (is_str, (reg_u64 >> r.0) & 1 != 0) {
             (true, _) => ResultClass::Str,
             (false, true) => ResultClass::Unsigned,
@@ -83,13 +83,10 @@ impl LogicalProgram {
         in_schema: &dyn SchemaFacts,
         out_schema: &dyn SchemaFacts,
     ) -> Result<MapEval, ExprValidateErr> {
-        let Output::Slots(_) = self.output else {
-            return Err(ExprValidateErr::OutputRoleMismatch);
-        };
         self.validate(in_schema, Some(out_schema))?;
         let is_identity = self.is_identity_map(in_schema, out_schema);
         let sinks = self.map_sinks(in_schema, out_schema);
-        let (prog, _) = self.resolve_program(in_schema, None);
+        let (prog, _) = self.resolve_program(in_schema, ReadAs::Value);
         Ok(MapEval {
             ev: Evaluator::new(prog),
             sinks,

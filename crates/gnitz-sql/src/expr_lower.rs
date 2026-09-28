@@ -6,7 +6,7 @@
 //! projection expression it emits.
 
 use crate::bind::structural::str_func_name;
-use crate::codec::literal::{invalid_literal, place, Placed};
+use crate::codec::literal::{assign, invalid_literal, place, Placed};
 use crate::error::GnitzSqlError;
 use crate::ir::{
     blend_type, decimal_compute_type, operand_ty_pair, operand_tys, temporal_arith_type, BExpr, BinOp, BoundExpr,
@@ -16,44 +16,9 @@ use crate::validate::check_decimal_scale;
 use gnitz_core::{ColType, ColumnDef, FixedInt, Schema, TypeCode};
 use gnitz_expr::{
     CalendarOp, CmpOp, ExprBuilder, FloatArithOp, FloatUnaryOp, IntArithOp, IntUnaryOp, LikePattern, LogicalInstr as L,
-    LogicalProgram, Reg, ScalarEval,
+    LogicalProgram, Reg, ScalarEval, Sink,
 };
-use gnitz_wire::decimal::{format_decimal, parse_decimal, pow10, rescale};
-
-/// Compile a comparison between two German-string columns, or a column and a
-/// string literal, to the `StrCol*` opcodes, which read the 16-byte cells
-/// directly and need no string register. STRING and BLOB share that layout, so
-/// both are admitted here; a BLOB has no other legal use (`col_ref` rejects it).
-///
-/// `None` is "not this shape": any other operand, or an operator that is not a
-/// comparison — which falls through to the register channel rather than erroring
-/// here, so `strcol || 'lit'` still reaches `||`. Nothing is emitted before the
-/// shape is settled, so a declined pair leaves no const-pool entry behind.
-fn try_compile_string_cmp(
-    left: &BoundExpr,
-    op: BinOp,
-    right: &BoundExpr,
-    cols: &[ColumnDef],
-    eb: &mut ExprBuilder,
-) -> Option<Reg> {
-    let is_str_col = |e: &BoundExpr| matches!(e, BoundExpr::ColRef(i) if cols[*i].ty.tc.is_german_string());
-    // The opcode pins the constant on the right, so a literal-on-left pair is
-    // read as its converse: `'A' < col` is `col > 'A'`.
-    let (col, s, cmp) = match (left, right) {
-        (BoundExpr::ColRef(c), BoundExpr::LitStr(s)) if is_str_col(left) => (*c, s, op.as_cmp()?),
-        (BoundExpr::LitStr(s), BoundExpr::ColRef(c)) if is_str_col(right) => (*c, s, op.converse().as_cmp()?),
-        (BoundExpr::ColRef(a), BoundExpr::ColRef(b)) if is_str_col(left) && is_str_col(right) => {
-            return Some(eb.emit(L::StrColCol {
-                op: op.as_cmp()?,
-                col_a: *a as u32,
-                col_b: *b as u32,
-            }));
-        }
-        _ => return None,
-    };
-    let const_idx = eb.add_const_bytes(s.as_bytes());
-    Some(eb.emit(L::StrColConst { op: cmp, col: col as u32, const_idx }))
-}
+use gnitz_wire::decimal::pow10;
 
 /// Which register class a lowered node produced. `Int`, `Dec` and `Float` are
 /// the scalar shapes — `Dec(s)` an integer holding a DECIMAL times `10^s`,
@@ -271,16 +236,16 @@ impl OpcodeBackend<'_> {
         self.eb.emit(L::IntArith { op: fix, a: t, b: off })
     }
 
-    /// Lower `e` as a DECIMAL of scale `to`. A numeric literal is folded to the
-    /// constant it is at that scale — or refused where it has none, rather than
-    /// wrapped at run time; anything else is computed and re-expressed.
+    /// Lower `e` as a DECIMAL of scale `to`: a literal as the constant an
+    /// assignment of it stores, anything else computed and re-expressed.
     fn lower_dec(&mut self, e: &BoundExpr, to: u8) -> Result<Reg, GnitzSqlError> {
         check_decimal_scale(to)?;
-        if let Some((v, s)) = e.decimal_literal() {
-            let val = rescale(v, s, to).ok_or_else(|| {
-                GnitzSqlError::Rejected(format!("{} does not fit a DECIMAL of scale {to}", format_decimal(v, s)))
-            })?;
-            return Ok(self.eb.emit(L::LoadConst { val, unsigned: false }));
+        if matches!(e, BoundExpr::LitStr(_)) || e.decimal_literal().is_some() {
+            let v = assign(e, ColType::decimal(to)).map_err(GnitzSqlError::Rejected)?;
+            return Ok(self.eb.emit(L::LoadConst {
+                val: FixedInt::I64.unpack(v),
+                unsigned: false,
+            }));
         }
         let (mut r, kind) = self.lower_num(e)?;
         // A DECIMAL is an i64, so a U64 value at or above 2^63 has none: the
@@ -540,7 +505,7 @@ impl OpcodeBackend<'_> {
     /// CAST, dispatched on the target class, then the source kind.
     fn cast(&mut self, expr: &BoundExpr, to: ColType) -> Result<(Reg, ExprKind), GnitzSqlError> {
         if to.is_decimal() {
-            return self.cast_to_decimal(expr, to.scale);
+            return Ok((self.lower_dec(expr, to.scale)?, ExprKind::Dec(to.scale)));
         }
         let to = to.tc;
         let (r, kind) = self.lower(expr)?;
@@ -633,19 +598,6 @@ impl OpcodeBackend<'_> {
         }
     }
 
-    /// `CAST(… AS DECIMAL(p, s))`.
-    fn cast_to_decimal(&mut self, expr: &BoundExpr, scale: u8) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        let reg = match expr {
-            BoundExpr::LitStr(text) => {
-                let val = parse_decimal(text, scale)
-                    .ok_or_else(|| GnitzSqlError::Rejected(invalid_literal(ColType::decimal(scale), text)))?;
-                self.eb.emit(L::LoadConst { val, unsigned: false })
-            }
-            _ => self.lower_dec(expr, scale)?,
-        };
-        Ok((reg, ExprKind::Dec(scale)))
-    }
-
     /// Searched CASE as a right-to-left fold of selects, so the first truthy
     /// WHEN wins. The result class is decided from the branch types before any
     /// result is lowered — lowering is eager, and a `LitNull` branch must be
@@ -696,20 +648,18 @@ impl OpcodeBackend<'_> {
                 .collect::<Option<Vec<Placed>>>()
                 .filter(|ps| self.range_is_register(inner, fi) || ps.iter().all(|p| !p.is_outside()));
             if let Some(placed) = placed {
-                let mut values: Vec<i64> = placed
+                let values: Vec<i64> = placed
                     .iter()
                     .filter_map(|p| match p {
                         Placed::At(v) => Some(fi.unpack(*v)),
                         _ => None,
                     })
                     .collect();
-                values.sort_unstable();
-                values.dedup();
                 let c = self.lower_int_operand(inner, ty)?;
                 if values.is_empty() {
                     return Ok((self.eb.emit(L::Cmp { op: CmpOp::Ne, a: c, b: c }), ExprKind::Int));
                 }
-                let set_idx = self.eb.add_const_int_set(&values);
+                let set_idx = self.eb.add_const_int_set(values);
                 return Ok((self.eb.emit(L::IntInSet { value_reg: c, set_idx }), ExprKind::Int));
             }
         }
@@ -791,6 +741,31 @@ impl OpcodeBackend<'_> {
         Ok(Some(self.eb.emit(L::Cmp { op, a: c, b })))
     }
 
+    /// A comparison of two German-string columns, or of one and a string literal,
+    /// as a `StrCol*` opcode over the cells themselves — the one legal use of a
+    /// BLOB column. `None` for any other shape or operator, which the register
+    /// channel lowers instead.
+    fn string_cmp(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Option<Reg> {
+        let cols = self.cols;
+        let is_str_col = |e: &BoundExpr| matches!(e, BoundExpr::ColRef(i) if cols[*i].ty.tc.is_german_string());
+        // The opcode pins the constant on the right, so a literal-on-left pair is
+        // read as its converse: `'A' < col` is `col > 'A'`.
+        let (col, s, cmp) = match (left, right) {
+            (BoundExpr::ColRef(c), BoundExpr::LitStr(s)) if is_str_col(left) => (*c, s, op.as_cmp()?),
+            (BoundExpr::LitStr(s), BoundExpr::ColRef(c)) if is_str_col(right) => (*c, s, op.converse().as_cmp()?),
+            (BoundExpr::ColRef(a), BoundExpr::ColRef(b)) if is_str_col(left) && is_str_col(right) => {
+                return Some(self.eb.emit(L::StrColCol {
+                    op: op.as_cmp()?,
+                    col_a: *a as u32,
+                    col_b: *b as u32,
+                }));
+            }
+            _ => return None,
+        };
+        let const_idx = self.eb.add_const_bytes(s.as_bytes());
+        Some(self.eb.emit(L::StrColConst { op: cmp, col: col as u32, const_idx }))
+    }
+
     fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<(Reg, ExprKind), GnitzSqlError> {
         if let BinOp::And | BinOp::Or = op {
             let (a, _) = self.lower_num(left)?;
@@ -803,7 +778,7 @@ impl OpcodeBackend<'_> {
         if let Some(reg) = self.cmp_placed(left, op, right)? {
             return Ok((reg, ExprKind::Int));
         }
-        if let Some(reg) = try_compile_string_cmp(left, op, right, self.cols, self.eb) {
+        if let Some(reg) = self.string_cmp(left, op, right) {
             return Ok((reg, ExprKind::Int));
         }
         // `||` reads both operands through the string channel, so `s || NULL` is
@@ -840,11 +815,9 @@ impl OpcodeBackend<'_> {
         let (l_float, r_float) = (l_kind.is_float(), r_kind.is_float());
         // POWER has no integer form: both operands lift.
         let is_float = l_float || r_float || op == BinOp::Pow;
-        if is_float && !l_float {
-            l = self.eb.emit(L::IntToFloat { a: l });
-        }
-        if is_float && !r_float {
-            r = self.eb.emit(L::IntToFloat { a: r });
+        if is_float {
+            l = self.as_float(l, l_kind);
+            r = self.as_float(r, r_kind);
         }
         let out = match is_float {
             true => ExprKind::Float,
@@ -959,7 +932,7 @@ pub(crate) fn compile_bound_expr_to_program(
 ) -> Result<LogicalProgram, GnitzSqlError> {
     let mut eb = ExprBuilder::new();
     let reg = compile_bound_expr(expr, cols, &mut eb)?;
-    Ok(eb.build(Some(reg))?)
+    Ok(eb.build(vec![Sink::Reg(reg)])?)
 }
 
 /// An expression's truth when its `NOT` / `AND` / `OR` connectives settle it over
@@ -999,7 +972,7 @@ pub(crate) fn compile_filter_program<'a>(
             None => r,
         });
     }
-    Ok(acc.map(|reg| eb.build(Some(reg))).transpose()?)
+    Ok(acc.map(|reg| eb.build(vec![Sink::Reg(reg)])).transpose()?)
 }
 
 /// The wire predicate blob for the AND of `conjuncts`; empty when statically

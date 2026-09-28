@@ -1,4 +1,4 @@
-use gnitz_expr::{ExprValidateErr, LogicalProgram, Output, Reg, Sink};
+use gnitz_expr::{ExprValidateErr, LogicalProgram, Reg, Sink};
 
 use super::{MapPlan, PkSource};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_COLUMNS};
@@ -67,7 +67,7 @@ fn test_map_copy_and_emit() {
         },
     ];
     let sinks = vec![Sink::Col(1), Sink::Reg(Reg(2))];
-    let prog = LogicalProgram::new(instrs, Output::Slots(sinks), vec![]);
+    let prog = LogicalProgram::new(instrs, sinks, vec![]);
 
     let mut func = MapPlan::from_map(prog, &in_schema, &out_schema, PkSource::Inherit).unwrap();
     let result = func.evaluate_map_batch(&batch);
@@ -316,7 +316,7 @@ fn test_from_predicate_filter_ranges_over_a_batch() {
         LogicalInstr::LoadConst { val: 15, unsigned: false },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
     ];
-    let mut func = LogicalProgram::new(instrs, Output::Result(Reg(2)), vec![])
+    let mut func = LogicalProgram::new(instrs, vec![Sink::Reg(Reg(2))], vec![])
         .resolve_filter(&schema)
         .unwrap();
 
@@ -368,7 +368,7 @@ fn map_whose_only_computed_column_is_a_string_still_runs_the_kernel() {
     ];
     let sinks = vec![Sink::Col(0), Sink::Reg(Reg(1))];
     let mut func = MapPlan::from_map(
-        LogicalProgram::new(instrs, Output::Slots(sinks), vec![]),
+        LogicalProgram::new(instrs, sinks, vec![]),
         &in_schema,
         &out_schema,
         PkSource::Inherit,
@@ -401,7 +401,7 @@ fn string_emit_composes_with_blob_passthrough() {
     ];
     let sinks = vec![Sink::Col(1), Sink::Reg(Reg(1))];
     let mut func = MapPlan::from_map(
-        LogicalProgram::new(instrs, Output::Slots(sinks), vec![]),
+        LogicalProgram::new(instrs, sinks, vec![]),
         &in_schema,
         &out_schema,
         PkSource::Inherit,
@@ -443,7 +443,7 @@ fn null_string_emit_zeroes_the_cell_and_sets_the_bit() {
     ];
     let sinks = vec![Sink::Col(0), Sink::Reg(Reg(1))];
     let mut func = MapPlan::from_map(
-        LogicalProgram::new(instrs, Output::Slots(sinks), vec![]),
+        LogicalProgram::new(instrs, sinks, vec![]),
         &in_schema,
         &out_schema,
         PkSource::Inherit,
@@ -722,7 +722,7 @@ fn map_ranges_bench() {
                     LogicalInstr::LoadColStr { col: 1 },
                     LogicalInstr::StrCase { a: Reg(0), upper: true },
                 ],
-                Output::Slots(vec![Sink::Reg(Reg(1))]),
+                vec![Sink::Reg(Reg(1))],
                 vec![],
             ),
             &str_in,
@@ -758,7 +758,7 @@ fn map_ranges_bench() {
                     arith(IntArithOp::Mul, 1, 2),
                     arith(IntArithOp::Sub, 2, 0),
                 ],
-                Output::Slots(vec![Sink::Reg(Reg(3)), Sink::Reg(Reg(4)), Sink::Reg(Reg(5))]),
+                vec![Sink::Reg(Reg(3)), Sink::Reg(Reg(4)), Sink::Reg(Reg(5))],
                 vec![],
             ),
             &int_in,
@@ -1175,7 +1175,7 @@ fn reindex_drop_null_keys_bench() {
     let plan = |nulls| MapPlan::from_wire(&s, &reindex_on(&[1], vec![1, 2, 3], nulls)).unwrap();
     let mut not_null = LogicalProgram::new(
         vec![LogicalInstr::IsNull { col: 1, invert: true }],
-        Output::Result(Reg(0)),
+        vec![Sink::Reg(Reg(0))],
         vec![],
     )
     .resolve_filter(&s)

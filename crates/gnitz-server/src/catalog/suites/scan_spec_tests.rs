@@ -514,7 +514,7 @@ fn gather_of_64_payload_columns_covers_every_slot() {
         }
     });
     // Identity-order gather of every payload column: src col k+1 → out slot k.
-    let copies: Vec<(u32, u32)> = (0..P as u32).map(|k| (k + 1, k)).collect();
+    let copies: Vec<u32> = (1..=P as u32).collect();
     let reply = e.registry.relation(tid).map(Relation::schema).unwrap();
     let spec = rows_spec(vec![], map_of(proj_blob(&copies), &reply), vec![], 0);
     let got = e.scan_spec(tid, spec, reply.layout_digest()).unwrap();
@@ -546,7 +546,7 @@ fn all_pk_sourced_projection_zeroes_null_words_across_chunks() {
         ],
         &[0],
     );
-    let spec = rows_spec(vec![], map_of(proj_blob(&[(0, 0)]), &reply), vec![], 0);
+    let spec = rows_spec(vec![], map_of(proj_blob(&[0]), &reply), vec![], 0);
     let got = e.scan_spec(tid, spec, reply.layout_digest()).unwrap();
     assert_eq!(got.len(), 300, "10 chunks of 32 rows minus the short tail");
     for r in 0..got.len() {
@@ -597,7 +597,7 @@ fn permuted_gather_with_string_and_nullable_across_chunks() {
         ],
         &[0],
     );
-    let spec = rows_spec(vec![], map_of(proj_blob(&[(2, 0), (0, 1), (1, 2)]), &reply), vec![], 0);
+    let spec = rows_spec(vec![], map_of(proj_blob(&[2, 0, 1]), &reply), vec![], 0);
     let got = e.scan_spec(tid, spec, reply.layout_digest()).unwrap();
     assert_eq!(got.len() as u64, N);
 
@@ -665,9 +665,9 @@ fn compute_projection_writes_at_keeper_tail_across_chunks() {
             a: v,
             b: two,
         });
-        eb.sink(gnitz_expr::Sink::Reg(doubled));
-        eb.sink(gnitz_expr::Sink::Col(2));
-        eb.build(None).expect("a well-formed program").to_blob_bytes()
+        eb.build(vec![gnitz_expr::Sink::Reg(doubled), gnitz_expr::Sink::Col(2)])
+            .expect("a well-formed program")
+            .to_blob_bytes()
     };
     // `keep = id * 10 < 1000` keeps ids 0..99, interleaved with the chunking.
     let spec = rows_spec(
@@ -713,7 +713,7 @@ fn projection_missing_an_output_slot_errs() {
         ],
         &[0],
     );
-    let spec = rows_spec(vec![], map_of(proj_blob(&[(1, 0)]), &reply), vec![], 0);
+    let spec = rows_spec(vec![], map_of(proj_blob(&[1]), &reply), vec![], 0);
     let err = e.scan_spec(tid, spec, reply.layout_digest()).err().unwrap();
     assert!(err.contains("OutputSlotCountMismatch"), "{err}");
 }
@@ -728,7 +728,7 @@ fn gather_top_k_keeps_boundary_row_whole() {
     // Reply: id U64 PK | val I64 — a gather of the single payload column.
     let reply = e.registry.relation(tid).map(Relation::schema).unwrap();
     let order = vec![OrderKey { col: 1, desc: false, nulls_first: false }];
-    let spec = rows_spec(vec![], map_of(proj_blob(&[(1, 0)]), &reply), order, 2);
+    let spec = rows_spec(vec![], map_of(proj_blob(&[1]), &reply), order, 2);
     let got = e.scan_spec(tid, spec, reply.layout_digest()).unwrap();
     // LIMIT 2 is covered by the single smallest row's weight 3 — kept whole.
     assert_eq!(triples(&got), vec![(0u128, 0, 3)]);
@@ -752,7 +752,7 @@ fn gather_limit_cuts_the_range_list_mid_chunk() {
     let reply = e.registry.relation(tid).map(Relation::schema).unwrap();
     let spec = rows_spec(
         pred_cmp_blob(gnitz_expr::CmpOp::Lt, 1, 1),
-        map_of(proj_blob(&[(1, 0)]), &reply),
+        map_of(proj_blob(&[1]), &reply),
         vec![],
         5,
     );

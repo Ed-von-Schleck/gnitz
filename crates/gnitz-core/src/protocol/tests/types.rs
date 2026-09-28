@@ -2,7 +2,7 @@ use super::*;
 use crate::protocol::wal_block::{decode_wal_block, encode_wal_block};
 use crate::test_support::{german_col, payload_of};
 use gnitz_expr::{
-    BatchView, CmpOp, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Output, Reg, ScalarEval, SchemaFacts,
+    BatchView, CmpOp, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Reg, ScalarEval, SchemaFacts, Sink,
 };
 
 /// `Schema`'s `ColumnTable` answers are what it was built from.
@@ -1242,7 +1242,7 @@ fn the_shared_evaluator_reads_a_client_batch() {
                 b: Reg(1),
             },
         ],
-        Output::Result(Reg(2)),
+        vec![Sink::Reg(Reg(2))],
         vec![],
     )
     .resolve_scalar(&schema)
@@ -1270,7 +1270,7 @@ fn nullable_payload_null_bits_reach_the_evaluator() {
                 b: Reg(1),
             },
         ],
-        Output::Result(Reg(2)),
+        vec![Sink::Reg(Reg(2))],
         vec![],
     )
     .resolve_scalar(&schema)
@@ -1297,7 +1297,7 @@ fn filter_over_the_region_path() {
             LogicalInstr::LoadConst { val: 0, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         ],
-        Output::Result(Reg(2)),
+        vec![Sink::Reg(Reg(2))],
         vec![],
     )
     .resolve_filter(&schema)
@@ -1316,7 +1316,7 @@ fn string_columns_compare_through_the_shared_blob_heap() {
     // STRING (ci4) vs BLOB (ci5): both pass `check_col(GermanString)`.
     let mut ev = LogicalProgram::new(
         vec![LogicalInstr::StrColCol { op: CmpOp::Lt, col_a: 4, col_b: 5 }],
-        Output::Result(Reg(0)),
+        vec![Sink::Reg(Reg(0))],
         vec![],
     )
     .resolve_scalar(&schema)

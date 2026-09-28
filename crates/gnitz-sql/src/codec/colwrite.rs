@@ -4,7 +4,7 @@
 //! literal, so `300` means the same thing whichever verb writes it; and
 //! [`check_not_null`] is the NOT NULL verdict both DML write paths take.
 
-use crate::codec::literal::{invalid_literal, place, Placed};
+use crate::codec::literal::assign;
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
 use gnitz_core::{push_zero_cell, ColumnDef, TypeCode};
@@ -62,22 +62,7 @@ pub(crate) fn append_value_to_col<R>(
 
 /// A literal as the native image of a column stored as an integer.
 pub(crate) fn native_value<R>(lit: &BExpr<R>, def: &ColumnDef) -> Result<u128, GnitzSqlError> {
-    let ty = def.ty;
-    let text = || lit.literal_text();
-    match place(lit, ty) {
-        Some(
-            Placed::At(v)
-            | Placed::Between { nearest: v, .. }
-            | Placed::Below { nearest: Some(v) }
-            | Placed::Above { nearest: Some(v) },
-        ) => Ok(v),
-        Some(Placed::Below { .. } | Placed::Above { .. }) => Err(format!("{ty} value out of range: {}", text())),
-        None => match lit {
-            BExpr::LitStr(s) => Err(invalid_literal(ty, s)),
-            _ => Err(format!("{} is not a {ty} value", text())),
-        },
-    }
-    .map_err(|m| GnitzSqlError::Rejected(format!("column '{}': {m}", def.name)))
+    assign(lit, def.ty).map_err(|m| GnitzSqlError::Rejected(format!("column '{}': {m}", def.name)))
 }
 
 /// A float column's value; `None` for a string. A magnitude past `i128` is
