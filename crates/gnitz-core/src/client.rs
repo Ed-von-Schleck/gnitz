@@ -5,11 +5,11 @@ use crate::connection::{
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
 use crate::protocol::{
-    BatchAppender, ColumnDef, FkTarget, PkBuf, PkColumn, ProtocolError, PushFamily, Schema, TypeCode, WireConflictMode,
-    ZSetBatch,
+    BatchAppender, ColumnDef, FkTarget, PkBuf, PkColumn, ProtocolError, PushFamily, Schema, WireConflictMode, ZSetBatch,
 };
 use gnitz_wire::{WireFault, WireStatus};
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use crate::mirror::{MirrorState, MirrorStore, MirroredView};
@@ -139,22 +139,10 @@ pub struct DeltaCursor {
     /// Identifies the boot and the relation this cursor belongs to.
     pub tag: u64,
     /// The last tick round it covers; the next poll asks for everything after it.
-    pub tick: u64,
+    pub tick: NonZeroU64,
 }
 
 impl DeltaCursor {
-    /// The tick a poll from this cursor reads after.
-    ///
-    /// Tick `0` is **refused**: it names no copy to protect and no tag to match,
-    /// so it could only mean a bootstrap — and a bootstrap walks the view's own
-    /// store and comes back in the view's schema, not the [`delta_reply_schema`]
-    /// shape a poll derives.
-    pub(crate) fn poll_after(self) -> Result<u64, ClientError> {
-        (self.tick != 0)
-            .then_some(self.tick)
-            .ok_or_else(|| delta_expired("delta cursor 0 names no round to continue from; bootstrap"))
-    }
-
     /// `next` as this cursor's successor, or a `DeltaExpired` refusal.
     ///
     /// A tag the server did not echo back names a different boot or a different
@@ -175,45 +163,6 @@ fn delta_expired(text: &str) -> ClientError {
         status: WireStatus::DeltaExpired,
         text: text.into(),
     })
-}
-
-/// The reply schema of an incremental delta read: a `_tick` U64 key column, then
-/// `view`'s PK columns in PK order, then its payload columns in schema order.
-///
-/// The order is `gnitz_wire::delta_schema_order`, which the engine's
-/// `make_delta_schema` applies to build the delta store's own descriptor — the
-/// same permutation, not a second statement of it. The worker's identity-rows
-/// path demands the reply schema match that layout exactly.
-///
-/// A bootstrap read is **not** in this shape — it walks the view's own store and
-/// comes back in the view's own schema.
-pub(crate) fn delta_reply_schema(view: &Schema) -> Result<Schema, ClientError> {
-    // The one limit that can bind: the stamp is one column more than the view,
-    // which is what the engine's `make_delta_schema` answers `None` for. Not
-    // `Schema::from_parts` — its PK-arity cap is the *persisted* PK-list codec's,
-    // and a stamped key is one column past it by construction.
-    if view.num_columns() >= gnitz_wire::MAX_COLUMNS {
-        return Err(ClientError::from(format!(
-            "a view with {} columns cannot carry a delta feed: the `_tick` stamp would exceed the \
-             {}-column limit",
-            view.num_columns(),
-            gnitz_wire::MAX_COLUMNS
-        )));
-    }
-    let mut columns = Vec::with_capacity(view.num_columns() + 1);
-    let mut pk_cols = Vec::with_capacity(view.pk_count() + 1);
-    for c in gnitz_wire::delta_schema_order(&view.pk_cols, view.num_columns()) {
-        let (cd, is_key) = match c {
-            gnitz_wire::DeltaCol::Tick => (ColumnDef::new("_tick", TypeCode::U64, false).hidden(), true),
-            gnitz_wire::DeltaCol::Key(i) => (view.columns[i].clone(), true),
-            gnitz_wire::DeltaCol::Payload(i) => (view.columns[i].clone(), false),
-        };
-        if is_key {
-            pk_cols.push(columns.len() as u32);
-        }
-        columns.push(cd);
-    }
-    Ok(Schema { columns, pk_cols })
 }
 
 /// The symbolic id by which a [`ViewBundle`] circuit's `ScanDelta` names
@@ -611,17 +560,13 @@ impl GnitzClient {
     }
 
     /// Poll a view's delta feed: every delta it emitted in `(cursor.tick, T]`,
-    /// with the cursor to poll from next. The reply comes back in the delta shape
-    /// this call derives from `view_schema`: a `_tick` key column, then the
-    /// view's PK columns, then its payload columns.
-    /// Apply what comes back and store the new cursor; there is nothing to
-    /// filter and nothing to reconcile.
+    /// with the cursor to poll from next. The reply comes back in the view's
+    /// schema, weights and all. Apply what comes back and store the new cursor;
+    /// there is nothing to filter and nothing to reconcile.
     ///
-    /// Both refusals a poll can answer with — a cursor at tick `0`, and a reply
-    /// whose tag does not continue the cursor — are `DeltaCursor::poll_after`
-    /// and `DeltaCursor::advanced_to`, which state the rule once for every
-    /// caller. Both surface as a `DeltaExpired` refusal, whose recovery is
-    /// to discard the copy and [`delta_bootstrap`](Self::delta_bootstrap) again.
+    /// A reply whose tag does not continue the cursor is refused as
+    /// `DeltaExpired`: discard the copy and
+    /// [`delta_bootstrap`](Self::delta_bootstrap) again.
     ///
     /// A poll does **not** drive a tick: a delta read answers "what has
     /// happened", not "what is current", so a push the tick loop has not run yet
@@ -632,23 +577,8 @@ impl GnitzClient {
         cursor: DeltaCursor,
         view_schema: &Arc<Schema>,
     ) -> Result<(ScanReply, DeltaCursor), ClientError> {
-        let rs = Arc::new(delta_reply_schema(view_schema)?);
-        let (data, next) = self.delta_read(view_id, cursor.poll_after()?, &rs)?;
+        let (data, next) = self.delta_read(view_id, cursor.tick.get(), view_schema)?;
         Ok((data, cursor.advanced_to(next)?))
-    }
-
-    /// [`Self::delta_bootstrap`] handing back the reply's *undecoded* blocks —
-    /// what the mirror state machine feeds a store.
-    ///
-    /// Decoding to a `ZSetBatch` walks every OPK key back to a native value, and
-    /// re-encoding it costs the walk again plus a second full region copy — to
-    /// reconstruct the block the socket already delivered.
-    pub(crate) fn delta_bootstrap_raw(
-        &mut self,
-        view_id: u64,
-        view_schema: &Arc<Schema>,
-    ) -> Result<(Vec<RawBlock>, DeltaCursor), ClientError> {
-        self.delta_read_raw(view_id, 0, view_schema)
     }
 
     /// One view's delta read, decoded under `reply_schema`, with the terminal
@@ -659,29 +589,22 @@ impl GnitzClient {
         after_tick: u64,
         reply_schema: &Arc<Schema>,
     ) -> Result<(ScanReply, DeltaCursor), ClientError> {
-        let (blocks, cursor) = self.delta_read_raw(view_id, after_tick, reply_schema)?;
+        let (blocks, cursor) = self.delta_read_raw(DeltaPollItem {
+            view_id,
+            after_tick,
+            reply_layout: reply_schema.layout_digest(),
+        })?;
         let schema = Arc::clone(reply_schema);
         let mut batch = ZSetBatch::new(&schema);
-        for b in &blocks {
+        for b in blocks {
             crate::protocol::wal_block::decode_wal_block_into(&mut batch, b.block(), &schema)?;
         }
         Ok((ScanReply { schema, batch, lsn: None }, cursor))
     }
 
     /// [`Self::delta_read`] keeping the reply's raw blocks. The cursor comes back
-    /// **unchecked** against a previous one — the tag rule belongs to the caller
-    /// that holds it.
-    pub(crate) fn delta_read_raw(
-        &mut self,
-        view_id: u64,
-        after_tick: u64,
-        reply_schema: &Arc<Schema>,
-    ) -> Result<(Vec<RawBlock>, DeltaCursor), ClientError> {
-        let item = DeltaPollItem {
-            view_id,
-            after_tick,
-            reply_layout: reply_schema.layout_digest(),
-        };
+    /// unchecked against a previous one.
+    pub(crate) fn delta_read_raw(&mut self, item: DeltaPollItem) -> Result<(Vec<RawBlock>, DeltaCursor), ClientError> {
         let slot = self.session.submit_delta_poll(&[item])?;
         let mut got: Option<PolledView> = None;
         let mut sink = |s: SlotId, view: PolledView| {

@@ -296,54 +296,17 @@ impl Batch {
     }
 
     /// An owned, tightly packed copy of `mb`'s `count` rows and its whole heap,
-    /// read under `in_schema` and written under `out_schema`: `Raw`, fresh blob
-    /// id.
-    ///
-    /// `out_schema`'s PK is a suffix of `in_schema`'s, dropping that many leading
-    /// key bytes per row; passing one schema twice is the verbatim copy.
-    ///
-    /// `Raw` even from a `Consolidated` source: dropping a leading key region
-    /// preserves neither sortedness nor distinctness once the batch spans more
-    /// than one prefix value.
-    pub(in crate::storage) fn from_mem_batch(
-        mb: &MemBatch,
-        in_schema: &SchemaDescriptor,
-        out_schema: &SchemaDescriptor,
-    ) -> Self {
-        let (strides, nr) = strides_from_schema(out_schema);
+    /// laid out under `schema`: `Raw`, fresh blob id.
+    pub(in crate::storage) fn from_mem_batch(mb: &MemBatch, schema: &SchemaDescriptor) -> Self {
+        let (strides, nr) = strides_from_schema(schema);
         let nr = nr as usize;
-        let (in_pk, out_pk) = (in_schema.pk_stride(), out_schema.pk_stride());
-        let skip = in_pk
-            .checked_sub(out_pk)
-            .expect("from_mem_batch: out_schema's PK is a suffix of in_schema's");
-        debug_assert_eq!(in_schema.num_payload_cols(), out_schema.num_payload_cols());
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
         let size = compute_offsets_into(&strides, nr, mb.count, &mut offsets);
         let mut data = acquire_arena(size, Fill::Uninit);
         // SAFETY: distinct allocations; `mb`'s regions hold `count × stride` bytes
         // each (a `Batch` by construction, a wire view by its parse), and `data`
-        // is sized for `count` rows. The PK region is left out: only these share
-        // a pitch across the two schemas.
-        unsafe {
-            copy_regions(
-                mb.data,
-                mb.offsets,
-                &mut data,
-                &offsets,
-                &strides,
-                REG_WEIGHT..nr,
-                mb.count,
-            )
-        };
-        let src_pk = &mb.data[mb.offsets[REG_PK]..][..mb.count * in_pk];
-        let dst_pk = &mut data[offsets[REG_PK]..][..mb.count * out_pk];
-        if skip == 0 {
-            dst_pk.copy_from_slice(src_pk);
-        } else {
-            for (out, src) in dst_pk.chunks_exact_mut(out_pk).zip(src_pk.chunks_exact(in_pk)) {
-                out.copy_from_slice(&src[skip..]);
-            }
-        }
+        // is sized for `count` rows.
+        unsafe { copy_regions(mb.data, mb.offsets, &mut data, &offsets, &strides, REG_PK..nr, mb.count) };
         let mut blob = acquire_arena(mb.blob.len(), Fill::Reserve);
         blob.extend_from_slice(mb.blob);
         Batch {
@@ -354,7 +317,7 @@ impl Batch {
             capacity: mb.count,
             count: mb.count,
             layout: Layout::Raw,
-            schema: *out_schema,
+            schema: *schema,
             blob_id: next_blob_id(),
         }
     }
@@ -1232,15 +1195,8 @@ impl Batch {
     ///
     /// Prepending one constant to every key preserves both sortedness and
     /// distinctness, so the layout claim carries across: a batch that arrives
-    /// `Consolidated` stays `Consolidated` and the stamp never forces a re-sort
-    /// the caller would not otherwise have paid for.
-    ///
-    /// The sibling of [`Self::widened_with_nulls`] rather than a call into it:
-    /// that one asserts the two schemas share a PK stride, and this changes it by
-    /// eight bytes. The NULL words copy whole here because the payload space is
-    /// identical — the delta schema is a reordering of the view's columns, not a
-    /// shift of them.
-    pub fn stamped_with_pk_prefix(&self, out_schema: &SchemaDescriptor, prefix: u64) -> Self {
+    /// `Consolidated` stays `Consolidated`.
+    pub(crate) fn stamped_with_pk_prefix(&self, out_schema: &SchemaDescriptor, prefix: u64) -> Self {
         let in_schema = &self.schema;
         let in_stride = in_schema.pk_stride();
         let out_stride = out_schema.pk_stride();
@@ -1262,6 +1218,32 @@ impl Batch {
         }
 
         output.inherit_layout(self);
+        output
+    }
+
+    /// The inverse of [`Self::stamped_with_pk_prefix`]: copy every row into
+    /// `out_schema`, whose key is this batch's key minus its leading eight-byte
+    /// prefix and whose payload space is unchanged.
+    ///
+    /// Left `Raw`: dropping the leading prefix preserves neither sortedness nor
+    /// distinctness once the batch spans more than one prefix value.
+    pub(crate) fn unstamped(&self, out_schema: &SchemaDescriptor) -> Self {
+        let in_schema = &self.schema;
+        let in_stride = in_schema.pk_stride();
+        let out_stride = out_schema.pk_stride();
+        let stamp_bytes = DELTA_TICK_COL.size() as usize;
+        debug_assert_eq!(in_stride, out_stride + stamp_bytes);
+        debug_assert_eq!(out_schema.num_payload_cols(), in_schema.num_payload_cols());
+        let mut output = self.shell_for(in_schema, out_schema, 0);
+        output.null_bmp_data_mut().copy_from_slice(self.null_bmp_data());
+        let src_pk = self.pk_data();
+        for (dst, src) in output
+            .pk_data_mut()
+            .chunks_exact_mut(out_stride)
+            .zip(src_pk.chunks_exact(in_stride))
+        {
+            dst.copy_from_slice(&src[stamp_bytes..]);
+        }
         output
     }
 
@@ -1315,7 +1297,7 @@ impl Batch {
             return self.empty_like();
         }
         // Only the used portion of data (count-based, not capacity-based).
-        let mut b = Self::from_mem_batch(&self.as_mem_batch(), &self.schema, &self.schema);
+        let mut b = Self::from_mem_batch(&self.as_mem_batch(), &self.schema);
         b.layout = self.layout;
         b.blob_id = self.blob_id;
         b

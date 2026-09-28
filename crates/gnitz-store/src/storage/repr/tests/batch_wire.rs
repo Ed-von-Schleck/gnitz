@@ -18,10 +18,7 @@ fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
     let schema = make_schema_pk_u64_payload_string();
     let long: &[u8] = b"a string long enough to spill";
     let clean = encode_to_wire_vec(&make_batch_bytes(&schema, &[(1, 1, b"short"), (2, 1, long)]));
-    assert_eq!(
-        Batch::decode_foreign_wal_block(&clean, &schema, &schema).map(|b| b.len()),
-        Ok(2)
-    );
+    assert_eq!(Batch::decode_foreign_wal_block(&clean, &schema).map(|b| b.len()), Ok(2));
 
     let cells = region_offset(&schema, 2, REG_PAYLOAD_START);
     let forgeries: [fn(&mut [u8]); 2] = [
@@ -35,7 +32,7 @@ fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
         forge(&mut buf[cells + row * 16..cells + (row + 1) * 16]);
         assert!(Batch::decode_from_wal_block(&buf, &schema).is_ok(), "row {row}");
         assert_eq!(
-            Batch::decode_foreign_wal_block(&buf, &schema, &schema).err(),
+            Batch::decode_foreign_wal_block(&buf, &schema).err(),
             Some("data WAL German string is not in canonical form"),
             "row {row}"
         );
@@ -63,16 +60,13 @@ fn a_foreign_decode_refuses_a_non_zero_cell_under_a_null() {
         b.end_row();
     }
     let clean = encode_to_wire_vec(&b.finish());
-    assert_eq!(
-        Batch::decode_foreign_wal_block(&clean, &schema, &schema).map(|b| b.len()),
-        Ok(2)
-    );
+    assert_eq!(Batch::decode_foreign_wal_block(&clean, &schema).map(|b| b.len()), Ok(2));
     let cell = region_offset(&schema, 2, REG_PAYLOAD_START + 1) + 8;
     let mut forged = clean.clone();
     forged[cell..cell + 8].fill(0xFF);
     assert!(Batch::decode_from_wal_block(&forged, &schema).is_ok());
     assert_eq!(
-        Batch::decode_foreign_wal_block(&forged, &schema, &schema).err(),
+        Batch::decode_foreign_wal_block(&forged, &schema).err(),
         Some("a non-zero cell under a NULL")
     );
 
@@ -80,7 +74,7 @@ fn a_foreign_decode_refuses_a_non_zero_cell_under_a_null() {
     let not_null = pk_payload_schema(&[TypeCode::U64]);
     let block = encode_to_wire_vec(&make_batch_raw(&not_null, &[(1, 1, -1), (2, 1, 0)]));
     assert_eq!(
-        Batch::decode_foreign_wal_block(&block, &not_null, &not_null).map(|b| b.len()),
+        Batch::decode_foreign_wal_block(&block, &not_null).map(|b| b.len()),
         Ok(2)
     );
 }

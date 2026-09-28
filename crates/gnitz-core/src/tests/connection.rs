@@ -604,7 +604,6 @@ mod spine_tests {
         let (s, peer) = pair();
         let mut c = GnitzClient::from_session(s);
         let sa = schema_a();
-        let reply_schema = Arc::new(sa.clone());
         let want = sa.layout_digest();
         let h = std::thread::spawn(move || {
             let req = peer.drain_request();
@@ -613,10 +612,23 @@ mod spine_tests {
             assert_eq!(items[0].reply_layout, want, "the reply layout rides the request");
             // Two hint-only frames: the server sends no schema block for a delta read.
             peer.send(&reply_warm(9, 0, &batch_a(&[1, 2]), true));
-            peer.send(&reply_warm(9, 0, &batch_a(&[3]), false));
+            // The terminal's `arg0` is the round the cursor moves to.
+            peer.send(&encode_frame(
+                reply_header(9, 0, 5, false),
+                &[],
+                None,
+                Some(&batch_a(&[3])),
+            ));
             peer
         });
-        let (blocks, _cursor) = c.delta_read_raw(9, 4, &reply_schema).unwrap();
+        let (blocks, cursor) = c
+            .delta_read_raw(gnitz_wire::txn_frame::DeltaPollItem {
+                view_id: 9,
+                after_tick: 4,
+                reply_layout: want,
+            })
+            .unwrap();
+        assert_eq!(cursor.tick.get(), 5);
         let _peer = h.join().unwrap();
         assert_eq!(blocks.len(), 2);
         let b0 = crate::protocol::wal_block::decode_wal_block(blocks[0].block(), &sa).unwrap();

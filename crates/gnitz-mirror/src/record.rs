@@ -1,6 +1,8 @@
 //! A copy's registration and feed position, published in the manifest beside
 //! the copy's rows.
 
+use std::num::NonZeroU64;
+
 use gnitz_core::DeltaCursor;
 use gnitz_wire::{decode_all, Reader, Writer};
 
@@ -21,7 +23,7 @@ impl MirrorRecord {
         let mut w = Writer::new();
         w.bool(self.cursor.is_some());
         if let Some(c) = self.cursor {
-            w.u64(c.tag).u64(c.tick);
+            w.u64(c.tag).u64(c.tick.get());
         }
         w.bytes32(self.schema_name.as_bytes())
             .bytes32(self.name.as_bytes())
@@ -35,7 +37,11 @@ impl MirrorRecord {
         let rec = decode_all(bytes, "mirror record", |r| {
             let cursor = match r.bool()? {
                 false => None,
-                true => Some(DeltaCursor { tag: r.u64()?, tick: r.u64()? }),
+                true => {
+                    let tag = r.u64()?;
+                    let tick = NonZeroU64::new(r.u64()?).ok_or_else(|| "a cursor at round 0".to_string())?;
+                    Some(DeltaCursor { tag, tick })
+                }
             };
             let text = |r: &mut Reader| String::from_utf8(r.bytes32()?.to_vec()).map_err(|e| e.to_string());
             Ok(MirrorRecord {

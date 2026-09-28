@@ -32,7 +32,6 @@
 //! second one, in this process or any other: a second [`Mirror::open`] takes a
 //! fresh file description, which `flock` treats as a conflict.
 
-mod apply;
 mod handle;
 mod reads;
 mod record;

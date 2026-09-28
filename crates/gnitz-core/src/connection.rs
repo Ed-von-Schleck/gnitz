@@ -6,6 +6,7 @@
 //! that arrives is the head slot's until its last train terminates.
 
 use std::collections::VecDeque;
+use std::num::NonZeroU64;
 use std::os::fd::{OwnedFd, RawFd};
 use std::sync::Arc;
 use std::time::Instant;
@@ -80,7 +81,8 @@ impl RawBlock {
     }
 
     /// A block that owns its whole buffer, for a producer that is not a reply
-    /// frame. [`MirrorStore::ingest`](crate::MirrorStore::ingest) takes these, so
+    /// frame. [`MirrorStore::reseed`](crate::MirrorStore::reseed) and
+    /// [`MirrorStore::advance`](crate::MirrorStore::advance) take these, so
     /// a store's own tests need a way to build one.
     pub fn from_block(block: Vec<u8>) -> RawBlock {
         RawBlock { block: 0..block.len(), frame: block }
@@ -873,8 +875,10 @@ impl Session {
         let schema = train.map(|h| h.0);
         let data = accum.data.take();
         if let Some((_, positions)) = poll {
+            let tick = NonZeroU64::new(ctrl.hdr.arg0)
+                .ok_or_else(|| ProtocolError::DecodeError("a delta-poll terminal at round 0".into()))?;
             let blocks = std::mem::take(&mut accum.blocks);
-            let cursor = DeltaCursor { tag: ctrl.hdr.arg1, tick: ctrl.hdr.arg0 };
+            let cursor = DeltaCursor { tag: ctrl.hdr.arg1, tick };
             let filled = Ok((blocks, cursor));
             return Ok(Some(fill_poll_position(pending, accum, done, positions, filled)));
         }

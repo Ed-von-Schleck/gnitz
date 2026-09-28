@@ -204,26 +204,22 @@ impl Batch {
     pub fn decode_from_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Self, &'static str> {
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
         let mb = decode_mem_batch_from_wal_block(data, schema, &mut offsets)?;
-        Ok(Batch::from_mem_batch(&mb, schema, schema))
+        Ok(Batch::from_mem_batch(&mb, schema))
     }
 
-    /// [`Self::decode_from_wal_block`] for a block a peer wrote: validated
-    /// under `in_schema`, then mapped into `out_schema`.
-    pub fn decode_foreign_wal_block(
-        data: &[u8],
-        in_schema: &SchemaDescriptor,
-        out_schema: &SchemaDescriptor,
-    ) -> Result<Self, &'static str> {
+    /// [`Self::decode_from_wal_block`] for a block a peer wrote, validated
+    /// first.
+    pub fn decode_foreign_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Self, &'static str> {
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
-        let mb = decode_mem_batch_from_wal_block(data, in_schema, &mut offsets)?;
-        validate_string_heap_extents(&mb, in_schema)?;
-        if gnitz_wire::first_not_null_violation(in_schema.not_null_payload_slots(), mb.null_bmp()).is_some() {
+        let mb = decode_mem_batch_from_wal_block(data, schema, &mut offsets)?;
+        validate_string_heap_extents(&mb, schema)?;
+        if gnitz_wire::first_not_null_violation(schema.not_null_payload_slots(), mb.null_bmp()).is_some() {
             return Err("a null bit on a NOT NULL column");
         }
-        if first_valued_null_cell(&mb, in_schema).is_some() {
+        if first_valued_null_cell(&mb, schema).is_some() {
             return Err("a non-zero cell under a NULL");
         }
-        Ok(Batch::from_mem_batch(&mb, in_schema, out_schema))
+        Ok(Batch::from_mem_batch(&mb, schema))
     }
 }
 

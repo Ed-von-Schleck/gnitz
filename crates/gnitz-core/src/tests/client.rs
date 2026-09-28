@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::TypeCode;
 use crate::SchemaFacts;
 
 fn kv_schema() -> Schema {

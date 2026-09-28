@@ -665,3 +665,52 @@ fn project_index_drops_ghosts_and_carries_each_weight() {
     assert_eq!(projected.get_weight(0), 1);
     assert_eq!(projected.get_weight(1), -1, "a retraction projects as a retraction");
 }
+
+/// `unstamped` gives back exactly the rows `stamped_with_pk_prefix` was handed:
+/// a compound key whose prefix is dropped whole, every weight, the NULL words,
+/// and a long (> 12 byte) string whose heap offset must still resolve.
+#[test]
+fn unstamped_inverts_stamped_with_pk_prefix() {
+    use crate::test_support::read_german_string;
+    let view = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::String, false),
+            SchemaColumn::new(TypeCode::I64, true),
+        ],
+        &[0, 1],
+    );
+    let delta = crate::schema::make_delta_schema(&view).expect("the stamped shape fits");
+    // `(key, key, weight, string, nullable)`.
+    type Row<'a> = (u64, u32, i64, &'a [u8], Option<i64>);
+    let long: &[u8] = b"a-fairly-long-string-value"; // 26 bytes > 12
+    let rows: [Row; 2] = [(1, 7, 1, long, Some(5)), (2, 3, -2, b"hi", None)];
+
+    let mut b = Batch::with_capacity(&view, rows.len());
+    for &(k0, k1, w, s, n) in &rows {
+        let mut pk = k0.to_be_bytes().to_vec();
+        pk.extend_from_slice(&k1.to_be_bytes());
+        b.extend_pk_bytes(&pk);
+        b.extend_weight(&w.to_le_bytes());
+        b.extend_col_blob(0, s);
+        b.extend_col(1, &n.unwrap_or(0).to_le_bytes());
+        b.commit_row(if n.is_none() { 1 << 1 } else { 0 });
+    }
+    b.certify_layout(Layout::Consolidated);
+
+    let out = b.stamped_with_pk_prefix(&delta, 7).unstamped(&view);
+    assert_eq!(out.count, b.count);
+    assert_eq!(out.layout(), Layout::Raw, "a dropped prefix preserves no order claim");
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(out.get_pk_bytes(i), b.get_pk_bytes(i), "row {i}: key");
+        assert_eq!(out.get_weight(i), b.get_weight(i), "row {i}: weight");
+        assert_eq!(out.get_null_word(i), b.get_null_word(i), "row {i}: null word");
+        assert_eq!(read_german_string(&out, 0, i), row.3, "row {i}: string");
+        assert_eq!(
+            out.get_col_ptr(i, 1, 8),
+            b.get_col_ptr(i, 1, 8),
+            "row {i}: nullable cell"
+        );
+    }
+}

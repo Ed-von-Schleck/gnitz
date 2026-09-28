@@ -87,7 +87,7 @@ impl RelationRegistry {
     }
 
     /// Every delta `id`'s feed recorded in rounds `(after_tick, cut_tick]`, in the
-    /// delta store's schema — or, at `after_tick = 0`, the view's own output store.
+    /// view's schema whatever `after_tick`; `0` walks the view's own output store.
     pub fn delta_read(
         &self,
         id: i64,
@@ -102,31 +102,30 @@ impl RelationRegistry {
                  create the view WITH (delta = '<size>') to subscribe to it"
             )));
         }
-        let (cursor, schema) = if after_tick == 0 {
-            (entry.cursor(), entry.schema())
-        } else {
-            let feed = entry.delta().ok_or_else(|| {
-                StoreError::rejected(format!(
-                    "delta_read: this process holds no delta store for relation {id}"
-                ))
-            })?;
-            // `_tick` leads the delta PK.
-            let dropped_through = leading_u64(feed.dropped_max().pk_bytes());
-            if delta_cursor_expired(after_tick, dropped_through) {
-                return Err(StoreError::DeltaExpired(format!(
-                    "delta cursor {after_tick} of relation {id} is below the \
-                     retained floor {dropped_through}; re-read at 0"
-                )));
-            }
-            let band = key_range_between_cuts(
-                KeyCut::above(&after_tick.to_be_bytes()),
-                KeyCut::above(&cut_tick.to_be_bytes()),
-                feed.schema().pk_stride(),
-            );
-            (feed.range_cursor(band).0, *feed.schema())
-        };
-        check_layout(reply_layout, &schema)?;
-        Ok(cursor.materialize())
+        let view = entry.schema();
+        check_layout(reply_layout, &view)?;
+        if after_tick == 0 {
+            return Ok(entry.cursor().materialize());
+        }
+        let feed = entry.delta().ok_or_else(|| {
+            StoreError::rejected(format!(
+                "delta_read: this process holds no delta store for relation {id}"
+            ))
+        })?;
+        // `_tick` leads the delta PK.
+        let dropped_through = leading_u64(feed.dropped_max().pk_bytes());
+        if delta_cursor_expired(after_tick, dropped_through) {
+            return Err(StoreError::DeltaExpired(format!(
+                "delta cursor {after_tick} of relation {id} is below the \
+                 retained floor {dropped_through}; re-read at 0"
+            )));
+        }
+        let band = key_range_between_cuts(
+            KeyCut::above(&after_tick.to_be_bytes()),
+            KeyCut::above(&cut_tick.to_be_bytes()),
+            feed.schema().pk_stride(),
+        );
+        Ok(Rc::new(feed.range_cursor(band).0.materialize().unstamped(&view)))
     }
 }
 

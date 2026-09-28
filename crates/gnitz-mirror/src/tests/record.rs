@@ -25,7 +25,10 @@ fn record(cursor: Option<DeltaCursor>) -> MirrorRecord {
 }
 
 fn one_cursor() -> Option<DeltaCursor> {
-    Some(DeltaCursor { tag: 0xFEED, tick: 41 })
+    Some(DeltaCursor {
+        tag: 0xFEED,
+        tick: NonZeroU64::new(41).unwrap(),
+    })
 }
 
 #[test]
@@ -68,4 +71,12 @@ fn a_block_describing_no_layout_is_refused() {
         ..record(one_cursor())
     };
     assert_eq!(MirrorRecord::decode(&rec.encode()), None);
+}
+
+#[test]
+fn a_cursor_at_round_0_is_refused() {
+    let mut bytes = record(one_cursor()).encode();
+    // The flag byte, then the tag, then the tick.
+    bytes[9..17].fill(0);
+    assert_eq!(MirrorRecord::decode(&bytes), None);
 }

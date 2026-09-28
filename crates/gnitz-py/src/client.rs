@@ -6,6 +6,7 @@
 //! every reply it hands back is decoded by `read`; nothing here dispatches on a
 //! column type.
 
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::PyValueError;
@@ -49,7 +50,7 @@ impl From<PollOutcome> for PyPollResult {
                 PollResult::Failed(e) => Some(e.to_string()),
                 _ => None,
             },
-            cursor: o.cursor.map(|c| (c.tag, c.tick)),
+            cursor: o.cursor.map(|c| (c.tag, c.tick.get())),
         }
     }
 }
@@ -265,11 +266,11 @@ impl PyGnitzClient {
 
     /// delta_poll(view_id, view_schema, cursor) -> DeltaReply
     ///
-    /// Every delta the view emitted since `cursor`, in the delta shape derived
-    /// from the view's schema: a hidden `_tick` key column, then the view's PK
-    /// columns, then its payload columns. `cursor` is the `(tag, tick)` a previous reply handed back. Apply
-    /// what comes back and keep the new cursor; there is nothing to filter and
-    /// nothing to reconcile.
+    /// Every delta the view emitted since `cursor`, in the view's own schema,
+    /// weights and all. `cursor` is the `(tag, tick)` a previous reply handed
+    /// back; a tick of 0 is refused. Apply what comes
+    /// back and keep the new cursor; there is nothing to filter and nothing to
+    /// reconcile.
     ///
     /// A cursor whose rounds are gone, or that names a different boot or
     /// relation, is refused with `GnitzDeltaExpiredError` rather than answered
@@ -281,7 +282,10 @@ impl PyGnitzClient {
         #[pyo3(from_py_with = resolve_py_schema)] view_schema: Arc<Schema>,
         cursor: (u64, u64),
     ) -> PyResult<Py<PyDeltaReply>> {
-        let cursor = DeltaCursor { tag: cursor.0, tick: cursor.1 };
+        let tick = NonZeroU64::new(cursor.1).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("a delta cursor at tick 0 continues no round; bootstrap")
+        })?;
+        let cursor = DeltaCursor { tag: cursor.0, tick };
         let (reply, cursor) = self.call(py, |c| c.delta_poll(view_id, cursor, &view_schema))?;
         PyDeltaReply::new(py, reply, cursor)
     }
@@ -439,7 +443,7 @@ impl PyGnitzClient {
     /// relation, so it advances over rounds that carried this view nothing —
     /// whether a copy changed is `PollResult.reseeded`, not this.
     pub fn cursor(&mut self, view_id: u64) -> PyResult<Option<(u64, u64)>> {
-        Ok(self.live()?.cursor_of(view_id).map(|c| (c.tag, c.tick)))
+        Ok(self.live()?.cursor_of(view_id).map(|c| (c.tag, c.tick.get())))
     }
 
     /// The message that poisoned this client's copy, or `None`. Answers on a

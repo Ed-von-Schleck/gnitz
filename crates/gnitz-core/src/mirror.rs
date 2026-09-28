@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::client::{delta_reply_schema, park, DeltaCursor, GnitzClient};
+use crate::client::{park, DeltaCursor, GnitzClient};
 use crate::connection::{Interest, PolledView, RawBlock, RelDescriptor, SlotId};
 use crate::error::ClientError;
 use crate::protocol::{Schema, ZSetBatch};
@@ -76,17 +76,17 @@ pub trait MirrorStore: Send {
         schema: &Schema,
     ) -> Result<Option<u64>, MirrorError>;
 
-    /// Tear `tid` down to `level`. See [`Invalidate`] — this is the *only* way a
-    /// copy, a cursor or a registration is ever dropped. Idempotent, and a `tid`
+    /// Tear `tid` down to `level`. See [`Invalidate`]. Idempotent, and a `tid`
     /// the store does not hold is `Ok(())`.
     fn invalidate(&mut self, tid: u64, level: Invalidate) -> Result<(), MirrorError>;
 
-    /// Apply `blocks` to `tid`'s copy, then advance its cursor to `next`.
-    ///
-    /// The blocks' shape is read off the copy's cursor: plain rows for a copy
-    /// holding none, round-stamped rows for one that kept it. Mismatching that
-    /// decodes against the wrong schema.
-    fn ingest(&mut self, tid: u64, blocks: Vec<RawBlock>, next: DeltaCursor) -> Result<(), MirrorError>;
+    /// Fill `tid`'s erased copy with `blocks`, the view's whole value at `cursor`.
+    /// Refused unless the copy holds neither a cursor nor a row.
+    fn reseed(&mut self, tid: u64, blocks: Vec<RawBlock>, cursor: DeltaCursor) -> Result<(), MirrorError>;
+
+    /// Apply `blocks`, the view's deltas after the copy's cursor, and advance it to
+    /// `next`. Refused for a copy holding no cursor.
+    fn advance(&mut self, tid: u64, blocks: Vec<RawBlock>, next: DeltaCursor) -> Result<(), MirrorError>;
 
     /// Run `spec` against `tid`'s copy, replying under `reply_schema`.
     fn scan_spec(
@@ -150,7 +150,7 @@ pub enum MirrorError {
     Engine(String),
     /// The store is poisoned and refuses every further call that touches a copy.
     /// Raised for a teardown that could not erase the copy it was clearing, and
-    /// for a panic caught mid-call. A failed ingest erases that copy instead.
+    /// for a panic caught mid-call. A failed apply erases that copy instead.
     ///
     /// [`GnitzClient::close_mirror`] is the only recovery.
     Poisoned(String),
@@ -225,7 +225,7 @@ impl PollResult {
 // ---------------------------------------------------------------------------
 
 /// One mirrored view, as the client tracks it: what to re-resolve it by, and the
-/// two schemas the wire verbs are handed.
+/// descriptor its reads and polls are answered under.
 pub(crate) struct MirroredView {
     /// Kept split rather than joined: the state machine re-resolves by
     /// `(schema, name)`.
@@ -236,10 +236,17 @@ pub(crate) struct MirroredView {
     /// included, which keeps `pk_stride` right for a view whose physical PK is a
     /// synthetic hidden column.
     pub(crate) desc: Arc<RelDescriptor>,
-    /// The shape a poll's *request* carries, prepared once: it is fixed for the
-    /// registration's life, so a poll clones one `Arc` instead of deep-cloning a
-    /// schema and re-encoding its block.
-    pub(crate) delta_reply: Arc<Schema>,
+}
+
+impl MirroredView {
+    /// A delta read of this view after `after_tick`, replied in its own schema.
+    fn poll_item(&self, after_tick: u64) -> DeltaPollItem {
+        DeltaPollItem {
+            view_id: self.desc.tid,
+            after_tick,
+            reply_layout: self.desc.schema.layout_digest(),
+        }
+    }
 }
 
 /// Everything a mirroring client holds beyond a plain one.
@@ -257,7 +264,7 @@ pub(crate) struct MirrorState {
 }
 
 impl MirrorState {
-    /// Check the tag `fetched` carries against `prev`, ingest, advance the cursor.
+    /// Check the tag `fetched` carries against `prev`, apply, advance the cursor.
     ///
     /// **No recovery here**: a recovery can re-point a registration at a view
     /// whose reply is already in hand, and applying it twice doubles every weight
@@ -271,7 +278,7 @@ impl MirrorState {
     ) -> Result<PollResult, ClientError> {
         let (blocks, at) = fetched?;
         let next = prev.advanced_to(at)?;
-        self.store.ingest(tid, blocks, next)?;
+        self.store.advance(tid, blocks, next)?;
         Ok(PollResult::Advanced)
     }
 }
@@ -281,8 +288,8 @@ impl MirrorState {
 // ---------------------------------------------------------------------------
 //
 // It lands on the client and not in a crate of its own because what it is made
-// of is connection work: it resolves names upstream, drives the two raw delta
-// verbs, and classifies what comes back. The only non-connection steps in it are
+// of is connection work: it resolves names upstream, drives the raw delta verb,
+// and classifies what comes back. The only non-connection steps in it are
 // calls through `MirrorStore` — which is also what makes it exist once for the
 // blocking, async and Python clients alike.
 
@@ -293,11 +300,11 @@ type ViewPollResults = Vec<(u64, Result<PollResult, ClientError>)>;
 /// one a copy of it.
 fn fail_range(
     applied: &mut ViewPollResults,
-    views: &[(u64, DeltaCursor, Arc<Schema>)],
+    views: &[(DeltaCursor, DeltaPollItem)],
     unanswered: Range<usize>,
     cause: ClientError,
 ) {
-    let mut ids = unanswered.map(|i| views[i].0);
+    let mut ids = unanswered.map(|i| views[i].1.view_id);
     let Some(first) = ids.next() else { return };
     let later: Vec<_> = ids.map(|tid| (tid, Err(cause.clone()))).collect();
     applied.push((first, Err(cause)));
@@ -372,13 +379,10 @@ impl GnitzClient {
     pub(crate) fn bind(&mut self, schema_name: &str, name: &str, desc: Arc<RelDescriptor>) -> Result<u64, ClientError> {
         let tid = desc.tid;
         let schema = Arc::clone(&desc.schema);
-        // Built before the store registers, so a schema the delta shape cannot
-        // carry leaves no record the client never entered.
         let entry = MirroredView {
             schema_name: schema_name.to_string(),
             name: name.to_string(),
             desc,
-            delta_reply: Arc::new(delta_reply_schema(&schema)?),
         };
         let retracted = self.mirror_state()?.store.register(tid, schema_name, name, &schema)?;
         let m = self.mirror_state()?;
@@ -404,20 +408,13 @@ impl GnitzClient {
         let Some(prev) = self.mirror_state()?.store.cursor_of(tid) else {
             return self.bootstrap(tid);
         };
-        let fetched = self.fetch_delta(tid, prev);
+        let item = self.mirrored_view(tid)?.poll_item(prev.tick.get());
+        let fetched = self.delta_read_raw(item);
         let m = self.mirror_state()?;
         match m.advance_from(tid, prev, fetched) {
             Ok(result) => Ok((tid, result)),
             Err(e) => self.recover(tid, e),
         }
-    }
-
-    /// Fetch `(prev, T]` for one view — the single-view form of
-    /// [`Self::delta_poll_many`], and the same unvalidated watermark.
-    fn fetch_delta(&mut self, tid: u64, prev: DeltaCursor) -> Result<(Vec<RawBlock>, DeltaCursor), ClientError> {
-        let reply_schema = Arc::clone(&self.mirrored_view(tid)?.delta_reply);
-        let after = prev.poll_after()?;
-        self.delta_read_raw(tid, after, &reply_schema)
     }
 
     /// The recovery a failed poll names, or the failure itself. Two classes name
@@ -473,13 +470,13 @@ impl GnitzClient {
     /// Reads whatever `tid` now names, so [`Self::sync`]'s precondition is this
     /// one too.
     fn bootstrap(&mut self, tid: u64) -> Result<(u64, PollResult), ClientError> {
-        // Everything between here and the ingest below is a copy that does not
-        // exist, and the missing cursor is what says so.
+        // Erased before the fetch, so the old copy is freed before the new one
+        // is held as frames.
         self.mirror_state()?.store.invalidate(tid, Invalidate::Copy)?;
-        let view_schema = Arc::clone(&self.mirrored_view(tid)?.desc.schema);
-        let (blocks, cursor) = self.delta_bootstrap_raw(tid, &view_schema)?;
+        let item = self.mirrored_view(tid)?.poll_item(0);
+        let (blocks, cursor) = self.delta_read_raw(item)?;
         let m = self.mirror_state()?;
-        m.store.ingest(tid, blocks, cursor)?;
+        m.store.reseed(tid, blocks, cursor)?;
         m.owed_reseed.insert(tid);
         Ok((tid, PollResult::Reseeded))
     }
@@ -604,27 +601,19 @@ impl GnitzClient {
     }
 
     /// Advance every view in `views`, one request per `DELTA_POLL_MAX_VIEWS`,
-    /// ingesting each view's blocks as that view's terminal arrives — so a poll
+    /// applying each view's blocks as that view's terminal arrives — so a poll
     /// over M views holds one train, not M. The cursor comes back
     /// unvalidated; the tag rule is [`MirrorState::advance_from`]'s.
     ///
-    /// A view that fails gets **that view's** own entry. Only a caller error (a
-    /// cursor with no round to poll after) and an interrupt end the call.
-    fn delta_poll_many(&mut self, views: &[(u64, DeltaCursor, Arc<Schema>)]) -> Result<ViewPollResults, ClientError> {
-        // Split, so the ingest writes to the mirror while the session drains:
+    /// A view that fails gets **that view's** own entry. Only an interrupt ends
+    /// the call.
+    fn delta_poll_many(&mut self, views: &[(DeltaCursor, DeltaPollItem)]) -> Result<ViewPollResults, ClientError> {
+        // Split, so the apply writes to the mirror while the session drains:
         // disjoint fields, so both borrows hold.
         let Self { session, mirror, park_hook, .. } = self;
         let Some(mirror) = mirror.as_deref_mut() else {
             return Err(no_mirror_store());
         };
-        // A cursor at round 0 names the bootstrap bound, which would read the
-        // whole view in the wrong shape: the caller's bug, raised before
-        // anything is encoded.
-        let afters = views
-            .iter()
-            .map(|(_, prev, _)| prev.poll_after())
-            .collect::<Result<Vec<_>, _>>()?;
-
         let mut applied = Vec::with_capacity(views.len());
         // Per open request, the positions it has yet to answer. They are filled
         // in order — the session refuses a terminal naming any other view — so
@@ -633,15 +622,7 @@ impl GnitzClient {
         let mut open: Vec<(SlotId, Range<usize>)> = Vec::new();
         for (chunk_at, chunk) in views.chunks(DELTA_POLL_MAX_VIEWS).enumerate() {
             let start = chunk_at * DELTA_POLL_MAX_VIEWS;
-            let batch: Vec<DeltaPollItem> = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, (tid, _, schema))| DeltaPollItem {
-                    view_id: *tid,
-                    after_tick: afters[start + i],
-                    reply_layout: schema.layout_digest(),
-                })
-                .collect();
+            let batch: Vec<DeltaPollItem> = chunk.iter().map(|&(_, item)| item).collect();
             let range = start..start + chunk.len();
             match session.submit_delta_poll(&batch) {
                 Ok(slot) => open.push((slot, range)),
@@ -660,7 +641,7 @@ impl GnitzClient {
                     };
                     let i = range.start;
                     range.start += 1;
-                    let (tid, prev, _) = views[i];
+                    let (prev, DeltaPollItem { view_id: tid, .. }) = views[i];
                     applied.push((tid, mirror.advance_from(tid, prev, result)));
                 };
                 session.step_polling(ready, Some(&mut sink))
@@ -705,14 +686,13 @@ impl GnitzClient {
         self.refuse_poisoned_mirror()?;
 
         // ── Phase 1: advance, in one round trip ────────────────────────────
-        // A cursor at tick 0 names no round to poll after, so it is phase 2's.
-        let mut requests: Vec<(u64, DeltaCursor, Arc<Schema>)> = Vec::new();
+        let mut requests: Vec<(DeltaCursor, DeltaPollItem)> = Vec::new();
         let mut recoveries: Vec<(u64, Option<ClientError>)> = Vec::new();
         {
             let m = self.mirror_state()?;
             for (&tid, v) in m.views.iter() {
-                match m.store.cursor_of(tid).filter(|c| c.poll_after().is_ok()) {
-                    Some(prev) => requests.push((tid, prev, Arc::clone(&v.delta_reply))),
+                match m.store.cursor_of(tid) {
+                    Some(prev) => requests.push((prev, v.poll_item(prev.tick.get()))),
                     None => recoveries.push((tid, None)),
                 }
             }
@@ -720,7 +700,7 @@ impl GnitzClient {
 
         let applied = self.delta_poll_many(&requests)?;
 
-        // ── Phase 2: recover, strictly after every phase-1 ingest ──────────
+        // ── Phase 2: recover, strictly after every phase-1 apply ───────────
         let mut out: Vec<PollOutcome> = Vec::with_capacity(applied.len() + recoveries.len());
         for (tid, r) in applied {
             match r {

@@ -253,7 +253,7 @@ pub fn decode_client_frame(
     known: impl FnOnce(&[u8]) -> Result<Option<SchemaDescriptor>, String>,
 ) -> Result<DecodedWire, String> {
     decode_frame(data, control, recordless, known, |b, s| {
-        Batch::decode_foreign_wal_block(b, s, s)
+        Batch::decode_foreign_wal_block(b, s)
     })
 }
 

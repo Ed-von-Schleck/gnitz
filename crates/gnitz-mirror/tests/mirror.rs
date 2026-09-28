@@ -191,10 +191,9 @@ impl Fixture {
 
 /// The schema every test shares.
 ///
-/// `v_keyed` has a **two-column PK** on purpose: a single-column `BIGINT` PK
-/// makes a wrong PK stride look right, so the round-stamp strip would go
-/// untested at exactly the point it can be silently wrong. `v_repl` is
-/// replicated, which routes its feed to worker 0 alone rather than broadcasting.
+/// `v_keyed` has a **two-column PK**: a single-column `BIGINT` PK makes a wrong
+/// PK stride look right. `v_repl` is replicated, so its feed lives on worker 0
+/// alone.
 fn seed(client: &mut GnitzClient) {
     client.create_schema("s").unwrap();
     sql(
@@ -282,15 +281,9 @@ fn a_mirrored_read_equals_the_server_read() {
     assert!(compared > 300, "the differential compared only {compared} rows");
 }
 
-/// The poll arm, across rounds that touch the same keys.
-///
-/// Three distinct bugs in the round-stamp strip hide from a weaker test: a
-/// single-column `BIGINT` PK makes a wrong stride look right, a bootstrap-only
-/// test never runs the poll arm at all, and a poll that covers one round at a
-/// time never exposes an inherited `Consolidated` layout claim — a single
-/// round's capture really is sorted and distinct, so the claim would be true. So
-/// this polls only after several ticks have accumulated, over a compound-PK view
-/// whose keys are hit again in every batch.
+/// The poll arm over a compound-PK view, polled only after several rounds that
+/// hit the same keys: one round's reply is sorted and distinct, a multi-round
+/// reply is neither.
 #[test]
 fn a_multi_round_poll_over_repeated_keys_stays_weight_exact() {
     let _g = serial();
@@ -302,9 +295,7 @@ fn a_multi_round_poll_over_repeated_keys_stays_weight_exact() {
     fx.differential("s", "SELECT * FROM v_keyed");
 
     for round in 0..3 {
-        // Three ticks per poll, all hitting keys the copy already holds: the
-        // strip must leave the batch claiming a raw layout, so the ingest's own
-        // sort-and-fold sums the repeats onto the right element.
+        // Three ticks per poll, all hitting keys the copy already holds.
         for step in 0..3 {
             let lo = 1 + round * 20;
             sql(
@@ -1201,9 +1192,8 @@ const SHAPE_VIEWS: &[(&str, &str, &str)] = &[
 /// Every store shape a view body produces, mirrored in one handle.
 ///
 /// Each puts a hidden synthetic key (`_join_pk`, `_group_pk`, `_set_pk`) or a
-/// nullable payload through local registration, `pk_stride`, the round-stamp
-/// strip and the null bitmap — the four places a wrong shape is silently wrong
-/// rather than an error.
+/// nullable payload through local registration, `pk_stride` and the null
+/// bitmap, where a wrong shape is silently wrong rather than an error.
 #[test]
 fn every_view_body_shape_mirrors() {
     let _g = serial();

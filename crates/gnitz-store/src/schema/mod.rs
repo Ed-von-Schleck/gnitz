@@ -882,43 +882,19 @@ pub(crate) const DELTA_TICK_COL: SchemaColumn = SchemaColumn::new(TypeCode::U64,
 const _: () = assert!(DELTA_TICK_COL.size() as usize == 8);
 
 /// The delta store's schema for a fed view: a `_tick` U64 key column, then the
-/// view's PK columns in PK-list order, then the view's payload columns in schema
-/// order. Derived rather than persisted, exactly as [`make_index_schema`] is —
-/// the delta store is registered and recovered the way a secondary index is.
+/// view's PK, then its payload, so the view's payload space is the delta's.
+/// Derived rather than persisted, as [`make_index_schema`] is. `None` for a view
+/// with no column to spare for the stamp.
 ///
-/// The order itself is `gnitz_wire::delta_schema_order`, which the client's
-/// `delta_reply_schema` applies to build the reply schema it ships; the two sides
-/// therefore cannot permute differently.
-///
-/// A `SchemaDescriptor` holds types, nullability and a PK-index list and **no
-/// column names at all**, so `_tick` is a position, not an identifier: there is
-/// nothing for a user column name to collide with.
-///
-/// This is a **reordering** of the view's columns, not a shift of them, and that
-/// is what lets a stamp copy the payload regions verbatim: the set of columns
-/// excluded from the payload space is the same set plus `_tick`, which is not one
-/// of them, so the *k*-th payload column of the view is the *k*-th payload column
-/// of the delta — null bitmap included, which indexes by payload position.
-///
-/// `None` — never an abort — for the one limit that binds: a view already at
-/// `MAX_COLUMNS` cannot carry a feed, because the stamp is one more column.
-/// Neither PK limit can, which the assertion below holds to rather than leaving
-/// to prose.
-///
-/// Stamped [`Placement::Local`] — "rows live on whichever worker produced them
-/// and are not keyed by `worker_for_pk` at all", which is what these rows are.
-/// Nothing routes by it (a delta read is routed off the *view's* schema), so this
-/// is not a second line of defence; it is what keeps a future router from being
-/// told something false.
-pub fn make_delta_schema(view: &SchemaDescriptor) -> Option<SchemaDescriptor> {
-    use gnitz_wire::DeltaCol;
+/// [`Placement::Local`]: each row lives on the worker that produced it.
+pub(crate) fn make_delta_schema(view: &SchemaDescriptor) -> Option<SchemaDescriptor> {
     let mut b = DerivedSchema::new();
-    for c in gnitz_wire::delta_schema_order(view.pk_indices(), view.num_columns()) {
-        match c {
-            DeltaCol::Tick => b.push_pk(DELTA_TICK_COL).ok()?,
-            DeltaCol::Key(i) => b.push_pk(view.columns[i]).ok()?,
-            DeltaCol::Payload(i) => b.push(view.columns[i]).ok()?,
-        }
+    b.push_pk(DELTA_TICK_COL).ok()?;
+    for &i in view.pk_indices() {
+        b.push_pk(view.columns[i as usize]).ok()?;
+    }
+    for (_, col) in view.payload_columns() {
+        b.push(*col).ok()?;
     }
     Some(b.finish().with_placement(Placement::Local))
 }

@@ -36,9 +36,10 @@ const TAG: u64 = 0xFEED;
 enum Ev {
     Register(u64, String),
     Invalidate(u64, Invalidate),
-    /// `(tid, whether the copy already held a cursor, the round it moved to)` —
-    /// the cursor being what the live store derives the blocks' shape from.
-    Ingest(u64, bool, u64),
+    /// `(tid, the round the copy was filled at)`.
+    Reseed(u64, u64),
+    /// `(tid, the round the copy moved to)`.
+    Advance(u64, u64),
 }
 
 #[derive(Clone, Default)]
@@ -96,10 +97,25 @@ impl MirrorStore for StubStore {
         Ok(())
     }
 
-    fn ingest(&mut self, tid: u64, _b: Vec<RawBlock>, next: DeltaCursor) -> Result<(), MirrorError> {
-        // The live store's derivation, over this stub's own cursor map.
-        self.log
-            .push(Ev::Ingest(tid, self.cursors.contains_key(&tid), next.tick));
+    /// The live store's cursor rules.
+    fn reseed(&mut self, tid: u64, _b: Vec<RawBlock>, cursor: DeltaCursor) -> Result<(), MirrorError> {
+        if self.cursors.contains_key(&tid) {
+            return Err(MirrorError::Engine(format!(
+                "stub: reseed of {tid}, which holds a cursor"
+            )));
+        }
+        self.log.push(Ev::Reseed(tid, cursor.tick.get()));
+        self.cursors.insert(tid, cursor);
+        Ok(())
+    }
+
+    fn advance(&mut self, tid: u64, _b: Vec<RawBlock>, next: DeltaCursor) -> Result<(), MirrorError> {
+        if !self.cursors.contains_key(&tid) {
+            return Err(MirrorError::Engine(format!(
+                "stub: advance of {tid}, which holds no cursor"
+            )));
+        }
+        self.log.push(Ev::Advance(tid, next.tick.get()));
         self.cursors.insert(tid, next);
         Ok(())
     }
@@ -258,7 +274,7 @@ fn fixture_priming(views: &[(u64, &str, u64)], prime: impl FnOnce(&mut Session))
     };
     for &(tid, name, tick) in views {
         store.names.insert(tid, format!("s.{name}"));
-        if tick != 0 {
+        if let Some(tick) = std::num::NonZeroU64::new(tick) {
             store.cursors.insert(tid, DeltaCursor { tag: TAG, tick });
         }
     }
@@ -277,7 +293,6 @@ fn fixture_priming(views: &[(u64, &str, u64)], prime: impl FnOnce(&mut Session))
                 schema: Arc::clone(&schema),
                 indexes: Vec::new(),
             }),
-            delta_reply: Arc::new(delta_reply_schema(&schema).unwrap()),
         };
         client.mirror.as_deref_mut().unwrap().views.insert(tid, entry);
     }
@@ -325,7 +340,7 @@ fn one_poll_writes_one_request_naming_every_view() {
 
     assert_eq!(report.len(), M, "one entry per view");
     assert!(report.iter().all(|o| matches!(o.result, PollResult::Advanced)));
-    assert!(report.iter().all(|o| o.cursor.is_some_and(|c| c.tick == 9)));
+    assert!(report.iter().all(|o| o.cursor.is_some_and(|c| c.tick.get() == 9)));
 }
 
 /// A refusal naming a vanished relation pays exactly one probe; every other
@@ -408,7 +423,7 @@ fn a_leftover_slot_does_not_shift_the_replies() {
 
     let mut ticks: Vec<(u64, u64)> = report
         .iter()
-        .map(|o| (o.view_id, o.cursor.expect("a round").tick))
+        .map(|o| (o.view_id, o.cursor.expect("a round").tick.get()))
         .collect();
     ticks.sort_unstable();
     assert_eq!(
@@ -455,7 +470,7 @@ fn no_recovery_runs_before_every_ingest_has() {
     let events = log.take();
     let first_ingest = events
         .iter()
-        .position(|e| matches!(e, Ev::Ingest(t, true, 11) if *t == alive))
+        .position(|e| matches!(e, Ev::Advance(t, 11) if *t == alive))
         .expect("phase 1 ingested the reply it had");
     let first_teardown = events.iter().position(|e| matches!(e, Ev::Invalidate(..)));
     assert!(
@@ -508,11 +523,11 @@ fn a_reseed_onto_a_live_copy_does_not_erase_it() {
         "the live copy must not be erased: {events:?}",
     );
     assert!(
-        !events.iter().any(|e| matches!(e, Ev::Ingest(8, false, _))),
+        !events.iter().any(|e| matches!(e, Ev::Reseed(8, _))),
         "and must not be re-read whole: {events:?}",
     );
     assert!(
-        matches!(report.as_slice(), [o] if o.view_id == 8 && o.cursor.is_some_and(|c| c.tick == 12)),
+        matches!(report.as_slice(), [o] if o.view_id == 8 && o.cursor.is_some_and(|c| c.tick.get() == 12)),
         "one entry, at the id the view ended up under: {report:?}",
     );
     assert!(!client.mirrored_ids().contains(&7), "the retired registration is gone");
@@ -538,7 +553,10 @@ fn a_misdirected_view_reply_is_refused_rather_than_ingested() {
         report.iter().all(|o| matches!(o.result, PollResult::Failed(_))),
         "no view may be advanced off a misdirected reply: {report:?}",
     );
-    assert!(!log.saw(|e| matches!(e, Ev::Ingest(..))), "and nothing may be ingested",);
+    assert!(
+        !log.saw(|e| matches!(e, Ev::Reseed(..) | Ev::Advance(..))),
+        "and nothing may be applied",
+    );
 }
 
 /// A batch that answers fewer views than it named fails the rest rather than
@@ -560,7 +578,7 @@ fn a_short_batch_reply_fails_the_views_it_never_answered() {
 
     let answered = report.iter().find(|o| o.view_id == ids[0]).expect("an entry");
     assert!(
-        matches!(answered.result, PollResult::Advanced) && answered.cursor.is_some_and(|c| c.tick == 11),
+        matches!(answered.result, PollResult::Advanced) && answered.cursor.is_some_and(|c| c.tick.get() == 11),
         "the view that was answered keeps its round: {report:?}",
     );
     let missing = report.iter().find(|o| o.view_id == ids[1]).expect("an entry");
@@ -569,7 +587,7 @@ fn a_short_batch_reply_fails_the_views_it_never_answered() {
         "the view that was not answered fails: {report:?}",
     );
     assert!(
-        !log.saw(|e| matches!(e, Ev::Ingest(t, _, _) if *t == ids[1])),
+        !log.saw(|e| matches!(e, Ev::Reseed(t, _) | Ev::Advance(t, _) if *t == ids[1])),
         "and nothing is ingested under it",
     );
 }
@@ -588,7 +606,7 @@ fn each_view_is_ingested_before_the_next_one_is_answered() {
         // Nothing else is on the wire, so an ingest seen before the second
         // terminal goes out ran off the first position's.
         let deadline = std::time::Instant::now() + PATIENCE;
-        while !watched.saw(|e| matches!(e, Ev::Ingest(t, _, _) if *t == ids[0])) {
+        while !watched.saw(|e| matches!(e, Ev::Reseed(t, _) | Ev::Advance(t, _) if *t == ids[0])) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the first view's blocks must reach the store before the second view is answered",

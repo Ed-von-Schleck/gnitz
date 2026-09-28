@@ -23,15 +23,9 @@ SETOP = "SELECT id FROM t EXCEPT SELECT tid FROM u"
 
 
 def _key(row):
-    """A row as a name-keyed tuple, so a view row and a delta row compare
-    directly: the delta schema is a *reordering* of the view's columns (`_tick`,
-    then the PK, then the payload), not the view's own order.
-
-    The stamp column drops out — it is which round carried the row, not part of
-    it. No view column can collide with the name: a user identifier may not start
-    with `_`.
-    """
-    return tuple(sorted((f, v) for f, v in row._asdict().items() if f != "_tick"))
+    """A row as a name-keyed tuple, so rows compare by column name rather than
+    by position."""
+    return tuple(sorted(row._asdict().items()))
 
 
 def _zset(rows):
@@ -98,9 +92,7 @@ _WIDE = "x" * 200
 
 def _flood(client, sn, lo_key, rows, chunk=500):
     """Push `rows` wide rows into `t` starting at `lo_key`, in `chunk`-sized
-    statements. Each statement is its own settle, so each is its own tick round —
-    which is what gives the delta store a stream of distinct `_tick` values to
-    stratify by."""
+    statements. Each statement is its own settle, so each is its own tick round."""
     for lo in range(lo_key, lo_key + rows, chunk):
         hi = min(lo + chunk - 1, lo_key + rows - 1)
         client.execute_sql(

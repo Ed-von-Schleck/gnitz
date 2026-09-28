@@ -6,9 +6,9 @@ use std::collections::HashMap;
 use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RawBlock, Schema, ZSetBatch};
 use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
-use gnitz_foundation::gnitz_debug;
+use gnitz_foundation::{gnitz_debug, gnitz_error};
 use gnitz_store::relation::{lock_data_dir, DirLock, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
-use gnitz_store::storage::{Slot, StoreError};
+use gnitz_store::storage::{Batch, Slot, StoreError};
 use gnitz_wire::ViewProps;
 
 use crate::record::MirrorRecord;
@@ -31,7 +31,7 @@ static CHECKPOINT_ERROR: Seam = Seam::new("GNITZ_INJECT_MIRROR_CHECKPOINT_ERROR"
 /// after the cursor is dropped and the copy erased. Debug-only.
 static BOOTSTRAP_ERROR: Seam = Seam::new("GNITZ_INJECT_MIRROR_BOOTSTRAP_ERROR");
 
-/// `GNITZ_INJECT_MIRROR_INGEST_PANIC`: panic once on a poll's apply, idle polls
+/// `GNITZ_INJECT_MIRROR_INGEST_PANIC`: panic once on an advance, idle polls
 /// included. A panic rather than an `Err`: nothing else reaches
 /// [`Mirror::touching`]'s guard arm.
 static INGEST_PANIC: Seam = Seam::new("GNITZ_INJECT_MIRROR_INGEST_PANIC");
@@ -114,17 +114,61 @@ impl Mirror {
         Ok(())
     }
 
-    // -- Poison ------------------------------------------------------------
-
-    /// Erase `tid`'s copy and report why. Leaves it registered, empty and
-    /// cursorless, so the next poll bootstraps it. A failed erase poisons, in
-    /// [`Self::invalidate_inner`].
-    pub(crate) fn erase_copy(&mut self, tid: u64, why: String) -> MirrorError {
-        match self.invalidate_inner(tid, Invalidate::Copy) {
-            Ok(()) => MirrorError::Engine(why),
-            Err(e) => e,
-        }
+    /// `tid`'s open copy.
+    fn copy(&self, tid: u64) -> &gnitz_store::relation::Relation {
+        self.registry
+            .relation(tid as i64)
+            .expect("a mirrored relation's copy is registered unless the store is poisoned")
     }
+
+    // -- Apply -------------------------------------------------------------
+
+    /// Apply `blocks`, set the cursor to `next`, then checkpoint if due. A failed
+    /// apply erases the copy; a failed auto-checkpoint is logged, and the next
+    /// one retries.
+    fn apply(&mut self, tid: u64, blocks: Vec<RawBlock>, next: DeltaCursor) -> Result<(), MirrorError> {
+        let schema = self.copy(tid).schema();
+        for raw in blocks {
+            self.applied_bytes += raw.block().len();
+            let applied = Batch::decode_foreign_wal_block(raw.block(), &schema)
+                .map_err(|e| format!("decoding a delta for {tid}: {e}"))
+                .and_then(|b| {
+                    self.registry
+                        .ingest(tid as i64, b)
+                        .map_err(|e| format!("applying a delta to {tid}: {e}"))
+                });
+            if let Err(why) = applied {
+                self.erase(tid)?;
+                return Err(MirrorError::Engine(why));
+            }
+        }
+        self.records.get_mut(&tid).expect("checked by the caller").cursor = Some(next);
+        if self.applied_bytes >= self.checkpoint_bytes {
+            if let Err(e) = self.checkpoint_inner() {
+                gnitz_error!(
+                    "mirror: auto-checkpoint failed: {} — the copies stand; the next checkpoint retries",
+                    e
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop `tid`'s cursor and rows, leaving it registered and empty. A failed
+    /// erase poisons: the registry may then hold no relation for the record.
+    fn erase(&mut self, tid: u64) -> Result<(), MirrorError> {
+        let Some(rec) = self.records.get_mut(&tid) else {
+            return Ok(());
+        };
+        rec.cursor = None;
+        let spec = copy_spec(tid, &rec.block)?;
+        self.registry
+            .unregister_and_erase(tid as i64)
+            .and_then(|()| self.registry.register(spec))
+            .map_err(|e| self.poison(format!("erasing the copy of {tid} failed: {e}")))
+    }
+
+    // -- Poison ------------------------------------------------------------
 
     /// Poison the store and report why.
     ///
@@ -190,11 +234,7 @@ impl Mirror {
         match level {
             Invalidate::Cursor => Ok(()),
             Invalidate::Copy => {
-                let spec = copy_spec(tid, &rec.block)?;
-                self.registry
-                    .unregister_and_erase(tid as i64)
-                    .and_then(|()| self.registry.register(spec))
-                    .map_err(|e| self.poison(format!("erasing the copy of {tid} failed: {e}")))?;
+                self.erase(tid)?;
                 if BOOTSTRAP_ERROR.take_once() {
                     return Err(MirrorError::Engine("injected bootstrap failure".to_string()));
                 }
@@ -234,36 +274,31 @@ impl MirrorStore for Mirror {
         self.touching("invalidating a copy", |m| m.invalidate_inner(tid, level))
     }
 
-    /// Apply, then advance the cursor, then maybe checkpoint. A checkpoint writes
-    /// the live records, so checkpointing first would record `prev` beside copies
-    /// that already absorbed through `next`, and the reopen would re-apply that
-    /// interval.
-    ///
-    /// Neither failure poisons: an apply failure erases that copy, and an
-    /// auto-checkpoint failure leaves the cursor advanced and the store usable.
-    fn ingest(&mut self, tid: u64, blocks: Vec<RawBlock>, next: DeltaCursor) -> Result<(), MirrorError> {
-        self.touching("applying a delta", |m| {
+    fn reseed(&mut self, tid: u64, blocks: Vec<RawBlock>, cursor: DeltaCursor) -> Result<(), MirrorError> {
+        self.touching("reseeding a copy", |m| {
             let Some(rec) = m.records.get(&tid) else {
                 return Err(MirrorError::Engine(format!("relation {tid} is not mirrored")));
             };
-            let stamped = rec.cursor.is_some();
-            if stamped && INGEST_PANIC.take_once() {
+            if rec.cursor.is_some() || m.copy(tid).cursor().valid {
+                return Err(MirrorError::Engine(format!(
+                    "relation {tid}'s copy is not erased; a whole value lands only on an empty copy"
+                )));
+            }
+            m.apply(tid, blocks, cursor)
+        })
+    }
+
+    fn advance(&mut self, tid: u64, blocks: Vec<RawBlock>, next: DeltaCursor) -> Result<(), MirrorError> {
+        self.touching("advancing a copy", |m| {
+            if m.cursor_of(tid).is_none() {
+                return Err(MirrorError::Engine(format!(
+                    "relation {tid}'s copy holds no cursor for deltas to continue"
+                )));
+            }
+            if INGEST_PANIC.take_once() {
                 panic!("injected mirror ingest panic");
             }
-            if !blocks.is_empty() {
-                let desc = m
-                    .registry
-                    .relation(tid as i64)
-                    .ok_or_else(|| MirrorError::Engine(format!("relation {tid} has no open copy")))?
-                    .schema();
-                let applied = m.ingest_blocks(tid, blocks, stamped, desc)?;
-                m.applied_bytes += applied;
-            }
-            m.records.get_mut(&tid).expect("resolved above").cursor = Some(next);
-            if m.applied_bytes >= m.checkpoint_bytes {
-                m.checkpoint_inner()?;
-            }
-            Ok(())
+            m.apply(tid, blocks, next)
         })
     }
 

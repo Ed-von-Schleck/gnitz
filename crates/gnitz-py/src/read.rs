@@ -408,6 +408,12 @@ impl PyDeltaReply {
     /// A delta read's rows and the cursor it returned.
     pub(crate) fn new(py: Python<'_>, reply: ScanReply, cursor: gnitz_core::DeltaCursor) -> PyResult<Py<PyDeltaReply>> {
         let rows = scan_result(py, reply)?;
-        Py::new(py, PyDeltaReply { rows, cursor: (cursor.tag, cursor.tick) })
+        Py::new(
+            py,
+            PyDeltaReply {
+                rows,
+                cursor: (cursor.tag, cursor.tick.get()),
+            },
+        )
     }
 }

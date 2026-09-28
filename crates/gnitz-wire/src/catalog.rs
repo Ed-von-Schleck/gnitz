@@ -447,37 +447,6 @@ pub fn qualified_key(schema_name: &str, name: &str) -> String {
     q
 }
 
-/// One column of a view's delta-feed reply schema. The variant carries the
-/// key/payload split, so neither side re-derives it from a position.
-pub enum DeltaCol {
-    /// The synthesized `_tick` U64 stamp — a key column, and the first.
-    Tick,
-    /// The view's column at this index, as a key column.
-    Key(usize),
-    /// The view's column at this index, as payload.
-    Payload(usize),
-}
-
-/// The columns of a view's delta-feed reply schema in output order: the `_tick`
-/// stamp, then the view's PK columns in PK order, then its payload columns in
-/// schema order.
-///
-/// The permutation needs no type, name or nullability — only `(pk_indices,
-/// num_columns)` — so it is stated once here and applied by the client (building
-/// a `Schema`) and the engine (building a `SchemaDescriptor`) alike, each keeping
-/// its own overflow behaviour.
-pub fn delta_schema_order(pk_indices: &[u32], num_columns: usize) -> Vec<DeltaCol> {
-    let mut out = Vec::with_capacity(num_columns + 1);
-    out.push(DeltaCol::Tick);
-    out.extend(pk_indices.iter().map(|&i| DeltaCol::Key(i as usize)));
-    out.extend(
-        (0..num_columns)
-            .filter(|&ci| payload_slot(pk_indices, ci).is_some())
-            .map(DeltaCol::Payload),
-    );
-    out
-}
-
 // ---------------------------------------------------------------------------
 // Schema sizing caps
 // ---------------------------------------------------------------------------
