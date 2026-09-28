@@ -1,8 +1,6 @@
-//! The TLS listener from argv to bound socket: the `--tls-*` flags, the rustls
-//! `ServerConfig`, and the TCP bind.
+//! The `--tls-*` flags and the rustls `ServerConfig` they resolve to.
 
-use std::net::{SocketAddr, TcpListener};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use gnitz_wire::ALPN_GNITZ;
@@ -19,13 +17,12 @@ pub(crate) struct TlsArgs {
     pub allow_unauthenticated: bool,
 }
 
-/// A TLS listener the flags asked for and the rustls config it serves, not yet
-/// bound.
+/// What `--tls-*` resolved to: the address to bind, the rustls config its
+/// connections are served under, and a minted dev certificate's public PEM.
 pub(crate) struct TlsConfig {
-    listen: SocketAddr,
-    cfg: Arc<rustls::ServerConfig>,
-    /// The minted dev certificate's public PEM, published at bind.
-    dev_pem: Option<String>,
+    pub(crate) listen: SocketAddr,
+    pub(crate) cfg: Arc<rustls::ServerConfig>,
+    pub(crate) dev_pem: Option<String>,
 }
 
 impl TlsArgs {
@@ -34,7 +31,10 @@ impl TlsArgs {
     pub(crate) fn resolve(self) -> Result<Option<TlsConfig>, String> {
         let Some(listen) = self.listen else {
             if self.cert.is_some() || self.key.is_some() || self.client_ca.is_some() || self.allow_unauthenticated {
-                return Err("--tls-* flags require --tls-listen".to_string());
+                return Err(
+                    "--tls-cert, --tls-key, --tls-client-ca and --allow-unauthenticated require --tls-listen"
+                        .to_string(),
+                );
             }
             return Ok(None);
         };
@@ -53,53 +53,11 @@ impl TlsArgs {
             gnitz_warn!(
                 "TLS listener on NON-LOOPBACK address {listen} with --allow-unauthenticated and NO client \
                  authentication: anyone who can reach this port gets full DDL/DML/scan access. Prefer \
-                 --tls-client-ca=PEM (required mTLS). Note: even a loopback bind trusts every local UID.",
+                 --tls-client-ca=PEM (required mTLS).",
             );
         }
         let (cfg, dev_pem) = server_crypto(cert_key, self.client_ca.as_deref())?;
         Ok(Some(TlsConfig { listen, cfg, dev_pem }))
-    }
-}
-
-impl TlsConfig {
-    /// Bind the TCP listener and publish its address to `<data_dir>/tls_endpoint`,
-    /// and a minted dev certificate's public PEM to `<data_dir>/tls_dev_cert.pem`.
-    pub(crate) fn bind(self, data_dir: &str) -> Result<(OwnedFd, Arc<rustls::ServerConfig>), String> {
-        use gnitz_foundation::posix_io::set_sockopt_int;
-
-        let listener =
-            TcpListener::bind(self.listen).map_err(|e| format!("failed to bind TLS listener {}: {e}", self.listen))?;
-        let fd = listener.as_raw_fd();
-        // Both are inherited by every accepted socket. Keepalive lets the kernel
-        // reap a half-open peer that would otherwise park its recv forever.
-        set_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
-        set_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
-        // A negative backlog re-listens at `net.core.somaxconn`.
-        if unsafe { libc::listen(fd, -1) } < 0 {
-            return Err(format!(
-                "failed to widen the TLS listener backlog: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        listener
-            .set_nonblocking(true)
-            .map_err(|e| format!("failed to set the TLS listener non-blocking: {e}"))?;
-        // Not `self.listen`, whose port may be 0.
-        let bound = listener
-            .local_addr()
-            .map_err(|e| format!("failed to read the bound TLS address: {e}"))?;
-        if let Some(pem) = self.dev_pem {
-            let path = format!("{data_dir}/tls_dev_cert.pem");
-            std::fs::write(&path, pem.as_bytes()).map_err(|e| format!("failed to publish {path}: {e}"))?;
-            gnitz_info!(
-                "TLS: minted a self-signed dev certificate (identity is ephemeral, regenerated every boot); \
-                 public PEM at {path}"
-            );
-        }
-        std::fs::write(format!("{data_dir}/tls_endpoint"), format!("{bound}\n"))
-            .map_err(|e| format!("failed to publish {data_dir}/tls_endpoint: {e}"))?;
-        gnitz_info!("Listening on tls://{}", bound);
-        Ok((OwnedFd::from(listener), self.cfg))
     }
 }
 
@@ -134,12 +92,13 @@ pub(super) fn server_crypto(
     let builder = rustls::ServerConfig::builder();
     let auth = match client_ca {
         Some(path) => {
+            let cas = CertificateDer::pem_file_iter(path)
+                .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+                .map_err(|e| format!("tls client-ca {path:?}: {e}"))?;
             let mut roots = rustls::RootCertStore::empty();
-            roots.add_parsable_certificates(
-                CertificateDer::pem_file_iter(path)
-                    .map_err(|e| format!("tls client-ca {path:?}: {e}"))?
-                    .filter_map(Result::ok),
-            );
+            for ca in cas {
+                roots.add(ca).map_err(|e| format!("tls client-ca {path:?}: {e}"))?;
+            }
             let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
                 .build()
                 .map_err(|e| format!("tls client-ca {path:?}: verifier build failed: {e}"))?;

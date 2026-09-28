@@ -13,7 +13,6 @@
 mod ddl;
 
 use std::cell::{Cell, RefCell};
-use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -26,6 +25,7 @@ use self::ddl::{commit_serial_range_durable, handle_ddl_txn, hold_relay_for_ddl,
 use super::TxnFamily;
 use crate::catalog::CatalogEngine;
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
+use crate::runtime::listen::ClientListener;
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{forward_scan, MasterDispatcher, RelayPrepared, WORKER_WATCH};
 use crate::runtime::peer::Peer;
@@ -338,15 +338,7 @@ impl Shared {
 pub struct ServerExecutor;
 
 impl ServerExecutor {
-    /// `tls` is the optional TLS listener from `server_main`: the bound TCP
-    /// listen fd and its rustls configuration.
-    pub fn run(
-        dispatcher: Rc<MasterDispatcher>,
-        data_dir: &str,
-        unix_fd: OwnedFd,
-        tls: Option<(OwnedFd, std::sync::Arc<rustls::ServerConfig>)>,
-        lsn_seed: u64,
-    ) -> i32 {
+    pub fn run(dispatcher: Rc<MasterDispatcher>, data_dir: &str, listeners: Vec<ClientListener>, lsn_seed: u64) -> i32 {
         let reactor = Rc::clone(dispatcher.reactor());
 
         // Every zone LSN this boot allocates exceeds `lsn_seed`; the boot
@@ -381,9 +373,8 @@ impl ServerExecutor {
         install_shutdown_signal_handlers();
 
         reactor.spawn(committer::run(committer_rx, Rc::clone(&shared)));
-        reactor.spawn(accept_loop(Rc::clone(&shared), unix_fd, None));
-        if let Some((fd, cfg)) = tls {
-            reactor.spawn(accept_loop(Rc::clone(&shared), fd, Some(cfg)));
+        for listener in listeners {
+            reactor.spawn(accept_loop(Rc::clone(&shared), listener));
         }
         reactor.spawn(tick_loop(Rc::clone(&shared), tick_rx));
         reactor.spawn(watchdog(Rc::clone(&shared)));
@@ -403,9 +394,10 @@ impl ServerExecutor {
 // Accept loop
 // ---------------------------------------------------------------------------
 
-async fn accept_loop(shared: Rc<Shared>, listen_fd: OwnedFd, tls: Option<std::sync::Arc<rustls::ServerConfig>>) {
+async fn accept_loop(shared: Rc<Shared>, listener: ClientListener) {
+    let ClientListener { fd, tls } = listener;
     let reactor = Rc::clone(shared.disp().reactor());
-    let mut accepted = reactor.attach_listener(listen_fd);
+    let mut accepted = reactor.attach_listener(fd);
     loop {
         let Some(conn) = reactor.client_conn(accepted.recv().await) else {
             continue;

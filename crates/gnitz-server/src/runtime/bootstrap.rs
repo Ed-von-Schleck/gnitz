@@ -7,7 +7,7 @@
 //! point rebuilds a view rather than silently resuming a stale one.
 
 use std::ops::Range;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, UnreplayedCatalog};
@@ -16,11 +16,12 @@ use gnitz_foundation::posix_io;
 
 use crate::runtime::affinity;
 use crate::runtime::executor::ServerExecutor;
+use crate::runtime::listen;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::reactor::{AckLease, Limits, Reactor};
 use crate::runtime::sal::zone::CommittedTail;
 use crate::runtime::sal::{sal_mmap_size, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
-use crate::runtime::tls::TlsConfig;
+use crate::runtime::tls::TlsArgs;
 use crate::runtime::w2m::{self, SalWake, W2mReceiver, W2mWriter, BOOT_READY_REQUEST_ID};
 use crate::runtime::wire as ipc;
 use crate::runtime::worker::WorkerProcess;
@@ -253,7 +254,7 @@ fn worker_boot_recovery(
 /// enters the executor event loop.
 ///
 /// Returns 0 on clean exit, non-zero on error.
-pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<TlsConfig>) -> i32 {
+pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, tls: TlsArgs) -> i32 {
     match run_server(data_dir, socket_path, num_workers, tls) {
         Ok(rc) => rc,
         Err(e) => {
@@ -489,7 +490,9 @@ async fn master_post_fork_recovery(
     Ok(())
 }
 
-fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<TlsConfig>) -> Result<i32, String> {
+fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: TlsArgs) -> Result<i32, String> {
+    let tls = tls.resolve()?;
+
     // Child directories + shard files.
     posix_io::raise_fd_limit(65536);
 
@@ -501,6 +504,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
 
     let mut opened =
         CatalogEngine::open_master(data_dir, num_workers).map_err(|e| format!("failed to open catalog: {e}"))?;
+    listen::clear_published(data_dir)?;
 
     gnitz_note!("Starting {num_workers} workers");
     gnitz_note!("Worker logs: {}/worker_N.log (N=0..{})", data_dir, num_workers - 1);
@@ -554,43 +558,9 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
         swept_bases,
     ))?;
 
-    // Bound after the fork, so no worker inherits the fd, and before the AF_UNIX
-    // socket, so a boot that fails the TCP bind never exposed the AF_UNIX socket.
-    let tls = tls.map(|t| t.bind(data_dir)).transpose()?;
-    let unix_fd = bind_unix_socket(socket_path)?;
+    let listeners = listen::bind_listeners(data_dir, socket_path, tls)?;
     gnitz_note!("GnitzDB ready");
-
-    Ok(ServerExecutor::run(dispatcher, data_dir, unix_fd, tls, lsn_seed))
-}
-
-/// Bind the AF_UNIX listener at `path`, replacing only a stale socket: a
-/// regular file there, or a socket something answers on, refuses the boot.
-fn bind_unix_socket(path: &str) -> Result<OwnedFd, String> {
-    use std::os::unix::fs::FileTypeExt;
-    use std::os::unix::net::{UnixListener, UnixStream};
-
-    let listener = match UnixListener::bind(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            let is_socket = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket());
-            if !is_socket {
-                return Err(format!("{path} exists and is not a socket"));
-            }
-            if UnixStream::connect(path).is_ok() {
-                return Err(format!("{path} is served by a running server"));
-            }
-            // Left by a server that is gone.
-            std::fs::remove_file(path).map_err(|e| format!("failed to remove stale socket {path}: {e}"))?;
-            UnixListener::bind(path)
-        }
-        r => r,
-    }
-    .and_then(|l| {
-        l.set_nonblocking(true)?;
-        Ok(OwnedFd::from(l))
-    })
-    .map_err(|e| format!("failed to create server socket {path}: {e}"))?;
-    gnitz_info!("Listening on {}", path);
-    Ok(listener)
+    Ok(ServerExecutor::run(dispatcher, data_dir, listeners, lsn_seed))
 }
 
 #[cfg(test)]

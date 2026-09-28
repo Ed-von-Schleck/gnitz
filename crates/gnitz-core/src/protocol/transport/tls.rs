@@ -105,9 +105,11 @@ fn build_client_config(target: &Target) -> io::Result<Arc<ClientConfig>> {
     let roots = match &target.ca {
         None => RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
         Some(path) => {
+            let certs = CertificateDer::pem_file_iter(path)
+                .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+                .map_err(|e| bad_file(path, e))?;
             let mut roots = RootCertStore::empty();
-            let certs = CertificateDer::pem_file_iter(path).map_err(|e| bad_file(path, e))?;
-            roots.add_parsable_certificates(certs.filter_map(Result::ok));
+            roots.add_parsable_certificates(certs);
             if roots.is_empty() {
                 return Err(bad_file(path, "no usable certificates"));
             }

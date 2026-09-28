@@ -68,8 +68,8 @@ Options:
   --tls-client-ca=PEM  Enable REQUIRED mTLS: clients must present an X.509
                        certificate chaining to this CA (chain) to complete the
                        handshake. Use a DEDICATED client-auth CA — any leaf the
-                       CA signs authenticates (a leaf with no clientAuth EKU is
-                       still accepted). No CRL/OCSP: revoke by rotating the CA,
+                       CA signs authenticates (a leaf with no extended-key-usage
+                       extension authenticates too). No CRL/OCSP: revoke by rotating the CA,
                        which invalidates all clients at once.
   --allow-unauthenticated
                        Escape hatch: permit a non-loopback bind with NO client
@@ -180,15 +180,11 @@ fn main() {
         process::exit(1);
     });
     gnitz_foundation::log::init(args.level, b"M");
-    let tls = args.tls.resolve().unwrap_or_else(|e| {
-        eprintln!("Error: {e}");
-        process::exit(1);
-    });
     process::exit(runtime::server_main(
         &args.data_dir,
         &args.socket_path,
         args.workers,
-        tls,
+        args.tls,
     ));
 }
 

@@ -138,6 +138,23 @@ fn client_config_profile() {
 }
 
 #[test]
+fn ca_file_with_a_malformed_section_is_refused() {
+    let ca = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ca.pem");
+    std::fs::write(
+        &path,
+        format!(
+            "{}-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n",
+            ca.cert.pem()
+        ),
+    )
+    .unwrap();
+    let target = parse_target(&format!("127.0.0.1:1?ca={}", path.display())).unwrap();
+    assert!(build_client_config(&target).is_err());
+}
+
+#[test]
 fn loopback_frame_split_across_two_records() {
     let payload: Vec<u8> = (0u8..=255).cycle().take(3000).collect();
     let p = payload.clone();

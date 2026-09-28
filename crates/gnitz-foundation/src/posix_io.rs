@@ -1,6 +1,6 @@
-//! POSIX file-I/O and mmap wrappers. One rule no signature states on its own:
-//! every call here returns `io::Result`, so the errno is captured at the
-//! syscall and no caller has to read it back out of ambient state.
+//! POSIX file-I/O and mmap wrappers. A call whose failure a caller acts on
+//! returns `io::Result`, the errno captured at the syscall so no caller reads it
+//! back out of ambient state; a best-effort call returns `()`.
 
 use libc::c_int;
 

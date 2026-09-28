@@ -61,28 +61,15 @@ fn test_queue() -> RecvQueue {
     RecvQueue::new(Budget::new(usize::MAX))
 }
 
-/// Client-side: buffer `frames` (each as [len:u32 LE][payload]) as
-/// plaintext and return the resulting ciphertext. Writes are interleaved
-/// with `write_tls` flushes because rustls bounds its plaintext buffer
-/// (64 KiB default) — the same discipline the client transport uses.
+/// Client-side: buffer `frames` (each as [len:u32 LE][payload]) as plaintext and
+/// return the ciphertext.
 fn encrypt_frames(client: &mut rustls::ClientConnection, frames: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let write_plaintext = |client: &mut rustls::ClientConnection, mut data: &[u8], out: &mut Vec<u8>| {
-        while !data.is_empty() {
-            let n = client.writer().write(data).unwrap();
-            data = &data[n..];
-            if n == 0 || client.wants_write() {
-                while client.wants_write() {
-                    client.write_tls(out).unwrap();
-                }
-            }
-        }
-    };
+    client.set_buffer_limit(None);
     for f in frames {
-        let prefix = (f.len() as u32).to_le_bytes();
-        write_plaintext(client, &prefix, &mut out);
-        write_plaintext(client, f, &mut out);
+        client.writer().write_all(&(f.len() as u32).to_le_bytes()).unwrap();
+        client.writer().write_all(f).unwrap();
     }
+    let mut out = Vec::new();
     while client.wants_write() {
         client.write_tls(&mut out).unwrap();
     }

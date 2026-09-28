@@ -81,12 +81,7 @@ impl ServerHandle {
     /// [`Self::start_tls`] requiring mTLS against a freshly minted client CA,
     /// whose signed leaf [`Self::mtls_target`] presents.
     pub fn start_mtls(workers: usize) -> Self {
-        Self::start_mtls_with_env(workers, &[])
-    }
-
-    /// [`Self::start_mtls`] with extra server-side environment variables.
-    pub fn start_mtls_with_env(workers: usize, extra_env: &[(&str, &str)]) -> Self {
-        Self::start_inner(workers, extra_env, Some("127.0.0.1:0"), true)
+        Self::start_inner(workers, &[], Some("127.0.0.1:0"), true)
     }
 
     /// Spawn a server with a raw TLS argv: the ready handle, or the stderr tail
