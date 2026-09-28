@@ -26,7 +26,7 @@ pub fn op_reduce(
     let shape = &plan.shape;
     let output_schema = &shape.output_schema;
 
-    // Folded by the VM at this register's first reader.
+    // The VM folds this register before any reader.
     debug_assert!(plan.is_exact_linear() || delta.is_consolidated());
 
     if delta.count == 0 {

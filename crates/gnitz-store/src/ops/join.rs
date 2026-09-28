@@ -239,7 +239,7 @@ pub fn op_join_delta_trace(
     out_schema: &SchemaDescriptor,
     probe: JoinProbe,
 ) -> Batch {
-    // Folded by the VM at this register's first reader (`OpFacts::consolidates_in`).
+    // The VM folds this register before any reader.
     debug_assert!(delta.is_consolidated());
     let n = delta.count;
     if n == 0 {

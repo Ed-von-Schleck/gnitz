@@ -1,89 +1,67 @@
-//! `build`: the liveness and consolidation passes that turn an emitted plan into
-//! a runnable [`VmHandle`].
+//! `build`: the register analysis that turns an emitted plan into a runnable
+//! [`Vm`].
 
 use super::*;
-
-/// Who last reads a register: an instruction, an integrate — which run after
-/// every instruction — or nobody.
-#[derive(Clone, Copy, PartialEq)]
-enum LastRead {
-    Nobody,
-    Instr(usize),
-    Integrate(usize),
-}
 
 /// Assemble one emitted plan. `out_reg` is the register the epoch's output is
 /// extracted from; `integrates` run after the whole instruction range.
 pub(in crate::query) fn build(
-    mut instructions: Vec<Instr>,
+    instructions: Vec<Instr>,
     integrates: Vec<(DeltaReg, StateIdx)>,
     delta_schemas: Vec<SchemaDescriptor>,
     out_reg: DeltaReg,
-) -> Box<VmHandle> {
-    // Destructive-register liveness, over the EMITTED instructions — so an
-    // elided node's register aliasing is seen through, not re-derived from
-    // graph edges. Forward, so the last write wins.
-    let mut last_read = vec![LastRead::Nobody; delta_schemas.len()];
-    for (pc, instr) in instructions.iter().enumerate() {
-        for (_, reg) in instr.operands() {
-            last_read[reg.at()] = LastRead::Instr(pc);
-        }
-    }
-    for (i, (reg, _)) in integrates.iter().enumerate() {
-        last_read[reg.at()] = LastRead::Integrate(i);
-    }
-    // After the scan, not before: the sink can itself be an operand, and the
-    // epoch epilogue reads it after the last integrate has run.
-    last_read[out_reg.at()] = LastRead::Nobody;
-
-    // Consolidation is the Z-set identity, so folding at the first reader
-    // serves every later one.
-    let mut fold_at = vec![None; delta_schemas.len()];
-    for instr in &instructions {
-        if facts(&instr.op).consolidates_in {
-            fold_at[instr.in_reg.at()] = Some(first_read_of(&instructions, instr.in_reg));
+) -> Vm {
+    // Every reader of a register runs after its one write, so a fold at the
+    // write serves every reader and a take by the last reader robs none.
+    #[cfg(debug_assertions)]
+    {
+        let mut seen = vec![false; delta_schemas.len()];
+        for instr in &instructions {
+            for r in instr.reads().into_iter().flatten() {
+                seen[r.at()] = true;
+            }
+            assert!(
+                !std::mem::replace(&mut seen[instr.out_reg.at()], true),
+                "a register is written once, before any read",
+            );
         }
     }
 
-    for (pc, instr) in instructions.iter_mut().enumerate() {
-        instr.inert_on_empty = facts(&instr.op).inert_on_empty;
-        for (i, reg) in instr.operands() {
-            instr.takes[i] = last_read[reg.at()] == LastRead::Instr(pc);
-            instr.folds[i] = fold_at[reg.at()] == Some(pc);
-        }
-    }
-
-    let integrates: Vec<Integrate> = integrates
+    // Over the EMITTED instructions — so an elided node's register aliasing is
+    // seen through, not re-derived from graph edges.
+    let mut regs: Vec<Reg> = delta_schemas
         .into_iter()
-        .enumerate()
-        .map(|(i, (reg, trace))| Integrate {
-            reg,
-            trace,
-            take: last_read[reg.at()] == LastRead::Integrate(i),
+        .map(|schema| Reg {
+            schema,
+            fold: false,
+            last_read: LastRead::Nobody,
         })
         .collect();
+    // Forward, so a later reader replaces an earlier one.
+    for (pc, instr) in instructions.iter().enumerate() {
+        for reg in instr.reads().into_iter().flatten() {
+            regs[reg.at()].last_read = LastRead::Instr(pc);
+        }
+        regs[instr.in_reg.at()].fold |= facts(&instr.op).consolidates_in;
+    }
+    for (i, &(reg, _)) in integrates.iter().enumerate() {
+        regs[reg.at()].last_read = LastRead::Integrate(i);
+    }
+    // After the scan, not before: the sink can itself be an operand.
+    regs[out_reg.at()].last_read = LastRead::Nobody;
 
-    let pending_ground_row = instructions
-        .iter()
-        .any(|i| matches!(&i.op, Op::Reduce { plan, .. } if plan.plan.seeds_ground));
+    let pending_ground_row = instructions.iter().any(|i| !i.inert_on_empty);
 
-    Box::new(VmHandle {
-        // Each vector grew by pushes and is then held for the cached plan's
-        // lifetime, so its slack is dead heap per sub-plan, per view, per worker.
-        batches: delta_schemas.iter().map(Batch::empty_with_schema).collect(),
+    Vm {
+        batches: regs.iter().map(|r| Batch::empty_with_schema(&r.schema)).collect(),
         program: Program {
-            instructions: shrunk(instructions),
-            integrates: shrunk(integrates),
-            delta_schemas: shrunk(delta_schemas),
+            instructions: instructions.into_boxed_slice(),
+            integrates: integrates.into_boxed_slice(),
+            regs: regs.into_boxed_slice(),
             out_reg,
         },
         pending_ground_row,
-    })
-}
-
-fn shrunk<T>(mut v: Vec<T>) -> Vec<T> {
-    v.shrink_to_fit();
-    v
+    }
 }
 
 #[cfg(test)]

@@ -7,10 +7,9 @@ use crate::test_support::{
 };
 
 /// DBSP distinct (set-membership clamp `[-1, 1]`): the named `op_weight_clamp`
-/// preset for the unit tests. Production dispatches `Instr::WeightClamp`
-/// straight to [`op_weight_clamp`].
-fn op_distinct(delta: Batch, cursor: &mut ReadCursor, schema: &SchemaDescriptor) -> (Batch, Batch) {
-    op_weight_clamp(delta, cursor, schema, ClampPreset::Distinct)
+/// preset for the unit tests, folding its input first as the VM does.
+fn op_distinct(delta: Batch, cursor: &mut ReadCursor, schema: &SchemaDescriptor) -> Batch {
+    op_weight_clamp(&delta.into_consolidated(schema), cursor, schema, ClampPreset::Distinct)
 }
 
 /// The clamp's per-element arithmetic, `clamp(w_old + Δw, lo, hi) − clamp(w_old,
@@ -38,18 +37,17 @@ fn weight_clamp_emits_the_clamped_transition_at_both_presets() {
             trace_cursor(make_batch(&schema, &[(1, w_old, 10)]), schema)
         };
         let delta = make_batch(&schema, &[(1, w_delta, 10)]);
-        let (out, consolidated) = op_weight_clamp(delta, &mut ch, &schema, preset);
+        let out = op_weight_clamp(&delta.into_consolidated(&schema), &mut ch, &schema, preset);
 
         let got: Vec<i64> = (0..out.count).map(|r| out.get_weight(r)).collect();
         let want: Vec<i64> = if want == 0 { vec![] } else { vec![want] };
         assert_eq!(got, want, "{preset:?} w_old={w_old} Δ={w_delta}");
         assert!(out.is_consolidated());
-        assert!(consolidated.is_consolidated());
     }
 
     // An empty delta short-circuits to an empty output.
     let mut ch = crate::storage::empty_cursor(schema);
-    let (out, _) = op_distinct(make_batch(&schema, &[]), &mut ch, &schema);
+    let out = op_distinct(make_batch(&schema, &[]), &mut ch, &schema);
     assert_eq!(out.count, 0);
 }
 
@@ -66,7 +64,7 @@ fn distinct_sub_merges_the_payloads_within_one_pk_group() {
     // Retract 10 (1→0 ⇒ −1), bump 20 (1→2 ⇒ no change), add 40 (0→1 ⇒ +1).
     // Payload 30 is untouched.
     let delta = make_batch(&schema, &[(1, -1, 10), (1, 1, 20), (1, 1, 40)]);
-    let (out, _) = op_distinct(delta, &mut ch, &schema);
+    let out = op_distinct(delta, &mut ch, &schema);
 
     let got: Vec<(i64, i64)> = (0..out.count)
         .map(|r| (gnitz_wire::read_i64_le(out.col_data(0), r * 8), out.get_weight(r)))
@@ -123,7 +121,7 @@ fn weight_clamp_matches_the_naive_clamp_over_every_shape() {
     ];
     for &(d, t) in cases {
         let mut ch = trace_cursor(make_batch(&schema, t), schema);
-        let (out, _) = op_distinct(make_batch(&schema, d), &mut ch, &schema);
+        let out = op_distinct(make_batch(&schema, d), &mut ch, &schema);
         let got: Vec<(u64, i64, i64)> = (0..out.count)
             .map(|r| {
                 (
@@ -173,7 +171,7 @@ fn distinct_probes_the_trace_by_whole_opk_keys_at_every_pk_shape() {
         for (delta_rows, want) in cases {
             let trace = make_batch_opk(&schema, &[(&held, 1, 10)]);
             let mut ch = trace_cursor(trace, schema);
-            let (out, _) = op_distinct(make_batch_opk(&schema, delta_rows), &mut ch, &schema);
+            let out = op_distinct(make_batch_opk(&schema, delta_rows), &mut ch, &schema);
 
             let got: Vec<(&[u8], i64)> = (0..out.count)
                 .map(|r| (out.get_pk_bytes(r), out.get_weight(r)))
@@ -188,11 +186,11 @@ fn distinct_probes_the_trace_by_whole_opk_keys_at_every_pk_shape() {
 /// `+1`.
 fn assert_payload_dispatch(schema: &SchemaDescriptor, mk: impl Fn(bool) -> Batch, what: &str) {
     let mut ch = trace_cursor(mk(false), *schema);
-    let (out, _) = op_distinct(mk(false), &mut ch, schema);
+    let out = op_distinct(mk(false), &mut ch, schema);
     assert_eq!(out.count, 0, "{what}: an existing element must not transition");
 
     let mut ch = trace_cursor(mk(false), *schema);
-    let (out, _) = op_distinct(mk(true), &mut ch, schema);
+    let out = op_distinct(mk(true), &mut ch, schema);
     assert_eq!((out.count, out.get_weight(0)), (1, 1), "{what}: a new element emits +1");
 }
 

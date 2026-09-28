@@ -14,7 +14,7 @@ fn ingest_err(op: &str, idx: StateIdx, e: StorageError) -> StoreError {
 /// two for a set-op post phase, one everywhere else. Returns the output
 /// register's batch, empty when the epoch produced nothing.
 pub(in crate::query) fn execute_epoch_multi(
-    vm: &mut VmHandle,
+    vm: &mut Vm,
     state: &mut CircuitState,
     inputs: impl IntoIterator<Item = (DeltaReg, Batch)>,
 ) -> Result<Batch, StoreError> {
@@ -33,7 +33,7 @@ pub(in crate::query) fn execute_epoch_multi(
 /// One chunk of a capacity-bounded view's hydration replay, which runs no
 /// integrate.
 pub(in crate::query) fn replay_chunk(
-    vm: &mut VmHandle,
+    vm: &mut Vm,
     state: &mut CircuitState,
     entry: ReplayEntry,
     seed: Batch,
@@ -49,7 +49,7 @@ pub(in crate::query) fn replay_chunk(
 /// Clear the registers and move each seed into its own, reporting whether every
 /// seed was empty. Split from [`run_instructions`] so only these lines are
 /// generic over the seed iterator, not the whole loop below.
-fn seed_inputs(vm: &mut VmHandle, inputs: impl IntoIterator<Item = (DeltaReg, Batch)>) -> bool {
+fn seed_inputs(vm: &mut Vm, inputs: impl IntoIterator<Item = (DeltaReg, Batch)>) -> bool {
     vm.release();
 
     let mut all_empty = true;
@@ -66,14 +66,22 @@ fn seed_inputs(vm: &mut VmHandle, inputs: impl IntoIterator<Item = (DeltaReg, Ba
             );
         }
         vm.batches[input_reg.at()] = input_batch;
+        fold_written(&mut vm.batches, &vm.program.regs, input_reg);
     }
     all_empty
 }
 
+/// Fold `reg`'s batch, just written, when some instruction reads it at net
+/// weights: every reader runs after the write, so each sees the folded form.
+#[inline]
+fn fold_written(batches: &mut [Batch], regs: &[Reg], reg: DeltaReg) {
+    let written = &regs[reg.at()];
+    if written.fold {
+        batches[reg.at()].consolidate_in_place(&written.schema);
+    }
+}
+
 /// Register `reg`'s batch, moved out when `take` and copied otherwise.
-///
-/// `#[inline]`: it returns a `Batch` by value, so a call would cost an extra
-/// sret move at every site.
 #[inline]
 fn take_or_clone(batches: &mut [Batch], reg: DeltaReg, take: bool) -> Batch {
     let batch = &mut batches[reg.at()];
@@ -84,8 +92,8 @@ fn take_or_clone(batches: &mut [Batch], reg: DeltaReg, take: bool) -> Batch {
 }
 
 /// Run the instruction stream from `start_pc`.
-fn run_instructions(vm: &mut VmHandle, state: &mut CircuitState, start_pc: usize) -> Result<(), StoreError> {
-    let VmHandle { program, batches, .. } = vm;
+fn run_instructions(vm: &mut Vm, state: &mut CircuitState, start_pc: usize) -> Result<(), StoreError> {
+    let Vm { program, batches, .. } = vm;
 
     gnitz_debug!(
         "vm: dispatch out_reg={} instrs={}",
@@ -93,72 +101,56 @@ fn run_instructions(vm: &mut VmHandle, state: &mut CircuitState, start_pc: usize
         program.instructions.len()
     );
 
-    let Program { instructions, delta_schemas, .. } = program;
-    for instr in &mut instructions[start_pc..] {
+    let Program { instructions, regs, .. } = program;
+    for (pc, instr) in instructions.iter_mut().enumerate().skip(start_pc) {
         let (in_reg, out_reg) = (instr.in_reg, instr.out_reg);
+        let takes = |r: DeltaReg| regs[r.at()].last_read == LastRead::Instr(pc);
 
-        // Fold in place what this instruction is the first reader of: the raw
-        // batch is freed and every later reader sees the folded form, where a
-        // kernel's own fold would allocate a copy beside it.
-        for (i, r) in instr.operands() {
-            if instr.folds[i] {
-                batches[r.at()].consolidate_in_place(&delta_schemas[r.at()]);
-            }
-        }
-
-        let all_empty = instr.operands().all(|(_, r)| batches[r.at()].is_empty());
+        let all_empty = instr.reads().into_iter().flatten().all(|r| batches[r.at()].is_empty());
         // The kernel would return exactly this, so skip it and its trace cursor.
         let out = if instr.inert_on_empty && all_empty {
-            Batch::empty_with_schema(&delta_schemas[out_reg.at()])
+            Batch::empty_with_schema(&regs[out_reg.at()].schema)
         } else {
             match &mut instr.op {
                 Op::Filter(pred) => {
-                    let schema = &delta_schemas[in_reg.at()];
+                    let schema = &regs[in_reg.at()].schema;
                     match ops::op_filter(&batches[in_reg.at()], pred, schema) {
                         Some(kept) => kept,
-                        None => take_or_clone(batches, in_reg, instr.takes[0]),
+                        None => take_or_clone(batches, in_reg, takes(in_reg)),
                     }
                 }
 
                 Op::Map(plan) => plan.evaluate_map_batch(&batches[in_reg.at()]),
 
-                Op::Negate => ops::op_negate(take_or_clone(batches, in_reg, instr.takes[0])),
+                Op::Negate => ops::op_negate(take_or_clone(batches, in_reg, takes(in_reg))),
 
                 Op::Union { in_b } => {
                     if in_reg == *in_b {
                         // Z + Z doubles every weight; delegating would take
-                        // operand 0 and add the emptied operand 1 to it. Only a
-                        // hand-built circuit aliases them.
-                        let mut batch = take_or_clone(batches, in_reg, instr.takes[0]);
+                        // operand 0 and add the emptied operand 1 to it.
+                        let mut batch = take_or_clone(batches, in_reg, takes(in_reg));
                         batch.map_weights(|w| w.wrapping_mul(2));
                         batch
                     } else if batches[in_reg.at()].is_empty() {
                         // `0 + B = B`, taking B rather than cloning it — which is
                         // why the arm is here and not in `op_union`.
-                        take_or_clone(batches, *in_b, instr.takes[1])
+                        take_or_clone(batches, *in_b, takes(*in_b))
                     } else {
                         // The union's own (nullability-merged) schema, not the
                         // left input's — see `op_union` for why a narrower one
                         // mis-sorts nulls.
                         ops::op_union(
-                            take_or_clone(batches, in_reg, instr.takes[0]),
+                            take_or_clone(batches, in_reg, takes(in_reg)),
                             &batches[in_b.at()],
-                            &delta_schemas[out_reg.at()],
+                            &regs[out_reg.at()].schema,
                         )
                     }
                 }
 
                 Op::WeightClamp { hist, preset } => {
-                    let schema = &delta_schemas[in_reg.at()];
-                    // Opened before the ingest below: the clamp reads `z⁻¹(I)`.
-                    let mut cursor = state.cursor_for_keys(*hist, &batches[in_reg.at()]);
-                    let delta = take_or_clone(batches, in_reg, instr.takes[0]);
-                    let (output, consolidated) = ops::op_weight_clamp(delta, &mut cursor, schema, *preset);
-                    drop(cursor);
-                    state
-                        .ingest_owned(*hist, consolidated)
-                        .map_err(|e| ingest_err("weight-clamp history", *hist, e))?;
-                    output
+                    let delta = &batches[in_reg.at()];
+                    let mut cursor = state.cursor_for_keys(*hist, delta);
+                    ops::op_weight_clamp(delta, &mut cursor, &regs[in_reg.at()].schema, *preset)
                 }
 
                 Op::JoinDT { trace, probe } => {
@@ -167,13 +159,13 @@ fn run_instructions(vm: &mut VmHandle, state: &mut CircuitState, start_pc: usize
                         true => state.cursor_for_keys(*trace, delta),
                         false => state.cursor(*trace),
                     };
-                    ops::op_join_delta_trace(delta, &mut cursor, &delta_schemas[out_reg.at()], *probe)
+                    ops::op_join_delta_trace(delta, &mut cursor, &regs[out_reg.at()].schema, *probe)
                 }
 
                 Op::WorkerFilter { slot } => ops::op_worker_filter(&batches[in_reg.at()], *slot),
 
                 Op::NullExtend { nulls_first } => {
-                    batches[in_reg.at()].widened_with_nulls(&delta_schemas[out_reg.at()], *nulls_first)
+                    batches[in_reg.at()].widened_with_nulls(&regs[out_reg.at()].schema, *nulls_first)
                 }
 
                 Op::Reduce { out_trace, plan } => {
@@ -213,11 +205,16 @@ fn run_instructions(vm: &mut VmHandle, state: &mut CircuitState, start_pc: usize
         // Free every operand this instruction was the last reader of, here
         // rather than per arm — so a register's lifetime follows the dataflow
         // instead of whether some kernel happens to take `Batch` by value.
-        for (i, r) in instr.operands() {
-            if instr.takes[i] {
+        for r in instr.reads().into_iter().flatten() {
+            if takes(r) {
                 batches[r.at()].release_buffers();
             }
         }
+
+        // After the release, so a fold never runs beside an input this
+        // instruction was the last reader of. `out_reg` is none of its reads:
+        // `build` checks each register is written once, before any read.
+        fold_written(batches, regs, out_reg);
     }
 
     gnitz_debug!("vm: dispatch done");
@@ -226,9 +223,10 @@ fn run_instructions(vm: &mut VmHandle, state: &mut CircuitState, start_pc: usize
 
 /// Accumulate each delta into its trace, after the whole instruction range — so
 /// no cursor opened in that range can observe this tick's integration.
-fn run_integrates(vm: &mut VmHandle, state: &mut CircuitState) -> Result<(), StoreError> {
-    let VmHandle { program, batches, .. } = vm;
-    for &Integrate { reg, trace, take } in &program.integrates {
+fn run_integrates(vm: &mut Vm, state: &mut CircuitState) -> Result<(), StoreError> {
+    let Vm { program, batches, .. } = vm;
+    for (i, &(reg, trace)) in program.integrates.iter().enumerate() {
+        let take = program.regs[reg.at()].last_read == LastRead::Integrate(i);
         gnitz_debug!("vm: INTEGRATE in_count={}", batches[reg.at()].len());
         // Not `take_or_clone`: for a `Raw` register its clone arm would cost a
         // clone plus the trace's own consolidate, where moving costs one.
@@ -245,11 +243,12 @@ fn run_integrates(vm: &mut VmHandle, state: &mut CircuitState) -> Result<(), Sto
 /// operator's identity path can hand an input batch straight back (see
 /// `op_union`), so the label on it may be an operand's; downstream — the
 /// exchange wire, `prepare_relay`, the dag driver — cannot re-derive it.
-fn take_output(vm: &mut VmHandle) -> Batch {
-    let VmHandle { program, batches, .. } = vm;
+fn take_output(vm: &mut Vm) -> Batch {
+    let Vm { program, batches, .. } = vm;
     let want = program.out_schema();
     let out = &mut batches[program.out_reg.at()];
     if out.is_empty() {
+        out.release_buffers();
         return Batch::empty_with_schema(want);
     }
     let mut batch = out.take();

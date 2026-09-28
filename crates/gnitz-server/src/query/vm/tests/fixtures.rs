@@ -73,7 +73,7 @@ impl TestPlan {
 
 /// A built program and the operator state it runs over.
 pub(in crate::query) struct TestVm {
-    pub(in crate::query) vm: Box<VmHandle>,
+    pub(in crate::query) vm: Vm,
     pub(in crate::query) state: CircuitState,
 }
 
@@ -92,15 +92,15 @@ impl TestVm {
 }
 
 impl std::ops::Deref for TestVm {
-    type Target = VmHandle;
+    type Target = Vm;
 
-    fn deref(&self) -> &VmHandle {
+    fn deref(&self) -> &Vm {
         &self.vm
     }
 }
 
 impl std::ops::DerefMut for TestVm {
-    fn deref_mut(&mut self) -> &mut VmHandle {
+    fn deref_mut(&mut self) -> &mut Vm {
         &mut self.vm
     }
 }

@@ -7,7 +7,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::query::vm::{DeltaReg, VmHandle};
+use crate::query::vm::{DeltaReg, Vm};
 use gnitz_expr::LogicalProgram;
 use gnitz_store::expr::MapPlan;
 use gnitz_store::ops::ScatterSpec;
@@ -227,7 +227,7 @@ impl LoadedCircuit {
 /// per `build_plan` call — an exchange side, or the post-combine phase, which
 /// for an exchange-free circuit is the whole plan.
 pub(super) struct SubPlan {
-    pub(in crate::query) vm: Box<VmHandle>,
+    pub(in crate::query) vm: Vm,
     /// source table id → the input register its delta seeds.
     pub(in crate::query) source_reg_map: FxHashMap<i64, DeltaReg>,
 }

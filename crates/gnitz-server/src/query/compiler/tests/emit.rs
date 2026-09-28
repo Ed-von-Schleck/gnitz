@@ -105,6 +105,25 @@ fn a_plan_outputs_the_named_node_which_its_node_list_must_hold() {
     assert_eq!(rejection(plan(&[0])), "operand is produced outside this plan");
 }
 
+/// The driver seeds one register per source, so a plan scanning one source
+/// twice is refused rather than leaving the second scan unseeded.
+#[test]
+fn a_plan_scanning_one_source_twice_is_rejected() {
+    let loaded = loaded_for_test(
+        [(0, scan_delta(10)), (1, scan_delta(10)), (2, gnitz_wire::OpNode::Union)],
+        vec![(0, 2, SLOT_IN), (1, 2, SLOT_B)],
+    );
+    let plan = build(
+        &loaded,
+        &loaded.ordered_where(|_| true),
+        &sources([(10, make_schema_u64_i64())]),
+        SELF_CONTAINED,
+        &[],
+        2,
+    );
+    assert_eq!(rejection(plan), "scan-delta: a plan scans one source twice");
+}
+
 /// An integral routed into a delta port names a store, not a batch: every port
 /// that takes a delta refuses one.
 #[test]
@@ -499,7 +518,6 @@ fn consume_flags(plan: &SubPlan) -> Vec<(&'static str, bool)> {
         .flat_map(|(op, takes)| {
             let label = match op {
                 Op::Union { .. } => ["union.a", "union.b"],
-                Op::WeightClamp { .. } => ["clamp", ""],
                 Op::Negate => ["negate", ""],
                 _ => return Vec::new(),
             };
@@ -512,45 +530,36 @@ fn consume_flags(plan: &SubPlan) -> Vec<(&'static str, bool)> {
         .collect()
 }
 
-/// The INTERSECT/EXCEPT fan-out shape: ScanDelta(10)'s register fans into both
-/// a destructive `Distinct` and a non-destructive `Negate` co-reader (standing
-/// in for integrate_trace). Instructions are emitted in node-id order, so the ids
-/// decide which consumer runs first. (The reader is a
-/// `Negate`, not a `Filter(None)`: a predicate-less Filter is elided by register
-/// aliasing and would no longer read the register at runtime.)
+/// The INTERSECT/EXCEPT fan-out shape: ScanDelta(10)'s register fans into two
+/// destructive readers. Instructions are emitted in node-id order, so the later
+/// one takes and the earlier one clones — whichever of them the plan outputs.
 #[test]
 fn a_destructive_op_takes_its_input_only_when_it_is_the_last_reader() {
-    let flags = |distinct_id: NodeId, reader_id: NodeId| {
+    for (out_id, other_id) in [(2, 1), (1, 2)] {
         let loaded = loaded_for_test(
             [
                 (0, scan_delta(10)),
-                (distinct_id, gnitz_wire::OpNode::Distinct),
-                (reader_id, gnitz_wire::OpNode::Negate),
+                (out_id, gnitz_wire::OpNode::Negate),
+                (other_id, gnitz_wire::OpNode::Negate),
             ],
-            vec![(0, distinct_id, SLOT_IN), (0, reader_id, SLOT_IN)],
+            vec![(0, out_id, SLOT_IN), (0, other_id, SLOT_IN)],
         );
-        let plan = build(
+        let (plan, _) = build(
             &loaded,
             &loaded.ordered_where(|_| true),
             &sources([(10, make_schema_u64_i64())]),
             SELF_CONTAINED,
             &[],
-            distinct_id,
+            out_id,
         )
-        .expect("both orderings compile")
-        .0;
-        consume_flags(&plan)
-    };
-    assert_eq!(
-        flags(2, 1),
-        vec![("negate", false), ("clamp", true)],
-        "the co-reader ran first and had to clone; the clamp's take is then free"
-    );
-    assert_eq!(
-        flags(1, 2),
-        vec![("clamp", false), ("negate", true)],
-        "the clamp runs first while the co-reader still has to read, so it must clone"
-    );
+        .expect("both orderings compile");
+        assert_eq!(
+            consume_flags(&plan),
+            vec![("negate", false), ("negate", true)],
+            "the first reader must clone while the second still has to read; the \
+             second's take is then free (plan output: node {out_id})"
+        );
+    }
 }
 
 /// The set-operation shape: two sources meet at one `Union`, neither operand has

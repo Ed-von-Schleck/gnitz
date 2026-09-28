@@ -22,24 +22,19 @@ fn an_integrate_takes_its_register_unless_it_is_the_sink() {
     p.integrate(2, t2);
 
     let vm = p.build_in(&registry, vec![schema; 3], 2);
-    let takes: Vec<bool> = vm.program.integrates.iter().map(|i| i.take).collect();
+    let last_reads: Vec<LastRead> = vm.program.regs.iter().map(|r| r.last_read).collect();
     assert_eq!(
-        takes,
-        vec![true, true, false],
-        "the sink is never taken out from under the epoch epilogue"
-    );
-    assert!(
-        vm.program.instructions.iter().all(|i| i.takes == [false; 2]),
-        "an integrate reads after every instruction, so none of them may take",
+        last_reads,
+        vec![LastRead::Integrate(0), LastRead::Integrate(1), LastRead::Nobody],
+        "an integrate reads after every instruction, and the sink is never taken \
+         out from under the epoch epilogue",
     );
 }
 
-/// Each consolidating instruction's input is folded at its FIRST reader, and
-/// nothing else is folded at all. Here every folded register is read by a
-/// cheaper instruction first, so the fold cannot be confused with the reader
-/// that needs it.
+/// A register is folded iff some instruction reads it at net weights — not
+/// merely because a cheaper instruction reads it too.
 #[test]
-fn a_folded_register_is_folded_by_its_first_reader() {
+fn only_a_register_read_at_net_weights_is_folded() {
     let dir = tempfile::tempdir().unwrap();
     let registry = vm_registry(dir.path());
     let schema = make_schema_u128_i64();
@@ -74,8 +69,7 @@ fn a_folded_register_is_folded_by_its_first_reader() {
         .probe;
 
     // reg 0 = clamp input, reg 2 = join delta, reg 4 = avi-reduce input,
-    // reg 6 = linear-reduce input. Each is negated first, so the pc that folds
-    // it is that negate and not the consolidating instruction.
+    // reg 6 = linear-reduce input, each also read by a negate.
     p.push(0, 1, Op::Negate);
     p.push(
         0,
@@ -85,6 +79,7 @@ fn a_folded_register_is_folded_by_its_first_reader() {
             preset: gnitz_store::ops::ClampPreset::Distinct,
         },
     );
+    p.integrate(0, hist);
     p.push(2, 3, Op::Negate);
     p.push(2, 9, Op::JoinDT { trace: join_trace, probe });
     p.push(4, 5, Op::Negate);
@@ -107,20 +102,8 @@ fn a_folded_register_is_folded_by_its_first_reader() {
     );
 
     let vm = p.build_in(&registry, vec![schema; 12], 11);
-    // `(register, pc)` for every operand the dispatch folds.
-    let marked: Vec<(usize, usize)> = vm
-        .program
-        .instructions
-        .iter()
-        .enumerate()
-        .flat_map(|(pc, instr)| {
-            instr
-                .operands()
-                .filter_map(move |(i, r)| instr.folds[i].then_some((r.at(), pc)))
-        })
-        .collect();
-    // The clamp input, the join delta and the value-indexed reduce's input, each
-    // at the negate that reads it first. The linear reduce's input (reg 6) is
-    // absent.
-    assert_eq!(marked, vec![(0, 0), (2, 2), (4, 4)]);
+    let folded: Vec<usize> = (0..12).filter(|&r| vm.program.regs[r].fold).collect();
+    // The clamp input, the join delta and the value-indexed reduce's input. The
+    // linear reduce's input (reg 6) is absent.
+    assert_eq!(folded, vec![0, 2, 4]);
 }

@@ -2,7 +2,7 @@
 //! plan, pre or post exchange).
 //!
 //! An arm resolves its operands, asks the operator's own constructor for its
-//! artifact, allocates a register and pushes an instruction. The artifacts —
+//! artifact, and pushes an instruction into a fresh register. The artifacts —
 //! output schemas, probes, packers, plans — and the guards a client-supplied
 //! circuit clears to get one belong to `gnitz-store`, beside the kernels that
 //! read them.
@@ -68,8 +68,12 @@ impl EmitCtx<'_> {
         self.layout.declare(format!("{kind}_{nid}"), schema)
     }
 
-    fn push(&mut self, in_reg: DeltaReg, out_reg: DeltaReg, op: Op) {
+    /// Push `op` over `in_reg`, writing a fresh register of `out_schema` — the
+    /// one way an instruction gets its output register, so each is written once.
+    fn push(&mut self, in_reg: DeltaReg, out_schema: SchemaDescriptor, op: Op) -> DeltaReg {
+        let out_reg = self.push_delta_reg(out_schema);
         self.instructions.push(Instr::new(in_reg, out_reg, op));
+        out_reg
     }
 
     /// The register `src` produced. The one rejection left after the load held
@@ -100,13 +104,13 @@ impl EmitCtx<'_> {
         Ok((self.reg_of(d)?.delta()?, self.reg_of(t)?.trace()?))
     }
 
-    /// The schema register `r` is labelled with — the emit-time twin of
-    /// [`crate::query::vm::Program::schema_of`].
+    /// The schema register `r` is labelled with.
     fn reg_schema(&self, r: DeltaReg) -> SchemaDescriptor {
-        self.delta_schemas[r.0 as usize]
+        self.delta_schemas[r.at()]
     }
 
-    /// Allocate a fresh delta register and return its id.
+    /// Allocate a fresh delta register and return its id. An instruction's output
+    /// register comes from [`EmitCtx::push`].
     fn push_delta_reg(&mut self, schema: SchemaDescriptor) -> DeltaReg {
         assert!(
             self.delta_schemas.len() < u16::MAX as usize,
@@ -141,7 +145,11 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
                 .map(Relation::schema)
                 .ok_or("scan-delta: unknown source table")?;
             let reg = ctx.push_delta_reg(schema);
-            ctx.source_reg_map.insert(*tid as i64, reg);
+            // The driver seeds one register per source, so a second scan would
+            // silently see nothing.
+            if ctx.source_reg_map.insert(*tid as i64, reg).is_some() {
+                return Err("scan-delta: a plan scans one source twice".into());
+            }
             Ok(OutReg::Delta(reg))
         }
 
@@ -154,26 +162,20 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             let pred = LogicalProgram::from_blob(blob)
                 .and_then(|p| p.resolve_filter(&in_schema))
                 .map_err(|e| OpBuildErr::Program("filter: invalid predicate program", e))?;
-            let out_reg = ctx.push_delta_reg(in_schema);
-            ctx.push(in_reg, out_reg, Op::Filter(Box::new(pred)));
-            Ok(OutReg::Delta(out_reg))
+            Ok(OutReg::Delta(ctx.push(in_reg, in_schema, Op::Filter(Box::new(pred)))))
         }
 
         gnitz_wire::OpNode::Map(mk) => emit_map(ctx, nid, mk),
 
         gnitz_wire::OpNode::Negate => {
             let in_reg = ctx.unary_delta_in(nid)?;
-            let out_reg = ctx.push_delta_reg(ctx.reg_schema(in_reg));
-            ctx.push(in_reg, out_reg, Op::Negate);
-            Ok(OutReg::Delta(out_reg))
+            Ok(OutReg::Delta(ctx.push(in_reg, ctx.reg_schema(in_reg), Op::Negate)))
         }
 
         gnitz_wire::OpNode::Union => {
             let (in_a, in_b) = ctx.binary_delta_in(nid)?;
             let out_schema = gnitz_store::ops::union_nullability_merge(&ctx.reg_schema(in_a), &ctx.reg_schema(in_b))?;
-            let out_reg = ctx.push_delta_reg(out_schema);
-            ctx.push(in_a, out_reg, Op::Union { in_b });
-            Ok(OutReg::Delta(out_reg))
+            Ok(OutReg::Delta(ctx.push(in_a, out_schema, Op::Union { in_b })))
         }
 
         gnitz_wire::OpNode::Distinct => emit_clamp(ctx, nid, ClampPreset::Distinct),
@@ -202,9 +204,11 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
                 &ctx.reg_schema(delta_reg),
                 ctx.layout.schema_of(trace),
             )?;
-            let out_reg = ctx.push_delta_reg(plan.out_schema);
-            ctx.push(delta_reg, out_reg, Op::JoinDT { trace, probe: plan.probe });
-            Ok(OutReg::Delta(out_reg))
+            Ok(OutReg::Delta(ctx.push(
+                delta_reg,
+                plan.out_schema,
+                Op::JoinDT { trace, probe: plan.probe },
+            )))
         }
 
         gnitz_wire::OpNode::IntegrateSink => {
@@ -230,20 +234,20 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             if ctx.self_contained {
                 return Ok(OutReg::Delta(in_reg));
             }
-            let out_reg = ctx.push_delta_reg(ctx.reg_schema(in_reg));
-            ctx.push(in_reg, out_reg, Op::WorkerFilter { slot: ctx.registry.slot() });
-            Ok(OutReg::Delta(out_reg))
+            let slot = ctx.registry.slot();
+            Ok(OutReg::Delta(ctx.push(
+                in_reg,
+                ctx.reg_schema(in_reg),
+                Op::WorkerFilter { slot },
+            )))
         }
 
         gnitz_wire::OpNode::NullExtend { type_codes, nulls_first } => {
             let in_reg = ctx.unary_delta_in(nid)?;
-            // Built once and homed in `reg_meta`; the op derives its
-            // appended-column count from it.
             let out_schema =
                 gnitz_store::ops::null_extend_output_schema(&ctx.reg_schema(in_reg), type_codes, *nulls_first)?;
-            let out_reg = ctx.push_delta_reg(out_schema);
-            ctx.push(in_reg, out_reg, Op::NullExtend { nulls_first: *nulls_first });
-            Ok(OutReg::Delta(out_reg))
+            let op = Op::NullExtend { nulls_first: *nulls_first };
+            Ok(OutReg::Delta(ctx.push(in_reg, out_schema, op)))
         }
     }
 }
@@ -258,8 +262,8 @@ fn emit_clamp(ctx: &mut EmitCtx, nid: NodeId, preset: ClampPreset) -> Result<Out
     let in_reg = ctx.unary_delta_in(nid)?;
     let schema = ctx.reg_schema(in_reg);
     let hist = ctx.declare_child("hist", nid, schema);
-    let out_reg = ctx.push_delta_reg(schema);
-    ctx.push(in_reg, out_reg, Op::WeightClamp { hist, preset });
+    let out_reg = ctx.push(in_reg, schema, Op::WeightClamp { hist, preset });
+    ctx.integrates.push((in_reg, hist));
     Ok(OutReg::Delta(out_reg))
 }
 
@@ -279,9 +283,7 @@ fn emit_map(ctx: &mut EmitCtx, nid: NodeId, mk: &gnitz_wire::MapKind) -> Result<
         return Ok(OutReg::Delta(in_reg));
     }
     let out_schema = *plan.out_schema();
-    let out_reg = ctx.push_delta_reg(out_schema);
-    ctx.push(in_reg, out_reg, Op::Map(Box::new(plan)));
-    Ok(OutReg::Delta(out_reg))
+    Ok(OutReg::Delta(ctx.push(in_reg, out_schema, Op::Map(Box::new(plan)))))
 }
 
 // ---------------------------------------------------------------------------
@@ -338,7 +340,6 @@ fn push_reduce(
 ) -> DeltaReg {
     let out_schema = plan.shape.output_schema;
     let out_trace = ctx.declare_child(trace_kind, nid, out_schema);
-    let out_reg = ctx.push_delta_reg(out_schema);
     // One table per reduce, serving every MIN/MAX of it — so per-aggregate entries
     // share a table_id, scratch dir and compaction namespace and cannot collide on
     // a memory-pressure flush.
@@ -347,7 +348,7 @@ fn push_reduce(
         .as_ref()
         .map(|bake| ctx.declare_child(index_kind, nid, bake.schema));
     let baked = Box::new(BakedReduce::new(plan, avi_table));
-    ctx.push(in_reg, out_reg, Op::Reduce { out_trace, plan: baked });
+    let out_reg = ctx.push(in_reg, out_schema, Op::Reduce { out_trace, plan: baked });
     ctx.integrates.push((out_reg, out_trace));
     out_reg
 }
@@ -362,11 +363,10 @@ fn push_topn(
 ) -> DeltaReg {
     let out_schema = plan.output_schema;
     let out_trace = ctx.declare_child(trace_kind, nid, out_schema);
-    let out_reg = ctx.push_delta_reg(out_schema);
     // The ordered index of every input row — the operator's whole history.
     let index_table = ctx.declare_child(index_kind, nid, plan.index.schema);
     let baked = Box::new(BakedTopN { plan, index_table });
-    ctx.push(in_reg, out_reg, Op::TopN { out_trace, plan: baked });
+    let out_reg = ctx.push(in_reg, out_schema, Op::TopN { out_trace, plan: baked });
     ctx.integrates.push((out_reg, out_trace));
     out_reg
 }
@@ -436,7 +436,7 @@ pub(super) fn build_plan(
         partial_seeds: seeds.iter().filter(|s| s.partials).map(|s| s.shard).collect(),
         registry,
         layout,
-        instructions: Vec::with_capacity(16),
+        instructions: Vec::new(),
         integrates: Vec::new(),
         delta_schemas: Vec::new(),
         out_reg_of: vec![None; loaded.len()],

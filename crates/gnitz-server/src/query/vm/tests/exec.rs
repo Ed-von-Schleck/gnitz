@@ -335,6 +335,7 @@ fn test_distinct_multi_tick() {
             preset: gnitz_store::ops::ClampPreset::Distinct,
         },
     );
+    p.integrate(0, hist);
     let mut vm = p.build_in(&registry, vec![schema; 2], 1);
 
     // Tick 1: insert pk=1 with weight +3 → distinct output should be +1
@@ -771,39 +772,25 @@ fn a_replay_leaves_every_trace_as_it_found_it() {
     assert_eq!(trace_zset(&vm, trace, &schema), before, "and writes none of them back");
 }
 
-/// A replay may not enter before a state writer, nor before a write of its own
-/// seeded register.
+/// A replay may not enter before a state writer.
 #[test]
 fn replay_entry_refuses_a_state_writer_past_the_entry() {
     let schema = make_schema_u128_i64();
-    let dir = tempfile::tempdir().unwrap();
-    let registry = vm_registry(dir.path());
 
     let mut p = TestPlan::default();
-    let hist = p.table("replay_entry_hist", schema);
-    p.push(
-        0,
-        1,
-        Op::WeightClamp {
-            hist,
-            preset: gnitz_store::ops::ClampPreset::Distinct,
-        },
-    );
+    let out_trace = p.table("replay_entry_reduce", schema);
+    let out_schema = push_reduce(&mut p, &[AggDescriptor::COUNT_STAR], &[], schema, out_trace, false);
+    p.integrate(1, out_trace);
     p.push(1, 2, Op::WorkerFilter { slot: Slot::SOLO });
-    let vm = p.build_in(&registry, vec![schema; 3], 2);
+    // Built without opening its stores: `replay_entry` reads the program alone.
+    let vm = p.build(vec![schema, out_schema, out_schema], 2);
 
     assert!(
         vm.program.replay_entry(DeltaReg(0)).is_err(),
-        "the clamp reads the seed"
+        "the reduce reads the seed"
     );
     assert_eq!(
         vm.program.replay_entry(DeltaReg(1)).map(|e| e.reg()).ok(),
         Some(DeltaReg(1))
     );
-
-    let mut p = TestPlan::default();
-    p.push(0, 1, Op::WorkerFilter { slot: Slot::SOLO });
-    p.push(1, 0, Op::WorkerFilter { slot: Slot::SOLO });
-    let vm = p.build(vec![schema; 2], 0);
-    assert!(vm.program.replay_entry(DeltaReg(0)).is_err(), "the seed is overwritten");
 }
