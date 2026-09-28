@@ -25,17 +25,17 @@ pub(crate) fn sql_col_type(dt: &DataType) -> Result<ColType, GnitzSqlError> {
         | DataType::Datetime(_)
         | DataType::TimestampNtz(_) => TypeCode::Timestamp,
         DataType::Timestamp(..) => {
-            return Err(GnitzSqlError::Unsupported(
+            return Err(GnitzSqlError::Rejected(
                 "a TIMESTAMP carries no time zone here; write TIMESTAMP without one".to_string(),
             ))
         }
         DataType::Decimal(info) | DataType::Numeric(info) | DataType::Dec(info) => return decimal_type(info),
         DataType::Boolean | DataType::Bool => {
-            return Err(GnitzSqlError::Unsupported(
+            return Err(GnitzSqlError::Rejected(
                 "BOOLEAN has no gnitz type; use TINYINT(1)".to_string(),
             ))
         }
-        _ => return Err(GnitzSqlError::Unsupported(format!("unsupported SQL type: {dt}"))),
+        _ => return Err(GnitzSqlError::Rejected(format!("unsupported SQL type: {dt}"))),
     };
     Ok(ColType::of(tc))
 }
@@ -48,18 +48,18 @@ fn decimal_type(info: &ExactNumberInfo) -> Result<ColType, GnitzSqlError> {
         ExactNumberInfo::PrecisionAndScale(p, s) => (p, s),
         ExactNumberInfo::Precision(p) => (p, 0),
         ExactNumberInfo::None => {
-            return Err(GnitzSqlError::Unsupported(
+            return Err(GnitzSqlError::Rejected(
                 "DECIMAL needs a precision and scale, e.g. DECIMAL(18, 2)".to_string(),
             ))
         }
     };
     if p == 0 || p > MAX_DECIMAL_SCALE as u64 {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "DECIMAL({p}, {s}): the precision must be 1..={MAX_DECIMAL_SCALE}"
         )));
     }
     if s < 0 || s as u64 > p {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "DECIMAL({p}, {s}): the scale must be 0..={p}"
         )));
     }

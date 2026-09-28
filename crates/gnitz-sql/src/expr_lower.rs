@@ -120,7 +120,7 @@ impl OpcodeBackend<'_> {
                     self.eb.emit(L::LoadConst { val: v as i64, unsigned: true }),
                     ExprKind::Int,
                 )),
-                None => Err(GnitzSqlError::Unsupported(format!(
+                None => Err(GnitzSqlError::Rejected(format!(
                     "integer literal {lit} does not fit a 64-bit register; it is usable only in a comparison \
                      or IN list against an integer column, an INSERT value or an UPDATE SET value"
                 ))),
@@ -151,14 +151,14 @@ impl OpcodeBackend<'_> {
         // Both rejections exist for their wording: the engine's validator refuses
         // a wide column on the integer load too, but names it by position only.
         if tc.is_wide_int() {
-            return Err(GnitzSqlError::Unsupported(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "column {:?} is {}; 128-bit columns cannot be used in expressions",
                 self.cols[idx].name, self.cols[idx].ty,
             )));
         }
         Ok(match tc {
             TypeCode::Blob => {
-                return Err(GnitzSqlError::Unsupported(format!(
+                return Err(GnitzSqlError::Rejected(format!(
                     "column {:?} is {}; blob columns support only =, <>, <, <=, >, >= \
                      against another blob/string column or a string literal",
                     self.cols[idx].name, self.cols[idx].ty,
@@ -188,7 +188,7 @@ impl OpcodeBackend<'_> {
     /// Lower `expr` into a scalar register, with its scalar class.
     fn lower_num(&mut self, expr: &BoundExpr) -> Result<(Reg, ExprKind), GnitzSqlError> {
         match self.lower(expr)? {
-            (_, ExprKind::Str) => Err(GnitzSqlError::Unsupported(format!(
+            (_, ExprKind::Str) => Err(GnitzSqlError::Rejected(format!(
                 "{} is a string; strings support comparison, LIKE/ILIKE, CONCAT/||, \
                  CASE/COALESCE/NULLIF, the string functions and CAST — not this",
                 self.describe(expr)
@@ -278,7 +278,7 @@ impl OpcodeBackend<'_> {
         check_decimal_scale(to)?;
         if let Some((v, s)) = e.decimal_literal() {
             let val = rescale(v, s, to).ok_or_else(|| {
-                GnitzSqlError::Bind(format!("{} does not fit a DECIMAL of scale {to}", format_decimal(v, s)))
+                GnitzSqlError::Rejected(format!("{} does not fit a DECIMAL of scale {to}", format_decimal(v, s)))
             })?;
             return Ok(self.eb.emit(L::LoadConst { val, unsigned: false }));
         }
@@ -297,7 +297,7 @@ impl OpcodeBackend<'_> {
         let src = e.infer_ty(self.cols).tc;
         if src.is_temporal() && src != target.tc {
             if (src, target.tc) != (TypeCode::Date, TypeCode::Timestamp) {
-                return Err(GnitzSqlError::Unsupported(format!(
+                return Err(GnitzSqlError::Rejected(format!(
                     "cannot mix {src} with {target} in one CASE/COALESCE/GREATEST/LEAST"
                 )));
             }
@@ -344,7 +344,7 @@ impl OpcodeBackend<'_> {
                 let f = self.as_float(r, kind);
                 Ok(self.eb.emit(L::FloatToStr { a: f }))
             }
-            _ => Err(GnitzSqlError::Unsupported("expected a string value here".to_string())),
+            _ => Err(GnitzSqlError::Rejected("expected a string value here".to_string())),
         }
     }
 
@@ -354,7 +354,7 @@ impl OpcodeBackend<'_> {
     fn int_operand(&mut self, e: &BoundExpr, what: impl FnOnce() -> String) -> Result<Reg, GnitzSqlError> {
         match self.lower_num(e)? {
             (r, ExprKind::Int) => Ok(r),
-            _ => Err(GnitzSqlError::Unsupported(format!(
+            _ => Err(GnitzSqlError::Rejected(format!(
                 "{} must be an integer expression",
                 what()
             ))),
@@ -432,7 +432,7 @@ impl OpcodeBackend<'_> {
             TypeCode::Timestamp => true,
             TypeCode::Date => false,
             t => {
-                return Err(GnitzSqlError::Unsupported(format!(
+                return Err(GnitzSqlError::Rejected(format!(
                     "a calendar function takes a DATE or TIMESTAMP; {} is {t}",
                     self.describe(arg)
                 )))
@@ -548,7 +548,7 @@ impl OpcodeBackend<'_> {
             let from = expr.infer_ty(self.cols).tc;
             match (kind, from, to) {
                 (ExprKind::Str, _, _) => {
-                    return Err(GnitzSqlError::Unsupported(format!(
+                    return Err(GnitzSqlError::Rejected(format!(
                         "CAST of a string to {to} is supported for a literal only"
                     )))
                 }
@@ -586,7 +586,7 @@ impl OpcodeBackend<'_> {
             return Ok((self.cast_float(f, to), ExprKind::Float));
         }
         let Some(fi) = FixedInt::from_type_code(to) else {
-            return Err(GnitzSqlError::Unsupported(format!("CAST to {to} is not supported")));
+            return Err(GnitzSqlError::Rejected(format!("CAST to {to} is not supported")));
         };
         let reg = match kind {
             ExprKind::Str => self.eb.emit(L::StrToInt { a: r, fi }),
@@ -638,7 +638,7 @@ impl OpcodeBackend<'_> {
         let reg = match expr {
             BoundExpr::LitStr(text) => {
                 let val = parse_decimal(text, scale)
-                    .ok_or_else(|| GnitzSqlError::Bind(invalid_literal(ColType::decimal(scale), text)))?;
+                    .ok_or_else(|| GnitzSqlError::Rejected(invalid_literal(ColType::decimal(scale), text)))?;
                 self.eb.emit(L::LoadConst { val, unsigned: false })
             }
             _ => self.lower_dec(expr, scale)?,
@@ -763,7 +763,7 @@ impl OpcodeBackend<'_> {
         let Some(p) = place(lit, ty) else {
             // A string `place` cannot read spells no value of the type.
             return match lit {
-                BExpr::LitStr(s) => Err(GnitzSqlError::Bind(invalid_literal(ty, s))),
+                BExpr::LitStr(s) => Err(GnitzSqlError::Rejected(invalid_literal(ty, s))),
                 _ => Ok(None),
             };
         };
@@ -817,7 +817,7 @@ impl OpcodeBackend<'_> {
         let (lt, rt) = operand_ty_pair(left, right, &|i: &usize| self.cols[*i].ty);
         if lt.tc.is_temporal() || rt.tc.is_temporal() {
             if op.as_cmp().is_none() && temporal_arith_type(op, lt, rt).is_none() {
-                return Err(GnitzSqlError::Unsupported(format!(
+                return Err(GnitzSqlError::Rejected(format!(
                     "operator {op:?} is not supported on a DATE/TIMESTAMP operand"
                 )));
             }
@@ -866,7 +866,7 @@ impl OpcodeBackend<'_> {
     ) -> Result<(Reg, ExprKind), GnitzSqlError> {
         let out = decimal_compute_type(op, lt, rt);
         if out.tc == TypeCode::String {
-            return Err(GnitzSqlError::Unsupported(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "operator {op:?} is not supported between a DECIMAL and a string"
             )));
         }
@@ -908,7 +908,7 @@ impl OpcodeBackend<'_> {
         if is_float {
             let op = op
                 .as_float_arith()
-                .ok_or_else(|| GnitzSqlError::Unsupported("float modulo not supported".to_string()))?;
+                .ok_or_else(|| GnitzSqlError::Rejected("float modulo not supported".to_string()))?;
             return Ok((self.eb.emit(L::FloatArith { op, a: l, b: r }), out));
         }
         let op = op
@@ -929,12 +929,12 @@ impl OpcodeBackend<'_> {
         (b, b_kind): (Reg, ExprKind),
     ) -> Result<(Reg, ExprKind), GnitzSqlError> {
         let Some(cmp) = op.as_cmp() else {
-            return Err(GnitzSqlError::Unsupported(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "operator {op:?} is not supported on a string operand"
             )));
         };
         if a_kind != ExprKind::Str || b_kind != ExprKind::Str {
-            return Err(GnitzSqlError::Unsupported(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "comparison {op:?} against a string needs both operands to be strings"
             )));
         }

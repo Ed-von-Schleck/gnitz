@@ -272,7 +272,7 @@ fn a_distinct_aggregate_that_cannot_share_one_distinct_set_is_rejected() {
         ("SELECT COUNT(DISTINCT *) FROM t", "needs a column argument"),
     ] {
         match bound_cols(sql).map(|_| ()) {
-            Err(GnitzSqlError::Unsupported(m)) => assert!(m.contains(needle), "{sql}: {m}"),
+            Err(GnitzSqlError::Rejected(m)) => assert!(m.contains(needle), "{sql}: {m}"),
             other => panic!("{sql}: {other:?}"),
         }
     }

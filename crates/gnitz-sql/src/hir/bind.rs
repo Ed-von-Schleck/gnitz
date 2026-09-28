@@ -134,7 +134,7 @@ fn resolve_relation(cx: &mut BindCx<'_>, name: &str) -> Result<Rc<RelExpr>, Gnit
     let rel = cx.cat.probe_relation(name)?;
     // The replaced view is retracted in the same bundle, taking the body's input with it.
     if cx.view.replacing == Some(rel.tid) {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "{} '{}.{name}' AS a query referencing the view itself is not supported",
             cx.view.stmt,
             cx.cat.schema_name()
@@ -144,7 +144,7 @@ fn resolve_relation(cx: &mut BindCx<'_>, name: &str) -> Result<Rc<RelExpr>, Gnit
     // which a view over it cannot reach.
     match rel.class {
         RelClass::BoundedView => {
-            return Err(GnitzSqlError::Unsupported(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "'{name}' is a capacity-bounded view; views cannot be created over it"
             )))
         }
@@ -174,14 +174,14 @@ impl<'a> QueryTail<'a> {
                 reject_if(query.limit_clause.is_some(), stmt, "OFFSET without ORDER BY … LIMIT")?;
                 Ok(None)
             }
-            (false, None) => Err(GnitzSqlError::Unsupported(format!(
+            (false, None) => Err(GnitzSqlError::Rejected(format!(
                 "{stmt}: ORDER BY without LIMIT — a view holds an unordered set, so an order alone \
                  maintains nothing; add LIMIT n to maintain the top n rows"
             ))),
-            (true, Some(_)) => Err(GnitzSqlError::Unsupported(format!(
+            (true, Some(_)) => Err(GnitzSqlError::Rejected(format!(
                 "{stmt}: LIMIT without ORDER BY names no rows in particular; add ORDER BY"
             ))),
-            (false, Some(0)) => Err(GnitzSqlError::Plan(format!("{stmt}: LIMIT 0 selects nothing"))),
+            (false, Some(0)) => Err(GnitzSqlError::Rejected(format!("{stmt}: LIMIT 0 selects nothing"))),
             (false, Some(limit)) => Ok(Some(QueryTail {
                 keys,
                 limit: limit as u64,
@@ -221,7 +221,7 @@ impl<'a> QueryTail<'a> {
             match output_column(e, cols.iter().map(|c| &c.def))? {
                 Some(at) => placed.push(at),
                 None => {
-                    return Err(GnitzSqlError::Unsupported(format!(
+                    return Err(GnitzSqlError::Rejected(format!(
                         "{stmt}: ORDER BY over a set operation names an output column or position"
                     )))
                 }
@@ -254,7 +254,7 @@ pub(crate) fn bind_body(cx: &mut BindCx<'_>, body: &SetExpr) -> Result<Rc<RelExp
         SetExpr::Select(select) => bind_select(cx, select, None),
         SetExpr::SetOperation { op, set_quantifier, left, right } => bind_set_op(cx, *op, *set_quantifier, left, right),
         SetExpr::Query(q) => bind_body(cx, reject_query_envelope_body(q, "parenthesized query")?),
-        _ => Err(GnitzSqlError::Unsupported(format!(
+        _ => Err(GnitzSqlError::Rejected(format!(
             "{} only supports SELECT and set operations",
             cx.view.stmt
         ))),
@@ -274,7 +274,7 @@ fn resolve_table_factor(
 ) -> Result<(Rc<RelExpr>, String, Vec<HirCol>), GnitzSqlError> {
     if let TableFactor::Derived { lateral, subquery, alias, sample } = factor {
         let Some(alias) = alias else {
-            return Err(GnitzSqlError::Unsupported(
+            return Err(GnitzSqlError::Rejected(
                 "a derived table (subquery in FROM) needs an alias".to_string(),
             ));
         };
@@ -316,7 +316,7 @@ fn bind_select(
     tail: Option<&QueryTail<'_>>,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let Some(first) = select.from.first() else {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "{}: a view body reads at least one relation; this one has no FROM clause",
             cx.view.stmt
         )));
@@ -363,7 +363,7 @@ fn bind_select(
             } else {
                 "SELECT DISTINCT"
             };
-            return Err(GnitzSqlError::Unsupported(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "EXISTS/IN subqueries are not supported together with {clause}; \
                  put the subquery in an inner view"
             )));
@@ -438,7 +438,7 @@ fn bind_body_suffix(
 fn reject_unselected_distinct_keys(projected: &RelExpr, placed: &[usize], ctx: &str) -> Result<(), GnitzSqlError> {
     let cols = projected.cols();
     if placed.iter().any(|&at| cols[at].def.is_hidden) {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "{ctx}: an ORDER BY key under SELECT DISTINCT must be a selected column"
         )));
     }
@@ -648,7 +648,7 @@ impl LeafBinder<ColId> for ScopeLeaf<'_> {
             Some((None, name)) => self.scope.resolve_unqualified(name)?,
             Some((Some(qual), name)) => self.scope.resolve_qualified(qual, name)?,
             None => {
-                return Err(GnitzSqlError::Unsupported(format!(
+                return Err(GnitzSqlError::Rejected(format!(
                     "{}: only column references supported",
                     self.clause
                 )))
@@ -663,7 +663,7 @@ impl LeafBinder<ColId> for ScopeLeaf<'_> {
         classify_agg_call(f)?;
         Err(clause_error(
             self.clause,
-            GnitzSqlError::Unsupported("aggregate functions are not allowed here".to_string()),
+            GnitzSqlError::Rejected("aggregate functions are not allowed here".to_string()),
         ))
     }
 
@@ -684,7 +684,7 @@ impl LeafBinder<ColId> for ScopeLeaf<'_> {
                 self.clause,
                 crate::bind::structural::unsupported_subquery(e),
             )),
-            SubPolicy::Reject(m) => Err(GnitzSqlError::Unsupported(m.to_string())),
+            SubPolicy::Reject(m) => Err(GnitzSqlError::Rejected(m.to_string())),
         }
     }
 }
@@ -759,13 +759,13 @@ fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_>, subquery: &'e Query) -> Result<Inn
     let inner_select = as_plain_select(reject_query_envelope_body(subquery, ctx)?, ctx)?;
     reject_unhonored_select_clauses(inner_select, HonoredClauses::PLAIN, ctx)?;
     let FromShape::SinglePlainRelation(factor) = classify_from(&inner_select.from) else {
-        return Err(GnitzSqlError::Unsupported(
+        return Err(GnitzSqlError::Rejected(
             "EXISTS/IN subquery: only a single FROM table without JOINs is supported; compose via views".into(),
         ));
     };
     let (inner_name, inner_alias) = extract_table_name_and_alias(factor, cx.cx.cat.schema_name(), "subquery")?;
     if outer_alias.eq_ignore_ascii_case(&inner_alias) {
-        return Err(GnitzSqlError::Bind(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "relation alias '{outer_alias}' is used by both the view FROM and its subquery; rename one"
         )));
     }
@@ -791,7 +791,7 @@ fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_>, subquery: &'e Query) -> Result<Inn
             match side(&bound, &inner_cols, outer_env) {
                 Side::Left | Side::Neither => local_preds.push(bound),
                 Side::Right => {
-                    return Err(GnitzSqlError::Unsupported(
+                    return Err(GnitzSqlError::Rejected(
                         "a subquery WHERE conjunct references only the outer relation; \
                          hoist it into the view's own WHERE clause"
                             .into(),
@@ -815,7 +815,7 @@ fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_>, subquery: &'e Query) -> Result<Inn
 fn single_projection_expr<'e>(select: &'e Select, err: &str) -> Result<&'e Expr, GnitzSqlError> {
     match select.projection.as_slice() {
         [SelectItem::UnnamedExpr(e)] | [SelectItem::ExprWithAlias { expr: e, .. }] => Ok(e),
-        _ => Err(GnitzSqlError::Unsupported(err.into())),
+        _ => Err(GnitzSqlError::Rejected(err.into())),
     }
 }
 
@@ -849,7 +849,7 @@ fn bind_exists_sub(
     if let Some(operand) = in_operand {
         // IN shape: reject a tuple / non-plain-column LHS before extracting the pair.
         if matches!(operand, Expr::Tuple(_)) {
-            return Err(GnitzSqlError::Unsupported(
+            return Err(GnitzSqlError::Rejected(
                 "IN (SELECT …): tuple operands are not supported".into(),
             ));
         }
@@ -904,7 +904,7 @@ fn bind_quantifier_sub(
     is_any: bool,
 ) -> Result<HirExpr, GnitzSqlError> {
     let Expr::Subquery(q) = right else {
-        return Err(GnitzSqlError::Unsupported(
+        return Err(GnitzSqlError::Rejected(
             "an ANY/ALL operator's right operand must be a subquery".into(),
         ));
     };
@@ -912,19 +912,19 @@ fn bind_quantifier_sub(
         (true, BinaryOperator::Eq) => return bind_exists_sub(cx, q, Some(left), false),
         (false, BinaryOperator::NotEq) => return bind_exists_sub(cx, q, Some(left), true),
         (true, BinaryOperator::NotEq) => {
-            return Err(GnitzSqlError::Unsupported(
+            return Err(GnitzSqlError::Rejected(
                 "`<> ANY (SELECT …)` is not supported (use NOT (x = ALL …) semantics via a wrapping view)".into(),
             ))
         }
         (false, BinaryOperator::Eq) => {
-            return Err(GnitzSqlError::Unsupported("`= ALL (SELECT …)` is not supported".into()))
+            return Err(GnitzSqlError::Rejected("`= ALL (SELECT …)` is not supported".into()))
         }
         (_, BinaryOperator::Lt) => BinOp::Lt,
         (_, BinaryOperator::LtEq) => BinOp::Le,
         (_, BinaryOperator::Gt) => BinOp::Gt,
         (_, BinaryOperator::GtEq) => BinOp::Ge,
         _ => {
-            return Err(GnitzSqlError::Unsupported(
+            return Err(GnitzSqlError::Rejected(
                 "only range (<, <=, >, >=), `= ANY`, and `<> ALL` quantified comparisons are supported".into(),
             ))
         }
@@ -942,7 +942,7 @@ fn bind_quantifier_sub(
     let proj_expr = single_projection_expr(ir.inner_select, err)?;
     let inner_col = bind_plain_col(proj_expr, &ir.inner_cols, &ir.inner_alias, err)?;
     if hircol_of(&ir.inner_cols, inner_col).def.is_nullable {
-        return Err(GnitzSqlError::Unsupported(
+        return Err(GnitzSqlError::Rejected(
             "a range ANY/ALL subquery's column must be NOT NULL — a NULL in the set makes ANY/ALL \
              three-valued in a way the MIN/MAX rewrite cannot reproduce"
                 .into(),
@@ -969,7 +969,7 @@ fn bind_quantifier_sub(
 fn bind_plain_col(e: &Expr, env: &[HirCol], alias: &str, err: &str) -> Result<ColId, GnitzSqlError> {
     single_relation_col_idx(env.iter().map(|c| &c.def), alias, e)
         .map(|i| env[i].id)
-        .map_err(|_| GnitzSqlError::Unsupported(err.into()))
+        .map_err(|_| GnitzSqlError::Rejected(err.into()))
 }
 
 /// Classify a scalar subquery's single-aggregate projection into `(func, arg)`.
@@ -980,10 +980,10 @@ fn classify_scalar_agg(
     non_agg: &str,
 ) -> Result<(AggFunc, Option<ColId>), GnitzSqlError> {
     let Expr::Function(f) = peel_nested(e) else {
-        return Err(GnitzSqlError::Unsupported(non_agg.into()));
+        return Err(GnitzSqlError::Rejected(non_agg.into()));
     };
     if !is_agg_call(f) {
-        return Err(GnitzSqlError::Unsupported(non_agg.into()));
+        return Err(GnitzSqlError::Rejected(non_agg.into()));
     }
     let (func, arg_expr) = classify_agg_call(f)?;
     let arg = match arg_expr.reject_distinct("a scalar subquery aggregate")? {
@@ -1007,14 +1007,14 @@ fn scalar_group_cols(correlation: &[HirExpr], outer: &[HirCol], inner: &[HirCol]
         match cross_comparison(conj, outer, inner) {
             Some((_, inner, BinOp::Eq)) => cols.push(inner.id),
             Some((_, _, op)) if op.as_range_rel().is_some() => {
-                return Err(GnitzSqlError::Unsupported(
+                return Err(GnitzSqlError::Rejected(
                     "a scalar/quantifier subquery cannot use a range correlation (only equality \
                      `inner_col = outer_col` conjuncts are supported)"
                         .into(),
                 ))
             }
             _ => {
-                return Err(GnitzSqlError::Unsupported(
+                return Err(GnitzSqlError::Rejected(
                     "a scalar/quantifier subquery's correlation contains a conjunct that is not an \
                      `inner_col = outer_col` equality; filter inside the subquery or a wrapping view"
                         .into(),
@@ -1070,7 +1070,7 @@ fn join_keys_and_type(join: &sqlparser::ast::Join) -> Result<(&JoinConstraint, J
         JoinOperator::FullOuter(c) => (c, JoinType::Full),
         JoinOperator::CrossJoin(c) => (c, JoinType::Inner),
         _ => {
-            return Err(GnitzSqlError::Unsupported(
+            return Err(GnitzSqlError::Rejected(
                 "JOIN: only INNER / LEFT / RIGHT / FULL JOIN, with ON / USING / \
                  NATURAL, are supported"
                     .into(),
@@ -1134,7 +1134,7 @@ fn fold_join_step(
     };
 
     if kind == JoinType::Full && !pairs.is_empty() {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "FULL JOIN … {merge_clause} is not supported: the merged column would be \
              COALESCE(left, right), which the join scope cannot name — the merge \
              retargets the shared name to one side's column, and a column reference \
@@ -1173,12 +1173,12 @@ fn merge_pairs(
         // scope's own wording says so — reporting it as "not found" would send
         // the reader looking for a column that is right there, twice.
         let l = scope.find_unqualified(name)?.ok_or_else(|| {
-            GnitzSqlError::Bind(format!(
+            GnitzSqlError::Rejected(format!(
                 "JOIN {clause}: column '{name}' not found on the left of the join"
             ))
         })?;
         let idx = find_unique_column(rcols.iter().map(|c| &c.def), name)?.ok_or_else(|| {
-            GnitzSqlError::Bind(format!(
+            GnitzSqlError::Rejected(format!(
                 "JOIN {clause}: column '{name}' not found on the right of the join"
             ))
         })?;
@@ -1275,10 +1275,10 @@ impl JoinScope {
             .relations
             .iter()
             .find(|(a, _)| a.eq_ignore_ascii_case(alias))
-            .ok_or_else(|| GnitzSqlError::Bind(format!("table alias '{alias}' not found")))?;
+            .ok_or_else(|| GnitzSqlError::Rejected(format!("table alias '{alias}' not found")))?;
         let cols = self.rel_cols(span);
         let idx = find_unique_column(cols.iter().map(|c| &c.def), name)?
-            .ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found in table '{alias}'")))?;
+            .ok_or_else(|| GnitzSqlError::Rejected(format!("column '{name}' not found in table '{alias}'")))?;
         Ok(cols[idx].id)
     }
 
@@ -1293,7 +1293,7 @@ impl JoinScope {
 
     fn resolve_unqualified(&self, name: &str) -> Result<ColId, GnitzSqlError> {
         self.find_unqualified(name)?
-            .ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found in any table")))
+            .ok_or_else(|| GnitzSqlError::Rejected(format!("column '{name}' not found in any table")))
     }
 }
 
@@ -1366,13 +1366,8 @@ impl<'a> PreMap<'a> {
 /// A rejection raised while binding one clause, named with it. The message already
 /// says what is wrong with the reference; only the clause is added.
 fn clause_error(clause: &str, e: GnitzSqlError) -> GnitzSqlError {
-    let prefixed = |m: String| format!("{clause}: {m}");
     match e {
-        GnitzSqlError::Bind(m) => GnitzSqlError::Bind(prefixed(m)),
-        GnitzSqlError::Plan(m) => GnitzSqlError::Plan(prefixed(m)),
-        GnitzSqlError::Unsupported(m) => GnitzSqlError::Unsupported(prefixed(m)),
-        // Not a verdict about the written reference — a control signal or an
-        // internal break, which must reach its handler unedited.
+        GnitzSqlError::Rejected(m) => GnitzSqlError::Rejected(format!("{clause}: {m}")),
         other => other,
     }
 }
@@ -1464,12 +1459,12 @@ fn distinct_arg(calls: &[AggKey]) -> Result<Option<ColId>, GnitzSqlError> {
         return Ok(None);
     };
     if calls.iter().any(|c| matches!(c.arg, AggArg::Distinct(a) if a != arg)) {
-        return Err(GnitzSqlError::Unsupported(
+        return Err(GnitzSqlError::Rejected(
             "DISTINCT aggregates: every DISTINCT aggregate of one query must read the same argument".into(),
         ));
     }
     if calls.iter().any(|c| !survives_dedup(c, arg)) {
-        return Err(GnitzSqlError::Unsupported(
+        return Err(GnitzSqlError::Rejected(
             "DISTINCT aggregates: a plain aggregate cannot be mixed with them, except MIN/MAX of the \
              DISTINCT argument"
                 .into(),
@@ -1606,7 +1601,7 @@ fn bind_grouped_suffix(
     // An ad-hoc read lowers to one stateless fold over one scan, which has no room
     // for the `Distinct` below the reduce.
     if surface == Surface::AdhocRead && calls.iter().any(|c| matches!(c.arg, AggArg::Distinct(_))) {
-        return Err(GnitzSqlError::Unsupported(
+        return Err(GnitzSqlError::Rejected(
             "DISTINCT aggregates are supported in a CREATE VIEW body only".into(),
         ));
     }
@@ -1733,18 +1728,16 @@ impl GroupedLeaf<'_> {
         // already aggregates rather than a second one.
         let arg = match arg_expr.ignoring_distinct() {
             Some(e) => Some(find_bound(self.extra, &bind_structural(e, self.leaf)?).ok_or_else(|| {
-                GnitzSqlError::Unsupported(format!("{}: unsupported aggregate argument {e}", self.clause))
+                GnitzSqlError::Internal(format!("{}: unsupported aggregate argument {e}", self.clause))
             })?),
             None => None,
         };
-        // Defensive on both paths: an aggregate reaching this leaf was collected
-        // into the reduce first, so no SQL body resolves to the rejection.
         self.aggs
             .iter()
             .find(|a| a.func == func && a.arg == arg)
             .ok_or_else(|| {
                 let name = arg.map_or("*", |id| hircol_of(self.env, id).def.name.as_str());
-                GnitzSqlError::Bind(format!(
+                GnitzSqlError::Internal(format!(
                     "{}: aggregate {func:?}({name}) could not be resolved",
                     self.clause
                 ))
@@ -1802,11 +1795,11 @@ impl LeafBinder<ColId> for GroupedLeaf<'_> {
         match find_bound(self.extra, &bound).filter(|id| self.group_cols.contains(id)) {
             Some(id) => Ok(BExpr::ColRef(id)),
             None => Err(match col_ref_parts(e).map(|(_, n)| n) {
-                Some(name) => GnitzSqlError::Plan(format!(
+                Some(name) => GnitzSqlError::Rejected(format!(
                     "{}: column '{name}' must appear in GROUP BY or an aggregate function",
                     self.clause
                 )),
-                None => GnitzSqlError::Unsupported(format!("{}: expected a group key or an aggregate", self.clause)),
+                None => GnitzSqlError::Rejected(format!("{}: expected a group key or an aggregate", self.clause)),
             }),
         }
     }
@@ -1833,14 +1826,14 @@ fn bind_set_op(
     left: &SetExpr,
     right: &SetExpr,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
-    match quantifier {
-        SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName => {
-            return Err(GnitzSqlError::Unsupported(
-                "BY NAME set operations are not supported".into(),
-            ))
-        }
-        _ => {}
-    }
+    reject_if(
+        matches!(
+            quantifier,
+            SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName
+        ),
+        "set operations",
+        "BY NAME",
+    )?;
     // Exhaustive (no `_`): a set operator a future `sqlparser` adds stops the
     // build here rather than reaching `RelExpr::set_op` as a silent EXCEPT.
     let kind = match op {

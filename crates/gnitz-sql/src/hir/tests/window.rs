@@ -56,7 +56,7 @@ fn visible(cols: &[ColumnDef]) -> Vec<(String, TypeCode, bool)> {
 
 fn rejects(sql: &str, needle: &str) {
     match plan(sql) {
-        Err(GnitzSqlError::Unsupported(m)) | Err(GnitzSqlError::Bind(m)) | Err(GnitzSqlError::Plan(m)) => {
+        Err(GnitzSqlError::Rejected(m)) => {
             assert!(
                 m.contains(needle),
                 "{sql}\n  rejected with {m:?}\n  expected {needle:?}"
@@ -248,7 +248,7 @@ fn frames_and_functions_outside_the_supported_set_are_rejected() {
     );
     rejects(
         "SELECT id, SUM(DISTINCT a) OVER () FROM t",
-        "DISTINCT: not supported on window functions",
+        "window functions: DISTINCT is not supported",
     );
     rejects("SELECT id, SUM(a) FILTER (WHERE a > 1) OVER () FROM t", "FILTER");
     rejects("SELECT id, SUM(s) OVER () FROM t", "SUM: not supported on STRING");

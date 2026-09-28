@@ -1083,7 +1083,7 @@ fn decode_push_txn_frame(cat: &CatalogEngine, body: &[u8]) -> Result<DecodedTxn,
 fn not_found(tid: i64) -> WireFault {
     WireFault {
         status: WireStatus::NotFound,
-        text: format!("table {tid} not found"),
+        text: format!("relation {tid} not found"),
     }
 }
 

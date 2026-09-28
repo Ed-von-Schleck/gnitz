@@ -163,7 +163,7 @@ fn double_quoted_uuid_binds_as_column_ref_not_seek() {
         &schema,
     )
     .expect_err("double-quoted token must not bind as a literal");
-    assert!(matches!(err, crate::GnitzSqlError::Bind(_)), "got {err:?}");
+    assert!(matches!(err, crate::GnitzSqlError::Rejected(_)), "got {err:?}");
 }
 
 /// A qualified reference resolves to the same column (the single-relation

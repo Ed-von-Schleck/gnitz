@@ -24,7 +24,7 @@ fn decode_view_options(options: &CreateTableOptions) -> Result<ViewProps, GnitzS
         capacity.map(|v| size_option("capacity", v)).transpose()?,
         delta.map(|v| size_option("delta", v)).transpose()?,
     )
-    .map_err(|e| GnitzSqlError::Unsupported(format!("CREATE VIEW WITH (capacity …, delta …): {e}")))
+    .map_err(|e| GnitzSqlError::Rejected(format!("CREATE VIEW WITH (capacity …, delta …): {e}")))
 }
 
 /// The byte count of one size-valued `CREATE VIEW` option.
@@ -33,7 +33,7 @@ fn size_option(option: &str, value: &sqlparser::ast::Expr) -> Result<u64, GnitzS
         value: Value::SingleQuotedString(text), ..
     }) = value
     else {
-        return Err(GnitzSqlError::Plan(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "CREATE VIEW option `{option}` takes a single-quoted size string, e.g. '256 MB'"
         )));
     };
@@ -46,7 +46,7 @@ fn size_option(option: &str, value: &sqlparser::ast::Expr) -> Result<u64, GnitzS
 /// budget one that retains nothing.
 fn parse_size(option: &str, text: &str) -> Result<u64, GnitzSqlError> {
     let bad = || {
-        GnitzSqlError::Plan(format!(
+        GnitzSqlError::Rejected(format!(
             "CREATE VIEW option `{option}`: '{text}' is not a size like '256 MB' \
              (a positive integer followed by KB, MB or GB)"
         ))
@@ -62,7 +62,7 @@ fn parse_size(option: &str, text: &str) -> Result<u64, GnitzSqlError> {
         .map(|&(_, m)| m)
         .ok_or_else(bad)?;
     match num.checked_mul(mult) {
-        Some(0) | None => Err(GnitzSqlError::Plan(format!(
+        Some(0) | None => Err(GnitzSqlError::Rejected(format!(
             "CREATE VIEW option `{option}`: '{text}' is out of range (must be positive and fit a u64)"
         ))),
         Some(bytes) => Ok(bytes),
@@ -183,7 +183,7 @@ fn resolve_view_id(cat: &Catalog<'_>, name: &str) -> Result<u64, GnitzSqlError> 
         RelClass::View => return Ok(rel.tid),
         RelClass::Table | RelClass::Stream => unreachable!("require_class admits views only"),
     };
-    Err(GnitzSqlError::Unsupported(format!(
+    Err(GnitzSqlError::Rejected(format!(
         "ALTER VIEW cannot retarget {option}; DROP and CREATE '{name}' instead"
     )))
 }

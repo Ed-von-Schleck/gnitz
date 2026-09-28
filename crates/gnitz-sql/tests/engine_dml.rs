@@ -16,11 +16,11 @@ fn rejected_inserts_write_nothing() {
     let (_srv, mut client, sn) = boot(1);
     exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     for (sql, variant, needle) in [
-        ("INSERT INTO t VALUES (1)", "Bind", "expects 2 value(s)"),
-        ("INSERT INTO t VALUES (1, 10, 99)", "Bind", "expects 2 value(s)"),
+        ("INSERT INTO t VALUES (1)", "Rejected", "expects 2 value(s)"),
+        ("INSERT INTO t VALUES (1, 10, 99)", "Rejected", "expects 2 value(s)"),
         (
             "INSERT INTO t VALUES (1, EXTRACT(YEAR FROM 2))",
-            "Unsupported",
+            "Rejected",
             "EXTRACT(YEAR FROM 2)",
         ),
     ] {
@@ -42,13 +42,13 @@ fn writes_and_indexes_need_a_base_table() {
         "DELETE FROM v",
         "CREATE INDEX ix ON v (v)",
     ] {
-        assert_rejects_variant(&mut client, &sn, sql, "Unsupported", "is a view");
+        assert_rejects_variant(&mut client, &sn, sql, "Rejected", "is a view");
     }
     for sql in [
         "INSERT INTO _seg999999 VALUES (1, 1)",
         "CREATE INDEX ix ON _seg999999 (v)",
     ] {
-        assert_rejects_variant(&mut client, &sn, sql, "Plan", "cannot start with '_'");
+        assert_rejects_variant(&mut client, &sn, sql, "Rejected", "cannot start with '_'");
     }
 }
 
@@ -66,94 +66,82 @@ fn a_refused_write_names_its_rule_and_writes_nothing() {
         exec(&mut client, &sn, sql);
     }
     for (sql, variant, needle) in [
-        (
-            "INSERT INTO t VALUES (2, 20, 'b') LIMIT 1",
-            "Unsupported",
-            "LIMIT/OFFSET",
-        ),
-        (
-            "INSERT INTO t VALUES (2, 20, 'b') FOR UPDATE",
-            "Unsupported",
-            "FOR UPDATE",
-        ),
-        ("INSERT IGNORE INTO t VALUES (2, 20, 'b')", "Unsupported", "IGNORE"),
-        ("REPLACE INTO t VALUES (2, 20, 'b')", "Unsupported", "REPLACE INTO"),
+        ("INSERT INTO t VALUES (2, 20, 'b') LIMIT 1", "Rejected", "LIMIT/OFFSET"),
+        ("INSERT INTO t VALUES (2, 20, 'b') FOR UPDATE", "Rejected", "FOR UPDATE"),
+        ("INSERT IGNORE INTO t VALUES (2, 20, 'b')", "Rejected", "IGNORE"),
+        ("REPLACE INTO t VALUES (2, 20, 'b')", "Rejected", "REPLACE INTO"),
         // RETURNING binds as a SELECT list does, so it refuses what one refuses,
         // and it is not accepted beside ON CONFLICT.
         (
             "INSERT INTO t VALUES (2, 20, 'b') RETURNING * REPLACE (v + 1 AS v)",
-            "Unsupported",
+            "Rejected",
             "REPLACE",
         ),
         (
             "INSERT INTO t VALUES (2, 20, 'b') ON CONFLICT (id) DO NOTHING RETURNING id",
-            "Unsupported",
-            "RETURNING with ON CONFLICT",
+            "Rejected",
+            "ON CONFLICT: RETURNING",
         ),
         // A conflict target names exactly the primary key: not another column,
         // not more, not a prefix.
         (
             "INSERT INTO t VALUES (2, 20, 'b') ON CONFLICT (v) DO NOTHING",
-            "Unsupported",
+            "Rejected",
             "primary key",
         ),
         (
             "INSERT INTO t VALUES (2, 20, 'b') ON CONFLICT (id, v) DO NOTHING",
-            "Unsupported",
+            "Rejected",
             "primary key",
         ),
         (
             "INSERT INTO c VALUES (1, 1, 10) ON CONFLICT (a) DO NOTHING",
-            "Unsupported",
+            "Rejected",
             "primary key",
         ),
         (
             "INSERT INTO t VALUES (1, 20, 'b') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v WHERE v > 5",
-            "Unsupported",
-            "DO UPDATE WHERE",
+            "Rejected",
+            "DO UPDATE: WHERE",
         ),
         (
             "INSERT INTO t VALUES (1, 20, 'b'), (1, 30, 'c') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
-            "Bind",
+            "Rejected",
             "second time",
         ),
-        (
-            "UPDATE t SET v = 9 WHERE id = 1 RETURNING id",
-            "Unsupported",
-            "RETURNING",
-        ),
-        ("DELETE FROM t WHERE id = 1 RETURNING id", "Unsupported", "RETURNING"),
-        ("DELETE FROM t LIMIT 1", "Unsupported", "LIMIT"),
-        ("DELETE FROM t ORDER BY id", "Unsupported", "ORDER BY"),
+        ("UPDATE t SET v = 9 WHERE id = 1 RETURNING id", "Rejected", "RETURNING"),
+        ("DELETE FROM t WHERE id = 1 RETURNING id", "Rejected", "RETURNING"),
+        ("DELETE FROM t LIMIT 1", "Rejected", "LIMIT"),
+        ("DELETE FROM t ORDER BY id", "Rejected", "ORDER BY"),
         // The join forms are refused before any name resolves, so `other` need
         // not exist.
         (
             "UPDATE t SET v = o.v FROM other o WHERE t.id = o.id",
-            "Unsupported",
+            "Rejected",
             "join-update",
         ),
         (
             "DELETE FROM t USING other o WHERE t.id = o.id",
-            "Unsupported",
+            "Rejected",
             "join-delete",
         ),
         (
             "UPDATE t JOIN c ON t.id = c.a SET v = 1",
-            "Unsupported",
+            "Rejected",
             "exactly one simple FROM",
         ),
-        ("UPDATE t SET id = 9 WHERE id = 1", "Unsupported", "primary key"),
-        ("UPDATE t SET v = UPPER(s)", "Bind", "cannot assign a string value"),
+        ("UPDATE t SET id = 9 WHERE id = 1", "Rejected", "primary key"),
+        ("UPDATE t SET v = UPPER(s)", "Rejected", "cannot assign a string value"),
         // A written alias displaces the table name, and a qualifier naming
         // anything else is not silently ignored.
-        ("UPDATE t AS x SET v = 1 WHERE t.v = 1", "Bind", "not found"),
-        ("DELETE FROM t WHERE nope.v = 1", "Bind", "not found"),
+        ("UPDATE t AS x SET v = 1 WHERE t.v = 1", "Rejected", "not found"),
+        ("DELETE FROM t WHERE nope.v = 1", "Rejected", "not found"),
         // A stream has no stored row to mutate or to resolve a conflict against.
-        ("UPDATE st SET v = 1 WHERE id = 1", "Unsupported", "is a stream"),
-        ("DELETE FROM st WHERE id = 1", "Unsupported", "is a stream"),
+        ("UPDATE st SET v = 1 WHERE id = 1", "Rejected", "is a stream"),
+        ("DELETE FROM st WHERE id = 1", "Rejected", "is a stream"),
         (
             "INSERT INTO st VALUES (1, 2) ON CONFLICT (id) DO NOTHING",
-            "Unsupported",
+            "Rejected",
             "is a stream",
         ),
     ] {
@@ -268,7 +256,7 @@ fn a_concurrent_add_column_fails_the_commit_cleanly() {
     exec(&mut b, &sn, "ALTER TABLE t ADD COLUMN c BIGINT");
     exec(&mut a, &sn, "INSERT INTO t (id, v) VALUES (3, 30)");
     let e = try_exec(&mut a, &sn, "COMMIT").expect_err("the table's layout changed");
-    assert_eq!(variant_of(&e).0, "Exec", "{e:?}");
+    assert_eq!(variant_of(&e).0, "Client", "{e:?}");
     assert!(!a.txn_active());
 
     assert_eq!(
@@ -376,7 +364,7 @@ fn a_text_table_past_one_frame_reads_back_whole_where_a_whole_table_update_still
 
     // …while one matching the whole table still fails, now on the write-back
     // push rather than on the read that feeds it.
-    assert_rejects_variant(&mut client, &sn, "UPDATE t SET v = 0", "Exec", INGRESS_ERR);
+    assert_rejects_variant(&mut client, &sn, "UPDATE t SET v = 0", "Client", INGRESS_ERR);
 
     // The no-WHERE DELETE reads every key and nothing else, and clears the table.
     assert_eq!(affected(&mut client, &sn, "DELETE FROM t"), ROWS as usize - per_group);
@@ -432,7 +420,7 @@ fn update_rejects_a_qualified_target() {
         &mut client,
         &sn,
         "UPDATE t SET x.v = 1",
-        "Plan",
+        "Rejected",
         "column must be a simple identifier",
     );
     assert_eq!(rows(&mut client, &sn, "SELECT id, v FROM t", &["id", "v"]), [[1, 1, 1]]);

@@ -37,7 +37,7 @@ pub(super) fn lower_topn(chain: &mut ViewChain, rel: &RelExpr) -> Result<EmitPie
         }
     }
     if key_ids.len() > gnitz_wire::MAX_ORDER_KEYS {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "ORDER BY: more than {} keys, the input's key included",
             gnitz_wire::MAX_ORDER_KEYS
         )));

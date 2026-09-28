@@ -164,7 +164,7 @@ pub(crate) fn reply_program(
         .map(|&c| source.columns[c as usize].clone().hidden());
     let k = source.pk_count() as u32;
     let schema = Schema::from_parts(key.chain(payload_cols).collect(), (0..k).collect())
-        .map_err(|e| GnitzSqlError::Unsupported(format!("{what}: {e}")))?;
+        .map_err(|e| GnitzSqlError::Rejected(format!("{what}: {e}")))?;
     Ok((schema, program))
 }
 

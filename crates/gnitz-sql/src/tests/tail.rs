@@ -26,7 +26,7 @@ fn a_position_names_a_visible_column() {
     for sql in ["SELECT * FROM t ORDER BY 0", "SELECT * FROM t ORDER BY 4"] {
         let q = parse_query(sql);
         match key_slots(&keys_of(&q), &cols, []) {
-            Err(GnitzSqlError::Unsupported(m)) => assert!(m.contains("ORDER BY position"), "{sql}: {m}"),
+            Err(GnitzSqlError::Rejected(m)) => assert!(m.contains("ORDER BY position"), "{sql}: {m}"),
             other => panic!("{sql}: {other:?}"),
         }
     }
@@ -74,7 +74,7 @@ fn extract_limit_offset_literals_and_errors() {
         "SELECT * FROM t LIMIT -1",
     ] {
         assert!(
-            matches!(extract_limit(&parse_query(sql)), Err(GnitzSqlError::Unsupported(_))),
+            matches!(extract_limit(&parse_query(sql)), Err(GnitzSqlError::Rejected(_))),
             "{sql} must error"
         );
     }
@@ -83,7 +83,7 @@ fn extract_limit_offset_literals_and_errors() {
         "SELECT * FROM t LIMIT 1 OFFSET 'x'",
     ] {
         assert!(
-            matches!(extract_offset(&parse_query(sql)), Err(GnitzSqlError::Unsupported(_))),
+            matches!(extract_offset(&parse_query(sql)), Err(GnitzSqlError::Rejected(_))),
             "{sql} must error"
         );
     }
@@ -105,7 +105,7 @@ fn resolve_order_by_rejects_clickhouse_duckdb_extensions() {
         kind: OrderByKind::All(OrderByOptions::default()),
         interpolate: None,
     };
-    assert!(matches!(resolve_order_by(&all), Err(GnitzSqlError::Unsupported(_))));
+    assert!(matches!(resolve_order_by(&all), Err(GnitzSqlError::Rejected(_))));
 
     let interpolate = OrderBy {
         kind: OrderByKind::Expressions(vec![ident_key()]),
@@ -113,7 +113,7 @@ fn resolve_order_by_rejects_clickhouse_duckdb_extensions() {
     };
     assert!(matches!(
         resolve_order_by(&interpolate),
-        Err(GnitzSqlError::Unsupported(_))
+        Err(GnitzSqlError::Rejected(_))
     ));
 
     let with_fill = OrderBy {
@@ -124,8 +124,5 @@ fn resolve_order_by_rejects_clickhouse_duckdb_extensions() {
         }]),
         interpolate: None,
     };
-    assert!(matches!(
-        resolve_order_by(&with_fill),
-        Err(GnitzSqlError::Unsupported(_))
-    ));
+    assert!(matches!(resolve_order_by(&with_fill), Err(GnitzSqlError::Rejected(_))));
 }

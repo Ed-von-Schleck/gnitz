@@ -599,7 +599,7 @@ fn bounded_views_hold_their_rows_and_survive_rename() {
         &mut client,
         &sn,
         "CREATE VIEW over AS SELECT id FROM l1r",
-        "Unsupported",
+        "Rejected",
         "capacity-bounded",
     );
 }

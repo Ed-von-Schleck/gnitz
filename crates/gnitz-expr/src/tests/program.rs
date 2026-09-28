@@ -831,11 +831,6 @@ fn from_blob_rejects_a_malformed_sink() {
     );
 }
 
-// The rendering the planner's `Unsupported` and the engine's `CREATE VIEW`
-// rejection both print: one wording for both. The register cap and the two
-// column rejections are the variants a working query can newly hit, so each gets
-// a sentence rather than a struct dump — a `Debug` dump would name internals to
-// a client who cannot act on any of them.
 #[test]
 fn validate_err_display_names_the_register_limit() {
     assert_eq!(

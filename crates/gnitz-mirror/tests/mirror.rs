@@ -19,6 +19,7 @@ mod support;
 
 use gnitz_core::{ClientError, GnitzClient, MirrorError, PollOutcome, PollResult, Schema, ZSetBatch};
 use gnitz_mirror::Mirror;
+use gnitz_sql::GnitzSqlError;
 use gnitz_store_testkit::{assert_child_ok, run_test_in_child, CHILD_OK};
 use gnitz_test_harness::ServerHandle;
 use support::copy_paths::{copy_dir, has_manifest, manifest_path};
@@ -2633,7 +2634,13 @@ fn poisoned_read_child() {
     assert!(mirror.mirrors(tid));
     let err = gnitz_sql::execute(&mut mirror, "s", "SELECT * FROM v_keyed")
         .expect_err("a poisoned copy must refuse the read it would answer");
-    assert!(err.to_string().contains("poisoned"), "the refusal must say why: {err}",);
+    assert!(
+        matches!(
+            err,
+            GnitzSqlError::Client(ClientError::Mirror(MirrorError::Poisoned(_)))
+        ),
+        "{err}"
+    );
 
     // A relation the copy does not hold is unaffected: poison must not take
     // every read on the connection down with it.

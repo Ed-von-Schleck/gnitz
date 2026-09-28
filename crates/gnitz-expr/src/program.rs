@@ -39,11 +39,8 @@ const SINK_BYTES: usize = SINK_WORDS * 4;
 /// which no register index can be — the register file is 64 deep.
 const MAP_OUTPUT: u32 = u32::MAX;
 
-/// Why a client-authored expr program was rejected at compile — a diagnostic for
-/// the recovery log. Production consumers only render it (the SQL planner wraps
-/// it as `Unsupported`, the engine's compiler carries it into `RejectedExpr`),
-/// so a variant's payload exists to make that text name the offending operand.
-/// Only tests discriminate the variants.
+/// Why a client-authored expr program was rejected at compile. A variant's payload
+/// is there for its `Display` to name the offending operand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExprValidateErr {
     UnknownOpcode(u32),
@@ -117,13 +114,7 @@ pub enum ExprValidateErr {
     BadWalk(String),
 }
 
-/// The client-facing rendering. Lives on the type so the planner's `Unsupported`
-/// and the engine's compile rejection print the same wording, and so the limit
-/// printed is the one [`LogicalProgram::from_blob`] enforces. The three variants
-/// an API mistake can raise get sentences — a large SQL predicate or computed
-/// projection, and a `LogicalProgram` a client hand-built through
-/// [`crate::ExprBuilder`] and `gnitz_wire::Circuit`. The rest are
-/// internal-shape violations with no user action, rendered as `Debug`.
+/// The client-facing rendering.
 impl fmt::Display for ExprValidateErr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

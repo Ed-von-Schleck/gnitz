@@ -26,7 +26,7 @@ impl Frame {
     pub(crate) fn leading(layout: Vec<ColId>, columns: Vec<ColumnDef>, npk: usize) -> Result<Frame, GnitzSqlError> {
         debug_assert_eq!(layout.len(), columns.len(), "a frame's two halves are parallel");
         let schema = Schema::from_parts(columns, (0..npk as u32).collect())
-            .map_err(|e| GnitzSqlError::Unsupported(format!("planned relation: {e}")))?;
+            .map_err(|e| GnitzSqlError::Rejected(format!("planned relation: {e}")))?;
         Ok(Frame { layout, schema: Arc::new(schema) })
     }
 

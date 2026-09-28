@@ -56,7 +56,7 @@ fn check_fk_type_compat(fk_col: &ColumnDef, parent_col: &ColumnDef) -> Result<()
     let fits = fk_col_type.decimal_domains_match(parent_col_type)
         && (fk_col_type.tc == parent_col_type.tc || fk_col_type.tc.int_domain_fits(parent_col_type.tc));
     if !fits {
-        return Err(GnitzSqlError::Bind(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "FK type mismatch: column type {fk_col_type} cannot reference column type \
              {parent_col_type} — the child column adopts the referenced type, which would \
              narrow or re-sign {fk_col_type}; declare the child with a type whose range \
@@ -88,9 +88,10 @@ fn resolve_index_columns<'c>(
     for c in columns {
         let name = index_column_ident(c, ctx)?;
         let idx = find_unique_column(cols, name)?
-            .ok_or_else(|| GnitzSqlError::Bind(format!("{ctx} column '{name}' not found")))? as u32;
+            .ok_or_else(|| GnitzSqlError::Rejected(format!("{ctx} column '{name}' not found")))?
+            as u32;
         if indices.contains(&idx) {
-            return Err(GnitzSqlError::Plan(format!("{ctx}: duplicate column '{name}'")));
+            return Err(GnitzSqlError::Rejected(format!("{ctx}: duplicate column '{name}'")));
         }
         names.push(name);
         indices.push(idx);
@@ -108,19 +109,19 @@ fn resolve_referred_column(
     pk_single: Option<usize>,
 ) -> Result<usize, GnitzSqlError> {
     if referred_columns.len() > 1 {
-        return Err(GnitzSqlError::Unsupported(
+        return Err(GnitzSqlError::Rejected(
             "multi-column FOREIGN KEY references are not supported".into(),
         ));
     }
     match referred_columns.first() {
         Some(ident) => find_unique_column(cols, &ident.value)?.ok_or_else(|| {
-            GnitzSqlError::Bind(format!(
+            GnitzSqlError::Rejected(format!(
                 "FK references column '{}' not found in table '{}'",
                 ident.value, ref_table,
             ))
         }),
         None => pk_single.ok_or_else(|| {
-            GnitzSqlError::Bind(format!(
+            GnitzSqlError::Rejected(format!(
                 "FK against '{ref_table}' must name the referenced column (its primary key is not a single column)",
             ))
         }),
@@ -140,7 +141,7 @@ fn resolve_fk_target_inline(
     let ref_col_idx = resolve_referred_column(site.referred_columns, ref_table, current_cols, pk_single)?;
 
     if pk_single != Some(ref_col_idx) {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "self-referencing FK must reference the primary key of '{}'; \
              column '{}' is not the lone PK",
             ref_table, current_cols[ref_col_idx].name,
@@ -154,7 +155,7 @@ fn resolve_fk_target_inline(
     // stores them). Every parent delete would then fail on a missing child
     // index. Rejecting it keeps the self-FK column non-PK and its index present.
     if ref_col_idx == site.col_idx {
-        return Err(GnitzSqlError::Bind(
+        return Err(GnitzSqlError::Rejected(
             "a self-referencing FK column must not be the referenced column itself".into(),
         ));
     }
@@ -206,7 +207,7 @@ fn resolve_fk_target(
             .iter()
             .any(|m| m.cols.as_slice() == [ref_col_idx as u32] && m.is_unique);
         if !unique {
-            return Err(GnitzSqlError::Unsupported(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "FK against table '{}' must reference the primary key or a column \
                  with a UNIQUE index; column '{}' has neither",
                 ref_table, ref_schema.columns[ref_col_idx].name,
@@ -230,7 +231,7 @@ fn parse_table_options(table_options: &CreateTableOptions) -> Result<TableProps,
     let flag = |key: &str, value: Option<&Expr>| match value {
         None => Ok(false),
         Some(Expr::Value(ValueWithSpan { value: Value::Boolean(b), .. })) => Ok(*b),
-        Some(_) => Err(GnitzSqlError::Plan(format!(
+        Some(_) => Err(GnitzSqlError::Rejected(format!(
             "WITH ({key} = …) expects a boolean (true/false)"
         ))),
     };
@@ -263,7 +264,7 @@ fn push_unique(
     raw_name: Option<String>,
 ) -> Result<(), GnitzSqlError> {
     if unique.iter().any(|u| u.cols == cols) {
-        return Err(GnitzSqlError::Plan(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "duplicate UNIQUE constraint on column(s) ({})",
             col_names.join(", ")
         )));
@@ -319,7 +320,7 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
         }
     }
     if inline_pk.len() > 1 {
-        return Err(GnitzSqlError::Plan("Multiple PRIMARY KEYs defined".into()));
+        return Err(GnitzSqlError::Rejected("Multiple PRIMARY KEYs defined".into()));
     }
 
     // The same three kinds again, table-level and in declaration order, with the
@@ -329,13 +330,13 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
         match constraint {
             TableConstraint::PrimaryKey(PrimaryKeyConstraint { columns: pk_cols, .. }) => {
                 if table_pk.is_some() {
-                    return Err(GnitzSqlError::Plan("Multiple PRIMARY KEYs defined".into()));
+                    return Err(GnitzSqlError::Rejected("Multiple PRIMARY KEYs defined".into()));
                 }
                 // Resolved before the inline conflict is reported, so an unknown
                 // column name is named rather than eclipsed by it.
                 let resolved = resolve_index_columns(pk_cols, &cols, "PRIMARY KEY")?.1;
                 if !inline_pk.is_empty() {
-                    return Err(GnitzSqlError::Plan("Multiple PRIMARY KEYs defined".into()));
+                    return Err(GnitzSqlError::Rejected("Multiple PRIMARY KEYs defined".into()));
                 }
                 table_pk = Some(resolved);
             }
@@ -343,13 +344,13 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
                 columns, foreign_table, referred_columns, ..
             }) => {
                 if columns.len() != 1 {
-                    return Err(GnitzSqlError::Unsupported(
+                    return Err(GnitzSqlError::Rejected(
                         "multi-column FOREIGN KEY constraints are not supported".into(),
                     ));
                 }
                 let local_col_name = &columns[0].value;
                 let col_idx = find_unique_column(&cols, local_col_name)?.ok_or_else(|| {
-                    GnitzSqlError::Bind(format!(
+                    GnitzSqlError::Rejected(format!(
                         "FOREIGN KEY column '{local_col_name}' not found in table definition"
                     ))
                 })?;
@@ -357,7 +358,7 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
             }
             TableConstraint::Unique(UniqueConstraint { name: name_ident, columns, .. }) => {
                 if columns.is_empty() {
-                    return Err(GnitzSqlError::Plan("UNIQUE constraint cannot be empty".into()));
+                    return Err(GnitzSqlError::Rejected("UNIQUE constraint cannot be empty".into()));
                 }
                 let (col_names, col_indices) = resolve_index_columns(columns, &cols, "UNIQUE")?;
                 push_unique(
@@ -395,7 +396,7 @@ fn pk_covered_unique(pk: &[u32]) -> &[u32] {
 /// id; this names the column.
 fn reject_stream_constraints(d: &Declared<'_>) -> Result<(), GnitzSqlError> {
     if let Some(site) = d.fk_sites.first() {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "a stream cannot carry a FOREIGN KEY (column '{}'): it holds no rows to check against",
             d.cols[site.col_idx].name
         )));
@@ -404,7 +405,7 @@ fn reject_stream_constraints(d: &Declared<'_>) -> Result<(), GnitzSqlError> {
     // here than it is on a table.
     if let Some(u) = d.unique.iter().find(|u| u.cols != pk_covered_unique(&d.pk)) {
         let names: Vec<&str> = u.cols.iter().map(|&c| d.cols[c as usize].name.as_str()).collect();
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "a stream cannot carry a UNIQUE constraint (column(s) {}): it holds no rows to index",
             names.join(", ")
         )));
@@ -422,7 +423,7 @@ fn drop_unique_covered_by_pk(
 ) -> Result<(), GnitzSqlError> {
     let covered = pk_covered_unique(pk);
     if let Some(u) = unique.iter().find(|u| u.cols == covered && u.raw_name.is_some()) {
-        return Err(GnitzSqlError::Plan(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "UNIQUE constraint '{}' on the primary-key column '{}' names no index: the primary \
              key already provides the constraint",
             u.raw_name.as_deref().unwrap_or_default(),
@@ -448,7 +449,7 @@ fn name_unique_indexes(
     for u in &unique {
         if let Some(raw) = &u.raw_name {
             if !taken.insert(canonical_user_name(raw)?) {
-                return Err(GnitzSqlError::Plan(format!("duplicate constraint name '{raw}'")));
+                return Err(GnitzSqlError::Rejected(format!("duplicate constraint name '{raw}'")));
             }
         }
     }
@@ -533,7 +534,7 @@ pub(crate) fn plan_create_table(
     let mut fks: Vec<InlineForeignKey> = Vec::with_capacity(fk_sites.len());
     for site in &fk_sites {
         if fks.iter().any(|fk| fk.col_idx as usize == site.col_idx) {
-            return Err(GnitzSqlError::Plan(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "column '{}' carries more than one FOREIGN KEY",
                 cols[site.col_idx].name
             )));
@@ -549,36 +550,22 @@ pub(crate) fn plan_create_table(
         cols[i as usize].is_nullable = false;
     }
 
-    // The admission rule is `gnitz-wire`'s, shared with the client gateway and the
-    // engine catalog. Only the wording is the planner's: it names the offending
-    // column, which the engine cannot.
     let pk_stride = gnitz_wire::validate_pk_tuple(&pk_indices, cols.len(), gnitz_wire::PK_LIST_MAX_COLS, |c| {
         let cd = &cols[c as usize];
         (cd.ty.tc, cd.is_nullable)
     })
     .map_err(|rule| match rule {
-        gnitz_wire::PkRule::Empty => {
-            GnitzSqlError::Plan("CREATE TABLE requires at least one PRIMARY KEY column".into())
-        }
-        gnitz_wire::PkRule::TooManyColumns { .. } => GnitzSqlError::Unsupported(format!(
-            "PRIMARY KEY supports at most {} columns",
-            gnitz_core::PK_LIST_MAX_COLS
-        )),
         gnitz_wire::PkRule::NotEligible { col, .. } => {
             let cd = &cols[col as usize];
             non_key_eligible_error(&cd.name, cd.ty.tc, "PRIMARY KEY")
         }
-        gnitz_wire::PkRule::StrideOutOfRange { stride } => GnitzSqlError::Unsupported(format!(
-            "PRIMARY KEY total stride must be 1..={} bytes, got {stride}",
-            gnitz_core::MAX_PK_BYTES
-        )),
-        other => GnitzSqlError::Unsupported(other.to_string()),
+        other => GnitzSqlError::Rejected(other.to_string()),
     })?;
 
     // The generated id has no compound form: a column spelled SERIAL is the table's
     // whole primary key.
     if let Some(&c) = serial.iter().find(|&&c| pk_indices.as_slice() != [c]) {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "SERIAL column '{}' must be the table's only SERIAL column and its single-column PRIMARY KEY",
             cols[c as usize].name
         )));
@@ -605,20 +592,20 @@ pub(crate) fn plan_create_table(
         for expr in exprs {
             let col_name = simple_ident_expr(expr, "CLUSTER BY")?;
             let idx = find_unique_column(&cols, col_name)?
-                .ok_or_else(|| GnitzSqlError::Bind(format!("CLUSTER BY column '{col_name}' not found")))?;
+                .ok_or_else(|| GnitzSqlError::Rejected(format!("CLUSTER BY column '{col_name}' not found")))?;
             cluster_indices.push(idx as u32);
         }
         let prefix_len =
-            gnitz_core::validate_dist_prefix(&pk_indices, &cluster_indices).map_err(GnitzSqlError::Plan)?;
+            gnitz_core::validate_dist_prefix(&pk_indices, &cluster_indices).map_err(GnitzSqlError::Rejected)?;
         // `validate_dist_prefix` bounded the prefix by the PK arity, so the `u8`
         // is lossless.
         let prefix_len = prefix_len as u8;
         if props.distribution == TableDistribution::Replicated {
-            return Err(GnitzSqlError::Plan(gnitz_wire::replicated_with_prefix(prefix_len)));
+            return Err(GnitzSqlError::Rejected(gnitz_wire::replicated_with_prefix(prefix_len)));
         }
         props.distribution = TableDistribution::Keyed { prefix_len };
     }
-    props.validate(pk_indices.len()).map_err(GnitzSqlError::Unsupported)?;
+    props.validate(pk_indices.len()).map_err(GnitzSqlError::Rejected)?;
 
     let unique_indexes = name_unique_indexes(unique, &cols, schema_name, &table_name)?;
     Ok(Some(TablePlan {
@@ -762,7 +749,7 @@ pub(crate) fn create_index_core(
     let explicit_name = req.explicit_name.as_deref().map(canonical_user_name).transpose()?;
 
     if req.columns.is_empty() {
-        return Err(GnitzSqlError::Plan(format!("{ctx}: at least one column required")));
+        return Err(GnitzSqlError::Rejected(format!("{ctx}: at least one column required")));
     }
 
     let (table_id, schema) = (target.tid, &target.schema);
@@ -793,7 +780,7 @@ pub(crate) fn create_index_core(
                 .iter()
                 .any(|(_, name, cols)| name == &base && cols.as_slice() == col_indices.as_slice())
             {
-                return Err(GnitzSqlError::Plan(format!(
+                return Err(GnitzSqlError::Rejected(format!(
                     "an index on these columns already exists as '{base}'"
                 )));
             }

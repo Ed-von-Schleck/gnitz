@@ -28,7 +28,7 @@ pub(crate) fn find_unique_column<'a>(
     for (i, c) in columns.into_iter().enumerate() {
         if !c.is_hidden && c.name.eq_ignore_ascii_case(col_name) {
             if found.is_some() {
-                return Err(GnitzSqlError::Bind(format!(
+                return Err(GnitzSqlError::Rejected(format!(
                     "column reference '{col_name}' is ambiguous"
                 )));
             }
@@ -43,7 +43,8 @@ pub(crate) fn require_column<'a>(
     columns: impl IntoIterator<Item = &'a ColumnDef>,
     col_name: &str,
 ) -> Result<usize, GnitzSqlError> {
-    find_unique_column(columns, col_name)?.ok_or_else(|| GnitzSqlError::Bind(format!("column '{col_name}' not found")))
+    find_unique_column(columns, col_name)?
+        .ok_or_else(|| GnitzSqlError::Rejected(format!("column '{col_name}' not found")))
 }
 
 /// The output column `e` names, if it names one. Matched by name alone: an
@@ -130,7 +131,7 @@ pub(crate) fn apply_positional_aliases<'a, 'b>(
     }
     let mut visible: Vec<&mut ColumnDef> = defs.into_iter().filter(|c| !c.is_hidden).collect();
     if n_aliases != visible.len() {
-        return Err(GnitzSqlError::Plan(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "{ctx} defines {n_aliases} column aliases but body returns {} columns",
             visible.len(),
         )));

@@ -2,8 +2,7 @@
 //! name the offending column — plus the shared projection-schema rules and the
 //! clause guards.
 //!
-//! **The guard contract**, which `ast_util::reject_fn_qualifiers`
-//! also carries: destructure the node without `..`, classifying every field
+//! **The guard contract**: destructure the node without `..`, classifying every field
 //! consumed / inert / rejected, so an upstream field addition is E0027 rather
 //! than a clause silently dropped; then a table of `reject_if` calls
 //! (`error::unsupported_clause`), naming the first present clause.
@@ -46,7 +45,7 @@ pub(crate) fn computed_column(alias: Option<String>, idx: usize, nominal: ColTyp
 /// overflows `i64`.
 pub(crate) fn check_decimal_scale(scale: u8) -> Result<(), GnitzSqlError> {
     if scale > MAX_DECIMAL_SCALE {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "DECIMAL scale {scale} exceeds {MAX_DECIMAL_SCALE}; CAST an operand to a narrower scale"
         )));
     }
@@ -103,7 +102,7 @@ pub(crate) fn reject_duplicate_names<'a>(
     context: &str,
 ) -> Result<(), GnitzSqlError> {
     match first_duplicate(names) {
-        Some(name) => Err(GnitzSqlError::Plan(format!(
+        Some(name) => Err(GnitzSqlError::Rejected(format!(
             "duplicate column name '{name}' in {context}"
         ))),
         None => Ok(()),
@@ -118,7 +117,7 @@ pub(crate) fn reject_repeated_object<'a>(
     context: &str,
 ) -> Result<(), GnitzSqlError> {
     match first_duplicate(names) {
-        Some(name) => Err(GnitzSqlError::Plan(format!(
+        Some(name) => Err(GnitzSqlError::Rejected(format!(
             "{context}: '{name}' is named more than once"
         ))),
         None => Ok(()),
@@ -133,19 +132,19 @@ pub(crate) fn reject_repeated_object<'a>(
 /// relation or index name — it must accept exactly the rows it synthesizes
 /// itself. It does enforce it for a schema name, which nothing synthesizes.
 pub(crate) fn validate_user_name(name: &str) -> Result<(), GnitzSqlError> {
-    gnitz_wire::validate_user_identifier(name).map_err(GnitzSqlError::Plan)
+    gnitz_wire::validate_user_identifier(name).map_err(GnitzSqlError::Rejected)
 }
 
 /// [`validate_user_name`] returning the canonical stored form. The one fold a
 /// user-supplied name gets in this crate; the catalog gateway applies the same
 /// one, so the two cannot spell canonicalization differently.
 pub(crate) fn canonical_user_name(name: &str) -> Result<String, GnitzSqlError> {
-    gnitz_wire::canonical_identifier(name).map_err(GnitzSqlError::Plan)
+    gnitz_wire::canonical_identifier(name).map_err(GnitzSqlError::Rejected)
 }
 
 /// [`reject_float_key`] for a key with no column name to report — a computed one.
 pub(crate) fn reject_float_key_of(what: &str, role: &str) -> GnitzSqlError {
-    GnitzSqlError::Unsupported(format!(
+    GnitzSqlError::Rejected(format!(
         "{role}: {what} cannot be a key (IEEE-754 -0.0/+0.0 and NaN break key equality)"
     ))
 }
@@ -192,7 +191,7 @@ pub(crate) fn reject_unbuildable_index_key(
 ) -> Result<(), GnitzSqlError> {
     gnitz_wire::index_key_types(types, src_pk_count, src_pk_stride).map_err(|rule| match rule {
         gnitz_wire::IndexKeyRule::NotEligible { col, .. } => non_key_eligible_error(names[col], types[col], role),
-        arity_or_stride => GnitzSqlError::Unsupported(arity_or_stride.to_string()),
+        arity_or_stride => GnitzSqlError::Rejected(arity_or_stride.to_string()),
     })?;
     Ok(())
 }
@@ -202,7 +201,7 @@ pub(crate) fn reject_unbuildable_index_key(
 /// CREATE TABLE path can raise the identical message from the shared rule's
 /// verdict instead of re-testing eligibility itself.
 pub(crate) fn non_key_eligible_error(name: &str, tc: TypeCode, role: &str) -> GnitzSqlError {
-    GnitzSqlError::Unsupported(format!("{role} column '{name}' of type {tc} cannot be a {role} key"))
+    GnitzSqlError::Rejected(format!("{role} column '{name}' of type {tc} cannot be a {role} key"))
 }
 
 /// What a surface requires of the relation a name resolved to. The wording rides
@@ -255,7 +254,7 @@ pub(crate) fn require_class(rel: &RelDescriptor, name: &str, want: ClassWant, op
     if want.accepts(rel.class) {
         return Ok(());
     }
-    Err(GnitzSqlError::Unsupported(format!(
+    Err(GnitzSqlError::Rejected(format!(
         "'{name}' is a {}; {op} requires {}",
         rel.class.noun(),
         want.noun()
@@ -266,7 +265,7 @@ pub(crate) fn require_class(rel: &RelDescriptor, name: &str, want: ClassWant, op
 /// assertion. `what` names the list; the two caps below are the only ones.
 fn reject_arity(what: &str, cols: usize, cap: usize) -> Result<(), GnitzSqlError> {
     if cols > cap {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "{what} has {cols} columns, exceeding the {cap}-column limit"
         )));
     }
@@ -415,7 +414,7 @@ pub(crate) fn reject_unhonored_select_clauses(
         // Honored, so not reported unsupported — but a QUALIFY with no window
         // value to filter on would then be silently dropped.
         if qualify.is_some() && !crate::ast_util::select_has_window(select) {
-            return Err(GnitzSqlError::Unsupported(
+            return Err(GnitzSqlError::Rejected(
                 "QUALIFY needs a window function in the SELECT list or in the QUALIFY predicate".into(),
             ));
         }
@@ -503,7 +502,7 @@ pub(crate) fn as_plain_select<'a>(
 ) -> Result<&'a sqlparser::ast::Select, GnitzSqlError> {
     match body {
         sqlparser::ast::SetExpr::Select(s) => Ok(s.as_ref()),
-        _ => Err(GnitzSqlError::Unsupported(format!(
+        _ => Err(GnitzSqlError::Rejected(format!(
             "{ctx}: only a plain SELECT body is supported"
         ))),
     }
@@ -517,11 +516,7 @@ pub(crate) fn non_recursive_ctes(query: &sqlparser::ast::Query) -> Result<&[sqlp
     let Some(with) = &query.with else {
         return Ok(&[]);
     };
-    if with.recursive {
-        return Err(GnitzSqlError::Unsupported(
-            "recursive CTEs are not supported".to_string(),
-        ));
-    }
+    reject_if(with.recursive, "WITH", "RECURSIVE")?;
     Ok(&with.cte_tables)
 }
 
@@ -776,20 +771,20 @@ pub(crate) fn kv_options<'a, const N: usize>(
         sqlparser::ast::CreateTableOptions::With(opts) => {
             for opt in opts {
                 let sqlparser::ast::SqlOption::KeyValue { key, value } = opt else {
-                    return Err(GnitzSqlError::Unsupported(format!(
+                    return Err(GnitzSqlError::Rejected(format!(
                         "unsupported {context} option in WITH (…), which takes `key = value` entries: {opt:?}"
                     )));
                 };
                 let Some(at) = keys.iter().position(|k| key.value.eq_ignore_ascii_case(k)) else {
                     let listed: Vec<String> = keys.iter().map(|k| format!("`{k}`")).collect();
-                    return Err(GnitzSqlError::Unsupported(format!(
+                    return Err(GnitzSqlError::Rejected(format!(
                         "unknown {context} option '{}'; the supported options are {}",
                         key.value,
                         listed.join(", ")
                     )));
                 };
                 if slots[at].replace(value).is_some() {
-                    return Err(GnitzSqlError::Plan(format!(
+                    return Err(GnitzSqlError::Rejected(format!(
                         "{context} option `{}` is given more than once",
                         keys[at]
                     )));
@@ -802,7 +797,7 @@ pub(crate) fn kv_options<'a, const N: usize>(
         sqlparser::ast::CreateTableOptions::Plain(_) => "space-separated options",
         sqlparser::ast::CreateTableOptions::TableProperties(_) => "TBLPROPERTIES (…)",
     };
-    Err(GnitzSqlError::Unsupported(format!(
+    Err(GnitzSqlError::Rejected(format!(
         "{form} is not supported; options must be given as WITH (…)"
     )))
 }
@@ -847,11 +842,9 @@ pub(crate) fn reject_unhonored_create_view_clauses(cv: &sqlparser::ast::CreateVi
         reject_if(data_type.is_some(), CTX, "a type on an output column alias")?;
         reject_if(options.is_some(), CTX, "an option list on an output column alias")?;
     }
-    // Not `reject_if`: that template names ONE clause a statement does not honor,
-    // and each of these is honored alone. `sqlparser` parses the pair; no dialect
-    // defines it.
+    // `sqlparser` parses the pair; no dialect defines it.
     if *or_replace && *if_not_exists {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "{CTX}: OR REPLACE and IF NOT EXISTS ask for opposite outcomes — replace what \
              is there, or leave what is there alone. Write one of them."
         )));

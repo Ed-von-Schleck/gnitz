@@ -131,74 +131,62 @@ fn join_key_rules() {
     rejects(
         &cat,
         &[
-            ("SELECT * FROM ty JOIN w ON ty.f = w.f", "Unsupported", "float"),
-            ("SELECT * FROM ty JOIN w ON ty.f < w.f", "Unsupported", "float"),
-            ("SELECT a.id FROM a FULL JOIN b USING (k)", "Unsupported", "COALESCE"),
-            ("SELECT a.id FROM a NATURAL FULL JOIN b", "Unsupported", "COALESCE"),
+            ("SELECT * FROM ty JOIN w ON ty.f = w.f", "Rejected", "float"),
+            ("SELECT * FROM ty JOIN w ON ty.f < w.f", "Rejected", "float"),
+            ("SELECT a.id FROM a FULL JOIN b USING (k)", "Rejected", "COALESCE"),
+            ("SELECT a.id FROM a NATURAL FULL JOIN b", "Rejected", "COALESCE"),
             (
                 "SELECT a.id FROM a JOIN b USING (nope)",
-                "Bind",
+                "Rejected",
                 "JOIN USING: column 'nope' not found",
             ),
-            ("SELECT * FROM ty JOIN a ON ty.big = a.k", "Unsupported", "signed-256"),
+            ("SELECT * FROM ty JOIN a ON ty.big = a.k", "Rejected", "signed-256"),
             (
                 "SELECT * FROM ty JOIN w ON ty.s = w.big",
-                "Unsupported",
+                "Rejected",
                 "content hash never matches",
             ),
-            (&over_cap, "Unsupported", "join key list"),
+            (&over_cap, "Rejected", "join key list"),
             (
                 "SELECT * FROM a LEFT JOIN b ON a.v <> b.w",
-                "Unsupported",
+                "Rejected",
                 "may be keyless",
             ),
-            ("SELECT * FROM a RIGHT JOIN b ON 1 = 1", "Unsupported", "may be keyless"),
-            (
-                "SELECT c.v FROM c NATURAL LEFT JOIN ty",
-                "Unsupported",
-                "may be keyless",
-            ),
+            ("SELECT * FROM a RIGHT JOIN b ON 1 = 1", "Rejected", "may be keyless"),
+            ("SELECT c.v FROM c NATURAL LEFT JOIN ty", "Rejected", "may be keyless"),
             (
                 "SELECT a.id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w <> a.v)",
-                "Unsupported",
+                "Rejected",
                 "may be keyless",
             ),
             (
                 "SELECT a.id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.w <> a.v)",
-                "Unsupported",
+                "Rejected",
                 "may be keyless",
             ),
             (
                 "SELECT * FROM a FULL JOIN b ON a.v <> b.w",
-                "Unsupported",
+                "Rejected",
                 "may be keyless",
             ),
-            (
-                "SELECT * FROM ty JOIN w ON ty.s < w.s",
-                "Unsupported",
-                "order-preserving",
-            ),
+            ("SELECT * FROM ty JOIN w ON ty.s < w.s", "Rejected", "order-preserving"),
             (
                 "SELECT * FROM p3 JOIN c ON p3.x < c.v",
-                "Unsupported",
+                "Rejected",
                 "range JOIN output PK",
             ),
-            (
-                "SELECT * FROM wl JOIN wr ON wl.fk = wr.fk",
-                "Unsupported",
-                "MAX_COLUMNS",
-            ),
-            (&frame_over_cap, "Unsupported", "MAX_COLUMNS"),
+            ("SELECT * FROM wl JOIN wr ON wl.fk = wr.fk", "Rejected", "MAX_COLUMNS"),
+            (&frame_over_cap, "Rejected", "MAX_COLUMNS"),
             // A range term leads with the eq prefix plus the range slot, one
             // column past the join frame's source-PK key.
             (
                 "SELECT * FROM w64 WHERE EXISTS (SELECT 1 FROM b WHERE b.k = w64.c0 AND b.w < w64.c1)",
-                "Unsupported",
+                "Rejected",
                 "column limit",
             ),
             (
                 "SELECT a.v AS x, b.w AS x FROM a JOIN b ON a.k = b.k",
-                "Plan",
+                "Rejected",
                 "duplicate column name",
             ),
         ],
@@ -228,38 +216,38 @@ fn outer_and_range_join_rules() {
         &[
             (
                 "SELECT * FROM a LEFT JOIN b ON a.k = b.k AND a.v <> b.w",
-                "Unsupported",
+                "Rejected",
                 "residual ON predicate",
             ),
             // One naming only the preserved side would have to decide the null-fill.
             (
                 "SELECT a.id FROM a LEFT JOIN b ON a.k = b.k AND a.v > 5",
-                "Unsupported",
+                "Rejected",
                 "residual ON predicate",
             ),
             (
                 "SELECT * FROM ty JOIN w ON ty.id = w.id AND ty.s LIKE w.s",
-                "Unsupported",
+                "Rejected",
                 "LIKE pattern must be a string literal",
             ),
             (
                 "SELECT * FROM ty JOIN a ON ty.id = a.id AND ty.s <> a.v",
-                "Unsupported",
+                "Rejected",
                 "both operands to be strings",
             ),
             (
                 "SELECT a.id AS aid, b.id AS bid FROM a RIGHT JOIN b ON a.v < b.w",
-                "Unsupported",
+                "Rejected",
                 "pure-range RIGHT/FULL",
             ),
             (
                 "SELECT a.id AS aid, b.id AS bid FROM a FULL JOIN b ON a.v < b.w",
-                "Unsupported",
+                "Rejected",
                 "pure-range RIGHT/FULL",
             ),
             (
                 "SELECT ty.id AS aid, w.id AS bid FROM ty FULL JOIN w ON ty.big < w.big",
-                "Unsupported",
+                "Rejected",
                 "pure-range RIGHT/FULL",
             ),
         ],
@@ -297,29 +285,29 @@ fn subquery_rules() {
     rejects(
         &cat,
         &[
-            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND a.v > 5)", "Unsupported", "hoist it into the view's own WHERE"),
-            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w <> a.v)", "Unsupported", "match-existence"),
-            ("SELECT * FROM n WHERE k NOT IN (SELECT k FROM b)", "Unsupported", "NOT NULL"),
-            ("SELECT * FROM a WHERE k NOT IN (SELECT k FROM n)", "Unsupported", "NOT NULL"),
-            ("SELECT * FROM a WHERE (k, v) IN (SELECT k, w FROM b)", "Unsupported", "tuple"),
-            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w > 5)", "Unsupported", "needs at least one equijoin"),
-            ("SELECT k, COUNT(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) GROUP BY k", "Unsupported", "GROUP BY/aggregates"),
-            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b JOIN a AS z ON b.k = z.k WHERE b.k = a.k)", "Unsupported", "single FROM table without JOINs"),
-            ("SELECT * FROM a WHERE EXISTS (SELECT k FROM b WHERE b.k = a.k GROUP BY k)", "Unsupported", "GROUP BY"),
-            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND EXISTS (SELECT 1 FROM b AS z WHERE z.k = b.w))", "Unsupported", "nested subqueries"),
-            ("SELECT * FROM a WHERE k IN (SELECT k, w FROM b)", "Unsupported", "exactly one plain column"),
-            ("SELECT * FROM a AS t WHERE EXISTS (SELECT 1 FROM b AS t WHERE t.k = t.k)", "Bind", "rename one"),
-            ("SELECT id FROM n WHERE n.k IN (SELECT k FROM b) OR n.v = 1", "Unsupported", "IN (SELECT …) in a mark position"),
-            ("SELECT id, k IN (SELECT k FROM b) AS f FROM n", "Unsupported", "IN (SELECT …) in a mark position"),
-            ("SELECT id FROM n WHERE NOT (k IN (SELECT k FROM b))", "Unsupported", "NOT NULL"),
-            ("SELECT id FROM n WHERE (k IN (SELECT k FROM b)) IS NULL", "Unsupported", "IN (SELECT …) in a mark position"),
-            ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k = a.k GROUP BY b.w) FROM a", "Unsupported", "GROUP BY"),
-            ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k < a.k) FROM a", "Unsupported", "range correlation"),
-            ("SELECT a.id, (SELECT COUNT(*) FROM b JOIN a AS z ON b.k = z.k WHERE b.k = a.k) FROM a", "Unsupported", "single FROM table without JOINs"),
-            ("SELECT a.id FROM a JOIN b ON a.k = b.k WHERE a.v < (SELECT MAX(w) FROM b AS z)", "Unsupported", "scalar subqueries are not supported"),
-            ("SELECT a.id, (SELECT b.w FROM b WHERE b.k = a.k) FROM a", "Unsupported", "single aggregate over its correlation group"),
-            ("SELECT a.v FROM a WHERE a.k = ALL (SELECT k FROM b)", "Unsupported", "`= ALL (SELECT …)` is not supported"),
-            ("SELECT a.v FROM a WHERE a.k <> ANY (SELECT k FROM b)", "Unsupported", "`<> ANY (SELECT …)` is not supported"),
+            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND a.v > 5)", "Rejected", "hoist it into the view's own WHERE"),
+            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w <> a.v)", "Rejected", "match-existence"),
+            ("SELECT * FROM n WHERE k NOT IN (SELECT k FROM b)", "Rejected", "NOT NULL"),
+            ("SELECT * FROM a WHERE k NOT IN (SELECT k FROM n)", "Rejected", "NOT NULL"),
+            ("SELECT * FROM a WHERE (k, v) IN (SELECT k, w FROM b)", "Rejected", "tuple"),
+            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w > 5)", "Rejected", "needs at least one equijoin"),
+            ("SELECT k, COUNT(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) GROUP BY k", "Rejected", "GROUP BY/aggregates"),
+            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b JOIN a AS z ON b.k = z.k WHERE b.k = a.k)", "Rejected", "single FROM table without JOINs"),
+            ("SELECT * FROM a WHERE EXISTS (SELECT k FROM b WHERE b.k = a.k GROUP BY k)", "Rejected", "GROUP BY"),
+            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND EXISTS (SELECT 1 FROM b AS z WHERE z.k = b.w))", "Rejected", "nested subqueries"),
+            ("SELECT * FROM a WHERE k IN (SELECT k, w FROM b)", "Rejected", "exactly one plain column"),
+            ("SELECT * FROM a AS t WHERE EXISTS (SELECT 1 FROM b AS t WHERE t.k = t.k)", "Rejected", "rename one"),
+            ("SELECT id FROM n WHERE n.k IN (SELECT k FROM b) OR n.v = 1", "Rejected", "IN (SELECT …) in a mark position"),
+            ("SELECT id, k IN (SELECT k FROM b) AS f FROM n", "Rejected", "IN (SELECT …) in a mark position"),
+            ("SELECT id FROM n WHERE NOT (k IN (SELECT k FROM b))", "Rejected", "NOT NULL"),
+            ("SELECT id FROM n WHERE (k IN (SELECT k FROM b)) IS NULL", "Rejected", "IN (SELECT …) in a mark position"),
+            ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k = a.k GROUP BY b.w) FROM a", "Rejected", "GROUP BY"),
+            ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k < a.k) FROM a", "Rejected", "range correlation"),
+            ("SELECT a.id, (SELECT COUNT(*) FROM b JOIN a AS z ON b.k = z.k WHERE b.k = a.k) FROM a", "Rejected", "single FROM table without JOINs"),
+            ("SELECT a.id FROM a JOIN b ON a.k = b.k WHERE a.v < (SELECT MAX(w) FROM b AS z)", "Rejected", "scalar subqueries are not supported"),
+            ("SELECT a.id, (SELECT b.w FROM b WHERE b.k = a.k) FROM a", "Rejected", "single aggregate over its correlation group"),
+            ("SELECT a.v FROM a WHERE a.k = ALL (SELECT k FROM b)", "Rejected", "`= ALL (SELECT …)` is not supported"),
+            ("SELECT a.v FROM a WHERE a.k <> ANY (SELECT k FROM b)", "Rejected", "`<> ANY (SELECT …)` is not supported"),
         ],
     );
 }
@@ -345,121 +333,121 @@ fn grouped_body_rules() {
         &[
             (
                 "SELECT id, SUM(s) AS x FROM ty GROUP BY id",
-                "Unsupported",
+                "Rejected",
                 "SUM: not supported on",
             ),
             (
                 "SELECT id, AVG(uid) AS x FROM ty GROUP BY id",
-                "Unsupported",
+                "Rejected",
                 "AVG: not supported on",
             ),
             (
                 "SELECT id, SUM(big) AS x FROM ty GROUP BY id",
-                "Unsupported",
+                "Rejected",
                 "SUM: not supported on",
             ),
             (
                 "SELECT g FROM t HAVING SUM(v) > 1",
-                "Plan",
+                "Rejected",
                 "column 'g' must appear in GROUP BY or an aggregate function",
             ),
             (
                 "SELECT a + 1 AS x, COUNT(*) AS c FROM m",
-                "Plan",
+                "Rejected",
                 "column 'a' must appear in GROUP BY",
             ),
             (
                 "SELECT id, COUNT(*) AS c FROM ty GROUP BY id HAVING SUM(big) > 0",
-                "Unsupported",
+                "Rejected",
                 "SUM: not supported on",
             ),
             (
                 "SELECT id, SUM(v) FROM t GROUP BY id HAVING SUM(*) > 0",
-                "Unsupported",
-                "requires exactly one column argument",
+                "Rejected",
+                "expects plain positional arguments",
             ),
             (
                 "SELECT id, AVG(v) FROM t GROUP BY id HAVING AVG(*) > 0",
-                "Unsupported",
-                "requires exactly one column argument",
+                "Rejected",
+                "expects plain positional arguments",
             ),
             (
                 "SELECT f, COUNT(*) AS n FROM ty GROUP BY f",
-                "Unsupported",
+                "Rejected",
                 "float column 'f' cannot be a key",
             ),
             (
                 "SELECT f + 1 AS x, COUNT(*) AS c FROM m GROUP BY f + 1",
-                "Unsupported",
+                "Rejected",
                 "float-valued expression cannot be a key",
             ),
             (
                 "SELECT b + 1 AS x FROM m GROUP BY a",
-                "Plan",
+                "Rejected",
                 "GROUP BY SELECT: column 'b' must appear in GROUP BY",
             ),
             (
                 "SELECT b FROM m GROUP BY a",
-                "Plan",
+                "Rejected",
                 "GROUP BY SELECT: column 'b' must appear in GROUP BY",
             ),
             (
                 "SELECT a + 1 AS x FROM m GROUP BY a + b",
-                "Plan",
+                "Rejected",
                 "GROUP BY SELECT: column 'a' must appear in GROUP BY",
             ),
             (
                 "SELECT a * b AS x, SUM(a * b) AS s FROM m GROUP BY k",
-                "Plan",
+                "Rejected",
                 "GROUP BY SELECT: column 'a' must appear in GROUP BY",
             ),
             (
                 "SELECT a, COUNT(*) AS n FROM m GROUP BY a HAVING b > 0",
-                "Plan",
+                "Rejected",
                 "HAVING: column 'b' must appear in GROUP BY",
             ),
             (
                 "SELECT a, COUNT(*) AS n FROM m GROUP BY a HAVING zzz > 0",
-                "Bind",
+                "Rejected",
                 "HAVING: column 'zzz' not found",
             ),
             (
                 "SELECT a, COUNT(*) AS n FROM m GROUP BY a HAVING n > 0",
-                "Bind",
+                "Rejected",
                 "HAVING: column 'n' not found",
             ),
             (
                 "SELECT a + b AS ab, COUNT(*) AS c FROM m GROUP BY a + b HAVING _pre0 > 5",
-                "Bind",
+                "Rejected",
                 "HAVING: column '_pre0' not found",
             ),
             (
                 "SELECT k, SUM(a) AS s FROM m GROUP BY k HAVING _agg > 1",
-                "Bind",
+                "Rejected",
                 "HAVING: column '_agg' not found",
             ),
-            ("SELECT g, SUM(v) FROM t GROUP BY t.nope", "Bind", "not found"),
+            ("SELECT g, SUM(v) FROM t GROUP BY t.nope", "Rejected", "not found"),
             (
                 "SELECT k, COUNT(*) AS c FROM a GROUP BY 0",
-                "Unsupported",
+                "Rejected",
                 "GROUP BY position 0 is out of range",
             ),
             (
                 "SELECT k, COUNT(*) AS c FROM a GROUP BY 5",
-                "Unsupported",
+                "Rejected",
                 "GROUP BY position 5 is out of range",
             ),
             (
                 "SELECT k, COUNT(*) AS c FROM a GROUP BY 2",
-                "Unsupported",
+                "Rejected",
                 "names an aggregate",
             ),
             (
                 "SELECT *, COUNT(*) AS c FROM a GROUP BY 1",
-                "Unsupported",
+                "Rejected",
                 "names a wildcard",
             ),
-            ("SELECT v FROM t GROUP BY ALL", "Unsupported", "GROUP BY"),
+            ("SELECT v FROM t GROUP BY ALL", "Rejected", "GROUP BY"),
         ],
     );
 }
@@ -478,12 +466,12 @@ fn a_date_never_pairs_with_a_timestamp_key() {
         &[
             (
                 "SELECT x.id FROM x JOIN tt ON x.d = tt.ts",
-                "Unsupported",
+                "Rejected",
                 "differ in unit (days vs microseconds)",
             ),
             (
                 "SELECT id, d FROM x UNION ALL SELECT id, ts FROM tt",
-                "Plan",
+                "Rejected",
                 "column 1 type mismatch",
             ),
         ],
@@ -504,83 +492,91 @@ fn set_op_and_distinct_rules() {
         &[
             // A DISTINCT body consumes none of these, so each is named rather
             // than dropped — DISTINCT ON included, rather than folded to DISTINCT.
-            ("SELECT DISTINCT ON (v) v, id FROM t", "Unsupported", "DISTINCT ON"),
+            ("SELECT DISTINCT ON (v) v, id FROM t", "Rejected", "DISTINCT ON"),
             (
                 "SELECT DISTINCT ON (v) v FROM t UNION SELECT id FROM t",
-                "Unsupported",
+                "Rejected",
                 "DISTINCT ON",
             ),
-            ("SELECT DISTINCT ON (v) v FROM t", "Unsupported", "DISTINCT ON"),
-            ("SELECT DISTINCT v FROM t GROUP BY v", "Unsupported", "GROUP BY"),
-            ("SELECT DISTINCT v FROM t HAVING v > 0", "Unsupported", "HAVING"),
-            ("SELECT DISTINCT v FROM t PREWHERE v > 5", "Unsupported", "PREWHERE"),
-            ("SELECT DISTINCT TOP 5 v FROM t", "Unsupported", "TOP"),
+            ("SELECT DISTINCT ON (v) v FROM t", "Rejected", "DISTINCT ON"),
+            ("SELECT DISTINCT v FROM t GROUP BY v", "Rejected", "GROUP BY"),
+            ("SELECT DISTINCT v FROM t HAVING v > 0", "Rejected", "HAVING"),
+            ("SELECT DISTINCT v FROM t PREWHERE v > 5", "Rejected", "PREWHERE"),
+            ("SELECT DISTINCT TOP 5 v FROM t", "Rejected", "TOP"),
             (
                 "SELECT DISTINCT v FROM t QUALIFY v > 1",
-                "Unsupported",
+                "Rejected",
                 "QUALIFY needs a window function",
             ),
             (
                 "SELECT f FROM ty UNION SELECT f FROM w",
-                "Unsupported",
+                "Rejected",
                 "float column 'f' cannot be a key",
             ),
             (
                 "SELECT f FROM ty EXCEPT SELECT f FROM w",
-                "Unsupported",
+                "Rejected",
                 "float column 'f' cannot be a key",
             ),
             (
                 "SELECT f FROM ty INTERSECT SELECT f FROM w",
-                "Unsupported",
+                "Rejected",
                 "float column 'f' cannot be a key",
             ),
             (
                 "SELECT DISTINCT f FROM ty",
-                "Unsupported",
+                "Rejected",
                 "float column 'f' cannot be a key",
             ),
             (
                 "SELECT DISTINCT * FROM ty",
-                "Unsupported",
+                "Rejected",
                 "float column 'f' cannot be a key",
             ),
             (
                 "SELECT * FROM t UNION ALL SELECT * FROM ty",
-                "Plan",
+                "Rejected",
                 "column count mismatch",
             ),
             (
                 "SELECT id, g FROM t UNION ALL SELECT id, s FROM ty",
-                "Plan",
+                "Rejected",
                 "type mismatch",
             ),
             // U64 against I64 needs a 128-bit common type, past the 8-byte cap.
-            ("SELECT x FROM w UNION ALL SELECT id FROM t", "Plan", "type mismatch"),
+            (
+                "SELECT x FROM w UNION ALL SELECT id FROM t",
+                "Rejected",
+                "type mismatch",
+            ),
             (
                 "SELECT g FROM t UNION ALL BY NAME SELECT g FROM u",
-                "Unsupported",
+                "Rejected",
                 "BY NAME",
             ),
             (
                 "SELECT g AS x, v AS x FROM t UNION SELECT g AS x, v AS x FROM t",
-                "Plan",
+                "Rejected",
                 "duplicate column name",
             ),
-            ("SELECT DISTINCT g AS x, v AS x FROM t", "Plan", "duplicate column name"),
+            (
+                "SELECT DISTINCT g AS x, v AS x FROM t",
+                "Rejected",
+                "duplicate column name",
+            ),
             (
                 "(SELECT g FROM t LIMIT 1) UNION SELECT g FROM t",
-                "Unsupported",
+                "Rejected",
                 "LIMIT/OFFSET",
             ),
             (
                 "SELECT g FROM t UNION (SELECT g FROM t ORDER BY g)",
-                "Unsupported",
+                "Rejected",
                 "ORDER BY",
             ),
             (
                 "(WITH c AS (SELECT g FROM t) SELECT g FROM c) UNION SELECT g FROM t",
-                "Unsupported",
+                "Rejected",
                 "WITH (CTE)",
             ),
         ],
@@ -594,32 +590,32 @@ fn projection_and_envelope_rules() {
     rejects(
         &cat,
         &[
-            ("SELECT g, g FROM t", "Plan", "duplicate column name"),
-            ("SELECT *, * FROM t", "Plan", "duplicate column name"),
-            ("SELECT t.*, t.* FROM t", "Unsupported", "SELECT item"),
-            ("SELECT * FROM t LIMIT 10", "Unsupported", "LIMIT"),
-            ("SELECT * EXCEPT (nope) FROM t", "Bind", "nope"),
-            ("SELECT * EXCEPT (g) RENAME (g AS v) FROM t", "Plan", "excluded"),
-            ("SELECT * RENAME (g AS x, g AS y) FROM t", "Plan", "twice"),
-            ("SELECT * RENAME (g AS v) FROM t", "Plan", "duplicate column name"),
-            ("SELECT * REPLACE (g + 1 AS g) FROM t", "Unsupported", "REPLACE"),
-            ("SELECT * ILIKE 'g%' FROM t", "Unsupported", "ILIKE"),
+            ("SELECT g, g FROM t", "Rejected", "duplicate column name"),
+            ("SELECT *, * FROM t", "Rejected", "duplicate column name"),
+            ("SELECT t.*, t.* FROM t", "Rejected", "SELECT item"),
+            ("SELECT * FROM t LIMIT 10", "Rejected", "LIMIT"),
+            ("SELECT * EXCEPT (nope) FROM t", "Rejected", "nope"),
+            ("SELECT * EXCEPT (g) RENAME (g AS v) FROM t", "Rejected", "excluded"),
+            ("SELECT * RENAME (g AS x, g AS y) FROM t", "Rejected", "twice"),
+            ("SELECT * RENAME (g AS v) FROM t", "Rejected", "duplicate column name"),
+            ("SELECT * REPLACE (g + 1 AS g) FROM t", "Rejected", "REPLACE"),
+            ("SELECT * ILIKE 'g%' FROM t", "Rejected", "ILIKE"),
             (
                 "WITH c AS (SELECT * REPLACE (g + 1 AS g) FROM t) SELECT * FROM c",
-                "Unsupported",
+                "Rejected",
                 "REPLACE",
             ),
-            ("SELECT v FROM t PREWHERE v > 5", "Unsupported", "PREWHERE"),
+            ("SELECT v FROM t PREWHERE v > 5", "Rejected", "PREWHERE"),
             (
                 "SELECT v, COUNT(*) FROM t PREWHERE v > 5 GROUP BY v",
-                "Unsupported",
+                "Rejected",
                 "PREWHERE",
             ),
-            ("SELECT v FROM t FETCH FIRST 5 ROWS ONLY", "Unsupported", "FETCH"),
-            ("SELECT v FROM t SORT BY v", "Unsupported", "SORT BY"),
-            ("SELECT id FROM t FOR UPDATE", "Unsupported", "FOR UPDATE"),
-            ("SELECT id FROM t SETTINGS max_threads = 1", "Unsupported", "SETTINGS"),
-            ("SELECT id FROM t FORMAT JSON", "Unsupported", "FORMAT"),
+            ("SELECT v FROM t FETCH FIRST 5 ROWS ONLY", "Rejected", "FETCH"),
+            ("SELECT v FROM t SORT BY v", "Rejected", "SORT BY"),
+            ("SELECT id FROM t FOR UPDATE", "Rejected", "FOR UPDATE"),
+            ("SELECT id FROM t SETTINGS max_threads = 1", "Rejected", "SETTINGS"),
+            ("SELECT id FROM t FORMAT JSON", "Rejected", "FORMAT"),
         ],
     );
     // An alias list renames what the body produced; it neither disambiguates it
@@ -631,7 +627,7 @@ fn projection_and_envelope_rules() {
         ),
         ("CREATE VIEW v (a, b) AS SELECT id FROM t", "column aliases"),
     ] {
-        assert_rejects(sql, plan(&cat, sql), "Plan", needle);
+        assert_rejects(sql, plan(&cat, sql), "Rejected", needle);
     }
 }
 
@@ -645,40 +641,36 @@ fn scalar_expression_rules() {
     for (expr, variant, needle) in [
         // A view is recomputed from deltas, so a clock read would make its
         // contents depend on when a tick ran.
-        ("NOW()", "Unsupported", "non-deterministic"),
-        ("CURRENT_DATE", "Unsupported", "non-deterministic"),
-        ("EXTRACT(YEAR FROM i)", "Unsupported", "DATE or TIMESTAMP"),
-        ("DATE_TRUNC('fortnight', d)", "Unsupported", "fortnight"),
-        ("DATE '2024-02-30'", "Bind", "invalid DATE literal"),
-        ("CAST(i AS UUID)", "Unsupported", "UUID"),
-        ("CAST(i AS BOOLEAN)", "Unsupported", "BOOLEAN"),
+        ("NOW()", "Rejected", "non-deterministic"),
+        ("CURRENT_DATE", "Rejected", "non-deterministic"),
+        ("EXTRACT(YEAR FROM i)", "Rejected", "DATE or TIMESTAMP"),
+        ("DATE_TRUNC('fortnight', d)", "Rejected", "fortnight"),
+        ("DATE '2024-02-30'", "Rejected", "invalid DATE literal"),
+        ("CAST(i AS UUID)", "Rejected", "UUID"),
+        ("CAST(i AS BOOLEAN)", "Rejected", "BOOLEAN"),
         // An integer literal past `u64::MAX` has no register slot at all.
         (
             "CAST(18446744073709551616 AS BIGINT UNSIGNED)",
-            "Unsupported",
+            "Rejected",
             "18446744073709551616",
         ),
-        ("CAST('abc' AS DECIMAL(5, 2))", "Bind", "invalid DECIMAL("),
+        ("CAST('abc' AS DECIMAL(5, 2))", "Rejected", "invalid DECIMAL("),
         // Each product adds its operands' scales, so a chain of them runs past
         // what the scaled integer can hold.
-        (
-            "qty * qty * qty * qty * qty * qty * qty",
-            "Unsupported",
-            "DECIMAL scale",
-        ),
+        ("qty * qty * qty * qty * qty * qty * qty", "Rejected", "DECIMAL scale"),
         // A string in a numeric position names the string operand.
-        ("GREATEST(s, s)", "Unsupported", "column \"s\" is a string"),
-        ("-s", "Unsupported", "column \"s\" is a string"),
-        ("s + 1", "Unsupported", "string operand"),
-        ("s AND i", "Unsupported", "is a string"),
-        ("s || 1", "Unsupported", "expected a string value"),
-        ("STRPOS(s, f)", "Unsupported", "expected a string value"),
-        ("LEFT(s, f)", "Unsupported", "must be an integer"),
+        ("GREATEST(s, s)", "Rejected", "column \"s\" is a string"),
+        ("-s", "Rejected", "column \"s\" is a string"),
+        ("s + 1", "Rejected", "string operand"),
+        ("s AND i", "Rejected", "is a string"),
+        ("s || 1", "Rejected", "expected a string value"),
+        ("STRPOS(s, f)", "Rejected", "expected a string value"),
+        ("LEFT(s, f)", "Rejected", "must be an integer"),
     ] {
         rejects(&cat, &[(&format!("SELECT id, {expr} AS y FROM x"), variant, needle)]);
     }
     // Summing day counts yields a number that is not a date.
-    rejects(&cat, &[("SELECT SUM(d) AS y FROM x", "Unsupported", "DATE column")]);
+    rejects(&cat, &[("SELECT SUM(d) AS y FROM x", "Rejected", "DATE column")]);
 }
 
 #[test]
@@ -689,38 +681,38 @@ fn cte_and_derived_table_rules() {
         &[
             (
                 "WITH cte(x, y, z) AS (SELECT id, g FROM t) SELECT x FROM cte",
-                "Plan",
+                "Rejected",
                 "column aliases",
             ),
             (
                 "WITH cte AS (SELECT * FROM t FETCH FIRST 5 ROWS ONLY) SELECT id FROM cte",
-                "Unsupported",
+                "Rejected",
                 "FETCH",
             ),
             (
                 "WITH cte AS (WITH d AS (SELECT * FROM t) SELECT * FROM d) SELECT id FROM cte",
-                "Unsupported",
+                "Rejected",
                 "WITH (CTE)",
             ),
             (
                 "WITH cte AS (SELECT * FROM t PREWHERE g > 5) SELECT id FROM cte",
-                "Unsupported",
+                "Rejected",
                 "PREWHERE",
             ),
             (
                 "WITH _cte AS (SELECT id FROM t WHERE id > 0) SELECT id FROM _cte",
-                "Plan",
+                "Rejected",
                 "cannot start with '_'",
             ),
             (
                 "SELECT x FROM (SELECT id AS x FROM t) AS _seg4096",
-                "Plan",
+                "Rejected",
                 "cannot start with '_'",
             ),
-            ("SELECT * FROM _seg4096", "Plan", "cannot start with '_'"),
+            ("SELECT * FROM _seg4096", "Rejected", "cannot start with '_'"),
             (
                 "SELECT id FROM (SELECT id, v FROM t WHERE v > 10)",
-                "Unsupported",
+                "Rejected",
                 "needs an alias",
             ),
         ],
@@ -733,18 +725,18 @@ fn top_n_rules() {
     rejects(
         &cat,
         &[
-            ("SELECT id FROM t ORDER BY v", "Unsupported", "ORDER BY without LIMIT"),
-            ("SELECT id FROM t LIMIT 3", "Unsupported", "LIMIT without ORDER BY"),
-            ("SELECT id FROM t ORDER BY v LIMIT 0", "Plan", "LIMIT 0"),
-            ("SELECT id FROM t OFFSET 5", "Unsupported", "OFFSET without"),
+            ("SELECT id FROM t ORDER BY v", "Rejected", "ORDER BY without LIMIT"),
+            ("SELECT id FROM t LIMIT 3", "Rejected", "LIMIT without ORDER BY"),
+            ("SELECT id FROM t ORDER BY v LIMIT 0", "Rejected", "LIMIT 0"),
+            ("SELECT id FROM t OFFSET 5", "Rejected", "OFFSET without"),
             (
                 "SELECT DISTINCT g FROM t ORDER BY v LIMIT 1",
-                "Unsupported",
+                "Rejected",
                 "selected column",
             ),
             (
                 "SELECT id FROM t UNION SELECT id FROM u ORDER BY v LIMIT 1",
-                "Unsupported",
+                "Rejected",
                 "output column or position",
             ),
         ],
@@ -776,29 +768,29 @@ fn ambiguous_and_hidden_column_rules() {
     rejects(
         &cat,
         &[
-            ("SELECT id FROM jv", "Bind", "is ambiguous"),
-            ("SELECT * FROM jv WHERE id = 5", "Bind", "is ambiguous"),
-            ("SELECT COUNT(*) FROM jv GROUP BY id", "Bind", "is ambiguous"),
+            ("SELECT id FROM jv", "Rejected", "is ambiguous"),
+            ("SELECT * FROM jv WHERE id = 5", "Rejected", "is ambiguous"),
+            ("SELECT COUNT(*) FROM jv GROUP BY id", "Rejected", "is ambiguous"),
             (
                 "SELECT id, COUNT(*) FROM ju GROUP BY id HAVING SUM(v) > 0",
-                "Bind",
+                "Rejected",
                 "is ambiguous",
             ),
             (
                 "SELECT x.k, y.v FROM a x JOIN ju y ON x.k = y.id",
-                "Bind",
+                "Rejected",
                 "is ambiguous",
             ),
-            ("SELECT _join_pk FROM jv", "Bind", "not found"),
+            ("SELECT _join_pk FROM jv", "Rejected", "not found"),
             // A qualifier naming no relation in scope is not a decoration.
-            ("SELECT b.id FROM t", "Bind", "not found"),
+            ("SELECT b.id FROM t", "Rejected", "not found"),
             (
                 "SELECT t.id AS x FROM t JOIN u ON t.id = u.id JOIN a USING (v)",
-                "Bind",
+                "Rejected",
                 "'v' is ambiguous",
             ),
             // `sv` drops `t`'s PK, which rides hidden.
-            ("SELECT id FROM sv", "Bind", "not found"),
+            ("SELECT id FROM sv", "Rejected", "not found"),
         ],
     );
 }
@@ -807,20 +799,24 @@ fn ambiguous_and_hidden_column_rules() {
 fn capacity_rules() {
     let cat = cat();
     for (clause, variant, needle) in [
-        ("WITH (foo = '1 MB')", "Unsupported", "unknown CREATE VIEW option"),
+        ("WITH (foo = '1 MB')", "Rejected", "unknown CREATE VIEW option"),
         // An unknown key names every key that would have been read, so the
         // message is enough to fix the statement without opening the grammar.
-        ("WITH (foo = '1 MB')", "Unsupported", "capacity"),
-        ("WITH (foo = '1 MB')", "Unsupported", "delta"),
-        ("WITH (capacity = 5)", "Plan", "single-quoted"),
-        ("WITH (capacity = 'lots')", "Plan", "not a size"),
-        ("WITH (capacity = '1 MB', capacity = '4 GB')", "Plan", "more than once"),
+        ("WITH (foo = '1 MB')", "Rejected", "capacity"),
+        ("WITH (foo = '1 MB')", "Rejected", "delta"),
+        ("WITH (capacity = 5)", "Rejected", "single-quoted"),
+        ("WITH (capacity = 'lots')", "Rejected", "not a size"),
+        (
+            "WITH (capacity = '1 MB', capacity = '4 GB')",
+            "Rejected",
+            "more than once",
+        ),
     ] {
         let sql = format!("CREATE VIEW v {clause} AS SELECT id, v FROM t");
         assert_rejects(&sql, plan(&cat, &sql), variant, needle);
     }
     let sql = "CREATE VIEW v WITH (capacity = '1 MB', delta = '1 MB') AS SELECT id, v FROM t";
-    assert_rejects(sql, plan(&cat, sql), "Unsupported", "cannot carry a delta feed");
+    assert_rejects(sql, plan(&cat, sql), "Rejected", "cannot carry a delta feed");
 
     // A filtered derived-table input fuses into the join's circuit, cutting nothing.
     let sql = "CREATE VIEW v WITH (capacity = '1 MB') AS \
@@ -839,36 +835,36 @@ fn capacity_rules() {
             "`{body}` cuts a segment unbounded"
         );
         let sql = format!("CREATE VIEW v WITH (capacity = '1 MB') AS {body}");
-        assert_rejects(&sql, plan(&cat, &sql), "Unsupported", "more than one view");
+        assert_rejects(&sql, plan(&cat, &sql), "Rejected", "more than one view");
     }
 
     // A bounded view is a leaf, and cannot be retargeted.
     rejects(
         &cat,
         &[
-            ("SELECT id, v FROM bv", "Unsupported", "capacity-bounded"),
+            ("SELECT id, v FROM bv", "Rejected", "capacity-bounded"),
             (
                 "SELECT bv.id, u.v FROM bv JOIN u ON bv.id = u.g",
-                "Unsupported",
+                "Rejected",
                 "capacity-bounded",
             ),
             (
                 "SELECT id FROM t WHERE id IN (SELECT id FROM bv)",
-                "Unsupported",
+                "Rejected",
                 "capacity-bounded",
             ),
             (
                 "WITH x AS (SELECT id, v FROM bv) SELECT id FROM x",
-                "Unsupported",
+                "Rejected",
                 "capacity-bounded",
             ),
         ],
     );
     let sql = "ALTER VIEW bv AS SELECT id, v FROM t WHERE v > 0";
-    assert_rejects(sql, plan(&cat, sql), "Unsupported", "capacity-bounded");
+    assert_rejects(sql, plan(&cat, sql), "Rejected", "capacity-bounded");
     // A fed view cannot be retargeted either: its feed would be silently dropped.
     let sql = "ALTER VIEW fv AS SELECT id, v FROM t WHERE v > 0";
-    assert_rejects(sql, plan(&cat, sql), "Unsupported", "delta feed");
+    assert_rejects(sql, plan(&cat, sql), "Rejected", "delta feed");
 }
 
 /// Both retarget spellings: never onto a body that reads the view itself, and
@@ -888,12 +884,12 @@ fn a_retarget_never_reads_itself_nor_replaces_a_non_view() {
             ("st", "SELECT id, v FROM u", "is a stream"),
         ] {
             let sql = format!("{verb} {target} AS {body}");
-            assert_rejects(&sql, plan(&cat, &sql), "Unsupported", needle);
+            assert_rejects(&sql, plan(&cat, &sql), "Rejected", needle);
         }
     }
     // The self-reference outranks the leaf rule a bounded view would also break.
     let sql = "CREATE OR REPLACE VIEW bv AS SELECT id, v FROM bv";
-    assert_rejects(sql, plan(&cat, sql), "Unsupported", "itself");
+    assert_rejects(sql, plan(&cat, sql), "Rejected", "itself");
 }
 
 /// The statement clauses the view planners themselves turn away, on both spellings:
@@ -931,7 +927,7 @@ fn view_statement_rejected_clause_matrix() {
         ("CREATE VIEW v CLUSTER BY (id) AS SELECT id FROM t", "CLUSTER BY"),
         ("CREATE VIEW v COMMENT = 'x' AS SELECT id FROM t", "COMMENT"),
     ] {
-        assert_rejects(sql, plan(&cat, sql), "Unsupported", needle);
+        assert_rejects(sql, plan(&cat, sql), "Rejected", needle);
     }
     // Every gnitz view is incrementally materialized, so the keyword is accepted.
     assert!(plan(&cat, "CREATE MATERIALIZED VIEW v AS SELECT id FROM t").is_ok());
@@ -945,7 +941,7 @@ fn view_statement_rejected_clause_matrix() {
 fn an_alter_view_body_names_alter_view() {
     let cat = cat();
     let sql = "ALTER VIEW tv AS SELECT 1";
-    assert_rejects(sql, plan(&cat, sql), "Unsupported", "ALTER VIEW: a view body reads");
+    assert_rejects(sql, plan(&cat, sql), "Rejected", "ALTER VIEW: a view body reads");
     let sql = "ALTER VIEW tv AS VALUES (1)";
-    assert_rejects(sql, plan(&cat, sql), "Unsupported", "ALTER VIEW only supports SELECT");
+    assert_rejects(sql, plan(&cat, sql), "Rejected", "ALTER VIEW only supports SELECT");
 }

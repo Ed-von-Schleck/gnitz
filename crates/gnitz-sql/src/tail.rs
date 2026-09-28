@@ -4,7 +4,7 @@
 //! the rule, and a rejection here cannot name a surface it does not know.
 
 use crate::ast_util::{clause_position, expr_usize_literal, reject_position_out_of_range};
-use crate::error::GnitzSqlError;
+use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use gnitz_core::ColumnDef;
 use sqlparser::ast::{Expr, LimitClause, OrderBy, OrderByExpr, OrderByKind, OrderByOptions};
 
@@ -49,10 +49,6 @@ pub(crate) fn order_exprs<'a>(keys: &[OrderKey<'a>]) -> Vec<&'a Expr> {
         .collect()
 }
 
-fn unsupported(what: &str) -> GnitzSqlError {
-    GnitzSqlError::Unsupported(format!("{what} is not supported"))
-}
-
 /// Classify one ORDER BY expression: an integer literal is positional, by the
 /// same rule GROUP BY reads; everything else is an expression.
 fn order_target(e: &Expr) -> Result<OrderTarget<'_>, GnitzSqlError> {
@@ -69,7 +65,7 @@ pub(crate) fn parse_order_by(order_by: Option<&OrderBy>) -> Result<Vec<OrderKey<
     };
     let keys = resolve_order_by(ob)?;
     if keys.len() > gnitz_wire::MAX_ORDER_KEYS {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "ORDER BY has more than {} keys",
             gnitz_wire::MAX_ORDER_KEYS
         )));
@@ -78,24 +74,20 @@ pub(crate) fn parse_order_by(order_by: Option<&OrderBy>) -> Result<Vec<OrderKey<
 }
 
 /// Parse the whole ORDER BY clause into resolved key specs, rejecting the
-/// unsupported ClickHouse/DuckDB extensions as a clean `Unsupported` error.
+/// unsupported ClickHouse/DuckDB extensions.
 fn resolve_order_by(ob: &OrderBy) -> Result<Vec<OrderKey<'_>>, GnitzSqlError> {
     // Exhaustive (no `..`) at each of the three levels: a dropped ORDER BY
     // modifier is a wrong result, so a future `sqlparser` field stops the build.
     let OrderBy { kind, interpolate } = ob;
-    if interpolate.is_some() {
-        return Err(unsupported("ORDER BY ... INTERPOLATE"));
-    }
+    reject_if(interpolate.is_some(), "ORDER BY", "INTERPOLATE")?;
     let exprs = match kind {
         OrderByKind::Expressions(e) => e,
-        OrderByKind::All(_) => return Err(unsupported("ORDER BY ALL")),
+        OrderByKind::All(_) => return Err(unsupported_clause("ORDER BY", "ALL")),
     };
     let mut keys = Vec::with_capacity(exprs.len());
     for obe in exprs {
         let OrderByExpr { expr, options, with_fill } = obe;
-        if with_fill.is_some() {
-            return Err(unsupported("ORDER BY ... WITH FILL"));
-        }
+        reject_if(with_fill.is_some(), "ORDER BY", "WITH FILL")?;
         let OrderByOptions { asc, nulls_first } = options;
         let asc = asc.unwrap_or(true);
         keys.push(OrderKey {
@@ -159,9 +151,7 @@ pub(crate) fn extract_limit(query: &sqlparser::ast::Query) -> Result<Option<usiz
     let limit = match &query.limit_clause {
         // Exhaustive (no `..`): a future `sqlparser` field stops the build.
         Some(LimitClause::LimitOffset { limit, offset: _, limit_by }) => {
-            if !limit_by.is_empty() {
-                return Err(GnitzSqlError::Unsupported("LIMIT ... BY is not supported".to_string()));
-            }
+            reject_if(!limit_by.is_empty(), "LIMIT", "BY")?;
             match limit {
                 Some(e) => e,
                 None => return Ok(None),

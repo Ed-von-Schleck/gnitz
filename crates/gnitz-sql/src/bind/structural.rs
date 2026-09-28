@@ -2,10 +2,10 @@ use std::convert::Infallible;
 
 use super::resolve::require_column;
 use crate::ast_util::{
-    bind_literal, classify_agg_call, col_ref_parts, function_positional_args, peel_nested, single_fn_name,
+    bind_literal, classify_agg_call, col_ref_parts, peel_nested, single_fn_name, CallSurface, PlainCall,
 };
 use crate::codec::literal::{invalid_literal, parse_temporal};
-use crate::error::GnitzSqlError;
+use crate::error::{reject_if, GnitzSqlError};
 use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, NumFunc, StrArg, StrFunc, TrimMode};
 use crate::types::sql_col_type;
 use gnitz_core::{ColumnDef, Schema};
@@ -64,7 +64,7 @@ pub(crate) trait LeafBinder<R> {
     /// really is an aggregate.
     fn bind_function(&self, f: &Function) -> Result<BExpr<R>, GnitzSqlError> {
         classify_agg_call(f)?;
-        Err(GnitzSqlError::Unsupported(
+        Err(GnitzSqlError::Rejected(
             "aggregate function not allowed in expression context".to_string(),
         ))
     }
@@ -74,7 +74,7 @@ pub(crate) trait LeafBinder<R> {
     /// A windowed call (`f(…) OVER (…)`). Only a view body's windowed SELECT
     /// list and QUALIFY admit one; every other context keeps this rejection.
     fn bind_window(&self, _f: &Function) -> Result<BExpr<R>, GnitzSqlError> {
-        Err(GnitzSqlError::Unsupported(
+        Err(GnitzSqlError::Rejected(
             "window functions (OVER) are only supported in the SELECT list and QUALIFY of a CREATE VIEW \
              body, and cannot be nested in another window function's operands"
                 .into(),
@@ -93,7 +93,7 @@ pub(crate) trait LeafBinder<R> {
 /// default, and what a leaf that overrides the method for *some* shapes falls back
 /// to for the rest.
 pub(crate) fn unsupported_subquery(e: &Expr) -> GnitzSqlError {
-    GnitzSqlError::Unsupported(match e {
+    GnitzSqlError::Rejected(match e {
         Expr::Subquery(_) => "scalar subqueries are not supported".into(),
         Expr::AnyOp { .. } | Expr::AllOp { .. } => "ANY/SOME/ALL subquery comparisons are not supported".into(),
         _ => "[NOT] EXISTS/IN (SELECT …) is only supported in a single-table CREATE VIEW \
@@ -108,7 +108,7 @@ fn bind_cast<R>(e: BExpr<R>, dt: &DataType) -> Result<BExpr<R>, GnitzSqlError> {
     Ok(match e {
         BExpr::LitStr(s) if to.tc.is_temporal() => BExpr::LitTemporal {
             tc: to.tc,
-            v: parse_temporal(to.tc, &s).ok_or_else(|| GnitzSqlError::Bind(invalid_literal(to, &s)))?,
+            v: parse_temporal(to.tc, &s).ok_or_else(|| GnitzSqlError::Rejected(invalid_literal(to, &s)))?,
         },
         e => BExpr::Cast { expr: Box::new(e), to },
     })
@@ -127,14 +127,12 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         // functions) bind here, above the leaf, so no leaf impl carries them.
         // Every other name falls through to the leaf — aggregates, or a context
         // rejection.
-        // Above the name dispatch, so `ABS(x) OVER (…)` is a window call the leaf
-        // refuses by name, not a scalar call refused for carrying a qualifier.
         Expr::Function(f) if f.over.is_some() => leaf.bind_window(f),
         Expr::Function(f) => match scalar_call(f) {
             Some((name, call)) => bind_scalar_call(name, call, f, leaf),
             None => match single_fn_name(f) {
                 Some(n) if VOLATILE_FNS.iter().any(|v| n.eq_ignore_ascii_case(v)) => {
-                    Err(GnitzSqlError::Unsupported(format!(
+                    Err(GnitzSqlError::Rejected(format!(
                         "{}: a non-deterministic function is not supported",
                         n.to_ascii_uppercase()
                     )))
@@ -154,19 +152,13 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
             array,
             format,
         } => {
-            if *array {
-                return Err(GnitzSqlError::Unsupported(
-                    "CAST to an ARRAY type is not supported".into(),
-                ));
-            }
-            if format.is_some() {
-                return Err(GnitzSqlError::Unsupported("CAST … FORMAT is not supported".into()));
-            }
+            reject_if(*array, "CAST", "an ARRAY target type")?;
+            reject_if(format.is_some(), "CAST", "FORMAT")?;
             bind_cast(bind_structural(e, leaf)?, data_type)
         }
         Expr::Extract { field, syntax: _, expr: e } => Ok(BExpr::Calendar {
             op: calendar_field(&field.to_string())
-                .ok_or_else(|| GnitzSqlError::Unsupported(format!("EXTRACT: field {field} is not supported")))?,
+                .ok_or_else(|| GnitzSqlError::Rejected(format!("EXTRACT: field {field} is not supported")))?,
             arg: Box::new(bind_structural(e, leaf)?),
         }),
         // SUBSTR and SUBSTRING, the `FROM/FOR` form and the comma form, all
@@ -197,11 +189,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
             expr: e,
             trim_characters,
         } => {
-            if trim_characters.is_some() {
-                return Err(GnitzSqlError::Unsupported(
-                    "TRIM(… , <characters>) is not supported".into(),
-                ));
-            }
+            reject_if(trim_characters.is_some(), "TRIM", "the (… , <characters>) form")?;
             Ok(BExpr::TrimCall {
                 s: Box::new(bind_structural(e, leaf)?),
                 mode: match trim_where {
@@ -259,9 +247,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
             pattern,
             escape_char,
         } => {
-            if *any {
-                return Err(GnitzSqlError::Unsupported("LIKE ANY is not supported".into()));
-            }
+            reject_if(*any, "LIKE", "ANY")?;
             let escape = like_escape(escape_char.as_ref())?;
             let node = BExpr::Like {
                 s: Box::new(bind_structural(subject, leaf)?),
@@ -277,7 +263,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         // `DATE '…'` (and the ODBC `{d '…'}`) is `CAST('…' AS DATE)`.
         Expr::TypedString(TypedString { data_type, value, uses_odbc_syntax: _ }) => match &value.value {
             Value::SingleQuotedString(s) => bind_cast(BExpr::LitStr(s.clone()), data_type),
-            v => Err(GnitzSqlError::Unsupported(format!(
+            v => Err(GnitzSqlError::Rejected(format!(
                 "{data_type} literal must be a single-quoted string, got {v}"
             ))),
         },
@@ -331,9 +317,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
                     UnaryOperator::Plus,
                     inner @ (BExpr::LitInt(_) | BExpr::LitFloat { .. } | BExpr::LitWide(_) | BExpr::LitNull),
                 ) => Ok(inner),
-                (o, _) => Err(GnitzSqlError::Unsupported(format!(
-                    "unary operator {o:?} not supported"
-                ))),
+                (o, _) => Err(GnitzSqlError::Rejected(format!("unary operator {o:?} not supported"))),
             }
         }
         // `e BETWEEN lo AND hi` ≡ `e >= lo AND e <= hi`; NOT BETWEEN negates it.
@@ -353,7 +337,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         // position.
         Expr::InList { expr: e, list, negated } => {
             let node = match list.as_slice() {
-                [] => return Err(GnitzSqlError::Unsupported("IN with an empty list".into())),
+                [] => return Err(GnitzSqlError::Rejected("IN with an empty list".into())),
                 [only] => BExpr::bin(bind_structural(e, leaf)?, BinOp::Eq, bind_structural(only, leaf)?),
                 _ => BExpr::InList {
                     inner: Box::new(bind_structural(e, leaf)?),
@@ -373,7 +357,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         }
         // Rendered as SQL, never `Debug`: the parser's `Debug` is a wall of
         // spans, and the reader wants the form they wrote.
-        _ => Err(GnitzSqlError::Unsupported(format!("expression not supported: {expr}"))),
+        _ => Err(GnitzSqlError::Rejected(format!("expression not supported: {expr}"))),
     }
 }
 
@@ -390,7 +374,7 @@ fn trim_set(trim_what: Option<&Expr>) -> Result<String, GnitzSqlError> {
     let Some(e) = trim_what else {
         return Ok(" ".to_string());
     };
-    let bad = || GnitzSqlError::Unsupported("TRIM: the characters to trim must be an ASCII string literal".into());
+    let bad = || GnitzSqlError::Rejected("TRIM: the characters to trim must be an ASCII string literal".into());
     literal_expr_string(e).filter(|s| s.is_ascii()).ok_or_else(bad)
 }
 
@@ -418,7 +402,7 @@ fn literal_expr_string(e: &Expr) -> Option<String> {
 /// as written, bound by the expression binder, so a VALUES cell and a WHERE
 /// operand cannot disagree on one.
 pub(crate) fn bind_constant(e: &Expr) -> Result<BExpr<Infallible>, GnitzSqlError> {
-    let not_constant = || GnitzSqlError::Unsupported(format!("expected a constant, got the expression: {e}"));
+    let not_constant = || GnitzSqlError::Rejected(format!("expected a constant, got the expression: {e}"));
     // Checked on the AST first: the binder folds `COALESCE(2, x)` and `NULL IS
     // NULL` to literals without binding the rest.
     if !literal_shaped(e) {
@@ -456,16 +440,16 @@ impl LeafBinder<Infallible> for NoColumns {
 /// A string literal only, so `s LIKE NULL` is rejected where PostgreSQL
 /// evaluates it to NULL.
 fn like_pattern(pattern: &Expr, escape: Option<char>) -> Result<LikePattern, GnitzSqlError> {
-    let bad = || GnitzSqlError::Unsupported("LIKE pattern must be a string literal".into());
+    let bad = || GnitzSqlError::Rejected("LIKE pattern must be a string literal".into());
     let s = literal_expr_string(pattern).ok_or_else(bad)?;
     LikePattern::encode(&s, escape)
-        .ok_or_else(|| GnitzSqlError::Plan("LIKE pattern must not end with escape character".to_string()))
+        .ok_or_else(|| GnitzSqlError::Rejected("LIKE pattern must not end with escape character".to_string()))
 }
 
 /// `\` by default, as in PostgreSQL and MySQL; `None` for `ESCAPE ''`.
 fn like_escape(escape_char: Option<&ValueWithSpan>) -> Result<Option<char>, GnitzSqlError> {
     let Some(v) = escape_char else { return Ok(Some('\\')) };
-    let bad = || GnitzSqlError::Unsupported("LIKE: ESCAPE must be a single character or ''".into());
+    let bad = || GnitzSqlError::Rejected("LIKE: ESCAPE must be a single character or ''".into());
     // A `ValueWithSpan`, not an `Expr`: the parser puts the escape in its own
     // slot, so there is no sign or parenthesis for `bind_constant` to peel.
     let Ok(BExpr::LitStr(s)) = bind_literal::<Infallible>(&v.value) else {
@@ -629,39 +613,14 @@ fn scalar_call(f: &Function) -> Option<(&'static str, Call)> {
         .copied()
 }
 
-/// The one arity-error shape for every structurally-bound call, matching what
-/// `classify_agg_call` already reports for the aggregates: `min..=max`
-/// arguments, unbounded above when `max` is `None`.
-fn wrong_arity(name: &str, min: usize, max: Option<usize>) -> GnitzSqlError {
-    const WORDS: [&str; 4] = ["zero", "one", "two", "three"];
-    // Spelled out up to three, then digits — total over every arity, so a wider
-    // signature cannot panic here.
-    let word = |n: usize| WORDS.get(n).map_or_else(|| n.to_string(), |w| (*w).to_string());
-    let plural = |n: usize| if n == 1 { "argument" } else { "arguments" };
-    let want = match max {
-        Some(max) if max == min => format!("exactly {} {}", word(min), plural(min)),
-        Some(max) => format!("{} or {} arguments", word(min), word(max)),
-        None => format!("at least {} {}", word(min), plural(min)),
-    };
-    GnitzSqlError::Unsupported(format!("{name}: requires {want}"))
-}
-
-/// Bind one of the [`SCALAR_CALLS`]. Arguments come through
-/// `function_positional_args`, so every call inherits the shared qualifier
-/// rejection (FILTER/DISTINCT/WITHIN GROUP/…) that COALESCE already applied; the arity
-/// is checked once, from [`Call::arity`], so each arm below indexes a validated
-/// slice.
+/// Bind one of the [`SCALAR_CALLS`].
 fn bind_scalar_call<R: Clone, L: LeafBinder<R>>(
     name: &str,
     call: Call,
     f: &Function,
     leaf: &L,
 ) -> Result<BExpr<R>, GnitzSqlError> {
-    let args = function_positional_args(f, name)?;
-    let (min, max) = call.arity();
-    if args.len() < min || max.is_some_and(|max| args.len() > max) {
-        return Err(wrong_arity(name, min, max));
-    }
+    let args = PlainCall::check(f, CallSurface::Scalar(name))?.args(name, call.arity())?;
     match call {
         // IFNULL/NVL is COALESCE at arity two; only `Call::arity` separates them.
         Call::Coalesce | Call::Ifnull => bind_coalesce(&args, leaf),
@@ -719,7 +678,7 @@ fn bind_scalar_call<R: Clone, L: LeafBinder<R>>(
         Call::Concat => Ok(BExpr::ConcatN { args: bind_all(&args, leaf)? }),
         Call::DateTrunc | Call::DatePart => {
             let unit = literal_expr_string(args[0])
-                .ok_or_else(|| GnitzSqlError::Unsupported(format!("{name}: the unit must be a string literal")))?;
+                .ok_or_else(|| GnitzSqlError::Rejected(format!("{name}: the unit must be a string literal")))?;
             // DATE_TRUNC takes the truncating half of the same vocabulary, so
             // the fields with no truncation (DOW, EPOCH, …) fall out as
             // unsupported units here rather than needing a second table.
@@ -728,7 +687,7 @@ fn bind_scalar_call<R: Clone, L: LeafBinder<R>>(
                 _ => Some(op),
             });
             Ok(BExpr::Calendar {
-                op: op.ok_or_else(|| GnitzSqlError::Unsupported(format!("{name}: unit {unit:?} is not supported")))?,
+                op: op.ok_or_else(|| GnitzSqlError::Rejected(format!("{name}: unit {unit:?} is not supported")))?,
                 arg: Box::new(bind_structural(args[1], leaf)?),
             })
         }
@@ -759,9 +718,7 @@ fn bind_all<R: Clone, L: LeafBinder<R>>(args: &[&Expr], leaf: &L) -> Result<Vec<
 /// `-15..=15`. f64 carries ~15–17 significant decimal digits, so a wider scale
 /// has no digits left to round at.
 fn round_scale(e: &Expr) -> Result<i8, GnitzSqlError> {
-    // Every failure here reports the one `Plan` error, which names the range as
-    // well as the shape; `LitInt` is what rejects a fractional scale.
-    let bad = || GnitzSqlError::Plan("ROUND: scale must be an integer literal in -15..=15".to_string());
+    let bad = || GnitzSqlError::Rejected("ROUND: scale must be an integer literal in -15..=15".to_string());
     let BExpr::LitInt(n) = bind_constant(e).map_err(|_| bad())? else {
         return Err(bad());
     };
@@ -779,7 +736,7 @@ fn bind_ceil_floor<R: Clone, L: LeafBinder<R>>(
     leaf: &L,
 ) -> Result<BExpr<R>, GnitzSqlError> {
     if !matches!(field, CeilFloorKind::DateTimeField(DateTimeField::NoDateTime)) {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "{name}: only the plain {name}(x) form is supported"
         )));
     }
@@ -806,11 +763,7 @@ fn map_binop(op: &BinaryOperator) -> Result<BinOp, GnitzSqlError> {
         BinaryOperator::And => BinOp::And,
         BinaryOperator::Or => BinOp::Or,
         BinaryOperator::StringConcat => BinOp::Concat,
-        o => {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "binary operator {o:?} not supported"
-            )))
-        }
+        o => return Err(GnitzSqlError::Rejected(format!("binary operator {o:?} not supported"))),
     })
 }
 
@@ -878,8 +831,7 @@ pub(crate) fn single_relation_col_idx<'a>(
     alias: &str,
     e: &Expr,
 ) -> Result<usize, GnitzSqlError> {
-    let (qual, name) =
-        col_ref_parts(e).ok_or_else(|| GnitzSqlError::Unsupported("expected a column reference".into()))?;
+    let (qual, name) = col_ref_parts(e).ok_or_else(|| GnitzSqlError::Rejected("expected a column reference".into()))?;
     reject_foreign_qualifier(qual, name, alias)?;
     require_column(cols, name)
 }
@@ -889,12 +841,12 @@ pub(crate) fn single_relation_col_idx<'a>(
 pub(crate) fn reject_foreign_qualifier(qual: Option<&str>, name: &str, alias: &str) -> Result<(), GnitzSqlError> {
     let Some(q) = qual else { return Ok(()) };
     if alias.is_empty() {
-        return Err(GnitzSqlError::Bind(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "column '{q}.{name}' not found (no relation is in scope)"
         )));
     }
     if !q.eq_ignore_ascii_case(alias) {
-        return Err(GnitzSqlError::Bind(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "table alias '{q}' not found (the relation in scope is '{alias}')"
         )));
     }

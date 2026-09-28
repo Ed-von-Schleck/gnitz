@@ -23,7 +23,7 @@ fn test_find_unique_column_duplicate_is_ambiguous() {
     // Two case-insensitively equal names (as a `SELECT *` join view produces).
     let cols = vec![col("Id", TypeCode::U64), col("ID", TypeCode::U64)];
     match find_unique_column(&cols, "id") {
-        Err(GnitzSqlError::Bind(s)) => assert!(s.contains("ambiguous"), "got: {s}"),
+        Err(GnitzSqlError::Rejected(s)) => assert!(s.contains("ambiguous"), "got: {s}"),
         other => panic!("expected Bind(ambiguous), got {other:?}"),
     }
 }

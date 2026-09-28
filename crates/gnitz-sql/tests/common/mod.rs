@@ -35,11 +35,8 @@ pub fn try_exec(client: &mut GnitzClient, sn: &str, sql: &str) -> Result<Vec<Sql
 /// The error's variant name and message.
 pub fn variant_of(e: &GnitzSqlError) -> (&'static str, String) {
     match e {
-        GnitzSqlError::Parse(m) => ("Parse", m.to_string()),
-        GnitzSqlError::Bind(m) => ("Bind", m.clone()),
-        GnitzSqlError::Plan(m) => ("Plan", m.clone()),
-        GnitzSqlError::Exec(m) => ("Exec", m.to_string()),
-        GnitzSqlError::Unsupported(m) => ("Unsupported", m.clone()),
+        GnitzSqlError::Rejected(m) => ("Rejected", m.clone()),
+        GnitzSqlError::Client(m) => ("Client", m.to_string()),
         GnitzSqlError::Internal(m) => ("Internal", m.clone()),
     }
 }

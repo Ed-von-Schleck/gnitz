@@ -62,7 +62,7 @@ fn is_null(b: &ZSetBatch, pi: usize, r: usize) -> bool {
 
 fn bind_err(r: Result<impl Sized, GnitzSqlError>) -> String {
     match r {
-        Err(GnitzSqlError::Bind(m)) => m,
+        Err(GnitzSqlError::Rejected(m)) => m,
         Err(e) => panic!("expected Bind, got {e:?}"),
         Ok(_) => panic!("expected Bind, got Ok"),
     }
@@ -84,7 +84,7 @@ fn a_column_assigned_twice_is_rejected() {
 fn a_qualified_target_is_rejected() {
     let schema = table(vec![ncol("val", TypeCode::I64)]);
     match compile("t.val = 1", &schema) {
-        Err(GnitzSqlError::Plan(m)) => assert!(m.contains("column must be a simple identifier"), "{m}"),
+        Err(GnitzSqlError::Rejected(m)) => assert!(m.contains("column must be a simple identifier"), "{m}"),
         Err(e) => panic!("expected Plan, got {e:?}"),
         Ok(_) => panic!("a qualified target must be rejected"),
     }

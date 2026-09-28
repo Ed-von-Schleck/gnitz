@@ -133,7 +133,7 @@ pub(super) fn commit_rmw(
         match client.push_rmw(read.tid, &read.schema, batch, basis) {
             Err(ClientError::Refused(WireFault { status: WireStatus::TxnConflict, .. }))
                 if attempt < RMW_MAX_ATTEMPTS => {}
-            r => return r.map(|()| count).map_err(GnitzSqlError::Exec),
+            r => return Ok(r.map(|()| count)?),
         }
     }
 }

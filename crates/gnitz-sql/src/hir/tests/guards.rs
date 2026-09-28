@@ -116,7 +116,7 @@ fn outer_with_residual_rejects_per_surface() {
     let residual = [crate::ir::BExpr::LitInt(1)];
     reject_outer_with_residual(JoinType::Inner, &residual).unwrap();
     let msg = |k| match reject_outer_with_residual(k, &residual).unwrap_err() {
-        GnitzSqlError::Unsupported(s) => s,
+        GnitzSqlError::Rejected(s) => s,
         e => panic!("expected Unsupported, got {e:?}"),
     };
     assert!(msg(JoinType::Left).contains("LEFT/RIGHT/FULL JOIN"));

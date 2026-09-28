@@ -253,7 +253,7 @@ mod occ {
         assert!(
             matches!(
                 &err,
-                GnitzSqlError::Exec(ClientError::Refused(WireFault { status: WireStatus::TxnConflict, .. }))
+                GnitzSqlError::Client(ClientError::Refused(WireFault { status: WireStatus::TxnConflict, .. }))
             ),
             "{err:?}"
         );

@@ -54,24 +54,24 @@ fn primary_key_precedence() {
     for (sql, variant, needle) in [
         (
             "CREATE TABLE t (a BIGINT PRIMARY KEY, b BIGINT, PRIMARY KEY (a, b))",
-            "Plan",
+            "Rejected",
             "Multiple PRIMARY KEYs",
         ),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT PRIMARY KEY)",
-            "Plan",
+            "Rejected",
             "Multiple PRIMARY KEYs",
         ),
         // The list resolves before the conflict is reported, so the typo is named.
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, PRIMARY KEY (typo))",
-            "Bind",
+            "Rejected",
             "typo",
         ),
         // Two table-level clauses: the second is the conflict.
         (
             "CREATE TABLE t (a BIGINT, b BIGINT, PRIMARY KEY (a), PRIMARY KEY (b))",
-            "Plan",
+            "Rejected",
             "Multiple PRIMARY KEYs",
         ),
     ] {
@@ -106,7 +106,7 @@ fn a_repeated_unique_is_rejected_in_both_spellings() {
         "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, UNIQUE(a), UNIQUE(a))",
         "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT UNIQUE, UNIQUE(a))",
     ] {
-        assert_rejects(sql, plan_table(&cat, sql), "Plan", "duplicate UNIQUE constraint");
+        assert_rejects(sql, plan_table(&cat, sql), "Rejected", "duplicate UNIQUE constraint");
     }
 }
 
@@ -115,7 +115,7 @@ fn a_repeated_unique_is_rejected_in_both_spellings() {
 fn a_second_foreign_key_on_one_column_is_rejected() {
     let cat = fk_catalog();
     let sql = "CREATE TABLE c (id BIGINT PRIMARY KEY, a BIGINT REFERENCES p(id), FOREIGN KEY (a) REFERENCES q(id))";
-    assert_rejects(sql, plan_table(&cat, sql), "Plan", "more than one FOREIGN KEY");
+    assert_rejects(sql, plan_table(&cat, sql), "Rejected", "more than one FOREIGN KEY");
 }
 
 /// A UNIQUE equal to the lone PK creates no index, so a name written on it would
@@ -128,7 +128,7 @@ fn a_named_unique_equal_to_the_lone_pk_is_rejected() {
         "CREATE TABLE t (id BIGINT PRIMARY KEY, CONSTRAINT uq UNIQUE(id))",
         "CREATE TABLE t (id BIGINT PRIMARY KEY CONSTRAINT uq UNIQUE)",
     ] {
-        assert_rejects(sql, plan_table(&cat, sql), "Plan", "uq");
+        assert_rejects(sql, plan_table(&cat, sql), "Rejected", "uq");
     }
     // Unnamed: accepted, and no index is planned.
     let c = created(&cat, "CREATE TABLE t (id BIGINT PRIMARY KEY UNIQUE)");
@@ -142,16 +142,12 @@ fn a_named_unique_equal_to_the_lone_pk_is_rejected() {
     assert_eq!(c.unique_indexes, vec![unique(&[0], "uq")]);
 }
 
-/// The engine's whole schema-admissibility rule is the column cap plus the PK
-/// rules; the cap is the planner's too, so a too-wide table is `Unsupported`
-/// here rather than an `Exec` failure inside the client gateway — the same
-/// variant the view surface produces.
 #[test]
 fn a_table_past_the_column_cap_is_unsupported() {
     let cat = catalog(vec![]);
     let cols: Vec<String> = (0..66).map(|i| format!("c{i} BIGINT")).collect();
     let sql = format!("CREATE TABLE t (id BIGINT PRIMARY KEY, {})", cols.join(", "));
-    assert_rejects(&sql, plan_table(&cat, &sql), "Unsupported", "65");
+    assert_rejects(&sql, plan_table(&cat, &sql), "Rejected", "65");
 }
 
 /// `OR REPLACE` would discard the table's rows; `DROP TABLE` says that out loud.
@@ -159,7 +155,7 @@ fn a_table_past_the_column_cap_is_unsupported() {
 fn or_replace_is_rejected() {
     let cat = catalog(vec![]);
     let sql = "CREATE OR REPLACE TABLE t (id BIGINT PRIMARY KEY)";
-    assert_rejects(sql, plan_table(&cat, sql), "Unsupported", "OR REPLACE");
+    assert_rejects(sql, plan_table(&cat, sql), "Rejected", "OR REPLACE");
 }
 
 /// A stream holds no rows, so it backs no index, enforces no referential action
@@ -183,7 +179,7 @@ fn a_stream_refuses_serial_a_foreign_key_and_a_unique() {
             "UNIQUE",
         ),
     ] {
-        assert_rejects(sql, plan_table(&cat, sql), "Unsupported", needle);
+        assert_rejects(sql, plan_table(&cat, sql), "Rejected", needle);
     }
     // The lone-PK-equal spelling plans no index, so it reaches no owner check.
     let c = created(
@@ -211,61 +207,61 @@ fn an_unhonoured_clause_or_fk_target_is_named() {
     for (sql, variant, needle) in [
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY) AS SELECT id FROM p",
-            "Unsupported",
+            "Rejected",
             "CTAS",
         ),
         (
             "CREATE TEMPORARY TABLE t (id BIGINT PRIMARY KEY)",
-            "Unsupported",
+            "Rejected",
             "TEMPORARY",
         ),
         // Inheriting would silently drop the parent's columns.
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY) INHERITS (p)",
-            "Unsupported",
+            "Rejected",
             "INHERITS",
         ),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, x BIGINT CHECK (x > 0))",
-            "Unsupported",
+            "Rejected",
             "CHECK",
         ),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, x BIGINT, CHECK (x > 0))",
-            "Unsupported",
+            "Rejected",
             "CHECK",
         ),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, x BIGINT DEFAULT 5)",
-            "Unsupported",
+            "Rejected",
             "DEFAULT",
         ),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p(id) ON DELETE CASCADE)",
-            "Unsupported",
+            "Rejected",
             "ON DELETE",
         ),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES phantom(id))",
-            "Exec",
+            "Client",
             "not found",
         ),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES st(id))",
-            "Unsupported",
+            "Rejected",
             "is a stream",
         ),
         // A compound PK has no lone column, so a member qualifies only through a
         // UNIQUE index of its own.
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT UNSIGNED REFERENCES cp(a))",
-            "Unsupported",
+            "Rejected",
             "UNIQUE index",
         ),
         (
             "CREATE TABLE t (x BIGINT UNSIGNED, y BIGINT UNSIGNED, id BIGINT PRIMARY KEY, \
              FOREIGN KEY (x, y) REFERENCES cp (a, b))",
-            "Unsupported",
+            "Rejected",
             "multi-column",
         ),
     ] {
@@ -294,7 +290,7 @@ fn a_serial_column_must_be_the_single_column_pk() {
             "single-column PRIMARY KEY",
         ),
     ] {
-        assert_rejects(sql, plan_table(&cat, sql), "Unsupported", needle);
+        assert_rejects(sql, plan_table(&cat, sql), "Rejected", needle);
     }
 }
 
@@ -338,7 +334,7 @@ fn an_fk_child_adopts_the_parent_type_before_the_index_is_checked() {
         "CREATE TABLE c2 (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p(u))",
     );
     let sql = "CREATE TABLE c3 (id BIGINT PRIMARY KEY, r BIGINT REFERENCES q(u))";
-    assert_rejects(sql, plan_table(&cat, sql), "Unsupported", "UNIQUE index");
+    assert_rejects(sql, plan_table(&cat, sql), "Rejected", "UNIQUE index");
 }
 
 /// Distinct column sets can render the same auto-name base when a column name
@@ -362,7 +358,7 @@ fn colliding_auto_names_are_disambiguated_within_the_bundle() {
     // rows the catalog cannot both reach.
     let sql = "CREATE TABLE u (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT, \
                CONSTRAINT MyIdx UNIQUE(a), CONSTRAINT myidx UNIQUE(b))";
-    assert_rejects(sql, plan_table(&cat, sql), "Plan", "'myidx'");
+    assert_rejects(sql, plan_table(&cat, sql), "Rejected", "'myidx'");
 }
 
 /// `IF NOT EXISTS` tests the name, whatever kind stands under it — and the
@@ -375,7 +371,7 @@ fn if_not_exists_plans_a_skip_but_a_bad_with_key_still_errors() {
         other => panic!("expected nothing planned, got {:?}", other.map(|_| "a create")),
     }
     let sql = "CREATE TABLE IF NOT EXISTS tv (id BIGINT PRIMARY KEY) WITH (bogus = true)";
-    assert_rejects(sql, plan_table(&cat, sql), "Unsupported", "bogus");
+    assert_rejects(sql, plan_table(&cat, sql), "Rejected", "bogus");
 }
 
 /// The planner asks for exactly the names it needs.
@@ -408,7 +404,7 @@ fn a_cross_schema_qualifier_is_rejected_rather_than_dropped() {
         "CREATE TABLE other.t (id BIGINT PRIMARY KEY)",
         "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES other.t(id))",
     ] {
-        assert_rejects(sql, plan_table(&cat, sql), "Unsupported", "cross-schema");
+        assert_rejects(sql, plan_table(&cat, sql), "Rejected", "cross-schema");
     }
     // The same-schema spelling is the one a Postgres user writes.
     let c = created(&cat, &format!("CREATE TABLE {SN}.t (id BIGINT PRIMARY KEY)"));

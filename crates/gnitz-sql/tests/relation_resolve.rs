@@ -241,7 +241,7 @@ fn one_statement_resolves_a_relation_once() {
 
     // An absent INSERT target costs one resolve.
     let n = requests_for(&mut client, |c| {
-        assert_rejects_variant(c, &sn, "INSERT INTO nope (id) VALUES (1)", "Exec", "nope");
+        assert_rejects_variant(c, &sn, "INSERT INTO nope (id) VALUES (1)", "Client", "nope");
     });
     assert_eq!(n, 1, "an absent target costs one resolve");
 }

@@ -368,13 +368,11 @@ fn min_max_n_rejects_non_numeric_arguments() {
     };
     for c in [1usize, 2] {
         let err = lower_err(&min_max(true, vec![BoundExpr::ColRef(c), BoundExpr::ColRef(c)]), &s);
-        assert!(matches!(err, GnitzSqlError::Unsupported(_)), "column {c}");
+        assert!(matches!(err, GnitzSqlError::Rejected(_)), "column {c}");
     }
 }
 
-/// The 64-register file bounds arity. The overflow is not a special case:
-/// it is the same `TooManyRegs` any large expression hits, surfaced as a
-/// plan-time `Unsupported` by the builder's one exit.
+/// The register file bounds arity.
 #[test]
 fn min_max_n_arity_is_bounded_by_the_register_file() {
     let s = cast_schema();
@@ -386,7 +384,7 @@ fn min_max_n_arity_is_bounded_by_the_register_file() {
         .lower(&min_max(true, args))
         .expect("lowering itself does not bound arity");
     match eb.build(Some(reg)).map_err(GnitzSqlError::from).err() {
-        Some(GnitzSqlError::Unsupported(msg)) => assert!(msg.contains("reg"), "got {msg:?}"),
+        Some(GnitzSqlError::Rejected(msg)) => assert!(msg.contains("reg"), "got {msg:?}"),
         other => panic!("expected a register-budget rejection, got {other:?}"),
     }
 }
@@ -816,7 +814,7 @@ fn lit_wide_is_placed_or_rejected_at_compile_boundary() {
     );
     let err = compile_bound_expr_to_program(&expr, &schema.columns).expect_err("wide literal must not compile");
     match err {
-        GnitzSqlError::Unsupported(msg) => {
+        GnitzSqlError::Rejected(msg) => {
             assert!(msg.contains("does not fit a 64-bit register"), "message: {msg}");
             assert!(msg.contains("18446744073709551616"), "message names the literal: {msg}");
         }
@@ -838,7 +836,7 @@ fn in_list_wide_int_operand_rejects() {
     )
     .expect_err("wide-int IN must not compile");
     assert!(
-        matches!(err, GnitzSqlError::Unsupported(_)),
+        matches!(err, GnitzSqlError::Rejected(_)),
         "expected Unsupported, got {err:?}"
     );
 }
@@ -1020,7 +1018,7 @@ fn mixed_string_and_numeric_case_branches_are_a_typed_error() {
         branches: vec![(BoundExpr::LitInt(1), str_lit("x"))],
         else_: Some(Box::new(BoundExpr::LitInt(0))),
     };
-    assert!(matches!(lower_err(&mixed, &schema), GnitzSqlError::Unsupported(_)));
+    assert!(matches!(lower_err(&mixed, &schema), GnitzSqlError::Rejected(_)));
 }
 
 /// Every numeric position reads its operands through `lower_num`, so a
@@ -1049,7 +1047,7 @@ fn strings_in_numeric_positions_are_rejected_by_lowering() {
     ];
     for e in &cases {
         assert!(
-            matches!(lower_err(e, &schema), GnitzSqlError::Unsupported(_)),
+            matches!(lower_err(e, &schema), GnitzSqlError::Rejected(_)),
             "{e:?} must be rejected by lowering"
         );
     }
@@ -1191,7 +1189,7 @@ fn like_over_a_numeric_operand_is_a_typed_error() {
     let schema = case_schema(); // col1 = i (I64)
     let err = compile_bound_expr_to_program(&like_of(BoundExpr::ColRef(1), "a", false), &schema.columns)
         .expect_err("a numeric subject has no string channel");
-    let GnitzSqlError::Unsupported(msg) = &err else {
+    let GnitzSqlError::Rejected(msg) = &err else {
         panic!("expected Unsupported, got {err:?}")
     };
     assert!(msg.contains("expected a string value"), "got {msg}");

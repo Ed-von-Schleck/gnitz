@@ -22,7 +22,7 @@ fn schema_with_val(val_tc: TypeCode) -> Schema {
 
 fn assert_unsupported(r: Result<BoundExpr, GnitzSqlError>, want_substr: &str) {
     match r.unwrap_err() {
-        GnitzSqlError::Unsupported(msg) => {
+        GnitzSqlError::Rejected(msg) => {
             assert!(
                 msg.contains(want_substr),
                 "got Unsupported({msg:?}), expected to contain {want_substr:?}"
@@ -434,7 +434,7 @@ fn transcendental_names_bind_to_their_function() {
 
 fn assert_plan_err(r: Result<BoundExpr, GnitzSqlError>, want_substr: &str) {
     match r.unwrap_err() {
-        GnitzSqlError::Plan(msg) => assert!(
+        GnitzSqlError::Rejected(msg) => assert!(
             msg.contains(want_substr),
             "got Plan({msg:?}), expected to contain {want_substr:?}"
         ),
@@ -664,7 +664,7 @@ fn like_rejects_what_it_cannot_bake_in() {
     assert_unsupported(bind_str("c LIKE c"), "LIKE pattern must be a string literal");
     assert_unsupported(bind_str("c LIKE NULL"), "LIKE pattern must be a string literal");
     assert_unsupported(bind_str("c LIKE 1"), "LIKE pattern must be a string literal");
-    assert_unsupported(bind_str("c LIKE ANY ('a%')"), "LIKE ANY is not supported");
+    assert_unsupported(bind_str("c LIKE ANY ('a%')"), "LIKE: ANY is not supported");
     // Two characters and a non-string are rejected escapes.
     for esc in ["'ab'", "1"] {
         assert_unsupported(bind_str(&format!("c LIKE 'a' ESCAPE {esc}")), "ESCAPE must be a single");
@@ -676,7 +676,7 @@ fn like_rejects_what_it_cannot_bake_in() {
 #[test]
 fn like_rejects_a_pattern_ending_in_a_live_escape() {
     match bind_str(r"c LIKE 'ab\'").unwrap_err() {
-        GnitzSqlError::Plan(msg) => assert_eq!(msg, "LIKE pattern must not end with escape character"),
+        GnitzSqlError::Rejected(msg) => assert_eq!(msg, "LIKE pattern must not end with escape character"),
         e => panic!("expected Plan, got {e:?}"),
     }
     assert_eq!(like_bytes(r"c LIKE 'ab\\'"), br"ab\");

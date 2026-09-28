@@ -15,14 +15,14 @@ pub(crate) fn reject_outer_with_residual(kind: JoinType, residual: &[HirExpr]) -
     }
     match kind {
         JoinType::Inner => Ok(()),
-        JoinType::Left | JoinType::Right | JoinType::Full => Err(GnitzSqlError::Unsupported(
+        JoinType::Left | JoinType::Right | JoinType::Full => Err(GnitzSqlError::Rejected(
             "LEFT/RIGHT/FULL JOIN with a residual ON predicate (a non-equi/non-range \
              conjunct, or a second range conjunct) is not supported; the residual \
              would have to participate in the outer null-fill. Use INNER JOIN, or \
              move the predicate to a WHERE over a wrapping view."
                 .into(),
         )),
-        JoinType::Semi | JoinType::Anti | JoinType::Mark(_) => Err(GnitzSqlError::Unsupported(
+        JoinType::Semi | JoinType::Anti | JoinType::Mark(_) => Err(GnitzSqlError::Rejected(
             "EXISTS/IN correlation contains a conjunct the semi-join cannot consume \
              (a non-equality/non-range comparison, a second range conjunct, or an OR \
              group spanning both relations); it would have to participate in the \
@@ -36,13 +36,13 @@ pub(crate) fn reject_outer_with_residual(kind: JoinType, residual: &[HirExpr]) -
 /// ordinary SQL with a buildable lowering; neither emitter was written.
 pub(crate) fn reject_join_shape(kind: JoinType, shape: JoinShape) -> Result<(), GnitzSqlError> {
     match (shape, kind) {
-        (JoinShape::Cross, k) if k != JoinType::Inner => Err(GnitzSqlError::Unsupported(
+        (JoinShape::Cross, k) if k != JoinType::Inner => Err(GnitzSqlError::Rejected(
             "a LEFT/RIGHT/FULL JOIN or an EXISTS/IN correlation needs at least one equijoin \
              or range predicate between its two sides; only an INNER step (CROSS JOIN, a \
              comma-separated FROM, or JOIN … ON with no cross-table comparison) may be keyless."
                 .into(),
         )),
-        (JoinShape::PureRange, k) if k.preserves_right() => Err(GnitzSqlError::Unsupported(
+        (JoinShape::PureRange, k) if k.preserves_right() => Err(GnitzSqlError::Rejected(
             "pure-range RIGHT/FULL JOIN (a sole inequality range conjunct with no \
              equality prefix) is not supported; its mirror null-fill has no inner-join \
              witness on the preserved side. Use INNER/LEFT JOIN, or add an equality \
@@ -63,7 +63,7 @@ pub(crate) fn reject_join_shape(kind: JoinType, shape: JoinShape) -> Result<(), 
 pub(crate) fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCode, GnitzSqlError> {
     reject_float_keys([left, right], "JOIN ON")?;
     if !left.ty.decimal_domains_match(right.ty) {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "JOIN ON: join key columns '{}' ({}) and '{}' ({}) differ; a DECIMAL joins only a \
              DECIMAL of the same scale",
             left.name, left.ty, right.name, right.ty
@@ -71,7 +71,7 @@ pub(crate) fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Res
     }
     let (lt, rt) = (left.ty.tc, right.ty.tc);
     if lt.is_temporal() && rt.is_temporal() && lt != rt {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "JOIN ON: join key columns '{}' ({}) and '{}' ({}) differ in unit (days vs microseconds)",
             left.name, left.ty, right.name, right.ty
         )));
@@ -81,14 +81,14 @@ pub(crate) fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Res
     // `join_key_common_type` cannot tell them apart — but a content hash never
     // equals a native integer, so the join would silently match nothing.
     if left.ty.tc.is_german_string() != right.ty.tc.is_german_string() {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "JOIN ON: cannot equijoin string/blob column '{}' ({}) with non-string \
              column '{}' ({}); a string content hash never matches a native key",
             left.name, left.ty, right.name, right.ty
         )));
     }
     left.ty.tc.join_key_common_type(right.ty.tc).ok_or_else(|| {
-        GnitzSqlError::Unsupported(format!(
+        GnitzSqlError::Rejected(format!(
             "JOIN ON: join key columns '{}' ({}) and '{}' ({}) cannot co-partition; \
              a cross-sign pair whose unsigned side is 128-bit (e.g. UINT128/UUID \
              joined with a signed integer) needs a signed-256 type that does not exist",
@@ -104,7 +104,7 @@ pub(crate) fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Res
 pub(crate) fn validate_range_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCode, GnitzSqlError> {
     for col in [left, right] {
         if col.ty.tc.is_german_string() {
-            return Err(GnitzSqlError::Unsupported(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "range join key column '{}' ({:?}): a string/blob content hash is not \
                  order-preserving and cannot bound a range conjunct",
                 col.name, col.ty.tc
@@ -121,13 +121,13 @@ pub(crate) fn reject_nullable_in(kind: JoinType, s: &SubqueryRef) -> Result<(), 
         return Ok(());
     }
     match kind {
-        JoinType::Anti => Err(GnitzSqlError::Unsupported(
+        JoinType::Anti => Err(GnitzSqlError::Rejected(
             "NOT IN (SELECT …) requires the outer operand and the subquery column to be \
              NOT NULL (SQL's NULL semantics diverge from the anti-join otherwise); \
              use NOT EXISTS with an explicit equality instead"
                 .into(),
         )),
-        JoinType::Mark(_) => Err(GnitzSqlError::Unsupported(
+        JoinType::Mark(_) => Err(GnitzSqlError::Rejected(
             "IN (SELECT …) in a mark position (under OR/NOT, in CASE, or projected) requires \
              the outer operand and the subquery column to be NOT NULL — SQL's 3VL diverges \
              from the two-valued mark; use a top-level AND `x IN (SELECT …)` conjunct, or \

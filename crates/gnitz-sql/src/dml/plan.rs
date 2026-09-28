@@ -48,7 +48,7 @@ fn bound_and_predicate(
         match compile_wire_conjuncts(residual.iter().copied(), &schema.columns) {
             Ok(predicate) => return Ok((bound, predicate)),
             // A conjunct the VM cannot carry; a later candidate may consume it.
-            Err(e @ GnitzSqlError::Unsupported(_)) => {
+            Err(e @ GnitzSqlError::Rejected(_)) => {
                 blocked.get_or_insert(e);
             }
             Err(e) => return Err(e),

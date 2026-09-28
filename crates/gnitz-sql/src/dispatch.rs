@@ -95,7 +95,7 @@ pub(crate) fn execute_statement(
         Statement::Update(update) => dml::execute_update(client, schema_name, update),
         Statement::Delete(del) => dml::execute_delete(client, schema_name, del),
         // Refused, not failed: the transaction stays open.
-        _ if client.txn_active() => Err(GnitzSqlError::Unsupported(
+        _ if client.txn_active() => Err(GnitzSqlError::Rejected(
             "this statement is not allowed inside a transaction".to_string(),
         )),
         Statement::CreateTable(create) => {
@@ -143,6 +143,6 @@ pub(crate) fn execute_statement(
             })?;
             hir::execute_view_chain(client, schema_name, chain)
         }
-        _ => Err(GnitzSqlError::Unsupported(format!("unsupported SQL statement: {stmt}"))),
+        _ => Err(GnitzSqlError::Rejected(format!("unsupported SQL statement: {stmt}"))),
     }
 }

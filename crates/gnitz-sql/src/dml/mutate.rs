@@ -65,7 +65,7 @@ fn execute_mutation(
     // `UPDATE a JOIN b ON … SET v = 1` parses; honoring only the relation would
     // update all of `a`.
     let FromShape::SinglePlainRelation(factor) = classify_from(from) else {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "{verb}: exactly one simple FROM table required"
         )));
     };
@@ -149,16 +149,16 @@ pub(super) fn bind_set_list(
             AssignmentTarget::ColumnName(name) => single_part_ident(name),
             _ => None,
         }
-        .ok_or_else(|| GnitzSqlError::Plan(format!("{clause_name}: column must be a simple identifier")))?;
+        .ok_or_else(|| GnitzSqlError::Rejected(format!("{clause_name}: column must be a simple identifier")))?;
         let ci = find_unique_column(&schema.columns, name)?
-            .ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found in {clause_name}")))?;
+            .ok_or_else(|| GnitzSqlError::Rejected(format!("column '{name}' not found in {clause_name}")))?;
         if schema.is_pk_col(ci) {
-            return Err(GnitzSqlError::Unsupported(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "cannot assign to primary key column in {clause_name}"
             )));
         }
         if set.iter().any(|s| s.ci == ci) {
-            return Err(GnitzSqlError::Bind(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "multiple assignments to column '{name}' in {clause_name}"
             )));
         }
@@ -181,7 +181,7 @@ fn bind_set_rhs(
     if clause == SetClause::DoUpdate {
         if let Some(col_name) = excluded_col(expr) {
             let col_idx = find_unique_column(&schema.columns, col_name)?
-                .ok_or_else(|| GnitzSqlError::Bind(format!("EXCLUDED.{col_name}: column not found")))?;
+                .ok_or_else(|| GnitzSqlError::Rejected(format!("EXCLUDED.{col_name}: column not found")))?;
             // Through the same classifier as a bare RHS, so `SET int_col =
             // EXCLUDED.str_col` is rejected here rather than per row.
             return classify_set_rhs(&BoundExpr::ColRef(col_idx), Scope::Excluded, target, schema);
@@ -189,7 +189,7 @@ fn bind_set_rhs(
         // `col + EXCLUDED.col`. The binder already rejects it (`EXCLUDED` names no
         // relation in scope); this says why, which its message cannot.
         if expr_contains_excluded(expr) {
-            return Err(GnitzSqlError::Unsupported(
+            return Err(GnitzSqlError::Rejected(
                 "EXCLUDED column references inside compound expressions are not \
                  supported; use a simple `col = EXCLUDED.col` assignment"
                     .to_string(),
@@ -266,7 +266,7 @@ pub(crate) fn classify_set_rhs(
         // An f64 register has no computed destination: nothing downstream can
         // tell its bit pattern from an integer's.
         None if src.tc.is_float() => {
-            return Err(GnitzSqlError::Unsupported(
+            return Err(GnitzSqlError::Rejected(
                 "SET from a floating-point expression is not supported".to_string(),
             ))
         }
@@ -280,7 +280,7 @@ pub(crate) fn classify_set_rhs(
         FixedInt::from_type_code(col.ty.tc).is_some()
     };
     if !admits {
-        return Err(GnitzSqlError::Bind(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "cannot assign {} value to column '{}' ({})",
             if str_valued { "a string" } else { "an integer" },
             col.name,
@@ -348,7 +348,7 @@ pub(crate) fn apply_set(
                             set_null(w, pi, v.is_none(), def)?;
                             let v = v.unwrap_or(0);
                             if !(min..=max).contains(&v) {
-                                return Err(GnitzSqlError::Bind(format!(
+                                return Err(GnitzSqlError::Rejected(format!(
                                     "column '{}': {} value out of range: {v}",
                                     def.name, def.ty
                                 )));

@@ -7,12 +7,13 @@
 //! Expansion writes names down, so `*` over a CTE exposing two same-named
 //! columns is refused where the flat wildcard passes them positionally.
 
+use super::derivation;
 use crate::ast_util::{
     body_is_grouped, classify_from, col_ref_parts, expand_wildcard_item, expr_node_count, expr_operands_mut,
     extract_table_name_and_alias, is_bare_wildcard_projection, object_name_ident, scalar_projection_item, FromShape,
 };
 use crate::bind::{apply_positional_aliases, reject_foreign_qualifier, single_relation_col_idx, Catalog};
-use crate::error::{derivation, unsupported_clause, GnitzSqlError};
+use crate::error::{unsupported_clause, GnitzSqlError};
 use crate::validate::{
     as_plain_select, computed_column_name, cte_body, non_recursive_ctes, reject_duplicate_projection_names,
     reject_unhonored_select_clauses, require_class, validate_user_name, ClassWant, HonoredClauses,
@@ -134,7 +135,7 @@ fn written_name(e: &Expr) -> Option<&str> {
 fn reject_oversized_expansion(cols: &[(ColumnDef, Expr)], ctx: &str) -> Result<(), GnitzSqlError> {
     let nodes: usize = cols.iter().map(|(_, e)| expr_node_count(e)).sum();
     if nodes > MAX_CTE_EXPANDED_NODES {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "{ctx} expands to {nodes} expression nodes, over the limit of {MAX_CTE_EXPANDED_NODES}.\n\
              CREATE VIEW <name> AS <the CTE body> — the engine maintains it incrementally — then SELECT from it."
         )));

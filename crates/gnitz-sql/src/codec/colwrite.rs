@@ -19,7 +19,7 @@ pub(crate) fn append_value_to_col<R>(
     lit: &BExpr<R>,
 ) -> Result<(), GnitzSqlError> {
     let tc = def.ty.tc;
-    let refuse = |m: &str| Err(GnitzSqlError::Bind(format!("column '{}': {m}", def.name)));
+    let refuse = |m: &str| Err(GnitzSqlError::Rejected(format!("column '{}': {m}", def.name)));
     // NULL is the one value every column type encodes alike: a zeroed cell of
     // the type's own stride, with the null bit set by the caller.
     if matches!(lit, BExpr::LitNull) {
@@ -77,7 +77,7 @@ pub(crate) fn native_value<R>(lit: &BExpr<R>, def: &ColumnDef) -> Result<u128, G
             _ => Err(format!("{} is not a {ty} value", text())),
         },
     }
-    .map_err(|m| GnitzSqlError::Bind(format!("column '{}': {m}", def.name)))
+    .map_err(|m| GnitzSqlError::Rejected(format!("column '{}': {m}", def.name)))
 }
 
 /// A float column's value; `None` for a string. A magnitude past `i128` is
@@ -104,7 +104,7 @@ fn float_value<R>(lit: &BExpr<R>) -> Option<f64> {
 /// `no_nulls = true`, which would take the filler zero for a real value.
 pub(crate) fn check_not_null(col_def: &ColumnDef, is_null: bool) -> Result<(), GnitzSqlError> {
     if is_null && !col_def.is_nullable {
-        return Err(GnitzSqlError::Bind(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "NULL value in column '{}' violates NOT NULL",
             col_def.name
         )));

@@ -38,7 +38,7 @@ fn unknown_with_key_and_non_boolean_value_are_rejected() {
     let t = "CREATE TABLE t (id BIGINT PRIMARY KEY)";
     let e = parse_table_options(&table_options_of(&format!("{t} WITH (streem = true)"))).unwrap_err();
     assert!(format!("{e:?}").contains("streem"), "must name the typo'd key: {e:?}");
-    assert!(matches!(e, GnitzSqlError::Unsupported(_)), "{e:?}");
+    assert!(matches!(e, GnitzSqlError::Rejected(_)), "{e:?}");
     let e = parse_table_options(&table_options_of(&format!("{t} WITH (stream = 1)"))).unwrap_err();
     assert!(format!("{e:?}").contains("stream"), "must name the key: {e:?}");
 }
@@ -54,7 +54,7 @@ fn a_repeated_with_key_is_rejected() {
     ] {
         let e = parse_table_options(&table_options_of(&format!("{t} {tail}"))).unwrap_err();
         assert!(
-            matches!(&e, GnitzSqlError::Plan(m) if m.contains("more than once")),
+            matches!(&e, GnitzSqlError::Rejected(m) if m.contains("more than once")),
             "{tail}: {e:?}"
         );
     }
@@ -109,7 +109,7 @@ fn fk_narrowing_resigning_or_cross_type_rejected() {
     ] {
         let (c, p) = (ColumnDef::new("c", child, false), ColumnDef::new("p", parent, false));
         assert!(
-            matches!(check_fk_type_compat(&c, &p), Err(GnitzSqlError::Bind(_))),
+            matches!(check_fk_type_compat(&c, &p), Err(GnitzSqlError::Rejected(_))),
             "{child:?} → {parent:?} must be rejected"
         );
     }
@@ -174,7 +174,7 @@ fn self_fk_column_referencing_itself_rejected() {
     // child column would be a PK column, which the FK auto-index skips.
     let err = resolve_fk_target_inline(&cols, &[0], "tree", &site(&obj("tree"), &[ident("id")], 0)).unwrap_err();
     match err {
-        GnitzSqlError::Bind(m) => assert!(m.contains("must not be the referenced column itself"), "got: {m}"),
+        GnitzSqlError::Rejected(m) => assert!(m.contains("must not be the referenced column itself"), "got: {m}"),
         e => panic!("expected Bind, got {e:?}"),
     }
 }
@@ -183,7 +183,7 @@ fn self_fk_column_referencing_itself_rejected() {
 fn self_fk_against_non_pk_column_rejected() {
     let cols = tree_cols();
     let err = resolve_fk_target_inline(&cols, &[0], "tree", &site(&obj("tree"), &[ident("tag")], 1)).unwrap_err();
-    assert!(matches!(err, GnitzSqlError::Unsupported(_)), "got: {err:?}");
+    assert!(matches!(err, GnitzSqlError::Rejected(_)), "got: {err:?}");
 }
 
 #[test]
@@ -191,10 +191,10 @@ fn self_fk_against_compound_pk_rejected() {
     let cols = tree_cols();
     // Named column: it is a PK member, but not the *lone* PK.
     let err = resolve_fk_target_inline(&cols, &[0, 1], "tree", &site(&obj("tree"), &[ident("id")], 2)).unwrap_err();
-    assert!(matches!(err, GnitzSqlError::Unsupported(_)), "got: {err:?}");
+    assert!(matches!(err, GnitzSqlError::Rejected(_)), "got: {err:?}");
     // Omitted column list: there is no single default target.
     let err = resolve_fk_target_inline(&cols, &[0, 1], "tree", &site(&obj("tree"), &[], 2)).unwrap_err();
-    assert!(matches!(err, GnitzSqlError::Bind(_)), "got: {err:?}");
+    assert!(matches!(err, GnitzSqlError::Rejected(_)), "got: {err:?}");
 }
 
 #[test]
@@ -202,7 +202,7 @@ fn duplicate_column_names_are_rejected_case_insensitively() {
     reject_duplicate_names(["a", "b"].into_iter(), "table definition").unwrap();
     let e = reject_duplicate_names(["a", "B", "A"].into_iter(), "table definition").unwrap_err();
     assert!(
-        matches!(&e, GnitzSqlError::Plan(m) if m.contains("duplicate column name 'A'")),
+        matches!(&e, GnitzSqlError::Rejected(m) if m.contains("duplicate column name 'A'")),
         "{e:?}"
     );
 }

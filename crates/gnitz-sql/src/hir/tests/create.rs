@@ -22,7 +22,7 @@ fn a_size_is_a_positive_integer_and_a_binary_unit() {
     }
     for lit in ["lots", "5", "5 TB", "-5 MB", "0 MB", "18446744073709551615 GB", ""] {
         assert!(
-            matches!(parse_size("capacity", lit), Err(GnitzSqlError::Plan(_))),
+            matches!(parse_size("capacity", lit), Err(GnitzSqlError::Rejected(_))),
             "{lit:?}"
         );
     }
@@ -31,13 +31,13 @@ fn a_size_is_a_positive_integer_and_a_binary_unit() {
 #[test]
 fn the_option_list_fills_the_two_budgets_and_refuses_anything_else() {
     let both = options_of("WITH (capacity = '1 MB', delta = '2 MB')");
-    assert!(matches!(both, Err(GnitzSqlError::Unsupported(ref m)) if m.contains("delta feed")));
+    assert!(matches!(both, Err(GnitzSqlError::Rejected(ref m)) if m.contains("delta feed")));
     let cap = options_of("WITH (capacity = '1 MB')").unwrap();
     assert_eq!(cap, ViewProps::Bounded { capacity_bytes: 1 << 20 });
     let delta = options_of("WITH (DELTA = '2 KB')").unwrap();
     assert_eq!(delta, ViewProps::Fed { delta_bytes: 2 << 10 });
     match options_of("WITH (foo = '1 MB')") {
-        Err(GnitzSqlError::Unsupported(m)) => assert!(m.contains("unknown CREATE VIEW option 'foo'"), "{m}"),
+        Err(GnitzSqlError::Rejected(m)) => assert!(m.contains("unknown CREATE VIEW option 'foo'"), "{m}"),
         other => panic!("{other:?}"),
     }
     for (with, needle) in [
@@ -48,7 +48,7 @@ fn the_option_list_fills_the_two_budgets_and_refuses_anything_else() {
         ("WITH (delta = '1 MB', Delta = '1 MB')", "more than once"),
     ] {
         match options_of(with) {
-            Err(GnitzSqlError::Plan(m)) => assert!(m.contains(needle), "{with}: {m}"),
+            Err(GnitzSqlError::Rejected(m)) => assert!(m.contains(needle), "{with}: {m}"),
             other => panic!("{with}: {other:?}"),
         }
     }

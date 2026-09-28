@@ -175,13 +175,13 @@ fn parse<'a>(
                     "ALTER COLUMN ADD GENERATED is not supported (no generated columns in gnitz)"
                 }
             };
-            Err(GnitzSqlError::Unsupported(msg.to_string()))
+            Err(GnitzSqlError::Rejected(msg.to_string()))
         }
         AlterTableOperation::AddConstraint { constraint, not_valid } => {
             const CTX: &str = "ALTER TABLE ADD CONSTRAINT";
             reject_if(*not_valid, CTX, "NOT VALID")?;
             let TableConstraint::Unique(u) = constraint else {
-                return Err(GnitzSqlError::Unsupported(
+                return Err(GnitzSqlError::Rejected(
                     "ADD CONSTRAINT: only UNIQUE constraints are supported".to_string(),
                 ));
             };
@@ -202,8 +202,6 @@ fn parse<'a>(
             validate_user_name(&name.value)?;
             Ok((CTX, Action::DropConstraint { name: &name.value, if_exists: *if_exists }))
         }
-        _ => Err(GnitzSqlError::Unsupported(
-            "this ALTER TABLE operation is not supported".to_string(),
-        )),
+        _ => Err(unsupported_clause("ALTER TABLE", &operation.to_string())),
     }
 }

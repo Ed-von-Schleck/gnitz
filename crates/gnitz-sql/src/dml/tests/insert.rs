@@ -74,7 +74,7 @@ fn insert_wrong_name_is_rejected() {
         &two_col(TypeCode::I64),
         None,
     ));
-    assert!(matches!(err, GnitzSqlError::Bind(_)), "got {err:?}");
+    assert!(matches!(err, GnitzSqlError::Rejected(_)), "got {err:?}");
 }
 
 #[test]
@@ -91,7 +91,7 @@ fn insert_qualified_name_is_rejected() {
         sqlparser::ast::Ident::new("pk"),
     ])];
     let err = err_of(insert_row_shape(&qualified, &two_col(TypeCode::I64), None));
-    assert!(matches!(err, GnitzSqlError::Plan(_)), "got {err:?}");
+    assert!(matches!(err, GnitzSqlError::Rejected(_)), "got {err:?}");
 }
 
 #[test]
@@ -216,7 +216,7 @@ fn a_serial_id_past_the_type_maximum_is_exhausted() {
     assert_eq!(dst.get_tuple(0), schema.opk_key_cols(&[max as u128]));
     for (base, n, next) in [(max, 2, max + 1), (max + 5, 1, max + 5), (u64::MAX, 2, u64::MAX)] {
         match PkPlan::serial(base, n, TypeCode::I16) {
-            Err(GnitzSqlError::Bind(m)) => {
+            Err(GnitzSqlError::Rejected(m)) => {
                 assert!(m.contains(&format!("exhausted: next value {next} ")), "{m}")
             }
             _ => panic!("expected exhaustion for base {base}, {n} rows"),

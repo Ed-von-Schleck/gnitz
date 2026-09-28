@@ -123,29 +123,21 @@ fn a_wildcard_expands_through_its_modifiers() {
         let want: Vec<(usize, String)> = want.iter().map(|&(i, n)| (i, n.to_string())).collect();
         assert_eq!(got, want, "{sql}");
     }
-    // `(sql, variant, substring)`: a modifier gnitz does not honor is
-    // `Unsupported`; a name resolving to nothing in the relation is `Bind`; a
-    // modifier list contradicting itself is `Plan`.
-    let rejected: &[(&str, &str, &str)] = &[
-        ("SELECT * REPLACE (a + 1 AS a) FROM t", "Unsupported", "REPLACE"),
-        ("SELECT * ILIKE 'a%' FROM t", "Unsupported", "ILIKE"),
-        ("SELECT * EXCEPT (nope) FROM t", "Bind", "unknown column 'nope'"),
-        ("SELECT * EXCEPT (_hid) FROM t", "Bind", "unknown column '_hid'"),
-        (
-            "SELECT * EXCEPT (a) RENAME (a AS x) FROM t",
-            "Plan",
-            "excluded column 'a'",
-        ),
-        ("SELECT * RENAME (a AS x, a AS y) FROM t", "Plan", "'a' twice"),
+    // `(sql, substring)`: a modifier gnitz does not honor, a name resolving to
+    // nothing in the relation, and a modifier list contradicting itself.
+    let rejected: &[(&str, &str)] = &[
+        ("SELECT * REPLACE (a + 1 AS a) FROM t", "REPLACE"),
+        ("SELECT * ILIKE 'a%' FROM t", "ILIKE"),
+        ("SELECT * EXCEPT (nope) FROM t", "unknown column 'nope'"),
+        ("SELECT * EXCEPT (_hid) FROM t", "unknown column '_hid'"),
+        ("SELECT * EXCEPT (a) RENAME (a AS x) FROM t", "excluded column 'a'"),
+        ("SELECT * RENAME (a AS x, a AS y) FROM t", "'a' twice"),
     ];
-    for (sql, variant, want) in rejected {
-        let (got, msg) = match expand_wildcard_item(&wildcard_item(sql), &cols, "SELECT").unwrap_err() {
-            GnitzSqlError::Unsupported(m) => ("Unsupported", m),
-            GnitzSqlError::Bind(m) => ("Bind", m),
-            GnitzSqlError::Plan(m) => ("Plan", m),
+    for (sql, want) in rejected {
+        let msg = match expand_wildcard_item(&wildcard_item(sql), &cols, "SELECT").unwrap_err() {
+            GnitzSqlError::Rejected(m) => m,
             other => panic!("{sql}: unexpected {other:?}"),
         };
-        assert_eq!(got, *variant, "{sql}: {msg}");
         assert!(msg.contains(want), "{sql}: {msg}");
     }
 }

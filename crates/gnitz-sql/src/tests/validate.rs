@@ -5,12 +5,18 @@ use gnitz_core::{ColumnDef, Schema, TypeCode};
 #[test]
 fn validate_user_name_rejects_reserved_and_malformed() {
     // Leading `_` is reserved (system prefix + synthesized `_seg…` segments).
-    assert!(matches!(validate_user_name("_hidden"), Err(GnitzSqlError::Plan(_))));
-    assert!(matches!(validate_user_name("_seg4096"), Err(GnitzSqlError::Plan(_))));
+    assert!(matches!(validate_user_name("_hidden"), Err(GnitzSqlError::Rejected(_))));
+    assert!(matches!(
+        validate_user_name("_seg4096"),
+        Err(GnitzSqlError::Rejected(_))
+    ));
     // Empty and illegal characters.
-    assert!(matches!(validate_user_name(""), Err(GnitzSqlError::Plan(_))));
-    assert!(matches!(validate_user_name("bad-name"), Err(GnitzSqlError::Plan(_))));
-    assert!(matches!(validate_user_name("a.b"), Err(GnitzSqlError::Plan(_))));
+    assert!(matches!(validate_user_name(""), Err(GnitzSqlError::Rejected(_))));
+    assert!(matches!(
+        validate_user_name("bad-name"),
+        Err(GnitzSqlError::Rejected(_))
+    ));
+    assert!(matches!(validate_user_name("a.b"), Err(GnitzSqlError::Rejected(_))));
     // Ordinary names — including an internal `_` — are accepted.
     assert!(validate_user_name("orders").is_ok());
     assert!(validate_user_name("my_view2").is_ok());
@@ -52,7 +58,7 @@ fn pk_list_arity_bounds() {
     reject_pk_list_arity("join key list", 0).unwrap();
     reject_pk_list_arity("join key list", gnitz_core::PK_LIST_MAX_COLS).unwrap();
     let over = reject_pk_list_arity("range JOIN output PK", gnitz_core::PK_LIST_MAX_COLS + 1).unwrap_err();
-    let GnitzSqlError::Unsupported(msg) = over else {
+    let GnitzSqlError::Rejected(msg) = over else {
         panic!("expected Unsupported, got {over:?}");
     };
     assert!(msg.contains("range JOIN output PK"), "{msg}");

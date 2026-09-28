@@ -17,7 +17,7 @@ use crate::codec::colwrite::{append_value_to_col, check_not_null, native_value};
 use crate::dml::mutate::{apply_set, bind_set_list, SetClause, SetCol};
 use crate::dml::plan::{rows_reply, RowsReply};
 use crate::dml::rmw::{commit_rmw, TargetRead};
-use crate::error::GnitzSqlError;
+use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::exec::client_map::ClientMap;
 use crate::ir::BExpr;
 use crate::validate::{reject_unhonored_insert_clauses, require_class, ClassWant};
@@ -52,14 +52,14 @@ fn validate_conflict_target(target: &Option<ConflictTarget>, schema: &Schema) ->
             let mut named: Vec<u32> = Vec::with_capacity(cols.len());
             for c in cols {
                 let ci = find_unique_column(&schema.columns, c.value.as_str())?
-                    .ok_or_else(|| GnitzSqlError::Bind(format!("ON CONFLICT ({}): column not found", c.value)))?;
+                    .ok_or_else(|| GnitzSqlError::Rejected(format!("ON CONFLICT ({}): column not found", c.value)))?;
                 named.push(ci as u32);
             }
             let mut pk = schema.pk_cols.clone();
             named.sort_unstable();
             pk.sort_unstable();
             if named != pk {
-                return Err(GnitzSqlError::Unsupported(format!(
+                return Err(GnitzSqlError::Rejected(format!(
                     "ON CONFLICT target must name exactly the primary key ({})",
                     pk.iter()
                         .map(|&ci| schema.columns[ci as usize].name.as_str())
@@ -69,9 +69,7 @@ fn validate_conflict_target(target: &Option<ConflictTarget>, schema: &Schema) ->
             }
             Ok(())
         }
-        Some(ConflictTarget::OnConstraint(_)) => Err(GnitzSqlError::Unsupported(
-            "ON CONFLICT ON CONSTRAINT not supported".to_string(),
-        )),
+        Some(ConflictTarget::OnConstraint(_)) => Err(unsupported_clause("INSERT … ON CONFLICT", "ON CONSTRAINT")),
     }
 }
 
@@ -105,16 +103,16 @@ fn insert_row_shape(
     }
     for (k, name) in columns.iter().enumerate() {
         let ident = single_part_ident(name)
-            .ok_or_else(|| GnitzSqlError::Plan("INSERT column list: column must be a simple identifier".into()))?;
+            .ok_or_else(|| GnitzSqlError::Rejected("INSERT column list: column must be a simple identifier".into()))?;
         let ci = find_unique_column(&schema.columns, ident)?
-            .ok_or_else(|| GnitzSqlError::Bind(format!("column '{ident}' not found in the INSERT column list")))?;
+            .ok_or_else(|| GnitzSqlError::Rejected(format!("column '{ident}' not found in the INSERT column list")))?;
         if Some(ci) == serial_ci {
-            return Err(GnitzSqlError::Unsupported(
+            return Err(GnitzSqlError::Rejected(
                 "cannot supply a value for a SERIAL column; omit it from the INSERT".to_string(),
             ));
         }
         if slot_of[ci].is_some() {
-            return Err(GnitzSqlError::Bind(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "column '{ident}' specified more than once in the INSERT column list"
             )));
         }
@@ -131,16 +129,12 @@ pub(crate) fn execute_insert(
     reject_unhonored_insert_clauses(insert)?;
     let table_name_str = match &insert.table {
         TableObject::TableName(obj_name) => extract_object_name(obj_name, schema_name, "INSERT")?,
-        _ => {
-            return Err(GnitzSqlError::Unsupported(
-                "INSERT with table function not supported".to_string(),
-            ))
-        }
+        _ => return Err(unsupported_clause("INSERT", "a table function target")),
     };
     let source = insert
         .source
         .as_ref()
-        .ok_or_else(|| GnitzSqlError::Unsupported("INSERT without VALUES not supported".to_string()))?;
+        .ok_or_else(|| GnitzSqlError::Rejected("INSERT without VALUES not supported".to_string()))?;
     let rows = extract_values_rows(source)?;
 
     let target = client.resolve_relation(schema_name, &table_name_str)?;
@@ -151,17 +145,17 @@ pub(crate) fn execute_insert(
     // RETURNING is supported on the plain-INSERT path only; capturing the
     // effective row under ON CONFLICT (which may UPDATE or skip a row) is out of
     // scope.
-    if insert.returning.is_some() && insert.on.is_some() {
-        return Err(GnitzSqlError::Unsupported(
-            "RETURNING with ON CONFLICT is not supported".to_string(),
-        ));
-    }
+    reject_if(
+        insert.returning.is_some() && insert.on.is_some(),
+        "INSERT … ON CONFLICT",
+        "RETURNING",
+    )?;
 
     // Resolve the ON CONFLICT clause into a `ConflictPlan`.
     let plan = match insert.on.as_ref() {
         None => ConflictPlan::Error,
         Some(OnInsert::DuplicateKeyUpdate(_)) => {
-            return Err(GnitzSqlError::Unsupported(
+            return Err(GnitzSqlError::Rejected(
                 "ON DUPLICATE KEY UPDATE not supported — use PostgreSQL-style \
                  ON CONFLICT (col) DO UPDATE"
                     .to_string(),
@@ -176,20 +170,14 @@ pub(crate) fn execute_insert(
             match action {
                 OnConflictAction::DoNothing => ConflictPlan::Resolve { set: None },
                 OnConflictAction::DoUpdate(do_update) => {
-                    if do_update.selection.is_some() {
-                        return Err(GnitzSqlError::Unsupported(
-                            "ON CONFLICT ... DO UPDATE WHERE not supported".to_string(),
-                        ));
-                    }
+                    reject_if(do_update.selection.is_some(), "INSERT … ON CONFLICT DO UPDATE", "WHERE")?;
                     let set = bind_set_list(&do_update.assignments, schema, &table_name_str, SetClause::DoUpdate)?;
                     ConflictPlan::Resolve { set: Some(set) }
                 }
             }
         }
         Some(_) => {
-            return Err(GnitzSqlError::Unsupported(
-                "unsupported ON clause in INSERT".to_string(),
-            ));
+            return Err(GnitzSqlError::Rejected("unsupported ON clause in INSERT".to_string()));
         }
     };
 
@@ -224,7 +212,7 @@ pub(crate) fn execute_insert(
             } else {
                 ""
             };
-            return Err(GnitzSqlError::Bind(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "INSERT specifies {} value(s) but table '{}' expects {} value(s){}",
                 row.len(),
                 table_name_str,
@@ -342,7 +330,7 @@ fn resolve_conflicts(
         let key = batch.pks.get_bytes(i);
         match first.entry(key) {
             Entry::Occupied(_) if set.is_some() => {
-                return Err(GnitzSqlError::Bind(
+                return Err(GnitzSqlError::Rejected(
                     "ON CONFLICT DO UPDATE cannot affect row a second time \
                      (duplicate PK in the same batch)"
                         .to_string(),
@@ -374,7 +362,7 @@ fn extract_values_rows(query: &Query) -> Result<&[Parens<Vec<Expr>>], GnitzSqlEr
         // Inert MySQL spellings of `VALUES (…)`: `VALUES ROW(…)` and `VALUE (…)`
         // parse to the same `rows`, so the row inserted is identical.
         SetExpr::Values(Values { rows, explicit_row: _, value_keyword: _ }) => Ok(rows),
-        _ => Err(GnitzSqlError::Unsupported(
+        _ => Err(GnitzSqlError::Rejected(
             "INSERT only supports VALUES (not INSERT INTO ... SELECT)".to_string(),
         )),
     }
@@ -397,7 +385,7 @@ impl PkPlan {
             .1;
         if i128::from(base) + n as i128 - 1 > max {
             let next = i128::from(base).max(max + 1);
-            return Err(GnitzSqlError::Bind(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "SERIAL primary key exhausted: next value {next} exceeds the column type maximum {max}"
             )));
         }
@@ -412,7 +400,7 @@ impl PkPlan {
             .iter()
             .map(|&pi| {
                 slot_of.get(pi as usize).copied().flatten().ok_or_else(|| {
-                    GnitzSqlError::Bind(format!(
+                    GnitzSqlError::Rejected(format!(
                         "PK column '{}' missing from INSERT row",
                         schema.columns[pi as usize].name
                     ))

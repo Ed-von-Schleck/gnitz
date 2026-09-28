@@ -22,3 +22,12 @@ pub(crate) use mutate::{execute_delete, execute_update};
 #[cfg(test)]
 pub(crate) use select::ReadPlan;
 pub(crate) use select::{execute_select, plan_read};
+
+/// An ad-hoc SELECT reads one relation; this query derives a new one, which a view
+/// maintains. `construct` names what was detected.
+fn derivation(construct: &str) -> crate::error::GnitzSqlError {
+    crate::error::GnitzSqlError::Rejected(format!(
+        "ad-hoc SELECT reads a single relation; this query derives a new one ({construct}).\n\
+         CREATE VIEW <name> AS <your query> — the engine maintains it incrementally — then SELECT from it."
+    ))
+}

@@ -10,8 +10,8 @@
 //! A query that *derives* a new relation — a JOIN, a set operation, an EXISTS/IN
 //! or scalar subquery, a derived table, a grouped CTE — has no single-relation
 //! sink; [`plan_query`] rejects it from the AST alone
-//! ([`crate::error::derivation`]), pointing at CREATE VIEW. A read the direct
-//! path merely cannot express is a feature-named `Unsupported`, never that
+//! ([`super::derivation`]), pointing at CREATE VIEW. A read the direct
+//! path merely cannot express is a feature-named rejection, never that
 //! template. A `WITH` is expanded into the body first (`dml::cte`), so a CTE
 //! reads through the flat query's sink.
 //!
@@ -20,6 +20,7 @@
 //! shape without reaching a server; [`execute_select`] runs the resulting plan and
 //! `dml::explain` formats the same plan instead of dispatching it.
 
+use super::derivation;
 use crate::agg::ground_partial_schema;
 use crate::ast_util::{
     body_is_grouped, classify_from, extract_table_name_and_alias, has_exists_in_subquery, has_scalar_subquery,
@@ -29,7 +30,7 @@ use crate::bind::{bind_single_table, output_column, Catalog};
 use crate::codec::project_schema::compute_map;
 use crate::dml::cte::inline_ctes;
 use crate::dml::plan::{access_path, rows_reply, RowsReply};
-use crate::error::{derivation, reject_if, GnitzSqlError};
+use crate::error::{reject_if, GnitzSqlError};
 use crate::exec::agg_finish::FoldFinish;
 use crate::exec::order::{order_and_window, Window};
 use crate::expr_lower::compile_scalar_evaluator;
@@ -156,14 +157,14 @@ pub(crate) fn plan_read(stmt: &Statement, cat: &Catalog<'_>) -> Result<ReadPlan,
             match statement.as_ref() {
                 Statement::Query(q) => q.as_ref(),
                 _ => {
-                    return Err(GnitzSqlError::Unsupported(
+                    return Err(GnitzSqlError::Rejected(
                         "EXPLAIN describes a SELECT; this statement is not one".to_string(),
                     ))
                 }
             }
         }
         _ => {
-            return Err(GnitzSqlError::Unsupported(
+            return Err(GnitzSqlError::Rejected(
                 "plan_read describes a SELECT or the EXPLAIN of one; this statement is neither".to_string(),
             ))
         }
@@ -182,8 +183,7 @@ fn plan_query(cat: &Catalog<'_>, query: &Query) -> Result<ReadPlan, GnitzSqlErro
         // Not the derivation template: CREATE VIEW refuses these bodies too.
         body => as_plain_select(body, "direct SELECT")?,
     };
-    // A single-relation subquery is detected nowhere else: without this an EXISTS/IN would
-    // surface as a bind error and a scalar subquery as a projection error.
+    // Detected nowhere else: without this the binder rejects these without naming CREATE VIEW.
     if has_exists_in_subquery(select) {
         return Err(derivation("EXISTS/IN subquery"));
     }

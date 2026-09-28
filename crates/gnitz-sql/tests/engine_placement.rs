@@ -50,11 +50,15 @@ fn cluster_by_admission() {
         "CREATE TABLE ok3 (a BIGINT UNSIGNED PRIMARY KEY, v BIGINT NOT NULL) CLUSTER BY a",
     );
     for (clause, variant, msg) in [
-        ("CLUSTER BY b", "Plan", "leading prefix"),
-        ("CLUSTER BY b, a", "Plan", "leading prefix"),
-        ("CLUSTER BY v", "Plan", "is not a PRIMARY KEY column"),
-        ("CLUSTER BY nope", "Bind", "not found"),
-        ("WITH (replicated = true) CLUSTER BY a", "Plan", "mutually exclusive"),
+        ("CLUSTER BY b", "Rejected", "leading prefix"),
+        ("CLUSTER BY b, a", "Rejected", "leading prefix"),
+        ("CLUSTER BY v", "Rejected", "is not a PRIMARY KEY column"),
+        ("CLUSTER BY nope", "Rejected", "not found"),
+        (
+            "WITH (replicated = true) CLUSTER BY a",
+            "Rejected",
+            "mutually exclusive",
+        ),
     ] {
         assert_rejects_variant(
             &mut client,
@@ -69,7 +73,7 @@ fn cluster_by_admission() {
         &sn,
         "CREATE TABLE bad (a BIGINT UNSIGNED, b BIGINT UNSIGNED, c BIGINT UNSIGNED, v BIGINT NOT NULL, \
          PRIMARY KEY (a, b, c)) CLUSTER BY a, c",
-        "Plan",
+        "Rejected",
         "leading prefix",
     );
 }

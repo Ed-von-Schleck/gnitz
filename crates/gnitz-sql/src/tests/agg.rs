@@ -27,7 +27,7 @@ fn agg_ops_rejects_unevaluatable_arg_types() {
         (AggFunc::Avg, 3), // AVG(uuid)
         (AggFunc::Sum, 4), // SUM(str)
     ] {
-        assert!(matches!(try_push(func, Some(ci)), Err(GnitzSqlError::Unsupported(_))));
+        assert!(matches!(try_push(func, Some(ci)), Err(GnitzSqlError::Rejected(_))));
     }
 }
 

@@ -871,7 +871,7 @@ impl RelExpr {
         let lcols = left.cols();
         let rcols = right.cols();
         if lcols.len() != rcols.len() {
-            return Err(GnitzSqlError::Plan(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "set operation: column count mismatch ({} vs {})",
                 lcols.len(),
                 rcols.len()
@@ -880,7 +880,7 @@ impl RelExpr {
         let mut out = Vec::with_capacity(lcols.len());
         for (i, (l, r)) in lcols.iter().zip(&rcols).enumerate() {
             let ty = set_op_common_type(l.def.ty, r.def.ty).ok_or_else(|| {
-                GnitzSqlError::Plan(format!(
+                GnitzSqlError::Rejected(format!(
                     "set operation: column {} type mismatch ({} vs {})",
                     i, l.def.ty, r.def.ty
                 ))

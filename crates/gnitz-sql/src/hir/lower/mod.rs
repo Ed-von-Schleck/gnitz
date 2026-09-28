@@ -203,7 +203,7 @@ pub(crate) fn lower(rel: Rc<RelExpr>, bounded: bool) -> Result<ViewBundle, Gnitz
     let top = lower_body(&mut chain, &rel)?;
     // A body whose inputs cut a segment of their own bounds a view over unbounded copies.
     if bounded && chain.has_segments() {
-        return Err(GnitzSqlError::Unsupported(
+        return Err(GnitzSqlError::Rejected(
             "CREATE VIEW WITH (capacity …): a body that compiles to more than one view is not supported".into(),
         ));
     }

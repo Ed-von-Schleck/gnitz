@@ -43,17 +43,16 @@ use super::{as_col, col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinTyp
 use crate::agg::default_agg_name;
 use crate::agg::AggFunc;
 use crate::ast_util::{
-    agg_func_from_name, classify_agg_shape, peel_nested, reject_fn_qualifiers, single_fn_name, unknown_function,
-    Distinct,
+    agg_func_from_name, classify_agg_shape, peel_nested, single_fn_name, unknown_function, CallSurface, PlainCall,
 };
 use crate::bind::{bind_structural, LeafBinder};
-use crate::error::GnitzSqlError;
+use crate::error::{reject_if, GnitzSqlError};
 use crate::ir::{BExpr, BinOp};
 use crate::validate::reject_float_key_of;
 use gnitz_core::{ColType, ColumnDef, TypeCode};
 use sqlparser::ast::{
-    Expr, Function, FunctionArguments, Ident, NamedWindowDefinition, NamedWindowExpr, OrderByExpr, OrderByOptions,
-    Select, WindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
+    Expr, Function, Ident, NamedWindowDefinition, NamedWindowExpr, OrderByExpr, OrderByOptions, Select, WindowFrame,
+    WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -273,7 +272,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
     fn resolve_spec<'f>(&'f self, over: &'f WindowType) -> Result<&'f WindowSpec, GnitzSqlError> {
         let inline = |s: &'f WindowSpec| {
             if s.window_name.is_some() {
-                return Err(GnitzSqlError::Unsupported(
+                return Err(GnitzSqlError::Rejected(
                     "a window specification extending a named window (OVER (w …)) is not supported".into(),
                 ));
             }
@@ -291,14 +290,14 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
                 .iter()
                 .find(|d| d.0.value.eq_ignore_ascii_case(&name.value))
                 .ok_or_else(|| {
-                    GnitzSqlError::Plan(format!("window '{}' is not defined in the WINDOW clause", name.value))
+                    GnitzSqlError::Rejected(format!("window '{}' is not defined in the WINDOW clause", name.value))
                 })?;
             match &def.1 {
                 NamedWindowExpr::WindowSpec(s) => return inline(s),
                 NamedWindowExpr::NamedWindow(next) => name = next,
             }
         }
-        Err(GnitzSqlError::Plan(format!(
+        Err(GnitzSqlError::Rejected(format!(
             "window '{}' is defined in terms of itself",
             name.value
         )))
@@ -330,11 +329,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
         let mut order = Vec::with_capacity(order_by.len());
         for o in order_by {
             let OrderByExpr { expr, options, with_fill } = o;
-            if with_fill.is_some() {
-                return Err(GnitzSqlError::Unsupported(
-                    "window ORDER BY: WITH FILL is not supported".into(),
-                ));
-            }
+            reject_if(with_fill.is_some(), "window ORDER BY", "WITH FILL")?;
             // `nulls_first` is inert: `check_key` below refuses a key that is not
             // provably NOT NULL, so this ORDER BY sees no NULL to place.
             let OrderByOptions { asc, nulls_first: _ } = options;
@@ -346,7 +341,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
         let written = order.len();
         if row_number {
             let Some(key) = &self.row_key else {
-                return Err(GnitzSqlError::Unsupported(
+                return Err(GnitzSqlError::Rejected(
                     "ROW_NUMBER needs an input with a unique row key (a table, or a grouped or \
                      DISTINCT body); over a join body, a stream, or a view keyed by a join key its \
                      ties have no order — use RANK or DENSE_RANK, or window over a view of the join"
@@ -364,7 +359,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
                 .collect();
             order.extend(tiebreak.into_iter().map(|e| (e, true)));
         } else if matches!(func, WinFunc::Rank | WinFunc::DenseRank) && order.is_empty() {
-            return Err(GnitzSqlError::Unsupported(
+            return Err(GnitzSqlError::Rejected(
                 "RANK / DENSE_RANK need an ORDER BY in their window specification".into(),
             ));
         }
@@ -417,13 +412,13 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
             return Err(reject_float_key_of("a float-valued expression", role));
         }
         if slot == KeySlot::Band && tc.is_german_string() {
-            return Err(GnitzSqlError::Unsupported(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "{role}: a string cannot be the first ORDER BY key; its content hash is not \
                  order-preserving, so it cannot bound the band join the window folds over"
             )));
         }
         if !self.never_null(e) {
-            return Err(GnitzSqlError::Unsupported(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "{role}: the key must be provably NOT NULL (a NOT NULL column, or an expression over \
                  NOT NULL columns) — the window is keyed on it, and a NULL key neither groups nor matches"
             )));
@@ -539,7 +534,7 @@ impl<L: ItemLeaf> ItemLeaf for WindowLeaf<'_, L> {
 /// whether it was written as `ROW_NUMBER` — which is `RANK` plus the row-key
 /// tiebreak the caller appends, so it has no [`WinFunc`] of its own.
 fn classify_window_call(f: &Function) -> Result<(WinFunc, Option<&Expr>, bool), GnitzSqlError> {
-    reject_fn_qualifiers(f, "window functions", Distinct::Rejected)?;
+    let call = PlainCall::check(f, CallSurface::Window)?;
     let name = single_fn_name(f).ok_or_else(|| unknown_function(f))?;
     let ranking = match name.to_ascii_lowercase().as_str() {
         "rank" => Some((WinFunc::Rank, false)),
@@ -548,29 +543,16 @@ fn classify_window_call(f: &Function) -> Result<(WinFunc, Option<&Expr>, bool), 
         _ => None,
     };
     let Some((func, row_number)) = ranking else {
-        // `bind_structural` routes every windowed call here, scalar names
-        // included, so `classify_agg_shape`'s "function not supported" would be
-        // false for `ABS(x) OVER (…)` — ABS is supported, just not windowed.
         if agg_func_from_name(name).is_none() {
-            return Err(GnitzSqlError::Unsupported(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "{}: not supported as a window function",
                 name.to_ascii_uppercase()
             )));
         }
-        let (agg, arg) = classify_agg_shape(f)?;
+        let (agg, arg) = classify_agg_shape(call)?;
         return Ok((WinFunc::Agg(agg), arg, false));
     };
-    let no_args = match &f.args {
-        FunctionArguments::None => true,
-        FunctionArguments::List(list) => list.args.is_empty(),
-        FunctionArguments::Subquery(_) => false,
-    };
-    if !no_args {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "{}: takes no arguments",
-            name.to_ascii_uppercase()
-        )));
-    }
+    call.args(&name.to_ascii_uppercase(), (0, Some(0)))?;
     Ok((func, None, row_number))
 }
 
@@ -586,13 +568,13 @@ fn frame_is_cumulative(frame: Option<&WindowFrame>, has_order: bool) -> Result<b
         (WindowFrameBound::Preceding(None), WindowFrameBound::Following(None)) => Ok(false),
         (WindowFrameBound::Preceding(None), WindowFrameBound::CurrentRow) => match frame.units {
             WindowFrameUnits::Range => Ok(has_order),
-            WindowFrameUnits::Rows | WindowFrameUnits::Groups => Err(GnitzSqlError::Unsupported(
+            WindowFrameUnits::Rows | WindowFrameUnits::Groups => Err(GnitzSqlError::Rejected(
                 "window frames: ROWS / GROUPS … CURRENT ROW excludes the current row's peers, which \
                  needs a total row order; use RANGE (the default frame)"
                     .into(),
             )),
         },
-        _ => Err(GnitzSqlError::Unsupported(
+        _ => Err(GnitzSqlError::Rejected(
             "window frames: only RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW (the default) and \
              BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING are supported"
                 .into(),

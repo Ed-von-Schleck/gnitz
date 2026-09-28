@@ -3,7 +3,7 @@
 //! never who calls it, which rots the moment a caller moves.
 
 use crate::agg::AggFunc;
-use crate::error::{reject_if, GnitzSqlError};
+use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::ir::{BExpr, NumLit};
 use crate::validate::{first_duplicate, validate_user_name};
 use gnitz_core::ColumnDef;
@@ -36,7 +36,7 @@ fn object_name_parts<'a>(name: &'a sqlparser::ast::ObjectName, context: &str) ->
         .map(|i| i.value.as_str())
         .collect();
     if parts.is_empty() || parts.len() != name.0.len() {
-        return Err(GnitzSqlError::Plan(format!("empty name in {context}")));
+        return Err(GnitzSqlError::Rejected(format!("empty name in {context}")));
     }
     Ok(parts)
 }
@@ -57,14 +57,14 @@ pub(crate) fn extract_object_name(
         [n] => *n,
         [s, n] if s.eq_ignore_ascii_case(session_schema) => *n,
         [s, ..] => {
-            return Err(GnitzSqlError::Unsupported(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "{context}: cross-schema names are not supported \
              (qualifier '{s}' is not the session schema '{session_schema}')"
             )))
         }
         // `object_name_parts` rejects the empty name, so this is 3+ parts.
         _ => {
-            return Err(GnitzSqlError::Unsupported(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "{context}: '{name}' has too many name parts"
             )))
         }
@@ -82,7 +82,7 @@ pub(crate) fn extract_index_name(name: &sqlparser::ast::ObjectName, context: &st
             validate_user_name(n)?;
             Ok((*n).to_string())
         }
-        _ => Err(GnitzSqlError::Unsupported(format!(
+        _ => Err(GnitzSqlError::Rejected(format!(
             "{context}: an index name takes no qualifier (index names are global, not schema-scoped)"
         ))),
     }
@@ -93,7 +93,7 @@ pub(crate) fn extract_index_name(name: &sqlparser::ast::ObjectName, context: &st
 pub(crate) fn extract_ident_name(name: &sqlparser::ast::ObjectName, context: &str) -> Result<String, GnitzSqlError> {
     object_name_ident(name)
         .map(|i| i.value.clone())
-        .ok_or_else(|| GnitzSqlError::Plan(format!("empty name in {context}")))
+        .ok_or_else(|| GnitzSqlError::Rejected(format!("empty name in {context}")))
 }
 
 /// True when a SELECT carries a GROUP BY — either `GROUP BY ALL` or a non-empty
@@ -126,10 +126,10 @@ pub(crate) fn bind_literal<R>(v: &Value) -> Result<BExpr<R>, GnitzSqlError> {
             }
             n.parse::<f64>()
                 .map(|v| BExpr::LitFloat { v, dec: decimal_of_number_text(n) })
-                .map_err(|_| GnitzSqlError::Plan(format!("invalid number literal: {n}")))
+                .map_err(|_| GnitzSqlError::Rejected(format!("invalid number literal: {n}")))
         }
         Value::SingleQuotedString(s) => Ok(BExpr::LitStr(s.clone())),
-        _ => Err(GnitzSqlError::Unsupported(format!(
+        _ => Err(GnitzSqlError::Rejected(format!(
             "value type not supported in expressions: {v:?}"
         ))),
     }
@@ -138,11 +138,11 @@ pub(crate) fn bind_literal<R>(v: &Value) -> Result<BExpr<R>, GnitzSqlError> {
 /// Parse `e` as a non-negative integer literal, or error — silently degrading a
 /// LIMIT returns every row. `what` names the clause for the message.
 pub(crate) fn expr_usize_literal(e: &Expr, what: &str) -> Result<usize, GnitzSqlError> {
-    let not_a_literal = || GnitzSqlError::Unsupported(format!("{what} must be an integer literal, not an expression"));
+    let not_a_literal = || GnitzSqlError::Rejected(format!("{what} must be an integer literal, not an expression"));
     let c = crate::bind::structural::bind_constant(e).map_err(|_| not_a_literal())?;
     match c {
         BExpr::LitInt(n) if n >= 0 => Ok(n as usize),
-        BExpr::LitInt(_) | BExpr::LitFloat { .. } | BExpr::LitWide(_) => Err(GnitzSqlError::Unsupported(format!(
+        BExpr::LitInt(_) | BExpr::LitFloat { .. } | BExpr::LitWide(_) => Err(GnitzSqlError::Rejected(format!(
             "{what} must be a non-negative integer literal, got '{}'",
             c.literal_text()
         ))),
@@ -187,16 +187,6 @@ pub(crate) fn agg_func_name(f: AggFunc) -> &'static str {
         .expect("every AggFunc spelling is in AGG_NAMES")
 }
 
-/// The invariant the two non-window entry points below rest on: `bind_structural`
-/// routes a windowed call to the leaf, so only `classify_window_call` ever sees
-/// one and `over` needs no handling here.
-fn debug_assert_not_windowed(f: &sqlparser::ast::Function) {
-    debug_assert!(
-        f.over.is_none(),
-        "a windowed call is routed by bind_structural, not classified here"
-    );
-}
-
 /// An aggregate call's argument. `COUNT(*)` is the only argument-less shape and
 /// `COUNT(DISTINCT *)` is not a shape at all, so a `Distinct` always carries one.
 #[derive(Clone, Copy, PartialEq)]
@@ -219,7 +209,7 @@ impl<T> AggArg<T> {
     /// would otherwise compute the plain aggregate. `on` names that surface.
     pub(crate) fn reject_distinct(self, on: &str) -> Result<Option<T>, GnitzSqlError> {
         match self {
-            AggArg::Distinct(_) => Err(unsupported_on("DISTINCT", on)),
+            AggArg::Distinct(_) => Err(unsupported_clause(on, "DISTINCT")),
             other => Ok(other.ignoring_distinct()),
         }
     }
@@ -247,15 +237,14 @@ impl<T> AggArg<T> {
 pub(crate) fn classify_agg_call(
     f: &sqlparser::ast::Function,
 ) -> Result<(AggFunc, AggArg<&sqlparser::ast::Expr>), GnitzSqlError> {
-    debug_assert_not_windowed(f);
-    reject_fn_qualifiers(f, "aggregates", Distinct::Consumed)?;
-    let (func, arg) = classify_agg_shape(f)?;
-    let arg = match (is_distinct_call(f), arg) {
+    let call = PlainCall::check(f, CallSurface::Aggregate)?;
+    let (func, arg) = classify_agg_shape(call)?;
+    let arg = match (call.is_distinct(), arg) {
         (false, None) => AggArg::Star,
         (false, Some(e)) => AggArg::All(e),
         (true, Some(e)) => AggArg::Distinct(e),
         (true, None) => {
-            return Err(GnitzSqlError::Unsupported(
+            return Err(GnitzSqlError::Rejected(
                 "COUNT(DISTINCT *): DISTINCT needs a column argument".into(),
             ))
         }
@@ -263,125 +252,135 @@ pub(crate) fn classify_agg_call(
     Ok((func, arg))
 }
 
-/// The argument-shape half of [`classify_agg_call`], with the qualifiers
-/// already checked by the caller — a windowed aggregate (`SUM(x) OVER (…)`)
-/// consumes its `OVER` and classifies its name and argument through here.
+/// An aggregate call's function and its one argument (`None` for `COUNT(*)`).
 pub(crate) fn classify_agg_shape(
-    f: &sqlparser::ast::Function,
+    call: PlainCall<'_>,
 ) -> Result<(AggFunc, Option<&sqlparser::ast::Expr>), GnitzSqlError> {
     use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    let f = call.0;
     let base = single_fn_name(f)
         .and_then(agg_func_from_name)
         .ok_or_else(|| unknown_function(f))?;
-    let args: &[FunctionArg] = match &f.args {
-        FunctionArguments::List(list) => &list.args,
-        _ => &[],
-    };
-    match (base, args) {
-        (AggFunc::Count, [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]) => Ok((AggFunc::Count, None)),
-        (_, [FunctionArg::Unnamed(FunctionArgExpr::Expr(e))]) => Ok((base, Some(e))),
-        (AggFunc::Count, _) => Err(GnitzSqlError::Unsupported("COUNT: unsupported argument form".into())),
-        _ => Err(GnitzSqlError::Unsupported(format!(
-            "{}: requires exactly one column argument",
-            agg_func_name(base)
-        ))),
-    }
-}
-
-/// Who consumes the `f(DISTINCT x)` qualifier. Rejecting is the safe default: a
-/// binder that reads only the name and the argument list drops it silently.
-pub(crate) enum Distinct {
-    Rejected,
-    Consumed,
-}
-
-/// True for `f(DISTINCT x)`.
-fn is_distinct_call(func: &sqlparser::ast::Function) -> bool {
-    use sqlparser::ast::{DuplicateTreatment, FunctionArguments};
-    matches!(&func.args, FunctionArguments::List(l)
-        if matches!(l.duplicate_treatment, Some(DuplicateTreatment::Distinct)))
-}
-
-/// The rejection every unimplemented qualifier takes: `"{what}: not supported on
-/// {on}"` — `error::unsupported_clause`'s template inverted, for a qualifier on
-/// a call rather than a clause on a statement.
-pub(crate) fn unsupported_on(what: &str, on: &str) -> GnitzSqlError {
-    GnitzSqlError::Unsupported(format!("{what}: not supported on {on}"))
-}
-
-/// Reject any qualifier on a function call the binder does not implement — a
-/// binder reads the name and the argument list, so an unrejected qualifier is
-/// silently dropped and the plain call computed. `on` names the context.
-pub(crate) fn reject_fn_qualifiers(
-    func: &sqlparser::ast::Function,
-    on: &str,
-    distinct: Distinct,
-) -> Result<(), GnitzSqlError> {
-    use sqlparser::ast::FunctionArguments;
-    let sqlparser::ast::Function {
-        // Consumed: the name dispatches the call, the argument list is bound.
-        name: _,
-        args,
-        // Inert: ODBC's `{fn NAME(args)}` spells `NAME(args)`, round-trips
-        // through `Display`, and changes no result.
-        uses_odbc_syntax: _,
-        // Consumed elsewhere: `bind_structural` routes a windowed call to the
-        // leaf, and `classify_window_call` consumes the specification. Nothing
-        // reaches this table with an unconsumed `OVER`.
-        over: _,
-        // Rejected below.
-        parameters,
-        filter,
-        null_treatment,
-        within_group,
-    } = func;
-    let unsupported = |what: &str| Err(unsupported_on(what, on));
-    if matches!(distinct, Distinct::Rejected) && is_distinct_call(func) {
-        return unsupported("DISTINCT");
-    }
-    if filter.is_some() {
-        return unsupported("FILTER (WHERE …)");
-    }
-    if !within_group.is_empty() {
-        return unsupported("WITHIN GROUP (ORDER BY …)");
-    }
-    if null_treatment.is_some() {
-        return unsupported("IGNORE/RESPECT NULLS");
-    }
-    if !matches!(parameters, FunctionArguments::None) {
-        return unsupported("parametric (ClickHouse) calls");
-    }
-    if let FunctionArguments::List(list) = args {
-        if !list.clauses.is_empty() {
-            return unsupported("in-argument clauses (ORDER BY / LIMIT / SEPARATOR)");
+    if base == AggFunc::Count {
+        if let FunctionArguments::List(list) = &f.args {
+            if let [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] = &list.args[..] {
+                return Ok((AggFunc::Count, None));
+            }
         }
     }
-    Ok(())
+    Ok((base, Some(call.args(agg_func_name(base), (1, Some(1)))?[0])))
 }
 
-/// Plain positional argument exprs of a function call, or a clean `Unsupported`
-/// for `*`, named args, or any qualifier [`reject_fn_qualifiers`] refuses.
-pub(crate) fn function_positional_args<'f>(
-    f: &'f sqlparser::ast::Function,
-    name: &str,
-) -> Result<Vec<&'f sqlparser::ast::Expr>, GnitzSqlError> {
-    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
-    debug_assert_not_windowed(f);
-    reject_fn_qualifiers(f, name, Distinct::Rejected)?;
-    let FunctionArguments::List(list) = &f.args else {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "{name}: requires a parenthesized argument list"
-        )));
+/// The binder a function call reaches, which decides the qualifiers it consumes:
+/// an aggregate its `DISTINCT`, a window function its `OVER`.
+#[derive(Clone, Copy)]
+pub(crate) enum CallSurface<'a> {
+    /// A scalar function, by the name it was called with.
+    Scalar(&'a str),
+    Aggregate,
+    Window,
+}
+
+/// A function call with every qualifier its surface does not consume refused,
+/// leaving its name and argument list to read.
+#[derive(Clone, Copy)]
+pub(crate) struct PlainCall<'f>(&'f sqlparser::ast::Function);
+
+impl<'f> PlainCall<'f> {
+    pub(crate) fn check(func: &'f sqlparser::ast::Function, surface: CallSurface<'_>) -> Result<Self, GnitzSqlError> {
+        use sqlparser::ast::FunctionArguments;
+        let on = match surface {
+            CallSurface::Scalar(name) => name,
+            CallSurface::Aggregate => "aggregates",
+            CallSurface::Window => "window functions",
+        };
+        let sqlparser::ast::Function {
+            // Consumed: the name dispatches the call, the argument list is bound.
+            name: _,
+            args,
+            // Inert: ODBC's `{fn NAME(args)}` spells `NAME(args)`, round-trips
+            // through `Display`, and changes no result.
+            uses_odbc_syntax: _,
+            over,
+            parameters,
+            filter,
+            null_treatment,
+            within_group,
+        } = func;
+        if over.is_some() && !matches!(surface, CallSurface::Window) {
+            return Err(GnitzSqlError::Internal(format!(
+                "{on}: a windowed call reached a non-window binder"
+            )));
+        }
+        let call = PlainCall(func);
+        reject_if(
+            !matches!(surface, CallSurface::Aggregate) && call.is_distinct(),
+            on,
+            "DISTINCT",
+        )?;
+        reject_if(filter.is_some(), on, "FILTER (WHERE …)")?;
+        reject_if(!within_group.is_empty(), on, "WITHIN GROUP (ORDER BY …)")?;
+        reject_if(null_treatment.is_some(), on, "IGNORE/RESPECT NULLS")?;
+        reject_if(
+            !matches!(parameters, FunctionArguments::None),
+            on,
+            "parametric (ClickHouse) calls",
+        )?;
+        reject_if(
+            matches!(args, FunctionArguments::List(list) if !list.clauses.is_empty()),
+            on,
+            "in-argument clauses (ORDER BY / LIMIT / SEPARATOR)",
+        )?;
+        Ok(call)
+    }
+
+    /// True for `f(DISTINCT x)`.
+    pub(crate) fn is_distinct(self) -> bool {
+        use sqlparser::ast::{DuplicateTreatment, FunctionArguments};
+        matches!(&self.0.args, FunctionArguments::List(l)
+            if matches!(l.duplicate_treatment, Some(DuplicateTreatment::Distinct)))
+    }
+
+    /// The plain positional argument exprs, `min..=max` of them (`None`: unbounded).
+    pub(crate) fn args(
+        self,
+        name: &str,
+        (min, max): (usize, Option<usize>),
+    ) -> Result<Vec<&'f sqlparser::ast::Expr>, GnitzSqlError> {
+        use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+        let FunctionArguments::List(list) = &self.0.args else {
+            return Err(GnitzSqlError::Rejected(format!(
+                "{name}: requires a parenthesized argument list"
+            )));
+        };
+        let args = list
+            .args
+            .iter()
+            .map(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
+                _ => Err(GnitzSqlError::Rejected(format!(
+                    "{name}: expects plain positional arguments (no `*`, named args)"
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if args.len() < min || max.is_some_and(|max| args.len() > max) {
+            return Err(wrong_arity(name, min, max));
+        }
+        Ok(args)
+    }
+}
+
+fn wrong_arity(name: &str, min: usize, max: Option<usize>) -> GnitzSqlError {
+    const WORDS: [&str; 4] = ["zero", "one", "two", "three"];
+    let word = |n: usize| WORDS.get(n).map_or_else(|| n.to_string(), |w| (*w).to_string());
+    let plural = |n: usize| if n == 1 { "argument" } else { "arguments" };
+    let want = match max {
+        Some(0) if min == 0 => return GnitzSqlError::Rejected(format!("{name}: takes no arguments")),
+        Some(max) if max == min => format!("exactly {} {}", word(min), plural(min)),
+        Some(max) => format!("{} or {} arguments", word(min), word(max)),
+        None => format!("at least {} {}", word(min), plural(min)),
     };
-    list.args
-        .iter()
-        .map(|arg| match arg {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
-            _ => Err(GnitzSqlError::Unsupported(format!(
-                "{name}: expects plain positional arguments (no `*`, named args)"
-            ))),
-        })
-        .collect()
+    GnitzSqlError::Rejected(format!("{name}: requires {want}"))
 }
 
 /// True when a SELECT body is grouped — the one disjunction every "route this to
@@ -426,7 +425,7 @@ fn expr_has_aggregate(e: &sqlparser::ast::Expr) -> bool {
 /// The rejection for a call whose name is not one this crate implements. Shared
 /// so every binder that turns a function away spells it the same way.
 pub(crate) fn unknown_function(f: &sqlparser::ast::Function) -> GnitzSqlError {
-    GnitzSqlError::Unsupported(format!(
+    GnitzSqlError::Rejected(format!(
         "function '{}' not supported",
         f.name.to_string().to_ascii_lowercase()
     ))
@@ -499,7 +498,7 @@ pub(crate) fn for_each_agg_call<E>(
 pub(crate) fn group_by_exprs(select: &sqlparser::ast::Select) -> Result<&[sqlparser::ast::Expr], GnitzSqlError> {
     match &select.group_by {
         sqlparser::ast::GroupByExpr::Expressions(exprs, _) => Ok(exprs),
-        _ => Err(GnitzSqlError::Unsupported(
+        _ => Err(GnitzSqlError::Rejected(
             "GROUP BY: only expression list supported".to_string(),
         )),
     }
@@ -524,7 +523,7 @@ pub(crate) fn clause_position(e: &Expr, what: &str) -> Result<Option<usize>, Gni
 /// but out of range reads the same either way, so it is worded once.
 pub(crate) fn reject_position_out_of_range(pos: usize, len: usize, what: &str) -> Result<(), GnitzSqlError> {
     if pos == 0 || pos > len {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "{what} position {pos} is out of range (1..={len})"
         )));
     }
@@ -546,12 +545,12 @@ pub(crate) fn group_by_target<'a>(
     };
     reject_position_out_of_range(pos, select.projection.len(), "GROUP BY")?;
     let target = projection_item_expr(&select.projection[pos - 1]).ok_or_else(|| {
-        GnitzSqlError::Unsupported(format!(
+        GnitzSqlError::Rejected(format!(
             "GROUP BY position {pos} names a wildcard, which is not a group key"
         ))
     })?;
     if expr_has_aggregate(target) {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "GROUP BY position {pos} names an aggregate, which cannot be a group key"
         )));
     }
@@ -709,13 +708,13 @@ pub(crate) fn scalar_projection_item<'a>(
     match item {
         SelectItem::UnnamedExpr(expr) => Ok((expr, None)),
         SelectItem::ExprWithAlias { expr, alias } => Ok((expr, Some(alias.value.clone()))),
-        SelectItem::ExprWithAliases { .. } => Err(GnitzSqlError::Unsupported(format!(
+        SelectItem::ExprWithAliases { .. } => Err(GnitzSqlError::Rejected(format!(
             "{ctx}: a multi-alias (`AS (a, b)`) SELECT item is not a supported SELECT item"
         ))),
-        SelectItem::Wildcard(_) => Err(GnitzSqlError::Unsupported(format!(
+        SelectItem::Wildcard(_) => Err(GnitzSqlError::Rejected(format!(
             "{ctx}: SELECT * is not a supported SELECT item"
         ))),
-        SelectItem::QualifiedWildcard(..) => Err(GnitzSqlError::Unsupported(format!(
+        SelectItem::QualifiedWildcard(..) => Err(GnitzSqlError::Rejected(format!(
             "{ctx}: SELECT <table>.* is not a supported SELECT item"
         ))),
     }
@@ -822,7 +821,7 @@ pub(crate) fn extract_table_name_and_alias(
         sample,
     } = tf
     else {
-        return Err(GnitzSqlError::Unsupported(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "{context}: only simple table references supported"
         )));
     };
@@ -863,7 +862,7 @@ pub(crate) fn extract_table_name_and_alias(
 pub(crate) fn simple_ident_expr<'a>(e: &'a sqlparser::ast::Expr, context: &str) -> Result<&'a str, GnitzSqlError> {
     match e {
         sqlparser::ast::Expr::Identifier(id) => Ok(&id.value),
-        _ => Err(GnitzSqlError::Unsupported(format!(
+        _ => Err(GnitzSqlError::Rejected(format!(
             "{context}: column must be a simple identifier"
         ))),
     }
@@ -1003,18 +1002,18 @@ where
     // say nothing.
     for &n in drop.iter().chain(rename.iter().map(|(f, _)| f)) {
         if !has_visible_column(cols.clone(), n) {
-            return Err(GnitzSqlError::Bind(format!(
+            return Err(GnitzSqlError::Rejected(format!(
                 "{ctx}: SELECT * EXCEPT/EXCLUDE/RENAME names unknown column '{n}'"
             )));
         }
     }
     if let Some((f, _)) = rename.iter().find(|(f, _)| excludes(f)) {
-        return Err(GnitzSqlError::Plan(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "{ctx}: SELECT * RENAME names excluded column '{f}'"
         )));
     }
     if let Some(f) = first_duplicate(rename.iter().map(|&(f, _)| f)) {
-        return Err(GnitzSqlError::Plan(format!(
+        return Err(GnitzSqlError::Rejected(format!(
             "{ctx}: SELECT * RENAME names column '{f}' twice"
         )));
     }
