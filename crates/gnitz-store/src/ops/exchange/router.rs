@@ -7,7 +7,7 @@ use crate::schema::{worker_for_key, worker_for_pk_bytes, MAX_PK_BYTES};
 use crate::schema::{ColumnLocator, OpBuildErr, SchemaDescriptor};
 use crate::storage::{run_merge, Batch, MemBatch};
 
-use super::super::group_key::GroupKeyCols;
+use super::super::group_key::GroupKey;
 
 /// Keep only the rows `slot` owns: those whose PK `worker_for_pk_bytes` routes
 /// to it, the hash the equality scatter routes a join key by. A broadcast delta
@@ -67,21 +67,23 @@ pub(super) enum ScatterKey {
     Fold(FoldCols),
 }
 
+impl From<GroupKey> for ScatterKey {
+    fn from(key: GroupKey) -> Self {
+        match key {
+            GroupKey::PkPrefix(n) => ScatterKey::PkPrefix(n),
+            GroupKey::Image(loc) => ScatterKey::Image(loc),
+            GroupKey::Fold(fold) => ScatterKey::Fold(fold),
+        }
+    }
+}
+
 impl ScatterKey {
     /// Refused when `schema` cannot route by `spec`: a column it has not got, or
     /// one the group key or a reindex key refuses.
     pub(super) fn new(spec: ScatterSpec<'_>, schema: &SchemaDescriptor) -> Result<Self, OpBuildErr> {
         let pk = schema.pk_indices();
         Ok(match spec {
-            ScatterSpec::GroupKey(cols) if cols == pk => ScatterKey::PkPrefix(schema.pk_stride()),
-            ScatterSpec::GroupKey(cols) => match GroupKeyCols::new(schema, cols)? {
-                GroupKeyCols {
-                    canonical: Some(ColumnLocator::Pk { byte_off: 0, size, .. }),
-                    ..
-                } => ScatterKey::PkPrefix(size as usize),
-                GroupKeyCols { canonical: Some(loc), .. } => ScatterKey::Image(loc),
-                GroupKeyCols { cols: fold, .. } => ScatterKey::Fold(fold),
-            },
+            ScatterSpec::GroupKey(cols) => GroupKey::new(schema, cols)?.into(),
             // Slots pack in slot order, so only the PK's leading columns in PK
             // order, unpromoted, pack the PK's own bytes.
             ScatterSpec::JoinKey(slots)

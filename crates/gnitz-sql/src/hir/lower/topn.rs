@@ -25,7 +25,7 @@ pub(super) fn lower_topn(chain: &mut ViewChain, rel: &RelExpr) -> Result<EmitPie
     let written: Vec<u32> = slots_of(in_layout, partition)?.into_iter().map(|c| c as u32).collect();
     // The normalized group names the same set as the written partition, so every
     // derivation below reads this one list.
-    let (out_key, group) = in_schema.reduce_key(&written);
+    let group = in_schema.reduce_group(&written);
     reject_float_keys(group.iter().map(|&c| &in_schema.columns[c as usize]), "PARTITION BY")?;
     // The input's key breaks ties, as `ROW_NUMBER` numbers them, so which rows are
     // selected is a function of the data alone.
@@ -53,13 +53,7 @@ pub(super) fn lower_topn(chain: &mut ViewChain, rel: &RelExpr) -> Result<EmitPie
         })
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
 
-    let out = keyed_frame(
-        &frame,
-        out_key,
-        &group,
-        0..frame.schema.columns.len() as u32,
-        Vec::new(),
-    )?;
+    let out = keyed_frame(&frame, &group, 0..frame.schema.columns.len() as u32, Vec::new())?;
     let node = cb.top_n(node, &group, &keys, *limit, *offset);
     // Keyed by the partition, which holds `limit` slots.
     Ok(EmitPieces {

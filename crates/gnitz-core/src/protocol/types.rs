@@ -1,6 +1,6 @@
 use gnitz_expr::{ColumnTable, SchemaFacts};
 
-pub use gnitz_wire::{ColType, FixedInt, PkBuf, ReduceOutKey, ScalarKind, TypeCode};
+pub use gnitz_wire::{ColType, FixedInt, PkBuf, ScalarKind, TypeCode};
 pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS};
 
 /// The relation and column a FOREIGN KEY column references. `SelfTable` names the
@@ -148,13 +148,14 @@ impl Schema {
         self.columns[i].is_hidden && !self.is_pk_col(i)
     }
 
-    /// The output-key kind a reduce or top-N grouped by `group` gets (the engine
-    /// derives the same), and the group list to send it: SQL's GROUP BY is
-    /// unordered, so a permutation of the PK is sent as the PK list itself.
-    pub fn reduce_key(&self, group: &[u32]) -> (ReduceOutKey, Vec<u32>) {
+    /// The group list to send a reduce or top-N grouped by `group`: SQL's
+    /// GROUP BY is unordered, so a permutation of the PK is sent as the PK list.
+    pub fn reduce_group(&self, group: &[u32]) -> Vec<u32> {
         let is_pk = group.len() == self.pk_cols.len() && self.pk_cols.iter().all(|p| group.contains(p));
-        let group = if is_pk { &self.pk_cols[..] } else { group };
-        (self.reduce_out_key(group), group.to_vec())
+        match is_pk {
+            true => self.pk_cols.clone(),
+            false => group.to_vec(),
+        }
     }
 
     /// The single definition of "this is an admissible schema": the

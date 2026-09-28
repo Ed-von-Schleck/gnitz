@@ -642,11 +642,9 @@ fn a_fold_reply_schema_not_matching_its_partial_layout_is_rejected() {
             }),
         },
     };
+    // Grouped by the non-null I64 `val`: the natural key is `val` itself.
     let partial = |last: Option<TypeCode>| {
-        let mut cols = vec![
-            SchemaColumn::new(TypeCode::U128, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ];
+        let mut cols = vec![SchemaColumn::new(TypeCode::I64, false)];
         cols.extend(last.map(|tc| SchemaColumn::new(tc, false)));
         SchemaDescriptor::new(&cols, &[0])
     };

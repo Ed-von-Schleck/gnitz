@@ -28,7 +28,7 @@ use crate::codec::project_schema::{payload_map, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 pub(crate) use chain::{EmitPieces, ViewChain};
-use gnitz_core::{ColumnDef, ReduceOutKey, RelDescriptor, Schema, ViewBundle};
+use gnitz_core::{ColumnDef, RelDescriptor, Schema, ViewBundle};
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::{AggDescriptor, ReduceOutSlot};
 use spine::SourceOrigin;
@@ -74,17 +74,16 @@ pub(crate) fn resolve_reduce_specs(
     Ok(r)
 }
 
-/// A group-keyed operator's output frame over `input`: its `output_layout` slots,
-/// then `tail`.
+/// A group-keyed operator's output frame over `input`: the `output_layout` of
+/// the key a reduce grouped by `group` gets, then `tail`.
 pub(crate) fn keyed_frame(
     input: &Frame,
-    out_key: ReduceOutKey,
     group: &[u32],
     row: impl IntoIterator<Item = u32>,
     tail: Vec<HirCol>,
 ) -> Result<Frame, GnitzSqlError> {
     let (mut layout, mut cols, mut npk) = (Vec::new(), Vec::new(), 0usize);
-    for slot in out_key.output_layout(group, row) {
+    for slot in input.schema.reduce_out_key(group).output_layout(group, row) {
         let (id, def) = match slot {
             ReduceOutSlot::SyntheticKey => (ColId::NONE, group_pk_def()),
             ReduceOutSlot::Key(c) | ReduceOutSlot::Carried(c) => {

@@ -361,7 +361,7 @@ fn make_join_key_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u128)]) -> 
 }
 
 /// A compound join key routes by the packed OPK bytes the reindex Map writes as
-/// `_join_pk`, not by `GroupKeyCols::key_row` — signed-negative and >16-byte
+/// `_join_pk`, not by the group key — signed-negative and >16-byte
 /// composites, through both arms of the gate.
 #[test]
 fn compound_join_key_scatter_copartitions() {

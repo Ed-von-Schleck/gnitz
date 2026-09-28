@@ -41,23 +41,23 @@ fn agg(agg_op: AggFunc, col_idx: u32) -> AggDescriptor {
     AggDescriptor { agg_op, col_idx }
 }
 
-/// Collect the partial output by group value (grp is payload col 0), returning
-/// per group `(weight, [Option<i64> per agg col])`.
+/// Collect the partial output by group value (grp is the natural output PK),
+/// returning per group `(weight, [Option<i64> per agg col])`.
 #[allow(clippy::type_complexity)]
 fn by_group(out: &Batch, n_aggs: usize) -> std::collections::HashMap<i64, (i64, Vec<Option<i64>>)> {
     let mb = out.as_mem_batch();
     let mut map = std::collections::HashMap::new();
     for row in 0..out.count {
         // `read_i64_le` takes a byte offset; every column here is an 8-byte I64.
-        let grp = read_i64_le(out.col_data(0), row * 8);
+        let grp = crate::test_support::opk_pk_i64(mb.get_pk_bytes(row));
         let nw = mb.get_null_word(row);
         let vals: Vec<Option<i64>> = (0..n_aggs)
             .map(|k| {
-                // Agg col k is payload slot 1 + k (slot 0 is the group col).
-                if gnitz_wire::null_word_get(nw, 1 + k) {
+                // Agg col k is payload slot k: the key region spells the group col.
+                if gnitz_wire::null_word_get(nw, k) {
                     None
                 } else {
-                    Some(read_i64_le(out.col_data(1 + k), row * 8))
+                    Some(read_i64_le(out.col_data(k), row * 8))
                 }
             })
             .collect();
@@ -96,6 +96,79 @@ fn fold_grouped_multi_agg_with_nulls() {
     assert_eq!(g[&10], (1, vec![Some(3), Some(2), Some(300), Some(100), Some(200)]));
     assert_eq!(g[&20], (1, vec![Some(2), Some(2), Some(100), Some(50), Some(50)]));
     assert_eq!(g[&30], (1, vec![Some(1), Some(0), Some(0), None, None]));
+}
+
+/// The partial layout is a view's reduce output over the same group set: a
+/// single non-null column and the whole PK are the natural key, a nullable
+/// column folds into `_group_pk` and rides as payload.
+#[test]
+fn fold_partial_layout_is_the_views() {
+    let count = vec![agg(AggFunc::Count, 0)];
+    let layout = |group: Vec<u32>| {
+        let s = *AdhocFold::new(&src_schema(), &direct(group, count.clone()), 1000)
+            .unwrap()
+            .output_schema();
+        let cols: Vec<(TypeCode, bool)> = s.columns[..s.num_columns()]
+            .iter()
+            .map(|c| (c.type_code, c.nullable))
+            .collect();
+        (cols, s.pk_indices().to_vec())
+    };
+    let i64c = (TypeCode::I64, false);
+    assert_eq!(layout(vec![1]), (vec![i64c, i64c], vec![0]), "single non-null column");
+    assert_eq!(
+        layout(vec![0]),
+        (vec![(TypeCode::U64, false), i64c], vec![0]),
+        "the whole PK"
+    );
+    assert_eq!(
+        layout(vec![2]),
+        (vec![(TypeCode::U128, false), (TypeCode::I64, true), i64c], vec![0]),
+        "a nullable column folds"
+    );
+}
+
+/// A whole-PK fold over a compound PK stamps each group's own PK.
+#[test]
+fn fold_over_the_whole_compound_pk_keys_by_it() {
+    let src = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::I64, false),
+        ],
+        &[0, 1],
+    );
+    let spec = direct(vec![0, 1], vec![agg(AggFunc::Count, 0), agg(AggFunc::Sum, 2)]);
+    let mut fold = AdhocFold::new(&src, &spec, 1000).unwrap();
+    let pk = |a: u64, b: i32| {
+        let mut k = [0u8; 12];
+        gnitz_wire::encode_pk_column(&a.to_le_bytes(), TypeCode::U64, &mut k[..8]);
+        gnitz_wire::encode_pk_column(&b.to_le_bytes(), TypeCode::I32, &mut k[8..]);
+        k
+    };
+    let mut b = Batch::with_capacity(&src, 2);
+    for (k, v) in [(pk(1, -1), 10i64), (pk(1, 2), 20)] {
+        b.extend_pk_bytes(&k);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &v.to_le_bytes());
+        b.count += 1;
+    }
+    b.set_layout_unchecked(Layout::Consolidated);
+    fold.fold_ranges(&b, &[(0, b.count)]).unwrap();
+    let out = fold.finish();
+    assert_eq!(out.schema().pk_stride(), 12);
+    let got: Vec<(Vec<u8>, i64, i64)> = (0..out.count)
+        .map(|r| {
+            (
+                out.get_pk_bytes(r).to_vec(),
+                read_i64_le(out.col_data(0), r * 8),
+                read_i64_le(out.col_data(1), r * 8),
+            )
+        })
+        .collect();
+    assert_eq!(got, vec![(pk(1, -1).to_vec(), 1, 10), (pk(1, 2).to_vec(), 1, 20)]);
 }
 
 #[test]

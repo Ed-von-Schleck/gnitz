@@ -187,42 +187,32 @@ impl RangeRel {
 
 /// How a reduce keys its output. For a `Reduce` node it is derived, never
 /// transmitted: both sides call [`Self::for_group_cols`] over facts they already
-/// hold — the source PK column list and the GROUP BY column list. A fold sink's
-/// reply is always [`Self::SyntheticFold`], whose 16-byte key the client combine
-/// hashes.
+/// hold — the source PK column list and the GROUP BY column list. The fold sink's
+/// reply is keyed the same way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReduceOutKey {
-    /// Leading synthetic `_group_pk` U128 = null-distinct group fold; the
-    /// group columns ride as payload. What every group set that is neither
-    /// natural kind gets, including the empty (global) group set.
+    /// The group columns are the output PK: the source's whole PK list, or one
+    /// non-nullable PK-eligible column.
+    Natural,
+    /// A leading hidden `_group_pk` U128, the NULL-distinct XXH3 fold of the
+    /// group columns, which ride as payload. Every other group set, the empty
+    /// (global) one included.
     SyntheticFold,
-    /// The group set is the source PK list; the output PK is the source PK
-    /// region verbatim.
-    SourcePk,
-    /// A single non-nullable U64/U128/UUID group column is the output PK
-    /// directly.
-    SingleNaturalCol,
 }
 
 impl ReduceOutKey {
-    /// The one precedence chain (eq-PK ▷ single-natural ▷ synthetic), from the
-    /// facts both sides already hold: the source's PK column list, the GROUP BY
-    /// column list, and a `(type_code, nullable)` reader for a group column.
+    /// The output key a reduce grouped by `group_cols` warrants, from the facts
+    /// both sides already hold: the source's PK column list, the GROUP BY column
+    /// list, and a `(type_code, nullable)` reader for a group column.
     pub fn for_group_cols(pk_cols: &[u32], group_cols: &[u32], col: impl Fn(u32) -> (TypeCode, bool)) -> Self {
-        let eq_pk = group_cols == pk_cols;
-        let single_natural = match *group_cols {
-            [c] => {
+        let natural = group_cols == pk_cols
+            || matches!(*group_cols, [c] if {
                 let (type_code, nullable) = col(c);
-                // A nullable column can never key the output: the PK region
-                // carries no null bitmap.
-                !nullable && type_code.is_natural_reduce_key()
-            }
-            _ => false,
-        };
-        if eq_pk {
-            ReduceOutKey::SourcePk
-        } else if single_natural {
-            ReduceOutKey::SingleNaturalCol
+                // The PK region carries no null bitmap.
+                !nullable && type_code.is_pk_eligible()
+            });
+        if natural {
+            ReduceOutKey::Natural
         } else {
             ReduceOutKey::SyntheticFold
         }
@@ -233,7 +223,7 @@ impl ReduceOutKey {
     pub fn output_layout(self, group_cols: &[u32], row: impl IntoIterator<Item = u32>) -> Vec<ReduceOutSlot> {
         let (lead, spelled): (Vec<ReduceOutSlot>, &[u32]) = match self {
             ReduceOutKey::SyntheticFold => (vec![ReduceOutSlot::SyntheticKey], &[]),
-            _ => (group_cols.iter().map(|&c| ReduceOutSlot::Key(c)).collect(), group_cols),
+            ReduceOutKey::Natural => (group_cols.iter().map(|&c| ReduceOutSlot::Key(c)).collect(), group_cols),
         };
         lead.into_iter()
             .chain(

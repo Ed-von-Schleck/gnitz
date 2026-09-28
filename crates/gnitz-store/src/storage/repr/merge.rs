@@ -377,6 +377,13 @@ impl<'a> MemBatch<'a> {
         let off = self.offsets[super::batch::REG_PK] + row * stride;
         &self.data[off..off + stride]
     }
+    /// The leading `n` bytes of row `row`'s PK.
+    #[inline(always)]
+    pub(crate) fn get_pk_prefix(&self, row: usize, n: usize) -> &'a [u8] {
+        debug_assert!(n <= self.pk_stride as usize);
+        let off = self.offsets[super::batch::REG_PK] + row * self.pk_stride as usize;
+        &self.data[off..off + n]
+    }
     #[inline(always)]
     pub fn get_weight(&self, row: usize) -> i64 {
         gnitz_wire::read_i64_le(self.data, self.offsets[super::batch::REG_WEIGHT] + row * 8)

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, BatchBuilder, Table};
-use crate::test_support::scratch_table;
+use crate::test_support::{opk_pk_i64, scratch_table};
 use gnitz_expr::{payload_is_null, payload_string};
 use gnitz_wire::{read_i64_le, OrderKey};
 
@@ -78,25 +78,41 @@ impl Harness {
         out
     }
 
-    /// The maintained output as `(grp, id) → (weight, val, s)`; the group is read
-    /// off the carried columns so every key kind reads the same way.
+    /// The input column the output is keyed by.
+    fn key(&self) -> Key {
+        match self.plan.output_schema.columns[0].type_code {
+            TypeCode::U128 => Key::Synthetic,
+            TypeCode::U64 => Key::Id,
+            TypeCode::I64 => Key::Grp,
+            t => panic!("unexpected key type {t}"),
+        }
+    }
+
+    /// Row `r`'s id: the output PK, or a carried column ahead of the rest.
+    fn id(&self, b: &Batch, r: usize) -> u64 {
+        match self.key() {
+            Key::Id => b.get_pk(r) as u64,
+            Key::Synthetic | Key::Grp => read_i64_le(b.col_data(0), r * 8) as u64,
+        }
+    }
+
+    /// The maintained output as `(grp, id) → (weight, val, s)`.
     fn state(&self) -> BTreeMap<(i64, u64), (i64, Option<i64>, String)> {
         let b = self.trace_out.open_cursor().materialize();
-        let carried = &self.plan.output_schema;
         // Carried payload order is input schema order minus the key region.
-        let (id_pi, grp_pi, val_pi, s_pi) = match carried.num_payload_cols() {
-            4 => (Some(0), 1, 2, 3),
-            3 => (None, 0, 1, 2),
-            n => panic!("unexpected payload width {n}"),
+        let (grp_pi, val_pi, s_pi) = match self.key() {
+            Key::Synthetic => (Some(1), 2, 3),
+            Key::Id => (Some(0), 1, 2),
+            Key::Grp => (None, 1, 2),
         };
         let mb = b.as_mem_batch();
         (0..b.count)
             .map(|r| {
-                let id = match id_pi {
-                    Some(pi) => read_i64_le(b.col_data(pi), r * 8) as u64,
-                    None => b.get_pk(r) as u64,
+                let id = self.id(&b, r);
+                let grp = match grp_pi {
+                    Some(pi) => read_i64_le(b.col_data(pi), r * 8),
+                    None => opk_pk_i64(b.get_pk_bytes(r)),
                 };
-                let grp = read_i64_le(b.col_data(grp_pi), r * 8);
                 let val = (!payload_is_null(&mb, r, val_pi)).then(|| read_i64_le(b.col_data(val_pi), r * 8));
                 ((grp, id), (b.get_weight(r), val, payload_string(&mb, r, s_pi)))
             })
@@ -113,15 +129,18 @@ impl Harness {
     /// An epoch's emitted delta as `(id, weight)`, which must be folded.
     fn net(&self, b: Batch) -> Vec<(u64, i64)> {
         assert!(b.is_consolidated(), "op_topn certifies its output folded");
-        (0..b.count)
-            .map(|r| match self.plan.output_schema.num_payload_cols() {
-                // The id is a carried payload column under a synthetic key, and
-                // the output PK itself when the group set is the input's key.
-                4 => (read_i64_le(b.col_data(0), r * 8) as u64, b.get_weight(r)),
-                _ => (b.get_pk(r) as u64, b.get_weight(r)),
-            })
-            .collect()
+        (0..b.count).map(|r| (self.id(&b, r), b.get_weight(r))).collect()
     }
+}
+
+/// The input column a top-N output is keyed by.
+enum Key {
+    /// The synthetic `_group_pk`; every input column is carried.
+    Synthetic,
+    /// The id, the input's own PK.
+    Id,
+    /// The group column.
+    Grp,
 }
 
 #[test]

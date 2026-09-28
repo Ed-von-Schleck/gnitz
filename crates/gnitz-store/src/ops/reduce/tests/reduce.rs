@@ -6,12 +6,12 @@ use crate::ops::op_negate;
 use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
 use crate::storage::{Batch, BatchBuilder, Layout, ReadCursor};
 use crate::test_support::{
-    make_batch_raw, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk_i64, payload0_i64, pk_payload_schema,
+    make_batch_raw, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk, opk_pk_i64, payload0_i64, pk_payload_schema,
     scratch_table, trace_cursor, u64_pk_schema,
 };
 use gnitz_wire::{read_i64_le, read_u64_le};
 
-use super::super::group_key::{GroupKeyCols, GroupOutKey};
+use super::super::group_key::GroupOutKey;
 use super::agg::Accumulator;
 use super::avi::AviBake;
 use super::emit::emit_reduce_row;
@@ -138,8 +138,13 @@ fn i64_av(v: i64) -> u64 {
 
 /// The output schema the plan derives for `(schema, group cols, aggs)`.
 fn out_schema_for(schema: &SchemaDescriptor, group_cols: &[u32], aggs: &[AggDescriptor]) -> SchemaDescriptor {
-    let (key, prefix) = GroupOutKey::for_group_cols(schema, group_cols, group_cols.iter().copied()).unwrap();
+    let (key, prefix) = GroupOutKey::new(schema, group_cols, group_cols.iter().copied()).unwrap();
     ReduceShape::new(schema, key, prefix, aggs).unwrap().output_schema
+}
+
+/// The group key `identity` of `row` under `cols`.
+fn group_identity(schema: &SchemaDescriptor, cols: &[u32], mb: &crate::storage::MemBatch, row: usize) -> u128 {
+    GroupOutKey::new(schema, cols, []).unwrap().0.identity(mb, row)
 }
 
 /// Asserts that each run under a keyed out-key is exactly one `group_of` group,
@@ -150,7 +155,7 @@ fn assert_runs_are_groups(
     batch: &Batch,
     group_of: impl Fn(usize) -> u128,
 ) -> Vec<usize> {
-    let key = GroupOutKey::synthetic(schema, cols, []).unwrap().0;
+    let key = GroupOutKey::new(schema, cols, []).unwrap().0;
     let runs = key.runs(batch);
     let mut seen: Vec<u128> = Vec::new();
     for run in runs.iter() {
@@ -169,8 +174,8 @@ fn assert_runs_are_groups(
 /// group columns'.
 #[test]
 fn grouped_reduce_narrow_signed_route_key() {
-    // Single non-nullable I64 group column: canonical, ≤8 bytes ⇒ the `u64` arm,
-    // whose route key sign-flips so −1 sorts below 0.
+    // A non-nullable I64 group column keys by its sign-flipped image, so −1
+    // sorts below 0.
     let in_schema = u64pk_i64grp_i64val(false);
     let aggs = sum_count_aggs(2);
     let out_schema = out_schema_for(&in_schema, &[1u32], &aggs);
@@ -193,8 +198,8 @@ fn grouped_reduce_narrow_signed_route_key() {
     let by_grp: std::collections::HashMap<i64, (i64, i64)> = (0..out.count)
         .map(|r| {
             (
-                read_i64_le(out.col_data(0), r * 8),
-                (read_i64_le(out.col_data(1), r * 8), read_i64_le(out.col_data(2), r * 8)),
+                opk_pk_i64(out.get_pk_bytes(r)),
+                (read_i64_le(out.col_data(0), r * 8), read_i64_le(out.col_data(1), r * 8)),
             )
         })
         .collect();
@@ -206,7 +211,7 @@ fn grouped_reduce_narrow_signed_route_key() {
 
 #[test]
 fn grouped_reduce_uuid_route_key() {
-    // Single non-nullable UUID group column: canonical, 16 bytes ⇒ the `u128` arm.
+    // A non-nullable UUID group column keys by its 16-byte image.
     let in_schema = make_schema_u64_uuid_i64();
     let aggs = sum_count_aggs(2);
     let out_schema = out_schema_for(&in_schema, &[1u32], &aggs);
@@ -236,7 +241,7 @@ fn grouped_reduce_uuid_route_key() {
 
 #[test]
 fn grouped_reduce_two_column_digest_key() {
-    // A two-column group set is not canonical ⇒ the XXH3 digest arm. Group
+    // A two-column group set keys by the XXH3 fold. Group
     // *order* is the digest's, so the assertion is per group, never positional.
     let in_schema = make_schema_u64_uuid_i64();
     let aggs = [AggDescriptor::COUNT_STAR];
@@ -303,12 +308,11 @@ fn test_reduce_sum_retraction() {
         &[0],
     );
 
-    // Output: pk(U128), grp(I64), sum(I64), count(I64). The trailing count is the
+    // Output: grp(I64), sum(I64), count(I64). The trailing count is the
     // cardinality companion every circuit reduce carries; op_reduce gates
     // emission on it.
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(TypeCode::U128, false),
             SchemaColumn::new(TypeCode::I64, false),
             SchemaColumn::new(TypeCode::I64, true),
             SchemaColumn::new(TypeCode::I64, false),
@@ -339,7 +343,7 @@ fn test_reduce_sum_retraction() {
     let out1 = op_reduce(&delta1, &mut to_ch, &in_schema, &[1u32], &aggs, None, false);
     // SUM of (100+200+300) = 600
     assert_eq!(out1.count, 1);
-    let sum1 = read_i64_le(out1.col_data(1), 0);
+    let sum1 = read_i64_le(out1.col_data(0), 0);
     assert_eq!(sum1, 600);
 
     // Tick 2: retract pk=2 (val=200) → SUM should go from 600 to 400
@@ -373,8 +377,8 @@ fn test_reduce_sum_retraction() {
 fn linear_sum_only_emptied_group_eliminated() {
     use crate::schema::{SchemaColumn, TypeCode};
 
-    // Input: pk(U64), grp(I64), val(I64). Output (synthetic GROUP BY grp):
-    // _group_pk(U128), grp(I64), sum(I64 nullable), count(I64 companion).
+    // Input: pk(U64), grp(I64), val(I64). Output (natural GROUP BY grp):
+    // grp(I64), sum(I64 nullable), count(I64 companion).
     let in_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
@@ -385,7 +389,6 @@ fn linear_sum_only_emptied_group_eliminated() {
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(TypeCode::U128, false),
             SchemaColumn::new(TypeCode::I64, false),
             SchemaColumn::new(TypeCode::I64, true),
             SchemaColumn::new(TypeCode::I64, false),
@@ -421,7 +424,7 @@ fn linear_sum_only_emptied_group_eliminated() {
     assert_eq!(out2.count, 1, "emptied group emits only the retraction, no +1 zombie");
     assert_eq!(out2.get_weight(0), -1, "the sole output row is the −1 retraction");
     assert_eq!(
-        read_i64_le(out2.col_data(1), 0),
+        read_i64_le(out2.col_data(0), 0),
         5,
         "retraction re-emits the stored SUM=5"
     );
@@ -446,40 +449,38 @@ fn linear_sum_only_new_all_null_group_present() {
         ],
         &[0],
     );
-    // Raw reduce output: _group_pk | grp | sum | cnn | count.
+    // Raw reduce output: grp | sum | cnn | count.
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(TypeCode::U128, false), // _group_pk
-            SchemaColumn::new(TypeCode::I64, false),  // grp
-            SchemaColumn::new(TypeCode::I64, false),  // sum
-            SchemaColumn::new(TypeCode::I64, false),  // cnn
-            SchemaColumn::new(TypeCode::I64, false),  // count (companion)
+            SchemaColumn::new(TypeCode::I64, false), // grp
+            SchemaColumn::new(TypeCode::I64, false), // sum
+            SchemaColumn::new(TypeCode::I64, false), // cnn
+            SchemaColumn::new(TypeCode::I64, false), // count (companion)
         ],
         &[0],
     );
-    // Finalize projects [pk, grp, sum]; cnn and the count companion are stripped.
+    // Finalize projects [grp, sum]; cnn and the count companion are stripped.
     let fin_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(TypeCode::U128, false),
             SchemaColumn::new(TypeCode::I64, false),
             SchemaColumn::new(TypeCode::I64, true), // sum (nullable)
         ],
         &[0],
     );
-    // grp → fin payload 0; sum / (cnn != 0) → fin payload 1, NULL when cnn is 0.
+    // sum / (cnn != 0) → fin payload 0, NULL when cnn is 0.
     let instrs = vec![
-        LogicalInstr::LoadColInt { col: 3 }, // r0 = cnn
+        LogicalInstr::LoadColInt { col: 2 }, // r0 = cnn
         LogicalInstr::LoadConst { val: 0, unsigned: false },
         LogicalInstr::Cmp { op: CmpOp::Ne, a: Reg(0), b: Reg(1) }, // r2 = (cnn != 0)
-        LogicalInstr::LoadColInt { col: 2 },                       // r3 = sum
+        LogicalInstr::LoadColInt { col: 1 },                       // r3 = sum
         LogicalInstr::IntArith {
             op: IntArithOp::Div,
             a: Reg(3),
             b: Reg(2),
         }, // r4 = sum / gate
     ];
-    // fin payload 0 = grp; fin payload 1 = the gated sum.
-    let sinks = vec![Sink::Col(1), Sink::Reg(Reg(4))];
+    // fin payload 0 = the gated sum.
+    let sinks = vec![Sink::Reg(Reg(4))];
     let mut fin_func = crate::expr::MapPlan::from_map(
         LogicalProgram::new(instrs, Output::Slots(sinks), vec![]),
         &out_schema,
@@ -517,23 +518,19 @@ fn linear_sum_only_new_all_null_group_present() {
         "new all-NULL group is present (cardinality 1), not dropped"
     );
     assert_eq!(
-        (raw.get_null_word(0) >> 1) & 1,
+        raw.get_null_word(0) & 1,
         0,
         "the raw SUM of an all-NULL group is present"
     );
     assert_eq!(
-        read_i64_le(raw.col_data(1), 0),
+        read_i64_le(raw.col_data(0), 0),
         0,
         "the raw SUM of an all-NULL group is 0"
     );
     assert_eq!(fin.count, 1);
     assert_eq!(fin.get_weight(0), 1, "one +1 row");
-    assert_eq!(read_i64_le(fin.col_data(0), 0), 7, "grp=7");
-    assert_eq!(
-        (fin.get_null_word(0) >> 1) & 1,
-        1,
-        "SUM of an all-NULL group renders as NULL",
-    );
+    assert_eq!(opk_pk_i64(fin.get_pk_bytes(0)), 7, "grp=7");
+    assert_eq!(fin.get_null_word(0) & 1, 1, "SUM of an all-NULL group renders as NULL",);
 }
 
 /// All-linear gate, reuse path: a COUNT(*)-only group driven to empty is
@@ -543,8 +540,7 @@ fn linear_sum_only_new_all_null_group_present() {
 fn count_star_only_emptied_group_eliminated() {
     use crate::schema::{SchemaColumn, TypeCode};
 
-    // Input: pk(U64), grp(I64). Output (synthetic GROUP BY grp):
-    // _group_pk(U128), grp(I64), count(I64).
+    // Input: pk(U64), grp(I64). Output (natural GROUP BY grp): grp(I64), count(I64).
     let in_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
@@ -554,7 +550,6 @@ fn count_star_only_emptied_group_eliminated() {
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(TypeCode::U128, false),
             SchemaColumn::new(TypeCode::I64, false),
             SchemaColumn::new(TypeCode::I64, false),
         ],
@@ -581,7 +576,7 @@ fn count_star_only_emptied_group_eliminated() {
     let mut to_ch = empty_trace(out_schema);
     let out1 = reduce(&row(1, 1), &mut to_ch);
     assert_eq!(out1.count, 1);
-    assert_eq!(read_i64_le(out1.col_data(1), 0), 1, "count=1");
+    assert_eq!(read_i64_le(out1.col_data(0), 0), 1, "count=1");
 
     // Tick 2: retract it → count 1 → 0 → group eliminated (only the −1 retraction).
     let mut to_ch2 = trace_cursor(out1, out_schema);
@@ -613,47 +608,45 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         &[0],
     );
 
-    // Raw reduce output: synthetic U128 _group_pk | grp | count | sum | cnn.
+    // Raw reduce output: natural grp | count | sum | cnn.
     // The aggregate column order mirrors agg_descs = [Count, Sum, CountNonNull].
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(TypeCode::U128, false), // _group_pk
-            SchemaColumn::new(TypeCode::I64, false),  // grp
-            SchemaColumn::new(TypeCode::I64, false),  // count
-            SchemaColumn::new(TypeCode::I64, false),  // sum
-            SchemaColumn::new(TypeCode::I64, false),  // cnn (companion)
+            SchemaColumn::new(TypeCode::I64, false), // grp
+            SchemaColumn::new(TypeCode::I64, false), // count
+            SchemaColumn::new(TypeCode::I64, false), // sum
+            SchemaColumn::new(TypeCode::I64, false), // cnn (companion)
         ],
         &[0],
     );
 
-    // Finalized output projects [pk, grp, count, sum] — companion stripped.
+    // Finalized output projects [grp, count, sum] — companion stripped.
     let fin_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(TypeCode::U128, false), // _group_pk
-            SchemaColumn::new(TypeCode::I64, false),  // grp
-            SchemaColumn::new(TypeCode::I64, false),  // count
-            SchemaColumn::new(TypeCode::I64, true),   // sum (nullable)
+            SchemaColumn::new(TypeCode::I64, false), // grp
+            SchemaColumn::new(TypeCode::I64, false), // count
+            SchemaColumn::new(TypeCode::I64, true),  // sum (nullable)
         ],
         &[0],
     );
 
     // Finalize program (full reduce-output column indices; resolved below):
-    //   copy grp(col 1) → fin payload 0, count(col 2) → fin payload 1,
-    //   emit sum-gate = sum(col 3) / (cnn(col 4) != 0) → fin payload 2.
+    //   copy count(col 1) → fin payload 0,
+    //   emit sum-gate = sum(col 2) / (cnn(col 3) != 0) → fin payload 1.
     // div-by-zero (cnn == 0) marks the SUM NULL; div-by-1 (cnn > 0) is exact.
     let instrs = vec![
-        LogicalInstr::LoadColInt { col: 4 },                       // r0 = cnn (col 4)
+        LogicalInstr::LoadColInt { col: 3 },                       // r0 = cnn (col 3)
         LogicalInstr::LoadConst { val: 0, unsigned: false },       // r1 = 0
         LogicalInstr::Cmp { op: CmpOp::Ne, a: Reg(0), b: Reg(1) }, // r2 = (cnn != 0) → 1/0
-        LogicalInstr::LoadColInt { col: 3 },                       // r3 = sum (col 3)
+        LogicalInstr::LoadColInt { col: 2 },                       // r3 = sum (col 2)
         LogicalInstr::IntArith {
             op: IntArithOp::Div,
             a: Reg(3),
             b: Reg(2),
         }, // r4 = sum / gate (NULL when gate == 0)
     ];
-    // fin payload 0 = grp, 1 = count, 2 = the gated sum.
-    let sinks = vec![Sink::Col(1), Sink::Col(2), Sink::Reg(Reg(4))];
+    // fin payload 0 = count, 1 = the gated sum.
+    let sinks = vec![Sink::Col(1), Sink::Reg(Reg(4))];
     let mut fin_func = crate::expr::MapPlan::from_map(
         LogicalProgram::new(instrs, Output::Slots(sinks), vec![]),
         &out_schema,
@@ -698,10 +691,10 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     assert_eq!(raw1.count, 1);
     assert_eq!(fin1.count, 1);
     assert_eq!(fin1.get_weight(0), 1);
-    assert_eq!(read_i64_le(fin1.col_data(1), 0), 2, "count=2");
-    assert_eq!(read_i64_le(fin1.col_data(2), 0), 5, "sum=5");
+    assert_eq!(read_i64_le(fin1.col_data(0), 0), 2, "count=2");
+    assert_eq!(read_i64_le(fin1.col_data(1), 0), 5, "sum=5");
     assert_eq!(
-        (fin1.get_null_word(0) >> 2) & 1,
+        (fin1.get_null_word(0) >> 1) & 1,
         0,
         "sum non-null while a contributor remains"
     );
@@ -731,12 +724,12 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         .find(|&r| fin2.get_weight(r) == 1)
         .expect("an insert row");
     assert_eq!(
-        read_i64_le(fin2.col_data(1), insert_row * 8),
+        read_i64_le(fin2.col_data(0), insert_row * 8),
         1,
         "COUNT(*) survives at 1",
     );
     assert_eq!(
-        (fin2.get_null_word(insert_row) >> 2) & 1,
+        (fin2.get_null_word(insert_row) >> 1) & 1,
         1,
         "SUM becomes NULL once its last non-null contributor is retracted",
     );
@@ -747,11 +740,11 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         .find(|&r| fin2.get_weight(r) == -1)
         .expect("a retract row");
     assert_eq!(
-        (fin2.get_null_word(retract_row) >> 2) & 1,
+        (fin2.get_null_word(retract_row) >> 1) & 1,
         0,
         "retracted SUM was non-null"
     );
-    assert_eq!(read_i64_le(fin2.col_data(2), retract_row * 8), 5, "retracted SUM = 5",);
+    assert_eq!(read_i64_le(fin2.col_data(1), retract_row * 8), 5, "retracted SUM = 5",);
 }
 
 /// A group whose MIN is NULL (all contributors NULL) is kept alive by COUNT(*).
@@ -760,8 +753,8 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
 /// passthrough, so the raw null bit is user-visible — the primary user-facing bug.
 #[test]
 fn null_min_retraction_re_emits_null() {
-    // in: pk(U64), grp(I64), val(I64 nullable); out (payload GROUP BY grp):
-    // pk(U128), grp(I64), count(I64), min(I64 nullable). min is payload index 2.
+    // in: pk(U64), grp(I64), val(I64 nullable); out (natural GROUP BY grp):
+    // grp(I64), count(I64), min(I64 nullable). min is payload index 1.
     let in_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
@@ -772,7 +765,6 @@ fn null_min_retraction_re_emits_null() {
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(TypeCode::U128, false),
             SchemaColumn::new(TypeCode::I64, false),
             SchemaColumn::new(TypeCode::I64, true),
             SchemaColumn::new(TypeCode::I64, true),
@@ -783,7 +775,7 @@ fn null_min_retraction_re_emits_null() {
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Count },
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Min },
     ];
-    let min_null_bit = 1u64 << 2;
+    let min_null_bit = 1u64 << 1;
 
     // Tick 1: (pk=1, grp=10, val=NULL) → COUNT keeps the group alive, MIN=NULL.
     let mut to_ch = empty_trace(out_schema);
@@ -846,7 +838,7 @@ fn all_null_sum_is_zero_whatever_the_history() {
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Sum },
     ];
     let out_schema = out_schema_for(&in_schema, &[1], &aggs);
-    assert!(!out_schema.columns[3].nullable, "a raw SUM is NOT NULL");
+    assert!(!out_schema.columns[2].nullable, "a raw SUM is NOT NULL");
     // `(pk, val, weight)` rows of group 10.
     let delta = |rows: &[(u128, Option<i64>, i64)]| {
         let mut b = Batch::with_capacity(&in_schema, rows.len());
@@ -868,7 +860,7 @@ fn all_null_sum_is_zero_whatever_the_history() {
     // The inserted row's `(null word, SUM)`.
     let new_sum = |out: &Batch| {
         let row = (0..out.count).find(|&i| out.get_weight(i) > 0).expect("an insert row");
-        (out.get_null_word(row), read_i64_le(out.col_data(2), row * 8))
+        (out.get_null_word(row), read_i64_le(out.col_data(1), row * 8))
     };
     let empty = Batch::empty_with_schema(&out_schema);
 
@@ -894,7 +886,7 @@ fn all_null_sum_is_zero_whatever_the_history() {
 #[test]
 fn reduce_trace_seek_wide_pk() {
     use crate::schema::{SchemaColumn, TypeCode};
-    use crate::test_support::{opk_pk, wide_pk_3xu64_schema};
+    use crate::test_support::wide_pk_3xu64_schema;
 
     // Wide PK: 3×U64 (stride 24) + I64 val. GROUP BY the full PK.
     let in_schema = wide_pk_3xu64_schema();
@@ -969,7 +961,6 @@ fn reduce_trace_seek_wide_pk() {
 #[test]
 fn reduce_trace_seek_compound_pk() {
     use crate::schema::{SchemaColumn, TypeCode};
-    use crate::test_support::opk_pk;
 
     let in_schema = SchemaDescriptor::new(
         &[
@@ -1314,7 +1305,7 @@ fn uuid_min_max_recede_through_the_value_index() {
     let mut trace = empty_trace(out_schema);
     let out1 = op_reduce(&t1, &mut trace, &in_schema, &[2u32], &aggs, None, false);
     assert_eq!(out1.count, 1);
-    assert_eq!((uuid_at(&out1, 0, 2), uuid_at(&out1, 0, 3)), (lo, hi));
+    assert_eq!((uuid_at(&out1, 0, 1), uuid_at(&out1, 0, 2)), (lo, hi));
 
     let t2 = op_negate(build_batch_u64_uuid_i64(&in_schema, &[(2, hi, 7), (3, lo, 7)]));
     let mut avi = Avi::new(&in_schema, &[2u32], &aggs, &[&t1, &t2]);
@@ -1329,13 +1320,12 @@ fn uuid_min_max_recede_through_the_value_index() {
         false,
     );
     let new_row = (0..out2.count).find(|&i| out2.get_weight(i) > 0).expect("new row");
-    assert_eq!((uuid_at(&out2, new_row, 2), uuid_at(&out2, new_row, 3)), (mid, mid));
+    assert_eq!((uuid_at(&out2, new_row, 1), uuid_at(&out2, new_row, 2)), (mid, mid));
 }
 
 #[test]
 fn test_group_runs_uuid_group() {
-    // A non-nullable UUID group column is a canonical key, so it takes the
-    // `u128` route-key arm — order-preserving, so the sort is by UUID value.
+    // A non-nullable UUID group column keys by its image: the sort is by UUID value.
     let schema = u64_pk_schema(SchemaColumn::new(TypeCode::UUID, false));
     let uuid_a: u128 = 0x1000_0000_0000_0000_0000_0000_0000_0001u128;
     let uuid_b: u128 = 0x0000_0000_0000_0000_0000_0000_0000_0002u128;
@@ -1363,10 +1353,10 @@ fn test_group_key_uuid_multi_col() {
     let mb = batch.as_mem_batch();
 
     // GROUP BY (uuid_col=1, i64_col=2)
-    let key0 = GroupKeyCols::new(&schema, &[1, 2]).unwrap().key_row(&mb, 0); // uuid_a, 42
-    let key1 = GroupKeyCols::new(&schema, &[1, 2]).unwrap().key_row(&mb, 1); // uuid_b, 42
-    let key2 = GroupKeyCols::new(&schema, &[1, 2]).unwrap().key_row(&mb, 2); // uuid_a, 43
-    let key0b = GroupKeyCols::new(&schema, &[1, 2]).unwrap().key_row(&mb, 0); // same as key0
+    let key0 = group_identity(&schema, &[1, 2], &mb, 0); // uuid_a, 42
+    let key1 = group_identity(&schema, &[1, 2], &mb, 1); // uuid_b, 42
+    let key2 = group_identity(&schema, &[1, 2], &mb, 2); // uuid_a, 43
+    let key0b = group_identity(&schema, &[1, 2], &mb, 0); // same as key0
 
     assert_ne!(key0, key1, "different UUIDs same int must yield different group keys");
     assert_ne!(key0, key2, "same UUID different int must yield different group keys");
@@ -1427,10 +1417,10 @@ fn test_group_key_includes_pk_pki0() {
     let batch = build_pk_other(&schema, &[(10, 100), (20, 100), (10, 200)]);
     let mb = batch.as_mem_batch();
 
-    let k_pk10_v100 = GroupKeyCols::new(&schema, &[0, 1]).unwrap().key_row(&mb, 0);
-    let k_pk20_v100 = GroupKeyCols::new(&schema, &[0, 1]).unwrap().key_row(&mb, 1);
-    let k_pk10_v200 = GroupKeyCols::new(&schema, &[0, 1]).unwrap().key_row(&mb, 2);
-    let k_pk10_v100_again = GroupKeyCols::new(&schema, &[0, 1]).unwrap().key_row(&mb, 0);
+    let k_pk10_v100 = group_identity(&schema, &[0, 1], &mb, 0);
+    let k_pk20_v100 = group_identity(&schema, &[0, 1], &mb, 1);
+    let k_pk10_v200 = group_identity(&schema, &[0, 1], &mb, 2);
+    let k_pk10_v100_again = group_identity(&schema, &[0, 1], &mb, 0);
 
     assert_ne!(k_pk10_v100, k_pk20_v100, "different PKs, same other → distinct keys");
     assert_ne!(k_pk10_v100, k_pk10_v200, "same PK, different other → distinct keys");
@@ -1446,9 +1436,9 @@ fn test_group_key_includes_pk_pki1() {
     let mb = batch.as_mem_batch();
 
     // group_by [col 0 = other, col 1 = pk]
-    let k_pk10_v100 = GroupKeyCols::new(&schema, &[0, 1]).unwrap().key_row(&mb, 0);
-    let k_pk20_v100 = GroupKeyCols::new(&schema, &[0, 1]).unwrap().key_row(&mb, 1);
-    let k_pk10_v200 = GroupKeyCols::new(&schema, &[0, 1]).unwrap().key_row(&mb, 2);
+    let k_pk10_v100 = group_identity(&schema, &[0, 1], &mb, 0);
+    let k_pk20_v100 = group_identity(&schema, &[0, 1], &mb, 1);
+    let k_pk10_v200 = group_identity(&schema, &[0, 1], &mb, 2);
 
     assert_ne!(k_pk10_v100, k_pk20_v100);
     assert_ne!(k_pk10_v100, k_pk10_v200);
@@ -1497,10 +1487,10 @@ fn test_group_key_null_distinct_from_zero() {
     let batch = build_pk_null_i64(&schema, &[(1, None), (2, Some(0)), (3, Some(7)), (4, None)]);
     let mb = batch.as_mem_batch();
 
-    let k_null = GroupKeyCols::new(&schema, &[1]).unwrap().key_row(&mb, 0);
-    let k_zero = GroupKeyCols::new(&schema, &[1]).unwrap().key_row(&mb, 1);
-    let k_seven = GroupKeyCols::new(&schema, &[1]).unwrap().key_row(&mb, 2);
-    let k_null2 = GroupKeyCols::new(&schema, &[1]).unwrap().key_row(&mb, 3);
+    let k_null = group_identity(&schema, &[1], &mb, 0);
+    let k_zero = group_identity(&schema, &[1], &mb, 1);
+    let k_seven = group_identity(&schema, &[1], &mb, 2);
+    let k_null2 = group_identity(&schema, &[1], &mb, 3);
 
     assert_ne!(k_null, k_zero, "NULL must form a distinct group from 0");
     assert_ne!(k_null, k_seven);
@@ -1510,9 +1500,8 @@ fn test_group_key_null_distinct_from_zero() {
 
 #[test]
 fn test_group_runs_nullable_group_col() {
-    // A nullable group column is not canonical, so the key is the fold, which
-    // streams a null marker: NULL is one group, distinct from the integer 0 it
-    // shares its stored bytes with, and its rows must be adjacent.
+    // A nullable group column keys by the fold: NULL is one group, distinct from
+    // the integer 0 it shares its stored bytes with, and its rows are adjacent.
     let schema = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
     let batch = build_pk_null_i64(&schema, &[(1, Some(0)), (2, None), (3, Some(5)), (4, None)]);
     let mb = batch.as_mem_batch();
@@ -1606,7 +1595,7 @@ fn test_emit_reduce_row_compound_pk_bytes() {
 fn test_reduce_min_pk_col_compound_pk() {
     let in_schema = pk_payload_schema(&[TypeCode::U64; 2]);
 
-    // SourcePk: the compound PK, then the I64 aggregate.
+    // The compound PK, then the I64 aggregate.
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
@@ -1699,9 +1688,9 @@ fn test_group_key_single_pk_col_compound_subset() {
     let batch = make_batch_compound_2xu64(&schema, &[(10, 50, 1, 0), (10, 99, 1, 0), (20, 50, 1, 0)]);
     let mb = batch.as_mem_batch();
 
-    let k0 = GroupKeyCols::new(&schema, &[0u32]).unwrap().key_row(&mb, 0);
-    let k1 = GroupKeyCols::new(&schema, &[0u32]).unwrap().key_row(&mb, 1);
-    let k2 = GroupKeyCols::new(&schema, &[0u32]).unwrap().key_row(&mb, 2);
+    let k0 = group_identity(&schema, &[0u32], &mb, 0);
+    let k1 = group_identity(&schema, &[0u32], &mb, 1);
+    let k2 = group_identity(&schema, &[0u32], &mb, 2);
 
     assert_eq!(k0, 10u128, "key must equal pk_col_0 value (10), not whole PK region");
     assert_eq!(k0, k1, "rows sharing pk_col_0 must hash to the same group key");
@@ -1717,8 +1706,8 @@ fn test_group_key_single_pk_col_single_pk_bit_identical() {
     let batch = make_batch(&schema, &[(42, 1, 100), (99, 1, 200)]);
     let mb = batch.as_mem_batch();
 
-    let k0 = GroupKeyCols::new(&schema, &[0u32]).unwrap().key_row(&mb, 0);
-    let k1 = GroupKeyCols::new(&schema, &[0u32]).unwrap().key_row(&mb, 1);
+    let k0 = group_identity(&schema, &[0u32], &mb, 0);
+    let k1 = group_identity(&schema, &[0u32], &mb, 1);
     assert_eq!(k0, 42u128, "single PK widens to the same value as before");
     assert_eq!(k1, 99u128);
 }
@@ -1730,8 +1719,7 @@ fn test_group_key_single_pk_col_single_pk_bit_identical() {
 #[test]
 fn test_op_reduce_compound_pk_group_by_subset_count() {
     let in_schema = pk_payload_schema(&[TypeCode::U64; 2]);
-    // GROUP BY a single U64 column → use_natural_pk via
-    // SingleNaturalCol. Output: U64 pk + I64 count.
+    // Output: U64 pk (the group column) + I64 count.
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
@@ -1813,7 +1801,7 @@ fn make_batch_u64pk_i64grp_u64val(
 /// picks the two shapes the reduce tests need: NOT NULL keeps the reduce output on
 /// the null-blind fixed-int comparator, nullable is required wherever a test writes
 /// a null bit into `val` (and is what the non-linear delta is then consolidated
-/// under). `grp` stays NOT NULL, which makes the group key canonical.
+/// under). `grp` stays NOT NULL, so it is the reduce's output PK.
 fn u64pk_i64grp_i64val(val_nullable: bool) -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
@@ -1861,7 +1849,7 @@ fn test_reduce_min_u64_high_bit_set() {
         false,
     );
     assert_eq!(out.count, 1);
-    let min_bits = u64::from_le_bytes(out.col_data(1)[0..8].try_into().unwrap());
+    let min_bits = u64::from_le_bytes(out.col_data(0)[0..8].try_into().unwrap());
     assert_eq!(min_bits, 1u64, "MIN(u64) must use unsigned ordering");
 }
 
@@ -1890,7 +1878,7 @@ fn test_reduce_max_u64_high_bit_set() {
         false,
     );
     assert_eq!(out.count, 1);
-    let max_bits = u64::from_le_bytes(out.col_data(1)[0..8].try_into().unwrap());
+    let max_bits = u64::from_le_bytes(out.col_data(0)[0..8].try_into().unwrap());
     assert_eq!(max_bits, u64::MAX, "MAX(u64) must use unsigned ordering");
 }
 
@@ -1916,7 +1904,7 @@ fn test_reduce_min_u64_incremental() {
         false,
     );
     assert_eq!(out1.count, 1);
-    let min1 = u64::from_le_bytes(out1.col_data(1)[0..8].try_into().unwrap());
+    let min1 = u64::from_le_bytes(out1.col_data(0)[0..8].try_into().unwrap());
     assert_eq!(min1, 1u64 << 60);
 
     // Tick 2: delta adds a row with val=1u64<<63, so the index holds both.
@@ -1945,8 +1933,8 @@ fn test_reduce_min_u64_incremental() {
         false,
     );
     assert_eq!(out2.count, 2, "retract old MIN + emit new MIN");
-    let retracted = u64::from_le_bytes(out2.col_data(1)[0..8].try_into().unwrap());
-    let new_min = u64::from_le_bytes(out2.col_data(1)[8..16].try_into().unwrap());
+    let retracted = u64::from_le_bytes(out2.col_data(0)[0..8].try_into().unwrap());
+    let new_min = u64::from_le_bytes(out2.col_data(0)[8..16].try_into().unwrap());
     assert_eq!(retracted, 1u64 << 60);
     assert_eq!(out2.get_weight(0), -1);
     assert_eq!(
@@ -1979,7 +1967,7 @@ fn test_reduce_max_u64_incremental() {
         false,
     );
     assert_eq!(out1.count, 1);
-    let max1 = u64::from_le_bytes(out1.col_data(1)[0..8].try_into().unwrap());
+    let max1 = u64::from_le_bytes(out1.col_data(0)[0..8].try_into().unwrap());
     assert_eq!(max1, 10);
 
     // Tick 2: delta adds val=u64::MAX, so the index holds both.
@@ -2005,10 +1993,10 @@ fn test_reduce_max_u64_incremental() {
     );
     // Expect: retract old MAX (10) + emit new MAX (u64::MAX).
     assert_eq!(out2.count, 2);
-    let retracted = u64::from_le_bytes(out2.col_data(1)[0..8].try_into().unwrap());
+    let retracted = u64::from_le_bytes(out2.col_data(0)[0..8].try_into().unwrap());
     assert_eq!(retracted, 10);
     assert_eq!(out2.get_weight(0), -1);
-    let new_max = u64::from_le_bytes(out2.col_data(1)[8..16].try_into().unwrap());
+    let new_max = u64::from_le_bytes(out2.col_data(0)[8..16].try_into().unwrap());
     assert_eq!(new_max, u64::MAX, "new MAX must be unsigned-max u64::MAX");
     assert_eq!(out2.get_weight(1), 1);
 }
@@ -2081,7 +2069,7 @@ fn test_reduce_min_max_i64_boundary() {
             false,
         );
         assert_eq!(out.count, 1);
-        let min = read_i64_le(out.col_data(1), 0);
+        let min = read_i64_le(out.col_data(0), 0);
         assert_eq!(min, i64::MIN, "MIN(I64) signed ordering preserved");
     }
 
@@ -2106,7 +2094,7 @@ fn test_reduce_min_max_i64_boundary() {
             false,
         );
         assert_eq!(out.count, 1);
-        let max = read_i64_le(out.col_data(1), 0);
+        let max = read_i64_le(out.col_data(0), 0);
         assert_eq!(max, i64::MAX, "MAX(I64) signed ordering preserved");
     }
 }
@@ -2525,7 +2513,6 @@ fn avi_retraction_returns_next_extremum() {
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(TypeCode::U128, false),
             SchemaColumn::new(TypeCode::U32, false),
             SchemaColumn::new(TypeCode::I64, true),
             SchemaColumn::new(TypeCode::I64, false), // count
@@ -2545,9 +2532,6 @@ fn avi_retraction_returns_next_extremum() {
         b.set_layout_unchecked(Layout::Consolidated);
         b
     };
-    let group_key = GroupKeyCols::new(&in_schema, &[1u32])
-        .unwrap()
-        .key_row(&delta.as_mem_batch(), 0);
 
     // AVI (post-state for group a=1): the retracted 5 is gone; the surviving
     // values are {10, 20}, so the prefix walk must return the smaller, 10.
@@ -2572,12 +2556,11 @@ fn avi_retraction_returns_next_extremum() {
     // trace_out: previous output for a=1 was MIN=5.
     let to_batch = {
         let mut b = Batch::with_capacity(&out_schema, 1);
-        b.extend_pk(group_key);
+        b.extend_pk_bytes(&1u32.to_be_bytes()); // a
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &1u32.to_le_bytes()); // a
-        b.extend_col(1, &5i64.to_le_bytes()); // min
-        b.extend_col(2, &3i64.to_le_bytes()); // count: {5, 10, 20}
+        b.extend_col(0, &5i64.to_le_bytes()); // min
+        b.extend_col(1, &3i64.to_le_bytes()); // count: {5, 10, 20}
         b.count += 1;
         b.set_layout_unchecked(Layout::Consolidated);
         b
@@ -2604,7 +2587,7 @@ fn avi_retraction_returns_next_extremum() {
     let mut inserted = None;
     for i in 0..out.count {
         let w = out.get_weight(i);
-        let v = read_i64_le(out.col_data(1), i * 8);
+        let v = read_i64_le(out.col_data(0), i * 8);
         if w < 0 {
             retracted = Some(v);
         } else {
@@ -2700,7 +2683,6 @@ fn min_tie_retract_one_copy_keeps_min() {
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(TypeCode::U128, false),
             SchemaColumn::new(TypeCode::I64, false),
             SchemaColumn::new(TypeCode::I64, true),
             SchemaColumn::new(TypeCode::I64, false), // count
@@ -2726,18 +2708,14 @@ fn min_tie_retract_one_copy_keeps_min() {
         b.set_layout_unchecked(Layout::Consolidated);
         b
     };
-    let group_key = GroupKeyCols::new(&in_schema, &[1u32])
-        .unwrap()
-        .key_row(&ti_batch.as_mem_batch(), 0);
 
     let to_batch = {
         let mut b = Batch::with_capacity(&out_schema, 1);
-        b.extend_pk(group_key);
+        b.extend_pk_bytes(&opk_pk(&out_schema, &[1])); // g
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &1i64.to_le_bytes());
-        b.extend_col(1, &5i64.to_le_bytes());
-        b.extend_col(2, &3i64.to_le_bytes()); // count: the three history rows
+        b.extend_col(0, &5i64.to_le_bytes());
+        b.extend_col(1, &3i64.to_le_bytes()); // count: the three history rows
         b.count += 1;
         b.set_layout_unchecked(Layout::Consolidated);
         b
@@ -2774,7 +2752,7 @@ fn min_tie_retract_one_copy_keeps_min() {
     let mut new_min = None;
     for i in 0..out.count {
         if out.get_weight(i) > 0 {
-            new_min = Some(read_i64_le(out.col_data(1), i * 8));
+            new_min = Some(read_i64_le(out.col_data(0), i * 8));
         }
     }
     assert_eq!(
@@ -2891,9 +2869,7 @@ fn avi_multi_col_retraction_returns_next_extremum() {
         b.set_layout_unchecked(Layout::Consolidated);
         b
     };
-    let group_key = GroupKeyCols::new(&in_schema, &[1u32, 2u32])
-        .unwrap()
-        .key_row(&delta.as_mem_batch(), 0);
+    let group_key = group_identity(&in_schema, &[1u32, 2u32], &delta.as_mem_batch(), 0);
 
     // AVI post-state for (3, 4): surviving min is 9. A decoy entry for a
     // different group (3, 5) sharing the a-byte prefix must NOT be matched.
@@ -3343,9 +3319,7 @@ fn avi_wide_retraction_returns_next_extremum() {
         b.set_layout_unchecked(Layout::Consolidated);
         b
     };
-    let group_key = GroupKeyCols::new(&in_schema, &[1u32, 2u32])
-        .unwrap()
-        .key_row(&delta.as_mem_batch(), 0);
+    let group_key = group_identity(&in_schema, &[1u32, 2u32], &delta.as_mem_batch(), 0);
 
     // AVI post-state: group (ga, gb) surviving values {9, 15}; a decoy group
     // (ga, gb+1) sharing the first 8 bytes holds a smaller 1 that must not win.
@@ -4050,7 +4024,7 @@ fn test_group_key_128bit_collision_resistance() {
     let mut his: HashSet<u64> = HashSet::new();
     let mut los: HashSet<u64> = HashSet::new();
     for row in 0..b.count {
-        let k = GroupKeyCols::new(&schema, &[1u32, 2u32]).unwrap().key_row(&mb, row);
+        let k = group_identity(&schema, &[1u32, 2u32], &mb, row);
         keys.insert(k);
         his.insert((k >> 64) as u64);
         los.insert(k as u64);
@@ -4078,8 +4052,8 @@ fn test_group_key_128bit_collision_resistance() {
 
     // Determinism: the same row hashes identically across calls (reused hasher).
     assert_eq!(
-        GroupKeyCols::new(&schema, &[1u32, 2u32]).unwrap().key_row(&mb, 0),
-        GroupKeyCols::new(&schema, &[1u32, 2u32]).unwrap().key_row(&mb, 0),
+        group_identity(&schema, &[1u32, 2u32], &mb, 0),
+        group_identity(&schema, &[1u32, 2u32], &mb, 0),
         "same row must hash identically",
     );
 }
@@ -4132,13 +4106,17 @@ fn test_group_key_blob_long_shared_prefix() {
     let blob_b: &[u8] = b"PREF_bbbbbbbbbb"; // 15 bytes, same prefix+length
     let batch = make_batch_blob_grp_i64(&schema, &[(1, 1, blob_a, 10), (2, 1, blob_b, 20), (3, 1, blob_a, 30)]);
     let mb = batch.as_mem_batch();
-    let keys = GroupKeyCols::new(&schema, &[1u32]).unwrap();
+    let (keys, _) = GroupOutKey::new(&schema, &[1u32], []).unwrap();
     assert_ne!(
-        keys.key_row(&mb, 0),
-        keys.key_row(&mb, 1),
+        keys.identity(&mb, 0),
+        keys.identity(&mb, 1),
         "distinct blobs key distinct groups"
     );
-    assert_eq!(keys.key_row(&mb, 0), keys.key_row(&mb, 2), "equal blobs key one group");
+    assert_eq!(
+        keys.identity(&mb, 0),
+        keys.identity(&mb, 2),
+        "equal blobs key one group"
+    );
 }
 
 #[test]
@@ -4237,8 +4215,8 @@ fn german_string_min_max_recede_through_the_value_index() {
         AggDescriptor { col_idx: 1, agg_op: AggFunc::Max },
     ];
     let out_schema = out_schema_for(&in_schema, &[2u32], &aggs);
-    // Payload: grp exemplar, count, min, max.
-    let (pi_min, pi_max) = (2usize, 3usize);
+    // Payload: count, min, max — the natural I64 group key is the PK.
+    let (pi_min, pi_max) = (1usize, 2usize);
     let content = |b: &Batch, row: usize, pi: usize| -> Vec<u8> {
         let mb = b.as_mem_batch();
         gnitz_expr::payload_bytes(&mb, row, pi).to_vec()
@@ -4964,10 +4942,9 @@ fn cg_delta(rows: &[(u64, i64, i32, i64, i64)]) -> Batch {
 #[test]
 fn reduce_multi_avi_foreign_group() {
     let in_schema = cg_src();
-    // Output: [_group_pk:U128, g:I32, min_a:I64(nullable), max_b:I64(nullable), count:I64].
+    // Output: [g:I32, min_a:I64(nullable), max_b:I64(nullable), count:I64].
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(TypeCode::U128, false),
             SchemaColumn::new(TypeCode::I32, false),
             SchemaColumn::new(TypeCode::I64, true),
             SchemaColumn::new(TypeCode::I64, true),
@@ -4999,10 +4976,12 @@ fn reduce_multi_avi_foreign_group() {
 
     assert_eq!(out.count, 2, "two groups → two rows");
     for i in 0..out.count {
-        let g = gnitz_wire::read_u32_le(out.col_data(0), i * 4) as i32;
-        let min_a = read_i64_le(out.col_data(1), i * 8);
-        let max_b = read_i64_le(out.col_data(2), i * 8);
-        let count = read_i64_le(out.col_data(3), i * 8);
+        let mut le = [0u8; 4];
+        gnitz_wire::decode_pk_column(out.get_pk_bytes(i), TypeCode::I32, &mut le);
+        let g = i32::from_le_bytes(le);
+        let min_a = read_i64_le(out.col_data(0), i * 8);
+        let max_b = read_i64_le(out.col_data(1), i * 8);
+        let count = read_i64_le(out.col_data(2), i * 8);
         match g {
             10 => {
                 assert_eq!(min_a, 3, "group 10 MIN(a) excludes group 20");
@@ -5019,7 +4998,7 @@ fn reduce_multi_avi_foreign_group() {
     }
 }
 
-/// Schema `[pk:U64, g:I32, a:I64]`; output `[_group_pk:U128, g:I32, min:I64?, count:I64]`.
+/// Schema `[pk:U64, g:I32, a:I64]`; output `[g:I32, min:I64?, count:I64]`.
 fn cg3_src() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
@@ -5033,7 +5012,6 @@ fn cg3_src() -> SchemaDescriptor {
 fn cg3_out() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(TypeCode::U128, false),
             SchemaColumn::new(TypeCode::I32, false),
             SchemaColumn::new(TypeCode::I64, true),
             SchemaColumn::new(TypeCode::I64, false),
@@ -5086,8 +5064,8 @@ fn reduce_multi_avi_linear_companion() {
     let mut to1 = empty_trace(out_schema);
     let out1 = cg3_tick(tmp.path(), &[&d1], &d1, &aggs, &mut to1);
     assert_eq!(out1.count, 1);
-    assert_eq!(read_i64_le(out1.col_data(1), 0), 3, "MIN=3 from the index");
-    assert_eq!(read_i64_le(out1.col_data(2), 0), 3, "COUNT=3");
+    assert_eq!(read_i64_le(out1.col_data(0), 0), 3, "MIN=3 from the index");
+    assert_eq!(read_i64_le(out1.col_data(1), 0), 3, "COUNT=3");
 
     // Tick 2: retract a=3 (the current min). MIN→5 (index post-state), COUNT 3→2.
     let d2 = cg3_delta(&[(3, -1, 7, 3, false)]);
@@ -5097,12 +5075,12 @@ fn reduce_multi_avi_linear_companion() {
     let mb = out2.as_mem_batch();
     let ins = (0..out2.count).find(|&i| mb.get_weight(i) == 1).expect("a +1 row");
     assert_eq!(
-        read_i64_le(out2.col_data(1), ins * 8),
+        read_i64_le(out2.col_data(0), ins * 8),
         5,
         "MIN recomputed to 5 from the index"
     );
     assert_eq!(
-        read_i64_le(out2.col_data(2), ins * 8),
+        read_i64_le(out2.col_data(1), ins * 8),
         2,
         "COUNT = old(3) + Σdelta(-1) = 2"
     );
@@ -5147,13 +5125,9 @@ fn reduce_multi_avi_all_null_emit() {
     let out1 = cg3_tick(tmp.path(), &[&d1], &d1, &aggs, &mut to1);
     assert_eq!(out1.count, 1, "all-NULL group with rows must still emit");
     assert_eq!(out1.get_weight(0), 1);
-    assert_eq!(read_i64_le(out1.col_data(2), 0), 2, "COUNT=2");
-    // MIN null bit: payload col 1 (min) → null-word bit 1.
-    assert_ne!(
-        out1.get_null_word(0) & (1 << 1),
-        0,
-        "MIN renders NULL for all-NULL group"
-    );
+    assert_eq!(read_i64_le(out1.col_data(1), 0), 2, "COUNT=2");
+    // MIN null bit: payload col 0 (min) → null-word bit 0.
+    assert_ne!(out1.get_null_word(0) & 1, 0, "MIN renders NULL for all-NULL group");
 }
 
 /// Nullable MIN over the combined index: a mixed group `{a=5, a=NULL}` whose
@@ -5172,7 +5146,7 @@ fn reduce_multi_avi_retract_to_all_null() {
     let mut to1 = empty_trace(out_schema);
     let out1 = cg3_tick(tmp.path(), &[&d1], &d1, &aggs, &mut to1);
     assert_eq!(out1.count, 1);
-    assert_eq!(read_i64_le(out1.col_data(1), 0), 5, "MIN=5");
+    assert_eq!(read_i64_le(out1.col_data(0), 0), 5, "MIN=5");
 
     // Tick 2: retract a=5. Group survives via the NULL row: (g, NULL, 1).
     let d2 = cg3_delta(&[(1, -1, 7, 5, false)]);
@@ -5182,8 +5156,8 @@ fn reduce_multi_avi_retract_to_all_null() {
     let ins = (0..out2.count)
         .find(|&i| mb2.get_weight(i) == 1)
         .expect("a +1 row — group survives");
-    assert_eq!(read_i64_le(out2.col_data(2), ins * 8), 1, "COUNT=1 (the NULL row)");
-    assert_ne!(out2.get_null_word(ins) & (1 << 1), 0, "MIN now NULL but group present");
+    assert_eq!(read_i64_le(out2.col_data(1), ins * 8), 1, "COUNT=1 (the NULL row)");
+    assert_ne!(out2.get_null_word(ins) & 1, 0, "MIN now NULL but group present");
 
     // Rebuild tick-2 output row to seed tick-3 trace_out.
     let row2 = {
@@ -5192,9 +5166,8 @@ fn reduce_multi_avi_retract_to_all_null() {
         b.extend_pk_bytes(out2.get_pk_bytes(ins));
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&out2.get_null_word(ins).to_le_bytes());
-        b.extend_col(0, &out2.col_data(0)[ins * 4..ins * 4 + 4]);
+        b.extend_col(0, &out2.col_data(0)[ins * 8..ins * 8 + 8]);
         b.extend_col(1, &out2.col_data(1)[ins * 8..ins * 8 + 8]);
-        b.extend_col(2, &out2.col_data(2)[ins * 8..ins * 8 + 8]);
         b.count += 1;
         b.set_layout_unchecked(Layout::Consolidated);
         b
@@ -5213,10 +5186,9 @@ fn reduce_multi_avi_retract_to_all_null() {
 #[test]
 fn reduce_multi_avi_same_col_min_max() {
     let in_schema = cg3_src();
-    // Output: [_group_pk:U128, g:I32, min:I64?, max:I64?, count:I64].
+    // Output: [g:I32, min:I64?, max:I64?, count:I64].
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(TypeCode::U128, false),
             SchemaColumn::new(TypeCode::I32, false),
             SchemaColumn::new(TypeCode::I64, true),
             SchemaColumn::new(TypeCode::I64, true),
@@ -5237,9 +5209,9 @@ fn reduce_multi_avi_same_col_min_max() {
     let mut to = empty_trace(out_schema);
     let out = op_reduce(&delta, &mut to, &in_schema, &[1u32], &aggs, Some(&mut avi_ch), false);
     assert_eq!(out.count, 1);
-    assert_eq!(read_i64_le(out.col_data(1), 0), 1, "MIN(a)=1 (ordinal 0)");
+    assert_eq!(read_i64_le(out.col_data(0), 0), 1, "MIN(a)=1 (ordinal 0)");
     assert_eq!(
-        read_i64_le(out.col_data(2), 0),
+        read_i64_le(out.col_data(1), 0),
         8,
         "MAX(a)=8 (ordinal 1), no ordinal collision"
     );
@@ -5390,8 +5362,8 @@ fn reduce_multi_avi_global_emptied() {
 // `op_reduce` visits groups in ascending output-PK order on every arm, which is
 // what its one retraction probe, `seek_pk_group_ascending`, is sound under. These
 // tests drive it across multi-epoch retraction (incl. sign-flip boundaries) and
-// over the nullable/hash arm, force a multi-source trace cursor so the merge-mode
-// gallop runs at scale, and pin the classifier.
+// over the nullable fold arm, and force a multi-source trace cursor so the
+// merge-mode gallop runs at scale.
 // ===========================================================================
 
 /// One input row over a `[U64 pk, <grp>, I64 val]` schema: `(pk, grp, val,
@@ -5406,6 +5378,19 @@ fn sum_count_out_synthetic(grp_col: SchemaColumn) -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U128, false),
+            grp_col,
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+        ],
+        &[0],
+    )
+}
+
+/// Output schema for a natural-PK `SUM/COUNT` reduce over a non-nullable
+/// group column: `[<grp> pk, I64 sum, I64 count]`.
+fn sum_count_out_natural(grp_col: SchemaColumn) -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
             grp_col,
             SchemaColumn::new(TypeCode::I64, false),
             SchemaColumn::new(TypeCode::I64, false),
@@ -5505,9 +5490,26 @@ fn readback_synthetic_i64(batch: &Batch) -> std::collections::BTreeMap<Option<i6
     m
 }
 
+/// Read a natural-I64-PK reduce output `[I64 pk(=grp), I64 sum, I64 count]`
+/// into a `grp → (sum, count)` map, asserting one net-weight-1 row per group.
+fn readback_natural_i64(batch: &Batch) -> std::collections::BTreeMap<Option<i64>, (i128, i64)> {
+    let mut m: std::collections::BTreeMap<Option<i64>, (i128, i64)> = std::collections::BTreeMap::new();
+    for r in 0..batch.count {
+        assert_eq!(batch.get_weight(r), 1, "each live group row nets weight 1");
+        let grp = opk_pk_i64(batch.get_pk_bytes(r));
+        let sum = read_i64_le(batch.col_data(0), r * 8) as i128;
+        let count = read_i64_le(batch.col_data(1), r * 8);
+        assert!(
+            m.insert(Some(grp), (sum, count)).is_none(),
+            "one output row per group (grp={grp})"
+        );
+    }
+    m
+}
+
 // Payload I64 group key, multi-epoch retraction across the sign flip. GROUP BY
-// a non-nullable I64 payload column ⇒ canonical Payload-arm key + synthetic
-// U128 output PK. Epoch 1 inserts every
+// a non-nullable I64 payload column ⇒ a natural output PK, the column's
+// sign-flipped OPK image. Epoch 1 inserts every
 // group; epoch 2 updates and deletes rows in several groups (including the
 // negative ones), so the retraction probe galloping over sign-flipped output
 // PKs must land on the exact old aggregate row.
@@ -5516,12 +5518,12 @@ fn reduce_monotone_probe_payload_i64_group() {
     let in_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false), // grp (non-nullable payload) — Payload arm
+            SchemaColumn::new(TypeCode::I64, false), // grp (non-nullable payload) — natural PK
             SchemaColumn::new(TypeCode::I64, false), // val
         ],
         &[0],
     );
-    let out_schema = sum_count_out_synthetic(SchemaColumn::new(TypeCode::I64, false));
+    let out_schema = sum_count_out_natural(SchemaColumn::new(TypeCode::I64, false));
     let aggs = sum_count_aggs(2);
 
     let epoch_rows: [&[GrpValRow]; 2] = [
@@ -5556,16 +5558,15 @@ fn reduce_monotone_probe_payload_i64_group() {
         "one live row per group, no un-cancelled ghosts"
     );
     assert_eq!(
-        readback_synthetic_i64(&final_batch),
+        readback_natural_i64(&final_batch),
         reference,
         "incremental SUM/COUNT across sign-flip retraction must match the from-scratch reference",
     );
 }
 
-// Payload U64 group key — the unsigned arm. A non-nullable U64 payload column is
-// natural-PK-eligible, so the output PK IS the group value (stride 8) and the
-// key is Payload-arm canonical. Groups straddle the high byte (1 vs 256) so a
-// byte-order slip in the gallop would misorder them.
+// Payload U64 group key — the unsigned arm: the output PK is the group value.
+// Groups straddle the high byte (1 vs 256) so a byte-order slip in the gallop
+// would misorder them.
 #[test]
 fn reduce_monotone_probe_payload_u64_group() {
     let in_schema = SchemaDescriptor::new(
@@ -5630,16 +5631,14 @@ fn reduce_monotone_probe_payload_u64_group() {
     );
 }
 
-// A nullable group column takes the hash arm, so the classifier returns None —
-// but the visit order still ascends, which is what lets the one retraction probe
-// serve every arm. Same retraction workload plus a NULL group (its own group);
-// results must still match the from-scratch reference.
+// A nullable group column keys by the fold. Same retraction workload plus a NULL
+// group (its own group); results must still match the from-scratch reference.
 #[test]
 fn reduce_nullable_group_takes_the_hash_arm() {
     let in_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, true),  // grp NULLABLE ⇒ hash arm
+            SchemaColumn::new(TypeCode::I64, true),  // grp NULLABLE ⇒ fold arm
             SchemaColumn::new(TypeCode::I64, false), // val
         ],
         &[0],
@@ -5677,37 +5676,6 @@ fn reduce_nullable_group_takes_the_hash_arm() {
     );
 }
 
-// Pin the shared classifier: the two canonical single-column arms (a PK
-// column, a non-nullable routable-int payload), and the hash fold (None) for
-// nullable / STRING / float / multi-column / empty group sets.
-// `GroupKeyCols::key_row` dispatches its fast path on the arm and `op_reduce`
-// keys its monotone probe on `is_some()`, so a drift here is a correctness
-// bug, not a perf one.
-#[test]
-fn single_col_canonical_group_key_predicate() {
-    use super::super::group_key::single_col_canonical_group_key;
-    let u64c = SchemaColumn::new(TypeCode::U64, false);
-    let i64c = SchemaColumn::new(TypeCode::I64, false);
-    let i64_null = SchemaColumn::new(TypeCode::I64, true);
-    let strc = SchemaColumn::new(TypeCode::String, false);
-    let f64c = SchemaColumn::new(TypeCode::F64, false);
-    let u128c = SchemaColumn::new(TypeCode::U128, false);
-
-    let check = |cols: &[SchemaColumn], pk: &[u32], gb: &[u32], expected: bool, label: &str| {
-        let schema = SchemaDescriptor::new(cols, pk);
-        assert_eq!(single_col_canonical_group_key(&schema, gb), expected, "{label}");
-    };
-    check(&[u64c, i64c], &[0], &[1], true, "non-nullable I64 payload");
-    check(&[u64c, u64c], &[0], &[1], true, "non-nullable U64 payload");
-    check(&[u64c, u128c], &[0], &[1], true, "U128 payload (routable_int)");
-    check(&[u64c, i64c], &[0], &[0], true, "single PK column");
-    check(&[u64c, i64_null], &[0], &[1], false, "nullable → hash arm");
-    check(&[u64c, strc], &[0], &[1], false, "STRING → hash arm");
-    check(&[u64c, f64c], &[0], &[1], false, "float → hash arm");
-    check(&[u64c, i64c, i64c], &[0], &[1, 2], false, "multi-column → hash arm");
-    check(&[u64c, i64c], &[0], &[], false, "empty (global) group set");
-}
-
 // Many groups per epoch over ≥ 3 trace_out sources. 200 groups spanning the sign
 // flip (-100..99), six epochs each touching every group (insert / update /
 // delete). One flush after epoch 0 plus accumulating memtable runs pushes the
@@ -5720,12 +5688,12 @@ fn reduce_monotone_probe_many_groups_multi_source() {
     let in_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false), // grp — Payload arm
+            SchemaColumn::new(TypeCode::I64, false), // grp — natural PK
             SchemaColumn::new(TypeCode::I64, false), // val
         ],
         &[0],
     );
-    let out_schema = sum_count_out_synthetic(SchemaColumn::new(TypeCode::I64, false));
+    let out_schema = sum_count_out_natural(SchemaColumn::new(TypeCode::I64, false));
     let aggs = sum_count_aggs(2);
 
     let groups: Vec<i64> = (-100..100).collect();
@@ -5768,7 +5736,7 @@ fn reduce_monotone_probe_many_groups_multi_source() {
         "one live row per group, no duplicates"
     );
     assert_eq!(
-        readback_synthetic_i64(&final_batch),
+        readback_natural_i64(&final_batch),
         reference,
         "many-group multi-source incremental SUM/COUNT must match the from-scratch reference",
     );
@@ -5869,17 +5837,17 @@ fn build_mm_delta(rows: &[(u64, i64, i64, i64)]) -> Batch {
 /// `grp → (min, max, count)` for a MIN/MAX/COUNT reduce, NULL extremes as `None`.
 type MmState = std::collections::BTreeMap<i64, (Option<i64>, Option<i64>, i64)>;
 
-/// Read a consolidated `mm_out_schema()` batch into `grp → (min, max, count)`,
+/// Read a consolidated natural-I64-keyed MIN/MAX/COUNT batch into `grp → (min, max, count)`,
 /// a NULL min/max reading as `None`. Asserts one net-weight-1 row per group.
 fn readback_mm(b: &Batch) -> MmState {
     let mut m = std::collections::BTreeMap::new();
     for r in 0..b.count {
         assert_eq!(b.get_weight(r), 1, "each live group is one net-weight-1 row");
         let nw = b.get_null_word(r);
-        let grp = read_i64_le(b.col_data(0), r * 8);
-        let min = (!gnitz_wire::null_word_get(nw, 1)).then(|| read_i64_le(b.col_data(1), r * 8));
-        let max = (!gnitz_wire::null_word_get(nw, 2)).then(|| read_i64_le(b.col_data(2), r * 8));
-        let count = read_i64_le(b.col_data(3), r * 8);
+        let grp = opk_pk_i64(b.get_pk_bytes(r));
+        let min = (!gnitz_wire::null_word_get(nw, 0)).then(|| read_i64_le(b.col_data(0), r * 8));
+        let max = (!gnitz_wire::null_word_get(nw, 1)).then(|| read_i64_le(b.col_data(1), r * 8));
+        let count = read_i64_le(b.col_data(2), r * 8);
         assert!(m.insert(grp, (min, max, count)).is_none(), "one output row per group");
     }
     m
@@ -6137,7 +6105,6 @@ fn avi_skip_mixed_int_min_float_max() {
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(TypeCode::U128, false),
             SchemaColumn::new(TypeCode::I64, false),
             SchemaColumn::new(TypeCode::I64, true), // min(ival)
             SchemaColumn::new(TypeCode::F64, true), // max(fval)
@@ -6174,9 +6141,9 @@ fn avi_skip_mixed_int_min_float_max() {
     let read = |b: &Batch| -> (Option<i64>, Option<f64>, i64) {
         assert_eq!(b.count, 1);
         let nw = b.get_null_word(0);
-        let min = (!gnitz_wire::null_word_get(nw, 1)).then(|| read_i64_le(b.col_data(1), 0));
-        let max = (!gnitz_wire::null_word_get(nw, 2)).then(|| f64::from_bits(read_u64_le(b.col_data(2), 0)));
-        let count = read_i64_le(b.col_data(3), 0);
+        let min = (!gnitz_wire::null_word_get(nw, 0)).then(|| read_i64_le(b.col_data(0), 0));
+        let max = (!gnitz_wire::null_word_get(nw, 1)).then(|| f64::from_bits(read_u64_le(b.col_data(1), 0)));
+        let count = read_i64_le(b.col_data(2), 0);
         (min, max, count)
     };
     assert_eq!(
@@ -6256,8 +6223,8 @@ fn check_float_minmax_against_oracle(val_tc: TypeCode, epochs_rows: &[Vec<(u64, 
         let got: std::collections::BTreeMap<i64, (u64, u64)> = (0..states[ep].count)
             .map(|i| {
                 (
-                    read_i64_le(states[ep].col_data(0), i * 8),
-                    (read_bits(&states[ep], 1, i), read_bits(&states[ep], 2, i)),
+                    opk_pk_i64(states[ep].get_pk_bytes(i)),
+                    (read_bits(&states[ep], 0, i), read_bits(&states[ep], 1, i)),
                 )
             })
             .collect();
@@ -6583,7 +6550,7 @@ fn a_reduce_without_a_count_is_rejected() {
     }
 }
 
-/// col 0 = U64 PK and the whole group key (⇒ SourcePk); col 1 = the
+/// col 0 = U64 PK and the whole group key; col 1 = the
 /// aggregate column, whose type is the only thing the two tests below vary.
 fn agg_over(tc: TypeCode) -> SchemaDescriptor {
     SchemaDescriptor::new(

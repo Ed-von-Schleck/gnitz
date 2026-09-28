@@ -35,8 +35,7 @@ impl TopNPlan {
         if limit == 0 {
             return Err(OpBuildErr::shape("top-n: a zero limit selects nothing"));
         }
-        let (key, prefix) =
-            GroupOutKey::for_group_cols(input_schema, group_cols, 0..input_schema.num_columns() as u32)?;
+        let (key, prefix) = GroupOutKey::new(input_schema, group_cols, 0..input_schema.num_columns() as u32)?;
         let output_schema = prefix.finish();
         let index = TopNIndex::new(input_schema, group_cols, order, &output_schema)?;
         Ok(TopNPlan { output_schema, key, offset, limit, index })

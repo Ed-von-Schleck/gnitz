@@ -400,8 +400,8 @@ fn test_reduce_groups_by_a_payload_column() {
         TypeCode::I64, // group col (payload col 0)
         TypeCode::I64, // agg col (payload col 1)
     ]);
-    // [U128 PK, I64 group_col, I64 sum_col, I64 count companion]
-    let out_schema = make_schema(&[TypeCode::I64, TypeCode::I64, TypeCode::I64]);
+    // [I64 group_col (natural PK), I64 sum_col, I64 count companion]
+    let out_schema = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::I64, false); 3], &[0]);
 
     let dir = tempfile::tempdir().unwrap();
     let registry = vm_registry(dir.path());
@@ -424,7 +424,7 @@ fn test_reduce_groups_by_a_payload_column() {
     let r1 = execute_epoch(&mut vm, input, 0).unwrap();
 
     assert_eq!(r1.len(), 1, "one group → one output row");
-    let sum_val = i64::from_le_bytes(r1.col_data(1)[0..8].try_into().unwrap());
+    let sum_val = i64::from_le_bytes(r1.col_data(0)[0..8].try_into().unwrap());
     assert_eq!(sum_val, 30, "SUM(10+20) must be 30");
 }
 

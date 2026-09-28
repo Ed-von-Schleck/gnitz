@@ -22,7 +22,7 @@ pub use transport::{hello_handshake, ClientTransport};
 #[cfg(not(any(test, feature = "integration")))]
 pub(crate) use transport::{hello_handshake, ClientTransport};
 pub use types::{
-    push_zero_cell, BatchAppender, ColType, ColumnDef, FixedInt, FkTarget, PayloadColumn, PkBuf, PkColumn,
-    ReduceOutKey, ScalarKind, Schema, TypeCode, ZSetBatch, MAX_PK_BYTES, PK_LIST_MAX_COLS,
+    push_zero_cell, BatchAppender, ColType, ColumnDef, FixedInt, FkTarget, PayloadColumn, PkBuf, PkColumn, ScalarKind,
+    Schema, TypeCode, ZSetBatch, MAX_PK_BYTES, PK_LIST_MAX_COLS,
 };
 pub use wal_block::decode_regions_into;

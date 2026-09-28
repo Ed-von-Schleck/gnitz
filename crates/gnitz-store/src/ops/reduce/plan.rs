@@ -119,7 +119,7 @@ impl ReducePlan {
             !seeds_ground || group_cols.is_empty(),
             "the ground row carries no group columns"
         );
-        let (key, prefix) = GroupOutKey::for_group_cols(input, group_cols, group_cols.iter().copied())?;
+        let (key, prefix) = GroupOutKey::new(input, group_cols, group_cols.iter().copied())?;
         let shape = ReduceShape::new(input, key, prefix, aggs)?;
         let avi = AviBake::new(input, group_cols, &shape.acc_template)?;
         Ok(ReducePlan { shape, seeds_ground, cardinality, avi })

@@ -423,33 +423,33 @@ fn a_malformed_scan_bound_is_rejected() {
     }
 }
 
-/// The reduce output key: a group set that is a permutation of the source PK
-/// keys on it; a single NOT NULL natural-key column keys on itself; anything
-/// else — a nullable or signed column, a partial or wider set — folds into a
-/// synthetic key.
+/// The reduce output key: the source PK list keys on itself, and so does a
+/// single NOT NULL PK-eligible column; anything else — a nullable, float or
+/// string column, a partial, reordered or wider set — folds into a synthetic key.
 #[test]
 #[allow(clippy::type_complexity)]
 fn for_group_cols_picks_the_output_key() {
+    use crate::TypeCode as T;
     use ReduceOutKey::*;
-    let (u64, u128, uuid, i64) = (
-        crate::TypeCode::U64,
-        crate::TypeCode::U128,
-        crate::TypeCode::UUID,
-        crate::TypeCode::I64,
-    );
     // (pk, group, (type code, nullable), key)
     let rows: &[(&[u32], &[u32], (TypeCode, bool), ReduceOutKey)] = &[
-        (&[0], &[1], (u64, true), SyntheticFold),
-        (&[0], &[1], (u64, false), SingleNaturalCol),
-        (&[0], &[1], (uuid, false), SingleNaturalCol),
-        (&[0], &[1], (u128, false), SingleNaturalCol),
-        (&[0], &[1], (i64, false), SyntheticFold),
-        (&[0], &[0], (i64, false), SourcePk),
-        (&[0, 1], &[0, 1], (i64, false), SourcePk),
-        (&[0, 1], &[1, 0], (i64, false), SyntheticFold),
-        (&[0, 1], &[0], (u64, false), SingleNaturalCol),
-        (&[0, 1], &[0, 1, 2], (u64, false), SyntheticFold),
-        (&[0, 1], &[1, 2], (u64, false), SyntheticFold),
+        (&[0], &[1], (T::U64, true), SyntheticFold),
+        (&[0], &[1], (T::I64, true), SyntheticFold),
+        (&[0], &[1], (T::U64, false), Natural),
+        (&[0], &[1], (T::UUID, false), Natural),
+        (&[0], &[1], (T::U128, false), Natural),
+        (&[0], &[1], (T::I64, false), Natural),
+        (&[0], &[1], (T::I32, false), Natural),
+        (&[0], &[1], (T::U8, false), Natural),
+        (&[0], &[1], (T::I128, false), Natural),
+        (&[0], &[1], (T::F64, false), SyntheticFold),
+        (&[0], &[1], (T::String, false), SyntheticFold),
+        (&[0], &[0], (T::I64, false), Natural),
+        (&[0, 1], &[0, 1], (T::I64, false), Natural),
+        (&[0, 1], &[1, 0], (T::I64, false), SyntheticFold),
+        (&[0, 1], &[0], (T::U64, false), Natural),
+        (&[0, 1], &[0, 1, 2], (T::U64, false), SyntheticFold),
+        (&[0, 1], &[1, 2], (T::U64, false), SyntheticFold),
     ];
     for (pk, group, col, want) in rows {
         assert_eq!(
@@ -501,12 +501,12 @@ fn output_layout_is_the_key_region_then_the_unspelled_row() {
     );
     // A natural key column is in the PK region, so it is not carried again.
     assert_eq!(
-        SingleNaturalCol.output_layout(&[2], 0..4),
+        Natural.output_layout(&[2], 0..4),
         vec![Key(2), Carried(0), Carried(1), Carried(3)]
     );
     // The PK list keys on every PK column.
     assert_eq!(
-        SourcePk.output_layout(&[0, 2], 0..4),
+        Natural.output_layout(&[0, 2], 0..4),
         vec![Key(0), Key(2), Carried(1), Carried(3)]
     );
     // A fold's row is its group set, a repeated column carried once per occurrence.

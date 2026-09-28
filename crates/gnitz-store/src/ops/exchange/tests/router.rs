@@ -1,5 +1,5 @@
 use super::*;
-use crate::ops::group_key::{GroupKeyCols, GroupOutKey};
+use crate::ops::group_key::GroupOutKey;
 use crate::schema::{Placement, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64};
 
@@ -152,8 +152,7 @@ fn test_scatter_key_packed_matches_image_routing() {
         assert_eq!(packed(&schema, &[1], &mb, 0), image, "U128 payload");
     }
 
-    // (6) single sub-column of a compound PK — the shape whose image comes from
-    // the group fold `GroupKeyCols::key_row` (its Pk arm is `opk_image`).
+    // (6) single sub-column of a compound PK.
     {
         let schema = SchemaDescriptor::new(
             &[
@@ -174,7 +173,8 @@ fn test_scatter_key_packed_matches_image_routing() {
         b.count += 1;
         let mb = b.as_mem_batch();
         for col in [0u32, 1u32] {
-            let image = worker_for_key(GroupKeyCols::new(&schema, &[col]).unwrap().key_row(&mb, 0), NW);
+            let (gk, _) = GroupOutKey::new(&schema, &[col], []).unwrap();
+            let image = worker_for_key(gk.identity(&mb, 0), NW);
             assert_eq!(packed(&schema, &[col], &mb, 0), image, "compound-PK sub-col {col}");
         }
     }
@@ -434,7 +434,7 @@ fn a_group_scatter_routes_each_row_to_its_output_pks_owner() {
         &[2, 0, 1],
         &[3, 0],
     ] {
-        let (gk, _) = GroupOutKey::for_group_cols(&schema, cols, []).expect("the fixture group keys");
+        let (gk, _) = GroupOutKey::new(&schema, cols, []).expect("the fixture group keys");
         let key = ScatterKey::new(ScatterSpec::GroupKey(cols), &schema).expect("the fixture key routes");
         let got = workers(&key, &schema, &mb, NW);
         for (row, &got) in got.iter().enumerate() {

@@ -1,7 +1,7 @@
 //! HIR → fold lowering: the ad-hoc read's reduce — or `SELECT DISTINCT`, a fold
-//! with no aggregate — as layout for a stateless `SyntheticFold` the client
-//! finishes. It shares `lower::reduce`'s rules and builds no evaluator. A DISTINCT
-//! the binder dropped, over rows already a set, lowers to no fold at all.
+//! with no aggregate — as layout for a stateless fold the client finishes. It
+//! shares `lower::reduce`'s rules, output key included, and builds no evaluator.
+//! A DISTINCT the binder dropped, over rows already a set, lowers to no fold.
 
 use super::super::physical::{self, Frame};
 use super::super::{as_col, split_filter, AggCol, ColId, HirExpr, ProjEntry, RelExpr};
@@ -9,7 +9,7 @@ use super::{keyed_frame, resolve_reduce_specs, ReduceSpecs};
 use crate::codec::project_schema::payload_map;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr};
-use gnitz_core::{ColumnDef, ReduceOutKey, Schema};
+use gnitz_core::{ColumnDef, Schema};
 use gnitz_wire::{AggReadSpec, ComputeMap};
 use std::sync::Arc;
 
@@ -24,9 +24,8 @@ pub(crate) struct FoldPieces {
     /// What the workers fold. It carries no cardinality COUNT: nothing stateless
     /// gates on one.
     pub(crate) agg: AggReadSpec,
-    /// The SyntheticFold partial-reply layout
-    /// (`[_group_pk | group cols | agg partials]`) the workers emit and every
-    /// `BoundExpr` below is written against.
+    /// The workers' partial reply, laid out as a view's reduce output over the
+    /// same group set; every `BoundExpr` below is written against it.
     pub(crate) partial_schema: Arc<Schema>,
     /// The fold sink's pre-map over the source schema, `None` when the reduce
     /// groups and aggregates source columns directly.
@@ -124,15 +123,8 @@ fn fold(
         }
     };
     let ReduceSpecs { group, specs, cols } = resolve_reduce_specs(group_cols, aggs, &reduce_in.layout)?;
-    // The partial reply layout, which every expression below resolves against: the
-    // fixed `SyntheticFold` key, then every group column in written order.
-    let partial = keyed_frame(
-        &reduce_in,
-        ReduceOutKey::SyntheticFold,
-        &group,
-        group.iter().copied(),
-        cols,
-    )?;
+    let group = reduce_in.schema.reduce_group(&group);
+    let partial = keyed_frame(&reduce_in, &group, group.iter().copied(), cols)?;
     let having = physical::resolve_preds(having, &partial.layout)?;
     let finalize = finalize
         .iter()

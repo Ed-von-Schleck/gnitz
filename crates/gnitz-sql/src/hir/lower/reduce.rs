@@ -33,7 +33,7 @@ pub(super) fn lower_reduce(
     let (node, reduce_in) = spine.emit(&mut cb, Top::Slots)?;
 
     let mut r = resolve_reduce_specs(group_cols, aggs, &reduce_in.layout)?;
-    let (out_key, group) = reduce_in.schema.reduce_key(&r.group);
+    let group = reduce_in.schema.reduce_group(&r.group);
     let ungrouped = group.is_empty();
     // The engine reads group existence off a COUNT(*); a hidden one if no
     // aggregate is one.
@@ -46,7 +46,7 @@ pub(super) fn lower_reduce(
     let reduced = cb.reduce_multi(node, &group, &r.specs, ungrouped);
 
     // HAVING over the raw reduce output, then the finalize projection.
-    let having_frame = keyed_frame(&reduce_in, out_key, &group, group.iter().copied(), r.cols)?;
+    let having_frame = keyed_frame(&reduce_in, &group, group.iter().copied(), r.cols)?;
     let filtered = emit_filter(&mut cb, reduced, having_preds, &having_frame)?;
     let (node, out) = project_front(&mut cb, filtered, items, &having_frame)?;
     // One row per group key, which the reduce output is keyed on.

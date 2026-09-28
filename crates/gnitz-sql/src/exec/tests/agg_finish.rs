@@ -40,8 +40,8 @@ fn spec(agg_op: WireAggFunc, col: usize, _: TypeCode) -> AggDescriptor {
     AggDescriptor { agg_op, col_idx: col as u32 }
 }
 
-/// The SyntheticFold partial layout over `source`: the hidden key, the group
-/// columns, then each spec's raw column.
+/// The synthetic-key partial layout over `source` — what a nullable or multi-column
+/// group set gets: the hidden key, the group columns, then each spec's raw column.
 fn partial_over(source: &Schema, group: &[usize], specs: &[AggDescriptor]) -> Schema {
     let mut cols = vec![group_pk_def()];
     cols.extend(group.iter().map(|&g| source.columns[g].clone()));
@@ -50,7 +50,7 @@ fn partial_over(source: &Schema, group: &[usize], specs: &[AggDescriptor]) -> Sc
             .iter()
             .map(|d| agg_col_def(d.agg_op, Some(&source.columns[d.col_idx as usize]), group.is_empty())),
     );
-    Schema::from_parts(cols, vec![0]).expect("the SyntheticFold layout is a valid client schema")
+    Schema::from_parts(cols, vec![0]).expect("the synthetic-key layout is a valid client schema")
 }
 
 fn partial_schema(group: &[usize], specs: &[AggDescriptor]) -> Schema {
@@ -383,4 +383,54 @@ fn avg_divides_an_unsigned_sum_unsigned() {
 #[test]
 fn avg_nulls_on_a_zero_count_companion() {
     assert_eq!(finish_avg(0, 0), None);
+}
+
+/// Keyed by a whole compound PK, every payload slot is an aggregate: rows sharing
+/// the key merge their aggregates, never a key column.
+#[test]
+fn a_whole_pk_natural_partial_merges_its_aggregates() {
+    let source = Schema {
+        columns: vec![
+            col("a", TypeCode::U64),
+            col("b", TypeCode::I32),
+            ncol("x", TypeCode::I64),
+        ],
+        pk_cols: vec![0, 1],
+    };
+    let specs = [
+        spec(WireAggFunc::Count, 0, TypeCode::I64),
+        spec(WireAggFunc::Sum, 2, TypeCode::I64),
+        spec(WireAggFunc::Min, 2, TypeCode::I64),
+    ];
+    let mut cols = vec![source.columns[0].clone(), source.columns[1].clone()];
+    cols.extend(
+        specs
+            .iter()
+            .map(|d| agg_col_def(d.agg_op, Some(&source.columns[d.col_idx as usize]), false)),
+    );
+    let partial = Schema::from_parts(cols, vec![0, 1]).unwrap();
+    let f = finish_of(&partial, &specs, &[], Vec::new());
+    let mut b = ZSetBatch::new(&partial);
+    for (key, n, sum, min) in [
+        ([7u128, (-1i32) as u32 as u128], 1i64, 10i64, 10i64),
+        ([7, 2], 2, 5, 1),
+        ([7, (-1i32) as u32 as u128], 3, 20, -4),
+    ] {
+        b.pks.push_natives(&partial, &key);
+        b.weights.push(1);
+        b.nulls.push(0);
+        for (pi, v) in [n, sum, min].into_iter().enumerate() {
+            b.payload[pi].bytes.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    let got = f.combine(b);
+
+    let mut want = PkColumn::empty_for_schema(&partial);
+    want.push_natives(&partial, &[7, (-1i32) as u32 as u128]);
+    want.push_natives(&partial, &[7, 2]);
+    assert_eq!(got.pks, want);
+    assert_eq!(ints(&got, 0), [4, 2]);
+    assert_eq!(ints(&got, 1), [30, 5]);
+    assert_eq!(ints(&got, 2), [-4, 1]);
 }

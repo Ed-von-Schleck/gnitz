@@ -6,6 +6,7 @@ use crate::schema::payload_order::compare_rows;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, Layout, ReadCursor, RowMark};
 
+use super::super::group_key::ground_pk;
 use super::agg::Accumulator;
 use super::emit::emit_reduce_row;
 use super::plan::ReducePlan;
@@ -33,7 +34,7 @@ pub fn op_reduce(
         // An empty source delivers only empty deltas, so the ground row is minted
         // here, by a worker `seeds_ground` names, and only while no V₀ row is stored.
         if plan.seeds_ground {
-            let v0 = shape.key.ground_pk();
+            let v0 = ground_pk();
             if !trace_out_cursor.seek_pk_group_ascending(v0.bytes()) {
                 let mut out = Batch::with_capacity(output_schema, 1);
                 emit_reduce_row(&mut out, None, v0.bytes(), &shape.acc_template);

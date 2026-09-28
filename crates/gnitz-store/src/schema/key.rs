@@ -1051,11 +1051,6 @@ impl ReindexPacker {
         Ok((packer, b))
     }
 
-    /// Pack the full reindex key (`out_stride` OPK bytes) for `row` into `dst`.
-    ///
-    /// One pass over the source columns, between the two key-level slots a
-    /// group key carries: the leading presence bitmap, whose bits are the NULL
-    /// tests the packed slots already perform, and the trailing fold.
     /// [`Self::pack_into`] over the leading `out_stride` bytes of `buf`,
     /// returning them — the prefix a group-keyed secondary index seeks by, so the
     /// key's width is read off the packer rather than re-sliced per index.
@@ -1066,6 +1061,11 @@ impl ReindexPacker {
         &buf[..n]
     }
 
+    /// Pack the full reindex key (`out_stride` OPK bytes) for `row` into `dst`.
+    ///
+    /// One pass over the source columns, between the two key-level slots a
+    /// group key carries: the leading presence bitmap, whose bits are the NULL
+    /// tests the packed slots already perform, and the trailing fold.
     #[inline]
     pub(crate) fn pack_into<R: RowSource>(&self, dst: &mut [u8], batch: &R, row: usize) {
         let null_word = batch.get_null_word(row);

@@ -128,11 +128,12 @@ def test_a_cut_over_a_bag_counts_logical_rows(client, src, tail, want):
 
 
 def test_a_grouped_views_hidden_key_is_not_a_positional_column(client, schema_name):
-    """A GROUP BY view carries a hidden `_group_pk`, so positional ORDER BY must
-    target the first VISIBLE column — and ORDER BY over the aggregate works."""
+    """A GROUP BY view over a nullable column carries a hidden `_group_pk`, so
+    positional ORDER BY must target the first VISIBLE column — and ORDER BY over
+    the aggregate works."""
     sn = schema_name
     client.execute_sql(
-        "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cat BIGINT NOT NULL); "
+        "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cat BIGINT); "
         "CREATE VIEW v AS SELECT cat, COUNT(*) AS cnt FROM orders GROUP BY cat; "
         "INSERT INTO orders VALUES (1,10),(2,10),(3,10),(4,20),(5,30),(6,30)",
         schema_name=sn)

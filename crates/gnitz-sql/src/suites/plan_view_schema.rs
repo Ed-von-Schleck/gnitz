@@ -575,9 +575,9 @@ fn an_aggregate_output_column_is_typed_by_its_argument_and_grouping() {
         ),
         (
             "SELECT grp, COUNT(*) AS n FROM evts GROUP BY grp",
-            sh(&[("_group_pk", true, false), ("grp", false, false), ("n", false, false)]),
+            sh(&[("grp", false, false), ("n", false, false)]),
             &[0],
-            &[TypeCode::U128, i, i],
+            &[i, i],
         ),
         // An extremum is one of its input values, so it keeps the source type.
         (

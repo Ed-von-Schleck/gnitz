@@ -1154,7 +1154,7 @@ fn rechurn_shapes(client: &mut GnitzClient, lo: i64, hi: i64) {
     sql(client, SH, &format!("DELETE FROM u WHERE id = {}", lo + 1));
 }
 
-/// The six view bodies of S1, each with the read that reaches past its `SELECT *`.
+/// The seven view bodies of S1, each with the read that reaches past its `SELECT *`.
 const SHAPE_VIEWS: &[(&str, &str, &str)] = &[
     (
         "v_join",
@@ -1170,6 +1170,12 @@ const SHAPE_VIEWS: &[(&str, &str, &str)] = &[
         "v_group",
         "SELECT tid, COUNT(*) AS n, SUM(w) AS total FROM u GROUP BY tid",
         "SELECT tid, total FROM v_group WHERE total > 200",
+    ),
+    (
+        // `w` is null-filled by the outer join, so this keys by `_group_pk`.
+        "v_group_null",
+        "SELECT w, COUNT(*) AS n FROM v_left GROUP BY w",
+        "SELECT w, n FROM v_group_null WHERE n > 1",
     ),
     (
         "v_except",

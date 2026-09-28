@@ -2,13 +2,12 @@
 //! FROM-less SELECT's constant row.
 //!
 //! The workers return one concatenated `ZSetBatch` of per-worker partial reduce
-//! rows in the SyntheticFold layout the fold lowering declares:
-//! `[_group_pk U128 (hidden PK) | group cols | one partial per physical agg spec]`.
+//! rows, in the layout the fold lowering declares.
 //! [`FoldFinish::combine`] folds them into one row per group in place.
 //! [`FoldFinish::apply`] then runs the two
 //! operators a grouped view runs over its reduce output — the HAVING filter and
 //! the finalize map, compiled as a view's are. Every output row keeps the
-//! engine's `_group_pk`, which makes a tied ORDER BY / LIMIT a function of the
+//! output key, which makes a tied ORDER BY / LIMIT a function of the
 //! data alone.
 //!
 //! A float SUM adds the partials in reply order, so its low bits follow the
@@ -18,7 +17,7 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
-use gnitz_core::{ColumnDef, Schema, ZSetBatch};
+use gnitz_core::{ColumnDef, PkBuf, Schema, ZSetBatch};
 use gnitz_expr::{ColumnLocator, RowFilter, SchemaFacts};
 use gnitz_wire::{read_u64_le, write_u64_le, AggFunc as WireAggFunc};
 use rustc_hash::FxHashMap;
@@ -34,7 +33,7 @@ use crate::ir::BoundExpr;
 pub(crate) struct FoldFinish {
     /// The partial reply layout; the combined groups keep it, HAVING and finalize read it.
     pub(crate) partial_schema: Arc<Schema>,
-    /// `[_group_pk (hidden PK) | finalize items]`.
+    /// The finalized result, keyed by the output key.
     pub(crate) out_schema: Arc<Schema>,
     /// Per physical agg spec, in partial order: the ordering by which a partial replaces the
     /// held value, `None` for a summing merge.
@@ -82,18 +81,15 @@ impl FoldFinish {
     pub(crate) fn combine(&self, mut partial: ZSetBatch) -> ZSetBatch {
         let schema = self.partial_schema.as_ref();
         let n_group = schema.num_payload_cols() - self.merge.len();
-        let locs: Vec<ColumnLocator> = (1..schema.columns.len())
-            .map(|ci| SchemaFacts::locate(schema, ci))
-            .collect();
-        let agg_locs = &locs[n_group..];
-        // `_group_pk` → the group's first row. The key is the group's identity, as it is on the
-        // view path.
-        let mut first_of: FxHashMap<u128, usize> =
+        let payload = schema.payload_locators();
+        let agg_locs = &payload[n_group..];
+        // Output key → the group's first row.
+        let mut first_of: FxHashMap<PkBuf, usize> =
             FxHashMap::with_capacity_and_hasher(partial.len(), Default::default());
         let mut keep: Vec<(usize, usize)> = Vec::new();
         for row in 0..partial.len() {
             debug_assert_eq!(partial.weights[row], 1, "a fold partial is one reduce row");
-            let key = u128::from_le_bytes(partial.pks.get_bytes(row).try_into().expect("_group_pk is 16 bytes"));
+            let key = PkBuf::from_bytes(partial.pks.get_bytes(row));
             match first_of.entry(key) {
                 Entry::Occupied(e) => {
                     let first = *e.get();

@@ -156,10 +156,11 @@ fn qualify_filters_on_window_values_and_select_aliases() {
     ] {
         plan(sql).unwrap_or_else(|e| panic!("{sql}\n  {e:?}"));
     }
+    // The partition key `k` is the view's natural PK, so it leads.
     let (_, cols) = plan("SELECT id, k FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY k ORDER BY a) = 1").unwrap();
     assert_eq!(
         visible(&cols),
-        vec![("id".into(), TypeCode::I64, false), ("k".into(), TypeCode::I64, false)]
+        vec![("k".into(), TypeCode::I64, false), ("id".into(), TypeCode::I64, false)]
     );
 }
 
