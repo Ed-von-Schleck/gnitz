@@ -69,9 +69,8 @@ pub(crate) struct Cte {
 }
 
 /// A body that only renames its source's visible columns, in order, collapses
-/// to that source under the new names: the projection carries no work, and an
-/// alias over the source reads it in place where an alias over the projection
-/// would cut a copy. Any other body is returned as it is, under its own defs.
+/// to that source under the new names, hidden columns included. Any other body
+/// is returned as it is, under its own defs.
 fn collapse_identity(rel: Rc<RelExpr>) -> (Rc<RelExpr>, Vec<ColumnDef>) {
     if let RelExpr::Project { input, items } = rel.as_ref() {
         let in_cols = input.cols();
@@ -1493,8 +1492,8 @@ pub(crate) fn bind_adhoc_fold(
 
 /// An ad-hoc SELECT list bound by [`bind_adhoc_projection`].
 pub(crate) struct AdhocProjection {
-    /// The source layout the items' `ColId`s resolve against.
-    pub layout: Vec<ColId>,
+    /// The source `Get`'s columns, which the items' `ColId`s name.
+    pub source: Vec<HirCol>,
     pub items: Vec<ProjEntry>,
     /// The item each ORDER BY expression key sorts on.
     pub placed: Vec<usize>,
@@ -1537,11 +1536,7 @@ pub(crate) fn bind_adhoc_projection(
         sub: SubPolicy::PerKind,
     };
     let placed = place_order_keys(order_exprs, &mut items, ids, &order_leaf)?;
-    Ok(AdhocProjection {
-        layout: cols.iter().map(|c| c.id).collect(),
-        items,
-        placed,
-    })
+    Ok(AdhocProjection { source: scope.combined, items, placed })
 }
 
 /// The `Get` an ad-hoc body binds over and the one-relation scope its names

@@ -20,11 +20,11 @@ mod setop;
 mod spine;
 mod topn;
 
-use super::physical::{self, Frame};
-use super::{slots_of, split_filter, AggCol, ColId, HirCol, HirExpr, ProjEntry, RelExpr};
+use super::physical::{self, Frame, Rename};
+use super::{col_by_id, split_filter, AggCol, ColId, HirCol, HirExpr, ProjEntry, RelExpr};
 use super::{JoinClass, JoinShape, JoinType};
 use crate::agg::group_pk_def;
-use crate::codec::project_schema::{payload_map, ProjItem};
+use crate::codec::project_schema::{compute_map, payload_program, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 pub(crate) use chain::{EmitPieces, ViewChain};
@@ -40,36 +40,40 @@ use std::sync::Arc;
 /// its group columns as reduce-input positions, and one spec per distinct
 /// physical aggregate column beside the output column it produces.
 pub(crate) struct ReduceSpecs {
-    /// Group columns as reduce-input positions, in GROUP BY order.
+    /// Group columns as reduce-input positions, normalized.
     pub(crate) group: Vec<u32>,
     pub(crate) specs: Vec<AggDescriptor>,
-    /// Each spec's output column, parallel to `specs`.
-    pub(crate) cols: Vec<HirCol>,
+    /// Each spec's output column, parallel to `specs`; `None` for one no reference
+    /// names.
+    pub(crate) cols: Vec<(Option<ColId>, ColumnDef)>,
 }
 
 impl ReduceSpecs {
-    pub(crate) fn push(&mut self, spec: AggDescriptor, col: HirCol) {
+    pub(crate) fn push(&mut self, spec: AggDescriptor, id: Option<ColId>, def: ColumnDef) {
         self.specs.push(spec);
-        self.cols.push(col);
+        self.cols.push((id, def));
     }
 }
 
-/// Resolve a `Reduce`'s group and aggregate columns against its input's layout.
+/// Resolve a `Reduce`'s group and aggregate columns against its input.
 pub(crate) fn resolve_reduce_specs(
     group_cols: &[ColId],
     aggs: &[AggCol],
-    layout: &[ColId],
+    input: &Frame,
 ) -> Result<ReduceSpecs, GnitzSqlError> {
-    let group = slots_of(layout, group_cols)?.into_iter().map(|c| c as u32).collect();
     let mut r = ReduceSpecs {
-        group,
+        group: input.reduce_group(group_cols)?,
         specs: Vec::with_capacity(aggs.len() + 1),
         cols: Vec::with_capacity(aggs.len() + 1),
     };
     for c in aggs {
         // COUNT(*) reads no column; slot 0 is the placeholder.
-        let col_idx = c.arg.map(|id| super::slot_of(layout, id)).transpose()?.unwrap_or(0) as u32;
-        r.push(AggDescriptor { agg_op: c.op, col_idx }, c.col.clone());
+        let col_idx = c.arg.map(|id| input.slot(id)).transpose()?.unwrap_or(0) as u32;
+        r.push(
+            AggDescriptor { agg_op: c.op, col_idx },
+            Some(c.col.id),
+            c.col.def.clone(),
+        );
     }
     Ok(r)
 }
@@ -80,23 +84,17 @@ pub(crate) fn keyed_frame(
     input: &Frame,
     group: &[u32],
     row: impl IntoIterator<Item = u32>,
-    tail: Vec<HirCol>,
+    tail: Vec<(Option<ColId>, ColumnDef)>,
 ) -> Result<Frame, GnitzSqlError> {
-    let (mut layout, mut cols, mut npk) = (Vec::new(), Vec::new(), 0usize);
-    for slot in input.schema.reduce_out_key(group).output_layout(group, row) {
-        let (id, def) = match slot {
-            ReduceOutSlot::SyntheticKey => (ColId::NONE, group_pk_def()),
-            ReduceOutSlot::Key(c) | ReduceOutSlot::Carried(c) => {
-                (input.layout[c as usize], input.schema.columns[c as usize].clone())
-            }
-        };
-        npk += usize::from(!matches!(slot, ReduceOutSlot::Carried(_)));
-        layout.push(id);
-        cols.push(def);
-    }
-    layout.extend(tail.iter().map(|c| c.id));
-    cols.extend(tail.into_iter().map(|c| c.def));
-    Frame::leading(layout, cols, npk)
+    let slots = input.schema.reduce_out_key(group).output_layout(group, row);
+    let npk = slots.iter().filter(|s| !matches!(s, ReduceOutSlot::Carried(_))).count();
+    let lead = slots.into_iter().map(|s| match s {
+        ReduceOutSlot::SyntheticKey => (None, group_pk_def()),
+        ReduceOutSlot::Key(c) | ReduceOutSlot::Carried(c) => {
+            (input.layout[c as usize], input.schema.columns[c as usize].clone())
+        }
+    });
+    Frame::new(lead.chain(tail), npk)
 }
 
 /// The downstream demand on a combine's output: the final projection and the
@@ -119,6 +117,15 @@ impl Demand<'_> {
 pub(crate) struct SegInput {
     pub src: SegSource,
     pub frame: Frame,
+}
+
+impl SegInput {
+    fn renamed(self, rename: &Rename) -> Result<SegInput, GnitzSqlError> {
+        Ok(SegInput {
+            frame: self.frame.renamed(rename)?,
+            src: self.src,
+        })
+    }
 }
 
 /// Where a [`SegInput`]'s rows come from.
@@ -176,7 +183,7 @@ fn emit_projection(
         .map(|i| i.passthrough_src().filter(|&c| !input.is_pk_col(c)).map(|c| c as u32))
         .collect();
     let Some(payload) = payload else {
-        return Ok(cb.map_expr(node, payload_map(items, out, input)?));
+        return Ok(cb.map_expr(node, compute_map(payload_program(items, out, input)?, out)));
     };
     let identity =
         items.len() == input.columns.len() && items.iter().enumerate().all(|(i, it)| it.passthrough_src() == Some(i));
@@ -191,15 +198,22 @@ pub(crate) fn project_front(
     items: &[ProjEntry],
     input: &Frame,
 ) -> Result<(gnitz_core::NodeId, Frame), GnitzSqlError> {
-    let proj = physical::physicalize_projection(items, &input.layout, &input.schema)?;
-    let node = emit_projection(cb, node, &proj.items, &proj.out.schema, &input.schema)?;
-    Ok((node, proj.out))
+    let (items, out) = physical::physicalize_projection(items, input)?;
+    let node = emit_projection(cb, node, &items, &out.schema, &input.schema)?;
+    Ok((node, out))
 }
 
-/// Lower a bound view body to its bundle.
-pub(crate) fn lower(rel: Rc<RelExpr>, bounded: bool) -> Result<ViewBundle, GnitzSqlError> {
+/// Lower a bound view body to its bundle, each output column carrying the name
+/// its column of `names` gives it.
+pub(crate) fn lower(rel: Rc<RelExpr>, bounded: bool, names: &[HirCol]) -> Result<ViewBundle, GnitzSqlError> {
     let mut chain = ViewChain::default();
-    let top = lower_body(&mut chain, &rel)?;
+    let mut top = lower_body(&mut chain, &rel)?;
+    let schema = Arc::make_mut(&mut top.out.schema);
+    for (slot, id) in top.out.layout.iter().enumerate() {
+        if let Some(c) = id.and_then(|id| col_by_id(names, id)) {
+            schema.columns[slot].name = c.def.name.clone();
+        }
+    }
     // A body whose inputs cut a segment of their own bounds a view over unbounded copies.
     if bounded && chain.has_segments() {
         return Err(GnitzSqlError::Rejected(
@@ -242,38 +256,30 @@ fn lowered_whole(rel: &RelExpr) -> bool {
     matches!(rel, RelExpr::Join { .. } | RelExpr::Reduce { .. })
 }
 
-/// `input` read in place: a catalog `Get`, or an alias of its input's source (cut
-/// whole, since every alias reads that one segment) under the alias's ids.
+/// `input` read in place: a catalog `Get`, or a rename of what is read in place.
+/// An alias renames its input's source, which is cut whole when it is not read
+/// in place.
 pub(crate) fn resolve_in_place(chain: &mut ViewChain, input: &Rc<RelExpr>) -> Result<Option<SegInput>, GnitzSqlError> {
     match input.as_ref() {
         RelExpr::Get { desc, cols } => Ok(Some(SegInput {
             src: SegSource::Catalog(Arc::clone(desc)),
-            frame: Frame {
-                layout: cols.iter().map(|c| c.id).collect(),
-                schema: Arc::clone(&desc.schema),
-            },
+            frame: Frame::scan(desc, cols),
         })),
+        RelExpr::Project { input, items } => {
+            let Some(rename) = Rename::of(items) else {
+                return Ok(None);
+            };
+            resolve_in_place(chain, input)?
+                .map(|seg| seg.renamed(&rename))
+                .transpose()
+        }
         RelExpr::Alias { input: inner, cols } => {
             let inner_cols = inner.cols();
-            let all: HashSet<ColId> = inner_cols.iter().map(|c| c.id).collect();
-            let SegInput { src, frame } = match resolve_in_place(chain, inner)? {
+            let seg = match resolve_in_place(chain, inner)? {
                 Some(seg) => seg,
-                None => cut_segment(chain, inner, &all)?,
+                None => cut_segment(chain, inner, &inner_cols.iter().map(|c| c.id).collect())?,
             };
-            let layout = frame
-                .layout
-                .iter()
-                .map(|id| {
-                    inner_cols
-                        .iter()
-                        .position(|c| c.id == *id)
-                        .map_or(ColId::NONE, |p| cols[p].id)
-                })
-                .collect();
-            Ok(Some(SegInput {
-                src,
-                frame: Frame { layout, schema: frame.schema },
-            }))
+            seg.renamed(&Rename::alias(&inner_cols, cols)).map(Some)
         }
         _ => Ok(None),
     }
@@ -346,13 +352,13 @@ fn filter(
 
 /// Resolve `preds` against `frame` and emit the filter. Shared by the emits that
 /// filter an already-emitted node: HAVING, and the WHERE over each join branch.
-pub(crate) fn emit_filter<'a>(
+pub(crate) fn emit_filter(
     cb: &mut gnitz_core::Circuit,
     node: gnitz_core::NodeId,
-    preds: impl IntoIterator<Item = &'a HirExpr>,
+    preds: &[HirExpr],
     frame: &Frame,
 ) -> Result<gnitz_core::NodeId, GnitzSqlError> {
-    filter(cb, node, &physical::resolve_preds(preds, &frame.layout)?, &frame.schema)
+    filter(cb, node, &frame.resolve_preds(preds)?, &frame.schema)
 }
 
 /// A join's two inputs opened through the spine and emitted into `cb`, each
@@ -437,7 +443,7 @@ impl JoinSide {
     }
 
     /// The kept payload's `ColId`s, in keep order.
-    pub(crate) fn ids(&self) -> impl Iterator<Item = ColId> + '_ {
+    pub(crate) fn ids(&self) -> impl Iterator<Item = Option<ColId>> + '_ {
         self.keep.iter().map(|&i| self.frame.layout[i as usize])
     }
 
@@ -466,16 +472,14 @@ pub(crate) fn join_sides(
 ) -> Result<[JoinSide; 2], GnitzSqlError> {
     let [left, right] = inputs;
     let [origin_l, origin_r] = origins;
-    let key = |frame: &Frame, is_left| slots_of(&frame.layout, &class.key_cols(is_left).collect::<Vec<_>>());
-    let keys = [key(&left, true)?, key(&right, false)?];
-    let (left_layout, right_layout) = (&left.layout, &right.layout);
+    let keys = [left.slots(class.key_cols(true))?, right.slots(class.key_cols(false))?];
     // One keep list per side, so a rule cannot write into the region another rule
     // owns.
-    let mut keep = [vec![false; left_layout.len()], vec![false; right_layout.len()]];
+    let mut keep = [vec![false; left.layout.len()], vec![false; right.layout.len()]];
     let mark = |keep: &mut [Vec<bool>; 2], id: ColId| {
-        if let Some(p) = left_layout.iter().position(|c| *c == id) {
+        if let Ok(p) = left.slot(id) {
             keep[0][p] = true;
-        } else if let Some(p) = right_layout.iter().position(|c| *c == id) {
+        } else if let Ok(p) = right.slot(id) {
             keep[1][p] = true;
         }
         // An id in neither layout is the mark column, which the shell substitutes

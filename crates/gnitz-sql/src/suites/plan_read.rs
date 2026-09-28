@@ -568,6 +568,19 @@ fn a_reads_reply_schema_hides_the_source_pk_behind_the_select_list() {
     }
 }
 
+/// `SELECT *` over a table at the column cap reads the table's own layout.
+#[test]
+fn a_reproducing_read_at_the_column_cap_ships_no_program() {
+    let i = TypeCode::I64;
+    let mut cols = vec![col("id", i)];
+    cols.extend((1..gnitz_wire::MAX_COLUMNS).map(|n| col(&format!("c{n}"), i)));
+    let wide = table(70, cols, vec![0]);
+    let cat = catalog(vec![("wide", std::sync::Arc::clone(&wide))]);
+    let plan = read(&cat, "SELECT * FROM wide").unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(plan.reply_schema(), wide.schema.as_ref());
+    assert!(plan.spec().expect("a relation read").sink.map.is_none());
+}
+
 // ── Rejections ───────────────────────────────────────────────────────────────
 
 /// Reads rejected at plan time, each with the guard that owns it.

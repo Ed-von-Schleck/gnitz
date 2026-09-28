@@ -1,14 +1,15 @@
 //! The positional pass, run at lowering. Assigns physical column positions to
-//! the layout-free logical IR: it substitutes each `ColId` leaf with a
-//! `ColRef(position)` against a node's column layout, and physicalizes a
-//! projection (the pass-through/computed split + the PK-front convention, whose
-//! single home is `place_pk_front`).
+//! the layout-free logical IR: [`Frame`] substitutes each `ColId` leaf with a
+//! `ColRef(position)` against a node's column layout, and
+//! [`physicalize_projection`] physicalizes a projection (the pass-through/computed
+//! split + the PK-front convention, whose single home is `place_pk_front`).
 
-use super::{slot_of, ColId, HirExpr, ProjEntry};
-use crate::codec::project_schema::{place_pk_front, ProjItem};
+use super::{as_col, ColId, HirCol, HirExpr, ProjEntry};
+use crate::codec::project_schema::{leading_schema, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use gnitz_core::{ColumnDef, Schema};
+use gnitz_core::{ColumnDef, RelDescriptor, Schema};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// A relation's physical addressing: the `ColId` at each slot and the schema
@@ -16,86 +17,162 @@ use std::sync::Arc;
 /// typed against `schema` at that position, so the two travel as one value.
 #[derive(Clone)]
 pub(crate) struct Frame {
-    pub(crate) layout: Vec<ColId>,
+    /// `None` at a slot no reference can name.
+    pub(crate) layout: Vec<Option<ColId>>,
     pub(crate) schema: Arc<Schema>,
 }
 
 impl Frame {
-    /// `columns` behind a leading key region of `npk` slots, admitted as a schema
-    /// the engine can hold.
-    pub(crate) fn leading(layout: Vec<ColId>, columns: Vec<ColumnDef>, npk: usize) -> Result<Frame, GnitzSqlError> {
-        debug_assert_eq!(layout.len(), columns.len(), "a frame's two halves are parallel");
-        let schema = Schema::from_parts(columns, (0..npk as u32).collect())
-            .map_err(|e| GnitzSqlError::Rejected(format!("planned relation: {e}")))?;
-        Ok(Frame { layout, schema: Arc::new(schema) })
+    /// `slots` behind a leading key region of `npk`, admitted as a schema the
+    /// engine can hold.
+    pub(crate) fn new(
+        slots: impl IntoIterator<Item = (Option<ColId>, ColumnDef)>,
+        npk: usize,
+    ) -> Result<Frame, GnitzSqlError> {
+        let (layout, columns): (Vec<_>, Vec<_>) = slots.into_iter().unzip();
+        Ok(Frame {
+            layout,
+            schema: Arc::new(leading_schema(columns, npk)?),
+        })
     }
 
-    /// `pk_cols` as the leading key region — identity-free slots nothing can
-    /// reference — then one iterator of `(id, def)` driving both halves.
+    /// `pk_cols` as an identity-free leading key region, then `payload`.
     pub(crate) fn keyed(
         pk_cols: Vec<ColumnDef>,
-        payload: impl IntoIterator<Item = (ColId, ColumnDef)>,
+        payload: impl IntoIterator<Item = (Option<ColId>, ColumnDef)>,
     ) -> Result<Frame, GnitzSqlError> {
         let npk = pk_cols.len();
-        let mut layout = vec![ColId::NONE; npk];
-        let mut columns = pk_cols;
-        for (id, def) in payload {
-            layout.push(id);
-            columns.push(def);
+        Frame::new(pk_cols.into_iter().map(|d| (None, d)).chain(payload), npk)
+    }
+
+    /// A catalog relation read under its `Get`'s ids.
+    pub(crate) fn scan(desc: &RelDescriptor, cols: &[HirCol]) -> Frame {
+        Frame {
+            layout: cols.iter().map(|c| Some(c.id)).collect(),
+            schema: Arc::clone(&desc.schema),
         }
-        Frame::leading(layout, columns, npk)
     }
 
-    /// The key region's width.
-    pub(crate) fn npk(&self) -> usize {
-        self.schema.pk_cols.len()
+    /// The slot `id` names. A `ColId` with no slot is an internal compile error.
+    pub(crate) fn slot(&self, id: ColId) -> Result<usize, GnitzSqlError> {
+        self.layout
+            .iter()
+            .position(|c| *c == Some(id))
+            .ok_or_else(|| GnitzSqlError::Internal("HIR column reference has no layout slot".into()))
+    }
+
+    /// [`Self::slot`] for each of `ids`, in order.
+    pub(crate) fn slots(&self, ids: impl IntoIterator<Item = ColId>) -> Result<Vec<usize>, GnitzSqlError> {
+        ids.into_iter().map(|id| self.slot(id)).collect()
+    }
+
+    /// The reduce group over `ids`' slots, normalized by `Schema::reduce_group`.
+    pub(crate) fn reduce_group(&self, ids: &[ColId]) -> Result<Vec<u32>, GnitzSqlError> {
+        let written: Vec<u32> = self.slots(ids.iter().copied())?.into_iter().map(|c| c as u32).collect();
+        Ok(self.schema.reduce_group(&written))
+    }
+
+    /// `expr` with every `ColId` leaf substituted by `ColRef(its slot)`.
+    pub(crate) fn resolve(&self, expr: &HirExpr) -> Result<BoundExpr, GnitzSqlError> {
+        expr.try_rebuild(&mut |id| self.slot(*id).map(BoundExpr::ColRef))
+    }
+
+    /// [`Self::resolve`] for each conjunct.
+    pub(crate) fn resolve_preds(&self, preds: &[HirExpr]) -> Result<Vec<BoundExpr>, GnitzSqlError> {
+        preds.iter().map(|p| self.resolve(p)).collect()
+    }
+
+    /// This frame under `rename`'s identities. A slot it does not name loses its
+    /// identity.
+    pub(crate) fn renamed(&self, rename: &Rename) -> Result<Frame, GnitzSqlError> {
+        let mut layout = vec![None; self.layout.len()];
+        let mut columns = self.schema.columns.clone();
+        for (src, out) in &rename.0 {
+            let slot = self.slot(*src)?;
+            layout[slot] = Some(out.id);
+            columns[slot] = out.def.clone();
+        }
+        Ok(Frame {
+            layout,
+            schema: Arc::new(Schema {
+                columns,
+                pk_cols: self.schema.pk_cols.clone(),
+            }),
+        })
     }
 }
 
-/// Substitute every `ColId` leaf with `ColRef(position of id in layout)`. A
-/// `ColId` with no layout slot is an internal compile error.
-pub(crate) fn resolve_refs(expr: &HirExpr, layout: &[ColId]) -> Result<BoundExpr, GnitzSqlError> {
-    expr.try_rebuild(&mut |id| slot_of(layout, *id).map(BoundExpr::ColRef))
+/// A projection that moves no data: each output column is a distinct input
+/// column under a new identity.
+pub(crate) struct Rename(Vec<(ColId, HirCol)>);
+
+impl Rename {
+    /// `items` as a rename, `None` unless each is a bare column, no column twice.
+    pub(crate) fn of(items: &[ProjEntry]) -> Option<Rename> {
+        let mut seen = HashSet::new();
+        items
+            .iter()
+            .map(|it| Some((as_col(&it.expr).filter(|id| seen.insert(*id))?, it.out.clone())))
+            .collect::<Option<_>>()
+            .map(Rename)
+    }
+
+    /// A relation's columns `inner` under `outer`, position by position.
+    pub(crate) fn alias(inner: &[HirCol], outer: &[HirCol]) -> Rename {
+        Rename(inner.iter().map(|c| c.id).zip(outer.iter().cloned()).collect())
+    }
 }
 
-/// Resolve each conjunct against `layout`. The list is what the scan bound and
-/// every filter emit consume; nothing folds it into a tree.
-pub(crate) fn resolve_preds<'a>(
-    preds: impl IntoIterator<Item = &'a HirExpr>,
-    layout: &[ColId],
-) -> Result<Vec<BoundExpr>, GnitzSqlError> {
-    preds.into_iter().map(|p| resolve_refs(p, layout)).collect()
+/// A projection's slots over `input`, in output order: each entry resolved and
+/// classified, then the input's PK pinned to the leading slots.
+pub(crate) fn project_slots(
+    items: &[ProjEntry],
+    input: &Frame,
+) -> Result<Vec<(ProjItem, Option<ColId>, ColumnDef)>, GnitzSqlError> {
+    let mut slots = items
+        .iter()
+        .map(|e| {
+            Ok((
+                ProjItem::from_bound(input.resolve(&e.expr)?),
+                Some(e.out.id),
+                e.out.def.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, GnitzSqlError>>()?;
+    place_pk_front(&mut slots, &input.schema);
+    Ok(slots)
 }
 
-/// A physicalized projection: the emission items and the output frame.
-pub(crate) struct PhysProjection {
-    pub items: Vec<ProjItem>,
-    pub out: Frame,
-}
-
-/// Physicalize a projection over `input_layout` / `input_schema`, the source PK
-/// pinned to the leading slots; an auto-prepended PK slot has no identity.
+/// [`project_slots`] as emission items and the output frame.
 pub(crate) fn physicalize_projection(
     items: &[ProjEntry],
-    input_layout: &[ColId],
-    input_schema: &Schema,
-) -> Result<PhysProjection, GnitzSqlError> {
-    let mut proj_items: Vec<ProjItem> = Vec::with_capacity(items.len());
-    let mut out_cols: Vec<ColumnDef> = Vec::with_capacity(items.len());
-    for entry in items {
-        proj_items.push(ProjItem::from_bound(resolve_refs(&entry.expr, input_layout)?));
-        out_cols.push(entry.out.def.clone());
-    }
-    let perm = place_pk_front(&mut proj_items, &mut out_cols, input_schema);
-    let layout = perm
+    input: &Frame,
+) -> Result<(Vec<ProjItem>, Frame), GnitzSqlError> {
+    let (proj, cols): (Vec<_>, Vec<_>) = project_slots(items, input)?
         .into_iter()
-        .map(|src| match src {
-            Some(i) => items[i].out.id,
-            None => ColId::NONE,
-        })
-        .collect();
-    Ok(PhysProjection {
-        items: proj_items,
-        out: Frame::leading(layout, out_cols, input_schema.pk_count())?,
-    })
+        .map(|(item, id, def)| (item, (id, def)))
+        .unzip();
+    Ok((proj, Frame::new(cols, input.schema.pk_count())?))
 }
+
+/// Pin the source PK to slots `0..k` in PK-list order, as the engine's
+/// `project_schema` does: each PK column's first pass-through moves there, and
+/// one nothing passes through is prepended hidden.
+fn place_pk_front(slots: &mut Vec<(ProjItem, Option<ColId>, ColumnDef)>, source: &Schema) {
+    for (target, &pk) in source.pk_cols.iter().enumerate() {
+        let pk = pk as usize;
+        let slot = match slots.iter().position(|(item, ..)| item.passthrough_src() == Some(pk)) {
+            Some(pos) => slots.remove(pos),
+            None => (
+                ProjItem::PassThrough { src_col: pk },
+                None,
+                source.columns[pk].clone().hidden(),
+            ),
+        };
+        slots.insert(target, slot);
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/physical.rs"]
+mod tests;

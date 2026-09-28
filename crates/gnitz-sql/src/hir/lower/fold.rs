@@ -6,7 +6,7 @@
 use super::super::physical::{self, Frame};
 use super::super::{as_col, split_filter, AggCol, ColId, HirExpr, ProjEntry, RelExpr};
 use super::{keyed_frame, resolve_reduce_specs, ReduceSpecs};
-use crate::codec::project_schema::payload_map;
+use crate::codec::project_schema::{compute_map, payload_program};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr};
 use gnitz_core::{ColumnDef, Schema};
@@ -48,10 +48,7 @@ fn source_frame(base: &RelExpr) -> Result<Frame, GnitzSqlError> {
             "an ad-hoc fold body does not read a relation".into(),
         ));
     };
-    Ok(Frame {
-        layout: cols.iter().map(|c| c.id).collect(),
-        schema: Arc::clone(&desc.schema),
-    })
+    Ok(Frame::scan(desc, cols))
 }
 
 /// Lower a bound ad-hoc grouped or `SELECT DISTINCT` body to its fold pieces; `None`
@@ -117,18 +114,17 @@ fn fold(
     let (reduce_in, map) = match pre {
         None => (src, None),
         Some(items) => {
-            let p = physical::physicalize_projection(items, &src.layout, &src.schema)?;
-            let map = payload_map(&p.items, &p.out.schema, &src.schema)?;
-            (p.out, Some(map))
+            let (items, out) = physical::physicalize_projection(items, &src)?;
+            let map = compute_map(payload_program(&items, &out.schema, &src.schema)?, &out.schema);
+            (out, Some(map))
         }
     };
-    let ReduceSpecs { group, specs, cols } = resolve_reduce_specs(group_cols, aggs, &reduce_in.layout)?;
-    let group = reduce_in.schema.reduce_group(&group);
+    let ReduceSpecs { group, specs, cols } = resolve_reduce_specs(group_cols, aggs, &reduce_in)?;
     let partial = keyed_frame(&reduce_in, &group, group.iter().copied(), cols)?;
-    let having = physical::resolve_preds(having, &partial.layout)?;
+    let having = partial.resolve_preds(having)?;
     let finalize = finalize
         .iter()
-        .map(|e| Ok((physical::resolve_refs(&e.expr, &partial.layout)?, e.out.def.clone())))
+        .map(|e| Ok((partial.resolve(&e.expr)?, e.out.def.clone())))
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
     Ok(FoldPieces {
         reduce_schema: reduce_in.schema,

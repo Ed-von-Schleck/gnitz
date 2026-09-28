@@ -18,7 +18,7 @@ fn v_then_k(src: &Schema) -> ClientMap {
         ProjItem::PassThrough { src_col: 0 },
     ];
     let cols = vec![src.columns[1].clone(), src.columns[0].clone()];
-    let (out, program) = reply_program(&items, cols, src, "test").unwrap();
+    let (out, program) = reply_program(&items, cols, src).unwrap();
     ClientMap::new(program, src, Arc::new(out)).unwrap()
 }
 

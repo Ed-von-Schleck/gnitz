@@ -1,7 +1,7 @@
 //! The set-operation and DISTINCT shell: each leaf, opened through the spine, is
 //! content-hashed to a synthetic PK and combined by weight arithmetic.
 
-use super::super::{slots_of, ColId, HirCol, RelExpr, SetOpKind};
+use super::super::{ColId, HirCol, RelExpr, SetOpKind};
 use super::spine::{open, Top};
 use super::{EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
@@ -91,7 +91,8 @@ fn hashed_side(
 ) -> Result<NodeId, GnitzSqlError> {
     let ids: Vec<ColId> = side.cols().iter().map(|c| c.id).collect();
     let (node, frame) = open(chain, side, &ids.iter().copied().collect())?.emit(cb, Top::Slots)?;
-    let key: Vec<ReindexSlot> = slots_of(&frame.layout, &ids)?
+    let key: Vec<ReindexSlot> = frame
+        .slots(ids.iter().copied())?
         .into_iter()
         .zip(out)
         .map(|(s, o)| {
@@ -109,7 +110,7 @@ fn hashed_pieces(cb: Circuit, top: NodeId, pk_name: &str, cols: &[HirCol]) -> Re
         top,
         out: Frame::keyed(
             vec![ColumnDef::new(pk_name, TypeCode::U128, false).hidden()],
-            cols.iter().map(|c| (c.id, c.def.clone())),
+            cols.iter().map(|c| (Some(c.id), c.def.clone())),
         )?,
         // A content hash identifies its own row.
         pk_repeats: false,

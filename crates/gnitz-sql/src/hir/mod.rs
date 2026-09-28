@@ -35,17 +35,21 @@ use std::sync::Arc;
 /// `RelExpr` tree, and lower it to its view bundle. A CTE is a subtree of that
 /// tree shared by every `Alias` naming it, so nothing compiles before the tree is
 /// whole.
-pub(crate) fn bind_and_lower(
+pub(crate) fn bind_and_lower<'a>(
     cat: &crate::bind::Catalog<'_>,
     query: &sqlparser::ast::Query,
     view: bind::ViewBody,
     bounded: bool,
+    aliases: impl ExactSizeIterator<Item = &'a sqlparser::ast::Ident>,
 ) -> Result<ViewBundle, GnitzSqlError> {
     let ids = ColIdGen::new();
+    let stmt = view.stmt;
     let mut cx = bind::BindCx::new(cat, &ids, view);
     bind::bind_ctes(&mut cx, query)?;
     let rel = bind::bind_query(&mut cx, query)?;
-    lower::lower(rel, bounded)
+    let mut names = rel.cols();
+    crate::bind::apply_positional_aliases(aliases, names.iter_mut().map(|c| &mut c.def), stmt)?;
+    lower::lower(rel, bounded, &names)
 }
 
 /// The ad-hoc read path's entry to the same core: bind a single-relation grouped
@@ -90,15 +94,12 @@ pub(crate) fn bind_adhoc_rows(
 ) -> Result<AdhocRows, GnitzSqlError> {
     let ids = ColIdGen::new();
     let bound = bind::bind_adhoc_projection(&ids, projection, Arc::clone(desc), alias, order_exprs)?;
-    let mut items = Vec::with_capacity(bound.items.len());
-    let mut cols = Vec::with_capacity(bound.items.len());
-    for entry in bound.items {
-        items.push(ProjItem::from_bound(physical::resolve_refs(
-            &entry.expr,
-            &bound.layout,
-        )?));
-        cols.push(entry.out.def);
-    }
+    let slots = physical::project_slots(&bound.items, &physical::Frame::scan(desc, &bound.source))?;
+    debug_assert!(
+        slots.iter().map(|s| s.1).eq(bound.items.iter().map(|e| Some(e.out.id))),
+        "`placed` indexes the bound items, so pinning the PK must move none of them"
+    );
+    let (items, cols) = slots.into_iter().map(|(item, _, def)| (item, def)).unzip();
     Ok(AdhocRows { items, cols, placed: bound.placed })
 }
 
@@ -108,20 +109,10 @@ pub(crate) fn bind_adhoc_rows(
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ColId(u32);
 
-impl ColId {
-    /// The identity-free slot: a physical layout position with no logical column
-    /// behind it — a hidden synthetic key (`_join_pk`, `_set_pk`, …), a reduce's
-    /// cardinality COUNT, an auto-prepended pass-through PK. Nothing can reference
-    /// such a slot (bind mints an id only where a name resolves), so it needs no
-    /// identity, only a position. Distinct from every minted id by construction:
-    /// `ColIdGen` counts up from 0.
-    pub(crate) const NONE: ColId = ColId(u32::MAX);
-}
-
 /// Monotonic `ColId` minter, threaded through bind by shared reference. `Get`
 /// mints one per schema column at its reference site; `Project` mints one per
-/// output `ProjEntry`. Bind-only: lowering assigns positions, never identities, so
-/// it pads its layouts with [`ColId::NONE`] instead.
+/// output `ProjEntry`. Bind-only: lowering assigns positions and never mints an
+/// identity; a slot it adds carries none.
 /// Interior-mutable: a leaf binder mints behind `&self`.
 pub(crate) struct ColIdGen(std::cell::Cell<u32>);
 
@@ -211,19 +202,6 @@ pub(crate) fn cross_comparison<'a>(
     }
 }
 
-/// The physical position of a `ColId` in a layout.
-pub(crate) fn slot_of(layout: &[ColId], id: ColId) -> Result<usize, GnitzSqlError> {
-    layout
-        .iter()
-        .position(|c| *c == id)
-        .ok_or_else(|| GnitzSqlError::Internal("HIR column reference has no layout slot".into()))
-}
-
-/// [`slot_of`] for each of `ids`, in order.
-pub(crate) fn slots_of(layout: &[ColId], ids: &[ColId]) -> Result<Vec<usize>, GnitzSqlError> {
-    ids.iter().map(|&id| slot_of(layout, id)).collect()
-}
-
 /// A subquery bound where its expression was written: the column it is read
 /// through, and what joins that column in when the body's projection is built.
 #[derive(Clone)]
@@ -308,9 +286,8 @@ pub(crate) enum RelExpr {
     /// to share.) `cols` is parallel to `input.cols()` and carries the same defs
     /// under new ids, so two aliases of one shared `input` are distinguishable
     /// by id wherever they meet (a self-join's two sides).
-    /// The lowering resolves it to its input's delta source — a table in place,
-    /// anything else cut once and shared through the cut memo — under the
-    /// alias's ids; it never materializes anything of its own.
+    /// The lowering reads it through its input's source and materializes
+    /// nothing of its own.
     Alias {
         input: Rc<RelExpr>,
         cols: Vec<HirCol>,
@@ -326,9 +303,9 @@ pub(crate) enum RelExpr {
         out: Vec<HirCol>,
     },
     /// Per-partition top-N: the rows of `input` filling weight slots
-    /// `offset .. offset + limit` of each `partition` value in `order` (then the
-    /// input's row key, then the whole row — a total order, so the result is a
-    /// function of the Z-set). Its output is `input`'s columns. `ORDER BY …
+    /// `offset .. offset + limit` of each `partition` value in `order`, then the
+    /// whole row, which leads with the input's key — a total order, so the result
+    /// is a function of the Z-set. Its output is `input`'s columns. `ORDER BY …
     /// LIMIT` on a view body is the empty partition; `QUALIFY ROW_NUMBER() OVER
     /// (…) <= n` names one.
     TopN {

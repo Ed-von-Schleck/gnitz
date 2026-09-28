@@ -1,7 +1,7 @@
 //! The input spine every consumer opens its inputs with: the filters and
 //! projections over a relation read in place fuse into the consumer's circuit.
 
-use super::super::physical::{self, Frame};
+use super::super::physical::{Frame, Rename};
 use super::super::{as_col, ColId, HirExpr, ProjEntry, RelExpr};
 use super::{
     collect_live_cols, cut_segment, filter, lowered_whole, project_front, resolve_in_place, EmitPieces, SegInput,
@@ -10,11 +10,10 @@ use super::{
 use crate::access::candidates;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use gnitz_core::{Circuit, NodeId, ReindexRole, ReindexSlot, Schema};
+use gnitz_core::{Circuit, NodeId, ReindexRole, ReindexSlot};
 use gnitz_wire::ReadBound;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::Arc;
 
 /// A single input as its consumer's circuit reads it: a source — a relation read
 /// in place, or a hidden segment — under the inline `Filter` / `Project` levels
@@ -60,8 +59,9 @@ impl SourceOrigin {
         let by_id = frame
             .layout
             .get(slot)
-            .filter(|&&id| id != ColId::NONE)
-            .and_then(|id| self.cols.get(id))
+            .copied()
+            .flatten()
+            .and_then(|id| self.cols.get(&id))
             .copied();
         // An auto-prepended PK column carries no id to look up.
         let by_pk = frame
@@ -173,8 +173,7 @@ impl Spine<'_> {
             .layout
             .iter()
             .enumerate()
-            .filter(|(_, &id)| id != ColId::NONE)
-            .map(|(slot, &id)| (id, slot as u32))
+            .filter_map(|(slot, id)| Some(((*id)?, slot as u32)))
             .collect();
         for (level, read) in &self.levels {
             let Level::Project(items) = level else { continue };
@@ -211,7 +210,7 @@ impl Spine<'_> {
         for (i, (level, read)) in levels.into_iter().enumerate() {
             match level {
                 Level::Where(preds) => {
-                    let preds = physical::resolve_preds(preds, &frame.layout)?;
+                    let preds = frame.resolve_preds(preds)?;
                     match node {
                         None => leading.push(preds),
                         Some(at) => node = Some(filter(cb, at, &preds, &frame.schema)?),
@@ -219,12 +218,9 @@ impl Spine<'_> {
                 }
                 Level::Project(items) => {
                     let items: Vec<ProjEntry> = items.iter().filter(|it| read.contains(&it.out.id)).cloned().collect();
-                    let output = output_at == Some(i);
-                    if !output {
-                        if let Some(relabeled) = relabel(&frame, &items) {
-                            frame = relabeled;
-                            continue;
-                        }
+                    if let Some(rename) = Rename::of(&items).filter(|_| output_at != Some(i)) {
+                        frame = frame.renamed(&rename)?;
+                        continue;
                     }
                     let at = match node {
                         Some(at) => at,
@@ -275,28 +271,6 @@ fn source(
         node = filter(cb, node, preds, &frame.schema)?;
     }
     Ok(node)
-}
-
-/// `items` as a relabel of `frame` when each names a distinct column: such a
-/// projection moves no data. A slot no item reads loses its identity.
-fn relabel(frame: &Frame, items: &[ProjEntry]) -> Option<Frame> {
-    let mut layout = vec![ColId::NONE; frame.layout.len()];
-    let mut columns = frame.schema.columns.clone();
-    for it in items {
-        let slot = frame.layout.iter().position(|&c| Some(c) == as_col(&it.expr))?;
-        if layout[slot] != ColId::NONE {
-            return None;
-        }
-        layout[slot] = it.out.id;
-        columns[slot] = it.out.def.clone();
-    }
-    Some(Frame {
-        layout,
-        schema: Arc::new(Schema {
-            columns,
-            pk_cols: frame.schema.pk_cols.clone(),
-        }),
-    })
 }
 
 /// Lower a linear body — the inline levels of `rel`, whose outermost projection is

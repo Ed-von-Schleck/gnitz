@@ -29,7 +29,7 @@
 //!
 //! The desugar is purely logical: `W` and `G` are shared subtrees read through
 //! aliases, and the lowering's cut memo and collision rule decide what is read
-//! in place (a bare table) and what is cut once to a hidden segment. Partition
+//! in place and what is cut once to a hidden segment. Partition
 //! and order keys are join keys of these shapes, so they carry the join-key
 //! rules: no float, no NULL, and no string in the band slot.
 //!
@@ -39,7 +39,7 @@
 //! holds the band self-join's traces over `G`, one row per peer group.
 
 use super::bind::{bind_projection, ItemLeaf};
-use super::{as_col, col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinType, ProjEntry, RelExpr, TopNKey};
+use super::{col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinType, ProjEntry, RelExpr, TopNKey};
 use crate::agg::default_agg_name;
 use crate::agg::AggFunc;
 use crate::ast_util::{
@@ -703,26 +703,10 @@ fn desugar<L: ItemLeaf>(
         })
         .collect();
 
-    // W: the input itself when it is a bare table every hoisted column passes
-    // through (the lowering reads it in place), else the narrowing projection
-    // (cut once to a segment every read shares).
-    let in_place = match input.as_ref() {
-        RelExpr::Get { cols, .. } => h
-            .items
-            .iter()
-            .map(|it| {
-                let src = as_col(&it.expr)?;
-                Some((it.out.id, cols.iter().position(|c| c.id == src)?))
-            })
-            .collect::<Option<HashMap<_, _>>>(),
-        _ => None,
-    };
-    let w = match in_place {
-        Some(pos) => WRel { rel: Rc::clone(&input), pos },
-        None => WRel {
-            pos: h.items.iter().enumerate().map(|(i, it)| (it.out.id, i)).collect(),
-            rel: leaf.project(input, h.items)?,
-        },
+    // W: the narrowing projection every read of the input aliases.
+    let w = WRel {
+        pos: h.items.iter().enumerate().map(|(i, it)| (it.out.id, i)).collect(),
+        rel: leaf.project(input, h.items)?,
     };
     let outer = Read::of(ids, &w.rel);
 

@@ -2,7 +2,7 @@
 //! HIR pipeline — the CTE phase (`hir::bind::bind_ctes`) and then
 //! `bind_and_lower` of the body — into a view bundle committed atomically.
 
-use crate::bind::{apply_positional_aliases, Catalog};
+use crate::bind::Catalog;
 use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::bind::ViewBody;
 use crate::validate::{
@@ -12,7 +12,6 @@ use crate::validate::{
 use crate::SqlResult;
 use gnitz_core::{GnitzClient, RelClass, ViewBundle, ViewProps};
 use sqlparser::ast::{CreateTableOptions, CreateView, Ident, ObjectName, Query, Value, ValueWithSpan};
-use std::sync::Arc;
 
 /// Binary units accepted by a `WITH (<option> = '<uint><unit>')` size string.
 const SIZE_UNITS: [(&str, u64); 3] = [("KB", 1 << 10), ("MB", 1 << 20), ("GB", 1 << 30)];
@@ -153,13 +152,7 @@ fn plan_segments<'a>(
 ) -> Result<ViewBundle, GnitzSqlError> {
     reject_unhonored_query_clauses(query, QueryEnvelope::WithAndTail, view.stmt)?;
     let bounded = matches!(props, ViewProps::Bounded { .. });
-    let mut bundle = crate::hir::bind_and_lower(cat, query, view, bounded)?;
-    apply_positional_aliases(
-        aliases,
-        Arc::make_mut(&mut bundle.view.schema).columns.iter_mut(),
-        view.stmt,
-    )?;
-    Ok(bundle)
+    crate::hir::bind_and_lower(cat, query, view, bounded, aliases)
 }
 
 /// Commit a planned `CREATE VIEW` or `ALTER VIEW … AS`.

@@ -65,7 +65,7 @@ impl FoldFinish {
             .into_iter()
             .map(|(expr, def)| (ProjItem::from_bound(expr), def))
             .unzip();
-        let (out_schema, program) = reply_program(&items, cols, &partial_schema, "aggregate SELECT output schema")?;
+        let (out_schema, program) = reply_program(&items, cols, &partial_schema)?;
         let finalize = ClientMap::new(program, &partial_schema, Arc::new(out_schema))?;
         Ok(FoldFinish {
             partial_schema,

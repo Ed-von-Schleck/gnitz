@@ -756,6 +756,23 @@ fn top_n_rules() {
     ] {
         assert_eq!(cols(by_expr), cols(by_name), "`{by_expr}`");
     }
+    // The index sorts on the written keys alone.
+    let i = TypeCode::I64;
+    let cab = catalog(vec![(
+        "cab",
+        table(60, vec![col("a", i), col("b", i), col("c", i)], vec![0, 1]),
+    )]);
+    let chain = view(&cab, "SELECT c FROM cab ORDER BY c LIMIT 2");
+    let orders: Vec<Vec<u16>> = final_view(&chain)
+        .circuit
+        .nodes()
+        .iter()
+        .filter_map(|n| match &n.op {
+            OpNode::TopN { order, .. } => Some(order.iter().map(|k| k.col).collect()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(orders, [vec![2u16]]);
 }
 
 #[test]
@@ -821,6 +838,9 @@ fn capacity_rules() {
     // A filtered derived-table input fuses into the join's circuit, cutting nothing.
     let sql = "CREATE VIEW v WITH (capacity = '1 MB') AS \
                SELECT a.id AS aid, d.w FROM a JOIN (SELECT k, w FROM b WHERE w > 3) d ON a.k = d.k";
+    plan(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+    // A CTE that only renames its table's columns reads the table in place.
+    let sql = "CREATE VIEW v WITH (capacity = '1 MB') AS WITH c AS (SELECT v AS w, id FROM t) SELECT id, w FROM c";
     plan(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
 
     // An inner equi-join root whose sides cut a segment of their own: the root

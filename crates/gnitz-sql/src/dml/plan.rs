@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::access::{candidates, residual, Candidate};
-use crate::codec::project_schema::{reply_program, ProjItem};
+use crate::codec::project_schema::{leading_schema, payload_program, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_wire_conjuncts;
 use crate::ir::BoundExpr;
@@ -83,11 +83,10 @@ pub(crate) fn rows_reply(
     alias: &str,
 ) -> Result<RowsReply, GnitzSqlError> {
     let keys = parse_order_by(order_by)?;
-    let crate::hir::AdhocRows { items, cols: mut out_cols, placed } =
+    let crate::hir::AdhocRows { items, cols: out_cols, placed } =
         crate::hir::bind_adhoc_rows(projection, desc, alias, &order_exprs(&keys))?;
     let schema = &desc.schema;
     let mut order = wire_keys(&keys, &out_cols, placed)?;
-    // Past the PK prefix `bind_adhoc_rows` places for ORDER BY; the reply carries its own.
     let k = schema.pk_count();
     if reproduces(schema, &items[k..], &out_cols[k..]) {
         for key in &mut order {
@@ -101,15 +100,10 @@ pub(crate) fn rows_reply(
             order,
         });
     }
-    let (reply, program) = reply_program(
-        &items[k..],
-        out_cols.split_off(k),
-        schema,
-        "read-spec reply schema is invalid",
-    )?;
+    let out = leading_schema(out_cols, k)?;
     Ok(RowsReply {
-        schema: Arc::new(reply),
-        program: Some(program),
+        program: Some(payload_program(&items, &out, schema)?),
+        schema: Arc::new(out),
         order,
     })
 }

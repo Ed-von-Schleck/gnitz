@@ -1,7 +1,7 @@
 //! The top-N shell. Its input opens through the spine, so a projection over a
 //! relation read in place is not stored a second time beside the operator's index.
 
-use super::super::{slot_of, slots_of, ColId, RelExpr, TopNKey};
+use super::super::{ColId, RelExpr};
 use super::spine::{open, Top};
 use super::{keyed_frame, EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
@@ -20,33 +20,29 @@ pub(super) fn lower_topn(chain: &mut ViewChain, rel: &RelExpr) -> Result<EmitPie
     let spine = open(chain, input, &live)?;
     let mut cb = Circuit::default();
     let (node, frame) = spine.emit(&mut cb, Top::Output)?;
-    let (in_schema, in_layout) = (&frame.schema, &frame.layout);
+    debug_assert!(
+        frame
+            .schema
+            .pk_cols
+            .iter()
+            .copied()
+            .eq(0..frame.schema.pk_count() as u32),
+        "a top-N input leads with its key, which the index carries as its tie-break"
+    );
 
-    let written: Vec<u32> = slots_of(in_layout, partition)?.into_iter().map(|c| c as u32).collect();
-    // The normalized group names the same set as the written partition, so every
-    // derivation below reads this one list.
-    let group = in_schema.reduce_group(&written);
-    reject_float_keys(group.iter().map(|&c| &in_schema.columns[c as usize]), "PARTITION BY")?;
-    // The input's key breaks ties, as `ROW_NUMBER` numbers them, so which rows are
-    // selected is a function of the data alone.
-    let mut key_ids: Vec<TopNKey> = order.clone();
-    for &pk in &in_schema.pk_cols {
-        let id = in_layout[pk as usize];
-        if !partition.contains(&id) && !key_ids.iter().any(|k| k.col == id) {
-            key_ids.push(TopNKey { col: id, desc: false, nulls_first: false });
-        }
-    }
-    if key_ids.len() > gnitz_wire::MAX_ORDER_KEYS {
+    let group = frame.reduce_group(partition)?;
+    reject_float_keys(group.iter().map(|&c| &frame.schema.columns[c as usize]), "PARTITION BY")?;
+    if order.len() > gnitz_wire::MAX_ORDER_KEYS {
         return Err(GnitzSqlError::Rejected(format!(
-            "ORDER BY: more than {} keys, the input's key included",
+            "ORDER BY: more than {} keys",
             gnitz_wire::MAX_ORDER_KEYS
         )));
     }
-    let keys = key_ids
+    let keys = order
         .iter()
         .map(|k| {
             Ok(OrderKey {
-                col: slot_of(in_layout, k.col)? as u16,
+                col: frame.slot(k.col)? as u16,
                 desc: k.desc,
                 nulls_first: k.nulls_first,
             })

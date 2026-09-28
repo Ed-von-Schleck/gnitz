@@ -264,11 +264,11 @@ fn wildcard_modifiers_rewrite_the_expansion() {
 
 // ── CTEs and derived tables ──────────────────────────────────────────────────
 
-/// A CTE's column aliases name its output; an identity body is a pass-through
-/// (one segment) while any other body is cut into a hidden segment where it is
-/// read — and not at all where nothing reads it.
+/// A CTE's column aliases name its output; a body that only renames columns
+/// reads its source in place (one segment) while any other body is cut into a
+/// hidden segment where it is read — and not at all where nothing reads it.
 #[test]
-fn a_cte_body_is_a_pass_through_only_when_it_is_the_identity() {
+fn a_cte_body_reads_in_place_only_when_it_renames() {
     let i = TypeCode::I64;
     let cat = catalog(vec![("ab", table(30, vec![col("a", i), col("b", i)], vec![0]))]);
     let rows: &[(&str, usize, Shape)] = &[
@@ -289,8 +289,23 @@ fn a_cte_body_is_a_pass_through_only_when_it_is_the_identity() {
         ),
         (
             "WITH cte AS (SELECT a FROM ab) SELECT a FROM cte",
-            2,
+            1,
             sh(&[("a", false, false)]),
+        ),
+        (
+            "WITH cte AS (SELECT b AS x, a FROM ab) SELECT x, a FROM cte",
+            1,
+            sh(&[("a", false, false), ("x", false, false)]),
+        ),
+        (
+            "WITH c AS (SELECT a, b FROM ab WHERE a > 0), cte AS (SELECT a + 1 AS s FROM c) SELECT s FROM cte",
+            3,
+            sh(&[("a", true, false), ("s", false, true)]),
+        ),
+        (
+            "WITH cte AS (SELECT a + 1 AS s FROM ab) SELECT s FROM cte",
+            2,
+            sh(&[("a", true, false), ("s", false, true)]),
         ),
         // The same-named derived alias shadows the CTE in the final body, so the
         // CTE is never read and never cut.
@@ -305,6 +320,59 @@ fn a_cte_body_is_a_pass_through_only_when_it_is_the_identity() {
         assert_eq!(view_count(&chain), *segments, "{body}");
         assert_eq!(&output_shape(&chain), shape, "{body}");
     }
+}
+
+/// A view's column list names the SELECT list in order, wherever the PK-front
+/// convention places each column.
+#[test]
+fn view_column_aliases_name_the_select_list() {
+    let i = TypeCode::I64;
+    let cat = catalog(vec![
+        (
+            "tn",
+            table(32, vec![col("id", i), ncol("name", TypeCode::String)], vec![0]),
+        ),
+        ("t", table(33, vec![col("id", i), col("g", i), col("v", i)], vec![0])),
+    ]);
+    let rows: &[(&str, Shape)] = &[
+        (
+            "CREATE VIEW v (x, y) AS SELECT name, id FROM tn",
+            sh(&[("y", false, false), ("x", false, true)]),
+        ),
+        (
+            "CREATE VIEW v (x, y) AS SELECT COUNT(*) AS n, g FROM t GROUP BY g",
+            sh(&[("y", false, false), ("x", false, false)]),
+        ),
+        (
+            "CREATE VIEW v (x, y) AS SELECT name, id FROM tn ORDER BY name LIMIT 2",
+            sh(&[("_group_pk", true, false), ("y", false, false), ("x", false, true)]),
+        ),
+    ];
+    for (sql, shape) in rows {
+        let chain = plan(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+        assert_eq!(&output_shape(&chain), shape, "{sql}");
+    }
+}
+
+/// A CTE that passes a view through whole keeps the view's hidden row key, so a
+/// ROW_NUMBER over the CTE is accepted as it is over the view.
+#[test]
+fn an_identity_cte_of_a_view_keeps_its_row_key() {
+    let i = TypeCode::I64;
+    let cat = catalog(vec![(
+        "vx",
+        rel(
+            40,
+            RelClass::View,
+            vec![col("id", i).hidden(), col("x", i)],
+            vec![0],
+            &[],
+        ),
+    )]);
+    view(
+        &cat,
+        "WITH c AS (SELECT * FROM vx) SELECT x, ROW_NUMBER() OVER (ORDER BY x) AS rn FROM c",
+    );
 }
 
 /// A CTE is one shared subtree read through an alias wherever it is named: a

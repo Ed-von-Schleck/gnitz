@@ -10,7 +10,7 @@ fn frame(ids: &ColIdGen, names: &[(&str, bool)], pk_cols: Vec<u32>) -> Frame {
         .map(|&(n, nullable)| ColumnDef::new(n, TypeCode::U64, nullable))
         .collect();
     Frame {
-        layout: cols.iter().map(|_| ids.next()).collect(),
+        layout: cols.iter().map(|_| Some(ids.next())).collect(),
         schema: Arc::new(Schema::from_parts(cols, pk_cols).unwrap()),
     }
 }
@@ -42,8 +42,8 @@ fn a_pinned_side_keeps_its_pk_alone() {
     let left = frame(&ids, &[("v", false), ("id", false)], vec![1]);
     let right = frame(&ids, &[("id", false), ("w", false)], vec![0]);
     let range = super::super::HirRange {
-        left: left.layout[0],
-        right: right.layout[1],
+        left: left.layout[0].unwrap(),
+        right: right.layout[1].unwrap(),
         op: gnitz_core::RangeRel::Lt,
         tc: TypeCode::U64,
     };
@@ -66,8 +66,8 @@ fn an_unreferenced_equi_join_keeps_one_left_column() {
     let right = frame(&ids, &[("k", false), ("w", false)], vec![0]);
     let cls = class(
         vec![EqPair {
-            left: left.layout[0],
-            right: right.layout[0],
+            left: left.layout[0].unwrap(),
+            right: right.layout[0].unwrap(),
             tc: TypeCode::U64,
         }],
         None,
@@ -87,8 +87,8 @@ fn a_preserved_side_keeps_its_nullable_key() {
     let right = frame(&ids, &[("id", false), ("k", true)], vec![0]);
     let cls = class(
         vec![EqPair {
-            left: left.layout[1],
-            right: right.layout[1],
+            left: left.layout[1].unwrap(),
+            right: right.layout[1].unwrap(),
             tc: TypeCode::U64,
         }],
         None,
@@ -113,13 +113,13 @@ fn a_band_nu_keeps_its_key_columns() {
     );
     let right = frame(&ids, &[("id", false), ("k", false), ("y", false)], vec![0]);
     let eq = vec![EqPair {
-        left: left.layout[1],
-        right: right.layout[1],
+        left: left.layout[1].unwrap(),
+        right: right.layout[1].unwrap(),
         tc: TypeCode::U64,
     }];
     let range = super::super::HirRange {
-        left: left.layout[2],
-        right: right.layout[2],
+        left: left.layout[2].unwrap(),
+        right: right.layout[2].unwrap(),
         op: gnitz_core::RangeRel::Le,
         tc: TypeCode::U64,
     };

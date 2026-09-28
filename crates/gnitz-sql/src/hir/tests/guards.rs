@@ -79,13 +79,14 @@ fn join_shape_admission() {
     for shape in [JoinShape::Cross, JoinShape::Equi, JoinShape::Band, JoinShape::PureRange] {
         reject_join_shape(JoinType::Inner, shape).unwrap();
     }
+    let mark = crate::hir::ColIdGen::new().next();
     for kind in [
         JoinType::Left,
         JoinType::Right,
         JoinType::Full,
         JoinType::Semi,
         JoinType::Anti,
-        JoinType::Mark(crate::hir::ColId::NONE),
+        JoinType::Mark(mark),
     ] {
         assert!(reject_join_shape(kind, JoinShape::Cross).is_err(), "{kind:?}");
         reject_join_shape(kind, JoinShape::Band).unwrap();
@@ -104,12 +105,13 @@ fn join_shape_admission() {
 /// reject with their own surface's wording.
 #[test]
 fn outer_with_residual_rejects_per_surface() {
+    let mark = crate::hir::ColIdGen::new().next();
     for k in [
         JoinType::Inner,
         JoinType::Left,
         JoinType::Full,
         JoinType::Semi,
-        JoinType::Mark(crate::hir::ColId::NONE),
+        JoinType::Mark(mark),
     ] {
         reject_outer_with_residual(k, &[]).unwrap();
     }
@@ -123,5 +125,5 @@ fn outer_with_residual_rejects_per_surface() {
     assert!(msg(JoinType::Full).contains("LEFT/RIGHT/FULL JOIN"));
     assert!(msg(JoinType::Semi).contains("EXISTS/IN correlation"));
     assert!(msg(JoinType::Anti).contains("EXISTS/IN correlation"));
-    assert!(msg(JoinType::Mark(crate::hir::ColId::NONE)).contains("EXISTS/IN correlation"));
+    assert!(msg(JoinType::Mark(mark)).contains("EXISTS/IN correlation"));
 }

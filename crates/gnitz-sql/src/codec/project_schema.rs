@@ -1,10 +1,9 @@
 //! Physical projections: [`ProjItem`]s over a source schema → output layout and
 //! the compiled payload program.
 //!
-//! `place_pk_front` pins the source PK to the leading output slots of a CREATE VIEW
-//! linear projection; [`payload_map`] compiles such a projection's payload into a
-//! [`ComputeMap`]; [`reply_program`] builds the reply schema and program of a
-//! leading-key projection.
+//! [`payload_program`] compiles a leading-key projection's payload;
+//! [`reply_program`] builds the reply schema and program of one over a source's
+//! hidden key; [`leading_schema`] admits a leading-key schema.
 
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_bound_expr;
@@ -40,17 +39,27 @@ impl ProjItem {
     }
 }
 
-/// A physicalized projection (`place_pk_front`'d, so its first `k` items copy
-/// `input`'s PK) as a [`ComputeMap`] over its payload.
-pub(crate) fn payload_map(items: &[ProjItem], out: &Schema, input: &Schema) -> Result<ComputeMap, GnitzSqlError> {
+/// `columns` behind a leading key region of `npk`, admitted as a schema the engine
+/// can hold.
+pub(crate) fn leading_schema(columns: Vec<ColumnDef>, npk: usize) -> Result<Schema, GnitzSqlError> {
+    Schema::from_parts(columns, (0..npk as u32).collect())
+        .map_err(|e| GnitzSqlError::Rejected(format!("output schema: {e}")))
+}
+
+/// The payload program of a physicalized projection, whose first `k` items copy
+/// `input`'s PK.
+pub(crate) fn payload_program(
+    items: &[ProjItem],
+    out: &Schema,
+    input: &Schema,
+) -> Result<LogicalProgram, GnitzSqlError> {
     let k = input.pk_count();
     debug_assert_eq!(out.pk_count(), k, "a projection keeps its input's key");
     debug_assert!(
         (0..k).all(|i| items[i].passthrough_src() == Some(input.pk_cols[i] as usize)),
         "a physicalized projection copies its input's PK in front"
     );
-    let program = compile_projection_map(&items[k..], &out.columns[k..], input)?;
-    Ok(compute_map(program, out))
+    compile_projection_map(&items[k..], &out.columns[k..], input)
 }
 
 /// A compiled payload program paired with the `(type_code, nullable)` declaration of `out`'s
@@ -97,74 +106,14 @@ fn compile_projection_map(
     Ok(eb.build(None)?)
 }
 
-/// Pin the full source PK to output slots `0..k` in PK-list order,
-/// matching the engine's `project_schema` (which copies every PK
-/// column to the front via `DerivedSchema::push_pk_of`). A PK column already at its
-/// target slot stays; one appearing later is removed+inserted (shifting the
-/// spanned non-PK columns right by one, preserving their relative order — a
-/// swap would not); one absent from the projection (omitted, or referenced
-/// only through a computed expression) is auto-prepended so the view carries
-/// the full source PK verbatim. One loop serves every PK arity — `k == 1`
-/// reduces to a single move-to-front.
-///
-/// Returns the permutation applied, as the pre-call index of each output slot
-/// (`None` for an auto-prepended PK column, which had no pre-call slot). Callers
-/// carrying a vector parallel to `out_cols` — the HIR's `ColId` layout — reorder
-/// it through this instead of re-deriving the convention.
-pub(crate) fn place_pk_front(
-    items: &mut Vec<ProjItem>,
-    out_cols: &mut Vec<ColumnDef>,
-    source_schema: &Schema,
-) -> Vec<Option<usize>> {
-    let mut perm: Vec<Option<usize>> = (0..items.len()).map(Some).collect();
-    for (target, &pk) in source_schema.pk_cols.iter().enumerate() {
-        let pk = pk as usize;
-        // First occurrence is the canonical physical-PK slot; any later
-        // duplicate (SELECT pk, pk AS x) stays in the payload region and is
-        // materialized by the expr-map column-copy path.
-        let cur = items.iter().position(|i| i.passthrough_src() == Some(pk));
-        match cur {
-            Some(pos) if pos == target => { /* already in place */ }
-            Some(pos) => {
-                let it = items.remove(pos);
-                let col = out_cols.remove(pos);
-                let tag = perm.remove(pos);
-                items.insert(target, it);
-                out_cols.insert(target, col);
-                perm.insert(target, tag);
-            }
-            None => {
-                // Auto-prepended: the source PK column the user did not project.
-                // It must ride the view (the physical key), but the user never
-                // named it, so it is hidden — `SELECT b FROM t` does not leak the
-                // PK `a`. (A source PK that is itself already hidden, e.g. a
-                // synthetic `_join_pk`, stays hidden — `.hidden()` is idempotent.)
-                items.insert(target, ProjItem::PassThrough { src_col: pk });
-                out_cols.insert(target, source_schema.columns[pk].clone().hidden());
-                perm.insert(target, None);
-            }
-        }
-    }
-    perm
-}
-
 /// The `(schema, payload program)` a projection over `source` produces: `source`'s PK,
-/// hidden, then the payload columns the program fills. `what` names the shape if the
-/// schema is invalid.
+/// hidden, then the payload columns the program fills.
 pub(crate) fn reply_program(
     payload_items: &[ProjItem],
     payload_cols: Vec<ColumnDef>,
     source: &Schema,
-    what: &str,
 ) -> Result<(Schema, LogicalProgram), GnitzSqlError> {
     let program = compile_projection_map(payload_items, &payload_cols, source)?;
-    let k = source.pk_count() as u32;
     let columns = source.hidden_key_columns().chain(payload_cols).collect();
-    let schema =
-        Schema::from_parts(columns, (0..k).collect()).map_err(|e| GnitzSqlError::Rejected(format!("{what}: {e}")))?;
-    Ok((schema, program))
+    Ok((leading_schema(columns, source.pk_count())?, program))
 }
-
-#[cfg(test)]
-#[path = "tests/project_schema.rs"]
-mod tests;
