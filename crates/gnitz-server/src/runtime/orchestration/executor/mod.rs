@@ -148,17 +148,15 @@ pub struct Shared {
     /// same-table pushes reach the committer concurrently and share one fsync.
     table_locks: RefCell<FxHashMap<u64, AsyncRwLock>>,
     /// Set true by the graceful-shutdown watcher before it sends the final
-    /// Shutdown barrier. Read only by [`Shared::enqueue_commit`], which is what
+    /// Shutdown barrier. Read only by [`Shared::commit`], which is what
     /// makes the test and the send one step.
     draining: Cell<bool>,
     /// OCC per-table commit-LSN map: `tid → the zone LSN its last accepted write
     /// this boot rode`. That LSN is published for a durable write; for a stream it is
     /// a reservation the batch never published, which is what makes
-    /// `read_is_fresh` answer false and drain. Bumped under the writer's table-lock guard immediately
-    /// after a successful commit, and read by the transaction's OCC precondition
-    /// check under the *write* guard on that lock, which excludes every bumper. A missing entry reads as
-    /// `boot_seed`. Single-threaded reactor — a plain `RefCell`, and no borrow
-    /// is ever held across an `.await`.
+    /// `read_is_fresh` answer false and drain. A missing entry reads as `boot_seed`.
+    /// Single-threaded reactor — a plain `RefCell`, and no borrow is ever held across an
+    /// `.await`.
     table_commit_lsn: RefCell<FxHashMap<u64, u64>>,
     /// The default for a `table_commit_lsn` miss (a table not written this boot),
     /// seeded to the catalog's system zone — the value `lsn_alloc.published()`
@@ -178,6 +176,27 @@ pub struct Shared {
     /// included (`GNITZ_HELLO_TIMEOUT_MS`). The default outlasts the client's own
     /// `CONNECT_TIMEOUT`, so only a client that has already given up is reaped.
     hello_timeout: Duration,
+}
+
+/// The table locks one task holds.
+struct HeldTables {
+    tids: Vec<u64>,
+    guards: TableGuards,
+}
+
+enum TableGuards {
+    Shared { _guard: ReadGuard },
+    Exclusive { _guards: Vec<WriteGuard> },
+}
+
+impl HeldTables {
+    fn holds(&self, tid: u64) -> bool {
+        self.tids.contains(&tid)
+    }
+
+    fn holds_exclusive(&self, tid: u64) -> bool {
+        matches!(self.guards, TableGuards::Exclusive { .. }) && self.holds(tid)
+    }
 }
 
 impl Shared {
@@ -205,53 +224,69 @@ impl Shared {
         self.table_locks.borrow_mut().entry(tid).or_default().clone()
     }
 
-    /// Take the write guard on every table in `tids`, sorting and deduping here
-    /// so no caller can get it wrong: ascending order is what keeps a child
-    /// INSERT and a parent DELETE from deadlocking on the same set, and a repeat
-    /// would re-guard a lock this task holds and hang forever.
+    /// The read guard on `tid`.
+    async fn lock_table_shared(&self, tid: u64) -> HeldTables {
+        let guard = self.table_lock(tid).read().await;
+        HeldTables {
+            tids: vec![tid],
+            guards: TableGuards::Shared { _guard: guard },
+        }
+    }
+
+    /// The write guard on every table in `tids`, taken in ascending order so a
+    /// child INSERT and a parent DELETE cannot deadlock on the same set, and each
+    /// once, since re-guarding a lock this task holds would hang forever.
     ///
     /// Owned, because the set is read out of the catalog and this loop awaits.
-    async fn lock_tables_exclusive(&self, mut tids: Vec<u64>) -> Vec<WriteGuard> {
+    async fn lock_tables_exclusive(&self, mut tids: Vec<u64>) -> HeldTables {
         tids.sort_unstable();
         tids.dedup();
         let mut guards = Vec::with_capacity(tids.len());
-        for tid in tids {
+        for &tid in &tids {
             guards.push(self.table_lock(tid).write().await);
         }
-        guards
-    }
-
-    /// OCC: record `lsn` as the last-committed-write watermark for each of `tids`,
-    /// under the caller's already-held table lock(s). The single writer of
-    /// `table_commit_lsn` — every commit path funnels through here, so none can
-    /// silently omit the bump. Call on the commit `Ok` path only.
-    ///
-    /// `max`, not overwrite: shared-guard pushes to one table resume from their
-    /// commit awaits in an order the guard does not enforce, so the watermark
-    /// must never regress — a precondition check would then false-pass.
-    fn record_commit_lsn(&self, tids: impl IntoIterator<Item = u64>, lsn: u64) {
-        let mut map = self.table_commit_lsn.borrow_mut();
-        for tid in tids {
-            let e = map.entry(tid).or_default();
-            *e = (*e).max(lsn);
+        HeldTables {
+            tids,
+            guards: TableGuards::Exclusive { _guards: guards },
         }
     }
 
-    /// Commit `req` unless a graceful shutdown has begun, and await its verdict
-    /// under the caller's catalog read guard. No await separates the test from the
-    /// send: a request that saw a live server is queued ahead of the watchdog's
-    /// Shutdown barrier.
+    /// Commit `req` unless a graceful shutdown has begun, await its verdict under
+    /// the caller's catalog read guard, and on success raise each of `tids`' commit
+    /// LSN to it. No await separates the test from the send: a request that saw a
+    /// live server is queued ahead of the watchdog's Shutdown barrier.
     async fn commit(
         &self,
         _catalog: &ReadGuard,
+        held: &HeldTables,
+        tids: impl IntoIterator<Item = u64>,
         req: impl FnOnce(oneshot::Sender<Result<u64, WireFault>>) -> CommitRequest,
     ) -> Result<u64, WireFault> {
+        let tids: Vec<u64> = tids.into_iter().collect();
+        assert!(
+            tids.iter().all(|&t| held.holds(t)),
+            "a commit bumps only tables whose lock it holds"
+        );
         if self.draining.get() {
             return Err("server shutting down".to_string().into());
         }
         let (done, rx) = oneshot::channel();
         self.committer_tx.send(req(done));
-        rx.await
+        let lsn = rx.await?;
+        let mut map = self.table_commit_lsn.borrow_mut();
+        for tid in tids {
+            // Pushes sharing a read guard resume from the await in any order.
+            let e = map.entry(tid).or_default();
+            *e = (*e).max(lsn);
+        }
+        Ok(lsn)
+    }
+
+    /// OCC: whether `tid` committed a write after `basis`. `held`'s write guard on
+    /// `tid` keeps any other commit to it from landing before the caller's.
+    fn written_since(&self, held: &HeldTables, tid: u64, basis: u64) -> bool {
+        assert!(held.holds_exclusive(tid), "an OCC check holds its table's write guard");
+        self.commit_lsn_of(tid) > basis
     }
 
     /// The zone LSN of `tid`'s last committed write this boot, or `boot_seed` for
@@ -827,11 +862,12 @@ async fn handle_push(
     // table, which fold into one SAL zone and one fsync. Every other push takes
     // all FK-related table locks exclusively.
     let reads_committed = shared.cat().push_reads_committed_state(target_id, mode);
-    let _tlocks = if !reads_committed {
-        (Some(shared.table_lock(target_id).read().await), Vec::new())
+    let held = if !reads_committed {
+        shared.lock_table_shared(target_id).await
     } else {
-        let lock_set: Vec<u64> = shared.cat().fk_lock_set(target_id).collect();
-        (None, shared.lock_tables_exclusive(lock_set).await)
+        shared
+            .lock_tables_exclusive(shared.cat().fk_lock_set(target_id).collect())
+            .await
     };
 
     // Distributed validation (PK / FK / unique indices). A plain push is a
@@ -847,7 +883,7 @@ async fn handle_push(
 
     let is_stream = kind == RelationKind::Stream;
     let zone_lsn = shared
-        .commit(&catalog, |done| {
+        .commit(&catalog, &held, [target_id], |done| {
             CommitRequest::Push(PendingPush {
                 tid: target_id,
                 batch,
@@ -856,16 +892,6 @@ async fn handle_push(
             })
         })
         .await?;
-    // Record the commit LSN for OCC while the table-lock guard is still held (a
-    // concurrent precondition check reads it under the write guard on the same
-    // lock, which excludes this one, so the bump lands before any conflicting txn
-    // can pass). Bump on the `Ok` path only: an `Err` reply is pre-SAL or
-    // fail-stop, so there is no live-visible durable change to record.
-    //
-    // Always the real LSN, stream included: clamping the watermark too would
-    // leave `commit_lsn_of` at its boot seed, so `read_is_fresh` would answer
-    // `true` forever and the batch would sit un-ticked.
-    shared.record_commit_lsn([target_id], zone_lsn);
     // A stream replies `0`: its push is not durable, and an ACK reports an LSN
     // only for a write a restart must recover. Keyed on the target rather than on
     // whether this batch happened to open a zone, so a stream push the committer
@@ -978,18 +1004,16 @@ async fn handle_push_txn(
         }
         shared.cat().recheck_record(tid, &head.seen)?;
     }
-    let family_tids: Vec<u64> = families.iter().map(|f| f.tid).collect();
 
     // 3. Acquire the per-table lock union ⋃ fk_lock_set(tid) exclusively.
     let mut union: Vec<u64> = Vec::new();
     for fam in &families {
         union.extend(shared.cat().fk_lock_set(fam.tid));
     }
-    let _tlocks = shared.lock_tables_exclusive(union).await;
+    let held = shared.lock_tables_exclusive(union).await;
 
-    // 3b. OCC under `_tlocks`, which guards every family tid (see
-    //     `table_commit_lsn`). A blind family's `BLIND` basis no commit exceeds.
-    if let Some(head) = heads.iter().find(|h| shared.commit_lsn_of(h.tid) > h.basis) {
+    // 3b. OCC. A blind family's `BLIND` basis no commit exceeds.
+    if let Some(head) = heads.iter().find(|h| shared.written_since(&held, h.tid, h.basis)) {
         return Err(WireFault {
             status: WireStatus::TxnConflict,
             text: format!(
@@ -1004,11 +1028,10 @@ async fn handle_push_txn(
 
     // 5. Commit.
     let lsn = shared
-        .commit(&catalog, |done| CommitRequest::Txn(PendingTxn { families, done }))
+        .commit(&catalog, &held, heads.iter().map(|h| h.tid), |done| {
+            CommitRequest::Txn(PendingTxn { families, done })
+        })
         .await?;
-
-    // 6. Bump while `_tlocks` still holds every family tid.
-    shared.record_commit_lsn(family_tids.iter().copied(), lsn);
     // Standard single-frame ACK (uncorrelated, as the DDL_TXN reply is).
     send_msg(peer, ipc::WireMsg { arg0: lsn, ..Default::default() });
     Ok(())

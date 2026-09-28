@@ -14,10 +14,10 @@ use std::sync::Arc;
 
 use crate::mirror::{MirrorState, MirrorStore, MirroredView};
 use crate::types::sys_schema;
-use gnitz_expr::{payload_bytes, payload_is_null, payload_u64};
+use gnitz_expr::{payload_bytes, payload_is_null, payload_u64, ExprBuilder, RowFilter};
 use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::txn_frame::{DeltaPollItem, BLIND};
-use gnitz_wire::Circuit;
+use gnitz_wire::{Circuit, ComputeMap, ReadBound, ReadSink, ReadSpec};
 use gnitz_wire::{
     RelClass, TableProps, ViewProps, CIRCUIT_NODES_TAB, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME,
     COL_TAB, IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB, RELTAB_PAY_NAME,
@@ -64,8 +64,6 @@ pub(crate) fn absent(text: String) -> ClientError {
 /// Build the `-1` retraction batch for `pks`: the server's unique-PK rule
 /// retracts by PK alone, so the payload columns are inert filler. Built directly rather
 /// than through `BatchAppender`, which has no way to take a whole `PkColumn`.
-/// Shared by `GnitzClient::delete` and the SQL layer's DELETE RMW retry closure
-/// (which needs the batch without an immediate push).
 pub fn retraction_batch(schema: &Schema, pks: PkColumn) -> ZSetBatch {
     let count = pks.len();
     ZSetBatch {
@@ -76,6 +74,26 @@ pub fn retraction_batch(schema: &Schema, pks: PkColumn) -> ZSetBatch {
         blob: vec![],
     }
 }
+
+/// The keys-only read of `schema`: a reply of its PK columns alone, and a rows sink
+/// whose zero-instruction map fills no payload slot.
+pub fn key_reply(schema: &Schema) -> (Arc<Schema>, ReadSink) {
+    let reply = Schema {
+        columns: schema.hidden_key_columns().collect(),
+        pk_cols: (0..schema.pk_count() as u32).collect(),
+    };
+    let program = ExprBuilder::new()
+        .build(None)
+        .expect("the empty program is well-formed")
+        .to_blob_bytes();
+    let map = ComputeMap { program, out_cols: Vec::new() };
+    (Arc::new(reply), ReadSink { map: Some(map), ..ReadSink::all_rows() })
+}
+
+/// Autocommit attempts [`GnitzClient::read_modify_write`] makes before surfacing
+/// the conflict for the caller's own retry. Each attempt re-reads; there is no
+/// backoff.
+pub const RMW_MAX_ATTEMPTS: usize = 4;
 
 // --- GnitzClient ---
 
@@ -381,43 +399,13 @@ impl GnitzClient {
             .into_lsn())
     }
 
-    /// Write `batch`, built from a read of `table_id` served at watermark `basis`,
-    /// on the condition that `table_id` was not written after that read. Inside a
-    /// transaction it is buffered and COMMIT checks the condition; otherwise it
-    /// ships now as a one-family PUSH_TXN, and a `TxnConflict` refusal means a
-    /// write landed after the read. An empty batch writes nothing — the engine
-    /// rejects an empty family.
-    pub fn push_rmw(
-        &mut self,
-        table_id: u64,
-        schema: &Schema,
-        batch: ZSetBatch,
-        basis: u64,
-    ) -> Result<(), ClientError> {
-        if let Some(txn) = &mut self.txn {
-            txn.push(table_id, schema, batch, WireConflictMode::Update, basis)?;
-            return Ok(());
-        }
-        if batch.is_empty() {
-            return Ok(());
-        }
-        let families = [PushFamily {
-            tid: table_id,
-            schema,
-            batch: &batch,
-            mode: WireConflictMode::Update,
-            basis,
-        }];
-        self.round_trip(Request::PushTxn { families: &families }).map(|_| ())
-    }
-
     pub fn scan(&mut self, table_id: u64) -> ScanResult {
         self.round_trip(Request::scan(table_id)).map(Reply::into_scan)
     }
 
     /// Run a parameterized bounded read — the ad-hoc SELECT access path — decoding
     /// every reply frame under `reply_schema`, since the server sends no schema block.
-    pub fn scan_spec(&mut self, table_id: u64, spec: &gnitz_wire::ReadSpec, reply_schema: &Arc<Schema>) -> ScanResult {
+    pub fn scan_spec(&mut self, table_id: u64, spec: &ReadSpec, reply_schema: &Arc<Schema>) -> ScanResult {
         self.round_trip(Request::ScanSpec { target_id: table_id, spec, reply_schema })
             .map(Reply::into_scan)
     }
@@ -481,7 +469,7 @@ impl GnitzClient {
             return Ok(None);
         };
         let schema = Arc::clone(&view.desc.schema);
-        let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None);
+        let spec = ReadSpec::all_rows(ReadBound::None);
         let batch = store.scan_spec(table_id, spec, &schema)?;
         Ok(Some(ScanReply { schema, batch, lsn: None }))
     }
@@ -501,12 +489,7 @@ impl GnitzClient {
     /// [`Self::scan_spec`], answered off the copy when it holds `table_id`.
     ///
     /// A held answer is the answer, empty or not; only "not held" falls through.
-    pub fn scan_spec_local_first(
-        &mut self,
-        table_id: u64,
-        spec: gnitz_wire::ReadSpec,
-        reply_schema: &Arc<Schema>,
-    ) -> ScanResult {
+    pub fn scan_spec_local_first(&mut self, table_id: u64, spec: ReadSpec, reply_schema: &Arc<Schema>) -> ScanResult {
         if let Some((_, store)) = self.local_read(table_id) {
             let batch = store.scan_spec(table_id, spec, reply_schema)?;
             return Ok(ScanReply {
@@ -789,13 +772,17 @@ impl GnitzClient {
         self.txn.take().map(|_| ()).ok_or_else(no_transaction)
     }
 
-    /// Commit the open transaction as one atomic `PUSH_TXN` frame — all
-    /// families land together under one durable zone LSN, or none do. Returns
-    /// that LSN (0 for an empty transaction, which needs no wire roundtrip).
-    /// Errors if no transaction is open; the transaction is closed even when
-    /// the commit fails.
+    /// Commit the open transaction atomically and return its durable zone LSN, `0`
+    /// when it wrote nothing. Errors if no transaction is open; the transaction is
+    /// closed even when the commit fails.
     pub fn txn_commit(&mut self) -> Result<u64, ClientError> {
         let buf = self.txn.take().ok_or_else(no_transaction)?;
+        self.push_txn(&buf)
+    }
+
+    /// Ship `buf` as one `PUSH_TXN` frame, whose families land together under one
+    /// zone LSN or not at all; an empty buffer sends nothing.
+    fn push_txn(&mut self, buf: &TxnBuffer) -> Result<u64, ClientError> {
         if buf.families.is_empty() {
             return Ok(0);
         }
@@ -814,12 +801,50 @@ impl GnitzClient {
             .map(Reply::into_lsn)
     }
 
-    /// The open transaction's buffered ops on `tid`, read in `schema`'s layout.
-    /// `None` in autocommit and for a table the transaction has not written.
-    pub fn txn_reads(&mut self, tid: u64, schema: &Schema) -> Result<Option<TxnReads<'_>>, ClientError> {
-        match self.txn.as_mut() {
-            Some(txn) => txn.reads(tid, schema),
-            None => Ok(None),
+    /// Read `target`'s rows under `bound` and `predicate` — only their keys when
+    /// `keys` — as the open transaction sees them, hand them to `build`, and write
+    /// what it returns on the condition that `target` was not written after the
+    /// read. Returns the written row count.
+    ///
+    /// Inside a transaction COMMIT checks the condition. In autocommit the statement
+    /// is a transaction of its own, and a conflict re-reads and rebuilds, up to
+    /// [`RMW_MAX_ATTEMPTS`] times.
+    pub fn read_modify_write<E: From<ClientError>>(
+        &mut self,
+        target: &RelDescriptor,
+        bound: ReadBound,
+        predicate: Vec<u8>,
+        keys: bool,
+        mut build: impl FnMut(ZSetBatch) -> Result<ZSetBatch, E>,
+    ) -> Result<usize, E> {
+        let (tid, schema) = (target.tid, &target.schema);
+        let (reply, sink) = match keys {
+            true => key_reply(schema),
+            false => (Arc::clone(schema), ReadSink::all_rows()),
+        };
+        let spec = ReadSpec { bound, predicate, sink };
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let ScanReply { batch, lsn, .. } = self.scan_spec(tid, &spec, &reply)?;
+            let basis = lsn.expect("a server read carries its watermark");
+            let mut own = TxnBuffer::default();
+            let txn = self.txn.as_mut().unwrap_or(&mut own);
+            let batch = build(txn.overlay(tid, schema, &spec, keys, batch)?)?;
+            let count = batch.len();
+            txn.push(tid, schema, batch, WireConflictMode::Update, basis)?;
+            let pushed = match self.txn {
+                Some(_) => Ok(0),
+                None => self.push_txn(&own),
+            };
+            match pushed {
+                Err(ClientError::Refused(WireFault { status: WireStatus::TxnConflict, .. }))
+                    if attempt < RMW_MAX_ATTEMPTS => {}
+                r => {
+                    r?;
+                    return Ok(count);
+                }
+            }
         }
     }
 
@@ -1051,7 +1076,7 @@ impl GnitzClient {
         // A minimal SCAN_DELTA → INTEGRATE_SINK circuit, built through the typed
         // builder so the row materialisation matches the stored layout exactly.
         let mut circuit = Circuit::default();
-        let scan = circuit.input_delta(source_table_id, gnitz_wire::ReadBound::None);
+        let scan = circuit.input_delta(source_table_id, ReadBound::None);
         circuit.sink(scan);
 
         let view = PlannedView {
@@ -1482,26 +1507,12 @@ fn no_transaction() -> ClientError {
     ClientError::from("no transaction open".to_string())
 }
 
-/// The write side of an open transaction. `push` — its one write entry point —
-/// appends to the target
-/// tid's **last** family when its conflict mode matches, else opens a new family
-/// (run-splitting), so per-table op order is preserved end to end: buffer call
-/// order = family frame order = the engine's validation-fold and
-/// worker-application order. Cross-tid interleaving is unconstrained (FK
-/// validation is post-transaction, order-free).
-///
-/// It also indexes buffered rows by PK (`last_op_of`) so read-your-own-writes
-/// lookups are O(1) point reads rather than a re-fold of
-/// the whole buffer per statement. The index is built **on read**, from a
-/// per-family watermark: each row is folded in at most once across the whole
-/// transaction, and a transaction that never reads its own writes — a blind bulk
-/// INSERT — builds none of it.
-///
-/// Owned by [`GnitzClient::txn`]; every client write path routes into it while
-/// it is open, and `txn_commit` ships it as one `PUSH_TXN` frame. Dropping
-/// it is rollback — nothing was ever sent.
+/// A transaction's buffered writes, which [`GnitzClient::push_txn`] ships as one
+/// `PUSH_TXN` frame; dropping it sends nothing. Per tid, the families are the
+/// maximal same-mode runs of the writes in call order, the order the engine
+/// validates and applies them in.
 #[derive(Default)]
-pub struct TxnBuffer {
+struct TxnBuffer {
     /// Creation order; per tid, maximal same-mode runs of the caller's op
     /// sequence.
     families: Vec<BufferedFamily>,
@@ -1533,7 +1544,7 @@ impl TxnBuffer {
     /// `[I(k)]`, in that order.
     ///
     /// Refused when `batch` is not in the layout `tid` already holds.
-    pub fn push(
+    fn push(
         &mut self,
         tid: u64,
         schema: &Schema,
@@ -1608,41 +1619,65 @@ impl TxnBuffer {
         self.families.iter().map(|f| f.indexed).sum()
     }
 
-    /// This buffer's ops on `tid`, with that relation's index caught up first;
-    /// `None` when the transaction holds no live op on `tid`.
-    pub fn reads(&mut self, tid: u64, schema: &Schema) -> Result<Option<TxnReads<'_>>, ClientError> {
+    /// `committed`, a server read of `tid` under `spec`, as this transaction sees
+    /// it: less every PK the transaction wrote, plus its live rows (last op per PK,
+    /// weight > 0) that `spec` keeps. With `keys`, `committed` is in the
+    /// [`key_reply`] layout, and so are the added rows.
+    fn overlay(
+        &mut self,
+        tid: u64,
+        schema: &Schema,
+        spec: &ReadSpec,
+        keys: bool,
+        committed: ZSetBatch,
+    ) -> Result<ZSetBatch, ClientError> {
         self.check_layout(tid, |held| held.batch.layout_matches(schema))?;
         self.index_tid(tid);
-        let Some(index) = self.last_op_of.get(&tid).filter(|m| !m.is_empty()) else {
-            return Ok(None);
+        let Some(index) = self.last_op_of.get(&tid) else {
+            return Ok(committed);
         };
-        Ok(Some(TxnReads { families: &self.families, index }))
-    }
-}
+        let keep: Vec<(usize, i64)> = (0..committed.len())
+            .filter(|&i| !index.contains_key(committed.pks.get_bytes(i)))
+            .map(|i| (i, committed.weights[i]))
+            .collect();
+        // `gather` compacts the string arena the dropped rows carried.
+        let mut out = committed.gather(&keep);
 
-/// The buffered ops on **one** relation — the only way to reach them, and the
-/// only way to construct it runs the index catch-up. So a read against a stale
-/// index, or against a relation the caller did not catch up, cannot be written.
-pub struct TxnReads<'a> {
-    families: &'a [BufferedFamily],
-    index: &'a HashMap<PkBuf, (usize, usize)>,
-}
-
-impl<'a> TxnReads<'a> {
-    /// The last op buffered on `pk`, as `(batch, row)` — or `None` if the
-    /// transaction has not touched that PK. The row's **weight sign** is the net
-    /// effect (positive: live row with that payload; negative: deleted),
-    /// mirroring the engine's own per-table fold.
-    pub fn last_op(&self, pk: &[u8]) -> Option<(&'a ZSetBatch, usize)> {
-        let &(fam, row) = self.index.get(pk)?;
-        Some((&self.families[fam].batch, row))
-    }
-
-    /// The last op on every PK the transaction has touched, as [`Self::last_op`]
-    /// returns one.
-    pub fn last_ops(&self) -> impl Iterator<Item = (&'a ZSetBatch, usize)> + '_ {
-        let families = self.families;
-        self.index.values().map(move |&(fam, row)| (&families[fam].batch, row))
+        let mut live = ZSetBatch::new(schema);
+        let families = &self.families;
+        let take = |&(fam, row): &(usize, usize)| {
+            let b = &families[fam].batch;
+            if b.weights[row] > 0 {
+                live.copy_row_at(b, row, b.weights[row]);
+            }
+        };
+        match &spec.bound {
+            ReadBound::PkSet(set) => set.iter().filter_map(|k| index.get(k)).for_each(take),
+            _ => index.values().for_each(take),
+        }
+        if live.is_empty() {
+            return Ok(out);
+        }
+        let mut ranges = Vec::new();
+        RowFilter::for_read(&spec.predicate, &spec.bound, schema)
+            .map_err(|e| ClientError::from(e.to_string()))?
+            .ranges(&live, &mut ranges);
+        if keys {
+            // The predicate has read the payload; the key reply carries none.
+            live.payload.clear();
+            live.blob.clear();
+            live.retain_ranges(&ranges);
+            live.nulls.fill(0);
+        } else {
+            let kept: Vec<(usize, i64)> = ranges
+                .iter()
+                .flat_map(|&(s, e)| s..e)
+                .map(|r| (r, live.weights[r]))
+                .collect();
+            live = live.gather(&kept);
+        }
+        out.extend_from_owned(live);
+        Ok(out)
     }
 }
 

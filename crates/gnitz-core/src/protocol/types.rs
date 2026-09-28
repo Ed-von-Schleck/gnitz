@@ -51,6 +51,12 @@ impl Schema {
         }
     }
 
+    /// The PK columns in PK-list order, hidden: the leading key of a reply that
+    /// carries this schema's key.
+    pub fn hidden_key_columns(&self) -> impl Iterator<Item = ColumnDef> + '_ {
+        self.pk_cols.iter().map(|&c| self.columns[c as usize].clone().hidden())
+    }
+
     /// The non-PK ("payload") columns as `(payload slot, col_idx, &ColumnDef)`,
     /// in slot order.
     #[inline]

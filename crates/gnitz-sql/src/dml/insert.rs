@@ -1,12 +1,10 @@
 //! INSERT, including the `ON CONFLICT` upsert family. The default form pushes
-//! with `WireConflictMode::Error`; `DO NOTHING` / `DO UPDATE` are resolved
-//! client-side (seek existing PKs, then filter or merge) before a single push.
-//! `DO UPDATE SET` binds, compiles and applies its list through `mutate`'s SET
-//! list (`bind_set_list`, `classify_set_rhs`, `apply_set`), so it behaves exactly
-//! like an `UPDATE ... SET`.
+//! with `WireConflictMode::Error`; `DO NOTHING` / `DO UPDATE` filter or merge the
+//! VALUES against the rows their keys hold, as a read-modify-write. `DO UPDATE
+//! SET` runs `mutate`'s SET list, so it behaves exactly like an `UPDATE ... SET`.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -16,7 +14,6 @@ use crate::bind::structural::bind_constant;
 use crate::codec::colwrite::{append_value_to_col, check_not_null, native_value};
 use crate::dml::mutate::{apply_set, bind_set_list, SetClause, SetCol};
 use crate::dml::plan::{rows_reply, RowsReply};
-use crate::dml::rmw::{commit_rmw, TargetRead};
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::exec::client_map::ClientMap;
 use crate::ir::BExpr;
@@ -296,54 +293,49 @@ pub(crate) fn execute_insert(
             }
         }
         ConflictPlan::Resolve { mut set } => {
-            // The RMW driver pushes `Update`, not `Error`: its OCC precondition is
-            // what settles a stale resolution, where `Error` would raise a
-            // duplicate-key error out of a statement spelled "do nothing". Re-resolved
-            // per retry, so `SET x = x + 1` reads the freshest `x`; every row rides
-            // at +1 and the worker's `enforce_unique_pk` turns a merged one into the
-            // retract-and-insert. DO NOTHING reads the held keys alone.
-            let keys = PkKeys::from_keys(schema.pk_stride(), (0..batch.len()).map(|i| batch.pks.get_bytes(i)));
-            let read = TargetRead::new(&target, ReadBound::PkSet(keys), Vec::new(), set.is_none())?;
-            let count = commit_rmw(client, &read, |held| {
-                resolve_conflicts(&batch, held, set.as_deref_mut(), schema)
+            let mut first: HashMap<&[u8], usize> = HashMap::with_capacity(batch.len());
+            for i in 0..batch.len() {
+                match first.entry(batch.pks.get_bytes(i)) {
+                    Entry::Vacant(v) => {
+                        v.insert(i);
+                    }
+                    Entry::Occupied(_) if set.is_some() => {
+                        return Err(GnitzSqlError::Rejected(
+                            "ON CONFLICT DO UPDATE cannot affect row a second time \
+                             (duplicate PK in the same batch)"
+                                .to_string(),
+                        ))
+                    }
+                    Entry::Occupied(_) => {}
+                }
+            }
+            let bound = ReadBound::PkSet(PkKeys::from_keys(schema.pk_stride(), first.keys().copied()));
+            let keys_only = set.is_none();
+            let count = client.read_modify_write(&target, bound, Vec::new(), keys_only, |held| {
+                resolve_conflicts(&batch, &first, held, set.as_deref_mut(), schema)
             })?;
             Ok(SqlResult::RowsAffected { count })
         }
     }
 }
 
-/// The batch an ON CONFLICT pushes. A key no row holds passes through; a held key
-/// is dropped (DO NOTHING) or merged with the SET list (DO UPDATE); a key repeated
-/// within the batch is skipped (DO NOTHING) or refused (DO UPDATE, PostgreSQL's
-/// "cannot affect row a second time").
+/// The batch an ON CONFLICT pushes: each key's `first` row of `batch`. A key no row
+/// holds passes through; a held key is dropped (DO NOTHING) or merged with the SET
+/// list (DO UPDATE).
 fn resolve_conflicts(
     batch: &ZSetBatch,
+    first: &HashMap<&[u8], usize>,
     held: ZSetBatch,
     set: Option<&mut [SetCol]>,
     schema: &Schema,
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    let is_held: HashSet<&[u8]> = (0..held.len()).map(|r| held.pks.get_bytes(r)).collect();
-    // Each key's first incoming row: the dedup and the EXCLUDED source at once.
-    let mut first: HashMap<&[u8], usize> = HashMap::with_capacity(batch.len());
-    let mut out = ZSetBatch::with_capacity(schema, batch.len());
-    for i in 0..batch.len() {
-        let key = batch.pks.get_bytes(i);
-        match first.entry(key) {
-            Entry::Occupied(_) if set.is_some() => {
-                return Err(GnitzSqlError::Rejected(
-                    "ON CONFLICT DO UPDATE cannot affect row a second time \
-                     (duplicate PK in the same batch)"
-                        .to_string(),
-                ))
-            }
-            Entry::Occupied(_) => continue,
-            Entry::Vacant(v) => {
-                v.insert(i);
-            }
-        }
-        if !is_held.contains(key) {
-            out.copy_row_at(batch, i, batch.weights[i]);
-        }
+    let mut is_held = vec![false; batch.len()];
+    for r in 0..held.len() {
+        is_held[first[held.pks.get_bytes(r)]] = true;
+    }
+    let mut out = ZSetBatch::with_capacity(schema, first.len());
+    for i in (0..batch.len()).filter(|&i| !is_held[i] && first[batch.pks.get_bytes(i)] == i) {
+        out.copy_row_at(batch, i, batch.weights[i]);
     }
     if let Some(set) = set {
         // `held` is the `Existing` scope, so `SET x = x + 1` reads the row a

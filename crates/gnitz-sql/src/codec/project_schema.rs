@@ -4,7 +4,7 @@
 //! `place_pk_front` pins the source PK to the leading output slots of a CREATE VIEW
 //! linear projection; [`payload_map`] compiles such a projection's payload into a
 //! [`ComputeMap`]; [`reply_program`] builds the reply schema and program of a
-//! leading-key projection, and [`key_reply`] the keys-only one.
+//! leading-key projection.
 
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_bound_expr;
@@ -158,22 +158,11 @@ pub(crate) fn reply_program(
     what: &str,
 ) -> Result<(Schema, LogicalProgram), GnitzSqlError> {
     let program = compile_projection_map(payload_items, &payload_cols, source)?;
-    let key = source
-        .pk_cols
-        .iter()
-        .map(|&c| source.columns[c as usize].clone().hidden());
     let k = source.pk_count() as u32;
-    let schema = Schema::from_parts(key.chain(payload_cols).collect(), (0..k).collect())
-        .map_err(|e| GnitzSqlError::Rejected(format!("{what}: {e}")))?;
+    let columns = source.hidden_key_columns().chain(payload_cols).collect();
+    let schema =
+        Schema::from_parts(columns, (0..k).collect()).map_err(|e| GnitzSqlError::Rejected(format!("{what}: {e}")))?;
     Ok((schema, program))
-}
-
-/// The keys-only reply over `schema`: its PK columns, hidden, and a map that fills no
-/// payload slot.
-pub(crate) fn key_reply(schema: &Schema) -> Result<(Schema, ComputeMap), GnitzSqlError> {
-    let (reply, program) = reply_program(&[], Vec::new(), schema, "key reply schema is invalid")?;
-    let map = compute_map(program, &reply);
-    Ok((reply, map))
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 //! UPDATE and DELETE, as one read-then-write flow: plan the WHERE through the
-//! shared access-path ladder (`dml::plan`), then, under the RMW driver
-//! (`dml::rmw`), read the rows it matches in the transaction's effective state and
-//! write the rewritten rows (UPDATE) or the retraction of their keys (DELETE).
+//! shared access-path ladder (`dml::plan`), then, as one read-modify-write, read
+//! the rows it matches and write the rewritten rows (UPDATE) or the retraction of
+//! their keys (DELETE).
 //!
 //! The SET list — [`bind_set_list`] binds the targets, [`classify_set_rhs`]
 //! compiles each value, [`apply_set`] rewrites a batch — is shared with INSERT's
@@ -11,7 +11,6 @@ use crate::ast_util::{classify_from, extract_table_name_and_alias, single_part_i
 use crate::bind::{bind_single_table, find_unique_column};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
 use crate::dml::plan::access_path;
-use crate::dml::rmw::{commit_rmw, TargetRead};
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::BoundExpr;
@@ -35,7 +34,6 @@ pub(crate) fn execute_update(
     execute_mutation(
         client,
         schema_name,
-        "UPDATE",
         std::slice::from_ref(&update.table),
         update.selection.as_ref(),
         Some(&update.assignments),
@@ -49,7 +47,7 @@ pub(crate) fn execute_delete(
 ) -> Result<SqlResult, GnitzSqlError> {
     reject_unhonored_delete_clauses(del)?;
     let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = &del.from;
-    execute_mutation(client, schema_name, "DELETE", from, del.selection.as_ref(), None)
+    execute_mutation(client, schema_name, from, del.selection.as_ref(), None)
 }
 
 /// A single-table UPDATE (`set` present) or DELETE: read the rows the WHERE
@@ -57,11 +55,11 @@ pub(crate) fn execute_delete(
 fn execute_mutation(
     client: &mut GnitzClient,
     schema_name: &str,
-    verb: &str,
     from: &[TableWithJoins],
     selection: Option<&Expr>,
     set: Option<&[Assignment]>,
 ) -> Result<SqlResult, GnitzSqlError> {
+    let verb = if set.is_some() { "UPDATE" } else { "DELETE" };
     // `UPDATE a JOIN b ON … SET v = 1` parses; honoring only the relation would
     // update all of `a`.
     let FromShape::SinglePlainRelation(factor) = classify_from(from) else {
@@ -78,11 +76,8 @@ fn execute_mutation(
         .map(|raw| bind_set_list(raw, schema, &alias, SetClause::Update))
         .transpose()?;
     let (bound, predicate) = access_path(schema, &alias, selection, &target.indexes)?;
-    // UPDATE reads whole rows; DELETE the source PK alone, with no blob heap. Both
-    // writes are built under the catalog schema, so an in-transaction DELETE
-    // buffers in the layout an INSERT does.
-    let read = TargetRead::new(&target, bound, predicate, set.is_none())?;
-    let count = commit_rmw(client, &read, |rows| match &mut set {
+    let keys_only = set.is_none();
+    let count = client.read_modify_write(&target, bound, predicate, keys_only, |rows| match &mut set {
         Some(set) => apply_set(set, rows, None, schema),
         None => Ok(retraction_batch(schema, rows.pks)),
     })?;

@@ -1,36 +1,21 @@
 #![cfg(feature = "integration")]
 
-//! A `ReadSpec` rows sink whose reply is **nothing but the primary key**: a
-//! PK-only reply schema plus a zero-instruction projection program.
+//! [`gnitz_core::key_reply`]: a `ReadSpec` rows sink whose reply is **nothing but
+//! the primary key**, a PK-only reply schema plus a zero-instruction projection
+//! program — a keys-only read over a table whose payload would not fit in one
+//! reply frame.
 //!
-//! No planner builds this shape by any other route — the ad-hoc read path always
-//! keeps at least one payload slot — and it is what lets `DELETE` read back only
-//! the keys it will retract, over a table whose payload would not even fit in one
-//! reply frame. What it exercises: a schema with zero payload columns is legal on
-//! the wire; a zero-instruction program is a non-empty blob, so the worker takes
-//! its projection branch rather than the identity one; the reply carries no blob
-//! heap; and the PK region round-trips byte-for-byte, including through a
-//! permuted, non-adjacent compound PK whose OPK sign flip must survive.
+//! What it exercises: a schema with zero payload columns is legal on the wire; a
+//! zero-instruction program is a non-empty blob, so the worker takes its
+//! projection branch rather than the identity one; the reply carries no blob heap;
+//! and the PK region round-trips byte-for-byte, including through a permuted,
+//! non-adjacent compound PK whose OPK sign flip must survive.
 
 use gnitz_core::protocol::{ColumnDef, Schema, TypeCode};
-use gnitz_core::{BatchAppender, GnitzClient, SchemaFacts, TableProps, ZSetBatch};
+use gnitz_core::{key_reply, BatchAppender, GnitzClient, SchemaFacts, TableProps, ZSetBatch};
 use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr as L};
 use gnitz_test_harness::{unique_schema, ServerHandle};
-use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
-
-/// The PK-only reply for `schema`: its PK columns in PK-list order, keyed on all
-/// of them, with no payload column at all.
-fn pk_only_reply_schema(schema: &Schema) -> std::sync::Arc<Schema> {
-    let cols: Vec<ColumnDef> = schema
-        .pk_cols
-        .iter()
-        .map(|&ci| schema.columns[ci as usize].clone())
-        .collect();
-    let k = cols.len();
-    std::sync::Arc::new(
-        Schema::from_parts(cols, (0..k as u32).collect()).expect("a PK-only reply schema is admissible"),
-    )
-}
+use gnitz_wire::{ReadBound, ReadSpec};
 
 /// `col > threshold` as a compiled predicate blob, over the SOURCE schema's
 /// column indices.
@@ -49,19 +34,6 @@ fn assert_no_payload(reply: &ZSetBatch, reply_schema: &Schema) {
     reply
         .validate(reply_schema)
         .expect("the reply validates under its schema");
-}
-
-/// The keys-only rows sink: a zero-instruction map declaring no slot, no ORDER
-/// BY, no limit.
-fn keys_only_sink() -> ReadSink {
-    let program = ExprBuilder::new()
-        .build(None)
-        .expect("a well-formed program")
-        .to_blob_bytes();
-    ReadSink {
-        map: Some(gnitz_wire::ComputeMap { program, out_cols: vec![] }),
-        ..ReadSink::all_rows()
-    }
 }
 
 /// A U64 PK, a TEXT column wide enough that an unprojected reply would carry a
@@ -97,14 +69,14 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
     }
     client.push(tid, &schema, &batch).unwrap();
 
-    let reply_schema = pk_only_reply_schema(&schema);
+    let (reply_schema, sink) = key_reply(&schema);
     assert_eq!(reply_schema.num_payload_cols(), 0, "the reply is nothing but the key");
     assert_eq!(reply_schema.pk_stride(), schema.pk_stride());
 
     let spec = ReadSpec {
         bound: ReadBound::None,
         predicate: gt_predicate(1, 150),
-        sink: keys_only_sink(),
+        sink,
     };
     let reply = client
         .scan_spec(tid, &spec, &reply_schema)
@@ -164,7 +136,7 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     }
     client.push(tid, &schema, &batch).unwrap();
 
-    let reply_schema = pk_only_reply_schema(&schema);
+    let (reply_schema, sink) = key_reply(&schema);
     assert_eq!(reply_schema.pk_stride(), schema.pk_stride());
     assert_eq!(reply_schema.num_payload_cols(), 0);
 
@@ -172,7 +144,7 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     let spec = ReadSpec {
         bound: ReadBound::None,
         predicate: gt_predicate(2, 15),
-        sink: keys_only_sink(),
+        sink,
     };
     let reply = client
         .scan_spec(tid, &spec, &reply_schema)
@@ -198,8 +170,7 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     assert_eq!(got, want, "both PK columns round-trip verbatim, sign flip included");
     assert_no_payload(&reply, &reply_schema);
 
-    // The un-projected read of the same rows carries the payload the DELETE shape
-    // drops — the whole point of the projection.
+    // The un-projected read of the same rows carries the payload the key reply drops.
     let full = client
         .scan_spec(tid, &ReadSpec::all_rows(ReadBound::None), &schema)
         .unwrap()

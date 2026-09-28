@@ -9,7 +9,6 @@ mod explain;
 mod insert;
 mod mutate;
 mod plan;
-mod rmw;
 mod select;
 
 pub(crate) use explain::execute_explain;
