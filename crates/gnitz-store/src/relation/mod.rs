@@ -10,9 +10,7 @@ use crate::schema::key::{key_range_between_cuts, pk_in_range, KeyCut};
 use crate::schema::SchemaDescriptor;
 
 use crate::schema::Slot;
-use crate::storage::{
-    Batch, PkSetGather, ReadCursor, RecoverySource, StorageError, StoreBudgets, StoreError, StoredRow, Table,
-};
+use crate::storage::{Batch, PkSetGather, ReadCursor, RecoverySource, StorageError, StoreBudgets, StoredRow, Table};
 use gnitz_wire::{PkColList, PkKeys, ViewProps};
 
 mod build;
@@ -344,14 +342,11 @@ impl Relation {
     }
 
     /// `cols`, if each names a column of this relation.
-    pub(crate) fn bound_cols(&self, cols: PkColList, op: &str) -> Result<PkColList, StoreError> {
+    pub(crate) fn bound_cols(&self, cols: PkColList, op: &str) -> Result<PkColList, String> {
         let schema = self.schema();
         match cols.as_slice().iter().all(|&c| schema.column(c as usize).is_some()) {
             true => Ok(cols),
-            false => Err(StoreError::rejected(format!(
-                "{op}: invalid column list for table {}",
-                self.id
-            ))),
+            false => Err(format!("{op}: invalid column list for table {}", self.id)),
         }
     }
 }
@@ -474,7 +469,7 @@ impl RelationRegistry {
     /// slice of the owner, or add a claim to the one already on `cols`. On
     /// `Err` nothing is entered. A claim's `unique` is trusted: a duplicate can
     /// straddle two workers' slices, so only the caller can check it.
-    pub fn add_index(&mut self, owner: u64, claim: IndexClaim, cols: &[u32]) -> Result<(), StoreError> {
+    pub fn add_index(&mut self, owner: u64, claim: IndexClaim, cols: &[u32]) -> Result<(), String> {
         let owner_schema = self.index_owner(owner)?.schema();
         if let Some(ix) = self.relation_mut(owner).and_then(|e| e.index_on_mut(cols)) {
             // The IDX_TAB net bound keeps one live row per id, applied once per process.
@@ -482,8 +477,7 @@ impl RelationRegistry {
             ix.claims.push(claim);
             return Ok(());
         }
-        let (key_spec, index_schema) =
-            crate::schema::index_spec_and_schema(cols, &owner_schema).map_err(StoreError::rejected)?;
+        let (key_spec, index_schema) = crate::schema::index_spec_and_schema(cols, &owner_schema)?;
         let mut ix = SecondaryIndex {
             cols: PkColList::from_slice(cols),
             store: Store::Absent(Box::new(index_schema)),
@@ -523,20 +517,20 @@ impl RelationRegistry {
     /// Publish a new column schema for a registered base table in place (any
     /// column ALTER): update the registry copy and push the same value down into
     /// the owned `Table`, which rebinds its shards if the region count grew.
-    pub fn swap_schema(&mut self, id: u64, schema: SchemaDescriptor) -> Result<(), StoreError> {
+    pub fn swap_schema(&mut self, id: u64, schema: SchemaDescriptor) -> Result<(), String> {
         let entry = self.relation_mut_or_err(id)?;
         // Checked, not asserted: what a stale `key_spec` produces is a silently
         // wrong index projection, which release codegen would not guard at all.
         if !schema.is_trailing_append_of(entry.store.schema()) {
-            return Err(StoreError::rejected(format!(
+            return Err(format!(
                 "ALTER on table {id}: the new descriptor is not a trailing append, \
                  which every index circuit's baked key_spec requires"
-            )));
+            ));
         }
         entry
             .store
             .swap_schema(schema)
-            .map_err(|e| StoreError::storage(format!("ALTER on table {id}: rebinding shards"), e))
+            .map_err(|e| format!("ALTER on table {id}: rebinding shards: {e}"))
     }
 
     // ── Registry reads ──────────────────────────────────────────────────
@@ -585,29 +579,29 @@ impl RelationRegistry {
     /// [`Self::relation`] plus the one "not registered" sentence — spelled the
     /// same by the mutating paths, so which verb asked cannot change what a
     /// client reads.
-    pub fn relation_or_err(&self, id: u64) -> Result<&Relation, StoreError> {
+    pub fn relation_or_err(&self, id: u64) -> Result<&Relation, String> {
         self.relation(id).ok_or_else(|| Self::unregistered(id))
     }
 
     /// `owner`, if it may carry a secondary index: only a base table can.
-    pub fn index_owner(&self, owner: u64) -> Result<&Relation, StoreError> {
+    pub fn index_owner(&self, owner: u64) -> Result<&Relation, String> {
         let e = self.relation_or_err(owner)?;
         if !e.kind().is_base_table() {
-            return Err(StoreError::rejected(format!(
+            return Err(format!(
                 "Index: owner {owner} is a {}; only a base table can be indexed",
                 e.kind().noun()
-            )));
+            ));
         }
         Ok(e)
     }
 
     /// [`Self::relation_or_err`] as `&mut`.
-    pub fn relation_mut_or_err(&mut self, id: u64) -> Result<&mut Relation, StoreError> {
+    pub fn relation_mut_or_err(&mut self, id: u64) -> Result<&mut Relation, String> {
         self.relation_mut(id).ok_or_else(|| Self::unregistered(id))
     }
 
-    fn unregistered(id: u64) -> StoreError {
-        StoreError::rejected(format!("relation {id} is not registered"))
+    fn unregistered(id: u64) -> String {
+        format!("relation {id} is not registered")
     }
 
     /// True iff at least one registered relation carries a delta feed.
@@ -625,9 +619,9 @@ impl RelationRegistry {
     }
 
     /// The column list a `pack_pk_cols` word names, admitted by [`Relation::bound_cols`].
-    pub fn index_cols(&self, id: u64, packed: u64, op: &str) -> Result<PkColList, StoreError> {
-        let cols = gnitz_wire::unpack_pk_cols(packed)
-            .map_err(|_| StoreError::rejected(format!("{op}: invalid column list for table {id}")))?;
+    pub fn index_cols(&self, id: u64, packed: u64, op: &str) -> Result<PkColList, String> {
+        let cols =
+            gnitz_wire::unpack_pk_cols(packed).map_err(|_| format!("{op}: invalid column list for table {id}"))?;
         self.relation_or_err(id)?.bound_cols(cols, op)
     }
 

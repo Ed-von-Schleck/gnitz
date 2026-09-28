@@ -209,16 +209,14 @@ impl CatalogEngine {
     /// Move `_sequences` row `seq_id` to `value`.
     fn set_sequence(&mut self, seq_id: u64, value: u64) -> Result<(), String> {
         let delta = self.sequence_delta(seq_id, value);
-        self.registry
-            .ingest(SysFamily::Sequence.id(), delta)
-            .map_err(|e| format!("sys_sequences ingest (seq {seq_id}) failed: {e}"))
+        self.registry.ingest(SysFamily::Sequence.id(), delta)
     }
 
     /// Write the next catalog id to `_sequences`, then flush every system table
     /// in one barrier.
     pub(crate) fn flush_all_system_tables(&mut self) -> Result<(), String> {
         self.set_sequence(SEQ_ID_NEXT_ID, self.next_id)?;
-        Ok(self.registry.checkpoint_system(self.system_zone)?)
+        self.registry.checkpoint_system(self.system_zone)
     }
 
     /// Load the next catalog id stored in `_sequences`, and latch the registry's
@@ -255,7 +253,7 @@ impl CatalogEngine {
     /// published after it is stamped with too.
     pub(crate) fn flush_ephemeral_round(&mut self, generation: u64) -> Result<(), String> {
         self.registry.set_resume_generation(generation);
-        Ok(self.registry.checkpoint_ephemeral(self.dag.ephemeral_states())?)
+        self.registry.checkpoint_ephemeral(self.dag.ephemeral_states())
     }
 
     /// Record the launched topology. Durable at the next system flush.

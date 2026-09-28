@@ -2,12 +2,12 @@
 
 use super::*;
 use gnitz_store::ops;
-use gnitz_store::storage::{Batch, StorageError, StoreError};
+use gnitz_store::storage::{Batch, StorageError};
 
 /// The one context template for a `vm:` ingest fault.
 #[cold]
-fn ingest_err(op: &str, idx: StateIdx, e: StorageError) -> StoreError {
-    StoreError::storage(format!("vm: {op} ingest (state_idx={idx:?})"), e)
+fn ingest_err(op: &str, idx: StateIdx, e: StorageError) -> String {
+    format!("vm: {op} ingest (state_idx={idx:?}): {e}")
 }
 
 /// Execute one epoch over `inputs`, one `(register, batch)` per seeded input —
@@ -17,7 +17,7 @@ pub(in crate::query) fn execute_epoch_multi(
     vm: &mut Vm,
     state: &mut CircuitState,
     inputs: impl IntoIterator<Item = (DeltaReg, Batch)>,
-) -> Result<Batch, StoreError> {
+) -> Result<Batch, String> {
     let all_empty = seed_inputs(vm, inputs);
     // Spent by any dispatched epoch, not just an empty one: the ground reduce
     // runs either way and leaves V₀ in its output trace.
@@ -37,7 +37,7 @@ pub(in crate::query) fn replay_chunk(
     state: &mut CircuitState,
     entry: ReplayEntry,
     seed: Batch,
-) -> Result<Batch, StoreError> {
+) -> Result<Batch, String> {
     seed_inputs(vm, std::iter::once((entry.reg, seed)));
     run_instructions(vm, state, entry.pc)?;
     let out = take_output(vm);
@@ -92,7 +92,7 @@ fn take_or_clone(batches: &mut [Batch], reg: DeltaReg, take: bool) -> Batch {
 }
 
 /// Run the instruction stream from `start_pc`.
-fn run_instructions(vm: &mut Vm, state: &mut CircuitState, start_pc: usize) -> Result<(), StoreError> {
+fn run_instructions(vm: &mut Vm, state: &mut CircuitState, start_pc: usize) -> Result<(), String> {
     let Vm { program, batches, .. } = vm;
 
     gnitz_debug!(
@@ -223,7 +223,7 @@ fn run_instructions(vm: &mut Vm, state: &mut CircuitState, start_pc: usize) -> R
 
 /// Accumulate each delta into its trace, after the whole instruction range — so
 /// no cursor opened in that range can observe this tick's integration.
-fn run_integrates(vm: &mut Vm, state: &mut CircuitState) -> Result<(), StoreError> {
+fn run_integrates(vm: &mut Vm, state: &mut CircuitState) -> Result<(), String> {
     let Vm { program, batches, .. } = vm;
     for (i, &(reg, trace)) in program.integrates.iter().enumerate() {
         let take = program.regs[reg.at()].last_read == LastRead::Integrate(i);

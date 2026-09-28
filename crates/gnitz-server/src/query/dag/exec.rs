@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::query::compiler::OUTPUT_RELAY;
-use gnitz_store::storage::StoreError;
 
 /// One edge of a tick's schedule: `producer`'s output feeds `view`. Field order
 /// is the sort order, and sorting puts a view after every view it reads, because
@@ -88,11 +87,11 @@ fn run_view_epoch(host: &mut impl DriveHost, view_id: u64, input: Batch, src_id:
         true => relay.send(host, input, src_id, true),
         false => input,
     };
-    run_plan(host, &relay, input, src_id).map_err(|e| e.to_string())
+    run_plan(host, &relay, input, src_id)
 }
 
 /// Run every side that scans `src_id` over its delta, then the post combine.
-fn run_plan(host: &mut impl DriveHost, relay: &Relay, input: Batch, src_id: u64) -> Result<Batch, StoreError> {
+fn run_plan(host: &mut impl DriveHost, relay: &Relay, input: Batch, src_id: u64) -> Result<Batch, String> {
     let code = &plan_of(host, relay.view_id).code;
     if code.sides.is_empty() {
         let seed = sub_seed(&code.post, input, src_id);
@@ -117,7 +116,7 @@ fn run_post(
     host: &mut impl DriveHost,
     view_id: u64,
     seeds: impl IntoIterator<Item = (vm::DeltaReg, Batch)>,
-) -> Result<Batch, StoreError> {
+) -> Result<Batch, String> {
     let ViewPlan { code, state } = plan_of(host, view_id);
     vm::execute_epoch_multi(&mut code.post.vm, state, seeds)
 }
@@ -129,7 +128,7 @@ fn run_side(
     i: usize,
     delta: Batch,
     src_id: u64,
-) -> Result<(vm::DeltaReg, Batch), StoreError> {
+) -> Result<(vm::DeltaReg, Batch), String> {
     let (pre, seed_reg, emits_replica) = {
         let ViewPlan { code, state } = plan_of(host, relay.view_id);
         let side = &mut code.sides[i];
@@ -170,7 +169,7 @@ impl DagEngine {
                 sub.vm.release();
             }
         }
-        registry.fold_to_ram(view_id).map_err(|e| e.to_string())
+        registry.fold_to_ram(view_id)
     }
 }
 

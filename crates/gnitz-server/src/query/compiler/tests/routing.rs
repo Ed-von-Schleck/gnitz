@@ -973,6 +973,6 @@ fn a_scan_of_an_unregistered_relation_is_rejected() {
     );
     assert_eq!(
         rejection(derive(&loaded, &sources([(7, wide_schema())]))),
-        "source 8 is not a registered relation"
+        "relation 8 is not registered"
     );
 }

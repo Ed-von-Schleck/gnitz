@@ -5,7 +5,6 @@
 use super::*;
 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StateLayout, StoreConfig};
 use gnitz_store::schema::Slot;
-use gnitz_store::storage::StoreError;
 use gnitz_wire::ViewProps;
 
 /// The view id every plan below is compiled for.
@@ -78,14 +77,11 @@ pub(in crate::query) struct TestVm {
 }
 
 impl TestVm {
-    pub(in crate::query) fn epoch<const N: usize>(
-        &mut self,
-        inputs: [(DeltaReg, Batch); N],
-    ) -> Result<Batch, StoreError> {
+    pub(in crate::query) fn epoch<const N: usize>(&mut self, inputs: [(DeltaReg, Batch); N]) -> Result<Batch, String> {
         execute_epoch_multi(&mut self.vm, &mut self.state, inputs)
     }
 
-    pub(in crate::query) fn replay(&mut self, seed: (DeltaReg, Batch)) -> Result<Batch, StoreError> {
+    pub(in crate::query) fn replay(&mut self, seed: (DeltaReg, Batch)) -> Result<Batch, String> {
         let entry = self.vm.program.replay_entry(seed.0).unwrap();
         replay_chunk(&mut self.vm, &mut self.state, entry, seed.1)
     }

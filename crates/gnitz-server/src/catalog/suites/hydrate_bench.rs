@@ -33,7 +33,7 @@ impl SkeletonHydrator for Counting<'_> {
         registry: &RelationRegistry,
         view_id: u64,
         keys: gnitz_wire::PkKeys,
-    ) -> Result<Batch, StoreError> {
+    ) -> Result<Batch, String> {
         let out = self.dag.hydrate_keys(registry, view_id, keys)?;
         self.hydrated += out.len();
         Ok(out)

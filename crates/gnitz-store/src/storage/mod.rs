@@ -16,7 +16,7 @@ mod spill;
 #[cfg(test)]
 mod suites;
 
-pub use error::{StorageError, StoreError};
+pub use error::StorageError;
 pub use lsm::read_cursor::{PkSetGather, ReadCursor};
 pub use lsm::run::StoredRow;
 pub use repr::batch::{Batch, Layout, MAX_BATCH_REGIONS};

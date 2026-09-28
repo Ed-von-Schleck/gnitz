@@ -903,7 +903,6 @@ async fn handle_read(
                 .cat()
                 .registry
                 .scan_spec(target_id, spec, schema.layout_digest(), None)
-                .map_err(|e| WireFault::from(e.to_string()))
         })?;
         let (schema_block, server_version) = shared.cat().negotiated_schema_block(target_id, client_version);
         send_msg(

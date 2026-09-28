@@ -2,7 +2,7 @@ use super::*;
 use crate::relation::{IndexClaim, RelationKind, RelationSpec, StoreConfig};
 use crate::schema::Slot;
 use crate::schema::{SchemaColumn, TypeCode};
-use crate::storage::{BatchBuilder, StoreError};
+use crate::storage::BatchBuilder;
 use crate::test_support::payload0_i64;
 use gnitz_wire::{key_image, AggDescriptor, AggReadSpec, Cut, KeyRange, OrderKey, PkColList, ReadSink};
 use gnitz_wire::{PkKeys, ViewProps};
@@ -79,7 +79,7 @@ fn ids(b: &Batch) -> Vec<(u128, i64)> {
     (0..b.count).map(|i| (b.get_pk(i), b.get_weight(i))).collect()
 }
 
-fn run(registry: &mut RelationRegistry, spec: &ReadSpec) -> Result<Rc<Batch>, StoreError> {
+fn run(registry: &mut RelationRegistry, spec: &ReadSpec) -> Result<Rc<Batch>, String> {
     let schema = id_val_schema();
     registry.scan_spec(TID, spec.clone(), schema.layout_digest(), None)
 }
@@ -512,7 +512,7 @@ struct Recompute {
 }
 
 impl SkeletonHydrator for Recompute {
-    fn hydrate_keys(&mut self, _: &RelationRegistry, _: u64, keys: PkKeys) -> Result<Batch, StoreError> {
+    fn hydrate_keys(&mut self, _: &RelationRegistry, _: u64, keys: PkKeys) -> Result<Batch, String> {
         let schema = id_val_schema();
         let ks: Vec<u64> = keys.iter().map(|k| u64::from_be_bytes(k.try_into().unwrap())).collect();
         let mut bb = BatchBuilder::new(schema);

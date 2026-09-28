@@ -85,10 +85,7 @@ impl CatalogEngine {
     /// Ingest one delta into its family's store and fire its hooks.
     fn apply_family(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
         let id = family.id();
-        let mut applied = self
-            .registry
-            .ingest_returning(id, batch)
-            .map_err(|e| format!("sys-table ingest failed (family={id}): {e}"))?;
+        let mut applied = self.registry.ingest_returning(id, batch)?;
         // The hooks read the rows through the catalog's descriptor, not the
         // descriptor the delta arrived under.
         applied.set_schema(family.schema());
@@ -97,7 +94,7 @@ impl CatalogEngine {
 
     /// Apply a push to ingestion point `tid`'s store, and hold its effect for the
     /// next tick of the views that scan `tid`.
-    pub(crate) fn ingest_unticked(&mut self, tid: u64, batch: Batch) -> Result<(), StoreError> {
+    pub(crate) fn ingest_unticked(&mut self, tid: u64, batch: Batch) -> Result<(), String> {
         if !self.dag.is_scanned(tid) {
             return self.registry.ingest(tid, batch);
         }

@@ -139,11 +139,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
         gnitz_wire::OpNode::ScanDelta { source: tid, .. } => {
             // A circuit scanning an unknown table is corrupt: the planner
             // registers every source before shipping the circuit.
-            let schema = ctx
-                .registry
-                .relation(*tid)
-                .map(Relation::schema)
-                .ok_or("scan-delta: unknown source table")?;
+            let schema = ctx.registry.relation_or_err(*tid)?.schema();
             let reg = ctx.push_delta_reg(schema);
             // The driver seeds one register per source, so a second scan would
             // silently see nothing.

@@ -189,9 +189,7 @@ fn scanned_schemas(
             if uses[&tid].bound.is_none() {
                 return Err(format!("source {tid} states a scatter key but is not scanned"));
             }
-            let relation = registry
-                .relation(tid)
-                .ok_or_else(|| format!("source {tid} is not a registered relation"))?;
+            let relation = registry.relation_or_err(tid)?;
             Ok((tid, relation.schema()))
         })
         .collect()

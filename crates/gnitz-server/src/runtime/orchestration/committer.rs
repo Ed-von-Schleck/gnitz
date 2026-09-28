@@ -325,17 +325,11 @@ struct CommitUnit {
     outcome: Outcome,
 }
 
-/// Who is owed this unit's verdict, and therefore what a worker-ACK error may do
-/// to it.
+/// Who is owed this unit's verdict.
 enum Outcome {
-    /// The coalesced clients of one merged run. A push degrades gracefully, so a
-    /// worker error downgrades that group's verdict.
+    /// The coalesced clients of one merged run.
     Pushes(Vec<oneshot::Sender<Result<u64, WireFault>>>),
-    /// One transaction. Its contract is "Err ⇒ nothing committed", so once the
-    /// zone is durable a worker error must never turn `Ok` into `Err`.
-    /// `commit_pushes` aborts instead — the DDL's tick gate and the catalog read
-    /// lock held through the ACK are what make that arm unreachable, and it
-    /// fail-stops rather than diverge if they ever do not.
+    /// One transaction. Its contract is "Err ⇒ nothing committed".
     Txn(oneshot::Sender<Result<u64, WireFault>>),
 }
 
@@ -345,10 +339,6 @@ impl CommitUnit {
     /// awaited that no worker was sent would park forever.
     fn live(&self) -> impl Iterator<Item = &GroupInfo> {
         self.groups.iter().filter(|g| g.write_err.is_none())
-    }
-
-    fn live_mut(&mut self) -> impl Iterator<Item = &mut GroupInfo> {
-        self.groups.iter_mut().filter(|g| g.write_err.is_none())
     }
 
     /// Resolve every `done` of this unit exactly once: `Ok(zone_lsn)` iff all of
@@ -482,8 +472,8 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
         //
         // A unit is all-or-nothing: a family that does not fit rolls the bundle
         // back to where it started, and the families before it were never
-        // published. A single-push unit has one group, so that same rule is what
-        // "a refused push degrades gracefully" means for it.
+        // published. A single-push unit has one group, so the same rule refuses
+        // that push alone.
         for unit in &mut units {
             let savepoint = scope.savepoint();
             let failure = unit.groups.iter().find_map(|g| lay_out_group(shared, &scope, g).err());
@@ -510,25 +500,11 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
     // uniqueness check nothing durable backs. It runs after Phase D's fsync.
     // ------------------------------------------------------------------
     {
-        for unit in &mut units {
-            let downgrade = matches!(unit.outcome, Outcome::Pushes(_));
-            for g in unit.live_mut() {
-                let Err(e) = g.req_ids.acks().await else {
-                    continue;
-                };
-                if downgrade {
-                    // Only a *worker* error invalidates: it means this worker took
-                    // none of a group the others did, so the filter may now
-                    // disagree with the cluster. A SAL-refused group reached no
-                    // worker at all.
-                    g.write_err = Some(e);
-                    shared.disp().unique_filter_invalidate_table(g.tid);
-                } else {
-                    // Discarding it would leave the transaction durable in the SAL
-                    // but missing from this worker's partition, with the client
-                    // told Ok — silent divergence.
-                    gnitz_fatal_abort!("worker rejected a committed transaction group (tid={}): {}", g.tid, e);
-                }
+        for g in units.iter().flat_map(|u| u.live()) {
+            if let Err(e) = g.req_ids.acks().await {
+                // The group is durable and the other workers applied it: answering it
+                // would leave the SAL and this worker's partition disagreeing.
+                gnitz_fatal_abort!("worker rejected a committed group (tid={}): {}", g.tid, e);
             }
         }
         // Bump tick counters and maybe fire the auto-tick BEFORE awaiting
@@ -552,7 +528,6 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
         // Publish the zone LSN exactly once, after fsync confirms durability.
         // Pipelined pushes batched together share one zone_lsn, so clients may see
         // duplicate LSNs — only non-decreasing monotonicity is guaranteed.
-        // `write_err` can still be set in Phase C.
         if units.iter().flat_map(|u| u.live()).next().is_some() {
             shared.lsn_alloc.publish(zone_lsn);
         }

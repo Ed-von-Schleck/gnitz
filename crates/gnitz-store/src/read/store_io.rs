@@ -7,7 +7,7 @@ use super::SkeletonHydrator;
 use crate::relation::{Relation, RelationKind, RelationRegistry};
 use crate::schema::key::{compare_pk_bytes, sort_indices, IndexKeySpec};
 use crate::schema::{project_schema, ColumnLocator};
-use crate::storage::{pk_group_end, Batch, PkSetGather, ReadCursor, SkeletonKeys, StoreError};
+use crate::storage::{pk_group_end, Batch, PkSetGather, ReadCursor, SkeletonKeys};
 use gnitz_wire::{KeyRange, PkKeys, ReadBound};
 
 const INDEX_SCAN_RATIO: usize = 16;
@@ -33,7 +33,7 @@ impl<'a, 'h> LiveSource<'a, 'h> {
 
     /// The next chunk, or `None` once the source is exhausted. `max_rows` bounds the merge
     /// groups visited; a skeleton row counts once however many rows it hydrates to.
-    pub(super) fn next_chunk(&mut self, max_rows: usize) -> Result<Option<Batch>, StoreError> {
+    pub(super) fn next_chunk(&mut self, max_rows: usize) -> Result<Option<Batch>, String> {
         let mut skeletons = SkeletonKeys::default();
         let Some(live) = self.source.drain_live_chunk(max_rows, &mut skeletons) else {
             return Ok(None);
@@ -42,17 +42,17 @@ impl<'a, 'h> LiveSource<'a, 'h> {
             return Ok(Some(live));
         }
         let Some(hydrator) = self.hydrator.as_deref_mut() else {
-            return Err(StoreError::rejected(format!(
+            return Err(format!(
                 "relation {} holds skeleton rows but this process maintains no circuit",
                 self.id
-            )));
+            ));
         };
         let SkeletonKeys { keys, coarse } = skeletons;
         let keys = PkKeys::from_sorted(live.schema().pk_stride(), keys);
         let expected = cfg!(debug_assertions).then(|| keys.clone());
         let hydrated = hydrator
             .hydrate_keys(self.registry, self.id, keys)
-            .map_err(|e| e.in_context(&format!("hydrate: view {}", self.id)))?;
+            .map_err(|e| format!("hydrate: view {}: {e}", self.id))?;
         if let Some(keys) = expected {
             debug_assert_hydration_matches(&hydrated, &keys, &coarse);
         }
@@ -66,7 +66,7 @@ impl<'a, 'h> LiveSource<'a, 'h> {
 impl RelationRegistry {
     /// The FK parent probe: every live row of `keys` at weight 1, projected to the payload
     /// column `ref_col`.
-    pub fn gather_bytes(&self, id: u64, keys: PkKeys, ref_col: u8) -> Result<Batch, StoreError> {
+    pub fn gather_bytes(&self, id: u64, keys: PkKeys, ref_col: u8) -> Result<Batch, String> {
         let entry = self.relation_or_err(id)?;
         let schema = entry.schema();
         let out_schema = project_schema(&schema, &[ref_col as u32]).expect("a one-column projection fits MAX_COLUMNS");
@@ -91,7 +91,7 @@ impl RelationRegistry {
 
     /// Open `bound`'s source over `id`, without walking it, and the part of `bound`
     /// the source does not apply.
-    pub fn open_bound(&self, id: u64, bound: ReadBound) -> Result<(SourceCursor, ReadBound), StoreError> {
+    pub fn open_bound(&self, id: u64, bound: ReadBound) -> Result<(SourceCursor, ReadBound), String> {
         let entry = self.relation_or_err(id)?;
         // A stream holds no rows, but a backfill over one still feeds an empty
         // epoch: that is what mints a global aggregate's ground row.
@@ -104,11 +104,11 @@ impl RelationRegistry {
             ReadBound::PkSet(keys) => {
                 let schema = entry.schema();
                 if keys.stride() != schema.pk_stride() {
-                    return Err(StoreError::rejected(format!(
+                    return Err(format!(
                         "open_bound: PkSet key stride {} != pk_stride {} (table {id})",
                         keys.stride(),
                         schema.pk_stride()
-                    )));
+                    ));
                 }
                 // A key this worker holds no row for copies nothing.
                 SourceCursor::PkSet(Box::new(entry.gather(keys, None)))
@@ -120,7 +120,7 @@ impl RelationRegistry {
 }
 
 /// The walk `r` names over `entry`, and the part of it the cursor leaves unapplied.
-fn open_range(entry: &Relation, r: KeyRange) -> Result<(SourceCursor, ReadBound), StoreError> {
+fn open_range(entry: &Relation, r: KeyRange) -> Result<(SourceCursor, ReadBound), String> {
     let cols = entry.bound_cols(r.cols(), "open_bound")?;
     let schema = entry.schema();
     if r.walks_pk(schema.pk_indices()) {

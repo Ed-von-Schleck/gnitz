@@ -13,11 +13,10 @@ use crate::runtime::sal::{SalMessage, SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{self as ipc};
 use gnitz_foundation::fault::Seam;
-use gnitz_store::relation::RelationRegistry;
+use gnitz_store::relation::{Relation, RelationRegistry};
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
-use gnitz_store::storage::StoreError;
 use gnitz_wire::{WireFlags, WireStatus};
 
 // ---------------------------------------------------------------------------
@@ -257,10 +256,7 @@ impl WorkerProcess {
                 fifo: msg.in_request_order,
                 wire: w,
             },
-            Err(e) => self.fatal_shutdown(&format!(
-                "failed to decode {:?} for tid={}: {e}",
-                msg.kind, msg.target_id
-            )),
+            Err(e) => gnitz_fatal_abort!("failed to decode {:?} for tid={}: {e}", msg.kind, msg.target_id),
         }
     }
 
@@ -295,12 +291,10 @@ impl WorkerProcess {
         let batch = match (data_batch, schema) {
             (Some(b), _) => b,
             (None, Some(s)) => Batch::empty_with_schema(&s),
-            (None, None) => self.fatal_shutdown(&format!("ExchangeRelay for tid={target_id} carries no schema")),
+            (None, None) => gnitz_fatal_abort!("ExchangeRelay for tid={target_id} carries no schema"),
         };
         if key != relay_wait {
-            self.fatal_shutdown(&format!(
-                "ExchangeRelay for {key:?} while waiting on {relay_wait:?} — diverged from the master"
-            ));
+            gnitz_fatal_abort!("ExchangeRelay for {key:?} while waiting on {relay_wait:?} — diverged from the master");
         }
         RelayHit { batch, drained }
     }
@@ -317,7 +311,7 @@ impl WorkerProcess {
                 // memory corruption or an engine bug; continuing would leave
                 // this worker with a permanently stale catalog — silently wrong
                 // results.
-                self.fatal_shutdown(&format!("DdlSync application failed for tid={target_id}: {fault}"));
+                gnitz_fatal_abort!("DdlSync application failed for tid={target_id}: {fault}");
             }
         }
     }
@@ -389,7 +383,7 @@ impl WorkerProcess {
             SalMessageKind::Push => {
                 if let Some(batch) = batch {
                     if !batch.is_empty() {
-                        self.handle_push(target_id, batch)?;
+                        self.handle_push(target_id, batch);
                     }
                 }
                 self.send_ack(target_id, request_id);
@@ -421,46 +415,34 @@ impl WorkerProcess {
             }
 
             SalMessageKind::ExchangeRelay => {
-                self.fatal_shutdown(&format!("ExchangeRelay for tid={target_id} outside an exchange wait"))
+                gnitz_fatal_abort!("ExchangeRelay for tid={target_id} outside an exchange wait")
             }
         }
     }
 
     // ── Request handlers ───────────────────────────────────────────────
 
-    fn handle_push(&mut self, target_id: u64, batch: Batch) -> Result<(), String> {
+    fn handle_push(&mut self, target_id: u64, batch: Batch) {
         let row_count = batch.len();
-        if target_id < gnitz_wire::FIRST_USER_TABLE_ID {
-            return Err(format!(
-                "a Push group named system table_id={target_id}; a system family arrives as DdlSync"
-            ));
-        }
-        // A view is the other non-ingestion-point, and the master already
-        // rejects one client-facing.
-        let kind = self.cat().registry.relation_or_err(target_id)?.kind();
-        if !kind.is_ingestion_point() {
-            return Err(format!(
-                "a Push group named relation {target_id}, which is a {}; \
-                 a push targets a base table or a stream",
+        // The master admitted this group against the catalog it committed under, and
+        // the SAL holds it durably: any failure here leaves this worker diverged from
+        // it. Only a restart replays it.
+        let res = match self.cat().registry.relation_or_err(target_id).map(Relation::kind) {
+            Ok(kind) if kind.is_ingestion_point() => self.cat().ingest_unticked(target_id, batch),
+            Ok(kind) => Err(format!(
+                "relation {target_id} is a {}, not an ingestion point",
                 kind.noun()
-            ));
-        }
-        // A storage fault leaves an ACKed push unapplied. Only a restart replays
-        // it; a fault reply would let the next checkpoint discard it.
-        match self.cat().ingest_unticked(target_id, batch) {
-            Ok(()) => {}
-            // An ingest never produces `DeltaExpired`; the or-pattern is what
-            // keeps the match total without a third arm.
-            Err(StoreError::Rejected(msg) | StoreError::DeltaExpired(msg)) => return Err(msg),
-            Err(e @ StoreError::Storage { .. }) => gnitz_fatal_abort!(
-                "worker: push apply failed (table_id={}): {} — committed data not \
-                 applied, state diverged from durable SAL; aborting for restart+replay",
+            )),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = res {
+            gnitz_fatal_abort!(
+                "worker: push apply failed (table_id={}): {} — aborting for restart+replay",
                 target_id,
                 e,
-            ),
+            );
         }
         gnitz_debug!("push tid={} rows={}", target_id, row_count);
-        Ok(())
     }
 
     /// Drive one view-maintenance tick of `target_id`'s dependent closure.
@@ -503,7 +485,10 @@ impl WorkerProcess {
     ) -> Result<(), gnitz_wire::WireFault> {
         let target_id = route.target_id;
         let reply_layout = gnitz_wire::decode_all(blob, "delta read", |r| r.u64())?;
-        let keeper = self.cat().delta_read(target_id, after_tick, cut_tick, reply_layout)?;
+        let keeper = self
+            .cat()
+            .registry
+            .delta_read(target_id, after_tick, cut_tick, reply_layout)?;
         self.send_reply(route, keeper);
         Ok(())
     }
@@ -694,7 +679,7 @@ impl WorkerProcess {
 
     /// Base checkpoint round.
     fn handle_flush_all(&mut self) -> Result<(), String> {
-        Ok(self.cat().registry.checkpoint_base()?)
+        self.cat().registry.checkpoint_base()
     }
 
     /// Run one DAG drive with the exchange context, returning its
@@ -715,13 +700,6 @@ impl WorkerProcess {
             );
         }
         drained
-    }
-
-    /// Unrecoverable worker fault. The master's watchdog turns the dead worker
-    /// into a cluster abort.
-    fn fatal_shutdown(&mut self, msg: &str) -> ! {
-        gnitz_warn!("FATAL: {}. Shutting down.", msg);
-        unsafe { libc::_exit(0) }
     }
 }
 

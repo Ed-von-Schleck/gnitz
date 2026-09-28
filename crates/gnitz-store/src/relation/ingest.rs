@@ -3,7 +3,7 @@
 
 use super::{Relation, RelationKind, RelationRegistry, SecondaryIndex, Store};
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, StorageError, StoreError, Table};
+use crate::storage::{Batch, StorageError, Table};
 
 /// `GNITZ_INJECT_INGEST_APPLY_ERROR=store|index`: report `Err(Io)` from the
 /// matching ingest below, which has already run — so what fires is the error
@@ -26,7 +26,7 @@ pub(super) fn fill_indexes(
     chunk_rows: usize,
     owner_id: u64,
     targets: &mut [&mut SecondaryIndex],
-) -> Result<(), StoreError> {
+) -> Result<(), String> {
     if targets.is_empty() {
         return Ok(());
     }
@@ -43,9 +43,9 @@ pub(super) fn fill_indexes(
         for ix in targets.iter_mut() {
             let cols = ix.cols;
             ix.project_and_ingest(&chunk).map_err(|e| {
-                StoreError::storage(
-                    format!("fill index on columns {:?} of relation {owner_id}", cols.as_slice()),
-                    e,
+                format!(
+                    "fill index on columns {:?} of relation {owner_id}: {e}",
+                    cols.as_slice()
                 )
             })?;
         }
@@ -59,16 +59,13 @@ impl RelationRegistry {
     /// Apply `batch` to `id`'s store and its index projections, moving it in.
     /// Kind-uniform: a base table's PK rule runs, everything else is written as
     /// it stands.
-    ///
-    /// `Rejected` means nothing was applied and the request is at fault;
-    /// `Storage` means committed data did not reach the store.
-    pub fn ingest(&mut self, id: u64, batch: Batch) -> Result<(), StoreError> {
+    pub fn ingest(&mut self, id: u64, batch: Batch) -> Result<(), String> {
         self.ingest_at(id, batch, None, false).map(drop)
     }
 
     /// [`Self::ingest`], handing back the batch as the store saw it, after PK
     /// enforcement — what a caller that must forward the applied rows takes.
-    pub fn ingest_returning(&mut self, id: u64, batch: Batch) -> Result<Batch, StoreError> {
+    pub fn ingest_returning(&mut self, id: u64, batch: Batch) -> Result<Batch, String> {
         self.ingest_at(id, batch, None, true)
             .map(|b| b.expect("`needed` is set, so the effective batch comes back"))
     }
@@ -86,29 +83,22 @@ impl RelationRegistry {
         batch: Batch,
         round: Option<u64>,
         needed: bool,
-    ) -> Result<Option<Batch>, StoreError> {
+    ) -> Result<Option<Batch>, String> {
         self.ingest_at(view_id, batch, round, needed)
     }
 
     /// Resolve `id`, admit the batch's shape against the store's, and apply it.
-    fn ingest_at(
-        &mut self,
-        id: u64,
-        batch: Batch,
-        round: Option<u64>,
-        needed: bool,
-    ) -> Result<Option<Batch>, StoreError> {
+    fn ingest_at(&mut self, id: u64, batch: Batch, round: Option<u64>, needed: bool) -> Result<Option<Batch>, String> {
         let entry = self.relation_mut_or_err(id)?;
-        // A pushed batch can carry a schema the registry has not caught up to.
         // Checked, not asserted: the append path sizes by the destination's region
-        // count, so a mismatch would drop the extra column and ACK the push.
+        // count, so a mismatch would silently drop the extra column.
         let want = entry.schema().num_payload_cols();
         if batch.num_payload_cols() != want {
-            return Err(StoreError::rejected(format!(
-                "push for table_id={id} carries {} payload columns, table schema has {}",
+            return Err(format!(
+                "batch for relation {id} carries {} payload columns, its schema has {}",
                 batch.num_payload_cols(),
                 want
-            )));
+            ));
         }
         Self::ingest_into(entry, batch, round, needed)
     }
@@ -124,7 +114,7 @@ impl RelationRegistry {
         batch: Batch,
         round: Option<u64>,
         needed: bool,
-    ) -> Result<Option<Batch>, StoreError> {
+    ) -> Result<Option<Batch>, String> {
         let (id, kind) = (entry.id(), entry.kind);
         // A stream's rows exist only as the deltas they produce.
         if kind == RelationKind::Stream {
@@ -155,9 +145,9 @@ impl RelationRegistry {
                 other => other.map(drop),
             };
             inject_ingest_apply_error("index", kind, res).map_err(|e| {
-                StoreError::storage(
-                    format!("ingest into index on columns {:?} of relation {id}", cols.as_slice()),
-                    e,
+                format!(
+                    "ingest into index on columns {:?} of relation {id}: {e}",
+                    cols.as_slice()
                 )
             })?;
         }
@@ -168,8 +158,7 @@ impl RelationRegistry {
             None if needed => (store.ingest_borrowed_batch(&effective), Some(effective)),
             None => (store.ingest_owned_batch(effective), None),
         };
-        inject_ingest_apply_error("store", kind, res)
-            .map_err(|e| StoreError::storage(format!("ingest into relation {id}"), e))?;
+        inject_ingest_apply_error("store", kind, res).map_err(|e| format!("ingest into relation {id}: {e}"))?;
 
         let Some((stamped, round)) = pending else {
             return Ok(echo);
@@ -194,13 +183,13 @@ impl RelationRegistry {
     /// Fold `id`'s store memtable into its RAM tier, which past its ceiling also
     /// spills it, compacts and runs the capacity sweep: no manifest publish, no
     /// barrier, and nothing of the relation's indexes. Unregistered is an `Err`.
-    pub fn fold_to_ram(&mut self, id: u64) -> Result<(), StoreError> {
+    pub fn fold_to_ram(&mut self, id: u64) -> Result<(), String> {
         let entry = self.relation_mut_or_err(id)?;
         entry
             .store
             .held_mut()
             .fold_to_ram()
-            .map_err(|e| StoreError::storage(format!("fold relation {id} to RAM"), e))
+            .map_err(|e| format!("fold relation {id} to RAM: {e}"))
     }
 
     /// Each user relation's own `Table` plus its index tables. System families
@@ -228,15 +217,15 @@ impl RelationRegistry {
     // ── The checkpoint rounds ───────────────────────────────────────────
 
     /// The base round: every user store that is not rederived, in one barrier.
-    pub fn checkpoint_base(&mut self) -> Result<(), StoreError> {
+    pub fn checkpoint_base(&mut self) -> Result<(), String> {
         crate::storage::flush_barrier(self.collect_user_tables().filter(|t| !t.is_rederived()), 0)
-            .map_err(|e| StoreError::storage("base flush", e))
+            .map_err(|e| format!("base flush: {e}"))
     }
 
     /// The system round: every system family's store, in one barrier.
-    pub fn checkpoint_system(&mut self, replay_floor: u64) -> Result<(), StoreError> {
+    pub fn checkpoint_system(&mut self, replay_floor: u64) -> Result<(), String> {
         crate::storage::flush_barrier(self.collect_system_tables(), replay_floor)
-            .map_err(|e| StoreError::storage("system catalog flush", e))
+            .map_err(|e| format!("system catalog flush: {e}"))
     }
 
     /// The ephemeral round at the resume generation: `state`'s operator traces and
@@ -244,10 +233,10 @@ impl RelationRegistry {
     pub fn checkpoint_ephemeral<'s>(
         &mut self,
         state: impl IntoIterator<Item = &'s mut crate::relation::CircuitState>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), String> {
         let generation = self.resume_generation;
         let mut tables: Vec<&mut Table> = state.into_iter().flat_map(|s| s.tables_mut()).collect();
         tables.extend(self.collect_user_tables().filter(|t| t.is_rederived()));
-        crate::storage::flush_barrier(tables, generation).map_err(|e| StoreError::storage("ephemeral flush", e))
+        crate::storage::flush_barrier(tables, generation).map_err(|e| format!("ephemeral flush: {e}"))
     }
 }

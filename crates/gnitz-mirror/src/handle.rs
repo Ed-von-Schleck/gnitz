@@ -12,7 +12,7 @@ use gnitz_store::relation::{
     lock_data_dir, DirLock, Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig,
 };
 use gnitz_store::schema::{SchemaDescriptor, Slot};
-use gnitz_store::storage::{Batch, StoreError};
+use gnitz_store::storage::Batch;
 use gnitz_wire::ViewProps;
 
 use crate::record::{descriptor_of_block, MirrorRecord};
@@ -20,12 +20,6 @@ use crate::record::{descriptor_of_block, MirrorRecord};
 /// Applied delta bytes after which an apply drives a checkpoint of its own.
 /// `GNITZ_MIRROR_CHECKPOINT_BYTES` overrides it.
 const DEFAULT_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
-
-/// A store error as the host sees it. `gnitz-core` does not depend on
-/// `gnitz-store`, so this cannot be a `From` impl.
-fn engine(e: StoreError) -> MirrorError {
-    MirrorError::Engine(e.to_string())
-}
 
 /// `GNITZ_INJECT_MIRROR_CHECKPOINT_ERROR`: fail the next checkpoint once, before
 /// anything durable moved. Debug-only.
@@ -68,9 +62,9 @@ impl Mirror {
     /// Open (or create) a store at `base_dir`. Fails if another store, in this
     /// process or another, holds it.
     pub fn open(base_dir: &str) -> Result<Self, MirrorError> {
-        let dir_lock = lock_data_dir(base_dir).map_err(engine)?;
+        let dir_lock = lock_data_dir(base_dir).map_err(MirrorError::Engine)?;
         let registry = RelationRegistry::new(base_dir, Slot::SOLO, StoreConfig::from_env("GNITZ_MIRROR_"));
-        let persisted = registry.persisted_records().map_err(engine)?;
+        let persisted = registry.persisted_records().map_err(MirrorError::Engine)?;
         let mut mirror = Mirror {
             registry,
             records: HashMap::new(),
@@ -83,18 +77,12 @@ impl Mirror {
         for (tid, record) in persisted {
             let reopened = match record.map(|bytes| MirrorRecord::decode(&bytes)) {
                 // Reopened from the manifest `rec` was read from.
-                Ok(Some((rec, schema))) => {
-                    mirror
-                        .registry
-                        .reopen_view(copy_spec(tid, schema))
-                        .map_err(engine)
-                        .map(|()| {
-                            mirror.records.insert(tid, rec);
-                        })
-                }
+                Ok(Some((rec, schema))) => mirror.registry.reopen_view(copy_spec(tid, schema)).map(|()| {
+                    mirror.records.insert(tid, rec);
+                }),
                 // Damage: the sweep below removes the directory.
                 Ok(None) => continue,
-                Err(e) => Err(engine(e)),
+                Err(e) => Err(e),
             };
             if let Err(e) = reopened {
                 gnitz_debug!("mirror: relation {} did not reopen, so it bootstraps: {}", tid, e);
@@ -227,7 +215,7 @@ impl MirrorStore for Mirror {
                     m.invalidate(tid, Invalidate::Registration)?;
                     m.registry
                         .register(copy_spec(tid, descriptor_of_block(&block)?))
-                        .map_err(engine)?;
+                        .map_err(MirrorError::Engine)?;
                     let rec = MirrorRecord {
                         schema_name: schema_name.to_string(),
                         name: name.to_string(),
@@ -309,7 +297,7 @@ impl MirrorStore for Mirror {
             let batch = m
                 .registry
                 .scan_spec(tid, spec, reply_schema.layout_digest(), None)
-                .map_err(engine)?;
+                .map_err(MirrorError::Engine)?;
             let mut regions = gnitz_wire::Regions::new();
             batch.wire_regions(&mut regions);
             let mut rows = ZSetBatch::new(reply_schema);
@@ -339,9 +327,11 @@ impl MirrorStore for Mirror {
                 return Err(MirrorError::Engine("injected checkpoint failure".to_string()));
             }
             for (&tid, rec) in &m.records {
-                m.registry.set_caller_record(tid, rec.encode()).map_err(engine)?;
+                m.registry
+                    .set_caller_record(tid, rec.encode())
+                    .map_err(MirrorError::Engine)?;
             }
-            m.registry.checkpoint_ephemeral([]).map_err(engine)
+            m.registry.checkpoint_ephemeral([]).map_err(MirrorError::Engine)
         })
     }
 

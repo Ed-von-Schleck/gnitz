@@ -85,10 +85,7 @@ fn a_corrupt_source_body_fails_the_relayout_and_keeps_the_source_set() {
 
     assert!(matches!(
         repartition_relation(rel, &make_schema_u64_i64(), 2, 4096, 64),
-        Err(StoreError::Storage {
-            err: StorageError::Corrupt("body checksum"),
-            ..
-        })
+        Err(e) if e.contains("corrupt: body checksum")
     ));
     assert!(shards[0].exists(), "the source shard survives");
     assert_eq!(

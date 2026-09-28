@@ -267,11 +267,7 @@ pub fn seek_by_index_range(
     start: gnitz_wire::Cut,
     end: gnitz_wire::Cut,
 ) -> Result<(Option<std::rc::Rc<Batch>>, gnitz_store::schema::SchemaDescriptor), gnitz_wire::WireFault> {
-    let schema = engine
-        .registry
-        .relation_or_err(tid)
-        .map_err(|e| gnitz_wire::WireFault::from(e.to_string()))?
-        .schema();
+    let schema = engine.registry.relation_or_err(tid)?.schema();
     let range = gnitz_wire::KeyRange::new(gnitz_wire::PkColList::from_slice(cols), eq, start, end);
     let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::Range(range));
     let rows = engine.scan_spec(tid, spec, schema.layout_digest())?;
@@ -286,11 +282,7 @@ pub fn seek_by_index(
     cols: &[u32],
     natives: &[u128],
 ) -> Result<(Option<std::rc::Rc<Batch>>, gnitz_store::schema::SchemaDescriptor), gnitz_wire::WireFault> {
-    let schema = engine
-        .registry
-        .relation_or_err(tid)
-        .map_err(|e| gnitz_wire::WireFault::from(e.to_string()))?
-        .schema();
+    let schema = engine.registry.relation_or_err(tid)?.schema();
     let images: Vec<u128> = cols
         .iter()
         .zip(natives)

@@ -265,13 +265,7 @@ fn ingest_apply_error_returned_internal() {
     batch.extend_null_bmp(&0u64.to_le_bytes());
     batch.count += 1;
     assert!(
-        matches!(
-            registry.ingest(tid, batch),
-            Err(StoreError::Storage {
-                err: crate::storage::StorageError::Io(_),
-                ..
-            })
-        ),
+        matches!(registry.ingest(tid, batch), Err(e) if e.contains("io error")),
         "the ingest must return the storage error when the seam is armed",
     );
     println!("{}", crate::test_support::CHILD_OK);

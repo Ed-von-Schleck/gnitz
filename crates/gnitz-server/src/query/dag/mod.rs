@@ -183,12 +183,8 @@ fn ensure_compiled<'a>(
         let view = registry.relation_or_err(view_id)?;
         let (code, layout) = compile(registry, view)
             .map_err(|e| format!("view_id={view_id} does not compile from its durable circuit: {e}"))?;
-        let state = CircuitState::open(registry, view_id, layout).map_err(|e| {
-            format!(
-                "view_id={view_id}: its derived state is corrupt or unreadable, or resources are \
-                 exhausted: {e}"
-            )
-        })?;
+        let state = CircuitState::open(registry, view_id, layout)
+            .map_err(|e| format!("view_id={view_id}: open operator state: {e}"))?;
         gnitz_debug!("dag: compiled view_id={}", view_id);
         *plan = Some(ViewPlan { code, state });
     }

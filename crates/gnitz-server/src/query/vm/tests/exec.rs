@@ -4,7 +4,7 @@ use super::fixtures::*;
 use super::*;
 use crate::test_support::{make_batch_u128, make_batch_u128_raw, make_schema_u128_i64, opk_pk, zset_of};
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, BatchBuilder, Layout, StoreError};
+use gnitz_store::storage::{Batch, BatchBuilder, Layout};
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
 use gnitz_wire::TypeCode;
@@ -13,7 +13,7 @@ use gnitz_wire::TypeCode;
 
 /// One epoch seeding a single input register — production seeds through
 /// `execute_epoch_multi` directly, with one entry per exchange side.
-fn execute_epoch(vm: &mut TestVm, input: Batch, input_reg: u16) -> Result<Batch, StoreError> {
+fn execute_epoch(vm: &mut TestVm, input: Batch, input_reg: u16) -> Result<Batch, String> {
     vm.epoch([(DeltaReg(input_reg), input)])
 }
 

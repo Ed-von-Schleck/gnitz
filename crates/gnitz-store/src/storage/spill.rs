@@ -8,7 +8,6 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 
-use super::error::StoreError;
 use super::repr::heap::{HeapNode, LoserTree};
 use gnitz_foundation::posix_io::Mmap;
 use gnitz_wire::MAX_PK_BYTES;
@@ -66,7 +65,7 @@ impl SpillSort {
         }
     }
 
-    pub fn push(&mut self, record: &[u8]) -> Result<(), StoreError> {
+    pub fn push(&mut self, record: &[u8]) -> Result<(), String> {
         debug_assert_eq!(record.len(), self.stride);
         self.flat.extend_from_slice(record);
         if self.flat.len() == self.run_len * self.stride {
@@ -75,7 +74,7 @@ impl SpillSort {
         Ok(())
     }
 
-    fn spill_run(&mut self) -> Result<(), StoreError> {
+    fn spill_run(&mut self) -> Result<(), String> {
         sort_records(&mut self.flat, self.stride);
         let file = match &mut self.spill {
             Some(f) => f,
@@ -86,22 +85,17 @@ impl SpillSort {
                     .mode(0o600)
                     .custom_flags(libc::O_TMPFILE)
                     .open(&self.dir)
-                    .map_err(|e| {
-                        StoreError::storage(
-                            format!("external sort: cannot create spill file in {}", self.dir),
-                            e.into(),
-                        )
-                    })?,
+                    .map_err(|e| format!("external sort: cannot create spill file in {}: {e}", self.dir))?,
             ),
         };
         file.write_all(&self.flat)
-            .map_err(|e| StoreError::storage("external sort: spill write failed", e.into()))?;
+            .map_err(|e| format!("external sort: spill write failed: {e}"))?;
         self.spilled_bytes += self.flat.len();
         self.flat.clear();
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<KeyProducer, StoreError> {
+    pub fn finish(mut self) -> Result<KeyProducer, String> {
         let records = if self.spill.is_none() {
             sort_records(&mut self.flat, self.stride);
             Records::Ram(self.flat)
@@ -111,7 +105,7 @@ impl SpillSort {
             let file = self.spill.take().expect("spilled");
             // The mapping keeps the inode alive after `file` closes.
             let map = Mmap::from_fd(file.as_raw_fd(), self.spilled_bytes)
-                .map_err(|e| StoreError::storage("external sort: mmap spill file failed", e.into()))?;
+                .map_err(|e| format!("external sort: mmap spill file failed: {e}"))?;
             map.advise_sequential();
             Records::Mapped(map)
         };

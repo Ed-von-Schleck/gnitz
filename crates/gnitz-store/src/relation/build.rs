@@ -10,7 +10,7 @@ static TABLE_CREATE_DELAY: Seam = Seam::new("GNITZ_INJECT_TABLE_CREATE_DELAY_MS"
 
 impl RelationRegistry {
     /// Enter a relation, its stores opened fresh.
-    pub fn register(&mut self, spec: RelationSpec) -> Result<(), StoreError> {
+    pub fn register(&mut self, spec: RelationSpec) -> Result<(), String> {
         let stores = self.build_relation_store(spec, false)?;
         self.enter(spec, stores);
         Ok(())
@@ -18,13 +18,10 @@ impl RelationRegistry {
 
     /// Enter a view whose rows open from the manifest already in its directory;
     /// `Err`, entering nothing, otherwise.
-    pub fn reopen_view(&mut self, spec: RelationSpec) -> Result<(), StoreError> {
+    pub fn reopen_view(&mut self, spec: RelationSpec) -> Result<(), String> {
         let stores = self.build_relation_store(spec, true)?;
         if !stores.0.held().resumed_from_checkpoint() {
-            return Err(StoreError::rejected(format!(
-                "view {} did not reopen from its manifest",
-                spec.id
-            )));
+            return Err(format!("view {} did not reopen from its manifest", spec.id));
         }
         self.enter(spec, stores);
         Ok(())
@@ -51,7 +48,7 @@ impl RelationRegistry {
         &self,
         spec: RelationSpec,
         resume: bool,
-    ) -> Result<(Store, Option<Box<Table>>), StoreError> {
+    ) -> Result<(Store, Option<Box<Table>>), String> {
         let RelationSpec { id, kind, schema } = spec;
         let absent = || Ok((Store::Absent(Box::new(schema)), None));
         let (recovery, budgets, feed) = match kind {
@@ -61,7 +58,7 @@ impl RelationRegistry {
             RelationKind::SystemCatalog => {
                 let dir = relation_dir(&self.base_dir, id);
                 let table = Table::new(&dir, schema, RecoverySource::SalReplay, self.store_budgets())
-                    .map_err(|e| StoreError::storage(format!("open store '{dir}'"), e))?;
+                    .map_err(|e| format!("open store '{dir}': {e}"))?;
                 return Ok((Store::Held(Box::new(table)), None));
             }
             // The master opens no user store, but it still creates the relation's
@@ -84,7 +81,7 @@ impl RelationRegistry {
                     remove_children(&relation_dir(&self.base_dir, id), |c| {
                         matches!(c.kind, ChildKind::Scratch(_)) && c.slot == slot
                     })
-                    .map_err(|e| StoreError::storage(format!("remove the operator traces of view {id}"), e))?;
+                    .map_err(|e| format!("remove the operator traces of view {id}: {e}"))?;
                 }
                 (
                     self.rederive_source(resume),
@@ -97,9 +94,8 @@ impl RelationRegistry {
         let delta = match feed {
             Some(budget) if schema.placement().counts_on(self.slot.rank) => {
                 // Admitted by the catalog precheck; a host registering outside it gets the refusal here.
-                let delta_schema = crate::schema::make_delta_schema(&schema).ok_or_else(|| {
-                    StoreError::rejected(format!("view {id} has too many columns to carry a delta feed"))
-                })?;
+                let delta_schema = crate::schema::make_delta_schema(&schema)
+                    .ok_or_else(|| format!("view {id} has too many columns to carry a delta feed"))?;
                 // Erased at open: no delta expresses what a boot does to a view, so every cursor restarts.
                 let table = self.open_child(
                     id,
@@ -123,8 +119,8 @@ impl RelationRegistry {
         schema: SchemaDescriptor,
         recovery: RecoverySource,
         budgets: StoreBudgets,
-    ) -> Result<Table, StoreError> {
+    ) -> Result<Table, String> {
         let dir = ChildAddr { kind, slot: self.slot }.dir(&relation_dir(&self.base_dir, id));
-        Table::new(&dir, schema, recovery, budgets).map_err(|e| StoreError::storage(format!("open store '{dir}'"), e))
+        Table::new(&dir, schema, recovery, budgets).map_err(|e| format!("open store '{dir}': {e}"))
     }
 }

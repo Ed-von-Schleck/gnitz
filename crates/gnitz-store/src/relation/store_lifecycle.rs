@@ -7,7 +7,6 @@ use super::relation_dir;
 use super::ChildKind;
 use super::{RelationKind, RelationRegistry, RelationSpec, Residency, SecondaryIndex, Store};
 use crate::schema::Slot;
-use crate::storage::StoreError;
 
 impl RelationRegistry {
     // -- Store management (for multi-worker fork) -----------------------------
@@ -22,7 +21,7 @@ impl RelationRegistry {
         rank: u32,
         residency: Residency,
         resume: impl Fn(u64) -> bool,
-    ) -> Result<usize, StoreError> {
+    ) -> Result<usize, String> {
         assert_eq!(
             self.residency,
             Residency::Master,
@@ -48,9 +47,7 @@ impl RelationRegistry {
                 kind: e.kind(),
                 schema: e.schema(),
             };
-            let (store, delta) = self
-                .build_relation_store(spec, may_resume)
-                .map_err(|err| err.in_context(&format!("open store tid={tid}")))?;
+            let (store, delta) = self.build_relation_store(spec, may_resume)?;
             let index_stores = e
                 .indexes
                 .iter()
@@ -87,7 +84,7 @@ impl RelationRegistry {
 
     /// Relay each base table's children onto this boot's worker count, then
     /// [`Self::reclaim_orphan_relation_dirs`]. Idempotent.
-    pub fn reconcile_child_dirs(&mut self) -> Result<(), StoreError> {
+    pub fn reconcile_child_dirs(&mut self) -> Result<(), String> {
         // A relay removes the set it read, and the reclaim deletes directories.
         assert_eq!(
             self.residency,
@@ -110,12 +107,11 @@ impl RelationRegistry {
     }
 
     /// The bytes `id`'s next published manifest carries beside its rows.
-    pub fn set_caller_record(&mut self, id: u64, record: Vec<u8>) -> Result<(), StoreError> {
-        self.relation_mut_or_err(id)
-            .map_err(|e| e.in_context("set_caller_record"))?
+    pub fn set_caller_record(&mut self, id: u64, record: Vec<u8>) -> Result<(), String> {
+        self.relation_mut_or_err(id)?
             .store
             .table_mut()
-            .ok_or_else(|| StoreError::rejected(format!("relation {id} holds no store in this process")))?
+            .ok_or_else(|| format!("relation {id} holds no store in this process"))?
             .set_caller_record(record);
         Ok(())
     }

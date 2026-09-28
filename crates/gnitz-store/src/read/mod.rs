@@ -20,7 +20,7 @@ mod store_io;
 pub use store_io::SourceCursor;
 
 use crate::relation::RelationRegistry;
-use crate::storage::{Batch, StoreError};
+use crate::storage::Batch;
 use gnitz_wire::PkKeys;
 
 /// Recomputes a capacity-bounded view's rows at its skeleton keys, from the view's
@@ -29,5 +29,5 @@ pub trait SkeletonHydrator {
     /// Every row of `view_id` at `keys` — at the view's `pk_stride`, each held by
     /// the view's store as a skeleton row — consolidated, each key's weights summing
     /// to its skeleton row's weight.
-    fn hydrate_keys(&mut self, registry: &RelationRegistry, view_id: u64, keys: PkKeys) -> Result<Batch, StoreError>;
+    fn hydrate_keys(&mut self, registry: &RelationRegistry, view_id: u64, keys: PkKeys) -> Result<Batch, String>;
 }

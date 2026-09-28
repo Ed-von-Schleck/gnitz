@@ -1019,8 +1019,11 @@ fn a_delta_read_under_another_layout_is_refused() {
     let fed = try_register_identity_view(&mut engine, tid, "fed", &cols, 0, 4 << 20).expect("a fed view");
     let own = engine.registry.relation_or_err(fed).unwrap().schema().layout_digest();
 
-    engine.delta_read(fed, 0, 0, own).expect("the view's own layout");
-    let Err(err) = engine.delta_read(fed, 0, 0, own ^ 1) else {
+    engine
+        .registry
+        .delta_read(fed, 0, 0, own)
+        .expect("the view's own layout");
+    let Err(err) = engine.registry.delta_read(fed, 0, 0, own ^ 1) else {
         panic!("a delta read under another layout must be refused");
     };
     assert!(

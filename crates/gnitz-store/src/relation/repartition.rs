@@ -17,15 +17,15 @@ use super::{ChildAddr, ChildKind};
 use crate::schema::{SchemaDescriptor, Slot};
 use crate::storage::{
     flush_barrier, from_runs, link_store, retire_store, route_rows_by_pk, Batch, Layout, RecoverySource, StorageError,
-    StoreBudgets, StoreError, Table,
+    StoreBudgets, Table,
 };
 
 /// The worker count of the complete child set to relay onto `launched`; `None`
 /// when nothing moves. A set missing a rank's manifest never finished a
 /// checkpoint, so the SAL tail still holds its rows.
-fn relay_source(rel_dir: &str, launched: u32) -> Result<Option<u32>, StoreError> {
+fn relay_source(rel_dir: &str, launched: u32) -> Result<Option<u32>, String> {
     let mut foreign = BTreeSet::new();
-    let names = subdir_names(rel_dir).map_err(|e| StoreError::storage(format!("repartition: list {rel_dir}"), e))?;
+    let names = subdir_names(rel_dir).map_err(|e| format!("repartition: list {rel_dir}: {e}"))?;
     for name in names {
         match ChildAddr::parse(&name) {
             Some(ChildAddr { kind: ChildKind::Rows, slot }) if slot.of != launched => {
@@ -33,17 +33,17 @@ fn relay_source(rel_dir: &str, launched: u32) -> Result<Option<u32>, StoreError>
             }
             Some(_) => {}
             None => {
-                return Err(StoreError::rejected(format!(
+                return Err(format!(
                     "{rel_dir}/{name} is in no child-directory grammar this build knows; \
                      it may hold rows written by an incompatible layout. Refusing to boot — \
                      delete the relation directory deliberately if the data is expendable."
-                )))
+                ))
             }
         }
     }
-    let complete = |of: u32| -> Result<bool, StoreError> {
+    let complete = |of: u32| -> Result<bool, String> {
         for m in cluster_children(of).map(|c| c.manifest(rel_dir)) {
-            if !fs::exists(&m).map_err(|e| StoreError::storage(format!("repartition: {m}"), e.into()))? {
+            if !fs::exists(&m).map_err(|e| format!("repartition: {m}: {e}"))? {
                 return Ok(false);
             }
         }
@@ -70,13 +70,13 @@ pub(super) fn repartition_relation(
     launched: u32,
     ram_tier_bytes: usize,
     chunk_rows: usize,
-) -> Result<(), StoreError> {
+) -> Result<(), String> {
     let Some(source) = relay_source(rel_dir, launched)? else {
         return Ok(());
     };
     gnitz_info!("repartition: {} from {} to {} worker(s)", rel_dir, source, launched);
     relay(rel_dir, schema, source, launched, ram_tier_bytes, chunk_rows)
-        .map_err(|e| StoreError::storage(format!("repartition {rel_dir} to {launched} worker(s)"), e))
+        .map_err(|e| format!("repartition {rel_dir} to {launched} worker(s): {e}"))
 }
 
 fn relay(

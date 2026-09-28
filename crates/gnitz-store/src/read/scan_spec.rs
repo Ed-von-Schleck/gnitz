@@ -2,7 +2,7 @@
 //! the bound, filter, map, then forward rows or fold them. A capacity-bounded
 //! view's rows hydrate chunk by chunk as the sink drains them.
 
-use gnitz_wire::{ReadBound, ReadSpec, SinkKind};
+use gnitz_wire::{ReadBound, ReadSpec, SinkKind, WireFault, WireStatus};
 
 use std::rc::Rc;
 
@@ -13,7 +13,7 @@ use crate::ops::AdhocFold;
 use crate::relation::RelationRegistry;
 use crate::schema::key::{key_range_between_cuts, leading_u64, KeyCut};
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, StoreError};
+use crate::storage::Batch;
 use gnitz_expr::{cmp_order_keys, order_locators, OrderLocator, RowFilter};
 
 impl RelationRegistry {
@@ -25,7 +25,7 @@ impl RelationRegistry {
         spec: ReadSpec,
         reply_layout: u64,
         hydrator: Option<&mut dyn SkeletonHydrator>,
-    ) -> Result<Rc<Batch>, StoreError> {
+    ) -> Result<Rc<Batch>, String> {
         let ReadSpec { bound, predicate, sink } = spec;
         let entry = self.relation_or_err(target_id)?;
         let src_schema = entry.schema();
@@ -42,14 +42,13 @@ impl RelationRegistry {
         let (source, unapplied) = self.open_bound(target_id, bound)?;
         // A bad predicate and a bad walk are both a corrupt request: the client
         // pre-compiled the identical program at plan time.
-        let filter = RowFilter::for_read(&predicate, &unapplied, &src_schema)
-            .map_err(|e| StoreError::rejected(format!("scan_spec: {e}")))?;
+        let filter = RowFilter::for_read(&predicate, &unapplied, &src_schema).map_err(|e| format!("scan_spec: {e}"))?;
         let mut map = sink
             .map
             .as_ref()
             .map(|m| MapPlan::from_compute_map(&src_schema, m))
             .transpose()
-            .map_err(|e| StoreError::rejected(format!("scan_spec map: {e}")))?;
+            .map_err(|e| format!("scan_spec map: {e}"))?;
         let sink_in = map.as_ref().map_or(src_schema, |m| *m.out_schema());
         let mut rows = Survivors {
             source: LiveSource::new(self, target_id, source, hydrator),
@@ -72,7 +71,7 @@ impl RelationRegistry {
                     debug_assert!(window > 0, "decode admits an order only under a cut");
                     sink_in
                         .check_cols(order.iter().map(|k| ("scan_spec: order key column", k.col as u32)))
-                        .map_err(|e| StoreError::rejected(e.to_string()))?;
+                        .map_err(|e| e.to_string())?;
                     topk_rows(
                         &mut rows,
                         chunk_rows,
@@ -88,37 +87,41 @@ impl RelationRegistry {
 
     /// Every delta `id`'s feed recorded in rounds `(after_tick, cut_tick]`, in the
     /// view's schema whatever `after_tick`; `0` walks the view's own output store.
+    /// A cursor below the retained floor is refused as [`WireStatus::DeltaExpired`];
+    /// every other refusal is `Error`.
     pub fn delta_read(
         &self,
         id: u64,
         after_tick: u64,
         cut_tick: u64,
         reply_layout: u64,
-    ) -> Result<Rc<Batch>, StoreError> {
+    ) -> Result<Rc<Batch>, WireFault> {
         let entry = self.relation_or_err(id)?;
         if !entry.has_delta_feed() {
-            return Err(StoreError::rejected(format!(
+            return Err(format!(
                 "delta_read: relation {id} carries no delta feed; \
                  create the view WITH (delta = '<size>') to subscribe to it"
-            )));
+            )
+            .into());
         }
         let view = entry.schema();
         check_layout(reply_layout, &view)?;
         if after_tick == 0 {
             return Ok(entry.cursor().materialize());
         }
-        let feed = entry.delta().ok_or_else(|| {
-            StoreError::rejected(format!(
-                "delta_read: this process holds no delta store for relation {id}"
-            ))
-        })?;
+        let feed = entry
+            .delta()
+            .ok_or_else(|| format!("delta_read: this process holds no delta store for relation {id}"))?;
         // `_tick` leads the delta PK.
         let dropped_through = leading_u64(feed.dropped_max().pk_bytes());
         if delta_cursor_expired(after_tick, dropped_through) {
-            return Err(StoreError::DeltaExpired(format!(
-                "delta cursor {after_tick} of relation {id} is below the \
-                 retained floor {dropped_through}; re-read at 0"
-            )));
+            return Err(WireFault {
+                status: WireStatus::DeltaExpired,
+                text: format!(
+                    "delta cursor {after_tick} of relation {id} is below the \
+                     retained floor {dropped_through}; re-read at 0"
+                ),
+            });
         }
         let band = key_range_between_cuts(
             KeyCut::above(&after_tick.to_be_bytes()),
@@ -131,9 +134,9 @@ impl RelationRegistry {
 
 /// The reply guard's refusal: a keeper built in any other layout would ship its
 /// regions under the client's strides.
-fn check_layout(reply_layout: u64, produced: &SchemaDescriptor) -> Result<(), StoreError> {
+fn check_layout(reply_layout: u64, produced: &SchemaDescriptor) -> Result<(), String> {
     if reply_layout != produced.layout_digest() {
-        return Err(StoreError::rejected("reply schema does not match the output layout"));
+        return Err("reply schema does not match the output layout".to_string());
     }
     Ok(())
 }
@@ -166,7 +169,7 @@ struct Survivors<'a, 'h> {
 impl Survivors<'_, '_> {
     /// The next source chunk and its surviving row ranges; `None` once the source is
     /// exhausted.
-    fn next(&mut self, max_rows: usize) -> Result<Option<SurvivorChunk<'_>>, StoreError> {
+    fn next(&mut self, max_rows: usize) -> Result<Option<SurvivorChunk<'_>>, String> {
         let Some(chunk) = self.source.next_chunk(max_rows)? else {
             return Ok(None);
         };
@@ -182,7 +185,7 @@ fn run_fold_sink(
     chunk_rows: usize,
     map: Option<&mut MapPlan>,
     mut fold: AdhocFold,
-) -> Result<Batch, StoreError> {
+) -> Result<Batch, String> {
     // One mapped batch for the whole scan: `clear` keeps its buffers.
     let mut map = map.map(|p| {
         let dst = Batch::empty_with_schema(p.out_schema());
@@ -220,7 +223,7 @@ fn stream_rows(
     mut map: Option<&mut MapPlan>,
     keeper_schema: &SchemaDescriptor,
     window: i64,
-) -> Result<Batch, StoreError> {
+) -> Result<Batch, String> {
     let early_stop = window > 0;
     let first = match early_stop {
         true => (window as usize).clamp(1, chunk_rows),
@@ -284,7 +287,7 @@ fn topk_rows(
     keeper_schema: &SchemaDescriptor,
     order: &[OrderLocator],
     window: i64,
-) -> Result<Batch, StoreError> {
+) -> Result<Batch, String> {
     // Mid-scan the keeper is still growing, so a trim at `window` would re-sort
     // after every chunk to shed rows the next chunk replaces. Saturating: an
     // unbounded `limit_k` leaves this unfireable rather than overflowing.

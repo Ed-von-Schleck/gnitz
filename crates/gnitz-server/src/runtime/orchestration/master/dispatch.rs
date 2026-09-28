@@ -618,7 +618,7 @@ impl MasterDispatcher {
     /// Returns the flush error WITHOUT resetting the SAL when the system-table
     /// flush fails: the SAL entries about to be discarded are that data's only
     /// durable copy, so resetting on a swallowed failure destroys it. The caller
-    /// leaves the SAL intact and either retries on a later checkpoint or aborts.
+    /// leaves the SAL intact and aborts or fails the boot.
     pub(crate) fn checkpoint_post_ack(&self, excl: &mut SalExcl<'_>) -> Result<(), WireFault> {
         let cat = self.cat();
         debug_assert!(

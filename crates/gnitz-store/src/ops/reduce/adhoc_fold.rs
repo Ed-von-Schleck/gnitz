@@ -23,7 +23,7 @@ use super::agg::Accumulator;
 use super::emit::emit_reduce_row;
 use super::plan::ReduceShape;
 use crate::schema::{SchemaDescriptor, SchemaFacts};
-use crate::storage::{Batch, MemBatch, StoreError};
+use crate::storage::{Batch, MemBatch};
 
 /// The request-scoped fold state.
 pub(crate) struct AdhocFold {
@@ -43,8 +43,8 @@ pub(crate) struct AdhocFold {
 impl AdhocFold {
     /// The fold of `agg` over `src_schema`, refused for a spec the schema cannot
     /// serve.
-    pub(crate) fn new(src_schema: &SchemaDescriptor, agg: &AggReadSpec, group_cap: usize) -> Result<Self, StoreError> {
-        let refuse = |e| StoreError::rejected(format!("scan_spec fold: {e}"));
+    pub(crate) fn new(src_schema: &SchemaDescriptor, agg: &AggReadSpec, group_cap: usize) -> Result<Self, String> {
+        let refuse = |e| format!("scan_spec fold: {e}");
         let (key, prefix) =
             GroupOutKey::new(src_schema, &agg.group_cols, agg.group_cols.iter().copied()).map_err(refuse)?;
         let mut groups = Batch::empty_with_schema(&prefix.finish());
@@ -72,7 +72,7 @@ impl AdhocFold {
 
     /// Fold the surviving `[start, end)` row ranges of one source chunk into the
     /// group state. `Err` past the per-worker group cap.
-    pub(crate) fn fold_ranges(&mut self, chunk: &Batch, ranges: &[(usize, usize)]) -> Result<(), StoreError> {
+    pub(crate) fn fold_ranges(&mut self, chunk: &Batch, ranges: &[(usize, usize)]) -> Result<(), String> {
         let Self {
             shape,
             groups,
@@ -133,7 +133,7 @@ struct FoldRows<'a> {
 }
 
 impl IdentityLoop for FoldRows<'_> {
-    type Out = Result<(), StoreError>;
+    type Out = Result<(), String>;
 
     fn run(self, identity: impl Fn(usize) -> u128) -> Self::Out {
         let FoldRows {
@@ -159,10 +159,10 @@ impl IdentityLoop for FoldRows<'_> {
                         Entry::Vacant(e) => {
                             let ord = groups.count;
                             if ord >= group_cap {
-                                return Err(StoreError::rejected(format!(
+                                return Err(format!(
                                     "GROUP BY exceeds {group_cap} distinct groups for ad-hoc execution; \
                                      CREATE VIEW to maintain this aggregation incrementally"
-                                )));
+                                ));
                             }
                             emit_reduce_row(
                                 groups,

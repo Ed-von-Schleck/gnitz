@@ -1,12 +1,11 @@
 //! What the catalog owns above the registry because it needs both rungs: the
 //! boot resume verdict, the source cursor a circuit backfill drives, and the read
-//! wrappers that add what a caller cannot — the hydrator, or a delta read's expiry
-//! status.
+//! wrappers that add what a caller cannot — the hydrator.
 
 use super::*;
 use gnitz_store::read::SourceCursor;
 use gnitz_store::relation::Residency;
-use gnitz_wire::{ReadBound, ReadSpec, WireFault};
+use gnitz_wire::{ReadBound, ReadSpec};
 use rustc_hash::FxHashSet;
 use std::rc::Rc;
 
@@ -14,45 +13,18 @@ impl CatalogEngine {
     /// Every row of `table_id`, with this engine's own circuit layer as the hydrator.
     pub(crate) fn scan(&mut self, table_id: u64) -> Result<Rc<Batch>, String> {
         let schema = self.registry.relation_or_err(table_id)?.schema();
-        Ok(self.registry.scan_spec(
+        self.registry.scan_spec(
             table_id,
             ReadSpec::all_rows(ReadBound::None),
             schema.layout_digest(),
             Some(&mut self.dag),
-        )?)
+        )
     }
 
     /// [`RelationRegistry::scan_spec`], hydrating.
-    pub(crate) fn scan_spec(
-        &mut self,
-        target_id: u64,
-        spec: ReadSpec,
-        reply_layout: u64,
-    ) -> Result<Rc<Batch>, WireFault> {
+    pub(crate) fn scan_spec(&mut self, target_id: u64, spec: ReadSpec, reply_layout: u64) -> Result<Rc<Batch>, String> {
         self.registry
             .scan_spec(target_id, spec, reply_layout, Some(&mut self.dag))
-            .map_err(|e| WireFault::from(e.to_string()))
-    }
-
-    /// [`RelationRegistry::delta_read`]. The one site where a delta read's store
-    /// error becomes a wire fault: an expired cursor keeps its own status,
-    /// everything else is `WireStatus::Error`.
-    pub(crate) fn delta_read(
-        &self,
-        target_id: u64,
-        after_tick: u64,
-        cut_tick: u64,
-        reply_layout: u64,
-    ) -> Result<Rc<Batch>, WireFault> {
-        self.registry
-            .delta_read(target_id, after_tick, cut_tick, reply_layout)
-            .map_err(|e| match e {
-                StoreError::DeltaExpired(text) => WireFault {
-                    status: gnitz_wire::WireStatus::DeltaExpired,
-                    text,
-                },
-                other => WireFault::from(other.to_string()),
-            })
     }
 
     /// Mark non-resumable every view whose checkpointed state — output stores
@@ -122,9 +94,8 @@ impl CatalogEngine {
     pub(crate) fn open_stores(&mut self, rank: u32, residency: Residency) -> Result<usize, String> {
         let topology = self.topology_matches();
         let dag = &self.dag;
-        Ok(self
-            .registry
-            .open_stores(rank, residency, |id| topology && !dag.awaits_rebuild(id))?)
+        self.registry
+            .open_stores(rank, residency, |id| topology && !dag.awaits_rebuild(id))
     }
 
     /// The cursor driving `source` through `view_id`'s circuit, under the bound the
@@ -134,6 +105,5 @@ impl CatalogEngine {
         self.registry
             .open_bound(source, bound)
             .map(|(cursor, _unapplied)| cursor)
-            .map_err(String::from)
     }
 }

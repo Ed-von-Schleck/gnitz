@@ -15,10 +15,7 @@ impl UnreplayedCatalog {
         let family = SysFamily::from_id(table_id).ok_or_else(|| format!("{table_id} is not a system table"))?;
         let engine = &mut self.0;
         engine.raise_next_id(family, &batch, 0..batch.len());
-        engine
-            .registry
-            .ingest(table_id, batch)
-            .map_err(|e| format!("sys-table ingest failed (family={table_id}): {e}"))?;
+        engine.registry.ingest(table_id, batch)?;
         engine.mark_zone_applied(lsn);
         Ok(())
     }

@@ -12,7 +12,7 @@ use gnitz_wire::PkColList;
 
 use super::{Relation, RelationRegistry, Store};
 use crate::schema::Slot;
-use crate::storage::{manifest_path, published, retire_store, StorageError, StoreError};
+use crate::storage::{manifest_path, published, retire_store, StorageError};
 
 /// What a child directory holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -175,10 +175,10 @@ fn parse_relation_dir_name(name: &str) -> Option<u64> {
     parse_id(name).filter(|id: &u64| id.to_string() == name)
 }
 
-pub(crate) fn ensure_dir(path: &str) -> Result<(), StoreError> {
+pub(crate) fn ensure_dir(path: &str) -> Result<(), String> {
     create_dir(path)
         .map(drop)
-        .map_err(|e| StoreError::storage(format!("create directory '{path}'"), e.into()))
+        .map_err(|e| format!("create directory '{path}': {e}"))
 }
 
 /// How long [`lock_data_dir`] waits out a held lock: a forked child holds its
@@ -196,7 +196,7 @@ pub struct DirLock {
 
 /// Create and lock `base_dir`, retrying a held lock for [`DIR_LOCK_RETRY_FOR`],
 /// then set NOCOW on it and create its [`relations_dir`].
-pub fn lock_data_dir(base_dir: &str) -> Result<DirLock, StoreError> {
+pub fn lock_data_dir(base_dir: &str) -> Result<DirLock, String> {
     ensure_dir(base_dir)?;
     let path = format!("{base_dir}/{DIR_LOCK_FILENAME}");
     let file = fs::OpenOptions::new()
@@ -205,28 +205,19 @@ pub fn lock_data_dir(base_dir: &str) -> Result<DirLock, StoreError> {
         .create(true)
         .truncate(false)
         .open(&path)
-        .map_err(|e| StoreError::storage(format!("open data-directory lock '{path}'"), e.into()))?;
+        .map_err(|e| format!("open data-directory lock '{path}': {e}"))?;
     let deadline = Instant::now() + DIR_LOCK_RETRY_FOR;
     loop {
         match file.try_lock() {
             Ok(()) => break,
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => thread::sleep(DIR_LOCK_RETRY_EVERY),
-            Err(TryLockError::WouldBlock) => {
-                return Err(StoreError::rejected(format!(
-                    "data directory '{base_dir}' is already held"
-                )))
-            }
-            Err(TryLockError::Error(e)) => {
-                return Err(StoreError::storage(
-                    format!("lock data directory '{base_dir}'"),
-                    e.into(),
-                ))
-            }
+            Err(TryLockError::WouldBlock) => return Err(format!("data directory '{base_dir}' is already held")),
+            Err(TryLockError::Error(e)) => return Err(format!("lock data directory '{base_dir}': {e}")),
         }
     }
     gnitz_foundation::posix_io::try_set_nocow(base_dir);
     let root = relations_dir(base_dir);
-    let create_err = |e: std::io::Error| StoreError::storage(format!("create '{root}'"), e.into());
+    let create_err = |e: std::io::Error| format!("create '{root}': {e}");
     if create_dir(&root).map_err(create_err)? {
         fsync_dir(base_dir).map_err(create_err)?;
     }
@@ -234,15 +225,15 @@ pub fn lock_data_dir(base_dir: &str) -> Result<DirLock, StoreError> {
 }
 
 /// One relation directory's caller record, or the I/O error reading it failed with.
-type PersistedRecord = (u64, Result<Vec<u8>, StoreError>);
+type PersistedRecord = (u64, Result<Vec<u8>, String>);
 
 impl RelationRegistry {
     /// Each relation directory's caller record for this slot, by id. A directory
     /// whose manifest is absent or damaged holds none; a failed read is that
     /// relation's `Err`.
-    pub fn persisted_records(&self) -> Result<Vec<PersistedRecord>, StoreError> {
+    pub fn persisted_records(&self) -> Result<Vec<PersistedRecord>, String> {
         let root = relations_dir(&self.base_dir);
-        let names = subdir_names(&root).map_err(|e| StoreError::storage(format!("list '{root}'"), e))?;
+        let names = subdir_names(&root).map_err(|e| format!("list '{root}': {e}"))?;
         let mut records = Vec::new();
         for name in names {
             let Some(id) = parse_relation_dir_name(&name) else {
@@ -251,10 +242,7 @@ impl RelationRegistry {
             let dir = format!("{root}/{name}");
             match caller_record_at(&dir, self.slot) {
                 Ok(Some(record)) => records.push((id, Ok(record))),
-                Err(e) => records.push((
-                    id,
-                    Err(StoreError::storage(format!("read the manifest under '{dir}'"), e)),
-                )),
+                Err(e) => records.push((id, Err(format!("read the manifest under '{dir}': {e}")))),
                 Ok(None) => {}
             }
         }
@@ -262,7 +250,7 @@ impl RelationRegistry {
     }
 
     /// Drop `id`'s entry and erase its directory, every rank's children included.
-    pub fn unregister_and_erase(&mut self, id: u64) -> Result<(), StoreError> {
+    pub fn unregister_and_erase(&mut self, id: u64) -> Result<(), String> {
         assert_eq!(self.slot.of, 1, "erasing a directory other ranks' stores live in");
         let Some(Relation { store, .. }) = self.tables.remove(&id) else {
             return Ok(());
@@ -272,7 +260,7 @@ impl RelationRegistry {
         if let Store::Held(table) = store {
             table
                 .unlink_manifest()
-                .map_err(|e| StoreError::storage(format!("erase relation {id} (dir={dir})"), e))?;
+                .map_err(|e| format!("erase relation {id} (dir={dir}): {e}"))?;
         }
         if let Err(e) = fs::remove_dir_all(&dir) {
             gnitz_debug!("relation: failed to erase relation dir {}: {}", dir, e);
@@ -282,9 +270,9 @@ impl RelationRegistry {
 
     /// Remove every relation directory and child this registry does not own. Sound
     /// only once every process sharing `base_dir` has applied this catalog.
-    pub fn reclaim_orphan_relation_dirs(&self) -> Result<(), StoreError> {
+    pub fn reclaim_orphan_relation_dirs(&self) -> Result<(), String> {
         let root = relations_dir(&self.base_dir);
-        let names = subdir_names(&root).map_err(|e| StoreError::storage(format!("list '{root}'"), e))?;
+        let names = subdir_names(&root).map_err(|e| format!("list '{root}': {e}"))?;
         for name in names {
             let dir = format!("{root}/{name}");
             let Some(entry) = parse_relation_dir_name(&name).and_then(|id| self.tables.get(&id)) else {
@@ -298,7 +286,7 @@ impl RelationRegistry {
             remove_children(&dir, |c| {
                 c.slot.of != of || matches!(c.kind, ChildKind::Index(cols) if entry.index_on(cols.as_slice()).is_none())
             })
-            .map_err(|e| StoreError::storage(format!("reclaim children of '{dir}'"), e))?;
+            .map_err(|e| format!("reclaim children of '{dir}': {e}"))?;
         }
         Ok(())
     }

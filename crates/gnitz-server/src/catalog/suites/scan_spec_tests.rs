@@ -180,7 +180,7 @@ fn pk_set_rejects_a_key_stride_other_than_the_relations() {
     let Err(err) = e.scan_spec(tid, spec, reply_schema.layout_digest()) else {
         panic!("a PkSet at the wrong stride must be rejected");
     };
-    assert!(err.text.contains("stride"), "{err}");
+    assert!(err.contains("stride"), "{err}");
 }
 
 /// A REPLICATED base table holds a full copy of the dataset in this worker's own
@@ -715,7 +715,7 @@ fn projection_missing_an_output_slot_errs() {
     );
     let spec = rows_spec(vec![], map_of(proj_blob(&[(1, 0)]), &reply), vec![], 0);
     let err = e.scan_spec(tid, spec, reply.layout_digest()).err().unwrap();
-    assert!(err.text.contains("OutputSlotCountMismatch"), "{err}");
+    assert!(err.contains("OutputSlotCountMismatch"), "{err}");
 }
 
 /// A gather + ORDER BY … LIMIT k over weight-3 rows, sized so
