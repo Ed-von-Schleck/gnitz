@@ -1,5 +1,6 @@
 use super::*;
 use crate::schema::key::{compare_pk_bytes, ReindexPacker};
+use crate::schema::ColumnTable;
 use crate::schema::{ground_owner, worker_for_pk_bytes};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
@@ -58,7 +59,7 @@ fn pk_routed_scatter_routes_every_row_to_its_owner() {
     let comp_s = pk_payload_schema(&[TypeCode::U64; 2]);
     let wide_s = wide_pk_3xu64_schema();
     assert!(
-        comp_s.pk_indices().len() > 1 && comp_s.pk_stride() == 16,
+        comp_s.pk_cols().len() > 1 && comp_s.pk_stride() == 16,
         "narrow compound PK"
     );
     assert!(wide_s.pk_stride() > 16, "wide compound PK");

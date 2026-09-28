@@ -4,6 +4,7 @@ use crate::catalog::CatalogEngine;
 use crate::test_support::{
     col_def, make_schema_u64_i64, pk_only_schema, scratch_dir, u64_pk_schema, write_circuit, write_identity_circuit,
 };
+use gnitz_expr::SchemaFacts;
 use gnitz_store::schema::SchemaColumn;
 use gnitz_wire::{OpNode, TypeCode};
 
@@ -363,8 +364,7 @@ fn a_partitioned_global_reduce_or_topn_relays_partials() {
 fn a_global_reduce_splits_only_where_partials_combine_and_workers_differ() {
     use gnitz_store::schema::Placement;
     let keyed = make_schema_u64_i64();
-    let unsplit =
-        |op: OpNode, source: SchemaDescriptor, of: u32| side_output(op, source, of).same_physical_layout(&source);
+    let unsplit = |op: OpNode, source: SchemaDescriptor, of: u32| side_output(op, source, of).same_layout(&source);
     assert!(unsplit(global_reduce(gnitz_wire::AggFunc::Sum), keyed, 1), "one worker");
     assert!(unsplit(global_topn(), keyed, 1), "one worker");
     let replicated = keyed.with_placement(Placement::Replicated);

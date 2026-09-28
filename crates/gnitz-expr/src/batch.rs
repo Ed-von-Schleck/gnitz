@@ -118,13 +118,10 @@ impl EvalScratch {
     /// A zero capacity is how a buffer stays unallocated for a program that never
     /// touches it.
     pub(crate) fn new(prog: &ResolvedProgram) -> Self {
-        let num_regs = prog.num_regs as usize;
-        // Full width, unlike `regs`: `set_null_reg` indexes these by the raw
-        // register and runs for `LoadNullStr`, a string one.
         let null_cap = if prog.no_nulls {
             0
         } else {
-            num_regs * NULL_WORDS_PER_REG
+            prog.num_regs() * NULL_WORDS_PER_REG
         };
         let mut scratch = EvalScratch {
             regs: vec![0; prog.scalar_lanes as usize * MORSEL],
@@ -424,10 +421,8 @@ impl Morsel<'_> {
 
 /// Propagate binary null: dst_null = a_null | b_null (word-at-a-time).
 ///
-/// `#[inline]` for [`maybe_pack_bool_bits`]' reason: once per instruction per
-/// morsel, and a no-op on the `no_nulls` arm. Kept apart from [`null_or_all`]:
-/// spelled through it, the `int_div` and `select` shapes of `expr_kernel_bench`
-/// each retire 1.3 % more instructions.
+/// Kept apart from [`null_or_all`]; the `int_div` and `select` shapes of
+/// `expr_kernel_bench` measure the split.
 #[inline]
 fn null_or2(s: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a: u16, b: u16) {
     if mo.no_nulls() {
@@ -528,10 +523,8 @@ fn eval_is_null(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, pi: u8, in
         return fill_is_null_regs(scratch, mo, dst, pi, invert, col_nullable);
     }
     // A destination read as a packed bit builds that word off the gather
-    // directly; one read as a value takes the lane fill below. Gated because it
-    // is not a win both ways: ungated, `is_null_arm_bench`'s register-sink `map`
-    // shape costs +30 %, against −31 % on `bare` and −8 % on the 4-conjunct
-    // chains.
+    // directly; one read as a value takes the lane fill below. `is_null_arm_bench`
+    // measures the gate.
     if mo.prog.needs_bool_pack(dst as usize) {
         return is_null_packed(scratch, mo, dst, pi, invert, col_nullable);
     }
@@ -658,11 +651,8 @@ fn maybe_unpack_bool_to_regs(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u1
 /// consumer (or, for filters, a bit_only result_reg). Non-bool producers reach
 /// a BOOL consumer through this path without restructuring their inner loop.
 ///
-/// The two tests are `#[inline]` and the pack is not: this is called once per
-/// instruction per morsel from `bin_op`/`un_op`, and on the `no_nulls` arm it is
-/// a no-op — so the *test* has to fold into the caller, where inlining the pack
-/// with it makes the whole thing too big for LLVM to do that. Worth 1.4 % of the
-/// `expr_kernel_bench` map shape, measured.
+/// The tests inline into the caller and the pack does not; the `map` shape of
+/// `expr_kernel_bench` measures the split.
 #[inline]
 fn maybe_pack_bool_bits(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16) {
     if !mo.no_nulls() && mo.prog.needs_bool_pack(dst as usize) {
@@ -782,10 +772,8 @@ impl<'a> StrBufs<'a> {
 /// [`EvalScratch`] has no lifetime parameter to hold one, and `MorselOut`
 /// borrows the scratch.
 ///
-/// Filled unconditionally; only the loop is skipped for a program with no string
-/// column. Handing `f` a shared static empty table on that arm instead costs
-/// 0.4–0.6 % on every string shape of `expr_kernel_bench`: `cols` stops being one
-/// traceable alloca, and the per-row [`StrBufs::region`] loads lose that.
+/// The table is filled whether or not the program loads a string column; the
+/// string shapes of `expr_kernel_bench` measure that against a shared empty one.
 pub(crate) fn with_str_bufs(prog: &ResolvedProgram, mb: &dyn BatchView, f: impl FnOnce(StrBufs<'_>)) {
     // The blob is read whatever `str_cols` says: `StrColConst` / `StrColCol`
     // reach it through their own operand without registering a column, so an
@@ -859,17 +847,12 @@ fn arena_push_span(arena: &mut Vec<u8>, bufs: StrBufs<'_>, src: u32, o: usize, l
     }
 }
 
-/// Row `row` of a 16-byte German-string cell region as a view, no byte copied: a
-/// long cell points into the blob, a short one at its own inline bytes, which
-/// `german_string_inline` shows are the contiguous slice `cell[4..4 + len]`.
-/// `buf` must be the [`StrBufs`] index holding `cells`. The out-of-range clamp is
-/// applied here, so LENGTH, the compares, the transforms and the emits all agree on
-/// the degraded value.
-fn cell_to_view(cells: &[u8], row: usize, buf: u32, blob_len: usize) -> StrView {
-    let o = row * 16;
-    let cell = &cells[o..o + 16];
+/// A 16-byte German-string cell at byte `o` of buffer `buf` as a view, no byte
+/// copied: a long cell points into the blob, a short one at its own inline bytes.
+/// A corrupt long cell reads as the empty string.
+fn cell_to_view(cell: &[u8; 16], o: usize, buf: u32, blob_len: usize) -> StrView {
     match german_string_inline(cell) {
-        Some(inline) => StrView::at(buf, o + 4, inline.len()),
+        Some(inline) => StrView::at(buf, o + gnitz_wire::GERMAN_INLINE_OFF, inline.len()),
         None => heap_view(cell, blob_len),
     }
 }
@@ -888,11 +871,29 @@ fn in_trim_set(set: &[u64; 4], b: u8) -> bool {
 }
 
 impl IntReg {
-    /// Row `i` of the register, widened. Each operand's magnitude is ≤ 2^64, so
-    /// the sum of two cannot overflow.
+    /// The register's first `m` rows.
     #[inline]
-    fn read(self, regs: &[i64], i: usize) -> i128 {
-        let v = regs[self.reg as usize * MORSEL + i];
+    fn lane(self, regs: &[i64], m: usize) -> IntLane<'_> {
+        IntLane {
+            rows: &regs[self.reg as usize * MORSEL..][..m],
+            signed: self.signed,
+        }
+    }
+}
+
+/// One [`IntReg`]'s rows in a morsel.
+#[derive(Clone, Copy)]
+struct IntLane<'r> {
+    rows: &'r [i64],
+    signed: bool,
+}
+
+impl IntLane<'_> {
+    /// Row `i`, widened. Each operand's magnitude is ≤ 2^64, so the sum of two
+    /// cannot overflow.
+    #[inline]
+    fn get(self, i: usize) -> i128 {
+        let v = self.rows[i];
         if self.signed {
             v as i128
         } else {
@@ -1127,10 +1128,8 @@ fn str2_to_scalar(
         // costs two bounds checks and two counter bumps per row.
         let (sa, sb) = (&str_views[base_a..base_a + mo.m], &str_views[base_b..base_b + mo.m]);
         let rd = &mut regs[base_d..base_d + mo.m];
-        for (i, r) in rd.iter_mut().enumerate() {
-            let va = view_bytes(sa[i], str_arena, bufs);
-            let vb = view_bytes(sb[i], str_arena, bufs);
-            *r = f(va, vb);
+        for ((r, &va), &vb) in rd.iter_mut().zip(sa).zip(sb) {
+            *r = f(view_bytes(va, str_arena, bufs), view_bytes(vb, str_arena, bufs));
         }
     }
     null_or2(scratch, mo, dst, a, b);
@@ -1160,11 +1159,8 @@ fn str_kernel<const S: usize, const I: usize>(
     merge_fail_mask(scratch, mo, dst, &bad);
 }
 
-/// [`str_kernel`] for a closure that cannot fail. The return type is the whole
-/// difference: with no `Option` there is no flag to raise, so none can be raised
-/// and then dropped, and no fail mask is written or scanned — which is the 1.1 %
-/// of `expr_kernel_bench`'s `str_upper` a dedicated one-string transform used to
-/// buy.
+/// [`str_kernel`] for a closure that cannot fail: no fail mask is written or
+/// scanned.
 fn str_kernel_total<const S: usize, const I: usize>(
     scratch: &mut EvalScratch,
     mo: &Morsel<'_>,
@@ -1195,9 +1191,10 @@ fn str_kernel_rows<const S: usize, const I: usize>(
     {
         let EvalScratch { regs, str_views, str_arena, .. } = &mut *scratch;
         let (srcs, vd) = split_windows(str_views, MORSEL, strs.map(usize::from), dst as usize, mo.m);
+        let lanes = ints.map(|r| r.lane(regs, vd.len()));
         for (i, r) in vd.iter_mut().enumerate() {
             let views = srcs.map(|w| w[i]);
-            let nums = ints.map(|r| r.read(regs, i));
+            let nums = lanes.map(|l| l.get(i));
             *r = f(str_arena, bufs, views, nums, i);
         }
     }
@@ -1245,8 +1242,8 @@ fn eval_str_select(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, cond: u
 
 /// SUBSTRING: a sub-view of the source, the bytes never copied.
 ///
-/// Kept apart from [`str_kernel`], whose `<1, 2>` case this is: through it,
-/// the `str_substr` bench shape retires 19.6 % more instructions.
+/// Kept apart from [`str_kernel`], whose `<1, 2>` case this is; the
+/// `str_substr` shape of `expr_kernel_bench` measures the split.
 fn eval_str_substr(
     scratch: &mut EvalScratch,
     mo: &Morsel<'_>,
@@ -1261,6 +1258,7 @@ fn eval_str_substr(
     let mut bad = [0u8; MORSEL];
     {
         let EvalScratch { regs, str_views, str_arena, .. } = &mut *scratch;
+        let (start, len) = (start.lane(regs, m), len.map(|l| l.lane(regs, m)));
         for i in 0..m {
             let v = str_views[base_s + i];
             let (s, base_off) = view_bytes_at(v, str_arena, bufs);
@@ -1268,10 +1266,10 @@ fn eval_str_substr(
             // clamp to `[1, past_end]`. The byte length only bounds the character
             // count; `char_offset` settles a window landing in the gap.
             let past_end = s.len() as i128 + 1;
-            let lo = start.read(regs, i);
+            let lo = start.get(i);
             let hi = match len {
                 Some(l) => {
-                    let len = l.read(regs, i);
+                    let len = l.get(i);
                     bad[i] = (len < 0) as u8;
                     lo + len
                 }
@@ -1371,77 +1369,79 @@ fn eval_str_concat(
 // String comparison — one kernel over two interchangeable operands
 // ---------------------------------------------------------------------------
 
-/// One side of a German-string compare: 16-byte cells `stride` bytes apart over
-/// `blob`, plus the null bit that makes the *result* null.
-///
-/// `stride == 0` pins every row to the same cell, which is what makes a resolved
-/// constant and a payload column the same operand — the compare is one loop with
-/// no per-row branch and no closure call, instead of a kernel per pairing. A
-/// constant is never NULL, so its `null_bit` is 0 and contributes nothing to the
-/// result's null mask.
+/// Where a compare operand's cell for morsel row `i` comes from.
+trait Cells: Copy {
+    fn cell(&self, i: usize) -> &[u8; 16];
+}
+
+/// A payload column's cells over the morsel.
 #[derive(Clone, Copy)]
-struct StrOperand<'a> {
-    cells: &'a [u8],
+struct ColumnCells<'a>(&'a [[u8; 16]]);
+
+impl Cells for ColumnCells<'_> {
+    fn cell(&self, i: usize) -> &[u8; 16] {
+        &self.0[i]
+    }
+}
+
+/// A resolved constant: one cell for every row.
+#[derive(Clone, Copy)]
+struct ConstCell<'a>(&'a [u8; 16]);
+
+impl Cells for ConstCell<'_> {
+    fn cell(&self, _: usize) -> &[u8; 16] {
+        self.0
+    }
+}
+
+/// One side of a German-string compare: its cells, the heap they point into, and
+/// the null bit that makes the *result* null.
+#[derive(Clone, Copy)]
+struct StrOperand<'a, C> {
+    cells: C,
     blob: &'a [u8],
-    stride: usize,
     null_bit: u64,
 }
 
-impl<'a> StrOperand<'a> {
-    /// A payload column's whole 16-byte-cell region, indexed by absolute row.
-    fn column(mb: &'a dyn BatchView, blob: &'a [u8], pi_byte: u8) -> Self {
+impl<'a> StrOperand<'a, ColumnCells<'a>> {
+    fn column(mb: &'a dyn BatchView, blob: &'a [u8], pi_byte: u8, mo: &Morsel<'_>) -> Self {
         let pi = pi_byte as usize;
+        let rows = &mb.col_data(pi, 16)[mo.start * 16..][..mo.m * 16];
         StrOperand {
-            cells: mb.col_data(pi, 16),
+            cells: ColumnCells(rows.as_chunks::<16>().0),
             blob,
-            stride: 16,
             null_bit: 1u64 << pi,
         }
     }
+}
 
-    /// The resolved constant cell, shared by every row. Its heap half, if it has
-    /// one, lives in the program's own constant arena — never the batch's blob.
+impl<'a> StrOperand<'a, ConstCell<'a>> {
     fn constant(prog: &'a ResolvedProgram, cell_idx: usize) -> Self {
         StrOperand {
-            cells: &prog.const_cells[cell_idx],
+            cells: ConstCell(&prog.const_cells[cell_idx]),
             blob: &prog.const_arena,
-            stride: 0,
             null_bit: 0,
         }
-    }
-
-    fn cell(&self, row: usize) -> &[u8] {
-        let o = row * self.stride;
-        &self.cells[o..o + 16]
     }
 }
 
 /// The one string-compare kernel. The compare runs unconditionally, including on
 /// rows where either operand's column is null, keeping the loop branch-free.
-///
-/// `#[inline(always)]` here and on [`str_cmp`]: only
-/// at the call site is a constant operand's `stride` the literal 0, and only
-/// then does the row loop fold `row * stride` away instead of bounds-checking
-/// both cell windows per row. Left to the inliner's own judgement each predicate
-/// has two call sites, loses the last-call-to-static bonus, and the loop is
-/// outlined.
+/// `str_const_filter_bench` measures the inlining.
 #[inline(always)]
-fn eval_str_cmp(
+fn eval_str_cmp<A: Cells, B: Cells>(
     scratch: &mut EvalScratch,
     mo: &Morsel<'_>,
     dst: u16,
-    a: StrOperand<'_>,
-    b: StrOperand<'_>,
+    a: StrOperand<'_, A>,
+    b: StrOperand<'_, B>,
     pred: impl Fn(Ordering) -> bool,
 ) {
     fill_null_bits_mask(scratch, dst, mo, a.null_bit | b.null_bit);
-    // `StrOperand` borrows the batch and the program, never the scratch, so the
-    // destination window is cut once outside the loop.
     let base_d = dst as usize * MORSEL;
     let rd = &mut scratch.regs[base_d..base_d + mo.m];
     for (i, r) in rd.iter_mut().enumerate() {
-        let row = mo.start + i;
-        *r = pred(compare_german_strings(a.cell(row), a.blob, b.cell(row), b.blob)) as i64;
+        *r = pred(compare_german_strings(a.cells.cell(i), a.blob, b.cells.cell(i), b.blob)) as i64;
     }
     maybe_pack_bool_bits(scratch, mo, dst);
 }
@@ -1602,9 +1602,15 @@ fn minmax2(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, b: u16, p
 
 /// Dispatch a German-string compare on its operator, hoisting the six-way
 /// branch out of the row loop: each arm instantiates [`eval_str_cmp`] with its
-/// own `Ordering` predicate. `#[inline(always)]` for the reason stated there.
-#[inline(always)]
-fn str_cmp(scratch: &mut EvalScratch, mo: &Morsel<'_>, op: CmpOp, d: u16, a: StrOperand<'_>, b: StrOperand<'_>) {
+/// own `Ordering` predicate.
+fn str_cmp<A: Cells, B: Cells>(
+    scratch: &mut EvalScratch,
+    mo: &Morsel<'_>,
+    op: CmpOp,
+    d: u16,
+    a: StrOperand<'_, A>,
+    b: StrOperand<'_, B>,
+) {
     match op {
         CmpOp::Eq => eval_str_cmp(scratch, mo, d, a, b, |o| o == Ordering::Equal),
         CmpOp::Ne => eval_str_cmp(scratch, mo, d, a, b, |o| o != Ordering::Equal),
@@ -1619,9 +1625,49 @@ fn str_cmp(scratch: &mut EvalScratch, mo: &Morsel<'_>, op: CmpOp, d: u16, a: Str
 // eval_batch — single morsel
 // ---------------------------------------------------------------------------
 
+/// `$body` once per [`FixedInt`] variant, with `$c` that variant as a `const`,
+/// so a width or codec call on it is a literal inside the row loop.
+macro_rules! for_each_fixed_int {
+    ($fi:expr, |$c:ident| $body:block) => {
+        match $fi {
+            FixedInt::U8 => {
+                const $c: FixedInt = FixedInt::U8;
+                $body
+            }
+            FixedInt::I8 => {
+                const $c: FixedInt = FixedInt::I8;
+                $body
+            }
+            FixedInt::U16 => {
+                const $c: FixedInt = FixedInt::U16;
+                $body
+            }
+            FixedInt::I16 => {
+                const $c: FixedInt = FixedInt::I16;
+                $body
+            }
+            FixedInt::U32 => {
+                const $c: FixedInt = FixedInt::U32;
+                $body
+            }
+            FixedInt::I32 => {
+                const $c: FixedInt = FixedInt::I32;
+                $body
+            }
+            FixedInt::U64 => {
+                const $c: FixedInt = FixedInt::U64;
+                $body
+            }
+            FixedInt::I64 => {
+                const $c: FixedInt = FixedInt::I64;
+                $body
+            }
+        }
+    };
+}
+
 /// Decode PK column `fi` at byte `off` of each of the morsel's rows into register
-/// `dst`, undoing the OPK encoding. Unswitched on `fi`, so each width reads a
-/// fixed-size array: one load and a byte swap per row.
+/// `dst`, undoing the OPK encoding.
 fn load_pk(
     scratch: &mut EvalScratch,
     mo: &Morsel<'_>,
@@ -1632,26 +1678,13 @@ fn load_pk(
 ) {
     let rows = &pk[mo.start * stride..(mo.start + mo.m) * stride];
     let dst_reg = scratch.reg_mut(dst, mo.m);
-    macro_rules! load {
-        ($w:expr, |$c:ident| $body:expr) => {{
-            const W: usize = $w;
-            assert!(off + W <= stride, "a PK column lies inside the PK");
-            for (r, row) in dst_reg.iter_mut().zip(rows.chunks_exact(stride)) {
-                let $c: &[u8; W] = row[off..off + W].try_into().unwrap();
-                *r = $body;
-            }
-        }};
-    }
-    match fi {
-        FixedInt::U8 => load!(1, |c| c[0] as i64),
-        FixedInt::I8 => load!(1, |c| (c[0] ^ 0x80) as i8 as i64),
-        FixedInt::U16 => load!(2, |c| u16::from_be_bytes(*c) as i64),
-        FixedInt::I16 => load!(2, |c| (u16::from_be_bytes(*c) ^ 0x8000) as i16 as i64),
-        FixedInt::U32 => load!(4, |c| u32::from_be_bytes(*c) as i64),
-        FixedInt::I32 => load!(4, |c| (u32::from_be_bytes(*c) ^ 0x8000_0000) as i32 as i64),
-        FixedInt::U64 => load!(8, |c| u64::from_be_bytes(*c) as i64),
-        FixedInt::I64 => load!(8, |c| (u64::from_be_bytes(*c) ^ (1u64 << 63)) as i64),
-    }
+    for_each_fixed_int!(fi, |FI| {
+        const W: usize = FI.width();
+        assert!(off + W <= stride, "a PK column lies inside the PK");
+        for (r, row) in dst_reg.iter_mut().zip(rows.chunks_exact(stride)) {
+            *r = gnitz_wire::decode_opk_i64(&row[off..off + W], FI);
+        }
+    });
     scratch.clear_null_reg(mo, dst);
     maybe_pack_bool_bits(scratch, mo, dst);
 }
@@ -1673,7 +1706,7 @@ pub(crate) fn eval_batch(
     // monomorphized view's field loads. `col_data` cannot join them — it is
     // addressed by `(pi, width)` on demand.
     let (pk_region, pk_stride) = mb.pk_region();
-    let mo = Morsel {
+    let morsel = Morsel {
         prog,
         null_bmp: mb.null_bmp(),
         start: morsel_start,
@@ -1682,55 +1715,32 @@ pub(crate) fn eval_batch(
     // Back to the constant prefix: the previous morsel's views die here.
     scratch.str_arena.truncate(prog.const_arena.len());
 
-    for instr in &prog.instrs {
-        match *instr {
+    for &(dst, instr) in &prog.instrs {
+        // Opaque per opcode, or LLVM hoists every arm's morsel arithmetic into one
+        // prologue each morsel pays; `filter_kernel_bench` measures it.
+        let mo = std::hint::black_box(&morsel);
+        let (morsel_start, m) = (mo.start, mo.m);
+        match instr {
             // ----------------------------------------------------------------
             // Load operations
             // ----------------------------------------------------------------
-            Instr::LoadPayloadInt { dst, pi, fi } => {
-                // The width is a `const fn` of `fi`; derive it once per
-                // instruction, outside the row loop (as `LoadPk` does).
+            Instr::LoadPayloadInt { pi, fi } => {
                 let col_data = mb.col_data(pi as usize, fi.width());
                 let dst_reg = scratch.reg_mut(dst, m);
-                // Widen `m` rows of a `SZ`-byte little-endian column into i64
-                // registers. `SZ` is a compile-time constant per instantiation,
-                // which is what `as_chunks` needs to vectorize.
-                macro_rules! load_int {
-                    ($ty:ty) => {{
-                        const SZ: usize = std::mem::size_of::<$ty>();
-                        let b = &col_data[morsel_start * SZ..(morsel_start + m) * SZ];
-                        for (i, c) in b.as_chunks::<SZ>().0.iter().enumerate() {
-                            dst_reg[i] = <$ty>::from_le_bytes(*c) as i64;
-                        }
-                    }};
-                }
-                // This match *is* `FixedInt`'s variants — total, with no wildcard,
-                // which is what `FixedInt` exists for: a wide column can no longer
-                // reach here, because `resolve_program` proved it could not.
-                match fi {
-                    // 8-byte: the one width with no widening and no signed/unsigned split —
-                    // the i64 register IS the storage type, a bare bit-reinterpret. Kept inline
-                    // so `load_int!` (which appends `as i64`) never emits a vacuous `i64 as i64`.
-                    FixedInt::U64 | FixedInt::I64 => {
-                        let b = &col_data[morsel_start * 8..(morsel_start + m) * 8];
-                        for (i, c) in b.as_chunks::<8>().0.iter().enumerate() {
-                            dst_reg[i] = i64::from_le_bytes(*c);
-                        }
+                for_each_fixed_int!(fi, |FI| {
+                    const W: usize = FI.width();
+                    let b = &col_data[morsel_start * W..(morsel_start + m) * W];
+                    for (r, c) in dst_reg.iter_mut().zip(b.as_chunks::<W>().0) {
+                        *r = FI.decode_le_i64(c);
                     }
-                    FixedInt::I32 => load_int!(i32),
-                    FixedInt::U32 => load_int!(u32),
-                    FixedInt::I16 => load_int!(i16),
-                    FixedInt::U16 => load_int!(u16),
-                    FixedInt::I8 => load_int!(i8),
-                    FixedInt::U8 => load_int!(u8),
-                }
-                fill_null_bits_mask(scratch, dst, &mo, 1u64 << pi);
-                maybe_pack_bool_bits(scratch, &mo, dst);
+                });
+                fill_null_bits_mask(scratch, dst, mo, 1u64 << pi);
+                maybe_pack_bool_bits(scratch, mo, dst);
             }
 
             // Every float register holds an f64 image, so an F32 column widens
             // on load.
-            Instr::LoadPayloadF32 { dst, pi } => {
+            Instr::LoadPayloadF32 { pi } => {
                 let col_data = mb.col_data(pi as usize, 4);
                 let dst_reg = scratch.reg_mut(dst, m);
                 let b = &col_data[morsel_start * 4..(morsel_start + m) * 4];
@@ -1738,107 +1748,107 @@ pub(crate) fn eval_batch(
                     let bits = u32::from_le_bytes(*c);
                     dst_reg[i] = encode_f64(f32::from_bits(bits) as f64);
                 }
-                fill_null_bits_mask(scratch, dst, &mo, 1u64 << pi);
-                maybe_pack_bool_bits(scratch, &mo, dst);
+                fill_null_bits_mask(scratch, dst, mo, 1u64 << pi);
+                maybe_pack_bool_bits(scratch, mo, dst);
             }
 
-            Instr::LoadPk { dst, off, fi } => load_pk(scratch, &mo, dst, (pk_region, pk_stride), off as usize, fi),
+            Instr::LoadPk { off, fi } => load_pk(scratch, mo, dst, (pk_region, pk_stride), off as usize, fi),
 
             // ----------------------------------------------------------------
             // Integer arithmetic
             // ----------------------------------------------------------------
             // The operator match is OUTSIDE the row loop, so each arm is its own
             // branch-free loop.
-            Instr::IntArith { op, dst, a, b, signed } => match op {
-                IntArithOp::Add => bin_op(scratch, &mo, dst, a, b, |x, y| x.wrapping_add(y)),
-                IntArithOp::Sub => bin_op(scratch, &mo, dst, a, b, |x, y| x.wrapping_sub(y)),
-                IntArithOp::Mul => bin_op(scratch, &mo, dst, a, b, |x, y| x.wrapping_mul(y)),
-                IntArithOp::Div => int_divmod::<false>(scratch, &mo, dst, a, b, signed),
-                IntArithOp::Mod => int_divmod::<true>(scratch, &mo, dst, a, b, signed),
+            Instr::IntArith { op, a, b, signed } => match op {
+                IntArithOp::Add => bin_op(scratch, mo, dst, a, b, |x, y| x.wrapping_add(y)),
+                IntArithOp::Sub => bin_op(scratch, mo, dst, a, b, |x, y| x.wrapping_sub(y)),
+                IntArithOp::Mul => bin_op(scratch, mo, dst, a, b, |x, y| x.wrapping_mul(y)),
+                IntArithOp::Div => int_divmod::<false>(scratch, mo, dst, a, b, signed),
+                IntArithOp::Mod => int_divmod::<true>(scratch, mo, dst, a, b, signed),
             },
-            Instr::IntUnary { op, dst, a, signed } => match op {
-                IntUnaryOp::Neg => un_op(scratch, &mo, dst, a, |x| x.wrapping_neg()),
-                IntUnaryOp::Abs => un_op(scratch, &mo, dst, a, |x| x.wrapping_abs()),
-                IntUnaryOp::Sign if signed => un_op(scratch, &mo, dst, a, |x| x.signum()),
-                IntUnaryOp::Sign => un_op(scratch, &mo, dst, a, |x| (x != 0) as i64),
+            Instr::IntUnary { op, a, signed } => match op {
+                IntUnaryOp::Neg => un_op(scratch, mo, dst, a, |x| x.wrapping_neg()),
+                IntUnaryOp::Abs => un_op(scratch, mo, dst, a, |x| x.wrapping_abs()),
+                IntUnaryOp::Sign if signed => un_op(scratch, mo, dst, a, |x| x.signum()),
+                IntUnaryOp::Sign => un_op(scratch, mo, dst, a, |x| (x != 0) as i64),
             },
             // `micros` is loop-invariant, so it is unswitched out of the kernel
             // like every neighbouring selector: each arm folds the unused half of
             // the day/time split, and the day arm folds its zero time-of-day
             // through the hour/minute/second ops. The one op that can NULL is the
             // only one that pays for the fail mask.
-            Instr::Calendar { op, dst, a, micros } => match (op, micros) {
-                (CalendarOp::ToMicros, _) => unary_null_like(scratch, &mo, dst, a, calendar::days_to_micros),
-                (op, true) => un_op(scratch, &mo, dst, a, |x| calendar::eval(op, x, true)),
-                (op, false) => un_op(scratch, &mo, dst, a, |x| calendar::eval(op, x, false)),
+            Instr::Calendar { op, a, micros } => match (op, micros) {
+                (CalendarOp::ToMicros, _) => unary_null_like(scratch, mo, dst, a, calendar::days_to_micros),
+                (op, true) => un_op(scratch, mo, dst, a, |x| calendar::eval(op, x, true)),
+                (op, false) => un_op(scratch, mo, dst, a, |x| calendar::eval(op, x, false)),
             },
-            Instr::FloatUnary { op, dst, a } => match op {
-                FloatUnaryOp::Neg => un_op(scratch, &mo, dst, a, |x| encode_f64(-decode_f64(x))),
-                FloatUnaryOp::Abs => un_op(scratch, &mo, dst, a, |x| encode_f64(decode_f64(x).abs())),
-                FloatUnaryOp::Floor => un_op(scratch, &mo, dst, a, |x| encode_f64(decode_f64(x).floor())),
-                FloatUnaryOp::Ceil => un_op(scratch, &mo, dst, a, |x| encode_f64(decode_f64(x).ceil())),
-                FloatUnaryOp::Round => un_op(scratch, &mo, dst, a, |x| encode_f64(decode_f64(x).round_ties_even())),
-                FloatUnaryOp::Trunc => un_op(scratch, &mo, dst, a, |x| encode_f64(decode_f64(x).trunc())),
-                FloatUnaryOp::Sqrt => un_op(scratch, &mo, dst, a, |x| encode_f64(decode_f64(x).sqrt())),
-                FloatUnaryOp::Ln => un_op(scratch, &mo, dst, a, |x| encode_f64(decode_f64(x).ln())),
-                FloatUnaryOp::Log10 => un_op(scratch, &mo, dst, a, |x| encode_f64(decode_f64(x).log10())),
-                FloatUnaryOp::Exp => un_op(scratch, &mo, dst, a, |x| encode_f64(decode_f64(x).exp())),
+            Instr::FloatUnary { op, a } => match op {
+                FloatUnaryOp::Neg => un_op(scratch, mo, dst, a, |x| encode_f64(-decode_f64(x))),
+                FloatUnaryOp::Abs => un_op(scratch, mo, dst, a, |x| encode_f64(decode_f64(x).abs())),
+                FloatUnaryOp::Floor => un_op(scratch, mo, dst, a, |x| encode_f64(decode_f64(x).floor())),
+                FloatUnaryOp::Ceil => un_op(scratch, mo, dst, a, |x| encode_f64(decode_f64(x).ceil())),
+                FloatUnaryOp::Round => un_op(scratch, mo, dst, a, |x| encode_f64(decode_f64(x).round_ties_even())),
+                FloatUnaryOp::Trunc => un_op(scratch, mo, dst, a, |x| encode_f64(decode_f64(x).trunc())),
+                FloatUnaryOp::Sqrt => un_op(scratch, mo, dst, a, |x| encode_f64(decode_f64(x).sqrt())),
+                FloatUnaryOp::Ln => un_op(scratch, mo, dst, a, |x| encode_f64(decode_f64(x).ln())),
+                FloatUnaryOp::Log10 => un_op(scratch, mo, dst, a, |x| encode_f64(decode_f64(x).log10())),
+                FloatUnaryOp::Exp => un_op(scratch, mo, dst, a, |x| encode_f64(decode_f64(x).exp())),
                 // `partial_cmp` against zero: -0.0 and +0.0 are `Equal`, NaN is
                 // `None` and stays NaN, as PostgreSQL spells it.
-                FloatUnaryOp::Sign => un_op(scratch, &mo, dst, a, |x| {
+                FloatUnaryOp::Sign => un_op(scratch, mo, dst, a, |x| {
                     encode_f64(decode_f64(x).partial_cmp(&0.0).map_or(f64::NAN, |o| o as i32 as f64))
                 }),
             },
             // A finite source whose rounded result is not finite overflowed f32's
             // range. Testing the ROUNDED value (not `|x| > f32::MAX`) keeps the
             // 2^28-1 doubles just above f32::MAX that round down to it.
-            Instr::FloatToF32 { dst, a } => unary_null_like(scratch, &mo, dst, a, |x| {
+            Instr::FloatToF32 { a } => unary_null_like(scratch, mo, dst, a, |x| {
                 let f = decode_f64(x);
                 let v32 = f as f32;
                 (encode_f64(v32 as f64), f.is_finite() && v32.is_infinite())
             }),
-            Instr::IntCast { dst, a, fi, src_signed } => {
+            Instr::IntCast { a, fi, src_signed } => {
                 let (lo, hi, hi_u) = int_cast_bounds(fi);
                 if src_signed {
-                    unary_null_like(scratch, &mo, dst, a, |x| (x, x < lo || x > hi))
+                    unary_null_like(scratch, mo, dst, a, |x| (x, x < lo || x > hi))
                 } else {
-                    unary_null_like(scratch, &mo, dst, a, |x| (x, (x as u64) > hi_u))
+                    unary_null_like(scratch, mo, dst, a, |x| (x, (x as u64) > hi_u))
                 }
             }
             // Truncate toward zero, then range-check in f64: NaN fails every
             // comparison and so fails the check, as ±inf and out-of-range do.
-            Instr::FloatToInt { dst, a, fi } => {
+            Instr::FloatToInt { a, fi } => {
                 let (flo, fhi) = float_to_int_bounds(fi);
                 if fi == FixedInt::U64 {
-                    unary_null_like(scratch, &mo, dst, a, |x| {
+                    unary_null_like(scratch, mo, dst, a, |x| {
                         let t = decode_f64(x).trunc();
                         let ok = t >= flo && t < fhi;
                         (if ok { t as u64 as i64 } else { 0 }, !ok)
                     })
                 } else {
-                    unary_null_like(scratch, &mo, dst, a, |x| {
+                    unary_null_like(scratch, mo, dst, a, |x| {
                         let t = decode_f64(x).trunc();
                         let ok = t >= flo && t < fhi;
                         (if ok { t as i64 } else { 0 }, !ok)
                     })
                 }
             }
-            Instr::IntMinMax2 { dst, a, b, is_max, signed } => match (is_max, signed) {
-                (true, true) => minmax2(scratch, &mo, dst, a, b, |x, y| x > y),
-                (false, true) => minmax2(scratch, &mo, dst, a, b, |x, y| x < y),
-                (true, false) => minmax2(scratch, &mo, dst, a, b, |x, y| (x as u64) > (y as u64)),
-                (false, false) => minmax2(scratch, &mo, dst, a, b, |x, y| (x as u64) < (y as u64)),
+            Instr::IntMinMax2 { a, b, is_max, signed } => match (is_max, signed) {
+                (true, true) => minmax2(scratch, mo, dst, a, b, |x, y| x > y),
+                (false, true) => minmax2(scratch, mo, dst, a, b, |x, y| x < y),
+                (true, false) => minmax2(scratch, mo, dst, a, b, |x, y| (x as u64) > (y as u64)),
+                (false, false) => minmax2(scratch, mo, dst, a, b, |x, y| (x as u64) < (y as u64)),
             },
             // `total_cmp` and nothing else: -0.0 and +0.0 are `==`-equal but
             // total_cmp-distinct, so an `==`-based pick would let operand order
             // decide which bit pattern survives.
-            Instr::FloatMinMax2 { dst, a, b, is_max } => {
+            Instr::FloatMinMax2 { a, b, is_max } => {
                 if is_max {
-                    minmax2(scratch, &mo, dst, a, b, |x, y| {
+                    minmax2(scratch, mo, dst, a, b, |x, y| {
                         decode_f64(x).total_cmp(&decode_f64(y)).is_gt()
                     })
                 } else {
-                    minmax2(scratch, &mo, dst, a, b, |x, y| {
+                    minmax2(scratch, mo, dst, a, b, |x, y| {
                         decode_f64(x).total_cmp(&decode_f64(y)).is_lt()
                     })
                 }
@@ -1847,28 +1857,22 @@ pub(crate) fn eval_batch(
             // ----------------------------------------------------------------
             // Integer set membership (col IN (…) as one opcode)
             // ----------------------------------------------------------------
-            Instr::IntInSet { dst, value_reg, set_idx } => {
+            Instr::IntInSet { value_reg, set_idx } => {
                 let set = &prog.int_sets[set_idx as usize];
-                un_op(scratch, &mo, dst, value_reg, |x| set.binary_search(&x).is_ok() as i64)
+                un_op(scratch, mo, dst, value_reg, |x| set.binary_search(&x).is_ok() as i64)
             }
 
             // ----------------------------------------------------------------
             // Float arithmetic
             // ----------------------------------------------------------------
-            Instr::FloatArith { op, dst, a, b } => match op {
-                FloatArithOp::Add => bin_op(scratch, &mo, dst, a, b, |x, y| {
-                    encode_f64(decode_f64(x) + decode_f64(y))
-                }),
-                FloatArithOp::Sub => bin_op(scratch, &mo, dst, a, b, |x, y| {
-                    encode_f64(decode_f64(x) - decode_f64(y))
-                }),
-                FloatArithOp::Mul => bin_op(scratch, &mo, dst, a, b, |x, y| {
-                    encode_f64(decode_f64(x) * decode_f64(y))
-                }),
-                FloatArithOp::Pow => bin_op(scratch, &mo, dst, a, b, |x, y| {
+            Instr::FloatArith { op, a, b } => match op {
+                FloatArithOp::Add => bin_op(scratch, mo, dst, a, b, |x, y| encode_f64(decode_f64(x) + decode_f64(y))),
+                FloatArithOp::Sub => bin_op(scratch, mo, dst, a, b, |x, y| encode_f64(decode_f64(x) - decode_f64(y))),
+                FloatArithOp::Mul => bin_op(scratch, mo, dst, a, b, |x, y| encode_f64(decode_f64(x) * decode_f64(y))),
+                FloatArithOp::Pow => bin_op(scratch, mo, dst, a, b, |x, y| {
                     encode_f64(decode_f64(x).powf(decode_f64(y)))
                 }),
-                FloatArithOp::Div => div_like(scratch, &mo, dst, a, b, |x, y| {
+                FloatArithOp::Div => div_like(scratch, mo, dst, a, b, |x, y| {
                     let (fa, fb) = (decode_f64(x), decode_f64(y));
                     let is_zero = fb == 0.0;
                     let fb_safe = if is_zero { 1.0 } else { fb };
@@ -1881,45 +1885,45 @@ pub(crate) fn eval_batch(
             // ----------------------------------------------------------------
             // One arm per (op, order), so the per-row loop carries no branch.
             // `UnsignedSigned` decides a negative `y` by its sign alone.
-            Instr::Cmp { op, dst, a, b, order } => match (op, order) {
+            Instr::Cmp { op, a, b, order } => match (op, order) {
                 (CmpOp::Eq, IntOrder::Signed | IntOrder::Unsigned) => {
-                    bin_op(scratch, &mo, dst, a, b, |x, y| (x == y) as i64)
+                    bin_op(scratch, mo, dst, a, b, |x, y| (x == y) as i64)
                 }
                 (CmpOp::Ne, IntOrder::Signed | IntOrder::Unsigned) => {
-                    bin_op(scratch, &mo, dst, a, b, |x, y| (x != y) as i64)
+                    bin_op(scratch, mo, dst, a, b, |x, y| (x != y) as i64)
                 }
-                (CmpOp::Gt, IntOrder::Signed) => bin_op(scratch, &mo, dst, a, b, |x, y| (x > y) as i64),
-                (CmpOp::Ge, IntOrder::Signed) => bin_op(scratch, &mo, dst, a, b, |x, y| (x >= y) as i64),
-                (CmpOp::Lt, IntOrder::Signed) => bin_op(scratch, &mo, dst, a, b, |x, y| (x < y) as i64),
-                (CmpOp::Le, IntOrder::Signed) => bin_op(scratch, &mo, dst, a, b, |x, y| (x <= y) as i64),
+                (CmpOp::Gt, IntOrder::Signed) => bin_op(scratch, mo, dst, a, b, |x, y| (x > y) as i64),
+                (CmpOp::Ge, IntOrder::Signed) => bin_op(scratch, mo, dst, a, b, |x, y| (x >= y) as i64),
+                (CmpOp::Lt, IntOrder::Signed) => bin_op(scratch, mo, dst, a, b, |x, y| (x < y) as i64),
+                (CmpOp::Le, IntOrder::Signed) => bin_op(scratch, mo, dst, a, b, |x, y| (x <= y) as i64),
                 (CmpOp::Gt, IntOrder::Unsigned) => {
-                    bin_op(scratch, &mo, dst, a, b, |x, y| ((x as u64) > (y as u64)) as i64)
+                    bin_op(scratch, mo, dst, a, b, |x, y| ((x as u64) > (y as u64)) as i64)
                 }
                 (CmpOp::Ge, IntOrder::Unsigned) => {
-                    bin_op(scratch, &mo, dst, a, b, |x, y| ((x as u64) >= (y as u64)) as i64)
+                    bin_op(scratch, mo, dst, a, b, |x, y| ((x as u64) >= (y as u64)) as i64)
                 }
                 (CmpOp::Lt, IntOrder::Unsigned) => {
-                    bin_op(scratch, &mo, dst, a, b, |x, y| ((x as u64) < (y as u64)) as i64)
+                    bin_op(scratch, mo, dst, a, b, |x, y| ((x as u64) < (y as u64)) as i64)
                 }
                 (CmpOp::Le, IntOrder::Unsigned) => {
-                    bin_op(scratch, &mo, dst, a, b, |x, y| ((x as u64) <= (y as u64)) as i64)
+                    bin_op(scratch, mo, dst, a, b, |x, y| ((x as u64) <= (y as u64)) as i64)
                 }
                 (CmpOp::Eq, IntOrder::UnsignedSigned) => {
-                    bin_op(scratch, &mo, dst, a, b, |x, y| (y >= 0 && x == y) as i64)
+                    bin_op(scratch, mo, dst, a, b, |x, y| (y >= 0 && x == y) as i64)
                 }
                 (CmpOp::Ne, IntOrder::UnsignedSigned) => {
-                    bin_op(scratch, &mo, dst, a, b, |x, y| (y < 0 || x != y) as i64)
+                    bin_op(scratch, mo, dst, a, b, |x, y| (y < 0 || x != y) as i64)
                 }
-                (CmpOp::Lt, IntOrder::UnsignedSigned) => bin_op(scratch, &mo, dst, a, b, |x, y| {
+                (CmpOp::Lt, IntOrder::UnsignedSigned) => bin_op(scratch, mo, dst, a, b, |x, y| {
                     (y >= 0 && (x as u64) < (y as u64)) as i64
                 }),
-                (CmpOp::Le, IntOrder::UnsignedSigned) => bin_op(scratch, &mo, dst, a, b, |x, y| {
+                (CmpOp::Le, IntOrder::UnsignedSigned) => bin_op(scratch, mo, dst, a, b, |x, y| {
                     (y >= 0 && (x as u64) <= (y as u64)) as i64
                 }),
-                (CmpOp::Gt, IntOrder::UnsignedSigned) => bin_op(scratch, &mo, dst, a, b, |x, y| {
-                    (y < 0 || (x as u64) > (y as u64)) as i64
-                }),
-                (CmpOp::Ge, IntOrder::UnsignedSigned) => bin_op(scratch, &mo, dst, a, b, |x, y| {
+                (CmpOp::Gt, IntOrder::UnsignedSigned) => {
+                    bin_op(scratch, mo, dst, a, b, |x, y| (y < 0 || (x as u64) > (y as u64)) as i64)
+                }
+                (CmpOp::Ge, IntOrder::UnsignedSigned) => bin_op(scratch, mo, dst, a, b, |x, y| {
                     (y < 0 || (x as u64) >= (y as u64)) as i64
                 }),
             },
@@ -1927,13 +1931,13 @@ pub(crate) fn eval_batch(
             // ----------------------------------------------------------------
             // Float comparisons
             // ----------------------------------------------------------------
-            Instr::FCmp { op, dst, a, b } => match op {
-                CmpOp::Eq => bin_op(scratch, &mo, dst, a, b, |x, y| (decode_f64(x) == decode_f64(y)) as i64),
-                CmpOp::Ne => bin_op(scratch, &mo, dst, a, b, |x, y| (decode_f64(x) != decode_f64(y)) as i64),
-                CmpOp::Gt => bin_op(scratch, &mo, dst, a, b, |x, y| (decode_f64(x) > decode_f64(y)) as i64),
-                CmpOp::Ge => bin_op(scratch, &mo, dst, a, b, |x, y| (decode_f64(x) >= decode_f64(y)) as i64),
-                CmpOp::Lt => bin_op(scratch, &mo, dst, a, b, |x, y| (decode_f64(x) < decode_f64(y)) as i64),
-                CmpOp::Le => bin_op(scratch, &mo, dst, a, b, |x, y| (decode_f64(x) <= decode_f64(y)) as i64),
+            Instr::FCmp { op, a, b } => match op {
+                CmpOp::Eq => bin_op(scratch, mo, dst, a, b, |x, y| (decode_f64(x) == decode_f64(y)) as i64),
+                CmpOp::Ne => bin_op(scratch, mo, dst, a, b, |x, y| (decode_f64(x) != decode_f64(y)) as i64),
+                CmpOp::Gt => bin_op(scratch, mo, dst, a, b, |x, y| (decode_f64(x) > decode_f64(y)) as i64),
+                CmpOp::Ge => bin_op(scratch, mo, dst, a, b, |x, y| (decode_f64(x) >= decode_f64(y)) as i64),
+                CmpOp::Lt => bin_op(scratch, mo, dst, a, b, |x, y| (decode_f64(x) < decode_f64(y)) as i64),
+                CmpOp::Le => bin_op(scratch, mo, dst, a, b, |x, y| (decode_f64(x) <= decode_f64(y)) as i64),
             },
 
             // ----------------------------------------------------------------
@@ -1941,12 +1945,12 @@ pub(crate) fn eval_batch(
             // ----------------------------------------------------------------
             // The operator branch stays outside the row loop on both arms: each
             // `bin_op` instantiation is its own branch-free loop.
-            Instr::BoolBinary { dst, a, b, is_or } => {
+            Instr::BoolBinary { a, b, is_or } => {
                 if mo.no_nulls() {
                     if is_or {
-                        bin_op(scratch, &mo, dst, a, b, |x, y| ((x != 0) || (y != 0)) as i64);
+                        bin_op(scratch, mo, dst, a, b, |x, y| ((x != 0) || (y != 0)) as i64);
                     } else {
-                        bin_op(scratch, &mo, dst, a, b, |x, y| ((x != 0) && (y != 0)) as i64);
+                        bin_op(scratch, mo, dst, a, b, |x, y| ((x != 0) && (y != 0)) as i64);
                     }
                 } else {
                     // Nullable arm: word-level u64 3VL on packed truthy bits.
@@ -1954,12 +1958,12 @@ pub(crate) fn eval_batch(
                     // `needs_bool_pack`; the unpack to `regs[dst]` is skipped
                     // for bit_only destinations whose only readers are BOOL.
                     bool_and_or_word_loop(scratch, dst, a, b, m, is_or);
-                    maybe_unpack_bool_to_regs(scratch, &mo, dst);
+                    maybe_unpack_bool_to_regs(scratch, mo, dst);
                 }
             }
-            Instr::BoolNot { dst, a } => {
+            Instr::BoolNot { a } => {
                 if mo.no_nulls() {
-                    un_op(scratch, &mo, dst, a, |x| (x == 0) as i64);
+                    un_op(scratch, mo, dst, a, |x| (x == 0) as i64);
                 } else {
                     let words = m.div_ceil(64);
                     let base_a = a as usize * NULL_WORDS_PER_REG;
@@ -1972,23 +1976,23 @@ pub(crate) fn eval_batch(
                         scratch.bool_bits[base_d + w] = !va & !na;
                         scratch.null_bits[base_d + w] = na;
                     }
-                    maybe_unpack_bool_to_regs(scratch, &mo, dst);
+                    maybe_unpack_bool_to_regs(scratch, mo, dst);
                 }
             }
 
             // ----------------------------------------------------------------
             // IS NULL / IS NOT NULL
             // ----------------------------------------------------------------
-            Instr::IsNull { dst, pi, invert } => eval_is_null(scratch, &mo, dst, pi, invert),
-            Instr::IsNullReg { dst, a, invert } => eval_is_null_reg(scratch, &mo, dst, a, invert),
+            Instr::IsNull { pi, invert } => eval_is_null(scratch, mo, dst, pi, invert),
+            Instr::IsNullReg { a, invert } => eval_is_null_reg(scratch, mo, dst, a, invert),
 
             // ----------------------------------------------------------------
             // Type cast. `signed: false` reinterprets the register as u64 first
             // so values >= 2^63 cast to the correct large positive float.
             // ----------------------------------------------------------------
-            Instr::IntToFloat { dst, a, signed } => match signed {
-                true => un_op(scratch, &mo, dst, a, |x| encode_f64(x as f64)),
-                false => un_op(scratch, &mo, dst, a, |x| encode_f64(x as u64 as f64)),
+            Instr::IntToFloat { a, signed } => match signed {
+                true => un_op(scratch, mo, dst, a, |x| encode_f64(x as f64)),
+                false => un_op(scratch, mo, dst, a, |x| encode_f64(x as u64 as f64)),
             },
 
             // ----------------------------------------------------------------
@@ -1996,7 +2000,7 @@ pub(crate) fn eval_batch(
             // ----------------------------------------------------------------
             // Rows where `cond` is non-NULL and truthy take `a`'s value + null
             // bit; all others (false OR NULL cond) take `b`'s.
-            Instr::Select { dst, cond, a, b } => {
+            Instr::Select { cond, a, b } => {
                 if mo.no_nulls() {
                     // Fast arm: cond truthiness lives in `regs` (no bool_bits in
                     // no_nulls mode); a straight per-row blend.
@@ -2007,17 +2011,17 @@ pub(crate) fn eval_batch(
                 } else {
                     let take_a = select_take_mask(scratch, dst, cond, a, b, m.div_ceil(64));
                     blend_by_mask(&mut scratch.regs, [a, b], dst, &take_a, m);
-                    maybe_pack_bool_bits(scratch, &mo, dst);
+                    maybe_pack_bool_bits(scratch, mo, dst);
                 }
             }
             // Manufacture a NULL: zero the value lane, set the null bit for every
             // live row. Only ever reached on the nullable arm (LoadNull forces
             // `no_nulls` off via its `Operands::makes_null` flag).
-            Instr::LoadNull { dst } => {
+            Instr::LoadNull => {
                 let base_d = dst as usize * MORSEL;
                 scratch.regs[base_d..base_d + m].fill(0);
-                set_null_reg(scratch, &mo, dst);
-                maybe_pack_bool_bits(scratch, &mo, dst);
+                set_null_reg(scratch, mo, dst);
+                maybe_pack_bool_bits(scratch, mo, dst);
             }
 
             // ----------------------------------------------------------------
@@ -2027,21 +2031,21 @@ pub(crate) fn eval_batch(
             // operand B comes from differs. `str_cmp` keeps the three-way
             // operator branch outside the row loop, so each operator gets its own
             // branch-free kernel.
-            Instr::StrColConst { op, dst, pi, cell_idx } => str_cmp(
+            Instr::StrColConst { op, pi, cell_idx } => str_cmp(
                 scratch,
-                &mo,
+                mo,
                 op,
                 dst,
-                StrOperand::column(mb, bufs.blob, pi),
+                StrOperand::column(mb, bufs.blob, pi, mo),
                 StrOperand::constant(prog, cell_idx as usize),
             ),
-            Instr::StrColCol { op, dst, pi_a, pi_b } => str_cmp(
+            Instr::StrColCol { op, pi_a, pi_b } => str_cmp(
                 scratch,
-                &mo,
+                mo,
                 op,
                 dst,
-                StrOperand::column(mb, bufs.blob, pi_a),
-                StrOperand::column(mb, bufs.blob, pi_b),
+                StrOperand::column(mb, bufs.blob, pi_a, mo),
+                StrOperand::column(mb, bufs.blob, pi_b, mo),
             ),
 
             // ----------------------------------------------------------------
@@ -2052,60 +2056,59 @@ pub(crate) fn eval_batch(
             // null bit, never an untouched lane. Skipping NULL rows would leave
             // a previous morsel's view behind, and it would resolve against the
             // refilled arena.
-            Instr::LoadColStr { dst, pi } => {
+            Instr::LoadColStr { pi } => {
                 let blob_len = bufs.blob.len();
                 // The buffer slot *is* the payload slot: `with_str_bufs` filled
                 // it, because `resolve` recorded `pi` in the same mask.
                 let buf = SRC_COL_BASE + pi as u32;
                 let cells = bufs.region(buf).expect("a column slot names a buffer");
                 let base_d = dst as usize * MORSEL;
-                // Destination `base_d + i`, source `morsel_start + i`: the two
-                // offsets differ, so the lane window is cut and walked rather
-                // than indexed twice.
-                for (i, v) in scratch.str_views[base_d..base_d + m].iter_mut().enumerate() {
-                    *v = cell_to_view(cells, morsel_start + i, buf, blob_len);
+                let rows = cells[morsel_start * 16..(morsel_start + m) * 16].as_chunks::<16>().0;
+                let lane = &mut scratch.str_views[base_d..base_d + m];
+                for (i, (v, cell)) in lane.iter_mut().zip(rows).enumerate() {
+                    *v = cell_to_view(cell, (morsel_start + i) * 16, buf, blob_len);
                 }
-                fill_null_bits_mask(scratch, dst, &mo, 1u64 << pi);
+                fill_null_bits_mask(scratch, dst, mo, 1u64 << pi);
             }
 
             // The `LoadNull` shape: a defined empty lane plus the null bit for
             // every live row, with the tail word masked so stale high bits never
             // read as null.
-            Instr::LoadNullStr { dst } => {
+            Instr::LoadNullStr => {
                 let base_d = dst as usize * MORSEL;
                 scratch.str_views[base_d..base_d + m].fill(StrView::default());
-                set_null_reg(scratch, &mo, dst);
+                set_null_reg(scratch, mo, dst);
             }
 
-            Instr::StrSelect { dst, cond, a, b } => eval_str_select(scratch, &mo, dst, cond, a, b),
+            Instr::StrSelect { cond, a, b } => eval_str_select(scratch, mo, dst, cond, a, b),
 
             // The operator branch stays outside the row loop, as `str_cmp` does
             // for the `StrColConst` / `StrColCol` pair.
-            Instr::StrCmp { op, dst, a, b } => match op {
-                CmpOp::Eq => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| (x == y) as i64),
-                CmpOp::Ne => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| (x != y) as i64),
-                CmpOp::Gt => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| (x > y) as i64),
-                CmpOp::Ge => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| (x >= y) as i64),
-                CmpOp::Lt => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| (x < y) as i64),
-                CmpOp::Le => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| (x <= y) as i64),
+            Instr::StrCmp { op, a, b } => match op {
+                CmpOp::Eq => str2_to_scalar(scratch, mo, bufs, dst, a, b, |x, y| (x == y) as i64),
+                CmpOp::Ne => str2_to_scalar(scratch, mo, bufs, dst, a, b, |x, y| (x != y) as i64),
+                CmpOp::Gt => str2_to_scalar(scratch, mo, bufs, dst, a, b, |x, y| (x > y) as i64),
+                CmpOp::Ge => str2_to_scalar(scratch, mo, bufs, dst, a, b, |x, y| (x >= y) as i64),
+                CmpOp::Lt => str2_to_scalar(scratch, mo, bufs, dst, a, b, |x, y| (x < y) as i64),
+                CmpOp::Le => str2_to_scalar(scratch, mo, bufs, dst, a, b, |x, y| (x <= y) as i64),
             },
 
             // Unswitched on `chars`, so each measure is its own monomorphised loop.
-            Instr::StrLen { dst, a, chars } => {
+            Instr::StrLen { a, chars } => {
                 if chars {
-                    str_to_scalar(scratch, &mo, bufs, dst, a, |s| char_count(s) as i64);
+                    str_to_scalar(scratch, mo, bufs, dst, a, |s| char_count(s) as i64);
                 } else {
-                    str_to_scalar(scratch, &mo, bufs, dst, a, |s| s.len() as i64);
+                    str_to_scalar(scratch, mo, bufs, dst, a, |s| s.len() as i64);
                 }
             }
 
             // A fresh copy in the arena, folded in place. Unswitched on `upper`,
             // as `StrLen` and `int_divmod` are, so the direction is a constant
             // inside the byte loop rather than a test per byte.
-            Instr::StrCase { dst, a, upper } => {
+            Instr::StrCase { a, upper } => {
                 macro_rules! fold_case {
                     (|$b:ident| $hit:expr) => {
-                        str_kernel_total(scratch, &mo, bufs, dst, [a], [], |arena, bufs, [v], []| {
+                        str_kernel_total(scratch, mo, bufs, dst, [a], [], |arena, bufs, [v], []| {
                             let (o, l) = arena_push_view(arena, bufs, v);
                             for $b in &mut arena[o..o + l] {
                                 // `b ^ 0x20` on a hit and `b ^ 0` otherwise — the
@@ -2123,13 +2126,13 @@ pub(crate) fn eval_batch(
                 }
             }
 
-            Instr::StrSubstr { dst, src, start, len } => eval_str_substr(scratch, &mo, bufs, dst, src, start, len),
+            Instr::StrSubstr { src, start, len } => eval_str_substr(scratch, mo, bufs, dst, src, start, len),
 
             // A sub-view of the source: the bytes are not copied, only the
             // offset and length narrowed.
-            Instr::StrTrim { dst, a, mode, set_idx } => {
+            Instr::StrTrim { a, mode, set_idx } => {
                 let set = &prog.trim_sets[set_idx as usize];
-                str_kernel_total(scratch, &mo, bufs, dst, [a], [], |arena, bufs, [v], []| {
+                str_kernel_total(scratch, mo, bufs, dst, [a], [], |arena, bufs, [v], []| {
                     let (s, base_off) = view_bytes_at(v, arena, bufs);
                     let (mut lo, mut hi) = (0usize, s.len());
                     if mode.trims_start() {
@@ -2146,57 +2149,57 @@ pub(crate) fn eval_batch(
                 });
             }
 
-            Instr::StrLike { dst, src, matcher_idx } => {
+            Instr::StrLike { src, matcher_idx } => {
                 let matcher = &prog.like_matchers[matcher_idx as usize];
                 let mut folded = Vec::new();
-                str_to_scalar(scratch, &mo, bufs, dst, src, |s| matcher.matches(s, &mut folded) as i64);
+                str_to_scalar(scratch, mo, bufs, dst, src, |s| matcher.matches(s, &mut folded) as i64);
             }
 
-            Instr::StrConcat { dst, a, b, skip_null } => eval_str_concat(scratch, &mo, bufs, dst, a, b, skip_null),
+            Instr::StrConcat { a, b, skip_null } => eval_str_concat(scratch, mo, bufs, dst, a, b, skip_null),
 
             // The three numeric→text arms share one loop, monomorphised per
             // closure so the signed/float branch stays outside it.
             // `unsigned_abs` rather than `-v`: `i64::MIN` has no positive i64.
-            Instr::IntToStr { dst, a, signed } => {
+            Instr::IntToStr { a, signed } => {
                 if signed {
-                    num_to_str(scratch, &mo, dst, a, |arena, v| {
+                    num_to_str(scratch, mo, dst, a, |arena, v| {
                         arena_push_int(arena, v.unsigned_abs(), v < 0)
                     });
                 } else {
-                    num_to_str(scratch, &mo, dst, a, |arena, v| arena_push_int(arena, v as u64, false));
+                    num_to_str(scratch, mo, dst, a, |arena, v| arena_push_int(arena, v as u64, false));
                 }
             }
 
-            Instr::FloatToStr { dst, a } => {
-                num_to_str(scratch, &mo, dst, a, |arena, v| arena_push_float(arena, decode_f64(v)));
+            Instr::FloatToStr { a } => {
+                num_to_str(scratch, mo, dst, a, |arena, v| arena_push_float(arena, decode_f64(v)));
             }
 
-            Instr::StrToInt { dst, a, fi } => {
+            Instr::StrToInt { a, fi } => {
                 let (lo, hi) = fi.range();
                 // A U64 value above i64::MAX narrows to its own bit pattern,
                 // which is what the register holds; the resolve-time U64
                 // tracking makes downstream reads agree.
-                str_parse_to_scalar(scratch, &mo, bufs, dst, a, |s| {
+                str_parse_to_scalar(scratch, mo, bufs, dst, a, |s| {
                     parse_decimal_i128(s).filter(|v| *v >= lo && *v <= hi).map(|v| v as i64)
                 });
             }
 
-            Instr::StrToFloat { dst, a } => {
-                str_parse_to_scalar(scratch, &mo, bufs, dst, a, |s| {
+            Instr::StrToFloat { a } => {
+                str_parse_to_scalar(scratch, mo, bufs, dst, a, |s| {
                     std::str::from_utf8(s.trim_ascii())
                         .ok()
                         .and_then(|t| t.parse::<f64>().ok())
                         .map(encode_f64)
                 });
             }
-            Instr::StrPos { dst, hay, needle } => {
-                str2_to_scalar(scratch, &mo, bufs, dst, hay, needle, |h, n| match find(h, n) {
+            Instr::StrPos { hay, needle } => {
+                str2_to_scalar(scratch, mo, bufs, dst, hay, needle, |h, n| match find(h, n) {
                     Some(off) => char_count(&h[..off]) as i64 + 1,
                     None => 0,
                 })
             }
-            Instr::StrSide { dst, src, n, left } => {
-                str_kernel_total(scratch, &mo, bufs, dst, [src], [n], |arena, bufs, [v], [n]| {
+            Instr::StrSide { src, n, left } => {
+                str_kernel_total(scratch, mo, bufs, dst, [src], [n], |arena, bufs, [v], [n]| {
                     let (s, base) = view_bytes_at(v, arena, bufs);
                     // Clamped to one past the byte length, so it fits a `usize`.
                     let n_abs = n.unsigned_abs().min(s.len() as u128 + 1) as usize;
@@ -2216,17 +2219,15 @@ pub(crate) fn eval_batch(
                     }
                 })
             }
-            Instr::StrReverse { dst, a } => {
-                str_kernel_total(scratch, &mo, bufs, dst, [a], [], |arena, bufs, [v], []| {
-                    let (o, l) = arena_push_view(arena, bufs, v);
-                    reverse_chars(&mut arena[o..o + l]);
-                    StrView::arena(o, l)
-                })
-            }
-            Instr::StrReplace { dst, s, from, to } => {
+            Instr::StrReverse { a } => str_kernel_total(scratch, mo, bufs, dst, [a], [], |arena, bufs, [v], []| {
+                let (o, l) = arena_push_view(arena, bufs, v);
+                reverse_chars(&mut arena[o..o + l]);
+                StrView::arena(o, l)
+            }),
+            Instr::StrReplace { s, from, to } => {
                 str_kernel(
                     scratch,
-                    &mo,
+                    mo,
                     bufs,
                     dst,
                     [s, from, to],
@@ -2275,8 +2276,8 @@ pub(crate) fn eval_batch(
                     },
                 )
             }
-            Instr::StrPad { dst, s, n, fill, left } => {
-                str_kernel(scratch, &mo, bufs, dst, [s, fill], [n], |arena, bufs, [vs, vf], [n]| {
+            Instr::StrPad { s, n, fill, left } => {
+                str_kernel(scratch, mo, bufs, dst, [s, fill], [n], |arena, bufs, [vs, vf], [n]| {
                     let (s, base) = view_bytes_at(vs, arena, bufs);
                     if n <= 0 {
                         return Some(StrView::default());
@@ -2322,14 +2323,8 @@ pub(crate) fn eval_batch(
                     Some(StrView::arena(out, total as usize))
                 })
             }
-            Instr::StrSplitPart { dst, s, delim, n } => str_kernel(
-                scratch,
-                &mo,
-                bufs,
-                dst,
-                [s, delim],
-                [n],
-                |arena, bufs, [vs, vd], [n]| {
+            Instr::StrSplitPart { s, delim, n } => {
+                str_kernel(scratch, mo, bufs, dst, [s, delim], [n], |arena, bufs, [vs, vd], [n]| {
                     if n == 0 {
                         return None;
                     }
@@ -2349,8 +2344,8 @@ pub(crate) fn eval_batch(
                     };
                     let field = idx.and_then(|i| fields(s, d).nth(i));
                     Some(field.map_or(StrView::default(), |(lo, hi)| StrView::at(vs.src, base + lo, hi - lo)))
-                },
-            ),
+                })
+            }
         }
     }
 }

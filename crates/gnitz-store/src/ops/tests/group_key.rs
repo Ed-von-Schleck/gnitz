@@ -1,5 +1,6 @@
 use super::*;
 use crate::schema::key::compare_pk_bytes;
+use crate::schema::ColumnTable;
 use crate::schema::{SchemaColumn, SchemaFacts, TypeCode};
 use crate::storage::Batch;
 use crate::test_support::{batch_of_pk_bytes, pk_payload_schema, wide_pk_3xu64_schema};
@@ -103,7 +104,7 @@ fn assert_canonical_order(schema: &SchemaDescriptor, pk_rows: &[Vec<u8>]) {
 
     let batch = batch_of_pk_bytes(schema, pk_rows);
     let mb = batch.as_mem_batch();
-    let key = GroupOutKey::new(schema, schema.pk_indices(), []).unwrap().0;
+    let key = GroupOutKey::new(schema, schema.pk_cols(), []).unwrap().0;
     let runs = key.runs(&batch);
     let got_keys: Vec<&[u8]> = visit_order(&runs, mb.count)
         .into_iter()
@@ -319,7 +320,7 @@ fn reduce_sort_argsort_bench() {
             _ => wide_pk_3xu64_schema(),
         };
         let batch = batch_of_pk_bytes(&schema, &bench_rows(n, stride));
-        let key = GroupOutKey::new(&schema, schema.pk_indices(), []).unwrap().0;
+        let key = GroupOutKey::new(&schema, schema.pk_cols(), []).unwrap().0;
 
         let t = std::time::Instant::now();
         let runs = key.runs(&batch);
@@ -368,7 +369,7 @@ fn a_wide_whole_pk_identity_is_the_checksum_of_its_bytes() {
     let pk = [1u64.to_be_bytes(), 2u64.to_be_bytes(), 3u64.to_be_bytes()].concat();
     let batch = batch_of_pk_bytes(&schema, &[&pk]);
     let mb = batch.as_mem_batch();
-    let (key, prefix) = GroupOutKey::new(&schema, schema.pk_indices(), []).unwrap();
+    let (key, prefix) = GroupOutKey::new(&schema, schema.pk_cols(), []).unwrap();
     assert_eq!(prefix.finish().pk_stride(), 24);
     assert_eq!(key.identity(&mb, 0), gnitz_wire::checksum_128(&pk));
     assert_eq!(key.out_pk(&mb, 0).bytes(), &pk[..]);

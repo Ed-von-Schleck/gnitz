@@ -8,6 +8,7 @@
 //! `unique_preflight.rs`, which shares nothing with this file but the
 //! `UniqueFilter` it seeds.
 
+use gnitz_expr::ColumnTable;
 use std::collections::hash_map::Entry;
 use std::ops::Range;
 
@@ -121,7 +122,7 @@ fn probe_schema(schema: &SchemaDescriptor) -> SchemaDescriptor {
 /// zero. Sorts `keys` first: an image orders as its OPK bytes do.
 fn build_check_batch(schema: &SchemaDescriptor, keys: &mut [u128], ref_tc: gnitz_wire::TypeCode) -> Batch {
     keys.sort_unstable();
-    let key_tc = schema.columns[schema.pk_indices()[0] as usize].type_code;
+    let key_tc = schema.columns[schema.pk_cols()[0] as usize].type_code;
     let (ref_w, key_w) = (ref_tc.wire_stride(), key_tc.wire_stride());
     let mut key = [0u8; gnitz_wire::MAX_PK_BYTES];
     let mut batch = Batch::with_capacity(schema, keys.len());
@@ -185,7 +186,7 @@ fn pk_violation_err(
 ) -> WireFault {
     let key_str = schema.format_pk_bytes(pk_bytes);
     let (sn, tn) = cat.qualified_name_or_unknown(tid);
-    let cols = cat.column_names(tid, schema.pk_indices());
+    let cols = cat.column_names(tid, schema.pk_cols());
     let what = match clash {
         Clash::InBatch => format!("Batch contains multiple rows with key ({cols})=({key_str})"),
         Clash::Committed => format!("Key ({cols})=({key_str}) already exists"),
@@ -778,7 +779,7 @@ fn plan_fk_existence(
         // independently of the PK.
         let parent_schema = disp.cat().registry.relation_or_err(parent_tid)?.schema();
         let ref_tc = loc.type_code();
-        let (key_schema, keyspace) = if parent_schema.is_lone_pk_col(parent_col) {
+        let (key_schema, keyspace) = if parent_schema.lone_pk_col() == Some(parent_col) {
             (probe_schema(&parent_schema), Keyspace::OwnPk)
         } else {
             let idx_schema = disp

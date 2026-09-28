@@ -27,6 +27,7 @@
 //! and the margin narrows as the walk grows until a full scan of a large view at
 //! high W is a loss. Narrowing the bound is the lever.
 
+use gnitz_expr::SchemaFacts;
 use gnitz_wire::{WireFault, WireStatus};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;

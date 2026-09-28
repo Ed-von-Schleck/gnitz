@@ -68,7 +68,7 @@ pub(crate) use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
 /// Resolved column addressing, homed in the leaf `gnitz-expr` crate so the
 /// expression evaluator (and, through it, the SQL client) shares one definition
 /// with the engine. Re-exported here because it *is* a schema fact —
-/// `SchemaDescriptor::locate` produces one.
+/// `SchemaFacts::locate` produces one.
 pub(crate) use gnitz_expr::ColumnLocator;
 
 /// Re-exported so a crate linking `gnitz-store` alone can name them.
@@ -281,7 +281,7 @@ pub enum Placement {
     /// workers is the relation; a read must gather every worker.
     Local,
     /// Hash-distributed: a row's owner is
-    /// `worker_for_pk_bytes(OPK(pk_indices()[..prefix_len]))`.
+    /// `worker_for_pk_bytes(OPK(pk_cols()[..prefix_len]))`.
     /// `prefix_len == pk_count` is the default (full-PK) distribution.
     Keyed { prefix_len: u8 },
 }
@@ -548,50 +548,13 @@ impl SchemaDescriptor {
         self.num_columns as usize
     }
 
-    /// All PK column indices, in compound-key order. Length is the PK arity:
-    /// 1 for a single-column PK, or the full sequence for a compound table PK
-    /// (and the co-partition analyzers compare against this whole sequence).
-    #[inline]
-    pub fn pk_indices(&self) -> &[u32] {
-        &self.pk_indices[..self.pk_count as usize]
-    }
-
     /// True when `self` is `prev` with zero or more columns appended — every
     /// column `prev` had keeping its position, `type_code` and PK membership.
     /// What leaves a baked span-encode plan's offsets and payload slots valid.
     pub(crate) fn is_trailing_append_of(&self, prev: &SchemaDescriptor) -> bool {
-        self.pk_indices() == prev.pk_indices()
+        self.pk_cols() == prev.pk_cols()
             && self.num_columns() >= prev.num_columns()
             && (0..prev.num_columns()).all(|i| self.columns[i].type_code == prev.columns[i].type_code)
-    }
-
-    /// Same column count, PK indices, and per-column `type_code`.
-    ///
-    /// Deliberately ignores per-column `nullable` (and `size`/`is_signed`, which
-    /// are derived from `type_code`) — this is **weaker** than the `PartialEq`
-    /// impl below, which compares the full column bytes including `nullable`.
-    /// Used for identity-MAP elision and sink type-safety, both of which must
-    /// treat a nullability-only difference as "same layout". Do not "simplify"
-    /// to `self == other`: that would compare `nullable` and change elision
-    /// semantics.
-    pub fn same_physical_layout(&self, other: &SchemaDescriptor) -> bool {
-        if self.num_columns() != other.num_columns() || self.pk_indices() != other.pk_indices() {
-            return false;
-        }
-        for i in 0..self.num_columns() {
-            if self.columns[i].type_code != other.columns[i].type_code {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// [`Self::same_physical_layout`]'s layout as one word.
-    pub fn layout_digest(&self) -> u64 {
-        gnitz_wire::layout_digest(
-            self.pk_indices(),
-            self.columns[..self.num_columns()].iter().map(|c| c.type_code),
-        )
     }
 
     /// Iterate over PK columns in pk-list order, yielding `(col_idx,
@@ -599,7 +562,7 @@ impl SchemaDescriptor {
     /// the iteration index, so callers that need it use `.enumerate()`.
     #[inline]
     pub(crate) fn pk_columns(&self) -> impl Iterator<Item = (usize, &SchemaColumn)> {
-        self.pk_indices()
+        self.pk_cols()
             .iter()
             .map(move |&ci| (ci as usize, &self.columns[ci as usize]))
     }
@@ -646,25 +609,24 @@ impl SchemaDescriptor {
     /// caller because it is the inverse of the OPK encoding this module owns, and
     /// it works for a PK wider than a `u128`.
     pub fn format_pk_bytes(&self, pk_bytes: &[u8]) -> String {
-        let mut parts: Vec<String> = Vec::new();
+        let native = self.native_le_key(pk_bytes);
         let mut off = 0usize;
-        for (_, col) in self.pk_columns() {
-            let size = col.size() as usize;
-            let mut le = [0u8; 16];
-            gnitz_wire::decode_pk_column(&pk_bytes[off..off + size], col.type_code, &mut le[..size]);
-            let le = &le[..size];
-            // Through the storage type: a calendar column renders as the signed
-            // integer it is, not as the unsigned fallthrough.
-            parts.push(match col.type_code.storage_type() {
-                TypeCode::UUID => gnitz_wire::format_uuid(u128::from_le_bytes(le.try_into().unwrap())),
-                TypeCode::U128 => format!("{}", u128::from_le_bytes(le.try_into().unwrap())),
-                TypeCode::I128 => format!("{}", i128::from_le_bytes(le.try_into().unwrap())),
-                t if t.is_signed_int() => format!("{}", gnitz_wire::read_signed_exact(le)),
-                _ => format!("{}", gnitz_wire::read_unsigned_exact(le)),
-            });
-            off += size;
-        }
-        parts.join(", ")
+        self.pk_columns()
+            .map(|(_, col)| {
+                let le = &native[off..off + col.size() as usize];
+                off += le.len();
+                // Through the storage type: a calendar column renders as the signed
+                // integer it is, not as the unsigned fallthrough.
+                match col.type_code.storage_type() {
+                    TypeCode::UUID => gnitz_wire::format_uuid(u128::from_le_bytes(le.try_into().unwrap())),
+                    TypeCode::U128 => format!("{}", u128::from_le_bytes(le.try_into().unwrap())),
+                    TypeCode::I128 => format!("{}", i128::from_le_bytes(le.try_into().unwrap())),
+                    t if t.is_signed_int() => format!("{}", gnitz_wire::read_signed_exact(le)),
+                    _ => format!("{}", gnitz_wire::read_unsigned_exact(le)),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// Number of non-PK ("payload") columns. `#[inline(always)]`: `Batch` derives
@@ -717,19 +679,11 @@ impl SchemaDescriptor {
         Ok(())
     }
 
-    /// True iff column `ci` is this schema's *only* PK column — the shape an
-    /// FK target must have for the parent probe to read the referenced value
-    /// straight out of the packed PK region.
-    #[inline]
-    pub fn is_lone_pk_col(&self, ci: usize) -> bool {
-        self.pk_indices().len() == 1 && self.is_pk_col(ci)
-    }
-
     /// True when `cols` holds every PK column. The span such a list encodes is
     /// a fixed-width OPK concatenation and widening is injective, so the span
     /// determines the row's PK: a unique index on `cols` cannot collide.
     pub fn covers_pk(&self, cols: &[u32]) -> bool {
-        self.pk_indices().iter().all(|p| cols.contains(p))
+        self.pk_cols().iter().all(|p| cols.contains(p))
     }
 
     /// [`SchemaFacts::payload_col_idx`], from a table filled at construction.
@@ -738,27 +692,25 @@ impl SchemaDescriptor {
         debug_assert!(pi < self.num_payload_cols(), "payload_col_idx: pi out of range");
         self.payload_to_ci[pi] as usize
     }
-
-    /// [`SchemaFacts::locate`], callable without the trait in scope.
-    #[inline]
-    pub fn locate(&self, col_idx: usize) -> ColumnLocator {
-        SchemaFacts::locate(self, col_idx)
-    }
 }
 
 impl ColumnTable for SchemaDescriptor {
+    #[inline]
     fn pk_cols(&self) -> &[u32] {
-        self.pk_indices()
+        &self.pk_indices[..self.pk_count as usize]
     }
 
+    #[inline]
     fn num_columns(&self) -> usize {
         self.num_columns as usize
     }
 
+    #[inline]
     fn col_type_code(&self, ci: usize) -> TypeCode {
         self.columns[ci].type_code
     }
 
+    #[inline]
     fn col_nullable(&self, ci: usize) -> bool {
         self.columns[ci].nullable
     }
@@ -783,13 +735,13 @@ impl std::fmt::Debug for SchemaDescriptor {
                 write!(f, " pk")?;
             }
         }
-        write!(f, "], pk_indices: {:?} }}", self.pk_indices())
+        write!(f, "], pk_indices: {:?} }}", self.pk_cols())
     }
 }
 
 impl PartialEq for SchemaDescriptor {
     fn eq(&self, other: &Self) -> bool {
-        if self.num_columns() != other.num_columns() || self.pk_indices() != other.pk_indices() {
+        if self.num_columns() != other.num_columns() || self.pk_cols() != other.pk_cols() {
             return false;
         }
         // Compare all four bytes of each active column; `size` and `is_signed` are
@@ -865,7 +817,7 @@ pub fn encode_schema_block(schema: &SchemaDescriptor) -> Vec<u8> {
         hidden: false,
         name: b"",
     });
-    gnitz_wire::schema_block::encode(cols, schema.pk_indices())
+    gnitz_wire::schema_block::encode(cols, schema.pk_cols())
 }
 
 /// The delta store's stamp column: the `_tick` round number, leading the delta
@@ -885,7 +837,7 @@ const _: () = assert!(DELTA_TICK_COL.size() as usize == 8);
 pub(crate) fn make_delta_schema(view: &SchemaDescriptor) -> Option<SchemaDescriptor> {
     let mut b = DerivedSchema::new();
     b.push_pk(DELTA_TICK_COL).ok()?;
-    for &i in view.pk_indices() {
+    for &i in view.pk_cols() {
         b.push_pk(view.columns[i as usize]).ok()?;
     }
     for (_, col) in view.payload_columns() {

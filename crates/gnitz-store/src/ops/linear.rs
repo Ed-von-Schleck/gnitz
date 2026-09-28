@@ -4,6 +4,7 @@
 //! `crate::expr::MapPlan::evaluate_map_batch`, null-extend
 //! `Batch::widened_with_nulls`.
 
+use crate::schema::{ColumnTable, SchemaFacts};
 use gnitz_expr::RowFilter;
 
 use crate::schema::{DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor, TypeCode};
@@ -37,7 +38,7 @@ pub fn op_filter(batch: &Batch, pred: &mut RowFilter, schema: &SchemaDescriptor)
 /// `a`'s schema with each column's nullability OR-ed with `b`'s: a NULL and a
 /// zero carry the same bytes, so only a nullable column's comparator parts them.
 pub fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Result<SchemaDescriptor, OpBuildErr> {
-    if !a.same_physical_layout(b) {
+    if !a.same_layout(b) {
         return Err(OpBuildErr::shape("union: inputs do not share a physical layout"));
     }
     let cols: Vec<SchemaColumn> = (0..a.num_columns())
@@ -46,7 +47,7 @@ pub fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Re
             SchemaColumn::new(ac.type_code, ac.nullable | bc.nullable)
         })
         .collect();
-    Ok(SchemaDescriptor::new(&cols, a.pk_indices()))
+    Ok(SchemaDescriptor::new(&cols, a.pk_cols()))
 }
 
 /// Output schema of an outer-join NULL_EXTEND ([`Batch::widened_with_nulls`]):

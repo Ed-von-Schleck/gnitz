@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_expr::{ColumnTable, SchemaFacts};
 use gnitz_store::schema::{make_index_schema, IndexKeySpec};
 use gnitz_wire::{key_image, MAX_PK_BYTES};
 
@@ -1288,7 +1289,7 @@ fn test_make_index_schema_composite_layout() {
     // source PK suffix = U64 = 8 bytes. Arity 3, stride 32.
     let idx = make_index_schema(&[1, 2], &src).unwrap();
     assert_eq!(idx.num_columns(), 3); // 2 promoted + 1 src pk
-    assert_eq!(idx.pk_indices(), &[0, 1, 2]); // every column in the PK
+    assert_eq!(idx.pk_cols(), &[0, 1, 2]); // every column in the PK
     assert_eq!(idx.columns[0].type_code, TypeCode::U64);
     assert_eq!(idx.columns[1].type_code, TypeCode::U128);
     assert_eq!(idx.columns[2].type_code, TypeCode::U64); // src pk column type

@@ -4,6 +4,7 @@
 use super::{
     append_bytes_image, int16_image, order_bits, order_inverse, wide_native_of_image, write_image_slot, WideKind,
 };
+use crate::schema::SchemaFacts;
 use crate::schema::{SchemaColumn, TypeCode};
 use crate::storage::{Batch, BatchBuilder};
 use crate::test_support::{pk_payload_schema, u64_pk_schema};

@@ -7,6 +7,7 @@
 use crate::catalog::cache::CatalogRecord;
 use crate::catalog::CatalogColumn;
 use crate::test_support::arb_type_code;
+use gnitz_expr::{ColumnTable, SchemaFacts};
 use gnitz_store::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::Batch;
 use gnitz_wire::{ColumnDef, TypeCode, MAX_PK_COLUMNS};
@@ -90,8 +91,8 @@ fn client_schema((types, nullables, pk): &Cols) -> gnitz_core::protocol::types::
 
 fn assert_descriptor_eq(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Result<(), TestCaseError> {
     prop_assert_eq!(
-        a.pk_indices(),
-        b.pk_indices(),
+        a.pk_cols(),
+        b.pk_cols(),
         "pk_indices (declared order) changed on round-trip"
     );
     prop_assert_eq!(a.num_columns(), b.num_columns(), "column count changed on round-trip");
@@ -138,24 +139,23 @@ proptest! {
 }
 
 proptest! {
-    /// The client's digest of a table equals the engine's, and two layouts share
-    /// a digest iff `same_physical_layout` holds — probed against an unrelated
-    /// schema and against `a` with every payload column's nullability flipped.
+    /// Two layouts share a digest iff `same_layout` holds — probed against an
+    /// unrelated schema and against `a` with every payload column's nullability
+    /// flipped.
     #[test]
-    fn layout_digest_agrees_with_same_physical_layout(
+    fn layout_digest_agrees_with_same_layout(
         a in arb_schema(gnitz_wire::PK_LIST_MAX_COLS),
         b in arb_schema(gnitz_wire::PK_LIST_MAX_COLS),
     ) {
-        prop_assert_eq!(client_schema(&a).layout_digest(), descriptor(&a).layout_digest());
         let (a, b) = (descriptor(&a), descriptor(&b));
         let flipped: Vec<SchemaColumn> = a.columns[..a.num_columns()]
             .iter()
             .enumerate()
-            .map(|(i, c)| SchemaColumn::new(c.type_code, !a.pk_indices().contains(&(i as u32)) && !c.nullable))
+            .map(|(i, c)| SchemaColumn::new(c.type_code, !a.pk_cols().contains(&(i as u32)) && !c.nullable))
             .collect();
-        let twin = SchemaDescriptor::new(&flipped, a.pk_indices());
+        let twin = SchemaDescriptor::new(&flipped, a.pk_cols());
         for other in [&b, &twin] {
-            prop_assert_eq!(a.same_physical_layout(other), a.layout_digest() == other.layout_digest());
+            prop_assert_eq!(a.same_layout(other), a.layout_digest() == other.layout_digest());
         }
     }
 }

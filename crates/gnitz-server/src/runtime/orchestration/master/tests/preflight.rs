@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_expr::ColumnTable;
 use gnitz_store::schema::SchemaColumn;
 use gnitz_wire::TypeCode;
 
@@ -38,7 +39,7 @@ fn probe_schema_keeps_the_key_and_drops_every_payload_column() {
 
     assert_eq!(pk_only.num_payload_cols(), 0);
     assert_eq!(pk_only.pk_stride(), schema.pk_stride());
-    assert_eq!(pk_only.pk_indices(), &[0]);
+    assert_eq!(pk_only.pk_cols(), &[0]);
 
     let batch = build_check_batch(&pk_only, &mut [42u128], TypeCode::U64);
     assert_eq!(batch.len(), 1);

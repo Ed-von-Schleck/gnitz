@@ -387,7 +387,7 @@ fn a_rename_stores_the_new_name_for_a_table_and_for_a_view() {
     // anything but the name would have been refused, and the `+1` carries the
     // same payload.
     let t2 = client.resolve("ren", "t2").unwrap().unwrap();
-    assert_eq!(t2.schema.num_columns(), id_v().num_columns());
+    assert_eq!(t2.schema.columns.len(), id_v().columns.len());
 }
 
 /// A mixed-sign bundle keeps the ascending creation order: `ALTER VIEW … AS`

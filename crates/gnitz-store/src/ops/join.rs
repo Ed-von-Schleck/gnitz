@@ -8,6 +8,7 @@
 //! `[key, left payload…, right payload…]` over the SQL sides, keyed by the delta
 //! PK, or by `[left PK…, right PK…]` under `Cross`.
 
+use crate::schema::ColumnTable;
 use std::cmp::Ordering;
 use std::ops::Range;
 
@@ -176,7 +177,7 @@ impl RangeProbe {
     /// Resolve a wire `left REL right` against the trace schema's key region.
     fn new(trace: &SchemaDescriptor, n_eq: u8, rel: RangeRel, delta_is_right: bool) -> Result<RangeProbe, OpBuildErr> {
         // The reindexed key is `[eq slots…, range slot]`.
-        if n_eq as usize + 1 != trace.pk_indices().len() {
+        if n_eq as usize + 1 != trace.pk_cols().len() {
             return Err(OpBuildErr::shape("range join: n_eq does not match trace key arity"));
         }
         // In PK order, so the range slot always keeps a span of its own.

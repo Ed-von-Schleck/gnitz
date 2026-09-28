@@ -182,7 +182,7 @@ pub(crate) fn execute_insert(
     let n = rows.len();
     let mut batch = ZSetBatch::with_capacity(schema, n);
 
-    let serial_ci = schema.pk_index_single().filter(|_| target.serial).map(|c| c as usize);
+    let serial_ci = schema.lone_pk_col().filter(|_| target.serial);
     let RowShape { slot_of, expected } = insert_row_shape(&insert.columns, schema, serial_ci)?;
     let payload: Vec<_> = schema.payload_columns().collect();
     // What a column the list left out reads as.

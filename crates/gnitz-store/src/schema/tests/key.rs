@@ -147,7 +147,7 @@ fn compare_pk_bytes_compound_mixed() {
 #[test]
 fn compare_pk_bytes_pk_indices_order_not_schema_order() {
     // Schema [U64, U64] with pk_indices = [1, 0]: column 1 is the first
-    // PK column. The byte layout follows pk_indices() order, so the
+    // PK column. The byte layout follows pk_cols() order, so the
     // first 8 bytes correspond to column 1.
     let s = SchemaDescriptor::new(
         &[
@@ -866,7 +866,7 @@ fn packer_output_schema_compound() {
         .unwrap()
         .output_schema(&in_schema, &[0, 1, 2])
         .unwrap();
-    assert_eq!(out.pk_indices(), &[0, 1], "2-slot compound PK");
+    assert_eq!(out.pk_cols(), &[0, 1], "2-slot compound PK");
     assert_eq!(out.columns[0].type_code, TypeCode::I32, "slot0 keeps I32 native width");
     assert_eq!(out.columns[1].type_code, TypeCode::U128, "slot1 U128");
     assert_eq!(out.pk_stride(), 4 + 16, "compound stride = Σ slot widths");
@@ -914,7 +914,7 @@ fn packer_output_schema_payload_prune() {
         .unwrap()
         .output_schema(&in_schema, &[0, 3])
         .unwrap();
-    assert_eq!(out.pk_indices(), &[0], "single synthetic PK slot");
+    assert_eq!(out.pk_cols(), &[0], "single synthetic PK slot");
     assert_eq!(out.columns[0].type_code, TypeCode::I32, "PK slot = reindex col1 (I32)");
     // Only the two kept payload columns follow — not all four input columns.
     assert_eq!(out.num_columns(), 1 + 2, "1 PK + 2 kept payload");
@@ -1534,7 +1534,7 @@ fn probe_key_distinguishes_spans_sharing_a_prefix() {
 
 /// A range over `schema`'s whole PK list.
 fn pk_range(schema: &SchemaDescriptor, eq: &[u128], start: Cut, end: Cut) -> KeyRange {
-    KeyRange::new(PkColList::from_slice(schema.pk_indices()), eq, start, end)
+    KeyRange::new(PkColList::from_slice(schema.pk_cols()), eq, start, end)
 }
 
 fn opk_u64(v: u64) -> Vec<u8> {

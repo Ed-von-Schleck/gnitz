@@ -1,6 +1,7 @@
 //! `TopNPlan` — everything `op_topn` needs that is a pure function of
 //! compile-time facts, baked once at emit time.
 
+use crate::schema::ColumnTable;
 use crate::schema::{OpBuildErr, SchemaDescriptor};
 use crate::storage::Batch;
 use gnitz_wire::OrderKey;
@@ -66,7 +67,7 @@ impl TopNPlan {
         offset: u64,
     ) -> Result<Self, OpBuildErr> {
         // A partial's key, then the input's columns in order.
-        let key = partials.pk_indices();
+        let key = partials.pk_cols();
         let shifted: Vec<OrderKey> = order
             .iter()
             .map(|k| OrderKey {

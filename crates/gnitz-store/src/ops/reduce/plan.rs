@@ -1,6 +1,7 @@
 //! `ReducePlan`, everything `op_reduce` needs baked at emit time, and the
 //! `ReduceShape` part of it the ad-hoc fold shares.
 
+use crate::schema::SchemaFacts;
 use crate::schema::{DerivedSchema, OpBuildErr, SchemaBound, SchemaColumn, SchemaDescriptor};
 
 use super::super::group_key::GroupOutKey;

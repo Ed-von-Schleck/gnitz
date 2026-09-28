@@ -26,7 +26,7 @@ pub(super) fn lower_topn(chain: &mut ViewChain, rel: &RelExpr) -> Result<EmitPie
             .pk_cols
             .iter()
             .copied()
-            .eq(0..frame.schema.pk_count() as u32),
+            .eq(0..frame.schema.pk_cols.len() as u32),
         "a top-N input leads with its key, which the index carries as its tie-break"
     );
 

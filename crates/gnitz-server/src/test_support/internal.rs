@@ -5,6 +5,7 @@
 //! crate-internals as `crate::` and widens no API — nothing links this crate.
 
 use crate::catalog::{CatalogColumn, CatalogEngine, SysFamily, PUBLIC_SCHEMA_ID};
+use gnitz_expr::SchemaFacts;
 use gnitz_store::storage::{Batch, BatchBuilder, ReadCursor};
 use gnitz_wire::sys_rows::{
     write_circuit_rows, write_idx_tab_row, write_table_tab_row, IdxTabRow, SysRowSink, TableTabRow,

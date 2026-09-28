@@ -281,7 +281,7 @@ impl CatalogEngine {
                     entry.kind().noun()
                 ));
             }
-            if !entry.schema().is_lone_pk_col(col.fk_col_idx as usize) {
+            if entry.schema().lone_pk_col() != Some(col.fk_col_idx as usize) {
                 // A composite index does not satisfy a single-column FK: a
                 // unique (a, b) does not guarantee uniqueness of `a` alone, so
                 // match only a single-column unique index on the referenced col.
@@ -911,7 +911,7 @@ impl CatalogEngine {
             let is_lone_pk = self
                 .registry
                 .relation(owner_id)
-                .is_some_and(|e| e.schema().is_lone_pk_col(src_col));
+                .is_some_and(|e| e.schema().lone_pk_col() == Some(src_col));
             if is_lone_pk {
                 continue;
             }

@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_expr::ColumnTable;
 use gnitz_wire::TypeCode;
 
 #[test]
@@ -20,7 +21,7 @@ fn schema_roundtrip_catalog_preserves_pk_order() {
         let tid = engine.get_by_name("public", "cpk_order").unwrap();
         let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
         assert_eq!(
-            schema.pk_indices(),
+            schema.pk_cols(),
             &[2, 1],
             "PK order (b, a) was not preserved across catalog restart",
         );

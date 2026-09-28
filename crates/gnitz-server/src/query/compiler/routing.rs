@@ -4,6 +4,7 @@
 //! be read without compiling.
 
 use super::*;
+use gnitz_expr::ColumnTable;
 use gnitz_store::schema::Placement;
 use gnitz_wire::ReadBound;
 
@@ -223,7 +224,7 @@ fn placement(sources: &FxHashMap<u64, SchemaDescriptor>, rows: RowHome, pk_arity
     };
     match rows {
         RowHome::OwnKey => Placement::KEYED_DEFAULT,
-        RowHome::SourcePk(tid) if tid == src && schema.pk_indices().len() == pk_arity => schema.placement(),
+        RowHome::SourcePk(tid) if tid == src && schema.pk_cols().len() == pk_arity => schema.placement(),
         RowHome::SourcePk(_) | RowHome::Producer => Placement::Local,
     }
 }
@@ -260,7 +261,7 @@ fn skips_output_exchange(
         false => Some(shard_cols.to_vec()),
         true => shard_cols
             .iter()
-            .map(|&c| schema.pk_indices().get(c as usize).copied())
+            .map(|&c| schema.pk_cols().get(c as usize).copied())
             .collect(),
     };
     source_cols.is_some_and(|cols| ScatterSpec::GroupKey(&cols).routes_to_native_owner(&schema))

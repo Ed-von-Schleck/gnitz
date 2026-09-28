@@ -17,7 +17,7 @@ fn test_project_schema_compound_pk() {
     let out = project_schema(&input, &[0, 3]).unwrap();
     // Two PK columns + two non-PK projected columns = 4 total.
     assert_eq!(out.num_columns(), 4);
-    assert_eq!(out.pk_indices(), &[0, 1]);
+    assert_eq!(out.pk_cols(), &[0, 1]);
 
     // Single-PK input collapses back to pk_indices = [0].
     let input_single = SchemaDescriptor::new(
@@ -28,7 +28,7 @@ fn test_project_schema_compound_pk() {
         &[0],
     );
     let out_single = project_schema(&input_single, &[1]).unwrap();
-    assert_eq!(out_single.pk_indices(), &[0]);
+    assert_eq!(out_single.pk_cols(), &[0]);
 
     // The bound is PK-inclusive: a payload count that alone fits still
     // overflows once the PK columns are prepended.
@@ -52,7 +52,7 @@ fn test_identity_map_detection() {
         ],
         &[0],
     );
-    assert!(a.same_physical_layout(&b));
+    assert!(a.same_layout(&b));
 
     let c = SchemaDescriptor::new(
         &[
@@ -61,7 +61,7 @@ fn test_identity_map_detection() {
         ],
         &[0],
     );
-    assert!(!a.same_physical_layout(&c));
+    assert!(!a.same_layout(&c));
 }
 
 // ── Reduce output key ────────────────────────────────────────────────────
@@ -236,7 +236,7 @@ fn test_new_constructs_schema() {
     ];
     let s = SchemaDescriptor::new(&cols, &[0]);
     assert_eq!(s.num_columns(), 3);
-    assert_eq!(s.pk_indices(), &[0]);
+    assert_eq!(s.pk_cols(), &[0]);
     assert_eq!(s.columns[0].type_code, TypeCode::U64);
     assert_eq!(s.columns[1].type_code, TypeCode::I64);
     assert_eq!(s.columns[2].type_code, TypeCode::String);
@@ -250,7 +250,7 @@ fn test_new_constructs_schema() {
 
     // Non-zero pk_index round-trips (use I64 col at index 1, not STRING).
     let s2 = SchemaDescriptor::new(&cols, &[1]);
-    assert_eq!(s2.pk_indices(), &[1]);
+    assert_eq!(s2.pk_cols(), &[1]);
 
     // Empty placeholder (Default-style).
     let empty = SchemaDescriptor::new(&[], &[]);
@@ -350,7 +350,7 @@ fn test_max_pk_columns_boundary() {
     let cols = [SchemaColumn::new(TypeCode::U64, false); MAX_PK_COLUMNS];
     let pks: Vec<u32> = (0..MAX_PK_COLUMNS as u32).collect();
     let s = SchemaDescriptor::new(&cols, &pks);
-    assert_eq!(s.pk_indices().len(), MAX_PK_COLUMNS);
+    assert_eq!(s.pk_cols().len(), MAX_PK_COLUMNS);
     let collected: Vec<(usize, usize)> = s.pk_columns().enumerate().map(|(ord, (ci, _))| (ord, ci)).collect();
     let expected: Vec<(usize, usize)> = (0..MAX_PK_COLUMNS).map(|k| (k, k)).collect();
     assert_eq!(collected, expected);

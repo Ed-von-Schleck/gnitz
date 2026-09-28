@@ -175,8 +175,7 @@ fn heap_strings_cross_the_mesh_intact() {
             let mb = got.as_mem_batch();
             for i in 0..got.len() {
                 let pk = got.get_pk(i) as u64;
-                let cell = &got.col_data(0)[i * 16..i * 16 + 16];
-                let bytes = gnitz_wire::german_string_content(cell, gnitz_expr::RowSource::blob(&mb));
+                let bytes = gnitz_expr::payload_bytes(&mb, i, 0);
                 assert_eq!(bytes, text(pk).as_bytes(), "round {round}: pk {pk}");
                 seen.push(pk);
             }

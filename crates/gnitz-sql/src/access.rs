@@ -206,7 +206,7 @@ const MAX_CROSS_PRODUCT_KEYS: usize = 65_536;
 /// The PK keys the WHERE names: each PK column's point, else its first IN list,
 /// crossed into OPK keys.
 fn pk_key_set(terms: &[Term], schema: &Schema) -> Option<(PkKeys, Vec<usize>)> {
-    let pk_count = schema.pk_count();
+    let pk_count = schema.pk_cols.len();
     let mut points = [0u128; PK_LIST_MAX_COLS];
     let mut lists: [Option<&[u128]>; PK_LIST_MAX_COLS] = [None; PK_LIST_MAX_COLS];
     let mut consumed = Vec::new();
@@ -315,7 +315,7 @@ pub(crate) fn candidates(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[Re
     }
     // A range pinning every PK column is the key set's one key.
     let pk_range = bound_column_list(PkColList::from_slice(&schema.pk_cols), &terms, schema)
-        .filter(|b| b.pinned < schema.pk_count());
+        .filter(|b| b.pinned < schema.pk_cols.len());
     if let Some(b) = pk_range {
         let tier = if b.pinned > 0 {
             Tier::PinnedPkRange

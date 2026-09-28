@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_expr::ColumnTable;
 
 /// A master catalog with only its system families registered, their stores open.
 /// [`Self::replay`] registers the rest.
@@ -61,7 +62,7 @@ impl CatalogEngine {
             engine.enter_relation(
                 family.id(),
                 RelationKind::SystemCatalog,
-                family.schema().pk_indices(),
+                family.schema().pk_cols(),
                 &family.column_defs(),
                 RelFacts::default(),
             );

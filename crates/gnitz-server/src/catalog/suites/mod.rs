@@ -3,6 +3,7 @@ mod atomicity_tests;
 mod compound_pk_smoke;
 mod ddl_fixture;
 use ddl_fixture::{make_secondary_index_name, parse_qualified_name};
+use gnitz_expr::SchemaFacts;
 mod ddl_tests;
 mod dir_deletion_tests;
 mod engine_tests;

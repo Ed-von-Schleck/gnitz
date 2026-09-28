@@ -152,7 +152,7 @@ pub(crate) fn physicalize_projection(
         .into_iter()
         .map(|(item, id, def)| (item, (id, def)))
         .unzip();
-    Ok((proj, Frame::new(cols, input.schema.pk_count())?))
+    Ok((proj, Frame::new(cols, input.schema.pk_cols.len())?))
 }
 
 /// Pin the source PK to slots `0..k` in PK-list order, as the engine's

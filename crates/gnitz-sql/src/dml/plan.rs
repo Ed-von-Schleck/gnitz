@@ -87,7 +87,7 @@ pub(crate) fn rows_reply(
         crate::hir::bind_adhoc_rows(projection, desc, alias, &order_exprs(&keys))?;
     let schema = &desc.schema;
     let mut order = wire_keys(&keys, &out_cols, placed)?;
-    let k = schema.pk_count();
+    let k = schema.pk_cols.len();
     if reproduces(schema, &items[k..], &out_cols[k..]) {
         for key in &mut order {
             key.col = items[key.col as usize]

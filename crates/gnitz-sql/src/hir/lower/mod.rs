@@ -175,7 +175,7 @@ fn emit_projection(
     out: &Schema,
     input: &Schema,
 ) -> Result<gnitz_core::NodeId, GnitzSqlError> {
-    let k = input.pk_count();
+    let k = input.pk_cols.len();
     // A payload slot naming a key column is a second copy of a value the key
     // region already carries; only the expression map can write one.
     let payload: Option<Vec<u32>> = items[k..]

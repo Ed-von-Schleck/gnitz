@@ -399,13 +399,8 @@ impl<'a> MemBatch<'a> {
     }
 }
 
-/// `MemBatch` is the sole physical batch the expression evaluator and the
-/// resolved-addressing types read through — [`RowSource`] per row, [`BatchView`]
-/// by region. Both traits live down in the leaf `gnitz-expr` crate, so those
-/// types never name this L2 type (and the SQL client can lend its own buffers
-/// through the same shapes). Each method forwards via UFCS to the inherent
-/// accessor of the same name, so the call binds to the concrete read rather than
-/// recursing into the trait.
+/// Each method forwards via UFCS to the inherent accessor of the same name, so
+/// the call binds to the concrete read rather than recursing into the trait.
 ///
 /// Every forwarder — **and every inherent accessor it UFCS-calls** — is
 /// `#[inline(always)]`; see [`BatchView`] for why the plain hint is not enough.

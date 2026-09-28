@@ -3,6 +3,7 @@
 //! wrappers that add what a caller cannot — the hydrator.
 
 use super::*;
+use gnitz_expr::SchemaFacts;
 use gnitz_store::read::SourceCursor;
 use gnitz_store::relation::Residency;
 use gnitz_wire::{ReadBound, ReadSpec};

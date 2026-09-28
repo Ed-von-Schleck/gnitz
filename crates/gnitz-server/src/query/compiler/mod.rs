@@ -5,6 +5,7 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
+use gnitz_expr::SchemaFacts;
 use rustc_hash::FxHashMap;
 
 use crate::query::vm::{DeltaReg, Vm};
@@ -320,7 +321,7 @@ pub(super) fn compile_view(
     )?;
     // Column count alone is not enough: equal counts with mismatched types would
     // let the client read a string descriptor out of integer storage.
-    if !post.vm.program.out_schema().same_physical_layout(view_schema) {
+    if !post.vm.program.out_schema().same_layout(view_schema) {
         return Err("sink schema does not match view output schema".into());
     }
     let sides = side_plans

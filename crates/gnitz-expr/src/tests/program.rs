@@ -3,13 +3,11 @@
 #![allow(clippy::approx_constant)]
 
 use gnitz_wire::{FixedInt, TypeCode};
-use std::collections::BTreeSet;
 
 // `tests/program.rs` is `#[path]`-attached to `program.rs`, so `super` is that
 // module — one import line rather than three spellings of it.
 use super::{
-    ColKind, ExprOp, FloatUnaryOp, IntOrder, IntUnaryOp, ProgramFacts, ReadAs, TrimMode, INSTR_BYTES, INSTR_WORDS,
-    MAX_CONST_POOL, SINK_WORDS,
+    ColKind, ExprOp, FloatUnaryOp, IntOrder, IntUnaryOp, ProgramFacts, ReadAs, INSTR_WORDS, MAX_CONST_POOL, SINK_WORDS,
 };
 use crate::batch::{decode_f64, encode_f64};
 use crate::eval::Resolved;
@@ -17,7 +15,6 @@ use crate::test_support::{
     filter_prog, is_not_null_op, is_null_op, make_int_view, make_string_view, map_prog, row_values, scalar_prog,
     schema_pk_ints, schema_pk_strings, TestOut, TestSchema, TestView,
 };
-use crate::CalendarOp;
 use crate::{
     CmpOp, ColumnLocator, ConstIdx, ExprValidateErr, FloatArithOp, Instr, IntArithOp, LogicalInstr, LogicalProgram,
     MapEval, NullPerm, Reg, ScalarEval, Sink,
@@ -348,7 +345,7 @@ fn a_column_index_resolves_to_the_pk_or_to_its_dense_payload_slot() {
         for (ci, &(want_slot, want_val)) in want.iter().enumerate() {
             let instrs = vec![LogicalInstr::LoadColInt { col: ci as u32 }];
             let mut prog = scalar_prog(&schema, instrs, Reg(0), vec![]);
-            let got_slot = match prog.prog().instrs[0] {
+            let got_slot = match prog.prog().instrs[0].1 {
                 Instr::LoadPk { .. } => None,
                 Instr::LoadPayloadInt { pi, .. } => Some(pi),
                 ref other => panic!("pk_index={pk_index} col {ci} resolved to {other:?}"),
@@ -500,7 +497,7 @@ fn select_propagates_u64_tracking_to_its_reader() {
     let prog = scalar_prog(&schema, instrs, Reg(5), vec![]);
     // Found by shape, not by position: which index resolution lands the compare
     // at is an internal detail, and three sibling tests already read it this way.
-    let cmp = prog.prog().instrs.iter().find_map(|i| match i {
+    let cmp = prog.prog().instrs.iter().find_map(|(_, i)| match i {
         Instr::Cmp { op, order, .. } => Some((*op, *order)),
         _ => None,
     });
@@ -670,9 +667,7 @@ fn a_program_round_trips_through_its_blob() {
     assert!(back.sinks.is_empty());
 }
 
-/// The layout and its version word in one assertion, so neither can be repasted
-/// without the other. Literals on both halves: bytes compared against the
-/// encoder that produced them would assert nothing.
+/// The blob layout and the opcode vocabulary, pinned to the version word.
 #[test]
 fn the_blob_layout_is_pinned_to_its_version_word() {
     // One instruction, both sink kinds, one pool entry — every region non-empty.
@@ -698,10 +693,25 @@ fn the_blob_layout_is_pinned_to_its_version_word() {
         2, 0, 0, 0,             // entry 0 length
         b'a', b'b',             // entry 0 bytes
     ];
+    // Every decodable word and what it decodes to.
+    let vocabulary: Vec<u8> = decodable_words()
+        .iter()
+        .flat_map(|(w, x)| {
+            gnitz_wire::as_le_bytes(w)
+                .iter()
+                .copied()
+                .chain(format!("{x:?}").into_bytes())
+        })
+        .collect();
     assert_eq!(
-        (prog.to_blob_bytes(), gnitz_wire::EXPR_BLOB_VERSION),
-        (want, 6),
-        "the expr-blob layout changed: bump EXPR_BLOB_VERSION before pasting the bytes reported here"
+        (
+            prog.to_blob_bytes(),
+            gnitz_wire::checksum(&vocabulary),
+            gnitz_wire::EXPR_BLOB_VERSION
+        ),
+        (want, 1858342113949671658, 6),
+        "the expr-blob layout or opcode vocabulary changed: bump EXPR_BLOB_VERSION if a number moved, \
+         then paste what is reported here"
     );
 }
 
@@ -1561,7 +1571,7 @@ fn min_max2_compare_domain_and_u64_propagation() {
         prog.prog()
             .instrs
             .iter()
-            .filter_map(|i| match i {
+            .filter_map(|(_, i)| match i {
                 Instr::IntMinMax2 { signed, .. } => Some(*signed),
                 _ => None,
             })
@@ -1592,7 +1602,7 @@ fn int_cast_reseeds_u64_tracking_from_its_target() {
         prog.prog()
             .instrs
             .iter()
-            .find_map(|i| match i {
+            .find_map(|(_, i)| match i {
                 Instr::Cmp { order, .. } => Some(*order == IntOrder::Signed),
                 _ => None,
             })
@@ -1621,7 +1631,7 @@ fn int_cast_records_the_source_signedness() {
             .prog()
             .instrs
             .iter()
-            .find_map(|i| match i {
+            .find_map(|(_, i)| match i {
                 Instr::IntCast { src_signed, .. } => Some(*src_signed),
                 _ => None,
             })
@@ -1734,7 +1744,7 @@ fn a_string_op_cannot_read_the_register_it_writes() {
 /// sink-only program has no register to collide over.
 #[test]
 fn a_sink_only_program_names_no_registers() {
-    assert_eq!(LogicalProgram::copy_cols(&[0, 1, 2]).sequential_copy_base(), Some(0));
+    assert!(LogicalProgram::copy_cols(&[0, 1, 2]).instrs().is_empty());
 }
 
 /// A register sink's destination must hold what the source register's class
@@ -1934,15 +1944,8 @@ fn string_nullability_classification() {
 // Encoder / decoder drift — the two tables over one opcode space
 // ---------------------------------------------------------------------------
 
-/// The number of [`LogicalInstr`] variants, which is what makes [`every_variant`]
-/// checkable for completeness: the fixture covers every variant iff the number of
-/// *distinct* variants it holds equals this.
-///
-/// Adding a variant is two forced steps and one number: the match below stops
-/// compiling, the author adds the name and bumps the count — and then the
-/// completeness assert fails until `every_variant` gains an entry. The match
-/// carries no per-variant data, so there is no index bookkeeping to keep dense;
-/// `mem::discriminant` does the counting.
+/// The number of [`LogicalInstr`] variants. A new variant stops the match below
+/// compiling until it is listed and counted.
 impl LogicalInstr {
     pub(crate) const VARIANT_COUNT: usize = 46;
 
@@ -2002,272 +2005,53 @@ impl LogicalInstr {
     }
 }
 
-/// One instance of every [`LogicalInstr`] variant, with a distinct value in
-/// every field so a swapped pair cannot round-trip by coincidence.
-///
-/// The registers are deliberately small and the programs below are never
-/// resolved: what is under test is the word layout alone, so the list need
-/// not be a type-coherent or even a validatable program.
-fn every_variant() -> Vec<LogicalInstr> {
-    use LogicalInstr as L;
-    let mut v = vec![
-        L::LoadColInt { col: 2 },
-        L::LoadColFloat { col: 4 },
-        L::LoadConst { val: -1_234_567_890_123, unsigned: false },
-        L::LoadConst { val: i64::MIN, unsigned: true },
-        L::IntArith {
-            op: IntArithOp::Add,
-            a: Reg(7),
-            b: Reg(8),
-        },
-        L::IntArith {
-            op: IntArithOp::Sub,
-            a: Reg(10),
-            b: Reg(11),
-        },
-        L::IntArith {
-            op: IntArithOp::Mul,
-            a: Reg(13),
-            b: Reg(14),
-        },
-        L::IntArith {
-            op: IntArithOp::Div,
-            a: Reg(16),
-            b: Reg(17),
-        },
-        L::IntArith {
-            op: IntArithOp::Mod,
-            a: Reg(19),
-            b: Reg(20),
-        },
-        L::FloatArith {
-            op: FloatArithOp::Add,
-            a: Reg(22),
-            b: Reg(23),
-        },
-        L::FloatArith {
-            op: FloatArithOp::Sub,
-            a: Reg(25),
-            b: Reg(26),
-        },
-        L::FloatArith {
-            op: FloatArithOp::Mul,
-            a: Reg(28),
-            b: Reg(29),
-        },
-        L::FloatArith {
-            op: FloatArithOp::Div,
-            a: Reg(31),
-            b: Reg(32),
-        },
-        L::IntToFloat { a: Reg(34) },
-        L::FloatToF32 { a: Reg(36) },
-        L::Select { cond: Reg(42), a: Reg(43), b: Reg(44) },
-        L::LoadNull,
-        L::BoolBinary { is_or: false, a: Reg(47), b: Reg(48) },
-        L::BoolBinary { is_or: true, a: Reg(50), b: Reg(51) },
-        L::BoolNot { a: Reg(53) },
-        L::IsNull { col: 55, invert: false },
-        L::IsNull { col: 57, invert: true },
-        L::IntInSet {
-            value_reg: Reg(59),
-            set_idx: ConstIdx(60),
-        },
-        L::LoadColStr { col: 62 },
-        L::LoadConstStr { const_idx: ConstIdx(64) },
-        L::LoadNullStr,
-        L::StrSelect { cond: Reg(67), a: Reg(68), b: Reg(69) },
-        // The two packed-pair families sit in *different* operand words —
-        // SELECT/SUBSTR in a2, TRIM/LIKE in a1 — which is the single
-        // per-opcode fact the encoder and decoder can silently disagree on.
-        L::StrSubstr {
-            src: Reg(71),
-            start_reg: Reg(72),
-            len_reg: Some(Reg(73)),
-        },
-        L::StrSubstr {
-            src: Reg(75),
-            start_reg: Reg(76),
-            len_reg: None,
-        },
-        L::StrLike {
-            src: Reg(81),
-            pat_idx: ConstIdx(82),
-            ci: false,
-        },
-        L::StrLike {
-            src: Reg(84),
-            pat_idx: ConstIdx(85),
-            ci: true,
-        },
-        L::IntToStr { a: Reg(87) },
-        L::FloatToStr { a: Reg(89) },
-        L::StrToFloat { a: Reg(93) },
-    ];
-    // The three cast opcodes and TRIM carry their family in the selector too, so
-    // each is swept from that family's own source.
-    for fi in gnitz_wire::TypeCode::ALL
+/// Every instruction the decoder accepts over each opcode's selector word and a
+/// few operand shapes. Operands are distinct so a swapped pair cannot
+/// round-trip; 0/1 reach a flag word, `u32::MAX` SUBSTR's absent length.
+fn decodable_words() -> Vec<([u32; INSTR_WORDS], LogicalInstr)> {
+    let shapes = [[11, 12, 13], [11, 0, 13], [11, 1, 13], [11, 12, u32::MAX]];
+    ExprOp::ALL
         .iter()
-        .filter_map(|&tc| FixedInt::from_type_code(tc))
-    {
-        v.push(L::FloatToInt { a: Reg(38), fi });
-        v.push(L::IntCast { a: Reg(40), fi });
-        v.push(L::StrToInt { a: Reg(91), fi });
-    }
-    for &mode in TrimMode::ALL {
-        v.push(L::StrTrim { a: Reg(78), mode, set_idx: ConstIdx(79) });
-    }
-    // The operator- and flag-parameterized families, every value of each.
-    for op in [CmpOp::Eq, CmpOp::Ne, CmpOp::Gt, CmpOp::Ge, CmpOp::Lt, CmpOp::Le] {
-        v.push(L::Cmp { op, a: Reg(101), b: Reg(102) });
-        v.push(L::FCmp { op, a: Reg(104), b: Reg(105) });
-    }
-    for op in [CmpOp::Eq, CmpOp::Ne, CmpOp::Gt, CmpOp::Ge, CmpOp::Lt, CmpOp::Le] {
-        v.push(L::StrColConst { op, col: 107, const_idx: ConstIdx(108) });
-        v.push(L::StrColCol { op, col_a: 110, col_b: 111 });
-        v.push(L::StrCmp { op, a: Reg(113), b: Reg(114) });
-    }
-    for op in [IntUnaryOp::Neg, IntUnaryOp::Abs, IntUnaryOp::Sign] {
-        v.push(L::IntUnary { op, a: Reg(116) });
-    }
-    for op in CalendarOp::ALL {
-        v.push(L::Calendar { op: *op, a: Reg(117), micros: false });
-        v.push(L::Calendar { op: *op, a: Reg(118), micros: true });
-    }
-    for op in [
-        FloatUnaryOp::Neg,
-        FloatUnaryOp::Abs,
-        FloatUnaryOp::Floor,
-        FloatUnaryOp::Ceil,
-        FloatUnaryOp::Round,
-        FloatUnaryOp::Trunc,
-        FloatUnaryOp::Sqrt,
-        FloatUnaryOp::Ln,
-        FloatUnaryOp::Log10,
-        FloatUnaryOp::Exp,
-        FloatUnaryOp::Sign,
-    ] {
-        v.push(L::FloatUnary { op, a: Reg(118) });
-    }
-    v.push(L::FloatArith {
-        op: FloatArithOp::Pow,
-        a: Reg(119),
-        b: Reg(120),
-    });
-    for is_max in [true, false] {
-        v.push(L::IntMinMax2 { a: Reg(120), b: Reg(121), is_max });
-        v.push(L::FloatMinMax2 { a: Reg(123), b: Reg(124), is_max });
-    }
-    for chars in [false, true] {
-        v.push(L::StrLen { a: Reg(126), chars });
-    }
-    for upper in [true, false] {
-        v.push(L::StrCase { a: Reg(128), upper });
-    }
-    for invert in [false, true] {
-        v.push(L::IsNullReg { a: Reg(129), invert });
-    }
-    for left in [true, false] {
-        v.push(L::StrSide { src: Reg(132), n_reg: Reg(133), left });
-        v.push(L::StrPad {
-            s: Reg(134),
-            n_reg: Reg(135),
-            fill: Reg(136),
-            left,
-        });
-    }
-    v.push(L::StrPos { hay: Reg(137), needle: Reg(138) });
-    v.push(L::StrReverse { a: Reg(139) });
-    v.push(L::StrReplace {
-        s: Reg(140),
-        from: Reg(141),
-        to: Reg(142),
-    });
-    v.push(L::StrSplitPart {
-        s: Reg(143),
-        delim: Reg(144),
-        n_reg: Reg(145),
-    });
-    for skip_null in [false, true] {
-        v.push(L::StrConcat { a: Reg(130), b: Reg(131), skip_null });
-    }
-    v
+        .flat_map(|op| (0..=64u32).flat_map(move |sel| shapes.map(|[a, b, c]| [op.as_wire(), sel, a, b, c])))
+        .filter_map(|w| {
+            Some((
+                w,
+                LogicalProgram::decode_instr(gnitz_wire::as_le_bytes(&w).try_into().unwrap()).ok()?,
+            ))
+        })
+        .collect()
 }
 
-/// `decode_instr ∘ to_wire == id`. The encoder and the decoder are the only two
-/// statements of the wire word layout, and this is what binds them: a swapped
-/// operand pair, a flag encoded into the wrong opcode, or a cast target on
-/// the wrong word all fail here.
+/// `decode_instr ∘ to_wire == id` over everything the decoder accepts, and the
+/// encoder emits the opcode and selector it was decoded from.
 #[test]
-fn every_instruction_round_trips_through_the_wire_form() {
-    let want = every_variant();
-    let words: Vec<u32> = want.iter().copied().flat_map(LogicalInstr::to_wire).collect();
-    // `from_blob` runs the structure-only validation, which this deliberately
-    // ill-formed fixture cannot pass — so decode the instructions directly.
-    let got: Vec<LogicalInstr> = gnitz_wire::as_le_bytes(&words)
-        .as_chunks::<INSTR_BYTES>()
-        .0
-        .iter()
-        .map(|t| LogicalProgram::decode_instr(t).expect("to_wire emits a decodable opcode"))
-        .collect();
-    assert_eq!(got, want);
+fn every_decodable_instruction_round_trips_through_the_wire_form() {
+    for (w, x) in decodable_words() {
+        let back = x.to_wire();
+        assert_eq!(back[..2], w[..2], "{x:?}: opcode and selector");
+        let again = LogicalProgram::decode_instr(gnitz_wire::as_le_bytes(&back).try_into().unwrap());
+        assert_eq!(again, Ok(x), "{x:?}: decode of its own encoding");
+    }
 }
 
-/// Every opcode the decoder accepts must be reachable from the encoder, and
-/// every [`LogicalInstr`] variant must appear in [`every_variant`] so the
-/// round-trip above actually covers its operand layout.
-///
-/// `decode_instr` matches [`ExprOp`] exhaustively, so "accepted" is `ExprOp::ALL`
-/// — an opcode with no decode arm no longer compiles, and one with no *encoder*
-/// arm fails here.
+/// The sweep reaches every [`LogicalInstr`] variant, and every selector family
+/// ends inside it.
 #[test]
-fn the_encoder_reaches_every_opcode_the_decoder_accepts() {
-    let emitted: BTreeSet<u32> = every_variant().iter().map(|i| i.to_wire()[0]).collect();
-    let accepted: BTreeSet<u32> = ExprOp::ALL.iter().map(|op| op.as_wire()).collect();
-    assert_eq!(emitted, accepted, "encoded opcodes vs. opcodes the decoder accepts");
-
-    // One opcode per variant, so the two counts are the same number.
+fn the_sweep_decodes_every_variant() {
     assert_eq!(ExprOp::ALL.len(), LogicalInstr::VARIANT_COUNT);
-
-    let all = every_variant();
-    let seen: std::collections::HashSet<_> = all.iter().map(std::mem::discriminant).collect();
+    let seen: std::collections::HashSet<_> = decodable_words()
+        .iter()
+        .map(|(_, x)| std::mem::discriminant(x))
+        .collect();
     assert_eq!(
         seen.len(),
         LogicalInstr::VARIANT_COUNT,
-        "every_variant() covers {} of {} LogicalInstr variants",
-        seen.len(),
-        LogicalInstr::VARIANT_COUNT,
+        "variants the decoder accepts a word for"
     );
-}
-
-/// The decoder narrows the selector on **every** opcode, so the `(op, selector)`
-/// pairs it accepts are computable from the enums alone — the encoder's own
-/// selectors, and nothing else. Without that, the family-less opcodes would
-/// accept any word there and this would need a hand-written per-family table.
-#[test]
-fn a_selector_outside_its_opcodes_family_is_rejected() {
-    // The selectors the encoder can emit for each opcode, off `every_variant`.
-    let mut emitted: std::collections::BTreeMap<u32, BTreeSet<u32>> = Default::default();
-    for i in every_variant() {
-        let w = i.to_wire();
-        emitted.entry(w[0]).or_default().insert(w[1]);
-    }
-    // Past every family's widest member (a cast target is a type code).
-    for &op in ExprOp::ALL {
-        let want = &emitted[&op.as_wire()];
-        for sel in 0..=64u32 {
-            // SUBSTR's absent-length sentinel; every other opcode ignores word 4.
-            let t = [op.as_wire(), sel, 0, 0, u32::MAX];
-            let accepted = LogicalProgram::decode_instr(gnitz_wire::as_le_bytes(&t).try_into().unwrap()).is_ok();
-            assert_eq!(
-                accepted,
-                want.contains(&sel),
-                "{op:?} selector {sel}: decoder {} the encoder {}",
-                if accepted { "accepts" } else { "rejects" },
-                if want.contains(&sel) { "emits" } else { "does not emit" },
-            );
-        }
-    }
+    assert!(
+        decodable_words().iter().all(|(w, _)| w[1] < 64),
+        "a selector family reaches the sweep's last selector: widen the sweep"
+    );
 }
 
 /// `LoadConst`'s `i64` is the one operand spanning two words: the split and the
@@ -2370,25 +2154,6 @@ fn scalar_lanes_covers_every_scalar_register_and_no_more() {
     assert_eq!(lanes(interleaved, &str_schema), (4, 3));
 }
 
-#[test]
-fn sequential_copy_projection() {
-    let base = |srcs: &[u32]| LogicalProgram::copy_cols(srcs).sequential_copy_base();
-    // src 1,2 → slots 0,1: base = 1.
-    assert_eq!(base(&[1, 2]), Some(1));
-    // Sources not sequential (2, then 1).
-    assert_eq!(base(&[2, 1]), None);
-    assert_eq!(base(&[]), None); // empty
-                                 // Compound PK (k = 2): finalize copies columns 2, 3 into slots 0, 1.
-    assert_eq!(base(&[2, 3]), Some(2));
-    // One computed register breaks the block copy, whatever the copies do.
-    let computed = LogicalProgram::new(
-        vec![LogicalInstr::LoadColInt { col: 2 }],
-        vec![Sink::Col(1), Sink::Reg(Reg(0))],
-        vec![],
-    );
-    assert_eq!(computed.sequential_copy_base(), None);
-}
-
 /// A map reproduces its input only when it copies every payload column into its
 /// own slot, computes nothing, and the two schemas locate every column alike.
 #[test]
@@ -2424,6 +2189,19 @@ fn is_identity_map_requires_an_in_order_copy_over_one_layout() {
         !LogicalProgram::copy_cols(&[1, 2]).is_identity_map(&schema, &other_pk),
         "different PK layout"
     );
+    // A PK that does not lead: the payload columns are 0 and 2.
+    let mid_pk = TestSchema::new(
+        &[(TypeCode::I64, true), (TypeCode::U64, false), (TypeCode::I64, false)],
+        &[1],
+    );
+    assert!(LogicalProgram::copy_cols(&[0, 2]).is_identity_map(&mid_pk, &mid_pk));
+    assert!(
+        !LogicalProgram::copy_cols(&[1, 2]).is_identity_map(&mid_pk, &mid_pk),
+        "a PK column copied into a payload slot"
+    );
+    // A PK-only schema: nothing to copy, so the empty program is its identity.
+    let pk_only = TestSchema::new(&[(TypeCode::U64, false)], &[0]);
+    assert!(LogicalProgram::copy_cols(&[]).is_identity_map(&pk_only, &pk_only));
 }
 
 /// The three shapes [`NullPerm`] collapses a copy list to, and the window each

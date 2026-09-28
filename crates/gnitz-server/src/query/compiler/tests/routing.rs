@@ -88,7 +88,7 @@ fn co_partitioning_needs_the_exact_pk_sequence_or_a_replicated_participant() {
     assert_eq!(
         both(&[0, 1], sources([(7, compound()), (9, compound())])),
         (true, true),
-        "the key [pk0, pk1] is pk_indices(): both sides already sit where it routes"
+        "the key [pk0, pk1] is pk_cols(): both sides already sit where it routes"
     );
     assert_eq!(
         both(&[1, 0], sources([(7, compound()), (9, compound())])),

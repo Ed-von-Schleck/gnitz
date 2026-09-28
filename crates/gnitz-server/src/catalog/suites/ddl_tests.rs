@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_expr::{ColumnTable, SchemaFacts};
 use gnitz_wire::{ColumnDef, COLTAB_PAY_NAME};
 use std::collections::HashMap;
 
@@ -581,23 +582,13 @@ fn test_pk_list_round_trips_into_registered_schema() {
     // reconstructed schema reflects the new list, not the old one.
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     assert_eq!(
-        engine
-            .registry
-            .relation(tid)
-            .map(Relation::schema)
-            .unwrap()
-            .pk_indices(),
+        engine.registry.relation(tid).map(Relation::schema).unwrap().pk_cols(),
         &[0]
     );
     engine.drop_table("public.t").unwrap();
     let tid2 = engine.create_table("public.t", &cols, &[1]).unwrap();
     assert_eq!(
-        engine
-            .registry
-            .relation(tid2)
-            .map(Relation::schema)
-            .unwrap()
-            .pk_indices(),
+        engine.registry.relation(tid2).map(Relation::schema).unwrap().pk_cols(),
         &[1]
     );
 
@@ -610,12 +601,7 @@ fn test_pk_list_round_trips_into_registered_schema() {
         let name = format!("public.w{n}");
         let tid = engine.create_table(&name, &wide, &pk_cols).unwrap();
         assert_eq!(
-            engine
-                .registry
-                .relation(tid)
-                .map(Relation::schema)
-                .unwrap()
-                .pk_indices(),
+            engine.registry.relation(tid).map(Relation::schema).unwrap().pk_cols(),
             pk_cols.as_slice(),
             "compound PK list must round-trip in full (input={pk_cols:?})"
         );

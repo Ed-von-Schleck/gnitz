@@ -409,7 +409,7 @@ fn pk24(a: u64, b: u128) -> [u8; 24] {
 fn pk_stride_wal_roundtrip_bytes_24() {
     let schema = wide24_schema();
     assert_eq!(schema.pk_stride(), 24);
-    assert_eq!(schema.pk_count(), 2);
+    assert_eq!(schema.pk_cols.len(), 2);
 
     let tuples = [
         pk24(1, 100),

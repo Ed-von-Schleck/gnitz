@@ -2,6 +2,7 @@
 //! WAL header and a schema record's arity prefix.
 
 use crate::test_support::{encode_to_wire_vec, make_batch, make_schema_u64_i64, sweep_bit_flips};
+use gnitz_expr::ColumnTable;
 use gnitz_store::schema::decode_schema_block;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
@@ -31,13 +32,13 @@ fn schema_record_4col() -> Vec<u8> {
 fn no_flip_in_a_schema_records_arity_prefix_is_silently_inert() {
     let mut buf = schema_record_4col();
     let reference = decode_schema_block(&buf).expect("clean");
-    let prefix = 4 + 1 + reference.pk_indices().len();
+    let prefix = 4 + 1 + reference.pk_cols().len();
     sweep_bit_flips(&mut buf, 0..prefix, |byte, bit, buf| {
         let Ok(decoded) = decode_schema_block(buf) else {
             return;
         };
         let same = decoded.num_columns() == reference.num_columns()
-            && decoded.pk_indices() == reference.pk_indices()
+            && decoded.pk_cols() == reference.pk_cols()
             && (0..decoded.num_columns()).all(|c| {
                 decoded.columns[c].type_code == reference.columns[c].type_code
                     && decoded.columns[c].nullable == reference.columns[c].nullable

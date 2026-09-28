@@ -21,36 +21,6 @@ pub struct Schema {
 }
 
 impl Schema {
-    /// The digest of this schema's physical layout — the one a read request
-    /// names its reply layout by.
-    pub fn layout_digest(&self) -> u64 {
-        gnitz_wire::layout_digest(&self.pk_cols, self.columns.iter().map(|c| c.ty.tc))
-    }
-
-    /// Number of logical columns in this schema (PK + payload).
-    #[inline]
-    pub fn num_columns(&self) -> usize {
-        self.columns.len()
-    }
-
-    /// Number of PK columns (compound-key arity). Compound primary keys are
-    /// supported end to end — `CREATE TABLE … PRIMARY KEY (a, b, …)` produces a
-    /// schema with `count >= 2` — so callers must not assume a lone PK column.
-    #[inline]
-    pub fn pk_count(&self) -> usize {
-        self.pk_cols.len()
-    }
-
-    /// The lone PK column's index, or `None` for a compound key. Total, so a
-    /// caller cannot reach the first of several PK columns by mistake.
-    #[inline]
-    pub fn pk_index_single(&self) -> Option<u32> {
-        match self.pk_cols[..] {
-            [ci] => Some(ci),
-            _ => None,
-        }
-    }
-
     /// The PK columns in PK-list order, hidden: the leading key of a reply that
     /// carries this schema's key.
     pub fn hidden_key_columns(&self) -> impl Iterator<Item = ColumnDef> + '_ {
@@ -169,17 +139,15 @@ impl Schema {
         Schema::from_parts(columns, pk.as_slice().to_vec())
     }
 
-    /// Whether `self` and `other` have the same physical layout: column count,
-    /// `pk_cols`, and per column its type code and nullability. Names, the
+    /// [`SchemaFacts::same_layout`] plus per-column nullability. Names, the
     /// hidden flag and a DECIMAL's scale are not compared.
     pub fn types_match(&self, other: &Schema) -> bool {
-        self.columns.len() == other.columns.len()
-            && self.pk_cols == other.pk_cols
+        self.same_layout(other)
             && self
                 .columns
                 .iter()
                 .zip(&other.columns)
-                .all(|(a, b)| a.ty.tc == b.ty.tc && a.is_nullable == b.is_nullable)
+                .all(|(a, b)| a.is_nullable == b.is_nullable)
     }
 }
 

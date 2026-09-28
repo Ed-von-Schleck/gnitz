@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::push_table_tab_row;
+use gnitz_expr::ColumnTable;
 use gnitz_store::storage::BatchBuilder;
 
 #[test]
@@ -7,7 +8,7 @@ fn the_circuit_table_has_a_compound_view_id_node_id_pk() {
     // from_wire_cols(&[0, 1]) must produce a 2-column PK whose stride is the
     // sum of the first two columns (U64 + U64 = 16 bytes).
     let schema = SysFamily::CircuitNodes.schema();
-    assert_eq!(schema.pk_indices(), &[0, 1], "circuit PK must be (col0, col1)");
+    assert_eq!(schema.pk_cols(), &[0, 1], "circuit PK must be (col0, col1)");
     assert_eq!(schema.pk_stride(), 16, "two U64 PK columns pack to 16 bytes");
 }
 

@@ -7,6 +7,7 @@ use crate::protocol::transport::poll_fd;
 use crate::protocol::{
     BatchAppender, ColumnDef, FkTarget, PkBuf, PkColumn, ProtocolError, PushFamily, Schema, WireConflictMode, ZSetBatch,
 };
+use gnitz_expr::{ColumnTable, SchemaFacts};
 use gnitz_wire::{WireFault, WireStatus};
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -80,7 +81,7 @@ pub fn retraction_batch(schema: &Schema, pks: PkColumn) -> ZSetBatch {
 pub fn key_reply(schema: &Schema) -> (Arc<Schema>, ReadSink) {
     let reply = Schema {
         columns: schema.hidden_key_columns().collect(),
-        pk_cols: (0..schema.pk_count() as u32).collect(),
+        pk_cols: (0..schema.pk_cols.len() as u32).collect(),
     };
     let program = LogicalProgram::copy_cols(&[]).to_blob_bytes();
     let map = ComputeMap { program, out_cols: Vec::new() };

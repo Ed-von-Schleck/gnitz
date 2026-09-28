@@ -1,6 +1,7 @@
 //! The store: what a host opens, and the `MirrorStore` surface a client drives
 //! it through.
 
+use gnitz_store::schema::SchemaFacts;
 use std::collections::HashMap;
 
 use gnitz_core::protocol::decode_regions_into;

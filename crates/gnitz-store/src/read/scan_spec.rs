@@ -2,6 +2,7 @@
 //! the bound, filter, map, then forward rows or fold them. A capacity-bounded
 //! view's rows hydrate chunk by chunk as the sink drains them.
 
+use crate::schema::SchemaFacts;
 use gnitz_wire::{ReadBound, ReadSpec, SinkKind, WireFault, WireStatus};
 
 use std::rc::Rc;
@@ -18,7 +19,7 @@ use gnitz_expr::{cmp_order_keys, order_locators, OrderLocator, RowFilter};
 
 impl RelationRegistry {
     /// Execute `spec` on this worker's slice, replying in the layout whose
-    /// [`SchemaDescriptor::layout_digest`] is `reply_layout`.
+    /// [`SchemaFacts::layout_digest`] is `reply_layout`.
     pub fn scan_spec(
         &self,
         target_id: u64,

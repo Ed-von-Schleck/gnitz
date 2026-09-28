@@ -53,8 +53,8 @@ pub(crate) fn payload_program(
     out: &Schema,
     input: &Schema,
 ) -> Result<LogicalProgram, GnitzSqlError> {
-    let k = input.pk_count();
-    debug_assert_eq!(out.pk_count(), k, "a projection keeps its input's key");
+    let k = input.pk_cols.len();
+    debug_assert_eq!(out.pk_cols.len(), k, "a projection keeps its input's key");
     debug_assert!(
         (0..k).all(|i| items[i].passthrough_src() == Some(input.pk_cols[i] as usize)),
         "a physicalized projection copies its input's PK in front"
@@ -67,7 +67,7 @@ pub(crate) fn payload_program(
 pub(crate) fn compute_map(program: LogicalProgram, out: &Schema) -> ComputeMap {
     ComputeMap {
         program: program.to_blob_bytes(),
-        out_cols: out.columns[out.pk_count()..]
+        out_cols: out.columns[out.pk_cols.len()..]
             .iter()
             .map(|c| (c.ty.tc, c.is_nullable))
             .collect(),
@@ -117,5 +117,5 @@ pub(crate) fn reply_program(
 ) -> Result<(Schema, LogicalProgram), GnitzSqlError> {
     let program = compile_projection_map(payload_items, &payload_cols, source)?;
     let columns = source.hidden_key_columns().chain(payload_cols).collect();
-    Ok((leading_schema(columns, source.pk_count())?, program))
+    Ok((leading_schema(columns, source.pk_cols.len())?, program))
 }

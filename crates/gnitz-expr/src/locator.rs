@@ -35,13 +35,6 @@ const _: () = assert!(
 );
 
 impl ColumnLocator {
-    /// Padding for fixed-size locator arrays; names no real column.
-    pub const EMPTY: ColumnLocator = ColumnLocator::Pk {
-        byte_off: 0,
-        size: 0,
-        type_code: TypeCode::U8,
-    };
-
     #[inline(always)]
     pub fn size(&self) -> usize {
         match *self {
@@ -146,7 +139,6 @@ impl ColumnLocator {
         match *self {
             ColumnLocator::Pk { .. } => gnitz_wire::widen_pk_be(cell),
             ColumnLocator::Payload { size, type_code, .. } => {
-                // Biased at the cell's width; the `u128` form measured slower.
                 let signed = type_code.is_signed_int();
                 if size == 16 {
                     u128::from_le_bytes(cell.try_into().unwrap()) ^ ((signed as u128) << 127)

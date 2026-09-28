@@ -21,6 +21,7 @@
 //! uncorrelated with the PK order produces, and where per-range fixed costs
 //! rather than per-row copies dominate.
 
+use gnitz_expr::SchemaFacts;
 use std::hint::black_box;
 use std::rc::Rc;
 use std::time::Instant;

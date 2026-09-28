@@ -219,12 +219,10 @@ pub fn widen_pk_be(pk_bytes: &[u8]) -> u128 {
 /// [`encode_pk_column`], fused with the widening [`crate::types::FixedInt`] defines.
 ///
 /// Spelled with byte-array literals rather than composed from `decode_pk_column`
-/// and [`widen_pk_be`]: its production caller is `ColumnLocator::decode_i64`,
-/// which the engine's reduce path runs per row, and
-/// at `-O0` (the profile the E2E suite runs) that composition costs an
-/// out-of-line call plus a 16-byte stack materialization the fused form does not
-/// need. The assert carries a static message: an `#[inline(always)]` body
-/// duplicates a formatted `Arguments` block into every call site.
+/// and [`widen_pk_be`], which at `-O0` costs a per-row caller an out-of-line call
+/// and a 16-byte stack image. The assert carries a static message: an
+/// `#[inline(always)]` body duplicates a formatted `Arguments` block into every
+/// call site.
 #[inline(always)]
 pub fn decode_opk_i64(opk: &[u8], fi: crate::FixedInt) -> i64 {
     use crate::FixedInt as F;
@@ -233,11 +231,13 @@ pub fn decode_opk_i64(opk: &[u8], fi: crate::FixedInt) -> i64 {
         F::U8 => opk[0] as i64,
         F::I8 => (opk[0] ^ 0x80) as i8 as i64,
         F::U16 => u16::from_be_bytes([opk[0], opk[1]]) as i64,
-        F::I16 => u16::from_be_bytes([opk[0] ^ 0x80, opk[1]]) as i16 as i64,
+        F::I16 => (u16::from_be_bytes([opk[0], opk[1]]) ^ (1 << 15)) as i16 as i64,
         F::U32 => u32::from_be_bytes([opk[0], opk[1], opk[2], opk[3]]) as i64,
-        F::I32 => u32::from_be_bytes([opk[0] ^ 0x80, opk[1], opk[2], opk[3]]) as i32 as i64,
+        F::I32 => (u32::from_be_bytes([opk[0], opk[1], opk[2], opk[3]]) ^ (1 << 31)) as i32 as i64,
         F::U64 => u64::from_be_bytes([opk[0], opk[1], opk[2], opk[3], opk[4], opk[5], opk[6], opk[7]]) as i64,
-        F::I64 => u64::from_be_bytes([opk[0] ^ 0x80, opk[1], opk[2], opk[3], opk[4], opk[5], opk[6], opk[7]]) as i64,
+        F::I64 => {
+            (u64::from_be_bytes([opk[0], opk[1], opk[2], opk[3], opk[4], opk[5], opk[6], opk[7]]) ^ (1 << 63)) as i64
+        }
     }
 }
 

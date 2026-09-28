@@ -42,16 +42,8 @@ fn selected(var: &str, only: &str, count: usize) {
 /// *driven* region down to one, so a `perf stat` over two pass counts
 /// differences to one channel's retired instructions on one domain.
 ///
-/// Retired instructions per row per operator, `n = 1M`, differenced over
-/// `GNITZ_BENCH_PASSES` 1 and 21 — the register channel is 1.6× to 6× the fused
-/// one on every domain:
-///
-/// | domain             | fused | registers |
-/// |--------------------|-------|-----------|
-/// | mixed              |  22.5 |     112.0 |
-/// | long               |  77.9 |     127.6 |
-/// | digits-first       |  19.8 |     118.6 |
-/// | abcd-shared-prefix |  53.9 |     118.6 |
+/// Differenced over two `GNITZ_BENCH_PASSES` counts, the register channel
+/// retires more instructions per row than the fused one on every domain.
 ///
 /// The controlled pair is `digits-first` against `abcd-shared-prefix`: same
 /// lengths, same content bytes, differing only in whether the 4-byte prefix
@@ -174,7 +166,7 @@ fn bench_passes() -> usize {
 
 /// Retired-instruction harness for the filter kernels.
 ///
-///   for s in pk nullable; do for p in 1 501; do \
+///   for s in pk pk_i64 i32 nullable literals; do for p in 1 501; do \
 ///     GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
 ///     cargo test -p gnitz-expr --release filter_kernel_bench -- --ignored --nocapture
 ///   done; done
@@ -197,6 +189,36 @@ fn filter_kernel_bench() {
         vec![
             LogicalInstr::LoadColInt { col: 0 },
             LogicalInstr::LoadConst { val: (n / 2) as i64, unsigned: false },
+            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
+        ],
+        Reg(2),
+        vec![],
+    );
+
+    // The same compare over an `I64` PK: the signed OPK decode, which `pk`'s
+    // `U64` key does not reach.
+    let pk_i64_schema = TestSchema::new(&[(TypeCode::I64, false), (TypeCode::I64, false)], &[0]);
+    let pk_i64_view = make_n_col_view(&pk_i64_schema, n, |_, _| 1, |_, _| false);
+    let mut pk_i64_filter = filter_prog(
+        &pk_i64_schema,
+        vec![
+            LogicalInstr::LoadColInt { col: 0 },
+            LogicalInstr::LoadConst { val: (n / 2) as i64, unsigned: false },
+            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
+        ],
+        Reg(2),
+        vec![],
+    );
+
+    // `a > 500` over one NOT NULL `I32` payload column: a payload load narrower
+    // than the 8-byte arm every other shape reads.
+    let i32_schema = TestSchema::new(&[(TypeCode::U64, false), (TypeCode::I32, false)], &[0]);
+    let i32_view = make_n_col_view(&i32_schema, n, |row, _| (row % 1000) as i64, |_, _| false);
+    let mut i32_filter = filter_prog(
+        &i32_schema,
+        vec![
+            LogicalInstr::LoadColInt { col: 1 },
+            LogicalInstr::LoadConst { val: 500, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         ],
         Reg(2),
@@ -269,6 +291,8 @@ fn filter_kernel_bench() {
     let mut ranges = Vec::new();
     for (name, ev, view) in [
         ("pk", &mut pk_filter, &pk_view),
+        ("pk_i64", &mut pk_i64_filter, &pk_i64_view),
+        ("i32", &mut i32_filter, &i32_view),
         ("nullable", &mut nn_filter, &nn_view),
         ("literals", &mut lit_filter, &lit_view),
     ] {

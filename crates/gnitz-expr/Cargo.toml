@@ -7,7 +7,7 @@ edition = "2021"
 gnitz-wire = { path = "../gnitz-wire" }
 # The substring scan.
 # `no_std` and itself dependency-free, so it pulls nothing into this leaf crate.
-memchr = "2"
+memchr = "2.8.3"
 
 [lints]
 workspace = true

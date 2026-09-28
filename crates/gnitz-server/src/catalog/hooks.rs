@@ -1,5 +1,6 @@
 use super::cache::RelationEntry;
 use super::*;
+use gnitz_expr::ColumnTable;
 use gnitz_expr::SchemaFacts;
 use std::collections::hash_map::Entry;
 
@@ -55,7 +56,7 @@ impl CatalogEngine {
             self.registry.slot().of
         );
         self.registry.register(RelationSpec { id, kind, schema })?;
-        self.enter_relation(id, kind, schema.pk_indices(), &col_defs, facts);
+        self.enter_relation(id, kind, schema.pk_cols(), &col_defs, facts);
         // Derived, not stored: every process builds the same FK circuits from the same
         // column records.
         for ci in self.fk_circuit_cols(id) {
@@ -214,7 +215,7 @@ impl CatalogEngine {
             let defs = self.read_column_defs(owner)?;
             if kind.is_base_table() {
                 let rebuilt =
-                    build_schema_from_col_defs(RelationKind::BaseTable, &defs, cur.pk_indices(), cur.placement())
+                    build_schema_from_col_defs(RelationKind::BaseTable, &defs, cur.pk_cols(), cur.placement())
                         .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;
                 if rebuilt != cur {
                     self.reject_if_dependent_views(owner, "column ALTER")?;
@@ -225,7 +226,7 @@ impl CatalogEngine {
                 .relations
                 .get_mut(&owner)
                 .expect("every registered relation has an entry")
-                .reschema(cur.pk_indices(), &defs);
+                .reschema(cur.pk_cols(), &defs);
         }
         Ok(())
     }

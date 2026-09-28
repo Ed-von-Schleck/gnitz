@@ -3,6 +3,7 @@
 
 use crate::expr::PkSource;
 use crate::ops::op_negate;
+use crate::schema::ColumnTable;
 use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
 use crate::storage::{Batch, BatchBuilder, Layout, ReadCursor};
 use crate::test_support::{
@@ -979,7 +980,7 @@ fn reduce_trace_seek_compound_pk() {
         ],
         &[0, 1],
     );
-    assert!(in_schema.pk_indices().len() > 1, "test invariant: compound PK");
+    assert!(in_schema.pk_cols().len() > 1, "test invariant: compound PK");
     assert!(in_schema.pk_stride() <= 16, "test invariant: stride 16 is narrow");
 
     let pk = |a: u64, b: u64| opk_pk(&in_schema, &[a as u128, b as u128]);
@@ -6434,7 +6435,7 @@ fn test_reduce_output_schema_compound_natural_pk() {
     let out = out_schema_for(&input, &[0, 1], &aggs);
     // 2 PK cols + 1 agg col.
     assert_eq!(out.num_columns(), 3);
-    assert_eq!(out.pk_indices(), &[0, 1]);
+    assert_eq!(out.pk_cols(), &[0, 1]);
     assert_eq!(out.columns[0].type_code, TypeCode::U64);
     assert_eq!(out.columns[1].type_code, TypeCode::U64);
     assert_eq!(out.columns[2].type_code, TypeCode::I64);
@@ -6454,7 +6455,7 @@ fn test_reduce_output_schema_single_pk_group_by_pk() {
     let aggs = vec![AggDescriptor { col_idx: 1, agg_op: AggFunc::Sum }];
     let out = out_schema_for(&input, &[0], &aggs);
     assert_eq!(out.num_columns(), 2);
-    assert_eq!(out.pk_indices(), &[0]);
+    assert_eq!(out.pk_cols(), &[0]);
     assert_eq!(out.columns[0].type_code, TypeCode::U64);
     assert_eq!(out.columns[1].type_code, TypeCode::I64);
 }
@@ -6622,7 +6623,7 @@ fn op_reduce_bench() {
     let sorted_rows = |schema: SchemaDescriptor, salt: u64| {
         let mut bb = BatchBuilder::new(schema);
         for i in 0..N {
-            match schema.pk_indices().len() {
+            match schema.pk_cols().len() {
                 1 => bb.begin_row(i as u128, 1),
                 _ => bb.begin_row_opk(&[(i / 16) as u128, (i % 16) as u128], 1),
             }

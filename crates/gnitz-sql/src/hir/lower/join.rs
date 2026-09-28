@@ -86,7 +86,7 @@ pub(super) fn lower_join_view(
     }
     let (node, out) = acc.expect("a join step emits at least one branch");
     let node = match out_key.exchanged() {
-        true => cb.shard(node, &(0..out.schema.pk_count() as u32).collect::<Vec<_>>()),
+        true => cb.shard(node, &(0..out.schema.pk_cols.len() as u32).collect::<Vec<_>>()),
         false => node,
     };
     // A join key and a pair PK each identify a matched pair, not a row.

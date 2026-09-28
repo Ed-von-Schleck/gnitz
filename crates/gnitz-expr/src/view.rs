@@ -196,6 +196,7 @@ pub fn payload_u64<S: RowSource>(src: &S, row: usize, pi: usize) -> u64 {
 
 /// One row's German-string (STRING or BLOB) payload slot `pi`, resolved through
 /// the source's own blob heap so a value over 12 bytes reads back whole.
+#[inline(always)]
 pub fn payload_bytes<S: RowSource>(src: &S, row: usize, pi: usize) -> &[u8] {
     let cell = src.get_col_ptr(row, pi, 16);
     gnitz_wire::german_string_content(cell, src.blob())

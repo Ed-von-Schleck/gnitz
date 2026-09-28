@@ -1,5 +1,6 @@
 use super::*;
 use crate::schema::key::NarrowPkOpk;
+use crate::schema::ColumnTable;
 use crate::schema::{SchemaColumn, TypeCode};
 use crate::storage::Layout;
 use gnitz_wire::{read_i64_le, AggDescriptor, AggFunc};
@@ -112,7 +113,7 @@ fn fold_partial_layout_is_the_views() {
             .iter()
             .map(|c| (c.type_code, c.nullable))
             .collect();
-        (cols, s.pk_indices().to_vec())
+        (cols, s.pk_cols().to_vec())
     };
     let i64c = (TypeCode::I64, false);
     assert_eq!(layout(vec![1]), (vec![i64c, i64c], vec![0]), "single non-null column");

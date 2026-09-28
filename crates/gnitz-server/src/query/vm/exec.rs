@@ -1,6 +1,7 @@
 //! Epoch execution: the two entry points and the opcode dispatch loop.
 
 use super::*;
+use gnitz_expr::SchemaFacts;
 use gnitz_store::ops;
 use gnitz_store::storage::{Batch, StorageError};
 
@@ -256,7 +257,7 @@ fn take_output(vm: &mut Vm) -> Batch {
     // physical layout means the batch was built against another schema
     // entirely, which the stamp would hide from the wire encode.
     debug_assert!(
-        batch.schema().same_physical_layout(want),
+        batch.schema().same_layout(want),
         "VM output register {}: batch label is not the register's physical layout",
         program.out_reg.0,
     );

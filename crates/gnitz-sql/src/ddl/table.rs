@@ -195,7 +195,7 @@ fn resolve_fk_target(
     require_class(&ref_rel, &ref_table, ClassWant::BaseTable, "a FOREIGN KEY target")?;
     let ref_tid = ref_rel.tid;
 
-    let pk_single = ref_schema.pk_index_single().map(|c| c as usize);
+    let pk_single = ref_schema.lone_pk_col();
     let ref_col_idx = resolve_referred_column(site.referred_columns, &ref_table, &ref_schema.columns, pk_single)?;
 
     // Legal target iff the referenced column is the parent's lone PK or carries a
@@ -758,7 +758,7 @@ pub(crate) fn create_index_core(
     // The same rule the engine applies, run here for the message: it names the
     // offending column, which the engine cannot.
     let col_types: Vec<TypeCode> = col_indices.iter().map(|&c| schema.columns[c as usize].ty.tc).collect();
-    reject_unbuildable_index_key(&col_names, &col_types, schema.pk_count(), schema.pk_stride(), ctx)?;
+    reject_unbuildable_index_key(&col_names, &col_types, schema.pk_cols.len(), schema.pk_stride(), ctx)?;
 
     let index_name = match explicit_name {
         Some(name) => {

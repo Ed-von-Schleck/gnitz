@@ -1,5 +1,6 @@
 use crate::runtime::wire::{decode_sal_slot, WireData, WireMsg};
 use crate::test_support::{make_batch, make_batch_raw, u64_pk_schema};
+use gnitz_expr::ColumnTable;
 use gnitz_store::schema::{encode_schema_block, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder, Layout, WireChunk};
 use gnitz_wire::control::CTRL_HEADER_SIZE;
@@ -50,7 +51,7 @@ fn encode_decode_roundtrip_with_schema() {
     assert!(decoded.schema.is_some());
     let s = decoded.schema.unwrap();
     assert_eq!(s.num_columns(), 2);
-    assert_eq!(s.pk_indices(), &[0]);
+    assert_eq!(s.pk_cols(), &[0]);
     assert_eq!(s.columns[0].type_code, TypeCode::U64);
     assert_eq!(s.columns[1].type_code, TypeCode::U64);
     assert!(decoded.data_batch.is_none());

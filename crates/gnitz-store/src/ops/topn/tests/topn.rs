@@ -2,6 +2,7 @@
 //! and integrate paths: the index and the output trace are scratch tables, so
 //! every assertion is over the maintained *state*, weights and all.
 
+use crate::schema::SchemaFacts;
 use std::collections::BTreeMap;
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};

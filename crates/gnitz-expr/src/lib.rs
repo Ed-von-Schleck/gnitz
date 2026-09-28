@@ -24,11 +24,11 @@
 //! implementor writes, and everything derived from it.
 //!
 //! `LogicalInstr::to_wire` and `LogicalProgram::decode_instr` are two tables over
-//! [`ExprOp`]; the vocabulary, both tables and the blob framing that carries
-//! them all live in `program.rs`, and `tests/program.rs`'s drift tests check
-//! them against each other. `gnitz-wire` keeps only `EXPR_BLOB_VERSION`, the
-//! word its `SYS_SCHEMA_DIGEST` const fold must see — it cannot depend on this
-//! crate to reach one.
+//! `ExprOp`; the vocabulary, both tables and the blob framing that carries them
+//! all live in `program.rs`, and `tests/program.rs` binds them to each other and
+//! to `EXPR_BLOB_VERSION`. `gnitz-wire` keeps only `EXPR_BLOB_VERSION`, the word
+//! its `SYS_SCHEMA_DIGEST` const fold must see — it cannot depend on this crate
+//! to reach one.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
@@ -50,8 +50,7 @@
 //! the debug build, and the reverse costs. `nm -C` on the rlibs is what shows
 //! which: a generic body appears as a local (`t`) symbol in each consuming
 //! crate's. Anything a generic entry point reaches per row is
-//! `#[inline(always)]` regardless, as are [`ColumnLocator`]'s methods and
-//! `RowSource::row_count`.
+//! `#[inline(always)]` regardless.
 //!
 //! Judge an inlining or kernel change on retired instructions
 //! (`perf stat -e instructions:u`), never on wall-clock: timings on the

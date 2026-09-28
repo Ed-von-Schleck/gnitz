@@ -217,7 +217,7 @@ gnitz_wire::wire_enum! {
     /// A wire enum so [`LogicalProgram::decode_instr`] matches exhaustively: a
     /// new opcode is a compile error there until it gets a decode arm — which
     /// discriminants on `LogicalInstr` itself would lose.
-    pub enum ExprOp: u32 {
+    pub(crate) enum ExprOp: u32 {
         LoadColInt = 1,
         LoadColFloat = 2,
         LoadConst = 3,
@@ -397,12 +397,12 @@ gnitz_wire::wire_enum! {
 
 impl TrimMode {
     #[inline]
-    pub fn trims_start(self) -> bool {
+    pub(crate) fn trims_start(self) -> bool {
         matches!(self, TrimMode::Both | TrimMode::Leading)
     }
 
     #[inline]
-    pub fn trims_end(self) -> bool {
+    pub(crate) fn trims_end(self) -> bool {
         matches!(self, TrimMode::Both | TrimMode::Trailing)
     }
 }
@@ -440,8 +440,8 @@ pub struct ConstIdx(pub u32);
 
 /// One output payload slot of a map, in slot order: `sinks[i]` writes slot `i`.
 /// Position *is* the destination, so an unwritten or twice-written slot cannot
-/// be expressed — where an unwritten one used to ship the uninitialized output
-/// batch's recycled bytes.
+/// be expressed, and no output slot is left holding the output batch's recycled
+/// bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sink {
     /// Copy an input column verbatim. No type operand: the engine resolves the
@@ -773,21 +773,18 @@ pub(crate) enum Instr {
     /// on, established once at resolve time (`validate` pins the column to
     /// `ColKind::FixedIntCol`), so the row loop carries no wildcard arm.
     LoadPayloadInt {
-        dst: u16,
         pi: u8,
         fi: FixedInt,
     },
     /// Payload F32 load, widened to the register's f64 image. An F64 column
     /// needs no kernel of its own — it lowers to `LoadPayloadInt` with `I64`.
     LoadPayloadF32 {
-        dst: u16,
         pi: u8,
     },
     /// PK-region integer load: the addressed OPK column at byte `off`. `off`
     /// cannot come from `fi` — it is the column's offset within the OPK region,
     /// not its width.
     LoadPk {
-        dst: u16,
         off: u8,
         fi: FixedInt,
     },
@@ -795,79 +792,66 @@ pub(crate) enum Instr {
     /// and `Mod` read it.
     IntArith {
         op: IntArithOp,
-        dst: u16,
         a: u16,
         b: u16,
         signed: bool,
     },
     Cmp {
         op: CmpOp,
-        dst: u16,
         a: u16,
         b: u16,
         order: IntOrder,
     },
     FCmp {
         op: CmpOp,
-        dst: u16,
         a: u16,
         b: u16,
     },
     FloatArith {
         op: FloatArithOp,
-        dst: u16,
         a: u16,
         b: u16,
     },
     IntToFloat {
-        dst: u16,
         a: u16,
         signed: bool,
     },
     FloatUnary {
         op: FloatUnaryOp,
-        dst: u16,
         a: u16,
     },
     /// `signed` is the resolve-time U64 tracking of `a`; only `Sign` reads it.
     IntUnary {
         op: IntUnaryOp,
-        dst: u16,
         a: u16,
         signed: bool,
     },
     Calendar {
         op: CalendarOp,
-        dst: u16,
         a: u16,
         micros: bool,
     },
     /// `fi` is the fixed-int target `decode_instr` narrowed the wire selector
     /// to, so the kernel's bounds lookup is total.
     FloatToInt {
-        dst: u16,
         a: u16,
         fi: FixedInt,
     },
     IntCast {
-        dst: u16,
         a: u16,
         fi: FixedInt,
         src_signed: bool,
     },
     FloatToF32 {
-        dst: u16,
         a: u16,
     },
     IntMinMax2 {
-        dst: u16,
         a: u16,
         b: u16,
         is_max: bool,
         signed: bool,
     },
     FloatMinMax2 {
-        dst: u16,
         a: u16,
         b: u16,
         is_max: bool,
@@ -875,33 +859,26 @@ pub(crate) enum Instr {
     /// SQL CASE blend (resolved): identical to the logical form — blends raw i64
     /// bit patterns; the lowerer lifts integer branches to f64.
     Select {
-        dst: u16,
         cond: u16,
         a: u16,
         b: u16,
     },
-    LoadNull {
-        dst: u16,
-    },
+    LoadNull,
     /// Three-valued AND, or OR when `is_or` — one kernel, the operator carried
     /// as data, as [`LogicalInstr::BoolBinary`] carries it.
     BoolBinary {
-        dst: u16,
         a: u16,
         b: u16,
         is_or: bool,
     },
     BoolNot {
-        dst: u16,
         a: u16,
     },
     IsNull {
-        dst: u16,
         pi: u8,
         invert: bool,
     },
     IsNullReg {
-        dst: u16,
         a: u16,
         invert: bool,
     },
@@ -910,20 +887,17 @@ pub(crate) enum Instr {
     /// vector, not the const pool.
     StrColConst {
         op: CmpOp,
-        dst: u16,
         pi: u8,
         cell_idx: u32,
     },
     StrColCol {
         op: CmpOp,
-        dst: u16,
         pi_a: u8,
         pi_b: u8,
     },
     /// Integer set membership: `dst = value_reg ∈ int_sets[set_idx]`. `set_idx`
     /// indexes `ResolvedProgram.int_sets`, not the const pool.
     IntInSet {
-        dst: u16,
         value_reg: u16,
         set_idx: u32,
     },
@@ -931,36 +905,28 @@ pub(crate) enum Instr {
     /// resolved from the logical column index, and is also the kernel's buffer
     /// index into [`ResolvedProgram::str_cols`]' table.
     LoadColStr {
-        dst: u16,
         pi: u8,
     },
-    LoadNullStr {
-        dst: u16,
-    },
+    LoadNullStr,
     StrSelect {
-        dst: u16,
         cond: u16,
         a: u16,
         b: u16,
     },
     StrCmp {
         op: CmpOp,
-        dst: u16,
         a: u16,
         b: u16,
     },
     StrLen {
-        dst: u16,
         a: u16,
         chars: bool,
     },
     StrCase {
-        dst: u16,
         a: u16,
         upper: bool,
     },
     StrSubstr {
-        dst: u16,
         src: u16,
         start: IntReg,
         len: Option<IntReg>,
@@ -968,7 +934,6 @@ pub(crate) enum Instr {
     /// `set_idx` indexes `ResolvedProgram::trim_sets` — the 256-bit membership
     /// table decoded once at resolve — not the const pool.
     StrTrim {
-        dst: u16,
         a: u16,
         mode: TrimMode,
         set_idx: u32,
@@ -976,66 +941,54 @@ pub(crate) enum Instr {
     /// `matcher_idx` indexes `ResolvedProgram::like_matchers`, not the const
     /// pool.
     StrLike {
-        dst: u16,
         src: u16,
         matcher_idx: u32,
     },
     StrConcat {
-        dst: u16,
         a: u16,
         b: u16,
         skip_null: bool,
     },
     IntToStr {
-        dst: u16,
         a: u16,
         signed: bool,
     },
     FloatToStr {
-        dst: u16,
         a: u16,
     },
     /// `fi` is the fixed-int target `decode_instr` narrowed the wire selector
     /// to, so the kernel's range lookup is total.
     StrToInt {
-        dst: u16,
         a: u16,
         fi: FixedInt,
     },
     StrToFloat {
-        dst: u16,
         a: u16,
     },
     StrSide {
-        dst: u16,
         src: u16,
         n: IntReg,
         left: bool,
     },
     StrPos {
-        dst: u16,
         hay: u16,
         needle: u16,
     },
     StrReverse {
-        dst: u16,
         a: u16,
     },
     StrReplace {
-        dst: u16,
         s: u16,
         from: u16,
         to: u16,
     },
     StrPad {
-        dst: u16,
         s: u16,
         n: IntReg,
         fill: u16,
         left: bool,
     },
     StrSplitPart {
-        dst: u16,
         s: u16,
         delim: u16,
         n: IntReg,
@@ -1505,32 +1458,17 @@ impl LogicalProgram {
         })
     }
 
-    /// If the program computes nothing and its sinks are one contiguous block of
-    /// column copies `src = [base, base+1, …]`, return `Some(base)`: the leading
-    /// columns the program skips (the PK region a finalize / identity MAP
-    /// inherits verbatim rather than copying). Otherwise `None`.
-    fn sequential_copy_base(&self) -> Option<usize> {
-        if !self.instrs.is_empty() {
-            return None;
-        }
-        let Sink::Col(base) = *self.sinks.first()? else {
-            return None;
-        };
-        self.sinks
-            .iter()
-            .enumerate()
-            .all(|(i, s)| matches!(*s, Sink::Col(c) if c == base + i as u32))
-            .then_some(base as usize)
-    }
-
     /// Whether this program, run as a map from `in_schema` to `out_schema` with the input PK carried
-    /// through, reproduces its input: every column locates identically, and the program copies each
-    /// payload column into its own slot and computes nothing.
+    /// through, reproduces its input: one layout on both sides, and the program copies each payload
+    /// column into its own slot and computes nothing.
     pub(crate) fn is_identity_map(&self, in_schema: &dyn SchemaFacts, out_schema: &dyn SchemaFacts) -> bool {
-        let n = in_schema.num_columns();
-        n == out_schema.num_columns()
-            && (0..n).all(|ci| in_schema.locate(ci) == out_schema.locate(ci))
-            && self.sequential_copy_base() == Some(in_schema.pk_cols().len())
+        in_schema.same_layout(out_schema)
+            && self.instrs.is_empty()
+            && self
+                .sinks
+                .iter()
+                .copied()
+                .eq((0..in_schema.num_payload_cols()).map(|pi| Sink::Col(in_schema.payload_col_idx(pi) as u32)))
     }
 
     /// Lower to the resolved form, with `sink_read` how the consumer reads each
@@ -1616,8 +1554,8 @@ impl LogicalProgram {
                     let fi = FixedInt::from_type_code(loc.type_code())
                         .expect("validated LoadColInt names a fixed-int column");
                     match loc {
-                        ColumnLocator::Pk { byte_off, .. } => I::LoadPk { dst, off: byte_off, fi },
-                        ColumnLocator::Payload { slot, .. } => I::LoadPayloadInt { dst, pi: slot, fi },
+                        ColumnLocator::Pk { byte_off, .. } => I::LoadPk { off: byte_off, fi },
+                        ColumnLocator::Payload { slot, .. } => I::LoadPayloadInt { pi: slot, fi },
                     }
                 }
                 L::LoadColFloat { col } => {
@@ -1626,8 +1564,8 @@ impl LogicalProgram {
                     // reading 8 bytes out of a 4-byte region.
                     let pi = payload_slot(col as usize);
                     match schema.col_type_code(col as usize) {
-                        TypeCode::F64 => I::LoadPayloadInt { dst, pi, fi: FixedInt::I64 },
-                        TypeCode::F32 => I::LoadPayloadF32 { dst, pi },
+                        TypeCode::F64 => I::LoadPayloadInt { pi, fi: FixedInt::I64 },
+                        TypeCode::F32 => I::LoadPayloadF32 { pi },
                         other => unreachable!("validated LoadColFloat names F32/F64, got {other}"),
                     }
                 }
@@ -1638,45 +1576,34 @@ impl LogicalProgram {
                 // The one thing resolution adds to the operator: which of the
                 // two dividing kernels runs unsigned, off the per-register U64
                 // tracking.
-                L::IntArith { op, a: Reg(a), b: Reg(b) } => I::IntArith { op, dst, a, b, signed: !is_u64(dst) },
-                L::FloatArith { op, a: Reg(a), b: Reg(b) } => I::FloatArith { op, dst, a, b },
+                L::IntArith { op, a: Reg(a), b: Reg(b) } => I::IntArith { op, a, b, signed: !is_u64(dst) },
+                L::FloatArith { op, a: Reg(a), b: Reg(b) } => I::FloatArith { op, a, b },
                 // Each operand is read with its own signedness, so a U64 value past
                 // 2^63 never equals or orders against a negative one.
-                L::Cmp { op, a: Reg(a), b: Reg(b) } => match (is_u64(a), is_u64(b)) {
-                    (false, false) => I::Cmp { op, dst, a, b, order: IntOrder::Signed },
-                    (true, true) => I::Cmp { op, dst, a, b, order: IntOrder::Unsigned },
-                    (true, false) => I::Cmp {
-                        op,
-                        dst,
-                        a,
-                        b,
-                        order: IntOrder::UnsignedSigned,
-                    },
-                    (false, true) => I::Cmp {
-                        op: op.converse(),
-                        dst,
-                        a: b,
-                        b: a,
-                        order: IntOrder::UnsignedSigned,
-                    },
-                },
-                L::FCmp { op, a: Reg(a), b: Reg(b) } => I::FCmp { op, dst, a, b },
-                L::FloatUnary { op, a: Reg(a) } => I::FloatUnary { op, dst, a },
-                L::IntUnary { op, a: Reg(a) } => I::IntUnary { op, dst, a, signed: !is_u64(a) },
-                L::Calendar { op, a: Reg(a), micros } => I::Calendar { op, dst, a, micros },
-                L::FloatToF32 { a: Reg(a) } => I::FloatToF32 { dst, a },
-                // Total on a validated program, the `LoadColInt` shape above:
-                L::FloatToInt { a: Reg(a), fi } => I::FloatToInt { dst, a, fi },
-                L::IntCast { a: Reg(a), fi } => I::IntCast { dst, a, fi, src_signed: !is_u64(a) },
-                L::IntMinMax2 { a: Reg(a), b: Reg(b), is_max } => {
-                    I::IntMinMax2 { dst, a, b, is_max, signed: !is_u64(dst) }
+                L::Cmp { op, a: Reg(a), b: Reg(b) } => {
+                    let (op, a, b, order) = match (is_u64(a), is_u64(b)) {
+                        (false, false) => (op, a, b, IntOrder::Signed),
+                        (true, true) => (op, a, b, IntOrder::Unsigned),
+                        (true, false) => (op, a, b, IntOrder::UnsignedSigned),
+                        (false, true) => (op.converse(), b, a, IntOrder::UnsignedSigned),
+                    };
+                    I::Cmp { op, a, b, order }
                 }
-                L::FloatMinMax2 { a: Reg(a), b: Reg(b), is_max } => I::FloatMinMax2 { dst, a, b, is_max },
-                L::IntToFloat { a: Reg(a) } => I::IntToFloat { dst, a, signed: !is_u64(a) },
-                L::Select { cond: Reg(cond), a: Reg(a), b: Reg(b) } => I::Select { dst, cond, a, b },
-                L::LoadNull => I::LoadNull { dst },
-                L::BoolBinary { a: Reg(a), b: Reg(b), is_or } => I::BoolBinary { dst, a, b, is_or },
-                L::BoolNot { a: Reg(a) } => I::BoolNot { dst, a },
+                L::FCmp { op, a: Reg(a), b: Reg(b) } => I::FCmp { op, a, b },
+                L::FloatUnary { op, a: Reg(a) } => I::FloatUnary { op, a },
+                L::IntUnary { op, a: Reg(a) } => I::IntUnary { op, a, signed: !is_u64(a) },
+                L::Calendar { op, a: Reg(a), micros } => I::Calendar { op, a, micros },
+                L::FloatToF32 { a: Reg(a) } => I::FloatToF32 { a },
+                // Total on a validated program, the `LoadColInt` shape above:
+                L::FloatToInt { a: Reg(a), fi } => I::FloatToInt { a, fi },
+                L::IntCast { a: Reg(a), fi } => I::IntCast { a, fi, src_signed: !is_u64(a) },
+                L::IntMinMax2 { a: Reg(a), b: Reg(b), is_max } => I::IntMinMax2 { a, b, is_max, signed: !is_u64(dst) },
+                L::FloatMinMax2 { a: Reg(a), b: Reg(b), is_max } => I::FloatMinMax2 { a, b, is_max },
+                L::IntToFloat { a: Reg(a) } => I::IntToFloat { a, signed: !is_u64(a) },
+                L::Select { cond: Reg(cond), a: Reg(a), b: Reg(b) } => I::Select { cond, a, b },
+                L::LoadNull => I::LoadNull,
+                L::BoolBinary { a: Reg(a), b: Reg(b), is_or } => I::BoolBinary { a, b, is_or },
+                L::BoolNot { a: Reg(a) } => I::BoolNot { a },
                 // Mandatory, not an optimization: `ColKind::AnyCol` admits a PK
                 // column, which `payload_slot` panics on. Never NULL, so the
                 // constant is what the payload kernel would fill anyway.
@@ -1685,9 +1612,9 @@ impl LogicalProgram {
                         const_regs.push((dst, invert as i64));
                         continue;
                     }
-                    ColumnLocator::Payload { slot, .. } => I::IsNull { dst, pi: slot, invert },
+                    ColumnLocator::Payload { slot, .. } => I::IsNull { pi: slot, invert },
                 },
-                L::IsNullReg { a: Reg(a), invert } => I::IsNullReg { dst, a, invert },
+                L::IsNullReg { a: Reg(a), invert } => I::IsNullReg { a, invert },
                 L::StrColConst { op, col, const_idx: ConstIdx(const_idx) } => {
                     let ci = const_idx as usize;
                     // Encoded on first reference, so a pool entry no `StrColConst`
@@ -1703,14 +1630,12 @@ impl LogicalProgram {
                     });
                     I::StrColConst {
                         op,
-                        dst,
                         pi: payload_slot(col as usize),
                         cell_idx,
                     }
                 }
                 L::StrColCol { op, col_a, col_b } => I::StrColCol {
                     op,
-                    dst,
                     pi_a: payload_slot(col_a as usize),
                     pi_b: payload_slot(col_b as usize),
                 },
@@ -1728,12 +1653,12 @@ impl LogicalProgram {
                         int_sets.push(set);
                         slot
                     });
-                    I::IntInSet { dst, value_reg, set_idx: new_idx }
+                    I::IntInSet { value_reg, set_idx: new_idx }
                 }
                 L::LoadColStr { col } => {
                     let pi = payload_slot(col as usize);
                     str_cols |= 1u64 << pi;
-                    I::LoadColStr { dst, pi }
+                    I::LoadColStr { pi }
                 }
                 L::LoadConstStr { const_idx: ConstIdx(const_idx) } => {
                     let ci = const_idx as usize;
@@ -1748,13 +1673,12 @@ impl LogicalProgram {
                     const_str_regs.push((dst, off, len));
                     continue;
                 }
-                L::LoadNullStr => I::LoadNullStr { dst },
-                L::StrSelect { cond: Reg(cond), a: Reg(a), b: Reg(b) } => I::StrSelect { dst, cond, a, b },
-                L::StrCmp { op, a: Reg(a), b: Reg(b) } => I::StrCmp { op, dst, a, b },
-                L::StrLen { a: Reg(a), chars } => I::StrLen { dst, a, chars },
-                L::StrCase { a: Reg(a), upper } => I::StrCase { dst, a, upper },
+                L::LoadNullStr => I::LoadNullStr,
+                L::StrSelect { cond: Reg(cond), a: Reg(a), b: Reg(b) } => I::StrSelect { cond, a, b },
+                L::StrCmp { op, a: Reg(a), b: Reg(b) } => I::StrCmp { op, a, b },
+                L::StrLen { a: Reg(a), chars } => I::StrLen { a, chars },
+                L::StrCase { a: Reg(a), upper } => I::StrCase { a, upper },
                 L::StrSubstr { src: Reg(src), start_reg, len_reg } => I::StrSubstr {
-                    dst,
                     src,
                     start: int_reg(start_reg),
                     len: len_reg.map(int_reg),
@@ -1777,7 +1701,7 @@ impl LogicalProgram {
                         trim_sets.push(table);
                         slot
                     });
-                    I::StrTrim { dst, a, mode, set_idx: new_idx }
+                    I::StrTrim { a, mode, set_idx: new_idx }
                 }
                 L::StrLike {
                     src: Reg(src),
@@ -1787,25 +1711,23 @@ impl LogicalProgram {
                     let pattern = &self.const_strings[pat_idx as usize];
                     let matcher_idx = like_matchers.len() as u32;
                     like_matchers.push(LikeMatcher::compile(pattern, ci));
-                    I::StrLike { dst, src, matcher_idx }
+                    I::StrLike { src, matcher_idx }
                 }
-                L::StrConcat { a: Reg(a), b: Reg(b), skip_null } => I::StrConcat { dst, a, b, skip_null },
-                L::IntToStr { a: Reg(a) } => I::IntToStr { dst, a, signed: !is_u64(a) },
-                L::FloatToStr { a: Reg(a) } => I::FloatToStr { dst, a },
-                L::StrToInt { a: Reg(a), fi } => I::StrToInt { dst, a, fi },
-                L::StrToFloat { a: Reg(a) } => I::StrToFloat { dst, a },
-                L::StrSide { src: Reg(src), n_reg, left } => I::StrSide { dst, src, n: int_reg(n_reg), left },
-                L::StrPos { hay: Reg(hay), needle: Reg(needle) } => I::StrPos { dst, hay, needle },
-                L::StrReverse { a: Reg(a) } => I::StrReverse { dst, a },
-                L::StrReplace { s: Reg(s), from: Reg(from), to: Reg(to) } => I::StrReplace { dst, s, from, to },
-                L::StrPad { s: Reg(s), n_reg, fill: Reg(fill), left } => {
-                    I::StrPad { dst, s, n: int_reg(n_reg), fill, left }
-                }
+                L::StrConcat { a: Reg(a), b: Reg(b), skip_null } => I::StrConcat { a, b, skip_null },
+                L::IntToStr { a: Reg(a) } => I::IntToStr { a, signed: !is_u64(a) },
+                L::FloatToStr { a: Reg(a) } => I::FloatToStr { a },
+                L::StrToInt { a: Reg(a), fi } => I::StrToInt { a, fi },
+                L::StrToFloat { a: Reg(a) } => I::StrToFloat { a },
+                L::StrSide { src: Reg(src), n_reg, left } => I::StrSide { src, n: int_reg(n_reg), left },
+                L::StrPos { hay: Reg(hay), needle: Reg(needle) } => I::StrPos { hay, needle },
+                L::StrReverse { a: Reg(a) } => I::StrReverse { a },
+                L::StrReplace { s: Reg(s), from: Reg(from), to: Reg(to) } => I::StrReplace { s, from, to },
+                L::StrPad { s: Reg(s), n_reg, fill: Reg(fill), left } => I::StrPad { s, n: int_reg(n_reg), fill, left },
                 L::StrSplitPart { s: Reg(s), delim: Reg(delim), n_reg } => {
-                    I::StrSplitPart { dst, s, delim, n: int_reg(n_reg) }
+                    I::StrSplitPart { s, delim, n: int_reg(n_reg) }
                 }
             };
-            instrs.push(resolved);
+            instrs.push((dst, resolved));
         }
         let prog = ResolvedProgram {
             no_nulls,
@@ -1815,17 +1737,12 @@ impl LogicalProgram {
             instrs,
             const_regs,
             const_str_regs,
-            num_regs,
             const_cells,
             int_sets,
             trim_sets,
             like_matchers,
             const_arena,
-            // One past the highest string register, or 0 for a program with
-            // none: lanes are register-major, so nothing above it is addressed.
             str_lanes: MAX_REGS as u32 - str_class.leading_zeros(),
-            // Narrows the buffer without moving anything in it: scalar
-            // registers already occupy `[0, scalar_lanes)`.
             scalar_lanes: (0..num_regs)
                 .rev()
                 .find(|&r| (str_class >> r) & 1 == 0)
@@ -2577,14 +2494,15 @@ impl LogicalProgram {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct ResolvedProgram {
-    pub(crate) instrs: Vec<Instr>,
+    /// The computing instructions, as `(destination, instruction)`: the constant
+    /// loads are lifted out, so a position is not a register.
+    pub(crate) instrs: Vec<(u16, Instr)>,
     /// The scalar constant registers, as `(destination, value)`: written once per
     /// evaluator, not per morsel.
     pub(crate) const_regs: Vec<(u16, i64)>,
     /// The string constant registers, as `(destination, `[`Self::const_arena`]
     /// `offset, length)` — the same treatment, over the lane array.
     pub(crate) const_str_regs: Vec<(u16, u32, u32)>,
-    pub(crate) num_regs: u32,
     /// The 16-byte German-string cells, indexed by the resolved `cell_idx`,
     /// with any heap half in `const_arena`. Only the constants a `StrColConst`
     /// names get one — encoded once at resolve, compared by
@@ -2615,15 +2533,9 @@ pub(crate) struct ResolvedProgram {
     /// slot the bit names — so a string register's `src` is a payload slot, not
     /// an allocation order, and no column can be left without one.
     pub(crate) str_cols: u64,
-    /// How many string register lanes the scratch must hold: one past the
-    /// highest string register, 0 for a program with none. Lanes are
-    /// register-major, so sizing by [`Self::num_regs`] would reserve 4 KiB per
-    /// register for lanes nothing can read.
+    /// One past the highest string register; 0 for a program with none.
     pub(crate) str_lanes: u32,
-    /// How many i64 register lanes the scratch must hold: one past the highest
-    /// *non*-string register. A string register's i64 lane is neither written
-    /// (its opcodes write `str_views`) nor readable (every i64 reader is held to
-    /// a scalar operand), so [`Self::num_regs`] would reserve 2 KiB for nothing.
+    /// One past the highest scalar register. A string register has no i64 lane.
     pub(crate) scalar_lanes: u32,
     /// True iff no instruction can produce a NULL against the schema this program
     /// was resolved against, so the evaluator skips null-bit tracking entirely.
@@ -2651,6 +2563,11 @@ pub(crate) struct ResolvedProgram {
 }
 
 impl ResolvedProgram {
+    /// One past the highest register of either class.
+    pub(crate) fn num_regs(&self) -> usize {
+        self.str_lanes.max(self.scalar_lanes) as usize
+    }
+
     /// Per instruction per morsel, from the BOOL arms of `eval_batch`.
     pub(crate) fn is_bit_only(&self, reg: usize) -> bool {
         (self.bit_only_mask >> reg) & 1 != 0

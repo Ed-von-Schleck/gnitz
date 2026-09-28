@@ -7,6 +7,7 @@ use super::SkeletonHydrator;
 use crate::relation::{Relation, RelationKind, RelationRegistry};
 use crate::schema::key::{compare_pk_bytes, sort_indices, IndexKeySpec};
 use crate::schema::{project_schema, ColumnLocator};
+use crate::schema::{ColumnTable, SchemaFacts};
 use crate::storage::{pk_group_end, Batch, PkSetGather, ReadCursor, SkeletonKeys};
 use gnitz_wire::{KeyRange, PkKeys, ReadBound};
 
@@ -123,7 +124,7 @@ impl RelationRegistry {
 fn open_range(entry: &Relation, r: KeyRange) -> Result<(SourceCursor, ReadBound), String> {
     let cols = entry.bound_cols(r.cols(), "open_bound")?;
     let schema = entry.schema();
-    if r.walks_pk(schema.pk_indices()) {
+    if r.walks_pk(schema.pk_cols()) {
         let (cursor, _) = entry.store().held().range_cursor(schema.pk_range_keys(&r));
         return Ok((SourceCursor::Full(Box::new(cursor)), ReadBound::None));
     }

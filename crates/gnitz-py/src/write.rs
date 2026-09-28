@@ -31,16 +31,16 @@ pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyR
     let mut native = Vec::with_capacity(schema.pk_stride());
     for pk_val in pks {
         native.clear();
-        match schema.pk_index_single() {
-            Some(ci) => push_pk_col(&mut native, schema, ci as usize, pk_val)?,
+        match schema.lone_pk_col() {
+            Some(ci) => push_pk_col(&mut native, schema, ci, pk_val)?,
             None => {
                 let tuple = pk_val.cast::<PyTuple>().map_err(|_| {
                     pyo3::exceptions::PyTypeError::new_err("a compound pk must be a tuple of its column values")
                 })?;
-                if tuple.len() != schema.pk_count() {
+                if tuple.len() != schema.pk_cols.len() {
                     return Err(pyo3::exceptions::PyTypeError::new_err(format!(
                         "a compound pk takes {} values, got {}",
-                        schema.pk_count(),
+                        schema.pk_cols.len(),
                         tuple.len()
                     )));
                 }

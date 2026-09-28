@@ -16,6 +16,7 @@
 //! The per-column codec and tuple encoders are `gnitz_wire::pk`'s, shared with the
 //! client; this module composes schema-typed and row-sourced keys from them.
 
+use crate::schema::ColumnTable;
 use std::cell::Cell;
 use std::cmp::Ordering;
 
@@ -341,6 +342,13 @@ pub use gnitz_wire::PkBuf;
 /// One indexed column: where the owner-side value lives (`locate` — a PK source
 /// is sliced from the OPK region, a payload column read from its dense slot),
 /// and the promoted key column it encodes at, whose `size()` is the slot width.
+/// Padding for this module's fixed-size locator arrays; names no real column.
+const EMPTY_LOC: ColumnLocator = ColumnLocator::Pk {
+    byte_off: 0,
+    size: 0,
+    type_code: TypeCode::U8,
+};
+
 #[derive(Clone, Copy)]
 struct IndexKeyCol {
     loc: ColumnLocator,
@@ -349,11 +357,8 @@ struct IndexKeyCol {
 
 impl IndexKeyCol {
     /// Unused slots of the fixed array: the schema layer's designated padding
-    /// column and locator. Nothing reads past `n`.
-    const EMPTY: IndexKeyCol = IndexKeyCol {
-        loc: ColumnLocator::EMPTY,
-        out: SchemaColumn::EMPTY,
-    };
+    /// column and [`EMPTY_LOC`]. Nothing reads past `n`.
+    const EMPTY: IndexKeyCol = IndexKeyCol { loc: EMPTY_LOC, out: SchemaColumn::EMPTY };
 
     fn new(loc: ColumnLocator, out: SchemaColumn) -> Self {
         IndexKeyCol { loc, out }
@@ -405,7 +410,7 @@ impl IndexKeySpec {
             }
             col_types.push(owner.columns[c as usize].type_code);
         }
-        let promoted = gnitz_wire::index_key_types(&col_types, owner.pk_indices().len(), owner.pk_stride())
+        let promoted = gnitz_wire::index_key_types(&col_types, owner.pk_cols().len(), owner.pk_stride())
             .map_err(|r| r.to_string())?;
         let mut spec = IndexKeySpec {
             n: cols.len() as u8,
@@ -438,7 +443,7 @@ impl IndexKeySpec {
     /// PK range walk reads through [`Self::range_keys`] as an index walk does.
     pub(crate) fn for_pk(schema: &SchemaDescriptor) -> Self {
         let mut spec = IndexKeySpec {
-            n: schema.pk_indices().len() as u8,
+            n: schema.pk_cols().len() as u8,
             key_size: schema.pk_stride() as u8,
             cols: [IndexKeyCol::EMPTY; MAX_PK_COLUMNS],
         };
@@ -643,7 +648,7 @@ impl SchemaDescriptor {
     /// The one worker that can answer `range`, when one provably can. Any worker
     /// answers an empty range, so worker 0 does.
     pub fn confined_worker(&self, range: &KeyRange, num_workers: usize) -> Option<usize> {
-        if !range.walks_pk(self.pk_indices()) {
+        if !range.walks_pk(self.pk_cols()) {
             return None;
         }
         let Some((start, end)) = self.pk_range_keys(range) else {
@@ -694,9 +699,8 @@ fn push_col_key<R: RowSource>(buf: &mut Vec<u8>, src: &R, row: usize, null_word:
     }
     buf.push(1);
     match loc {
-        ColumnLocator::Payload { slot, size, type_code } if type_code.is_german_string() => {
-            let content =
-                gnitz_wire::german_string_content(src.get_col_ptr(row, slot as usize, size as usize), src.blob());
+        ColumnLocator::Payload { slot, type_code, .. } if type_code.is_german_string() => {
+            let content = gnitz_expr::payload_bytes(src, row, slot as usize);
             buf.extend_from_slice(&(content.len() as u32).to_le_bytes());
             buf.extend_from_slice(content);
         }
@@ -856,7 +860,7 @@ impl ColPromoter {
     const PLACEHOLDER: ColPromoter = ColPromoter {
         out_col: SchemaColumn::EMPTY,
         nullable: false,
-        kind: PromoteKind::Col(ColumnLocator::EMPTY),
+        kind: PromoteKind::Col(EMPTY_LOC),
     };
 
     /// A slot packing into a `out_tc` output PK column. The one place the output

@@ -100,14 +100,12 @@ pub fn read_pk_opk(region: &[u8], i: usize, stride: usize) -> u128 {
 /// Decode a single signed I64 PK column from its OPK (big-endian, sign-flipped)
 /// bytes back to the native value — the inverse of `extend_pk_opk` for an I64 PK.
 pub fn opk_pk_i64(opk_bytes: &[u8]) -> i64 {
-    let mut le = [0u8; 8];
-    gnitz_wire::decode_pk_column(&opk_bytes[..8], TypeCode::I64, &mut le);
-    i64::from_le_bytes(le)
+    gnitz_wire::decode_opk_i64(&opk_bytes[..8], gnitz_wire::FixedInt::I64)
 }
 
 /// Payload column 0 of row `row`, an 8-byte integer.
 pub fn payload0_i64<S: gnitz_expr::RowSource>(src: &S, row: usize) -> i64 {
-    i64::from_le_bytes(src.get_col_ptr(row, 0, 8).try_into().unwrap())
+    gnitz_expr::payload_u64(src, row, 0) as i64
 }
 
 /// [`payload0_i64`] of a located store row.

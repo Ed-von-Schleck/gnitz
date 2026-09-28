@@ -77,7 +77,7 @@ fn the_output_lays_out_the_key_then_both_payloads() {
 
     // A keyless join takes no part in either key, so it mints the pair.
     let crossed = plan(JoinKind::Cross, false, &left, &right).out_schema;
-    assert_eq!(crossed.pk_indices(), &[0, 1]);
+    assert_eq!(crossed.pk_cols(), &[0, 1]);
     assert_eq!(crossed.num_columns(), 4);
     assert_eq!(crossed.columns[2].type_code, TypeCode::I64);
     assert_eq!(crossed.columns[3].type_code, TypeCode::String);
@@ -98,7 +98,7 @@ fn the_output_carries_a_compound_pk_into_the_key_region() {
     let joined = plan(JoinKind::Equi, false, &left, &right).out_schema;
     // Two PK columns up front, then left payload (2), then right payload (1) = 5.
     assert_eq!(joined.num_columns(), 5);
-    assert_eq!(joined.pk_indices(), &[0, 1]);
+    assert_eq!(joined.pk_cols(), &[0, 1]);
     assert_eq!(joined.columns[0].type_code, TypeCode::U64);
     assert_eq!(joined.columns[1].type_code, TypeCode::U64);
 
@@ -111,7 +111,7 @@ fn the_output_carries_a_compound_pk_into_the_key_region() {
         &[0],
     );
     let joined_single = plan(JoinKind::Equi, false, &single, &single).out_schema;
-    assert_eq!(joined_single.pk_indices(), &[0]);
+    assert_eq!(joined_single.pk_cols(), &[0]);
 }
 
 /// A keyed join reads one side's PK region as the other's, so a mismatched pair

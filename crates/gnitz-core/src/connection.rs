@@ -5,6 +5,7 @@
 //! accumulator and it belongs to the head of the pending queue: every byte
 //! that arrives is the head slot's until its last train terminates.
 
+use gnitz_expr::SchemaFacts;
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
 use std::os::fd::{OwnedFd, RawFd};

@@ -78,6 +78,25 @@ pub trait SchemaFacts: ColumnTable {
     fn num_payload_cols(&self) -> usize {
         self.num_columns() - self.pk_cols().len()
     }
+    /// The PK column when the PK is exactly one column.
+    fn lone_pk_col(&self) -> Option<usize> {
+        match self.pk_cols() {
+            [c] => Some(*c as usize),
+            _ => None,
+        }
+    }
+    /// The digest a read request names its reply layout by: the PK list and every
+    /// column's type code. Nullability is not part of it.
+    fn layout_digest(&self) -> u64 {
+        gnitz_wire::layout_digest(self.pk_cols(), (0..self.num_columns()).map(|c| self.col_type_code(c)))
+    }
+    /// Same PK list and per-column type codes — what [`Self::layout_digest`]
+    /// digests. Nullability is not compared.
+    fn same_layout(&self, other: &dyn SchemaFacts) -> bool {
+        self.pk_cols() == other.pk_cols()
+            && self.num_columns() == other.num_columns()
+            && (0..self.num_columns()).all(|c| self.col_type_code(c) == other.col_type_code(c))
+    }
     /// Total encoded PK width — the PK region's per-row stride.
     fn pk_stride(&self) -> usize {
         self.pk_cols()

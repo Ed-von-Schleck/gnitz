@@ -5,6 +5,9 @@ use crate::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 /// Threshold for inline German String storage (bytes).
 pub const SHORT_STRING_THRESHOLD: usize = 12;
 
+/// Where a short cell's content starts: right after its `u32` length.
+pub const GERMAN_INLINE_OFF: usize = 4;
+
 /// Encode a byte slice as a 16-byte German String struct destined for a heap
 /// whose current end is `heap_off`, returning the cell and the bytes it spills
 /// there — empty while the value fits inline. Returning the spill rather than
@@ -30,7 +33,7 @@ pub(crate) fn encode_german_string_cell(s: &[u8], heap_off: usize) -> ([u8; 16],
         return (st, s);
     }
     // Prefix and suffix are one run: the whole value, inline.
-    st[4..4 + len].copy_from_slice(s);
+    st[GERMAN_INLINE_OFF..GERMAN_INLINE_OFF + len].copy_from_slice(s);
     (st, &[])
 }
 
@@ -71,7 +74,7 @@ pub fn blob_extent(blob_len: usize, heap_offset: u64, length: usize) -> Option<s
 pub fn german_string_inline(cell: &[u8]) -> Option<&[u8]> {
     let length = read_u32_le(cell, 0) as usize;
     if length <= SHORT_STRING_THRESHOLD {
-        Some(&cell[4..4 + length])
+        Some(&cell[GERMAN_INLINE_OFF..GERMAN_INLINE_OFF + length])
     } else {
         None
     }

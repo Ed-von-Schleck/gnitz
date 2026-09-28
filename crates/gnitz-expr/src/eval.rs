@@ -174,7 +174,7 @@ impl RowFilter {
         Ok(f)
     }
 
-    pub fn keeps_every_row(&self) -> bool {
+    pub(crate) fn keeps_every_row(&self) -> bool {
         self.pred.is_none() && self.walk.is_none()
     }
 
@@ -298,12 +298,12 @@ impl MapEval {
 
     /// Write the null words and computed columns of source rows
     /// `src_start..src_start + n` into `dst` rows from `dst_start`.
-    pub fn write_computed<T: MapTarget + ?Sized>(
+    pub fn write_computed(
         &mut self,
         src: &dyn BatchView,
         src_start: usize,
         n: usize,
-        dst: &mut T,
+        dst: &mut dyn MapTarget,
         dst_start: usize,
     ) {
         let emits = self.emits_anything();

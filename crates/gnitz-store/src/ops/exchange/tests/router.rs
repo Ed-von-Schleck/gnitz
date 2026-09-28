@@ -1,5 +1,6 @@
 use super::*;
 use crate::ops::group_key::GroupOutKey;
+use crate::schema::SchemaFacts;
 use crate::schema::{Placement, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
 use crate::test_support::{make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64};
 

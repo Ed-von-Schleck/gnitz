@@ -6,6 +6,7 @@
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 
+use gnitz_expr::{ColumnTable, SchemaFacts};
 use std::hint::black_box;
 
 use super::*;
@@ -124,7 +125,7 @@ fn hydrate_seek_bench() {
     let schema = engine.registry.relation(view).map(Relation::schema).unwrap();
     let key = ROWS / 2;
     let spec = ReadSpec::all_rows(ReadBound::Range(KeyRange::point(
-        PkColList::from_slice(schema.pk_indices()),
+        PkColList::from_slice(schema.pk_cols()),
         &[],
         key as u128,
     )));
@@ -299,7 +300,7 @@ fn hydrate_trace_probe_bench() {
 
     let schema = engine.registry.relation(join).map(Relation::schema).unwrap();
     let spec = ReadSpec::all_rows(ReadBound::Range(KeyRange::point(
-        PkColList::from_slice(schema.pk_indices()),
+        PkColList::from_slice(schema.pk_cols()),
         &[],
         scramble(ROWS / 2) as u128,
     )));

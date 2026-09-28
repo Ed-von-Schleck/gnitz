@@ -2,6 +2,7 @@
 //! routing-key helpers.
 
 use crate::schema::key::{locate_key_col, FoldCols, ReindexPacker};
+use crate::schema::ColumnTable;
 use crate::schema::Slot;
 use crate::schema::{worker_for_key, worker_for_pk_bytes};
 use crate::schema::{ColumnLocator, OpBuildErr, SchemaDescriptor};
@@ -81,7 +82,7 @@ impl ScatterKey {
     /// Refused when `schema` cannot route by `spec`: a column it has not got, or
     /// one the group key or a reindex key refuses.
     pub(super) fn new(spec: ScatterSpec<'_>, schema: &SchemaDescriptor) -> Result<Self, OpBuildErr> {
-        let pk = schema.pk_indices();
+        let pk = schema.pk_cols();
         Ok(match spec {
             ScatterSpec::GroupKey(cols) => GroupKey::new(schema, cols)?.into(),
             // Slots pack in slot order, so only the PK's leading columns in PK
