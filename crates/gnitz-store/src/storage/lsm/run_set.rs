@@ -25,6 +25,23 @@ pub(super) const FOLD_THRESHOLD: usize = 16;
 /// Rough bytes per row, used to size the bloom from a byte budget.
 const EST_BYTES_PER_ROW: usize = 40;
 
+/// A batch as a [`RunSet`] holds it: [`Batch::trimmed`], since the set charges
+/// only its rows' bytes.
+pub(super) struct TrimmedRun(Rc<Batch>);
+
+impl TrimmedRun {
+    pub(super) fn new(batch: Batch) -> Self {
+        TrimmedRun(Rc::new(batch.trimmed()))
+    }
+}
+
+impl std::ops::Deref for TrimmedRun {
+    type Target = Batch;
+    fn deref(&self) -> &Batch {
+        &self.0
+    }
+}
+
 pub(super) struct RunSet {
     runs: Vec<Rc<Batch>>,
     /// PK bloom over every live run, built on the first probe: a set that is
@@ -49,7 +66,7 @@ impl RunSet {
 
     /// Append a consolidated run, folding the set when it gets crowded. Empty
     /// runs are never stored, so `is_empty()` is exactly "no rows".
-    pub(crate) fn push(&mut self, run: Rc<Batch>, schema: &SchemaDescriptor) {
+    pub(crate) fn push(&mut self, TrimmedRun(run): TrimmedRun, schema: &SchemaDescriptor) {
         debug_assert!(
             run.consolidated_verified(schema),
             "RunSet::push requires a consolidated run",
@@ -120,7 +137,7 @@ impl RunSet {
                     widened.consolidated_verified(schema),
                     "widen_runs: the widened run must still be consolidated",
                 );
-                *run = Rc::new(widened);
+                *run = TrimmedRun::new(widened).0;
             }
             bytes += run.total_bytes();
         }
@@ -154,7 +171,7 @@ impl RunSet {
         }
         if merged.count > 0 {
             self.bytes = merged.total_bytes();
-            self.runs.push(Rc::new(merged));
+            self.runs.push(TrimmedRun::new(merged).0);
         } else {
             self.bytes = 0;
         }
@@ -169,9 +186,9 @@ impl RunSet {
     /// Fold to a single run and return it, **retained** — a consumer whose write
     /// fails leaves the data intact for retry, and clears the set itself once the
     /// run is safely elsewhere. `None` when the set is empty or fully cancelled.
-    pub(super) fn fold_to_single(&mut self, schema: &SchemaDescriptor) -> Option<Rc<Batch>> {
+    pub(super) fn fold_to_single(&mut self, schema: &SchemaDescriptor) -> Option<TrimmedRun> {
         self.fold(schema);
-        self.runs.first().map(Rc::clone)
+        self.runs.first().map(|run| TrimmedRun(Rc::clone(run)))
     }
 
     /// Bloom probe for a PK by its [`probe_key`] — derived by the caller,

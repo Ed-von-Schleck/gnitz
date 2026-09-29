@@ -36,9 +36,9 @@ enum BlobMode<'a> {
     /// through the ordinary equal-stride bulk copy.
     Verbatim,
     /// Relocate each cell's bytes into `output.blob` — else its heap offset
-    /// dangles once the source is dropped. `Some` deduplicates identical spans
-    /// across every column and row of one map; `None` relocates without dedup.
-    Relocate(Option<&'a mut crate::storage::BlobCache>),
+    /// dangles once the source is dropped. The cache deduplicates identical
+    /// spans across every column and row of one map.
+    Relocate(&'a mut crate::storage::BlobCache),
 }
 
 /// Average survivor-run length below which a computing map copies its survivors
@@ -169,7 +169,7 @@ fn copy_column(
                         &src_col[src_off..src_off + 16],
                         &in_batch.blob,
                         dst_blob,
-                        cache.as_deref_mut(),
+                        Some(&mut **cache),
                     );
                     let dst_off = (dst_base + i) * 16;
                     dst_col[dst_off..dst_off + 16].copy_from_slice(&cell);
@@ -212,8 +212,6 @@ pub struct MapPlan {
     ev: MapEval,
     /// Where the output PK region comes from.
     pk_source: PkSource,
-    /// Some copy carries a German-string column, so a cell can be relocated.
-    copies_a_string: bool,
     /// The input has German-string columns and every one is carried by a copy,
     /// so its heap holds no bytes the output would adopt dead.
     keeps_every_string: bool,
@@ -406,7 +404,6 @@ impl MapPlan {
         pk_source: PkSource,
     ) -> Result<Self, ExprValidateErr> {
         let ev = logical.resolve_map(in_schema, out_schema)?;
-        let copies_a_string = ev.copies().iter().any(|c| c.src.type_code().is_german_string());
         // A copy's source locator is exactly what `locate` gives for its column.
         let is_copied = |ci| {
             let loc = in_schema.locate(ci);
@@ -420,7 +417,6 @@ impl MapPlan {
         Ok(MapPlan {
             ev,
             pk_source,
-            copies_a_string,
             keeps_every_string,
             null_key_mask: 0,
             out_schema: *out_schema,
@@ -509,11 +505,7 @@ impl MapPlan {
         out.count = old + total;
 
         let shares_blob = out.shares_blob_with(&src.as_mem_batch());
-        // Worth a TLS pool pop only when some *copy* relocates a cell.
-        let mut cache = match self.copies_a_string && !shares_blob {
-            true => crate::storage::BlobCacheGuard::acquire(out.schema(), total),
-            false => crate::storage::BlobCacheGuard::empty(),
-        };
+        let mut cache = crate::storage::BlobCache::new(total);
         // For relocated copies and string emits alike.
         if out.schema().has_german_string() && !shares_blob && blob_cap != 0 {
             out.reserve_blob(blob_cap);
@@ -523,7 +515,7 @@ impl MapPlan {
             let w = RowWindow { src: start, dst, n: end - start };
             let blob = match shares_blob {
                 true => BlobMode::Verbatim,
-                false => BlobMode::Relocate(cache.get_mut()),
+                false => BlobMode::Relocate(&mut cache),
             };
             self.map_rows_into(src, out, w, blob);
             dst += w.n;

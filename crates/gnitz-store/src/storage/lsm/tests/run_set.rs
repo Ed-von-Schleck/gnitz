@@ -2,7 +2,7 @@ use super::*;
 use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64};
 
 fn push(set: &mut RunSet, schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) {
-    set.push(Rc::new(make_batch(schema, rows)), schema);
+    set.push(TrimmedRun::new(make_batch(schema, rows)), schema);
 }
 
 /// Probe by a narrow PK, deriving the filter key the way the production walk
@@ -36,7 +36,7 @@ fn fold_to_single_is_identity_for_one_run() {
     let original = Rc::clone(&set.runs()[0]);
 
     let folded = set.fold_to_single(&schema).expect("one run");
-    assert!(Rc::ptr_eq(&folded, &original), "singleton fold must not rewrite");
+    assert!(std::ptr::eq(&*folded, &*original), "singleton fold must not rewrite");
 }
 
 #[test]
@@ -45,7 +45,7 @@ fn empty_and_fully_cancelled_sets_fold_to_none() {
     let mut set = RunSet::new(1 << 20);
     assert!(set.fold_to_single(&schema).is_none(), "empty set");
 
-    set.push(Rc::new(make_batch(&schema, &[])), &schema);
+    set.push(TrimmedRun::new(make_batch(&schema, &[])), &schema);
     assert!(set.is_empty(), "a 0-row push stores no run");
 
     push(&mut set, &schema, &[(1, 1, 10)]);
@@ -125,7 +125,7 @@ fn lying_consolidated_run_is_rejected() {
 
     let mut bad = desc_two_row_batch(&schema);
     bad.set_layout_unchecked(crate::storage::Layout::Consolidated);
-    set.push(Rc::new(bad), &schema);
+    set.push(TrimmedRun::new(bad), &schema);
 }
 
 /// The same unsorted rows with the flags stripped (as the ingress strip
@@ -137,7 +137,7 @@ fn cleared_flags_unsorted_run_consolidates_ok() {
     push(&mut set, &schema, &[(5, 1, 50)]);
 
     let clean = desc_two_row_batch(&schema);
-    set.push(Rc::new(clean.into_consolidated(&schema)), &schema);
+    set.push(TrimmedRun::new(clean.into_consolidated(&schema)), &schema);
 
     let folded = set.fold_to_single(&schema).expect("three rows survive");
     assert_eq!(folded.count, 3);
@@ -172,7 +172,7 @@ fn reduce_output_folds_to_the_latest_aggregate() {
             b.extend_col(1, &av.to_le_bytes());
             b.count += 1;
         }
-        Rc::new(b.into_consolidated(&schema))
+        TrimmedRun::new(b.into_consolidated(&schema))
     };
 
     let mut set = RunSet::new(1 << 20);

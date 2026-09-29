@@ -388,8 +388,8 @@ fn batch_region_access() {
 /// clone owns its own buffers — dropping both must not double-free.
 #[test]
 fn drop_recycles_buffers() {
-    use crate::storage::repr::batch_pool::{acquire_buf, recycle_buf};
-    while acquire_buf().capacity() > 0 {}
+    use crate::storage::repr::batch_pool::drain_pool;
+    drain_pool();
 
     let schema = crate::test_support::make_schema_u64_i64();
     let batch = crate::test_support::make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
@@ -399,20 +399,68 @@ fn drop_recycles_buffers() {
     drop(batch);
     drop(cloned);
 
-    let mut found = false;
-    let mut drained = Vec::new();
-    loop {
-        let buf = acquire_buf();
-        if buf.capacity() == 0 {
-            break;
-        }
-        found |= buf.capacity() >= data_cap;
-        drained.push(buf);
+    assert!(
+        drain_pool().iter().any(|b| b.capacity() >= data_cap),
+        "pool should contain the recycled data buffer"
+    );
+}
+
+/// Rows dropped by `truncate_to` re-enter `[count, capacity)`, so a later read
+/// of a cell no refill wrote sees the poison, not the dropped row.
+#[cfg(debug_assertions)]
+#[test]
+fn truncate_to_poisons_dropped_rows() {
+    let schema = crate::test_support::make_schema_u64_i64();
+    let mut batch = crate::test_support::make_batch_raw(&schema, &[(1, 1, 10), (2, 1, 20)]);
+    batch.truncate_to(RowMark { count: 1, blob_len: 0 });
+    for r in 0..batch.arena_regions() {
+        let s = batch.strides[r] as usize;
+        let start = batch.offsets[r] + s;
+        assert!(
+            batch.data[start..start + s].iter().all(|&b| b == 0xA5),
+            "region {r} of the dropped row is not poisoned"
+        );
     }
-    assert!(found, "pool should contain the recycled data buffer");
-    for buf in drained {
-        recycle_buf(buf);
-    }
+}
+
+/// A batch whose buffers hold more than twice what its rows need comes back as
+/// a tight copy with its layout and blob identity; a tight one comes back as
+/// the same allocation.
+#[test]
+fn trimmed_copies_only_oversized_batches() {
+    let schema = crate::test_support::make_schema_u64_i64();
+    let src = crate::test_support::make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
+
+    let mut loose = Batch::with_capacity(&schema, 1000);
+    loose.append_batch(&src, 0, 1);
+    loose.certify_layout(Layout::Consolidated);
+    let (cap, blob_id) = (loose.data_capacity(), loose.blob_id);
+    let trimmed = loose.trimmed();
+    assert!(trimmed.data_capacity() < cap, "an oversized batch is copied down");
+    assert_eq!(trimmed.count, 1);
+    assert_eq!(trimmed.layout, Layout::Consolidated);
+    assert_eq!(trimmed.blob_id, blob_id);
+
+    let ptr = trimmed.data.as_ptr();
+    let again = trimmed.trimmed();
+    assert_eq!(again.data.as_ptr(), ptr, "a trimmed batch is not copied again");
+
+    let mut tight = Batch::with_capacity(&schema, 4);
+    tight.append_batch(&src, 0, 4);
+    let ptr = tight.data.as_ptr();
+    assert_eq!(
+        tight.trimmed().data.as_ptr(),
+        ptr,
+        "a batch filled to its capacity is kept"
+    );
+
+    // 1-byte columns pad each region to 8 bytes: a copy holding one row is
+    // still tight.
+    let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
+    cols.extend((0..6).map(|_| SchemaColumn::new(TypeCode::U8, false)));
+    let narrow = Batch::clone(&Batch::zeroed(&SchemaDescriptor::new(&cols, &[0]), 1));
+    let ptr = narrow.data.as_ptr();
+    assert_eq!(narrow.trimmed().data.as_ptr(), ptr, "a padded one-row copy is kept");
 }
 
 // ── Gather / widen: blob arms, layout propagation, empty shape ──────────
@@ -564,14 +612,14 @@ fn empty_constructors_carry_the_schema_pk_stride() {
 
 #[test]
 fn empty_batch_drop_is_noop() {
-    use crate::storage::repr::batch_pool::acquire_buf;
-    while acquire_buf().capacity() > 0 {}
+    use crate::storage::repr::batch_pool::drain_pool;
+    drain_pool();
 
     let batch = Batch::empty_with_schema(&crate::test_support::pk_only_schema(&[TypeCode::U64]));
     assert_eq!(batch.data_capacity(), 0);
     drop(batch);
 
-    assert_eq!(acquire_buf().capacity(), 0, "empty batch should not pollute pool");
+    assert!(drain_pool().is_empty(), "empty batch should not pollute pool");
 }
 
 // A long string (len > 12) whose blob offset lands past the empty arena reads

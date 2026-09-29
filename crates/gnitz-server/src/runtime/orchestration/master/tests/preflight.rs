@@ -91,11 +91,8 @@ fn probe_schema_carries_the_source_placement() {
     );
 }
 
-/// The check-batch allocation path with `BUF_POOL` as its only cache — what is
-/// left after the per-(target, key columns) batch pool in front of it was
-/// deleted. `Batch::drop` returns its arena at full capacity and
-/// `with_capacity` pops it straight back, so a steady cycle allocates nothing
-/// after the first round.
+/// The check-batch allocation path, each round over the arena the previous
+/// round's batch returned to the pool.
 ///
 /// `cd crates && cargo test -p gnitz-server --release check_batch_build_bench -- --ignored --nocapture --test-threads=1`
 #[test]
@@ -104,9 +101,6 @@ fn check_batch_build_bench() {
     use std::hint::black_box;
     use std::time::Instant;
 
-    // A realistic bulk probe: ~20k keys is the band the deleted pool's
-    // `MAX_RETAIN_BYTES` refused and its `POOL_BYPASS_BYTES` floor still served,
-    // i.e. exactly where the two caches could have differed.
     const ROWS: usize = 20_000;
     const ROUNDS: usize = 2_000;
 
@@ -117,8 +111,8 @@ fn check_batch_build_bench() {
     let schema = probe_schema(&SchemaDescriptor::new(&cols, &[0]));
     let keys: Vec<[u8; 8]> = (0..ROWS as u64).map(|i| i.to_be_bytes()).collect();
 
-    // One warm round, so the arena `BUF_POOL` hands out is already the right
-    // size and the timed loop measures the steady state.
+    // One warm round, so the pooled arena is already the right size and the
+    // timed loop measures the steady state.
     drop(build_check_batch_pk_bytes(&schema, keys.iter().map(|k| &k[..])));
 
     let t = Instant::now();

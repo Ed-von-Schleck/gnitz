@@ -6,7 +6,7 @@ use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::repr::batch::{Batch, REG_PAYLOAD_START};
 use crate::storage::repr::layout::Encoding;
 use crate::storage::repr::merge::ColumnarSource;
-use crate::storage::repr::merge::{run_merge, BlobCacheGuard};
+use crate::storage::repr::merge::{run_merge, BlobCache};
 use crate::storage::repr::shard_file::{self, region_dir, ShardWriteOpts};
 use crate::storage::repr::shard_reader::MappedShard;
 use crate::test_support::{make_batch_raw, make_schema_u64_i64, opk_pk, pk_payload_schema};
@@ -769,9 +769,9 @@ fn decode_diff_shard(path: &str, schema: &SchemaDescriptor) -> Vec<DecodedRow> {
 fn oracle_compact_row_at_a_time(input_files: &[&str], output_file: &str, schema: &SchemaDescriptor) {
     let shards = open_inputs(input_files, schema);
     let mut batch = Batch::with_capacity(schema, 1024);
-    let mut blob_cache = BlobCacheGuard::acquire(schema, 1024);
+    let mut blob_cache = BlobCache::new(1024);
     run_merge(&shards, schema, |src, row, w| {
-        batch.append_row_from_source(w, &shards[src], row, blob_cache.get_mut());
+        batch.append_row_from_source(w, &shards[src], row, Some(&mut blob_cache));
     });
     batch.write_as_shard(output_file, ShardWriteOpts::COMPACTION).unwrap();
 }
@@ -868,7 +868,7 @@ fn test_compact_columnar_matches_row_at_a_time() {
 // `run_merge` survivor stream per guard.
 
 /// Row-at-a-time multi-guard compaction, the routed oracle (one growable
-/// `Batch` + `BlobCacheGuard` per guard). Returns `Some(path)` per non-empty
+/// `Batch` + `BlobCache` per guard). Returns `Some(path)` per non-empty
 /// guard, `None` for an empty one.
 fn oracle_merge_and_route_row_at_a_time(
     input_files: &[&str],
@@ -879,11 +879,11 @@ fn oracle_merge_and_route_row_at_a_time(
     let shards = open_inputs(input_files, schema);
     let n = guard_keys.len();
     let mut batches: Vec<Batch> = (0..n).map(|_| Batch::with_capacity(schema, 256)).collect();
-    let mut blob_caches: Vec<BlobCacheGuard> = (0..n).map(|_| BlobCacheGuard::acquire(schema, 256)).collect();
+    let mut blob_caches: Vec<BlobCache> = (0..n).map(|_| BlobCache::new(256)).collect();
     run_merge(&shards, schema, |src, row, w| {
         let pk = shards[src].get_pk_bytes(row);
         let g = guard_slot(guard_keys, pk, PkBuf::pk_bytes);
-        batches[g].append_row_from_source(w, &shards[src], row, blob_caches[g].get_mut());
+        batches[g].append_row_from_source(w, &shards[src], row, Some(&mut blob_caches[g]));
     });
     (0..n)
         .map(|g| {

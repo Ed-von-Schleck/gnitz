@@ -48,8 +48,7 @@ pub fn op_reduce(
     let runs = shape.key.runs(delta);
 
     // A group emits at most its retraction and its new row.
-    let reserved = 2 * runs.len();
-    let mut out = Batch::with_capacity(output_schema, reserved);
+    let mut out = Batch::with_capacity(output_schema, 2 * runs.len());
     let mut accs = shape.acc_template.clone();
     let mut avi = plan.avi.as_ref().map(|bake| {
         let cursor = history.expect("a value-indexed reduce is handed a cursor over the index its plan describes");
@@ -115,11 +114,6 @@ pub fn op_reduce(
 
     gnitz_debug!("op_reduce: in={} groups={} out={}", delta.count, runs.len(), out.count);
 
-    // The output moves on with its allocation, so a batch that used under half its
-    // reservation is copied down to size.
-    if out.count < reserved / 2 {
-        out = Batch::clone(&out);
-    }
     out.certify_layout(Layout::Consolidated);
     out
 }

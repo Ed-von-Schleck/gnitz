@@ -63,7 +63,7 @@ fn test_relocate_german_string_vec_cache_hit_dedups() {
     src_cell[8..16].copy_from_slice(&0u64.to_le_bytes());
 
     let mut dst_blob: Vec<u8> = Vec::new();
-    let mut cache: BlobCache = BlobCache::default();
+    let mut cache = BlobCache::new(0);
 
     let r1 = relocate_german_string_vec(&src_cell, &src_blob, &mut dst_blob, Some(&mut cache));
     let after_first = dst_blob.len();
@@ -72,6 +72,59 @@ fn test_relocate_german_string_vec_cache_hit_dedups() {
     let r2 = relocate_german_string_vec(&src_cell, &src_blob, &mut dst_blob, Some(&mut cache));
     assert_eq!(dst_blob.len(), 20, "cache hit must not append a second copy");
     assert_eq!(&r1[8..16], &r2[8..16], "both calls must return the same offset");
+}
+
+#[test]
+fn prorated_blob_cap_is_the_rounded_up_share_within_the_heap() {
+    assert_eq!(prorated_blob_cap(1000, 100, 10), 100);
+    assert_eq!(
+        prorated_blob_cap(10, 100, 5),
+        5,
+        "a sub-byte share rounds up to a byte per row"
+    );
+    assert_eq!(prorated_blob_cap(100, 10, 20), 100, "never more than the whole heap");
+    assert_eq!(prorated_blob_cap(usize::MAX, 2, usize::MAX), usize::MAX, "no overflow");
+    assert_eq!(prorated_blob_cap(0, 10, 5), 0);
+    assert_eq!(prorated_blob_cap(10, 0, 5), 0);
+}
+
+/// A cache takes a pooled map only at its first relocation, and returns it on
+/// drop.
+#[test]
+fn blob_cache_takes_a_pooled_map_only_when_it_relocates() {
+    let pooled = || {
+        BLOB_CACHE_POOL.with(|p| {
+            let items = p.take();
+            let n = items.len();
+            p.set(items);
+            n
+        })
+    };
+    BLOB_CACHE_POOL.with(|p| {
+        p.set(VecDeque::from([SpanMap::with_capacity_and_hasher(
+            16,
+            Default::default(),
+        )]))
+    });
+
+    drop(BlobCache::new(8));
+    assert_eq!(pooled(), 1, "a cache that relocates nothing leaves the pool alone");
+
+    let payload: &[u8] = b"hello world test dat";
+    let mut src_cell = [0u8; 16];
+    src_cell[0..4].copy_from_slice(&20u32.to_le_bytes());
+    src_cell[4..8].copy_from_slice(&payload[0..4]);
+    let mut cache = BlobCache::new(8);
+    relocate_german_string_vec(&src_cell, payload, &mut Vec::new(), Some(&mut cache));
+    assert_eq!(pooled(), 0, "the first relocation takes the pooled map");
+    drop(cache);
+    assert_eq!(pooled(), 1, "drop returns it");
+
+    let mut widest = BlobCache::new(usize::MAX);
+    widest.map();
+    drop(widest);
+    assert_eq!(pooled(), 1, "a map reserved to the cap is still pooled");
+    BLOB_CACHE_POOL.with(|p| p.take());
 }
 
 use super::super::batch::{Batch, Layout};

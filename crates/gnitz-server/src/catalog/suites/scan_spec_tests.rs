@@ -487,7 +487,7 @@ fn huge_limit_does_not_truncate_the_early_stop() {
 /// [`ingest_fixture`] in one round, with `chunk_rows` pinning the sink's chunk
 /// size so a test can force the keeper to be reused across ≥2 chunks — the only
 /// way a stale-byte leak in the projection's tail writes would show, since the
-/// keeper arena grows `Fill::Uninit`.
+/// keeper arena grows into uninitialized memory.
 fn proj_fixture(
     name: &str,
     cols: &[CatalogColumn],

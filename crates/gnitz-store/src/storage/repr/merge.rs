@@ -13,6 +13,7 @@
 
 use std::cell::Cell;
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::ops::{ControlFlow, Range};
 
 use super::batch::{Batch, Layout};
@@ -107,32 +108,19 @@ pub(crate) fn mem_batch_to_unified<'a>(
     }
 }
 
-/// Identity-keyed dedup cache for `relocate_german_string_vec`, keyed by
-/// [`blob_span_key`]: the same source span is copied at most once, and the
-/// cached value is where it landed in the destination blob.
-pub(crate) type BlobCache = FxHashMap<(usize, usize, usize), usize>;
+type SpanKey = (usize, usize, usize);
+type SpanMap = FxHashMap<SpanKey, usize>;
 
 /// One source span, identified by the heap it lives in. Shared so a sizing pass
 /// charges exactly the spans a relocation copies.
 #[inline]
-pub(super) fn blob_span_key(src_blob: &[u8], start: usize, length: usize) -> (usize, usize, usize) {
+pub(super) fn blob_span_key(src_blob: &[u8], start: usize, length: usize) -> SpanKey {
     (src_blob.as_ptr() as usize, start, length)
 }
 
 /// Reserve hint for a destination heap taking `out_rows` of a `src_rows`-row
-/// source whose heap is `src_blob` bytes: that slice's row-proportional share.
-///
-/// Reserving the *whole* source heap per target instead would ask for N× the
-/// bytes any one of them can write, evicting pooled buffers and mallocing fresh
-/// above the recycle cap.
-///
-/// Rounds the per-row share up, so a source holding fewer heap bytes than rows
-/// still reserves a byte per row rather than nothing; computes the product in
-/// `u128`, so a large heap times a large row count cannot overflow into a small
-/// estimate; and clamps to `src_blob`, since no slice needs more than the whole
-/// heap. A hint only — every consumer grows on demand — so being off costs one
-/// realloc. An empty source heap asks for zero: the destination writes no heap
-/// bytes either.
+/// source whose heap is `src_blob` bytes: that slice's row-proportional share,
+/// rounded up, and at most the whole heap.
 pub(crate) fn prorated_blob_cap(src_blob: usize, src_rows: usize, out_rows: usize) -> usize {
     if src_blob == 0 || src_rows == 0 {
         return 0;
@@ -204,7 +192,7 @@ fn relocate_long_german_string(
     let off = match cache {
         Some(cache) => {
             let key = blob_span_key(src_blob, span.start, length);
-            *cache.entry(key).or_insert_with(|| {
+            *cache.map().entry(key).or_insert_with(|| {
                 dst_blob.extend_from_slice(&src_blob[span]);
                 new_offset
             })
@@ -219,69 +207,48 @@ fn relocate_long_german_string(
 }
 
 // ---------------------------------------------------------------------------
-// Blob cache: TLS-pooled map from a source long-string span to its offset in the
-// destination heap, used by `relocate_german_string_vec` to copy each span once.
-// Allocating the HashMap on every scan was hot in the profile; pool it across
-// calls and only acquire one when the schema actually contains a STRING column.
+// Blob cache
 // ---------------------------------------------------------------------------
 
-/// Don't recycle caches that grew beyond this many buckets — keeps idle pool
-/// memory bounded. Sized for typical merge fan-in of a few thousand unique
-/// long-string spans; oversized caches are dropped instead of pooled.
-const BLOB_CACHE_RECYCLE_CAP: usize = 65_536;
-
-/// Upper bound on the up-front `reserve` in [`BlobCacheGuard::acquire`].
-///
-/// The row count callers pass is an upper bound on *rows*, but only long
-/// (`> SHORT_STRING_THRESHOLD`) cells ever reach the map, so it wildly
-/// over-estimates the entry count on the whole-relation sizes `write_to_batch`
-/// is handed (a full scan passes its Σ-input row count). Reserving that far also
-/// pushes capacity past `BLOB_CACHE_RECYCLE_CAP`, so the cache is dropped instead
-/// of pooled — turning the pool into a guaranteed malloc/free per call. The map
-/// grows on demand past this, and the pool converges to the real working set.
+/// The most entries a [`BlobCache`] reserves up front. Callers pass a row count,
+/// but only long strings reach the map.
 const BLOB_CACHE_RESERVE_CAP: usize = 4096;
 
 thread_local! {
-    static BLOB_CACHE_POOL: Cell<Vec<BlobCache>> =
-        const { Cell::new(Vec::new()) };
+    static BLOB_CACHE_POOL: Cell<VecDeque<SpanMap>> = const { Cell::new(VecDeque::new()) };
 }
 
-/// RAII wrapper that returns a pooled blob cache only when the schema has at
-/// least one STRING column, and recycles it on drop.
-pub(crate) struct BlobCacheGuard(Option<BlobCache>);
+/// Dedups long-string spans relocated into one destination heap, so each is
+/// copied once. Its map is pooled, and taken at the first relocation.
+pub(crate) struct BlobCache {
+    map: Option<SpanMap>,
+    reserve: usize,
+}
 
-impl BlobCacheGuard {
-    /// `max_rows` is a sizing hint, clamped to [`BLOB_CACHE_RESERVE_CAP`] here so
-    /// no caller has to remember to bound it.
-    pub(crate) fn acquire(schema: &SchemaDescriptor, max_rows: usize) -> Self {
-        if schema.has_german_string() {
-            let mut cache = tls_pool::acquire(&BLOB_CACHE_POOL);
-            cache.reserve(max_rows.min(BLOB_CACHE_RESERVE_CAP));
-            Self(Some(cache))
-        } else {
-            Self(None)
+impl BlobCache {
+    pub(crate) fn new(rows: usize) -> Self {
+        BlobCache {
+            map: None,
+            reserve: rows.min(BLOB_CACHE_RESERVE_CAP),
         }
     }
 
-    /// A guard holding no cache — for callers that already decided the
-    /// relocate/dedup path is not needed (e.g. blob passthrough).
-    pub(crate) fn empty() -> Self {
-        Self(None)
-    }
-
-    pub(crate) fn get_mut(&mut self) -> Option<&mut BlobCache> {
-        self.0.as_mut()
+    pub(super) fn map(&mut self) -> &mut SpanMap {
+        let reserve = self.reserve;
+        self.map.get_or_insert_with(|| {
+            let mut map = tls_pool::take(&BLOB_CACHE_POOL, |_| true).unwrap_or_default();
+            map.reserve(reserve);
+            map
+        })
     }
 }
 
-impl Drop for BlobCacheGuard {
+impl Drop for BlobCache {
     fn drop(&mut self) {
-        if let Some(mut cache) = self.0.take() {
-            if cache.capacity() > BLOB_CACHE_RECYCLE_CAP {
-                return;
-            }
-            cache.clear();
-            tls_pool::recycle(&BLOB_CACHE_POOL, cache);
+        if let Some(mut map) = self.map.take() {
+            let bytes = map.capacity() * std::mem::size_of::<(SpanKey, usize)>();
+            map.clear();
+            tls_pool::recycle(&BLOB_CACHE_POOL, map, bytes);
         }
     }
 }
@@ -537,7 +504,7 @@ pub(crate) struct DirectWriter<'a> {
     /// Growable blob arena; capacity is reserved up-front by `write_to_batch`,
     /// and `blob.len()` doubles as the next-write offset.
     blob: &'a mut Vec<u8>,
-    blob_cache: BlobCacheGuard,
+    blob_cache: BlobCache,
     pub(super) count: usize,
     /// Borrowed, not owned: the scatter reads it per column, and a
     /// `SchemaDescriptor` is 360 bytes (pinned in `schema`) — copying it in would
@@ -603,7 +570,7 @@ impl<'a> DirectWriter<'a> {
             null_bmp,
             col_bufs,
             blob,
-            blob_cache: BlobCacheGuard::acquire(schema, rows),
+            blob_cache: BlobCache::new(rows),
             count: 0,
             schema,
         }
@@ -629,7 +596,7 @@ impl<'a> DirectWriter<'a> {
             null_bmp,
             col_bufs,
             blob,
-            blob_cache: BlobCacheGuard::acquire(schema, blob_cache_capacity),
+            blob_cache: BlobCache::new(blob_cache_capacity),
             count: 0,
             schema,
         }
@@ -641,7 +608,7 @@ impl<'a> DirectWriter<'a> {
     /// what carries the inline across that boundary.
     #[inline]
     pub(super) fn write_string_cell(&mut self, payload_col: usize, src_struct: &[u8], src_blob: &[u8], out_row: usize) {
-        let dest = relocate_german_string_vec(src_struct, src_blob, self.blob, self.blob_cache.get_mut());
+        let dest = relocate_german_string_vec(src_struct, src_blob, self.blob, Some(&mut self.blob_cache));
         let off = out_row * 16;
         self.col_bufs[payload_col][off..off + 16].copy_from_slice(&dest);
     }

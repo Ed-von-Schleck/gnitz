@@ -11,7 +11,7 @@ use std::rc::Rc;
 use super::batch::{
     write_to_batch, Batch, Layout, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
 };
-use super::batch_pool::{acquire_arena, Fill};
+use super::batch_pool::acquire_uninit;
 use super::layout::*;
 use super::merge::{prorated_blob_cap, should_relocate_blob, ColPtr, ColumnarSource, UnifiedSource};
 use super::scatter::DecodedColumns;
@@ -407,7 +407,8 @@ impl ColumnarSource for MappedShard {
                     PayloadRegion::Mapped(cp) => *cp,
                     PayloadRegion::Packed(p) => {
                         let w = p.elem_width;
-                        let mut column = acquire_arena(window.len() * w, Fill::Uninit);
+                        // SAFETY: `for_decode` writes every cell of `column`.
+                        let mut column = unsafe { acquire_uninit(window.len() * w) };
                         for_decode(self.mapped(p.image), p.bw, w, window.start, &mut column);
                         // Rebased so that row `window.start` reads the column's first cell.
                         ColPtr {

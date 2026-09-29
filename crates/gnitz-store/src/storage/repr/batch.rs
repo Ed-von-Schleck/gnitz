@@ -6,8 +6,8 @@
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::batch_pool::{acquire_arena, debug_poison, recycle_buf, Fill};
-use super::merge::{self, relocate_german_string_vec, BlobCache, BlobCacheGuard, ColPtr, MemBatch};
+use super::batch_pool::{acquire_arena, acquire_uninit, is_tight, recycle_buf};
+use super::merge::{self, relocate_german_string_vec, BlobCache, ColPtr, MemBatch};
 use crate::schema::key::NarrowPkOpk;
 use crate::schema::{ColumnLocator, SchemaDescriptor, SchemaFacts, DELTA_TICK_COL};
 use gnitz_expr::RowSource;
@@ -243,7 +243,9 @@ impl Batch {
             blob_id: next_blob_id(),
         };
         let total_size = compute_offsets_into(&strides, nr as usize, rows, &mut b.offsets);
-        b.data = acquire_arena(total_size, Fill::Uninit);
+        // SAFETY: a `Batch` reads no row at or past `count`, which is 0.
+        b.data = unsafe { acquire_uninit(total_size) };
+        b.debug_poison_rows(0..rows);
         b
     }
 
@@ -261,7 +263,7 @@ impl Batch {
     /// allocator. A heap already holding bytes has to grow in place.
     pub(crate) fn reserve_blob(&mut self, bytes: usize) {
         match self.blob.capacity() {
-            0 => self.blob = acquire_arena(bytes, Fill::Reserve),
+            0 => self.blob = acquire_arena(bytes),
             _ => self.blob.reserve(bytes),
         }
     }
@@ -302,12 +304,12 @@ impl Batch {
         let nr = nr as usize;
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
         let size = compute_offsets_into(&strides, nr, mb.count, &mut offsets);
-        let mut data = acquire_arena(size, Fill::Uninit);
-        // SAFETY: distinct allocations; `mb`'s regions hold `count × stride` bytes
-        // each (a `Batch` by construction, a wire view by its parse), and `data`
-        // is sized for `count` rows.
+        // SAFETY: `data` holds exactly `count` rows, all written by
+        // `copy_regions`; distinct allocations; `mb`'s regions hold `count ×
+        // stride` bytes each (a `Batch` by construction, a wire view by its parse).
+        let mut data = unsafe { acquire_uninit(size) };
         unsafe { copy_regions(mb.data, mb.offsets, &mut data, &offsets, &strides, REG_PK..nr, mb.count) };
-        let mut blob = acquire_arena(mb.blob.len(), Fill::Reserve);
+        let mut blob = acquire_arena(mb.blob.len());
         blob.extend_from_slice(mb.blob);
         Batch {
             data,
@@ -557,14 +559,10 @@ impl Batch {
         let new_total = compute_offsets_into(&self.strides, nr, new_cap, &mut new_offsets);
 
         if new_total > self.data.capacity() {
-            // Out-of-place grow.  Vec::reserve on a too-small buffer triggers
-            // realloc, which copies ALL old bytes to a new allocation (copy #1),
-            // then copy_within would shift regions to new offsets (copy #2).
-            // Bypass that by scatter-copying directly into a fresh buffer.
-            // Zeroing is not needed (`Uninit`): `copy_regions` fills every live
-            // byte, and all accessors are bounded by `count`.
-            let mut new_data = acquire_arena(new_total, Fill::Uninit);
-            // SAFETY: distinct allocations; both sides sized per compute_offsets_into.
+            // Each region lands at its new offset in one copy.
+            // SAFETY: `copy_regions` writes the `count` rows a `Batch` reads;
+            // distinct allocations; both sides sized per `compute_offsets_into`.
+            let mut new_data = unsafe { acquire_uninit(new_total) };
             unsafe {
                 copy_regions(
                     &self.data,
@@ -578,10 +576,9 @@ impl Batch {
             }
 
             let old_data = std::mem::replace(&mut self.data, new_data);
-            super::batch_pool::recycle_buf(old_data);
+            recycle_buf(old_data);
         } else {
-            // Vec already has sufficient capacity (e.g. cleared batch being
-            // refilled).  copy_within shifts regions in one pass.
+            // The arena has room already: shift each region to its new offset.
             unsafe {
                 self.data.set_len(new_total);
                 for i in (0..nr).rev() {
@@ -597,20 +594,22 @@ impl Batch {
                     }
                 }
             }
-            // The `set_len` above exposes `[capacity, new_cap)` of every region
-            // holding whatever the previous fill left there — the one capacity
-            // grow that does not run through `acquire_arena`. Poison it too, so
-            // the tripwire has no hole (see `debug_poison`).
-            if cfg!(debug_assertions) {
-                for (&start, &stride) in new_offsets[..nr].iter().zip(&self.strides[..nr]) {
-                    let live = start + self.count * stride as usize;
-                    let end = start + new_cap * stride as usize;
-                    debug_poison(&mut self.data[live..end]);
-                }
-            }
         }
         self.offsets = new_offsets;
         self.capacity = new_cap;
+        self.debug_poison_rows(self.count..new_cap);
+    }
+
+    /// In debug builds, fill `rows` of every region with `0xA5`, so reading a row
+    /// nothing wrote sees an implausible value rather than a plausible leftover.
+    fn debug_poison_rows(&mut self, rows: Range<usize>) {
+        if cfg!(debug_assertions) {
+            let nr = self.arena_regions();
+            for (&start, &s) in self.offsets[..nr].iter().zip(&self.strides[..nr]) {
+                let s = s as usize;
+                self.data[start + rows.start * s..start + rows.end * s].fill(0xA5);
+            }
+        }
     }
 
     /// The current row's `len` bytes of region `r`, growing first if the row is
@@ -882,16 +881,19 @@ pub(crate) struct AppendSession<'d> {
     /// source's blob is not already the destination's (a shared blob copies the
     /// 16-byte structs verbatim), which each push re-decides per source.
     mask: u64,
-    guard: BlobCacheGuard,
+    cache: BlobCache,
 }
 
 impl<'d> AppendSession<'d> {
-    /// The session holds a pooled blob dedup cache for its whole life, so
-    /// repeated long-string spans are appended once across every push.
+    /// The session's blob dedup cache lives as long as it does, so repeated
+    /// long-string spans are appended once across every push.
     pub(crate) fn open(dst: &'d mut Batch, hint_rows: usize) -> Self {
         let mask = string_mask(dst);
-        let guard = BlobCacheGuard::acquire(&dst.schema, hint_rows);
-        AppendSession { dst, mask, guard }
+        AppendSession {
+            dst,
+            mask,
+            cache: BlobCache::new(hint_rows),
+        }
     }
 
     /// Append rows `[start, end)` of `src`.
@@ -902,13 +904,13 @@ impl<'d> AppendSession<'d> {
     /// Append every listed range of `src`, in list order.
     pub(crate) fn push_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)]) {
         self.dst
-            .append_ranges_inner(src, ranges, self.mask, self.guard.get_mut());
+            .append_ranges_inner(src, ranges, self.mask, Some(&mut self.cache));
     }
 
     /// Append one row of `src` at an explicit weight, under the session's own
     /// blob dedup cache. A zero weight appends nothing.
     pub(crate) fn push_row<S: RowSource>(&mut self, src: &S, row: usize, weight: i64) {
-        self.dst.append_row_from_source(weight, src, row, self.guard.get_mut());
+        self.dst.append_row_from_source(weight, src, row, Some(&mut self.cache));
     }
 }
 
@@ -1011,6 +1013,7 @@ impl Batch {
     #[inline]
     pub(crate) fn truncate_to(&mut self, mark: RowMark) {
         debug_assert!(mark.count <= self.count && mark.blob_len <= self.blob.len());
+        self.debug_poison_rows(mark.count..self.count);
         self.count = mark.count;
         self.blob.truncate(mark.blob_len);
     }
@@ -1446,21 +1449,8 @@ impl Batch {
         if self.holds_nothing() {
             return;
         }
-        // data buffer stays allocated — capacity and offsets remain valid. The
-        // rows just dropped are the one way live batch bytes get re-exposed
-        // without passing through `acquire_arena` or `reserve_rows`, so poison
-        // them too: a refill that skips a cell must trip, not silently ship the
-        // previous fill's bytes (see `debug_poison`). Only the live prefix of
-        // each region — everything past `count` is already poisoned, and this
-        // runs per epoch on every VM delta register.
-        if cfg!(debug_assertions) {
-            let nr = self.arena_regions();
-            for (&start, &stride) in self.offsets[..nr].iter().zip(&self.strides[..nr]) {
-                debug_poison(&mut self.data[start..start + self.count * stride as usize]);
-            }
-        }
-        self.count = 0;
-        self.blob.clear();
+        // data buffer stays allocated — capacity and offsets remain valid.
+        self.truncate_to(RowMark { count: 0, blob_len: 0 });
         self.downgrade();
         self.blob_id = next_blob_id();
     }
@@ -1651,10 +1641,8 @@ impl Batch {
     /// consolidation slow path both entry points above share.
     ///
     /// The fold runs first so the arena is sized to the survivor count, not the
-    /// input row count: that is poison fill skipped in debug, and in release a
-    /// heavily-cancelling fold that stays under `POOL_BYPASS_BYTES` and is
-    /// recycled. Blob capacity is reserved, not zeroed, so the whole source heap
-    /// is a free bound.
+    /// input row count. Blob capacity is reserved, not zeroed, so the whole
+    /// source heap is a free bound.
     fn consolidate_into_new(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
         let mb = batch.as_mem_batch();
         let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(batch.count);
@@ -1665,6 +1653,17 @@ impl Batch {
         result
     }
 
+    /// `self`, or a tight copy when its buffers are not [`is_tight`] for its rows.
+    pub(crate) fn trimmed(self) -> Batch {
+        let mut offsets = [0usize; MAX_BATCH_REGIONS];
+        let need =
+            compute_offsets_into(&self.strides, self.arena_regions(), self.count, &mut offsets) + self.blob.len();
+        if is_tight(self.data.capacity() + self.blob.capacity(), need) {
+            return self;
+        }
+        Batch::clone(&self)
+    }
+
     #[cfg(test)]
     pub(crate) fn data_capacity(&self) -> usize {
         self.data.capacity()
@@ -1673,8 +1672,8 @@ impl Batch {
 
 impl Drop for Batch {
     fn drop(&mut self) {
-        super::batch_pool::recycle_buf(std::mem::take(&mut self.data));
-        super::batch_pool::recycle_buf(std::mem::take(&mut self.blob));
+        recycle_buf(std::mem::take(&mut self.data));
+        recycle_buf(std::mem::take(&mut self.blob));
     }
 }
 
@@ -1748,7 +1747,7 @@ pub(crate) fn write_to_batch(
     };
     b.count = rows;
     if b.blob.is_empty() {
-        super::batch_pool::recycle_buf(std::mem::take(&mut b.blob));
+        recycle_buf(std::mem::take(&mut b.blob));
     }
     b
 }

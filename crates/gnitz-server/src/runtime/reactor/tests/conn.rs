@@ -18,9 +18,9 @@ async fn owned_send(r: &Reactor, conn: &Rc<ClientConn>, payload: Vec<u8>) -> Res
 
 /// A pooled send buffer holding `bytes`.
 fn pooled(bytes: &[u8]) -> PooledBuf {
-    let mut b = gnitz_store::storage::acquire_buf();
-    b.extend_from_slice(bytes);
-    PooledBuf(b)
+    let mut b = PooledBuf::with_capacity(bytes.len());
+    b.0.extend_from_slice(bytes);
+    b
 }
 
 /// A send's carry: `body`, over a connection of its own.
@@ -275,7 +275,6 @@ fn send_owned_evicts_a_client_that_never_drains() {
 #[test]
 #[ignore]
 fn fanout_coalesced_egress_bench() {
-    use gnitz_store::storage::acquire_buf;
     use std::hint::black_box;
 
     const ITERS: usize = 3000;
@@ -309,12 +308,11 @@ fn fanout_coalesced_egress_bench() {
                     };
                     let run_coalesced = async || {
                         let t = Instant::now();
-                        let mut buf = acquire_buf();
-                        buf.reserve(total);
+                        let mut buf = PooledBuf::with_capacity(total);
                         for _ in 0..w {
-                            buf.extend_from_slice(&frame);
+                            buf.0.extend_from_slice(&frame);
                         }
-                        let _ = black_box(r2.send_owned(&conn, SendBody::Pooled(PooledBuf(buf))).await);
+                        let _ = black_box(r2.send_owned(&conn, SendBody::Pooled(buf)).await);
                         t.elapsed()
                     };
                     if i % 2 == 0 {

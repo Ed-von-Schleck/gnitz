@@ -14,7 +14,7 @@ use std::ops::Range;
 
 use crate::schema::key::{compare_pk_ordering, key_range_between_cuts, KeyCut, PkBuf};
 use crate::schema::{DerivedSchema, OpBuildErr, SchemaDescriptor, MAX_PK_BYTES};
-use crate::storage::{pk_group_end, pk_prefix_group_end, Batch, BlobCacheGuard, ReadCursor};
+use crate::storage::{pk_group_end, pk_prefix_group_end, Batch, BlobCache, ReadCursor};
 
 use gnitz_expr::RowSource;
 use gnitz_wire::{null_word_at, JoinKind, RangeRel, TypeCode};
@@ -266,7 +266,7 @@ pub fn op_join_delta_trace(
     };
 
     let mut output = Batch::with_capacity(out_schema, rows);
-    let mut cache = BlobCacheGuard::acquire(out_schema, rows);
+    let mut cache = BlobCache::new(rows);
 
     let mut emit = |rs: usize, re: usize, c: &ReadCursor| {
         let w_trace = c.current_weight;
@@ -294,8 +294,8 @@ pub fn op_join_delta_trace(
             output.begin_row(pk, w_out);
 
             let d_null = delta_mb.get_null_word(i);
-            output.append_payload_cols(d_slots.clone(), &delta_mb, i, cache.get_mut());
-            output.append_payload_cols(t_slots.clone(), t_src, t_row, cache.get_mut());
+            output.append_payload_cols(d_slots.clone(), &delta_mb, i, Some(&mut cache));
+            output.append_payload_cols(t_slots.clone(), t_src, t_row, Some(&mut cache));
             // Each half's null bits rebase onto the slot its columns landed at.
             output.commit_row(t_bits | null_word_at(d_null, d_slots.start));
         }

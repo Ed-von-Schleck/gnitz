@@ -15,7 +15,7 @@ use gnitz_wire::PkKeys;
 use super::manifest::Manifest;
 use super::read_cursor::{self, PkSetGather, ReadCursor};
 use super::run::{Run, StoredRow};
-use super::run_set::RunSet;
+use super::run_set::{RunSet, TrimmedRun};
 use super::shard_index::{ShardBudget, ShardIndex};
 use crate::schema::key::{pk_bytes_eq, pk_in_range, pk_ranges_overlap, probe_key, PkBuf};
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
@@ -337,7 +337,7 @@ impl Table {
             return Ok(());
         }
         self.cached_full_scan.set(None);
-        self.memtable.push(Rc::new(batch), &self.shard_index.schema);
+        self.memtable.push(TrimmedRun::new(batch), &self.shard_index.schema);
         if self.memtable.is_full() {
             self.fold_to_ram()?;
         }

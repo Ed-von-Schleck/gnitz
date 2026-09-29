@@ -3,15 +3,14 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use io_uring::types::FsyncFlags;
 
 use super::super::batch_fsync::{new_ring, sync_paths};
 use super::super::manifest::{self, Manifest};
+use super::super::run_set::TrimmedRun;
 use super::Table;
 use crate::storage::error::StorageError;
-use crate::storage::repr::batch::Batch;
 
 /// A publish [`Table::flush_prepare`] staged and [`flush_barrier`] completes.
 pub(super) struct FlushWork {
@@ -146,7 +145,7 @@ impl Table {
 
     /// Move the RAM tier's folded run to an unsynced L0 shard, then run the disk
     /// tier's upkeep.
-    fn spill_ram_tier(&mut self, run: Rc<Batch>) -> Result<(), StorageError> {
+    fn spill_ram_tier(&mut self, run: TrimmedRun) -> Result<(), StorageError> {
         self.shard_index.append_l0_run(&run)?;
         self.ram_tier.clear();
         // Free the spilled rows before compaction allocates.

@@ -1,6 +1,7 @@
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::repr::batch::REG_PK;
+use crate::storage::repr::batch_pool::tls_pool::MAX_POOLED_BYTES;
 use crate::storage::repr::layout::Encoding;
 use crate::storage::repr::shard_file::region_dir;
 use crate::storage::{BatchBuilder, Layout};
@@ -940,14 +941,14 @@ fn materialize_reserves_for_the_survivors() {
     let inserts = run(0, 1);
     let retracts = run(1, -1);
     let heap = inserts.blob.len() + retracts.blob.len();
-    assert!(heap > 2 * 1024 * 1024, "must exceed POOL_BYPASS_BYTES: {heap}");
+    assert!(heap > MAX_POOLED_BYTES, "must exceed MAX_POOLED_BYTES: {heap}");
 
     let batch = create_read_cursor(&[inserts, retracts], &[], schema).materialize();
     assert_eq!(batch.count, 1, "all but the first key cancels");
     assert_eq!(batch.blob.len(), 512, "one surviving string");
     assert!(
-        batch.blob.capacity() <= 2 * 1024 * 1024,
-        "the reservation must not cover the cancelled rows: {}",
+        batch.blob.capacity() <= MAX_POOLED_BYTES,
+        "the reservation must not cover the cancelled rows (MAX_POOLED_BYTES): {}",
         batch.blob.capacity(),
     );
 }
@@ -955,7 +956,7 @@ fn materialize_reserves_for_the_survivors() {
 /// The chunked drain's blob reservation stays O(chunk) as the drain advances.
 /// Prorating by the rows *remaining* would grow the per-row density every chunk,
 /// reaching the whole heap on the last — the peak `drain_chunk` exists to avoid.
-/// Observable because the pool retains nothing above `POOL_BYPASS_BYTES`.
+/// Observable because the pool retains nothing above `MAX_POOLED_BYTES`.
 #[test]
 fn drain_chunk_blob_reservation_stays_o_chunk() {
     let schema = make_schema_pk_u64_payload_string();
@@ -977,8 +978,8 @@ fn drain_chunk_blob_reservation_stays_o_chunk() {
     let (even, odd) = (run(0), run(1));
     let total_blob = even.blob.len() + odd.blob.len();
     assert!(
-        total_blob > 2 * 1024 * 1024,
-        "the whole heap must exceed POOL_BYPASS_BYTES for a whole-heap reservation to show: {total_blob}"
+        total_blob > MAX_POOLED_BYTES,
+        "the whole heap must exceed MAX_POOLED_BYTES for a whole-heap reservation to show: {total_blob}"
     );
 
     let mut cursor = create_read_cursor(&[even, odd], &[], schema);
@@ -987,8 +988,8 @@ fn drain_chunk_blob_reservation_stays_o_chunk() {
     while let Some(chunk) = cursor.drain_chunk(CHUNK) {
         rows += chunk.count;
         assert!(
-            chunk.blob.capacity() <= 2 * 1024 * 1024,
-            "chunk reserved {} blob bytes of a {total_blob}-byte relation",
+            chunk.blob.capacity() <= MAX_POOLED_BYTES,
+            "chunk reserved {} blob bytes of a {total_blob}-byte relation (MAX_POOLED_BYTES)",
             chunk.blob.capacity(),
         );
     }

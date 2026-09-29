@@ -12,7 +12,7 @@ use std::mem::MaybeUninit;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gnitz_store::storage::{acquire_buf, PooledBuf};
+use gnitz_store::storage::PooledBuf;
 
 use crate::runtime::reactor::{
     chan, AsyncRwLock, ClientConn, PeerGone, Reactor, RecvEnd, RecvFilter, RecvQueue, SendBody, WriteGuard,
@@ -20,6 +20,12 @@ use crate::runtime::reactor::{
 
 /// Size of the ciphertext window each recv lands in.
 const CIPHER_WINDOW_BYTES: usize = 64 * 1024;
+
+/// The most plaintext one TLS record carries.
+const TLS_MAX_FRAGMENT: usize = 16 * 1024;
+/// A TLS 1.2 AEAD record's bytes beyond its plaintext: header, explicit nonce,
+/// tag.
+const TLS_RECORD_OVERHEAD: usize = 5 + 8 + 16;
 
 /// Feed one socket chunk of ciphertext through rustls, enqueueing the plaintext
 /// frames it yields on `q`.
@@ -92,9 +98,11 @@ impl TlsShared {
     }
 
     /// Send everything rustls has queued. Callers hold `send_lock`, which is
-    /// what keeps records in emission order.
-    async fn flush_records(&self, _: &WriteGuard) -> Result<(), PeerGone> {
-        let mut out = PooledBuf(acquire_buf());
+    /// what keeps records in emission order. `plaintext`, the bytes handed to
+    /// rustls since the last flush, sizes the buffer.
+    async fn flush_records(&self, _: &WriteGuard, plaintext: usize) -> Result<(), PeerGone> {
+        let records = plaintext.div_ceil(TLS_MAX_FRAGMENT);
+        let mut out = PooledBuf::with_capacity(plaintext + records * TLS_RECORD_OVERHEAD);
         {
             let mut sess = self.state.borrow_mut();
             while sess.wants_write() {
@@ -106,7 +114,7 @@ impl TlsShared {
 
     async fn flush_queued(&self) {
         let send = self.send_lock.write().await;
-        let _ = self.flush_records(&send).await;
+        let _ = self.flush_records(&send, 0).await;
     }
 
     /// Encrypt and send `body` under one `send_lock` hold; rustls sizes the chunks.
@@ -114,6 +122,7 @@ impl TlsShared {
         let send = self.send_lock.write().await;
         let len = body.bytes().len();
         let mut off = 0;
+        let mut flushed = 0;
         while off < len {
             {
                 let mut sess = self.state.borrow_mut();
@@ -133,11 +142,12 @@ impl TlsShared {
             if off == len {
                 break;
             }
-            self.flush_records(&send).await?;
+            self.flush_records(&send, off - flushed).await?;
+            flushed = off;
         }
         // rustls holds every byte now: release the body — a W2M slot — before the send.
         drop(body);
-        self.flush_records(&send).await
+        self.flush_records(&send, off - flushed).await
     }
 }
 

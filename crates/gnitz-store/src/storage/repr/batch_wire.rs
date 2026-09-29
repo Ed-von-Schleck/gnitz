@@ -2,8 +2,8 @@
 //! WAL-block decoding with the validation it runs.
 
 use super::batch::{strides_from_schema, string_mask, Batch, MAX_BATCH_REGIONS, REG_PK};
-use super::batch_pool::{acquire_arena, recycle_buf, Fill};
-use super::merge::{blob_span_key, prorated_blob_cap, BlobCache, BlobCacheGuard, DirectWriter, MemBatch};
+use super::batch_pool::{acquire_arena, recycle_buf};
+use super::merge::{blob_span_key, prorated_blob_cap, BlobCache, DirectWriter, MemBatch};
 use crate::schema::{SchemaDescriptor, SchemaFacts};
 use gnitz_wire::wal;
 use gnitz_wire::Regions;
@@ -116,12 +116,11 @@ impl Batch {
     ) -> usize {
         let slope = row_width(self.strides());
         let base = overhead + wal::WAL_HEADER_SIZE;
-        let mut guard = BlobCacheGuard::acquire(self.schema(), rows.len());
-        let seen = guard.get_mut().expect("a German-string column implies a blob cache");
+        let mut seen = BlobCache::new(rows.len());
         let mut heap = 0usize;
         let mut fit = 0usize;
         for row in rows {
-            let row_heap = heap + self.row_heap_cost(row, slots, seen);
+            let row_heap = heap + self.row_heap_cost(row, slots, &mut seen);
             // The first row goes in whatever it costs; a frame carries whole rows.
             if fit > 0 && base + (fit + 1) * slope + row_heap > budget {
                 break;
@@ -141,7 +140,11 @@ impl Batch {
                 continue;
             };
             let len = span.end - span.start;
-            if seen.insert(blob_span_key(&self.blob, span.start, len), 0).is_none() {
+            if seen
+                .map()
+                .insert(blob_span_key(&self.blob, span.start, len), 0)
+                .is_none()
+            {
                 cost += len;
             }
         }
@@ -199,10 +202,7 @@ impl Batch {
             0 => 0,
             _ => prorated_blob_cap(self.blob.len(), self.count, count),
         };
-        let mut heap = match cap {
-            0 => Vec::new(),
-            _ => acquire_arena(cap, Fill::Reserve),
-        };
+        let mut heap = acquire_arena(cap);
         let mut writer = DirectWriter::over_regions(
             &mut out[..heap_at],
             &offsets,
