@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::BatchBuilder;
 use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64};
 
 fn push(set: &mut RunSet, schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) {
@@ -163,15 +164,14 @@ fn reduce_output_folds_to_the_latest_aggregate() {
         &[0],
     );
     let make = |rows: &[(u128, i64, i64, i64)]| {
-        let mut b = Batch::with_capacity(&schema, rows.len().max(1));
+        let mut b = BatchBuilder::new(schema);
         for &(pk, w, gv, av) in rows {
-            b.extend_pk(pk);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &gv.to_le_bytes());
-            b.extend_col(1, &av.to_le_bytes());
-            b.count += 1;
+            b.begin_row(pk, w);
+            b.put_int(gv as u128);
+            b.put_int(av as u128);
+            b.end_row();
         }
+        let b = b.finish();
         TrimmedRun::new(b.into_consolidated(&schema))
     };
 

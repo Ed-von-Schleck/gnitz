@@ -2,7 +2,6 @@
 //! application, delta capture, and the flush / checkpoint table collection.
 
 use super::{Relation, RelationKind, RelationRegistry, SecondaryIndex, Store};
-use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, StorageError, Table};
 
 /// `GNITZ_INJECT_INGEST_APPLY_ERROR=store|index`: report `Err(Io)` from the
@@ -120,22 +119,22 @@ impl RelationRegistry {
         if kind == RelationKind::Stream {
             return Ok(needed.then_some(batch));
         }
-        let effective = match kind.is_base_table() {
-            true => super::unique_pk::enforce_unique_pk(entry.store.held(), batch),
-            false => batch,
+        let effective = match kind {
+            RelationKind::BaseTable => super::unique_pk::enforce_unique_pk(entry.store.held(), batch),
+            // Folded once for the store, the delta capture and every reader of the
+            // echo, which all read a view's output at net weights.
+            RelationKind::View(_) => batch.into_consolidated(entry.store.schema()),
+            RelationKind::SystemCatalog | RelationKind::Stream => batch,
         };
         if effective.count == 0 {
             return Ok(needed.then_some(effective));
         }
 
-        let capture: Option<(SchemaDescriptor, u64)> = entry.delta.as_deref().map(|t| *t.schema()).zip(round);
-        // Folded once for both: a round keeps one net weight per element, and the
-        // store then takes that fold by value instead of folding its own copy.
-        let folded = capture.and_then(|_| Batch::consolidate_if_needed(&effective, entry.store.schema()));
-        let pending = capture.map(|(delta_schema, r)| {
-            let src = folded.as_ref().unwrap_or(&effective);
-            (src.stamped_with_pk_prefix(&delta_schema, r), r)
-        });
+        let pending = entry
+            .delta
+            .as_deref()
+            .zip(round)
+            .map(|(feed, r)| (effective.stamped_with_pk_prefix(feed.schema(), r), r));
 
         for ix in entry.indexes.iter_mut() {
             let cols = ix.cols;
@@ -153,10 +152,9 @@ impl RelationRegistry {
         }
 
         let store = entry.store.held_mut();
-        let (res, echo) = match folded {
-            Some(f) => (store.ingest_owned_batch(f), needed.then_some(effective)),
-            None if needed => (store.ingest_borrowed_batch(&effective), Some(effective)),
-            None => (store.ingest_owned_batch(effective), None),
+        let (res, echo) = match needed {
+            true => (store.ingest_borrowed_batch(&effective), Some(effective)),
+            false => (store.ingest_owned_batch(effective), None),
         };
         inject_ingest_apply_error("store", kind, res).map_err(|e| format!("ingest into relation {id}: {e}"))?;
 

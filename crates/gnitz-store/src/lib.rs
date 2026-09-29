@@ -8,7 +8,7 @@
 //! graph, not a comment: nothing here can name anything there, and nothing links
 //! what is there.
 //!
-//! The six public module roots below are the API. They form a layer ladder,
+//! The public module roots below are the API. They form a layer ladder,
 //! each naming only those beneath it — `tests/rungs.rs` states that table and
 //! enforces it. The submodules under each root are private; what a root
 //! re-exports is what it publishes, plus `schema::key`, named as a
@@ -39,12 +39,6 @@ pub mod relation;
 pub mod schema;
 pub mod storage;
 
-// Public only because the seam needs it: `gnitz-server`'s compiler and VM name
-// `MapPlan` and its siblings, and `read` is on this side of the crate boundary
-// while they are not. A consumer that needs the expression *language* names
-// `gnitz-expr`, the crate.
-pub mod expr;
-
 #[cfg(test)]
 mod test_rng;
 
@@ -58,9 +52,9 @@ mod rung_tests;
 #[path = "tests/row_count.rs"]
 mod row_count_tests;
 
-// `test_support::shared` is compiled here, as the whole of `gnitz-store-testkit`,
-// and again inside `gnitz-server` — all from one source, which spells every path
-// `gnitz_store::`. This alias is what makes those paths resolve in this crate.
+// `test_support::shared` is compiled here and again as `gnitz-store-testkit` —
+// from one source, which spells every path `gnitz_store::`. This alias is what
+// makes those paths resolve in this crate.
 #[cfg(test)]
 extern crate self as gnitz_store;
 #[cfg(test)]

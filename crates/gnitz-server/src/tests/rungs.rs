@@ -2,7 +2,7 @@
 //! the two lower rungs can end the process.
 //!
 //! The crate graph cannot enforce either — the three rungs are one crate. The
-//! walk is `test_support::ladder`, shared with `gnitz-store`'s own guard; what
+//! walk is `gnitz-store-testkit`'s, shared with `gnitz-store`'s own guard; what
 //! is stated here is only this crate's table.
 
 use std::fs;

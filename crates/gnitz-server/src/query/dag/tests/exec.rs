@@ -170,7 +170,7 @@ impl DriveHost for Recorder<'_> {
         (&mut self.cat.dag, &mut self.cat.registry)
     }
 
-    fn exchange(&mut self, _view_id: u64, batch: Cow<'_, Batch>, _spec: Option<ScatterSpec<'_>>) -> Batch {
+    fn exchange(&mut self, _view_id: u64, batch: Cow<'_, Batch>, _plan: Option<&ScatterPlan>, _fold: bool) -> Batch {
         self.sent.push(batch.len());
         batch.into_owned()
     }
@@ -178,7 +178,7 @@ impl DriveHost for Recorder<'_> {
 
 /// A side whose output every worker holds whole never reaches the host: each
 /// rank keeps its own share, and the ranks' shares partition the output. Any
-/// other side's output runs a round.
+/// other side's output runs a round, an empty one included.
 #[test]
 fn a_replica_sides_output_is_shared_without_a_round() {
     let rows: Vec<(u64, i64, i64)> = (1..=16).map(|k| (k, 1, k as i64 * 10)).collect();
@@ -195,21 +195,31 @@ fn a_replica_sides_output_is_shared_without_a_round() {
             .unwrap();
 
         let delta = delta_for(&engine, t, &rows);
-        let relay = Relay {
-            view_id: 99,
-            elide: false,
-            shard_cols: Box::from([0u32]),
-        };
+        let plan = std::rc::Rc::new(ScatterPlan::group(delta.schema(), &[0]).unwrap());
         let mut host = Recorder { cat: &mut engine, sent: Vec::new() };
-        let share = relay.round(&mut host, Batch::clone(&delta), true).unwrap();
+        let share = relay(
+            &mut host,
+            99,
+            Cow::Borrowed(&delta),
+            Some(&Relay::Share(plan.clone())),
+            false,
+        );
         assert!(host.sent.is_empty(), "rank {rank}: a replica's share runs no round");
         shares.extend((0..share.len()).map(|i| share.get_pk(i) as u64));
 
-        relay.round(&mut host, delta, false).unwrap();
+        let empty = Batch::empty_with_schema(delta.schema());
+        relay(
+            &mut host,
+            99,
+            Cow::Owned(delta),
+            Some(&Relay::Round(plan.clone())),
+            false,
+        );
+        relay(&mut host, 99, Cow::Owned(empty), Some(&Relay::Round(plan)), false);
         assert_eq!(
             host.sent,
-            vec![rows.len()],
-            "rank {rank}: any other output runs a round"
+            vec![rows.len(), 0],
+            "rank {rank}: any other output runs a round, even an empty one"
         );
     }
     shares.sort_unstable();

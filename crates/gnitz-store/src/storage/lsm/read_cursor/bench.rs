@@ -11,6 +11,7 @@
 use super::tests::{adv_assert_cursor_oracle, adv_key, write_test_shard};
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::storage::BatchBuilder;
 use crate::storage::Layout;
 use crate::test_support::{make_schema_u128_i64, make_schema_u64_i64, wide_pk_3xu64_schema};
 use std::rc::Rc;
@@ -361,14 +362,13 @@ fn adv_build_interleaved_shards(
 /// tier of the leaf gallop, whose `get_pk_bytes` leaf differs from the shard mmap.
 fn adv_build_batch_dense(schema: SchemaDescriptor, count: usize) -> Rc<Batch> {
     let stride = schema.pk_stride();
-    let mut b = Batch::with_capacity(&schema, count.max(1));
+    let mut b = BatchBuilder::new(schema);
     for i in 0..count {
-        b.extend_pk_bytes(&adv_key(i as u64, stride)[..stride]);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &0i64.to_le_bytes());
-        b.count += 1;
+        b.begin_row_bytes(&adv_key(i as u64, stride)[..stride], 1i64);
+        b.put_int(0);
+        b.end_row();
     }
+    let mut b = b.finish();
     b.certify_layout(Layout::Consolidated);
     Rc::new(b)
 }
@@ -377,14 +377,13 @@ fn adv_build_batch_dense(schema: SchemaDescriptor, count: usize) -> Rc<Batch> {
 /// the caller), OPK-encoding each PK. The delta source of the `Multi` fixture.
 fn adv_build_batch_rows(schema: SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Rc<Batch> {
     let stride = schema.pk_stride();
-    let mut b = Batch::with_capacity(&schema, rows.len().max(1));
+    let mut b = BatchBuilder::new(schema);
     for &(pk, w, v) in rows {
-        b.extend_pk_bytes(&adv_key(pk, stride)[..stride]);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &v.to_le_bytes());
-        b.count += 1;
+        b.begin_row_bytes(&adv_key(pk, stride)[..stride], w);
+        b.put_int(v as u128);
+        b.end_row();
     }
+    let mut b = b.finish();
     b.certify_layout(Layout::Consolidated);
     Rc::new(b)
 }

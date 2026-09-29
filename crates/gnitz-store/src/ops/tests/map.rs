@@ -3,24 +3,24 @@ use gnitz_expr::{ExprValidateErr, LogicalProgram, Reg, Sink};
 use super::{MapPlan, PkSource};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_COLUMNS};
 use crate::storage::Batch;
+use crate::storage::BatchBuilder;
 
 /// Build a `Batch` of `(pk, weight, null_word, payload i64 cells)` rows against
 /// `schema` — the engine-side physical batch these tests drive [`MapPlan`]
 /// with, as opposed to the owned-buffer view `gnitz-expr`'s own tests use.
 fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u64, &[i64])]) -> Batch {
-    let mut batch = Batch::with_capacity(schema, rows.len().max(1));
+    let mut batch = BatchBuilder::new(*schema);
     for &(pk, weight, null_word, cols) in rows {
-        batch.extend_pk(pk as u128);
-        batch.extend_weight(&weight.to_le_bytes());
-        batch.extend_null_bmp(&null_word.to_le_bytes());
+        batch.begin_row(pk as u128, weight);
         for (pi, _col) in schema.payload_columns() {
-            if pi < cols.len() {
-                batch.extend_col(pi, &cols[pi].to_le_bytes());
+            match null_word >> pi & 1 {
+                1 => batch.put_null(),
+                _ => batch.put_int(cols[pi] as u128),
             }
         }
-        batch.count += 1;
+        batch.end_row();
     }
-    batch
+    batch.finish()
 }
 
 fn make_schema(pk_index: u32, col_types: &[TypeCode]) -> SchemaDescriptor {
@@ -91,25 +91,19 @@ fn test_empty_batch() {
 
 #[test]
 fn test_map_blob_passthrough_and_fallback() {
-    // German-string struct: short (≤12 bytes) inline, else heap-backed.
-    fn push_gs(b: &mut Batch, pi: usize, s: &[u8]) {
-        b.extend_col_blob(pi, s);
-    }
     // Input: [U64 PK, STRING s1 (short inline), STRING s2 (long, heap-backed)].
     fn build(schema: &SchemaDescriptor) -> Batch {
-        let mut b = Batch::with_capacity(schema, 2);
+        let mut b = BatchBuilder::new(*schema);
         for (pk, s1, s2) in [
             (1u128, b"ab".as_slice(), b"long-string-one-xyz".as_slice()),
             (2u128, b"cd".as_slice(), b"long-string-two-abcdef".as_slice()),
         ] {
-            b.extend_pk(pk);
-            b.extend_weight(&1i64.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            push_gs(&mut b, 0, s1); // payload idx 0 = s1
-            push_gs(&mut b, 1, s2); // payload idx 1 = s2
-            b.count += 1;
+            b.begin_row(pk, 1);
+            b.put_blob(s1);
+            b.put_blob(s2);
+            b.end_row();
         }
-        b
+        b.finish()
     }
 
     let in_schema = make_schema(0, &[TypeCode::U64, TypeCode::String, TypeCode::String]);
@@ -187,12 +181,11 @@ fn test_map_pk_copy_col_u128_and_signed_i64() {
 
     let pk0: u128 = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210;
     let pk1: i64 = -5; // negative: exercises the OPK sign-bit flip on decode
-    let mut batch = Batch::with_capacity(&in_schema, 1);
-    batch.extend_pk_opk(&[pk0, pk1 as u64 as u128]);
-    batch.extend_weight(&1i64.to_le_bytes());
-    batch.extend_null_bmp(&0u64.to_le_bytes());
-    batch.extend_col(0, &42i64.to_le_bytes());
-    batch.count += 1;
+    let mut batch = BatchBuilder::new(in_schema);
+    batch.begin_row_opk(&[pk0, pk1 as u64 as u128], 1i64);
+    batch.put_int(42);
+    batch.end_row();
+    let batch = batch.finish();
 
     let prog = LogicalProgram::copy_cols(&[
         0, // PK col 0 (U128) → payload 0
@@ -250,13 +243,12 @@ fn test_map_copy_col_widens_into_promoted_slot() {
     );
 
     let (c0, c1, c2, c3): (u16, i16, i8, u8) = (0xBEEF, -300, -7, 0xFE);
-    let mut batch = Batch::with_capacity(&in_schema, 1);
-    batch.extend_pk_opk(&[c0 as u128, c1 as u16 as u128]);
-    batch.extend_weight(&1i64.to_le_bytes());
-    batch.extend_null_bmp(&0u64.to_le_bytes());
-    batch.extend_col(0, &c2.to_le_bytes());
-    batch.extend_col(1, &c3.to_le_bytes());
-    batch.count += 1;
+    let mut batch = BatchBuilder::new(in_schema);
+    batch.begin_row_opk(&[c0 as u128, c1 as u16 as u128], 1i64);
+    batch.put_int(c2 as u128);
+    batch.put_int(c3 as u128);
+    batch.end_row();
+    let batch = batch.finish();
 
     let prog = LogicalProgram::copy_cols(&[
         0, // U16 PK  → zero-extend
@@ -333,17 +325,15 @@ fn test_from_predicate_filter_ranges_over_a_batch() {
 /// A batch of `(pk, string cells)` rows: one STRING payload column per entry
 /// of `cells`, encoded through the blob heap the map must relocate or share.
 fn make_string_batch(schema: &SchemaDescriptor, rows: &[&[&[u8]]]) -> Batch {
-    let mut batch = Batch::with_capacity(schema, rows.len().max(1));
+    let mut batch = BatchBuilder::new(*schema);
     for (row, cells) in rows.iter().enumerate() {
-        batch.extend_pk(row as u128 + 1);
-        batch.extend_weight(&1i64.to_le_bytes());
-        batch.extend_null_bmp(&0u64.to_le_bytes());
+        batch.begin_row(row as u128 + 1, 1);
         for (pi, _col) in schema.payload_columns() {
-            batch.extend_col_blob(pi, cells[pi]);
+            batch.put_blob(cells[pi]);
         }
-        batch.count += 1;
+        batch.end_row();
     }
-    batch
+    batch.finish()
 }
 
 /// A map whose *only* computed column is a string. The compute kernel is
@@ -462,7 +452,7 @@ fn null_string_emit_zeroes_the_cell_and_sets_the_bit() {
 
 #[test]
 fn map_with_pack_pk_source_promotes_payload_to_pk() {
-    use crate::schema::key::ReindexPacker;
+    use crate::ops::reindex::ReindexPacker;
     use crate::test_support::{make_batch, make_schema_u64_i64};
     // `PkSource::Pack` rewrites the output PK by reading the referenced
     // column through the reindex packer. Verifies (1) every row's output PK
@@ -534,18 +524,18 @@ fn hash_row_keys_a_row_by_its_content_across_nulls_strings_and_blobs() {
     ];
 
     let in_schema = make_schema(0, &[TypeCode::U64, TypeCode::I64, TypeCode::String, TypeCode::Blob]);
-    let mut batch = Batch::with_capacity(&in_schema, rows.len());
+    let mut batch = BatchBuilder::new(in_schema);
     for (row, &(v, is_null, s, b)) in rows.iter().enumerate() {
-        batch.extend_pk(row as u128);
-        batch.extend_weight(&1i64.to_le_bytes());
-        // Bit 0 is payload slot 0 — the I64 column.
-        batch.extend_null_bmp(&(is_null as u64).to_le_bytes());
-        batch.extend_col(0, &v.to_le_bytes());
-        for (pi, content) in [(1, s), (2, b)] {
-            batch.extend_col_blob(pi, content);
+        batch.begin_row(row as u128, 1);
+        match is_null {
+            true => batch.put_null(),
+            false => batch.put_int(v as u128),
         }
-        batch.count += 1;
+        batch.put_blob(s);
+        batch.put_blob(b);
+        batch.end_row();
     }
+    let batch = batch.finish();
 
     // The hash-row output schema: one synthetic U128 PK, then the payload.
     let out_schema = make_schema(0, &[TypeCode::U128, TypeCode::I64, TypeCode::String, TypeCode::Blob]);
@@ -621,14 +611,13 @@ fn a_compound_permuted_pk_decodes_at_every_width() {
         [-1, 40_000, -1, u64::MAX as i128, -1],
         [i8::MAX as i128, u16::MAX as i128, i32::MAX as i128, 1, i128::MAX],
     ];
-    let mut batch = Batch::with_capacity(&in_schema, rows.len());
+    let mut batch = BatchBuilder::new(in_schema);
     for vals in &rows {
         let natives: Vec<u128> = pk_order.iter().map(|&ci| vals[ci as usize] as u128).collect();
-        batch.extend_pk_opk(&natives);
-        batch.extend_weight(&1i64.to_le_bytes());
-        batch.extend_null_bmp(&0u64.to_le_bytes());
-        batch.count += 1;
+        batch.begin_row_opk(&natives, 1i64);
+        batch.end_row();
     }
+    let batch = batch.finish();
 
     let mut plan = MapPlan::from_map(
         LogicalProgram::copy_cols(&[0, 1, 2, 3, 4]),
@@ -668,7 +657,7 @@ fn a_compound_permuted_pk_decodes_at_every_width() {
 #[test]
 #[ignore]
 fn map_ranges_bench() {
-    use crate::schema::key::ReindexPacker;
+    use crate::ops::reindex::ReindexPacker;
     use gnitz_expr::{IntArithOp, LogicalInstr};
     use std::hint::black_box;
 
@@ -685,15 +674,14 @@ fn map_ranges_bench() {
     // Column 0 is what puts a `ColumnLocator::Pk` copy in the loop; the keep-set
     // rules retain the source PK on every one of those.
     let rx_in = make_schema(0, &[TypeCode::U64, TypeCode::I64, TypeCode::I64]);
-    let mut rx_batch = Batch::with_capacity(&rx_in, N);
+    let mut rx_batch = BatchBuilder::new(rx_in);
     for i in 0..N as u64 {
-        rx_batch.extend_pk(i as u128);
-        rx_batch.extend_weight(&1i64.to_le_bytes());
-        rx_batch.extend_null_bmp(&0u64.to_le_bytes());
-        rx_batch.extend_col(0, &i.wrapping_mul(2_654_435_761).to_le_bytes());
-        rx_batch.extend_col(1, &(!i).to_le_bytes());
-        rx_batch.count += 1;
+        rx_batch.begin_row(i as u128, 1i64);
+        rx_batch.put_int(i.wrapping_mul(2_654_435_761) as u128);
+        rx_batch.put_int((!i) as u128);
+        rx_batch.end_row();
     }
+    let rx_batch = rx_batch.finish();
     let rx_packer = ReindexPacker::new(&rx_in, &[(1, None)]).unwrap();
     let rx_out = rx_packer.output_schema(&rx_in, &[0, 1, 2]).unwrap();
     let mut rx_plan = MapPlan::from_map(
@@ -707,14 +695,13 @@ fn map_ranges_bench() {
     // --- String source: [U64 PK, STRING], every cell past the inline threshold
     // so every one is heap-backed and an emit grows the output blob.
     let str_in = make_schema(0, &[TypeCode::U64, TypeCode::String]);
-    let mut str_batch = Batch::with_capacity(&str_in, N);
+    let mut str_batch = BatchBuilder::new(str_in);
     for i in 0..N {
-        str_batch.extend_pk(i as u128);
-        str_batch.extend_weight(&1i64.to_le_bytes());
-        str_batch.extend_null_bmp(&0u64.to_le_bytes());
-        str_batch.extend_col_blob(0, format!("row-{i:012}-payload").as_bytes());
-        str_batch.count += 1;
+        str_batch.begin_row(i as u128, 1i64);
+        str_batch.put_blob(format!("row-{i:012}-payload").as_bytes());
+        str_batch.end_row();
     }
+    let str_batch = str_batch.finish();
     let upper = || {
         MapPlan::from_map(
             LogicalProgram::new(
@@ -736,16 +723,15 @@ fn map_ranges_bench() {
     // --- Integer source: [U64 PK, I64, I64, I64], and a map computing three
     // columns out of it.
     let int_in = make_schema(0, &[TypeCode::U64, TypeCode::I64, TypeCode::I64, TypeCode::I64]);
-    let mut int_batch = Batch::with_capacity(&int_in, N);
+    let mut int_batch = BatchBuilder::new(int_in);
     for i in 0..N as u64 {
-        int_batch.extend_pk(i as u128);
-        int_batch.extend_weight(&1i64.to_le_bytes());
-        int_batch.extend_null_bmp(&0u64.to_le_bytes());
+        int_batch.begin_row(i as u128, 1);
         for pi in 0..3u64 {
-            int_batch.extend_col(pi as usize, &(i.wrapping_mul(2_654_435_761 + pi) % 1000).to_le_bytes());
+            int_batch.put_int((i.wrapping_mul(2_654_435_761 + pi) % 1000) as u128);
         }
-        int_batch.count += 1;
+        int_batch.end_row();
     }
+    let int_batch = int_batch.finish();
     let arith = |op, a, b| LogicalInstr::IntArith { op, a: Reg(a), b: Reg(b) };
     let int3 = || {
         MapPlan::from_map(
@@ -785,20 +771,19 @@ fn map_ranges_bench() {
         let mut out_tcs = vec![TypeCode::U128];
         out_tcs.extend_from_slice(payload);
         let in_schema = make_schema(0, &in_tcs);
-        let mut batch = Batch::with_capacity(&in_schema, N);
+        let mut batch = BatchBuilder::new(in_schema);
         for i in 0..N as u64 {
-            batch.extend_pk(i as u128);
-            batch.extend_weight(&1i64.to_le_bytes());
-            batch.extend_null_bmp(&0u64.to_le_bytes());
+            batch.begin_row(i as u128, 1);
             for (pi, &tc) in payload.iter().enumerate() {
                 if tc == TypeCode::String {
-                    batch.extend_col_blob(pi, format!("row-{i:012}-payload").as_bytes());
+                    batch.put_string(&format!("row-{i:012}-payload"));
                 } else {
-                    batch.extend_col(pi, &i.wrapping_mul(2_654_435_761 + pi as u64).to_le_bytes());
+                    batch.put_int(i.wrapping_mul(2_654_435_761 + pi as u64) as u128);
                 }
             }
-            batch.count += 1;
+            batch.end_row();
         }
+        let batch = batch.finish();
         let cols: Vec<u32> = (1..=payload.len() as u32).collect();
         let plan = MapPlan::from_map(
             LogicalProgram::copy_cols(&cols),

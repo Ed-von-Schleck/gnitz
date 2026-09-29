@@ -23,6 +23,7 @@ rcgen.workspace = true
 # DDL-bundle client→server pairing and of the layout-digest agreement (the
 # schema-codec suite), and the client batches the executor tests push.
 gnitz-core = { path = "../gnitz-core" }
+gnitz-store-testkit = { path = "../gnitz-store-testkit" }
 proptest.workspace = true
 tempfile.workspace = true
 

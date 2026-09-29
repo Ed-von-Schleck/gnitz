@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::runtime::sal::MAX_WORKERS;
 use crate::runtime::w2m::SalWake;
 use gnitz_foundation::posix_io;
-use gnitz_store::ops::{op_exchange_gather, op_exchange_route, ScatterSpec};
+use gnitz_store::ops::{op_exchange_gather, op_exchange_route, ScatterPlan};
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::{decode_mem_batch_from_wal_block, Batch, Layout, MAX_BATCH_REGIONS};
 
@@ -88,7 +88,8 @@ struct Head {
     /// The publisher's source partition is drained — a backfill stops once every
     /// worker's is.
     drained: u64,
-    /// The published partition was consolidated, so every block is.
+    /// The published partition was consolidated and the round lands where it
+    /// folds, so every block is merged on gather.
     consolidated: u64,
     /// The publisher has rows left for another part of this round.
     more: u64,
@@ -117,7 +118,7 @@ struct Open {
     view: u64,
     schema: SchemaDescriptor,
     drained: bool,
-    /// The published batch was consolidated, so every block this worker writes is.
+    /// The published batch was consolidated and the round lands where it folds.
     consolidated: bool,
     /// How far this worker's writing has come; `None` once every row it sends
     /// is written.
@@ -184,17 +185,16 @@ impl Mesh {
         (self.part % 2) as usize
     }
 
-    /// Open a round of `view`: send the live rows of `batch` split by `spec` or,
-    /// with none, all of them to every worker, as the round's first part. Fatal
-    /// while a round is open, on a refused route, or on a row larger than an
-    /// outbox.
-    pub(crate) fn publish(&mut self, view: u64, drained: bool, batch: &Batch, spec: Option<ScatterSpec<'_>>) {
+    /// Open a round of `view`: send the live rows of `batch` split by `plan` or,
+    /// with none, all of them to every worker, as the round's first part; `fold`
+    /// is [`crate::query::DriveHost::exchange`]'s. Fatal while a round is open,
+    /// or on a row larger than an outbox.
+    pub(crate) fn publish(&mut self, view: u64, drained: bool, batch: &Batch, plan: Option<&ScatterPlan>, fold: bool) {
         assert!(self.open.is_none(), "exchange of view {view}: a round is already open");
         let nw = self.nw();
-        let shared = match spec {
-            Some(spec) => {
-                op_exchange_route(batch, spec, &mut self.routed, nw)
-                    .unwrap_or_else(|e| gnitz_fatal_abort!("exchange of view {view}: {e}"));
+        let shared = match plan {
+            Some(p) => {
+                op_exchange_route(batch, p, &mut self.routed, nw);
                 false
             }
             None => {
@@ -209,7 +209,7 @@ impl Mesh {
             view,
             schema: *batch.schema(),
             drained,
-            consolidated: batch.layout() == Layout::Consolidated,
+            consolidated: fold && batch.layout() == Layout::Consolidated,
             unsent: Some(Cursor { shared, list: 0, offset: 0 }),
             saved: Vec::new(),
             saved_consolidated: true,

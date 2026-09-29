@@ -48,13 +48,13 @@ pub fn pk_u64_two_i64_schema() -> SchemaDescriptor {
 /// allowed (multiset deltas), so only a strictly *decreasing* PK is rejected;
 /// `certify_layout(Consolidated)` then debug-verifies the full (PK, payload) order.
 pub fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i64)]) -> Batch {
-    let mut b = Batch::with_capacity(schema, rows.len().max(1));
+    let mut b = BatchBuilder::new(*schema);
     for &(c0, c1, c2, w, val) in rows {
-        b.extend_pk_opk(&[c0 as u128, c1 as u128, c2 as u128]);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
-        b.commit_row(0);
+        b.begin_row_opk(&[c0 as u128, c1 as u128, c2 as u128], w);
+        b.put_int(val as u128);
+        b.end_row();
     }
+    let mut b = b.finish();
     for r in 1..b.count {
         assert_ne!(
             compare_pk_bytes(b.get_pk_bytes(r - 1), b.get_pk_bytes(r)),
@@ -135,13 +135,13 @@ pub fn make_schema_i64pk_i64() -> SchemaDescriptor {
 /// [`Batch::extend_pk_opk`] (sign-flipped big-endian), so the bytes match an
 /// ingested row; callers must pass OPK-sorted rows.
 pub fn make_batch_i64pk(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> Batch {
-    let mut b = Batch::with_capacity(schema, rows.len().max(1));
+    let mut b = BatchBuilder::new(*schema);
     for &(pk, w, val) in rows {
-        b.extend_pk_opk(&[(pk as u64) as u128]);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
-        b.commit_row(0);
+        b.begin_row_opk(&[(pk as u64) as u128], w);
+        b.put_int(val as u128);
+        b.end_row();
     }
+    let mut b = b.finish();
     b.certify_layout(Layout::Consolidated);
     b
 }
@@ -160,13 +160,13 @@ pub fn make_schema_pk_u64_payload_blob() -> SchemaDescriptor {
 /// from `(pk, weight, bytes)` rows, already in (PK, payload) order. Values over 12
 /// bytes land in the blob heap, so this is the builder for blob-propagation tests.
 pub fn make_batch_bytes(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> Batch {
-    let mut b = Batch::with_capacity(schema, rows.len().max(1));
+    let mut b = BatchBuilder::new(*schema);
     for &(pk, w, val) in rows {
-        b.extend_pk(pk as u128);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_col_blob(0, val);
-        b.commit_row(0);
+        b.begin_row(pk as u128, w);
+        b.put_blob(val);
+        b.end_row();
     }
+    let mut b = b.finish();
     b.certify_layout(Layout::Consolidated);
     b
 }
@@ -213,31 +213,6 @@ pub fn bench_time_each<S>(iters: usize, mut setup: impl FnMut() -> S, mut body: 
     total
 }
 
-/// Every `.rs` file under `dir`, recursively. `enter` decides whether a
-/// sub-directory is descended into; `dir` itself is always read, and an
-/// unreadable one is a panic — a source-text guard that silently walked nothing
-/// would pass for the wrong reason.
-pub fn rs_files_under(
-    dir: &std::path::Path,
-    enter: impl Fn(&std::path::Path) -> bool + Copy,
-) -> Vec<std::path::PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        panic!("a source walk must be able to read {}", dir.display());
-    };
-    let mut out = Vec::new();
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            if enter(&p) {
-                out.extend(rs_files_under(&p, enter));
-            }
-        } else if p.extension().is_some_and(|x| x == "rs") {
-            out.push(p);
-        }
-    }
-    out
-}
-
 /// A rederived table under `dir` at the default budgets — nothing a test puts
 /// here spills, since that needs the whole 32 MiB RAM tier. For a test that just
 /// needs somewhere to put rows.
@@ -268,4 +243,12 @@ pub fn settled_rss() -> u64 {
     // SAFETY: `malloc_trim` only releases memory the allocator holds free.
     unsafe { libc::malloc_trim(0) };
     gnitz_foundation::perf::rss_bytes()
+}
+
+/// A native little-endian cell of up to 16 bytes as the zero-extended value
+/// `BatchBuilder::put_int` writes back at the cell's own width.
+pub(crate) fn le_cell(cell: &[u8]) -> u128 {
+    let mut v = [0u8; 16];
+    v[..cell.len()].copy_from_slice(cell);
+    u128::from_le_bytes(v)
 }

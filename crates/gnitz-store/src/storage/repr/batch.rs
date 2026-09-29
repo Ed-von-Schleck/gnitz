@@ -43,7 +43,7 @@ const FIXED_REGION_STRIDE: u8 = 8;
 pub(in crate::storage) const FIXED_REGION_BYTES: usize = FIXED_REGION_STRIDE as usize;
 
 /// Total rows in a `[start, end)` row-range list — the shape every range-driven
-/// path (`append_ranges`, `Batch::from_ranges`, `MapPlan::append_map_ranges`)
+/// path (`append_ranges`, `Batch::from_ranges`, `ops::MapPlan::append_map_ranges`)
 /// sizes its destination by.
 #[inline]
 pub(crate) fn range_rows(ranges: &[(usize, usize)]) -> usize {
@@ -276,9 +276,8 @@ impl Batch {
     /// the caller never faults in, where `with_capacity` + a memset would touch
     /// every page of what is routinely a 256 MiB arena.
     ///
-    /// Every caller is a test. It carries no `#[cfg(test)]` because the test
-    /// helpers also compile inside `gnitz-server` and as `gnitz-store-testkit`,
-    /// ordinary dependent crates, which see only what this library publishes.
+    /// Not `#[cfg(test)]`: `gnitz-store-testkit`'s helpers reach it as published
+    /// API.
     pub fn zeroed(schema: &SchemaDescriptor, rows: usize) -> Self {
         let (strides, nr) = strides_from_schema(schema);
         let mut b = Batch {
@@ -733,7 +732,7 @@ impl Batch {
     /// storage — so this stays a downward edge. Not test-only: it is what
     /// `BatchBuilder::begin_row_opk`, and through it the `SysRowSink` the
     /// catalog writes rows with, dispatches to.
-    pub fn extend_pk_opk(&mut self, native_col_vals: &[u128]) {
+    pub(crate) fn extend_pk_opk(&mut self, native_col_vals: &[u128]) {
         self.extend_pk_bytes(self.schema.opk_key_cols(native_col_vals).pk_bytes());
     }
 
@@ -785,7 +784,7 @@ impl Batch {
         src: &MemBatch<'_>,
         ranges: &[(usize, usize)],
         string_mask: u64,
-        mut cache: Option<&mut BlobCache>,
+        cache: &mut BlobCache,
     ) {
         let total: usize = ranges
             .iter()
@@ -830,7 +829,7 @@ impl Batch {
                             src.get_col_ptr(row, pi, 16),
                             src.blob,
                             &mut self.blob,
-                            cache.as_deref_mut(),
+                            Some(&mut *cache),
                         );
                         self.data[dst_off..dst_off + 16].copy_from_slice(&cell);
                         dst_off += 16;
@@ -897,8 +896,7 @@ impl<'d> AppendSession<'d> {
 
     /// Append every listed range of `src`, in list order.
     pub(crate) fn push_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)]) {
-        self.dst
-            .append_ranges_inner(src, ranges, self.mask, Some(&mut self.cache));
+        self.dst.append_ranges_inner(src, ranges, self.mask, &mut self.cache);
     }
 
     /// Append one row of `src` at an explicit weight, under the session's own

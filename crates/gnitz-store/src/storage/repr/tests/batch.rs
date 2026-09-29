@@ -1,5 +1,6 @@
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::storage::BatchBuilder;
 use crate::test_support::{pk_payload_schema, wide_pk_3xu64_schema};
 use gnitz_expr::payload_string;
 
@@ -17,15 +18,13 @@ fn write_to_batch_narrow_pk_odd_rowcount_round_trips() {
         let schema = crate::test_support::pk_payload_schema(&[tc]);
         let stride = schema.pk_stride();
 
-        let mut src = Batch::empty_with_schema(&schema);
-        src.reserve_rows(rows.len());
+        let mut src = BatchBuilder::new(schema);
         for &(pk, w, v) in &rows {
-            src.extend_pk(pk);
-            src.extend_weight(&w.to_le_bytes());
-            src.extend_null_bmp(&0u64.to_le_bytes());
-            src.extend_col(0, &v.to_le_bytes());
-            src.count += 1;
+            src.begin_row(pk, w);
+            src.put_int(v as u128);
+            src.end_row();
         }
+        let src = src.finish();
         let src_mb = src.as_mem_batch();
 
         let mut cols = Vec::new();
@@ -735,16 +734,14 @@ fn unstamped_inverts_stamped_with_pk_prefix() {
     let long: &[u8] = b"a-fairly-long-string-value"; // 26 bytes > 12
     let rows: [Row; 2] = [(1, 7, 1, long, Some(5)), (2, 3, -2, b"hi", None)];
 
-    let mut b = Batch::with_capacity(&view, rows.len());
+    let mut b = BatchBuilder::new(view);
     for &(k0, k1, w, s, n) in &rows {
-        let mut pk = k0.to_be_bytes().to_vec();
-        pk.extend_from_slice(&k1.to_be_bytes());
-        b.extend_pk_bytes(&pk);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_col_blob(0, s);
-        b.extend_col(1, &n.unwrap_or(0).to_le_bytes());
-        b.commit_row(if n.is_none() { 1 << 1 } else { 0 });
+        b.begin_row_opk(&[k0 as u128, k1 as u128], w);
+        b.put_blob(s);
+        b.put_opt_int(n.map(|v| v as u128));
+        b.end_row();
     }
+    let mut b = b.finish();
     b.certify_layout(Layout::Consolidated);
 
     let out = b.stamped_with_pk_prefix(&delta, 7).unstamped(&view);

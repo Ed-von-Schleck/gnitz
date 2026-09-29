@@ -5,10 +5,10 @@
 
 use std::ops::Range;
 
-use crate::schema::key::{locate_key_col, pk_width_dispatch, FoldCols, NarrowPkOpk, PkSortKey};
+use super::reindex::{locate_key_col, FoldCols};
+use crate::schema::key::{pk_width_dispatch, NarrowPkOpk, PkSortKey};
 use crate::schema::{
-    ColumnLocator, DerivedSchema, OpBuildErr, ReduceOutKey, SchemaBound, SchemaColumn, SchemaDescriptor, SchemaFacts,
-    TypeCode,
+    ColumnLocator, DerivedSchema, ReduceOutKey, SchemaBound, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode,
 };
 use crate::storage::{Batch, MemBatch};
 use gnitz_wire::{ReduceOutSlot, NARROW_PK_MAX_BYTES};
@@ -26,7 +26,7 @@ pub(super) enum GroupKey {
 
 impl GroupKey {
     /// Refused when a group column is out of range or has no key image.
-    pub(super) fn new(schema: &SchemaDescriptor, group_cols: &[u32]) -> Result<Self, OpBuildErr> {
+    pub(super) fn new(schema: &SchemaDescriptor, group_cols: &[u32]) -> Result<Self, String> {
         let locs: Vec<ColumnLocator> = group_cols
             .iter()
             .map(|&c| locate_key_col(schema, c, "group key"))
@@ -91,13 +91,13 @@ impl GroupOutKey {
         input: &SchemaDescriptor,
         group_cols: &[u32],
         row: impl IntoIterator<Item = u32>,
-    ) -> Result<(Self, DerivedSchema), OpBuildErr> {
+    ) -> Result<(Self, DerivedSchema), String> {
         let key = GroupKey::new(input, group_cols)?;
         let kind = match key {
             GroupKey::Fold(_) => ReduceOutKey::SyntheticFold,
             _ => ReduceOutKey::Natural,
         };
-        let over = |e: SchemaBound| OpBuildErr::shape(format!("group key: output {e}"));
+        let over = |e: SchemaBound| format!("group key: output {e}");
         let mut b = DerivedSchema::new();
         let mut carried = Vec::new();
         for slot in kind.output_layout(group_cols, row) {

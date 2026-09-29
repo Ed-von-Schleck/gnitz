@@ -260,3 +260,7 @@ impl BoundedIndexCursor {
         true
     }
 }
+
+#[cfg(test)]
+#[path = "tests/store_io.rs"]
+mod tests;

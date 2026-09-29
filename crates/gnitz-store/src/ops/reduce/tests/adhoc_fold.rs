@@ -2,7 +2,7 @@ use super::*;
 use crate::schema::key::NarrowPkOpk;
 use crate::schema::ColumnTable;
 use crate::schema::{SchemaColumn, TypeCode};
-use crate::storage::Layout;
+use crate::storage::{BatchBuilder, Layout};
 use gnitz_wire::{read_i64_le, AggDescriptor, AggFunc};
 
 // Source: pk(U64), grp(I64), val(I64, nullable). val is payload slot 1.
@@ -20,16 +20,14 @@ fn src_schema() -> SchemaDescriptor {
 /// (pk, weight, grp, Option<val>) → a consolidated source batch.
 fn build(rows: &[(u64, i64, i64, Option<i64>)]) -> Batch {
     let s = src_schema();
-    let mut b = Batch::with_capacity(&s, rows.len().max(1));
+    let mut b = BatchBuilder::new(s);
     for &(pk, w, grp, val) in rows {
-        b.extend_pk(pk as u128);
-        b.extend_weight(&w.to_le_bytes());
-        let null_word = if val.is_none() { 1u64 << 1 } else { 0 };
-        b.extend_null_bmp(&null_word.to_le_bytes());
-        b.extend_col(0, &grp.to_le_bytes()); // grp (payload 0)
-        b.extend_col(1, &val.unwrap_or(0).to_le_bytes()); // val (payload 1)
-        b.count += 1;
+        b.begin_row(pk as u128, w);
+        b.put_int(grp as u128);
+        b.put_opt_int(val.map(|v| v as u128));
+        b.end_row();
     }
+    let mut b = b.finish();
     b.set_layout_unchecked(Layout::Consolidated);
     b
 }
@@ -148,14 +146,13 @@ fn fold_over_the_whole_compound_pk_keys_by_it() {
         gnitz_wire::encode_pk_column(&b.to_le_bytes(), TypeCode::I32, &mut k[8..]);
         k
     };
-    let mut b = Batch::with_capacity(&src, 2);
+    let mut b = BatchBuilder::new(src);
     for (k, v) in [(pk(1, -1), 10i64), (pk(1, 2), 20)] {
-        b.extend_pk_bytes(&k);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &v.to_le_bytes());
-        b.count += 1;
+        b.begin_row_bytes(&k, 1);
+        b.put_int(v as u128);
+        b.end_row();
     }
+    let mut b = b.finish();
     b.set_layout_unchecked(Layout::Consolidated);
     fold.fold_ranges(&b, &[(0, b.count)]).unwrap();
     let out = fold.finish();

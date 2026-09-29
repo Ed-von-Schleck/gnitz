@@ -11,17 +11,17 @@ use super::super::run_set::FOLD_THRESHOLD;
 use super::{RecoverySource, StoreBudgets, Table, DEFAULT_RAM_TIER_BYTES};
 use crate::schema::SchemaDescriptor;
 use crate::storage::repr::batch::Batch;
+use crate::storage::BatchBuilder;
 use crate::test_support::pk_u64_two_i64_schema;
 
 /// Append one row `(pk, payload, payload, weight)` to `b` (both I64 payload
 /// columns carry the same value so a retraction is an exact (PK,payload) match
 /// of its insert).
-fn push_row(b: &mut Batch, pk: u64, payload: i64, weight: i64) {
-    b.extend_pk(pk as u128);
-    b.extend_weight(&weight.to_le_bytes());
-    b.extend_col(0, &payload.to_le_bytes());
-    b.extend_col(1, &payload.to_le_bytes());
-    b.commit_row(0);
+fn push_row(b: &mut BatchBuilder, pk: u64, payload: i64, weight: i64) {
+    b.begin_row(pk as u128, weight);
+    b.put_int(payload as u128);
+    b.put_int(payload as u128);
+    b.end_row();
 }
 
 /// One tick of `distinct(d)`: `d` rows with fresh keys `t*d .. t*d+d`, weight +1
@@ -29,12 +29,12 @@ fn push_row(b: &mut Batch, pk: u64, payload: i64, weight: i64) {
 /// order for the FLSM tree: every fold lands in fresh key space, so a vertical
 /// overlaps nothing.
 fn distinct_tick(schema: &SchemaDescriptor, t: usize, d: usize) -> Batch {
-    let mut b = Batch::with_capacity(schema, d.max(1));
+    let mut b = BatchBuilder::new(*schema);
     for i in 0..d {
         let k = (t * d + i) as u64;
         push_row(&mut b, k, k as i64, 1);
     }
-    b
+    b.finish()
 }
 
 fn gen_distinct(schema: &SchemaDescriptor, d: usize, ticks: usize) -> Vec<Batch> {
@@ -52,7 +52,7 @@ fn gen_churn(schema: &SchemaDescriptor, h: usize, d: usize, ticks: usize) -> Vec
     let mut counter: usize = 0;
     (0..ticks)
         .map(|_| {
-            let mut b = Batch::with_capacity(schema, d.max(1));
+            let mut b = BatchBuilder::new(*schema);
             for _ in 0..updates_per_tick {
                 let k = counter % h;
                 let payload = counter as i64;
@@ -63,7 +63,7 @@ fn gen_churn(schema: &SchemaDescriptor, h: usize, d: usize, ticks: usize) -> Vec
                 push_row(&mut b, k as u64, payload, 1);
                 last[k] = Some(payload);
             }
-            b
+            b.finish()
         })
         .collect()
 }
@@ -76,11 +76,11 @@ fn gen_churn(schema: &SchemaDescriptor, h: usize, d: usize, ticks: usize) -> Vec
 fn scatter_tick(schema: &SchemaDescriptor, rng: &mut crate::test_rng::Rng, d: usize, keyspace: u64) -> Batch {
     let mut keys: Vec<u64> = (0..d).map(|_| rng.gen_range(keyspace)).collect();
     keys.sort_unstable();
-    let mut b = Batch::with_capacity(schema, d.max(1));
+    let mut b = BatchBuilder::new(*schema);
     for k in keys {
         push_row(&mut b, k, k as i64, 1);
     }
-    b
+    b.finish()
 }
 
 enum Gen {

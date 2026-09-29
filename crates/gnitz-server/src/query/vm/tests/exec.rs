@@ -296,16 +296,10 @@ fn test_delta_isolation_across_ticks() {
 fn test_map_operator() {
     // MAP projection: reorder/select columns.
     let in_schema = make_schema(&[TypeCode::I64, TypeCode::I64]);
-    let out_schema = make_schema_u128_i64();
 
     let mut p = TestPlan::default();
-    let map = gnitz_store::expr::MapPlan::from_map(
-        gnitz_expr::LogicalProgram::copy_cols(&[2]),
-        &in_schema,
-        &out_schema,
-        gnitz_store::expr::PkSource::Inherit,
-    )
-    .unwrap();
+    let map = gnitz_store::ops::MapPlan::from_wire(&in_schema, &gnitz_wire::MapKind::Projection(vec![2])).unwrap();
+    let out_schema = *map.out_schema();
     p.push(0, 1, Op::Map(Box::new(map)));
 
     let input = make_batch_2col(in_schema, &[(1, 1, 10, 100), (2, 1, 20, 200)]);

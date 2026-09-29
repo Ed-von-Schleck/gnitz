@@ -132,6 +132,7 @@ use super::*;
 use crate::schema::key::compare_pk_bytes;
 use crate::schema::payload_order::compare_full_rows;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::storage::BatchBuilder;
 use crate::test_support::{make_schema_u128_i64, pk_payload_schema, pk_u64_two_i64_schema};
 
 /// Build an owned `Batch` from a row tuple list. Tests obtain a `MemBatch`
@@ -190,15 +191,13 @@ fn batchview_row_matches_region() {
 /// puts the equal-PK payload tiebreak and the group fold on the measured path.
 /// The schema's `pk_stride` selects the width.
 fn bench_sorted_batch(schema: &SchemaDescriptor, n: usize, dup: usize) -> Batch {
-    let mut b = Batch::with_capacity(schema, n.max(1));
+    let mut b = BatchBuilder::new(*schema);
     for i in 0..n {
-        b.extend_pk((i / dup) as u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &(i as i64).to_le_bytes());
-        b.count += 1;
+        b.begin_row((i / dup) as u128, 1i64);
+        b.put_int(i as i64 as u128);
+        b.end_row();
     }
-    b
+    b.finish()
 }
 
 /// Throughput of `run_merge`'s comparator-driven N-way merge at stride 8 and
@@ -258,18 +257,16 @@ fn bench_generic_schema() -> SchemaDescriptor {
 /// columns are constant within a PK group, so a tie walks the float and the
 /// 128-bit dispatch before the trailing I64 resolves it.
 fn bench_sorted_generic_batch(schema: &SchemaDescriptor, n: usize, dup: usize) -> Batch {
-    let mut b = Batch::with_capacity(schema, n.max(1));
+    let mut b = BatchBuilder::new(*schema);
     for i in 0..n {
         let group = (i / dup) as u64;
-        b.extend_pk(group as u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &(group as f64).to_le_bytes());
-        b.extend_col(1, &(group as u128).to_le_bytes());
-        b.extend_col(2, &(i as i64).to_le_bytes());
-        b.count += 1;
+        b.begin_row(group as u128, 1);
+        b.put_float(group as f64);
+        b.put_int(group as u128);
+        b.put_int(i as u128);
+        b.end_row();
     }
-    b
+    b.finish()
 }
 
 /// [`run_merge_dup_pk_bench`] over the `Generic` payload comparator, which the
@@ -301,16 +298,14 @@ fn run_merge_dup_pk_generic_bench() {
 /// `key_fn(i)`, weight +1, both I64 payload columns derived from the row
 /// index (payloads are irrelevant when all PKs are distinct).
 fn bench_flush_batch(schema: &SchemaDescriptor, n: usize, key_fn: impl Fn(usize) -> u64) -> Batch {
-    let mut b = Batch::with_capacity(schema, n.max(1));
+    let mut b = BatchBuilder::new(*schema);
     for i in 0..n {
-        b.extend_pk(key_fn(i) as u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &(i as i64).to_le_bytes());
-        b.extend_col(1, &((i as i64) * 2).to_le_bytes());
-        b.count += 1;
+        b.begin_row(key_fn(i) as u128, 1i64);
+        b.put_int(i as i64 as u128);
+        b.put_int(((i as i64) * 2) as u128);
+        b.end_row();
     }
-    b
+    b.finish()
 }
 
 /// The N-way merge over **1 big run + 4 small runs**, priced per small-run row.
@@ -871,23 +866,10 @@ mod merge_materialize_vs_reference {
         c2: I,
     }
 
-    fn enc_str(b: &mut Batch, pi: usize, nw: &mut u64, c: &S) -> [u8; 16] {
+    fn put_str(b: &mut BatchBuilder, c: &S) {
         match c {
-            S::V(bytes) => gnitz_wire::encode_german_string(bytes, &mut b.blob),
-            S::Null => {
-                gnitz_wire::null_word_set(nw, pi, true);
-                [0u8; 16]
-            }
-        }
-    }
-
-    fn enc_int(pi: usize, nw: &mut u64, c: &I) -> [u8; 8] {
-        match c {
-            I::V(v) => v.to_le_bytes(),
-            I::Null => {
-                gnitz_wire::null_word_set(nw, pi, true);
-                [0u8; 8]
-            }
+            S::V(bytes) => b.put_blob(bytes),
+            S::Null => b.put_null(),
         }
     }
 
@@ -895,21 +877,18 @@ mod merge_materialize_vs_reference {
     /// distinct within a run here, so PK order == (PK, payload) order) and carry
     /// non-zero weights — the certify debug-verifies both.
     fn build_run(schema: &SchemaDescriptor, rows: Vec<RowSpec>) -> Batch {
-        let mut b = Batch::empty_with_schema(schema);
-        b.reserve_rows(rows.len().max(1));
+        let mut b = BatchBuilder::new(*schema);
         for row in &rows {
-            let mut nw = 0u64;
-            let st0 = enc_str(&mut b, 0, &mut nw, &row.c0);
-            let st1 = enc_str(&mut b, 1, &mut nw, &row.c1);
-            let ic = enc_int(2, &mut nw, &row.c2);
-            b.extend_pk_bytes(&row.pk);
-            b.extend_weight(&row.w.to_le_bytes());
-            b.extend_null_bmp(&nw.to_le_bytes());
-            b.extend_col(0, &st0);
-            b.extend_col(1, &st1);
-            b.extend_col(2, &ic);
-            b.count += 1;
+            b.begin_row_bytes(&row.pk, row.w);
+            put_str(&mut b, &row.c0);
+            put_str(&mut b, &row.c1);
+            match row.c2 {
+                I::V(v) => b.put_int(v as u128),
+                I::Null => b.put_null(),
+            }
+            b.end_row();
         }
+        let mut b = b.finish();
         b.certify_layout(Layout::Consolidated);
         b
     }

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use super::{op_join_delta_trace, JoinPlan};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::storage::{Batch, Layout, ReadCursor};
+use crate::storage::{Batch, BatchBuilder, Layout, ReadCursor};
 use crate::test_support::bench_time_each;
 use gnitz_wire::{JoinKind, RangeRel};
 
@@ -93,25 +93,22 @@ type Row = (Vec<u128>, i64);
 /// in the blob heap and the emit path must relocate rather than copy them
 /// inline. Every fourth nullable cell is NULL.
 fn build(schema: &SchemaDescriptor, p: Payload, rows: &[Row]) -> Batch {
-    let mut b = Batch::with_capacity(schema, rows.len().max(1));
+    let mut b = BatchBuilder::new(*schema);
     for (i, (pk, ord)) in rows.iter().enumerate() {
-        b.extend_pk_opk(pk);
-        b.extend_weight(&1i64.to_le_bytes());
-        let null = matches!(p, Payload::Nullable) && i % 4 == 0;
-        b.extend_col(0, &ord.to_le_bytes());
+        b.begin_row_opk(pk, 1);
+        b.put_int(*ord as u128);
         match p {
             Payload::Int => {}
-            Payload::Nullable => b.extend_col(1, &if null { 0 } else { ord * 7 }.to_le_bytes()),
-            Payload::Str => {
-                // Only a handful of distinct long strings, so the dedup cache
-                // has repeated spans to collapse — the shape a fan-out join
-                // actually presents it.
-                let s = format!("join-bench-payload-{:05}", ord % 8);
-                b.extend_col_blob(1, s.as_bytes());
-            }
+            Payload::Nullable if i % 4 == 0 => b.put_null(),
+            Payload::Nullable => b.put_int((ord * 7) as u128),
+            // Only a handful of distinct long strings, so the dedup cache has
+            // repeated spans to collapse — the shape a fan-out join actually
+            // presents it.
+            Payload::Str => b.put_string(&format!("join-bench-payload-{:05}", ord % 8)),
         }
-        b.commit_row(u64::from(null) << 1);
+        b.end_row();
     }
+    let mut b = b.finish();
     b.certify_layout(Layout::Consolidated);
     b
 }

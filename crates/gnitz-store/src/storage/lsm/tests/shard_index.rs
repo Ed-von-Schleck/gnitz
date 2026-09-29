@@ -4,6 +4,7 @@ use crate::schema::key::probe_key;
 use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
 use crate::storage::repr::batch::Batch;
 use crate::storage::repr::shard_file;
+use crate::storage::BatchBuilder;
 use crate::test_support::{
     make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, opk_pk, pk_payload_schema,
 };
@@ -109,17 +110,15 @@ fn dense_batch(base: u64, n: u64) -> Batch {
 /// lets a guard still be over target after one fold.
 fn fat_batch(base: u64, n: u64, width: usize) -> Batch {
     let schema = make_schema_pk_u64_payload_string();
-    let mut b = Batch::with_capacity(&schema, n as usize);
+    let mut b = BatchBuilder::new(schema);
     for pk in base..base + n {
-        b.extend_pk(pk as u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
         // Vary the body per row so the text carries no run the writer can fold.
         let body: Vec<u8> = (0..width).map(|i| b'a' + ((pk as usize + i) % 26) as u8).collect();
-        b.extend_col_blob(0, &body);
-        b.count += 1;
+        b.begin_row(pk as u128, 1);
+        b.put_blob(&body);
+        b.end_row();
     }
-    b
+    b.finish()
 }
 
 /// Rows in a shard the guard rebalance neither splits nor merges.

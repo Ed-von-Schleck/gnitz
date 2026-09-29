@@ -5,7 +5,7 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::storage::{Batch, Layout};
+use crate::storage::{Batch, BatchBuilder, Layout};
 use crate::test_support::{
     make_batch, make_batch_i64pk as make_signed_batch, make_batch_opk, make_schema_i64pk_i64 as make_schema_signed,
     make_schema_u64_i64, opk_pk, pk_only_schema, pk_payload_schema, row_key, trace_cursor, zset_of, RowKey,
@@ -699,24 +699,22 @@ fn make_range_schema(n_eq: usize, wide: bool) -> SchemaDescriptor {
 /// (PK, payload) order.
 fn make_range_batch(schema: &SchemaDescriptor, rows: &[(Vec<u64>, u64, i64, i64)]) -> Batch {
     let wide = schema.num_payload_cols() > 1;
-    let mut b = Batch::with_capacity(schema, rows.len().max(1));
+    let mut b = BatchBuilder::new(*schema);
     for (eq, range, w, val) in rows {
         let mut vals: Vec<u128> = eq.iter().map(|&x| x as u128).collect();
         vals.push(*range as u128);
-        b.extend_pk_opk(&vals);
-        b.extend_weight(&w.to_le_bytes());
-        let null = wide && *val < 0;
-        b.extend_null_bmp(&(u64::from(null) << 1).to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
+        b.begin_row_opk(&vals, *w);
+        b.put_int(*val as u128);
         if wide {
-            let nullable = if null { 0 } else { val.wrapping_mul(3) };
-            b.extend_col(1, &nullable.to_le_bytes());
-            let s = FIXTURE_STRINGS[val.rem_euclid(FIXTURE_STRINGS.len() as i64) as usize];
-            b.extend_col_blob(2, s);
+            match *val < 0 {
+                true => b.put_null(),
+                false => b.put_int(val.wrapping_mul(3) as u128),
+            }
+            b.put_blob(FIXTURE_STRINGS[val.rem_euclid(FIXTURE_STRINGS.len() as i64) as usize]);
         }
-        b.count += 1;
+        b.end_row();
     }
-    b
+    b.finish()
 }
 
 /// Each output row as `(first payload, second payload, weight)` — what a join

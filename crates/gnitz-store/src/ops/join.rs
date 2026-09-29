@@ -13,7 +13,7 @@ use std::cmp::Ordering;
 use std::ops::Range;
 
 use crate::schema::key::{compare_pk_ordering, key_range_between_cuts, KeyCut, PkBuf};
-use crate::schema::{DerivedSchema, OpBuildErr, SchemaDescriptor, MAX_PK_BYTES};
+use crate::schema::{DerivedSchema, SchemaDescriptor, MAX_PK_BYTES};
 use crate::storage::{pk_group_end, pk_prefix_group_end, Batch, BlobCache, ReadCursor};
 
 use gnitz_expr::RowSource;
@@ -93,12 +93,12 @@ impl JoinPlan {
         delta_is_right: bool,
         delta: &SchemaDescriptor,
         trace: &SchemaDescriptor,
-    ) -> Result<JoinPlan, OpBuildErr> {
+    ) -> Result<JoinPlan, String> {
         let (left, right) = match delta_is_right {
             true => (trace, delta),
             false => (delta, trace),
         };
-        let over = |e| OpBuildErr::shape(format!("join: merged schema {e}"));
+        let over = |e| format!("join: merged schema {e}");
         let mut b = DerivedSchema::new();
         b.push_pk_of(left).map_err(over)?;
         if kind == JoinKind::Cross {
@@ -142,16 +142,14 @@ impl JoinPlan {
 
 /// A keyed walk reads one side's PK region as the other's, so the two key
 /// layouts must be identical down to the OPK encoding each column type implies.
-fn same_pk_types(delta: &SchemaDescriptor, trace: &SchemaDescriptor) -> Result<(), OpBuildErr> {
+fn same_pk_types(delta: &SchemaDescriptor, trace: &SchemaDescriptor) -> Result<(), String> {
     fn types(s: &SchemaDescriptor) -> impl Iterator<Item = TypeCode> + '_ {
         s.pk_columns().map(|(_, c)| c.type_code)
     }
     if types(delta).eq(types(trace)) {
         return Ok(());
     }
-    Err(OpBuildErr::shape(
-        "join: delta and trace PK column types differ (both sides must reindex at the pair's common type)",
-    ))
+    Err("join: delta and trace PK column types differ (both sides must reindex at the pair's common type)".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -174,10 +172,10 @@ struct RangeProbe {
 
 impl RangeProbe {
     /// Resolve a wire `left REL right` against the trace schema's key region.
-    fn new(trace: &SchemaDescriptor, n_eq: u8, rel: RangeRel, delta_is_right: bool) -> Result<RangeProbe, OpBuildErr> {
+    fn new(trace: &SchemaDescriptor, n_eq: u8, rel: RangeRel, delta_is_right: bool) -> Result<RangeProbe, String> {
         // The reindexed key is `[eq slots…, range slot]`.
         if n_eq as usize + 1 != trace.pk_cols().len() {
-            return Err(OpBuildErr::shape("range join: n_eq does not match trace key arity"));
+            return Err("range join: n_eq does not match trace key arity".to_string());
         }
         // In PK order, so the range slot always keeps a span of its own.
         let eq_size = trace

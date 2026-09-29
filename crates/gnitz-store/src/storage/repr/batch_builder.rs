@@ -111,19 +111,6 @@ impl BatchBuilder {
         self.put_int(val as u128);
     }
 
-    /// Put a float for the current payload column, narrowed to that column's own
-    /// width — the same value-fits-its-column shape [`Self::put_int`] has. An F32
-    /// column stores the `as f32` narrowing, so a caller need not know the width.
-    #[cfg(test)]
-    pub(crate) fn put_float(&mut self, val: f64) {
-        let col_size = self.schema().columns[self.physical_col_idx()].size() as usize;
-        match col_size {
-            4 => self.batch.extend_col(self.curr_col, &(val as f32).to_le_bytes()),
-            _ => self.batch.extend_col(self.curr_col, &val.to_le_bytes()),
-        }
-        self.curr_col += 1;
-    }
-
     /// Put raw bytes for the current STRING/BLOB payload column;
     /// `payload_bytes` is the read-back twin.
     pub fn put_blob(&mut self, b: &[u8]) {
@@ -141,6 +128,27 @@ impl BatchBuilder {
         self.batch.fill_col_zero(self.curr_col);
         gnitz_wire::null_word_set(&mut self.curr_null_word, self.curr_col, true);
         self.curr_col += 1;
+    }
+
+    /// Put a float for the current payload column, narrowed to that column's own
+    /// width: an F32 column stores the `as f32` narrowing.
+    #[cfg(test)]
+    pub(crate) fn put_float(&mut self, val: f64) {
+        let col_size = self.schema().columns[self.physical_col_idx()].size() as usize;
+        match col_size {
+            4 => self.batch.extend_col(self.curr_col, &(val as f32).to_le_bytes()),
+            _ => self.batch.extend_col(self.curr_col, &val.to_le_bytes()),
+        }
+        self.curr_col += 1;
+    }
+
+    /// [`Self::put_int`], or [`Self::put_null`] for `None`.
+    #[cfg(test)]
+    pub(crate) fn put_opt_int(&mut self, val: Option<u128>) {
+        match val {
+            Some(v) => self.put_int(v),
+            None => self.put_null(),
+        }
     }
 
     /// Finish the current row: the accumulated null word, through the shared

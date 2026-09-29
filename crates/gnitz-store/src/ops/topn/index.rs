@@ -15,8 +15,8 @@
 //! leading image bytes in the PK keep one group's entries off the merge's
 //! row-by-row equal-PK arm, exactly as the AVI's value column does.
 
-use crate::schema::key::ReindexPacker;
-use crate::schema::{ColumnLocator, OpBuildErr, SchemaDescriptor, SchemaFacts};
+use crate::ops::reindex::ReindexPacker;
+use crate::schema::{oob_col, ColumnLocator, SchemaDescriptor, SchemaFacts};
 use crate::storage::Batch;
 use gnitz_expr::{OrderLocator, RowSource};
 use gnitz_wire::OrderKey;
@@ -65,27 +65,27 @@ impl TopNIndex {
         group_cols: &[u32],
         order: &[OrderKey],
         output: &SchemaDescriptor,
-    ) -> Result<Self, OpBuildErr> {
+    ) -> Result<Self, String> {
         // Without a key the index orders a group's rows arbitrarily, so which rows
         // fill the window would not be a function of the Z-set.
         if order.is_empty() {
-            return Err(OpBuildErr::shape("top-n: no order keys"));
+            return Err("top-n: no order keys".to_string());
         }
         let order: Vec<OrderSpec> = order
             .iter()
             .map(|key| {
                 let loc = input
                     .try_locate(key.col as usize)
-                    .ok_or_else(|| OpBuildErr::oob_col("top-n: order column", key.col as u32, input))?;
+                    .ok_or_else(|| oob_col("top-n: order column", key.col as u32, input))?;
                 Ok(OrderSpec {
                     key: OrderLocator::of(loc, key),
                     kind: ImageKind::of(loc.type_code()),
                 })
             })
-            .collect::<Result<_, OpBuildErr>>()?;
+            .collect::<Result<_, String>>()?;
         let suffix = [image_slot_col(matches!(order[0].kind, ImageKind::Wide(_)))];
         let (key_packer, mut b) = ReindexPacker::new_group_key(input, group_cols, &suffix)?;
-        let over = |e| OpBuildErr::shape(format!("top-n: index {e}"));
+        let over = |e| format!("top-n: index {e}");
         for _ in &order {
             b.push(IMAGE_COL).map_err(over)?;
         }

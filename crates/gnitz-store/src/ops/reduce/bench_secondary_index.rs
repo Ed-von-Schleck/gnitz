@@ -24,7 +24,7 @@ use std::time::Duration;
 use super::avi::{avi_batch, AviBake};
 use super::plan::ReducePlan;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
-use crate::storage::Batch;
+use crate::storage::{Batch, BatchBuilder};
 use crate::test_support::{bench_time, bench_time_each, scratch_table};
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
@@ -55,15 +55,14 @@ fn src_schema() -> SchemaDescriptor {
 }
 
 fn build_input(schema: &SchemaDescriptor) -> Batch {
-    let mut b = Batch::with_capacity(schema, N_ROWS);
+    let mut b = BatchBuilder::new(*schema);
     for row in 0..N_ROWS as u64 {
-        b.extend_pk(row as u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_col(0, &((row % N_GROUPS) as u32).to_le_bytes());
-        b.extend_col(1, &((row.wrapping_mul(2654435761)) as i64).to_le_bytes());
-        b.commit_row(0);
+        b.begin_row(row as u128, 1i64);
+        b.put_int(((row % N_GROUPS) as u32) as u128);
+        b.put_int(((row.wrapping_mul(2654435761)) as i64) as u128);
+        b.end_row();
     }
-    b
+    b.finish()
 }
 
 /// Source schema for the wide shape: U64 pk | U32 grp | U128 val.
@@ -81,16 +80,15 @@ fn wide_src_schema() -> SchemaDescriptor {
 /// [`build_input`] over [`wide_src_schema`], the value scrambled across the
 /// whole 128-bit range.
 fn build_wide_input(schema: &SchemaDescriptor) -> Batch {
-    let mut b = Batch::with_capacity(schema, N_ROWS);
+    let mut b = BatchBuilder::new(*schema);
     for row in 0..N_ROWS as u64 {
-        b.extend_pk(row as u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_col(0, &((row % N_GROUPS) as u32).to_le_bytes());
         let v = (row.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128) << 64 | row as u128;
-        b.extend_col(1, &v.to_le_bytes());
-        b.commit_row(0);
+        b.begin_row(row as u128, 1);
+        b.put_int((row % N_GROUPS) as u128);
+        b.put_int(v);
+        b.end_row();
     }
-    b
+    b.finish()
 }
 
 /// The production bake for one extreme over `col` grouped by `grp`, reached the

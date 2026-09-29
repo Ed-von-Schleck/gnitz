@@ -1,6 +1,6 @@
 //! The ladder guard: every rung names only the rungs beneath it.
 //!
-//! The crate graph cannot enforce this — the six rungs are one crate, so
+//! The crate graph cannot enforce this — the rungs are one crate, so
 //! nothing else stops a `relation` file from naming `crate::ops` tomorrow. The
 //! walk itself is `test_support::ladder`, shared with `gnitz-server`'s own
 //! guard; what is stated here is only this crate's table.
@@ -17,10 +17,9 @@ use crate::test_support::{assert_ladder, rung_files};
 const LADDER: &[(&str, &[&str])] = &[
     ("schema", &[]),
     ("storage", &["schema"]),
-    ("expr", &["schema", "storage"]),
-    ("ops", &["schema", "storage", "expr"]),
+    ("ops", &["schema", "storage"]),
     ("relation", &["schema", "storage"]),
-    ("read", &["schema", "storage", "expr", "ops", "relation"]),
+    ("read", &["schema", "storage", "ops", "relation"]),
 ];
 
 #[test]

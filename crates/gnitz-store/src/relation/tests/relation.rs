@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::BatchBuilder;
 
 /// A one-worker registry over a fresh base directory named `name`.
 fn solo_registry(name: &str) -> RelationRegistry {
@@ -149,12 +150,11 @@ fn ephemeral_flush_includes_index_circuits() {
 
     // Put one row in the index table's memtable.
     {
-        let mut batch = Batch::with_capacity(&parent_schema, 1);
-        batch.extend_pk(1u128);
-        batch.extend_weight(&1i64.to_le_bytes());
-        batch.extend_null_bmp(&0u64.to_le_bytes());
-        batch.extend_col(0, &7u64.to_le_bytes());
-        batch.count += 1;
+        let mut batch = BatchBuilder::new(parent_schema);
+        batch.begin_row(1u128, 1i64);
+        batch.put_int(7);
+        batch.end_row();
+        let batch = batch.finish();
         let ic = registry.relation_mut(70).and_then(|r| r.index_on_mut(&[1])).unwrap();
         assert!(ic.project_and_ingest(&batch).unwrap(), "the projection is not empty");
     }
@@ -195,12 +195,10 @@ fn a_fed_view_retains_each_round_at_its_own_weight() {
         .unwrap();
 
     let row = |w: i64| {
-        let mut b = Batch::with_capacity(&schema, 1);
-        b.extend_pk(7u128);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.count += 1;
-        b
+        let mut b = BatchBuilder::new(schema);
+        b.begin_row(7u128, w);
+        b.end_row();
+        b.finish()
     };
     registry.ingest_view_delta(vid, row(1), Some(4), false).unwrap();
     registry.ingest_view_delta(vid, row(-1), Some(5), false).unwrap();
@@ -259,11 +257,10 @@ fn ingest_apply_error_returned_internal() {
     let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
     let tid = gnitz_wire::FIRST_USER_TABLE_ID;
     register_entry(&mut registry, tid, schema, RelationKind::View(ViewProps::Plain));
-    let mut batch = Batch::with_capacity(&schema, 1);
-    batch.extend_pk(1u128);
-    batch.extend_weight(&1i64.to_le_bytes());
-    batch.extend_null_bmp(&0u64.to_le_bytes());
-    batch.count += 1;
+    let mut batch = BatchBuilder::new(schema);
+    batch.begin_row(1u128, 1i64);
+    batch.end_row();
+    let batch = batch.finish();
     assert!(
         matches!(registry.ingest(tid, batch), Err(e) if e.contains("io error")),
         "the ingest must return the storage error when the seam is armed",

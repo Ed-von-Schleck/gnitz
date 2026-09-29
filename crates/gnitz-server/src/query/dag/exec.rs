@@ -31,32 +31,16 @@ pub(crate) enum Drive {
     },
 }
 
-/// How one view's epoch reaches the other workers.
-struct Relay {
-    view_id: u64,
-    /// This view's shuffle is a proven no-op, so a round hands its batch back.
-    elide: bool,
-    /// What a side's output round routes by: the view's shard columns.
-    shard_cols: Box<[u32]>,
-}
-
-impl Relay {
-    /// One repartition of a side's output. A side whose output every worker
-    /// holds whole keeps its own share; any other runs a round, even for an
-    /// empty batch, so the collective rounds stay balanced across workers.
-    fn round(&self, host: &mut impl DriveHost, batch: Batch, emits_replica: bool) -> Result<Batch, String> {
-        let spec = ScatterSpec::GroupKey(&self.shard_cols);
-        match (self.elide, emits_replica) {
-            (true, _) => Ok(batch),
-            (false, true) => self.share(host, &batch, spec),
-            (false, false) => Ok(host.exchange(self.view_id, Cow::Owned(batch), Some(spec))),
+/// Hand `batch` to the workers that consume it.
+fn relay(host: &mut impl DriveHost, view_id: u64, batch: Cow<'_, Batch>, how: Option<&Relay>, fold: bool) -> Batch {
+    match how {
+        None => batch.into_owned(),
+        Some(Relay::Broadcast) => host.exchange(view_id, batch, None, fold),
+        Some(Relay::Round(p)) => host.exchange(view_id, batch, Some(p), fold),
+        Some(Relay::Share(p)) => {
+            let slot = host.parts().1.slot();
+            p.share(&batch, slot)
         }
-    }
-
-    /// This worker's share under `spec` of `batch`, which every worker holds
-    /// whole.
-    fn share(&self, host: &mut impl DriveHost, batch: &Batch, spec: ScatterSpec<'_>) -> Result<Batch, String> {
-        ops::op_exchange_share(batch, spec, host.parts().1.slot()).map_err(|e| format!("view {}: {e}", self.view_id))
     }
 }
 
@@ -74,35 +58,30 @@ fn run_view_epoch(
     input: Cow<'_, Batch>,
     src_id: u64,
 ) -> Result<Batch, String> {
-    let (relay, route) = {
+    let (route, fold) = {
         let (dag, registry) = host.parts();
         let (meta, plan) = ensure_compiled(&mut dag.views, registry, view_id)?;
-        let relay = Relay {
-            view_id,
-            elide: plan.code.self_contained || meta.skips_exchange,
-            shard_cols: meta.output_shard_cols().into(),
-        };
-        let route = match plan.code.self_contained {
+        let code = &plan.code;
+        let route = match code.self_contained {
             true => None,
             false => meta.source_route(src_id).cloned(),
         };
-        (relay, route)
+        let fold = match code.sides.is_empty() {
+            true => code.post.seed_folds(src_id),
+            false => code.sides.iter().any(|s| s.plan.seed_folds(src_id)),
+        };
+        (route, fold)
     };
-    let input = match &route {
-        Some(RelayRoute::Broadcast) => host.exchange(view_id, input, None),
-        Some(RelayRoute::JoinKey(slots)) => host.exchange(view_id, input, Some(ScatterSpec::JoinKey(slots))),
-        Some(RelayRoute::Share(slots)) => relay.share(host, &input, ScatterSpec::JoinKey(slots))?,
-        None => input.into_owned(),
-    };
-    run_plan(host, &relay, input, src_id)
+    let input = relay(host, view_id, input, route.as_ref(), fold);
+    run_plan(host, view_id, input, src_id)
 }
 
 /// Run every side that scans `src_id` over its delta, then the post combine.
-fn run_plan(host: &mut impl DriveHost, relay: &Relay, input: Batch, src_id: u64) -> Result<Batch, String> {
-    let code = &plan_of(host, relay.view_id).code;
+fn run_plan(host: &mut impl DriveHost, view_id: u64, input: Batch, src_id: u64) -> Result<Batch, String> {
+    let code = &plan_of(host, view_id).code;
     if code.sides.is_empty() {
         let seed = sub_seed(&code.post, input, src_id);
-        return run_post(host, relay.view_id, [seed]);
+        return run_post(host, view_id, [seed]);
     }
     // `a UNION a` scans the source on more than one side.
     let scanning: Vec<usize> = (0..code.sides.len())
@@ -111,11 +90,11 @@ fn run_plan(host: &mut impl DriveHost, relay: &Relay, input: Batch, src_id: u64)
     let mut seeds = Vec::with_capacity(scanning.len());
     if let Some((&last, rest)) = scanning.split_last() {
         for &i in rest {
-            seeds.push(run_side(host, relay, i, Batch::clone(&input), src_id)?);
+            seeds.push(run_side(host, view_id, i, Batch::clone(&input), src_id)?);
         }
-        seeds.push(run_side(host, relay, last, input, src_id)?);
+        seeds.push(run_side(host, view_id, last, input, src_id)?);
     }
-    run_post(host, relay.view_id, seeds)
+    run_post(host, view_id, seeds)
 }
 
 /// The post phase over the seeds the sides produced.
@@ -131,19 +110,20 @@ fn run_post(
 /// Side `i`'s seed for the post phase: its relayed output.
 fn run_side(
     host: &mut impl DriveHost,
-    relay: &Relay,
+    view_id: u64,
     i: usize,
     delta: Batch,
     src_id: u64,
 ) -> Result<(vm::DeltaReg, Batch), String> {
-    let (pre, seed_reg, emits_replica) = {
-        let ViewPlan { code, state } = plan_of(host, relay.view_id);
+    let (pre, seed_reg, how, fold) = {
+        let ViewPlan { code, state } = plan_of(host, view_id);
+        let fold = code.post.vm.program.folds(code.sides[i].seed_reg);
         let side = &mut code.sides[i];
         let seed = sub_seed(&side.plan, delta, src_id);
         let pre = vm::execute_epoch_multi(&mut side.plan.vm, state, [seed])?;
-        (pre, side.seed_reg, side.emits_replica)
+        (pre, side.seed_reg, side.relay.clone(), fold)
     };
-    Ok((seed_reg, relay.round(host, pre, emits_replica)?))
+    Ok((seed_reg, relay(host, view_id, Cow::Owned(pre), how.as_ref(), fold)))
 }
 
 // ── DAG traversal driver ────────────────────────────────────────────────

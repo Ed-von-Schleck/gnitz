@@ -28,20 +28,16 @@ use crate::storage::repr::seek::pk_group_end;
 use crate::storage::repr::shard_reader::MappedShard;
 
 /// Ingest runs fold into the RAM tier once they pass this. 192 KiB and 768 KiB
-/// are indistinguishable in total stall (btrfs, W=4, 4 views, 200k rows, ×3:
-/// 545/543/540 ms against 544/563/550 ms).
+/// stall alike.
 const MEMTABLE_BYTES: usize = 192 << 10;
 
 /// The RAM-tier ceiling every store opens with: it bounds that one tier, not the
-/// table's heap. At the production checkpoint cadence (4M rows, W=4, btrfs) a
-/// 4 MiB ceiling wrote 98.7 MB of spill per 4M rows and this 32 MiB none, for
-/// +45 MB of cluster RSS; shrinking it is how a test reaches the disk regime on
-/// small data.
+/// table's heap. The ceiling trades spill writes against RSS; shrinking it is how
+/// a test reaches the disk regime on small data.
 pub(crate) const DEFAULT_RAM_TIER_BYTES: usize = 32 << 20;
 
 /// What one `Table` opens with: its RAM-tier ceiling, and what bounds its
-/// registered on-disk shard bytes. Outside this crate only [`Self::new`] is
-/// reachable, so no external caller can mint a store that evicts.
+/// registered on-disk shard bytes.
 #[derive(Clone, Copy)]
 pub(crate) struct StoreBudgets {
     ram_tier_bytes: usize,

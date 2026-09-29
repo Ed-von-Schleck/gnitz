@@ -2,7 +2,7 @@
 //! `ReduceShape` part of it the ad-hoc fold shares.
 
 use crate::schema::SchemaFacts;
-use crate::schema::{DerivedSchema, OpBuildErr, SchemaBound, SchemaColumn, SchemaDescriptor};
+use crate::schema::{oob_col, DerivedSchema, SchemaBound, SchemaColumn, SchemaDescriptor};
 
 use super::super::group_key::GroupOutKey;
 use super::agg::Accumulator;
@@ -28,18 +28,14 @@ impl ReduceShape {
         key: GroupOutKey,
         mut prefix: DerivedSchema,
         aggs: &[AggDescriptor],
-    ) -> Result<Self, OpBuildErr> {
-        let over = |e: SchemaBound| OpBuildErr::shape(format!("reduce: output {e}"));
+    ) -> Result<Self, String> {
+        let over = |e: SchemaBound| format!("reduce: output {e}");
         for d in aggs {
             let src = input
                 .column(d.col_idx as usize)
-                .ok_or_else(|| OpBuildErr::oob_col("reduce: aggregate column", d.col_idx, input))?;
-            let tc = gnitz_wire::agg_output_type(d.agg_op, src.type_code).ok_or_else(|| {
-                OpBuildErr::shape(format!(
-                    "reduce: {:?} is not defined over type code {}",
-                    d.agg_op, src.type_code
-                ))
-            })?;
+                .ok_or_else(|| oob_col("reduce: aggregate column", d.col_idx, input))?;
+            let tc = gnitz_wire::agg_output_type(d.agg_op, src.type_code)
+                .ok_or_else(|| format!("reduce: {:?} is not defined over type code {}", d.agg_op, src.type_code))?;
             prefix
                 .push(SchemaColumn::new(
                     tc,
@@ -77,14 +73,14 @@ impl ReducePlan {
         group_cols: &[u32],
         aggs: &[AggDescriptor],
         seeds_ground: bool,
-    ) -> Result<Self, OpBuildErr> {
+    ) -> Result<Self, String> {
         Self::new(input, group_cols, aggs, cardinality(aggs)?, seeds_ground)
     }
 
     /// One worker's share of a global reduce over `aggs`, or `None` unless every
     /// aggregate is a count or an integer sum, the aggregates [`Self::combine`]
     /// folds.
-    pub fn partial(input: &SchemaDescriptor, aggs: &[AggDescriptor]) -> Result<Option<Self>, OpBuildErr> {
+    pub fn partial(input: &SchemaDescriptor, aggs: &[AggDescriptor]) -> Result<Option<Self>, String> {
         // No ground row: a worker with no rows contributes no partial.
         let plan = Self::from_wire(input, &[], aggs, false)?;
         Ok(plan.is_exact_linear().then_some(plan))
@@ -92,11 +88,7 @@ impl ReducePlan {
 
     /// The global reduce over relayed [`Self::partial`] outputs `[V₀ | aggregates…]`,
     /// each aggregate folding its own column by its [`AggFunc::merge_op`].
-    pub fn combine(
-        partials: &SchemaDescriptor,
-        aggs: &[AggDescriptor],
-        seeds_ground: bool,
-    ) -> Result<Self, OpBuildErr> {
+    pub fn combine(partials: &SchemaDescriptor, aggs: &[AggDescriptor], seeds_ground: bool) -> Result<Self, String> {
         let merged: Vec<AggDescriptor> = aggs
             .iter()
             .zip(1..)
@@ -115,7 +107,7 @@ impl ReducePlan {
         aggs: &[AggDescriptor],
         cardinality: usize,
         seeds_ground: bool,
-    ) -> Result<Self, OpBuildErr> {
+    ) -> Result<Self, String> {
         debug_assert!(
             !seeds_ground || group_cols.is_empty(),
             "the ground row carries no group columns"
@@ -135,8 +127,8 @@ impl ReducePlan {
 
 /// The position of the COUNT(*) holding a group's net row count: only it tells
 /// an emptied group from a live one.
-fn cardinality(aggs: &[AggDescriptor]) -> Result<usize, OpBuildErr> {
+fn cardinality(aggs: &[AggDescriptor]) -> Result<usize, String> {
     aggs.iter()
         .position(|d| d.agg_op == AggFunc::Count)
-        .ok_or_else(|| OpBuildErr::shape("reduce: a circuit reduce needs a COUNT(*)"))
+        .ok_or_else(|| "reduce: a circuit reduce needs a COUNT(*)".to_string())
 }

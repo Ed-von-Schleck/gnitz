@@ -117,7 +117,8 @@ unsigned byte comparison over the OPK region (`compare_pk_bytes`), then payload
 columns in schema order (`compare_rows`). Payload comparison skips PK columns:
 null < non-null and null == null; STRING by German-string comparison; F64/F32 by
 `total_cmp`, so NaN has a defined position and transitivity holds for every
-input; everything else as a sign-extended signed integer.
+input; every other column by its own type's order — signed integers signed,
+unsigned (incl. UUID) unsigned.
 
 > **Every merge and consolidation path must sort by (PK, payload), never by PK
 > alone.** PK-only ordering interleaves rows that share a PK but differ in
@@ -375,12 +376,11 @@ sits between `query` and `read`:
 ```
 runtime (L7)   → catalog, query, read, ops, storage, schema   orchestration · protocol · reactor
 catalog        → query, read, relation, ops, storage, schema
-query (L5)     → read, relation, ops, expr, storage, schema   compiler · vm · dag
+query (L5)     → read, relation, ops, storage, schema         compiler · vm · dag
   ── the crate seam: everything above is `gnitz-server`, below is `gnitz-store` ──
-read           → relation, ops, expr, storage, schema         ReadSpec executor · store read verbs
+read           → relation, ops, storage, schema               ReadSpec executor · store read verbs
 relation (L4)  → storage, schema                              registry · store handles · ingest
-ops            → expr, storage, schema                        join · reduce · exchange · …
-expr           → storage, schema
+ops            → storage, schema                              join · reduce · exchange · map · …
 storage        → schema                                       repr (L2) · lsm (L3)
 schema           — the bottom rung; names none of the others
 ```
@@ -400,18 +400,15 @@ Each subsystem's `mod.rs` header states its own surface, its internal split, and
 what is deliberately closed off. Read that rather than a summary here.
 
 `gnitz-foundation`, `gnitz-wire` and `gnitz-expr` sit **below this whole
-table**: they are separate crates, so a `storage`-layer `use
-gnitz_expr::RowSource` is not an up-edge into the engine's own `expr` module.
-Read `expr` in the ladder above as the engine-local expression layer only.
+table**: they are separate crates.
 
 A relation is stored as one `Table` per worker. A relation's id exceeds the id of
 every relation it scans (refused at DDL precheck), so ascending id order is
 dependency order. Test scaffolding lives in
 `test_support` / `test_rng` and per-module `tests/`. Each of the two crates has
 its own `test_support`. `gnitz-store` splits its by reach: `shared` is compiled
-again elsewhere — as the whole of `gnitz-store-testkit`, and inside
-`gnitz-server` — so it sees only that crate's public API, where `internal` is
-that crate's own. A helper goes in `internal` unless another crate needs it;
+again as `gnitz-store-testkit`, which other crates' tests link, so it sees only
+that crate's public API, where `internal` is that crate's own. A helper goes in `internal` unless another crate needs it;
 putting a local helper in `shared` forces whatever it touches to become published
 API. `gnitz-server` needs no such split: nothing links it.
 

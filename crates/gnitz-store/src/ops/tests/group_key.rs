@@ -1,9 +1,9 @@
 use super::*;
 use crate::schema::key::compare_pk_bytes;
 use crate::schema::ColumnTable;
-use crate::schema::{SchemaColumn, SchemaFacts, TypeCode};
-use crate::storage::Batch;
-use crate::test_support::{batch_of_pk_bytes, pk_payload_schema, wide_pk_3xu64_schema};
+use crate::schema::{SchemaColumn, TypeCode};
+use crate::storage::{Batch, BatchBuilder};
+use crate::test_support::{batch_of_pk_bytes, le_cell, pk_payload_schema, wide_pk_3xu64_schema};
 
 // ---------------------------------------------------------------------------
 // Group key
@@ -18,20 +18,16 @@ fn single_natural_col_keys_by_its_opk_from_either_side() {
     let key = |tc: TypeCode, le: &[u8], col1_is_pk: bool| -> (u128, Vec<u8>) {
         let cols = [SchemaColumn::new(TypeCode::U64, false), SchemaColumn::new(tc, false)];
         let schema = SchemaDescriptor::new(&cols, if col1_is_pk { &[0, 1] } else { &[0] });
-        let mut b = Batch::with_capacity(&schema, 1);
-        if col1_is_pk {
-            let mut native = [0u8; 16];
-            native[..le.len()].copy_from_slice(le);
-            b.extend_pk_opk(&[0, u128::from_le_bytes(native)]);
-        } else {
-            b.extend_pk(0u128);
+        let mut b = BatchBuilder::new(schema);
+        match col1_is_pk {
+            true => b.begin_row_opk(&[0, le_cell(le)], 1),
+            false => {
+                b.begin_row(0, 1);
+                b.put_int(le_cell(le));
+            }
         }
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        if !col1_is_pk {
-            b.extend_col(schema.payload_slot(1).unwrap(), le);
-        }
-        b.count += 1;
+        b.end_row();
+        let b = b.finish();
         let (key, _) = GroupOutKey::new(&schema, &[1], []).unwrap();
         let mb = b.as_mem_batch();
         (key.identity(&mb, 0), key.out_pk(&mb, 0).bytes().to_vec())

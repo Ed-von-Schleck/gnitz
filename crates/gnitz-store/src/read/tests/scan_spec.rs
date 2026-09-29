@@ -225,14 +225,8 @@ fn walk_fixture(name: &str, indexed: bool) -> RelationRegistry {
     for id in 0..WALK_ROWS {
         let (val, big) = walk_row(id);
         bb.begin_row(id as u128, 1);
-        match val {
-            Some(v) => bb.put_int(v as u128),
-            None => bb.put_null(),
-        }
-        match big {
-            Some(b) => bb.put_int(b),
-            None => bb.put_null(),
-        }
+        bb.put_opt_int(val.map(|v| v as u128));
+        bb.put_opt_int(big);
         bb.end_row();
     }
     registry.ingest(TID, bb.finish()).unwrap();

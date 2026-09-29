@@ -1,14 +1,6 @@
-//! The rung-guard walk: one crate's layer ladder, asserted as source text.
-//!
-//! **This file is compiled twice, from one source** — as a `cfg(test)` module
-//! here and through a `#[path]` in `gnitz-server`'s own `test_support`. Both
-//! crates are laid out as a ladder of rungs whose ordering the crate graph
-//! cannot enforce, and one walk keeps the two guards from drifting on what
-//! counts as a reach.
-//!
-//! It is deliberately not part of [`super::shared`]: that file is store-level
-//! *fixtures*, and is compiled into `gnitz-store-testkit` as library code. A
-//! ladder guard is neither, and keeping it out leaves the testkit untouched.
+//! The rung-guard walk: a crate's layer ladder, asserted as source text, and the
+//! source walk every source-text guard reads through. Compiled here and as part
+//! of `gnitz-store-testkit`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -51,30 +43,31 @@ pub fn assert_ladder(src_root: &Path, ladder: &[(&str, &[&str])]) {
 /// a higher one to build its fixture, which is not the dependency the ladder is
 /// about.
 pub fn rung_files(src_root: &Path, rung: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
     let dir = src_root.join(rung);
-    if dir.is_dir() {
-        walk(&dir, &mut out);
-    } else {
-        out.push(src_root.join(format!("{rung}.rs")));
-    }
+    let out = match dir.is_dir() {
+        true => rs_files_under(&dir, |p| p.file_name().is_none_or(|n| n != "tests")),
+        false => vec![src_root.join(format!("{rung}.rs"))],
+    };
     assert!(!out.is_empty(), "the rung guard found no files for {rung}");
     out
 }
 
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Every `.rs` file under `dir`, recursively, entering the sub-directories
+/// `enter` accepts. An unreadable directory panics.
+pub fn rs_files_under(dir: &Path, enter: impl Fn(&Path) -> bool + Copy) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
-        panic!("the rung guard must be able to read {}", dir.display());
+        panic!("a source walk must be able to read {}", dir.display());
     };
+    let mut out = Vec::new();
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
-            if p.file_name().is_some_and(|n| n == "tests") {
-                continue;
+            if enter(&p) {
+                out.extend(rs_files_under(&p, enter));
             }
-            walk(&p, out);
         } else if p.extension().is_some_and(|x| x == "rs") {
             out.push(p);
         }
     }
+    out
 }

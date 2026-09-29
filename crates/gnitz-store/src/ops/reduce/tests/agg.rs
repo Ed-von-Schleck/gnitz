@@ -1,6 +1,7 @@
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::storage::Batch;
+use crate::storage::{Batch, BatchBuilder};
+use crate::test_support::le_cell;
 use gnitz_wire::AggDescriptor;
 
 /// Single-row batch with a U64 PK and one F64 payload column carrying `val`.
@@ -12,13 +13,11 @@ fn f64_batch(val: f64) -> Batch {
         ],
         &[0],
     );
-    let mut b = Batch::with_capacity(&schema, 1);
-    b.extend_pk(1u128);
-    b.extend_weight(&1i64.to_le_bytes());
-    b.extend_null_bmp(&0u64.to_le_bytes());
-    b.extend_col(0, &val.to_le_bytes());
-    b.count += 1;
-    b
+    let mut b = BatchBuilder::new(schema);
+    b.begin_row(1u128, 1i64);
+    b.put_float(val);
+    b.end_row();
+    b.finish()
 }
 
 fn f64_acc(agg_op: AggFunc) -> Accumulator {
@@ -86,23 +85,22 @@ fn bulk_step_matches_step_from_batch() {
     cols.extend(tcs.iter().map(|&tc| SchemaColumn::new(tc, true)));
     let schema = SchemaDescriptor::new(&cols, &[0]);
     let mut rng = crate::test_rng::Rng::new(0x5eed);
-    let mut b = Batch::with_capacity(&schema, N);
+    let mut b = BatchBuilder::new(schema);
     for row in 0..N {
-        b.extend_pk(row as u128);
-        b.extend_weight(&(rng.gen_range(5) as i64 + 1).to_le_bytes());
+        b.begin_row(row as u128, rng.gen_range(5) as i64 + 1);
         let nulls = rng.next_u64() & ((1 << tcs.len()) - 1);
-        b.extend_null_bmp(&nulls.to_le_bytes());
         for (pi, &tc) in tcs.iter().enumerate() {
             let v = rng.next_u64();
-            let bytes = match tc {
-                TypeCode::F32 => ((v as i32) as f32 / 7.0).to_le_bytes().to_vec(),
-                TypeCode::F64 => ((v as i64) as f64 / 7.0).to_le_bytes().to_vec(),
-                _ => v.to_le_bytes()[..schema.columns[pi + 1].size() as usize].to_vec(),
-            };
-            b.extend_col(pi, &bytes);
+            match tc {
+                _ if nulls >> pi & 1 == 1 => b.put_null(),
+                TypeCode::F32 => b.put_float(f64::from((v as i32) as f32 / 7.0)),
+                TypeCode::F64 => b.put_float((v as i64) as f64 / 7.0),
+                _ => b.put_int(le_cell(&v.to_le_bytes()[..schema.columns[pi + 1].size() as usize])),
+            }
         }
-        b.count += 1;
+        b.end_row();
     }
+    let b = b.finish();
     let mb = b.as_mem_batch();
     for ci in 1..=tcs.len() as u32 {
         for agg_op in [

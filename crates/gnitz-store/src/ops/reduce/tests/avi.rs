@@ -6,8 +6,8 @@ use super::super::plan::ReducePlan;
 use super::*;
 use crate::ops::order_image::scalar_image;
 use crate::schema::{ColumnLocator, TypeCode};
-use crate::storage::MemBatch;
-use crate::test_support::scratch_table;
+use crate::storage::{BatchBuilder, MemBatch};
+use crate::test_support::{le_cell, scratch_table};
 use gnitz_wire::{AggDescriptor, AggFunc, ScalarKind};
 
 /// One-row batch holding `le` (the value's native little-endian bytes) in a
@@ -18,13 +18,11 @@ fn payload_row(tc: TypeCode, le: &[u8]) -> (Batch, ColumnLocator) {
         &[SchemaColumn::new(TypeCode::U64, false), SchemaColumn::new(tc, false)],
         &[0],
     );
-    let mut b = Batch::with_capacity(&schema, 1);
-    b.extend_pk(1u128);
-    b.extend_weight(&1i64.to_le_bytes());
-    b.extend_null_bmp(&0u64.to_le_bytes());
-    b.extend_col(0, &le[..schema.columns[1].size() as usize]);
-    b.count += 1;
-    (b, schema.locate(1))
+    let mut b = BatchBuilder::new(schema);
+    b.begin_row(1, 1);
+    b.put_int(le_cell(&le[..schema.columns[1].size() as usize]));
+    b.end_row();
+    (b.finish(), schema.locate(1))
 }
 
 /// The AVI's own convention on top of the shared value image: a MAX ordinal
@@ -66,16 +64,15 @@ fn a_mixed_scalar_and_wide_bake_reads_both_ordinals_back() {
     // One group. Every `b` is below 2^64, so the wide images share their leading
     // eight bytes — the collapse the sixteen-byte slot is there to avoid.
     let rows: [(u64, i32, i64, u128); 3] = [(1, 7, 5, 9), (2, 7, -3, 1 << 40), (3, 7, 11, 12)];
-    let mut delta = Batch::with_capacity(&src, rows.len());
+    let mut delta = BatchBuilder::new(src);
     for (pk, g, a, b) in rows {
-        delta.extend_pk(pk as u128);
-        delta.extend_weight(&1i64.to_le_bytes());
-        delta.extend_null_bmp(&0u64.to_le_bytes());
-        delta.extend_col(src.payload_slot(1).unwrap(), &g.to_le_bytes());
-        delta.extend_col(src.payload_slot(2).unwrap(), &a.to_le_bytes());
-        delta.extend_col(src.payload_slot(3).unwrap(), &b.to_le_bytes());
-        delta.count += 1;
+        delta.begin_row(pk as u128, 1i64);
+        delta.put_int(g as u128);
+        delta.put_int(a as u128);
+        delta.put_int(b);
+        delta.end_row();
     }
+    let delta = delta.finish();
 
     let accs = index_and_seed(&plan, &delta);
     assert_eq!(accs[0].value_bits() as i64, -3, "MIN(a) out of the widened slot");
@@ -101,15 +98,15 @@ fn wide_value(acc: &Accumulator) -> Vec<u8> {
 }
 
 /// `[pk:U64, g:I32, v]` rows of one group, `v` written by `put`.
-fn one_group_delta(src: &SchemaDescriptor, n: u64, mut put: impl FnMut(&mut Batch, u64)) -> Batch {
-    let mut delta = Batch::with_capacity(src, n as usize);
+fn one_group_delta(src: &SchemaDescriptor, n: u64, mut put: impl FnMut(&mut BatchBuilder, u64)) -> Batch {
+    let mut delta = BatchBuilder::new(*src);
     for pk in 0..n {
-        delta.begin_row(&pk.to_be_bytes(), 1);
-        delta.extend_col(src.payload_slot(1).unwrap(), &7i32.to_le_bytes());
+        delta.begin_row(pk as u128, 1);
+        delta.put_int(7);
         put(&mut delta, pk);
-        delta.commit_row(0);
+        delta.end_row();
     }
-    delta
+    delta.finish()
 }
 
 /// A 16-byte-only index has no payload column and reads its extreme out of the key.
@@ -136,7 +133,7 @@ fn a_sixteen_byte_only_bake_keeps_its_image_in_the_key() {
 
     let values = [3u128 << 100, (1 << 64) | 5, 1 << 64, u128::MAX];
     let delta = one_group_delta(&src, values.len() as u64, |b, pk| {
-        b.extend_col(src.payload_slot(2).unwrap(), &values[pk as usize].to_le_bytes());
+        b.put_int(values[pk as usize]);
     });
     let accs = index_and_seed(&plan, &delta);
     assert_eq!(wide_value(&accs[0]), (1u128 << 64).to_le_bytes(), "MIN(v)");
@@ -165,8 +162,8 @@ fn a_sixteen_byte_and_string_bake_reads_both_ordinals_back() {
     let rows = [(9u128 << 70, 'b'), (4 << 70, 'z'), (6 << 70, 'm')];
     let delta = one_group_delta(&src, rows.len() as u64, |b, pk| {
         let (a, last) = rows[pk as usize];
-        b.extend_col(src.payload_slot(2).unwrap(), &a.to_le_bytes());
-        b.extend_col_blob(src.payload_slot(3).unwrap(), format!("{SLOT_WIDE}{last}").as_bytes());
+        b.put_int(a);
+        b.put_string(&format!("{SLOT_WIDE}{last}"));
     });
     let accs = index_and_seed(&plan, &delta);
     assert_eq!(wide_value(&accs[0]), (4u128 << 70).to_le_bytes(), "MIN(a)");

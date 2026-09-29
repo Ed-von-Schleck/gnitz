@@ -35,10 +35,7 @@ fn batch(rows: &[Row<'_>]) -> Batch {
     for &(id, w, grp, val, s) in rows {
         b.begin_row(id as u128, w);
         b.put_int(grp as u128);
-        match val {
-            Some(v) => b.put_int(v as u128),
-            None => b.put_null(),
-        }
+        b.put_opt_int(val.map(|v| v as u128));
         b.put_string(s);
         b.end_row();
     }

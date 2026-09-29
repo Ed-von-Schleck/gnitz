@@ -4,8 +4,8 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-use gnitz_store::expr::MapPlan;
 use gnitz_store::ops;
+use gnitz_store::ops::MapPlan;
 use gnitz_store::relation::{CircuitState, StateIdx};
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::schema::Slot;
@@ -293,6 +293,11 @@ impl Program {
     /// The schema of the register this program's output leaves in.
     pub(in crate::query) fn out_schema(&self) -> &SchemaDescriptor {
         self.schema_of(self.out_reg)
+    }
+
+    /// A batch written to `reg` is folded.
+    pub(in crate::query) fn folds(&self, reg: DeltaReg) -> bool {
+        self.regs[reg.at()].fold
     }
 
     /// The register the epoch's output is extracted from.

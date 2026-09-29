@@ -657,59 +657,6 @@ fn test_compound_pk_secondary_index_retract() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── seek_by_index orphaned-entry infinite-loop guard ─────────────────────
-//
-// An orphaned index entry (positive weight, no matching source row) must
-// terminate the seek scan, not spin: seek_by_index must seek once and walk
-// forward, never re-seek to the same orphan on each iteration.
-
-#[test]
-fn test_seek_by_index_orphan_entry_terminates() {
-    let dir = temp_dir("seek_by_index_orphan");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
-    let tid = engine.create_table("public.orphan_t", &cols, &[0]).unwrap();
-    engine.create_index("public.orphan_t", &["val"], false).unwrap();
-
-    // Locate the index circuit on `val` (col_idx 1) and grab its schema.
-    let idx_schema = engine
-        .registry
-        .relation(tid)
-        .and_then(|r| r.index_on(&[1]))
-        .expect("index circuit on col 1")
-        .schema();
-    let idx_key_size = idx_schema.columns[0].size() as usize;
-
-    // Forge an orphan index row directly into the index table, bypassing the
-    // source-table ingest: index PK = (promoted indexed value || src_pk),
-    // weight +1, but no source row with src_pk=12345 exists.
-    let stride = idx_schema.pk_stride();
-    let mut pk = vec![0u8; stride];
-    pk[..idx_key_size].copy_from_slice(&777u64.to_le_bytes()[..idx_key_size]);
-    pk[idx_key_size..idx_key_size + 8].copy_from_slice(&12345u64.to_le_bytes());
-
-    let mut b = Batch::with_capacity(&idx_schema, 1);
-    b.push_key_row(&pk, 1);
-
-    engine
-        .registry
-        .relation_mut(tid)
-        .and_then(|r| r.index_on_mut(&[1]))
-        .expect("index circuit on col 1")
-        .ingest_owned_batch(b)
-        .unwrap();
-    engine.registry.checkpoint_base().unwrap();
-
-    // The indexed value resolves to an orphan whose source row is missing.
-    // Must return None and, crucially, must not hang.
-    let r = seek_by_index(&mut engine, tid, &[1], &[777u128]).unwrap().0;
-    assert!(r.is_none(), "orphan index entry must resolve to no source row");
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
 #[test]
 fn drop_table_removes_the_relation_entry() {
     let (mut engine, tid, dir) = table_fixture(

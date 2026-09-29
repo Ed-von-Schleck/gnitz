@@ -5,7 +5,6 @@
 //! that, plus every fallback that degrades a bound to a full scan.
 
 use super::*;
-use gnitz_expr::SchemaFacts;
 use gnitz_store::read::SourceCursor;
 use gnitz_wire::{key_image, Cut, KeyRange, PkColList};
 
@@ -146,95 +145,6 @@ fn bounded_drain_is_chunk_size_invariant_and_ascending() {
         got.sort_unstable();
         assert_eq!(got, want, "chunk {chunk}");
     }
-    engine.close();
-}
-
-/// A collected PK with no live base row says nothing about the PKs still to come
-/// in the same chunk, so the gather must skip it and keep going: breaking out of
-/// the PK loop there would silently drop every later row of the chunk.
-///
-/// The trigger is a live index entry whose base row is gone: the registry ingest
-/// retracts both sides, then the victim's index row goes back at `+1`. The DML
-/// path always retracts the pair together; the point is the gather surviving
-/// them apart.
-#[test]
-fn absent_pk_mid_chunk_does_not_truncate_the_gather() {
-    let (mut engine, tid, vid) = fixture(
-        "srccur_midchunk",
-        Some(val_bound(Cut::before(img(500)), Cut::before(img(600)))),
-    );
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    // An id in the middle of the range, so its index entry is still collected
-    // while its base row is gone and ids above it are still to come in the same
-    // chunk.
-    let victim = 55u64;
-
-    // The victim's index key, read off the live index before the retraction takes
-    // it with the base row.
-    let (idx_schema, victim_idx_key) = {
-        let entry = engine.registry.relation_or_err(tid).unwrap();
-        let ic = &entry.indexes()[0];
-        let idx_schema = ic.schema();
-        let src_pk_stride = entry.schema().pk_stride();
-        let idx_key_size = ic.key_spec().key_size();
-        let mut probe = ic.cursor();
-        let mut key = Vec::new();
-        while probe.valid {
-            let k = probe.current_pk_bytes();
-            if k[idx_key_size..idx_key_size + src_pk_stride] == victim.to_be_bytes()[..src_pk_stride] {
-                key = k.to_vec();
-                break;
-            }
-            probe.advance();
-        }
-        assert_eq!(
-            key.len(),
-            idx_schema.pk_stride(),
-            "expected a live index entry for the victim"
-        );
-        (idx_schema, key)
-    };
-
-    let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(victim as u128, -1);
-    bb.put_u64(victim * 10);
-    bb.end_row();
-    engine.registry.ingest(tid, bb.finish()).unwrap();
-
-    // Put the index entry back at `+1`: the ingest above projected the
-    // retraction into the index too.
-    let mut ib = Batch::with_capacity(&idx_schema, 1);
-    ib.push_key_row(&victim_idx_key, 1);
-    engine
-        .registry
-        .relation_mut(tid)
-        .and_then(|r| r.index_on_mut(&[1]))
-        .unwrap()
-        .ingest_owned_batch(ib)
-        .unwrap();
-
-    // The premise this pins: the store now holds no live row at the victim's key,
-    // which is what makes the gather's per-PK probe copy nothing in the middle of
-    // the chunk.
-    let victim_key = schema.opk_key(&(victim as u128).to_le_bytes());
-    let probe_entry = engine.registry.relation_or_err(tid).unwrap();
-    let mut probe = probe_entry.cursor();
-    probe.seek_bytes(victim_key.pk_bytes());
-    assert!(
-        !(probe.valid && probe.current_pk_eq(victim_key.pk_bytes()) && probe.current_weight > 0),
-        "the store must hold no live row at the victim's key"
-    );
-    drop(probe);
-
-    // One chunk holds the whole range, so the absent PK sits in the middle of it.
-    let mut cur = engine.open_source_cursor(vid, tid).unwrap();
-    assert!(matches!(cur, SourceCursor::Bounded(_)));
-    let got = drain_all(&mut cur, 64);
-    let want: Vec<(u128, i64)> = (50..60u128).filter(|&i| i != victim as u128).map(|i| (i, 1)).collect();
-    assert_eq!(
-        got, want,
-        "ids above the absent one (id {victim}) must survive the same chunk"
-    );
     engine.close();
 }
 
@@ -400,63 +310,6 @@ fn degenerate_point_range_returns_one_key_group() {
     let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)));
     assert_eq!(drain_all(&mut cur, 64), vec![(73u128, 1)]);
-    engine.close();
-}
-
-/// An in-range index entry whose base row is absent does not end the walk. The
-/// orphan is written straight into the index table; DML never leaves one.
-#[test]
-fn an_orphaned_index_entry_does_not_end_the_walk() {
-    let (mut engine, tid, vid) = fixture(
-        "srccur_orphan",
-        Some(val_bound(Cut::before(img(500)), Cut::before(img(600)))),
-    );
-
-    // Clone a live in-range entry's key (val=550 ⇒ id=55) and swap its source-PK
-    // suffix to an id no base row carries. The index schema is all-PK, zero
-    // payload, so the key IS the row.
-    let entry = engine.registry.relation_or_err(tid).unwrap();
-    let ic = &entry.indexes()[0];
-    let idx_schema = ic.schema();
-    let src_pk_stride = entry.schema().pk_stride();
-    let idx_pk_stride = idx_schema.pk_stride();
-    let idx_key_size = ic.key_spec().key_size();
-
-    let mut probe = ic.cursor();
-    let mut orphan_key = Vec::new();
-    while probe.valid {
-        let k = probe.current_pk_bytes();
-        // The leading key is val's OPK; find the entry for val=550.
-        if k[idx_key_size..idx_key_size + src_pk_stride] == 55u64.to_be_bytes()[..src_pk_stride] {
-            orphan_key = k.to_vec();
-            break;
-        }
-        probe.advance();
-    }
-    drop(probe);
-    assert_eq!(orphan_key.len(), idx_pk_stride, "expected a live index entry for id=55");
-    // id 9999 exists in no base row — the same val group, an absent source PK.
-    orphan_key[idx_key_size..idx_key_size + src_pk_stride].copy_from_slice(&9999u64.to_be_bytes()[8 - src_pk_stride..]);
-
-    let mut ob = Batch::with_capacity(&idx_schema, 1);
-    ob.push_key_row(&orphan_key, 1);
-    engine
-        .registry
-        .relation_mut(tid)
-        .and_then(|r| r.index_on_mut(&[1]))
-        .unwrap()
-        .ingest_owned_batch(ob)
-        .unwrap();
-
-    // A chunk of 1 gives the orphan an index window of its own.
-    let mut cur = engine.open_source_cursor(vid, tid).unwrap();
-    assert!(matches!(cur, SourceCursor::Bounded(_)));
-    let got = drain_all(&mut cur, 1);
-    let want: Vec<(u128, i64)> = (50..60u128).map(|i| (i, 1)).collect();
-    assert_eq!(
-        got, want,
-        "the orphan must be skipped and the walk continue to the range end"
-    );
     engine.close();
 }
 

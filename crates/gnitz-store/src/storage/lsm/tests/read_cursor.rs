@@ -111,14 +111,13 @@ fn test_seek_compound_pk_lands_on_exact_row() {
     let schema = make_schema_compound_u64();
     // Canonical (first-column-major) storage order: (1,5) then (2,3).
     // As u128 the order is reversed: pack(2,3) < pack(1,5).
-    let mut b = Batch::with_capacity(&schema, 2);
+    let mut b = BatchBuilder::new(schema);
     for &(c0, c1, v) in &[(1u64, 5u64, 100i64), (2, 3, 200)] {
-        b.extend_pk_bytes(&compound_pk_bytes(c0, c1));
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &v.to_le_bytes());
-        b.count += 1;
+        b.begin_row_bytes(&compound_pk_bytes(c0, c1), 1i64);
+        b.put_int(v as u128);
+        b.end_row();
     }
+    let mut b = b.finish();
     b.certify_layout(Layout::Consolidated);
     let mut cursor = create_read_cursor(&[Rc::new(b)], &[], schema);
 
@@ -146,14 +145,13 @@ fn i64_opk(v: i64) -> [u8; 8] {
 fn test_seek_signed_pk_lands_on_negative_row() {
     let schema = make_schema_i64pk_i64();
     // Storage (signed) order: -3, -1, 2.
-    let mut b = Batch::with_capacity(&schema, 3);
+    let mut b = BatchBuilder::new(schema);
     for &(pk, v) in &[(-3i64, 30i64), (-1, 10), (2, 20)] {
-        b.extend_pk_bytes(&i64_opk(pk));
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &v.to_le_bytes());
-        b.count += 1;
+        b.begin_row_bytes(&i64_opk(pk), 1i64);
+        b.put_int(v as u128);
+        b.end_row();
     }
+    let mut b = b.finish();
     b.certify_layout(Layout::Consolidated);
     let mut cursor = create_read_cursor(&[Rc::new(b)], &[], schema);
 
@@ -403,12 +401,11 @@ fn test_scatter_many_sources_beyond_old_cap() {
 fn test_compound_pk_multi_source_merge_order() {
     let schema = make_schema_compound_u64();
     let make = |a: u64, b: u64, val: i64| -> Rc<Batch> {
-        let mut bt = Batch::with_capacity(&schema, 1);
-        bt.extend_pk_bytes(&compound_pk_bytes(a, b));
-        bt.extend_weight(&1i64.to_le_bytes());
-        bt.extend_null_bmp(&0u64.to_le_bytes());
-        bt.extend_col(0, &val.to_le_bytes());
-        bt.count += 1;
+        let mut bt = BatchBuilder::new(schema);
+        bt.begin_row_bytes(&compound_pk_bytes(a, b), 1i64);
+        bt.put_int(val as u128);
+        bt.end_row();
+        let mut bt = bt.finish();
         bt.certify_layout(Layout::Consolidated);
         Rc::new(bt)
     };
@@ -442,14 +439,13 @@ fn pk3(a: u64, b: u64, c: u64) -> [u8; 24] {
 
 fn make_wide_batch(rows: &[([u8; 24], i64, i64)]) -> Rc<Batch> {
     let schema = wide_pk_3xu64_schema();
-    let mut bt = Batch::with_capacity(&schema, rows.len().max(1));
+    let mut bt = BatchBuilder::new(schema);
     for (pk, w, val) in rows {
-        bt.extend_pk_bytes(pk);
-        bt.extend_weight(&w.to_le_bytes());
-        bt.extend_null_bmp(&0u64.to_le_bytes());
-        bt.extend_col(0, &val.to_le_bytes());
-        bt.count += 1;
+        bt.begin_row_bytes(pk, *w);
+        bt.put_int(*val as u128);
+        bt.end_row();
     }
+    let mut bt = bt.finish();
     bt.certify_layout(Layout::Consolidated);
     Rc::new(bt)
 }
@@ -523,14 +519,13 @@ fn seek_first_positive_with_prefix_includes_negative_suffix() {
     };
     // Sorted by compare_pk_bytes: col0 asc, col1 signed asc (negatives first).
     let rows = [(mk(1, -5), 1i64), (mk(1, -1), 1), (mk(1, 3), 1), (mk(2, -9), 1)];
-    let mut b = Batch::with_capacity(&schema, rows.len());
+    let mut b = BatchBuilder::new(schema);
     for (pk, val) in &rows {
-        b.extend_pk_bytes(pk);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
-        b.count += 1;
+        b.begin_row_bytes(pk, 1i64);
+        b.put_int(*val as u128);
+        b.end_row();
     }
+    let mut b = b.finish();
     b.certify_layout(Layout::Consolidated);
     let batch = Rc::new(b);
     let mut cursor = create_read_cursor(&[batch], &[], schema);
@@ -1135,13 +1130,12 @@ fn write_skeleton_shard(
     rows: &[(u64, i64)],
 ) -> MappedShard {
     let skel = crate::storage::lsm::compact::skeleton_schema(schema);
-    let mut b = Batch::with_capacity(&skel, rows.len().max(1));
+    let mut b = BatchBuilder::new(skel);
     for &(pk, w) in rows {
-        b.extend_pk(pk as u128);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.count += 1;
+        b.begin_row(pk as u128, w);
+        b.end_row();
     }
+    let b = b.finish();
     let shard_path = dir.join(name).to_str().unwrap().to_owned();
     b.write_as_shard(
         &shard_path,

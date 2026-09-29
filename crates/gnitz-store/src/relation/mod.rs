@@ -60,6 +60,14 @@ pub struct SecondaryIndex {
 }
 
 impl SecondaryIndex {
+    /// Write index rows directly, in the index's own layout — the one write that
+    /// does not ride a projection of the owner, for a test that needs an entry no
+    /// projection of the owner could produce.
+    #[cfg(test)]
+    pub(crate) fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), crate::storage::StorageError> {
+        self.store.held_mut().ingest_owned_batch(batch)
+    }
+
     /// By value, not as a slice: `PkColList` is `Copy`, so the list can be keyed
     /// on or held past the borrow of the registry that produced it.
     pub fn cols(&self) -> PkColList {
@@ -95,13 +103,6 @@ impl SecondaryIndex {
     pub(crate) fn cursor_over(&self, r: &gnitz_wire::KeyRange) -> (ReadCursor, usize) {
         let t = self.store.held();
         t.range_cursor(self.key_spec.range_keys(t.schema().pk_stride(), r))
-    }
-
-    /// Write index rows directly, in the index's own layout — the one write that
-    /// does not ride a projection of the owner. For tests that need an entry no
-    /// projection of the owner could produce.
-    pub fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
-        self.store.held_mut().ingest_owned_batch(batch)
     }
 
     /// Project `source` into this index's layout and ingest the result.
@@ -334,7 +335,7 @@ impl Relation {
     }
 
     /// [`Self::index_on`] as `&mut`.
-    pub fn index_on_mut(&mut self, cols: &[u32]) -> Option<&mut SecondaryIndex> {
+    pub(crate) fn index_on_mut(&mut self, cols: &[u32]) -> Option<&mut SecondaryIndex> {
         self.indexes.iter_mut().find(|ix| ix.cols.as_slice() == cols)
     }
 
@@ -574,7 +575,7 @@ impl RelationRegistry {
 
     /// [`Self::relation`] as `&mut` — the one mutable route into a relation, so
     /// navigation reads the same in both directions.
-    pub fn relation_mut(&mut self, id: u64) -> Option<&mut Relation> {
+    pub(crate) fn relation_mut(&mut self, id: u64) -> Option<&mut Relation> {
         self.tables.get_mut(&id)
     }
 
@@ -598,7 +599,7 @@ impl RelationRegistry {
     }
 
     /// [`Self::relation_or_err`] as `&mut`.
-    pub fn relation_mut_or_err(&mut self, id: u64) -> Result<&mut Relation, String> {
+    pub(crate) fn relation_mut_or_err(&mut self, id: u64) -> Result<&mut Relation, String> {
         self.relation_mut(id).ok_or_else(|| Self::unregistered(id))
     }
 

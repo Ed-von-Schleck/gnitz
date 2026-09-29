@@ -6,6 +6,7 @@ use ddl_fixture::{make_secondary_index_name, parse_qualified_name};
 use gnitz_expr::SchemaFacts;
 mod ddl_tests;
 mod dir_deletion_tests;
+mod echo_fold_bench;
 mod engine_tests;
 mod fk_tests;
 mod hydrate_bench;

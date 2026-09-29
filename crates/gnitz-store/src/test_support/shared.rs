@@ -1,20 +1,7 @@
-//! The store-level test helpers `gnitz-server`'s and `gnitz-mirror`'s tests
-//! share with this crate's own.
-//!
-//! **This file is compiled three times, from one source** — as a `cfg(test)`
-//! module here, as the whole of `gnitz-store-testkit` (which is how
-//! `gnitz-mirror`'s tests reach it), and through a `#[path]` in `gnitz-server`'s
-//! own `test_support`. A copy per crate would be three independent Z-set batch
-//! builders free to drift on the one thing that fails with no error and no
-//! assertion — a batch whose layout claim or weights do not match what the
-//! encoder produced.
-//!
-//! Every path below is spelled `gnitz_store::`, which resolves through
-//! `extern crate self as gnitz_store` in this crate and to the real dependency
-//! elsewhere. So this compilation sees only `gnitz-store`'s public API, and a
-//! helper that reached a crate-internal fails to build here. When that happens
-//! the fix is to move the helper to [`super::internal`], not to publish the
-//! internal — see this module's parent for what that costs.
+//! The store-level test helpers other crates' tests share with this crate's own,
+//! compiled here and as `gnitz-store-testkit` from this one source. Every path is
+//! spelled `gnitz_store::`, so a helper sees only the public API; one that needs a
+//! crate-internal belongs in [`super::internal`].
 
 use proptest::prelude::*;
 

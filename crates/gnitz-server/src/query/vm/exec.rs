@@ -72,8 +72,8 @@ fn seed_inputs(vm: &mut Vm, inputs: impl IntoIterator<Item = (DeltaReg, Batch)>)
     all_empty
 }
 
-/// Fold `reg`'s batch, just written, when some instruction reads it at net
-/// weights: every reader runs after the write, so each sees the folded form.
+/// Fold `reg`'s batch, just written, when its register folds: every reader runs
+/// after the write, so each sees the folded form.
 #[inline]
 fn fold_written(batches: &mut [Batch], regs: &[Reg], reg: DeltaReg) {
     let written = &regs[reg.at()];

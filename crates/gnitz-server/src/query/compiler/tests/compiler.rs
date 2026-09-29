@@ -235,7 +235,7 @@ fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
 }
 
 /// A shard column the relay's group key would refuse is a `CREATE VIEW`
-/// rejection: workers route by it only mid-round, where a refusal is fatal.
+/// rejection, even on one worker, where nothing relays.
 #[test]
 fn a_float_shard_column_is_rejected() {
     let dir = scratch_dir("compiler", "float_shard");

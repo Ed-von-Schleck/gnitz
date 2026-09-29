@@ -14,7 +14,7 @@ use super::super::order_image::{
     IMAGE_COL,
 };
 use super::agg::{Accumulator, ExtremeSpec};
-use crate::schema::key::ReindexPacker;
+use crate::ops::reindex::ReindexPacker;
 use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_PK_BYTES};
 use crate::storage::{Batch, MemBatch, ReadCursor};
 use gnitz_expr::payload_bytes;
@@ -59,7 +59,7 @@ impl AviBake {
         src: &SchemaDescriptor,
         group_by_cols: &[u32],
         accs: &[Accumulator],
-    ) -> Result<Option<Self>, crate::schema::OpBuildErr> {
+    ) -> Result<Option<Self>, String> {
         let aggs: Vec<AviAgg> = accs
             .iter()
             .enumerate()

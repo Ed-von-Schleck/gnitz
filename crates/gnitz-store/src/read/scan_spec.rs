@@ -9,8 +9,8 @@ use std::rc::Rc;
 
 use super::store_io::LiveSource;
 use super::SkeletonHydrator;
-use crate::expr::MapPlan;
 use crate::ops::AdhocFold;
+use crate::ops::MapPlan;
 use crate::relation::RelationRegistry;
 use crate::schema::key::{key_range_between_cuts, leading_u64, KeyCut};
 use crate::schema::SchemaDescriptor;

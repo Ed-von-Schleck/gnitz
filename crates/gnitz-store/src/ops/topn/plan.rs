@@ -2,7 +2,7 @@
 //! compile-time facts, baked once at emit time.
 
 use crate::schema::ColumnTable;
-use crate::schema::{OpBuildErr, SchemaDescriptor};
+use crate::schema::SchemaDescriptor;
 use crate::storage::Batch;
 use gnitz_wire::OrderKey;
 
@@ -32,9 +32,9 @@ impl TopNPlan {
         order: &[OrderKey],
         limit: u64,
         offset: u64,
-    ) -> Result<Self, OpBuildErr> {
+    ) -> Result<Self, String> {
         if limit == 0 {
-            return Err(OpBuildErr::shape("top-n: a zero limit selects nothing"));
+            return Err("top-n: a zero limit selects nothing".to_string());
         }
         let (key, prefix) = GroupOutKey::new(input_schema, group_cols, 0..input_schema.num_columns() as u32)?;
         let output_schema = prefix.finish();
@@ -54,18 +54,13 @@ impl TopNPlan {
         order: &[OrderKey],
         limit: u64,
         offset: u64,
-    ) -> Result<Self, OpBuildErr> {
+    ) -> Result<Self, String> {
         Self::from_wire(input_schema, &[], order, limit.saturating_add(offset), 0)
     }
 
     /// The global window over relayed [`Self::partial`] outputs, grouped on their
     /// key.
-    pub fn combine(
-        partials: &SchemaDescriptor,
-        order: &[OrderKey],
-        limit: u64,
-        offset: u64,
-    ) -> Result<Self, OpBuildErr> {
+    pub fn combine(partials: &SchemaDescriptor, order: &[OrderKey], limit: u64, offset: u64) -> Result<Self, String> {
         // A partial's key, then the input's columns in order.
         let key = partials.pk_cols();
         let shifted: Vec<OrderKey> = order

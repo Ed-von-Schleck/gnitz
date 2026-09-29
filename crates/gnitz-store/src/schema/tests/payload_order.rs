@@ -8,20 +8,22 @@ use crate::test_support::pk_only_schema;
 /// which is why a nullable schema must resolve to `Generic`.
 #[test]
 fn null_equality_separates_the_two_payload_comparators() {
-    use crate::storage::Batch;
+    use crate::storage::BatchBuilder;
 
     let pk = SchemaColumn::new(TypeCode::U128, false);
     let nullable = SchemaDescriptor::new(&[pk, SchemaColumn::new(TypeCode::I64, true)], &[0]);
     let non_null = SchemaDescriptor::new(&[pk, SchemaColumn::new(TypeCode::I64, false)], &[0]);
 
-    let mut pair = Batch::with_capacity(&nullable, 2);
-    for null_word in [1u64, 0] {
-        pair.extend_pk(0x1234_5678_9abc_def0);
-        pair.extend_weight(&1i64.to_le_bytes());
-        pair.extend_null_bmp(&null_word.to_le_bytes());
-        pair.extend_col(0, &0i64.to_le_bytes());
-        pair.count += 1;
+    let mut pair = BatchBuilder::new(nullable);
+    for null in [true, false] {
+        pair.begin_row(0x1234_5678_9abc_def0, 1);
+        match null {
+            true => pair.put_null(),
+            false => pair.put_int(0),
+        }
+        pair.end_row();
     }
+    let pair = pair.finish();
 
     assert_eq!(
         compare_rows(&nullable, &pair, 0, &pair, 1),

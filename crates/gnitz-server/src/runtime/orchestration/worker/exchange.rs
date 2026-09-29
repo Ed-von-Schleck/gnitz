@@ -3,7 +3,7 @@
 //! SAL group arriving during that wait does.
 
 use super::*;
-use gnitz_store::ops::ScatterSpec;
+use gnitz_store::ops::ScatterPlan;
 use std::borrow::Cow;
 
 /// The worker as a drive's [`DriveHost`].
@@ -22,8 +22,8 @@ impl DriveHost for DagExchangeCtx<'_> {
         (&mut cat.dag, &mut cat.registry)
     }
 
-    fn exchange(&mut self, view_id: u64, batch: Cow<'_, Batch>, spec: Option<ScatterSpec<'_>>) -> Batch {
-        let (batch, all_drained) = self.worker.exchange(view_id, batch, spec, self.own_drained);
+    fn exchange(&mut self, view_id: u64, batch: Cow<'_, Batch>, plan: Option<&ScatterPlan>, fold: bool) -> Batch {
+        let (batch, all_drained) = self.worker.exchange(view_id, batch, plan, fold, self.own_drained);
         self.all_drained = all_drained;
         batch
     }
@@ -38,10 +38,11 @@ impl WorkerProcess {
         &mut self,
         view_id: u64,
         batch: Cow<'_, Batch>,
-        spec: Option<ScatterSpec<'_>>,
+        plan: Option<&ScatterPlan>,
+        fold: bool,
         drained: bool,
     ) -> (Batch, bool) {
-        self.mesh.publish(view_id, drained, &batch, spec);
+        self.mesh.publish(view_id, drained, &batch, plan, fold);
         // Dropped once every row is written, so this worker holds the partition
         // it sends beside the one it gathers only while its rows span parts.
         let mut batch = self.mesh.sending().then_some(batch);

@@ -1,6 +1,5 @@
-//! SQL type constants, schema descriptor types, the schema-shaping free
-//! functions derived from them, and [`OpBuildErr`] — the one vocabulary every
-//! store-side operator constructor rejects untrusted parameters through.
+//! SQL type constants, schema descriptor types, and the schema-shaping free
+//! functions derived from them.
 //!
 //! These are shared across the storage, IPC, and query layers.
 //!
@@ -8,56 +7,12 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-use std::borrow::Cow;
-
 use gnitz_wire::schema_block::SchemaBlockCol;
 use gnitz_wire::ColType;
 
-/// Why a store-side operator constructor refused the parameters it was handed —
-/// one vocabulary for all of them, so the constructor rather than each caller
-/// owns the wording of its own trust boundary.
-#[derive(Debug)]
-pub enum OpBuildErr {
-    /// The parameters do not fit the schema: an out-of-range column, an arity or
-    /// byte-budget overrun, a column type the operator has no image for. `Cow`
-    /// because most of these interpolate the offending value.
-    Shape(Cow<'static, str>),
-    /// An expression program was refused. The phrase names the guard and the
-    /// payload carries the validator's own reason, so the rejection says which
-    /// limit the program exceeded and not only which guard fired.
-    Program(&'static str, gnitz_expr::ExprValidateErr),
-}
-
-impl OpBuildErr {
-    /// A [`OpBuildErr::Shape`] from either a literal or an interpolated reason.
-    pub(crate) fn shape(why: impl Into<Cow<'static, str>>) -> Self {
-        OpBuildErr::Shape(why.into())
-    }
-
-    /// A client-supplied column index out of range for the schema it indexes;
-    /// `what` names the list it came from. The bound is always `num_columns()`,
-    /// never `MAX_COLUMNS`: the slots between read back as
-    /// [`SchemaColumn::EMPTY`].
-    pub fn oob_col(what: &str, c: u32, schema: &SchemaDescriptor) -> Self {
-        OpBuildErr::shape(format!("{what} {c} out of range ({} cols)", schema.num_columns()))
-    }
-}
-
-impl std::fmt::Display for OpBuildErr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OpBuildErr::Shape(why) => f.write_str(why),
-            OpBuildErr::Program(guard, e) => write!(f, "{guard}: {e}"),
-        }
-    }
-}
-
-/// The server's error plumbing is string-typed; this keeps `?` working where a
-/// compile hands an operator constructor's rejection on.
-impl From<OpBuildErr> for String {
-    fn from(e: OpBuildErr) -> String {
-        e.to_string()
-    }
+/// The refusal of column `c` of the `what` list, out of range for `schema`.
+pub(crate) fn oob_col(what: &str, c: u32, schema: &SchemaDescriptor) -> String {
+    format!("{what} {c} out of range ({} cols)", schema.num_columns())
 }
 
 pub(crate) use gnitz_wire::ReduceOutKey;
@@ -587,17 +542,15 @@ impl SchemaDescriptor {
     /// owning worker by hashing only the leading distribution prefix
     /// (`key[..dist_stride()]`), so the slicing rule lives in one place. `key` is
     /// the full PK, and for the full-PK default this is byte-identical to hashing
-    /// all of it. An exchange scatter resolves its own key in `ScatterKey`.
+    /// all of it. An exchange scatter resolves its own key in `ScatterPlan`.
     #[inline]
     pub fn worker_for_pk(&self, key: &[u8], num_workers: usize) -> usize {
         worker_for_pk_bytes(&key[..self.dist_stride()], num_workers)
     }
 
     /// Where this relation's rows live — the one value every placement decision
-    /// reads, so no two can disagree. Crate-visible so the
-    /// ALTER … DROP NOT NULL descriptor rebuild (`hook_column_change`) can carry it
-    /// across the swap: `SchemaDescriptor::eq` ignores it, so a rebuilt
-    /// descriptor must be constructed with it again.
+    /// reads, so no two can disagree. `SchemaDescriptor::eq` ignores it, so a
+    /// rebuilt descriptor must be constructed with it again.
     #[inline]
     pub const fn placement(&self) -> Placement {
         self.placement
@@ -669,10 +622,10 @@ impl SchemaDescriptor {
     /// Bound every `(what, column)` of `cols` against this schema. Ahead of the
     /// derivations an operator's `from_wire` runs, each of which indexes the
     /// fixed column array raw; `what` names the list the index came from.
-    pub(crate) fn check_cols<'a>(&self, cols: impl IntoIterator<Item = (&'a str, u32)>) -> Result<(), OpBuildErr> {
+    pub(crate) fn check_cols<'a>(&self, cols: impl IntoIterator<Item = (&'a str, u32)>) -> Result<(), String> {
         for (what, c) in cols {
             if self.column(c as usize).is_none() {
-                return Err(OpBuildErr::oob_col(what, c, self));
+                return Err(oob_col(what, c, self));
             }
         }
         Ok(())

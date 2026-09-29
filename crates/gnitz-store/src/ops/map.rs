@@ -4,16 +4,11 @@
 //! `gnitz_expr::RowFilter` wherever one is held; a map is this plan, which adds
 //! the PK, weight and column moves around the computed columns
 //! `gnitz_expr::MapEval` writes.
-//!
-//! The evaluator itself lives in `gnitz-expr`; this module is a consumer of that
-//! crate, not its home, so `LogicalProgram`, the instruction model and the
-//! resolved form are named `gnitz_expr::` at each call site rather than
-//! re-exported here.
 
 use gnitz_expr::{ColCopy, ExprValidateErr, LogicalProgram, MapEval};
 
-use crate::schema::key::{locate_key_col, FoldCols, ReindexPacker};
-use crate::schema::{ColumnLocator, DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
+use super::reindex::{locate_key_col, FoldCols, ReindexPacker};
+use crate::schema::{oob_col, ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
 use crate::storage::Batch;
 
 /// One map step's row window: source rows `[src, src + n)` onto destination rows
@@ -53,7 +48,7 @@ const PACK_COMPACT_RUN_LEN: usize = 24;
 /// Where a map's output PK region comes from. Owned by the plan rather than
 /// passed per call, so the region cannot be left unwritten between two
 /// statements and no caller can pair a plan with the wrong stamp.
-pub enum PkSource {
+pub(crate) enum PkSource {
     /// Copy the input PK region verbatim, into an output schema whose PK is the
     /// input's.
     Inherit,
@@ -284,8 +279,8 @@ fn reindex_hash_row(output: &mut Batch) {
 fn compute_map_output_schema(
     in_schema: &SchemaDescriptor,
     out_cols: &[(TypeCode, bool)],
-) -> Result<SchemaDescriptor, OpBuildErr> {
-    let over = |e| OpBuildErr::shape(format!("compute map: output {e}"));
+) -> Result<SchemaDescriptor, String> {
+    let over = |e| format!("compute map: output {e}");
     let mut b = DerivedSchema::new();
     b.push_pk_of(in_schema).map_err(over)?;
     for &(tc, nullable) in out_cols {
@@ -300,8 +295,8 @@ fn compute_map_output_schema(
 fn hashrow_output_schema(
     in_schema: &SchemaDescriptor,
     cols: &[gnitz_wire::ReindexSlot],
-) -> Result<SchemaDescriptor, OpBuildErr> {
-    let over = |e| OpBuildErr::shape(format!("hash-row map: output {e}"));
+) -> Result<SchemaDescriptor, String> {
+    let over = |e| format!("hash-row map: output {e}");
     let mut b = DerivedSchema::new();
     b.push_pk(SchemaColumn::new(crate::schema::TypeCode::U128, false))
         .map_err(over)?;
@@ -311,7 +306,7 @@ fn hashrow_output_schema(
         locate_key_col(in_schema, c, "hash-row map")?;
         let src = in_schema
             .column(c as usize)
-            .ok_or_else(|| OpBuildErr::oob_col("hash-row map: column", c, in_schema))?;
+            .ok_or_else(|| oob_col("hash-row map: column", c, in_schema))?;
         b.push(SchemaColumn::new(tgt.unwrap_or(src.type_code), src.nullable))
             .map_err(over)?;
     }
@@ -323,7 +318,7 @@ impl MapPlan {
     /// map program, PK source)` triple, and the trust boundary each kind's
     /// client-supplied column list clears. Every kind ends in the same
     /// [`Self::from_map`], so an elided map is validated like any other.
-    pub fn from_wire(in_schema: &SchemaDescriptor, mk: &gnitz_wire::MapKind) -> Result<Self, OpBuildErr> {
+    pub fn from_wire(in_schema: &SchemaDescriptor, mk: &gnitz_wire::MapKind) -> Result<Self, String> {
         let mut null_key_mask = 0;
         let (out_schema, prog, pk_source) = match mk {
             gnitz_wire::MapKind::Compute(map) => return Self::from_compute_map(in_schema, map),
@@ -357,21 +352,21 @@ impl MapPlan {
                 // skips a PK index while `copy_cols` still numbers a sink for it.
                 for &c in cols {
                     if in_schema.payload_slot(c as usize).is_none() {
-                        return Err(OpBuildErr::shape(format!(
+                        return Err(format!(
                             "projection map: column {c} is not a payload column of a {}-column schema",
                             in_schema.num_columns()
-                        )));
+                        ));
                     }
                 }
                 // `cols` is bounded per entry but not in length, and duplicates
                 // are legal, so a long list still overruns the fixed schema array.
                 let out_schema = crate::schema::project_schema(in_schema, cols)
-                    .ok_or_else(|| OpBuildErr::shape("projection map: output exceeds MAX_COLUMNS"))?;
+                    .ok_or_else(|| "projection map: output exceeds MAX_COLUMNS".to_string())?;
                 (out_schema, LogicalProgram::copy_cols(cols), PkSource::Inherit)
             }
         };
         let plan = Self::from_map(prog, in_schema, &out_schema, pk_source)
-            .map_err(|e| OpBuildErr::Program("map: program/schema mismatch", e))?;
+            .map_err(|e| format!("map: program/schema mismatch: {e}"))?;
         Ok(MapPlan { null_key_mask, ..plan })
     }
 
@@ -379,25 +374,21 @@ impl MapPlan {
     /// also a read spec's pre-map. The output schema is derived, never shipped —
     /// the map inherits the input's PK region verbatim ([`PkSource::Inherit`]),
     /// so no caller can describe a PK region the map does not produce.
-    pub(crate) fn from_compute_map(
-        in_schema: &SchemaDescriptor,
-        map: &gnitz_wire::ComputeMap,
-    ) -> Result<Self, OpBuildErr> {
+    pub(crate) fn from_compute_map(in_schema: &SchemaDescriptor, map: &gnitz_wire::ComputeMap) -> Result<Self, String> {
         let out_schema = compute_map_output_schema(in_schema, &map.out_cols)?;
         // The only map whose program is client bytes; every other kind builds
         // one from a column list. Rejected, not skipped: skipping a corrupt blob
         // would leave the output at the default empty schema.
-        let prog =
-            LogicalProgram::from_blob(&map.program).map_err(|e| OpBuildErr::Program("map: invalid program", e))?;
+        let prog = LogicalProgram::from_blob(&map.program).map_err(|e| format!("map: invalid program: {e}"))?;
         Self::from_map(prog, in_schema, &out_schema, PkSource::Inherit)
-            .map_err(|e| OpBuildErr::Program("map: program/schema mismatch", e))
+            .map_err(|e| format!("map: program/schema mismatch: {e}"))
     }
 
     /// Map plan from a logical expression program. A pure projection is the
     /// special case where the program computes nothing and every sink is a
     /// column copy (see [`LogicalProgram::copy_cols`]): the plan reduces to the
     /// copy list and the resolved program's null permutation.
-    pub fn from_map(
+    pub(crate) fn from_map(
         logical: LogicalProgram,
         in_schema: &SchemaDescriptor,
         out_schema: &SchemaDescriptor,
@@ -573,5 +564,5 @@ impl MapPlan {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[path = "tests/expr.rs"]
+#[path = "tests/map.rs"]
 mod tests;

@@ -1,98 +1,75 @@
-//! Exchange worker routing: `ScatterSpec`, `ScatterKey`, and the per-row
-//! routing-key helpers.
+//! Exchange worker routing: [`ScatterPlan`] and the per-row routing-key
+//! kernels.
 
-use crate::schema::key::{locate_key_col, FoldCols, ReindexPacker};
+use crate::ops::group_key::GroupKey;
+use crate::ops::reindex::{locate_key_col, FoldCols, ReindexPacker};
 use crate::schema::ColumnTable;
 use crate::schema::Slot;
 use crate::schema::{worker_for_key, worker_for_pk_bytes};
-use crate::schema::{ColumnLocator, OpBuildErr, SchemaDescriptor};
+use crate::schema::{ColumnLocator, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch};
-
-use super::super::group_key::GroupKey;
 
 /// Keep only the live rows `slot` owns: those whose PK `worker_for_pk_bytes`
 /// routes to it, the hash the equality scatter routes a join key by. A broadcast
 /// delta filtered here integrates into a trace partitioned like a scattered one.
 pub fn op_worker_filter(batch: &Batch, slot: Slot) -> Batch {
-    ScatterKey::PkPrefix(batch.schema().pk_stride()).share(batch, slot)
+    ScatterPlan::whole_pk(batch.schema()).share(batch, slot)
 }
 
-/// What a scatter routes by. Either way a row goes to the owner of the PK its
-/// consumer gives it.
-#[derive(Clone, Copy, Debug)]
-pub enum ScatterSpec<'a> {
-    /// Rows grouped by these columns: the owner of the output PK a reduce over
-    /// them keys the row's group by.
-    GroupKey(&'a [u32]),
-    /// An equi-join key: the owner of the `_join_pk` the reindex Map packs from
-    /// these `(source column, promotion target)` slots.
-    JoinKey(&'a [gnitz_wire::ReindexSlot]),
-}
+/// A scatter key resolved against one schema: each row goes to the owner of the
+/// PK its consumer gives it.
+pub struct ScatterPlan(Key);
 
-impl ScatterSpec<'_> {
-    /// Refused exactly where the scatter would refuse it.
-    pub fn check(self, schema: &SchemaDescriptor) -> Result<(), OpBuildErr> {
-        ScatterKey::new(self, schema).map(drop)
-    }
-
-    /// True iff the exchange this spec describes would move nothing: it hashes
-    /// exactly the bytes `worker_for_pk` placed the rows by.
-    pub fn routes_to_native_owner(self, schema: &SchemaDescriptor) -> bool {
-        schema.placement().is_key_routed()
-            && matches!(ScatterKey::new(self, schema), Ok(ScatterKey::PkPrefix(n)) if n == schema.dist_stride())
-    }
-}
-
-/// A [`ScatterSpec`] resolved against one schema: what each row is hashed by.
-pub(super) enum ScatterKey {
-    /// The row's leading `n` PK bytes.
-    PkPrefix(usize),
-    /// One column's OPK image — what a single-column key packs to.
-    Image(ColumnLocator),
+enum Key {
+    /// The output PK a reduce over the columns stamps — also what an unpromoted
+    /// PK-prefix or single-column join key packs to.
+    Group(GroupKey),
     /// The `_join_pk` the reindex Map packs.
     Packed(ReindexPacker),
-    /// The NULL-distinct XXH3 fold of the group columns.
-    Fold(FoldCols),
 }
 
-impl From<GroupKey> for ScatterKey {
-    fn from(key: GroupKey) -> Self {
-        match key {
-            GroupKey::PkPrefix(n) => ScatterKey::PkPrefix(n),
-            GroupKey::Image(loc) => ScatterKey::Image(loc),
-            GroupKey::Fold(fold) => ScatterKey::Fold(fold),
-        }
+impl ScatterPlan {
+    /// Rows grouped by `cols`, keyed by the output PK a reduce over them stamps.
+    pub fn group(schema: &SchemaDescriptor, cols: &[u32]) -> Result<Self, String> {
+        Ok(ScatterPlan(Key::Group(GroupKey::new(schema, cols)?)))
     }
-}
 
-impl ScatterKey {
-    /// Refused when `schema` cannot route by `spec`: a column it has not got, or
-    /// one the group key or a reindex key refuses.
-    pub(super) fn new(spec: ScatterSpec<'_>, schema: &SchemaDescriptor) -> Result<Self, OpBuildErr> {
+    /// An equi-join key, keyed by the `_join_pk` the reindex Map packs from `slots`.
+    pub fn join(schema: &SchemaDescriptor, slots: &[gnitz_wire::ReindexSlot]) -> Result<Self, String> {
         let pk = schema.pk_cols();
-        Ok(match spec {
-            ScatterSpec::GroupKey(cols) => GroupKey::new(schema, cols)?.into(),
+        let key = match slots {
             // Slots pack in slot order, so only the PK's leading columns in PK
             // order, unpromoted, pack the PK's own bytes.
-            ScatterSpec::JoinKey(slots)
-                if slots.len() <= pk.len() && slots.iter().zip(pk).all(|(&(c, t), &p)| c == p && t.is_none()) =>
-            {
-                ScatterKey::PkPrefix(
+            _ if slots.len() <= pk.len() && slots.iter().zip(pk).all(|(&(c, t), &p)| c == p && t.is_none()) => {
+                GroupKey::PkPrefix(
                     slots
                         .iter()
                         .map(|&(c, _)| schema.columns[c as usize].size() as usize)
                         .sum(),
                 )
             }
-            ScatterSpec::JoinKey(&[(c, None)])
+            &[(c, None)]
                 if schema
                     .column(c as usize)
                     .is_some_and(|col| col.type_code.is_pk_eligible()) =>
             {
-                ScatterKey::Image(locate_key_col(schema, c, "reindex key")?)
+                GroupKey::Image(locate_key_col(schema, c, "reindex key")?)
             }
-            ScatterSpec::JoinKey(slots) => ScatterKey::Packed(ReindexPacker::new(schema, slots)?),
-        })
+            _ => return Ok(ScatterPlan(Key::Packed(ReindexPacker::new(schema, slots)?))),
+        };
+        Ok(ScatterPlan(Key::Group(key)))
+    }
+
+    /// The whole PK — what [`op_worker_filter`] keeps a broadcast delta's share by.
+    fn whole_pk(schema: &SchemaDescriptor) -> Self {
+        ScatterPlan(Key::Group(GroupKey::PkPrefix(schema.pk_stride())))
+    }
+
+    /// True iff the exchange this plan describes would move nothing: it hashes
+    /// exactly the bytes `worker_for_pk` placed `schema`'s rows by.
+    pub fn routes_to_native_owner(&self, schema: &SchemaDescriptor) -> bool {
+        schema.placement().is_key_routed()
+            && matches!(self.0, Key::Group(GroupKey::PkPrefix(n)) if n == schema.dist_stride())
     }
 
     /// Route every live row of `mb` — a weight-0 row is not a Z-set element —
@@ -103,8 +80,8 @@ impl ScatterKey {
     }
 
     /// The live rows of `batch` that `slot` owns: its share of a batch every
-    /// worker holds whole.
-    pub(super) fn share(&self, batch: &Batch, slot: Slot) -> Batch {
+    /// worker holds whole, and what a round under this plan would hand it.
+    pub fn share(&self, batch: &Batch, slot: Slot) -> Batch {
         let nw = slot.of as usize;
         let mut share = Share {
             rank: slot.rank as usize,
@@ -115,12 +92,14 @@ impl ScatterKey {
     }
 
     fn route_into(&self, mb: &MemBatch, nw: usize, sink: &mut impl RowSink) {
-        match *self {
-            ScatterKey::PkPrefix(n) => route_rows(mb, sink, PrefixW { n, nw }),
-            ScatterKey::Image(loc @ ColumnLocator::Payload { .. }) => route_rows(mb, sink, ImageW::<true> { loc, nw }),
-            ScatterKey::Image(loc) => route_rows(mb, sink, ImageW::<false> { loc, nw }),
-            ScatterKey::Packed(ref packer) => route_rows_packed(mb, sink, packer, nw),
-            ScatterKey::Fold(ref fold) => route_rows(mb, sink, FoldW { fold, nw }),
+        match self.0 {
+            Key::Group(GroupKey::PkPrefix(n)) => route_rows(mb, sink, PrefixW { n, nw }),
+            Key::Group(GroupKey::Image(loc @ ColumnLocator::Payload { .. })) => {
+                route_rows(mb, sink, ImageW::<true> { loc, nw })
+            }
+            Key::Group(GroupKey::Image(loc)) => route_rows(mb, sink, ImageW::<false> { loc, nw }),
+            Key::Packed(ref packer) => route_rows_packed(mb, sink, packer, nw),
+            Key::Group(GroupKey::Fold(ref fold)) => route_rows(mb, sink, FoldW { fold, nw }),
         }
     }
 }

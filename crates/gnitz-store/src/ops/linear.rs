@@ -1,13 +1,13 @@
 //! Linear operators: filter and union.
 //!
 //! The others live with the batch mechanics they are: negate is
-//! `Batch::negated`, MAP `crate::expr::MapPlan::evaluate_map_batch`,
+//! `Batch::negated`, MAP `crate::ops::MapPlan::evaluate_map_batch`,
 //! null-extend `Batch::widened_with_nulls`.
 
 use crate::schema::{ColumnTable, SchemaFacts};
 use gnitz_expr::RowFilter;
 
-use crate::schema::{DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::Batch;
 
 // ---------------------------------------------------------------------------
@@ -32,9 +32,9 @@ pub fn op_filter(batch: &Batch, pred: &mut RowFilter) -> Option<Batch> {
 
 /// `a`'s schema with each column's nullability OR-ed with `b`'s: a NULL and a
 /// zero carry the same bytes, so only a nullable column's comparator parts them.
-pub fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Result<SchemaDescriptor, OpBuildErr> {
+pub fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Result<SchemaDescriptor, String> {
     if !a.same_layout(b) {
-        return Err(OpBuildErr::shape("union: inputs do not share a physical layout"));
+        return Err("union: inputs do not share a physical layout".to_string());
     }
     let cols: Vec<SchemaColumn> = (0..a.num_columns())
         .map(|c| {
@@ -52,9 +52,9 @@ pub fn null_extend_output_schema(
     in_schema: &SchemaDescriptor,
     type_codes: &[TypeCode],
     nulls_first: bool,
-) -> Result<SchemaDescriptor, OpBuildErr> {
+) -> Result<SchemaDescriptor, String> {
     let mut b = DerivedSchema::new();
-    let over = |e| OpBuildErr::shape(format!("null-extend: merged schema {e}"));
+    let over = |e| format!("null-extend: merged schema {e}");
     b.push_pk_of(in_schema).map_err(over)?;
     let fill = |b: &mut DerivedSchema| {
         type_codes
