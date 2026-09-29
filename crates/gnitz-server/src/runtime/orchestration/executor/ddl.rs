@@ -1,8 +1,7 @@
 //! The catalog-zone write path: one protocol, two entry points.
 //! [`handle_ddl_txn`] ingests a client bundle of system-table families;
-//! [`commit_serial_range_durable`] advances one sequence. Both reserve a zone
-//! LSN, mutate the catalog, pin the families it wrote, [`emit_zone_to_sal`] and
-//! [`publish_after_fsync`].
+//! [`commit_serial_range_durable`] advances one sequence. Both mutate the
+//! catalog, then [`emit_zone_to_sal`] and await its fsync.
 //!
 //! A DDL bundle additionally runs under [`DdlLocks`]. The serial path needs none of that: a `sys_sequences`
 //! advance has no DAG evaluation and no rollback path, and the row it broadcasts
@@ -20,7 +19,6 @@ use std::time::{Duration, Instant};
 use super::{guard_panic, park_until, request_barrier, send_msg, Shared};
 use crate::catalog::{family_pk_partition, idx_tab_partition, PkPartition, SysFamily};
 use crate::runtime::committer::BarrierKind;
-use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::UniqueFilter;
 use crate::runtime::orchestration::guard_panic_async;
 use crate::runtime::peer::Peer;
@@ -179,18 +177,14 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
             .validate_unique_index_create(owner_id, cols.as_slice())
             .await
         {
-            // No zone LSN reserved, no catalog mutation yet: just surface
-            // the violation to the client. The write lock drops on return.
+            // No catalog mutation yet: just surface the violation to the
+            // client. The write lock drops on return.
             Err(e) => return Err(e),
             Ok(Some(filter)) => filter_seeds.push((owner_id, cols, filter)),
             // The index covers the owner's PK: nothing will consult a filter.
             Ok(None) => {}
         }
     }
-
-    // Reserve the zone LSN but do NOT publish it until fsync confirms
-    // durability.
-    let zone_lsn = shared.lsn_alloc.reserve();
 
     // Ingest the families in ascending topo order so every register/index hook
     // sees its dependencies already in the memtable. For a CREATE VIEW, drain the
@@ -252,13 +246,12 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
         });
     }
     ingest_res?;
-    shared.cat_mut().mark_zone_applied(zone_lsn);
 
-    // SAL emission window: broadcast each queued family under the shared
-    // zone_lsn, commit the zone, then fsync. A failure here is unrecoverable —
-    // workers already applied the DdlSync groups in real time — so abort.
-    let synced = emit_zone_to_sal(shared, &mut shared.disp().sal().lock().await, "DDL", zone_lsn);
-    publish_after_fsync(&shared.lsn_alloc, zone_lsn, synced).await;
+    // SAL emission window: broadcast each queued family as one zone, then fsync.
+    // A failure here is unrecoverable — workers already applied the DdlSync
+    // groups in real time — so abort.
+    let (zone_lsn, synced) = emit_zone_to_sal(shared, &mut shared.disp().sal().lock().await, "DDL");
+    synced.await;
 
     // Relation ids are never reissued within a boot, so these entries are dead.
     for &id in tables.drops.iter().chain(&views.drops) {
@@ -301,20 +294,21 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
     Ok(())
 }
 
-/// Emit every queued family broadcast as one zone at `zone_lsn` and submit its
-/// fdatasync. Aborts on failure: the catalog is already mutated in memory.
+/// Emit every queued family broadcast as one zone, mark it applied, and submit
+/// its fdatasync; answers the zone LSN and the fsync. Aborts on failure: the
+/// catalog is already mutated in memory.
 fn emit_zone_to_sal<'w>(
     shared: &Shared,
     excl: &mut SalExcl<'w>,
     op: &'static str,
-    zone_lsn: u64,
-) -> impl Future<Output = ()> + 'w {
+) -> (u64, impl Future<Output = ()> + 'w) {
     let disp = shared.disp();
     let drained = shared.cat_mut().drain_pending_broadcasts();
     // Nothing inside the scope is visible until it commits, so a refused group
     // leaves no half-written zone behind. The block is synchronous throughout,
     // which is what the scope requires.
-    let scope = excl.begin(zone_lsn, "ddl");
+    let scope = excl.begin("ddl");
+    let zone_lsn = scope.lsn();
     let emitted = guard_panic(op, || {
         // The wire carries the family as its tid; this is the one place the
         // typed family narrows.
@@ -326,18 +320,12 @@ fn emit_zone_to_sal<'w>(
     if let Err(e) = emitted {
         gnitz_fatal_abort!("{} broadcast failed after in-memory catalog mutation: {}", op, e);
     }
-    // Synced even when no zone opened: publishing `zone_lsn` vouches for every
-    // LSN below it.
-    scope.commit();
-    excl.sync(disp.reactor(), op)
-}
-
-/// Await `synced`, then publish `zone`. Paired for the same reason
-/// `ZoneLsnAllocator` pairs reserve and publish: no caller can publish an LSN
-/// whose bytes are not yet on disk.
-async fn publish_after_fsync(alloc: &ZoneLsnAllocator, zone: u64, synced: impl Future<Output = ()>) {
-    synced.await;
-    alloc.publish(zone);
+    // Only a closed zone raises the replay floor: an LSN no member carries can
+    // be the next scope's, whose zone boot replay would then skip.
+    if scope.commit() {
+        shared.cat_mut().mark_zone_applied(zone_lsn);
+    }
+    (zone_lsn, excl.sync(disp.reactor(), op))
 }
 
 /// Durably reserve a SERIAL id range for `seq_id` and return its base. It commits
@@ -349,7 +337,7 @@ async fn publish_after_fsync(alloc: &ZoneLsnAllocator, zone: u64, synced: impl F
 /// `handle_ddl_txn` holds its write guard past the fsync instead, needing it for
 /// its post-fsync catalog cleanup and the backfill.
 pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: u64, count: u64) -> Result<i64, String> {
-    let (base, zone_lsn, synced) = {
+    let (base, synced) = {
         // Lock order catalog -> SAL, matching INSERT/SEEK, so acquiring SAL under
         // catalog.write cannot deadlock. Both guards drop at the end of this block.
         let _write = shared.catalog_rwlock.write().await;
@@ -357,7 +345,6 @@ pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: u64
         let mut excl = shared.disp().sal().lock().await;
 
         let (base, delta) = shared.cat().reserve_user_sequence(seq_id, count)?;
-        let zone_lsn = shared.lsn_alloc.reserve();
 
         // A sys_sequences advance is a pure system-table write (no view tick,
         // no rollback); a hook failure on a well-formed 2-row delta is an
@@ -365,15 +352,14 @@ pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: u64
         if let Err(e) = shared.cat_mut().submit(SysFamily::Sequence, delta) {
             gnitz_fatal_abort!("sys_sequences ingest (serial range) failed: {}", e);
         }
-        shared.cat_mut().mark_zone_applied(zone_lsn);
 
         // SAL emission under the still-held `SalExcl`; the fdatasync SQE is
         // submitted synchronously. Both guards drop as this block ends, before
         // the await below.
-        let synced = emit_zone_to_sal(shared, &mut excl, "serial-range", zone_lsn);
-        (base, zone_lsn, synced)
+        let (_, synced) = emit_zone_to_sal(shared, &mut excl, "serial-range");
+        (base, synced)
     };
 
-    publish_after_fsync(&shared.lsn_alloc, zone_lsn, synced).await;
+    synced.await;
     Ok(base)
 }

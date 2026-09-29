@@ -391,8 +391,8 @@ fn run_worker_child(
 }
 
 /// The master's half of recovery before any worker exists: the sweep set every
-/// worker inherits, and the zone-LSN seed: the newest zone the system families hold.
-fn master_pre_fork_recovery(catalog: &mut CatalogEngine) -> Result<(Vec<u64>, u64), String> {
+/// worker inherits.
+fn master_pre_fork_recovery(catalog: &mut CatalogEngine) -> Result<Vec<u64>, String> {
     // G → G+1, the resume generation left at G: until `boot_checkpoint`
     // restamps at G+1, a crash rebuilds every view instead of resuming it.
     catalog.advance_durable_generation()?;
@@ -410,8 +410,7 @@ fn master_pre_fork_recovery(catalog: &mut CatalogEngine) -> Result<(Vec<u64>, u6
     // workers that do not exist yet.
     catalog.compute_invalid_views();
 
-    let lsn_seed = catalog.system_zone();
-    Ok((swept_base_tables(catalog), lsn_seed))
+    Ok(swept_base_tables(catalog))
 }
 
 /// Fork one child per worker, each of which never returns. Yields the parent's
@@ -527,7 +526,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: TlsArgs)
     // Leaked: the dispatcher and reactor borrow it for the life of the process.
     let catalog: &'static mut CatalogEngine = Box::leak(Box::new(catalog));
 
-    let (swept_bases, lsn_seed) = master_pre_fork_recovery(catalog)?;
+    let swept_bases = master_pre_fork_recovery(catalog)?;
 
     let worker_pids = fork_workers(catalog, data_dir, num_workers, &ipc, &swept_bases, pinning.as_ref())?;
 
@@ -569,7 +568,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: TlsArgs)
 
     let listeners = listen::bind_listeners(data_dir, socket_path, tls)?;
     gnitz_note!("GnitzDB ready");
-    Ok(ServerExecutor::run(dispatcher, data_dir, listeners, lsn_seed))
+    Ok(ServerExecutor::run(dispatcher, data_dir, listeners))
 }
 
 #[cfg(test)]

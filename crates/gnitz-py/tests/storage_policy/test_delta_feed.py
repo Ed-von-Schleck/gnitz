@@ -174,8 +174,8 @@ def test_an_up_to_date_poll_writes_no_sal_bytes(own_server):
 
 
 def test_a_poll_of_a_stream_fed_view_takes_no_tick_and_loses_no_round(client, schema_name):
-    """Every other read of a stream-fed view drains pending ticks, since a stream
-    push never advances the published tick. A delta poll answers "what has
+    """Every other read of a stream-fed view drains the tick a push leaves
+    pending. A delta poll answers "what has
     happened", so it drains nothing — else every poll would tick the whole server.
 
     Observable because a drain is synchronous: a poll issued right after a push

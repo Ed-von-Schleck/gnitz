@@ -26,7 +26,6 @@ use super::TxnFamily;
 use crate::catalog::CatalogEngine;
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
 use crate::runtime::listen::ClientListener;
-use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{forward_scan, MasterDispatcher, WORKER_WATCH};
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, RecvBuf, WriteGuard};
@@ -129,9 +128,8 @@ pub struct Shared {
     /// [`Shared::note_commit_rows`], so every trigger this process sends is minted
     /// in one place.
     tick_tx: chan::Sender<TickTrigger>,
-    /// Zone-LSN allocation high-water + durability watermark, read by the
-    /// committer so the read handlers report the same LSN it assigns.
-    pub(super) lsn_alloc: ZoneLsnAllocator,
+    /// The SAL watermark the last completed tick snapshotted: every commit at or
+    /// below it is reflected in every view.
     last_tick_lsn: Cell<u64>,
     /// Tables with a pending delta, each with the row count feeding the tick
     /// threshold.
@@ -146,19 +144,12 @@ pub struct Shared {
     /// makes the test and the send one step.
     draining: Cell<bool>,
     /// OCC per-table commit-LSN map: `tid → the zone LSN its last accepted write
-    /// this boot rode`. That LSN is published for a durable write; for a stream it is
-    /// a reservation the batch never published, which is what makes
-    /// `read_is_fresh` answer false and drain. A missing entry reads as `boot_seed`.
+    /// this boot rode`. A missing entry reads as `boot_seed`.
     /// Single-threaded reactor — a plain `RefCell`, and no borrow is ever held across an
     /// `.await`.
     table_commit_lsn: RefCell<FxHashMap<u64, u64>>,
-    /// The default for a `table_commit_lsn` miss (a table not written this boot),
-    /// seeded to the catalog's system zone — the value `lsn_alloc.published()`
-    /// also starts at. Within a boot every live OCC basis is ≥ it and every
-    /// commit's zone exceeds it, so a miss cannot false-pass. That rests on a
-    /// basis being a read's watermark, held no longer than the connection that
-    /// read it, not on this dominating every pre-crash durable zone, which it
-    /// need not.
+    /// The SAL watermark when the executor started: every read watermark this
+    /// boot is at or above it, and every commit's zone above it.
     boot_seed: u64,
     /// Set by the watchdog when it tears the node down over a dead worker. The
     /// watchdog is detached and its `Output` discarded, so this is how the
@@ -284,11 +275,9 @@ impl Shared {
     }
 
     /// The zone LSN of `tid`'s last committed write this boot, or `boot_seed` for
-    /// a table not written this boot. The miss default is sound for OCC because
-    /// every live basis is ≥ `boot_seed` (the argument is on that field), and for
-    /// read freshness because `boot_seed` is the same `initial_lsn` `last_tick_lsn`
-    /// is seeded to, so an unwritten table compares as absorbed — which it is,
-    /// boot finishing its recovery tick sweep first.
+    /// a table not written this boot: no basis read this boot is below it, and
+    /// `last_tick_lsn` starts at it, so an unwritten table compares as absorbed —
+    /// which it is, boot finishing its recovery tick sweep first.
     fn commit_lsn_of(&self, tid: u64) -> u64 {
         self.table_commit_lsn
             .borrow()
@@ -367,12 +356,9 @@ impl Shared {
 pub struct ServerExecutor;
 
 impl ServerExecutor {
-    pub fn run(dispatcher: Rc<MasterDispatcher>, data_dir: &str, listeners: Vec<ClientListener>, lsn_seed: u64) -> i32 {
+    pub fn run(dispatcher: Rc<MasterDispatcher>, data_dir: &str, listeners: Vec<ClientListener>) -> i32 {
         let reactor = Rc::clone(dispatcher.reactor());
-
-        // Every zone LSN this boot allocates exceeds `lsn_seed`; the boot
-        // recovery that computes it states what it dominates.
-        let initial_lsn = lsn_seed;
+        let boot_seed = dispatcher.sal().watermark();
 
         let (committer_tx, committer_rx) = chan::unbounded::<CommitRequest>();
         let (tick_tx, tick_rx) = chan::unbounded::<TickTrigger>();
@@ -382,13 +368,12 @@ impl ServerExecutor {
             catalog_rwlock: AsyncRwLock::default(),
             tick_gate: AsyncRwLock::default(),
             tick_tx,
-            lsn_alloc: ZoneLsnAllocator::new(initial_lsn),
-            last_tick_lsn: Cell::new(initial_lsn),
+            last_tick_lsn: Cell::new(boot_seed),
             tick_rows: RefCell::new(FxHashMap::default()),
             table_locks: RefCell::new(FxHashMap::default()),
             draining: Cell::new(false),
             table_commit_lsn: RefCell::new(FxHashMap::default()),
-            boot_seed: initial_lsn,
+            boot_seed,
             worker_crashed: Cell::new(false),
             data_dir: data_dir.to_string(),
             hello_timeout: Duration::from_millis(gnitz_foundation::env::env_num(
@@ -598,17 +583,15 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
 
 /// Emit one Tick group for every `tid` and await the per-worker ACKs.
 async fn run_tick(shared: &Rc<Shared>, tids: &[u64]) -> Result<(), WireFault> {
-    // Snapshot before any .await: a concurrent push can advance the published LSN
-    // while we wait for tick ACKs, and setting last_tick_lsn to that
-    // higher value would report an LSN that this tick never processed.
-    let snapshot_lsn = shared.lsn_alloc.published();
+    // Snapshot in the same step as the caller's drain of `tick_rows`: the
+    // committer queues a commit's tids as it lays the commit out, so every
+    // commit at or below the snapshot was drained by this tick or an earlier
+    // one. A later snapshot could cover a commit this tick never took.
+    let snapshot_lsn = shared.disp().sal().watermark();
     if tids.is_empty() {
         // Nothing pending: an earlier completed tick already took every commit
-        // published at or below the snapshot, because the committer queues a tid
-        // before it publishes that commit's zone LSN. The watermark still
-        // advances — `read_is_fresh` reads it, and a reader whose source
-        // committed between a tick's dequeue and its publish would otherwise
-        // never see its drain take effect.
+        // at or below the snapshot. The watermark still advances, so a drain a
+        // reader waits on brings `last_tick_lsn` up to the moment it ran.
         shared.last_tick_lsn.set(snapshot_lsn);
         return Ok(());
     }
@@ -864,7 +847,7 @@ async fn handle_read(
                     schema_version: server_version,
                     ..Default::default()
                 },
-                arg0: shared.last_tick_lsn.get(),
+                arg0: read_watermark(shared, kind),
                 data: if rows.is_empty() {
                     ipc::WireData::None
                 } else {
@@ -1102,10 +1085,10 @@ fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, target_id: u64, name_bl
 /// transitively, through view sources — committed at or below the last completed
 /// tick's watermark.
 ///
-/// Sound because the committer marks every scanned tid in `tick_rows` before
-/// publishing that commit's zone LSN, a contract stated at that mark; a *missing* map entry is
-/// the `boot_seed` argument. Erring towards false is harmless (one extra drain),
-/// which is where a stream lands: its reserved LSN is never published.
+/// Sound because the committer queues a commit's tids in `tick_rows` in the
+/// step that lays the commit out (see `run_tick`'s snapshot); a *missing* map
+/// entry is the `boot_seed` argument. Erring towards false is harmless (one
+/// extra drain).
 ///
 /// A non-view target is vacuously fresh and answers before the closure walk.
 /// Caller holds the catalog read lock.
@@ -1188,13 +1171,12 @@ fn terminal_scan_msg(target_id: u64, arg0: u64, arg1: u64) -> ipc::WireMsg<'stat
 }
 
 /// The LSN at or below which every commit is reflected in a read of a `kind`
-/// relation. Called under the read's own SAL hold: every durable allocator
-/// reserves and lays out its zone under that hold (DDL under the catalog write
-/// lock, which the read's guard excludes), so every zone `<= reserved()` is in
-/// the SAL ahead of the read or was rolled back. A view reflects its last tick.
+/// relation. Called under the read's own SAL hold, so every zone at or below
+/// the SAL watermark precedes the read's group in the log. A view reflects its
+/// last tick.
 fn read_watermark(shared: &Shared, kind: RelationKind) -> u64 {
     match kind {
-        RelationKind::BaseTable => shared.lsn_alloc.reserved(),
+        RelationKind::BaseTable => shared.disp().sal().watermark(),
         _ => shared.last_tick_lsn.get(),
     }
 }

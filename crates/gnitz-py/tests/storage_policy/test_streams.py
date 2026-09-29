@@ -42,8 +42,8 @@ def test_views_over_a_stream_track_pushes_from_their_creation_on(client, schema_
     """A GROUP BY view tracks every push. A view over that *view* backfills from
     its accumulated output store like over any view, while a second view over the
     stream itself starts empty: a stream's backfill scans a store that holds no
-    rows. Every read verb — SQL, `scan`, `scan_many` — drains its own pending
-    tick, since a stream push never advances the published tick."""
+    rows. Every read verb — SQL, `scan`, `scan_many` — drains the tick the push
+    before it left pending."""
     sn = schema_name
     _stream(client, sn)
     client.execute_sql(f"CREATE VIEW hot AS {_HOT}", schema_name=sn)

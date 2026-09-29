@@ -30,7 +30,7 @@ mod protocol;
 mod reactor;
 mod tls;
 
-use orchestration::{committer, executor, lsn, master, peer, worker};
+use orchestration::{committer, executor, master, peer, worker};
 use protocol::{mesh, sal, w2m, wire};
 
 pub(crate) use bootstrap::server_main;

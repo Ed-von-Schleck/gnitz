@@ -795,6 +795,9 @@ pub(crate) struct SalWriter {
     epoch: Cell<u32>,
     /// The anchored synced offset of the live epoch.
     synced: Cell<u64>,
+    /// The LSN of the latest scope that published anything; see
+    /// [`Self::watermark`].
+    watermark: Cell<u64>,
     checkpoint_threshold: u64,
     /// A group was refused since the last reset that an empty log would admit,
     /// so a checkpoint is warranted whatever the write cursor says. Cleared by
@@ -825,6 +828,7 @@ impl SalWriter {
             write_cursor: Cell::new(0),
             epoch: Cell::new(0),
             synced: Cell::new(0),
+            watermark: Cell::new(0),
             checkpoint_threshold,
             refused_transient: Cell::new(false),
             num_workers,
@@ -985,7 +989,8 @@ impl SalWriter {
 
     /// Open a publication scope at zone LSN `lsn`: groups laid out in it are
     /// invisible until [`SalScope::commit`], and an uncommitted drop discards
-    /// the span. `tag` names the scope for [`ZONE_PANIC`].
+    /// the span. `tag` names the scope for [`ZONE_PANIC`]. Live scopes take
+    /// their LSN from [`SalExcl::begin`]; only tests pick one.
     fn begin(&self, lsn: u64, tag: &'static str) -> SalScope<'_> {
         debug_assert!(lsn != 0, "LSN 0 marks a group outside every zone");
         SalScope {
@@ -1081,6 +1086,19 @@ impl SalWriter {
     pub(crate) fn epoch(&self) -> u32 {
         self.epoch.get()
     }
+
+    /// The zone LSN a scope opened now would take: its position on the log.
+    /// The epoch is the high word, so LSNs follow SAL order across checkpoints
+    /// and restarts. Two scopes that published anything never share one.
+    fn next_zone_lsn(&self) -> u64 {
+        epoch_word(self.epoch.get(), self.write_cursor.get())
+    }
+
+    /// Every scope that published anything took an LSN at or below this; every
+    /// scope opened later takes one above it. Moves only when a scope commits.
+    pub(crate) fn watermark(&self) -> u64 {
+        self.watermark.get()
+    }
 }
 
 /// Sole write access. Dropping it wakes each worker a group written under it
@@ -1096,10 +1114,10 @@ impl<'a> SalExcl<'a> {
         self.writer.write(g)
     }
 
-    /// See [`SalWriter::begin`]. `&mut`, so no scope overlaps another, a rewind
-    /// or a [`Self::sync`].
-    pub(crate) fn begin(&mut self, lsn: u64, tag: &'static str) -> SalScope<'_> {
-        self.writer.begin(lsn, tag)
+    /// See [`SalWriter::begin`], at the log's next zone LSN. `&mut`, so no scope
+    /// overlaps another, a rewind or a [`Self::sync`].
+    pub(crate) fn begin(&mut self, tag: &'static str) -> SalScope<'_> {
+        self.writer.begin(self.writer.next_zone_lsn(), tag)
     }
 
     /// `fdatasync` the log, fatal on failure; once done, anchor the cursor at
@@ -1122,9 +1140,12 @@ impl<'a> SalExcl<'a> {
         self.writer.rewind(next_epoch(self.writer.epoch.get()));
     }
 
-    /// The boot rewind, to the live epoch the recovered tail names.
+    /// The boot rewind, to the live epoch the recovered tail names. Seeds the
+    /// watermark below every LSN this boot, above every earlier boot's.
     pub(crate) fn boot_rewind(&mut self, live_epoch: u32) {
-        self.writer.rewind(live_epoch);
+        let w = self.writer;
+        w.rewind(live_epoch);
+        w.watermark.set(w.next_zone_lsn() - 1);
     }
 
     /// Wake every worker a group written since the last wake reached.
@@ -1160,6 +1181,11 @@ pub(crate) struct SalScope<'a> {
 }
 
 impl SalScope<'_> {
+    /// The LSN this scope's zone members carry.
+    pub(crate) fn lsn(&self) -> u64 {
+        self.lsn
+    }
+
     /// Lay `g` out inside the scope, unpublished. `zoned` puts it in the
     /// scope's atomic zone at the scope's LSN; otherwise it is written at LSN 0.
     pub(crate) fn write(&self, g: &DirectGroup, zoned: bool) -> Result<(), WireFault> {
@@ -1190,6 +1216,10 @@ impl SalScope<'_> {
     pub(crate) fn commit(mut self) -> bool {
         self.committed = true;
         let end = self.writer.write_cursor.get();
+        // An empty scope's LSN is the next scope's too, so it must not count.
+        if end > self.from {
+            self.writer.watermark.set(self.lsn);
+        }
         let Some(last) = self.last_member.get() else {
             self.writer.publish_range(self.from, end);
             return false;

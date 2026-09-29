@@ -275,11 +275,10 @@ impl CommitUnit {
     }
 }
 
-/// Commit one batch of pushes. Emits every group's SAL writes and submits the
-/// fsync SQE under one SAL hold, THEN awaits worker ACKs (Phase C) and the fsync
-/// CQE (Phase D). LSN
-/// assignment and `done.send` happen after worker ACKs; the unique-index filter
-/// update happens after fsync.
+/// Commit one batch of pushes. Emits every group's SAL writes, queues their tids
+/// for the tick and submits the fsync SQE under one SAL hold, THEN awaits worker
+/// ACKs (Phase C) and the fsync CQE (Phase D). `done.send` and the unique-index
+/// filter update happen after fsync.
 async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: Vec<PendingTxn>) {
     // Sort by tid so runs are homogeneous. Stable: arrival order within a run is
     // what makes intra-batch last-insert-wins mean last *inserted*.
@@ -366,22 +365,19 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
     }
 
     // ------------------------------------------------------------------
-    // Phase B (under the SAL writer): emit SAL groups, submit fsync SQE.
-    //
-    // The batch's recoverable groups form one zone, whose LSN publishes only
-    // after its fsync (Phase D).
+    // Phase B (under the SAL writer): emit SAL groups, queue their tids for the
+    // tick, submit fsync SQE. The batch's recoverable groups form one zone.
     // ------------------------------------------------------------------
     let (zone_lsn, synced) = {
         let disp = shared.disp();
         let mut excl = disp.sal().lock().await;
 
-        let zone_lsn = shared.lsn_alloc.reserve();
-
         // Nothing laid out inside the scope is visible until it commits, so a
         // transaction that runs out of SAL space part-way can take its earlier
         // families back. Every write, the commit and the fsync submit are in
         // this one synchronous block, so no reader ever observes the gap.
-        let scope = excl.begin(zone_lsn, "commit");
+        let scope = excl.begin("commit");
+        let zone_lsn = scope.lsn();
 
         // Emit every unit into the zone, in unit order (transactions first). The
         // first recoverable group the scope admits opens the zone.
@@ -402,51 +398,37 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
         }
 
         let synced = scope.commit().then(|| excl.sync(disp.reactor(), "committer"));
+        // Queued in the block that laid the groups out, so a tick whose snapshot
+        // of the SAL watermark covers `zone_lsn` also takes these tids — what
+        // `read_is_fresh` relies on. The tick's group follows these in the log,
+        // and the auto-tick it may fire overlaps the ACKs and the fsync.
+        shared.note_commit_rows(units.iter().flat_map(|u| u.live()).map(|g| (g.tid, g.merged.len())));
         (zone_lsn, synced)
     };
 
     // ------------------------------------------------------------------
-    // Phase C (no lock): await push ACKs, per live group in unit order, then
-    // fire tick. Replies for later groups wait in their routes meanwhile.
-    // fsync is awaited separately in Phase D so DAG evaluation overlaps
-    // with fdatasync (~5 ms gap eliminated). LSN publish is deferred to
-    // after fsync so clients only see a durable LSN.
+    // Phase C (no lock): await push ACKs, per live group in unit order. Replies
+    // for later groups wait in their routes meanwhile.
     // unique_filter_ingest_batch is NOT called here: a filter entry for rows a
     // crash would discard makes the next INSERT of the same key fail a
     // uniqueness check nothing durable backs. It runs after Phase D's fsync.
     // ------------------------------------------------------------------
-    {
-        for g in units.iter().flat_map(|u| u.live()) {
-            if let Err(e) = g.lease.acks().await {
-                // The group is durable and the other workers applied it: answering it
-                // would leave the SAL and this worker's partition disagreeing.
-                gnitz_fatal_abort!("worker rejected a committed group (tid={}): {}", g.tid, e);
-            }
+    for g in units.iter().flat_map(|u| u.live()) {
+        if let Err(e) = g.lease.acks().await {
+            // The group is durable and the other workers applied it: answering it
+            // would leave the SAL and this worker's partition disagreeing.
+            gnitz_fatal_abort!("worker rejected a committed group (tid={}): {}", g.tid, e);
         }
-        // Bump tick counters and maybe fire the auto-tick BEFORE awaiting
-        // the fsync CQE so DAG evaluation overlaps with fdatasync. We
-        // bump on writes that succeeded at the worker level — the LSN publish
-        // is deferred but tick batching can proceed.
-        //
-        // CONTRACT for `read_is_fresh`: this mark must precede the Phase-D
-        // `publish`, or a tick whose snapshot already reached that LSN can miss
-        // the tid and the freshness test serves the view without its delta.
-        shared.note_commit_rows(units.iter().flat_map(|u| u.live()).map(|g| (g.tid, g.merged.len())));
     }
 
     // ------------------------------------------------------------------
-    // Phase D (no lock): await fsync CQE.  Client response is held until
-    // after fsync so the client sees only durable data. A batch of nothing but
-    // stream groups opened no zone: no fsync to await, and no LSN to publish.
+    // Phase D (no lock): await fsync CQE. Client response is held until after
+    // fsync so the client sees only durable data. A batch of nothing but stream
+    // groups opened no zone, so has no fsync to await. Pushes batched together
+    // share one zone LSN.
     // ------------------------------------------------------------------
     if let Some(synced) = synced {
         synced.await;
-        // Publish the zone LSN exactly once, after fsync confirms durability.
-        // Pipelined pushes batched together share one zone_lsn, so clients may see
-        // duplicate LSNs — only non-decreasing monotonicity is guaranteed.
-        if units.iter().flat_map(|u| u.live()).next().is_some() {
-            shared.lsn_alloc.publish(zone_lsn);
-        }
     }
 
     // Update unique-index filters now that fsync confirms durability.

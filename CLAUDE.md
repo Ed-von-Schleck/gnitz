@@ -596,9 +596,8 @@ occupy the SAL exactly as a table's do, so it is reclaimed by the same byte-base
 checkpoint test and at the same rate — except inside a DDL window, where no
 checkpoint runs, and where a stream is the most likely thing to reach the ceiling.
 
-Every read of a stream-fed view drains pending ticks: freshness is measured
-against the published tick, which a stream push never advances. A cost, not a
-correctness defect — when nothing is pending the drain takes the empty fast path.
+A read of a view drains pending ticks when a push it reaches has not been
+ticked yet — a stream push exactly as a table's.
 
 ## Window functions
 
@@ -660,7 +659,7 @@ for cross-process visibility. It exists solely for crash recovery.
 
 Durable operations are atomic: crash recovery applies an operation in full
 or not at all, so a crash never leaves a half-written DDL or push behind.
-They fdatasync before the ACK, publish their zone LSN, and reply with it.
+They fdatasync before the ACK and reply with their zone LSN.
 Everything else wakes the workers without a sync and replies LSN `0`: the
 command-only operations — view ticks, scans, seeks, backfills, validation
 queries — plus a push to a **stream**, which upserts nothing that survives a

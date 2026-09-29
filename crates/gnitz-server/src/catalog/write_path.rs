@@ -118,11 +118,6 @@ impl CatalogEngine {
         self.system_zone = self.system_zone.max(zone_lsn);
     }
 
-    /// The newest SAL zone applied to the system families.
-    pub(crate) fn system_zone(&self) -> u64 {
-        self.system_zone
-    }
-
     /// Catalog families are applied in memory but not yet committed to the SAL.
     pub(crate) fn has_uncommitted_families(&self) -> bool {
         !self.pending_broadcasts.is_empty()

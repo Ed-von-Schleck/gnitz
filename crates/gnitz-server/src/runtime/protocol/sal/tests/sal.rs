@@ -507,7 +507,7 @@ fn every_bit_of_a_zoned_slot_is_covered_by_its_own_checksum() {
     let schema = make_schema_u64_i64();
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
     let mut excl = try_poll_once(sal.writer.lock()).expect("uncontended");
-    let scope = excl.begin(5, "test");
+    let scope = excl.begin("test");
     sal.push_group(16, schema, &batch, |g| scope.write(g, true));
     assert!(scope.commit(), "the zone was open");
     drop(excl);
