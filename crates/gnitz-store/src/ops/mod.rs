@@ -35,7 +35,7 @@ mod bench_join;
 
 pub use distinct::{op_weight_clamp, ClampPreset};
 pub use exchange::op_worker_filter;
-pub use exchange::{op_exchange_gather, op_exchange_route, ScatterSpec};
+pub use exchange::{op_exchange_gather, op_exchange_route, op_exchange_share, ScatterSpec};
 pub use join::{op_join_delta_trace, JoinPlan, JoinProbe};
 pub use linear::{null_extend_output_schema, op_filter, op_union, union_nullability_merge};
 pub(crate) use reduce::AdhocFold;

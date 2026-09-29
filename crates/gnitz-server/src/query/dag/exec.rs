@@ -2,7 +2,6 @@
 //! runs through, and the DAG evaluation driver.
 
 use super::*;
-use crate::query::compiler::OUTPUT_RELAY;
 
 /// One edge of a tick's schedule: `producer`'s output feeds `view`. Field order
 /// is the sort order, and sorting puts a view after every view it reads, because
@@ -37,61 +36,27 @@ struct Relay {
     view_id: u64,
     /// This view's shuffle is a proven no-op, so a round hands its batch back.
     elide: bool,
-    /// This epoch's source is replicated and another worker holds its counted
-    /// copy, so that worker sends the single-sourced rounds.
-    muted: bool,
     /// What a side's output round routes by: the view's shard columns.
     shard_cols: Box<[u32]>,
 }
 
 impl Relay {
-    /// The relay of `view_id`'s epoch over `src_id`'s delta, its output rounds
-    /// routed by `shard_cols`.
-    fn new(registry: &RelationRegistry, view_id: u64, src_id: u64, elide: bool, shard_cols: &[u32]) -> Relay {
-        let muted = registry
-            .relation(src_id)
-            .is_some_and(|r| !r.schema().placement().counts_on(registry.slot().rank));
-        Relay {
-            view_id,
-            elide,
-            muted,
-            shard_cols: shard_cols.into(),
+    /// One repartition of a side's output. A side whose output every worker
+    /// holds whole keeps its own share; any other runs a round, even for an
+    /// empty batch, so the collective rounds stay balanced across workers.
+    fn round(&self, host: &mut impl DriveHost, batch: Batch, emits_replica: bool) -> Result<Batch, String> {
+        let spec = ScatterSpec::GroupKey(&self.shard_cols);
+        match (self.elide, emits_replica) {
+            (true, _) => Ok(batch),
+            (false, true) => self.share(host, &batch, spec),
+            (false, false) => Ok(host.exchange(self.view_id, Cow::Owned(batch), Some(spec))),
         }
     }
 
-    /// One repartition round of a side's output. Run even for an empty batch, so
-    /// the collective rounds stay balanced across workers.
-    fn round(&self, host: &mut impl DriveHost, batch: Batch, emits_replica: bool) -> Batch {
-        match self.elide {
-            true => batch,
-            false => self.send(
-                host,
-                Cow::Owned(batch),
-                OUTPUT_RELAY,
-                Some(ScatterSpec::GroupKey(&self.shard_cols)),
-                emits_replica,
-            ),
-        }
-    }
-
-    /// Publish `batch` under `key`, split by `spec` or whole to every worker, and
-    /// take back what this worker owns. A muted round publishes an empty batch
-    /// instead: under `replica` every worker holds the same rows, so sending them
-    /// all would relay each one `W` times.
-    fn send(
-        &self,
-        host: &mut impl DriveHost,
-        batch: Cow<'_, Batch>,
-        key: u64,
-        spec: Option<ScatterSpec<'_>>,
-        replica: bool,
-    ) -> Batch {
-        if self.muted && replica {
-            let empty = Batch::empty_with_schema(batch.schema());
-            drop(batch);
-            return host.exchange(self.view_id, Cow::Owned(empty), key, spec);
-        }
-        host.exchange(self.view_id, batch, key, spec)
+    /// This worker's share under `spec` of `batch`, which every worker holds
+    /// whole.
+    fn share(&self, host: &mut impl DriveHost, batch: &Batch, spec: ScatterSpec<'_>) -> Result<Batch, String> {
+        ops::op_exchange_share(batch, spec, host.parts().1.slot()).map_err(|e| format!("view {}: {e}", self.view_id))
     }
 }
 
@@ -112,13 +77,11 @@ fn run_view_epoch(
     let (relay, route) = {
         let (dag, registry) = host.parts();
         let (meta, plan) = ensure_compiled(&mut dag.views, registry, view_id)?;
-        let relay = Relay::new(
-            registry,
+        let relay = Relay {
             view_id,
-            src_id,
-            plan.code.self_contained || meta.skips_exchange,
-            meta.output_shard_cols(),
-        );
+            elide: plan.code.self_contained || meta.skips_exchange,
+            shard_cols: meta.output_shard_cols().into(),
+        };
         let route = match plan.code.self_contained {
             true => None,
             false => meta.source_route(src_id).cloned(),
@@ -126,7 +89,9 @@ fn run_view_epoch(
         (relay, route)
     };
     let input = match &route {
-        Some(route) => relay.send(host, input, src_id, route.spec(), true),
+        Some(RelayRoute::Broadcast) => host.exchange(view_id, input, None),
+        Some(RelayRoute::JoinKey(slots)) => host.exchange(view_id, input, Some(ScatterSpec::JoinKey(slots))),
+        Some(RelayRoute::Share(slots)) => relay.share(host, &input, ScatterSpec::JoinKey(slots))?,
         None => input.into_owned(),
     };
     run_plan(host, &relay, input, src_id)
@@ -178,7 +143,7 @@ fn run_side(
         let pre = vm::execute_epoch_multi(&mut side.plan.vm, state, [seed])?;
         (pre, side.seed_reg, side.emits_replica)
     };
-    Ok((seed_reg, relay.round(host, pre, emits_replica)))
+    Ok((seed_reg, relay.round(host, pre, emits_replica)?))
 }
 
 // ── DAG traversal driver ────────────────────────────────────────────────

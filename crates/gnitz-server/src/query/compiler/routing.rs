@@ -21,21 +21,10 @@ pub(crate) enum RelayRoute {
     /// range slot, so equal eq-values co-partition both sides and the range
     /// probe stays partition-local.
     JoinKey(Box<[gnitz_wire::ReindexSlot]>),
+    /// A replicated source's [`RelayRoute::JoinKey`]: every worker holds the
+    /// whole delta, so each keeps its own share of it and no round runs.
+    Share(Box<[gnitz_wire::ReindexSlot]>),
 }
-
-impl RelayRoute {
-    /// The scatter this route splits a partition by; `None` for a broadcast.
-    pub(crate) fn spec(&self) -> Option<ScatterSpec<'_>> {
-        match self {
-            RelayRoute::Broadcast => None,
-            RelayRoute::JoinKey(slots) => Some(ScatterSpec::JoinKey(slots)),
-        }
-    }
-}
-
-/// The source id a round carries when it is not a source's own scatter: a
-/// side's relayed output, which routes by the view's own shard columns.
-pub(crate) const OUTPUT_RELAY: u64 = 0;
 
 /// Per-view circuit metadata, derived from one circuit load: every worker routes
 /// its own partitions by it, so no two workers can route one round differently.
@@ -116,23 +105,24 @@ impl ViewMeta {
                 && !use_.owner_trimmed
                 // A clamp over one worker's slice admits the key once per worker.
                 && (replicated(tid) || !use_.set_fed);
-            let skips = match &route {
-                // A broadcast's matches spread over the whole other side.
-                RelayRoute::Broadcast => false,
-                RelayRoute::JoinKey(k) => {
-                    ScatterSpec::JoinKey(k).routes_to_native_owner(&schema) || partner_makes_every_match
+            // A broadcast never skips: its matches spread over the whole other side.
+            if let RelayRoute::JoinKey(k) = &route {
+                if ScatterSpec::JoinKey(k).routes_to_native_owner(&schema) || partner_makes_every_match {
+                    continue;
                 }
-            };
-            if skips {
-                continue;
-            }
-            // Every worker scatters by this key mid-round, where a refusal aborts
-            // it.
-            if let RelayRoute::JoinKey(slots) = &route {
-                ScatterSpec::JoinKey(slots)
+                // Every worker scatters by this key mid-round, where a refusal
+                // aborts it.
+                ScatterSpec::JoinKey(k)
                     .check(&schema)
                     .map_err(|e| format!("source {tid} scatter key: {e}"))?;
             }
+            let route = match route {
+                // Every worker already holds the whole delta a broadcast would
+                // hand it.
+                RelayRoute::Broadcast if replicated(tid) => continue,
+                RelayRoute::JoinKey(slots) if replicated(tid) => RelayRoute::Share(slots),
+                route => route,
+            };
             source_routes.insert(tid, route);
         }
 

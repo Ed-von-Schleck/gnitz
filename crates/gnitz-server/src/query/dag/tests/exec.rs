@@ -157,7 +157,7 @@ fn backfill_chunk_runs_only_the_named_view() {
     assert!(drive(&mut LocalDrive(&mut engine), backfill(999_999), empty).is_err());
 }
 
-// ── The relay's single-sourcing ─────────────────────────────────────────────
+// ── A side's output relay ───────────────────────────────────────────────────
 
 /// Records the row count of every batch a relay sends, and relays it back.
 struct Recorder<'a> {
@@ -170,58 +170,54 @@ impl DriveHost for Recorder<'_> {
         (&mut self.cat.dag, &mut self.cat.registry)
     }
 
-    fn exchange(&mut self, _view_id: u64, batch: Cow<'_, Batch>, _key: u64, _spec: Option<ScatterSpec<'_>>) -> Batch {
+    fn exchange(&mut self, _view_id: u64, batch: Cow<'_, Batch>, _spec: Option<ScatterSpec<'_>>) -> Batch {
         self.sent.push(batch.len());
         batch.into_owned()
     }
 }
 
-/// Every other rank still takes part in the round, with an empty batch.
+/// A side whose output every worker holds whole never reaches the host: each
+/// rank keeps its own share, and the ranks' shares partition the output. Any
+/// other side's output runs a round.
 #[test]
-fn a_replicated_sources_relay_is_sent_by_worker_0_alone() {
-    let cols = view_cols();
+fn a_replica_sides_output_is_shared_without_a_round() {
+    let rows: Vec<(u64, i64, i64)> = (1..=16).map(|k| (k, 1, k as i64 * 10)).collect();
+    let mut shares: Vec<u64> = Vec::new();
     for rank in [0u32, 1] {
-        let mut engine = CatalogEngine::open_master(&scratch_dir("dag_exec", &format!("relay_trim_{rank}")), 2)
+        let mut engine = CatalogEngine::open_master(&scratch_dir("dag_exec", &format!("relay_share_{rank}")), 2)
             .unwrap()
             .replay()
             .unwrap();
-        let replicated = engine.allocate_ids(1).unwrap();
-        engine.write_column_records(replicated, &cols).unwrap();
-        let mut bb = gnitz_store::storage::BatchBuilder::new(*crate::catalog::SysFamily::Table.schema());
-        let flags = gnitz_wire::TableProps {
-            distribution: gnitz_wire::TableDistribution::Replicated,
-            ..Default::default()
-        }
-        .pack();
-        crate::test_support::push_table_tab_row(
-            &mut bb,
-            replicated,
-            crate::catalog::PUBLIC_SCHEMA_ID,
-            "rt",
-            gnitz_wire::pack_pk_cols(&[0]),
-            flags,
-            1,
-        );
-        engine.submit(crate::catalog::SysFamily::Table, bb.finish()).unwrap();
-        let keyed = engine.create_table("public.kt", &cols, &[0]).unwrap();
+        let t = engine.create_table("public.t", &view_cols(), &[0]).unwrap();
         engine.registry.reconcile_child_dirs().unwrap();
         engine
             .open_stores(rank, gnitz_store::relation::Residency::Worker)
             .unwrap();
 
-        let delta = delta_for(&engine, replicated, &[(1, 1, 10), (2, 1, 20)]);
-        // One relay per source: muting is bound at construction.
-        let over_replicated = Relay::new(&engine.registry, 99, replicated, false, &[]);
-        let over_keyed = Relay::new(&engine.registry, 99, keyed, false, &[]);
+        let delta = delta_for(&engine, t, &rows);
+        let relay = Relay {
+            view_id: 99,
+            elide: false,
+            shard_cols: Box::from([0u32]),
+        };
         let mut host = Recorder { cat: &mut engine, sent: Vec::new() };
-        over_replicated.send(&mut host, Cow::Borrowed(&delta), replicated, None, true);
-        over_keyed.send(&mut host, Cow::Borrowed(&delta), keyed, None, true);
-        // A single-side round is not single-sourced, so it is sent by every rank.
-        over_replicated.round(&mut host, delta, false);
+        let share = relay.round(&mut host, Batch::clone(&delta), true).unwrap();
+        assert!(host.sent.is_empty(), "rank {rank}: a replica's share runs no round");
+        shares.extend((0..share.len()).map(|i| share.get_pk(i) as u64));
 
-        let replicated_rows = if rank == 0 { 2 } else { 0 };
-        assert_eq!(host.sent, vec![replicated_rows, 2, 2], "rank {rank}");
+        relay.round(&mut host, delta, false).unwrap();
+        assert_eq!(
+            host.sent,
+            vec![rows.len()],
+            "rank {rank}: any other output runs a round"
+        );
     }
+    shares.sort_unstable();
+    assert_eq!(
+        shares,
+        (1..=16).collect::<Vec<u64>>(),
+        "the ranks' shares partition the output"
+    );
 }
 
 // ── Per-epoch cost ──────────────────────────────────────────────────────────

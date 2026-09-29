@@ -10,7 +10,7 @@ use std::borrow::Cow;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::query::compiler::{self, CompileOutput, SubPlan, ViewMeta};
+use crate::query::compiler::{self, CompileOutput, RelayRoute, SubPlan, ViewMeta};
 use crate::query::vm;
 use gnitz_store::ops::{self, ScatterSpec};
 use gnitz_store::relation::{CircuitState, Relation, RelationRegistry, StateLayout};
@@ -29,9 +29,9 @@ use meta::DepMap;
 /// the other workers.
 pub(crate) trait DriveHost {
     fn parts(&mut self) -> (&mut DagEngine, &mut RelationRegistry);
-    /// This worker's `batch` for `view_id`, repartitioned by `spec` in the round
-    /// `key` names — with no spec, every worker's whole batch: the rows it owns.
-    fn exchange(&mut self, view_id: u64, batch: Cow<'_, Batch>, key: u64, spec: Option<ScatterSpec<'_>>) -> Batch;
+    /// This worker's share of every worker's `batch` for `view_id` under
+    /// `spec`; with none, all of it.
+    fn exchange(&mut self, view_id: u64, batch: Cow<'_, Batch>, spec: Option<ScatterSpec<'_>>) -> Batch;
 }
 
 // ---------------------------------------------------------------------------

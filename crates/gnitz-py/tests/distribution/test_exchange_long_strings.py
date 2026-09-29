@@ -2,13 +2,20 @@
 carry `t.body`, a string past the inline threshold, so every partition a worker
 publishes and every slice it gathers carries heap bytes. Views created before
 the insert run the tick path, after it the backfill path, pad rounds included.
+
+The same cases run again on a server with tiny exchange outboxes, where every
+round spans many parts.
 """
 
+import gnitz
+import pytest
 from _read import bag, rows
 from _serverproc import NEEDS_MULTI
 from _sql import insert
 
 pytestmark = NEEDS_MULTI
+
+_SMALL_OUTBOX_ENV = {"GNITZ_MESH_OUTBOX_BYTES": "8192"}
 
 _T = [(i, i % 400, f"row-{i}-" + "z" * 200) for i in range(800)]   # (pk, k, body)
 _U = [(i, i * 3) for i in range(400)]                               # (id, b)
@@ -59,3 +66,19 @@ def test_a_backfill_exchanges_long_string_rows(client, schema_name):
     _fill(client, sn)
     _create_views(client, sn)
     _assert_views(client, sn)
+
+
+@pytest.mark.parametrize("views_first", [True, False], ids=["tick", "backfill"])
+def test_long_string_rounds_span_many_parts(own_server, views_first):
+    own_server.start(extra_env=_SMALL_OUTBOX_ENV)
+    with gnitz.connect(own_server.sock_path) as client:
+        sn = "parts"
+        client.create_schema(sn)
+        _create_tables(client, sn)
+        if views_first:
+            _create_views(client, sn)
+            _fill(client, sn)
+        else:
+            _fill(client, sn)
+            _create_views(client, sn)
+        _assert_views(client, sn)

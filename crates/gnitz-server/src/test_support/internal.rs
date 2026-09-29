@@ -132,7 +132,6 @@ impl crate::query::DriveHost for LocalDrive<'_> {
         &mut self,
         view_id: u64,
         _batch: std::borrow::Cow<'_, Batch>,
-        _key: u64,
         _spec: Option<gnitz_store::ops::ScatterSpec<'_>>,
     ) -> Batch {
         panic!("view {view_id} relayed: this host serves exchange-free circuits only");

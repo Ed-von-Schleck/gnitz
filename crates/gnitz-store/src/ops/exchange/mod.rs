@@ -8,6 +8,6 @@
 mod round;
 mod router;
 
-pub use round::{op_exchange_gather, op_exchange_route};
+pub use round::{op_exchange_gather, op_exchange_route, op_exchange_share};
 pub use router::op_worker_filter;
 pub use router::ScatterSpec;

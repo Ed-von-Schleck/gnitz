@@ -1,95 +1,142 @@
 //! The exchange mesh: workers trade a round's partitions directly through one
-//! anonymous shared mapping. Every worker runs the same rounds in the same order,
-//! so a round is complete once the cluster-wide `arrivals` count reaches
-//! `(round + 1) * W`. Each worker has two outboxes, alternating by round, so it
-//! rewrites one only after every peer has gathered from it. Nothing here is
-//! durable.
+//! anonymous shared mapping. A round is one or more parts, and each part is one
+//! arrival per worker. Every worker runs the same parts in the same order, so a
+//! part is complete once the cluster-wide `arrivals` count reaches
+//! `(part + 1) * W`. Each worker has two outboxes, alternating by part, so it
+//! rewrites one only after every peer has read it. A partition too large for
+//! one outbox continues in the round's next part. Nothing here is durable.
 //!
 //! ```text
-//! [0, 64)                        arrivals: AtomicU64 — publishes since boot
-//! [HEADER_BYTES + (2w + p) * OUTBOX_BYTES, +OUTBOX_BYTES)   worker w's outbox p
-//!   outbox: [Head][dir: (u64 offset, u64 len) × W][pad to BLOCKS_AT][blocks, 8-aligned]
+//! [0, 8)                         arrivals: AtomicU64 — parts published since boot
+//! [8, 16)                        outbox_bytes: u64 — fixed when the region is mapped
+//! [HEADER_BYTES + (2w + p) * outbox_bytes, +outbox_bytes)   worker w's outbox p
+//!   outbox: [Head, padded to BLOCKS_AT][blocks, 8-aligned]
 //! ```
 //!
-//! A block is one receiver's rows as a WAL block of the round's schema, which
-//! every worker already holds from its own partition; `len == 0` sends none. The
-//! [`Head`] names the round, and is the divergence check.
+//! A block is one receiver's rows of a part as a WAL block of the round's
+//! schema, which every worker already holds from its own partition; an empty
+//! [`Span`] sends none. The [`Head`] names the view, and is the divergence check.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::runtime::sal::MAX_WORKERS;
 use crate::runtime::w2m::SalWake;
-use crate::runtime::wire::WireData;
 use gnitz_foundation::posix_io;
 use gnitz_store::ops::{op_exchange_gather, op_exchange_route, ScatterSpec};
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::{decode_mem_batch_from_wal_block, Batch, Layout, MAX_BATCH_REGIONS};
 
-/// Virtual bytes of one outbox; each round rewrites it from its start.
-const OUTBOX_BYTES: usize = 1 << 30;
+/// The default and largest virtual size of one outbox.
+pub(crate) const OUTBOX_BYTES: usize = 1 << 30;
+const _: () = assert!(
+    OUTBOX_BYTES <= u32::MAX as usize,
+    "a WAL block stores its size as a u32"
+);
 
 const PAGE_BYTES: usize = 4096;
 
-/// The page holding `arrivals`; the outboxes start past it.
+/// The page holding `arrivals` and the outbox size; the outboxes start past it.
 const HEADER_BYTES: usize = PAGE_BYTES;
 
-/// Where an outbox's blocks start: past its [`Head`] and its directory, one
-/// `(offset, len)` pair per receiver.
+/// Where an outbox's blocks start: past its [`Head`].
 const BLOCKS_AT: usize = PAGE_BYTES;
-const DIR_AT: usize = size_of::<Head>();
-const _: () = assert!(
-    DIR_AT + MAX_WORKERS * 16 <= BLOCKS_AT,
-    "an outbox's head and directory fit its first page"
-);
+const _: () = assert!(size_of::<Head>() <= BLOCKS_AT, "an outbox's head fits its first page");
 
-/// Resident bytes an outbox keeps past its latest round; a round that ends
+/// Resident bytes an outbox keeps past its latest part; a part that ends
 /// further below the outbox's high-water mark returns the pages beyond it.
 const RESIDENT_SLACK_BYTES: usize = 64 << 20;
 
-fn region_bytes(nw: usize) -> usize {
-    HEADER_BYTES + 2 * nw * OUTBOX_BYTES
+/// The outbox size: `GNITZ_MESH_OUTBOX_BYTES`, clamped, or [`OUTBOX_BYTES`].
+pub(crate) fn outbox_bytes() -> usize {
+    let asked = gnitz_foundation::env::env_num("GNITZ_MESH_OUTBOX_BYTES", OUTBOX_BYTES);
+    let size = asked.clamp(2 * PAGE_BYTES, OUTBOX_BYTES).next_multiple_of(PAGE_BYTES);
+    if size != asked {
+        gnitz_info!(
+            "GNITZ_MESH_OUTBOX_BYTES={asked} is outside [{}, {OUTBOX_BYTES}] or not page-sized; using {size}",
+            2 * PAGE_BYTES
+        );
+    }
+    size
 }
 
-/// The mesh region for `nw` workers, zeroed, shared with every forked child and
-/// never unmapped.
-pub(crate) fn create_region(nw: usize) -> std::io::Result<*mut u8> {
-    posix_io::map_anon_shared(region_bytes(nw))
+/// The mesh region for `nw` workers' outboxes of `outbox_bytes` each, zeroed but
+/// for the size it records, shared with every forked child and never unmapped.
+pub(crate) fn create_region(nw: usize, outbox_bytes: usize) -> std::io::Result<*mut u8> {
+    let base = posix_io::map_anon_shared(HEADER_BYTES + 2 * nw * outbox_bytes)?;
+    // SAFETY: the mapping is page-aligned and its first page is the header.
+    unsafe { base.add(8).cast::<u64>().write(outbox_bytes as u64) };
+    Ok(base)
 }
 
-/// An outbox's first bytes: the round its blocks belong to.
+/// Bytes `[at, at + len)` of an outbox; `len == 0` names no block.
 #[derive(Clone, Copy)]
+#[repr(C)]
+struct Span {
+    at: u64,
+    len: u64,
+}
+
+impl Span {
+    const EMPTY: Span = Span { at: 0, len: 0 };
+}
+
+/// An outbox's first bytes: what the publisher's part is, and each receiver's
+/// block of it.
 #[repr(C)]
 struct Head {
     view: u64,
-    key: u64,
-    round: u64,
     /// The publisher's source partition is drained — a backfill stops once every
     /// worker's is.
     drained: u64,
     /// The published partition was consolidated, so every block is.
     consolidated: u64,
+    /// The publisher has rows left for another part of this round.
+    more: u64,
+    blocks: [Span; MAX_WORKERS],
 }
 
 pub(crate) struct Mesh {
     base: *mut u8,
     rank: usize,
-    /// Rounds this worker has gathered — identical on every worker.
-    round: u64,
-    /// The round this worker published and has not gathered yet.
-    open: Option<OpenRound>,
+    outbox_bytes: usize,
+    /// Parts gathered since boot — identical on every worker; its parity picks
+    /// the outbox.
+    part: u64,
+    open: Option<Open>,
     /// One per worker, on its W2M header's `sal_park` word.
     wakes: Vec<SalWake>,
-    /// Per-worker row lists of the round being published, reused.
+    /// Per-receiver row lists of the round being sent, reused across rounds.
     routed: Vec<Vec<u32>>,
     /// How far into each of this worker's outboxes pages may be resident.
     resident: [usize; 2],
 }
 
-/// What [`Mesh::gather`] checks the peers' heads against and decodes by.
-struct OpenRound {
+/// A round between its [`Mesh::publish`] and the [`Mesh::advance`] that
+/// finishes it.
+struct Open {
     view: u64,
-    key: u64,
     schema: SchemaDescriptor,
+    drained: bool,
+    /// The published batch was consolidated, so every block this worker writes is.
+    consolidated: bool,
+    /// How far this worker's writing has come; `None` once every row it sends
+    /// is written.
+    unsent: Option<Cursor>,
+    /// This receiver's non-empty blocks from the round's earlier parts, copied
+    /// out raw.
+    saved: Vec<Vec<u8>>,
+    /// Every sender of a saved block was consolidated.
+    saved_consolidated: bool,
+}
+
+/// How far a round's writing has come through its row lists: at
+/// `routed[list][offset..]`.
+#[derive(Clone, Copy)]
+struct Cursor {
+    /// `routed[0]` goes to every receiver.
+    shared: bool,
+    list: usize,
+    offset: usize,
 }
 
 impl Mesh {
@@ -104,7 +151,9 @@ impl Mesh {
         Mesh {
             base,
             rank,
-            round: 0,
+            // SAFETY: `create_region` wrote it before any worker was forked.
+            outbox_bytes: unsafe { base.add(8).cast::<u64>().read() } as usize,
+            part: 0,
             open: None,
             wakes,
             routed: Vec::new(),
@@ -121,64 +170,133 @@ impl Mesh {
         unsafe { AtomicU64::from_ptr(self.base.cast()) }
     }
 
-    /// Worker `w`'s outbox for the current round.
+    /// Worker `w`'s outbox for the current part.
     fn outbox(&self, w: usize) -> *mut u8 {
         assert!(w < self.nw(), "worker {w} of {}", self.nw());
         // SAFETY: `w < nw`, so the outbox lies inside the region.
-        unsafe { self.base.add(HEADER_BYTES + (2 * w + self.parity()) * OUTBOX_BYTES) }
+        unsafe {
+            self.base
+                .add(HEADER_BYTES + (2 * w + self.parity()) * self.outbox_bytes)
+        }
     }
 
     fn parity(&self) -> usize {
-        (self.round % 2) as usize
+        (self.part % 2) as usize
     }
 
-    /// Open round `(view, key)`: write `batch` into this worker's outbox, split
-    /// by `spec` or, with none, whole to every worker; count the arrival, and wake
-    /// every peer if it completed the round. Fatal while a round is open, on
-    /// oversize, or on a refused route.
-    pub(crate) fn publish(&mut self, view: u64, key: u64, drained: bool, batch: &Batch, spec: Option<ScatterSpec<'_>>) {
-        assert!(
-            self.open.is_none(),
-            "exchange of view {view}, key {key}: a round is already open"
-        );
+    /// Open a round of `view`: send the live rows of `batch` split by `spec` or,
+    /// with none, all of them to every worker, as the round's first part. Fatal
+    /// while a round is open, on a refused route, or on a row larger than an
+    /// outbox.
+    pub(crate) fn publish(&mut self, view: u64, drained: bool, batch: &Batch, spec: Option<ScatterSpec<'_>>) {
+        assert!(self.open.is_none(), "exchange of view {view}: a round is already open");
         let nw = self.nw();
-        let mut out = Outbox {
-            base: self.outbox(self.rank),
-            end: BLOCKS_AT,
-            view,
-        };
-        out.head(Head {
-            view,
-            key,
-            round: self.round,
-            drained: drained as u64,
-            consolidated: (batch.layout() == Layout::Consolidated) as u64,
-        });
-        match spec {
-            None => {
-                let at = out.put(WireData::Whole(batch));
-                (0..nw).for_each(|r| out.direct(r, at));
-            }
+        let shared = match spec {
             Some(spec) => {
-                let routed = op_exchange_route(batch, spec, &mut self.routed, nw)
-                    .unwrap_or_else(|e| gnitz_fatal_abort!("exchange of view {view}, key {key}: {e}"));
-                // A heap-referencing row cannot be framed in place; its subset
-                // carries its own heap.
-                let heapless = batch.heap_referencing_slots() == 0;
-                for (r, rows) in routed.iter().enumerate() {
-                    let at = match heapless {
-                        true => out.put(WireData::Scattered { batch, indices: rows }),
-                        false => out.put(WireData::Whole(&batch.ascending_subset(rows))),
-                    };
-                    out.direct(r, at);
+                op_exchange_route(batch, spec, &mut self.routed, nw)
+                    .unwrap_or_else(|e| gnitz_fatal_abort!("exchange of view {view}: {e}"));
+                false
+            }
+            None => {
+                self.routed.resize_with(1, Vec::new);
+                let live = &mut self.routed[0];
+                live.clear();
+                live.extend((0..batch.len()).filter(|&i| batch.get_weight(i) != 0).map(|i| i as u32));
+                true
+            }
+        };
+        self.open = Some(Open {
+            view,
+            schema: *batch.schema(),
+            drained,
+            consolidated: batch.layout() == Layout::Consolidated,
+            unsent: Some(Cursor { shared, list: 0, offset: 0 }),
+            saved: Vec::new(),
+            saved_consolidated: true,
+        });
+        self.send_part(Some(batch));
+    }
+
+    /// This worker has rows of the open round still to write, from the batch it
+    /// published.
+    pub(crate) fn sending(&self) -> bool {
+        self.open.as_ref().is_some_and(|open| open.unsent.is_some())
+    }
+
+    /// Send the open round's next part: what is left of `batch`'s rows, or
+    /// nothing once they are all written.
+    fn send_part(&mut self, batch: Option<&Batch>) {
+        let open = self.open.as_ref().expect("a part of an open round");
+        let mut head = Head {
+            view: open.view,
+            drained: open.drained as u64,
+            consolidated: open.consolidated as u64,
+            more: 0,
+            blocks: [Span::EMPTY; MAX_WORKERS],
+        };
+        let mut unsent = open.unsent;
+        let mut end = BLOCKS_AT;
+        if let Some(at) = &mut unsent {
+            let batch = batch.expect("the batch of a round still being sent");
+            let more;
+            (end, more) = self.write_rows(batch, at, &mut head.blocks);
+            if more && end == BLOCKS_AT {
+                gnitz_fatal_abort!(
+                    "exchange of view {}: a row does not fit the {}-byte outbox",
+                    head.view,
+                    self.outbox_bytes
+                );
+            }
+            head.more = more as u64;
+        }
+        self.open.as_mut().expect("still open").unsent = unsent.filter(|_| head.more != 0);
+        self.arrive(&head, end);
+    }
+
+    /// Write `batch`'s rows from `at` as one block per row list, naming each in
+    /// `blocks`, until the lists end or the outbox fills. Returns where the
+    /// blocks end, and whether rows are left.
+    fn write_rows(&self, batch: &Batch, at: &mut Cursor, blocks: &mut [Span; MAX_WORKERS]) -> (usize, bool) {
+        let nw = self.nw();
+        let outbox = self.outbox(self.rank);
+        let lists = if at.shared { 1 } else { nw };
+        let mut end = BLOCKS_AT;
+        while at.list < lists {
+            let rest = &self.routed[at.list][at.offset..];
+            if !rest.is_empty() {
+                // SAFETY: `[end, outbox_bytes)` lies inside this worker's own
+                // outbox, which no peer reads until the arrival that follows.
+                let out = unsafe { std::slice::from_raw_parts_mut(outbox.add(end), self.outbox_bytes - end) };
+                let Some((n, len)) = batch.encode_scattered_prefix(rest, out) else {
+                    return (end, true);
+                };
+                let span = Span { at: end as u64, len: len as u64 };
+                match at.shared {
+                    true => blocks[..nw].fill(span),
+                    false => blocks[at.list] = span,
+                }
+                end = (end + len).next_multiple_of(8);
+                if n < rest.len() {
+                    at.offset += n;
+                    return (end, true);
                 }
             }
+            at.list += 1;
+            at.offset = 0;
         }
-        self.trim(out.end);
-        self.open = Some(OpenRound { view, key, schema: *batch.schema() });
+        (end, false)
+    }
+
+    /// Publish `head` and the blocks before `end` as this worker's part: count
+    /// the arrival, and wake every peer if it completed the part.
+    fn arrive(&mut self, head: &Head, end: usize) {
+        // SAFETY: the outbox is page-aligned and its first page holds the head;
+        // no peer reads it until the arrival below.
+        unsafe { std::ptr::copy_nonoverlapping(head, self.outbox(self.rank).cast::<Head>(), 1) }
+        self.trim(end);
+        let nw = self.nw() as u64;
         // Release: a peer that sees the count sees the outbox writes above.
-        let last = (self.round + 1) * nw as u64 - 1;
-        if self.arrivals().fetch_add(1, Ordering::AcqRel) == last {
+        if self.arrivals().fetch_add(1, Ordering::AcqRel) == (self.part + 1) * nw - 1 {
             for (w, wake) in self.wakes.iter().enumerate() {
                 if w != self.rank {
                     wake.wake();
@@ -187,8 +305,8 @@ impl Mesh {
         }
     }
 
-    /// Return the pages of this round's outbox past `end`, once they exceed
-    /// [`RESIDENT_SLACK_BYTES`]. Every peer gathered what they held two rounds ago.
+    /// Return the pages of this part's outbox past `end`, once they exceed
+    /// [`RESIDENT_SLACK_BYTES`]. Every peer read what they held two parts ago.
     fn trim(&mut self, end: usize) {
         let p = self.parity();
         let end = end.next_multiple_of(PAGE_BYTES);
@@ -200,111 +318,85 @@ impl Mesh {
         self.resident[p] = self.resident[p].max(end);
     }
 
-    /// Every worker has published the current round.
+    /// Every worker has published the current part.
     pub(crate) fn complete(&self) -> bool {
-        self.arrivals().load(Ordering::Acquire) >= (self.round + 1) * self.nw() as u64
+        self.arrivals().load(Ordering::Acquire) >= (self.part + 1) * self.nw() as u64
     }
 
-    /// Close the open round: the rows every peer sent this worker, and whether
-    /// every peer's partition was drained. Fatal unless the round is complete, or
-    /// when a peer's head names another (view, key, round).
-    pub(crate) fn gather(&mut self) -> (Batch, bool) {
-        let OpenRound { view, key, schema } = self.open.take().expect("gather without an open round");
-        assert!(self.complete(), "gathered before every worker published");
-        let round = self.round;
-        let (mut drained, mut consolidated) = (true, true);
-        let mut offsets = vec![[0usize; MAX_BATCH_REGIONS]; self.nw()];
-        let mut slices = Vec::with_capacity(self.nw());
-        for (peer, offsets) in offsets.iter_mut().enumerate() {
+    /// Take in the completed part and send the next from `batch`, the one
+    /// published, which is needed while [`Self::sending`]; or on the round's
+    /// last part close it: the rows every peer sent this worker, and whether
+    /// every peer's partition was drained.
+    pub(crate) fn advance(&mut self, batch: Option<&Batch>) -> Option<(Batch, bool)> {
+        assert!(self.complete(), "advanced before every worker published");
+        let mut open = self.open.take().expect("advance without an open round");
+        let view = open.view;
+        let (mut drained, mut more, mut consolidated) = (true, false, open.saved_consolidated);
+        let mut blocks = Vec::with_capacity(self.nw());
+        for peer in 0..self.nw() {
             // SAFETY: the peer wrote its head before the arrival `complete`
-            // observed, and rewrites it only after this worker's next publish.
-            let head = unsafe { self.outbox(peer).cast::<Head>().read() };
-            if (head.view, head.key, head.round) != (view, key, round) {
+            // observed, and rewrites it only after this worker's next arrival.
+            let head = unsafe { &*self.outbox(peer).cast::<Head>() };
+            if head.view != view {
                 gnitz_fatal_abort!(
-                    "exchange of (view {view}, key {key}, round {round}): worker {peer} published \
-                     (view {}, key {}, round {}) — workers diverged",
-                    head.view,
-                    head.key,
-                    head.round
+                    "exchange of view {view}: worker {peer} published view {} — workers diverged",
+                    head.view
                 );
             }
             drained &= head.drained != 0;
-            let block = self.block_from(peer);
-            if block.is_empty() {
-                continue;
+            more |= head.more != 0;
+            let block = self.block(peer, head.blocks[self.rank]);
+            if !block.is_empty() {
+                consolidated &= head.consolidated != 0;
+                blocks.push(block);
             }
-            consolidated &= head.consolidated != 0;
-            slices.push(
-                decode_mem_batch_from_wal_block(block, &schema, offsets).unwrap_or_else(|e| {
-                    gnitz_fatal_abort!("exchange of view {view}, key {key}: worker {peer}'s block: {e}")
-                }),
-            );
         }
+        if more {
+            open.saved.extend(blocks.into_iter().map(<[u8]>::to_vec));
+            open.saved_consolidated = consolidated;
+            self.open = Some(open);
+            self.part += 1;
+            self.send_part(batch);
+            return None;
+        }
+        let schema = open.schema;
+        let mut offsets = vec![[0usize; MAX_BATCH_REGIONS]; open.saved.len() + blocks.len()];
+        let slices: Vec<_> = open
+            .saved
+            .iter()
+            .map(Vec::as_slice)
+            .chain(blocks)
+            .zip(offsets.iter_mut())
+            .map(|(block, offsets)| {
+                decode_mem_batch_from_wal_block(block, &schema, offsets)
+                    .unwrap_or_else(|e| gnitz_fatal_abort!("exchange of view {view}: a peer's block: {e}"))
+            })
+            .collect();
         let rows = op_exchange_gather(&slices, &schema, consolidated);
-        self.round += 1;
-        (rows, drained)
+        self.part += 1;
+        Some((rows, drained))
     }
 
-    /// The block `peer` addressed to this worker in the current round.
-    fn block_from(&self, peer: usize) -> &[u8] {
-        let outbox = self.outbox(peer);
-        // SAFETY: the directory lies inside the peer's outbox, and the peer wrote
-        // it before the arrival `complete` observed.
-        let (at, len) = unsafe {
-            let entry = outbox.add(DIR_AT + 16 * self.rank).cast::<u64>();
-            (entry.read() as usize, entry.add(1).read() as usize)
-        };
-        if at < BLOCKS_AT || len > OUTBOX_BYTES - at {
-            gnitz_fatal_abort!("exchange: worker {peer}'s directory names bytes [{at}, +{len}) outside its outbox");
+    /// The block `span` names in `peer`'s outbox for the current part.
+    fn block(&self, peer: usize, span: Span) -> &[u8] {
+        if span.len == 0 {
+            return &[];
+        }
+        let inside = span.at >= BLOCKS_AT as u64
+            && span
+                .at
+                .checked_add(span.len)
+                .is_some_and(|e| e <= self.outbox_bytes as u64);
+        if !inside {
+            gnitz_fatal_abort!(
+                "exchange: worker {peer}'s head names bytes [{}, +{}) outside its outbox",
+                span.at,
+                span.len
+            );
         }
         // SAFETY: checked above to lie inside the peer's outbox, which it
-        // rewrites only after this worker's next publish.
-        unsafe { std::slice::from_raw_parts(outbox.add(at), len) }
-    }
-}
-
-/// One outbox being written: its blocks so far end at `end`.
-struct Outbox {
-    base: *mut u8,
-    end: usize,
-    view: u64,
-}
-
-impl Outbox {
-    fn head(&mut self, head: Head) {
-        // SAFETY: the outbox is page-aligned and its first page holds the head.
-        unsafe { self.base.cast::<Head>().write(head) }
-    }
-
-    /// Append `data` as one block, returning its `(offset, len)`; no rows append
-    /// none.
-    fn put(&mut self, data: WireData) -> (u64, u64) {
-        if data.row_count() == 0 {
-            return (BLOCKS_AT as u64, 0);
-        }
-        let (at, size) = (self.end, data.wire_byte_size());
-        if size > OUTBOX_BYTES - at {
-            gnitz_fatal_abort!(
-                "exchange of view {}: a {size}-byte partition does not fit the {OUTBOX_BYTES}-byte outbox",
-                self.view
-            );
-        }
-        // SAFETY: `[at, at + size)` lies inside this worker's own outbox, which no
-        // peer reads until the arrival that follows.
-        let written = data.encode(unsafe { std::slice::from_raw_parts_mut(self.base.add(at), size) });
-        debug_assert_eq!(written, size, "the block's encoded size");
-        self.end = (at + size).next_multiple_of(8);
-        (at as u64, size as u64)
-    }
-
-    /// Point receiver `r`'s directory entry at the block `(at, len)`.
-    fn direct(&mut self, r: usize, (at, len): (u64, u64)) {
-        // SAFETY: `r < MAX_WORKERS`, so the entry lies inside the first page.
-        unsafe {
-            let entry = self.base.add(DIR_AT + 16 * r).cast::<u64>();
-            entry.write(at);
-            entry.add(1).write(len);
-        }
+        // rewrites only after this worker's next arrival.
+        unsafe { std::slice::from_raw_parts(self.outbox(peer).add(span.at as usize), span.len as usize) }
     }
 }
 

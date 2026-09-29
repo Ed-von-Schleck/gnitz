@@ -1,7 +1,8 @@
 //! One exchange round's two ends: [`op_exchange_route`] on the sending worker,
-//! [`op_exchange_gather`] on the receiving one.
+//! [`op_exchange_gather`] on the receiving one; and [`op_exchange_share`], the
+//! round a batch every worker holds whole needs none of.
 
-use crate::schema::{OpBuildErr, SchemaDescriptor};
+use crate::schema::{OpBuildErr, SchemaDescriptor, Slot};
 use crate::storage::{merge_consolidated, reset_slots, Batch, Layout, MemBatch};
 
 use super::router::{ScatterKey, ScatterSpec};
@@ -23,10 +24,22 @@ pub fn op_exchange_route<'a>(
     Ok(slots)
 }
 
-/// Z-set `+` over one receiver's slices of an exchange round, one per sender:
-/// merged when every slice is `consolidated`, else concatenated in sender order.
+/// The live rows of `batch`, which every worker holds whole, that `slot` owns
+/// under `spec`: what a round under `spec` would hand it.
+///
+/// Refused exactly where [`op_exchange_route`] is.
+pub fn op_exchange_share(batch: &Batch, spec: ScatterSpec<'_>, slot: Slot) -> Result<Batch, OpBuildErr> {
+    Ok(ScatterKey::new(spec, batch.schema())?.share(batch, slot))
+}
+
+/// Z-set `+` over one receiver's slices of an exchange round, none of them
+/// empty: merged when every slice is `consolidated`, else concatenated in order.
 pub fn op_exchange_gather(slices: &[MemBatch], schema: &SchemaDescriptor, consolidated: bool) -> Batch {
-    if consolidated && slices.iter().filter(|mb| mb.count > 0).count() >= 2 {
+    debug_assert!(
+        slices.iter().all(|mb| mb.count > 0),
+        "an exchange gather over an empty slice"
+    );
+    if consolidated && slices.len() >= 2 {
         return merge_consolidated(slices, schema);
     }
     let mut out = Batch::concat(schema, slices.iter().cloned());

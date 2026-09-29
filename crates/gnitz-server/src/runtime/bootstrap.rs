@@ -311,7 +311,8 @@ fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
     let w2m_ptrs = (0..nw)
         .map(|w| w2m::create_region().map_err(|e| format!("failed to map W2M region for W{w}: {e}")))
         .collect::<Result<Vec<_>, _>>()?;
-    let mesh = mesh::create_region(nw).map_err(|e| format!("failed to map the exchange mesh: {e}"))?;
+    let mesh =
+        mesh::create_region(nw, mesh::outbox_bytes()).map_err(|e| format!("failed to map the exchange mesh: {e}"))?;
 
     Ok(SharedIpc { sal_fd, sal, tail, w2m_ptrs, mesh })
 }

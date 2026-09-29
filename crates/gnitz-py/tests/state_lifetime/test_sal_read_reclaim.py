@@ -3,8 +3,9 @@
 Every read verb writes a SAL command group and nothing on a read path rewinds the
 write cursor, so reads alone march it to the end of the mapping. The committer
 checks its checkpoint threshold only when something is sent to it, which a
-read-only workload never does, so only the watchdog's reclaim barrier — fired
-once the cursor crosses that threshold — can free it without a write.
+read-only workload never does, so only the watchdog's reclaim wake — sent once
+the cursor crosses that threshold, to make the committer re-test it — can free
+it without a write.
 
 `tiny_sal_server`'s threshold is high enough that the pushes below stop short of
 it and only the reads cross it: with the watchdog removed, the read loops wedge.
@@ -136,9 +137,9 @@ def test_concurrent_read_only_clients_survive_reclaim(tiny_sal_server):
 
 def test_a_ddl_concurrent_with_reclaim_does_not_deadlock(tiny_sal_server):
     """Two CREATE VIEWs while the read loops hold the SAL past the checkpoint
-    threshold. The watchdog's barrier must not start a checkpoint sequence while a
-    DDL holds the tick gate — the drain would wait on a tick the DDL keeps out,
-    against a barrier that resolves only at sequence end.
+    threshold. A checkpoint sequence the watchdog's reclaim wake starts must not
+    run while a DDL holds the tick gate — its drain would wait on a tick the DDL
+    keeps out.
 
     Two of them, not one: the second DDL queues on the gate the first holds.
     """
@@ -146,8 +147,8 @@ def test_a_ddl_concurrent_with_reclaim_does_not_deadlock(tiny_sal_server):
     with gnitz.connect(target) as client:
         sn, tid = _setup(client)
 
-        # Cross the threshold before the DDLs, so a reclaim barrier is in flight for
-        # the whole window. Counted, not slept: the crossing is a number of scan
+        # Cross the threshold before the DDLs, so the watchdog sends reclaim wakes
+        # for the whole window. Counted, not slept: the crossing is a number of scan
         # groups, which no machine speed can under-shoot.
         errors = []
         _read_loop(target, tid, errors, _counted(SCANS))

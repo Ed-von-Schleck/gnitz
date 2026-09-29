@@ -1,8 +1,8 @@
 """Replicated placement: a whole copy of the relation on every worker.
 
 Writes broadcast to every worker's copy, a read of a replicated relation is
-served by one worker, and a mixed view's exchange relays a replicated source's
-delta from one worker only.
+served by one worker, and a mixed view's exchange never relays a replicated
+source's delta: every worker already holds it, so each keeps its own share.
 
 Everything here is asserted by WEIGHT, never by row presence. The failures this
 placement admits leave the row *set* right and only the weights wrong — a read
@@ -283,12 +283,13 @@ def test_every_shape_keeps_its_weights_over_replicated_sources(client, schema_na
     computes all of it and the read is served by one, so a set-op, DISTINCT or
     range-join circuit that still scattered its output would lose the rows hashed
     away from that worker and inflate the rest. A mixed view does exchange, and
-    relaying the replicated side's delta from every worker instead of one would
-    put W copies of each of its rows in the join trace or the union, where
-    consolidation sums them into one row at weight W. A replicated preserved side
-    of an outer, semi or anti join cannot stay local against a partitioned
-    partner either: every worker would clamp its whole copy against its own slice
-    of the partner, null-filling or keeping a row once per worker. `c_and_ua`
+    relaying the replicated side's delta from every worker would put W copies of
+    each of its rows in the join trace or the union, where consolidation sums
+    them into one row at weight W; each worker keeps only its own share of it.
+    A replicated preserved side of an outer, semi or anti join cannot stay local
+    against a partitioned partner either: every worker would clamp its whole
+    copy against its own slice of the partner, null-filling or keeping a row
+    once per worker. `c_and_ua`
     unions a partitioned table with `ua`, which is replicated when both its
     sources are.
     """

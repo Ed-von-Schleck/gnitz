@@ -1,6 +1,6 @@
 //! The worker's half of an exchange round: publishing its partition on the mesh,
-//! waiting for every peer's, and the matrix that decides what a SAL group
-//! arriving during that wait does.
+//! waiting for every peer's, part by part, and the matrix that decides what a
+//! SAL group arriving during that wait does.
 
 use super::*;
 use gnitz_store::ops::ScatterSpec;
@@ -22,30 +22,29 @@ impl DriveHost for DagExchangeCtx<'_> {
         (&mut cat.dag, &mut cat.registry)
     }
 
-    fn exchange(&mut self, view_id: u64, batch: Cow<'_, Batch>, key: u64, spec: Option<ScatterSpec<'_>>) -> Batch {
-        let (batch, all_drained) = self.worker.exchange(view_id, batch, key, spec, self.own_drained);
+    fn exchange(&mut self, view_id: u64, batch: Cow<'_, Batch>, spec: Option<ScatterSpec<'_>>) -> Batch {
+        let (batch, all_drained) = self.worker.exchange(view_id, batch, spec, self.own_drained);
         self.all_drained = all_drained;
         batch
     }
 }
 
 impl WorkerProcess {
-    /// Publish `batch` as this worker's round of `(view_id, key)` and block until
-    /// every peer has published theirs, returning the rows this worker owns and
-    /// whether every worker's partition was drained. SAL groups arriving
-    /// mid-wait are dispatched per [`Self::dispatch_in_eval`].
+    /// Publish `batch` as this worker's round of `view_id` and block until every
+    /// part of it is complete, returning the rows this worker owns and whether
+    /// every worker's partition was drained. SAL groups arriving mid-wait are
+    /// dispatched per [`Self::dispatch_in_eval`].
     fn exchange(
         &mut self,
         view_id: u64,
         batch: Cow<'_, Batch>,
-        key: u64,
         spec: Option<ScatterSpec<'_>>,
         drained: bool,
     ) -> (Batch, bool) {
-        self.mesh.publish(view_id, key, drained, &batch, spec);
-        // Before the park, so this worker never holds an owned partition and the
-        // gathered one at once.
-        drop(batch);
+        self.mesh.publish(view_id, drained, &batch, spec);
+        // Dropped once every row is written, so this worker holds the partition
+        // it sends beside the one it gathers only while its rows span parts.
+        let mut batch = self.mesh.sending().then_some(batch);
         loop {
             self.w2m_writer
                 .sal_park()
@@ -55,7 +54,12 @@ impl WorkerProcess {
                 self.dispatch_in_eval(req);
             }
             if self.mesh.complete() {
-                return self.mesh.gather();
+                if let Some(out) = self.mesh.advance(batch.as_deref()) {
+                    return out;
+                }
+                if !self.mesh.sending() {
+                    batch = None;
+                }
             }
         }
     }

@@ -505,17 +505,18 @@ fn pure_range(n_eq: u8) -> JoinKind {
     JoinKind::Range { n_eq, rel: RangeRel::Lt }
 }
 
-/// The `JoinKey` scatter's columns, or `None` when there is no such route.
+/// The join key's columns a route splits by, or `None` when there is no such
+/// route.
 fn join_cols(route: Option<&RelayRoute>) -> Option<Vec<u32>> {
     match route? {
-        RelayRoute::JoinKey(slots) => Some(slots.iter().map(|&(c, _)| c).collect()),
-        _ => None,
+        RelayRoute::JoinKey(slots) | RelayRoute::Share(slots) => Some(slots.iter().map(|&(c, _)| c).collect()),
+        RelayRoute::Broadcast => None,
     }
 }
 
 /// A pure-range join (`n_eq == 0`) and a cross join spread their matches over
 /// the whole key space, so the keyed source's delta must be broadcast. The
-/// output relay (`source_id == 0`) is not a join relay and still scatters.
+/// view's output relay is not a join relay and still scatters.
 #[test]
 fn the_keyed_source_of_a_keyless_join_broadcasts_and_the_output_relay_does_not() {
     for kind in [pure_range(0), JoinKind::Cross] {
@@ -527,7 +528,7 @@ fn the_keyed_source_of_a_keyless_join_broadcasts_and_the_output_relay_does_not()
         assert_eq!(
             meta.output_shard_cols(),
             &[1u32][..],
-            "{kind:?}: source 0 is not a join relay — it routes by the view's shard cols"
+            "{kind:?}: the output relay routes by the view's shard cols"
         );
     }
 }
@@ -636,10 +637,9 @@ fn an_owner_trimmed_source_routes_by_its_pk_under_a_broadcast_join() {
     assert!(matches!(keyed.source_route(9), Some(RelayRoute::Broadcast)));
 
     let replicated = meta(make_schema_u64_i64().with_placement(Placement::Replicated));
-    assert_eq!(
-        join_cols(replicated.source_route(7)),
-        Some(vec![0]),
-        "a replicated copy is relayed by key from one worker"
+    assert!(
+        matches!(replicated.source_route(7), Some(RelayRoute::Share(k)) if k[..] == [(0, None)]),
+        "a replicated copy is kept by key where it stands"
     );
 }
 

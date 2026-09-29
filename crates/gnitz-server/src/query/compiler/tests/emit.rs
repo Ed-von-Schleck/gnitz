@@ -613,9 +613,8 @@ fn a_union_takes_each_unread_operand_but_never_the_sink_register() {
 
 // ── Replica sides ───────────────────────────────────────────────────────
 
-/// A muted relay round drops a side's rows, so it must fire exactly when every
-/// worker computed the same ones — a fact about the side's sources, not its
-/// arity.
+/// A side emits a replica exactly when every worker computes the same rows — a
+/// fact about the side's sources, not its arity.
 #[test]
 fn a_side_emits_a_replica_only_over_replicated_sources_it_does_not_trim() {
     use gnitz_store::schema::Placement;

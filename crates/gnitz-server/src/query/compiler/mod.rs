@@ -32,8 +32,7 @@ pub(super) use hydration::{Hydration, HydrationSeed};
 // `pub(super)` by default: `dag` is the only module that names the compiler, so
 // a `pub(crate)` would publish it to the catalog and runtime rungs too.
 pub(super) use load::{load_circuit, read_circuit_node_row};
-pub(super) use routing::ViewMeta;
-pub(crate) use routing::OUTPUT_RELAY;
+pub(super) use routing::{RelayRoute, ViewMeta};
 
 /// The most nodes one view's circuit may hold.
 pub(crate) const MAX_CIRCUIT_NODES: usize = 16_384;
@@ -238,8 +237,7 @@ pub(super) struct SubPlan {
 pub(super) struct Side {
     pub(in crate::query) plan: SubPlan,
     pub(in crate::query) seed_reg: DeltaReg,
-    /// Every worker computes this side's whole output, so a muted round must
-    /// publish nothing rather than relay each row `W` times.
+    /// Every worker computes this side's whole output.
     pub(in crate::query) emits_replica: bool,
 }
 

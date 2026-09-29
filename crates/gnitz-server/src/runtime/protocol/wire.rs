@@ -141,7 +141,9 @@ impl<'a> WireData<'a> {
             WireData::None => 0,
             WireData::Whole(b) => b.encode_to_wire(out),
             WireData::Range { batch, start, rows } => batch.encode_range_to_wire(start, rows, out),
-            WireData::Scattered { batch, indices } => batch.encode_scattered_to_wire(indices, out),
+            WireData::Scattered { batch, indices } => batch
+                .encode_scattered_to_wire(indices, out)
+                .expect("a heap-free scatter fits the bytes its size reserved"),
         }
     }
 }

@@ -285,3 +285,61 @@ fn wire_chunk_within_never_returns_an_empty_chunk() {
     let (_, batch) = string_rows(&[(1, &"w".repeat(4096)), (2, &"w".repeat(4096))]);
     assert_eq!(chunk_rows(&batch, 0, 0, 64), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Scattered blocks: encode_scattered_to_wire, encode_scattered_prefix
+// ---------------------------------------------------------------------------
+
+/// A scatter of a heap-bearing batch relocates the strings its rows reference
+/// into the block's own heap, so a peer's validated decode reads every row back
+/// in the order the indices named.
+#[test]
+fn a_scattered_block_carries_its_own_heap() {
+    let values: Vec<(u64, String)> = (0..6u64).map(|i| (i, format!("{i:->40}"))).collect();
+    let (schema, src) = string_rows(&values.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>());
+    let indices = [4u32, 1, 3];
+    let mut out = vec![0u8; src.wire_byte_size()];
+    let written = src
+        .encode_scattered_to_wire(&indices, &mut out)
+        .expect("the whole batch's size fits");
+    let mut exact = vec![0u8; written];
+    assert_eq!(
+        src.encode_scattered_prefix(&indices, &mut exact),
+        Some((indices.len(), written)),
+        "the fit charges exactly the heap the encoder writes"
+    );
+    let got = Batch::decode_foreign_wal_block(&out[..written], &schema).expect("a canonical block");
+    assert_eq!(got.len(), indices.len());
+    assert!(got.blob.len() < src.blob.len(), "only the selected rows' spans travel");
+    for (i, &idx) in indices.iter().enumerate() {
+        assert_eq!(got.get_pk(i), idx as u128);
+        assert_eq!(got.get_weight(i), 1);
+        assert_eq!(gnitz_expr::payload_string(&got, i, 0), values[idx as usize].1);
+    }
+}
+
+/// `None`, not a truncated block, when either the fixed regions or the heap
+/// behind them overflow `out`.
+#[test]
+fn a_scattered_block_that_overflows_its_buffer_is_refused() {
+    let (_, src) = string_rows(&[(1, &"x".repeat(100)), (2, &"y".repeat(100))]);
+    let fixed = src.wire_byte_size_range(2);
+    let mut out = vec![0u8; fixed - 1];
+    assert!(
+        src.encode_scattered_to_wire(&[0, 1], &mut out).is_none(),
+        "the fixed regions overflow"
+    );
+    let mut out = vec![0u8; fixed + 150];
+    assert!(
+        src.encode_scattered_to_wire(&[0, 1], &mut out).is_none(),
+        "the heap overflows"
+    );
+    let mut out = vec![0u8; fixed + 150];
+    assert_eq!(
+        src.encode_scattered_prefix(&[0, 1], &mut out),
+        Some((1, src.wire_byte_size_range(1) + 100)),
+        "the prefix is the one row whose heap fits"
+    );
+    let mut out = vec![0u8; fixed + 200];
+    assert_eq!(src.encode_scattered_to_wire(&[0, 1], &mut out), Some(fixed + 200));
+}

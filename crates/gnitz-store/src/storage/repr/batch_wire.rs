@@ -2,7 +2,8 @@
 //! WAL-block decoding with the validation it runs.
 
 use super::batch::{strides_from_schema, string_mask, Batch, MAX_BATCH_REGIONS, REG_PK};
-use super::merge::{blob_span_key, BlobCache, BlobCacheGuard, DirectWriter, MemBatch};
+use super::batch_pool::{acquire_arena, recycle_buf, Fill};
+use super::merge::{blob_span_key, prorated_blob_cap, BlobCache, BlobCacheGuard, DirectWriter, MemBatch};
 use crate::schema::{SchemaDescriptor, SchemaFacts};
 use gnitz_wire::wal;
 use gnitz_wire::Regions;
@@ -65,7 +66,7 @@ impl Batch {
             let rows = self.rows_by_width(start, overhead, budget);
             (WireChunk::Range { rows }, overhead + self.wire_byte_size_range(rows))
         } else {
-            let rows = self.rows_with_heap(start, slots, overhead, budget);
+            let rows = self.rows_with_heap(start..self.count, slots, overhead, budget);
             let owned = self.wire_chunk(start, rows);
             let size = overhead + owned.wire_byte_size();
             (WireChunk::Owned(owned), size)
@@ -104,26 +105,31 @@ impl Batch {
         (self.count - start).min((budget.saturating_sub(overhead + wal::WAL_HEADER_SIZE) / slope).max(1))
     }
 
-    /// Rows from `start` that fit `budget` once the heap bytes they relocate are
-    /// charged. `slots` names the German-string payload slots.
-    fn rows_with_heap(&self, start: usize, slots: u64, overhead: usize, budget: usize) -> usize {
+    /// How many of `rows`, from the front, fit `budget` once the heap bytes they
+    /// relocate are charged. `slots` names the German-string payload slots.
+    fn rows_with_heap(
+        &self,
+        rows: impl ExactSizeIterator<Item = usize>,
+        slots: u64,
+        overhead: usize,
+        budget: usize,
+    ) -> usize {
         let slope = row_width(self.strides());
         let base = overhead + wal::WAL_HEADER_SIZE;
-        let remaining = self.count - start;
-        let mut guard = BlobCacheGuard::acquire(self.schema(), remaining);
+        let mut guard = BlobCacheGuard::acquire(self.schema(), rows.len());
         let seen = guard.get_mut().expect("a German-string column implies a blob cache");
         let mut heap = 0usize;
-        let mut rows = 0usize;
-        while rows < remaining {
-            let row_heap = heap + self.row_heap_cost(start + rows, slots, seen);
+        let mut fit = 0usize;
+        for row in rows {
+            let row_heap = heap + self.row_heap_cost(row, slots, seen);
             // The first row goes in whatever it costs; a frame carries whole rows.
-            if rows > 0 && base + (rows + 1) * slope + row_heap > budget {
+            if fit > 0 && base + (fit + 1) * slope + row_heap > budget {
                 break;
             }
             heap = row_heap;
-            rows += 1;
+            fit += 1;
         }
-        rows
+        fit
     }
 
     /// Heap bytes row `row` adds to a chunk whose spans are already in `seen`.
@@ -176,25 +182,72 @@ impl Batch {
         wal::write_block(&r, out)
     }
 
-    /// Encode the rows `indices` selects, in order, as one WAL block of
-    /// `wire_byte_size_range(indices.len())` bytes at the front of `out`.
-    pub fn encode_scattered_to_wire(&self, indices: &[u32], out: &mut [u8]) -> usize {
-        debug_assert!(
-            self.heap_referencing_slots() == 0,
-            "a row scatter writes no heap bytes, so no cell may reference one"
-        );
+    /// The rows `indices` selects, in order, as one WAL block at the front of
+    /// `out`, their strings relocated into the block's own heap. Returns bytes
+    /// written; `None` when the block does not fit `out`.
+    pub fn encode_scattered_to_wire(&self, indices: &[u32], out: &mut [u8]) -> Option<usize> {
         let count = indices.len();
         let strides = self.strides();
-        let nr = strides.len();
-        let total_size = wal::write_head(out, count, count * row_width(strides), 0);
-        let block = &mut out[..total_size];
-
+        let fixed = count * row_width(strides);
+        let heap_at = wal::WAL_HEADER_SIZE + fixed;
+        if heap_at > out.len() {
+            return None;
+        }
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
-        wire_offsets(strides, nr, count, &mut offsets);
-        let mut no_heap: Vec<u8> = Vec::new();
-        let mut writer = DirectWriter::over_regions(block, &offsets, strides, nr, count, self.schema(), &mut no_heap);
+        wire_offsets(strides, strides.len(), count, &mut offsets);
+        let cap = match self.heap_referencing_slots() {
+            0 => 0,
+            _ => prorated_blob_cap(self.blob.len(), self.count, count),
+        };
+        let mut heap = match cap {
+            0 => Vec::new(),
+            _ => acquire_arena(cap, Fill::Reserve),
+        };
+        let mut writer = DirectWriter::over_regions(
+            &mut out[..heap_at],
+            &offsets,
+            strides,
+            strides.len(),
+            count,
+            self.schema(),
+            &mut heap,
+        );
         super::scatter::scatter_copy(&self.as_mem_batch(), indices, &mut writer);
-        total_size
+        drop(writer);
+        let total = heap_at + heap.len();
+        let Some(dst) = out.get_mut(heap_at..total) else {
+            recycle_buf(heap);
+            return None;
+        };
+        dst.copy_from_slice(&heap);
+        let written = wal::write_head(out, count, fixed, heap.len());
+        recycle_buf(heap);
+        Some(written)
+    }
+
+    /// The longest front run of the rows `indices` selects, ascending, that fits
+    /// `out` as one block, written there: its row count and bytes. `None` when
+    /// not even the first row fits.
+    pub fn encode_scattered_prefix(&self, indices: &[u32], out: &mut [u8]) -> Option<(usize, usize)> {
+        let fixed_fit = out.len().saturating_sub(wal::WAL_HEADER_SIZE) / row_width(self.strides());
+        let rows = &indices[..indices.len().min(fixed_fit)];
+        if rows.is_empty() {
+            return None;
+        }
+        // Every row, ascending, is the batch itself: framed whole, heap as it is.
+        if indices.len() == self.count && self.wire_byte_size() <= out.len() {
+            return Some((self.count, self.encode_to_wire(out)));
+        }
+        let slots = self.heap_referencing_slots();
+        // A heap-free block fits by width alone, and the sizing pass is skipped
+        // when the source's whole heap fits too.
+        if slots == 0 || self.wire_byte_size_range(rows.len()) + self.blob.len() <= out.len() {
+            if let Some(len) = self.encode_scattered_to_wire(rows, out) {
+                return Some((rows.len(), len));
+            }
+        }
+        let n = self.rows_with_heap(rows.iter().map(|&i| i as usize), slots, 0, out.len());
+        self.encode_scattered_to_wire(&rows[..n], out).map(|len| (n, len))
     }
 
     /// Decode a WAL block the engine wrote into an owned `Raw` batch. String

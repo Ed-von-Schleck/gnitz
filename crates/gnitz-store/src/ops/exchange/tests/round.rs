@@ -17,10 +17,12 @@ fn scatter(batch: &Batch, spec: ScatterSpec<'_>, num_workers: usize) -> Vec<Batc
     rows.iter().map(|r| batch.ascending_subset(r)).collect()
 }
 
-/// [`op_exchange_gather`] over owned slices.
+/// [`op_exchange_gather`] over owned slices, skipping the empty ones as the
+/// mesh does.
 fn gather(slices: &[&Batch], schema: &SchemaDescriptor) -> Batch {
-    let mem: Vec<MemBatch> = slices.iter().map(|b| b.as_mem_batch()).collect();
-    op_exchange_gather(&mem, schema, slices.iter().all(|b| b.is_consolidated()))
+    let live: Vec<&Batch> = slices.iter().copied().filter(|b| b.count > 0).collect();
+    let mem: Vec<MemBatch> = live.iter().map(|b| b.as_mem_batch()).collect();
+    op_exchange_gather(&mem, schema, live.iter().all(|b| b.is_consolidated()))
 }
 
 fn total_rows(batches: &[Batch]) -> usize {
@@ -271,6 +273,31 @@ fn rows_of(b: &Batch) -> Vec<(u128, i64, i64)> {
     (0..b.count)
         .map(|i| (b.get_pk(i), b.get_weight(i), payload(b, i)))
         .collect()
+}
+
+/// [`op_exchange_share`] hands each worker exactly what a round under the same
+/// spec routes it, weight-0 rows dropped, for every key kind.
+#[test]
+fn a_share_is_what_the_round_routes_that_worker() {
+    let schema = make_schema_u64_i64();
+    let rows: Vec<(u64, i64, i64)> = (0..64u64)
+        .map(|i| (i * 7 + 1, [1, 0, -2][i as usize % 3], i as i64 % 5))
+        .collect();
+    let batch = make_batch_raw(&schema, &rows);
+    let join = [(1u32, None)];
+    for spec in [
+        ScatterSpec::GroupKey(&[0]),
+        ScatterSpec::GroupKey(&[1]),
+        ScatterSpec::JoinKey(&join),
+    ] {
+        for nw in [1usize, 2, 4] {
+            let routed = scatter(&batch, spec, nw);
+            for (rank, want) in routed.iter().enumerate() {
+                let got = op_exchange_share(&batch, spec, crate::schema::Slot::new(rank as u32, nw as u32)).unwrap();
+                assert_eq!(rows_of(&got), rows_of(want), "{spec:?}, rank {rank} of {nw}");
+            }
+        }
+    }
 }
 
 /// Per receiver, [`op_exchange_gather`] over the slice each sender's own

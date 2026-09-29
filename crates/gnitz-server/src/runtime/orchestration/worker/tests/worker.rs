@@ -36,7 +36,9 @@ fn send_helpers_publish_on_the_request_id() {
 /// budget is pinned rather than read from the environment, so a shell that
 /// exports `GNITZ_REPLY_FRAME_BUDGET` does not reshape these frames.
 fn make_test_worker(catalog: *mut CatalogEngine, writer: W2mWriter) -> WorkerProcess {
-    let mesh = crate::runtime::mesh::fixtures::meshes(1).pop().unwrap();
+    let mesh = crate::runtime::mesh::fixtures::meshes(1, crate::runtime::mesh::OUTBOX_BYTES)
+        .pop()
+        .unwrap();
     let mut wp = WorkerProcess::new(catalog, unsafe { std::mem::zeroed() }, writer, mesh);
     wp.reply_frame_budget = gnitz_wire::MAX_FRAME_PAYLOAD;
     wp
