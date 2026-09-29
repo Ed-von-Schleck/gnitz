@@ -904,17 +904,16 @@ const CELL_CLASSES: [&[u8]; 5] = [
 
 #[test]
 fn case_fold_is_ascii_only_and_leaves_other_bytes_alone() {
-    // The ASCII boundary bytes on both sides of `a-z`/`A-Z`, a multibyte UTF-8
-    // sequence, and a lone continuation byte.
-    let vals: &[&[u8]] = &[b"`az{", b"@AZ[", "straße".as_bytes(), &[0xC3, 0x9F, 0x80]];
-    let up = run_str_rows(vals, &[false; 4], |a| vec![LogicalInstr::StrCase { a, upper: true }]);
+    // The ASCII boundary bytes on both sides of `a-z`/`A-Z`, and a multibyte
+    // UTF-8 sequence.
+    let vals: &[&[u8]] = &[b"`az{", b"@AZ[", "straße".as_bytes()];
+    let up = run_str_rows(vals, &[false; 3], |a| vec![LogicalInstr::StrCase { a, upper: true }]);
     assert_eq!(up[0].0, b"`AZ{", "only a-z folds; the neighbours pass through");
     assert_eq!(up[1].0, b"@AZ[");
     // Documented deviation from PostgreSQL under a UTF-8 locale: ß is untouched.
     assert_eq!(up[2].0, "STRAßE".as_bytes());
-    assert_eq!(up[3].0, &[0xC3, 0x9F, 0x80]);
 
-    let lo = run_str_rows(vals, &[false; 4], |a| vec![LogicalInstr::StrCase { a, upper: false }]);
+    let lo = run_str_rows(vals, &[false; 3], |a| vec![LogicalInstr::StrCase { a, upper: false }]);
     assert_eq!(lo[0].0, b"`az{");
     assert_eq!(lo[1].0, b"@az[");
 }
@@ -938,20 +937,18 @@ fn case_fold_round_trips_every_cell_class_and_propagates_null() {
 
 #[test]
 fn length_counts_characters_and_octets_separately() {
-    // A combining mark, a ZWJ emoji, and bytes that are not UTF-8 at all — the
-    // engine is byte-transparent, so the count must stay total.
+    // A combining mark and a ZWJ emoji.
     let vals: &[&[u8]] = &[
         b"abc",
         "e\u{0301}".as_bytes(),
         "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}".as_bytes(),
-        &[0xFF, 0xFE, 0x41],
     ];
-    let chars = run_str_to_scalar(vals, &[false; 4], |a| vec![LogicalInstr::StrLen { a, chars: true }]);
-    let bytes = run_str_to_scalar(vals, &[false; 4], |a| vec![LogicalInstr::StrLen { a, chars: false }]);
+    let chars = run_str_to_scalar(vals, &[false; 3], |a| vec![LogicalInstr::StrLen { a, chars: true }]);
+    let bytes = run_str_to_scalar(vals, &[false; 3], |a| vec![LogicalInstr::StrLen { a, chars: false }]);
     // The emoji is 5 codepoints (three faces joined by two ZWJs) in 18 bytes —
     // the byte/character distinction OCTET_LENGTH exists to expose.
-    assert_eq!(chars, [Some(3), Some(2), Some(5), Some(3)]);
-    assert_eq!(bytes, [Some(3), Some(3), Some(18), Some(3)]);
+    assert_eq!(chars, [Some(3), Some(2), Some(5)]);
+    assert_eq!(bytes, [Some(3), Some(3), Some(18)]);
 }
 
 #[test]
@@ -961,7 +958,7 @@ fn length_of_null_is_null() {
 }
 
 /// The window rule is the totality proof: every endpoint is clamped in i128 to
-/// `[1, N + 1]` before any narrowing, so no start/length pair can panic or read
+/// `[0, N]` over 0-based indices before any narrowing, so no start/length pair can panic or read
 /// out of the string.
 #[test]
 fn substring_window_matches_postgres_and_is_total() {
@@ -983,8 +980,7 @@ fn substring_window_matches_postgres_and_is_total() {
     assert_eq!(one(b"abc", 2, None).0, b"bc");
     // A start at or past the end is empty, never a panic.
     assert_eq!(one(b"abc", 4, None).0, b"");
-    // A start at or below 0 is the whole string: the upper clamp is N+1 because
-    // the window is half-open, so clamping to N would lose the last character.
+    // A window reaching below position 1 keeps only its part from 1 on.
     assert_eq!(one(b"abc", -1, None).0, b"abc");
     assert_eq!(one(b"abc", 0, Some(2)).0, b"a");
     assert_eq!(one(b"abc", 1, Some(0)).0, b"");
@@ -1006,15 +1002,6 @@ fn substring_window_matches_postgres_and_is_total() {
     assert_eq!(one("äöü".as_bytes(), 3, Some(5)).0, "ü".as_bytes());
     assert_eq!(one("äöü".as_bytes(), 1, Some(4)).0, "äöü".as_bytes());
     assert_eq!(one("äöü".as_bytes(), 5, Some(2)).0, b"");
-    // A lone continuation byte belongs to no character, so the value has zero
-    // characters and every window over it is empty — even `FROM 1`, which is the
-    // identity on every well-formed value. The clamp ceiling is the byte length,
-    // so this is the case that distinguishes it from the character count.
-    assert_eq!(one(&[0x80], 1, None).0, b"");
-    assert_eq!(one(&[0x80], i64::MIN, None).0, b"");
-    assert_eq!(one(&[0x80, 0x80], 1, Some(1)).0, b"");
-    // A continuation byte *after* a character start is part of that character.
-    assert_eq!(one(&[0x80, b'a'], 1, None).0, b"a");
     // A heap-backed source yields a sub-view of the heap, not a copy.
     assert_eq!(one(b"abcdefghijklmnop", 14, Some(2)).0, b"no");
 }
@@ -1551,9 +1538,6 @@ fn text_to_float_parses_or_nulls() {
             None => assert!(got[i].is_none(), "{s:?} must be NULL"),
         }
     }
-    // Invalid UTF-8 is NULL, not a panic: the engine is byte-transparent.
-    let bad = run_str_to_scalar(&[&[0xFF, 0xFE]], &[false], |a| vec![LogicalInstr::StrToFloat { a }]);
-    assert!(bad[0].is_none());
 }
 
 /// A morsel-crossing run: the arena is truncated back to its constant prefix at
@@ -1839,33 +1823,16 @@ fn left_and_right_count_characters_from_either_end() {
     let want = |ss: [&str; 5]| ss.iter().map(|x| x.as_bytes().to_vec()).collect::<Vec<_>>();
     assert_eq!(run(s, n, true), want(["hé", "héll", "héllo", "", ""]));
     assert_eq!(run(s, n, false), want(["lo", "éllo", "héllo", "", ""]));
-
-    // Bytes with no character start at all, and a count past the total. `0x80`
-    // is a continuation byte, so it belongs to the character before it and the
-    // last row is two characters, not three; a string of nothing but
-    // continuation bytes has no character at all and RIGHT drops all of it.
-    let odd: &[&[u8]] = &[
-        &[0x80, 0x80],
-        &[0x80, 0x80],
-        b"",
-        &[0xFF, b'a', 0x80],
-        &[0xFF, b'a', 0x80],
-    ];
-    let counts: &[i64] = &[1, 9, 3, 1, 9];
-    assert_eq!(
-        run(odd, counts, false),
-        vec![vec![], vec![], vec![], vec![b'a', 0x80], vec![0xFF, b'a', 0x80]],
-    );
 }
 
-/// `StrSide` is the one string producer instantiated infallible, so it merges no
+/// `StrSide` is instantiated infallible, so it merges no
 /// fail mask — not even a provably-zero one. Both arms must still answer the
 /// same, and the `no_nulls` one must produce no NULL at all, since a dropped
 /// fail flag there is exactly what the instantiation asserts cannot happen.
 #[test]
 fn right_is_infallible_and_agrees_across_the_arms() {
     let schema = schema_pk_strings(1, false);
-    let vals: Vec<&[u8]> = vec!["héllo wörld".as_bytes(), b"", b"abc", &[0x80, 0xFF, b'z']];
+    let vals: Vec<&[u8]> = vec!["héllo wörld".as_bytes(), b"", b"abc", "日本語".as_bytes()];
     let rows: Vec<&[&[u8]]> = vals.iter().map(std::slice::from_ref).collect();
     let view = make_string_view(&schema, &rows);
     let instrs = vec![
@@ -1878,10 +1845,7 @@ fn right_is_infallible_and_agrees_across_the_arms() {
     let got = read(&mut fast);
     assert_eq!(got, read(&mut nullable), "the arms disagree");
     assert!(!got.iter().any(|&(_, is_null)| is_null), "RIGHT never makes a NULL");
-    // The last fixture leads with a continuation byte, which begins no
-    // character of its own: the value is the two characters `0xFF` and `z`, so
-    // RIGHT(2) keeps both and the leading byte falls off.
-    let want: Vec<&[u8]> = vec!["ld".as_bytes(), b"", b"bc", &[0xFF, b'z']];
+    let want: Vec<&[u8]> = vec!["ld".as_bytes(), b"", b"bc", "本語".as_bytes()];
     assert_eq!(got.iter().map(|(v, _)| v.as_slice()).collect::<Vec<_>>(), want);
 }
 
@@ -1951,18 +1915,24 @@ fn replace_over_arena_operands_rewrites_correctly() {
 /// to its first `n` characters, and pad nothing for an empty fill.
 #[test]
 fn pad_measures_characters_and_truncates_a_long_subject() {
-    let s: &[&[u8]] = &["hé".as_bytes(), "hé".as_bytes(), b"hello", b"a", b"a", b"a"];
-    let n: &[i64] = &[5, 5, 3, 0, 3, -2];
-    let fill: &[&[u8]] = &[b"xy", "éx".as_bytes(), b"x", b"x", b"", b"x"];
+    let s: &[&[u8]] = &["hé".as_bytes(), "hé".as_bytes(), b"hello", b"a", b"a", b"a", b"a", b"a"];
+    let n: &[i64] = &[5, 5, 3, 0, 3, -2, 8, 2];
+    let fill: &[&[u8]] = &[b"xy", "éx".as_bytes(), b"x", b"x", b"", b"x", b"xyz", b"xyz"];
     let run = |left: bool| {
         let (mut ev, view) = mixed_prog(&[s, fill], &[n], vec![], |r| {
             vec![LogicalInstr::StrPad { s: r[0], n_reg: r[2], fill: r[1], left }]
         });
         str_rows(&mut ev, &view).into_iter().map(|(v, _)| v).collect::<Vec<_>>()
     };
-    let want = |ss: [&str; 6]| ss.iter().map(|x| x.as_bytes().to_vec()).collect::<Vec<_>>();
-    assert_eq!(run(true), want(["xyxhé", "éxéhé", "hel", "", "a", ""]));
-    assert_eq!(run(false), want(["héxyx", "hééxé", "hel", "", "a", ""]));
+    let want = |ss: [&str; 8]| ss.iter().map(|x| x.as_bytes().to_vec()).collect::<Vec<_>>();
+    assert_eq!(
+        run(true),
+        want(["xyxhé", "éxéhé", "hel", "", "a", "", "xyzxyzxa", "xa"])
+    );
+    assert_eq!(
+        run(false),
+        want(["héxyx", "hééxé", "hel", "", "a", "", "axyzxyzx", "ax"])
+    );
 }
 
 /// SPLIT_PART indexes fields from either end, is empty past the last field,

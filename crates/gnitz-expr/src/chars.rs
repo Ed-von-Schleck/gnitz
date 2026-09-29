@@ -1,68 +1,90 @@
-//! Where a character begins, for every kernel that counts, windows or reorders
-//! characters.
-//!
-//! A leaf below both — it reads no register file, no scratch and no program, so
-//! `like.rs` need not import out of the kernel file it is otherwise independent
-//! of.
+//! Character boundaries in STRING values, which are UTF-8: a character is a
+//! codepoint, and begins at every byte that is not a continuation byte.
 
-/// The byte index of every character start, which is the engine's one definition
-/// of where a character begins: a byte whose top bits are not `10`. A
-/// continuation byte belongs to the character it follows, so a *leading* one
-/// belongs to no character at all. On valid UTF-8 these are exactly the codepoint
-/// boundaries; on arbitrary bytes it stays total and panic-free, which is what a
-/// byte-transparent engine needs.
-fn char_starts(s: &[u8]) -> impl DoubleEndedIterator<Item = usize> + '_ {
-    s.iter().enumerate().filter(|(_, &b)| is_char_start(b)).map(|(k, _)| k)
+fn is_continuation(b: u8) -> bool {
+    (b & 0xC0) == 0x80
 }
 
-/// Whether `b` begins a character — the one test [`char_starts`] filters by.
-fn is_char_start(b: u8) -> bool {
-    (b & 0xC0) != 0x80
+/// The fewest characters to go at which the offset walks skip whole words.
+const WORD_SKIP_MIN: usize = 9;
+
+/// How many of the eight bytes of `w` begin a character: those whose top bit
+/// is clear or whose next bit is set.
+fn starts_in(w: [u8; 8]) -> usize {
+    let w = u64::from_le_bytes(w);
+    (((!w >> 7) | (w >> 6)) & 0x0101_0101_0101_0101).count_ones() as usize
 }
 
-/// Reverse the characters of `s` in place: the bytes are reversed whole, which
-/// leaves each character as its continuation bytes followed by its start byte,
-/// and then each such group is reversed back. Total on any bytes, as the
-/// definition above is.
+/// Reverse the characters of `s` in place.
 pub(crate) fn reverse_chars(s: &mut [u8]) {
-    s.reverse();
-    let mut i = 0;
-    while i < s.len() {
-        let mut j = i;
-        while j < s.len() && !is_char_start(s[j]) {
-            j += 1;
+    // ASCII has no continuation bytes, so its characters are its bytes.
+    if !s.is_ascii() {
+        for c in s.chunk_by_mut(|_, &b| is_continuation(b)) {
+            c.reverse();
         }
-        let end = (j + 1).min(s.len());
-        s[i..end].reverse();
-        i = end;
     }
+    s.reverse();
 }
 
-/// Characters as the engine counts them — on valid UTF-8, the codepoint count.
+/// The number of characters in `s`.
 pub(crate) fn char_count(s: &[u8]) -> usize {
-    char_starts(s).count()
+    // `u32` lanes: twice as many per vector as `usize`.
+    s.iter().map(|&b| !is_continuation(b) as u32).sum::<u32>() as usize
 }
 
-/// Byte offset of the `n`-th character start at or after `from`, or `s.len()`
-/// when the string has fewer — the clamp SUBSTRING's window relies on. `[0x80]`
-/// has no character starts, so every offset into it is `s.len()`.
-///
-/// Resuming from a known character start is what keeps a bounded window's cost
-/// proportional to the window rather than to the string.
-pub(crate) fn char_offset(s: &[u8], from: usize, n: usize) -> usize {
-    char_starts(&s[from..]).nth(n).map_or(s.len(), |k| k + from)
+/// Byte offset where character `n` (from 0) begins, or `s.len()` when `s` has
+/// no more than `n` characters.
+pub(crate) fn char_offset(s: &[u8], mut n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    // Character 0 begins at byte 0.
+    let mut i = 1;
+    while let Some(w) = s.get(i..i + 8).filter(|_| n >= WORD_SKIP_MIN) {
+        let c = starts_in(w.try_into().unwrap());
+        if c >= n {
+            break;
+        }
+        n -= c;
+        i += 8;
+    }
+    while i < s.len() {
+        if !is_continuation(s[i]) {
+            n -= 1;
+            if n == 0 {
+                return i;
+            }
+        }
+        i += 1;
+    }
+    s.len()
 }
 
-/// Byte offset where the last `n` characters begin — the mirror of
-/// [`char_offset`], walked from the end so the cost follows `n` rather than the
-/// string. `n == 0` is the end of the string, and a string with fewer than `n`
-/// character starts begins at its first one (`s.len()` when it has none, as
-/// `[0x80]` does).
-pub(crate) fn char_offset_back(s: &[u8], n: usize) -> usize {
-    let Some(k) = n.checked_sub(1) else { return s.len() };
-    char_starts(s)
-        .nth_back(k)
-        .unwrap_or_else(|| char_starts(s).next().unwrap_or(s.len()))
+/// Byte offset where the last `n` characters begin: `s.len()` for `n == 0`, and
+/// 0 when `s` has no more than `n`.
+pub(crate) fn char_offset_back(s: &[u8], mut n: usize) -> usize {
+    if n == 0 {
+        return s.len();
+    }
+    let mut i = s.len();
+    while i >= 8 && n >= WORD_SKIP_MIN {
+        let c = starts_in(s[i - 8..i].try_into().unwrap());
+        if c >= n {
+            break;
+        }
+        n -= c;
+        i -= 8;
+    }
+    while i > 0 {
+        i -= 1;
+        if !is_continuation(s[i]) {
+            n -= 1;
+            if n == 0 {
+                return i;
+            }
+        }
+    }
+    0
 }
 
 #[cfg(test)]

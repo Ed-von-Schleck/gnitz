@@ -808,8 +808,8 @@ fn view_span(v: StrView, buf_len: usize) -> (usize, usize) {
 }
 
 /// `v`'s bytes together with the offset they sit at. The sub-view producers
-/// (SUBSTRING, TRIM) need both, and must read the offset from here rather than
-/// from `v.off`: a clamped-away view reports offset 0.
+/// need both, and must read the offset from here rather than from `v.off`: a
+/// clamped-away view reports offset 0.
 fn view_bytes_at<'x>(v: StrView, arena: &'x [u8], bufs: StrBufs<'x>) -> (&'x [u8], usize) {
     let buf = bufs.region(v.src).unwrap_or(arena);
     let (o, l) = view_span(v, buf.len());
@@ -1262,33 +1262,28 @@ fn eval_str_substr(
         for i in 0..m {
             let v = str_views[base_s + i];
             let (s, base_off) = view_bytes_at(v, str_arena, bufs);
-            // Positions are 1-based and the window half-open, so both endpoints
-            // clamp to `[1, past_end]`. The byte length only bounds the character
-            // count; `char_offset` settles a window landing in the gap.
-            let past_end = s.len() as i128 + 1;
-            let lo = start.get(i);
+            // 0-based character indices, clamped to the byte length, which
+            // bounds the character count.
+            let n = s.len() as i128;
+            let lo = start.get(i) - 1;
             let hi = match len {
                 Some(l) => {
                     let len = l.get(i);
                     bad[i] = (len < 0) as u8;
                     lo + len
                 }
-                None => past_end,
+                None => n,
             };
-            let (lo, hi) = (lo.clamp(1, past_end), hi.clamp(1, past_end));
-            // One comparison covering a zero length, a start past the end, and a
-            // window entirely below 1.
-            str_views[base_d + i] = if lo >= hi {
+            let (t_lo, t_hi) = (lo.clamp(0, n) as usize, hi.clamp(0, n) as usize);
+            str_views[base_d + i] = if t_lo >= t_hi {
                 StrView::default()
             } else {
-                let (t_lo, t_hi) = ((lo - 1) as usize, (hi - 1) as usize);
-                let b_lo = char_offset(s, 0, t_lo);
-                // A window ending at or past the byte length ends at the string's
-                // end, since a character is ≥ one byte.
-                let b_hi = if t_hi >= s.len() {
+                let b_lo = char_offset(s, t_lo);
+                // No character ends past the byte length.
+                let b_hi = if t_hi == s.len() {
                     s.len()
                 } else {
-                    char_offset(s, b_lo, t_hi - t_lo)
+                    b_lo + char_offset(&s[b_lo..], t_hi - t_lo)
                 };
                 StrView::at(v.src, base_off + b_lo, b_hi - b_lo)
             };
@@ -2201,14 +2196,12 @@ pub(crate) fn eval_batch(
             Instr::StrSide { src, n, left } => {
                 str_kernel_total(scratch, mo, bufs, dst, [src], [n], |arena, bufs, [v], [n]| {
                     let (s, base) = view_bytes_at(v, arena, bufs);
-                    // Clamped to one past the byte length, so it fits a `usize`.
-                    let n_abs = n.unsigned_abs().min(s.len() as u128 + 1) as usize;
+                    // Clamped to the byte length, which no character count exceeds.
+                    let n_abs = n.unsigned_abs().min(s.len() as u128) as usize;
                     // A non-negative LEFT and a negative RIGHT count from the start.
                     let counts_from_start = (n >= 0) == left;
-                    // Walked from the end the count is measured from, so
-                    // `RIGHT(s, 10)` costs ten characters, not two passes.
                     let cut = if counts_from_start {
-                        char_offset(s, 0, n_abs)
+                        char_offset(s, n_abs)
                     } else {
                         char_offset_back(s, n_abs)
                     };
@@ -2286,7 +2279,7 @@ pub(crate) fn eval_batch(
                     // A width at or below the subject's own length truncates —
                     // the LEFT of `n` characters, a sub-view.
                     if n <= s_chars as i128 {
-                        return Some(StrView::at(vs.src, base, char_offset(s, 0, n as usize)));
+                        return Some(StrView::at(vs.src, base, char_offset(s, n as usize)));
                     }
                     let (fill, fill_base) = view_bytes_at(vf, arena, bufs);
                     let fill_chars = char_count(fill);
@@ -2300,18 +2293,25 @@ pub(crate) fn eval_batch(
                         _ => return None,
                     };
                     let (whole, rem) = (pad_chars / fill_chars, pad_chars % fill_chars);
-                    let rem_bytes = char_offset(fill, 0, rem);
-                    let total = s.len() as u128 + (whole * fill.len()) as u128 + rem_bytes as u128;
+                    let pad_len = whole * fill.len() + char_offset(fill, rem);
+                    let total = s.len() as u128 + pad_len as u128;
                     if total > u32::MAX as u128 {
                         return None;
                     }
-                    let (s_len, fill_len) = (s.len(), fill.len());
+                    let (s_len, fill_len, fill0) = (s.len(), fill.len(), fill[0]);
                     let out = arena.len();
+                    // The pad doubles itself: `n` fills cost `log2 n` copies.
                     let push_pad = |arena: &mut Vec<u8>| {
-                        for _ in 0..whole {
-                            arena_push_span(arena, bufs, vf.src, fill_base, fill_len);
+                        let p = arena.len();
+                        if fill_len == 1 {
+                            arena.resize(p + pad_len, fill0);
+                            return;
                         }
-                        arena_push_span(arena, bufs, vf.src, fill_base, rem_bytes);
+                        arena_push_span(arena, bufs, vf.src, fill_base, fill_len.min(pad_len));
+                        while arena.len() - p < pad_len {
+                            let have = arena.len() - p;
+                            arena.extend_from_within(p..p + have.min(pad_len - have));
+                        }
                     };
                     if left {
                         push_pad(arena);

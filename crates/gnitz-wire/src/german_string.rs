@@ -135,6 +135,13 @@ pub fn canonical_short_cell(src: &[u8; 16]) -> Option<[u8; 16]> {
     None
 }
 
+/// True if `cell` is short and all sixteen of its bytes are ASCII, so its
+/// content is.
+#[inline]
+pub fn german_string_short_ascii(cell: &[u8; 16]) -> bool {
+    german_string_inline(cell).is_some() && u128::from_le_bytes(*cell) & u128::from_le_bytes([0x80; 16]) == 0
+}
+
 /// The content of cell `s`, with a long cell that overruns `blob` read as empty
 /// — the one degrading accessor, so every path degrades alike.
 #[inline]

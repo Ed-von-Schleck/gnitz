@@ -11,6 +11,8 @@ xorf = { version = "0.13", default-features = false, features = ["binary-fuse"] 
 libc.workspace = true
 io-uring.workspace = true
 rustc-hash.workspace = true
+# The UTF-8 check on a pushed block's STRING cells.
+simdutf8 = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -6,7 +6,7 @@ use super::batch_pool::{acquire_arena, recycle_buf};
 use super::merge::{blob_span_key, prorated_blob_cap, BlobCache, DirectWriter, MemBatch};
 use crate::schema::{SchemaDescriptor, SchemaFacts};
 use gnitz_wire::wal;
-use gnitz_wire::Regions;
+use gnitz_wire::{Regions, TypeCode};
 
 /// One row's bytes across the fixed regions of `strides`.
 fn row_width(strides: &[u8]) -> usize {
@@ -254,7 +254,7 @@ impl Batch {
     pub fn decode_foreign_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Self, &'static str> {
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
         let mut mb = decode_mem_batch_from_wal_block(data, schema, &mut offsets)?;
-        mb.dead_heap = validate_string_heap_extents(&mb, schema)?;
+        mb.dead_heap = validate_string_cells(&mb, schema)?;
         if gnitz_wire::first_not_null_violation(schema.not_null_payload_slots(), mb.null_bmp()).is_some() {
             return Err("a null bit on a NOT NULL column");
         }
@@ -276,23 +276,45 @@ pub(super) fn first_valued_null_cell(mb: &MemBatch<'_>, schema: &SchemaDescripto
     gnitz_wire::first_valued_null(schema.nullable_payload_slots(), mb.null_bmp(), col)
 }
 
-/// Every German-string cell of `mb` is in canonical form against its own heap.
-/// Answers the heap's exact count of bytes no cell references.
-fn validate_string_heap_extents(mb: &MemBatch<'_>, schema: &SchemaDescriptor) -> Result<usize, &'static str> {
-    walk_heap_spans(mb, schema, |cell| gnitz_wire::german_string_cell_ok(cell, mb.blob))
-        .ok_or("data WAL German string is not in canonical form")
+/// Every German-string cell of `mb` is in canonical form against its own heap,
+/// and every STRING cell's content is UTF-8. Answers the heap's exact count of
+/// bytes no cell references.
+fn validate_string_cells(mb: &MemBatch<'_>, schema: &SchemaDescriptor) -> Result<usize, &'static str> {
+    // Non-ASCII STRING contents, each closed by an ASCII byte so no character
+    // runs from one into the next.
+    let mut text = Vec::new();
+    let dead = walk_heap_spans(mb, schema, |cell, tc| {
+        if !gnitz_wire::german_string_cell_ok(cell, mb.blob) {
+            return false;
+        }
+        if tc == TypeCode::String && !gnitz_wire::german_string_short_ascii(cell) {
+            let c = gnitz_wire::german_string_content(cell, mb.blob);
+            if !c.is_ascii() {
+                text.extend_from_slice(c);
+                text.push(0);
+            }
+        }
+        true
+    })
+    .ok_or("data WAL German string is not in canonical form")?;
+    simdutf8::basic::from_utf8(&text).map_err(|_| "a STRING cell is not UTF-8")?;
+    Ok(dead)
 }
 
 /// The exact count of `mb`'s heap bytes no long string cell references, a cell
 /// overrunning the heap referencing none.
 pub(super) fn measure_dead_heap(mb: &MemBatch<'_>, schema: &SchemaDescriptor) -> usize {
-    walk_heap_spans(mb, schema, |_| true).expect("an accepting walk")
+    walk_heap_spans(mb, schema, |_, _| true).expect("an accepting walk")
 }
 
 /// Mark every German-string cell's heap span, after `accept` has passed the
 /// cell, and answer the heap bytes left unmarked; `None` at the first cell
 /// `accept` refuses.
-fn walk_heap_spans(mb: &MemBatch<'_>, schema: &SchemaDescriptor, accept: impl Fn(&[u8; 16]) -> bool) -> Option<usize> {
+fn walk_heap_spans(
+    mb: &MemBatch<'_>,
+    schema: &SchemaDescriptor,
+    mut accept: impl FnMut(&[u8; 16], TypeCode) -> bool,
+) -> Option<usize> {
     let heap = mb.blob.len();
     if !schema.has_german_string() {
         return Some(heap);
@@ -303,7 +325,7 @@ fn walk_heap_spans(mb: &MemBatch<'_>, schema: &SchemaDescriptor, accept: impl Fn
             continue;
         }
         for cell in mb.col_data(pi, 16).as_chunks::<16>().0 {
-            if !accept(cell) {
+            if !accept(cell, col.type_code) {
                 return None;
             }
             if let Some(span) = gnitz_wire::german_string_heap(cell, heap) {

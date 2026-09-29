@@ -1,30 +1,39 @@
-use super::{char_count, char_offset, char_offset_back};
+use super::{char_count, char_offset, char_offset_back, reverse_chars};
 
-/// The fixtures every character rule has to stay total on: ASCII, valid
-/// multi-byte UTF-8, bytes that are not UTF-8 at all, a string with no character
-/// start whatsoever, and the empty string.
-const FIXTURES: [&[u8]; 5] = [
-    b"abcde",
-    "héllo wörld".as_bytes(),
-    &[0xFF, b'a', 0x80, 0xE2, b'b'],
-    &[0x80, 0x80],
-    b"",
-];
+/// Every helper against `str`'s own view of the same text.
+fn check(s: &str) {
+    let b = s.as_bytes();
+    let starts: Vec<usize> = s.char_indices().map(|(k, _)| k).collect();
+    assert_eq!(char_count(b), starts.len(), "count {s:?}");
+    for n in 0..starts.len() + 3 {
+        let front = starts.get(n).copied().unwrap_or(b.len());
+        assert_eq!(char_offset(b, n), front, "offset {s:?} n={n}");
+        let back = if n == 0 {
+            b.len()
+        } else {
+            starts.len().checked_sub(n).map_or(0, |i| starts[i])
+        };
+        assert_eq!(char_offset_back(b, n), back, "offset_back {s:?} n={n}");
+    }
+    let mut r = b.to_vec();
+    reverse_chars(&mut r);
+    assert_eq!(r, s.chars().rev().collect::<String>().as_bytes(), "reverse {s:?}");
+}
 
-/// [`char_offset_back`] is [`char_offset`] counted from the other end, at every
-/// count including the two the walk-from-the-front spelling got right by
-/// accident: `n == 0` is the end of the string, and a count past the character
-/// total is its first character start — `s.len()` for a string that has none.
+/// Every string of up to five characters over one character of each UTF-8
+/// width, plus two long strings for the vectorised count, the offset walks'
+/// word skips and the ASCII reverse.
 #[test]
-fn char_offset_back_is_char_offset_from_the_other_end() {
-    for s in FIXTURES {
-        let chars = char_count(s);
-        for n in 0..chars + 3 {
-            assert_eq!(
-                char_offset_back(s, n),
-                char_offset(s, 0, chars.saturating_sub(n)),
-                "s={s:?} n={n}",
-            );
+fn every_helper_agrees_with_str() {
+    const ALPHABET: [char; 4] = ['a', 'é', '€', '😀'];
+    for len in 0..=5u32 {
+        for code in 0..ALPHABET.len().pow(len) {
+            let s: String = (0..len)
+                .map(|i| ALPHABET[code / ALPHABET.len().pow(i) % ALPHABET.len()])
+                .collect();
+            check(&s);
         }
     }
+    check(&"x".repeat(100));
+    check(&"héllo wörld".repeat(8));
 }

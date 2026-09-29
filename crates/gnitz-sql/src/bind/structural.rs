@@ -362,14 +362,8 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
 }
 
 /// The bytes a TRIM strips: an ASCII string literal, defaulting to a single
-/// space.
-///
-/// A non-literal, non-ASCII or NULL set is rejected here rather than deferred,
-/// because the set is compile-time data the engine bakes into a membership
-/// table, not a per-row operand. Restricting it to ASCII is what makes the strip
-/// byte-wise and still character-safe: an ASCII byte never occurs inside a
-/// UTF-8 multibyte sequence. PostgreSQL instead treats `btrim(s, NULL)` as
-/// runtime NULL propagation.
+/// space. The set is compile-time data, so a NULL one is rejected here, where
+/// PostgreSQL's `btrim(s, NULL)` is NULL per row.
 fn trim_set(trim_what: Option<&Expr>) -> Result<String, GnitzSqlError> {
     let Some(e) = trim_what else {
         return Ok(" ".to_string());

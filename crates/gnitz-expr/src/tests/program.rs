@@ -17,7 +17,7 @@ use crate::test_support::{
 };
 use crate::{
     CmpOp, ColumnLocator, ConstIdx, ExprValidateErr, FloatArithOp, Instr, IntArithOp, LogicalInstr, LogicalProgram,
-    MapEval, NullPerm, Reg, ScalarEval, Sink,
+    MapEval, NullPerm, PoolEntry, Reg, ScalarEval, Sink, TrimMode,
 };
 
 /// The phrase a `ColKindMismatch` renders for `kind`, read from its one source
@@ -635,9 +635,8 @@ fn wire_err(r: Result<LogicalProgram, ExprValidateErr>) -> ExprValidateErr {
     }
 }
 
-/// A program round-trips through its own blob. The pool is byte-transparent — an
-/// empty entry, multi-byte UTF-8 and a non-UTF-8 string all survive — and an
-/// entry no instruction names survives too.
+/// A program round-trips through its own blob: an empty entry, multi-byte UTF-8,
+/// a non-UTF-8 compare constant, and entries no instruction names.
 #[test]
 fn a_program_round_trips_through_its_blob() {
     let pool = vec![
@@ -1325,10 +1324,49 @@ fn a_non_canonical_in_set_pool_is_rejected() {
                 &[],
                 vec![gnitz_wire::as_le_bytes(pool).to_vec()]
             )),
-            ExprValidateErr::IntSetNotCanonical { set_idx: 0 },
+            ExprValidateErr::PoolEntryMalformed { const_idx: 0, want: PoolEntry::IntSet },
             "pool {pool:?}"
         );
     }
+}
+
+/// A const-pool entry is held to what its opcode reads it as: a STRING value
+/// and a LIKE pattern's text are UTF-8, a TRIM set is ASCII, and a compare
+/// constant, which also serves BLOB columns, is any bytes.
+#[test]
+fn a_pool_entry_is_held_to_its_kind() {
+    use crate::like::{ANY_MANY, ANY_ONE};
+    let check = |instr: LogicalInstr, entry: &[u8]| {
+        let instrs = vec![LogicalInstr::LoadColStr { col: 1 }, instr];
+        LogicalProgram::from_instrs(instrs, vec![Sink::Reg(Reg(1))], vec![entry.to_vec()]).err()
+    };
+    let malformed = |want| Some(ExprValidateErr::PoolEntryMalformed { const_idx: 0, want });
+    let text = LogicalInstr::LoadConstStr { const_idx: ConstIdx(0) };
+    let trim = LogicalInstr::StrTrim {
+        a: Reg(0),
+        mode: TrimMode::Both,
+        set_idx: ConstIdx(0),
+    };
+    let like = LogicalInstr::StrLike {
+        src: Reg(0),
+        pat_idx: ConstIdx(0),
+        ci: false,
+    };
+    let cmp = LogicalInstr::StrColConst {
+        op: CmpOp::Eq,
+        col: 1,
+        const_idx: ConstIdx(0),
+    };
+    assert_eq!(check(text, &[0xC3]), malformed(PoolEntry::Text));
+    assert_eq!(check(text, "é".as_bytes()), None);
+    assert_eq!(check(trim, "é".as_bytes()), malformed(PoolEntry::TrimSet));
+    assert_eq!(check(trim, b" x"), None);
+    assert_eq!(
+        check(like, &[ANY_MANY, 0xC3, ANY_ONE]),
+        malformed(PoolEntry::LikePattern)
+    );
+    assert_eq!(check(like, &[ANY_MANY, 0xC3, 0xA9, ANY_ONE]), None);
+    assert_eq!(check(cmp, &[0xFF, 0x00]), None);
 }
 
 #[test]
@@ -1339,7 +1377,7 @@ fn validate_rejects_a_misaligned_in_set_pool() {
             &[],
             vec![vec![0u8; 5]]
         )),
-        ExprValidateErr::IntSetNotCanonical { set_idx: 0 }
+        ExprValidateErr::PoolEntryMalformed { const_idx: 0, want: PoolEntry::IntSet }
     );
 }
 

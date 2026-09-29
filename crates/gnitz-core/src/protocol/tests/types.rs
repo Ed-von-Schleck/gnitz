@@ -826,13 +826,23 @@ fn a_fixed_value_in_a_string_column_panics() {
 }
 
 #[test]
-#[should_panic(expected = "a string/blob value cannot be written to the U64 column")]
+#[should_panic(expected = "a String value cannot be written to the U64 column")]
 fn a_string_in_a_fixed_column_panics() {
     let schema = kv_schema(TypeCode::U64);
     let mut batch = ZSetBatch::new(&schema);
     BatchAppender::new(&mut batch, &schema)
         .add_row(1u128, 1)
         .str_val("oops");
+}
+
+#[test]
+#[should_panic(expected = "a Blob value cannot be written to the String column")]
+fn raw_bytes_in_a_string_column_panic() {
+    let schema = kv_schema(TypeCode::String);
+    let mut batch = ZSetBatch::new(&schema);
+    BatchAppender::new(&mut batch, &schema)
+        .add_row(1u128, 1)
+        .bytes_val(b"\xff");
 }
 
 /// A 16-byte write into an 8-byte column shares the `Fixed` variant, so only

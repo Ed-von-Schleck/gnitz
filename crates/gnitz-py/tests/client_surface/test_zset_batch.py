@@ -394,8 +394,7 @@ class TestValueCoercion:
     def test_bytes_and_text_columns_stay_apart(self):
         """BLOB and STRING share one region form, so the extraction is where the
         two kinds stay separate: BLOB takes bytes and refuses `str`; STRING takes
-        `str` and refuses bytes — nothing downstream would reject non-UTF-8, so
-        this is where TEXT stays text."""
+        `str` and refuses bytes."""
         schema = Schema([ColumnDef("pk", TypeCode.U64),
                          ColumnDef("payload", TypeCode.BLOB),
                          ColumnDef("s", TypeCode.STRING)], [0])

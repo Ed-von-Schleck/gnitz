@@ -407,3 +407,156 @@ fn a_block_declaring_more_dead_than_heap_is_refused() {
         Some("block declares more dead heap than heap")
     );
 }
+
+/// A pushed block decodes iff every STRING cell is UTF-8, as a per-cell
+/// `from_utf8` judges it, over random blocks mixing valid pieces and invalid
+/// ones. A BLOB column between the two STRING columns may hold anything.
+#[test]
+fn foreign_decode_utf8_matches_per_cell_oracle() {
+    use crate::schema::SchemaColumn;
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::String, false),
+            SchemaColumn::new(TypeCode::Blob, false),
+            SchemaColumn::new(TypeCode::String, false),
+        ],
+        &[0],
+    );
+    const PIECES: [&[u8]; 12] = [
+        b"a",
+        b"xyz",
+        "é".as_bytes(),
+        "€".as_bytes(),
+        "𝄞".as_bytes(),
+        &[0x80],
+        &[0xFF],
+        &[0xC3],
+        &[0xE2, 0x82],
+        &[0xED, 0xA0, 0x80],
+        &[0xA9],
+        b"0123456789",
+    ];
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut rnd = |m: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % m
+    };
+    let (mut ok_n, mut bad_n) = (0, 0);
+    for _ in 0..20000 {
+        let rows = 1 + rnd(4);
+        let mut b = super::super::batch_builder::BatchBuilder::new(schema);
+        let mut valid = true;
+        for i in 0..rows {
+            b.begin_row(i as u128, 1);
+            for col in 0..3 {
+                // Mostly valid pieces, so a block is often wholly valid.
+                let n = rnd(8);
+                let mut v = Vec::new();
+                for _ in 0..n {
+                    let k = if rnd(6) == 0 {
+                        rnd(12)
+                    } else {
+                        [0, 1, 2, 3, 4, 11][rnd(6) as usize]
+                    };
+                    v.extend_from_slice(PIECES[k as usize]);
+                }
+                if col != 1 {
+                    valid &= std::str::from_utf8(&v).is_ok();
+                }
+                b.put_blob(&v);
+            }
+            b.end_row();
+        }
+        let block = encode_to_wire_vec(&b.finish());
+        let got = Batch::decode_foreign_wal_block(&block, &schema);
+        assert_eq!(got.is_ok(), valid, "{:?}", got.err());
+        if valid {
+            ok_n += 1
+        } else {
+            bad_n += 1
+        }
+    }
+    assert!(ok_n > 2000 && bad_n > 2000, "{ok_n} valid, {bad_n} invalid");
+}
+
+/// The block's STRING contents are checked as separate values: no character
+/// may span two cells, or a cell and the heap bytes beside it.
+#[test]
+fn foreign_decode_utf8_spans_split_across_cells() {
+    use crate::schema::SchemaColumn;
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::String, false),
+            SchemaColumn::new(TypeCode::Blob, false),
+        ],
+        &[0],
+    );
+    let accepts = |rows: &[(&[u8], &[u8])]| {
+        let mut b = super::super::batch_builder::BatchBuilder::new(schema);
+        for (i, (s, x)) in rows.iter().enumerate() {
+            b.begin_row(i as u128, 1);
+            b.put_blob(s);
+            b.put_blob(x);
+            b.end_row();
+        }
+        Batch::decode_foreign_wal_block(&encode_to_wire_vec(&b.finish()), &schema).is_ok()
+    };
+    let long = |pre: &[u8], post: &[u8]| [pre, b"0123456789abcdef", post].concat();
+    // Valid, long and short, with the heap wholly UTF-8.
+    assert!(accepts(&[(&long(b"", "é".as_bytes()), b"x"), ("aé€".as_bytes(), b"")]));
+    // A long STRING starting mid-character after a BLOB ending in a lead byte:
+    // the heap reads as UTF-8 across the seam.
+    assert!(!accepts(&[(b"", &long(b"", &[0xC3])), (&long(&[0xA9], b""), b"")]));
+    // A long STRING ending in a lead byte before a BLOB starting with a
+    // continuation byte.
+    assert!(!accepts(&[(&long(b"", &[0xC3]), &long(&[0xA9], b""))]));
+    // Two full short cells whose contents join into one character.
+    assert!(!accepts(&[(b"0123456789\xE2\x82", b""), (b"\xAC", b"")]));
+    // The heap not UTF-8 (a BLOB), the STRING cells valid, and then not.
+    assert!(accepts(&[(&long(b"", "é".as_bytes()), &[0xFF; 20])]));
+    assert!(!accepts(&[(&long(b"", &[0xFF]), &[0xFF; 20])]));
+}
+
+/// Retired instructions for `decode_foreign_wal_block` over 1000 rows of one
+/// STRING column. `GNITZ_BENCH_SHAPE` picks the value; difference two
+/// `GNITZ_BENCH_PASSES` counts under `perf stat -e instructions:u`.
+#[test]
+#[ignore]
+fn foreign_decode_string_bench() {
+    let shape = std::env::var("GNITZ_BENCH_SHAPE").unwrap_or_else(|_| "s12".to_string());
+    let passes: usize = std::env::var("GNITZ_BENCH_PASSES").map_or(1, |p| p.parse().unwrap());
+    let unit = match shape.as_str() {
+        "s12" => "abcdefghijkl".to_string(),
+        "u9" => "aé€bxy".to_string(),
+        "s64" => "abcdefgh".repeat(8),
+        "m64" => format!("{}é", "abcdefgh".repeat(7)),
+        "u64" => "aéb€".repeat(8),
+        "s512" => "abcdefgh".repeat(64),
+        "u512" => "aéb€".repeat(73),
+        other => panic!("GNITZ_BENCH_SHAPE must be s12/u9/s64/m64/u64/s512/u512, got {other:?}"),
+    };
+    let schema = crate::test_support::u64_pk_schema(crate::schema::SchemaColumn::new(TypeCode::String, false));
+    let mut b = super::super::batch_builder::BatchBuilder::new(schema);
+    for i in 0..1000u64 {
+        b.begin_row(i as u128, 1);
+        let mut v = unit.clone().into_bytes();
+        v[0] = b'0' + (i % 10) as u8;
+        b.put_string(std::str::from_utf8(&v).unwrap());
+        b.end_row();
+    }
+    let block = encode_to_wire_vec(&b.finish());
+    let mut acc = 0usize;
+    for _ in 0..passes {
+        acc += Batch::decode_foreign_wal_block(std::hint::black_box(&block), &schema)
+            .unwrap()
+            .len();
+    }
+    println!(
+        "foreign_decode_string_bench shape={shape} passes={passes} acc={}",
+        std::hint::black_box(acc)
+    );
+}

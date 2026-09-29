@@ -1,9 +1,6 @@
 //! SQL LIKE / ILIKE: the pattern encoding, and the matcher it compiles into.
 //!
-//! `%` matches any bytes and `_` one character, by the boundary [`crate::chars`]
-//! defines for SUBSTRING. On valid UTF-8 the two granularities agree; on bytes
-//! that are not, a byte-granular `%` is what keeps every specialization
-//! answering as the `Generic` walk does.
+//! `%` matches any characters and `_` one, as [`crate::chars`] defines them.
 
 use memchr::memmem::Finder;
 
@@ -46,6 +43,16 @@ impl LikePattern {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    /// Whether `bytes` is a pattern [`Self::encode`] could produce: UTF-8 text
+    /// between the wildcard bytes.
+    pub(crate) fn is_encoding(bytes: &[u8]) -> bool {
+        bytes.split(is_wildcard).all(|text| std::str::from_utf8(text).is_ok())
+    }
+}
+
+fn is_wildcard(b: &u8) -> bool {
+    matches!(*b, ANY_MANY | ANY_ONE)
 }
 
 pub(crate) struct LikeMatcher {
@@ -72,54 +79,47 @@ enum LikeKind {
 #[allow(clippy::large_enum_variant)]
 enum LikeTok {
     Lit(Finder<'static>),
+    /// `_`.
     AnyOne,
-    AnyMany,
+    /// `%` and the literal after it.
+    SkipTo(Finder<'static>),
+    /// A trailing `%`.
+    AnyRest,
 }
 
-/// Under `ci` each literal run is ASCII-lowercased.
+/// A run of wildcards becomes its `_`s, then its `%` joined to the literal
+/// after it. Under `ci` each literal is ASCII-lowercased.
 fn tokenize(pattern: &[u8], ci: bool) -> Vec<LikeTok> {
+    let finder = |lit: &[u8]| match ci {
+        true => Finder::new(&lit.to_ascii_lowercase()).into_owned(),
+        false => Finder::new(lit).into_owned(),
+    };
     let mut toks = Vec::new();
     let mut rest = pattern;
-    while let Some((&b, tail)) = rest.split_first() {
-        match b {
-            ANY_MANY => {
-                if !matches!(toks.last(), Some(LikeTok::AnyMany)) {
-                    toks.push(LikeTok::AnyMany);
-                }
-                rest = tail;
-            }
-            ANY_ONE => {
-                toks.push(LikeTok::AnyOne);
-                rest = tail;
-            }
-            _ => {
-                let n = rest
-                    .iter()
-                    .position(|&b| matches!(b, ANY_MANY | ANY_ONE))
-                    .unwrap_or(rest.len());
-                let run = &rest[..n];
-                let finder = if ci {
-                    Finder::new(&run.to_ascii_lowercase()).into_owned()
-                } else {
-                    Finder::new(run).into_owned()
-                };
-                toks.push(LikeTok::Lit(finder));
-                rest = &rest[n..];
-            }
+    while !rest.is_empty() {
+        let (wild, tail) = rest.split_at(rest.iter().take_while(|b| is_wildcard(b)).count());
+        let (lit, tail) = tail.split_at(tail.iter().position(is_wildcard).unwrap_or(tail.len()));
+        toks.extend(wild.iter().filter(|&&b| b == ANY_ONE).map(|_| LikeTok::AnyOne));
+        match (wild.contains(&ANY_MANY), lit.is_empty()) {
+            (true, true) => toks.push(LikeTok::AnyRest),
+            (true, false) => toks.push(LikeTok::SkipTo(finder(lit))),
+            (false, true) => {}
+            (false, false) => toks.push(LikeTok::Lit(finder(lit))),
         }
+        rest = tail;
     }
     toks
 }
 
 fn specialize(toks: Vec<LikeTok>) -> LikeKind {
-    use LikeTok::{AnyMany, Lit};
+    use LikeTok::{AnyRest, Lit, SkipTo};
     match toks.as_slice() {
         [] => LikeKind::Exact(Vec::new()),
         [Lit(l)] => LikeKind::Exact(l.needle().to_vec()),
-        [Lit(l), AnyMany] => LikeKind::Prefix(l.needle().to_vec()),
-        [AnyMany] => LikeKind::Prefix(Vec::new()),
-        [AnyMany, Lit(l)] => LikeKind::Suffix(l.needle().to_vec()),
-        [AnyMany, Lit(l), AnyMany] => LikeKind::Contains(l.clone()),
+        [Lit(l), AnyRest] => LikeKind::Prefix(l.needle().to_vec()),
+        [AnyRest] => LikeKind::Prefix(Vec::new()),
+        [SkipTo(l)] => LikeKind::Suffix(l.needle().to_vec()),
+        [SkipTo(l), AnyRest] => LikeKind::Contains(l.clone()),
         _ => LikeKind::Generic(toks),
     }
 }
@@ -174,20 +174,19 @@ fn fold<'a>(ci: bool, h: &'a [u8], folded: &'a mut Vec<u8>) -> &'a [u8] {
     folded
 }
 
-/// A glob walk with one backtrack point, `anchor`: the token after the latest
-/// `%`, and the earliest offset it has not been tried at. A literal is tried only
-/// where it occurs. `O(n·m)` in haystack bytes × pattern bytes.
+/// A glob walk with one backtrack point, `anchor`: the latest `SkipTo`'s
+/// literal, the token after it, and the earliest offset the literal has not been
+/// tried at. `O(n·m)` in haystack bytes × pattern bytes.
 fn generic_match(toks: &[LikeTok], h: &[u8]) -> bool {
     let n = h.len();
     let (mut ti, mut hi) = (0usize, 0usize);
-    let mut anchor: Option<(usize, usize)> = None;
+    let mut anchor: Option<(&Finder<'static>, usize, usize)> = None;
     loop {
         match toks.get(ti) {
-            // A trailing `%` absorbs the rest.
-            Some(LikeTok::AnyMany) if ti + 1 == toks.len() => return true,
-            Some(LikeTok::AnyMany) => anchor = Some((ti + 1, hi)),
+            Some(LikeTok::AnyRest) => return true,
+            Some(LikeTok::SkipTo(l)) => anchor = Some((l, ti + 1, hi)),
             Some(LikeTok::AnyOne) if hi < n => {
-                hi = char_offset(h, hi, 1);
+                hi += char_offset(&h[hi..], 1);
                 ti += 1;
                 continue;
             }
@@ -203,21 +202,15 @@ fn generic_match(toks: &[LikeTok], h: &[u8]) -> bool {
             None if hi == n => return true,
             None => {}
         }
-        let Some((ati, ahi)) = &mut anchor else { return false };
-        (ti, hi) = match &toks[*ati] {
-            LikeTok::Lit(l) => {
-                let Some(k) = find_lit(&h[*ahi..], l) else { return false };
-                let at = *ahi + k;
-                *ahi = at + 1;
-                (*ati + 1, at + l.needle().len())
-            }
-            _ if *ahi <= n => {
-                let at = *ahi;
-                *ahi += 1;
-                (*ati, at)
-            }
-            _ => return false,
+        let Some((l, next, from)) = &mut anchor else {
+            return false;
         };
+        let Some(k) = find_lit(&h[*from..], l) else {
+            return false;
+        };
+        let at = *from + k;
+        *from = at + 1;
+        (ti, hi) = (*next, at + l.needle().len());
     }
 }
 

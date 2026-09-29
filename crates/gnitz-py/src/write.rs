@@ -103,8 +103,8 @@ impl PyZSetBatch {
 }
 
 /// Append one non-null payload cell of type `tc`, spilling a German string into
-/// `blob`. STRING extracts a `str` and BLOB arbitrary bytes: the region carries
-/// both alike, so this extraction is where TEXT stays valid UTF-8.
+/// `blob`. STRING extracts a `str` and BLOB arbitrary bytes: a `str` is UTF-8 by
+/// construction; the engine refuses a STRING cell that is not.
 fn push_column_value(col: &mut Vec<u8>, blob: &mut Vec<u8>, ty: ColType, val: &Bound<'_, PyAny>) -> PyResult<()> {
     match ty.tc {
         TypeCode::String => {

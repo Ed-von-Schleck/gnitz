@@ -493,7 +493,7 @@ fn is_null_arm_bench() {
 }
 
 /// One `len`-byte haystack per row in the single STRING payload slot: `unit`
-/// repeated, with one byte per row overwritten by a digit so every row differs
+/// repeated, with one ASCII byte per row overwritten by a digit so every row differs
 /// and no matcher can be hoisted out of the row loop. A fixed length is what
 /// makes a per-byte slope readable, where [`str_bench_view`]'s alternating
 /// widths average two regimes.
@@ -503,7 +503,9 @@ fn fixed_len_str_view(schema: &TestSchema, n: usize, len: usize, unit: &[u8]) ->
     for row in 0..n {
         set_row_pk(&mut v, schema, row, row as u64 + 1);
         let mut s: Vec<u8> = unit.iter().copied().cycle().take(len).collect();
-        s[row % len] = b'0' + (row % 10) as u8;
+        if s[row % len].is_ascii() {
+            s[row % len] = b'0' + (row % 10) as u8;
+        }
         v.set_string(row, 0, &s);
     }
     v
@@ -541,7 +543,10 @@ fn str_bench_view(schema: &TestSchema, n: usize, cols: usize) -> TestView {
 ///            str_icontains_12 str_icontains_512 str_iprefix_128 \
 ///            str_generic_resume_128 str_generic_resume_512 \
 ///            str_strpos_128 str_strpos_512 \
-///            str_side_64 str_side_512; do
+///            str_side_64 str_side_512 \
+///            str_chars_12 str_chars_128 str_chars_512 str_like_any3 \
+///            str_reverse_128 str_reverse_utf8_128 str_lpad_12 \
+///            str_left200 str_right200 str_substr_far; do
 ///     for p in 1 501; do \
 ///       GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
 ///       cargo test -p gnitz-expr --release expr_kernel_bench -- --ignored --nocapture
@@ -736,6 +741,71 @@ fn expr_kernel_bench() {
         vec![],
     );
 
+    // --- the character-granular kernels, over ASCII and over UTF-8 views.
+    let utf8_views: Vec<TestView> = [12usize, 128, 512]
+        .iter()
+        .map(|&l| fixed_len_str_view(&str1, n, l, "aéb".as_bytes()))
+        .collect();
+    let str_chars = scalar_prog(
+        &str1,
+        vec![load_str(1), LogicalInstr::StrLen { a: Reg(0), chars: true }],
+        Reg(1),
+        vec![],
+    );
+    let str_reverse = scalar_prog(
+        &str1,
+        vec![load_str(1), LogicalInstr::StrReverse { a: Reg(0) }],
+        Reg(1),
+        vec![],
+    );
+    let str_lpad = scalar_prog(
+        &str1,
+        vec![
+            load_str(1),
+            LogicalInstr::LoadConst { val: 40, unsigned: false },
+            LogicalInstr::LoadConstStr { const_idx: ConstIdx(0) },
+            LogicalInstr::StrPad {
+                s: Reg(0),
+                n_reg: Reg(1),
+                fill: Reg(2),
+                left: true,
+            },
+        ],
+        Reg(3),
+        vec![b" ".to_vec()],
+    );
+    // Windows far into the string, where the offset walks skip whole words.
+    let side200 = |left| {
+        scalar_prog(
+            &str1,
+            vec![
+                load_str(1),
+                LogicalInstr::LoadConst { val: 200, unsigned: false },
+                LogicalInstr::StrSide { src: Reg(0), n_reg: Reg(1), left },
+            ],
+            Reg(2),
+            vec![],
+        )
+    };
+    let (str_left200, str_right200) = (side200(true), side200(false));
+    let str_substr_far = scalar_prog(
+        &str1,
+        vec![
+            load_str(1),
+            LogicalInstr::LoadConst { val: 200, unsigned: false },
+            LogicalInstr::LoadConst { val: 10, unsigned: false },
+            LogicalInstr::StrSubstr {
+                src: Reg(0),
+                start_reg: Reg(1),
+                len_reg: Some(Reg(2)),
+            },
+        ],
+        Reg(3),
+        vec![],
+    );
+    // A `%` ahead of `_`s.
+    let like_any3 = like_prog("%___", false);
+
     // --- a real map: six compute opcodes plus two register sinks, driven through
     //     `write_computed` the way a maintained view's projection is ---
     let map_in = schema_pk_ints(3, false);
@@ -815,6 +885,11 @@ fn expr_kernel_bench() {
         ("str_strpos_128", &strpos, &freq_views[0], 2),
         ("str_strpos_512", &strpos, &freq_views[1], 2),
     ]);
+    let [str_chars, like_any3] = [str_chars, like_any3].map(RefCell::new);
+    for (k, name) in ["str_chars_12", "str_chars_128", "str_chars_512"].iter().enumerate() {
+        scalar_shapes.push((name, &str_chars, &utf8_views[k], 1));
+    }
+    scalar_shapes.push(("str_like_any3", &like_any3, &utf8_views[1], 1));
     for (name, ev, view, reg) in scalar_shapes {
         if !driven(name) {
             continue;
@@ -837,6 +912,16 @@ fn expr_kernel_bench() {
     for (k, name) in ["str_side_64", "str_side_512"].iter().enumerate() {
         str_shapes.push((name, &str_side, &side_views[k], 2));
     }
+    let [str_reverse, str_lpad, str_left200, str_right200, str_substr_far] =
+        [str_reverse, str_lpad, str_left200, str_right200, str_substr_far].map(RefCell::new);
+    str_shapes.extend([
+        ("str_reverse_128", &str_reverse, &like_views[1], 1),
+        ("str_reverse_utf8_128", &str_reverse, &utf8_views[1], 1),
+        ("str_lpad_12", &str_lpad, &like_views[0], 3),
+        ("str_left200", &str_left200, &utf8_views[2], 2),
+        ("str_right200", &str_right200, &utf8_views[2], 2),
+        ("str_substr_far", &str_substr_far, &utf8_views[2], 3),
+    ]);
     for (name, ev, view, reg) in str_shapes {
         if !driven(name) {
             continue;

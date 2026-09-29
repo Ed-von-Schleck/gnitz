@@ -140,9 +140,21 @@ fn underscore_consumes_one_character_not_one_byte() {
     assert!(hit(&like("_ö_"), "aöb".as_bytes()));
     assert!(hit(&like("_"), "é".as_bytes()));
     assert!(!hit(&like("_"), "éé".as_bytes()));
-    // On invalid UTF-8 `_` inherits SUBSTRING's rule: a lone continuation byte
-    // starts no character, so it is consumed together with the byte after it.
-    assert!(hit(&like("_"), &[0x80, 0x41]));
+}
+
+#[test]
+fn a_wildcard_run_is_its_underscores_then_one_skip() {
+    let toks = tokenize(&raw("%_%_a"), false);
+    assert!(
+        matches!(toks.as_slice(), [LikeTok::AnyOne, LikeTok::AnyOne, LikeTok::SkipTo(_)]),
+        "the run is its two `_`s, then its `%` joined to the literal"
+    );
+    assert!(!hit(&like("%_%"), b""));
+    assert!(hit(&like("_%_"), b"ab"));
+    assert!(!hit(&like("_%_"), b"a"));
+    assert!(hit(&like("a%_%_%b"), b"axyb"));
+    assert!(!hit(&like("a%_%_%b"), b"axb"));
+    agrees_with_reference(&raw("%_%a%__%"), &[b"xa", b"xaaa", "éaéé".as_bytes(), b"a"]);
 }
 
 #[test]
@@ -164,28 +176,6 @@ fn the_anchor_walk_terminates() {
     // The classic backtracking-regex bait costs one anchor walk, not an
     // exponential blowup — the single anchor is why.
     assert!(!hit(&like("%a%a%a%a%a%ab"), &[b'a'; 400]));
-}
-
-// ---------------------------------------------------------------------------
-// The byte-granular anchor
-// ---------------------------------------------------------------------------
-
-#[test]
-fn the_anchor_advances_by_one_byte() {
-    // A boundary-aligned retry never proposes position 1 here, so it would miss
-    // a match the specializations see.
-    assert!(hit(&like("%A%B%"), &[0x41, 0x93, 0x42]));
-    agrees_with_generic("%ab", &[&[0x80, b'a', b'b']]);
-    agrees_with_generic("%a%", &[&[0x80, b'a', b'b']]);
-}
-
-#[test]
-fn a_literal_starting_mid_character_agrees_with_its_specialization() {
-    // A literal run that *begins* with a continuation byte: the walk and
-    // `Contains` must answer alike, and both must find the match at offset 1.
-    let h = [0x41u8, 0x93, 0x42];
-    assert!(hit(&LikeMatcher::compile(&[ANY_MANY, 0x93, ANY_MANY, b'B'], false), &h));
-    assert!(hit(&LikeMatcher::compile(&[ANY_MANY, 0x93, ANY_MANY], false), &h));
 }
 
 #[test]
@@ -256,11 +246,6 @@ fn a_multi_byte_escape_character() {
 #[test]
 fn the_wildcards_encode_to_bytes_utf8_text_never_contains() {
     assert_eq!(raw("a%b_c"), [b'a', ANY_MANY, b'b', ANY_ONE, b'c']);
-    // Every other byte is a literal, so a pattern forged with bytes the encoder
-    // never produces still compiles and matches them literally.
-    let m = LikeMatcher::compile(&[b'a', 0x80, ANY_MANY], false);
-    assert!(hit(&m, &[b'a', 0x80, b'z']));
-    assert!(!hit(&m, b"a"));
 }
 
 // ---------------------------------------------------------------------------
@@ -272,10 +257,18 @@ fn the_wildcards_encode_to_bytes_utf8_text_never_contains() {
 fn ref_match(toks: &[LikeTok], h: &[u8], ci: bool) -> bool {
     match toks.first() {
         None => h.is_empty(),
-        Some(LikeTok::AnyMany) => (0..=h.len()).any(|k| ref_match(&toks[1..], &h[k..], ci)),
+        Some(LikeTok::AnyRest) => true,
+        Some(LikeTok::SkipTo(l)) => {
+            let l = l.needle();
+            (0..=h.len().saturating_sub(l.len())).any(|k| {
+                h.len() >= k + l.len()
+                    && anchored_eq(&h[k..k + l.len()], l, ci)
+                    && ref_match(&toks[1..], &h[k + l.len()..], ci)
+            })
+        }
         // The walk's own character step: the two differ only in how they
         // backtrack.
-        Some(LikeTok::AnyOne) => !h.is_empty() && ref_match(&toks[1..], &h[crate::chars::char_offset(h, 0, 1)..], ci),
+        Some(LikeTok::AnyOne) => !h.is_empty() && ref_match(&toks[1..], &h[crate::chars::char_offset(h, 1)..], ci),
         // On the unfolded haystack, so the oracle stays independent of the fold.
         Some(LikeTok::Lit(l)) => {
             let l = l.needle();
@@ -302,10 +295,10 @@ fn agrees_with_reference(pattern: &[u8], haystacks: &[&[u8]]) {
     }
 }
 
-/// Every token the anchor can resume on.
+/// Every place the anchor literal can sit.
 #[test]
 fn the_generic_walk_agrees_with_the_oracle() {
-    // The anchor token is `AnyOne`, not a literal.
+    // A `%` ahead of a `_`.
     agrees_with_reference(&raw("%_abc%"), &[b"abc", b"xabc", b"xxabcyy", b"", b"_abc", b"AXABC"]);
     // The anchor literal never occurs.
     agrees_with_reference(
@@ -314,7 +307,7 @@ fn the_generic_walk_agrees_with_the_oracle() {
     );
     // It occurs only overlapping a partial match.
     agrees_with_reference(&raw("%ab%ab%"), &[b"aXab", b"abab", b"aabab", b"ab", b"aab", b"aAbAB"]);
-    // The anchor alternates between a literal and a wildcard.
+    // A `_` between the anchor literal and the next `%`.
     agrees_with_reference(
         &raw("%a_c%d%"),
         &[b"abcd", b"zabczzd", b"abc", b"dabc", b"a_cd", b"ZABCZZD"],
@@ -330,25 +323,6 @@ fn the_generic_walk_agrees_with_the_oracle() {
         &raw("%ne%xq"),
         &[&dense, &tail, &upper, &[dense.as_slice(), b"xq"].concat()],
     );
-}
-
-/// `%` is byte-granular, so the walk resumes at offsets that are not character
-/// boundaries.
-#[test]
-fn the_walk_stays_byte_granular_on_non_utf8() {
-    // A lone continuation byte has no character start at all, and a truncated
-    // multi-byte sequence puts the literal mid-character.
-    let bytes: [&[u8]; 6] = [
-        &[0x80, b'a', b'b', 0x80, b'a', b'b'],
-        &[0xE2, 0x82, b'a', b'b'],
-        &[0xFF, 0xFE, b'a', b'b', 0xFF],
-        b"ab",
-        &[0x80],
-        &[],
-    ];
-    agrees_with_reference(&raw("%ab%b%"), &bytes);
-    agrees_with_reference(&raw("%_ab%"), &bytes);
-    agrees_with_reference(&[ANY_MANY, 0x80, ANY_MANY, b'a', ANY_MANY], &bytes);
 }
 
 /// An occurrence overlapping a failed candidate is still found.

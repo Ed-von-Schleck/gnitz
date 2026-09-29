@@ -10,7 +10,7 @@
 //! encode/decode pair that is its only reader.
 
 use crate::calendar::CalendarOp;
-use crate::like::LikeMatcher;
+use crate::like::{LikeMatcher, LikePattern};
 use crate::{ColumnLocator, SchemaFacts};
 use gnitz_wire::{decode_all, encode_german_string, FixedInt, TypeCode, Writer};
 use std::fmt;
@@ -57,8 +57,10 @@ pub enum ExprValidateErr {
         const_idx: u32,
         n: usize,
     },
-    IntSetNotCanonical {
-        set_idx: u32,
+    /// A const-pool entry that is not what its opcode reads it as.
+    PoolEntryMalformed {
+        const_idx: u32,
+        want: PoolEntry,
     },
     ColOutOfRange {
         col: u32,
@@ -637,8 +639,7 @@ pub enum LogicalInstr {
         a: Reg,
         b: Reg,
     },
-    /// Length into a *scalar* register: bytes, or `chars` — the count of
-    /// non-continuation bytes, which on valid UTF-8 is the codepoint count.
+    /// Length into a *scalar* register: bytes, or `chars` — the codepoint count.
     StrLen {
         a: Reg,
         chars: bool,
@@ -1216,7 +1217,9 @@ impl LogicalProgram {
             let ops = operands(instr);
             // The const-pool index an opcode carries rather than names as an
             // operand — the table states that too.
-            check_extra(ops.extra, &const_strings)?;
+            if let Some((idx, want)) = ops.pool {
+                check_pool_entry(idx, want, &const_strings)?;
+            }
             for &(reg, read) in ops.reads.iter().flatten() {
                 // Reading a not-yet-written lane would take whatever the
                 // previous morsel left there — another row's value, or for a
@@ -1263,7 +1266,7 @@ impl LogicalProgram {
         &self.instrs
     }
 
-    /// The byte-transparent const pool the instructions index into.
+    /// The const pool the instructions index into.
     pub fn const_strings(&self) -> &[Vec<u8>] {
         &self.const_strings
     }
@@ -1860,18 +1863,20 @@ impl LogicalProgram {
 }
 
 /// Bound the const-pool index an opcode carries rather than names as an
-/// operand, and hold an `IntInSet` pool to its canonical form.
-fn check_extra(extra: Extra, const_strings: &[Vec<u8>]) -> Result<(), ExprValidateErr> {
-    match extra {
-        Extra::ConstIdx(const_idx) => check_const_idx(const_idx.0, const_strings.len()),
-        Extra::IntSet(set_idx) => {
-            check_const_idx(set_idx.0, const_strings.len())?;
-            match int_set_is_canonical(&const_strings[set_idx.0 as usize]) {
-                true => Ok(()),
-                false => Err(ExprValidateErr::IntSetNotCanonical { set_idx: set_idx.0 }),
-            }
-        }
-        Extra::None => Ok(()),
+/// operand, and hold the entry to what the opcode reads it as.
+fn check_pool_entry(idx: ConstIdx, want: PoolEntry, const_strings: &[Vec<u8>]) -> Result<(), ExprValidateErr> {
+    check_const_idx(idx.0, const_strings.len())?;
+    let bytes = &const_strings[idx.0 as usize];
+    let ok = match want {
+        PoolEntry::Bytes => true,
+        PoolEntry::Text => std::str::from_utf8(bytes).is_ok(),
+        PoolEntry::LikePattern => LikePattern::is_encoding(bytes),
+        PoolEntry::TrimSet => bytes.is_ascii(),
+        PoolEntry::IntSet => int_set_is_canonical(bytes),
+    };
+    match ok {
+        true => Ok(()),
+        false => Err(ExprValidateErr::PoolEntryMalformed { const_idx: idx.0, want }),
     }
 }
 
@@ -1961,9 +1966,9 @@ struct Operands {
     write: WriteAs,
     reads: [Option<(Reg, ReadAs)>; MAX_READS],
     cols: [Option<(u32, ColKind)>; MAX_COL_OPERANDS],
-    /// A value the opcode carries that is neither a register nor a column, but
-    /// still reaches a panicking / OOB / truncating site if forged.
-    extra: Extra,
+    /// The const-pool entry the opcode carries rather than names as an operand,
+    /// and what it reads that entry as.
+    pool: Option<(ConstIdx, PoolEntry)>,
     /// True iff the kernel can turn non-NULL input into a NULL result — a zero
     /// divisor, an out-of-range cast, an unparsable text→number, a CONCAT past
     /// `u32::MAX`, `LoadNull*` on every row. A column operand's own nullability
@@ -1971,17 +1976,21 @@ struct Operands {
     makes_null: bool,
 }
 
-/// A per-opcode const-pool index — client-controlled, and bounded against the
-/// pool by [`LogicalProgram::from_instrs`] before a kernel reads it. Stated in
-/// the operand table beside the opcode's registers and columns, so classifying a
-/// new opcode is one edit rather than two.
-#[derive(Clone, Copy)]
-enum Extra {
-    None,
-    /// A const-pool index.
-    ConstIdx(ConstIdx),
-    /// An `IntInSet` value pool.
-    IntSet(ConstIdx),
+/// What an opcode reads its const-pool entry as. The pool is client-controlled,
+/// so [`LogicalProgram::from_instrs`] holds each named entry to its kind before a
+/// kernel reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolEntry {
+    /// Any bytes: a German-string compare, which also serves BLOB columns.
+    Bytes,
+    /// A STRING value, so UTF-8.
+    Text,
+    /// A LIKE pattern: UTF-8 text around the wildcard bytes.
+    LikePattern,
+    /// TRIM's byte set. ASCII, so stripping bytes never splits a character.
+    TrimSet,
+    /// An `IntInSet` pool in canonical form.
+    IntSet,
 }
 
 /// The widest opcodes read three registers: SELECT, SUBSTRING, STR_SELECT,
@@ -1995,7 +2004,7 @@ fn writes(write: WriteAs) -> Operands {
         write,
         reads: [None; MAX_READS],
         cols: [None; MAX_COL_OPERANDS],
-        extra: Extra::None,
+        pool: None,
         makes_null: false,
     }
 }
@@ -2024,10 +2033,9 @@ impl Operands {
         }
     }
 
-    /// Record a client-controlled const-pool index the construction pass must
-    /// bound.
-    fn with_extra(mut self, extra: Extra) -> Self {
-        self.extra = extra;
+    /// Record the const-pool entry the construction pass must bound and check.
+    fn with_pool(mut self, idx: ConstIdx, want: PoolEntry) -> Self {
+        self.pool = Some((idx, want));
         self
     }
 
@@ -2107,7 +2115,7 @@ fn operands(li: &LogicalInstr) -> Operands {
             .reading(b, RVal),
         L::IntInSet { value_reg, set_idx } => writes(WBool)
             .reading(value_reg, RVal)
-            .with_extra(Extra::IntSet(set_idx)),
+            .with_pool(set_idx, PoolEntry::IntSet),
         L::LoadConst { val: _, unsigned } => writes(WVal(Fixed(unsigned))),
         // A NULL on every row.
         L::LoadNull => writes(WVal(Fixed(false))).may_null(),
@@ -2130,7 +2138,7 @@ fn operands(li: &LogicalInstr) -> Operands {
         // bool, but a NULL operand makes it NULL, so the null bit flows.
         L::StrColConst { op: _, col, const_idx } => writes(WBool)
             .on_col(col, ColKind::StringPayload)
-            .with_extra(Extra::ConstIdx(const_idx)),
+            .with_pool(const_idx, PoolEntry::Bytes),
         L::StrColCol { op: _, col_a, col_b } => writes(WBool)
             .on_col(col_a, ColKind::StringPayload)
             .on_col(col_b, ColKind::StringPayload),
@@ -2139,7 +2147,7 @@ fn operands(li: &LogicalInstr) -> Operands {
         L::LoadColStr { col } => writes(WStr).on_col(col, ColKind::StringPayload),
 
         // --- String registers ---
-        L::LoadConstStr { const_idx } => writes(WStr).with_extra(Extra::ConstIdx(const_idx)),
+        L::LoadConstStr { const_idx } => writes(WStr).with_pool(const_idx, PoolEntry::Text),
         // A NULL on every row.
         L::LoadNullStr => writes(WStr).may_null(),
         L::IntToStr { a } | L::FloatToStr { a } => writes(WStr).reading(a, RVal),
@@ -2149,9 +2157,11 @@ fn operands(li: &LogicalInstr) -> Operands {
         L::StrToFloat { a } => writes(WVal(Fixed(false))).reading(a, RStr).may_null(),
         L::StrToInt { a, fi } => writes(WVal(Fixed(fi == FixedInt::U64))).reading(a, RStr).may_null(),
         L::StrCmp { op: _, a, b } => writes(WBool).reading(a, RStr).reading(b, RStr),
-        L::StrLike { src, pat_idx, ci: _ } => writes(WBool).reading(src, RStr).with_extra(Extra::ConstIdx(pat_idx)),
+        L::StrLike { src, pat_idx, ci: _ } => writes(WBool)
+            .reading(src, RStr)
+            .with_pool(pat_idx, PoolEntry::LikePattern),
         L::StrCase { a, upper: _ } => writes(WStr).reading(a, RStr),
-        L::StrTrim { a, mode: _, set_idx } => writes(WStr).reading(a, RStr).with_extra(Extra::ConstIdx(set_idx)),
+        L::StrTrim { a, mode: _, set_idx } => writes(WStr).reading(a, RStr).with_pool(set_idx, PoolEntry::TrimSet),
         // A combined length above `u32::MAX` yields NULL, which is easy to miss
         // because CONCAT otherwise looks like a pure transform.
         L::StrConcat { a, b, skip_null: _ } => writes(WStr).reading(a, RStr).reading(b, RStr).may_null(),

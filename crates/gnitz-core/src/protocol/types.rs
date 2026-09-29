@@ -843,21 +843,22 @@ impl<'a> BatchAppender<'a> {
 
     /// Append a string value to the next STRING column.
     pub fn str_val(&mut self, s: &str) -> &mut Self {
-        self.german_val(s.as_bytes())
+        self.german_val(s.as_bytes(), TypeCode::String)
     }
 
     /// Append a raw byte slice to the next BLOB column.
     pub fn bytes_val(&mut self, b: &[u8]) -> &mut Self {
-        self.german_val(b)
+        self.german_val(b, TypeCode::Blob)
     }
 
-    /// Append one German-string cell, spilling into the batch's arena.
-    fn german_val(&mut self, b: &[u8]) -> &mut Self {
+    /// Append one German-string cell of type `want`, spilling into the batch's
+    /// arena.
+    fn german_val(&mut self, b: &[u8], want: TypeCode) -> &mut Self {
         let pi = self.col_index();
         let tc = self.batch.payload[pi].tc();
         assert!(
-            tc.is_german_string(),
-            "BatchAppender: a string/blob value cannot be written to the {tc:?} column at payload slot {pi}",
+            tc == want,
+            "BatchAppender: a {want:?} value cannot be written to the {tc:?} column at payload slot {pi}",
         );
         let cell = gnitz_wire::encode_german_string(b, &mut self.batch.blob);
         self.batch.payload[pi].bytes.extend_from_slice(&cell);
