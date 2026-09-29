@@ -20,22 +20,6 @@ impl ZSetBatch {
     }
 }
 
-/// The batch as a lone WAL block.
-#[cfg(test)]
-pub(crate) fn encode_wal_block(batch: &ZSetBatch) -> Vec<u8> {
-    let mut out = Vec::new();
-    gnitz_wire::wal::append_block(&batch.wire_regions(), 0, &mut out);
-    out
-}
-
-/// A WAL block decoded under `schema` into a fresh batch.
-#[cfg(test)]
-pub(crate) fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<ZSetBatch, ProtocolError> {
-    let mut sink = ZSetBatch::new(schema);
-    decode_wal_block_into(&mut sink, data, schema)?;
-    Ok(sink)
-}
-
 /// Each fixed region's per-row width under `schema`, in canonical order.
 fn fixed_strides(schema: &Schema) -> impl Iterator<Item = usize> + '_ {
     [schema.pk_stride(), 8, 8]
@@ -80,15 +64,6 @@ pub fn decode_regions_into(
 }
 
 fn append_regions(sink: &mut ZSetBatch, regions: &[&[u8]], count: usize, schema: &Schema) -> Result<(), ProtocolError> {
-    let pk_stride = schema.pk_stride();
-    // Bound the stride so the `as u8` a `PkColumn` holds stays lossless.
-    if pk_stride > gnitz_wire::MAX_PK_BYTES {
-        return Err(ProtocolError::DecodeError(format!(
-            "pk_stride {pk_stride} exceeds MAX_PK_BYTES {}",
-            gnitz_wire::MAX_PK_BYTES
-        )));
-    }
-
     sink.reserve(count);
     sink.pks.push_region_bytes(regions[REG_PK]);
     gnitz_wire::extend_from_le_bytes(&mut sink.weights, regions[REG_WEIGHT]);

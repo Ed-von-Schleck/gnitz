@@ -109,6 +109,23 @@ pub(crate) fn raw_read_frame(fd: &OwnedFd) -> Vec<u8> {
     payload
 }
 
+/// The batch as a lone WAL block.
+pub(crate) fn encode_wal_block(batch: &crate::ZSetBatch) -> Vec<u8> {
+    let mut out = Vec::new();
+    gnitz_wire::wal::append_block(&batch.wire_regions(), 0, &mut out);
+    out
+}
+
+/// A WAL block decoded under `schema` into a fresh batch.
+pub(crate) fn decode_wal_block(
+    data: &[u8],
+    schema: &crate::Schema,
+) -> Result<crate::ZSetBatch, crate::protocol::error::ProtocolError> {
+    let mut sink = crate::ZSetBatch::new(schema);
+    crate::protocol::wal_block::decode_wal_block_into(&mut sink, data, schema)?;
+    Ok(sink)
+}
+
 /// A STRING/BLOB column region from its values, spilling into `blob`; `None` is
 /// a NULL cell, which the region zero-fills.
 pub(crate) fn german_col(vals: &[Option<&[u8]>], blob: &mut Vec<u8>) -> Vec<u8> {

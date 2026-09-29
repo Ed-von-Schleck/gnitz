@@ -1468,7 +1468,7 @@ impl TxnBuffer {
             let f = &mut self.families[fam];
             for row in f.indexed..f.batch.len() {
                 if f.batch.weights[row] != 0 {
-                    index.insert(f.batch.pks.get_tuple(row), (fam, row));
+                    index.insert(PkBuf::from_bytes(f.batch.pks.get_bytes(row)), (fam, row));
                 }
             }
             f.indexed = f.batch.len();

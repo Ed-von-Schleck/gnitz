@@ -271,5 +271,5 @@ pub(crate) fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<PkBuf, G
         .collect::<Result<Vec<_>, _>>()?;
     let mut pks = PkColumn::empty_for_schema(schema);
     crate::dml::PkPlan::written(&slot_of, schema)?.push(schema, 0, &cells, &mut pks)?;
-    Ok(pks.get_tuple(0))
+    Ok(PkBuf::from_bytes(pks.get_bytes(0)))
 }

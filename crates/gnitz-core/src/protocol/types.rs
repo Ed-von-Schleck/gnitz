@@ -2,7 +2,7 @@ use gnitz_expr::{ColumnTable, SchemaFacts};
 use std::sync::{Arc, OnceLock};
 
 use gnitz_wire::MAX_COLUMNS;
-use gnitz_wire::{ColumnDef, PkBuf, PkKeys, TypeCode};
+use gnitz_wire::{ColumnDef, PkKeys, TypeCode};
 
 /// The relation and column a FOREIGN KEY column references. `SelfTable` names the
 /// table being created, which has no id yet.
@@ -171,12 +171,16 @@ pub struct PkColumn {
 
 impl PkColumn {
     /// Empty `PkColumn` matching `schema`'s PK layout — the only constructor, so
-    /// the stride is never independent data to keep in sync.
+    /// the stride is never independent data to keep in sync, and never zero or
+    /// wider than a key.
     pub fn empty_for_schema(schema: &Schema) -> Self {
-        PkColumn {
-            stride: schema.pk_stride() as u8,
-            buf: vec![],
-        }
+        let stride = schema.pk_stride();
+        assert!(
+            (1..=gnitz_wire::MAX_PK_BYTES).contains(&stride),
+            "PkColumn: pk_stride {stride} is outside 1..={}",
+            gnitz_wire::MAX_PK_BYTES
+        );
+        PkColumn { stride: stride as u8, buf: vec![] }
     }
 
     /// A column of `schema`'s keys from their native packed values. The
@@ -191,11 +195,7 @@ impl PkColumn {
 
     /// Bytes per row.
     #[inline]
-    pub fn stride(&self) -> u8 {
-        self.stride
-    }
-
-    fn width(&self) -> usize {
+    pub fn stride(&self) -> usize {
         self.stride as usize
     }
 
@@ -207,11 +207,11 @@ impl PkColumn {
 
     /// These keys as a read's key set.
     pub fn keys(&self) -> PkKeys {
-        PkKeys::from_keys(self.width(), self.buf.chunks_exact(self.width()))
+        PkKeys::from_keys(self.stride(), self.buf.chunks_exact(self.stride()))
     }
 
     pub fn len(&self) -> usize {
-        self.buf.len() / self.width()
+        self.buf.len() / self.stride()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -233,19 +233,19 @@ impl PkColumn {
 
     /// Borrow row `i`'s `stride` OPK bytes.
     pub fn get_bytes(&self, i: usize) -> &[u8] {
-        let s = self.width();
+        let s = self.stride();
         &self.buf[i * s..(i + 1) * s]
     }
 
     /// Room for `n` more rows.
     pub fn reserve(&mut self, n: usize) {
-        self.buf.reserve(n * self.width());
+        self.buf.reserve(n * self.stride());
     }
 
     /// Append a key whose low `stride` bytes carry the PK columns' native
     /// little-endian images.
     pub fn push_u128(&mut self, schema: &Schema, pk: u128) {
-        let s = self.width();
+        let s = self.stride();
         // Hard, not debug-only: in release the slice below would OOB-panic with
         // an opaque "index out of range".
         assert!(s <= 16, "push_u128: stride {s} > 16 cannot come from a u128");
@@ -254,7 +254,7 @@ impl PkColumn {
 
     /// Append one row given as its `stride` native little-endian column bytes.
     pub fn push_bytes(&mut self, schema: &Schema, native_le: &[u8]) {
-        debug_assert_eq!(native_le.len(), self.width());
+        debug_assert_eq!(native_le.len(), self.stride());
         self.push_region_bytes(schema.opk_key(native_le).pk_bytes());
     }
 
@@ -265,12 +265,12 @@ impl PkColumn {
 
     /// Append whole OPK rows verbatim — `opk` is a multiple of `stride` bytes
     /// already in region form.
-    pub fn push_region_bytes(&mut self, opk: &[u8]) {
+    pub(crate) fn push_region_bytes(&mut self, opk: &[u8]) {
         debug_assert!(
-            opk.len().is_multiple_of(self.width()),
+            opk.len().is_multiple_of(self.stride()),
             "push_region_bytes: {} bytes is not a whole number of {}-byte rows",
             opk.len(),
-            self.width(),
+            self.stride(),
         );
         self.buf.extend_from_slice(opk);
     }
@@ -282,14 +282,7 @@ impl PkColumn {
     }
 
     fn truncate(&mut self, len: usize) {
-        self.buf.truncate(len * self.width());
-    }
-
-    /// Read row `i` into a [`PkBuf`] — a verbatim byte move, both being OPK. A
-    /// caller only *looking a key up* passes [`Self::get_bytes`] straight to the
-    /// map instead: `PkBuf` borrows as `[u8]`.
-    pub fn get_tuple(&self, i: usize) -> PkBuf {
-        PkBuf::from_bytes(self.get_bytes(i))
+        self.buf.truncate(len * self.stride());
     }
 
     /// Append the row at `src[i]` to `self`. Strides must match.
@@ -482,6 +475,10 @@ impl ZSetBatch {
     /// has its heap offset shifted by that much.
     pub fn extend_from_owned(&mut self, mut other: ZSetBatch) {
         assert!(self.same_layout(&other), "extend_from_owned: layout mismatch");
+        if self.is_empty() {
+            *self = other;
+            return;
+        }
         self.pks.append(&mut other.pks);
         self.weights.append(&mut other.weights);
         self.nulls.append(&mut other.nulls);
@@ -522,7 +519,7 @@ impl ZSetBatch {
         if ranges == [(0, self.len())] {
             return;
         }
-        let ps = self.pks.width();
+        let ps = self.pks.stride();
         let mut dst = 0;
         for &(s, e) in ranges {
             self.pks.buf.copy_within(s * ps..e * ps, dst * ps);
@@ -559,7 +556,7 @@ impl ZSetBatch {
     /// The batch's layout is `schema`'s: PK stride, payload slot count, and each
     /// slot's type.
     pub fn layout_matches(&self, schema: &Schema) -> Result<(), std::string::String> {
-        if self.pks.stride() as usize != schema.pk_stride() {
+        if self.pks.stride() != schema.pk_stride() {
             return Err(format!(
                 "mismatched PK stride: expected {}, got {}",
                 schema.pk_stride(),
@@ -589,20 +586,7 @@ impl ZSetBatch {
     /// Validate that all vectors are consistently sized for the given schema, and
     /// that every NULL is a zeroed cell of a nullable column.
     pub fn validate(&self, schema: &Schema) -> Result<(), std::string::String> {
-        // The PK buffer's own shape, checked before `PkColumn::len` divides by
-        // the stride. A stride that disagrees with the schema would make every
-        // row read at the wrong offset.
-        if self.pks.stride() == 0 {
-            return Err("PK stride must be non-zero".into());
-        }
         self.layout_matches(schema)?;
-        if !self.pks.region().len().is_multiple_of(self.pks.stride() as usize) {
-            return Err(format!(
-                "PK buffer length {} is not a multiple of stride {}",
-                self.pks.region().len(),
-                self.pks.stride()
-            ));
-        }
         let n = self.pks.len();
         if self.weights.len() != n {
             return Err(format!("weights length {} != row count {}", self.weights.len(), n));
@@ -650,7 +634,7 @@ impl ZSetBatch {
         let mut blob = Vec::new();
         let mut pks = PkColumn {
             stride: self.pks.stride,
-            buf: Vec::with_capacity(n * self.pks.width()),
+            buf: Vec::with_capacity(n * self.pks.stride()),
         };
         for &(r, _) in rows {
             pks.push_from(&self.pks, r);

@@ -127,13 +127,7 @@ fn ints(b: &ZSetBatch, pi: usize) -> Vec<i64> {
 }
 
 fn strs(b: &ZSetBatch, pi: usize) -> Vec<String> {
-    b.payload[pi]
-        .bytes
-        .as_chunks::<16>()
-        .0
-        .iter()
-        .map(|c| String::from_utf8(gnitz_wire::german_string_content(c, &b.blob).to_vec()).unwrap())
-        .collect()
+    (0..b.len()).map(|r| gnitz_expr::payload_string(b, r, pi)).collect()
 }
 
 fn gt(ci: usize, v: i64) -> BoundExpr {

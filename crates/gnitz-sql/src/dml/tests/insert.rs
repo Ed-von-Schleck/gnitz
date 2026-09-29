@@ -213,7 +213,7 @@ fn a_serial_id_past_the_type_maximum_is_exhausted() {
     let plan = PkPlan::serial(max - 1, 2, TypeCode::I16).unwrap();
     let mut dst = PkColumn::empty_for_schema(&schema);
     plan.push(&schema, 1, &[], &mut dst).unwrap();
-    assert_eq!(dst.get_tuple(0), schema.opk_key_cols(&[max as u128]));
+    assert_eq!(dst.get_bytes(0), schema.opk_key_cols(&[max as u128]).pk_bytes());
     for (base, n, next) in [(max, 2, max + 1), (max + 5, 1, max + 5), (u64::MAX, 2, u64::MAX)] {
         match PkPlan::serial(base, n, TypeCode::I16) {
             Err(GnitzSqlError::Rejected(m)) => {

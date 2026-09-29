@@ -172,14 +172,8 @@ mod spine_tests {
         let d1 = &replies[1].batch;
         assert_eq!(d1.payload.len(), 2);
         assert_eq!(d1.pks.to_vec_u128(&sb), vec![20, 21]);
-        let strs: Vec<&[u8]> = d1.payload[0]
-            .bytes
-            .as_chunks::<16>()
-            .0
-            .iter()
-            .map(|cell| gnitz_wire::german_string_content(cell, &d1.blob))
-            .collect();
-        assert_eq!(strs, [b"s20".as_slice(), b"s21".as_slice()]);
+        let strs: Vec<&str> = (0..d1.len()).map(|r| gnitz_expr::payload_str(d1, r, 0)).collect();
+        assert_eq!(strs, ["s20", "s21"]);
         // Each reply carries the schema its relation was paired with.
         assert!(Arc::ptr_eq(&replies[0].schema, &sa));
         assert!(Arc::ptr_eq(&replies[1].schema, &sb));
@@ -577,7 +571,7 @@ mod spine_tests {
         assert_eq!(cursor.tick.get(), 5);
         let _peer = h.join().unwrap();
         assert_eq!(blocks.len(), 2);
-        let b0 = crate::protocol::wal_block::decode_wal_block(blocks[0].block(), &sa).unwrap();
+        let b0 = crate::test_support::decode_wal_block(blocks[0].block(), &sa).unwrap();
         assert_eq!(b0.pks.to_vec_u128(&sa), vec![1, 2]);
     }
 }

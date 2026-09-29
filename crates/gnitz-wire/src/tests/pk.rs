@@ -303,3 +303,15 @@ fn cross_sign_copartitions() {
         }
     }
 }
+
+#[test]
+fn a_max_pk_bytes_key_fits_a_pk_buf() {
+    let t = PkBuf::from_bytes(&[0xab; crate::MAX_PK_BYTES]);
+    assert_eq!(t.width(), crate::MAX_PK_BYTES);
+}
+
+#[test]
+#[should_panic(expected = "PkBuf::from_bytes: length")]
+fn a_key_past_max_pk_bytes_panics() {
+    PkBuf::from_bytes(&[0; crate::MAX_PK_BYTES + 1]);
+}

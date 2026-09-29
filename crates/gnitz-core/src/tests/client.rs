@@ -345,14 +345,10 @@ fn a_copied_catalog_row_differs_only_where_it_is_patched() {
     // Every non-name column is the stored row's, in both halves.
     let flags = &pair.payload[gnitz_wire::TABTAB_PAY_FLAGS].bytes;
     assert_eq!(flags[..], [9u64.to_le_bytes(), 9u64.to_le_bytes()].concat()[..]);
-    let names: Vec<&[u8]> = pair.payload[RELTAB_PAY_NAME]
-        .bytes
-        .as_chunks::<16>()
-        .0
-        .iter()
-        .map(|cell| gnitz_wire::german_string_content(cell, &pair.blob))
+    let names: Vec<&str> = (0..2)
+        .map(|r| gnitz_expr::payload_str(&pair, r, RELTAB_PAY_NAME))
         .collect();
-    assert_eq!(names, [b"t".as_slice(), b"t2".as_slice()]);
+    assert_eq!(names, ["t", "t2"]);
 }
 
 #[test]

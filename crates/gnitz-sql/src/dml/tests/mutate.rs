@@ -1,6 +1,7 @@
 use super::*;
 use crate::test_support::{col, ncol, parse_expr_sql, parse_stmt};
 use gnitz_core::BatchAppender;
+use gnitz_expr::{payload_bytes, payload_is_null, payload_u64};
 use gnitz_wire::TypeCode;
 use sqlparser::ast::Statement;
 
@@ -39,26 +40,6 @@ fn rows_of(schema: &Schema, n: usize, mut fill: impl FnMut(&mut BatchAppender<'_
         fill(&mut app, r);
     }
     b
-}
-
-fn i64_at(b: &ZSetBatch, pi: usize, r: usize) -> i64 {
-    i64::from_le_bytes(b.payload[pi].bytes[r * 8..(r + 1) * 8].try_into().unwrap())
-}
-
-fn u64_at(b: &ZSetBatch, pi: usize, r: usize) -> u64 {
-    i64_at(b, pi, r) as u64
-}
-
-fn f64_at(b: &ZSetBatch, pi: usize, r: usize) -> f64 {
-    f64::from_le_bytes(b.payload[pi].bytes[r * 8..(r + 1) * 8].try_into().unwrap())
-}
-
-fn str_at(b: &ZSetBatch, pi: usize, r: usize) -> &[u8] {
-    german_string_content(&b.payload[pi].bytes[r * 16..(r + 1) * 16], &b.blob)
-}
-
-fn is_null(b: &ZSetBatch, pi: usize, r: usize) -> bool {
-    null_word_get(b.nulls[r], pi)
 }
 
 fn bind_err(r: Result<impl Sized, GnitzSqlError>) -> String {
@@ -124,8 +105,8 @@ fn a_non_null_assignment_clears_the_null_bit() {
         a.null();
     });
     let out = run("val = 99", &schema, rows).unwrap();
-    assert!(!is_null(&out, 0, 0));
-    assert_eq!(i64_at(&out, 0, 0), 99);
+    assert!(!payload_is_null(&out, 0, 0));
+    assert_eq!(payload_u64(&out, 0, 0) as i64, 99);
     assert_eq!(out.weights, [1]);
 }
 
@@ -136,8 +117,8 @@ fn unassigned_columns_carry_their_null_bits() {
         a.i64_val(5).null();
     });
     let out = run("a = 10", &schema, rows).unwrap();
-    assert!(!is_null(&out, 0, 0), "a assigned non-null");
-    assert!(is_null(&out, 1, 0), "b unassigned stays null");
+    assert!(!payload_is_null(&out, 0, 0), "a assigned non-null");
+    assert!(payload_is_null(&out, 0, 1), "b unassigned stays null");
 }
 
 #[test]
@@ -146,12 +127,15 @@ fn a_decimal_literal_rounds_to_the_column_scale() {
     let rows = rows_of(&schema, 1, |a, _| {
         a.i64_val(0);
     });
-    assert_eq!(i64_at(&run("d = 1.005", &schema, rows).unwrap(), 0, 0), 101);
+    assert_eq!(payload_u64(&run("d = 1.005", &schema, rows).unwrap(), 0, 0) as i64, 101);
     // A string literal spells a DECIMAL too, as it does in an INSERT cell.
     let rows = rows_of(&schema, 1, |a, _| {
         a.i64_val(0);
     });
-    assert_eq!(i64_at(&run("d = '1.25'", &schema, rows).unwrap(), 0, 0), 125);
+    assert_eq!(
+        payload_u64(&run("d = '1.25'", &schema, rows).unwrap(), 0, 0) as i64,
+        125
+    );
 }
 
 #[test]
@@ -166,7 +150,7 @@ fn a_wide_negative_literal_keeps_its_sign() {
         a.f64_val(0.0);
     });
     let out = run("f = -18446744073709551615", &schema, rows).unwrap();
-    assert_eq!(f64_at(&out, 0, 0), -18446744073709551615.0);
+    assert_eq!(f64::from_bits(payload_u64(&out, 0, 0)), -18446744073709551615.0);
 }
 
 #[test]
@@ -176,8 +160,8 @@ fn a_float_literal_writes_a_double_column() {
         a.null();
     });
     let out = run("f = 1.5", &schema, rows).unwrap();
-    assert_eq!(f64_at(&out, 0, 0), 1.5);
-    assert!(!is_null(&out, 0, 0));
+    assert_eq!(f64::from_bits(payload_u64(&out, 0, 0)), 1.5);
+    assert!(!payload_is_null(&out, 0, 0));
 }
 
 /// A string literal is spilled once into the result arena, however many rows
@@ -192,7 +176,7 @@ fn a_long_string_literal_spills_once() {
     let out = run(&format!("s = '{long}'"), &schema, rows).unwrap();
     assert_eq!(out.blob.len(), long.len());
     for r in 0..3 {
-        assert_eq!(str_at(&out, 0, r), long.as_bytes());
+        assert_eq!(payload_bytes(&out, r, 0), long.as_bytes());
     }
 }
 
@@ -209,8 +193,8 @@ fn a_copy_from_a_null_source_sets_the_null_bit() {
     let mut set = compile("a = b", &schema).unwrap();
     assert!(matches!(set[0].rhs, SetRhs::Copy { src: 1, .. }));
     let out = apply_set(&mut set, rows, None, &schema).unwrap();
-    assert!(is_null(&out, 0, 0), "a takes b's NULL");
-    assert!(is_null(&out, 1, 0), "b stays null");
+    assert!(payload_is_null(&out, 0, 0), "a takes b's NULL");
+    assert!(payload_is_null(&out, 0, 1), "b stays null");
 }
 
 /// Every right-hand side reads the rows as they were.
@@ -221,7 +205,7 @@ fn a_swap_reads_the_old_row() {
         a.i64_val(1).i64_val(2);
     });
     let out = run("a = b, b = a", &schema, rows).unwrap();
-    assert_eq!((i64_at(&out, 0, 0), i64_at(&out, 1, 0)), (2, 1));
+    assert_eq!((payload_u64(&out, 0, 0) as i64, payload_u64(&out, 0, 1) as i64), (2, 1));
 }
 
 #[test]
@@ -236,7 +220,7 @@ fn same_type_copies_work_for_float_and_uuid_columns() {
         a.f64_val(0.0).f64_val(2.5).u128_val(0).u128_val(u128::MAX - 7);
     });
     let out = run("f = g, u = w", &schema, rows).unwrap();
-    assert_eq!(f64_at(&out, 0, 0), 2.5);
+    assert_eq!(f64::from_bits(payload_u64(&out, 0, 0)), 2.5);
     assert_eq!(
         u128::from_le_bytes(out.payload[2].bytes[..16].try_into().unwrap()),
         u128::MAX - 7
@@ -255,8 +239,8 @@ fn a_non_string_set_leaves_the_arena_unchanged() {
     let blob = rows.blob.clone();
     let out = run("v = 99", &schema, rows).unwrap();
     assert_eq!(out.blob, blob);
-    assert_eq!(str_at(&out, 0, 0), long);
-    assert_eq!(i64_at(&out, 1, 0), 99);
+    assert_eq!(payload_bytes(&out, 0, 0), long);
+    assert_eq!(payload_u64(&out, 0, 1) as i64, 99);
 }
 
 /// Assigning one string column rebuilds the others into a fresh arena, so the
@@ -270,8 +254,8 @@ fn a_text_assignment_leaves_only_referenced_spill() {
     });
     let out = run("s = 'x'", &schema, rows).unwrap();
     assert_eq!(out.blob.len(), kept.len());
-    assert_eq!(str_at(&out, 0, 0), b"x");
-    assert_eq!(str_at(&out, 1, 0), kept.as_bytes());
+    assert_eq!(payload_bytes(&out, 0, 0), b"x");
+    assert_eq!(payload_bytes(&out, 0, 1), kept.as_bytes());
 }
 
 // ------------------------------------------------------------------
@@ -292,9 +276,9 @@ fn a_computed_value_over_a_nullable_column() {
         }
     });
     let out = run("a = b + 1", &schema, rows).unwrap();
-    assert_eq!(i64_at(&out, 0, 0), 6);
-    assert!(!is_null(&out, 0, 0));
-    assert!(is_null(&out, 0, 1), "NULL + 1 is NULL");
+    assert_eq!(payload_u64(&out, 0, 0) as i64, 6);
+    assert!(!payload_is_null(&out, 0, 0));
+    assert!(payload_is_null(&out, 1, 0), "NULL + 1 is NULL");
 }
 
 #[test]
@@ -304,7 +288,11 @@ fn set_reads_the_pk_column() {
         let rows = rows_of(&schema, 1, |a, _| {
             a.i64_val(0);
         });
-        assert_eq!(i64_at(&run(set, &schema, rows).unwrap(), 0, 0), want, "{set}");
+        assert_eq!(
+            payload_u64(&run(set, &schema, rows).unwrap(), 0, 0) as i64,
+            want,
+            "{set}"
+        );
     }
 }
 
@@ -330,7 +318,7 @@ fn a_computed_string_evaluates_to_a_string() {
         a.str_val("hello");
     });
     assert_eq!(
-        str_at(&apply_set(&mut set, rows, None, &schema).unwrap(), 0, 0),
+        payload_bytes(&apply_set(&mut set, rows, None, &schema).unwrap(), 0, 0),
         b"HELLO"
     );
 }
@@ -408,7 +396,10 @@ fn a_u64_value_past_i64_max_writes() {
     let rows = rows_of(&schema, 1, |a, _| {
         a.u64_val(1 << 63);
     });
-    assert_eq!(u64_at(&run("u = u + 1", &schema, rows).unwrap(), 0, 0), (1 << 63) + 1);
+    assert_eq!(
+        payload_u64(&run("u = u + 1", &schema, rows).unwrap(), 0, 0),
+        (1 << 63) + 1
+    );
 }
 
 #[test]
@@ -431,7 +422,7 @@ fn a_decimal_source_rounds_into_an_integer_column() {
         a.i64_val(0).i64_val([150, 149][r]);
     });
     let out = run("i = d", &schema, rows).unwrap();
-    assert_eq!((i64_at(&out, 0, 0), i64_at(&out, 0, 1)), (2, 1));
+    assert_eq!((payload_u64(&out, 0, 0) as i64, payload_u64(&out, 1, 0) as i64), (2, 1));
 }
 
 #[test]
@@ -444,7 +435,7 @@ fn a_date_source_converts_into_a_timestamp_column() {
     rows.payload[0].bytes.extend_from_slice(&2i32.to_le_bytes());
     rows.payload[1].bytes.extend_from_slice(&0i64.to_le_bytes());
     let out = run("ts = d", &schema, rows).unwrap();
-    assert_eq!(i64_at(&out, 1, 0), 2 * 86_400_000_000);
+    assert_eq!(payload_u64(&out, 0, 1) as i64, 2 * 86_400_000_000);
 }
 
 /// An `EXCLUDED.col` reference anywhere the binder can reach — inside CASE,
