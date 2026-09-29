@@ -254,7 +254,7 @@ fn validate_string_heap_extents(mb: &MemBatch<'_>, schema: &SchemaDescriptor) ->
 /// region offsets in `offsets`.
 ///
 /// String cells are not canonicalized: relocate them on the way in
-/// (`Batch::append_mem_batch*`), validate them
+/// (`Batch::append_ranges`), validate them
 /// ([`Batch::decode_foreign_wal_block`]), or read no string column.
 pub fn decode_mem_batch_from_wal_block<'a>(
     data: &'a [u8],

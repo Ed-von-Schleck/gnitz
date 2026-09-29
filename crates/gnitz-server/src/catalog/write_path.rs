@@ -3,7 +3,6 @@
 //! orphan-directory sweep.
 
 use super::*;
-use gnitz_store::ops::op_negate;
 
 impl CatalogEngine {
     // -- The applied-delta entry points ----------------------------------------
@@ -47,16 +46,18 @@ impl CatalogEngine {
             if !segs.is_empty() {
                 owners.extend((0..segs.len()).map(|i| segs.get_pk(i) as u64));
                 owners.sort_unstable();
-                let mut merged = op_negate(segs);
+                let mut merged = segs.negated();
                 merged.append_batch(&batch, 0, batch.len());
                 batch = merged;
             }
         }
-        let indices = op_negate(self.sys_rows_where(SysFamily::Index, |s, i| {
-            owners
-                .binary_search(&(payload_u64(s, i, gnitz_wire::IDXTAB_PAY_OWNER_ID)))
-                .is_ok()
-        }));
+        let indices = self
+            .sys_rows_where(SysFamily::Index, |s, i| {
+                owners
+                    .binary_search(&(payload_u64(s, i, gnitz_wire::IDXTAB_PAY_OWNER_ID)))
+                    .is_ok()
+            })
+            .negated();
         // A SERIAL row's key is its table id.
         let sequences = self.retract_under(SysFamily::Sequence, &owners);
         let circuits = self.retract_under(SysFamily::CircuitNodes, &owners);
@@ -155,7 +156,7 @@ impl CatalogEngine {
         self.drain_pending_broadcasts()
             .into_iter()
             .rev()
-            .try_for_each(|(family, batch)| self.apply_family(family, op_negate(batch)))
+            .try_for_each(|(family, batch)| self.apply_family(family, batch.negated()))
             .map_err(|e| {
                 format!(
                     "Stage-A DDL compensation failed — catalog cannot be restored, \

@@ -206,7 +206,7 @@ fn filter_keeps_exactly_the_matching_rows() {
         .resolve_filter(&schema)
         .unwrap();
 
-    let out = op_filter(&make_batch(&schema, rows), &mut func, &schema).expect("a selective filter copies");
+    let out = op_filter(&make_batch(&schema, rows), &mut func).expect("a selective filter copies");
     let got: Vec<u64> = (0..out.count).map(|r| out.get_pk(r) as u64).collect();
     let want: Vec<u64> = rows.iter().filter(|&&(_, _, v)| v > 10).map(|&(pk, ..)| pk).collect();
     assert_eq!(got, want);
@@ -225,22 +225,7 @@ fn filter_keeps_exactly_the_matching_rows() {
     )
     .resolve_filter(&schema)
     .unwrap();
-    assert!(op_filter(&make_batch(&schema, rows), &mut all_pass, &schema).is_none());
-}
-
-/// Negate is the Z-Set group inverse: every weight flips sign and nothing else
-/// moves. `i64::MIN` is its own inverse in ℤ/2⁶⁴, so `wrapping_neg` leaves it
-/// where it is instead of overflowing.
-#[test]
-fn negate_flips_every_weight() {
-    let schema = make_schema_u64_i64();
-    let out = op_negate(make_batch(&schema, &[(1, 3, 10), (2, -1, 20), (3, i64::MIN, 30)]));
-
-    let got: Vec<(i64, i64)> = (0..out.count)
-        .map(|r| (out.get_weight(r), read_i64_le(out.col_data(0), r * 8)))
-        .collect();
-    assert_eq!(got, vec![(-3, 10), (1, 20), (i64::MIN, 30)]);
-    assert!(out.is_consolidated());
+    assert!(op_filter(&make_batch(&schema, rows), &mut all_pass).is_none());
 }
 
 /// One side's `(pk, weight, payload)` row generator, indexed by row number.

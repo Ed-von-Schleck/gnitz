@@ -2,7 +2,6 @@
 //! file rather than a shared `common.rs` so the tests file stays self-contained.
 
 use crate::expr::PkSource;
-use crate::ops::op_negate;
 use crate::schema::ColumnTable;
 use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
 use crate::storage::{Batch, BatchBuilder, Layout, ReadCursor};
@@ -1308,7 +1307,7 @@ fn uuid_min_max_recede_through_the_value_index() {
     assert_eq!(out1.count, 1);
     assert_eq!((uuid_at(&out1, 0, 1), uuid_at(&out1, 0, 2)), (lo, hi));
 
-    let t2 = op_negate(build_batch_u64_uuid_i64(&in_schema, &[(2, hi, 7), (3, lo, 7)]));
+    let t2 = build_batch_u64_uuid_i64(&in_schema, &[(2, hi, 7), (3, lo, 7)]).negated();
     let mut avi = Avi::new(&in_schema, &[2u32], &aggs, &[&t1, &t2]);
     let mut trace2 = trace_cursor(out1, out_schema);
     let out2 = op_reduce(
@@ -4243,7 +4242,7 @@ fn german_string_min_max_recede_through_the_value_index() {
 
     // Retract both extremes; the index holds t1 and t2 and the seek lands on the
     // next value each side.
-    let t2 = op_negate(make_batch_blob_grp_i64(&in_schema, &[(3, 1, lo, 10), (4, 1, top, 10)]));
+    let t2 = make_batch_blob_grp_i64(&in_schema, &[(3, 1, lo, 10), (4, 1, top, 10)]).negated();
     let mut avi = Avi::new(&in_schema, &[2u32], &aggs, &[&t1, &t2]);
     let mut trace2 = trace_cursor(out1, out_schema);
     let out2 = op_reduce(
@@ -4812,7 +4811,7 @@ impl Instance {
     /// One epoch over `delta`, the trace being everything emitted before it.
     fn tick(&mut self, delta: &Batch) -> Batch {
         let schema = self.plan.shape.output_schema;
-        let trace = Batch::concat(&schema, self.emitted.iter()).into_consolidated(&schema);
+        let trace = Batch::concat(&schema, self.emitted.iter().map(Batch::as_mem_batch)).into_consolidated(&schema);
         let out = super::op_reduce::op_reduce(delta, &mut trace_cursor(trace, schema), None, &self.plan)
             .into_consolidated(&schema);
         self.emitted.push(Batch::clone(&out));
@@ -4863,14 +4862,14 @@ fn two_workers_partials_combine_to_the_funnels_output() {
     ];
     for (i, &(da, db)) in ticks.iter().enumerate() {
         let (da, db) = (make_batch_raw(&input, da), make_batch_raw(&input, db));
-        let relayed = Batch::concat(&partials, [a.tick(&da), b.tick(&db)].iter());
+        let relayed = Batch::concat(&partials, [a.tick(&da), b.tick(&db)].iter().map(Batch::as_mem_batch));
         let combined = combine.tick(&relayed);
-        let whole = Batch::concat(&input, [da, db].iter());
+        let whole = Batch::concat(&input, [da, db].iter().map(Batch::as_mem_batch));
         let want = funnel.tick(&whole);
         assert_eq!(reduce_rows(&combined), reduce_rows(&want), "tick {i}");
     }
     // The last tick emptied the group: the ground row stands, at V₀.
-    let net = Batch::concat(&partials, combine.emitted.iter()).into_consolidated(&partials);
+    let net = Batch::concat(&partials, combine.emitted.iter().map(Batch::as_mem_batch)).into_consolidated(&partials);
     assert_eq!(
         reduce_rows(&net),
         vec![(gnitz_wire::global_group_key(), 1, vec![0, 0, 0])]

@@ -26,16 +26,10 @@ pub fn op_exchange_route<'a>(
 /// Z-set `+` over one receiver's slices of an exchange round, one per sender:
 /// merged when every slice is `consolidated`, else concatenated in sender order.
 pub fn op_exchange_gather(slices: &[MemBatch], schema: &SchemaDescriptor, consolidated: bool) -> Batch {
-    let live: Vec<&MemBatch> = slices.iter().filter(|mb| mb.count > 0).collect();
-    if consolidated && live.len() >= 2 {
+    if consolidated && slices.iter().filter(|mb| mb.count > 0).count() >= 2 {
         return merge_consolidated(slices, schema);
     }
-    let rows = live.iter().map(|mb| mb.count).sum();
-    let blob = live.iter().map(|mb| mb.blob.len()).sum();
-    let mut out = Batch::with_capacity_blob(schema, rows, blob);
-    for mb in live {
-        out.append_mem_batch(mb);
-    }
+    let mut out = Batch::concat(schema, slices.iter().cloned());
     if consolidated {
         out.certify_layout(Layout::Consolidated);
     }

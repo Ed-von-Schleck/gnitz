@@ -38,7 +38,7 @@ fn partition(w: usize, round: u64) -> Batch {
 fn expected(spec: Option<ScatterSpec<'_>>, round: u64, r: usize) -> Vec<(u128, i64, i64)> {
     let schema = make_schema_u64_i64();
     let parts: Vec<Batch> = (0..NW).map(|w| partition(w, round)).collect();
-    let summed = Batch::concat(&schema, parts.iter()).into_consolidated(&schema);
+    let summed = Batch::concat(&schema, parts.iter().map(Batch::as_mem_batch)).into_consolidated(&schema);
     match spec {
         None => rows(&summed),
         Some(spec) => {

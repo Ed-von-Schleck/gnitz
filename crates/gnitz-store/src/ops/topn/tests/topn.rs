@@ -334,8 +334,11 @@ fn two_workers_partials_combine_to_the_funnels_window() {
         (&[(7, 1, 0, None, "g")], &[(8, 2, 0, Some(1), "h")]),
     ];
     for (i, &(da, db)) in ticks.iter().enumerate() {
-        let relayed = Batch::concat(&partials, [a.tick(&batch(da)), b.tick(&batch(db))].iter());
-        let whole = Batch::concat(&schema(), [batch(da), batch(db)].iter());
+        let relayed = Batch::concat(
+            &partials,
+            [a.tick(&batch(da)), b.tick(&batch(db))].iter().map(Batch::as_mem_batch),
+        );
+        let whole = Batch::concat(&schema(), [batch(da), batch(db)].iter().map(Batch::as_mem_batch));
         let got = combine.tick(&relayed);
         let want = funnel.tick(&whole);
         let (got, want) = (combine.net(got), funnel.net(want));

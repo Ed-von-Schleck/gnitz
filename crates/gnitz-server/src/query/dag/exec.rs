@@ -66,7 +66,7 @@ impl Relay {
             true => batch,
             false => self.send(
                 host,
-                batch,
+                Cow::Owned(batch),
                 OUTPUT_RELAY,
                 Some(ScatterSpec::GroupKey(&self.shard_cols)),
                 emits_replica,
@@ -81,7 +81,7 @@ impl Relay {
     fn send(
         &self,
         host: &mut impl DriveHost,
-        batch: Batch,
+        batch: Cow<'_, Batch>,
         key: u64,
         spec: Option<ScatterSpec<'_>>,
         replica: bool,
@@ -89,7 +89,7 @@ impl Relay {
         if self.muted && replica {
             let empty = Batch::empty_with_schema(batch.schema());
             drop(batch);
-            return host.exchange(self.view_id, empty, key, spec);
+            return host.exchange(self.view_id, Cow::Owned(empty), key, spec);
         }
         host.exchange(self.view_id, batch, key, spec)
     }
@@ -103,7 +103,12 @@ fn plan_of(host: &mut impl DriveHost, view_id: u64) -> &mut ViewPlan {
 // ── Epoch execution ─────────────────────────────────────────────────────
 
 /// Run one view's epoch over `src_id`'s delta.
-fn run_view_epoch(host: &mut impl DriveHost, view_id: u64, input: Batch, src_id: u64) -> Result<Batch, String> {
+fn run_view_epoch(
+    host: &mut impl DriveHost,
+    view_id: u64,
+    input: Cow<'_, Batch>,
+    src_id: u64,
+) -> Result<Batch, String> {
     let (relay, route) = {
         let (dag, registry) = host.parts();
         let (meta, plan) = ensure_compiled(&mut dag.views, registry, view_id)?;
@@ -122,7 +127,7 @@ fn run_view_epoch(host: &mut impl DriveHost, view_id: u64, input: Batch, src_id:
     };
     let input = match &route {
         Some(route) => relay.send(host, input, src_id, route.spec(), true),
-        None => input,
+        None => input.into_owned(),
     };
     run_plan(host, &relay, input, src_id)
 }
@@ -229,11 +234,11 @@ pub(crate) fn drive(host: &mut impl DriveHost, what: Drive, delta: Batch) -> Res
     for step in &schedule {
         let left = readers.get_mut(&step.producer).expect("counted above");
         *left -= 1;
-        // The last reader takes the batch; earlier ones copy as they run, so at
-        // most two copies are live.
+        // The last reader takes the batch; an earlier one borrows it, and copies
+        // it only when its view is unrouted, so at most two copies are live.
         let input = match *left {
-            0 => outputs.remove(&step.producer),
-            _ => outputs.get(&step.producer).cloned(),
+            0 => outputs.remove(&step.producer).map(Cow::Owned),
+            _ => outputs.get(&step.producer).map(Cow::Borrowed),
         }
         .expect("the schedule runs every producer before the steps it feeds");
         let needed = readers.contains_key(&step.view);

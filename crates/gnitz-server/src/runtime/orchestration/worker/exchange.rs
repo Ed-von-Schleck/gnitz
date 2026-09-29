@@ -4,6 +4,7 @@
 
 use super::*;
 use gnitz_store::ops::ScatterSpec;
+use std::borrow::Cow;
 
 /// The worker as a drive's [`DriveHost`].
 pub(super) struct DagExchangeCtx<'a> {
@@ -21,7 +22,7 @@ impl DriveHost for DagExchangeCtx<'_> {
         (&mut cat.dag, &mut cat.registry)
     }
 
-    fn exchange(&mut self, view_id: u64, batch: Batch, key: u64, spec: Option<ScatterSpec<'_>>) -> Batch {
+    fn exchange(&mut self, view_id: u64, batch: Cow<'_, Batch>, key: u64, spec: Option<ScatterSpec<'_>>) -> Batch {
         let (batch, all_drained) = self.worker.exchange(view_id, batch, key, spec, self.own_drained);
         self.all_drained = all_drained;
         batch
@@ -36,13 +37,13 @@ impl WorkerProcess {
     fn exchange(
         &mut self,
         view_id: u64,
-        batch: Batch,
+        batch: Cow<'_, Batch>,
         key: u64,
         spec: Option<ScatterSpec<'_>>,
         drained: bool,
     ) -> (Batch, bool) {
         self.mesh.publish(view_id, key, drained, &batch, spec);
-        // Before the park, so this worker never holds its own partition and the
+        // Before the park, so this worker never holds an owned partition and the
         // gathered one at once.
         drop(batch);
         loop {

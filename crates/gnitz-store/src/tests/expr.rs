@@ -1230,7 +1230,7 @@ fn reindex_drop_null_keys_bench() {
             );
         };
         arm("(a) filter + reindex", &mut || {
-            let filtered = crate::ops::op_filter(&batch, &mut not_null, &s);
+            let filtered = crate::ops::op_filter(&batch, &mut not_null);
             black_box(keep.evaluate_map_batch(filtered.as_ref().unwrap_or(&batch)));
         });
         arm("(a) drop reindex", &mut || {

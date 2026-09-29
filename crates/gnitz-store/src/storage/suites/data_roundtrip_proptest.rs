@@ -244,8 +244,7 @@ proptest! {
         // Physical retraction: ingest the same rows negated into the memtable.
         let mut neg = Batch::with_capacity(&schema, half.max(1));
         neg.append_batch(&original, 0, half);
-        neg.map_weights(|w| -w);
-        table.ingest_owned_batch(neg).unwrap();
+        table.ingest_owned_batch(neg.negated()).unwrap();
 
         for i in 0..half {
             prop_assert!(!table.has_pk_bytes(original.get_pk_bytes(i)));

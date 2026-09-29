@@ -113,17 +113,12 @@ fn run_instructions(vm: &mut Vm, state: &mut CircuitState, start_pc: usize) -> R
             Batch::empty_with_schema(&regs[out_reg.at()].schema)
         } else {
             match &mut instr.op {
-                Op::Filter(pred) => {
-                    let schema = &regs[in_reg.at()].schema;
-                    match ops::op_filter(&batches[in_reg.at()], pred, schema) {
-                        Some(kept) => kept,
-                        None => take_or_clone(batches, in_reg, takes(in_reg)),
-                    }
-                }
+                Op::Filter(pred) => ops::op_filter(&batches[in_reg.at()], pred)
+                    .unwrap_or_else(|| take_or_clone(batches, in_reg, takes(in_reg))),
 
                 Op::Map(plan) => plan.evaluate_map_batch(&batches[in_reg.at()]),
 
-                Op::Negate => ops::op_negate(take_or_clone(batches, in_reg, takes(in_reg))),
+                Op::Negate => take_or_clone(batches, in_reg, takes(in_reg)).negated(),
 
                 Op::Union { in_b } => {
                     if in_reg == *in_b {
@@ -138,8 +133,8 @@ fn run_instructions(vm: &mut Vm, state: &mut CircuitState, start_pc: usize) -> R
                         take_or_clone(batches, *in_b, takes(*in_b))
                     } else {
                         // The union's own (nullability-merged) schema, not the
-                        // left input's — see `op_union` for why a narrower one
-                        // mis-sorts nulls.
+                        // left input's — see `union_nullability_merge` for why a
+                        // narrower one mis-sorts nulls.
                         ops::op_union(
                             take_or_clone(batches, in_reg, takes(in_reg)),
                             &batches[in_b.at()],

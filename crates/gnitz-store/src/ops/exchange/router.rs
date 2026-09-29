@@ -15,9 +15,6 @@ use super::super::group_key::GroupKey;
 /// filtered here integrates into a trace partitioned like a scattered one.
 pub fn op_worker_filter(batch: &Batch, slot: Slot) -> Batch {
     let n = batch.count;
-    if n == 0 {
-        return Batch::clone(batch);
-    }
     let nw = slot.of as usize;
     let wid = slot.rank as usize;
     let mb = batch.as_mem_batch();

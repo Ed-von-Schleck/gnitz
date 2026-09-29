@@ -140,12 +140,6 @@ pub(crate) struct DerivedSchema {
     pk_bytes: usize,
 }
 
-impl Default for DerivedSchema {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl DerivedSchema {
     pub(crate) fn new() -> Self {
         DerivedSchema {
@@ -199,6 +193,11 @@ impl DerivedSchema {
             self.push_pk(*c)?;
         }
         Ok(())
+    }
+
+    /// Append `schema`'s payload columns in schema order.
+    pub(crate) fn push_payload_of(&mut self, schema: &SchemaDescriptor) -> Result<(), SchemaBound> {
+        schema.payload_columns().try_for_each(|(_, c)| self.push(*c))
     }
 
     pub(crate) fn finish(&self) -> SchemaDescriptor {
@@ -837,12 +836,8 @@ const _: () = assert!(DELTA_TICK_COL.size() as usize == 8);
 pub(crate) fn make_delta_schema(view: &SchemaDescriptor) -> Option<SchemaDescriptor> {
     let mut b = DerivedSchema::new();
     b.push_pk(DELTA_TICK_COL).ok()?;
-    for &i in view.pk_cols() {
-        b.push_pk(view.columns[i as usize]).ok()?;
-    }
-    for (_, col) in view.payload_columns() {
-        b.push(*col).ok()?;
-    }
+    b.push_pk_of(view).ok()?;
+    b.push_payload_of(view).ok()?;
     Some(b.finish().with_placement(Placement::Local))
 }
 

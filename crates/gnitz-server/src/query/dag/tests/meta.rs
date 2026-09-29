@@ -46,8 +46,7 @@ fn the_dep_map_follows_circuit_deltas_idempotently() {
     let mut bb = gnitz_store::storage::BatchBuilder::new(*crate::catalog::SysFamily::CircuitNodes.schema());
     gnitz_wire::sys_rows::write_circuit_rows(&mut bb, 5, &circuit);
     let plus = bb.finish();
-    let mut minus = plus.clone();
-    minus.map_weights(i64::wrapping_neg);
+    let minus = plus.clone().negated();
 
     let mut dag = DagEngine::default();
     dag.apply_circuit_delta(&minus);
@@ -78,8 +77,7 @@ fn a_retraction_unlinks_only_its_own_view() {
         bb.finish()
     };
     let (five, six) = (dag_of(5), dag_of(6));
-    let mut drop_five = five.clone();
-    drop_five.map_weights(i64::wrapping_neg);
+    let drop_five = five.clone().negated();
 
     let mut dag = DagEngine::default();
     dag.apply_circuit_delta(&five);

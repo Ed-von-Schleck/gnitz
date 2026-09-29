@@ -714,3 +714,18 @@ fn unstamped_inverts_stamped_with_pk_prefix() {
         );
     }
 }
+
+/// Negate is the Z-Set group inverse: every weight flips sign and nothing else
+/// moves. `i64::MIN` is its own inverse in ℤ/2⁶⁴, so `wrapping_neg` leaves it
+/// where it is instead of overflowing.
+#[test]
+fn negate_flips_every_weight() {
+    let schema = crate::test_support::make_schema_u64_i64();
+    let out = crate::test_support::make_batch(&schema, &[(1, 3, 10), (2, -1, 20), (3, i64::MIN, 30)]).negated();
+
+    let got: Vec<(i64, i64)> = (0..out.count)
+        .map(|r| (out.get_weight(r), gnitz_wire::read_i64_le(out.col_data(0), r * 8)))
+        .collect();
+    assert_eq!(got, vec![(-3, 10), (1, 20), (i64::MIN, 30)]);
+    assert!(out.is_consolidated());
+}

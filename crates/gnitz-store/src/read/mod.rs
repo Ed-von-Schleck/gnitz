@@ -2,8 +2,8 @@
 //! `impl RelationRegistry` blocks over `relation` and `ops`.
 //!
 //! It is a rung of its own because it names the operator layer — `AdhocFold` in
-//! `scan_spec`, `op_union` in `store_io` — which `relation` may not. Two
-//! symbols, but they are what put `read` above `ops`.
+//! `scan_spec` — which `relation` may not. One symbol, but it is what puts
+//! `read` above `ops`.
 //!
 //! Nothing here reaches a `CatalogEngine` or a `DagEngine`: those are in
 //! `gnitz-server`, which depends on this crate, so the direction is the crate

@@ -105,9 +105,8 @@ impl JoinPlan {
             // The keyless join matches on neither key, so it mints the pair.
             b.push_pk_of(right).map_err(over)?;
         }
-        for (_, c) in left.payload_columns().chain(right.payload_columns()) {
-            b.push(*c).map_err(over)?;
-        }
+        b.push_payload_of(left).map_err(over)?;
+        b.push_payload_of(right).map_err(over)?;
         let out_schema = b.finish();
 
         // Both regions run the left SQL side first, so one split serves either.

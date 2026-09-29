@@ -6,6 +6,8 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
+use std::borrow::Cow;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::query::compiler::{self, CompileOutput, SubPlan, ViewMeta};
@@ -29,7 +31,7 @@ pub(crate) trait DriveHost {
     fn parts(&mut self) -> (&mut DagEngine, &mut RelationRegistry);
     /// This worker's `batch` for `view_id`, repartitioned by `spec` in the round
     /// `key` names — with no spec, every worker's whole batch: the rows it owns.
-    fn exchange(&mut self, view_id: u64, batch: Batch, key: u64, spec: Option<ScatterSpec<'_>>) -> Batch;
+    fn exchange(&mut self, view_id: u64, batch: Cow<'_, Batch>, key: u64, spec: Option<ScatterSpec<'_>>) -> Batch;
 }
 
 // ---------------------------------------------------------------------------

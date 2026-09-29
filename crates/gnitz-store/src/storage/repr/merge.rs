@@ -910,22 +910,6 @@ impl Batch {
         out.certify_layout(Layout::Consolidated);
         out
     }
-
-    /// `other`'s rows appended onto this batch — Z-Set `+` where an input is
-    /// unsorted, so the output claims no order and nothing folds. Appending in
-    /// place copies only the right side and relocates no left-side string cell:
-    /// `self` already owns the heap those point into.
-    pub(crate) fn concatenated(mut self, other: &Batch, schema: &SchemaDescriptor) -> Batch {
-        let n_b = other.count;
-        // Up front: a batch at capacity would otherwise grow by `capacity * 2`
-        // and re-copy the left side.
-        self.reserve_rows(n_b);
-        self.append_session(n_b).push_range(&other.as_mem_batch(), 0, n_b);
-        // Physically identical to both inputs' (`union_nullability_merge` returns
-        // nothing else), so `self`'s region strides still describe it.
-        self.set_schema(schema);
-        self
-    }
 }
 
 #[inline]

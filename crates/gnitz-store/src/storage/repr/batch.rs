@@ -488,8 +488,8 @@ impl Batch {
     }
     /// Apply `f` to every row's weight in place. Generic so the per-epoch
     /// callers (negate, delta doubling) monomorphize to a tight loop. The
-    /// layout tag is untouched: callers pass sign-preserving maps (negation,
-    /// ×2, non-zero clamping) that cannot mint ghosts or fold duplicates.
+    /// layout tag is untouched: weights are not part of element identity, so
+    /// callers only need a map that sends no non-zero weight to zero.
     #[inline]
     pub fn map_weights(&mut self, f: impl Fn(i64) -> i64) {
         let off = self.offsets[REG_WEIGHT];
@@ -499,6 +499,13 @@ impl Batch {
         {
             *chunk = f(i64::from_le_bytes(*chunk)).to_le_bytes();
         }
+    }
+    /// Every weight's sign flipped: the Z-set inverse. `wrapping_neg` because
+    /// `i64::MIN` must not panic; element identity is untouched, so the layout
+    /// claim carries over.
+    pub fn negated(mut self) -> Batch {
+        self.map_weights(i64::wrapping_neg);
+        self
     }
     /// Overwrite every row's weight with `weights`, one per row in row order.
     /// Arbitrary weights can mint ghosts, so the layout claim is dropped.
@@ -1345,12 +1352,6 @@ impl Batch {
         self.append_session(rows).push_ranges(src, ranges);
     }
 
-    /// All of `src` — the full-range decode/accumulate entry point (an exchange
-    /// gather, the master's index-scan merge).
-    pub fn append_mem_batch(&mut self, src: &MemBatch<'_>) {
-        self.append_ranges(src, &[(0, src.count)]);
-    }
-
     /// Rows `[start, end)` of another `Batch` of the same schema.
     pub fn append_batch(&mut self, src: &Batch, start: usize, end: usize) {
         self.append_ranges(&src.as_mem_batch(), &[(start, end)]);
@@ -1400,7 +1401,7 @@ impl Batch {
     }
 
     /// Every source's rows, in order, in one fresh `Raw` batch.
-    pub fn concat<'s>(schema: &SchemaDescriptor, sources: impl Iterator<Item = &'s Batch> + Clone) -> Batch {
+    pub fn concat<'s>(schema: &SchemaDescriptor, sources: impl Iterator<Item = MemBatch<'s>> + Clone) -> Batch {
         let (mut rows, mut blob) = (0usize, 0usize);
         for src in sources.clone() {
             rows += src.count;
@@ -1408,7 +1409,7 @@ impl Batch {
         }
         let mut out = Batch::with_capacity_blob(schema, rows, blob);
         for src in sources {
-            out.append_batch(src, 0, src.count);
+            out.append_ranges(&src, &[(0, src.count)]);
         }
         out
     }

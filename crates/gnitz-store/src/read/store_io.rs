@@ -57,10 +57,12 @@ impl<'a, 'h> LiveSource<'a, 'h> {
         if let Some(keys) = expected {
             debug_assert_hydration_matches(&hydrated, &keys, &coarse);
         }
-        // Both consolidated and PK-disjoint; `hydrated` first so a chunk of skeleton rows
-        // alone passes through `op_union`'s empty-operand arm.
+        // Both consolidated and PK-disjoint.
         let schema = *live.schema();
-        Ok(Some(crate::ops::op_union(hydrated, &live, &schema)))
+        Ok(Some(match live.is_empty() {
+            true => hydrated,
+            false => hydrated.merged_consolidated(&live, &schema),
+        }))
     }
 }
 

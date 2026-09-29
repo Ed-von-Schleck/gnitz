@@ -1,7 +1,7 @@
 //! The DBSP operators: the kernels a compiled circuit's instructions dispatch
 //! to, each consuming and emitting deltas rather than recomputing from state.
 //!
-//!   - `linear`    — filter, negate, union (Theorem 3.3: no state added)
+//!   - `linear`    — filter, union (Theorem 3.3: no state added)
 //!   - `join`      — the bilinear operator, equi, range and cross, over one probe
 //!   - `reduce`    — the aggregates and their combined value index (`avi`)
 //!   - `topn`      — per-group top-N over an ordered index of every input row
@@ -37,8 +37,7 @@ pub use distinct::{op_weight_clamp, ClampPreset};
 pub use exchange::op_worker_filter;
 pub use exchange::{op_exchange_gather, op_exchange_route, ScatterSpec};
 pub use join::{op_join_delta_trace, JoinPlan, JoinProbe};
-pub use linear::{null_extend_output_schema, op_union, union_nullability_merge};
-pub use linear::{op_filter, op_negate};
+pub use linear::{null_extend_output_schema, op_filter, op_union, union_nullability_merge};
 pub(crate) use reduce::AdhocFold;
 pub use reduce::{avi_batch, op_reduce, AviBake, ReducePlan};
 pub use topn::{op_topn, TopNPlan};

@@ -336,7 +336,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
             match guard_panic("commit_merge", || {
                 Ok::<_, String>(Batch::concat(
                     &shared.disp().schema_desc_for(tid),
-                    std::iter::once(&head).chain(tail.iter()),
+                    std::iter::once(&head).chain(tail.iter()).map(Batch::as_mem_batch),
                 ))
             }) {
                 Ok(m) => m,

@@ -43,9 +43,6 @@ pub fn op_weight_clamp(
     // The VM folds this register before any reader.
     debug_assert!(delta.is_consolidated());
     let n = delta.count;
-    if n == 0 {
-        return Batch::empty_with_schema(schema);
-    }
 
     // 1. Per delta element, the clamped change against its trace weight. Every
     //    delta group is visited: an element transitions whether or not the trace

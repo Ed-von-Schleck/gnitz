@@ -1,8 +1,8 @@
-//! Linear operators: filter, negate, union.
+//! Linear operators: filter and union.
 //!
-//! The other two live with the batch mechanics they are: MAP is
-//! `crate::expr::MapPlan::evaluate_map_batch`, null-extend
-//! `Batch::widened_with_nulls`.
+//! The others live with the batch mechanics they are: negate is
+//! `Batch::negated`, MAP `crate::expr::MapPlan::evaluate_map_batch`,
+//! null-extend `Batch::widened_with_nulls`.
 
 use crate::schema::{ColumnTable, SchemaFacts};
 use gnitz_expr::RowFilter;
@@ -19,12 +19,7 @@ use crate::storage::Batch;
 /// through instead of paying `from_ranges` a whole-batch copy, blob heap
 /// included. An index-bounded backfill takes that path on every chunk: the
 /// access path already satisfies the predicate the circuit still carries.
-pub fn op_filter(batch: &Batch, pred: &mut RowFilter, schema: &SchemaDescriptor) -> Option<Batch> {
-    // The DAG pushes an empty placeholder every epoch; nothing to evaluate.
-    if batch.count == 0 {
-        return Some(Batch::empty_with_schema(schema));
-    }
-
+pub fn op_filter(batch: &Batch, pred: &mut RowFilter) -> Option<Batch> {
     // A per-call `Vec`: measured against a reused one it is a wash. `ranges`
     // lends `out` so a *chunked* scan can carry one list; this caller has one batch.
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -32,7 +27,7 @@ pub fn op_filter(batch: &Batch, pred: &mut RowFilter, schema: &SchemaDescriptor)
     if ranges == [(0, batch.count)] {
         return None;
     }
-    Some(Batch::from_ranges(batch, &ranges, schema, 0))
+    Some(Batch::from_ranges(batch, &ranges, batch.schema(), 0))
 }
 
 /// `a`'s schema with each column's nullability OR-ed with `b`'s: a NULL and a
@@ -61,28 +56,17 @@ pub fn null_extend_output_schema(
     let mut b = DerivedSchema::new();
     let over = |e| OpBuildErr::shape(format!("null-extend: merged schema {e}"));
     b.push_pk_of(in_schema).map_err(over)?;
-    let nulls = |b: &mut DerivedSchema| {
+    let fill = |b: &mut DerivedSchema| {
         type_codes
             .iter()
-            .try_for_each(|&tc| b.push(SchemaColumn::new(tc, true)).map_err(over))
+            .try_for_each(|&tc| b.push(SchemaColumn::new(tc, true)))
     };
-    if nulls_first {
-        nulls(&mut b)?;
+    match nulls_first {
+        true => fill(&mut b).and_then(|()| b.push_payload_of(in_schema)),
+        false => b.push_payload_of(in_schema).and_then(|()| fill(&mut b)),
     }
-    for (_, c) in in_schema.payload_columns() {
-        b.push(*c).map_err(over)?;
-    }
-    if !nulls_first {
-        nulls(&mut b)?;
-    }
+    .map_err(over)?;
     Ok(b.finish())
-}
-
-/// Negate: flip the sign of every weight. `wrapping_neg` because `i64::MIN` must
-/// not panic; element identity is untouched, so the layout claim carries over.
-pub fn op_negate(mut batch: Batch) -> Batch {
-    batch.map_weights(i64::wrapping_neg);
-    batch
 }
 
 /// Union: algebraic addition of two Z-Set streams. Two consolidated inputs take an
@@ -96,23 +80,15 @@ pub fn op_negate(mut batch: Batch) -> Batch {
 pub fn op_union(batch_a: Batch, batch_b: &Batch, out_schema: &SchemaDescriptor) -> Batch {
     if batch_b.count == 0 {
         // O(1) pass-through: no allocation, the layout claim preserved.
-        gnitz_debug!("op_union: a={} b=0 identity", batch_a.count);
         return batch_a;
     }
-    if batch_a.count == 0 {
-        return Batch::clone(batch_b);
-    }
-    let (n_a, n_b) = (batch_a.count, batch_b.count);
-
     if batch_a.consolidated_verified(out_schema) && batch_b.consolidated_verified(out_schema) {
-        let output = batch_a.merged_consolidated(batch_b, out_schema);
-        gnitz_debug!("op_union: a={n_a} b={n_b} out={} sorted_merge", output.count);
-        return output;
+        return batch_a.merged_consolidated(batch_b, out_schema);
     }
-
-    // Not both consolidated: concatenate (the appends leave `output` `Raw`).
-    let output = batch_a.concatenated(batch_b, out_schema);
-    gnitz_debug!("op_union: a={n_a} b={n_b} out={} concat", output.count);
+    let mut output = batch_a;
+    output.append_batch(batch_b, 0, batch_b.count);
+    // Physically identical to both inputs', so `output`'s strides still hold.
+    output.set_schema(out_schema);
     output
 }
 

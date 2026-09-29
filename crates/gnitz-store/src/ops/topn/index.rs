@@ -89,9 +89,7 @@ impl TopNIndex {
         for _ in &order {
             b.push(IMAGE_COL).map_err(over)?;
         }
-        for (_, &c) in output.payload_columns() {
-            b.push(c).map_err(over)?;
-        }
+        b.push_payload_of(output).map_err(over)?;
         let schema = b.finish();
         let tail = schema.num_columns() - output.num_payload_cols();
         Ok(TopNIndex {

@@ -17,9 +17,6 @@ const MAX_TOPN_CAP_HINT: usize = 1 << 16;
 pub fn op_topn(delta: &Batch, trace_out: &mut ReadCursor, history: &mut ReadCursor, plan: &TopNPlan) -> Batch {
     let output_schema = &plan.output_schema;
     let n = delta.count;
-    if n == 0 {
-        return Batch::empty_with_schema(output_schema);
-    }
     let mb = delta.as_mem_batch();
 
     let runs = plan.key.runs(delta);

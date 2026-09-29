@@ -305,7 +305,7 @@ fn gathering_each_senders_slices_equals_routing_the_summed_partitions() {
                         }
                     })
                     .collect();
-                let summed = Batch::concat(&schema, parts.iter()).into_consolidated(&schema);
+                let summed = Batch::concat(&schema, parts.iter().map(Batch::as_mem_batch)).into_consolidated(&schema);
                 let want = scatter(&summed, spec, nw);
                 let per_sender: Vec<Vec<Batch>> = parts.iter().map(|p| scatter(p, spec, nw)).collect();
                 for (r, want) in want.iter().enumerate() {

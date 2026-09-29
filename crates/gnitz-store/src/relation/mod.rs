@@ -287,8 +287,10 @@ impl Relation {
                 .filter(|&i| b.get_weight(i) != 0 && pk_in_range(first, last, b.get_pk_bytes(i)))
                 .map(|i| i as u32)
                 .collect();
-            let mut undo = b.ascending_subset(&in_range).into_consolidated(table.schema());
-            undo.map_weights(i64::wrapping_neg);
+            let undo = b
+                .ascending_subset(&in_range)
+                .into_consolidated(table.schema())
+                .negated();
             std::rc::Rc::new(undo)
         });
         table.gather(keys, undo)
