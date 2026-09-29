@@ -1,7 +1,7 @@
 //! The OPK lower-bound search every sorted PK region seeks through, stateless
 //! and galloping, plus the equal-PK group bracket. `Batch`, `MappedShard` and
 //! the `Run` that is either all seek through the `(count, stride, ColPtr)`
-//! entry points here.
+//! entry points here; a seek by (PK, payload) gallops through [`gallop_by`].
 
 use super::merge::ColPtr;
 use crate::schema::key::{pk_width_dispatch, PkSortKey};
@@ -31,7 +31,7 @@ fn lower_bound_by(mut lo: usize, mut hi: usize, lt: impl Fn(usize) -> bool) -> u
 /// only the speedup, at the cost of at most two extra comparisons. `lt(i)` reports
 /// row `i < probe`, as in [`lower_bound_by`].
 #[inline]
-fn gallop_by(count: usize, hint: usize, lt: impl Fn(usize) -> bool) -> usize {
+pub(crate) fn gallop_by(count: usize, hint: usize, lt: impl Fn(usize) -> bool) -> usize {
     let h = hint.min(count);
     if h < count && lt(h) {
         // boundary strictly after the hint

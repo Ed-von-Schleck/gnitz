@@ -6,7 +6,7 @@
 use super::*;
 use gnitz_expr::ColumnTable;
 use gnitz_store::schema::Placement;
-use gnitz_wire::ReadBound;
+use gnitz_wire::{ClampKind, ReadBound};
 
 /// How each worker routes its partition of one source's delta into a view.
 #[derive(Clone, Debug, PartialEq)]
@@ -314,7 +314,7 @@ fn source_uses(loaded: &LoadedCircuit) -> Result<(FxHashMap<u64, SourceUse>, Opt
     for (nid, op) in loaded.ops() {
         let propagates = matches!(
             op,
-            OpNode::Filter(_) | OpNode::Map(_) | OpNode::IntegrateTrace | OpNode::Distinct
+            OpNode::Filter(_) | OpNode::Map(_) | OpNode::IntegrateTrace | OpNode::WeightClamp(ClampKind::Distinct)
         );
         for p in loaded.inputs(nid).iter() {
             if let Some(tid) = owner[p] {
@@ -357,7 +357,7 @@ fn source_uses(loaded: &LoadedCircuit) -> Result<(FxHashMap<u64, SourceUse>, Opt
                 }
                 states_key[nid] = Some(tid);
             }
-            OpNode::Distinct => {
+            OpNode::WeightClamp(ClampKind::Distinct) => {
                 if let Some(tid) = owner[nid] {
                     uses.entry(tid).or_default().set_fed = true;
                 }

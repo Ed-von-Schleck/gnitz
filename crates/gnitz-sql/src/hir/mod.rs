@@ -486,7 +486,7 @@ impl JoinType {
     }
 
     /// A left row survives unmatched ⇒ the right columns can be NULL, and
-    /// `ν_A = positive_part(A − π_A(inner))` is emitted.
+    /// `ν_A`, A's rows no right row matches, is emitted.
     pub(crate) fn preserves_left(self) -> bool {
         matches!(self, JoinType::Left | JoinType::Full)
     }
@@ -530,8 +530,8 @@ impl JoinType {
         matches!(self, JoinType::Semi | JoinType::Anti | JoinType::Mark(_))
     }
 
-    /// Whether this side gets a **ν** — the unmatched set
-    /// `positive_part(P_all − π_P(inner))`. Wider than [`Self::preserves`], which
+    /// Whether this side gets a **ν** — the unmatched set `w_P · [S = 0]`, its
+    /// rows no row of the other side matches. Wider than [`Self::preserves`], which
     /// answers "emit an outer null-fill branch": `Semi`/`Anti`/`Mark` preserve
     /// neither side yet all three decide per left row by match existence. The
     /// reindex keep set protects the ν operands, so it asks this rather than

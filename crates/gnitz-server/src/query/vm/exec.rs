@@ -143,10 +143,10 @@ fn run_instructions(vm: &mut Vm, state: &mut CircuitState, start_pc: usize) -> R
                     }
                 }
 
-                Op::WeightClamp { hist, preset } => {
+                Op::WeightClamp { hist, kind } => {
                     let delta = &batches[in_reg.at()];
                     let mut cursor = state.cursor_for_keys(*hist, delta);
-                    ops::op_weight_clamp(delta, &mut cursor, &regs[in_reg.at()].schema, *preset)
+                    ops::op_weight_clamp(delta, &mut cursor, *kind)
                 }
 
                 Op::JoinDT { trace, probe } => {

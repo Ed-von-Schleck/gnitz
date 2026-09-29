@@ -78,10 +78,11 @@ fn an_unreferenced_equi_join_keeps_one_left_column() {
     assert!(sides[1].keep.is_empty());
 }
 
-/// A LEFT join's preserved side keeps its nullable equi key: a NULL key packs
-/// from its zero cell, colliding with a real `k = 0` row.
+/// A LEFT join's preserved side does not keep its nullable equi key: an equi ν
+/// subtracts exactly, so a NULL-keyed row packed from a zero cell never cancels
+/// against a real `k = 0` one.
 #[test]
-fn a_preserved_side_keeps_its_nullable_key() {
+fn a_preserved_side_drops_its_nullable_key() {
     let ids = ColIdGen::new();
     let left = frame(&ids, &[("id", false), ("k", true)], vec![0]);
     let right = frame(&ids, &[("id", false), ("k", true)], vec![0]);
@@ -95,14 +96,12 @@ fn a_preserved_side_keeps_its_nullable_key() {
     );
     let o = origins(&left, &right);
     let sides = join_sides(NO_DEMAND, &cls, JoinType::Left, [left, right], o).unwrap();
-    // Left has a ν and a nullable key at slot 1: that key, not the Rule 5 fallback.
-    assert_eq!(sides[0].keep.as_slice(), &[1u32][..]);
-    // The right side has no ν, so its equally-nullable key is not protected.
+    // Left has a ν and keeps nothing else: the Rule 5 fallback, column 0.
+    assert_eq!(sides[0].keep.as_slice(), &[0u32][..]);
     assert!(sides[1].keep.is_empty());
 }
 
-/// A band ν is keyed by the source PK, so it keeps every key column; an equi ν
-/// only a nullable one.
+/// A band ν is keyed by the source PK, so it keeps every key column.
 #[test]
 fn a_band_nu_keeps_its_key_columns() {
     let ids = ColIdGen::new();

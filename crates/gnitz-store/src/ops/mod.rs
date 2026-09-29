@@ -6,7 +6,7 @@
 //!   - `reduce`    — the aggregates and their combined value index (`avi`)
 //!   - `topn`      — per-group top-N over an ordered index of every input row
 //!   - `order_image` — the byte images both indexes order by
-//!   - `distinct`  — the weight clamps every set operation is built from
+//!   - `clamp`     — the weight clamps every set operation is built from
 //!   - `exchange`  — repartition and broadcast across workers
 //!   - `group_key` — the shared key machinery
 //!
@@ -21,7 +21,7 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-mod distinct;
+mod clamp;
 mod exchange;
 mod group_key;
 mod join;
@@ -33,7 +33,7 @@ mod topn;
 #[cfg(test)]
 mod bench_join;
 
-pub use distinct::{op_weight_clamp, ClampPreset};
+pub use clamp::op_weight_clamp;
 pub use exchange::op_worker_filter;
 pub use exchange::{op_exchange_gather, op_exchange_route, op_exchange_share, ScatterSpec};
 pub use join::{op_join_delta_trace, JoinPlan, JoinProbe};

@@ -469,7 +469,7 @@ fn join_meta_in(kind: JoinKind, key_cols: &[u32], distinct: [bool; 2], ext: Rela
         nodes.push((cur, scan_delta(source)));
         if distinct[i] {
             let d = nodes.len();
-            nodes.push((d, OpNode::Distinct));
+            nodes.push((d, OpNode::WeightClamp(gnitz_wire::ClampKind::Distinct)));
             edges.push((cur, d, SLOT_IN));
             cur = d;
         }

@@ -16,6 +16,7 @@ use crate::storage::repr::batch::Batch;
 use crate::storage::repr::heap::{HeapNode, LoserTree};
 use crate::storage::repr::merge::MemBatch;
 use crate::storage::repr::merge::{self, ColumnarSource, PosCursor};
+use crate::storage::repr::seek::gallop_by;
 #[cfg(test)]
 use crate::storage::repr::shard_reader::MappedShard;
 
@@ -269,30 +270,37 @@ impl ReadCursor {
             ..
         } = &mut *self;
         let less = merge::merge_less(schema, sources, payload, *any_skeleton);
-        Self::seek_phase(tree, sources, states, key, &less);
+        Self::seek_phase(
+            tree,
+            sources,
+            states,
+            |s: &Run, r: usize| compare_pk_ordering(s.get_pk_bytes(r), key) == Ordering::Less,
+            |s: &Run, pos: usize| s.advance_to(key, pos),
+            &less,
+        );
         self.advance_merge_with(payload);
     }
 
-    /// Advance every laggard head (OPK `< key`) to its own `lower_bound(key)`,
-    /// restoring the loser tree with one `step_top` per gallop. Only the root can
-    /// lag — it is the global min — so the loop gallops it alone, and leaves the
-    /// tree positioned exactly as a from-scratch rebuild at `key` would.
+    /// Advance every laggard head (`lags` its row) to its own lower bound via
+    /// `gallop`, restoring the loser tree with one `step_top` per gallop. Only the
+    /// root can lag — it is the global min — so the loop gallops it alone, and
+    /// leaves the tree positioned exactly as a from-scratch rebuild at the bound
+    /// would.
     fn seek_phase(
         heap: &mut LoserTree,
         sources: &[Run],
         states: &mut [PosCursor],
-        key: &[u8],
+        lags: impl Fn(&Run, usize) -> bool,
+        gallop: impl Fn(&Run, usize) -> usize,
         less: &impl Fn(&HeapNode, &HeapNode) -> bool,
     ) {
         while let Some(HeapNode { source_idx: src, row }) = heap.peek() {
             let (src, row) = (src as usize, row as usize);
-            // The root is the global min, so once its OPK bytes reach `key` every
-            // head has. `compare_pk_ordering` compares the full stride bytes —
-            // exact at every width. Otherwise the root lags; gallop it forward.
-            if compare_pk_ordering(sources[src].get_pk_bytes(row), key) != Ordering::Less {
+            // The root is the global min, so once it no longer lags neither does any head.
+            if !lags(&sources[src], row) {
                 break;
             }
-            states[src].position = sources[src].advance_to(key, states[src].position);
+            states[src].position = gallop(&sources[src], states[src].position);
             heap.step_top(states[src].is_valid().then_some(states[src].position as u32), less);
         }
     }
@@ -376,64 +384,99 @@ impl ReadCursor {
         }
     }
 
-    /// `f(i, w)` for each row `i` of `mb[range]`, one PK group, with the weight of
-    /// the byte-equal (PK, payload) trace row, or `0`: one lockstep pass over the
-    /// two sorted sides from the cursor's position, which the caller has put at
-    /// or past the group, in place of a seek per row.
-    pub(crate) fn for_each_mem_row_weight<F: FnMut(usize, i64)>(&mut self, mb: &MemBatch, range: Range<usize>, f: F) {
-        with_payload_cmp!(
-            self.schema,
-            Self::for_each_mem_row_weight_with::<_, _>,
-            self,
-            mb,
-            range,
-            f
-        );
+    /// `f(i, w)` for every row `i` of the (PK, payload)-sorted `mb`, `w` the net
+    /// weight of the trace element equal to row `i` in (PK, payload), or 0. Rows
+    /// are probed in order, each moving the cursor forward from where the last left it.
+    pub(crate) fn for_each_mem_row_weight<F: FnMut(usize, i64)>(&mut self, mb: &MemBatch, f: F) {
+        with_payload_cmp!(self.schema, Self::for_each_mem_row_weight_with::<_, _>, self, mb, f);
     }
 
     #[inline]
     fn for_each_mem_row_weight_with<F: FnMut(usize, i64), P: PayloadOrder>(
         &mut self,
         mb: &MemBatch,
-        range: Range<usize>,
         mut f: F,
         payload: P,
     ) {
-        if range.is_empty() {
-            return;
-        }
-        let key = mb.get_pk_bytes(range.start);
-        debug_assert!(
-            pk_bytes_eq(key, mb.get_pk_bytes(range.end - 1)),
-            "for_each_mem_row_weight: range spans more than one PK group"
-        );
-        debug_assert!(
-            !self.valid || self.current_pk_cmp_bytes(key) != Ordering::Less,
-            "for_each_mem_row_weight: cursor behind the group"
-        );
-        for i in range {
-            let w = loop {
-                if !self.valid || !self.current_pk_eq(key) {
-                    break 0;
-                }
-                match payload.compare(
-                    &self.schema,
-                    &self.sources[self.current_entry_idx],
-                    self.current_row,
-                    mb,
-                    i,
-                ) {
-                    Ordering::Less => self.advance_with(payload),
-                    Ordering::Equal => {
-                        let w = self.current_weight;
-                        self.advance_with(payload);
-                        break w;
-                    }
-                    Ordering::Greater => break 0,
-                }
-            };
+        // A skeleton run folds a PK group regardless of payload; no history holds one.
+        debug_assert!(!self.any_skeleton, "element walk over a skeleton store");
+        for i in 0..mb.count {
+            let w = self.weight_of_with(mb, i, payload);
             f(i, w);
         }
+    }
+
+    /// `mb[i]`'s weight at or after the cursor, consuming the element on a match.
+    #[inline]
+    fn weight_of_with<P: PayloadOrder>(&mut self, mb: &MemBatch, i: usize, payload: P) -> i64 {
+        let key = mb.get_pk_bytes(i);
+        // `advance_to_forward`, with the payload order already selected.
+        if self.valid && self.current_pk_cmp_bytes(key) == Ordering::Less {
+            match self.mode {
+                None => self.seek_forward_merge_with(key, payload),
+                Some(_) => self.reposition_to(key),
+            }
+        }
+        if !self.valid || !self.current_pk_eq(key) {
+            return 0;
+        }
+        let mut ord = self.cmp_current_payload(mb, i, payload);
+        if ord == Ordering::Less {
+            self.seek_element_forward_with(mb, i, payload);
+            if !self.valid || !self.current_pk_eq(key) {
+                return 0;
+            }
+            ord = self.cmp_current_payload(mb, i, payload);
+        }
+        match ord {
+            Ordering::Equal => {
+                let w = self.current_weight;
+                self.advance_with(payload);
+                w
+            }
+            _ => 0,
+        }
+    }
+
+    #[inline]
+    fn cmp_current_payload<P: PayloadOrder>(&self, mb: &MemBatch, i: usize, payload: P) -> Ordering {
+        payload.compare(
+            &self.schema,
+            &self.sources[self.current_entry_idx],
+            self.current_row,
+            mb,
+            i,
+        )
+    }
+
+    /// Inside `mb[i]`'s PK group, forward-seek to the first live element `>= mb[i]`.
+    /// Every head already sits at or above the cursor's element, which shares the PK.
+    fn seek_element_forward_with<P: PayloadOrder>(&mut self, mb: &MemBatch, i: usize, payload: P) {
+        let key = mb.get_pk_bytes(i);
+        let ReadCursor {
+            tree,
+            sources,
+            states,
+            schema,
+            any_skeleton,
+            mode,
+            ..
+        } = &mut *self;
+        let (sources, schema) = (&*sources, &*schema);
+        let lags = |s: &Run, r: usize| {
+            compare_pk_ordering(s.get_pk_bytes(r), key).then_with(|| payload.compare(schema, s, r, mb, i))
+                == Ordering::Less
+        };
+        let gallop = |s: &Run, pos: usize| gallop_by(s.row_count(), pos, |r| lags(s, r));
+        match *mode {
+            // The other sources' windows are empty, and a forward seek keeps them so.
+            Some(src) => states[src].position = gallop(&sources[src], states[src].position),
+            None => {
+                let less = merge::merge_less(schema, sources, payload, *any_skeleton);
+                Self::seek_phase(tree, sources, states, lags, gallop, &less);
+            }
+        }
+        self.advance_with(payload);
     }
 
     /// Walk forward while `cont` holds, calling `f` on each row; on return the

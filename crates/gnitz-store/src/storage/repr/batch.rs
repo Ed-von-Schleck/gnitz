@@ -509,12 +509,6 @@ impl Batch {
         self.map_weights(i64::wrapping_neg);
         self
     }
-    /// Overwrite every row's weight with `weights`, one per row in row order.
-    /// Arbitrary weights can mint ghosts, so the layout claim is dropped.
-    pub(crate) fn overwrite_weights(&mut self, weights: &[i64]) {
-        self.weight_data_mut().copy_from_slice(gnitz_wire::as_le_bytes(weights));
-        self.downgrade();
-    }
     /// True iff every row's weight is `> 0` — vacuously true for an empty batch.
     /// Branch-free over the contiguous weight region, so
     /// the conforming case is one pass with no early exit to serialize it.

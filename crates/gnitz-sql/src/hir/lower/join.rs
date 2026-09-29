@@ -4,7 +4,7 @@
 use super::super::{ColId, HirExpr, JoinClass, JoinShape, JoinType, OutKey, ProjEntry, RelExpr};
 use super::joincore::{
     emit_range_null_fill_tail, equi_prologue, join_pk_coldefs, pair_pk_coldefs, range_prologue, rekey_on_source_pk,
-    src_pk_coldefs, unmatched,
+    src_pk_coldefs,
 };
 use super::{emit_filter, emit_join_inputs, project_front, Demand, EmitPieces, JoinSide, ViewChain};
 use crate::error::GnitzSqlError;
@@ -142,7 +142,8 @@ fn emit_equi(
     sides: &[JoinSide; 2],
     unique: [bool; 2],
 ) -> Result<Vec<Branch>, GnitzSqlError> {
-    let (all, inner) = equi_prologue(cb, class, sides, inputs, kind, unique[1])?;
+    let pro = equi_prologue(cb, class, sides, inputs, kind, unique[1])?;
+    let (all, inner) = (pro.all, pro.inner);
     if kind.is_decorrelated() {
         return Ok(exists_branches(cb, kind, Split::Matched(inner), all[0]));
     }
@@ -155,8 +156,13 @@ fn emit_equi(
             let (p, o) = (usize::from(!preserved_is_left), usize::from(preserved_is_left));
             let p0 = k + if preserved_is_left { 0 } else { sides[0].n() };
             let proj: Vec<u32> = (p0..p0 + sides[p].n()).map(|c| c as u32).collect();
-            let pi = cb.map(inner, &proj); // π_P(inner) = [_join_pk, P]
-            let nu_p = unmatched(cb, all[p], pi, unique[o]);
+            // A side unique on the key matches each P row at most once, so
+            // π_P(inner) = [_join_pk, P] is P's matched rows at their own weight.
+            let matched = match unique[o] {
+                true => cb.map(inner, &proj),
+                false => pro.matched(cb, p),
+            };
+            let nu_p = cb.difference(all[p], matched);
             // A side that keeps nothing contributes no NULL region at all.
             let o_tcs = sides[o].kept_type_codes();
             match o_tcs.is_empty() {

@@ -76,10 +76,9 @@ fn only_a_register_read_at_net_weights_is_folded() {
         8,
         Op::WeightClamp {
             hist,
-            preset: gnitz_store::ops::ClampPreset::Distinct,
+            kind: gnitz_wire::ClampKind::Distinct,
         },
     );
-    p.integrate(0, hist);
     p.push(2, 3, Op::Negate);
     p.push(2, 9, Op::JoinDT { trace: join_trace, probe });
     p.push(4, 5, Op::Negate);

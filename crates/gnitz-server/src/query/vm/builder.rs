@@ -4,10 +4,12 @@
 use super::*;
 
 /// Assemble one emitted plan. `out_reg` is the register the epoch's output is
-/// extracted from; `integrates` run after the whole instruction range.
+/// extracted from; `integrates` are the join traces the circuit declares; each
+/// op's own integral is added here. All of them run after the whole instruction
+/// range.
 pub(in crate::query) fn build(
     instructions: Vec<Instr>,
-    integrates: Vec<(DeltaReg, StateIdx)>,
+    mut integrates: Vec<(DeltaReg, StateIdx)>,
     delta_schemas: Vec<SchemaDescriptor>,
     out_reg: DeltaReg,
 ) -> Vm {
@@ -26,6 +28,8 @@ pub(in crate::query) fn build(
             );
         }
     }
+
+    integrates.extend(instructions.iter().filter_map(Instr::own_integral));
 
     // Over the EMITTED instructions — so an elided node's register aliasing is
     // seen through, not re-derived from graph edges.

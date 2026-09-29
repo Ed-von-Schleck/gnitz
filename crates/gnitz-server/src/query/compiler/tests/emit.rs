@@ -480,29 +480,6 @@ fn a_wide_pk_join_compiles() {
     .is_ok());
 }
 
-// ── Weight-clamp presets ────────────────────────────────────────────────
-
-/// The two clamp operators differ in nothing but their preset, and the preset is
-/// what makes them different operators: `distinct` is the set-membership clamp,
-/// `positive_part` the bag clamp that drops the negative part only. The bounds
-/// each resolves to are `ops::ClampPreset`'s and tested there.
-#[test]
-fn the_two_clamp_operators_carry_their_own_presets() {
-    use gnitz_store::ops::ClampPreset;
-    let fixture = MidCircuit::new(make_schema_u64_i64());
-    for (op, want) in [
-        (gnitz_wire::OpNode::Distinct, ClampPreset::Distinct),
-        (gnitz_wire::OpNode::PositivePart, ClampPreset::PositivePart),
-    ] {
-        let (plan, _) = fixture.build(op.clone()).expect("both clamps compile");
-        let got = plan.vm.program.ops().find_map(|op| match op {
-            Op::WeightClamp { preset, .. } => Some(*preset),
-            _ => None,
-        });
-        assert_eq!(got, Some(want), "{op:?}");
-    }
-}
-
 // ── Destructive-register liveness ───────────────────────────────────────
 //
 // A register may be emptied in place iff it has no later reader and is not the

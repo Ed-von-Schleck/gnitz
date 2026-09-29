@@ -491,23 +491,16 @@ pub(crate) fn join_sides(
     for id in referenced {
         mark(&mut keep, id);
     }
-    // Rule 3: a side with a ν keeps each key column its ν cannot do without.
-    let keeps_key_col = |def: &ColumnDef, is_left: bool| match class.shape() {
-        // A NULL key packs from a zero cell, the same bytes as a real `0`, so the
-        // kept column holds a NULL-keyed row apart from a 0-keyed one under the
-        // clamp.
-        JoinShape::Equi => def.is_nullable && kind.emits_unmatched(is_left),
-        // A band ν is keyed by the source PK, which a bag-valued side repeats; a
-        // pure range re-keys its owned A slice onto the range column.
-        JoinShape::Band | JoinShape::PureRange => true,
-        JoinShape::Cross => false,
-    };
-    for (side, is_left, frame) in [(0, true, &left), (1, false, &right)] {
-        if !kind.has_nu(is_left) {
-            continue;
-        }
-        for &pos in &keys[side] {
-            keep[side][pos] |= keeps_key_col(&frame.schema.columns[pos], is_left);
+    // Rule 3: a band or pure-range side with a ν keeps its key columns. A band ν
+    // is keyed by the source PK, which a bag-valued side repeats; a pure range
+    // re-keys its owned A slice onto the range column.
+    if matches!(class.shape(), JoinShape::Band | JoinShape::PureRange) {
+        for (side, is_left) in [(0, true), (1, false)] {
+            if kind.has_nu(is_left) {
+                for &pos in &keys[side] {
+                    keep[side][pos] = true;
+                }
+            }
         }
     }
     // Rule 4: a side whose source PK the output key packs out of the payload pins

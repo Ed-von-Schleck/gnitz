@@ -264,6 +264,17 @@ pub enum JoinKind {
     Cross,
 }
 
+/// Which weight clamp an [`OpNode::WeightClamp`] is — one opcode each. A closed
+/// set rather than a `(lo, hi)` pair, so no circuit can name a clamp that is not
+/// the lift of a per-element clamp of `0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClampKind {
+    /// Set membership: `[0, 1]`.
+    Distinct,
+    /// Bag multiplicity: `[0, i64::MAX]`.
+    PositivePart,
+}
+
 /// What a reindex `Map` re-keys *for*. A scan can fan out into several reindex
 /// Maps on different keys, and a re-key of already-routed rows looks the same
 /// from the graph, so the planner states which is which where it knows.
@@ -351,13 +362,7 @@ pub enum OpNode {
     Map(MapKind),
     Negate,
     Union,
-    Distinct,
-    /// Multiplicity-preserving counterpart to `Distinct`: both emit
-    /// `clamp(w_new, lo, hi) − clamp(w_old, lo, hi)` per consolidated
-    /// (PK, payload), differing only in the preset the engine's `ClampPreset`
-    /// resolves. Two opcodes rather than one node carrying `(lo, hi)`, so a
-    /// forged circuit cannot name `min > max`.
-    PositivePart,
+    WeightClamp(ClampKind),
     Reduce {
         group_cols: Vec<u32>,
         /// Aggregate specs `(func, source column)`. Carries a `Count`;
@@ -421,8 +426,7 @@ impl OpNode {
             OpNode::Filter(_)
             | OpNode::Map(_)
             | OpNode::Negate
-            | OpNode::Distinct
-            | OpNode::PositivePart
+            | OpNode::WeightClamp(_)
             | OpNode::Reduce { .. }
             | OpNode::IntegrateSink
             | OpNode::IntegrateTrace
@@ -623,7 +627,7 @@ impl Circuit {
     }
 
     pub fn distinct(&mut self, input: NodeId) -> NodeId {
-        self.add(OpNode::Distinct, NodeInputs::Unary(input))
+        self.add(OpNode::WeightClamp(ClampKind::Distinct), NodeInputs::Unary(input))
     }
 
     /// The Z-set difference `minuend − subtrahend` as `negate` → `union`.
@@ -639,10 +643,10 @@ impl Circuit {
     }
 
     /// The weight-exact clamped difference `positive_part(minuend − subtrahend)`:
-    /// [`Self::difference`] → [`OpNode::PositivePart`].
+    /// [`Self::difference`] → [`OpNode::WeightClamp`] of [`ClampKind::PositivePart`].
     pub fn positive_diff(&mut self, minuend: NodeId, subtrahend: NodeId) -> NodeId {
         let diff = self.difference(minuend, subtrahend);
-        self.add(OpNode::PositivePart, NodeInputs::Unary(diff))
+        self.add(OpNode::WeightClamp(ClampKind::PositivePart), NodeInputs::Unary(diff))
     }
 
     /// [`OpNode::Join`]: `delta` probes the integral `trace`. `delta_is_right`
@@ -939,8 +943,14 @@ pub fn encode_op_node(op: &OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
         }
         OpNode::Negate => (Opcode::Negate, None, None),
         OpNode::Union => (Opcode::Union, None, None),
-        OpNode::Distinct => (Opcode::Distinct, None, None),
-        OpNode::PositivePart => (Opcode::PositivePart, None, None),
+        OpNode::WeightClamp(k) => (
+            match k {
+                ClampKind::Distinct => Opcode::Distinct,
+                ClampKind::PositivePart => Opcode::PositivePart,
+            },
+            None,
+            None,
+        ),
         OpNode::Reduce { group_cols, agg, global_ground } => {
             w.bool(*global_ground);
             write_cols(&mut w, group_cols);
@@ -1060,8 +1070,8 @@ fn decode_params(r: &mut Reader, opcode: u64, src_tab: Option<u64>, params: Opti
         }
         Opcode::Negate => OpNode::Negate,
         Opcode::Union => OpNode::Union,
-        Opcode::Distinct => OpNode::Distinct,
-        Opcode::PositivePart => OpNode::PositivePart,
+        Opcode::Distinct => OpNode::WeightClamp(ClampKind::Distinct),
+        Opcode::PositivePart => OpNode::WeightClamp(ClampKind::PositivePart),
         Opcode::Reduce => {
             let global_ground = r.bool()?;
             let group_cols = read_cols(r)?;

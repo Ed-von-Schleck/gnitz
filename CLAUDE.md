@@ -215,7 +215,9 @@ match *existence*, not on weight arithmetic alone.
 
 The paper does not incrementalize outer joins — it lowers them to plans with
 extra joins, as Feldera does by injecting ghost `(k, NULL)` tuples into an inner
-join. GnitzDB's construction is join-free and its own.
+join. GnitzDB's is its own: against a side unique on the key, `ν = all − π_P(inner)`; otherwise
+`ν = all − (P ⋈ distinct(keys of the other side))` for equi, and
+`positive_part(all − π_P(inner))` for band.
 
 There is **no fused outer opcode**. `LEFT JOIN = inner ∪ null_extend(ν)`, where
 `ν` is the unmatched preserved rows at their true multiplicity: per preserved
@@ -263,11 +265,10 @@ at weight −1, the new at +1.
 
 *Set operations* (UNION/INTERSECT/EXCEPT, DISTINCT and ALL) are **join-free**:
 each is a linear combination of `{union, negate}` plus the weight-clamp primitive
-(`distinct = clamp[-1,1]`, `positive_part = clamp[0,i64::MAX]`) over
+(`distinct = clamp[0,1]`, `positive_part = clamp[0,i64::MAX]`) over
 content-hashed leaves — EXCEPT DISTINCT = `positive_part(distinct(A) −
-B)`, INTERSECT DISTINCT = `distinct(A) − positive_part(distinct(A) − B)`. There is **no anti-join operator**: these, the outer-join
-null-fills over a non-unique side, and band EXISTS/IN are the only
-`positive_part` users.
+B)`, INTERSECT DISTINCT = `distinct(A) − positive_part(distinct(A) − B)`. There is **no anti-join operator**: these, the band outer-join
+null-fills, and band EXISTS/IN are the only `positive_part` users.
 
 ### The integral (trace)
 

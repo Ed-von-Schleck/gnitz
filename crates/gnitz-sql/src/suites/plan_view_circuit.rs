@@ -7,7 +7,7 @@
 //! counts and node numbering are free to change.
 
 use gnitz_core::{OpNode, TypeCode};
-use gnitz_wire::{JoinKind, ReadBound};
+use gnitz_wire::{ClampKind, JoinKind, ReadBound};
 
 use super::*;
 
@@ -55,8 +55,8 @@ impl Node {
             CrossJoin => matches!(op, OpNode::Join { kind: JoinKind::Cross, .. }),
             Reduce => matches!(op, OpNode::Reduce { .. }),
             GlobalGround => matches!(op, OpNode::Reduce { global_ground: true, .. }),
-            Distinct => matches!(op, OpNode::Distinct),
-            PositivePart => matches!(op, OpNode::PositivePart),
+            Distinct => matches!(op, OpNode::WeightClamp(ClampKind::Distinct)),
+            PositivePart => matches!(op, OpNode::WeightClamp(ClampKind::PositivePart)),
             WorkerFilter => matches!(op, OpNode::WorkerFilter),
             NullExtend => matches!(op, OpNode::NullExtend { .. }),
             Filter => matches!(op, OpNode::Filter(_)),
@@ -97,12 +97,13 @@ const SHAPES: &[Row] = &[
     // Linear: no exchange, one filter per WHERE.
     ("SELECT id, v FROM t", 1, &[], &[]),
     ("SELECT id, v * 2 AS d FROM t WHERE v > 5", 1, &[], &[(Filter, 1)]),
-    // Equi join: two join terms, no exchange; the null-fill is a clamp and a
-    // null-extend per preserved side, never a distinct.
+    // Equi join: two join terms, no exchange; a null-fill against a non-unique
+    // side subtracts the preserved rows joined (two more terms) against the other
+    // side's distinct key set, then null-extends.
     ("SELECT a.id AS aid, b.w FROM a JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 2)]),
-    ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 2), (PositivePart, 1), (NullExtend, 1)]),
-    ("SELECT a.id AS aid, b.w FROM a RIGHT JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 2), (PositivePart, 1), (NullExtend, 1)]),
-    ("SELECT a.id AS aid, b.w FROM a FULL JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 2), (PositivePart, 2), (NullExtend, 2)]),
+    ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 4), (Distinct, 1), (NullExtend, 1)]),
+    ("SELECT a.id AS aid, b.w FROM a RIGHT JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 4), (Distinct, 1), (NullExtend, 1)]),
+    ("SELECT a.id AS aid, b.w FROM a FULL JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 6), (Distinct, 2), (NullExtend, 2)]),
     // A null-fill against a side unique on the key subtracts without a clamp.
     ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.id", 1, &[], &[(EquiJoin, 2), (NullExtend, 1)]),
     // A residual or WHERE is one filter; a nullable key is none, its re-key
@@ -112,12 +113,12 @@ const SHAPES: &[Row] = &[
     ("SELECT a.id AS aid, b.w FROM a JOIN b ON a.k = b.k WHERE a.v > 5", 1, &[], &[(EquiJoin, 2), (Filter, 1)]),
     ("SELECT n.id AS nid, b.w FROM n JOIN b ON n.k = b.k", 1, &[], &[(EquiJoin, 2)]),
     ("SELECT a.id AS aid, n.v FROM a JOIN n ON a.k = n.k", 1, &[], &[(EquiJoin, 2)]),
-    ("SELECT n.id AS nid, b.w FROM n LEFT JOIN b ON n.k = b.k", 1, &[], &[(EquiJoin, 2), (PositivePart, 1), (NullExtend, 1)]),
-    ("SELECT n.id AS nid, m.v FROM n LEFT JOIN m ON n.k = m.k", 1, &[], &[(EquiJoin, 2), (PositivePart, 1), (NullExtend, 1)]),
+    ("SELECT n.id AS nid, b.w FROM n LEFT JOIN b ON n.k = b.k", 1, &[], &[(EquiJoin, 4), (Distinct, 1), (NullExtend, 1)]),
+    ("SELECT n.id AS nid, m.v FROM n LEFT JOIN m ON n.k = m.k", 1, &[], &[(EquiJoin, 4), (Distinct, 1), (NullExtend, 1)]),
     // A composite key mixing a NOT NULL and a nullable column.
-    ("SELECT n.id AS nid, b.w FROM n LEFT JOIN b ON n.k = b.k AND n.id = b.w", 1, &[], &[(EquiJoin, 2), (PositivePart, 1), (NullExtend, 1)]),
+    ("SELECT n.id AS nid, b.w FROM n LEFT JOIN b ON n.k = b.k AND n.id = b.w", 1, &[], &[(EquiJoin, 4), (Distinct, 1), (NullExtend, 1)]),
     // An ON conjunct over the null-supplying side filters that input.
-    ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.k AND b.w > 3", 1, &[], &[(EquiJoin, 2), (PositivePart, 1), (NullExtend, 1), (Filter, 1)]),
+    ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.k AND b.w > 3", 1, &[], &[(EquiJoin, 4), (Distinct, 1), (NullExtend, 1), (Filter, 1)]),
     // A filtered derived-table input fuses into the join, cutting no segment.
     ("SELECT a.id AS aid, d.w FROM a JOIN (SELECT k, w FROM b WHERE w > 3) d ON a.k = d.k", 1, &[], &[(EquiJoin, 2), (Filter, 1)]),
     // Band join: two range terms, one pair-PK output exchange, no worker filter.

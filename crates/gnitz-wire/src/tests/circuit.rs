@@ -31,7 +31,7 @@ fn sample(op: Opcode) -> OpNode {
             agg: vec![agg(AggFunc::Min, 4), agg(AggFunc::Sum, 1)],
             global_ground: false,
         },
-        Opcode::Distinct => OpNode::Distinct,
+        Opcode::Distinct => OpNode::WeightClamp(ClampKind::Distinct),
         // A non-ascending index column list: `PkColList`'s `PartialEq` spans the
         // whole backing array, so a reordered list fails the round-trip.
         Opcode::ScanDelta => OpNode::ScanDelta {
@@ -58,7 +58,7 @@ fn sample(op: Opcode) -> OpNode {
             cols: vec![(1, None), (2, Some(TypeCode::I32))],
         }),
         Opcode::WorkerFilter => OpNode::WorkerFilter,
-        Opcode::PositivePart => OpNode::PositivePart,
+        Opcode::PositivePart => OpNode::WeightClamp(ClampKind::PositivePart),
         Opcode::MapReindex => OpNode::Map(MapKind::Reindex {
             keep: vec![0],
             key: vec![(2, None), (5, Some(TypeCode::I64))],

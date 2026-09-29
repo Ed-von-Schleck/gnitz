@@ -117,7 +117,7 @@ fn the_carve_splits_sides_from_the_post_phase() {
             (3, OpNode::ExchangeShard { shard_cols: vec![0] }),
             (4, OpNode::ExchangeShard { shard_cols: vec![0] }),
             (5, OpNode::Union),
-            (6, OpNode::Distinct),
+            (6, OpNode::WeightClamp(gnitz_wire::ClampKind::Distinct)),
             (7, OpNode::IntegrateSink),
         ],
         vec![

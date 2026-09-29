@@ -35,18 +35,31 @@ fn keyed_side(
     Ok((all, reindex))
 }
 
-/// `all − π`, where `π` is `all`'s matched multiplicity keyed like it. Clamped at
-/// zero unless the other side is unique on the equality key, which bounds it by
-/// `all`.
-pub(super) fn unmatched(cb: &mut Circuit, all: NodeId, pi: NodeId, other_unique: bool) -> NodeId {
-    match other_unique {
-        true => cb.difference(all, pi),
-        false => cb.positive_diff(all, pi),
+/// An equi join's shared nodes: each side's [`keyed_side`] `all`, the reindex
+/// each side's delta joins through and its trace, and the symmetric 2-term join
+/// over `[_join_pk, kept-A, kept-B]`.
+pub(super) struct EquiPrologue {
+    pub(super) all: [NodeId; 2],
+    reindex: [NodeId; 2],
+    trace: [NodeId; 2],
+    pub(super) inner: NodeId,
+}
+
+impl EquiPrologue {
+    /// Side `p`'s keyed rows that some row of the other side matches, each at its
+    /// own weight `w_P · [S > 0]`, laid out like `all[p]`: `p`'s reindex joined
+    /// against the other side's key set.
+    pub(super) fn matched(&self, cb: &mut Circuit, p: usize) -> NodeId {
+        let o = 1 - p;
+        let keys = cb.map(self.reindex[o], &[]);
+        let set = cb.distinct(keys);
+        let trace_set = cb.integrate_trace(set);
+        let (mut deltas, mut traces) = (self.reindex, self.trace);
+        (deltas[o], traces[o]) = (set, trace_set);
+        cb.join_terms(deltas, traces, JoinKind::Equi)
     }
 }
 
-/// `(all, inner)`: each side's [`keyed_side`] `all`, and the symmetric 2-term
-/// join over `[_join_pk, kept-A, kept-B]`.
 pub(super) fn equi_prologue(
     cb: &mut Circuit,
     class: &JoinClass,
@@ -54,7 +67,7 @@ pub(super) fn equi_prologue(
     inputs: [NodeId; 2],
     kind: JoinType,
     b_unique: bool,
-) -> Result<([NodeId; 2], NodeId), GnitzSqlError> {
+) -> Result<EquiPrologue, GnitzSqlError> {
     let tcs = class.key_tcs();
     let side = |cb: &mut Circuit, i: usize| keyed_side(cb, &sides[i], inputs[i], &tcs, kind.emits_unmatched(i == 0));
     let (all_b, reindex_b) = side(cb, 1)?;
@@ -68,7 +81,12 @@ pub(super) fn equi_prologue(
     let trace_a = cb.integrate_trace(reindex_a);
     let trace_b = cb.integrate_trace(b_delta);
     let inner = cb.join_terms([reindex_a, b_delta], [trace_a, trace_b], JoinKind::Equi);
-    Ok(([all_a, all_b], inner))
+    Ok(EquiPrologue {
+        all: [all_a, all_b],
+        reindex: [reindex_a, b_delta],
+        trace: [trace_a, trace_b],
+        inner,
+    })
 }
 
 /// The output PK columns a re-key onto source PKs mints: one per listed
@@ -238,7 +256,13 @@ impl RangePrologue<'_> {
         let base = self.k + if is_left { 0 } else { self.sides[0].n() };
         let pi = rekey_pinned(cb, merged, base, std::slice::from_ref(&self.sides[i]));
         let all = rekey_on_source_pk(cb, self.inputs[i], &self.sides[i], false)?;
-        Ok((all, unmatched(cb, all, pi, other_unique)))
+        // `π` is P's matched multiplicity, which only a side unique on the
+        // equality key bounds by `all`; otherwise the difference is clamped at 0.
+        let nu = match other_unique {
+            true => cb.difference(all, pi),
+            false => cb.positive_diff(all, pi),
+        };
+        Ok((all, nu))
     }
 
     /// The [`Self::merged`] output re-keyed onto the source-PK pair `_pair_pk`,

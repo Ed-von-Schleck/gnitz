@@ -332,10 +332,9 @@ fn test_distinct_multi_tick() {
         1,
         Op::WeightClamp {
             hist,
-            preset: gnitz_store::ops::ClampPreset::Distinct,
+            kind: gnitz_wire::ClampKind::Distinct,
         },
     );
-    p.integrate(0, hist);
     let mut vm = p.build_in(&registry, vec![schema; 2], 1);
 
     // Tick 1: insert pk=1 with weight +3 → distinct output should be +1
@@ -416,7 +415,6 @@ fn test_reduce_groups_by_a_payload_column() {
     let group_cols = [1u32]; // schema col 1 = payload col 0 (group key)
 
     push_reduce(&mut p, &agg_descs, &group_cols, in_schema, out_trace, false);
-    p.integrate(1, out_trace);
     let mut vm = p.build_in(&registry, vec![in_schema, out_schema], 1);
 
     // Both rows in group=1, values 10 and 20.
@@ -451,7 +449,6 @@ fn test_reduce_multi_agg() {
     let group_cols = [0u32];
 
     push_reduce(&mut p, &agg_descs, &group_cols, in_schema, out_trace, false);
-    p.integrate(1, out_trace);
     let mut vm = p.build_in(&registry, vec![in_schema, out_schema], 1);
 
     // Three rows all with pk=1, vals 10, 20, 30.
@@ -487,7 +484,6 @@ fn an_empty_epoch_mints_the_ground_row_once() {
             plan: Box::new(BakedReduce::new(plan, None)),
         },
     );
-    p.integrate(1, out_trace);
     let mut vm = p.build_in(&registry, vec![in_schema, out_schema], 1);
     assert!(
         vm.pending_ground_row,
@@ -526,7 +522,6 @@ fn a_non_empty_epoch_spends_the_ground_latch_too() {
             plan: Box::new(BakedReduce::new(plan, None)),
         },
     );
-    p.integrate(1, out_trace);
     let mut vm = p.build_in(&registry, vec![in_schema, out_schema], 1);
     assert!(vm.pending_ground_row);
 
@@ -687,7 +682,6 @@ fn a_second_epoch_retracts_the_first_ones_aggregate() {
             plan: Box::new(BakedReduce::new(plan, None)),
         },
     );
-    p.integrate(1, out_trace);
     let mut vm = p.build_in(&registry, vec![in_schema, out_schema], 1);
 
     let sum_of = |vm: &TestVm| -> Vec<i64> {
@@ -729,7 +723,6 @@ fn a_second_topn_epoch_retracts_the_first_ones_row() {
             plan: Box::new(BakedTopN { plan, index_table }),
         },
     );
-    p.integrate(1, out_trace);
     let mut vm = p.build_in(&registry, vec![in_schema, out_schema], 1);
 
     execute_epoch(&mut vm, make_batch_u128(&in_schema, &[(1, 1, 10)]), 0).unwrap();
@@ -772,15 +765,14 @@ fn a_replay_leaves_every_trace_as_it_found_it() {
     assert_eq!(trace_zset(&vm, trace, &schema), before, "and writes none of them back");
 }
 
-/// A replay may not enter before a state writer.
+/// A replay may not enter before a stateful operator.
 #[test]
-fn replay_entry_refuses_a_state_writer_past_the_entry() {
+fn replay_entry_refuses_a_stateful_operator_past_the_entry() {
     let schema = make_schema_u128_i64();
 
     let mut p = TestPlan::default();
     let out_trace = p.table("replay_entry_reduce", schema);
     let out_schema = push_reduce(&mut p, &[AggDescriptor::COUNT_STAR], &[], schema, out_trace, false);
-    p.integrate(1, out_trace);
     p.push(1, 2, Op::WorkerFilter { slot: Slot::SOLO });
     // Built without opening its stores: `replay_entry` reads the program alone.
     let vm = p.build(vec![schema, out_schema, out_schema], 2);
@@ -792,5 +784,22 @@ fn replay_entry_refuses_a_state_writer_past_the_entry() {
     assert_eq!(
         vm.program.replay_entry(DeltaReg(1)).map(|e| e.reg()).ok(),
         Some(DeltaReg(1))
+    );
+
+    // A clamp reads its input's history, which the seed never entered.
+    let mut p = TestPlan::default();
+    let hist = p.table("replay_entry_clamp", schema);
+    p.push(
+        0,
+        1,
+        Op::WeightClamp {
+            hist,
+            kind: gnitz_wire::ClampKind::Distinct,
+        },
+    );
+    let vm = p.build(vec![schema; 2], 1);
+    assert!(
+        vm.program.replay_entry(DeltaReg(0)).is_err(),
+        "the clamp reads the seed"
     );
 }

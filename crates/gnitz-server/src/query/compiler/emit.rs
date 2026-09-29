@@ -9,7 +9,7 @@
 
 use super::*;
 use crate::query::vm::{BakedReduce, BakedTopN, Instr, Op};
-use gnitz_store::ops::{ClampPreset, JoinPlan};
+use gnitz_store::ops::JoinPlan;
 use gnitz_store::relation::StateLayout;
 
 // ---------------------------------------------------------------------------
@@ -174,8 +174,16 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             Ok(OutReg::Delta(ctx.push(in_a, out_schema, Op::Union { in_b })))
         }
 
-        gnitz_wire::OpNode::Distinct => emit_clamp(ctx, nid, ClampPreset::Distinct),
-        gnitz_wire::OpNode::PositivePart => emit_clamp(ctx, nid, ClampPreset::PositivePart),
+        gnitz_wire::OpNode::WeightClamp(kind) => {
+            let in_reg = ctx.unary_delta_in(nid)?;
+            let schema = ctx.reg_schema(in_reg);
+            let hist = ctx.declare_child("hist", nid, schema);
+            Ok(OutReg::Delta(ctx.push(
+                in_reg,
+                schema,
+                Op::WeightClamp { hist, kind: *kind },
+            )))
+        }
 
         gnitz_wire::OpNode::Reduce { group_cols, agg, global_ground } => {
             emit_reduce(ctx, nid, group_cols, agg, *global_ground)
@@ -246,21 +254,6 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             Ok(OutReg::Delta(ctx.push(in_reg, out_schema, op)))
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// WEIGHT-CLAMP emission
-// ---------------------------------------------------------------------------
-
-/// `distinct` and `positive_part` differ in nothing but their preset, which the
-/// caller's own match arm supplies.
-fn emit_clamp(ctx: &mut EmitCtx, nid: NodeId, preset: ClampPreset) -> Result<OutReg, String> {
-    let in_reg = ctx.unary_delta_in(nid)?;
-    let schema = ctx.reg_schema(in_reg);
-    let hist = ctx.declare_child("hist", nid, schema);
-    let out_reg = ctx.push(in_reg, schema, Op::WeightClamp { hist, preset });
-    ctx.integrates.push((in_reg, hist));
-    Ok(OutReg::Delta(out_reg))
 }
 
 // ---------------------------------------------------------------------------
@@ -344,9 +337,7 @@ fn push_reduce(
         .as_ref()
         .map(|bake| ctx.declare_child(index_kind, nid, bake.schema));
     let baked = Box::new(BakedReduce::new(plan, avi_table));
-    let out_reg = ctx.push(in_reg, out_schema, Op::Reduce { out_trace, plan: baked });
-    ctx.integrates.push((out_reg, out_trace));
-    out_reg
+    ctx.push(in_reg, out_schema, Op::Reduce { out_trace, plan: baked })
 }
 
 /// Declare `plan`'s children under `kinds`, and push the top-N over `in_reg`.
@@ -362,9 +353,7 @@ fn push_topn(
     // The ordered index of every input row — the operator's whole history.
     let index_table = ctx.declare_child(index_kind, nid, plan.index.schema);
     let baked = Box::new(BakedTopN { plan, index_table });
-    let out_reg = ctx.push(in_reg, out_schema, Op::TopN { out_trace, plan: baked });
-    ctx.integrates.push((out_reg, out_trace));
-    out_reg
+    ctx.push(in_reg, out_schema, Op::TopN { out_trace, plan: baked })
 }
 
 /// `consumer`'s per-worker partial over its shard's input, or `None` for a reduce

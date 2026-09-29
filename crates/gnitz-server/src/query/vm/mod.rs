@@ -10,6 +10,7 @@ use gnitz_store::relation::{CircuitState, StateIdx};
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::schema::Slot;
 use gnitz_store::storage::Batch;
+use gnitz_wire::ClampKind;
 
 mod builder;
 mod exec;
@@ -57,12 +58,11 @@ pub(in crate::query) enum Op {
         in_b: DeltaReg,
     },
     /// Shared instruction for `distinct` and `positive_part`: per consolidated
-    /// (PK, payload), emit `clamp(w_new) − clamp(w_old)` at `preset`'s bounds.
+    /// (PK, payload), emit `clamp(w_new) − clamp(w_old)` at `kind`'s bounds.
     WeightClamp {
-        /// The history trace `I(in)`, which a `Program::integrates` entry
-        /// accumulates.
+        /// The history trace `I(in)`, which `build` integrates.
         hist: StateIdx,
-        preset: ops::ClampPreset,
+        kind: ClampKind,
     },
     /// The delta-trace inner join, equi, range and cross alike: the probe is
     /// baked by the compiler from the wire's `JoinKind` and side flag, so neither
@@ -128,9 +128,10 @@ struct OpFacts {
     /// It reads its input at net weights, so the VM folds that register when it
     /// is written.
     consolidates_in: bool,
-    /// It writes operator state — a value index, an ordered index. Not the
-    /// output trace, which a `Program::integrates` entry writes.
-    writes_state: bool,
+    /// Its output depends on state it owns — its input's history, a value index,
+    /// an ordered index — so a replay past it would read that state against a
+    /// seed it never saw.
+    stateful: bool,
     /// With every delta operand empty its kernel returns
     /// `empty_with_schema(out_reg)` and touches no trace.
     inert_on_empty: bool,
@@ -139,7 +140,7 @@ struct OpFacts {
 fn facts(op: &Op) -> OpFacts {
     let linear = OpFacts {
         consolidates_in: false,
-        writes_state: false,
+        stateful: false,
         inert_on_empty: true,
     };
     match op {
@@ -149,14 +150,19 @@ fn facts(op: &Op) -> OpFacts {
         | Op::Union { .. }
         | Op::WorkerFilter { .. }
         | Op::NullExtend { .. } => linear,
-        Op::WeightClamp { .. } | Op::JoinDT { .. } => OpFacts { consolidates_in: true, ..linear },
+        Op::WeightClamp { .. } => OpFacts {
+            consolidates_in: true,
+            stateful: true,
+            ..linear
+        },
+        Op::JoinDT { .. } => OpFacts { consolidates_in: true, ..linear },
         Op::Reduce { plan, .. } => OpFacts {
             consolidates_in: !plan.plan.is_exact_linear(),
-            writes_state: true,
+            stateful: true,
             // A global-ground reduce mints V₀ from an empty delta.
             inert_on_empty: !plan.plan.seeds_ground,
         },
-        Op::TopN { .. } => OpFacts { writes_state: true, ..linear },
+        Op::TopN { .. } => OpFacts { stateful: true, ..linear },
     }
 }
 
@@ -176,7 +182,7 @@ impl Instr {
             Op::Filter(_)
             | Op::Map(_)
             | Op::Negate
-            | Op::WeightClamp { hist: _, preset: _ }
+            | Op::WeightClamp { hist: _, kind: _ }
             | Op::JoinDT { trace: _, probe: _ }
             | Op::WorkerFilter { slot: _ }
             | Op::NullExtend { nulls_first: _ }
@@ -184,6 +190,24 @@ impl Instr {
             | Op::TopN { out_trace: _, plan: _ } => None,
         };
         [Some(self.in_reg), second]
+    }
+
+    /// The trace this instruction's op owns as the integral of one of its own
+    /// registers — the clamp's input history, a reduce's or top-N's output — which
+    /// `build` schedules as an integrate. No `_` arm, as in [`Self::reads`]: a new
+    /// opcode must say whether it owns one.
+    fn own_integral(&self) -> Option<(DeltaReg, StateIdx)> {
+        match &self.op {
+            Op::WeightClamp { hist, .. } => Some((self.in_reg, *hist)),
+            Op::Reduce { out_trace, .. } | Op::TopN { out_trace, .. } => Some((self.out_reg, *out_trace)),
+            Op::Filter(_)
+            | Op::Map(_)
+            | Op::Negate
+            | Op::Union { .. }
+            | Op::JoinDT { .. }
+            | Op::WorkerFilter { .. }
+            | Op::NullExtend { .. } => None,
+        }
     }
 }
 
@@ -277,12 +301,6 @@ impl Program {
         self.out_reg
     }
 
-    /// The operators, in program order.
-    #[cfg(test)]
-    pub(in crate::query) fn ops(&self) -> impl Iterator<Item = &Op> + '_ {
-        self.instructions.iter().map(|i| &i.op)
-    }
-
     /// Every instruction with, per operand, whether it is that operand's last
     /// reader — the take verdict the dispatch acts on.
     #[cfg(test)]
@@ -311,8 +329,8 @@ impl Program {
             .position(|i| i.reads().into_iter().flatten().any(|r| r == reg))
             .unwrap_or(self.instructions.len());
         let rest = &self.instructions[pc..];
-        if rest.iter().any(|i| facts(&i.op).writes_state) {
-            return Err("replay: the program writes operator state past its entry".into());
+        if rest.iter().any(|i| facts(&i.op).stateful) {
+            return Err("replay: the program has a stateful operator past its entry".into());
         }
         Ok(ReplayEntry { reg, pc })
     }
