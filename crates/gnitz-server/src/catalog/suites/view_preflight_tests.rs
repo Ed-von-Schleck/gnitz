@@ -11,16 +11,6 @@
 
 use super::*;
 
-/// A predicate blob whose register file exceeds `MAX_REGS`, so
-/// `LogicalProgram::from_blob` rejects it. Forged word by word: the client's
-/// `ExprBuilder` refuses to build an over-cap program, so only a corrupt
-/// circuit can carry one — which is the input the pre-flight exists to catch.
-fn over_cap_pred_blob() -> Vec<u8> {
-    let n = gnitz_expr::MAX_REGS as u32 + 1;
-    let code = (0..n).map(|dst| gnitz_expr::LogicalInstr::LoadConst { val: dst as i64, unsigned: false }.to_wire());
-    gnitz_expr::encode_expr_blob(code, std::iter::once([gnitz_expr::SinkKind::Reg.as_wire(), n - 1]), &[])
-}
-
 /// `ScanDelta(base_tid) → Filter(pred) → Distinct → Integrate` for `vid`. The
 /// filter blob is what decides whether the view compiles.
 fn write_filtered_circuit(engine: &mut CatalogEngine, vid: u64, base_tid: u64, pred: &[u8]) {
@@ -69,14 +59,15 @@ fn test_preflight_compile_verdict() {
         "a well-formed circuit must pass the pre-flight"
     );
 
-    // An over-cap predicate: the register file exceeds MAX_REGS, so the filter's
-    // program is rejected, and the message names the limit it exceeded.
-    let bad_vid = register_filtered_view(&mut engine, base_tid, "vbad", &over_cap_pred_blob());
+    // A predicate blob the expression decoder refuses — only a corrupt circuit
+    // can carry one, since the client's builder cannot — and the message is the
+    // decoder's own.
+    let bad_vid = register_filtered_view(&mut engine, base_tid, "vbad", &[0xFF]);
     let msg = crate::query::preflight_compile(&engine.registry, bad_vid)
-        .expect_err("an over-cap predicate must fail the pre-flight");
+        .expect_err("an undecodable predicate must fail the pre-flight");
     assert!(
-        msg.contains("registers") && msg.contains(&gnitz_expr::MAX_REGS.to_string()),
-        "the rejection must state the register limit, got: {msg}"
+        msg.contains("expr blob"),
+        "the rejection must be the decoder's, got: {msg}"
     );
 
     engine.close();

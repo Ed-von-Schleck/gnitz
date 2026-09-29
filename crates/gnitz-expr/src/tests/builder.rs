@@ -1,24 +1,5 @@
 use super::*;
-use crate::{CmpOp, IntArithOp, LogicalInstr as L, LogicalProgram};
-
-/// The blob a built program encodes to must decode back to the instructions the
-/// builder recorded — which is what makes `to_blob_bytes` and the engine's
-/// `from_blob` two views of one program rather than two programs.
-#[test]
-fn the_blob_round_trips_through_the_wire_decoder() {
-    let mut b = ExprBuilder::new();
-    let c = b.emit(L::LoadConst { val: 1_234_567_890_123, unsigned: false });
-    let col = b.emit(L::LoadColInt { col: 0 });
-    let cond = b.emit(L::Cmp { op: CmpOp::Gt, a: col, b: c });
-    let s_idx = b.add_const_bytes("längre sträng".as_bytes());
-    let _ = b.emit(L::StrColConst { op: CmpOp::Eq, col: 1, const_idx: s_idx });
-    let _ = b.add_const_bytes(b"");
-    let sel = b.emit(L::Select { cond, a: col, b: c });
-    let prog = b.build(vec![Sink::Reg(sel)]).expect("a well-formed program");
-
-    let decoded = LogicalProgram::from_blob(&prog.to_blob_bytes()).expect("the blob must decode");
-    assert_eq!(decoded.instrs(), prog.instrs());
-}
+use crate::{IntArithOp, LogicalInstr as L};
 
 /// Two identical instructions hold one value, so the second `emit` answers the
 /// first's register, and two equal literals are one pool entry — which is what
@@ -43,17 +24,20 @@ fn the_builder_folds_identical_instructions_and_pool_entries() {
 
 /// A lift of a constant is another constant, folded at emit rather than at
 /// resolve: the `IntToFloat` never enters the program, so no schema-resolution
-/// pass has to read back what an earlier instruction wrote.
+/// pass has to read back what an earlier instruction wrote. An unsigned
+/// constant lifts as the `u64` its bits are.
 #[test]
 fn a_lift_over_a_constant_folds_to_a_float_constant() {
-    let mut b = ExprBuilder::new();
-    let c = b.emit(L::LoadConst { val: -7, unsigned: false });
-    let lifted = b.emit(L::IntToFloat { a: c });
-    let prog = b.build(vec![Sink::Reg(lifted)]).expect("a well-formed program");
-    assert!(matches!(
-        prog.instrs(),
-        [L::LoadConst { val: -7, unsigned: false }, L::LoadConst { val, unsigned: false }] if f64::from_bits(*val as u64) == -7.0
-    ));
+    for (val, unsigned, want) in [(-7, false, -7.0), (-1, true, u64::MAX as f64)] {
+        let mut b = ExprBuilder::new();
+        let c = b.emit(L::LoadConst { val, unsigned });
+        let lifted = b.emit(L::IntToFloat { a: c });
+        let prog = b.build(vec![Sink::Reg(lifted)]).expect("a well-formed program");
+        assert!(
+            matches!(prog.instrs(), [_, L::LoadConst { val, unsigned: false }] if f64::from_bits(*val as u64) == want),
+            "{val} unsigned={unsigned}"
+        );
+    }
 
     // A lift over a computed register is untouched.
     let mut b = ExprBuilder::new();
@@ -77,19 +61,6 @@ fn a_range_check_over_the_same_range_check_folds() {
     assert_ne!(narrower, narrow);
     let prog = b.build(vec![Sink::Reg(narrower)]).expect("a well-formed program");
     assert_eq!(prog.instrs().len(), 3);
-}
-
-/// An unsigned constant lifts as the `u64` its bits are.
-#[test]
-fn a_lift_over_an_unsigned_constant_reads_it_unsigned() {
-    let mut b = ExprBuilder::new();
-    let c = b.emit(L::LoadConst { val: -1, unsigned: true });
-    let lifted = b.emit(L::IntToFloat { a: c });
-    let prog = b.build(vec![Sink::Reg(lifted)]).expect("a well-formed program");
-    assert!(matches!(
-        prog.instrs(),
-        [_, L::LoadConst { val, unsigned: false }] if f64::from_bits(*val as u64) == 1.8446744073709552e19
-    ));
 }
 
 /// A day count widened to microseconds folds to its product, and an overflowing

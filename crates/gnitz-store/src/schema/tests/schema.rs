@@ -257,37 +257,6 @@ fn test_new_constructs_schema() {
     assert_eq!(empty.num_columns(), 0);
 }
 
-#[test]
-fn test_payload_slot_around_pk() {
-    // pk_index = 1: col 0 maps to payload 0, col 2 maps to payload 1, and
-    // the PK column (1) has no payload slot.
-    let s = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U64, false),
-        ],
-        &[1],
-    );
-    assert_eq!(s.payload_slot(0), Some(0));
-    assert_eq!(s.payload_slot(2), Some(1));
-    assert_eq!(s.payload_slot(1), None);
-}
-
-#[test]
-#[should_panic(expected = "locate: col_idx 3 out of bounds")]
-fn test_locate_out_of_bounds_panics() {
-    let s = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U64, false),
-        ],
-        &[0],
-    );
-    let _ = s.locate(3);
-}
-
 /// The descriptor constructor admits exactly the wire allow-list — no more
 /// (STRING/BLOB carry an unrelocatable heap offset, floats break the
 /// byte-equal key contract) and no less. Driven off `is_pk_eligible` rather

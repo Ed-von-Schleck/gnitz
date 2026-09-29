@@ -8,7 +8,7 @@ use crate::{assert_batchview_consistent, BatchView, RowSource};
 
 #[test]
 fn test_view_satisfies_the_region_per_row_contract() {
-    let v = fixture();
+    let (_, v) = fixture();
     // The fixture's two PK columns, at their PK-list offsets, with the native
     // values it wrote — sign-extended, so the signed column's expectation is
     // spelled the same way as the unsigned one's.
@@ -66,8 +66,8 @@ impl BatchView for MisMappedSlot {
 #[should_panic(expected = "get_col_ptr")]
 fn contract_harness_rejects_a_mismapped_payload_slot() {
     let mut v = TestView::new(2, 8);
-    assert_eq!(v.push_col(8), 0);
-    assert_eq!(v.push_col(8), 1);
+    v.push_col(8);
+    v.push_col(8);
     for row in 0..2 {
         v.set_payload(row, 0, &(row as u64).to_le_bytes());
         v.set_payload(row, 1, &(100 + row as u64).to_le_bytes());

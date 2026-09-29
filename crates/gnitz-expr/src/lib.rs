@@ -76,7 +76,6 @@ pub use eval::*;
 pub use like::*;
 pub use locator::*;
 pub use program::*;
-pub(crate) use range::RangeMembership;
 pub use schema_facts::*;
 pub use view::*;
 

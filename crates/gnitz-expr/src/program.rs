@@ -17,9 +17,8 @@ use std::fmt;
 
 /// The register file is capped at 64: the `BoolBinary` 3VL paths, the
 /// null-bit propagation, and every register-indexed mask address registers by
-/// bit in a `u64`. Public for the engine's view pre-flight tests, which build a
-/// program at the limit.
-pub const MAX_REGS: usize = u64::BITS as usize;
+/// bit in a `u64`.
+pub(crate) const MAX_REGS: usize = u64::BITS as usize;
 
 /// The const pool's entry cap: an instruction names at most one pool entry, and
 /// `from_instrs` caps instructions at [`MAX_REGS`] — so an entry past this is one
@@ -272,7 +271,7 @@ gnitz_wire::wire_enum! {
 gnitz_wire::wire_enum! {
     /// What one sink pair `[kind, value]` names. Sinks ride the blob's own
     /// region, so this space is disjoint from [`ExprOp`]'s.
-    pub enum SinkKind: u32 {
+    pub(crate) enum SinkKind: u32 {
         /// Copy input column `value` verbatim.
         Col = 0,
         /// Store register `value`.
@@ -1024,7 +1023,7 @@ impl LogicalInstr {
     /// inverse of `LogicalProgram::decode_instr` — the two are the only
     /// statements of the word layout, held together by the round-trip test.
     /// Unused words are 0, matching what the decoder ignores.
-    pub fn to_wire(self) -> [u32; INSTR_WORDS] {
+    pub(crate) fn to_wire(self) -> [u32; INSTR_WORDS] {
         use LogicalInstr as L;
         // Every arm is `[op, selector, a1, a2, a3]`; these shorten the common
         // shapes. `sel` is 0 for an opcode that names no family.
@@ -1134,7 +1133,7 @@ impl Sink {
 ///
 /// The register count is not carried: a register is the index of the
 /// instruction that writes it, so N *is* the register file's size.
-pub fn encode_expr_blob(
+pub(crate) fn encode_expr_blob(
     code: impl ExactSizeIterator<Item = [u32; INSTR_WORDS]>,
     sinks: impl ExactSizeIterator<Item = [u32; SINK_WORDS]>,
     const_strings: &[Vec<u8>],

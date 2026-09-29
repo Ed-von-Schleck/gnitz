@@ -1,9 +1,8 @@
 //! Range membership over key images, driven through [`TestView`].
 
-use crate::test_support::{TestSchema, TestView};
-use crate::{RangeMembership, RowSource, SchemaFacts};
-use gnitz_wire::TypeCode;
-use gnitz_wire::{image_mask, key_image, Cut, FixedInt, KeyRange, PkColList};
+use crate::test_support::{make_n_col_view, passing_rows, TestSchema, TestView};
+use crate::{ExprValidateErr, RowFilter, SchemaFacts};
+use gnitz_wire::{image_mask, key_image, Cut, FixedInt, KeyRange, PkColList, ReadBound, TypeCode};
 
 fn range(cols: &[u32], eq: &[u128], start: Cut, end: Cut) -> KeyRange {
     KeyRange::new(PkColList::from_slice(cols), eq, start, end)
@@ -13,15 +12,15 @@ fn point(cols: &[u32], v: u128) -> KeyRange {
     KeyRange::point(PkColList::from_slice(cols), &[], v)
 }
 
-/// The rows of `v` the walk `range` admits, ANDed into all-ones words.
+/// The rows of `v` the walk `range` admits, through the read filter that runs it.
 fn admitted(range: KeyRange, schema: &TestSchema, v: &TestView) -> Vec<usize> {
-    let n = v.row_count();
-    let mut words = vec![u64::MAX; n.div_ceil(64)];
-    if !n.is_multiple_of(64) {
-        words[n / 64] = gnitz_wire::low_bits_mask(n % 64);
-    }
-    RangeMembership::new(&range, schema).unwrap().and_into(v, &mut words);
-    (0..n).filter(|&r| (words[r / 64] >> (r % 64)) & 1 != 0).collect()
+    let mut f = RowFilter::for_read(&[], &ReadBound::Range(range), schema).unwrap();
+    passing_rows(&mut f, v)
+        .iter()
+        .enumerate()
+        .filter(|(_, &p)| p)
+        .map(|(r, _)| r)
+        .collect()
 }
 
 /// A signed payload column: `[-3, 3)` straddles zero, and the cut kinds decide the edges.
@@ -29,11 +28,7 @@ fn admitted(range: KeyRange, schema: &TestSchema, v: &TestView) -> Vec<usize> {
 fn signed_cuts_admit_across_zero() {
     let schema = TestSchema::new(&[(TypeCode::U64, false), (TypeCode::I64, true)], &[0]);
     let vals = [-4i64, -3, -1, 0, 2, 3, i64::MIN, i64::MAX];
-    let mut v = TestView::new(vals.len(), 8);
-    v.push_col(8);
-    for (r, x) in vals.iter().enumerate() {
-        v.set_payload(r, 0, &x.to_le_bytes());
-    }
+    let v = make_n_col_view(&schema, vals.len(), |r, _| vals[r], |_, _| false);
     let p = |x: i128| key_image(TypeCode::I64, FixedInt::I64.pack(x));
     let r = range(&[1], &[], Cut::before(p(-3)), Cut::before(p(3)));
     assert_eq!(admitted(r, &schema, &v), vec![1, 2, 3, 4]);
@@ -74,14 +69,7 @@ fn a_null_in_any_indexed_column_is_outside_the_walk() {
         &[(TypeCode::U64, false), (TypeCode::U64, true), (TypeCode::U64, true)],
         &[0],
     );
-    let mut v = TestView::new(3, 8);
-    v.push_col(8);
-    v.push_col(8);
-    for r in 0..3 {
-        v.set_payload(r, 0, &7u64.to_le_bytes());
-    }
-    v.set_null(1, 0);
-    v.set_null(2, 1);
+    let v = make_n_col_view(&schema, 3, |_, _| 7, |r, c| r == c + 1);
     assert_eq!(admitted(point(&[1, 2], 7), &schema, &v), vec![0]);
 }
 
@@ -90,10 +78,7 @@ fn a_null_in_any_indexed_column_is_outside_the_walk() {
 #[test]
 fn an_over_wide_value_is_masked_to_the_column() {
     let schema = TestSchema::new(&[(TypeCode::U64, false), (TypeCode::U8, true)], &[0]);
-    let mut v = TestView::new(2, 8);
-    v.push_col(1);
-    v.set_payload(0, 0, &[7]);
-    v.set_payload(1, 0, &[8]);
+    let v = make_n_col_view(&schema, 2, |r, _| 7 + r as i64, |_, _| false);
     assert_eq!(admitted(point(&[1], 0x1_07), &schema, &v), vec![0]);
 }
 
@@ -136,9 +121,7 @@ fn a_malformed_walk_is_refused() {
         &[(TypeCode::U64, false), (TypeCode::F64, true), (TypeCode::U64, true)],
         &[0],
     );
-    assert!(RangeMembership::new(&point(&[1], 0), &schema).is_err());
-    assert!(matches!(
-        RangeMembership::new(&point(&[3], 0), &schema),
-        Err(crate::ExprValidateErr::BadWalk(_))
-    ));
+    let walk = |r| RowFilter::for_read(&[], &ReadBound::Range(r), &schema).err();
+    assert!(matches!(walk(point(&[1], 0)), Some(ExprValidateErr::BadWalk(_))));
+    assert!(matches!(walk(point(&[3], 0)), Some(ExprValidateErr::BadWalk(_))));
 }

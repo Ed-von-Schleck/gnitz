@@ -3,25 +3,16 @@
 use std::cmp::Ordering;
 
 use crate::test_support::{locator_fixture as fixture, TestSchema, TestView};
-use crate::{cmp_order_keys, order_locators, ColumnLocator, OrderLocator};
+use crate::{cmp_order_keys, order_locators, ColumnLocator, OrderLocator, SchemaFacts};
 use gnitz_wire::OrderKey;
 use gnitz_wire::TypeCode;
 
 #[test]
 fn pk_locator_reads_decode_the_opk_sign_flip() {
-    let v = fixture();
-    // Trailing signed column of a compound PK — non-zero `byte_off`.
-    let signed = ColumnLocator::Pk {
-        byte_off: 4,
-        size: 8,
-        type_code: TypeCode::I64,
-    };
-    // Leading unsigned column.
-    let unsigned = ColumnLocator::Pk {
-        byte_off: 0,
-        size: 4,
-        type_code: TypeCode::U32,
-    };
+    let (schema, v) = fixture();
+    // Trailing signed column of a compound PK — non-zero `byte_off` — and the
+    // leading unsigned one.
+    let (signed, unsigned) = (schema.locate(1), schema.locate(0));
     // `bytes` is the at-rest OPK image: big-endian with the sign bit flipped, so
     // `-1` lands just below `i64::MAX` and `i64::MIN` at all-zero. Spelled as
     // literal bytes rather than through the encoder the fixture wrote with,
@@ -59,7 +50,7 @@ fn a_promoted_key_is_the_same_bytes_whichever_arm_encodes_it() {
     // One logical U32 value in a PK column and in a payload column of the same
     // row, plus a wider payload column to promote against.
     let mut v = TestView::new(3, 4);
-    assert_eq!(v.push_col(4), 0);
+    v.push_col(4);
     let vals = [0u32, 7, u32::MAX];
     for (row, &x) in vals.iter().enumerate() {
         v.set_pk_col(row, 0, &x.to_le_bytes(), TypeCode::U32);
@@ -104,40 +95,23 @@ fn a_promoted_key_is_the_same_bytes_whichever_arm_encodes_it() {
 /// a payload column its native value.
 #[test]
 fn cmp_non_null_orders_both_arms_by_logical_value() {
-    let v = fixture();
-    let pk_signed = ColumnLocator::Pk {
-        byte_off: 4,
-        size: 8,
-        type_code: TypeCode::I64,
-    };
+    let (schema, v) = fixture();
+    let pk_signed = schema.locate(1);
     // Rows carry -1, 0, i64::MIN in the trailing PK column.
     assert_eq!(pk_signed.cmp_non_null(&v, 2, &v, 0), Ordering::Less, "i64::MIN < -1");
     assert_eq!(pk_signed.cmp_non_null(&v, 0, &v, 1), Ordering::Less, "-1 < 0");
     assert_eq!(pk_signed.cmp_non_null(&v, 1, &v, 1), Ordering::Equal);
 
     // Payload slot 2 holds the row index, so it is already ascending.
-    let payload = ColumnLocator::Payload {
-        slot: 2,
-        size: 8,
-        type_code: TypeCode::U64,
-    };
+    let payload = schema.locate(4);
     assert_eq!(payload.cmp_non_null(&v, 0, &v, 2), Ordering::Less);
     assert_eq!(payload.cmp_non_null(&v, 2, &v, 0), Ordering::Greater);
 }
 
 #[test]
 fn payload_locator_reads_are_verbatim_native_le() {
-    let v = fixture();
-    let narrow = ColumnLocator::Payload {
-        slot: 0,
-        size: 4,
-        type_code: TypeCode::I32,
-    };
-    let wide = ColumnLocator::Payload {
-        slot: 1,
-        size: 16,
-        type_code: TypeCode::U128,
-    };
+    let (schema, v) = fixture();
+    let (narrow, wide) = (schema.locate(2), schema.locate(3));
     assert_eq!(narrow.bytes(&v, 1), &(-3i32).to_le_bytes()[..]);
     let mut scratch = [0u8; 16];
     assert_eq!(narrow.native_le_bytes(&v, 1, &mut scratch), &(-3i32).to_le_bytes()[..]);
@@ -148,23 +122,9 @@ fn payload_locator_reads_are_verbatim_native_le() {
 
 #[test]
 fn is_null_reads_the_addressed_slot_bit() {
-    let mut v = fixture();
+    let (schema, mut v) = fixture();
     v.set_null(1, 2);
-    let slot0 = ColumnLocator::Payload {
-        slot: 0,
-        size: 4,
-        type_code: TypeCode::I32,
-    };
-    let slot2 = ColumnLocator::Payload {
-        slot: 2,
-        size: 8,
-        type_code: TypeCode::U64,
-    };
-    let pk = ColumnLocator::Pk {
-        byte_off: 0,
-        size: 4,
-        type_code: TypeCode::U32,
-    };
+    let (pk, slot0, slot2) = (schema.locate(0), schema.locate(2), schema.locate(4));
     assert!(slot2.is_null(&v, 1));
     assert!(!slot2.is_null(&v, 0));
     assert!(!slot0.is_null(&v, 1), "a set bit at slot 2 must not read as slot 0");
@@ -193,7 +153,7 @@ fn opk_image_agrees_across_regions() {
     for t in gnitz_wire::TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
         let (type_code, w) = (*t, t.wire_stride());
         let mut v = TestView::new(PATTERNS.len(), w);
-        assert_eq!(v.push_col(w), 0);
+        v.push_col(w);
         for (row, p) in PATTERNS.iter().enumerate() {
             let native = &p.to_le_bytes()[..w];
             v.set_pk_col(row, 0, native, type_code);
@@ -270,12 +230,12 @@ fn order_locators_append_the_identity_tiebreak_in_pk_list_order() {
 #[test]
 fn null_placement_ignores_the_direction() {
     let mut v = TestView::new(3, 0);
-    let slot = v.push_col(8);
-    v.set_payload(1, slot, &5i64.to_le_bytes());
-    v.set_null(0, slot);
-    v.set_null(2, slot);
+    v.push_col(8);
+    v.set_payload(1, 0, &5i64.to_le_bytes());
+    v.set_null(0, 0);
+    v.set_null(2, 0);
     let loc = ColumnLocator::Payload {
-        slot: slot as u8,
+        slot: 0,
         size: 8,
         type_code: TypeCode::I64,
     };

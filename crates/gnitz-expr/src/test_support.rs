@@ -1,11 +1,10 @@
-//! Owned-buffer stand-ins for the engine's physical batch and schema, so the
-//! evaluator's tests run entirely inside this crate.
+//! Owned-buffer stand-ins for a physical batch and schema, so the evaluator's
+//! tests run entirely inside this crate.
 //!
-//! The engine is a binary crate: its `Batch`/`SchemaDescriptor` are unreachable
-//! from here. That is the point rather than a workaround — driving every kernel
-//! through a batch and a schema they were *not* written for is what proves the
-//! addressing paths hold for the client-side adapter that will read the same
-//! expressions, and [`TestView`] is that adapter's seed.
+//! The store's and the client's batches both live in crates that depend on this
+//! one, so neither is reachable from here — and driving every kernel through a
+//! batch and a schema they were not written for is what holds the addressing
+//! paths to the [`BatchView`] / [`ColumnTable`] contracts alone.
 
 use gnitz_wire::TypeCode;
 
@@ -25,7 +24,7 @@ pub struct TestView {
     nulls: Vec<u8>,
     cols: Vec<Vec<u8>>,
     /// The variable-length heap the 16-byte German-string cells point into.
-    pub blob: Vec<u8>,
+    blob: Vec<u8>,
 }
 
 impl TestView {
@@ -40,10 +39,40 @@ impl TestView {
         }
     }
 
+    /// `rows` rows over `schema`: one payload column per slot, sized from its
+    /// declared type, row `r`'s PK `r + 1`, nothing NULL.
+    pub fn for_schema(schema: &TestSchema, rows: usize) -> Self {
+        let mut v = TestView::new(rows, schema.pk_stride());
+        for pi in 0..schema.num_payload_cols() {
+            v.push_col(schema.locate(schema.payload_col_idx(pi)).size());
+        }
+        for row in 0..rows {
+            v.set_pk(schema, row, row as u64 + 1);
+        }
+        v
+    }
+
     /// Append a payload column whose cells are `col_size` bytes wide.
-    pub fn push_col(&mut self, col_size: usize) -> usize {
+    pub fn push_col(&mut self, col_size: usize) {
         self.cols.push(vec![0u8; self.rows * col_size]);
-        self.cols.len() - 1
+    }
+
+    /// Write `pk` into every PK column of `row`, addressed through the schema's
+    /// own locator, so a fixture cannot disagree with the addressing the kernels
+    /// use. A compound PK gets the same source value in each column, truncated to
+    /// that column's width; `pk` is a bit pattern, so a signed column reads it
+    /// two's-complement.
+    pub fn set_pk(&mut self, schema: &TestSchema, row: usize, pk: u64) {
+        for ci in 0..schema.num_columns() {
+            if let ColumnLocator::Pk { byte_off, size, type_code } = schema.locate(ci) {
+                self.set_pk_col(
+                    row,
+                    byte_off as usize,
+                    &pk.to_le_bytes()[..(size as usize).min(8)],
+                    type_code,
+                );
+            }
+        }
     }
 
     /// OPK-encode `native` (native-LE bytes of type `type_code`) into the PK
@@ -61,6 +90,13 @@ impl TestView {
         let stride = self.cols[pi].len() / self.rows;
         let base = row * stride;
         self.cols[pi][base..base + native.len()].copy_from_slice(native);
+    }
+
+    /// Store `val` little-endian into the low bytes of `row`'s cell in slot `pi`,
+    /// truncated to a narrower cell.
+    pub fn set_int(&mut self, row: usize, pi: usize, val: i64) {
+        let w = (self.cols[pi].len() / self.rows).min(8);
+        self.set_payload(row, pi, &val.to_le_bytes()[..w]);
     }
 
     /// Encode `s` into this view's blob and store the resulting 16-byte
@@ -150,62 +186,28 @@ impl ColumnTable for TestSchema {
     }
 }
 
-/// Push one payload column per `schema` payload slot, sized from its declared
-/// type, and return the widths.
-pub fn push_payload_cols(v: &mut TestView, schema: &TestSchema) -> Vec<usize> {
-    let widths: Vec<usize> = (0..schema.num_payload_cols())
-        .map(|pi| schema.locate(schema.payload_col_idx(pi)).size())
-        .collect();
-    for &w in &widths {
-        v.push_col(w);
-    }
-    widths
-}
-
-/// Write `pk` into every PK column of `row`, addressed through the schema's own
-/// locator — offset, width and type code all come from `locate`, so a fixture
-/// cannot disagree with the addressing the kernels use. A compound PK gets the
-/// same source value in each column, truncated to that column's width; `pk` is a
-/// bit pattern, so a signed column reads it two's-complement.
-pub fn set_row_pk(v: &mut TestView, schema: &TestSchema, row: usize, pk: u64) {
-    for ci in 0..schema.num_columns() {
-        if let ColumnLocator::Pk { byte_off, size, type_code } = schema.locate(ci) {
-            v.set_pk_col(
-                row,
-                byte_off as usize,
-                &pk.to_le_bytes()[..(size as usize).min(8)],
-                type_code,
-            );
-        }
-    }
-}
-
 /// Build a [`TestView`] of `(pk, null_word, payload values)` rows against
 /// `schema`: each payload column is sized from its declared type and each row's
 /// `i64` value is stored little-endian into the low bytes of its cell.
 pub fn make_int_view(schema: &TestSchema, rows: &[(u64, u64, &[i64])]) -> TestView {
-    let mut v = TestView::new(rows.len(), schema.pk_stride());
-    let widths = push_payload_cols(&mut v, schema);
+    let mut v = TestView::for_schema(schema, rows.len());
     for (row, &(pk, null_word, cols)) in rows.iter().enumerate() {
-        set_row_pk(&mut v, schema, row, pk);
+        v.set_pk(schema, row, pk);
         v.set_null_word(row, null_word);
         for (pi, &val) in cols.iter().enumerate() {
-            let w = widths[pi].min(8);
-            v.set_payload(row, pi, &val.to_le_bytes()[..w]);
+            v.set_int(row, pi, val);
         }
     }
     v
 }
 
-/// Build a [`TestView`] whose payload columns are German strings: `rows[r][c]`
-/// is row `r`'s value for payload slot `c`. PKs are `1..=n`, nothing is NULL.
-pub fn make_string_view(schema: &TestSchema, rows: &[&[&[u8]]]) -> TestView {
-    let mut v = TestView::new(rows.len(), schema.pk_stride());
-    push_payload_cols(&mut v, schema);
-    for (row, cells) in rows.iter().enumerate() {
-        set_row_pk(&mut v, schema, row, row as u64 + 1);
-        for (pi, s) in cells.iter().enumerate() {
-            v.set_string(row, pi, s);
+/// An `n`-row view over `schema`'s German-string payload columns: slot `c` of
+/// `row` holds `cell(row, c)`. PKs are `1..=n`, nothing is NULL.
+pub fn make_string_view<S: AsRef<[u8]>>(schema: &TestSchema, n: usize, cell: impl Fn(usize, usize) -> S) -> TestView {
+    let mut v = TestView::for_schema(schema, n);
+    for row in 0..n {
+        for pi in 0..schema.num_payload_cols() {
+            v.set_string(row, pi, cell(row, pi).as_ref());
         }
     }
     v
@@ -237,14 +239,12 @@ pub fn make_n_col_view(
     f: impl Fn(usize, usize) -> i64,
     null_pred: impl Fn(usize, usize) -> bool,
 ) -> TestView {
-    let mut v = TestView::new(n, schema.pk_stride());
-    let widths = push_payload_cols(&mut v, schema);
+    let mut v = TestView::for_schema(schema, n);
     for row in 0..n {
-        set_row_pk(&mut v, schema, row, row as u64 + 1);
         let mut null_word = 0u64;
-        for (col, &w) in widths.iter().enumerate() {
+        for col in 0..schema.num_payload_cols() {
             gnitz_wire::null_word_set(&mut null_word, col, null_pred(row, col));
-            v.set_payload(row, col, &f(row, col).to_le_bytes()[..w.min(8)]);
+            v.set_int(row, col, f(row, col));
         }
         v.set_null_word(row, null_word);
     }
@@ -279,19 +279,6 @@ pub fn filter_prog(
     LogicalProgram::new(instrs, vec![Sink::Reg(result_reg)], const_strings)
         .resolve_filter(schema)
         .expect("test predicate must validate")
-}
-
-/// One predicate resolved as a filter and as a scalar.
-pub fn filter_and_scalar(
-    schema: &TestSchema,
-    instrs: Vec<LogicalInstr>,
-    result_reg: Reg,
-    const_strings: Vec<Vec<u8>>,
-) -> (RowFilter, ScalarEval) {
-    (
-        filter_prog(schema, instrs.clone(), result_reg, const_strings.clone()),
-        scalar_prog(schema, instrs, result_reg, const_strings),
-    )
 }
 
 /// Build and resolve a map program, checked against both the schema it reads
@@ -334,11 +321,16 @@ pub fn passing_rows(ev: &mut RowFilter, mb: &TestView) -> Vec<bool> {
     passed
 }
 
-/// The runs `ev` reports, verbatim. For tests whose subject is the range
-/// stitching itself rather than which rows pass.
+/// The runs `ev` reports, verbatim, each checked to be a non-empty run inside
+/// the batch. The buffer is seeded with a stale entry, so a `ranges` that
+/// appended rather than cleared fails here.
 pub fn passing_ranges(ev: &mut RowFilter, mb: &TestView) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
+    let mut ranges = vec![(usize::MAX, usize::MAX)];
     ev.ranges(mb, &mut ranges);
+    let n = mb.row_count();
+    for &(s, e) in &ranges {
+        assert!(s < e && e <= n, "run ({s}, {e}) is not a non-empty run of 0..{n}");
+    }
     ranges
 }
 
@@ -382,12 +374,19 @@ impl MapTarget for TestOut {
 }
 
 /// A three-row view with a compound `(U32, I64)` PK and payload slots
-/// `0: I32`, `1: U128`, `2: U64`.
-pub fn locator_fixture() -> TestView {
-    let mut v = TestView::new(3, 12);
-    assert_eq!(v.push_col(4), 0);
-    assert_eq!(v.push_col(16), 1);
-    assert_eq!(v.push_col(8), 2);
+/// `0: I32`, `1: U128`, `2: U64`, and its schema.
+pub fn locator_fixture() -> (TestSchema, TestView) {
+    let schema = TestSchema::new(
+        &[
+            (TypeCode::U32, false),
+            (TypeCode::I64, false),
+            (TypeCode::I32, true),
+            (TypeCode::U128, true),
+            (TypeCode::U64, true),
+        ],
+        &[0, 1],
+    );
+    let mut v = TestView::for_schema(&schema, 3);
     for (row, (a, b)) in [(7u32, -1i64), (0, 0), (u32::MAX, i64::MIN)].into_iter().enumerate() {
         v.set_pk_col(row, 0, &a.to_le_bytes(), TypeCode::U32);
         v.set_pk_col(row, 4, &b.to_le_bytes(), TypeCode::I64);
@@ -395,7 +394,7 @@ pub fn locator_fixture() -> TestView {
         v.set_payload(row, 1, &(1u128 << 100).to_le_bytes());
         v.set_payload(row, 2, &(row as u64).to_le_bytes());
     }
-    v
+    (schema, v)
 }
 
 /// `IS NULL` / `IS NOT NULL` over column `col`. The two read one null-bitmap bit

@@ -8,9 +8,8 @@ use gnitz_wire::ReadBound;
 
 use crate::batch::{eval_batch, scan_filter_bits, with_str_bufs, EvalScratch, MorselOut, MORSEL};
 use crate::program::{ColCopy, MapSinks, ReadAs};
-use crate::{
-    BatchView, ExprValidateErr, LogicalProgram, MapTarget, RangeMembership, ResolvedProgram, SchemaFacts, Sink,
-};
+use crate::range::RangeMembership;
+use crate::{BatchView, ExprValidateErr, LogicalProgram, MapTarget, ResolvedProgram, SchemaFacts, Sink};
 
 /// One program's result for every row of a batch, in the shape its result
 /// register's class fixes.
@@ -379,13 +378,6 @@ impl Resolved for MapEval {
     }
     fn into_prog(self) -> ResolvedProgram {
         self.ev.prog
-    }
-}
-
-#[cfg(test)]
-impl MapEval {
-    pub(crate) fn sinks(&self) -> &MapSinks {
-        &self.sinks
     }
 }
 

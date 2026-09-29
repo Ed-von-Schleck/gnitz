@@ -1,4 +1,4 @@
-use gnitz_expr::{ExprValidateErr, LogicalProgram, Reg, Sink};
+use gnitz_expr::{LogicalProgram, Reg, Sink};
 
 use super::{MapPlan, PkSource};
 use crate::ops::reindex::FoldCols;
@@ -266,60 +266,6 @@ fn test_map_copy_col_widens_into_promoted_slot() {
     assert_eq!(widened(1), c1 as i64, "I16 PK sign-extends");
     assert_eq!(widened(2), c2 as i64, "I8 payload sign-extends");
     assert_eq!(widened(3), c3 as i64, "U8 payload zero-extends");
-}
-
-/// An instruction-free program writes output slots — the shape every `copy_cols`
-/// map has, so `validate` cannot reject it outright. The filter role reads a
-/// result register back, so it rejects rather than letting the program pass as a
-/// filter matching nothing (which a client would read as an empty table).
-#[test]
-fn test_register_free_predicate_is_rejected() {
-    let schema = make_schema(0, &[TypeCode::U64, TypeCode::I64]);
-    let prog = LogicalProgram::copy_cols(&[]);
-    assert_eq!(
-        prog.resolve_filter(&schema).err(),
-        Some(ExprValidateErr::OutputRoleMismatch)
-    );
-    // The same shape is legitimate as a map: `copy_cols` builds it.
-    assert!(MapPlan::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema, PkSource::Inherit).is_ok());
-}
-
-/// The predicate wiring over a real `Batch`, including the range coalescing
-/// that turns per-row verdicts into the `(start, end)` list every consumer reads.
-#[test]
-fn test_from_predicate_filter_ranges_over_a_batch() {
-    use gnitz_expr::{CmpOp, LogicalInstr};
-
-    let schema = make_schema(0, &[TypeCode::U64, TypeCode::I64]);
-    // Rows 1..=6 with col1 = 5, 20, 30, 0, 40, 50 → `col1 > 15` keeps
-    // {1, 2} and {4, 5}: two runs, so a PK-only or per-row answer would differ.
-    let rows: Vec<(u64, i64, u64, &[i64])> = vec![
-        (1, 1, 0, &[5]),
-        (2, 1, 0, &[20]),
-        (3, 1, 0, &[30]),
-        (4, 1, 0, &[0]),
-        (5, 1, 0, &[40]),
-        (6, 1, 0, &[50]),
-    ];
-    let batch = make_int_batch(&schema, &rows);
-
-    let instrs = vec![
-        LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::LoadConst { val: 15, unsigned: false },
-        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
-    ];
-    let mut func = LogicalProgram::new(instrs, vec![Sink::Reg(Reg(2))], vec![])
-        .resolve_filter(&schema)
-        .unwrap();
-
-    let mut ranges = Vec::new();
-    func.ranges(&batch.as_mem_batch(), &mut ranges);
-    assert_eq!(ranges, vec![(1, 3), (4, 6)]);
-
-    // `out` is cleared, not appended to, so a reused buffer cannot leak a
-    // previous chunk's ranges into this one.
-    func.ranges(&batch.as_mem_batch(), &mut ranges);
-    assert_eq!(ranges, vec![(1, 3), (4, 6)]);
 }
 
 /// A batch of `(pk, string cells)` rows: one STRING payload column per entry
