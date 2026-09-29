@@ -27,7 +27,7 @@ pub fn op_filter(batch: &Batch, pred: &mut RowFilter) -> Option<Batch> {
     if ranges == [(0, batch.count)] {
         return None;
     }
-    Some(Batch::from_ranges(batch, &ranges, batch.schema(), 0))
+    Some(Batch::from_ranges(batch, &ranges, 0))
 }
 
 /// `a`'s schema with each column's nullability OR-ed with `b`'s: a NULL and a
@@ -82,13 +82,12 @@ pub fn op_union(batch_a: Batch, batch_b: &Batch, out_schema: &SchemaDescriptor) 
         // O(1) pass-through: no allocation, the layout claim preserved.
         return batch_a;
     }
-    if batch_a.consolidated_verified(out_schema) && batch_b.consolidated_verified(out_schema) {
+    if batch_a.consolidated_verified() && batch_b.consolidated_verified() {
         return batch_a.merged_consolidated(batch_b, out_schema);
     }
     let mut output = batch_a;
-    output.append_batch(batch_b, 0, batch_b.count);
-    // Physically identical to both inputs', so `output`'s strides still hold.
     output.set_schema(out_schema);
+    output.append_batch(batch_b);
     output
 }
 

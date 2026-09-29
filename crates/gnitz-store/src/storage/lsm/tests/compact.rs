@@ -1062,7 +1062,7 @@ mod skeleton_tests {
     fn write_shard(path: &std::path::Path, rows: &[(u64, i64, i64)], schema: &SchemaDescriptor) -> String {
         let shard_path = path.to_str().unwrap().to_owned();
         crate::test_support::make_batch_raw(schema, rows)
-            .into_consolidated(schema)
+            .into_consolidated()
             .write_as_shard(&shard_path, ShardWriteOpts::default())
             .unwrap();
         shard_path

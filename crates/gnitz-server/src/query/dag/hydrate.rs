@@ -26,7 +26,7 @@ impl SkeletonHydrator for DagEngine {
         let mut out = Batch::empty_with_schema(&view_schema);
         while let Some(seed) = gather.drain_chunk(registry.scan_chunk_rows()) {
             let produced = vm::replay_chunk(vm, state, hydration.entry, seed)?;
-            out.append_above(produced.into_consolidated(&view_schema));
+            out.append_above(produced.into_consolidated());
         }
         Ok(out)
     }

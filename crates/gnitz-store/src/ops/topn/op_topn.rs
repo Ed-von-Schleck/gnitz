@@ -68,7 +68,7 @@ pub fn op_topn(delta: &Batch, trace_out: &mut ReadCursor, history: &mut ReadCurs
         }
     }
 
-    let out = out.into_consolidated(output_schema);
+    let out = out.into_consolidated();
     gnitz_debug!("op_topn: in={} groups={} out={}", n, runs.len(), out.count);
     out
 }

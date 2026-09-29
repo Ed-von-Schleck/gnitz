@@ -78,7 +78,7 @@ fn seed_inputs(vm: &mut Vm, inputs: impl IntoIterator<Item = (DeltaReg, Batch)>)
 fn fold_written(batches: &mut [Batch], regs: &[Reg], reg: DeltaReg) {
     let written = &regs[reg.at()];
     if written.fold {
-        batches[reg.at()].consolidate_in_place(&written.schema);
+        batches[reg.at()].consolidate_in_place();
     }
 }
 

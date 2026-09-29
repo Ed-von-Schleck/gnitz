@@ -243,7 +243,7 @@ proptest! {
 
         // Physical retraction: ingest the same rows negated into the memtable.
         let mut neg = Batch::with_capacity(&schema, half.max(1));
-        neg.append_batch(&original, 0, half);
+        neg.append_ranges(&original.as_mem_batch(), &[(0, half)]);
         table.ingest_owned_batch(neg.negated()).unwrap();
 
         for i in 0..half {
@@ -279,7 +279,7 @@ proptest! {
             let start = k * rows / WAVES;
             let end = (k + 1) * rows / WAVES;
             let mut wave = Batch::with_capacity(&schema, end - start);
-            wave.append_batch(&original, start, end);
+            wave.append_ranges(&original.as_mem_batch(), &[(start, end)]);
             table.ingest_owned_batch(wave).unwrap();
             table.flush().unwrap();
         }

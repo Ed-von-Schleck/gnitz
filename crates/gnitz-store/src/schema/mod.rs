@@ -776,9 +776,30 @@ pub fn encode_schema_block(schema: &SchemaDescriptor) -> Vec<u8> {
 /// schema's PK. Named so its width is read off the column rather than written as
 /// a literal at each offset.
 pub(crate) const DELTA_TICK_COL: SchemaColumn = SchemaColumn::new(TypeCode::U64, false);
-// `stamped_with_pk_prefix` writes the stamp as a `u64`'s big-endian image, which
-// is this column's OPK image only at this width.
+// A `u64`'s big-endian image is this column's OPK image only at this width.
 const _: () = assert!(DELTA_TICK_COL.size() as usize == 8);
+
+/// The prefix every delta key recorded in `round` starts with.
+pub(crate) fn delta_round_prefix(round: u64) -> [u8; 8] {
+    round.to_be_bytes()
+}
+
+/// Write the delta key of a view row keyed `view_key`, recorded in `round`.
+pub(crate) fn write_delta_key(round: u64, view_key: &[u8], delta_key: &mut [u8]) {
+    let (tick, key) = delta_key.split_at_mut(DELTA_TICK_COL.size() as usize);
+    tick.copy_from_slice(&delta_round_prefix(round));
+    key.copy_from_slice(view_key);
+}
+
+/// The round a delta key was recorded in.
+pub(crate) fn delta_round(delta_key: &[u8]) -> u64 {
+    u64::from_be_bytes(delta_key[..8].try_into().expect("a delta key leads with its round"))
+}
+
+/// The view key inside a delta key.
+pub(crate) fn delta_view_key(delta_key: &[u8]) -> &[u8] {
+    &delta_key[DELTA_TICK_COL.size() as usize..]
+}
 
 /// The delta store's schema for a fed view: a `_tick` U64 key column, then the
 /// view's PK, then its payload, so the view's payload space is the delta's.

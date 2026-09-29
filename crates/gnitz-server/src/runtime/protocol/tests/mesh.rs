@@ -48,7 +48,7 @@ fn partition(w: usize, round: u64) -> Batch {
 /// every sender's partition summed, or with no spec all of it.
 fn expected_of(parts: &[Batch], spec: Option<&ScatterPlan>, r: usize) -> Batch {
     let schema = *parts[0].schema();
-    let summed = Batch::concat(&schema, parts.iter().map(Batch::as_mem_batch)).into_consolidated(&schema);
+    let summed = Batch::concat(&schema, parts.iter().map(Batch::as_mem_batch)).into_consolidated();
     match spec {
         None => summed,
         Some(spec) => {
@@ -165,16 +165,11 @@ fn a_round_into_a_non_folding_register_concatenates() {
     for (w, m) in mesh.iter_mut().enumerate() {
         m.publish(9, false, &partition(w, 0), Some(&pk), false);
     }
-    let schema = make_schema_u64_i64();
     for m in mesh.iter_mut() {
         let r = m.rank;
         let (got, _) = m.advance(None).expect("a round that fits one part");
         assert_eq!(got.layout(), Layout::Raw, "worker {r}");
-        assert_eq!(
-            rows(&got.into_consolidated(&schema)),
-            expected(Some(&pk), 0, r),
-            "worker {r}"
-        );
+        assert_eq!(rows(&got.into_consolidated()), expected(Some(&pk), 0, r), "worker {r}");
     }
 }
 
@@ -357,7 +352,7 @@ fn a_heap_heavy_round_is_sized_by_its_relocated_heap() {
     );
     for (r, (got, _)) in got.into_iter().enumerate() {
         assert_eq!(got.layout(), Layout::Raw, "receiver {r}: a raw sender's rows stay raw");
-        let got = got.into_consolidated(&schema);
+        let got = got.into_consolidated();
         assert_eq!(string_rows(&got), want[r], "receiver {r}");
         assert!(
             want[r].iter().all(|&(_, w, _)| w == 3),

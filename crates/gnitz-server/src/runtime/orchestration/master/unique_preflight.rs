@@ -14,7 +14,6 @@ use super::unique_filter::UNIQUE_FILTER_CAP;
 use crate::runtime::reactor::TrainFrame;
 use gnitz_store::relation::Relation;
 use gnitz_store::schema::key::PkBuf;
-use gnitz_store::storage::MAX_BATCH_REGIONS;
 
 /// One worker's sorted spans in `merge_index_scan`: the frame being read, which
 /// pins its ring bytes, and the byte range of its unread keys inside them.
@@ -42,8 +41,8 @@ impl PreflightKeyStream<'_> {
             let Some(f) = self.lease.next_of(self.w).await? else {
                 return Ok(None);
             };
-            let mut offsets = [0usize; MAX_BATCH_REGIONS];
-            let mb = f.rows(frame_schema, &mut offsets);
+            let block = f.rows(frame_schema);
+            let mb = block.view();
             let start = mb.pk().as_ptr() as usize - f.slot.bytes().as_ptr() as usize;
             self.keys = start..start + mb.len() * stride;
             self.frame = Some(f);

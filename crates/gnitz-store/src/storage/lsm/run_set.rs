@@ -75,10 +75,7 @@ impl RunSet {
     /// Append a consolidated run, folding the set when it gets crowded. Empty
     /// runs are never stored, so `is_empty()` is exactly "no rows".
     pub(crate) fn push(&mut self, TrimmedRun(run): TrimmedRun, schema: &SchemaDescriptor) {
-        debug_assert!(
-            run.consolidated_verified(schema),
-            "RunSet::push requires a consolidated run",
-        );
+        debug_assert!(run.consolidated_verified(), "RunSet::push requires a consolidated run",);
         if run.count == 0 {
             return;
         }
@@ -167,7 +164,7 @@ impl RunSet {
             if run.num_payload_cols() < npc {
                 let widened = run.widened_with_nulls(schema, false);
                 debug_assert!(
-                    widened.consolidated_verified(schema),
+                    widened.consolidated_verified(),
                     "widen_runs: the widened run must still be consolidated",
                 );
                 *run = TrimmedRun::new(widened).0;

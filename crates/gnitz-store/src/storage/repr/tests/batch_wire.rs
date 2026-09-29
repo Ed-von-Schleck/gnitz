@@ -85,10 +85,7 @@ fn a_foreign_decode_refuses_a_non_zero_cell_under_a_null() {
 fn decode_from_wal_block_rejects_header_forgeries() {
     let schema = pk_payload_schema(&[TypeCode::U64]);
     let clean = encode_to_wire_vec(&make_batch_raw(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]));
-    let decode = |buf: &[u8]| {
-        let mut offsets = [0usize; MAX_BATCH_REGIONS];
-        decode_mem_batch_from_wal_block(buf, &schema, &mut offsets).err()
-    };
+    let decode = |buf: &[u8]| WalBlock::parse(buf, &schema).err();
     let mismatch = Some("block size does not match its rows and heap");
     for (off, forged) in [
         (wal::WAL_OFF_ROWS, 0),
@@ -149,13 +146,12 @@ fn wal_block_bench() {
         }
         let batch = b.finish();
         let mut buf = vec![0u8; batch.wire_byte_size()];
-        let mut offsets = [0usize; MAX_BATCH_REGIONS];
 
         let t = Instant::now();
         for _ in 0..ITERS {
             let n = black_box(&batch).encode_to_wire(black_box(&mut buf));
-            let mb = decode_mem_batch_from_wal_block(black_box(&buf[..n]), &schema, &mut offsets).unwrap();
-            black_box(mb.count);
+            let block = WalBlock::parse(black_box(&buf[..n]), &schema).unwrap();
+            black_box(block.view().count);
         }
         println!(
             "wal block {rows} rows: encode + decode {:.1} ns",
@@ -166,11 +162,11 @@ fn wal_block_bench() {
 
 /// Rows the chunker takes from `start` under `budget`.
 fn chunk_rows(b: &Batch, start: usize, overhead: usize, budget: usize) -> usize {
-    b.wire_chunk_within(start, overhead, budget).0.rows()
+    b.wire_frame_within(start, overhead, budget).rows()
 }
 
 // ---------------------------------------------------------------------------
-// Reply chunking: wire_chunk_within
+// Reply chunking: wire_frame_within
 // ---------------------------------------------------------------------------
 
 /// A U64 PK with one STRING payload column, and `(pk, value)` rows at weight 1
@@ -186,37 +182,31 @@ fn string_rows(rows: &[(u64, &str)]) -> (SchemaDescriptor, Batch) {
     (schema, b.finish())
 }
 
-/// A strict subrange of a heap-bearing batch ships a heap holding only the spans
-/// its own rows reference, keeps every cell's content, and keeps the source's
-/// layout claim — which is what the frame encoder stamps into the wire flags.
+/// A frame inside a heap-bearing batch encodes its rows' spans and no others,
+/// in exactly the bytes it was sized at.
 #[test]
-fn a_compacted_subrange_carries_only_its_spans_and_the_layout() {
-    let (_schema, mut src) = string_rows(&[
+fn a_frame_carries_only_its_spans() {
+    let (schema, src) = string_rows(&[
         (1, "the first long value"),
         (2, "the second long value"),
         (3, "the third long value"),
         (4, "the fourth long value"),
     ]);
-    src.certify_layout(super::super::batch::Layout::Consolidated);
+    let budget = src.wire_byte_size_range(2) + "the second long value".len() + "the third long value".len();
+    let frame = src.wire_frame_within(1, 0, budget);
+    assert_eq!((frame.rows(), src.wire_frame_size(&frame)), (2, budget));
 
-    let chunk = src.compacted(1..3);
+    let mut buf = vec![0u8; src.wire_byte_size()];
+    let n = src.encode_frame(&frame, &mut buf);
+    assert_eq!(n, budget);
+    let chunk = Batch::decode_foreign_wal_block(&buf[..n], &schema).unwrap();
     assert_eq!(chunk.len(), 2);
-    assert!(
-        chunk.blob.len() < src.blob.len(),
-        "a 2-of-4 subrange must carry only its own spans ({} vs {})",
-        chunk.blob.len(),
-        src.blob.len()
-    );
+    assert_eq!(chunk.blob.len(), budget - src.wire_byte_size_range(2));
     for (i, want) in [(0usize, "the second long value"), (1, "the third long value")] {
         assert_eq!(gnitz_expr::payload_string(&chunk, i, 0), want);
         assert_eq!(chunk.get_pk(i), (i + 2) as u128);
         assert_eq!(chunk.get_weight(i), 1);
     }
-    assert_eq!(
-        chunk.layout(),
-        src.layout(),
-        "a contiguous subrange of an ordered, ghost-free batch is both"
-    );
 }
 
 /// Rows pointing at ONE source span cost that span once — the shape a join's
@@ -224,13 +214,15 @@ fn a_compacted_subrange_carries_only_its_spans_and_the_layout() {
 /// points every output row at it. Counting per row instead would size each frame
 /// as if every row carried a private copy, and emit far too many frames.
 #[test]
-fn wire_chunk_within_counts_a_shared_span_once() {
+fn wire_frame_within_counts_a_shared_span_once() {
     const N: usize = 20;
     let (schema, one) = string_rows(&[(1, &"v".repeat(200))]);
-    // One append session, so its blob cache dedups the repeated range: every
-    // row of `shared` points at the same span of `shared`'s own heap.
+    // One relocating append session, so its blob cache dedups the repeated
+    // range: every row of `shared` points at the same span of its own heap.
     let mut shared = Batch::with_capacity(&schema, N);
-    shared.append_ranges(&one.as_mem_batch(), &[(0, 1); N]);
+    shared
+        .append_session(N)
+        .push_ranges(&one.as_mem_batch(), None, &[(0, 1); N]);
 
     let distinct_rows: Vec<(u64, String)> = (0..N as u64).map(|i| (i, format!("{i:-<200}"))).collect();
     let (_, distinct) = string_rows(&distinct_rows.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>());
@@ -249,7 +241,7 @@ fn wire_chunk_within_counts_a_shared_span_once() {
 /// empty heap and inverts exactly, and one long row puts the rest on the
 /// forward walk.
 #[test]
-fn wire_chunk_within_does_not_collapse_on_short_strings() {
+fn wire_frame_within_does_not_collapse_on_short_strings() {
     let short_rows: Vec<(u64, &str)> = (0..30u64).map(|i| (i, "abcdefghijkl")).collect();
     let (_, all_short) = string_rows(&short_rows);
     assert!(all_short.blob.is_empty(), "12-byte values stay inline");
@@ -268,21 +260,16 @@ fn wire_chunk_within_does_not_collapse_on_short_strings() {
         "the short rows past the long one cost their fixed width and nothing more"
     );
 
-    // An empty heap is framed off the source; a live one relocates.
-    assert!(matches!(
-        all_short.wire_chunk_within(0, 0, budget).0,
-        super::WireChunk::Range { .. }
-    ));
-    assert!(matches!(
-        mixed.wire_chunk_within(1, 0, budget).0,
-        super::WireChunk::Owned(_)
-    ));
+    for (b, start) in [(&all_short, 0), (&mixed, 1)] {
+        let frame = b.wire_frame_within(start, 0, budget);
+        assert_eq!(b.wire_frame_size(&frame), b.wire_byte_size_range(10), "no heap byte");
+    }
 }
 
 /// A row too wide for the budget still ships: the chunk carries it alone rather
 /// than coming back empty, and the caller sizes what it got.
 #[test]
-fn wire_chunk_within_never_returns_an_empty_chunk() {
+fn wire_frame_within_never_returns_an_empty_frame() {
     let (_, batch) = string_rows(&[(1, &"w".repeat(4096)), (2, &"w".repeat(4096))]);
     assert_eq!(chunk_rows(&batch, 0, 0, 64), 1);
 }
@@ -401,9 +388,8 @@ fn a_block_declaring_more_dead_than_heap_is_refused() {
     let b = make_batch_bytes(&schema, &[(1, 1, &[b'a'; 20])]);
     let mut block = encode_to_wire_vec(&b);
     gnitz_wire::write_u32_le(&mut block, wal::WAL_OFF_HEAP_DEAD, b.blob.len() as u32 + 1);
-    let mut offsets = [0usize; MAX_BATCH_REGIONS];
     assert_eq!(
-        decode_mem_batch_from_wal_block(&block, &schema, &mut offsets).err(),
+        WalBlock::parse(&block, &schema).err(),
         Some("block declares more dead heap than heap")
     );
 }
@@ -559,4 +545,56 @@ fn foreign_decode_string_bench() {
         "foreign_decode_string_bench shape={shape} passes={passes} acc={}",
         std::hint::black_box(acc)
     );
+}
+
+/// Retired instructions to drain a 10⁵-row batch frame by frame at a 64 KiB
+/// budget, each frame sized by `wire_frame_within` and then encoded. Two shapes:
+/// every row a long 40-byte string, and a wide fixed row whose string is short
+/// on all but one row in 64.
+/// `#[ignore]`; run release:
+///   cargo test -p gnitz-store --release reply_chunk_strings_bench -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn reply_chunk_strings_bench() {
+    use crate::schema::SchemaColumn;
+    const N: usize = 100_000;
+    const BUDGET: usize = 64 << 10;
+
+    let values: Vec<(u64, String)> = (0..N as u64).map(|i| (i, format!("{i:040}"))).collect();
+    let (_, long) = string_rows(&values.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>());
+
+    let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
+    cols.extend([SchemaColumn::new(TypeCode::I64, false); 6]);
+    cols.push(SchemaColumn::new(TypeCode::String, false));
+    let wide_schema = SchemaDescriptor::new(&cols, &[0]);
+    let mut b = super::super::batch_builder::BatchBuilder::new(wide_schema);
+    for i in 0..N as u64 {
+        b.begin_row(i as u128, 1);
+        for c in 0..6u64 {
+            b.put_int(i.wrapping_mul(2_654_435_761 + c) as u128);
+        }
+        match i % 64 {
+            0 => b.put_string(&format!("{i:040}")),
+            _ => b.put_string(&format!("s{}", i % 1000)),
+        }
+        b.end_row();
+    }
+    let wide = b.finish();
+
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let mut buf = vec![0u8; 2 * BUDGET];
+    for (name, batch) in [("long", &long), ("wide_short", &wide)] {
+        let ((frames, bytes), instructions) = counter.measure(|| {
+            let (mut start, mut frames, mut bytes) = (0, 0, 0);
+            while start < batch.len() {
+                let frame = batch.wire_frame_within(start, 0, BUDGET);
+                bytes += batch.encode_frame(&frame, &mut buf);
+                start = frame.end();
+                frames += 1;
+            }
+            (frames, bytes)
+        });
+        std::hint::black_box(&buf);
+        println!("reply_chunk_strings_bench {name}: {instructions} instr, {frames} frames, {bytes} bytes");
+    }
 }

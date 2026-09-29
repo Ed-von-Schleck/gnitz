@@ -45,7 +45,7 @@ pub(crate) fn enforce_unique_pk(store: &Table, mut batch: Batch) -> Batch {
         return batch;
     }
     let kept = complement(dropped, batch.count);
-    let mut effective = Batch::from_ranges(&batch, &kept, schema, stored.len());
+    let mut effective = Batch::from_ranges(&batch, &kept, stored.len());
     if !stored.is_empty() {
         let mut sink = effective.append_session(stored.len());
         for s in &stored {

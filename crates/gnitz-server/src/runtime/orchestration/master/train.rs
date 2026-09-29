@@ -4,7 +4,7 @@
 use super::*;
 
 use crate::runtime::peer::Peer;
-use gnitz_store::storage::{MemBatch, MAX_BATCH_REGIONS};
+use gnitz_store::storage::MemBatch;
 
 /// Hand `on_batch` the rows of every frame of `lease`, workers in ascending order,
 /// each decoded against `expected`.
@@ -14,8 +14,7 @@ pub(super) async fn drain_rows(
     mut on_batch: impl FnMut(&MemBatch<'_>) -> Result<(), WireFault>,
 ) -> Result<(), WireFault> {
     while let Some(f) = lease.next().await? {
-        let mut offsets = [0usize; MAX_BATCH_REGIONS];
-        on_batch(&f.rows(expected, &mut offsets))?;
+        on_batch(&f.rows(expected).view())?;
     }
     Ok(())
 }

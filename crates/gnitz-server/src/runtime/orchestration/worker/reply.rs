@@ -110,18 +110,16 @@ fn send_train_frame(
     if start == 0 && emit_whole_if_fits(w2m, route, batch, budget, ends_train) {
         return Ok(batch.len());
     }
-    let (chunk, size) = batch.wire_chunk_within(start, reply_frame(route, false).size(), budget);
-    if size > gnitz_wire::MAX_FRAME_PAYLOAD {
-        return Err(crate::runtime::wire::oversized_frame_message(size).into());
+    let frame = batch.wire_frame_within(start, reply_frame(route, false).size(), budget);
+    let end = frame.end();
+    let msg = WireMsg {
+        data: WireData::Frame { batch, frame },
+        ..reply_frame(route, ends_train && end == batch.len())
+    };
+    if msg.size() > gnitz_wire::MAX_FRAME_PAYLOAD {
+        return Err(crate::runtime::wire::oversized_frame_message(msg.size()).into());
     }
-    let end = start + chunk.rows();
-    w2m.send_msg(
-        route.request_id,
-        &WireMsg {
-            data: WireData::of_chunk(batch, start, &chunk),
-            ..reply_frame(route, ends_train && end == batch.len())
-        },
-    );
+    w2m.send_msg(route.request_id, &msg);
     Ok(end)
 }
 

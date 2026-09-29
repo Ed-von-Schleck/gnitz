@@ -12,8 +12,8 @@ use super::SkeletonHydrator;
 use crate::ops::AdhocFold;
 use crate::ops::MapPlan;
 use crate::relation::RelationRegistry;
-use crate::schema::key::{key_range_between_cuts, leading_u64, KeyCut};
-use crate::schema::SchemaDescriptor;
+use crate::schema::key::{key_range_between_cuts, KeyCut};
+use crate::schema::{delta_round, delta_round_prefix, delta_view_key, SchemaDescriptor};
 use crate::storage::Batch;
 use gnitz_expr::{cmp_order_keys, order_locators, OrderLocator, RowFilter};
 
@@ -113,8 +113,7 @@ impl RelationRegistry {
         let feed = entry
             .delta()
             .ok_or_else(|| format!("delta_read: this process holds no delta store for relation {id}"))?;
-        // `_tick` leads the delta PK.
-        let dropped_through = leading_u64(feed.dropped_max().pk_bytes());
+        let dropped_through = delta_round(feed.dropped_max().pk_bytes());
         if delta_cursor_expired(after_tick, dropped_through) {
             return Err(WireFault {
                 status: WireStatus::DeltaExpired,
@@ -125,11 +124,14 @@ impl RelationRegistry {
             });
         }
         let band = key_range_between_cuts(
-            KeyCut::above(&after_tick.to_be_bytes()),
-            KeyCut::above(&cut_tick.to_be_bytes()),
+            KeyCut::above(&delta_round_prefix(after_tick)),
+            KeyCut::above(&delta_round_prefix(cut_tick)),
             feed.schema().pk_stride(),
         );
-        Ok(Rc::new(feed.range_cursor(band).materialize().unstamped(&view)))
+        let rows = feed.range_cursor(band).materialize();
+        Ok(Rc::new(
+            rows.rekeyed(&view, |src, dst| dst.copy_from_slice(delta_view_key(src))),
+        ))
     }
 }
 
@@ -351,10 +353,7 @@ fn topk_keep(keeper: Batch, order: &[OrderLocator], window: i64) -> (Batch, i64)
             .map_or(perm.len(), |i| i + 1);
         perm.truncate(cut);
     }
-    (
-        Batch::from_indexed_rows(&keeper.as_mem_batch(), &perm, keeper.schema()),
-        acc,
-    )
+    (keeper.indexed_rows(&perm), acc)
 }
 
 #[cfg(test)]

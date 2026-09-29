@@ -13,7 +13,7 @@ use super::batch::{
 };
 use super::batch_pool::acquire_uninit;
 use super::layout::*;
-use super::merge::{carried_dead, prorated_blob_cap, row_long_bytes, ColPtr, ColumnarSource, UnifiedSource};
+use super::merge::{carried_dead, long_bytes_outside, prorated_blob_cap, ColPtr, ColumnarSource, UnifiedSource};
 use super::scatter::DecodedColumns;
 use super::shard_filter;
 use crate::schema::{SchemaDescriptor, SchemaFacts};
@@ -283,9 +283,7 @@ impl MappedShard {
     pub(crate) fn slice_to_owned_batch(&self, start: usize, row_count: usize) -> Batch {
         let n = self.header.row_count;
         let carried = carried_dead(self.blob().len(), 0, n, row_count, || {
-            let mask = self.schema.string_payload_slots();
-            let outside = (0..start).chain(start + row_count..n);
-            outside.map(|row| row_long_bytes(self, mask, row)).sum()
+            long_bytes_outside(self, self.schema.string_payload_slots(), &[(start, start + row_count)])
         });
         self.slice_to_owned_batch_with(start, row_count, carried)
     }
@@ -350,7 +348,7 @@ impl MappedShard {
                 };
                 if relocate && col.type_code.is_german_string() {
                     for i in 0..row_count {
-                        w.write_string_cell(pi, unsafe { cp.row(start + i, 16) }, blob, i);
+                        w.write_string_cell(pi, unsafe { cp.row(start + i, 16) }, blob, None, i);
                     }
                 } else {
                     copy_rows(cp, col.size() as usize, w.col_bufs[pi]);

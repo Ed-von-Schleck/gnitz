@@ -2,7 +2,7 @@ use crate::runtime::wire::{decode_sal_slot, WireData, WireMsg};
 use crate::test_support::{make_batch, make_batch_raw, u64_pk_schema};
 use gnitz_expr::ColumnTable;
 use gnitz_store::schema::{encode_schema_block, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, BatchBuilder, Layout, WireChunk};
+use gnitz_store::storage::{Batch, BatchBuilder, Layout};
 use gnitz_wire::control::CTRL_HEADER_SIZE;
 use gnitz_wire::try_decode_german_string;
 use gnitz_wire::TypeCode;
@@ -275,24 +275,19 @@ fn a_range_chunk_frames_identically_to_the_same_rows_whole() {
     let blk = encode_schema_block(&sd);
 
     // A budget sized for exactly three rows of this schema.
-    let (chunk, _) = batch.wire_chunk_within(2, 0, make_blobless_batch(3).wire_byte_size());
-    assert_eq!(chunk.rows(), 3);
-    assert!(
-        matches!(chunk, WireChunk::Range { .. }),
-        "a blobless batch is framed off the source, with no sub-batch built"
-    );
+    let frame = batch.wire_frame_within(2, 0, make_blobless_batch(3).wire_byte_size());
+    assert_eq!(frame.rows(), 3);
 
     let msg = WireMsg {
         target_id: 1,
         schema_block: Some(&blk),
-        data: WireData::of_chunk(&batch, 2, &chunk),
+        data: WireData::Frame { batch: &batch, frame },
         ..Default::default()
     };
     let buf = msg.encode_to_vec();
 
     // The same rows as a batch of their own, framed the long way round.
-    let mut owned = Batch::with_capacity(&sd, 3);
-    owned.append_batch(&batch, 2, 5);
+    let owned = batch.ascending_subset(&[2, 3, 4]);
     let whole = WireMsg {
         target_id: 1,
         schema_block: Some(&blk),

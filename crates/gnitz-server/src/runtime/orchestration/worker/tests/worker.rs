@@ -423,13 +423,9 @@ fn fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
         assert!(ctrl.hdr.flags.scan_last);
         assert!(ctrl.hdr.flags.continuation);
 
-        let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-        let b = gnitz_store::storage::decode_mem_batch_from_wal_block(
-            &data[ctrl.data.clone().expect("data block")],
-            &schema,
-            &mut offsets,
-        )
-        .expect("decode with schema hint");
+        let block = gnitz_store::storage::WalBlock::parse(&data[ctrl.data.clone().expect("data block")], &schema)
+            .expect("decode with schema hint");
+        let b = block.view();
         assert_eq!(b.len(), 5);
         for i in 0..5usize {
             assert_eq!(mem_pk(&b, i), i as u128);
@@ -456,12 +452,10 @@ fn fifo_emits_a_fitting_reply_over_the_source_batch() {
     let mut block = vec![0u8; gnitz_wire::wal::block_size(&regions)];
     gnitz_wire::wal::write_block(&regions, 4096, &mut block);
     let batch = Rc::new(Batch::decode_from_wal_block(&block, &schema).unwrap());
-    let (chunk, _) = batch.wire_chunk_within(0, 0, usize::MAX);
-    let gnitz_store::storage::WireChunk::Owned(compacted) = chunk else {
-        panic!("a heap-bearing batch must relocate into a chunk of its own");
-    };
+    let frame = batch.wire_frame_within(0, 0, usize::MAX);
+    assert_eq!(frame.rows(), batch.len());
     assert!(
-        compacted.wire_byte_size() < batch.wire_byte_size(),
+        batch.wire_frame_size(&frame) < batch.wire_byte_size(),
         "the fixture must have a dedupable heap for the size test to discriminate"
     );
 
@@ -569,14 +563,9 @@ fn pending_streams_drain_two_trains_fifo() {
                 ctrl.hdr.flags.scan_last, is_last,
                 "scan_last only on the train's terminal chunk"
             );
-            let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-            let b = gnitz_store::storage::decode_mem_batch_from_wal_block(
-                &bytes[ctrl.data.clone().expect("data block")],
-                schema,
-                &mut offsets,
-            )
-            .expect("every frame decodes against the train's schema");
-            rows += b.len();
+            let block = gnitz_store::storage::WalBlock::parse(&bytes[ctrl.data.clone().expect("data block")], schema)
+                .expect("every frame decodes against the train's schema");
+            rows += block.view().len();
         }
         assert_eq!(rows, total_rows, "the train's chunks cover all rows exactly once");
     }
@@ -712,13 +701,9 @@ fn a_long_string_train_reassembles_with_its_weights() {
             i == frames.len() - 1,
             "scan_last only on the terminal frame"
         );
-        let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-        let b = gnitz_store::storage::decode_mem_batch_from_wal_block(
-            &bytes[ctrl.data.clone().expect("data block")],
-            &schema,
-            &mut offsets,
-        )
-        .expect("every frame decodes against the client's own schema");
+        let block = gnitz_store::storage::WalBlock::parse(&bytes[ctrl.data.clone().expect("data block")], &schema)
+            .expect("every frame decodes against the client's own schema");
+        let b = block.view();
         for r in 0..b.len() {
             got.push((mem_pk(&b, r), b.get_weight(r), gnitz_expr::payload_string(&b, r, 0)));
         }

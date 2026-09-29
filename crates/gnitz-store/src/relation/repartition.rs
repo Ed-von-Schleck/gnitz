@@ -144,7 +144,7 @@ fn rewrite_targets(
                 continue;
             }
             let slice = chunk.ascending_subset(idx);
-            buffer.append_batch(&slice, 0, slice.count);
+            buffer.append_batch(&slice);
             if buffer.total_bytes() >= ram_tier_bytes {
                 write_run(target, buffer)?;
             }

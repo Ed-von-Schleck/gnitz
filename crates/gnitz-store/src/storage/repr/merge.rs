@@ -189,46 +189,75 @@ pub(super) fn carried_dead(
     (!heap_is_wasteful(dead, heap)).then_some(dead)
 }
 
+/// The heap bytes a long German-string cell names; none for a short one.
+#[inline]
+pub(super) fn cell_long_bytes(cell: &[u8]) -> usize {
+    gnitz_wire::german_string_heap(cell, usize::MAX).map_or(0, |span| span.len())
+}
+
+/// [`row_long_bytes`] summed over every row of `src` outside the ascending,
+/// disjoint `kept` ranges.
+pub(super) fn long_bytes_outside<S: RowSource>(src: &S, mask: u64, kept: &[(usize, usize)]) -> usize {
+    let bounds = kept.iter().copied().chain([(src.row_count(), src.row_count())]);
+    let gaps = bounds.scan(0, |next, (start, end)| {
+        let gap = *next..start;
+        *next = end;
+        Some(gap)
+    });
+    gaps.flatten().map(|row| row_long_bytes(src, mask, row)).sum()
+}
+
 /// The heap bytes `row`'s long cells in the German-string slots `mask` name.
 /// A span two cells share counts twice.
 #[inline]
 pub(super) fn row_long_bytes<S: RowSource>(src: &S, mask: u64, row: usize) -> usize {
     gnitz_wire::BitIter(mask)
-        .filter_map(|pi| gnitz_wire::german_string_heap(src.get_col_ptr(row, pi, 16), usize::MAX))
-        .map(|span| span.len())
+        .map(|pi| cell_long_bytes(src.get_col_ptr(row, pi, 16)))
         .sum()
 }
 
-/// Where a copy's German-string cells find their bytes. The dedup cache belongs
-/// to relocation alone, so it lives in that arm.
-pub(crate) enum HeapArm<'c> {
-    /// Each cell's span, copied into the destination heap once under the cache.
-    Relocate(&'c mut BlobCache),
-    /// The source's heap, already in the destination's at this base.
-    At(usize),
-}
-
-/// Copy the German-string cells `src` (whole 16-byte cells, their spans in
-/// `src_blob`) onto `dst` as `heap` says: shifted onto the carried heap, or
-/// each relocated into `dst_blob`.
+/// Copy the whole German-string cells `src` onto `dst`, each rebased as
+/// [`rebase_string_cell`] rebases one: the carried arm shifts them in bulk.
 #[inline]
 pub(crate) fn copy_string_cells(
     dst: &mut [u8],
     src: &[u8],
     src_blob: &[u8],
     dst_blob: &mut Vec<u8>,
-    heap: &mut HeapArm<'_>,
+    heap_at: Option<usize>,
+    cache: &mut BlobCache,
 ) {
-    match heap {
-        HeapArm::At(base) => {
+    match heap_at {
+        Some(base) => {
             dst.copy_from_slice(src);
-            gnitz_wire::shift_german_string_heaps(dst, *base);
+            gnitz_wire::shift_german_string_heaps(dst, base);
         }
-        HeapArm::Relocate(cache) => {
+        None => {
             for (d, s) in dst.as_chunks_mut::<16>().0.iter_mut().zip(src.as_chunks::<16>().0) {
-                *d = relocate_german_string_vec(s, src_blob, dst_blob, Some(&mut **cache));
+                *d = relocate_german_string_vec(s, src_blob, dst_blob, Some(&mut *cache));
             }
         }
+    }
+}
+
+/// Write `src_cell` into `dst`, rebased onto the destination heap: shifted
+/// onto `src_blob` carried there at `heap_at`, or relocated into `dst_blob`
+/// under `cache`.
+#[inline(always)]
+fn rebase_string_cell(
+    dst: &mut [u8],
+    src_cell: &[u8],
+    src_blob: &[u8],
+    dst_blob: &mut Vec<u8>,
+    heap_at: Option<usize>,
+    cache: &mut BlobCache,
+) {
+    match heap_at {
+        Some(base) => {
+            dst.copy_from_slice(&src_cell[..16]);
+            gnitz_wire::shift_german_string_heaps(dst, base);
+        }
+        None => dst.copy_from_slice(&relocate_german_string_vec(src_cell, src_blob, dst_blob, Some(cache))),
     }
 }
 
@@ -312,6 +341,7 @@ impl BlobCache {
         }
     }
 
+    #[inline]
     pub(super) fn map(&mut self) -> &mut SpanMap {
         let reserve = self.reserve;
         self.map.get_or_insert_with(|| {
@@ -351,8 +381,8 @@ pub struct MemBatch<'a> {
     /// Borrowed, not owned: `usize` × `MAX_BATCH_REGIONS` is ~½ KiB, and this
     /// view exists to be derived per range, per chunk and per operator call.
     /// `Batch` already holds the array inline, so `as_mem_batch` lends it; the
-    /// one view with no owning `Batch` (a borrowed wire frame) has its decoder's
-    /// caller hold the array beside the view.
+    /// one view with no owning `Batch`, a borrowed wire frame, borrows it from
+    /// its [`super::batch_wire::WalBlock`].
     pub(crate) offsets: &'a [usize; super::batch::MAX_BATCH_REGIONS],
     pub pk_stride: u8, // byte width of the PK region per row
     pub(crate) blob: &'a [u8],
@@ -570,9 +600,8 @@ impl PosCursor {
 pub(crate) struct DirectWriter<'a> {
     // `repr`'s row-copy kernels write these fixed regions directly, so they are
     // `pub(super)`; `blob`/`blob_cache` stay private — the heap is reached only
-    // through `write_string_cell`.
+    // through its methods.
     pub(super) pk: &'a mut [u8],
-    pub(super) pk_stride: u8,
     pub(super) weight: &'a mut [u8],
     pub(super) null_bmp: &'a mut [u8],
     pub(super) col_bufs: Vec<&'a mut [u8]>,
@@ -588,24 +617,6 @@ pub(crate) struct DirectWriter<'a> {
 }
 
 impl<'a> DirectWriter<'a> {
-    /// Open over a contiguous arena of `rows` rows, carving it at the offsets
-    /// [`super::batch::compute_offsets_into`] gives for `schema` — so the arena's
-    /// eventual reader addresses each region where this wrote it.
-    pub(crate) fn over_arena(
-        data: &'a mut [u8],
-        schema: &'a SchemaDescriptor,
-        rows: usize,
-        blob: &'a mut Vec<u8>,
-    ) -> Self {
-        use super::batch::{compute_offsets_into, strides_from_schema, MAX_BATCH_REGIONS};
-
-        let (strides, nr) = strides_from_schema(schema);
-        let nr = nr as usize;
-        let mut offsets = [0usize; MAX_BATCH_REGIONS];
-        compute_offsets_into(&strides, nr, rows, &mut offsets);
-        Self::over_regions(data, &offsets, &strides, nr, rows, schema, blob)
-    }
-
     /// One writable slice per fixed region, carved at `offsets[r]` from
     /// `data`'s own start — so a wire block's header comes out as
     /// the first region's leading pad.
@@ -613,12 +624,12 @@ impl<'a> DirectWriter<'a> {
         data: &'a mut [u8],
         offsets: &[usize],
         strides: &[u8],
-        nr: usize,
         rows: usize,
         schema: &'a SchemaDescriptor,
         blob: &'a mut Vec<u8>,
     ) -> Self {
         use super::batch::REG_PAYLOAD_START;
+        let nr = strides.len();
         debug_assert!(nr >= REG_PAYLOAD_START, "a carve must cover the three fixed regions");
 
         let mut fixed: [&mut [u8]; REG_PAYLOAD_START] = [&mut [], &mut [], &mut []];
@@ -640,7 +651,6 @@ impl<'a> DirectWriter<'a> {
 
         DirectWriter {
             pk,
-            pk_stride: schema.pk_stride() as u8,
             weight,
             null_bmp,
             col_bufs,
@@ -651,41 +661,20 @@ impl<'a> DirectWriter<'a> {
         }
     }
 
-    /// The region slices supplied one by one, for a test that builds them by
-    /// hand rather than out of one arena.
-    #[cfg(test)]
-    pub(crate) fn new(
-        pk: &'a mut [u8],
-        weight: &'a mut [u8],
-        null_bmp: &'a mut [u8],
-        col_bufs: Vec<&'a mut [u8]>,
-        blob: &'a mut Vec<u8>,
-        schema: &'a SchemaDescriptor,
-        blob_cache_capacity: usize,
-    ) -> Self {
-        let pk_stride = schema.pk_stride() as u8;
-        DirectWriter {
-            pk,
-            pk_stride,
-            weight,
-            null_bmp,
-            col_bufs,
-            blob,
-            blob_cache: BlobCache::new(blob_cache_capacity),
-            count: 0,
-            schema,
-        }
-    }
-
-    /// Write one 16-byte German string struct from raw source slices.
-    ///
-    /// `#[inline]`: called per row from sibling modules in `repr`; the hint is
-    /// what carries the inline across that boundary.
+    /// Write one German-string cell at `out_row`, rebased per
+    /// [`rebase_string_cell`].
     #[inline]
-    pub(super) fn write_string_cell(&mut self, payload_col: usize, src_struct: &[u8], src_blob: &[u8], out_row: usize) {
-        let dest = relocate_german_string_vec(src_struct, src_blob, self.blob, Some(&mut self.blob_cache));
+    pub(super) fn write_string_cell(
+        &mut self,
+        payload_col: usize,
+        src_struct: &[u8],
+        src_blob: &[u8],
+        heap_at: Option<usize>,
+        out_row: usize,
+    ) {
         let off = out_row * 16;
-        self.col_bufs[payload_col][off..off + 16].copy_from_slice(&dest);
+        let dst = &mut self.col_bufs[payload_col][off..off + 16];
+        rebase_string_cell(dst, src_struct, src_blob, self.blob, heap_at, &mut self.blob_cache);
     }
 
     /// Carry a source heap whole onto the end of this writer's heap. Returns the

@@ -3,7 +3,7 @@
 use std::rc::Rc;
 
 use gnitz_store::schema::{decode_schema_block, encode_schema_block, SchemaDescriptor};
-use gnitz_store::storage::{Batch, Layout, WireChunk};
+use gnitz_store::storage::{Batch, Layout, WireFrame};
 use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::{WireFlags, WireStatus};
 
@@ -81,12 +81,10 @@ pub enum WireData<'a> {
     #[default]
     None,
     Whole(&'a Batch),
-    /// Rows `[start, start + rows)` framed directly off `batch`, with no heap —
-    /// so no payload cell of those rows may reference one.
-    Range {
+    /// One reply frame of `batch`.
+    Frame {
         batch: &'a Batch,
-        start: usize,
-        rows: usize,
+        frame: WireFrame,
     },
     /// The rows `indices` selects, in that order, encoded straight into the
     /// destination — no per-worker sub-`Batch` in between. `batch` has no heap,
@@ -98,20 +96,12 @@ pub enum WireData<'a> {
 }
 
 impl<'a> WireData<'a> {
-    /// The payload for one frame of a train over `batch`, from `start`.
-    pub(crate) fn of_chunk(batch: &'a Batch, start: usize, chunk: &'a WireChunk) -> Self {
-        match chunk {
-            WireChunk::Range { rows } => WireData::Range { batch, start, rows: *rows },
-            WireChunk::Owned(b) => WireData::Whole(b),
-        }
-    }
-
     /// Rows this payload carries; `0` means the slot or frame is dataless.
     pub(crate) fn row_count(&self) -> usize {
         match *self {
             WireData::None => 0,
             WireData::Whole(b) => b.len(),
-            WireData::Range { rows, .. } => rows,
+            WireData::Frame { frame, .. } => frame.rows(),
             WireData::Scattered { indices, .. } => indices.len(),
         }
     }
@@ -121,7 +111,7 @@ impl<'a> WireData<'a> {
     fn batch(&self) -> Option<&'a Batch> {
         match *self {
             WireData::None => None,
-            WireData::Whole(b) | WireData::Range { batch: b, .. } | WireData::Scattered { batch: b, .. } => Some(b),
+            WireData::Whole(b) | WireData::Frame { batch: b, .. } | WireData::Scattered { batch: b, .. } => Some(b),
         }
     }
 
@@ -130,7 +120,7 @@ impl<'a> WireData<'a> {
         match *self {
             WireData::None => 0,
             WireData::Whole(b) => b.wire_byte_size(),
-            WireData::Range { batch, rows, .. } => batch.wire_byte_size_range(rows),
+            WireData::Frame { batch, frame } => batch.wire_frame_size(&frame),
             WireData::Scattered { batch, indices } => batch.wire_byte_size_range(indices.len()),
         }
     }
@@ -140,7 +130,7 @@ impl<'a> WireData<'a> {
         match *self {
             WireData::None => 0,
             WireData::Whole(b) => b.encode_to_wire(out),
-            WireData::Range { batch, start, rows } => batch.encode_range_to_wire(start, rows, out),
+            WireData::Frame { batch, frame } => batch.encode_frame(&frame, out),
             WireData::Scattered { batch, indices } => batch
                 .encode_scattered_to_wire(indices, out)
                 .expect("a heap-free scatter fits the bytes its size reserved"),

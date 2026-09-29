@@ -142,7 +142,7 @@ impl Batch {
         assert!(n > 0, "every writer skips an empty output");
         // A shard carries no dead heap bytes.
         if self.dead_heap != 0 && super::batch_wire::measure_dead_heap(&self.as_mem_batch(), schema) != 0 {
-            return self.compacted(0..n).write_as_shard(path, opts);
+            return self.compacted().write_as_shard(path, opts);
         }
         self.debug_verify_dead_heap();
         let mut regions = gnitz_wire::Regions::new();

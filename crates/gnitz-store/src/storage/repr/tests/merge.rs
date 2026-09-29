@@ -315,7 +315,6 @@ fn bench_flush_batch(schema: &SchemaDescriptor, n: usize, key_fn: impl Fn(usize)
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn merge_batches_skewed_bench() {
-    use super::super::batch::write_to_batch;
     use std::hint::black_box;
     use std::time::Instant;
 
@@ -341,16 +340,11 @@ fn merge_batches_skewed_bench() {
         let total_rows: usize = sorted.iter().map(|b| b.count).sum();
 
         // Warm up the path once (allocator, batch pool, page-in); untimed.
-        black_box(write_to_batch(&schema, total_rows, 0, |w| {
-            merge_batches(&sorted, &schema, w);
-        }));
+        black_box(merge_batches(&sorted, &schema));
 
         let t = Instant::now();
         for _ in 0..iters {
-            let b = write_to_batch(&schema, total_rows, 0, |w| {
-                merge_batches(&sorted, &schema, w);
-            });
-            black_box(&b);
+            black_box(merge_batches(&sorted, &schema));
         }
         let secs = t.elapsed().as_secs_f64();
 
@@ -372,7 +366,7 @@ fn merge_to_rows(batches: &[Batch], schema: &SchemaDescriptor) -> Vec<(u128, i64
 }
 
 fn run_consolidate(b: &Batch, schema: &SchemaDescriptor) -> Vec<(u128, i64, i64)> {
-    narrow(run_consolidate_bytes(b, schema), schema.pk_stride())
+    narrow(run_consolidate_bytes(b), schema.pk_stride())
 }
 
 /// The Z-set fold, as `(inputs, expected output)`. Weights of matching
@@ -576,12 +570,12 @@ fn every_pk_width_orders_by_opk_bytes() {
         let m = merge_to_rows_wide(&batches, &schema);
         assert_eq!(ranks(&m), want, "stride {stride}: merge");
 
-        let c = run_consolidate_bytes(&make_batch_bytes(&schema, &shuffled), &schema);
+        let c = run_consolidate_bytes(&make_batch_bytes(&schema, &shuffled));
         assert_eq!(ranks(&c), want, "stride {stride}: consolidate_groups");
 
         // Already in order on the way in: the sort must be a no-op, not a
         // reshuffle of the equal-key groups.
-        let f = run_consolidate_bytes(&make_batch_bytes(&schema, &sorted), &schema);
+        let f = run_consolidate_bytes(&make_batch_bytes(&schema, &sorted));
         assert_eq!(ranks(&f), want, "stride {stride}: consolidate_groups (pre-sorted)");
 
         // The PK survives as its OPK image, not as some re-packing of it.
@@ -640,82 +634,41 @@ fn wpk(tcs: &[TypeCode], lead: u128, tail: u128) -> Vec<u8> {
     v
 }
 
-/// Run `run` against a fresh single-payload-column `DirectWriter` and return
-/// the `(pk_bytes, weight, i64_payload)` of each output row. Width-agnostic:
-/// drives both narrow and wide strides (callers build the schema explicitly).
-fn writer_run(
-    schema: &SchemaDescriptor,
-    total_rows: usize,
-    run: impl FnOnce(&mut DirectWriter),
-) -> Vec<(Vec<u8>, i64, i64)> {
-    let stride = schema.pk_stride();
-    let rows = total_rows.max(1);
-    let mut out_pk = vec![0u8; rows * stride];
-    let mut out_w = vec![0u8; rows * 8];
-    let mut out_n = vec![0u8; rows * 8];
-    let mut out_c = vec![0u8; rows * 8];
-    let mut out_b: Vec<u8> = Vec::with_capacity(1);
-    let count;
-    {
-        let mut writer = DirectWriter::new(
-            &mut out_pk,
-            &mut out_w,
-            &mut out_n,
-            vec![&mut out_c],
-            &mut out_b,
-            schema,
-            0,
-        );
-        run(&mut writer);
-        count = writer.count;
-    }
-    (0..count)
+/// The `(pk_bytes, weight, i64_payload)` of each row of a single-payload-column
+/// batch. Width-agnostic: reads narrow and wide strides alike (callers build
+/// the schema explicitly).
+fn i64_rows(b: &Batch) -> Vec<(Vec<u8>, i64, i64)> {
+    (0..b.count)
         .map(|i| {
-            let pk = out_pk[i * stride..(i + 1) * stride].to_vec();
-            let w = gnitz_wire::read_i64_le(&out_w, i * 8);
-            let v = gnitz_wire::read_i64_le(&out_c, i * 8);
-            (pk, w, v)
+            (
+                b.get_pk_bytes(i).to_vec(),
+                b.get_weight(i),
+                gnitz_wire::read_i64_le(b.col_data(0), i * 8),
+            )
         })
         .collect()
 }
 
-/// One-shot merge into a writer whose arena is already sized to the Σ-input
-/// upper bound, for the tests and microbench that pre-size their writer.
-fn merge_batches(batches: &[MemBatch], schema: &SchemaDescriptor, writer: &mut DirectWriter) {
-    let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(batches.iter().map(|b| b.count).sum());
+/// The N-way merge's survivors, materialized with every string relocated.
+fn merge_batches(batches: &[MemBatch], schema: &SchemaDescriptor) -> Batch {
+    let total = batches.iter().map(|b| b.count).sum();
+    let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(total);
     run_merge(batches, schema, |src, row, w| {
         survivors.push((src as u32, row as u32, w))
     });
-    let mut cols = Vec::new();
-    let unified: Vec<UnifiedSource> = batches
-        .iter()
-        .map(|b| mem_batch_to_unified(b, schema, &mut cols))
-        .collect();
-    super::super::scatter::scatter_unified_sources(&unified, &cols, &survivors, writer);
+    super::super::scatter::UnifiedSet::whole(batches, schema).materialize(&survivors, total)
 }
 
 fn merge_to_rows_wide(batches: &[Batch], schema: &SchemaDescriptor) -> Vec<(Vec<u8>, i64, i64)> {
     let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
-    let sorted: Vec<MemBatch> = mem.to_vec();
-    let total: usize = sorted.iter().map(|b| b.count).sum();
-    writer_run(schema, total, |w| {
-        merge_batches(&sorted, schema, w);
-    })
+    i64_rows(&merge_batches(&mem, schema))
 }
 
 /// Byte-form consolidation harness: returns `(pk_bytes, weight, i64_payload)`
 /// per output row. Width-agnostic (sibling of the packed-`u64` `run_consolidate`
 /// above, for PK shapes whose bytes don't fit a single `u64`).
-fn run_consolidate_bytes(b: &Batch, schema: &SchemaDescriptor) -> Vec<(Vec<u8>, i64, i64)> {
-    let mb = b.as_mem_batch();
-    let total = mb.count;
-    let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(total);
-    consolidate_groups(&mb, schema, &mut survivors);
-    let mut cols = Vec::with_capacity(schema.num_payload_cols());
-    let unified = [mem_batch_to_unified(&mb, schema, &mut cols)];
-    writer_run(schema, total, |w| {
-        super::super::scatter::scatter_unified_sources(&unified, &cols, &survivors, w);
-    })
+fn run_consolidate_bytes(b: &Batch) -> Vec<(Vec<u8>, i64, i64)> {
+    i64_rows(&b.clone().into_consolidated())
 }
 
 #[test]
@@ -806,7 +759,7 @@ fn wide_consolidate_prefix_collision_and_identical_payload() {
     let p1 = wpk(tcs, 1, 1);
     let p2 = wpk(tcs, 1, 2);
     let b = make_batch_bytes(&s, &[(p0.clone(), 1, 0), (p1.clone(), 1, 0), (p2.clone(), 1, 5)]);
-    let out = run_consolidate_bytes(&b, &s);
+    let out = run_consolidate_bytes(&b);
     assert_eq!(out.len(), 3, "distinct prefix-colliding PKs must not fold");
     assert_eq!(out[0], (p0, 1, 0));
     assert_eq!(out[1], (p1, 1, 0));
@@ -824,7 +777,7 @@ fn wide_consolidate_prefix_collision_and_identical_payload() {
             (r.clone(), -1, -1),
         ],
     );
-    let out2 = run_consolidate_bytes(&b2, &s);
+    let out2 = run_consolidate_bytes(&b2);
     assert_eq!(out2, vec![(q, 2, 7)]);
 }
 
@@ -893,40 +846,6 @@ mod merge_materialize_vs_reference {
         b
     }
 
-    struct OutBufs {
-        count: usize,
-        pk_stride: usize,
-        pk: Vec<u8>,
-        nb: Vec<u8>,
-        wt: Vec<u8>,
-        cols: Vec<Vec<u8>>,
-        blob: Vec<u8>,
-    }
-
-    fn materialize(
-        schema: &SchemaDescriptor,
-        total_rows: usize,
-        total_blob: usize,
-        run: impl FnOnce(&mut DirectWriter),
-    ) -> OutBufs {
-        let pk_stride = schema.pk_stride();
-        let rows = total_rows.max(1);
-        let mut pk = vec![0u8; rows * pk_stride];
-        let mut wt = vec![0u8; rows * 8];
-        let mut nb = vec![0u8; rows * 8];
-        let col_sizes: Vec<usize> = schema.payload_columns().map(|(_, c)| c.size() as usize).collect();
-        let mut cols: Vec<Vec<u8>> = col_sizes.iter().map(|&cs| vec![0u8; rows * cs]).collect();
-        let mut blob: Vec<u8> = Vec::with_capacity(total_blob.max(1));
-        let count;
-        {
-            let col_refs: Vec<&mut [u8]> = cols.iter_mut().map(|c| c.as_mut_slice()).collect();
-            let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, col_refs, &mut blob, schema, total_rows);
-            run(&mut writer);
-            count = writer.count;
-        }
-        OutBufs { count, pk_stride, pk, nb, wt, cols, blob }
-    }
-
     #[derive(Debug, PartialEq)]
     enum CellVal {
         Null,
@@ -962,16 +881,12 @@ mod merge_materialize_vs_reference {
             .collect()
     }
 
-    fn decode(schema: &SchemaDescriptor, out: &OutBufs) -> Vec<Row> {
+    fn decode(schema: &SchemaDescriptor, out: &Batch) -> Vec<Row> {
         (0..out.count)
             .map(|i| {
-                let pk = out.pk[i * out.pk_stride..(i + 1) * out.pk_stride].to_vec();
-                let w = gnitz_wire::read_i64_le(&out.wt, i * 8);
-                let nw = gnitz_wire::read_u64_le(&out.nb, i * 8);
-                let cells = decode_cells(schema, nw, &out.blob, |pi, cs| {
-                    out.cols[pi][i * cs..i * cs + cs].to_vec()
-                });
-                (pk, w, nw, cells)
+                let nw = out.get_null_word(i);
+                let cells = decode_cells(schema, nw, out.blob(), |pi, cs| out.get_col_ptr(i, pi, cs).to_vec());
+                (out.get_pk_bytes(i).to_vec(), out.get_weight(i), nw, cells)
             })
             .collect()
     }
@@ -983,7 +898,7 @@ mod merge_materialize_vs_reference {
     fn reference_fold(schema: &SchemaDescriptor, runs: &[Batch]) -> Vec<Row> {
         let mut all = Batch::with_capacity(schema, runs.iter().map(|b| b.count).sum());
         for r in runs {
-            all.append_batch(r, 0, r.count);
+            all.append_batch(r);
         }
         let mb = all.as_mem_batch();
         let n = mb.count;
@@ -1008,23 +923,23 @@ mod merge_materialize_vs_reference {
         out
     }
 
-    /// Materialize `runs` through the merge + columnar scatter and assert it
-    /// matches the oracle. Returns the decoded survivors for caller-specific
-    /// assertions.
+    /// Materialize `runs` through the merge + columnar scatter, once relocating
+    /// every string and once carrying each heap where the verdict prefers it,
+    /// and assert both match the oracle. Returns the decoded survivors for
+    /// caller-specific assertions.
     fn assert_matches_reference(schema: &SchemaDescriptor, runs: Vec<Batch>) -> Vec<Row> {
         let mem: Vec<MemBatch<'_>> = runs.iter().map(|b| b.as_mem_batch()).collect();
-        let total_rows: usize = mem.iter().map(|b| b.count).sum();
-        let total_blob: usize = mem.iter().map(|b| b.blob.len()).sum();
-
-        let out = materialize(schema, total_rows, total_blob, |writer| {
-            merge_batches(&mem, schema, writer);
-        });
-        let got = decode(schema, &out);
+        let want = reference_fold(schema, &runs);
+        let got = decode(schema, &merge_batches(&mem, schema));
         assert!(!got.is_empty(), "merge produced no survivors");
         assert_eq!(
-            got,
-            reference_fold(schema, &runs),
-            "merge + columnar scatter diverged from the argsort/fold reference"
+            got, want,
+            "merge + relocating scatter diverged from the argsort/fold reference"
+        );
+        assert_eq!(
+            decode(schema, &merge_consolidated(&mem, schema)),
+            want,
+            "merge + carrying scatter diverged from the argsort/fold reference"
         );
         got
     }
@@ -1229,7 +1144,7 @@ fn consolidate_reference(b: &Batch, schema: &SchemaDescriptor) -> Vec<(Vec<u8>, 
 
 fn assert_consolidate_matches_reference(schema: &SchemaDescriptor, rows: &[(Vec<u8>, i64, i64)]) {
     let b = make_batch_bytes(schema, rows);
-    let got = run_consolidate_bytes(&b, schema);
+    let got = run_consolidate_bytes(&b);
     let want = consolidate_reference(&b, schema);
     assert_eq!(got, want, "OPK consolidated output diverged from reference");
     // Independent of the reference's grouping: the OPK sort must leave the
@@ -1265,7 +1180,7 @@ fn opk_single_signed_i64_negatives() {
     ];
     assert_consolidate_matches_reference(&s, &rows);
     // Concrete order check: negatives precede non-negatives.
-    let out = run_consolidate_bytes(&make_batch_bytes(&s, &rows), &s);
+    let out = run_consolidate_bytes(&make_batch_bytes(&s, &rows));
     let pks: Vec<i64> = out.iter().map(|r| crate::test_support::opk_pk_i64(&r.0)).collect();
     assert_eq!(pks, vec![i64::MIN, -100, -1, 0, i64::MAX]);
 }

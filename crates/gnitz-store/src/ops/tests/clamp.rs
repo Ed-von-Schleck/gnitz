@@ -12,8 +12,7 @@ use gnitz_wire::ClampKind::{Distinct, PositivePart};
 
 /// `op_weight_clamp` of `kind`, folding its input first as the VM does.
 fn op_clamp(kind: ClampKind, delta: Batch, cursor: &mut ReadCursor) -> Batch {
-    let schema = *delta.schema();
-    op_weight_clamp(&delta.into_consolidated(&schema), cursor, kind)
+    op_weight_clamp(&delta.into_consolidated(), cursor, kind)
 }
 
 /// The clamp's per-element arithmetic, `clamp(w_old + Δw, 0, cap) − clamp(w_old,
@@ -265,10 +264,12 @@ fn distinct_compares_payloads_through_the_schema_selected_comparator() {
 }
 
 /// One bench shape: the trace's runs and the delta, each as `(pk, weight,
-/// payload)` rows, every payload column holding the row's payload.
+/// payload)` rows, every payload column holding the row's payload — as a
+/// 40-byte heap-backed string of the row under `strings`.
 struct BenchShape {
     name: String,
     payload_cols: usize,
+    strings: bool,
     runs: Vec<Vec<ClampRow>>,
     delta: Vec<ClampRow>,
 }
@@ -282,10 +283,11 @@ fn deal(rows: impl IntoIterator<Item = ClampRow>, n: usize) -> Vec<Vec<ClampRow>
     runs
 }
 
-/// A U64 PK over `n` I64 payload columns.
-fn bench_schema(n: usize) -> SchemaDescriptor {
+/// A U64 PK over `n` I64 payload columns, or `n` STRING ones under `strings`.
+fn bench_schema(n: usize, strings: bool) -> SchemaDescriptor {
+    let tc = if strings { TypeCode::String } else { TypeCode::I64 };
     let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
-    cols.extend((0..n).map(|_| SchemaColumn::new(TypeCode::I64, false)));
+    cols.extend((0..n).map(|_| SchemaColumn::new(tc, false)));
     SchemaDescriptor::new(&cols, &[0])
 }
 
@@ -293,12 +295,15 @@ fn bench_batch(schema: &SchemaDescriptor, rows: &[ClampRow]) -> Batch {
     let mut b = crate::storage::BatchBuilder::new(*schema);
     for &(pk, w, val) in rows {
         b.begin_row(pk as u128, w);
-        for _ in 0..schema.payload_columns().count() {
-            b.put_int(val as u128);
+        for (_, col) in schema.payload_columns() {
+            match col.type_code {
+                TypeCode::String => b.put_string(&format!("{pk:020}-{val:019}")),
+                _ => b.put_int(val as u128),
+            }
         }
         b.end_row();
     }
-    b.finish().into_consolidated(schema)
+    b.finish().into_consolidated()
 }
 
 /// `op_weight_clamp` per shape, opening its ranged cursor inside the timed region
@@ -315,6 +320,7 @@ fn weight_clamp_bench() {
         BenchShape {
             name: "sparse, 4 runs".into(),
             payload_cols: 1,
+            strings: false,
             runs: (0..4u64)
                 .map(|r| (0..16_384u64).map(|k| (k * 8 + 2 * r, 1, 0)).collect())
                 .collect(),
@@ -323,44 +329,60 @@ fn weight_clamp_bench() {
         BenchShape {
             name: "dense retract, 1 run".into(),
             payload_cols: 1,
+            strings: false,
             runs: deal(dense(1), 1),
             delta: dense(-1).collect(),
         },
         BenchShape {
             name: "dense re-add, 1 run".into(),
             payload_cols: 1,
+            strings: false,
             runs: deal(dense(1), 1),
             delta: dense(1).collect(),
         },
         BenchShape {
             name: "dense retract, 4 runs".into(),
             payload_cols: 1,
+            strings: false,
             runs: deal(dense(1), 4),
             delta: dense(-1).collect(),
         },
         BenchShape {
             name: "dense retract, 4 payload cols".into(),
             payload_cols: 4,
+            strings: false,
             runs: deal(dense(1), 1),
             delta: dense(-1).collect(),
         },
         BenchShape {
             name: "spread, half hits".into(),
             payload_cols: 1,
+            strings: false,
             runs: deal((0..N).map(|k| (2 * k, 1, 0)), 1),
             delta: dense(-1).collect(),
         },
         BenchShape {
             name: "insert-only, all emit".into(),
             payload_cols: 1,
+            strings: false,
             runs: deal((0..N).map(|k| (2 * k + 1, 1, 0)), 1),
             delta: (0..N).map(|k| (2 * k, 1, 0)).collect(),
         },
     ];
+    // Every row emits a weight other than its own, so the output is copied rather
+    // than handed back, with its strings.
+    shapes.push(BenchShape {
+        name: "insert-only at w=2, strings".into(),
+        payload_cols: 1,
+        strings: true,
+        runs: deal((0..N).map(|k| (2 * k + 1, 1, 0)), 1),
+        delta: (0..N).map(|k| (2 * k, 2, 0)).collect(),
+    });
     for g in [1_000, 100_000] {
         shapes.push(BenchShape {
             name: format!("hot, 1 probe, G={g}, 4 runs"),
             payload_cols: 1,
+            strings: false,
             runs: deal(hot_group(1, g), 4),
             delta: vec![(1, 1, g + 10)],
         });
@@ -369,6 +391,7 @@ fn weight_clamp_bench() {
         shapes.push(BenchShape {
             name: format!("hot, 256 probes, G={g}, {n_runs} runs"),
             payload_cols: 1,
+            strings: false,
             runs: deal(hot_group(1, g), n_runs),
             delta: hot_probes(g),
         });
@@ -376,7 +399,7 @@ fn weight_clamp_bench() {
 
     let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
     for shape in shapes {
-        let schema = bench_schema(shape.payload_cols);
+        let schema = bench_schema(shape.payload_cols, shape.strings);
         let tmp = tempfile::tempdir().unwrap();
         let mut trace = crate::test_support::scratch_table(tmp.path().to_str().unwrap(), schema);
         for run in &shape.runs {

@@ -179,7 +179,7 @@ fn creating_a_child_of_a_parent_the_same_delta_drops_is_refused() {
         .unwrap();
 
     let mut batch = engine.retract_under(SysFamily::Table, &[parent_tid]);
-    batch.append_batch(&build_table_tab_row(child_tid, pack_pk_cols(&[0]), "child"), 0, 1);
+    batch.append_batch(&build_table_tab_row(child_tid, pack_pk_cols(&[0]), "child"));
     let err = engine
         .submit(SysFamily::Table, batch)
         .expect_err("a child of a parent this delta drops must be refused");

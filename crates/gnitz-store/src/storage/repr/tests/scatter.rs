@@ -26,32 +26,17 @@ fn keys(stride: usize, n: usize) -> Vec<Vec<u8>> {
     (0..n).map(|i| vec![0x11 * (i as u8 + 1); stride]).collect()
 }
 
-/// Run `f` against a `DirectWriter` sized for `n` rows of `schema` and read the
-/// destination back. Reading the PK as bytes rather than as a widened `u128` is
-/// what lets one runner serve every stride.
+/// Run `f` against a `write_to_batch` writer sized for `n` rows of `schema` and
+/// read the batch back. Reading the PK as bytes rather than as a widened `u128`
+/// is what lets one runner serve every stride.
 fn scatter_into(schema: &SchemaDescriptor, n: usize, f: impl FnOnce(&mut DirectWriter)) -> Vec<Row> {
-    let stride = schema.pk_stride();
-    let mut pk = vec![0u8; n * stride];
-    let (mut wt, mut nb, mut col0) = (vec![0u8; n * 8], vec![0u8; n * 8], vec![0u8; n * 8]);
-    let mut blob: Vec<u8> = Vec::with_capacity(1);
-
-    let count;
-    {
-        let mut w = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, schema, 0);
-        assert_eq!(
-            usize::from(w.pk_stride),
-            stride,
-            "the writer must take its stride from the schema"
-        );
-        f(&mut w);
-        count = w.count;
-    }
-    (0..count)
+    let out = write_to_batch(schema, n, 0, f);
+    (0..out.len())
         .map(|i| {
             (
-                pk[i * stride..(i + 1) * stride].to_vec(),
-                gnitz_wire::read_i64_le(&wt, i * 8),
-                gnitz_wire::read_i64_le(&col0, i * 8),
+                out.get_pk_bytes(i).to_vec(),
+                out.get_weight(i),
+                gnitz_wire::read_i64_le(out.col_data(0), i * 8),
             )
         })
         .collect()
@@ -284,7 +269,7 @@ fn both_kernels_relocate_german_string_cells() {
     let src = make_batch_bytes(&schema, &[(1, 1, short), (2, 1, long)]);
     let mb = src.as_mem_batch();
 
-    let one = Batch::from_indexed_rows(&mb, &[1, 0], &schema);
+    let one = src.indexed_rows(&[1, 0]);
     assert_eq!(read_german_string(&one, 0, 0), long);
     assert_eq!(read_german_string(&one, 0, 1), short);
 

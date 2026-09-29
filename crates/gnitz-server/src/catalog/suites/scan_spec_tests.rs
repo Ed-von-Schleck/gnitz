@@ -719,7 +719,7 @@ fn projection_missing_an_output_slot_errs() {
 }
 
 /// A gather + ORDER BY … LIMIT k over weight-3 rows, sized so
-/// `summed > 2 · limit_k` fires `topk_keep` mid-scan: `from_indexed_rows` must
+/// `summed > 2 · limit_k` fires `topk_keep` mid-scan: `indexed_rows` must
 /// compact a gather-produced keeper and still keep the boundary row whole.
 #[test]
 fn gather_top_k_keeps_boundary_row_whole() {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::storage::BatchBuilder;
+use crate::storage::{BatchBuilder, Layout};
 use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64};
 
 fn push(set: &mut RunSet, schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) {
@@ -138,7 +138,7 @@ fn cleared_flags_unsorted_run_consolidates_ok() {
     push(&mut set, &schema, &[(5, 1, 50)]);
 
     let clean = desc_two_row_batch(&schema);
-    set.push(TrimmedRun::new(clean.into_consolidated(&schema)), &schema);
+    set.push(TrimmedRun::new(clean.into_consolidated()), &schema);
 
     let folded = set.fold_to_single(&schema).expect("three rows survive");
     assert_eq!(folded.count, 3);
@@ -172,7 +172,7 @@ fn reduce_output_folds_to_the_latest_aggregate() {
             b.end_row();
         }
         let b = b.finish();
-        TrimmedRun::new(b.into_consolidated(&schema))
+        TrimmedRun::new(b.into_consolidated())
     };
 
     let mut set = RunSet::new(1 << 20);
@@ -186,6 +186,56 @@ fn reduce_output_folds_to_the_latest_aggregate() {
     assert_eq!(folded.get_weight(0), 1);
     let agg = i64::from_le_bytes(folded.get_col_ptr(0, 1, 8).try_into().unwrap());
     assert_eq!(agg, 15000);
+}
+
+/// Runs from either side of an `ALTER … DROP NOT NULL` fold under the schema the
+/// fold is handed, not the dominant run's NOT NULL label.
+#[test]
+fn a_fold_merges_runs_of_different_nullability_under_its_own_schema() {
+    use crate::schema::{SchemaColumn, TypeCode};
+
+    let label = |nullable| {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(TypeCode::I64, nullable),
+            ],
+            &[0],
+        )
+    };
+    let (not_null, nullable) = (label(false), label(true));
+    let run = |schema: SchemaDescriptor, rows: &[(u128, Option<i64>, i64)]| {
+        let mut b = BatchBuilder::new(schema);
+        for &(pk, v, w) in rows {
+            b.begin_row(pk, w);
+            match v {
+                Some(v) => b.put_int(v as u128),
+                None => b.put_null(),
+            }
+            b.end_row();
+        }
+        let mut b = b.finish();
+        b.certify_layout(Layout::Consolidated);
+        TrimmedRun::new(b)
+    };
+
+    let mut set = RunSet::new(1 << 20);
+    set.push(
+        run(not_null, &[(1, Some(-3), 1), (2, Some(7), 1), (3, Some(8), 1)]),
+        &not_null,
+    );
+    set.push(run(nullable, &[(1, None, 1), (1, Some(-3), -1)]), &nullable);
+    set.fold(&nullable);
+
+    let folded = &set.runs()[0];
+    let got: Vec<(u128, Option<i64>, i64)> = (0..folded.count)
+        .map(|i| {
+            let v = (folded.get_null_word(i) & 1 == 0)
+                .then(|| i64::from_le_bytes(folded.get_col_ptr(i, 0, 8).try_into().unwrap()));
+            (folded.get_pk(i), v, folded.get_weight(i))
+        })
+        .collect();
+    assert_eq!(got, vec![(1, None, 1), (2, Some(7), 1), (3, Some(8), 1)]);
 }
 
 #[test]

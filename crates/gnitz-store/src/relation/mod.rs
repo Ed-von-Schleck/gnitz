@@ -287,10 +287,7 @@ impl Relation {
                 .filter(|&i| b.get_weight(i) != 0 && pk_in_range(first, last, b.get_pk_bytes(i)))
                 .map(|i| i as u32)
                 .collect();
-            let undo = b
-                .ascending_subset(&in_range)
-                .into_consolidated(table.schema())
-                .negated();
+            let undo = b.ascending_subset(&in_range).into_consolidated().negated();
             std::rc::Rc::new(undo)
         });
         table.gather(keys, undo)

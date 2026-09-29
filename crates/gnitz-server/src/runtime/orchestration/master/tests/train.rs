@@ -174,15 +174,14 @@ fn next_yields_only_row_frames_and_ends_at_each_terminal() {
 
     fx.reactor.route_w2m_for_test();
 
-    let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
     for (w, pk) in [(0u32, 1u128), (1, 2)] {
         let f = try_poll_once(fx.lease.next())
             .expect("completes in one poll")
             .expect("no fault")
             .expect("a row frame");
         assert_eq!(f.slot.worker, w, "frames arrive in worker order");
-        let mb = f.rows(&schema, &mut offsets);
-        assert_eq!(gnitz_wire::widen_pk_be(mb.get_pk_bytes(0)), pk);
+        let block = f.rows(&schema);
+        assert_eq!(gnitz_wire::widen_pk_be(block.view().get_pk_bytes(0)), pk);
     }
     assert!(
         try_poll_once(fx.lease.next())

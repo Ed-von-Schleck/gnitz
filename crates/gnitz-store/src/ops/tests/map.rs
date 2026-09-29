@@ -646,7 +646,7 @@ fn a_compound_permuted_pk_decodes_at_every_width() {
 /// Difference two pass counts, one shape per process:
 ///
 ///   cargo build -p gnitz-store --release --tests
-///   for s in reindex permute int3_whole int3_r16 upper_r16; do for p in 1 21; do \
+///   for s in reindex permute proj_keep_str proj_drop_str int3_whole int3_r16 upper_r16; do for p in 1 21; do \
 ///     GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
 ///     cargo test -p gnitz-store --release map_ranges_bench -- --ignored --nocapture
 ///   done; done
@@ -800,11 +800,30 @@ fn map_ranges_bench() {
         hash_row("hash_row[i64x3,str]", &[I64, I64, I64, STR]),
     ];
 
+    // --- Two heap-backed string columns, [U64 PK, STRING, STRING], and a
+    // projection keeping both, or only the first.
+    let str2_in = make_schema(0, &[TypeCode::U64, TypeCode::String, TypeCode::String]);
+    let mut str2_batch = BatchBuilder::new(str2_in);
+    for i in 0..N {
+        str2_batch.begin_row(i as u128, 1i64);
+        str2_batch.put_string(&format!("first-{i:016}-payload-first"));
+        str2_batch.put_string(&format!("second-{i:016}-payload-second"));
+        str2_batch.end_row();
+    }
+    let str2_batch = str2_batch.finish();
+    let projection = |cols: &[u32]| {
+        let out = crate::schema::project_schema(&str2_in, cols).unwrap();
+        MapPlan::from_map(LogicalProgram::copy_cols(cols), &str2_in, &out, PkSource::Inherit).unwrap()
+    };
+    let (mut keep_str, mut drop_str) = (projection(&[1, 2]), projection(&[1]));
+
     // Whole-batch shapes, through `evaluate_map_batch`.
     let whole = [
         ("reindex", &mut rx_plan, &rx_batch),
         ("str_emit", &mut se_plan, &str_batch),
         ("permute", &mut permute, &int_batch),
+        ("proj_keep_str", &mut keep_str, &str2_batch),
+        ("proj_drop_str", &mut drop_str, &str2_batch),
     ]
     .into_iter()
     .chain(hash_rows.iter_mut().map(|(name, plan, batch)| (*name, plan, &*batch)));

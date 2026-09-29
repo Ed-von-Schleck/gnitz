@@ -2,6 +2,7 @@
 //! application, delta capture, and the flush / checkpoint table collection.
 
 use super::{Relation, RelationKind, RelationRegistry, SecondaryIndex, Store};
+use crate::schema::write_delta_key;
 use crate::storage::{Batch, StorageError, Table};
 
 /// `GNITZ_INJECT_INGEST_APPLY_ERROR=store|index`: report `Err(Io)` from the
@@ -123,18 +124,19 @@ impl RelationRegistry {
             RelationKind::BaseTable => super::unique_pk::enforce_unique_pk(entry.store.held(), batch),
             // Folded once for the store, the delta capture and every reader of the
             // echo, which all read a view's output at net weights.
-            RelationKind::View(_) => batch.into_consolidated(entry.store.schema()),
+            RelationKind::View(_) => batch.into_consolidated(),
             RelationKind::SystemCatalog | RelationKind::Stream => batch,
         };
         if effective.count == 0 {
             return Ok(needed.then_some(effective));
         }
 
-        let pending = entry
-            .delta
-            .as_deref()
-            .zip(round)
-            .map(|(feed, r)| (effective.stamped_with_pk_prefix(feed.schema(), r), r));
+        let pending = entry.delta.as_deref().zip(round).map(|(feed, r)| {
+            let mut stamped = effective.rekeyed(feed.schema(), |src, dst| write_delta_key(r, src, dst));
+            // One round's keys share their prefix, so the order holds.
+            stamped.inherit_layout(&effective);
+            (stamped, r)
+        });
 
         for ix in entry.indexes.iter_mut() {
             let cols = ix.cols;

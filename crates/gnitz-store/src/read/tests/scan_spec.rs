@@ -518,7 +518,7 @@ impl SkeletonHydrator for Recompute {
             }
         }
         self.calls.push(ks);
-        Ok(bb.finish().into_consolidated(&schema))
+        Ok(bb.finish().into_consolidated())
     }
 }
 

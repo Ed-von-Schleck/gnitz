@@ -736,7 +736,7 @@ pub(crate) fn create_read_cursor(
     from_runs(
         batches
             .iter()
-            .map(|b| Run::Mem(Batch::consolidate_if_needed(b, &schema).map_or_else(|| Rc::clone(b), Rc::new)))
+            .map(|b| Run::Mem(Batch::consolidate_if_needed(b).map_or_else(|| Rc::clone(b), Rc::new)))
             .chain(shard_arcs.iter().cloned().map(Run::Shard)),
         schema,
         batches.len() + shard_arcs.len(),

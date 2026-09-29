@@ -24,7 +24,7 @@ use crate::runtime::w2m::SalWake;
 use gnitz_foundation::posix_io;
 use gnitz_store::ops::{op_exchange_gather, op_exchange_route, ScatterPlan};
 use gnitz_store::schema::SchemaDescriptor;
-use gnitz_store::storage::{decode_mem_batch_from_wal_block, Batch, Layout, MAX_BATCH_REGIONS};
+use gnitz_store::storage::{Batch, Layout, WalBlock};
 
 /// The default and largest virtual size of one outbox.
 pub(crate) const OUTBOX_BYTES: usize = 1 << 30;
@@ -360,18 +360,17 @@ impl Mesh {
             return None;
         }
         let schema = open.schema;
-        let mut offsets = vec![[0usize; MAX_BATCH_REGIONS]; open.saved.len() + blocks.len()];
-        let slices: Vec<_> = open
+        let parsed: Vec<WalBlock> = open
             .saved
             .iter()
             .map(Vec::as_slice)
             .chain(blocks)
-            .zip(offsets.iter_mut())
-            .map(|(block, offsets)| {
-                decode_mem_batch_from_wal_block(block, &schema, offsets)
+            .map(|block| {
+                WalBlock::parse(block, &schema)
                     .unwrap_or_else(|e| gnitz_fatal_abort!("exchange of view {view}: a peer's block: {e}"))
             })
             .collect();
+        let slices: Vec<_> = parsed.iter().map(WalBlock::view).collect();
         let rows = op_exchange_gather(&slices, &schema, consolidated);
         self.part += 1;
         Some((rows, drained))

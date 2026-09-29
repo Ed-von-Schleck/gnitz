@@ -47,7 +47,7 @@ impl CatalogEngine {
                 owners.extend((0..segs.len()).map(|i| segs.get_pk(i) as u64));
                 owners.sort_unstable();
                 let mut merged = segs.negated();
-                merged.append_batch(&batch, 0, batch.len());
+                merged.append_batch(&batch);
                 batch = merged;
             }
         }

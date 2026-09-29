@@ -176,7 +176,7 @@ impl GroupOutKey {
             // A consolidated batch is in PK order, so already grouped by any PK prefix.
             &GroupKey::PkPrefix(w) => pk_width_dispatch!(w, |K| {
                 let key = |i| K::from_opk(mb.get_pk_prefix(i, w));
-                match batch.consolidated_verified(batch.schema()) {
+                match batch.consolidated_verified() {
                     true => GroupRuns::in_place(n, key),
                     false => GroupRuns::sorted(n, key),
                 }

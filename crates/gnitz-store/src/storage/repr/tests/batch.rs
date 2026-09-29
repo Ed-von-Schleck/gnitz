@@ -240,8 +240,8 @@ fn flagged_batch(rows: &[(u128, i64, i64)], layout: Layout) -> (Batch, SchemaDes
 #[test]
 #[should_panic(expected = "not strictly")]
 fn into_consolidated_panics_on_lying_consolidated_dup() {
-    let (b, schema) = flagged_batch(&[(1, 1, 5), (1, 1, 5)], Layout::Consolidated);
-    let _ = b.into_consolidated(&schema);
+    let (b, _) = flagged_batch(&[(1, 1, 5), (1, 1, 5)], Layout::Consolidated);
+    let _ = b.into_consolidated();
 }
 
 // Ghost clause: strictly ordered, but carrying a net-zero row under Consolidated.
@@ -249,19 +249,19 @@ fn into_consolidated_panics_on_lying_consolidated_dup() {
 #[test]
 #[should_panic(expected = "ghost not eliminated")]
 fn into_consolidated_panics_on_consolidated_ghost() {
-    let (b, schema) = flagged_batch(&[(1, 1, 0), (2, 0, 0), (3, 1, 0)], Layout::Consolidated);
-    let _ = b.into_consolidated(&schema);
+    let (b, _) = flagged_batch(&[(1, 1, 0), (2, 0, 0), (3, 1, 0)], Layout::Consolidated);
+    let _ = b.into_consolidated();
 }
 
 // An honest sorted+consolidated batch passes both entry points with no panic.
 #[test]
 fn honest_sorted_consolidated_batch_passes_verifiers() {
-    let (b, schema) = flagged_batch(&[(1, 1, 0), (2, 1, 0), (3, 1, 0)], Layout::Consolidated);
+    let (b, _) = flagged_batch(&[(1, 1, 0), (2, 1, 0), (3, 1, 0)], Layout::Consolidated);
     assert!(
-        Batch::consolidate_if_needed(&b, &schema).is_none(),
+        Batch::consolidate_if_needed(&b).is_none(),
         "C+D: honest sorted/consolidated batch borrows original"
     );
-    let cb = b.into_consolidated(&schema);
+    let cb = b.into_consolidated();
     assert_eq!(cb.count, 3, "A: honest consolidated batch passes through");
 }
 
@@ -286,7 +286,7 @@ fn layout_lifecycle_default_raise_and_lower() {
 
     // Any append downgrades all the way to Raw (the W2M-class fail-safe).
     let src = make_batch_raw(&schema, &[(3, 1, 30)]);
-    b.append_batch(&src, 0, 1);
+    b.append_ranges(&src.as_mem_batch(), &[(0, 1)]);
     assert_eq!(b.layout(), Layout::Raw, "append downgrades to Raw");
 
     b.clear();
@@ -342,14 +342,14 @@ fn batch_append_batch() {
     let src = crate::test_support::make_batch(&schema, &[(10, 1, 100), (20, 1, 200), (30, 1, 300)]);
     let mut dst = Batch::with_capacity(&schema, 8);
 
-    dst.append_batch(&src, 0, 3);
+    dst.append_ranges(&src.as_mem_batch(), &[(0, 3)]);
     assert_eq!(dst.count, 3);
     assert_eq!(dst.get_pk(0), 10);
     assert_eq!(dst.get_pk(2), 30);
     assert_eq!(dst.get_weight(1), 1);
 
     dst.clear();
-    dst.append_batch(&src, 1, 2);
+    dst.append_ranges(&src.as_mem_batch(), &[(1, 2)]);
     assert_eq!(dst.count, 1);
     assert_eq!(dst.get_pk(0), 20);
 }
@@ -363,7 +363,7 @@ fn batch_append_batch_from_empty_exceeds_initial_capacity() {
     let src = crate::test_support::make_batch(&schema, &rows);
 
     let mut dst = Batch::empty_with_schema(&schema);
-    dst.append_batch(&src, 0, src.count);
+    dst.append_batch(&src);
 
     assert_eq!(dst.count, 200);
     for i in 0..200usize {
@@ -431,7 +431,7 @@ fn trimmed_copies_only_oversized_batches() {
     let src = crate::test_support::make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
 
     let mut loose = Batch::with_capacity(&schema, 1000);
-    loose.append_batch(&src, 0, 1);
+    loose.append_ranges(&src.as_mem_batch(), &[(0, 1)]);
     loose.certify_layout(Layout::Consolidated);
     let cap = loose.data_capacity();
     let trimmed = loose.trimmed();
@@ -444,7 +444,7 @@ fn trimmed_copies_only_oversized_batches() {
     assert_eq!(again.data.as_ptr(), ptr, "a trimmed batch is not copied again");
 
     let mut tight = Batch::with_capacity(&schema, 4);
-    tight.append_batch(&src, 0, 4);
+    tight.append_ranges(&src.as_mem_batch(), &[(0, 4)]);
     let ptr = tight.data.as_ptr();
     assert_eq!(
         tight.trimmed().data.as_ptr(),
@@ -479,7 +479,7 @@ fn from_ranges_resolves_long_values_under_both_blob_arms() {
         !super::super::merge::should_relocate_blob(small.blob.len(), small.count, 1),
         "precondition: this shape takes the sharing arm",
     );
-    let shared = Batch::from_ranges(&small, &[(0, 1)], &schema, 0);
+    let shared = Batch::from_ranges(&small, &[(0, 1)], 0);
     assert_eq!(shared.count, 1);
     assert_eq!(read_german_string(&shared, 0, 0), long);
     assert_eq!(
@@ -497,7 +497,7 @@ fn from_ranges_resolves_long_values_under_both_blob_arms() {
         super::super::merge::should_relocate_blob(wide.blob.len(), wide.count, 1),
         "precondition: this shape takes the relocating arm",
     );
-    let relocated = Batch::from_ranges(&wide, &[(7, 8)], &schema, 0);
+    let relocated = Batch::from_ranges(&wide, &[(7, 8)], 0);
     assert_eq!(relocated.count, 1);
     assert_eq!(read_german_string(&relocated, 0, 0), vals[7]);
     assert!(
@@ -515,7 +515,7 @@ fn from_ranges_inherits_its_source_layout() {
     let src = crate::test_support::make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
     assert!(src.is_consolidated(), "precondition: the source claims consolidated");
 
-    let subset = Batch::from_ranges(&src, &[(0, 1), (2, 3)], &schema, 0);
+    let subset = Batch::from_ranges(&src, &[(0, 1), (2, 3)], 0);
     assert_eq!(subset.count, 2);
     assert!(
         subset.is_consolidated(),
@@ -577,18 +577,18 @@ fn consolidate_in_place_folds_once_and_certifies() {
 
     let mut raw = make_batch_raw(&schema, &[(2, 1, 20), (1, 1, 10), (1, 2, 10)]);
     assert_eq!(raw.layout(), Layout::Raw);
-    raw.consolidate_in_place(&schema);
+    raw.consolidate_in_place();
     assert_eq!(raw.layout(), Layout::Consolidated);
     assert_eq!(raw.count, 2);
     assert_eq!((raw.get_pk(0), raw.get_weight(0)), (1, 3));
 
     let mut already = crate::test_support::make_batch(&schema, &[(1, 1, 10)]);
-    already.consolidate_in_place(&schema);
+    already.consolidate_in_place();
     assert_eq!(already.count, 1);
     assert_eq!(already.layout(), Layout::Consolidated);
 
     let mut empty = Batch::empty_with_schema(&schema);
-    empty.consolidate_in_place(&schema);
+    empty.consolidate_in_place();
     assert_eq!(empty.count, 0);
 }
 
@@ -712,11 +712,10 @@ fn project_index_drops_ghosts_and_carries_each_weight() {
     assert_eq!(projected.get_weight(1), -1, "a retraction projects as a retraction");
 }
 
-/// `unstamped` gives back exactly the rows `stamped_with_pk_prefix` was handed:
-/// a compound key whose prefix is dropped whole, every weight, the NULL words,
-/// and a long (> 12 byte) string whose heap offset must still resolve.
+/// Stamping a delta key on and off through `rekeyed` gives back every row whole:
+/// compound key, weight, NULL word, and a long string's heap span.
 #[test]
-fn unstamped_inverts_stamped_with_pk_prefix() {
+fn rekeyed_round_trips_a_key_prefix() {
     use crate::test_support::read_german_string;
     let view = SchemaDescriptor::new(
         &[
@@ -743,9 +742,13 @@ fn unstamped_inverts_stamped_with_pk_prefix() {
     let mut b = b.finish();
     b.certify_layout(Layout::Consolidated);
 
-    let out = b.stamped_with_pk_prefix(&delta, 7).unstamped(&view);
+    let stamped = b.rekeyed(&delta, |src, dst| crate::schema::write_delta_key(7, src, dst));
+    assert_eq!(stamped.layout(), Layout::Raw, "rekeyed claims no order");
+    assert_eq!(&stamped.get_pk_bytes(1)[..8], &7u64.to_be_bytes());
+    let out = stamped.rekeyed(&view, |src, dst| {
+        dst.copy_from_slice(crate::schema::delta_view_key(src))
+    });
     assert_eq!(out.count, b.count);
-    assert_eq!(out.layout(), Layout::Raw, "a dropped prefix preserves no order claim");
     for (i, row) in rows.iter().enumerate() {
         assert_eq!(out.get_pk_bytes(i), b.get_pk_bytes(i), "row {i}: key");
         assert_eq!(out.get_weight(i), b.get_weight(i), "row {i}: weight");
@@ -796,22 +799,64 @@ fn carry_heap_charges_exactly_the_excluded_rows() {
     let mb = src.as_mem_batch();
 
     let mut out = Batch::with_capacity(src.schema(), 8);
-    assert_eq!(out.carry_heap(&mb, mask, &[(0, 2), (3, 8)]), Some(0));
+    assert_eq!(out.carry_heap(&mb, mask, mask, &[(0, 2), (3, 8)]), Some(0));
     assert_eq!(out.dead_heap, 5 + 30, "row 2's span and the source's own padding");
 
     let mut short = Batch::with_capacity(src.schema(), 8);
-    assert_eq!(short.carry_heap(&mb, mask, &[(0, 3), (4, 8)]), Some(0));
+    assert_eq!(short.carry_heap(&mb, mask, mask, &[(0, 3), (4, 8)]), Some(0));
     assert_eq!(short.dead_heap, 5, "a short row leaves no span behind");
 
     let mut all = Batch::with_capacity(src.schema(), 8);
-    assert_eq!(all.carry_heap(&mb, mask, &[(0, 8)]), Some(0));
+    assert_eq!(all.carry_heap(&mb, mask, mask, &[(0, 8)]), Some(0));
     assert_eq!(all.dead_heap, 5, "keeping every row charges only the padding");
 
     for kept in [&[][..], &[(0, 2)][..]] {
         let mut refused = Batch::with_capacity(src.schema(), 8);
-        assert_eq!(refused.carry_heap(&mb, mask, kept), None, "{kept:?}");
+        assert_eq!(refused.carry_heap(&mb, mask, mask, kept), None, "{kept:?}");
         assert_eq!((refused.blob.len(), refused.dead_heap), (0, 0));
     }
+
+    let mut no_string = Batch::with_capacity(src.schema(), 8);
+    assert_eq!(
+        no_string.carry_heap(&mb, mask, 0, &[(0, 8)]),
+        None,
+        "a copy keeping no string slot"
+    );
+}
+
+/// A copy that drops a string slot is charged that slot's long bytes of every
+/// row it keeps, and refused once they leave the heap wasteful.
+#[test]
+fn carry_heap_charges_the_dropped_slots() {
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::String, false),
+            SchemaColumn::new(TypeCode::String, false),
+        ],
+        &[0],
+    );
+    let mut b = BatchBuilder::new(schema);
+    for pk in 1..=4u128 {
+        b.begin_row(pk, 1);
+        b.put_blob(&[b'a'; 100]);
+        b.put_blob(&[b'b'; 20]);
+        b.end_row();
+    }
+    let src = b.finish();
+    let mask = schema.string_payload_slots();
+    let mb = src.as_mem_batch();
+
+    let mut keeps_a = Batch::with_capacity(&schema, 4);
+    assert_eq!(keeps_a.carry_heap(&mb, mask, 0b01, &[(0, 4)]), Some(0));
+    assert_eq!(keeps_a.dead_heap, 4 * 20, "slot 1's span on every kept row");
+
+    let mut keeps_b = Batch::with_capacity(&schema, 4);
+    assert_eq!(
+        keeps_b.carry_heap(&mb, mask, 0b10, &[(0, 4)]),
+        None,
+        "400 of 480 bytes dead"
+    );
 }
 
 /// Truncation drops the heap appended since the mark along with its rows.
@@ -823,7 +868,7 @@ fn truncate_to_drops_the_heap_appended_since_the_mark() {
     let shared = out.mark();
 
     let fresh = make_string_batch(&[(4, 1, &[b'e'; 50])]);
-    out.append_batch(&fresh, 0, 1);
+    out.append_batch(&fresh);
     assert!(out.blob.len() > shared.blob_len);
     out.truncate_to(shared);
     assert_eq!((out.blob.len(), out.dead_heap), (src.blob.len(), 0));
@@ -886,4 +931,32 @@ fn trimmed_compacts_past_a_quarter_dead() {
     assert_eq!((compacted.blob.len(), compacted.dead_heap), (60, 0));
     assert_eq!(read_strings(&compacted), [vec![b'a'; 20], vec![b'b'; 40]]);
     assert_eq!(compacted.layout, Layout::Consolidated);
+}
+
+/// Retired instructions of `append_batch` over a string-bearing source: a 64-row
+/// batch of 40-byte strings appended 10⁴ times into one growing destination.
+/// `#[ignore]`; run release:
+///   cargo test -p gnitz-store --release append_batch_strings_bench -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn append_batch_strings_bench() {
+    const ROWS: usize = 64;
+    const APPENDS: usize = 10_000;
+    let values: Vec<Vec<u8>> = (0..ROWS).map(|i| format!("{i:040}").into_bytes()).collect();
+    let rows: Vec<(u64, i64, &[u8])> = values.iter().enumerate().map(|(i, v)| (i as u64, 1, &v[..])).collect();
+    let src = make_string_batch(&rows);
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let (dst, instructions) = counter.measure(|| {
+        let mut dst = Batch::empty_with_schema(src.schema());
+        for _ in 0..APPENDS {
+            dst.append_batch(std::hint::black_box(&src));
+        }
+        dst
+    });
+    assert_eq!(dst.count, ROWS * APPENDS);
+    println!(
+        "append_batch_strings_bench: {} instr/append, heap {} bytes",
+        instructions / APPENDS as u64,
+        dst.blob.len()
+    );
 }

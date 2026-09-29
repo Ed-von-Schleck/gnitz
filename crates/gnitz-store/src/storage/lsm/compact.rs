@@ -127,14 +127,7 @@ pub(super) fn merge_and_route(
                 bucket,
             ),
         };
-        let mut batch = set.materialize(rows, nsurv);
-        if folded.is_some() {
-            // The fused pass copied the *source's* payload null bits, which mean
-            // nothing without a payload. Zeroing collapses the region to
-            // `Encoding::Constant` — 8 bytes for the whole file.
-            batch.null_bmp_data_mut().fill(0);
-        }
-        emit(dest, batch)?;
+        emit(dest, set.materialize(rows, nsurv))?;
     }
     Ok(())
 }

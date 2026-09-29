@@ -85,11 +85,10 @@ fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, expected
             ctrl.schema.is_none(),
             "no pre-flight frame carries a schema block: the master builds it"
         );
-        let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
         if let Some(data) = ctrl.data.clone() {
-            let mb =
-                gnitz_store::storage::decode_mem_batch_from_wal_block(&slot.bytes()[data], frame_schema, &mut offsets)
-                    .expect("frame decodes");
+            let block =
+                gnitz_store::storage::WalBlock::parse(&slot.bytes()[data], frame_schema).expect("frame decodes");
+            let mb = block.view();
             for i in 0..mb.len() {
                 keys.push(PkBuf::from_bytes(mb.get_pk_bytes(i)));
             }

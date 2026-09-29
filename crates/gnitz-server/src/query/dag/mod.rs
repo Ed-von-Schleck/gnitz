@@ -117,7 +117,7 @@ impl DagEngine {
     /// drains.
     pub(crate) fn buffer_unticked(&mut self, tid: u64, delta: Batch) {
         match self.unticked.get_mut(&tid) {
-            Some(existing) => existing.append_batch(&delta, 0, delta.len()),
+            Some(existing) => existing.append_batch(&delta),
             None => {
                 self.unticked.insert(tid, delta);
             }

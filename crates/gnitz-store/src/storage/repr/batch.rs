@@ -6,9 +6,9 @@
 use std::ops::Range;
 
 use super::batch_pool::{acquire_arena, acquire_uninit, is_tight, recycle_buf};
-use super::merge::{self, copy_string_cells, relocate_german_string_vec, BlobCache, ColPtr, HeapArm, MemBatch};
+use super::merge::{self, copy_string_cells, relocate_german_string_vec, BlobCache, ColPtr, MemBatch};
 use crate::schema::key::NarrowPkOpk;
-use crate::schema::{ColumnLocator, SchemaDescriptor, SchemaFacts, DELTA_TICK_COL};
+use crate::schema::{ColumnLocator, SchemaDescriptor, SchemaFacts};
 use gnitz_expr::RowSource;
 use gnitz_wire::{read_i64_le, read_u64_le, write_u64_le, TypeCode};
 
@@ -21,7 +21,7 @@ pub(crate) use gnitz_wire::MAX_WIRE_REGIONS;
 /// Regions tracked in the `offsets`/`strides` arrays: 3 fixed (pk, weight,
 /// null_bmp) + the payload columns. The blob is not one of them — it lives in
 /// `self.blob` — so this is the wire cap less that slot.
-pub const MAX_BATCH_REGIONS: usize = MAX_WIRE_REGIONS - 1;
+pub(crate) const MAX_BATCH_REGIONS: usize = MAX_WIRE_REGIONS - 1;
 
 // ── Region indices into `offsets` / `strides` ───────────────────────────────
 //
@@ -84,6 +84,14 @@ pub(in crate::storage) fn strides_from_schema(schema: &SchemaDescriptor) -> ([u8
     (strides, nr as u8)
 }
 
+/// Cells [`Batch::carry_heap`] charges dead between two waste checks.
+const DEAD_CHECK_CELLS: usize = 1024;
+
+/// One row's bytes across the fixed regions of `strides`.
+pub(super) fn row_width(strides: &[u8]) -> usize {
+    strides.iter().map(|&s| s as usize).sum()
+}
+
 /// Copy `count` rows of each region in `regions` from `src` (regions at
 /// `src_offsets`) into `dst` (regions at `dst_offsets`), one bulk copy per
 /// region. A caller whose two sides disagree on a region's pitch leaves that
@@ -116,10 +124,8 @@ pub(super) unsafe fn copy_regions(
     }
 }
 
-/// Cached row-layout guarantee. A mutation can only clear it; two paths set it —
-/// `certify_layout`, which debug-verifies first, and `inherit_layout`, which
-/// copies an already-verified tag across a faithful copy. `pub` so callers name
-/// the variants; the `Batch.layout` field itself is private.
+/// Cached row-layout guarantee. Every mutation clears it; only code that has
+/// just verified or produced the property raises it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Layout {
     /// No order/fold guarantee.
@@ -167,9 +173,9 @@ pub struct Batch {
     /// Fresh batches default to `Raw` — a forgotten raise degrades to a safe
     /// re-fold, never a lie.
     layout: Layout,
-    /// The schema this batch's rows were laid out under. Moved only through
-    /// [`Self::set_schema`]; a consumer whose own descriptor governs instead
-    /// passes it explicitly (see [`Self::into_consolidated`]).
+    /// The schema this batch's rows were laid out under, and the one every
+    /// operation on this batch alone runs under. Moved only through
+    /// [`Self::set_schema`].
     schema: SchemaDescriptor,
 }
 
@@ -203,8 +209,7 @@ impl Batch {
     }
 
     /// Zero-allocation empty batch with this batch's exact shape (strides,
-    /// region count, schema) — honest for schema-less join-shaped batches too.
-    /// The empty return / swap-placeholder constructor.
+    /// region count, schema). The empty return / swap-placeholder constructor.
     fn empty_like(&self) -> Self {
         Self::empty_from(self.strides, &self.schema)
     }
@@ -220,17 +225,8 @@ impl Batch {
     /// (poisoned in debug builds): every counted row must have every region written.
     pub fn with_capacity(schema: &SchemaDescriptor, rows: usize) -> Self {
         let (strides, nr) = strides_from_schema(schema);
-        let mut b = Batch {
-            data: Vec::new(),
-            blob: Vec::new(),
-            dead_heap: 0,
-            offsets: [0usize; MAX_BATCH_REGIONS],
-            strides,
-            capacity: rows,
-            count: 0,
-            layout: Layout::Raw,
-            schema: *schema,
-        };
+        let mut b = Self::empty_from(strides, schema);
+        b.capacity = rows;
         let total_size = compute_offsets_into(&strides, nr as usize, rows, &mut b.offsets);
         // SAFETY: a `Batch` reads no row at or past `count`, which is 0.
         b.data = unsafe { acquire_uninit(total_size) };
@@ -264,22 +260,11 @@ impl Batch {
     /// `vec![0u8; _]` deliberately — a calloc of this size is demand-zero mmap
     /// the caller never faults in, where `with_capacity` + a memset would touch
     /// every page of what is routinely a 256 MiB arena.
-    ///
-    /// Not `#[cfg(test)]`: `gnitz-store-testkit`'s helpers reach it as published
-    /// API.
     pub fn zeroed(schema: &SchemaDescriptor, rows: usize) -> Self {
         let (strides, nr) = strides_from_schema(schema);
-        let mut b = Batch {
-            data: Vec::new(),
-            blob: Vec::new(),
-            dead_heap: 0,
-            offsets: [0usize; MAX_BATCH_REGIONS],
-            strides,
-            capacity: rows.max(1),
-            count: rows,
-            layout: Layout::Raw,
-            schema: *schema,
-        };
+        let mut b = Self::empty_from(strides, schema);
+        b.capacity = rows.max(1);
+        b.count = rows;
         let total_size = compute_offsets_into(&strides, nr as usize, rows.max(1), &mut b.offsets);
         b.data = vec![0u8; total_size];
         b
@@ -290,26 +275,29 @@ impl Batch {
     pub(in crate::storage) fn from_mem_batch(mb: &MemBatch, schema: &SchemaDescriptor) -> Self {
         let (strides, nr) = strides_from_schema(schema);
         let nr = nr as usize;
-        let mut offsets = [0usize; MAX_BATCH_REGIONS];
-        let size = compute_offsets_into(&strides, nr, mb.count, &mut offsets);
+        let mut b = Self::empty_from(strides, schema);
+        let size = compute_offsets_into(&strides, nr, mb.count, &mut b.offsets);
         // SAFETY: `data` holds exactly `count` rows, all written by
         // `copy_regions`; distinct allocations; `mb`'s regions hold `count ×
         // stride` bytes each (a `Batch` by construction, a wire view by its parse).
-        let mut data = unsafe { acquire_uninit(size) };
-        unsafe { copy_regions(mb.data, mb.offsets, &mut data, &offsets, &strides, REG_PK..nr, mb.count) };
-        let mut blob = acquire_arena(mb.blob.len());
-        blob.extend_from_slice(mb.blob);
-        Batch {
-            data,
-            blob,
-            dead_heap: mb.dead_heap,
-            offsets,
-            strides,
-            capacity: mb.count,
-            count: mb.count,
-            layout: Layout::Raw,
-            schema: *schema,
-        }
+        b.data = unsafe { acquire_uninit(size) };
+        unsafe {
+            copy_regions(
+                mb.data,
+                mb.offsets,
+                &mut b.data,
+                &b.offsets,
+                &strides,
+                REG_PK..nr,
+                mb.count,
+            )
+        };
+        b.blob = acquire_arena(mb.blob.len());
+        b.blob.extend_from_slice(mb.blob);
+        b.dead_heap = mb.dead_heap;
+        b.capacity = mb.count;
+        b.count = mb.count;
+        b
     }
 
     // ── Schema installation ─────────────────────────────────────────────
@@ -754,35 +742,32 @@ impl Batch {
         self.data[dst_off..dst_off + n * stride].copy_from_slice(&src_region_data[src_off..src_off + n * stride]);
     }
 
-    /// Open an [`AppendSession`] over this batch. Every bulk append runs through
-    /// one; `hint_rows` sizes its blob dedup cache.
+    /// Open an [`AppendSession`] over this batch; `hint_rows` sizes its blob
+    /// dedup cache.
     pub(crate) fn append_session(&mut self, hint_rows: usize) -> AppendSession<'_> {
-        AppendSession::open(self, hint_rows)
+        AppendSession {
+            mask: self.schema.string_payload_slots(),
+            dst: self,
+            cache: BlobCache::new(hint_rows),
+        }
     }
 
-    /// The one bulk-append body: copy every `[start, end)` row range of `src`, in
-    /// list order, onto `self`'s tail. `start <= end <= src.count` per range, and
-    /// `self` must share `src`'s schema (column count and strides).
-    ///
-    /// Non-STRING payload columns: one `copy_from_slice` per region per range.
-    /// STRING payload columns (`string_mask`) follow `heap`.
-    ///
-    /// Taking the whole list rather than one range hoists the fixed per-call
-    /// setup — the capacity reserve, the blob reserve, and the payload
-    /// string-column map — out of the range loop. A predicate uncorrelated with
-    /// the PK order yields thousands of 1-row ranges per chunk, where that setup
-    /// otherwise dominates the copy it is setting up.
-    ///
-    /// Downgrades the layout to `Raw`: any append can break (PK, payload) order or
-    /// introduce a duplicate/ghost, so no prior claim survives. This closes the
-    /// W2M-decode trap where a stale strong claim could outlive an appender.
+    /// Copy every `[start, end)` range of `src`, a batch of this one's layout,
+    /// onto the tail: fixed-width regions in bulk, string cells rebased per
+    /// `heap_at`. Leaves the layout `Raw`.
     fn append_ranges_inner(
         &mut self,
         src: &MemBatch<'_>,
         ranges: &[(usize, usize)],
         string_mask: u64,
-        mut heap: HeapArm<'_>,
+        heap_at: Option<usize>,
+        cache: &mut BlobCache,
     ) {
+        debug_assert_eq!(
+            src.pk_stride,
+            self.pk_stride(),
+            "append_ranges_inner: a source of another layout"
+        );
         let total: usize = ranges
             .iter()
             .map(|&(start, end)| {
@@ -800,7 +785,7 @@ impl Batch {
         }
         self.reserve_rows(total);
         let npc = self.num_payload_cols();
-        if matches!(heap, HeapArm::Relocate(_)) && !src.blob.is_empty() {
+        if heap_at.is_none() && !src.blob.is_empty() {
             // The rows this call copies, not the whole source heap: a many-run merge
             // appends into one output, and the whole heap per run ratchets capacity.
             self.reserve_blob(merge::prorated_blob_cap(src.blob.len(), src.count, total));
@@ -824,7 +809,8 @@ impl Batch {
                         cells,
                         src.blob,
                         &mut self.blob,
-                        &mut heap,
+                        heap_at,
+                        cache,
                     );
                 } else if cs > 0 {
                     self.bulk_copy_region(r, src.col_data(pi, cs), start, end);
@@ -836,14 +822,8 @@ impl Batch {
     }
 }
 
-/// An open append into one destination batch — the only way to reach
-/// [`Batch::append_ranges_inner`], so no caller can skip its setup or repay it.
-///
-/// That setup — the payload string-column mask and one pooled blob dedup cache —
-/// is resolved once and reused by every push, which is what makes a *run*-at-a-
-/// time appender viable. A merge whose runs are short is where that matters: two
-/// sorted streams of uniform 128-bit keys have an expected run length of 2, so
-/// the per-call setup would otherwise dominate the copy it sets up.
+/// An open append into one destination batch: the string-slot mask and blob
+/// dedup cache every push reuses, so appending runs of a row or two stays cheap.
 pub(crate) struct AppendSession<'d> {
     dst: &'d mut Batch,
     /// Bit `pi` set = payload slot `pi` is a German string.
@@ -851,33 +831,19 @@ pub(crate) struct AppendSession<'d> {
     cache: BlobCache,
 }
 
-impl<'d> AppendSession<'d> {
-    /// The session's blob dedup cache lives as long as it does, so repeated
-    /// long-string spans are appended once across every push.
-    pub(crate) fn open(dst: &'d mut Batch, hint_rows: usize) -> Self {
-        let mask = dst.schema.string_payload_slots();
-        AppendSession {
-            dst,
-            mask,
-            cache: BlobCache::new(hint_rows),
-        }
-    }
-
+impl AppendSession<'_> {
     /// [`Batch::carry_heap`] into the session's destination: the `heap_at` to
     /// push `src`'s rows at.
     pub(crate) fn carry(&mut self, src: &MemBatch<'_>, kept: &[(usize, usize)]) -> Option<usize> {
-        self.dst.carry_heap(src, self.mask, kept)
+        self.dst.carry_heap(src, self.mask, self.mask, kept)
     }
 
     /// Append every listed range of `src`, in list order: its string cells
     /// shifted onto its heap carried at `heap_at`, or relocated under the
     /// session's cache.
     pub(crate) fn push_ranges(&mut self, src: &MemBatch<'_>, heap_at: Option<usize>, ranges: &[(usize, usize)]) {
-        let heap = match heap_at {
-            Some(base) => HeapArm::At(base),
-            None => HeapArm::Relocate(&mut self.cache),
-        };
-        self.dst.append_ranges_inner(src, ranges, self.mask, heap);
+        self.dst
+            .append_ranges_inner(src, ranges, self.mask, heap_at, &mut self.cache);
     }
 
     /// Append one row of `src` at an explicit weight, under the session's own
@@ -955,12 +921,11 @@ impl Batch {
     ///
     /// The one exception is a run out of a `RunSet`, which `RunSet::push` already
     /// verified on the way in.
-    #[cfg_attr(not(debug_assertions), allow(unused_variables))]
     #[inline]
-    pub(crate) fn consolidated_verified(&self, schema: &SchemaDescriptor) -> bool {
+    pub(crate) fn consolidated_verified(&self) -> bool {
         #[cfg(debug_assertions)]
         if self.layout == Layout::Consolidated {
-            self.debug_verify_consolidated(schema);
+            self.debug_verify_consolidated(&self.schema);
         }
         self.is_consolidated()
     }
@@ -1037,9 +1002,8 @@ impl Batch {
         self.layout = Layout::Raw;
     }
 
-    /// Copy `src`'s already-verified layout tag without re-verifying. Sound only
-    /// where this batch is a source-order subsequence of `src`, which preserves
-    /// order, weights and (PK, payload) distinctness alike.
+    /// Copy `src`'s layout tag without re-verifying: sound for a copy of `src`
+    /// that keeps its (PK, payload) order, distinctness and weights.
     #[inline]
     pub(crate) fn inherit_layout(&mut self, src: &Batch) {
         self.layout = src.layout;
@@ -1101,20 +1065,15 @@ impl Batch {
     /// unused capacity and inter-region padding, so a caller sizing a RAM budget
     /// against it is measuring rows held, not bytes allocated.
     pub(crate) fn total_bytes(&self) -> usize {
-        let nr = self.arena_regions();
-        let mut total = self.blob.len();
-        for i in 0..nr {
-            total += self.count * self.strides[i] as usize;
-        }
-        total
+        self.count * row_width(self.strides()) + self.blob.len()
     }
 
     /// The rows `indices` names, in that order, at their own weights; none may be
     /// weight 0.
-    pub(crate) fn from_indexed_rows(batch: &MemBatch, indices: &[u32], schema: &SchemaDescriptor) -> Self {
-        let blob_cap = merge::prorated_blob_cap(batch.blob.len(), batch.count, indices.len());
-        write_to_batch(schema, indices.len(), blob_cap, |writer| {
-            super::scatter::scatter_copy(batch, indices, writer);
+    pub(crate) fn indexed_rows(&self, indices: &[u32]) -> Self {
+        let blob_cap = merge::prorated_blob_cap(self.blob.len(), self.count, indices.len());
+        write_to_batch(&self.schema, indices.len(), blob_cap, |writer| {
+            super::scatter::scatter_copy(&self.as_mem_batch(), indices, writer);
         })
     }
 
@@ -1122,14 +1081,14 @@ impl Batch {
     /// layout: taking rows in source order preserves (PK, payload) ordering and
     /// leaves weights untouched, so a consolidated source yields a consolidated
     /// subset. A reordering caller wants
-    /// [`from_indexed_rows`](Self::from_indexed_rows), whose weight-0 precondition
+    /// [`indexed_rows`](Self::indexed_rows), whose weight-0 precondition
     /// this inherits.
     pub fn ascending_subset(&self, indices: &[u32]) -> Self {
         debug_assert!(
             indices.windows(2).all(|w| w[0] < w[1]),
             "ascending_subset requires a strictly ascending index list",
         );
-        let mut out = Self::from_indexed_rows(&self.as_mem_batch(), indices, &self.schema);
+        let mut out = self.indexed_rows(indices);
         out.inherit_layout(self);
         out
     }
@@ -1182,80 +1141,35 @@ impl Batch {
         let n = self.count;
         let mut out = Self::with_capacity(out_schema, n);
         out.count = n;
-        let mut cache;
-        let mut heap = match out.carry_heap(&self.as_mem_batch(), in_schema.string_payload_slots(), &[(0, n)]) {
-            Some(base) => HeapArm::At(base),
-            None => {
-                cache = BlobCache::new(n);
-                HeapArm::Relocate(&mut cache)
-            }
-        };
+        let mask = in_schema.string_payload_slots();
+        let heap_at = out.carry_heap(&self.as_mem_batch(), mask, mask, &[(0, n)]);
+        let mut cache = BlobCache::new(n);
         out.weight_data_mut().copy_from_slice(self.weight_data());
         for (pi, col) in in_schema.payload_columns() {
             let src = &self.col_data(pi)[..n * col.size() as usize];
             let (dst, _, dst_blob) = out.col_null_and_blob_mut(first_slot + pi);
             match col.type_code.is_german_string() {
-                true => copy_string_cells(dst, src, &self.blob, dst_blob, &mut heap),
+                true => copy_string_cells(dst, src, &self.blob, dst_blob, heap_at, &mut cache),
                 false => dst.copy_from_slice(src),
             }
         }
         out
     }
 
-    /// Copy every row into `out_schema`, whose key is `prefix` (eight big-endian
-    /// bytes) followed by this batch's own key and whose payload space is
-    /// unchanged — the shape [`crate::schema::make_delta_schema`] derives.
-    ///
-    /// Prepending one constant to every key preserves both sortedness and
-    /// distinctness, so the layout claim carries across: a batch that arrives
-    /// `Consolidated` stays `Consolidated`.
-    pub(crate) fn stamped_with_pk_prefix(&self, out_schema: &SchemaDescriptor, prefix: u64) -> Self {
-        let in_schema = &self.schema;
-        let in_stride = in_schema.pk_stride();
-        let out_stride = out_schema.pk_stride();
-        let stamp_bytes = DELTA_TICK_COL.size() as usize;
-        debug_assert_eq!(out_stride, in_stride + stamp_bytes);
-        debug_assert_eq!(out_schema.num_payload_cols(), in_schema.num_payload_cols());
+    /// Every row copied into `out_schema`, whose payload space is this batch's;
+    /// each output key written by `rekey(src_key, dst_key)`. Left `Raw`.
+    pub(crate) fn rekeyed(&self, out_schema: &SchemaDescriptor, rekey: impl Fn(&[u8], &mut [u8])) -> Batch {
+        debug_assert_eq!(out_schema.num_payload_cols(), self.schema.num_payload_cols());
         let mut output = self.shell_for(out_schema, 0);
         output.null_bmp_data_mut().copy_from_slice(self.null_bmp_data());
-
-        let stamp = prefix.to_be_bytes();
-        let src_pk = self.pk_data();
+        let out_stride = out_schema.pk_stride();
+        let in_stride = self.schema.pk_stride();
         for (dst, src) in output
             .pk_data_mut()
             .chunks_exact_mut(out_stride)
-            .zip(src_pk.chunks_exact(in_stride))
+            .zip(self.pk_data().chunks_exact(in_stride))
         {
-            dst[..stamp_bytes].copy_from_slice(&stamp);
-            dst[stamp_bytes..].copy_from_slice(src);
-        }
-
-        output.inherit_layout(self);
-        output
-    }
-
-    /// The inverse of [`Self::stamped_with_pk_prefix`]: copy every row into
-    /// `out_schema`, whose key is this batch's key minus its leading eight-byte
-    /// prefix and whose payload space is unchanged.
-    ///
-    /// Left `Raw`: dropping the leading prefix preserves neither sortedness nor
-    /// distinctness once the batch spans more than one prefix value.
-    pub(crate) fn unstamped(&self, out_schema: &SchemaDescriptor) -> Self {
-        let in_schema = &self.schema;
-        let in_stride = in_schema.pk_stride();
-        let out_stride = out_schema.pk_stride();
-        let stamp_bytes = DELTA_TICK_COL.size() as usize;
-        debug_assert_eq!(in_stride, out_stride + stamp_bytes);
-        debug_assert_eq!(out_schema.num_payload_cols(), in_schema.num_payload_cols());
-        let mut output = self.shell_for(out_schema, 0);
-        output.null_bmp_data_mut().copy_from_slice(self.null_bmp_data());
-        let src_pk = self.pk_data();
-        for (dst, src) in output
-            .pk_data_mut()
-            .chunks_exact_mut(out_stride)
-            .zip(src_pk.chunks_exact(in_stride))
-        {
-            dst.copy_from_slice(&src[stamp_bytes..]);
+            rekey(src, dst);
         }
         output
     }
@@ -1333,29 +1247,29 @@ impl Batch {
         unsafe { super::seek::seek_advance_to(self.count, stride, cp, key, hint) }
     }
 
-    /// Bulk-copy every `[start, end)` range of `src`, in list order, onto this
-    /// batch's tail — the one bulk-append entry point, relocating German-string
-    /// blob data into `self`'s heap. One capacity reserve, one string-column mask
-    /// and one blob dedup cache serve the whole list, so a filter pass's thousands
-    /// of one-row ranges pay it once.
+    /// Copy every `[start, end)` range of `src`, ascending and disjoint, onto
+    /// this batch's tail, one append setup serving the whole list.
     pub(crate) fn append_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)]) {
-        self.append_counted_ranges(src, ranges, range_rows(ranges));
-    }
-
-    /// [`Self::append_ranges`] with the ranges' row count already in hand.
-    fn append_counted_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)], rows: usize) {
+        let rows = range_rows(ranges);
         // Before the session, which derives a payload string mask and takes a
         // pooled blob cache to copy nothing. An all-DELETE push emits one empty
         // range per row.
         if rows == 0 {
             return;
         }
-        self.append_session(rows).push_ranges(src, None, ranges);
+        let mut s = self.append_session(rows);
+        let at = s.carry(src, ranges);
+        s.push_ranges(src, at, ranges);
     }
 
-    /// Rows `[start, end)` of another `Batch` of the same schema.
-    pub fn append_batch(&mut self, src: &Batch, start: usize, end: usize) {
-        self.append_ranges(&src.as_mem_batch(), &[(start, end)]);
+    /// Copy every row of `src` onto this batch's tail.
+    pub fn append_batch(&mut self, src: &Batch) {
+        debug_assert_eq!(
+            src.schema.nullable_payload_slots() & !self.schema.nullable_payload_slots(),
+            0,
+            "append_batch: the source admits a NULL this batch's label refuses",
+        );
+        self.append_ranges(&src.as_mem_batch(), &[(0, src.count)]);
     }
 
     /// All of `next`, every row of which sorts above every row of this batch in
@@ -1373,7 +1287,7 @@ impl Batch {
             );
         }
         let consolidated = self.is_consolidated() && next.is_consolidated();
-        self.append_batch(&next, 0, next.count);
+        self.append_batch(&next);
         if consolidated {
             self.layout = Layout::Consolidated;
         }
@@ -1381,24 +1295,9 @@ impl Batch {
 
     /// The rows of `src`'s disjoint ascending `[start, end)` ranges, inheriting its
     /// layout, in an arena with room for `spare_rows` more.
-    pub(crate) fn from_ranges(
-        src: &Batch,
-        ranges: &[(usize, usize)],
-        schema: &SchemaDescriptor,
-        spare_rows: usize,
-    ) -> Batch {
-        debug_assert!(
-            ranges.windows(2).all(|w| w[0].1 <= w[1].0),
-            "from_ranges: ranges must be disjoint and ascending",
-        );
-        let rows = range_rows(ranges);
-        let mut out = Batch::with_capacity(schema, rows + spare_rows);
-        if rows > 0 {
-            let mb = src.as_mem_batch();
-            let mut sink = out.append_session(rows);
-            let heap_at = sink.carry(&mb, ranges);
-            sink.push_ranges(&mb, heap_at, ranges);
-        }
+    pub(crate) fn from_ranges(src: &Batch, ranges: &[(usize, usize)], spare_rows: usize) -> Batch {
+        let mut out = Batch::with_capacity(&src.schema, range_rows(ranges) + spare_rows);
+        out.append_ranges(&src.as_mem_batch(), ranges);
         out.inherit_layout(src);
         out
     }
@@ -1411,11 +1310,8 @@ impl Batch {
             blob += src.blob.len();
         }
         let mut out = Batch::with_capacity_blob(schema, rows, blob);
-        let mut sink = out.append_session(rows);
         for src in sources {
-            let whole = [(0, src.count)];
-            let heap_at = sink.carry(&src, &whole);
-            sink.push_ranges(&src, heap_at, &whole);
+            out.append_ranges(&src, &[(0, src.count)]);
         }
         out
     }
@@ -1457,26 +1353,37 @@ impl Batch {
         self.downgrade();
     }
 
-    /// Append `src`'s heap onto this batch's, for copying its ascending `kept`
-    /// ranges, when [`merge::carried_dead`] prefers it: the base those rows'
-    /// cells shift by, the long bytes of every other row charged dead. `None`
-    /// appends nothing; the caller relocates. `mask` names `src`'s German-string
-    /// payload slots.
-    pub(crate) fn carry_heap(&mut self, src: &MemBatch<'_>, mask: u64, kept: &[(usize, usize)]) -> Option<usize> {
+    /// Carry `src`'s heap onto this one to copy the string slots `kept_slots`
+    /// of the rows `kept`, unless relocating them is cheaper or the carried heap
+    /// would be wasteful. Returns the base the copied cells shift by, with every
+    /// byte they cannot reference charged dead. `mask` is `src`'s string slots.
+    pub(crate) fn carry_heap(
+        &mut self,
+        src: &MemBatch<'_>,
+        mask: u64,
+        kept_slots: u64,
+        kept: &[(usize, usize)],
+    ) -> Option<usize> {
         debug_assert!(kept.windows(2).all(|w| w[0].1 <= w[1].0) && kept.last().is_none_or(|k| k.1 <= src.count));
-        let excluded = || {
-            let gaps = kept
-                .iter()
-                .copied()
-                .chain([(src.count, src.count)])
-                .scan(0, |next, (start, end)| {
-                    let gap = *next..start;
-                    *next = end;
-                    Some(gap)
-                });
-            gaps.flatten().map(|row| merge::row_long_bytes(src, mask, row)).sum()
-        };
-        let dead = merge::carried_dead(src.blob.len(), src.dead_heap, src.count, range_rows(kept), excluded)?;
+        debug_assert_eq!(kept_slots & !mask, 0, "carry_heap: a kept slot is not a string slot");
+        let heap = src.blob.len();
+        if kept_slots == 0 && heap != 0 {
+            return None;
+        }
+        let mut dead = src.dead_heap;
+        for pi in gnitz_wire::BitIter(mask & !kept_slots) {
+            let cells = src.col_data(pi, 16).as_chunks::<16>().0;
+            for &(start, end) in kept {
+                for run in cells[start..end].chunks(DEAD_CHECK_CELLS) {
+                    dead += run.iter().map(|cell| merge::cell_long_bytes(cell)).sum::<usize>();
+                    if merge::heap_is_wasteful(dead, heap) {
+                        return None;
+                    }
+                }
+            }
+        }
+        let excluded = || merge::long_bytes_outside(src, mask, kept);
+        let dead = merge::carried_dead(heap, dead, src.count, range_rows(kept), excluded)?;
         let base = self.blob.len();
         self.reserve_blob(src.blob.len());
         self.blob.extend_from_slice(src.blob);
@@ -1528,7 +1435,7 @@ impl Batch {
     /// Append `cell` into output slot `out_pi`, relocating a STRING/BLOB struct
     /// into `self.blob` against `src_blob`.
     #[inline(always)]
-    pub(crate) fn append_payload_cell(
+    fn append_payload_cell(
         &mut self,
         out_pi: usize,
         type_code: TypeCode,
@@ -1572,8 +1479,8 @@ impl Batch {
         }
     }
 
-    /// Consume this batch, consolidating it if needed. The returned batch is
-    /// certified `Consolidated`.
+    /// Consume this batch, consolidating it under its own label if needed. The
+    /// returned batch is certified `Consolidated`.
     ///
     /// Fast path: an already-consolidated (or empty) `self` is returned by move,
     /// allocating nothing. Slow path: sorts and weight-folds into a fresh batch,
@@ -1582,23 +1489,23 @@ impl Batch {
     /// `#[inline]`: the move is still a 1 KiB struct copy, and the call is
     /// cross-crate, so without a hint it is not an inline candidate outside LTO.
     #[inline]
-    pub fn into_consolidated(mut self, schema: &SchemaDescriptor) -> Batch {
-        if self.consolidated_verified(schema) {
+    pub fn into_consolidated(mut self) -> Batch {
+        if self.consolidated_verified() {
             // Already consolidated, or empty (structurally consolidated): return
             // by move. Pin the tag so an empty `Raw` batch still reports
             // `Consolidated` to downstream trust sites.
             self.layout = Layout::Consolidated;
             return self;
         }
-        Self::consolidate_into_new(&self, schema)
+        Self::consolidate_into_new(&self)
     }
 
     /// Consolidate this batch where it stands. The tag is read first so an
     /// already-folded batch is not moved out and back for nothing;
     /// [`Self::into_consolidated`] then owns the fold.
-    pub fn consolidate_in_place(&mut self, schema: &SchemaDescriptor) {
+    pub fn consolidate_in_place(&mut self) {
         if !self.is_consolidated() {
-            *self = self.take().into_consolidated(schema);
+            *self = self.take().into_consolidated();
         }
     }
 
@@ -1608,17 +1515,17 @@ impl Batch {
     ///
     /// Idiomatic usage:
     /// ```ignore
-    /// let cs = Batch::consolidate_if_needed(delta, schema);
+    /// let cs = Batch::consolidate_if_needed(delta);
     /// let c: &Batch = cs.as_ref().unwrap_or(delta);
     /// ```
-    pub(crate) fn consolidate_if_needed(batch: &Batch, schema: &SchemaDescriptor) -> Option<Batch> {
-        (!batch.consolidated_verified(schema)).then(|| Self::consolidate_into_new(batch, schema))
+    pub(crate) fn consolidate_if_needed(batch: &Batch) -> Option<Batch> {
+        (!batch.consolidated_verified()).then(|| Self::consolidate_into_new(batch))
     }
 
     /// An owned, certified-`Consolidated` copy: folds if needed, else clones and
     /// pins the tag. The borrowed counterpart of [`Self::into_consolidated`].
-    pub(crate) fn to_consolidated(&self, schema: &SchemaDescriptor) -> Batch {
-        match Self::consolidate_if_needed(self, schema) {
+    pub(crate) fn to_consolidated(&self) -> Batch {
+        match Self::consolidate_if_needed(self) {
             Some(folded) => folded,
             None => {
                 let mut c = Batch::clone(self);
@@ -1633,7 +1540,8 @@ impl Batch {
     ///
     /// The fold runs first so the arena is sized to the survivor count, not the
     /// input row count.
-    fn consolidate_into_new(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
+    fn consolidate_into_new(batch: &Batch) -> Batch {
+        let schema = &batch.schema;
         let mb = batch.as_mem_batch();
         let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(batch.count);
         merge::consolidate_groups(&mb, schema, &mut survivors);
@@ -1651,7 +1559,7 @@ impl Batch {
         if merge::heap_is_wasteful(self.dead_heap, self.blob.len()) {
             self.dead_heap = super::batch_wire::measure_dead_heap(&self.as_mem_batch(), &self.schema);
             if merge::heap_is_wasteful(self.dead_heap, self.blob.len()) {
-                return self.compacted(0..self.count);
+                return self.compacted();
             }
         }
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
@@ -1663,12 +1571,12 @@ impl Batch {
         Batch::clone(&self)
     }
 
-    /// `rows` as a tight batch of their own, every long string relocated, so its
-    /// heap holds no dead bytes. A contiguous source-order subrange keeps order
-    /// and distinctness, so the layout claim carries.
-    pub(crate) fn compacted(&self, rows: Range<usize>) -> Batch {
-        let mut out = Batch::with_capacity(&self.schema, rows.len());
-        out.append_batch(self, rows.start, rows.end);
+    /// A tight copy with every long string relocated, so its heap holds no
+    /// dead bytes.
+    pub(crate) fn compacted(&self) -> Batch {
+        let n = self.count;
+        let mut out = Batch::with_capacity(&self.schema, n);
+        out.append_session(n).push_ranges(&self.as_mem_batch(), None, &[(0, n)]);
         out.inherit_layout(self);
         out
     }
@@ -1763,7 +1671,15 @@ pub(crate) fn write_to_batch(
     }
     let mut b = Batch::with_capacity_blob(schema, max_rows, max_blob);
     let rows = {
-        let mut writer = merge::DirectWriter::over_arena(&mut b.data, &b.schema, b.capacity, &mut b.blob);
+        let nr = b.arena_regions();
+        let mut writer = merge::DirectWriter::over_regions(
+            &mut b.data,
+            &b.offsets[..nr],
+            &b.strides[..nr],
+            b.capacity,
+            &b.schema,
+            &mut b.blob,
+        );
         write_fn(&mut writer);
         writer.count
     };

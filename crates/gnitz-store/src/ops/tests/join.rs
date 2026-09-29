@@ -36,7 +36,7 @@ fn join(
 ) -> Batch {
     let p = plan(kind, delta_is_right, delta_schema, trace_schema);
     // The VM hands the kernel a folded register; these fixtures build raw ones.
-    let cs = Batch::consolidate_if_needed(delta, delta_schema);
+    let cs = Batch::consolidate_if_needed(delta);
     op_join_delta_trace(cs.as_ref().unwrap_or(delta), cursor, &p.out_schema, p.probe)
 }
 
@@ -822,8 +822,8 @@ fn assert_matches_reference(
     what: &str,
 ) -> usize {
     let p = plan(kind, delta_is_right, &delta_schema, &trace_schema);
-    let cs = Batch::consolidate_if_needed(delta, &delta_schema);
-    let trace = Batch::consolidate_if_needed(&trace, &trace_schema).unwrap_or(trace);
+    let cs = Batch::consolidate_if_needed(delta);
+    let trace = Batch::consolidate_if_needed(&trace).unwrap_or(trace);
     let (want, want_rows) = reference(
         kind,
         delta_is_right,

@@ -90,7 +90,7 @@ pub(crate) fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut Direc
     let base = writer.count; // first output row for this scatter
 
     width_dispatch!(
-        writer.pk_stride as usize,
+        writer.schema.pk_stride(),
         scatter_pk_wt_nbm,
         batch,
         indices,
@@ -106,7 +106,7 @@ pub(crate) fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut Direc
             for (out, &idx) in indices.iter().enumerate() {
                 let row = idx as usize;
                 let src_struct = batch.get_col_ptr(row, pi, 16);
-                writer.write_string_cell(pi, src_struct, batch.blob, base + out);
+                writer.write_string_cell(pi, src_struct, batch.blob, None, base + out);
             }
         } else {
             let src_col = batch.col_data(pi, cs);
@@ -185,7 +185,7 @@ pub(crate) fn scatter_unified_sources(
     let base = writer.count;
 
     width_dispatch!(
-        writer.pk_stride as usize,
+        writer.schema.pk_stride(),
         scatter_unified_pk_wt_nbm,
         sources,
         rows,
@@ -200,14 +200,7 @@ pub(crate) fn scatter_unified_sources(
             for (out, &(si, ri, _)) in rows.iter().enumerate() {
                 let src = unsafe { sources.get_unchecked(si as usize) };
                 let src_struct = unsafe { cols.get_unchecked(src.cols_off + pi).row(ri as usize, 16) };
-                match src.heap_at {
-                    Some(heap_at) => {
-                        let dst = &mut writer.col_bufs[pi][(base + out) * 16..(base + out + 1) * 16];
-                        dst.copy_from_slice(src_struct);
-                        gnitz_wire::shift_german_string_heaps(dst, heap_at);
-                    }
-                    None => writer.write_string_cell(pi, src_struct, src.blob, base + out),
-                }
+                writer.write_string_cell(pi, src_struct, src.blob, src.heap_at, base + out);
             }
         } else {
             let dst = &mut writer.col_bufs[pi][base * cs..];
@@ -219,7 +212,8 @@ pub(crate) fn scatter_unified_sources(
 }
 
 // The destination stride is the writer's; source reads keep `src.pk.stride`, so a
-// Constant region repeats its one row for every output row.
+// Constant region repeats its one row for every output row. A null word keeps
+// only the writer's payload columns' bits.
 #[inline(always)]
 fn scatter_unified_pk_wt_nbm<const PKS: usize>(
     sources: &[UnifiedSource<'_>],
@@ -233,6 +227,7 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
     let pk_dst = writer.pk.as_mut_ptr();
     let wt_dst = writer.weight.as_mut_ptr();
     let nbm_dst = writer.null_bmp.as_mut_ptr();
+    let keep = gnitz_wire::low_bits_mask(writer.schema.num_payload_cols());
     for (out, &(si, ri, w)) in rows.iter().enumerate() {
         let src = unsafe { sources.get_unchecked(si as usize) };
         let dst_row = base + out;
@@ -242,7 +237,7 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
         unsafe {
             std::ptr::copy_nonoverlapping(pk_ptr, pk_dst.add(dst_row * pks), pks);
             std::ptr::copy_nonoverlapping(wb.as_ptr(), wt_dst.add(dst_row * FB), FB);
-            let nbm = (nbm_ptr as *const u64).read_unaligned() | src.null_pad_mask;
+            let nbm = ((nbm_ptr as *const u64).read_unaligned() | src.null_pad_mask) & keep;
             (nbm_dst.add(dst_row * FB) as *mut u64).write_unaligned(nbm);
         }
     }

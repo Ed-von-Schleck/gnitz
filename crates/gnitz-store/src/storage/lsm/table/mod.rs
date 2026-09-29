@@ -283,12 +283,12 @@ impl Table {
     /// calls it once per epoch.
     #[inline]
     pub(crate) fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
-        self.push_memtable(batch.into_consolidated(&self.shard_index.schema))
+        self.push_memtable(batch.into_consolidated())
     }
 
     /// [`Self::ingest_owned_batch`] for a caller that keeps reading `batch`.
     pub(crate) fn ingest_borrowed_batch(&mut self, batch: &Batch) -> Result<(), StorageError> {
-        self.push_memtable(batch.to_consolidated(&self.shard_index.schema))
+        self.push_memtable(batch.to_consolidated())
     }
 
     /// The tail both entry points share, taking a batch already certified

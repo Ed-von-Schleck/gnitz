@@ -52,7 +52,7 @@ fn op_reduce(
     let plan = make_plan(input_schema, group_by_cols, agg_descs, seeds_ground);
     // The VM folds the register before both the kernel and the value index.
     let cs = (!plan.is_exact_linear())
-        .then(|| Batch::consolidate_if_needed(delta, input_schema))
+        .then(|| Batch::consolidate_if_needed(delta))
         .flatten();
     let delta = cs.as_ref().unwrap_or(delta);
     // A non-linear reduce always carries a value index. `None` from a caller
@@ -4729,9 +4729,9 @@ impl Instance {
     /// One epoch over `delta`, the trace being everything emitted before it.
     fn tick(&mut self, delta: &Batch) -> Batch {
         let schema = self.plan.shape.output_schema;
-        let trace = Batch::concat(&schema, self.emitted.iter().map(Batch::as_mem_batch)).into_consolidated(&schema);
-        let out = super::op_reduce::op_reduce(delta, &mut trace_cursor(trace, schema), None, &self.plan)
-            .into_consolidated(&schema);
+        let trace = Batch::concat(&schema, self.emitted.iter().map(Batch::as_mem_batch)).into_consolidated();
+        let out =
+            super::op_reduce::op_reduce(delta, &mut trace_cursor(trace, schema), None, &self.plan).into_consolidated();
         self.emitted.push(Batch::clone(&out));
         out
     }
@@ -4787,7 +4787,7 @@ fn two_workers_partials_combine_to_the_funnels_output() {
         assert_eq!(reduce_rows(&combined), reduce_rows(&want), "tick {i}");
     }
     // The last tick emptied the group: the ground row stands, at V₀.
-    let net = Batch::concat(&partials, combine.emitted.iter().map(Batch::as_mem_batch)).into_consolidated(&partials);
+    let net = Batch::concat(&partials, combine.emitted.iter().map(Batch::as_mem_batch)).into_consolidated();
     assert_eq!(
         reduce_rows(&net),
         vec![(gnitz_wire::global_group_key(), 1, vec![0, 0, 0])]

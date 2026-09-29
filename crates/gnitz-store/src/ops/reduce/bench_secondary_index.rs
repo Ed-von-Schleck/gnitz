@@ -197,7 +197,7 @@ fn decompose(label: &str, bake: AviBake, input: Batch) {
         ITERS,
         || avi_batch(input, bake),
         |b| {
-            std::hint::black_box(b.into_consolidated(&avi_schema));
+            std::hint::black_box(b.into_consolidated());
         },
     );
     // A fresh table per iteration, opened outside the clock: an ingest into a
@@ -234,7 +234,7 @@ fn bench_single_pk_sort(label: &str, pk_schema: SchemaDescriptor, pk_bytes_for: 
         out
     };
     let sort = bench_time(ITERS, || {
-        std::hint::black_box(build().into_consolidated(&pk_schema));
+        std::hint::black_box(build().into_consolidated());
     });
     let s = ns_per_row(sort);
     println!(

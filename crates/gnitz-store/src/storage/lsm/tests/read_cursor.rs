@@ -1244,7 +1244,7 @@ fn a_skeleton_row_coarsens_its_whole_pk_group() {
             bb.put_null();
         }
         bb.end_row();
-        let mem = Rc::new(bb.finish().into_consolidated(&schema));
+        let mem = Rc::new(bb.finish().into_consolidated());
 
         let mut c = create_read_cursor(&[mem], &[sk], schema);
         assert_eq!(
