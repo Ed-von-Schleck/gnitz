@@ -275,11 +275,6 @@ impl Table {
         self.resumed_from_checkpoint
     }
 
-    /// Durably unlink this store's manifest, so no reopen reloads its shards.
-    pub(crate) fn unlink_manifest(self) -> Result<(), StorageError> {
-        super::manifest::unlink(&self.shard_index.output_dir)
-    }
-
     /// See [`ShardIndex::append_terminal_run`].
     pub(crate) fn append_terminal_run(&mut self, run: &Batch) -> Result<(), StorageError> {
         self.cached_full_scan.set(None);

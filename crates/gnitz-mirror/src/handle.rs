@@ -241,10 +241,10 @@ impl MirrorStore for Mirror {
             let erased = match level {
                 Invalidate::Cursor => return Ok(()),
                 Invalidate::Copy => {
+                    // A rederived open with no resume point erases the copy.
                     let spec = copy_spec(tid, m.copy(tid).schema());
-                    m.registry
-                        .unregister_and_erase(tid)
-                        .and_then(|()| m.registry.register(spec))
+                    m.registry.unregister(tid);
+                    m.registry.register(spec)
                 }
                 Invalidate::Registration => {
                     m.records.remove(&tid);

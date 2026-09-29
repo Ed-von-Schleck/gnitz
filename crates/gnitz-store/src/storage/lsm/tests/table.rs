@@ -47,7 +47,7 @@ fn is_compaction_output(t: &Table, path: &str) -> bool {
 
 /// Every shard file in `dir`, sorted.
 fn shard_files(dir: &std::path::Path) -> Vec<String> {
-    let prefix = super::super::naming::SHARD_PREFIX;
+    let prefix = super::super::manifest::SHARD_PREFIX;
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.flatten()
@@ -289,7 +289,7 @@ fn table_new_corrupted_manifest_preserves_stray_shard() {
     std::fs::write(&manifest_path, b"not a valid manifest").unwrap();
 
     // Drop a stray shard file.
-    let stray = tdir.join(super::super::naming::shard_name(1));
+    let stray = tdir.join(super::super::manifest::shard_name(1));
     std::fs::write(&stray, b"orphan").unwrap();
 
     let result = Table::new(
@@ -834,7 +834,7 @@ fn salreplay_spills_are_named_by_seq() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("salreplay_spill");
     let schema = make_schema_u64_i64();
-    let name = super::super::naming::shard_name;
+    let name = super::super::manifest::shard_name;
     // Small memtable budget forces overflow → fold_to_ram; tiny ceiling forces
     // the folded L0 to spill.
     let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
@@ -1362,7 +1362,7 @@ fn assert_unpublished_inputs_gone(t: &Table, dir: &std::path::Path, published: &
         .collect();
     for f in std::fs::read_dir(dir).unwrap().flatten() {
         let name = f.file_name().to_string_lossy().into_owned();
-        if name.starts_with(super::super::naming::SHARD_PREFIX) {
+        if name.starts_with(super::super::manifest::SHARD_PREFIX) {
             assert!(
                 name == published || live.contains(&name),
                 "superseded unpublished shard {name} is still on disk"

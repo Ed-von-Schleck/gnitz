@@ -4,8 +4,7 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use super::manifest::{ManifestEntry, ShardSet};
-use super::naming;
+use super::manifest::{self, ManifestEntry, ShardSet};
 use crate::schema::key::PkBuf;
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, pk_in_range};
 use crate::schema::SchemaDescriptor;
@@ -134,7 +133,7 @@ impl ShardIndex {
             .iter()
             .flat_map(|l| &l.guards)
             .flat_map(|g| &g.entries)
-            .map(|e| naming::shard_name(e.seq))
+            .map(|e| manifest::shard_name(e.seq))
             .collect()
     }
 }
@@ -196,7 +195,7 @@ pub(super) struct ShardEntry {
 impl ShardEntry {
     /// Open the shard drawn at `seq` in the store at `dir`.
     pub(crate) fn open(dir: &str, seq: u64, schema: &SchemaDescriptor, newest: u64) -> Result<Self, StorageError> {
-        let shard = Rc::new(MappedShard::open(&naming::shard_path(dir, seq), schema)?);
+        let shard = Rc::new(MappedShard::open(&manifest::shard_path(dir, seq), schema)?);
         let pk_min = PkBuf::from_bytes(shard.get_pk_bytes(0));
         let pk_max = PkBuf::from_bytes(shard.get_pk_bytes(shard.row_count() - 1));
         Ok(ShardEntry { shard, seq, newest, pk_min, pk_max })
@@ -376,7 +375,7 @@ pub(super) struct ShardIndex {
 
     /// The last seq drawn; a shard is named by its seq.
     shard_seq: u64,
-    /// The last seq the most recently renamed manifest could name; see
+    /// The last seq drawn when the most recently renamed manifest was built; see
     /// [`Self::published`].
     published_through: u64,
     /// Published shards the index has dropped, unlinked by
@@ -397,8 +396,8 @@ pub(super) struct ShardIndex {
 }
 
 impl ShardIndex {
-    /// Open the store at `output_dir` holding `shards`, unlinking every shard and
-    /// staging file there that `shards` does not name. `skip_pk_filter`: nothing
+    /// Open the store at `output_dir` holding `shards`, unlinking the staging file
+    /// and every shard `shards` does not name. `skip_pk_filter`: nothing
     /// probes this store by PK.
     pub(super) fn open(
         output_dir: &str,
@@ -435,8 +434,8 @@ impl ShardIndex {
         }
         idx.shard_seq = idx.all_entries().map(|e| e.seq).max().unwrap_or(0);
         idx.published_through = idx.shard_seq;
-        let live: HashSet<String> = idx.all_entries().map(|e| naming::shard_name(e.seq)).collect();
-        naming::remove_stale_files(output_dir, &live);
+        let live: HashSet<String> = idx.all_entries().map(|e| manifest::shard_name(e.seq)).collect();
+        manifest::remove_stale_files(output_dir, &live)?;
         Ok(idx)
     }
 

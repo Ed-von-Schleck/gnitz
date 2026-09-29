@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use gnitz_foundation::posix_io::{create_dir, fsync_dir};
 use gnitz_wire::PkColList;
 
-use super::{Relation, RelationRegistry, Store};
+use super::RelationRegistry;
 use crate::schema::Slot;
-use crate::storage::{manifest_path, published, retire_store, StorageError};
+use crate::storage::{manifest_path, read_intact, retire_store, StorageError};
 
 /// What a child directory holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -72,14 +72,14 @@ impl<'a> ChildAddr<'a> {
             None => (None, name.strip_prefix('w')?),
         };
         let (rank, of) = slot.split_once("of")?;
-        let (rank, of) = (parse_id(rank)?, parse_id(of)?);
+        let (rank, of) = (rank.parse().ok()?, of.parse().ok()?);
         let slot = (rank < of).then_some(Slot { rank, of })?;
         let kind = match prefix {
             None => ChildKind::Rows,
             Some("delta") => ChildKind::Delta,
             Some(p) => match p.strip_prefix("idx_") {
                 Some(list) => {
-                    let cols: Vec<u32> = list.split('-').map(parse_id).collect::<Option<_>>()?;
+                    let cols: Vec<u32> = list.split('-').map(|c| c.parse().ok()).collect::<Option<_>>()?;
                     gnitz_wire::validate_pk_col_list(&cols, gnitz_wire::PK_LIST_COL_LIMIT).ok()?;
                     ChildKind::Index(PkColList::from_slice(&cols))
                 }
@@ -109,14 +109,14 @@ pub(super) fn children_at_generation(rel_dir: &str, num_workers: u32, generation
     cluster_children(num_workers)
         .map(|c| c.dir(rel_dir))
         .chain(scratch.map(|n| format!("{rel_dir}/{n}")))
-        .all(|d| matches!(published(&d), Ok(Some(p)) if p.checkpoint_mark == generation))
+        .all(|d| matches!(read_intact(&d), Ok(Some(m)) if m.checkpoint_mark == generation))
 }
 
 /// The caller record of `slot`'s rows child under `rel_dir`; `Ok(None)` without
 /// an intact manifest.
 fn caller_record_at(rel_dir: &str, slot: Slot) -> Result<Option<Vec<u8>>, StorageError> {
     let dir = ChildAddr { kind: ChildKind::Rows, slot }.dir(rel_dir);
-    Ok(published(&dir)?.map(|p| p.caller_record))
+    Ok(read_intact(&dir)?.map(|m| m.caller_record))
 }
 
 /// Immediate sub-directory names of `path`, none if it is missing. Collected
@@ -135,11 +135,6 @@ pub(super) fn subdir_names(path: &str) -> Result<Vec<String>, StorageError> {
         }
     }
     Ok(names)
-}
-
-/// A directory-name id component: ASCII digits only.
-fn parse_id<T: std::str::FromStr>(s: &str) -> Option<T> {
-    s.bytes().all(|b| b.is_ascii_digit()).then(|| s.parse().ok())?
 }
 
 /// Retire every child of `dir` that `dead` picks; names in no child grammar are
@@ -172,7 +167,7 @@ pub fn relation_dir(base_dir: &str, id: u64) -> String {
 /// The relation id `name` denotes, or `None` unless [`relation_dir`] gives that
 /// id exactly this name.
 fn parse_relation_dir_name(name: &str) -> Option<u64> {
-    parse_id(name).filter(|id: &u64| id.to_string() == name)
+    name.parse().ok().filter(|id: &u64| id.to_string() == name)
 }
 
 pub(crate) fn ensure_dir(path: &str) -> Result<(), String> {
@@ -252,16 +247,12 @@ impl RelationRegistry {
     /// Drop `id`'s entry and erase its directory, every rank's children included.
     pub fn unregister_and_erase(&mut self, id: u64) -> Result<(), String> {
         assert_eq!(self.slot.of, 1, "erasing a directory other ranks' stores live in");
-        let Some(Relation { store, .. }) = self.tables.remove(&id) else {
+        if self.tables.remove(&id).is_none() {
             return Ok(());
-        };
-        let dir = relation_dir(&self.base_dir, id);
-        // Durably first: the manifest carries the record a reopen would revive.
-        if let Store::Held(table) = store {
-            table
-                .unlink_manifest()
-                .map_err(|e| format!("erase relation {id} (dir={dir}): {e}"))?;
         }
+        let dir = relation_dir(&self.base_dir, id);
+        // Durably first: a child's manifest carries the record a reopen would revive.
+        remove_children(&dir, |_| true).map_err(|e| format!("erase relation {id} (dir={dir}): {e}"))?;
         if let Err(e) = fs::remove_dir_all(&dir) {
             gnitz_debug!("relation: failed to erase relation dir {}: {}", dir, e);
         }

@@ -1,4 +1,4 @@
-use super::super::naming;
+use super::super::manifest;
 use super::*;
 use crate::schema::key::probe_key;
 use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
@@ -31,7 +31,7 @@ impl ShardIndex {
 
 /// Reopen the store at `dir` from its published manifest, as `Table::new` does.
 fn reopen(dir: &str, schema: SchemaDescriptor) -> ShardIndex {
-    let shards = super::super::manifest::read(dir).unwrap().map(|m| m.shards);
+    let shards = manifest::read(dir).unwrap().map(|m| m.shards);
     ShardIndex::open(dir, schema, ShardBudget::Unbounded, false, shards.as_ref()).unwrap()
 }
 
@@ -138,7 +138,7 @@ fn seed_guard(idx: &mut ShardIndex, level_idx: usize, key: PkBuf, batch: &Batch,
         .write_shard(batch, shard_file::ShardWriteOpts::default(), Some(stamp))
         .unwrap();
     idx.levels[level_idx].get_or_create_guard(key).entries.push(entry);
-    idx.published_through = idx.shard_seq;
+    idx.mark_published();
 }
 
 /// [`seed_guard`] of a stable shard of keys `base..`; answers them.
@@ -177,15 +177,14 @@ fn assert_all_found(idx: &ShardIndex, keys: impl IntoIterator<Item = u64>) {
 /// Rename the index's manifest into place, as the barrier does minus the
 /// fsyncs, leaving the retired shards on disk.
 fn rename_manifest(idx: &mut ShardIndex) {
-    let through = idx.last_seq();
-    let bytes = super::super::manifest::encode(&super::super::manifest::Manifest {
+    let bytes = manifest::encode(&manifest::Manifest {
         checkpoint_mark: 0,
         caller_record: Vec::new(),
         shards: idx.shard_set(),
     });
-    super::super::manifest::prepare(&idx.output_dir, &bytes).unwrap();
-    super::super::manifest::commit(&idx.output_dir).unwrap();
-    idx.mark_published(through);
+    manifest::prepare(&idx.output_dir, &bytes).unwrap();
+    manifest::commit(&idx.output_dir).unwrap();
+    idx.mark_published();
 }
 
 /// Publish the index's manifest as the barrier does, minus the fsyncs.
@@ -362,7 +361,7 @@ fn a_failing_vertical_band_leaves_the_bands_before_it_folded() {
 
     let (split_outputs, first_band_fold) = (2, 1);
     let second_band_fold = idx.shard_seq + split_outputs + first_band_fold + 1;
-    let blocker = dir.path().join(naming::shard_name(second_band_fold));
+    let blocker = dir.path().join(manifest::shard_name(second_band_fold));
     std::fs::create_dir_all(&blocker).unwrap();
 
     let hi_dest_seq = idx.levels[1].guards[1].entries[0].seq;
@@ -476,7 +475,7 @@ fn test_unsynced_tracking_register_prune_clear() {
     let spills: Vec<String> = idx
         .l0
         .iter()
-        .map(|e| naming::shard_path(&idx.output_dir, e.seq))
+        .map(|e| manifest::shard_path(&idx.output_dir, e.seq))
         .collect();
     assert_eq!(idx.unsynced_paths().count(), 5, "registration marks, on its own");
 
@@ -494,7 +493,7 @@ fn test_unsynced_tracking_register_prune_clear() {
         "the compaction outputs are themselves unsynced until a barrier publishes them"
     );
 
-    idx.mark_published(idx.last_seq());
+    idx.mark_published();
     assert!(idx.unsynced_paths().next().is_none());
 }
 
@@ -592,8 +591,8 @@ fn test_run_compact_failure_leaves_l0_intact() {
         all_pks.push(pk);
     }
 
-    // A directory at the next seq's name: the output's staged rename fails.
-    std::fs::create_dir_all(dir.path().join(naming::shard_name(idx.shard_seq + 1))).unwrap();
+    // A directory at the next seq's name: the output shard cannot be created.
+    std::fs::create_dir_all(dir.path().join(manifest::shard_name(idx.shard_seq + 1))).unwrap();
     let l0_before = idx.l0.len();
 
     let result = idx.run_compact();
@@ -627,11 +626,11 @@ fn a_compaction_failing_past_its_first_output_leaves_no_output_behind() {
     let inputs: Vec<String> = idx
         .l0
         .iter()
-        .map(|e| naming::shard_path(&idx.output_dir, e.seq))
+        .map(|e| manifest::shard_path(&idx.output_dir, e.seq))
         .collect();
 
-    let first = dir.path().join(naming::shard_name(idx.shard_seq + 1));
-    std::fs::create_dir_all(dir.path().join(naming::shard_name(idx.shard_seq + 2))).unwrap();
+    let first = dir.path().join(manifest::shard_name(idx.shard_seq + 1));
+    std::fs::create_dir_all(dir.path().join(manifest::shard_name(idx.shard_seq + 2))).unwrap();
 
     assert!(idx.run_compact().is_err(), "the second output cannot be written");
     assert!(!first.exists(), "the first output was unlinked");
@@ -809,7 +808,7 @@ fn test_vertical_disjoint_guards_no_name_collision() {
     let files: Vec<String> = idx.levels[1]
         .guards
         .iter()
-        .flat_map(|g| g.entries.iter().map(|e| naming::shard_path(&idx.output_dir, e.seq)))
+        .flat_map(|g| g.entries.iter().map(|e| manifest::shard_path(&idx.output_dir, e.seq)))
         .collect();
     assert_eq!(files.len(), 2, "two L2 guards, one entry each");
     assert_ne!(files[0], files[1], "disjoint-guard outputs must not share a name");
@@ -855,7 +854,7 @@ fn test_vertical_same_guard_recompaction_unlink_retired_keeps_live() {
     idx.vertical_fold(0).unwrap();
 
     publish_manifest(&mut idx);
-    let live = naming::shard_path(&idx.output_dir, idx.levels[1].guards[0].entries[0].seq);
+    let live = manifest::shard_path(&idx.output_dir, idx.levels[1].guards[0].entries[0].seq);
     assert!(
         std::path::Path::new(&live).exists(),
         "unlink_retired deleted the live L2 shard {live}",
@@ -874,10 +873,10 @@ fn open_removes_exactly_the_unreferenced_files() {
     let mut idx = ShardIndex::open(d, make_schema_u64_i64(), ShardBudget::Unbounded, false, None).unwrap();
     idx.append_l0_run(&test_batch(&[10], &[100])).unwrap();
     publish_manifest(&mut idx);
-    let live = naming::shard_name(idx.shard_seq);
+    let live = manifest::shard_name(idx.shard_seq);
 
     for seq in [99, 7] {
-        write_test_shard(dir.path(), &naming::shard_name(seq), &[seq], &[1]);
+        write_test_shard(dir.path(), &manifest::shard_name(seq), &[seq], &[1]);
     }
     std::fs::write(dir.path().join("manifest.bin.tmp"), b"x").unwrap();
     std::fs::write(dir.path().join("other"), b"x").unwrap();
@@ -898,7 +897,7 @@ fn open_removes_exactly_the_unreferenced_files() {
 #[test]
 fn open_of_no_manifest_removes_every_shard() {
     let dir = tempfile::tempdir().unwrap();
-    let stray = dir.path().join(naming::shard_name(7));
+    let stray = dir.path().join(manifest::shard_name(7));
     std::fs::write(&stray, b"orphan").unwrap();
     ShardIndex::open(
         dir.path().to_str().unwrap(),
@@ -918,8 +917,8 @@ fn test_single_pk_probe_golden() {
     let schema = make_schema_u64_i64();
 
     let d = dir.path().to_str().unwrap();
-    write_test_shard(dir.path(), &naming::shard_name(1), &[10, 20], &[1, 2]);
-    write_test_shard(dir.path(), &naming::shard_name(2), &[30, 40], &[3, 4]);
+    write_test_shard(dir.path(), &manifest::shard_name(1), &[10, 20], &[1, 2]);
+    write_test_shard(dir.path(), &manifest::shard_name(2), &[30, 40], &[3, 4]);
     let e_lo = ShardEntry::open(d, 1, &schema, 1).unwrap();
     let e_hi = ShardEntry::open(d, 2, &schema, 2).unwrap();
 
@@ -974,7 +973,7 @@ fn test_compound_range_prune() {
     let dir = tempfile::tempdir().unwrap();
     write_compound_shard(
         dir.path(),
-        &naming::shard_name(1),
+        &manifest::shard_name(1),
         &[(1, 5), (1, 9), (2, 3)],
         &[10, 20, 30],
     );
@@ -1826,7 +1825,7 @@ fn a_superseded_shard_waits_for_the_barrier_only_if_a_manifest_names_it() {
     let files = |idx: &ShardIndex| {
         let mut f: Vec<String> = idx
             .all_entries()
-            .map(|e| naming::shard_path(&idx.output_dir, e.seq))
+            .map(|e| manifest::shard_path(&idx.output_dir, e.seq))
             .collect();
         f.sort();
         f
@@ -1866,7 +1865,7 @@ fn retired_shards_outlive_a_rename_until_the_drain() {
     publish_manifest(&mut idx);
     let inputs: Vec<String> = idx
         .all_entries()
-        .map(|e| naming::shard_path(&idx.output_dir, e.seq))
+        .map(|e| manifest::shard_path(&idx.output_dir, e.seq))
         .collect();
     idx.run_compact().unwrap();
 

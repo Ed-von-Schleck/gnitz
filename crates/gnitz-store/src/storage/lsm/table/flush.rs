@@ -14,10 +14,7 @@ use crate::storage::error::StorageError;
 
 /// A publish [`Table::flush_prepare`] staged and [`flush_barrier`] completes.
 pub(super) struct FlushWork {
-    manifest_tmp: String,
     bytes: Vec<u8>,
-    /// The shard index's last seq when the manifest was built.
-    names_through: u64,
     /// Fsynced once the manifest is renamed.
     dirs: Vec<PathBuf>,
 }
@@ -41,8 +38,11 @@ pub(crate) fn flush_barrier<'a>(
     // Every unsynced shard and every staged manifest, before any rename.
     sync_paths(
         &mut ring,
-        work.iter()
-            .flat_map(|(t, w)| t.shard_index.unsynced_paths().chain([w.manifest_tmp.clone()])),
+        work.iter().flat_map(|(t, _)| {
+            t.shard_index
+                .unsynced_paths()
+                .chain([manifest::staging_path(&t.shard_index.output_dir)])
+        }),
         FsyncFlags::DATASYNC,
     )?;
     let mut dirs = BTreeSet::new();
@@ -50,7 +50,7 @@ pub(crate) fn flush_barrier<'a>(
     for (t, w) in work {
         // The rename publishes every shard the manifest names.
         manifest::commit(&t.shard_index.output_dir)?;
-        t.shard_index.mark_published(w.names_through);
+        t.shard_index.mark_published();
         dirs.extend(w.dirs);
         published.push((t, w.bytes));
     }
@@ -115,7 +115,6 @@ impl Table {
         if let Some(run) = self.ram_tier.fold_to_single(&self.shard_index.schema) {
             self.spill_ram_tier(run)?;
         }
-        let names_through = self.shard_index.last_seq();
         let bytes = manifest::encode(&Manifest {
             checkpoint_mark,
             caller_record: self.caller_record.clone(),
@@ -131,7 +130,7 @@ impl Table {
         let first_publish = self.durable_manifest.is_none();
         // Unknown until the barrier records it: a failed publish may have renamed.
         self.durable_manifest = None;
-        let manifest_tmp = manifest::prepare(&self.shard_index.output_dir, &bytes)?;
+        manifest::prepare(&self.shard_index.output_dir, &bytes)?;
         // A first publish also makes the store's and its relation's directory entries durable.
         let entry_dirs = if first_publish { 2 } else { 0 };
         let dirs = Path::new(&self.shard_index.output_dir)
@@ -140,7 +139,7 @@ impl Table {
             .filter(|d| !d.as_os_str().is_empty())
             .map(Path::to_path_buf)
             .collect();
-        Ok(Some(FlushWork { manifest_tmp, bytes, names_through, dirs }))
+        Ok(Some(FlushWork { bytes, dirs }))
     }
 
     /// Move the RAM tier's folded run to an unsynced L0 shard, then run the disk

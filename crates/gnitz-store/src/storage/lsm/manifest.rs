@@ -1,6 +1,11 @@
-use std::fs;
+//! One store directory: the manifest serde, the directory's file names and the
+//! primitives over them. A store owns its directory, so every shard and staging
+//! file in it is the store's.
 
-use super::naming::shard_path;
+use std::collections::HashSet;
+use std::fs;
+use std::io;
+
 use crate::schema::key::PkBuf;
 use crate::schema::MAX_PK_BYTES;
 use crate::storage::error::StorageError;
@@ -11,10 +16,11 @@ const MAGIC: u64 = 0x4D414E49464E5447;
 const VERSION: u64 = 16;
 
 const MANIFEST_FILE: &str = "manifest.bin";
+/// The one file a manifest is staged under before its rename.
+const STAGING_FILE: &str = "manifest.bin.tmp";
 
-/// The suffix a manifest is staged under before its rename — also how startup
-/// GC names a stray one.
-pub(super) const STAGING_SUFFIX: &str = ".tmp";
+/// Every shard basename's prefix.
+pub(super) const SHARD_PREFIX: &str = "shard_";
 
 /// What a shard index publishes and reopens from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,8 +123,40 @@ pub(crate) fn manifest_path(store_dir: &str) -> String {
     format!("{store_dir}/{MANIFEST_FILE}")
 }
 
-fn staging_path(dir: &str) -> String {
-    format!("{}{STAGING_SUFFIX}", manifest_path(dir))
+/// The path a manifest is staged under in the store at `dir`.
+pub(super) fn staging_path(dir: &str) -> String {
+    format!("{dir}/{STAGING_FILE}")
+}
+
+/// The basename of the shard drawn at `seq`: `shard_{seq}.db`.
+pub(super) fn shard_name(seq: u64) -> String {
+    format!("{SHARD_PREFIX}{seq}.db")
+}
+
+/// The path of the shard drawn at `seq` in the store at `dir`.
+pub(super) fn shard_path(dir: &str, seq: u64) -> String {
+    format!("{dir}/{}", shard_name(seq))
+}
+
+/// `r`, with `NotFound` read as success.
+fn absent_ok(r: io::Result<()>) -> io::Result<()> {
+    match r {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        r => r,
+    }
+}
+
+/// Remove the staging file and every shard not in `keep` from `dir`.
+pub(super) fn remove_stale_files(dir: &str, keep: &HashSet<String>) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name == STAGING_FILE || (name.starts_with(SHARD_PREFIX) && !keep.contains(name)) {
+            absent_ok(fs::remove_file(entry.path()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Read and decode `dir`'s manifest. `Ok(None)` when it does not exist yet;
@@ -126,7 +164,7 @@ fn staging_path(dir: &str) -> String {
 pub(crate) fn read(dir: &str) -> Result<Option<Manifest>, StorageError> {
     match fs::read(manifest_path(dir)) {
         Ok(buf) => decode(&buf).map(Some),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
@@ -139,28 +177,11 @@ pub(crate) fn read_intact(dir: &str) -> Result<Option<Manifest>, StorageError> {
     }
 }
 
-/// What the store at `store_dir` last published for its owner.
-pub(crate) struct Published {
-    pub checkpoint_mark: u64,
-    pub caller_record: Vec<u8>,
-}
-
-/// [`read_intact`], narrowed to what the store's owner published.
-pub(crate) fn published(store_dir: &str) -> Result<Option<Published>, StorageError> {
-    read_intact(store_dir).map(|o| {
-        o.map(|m| Published {
-            checkpoint_mark: m.checkpoint_mark,
-            caller_record: m.caller_record,
-        })
-    })
-}
-
-/// Stage `bytes` (an [`encode`]d manifest) beside `dir`'s manifest, returning
-/// the staged file's path. Does NOT fdatasync or rename.
-pub(crate) fn prepare(dir: &str, bytes: &[u8]) -> Result<String, StorageError> {
-    let tmp = staging_path(dir);
-    fs::write(&tmp, bytes)?;
-    Ok(tmp)
+/// Stage `bytes` (an [`encode`]d manifest) beside `dir`'s manifest. Does NOT
+/// fdatasync or rename.
+pub(crate) fn prepare(dir: &str, bytes: &[u8]) -> Result<(), StorageError> {
+    fs::write(staging_path(dir), bytes)?;
+    Ok(())
 }
 
 /// Rename the manifest [`prepare`] staged onto `dir`'s manifest path.
@@ -172,10 +193,6 @@ pub(crate) fn commit(dir: &str) -> Result<(), StorageError> {
 /// Durably unlink `dir`'s manifest; an absent manifest or directory is already
 /// unlinked.
 pub(crate) fn unlink(dir: &str) -> Result<(), StorageError> {
-    let absent_ok = |r: std::io::Result<()>| match r {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        r => r,
-    };
     absent_ok(fs::remove_file(manifest_path(dir)))?;
     Ok(absent_ok(fsync_dir(dir))?)
 }
@@ -185,11 +202,8 @@ pub(crate) fn unlink(dir: &str) -> Result<(), StorageError> {
 pub(crate) fn retire_store(store_dir: &str) -> Result<(), StorageError> {
     unlink(store_dir)?;
     // Without its manifest the directory holds no reachable rows.
-    match fs::remove_dir_all(store_dir) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            gnitz_warn!("storage: failed to remove retired store dir {}: {}", store_dir, e)
-        }
-        _ => {}
+    if let Err(e) = absent_ok(fs::remove_dir_all(store_dir)) {
+        gnitz_warn!("storage: failed to remove retired store dir {}: {}", store_dir, e);
     }
     Ok(())
 }

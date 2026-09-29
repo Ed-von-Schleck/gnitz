@@ -8,7 +8,7 @@ use std::fs;
 use std::rc::Rc;
 
 use super::super::compact;
-use super::super::naming;
+use super::super::manifest;
 use super::{
     CompactionInputs, CompactionKind, LevelGuard, ShardBudget, ShardEntry, ShardIndex, FLSM_LEVELS,
     GUARD_FILE_THRESHOLD, L0_COMPACT_THRESHOLD, MIN_GUARD_BYTES, SWEEP_STEPS, TERMINAL_LEVEL_IDX,
@@ -51,7 +51,7 @@ impl ShardIndex {
     ) -> Result<ShardEntry, StorageError> {
         self.shard_seq += 1;
         let seq = self.shard_seq;
-        let path = naming::shard_path(&self.output_dir, seq);
+        let path = manifest::shard_path(&self.output_dir, seq);
         batch
             .write_as_shard(
                 &path,
@@ -66,7 +66,7 @@ impl ShardIndex {
 
     /// Unlink the shard drawn at `seq`, best-effort.
     fn unlink_shard(&self, seq: u64) {
-        let _ = fs::remove_file(naming::shard_path(&self.output_dir, seq));
+        let _ = fs::remove_file(manifest::shard_path(&self.output_dir, seq));
     }
 
     /// Append `run` to L0 as one unpublished shard: the spill.
@@ -114,18 +114,12 @@ impl ShardIndex {
     pub(crate) fn unsynced_paths(&self) -> impl Iterator<Item = String> + '_ {
         self.all_entries()
             .filter(|e| !self.published(e))
-            .map(|e| naming::shard_path(&self.output_dir, e.seq))
+            .map(|e| manifest::shard_path(&self.output_dir, e.seq))
     }
 
-    /// The last seq drawn.
-    pub(crate) fn last_seq(&self) -> u64 {
-        self.shard_seq
-    }
-
-    /// The manifest built when [`Self::last_seq`] was `through` has been renamed
-    /// into place.
-    pub(crate) fn mark_published(&mut self, through: u64) {
-        self.published_through = through;
+    /// The manifest built from the current shard set has been renamed into place.
+    pub(crate) fn mark_published(&mut self) {
+        self.published_through = self.shard_seq;
     }
 
     /// Every live shard's `Rc`, yielded lazily — callers `extend` without an
