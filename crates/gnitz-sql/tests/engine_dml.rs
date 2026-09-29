@@ -307,7 +307,8 @@ fn a_text_table_past_one_frame_reads_back_whole_where_a_whole_table_update_still
         "CREATE TABLE t (id BIGINT UNSIGNED PRIMARY KEY, v BIGINT UNSIGNED NOT NULL, s TEXT NOT NULL) \
          WITH (replicated = true)",
     );
-    let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
+    let rel = client.resolve_relation(&sn, "t").unwrap();
+    let (tid, schema) = (rel.tid, rel.schema.clone());
 
     // Binary push, not `INSERT … VALUES`: the parse cost would dominate and this
     // test is about the read.
@@ -318,15 +319,19 @@ fn a_text_table_past_one_frame_reads_back_whole_where_a_whole_table_update_still
         for id in start..(start + CHUNK).min(ROWS) {
             app.add_row(id as u128, 1).u64_val(id % GROUPS).str_val(&text);
         }
-        client.push(tid, &schema, &batch).unwrap();
+        client
+            .push(tid, &schema, &batch, gnitz_wire::WireConflictMode::Update)
+            .unwrap();
     }
 
     // The unprojected read of this table spans many frames and reassembles whole
     // — checked by content, not by count: each frame's rows are appended into one
     // batch, and the null words and German cells of a frame are indexed by its
     // own row numbers, so a wrong offset moves values without losing any.
-    let gnitz_core::ScanReply { schema: rschema, batch, .. } =
-        client.scan(tid).expect("an 85 MB TEXT reply chunks like any other");
+    let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None);
+    let gnitz_core::ScanReply { schema: rschema, batch, .. } = client
+        .scan_spec(tid, &spec, &schema)
+        .expect("an 85 MB TEXT reply chunks like any other");
     assert_eq!(batch.len(), ROWS as usize);
     let (id_ci, v_ci, s_ci) = (col_idx(&rschema, "id"), col_idx(&rschema, "v"), col_idx(&rschema, "s"));
     let mut seen = vec![false; ROWS as usize];

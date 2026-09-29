@@ -247,64 +247,6 @@ fn test_schema_ne_type_code() {
     assert_ne!(a, b);
 }
 
-// --- types_match tests ---
-
-fn one_col(name: &str, tc: TypeCode, nullable: bool) -> Schema {
-    Schema {
-        columns: vec![ColumnDef::new(name, tc, nullable)],
-        pk_cols: vec![0],
-    }
-}
-
-#[test]
-fn types_match_false_on_pk_type_u64_vs_i64() {
-    // Same width, different OPK image for the same logical value.
-    let u = one_col("pk", TypeCode::U64, false);
-    let i = one_col("pk", TypeCode::I64, false);
-    assert!(!u.types_match(&i));
-}
-
-#[test]
-fn types_match_ignores_column_names() {
-    let a = one_col("pk", TypeCode::U64, false);
-    let b = one_col("id", TypeCode::U64, false);
-    assert!(a.types_match(&b));
-}
-
-#[test]
-fn types_match_false_on_nullability() {
-    let a = one_col("x", TypeCode::U64, false);
-    let b = one_col("x", TypeCode::U64, true);
-    assert!(!a.types_match(&b));
-}
-
-#[test]
-fn types_match_false_on_pk_cols() {
-    let a = Schema {
-        columns: vec![
-            ColumnDef::new("a", TypeCode::U64, false),
-            ColumnDef::new("b", TypeCode::U64, false),
-        ],
-        pk_cols: vec![0],
-    };
-    let mut b = a.clone();
-    b.pk_cols = vec![1];
-    assert!(!a.types_match(&b));
-}
-
-#[test]
-fn types_match_false_on_column_count() {
-    let a = one_col("pk", TypeCode::U64, false);
-    let b = Schema {
-        columns: vec![
-            ColumnDef::new("pk", TypeCode::U64, false),
-            ColumnDef::new("v", TypeCode::U64, false),
-        ],
-        pk_cols: vec![0],
-    };
-    assert!(!a.types_match(&b));
-}
-
 // --- Step 2: validate() tests ---
 
 #[test]
@@ -485,7 +427,7 @@ fn test_validate_wide_pk_zero_stride() {
 }
 
 #[test]
-#[should_panic(expected = "payload layout mismatch")]
+#[should_panic(expected = "extend_from_owned: layout mismatch")]
 fn test_extend_from_payload_count_mismatch_panics() {
     let schema2 = Schema {
         columns: vec![
@@ -506,7 +448,7 @@ fn test_extend_from_payload_count_mismatch_panics() {
 /// Equal slot counts are not enough: a batch whose slot holds another type would
 /// have its cells read at that type's width.
 #[test]
-#[should_panic(expected = "payload layout mismatch")]
+#[should_panic(expected = "extend_from_owned: layout mismatch")]
 fn extend_from_owned_refuses_a_different_payload_layout() {
     let typed = |tc| Schema {
         columns: vec![
@@ -879,15 +821,15 @@ fn test_appender_then_validate() {
 
 #[test]
 fn pk_tuple_from_bytes_max_accepts() {
-    let bytes = vec![0xabu8; MAX_PK_BYTES];
+    let bytes = vec![0xabu8; gnitz_wire::MAX_PK_BYTES];
     let t = PkBuf::from_bytes(&bytes);
-    assert_eq!(t.width(), MAX_PK_BYTES);
+    assert_eq!(t.width(), gnitz_wire::MAX_PK_BYTES);
 }
 
 #[test]
 #[should_panic(expected = "PkBuf::from_bytes: length")]
 fn pk_tuple_from_bytes_over_panics() {
-    PkBuf::from_bytes(&[0u8; MAX_PK_BYTES + 1]);
+    PkBuf::from_bytes(&[0u8; gnitz_wire::MAX_PK_BYTES + 1]);
 }
 
 // --- `null()` sets the null bitmap bit ---
@@ -1357,28 +1299,6 @@ fn fixture_round_trips_through_encode_and_decode() {
     }
 }
 
-/// A permutation of the PK is sent as the PK list, and so keyed by it; any
-/// other group set is sent as written.
-#[test]
-fn reduce_group_sends_a_pk_permutation_as_the_pk_list() {
-    let s = Schema::from_parts(
-        vec![
-            ColumnDef::new("a", TypeCode::U64, false),
-            ColumnDef::new("b", TypeCode::U64, false),
-            ColumnDef::new("c", TypeCode::I64, false),
-        ],
-        vec![0, 1],
-    )
-    .expect("client-valid schema");
-    assert_eq!(s.reduce_group(&[1, 0]), vec![0, 1]);
-    assert_eq!(s.reduce_group(&[0, 1]), vec![0, 1]);
-    assert_eq!(s.reduce_group(&[2, 1]), vec![2, 1]);
-    assert_eq!(
-        s.reduce_out_key(&s.reduce_group(&[1, 0])),
-        gnitz_wire::ReduceOutKey::Natural
-    );
-}
-
 /// Every fact a `Schema` carries must survive the block round-trip: column
 /// types, nullability, names, the `hidden` marker, and the declared PK order
 /// (which is not column order here).
@@ -1397,12 +1317,12 @@ fn schema_survives_the_block_roundtrip() {
     assert_eq!(Schema::from_block(&original.to_block()).unwrap(), original);
 }
 
-/// The client's PK arity cap is `PK_LIST_MAX_COLS` — a key it accepts must
+/// The client's PK arity cap is `gnitz_wire::PK_LIST_MAX_COLS` — a key it accepts must
 /// round-trip through the persisted PK-list word — so it must refuse a record
 /// the shared codec, capped wider, admits.
 #[test]
 fn a_pk_wider_than_the_client_codec_is_rejected() {
-    let n = PK_LIST_MAX_COLS + 1;
+    let n = gnitz_wire::PK_LIST_MAX_COLS + 1;
     let wide = Schema {
         columns: (0..n).map(|_| ColumnDef::new("k", TypeCode::U64, false)).collect(),
         pk_cols: (0..n as u32).collect(),

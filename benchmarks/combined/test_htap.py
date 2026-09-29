@@ -101,15 +101,13 @@ def test_htap(client, socket_path, schema_name, bench_timer, scale_mode):
         return {"commits": commits, "conflicts": conflicts, "latencies": lat}
 
     def reader_fn(conn, deadline):
-        ro_tid, _ = conn.resolve_table(sn, "orders")
-        rl_tid, _ = conn.resolve_table(sn, "lineitem")
-        rev_vid, _ = conn.resolve_table(sn, "rev_by_nation")
-        obs_vid, _ = conn.resolve_table(sn, "orders_by_status")
+        rels = [conn.resolve_table(sn, name)
+                for name in ("orders", "lineitem", "rev_by_nation", "orders_by_status")]
         ops = torn = 0
         lat = []
         while time.perf_counter() < deadline:
             start = time.perf_counter()
-            o_snap, l_snap, _rev, obs = conn.scan_many([ro_tid, rl_tid, rev_vid, obs_vid])
+            o_snap, l_snap, _rev, obs = conn.scan_many(rels)
             lat.append((time.perf_counter() - start) * 1000.0)
             # Torn/consistency accounting runs AFTER the timed scan_many so it
             # never inflates the measured reader latency.

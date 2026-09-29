@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{col, ncol, parse_stmt, table};
-use gnitz_core::TypeCode;
+use gnitz_wire::TypeCode;
 use sqlparser::ast::Statement;
 use std::rc::Rc;
 

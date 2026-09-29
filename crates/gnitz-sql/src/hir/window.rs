@@ -49,7 +49,7 @@ use crate::bind::{bind_structural, LeafBinder};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::ir::{BExpr, BinOp};
 use crate::validate::reject_float_key_of;
-use gnitz_core::{ColType, ColumnDef, TypeCode};
+use gnitz_wire::{ColType, ColumnDef, TypeCode};
 use sqlparser::ast::{
     Expr, Function, Ident, NamedWindowDefinition, NamedWindowExpr, OrderByExpr, OrderByOptions, Select, WindowFrame,
     WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,

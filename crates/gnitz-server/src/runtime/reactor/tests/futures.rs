@@ -102,7 +102,7 @@ fn fsync_submit_flushes_sqe_before_returning() {
 fn a_train_route_queues_past_worker_count_in_arrival_order() {
     const N: usize = 100; // > MAX_WORKERS
     let (r, writers) = reactor_with_rings(1);
-    let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::Scan);
+    let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::ScanSpec);
     for i in 0..N {
         let msg = crate::runtime::wire::WireMsg {
             target_id: 100 + i as u64,
@@ -128,7 +128,7 @@ fn a_train_route_queues_past_worker_count_in_arrival_order() {
 #[test]
 fn a_dropped_lease_releases_held_and_late_frames() {
     let (r, writers) = reactor_with_rings(1);
-    let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::Scan);
+    let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::ScanSpec);
     let id = lease.id();
     writers[0].send_msg(id, &Default::default());
     r.drain_all_w2m();
@@ -160,7 +160,7 @@ fn a_dropped_lease_unblocks_a_streaming_writer() {
     let ptr = region.ptr();
 
     let r = make_reactor_over(W2mReceiver::new(vec![ptr]));
-    let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::Scan);
+    let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::ScanSpec);
     let id = lease.id();
     let writer = W2mWriter::new(ptr);
 

@@ -4,8 +4,8 @@
 use super::{HirExpr, JoinShape, JoinType, SubqueryKind, SubqueryRef};
 use crate::error::GnitzSqlError;
 use crate::validate::reject_float_keys;
-use gnitz_core::{ColumnDef, TypeCode};
 use gnitz_wire::JoinKeyRule;
+use gnitz_wire::{ColumnDef, TypeCode};
 
 /// `residual`, what a join's ON left unkeyed, applies only as a filter over an
 /// INNER product: `JoinClass` has nowhere to hold one, so `place()` drops it into

@@ -39,7 +39,7 @@ def test_a_seek_reflects_every_acked_push_under_concurrent_ddl(client, server, s
                 "CREATE VIEW v2 AS SELECT * FROM v1 WHERE val >= 0"):
         client.execute_sql(sql, schema_name=sn)
     tid, schema = client.resolve_table(sn, "t")
-    v1, v2 = (client.resolve_table(sn, v)[0] for v in ("v1", "v2"))
+    (v1, v1_schema), (v2, v2_schema) = (client.resolve_table(sn, v) for v in ("v1", "v2"))
     errors = []
 
     def churn():
@@ -61,8 +61,8 @@ def test_a_seek_reflects_every_acked_push_under_concurrent_ddl(client, server, s
             while k < 30 or (th.is_alive() and k < 10_000):
                 k += 1
                 client.push(tid, gnitz.ZSetBatch(schema).append(pk=k, val=k * 10))
-                assert bag(b.seek(v2, pk=k), "pk", "val") == {(k, k * 10): 1}, f"v2 seek {k}"
-                assert bag(b.seek(v1, pk=k), "pk", "val") == {(k, k * 10): 1}, f"v1 seek {k}"
+                assert bag(b.seek(v2, v2_schema, pk=k), "pk", "val") == {(k, k * 10): 1}, f"v2 seek {k}"
+                assert bag(b.seek(v1, v1_schema, pk=k), "pk", "val") == {(k, k * 10): 1}, f"v1 seek {k}"
     finally:
         join_or_fail("the DDL churn hung", th)
     assert not errors, errors
@@ -84,20 +84,20 @@ def test_a_read_waits_for_its_own_in_flight_tick(client, schema_name):
                        schema_name=sn)
     client.execute_sql("CREATE VIEW v AS SELECT g, COUNT(*) AS n FROM t GROUP BY g", schema_name=sn)
     tid, schema = client.resolve_table(sn, "t")
-    vid = client.resolve_table(sn, "v")[0]
+    vid, v_schema = client.resolve_table(sn, "v")
 
     def push_range(lo, hi):
         client.push(tid, gnitz.ZSetBatch(schema).extend([{"pk": i, "g": i} for i in range(lo, hi)]))
 
     push_range(0, BIG_ROWS)
-    assert bag(client.scan(vid), "g", "n") == {(i, 1): 1 for i in range(BIG_ROWS)}
+    assert bag(client.scan(vid, v_schema), "g", "n") == {(i, 1): 1 for i in range(BIG_ROWS)}
 
     push_range(BIG_ROWS, 2 * BIG_ROWS)
     end = 2 * BIG_ROWS + 300
     for lo in range(2 * BIG_ROWS, end, 100):
         client.execute_sql("INSERT INTO t VALUES " + ", ".join(f"({i}, {i})" for i in range(lo, lo + 100)),
                            schema_name=sn)
-    assert bag(client.scan(vid), "g", "n") == {(i, 1): 1 for i in range(end)}
+    assert bag(client.scan(vid, v_schema), "g", "n") == {(i, 1): 1 for i in range(end)}
 
 
 def test_an_unrelated_pending_tick_does_not_gate_the_read(client, schema_name):
@@ -111,21 +111,21 @@ def test_an_unrelated_pending_tick_does_not_gate_the_read(client, schema_name):
                 "CREATE VIEW v2 AS SELECT val, COUNT(*) AS n FROM t2 GROUP BY val"):
         client.execute_sql(sql, schema_name=sn)
     (t1, schema), (t2, _) = client.resolve_table(sn, "t1"), client.resolve_table(sn, "t2")
-    v1, v2 = (client.resolve_table(sn, v)[0] for v in ("v1", "v2"))
+    (v1, v1_schema), (v2, v2_schema) = (client.resolve_table(sn, v) for v in ("v1", "v2"))
 
     def push_small(tid):
         # Under the coalesce threshold: no auto-tick, the tid sits pending.
         return client.push(tid, gnitz.ZSetBatch(schema).extend([{"pk": i, "val": i} for i in range(10)]))
 
     push_small(t1)
-    client.scan(v1)                   # drains t1; v1 is now clean
-    before = client.scan(v1).lsn      # fresh: no drain, so the watermark stands
+    client.scan(v1, v1_schema)        # drains t1; v1 is now clean
+    before = client.scan(v1, v1_schema).lsn  # fresh: no drain, so the watermark stands
 
     push_lsn = push_small(t2)
-    after = client.scan(v1).lsn
+    after = client.scan(v1, v1_schema).lsn
     assert after == before and after < push_lsn, (
         f"read of a clean view ticked an unrelated relation "
         f"(watermark {before} -> {after}, unrelated push at {push_lsn})")
 
     # And the drain is not simply broken: v2's own read does absorb it.
-    assert client.scan(v2).lsn >= push_lsn, "a read of the dirty view must drain its source"
+    assert client.scan(v2, v2_schema).lsn >= push_lsn, "a read of the dirty view must drain its source"

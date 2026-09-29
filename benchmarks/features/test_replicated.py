@@ -98,7 +98,7 @@ def test_dim_scan_cost(client, schema_name, bench_timer, scale_mode, placement, 
     push_stream(client, tid, schema, _dim_seed, dim_rows)
 
     for _ in range(5):
-        bench_timer.measure(lambda: sum(1 for _ in client.scan(tid)),
+        bench_timer.measure(lambda: sum(1 for _ in client.scan(tid, schema)),
                             rows_per_call=dim_rows)
 
 
@@ -122,8 +122,7 @@ def test_mixed_view_backfill(client, schema_name, bench_timer, scale_mode,
     client.execute_sql(
         "CREATE VIEW v AS SELECT pk, val FROM dim UNION ALL SELECT pk, val FROM fact",
         schema_name=sn)
-    vid, _ = client.resolve_table(sn, "v")
-    rows = sum(1 for _ in client.scan(vid))
+    rows = sum(1 for _ in client.scan(*client.resolve_table(sn, "v")))
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     # A view backfills exactly once, and `measure` discards its warmup
@@ -152,5 +151,4 @@ def test_setop_view_maintenance(client, schema_name, bench_timer, scale_mode, pl
 
     _stream_into_dim(client, bench_timer, tid, schema, sz)
 
-    vid, _ = client.resolve_table(sn, "v")
-    assert sum(1 for _ in client.scan(vid)) > 0, "view empty after streaming"
+    assert sum(1 for _ in client.scan(*client.resolve_table(sn, "v"))) > 0, "view empty after streaming"

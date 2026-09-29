@@ -29,7 +29,7 @@ async def test_pipelined_pushes_over_tls(_srv, client, schema_name):
             aconn.push(tid, gnitz.ZSetBatch(KV).extend(rows[i * 99:(i + 1) * 99]))
             for i in range(50)])
     with gnitz.connect(_srv.tls_target) as conn:
-        assert bag(conn.scan(tid)) == {(r["pk"], r["val"]): 1 for r in rows}
+        assert bag(conn.scan(tid, KV)) == {(r["pk"], r["val"]): 1 for r in rows}
 
 
 def test_a_bad_ca_path_is_refused(_srv):

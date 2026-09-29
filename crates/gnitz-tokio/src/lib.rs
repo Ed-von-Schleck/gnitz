@@ -18,8 +18,9 @@ use std::task::{Context, Poll};
 
 use gnitz_core::{
     qualified_name, ClientError, GnitzClient, Interest, RelDescriptor, RelTarget, Reply, Request, ScanReply, Schema,
-    Session, SlotId, WireConflictMode, ZSetBatch,
+    Session, SlotId, ZSetBatch,
 };
+use gnitz_wire::{ReadSpec, WireConflictMode};
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::sync::{mpsc, oneshot};
 
@@ -130,26 +131,33 @@ impl AsyncClient {
         .map(|r| r.into_lsn())
     }
 
-    pub async fn scan(&self, tid: u64) -> Result<ScanReply, ClientError> {
-        self.call(move |s| s.submit(Request::scan(tid)))
-            .await
-            .map(|r| r.into_scan())
+    /// Read `tid` under `spec`, replied in `reply_schema`'s layout.
+    pub async fn scan_spec(
+        &self,
+        tid: u64,
+        spec: ReadSpec,
+        reply_schema: Arc<Schema>,
+    ) -> Result<ScanReply, ClientError> {
+        self.call(move |s| {
+            s.submit(Request::ScanSpec {
+                target_id: tid,
+                spec: &spec,
+                reply_schema: &reply_schema,
+            })
+        })
+        .await
+        .map(|r| r.into_scan())
     }
 
-    /// A point SEEK by primary key: `key` is the packed native-LE PK columns.
-    pub async fn seek(&self, tid: u64, key: &[u8]) -> Result<ScanReply, ClientError> {
-        let key = key.to_vec();
-        self.call(move |s| s.submit(Request::seek(tid, &key)))
-            .await
-            .map(|r| r.into_scan())
-    }
-
-    /// Snapshot N relations at one server-side SAL cut, in request order.
-    pub async fn scan_many(&self, tids: &[u64]) -> Result<Vec<ScanReply>, ClientError> {
-        let tids = tids.to_vec();
-        self.call(move |s| s.submit(Request::ScanMulti(&tids)))
-            .await
-            .map(|r| r.into_multi())
+    /// Snapshot N relations at one server-side SAL cut, in request order, each
+    /// replied in the layout of the schema paired with it.
+    pub async fn scan_many(&self, relations: Vec<(u64, Arc<Schema>)>) -> Result<Vec<ScanReply>, ClientError> {
+        self.call(move |s| {
+            let rels: Vec<(u64, &Arc<Schema>)> = relations.iter().map(|(tid, schema)| (*tid, schema)).collect();
+            s.submit(Request::ScanMulti(&rels))
+        })
+        .await
+        .map(|r| r.into_multi())
     }
 
     /// Describe one relation. Always a round trip. On the surface because every
@@ -180,20 +188,24 @@ impl AsyncClient {
         .await?
     }
 
-    /// [`Self::scan`], answered off the copy when it holds `tid`.
-    pub async fn scan_local_first(&self, tid: u64) -> Result<ScanReply, ClientError> {
-        let local = {
-            let mut slot = Arc::clone(&self.client).lock_owned().await;
-            if slot.as_ref().is_some_and(|c| c.mirrors(tid)) {
-                blocking(move || slot.as_mut().expect("held above").scan_local(tid)).await??
-            } else {
-                None
-            }
-        };
-        match local {
-            Some(reply) => Ok(reply),
-            None => self.scan(tid).await,
+    /// [`Self::scan_spec`], answered off the copy when it holds `tid`.
+    pub async fn scan_spec_local_first(
+        &self,
+        tid: u64,
+        spec: ReadSpec,
+        reply_schema: Arc<Schema>,
+    ) -> Result<ScanReply, ClientError> {
+        let mut slot = Arc::clone(&self.client).lock_owned().await;
+        if !slot.as_ref().is_some_and(|c| c.mirrors(tid)) {
+            drop(slot);
+            return self.scan_spec(tid, spec, reply_schema).await;
         }
+        blocking(move || {
+            slot.as_mut()
+                .expect("held above")
+                .scan_spec_local_first(tid, spec, &reply_schema)
+        })
+        .await?
     }
 }
 

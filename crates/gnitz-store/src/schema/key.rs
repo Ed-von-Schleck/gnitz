@@ -1,14 +1,13 @@
 //! Order-preserving primary-key (OPK) primitives.
 //!
 //! These pure layout/key operations sit *below* both `schema` and `storage`:
-//! they encode a PK region — a whole one, a wire seek key, or an index's
-//! leading-column span — to its order-preserving big-endian
-//! image, compare two such images with a raw `memcmp`, pack a narrow region
-//! into a sort key, carry a width-tagged PK byte buffer, and derive the
-//! half-open key range a `KeyRange`'s cut pair denotes — and compose a
-//! multi-column key span ([`KeySpec`]). None of them reaches
-//! up into storage — the dependency runs `storage → schema::key`,
-//! the legitimate downward direction. This module is the one import path: every
+//! they encode a PK region — a whole one or an index's leading-column span —
+//! to its order-preserving big-endian image, compare two such images with a
+//! raw `memcmp`, pack a narrow region into a sort key, carry a width-tagged PK
+//! byte buffer, and derive the half-open key range a `KeyRange`'s cut pair
+//! denotes — and compose a multi-column key span ([`KeySpec`]). None of them
+//! reaches up into storage — the dependency runs `storage → schema::key`, the
+//! legitimate downward direction. This module is the one import path: every
 //! caller, storage included, names `crate::schema::key::X`.
 //!
 //! The per-column codec and tuple encoders are `gnitz_wire::pk`'s, shared with the
@@ -103,20 +102,6 @@ pub(crate) fn pk_in_range(min: &[u8], max: &[u8], key: &[u8]) -> bool {
 #[inline]
 pub(crate) fn pk_ranges_overlap(min: &[u8], max: &[u8], lo: &[u8], hi: &[u8]) -> bool {
     compare_pk_bytes(max, lo) != Ordering::Less && compare_pk_bytes(min, hi) != Ordering::Greater
-}
-
-// ---------------------------------------------------------------------------
-// Order-preserving PK encoder
-// ---------------------------------------------------------------------------
-
-/// A wire seek key (packed native-LE PK columns) as the OPK a PK region holds. Only
-/// the PK's own stride is read, so a scalar key may arrive as a 16-byte word.
-pub fn seek_opk_bytes(schema: &SchemaDescriptor, key: &[u8]) -> Result<PkBuf, String> {
-    let stride = schema.pk_stride();
-    let key = key
-        .get(..stride)
-        .ok_or_else(|| format!("key of {} bytes is shorter than the {stride}-byte PK", key.len()))?;
-    Ok(schema.opk_key(key))
 }
 
 // ---------------------------------------------------------------------------

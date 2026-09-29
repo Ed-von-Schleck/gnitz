@@ -14,13 +14,12 @@
 //! comparator believe the schema. This test drives the frame the client library
 //! would never build.
 
-use gnitz_core::protocol::{
-    encode_frame, hello_handshake, ClientTransport, ClientVerb, ColumnDef, Schema, TypeCode, WireFlags,
-};
-use gnitz_core::TableProps;
+use gnitz_core::{encode_frame, hello_handshake, ClientTransport, Schema};
 use gnitz_core::{BatchAppender, GnitzClient, ZSetBatch};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 use gnitz_wire::control::peek_control_block;
+use gnitz_wire::TableProps;
+use gnitz_wire::{ClientVerb, ColumnDef, TypeCode, WireFlags};
 
 /// Ship `batch` as a PUSH, bypassing the client-side `ZSetBatch::validate` that
 /// `Session::submit` runs by writing the encoded frame to the socket itself —
@@ -71,7 +70,8 @@ fn a_null_bit_on_a_not_null_column_is_rejected_at_the_client_boundary() {
             &[],
         )
         .unwrap();
-    let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
+    let desc = client.resolve_relation(&sn, "t").unwrap();
+    let (tid, schema) = (desc.tid, std::sync::Arc::clone(&desc.schema));
 
     let build = || {
         let mut batch = ZSetBatch::new(&schema);

@@ -32,7 +32,7 @@ def scans(module_schema):
     for name, (schema, rows) in _TABLES.items():
         tid = conn.create_table(sn, name, schema)
         conn.push(tid, ZSetBatch(schema).extend(rows))
-        out[name] = conn.scan(tid)
+        out[name] = conn.scan(tid, schema)
     return out
 
 
@@ -74,7 +74,7 @@ def test_including_hidden_presents_every_column_of_the_same_rows(module_schema):
         "CREATE TABLE hid (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
         "INSERT INTO hid VALUES (1, 10, 100), (2, 20, 200); "
         "ALTER TABLE hid DROP COLUMN a", schema_name=sn)
-    result = conn.scan(conn.resolve_table(sn, "hid")[0])
+    result = conn.scan(*conn.resolve_table(sn, "hid"))
     full = result.including_hidden()
 
     assert [r._fields for r in result] == [("pk", "b")] * 2

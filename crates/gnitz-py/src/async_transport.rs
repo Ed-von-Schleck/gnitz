@@ -13,10 +13,14 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::IntoPyObjectExt;
 
-use gnitz_core::{ClientError, Interest, Reply, Request, Session, SlotId, WireConflictMode};
+use std::sync::Arc;
+
+use gnitz_core::{ClientError, Interest, Reply, Request, Schema, Session, SlotId};
+use gnitz_wire::{ReadBound, ReadSpec, WireConflictMode};
 
 use crate::read::scan_result;
-use crate::write::{pk_key_from_py, PyZSetBatch};
+use crate::schema::{resolve_py_schema, scan_pairs};
+use crate::write::{pk_point_spec, PyZSetBatch};
 use crate::{build_pylist, client_err};
 
 #[pyclass(name = "AsyncTransport")]
@@ -198,19 +202,45 @@ impl PyAsyncTransport {
         )
     }
 
-    fn scan(slf: &Bound<'_, Self>, target_id: u64) -> PyResult<Py<PyAny>> {
-        Self::submit(slf, Request::scan(target_id))
+    fn scan(
+        slf: &Bound<'_, Self>,
+        target_id: u64,
+        #[pyo3(from_py_with = resolve_py_schema)] schema: Arc<Schema>,
+    ) -> PyResult<Py<PyAny>> {
+        let spec = ReadSpec::all_rows(ReadBound::None);
+        Self::submit(
+            slf,
+            Request::ScanSpec {
+                target_id,
+                spec: &spec,
+                reply_schema: &schema,
+            },
+        )
     }
 
-    /// N relations at one server-side SAL cut, resolved as a list in request
-    /// order.
-    fn scan_many(slf: &Bound<'_, Self>, target_ids: Vec<u64>) -> PyResult<Py<PyAny>> {
-        Self::submit(slf, Request::ScanMulti(&target_ids))
+    /// N `(table_id, schema)` relations at one server-side SAL cut, resolved as
+    /// a list in request order.
+    fn scan_many(slf: &Bound<'_, Self>, pairs: Vec<(u64, Bound<'_, PyAny>)>) -> PyResult<Py<PyAny>> {
+        let rels = scan_pairs(&pairs)?;
+        let rels: Vec<(u64, &Arc<Schema>)> = rels.iter().map(|(tid, s)| (*tid, s)).collect();
+        Self::submit(slf, Request::ScanMulti(&rels))
     }
 
-    fn seek(slf: &Bound<'_, Self>, target_id: u64, pk: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        let key = pk_key_from_py(&pk)?;
-        Self::submit(slf, Request::seek(target_id, &key))
+    fn seek(
+        slf: &Bound<'_, Self>,
+        target_id: u64,
+        #[pyo3(from_py_with = resolve_py_schema)] schema: Arc<Schema>,
+        pk: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let spec = pk_point_spec(&schema, &pk)?;
+        Self::submit(
+            slf,
+            Request::ScanSpec {
+                target_id,
+                spec: &spec,
+                reply_schema: &schema,
+            },
+        )
     }
 
     fn on_readable(slf: &Bound<'_, Self>) -> PyResult<()> {

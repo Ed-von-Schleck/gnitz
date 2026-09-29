@@ -28,8 +28,9 @@ use crate::codec::project_schema::{compute_map, payload_program, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 pub(crate) use chain::{EmitPieces, ViewChain};
-use gnitz_core::{ColumnDef, RelDescriptor, Schema, ViewBundle};
+use gnitz_core::{RelDescriptor, Schema, ViewBundle};
 use gnitz_expr::SchemaFacts;
+use gnitz_wire::ColumnDef;
 use gnitz_wire::{AggDescriptor, ReduceOutSlot};
 use spine::SourceOrigin;
 use std::collections::HashSet;
@@ -169,12 +170,12 @@ pub(crate) fn collect_live_cols<'a>(exprs: impl IntoIterator<Item = &'a HirExpr>
 /// The cheapest node producing `items` over `input`, whose key region the engine
 /// carries verbatim: the input itself, a copy list, or the payload expression map.
 fn emit_projection(
-    cb: &mut gnitz_core::Circuit,
-    node: gnitz_core::NodeId,
+    cb: &mut gnitz_wire::Circuit,
+    node: gnitz_wire::NodeId,
     items: &[ProjItem],
     out: &Schema,
     input: &Schema,
-) -> Result<gnitz_core::NodeId, GnitzSqlError> {
+) -> Result<gnitz_wire::NodeId, GnitzSqlError> {
     let k = input.pk_cols.len();
     // A payload slot naming a key column is a second copy of a value the key
     // region already carries; only the expression map can write one.
@@ -193,11 +194,11 @@ fn emit_projection(
 /// `items` over `input` with `input`'s PK pinned to the front — the linear
 /// projection.
 pub(crate) fn project_front(
-    cb: &mut gnitz_core::Circuit,
-    node: gnitz_core::NodeId,
+    cb: &mut gnitz_wire::Circuit,
+    node: gnitz_wire::NodeId,
     items: &[ProjEntry],
     input: &Frame,
-) -> Result<(gnitz_core::NodeId, Frame), GnitzSqlError> {
+) -> Result<(gnitz_wire::NodeId, Frame), GnitzSqlError> {
     let (items, out) = physical::physicalize_projection(items, input)?;
     let node = emit_projection(cb, node, &items, &out.schema, &input.schema)?;
     Ok((node, out))
@@ -339,11 +340,11 @@ fn as_body(subtree: &Rc<RelExpr>, live: &HashSet<ColId>) -> Rc<RelExpr> {
 /// Compile `preds` over `schema` and emit their AND — passing `node` through
 /// untouched when nothing is left to test.
 fn filter(
-    cb: &mut gnitz_core::Circuit,
-    node: gnitz_core::NodeId,
+    cb: &mut gnitz_wire::Circuit,
+    node: gnitz_wire::NodeId,
     preds: &[BoundExpr],
     schema: &Schema,
-) -> Result<gnitz_core::NodeId, GnitzSqlError> {
+) -> Result<gnitz_wire::NodeId, GnitzSqlError> {
     match crate::expr_lower::compile_filter_program(preds, &schema.columns)? {
         Some(prog) => Ok(cb.filter(node, prog.to_blob_bytes())),
         None => Ok(node),
@@ -353,11 +354,11 @@ fn filter(
 /// Resolve `preds` against `frame` and emit the filter. Shared by the emits that
 /// filter an already-emitted node: HAVING, and the WHERE over each join branch.
 pub(crate) fn emit_filter(
-    cb: &mut gnitz_core::Circuit,
-    node: gnitz_core::NodeId,
+    cb: &mut gnitz_wire::Circuit,
+    node: gnitz_wire::NodeId,
     preds: &[HirExpr],
     frame: &Frame,
-) -> Result<gnitz_core::NodeId, GnitzSqlError> {
+) -> Result<gnitz_wire::NodeId, GnitzSqlError> {
     filter(cb, node, &frame.resolve_preds(preds)?, &frame.schema)
 }
 
@@ -365,12 +366,12 @@ pub(crate) fn emit_filter(
 /// carrying what `down` reads and its own keys, and kept under [`join_sides`].
 pub(crate) fn emit_join_inputs(
     chain: &mut ViewChain,
-    cb: &mut gnitz_core::Circuit,
+    cb: &mut gnitz_wire::Circuit,
     down: Demand<'_>,
     [left, right]: [&Rc<RelExpr>; 2],
     kind: JoinType,
     class: &JoinClass,
-) -> Result<([gnitz_core::NodeId; 2], [JoinSide; 2]), GnitzSqlError> {
+) -> Result<([gnitz_wire::NodeId; 2], [JoinSide; 2]), GnitzSqlError> {
     let live = |is_left: bool| {
         let mut live = HashSet::new();
         down.refs(&mut live);
@@ -419,8 +420,8 @@ impl JoinSide {
     /// the relation the master scatters.
     pub(crate) fn scatter_key(
         &self,
-        key: &[gnitz_core::ReindexSlot],
-    ) -> Result<gnitz_core::ReindexRole, GnitzSqlError> {
+        key: &[gnitz_wire::ReindexSlot],
+    ) -> Result<gnitz_wire::ReindexRole, GnitzSqlError> {
         self.origin.scatter_role(&self.frame, key).ok_or_else(|| {
             GnitzSqlError::Internal("a join key column is not a column of the relation it scatters".into())
         })
@@ -454,7 +455,7 @@ impl JoinSide {
 
     /// The type codes of the kept payload columns — what `null_extend` needs to
     /// synthesize this side's NULL region.
-    pub(crate) fn kept_type_codes(&self) -> Vec<gnitz_core::TypeCode> {
+    pub(crate) fn kept_type_codes(&self) -> Vec<gnitz_wire::TypeCode> {
         self.kept_defs().map(|c| c.ty.tc).collect()
     }
 }

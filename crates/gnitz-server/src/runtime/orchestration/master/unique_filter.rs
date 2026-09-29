@@ -10,8 +10,10 @@ use rustc_hash::FxHashSet;
 
 use super::train::drain_rows;
 use super::*;
+use gnitz_expr::SchemaFacts;
 use gnitz_store::schema::key::{probe_key, PkBuf};
 use gnitz_store::schema::KeySpec;
+use gnitz_wire::{ReadBound, ReadSpec};
 
 /// Spans tracked per filter before it disables itself: `FxHashSet<u64>`'s
 /// 2^23-bucket table at its 7/8 load factor, the largest count that never grows
@@ -188,14 +190,9 @@ impl MasterDispatcher {
         }
         let schema = self.schema_desc_for(table_id);
 
+        let spec = ReadSpec::all_rows(ReadBound::None).encode();
         let lease = self
-            .scan(DirectGroup {
-                template: wire::WireMsg {
-                    target_id: table_id,
-                    ..Default::default()
-                },
-                ..DirectGroup::new(SalMessageKind::Scan)
-            })
+            .scan(DirectGroup::scan_spec(table_id, &spec, schema.layout_digest()))
             .await?;
 
         drain_rows(&lease, &schema, |mb| {

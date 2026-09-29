@@ -1,7 +1,8 @@
 use super::*;
 use crate::ir::NumLit;
 use crate::test_support::parse_expr_sql;
-use gnitz_core::{ColumnDef, Schema, TypeCode};
+use gnitz_core::Schema;
+use gnitz_wire::{ColumnDef, TypeCode};
 
 /// Bind against `schema` as relation `t` — the alias every qualified reference
 /// in this file writes.

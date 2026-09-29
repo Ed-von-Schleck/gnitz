@@ -11,7 +11,6 @@
 
 mod ddl;
 
-use gnitz_expr::SchemaFacts;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -32,11 +31,10 @@ use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, ReadG
 use crate::runtime::sal::{DirectGroup, GroupTargets, SalMessageKind};
 use crate::runtime::wire as ipc;
 use gnitz_store::relation::{Relation, RelationKind};
-use gnitz_store::schema::key::seek_opk_bytes;
 use gnitz_store::storage::Batch;
 use gnitz_wire::control::DecodedControl;
 use gnitz_wire::txn_frame::DeltaPollItem;
-use gnitz_wire::{PkKeys, ReadBound, ReadSpec, WireFault, WireFlags, WireStatus};
+use gnitz_wire::{ReadBound, ReadSpec, WireFault, WireStatus};
 
 const TICK_COALESCE_ROWS: usize = 10_000;
 
@@ -679,10 +677,6 @@ async fn dispatch_request(
         }
 
         ClientVerb::Push => handle_push(shared, peer, buf, ctrl).await,
-
-        verb @ (ClientVerb::Scan | ClientVerb::Seek) => {
-            handle_read(shared, peer, &ctrl, &data[ctrl.blob.clone()], verb).await
-        }
     }
 }
 
@@ -797,83 +791,6 @@ async fn handle_push(
     // coalesced with a base-table push still answers `0`.
     let reply_lsn = if is_stream { 0 } else { zone_lsn };
     send_push_ack(peer, target_id, reply_lsn);
-    Ok(())
-}
-
-/// SCAN or SEEK of one relation: a catalog family is served master-locally,
-/// anything else fans out — a seek as a one-key `ScanSpec`.
-async fn handle_read(
-    shared: &Rc<Shared>,
-    peer: &Peer,
-    ctrl: &gnitz_wire::control::DecodedControl,
-    blob: &[u8],
-    verb: ClientVerb,
-) -> Result<(), WireFault> {
-    let target_id = ctrl.hdr.target_id;
-    let client_version = ctrl.hdr.flags.schema_version;
-    let (g, kind) = read_lock(shared, target_id, Access::Read).await?;
-    let schema = shared.disp().schema_desc_for(target_id);
-    let bound = match verb {
-        ClientVerb::Seek => {
-            let opk = seek_opk_bytes(&schema, blob).map_err(|e| format!("seek: table {target_id}: {e}"))?;
-            ReadBound::PkSet(PkKeys::from_keys(schema.pk_stride(), [opk.pk_bytes()]))
-        }
-        _ => ReadBound::None,
-    };
-    let spec = ReadSpec::all_rows(bound);
-
-    if kind == RelationKind::SystemCatalog {
-        let rows = guard_panic("read", || {
-            shared
-                .cat()
-                .registry
-                .scan_spec(target_id, spec, schema.layout_digest(), None)
-        })?;
-        let (schema_block, server_version) = shared.cat().negotiated_schema_block(target_id, client_version);
-        send_msg(
-            peer,
-            ipc::WireMsg {
-                target_id,
-                flags: WireFlags {
-                    schema_version: server_version,
-                    ..Default::default()
-                },
-                arg0: read_watermark(shared, kind),
-                data: if rows.is_empty() {
-                    ipc::WireData::None
-                } else {
-                    ipc::WireData::Whole(&rows)
-                },
-                schema_block: schema_block.as_deref(),
-                ..Default::default()
-            },
-        );
-        return Ok(());
-    }
-
-    let (sal_kind, blob, reply_layout) = match verb {
-        ClientVerb::Seek => (SalMessageKind::ScanSpec, spec.encode(), schema.layout_digest()),
-        _ => (SalMessageKind::Scan, Vec::new(), 0),
-    };
-
-    let (prelim, server_version) = shared.cat().negotiated_schema_block(target_id, client_version);
-    if let Some(block) = prelim {
-        send_msg(peer, prelim_schema_msg(target_id, server_version, &block));
-    }
-
-    let template = ipc::WireMsg {
-        target_id,
-        flags: WireFlags {
-            schema_version: server_version,
-            ..Default::default()
-        },
-        arg0: reply_layout,
-        blob: &blob,
-        ..Default::default()
-    };
-    let group = DirectGroup { template, ..DirectGroup::new(sal_kind) };
-    let result = fan_out_scan(shared, peer, g, kind, group).await;
-    finish_scan_fanout(peer, target_id, 0, result);
     Ok(())
 }
 
@@ -1051,7 +968,7 @@ fn resolve_request_target(shared: &Rc<Shared>, target_id: u64, name_blob: &[u8])
 fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, target_id: u64, name_blob: &[u8]) -> Result<(), WireFault> {
     let answer = resolve_request_target(shared, target_id, name_blob)?
         .and_then(|tid| shared.cat().resolve_answer(tid).map(|a| (tid, a)));
-    let Some((tid, (desc, schema_block, version))) = answer else {
+    let Some((tid, (desc, schema_block))) = answer else {
         // No such relation: a successful reply naming none.
         send_msg(peer, ipc::WireMsg::default());
         return Ok(());
@@ -1060,10 +977,6 @@ fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, target_id: u64, name_bl
         peer,
         ipc::WireMsg {
             target_id: tid,
-            flags: WireFlags {
-                schema_version: version,
-                ..Default::default()
-            },
             schema_block: Some(&schema_block),
             blob: &desc.encode(),
             ..Default::default()
@@ -1137,18 +1050,6 @@ async fn read_lock(
     Ok((g, kind))
 }
 
-/// The preliminary schema-only frame — carrying `continuation`, the
-/// `server_version`, and the captured wire block — that precedes a scan's data
-/// frames on a schema-cache miss.
-fn prelim_schema_msg(tid: u64, server_version: u16, block: &[u8]) -> ipc::WireMsg<'_> {
-    ipc::WireMsg {
-        target_id: tid,
-        flags: WireFlags::train_frame(server_version, false),
-        schema_block: Some(block),
-        ..Default::default()
-    }
-}
-
 /// A reply train's terminal frame. `arg0` is the read's watermark (see
 /// [`read_watermark`]), or a DELTA_POLL position's tick round, whose cursor tag
 /// rides `arg1`; `arg1` is `0` for every other read.
@@ -1205,8 +1106,7 @@ fn finish_scan_fanout(peer: &Peer, target_id: u64, arg1: u64, result: Result<u64
     }
 }
 
-/// SCAN_SPEC: the scan pipeline under a client-authored reply schema, so no schema
-/// block goes back, routed by the request's bound.
+/// SCAN_SPEC: one relation, replied in the client's layout `reply_layout`.
 async fn handle_scan_spec(
     shared: &Rc<Shared>,
     peer: &Peer,
@@ -1214,19 +1114,28 @@ async fn handle_scan_spec(
     blob: &[u8],
     reply_layout: u64,
 ) -> Result<(), WireFault> {
-    // `UserRead`: a `ReadSpec` has only a fan-out realization, which a catalog
-    // family has no form of.
-    let (g, kind) = read_lock(shared, target_id, Access::UserRead).await?;
-    let template = ipc::WireMsg {
-        target_id,
-        arg0: reply_layout,
-        blob,
-        ..Default::default()
-    };
-    let group = DirectGroup {
-        template,
-        ..DirectGroup::new(SalMessageKind::ScanSpec)
-    };
+    let (g, kind) = read_lock(shared, target_id, Access::Read).await?;
+    if kind == RelationKind::SystemCatalog {
+        let spec = ReadSpec::decode(blob).map_err(|e| format!("decode error: {e}"))?;
+        let rows = guard_panic("read", || {
+            shared.cat().registry.scan_spec(target_id, spec, reply_layout, None)
+        })?;
+        send_msg(
+            peer,
+            ipc::WireMsg {
+                target_id,
+                arg0: read_watermark(shared, kind),
+                data: if rows.is_empty() {
+                    ipc::WireData::None
+                } else {
+                    ipc::WireData::Whole(&rows)
+                },
+                ..Default::default()
+            },
+        );
+        return Ok(());
+    }
+    let group = DirectGroup::scan_spec(target_id, blob, reply_layout);
     let result = fan_out_scan(shared, peer, g, kind, group).await;
     finish_scan_fanout(peer, target_id, 0, result);
     Ok(())
@@ -1345,18 +1254,14 @@ fn delta_up_to_date(shared: &Shared, target_id: u64, after_tick: u64) -> bool {
         && after_tick >= shared.disp().last_delta_round(target_id)
 }
 
-/// One relation's Phase-1 capture for `handle_scan_multi`: exactly what
-/// [`CatalogEngine::negotiated_schema_block`] answered, carried to the deferred Phase-2 emit.
+/// One relation's Phase-1 capture for `handle_scan_multi`, carried to the
+/// deferred Phase-2 emit.
 struct ScanMultiRelPlan {
     tid: u64,
-    /// Stamped into the preliminary frame and onto the read, whose frames echo it.
-    server_version: u16,
+    reply_layout: u64,
     kind: RelationKind,
     /// The read's watermark, sampled inside the cut.
     lsn: u64,
-    /// The wire schema block to emit before this relation's train, present iff
-    /// the client's cached version missed.
-    block: Option<Rc<[u8]>>,
 }
 
 /// SCAN_MULTI: snapshot N relations at one SAL cut and stream N reply trains in
@@ -1376,7 +1281,7 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
     // handed back, so a DDL during the drain is caught there and an unknown tid
     // is rejected there rather than here.
     let mut cat = shared.catalog_rwlock.read().await;
-    if relations.iter().any(|&(tid, _)| !read_is_fresh(shared, tid)) {
+    if relations.iter().any(|r| !read_is_fresh(shared, r.tid)) {
         cat = drain_and_relock(shared, cat).await?;
     }
 
@@ -1385,49 +1290,34 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Res
     let (dispatches, plans) = {
         let _cat = cat;
         let mut plans: Vec<ScanMultiRelPlan> = Vec::with_capacity(relations.len());
-        for &(tid_u, client_ver) in &relations {
-            let tid = tid_u;
-            // Base tables AND views are legal; `UserRead` refuses a catalog
-            // family, which stays on the plain path that serves it
-            // master-locally.
-            let kind = target_kind(shared, tid, Access::UserRead)?;
-            // Capture (not emit) each relation's preliminary schema frame here so
-            // Phase 2 can send it after the one-cut dispatch, in request order.
-            let (block, server_version) = shared.cat().negotiated_schema_block(tid, client_ver);
-            plans.push(ScanMultiRelPlan { tid, server_version, kind, lsn: 0, block });
+        for r in &relations {
+            let kind = target_kind(shared, r.tid, Access::UserRead)?;
+            plans.push(ScanMultiRelPlan {
+                tid: r.tid,
+                reply_layout: r.reply_layout,
+                kind,
+                lsn: 0,
+            });
         }
+        let spec = ReadSpec::all_rows(ReadBound::None).encode();
         let disp = shared.disp();
         let dispatches = disp
             .scan_cut(plans.len(), |cut| {
                 for plan in &mut plans {
                     plan.lsn = read_watermark(shared, plan.kind);
-                    cut.read(DirectGroup {
-                        template: ipc::WireMsg {
-                            target_id: plan.tid,
-                            flags: WireFlags {
-                                schema_version: plan.server_version,
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        },
-                        ..DirectGroup::new(SalMessageKind::Scan)
-                    })?;
+                    cut.read(DirectGroup::scan_spec(plan.tid, &spec, plan.reply_layout))?;
                 }
                 Ok(())
             })
             .await?;
         // Release the catalog read lock here: Phase 2 touches no catalog state
-        // (the snapshot is worker-frozen and the schemas are captured), so
-        // holding it across the whole bulk read would needlessly block DDL.
+        // (the snapshot is worker-frozen), so holding it across the whole bulk
+        // read would needlessly block DDL.
         (dispatches, plans)
     };
 
     // ── Phase 2: sequential per-relation drain (no locks; holds all leases) ──
     for (plan, d) in plans.iter().zip(&dispatches) {
-        // Preliminary schema-only frame first, when captured in Phase 1.
-        if let Some(block) = plan.block.as_ref() {
-            send_msg(peer, prelim_schema_msg(plan.tid, plan.server_version, block));
-        }
         // Drain this relation's train (all workers, ascending) before the next —
         // the FIFO reply contract makes request order == ring order.
         forward_scan(peer, d).await?;

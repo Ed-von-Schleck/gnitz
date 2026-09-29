@@ -33,10 +33,10 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::client::{park, DeltaCursor, GnitzClient};
-use crate::connection::{Interest, PolledView, RawBlock, RelDescriptor, SlotId};
+use crate::client::{park, GnitzClient};
+use crate::connection::{DeltaCursor, Interest, PolledView, RawBlock, RelDescriptor, SlotId};
 use crate::error::ClientError;
-use crate::protocol::{Schema, ZSetBatch};
+use crate::{Schema, ZSetBatch};
 use gnitz_wire::txn_frame::{DeltaPollItem, DELTA_POLL_MAX_VIEWS};
 use gnitz_wire::RelClass;
 
@@ -265,6 +265,12 @@ pub(crate) struct MirrorState {
 }
 
 impl MirrorState {
+    /// See [`GnitzClient::cursor_of`].
+    pub(crate) fn cursor_of(&self, tid: u64) -> Option<DeltaCursor> {
+        self.views.get(&tid)?;
+        self.store.cursor_of(tid)
+    }
+
     /// Check the tag `fetched` carries against `prev`, apply, advance the cursor.
     ///
     /// **No recovery here**: a recovery can re-point a registration at a view
@@ -758,10 +764,7 @@ impl GnitzClient {
     /// so it advances over rounds that carried this view nothing. Whether a copy
     /// was discarded is [`PollResult::Reseeded`], not this.
     pub fn cursor_of(&self, table_id: u64) -> Option<DeltaCursor> {
-        self.mirror
-            .as_deref()
-            .filter(|m| m.views.contains_key(&table_id))
-            .and_then(|m| m.store.cursor_of(table_id))
+        self.mirror.as_deref()?.cursor_of(table_id)
     }
 
     /// Make every copy and its cursor durable.
@@ -811,14 +814,8 @@ impl GnitzClient {
         }
     }
 
-    /// Tear down this client's own copy of `tid`, because a DDL statement it just
-    /// ran retired the relation the copy holds.
-    ///
-    /// **Infallible, because it runs after the statement committed.** The
-    /// `views.remove` is the read gate and cannot fail; the teardown past it is
-    /// reclamation, and its only refusal is a poisoned store — which is already
-    /// an error in its own right, reported at [`Self::mirror_poisoned`] and
-    /// raised by every read that reaches it.
+    /// Drop this client's copy of `tid`. Leaving `views` is what stops local
+    /// reads; the store's teardown fails only on a poisoned store.
     pub(crate) fn invalidate_own_copy(&mut self, tid: u64) {
         let Some(m) = self.mirror.as_deref_mut() else {
             return;

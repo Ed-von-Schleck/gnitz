@@ -25,7 +25,7 @@ def test_a_push_whose_pk_type_disagrees_is_rejected(client, schema_name):
     signed_pk = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.I64), KV.columns[1]], [0])
     with pytest.raises(gnitz.GnitzError):
         client.push(tid, gnitz.ZSetBatch(signed_pk).extend([{"pk": 1, "val": 42}]))
-    assert bag(client.scan(tid)) == {}
+    assert bag(client.scan(tid, KV)) == {}
 
 
 def test_a_push_whose_decimal_scale_disagrees_is_rejected(client, schema_name):
@@ -35,7 +35,7 @@ def test_a_push_whose_decimal_scale_disagrees_is_rejected(client, schema_name):
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, d DECIMAL(10,4) NOT NULL)",
         schema_name=schema_name)
-    tid, _ = client.resolve_table(schema_name, "t")
+    tid, t_schema = client.resolve_table(schema_name, "t")
 
     def at_scale(scale):
         schema = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.I64),
@@ -44,17 +44,17 @@ def test_a_push_whose_decimal_scale_disagrees_is_rejected(client, schema_name):
 
     with pytest.raises(gnitz.GnitzError, match="Schema mismatch"):
         client.push(tid, at_scale(2))
-    assert bag(client.scan(tid)) == {}
+    assert bag(client.scan(tid, t_schema)) == {}
 
     client.push(tid, at_scale(4))
-    assert bag(client.scan(tid), "pk", "d") == {(1, Decimal("1.5000")): 1}
+    assert bag(client.scan(tid, t_schema), "pk", "d") == {(1, Decimal("1.5000")): 1}
 
 
 def test_writes_to_a_view_are_rejected_and_change_nothing(client, schema_name):
     """A view's tid lives in the same id space as a base table's, so a raw push
     or delete addressed to one would commit rows its circuit never produced. SQL
-    refuses a view target in the binder; the raw API reaches only the server,
-    since the client's schema cache carries no relation kind. It is one guard on
+    refuses a view target in the binder; the raw API reaches only the server's
+    guard. It is one guard on
     every write, the empty-batch arm included — so a client bug producing an
     empty batch fails instead of being masked by the no-op ACK a base table
     still gives."""
@@ -72,7 +72,7 @@ def test_writes_to_a_view_are_rejected_and_change_nothing(client, schema_name):
                   lambda: client.push(vid, gnitz.ZSetBatch(v_schema))):
         with pytest.raises(gnitz.GnitzError, match=_NOT_WRITABLE):
             write()
-    assert bag(client.scan(vid)) == {(1, 100): 1}
+    assert bag(client.scan(vid, v_schema)) == {(1, 100): 1}
 
     # The same empty batch against the base table is the ordinary no-op ACK.
     assert client.push(tid, gnitz.ZSetBatch(t_schema)) == 0
@@ -86,7 +86,7 @@ def test_an_absent_relation_is_a_miss_not_a_writability_failure(client, schema_n
     with pytest.raises(gnitz.GnitzNotFoundError, match="not found"):
         client.push(99999999, batch)
     with pytest.raises(gnitz.GnitzError):
-        client.scan(99999999)
+        client.scan(99999999, KV)
 
     with pytest.raises(gnitz.GnitzNotFoundError) as ei:
         client.drop_table(schema_name, "nope")
@@ -117,7 +117,7 @@ def test_system_relations_survive_a_rejected_drop(client):
     rejected cascade must not have retracted a single member on its way to the
     row it was rejected on."""
     def sys_ids():
-        return {r["table_id"] for r in client.scan(gnitz.TABLE_TAB)
+        return {r["table_id"] for r in client.scan(gnitz.TABLE_TAB, gnitz.sys_schema(gnitz.TABLE_TAB))
                 if r["table_id"] < gnitz.FIRST_USER_TABLE_ID}
 
     before = sys_ids()

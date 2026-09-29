@@ -58,22 +58,21 @@ def _setup(client):
             batch.append(pk=i, pad=_FILL_PAD)
         client.push(filler, batch)
 
-    tid, _ = client.resolve_table(sn, "t")
-    return sn, tid
+    return sn, client.resolve_table(sn, "t")
 
 
-def _rows(client, tid):
-    return bag(client.scan(tid), "pk", "val")
+def _rows(client, rel):
+    return bag(client.scan(*rel), "pk", "val")
 
 
-def _served(client, tid):
+def _served(client, rel):
     """One scan, retried past the SAL-full refusals a cursor past the threshold
     legitimately produces — matched by exception class, not message text.
     Raises once the refusals outlast `SAL_FULL_GRACE_S`."""
     give_up_at = None
     while True:
         try:
-            return _rows(client, tid)
+            return _rows(client, rel)
         except gnitz.GnitzSalFullError as e:
             # No backoff: a refused scan writes nothing, and the pressure these
             # readers keep on the cursor is what holds it at the margin under test.
@@ -83,14 +82,14 @@ def _served(client, tid):
                 raise AssertionError(f"SAL never reclaimed: {e!r}") from e
 
 
-def _read_loop(target, tid, errors, keep_going):
-    """Scan `tid` on its own connection while `keep_going()`, recording the first
+def _read_loop(target, rel, errors, keep_going):
+    """Scan `rel` on its own connection while `keep_going()`, recording the first
     wrong answer, wedge or connection failure in `errors`. One `keep_going` tick
     is one scan, never one attempt."""
     try:
         with gnitz.connect(target) as c:
             while keep_going():
-                got = _served(c, tid)
+                got = _served(c, rel)
                 if got != _EXPECTED:
                     errors.append(f"wrong rows: {got}")
                     return
@@ -115,11 +114,11 @@ def test_concurrent_read_only_clients_survive_reclaim(tiny_sal_server):
     """
     target, proc = tiny_sal_server
     with gnitz.connect(target) as client:
-        sn, tid = _setup(client)
+        sn, rel = _setup(client)
 
         errors = []
         threads = [threading.Thread(daemon=True, target=_read_loop,
-                                    args=(target, tid, errors, _counted(SCANS // 4)))
+                                    args=(target, rel, errors, _counted(SCANS // 4)))
                    for _ in range(4)]
         for t in threads:
             t.start()
@@ -127,12 +126,12 @@ def test_concurrent_read_only_clients_survive_reclaim(tiny_sal_server):
 
         assert proc.poll() is None, "master died under concurrent read-only load"
         assert not errors, f"concurrent readers failed: {errors[:3]}"
-        assert _rows(client, tid) == _EXPECTED
+        assert _rows(client, rel) == _EXPECTED
 
         # The first write after a long read-only stretch used to hit a full SAL
         # inside `flush_round` and `_exit(134)`.
         client.execute_sql("INSERT INTO t VALUES (4, 2, 40, 400)", schema_name=sn)
-        assert _rows(client, tid) == _EXPECTED | {(4, 40): 1}
+        assert _rows(client, rel) == _EXPECTED | {(4, 40): 1}
 
 
 def test_a_ddl_concurrent_with_reclaim_does_not_deadlock(tiny_sal_server):
@@ -145,18 +144,18 @@ def test_a_ddl_concurrent_with_reclaim_does_not_deadlock(tiny_sal_server):
     """
     target, proc = tiny_sal_server
     with gnitz.connect(target) as client:
-        sn, tid = _setup(client)
+        sn, rel = _setup(client)
 
         # Cross the threshold before the DDLs, so the watchdog sends reclaim wakes
         # for the whole window. Counted, not slept: the crossing is a number of scan
         # groups, which no machine speed can under-shoot.
         errors = []
-        _read_loop(target, tid, errors, _counted(SCANS))
+        _read_loop(target, rel, errors, _counted(SCANS))
         assert not errors, f"readers failed before the DDL: {errors[:3]}"
 
         stop = threading.Event()
         readers = [threading.Thread(daemon=True, target=_read_loop,
-                                    args=(target, tid, errors, lambda: not stop.is_set()))
+                                    args=(target, rel, errors, lambda: not stop.is_set()))
                    for _ in range(4)]
         for t in readers:
             t.start()
@@ -187,7 +186,7 @@ def test_a_ddl_concurrent_with_reclaim_does_not_deadlock(tiny_sal_server):
         assert proc.poll() is None, "master died on a DDL concurrent with reclaim"
         assert not errors, f"readers failed during the DDL: {errors[:3]}"
 
-        v1, _ = client.resolve_table(sn, "v1")
-        v2, _ = client.resolve_table(sn, "v2")
-        assert bag(client.scan(v1), "pk", "val") == {(1, 10): 1, (2, 20): 1}
-        assert bag(client.scan(v2), "pk", "val") == {(3, 30): 1}
+        v1 = client.resolve_table(sn, "v1")
+        v2 = client.resolve_table(sn, "v2")
+        assert bag(client.scan(*v1), "pk", "val") == {(1, 10): 1, (2, 20): 1}
+        assert bag(client.scan(*v2), "pk", "val") == {(3, 30): 1}

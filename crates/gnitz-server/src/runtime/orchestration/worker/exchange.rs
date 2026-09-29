@@ -74,7 +74,7 @@ impl WorkerProcess {
         use SalMessageKind::*;
         match req.kind {
             // Answered mid-drive, a read would see a half-run tick.
-            Scan | ScanSpec | DeltaRead => self.deferred.push(req),
+            ScanSpec | DeltaRead => self.deferred.push(req),
             // The master holds the SAL writer until every worker ACKs a flush.
             Flush => self.handle_request(req),
             // Deferred, the ingest ACK would wait for the drive.

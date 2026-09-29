@@ -6,8 +6,8 @@ use crate::agg::AggFunc;
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::ir::{BExpr, NumLit};
 use crate::validate::{first_duplicate, validate_user_name};
-use gnitz_core::ColumnDef;
 use gnitz_wire::decimal::decimal_of_number_text;
+use gnitz_wire::ColumnDef;
 use sqlparser::ast::{ExcludeSelectItem, Expr, RenameSelectItem, SelectItem, Value, WildcardAdditionalOptions};
 
 /// The identifier of an `ObjectName`'s last part, or `None` when that part is

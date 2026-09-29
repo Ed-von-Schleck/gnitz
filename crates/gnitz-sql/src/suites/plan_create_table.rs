@@ -2,7 +2,8 @@
 //! precedence between the passes, the constraint spellings that are rejected,
 //! and the bundle a plan carries.
 
-use gnitz_core::{FkTarget, InlineForeignKey, InlineUniqueIndex, RelClass, TypeCode};
+use gnitz_core::{FkTarget, InlineForeignKey, InlineUniqueIndex};
+use gnitz_wire::{RelClass, TypeCode};
 
 use super::*;
 

@@ -10,7 +10,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyString;
 
-use gnitz_core::{ColType, ColumnDef, Schema};
+use gnitz_core::Schema;
+use gnitz_wire::{ColType, ColumnDef};
 
 /// One column: a name, a validated type, and its nullability and hidden flags.
 /// A column carries no PK flag — the PK is the schema's ordered `pk_indices`.
@@ -147,4 +148,26 @@ impl PySchema {
 /// an owned `Arc<Schema>`.
 pub(crate) fn resolve_py_schema(obj: &Bound<'_, PyAny>) -> PyResult<Arc<Schema>> {
     Ok(Arc::clone(&obj.cast::<PySchema>()?.get().rust))
+}
+
+/// `(table_id, schema)` pairs as the relations a multi-relation read names.
+pub(crate) fn scan_pairs(pairs: &[(u64, Bound<'_, PyAny>)]) -> PyResult<Vec<(u64, Arc<Schema>)>> {
+    pairs
+        .iter()
+        .map(|(tid, schema)| Ok((*tid, resolve_py_schema(schema)?)))
+        .collect()
+}
+
+/// sys_schema(table_id) -> Schema: the schema of system table `table_id`, the
+/// layout a read of it must name.
+#[pyfunction]
+pub(crate) fn sys_schema(table_id: u64) -> PyResult<PySchema> {
+    if gnitz_wire::sys_family_index(table_id).is_none() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{table_id} is not a system table id"
+        )));
+    }
+    Ok(PySchema {
+        rust: Arc::clone(gnitz_core::sys_schema(table_id)),
+    })
 }

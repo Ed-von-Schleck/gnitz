@@ -8,7 +8,8 @@ use super::{as_col, ColId, HirCol, HirExpr, ProjEntry};
 use crate::codec::project_schema::{leading_schema, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use gnitz_core::{ColumnDef, RelDescriptor, Schema};
+use gnitz_core::{RelDescriptor, Schema};
+use gnitz_wire::ColumnDef;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -66,10 +67,13 @@ impl Frame {
         ids.into_iter().map(|id| self.slot(id)).collect()
     }
 
-    /// The reduce group over `ids`' slots, normalized by `Schema::reduce_group`.
+    /// The group list to send a reduce or top-N grouped by `ids`' slots: SQL's
+    /// GROUP BY is unordered, so a permutation of the PK is sent as the PK list.
     pub(crate) fn reduce_group(&self, ids: &[ColId]) -> Result<Vec<u32>, GnitzSqlError> {
-        let written: Vec<u32> = self.slots(ids.iter().copied())?.into_iter().map(|c| c as u32).collect();
-        Ok(self.schema.reduce_group(&written))
+        let group: Vec<u32> = self.slots(ids.iter().copied())?.into_iter().map(|c| c as u32).collect();
+        let pk = &self.schema.pk_cols;
+        let is_pk = group.len() == pk.len() && pk.iter().all(|p| group.contains(p));
+        Ok(if is_pk { pk.clone() } else { group })
     }
 
     /// `expr` with every `ColId` leaf substituted by `ColRef(its slot)`.

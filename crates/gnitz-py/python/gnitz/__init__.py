@@ -6,7 +6,7 @@ from gnitz._native import (
     PollResult,
     SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, IDX_TAB,
     FIRST_USER_TABLE_ID, MAX_COLUMNS,
-    debug_assertions,
+    debug_assertions, sys_schema,
 )
 from gnitz._types import TypeCode
 

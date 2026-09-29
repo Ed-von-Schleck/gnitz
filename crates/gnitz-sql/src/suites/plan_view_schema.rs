@@ -2,7 +2,7 @@
 //! key slots, nullability, type codes and the PK column set — planned with no
 //! server against a hand-built catalog.
 
-use gnitz_core::{RelClass, TypeCode, PK_LIST_MAX_COLS};
+use gnitz_wire::{RelClass, TypeCode, PK_LIST_MAX_COLS};
 
 use super::*;
 

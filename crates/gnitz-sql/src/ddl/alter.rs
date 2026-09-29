@@ -28,7 +28,7 @@ enum Action<'a> {
         old: &'a str,
         new: &'a str,
     },
-    AddColumn(gnitz_core::ColumnDef),
+    AddColumn(gnitz_wire::ColumnDef),
     DropColumn {
         name: &'a str,
         if_exists: bool,
@@ -76,7 +76,7 @@ pub(crate) fn execute_alter_table(
 
     let cols = &rel.schema.columns;
     match action {
-        Action::RenameRelation { new_name } => client.alter_rename_relation(schema_name, &rel, &new_name)?,
+        Action::RenameRelation { new_name } => client.alter_rename_relation(&rel, &new_name)?,
         Action::RenameColumn { old, new } => client.alter_rename_column(rel.tid, require_column(cols, old)?, new)?,
         Action::AddColumn(def) => client.alter_add_column(&rel, &def)?,
         Action::DropColumn { name, if_exists: true } if find_unique_column(cols, name)?.is_none() => {}

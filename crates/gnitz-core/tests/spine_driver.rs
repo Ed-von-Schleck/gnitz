@@ -12,12 +12,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use gnitz_core::{
-    ColumnDef, GnitzClient, Interest, PkColumn, Reply, Request, Schema, Session, SlotId, TableProps, TypeCode,
-    WireConflictMode, ZSetBatch, MAX_IN_FLIGHT,
-};
+use gnitz_core::{GnitzClient, Interest, PkColumn, Reply, Request, Schema, Session, SlotId, ZSetBatch, MAX_IN_FLIGHT};
 use gnitz_foundation::posix_io::set_sockopt_int;
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
+use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, WireConflictMode};
+use std::sync::Arc;
 
 /// A `(pk BIGINT, a BIGINT)` table reachable through `target`, and the
 /// blocking client that made it.
@@ -28,8 +27,8 @@ fn table(target: &str) -> (GnitzClient, u64, std::sync::Arc<Schema>) {
     client
         .create_table(&sn, "t", &local_schema(), &[], TableProps::default(), &[])
         .unwrap();
-    let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
-    (client, tid, schema)
+    let desc = client.resolve_relation(&sn, "t").unwrap();
+    (client, desc.tid, Arc::clone(&desc.schema))
 }
 
 /// The fixture table's schema, built locally — `table()` creates it, and
@@ -96,6 +95,7 @@ fn concurrent_pushes_and_scans(target: &str) {
     // Small socket buffers so the outbound queue is drained across several
     // steps rather than in one writev.
     set_sockopt_int(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 64 * 1024);
+    let all = ReadSpec::all_rows(ReadBound::None);
     let sent_before = s.requests_sent();
     let n = 40usize;
     let per = 5_000usize;
@@ -104,7 +104,7 @@ fn concurrent_pushes_and_scans(target: &str) {
         let batch = rows((i * per) as i64, per);
         let id = s.submit(push_req(tid, &schema, &batch)).unwrap();
         slots.push((id, true));
-        let id = s.submit(Request::scan(tid)).unwrap();
+        let id = s.submit(scan_req(tid, &all, &schema)).unwrap();
         slots.push((id, false));
     }
     assert_eq!(s.requests_sent() - sent_before, 2 * n as u64, "counted on enqueue");
@@ -130,8 +130,10 @@ fn concurrent_pushes_and_scans(target: &str) {
     }
     assert_eq!(s.interest(), Interest::NONE);
     // The blocking client and the driver agree on the table.
-    assert_eq!(blocking.scan(tid).unwrap().batch.len(), n * per);
-    assert_eq!(blocking.seek(tid, &7u64.to_le_bytes()).unwrap().batch.len(), 1);
+    assert_eq!(blocking.scan_spec(tid, &all, &schema).unwrap().batch.len(), n * per);
+    let key = PkColumn::from_natives(&schema, [7]);
+    let one = ReadSpec::all_rows(ReadBound::PkSet(key.keys()));
+    assert_eq!(blocking.scan_spec(tid, &one, &schema).unwrap().batch.len(), 1);
 }
 
 #[test]
@@ -149,21 +151,22 @@ fn concurrent_pushes_and_scans_tls() {
 #[test]
 fn cap_raises_and_every_slot_below_it_completes() {
     let srv = ServerHandle::start_with_env(4, &[]);
-    let (_blocking, tid, _schema) = table(srv.sock_path());
+    let (_blocking, tid, schema) = table(srv.sock_path());
+    let all = ReadSpec::all_rows(ReadBound::None);
     let mut s = Session::connect(srv.sock_path()).unwrap();
     let mut ids = Vec::new();
     for _ in 0..MAX_IN_FLIGHT {
-        ids.push(s.submit(Request::scan(tid)).unwrap());
+        ids.push(s.submit(scan_req(tid, &all, &schema)).unwrap());
     }
     assert!(
-        s.submit(Request::scan(tid)).is_err(),
+        s.submit(scan_req(tid, &all, &schema)).is_err(),
         "the cap raises rather than hanging"
     );
     let (done, _) = drive_all(&mut s, MAX_IN_FLIGHT);
     for id in ids {
         assert!(done[&id].is_ok());
     }
-    assert!(s.submit(Request::scan(tid)).is_ok(), "below the cap again");
+    assert!(s.submit(scan_req(tid, &all, &schema)).is_ok(), "below the cap again");
     let _ = drive_all(&mut s, 1);
 }
 
@@ -171,6 +174,7 @@ fn cap_raises_and_every_slot_below_it_completes() {
 fn abandoned_slot_does_not_desync_and_close_abandons_every_slot() {
     let srv = ServerHandle::start_with_env(4, &[]);
     let (_blocking, tid, schema) = table(srv.sock_path());
+    let all = ReadSpec::all_rows(ReadBound::None);
     let mut s = Session::connect(srv.sock_path()).unwrap();
     let batch = rows(0, 10);
     // Submit a push and never wait for it: the driver walks away.
@@ -178,7 +182,7 @@ fn abandoned_slot_does_not_desync_and_close_abandons_every_slot() {
     s.step(Interest::WRITE);
     // The next request's reply arrives behind the abandoned one's; the head
     // accumulator consumes that train first, so this one decodes correctly.
-    let scan = s.submit(Request::scan(tid)).unwrap();
+    let scan = s.submit(scan_req(tid, &all, &schema)).unwrap();
     let (done, _) = drive_all(&mut s, 2);
     assert!(done[&abandoned].is_ok());
     let Reply::Scan(data) = done[&scan].as_ref().unwrap() else {
@@ -187,8 +191,8 @@ fn abandoned_slot_does_not_desync_and_close_abandons_every_slot() {
     assert_eq!(data.batch.len(), 10);
 
     // Now close with work pending.
-    let a = s.submit(Request::scan(tid)).unwrap();
-    let b = s.submit(Request::scan(tid)).unwrap();
+    let a = s.submit(scan_req(tid, &all, &schema)).unwrap();
+    let b = s.submit(scan_req(tid, &all, &schema)).unwrap();
     let done = s.close();
     let ids: Vec<_> = done.iter().map(|(id, _)| *id).collect();
     assert_eq!(ids, vec![a, b]);
@@ -197,9 +201,18 @@ fn abandoned_slot_does_not_desync_and_close_abandons_every_slot() {
         .all(|(_, r)| matches!(r, Err(gnitz_core::ClientError::Closed))));
     assert_eq!(s.interest(), Interest::NONE);
     assert!(matches!(
-        s.submit(Request::scan(tid)),
+        s.submit(scan_req(tid, &all, &schema)),
         Err(gnitz_core::ClientError::Closed)
     ));
+}
+
+/// Every row of `tid`, decoded under `schema`.
+fn scan_req<'a>(tid: u64, spec: &'a ReadSpec, schema: &'a Arc<Schema>) -> Request<'a> {
+    Request::ScanSpec {
+        target_id: tid,
+        spec,
+        reply_schema: schema,
+    }
 }
 
 fn push_req<'a>(tid: u64, schema: &'a Schema, batch: &'a ZSetBatch) -> Request<'a> {
@@ -236,7 +249,9 @@ fn syscall_count_child() {
         pk_cols: vec![0],
     };
     for i in 0..n {
-        client.push(tid, &schema, &rows(i as i64, 1)).unwrap();
+        client
+            .push(tid, &schema, &rows(i as i64, 1), WireConflictMode::Update)
+            .unwrap();
     }
 }
 
@@ -293,13 +308,14 @@ fn blocking_client_survives_server_restart_with_a_lost_verdict() {
     // A dead peer produces readability; the step that follows reads the EOF
     // and the blocking client reports the connection lost thereafter.
     let mut srv = ServerHandle::start_with_env(1, &[]);
-    let (mut client, tid, _schema) = table(srv.sock_path());
+    let (mut client, tid, schema) = table(srv.sock_path());
+    let all = ReadSpec::all_rows(ReadBound::None);
     srv.restart();
     let t0 = std::time::Instant::now();
-    assert!(client.scan(tid).is_err());
+    assert!(client.scan_spec(tid, &all, &schema).is_err());
     assert!(t0.elapsed() < Duration::from_secs(5));
     assert!(matches!(
-        client.scan(tid),
+        client.scan_spec(tid, &all, &schema),
         Err(gnitz_core::ClientError::ConnectionLost(_))
     ));
 }

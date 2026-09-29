@@ -3,8 +3,9 @@
 //! A base table's SAL replay applies every committed group, whatever LSNs its
 //! shards carry.
 
-use gnitz_core::{BatchAppender, ColumnDef, GnitzClient, Schema, TableProps, TypeCode, ZSetBatch};
+use gnitz_core::{BatchAppender, GnitzClient, Schema, ZSetBatch};
 use gnitz_test_harness::{unique_schema, ServerHandle};
+use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, WireConflictMode};
 
 const WORKERS: usize = 2;
 
@@ -25,7 +26,7 @@ fn push_one(client: &mut GnitzClient, tid: u64, schema: &Schema, k: u64) {
     BatchAppender::new(&mut batch, schema)
         .add_row(k as u128, 1)
         .i64_val(k as i64);
-    client.push(tid, schema, &batch).unwrap();
+    client.push(tid, schema, &batch, WireConflictMode::Update).unwrap();
 }
 
 #[test]
@@ -62,7 +63,9 @@ fn acked_pushes_survive_a_worker_counter_ahead_of_the_zone_seed() {
     srv.restart();
 
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
-    let gnitz_core::ScanReply { schema: got_schema, batch, .. } = client.scan(tid).unwrap();
+    let got_schema = std::sync::Arc::new(schema.clone());
+    let spec = ReadSpec::all_rows(ReadBound::None);
+    let batch = client.scan_spec(tid, &spec, &got_schema).unwrap().batch;
     let mut got: Vec<(u64, i64)> = (0..batch.len())
         .map(|i| (batch.pks.get(&got_schema, i) as u64, batch.weights[i]))
         .collect();

@@ -30,7 +30,8 @@ use crate::validate::{
     as_plain_select, cte_body, non_recursive_ctes, reject_duplicate_projection_names, reject_float_key,
     reject_query_envelope_body, reject_unhonored_select_clauses, validate_user_name, HonoredClauses,
 };
-use gnitz_core::{ColType, ColumnDef, RelClass, RelDescriptor, TypeCode};
+use gnitz_core::RelDescriptor;
+use gnitz_wire::{ColType, ColumnDef, RelClass, TypeCode};
 use sqlparser::ast::{
     BinaryOperator, Expr, Function, JoinConstraint, JoinOperator, NamedWindowExpr, Query, Select, SelectItem, SetExpr,
     SetOperator, SetQuantifier, TableFactor,

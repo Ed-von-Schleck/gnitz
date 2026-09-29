@@ -10,9 +10,10 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use gnitz_core::{ColumnDef, GnitzClient, PkColumn, Schema, TableProps, TypeCode, ZSetBatch};
+use gnitz_core::{GnitzClient, PkColumn, Schema, ZSetBatch};
 use gnitz_mirror::Mirror;
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
+use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, WireConflictMode};
 use tokio::runtime::Runtime;
 
 /// A `(pk BIGINT, a BIGINT)` table, the blocking client that made it, and the
@@ -24,7 +25,8 @@ fn table(target: &str) -> (GnitzClient, u64, Arc<Schema>, String) {
     client
         .create_table(&sn, "t", &local_schema(), &[], TableProps::default(), &[])
         .unwrap();
-    let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
+    let rel = client.resolve_relation(&sn, "t").unwrap();
+    let (tid, schema) = (rel.tid, rel.schema.clone());
     (client, tid, schema, sn)
 }
 
@@ -133,17 +135,31 @@ fn cloned_handles_across_tasks_each_get_their_own_result() {
         assert!(rt.block_on(p).unwrap().unwrap() > 0, "each push gets its own LSN");
     }
 
-    // Every read verb, and a seek whose row is its own.
-    assert_eq!(rt.block_on(client.scan(tid)).unwrap().batch.len(), n * 10);
+    // Every read verb, and a keyed read whose row is its own.
+    let all = || ReadSpec::all_rows(ReadBound::None);
     assert_eq!(
-        rt.block_on(client.seek(tid, &7u64.to_le_bytes())).unwrap().batch.len(),
+        rt.block_on(client.scan_spec(tid, all(), Arc::clone(&schema)))
+            .unwrap()
+            .batch
+            .len(),
+        n * 10
+    );
+    let key = PkColumn::from_natives(&schema, [7]);
+    let one = ReadSpec::all_rows(ReadBound::PkSet(key.keys()));
+    assert_eq!(
+        rt.block_on(client.scan_spec(tid, one, Arc::clone(&schema)))
+            .unwrap()
+            .batch
+            .len(),
         1
     );
     // A repeated tid is two positions, each answered in full.
-    let many = rt.block_on(client.scan_many(&[tid, tid])).unwrap();
+    let many = rt
+        .block_on(client.scan_many(vec![(tid, Arc::clone(&schema)), (tid, Arc::clone(&schema))]))
+        .unwrap();
     assert_eq!(many.len(), 2);
     assert!(many.iter().all(|r| r.batch.len() == n * 10));
-    let many = rt.block_on(client.scan_many(&[tid])).unwrap();
+    let many = rt.block_on(client.scan_many(vec![(tid, Arc::clone(&schema))])).unwrap();
     assert_eq!(many.len(), 1);
     assert_eq!(many[0].batch.len(), n * 10);
 
@@ -236,7 +252,7 @@ fn one_writev_per_burst() {
 /// planner, so the circuit is a `ScanDelta` into the sink the compiler takes as
 /// the plan's output register.
 fn fed_view(client: &mut GnitzClient, sn: &str, tid: u64) -> u64 {
-    let mut circuit = gnitz_core::Circuit::default();
+    let mut circuit = gnitz_wire::Circuit::default();
     let src = circuit.input_delta(tid, gnitz_wire::ReadBound::None);
     circuit.sink(src);
     client
@@ -249,7 +265,7 @@ fn fed_view(client: &mut GnitzClient, sn: &str, tid: u64) -> u64 {
                 pk_repeats: false,
             }
             .into(),
-            gnitz_core::ViewProps::Fed { delta_bytes: 8 << 20 },
+            gnitz_wire::ViewProps::Fed { delta_bytes: 8 << 20 },
             None,
         )
         .expect("create the fed view")
@@ -274,20 +290,25 @@ fn an_async_handle_mirrors_through_a_blocking_client() {
     let srv = ServerHandle::start_with_env(4, &[]);
     let (mut blocking, tid, schema, sn) = table(srv.sock_path());
     let vid = fed_view(&mut blocking, &sn, tid);
-    blocking.push(tid, &schema, &rows(0, 50)).unwrap();
+    blocking
+        .push(tid, &schema, &rows(0, 50), WireConflictMode::Update)
+        .unwrap();
     // A read against the server drains the pending ticks, so the rounds a
     // bootstrap reads already exist.
-    let _ = blocking.scan(vid).unwrap();
+    let all = || ReadSpec::all_rows(ReadBound::None);
+    let _ = blocking.scan_spec(vid, &all(), &schema).unwrap();
 
     let rt = Runtime::new().unwrap();
     let (client, conn) = rt.block_on(gnitz_tokio::connect(srv.sock_path())).expect("connect");
     let driver = rt.spawn(conn);
 
-    // A handle that never attached answers exactly what `scan` answers, served
+    // A handle that never attached answers exactly what `scan_spec` answers, served
     // LSN included — the observable half of the unattached fast path. That it
     // took no `spawn_blocking` is not assertable and is not asserted.
-    let bare = rt.block_on(client.scan_local_first(vid)).unwrap();
-    let plain = rt.block_on(client.scan(vid)).unwrap();
+    let bare = rt
+        .block_on(client.scan_spec_local_first(vid, all(), Arc::clone(&schema)))
+        .unwrap();
+    let plain = rt.block_on(client.scan_spec(vid, all(), Arc::clone(&schema))).unwrap();
     assert_eq!(weights(&bare.batch), weights(&plain.batch));
     assert!(bare.lsn.is_some(), "an unmirrored read carries the server's LSN");
     assert_eq!(bare.lsn, plain.lsn);
@@ -353,8 +374,10 @@ fn an_async_handle_mirrors_through_a_blocking_client() {
     // Two clones polling one view concurrently. One whole advance runs under one
     // lock, so they serialize instead of both fetching `(c, …]` and both
     // applying it.
-    blocking.push(tid, &schema, &rows(50, 50)).unwrap();
-    let expected = weights(&blocking.scan(vid).unwrap().batch);
+    blocking
+        .push(tid, &schema, &rows(50, 50), WireConflictMode::Update)
+        .unwrap();
+    let expected = weights(&blocking.scan_spec(vid, &all(), &schema).unwrap().batch);
     let (a, b) = (client.clone(), client.clone());
     let (ra, rb) = rt.block_on(async {
         tokio::join!(
@@ -368,7 +391,9 @@ fn an_async_handle_mirrors_through_a_blocking_client() {
     rt.block_on(client.with_blocking_client(GnitzClient::poll_mirror))
         .expect("a third, for the tail round");
 
-    let local = rt.block_on(client.scan_local_first(vid)).unwrap();
+    let local = rt
+        .block_on(client.scan_spec_local_first(vid, all(), Arc::clone(&schema)))
+        .unwrap();
     assert!(local.lsn.is_none(), "a local answer carries no served LSN");
     assert_eq!(
         weights(&local.batch),
@@ -377,7 +402,9 @@ fn an_async_handle_mirrors_through_a_blocking_client() {
     );
 
     // A relation the copy does not hold still reads, over the wire.
-    let unheld = rt.block_on(client.scan_local_first(tid)).unwrap();
+    let unheld = rt
+        .block_on(client.scan_spec_local_first(tid, all(), Arc::clone(&schema)))
+        .unwrap();
     assert!(unheld.lsn.is_some(), "a delegated read carries the server's LSN");
     assert_eq!(weights(&unheld.batch).len(), 100);
 

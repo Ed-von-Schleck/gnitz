@@ -1,9 +1,10 @@
 use super::*;
-use crate::protocol::types::{BatchAppender, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use crate::protocol::wal_block::decode_wal_block;
-use crate::protocol::{ClientVerb, WireConflictMode, WireFlags, WireStatus};
 use crate::test_support::{german_col, payload_of};
+use crate::{BatchAppender, PkColumn, Schema, ZSetBatch};
 use gnitz_wire::control::peek_control_block;
+use gnitz_wire::{ClientVerb, WireConflictMode, WireFlags, WireStatus};
+use gnitz_wire::{ColumnDef, TypeCode};
 
 /// A plain push() request's flags.
 fn push() -> WireFlags {

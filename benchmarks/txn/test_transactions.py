@@ -79,8 +79,7 @@ def test_atomic_multitable(client, socket_path, schema_name, bench_timer, scale_
     bench_timer.extra.update(txns_per_sec=round(commits / elapsed, 1) if elapsed else 0.0,
                              conflicts=sum(p["conflicts"] for p in parts), commits=commits)
     assert commits > 0
-    vid_orders, _ = client.resolve_table(sn, "orders")
-    assert len(client.scan(vid_orders)) > 0
+    assert len(client.scan(*client.resolve_table(sn, "orders"))) > 0
 
 
 # ---------------------------------------------------------------------------

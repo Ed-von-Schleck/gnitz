@@ -234,8 +234,7 @@ fn decode_wire_round_trips_error_text() {
 #[test]
 fn decode_wire_round_trips_every_control_field() {
     let flags = WireFlags {
-        verb: ClientVerb::ScanSpec,
-        schema_version: 0xCAFE,
+        verb: ClientVerb::PushTxn,
         continuation: true,
         ..Default::default()
     };

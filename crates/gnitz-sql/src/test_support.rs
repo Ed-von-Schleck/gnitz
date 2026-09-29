@@ -6,9 +6,8 @@
 use crate::bind::Catalog;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use gnitz_core::{
-    ColumnDef, PkBuf, PkColList, PkColumn, PlannedView, RelClass, RelDescriptor, RelIndex, Schema, TypeCode, ZSetBatch,
-};
+use gnitz_core::{PkColumn, PlannedView, RelDescriptor, Schema, ZSetBatch};
+use gnitz_wire::{ColumnDef, PkBuf, PkColList, RelClass, RelIndex, TypeCode};
 use sqlparser::ast::{BinaryOperator, Expr, Ident, UnaryOperator, Value};
 use std::sync::Arc;
 

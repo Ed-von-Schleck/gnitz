@@ -1,6 +1,7 @@
 use super::*;
 use crate::test_support::{col, ncol, parse_expr_sql, parse_stmt};
-use gnitz_core::{BatchAppender, TypeCode};
+use gnitz_core::BatchAppender;
+use gnitz_wire::TypeCode;
 use sqlparser::ast::Statement;
 
 /// `(pk U64 PK, cols…)`.

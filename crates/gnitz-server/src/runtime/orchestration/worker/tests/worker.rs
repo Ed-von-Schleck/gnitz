@@ -47,12 +47,7 @@ fn make_test_worker(catalog: *mut CatalogEngine, writer: W2mWriter) -> WorkerPro
 /// The reply route every helper below takes, in the order `dispatch_inner`
 /// resolves it. Inline-emitting; [`fifo_route`] is the queued twin.
 fn route(target_id: u64, request_id: u32) -> ReplyRoute {
-    ReplyRoute {
-        target_id,
-        request_id,
-        fifo: false,
-        schema_version: 0,
-    }
+    ReplyRoute { target_id, request_id, fifo: false }
 }
 
 /// [`route`] for a group the master wrote as one of several.
@@ -124,7 +119,6 @@ fn reads_defer_inside_exchange_in_request_order() {
         )
     };
     let reads = [
-        (SalMessageKind::Scan, 75, 4240),
         (SalMessageKind::ScanSpec, 76, 4241),
         (SalMessageKind::DeltaRead, 77, 4242),
     ];
@@ -151,7 +145,7 @@ fn a_queued_train_is_not_emitted_inside_an_exchange_wait() {
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.send_reply(fifo_route(1, 5), make_n_row_batch(make_schema_u64_i64(), 3));
 
-    dispatch_in_eval(&mut wp, SalMessageKind::Scan, 999, control_frame(999));
+    dispatch_in_eval(&mut wp, SalMessageKind::ScanSpec, 999, control_frame(999));
 
     assert_eq!(wp.pending_streams.front().map(|t| t.next_row), Some(0));
     assert!(walk_frames(ptr).is_empty());
@@ -512,8 +506,7 @@ fn walk_frames(ptr: *mut u8) -> Vec<(u32, Vec<u8>)> {
 }
 
 /// Two queued trains drain strictly FIFO: every frame of train A
-/// (multi-chunk, terminal `scan_last`) precedes train B's, and each queued
-/// train's frames echo its own route's `schema_version`.
+/// (multi-chunk, terminal `scan_last`) precedes train B's.
 #[test]
 fn pending_streams_drain_two_trains_fifo() {
     let schema_a = make_schema_u64_i64();
@@ -537,12 +530,12 @@ fn pending_streams_drain_two_trains_fifo() {
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.pending_streams.push_back(PendingScan {
         batch: Rc::new(batch_a),
-        route: ReplyRoute { schema_version: 7, ..route(1, 11) },
+        route: route(1, 11),
         next_row: 0,
     });
     wp.pending_streams.push_back(PendingScan {
         batch: Rc::new(batch_b),
-        route: ReplyRoute { schema_version: 9, ..route(2, 22) },
+        route: route(2, 22),
         next_row: 0,
     });
 
@@ -564,17 +557,13 @@ fn pending_streams_drain_two_trains_fifo() {
     let last_a = frames.iter().rposition(|(req, _)| *req == 11).unwrap();
     assert!(last_a < first_b, "train A's frames must FULLY precede train B's");
 
-    for (req, schema, version, total_rows) in [(11u32, &schema_a, 7u16, 10usize), (22u32, &schema_b, 9u16, 5usize)] {
+    for (req, schema, total_rows) in [(11u32, &schema_a, 10usize), (22u32, &schema_b, 5usize)] {
         let train: Vec<_> = frames.iter().filter(|(r, _)| *r == req).collect();
         let mut rows = 0usize;
         for (i, (_, bytes)) in train.iter().enumerate() {
             let ctrl = gnitz_wire::control::peek_control_block(bytes).expect("ctrl");
             assert!(ctrl.hdr.flags.continuation);
             assert!(ctrl.schema.is_none(), "a reply frame carries no schema block");
-            assert_eq!(
-                ctrl.hdr.flags.schema_version, version,
-                "the frame echoes its route's version"
-            );
             let is_last = i == train.len() - 1;
             assert_eq!(
                 ctrl.hdr.flags.scan_last, is_last,

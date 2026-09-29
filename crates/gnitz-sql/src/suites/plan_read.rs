@@ -3,7 +3,8 @@
 //! rejected before any request could be issued.
 
 use crate::dml::explain_lines;
-use gnitz_core::{ClientError, RelClass, TypeCode, WireFault, WireStatus};
+use gnitz_core::ClientError;
+use gnitz_wire::{RelClass, TypeCode, WireFault, WireStatus};
 use sqlparser::ast::Statement;
 
 use super::*;

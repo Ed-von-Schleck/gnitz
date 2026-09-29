@@ -7,6 +7,7 @@ use gnitz_expr::SchemaFacts;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use crate::protocol::transport::ClientTransport;
+use crate::Session;
 
 /// Both ends of a connected Unix socketpair — the loopback every framing test
 /// runs over.
@@ -29,6 +30,22 @@ pub(crate) fn make_transport_pair() -> (ClientTransport, ClientTransport) {
     (ClientTransport::from_unix_fd(a), ClientTransport::from_unix_fd(b))
 }
 
+/// A scripted peer: the raw far end of a socketpair a [`Session`] runs over.
+pub(crate) struct Peer(pub(crate) OwnedFd);
+
+impl Peer {
+    /// Write one length-prefixed frame.
+    pub(crate) fn send(&self, payload: &[u8]) {
+        raw_send(&self.0, &framed(payload));
+    }
+}
+
+/// A session over one end of a socketpair, and the peer on the other.
+pub(crate) fn session_pair() -> (Session, Peer) {
+    let (a, b) = make_socketpair();
+    (Session::over(ClientTransport::from_unix_fd(a)), Peer(b))
+}
+
 /// A control-only reply frame carrying `lsn` in `arg0` — the terminal a
 /// scripted peer answers an uncorrelated request with.
 pub(crate) fn reply_ctrl(tid: u64, lsn: u64) -> Vec<u8> {
@@ -37,7 +54,7 @@ pub(crate) fn reply_ctrl(tid: u64, lsn: u64) -> Vec<u8> {
         arg0: lsn,
         ..Default::default()
     };
-    crate::protocol::encode_frame(hdr, &[], None, None)
+    crate::encode_frame(hdr, &[], None, None)
 }
 
 /// `[u32 LE len][payload]`, what a peer writes.
@@ -104,16 +121,13 @@ pub(crate) fn german_col(vals: &[Option<&[u8]>], blob: &mut Vec<u8>) -> Vec<u8> 
 
 /// `schema`'s payload regions holding `regions`, one per payload slot in slot
 /// order, each typed as its schema column.
-pub(crate) fn payload_of(
-    schema: &crate::protocol::Schema,
-    regions: Vec<Vec<u8>>,
-) -> Vec<crate::protocol::PayloadColumn> {
+pub(crate) fn payload_of(schema: &crate::Schema, regions: Vec<Vec<u8>>) -> Vec<crate::PayloadColumn> {
     assert_eq!(regions.len(), schema.num_payload_cols(), "one region per payload slot");
     schema
         .payload_columns()
         .zip(regions)
         .map(|((_, _, c), bytes)| {
-            let mut col = crate::protocol::PayloadColumn::new(c.ty.tc);
+            let mut col = crate::PayloadColumn::new(c.ty.tc);
             col.bytes = bytes;
             col
         })

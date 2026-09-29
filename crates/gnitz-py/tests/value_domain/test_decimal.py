@@ -48,7 +48,7 @@ def test_the_declared_scale_reaches_the_catalog_and_the_wire(client, priced):
     assert schema.columns[3].scale == 3
     assert schema.columns[1].scale == 0, "a BIGINT carries scale 0, not a null scale"
 
-    rs = client.scan(tid)
+    rs = client.scan(tid, schema)
     assert bag(rs, "id", "price", "qty") == {
         (1, Decimal("12.50"), Decimal("3.000")): 1,
         (2, Decimal("0.10"), Decimal("3.500")): 1,

@@ -84,8 +84,6 @@ struct ReplyRoute {
     request_id: u32,
     /// Queue the reply behind earlier trains even when it fits one frame.
     fifo: bool,
-    /// The request's schema version, which every frame of the reply echoes.
-    schema_version: u16,
 }
 
 impl WorkerProcess {
@@ -189,7 +187,6 @@ impl WorkerProcess {
             target_id: hdr.target_id,
             request_id,
             fifo,
-            schema_version: hdr.flags.schema_version,
         };
         let blob = decoded.blob;
         let batch = decoded.data_batch;
@@ -267,12 +264,6 @@ impl WorkerProcess {
                     self.handle_tick(tid, hdr.arg0 + i as u64);
                 }
                 self.send_ack(target_id, request_id);
-                Ok(())
-            }
-
-            SalMessageKind::Scan => {
-                let result = self.cat().scan(target_id)?;
-                self.send_reply(route, result);
                 Ok(())
             }
 

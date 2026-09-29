@@ -287,6 +287,20 @@ impl<'a> DirectGroup<'a> {
         }
     }
 
+    /// A read of `target_id` under the encoded `ReadSpec` `spec`, replied in the
+    /// layout whose digest is `reply_layout`.
+    pub(crate) fn scan_spec(target_id: u64, spec: &'a [u8], reply_layout: u64) -> Self {
+        DirectGroup {
+            template: WireMsg {
+                target_id,
+                arg0: reply_layout,
+                blob: spec,
+                ..Default::default()
+            },
+            ..Self::new(SalMessageKind::ScanSpec)
+        }
+    }
+
     /// Worker `w`'s message. The one definition — sizing and encoding both go
     /// through it, so a slot's size and its bytes cannot disagree.
     ///
@@ -420,8 +434,6 @@ gnitz_wire::wire_enum! {
     /// group header; `ALL`/`from_wire` come from the one variant list, so a
     /// decode cannot fall behind the enum.
     pub(crate) enum SalMessageKind: u8 {
-        /// Full table scan.
-        Scan = 0,
         Shutdown = 1,
         /// Base round of a checkpoint: flush base and system tables.
         Flush = 2,

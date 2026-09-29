@@ -25,7 +25,7 @@ and the join a deterministic per-key prefix at W>1.
 
 import pytest
 import gnitz
-from _read import bag
+from _read import bag, scanned
 from _serverproc import NUM_WORKERS
 from _sql import values
 
@@ -309,8 +309,7 @@ def _snapshot(conn):
     out = {}
     for name, sh in _SHAPES.items():
         for view, cols in sh["views"].items():
-            vid, _ = conn.resolve_table(name, view)
-            out[f"{name}.{view}"] = bag(conn.scan(vid), *cols)
+            out[f"{name}.{view}"] = bag(scanned(conn, name, view), *cols)
     return out
 
 
@@ -390,20 +389,20 @@ def test_a_recovered_view_still_ticks_from_every_source(own_server):
 
     own_server.restart()
     with gnitz.connect(own_server.sock_path) as conn:
-        ab, _ = conn.resolve_table("tick", "ab")
-        cbv, _ = conn.resolve_table("tick", "cbv")
+        ab = conn.resolve_table("tick", "ab")
+        cbv = conn.resolve_table("tick", "cbv")
         # Both branches carry val=10, so UNION ALL holds it at weight 2 — the one
         # multiplicity a row-set comparison of this view could not see.
-        assert bag(conn.scan(ab), "val") == {(10,): 2}
+        assert bag(conn.scan(*ab), "val") == {(10,): 2}
 
         conn.execute_sql("INSERT INTO a VALUES (3, 30)", schema_name="tick")
         conn.execute_sql("INSERT INTO b VALUES (4, 40)", schema_name="tick")
-        assert bag(conn.scan(ab), "val") == {(10,): 2, (30,): 1, (40,): 1}, \
+        assert bag(conn.scan(*ab), "val") == {(10,): 2, (30,): 1, (40,): 1}, \
             "the view must tick from both sources"
 
         more = [(a, 9, a * 100 + 9) for a in range(1, 9)]
         conn.execute_sql(f"INSERT INTO cbt VALUES {values(more)}", schema_name="tick")
-        assert bag(conn.scan(cbv), "a", "b", "v") == {r: 1 for r in _CB + more}, \
+        assert bag(conn.scan(*cbv), "a", "b", "v") == {r: 1 for r in _CB + more}, \
             "the post-restart insert must reach the view"
 
 
@@ -452,18 +451,18 @@ def test_a_min_max_view_decodes_back_to_the_same_value_after_a_restart(own_serve
     cols = ["grp", "i32_lo", "i32_hi", "u64_lo", "u64_hi",
             "f32_lo", "f32_hi", "f64_lo", "f64_hi"]
     want = {(7, -2147483648, 100000, 1, 9223372036854775809, -2.25, 4.0, -2.25, 4.0): 1}
-    vid, _ = conn.resolve_table("mmr", "v")
-    assert bag(conn.scan(vid), *cols) == want, "pre-restart"
+    v = conn.resolve_table("mmr", "v")
+    assert bag(conn.scan(*v), *cols) == want, "pre-restart"
     conn.close()
 
     own_server.restart()
     conn = gnitz.connect(own_server.sock_path)
-    vid, _ = conn.resolve_table("mmr", "v")
-    assert bag(conn.scan(vid), *cols) == want, "post-restart"
+    v = conn.resolve_table("mmr", "v")
+    assert bag(conn.scan(*v), *cols) == want, "post-restart"
 
     # A retraction after the restart forces the resumed view back through the
     # index: the extremum recedes to the next stored value, not to the delta's.
     conn.execute_sql("DELETE FROM t WHERE pk = 1", schema_name="mmr")
-    assert bag(conn.scan(vid), *cols) == {
+    assert bag(conn.scan(*v), *cols) == {
         (7, 256, 100000, 256, 9223372036854775809, 1.5, 4.0, 1.5, 4.0): 1}
     conn.close()

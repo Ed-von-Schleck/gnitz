@@ -1,8 +1,8 @@
 use super::*;
 use crate::test_support::{col, ncol};
-use gnitz_core::TypeCode;
 use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_wire::OrderKey;
+use gnitz_wire::TypeCode;
 
 // ---- paginate (multiplicity walk) ----
 

@@ -9,11 +9,9 @@
 //! cross-worker barrier can hold a consumer back — correct output rests
 //! entirely on the driver visiting a producer before its consumer.
 
-use gnitz_core::{
-    BatchAppender, Circuit, ColumnDef, GnitzClient, PlannedView, Schema, TableProps, TypeCode, ViewBundle, ViewProps,
-    ZSetBatch,
-};
+use gnitz_core::{BatchAppender, GnitzClient, PlannedView, Schema, ViewBundle, ZSetBatch};
 use gnitz_test_harness::{unique_schema, ServerHandle};
+use gnitz_wire::{Circuit, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, ViewProps, WireConflictMode};
 use std::sync::Arc;
 
 const BASE_ROWS: [(i64, i64); 3] = [(1, 10), (2, 20), (3, 30)];
@@ -36,13 +34,13 @@ fn make_base(client: &mut GnitzClient, sn: &str) -> (u64, Schema) {
     for (pk, v) in BASE_ROWS {
         app.add_row(pk as u128, 1).i64_val(v);
     }
-    client.push(tid, &schema, &batch).unwrap();
+    client.push(tid, &schema, &batch, WireConflictMode::Update).unwrap();
     (tid, schema)
 }
 
 /// One identity segment reading `source_id`.
 fn segment(source_id: u64, schema: &Schema) -> PlannedView {
-    let mut circuit = gnitz_core::Circuit::default();
+    let mut circuit = gnitz_wire::Circuit::default();
     let inp = circuit.input_delta(source_id, gnitz_wire::ReadBound::None);
     circuit.sink(inp);
     PlannedView {
@@ -61,19 +59,33 @@ fn chain(base_tid: u64, schema: &Schema) -> ViewBundle {
     }
 }
 
+/// Every row of `tid`, decoded under `schema`.
+fn scan_all(client: &mut GnitzClient, tid: u64, schema: &Arc<Schema>) -> ZSetBatch {
+    let spec = ReadSpec::all_rows(ReadBound::None);
+    client.scan_spec(tid, &spec, schema).unwrap().batch
+}
+
 /// The vids of every live VIEW_TAB row.
 fn live_view_vids(client: &mut GnitzClient) -> Vec<u64> {
-    let b = client.scan(gnitz_wire::VIEW_TAB).unwrap().batch;
+    let b = scan_all(
+        client,
+        gnitz_wire::VIEW_TAB,
+        gnitz_core::sys_schema(gnitz_wire::VIEW_TAB),
+    );
     (0..b.len())
         .filter(|&i| b.weights[i] > 0)
-        .map(|i| b.pks.get(gnitz_core::types::sys_schema(gnitz_wire::VIEW_TAB), i) as u64)
+        .map(|i| b.pks.get(gnitz_core::sys_schema(gnitz_wire::VIEW_TAB), i) as u64)
         .collect()
 }
 
 /// The vids of every live VIEW_TAB row naming `owner_vid` as its owner.
 fn segment_vids_of(client: &mut GnitzClient, owner_vid: u64) -> Vec<u64> {
-    let b = client.scan(gnitz_wire::VIEW_TAB).expect("scan VIEW_TAB").batch;
-    let view_tab = gnitz_core::types::sys_schema(gnitz_wire::VIEW_TAB);
+    let b = scan_all(
+        client,
+        gnitz_wire::VIEW_TAB,
+        gnitz_core::sys_schema(gnitz_wire::VIEW_TAB),
+    );
+    let view_tab = gnitz_core::sys_schema(gnitz_wire::VIEW_TAB);
     let owners = &b.payload[gnitz_wire::VIEWTAB_PAY_OWNER_VIEW_ID].bytes;
     (0..b.len())
         .filter(|&i| b.weights[i] > 0)
@@ -84,7 +96,8 @@ fn segment_vids_of(client: &mut GnitzClient, owner_vid: u64) -> Vec<u64> {
 
 /// `(pk, v, weight)` of every row a `(pk, v)` relation holds, sorted.
 fn weighted_rows(client: &mut GnitzClient, id: u64) -> Vec<(i64, i64, i64)> {
-    let gnitz_core::ScanReply { schema, batch: b, .. } = client.scan(id).unwrap();
+    let schema = client.describe_by_id(id).unwrap().schema.clone();
+    let b = scan_all(client, id, &schema);
     let vs = &b.payload[0].bytes;
     let mut out: Vec<(i64, i64, i64)> = (0..b.len())
         .map(|i| {
@@ -113,7 +126,7 @@ fn a_chain_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
         .unwrap();
     assert_eq!(
         owner,
-        client.resolve_table_or_view_id(&sn, "f").unwrap().0,
+        client.resolve_relation(&sn, "f").unwrap().tid,
         "the returned id is the user view's"
     );
     let mut segs = segment_vids_of(&mut client, owner);
@@ -131,7 +144,7 @@ fn a_chain_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
 
     // A rename is a net-live rewrite of the owner's row: the cascade must not fire.
     let f = client.resolve_relation(&sn, "f").unwrap();
-    client.alter_rename_relation(&sn, &f, "renamed").unwrap();
+    client.alter_rename_relation(&f, "renamed").unwrap();
     let mut segs = segment_vids_of(&mut client, owner);
     segs.sort();
     assert_eq!(segs, vids[..2], "a rename keeps the owner's segments");
@@ -193,7 +206,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
     // A node list past the column cap encodes, and the engine refuses it at load.
     let mut wide = Circuit::default();
     let scan = wide.input_delta(base_tid, gnitz_wire::ReadBound::None);
-    let proj = wide.map(scan, &vec![0; gnitz_core::MAX_COLUMNS + 1]);
+    let proj = wide.map(scan, &vec![0; gnitz_wire::MAX_COLUMNS + 1]);
     wide.sink(proj);
     let planned = PlannedView {
         circuit: wide,
@@ -204,7 +217,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains(&format!("exceeds cap {}", gnitz_core::MAX_COLUMNS)),
+        err.contains(&format!("exceeds cap {}", gnitz_wire::MAX_COLUMNS)),
         "got: {err}"
     );
     assert_eq!(

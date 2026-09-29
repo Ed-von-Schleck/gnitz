@@ -3,7 +3,7 @@
 //! the substring names the rule, never the sentence.
 
 use super::*;
-use gnitz_core::{ColType, ColumnDef, RelClass, TypeCode, PK_LIST_MAX_COLS};
+use gnitz_wire::{ColType, ColumnDef, RelClass, TypeCode, PK_LIST_MAX_COLS};
 
 /// [`base`] plus the shapes the rejections need: `w` (a second typed table),
 /// `m` (integer and float payloads for grouped bodies), `p3` (a three-column

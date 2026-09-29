@@ -5,9 +5,10 @@
 
 use crate::codec::literal::{place, Placed};
 use crate::ir::{BExpr, BinOp, BoundExpr};
-use gnitz_core::{RelIndex, Schema, TypeCode, PK_LIST_MAX_COLS};
+use gnitz_core::Schema;
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::{image_mask, key_image, Cut, KeyRange, PkColList, PkKeys, ReadBound};
+use gnitz_wire::{RelIndex, TypeCode, PK_LIST_MAX_COLS};
 use std::cmp::Reverse;
 use std::ops::RangeInclusive;
 

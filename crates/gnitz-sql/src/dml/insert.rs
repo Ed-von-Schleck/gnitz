@@ -19,8 +19,9 @@ use crate::exec::client_map::ClientMap;
 use crate::ir::BExpr;
 use crate::validate::{reject_unhonored_insert_clauses, require_class, ClassWant};
 use crate::SqlResult;
-use gnitz_core::{FixedInt, GnitzClient, PkColumn, RelClass, Schema, TypeCode, WireConflictMode, ZSetBatch};
+use gnitz_core::{GnitzClient, PkColumn, Schema, ZSetBatch};
 use gnitz_expr::SchemaFacts;
+use gnitz_wire::{FixedInt, RelClass, TypeCode, WireConflictMode};
 use gnitz_wire::{PkKeys, ReadBound};
 use sqlparser::ast::{
     ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query, SetExpr,
@@ -277,7 +278,7 @@ pub(crate) fn execute_insert(
             // will project it, saving a deep clone inside a transaction.
             match returning {
                 Some((schema_out, map)) => {
-                    client.push_with_mode(tid, schema, &batch, mode)?;
+                    client.push(tid, schema, &batch, mode)?;
                     Ok(SqlResult::Rows {
                         schema: schema_out,
                         batch: match map {

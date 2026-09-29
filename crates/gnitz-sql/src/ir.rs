@@ -1,6 +1,6 @@
-use gnitz_core::{ColType, ColumnDef, TypeCode};
 use gnitz_expr::CalendarOp;
 use gnitz_wire::decimal::MAX_DECIMAL_SCALE;
+use gnitz_wire::{ColType, ColumnDef, TypeCode};
 
 /// Both are instruction selectors, so the evaluator crate owns their
 /// definitions; the IR carries each verbatim rather than restating it.
@@ -748,8 +748,8 @@ impl BinOp {
 
     /// The four ordering operators, mapped to the relation a range join key
     /// carries — [`Self::as_cmp`]'s shape and rationale.
-    pub(crate) fn as_range_rel(self) -> Option<gnitz_core::RangeRel> {
-        use gnitz_core::RangeRel;
+    pub(crate) fn as_range_rel(self) -> Option<gnitz_wire::RangeRel> {
+        use gnitz_wire::RangeRel;
         match self {
             BinOp::Lt => Some(RangeRel::Lt),
             BinOp::Le => Some(RangeRel::Le),

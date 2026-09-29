@@ -79,6 +79,6 @@ def test_a_key_slot_is_absent_from_every_client_row(client, schema_name):
             assert bag(rows, *cols) == (before if step == "before" else after), (step, name)
             assert all(set(r._fields) == set(cols) for r in rows), (step, name, rows)
 
-    raw = list(client.scan(client.resolve_table(sn, "jv1")[0]).including_hidden())
+    raw = scanned(client, sn, "jv1", hidden=True)
     assert [r._fields[0] for r in raw] == ["_join_pk"], raw
     assert bag(raw, "_join_pk", "av", "bv") == {(7, 100, 200): 1}

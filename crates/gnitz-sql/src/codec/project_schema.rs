@@ -8,9 +8,10 @@
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_bound_expr;
 use crate::ir::BoundExpr;
-use gnitz_core::{ColumnDef, FixedInt, Schema};
+use gnitz_core::Schema;
 use gnitz_expr::{ExprBuilder, LogicalInstr, LogicalProgram, Sink};
 use gnitz_wire::ComputeMap;
+use gnitz_wire::{ColumnDef, FixedInt};
 
 /// One output column of a projection: a verbatim source column
 /// (`PassThrough`) or a value derived by an expression (`Computed`).

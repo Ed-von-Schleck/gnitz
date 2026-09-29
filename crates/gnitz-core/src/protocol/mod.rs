@@ -2,26 +2,8 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-pub mod error;
-pub mod message;
+pub(crate) mod error;
+pub(crate) mod message;
 pub(crate) mod transport;
-pub mod types;
+pub(crate) mod types;
 pub(crate) mod wal_block;
-
-pub use error::ProtocolError;
-// The wire protocol's own vocabulary, re-exported at the module root so the
-// client's protocol code has one import path for it.
-pub use gnitz_wire::{ClientVerb, WireConflictMode, WireFlags, WireStatus, MAX_COLUMNS};
-pub use message::{encode_ddl_txn, encode_frame, encode_push_txn, PushFamily};
-// Only the `integration` suite drives a raw transport from outside; a shipped
-// build keeps it crate-private. The cfgs are complementary because two `use`
-// statements binding one name is `E0252` whatever their visibility.
-#[cfg(any(test, feature = "integration"))]
-pub use transport::{hello_handshake, ClientTransport};
-#[cfg(not(any(test, feature = "integration")))]
-pub(crate) use transport::{hello_handshake, ClientTransport};
-pub use types::{
-    push_zero_cell, BatchAppender, ColType, ColumnDef, FixedInt, FkTarget, PayloadColumn, PkBuf, PkColumn, ScalarKind,
-    Schema, TypeCode, ZSetBatch, MAX_PK_BYTES, PK_LIST_MAX_COLS,
-};
-pub use wal_block::decode_regions_into;

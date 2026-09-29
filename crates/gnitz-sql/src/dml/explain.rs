@@ -7,9 +7,11 @@
 
 use crate::dml::select::{ReadCase, ReadPlan, SpecRead};
 use crate::SqlResult;
-use gnitz_core::{BatchAppender, ColumnDef, GnitzClient, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{BatchAppender, GnitzClient, Schema, ZSetBatch};
+use gnitz_expr::SchemaFacts;
 use gnitz_wire::sys_rows::SysRowSink;
 use gnitz_wire::{AggFunc, AggReadSpec, ReadBound, SinkKind};
+use gnitz_wire::{ColumnDef, TypeCode};
 
 /// Describe `plan` without running it: the EXPLAIN reply. A read of a relation
 /// `client` mirrors is described as the local read it is served as.
@@ -132,12 +134,18 @@ fn access_line(bound: &ReadBound, schema: &Schema) -> String {
     }
 }
 
+/// Whether column `i` is a hidden **payload** column: one appended to order the
+/// reply. A hidden PK column carries the reply's key instead.
+fn is_hidden_payload(schema: &Schema, i: usize) -> bool {
+    schema.columns[i].is_hidden && !schema.is_pk_col(i)
+}
+
 /// How wide the reply is: its visible columns, the hidden ones appended to order it, and
 /// whether it ships no map.
 fn projection_line(schema: &Schema, unprojected: bool) -> String {
     let visible = schema.visible_columns().count();
     let extra = (0..schema.columns.len())
-        .filter(|&i| schema.is_hidden_payload(i))
+        .filter(|&i| is_hidden_payload(schema, i))
         .count();
     let mut line = if extra > 0 {
         format!("projection: {visible} columns (+{extra} for ordering)")

@@ -2,7 +2,7 @@ use super::*;
 use crate::bind::structural::bind_constant;
 use crate::error::GnitzSqlError;
 use crate::test_support::{lit, parse_expr_sql};
-use gnitz_core::TypeCode;
+use gnitz_wire::TypeCode;
 
 /// One row per operand position `bind_structural` recurses into. A position
 /// [`expr_operands`] misses looks aggregate-free, routing the query to the scalar

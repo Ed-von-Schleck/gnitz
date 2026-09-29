@@ -383,9 +383,9 @@ def stream_and_assert(client, sn, bench_timer, tid, schema, build, sz, read_view
     """Stream `sz["iters"]` delta epochs into (tid, schema), then assert
     `read_view` is non-empty (unless allow_empty). Returns rows streamed."""
     n = stream_deltas(client, bench_timer, tid, schema, build, sz["iters"], sz["delta"])
-    vid, _ = client.resolve_table(sn, read_view)
+    vid, v_sch = client.resolve_table(sn, read_view)
     if not allow_empty:
-        assert len(client.scan(vid)) > 0, f"{read_view} empty after streaming {n} rows"
+        assert len(client.scan(vid, v_sch)) > 0, f"{read_view} empty after streaming {n} rows"
     return n
 
 

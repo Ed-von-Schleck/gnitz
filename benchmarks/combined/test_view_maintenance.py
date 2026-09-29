@@ -56,5 +56,4 @@ def test_view_maintenance(client, schema_name, bench_timer, scale_mode):
         if del_pks:
             client.delete(fact_tid, fact_schema, del_pks)
 
-    vid, _ = client.resolve_table(sn, "v_rev")
-    assert len(client.scan(vid)) > 0, "v_rev empty"
+    assert len(client.scan(*client.resolve_table(sn, "v_rev"))) > 0, "v_rev empty"

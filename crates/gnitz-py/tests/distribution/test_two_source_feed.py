@@ -43,7 +43,7 @@ def test_a_feed_polled_across_two_source_tick_batches_loses_no_round(client, sch
     _mk_feed(client, sn, "f", JOIN)
     t_id, t_schema = client.resolve_table(sn, "t")
     u_id, u_schema = client.resolve_table(sn, "u")
-    vid, _ = client.resolve_table(sn, "f")
+    vid, schema = client.resolve_table(sn, "f")
 
     copy, errors = {}, []
     ready, stop = threading.Event(), threading.Event()
@@ -68,7 +68,7 @@ def test_a_feed_polled_across_two_source_tick_batches_loses_no_round(client, sch
 
     # A scan drains every pending tick, so every round exists before the
     # poller's last polls collect it.
-    live = _zset(client.scan(vid).including_hidden())
+    live = _zset(client.scan(vid, schema).including_hidden())
     stop.set()
     join_or_fail("the poller hung", poller)
     assert not errors, errors

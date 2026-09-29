@@ -13,12 +13,13 @@ use crate::ir::{
     NumFunc, StrArg, StrFunc, TrimMode,
 };
 use crate::validate::check_decimal_scale;
-use gnitz_core::{ColType, ColumnDef, FixedInt, Schema, TypeCode};
+use gnitz_core::Schema;
 use gnitz_expr::{
     CalendarOp, CmpOp, ExprBuilder, FloatArithOp, FloatUnaryOp, IntArithOp, IntUnaryOp, LikePattern, LogicalInstr as L,
     LogicalProgram, Reg, ScalarEval, Sink,
 };
 use gnitz_wire::decimal::pow10;
+use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
 
 /// Which register class a lowered node produced. `Int`, `Dec` and `Float` are
 /// the scalar shapes — `Dec(s)` an integer holding a DECIMAL times `10^s`,

@@ -8,7 +8,7 @@
 //! |--------------|----------------------------------------------------------|---------------------------|
 //! | `DDL_TXN`    | `target_id` = system family                              | data block                |
 //! | `PUSH_TXN`   | `target_id`; `flags.conflict_mode`; `arg0` = basis       | schema record, data block |
-//! | `SCAN_MULTI` | `target_id`; `flags.schema_version`                      | none                      |
+//! | `SCAN_MULTI` | `target_id`; `arg0` = reply layout digest                | none                      |
 //! | `DELTA_POLL` | `target_id` = view (≠ 0); `arg0` = reply layout digest; `arg1` = after_tick | none   |
 //!
 //! **A reply fault's `target_id`:** a `DELTA_POLL` fault naming one of its views
@@ -115,15 +115,22 @@ pub fn decode_items(body: &[u8], verb: ClientVerb) -> Result<Vec<(&[u8], Decoded
     Ok(out)
 }
 
-/// Encode a `SCAN_MULTI` frame of `(tid, client_schema_version)` relations,
-/// without the 4-byte frame length prefix.
-pub fn encode_scan_multi(relations: &[(u64, u16)]) -> Vec<u8> {
+/// One SCAN_MULTI item: every row of `tid`, replied in the layout whose digest
+/// is `reply_layout`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanMultiItem {
+    pub tid: u64,
+    pub reply_layout: u64,
+}
+
+/// Encode a `SCAN_MULTI` frame, without the 4-byte frame length prefix.
+pub fn encode_scan_multi(relations: &[ScanMultiItem]) -> Vec<u8> {
     let items: Vec<FrameItem> = relations
         .iter()
-        .map(|&(target_id, schema_version)| FrameItem {
+        .map(|r| FrameItem {
             hdr: ControlHeader {
-                target_id,
-                flags: WireFlags { schema_version, ..Default::default() },
+                target_id: r.tid,
+                arg0: r.reply_layout,
                 ..Default::default()
             },
             schema: None,
@@ -133,12 +140,14 @@ pub fn encode_scan_multi(relations: &[(u64, u16)]) -> Vec<u8> {
     encode_items(ClientVerb::ScanMulti, &items)
 }
 
-/// Decode a `SCAN_MULTI` frame body into its per-relation `(tid,
-/// client_schema_version)` list, in request order.
-pub fn decode_scan_multi(body: &[u8]) -> Result<Vec<(u64, u16)>, String> {
+/// Decode a `SCAN_MULTI` frame body into its items, in request order.
+pub fn decode_scan_multi(body: &[u8]) -> Result<Vec<ScanMultiItem>, String> {
     Ok(decode_items(body, ClientVerb::ScanMulti)?
         .into_iter()
-        .map(|(_, c)| (c.hdr.target_id, c.hdr.flags.schema_version))
+        .map(|(_, c)| ScanMultiItem {
+            tid: c.hdr.target_id,
+            reply_layout: c.hdr.arg0,
+        })
         .collect())
 }
 

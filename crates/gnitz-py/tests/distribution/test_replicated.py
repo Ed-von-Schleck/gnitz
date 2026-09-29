@@ -137,7 +137,7 @@ def test_every_write_reaches_every_copy(client, schema_name):
         "CREATE VIEW star AS SELECT j.fid AS fid, j.nm AS nm, dim2.b AS b "
         "FROM j JOIN dim2 ON j.r2 = dim2.id", schema_name=sn)
     dim_id, dim_schema = client.resolve_table(sn, "dim")
-    jid = client.resolve_table(sn, "j")[0]
+    jid, j_schema = client.resolve_table(sn, "j")
 
     # (statement, table, changes); a `None` statement pushes the changes raw.
     steps = [
@@ -170,7 +170,7 @@ def test_every_write_reaches_every_copy(client, schema_name):
         assert bag(scanned(client, sn, "star"), "fid", "nm", "b") == {
             (f, nm, dims2[r2]): 1 for f, r2, nm in joined if r2 in dims2}, sql
         for k in range(1, 5):
-            assert bag(client.seek(jid, pk=k), "fid", "r2", "nm") == {
+            assert bag(client.seek(jid, j_schema, pk=k), "fid", "r2", "nm") == {
                 row: 1 for row, r1 in joined.items() if r1 == k}, (sql, k)
 
 

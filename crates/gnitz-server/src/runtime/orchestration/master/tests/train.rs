@@ -16,7 +16,7 @@ impl DrainFixture {
     fn new(n_workers: usize) -> (Self, Vec<crate::runtime::w2m::W2mWriter>) {
         let (reactor, writers) = reactor_with_rings(n_workers);
         let reactor = Rc::new(reactor);
-        let lease = reactor.lease_train(crate::runtime::sal::WorkerSet::ALL, SalMessageKind::Scan);
+        let lease = reactor.lease_train(crate::runtime::sal::WorkerSet::ALL, SalMessageKind::ScanSpec);
         let (peer_sock, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         drop(partner);
         let conn = reactor
@@ -34,14 +34,7 @@ fn frame(writer: &crate::runtime::w2m::W2mWriter, req: u32, flags: WireFlags, ba
 
 /// A worker fault: an `Error` frame ending its train.
 fn fault_frame(writer: &crate::runtime::w2m::W2mWriter, req: u32, msg: &[u8]) {
-    send_frame(
-        writer,
-        req,
-        WireFlags::train_frame(0, true),
-        WireStatus::Error,
-        msg,
-        None,
-    );
+    send_frame(writer, req, WireFlags::train_frame(true), WireStatus::Error, msg, None);
 }
 
 fn send_frame(
@@ -86,15 +79,15 @@ fn drain_rows_errs_immediately_on_fault_frame() {
     let req = fx.lease.id();
 
     fault_frame(&writers[0], req, b"boom");
-    frame(&writers[1], req, WireFlags::train_frame(0, false), Some(&rows));
-    frame(&writers[1], req, WireFlags::train_frame(0, true), Some(&rows));
+    frame(&writers[1], req, WireFlags::train_frame(false), Some(&rows));
+    frame(&writers[1], req, WireFlags::train_frame(true), Some(&rows));
 
     fx.reactor.route_w2m_for_test();
 
     let result = try_poll_once(drain_rows(&fx.lease, &schema, |_| Ok(()))).expect("completes in one poll");
     let err = result.expect_err("worker fault must surface as Err");
     assert!(
-        err.text.contains("worker 0: Scan:"),
+        err.text.contains("worker 0: ScanSpec:"),
         "error names the worker and the kind: {err}"
     );
     assert!(err.text.contains("boom"), "error carries the worker message: {err}");
@@ -116,10 +109,10 @@ fn drain_rows_merges_chunked_and_single_frame_trains() {
     let req = fx.lease.id();
 
     // Worker 0: a chunked train.
-    frame(&writers[0], req, WireFlags::train_frame(0, false), Some(&chunk_a));
-    frame(&writers[0], req, WireFlags::train_frame(0, true), Some(&chunk_b));
+    frame(&writers[0], req, WireFlags::train_frame(false), Some(&chunk_a));
+    frame(&writers[0], req, WireFlags::train_frame(true), Some(&chunk_b));
     // Worker 1: a one-frame train.
-    frame(&writers[1], req, WireFlags::train_frame(0, true), Some(&single));
+    frame(&writers[1], req, WireFlags::train_frame(true), Some(&single));
 
     fx.reactor.route_w2m_for_test();
 
@@ -148,8 +141,8 @@ fn drain_rows_sink_error_aborts_drain() {
 
     let (fx, writers) = DrainFixture::new(1);
     let req = fx.lease.id();
-    frame(&writers[0], req, WireFlags::train_frame(0, false), Some(&chunk));
-    frame(&writers[0], req, WireFlags::train_frame(0, true), Some(&chunk));
+    frame(&writers[0], req, WireFlags::train_frame(false), Some(&chunk));
+    frame(&writers[0], req, WireFlags::train_frame(true), Some(&chunk));
 
     fx.reactor.route_w2m_for_test();
 
@@ -174,10 +167,10 @@ fn next_yields_only_row_frames_and_ends_at_each_terminal() {
 
     let (fx, writers) = DrainFixture::new(2);
     let req = fx.lease.id();
-    frame(&writers[0], req, WireFlags::train_frame(0, false), None);
-    frame(&writers[0], req, WireFlags::train_frame(0, false), Some(&rows_a));
-    frame(&writers[0], req, WireFlags::train_frame(0, true), None);
-    frame(&writers[1], req, WireFlags::train_frame(0, true), Some(&rows_b));
+    frame(&writers[0], req, WireFlags::train_frame(false), None);
+    frame(&writers[0], req, WireFlags::train_frame(false), Some(&rows_a));
+    frame(&writers[0], req, WireFlags::train_frame(true), None);
+    frame(&writers[1], req, WireFlags::train_frame(true), Some(&rows_b));
 
     fx.reactor.route_w2m_for_test();
 
@@ -207,7 +200,7 @@ fn next_yields_only_row_frames_and_ends_at_each_terminal() {
 fn forward_scan_drops_a_row_less_frame() {
     let (fx, writers) = DrainFixture::new(1);
     let req = fx.lease.id();
-    frame(&writers[0], req, WireFlags::train_frame(0, true), None);
+    frame(&writers[0], req, WireFlags::train_frame(true), None);
 
     fx.reactor.route_w2m_for_test();
 
@@ -234,9 +227,9 @@ fn forward_scan_coalesces_single_frame_heads() {
 
     let (fx, writers) = DrainFixture::new(3);
     let req = fx.lease.id();
-    let observable_bytes = frame(&writers[0], req, WireFlags::train_frame(0, true), Some(&rows_a))
-        + frame(&writers[2], req, WireFlags::train_frame(0, true), Some(&rows_c));
-    frame(&writers[1], req, WireFlags::train_frame(0, true), None);
+    let observable_bytes = frame(&writers[0], req, WireFlags::train_frame(true), Some(&rows_a))
+        + frame(&writers[2], req, WireFlags::train_frame(true), Some(&rows_c));
+    frame(&writers[1], req, WireFlags::train_frame(true), None);
 
     fx.reactor.route_w2m_for_test();
     let before: Vec<u64> = (0..3).map(|w| fx.reactor.release_cursor_for_test(w)).collect();

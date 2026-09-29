@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{col, parse_query};
-use gnitz_core::TypeCode;
+use gnitz_wire::TypeCode;
 use sqlparser::ast::Expr;
 
 /// The ORDER BY keys of `sql`.

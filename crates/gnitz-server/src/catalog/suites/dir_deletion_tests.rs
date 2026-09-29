@@ -229,7 +229,7 @@ fn gc_leaves_live_entities_untouched() {
         assert!(Path::new(d).exists(), "live dir {d} must survive");
     }
     assert_eq!(
-        engine.scan(t1).unwrap().len(),
+        scan_all(&mut engine, t1).len(),
         1,
         "flushed table must still read back after the sweep"
     );

@@ -289,7 +289,7 @@ def test_only_a_base_table_registers_an_fk_and_a_self_reference_names_itself(cli
     tid, _ = client.resolve_table(sn, "tree")
     vid, _ = client.resolve_table(sn, "tree_v")
     fks = {(r.owner_id, r.col_idx): r.fk_table_id
-           for r in client.scan(gnitz.COL_TAB) if r.owner_id in (tid, vid)}
+           for r in client.scan(gnitz.COL_TAB, gnitz.sys_schema(gnitz.COL_TAB)) if r.owner_id in (tid, vid)}
     assert fks == {(tid, 0): 0, (tid, 1): tid, (vid, 0): 0, (vid, 1): 0}
 
 

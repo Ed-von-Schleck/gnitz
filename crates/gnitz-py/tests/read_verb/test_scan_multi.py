@@ -1,7 +1,7 @@
 """The consistent multi-relation scan (SCAN_MULTI / scan_many).
 
-`scan_many([A, B, ...])` snapshots every relation at ONE server-side SAL cut and
-streams the N reply trains in request order. The headline guarantee: an atomic
+`scan_many([(A, schema_a), (B, schema_b), ...])` snapshots every relation at
+ONE server-side SAL cut and streams the N reply trains in request order. The headline guarantee: an atomic
 multi-table transaction (PUSH_TXN) is either visible in every relation's
 result or in none — never torn across the set. This is the read-side completion
 of the atomic multi-table write story.
@@ -28,6 +28,11 @@ def _kv(client, sn, name):
     return client.create_table(sn, name, KV)
 
 
+def _kvs(*tids):
+    """`tids`, each paired with the `KV` schema its rows are read in."""
+    return [(t, KV) for t in tids]
+
+
 def _batch(values):
     return gnitz.ZSetBatch(KV).extend({"pk": pk, "val": val} for pk, val in values)
 
@@ -35,18 +40,21 @@ def _batch(values):
 def test_the_results_line_up_with_the_requested_tids(client, schema_name):
     """Request order is reply order, and an empty relation still occupies its
     slot. Such a relation contributes no worker frame at all — the master
-    forwards only frames carrying rows or a schema block — so its train is
-    delimited by its master-authored terminal alone."""
+    forwards only frames carrying rows — so its train is delimited by its
+    master-authored terminal alone. However many relations it names, it is one
+    request."""
     sn = schema_name
     a, empty, b = (_kv(client, sn, name) for name in ("a", "empty", "b"))
     client.push(a, _batch([(pk, pk * 10) for pk in range(20)]))
     client.push(b, _batch([(99, 990)]))
 
     want_a = {(pk, pk * 10): 1 for pk in range(20)}
-    res = client.scan_many([a, empty, b])
+    before = client.requests_sent
+    res = client.scan_many(_kvs(a, empty, b))
+    assert client.requests_sent == before + 1, "a scan_many is one request"
     assert [bag(r) for r in res] == [want_a, {}, {(99, 990): 1}]
     # Reversed request order → reversed results.
-    assert [bag(r) for r in client.scan_many([b, empty, a])] == \
+    assert [bag(r) for r in client.scan_many(_kvs(b, empty, a))] == \
         [{(99, 990): 1}, {}, want_a]
 
 
@@ -57,9 +65,9 @@ def test_a_base_and_a_view_snapshot_at_one_cut(client, schema_name):
     t = _kv(client, sn, "t")
     client.push(t, _batch([(i, 1) for i in range(20)]))
     client.execute_sql("CREATE VIEW v AS SELECT COUNT(*) AS c FROM t", schema_name=sn)
-    v, _ = client.resolve_table(sn, "v")
+    v = client.resolve_table(sn, "v")
 
-    assert [bag(r) for r in client.scan_many([t, v])] == \
+    assert [bag(r) for r in client.scan_many([(t, KV), v])] == \
         [{(i, 1): 1 for i in range(20)}, {(20,): 1}]
 
 
@@ -76,13 +84,13 @@ def test_a_base_read_is_fresh_whatever_its_views_are_doing(client, schema_name):
         client.execute_sql(
             f"CREATE VIEW agg{i} AS SELECT g, SUM(v) AS s FROM t WHERE v > {i} GROUP BY g",
             schema_name=sn)
-    tid = client.resolve_table(sn, "t")[0]
+    tid, schema = client.resolve_table(sn, "t")
     client.execute_sql(
         "INSERT INTO t VALUES " + ",".join(f"({i}, {i % 4}, {i})" for i in range(60)),
         schema_name=sn)
 
     want = {(i, i % 4, i): 1 for i in range(60)}
-    single, multi = client.scan(tid), client.scan_many([tid])
+    single, multi = client.scan(tid, schema), client.scan_many([(tid, schema)])
     assert len(multi) == 1
     assert bag(single) == bag(multi[0]) == want
     assert multi[0].lsn == single.lsn
@@ -121,7 +129,7 @@ def test_a_commit_is_never_observed_torn(server, schema_name):
         def reader():
             with gnitz.connect(server) as rc:
                 while not stop.is_set():
-                    ra, rb = (bag(r) for r in rc.scan_many([a, b]))
+                    ra, rb = (bag(r) for r in rc.scan_many(_kvs(a, b)))
                     sizes.add(len(ra))
                     if ra != rb or set(ra.values()) - {1}:
                         bad.append((ra != rb, sorted(set(ra.values()))))
@@ -132,7 +140,7 @@ def test_a_commit_is_never_observed_torn(server, schema_name):
         join_or_fail("the writer or reader hung", wt, rt)
 
         assert not bad, f"torn or mis-weighted snapshot: {bad}"
-        final = wc.scan_many([a, b])
+        final = wc.scan_many(_kvs(a, b))
         assert bag(final[0]) == bag(final[1]) == {(i, i): 1 for i in range(N)}
         # Evidence the reader interleaved with the writer (saw the table grow).
         assert len([s for s in sizes if 0 < s < N]) >= 2, \
@@ -149,10 +157,10 @@ def test_a_view_never_leads_its_base(server, schema_name):
         t = _kv(wc, sn, "t")
         wc.execute_sql(
             "CREATE VIEW v AS SELECT pk, val FROM t WHERE val >= 0", schema_name=sn)
-        v, _ = wc.resolve_table(sn, "v")
+        v = wc.resolve_table(sn, "v")
 
         wc.push(t, _batch([(i, i) for i in range(10)]))
-        res = wc.scan_many([t, v])
+        res = wc.scan_many([(t, KV), v])
         assert bag(res[0]) == bag(res[1]) == {(i, i): 1 for i in range(10)}
 
         stop = threading.Event()
@@ -168,7 +176,7 @@ def test_a_view_never_leads_its_base(server, schema_name):
         def reader():
             with gnitz.connect(server) as rc:
                 while not stop.is_set():
-                    rt_, rv = (bag(r) for r in rc.scan_many([t, v]))
+                    rt_, rv = (bag(r) for r in rc.scan_many([(t, KV), v]))
                     if not rv.keys() <= rt_.keys():
                         violations.append((len(rt_), len(rv)))
                         return
@@ -180,29 +188,8 @@ def test_a_view_never_leads_its_base(server, schema_name):
 
 
 # ---------------------------------------------------------------------------
-# Schema negotiation, error paths, FIFO reply ordering
+# Error paths, FIFO reply ordering
 # ---------------------------------------------------------------------------
-
-
-def test_a_cold_and_a_warm_schema_cache_decode_alike(server, schema_name):
-    """A fresh connection's first scan_many is cold (schema block absorbed into
-    the cache); the second is warm (schema served from cache). Both decode
-    identically, and so does a partially-warm call — the per-relation
-    schema-version stamping and the optional preliminary schema frame both work
-    through the multi path."""
-    sn = schema_name
-    with gnitz.connect(server) as setup:
-        a, b = _kv(setup, sn, "a"), _kv(setup, sn, "b")
-        setup.push(a, _batch([(1, 1)]))
-        setup.push(b, _batch([(2, 2)]))
-
-    want = [{(1, 1): 1}, {(2, 2): 1}]
-    with gnitz.connect(server) as rc:
-        assert [bag(r) for r in rc.scan_many([a, b])] == want   # cold
-        assert [bag(r) for r in rc.scan_many([a, b])] == want   # warm
-    with gnitz.connect(server) as rc2:
-        rc2.scan(a)                                             # warm only a
-        assert [bag(r) for r in rc2.scan_many([a, b])] == want
 
 
 def test_every_refusal_leaves_the_server_serving(client, schema_name):
@@ -210,32 +197,32 @@ def test_every_refusal_leaves_the_server_serving(client, schema_name):
     t = _kv(client, sn, "t")
     client.push(t, _batch([(1, 1)]))
 
-    for why, tids in [
+    for why, rels in [
         ("empty list", []),
-        ("too many relations", [t + 1 + i for i in range(17)]),
+        ("too many relations", _kvs(*(t + 1 + i for i in range(17)))),
         # A fan-out read has no form for a system relation — refused server-side.
-        ("system tid", [gnitz.TABLE_TAB]),
+        ("system tid", [(gnitz.TABLE_TAB, gnitz.sys_schema(gnitz.TABLE_TAB))]),
     ]:
         with pytest.raises(gnitz.GnitzError):
-            client.scan_many(tids)
-        assert bag(client.scan_many([t])[0]) == {(1, 1): 1}, f"unhealthy after {why}"
+            client.scan_many(rels)
+        assert bag(client.scan_many(_kvs(t))[0]) == {(1, 1): 1}, f"unhealthy after {why}"
 
     # An unknown user tid resolves to no table, and the refusal names it.
     missing = gnitz.FIRST_USER_TABLE_ID + 987654
     with pytest.raises(gnitz.GnitzNotFoundError, match=str(missing)):
-        client.scan_many([t, missing])
-    assert bag(client.scan_many([t])[0]) == {(1, 1): 1}, "unhealthy after unknown tid"
+        client.scan_many(_kvs(t, missing))
+    assert bag(client.scan_many(_kvs(t))[0]) == {(1, 1): 1}, "unhealthy after unknown tid"
 
 
 def test_a_repeated_tid_is_answered_at_each_position(client, schema_name):
     t = _kv(client, schema_name, "t")
     client.push(t, _batch([(1, 1), (2, 2)]))
-    assert [bag(r) for r in client.scan_many([t, t])] == [{(1, 1): 1, (2, 2): 1}] * 2
+    assert [bag(r) for r in client.scan_many(_kvs(t, t))] == [{(1, 1): 1, (2, 2): 1}] * 2
 
 
 def test_a_chunked_train_does_not_let_its_siblings_jump_it(reply_frame_budget_server):
     """With a 16 KiB reply budget, `big` chunks into a multi-frame train per
-    worker while the tiny siblings are one frame each. `scan_many([big, s...])`
+    worker while the tiny siblings are one frame each. `scan_many` of `[big, s...]`
     must stream in request order without wedging — the shape that deadlocks
     without the `scan_fifo_reply` flag, where the immediate-emit fast path would jump
     the tiny relations ahead of big's queued chunks. Both orderings, plus a
@@ -258,8 +245,8 @@ def test_a_chunked_train_does_not_let_its_siblings_jump_it(reply_frame_budget_se
     for k, tid in enumerate(ids):
         c.push(tid, _batch([(k, k * 10)]))
     wants = [{(k, k * 10): 1} for k in range(8)]
-    assert [bag(r) for r in c.scan_many([big] + ids)] == [want_big] + wants
-    assert [bag(r) for r in c.scan_many(ids + [big])] == wants + [want_big]
+    assert [bag(r) for r in c.scan_many(_kvs(big, *ids))] == [want_big] + wants
+    assert [bag(r) for r in c.scan_many(_kvs(*ids, big))] == wants + [want_big]
 
     # A blob-bearing sibling: a TEXT dimension must FIFO behind big too, and
     # its own train chunks like any other. The values are past the 12-byte
@@ -272,5 +259,5 @@ def test_a_chunked_train_does_not_let_its_siblings_jump_it(reply_frame_budget_se
     names = [f"name-{i}-" + "z" * 200 for i in range(400)]
     c.push(dim, gnitz.ZSetBatch(dim_schema).extend(
         {"pk": i, "s": nm} for i, nm in enumerate(names)))
-    assert [bag(r) for r in c.scan_many([big, dim])] == \
+    assert [bag(r) for r in c.scan_many([(big, KV), (dim, dim_schema)])] == \
         [want_big, {(i, nm): 1 for i, nm in enumerate(names)}]

@@ -3,8 +3,8 @@ use crate::test_support::{
     col, compound_schema_u64_u64, extract_pk_value, ncol, neg_num_expr, num_expr, parse_expr_sql, pk_schema, two_col,
     uuid_schema_pk, uuid_str_expr,
 };
-use gnitz_core::TypeCode;
 use gnitz_expr::SchemaFacts;
+use gnitz_wire::TypeCode;
 
 // `two_col` has columns ["pk", "val"] in schema order.
 fn idents(names: &[&str]) -> Vec<ObjectName> {
@@ -23,8 +23,8 @@ fn err_of(r: Result<RowShape, GnitzSqlError>) -> GnitzSqlError {
 fn serial_schema() -> Schema {
     Schema {
         columns: vec![
-            gnitz_core::ColumnDef::new("id", TypeCode::U64, false),
-            gnitz_core::ColumnDef::new("val", TypeCode::I64, true),
+            gnitz_wire::ColumnDef::new("id", TypeCode::U64, false),
+            gnitz_wire::ColumnDef::new("val", TypeCode::I64, true),
         ],
         pk_cols: vec![0],
     }

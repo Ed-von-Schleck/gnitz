@@ -6,7 +6,7 @@ use super::spine::{open, Top};
 use super::{emit_filter, keyed_frame, project_front, resolve_reduce_specs, EmitPieces, ReduceSpecs, ViewChain};
 use crate::agg::agg_col_def;
 use crate::error::GnitzSqlError;
-use gnitz_core::Circuit;
+use gnitz_wire::Circuit;
 use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc};
 use std::collections::HashSet;
 

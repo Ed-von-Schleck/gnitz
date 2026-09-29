@@ -1,7 +1,7 @@
 use super::types::{Schema, ZSetBatch};
-use super::WireConflictMode;
 use gnitz_wire::control::{append_frame, ControlHeader};
 use gnitz_wire::txn_frame::{encode_items, FrameItem};
+use gnitz_wire::WireConflictMode;
 use gnitz_wire::{ClientVerb, WireFlags};
 
 /// One frame payload, without the 4-byte length prefix. An empty batch ships no

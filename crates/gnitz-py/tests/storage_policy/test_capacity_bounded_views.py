@@ -65,10 +65,10 @@ def _any_skeleton(data_dir, view_id):
 
 def _twin(client, sn, name, body, capacity="1 KB"):
     """A bounded view `b_{name}` and its unbounded twin `p_{name}` over one body.
-    Returns `(bounded_vid, plain_vid)`."""
+    Returns `((bounded_vid, schema), (plain_vid, schema))`."""
     client.execute_sql(f"CREATE VIEW b_{name} WITH (capacity = '{capacity}') AS {body}", schema_name=sn)
     client.execute_sql(f"CREATE VIEW p_{name} AS {body}", schema_name=sn)
-    return client.resolve_table(sn, f"b_{name}")[0], client.resolve_table(sn, f"p_{name}")[0]
+    return client.resolve_table(sn, f"b_{name}"), client.resolve_table(sn, f"p_{name}")
 
 
 # ── parity ───────────────────────────────────────────────────────────────────
@@ -99,22 +99,22 @@ def test_bounded_view_matches_its_unbounded_twin(sweeping_client, sweeping_serve
 
     for lo, hi in ((1, 400), (401, 1200)):
         _churn(c, sn, lo, hi, chunk=100)
-        live = bag(c.scan(pid))
-        assert bag(c.scan(bid)) == live, f"full scan through {hi}"
+        live = bag(c.scan(*pid))
+        assert bag(c.scan(*bid)) == live, f"full scan through {hi}"
 
     # Created over tables that already hold every row: the backfill derives the
     # store hydrated and the sweep dehydrates it as it spills.
     c.execute_sql(f"CREATE VIEW late WITH (capacity = '{capacity}') AS {body}", schema_name=sn)
-    late, _ = c.resolve_table(sn, "late")
-    assert bag(c.scan(late)) == live, "backfill"
+    late = c.resolve_table(sn, "late")
+    assert bag(c.scan(*late)) == live, "backfill"
 
     # Point seeks, on keys spread across the whole range — the low ones are the
     # coldest by write recency, so they are the ones most likely dehydrated.
     keys = sorted({k[0] for k in live})
     for pk in keys[:5] + keys[len(keys) // 2 : len(keys) // 2 + 5] + keys[-5:]:
-        assert bag(c.seek(bid, pk)) == bag(c.seek(pid, pk)), f"seek {pk}"
+        assert bag(c.seek(*bid, pk)) == bag(c.seek(*pid, pk)), f"seek {pk}"
     # A key the view does not hold.
-    assert bag(c.seek(bid, 10**9)) == {}
+    assert bag(c.seek(*bid, 10**9)) == {}
 
     # The ScanSpec path: predicate, ORDER BY / LIMIT, and an aggregate fold.
     for tmpl in [
@@ -128,9 +128,9 @@ def test_bounded_view_matches_its_unbounded_twin(sweeping_client, sweeping_serve
         assert bag(rows(c, sn, tmpl.format(v="b_v"))) == want, tmpl
 
     data_dir = sweeping_server.data_dir
-    assert _any_skeleton(data_dir, bid) == sweeps
-    assert _any_skeleton(data_dir, late) == sweeps
-    assert not _any_skeleton(data_dir, pid), "the twin must never dehydrate"
+    assert _any_skeleton(data_dir, bid[0]) == sweeps
+    assert _any_skeleton(data_dir, late[0]) == sweeps
+    assert not _any_skeleton(data_dir, pid[0]), "the twin must never dehydrate"
 
 
 def test_a_pk_group_with_several_payloads_folds_to_one_skeleton_weight(sweeping_client, sweeping_server):
@@ -159,18 +159,18 @@ def test_a_pk_group_with_several_payloads_folds_to_one_skeleton_weight(sweeping_
         c.execute_sql("INSERT INTO u VALUES " + ",".join(f"({i * fan + j}, {i}, {j})" for i in ids for j in range(fan)),
                       schema_name=sn)
 
-    spread_want = bag(c.scan(p_spread))
-    folded_want = bag(c.scan(p_folded))
+    spread_want = bag(c.scan(*p_spread))
+    folded_want = bag(c.scan(*p_folded))
     assert set(spread_want.values()) == {1} and len(spread_want) == keys * fan
     assert set(folded_want.values()) == {fan} and len(folded_want) == keys
 
-    assert _any_skeleton(sweeping_server.data_dir, b_spread), "the group view must have dehydrated"
-    assert _any_skeleton(sweeping_server.data_dir, b_folded), "the weight view must have dehydrated"
-    assert bag(c.scan(b_spread)) == spread_want
-    assert bag(c.scan(b_folded)) == folded_want
+    assert _any_skeleton(sweeping_server.data_dir, b_spread[0]), "the group view must have dehydrated"
+    assert _any_skeleton(sweeping_server.data_dir, b_folded[0]), "the weight view must have dehydrated"
+    assert bag(c.scan(*b_spread)) == spread_want
+    assert bag(c.scan(*b_folded)) == folded_want
     # And through a seek, which opens the skeleton run directly.
     for pk in (1, keys // 2, keys):
-        assert bag(c.seek(b_folded, pk)) == bag(c.seek(p_folded, pk)), f"seek {pk}"
+        assert bag(c.seek(*b_folded, pk)) == bag(c.seek(*p_folded, pk)), f"seek {pk}"
 
 
 def test_a_compound_uuid_pk_with_one_leading_value_reads_like_its_twin(sweeping_client, sweeping_server):
@@ -194,10 +194,9 @@ def test_a_compound_uuid_pk_with_one_leading_value_reads_like_its_twin(sweeping_
         )
         c.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
 
-    assert _any_skeleton(sweeping_server.data_dir, bid), "the bounded store must have dehydrated"
-    assert bag(c.scan(bid)) == bag(c.scan(pid)), "full scan"
-    # The wire `seek` verb takes a compound PK as its native byte image, so
-    # point lookups go through SQL — the path a reader actually uses.
+    assert _any_skeleton(sweeping_server.data_dir, bid[0]), "the bounded store must have dehydrated"
+    assert bag(c.scan(*bid)) == bag(c.scan(*pid)), "full scan"
+    # Point lookups go through SQL — the path a reader actually uses.
     for i in [0, n // 2, n - 1]:
         q = f"SELECT b, body FROM {{v}} WHERE a = '{tenant}' AND b = '00000000-0000-0000-0000-{i:012x}'"
         got = bag(rows(c, sn, q.format(v="b_u")))
@@ -233,12 +232,12 @@ def test_a_bounded_join_over_a_stream_reads_like_its_twin(sweeping_client, sweep
             schema_name=sn,
         )
 
-    live = bag(c.scan(pid))
+    live = bag(c.scan(*pid))
     assert len(live) == n
-    assert _any_skeleton(sweeping_server.data_dir, bid), "the bounded store must have dehydrated"
-    assert bag(c.scan(bid)) == live, "full scan"
+    assert _any_skeleton(sweeping_server.data_dir, bid[0]), "the bounded store must have dehydrated"
+    assert bag(c.scan(*bid)) == live, "full scan"
     for pk in (1, 2, n // 2, n - 1, n):
-        assert bag(c.seek(bid, pk)) == bag(c.seek(pid, pk)), f"seek {pk}"
+        assert bag(c.seek(*bid, pk)) == bag(c.seek(*pid, pk)), f"seek {pk}"
 
 
 # ── capacity across restarts ─────────────────────────────────────────────────
@@ -268,20 +267,20 @@ def test_a_tight_capacity_holds_the_registered_bytes_down_across_restarts(sweepi
     for lo, hi in ((1, 1200), (2001, 5200)):
         with gnitz.connect(sweeping_server.sock_path) as c:
             _churn(c, sn, lo, hi, chunk=100)
-            live = bag(c.scan(pid))
-            assert bag(c.scan(bid)) == live, f"parity through {hi}"
-        assert _any_skeleton(sweeping_server.data_dir, bid)
+            live = bag(c.scan(*pid))
+            assert bag(c.scan(*bid)) == live, f"parity through {hi}"
+        assert _any_skeleton(sweeping_server.data_dir, bid[0])
 
         sweeping_server.restart(graceful=True)
         # Reading drains whatever the boot still owes, so the directory is not
         # sampled mid-flight.
         with gnitz.connect(sweeping_server.sock_path) as c:
-            assert bag(c.scan(bid)) == live, f"first read after the reboot through {hi}"
-            assert bag(c.scan(pid)) == live, f"twin after the reboot through {hi}"
+            assert bag(c.scan(*bid)) == live, f"first read after the reboot through {hi}"
+            assert bag(c.scan(*pid)) == live, f"twin after the reboot through {hi}"
 
         # Twice the floor is the headroom: a shard carries a header and the sweep
         # stops one guard above the fixpoint.
-        bounded = sum(os.path.getsize(p) for p in _shard_files(sweeping_server.data_dir, bid))
+        bounded = sum(os.path.getsize(p) for p in _shard_files(sweeping_server.data_dir, bid[0]))
         floor = len(live) * _SKELETON_ROW_BYTES
         assert bounded <= 2 * max(1024, floor), (
             f"through {hi}: {bounded} bytes over {len(live)} keys, against a declared "

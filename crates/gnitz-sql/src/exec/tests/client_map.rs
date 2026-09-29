@@ -1,7 +1,7 @@
 use super::*;
 use crate::codec::project_schema::{reply_program, ProjItem};
 use crate::test_support::{col, ncol};
-use gnitz_core::TypeCode;
+use gnitz_wire::TypeCode;
 
 /// `(k I64 PK, v I64 NULL)`.
 fn source() -> Schema {

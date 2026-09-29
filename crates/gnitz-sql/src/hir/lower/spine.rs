@@ -10,8 +10,8 @@ use super::{
 use crate::access::candidates;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use gnitz_core::{Circuit, NodeId, ReindexRole, ReindexSlot};
 use gnitz_wire::ReadBound;
+use gnitz_wire::{Circuit, NodeId, ReindexRole, ReindexSlot};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 

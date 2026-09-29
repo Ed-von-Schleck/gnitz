@@ -5,7 +5,8 @@
 use super::super::physical::Frame;
 use super::super::RelExpr;
 use super::{SegInput, SegSource};
-use gnitz_core::{segment_id, Circuit, NodeId, PlannedView, ViewBundle};
+use gnitz_core::{segment_id, PlannedView, ViewBundle};
+use gnitz_wire::{Circuit, NodeId};
 use std::collections::HashMap;
 use std::sync::Arc;
 

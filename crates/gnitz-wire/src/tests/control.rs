@@ -8,7 +8,6 @@ fn probe_header() -> ControlHeader {
         flags: WireFlags {
             verb: ClientVerb::ScanSpec,
             conflict_mode: crate::WireConflictMode::Error,
-            schema_version: 0xBBCC,
             continuation: true,
             scan_last: true,
             probe_mode: crate::WireProbeMode::AllHolders,
@@ -100,7 +99,7 @@ fn peek_locates_the_sections_the_head_announced() {
     assert_eq!(peek_control_block(&empty).unwrap().schema, Some(head + 4..head + 4));
 }
 
-/// A data block is malformed on every verb but PUSH — `Scan` above all, which
+/// A data block is malformed on every verb but PUSH — a read above all, which
 /// would otherwise be answered with a streamed table dump.
 #[test]
 fn client_verb_rejects_data_on_a_non_push_verb() {

@@ -17,9 +17,10 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
-use gnitz_core::{ColumnDef, PkBuf, Schema, ZSetBatch};
+use gnitz_core::{Schema, ZSetBatch};
 use gnitz_expr::{ColumnLocator, RowFilter, SchemaFacts};
 use gnitz_wire::{read_u64_le, write_u64_le, AggFunc as WireAggFunc};
+use gnitz_wire::{ColumnDef, PkBuf};
 use rustc_hash::FxHashMap;
 
 use crate::codec::project_schema::{reply_program, ProjItem};

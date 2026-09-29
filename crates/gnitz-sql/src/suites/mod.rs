@@ -18,7 +18,8 @@ use crate::dml::ReadPlan;
 use crate::error::GnitzSqlError;
 use crate::hir::{plan_alter_view, plan_create_view, PlannedChain};
 use crate::test_support::*;
-use gnitz_core::{Circuit, OpNode, PlannedView, RelClass, TypeCode};
+use gnitz_core::PlannedView;
+use gnitz_wire::{Circuit, OpNode, RelClass, TypeCode};
 use sqlparser::ast::Statement;
 
 /// `Err` unwrapped without demanding `Debug` of the success value.

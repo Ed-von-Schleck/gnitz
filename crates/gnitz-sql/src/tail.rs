@@ -5,7 +5,7 @@
 
 use crate::ast_util::{clause_position, expr_usize_literal, reject_position_out_of_range};
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
-use gnitz_core::ColumnDef;
+use gnitz_wire::ColumnDef;
 use sqlparser::ast::{Expr, LimitClause, OrderBy, OrderByExpr, OrderByKind, OrderByOptions};
 
 /// What an ORDER BY key names: a 1-based visible-output position, or an

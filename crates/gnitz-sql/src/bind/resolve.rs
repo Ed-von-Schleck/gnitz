@@ -1,6 +1,7 @@
 use crate::ast_util::col_ref_parts;
 use crate::error::GnitzSqlError;
-use gnitz_core::{qualified_name, ColumnDef, RelDescriptor};
+use gnitz_core::{qualified_name, RelDescriptor};
+use gnitz_wire::ColumnDef;
 use sqlparser::ast::{Expr, Ident};
 use std::cell::RefCell;
 use std::collections::HashMap;

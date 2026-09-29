@@ -85,5 +85,4 @@ def test_tpch(client, schema_name, bench_timer, scale_mode):
         prev = rows
 
     for v in _READ_VIEWS:
-        vid, _ = client.resolve_table(sn, v)
-        assert len(client.scan(vid)) > 0, f"{v} empty after streaming"
+        assert len(client.scan(*client.resolve_table(sn, v))) > 0, f"{v} empty after streaming"

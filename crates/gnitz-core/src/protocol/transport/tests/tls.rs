@@ -181,7 +181,7 @@ fn loopback_one_record_two_frames_one_step_completes_both_slots() {
         end.write_all(&both).unwrap();
         end.flush().unwrap();
     });
-    let mut s = Session::from_transport(lb.connect());
+    let mut s = Session::over(lb.connect());
     let req = reply_ctrl(0, 0);
     let a = s.submit(Request::RawFrame(req.clone())).unwrap();
     let b = s.submit(Request::RawFrame(req)).unwrap();
@@ -218,7 +218,7 @@ fn loopback_two_back_to_back_records_come_out_of_one_step() {
         write_frame(&mut end, &reply_ctrl(0, 1));
         write_frame(&mut end, &reply_ctrl(0, 2));
     });
-    let mut s = Session::from_transport(lb.connect());
+    let mut s = Session::over(lb.connect());
     let req = reply_ctrl(0, 0);
     s.submit(Request::RawFrame(req.clone())).unwrap();
     s.submit(Request::RawFrame(req)).unwrap();
@@ -260,7 +260,7 @@ fn loopback_step_write_can_empty_the_queue_with_ciphertext_still_pending() {
     });
     let t = lb.connect();
     set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 8 * 1024);
-    let mut s = Session::from_transport(t);
+    let mut s = Session::over(t);
     let slot = s.submit(Request::RawFrame(frame)).unwrap();
     assert!(s.step(Interest::WRITE).is_empty());
     assert_eq!(s.queued_bytes(), 0, "rustls took the whole frame");
@@ -414,7 +414,7 @@ fn loopback_reply_and_close_notify_in_one_read_complete_the_slot() {
         end.conn.send_close_notify();
         end.flush().unwrap();
     });
-    let mut s = Session::from_transport(lb.connect());
+    let mut s = Session::over(lb.connect());
     let slot = s.submit(Request::RawFrame(reply_ctrl(0, 0))).unwrap();
     assert!(s.step(Interest::WRITE).is_empty());
     std::thread::sleep(Duration::from_millis(200));

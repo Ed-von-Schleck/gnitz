@@ -48,5 +48,4 @@ def test_view_maintenance_sql(client, schema_name, bench_timer, scale_mode):
                 f"DELETE FROM fact_orders WHERE o_id={rng.randint(1, hi)}",
                 schema_name=sn)
 
-    vid, _ = client.resolve_table(sn, "v_rev")
-    assert len(client.scan(vid)) > 0, "v_rev empty"
+    assert len(client.scan(*client.resolve_table(sn, "v_rev"))) > 0, "v_rev empty"

@@ -1,20 +1,16 @@
 use crate::connection::{
-    IdRun, Interest, MultiScanResult, PollSink, PolledView, RawBlock, RelDescriptor, RelTarget, Reply, Request,
-    ScanReply, ScanResult, Session, SlotId,
+    DeltaCursor, IdRun, Interest, PollSink, PolledView, RawBlock, RelDescriptor, RelTarget, Reply, Request, ScanReply,
+    ScanResult, Session, SlotId,
 };
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
-use crate::protocol::{
-    BatchAppender, ColumnDef, FkTarget, PkBuf, PkColumn, ProtocolError, PushFamily, Schema, WireConflictMode, ZSetBatch,
-};
+use crate::{sys_schema, BatchAppender, FkTarget, PkColumn, ProtocolError, PushFamily, Schema, ZSetBatch};
 use gnitz_expr::{ColumnTable, SchemaFacts};
+use gnitz_wire::{ColumnDef, PkBuf, WireConflictMode};
 use gnitz_wire::{WireFault, WireStatus};
 use std::collections::HashMap;
-use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use crate::mirror::{MirrorState, MirrorStore, MirroredView};
-use crate::types::sys_schema;
 use gnitz_expr::{payload_bytes, payload_is_null, payload_u64, LogicalProgram, RowFilter};
 use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::txn_frame::{DeltaPollItem, BLIND};
@@ -137,50 +133,6 @@ fn segment_name(vid: u64) -> String {
     format!("_seg{vid}")
 }
 
-/// A subscriber's whole state: one word, held on the client.
-///
-/// `tag` names what the cursor is a cursor *into* — a `(boot, relation)`
-/// identity. A round number alone identifies nothing: it is meaningless across a
-/// restart, because the counter starts over, and meaningless across a
-/// `DROP VIEW v; CREATE VIEW v …`, because the recreated `v` takes a fresh id
-/// whose rounds are numbered from the same global counter as the old one's — so a
-/// stale cursor would read as "nothing changed" and the client would sit on the
-/// previous view's rows. A tag the server does not echo back means: discard the
-/// copy and bootstrap again.
-///
-/// The cursor lives here and nowhere else, so there is nothing to lose on a
-/// disconnect, nothing to forge, and no liveness for the server to detect.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct DeltaCursor {
-    /// Identifies the boot and the relation this cursor belongs to.
-    pub tag: u64,
-    /// The last tick round it covers; the next poll asks for everything after it.
-    pub tick: NonZeroU64,
-}
-
-impl DeltaCursor {
-    /// `next` as this cursor's successor, or a `DeltaExpired` refusal.
-    ///
-    /// A tag the server did not echo back names a different boot or a different
-    /// relation, and the rows such a read draws are unsafe to apply: they are the
-    /// *other* relation's recent deltas, and a recreated view's backfill never
-    /// enters a delta store at all. The recovery is the one a cursor that fell out
-    /// of the retention window gets — discard the copy and bootstrap.
-    pub(crate) fn advanced_to(self, next: DeltaCursor) -> Result<DeltaCursor, ClientError> {
-        (self.tag == next.tag)
-            .then_some(next)
-            .ok_or_else(|| delta_expired("delta cursor's tag names a different boot or relation; bootstrap"))
-    }
-}
-
-/// A `WireStatus::DeltaExpired` refusal raised on this side.
-fn delta_expired(text: &str) -> ClientError {
-    ClientError::Refused(WireFault {
-        status: WireStatus::DeltaExpired,
-        text: text.into(),
-    })
-}
-
 /// The symbolic id by which a [`ViewBundle`] circuit's `ScanDelta` names
 /// `segments[j]`. Symbolic ids start at [`gnitz_wire::CATALOG_ID_CEILING`], which
 /// no durable relation id reaches, so `create_view_chain` tells them apart from
@@ -244,7 +196,7 @@ const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send::<GnitzClient>();
     assert_send_sync::<Session>();
-    assert_send_sync::<crate::protocol::ClientTransport>();
+    assert_send_sync::<crate::ClientTransport>();
     assert_send::<ZSetBatch>();
     assert_send::<ClientError>();
     // Handed back as `Arc<Schema>` by the scan path, and `Arc<T>: Send` requires
@@ -254,20 +206,10 @@ const _: fn() = || {
 
 impl GnitzClient {
     pub fn connect(target: &str) -> Result<Self, ClientError> {
-        let session = Session::connect(target)?;
-        Ok(GnitzClient {
-            session,
-            park_hook: None,
-            serial_cache: HashMap::new(),
-            txn: None,
-            mirror: None,
-        })
+        Session::connect(target).map(Self::from_session)
     }
 
-    /// A client over an already-connected session, for the scripted-peer tests.
-    /// The twin of [`Session::from_transport`], in the crate that owns both
-    /// types.
-    #[cfg(test)]
+    /// A client over an already-connected session.
     pub(crate) fn from_session(session: Session) -> GnitzClient {
         GnitzClient {
             session,
@@ -342,18 +284,13 @@ impl GnitzClient {
         self.alloc(IdRun::Ids(1))
     }
 
-    pub fn push(&mut self, table_id: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, ClientError> {
-        self.push_with_mode(table_id, schema, batch, WireConflictMode::Update)
-    }
-
-    /// Push with an explicit `WireConflictMode`. SQL `INSERT` uses `Error` to get
-    /// SQL-standard rejection semantics; all other callers pass `Update` (or use
-    /// the plain `push`, which defaults to `Update`).
+    /// Push `batch` under `mode`. SQL `INSERT` uses `Error` to get SQL-standard
+    /// rejection semantics; every other caller passes `Update`.
     ///
     /// Inside an open transaction the batch is buffered instead of sent, and the
     /// returned LSN is `0` — nothing is durable until `txn_commit`, which returns
     /// the one zone LSN covering the whole bundle.
-    pub fn push_with_mode(
+    pub fn push(
         &mut self,
         table_id: u64,
         schema: &Schema,
@@ -367,7 +304,7 @@ impl GnitzClient {
         self.send_push(table_id, schema, batch, mode)
     }
 
-    /// [`Self::push_with_mode`] for a caller that owns the batch and drops it:
+    /// [`Self::push`] for a caller that owns the batch and drops it:
     /// inside a transaction the rows move into the buffer instead of being deep
     /// cloned. The borrowing form stays for callers that cannot move (the Python
     /// driver holds a `PyRef`).
@@ -397,12 +334,7 @@ impl GnitzClient {
             .into_lsn())
     }
 
-    pub fn scan(&mut self, table_id: u64) -> ScanResult {
-        self.round_trip(Request::scan(table_id)).map(Reply::into_scan)
-    }
-
-    /// Run a parameterized bounded read — the ad-hoc SELECT access path — decoding
-    /// every reply frame under `reply_schema`, since the server sends no schema block.
+    /// Run a parameterized bounded read, replied in `reply_schema`'s layout.
     pub fn scan_spec(&mut self, table_id: u64, spec: &ReadSpec, reply_schema: &Arc<Schema>) -> ScanResult {
         self.round_trip(Request::ScanSpec { target_id: table_id, spec, reply_schema })
             .map(Reply::into_scan)
@@ -410,8 +342,8 @@ impl GnitzClient {
 
     // ── The read seam ──────────────────────────────────────────────────────
     //
-    // `resolve`, `scan` and `scan_spec` are the connection; the `_local_first`
-    // trio below consults the copy and falls through to them, so every call site
+    // `resolve` and `scan_spec` are the connection; the `_local_first` pair
+    // below consults the copy and falls through to them, so every call site
     // declares which freshness it is asking for. **The gate is what the copy
     // holds, never whether a store is attached**, so a client with one reads
     // exactly like a client without for every relation the copy does not hold.
@@ -448,55 +380,17 @@ impl GnitzClient {
         }
     }
 
-    /// The registration and the store behind a local read of `tid` — the gate
-    /// [`Self::mirrors`] tests, returning what it proved. `None` when the copy
-    /// does not hold `tid` and the read is the caller's to delegate.
-    pub(crate) fn local_read(&mut self, tid: u64) -> Option<(&MirroredView, &mut dyn MirrorStore)> {
-        let m = self.mirror.as_deref_mut()?;
-        m.store.cursor_of(tid)?;
-        let MirrorState { store, views, .. } = m; // disjoint fields, so two borrows
-        Some((views.get(&tid)?, store.as_mut()))
-    }
-
-    /// Every row of `table_id` off the copy, or `None` when the copy does not
-    /// hold it and the read is the caller's to delegate — which an async handle
-    /// does on its own connection rather than this one, and
-    /// [`Self::scan_local_first`] does here.
-    pub fn scan_local(&mut self, table_id: u64) -> Result<Option<ScanReply>, ClientError> {
-        let Some((view, store)) = self.local_read(table_id) else {
-            return Ok(None);
-        };
-        let schema = Arc::clone(&view.desc.schema);
-        let spec = ReadSpec::all_rows(ReadBound::None);
-        let batch = store.scan_spec(table_id, spec, &schema)?;
-        Ok(Some(ScanReply { schema, batch, lsn: None }))
-    }
-
-    /// [`Self::scan`], answered off the copy when it holds `table_id`.
-    ///
-    /// The served LSN is `None` for a local answer: it is a server-side counter,
-    /// and a copy's freshness is a feed round — [`Self::cursor_of`] is where a
-    /// host reads it.
-    pub fn scan_local_first(&mut self, table_id: u64) -> Result<ScanReply, ClientError> {
-        match self.scan_local(table_id)? {
-            Some(r) => Ok(r),
-            None => self.scan(table_id),
-        }
-    }
-
-    /// [`Self::scan_spec`], answered off the copy when it holds `table_id`.
-    ///
-    /// A held answer is the answer, empty or not; only "not held" falls through.
+    /// [`Self::scan_spec`], answered off the copy when it holds `table_id`, with
+    /// no served LSN: a copy's freshness is [`Self::cursor_of`].
     pub fn scan_spec_local_first(&mut self, table_id: u64, spec: ReadSpec, reply_schema: &Arc<Schema>) -> ScanResult {
-        if let Some((_, store)) = self.local_read(table_id) {
-            let batch = store.scan_spec(table_id, spec, reply_schema)?;
-            return Ok(ScanReply {
+        match self.mirror.as_deref_mut() {
+            Some(m) if m.cursor_of(table_id).is_some() => Ok(ScanReply {
+                batch: m.store.scan_spec(table_id, spec, reply_schema)?,
                 schema: Arc::clone(reply_schema),
-                batch,
                 lsn: None,
-            });
+            }),
+            _ => self.scan_spec(table_id, &spec, reply_schema),
         }
-        self.scan_spec(table_id, &spec, reply_schema)
     }
 
     /// Replace the connection and keep the copies — what a host does after a
@@ -602,15 +496,9 @@ impl GnitzClient {
     /// Consistent snapshot of N relations at one server-side SAL cut, returned
     /// in request order. An atomic multi-table `txn_commit` is never observed torn
     /// across the result set.
-    pub fn scan_many(&mut self, table_ids: &[u64]) -> MultiScanResult {
-        self.round_trip(Request::ScanMulti(table_ids)).map(Reply::into_multi)
-    }
-
-    /// A point SEEK by primary key: `key` is the packed PK columns in the wire's
-    /// **native** little-endian key space. The engine OPK-encodes it against the
-    /// relation's schema, so no caller here needs one.
-    pub fn seek(&mut self, table_id: u64, key: &[u8]) -> ScanResult {
-        self.round_trip(Request::seek(table_id, key)).map(Reply::into_scan)
+    /// Each relation is replied in the layout of the schema paired with it.
+    pub fn scan_many(&mut self, relations: &[(u64, &Arc<Schema>)]) -> Result<Vec<ScanReply>, ClientError> {
+        self.round_trip(Request::ScanMulti(relations)).map(Reply::into_multi)
     }
 
     /// The descriptor for `tid` — the by-id twin of [`Self::resolve`], one round
@@ -684,7 +572,7 @@ impl GnitzClient {
         if_exists: bool,
         matches: impl Fn(&ZSetBatch, usize) -> bool,
     ) -> Result<(), ClientError> {
-        let scanned = checked_sys_rows(IDX_TAB, self.scan(IDX_TAB)?)?;
+        let scanned = self.sys_rows(IDX_TAB, ReadBound::None)?;
         let idx_schema = sys_schema(IDX_TAB);
         let mut batch = ZSetBatch::new(idx_schema);
         let mut retired: Vec<usize> = Vec::with_capacity(names.len());
@@ -719,7 +607,7 @@ impl GnitzClient {
     /// `(id, name, indexed columns)` of every live secondary index. Names come back
     /// canonical (lowercase): every writer folds them at store time.
     pub fn index_rows(&mut self) -> Result<Vec<(u64, String, gnitz_wire::PkColList)>, ClientError> {
-        let idx_batch = checked_sys_rows(IDX_TAB, self.scan(IDX_TAB)?)?;
+        let idx_batch = self.sys_rows(IDX_TAB, ReadBound::None)?;
         let mut out = Vec::new();
         for i in idx_batch.live_rows() {
             let name = col_str(&idx_batch, IDXTAB_PAY_NAME, i)?.to_string();
@@ -849,43 +737,47 @@ impl GnitzClient {
     // --- DDL ---
 
     /// Every catalog write goes through here, so this is where DDL is refused
-    /// inside a transaction and where a retired view's copy is dropped.
+    /// inside a transaction and where the copies learn what it committed.
     pub fn push_ddl_txn(&mut self, families: &[(u64, ZSetBatch)]) -> Result<(), ClientError> {
         if self.txn.is_some() {
             return Err(ClientError::from("DDL is not allowed inside a transaction".to_string()));
         }
         self.round_trip(Request::DdlTxn(families))?;
-        self.forget_retired_views(families);
+        self.after_ddl_commit(families);
         Ok(())
     }
 
-    /// Stop mirroring every view this committed bundle retired: a VIEW_TAB pk at
-    /// negative weight and **not** at positive weight. A pk at both is a rewrite
-    /// pair, which for VIEW_TAB is only a rename — handled at
-    /// [`Self::alter_rename_relation`], where the new name is in hand.
-    ///
-    /// No DDL retires a view its own batch does not name: `DROP TABLE` and the
-    /// `ALTER TABLE` column ops are RESTRICT, `DROP SCHEMA` emits a `-1` per
-    /// member, and a replaced view's lone `-1` rides the replacement's batch. The
-    /// engine's cascade reaches only hidden chain segments, which
-    /// `canonical_identifier` refuses to name and so cannot be mirrored.
-    fn forget_retired_views(&mut self, families: &[(u64, ZSetBatch)]) {
-        if self.mirror.is_none() {
+    /// Drop the copy of every view the bundle retracted, except a mirrored view
+    /// the bundle also wrote back — a rename — which is rebound under its new
+    /// name.
+    fn after_ddl_commit(&mut self, families: &[(u64, ZSetBatch)]) {
+        let Some(m) = self.mirror.as_deref() else {
             return;
-        }
+        };
         let Some((_, b)) = families.iter().find(|(family, _)| *family == VIEW_TAB) else {
             return;
         };
-        // A create-only bundle allocates nothing.
-        if !b.weights.iter().any(|&w| w < 0) {
-            return;
-        }
         let s = sys_schema(VIEW_TAB);
         let vid = |i| b.pks.get(s, i) as u64;
-        let rewritten: Vec<u64> = b.live_rows().map(vid).collect();
-        for i in 0..b.len() {
-            if b.weights[i] < 0 && !rewritten.contains(&vid(i)) {
-                self.invalidate_own_copy(vid(i));
+        let mut dropped: Vec<u64> = Vec::new();
+        let mut renamed: Vec<(String, String, Arc<RelDescriptor>)> = Vec::new();
+        for v in (0..b.len()).filter(|&i| b.weights[i] < 0).map(vid) {
+            match (m.views.get(&v), b.live_rows().find(|&j| vid(j) == v)) {
+                (Some(view), Some(j)) => renamed.push((
+                    view.schema_name.clone(),
+                    gnitz_expr::payload_str(b, j, RELTAB_PAY_NAME).to_owned(),
+                    Arc::clone(&view.desc),
+                )),
+                _ => dropped.push(v),
+            }
+        }
+        for v in dropped {
+            self.invalidate_own_copy(v);
+        }
+        for (schema_name, name, desc) in renamed {
+            let tid = desc.tid;
+            if self.bind(&schema_name, &name, desc).is_err() {
+                self.invalidate_own_copy(tid);
             }
         }
     }
@@ -994,9 +886,9 @@ impl GnitzClient {
                 .map_err(|msg| ClientError::from(format!("create_table: unique index '{}': {msg}", spec.name)))?;
         }
 
+        let schema_id = self.lookup_schema_id(&schema_name)?;
         // The table's id, then one per inline UNIQUE index.
         let new_tid = self.alloc(IdRun::Ids(1 + unique_indexes.len() as u64))?;
-        let schema_id = self.lookup_schema_id(&schema_name)?;
 
         // Encode the PK list using the shared wire packer so the engine
         // catalog decodes it identically. Single-PK callers still flow
@@ -1200,8 +1092,8 @@ impl GnitzClient {
             }
         }
 
-        // One families entry per tid (mandatory: the engine's derived lists read
-        // only the first block per family).
+        // One families entry per tid: the engine refuses a second block per
+        // family.
         let mut families: Vec<(u64, ZSetBatch)> = Vec::new();
         families.push((COL_TAB, col_batch));
         if !nodes_batch.is_empty() {
@@ -1265,7 +1157,7 @@ impl GnitzClient {
     fn schema_retractions(&mut self, family: u64, schema_id: u64) -> Result<ZSetBatch, ClientError> {
         let s = sys_schema(family);
         let mut out = ZSetBatch::new(s);
-        let scanned = checked_sys_rows(family, self.scan(family)?)?;
+        let scanned = self.sys_rows(family, ReadBound::None)?;
         for i in scanned.live_rows() {
             if payload_u64(&scanned, i, RELTAB_PAY_SCHEMA_ID) == schema_id {
                 out.copy_row_at(&scanned, i, -1);
@@ -1292,13 +1184,7 @@ impl GnitzClient {
     }
 
     /// Rename `rel`: a `(-1, +1)` rewrite pair of its TABLE_TAB / VIEW_TAB row.
-    pub fn alter_rename_relation(
-        &mut self,
-        schema_name: &str,
-        rel: &Arc<RelDescriptor>,
-        new_name: &str,
-    ) -> Result<(), ClientError> {
-        let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
+    pub fn alter_rename_relation(&mut self, rel: &RelDescriptor, new_name: &str) -> Result<(), ClientError> {
         let new_name = gnitz_wire::canonical_identifier(new_name)?;
         let tid = rel.tid;
         let family = if rel.class.is_view() { VIEW_TAB } else { TABLE_TAB };
@@ -1307,29 +1193,7 @@ impl GnitzClient {
             tid as u128,
             || absent(format!("relation {tid} not found")),
             |b, row| b.set_string_cell(row, RELTAB_PAY_NAME, &new_name),
-        )?;
-        if rel.class.is_view() {
-            // The id, the layout and the rows are unchanged, so the copy is
-            // renamed rather than destroyed. Both probes resolve before either
-            // arm runs, because the arms need `&mut self`.
-            let (claimed, held) = self.mirror.as_deref().map_or((false, false), |m| {
-                (m.views.contains_key(&tid), m.store.cursor_of(tid).is_some())
-            });
-            if claimed {
-                // Post-commit, so this must not fail the rename. The only way it
-                // refuses is a poisoned store, which then refuses every read of
-                // the copy too and drops this binding with itself at
-                // `close_mirror` — so the stale name it leaves cannot be acted on.
-                let _ = self.bind(&schema_name, &new_name, Arc::clone(rel));
-            } else if held {
-                // A previous session's copy, replayed by the store's open and
-                // never claimed here. Binding it would mirror a view the host did
-                // not ask for; leaving it would leave the store's record naming
-                // the freed name, for a later registration's scan to match.
-                self.invalidate_own_copy(tid);
-            }
-        }
-        Ok(())
+        )
     }
 
     pub fn alter_rename_column(&mut self, tid: u64, col_idx: usize, new_col: &str) -> Result<(), ClientError> {
@@ -1413,15 +1277,6 @@ impl GnitzClient {
             .ok_or_else(|| not_found("relation", schema_name, name))
     }
 
-    pub fn resolve_table_or_view_id(
-        &mut self,
-        schema_name: &str,
-        name: &str,
-    ) -> Result<(u64, Arc<Schema>), ClientError> {
-        let d = self.resolve_relation(schema_name, name)?;
-        Ok((d.tid, Arc::clone(&d.schema)))
-    }
-
     // --- Relation resolution ---
 
     /// The descriptor for `schema_name.name`, or `None` when no such relation
@@ -1449,22 +1304,32 @@ impl GnitzClient {
     /// missing row — or an entirely empty SCHEMA_TAB — is a
     /// `NotFound` refusal, like every other catalog absence.
     pub(crate) fn lookup_schema_id(&mut self, schema_name: &str) -> Result<u64, ClientError> {
-        let batch = checked_sys_rows(SCHEMA_TAB, self.scan(SCHEMA_TAB)?)?;
+        let batch = self.sys_rows(SCHEMA_TAB, ReadBound::None)?;
         find_schema_id(&batch, schema_name)?.ok_or_else(|| absent(format!("schema '{schema_name}' not found")))
     }
 
-    /// The live system-catalog row with PK `key`, by one master-local SEEK: the
+    /// System family `family`'s rows under `bound`, decoded under its own schema;
+    /// the server checks the reply against that schema's layout.
+    fn sys_rows(&mut self, family: u64, bound: ReadBound) -> Result<ZSetBatch, ClientError> {
+        Ok(self
+            .scan_spec(family, &ReadSpec::all_rows(bound), sys_schema(family))?
+            .batch)
+    }
+
+    /// The live `family` row keyed `key`, by one master-local keyed read: the
     /// reply batch and the row's index in it, for a caller to copy the stored row
-    /// out of. No live row is `missing()`.
+    /// out of. `PkSet` is exact, so a live row in the reply is that key's; none is
+    /// `missing()`.
     fn seek_sys_row(
         &mut self,
         family: u64,
         key: u128,
         missing: impl FnOnce() -> ClientError,
     ) -> Result<(ZSetBatch, usize), ClientError> {
-        let reply = checked_sys_rows(family, self.seek(family, &key.to_le_bytes())?)?;
-        let i = reply.live_row_with_pk(sys_schema(family), key).ok_or_else(missing)?;
-        Ok((reply, i))
+        let keys = PkColumn::from_natives(sys_schema(family), [key]).keys();
+        let batch = self.sys_rows(family, ReadBound::PkSet(keys))?;
+        let i = batch.live_rows().next().ok_or_else(missing)?;
+        Ok((batch, i))
     }
 }
 
@@ -1688,21 +1553,6 @@ fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<Option<u64>, ClientEr
         }
     }
     Ok(None)
-}
-
-/// A system family's rows, with the reply's schema checked against
-/// `sys_schema(family)`. The row readers above index a reply positionally, and a
-/// reply is decoded against the server's block or this connection's cache — never
-/// against `sys_schema` — so the check is what makes that indexing a precondition
-/// rather than a cross-crate assumption.
-fn checked_sys_rows(family: u64, reply: ScanReply) -> Result<ZSetBatch, ClientError> {
-    if !reply.schema.types_match(sys_schema(family)) {
-        return Err(ProtocolError::DecodeError(format!(
-            "system family {family} answered in a schema that is not its own"
-        ))
-        .into());
-    }
-    Ok(reply.batch)
 }
 
 /// Append one `COL_TAB` row per column of `owner_id`, at `+1`.

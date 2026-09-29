@@ -164,16 +164,16 @@ def test_a_failed_tick_reports_and_requeues(tick_emit_fault_server):
         schema_name=sn)
     client.execute_sql(
         "CREATE VIEW v AS SELECT pk, val FROM tickfault WHERE val > 5", schema_name=sn)
-    vid, _ = client.resolve_table(sn, "v")
+    vid, schema = client.resolve_table(sn, "v")
 
     client.execute_sql("INSERT INTO tickfault VALUES (1, 10), (2, 20), (3, 1)",
                        schema_name=sn)
 
     with pytest.raises(gnitz.GnitzError):
-        list(client.scan(vid))
+        list(client.scan(vid, schema))
 
     # The seam is spent and the tid was re-queued, so this read ticks it. A view
     # read is served only once its source closure is at the last completed tick's
     # watermark, so one read is the whole claim — polling for convergence would
     # also pass on a view that converges and then diverges again.
-    assert bag(client.scan(vid), "pk", "val") == {(1, 10): 1, (2, 20): 1}
+    assert bag(client.scan(vid, schema), "pk", "val") == {(1, 10): 1, (2, 20): 1}

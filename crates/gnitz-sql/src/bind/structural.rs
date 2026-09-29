@@ -8,8 +8,9 @@ use crate::codec::literal::{invalid_literal, parse_temporal};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, NumFunc, StrArg, StrFunc, TrimMode};
 use crate::types::sql_col_type;
-use gnitz_core::{ColumnDef, Schema};
+use gnitz_core::Schema;
 use gnitz_expr::{CalendarOp, LikePattern};
+use gnitz_wire::ColumnDef;
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, CeilFloorKind, DataType, DateTimeField, Expr, Function, TrimWhereField, TypedString,
     UnaryOperator, Value, ValueWithSpan,

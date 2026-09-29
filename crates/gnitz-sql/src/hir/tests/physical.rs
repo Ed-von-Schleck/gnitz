@@ -1,7 +1,7 @@
 use super::*;
 use crate::hir::ColIdGen;
 use crate::ir::BExpr;
-use gnitz_core::TypeCode;
+use gnitz_wire::TypeCode;
 
 /// A frame over `I64` columns `names` keyed by `pk_cols`, its layout minted from `ids`.
 fn frame(ids: &ColIdGen, names: &[&str], pk_cols: &[u32]) -> Frame {
@@ -104,4 +104,21 @@ fn project_slots_pins_the_full_source_pk_to_the_leading_slots() {
             );
         }
     }
+}
+
+/// A permutation of the PK is sent as the PK list, and so keyed by it; any
+/// other group set is sent as written.
+#[test]
+fn reduce_group_sends_a_pk_permutation_as_the_pk_list() {
+    use gnitz_expr::SchemaFacts;
+    let ids = ColIdGen::new();
+    let f = frame(&ids, &["a", "b", "c"], &[0, 1]);
+    let id = |slot: usize| f.layout[slot].unwrap();
+    assert_eq!(f.reduce_group(&[id(1), id(0)]).unwrap(), vec![0, 1]);
+    assert_eq!(f.reduce_group(&[id(0), id(1)]).unwrap(), vec![0, 1]);
+    assert_eq!(f.reduce_group(&[id(2), id(1)]).unwrap(), vec![2, 1]);
+    assert_eq!(
+        f.schema.reduce_out_key(&f.reduce_group(&[id(1), id(0)]).unwrap()),
+        gnitz_wire::ReduceOutKey::Natural
+    );
 }

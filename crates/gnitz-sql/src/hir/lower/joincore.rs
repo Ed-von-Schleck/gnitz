@@ -5,8 +5,9 @@ use super::JoinSide;
 use crate::error::GnitzSqlError;
 use crate::validate::reject_column_overflow;
 
-use gnitz_core::{Circuit, ColumnDef, NodeId, NullKeys, RangeRel, ReindexRole, ReindexSlot, Schema, TypeCode};
+use gnitz_core::Schema;
 use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc, JoinKind};
+use gnitz_wire::{Circuit, ColumnDef, NodeId, NullKeys, RangeRel, ReindexRole, ReindexSlot, TypeCode};
 
 /// This side's reindex key over `cols`, each slot typed at its `slot_tcs` type.
 fn side_reindex_key(cols: &[usize], slot_tcs: &[TypeCode]) -> Vec<ReindexSlot> {

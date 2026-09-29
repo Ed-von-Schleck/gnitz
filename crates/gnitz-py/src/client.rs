@@ -13,16 +13,15 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use gnitz_core::{
-    ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, ScanReply, Schema, TableProps, WireConflictMode,
-};
+use gnitz_core::{ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, ScanReply, Schema};
 use gnitz_mirror::Mirror;
 use gnitz_sql::SqlResult;
 use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec};
+use gnitz_wire::{TableProps, WireConflictMode};
 
 use crate::read::{scan_result, PyDeltaReply, PyScanResult};
-use crate::schema::{resolve_py_schema, PySchema};
-use crate::write::{pk_key_from_py, py_pks_to_column, py_scalar_key, PyZSetBatch};
+use crate::schema::{resolve_py_schema, scan_pairs, PySchema};
+use crate::write::{pk_point_spec, py_key_image, py_pks_to_column, PyZSetBatch};
 use crate::{build_pylist, client_err, connect_client, sql_err, GnitzError};
 
 /// What one view's poll did. `PollOutcome` flattened for Python, which has no
@@ -185,7 +184,7 @@ impl PyGnitzClient {
         // the blocking push without cloning the batch.
         let schema = batch.schema.as_ref();
         let b = &batch.batch;
-        self.call(py, move |c| c.push_with_mode(target_id, schema, b, m))
+        self.call(py, move |c| c.push(target_id, schema, b, m))
     }
 
     /// delete(target_id, schema, pks) — `pks` is a list where each element is the key's value
@@ -235,17 +234,23 @@ impl PyGnitzClient {
 
     /// resolve_table(schema_name, table_name) -> (tid: int, schema: Schema)
     pub fn resolve_table(&mut self, py: Python<'_>, schema_name: &str, table_name: &str) -> PyResult<(u64, PySchema)> {
-        let (tid, rust) = self.call(py, |c| c.resolve_table_or_view_id(schema_name, table_name))?;
-        Ok((tid, PySchema { rust }))
+        let rel = self.call(py, |c| c.resolve_relation(schema_name, table_name))?;
+        Ok((rel.tid, PySchema { rust: Arc::clone(&rel.schema) }))
     }
 
-    /// scan(target_id) -> ScanResult
+    /// scan(target_id, schema) -> ScanResult
     ///
-    /// Every row of the relation, off this client's local copy if it mirrors one
-    /// and from the server if it does not. `lsn` is `None` for a local answer;
-    /// a copy's freshness is `cursor(view_id)`.
-    pub fn scan(&mut self, py: Python<'_>, target_id: u64) -> PyResult<Py<PyScanResult>> {
-        let reply = self.call(py, |c| c.scan_local_first(target_id))?;
+    /// Every row of the relation in `schema`'s layout, off this client's local
+    /// copy if it mirrors one. `lsn` is `None` for a local answer; a copy's
+    /// freshness is `cursor(view_id)`.
+    pub fn scan(
+        &mut self,
+        py: Python<'_>,
+        target_id: u64,
+        #[pyo3(from_py_with = resolve_py_schema)] schema: Arc<Schema>,
+    ) -> PyResult<Py<PyScanResult>> {
+        let spec = ReadSpec::all_rows(ReadBound::None);
+        let reply = self.call(py, |c| c.scan_spec_local_first(target_id, spec, &schema))?;
         scan_result(py, reply)
     }
 
@@ -290,21 +295,37 @@ impl PyGnitzClient {
         PyDeltaReply::new(py, reply, cursor)
     }
 
-    /// scan_many(target_ids) -> list[ScanResult]
+    /// scan_many(pairs) -> list[ScanResult]
     ///
     /// Consistent snapshot of N relations at one server-side SAL cut, in request
     /// order: an atomic multi-table transaction is never observed torn across it.
-    pub fn scan_many(&mut self, py: Python<'_>, target_ids: Vec<u64>) -> PyResult<Vec<Py<PyScanResult>>> {
-        let results = self.call(py, |c| c.scan_many(&target_ids))?;
+    /// `pairs` is a list of `(table_id, schema)`.
+    pub fn scan_many(
+        &mut self,
+        py: Python<'_>,
+        pairs: Vec<(u64, Bound<'_, PyAny>)>,
+    ) -> PyResult<Vec<Py<PyScanResult>>> {
+        let rels = scan_pairs(&pairs)?;
+        let results = self.call(py, |c| {
+            let rels: Vec<(u64, &Arc<Schema>)> = rels.iter().map(|(tid, s)| (*tid, s)).collect();
+            c.scan_many(&rels)
+        })?;
         results.into_iter().map(|reply| scan_result(py, reply)).collect()
     }
 
-    /// seek(table_id, pk) -> ScanResult.
-    /// `pk` may be a scalar (single-PK tables) or `bytes` (compound or
-    /// wide-byte PKs).
-    pub fn seek(&mut self, py: Python<'_>, table_id: u64, pk: Bound<'_, PyAny>) -> PyResult<Py<PyScanResult>> {
-        let key = pk_key_from_py(&pk)?;
-        let reply = self.call(py, move |c| c.seek(table_id, &key))?;
+    /// seek(table_id, schema, pk) -> ScanResult.
+    ///
+    /// The rows keyed `pk`: a single-column key's value, or a compound key's
+    /// tuple of column values in PK order.
+    pub fn seek(
+        &mut self,
+        py: Python<'_>,
+        table_id: u64,
+        #[pyo3(from_py_with = resolve_py_schema)] schema: Arc<Schema>,
+        pk: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyScanResult>> {
+        let spec = pk_point_spec(&schema, &pk)?;
+        let reply = self.call(py, move |c| c.scan_spec(table_id, &spec, &schema))?;
         scan_result(py, reply)
     }
 
@@ -319,28 +340,24 @@ impl PyGnitzClient {
         col_indices: Vec<u32>,
         key_vals: Bound<'_, PyList>,
     ) -> PyResult<Py<PyScanResult>> {
-        let keys = key_vals
-            .iter()
-            .map(|item| py_scalar_key(&item))
-            .collect::<PyResult<Vec<u128>>>()?;
         gnitz_wire::validate_pk_col_list(&col_indices, schema.columns.len())
             .map_err(|e| PyValueError::new_err(format!("seek_by_index: {e}")))?;
-        // Each value at its own column's type: a range carries key images.
-        let keys: Vec<u128> = col_indices
+        let count_error = || {
+            PyValueError::new_err(format!(
+                "seek_by_index: key value count {} must be in 1..={}",
+                key_vals.len(),
+                col_indices.len()
+            ))
+        };
+        if key_vals.len() > col_indices.len() {
+            return Err(count_error());
+        }
+        let keys = col_indices
             .iter()
-            .zip(&keys)
-            .map(|(&c, &v)| gnitz_wire::key_image(schema.columns[c as usize].ty.tc, v))
-            .collect();
-        let (&last, eq) = keys
-            .split_last()
-            .filter(|_| keys.len() <= col_indices.len())
-            .ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "seek_by_index: key value count {} must be in 1..={}",
-                    keys.len(),
-                    col_indices.len()
-                ))
-            })?;
+            .zip(key_vals.iter())
+            .map(|(&c, v)| py_key_image(schema.columns[c as usize].ty.tc, &v))
+            .collect::<PyResult<Vec<u128>>>()?;
+        let (&last, eq) = keys.split_last().ok_or_else(count_error)?;
         let range = KeyRange::point(PkColList::from_slice(&col_indices), eq, last);
         let spec = ReadSpec::all_rows(ReadBound::Range(range));
         scan_result(py, self.call(py, |c| c.scan_spec(table_id, &spec, &schema))?)

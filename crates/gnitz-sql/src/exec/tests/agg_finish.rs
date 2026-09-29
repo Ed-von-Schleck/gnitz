@@ -3,8 +3,9 @@ use crate::agg::AggFunc;
 use crate::agg::{agg_col_def, finalize_agg_bexpr, group_pk_def};
 use crate::ir::{BExpr, BinOp};
 use crate::test_support::{col, ncol};
-use gnitz_core::{PkColumn, TypeCode};
+use gnitz_core::PkColumn;
 use gnitz_wire::AggDescriptor;
+use gnitz_wire::TypeCode;
 
 /// A long body, spilled to the arena rather than inlined in its German cell.
 const LONG_M: &str = "a string past the inline prefix: m";

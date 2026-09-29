@@ -11,14 +11,14 @@
 use super::*;
 use crate::connection::{Request, Session};
 use crate::protocol::message::encode_frame;
-use crate::protocol::transport::{poll_fd, ClientTransport};
-use crate::protocol::{ColumnDef, TypeCode, WireStatus};
-use crate::test_support::{framed, make_socketpair, raw_read_frame, raw_send};
+use crate::protocol::transport::poll_fd;
+use crate::test_support::{raw_read_frame, session_pair, Peer};
 use gnitz_wire::control::peek_control_block;
 use gnitz_wire::control::ControlHeader;
 use gnitz_wire::RelDescriptorBlob;
+use gnitz_wire::{ColumnDef, TypeCode, WireStatus};
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -149,9 +149,6 @@ impl MirrorStore for StubStore {
 // The scripted peer
 // ---------------------------------------------------------------------------
 
-/// The raw far end of the socketpair.
-struct Peer(OwnedFd);
-
 /// How long a request that is on its way may take. Only ever paid in full by a
 /// regression, which then fails rather than hangs.
 const PATIENCE: Duration = Duration::from_secs(5);
@@ -160,10 +157,6 @@ const PATIENCE: Duration = Duration::from_secs(5);
 const QUIET: Duration = Duration::from_millis(500);
 
 impl Peer {
-    fn send(&self, payload: &[u8]) {
-        raw_send(&self.0, &framed(payload));
-    }
-
     /// Whether another request frame arrives within `d`. An expired timeout is
     /// `WouldBlock`, which is the "nothing came" answer rather than a failure.
     fn waits(&self, d: Duration) -> bool {
@@ -260,8 +253,7 @@ fn view_schema() -> Schema {
 /// first, for the one test that needs a slot left pending behind the client's
 /// back.
 fn fixture_priming(views: &[(u64, &str, u64)], prime: impl FnOnce(&mut Session)) -> (GnitzClient, Peer, Log) {
-    let (a, b) = make_socketpair();
-    let mut session = Session::from_transport(ClientTransport::from_unix_fd(a));
+    let (mut session, peer) = session_pair();
     prime(&mut session);
     let mut client = GnitzClient::from_session(session);
 
@@ -296,7 +288,7 @@ fn fixture_priming(views: &[(u64, &str, u64)], prime: impl FnOnce(&mut Session))
         client.mirror.as_deref_mut().unwrap().views.insert(tid, entry);
     }
     log.take();
-    (client, Peer(b), log)
+    (client, peer, log)
 }
 
 fn fixture(views: &[(u64, &str, u64)]) -> (GnitzClient, Peer, Log) {
@@ -693,7 +685,8 @@ fn a_dead_connection_fails_each_view_rather_than_the_call() {
 fn a_poll_after_the_connection_was_lost_fails_every_view() {
     let (mut client, peer, _log) = fixture(&[(7, "a", 4), (8, "b", 4)]);
     drop(peer);
-    let r = client.scan(1);
+    let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None);
+    let r = client.scan_spec(1, &spec, &Arc::new(view_schema()));
     assert!(matches!(r, Err(ClientError::ConnectionLost(_))), "{r:?}");
 
     let report = client.poll_mirror().expect("a lost connection fails each view");

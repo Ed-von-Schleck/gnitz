@@ -54,18 +54,18 @@ def test_a_dropped_relation_stops_answering_while_its_siblings_serve(client, sch
 
     _push(client, tid, (1, 10))
     for vid in (va, vb):
-        assert bag(client.scan(vid), "pk", "val") == {(1, 10): 1}
+        assert bag(client.scan(vid, KV), "pk", "val") == {(1, 10): 1}
 
     client.drop_view(schema_name, "va")
     with pytest.raises(gnitz.GnitzError):
-        client.scan(va)
+        client.scan(va, KV)
     _push(client, tid, (2, 20))
-    assert bag(client.scan(vb), "pk", "val") == {(1, 10): 1, (2, 20): 1}
+    assert bag(client.scan(vb, KV), "pk", "val") == {(1, 10): 1, (2, 20): 1}
 
     client.drop_view(schema_name, "vb")
     client.drop_table(schema_name, "src")
     with pytest.raises(gnitz.GnitzError):
-        client.scan(tid)
+        client.scan(tid, KV)
 
 
 def test_drop_index_is_seen_by_the_next_statement_on_another_connection(

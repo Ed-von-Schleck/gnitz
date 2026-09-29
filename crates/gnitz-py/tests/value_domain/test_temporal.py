@@ -99,7 +99,7 @@ def test_a_date_key_serves_the_read_and_write_verbs_alike(client, schema_name):
     client.execute_sql(
         "CREATE TABLE t (d DATE NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
         schema_name=sn)
-    tid, _ = client.resolve_table(sn, "t")
+    tid, schema = client.resolve_table(sn, "t")
     days = [D + timedelta(days=i) for i in range(12)]
     client.execute_sql(
         "INSERT INTO t VALUES " + ", ".join(f"('{x.isoformat()}', {i})"
@@ -107,9 +107,9 @@ def test_a_date_key_serves_the_read_and_write_verbs_alike(client, schema_name):
         schema_name=sn)
 
     # The binding seeks by a `date` object; the planner by a literal.
-    assert bag(client.seek(tid, pk=D + timedelta(days=5)), "d", "v") == \
+    assert bag(client.seek(tid, schema, pk=D + timedelta(days=5)), "d", "v") == \
         {(D + timedelta(days=5), 5): 1}
-    assert list(client.seek(tid, pk=date(1999, 1, 1))) == []
+    assert list(client.seek(tid, schema, pk=date(1999, 1, 1))) == []
 
     client.execute_sql("DELETE FROM t WHERE d = DATE '2024-03-05'", schema_name=sn)
     client.execute_sql("DELETE FROM t WHERE d = '2024-03-06'", schema_name=sn)

@@ -1,7 +1,8 @@
 use gnitz_expr::{ColumnTable, SchemaFacts};
+use std::sync::{Arc, OnceLock};
 
-pub use gnitz_wire::{ColType, ColumnDef, FixedInt, PkBuf, ScalarKind, TypeCode};
-pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS};
+use gnitz_wire::MAX_COLUMNS;
+use gnitz_wire::{ColumnDef, PkBuf, PkKeys, TypeCode};
 
 /// The relation and column a FOREIGN KEY column references. `SelfTable` names the
 /// table being created, which has no id yet.
@@ -47,32 +48,6 @@ impl Schema {
     #[inline]
     pub fn visible_columns(&self) -> impl Iterator<Item = (usize, &ColumnDef)> {
         self.columns.iter().enumerate().filter(|(_, c)| !c.is_hidden)
-    }
-
-    /// True iff any **non-PK** column is hidden. A view's synthetic hidden keys
-    /// are PK columns, so they never count.
-    #[inline]
-    pub fn has_hidden_payload(&self) -> bool {
-        (0..self.columns.len()).any(|i| self.is_hidden_payload(i))
-    }
-
-    /// Whether column `i` is a hidden **payload** column. A wildcard *expansion*
-    /// drops every hidden column, PK included; the raw passthrough this gates
-    /// keeps a hidden PK column, which carries the batch's key. So the two agree
-    /// on every payload slot, and differ only there.
-    #[inline]
-    pub fn is_hidden_payload(&self, i: usize) -> bool {
-        self.columns[i].is_hidden && !self.is_pk_col(i)
-    }
-
-    /// The group list to send a reduce or top-N grouped by `group`: SQL's
-    /// GROUP BY is unordered, so a permutation of the PK is sent as the PK list.
-    pub fn reduce_group(&self, group: &[u32]) -> Vec<u32> {
-        let is_pk = group.len() == self.pk_cols.len() && self.pk_cols.iter().all(|p| group.contains(p));
-        match is_pk {
-            true => self.pk_cols.clone(),
-            false => group.to_vec(),
-        }
     }
 
     /// The single definition of "this is an admissible schema": the
@@ -138,17 +113,30 @@ impl Schema {
         })?;
         Schema::from_parts(columns, pk.as_slice().to_vec())
     }
+}
 
-    /// [`SchemaFacts::same_layout`] plus per-column nullability. Names, the
-    /// hidden flag and a DECIMAL's scale are not compared.
-    pub fn types_match(&self, other: &Schema) -> bool {
-        self.same_layout(other)
-            && self
-                .columns
-                .iter()
-                .zip(&other.columns)
-                .all(|(a, b)| a.is_nullable == b.is_nullable)
-    }
+/// The client `Schema` of system table `tid`, built from `gnitz_wire::SYS_FAMILIES`.
+///
+/// Panics on an id that is not a system table.
+pub fn sys_schema(tid: u64) -> &'static Arc<Schema> {
+    static INSTANCE: OnceLock<Vec<Arc<Schema>>> = OnceLock::new();
+    let schemas = INSTANCE.get_or_init(|| {
+        gnitz_wire::SYS_FAMILIES
+            .iter()
+            .map(|f| {
+                Arc::new(Schema {
+                    columns: f
+                        .cols
+                        .iter()
+                        .map(|c| ColumnDef::new(c.name, c.type_code, c.nullable))
+                        .collect(),
+                    pk_cols: f.pk_cols.to_vec(),
+                })
+            })
+            .collect()
+    });
+    let idx = gnitz_wire::sys_family_index(tid).unwrap_or_else(|| panic!("not a system table id: {tid}"));
+    &schemas[idx]
 }
 
 impl ColumnTable for Schema {
@@ -215,6 +203,11 @@ impl PkColumn {
     #[inline]
     pub fn region(&self) -> &[u8] {
         &self.buf
+    }
+
+    /// These keys as a read's key set.
+    pub fn keys(&self) -> PkKeys {
+        PkKeys::from_keys(self.width(), self.buf.chunks_exact(self.width()))
     }
 
     pub fn len(&self) -> usize {
@@ -300,7 +293,7 @@ impl PkColumn {
     }
 
     /// Append the row at `src[i]` to `self`. Strides must match.
-    pub fn push_from(&mut self, src: &PkColumn, i: usize) {
+    fn push_from(&mut self, src: &PkColumn, i: usize) {
         debug_assert_eq!(self.stride, src.stride);
         self.buf.extend_from_slice(src.get_bytes(i));
     }
@@ -484,21 +477,11 @@ impl ZSetBatch {
         (0..self.len()).filter(move |&i| self.weights[i] > 0)
     }
 
-    /// The live row whose PK, packed as [`PkColumn::get`] returns it, is `pk`.
-    pub fn live_row_with_pk(&self, schema: &Schema, pk: u128) -> Option<usize> {
-        self.live_rows().find(|&i| self.pks.get(schema, i) == pk)
-    }
-
     /// Append all rows of `other`, consuming it: each region concatenates, and
     /// `other`'s arena lands on this one's tail, so every German cell it carries
     /// has its heap offset shifted by that much.
     pub fn extend_from_owned(&mut self, mut other: ZSetBatch) {
-        assert_eq!(
-            self.pks.stride(),
-            other.pks.stride(),
-            "extend_from_owned: PK stride mismatch",
-        );
-        assert!(self.same_layout(&other), "extend_from_owned: payload layout mismatch",);
+        assert!(self.same_layout(&other), "extend_from_owned: layout mismatch");
         self.pks.append(&mut other.pks);
         self.weights.append(&mut other.weights);
         self.nulls.append(&mut other.nulls);
@@ -767,7 +750,7 @@ impl<'a> BatchAppender<'a> {
 
     /// [`Self::add_row`] for a **compound** PK: `natives` are the PK columns'
     /// native values in PK-list order.
-    pub fn add_row_cols(&mut self, natives: &[u128], weight: i64) -> &mut Self {
+    fn add_row_cols(&mut self, natives: &[u128], weight: i64) -> &mut Self {
         self.open_row(weight);
         self.batch.pks.push_natives(self.schema, natives);
         self

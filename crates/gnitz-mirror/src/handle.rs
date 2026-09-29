@@ -4,7 +4,7 @@
 use gnitz_store::schema::SchemaFacts;
 use std::collections::HashMap;
 
-use gnitz_core::protocol::decode_regions_into;
+use gnitz_core::decode_regions_into;
 use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RawBlock, Schema, ZSetBatch};
 use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;

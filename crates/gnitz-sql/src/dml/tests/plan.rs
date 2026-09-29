@@ -1,7 +1,7 @@
 use super::*;
 use crate::expr_lower::compile_wire_conjuncts;
 use crate::test_support::{bind_where, col, idx_metas_flagged, pk_schema, two_col};
-use gnitz_core::TypeCode;
+use gnitz_wire::TypeCode;
 
 /// The plan for `where_expr` against `lists` (the table's indexes).
 /// An access path's bound and compiled predicate.

@@ -55,11 +55,11 @@ def test_views_over_a_stream_track_pushes_from_their_creation_on(client, schema_
     assert _read(client, sn, "big") == {(0, 1650): 1, (2, 1550): 1}
     assert _read(client, sn, "late") == {}
 
-    vid, _ = client.resolve_table(sn, "hot")
+    vid, schema = client.resolve_table(sn, "hot")
     insert(client, sn, "s", [(99, 1, 7)])
-    assert bag(client.scan(vid)) == {(0, 1650): 1, (1, 1457): 1, (2, 1550): 1}
+    assert bag(client.scan(vid, schema)) == {(0, 1650): 1, (1, 1457): 1, (2, 1550): 1}
     insert(client, sn, "s", [(100, 1, 100)])
-    assert bag(client.scan_many([vid])[0]) == {(0, 1650): 1, (1, 1557): 1, (2, 1550): 1}
+    assert bag(client.scan_many([(vid, schema)])[0]) == {(0, 1650): 1, (1, 1557): 1, (2, 1550): 1}
     assert _read(client, sn, "late") == {(1, 107): 1}
     assert _read(client, sn, "big") == {(0, 1650): 1, (1, 1557): 1, (2, 1550): 1}
 

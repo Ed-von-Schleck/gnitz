@@ -79,14 +79,14 @@ fn catalog_defs((types, nullables, _): &Cols) -> Vec<CatalogColumn> {
 }
 
 /// The client's schema, named `c{i}`.
-fn client_schema((types, nullables, pk): &Cols) -> gnitz_core::protocol::types::Schema {
+fn client_schema((types, nullables, pk): &Cols) -> gnitz_core::Schema {
     let columns = types
         .iter()
         .zip(nullables)
         .enumerate()
         .map(|(i, (&tc, &nullable))| ColumnDef::new(format!("c{i}"), tc, nullable))
         .collect();
-    gnitz_core::protocol::types::Schema { columns, pk_cols: pk.clone() }
+    gnitz_core::Schema { columns, pk_cols: pk.clone() }
 }
 
 fn assert_descriptor_eq(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Result<(), TestCaseError> {
@@ -171,8 +171,8 @@ proptest! {
 /// family — with STRING columns and compound PKs.
 #[test]
 fn ddl_txn_roundtrip_client_to_server() {
-    use gnitz_core::protocol::types::{BatchAppender, ZSetBatch};
-    use gnitz_core::types::sys_schema;
+    use gnitz_core::sys_schema;
+    use gnitz_core::{BatchAppender, ZSetBatch};
     use gnitz_wire::sys_rows::{
         write_circuit_node_row, write_col_tab_row, write_idx_tab_row, write_table_tab_row, write_view_tab_row,
         CircuitNodeRow, ColTabRow, IdxTabRow, TableTabRow, ViewTabRow,
@@ -230,7 +230,7 @@ fn ddl_txn_roundtrip_client_to_server() {
     // families, whose two scalar forms differ (the engine reads the widened key
     // high-half-first, the client low-half-first) over identical wire bytes.
     let verify = |families: &[(u64, ZSetBatch)], check_pk: &[bool]| {
-        let payload = gnitz_core::protocol::encode_ddl_txn(families);
+        let payload = gnitz_core::encode_ddl_txn(families);
         let ctrl = gnitz_wire::control::peek_control_block(&payload).expect("control header");
         let decoded = decode_items(&payload[ctrl.body], gnitz_wire::ClientVerb::DdlTxn).expect("decode_items");
         assert_eq!(decoded.len(), families.len(), "family count");
@@ -252,7 +252,7 @@ fn ddl_txn_roundtrip_client_to_server() {
                 if check_pk[fi] {
                     assert_eq!(
                         batch.get_pk(i),
-                        exp_batch.pks.get(gnitz_core::types::sys_schema(*exp_tid), i),
+                        exp_batch.pks.get(gnitz_core::sys_schema(*exp_tid), i),
                         "pk row {i} tid {got_tid}"
                     );
                 }

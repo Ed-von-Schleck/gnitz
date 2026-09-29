@@ -73,7 +73,7 @@ class Subscriber:
         raise AssertionError("feed did not settle in 12 polls")
 
     def scan(self):
-        return _zset(self.client.scan(self.vid).including_hidden())
+        return _zset(self.client.scan(self.vid, self.schema).including_hidden())
 
     def assert_converged(self, what=""):
         """Quiesce, then require the copy to equal the view as a multiset.

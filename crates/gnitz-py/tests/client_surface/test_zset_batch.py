@@ -323,7 +323,7 @@ def test_a_dropped_column_is_a_tombstone_the_writer_fills(client, schema_name):
     assert _dump(batch) == [((1, 0, 100, 10), 1), ((2, 0, 200, 20), 1)]
     client.push(tid, batch)
 
-    rows = list(client.scan(tid))
+    rows = list(client.scan(tid, schema))
     assert sorted((r.id, r.a, r.b, r._weight) for r in rows) == [
         (1, 10, 100, 1), (2, 20, 200, 1)]
     assert all(r._fields == ("id", "b", "a") for r in rows)

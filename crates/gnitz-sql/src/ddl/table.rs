@@ -12,11 +12,10 @@ use crate::validate::{
     require_class, ClassWant, ColumnOptionSite,
 };
 use crate::SqlResult;
-use gnitz_core::{
-    ColType, ColumnDef, FkTarget, GnitzClient, InlineForeignKey, InlineUniqueIndex, Schema, TableProps, TypeCode,
-};
+use gnitz_core::{FkTarget, GnitzClient, InlineForeignKey, InlineUniqueIndex, Schema};
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::TableDistribution;
+use gnitz_wire::{ColType, ColumnDef, TableProps, TypeCode};
 use sqlparser::ast::{
     ColumnOption, CreateTableOptions, Expr, ForeignKeyConstraint, ObjectType, PrimaryKeyConstraint, TableConstraint,
     UniqueConstraint, Value, ValueWithSpan, WrappedCollection,
@@ -596,7 +595,7 @@ pub(crate) fn plan_create_table(
             cluster_indices.push(idx as u32);
         }
         let prefix_len =
-            gnitz_core::validate_dist_prefix(&pk_indices, &cluster_indices).map_err(GnitzSqlError::Rejected)?;
+            gnitz_wire::validate_dist_prefix(&pk_indices, &cluster_indices).map_err(GnitzSqlError::Rejected)?;
         // `validate_dist_prefix` bounded the prefix by the PK arity, so the `u8`
         // is lossless.
         let prefix_len = prefix_len as u8;

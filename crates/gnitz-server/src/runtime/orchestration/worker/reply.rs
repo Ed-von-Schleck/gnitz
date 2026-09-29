@@ -24,7 +24,7 @@ pub(super) struct PendingScan {
 fn reply_frame(route: ReplyRoute, last: bool) -> WireMsg<'static> {
     WireMsg {
         target_id: route.target_id,
-        flags: WireFlags::train_frame(route.schema_version, last),
+        flags: WireFlags::train_frame(last),
         ..Default::default()
     }
 }
@@ -136,13 +136,7 @@ pub(crate) fn send_unique_preflight_keys(
     chunk_rows: usize,
     keys: &mut gnitz_store::storage::KeyProducer,
 ) {
-    let route = ReplyRoute {
-        target_id,
-        request_id,
-        fifo: false,
-        // The synthetic schema has no version.
-        schema_version: 0,
-    };
+    let route = ReplyRoute { target_id, request_id, fifo: false };
     let mut chunk = Batch::with_capacity(frame_schema, keys.remaining().min(chunk_rows));
     loop {
         chunk.clear();

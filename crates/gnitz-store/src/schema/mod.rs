@@ -30,7 +30,7 @@ pub(crate) use gnitz_expr::ColumnLocator;
 pub use gnitz_expr::{ColumnTable, SchemaFacts};
 
 /// Order-preserving primary-key (OPK) primitives — every native→OPK encoder
-/// (whole PK, seek wire pair, index leading span), compare/pack, and the
+/// (whole PK, index leading span), compare/pack, and the
 /// re-export of the width-tagged `PkBuf` those encoders return. Sits below both
 /// schema and storage, and is the **one** import path: a second re-export would
 /// leave the byte-order rule spelled two ways in adjacent lines of one call site.

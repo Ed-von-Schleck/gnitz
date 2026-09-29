@@ -142,7 +142,7 @@ def test_a_transaction_commits_only_if_no_table_it_modified_was_written(occ, via
     write."""
     sn, connect = occ
     a, b = connect(), connect()
-    u_tid, ledger_tid = (a.resolve_table(sn, name)[0] for name in ("u", "ledger"))
+    (u_tid, u_schema), (ledger_tid, ledger_schema) = (a.resolve_table(sn, name) for name in ("u", "ledger"))
     conflicts = ledger_read != "SELECT * FROM ledger"
 
     def body():
@@ -161,8 +161,8 @@ def test_a_transaction_commits_only_if_no_table_it_modified_was_written(occ, via
             body()
             a.execute_sql("COMMIT", schema_name=sn)
 
-    assert bag(a.scan(u_tid), "pk", "val") == {(1, 0 if conflicts else 1): 1}
-    assert bag(a.scan(ledger_tid), "pk", "val") == {(1, 100): 1, (2, 0): 1}
+    assert bag(a.scan(u_tid, u_schema), "pk", "val") == {(1, 0 if conflicts else 1): 1}
+    assert bag(a.scan(ledger_tid, ledger_schema), "pk", "val") == {(1, 100): 1, (2, 0): 1}
     if rename:
         assert a.resolve_table(sn, "ledger2")[0] == ledger_tid
     if conflicts:
@@ -170,8 +170,8 @@ def test_a_transaction_commits_only_if_no_table_it_modified_was_written(occ, via
         a.execute_sql(_BUMP_1.format("u"), schema_name=sn)
         a.execute_sql(_BUMP_1.format("ledger2" if rename else "ledger"), schema_name=sn)
         a.execute_sql("COMMIT", schema_name=sn)
-        assert bag(a.scan(u_tid), "pk", "val") == {(1, 1): 1}
-        assert bag(a.scan(ledger_tid), "pk", "val") == {(1, 101): 1, (2, 0): 1}
+        assert bag(a.scan(u_tid, u_schema), "pk", "val") == {(1, 1): 1}
+        assert bag(a.scan(ledger_tid, ledger_schema), "pk", "val") == {(1, 101): 1, (2, 0): 1}
 
 
 # ── Refusals no concurrent writer may dilute ─────────────────────────────────
@@ -215,7 +215,7 @@ def test_insert_duplicate_key_raises_while_upserts_are_in_flight(server, client,
     assert not failures, f"concurrent upserts failed: {failures}"
 
     # The rejected INSERTs left the original row untouched, at weight 1.
-    assert {k: w for k, w in bag(client.scan(tid)).items() if k[0] == 1} == {(1, 10): 1}
+    assert {k: w for k, w in bag(client.scan(tid, schema)).items() if k[0] == 1} == {(1, 10): 1}
 
 
 @pytest.mark.parametrize("ddl,parent_table,parent,child_table,child", [

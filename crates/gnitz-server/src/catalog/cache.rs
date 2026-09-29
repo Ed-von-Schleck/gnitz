@@ -6,7 +6,6 @@ use gnitz_wire::{RelDescriptorBlob, RelIndex};
 use gnitz_wire::{IDXTAB_PAY_NAME, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME};
 use rustc_hash::FxHashMap;
 use std::hash::Hash;
-use std::num::NonZeroU16;
 
 // ---------------------------------------------------------------------------
 // CatalogCacheSet — all typed caches for one CatalogEngine
@@ -23,9 +22,6 @@ pub(in crate::catalog) struct RelFacts {
 /// What one registered relation's lifetime owns: entered by its registration,
 /// removed by its unregistration.
 pub(in crate::catalog) struct RelationEntry {
-    /// The token a client's cached schema record is validated against on a
-    /// read; a client sends 0 when it holds none.
-    pub(in crate::catalog) schema_version: NonZeroU16,
     pub(in crate::catalog) record: CatalogRecord,
     /// The FK edges this relation declares as a child.
     pub(in crate::catalog) fks: Vec<FkEdge>,
@@ -57,16 +53,14 @@ impl CatalogRecord {
 impl RelationEntry {
     pub(in crate::catalog) fn new(pk: &[u32], defs: &[CatalogColumn], fks: Vec<FkEdge>, facts: RelFacts) -> Self {
         RelationEntry {
-            schema_version: NonZeroU16::MIN,
             record: CatalogRecord::new(pk, defs),
             fks,
             facts,
         }
     }
 
-    /// Re-encode the record for a changed column set, under a new version.
+    /// Re-encode the record for a changed column set.
     pub(in crate::catalog) fn reschema(&mut self, pk: &[u32], defs: &[CatalogColumn]) {
-        self.schema_version = self.schema_version.checked_add(1).unwrap_or(NonZeroU16::MIN);
         self.record = CatalogRecord::new(pk, defs);
     }
 }
@@ -98,18 +92,9 @@ impl CatalogEngine {
         check_same_types(seen, current)
     }
 
-    /// The schema record a reply to a client at `client_version` carries, and the
-    /// version its flags report.
-    pub(crate) fn negotiated_schema_block(&self, tid: u64, client_version: u16) -> (Option<Rc<[u8]>>, u16) {
-        let entry = self.relation_entry(tid);
-        let version = entry.schema_version.get();
-        let block = (client_version != version).then(|| entry.record.bytes.clone());
-        (block, version)
-    }
-
-    /// What a RESOLVE of `tid` answers: its descriptor, and its named record with
-    /// that record's version. `None` for an unregistered id.
-    pub(crate) fn resolve_answer(&self, tid: u64) -> Option<(RelDescriptorBlob, Rc<[u8]>, u16)> {
+    /// What a RESOLVE of `tid` answers: its descriptor and its named record.
+    /// `None` for an unregistered id.
+    pub(crate) fn resolve_answer(&self, tid: u64) -> Option<(RelDescriptorBlob, Rc<[u8]>)> {
         let rel = self.registry.relation(tid)?;
         let entry = self.relation_entry(tid);
         let desc = RelDescriptorBlob {
@@ -125,7 +110,7 @@ impl CatalogEngine {
                 })
                 .collect(),
         };
-        Some((desc, entry.record.bytes.clone(), entry.schema_version.get()))
+        Some((desc, entry.record.bytes.clone()))
     }
 }
 

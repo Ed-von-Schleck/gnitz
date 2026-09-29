@@ -2,6 +2,10 @@ use super::*;
 use crate::control::CTRL_HEADER_SIZE;
 use crate::WireConflictMode;
 
+fn rel(tid: u64, reply_layout: u64) -> ScanMultiItem {
+    ScanMultiItem { tid, reply_layout }
+}
+
 fn item(view_id: u64, after_tick: u64, reply_layout: u64) -> DeltaPollItem {
     DeltaPollItem { view_id, after_tick, reply_layout }
 }
@@ -76,7 +80,7 @@ fn the_prologue_carries_only_the_verb() {
             encode_items(ClientVerb::PushTxn, &[family(16, WireConflictMode::Update, 42, &d)]),
             ClientVerb::PushTxn,
         ),
-        (encode_scan_multi(&[(7, 0)]), ClientVerb::ScanMulti),
+        (encode_scan_multi(&[rel(7, 0)]), ClientVerb::ScanMulti),
         (encode_delta_poll(&[item(7, 3, 2)]), ClientVerb::DeltaPoll),
     ];
     for (frame, verb) in frames {
@@ -139,8 +143,8 @@ fn push_txn_roundtrips_families_modes_and_bases() {
 }
 
 #[test]
-fn scan_multi_roundtrips_order_and_versions() {
-    let rels = [(7u64, 0u16), (8, 3), (9, u16::MAX)];
+fn scan_multi_roundtrips_order_and_layouts() {
+    let rels = [rel(7, 0), rel(8, 3), rel(9, u64::MAX)];
     assert_eq!(peeked(&encode_scan_multi(&rels), decode_scan_multi).unwrap(), rels);
 }
 
@@ -175,7 +179,7 @@ fn the_item_rules_are_the_decoders() {
 
     let views = [item(4, 0, 9), item(4, 0, 9)];
     assert_eq!(peeked(&encode_delta_poll(&views), decode_delta_poll).unwrap(), views);
-    let rels = [(4u64, 0u16), (4, 0)];
+    let rels = [rel(4, 0), rel(4, 0)];
     assert_eq!(peeked(&encode_scan_multi(&rels), decode_scan_multi).unwrap(), rels);
 }
 
@@ -193,13 +197,13 @@ fn a_frame_past_its_cap_is_refused_by_the_decoder() {
     let err = peeked(&encode_delta_poll(&over), decode_delta_poll).expect_err("past the cap");
     assert!(err.contains("too many items"), "{err:?}");
 
-    let rels: Vec<(u64, u16)> = (1..=SCAN_MULTI_MAX_RELATIONS as u64).map(|id| (id, 0)).collect();
+    let rels: Vec<ScanMultiItem> = (1..=SCAN_MULTI_MAX_RELATIONS as u64).map(|id| rel(id, 0)).collect();
     assert_eq!(
         peeked(&encode_scan_multi(&rels), decode_scan_multi).unwrap().len(),
         rels.len()
     );
     let mut over = rels.clone();
-    over.push((u64::MAX, 0));
+    over.push(rel(u64::MAX, 0));
     let err = peeked(&encode_scan_multi(&over), decode_scan_multi).expect_err("past the cap");
     assert!(err.contains("too many items"), "{err:?}");
 }
@@ -234,8 +238,8 @@ fn a_truncation_inside_an_item_is_a_decode_error() {
     );
     check(
         "SCAN_MULTI",
-        &encode_scan_multi(&[(7, 0)]),
-        &encode_scan_multi(&[(7, 0), (7, 0)]),
+        &encode_scan_multi(&[rel(7, 0)]),
+        &encode_scan_multi(&[rel(7, 0), rel(7, 0)]),
         decode_scan_multi,
     );
     let v = item(7, 3, 4);
@@ -293,10 +297,10 @@ fn an_item_off_its_verbs_shape_is_refused() {
         }
         let other = ControlHeader {
             flags: WireFlags {
-                verb: if verb == ClientVerb::Scan {
+                verb: if verb == ClientVerb::ScanSpec {
                     ClientVerb::Push
                 } else {
-                    ClientVerb::Scan
+                    ClientVerb::ScanSpec
                 },
                 ..Default::default()
             },
@@ -310,7 +314,10 @@ fn an_item_off_its_verbs_shape_is_refused() {
         let err = decode_items(&one_item(hdr, b"blob", schema, data), verb).expect_err("blob");
         assert!(err.contains("blob"), "{verb:?}: {err}");
     }
-    let err = decode_items(&one_item(ControlHeader::default(), b"", false, false), ClientVerb::Scan)
-        .expect_err("a single-item verb");
+    let err = decode_items(
+        &one_item(ControlHeader::default(), b"", false, false),
+        ClientVerb::ScanSpec,
+    )
+    .expect_err("a single-item verb");
     assert!(err.contains("not a multi-item verb"), "{err}");
 }

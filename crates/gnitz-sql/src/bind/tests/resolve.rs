@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_core::{ColumnDef, TypeCode};
+use gnitz_wire::{ColumnDef, TypeCode};
 
 fn col(name: &str, tc: TypeCode) -> ColumnDef {
     ColumnDef::new(name, tc, false)

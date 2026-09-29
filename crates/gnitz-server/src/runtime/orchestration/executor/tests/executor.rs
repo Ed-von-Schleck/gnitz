@@ -31,8 +31,9 @@ fn stream_push_rejects_error_conflict_mode() {
     assert!(e.contains("conflict mode 'error'"), "got: {e}");
 }
 
-use gnitz_core::protocol::types::{BatchAppender, ColumnDef, Schema, TypeCode, ZSetBatch};
-use gnitz_core::protocol::{encode_push_txn, PushFamily};
+use gnitz_core::{encode_push_txn, PushFamily};
+use gnitz_core::{BatchAppender, Schema, ZSetBatch};
+use gnitz_wire::{ColumnDef, TypeCode};
 
 /// A catalog holding `public.t1` and `public.t2`, both `(id U64 PK, v I64)`.
 fn two_table_catalog() -> (tempfile::TempDir, CatalogEngine, [u64; 2]) {

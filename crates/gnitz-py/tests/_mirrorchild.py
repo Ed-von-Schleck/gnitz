@@ -13,7 +13,7 @@ import sys
 import time
 
 import gnitz
-from _read import rows
+from _read import rows, scanned
 
 READY = "MIRROR-CHILD-READY"
 
@@ -46,7 +46,7 @@ def erase():
     [vid] = m.mirrored_ids()
     assert m.mirrors(vid) is False
     assert rows(m, sn, "SELECT * FROM f"), "a read the copy cannot answer is delegated"
-    assert len(m.scan(vid)) > 0, "and so is a scan of it"
+    assert scanned(m, sn, "f"), "and so is a scan of it"
     assert rows(m, sn, "SELECT * FROM t")
 
     # The copy goes, the directory is released, and the client can attach again;
@@ -70,6 +70,7 @@ def panic():
     m = gnitz.connect(target)
     m.mirror_at(base)
     vid = m.mirror_view(sn, "f").view_id
+    f_schema = m.resolve_table(sn, "f")[1]
     assert m.mirrors(vid), "the bootstrap succeeds; the seam fires on a poll"
 
     _churn(m, sn, 61, 120)
@@ -84,7 +85,7 @@ def panic():
     # The copy is still gated in, so these are reads it would have answered.
     assert m.mirrors(vid)
     for call in (lambda: m.execute_sql("SELECT * FROM f", schema_name=sn),
-                 lambda: m.scan(vid)):
+                 lambda: m.scan(vid, f_schema)):
         try:
             call()
             raise SystemExit("a poisoned copy must refuse the reads it would answer")

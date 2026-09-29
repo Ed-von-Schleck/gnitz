@@ -97,7 +97,7 @@ def test_a_push_decoded_before_an_alter_is_refused(dedicated_server):
             join_or_fail("the held push never returned", th)
 
         assert "err" in outcome, f"the racing push committed at LSN {outcome.get('lsn')}"
-        assert bag(client.scan(tid)) == {}
+        assert bag(scanned(client, "s", "t")) == {}
 
 
 @pytest.mark.parametrize("body, row", [
@@ -176,4 +176,4 @@ def test_a_drop_does_not_race_a_worker_still_creating_the_table(seamed_server):
         client.drop_table("s", f"t{i}")
     tid = client.create_table("s", "t", KV)
     client.push(tid, gnitz.ZSetBatch(KV).append(pk=1, val=1))
-    assert bag(client.scan(tid)) == {(1, 1): 1}
+    assert bag(client.scan(tid, KV)) == {(1, 1): 1}

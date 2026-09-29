@@ -35,7 +35,7 @@ _VIOLATION = "[Uu]nique index violation"
 
 def _has_index(client, sn, table="t"):
     """True if any live IdxTab row names `table` as its owner."""
-    batch = client.scan(gnitz.IDX_TAB)
+    batch = client.scan(gnitz.IDX_TAB, gnitz.sys_schema(gnitz.IDX_TAB))
     tid, _ = client.resolve_table(sn, table)
     return any(r._weight > 0 and r.owner_id == tid for r in batch)
 
@@ -418,7 +418,7 @@ def test_a_write_is_validated_against_its_fold(client, schema_name, via, committ
         final = committed
     else:
         run()
-    assert bag(client.scan(tid)) == dict.fromkeys(final, 1)
+    assert bag(client.scan(tid, schema)) == dict.fromkeys(final, 1)
 
 
 def test_bulk_colliding_fresh_pks_rejected(client, schema_name):
@@ -432,7 +432,7 @@ def test_bulk_colliding_fresh_pks_rejected(client, schema_name):
     client.push(tid, gnitz.ZSetBatch(schema).extend([{"pk": p, "val": v} for p, v in committed]))
     with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
         client.push(tid, gnitz.ZSetBatch(schema).extend([{"pk": n + i, "val": i} for i in range(n)]))
-    assert bag(client.scan(tid)) == dict.fromkeys(committed, 1)
+    assert bag(client.scan(tid, schema)) == dict.fromkeys(committed, 1)
 
 
 _UNIQUE_A = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT UNIQUE)"

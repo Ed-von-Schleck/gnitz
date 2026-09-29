@@ -9,12 +9,13 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
-use gnitz_core::{ColumnDef, DeltaCursor, Invalidate, MirrorError, MirrorStore, RawBlock, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RawBlock, Schema, ZSetBatch};
 use gnitz_mirror::Mirror;
 use gnitz_store::storage::Batch;
 use gnitz_store_testkit::{
     assert_child_ok, in_child_test, make_batch, make_schema_u64_i64, run_test_in_child, scratch_dir, CHILD_OK,
 };
+use gnitz_wire::{ColumnDef, TypeCode};
 use gnitz_wire::{ReadBound, ReadSpec};
 
 #[path = "support/common.rs"]

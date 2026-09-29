@@ -1,5 +1,5 @@
 use crate::mirror::MirrorError;
-use crate::protocol::ProtocolError;
+use crate::ProtocolError;
 use gnitz_wire::WireFault;
 use std::fmt;
 use std::sync::Arc;

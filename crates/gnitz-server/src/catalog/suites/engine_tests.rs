@@ -258,7 +258,7 @@ fn test_ingest_scan_seek_family() {
     engine.registry.checkpoint_base().unwrap();
 
     // Scan
-    let scan_batch = engine.scan(tid).unwrap();
+    let scan_batch = scan_all(&mut engine, tid);
     assert_eq!(scan_batch.len(), 3);
 
     // Point read, present
@@ -322,7 +322,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     engine.registry.checkpoint_base().unwrap();
 
     // Scan — should have exactly 1 row with val=200
-    let scan = engine.scan(tid).unwrap();
+    let scan = scan_all(&mut engine, tid);
     assert_eq!(scan.len(), 1);
     assert_eq!(scan.get_pk(0), 1);
     assert_eq!(payload_u64(&*scan, 0, 0), 200, "the later write must win the PK");
@@ -647,7 +647,7 @@ fn test_circuit_table_surface_introspectable() {
 
     // The new schema is SQL-introspectable — `SELECT * FROM CircuitNodes`
     // must return what we just inserted (full-scan path, used by SQL planner).
-    let scan = engine.scan(gnitz_wire::CIRCUIT_NODES_TAB).unwrap();
+    let scan = scan_all(&mut engine, gnitz_wire::CIRCUIT_NODES_TAB);
     assert_eq!(scan.len(), 1, "scan must expose CircuitNodes rows");
 
     // Compound PK: a point read by the 16-byte at-rest `(view_id, node_id)` OPK region.

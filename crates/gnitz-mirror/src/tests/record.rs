@@ -1,6 +1,7 @@
 //! The record codec: what a round trip preserves, and what bytes it refuses.
 
-use gnitz_core::{ColumnDef, Schema, TypeCode};
+use gnitz_core::Schema;
+use gnitz_wire::{ColumnDef, TypeCode};
 
 use super::*;
 

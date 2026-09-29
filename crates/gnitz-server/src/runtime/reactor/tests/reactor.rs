@@ -20,7 +20,7 @@ fn a_lease_routes_its_id_until_dropped() {
         vec![acks.id()]
     );
 
-    let train = r.lease_train(WorkerSet::one(1), SalMessageKind::Scan);
+    let train = r.lease_train(WorkerSet::one(1), SalMessageKind::ScanSpec);
     assert_eq!(train.id(), acks.id() + 1, "the next lease takes the next id");
     assert_eq!(train.workers().iter().collect::<Vec<_>>(), vec![1]);
     assert_eq!(
@@ -104,7 +104,7 @@ fn lease_ids_wrap_past_zero_and_skip_live_ids() {
     assert_eq!(wrapped.id(), 1, "the id after u32::MAX is 1, not 0");
 
     r.inner.next_request_id.set(1);
-    let skipped = r.lease_train(WorkerSet::ALL, SalMessageKind::Scan);
+    let skipped = r.lease_train(WorkerSet::ALL, SalMessageKind::ScanSpec);
     assert_eq!(skipped.id(), 2, "a live lease's id is skipped");
 }
 

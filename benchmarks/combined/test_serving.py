@@ -82,7 +82,7 @@ def test_serving_natural(client, socket_path, schema_name, bench_timer, scale_mo
 
     def reader_fn(conn, deadline):
         o_tid, o_sch = conn.resolve_table(sn, "o")
-        vid, _ = conn.resolve_table(sn, "rev")
+        vid, v_sch = conn.resolve_table(sn, "rev")
         mygroup = READER_GROUP_BASE + (os.getpid() % 5_000_000)
         pk = PK_BASE + os.getpid() * 100_000_000
         total = ops = stale = 0
@@ -92,7 +92,7 @@ def test_serving_natural(client, socket_path, schema_name, bench_timer, scale_mo
             pk += 1
             total += 1
             start = time.perf_counter()
-            res = conn.seek(vid, mygroup)
+            res = conn.seek(vid, v_sch, mygroup)
             lat.append((time.perf_counter() - start) * 1000.0)
             rows = [r for r in res if r._weight > 0]
             if len(rows) != 1 or rows[0].s != total:
@@ -112,14 +112,14 @@ def test_serving_passthrough(client, socket_path, schema_name, bench_timer, scal
 
     def reader_fn(conn, deadline):
         o_tid, o_sch = conn.resolve_table(sn, "o")
-        vid, _ = conn.resolve_table(sn, "passthru")
+        vid, v_sch = conn.resolve_table(sn, "passthru")
         pk = PK_BASE + os.getpid() * 100_000_000
         ops = stale = 0
         lat = []
         while time.perf_counter() < deadline:
             push_one(conn, o_tid, o_sch, pk=pk, cust=1, amt=pk % 1000)  # the reader's own write
             start = time.perf_counter()
-            res = conn.seek(vid, pk)
+            res = conn.seek(vid, v_sch, pk)
             lat.append((time.perf_counter() - start) * 1000.0)
             rows = [r for r in res if r._weight > 0]
             if len(rows) != 1 or rows[0].pk != pk:

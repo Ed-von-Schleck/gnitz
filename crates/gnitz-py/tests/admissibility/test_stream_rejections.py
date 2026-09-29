@@ -30,10 +30,10 @@ def test_no_binary_read_verb_serves_a_stream(streamed):
     conn, sn = streamed
     tid, schema = conn.resolve_table(sn, "s")
     for verb in (
-        lambda: conn.scan(tid),
-        lambda: conn.seek(tid, 1),
+        lambda: conn.scan(tid, schema),
+        lambda: conn.seek(tid, schema, 1),
         lambda: conn.seek_by_index(tid, schema, [1], [0]),
-        lambda: conn.scan_many([tid]),
+        lambda: conn.scan_many([(tid, schema)]),
         lambda: conn.delta_bootstrap(tid, schema),
     ):
         with pytest.raises(gnitz.GnitzError, match="stream"):
@@ -51,4 +51,4 @@ def test_a_transaction_writing_a_stream_is_refused_whole(streamed):
         with conn.transaction() as txn:
             txn.push(t_tid, gnitz.ZSetBatch(t_schema).extend([{"id": 1, "kind": 1}]))
             txn.push(s_tid, gnitz.ZSetBatch(s_schema).extend([{"id": 2, "kind": 2, "amount": 2}]))
-    assert bag(conn.scan(t_tid)) == {}, "the table's write must be refused with it"
+    assert bag(conn.scan(t_tid, t_schema)) == {}, "the table's write must be refused with it"

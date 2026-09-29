@@ -95,7 +95,7 @@ def test_a_view_tracks_its_base_under_sustained_ingest_with_scans(checkpoint_ser
          gnitz.connect(checkpoint_server) as scanner:
         sn, tid, schema = _setup(pusher)
         pusher.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t", schema_name=sn)
-        vid, _ = pusher.resolve_table(sn, "v")
+        vid, v_schema = pusher.resolve_table(sn, "v")
 
         n_batches, batch_size = 40, 300   # 300 < TICK_COALESCE_ROWS: no auto-tick
         errors = []
@@ -105,7 +105,7 @@ def test_a_view_tracks_its_base_under_sustained_ingest_with_scans(checkpoint_ser
             started.wait(timeout=START_TIMEOUT)
             try:
                 for _ in range(30):
-                    scanner.scan(vid)
+                    scanner.scan(vid, v_schema)
             except Exception as exc:
                 errors.append(("scan", exc))
 
@@ -122,8 +122,8 @@ def test_a_view_tracks_its_base_under_sustained_ingest_with_scans(checkpoint_ser
 
 @pytest.mark.parametrize("probe", ["seek", "scan"])
 def test_a_fanout_read_does_not_hang_during_a_checkpoint(probe, checkpoint_server):
-    """SEEK (single_worker_async) and SCAN (dispatch_fanout) each write their own
-    SAL group. Writing it without holding the SAL writer lets a request that
+    """A keyed read (routed to one worker) and a full read (fanned out) each
+    write their own SAL group. Writing it without holding the SAL writer lets a request that
     arrives in the Flush ACK-wait window use the old epoch, which every worker
     skips — and the read never returns."""
     with gnitz.connect(checkpoint_server) as pusher, \
@@ -134,7 +134,7 @@ def test_a_fanout_read_does_not_hang_during_a_checkpoint(probe, checkpoint_serve
             schema_name=sn)
         pusher.execute_sql("INSERT INTO target VALUES (1, 10), (42, 999)",
                            schema_name=sn)
-        target, _ = pusher.resolve_table(sn, "target")
+        target, target_schema = pusher.resolve_table(sn, "target")
 
         errors = []
         started = threading.Event()
@@ -144,10 +144,10 @@ def test_a_fanout_read_does_not_hang_during_a_checkpoint(probe, checkpoint_serve
             try:
                 for _ in range(40):
                     if probe == "seek":
-                        assert bag(reader.seek(target, pk=42), "pk", "val") == \
+                        assert bag(reader.seek(target, target_schema, pk=42), "pk", "val") == \
                             {(42, 999): 1}
                     else:
-                        assert bag(reader.scan(target), "pk", "val") == \
+                        assert bag(reader.scan(target, target_schema), "pk", "val") == \
                             {(1, 10): 1, (42, 999): 1}
             except Exception as exc:
                 errors.append((probe, exc))
@@ -215,5 +215,4 @@ def test_a_view_created_over_committed_data_survives_a_checkpoint_window(checkpo
             schema_name="ckv")
     conn.execute_sql("CREATE VIEW v AS SELECT g, COUNT(*) AS c FROM t GROUP BY g",
                      schema_name="ckv")
-    vid, _ = conn.resolve_table("ckv", "v")
-    assert bag(conn.scan(vid), "g", "c") == {(g, n // 10): 1 for g in range(10)}
+    assert bag(scanned(conn, "ckv", "v"), "g", "c") == {(g, n // 10): 1 for g in range(10)}

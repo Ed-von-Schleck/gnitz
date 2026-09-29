@@ -2,9 +2,9 @@
 //! by seek keys, written cells and VM comparisons alike.
 
 use crate::ir::{BExpr, NumLit};
-use gnitz_core::{ColType, FixedInt, TypeCode};
 use gnitz_expr::calendar::MICROS_PER_DAY;
 use gnitz_wire::decimal::parse_decimal_text;
+use gnitz_wire::{ColType, FixedInt, TypeCode};
 
 /// A DATE/TIMESTAMP spelling as the integer a column of type `tc` stores; `None`
 /// for text that spells no such value, and for any other type.

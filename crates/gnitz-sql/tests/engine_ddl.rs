@@ -6,13 +6,16 @@
 
 mod common;
 use common::*;
-use gnitz_core::{ClientError, GnitzClient, SchemaFacts, TypeCode, WireFault, WireStatus};
+use gnitz_core::{ClientError, GnitzClient};
+use gnitz_expr::SchemaFacts;
 use gnitz_sql::{GnitzSqlError, SqlResult};
+use gnitz_wire::{TypeCode, WireFault, WireStatus};
 
 /// `Some(is_unique)` of the single-column index on `table.col`, `None` when the
 /// column carries no index.
 fn unique_on(client: &mut GnitzClient, sn: &str, table: &str, col: &str) -> Option<bool> {
-    let (tid, schema) = client.resolve_table_or_view_id(sn, table).unwrap();
+    let rel = client.resolve_relation(sn, table).unwrap();
+    let (tid, schema) = (rel.tid, rel.schema.clone());
     let want = [col_idx(&schema, col) as u32];
     client
         .describe_by_id(tid)
@@ -126,7 +129,7 @@ fn pk_admission_matrix() {
     ];
     for &(sql, table, pk_indices, stride, tcs, names) in accepted {
         exec(&mut client, &sn, sql);
-        let s = client.resolve_table_or_view_id(&sn, table).unwrap().1;
+        let s = client.resolve_relation(&sn, table).unwrap().schema.clone();
         assert_eq!(s.pk_cols, pk_indices, "{table}");
         assert_eq!(s.pk_stride(), stride, "{table}");
         for ((&pi, &tc), &name) in pk_indices.iter().zip(tcs).zip(names) {
@@ -196,7 +199,7 @@ fn fk_child_adopts_the_parent_pk_type() {
         &sn,
         "CREATE TABLE child (cid INT PRIMARY KEY, p_id INT REFERENCES parent(id))",
     );
-    let s = client.resolve_table_or_view_id(&sn, "child").unwrap().1;
+    let s = client.resolve_relation(&sn, "child").unwrap().schema.clone();
     let fk = &s.columns[col_idx(&s, "p_id")];
     assert_eq!(fk.ty.tc, TypeCode::I64);
     let err = try_exec(&mut client, &sn, "INSERT INTO child VALUES (1, 99)").unwrap_err();
@@ -289,7 +292,7 @@ fn inline_unique_matrix() {
         assert_rejects_variant(&mut client, &sn, sql, variant, needle);
     }
     assert!(
-        client.resolve_table_or_view_id(&sn, "ux").is_err(),
+        client.resolve_relation(&sn, "ux").is_err(),
         "a rejected table is not created"
     );
 }
@@ -308,7 +311,7 @@ fn relation_names_are_case_insensitive() {
         "already exists",
     );
     exec(&mut client, &sn, "DROP TABLE fOO");
-    assert!(client.resolve_table_or_view_id(&sn, "foo").is_err());
+    assert!(client.resolve_relation(&sn, "foo").is_err());
 }
 
 /// Every SQL surface reports an absent relation as the one classified `NotFound`,
@@ -664,7 +667,7 @@ fn a_multi_name_drop_is_one_atomic_zone() {
 
     // `b` is read by a view, so its drop refuses — and `a` survives with it.
     assert_rejects_variant(&mut client, &sn, "DROP TABLE a, b", "Client", "View dependency");
-    assert!(client.resolve_table_or_view_id(&sn, "a").is_ok(), "a is untouched");
+    assert!(client.resolve_relation(&sn, "a").is_ok(), "a is untouched");
 
     // Two `-1`s on one catalog PK is not a retraction the engine accepts.
     assert_rejects_variant(&mut client, &sn, "DROP TABLE a, A", "Rejected", "named more than once");
@@ -672,13 +675,13 @@ fn a_multi_name_drop_is_one_atomic_zone() {
     // A FK child co-dropped in the same batch is self-resolving, so the pair
     // drops in either written order.
     exec(&mut client, &sn, "DROP TABLE parent, child");
-    assert!(client.resolve_table_or_view_id(&sn, "parent").is_err());
-    assert!(client.resolve_table_or_view_id(&sn, "child").is_err());
+    assert!(client.resolve_relation(&sn, "parent").is_err());
+    assert!(client.resolve_relation(&sn, "child").is_err());
 
     exec(&mut client, &sn, "DROP VIEW keeper");
     exec(&mut client, &sn, "DROP TABLE a, b");
-    assert!(client.resolve_table_or_view_id(&sn, "a").is_err());
-    assert!(client.resolve_table_or_view_id(&sn, "b").is_err());
+    assert!(client.resolve_relation(&sn, "a").is_err());
+    assert!(client.resolve_relation(&sn, "b").is_err());
 }
 
 /// A qualifier naming the session schema is accepted; any other is a cross-schema

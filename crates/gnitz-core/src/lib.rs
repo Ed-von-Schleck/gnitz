@@ -5,38 +5,32 @@
 //! `src/tests/` holds those; the crate-root `tests/` beside `src/` is the
 //! integration suite, gated on the `integration` feature.
 
-pub mod client;
-pub mod connection;
-pub mod error;
-pub mod mirror;
-pub mod protocol;
+mod client;
+mod connection;
+mod error;
+mod mirror;
+mod protocol;
 #[cfg(test)]
 mod test_support;
-pub mod types;
 
-// The crate prelude: the names a client of gnitz-core names by hand. Every
-// module is `pub`, so anything omitted here is still reachable by its own path —
-// this list carries no meaning beyond "spelled often enough to be worth
-// shortening".
 pub use client::{
-    key_reply, not_found, qualified_name, retraction_batch, segment_id, DeltaCursor, GnitzClient, InlineForeignKey,
+    key_reply, not_found, qualified_name, retraction_batch, segment_id, GnitzClient, InlineForeignKey,
     InlineUniqueIndex, ParkHook, PlannedView, ViewBundle, MAX_CHAIN_SEGMENTS, RMW_MAX_ATTEMPTS,
 };
 pub use connection::{
-    Completions, IdRun, Interest, RawBlock, RelDescriptor, RelTarget, Reply, Request, ScanReply, Session, SlotId,
-    MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
+    Completions, DeltaCursor, IdRun, Interest, RawBlock, RelDescriptor, RelTarget, Reply, Request, ScanReply,
+    ScanResult, Session, SlotId, MAX_IN_FLIGHT,
 };
 pub use error::ClientError;
-pub use gnitz_expr::{ColumnTable, SchemaFacts};
-pub use gnitz_wire::{
-    validate_dist_prefix, PkColList, ReindexSlot, RelClass, RelIndex, TableProps, ViewProps, FIRST_USER_TABLE_ID,
-    TABLE_TAB,
-};
-pub use gnitz_wire::{Circuit, NodeId, NullKeys, OpNode, RangeRel, ReindexRole};
-pub use gnitz_wire::{WireFault, WireStatus};
 pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult};
-pub use protocol::{
-    push_zero_cell, BatchAppender, ColType, ColumnDef, FixedInt, FkTarget, PayloadColumn, PkBuf, PkColumn,
-    ProtocolError, ScalarKind, Schema, TypeCode, WireConflictMode, ZSetBatch, MAX_COLUMNS, MAX_PK_BYTES,
-    PK_LIST_MAX_COLS,
+pub use protocol::error::ProtocolError;
+pub use protocol::message::{encode_ddl_txn, encode_frame, encode_push_txn, PushFamily};
+pub use protocol::types::{
+    push_zero_cell, sys_schema, BatchAppender, BatchMark, FkTarget, PayloadColumn, PkColumn, Schema, ZSetBatch,
 };
+pub use protocol::wal_block::decode_regions_into;
+// Public to the `integration` suite alone.
+#[cfg(any(test, feature = "integration"))]
+pub use protocol::transport::{hello_handshake, ClientTransport};
+#[cfg(not(any(test, feature = "integration")))]
+pub(crate) use protocol::transport::{hello_handshake, ClientTransport};

@@ -148,7 +148,7 @@ impl JoinClass {
         // Past the arity cap an ON comparison still claims its slot, so the cap's
         // error reports the count written; a filter comparison stays a filter.
         let fits = origin == Origin::On
-            || self.eq.len() + 1 + usize::from(self.range.is_some()) <= gnitz_core::PK_LIST_MAX_COLS;
+            || self.eq.len() + 1 + usize::from(self.range.is_some()) <= gnitz_wire::PK_LIST_MAX_COLS;
         if !(slot && fits) {
             return Ok(Some(conj));
         }

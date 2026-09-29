@@ -32,10 +32,10 @@ def test_view_scan(client, schema_name, bench_timer, scale_mode):
     tid, schema = client.resolve_table(sn, "t")
     push_stream(client, tid, schema,
                 lambda b, k: b.append(pk=k + 1, g=k % NGROUP, v=(k * 7) % 1000), sz["base"])
-    vid, _ = client.resolve_table(sn, "v")
+    vid, v_sch = client.resolve_table(sn, "v")
     for _ in range(_reads(scale_mode)):
-        bench_timer.measure(client.scan, vid, rows_per_call=NGROUP)
-    assert len(client.scan(vid)) > 0
+        bench_timer.measure(client.scan, vid, v_sch, rows_per_call=NGROUP)
+    assert len(client.scan(vid, v_sch)) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -53,14 +53,14 @@ def test_view_seek_natural(client, schema_name, bench_timer, scale_mode):
     push_stream(client, tid, schema,
                 lambda b, k: b.append(pk=k + 1, cust=(k % NGROUP) + 1, amt=(k * 3) % 1000),
                 sz["base"])
-    vid, _ = client.resolve_table(sn, "v")
+    vid, v_sch = client.resolve_table(sn, "v")
     next_pk = sz["base"] + 1
     hot = 1
     for _ in range(_reads(scale_mode)):
         push_one(client, tid, schema, pk=next_pk, cust=hot, amt=1)  # RYOW write
         next_pk += 1
-        bench_timer.measure(client.seek, vid, hot, rows_per_call=1)
-    assert len(client.seek(vid, hot)) == 1
+        bench_timer.measure(client.seek, vid, v_sch, hot, rows_per_call=1)
+    assert len(client.seek(vid, v_sch, hot)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -74,14 +74,14 @@ def test_view_passthrough_seek(client, schema_name, bench_timer, scale_mode):
     client.execute_sql("CREATE VIEW v AS SELECT * FROM t WHERE v >= 0", schema_name=sn)
     tid, schema = client.resolve_table(sn, "t")
     push_stream(client, tid, schema, lambda b, k: b.append(pk=k + 1, v=(k * 5) % 1000), sz["base"])
-    vid, _ = client.resolve_table(sn, "v")
+    vid, v_sch = client.resolve_table(sn, "v")
     next_pk = sz["base"] + 1
     for _ in range(_reads(scale_mode)):
         push_one(client, tid, schema, pk=next_pk, v=1)  # RYOW write
         pk = next_pk
         next_pk += 1
-        bench_timer.measure(client.seek, vid, pk, rows_per_call=1)
-    assert len(client.seek(vid, sz["base"])) == 1
+        bench_timer.measure(client.seek, vid, v_sch, pk, rows_per_call=1)
+    assert len(client.seek(vid, v_sch, sz["base"])) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -149,10 +149,10 @@ def _scan_many_n(client, sn, bench_timer, sz, reads, nviews):
     tid, schema = client.resolve_table(sn, "t")
     push_stream(client, tid, schema,
                 lambda b, k: b.append(pk=k + 1, g=k % NGROUP, v=(k * 7) % 1000), sz["base"])
-    vids = [client.resolve_table(sn, f"v{i}")[0] for i in range(nviews)]
+    views = [client.resolve_table(sn, f"v{i}") for i in range(nviews)]
     for _ in range(reads):
-        bench_timer.measure(client.scan_many, vids, rows_per_call=NGROUP * nviews)
-    assert all(len(r) > 0 for r in client.scan_many(vids))
+        bench_timer.measure(client.scan_many, views, rows_per_call=NGROUP * nviews)
+    assert all(len(r) > 0 for r in client.scan_many(views))
 
 
 def test_scan_many_2(client, schema_name, bench_timer, scale_mode):

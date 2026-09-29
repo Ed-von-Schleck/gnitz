@@ -9,7 +9,8 @@ use super::{keyed_frame, resolve_reduce_specs, ReduceSpecs};
 use crate::codec::project_schema::{compute_map, payload_program};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr};
-use gnitz_core::{ColumnDef, Schema};
+use gnitz_core::Schema;
+use gnitz_wire::ColumnDef;
 use gnitz_wire::{AggReadSpec, ComputeMap};
 use std::sync::Arc;
 

@@ -6,18 +6,37 @@
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
-use gnitz_core::protocol::{encode_frame, hello_handshake, ClientTransport, ClientVerb, WireFlags, WireStatus};
+use gnitz_core::{encode_frame, hello_handshake, ClientTransport};
+use gnitz_expr::SchemaFacts;
 use gnitz_foundation::posix_io::set_sockopt_int;
 use gnitz_wire::control::{peek_control_block, ControlHeader};
+use gnitz_wire::{ClientVerb, ReadBound, ReadSpec, WireFlags, WireStatus};
 
-/// One control-only frame, blocking until it is on the wire.
-fn send_control(t: &mut ClientTransport, target_id: u64, flags: WireFlags) -> Result<(), gnitz_core::ProtocolError> {
-    let hdr = ControlHeader { flags, target_id, ..Default::default() };
-    t.send_frame(encode_frame(hdr, &[], None, None), None)
+/// A raw read of every row of `target_id` in `schema`'s layout, blocking until
+/// it is on the wire.
+fn send_scan(t: &mut ClientTransport, target_id: u64, schema: &Schema) -> Result<(), gnitz_core::ProtocolError> {
+    let hdr = ControlHeader {
+        target_id,
+        arg0: schema.layout_digest(),
+        ..Default::default()
+    };
+    let spec = ReadSpec::all_rows(ReadBound::None).encode();
+    t.send_frame(encode_frame(hdr, &spec, None, None), None)
 }
-use gnitz_core::TableProps;
-use gnitz_core::{ColumnDef, GnitzClient, PkColumn, Schema, TypeCode, WireConflictMode, ZSetBatch};
+
+/// Every row of `tid`, decoded under `schema`.
+fn scan_all(
+    client: &mut GnitzClient,
+    tid: u64,
+    schema: &std::sync::Arc<Schema>,
+) -> Result<ZSetBatch, gnitz_core::ClientError> {
+    let spec = ReadSpec::all_rows(ReadBound::None);
+    Ok(client.scan_spec(tid, &spec, schema)?.batch)
+}
+use gnitz_core::{GnitzClient, PkColumn, Schema, ZSetBatch};
 use gnitz_test_harness::{unique_schema, ServerHandle};
+use gnitz_wire::TableProps;
+use gnitz_wire::{ColumnDef, TypeCode, WireConflictMode};
 
 /// `(client, schema_name, table_id, schema)` for a fresh `(pk BIGINT, a
 /// BIGINT, b BIGINT)` table reachable via `target`.
@@ -40,8 +59,8 @@ fn client_with_table(target: &str) -> (GnitzClient, String, u64, std::sync::Arc<
             &[],
         )
         .unwrap();
-    let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
-    (client, sn, tid, schema)
+    let desc = client.resolve_relation(&sn, "t").unwrap();
+    (client, sn, desc.tid, std::sync::Arc::clone(&desc.schema))
 }
 
 /// Ship one PUSH frame over a raw transport, bypassing `Session` — these tests
@@ -52,7 +71,7 @@ fn send_push(
     flags: WireFlags,
     schema: &Schema,
     batch: &ZSetBatch,
-) -> Result<(), gnitz_core::protocol::ProtocolError> {
+) -> Result<(), gnitz_core::ProtocolError> {
     let hdr = ControlHeader {
         flags,
         target_id: tid,
@@ -200,19 +219,23 @@ fn push_scan_roundtrip_over_tls() {
     let srv = ServerHandle::start_tls(4);
     let (mut client, _sn, tid, schema) = client_with_table(&srv.tls_target());
 
-    client.push(tid, &schema, &make_batch(&schema, 0, 1_000)).unwrap();
+    client
+        .push(tid, &schema, &make_batch(&schema, 0, 1_000), WireConflictMode::Update)
+        .unwrap();
     // Retract one row (weight -1) so the scan proves net weights, not just
     // row presence.
     let mut retract = make_batch(&schema, 500, 1);
     retract.weights = vec![-1];
-    client.push(tid, &schema, &retract).unwrap();
+    client.push(tid, &schema, &retract, WireConflictMode::Update).unwrap();
 
-    let batch = client.scan(tid).unwrap().batch;
+    let batch = scan_all(&mut client, tid, &schema).unwrap();
     assert_eq!(batch.len(), 999, "1000 inserts − 1 retraction");
     assert!(batch.weights.iter().all(|&w| w == 1), "all net weights must be +1");
-    // Spot-check payload integrity via a seek.
-    let row = client.seek(tid, &123u64.to_le_bytes()).unwrap().batch;
-    assert_eq!(row.len(), 1, "seek must find pk=123");
+    // Spot-check payload integrity via a keyed read.
+    let key = PkColumn::from_natives(&schema, [123]);
+    let spec = ReadSpec::all_rows(ReadBound::PkSet(key.keys()));
+    let row = client.scan_spec(tid, &spec, &schema).unwrap().batch;
+    assert_eq!(row.len(), 1, "the keyed read must find pk=123");
     {
         let bytes = &row.payload[0].bytes;
         assert_eq!(i64::from_le_bytes(bytes[0..8].try_into().unwrap()), 369);
@@ -228,9 +251,11 @@ fn big_push_and_multiframe_scan() {
 
     // ~16 MB in one push frame (700k rows × 24 B payload)...
     let count = 700_000;
-    client.push(tid, &schema, &make_batch(&schema, 0, count)).unwrap();
+    client
+        .push(tid, &schema, &make_batch(&schema, 0, count), WireConflictMode::Update)
+        .unwrap();
     // ...and a scan whose train spans many worker frames.
-    let batch = client.scan(tid).unwrap().batch;
+    let batch = scan_all(&mut client, tid, &schema).unwrap();
     assert_eq!(batch.len(), count);
 }
 
@@ -242,15 +267,23 @@ fn unix_and_tls_clients_share_a_table() {
     let (mut tls_client, sn, tid, schema) = client_with_table(&srv.tls_target());
     let mut unix_client = GnitzClient::connect(srv.sock_path()).unwrap();
 
-    tls_client.push(tid, &schema, &make_batch(&schema, 0, 100)).unwrap();
-    let (utid, uschema) = unix_client.resolve_table_or_view_id(&sn, "t").unwrap();
+    tls_client
+        .push(tid, &schema, &make_batch(&schema, 0, 100), WireConflictMode::Update)
+        .unwrap();
+    let udesc = unix_client.resolve_relation(&sn, "t").unwrap();
+    let (utid, uschema) = (udesc.tid, std::sync::Arc::clone(&udesc.schema));
     assert_eq!(utid, tid);
     unix_client
-        .push(utid, &uschema, &make_batch(&uschema, 100, 100))
+        .push(
+            utid,
+            &uschema,
+            &make_batch(&uschema, 100, 100),
+            WireConflictMode::Update,
+        )
         .unwrap();
 
-    assert_eq!(tls_client.scan(tid).unwrap().batch.len(), 200);
-    assert_eq!(unix_client.scan(utid).unwrap().batch.len(), 200);
+    assert_eq!(scan_all(&mut tls_client, tid, &schema).unwrap().len(), 200);
+    assert_eq!(scan_all(&mut unix_client, utid, &uschema).unwrap().len(), 200);
 }
 
 // ── 6. wire-version mismatch HELLO ─────────────────────────────────────────
@@ -273,14 +306,17 @@ fn wire_version_mismatch_is_refused() {
 fn restart_same_port_fails_fast_then_reconnects() {
     let mut srv = ServerHandle::start_tls(1);
     let target = srv.tls_target();
-    let (mut client, _sn, tid, _schema) = client_with_table(&target);
+    let (mut client, _sn, tid, schema) = client_with_table(&target);
 
     srv.restart();
 
     // The old client's next call must fail fast (EOF/RST-derived), well
     // under 5 s — no timeout machinery involved.
     let t0 = Instant::now();
-    assert!(client.scan(tid).is_err(), "stale connection must error after restart");
+    assert!(
+        scan_all(&mut client, tid, &schema).is_err(),
+        "stale connection must error after restart"
+    );
     assert!(
         t0.elapsed() < Duration::from_secs(5),
         "stale-connection error must be immediate, took {:?}",
@@ -323,7 +359,7 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
             send_push(&mut t, tid, push_flags, &schema, &batch).unwrap();
         }
         // The scan whose response (~18 MB) exceeds the shrunken buffers.
-        send_control(&mut t, tid, WireFlags::default()).unwrap();
+        send_scan(&mut t, tid, &schema).unwrap();
 
         // Now read everything: n ACKs, then the scan train.
         for _ in 0..n_pushes {
@@ -374,7 +410,12 @@ fn inbound_cap_breach_closes_stalled_connection() {
         // Enough rows that the scan train exceeds the shrunken buffers.
         for block in 0..8u64 {
             setup
-                .push(tid, &schema, &make_batch(&schema, block * 25_000, 25_000))
+                .push(
+                    tid,
+                    &schema,
+                    &make_batch(&schema, block * 25_000, 25_000),
+                    WireConflictMode::Update,
+                )
                 .unwrap();
         }
 
@@ -383,7 +424,7 @@ fn inbound_cap_breach_closes_stalled_connection() {
         hello_handshake(&mut t, None).unwrap();
         // Ask for the scan, then never read: the train stalls, pinning
         // connection_loop in its guarded send.
-        send_control(&mut t, tid, WireFlags::default()).unwrap();
+        send_scan(&mut t, tid, &schema).unwrap();
 
         // Pipeline ~80 MB of pushes past the 64 MiB cap; the breach discards
         // them unapplied. Each duplicates block 0, so the scan below holds regardless.
@@ -406,7 +447,7 @@ fn inbound_cap_breach_closes_stalled_connection() {
         );
 
         // The cluster keeps serving other clients.
-        assert_eq!(setup.scan(tid).unwrap().batch.len(), 200_000);
+        assert_eq!(scan_all(&mut setup, tid, &schema).unwrap().len(), 200_000);
     });
 }
 
@@ -422,14 +463,19 @@ fn stalled_scan_client_is_evicted_by_send_deadline() {
         let (mut setup, _sn, tid, schema) = client_with_table(&target);
         for block in 0..8u64 {
             setup
-                .push(tid, &schema, &make_batch(&schema, block * 25_000, 25_000))
+                .push(
+                    tid,
+                    &schema,
+                    &make_batch(&schema, block * 25_000, 25_000),
+                    WireConflictMode::Update,
+                )
                 .unwrap();
         }
 
         let mut t = ClientTransport::connect(&target, None).unwrap();
         set_small_bufs(t.as_raw_fd());
         hello_handshake(&mut t, None).unwrap();
-        send_control(&mut t, tid, WireFlags::default()).unwrap();
+        send_scan(&mut t, tid, &schema).unwrap();
         // Never read. Allow a few deadlines of slack.
         assert!(
             eviction_observed_within(&mut t, 8_000),
@@ -437,7 +483,7 @@ fn stalled_scan_client_is_evicted_by_send_deadline() {
         );
 
         // No cluster freeze / no lock wedge: a concurrent client still works.
-        assert_eq!(setup.scan(tid).unwrap().batch.len(), 200_000);
+        assert_eq!(scan_all(&mut setup, tid, &schema).unwrap().len(), 200_000);
     });
 }
 
@@ -450,8 +496,10 @@ fn mtls_roundtrip_push_and_scan() {
     // server cert. A required-mTLS server accepts it, so the full data path
     // works end to end.
     let (mut client, _sn, tid, schema) = client_with_table(&srv.mtls_target());
-    client.push(tid, &schema, &make_batch(&schema, 0, 500)).unwrap();
-    let batch = client.scan(tid).unwrap().batch;
+    client
+        .push(tid, &schema, &make_batch(&schema, 0, 500), WireConflictMode::Update)
+        .unwrap();
+    let batch = scan_all(&mut client, tid, &schema).unwrap();
     assert_eq!(batch.len(), 500, "authenticated client's rows must round-trip");
 }
 

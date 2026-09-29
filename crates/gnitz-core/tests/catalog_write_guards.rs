@@ -7,14 +7,16 @@
 //! its qualified-name keys depend on are enforced at the master's trust boundary,
 //! and these tests drive that boundary directly with hand-built bundles.
 
-use gnitz_core::protocol::{BatchAppender, ColumnDef, Schema, TypeCode, ZSetBatch};
-use gnitz_core::types::sys_schema;
-use gnitz_core::{GnitzClient, TableProps};
+use gnitz_core::sys_schema;
+use gnitz_core::GnitzClient;
+use gnitz_core::{BatchAppender, Schema, ZSetBatch};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::sys_rows::{
     write_circuit_node_row, write_col_tab_row, write_idx_tab_row, write_schema_tab_row, write_table_tab_row,
     CircuitNodeRow, ColTabRow, IdxTabRow, SchemaTabRow, TableTabRow,
 };
+use gnitz_wire::{ColumnDef, TypeCode};
+use gnitz_wire::{TableProps, WireConflictMode};
 use gnitz_wire::{COL_TAB, IDX_TAB, SCHEMA_TAB, SEQ_TAB, TABLE_TAB};
 
 /// One SCHEMA_TAB batch registering `(schema_id, name)`.
@@ -370,8 +372,8 @@ fn a_rename_stores_the_new_name_for_a_table_and_for_a_view() {
 
     let t = client.resolve_relation("ren", "t").unwrap();
     let v = client.resolve_relation("ren", "v").unwrap();
-    client.alter_rename_relation("ren", &t, "t2").unwrap();
-    client.alter_rename_relation("ren", &v, "v2").unwrap();
+    client.alter_rename_relation(&t, "t2").unwrap();
+    client.alter_rename_relation(&v, "v2").unwrap();
 
     assert!(
         client.resolve("ren", "t").unwrap().is_none(),
@@ -403,7 +405,7 @@ fn an_alter_view_bundle_still_applies_in_creation_order() {
         .unwrap();
     let first = client.create_view("mixed", "v", tid).unwrap();
 
-    let mut circuit = gnitz_core::Circuit::default();
+    let mut circuit = gnitz_wire::Circuit::default();
     let scan = circuit.input_delta(tid, gnitz_wire::ReadBound::None);
     circuit.sink(scan);
     let vid = client
@@ -416,7 +418,7 @@ fn an_alter_view_bundle_still_applies_in_creation_order() {
                 pk_repeats: false,
             }
             .into(),
-            gnitz_core::ViewProps::default(),
+            gnitz_wire::ViewProps::default(),
             Some(first),
         )
         .expect("the replacement bundle applies");
@@ -499,7 +501,7 @@ fn a_view_scanning_itself_is_refused() {
     s.push_ddl_txn(&[(SCHEMA_TAB, schema_row(sid, "selfscan"))]).unwrap();
 
     let vid = s.alloc_id().unwrap();
-    let mut circuit = gnitz_core::Circuit::default();
+    let mut circuit = gnitz_wire::Circuit::default();
     let scan = circuit.input_delta(vid, gnitz_wire::ReadBound::None);
     circuit.sink(scan);
     let nodes = sys_schema(gnitz_wire::CIRCUIT_NODES_TAB);
@@ -694,7 +696,7 @@ fn push_equal_values(client: &mut GnitzClient, tid: u64) {
     let mut app = BatchAppender::new(&mut batch, &schema);
     app.add_row(1, 1).i64_val(5);
     app.add_row(2, 1).i64_val(5);
-    client.push(tid, &schema, &batch).unwrap();
+    client.push(tid, &schema, &batch, WireConflictMode::Update).unwrap();
 }
 
 /// An index the owner rule refuses is refused as such, not scanned for duplicates.

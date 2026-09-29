@@ -9,11 +9,11 @@ def test_connect_shapes_close_and_refuse(server):
     reconnecting behind the caller's back. A fresh connection to the same target
     still works — closing one is not closing the transport."""
     conn = gnitz.connect(server)
-    assert len(conn.scan(gnitz.SCHEMA_TAB)) > 0
+    assert len(conn.scan(gnitz.SCHEMA_TAB, gnitz.sys_schema(gnitz.SCHEMA_TAB))) > 0
     conn.close()
     conn.close()                                  # idempotent
     with pytest.raises(gnitz.GnitzError, match="closed"):
-        conn.scan(gnitz.SCHEMA_TAB)
+        conn.scan(gnitz.SCHEMA_TAB, gnitz.sys_schema(gnitz.SCHEMA_TAB))
 
     with gnitz.connect(server) as fresh:
-        assert len(fresh.scan(gnitz.SCHEMA_TAB)) > 0
+        assert len(fresh.scan(gnitz.SCHEMA_TAB, gnitz.sys_schema(gnitz.SCHEMA_TAB))) > 0

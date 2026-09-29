@@ -16,8 +16,9 @@
 //! What a *surface* consumes is passed in — `HonoredClauses`, `QueryEnvelope`.
 
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
-use gnitz_core::{ColType, ColumnDef, RelClass, RelDescriptor, TypeCode};
+use gnitz_core::RelDescriptor;
 use gnitz_wire::decimal::MAX_DECIMAL_SCALE;
+use gnitz_wire::{ColType, ColumnDef, RelClass, TypeCode};
 
 /// The column def of a *computed* projection item, from the expression's
 /// nominal type. One home for the three rules every computed column obeys, so
@@ -274,13 +275,13 @@ fn reject_arity(what: &str, cols: usize, cap: usize) -> Result<(), GnitzSqlError
 
 /// A relation's column list, against the engine's column limit.
 pub(crate) fn reject_column_overflow(what: &str, cols: usize) -> Result<(), GnitzSqlError> {
-    reject_arity(what, cols, gnitz_core::MAX_COLUMNS)
+    reject_arity(what, cols, gnitz_wire::MAX_COLUMNS)
 }
 
 /// A synthesized key list — a join's reindex slots, or a join output's pair PK —
 /// against the width a registered PK may have.
 pub(crate) fn reject_pk_list_arity(what: &str, cols: usize) -> Result<(), GnitzSqlError> {
-    reject_arity(what, cols, gnitz_core::PK_LIST_MAX_COLS)
+    reject_arity(what, cols, gnitz_wire::PK_LIST_MAX_COLS)
 }
 
 /// The `Select` clauses a shape legitimately consumes, beyond the universal

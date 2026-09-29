@@ -57,7 +57,9 @@ def access(client, sn, q):
     return got[0]
 
 
-def scanned(client, sn, name):
-    """The rows of a full scan of a relation named in `sn` — the scan-side
-    counterpart of `rows`, so both compose with `bag`."""
-    return list(client.scan(client.resolve_table(sn, name)[0]))
+def scanned(client, sn, name, *, hidden=False):
+    """The rows of a full scan of a relation named in `sn`, hidden columns
+    included when `hidden` — the scan-side counterpart of `rows`, so both
+    compose with `bag`."""
+    result = client.scan(*client.resolve_table(sn, name))
+    return list(result.including_hidden() if hidden else result)

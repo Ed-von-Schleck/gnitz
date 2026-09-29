@@ -12,8 +12,8 @@ use crate::hir::physical::Frame;
 use crate::ir::BExpr;
 use crate::validate::reject_pk_list_arity;
 
-use gnitz_core::{Circuit, ColumnDef, NodeId};
 use gnitz_wire::JoinKind;
+use gnitz_wire::{Circuit, ColumnDef, NodeId};
 use std::borrow::Cow;
 
 /// One branch an emitter hands the shell: its node over the join frame, and a mark

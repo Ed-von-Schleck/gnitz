@@ -227,10 +227,10 @@ def test_a_replaced_view_resumes_with_its_new_body(own_server):
     own_server.restart()
     with gnitz.connect(own_server.sock_path) as conn:
         for name, live, retired in (("r", live_r, retired_r), ("a2", live_a, retired_a)):
-            again, _ = conn.resolve_table(sn, name)
+            again, schema = conn.resolve_table(sn, name)
             assert again == live, f"{name}: the name must resolve to the replacement"
             with pytest.raises(gnitz.GnitzError):
-                conn.scan(retired)
+                conn.scan(retired, schema)
             assert bag(scanned(conn, sn, name), "pk", "b") == {(1, 100): 1}, \
                 f"{name}: must resume with the new body"
 

@@ -325,7 +325,7 @@ fn plan_constant(query: &Query, select: &Select) -> Result<(Arc<Schema>, ZSetBat
     // No relation is in scope: the ground row's one column is hidden, so every
     // written name is unresolvable, a qualified one included.
     let bind = |e: &sqlparser::ast::Expr| bind_single_table(e, &ground, "");
-    let mut items: Vec<(BoundExpr, gnitz_core::ColumnDef)> = Vec::new();
+    let mut items: Vec<(BoundExpr, gnitz_wire::ColumnDef)> = Vec::new();
     for (idx, item) in select.projection.iter().enumerate() {
         let (expr, alias) = scalar_projection_item(item, CTX)?;
         let bound = bind(expr)?;

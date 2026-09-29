@@ -1,6 +1,6 @@
 use crate::error::GnitzSqlError;
-use gnitz_core::{ColType, ColumnDef, TypeCode};
 use gnitz_wire::decimal::MAX_DECIMAL_SCALE;
+use gnitz_wire::{ColType, ColumnDef, TypeCode};
 use sqlparser::ast::{ColumnOption, DataType, ExactNumberInfo, TimezoneInfo};
 
 pub(crate) fn sql_col_type(dt: &DataType) -> Result<ColType, GnitzSqlError> {

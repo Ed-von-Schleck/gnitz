@@ -90,21 +90,23 @@ class AsyncConnection:
         """Push a batch to a table.  Awaits to the ingest LSN (int)."""
         return self._transport.push(target_id, batch)
 
-    def scan(self, target_id):
-        """Scan a table/view.  Awaits to a ``ScanResult``."""
-        return self._transport.scan(target_id)
+    def scan(self, target_id, schema):
+        """Scan a table/view in ``schema``'s layout.  Awaits to a ``ScanResult``."""
+        return self._transport.scan(target_id, schema)
 
-    def scan_many(self, target_ids):
-        """Consistent snapshot of N relations at one server-side SAL cut.
+    def scan_many(self, pairs):
+        """Consistent snapshot of N ``(table_id, schema)`` relations at one
+        server-side SAL cut.
 
         Awaits to a ``list`` of ``ScanResult`` in request order.  An atomic
         multi-table transaction is never observed torn across the list.
         """
-        return self._transport.scan_many(target_ids)
+        return self._transport.scan_many(pairs)
 
-    def seek(self, table_id, pk):
-        """Point-lookup by primary key.  Awaits to a ``ScanResult``."""
-        return self._transport.seek(table_id, pk)
+    def seek(self, table_id, schema, pk):
+        """Point-lookup by primary key: a single-column key's value, or a
+        compound key's tuple.  Awaits to a ``ScanResult``."""
+        return self._transport.seek(table_id, schema, pk)
 
     # -- lifecycle ---------------------------------------------------------
 

@@ -1,8 +1,9 @@
 use super::*;
-use crate::protocol::types::{ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use crate::test_support::{german_col, payload_of};
+use crate::{PkColumn, Schema, ZSetBatch};
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::wal::{WAL_HEADER_SIZE, WAL_OFF_ROWS, WAL_OFF_VERSION};
+use gnitz_wire::{ColumnDef, TypeCode};
 
 /// Fixed region `region_idx`'s `(offset, size)` in a block over `schema`.
 fn get_region_offset_size(block: &[u8], schema: &Schema, region_idx: usize) -> (usize, usize) {
@@ -343,7 +344,7 @@ fn wal_retraction_u64() {
 
 #[test]
 fn test_batch_appender_round_trip_u64_pk() {
-    use crate::protocol::types::BatchAppender;
+    use crate::BatchAppender;
     let schema = u64_schema();
     let mut batch = ZSetBatch::new(&schema);
     {
@@ -362,7 +363,7 @@ fn test_batch_appender_round_trip_u64_pk() {
 
 #[test]
 fn test_batch_appender_round_trip_u128_pk() {
-    use crate::protocol::types::BatchAppender;
+    use crate::BatchAppender;
     let schema = u128_schema();
     let pks = vec![0u128, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX];
     let mut batch = ZSetBatch::new(&schema);

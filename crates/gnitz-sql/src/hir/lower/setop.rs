@@ -6,7 +6,7 @@ use super::spine::{open, Top};
 use super::{EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
 use crate::hir::physical::Frame;
-use gnitz_core::{Circuit, ColumnDef, NodeId, ReindexSlot, TypeCode};
+use gnitz_wire::{Circuit, ColumnDef, NodeId, ReindexSlot, TypeCode};
 use std::rc::Rc;
 
 /// Lower a `SetOp` body: its tree of directly nested set operations is one

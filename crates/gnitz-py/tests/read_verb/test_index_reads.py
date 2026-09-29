@@ -65,6 +65,17 @@ def test_index_seek_takes_a_negative_key(client, schema_name):
     assert bag(client.seek_by_index(tid, schema, [1], [5]), "pk", "delta") == {(2, 5): 1}
 
 
+@pytest.mark.parametrize("keys", [[], [5, 5]], ids=["none", "surplus"])
+def test_index_seek_refuses_a_key_count_the_index_cannot_take(client, schema_name, keys):
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, delta BIGINT NOT NULL); "
+        "CREATE INDEX ON t(delta)", schema_name=sn)
+    tid, schema = client.resolve_table(sn, "t")
+    with pytest.raises(ValueError, match="key value count"):
+        client.seek_by_index(tid, schema, [1], keys)
+
+
 # ---------------------------------------------------------------------------
 # Equality and ranges through SQL
 # ---------------------------------------------------------------------------

@@ -7,9 +7,19 @@ use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::Duration;
 
-use gnitz_core::ClientError;
+use std::sync::Arc;
+
+use gnitz_core::{ClientError, ScanReply, Schema};
 use gnitz_tokio::{AsyncClient, Connection};
+use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode};
 use tokio::runtime::Runtime;
+
+/// A read of every row of `tid`, in a layout the peer never checks.
+async fn scan(c: AsyncClient, tid: u64) -> Result<ScanReply, ClientError> {
+    let schema = Schema::from_parts(vec![ColumnDef::new("k", TypeCode::U64, false)], vec![0]).unwrap();
+    c.scan_spec(tid, ReadSpec::all_rows(ReadBound::None), Arc::new(schema))
+        .await
+}
 
 /// A client connected to a peer that has answered its HELLO, and the peer's end.
 fn connect_to_peer(rt: &Runtime) -> (AsyncClient, Connection, UnixStream) {
@@ -52,14 +62,14 @@ fn a_submit_flushes_while_a_reply_is_outstanding() {
     rt.spawn(conn);
     let first = rt.spawn({
         let c = client.clone();
-        async move { c.scan(1).await }
+        async move { scan(c, 1).await }
     });
     assert!(!read_frame(&mut peer).is_empty(), "the first request is on the wire");
 
     // Nothing has been answered. The second submit must still leave.
     let second = rt.spawn({
         let c = client.clone();
-        async move { c.scan(2).await }
+        async move { scan(c, 2).await }
     });
     assert!(
         !read_frame(&mut peer).is_empty(),
@@ -84,7 +94,7 @@ fn a_connection_error_fails_every_outstanding_operation() {
     let ops: Vec<_> = (1..=8u64)
         .map(|tid| {
             let c = client.clone();
-            rt.spawn(async move { c.scan(tid).await })
+            rt.spawn(async move { scan(c, tid).await })
         })
         .collect();
     // At least one frame is on the wire before the peer goes.
@@ -99,7 +109,7 @@ fn a_connection_error_fails_every_outstanding_operation() {
         );
     }
     // Further work is refused rather than queued onto a dead connection.
-    let r = rt.block_on(client.scan(1));
+    let r = rt.block_on(scan(client.clone(), 1));
     assert!(matches!(r, Err(ClientError::ConnectionLost(_))), "{r:?}");
     drop(client);
     rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), driver).await })
@@ -131,13 +141,13 @@ fn a_verb_submitted_after_the_connection_died_still_resolves() {
     let driver = rt.spawn(conn);
     let outstanding = rt.spawn({
         let c = client.clone();
-        async move { c.scan(1).await }
+        async move { scan(c, 1).await }
     });
     let r = rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), outstanding).await });
     let r = r.expect("the outstanding verb resolves").unwrap();
     assert!(matches!(r, Err(ClientError::ConnectionLost(_))), "{r:?}");
 
-    let late = rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), client.scan(2)).await });
+    let late = rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), scan(client.clone(), 2)).await });
     match late {
         Ok(r) => assert!(
             matches!(r, Err(ClientError::ConnectionLost(_))),

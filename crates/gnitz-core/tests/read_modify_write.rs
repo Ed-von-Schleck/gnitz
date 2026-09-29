@@ -6,13 +6,12 @@
 
 use std::sync::Arc;
 
-use gnitz_core::protocol::{ColumnDef, Schema, TypeCode};
-use gnitz_core::{
-    BatchAppender, ClientError, GnitzClient, RelDescriptor, SchemaFacts, TableProps, WireFault, WireStatus, ZSetBatch,
-    RMW_MAX_ATTEMPTS,
-};
+use gnitz_core::Schema;
+use gnitz_core::{BatchAppender, ClientError, GnitzClient, PkColumn, RelDescriptor, ZSetBatch, RMW_MAX_ATTEMPTS};
 use gnitz_test_harness::{unique_schema, ServerHandle};
-use gnitz_wire::{read_i64_le, PkKeys, ReadBound};
+use gnitz_wire::{read_i64_le, ReadBound};
+use gnitz_wire::{ColumnDef, TypeCode};
+use gnitz_wire::{ReadSpec, TableProps, WireConflictMode, WireFault, WireStatus};
 
 struct Fixture {
     _srv: ServerHandle,
@@ -51,7 +50,7 @@ fn commit(client: &mut GnitzClient, target: &RelDescriptor, pk: u128, val: i64) 
     let s = &target.schema;
     let mut batch = ZSetBatch::new(s);
     BatchAppender::new(&mut batch, s).add_row(pk, 1).i64_val(val);
-    client.push(target.tid, s, &batch).unwrap();
+    client.push(target.tid, s, &batch, WireConflictMode::Update).unwrap();
 }
 
 /// `a`'s read of pk 1 and its `val + 1` build, which calls `side` first on every
@@ -61,7 +60,7 @@ fn run_increment(
     mut side: impl FnMut(&mut GnitzClient, &RelDescriptor, usize),
 ) -> (Result<usize, ClientError>, usize) {
     let s = Arc::clone(&f.target.schema);
-    let keys = PkKeys::from_keys(s.pk_stride(), [s.opk_key_cols(&[1]).pk_bytes()]);
+    let keys = PkColumn::from_natives(&s, [1]).keys();
     let mut attempts = 0;
     let Fixture { a, b, target, .. } = f;
     let result = a.read_modify_write(target, ReadBound::PkSet(keys), Vec::new(), false, |mut rows| {
@@ -78,7 +77,8 @@ fn run_increment(
 
 /// Every row of `t` at pk 1, as `(val, weight)`.
 fn row_1(client: &mut GnitzClient, target: &RelDescriptor) -> Vec<(i64, i64)> {
-    let b = client.scan(target.tid).unwrap().batch;
+    let spec = ReadSpec::all_rows(ReadBound::None);
+    let b = client.scan_spec(target.tid, &spec, &target.schema).unwrap().batch;
     let s = &target.schema;
     (0..b.len())
         .filter(|&i| b.pks.get(s, i) == 1)

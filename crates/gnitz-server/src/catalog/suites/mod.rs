@@ -31,18 +31,31 @@ use gnitz_wire::{pack_pk_cols, TypeCode, PK_LIST_PACKED_FLAG};
 
 use std::fs;
 
-/// Every live row of `opk`'s PK group, read as a one-key `PkSet`.
-fn pk_group(engine: &mut CatalogEngine, tid: u64, opk: &[u8]) -> std::rc::Rc<gnitz_store::storage::Batch> {
+/// Every row of `tid` under `bound`, in the relation's own layout.
+fn read_rows(
+    engine: &mut CatalogEngine,
+    tid: u64,
+    bound: gnitz_wire::ReadBound,
+) -> std::rc::Rc<gnitz_store::storage::Batch> {
     let schema = engine
         .registry
         .relation(tid)
         .map(gnitz_store::relation::Relation::schema)
         .expect("a registered relation");
-    let keys = gnitz_wire::PkKeys::from_keys(schema.pk_stride(), [opk]);
-    let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::PkSet(keys));
     engine
-        .scan_spec(tid, spec, schema.layout_digest())
-        .expect("a point read")
+        .scan_spec(tid, gnitz_wire::ReadSpec::all_rows(bound), schema.layout_digest())
+        .expect("a read")
+}
+
+/// Every row of `tid`.
+fn scan_all(engine: &mut CatalogEngine, tid: u64) -> std::rc::Rc<gnitz_store::storage::Batch> {
+    read_rows(engine, tid, gnitz_wire::ReadBound::None)
+}
+
+/// Every live row of `opk`'s PK group, read as a one-key `PkSet`.
+fn pk_group(engine: &mut CatalogEngine, tid: u64, opk: &[u8]) -> std::rc::Rc<gnitz_store::storage::Batch> {
+    let keys = gnitz_wire::PkKeys::from_keys(opk.len(), [opk]);
+    read_rows(engine, tid, gnitz_wire::ReadBound::PkSet(keys))
 }
 
 /// [`pk_group`] by a narrow native key.
@@ -52,7 +65,7 @@ fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> std::rc::
         .relation(tid)
         .map(gnitz_store::relation::Relation::schema)
         .expect("a registered relation");
-    let opk = gnitz_store::schema::key::seek_opk_bytes(&schema, &key.to_le_bytes()).expect("a narrow key");
+    let opk = schema.opk_key(&key.to_le_bytes());
     pk_group(engine, tid, opk.pk_bytes())
 }
 

@@ -10,8 +10,9 @@ use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_wire_conjuncts;
 use crate::ir::BoundExpr;
 use crate::tail::{order_exprs, parse_order_by, wire_keys};
-use gnitz_core::{ColumnDef, RelDescriptor, RelIndex, Schema};
-use gnitz_expr::LogicalProgram;
+use gnitz_core::{RelDescriptor, Schema};
+use gnitz_expr::{LogicalProgram, SchemaFacts};
+use gnitz_wire::{ColumnDef, RelIndex};
 use gnitz_wire::{OrderKey, ReadBound};
 use sqlparser::ast::{Expr, OrderBy, SelectItem};
 
@@ -118,7 +119,17 @@ fn reproduces(schema: &Schema, items: &[ProjItem], out_cols: &[ColumnDef]) -> bo
     let relation = schema
         .visible_columns()
         .map(|(i, col)| (Some(i), false, col.name.as_str()));
-    !schema.has_hidden_payload() && reply.eq(relation)
+    !has_hidden_payload(schema) && reply.eq(relation)
+}
+
+/// True iff any **non-PK** column is hidden. A view's synthetic hidden keys are
+/// PK columns, so they never count.
+fn has_hidden_payload(schema: &Schema) -> bool {
+    schema
+        .columns
+        .iter()
+        .enumerate()
+        .any(|(i, c)| c.is_hidden && !schema.is_pk_col(i))
 }
 
 // ---------------------------------------------------------------------------

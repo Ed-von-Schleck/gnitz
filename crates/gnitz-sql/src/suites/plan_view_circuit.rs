@@ -6,8 +6,8 @@
 //! worker-filter / filter node counts. Projection lists, map counts, union
 //! counts and node numbering are free to change.
 
-use gnitz_core::{OpNode, TypeCode};
 use gnitz_wire::{ClampKind, JoinKind, ReadBound};
+use gnitz_wire::{OpNode, TypeCode};
 
 use super::*;
 
@@ -276,7 +276,7 @@ fn indexed(indexes: &[&[u32]]) -> Catalog<'static> {
             "t",
             rel(
                 40,
-                gnitz_core::RelClass::Table,
+                gnitz_wire::RelClass::Table,
                 vec![col("pk", i), col("g", i), col("ind", i), col("other", i)],
                 vec![0],
                 indexes,

@@ -6,6 +6,7 @@
 //! reads back through `read::scan_result` — a pyclass crosses the directional
 //! pair, no codec does.
 
+use std::borrow::Cow;
 use std::ffi::CStr;
 use std::sync::Arc;
 
@@ -15,8 +16,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDate, PyDateAccess, PyDateTime, PyDict, PyString, PyTimeAccess, PyTuple, PyTzInfoAccess};
 use pyo3::Borrowed;
 
-use gnitz_core::{ColType, PkColumn, ScanReply, Schema, SchemaFacts, TypeCode, ZSetBatch};
+use gnitz_core::{PkColumn, ScanReply, Schema, ZSetBatch};
+use gnitz_expr::SchemaFacts;
 use gnitz_wire::decimal::{decimal_of_f64, parse_decimal, rescale};
+use gnitz_wire::{ColType, ReadBound, ReadSpec, TypeCode};
 
 use crate::read::{scan_result, PyScanResult};
 use crate::schema::resolve_py_schema;
@@ -52,6 +55,13 @@ pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyR
         pk_col.push_bytes(schema, &native);
     }
     Ok(pk_col)
+}
+
+/// A read of the rows keyed `pk` — a single-column key's value, or a compound
+/// key's tuple — encoded exactly as [`py_pks_to_column`] encodes a pushed row's.
+pub(crate) fn pk_point_spec(schema: &Schema, pk: &Bound<'_, PyAny>) -> PyResult<ReadSpec> {
+    let keys = py_pks_to_column(schema, std::slice::from_ref(pk))?.keys();
+    Ok(ReadSpec::all_rows(ReadBound::PkSet(keys)))
 }
 
 /// Append PK column `ci`'s value `v` to `native`, refusing `None`.
@@ -108,11 +118,11 @@ impl PyZSetBatch {
 fn push_column_value(col: &mut Vec<u8>, blob: &mut Vec<u8>, ty: ColType, val: &Bound<'_, PyAny>) -> PyResult<()> {
     match ty.tc {
         TypeCode::String => {
-            let s = val.extract::<String>()?;
+            let s = val.cast::<PyString>()?.to_cow()?;
             col.extend_from_slice(&gnitz_wire::encode_german_string(s.as_bytes(), blob));
         }
         TypeCode::Blob => {
-            let b = val.extract::<Vec<u8>>()?;
+            let b = val.extract::<Cow<[u8]>>()?;
             col.extend_from_slice(&gnitz_wire::encode_german_string(&b, blob));
         }
         _ => push_fixed_le(col, ty, val)?,
@@ -583,9 +593,8 @@ impl PyZSetBatch {
 /// A string is UUID text — canonical or bare 32-hex — and nothing else
 /// (`gnitz_wire::parse_uuid`, the crate that owns wire-value text). Which
 /// *columns* a string may be written to is not decided here: this function is
-/// also reached from the schema-less wire path [`py_scalar_key`], which has no
-/// type code to consult. The typed encoder
-/// [`push_fixed_le`] reaches it for UUID alone.
+/// also reached from [`py_key_image`], which accepts UUID text for any key. The
+/// typed encoder [`push_fixed_le`] reaches it for UUID alone.
 pub(crate) fn extract_uuid_or_u128(val: &Bound<'_, PyAny>) -> PyResult<u128> {
     // `cast` before `extract` on both arms: a failed `extract` builds *and
     // normalizes* a full `PyErr` only to discard it, which a `uuid.UUID` or
@@ -708,39 +717,21 @@ fn push_fixed_le(buf: &mut Vec<u8>, ty: ColType, item: &Bound<'_, PyAny>) -> PyR
     Ok(())
 }
 
-/// A Python seek key as the wire key. `bytes` is packed native-LE columns;
-/// anything else is one scalar ([`py_scalar_key`]).
-pub(crate) fn pk_key_from_py(pk: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-    // bytes first: `py_scalar_key` falls through to `getattr("int")`, which a
-    // bytes key would walk before failing.
-    if let Ok(bytes) = pk.cast::<pyo3::types::PyBytes>() {
-        let b = bytes.as_bytes();
-        if b.is_empty() || b.len() > gnitz_core::MAX_PK_BYTES {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "packed pk must be 1..={} bytes, got {}",
-                gnitz_core::MAX_PK_BYTES,
-                b.len(),
-            )));
-        }
-        return Ok(b.to_vec());
-    }
-    Ok(py_scalar_key(pk)?.to_le_bytes().to_vec())
+/// One key value's image in a `tc` column's key order. The value is truncated to
+/// the column's width, not range-checked.
+pub(crate) fn py_key_image(tc: TypeCode, pk: &Bound<'_, PyAny>) -> PyResult<u128> {
+    Ok(gnitz_wire::key_image(tc, py_native_key(pk)?))
 }
 
-/// One scalar key value as the 16-byte native word the wire carries, of which
-/// the server reads only the column's own stride — a truncation, not a range
-/// check. The signed arm keeps a negative key packing to the same
-/// two's-complement bytes the typed append path writes.
-pub(crate) fn py_scalar_key(pk: &Bound<'_, PyAny>) -> PyResult<u128> {
+/// [`py_key_image`]'s value as a native word; a negative one is its
+/// two's-complement image.
+fn py_native_key(pk: &Bound<'_, PyAny>) -> PyResult<u128> {
     // `i128` first, so a negative key does not build and discard an
     // `OverflowError` on the unsigned arm; a `U128` key above `i128::MAX`, a
     // `uuid.UUID` and UUID text all fall to the last.
     if let Ok(val) = pk.extract::<i128>() {
         return Ok(val as u128);
     }
-    // A `datetime` keys a TIMESTAMP column and a `date` a DATE one; the server
-    // reads only the column's own stride, which is what tells them apart from a
-    // plain integer key.
     if pk.is_instance_of::<PyDateTime>() {
         return Ok(extract_micros(pk)? as i128 as u128);
     }

@@ -6,7 +6,7 @@ use super::spine::{open, Top};
 use super::{keyed_frame, EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
 use crate::validate::reject_float_keys;
-use gnitz_core::Circuit;
+use gnitz_wire::Circuit;
 use gnitz_wire::OrderKey;
 use std::collections::HashSet;
 

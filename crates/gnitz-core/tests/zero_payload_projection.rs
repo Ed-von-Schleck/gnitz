@@ -11,11 +11,14 @@
 //! and the PK region round-trips byte-for-byte, including through a permuted,
 //! non-adjacent compound PK whose OPK sign flip must survive.
 
-use gnitz_core::protocol::{ColumnDef, Schema, TypeCode};
-use gnitz_core::{key_reply, BatchAppender, GnitzClient, SchemaFacts, TableProps, ZSetBatch};
+use gnitz_core::Schema;
+use gnitz_core::{key_reply, BatchAppender, GnitzClient, ZSetBatch};
+use gnitz_expr::SchemaFacts;
 use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr as L, Sink};
 use gnitz_test_harness::{unique_schema, ServerHandle};
+use gnitz_wire::{ColumnDef, TypeCode};
 use gnitz_wire::{ReadBound, ReadSpec};
+use gnitz_wire::{TableProps, WireConflictMode};
 
 /// `col > threshold` as a compiled predicate blob, over the SOURCE schema's
 /// column indices.
@@ -62,14 +65,15 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
             &[],
         )
         .unwrap();
-    let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
+    let desc = client.resolve_relation(&sn, "t").unwrap();
+    let (tid, schema) = (desc.tid, std::sync::Arc::clone(&desc.schema));
 
     let mut batch = ZSetBatch::new(&schema);
     let mut app = BatchAppender::new(&mut batch, &schema);
     for i in 1u64..=200 {
         app.add_row(i as u128, 1).i64_val(i as i64).str_val(&"x".repeat(300));
     }
-    client.push(tid, &schema, &batch).unwrap();
+    client.push(tid, &schema, &batch, WireConflictMode::Update).unwrap();
 
     let (reply_schema, sink) = key_reply(&schema);
     assert_eq!(reply_schema.num_payload_cols(), 0, "the reply is nothing but the key");
@@ -124,7 +128,8 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
             &[],
         )
         .unwrap();
-    let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
+    let desc = client.resolve_relation(&sn, "t").unwrap();
+    let (tid, schema) = (desc.tid, std::sync::Arc::clone(&desc.schema));
     assert_eq!(schema.pk_stride(), 12, "I64 then U32, tightly packed");
 
     // `(c3, c0)` packed native little-endian in PK-list order — c3 at offset 0,
@@ -136,7 +141,7 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     for &(c3, c0, c2) in &rows {
         app.add_row(key(c3, c0), 1).str_val("payload").i64_val(c2);
     }
-    client.push(tid, &schema, &batch).unwrap();
+    client.push(tid, &schema, &batch, WireConflictMode::Update).unwrap();
 
     let (reply_schema, sink) = key_reply(&schema);
     assert_eq!(reply_schema.pk_stride(), schema.pk_stride());

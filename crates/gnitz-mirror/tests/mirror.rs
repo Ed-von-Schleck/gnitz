@@ -410,7 +410,7 @@ fn a_registered_view_is_described_locally() {
     assert_eq!(desc.tid, keyed, "the copy is held under the server's id");
     assert_eq!(
         desc.class,
-        gnitz_core::RelClass::FedView,
+        gnitz_wire::RelClass::FedView,
         "only a fed view can be mirrored"
     );
     assert!(desc.indexes.is_empty(), "only a base table may own an index");
@@ -1270,8 +1270,8 @@ fn nullable_payloads_of_every_width_survive_the_copy() {
     // The BLOB table: created and seeded through the binary API, then read and
     // retracted through SQL like any other.
     let cols = vec![
-        gnitz_core::ColumnDef::new("id", gnitz_core::TypeCode::I64, false),
-        gnitz_core::ColumnDef::new("b", gnitz_core::TypeCode::Blob, true),
+        gnitz_wire::ColumnDef::new("id", gnitz_wire::TypeCode::I64, false),
+        gnitz_wire::ColumnDef::new("b", gnitz_wire::TypeCode::Blob, true),
     ];
     fx.direct
         .create_table(
@@ -1279,11 +1279,12 @@ fn nullable_payloads_of_every_width_survive_the_copy() {
             "blb",
             &Schema { columns: cols, pk_cols: vec![0] },
             &[],
-            gnitz_core::TableProps::default(),
+            gnitz_wire::TableProps::default(),
             &[],
         )
         .expect("a BLOB column is admissible through the binary API");
-    let (blb_tid, blb_schema) = fx.direct.resolve_table_or_view_id("nl", "blb").unwrap();
+    let rel = fx.direct.resolve_relation("nl", "blb").unwrap();
+    let (blb_tid, blb_schema) = (rel.tid, rel.schema.clone());
     let mut batch = gnitz_core::ZSetBatch::new(&blb_schema);
     {
         let mut app = gnitz_core::BatchAppender::new(&mut batch, &blb_schema);
@@ -1296,7 +1297,9 @@ fn nullable_payloads_of_every_width_survive_the_copy() {
             }
         }
     }
-    fx.direct.push(blb_tid, &blb_schema, &batch).expect("push blobs");
+    fx.direct
+        .push(blb_tid, &blb_schema, &batch, gnitz_wire::WireConflictMode::Update)
+        .expect("push blobs");
 
     sql(
         &mut fx.direct,

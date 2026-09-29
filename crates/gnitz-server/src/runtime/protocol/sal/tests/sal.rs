@@ -19,7 +19,7 @@ fn sal_round_trip() {
     let log = TestLog::new(1 << 20, 1, 1);
     let bufs: Vec<Vec<u8>> = vec![vec![0xAA; 100], vec![], vec![0xBB; 200], vec![0xCC; 50]];
     let payloads: Vec<&[u8]> = bufs.iter().map(|b| b.as_slice()).collect();
-    log.write(42, 100, SalMessageKind::Scan, &payloads);
+    log.write(42, 100, SalMessageKind::ScanSpec, &payloads);
 
     let msg = group_in(log.log(), 0, 1);
     assert_eq!(msg.lsn, 100);
@@ -40,7 +40,7 @@ fn sal_multiple_groups() {
     let log = TestLog::new(1 << 20, 1, 1);
     for g in 0..3u64 {
         let buf = vec![(g + 1) as u8; 64];
-        log.write(g, g * 10, SalMessageKind::Scan, &[&buf, &[]]);
+        log.write(g, g * 10, SalMessageKind::ScanSpec, &[&buf, &[]]);
     }
 
     let groups: Vec<_> = log.log().walk(1).collect();
@@ -61,7 +61,7 @@ fn sal_full_error() {
     let log = TestLog::new(PREFIX_BYTES + CHECKPOINT_RESERVE + payload, 1, 1);
     let buf = vec![0xFF; payload];
     assert!(
-        log.try_write(0, 0, SalMessageKind::Scan, 0, &[&buf]).is_err(),
+        log.try_write(0, 0, SalMessageKind::ScanSpec, 0, &[&buf]).is_err(),
         "a group overrunning the ordinary cap must be refused"
     );
 }
@@ -70,7 +70,7 @@ fn sal_full_error() {
 #[test]
 fn sal_checkpoint_reset() {
     let log = TestLog::new(1 << 20, 1, 1);
-    log.write(0, 0, SalMessageKind::Scan, &[&[0x11u8; 32]]);
+    log.write(0, 0, SalMessageKind::ScanSpec, &[&[0x11u8; 32]]);
 
     try_poll_once(log.writer.lock())
         .expect("uncontended")
@@ -79,7 +79,7 @@ fn sal_checkpoint_reset() {
     assert_eq!(log.cursor(), 0);
     assert!(matches!(log.log().read_at(0, EpochGate::Walk(2)), SalStep::Absent));
 
-    log.write(0, 0, SalMessageKind::Scan, &[&[0x22u8; 32]]);
+    log.write(0, 0, SalMessageKind::ScanSpec, &[&[0x22u8; 32]]);
     let msg = group_at(log.log(), 0);
     assert_eq!(msg.slot(0).expect("data slot"), vec![0x22u8; 32].as_slice());
 }
@@ -93,11 +93,11 @@ fn a_group_hides_the_slots_of_a_wider_group_at_the_same_offset() {
     // An 8-worker group leaves a fully populated directory at offset 0.
     let wide: Vec<Vec<u8>> = (0..8).map(|i| vec![0xA0 + i as u8; 64]).collect();
     let wide_refs: Vec<&[u8]> = wide.iter().map(|b| b.as_slice()).collect();
-    log.write(0, 0, SalMessageKind::Scan, &wide_refs);
+    log.write(0, 0, SalMessageKind::ScanSpec, &wide_refs);
 
     // The same offset rewritten by a 2-worker topology.
     log.seek(0, 2);
-    log.write(0, 0, SalMessageKind::Scan, &[&[0x11u8; 32], &[0x22u8; 32]]);
+    log.write(0, 0, SalMessageKind::ScanSpec, &[&[0x11u8; 32], &[0x22u8; 32]]);
 
     let msg = group_at(log.log(), 0);
     assert_eq!(msg.slots(), 2, "the group's own count is the narrow one");
@@ -117,14 +117,14 @@ fn a_group_hides_the_slots_of_a_wider_group_at_the_same_offset() {
 fn a_group_wider_than_max_workers_is_a_logic_fault() {
     let log = TestLog::new(1 << 20, 1, 1);
     let payloads = vec![&[][..]; MAX_WORKERS + 1];
-    let _ = log.try_write(0, 0, SalMessageKind::Scan, 0, &payloads);
+    let _ = log.try_write(0, 0, SalMessageKind::ScanSpec, 0, &payloads);
 }
 
 #[test]
 fn effective_max_reserves_by_kind() {
     let mmap = 1usize << 30;
     assert_eq!(
-        effective_max(SalMessageKind::Scan, mmap),
+        effective_max(SalMessageKind::ScanSpec, mmap),
         mmap - PREFIX_BYTES - CHECKPOINT_RESERVE
     );
     for terminal in [
@@ -144,7 +144,7 @@ fn effective_max_reserves_by_kind() {
 fn ordinary_cap_at_the_sal_floor_still_admits_a_group() {
     // The floor is the smallest configurable mapping; the reserve must leave the
     // overwhelming majority of it to ordinary groups.
-    let cap = effective_max(SalMessageKind::Scan, MIN_SAL_BYTES);
+    let cap = effective_max(SalMessageKind::ScanSpec, MIN_SAL_BYTES);
     assert!(
         cap > MIN_SAL_BYTES - MIN_SAL_BYTES / 64,
         "the reserve must not eat the SAL floor: cap {cap} of {MIN_SAL_BYTES}"
@@ -157,11 +157,11 @@ fn a_terminal_group_fits_where_an_ordinary_group_does_not() {
     // full-width checkpoint round.
     let size = MIN_SAL_BYTES;
     let log = TestLog::new(size, 1, 1);
-    let cursor = effective_max(SalMessageKind::Scan, size) as u64 - PREFIX_BYTES as u64;
+    let cursor = effective_max(SalMessageKind::ScanSpec, size) as u64 - PREFIX_BYTES as u64;
 
     log.seek(cursor, 1);
     assert!(
-        log.try_write(0, 0, SalMessageKind::Scan, 0, &[&[]]).is_err(),
+        log.try_write(0, 0, SalMessageKind::ScanSpec, 0, &[&[]]).is_err(),
         "an ordinary group must be refused once the cursor passes the ordinary cap"
     );
 
@@ -178,10 +178,10 @@ fn a_terminal_group_fits_where_an_ordinary_group_does_not() {
 fn sal_epoch_fence() {
     let log = TestLog::new(1 << 20, 1, 5);
     let buf = vec![0x33u8; 32];
-    log.write(0, 0, SalMessageKind::Scan, &[&buf]);
+    log.write(0, 0, SalMessageKind::ScanSpec, &[&buf]);
     let second = log.cursor();
     log.seek(second, 6);
-    log.write(0, 0, SalMessageKind::Scan, &[&buf]);
+    log.write(0, 0, SalMessageKind::ScanSpec, &[&buf]);
 
     let view = log.log();
     group_in(view, 0, 5);
@@ -266,13 +266,13 @@ fn sal_cross_process_checkpoint() {
         panic!("the worker never reported");
     };
 
-    log.try_write(0, 10, SalMessageKind::Scan, 0, &[&buf])
+    log.try_write(0, 10, SalMessageKind::ScanSpec, 0, &[&buf])
         .expect("group fits");
     wake.wake();
     assert_eq!(report(), (10, 0xAA), "round 1");
 
     log.seek(0, 2);
-    log.try_write(0, 20, SalMessageKind::Scan, 0, &[&buf2])
+    log.try_write(0, 20, SalMessageKind::ScanSpec, 0, &[&buf2])
         .expect("group fits");
     wake.wake();
     assert_eq!(report(), (20, 0xBB), "round 2");
@@ -321,11 +321,11 @@ fn a_leased_group_writes_only_its_set_on_one_id() {
             request_id: 40,
             in_request_order: true,
         },
-        ..DirectGroup::new(SalMessageKind::Scan)
+        ..DirectGroup::new(SalMessageKind::ScanSpec)
     };
     log.writer.write(&group).expect("group fits");
     log.writer
-        .write(&DirectGroup::new(SalMessageKind::Scan))
+        .write(&DirectGroup::new(SalMessageKind::ScanSpec))
         .expect("group fits");
 
     for w in 0..4u32 {
@@ -351,7 +351,7 @@ fn dropping_a_sal_excl_wakes_exactly_the_workers_it_reached() {
             request_id: 1,
             in_request_order: false,
         },
-        ..DirectGroup::new(SalMessageKind::Scan)
+        ..DirectGroup::new(SalMessageKind::ScanSpec)
     };
 
     drop(try_poll_once(log.writer.lock()).expect("uncontended"));
@@ -383,18 +383,18 @@ fn a_reader_is_empty_only_while_no_group_is_readable_at_its_cursor() {
     let reader = SalReader::new(log.log(), 0, 1);
     assert!(reader.is_empty(), "an unwritten log");
 
-    log.write(0, 0, SalMessageKind::Scan, &[&[], &[0u8; 32]]);
+    log.write(0, 0, SalMessageKind::ScanSpec, &[&[], &[0u8; 32]]);
     assert!(!reader.is_empty(), "another worker's unicast");
     assert!(reader.next().is_none(), "holds nothing for worker 0");
     assert!(reader.is_empty(), "and the cursor is past it");
 
-    log.write(0, 0, SalMessageKind::Scan, &[&[0u8; 32], &[]]);
+    log.write(0, 0, SalMessageKind::ScanSpec, &[&[0u8; 32], &[]]);
     assert!(!reader.is_empty());
     assert!(reader.next().is_some());
     assert!(reader.is_empty());
 
     let leftover = TestLog::new(1 << 20, 1, 1);
-    leftover.write(0, 0, SalMessageKind::Scan, &[&[0u8; 32]]);
+    leftover.write(0, 0, SalMessageKind::ScanSpec, &[&[0u8; 32]]);
     assert!(
         SalReader::new(leftover.log(), 0, 2).is_empty(),
         "an older epoch's group at the cursor"
@@ -407,7 +407,7 @@ fn a_reader_is_empty_only_while_no_group_is_readable_at_its_cursor() {
 #[test]
 fn sal_prefix_epoch_gate() {
     let log = TestLog::new(1 << 20, 1, 1);
-    log.write(7, 11, SalMessageKind::Scan, &[&[0x5Au8; 48]]);
+    log.write(7, 11, SalMessageKind::ScanSpec, &[&[0x5Au8; 48]]);
 
     let view = log.log();
     assert!(
@@ -429,7 +429,7 @@ fn sal_prefix_packing_boundaries() {
     // The multi-MiB group below plus the reserve; nothing here needs more.
     let log = TestLog::new(2 << 20, 1, u32::MAX);
 
-    log.write(0, 0, SalMessageKind::Scan, &[&[]]);
+    log.write(0, 0, SalMessageKind::ScanSpec, &[&[]]);
     assert_eq!(log.log().prefix_word(0), epoch_word(u32::MAX, PRESENT));
     let msg = group_in(log.log(), 0, u32::MAX);
     assert_eq!(msg.end, (PREFIX_BYTES + group_header_size(1)) as u64);
@@ -437,7 +437,7 @@ fn sal_prefix_packing_boundaries() {
 
     log.seek(0, 1);
     let big = vec![0xEEu8; 1 << 20];
-    log.write(0, 0, SalMessageKind::Scan, &[&big]);
+    log.write(0, 0, SalMessageKind::ScanSpec, &[&big]);
     let expected_payload = group_header_size(1) + (1 << 20); // already 8-aligned
     assert_eq!(log.log().prefix_word(0), epoch_word(1, PRESENT));
     let msg = group_in(log.log(), 0, 1);
@@ -464,10 +464,10 @@ fn every_group_header_size_is_8_aligned() {
 
     // The odd case end to end: one worker, so the directory is a single u32.
     let log = TestLog::new(1 << 20, 1, 1);
-    log.write(0, 0, SalMessageKind::Scan, &[&[0u8; 24]]);
+    log.write(0, 0, SalMessageKind::ScanSpec, &[&[0u8; 24]]);
     let second = log.cursor();
     assert_eq!(second % 8, 0, "a one-worker group's successor base must be 8-aligned");
-    log.write(0, 0, SalMessageKind::Scan, &[&[0u8; 24]]);
+    log.write(0, 0, SalMessageKind::ScanSpec, &[&[0u8; 24]]);
     assert_eq!(log.cursor() % 8, 0);
 }
 
@@ -484,7 +484,7 @@ fn the_derived_stride_equals_the_writers_group_size_at_every_width() {
         let payloads: Vec<&[u8]> = (0..slots)
             .map(|w| if w % 2 == 1 { &[][..] } else { buf.as_slice() })
             .collect();
-        log.write(7, 9, SalMessageKind::Scan, &payloads);
+        log.write(7, 9, SalMessageKind::ScanSpec, &payloads);
 
         let msg = group_in(log.log(), 0, 1);
         assert_eq!(msg.slots() as usize, slots);
@@ -1021,8 +1021,8 @@ fn every_single_bit_flip_in_a_group_header_is_rejected() {
 fn a_header_only_verifies_at_the_offset_it_was_published_at() {
     let log = TestLog::new(1 << 20, 1, 1);
     let buf = vec![0x11u8; 64];
-    log.write(42, 100, SalMessageKind::Scan, &[&buf]);
-    let second = log.write(43, 101, SalMessageKind::Scan, &[&buf]);
+    log.write(42, 100, SalMessageKind::ScanSpec, &[&buf]);
+    let second = log.write(43, 101, SalMessageKind::ScanSpec, &[&buf]);
 
     let hdr_len = group_header_size(1);
     // Group B's whole header over group A's — same epoch, same shape, a
@@ -1141,7 +1141,7 @@ fn every_kind_round_trips_through_the_header() {
 #[test]
 fn an_unknown_ordinal_in_a_verified_header_is_corrupt() {
     let log = TestLog::new(1 << 20, 1, 1);
-    log.write(0, 1, SalMessageKind::Scan, &[&[0u8; 8]]);
+    log.write(0, 1, SalMessageKind::ScanSpec, &[&[0u8; 8]]);
     let view = log.log();
 
     restamp_header(&log, |hdr| hdr[OFF_KIND] = SalMessageKind::Tick.as_wire());
@@ -1157,7 +1157,7 @@ fn an_unknown_ordinal_in_a_verified_header_is_corrupt() {
     );
 
     restamp_header(&log, |hdr| {
-        hdr[OFF_KIND] = SalMessageKind::Scan.as_wire();
+        hdr[OFF_KIND] = SalMessageKind::ScanSpec.as_wire();
         hdr[OFF_FLAGS] = FLAG_ZONE_END | FLAG_IN_REQUEST_ORDER;
     });
     assert!(group_at(view, 0).zone_end, "both known flags verify");
@@ -1191,7 +1191,7 @@ fn an_unknown_ordinal_in_a_verified_header_is_corrupt() {
 fn the_live_path_parks_on_a_leftover_whose_prefix_epoch_was_raised() {
     use crate::runtime::sal::SalReader;
     let log = TestLog::new(1 << 20, 1, 1);
-    log.write(7, 11, SalMessageKind::Scan, &[&[0u8; 32]]);
+    log.write(7, 11, SalMessageKind::ScanSpec, &[&[0u8; 32]]);
     // Raise only the prefix's epoch copy: 1 -> 2, header untouched.
     unsafe {
         let word = log.ptr() as *mut u64;
@@ -1232,7 +1232,7 @@ fn the_live_path_aborts_on_a_damaged_header_internal() {
         return;
     }
     let log = TestLog::new(1 << 20, 1, 1);
-    log.write(7, 11, SalMessageKind::Scan, &[&[0u8; 32]]);
+    log.write(7, 11, SalMessageKind::ScanSpec, &[&[0u8; 32]]);
     // A sanity read before the damage, so the abort below is the damage.
     let reader = SalReader::new(log.log(), 0, 1);
     assert!(reader.next().is_some());

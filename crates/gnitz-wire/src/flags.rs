@@ -9,16 +9,12 @@ wire_enum! {
     /// The verb a client request frame names.
     #[derive(Default)]
     pub enum ClientVerb: u8 {
-        /// Stream a whole relation.
+        /// A parameterized bounded read (`ReadSpec`) of one relation, replied in
+        /// the layout whose digest is `arg0`.
         #[default]
-        Scan = 0,
+        ScanSpec = 0,
         /// A data push. An empty batch is still a push, ACKed at LSN 0.
         Push = 1,
-        /// Every row of one PK group, the key (packed native-LE PK columns) in the
-        /// blob.
-        Seek = 2,
-        /// A parameterized bounded read (`ReadSpec`).
-        ScanSpec = 3,
         /// A delta read of N views: one frame naming N fed views, each with its
         /// own cursor and client-authored reply schema.
         DeltaPoll = 4,
@@ -56,8 +52,6 @@ pub struct WireFlags {
     pub verb: ClientVerb,
     /// Bits 8-15: a push's conflict mode.
     pub conflict_mode: WireConflictMode,
-    /// Bits 16-31: the relation schema version the frame speaks, 0 = none.
-    pub schema_version: u16,
     /// Bit 34: more frames of this reply follow. Set on every per-worker reply
     /// frame, absent on the master's terminal frame.
     pub continuation: bool,
@@ -73,16 +67,16 @@ pub struct WireFlags {
 pub(crate) const FLAG_HAS_SCHEMA: u64 = 1 << 32;
 pub(crate) const FLAG_HAS_DATA: u64 = 1 << 33;
 
-const RESERVED_BITS: u64 = !crate::low_bits_mask(39);
+/// Bits 16-31 and 39-63: no field.
+const RESERVED_BITS: u64 = !crate::low_bits_mask(39) | (crate::low_bits_mask(32) & !crate::low_bits_mask(16));
 
 impl WireFlags {
     /// A frame of a worker's reply train: `continuation` always, since the master's terminal
     /// frame ends the client's reply; `scan_last` on the train's last frame.
-    pub const fn train_frame(schema_version: u16, last: bool) -> Self {
+    pub const fn train_frame(last: bool) -> Self {
         WireFlags {
-            verb: ClientVerb::Scan,
+            verb: ClientVerb::ScanSpec,
             conflict_mode: WireConflictMode::Update,
-            schema_version,
             continuation: true,
             batch_consolidated: false,
             scan_last: last,
@@ -93,7 +87,6 @@ impl WireFlags {
     pub const fn pack(self) -> u64 {
         self.verb as u64
             | (self.conflict_mode as u64) << 8
-            | (self.schema_version as u64) << 16
             | (self.continuation as u64) << 34
             | (self.batch_consolidated as u64) << 35
             | (self.scan_last as u64) << 36
@@ -110,7 +103,6 @@ impl WireFlags {
         Ok(WireFlags {
             verb: ClientVerb::from_wire(w as u8).ok_or("flags: unknown request verb")?,
             conflict_mode: WireConflictMode::from_wire((w >> 8) as u8).ok_or("flags: unknown conflict mode")?,
-            schema_version: (w >> 16) as u16,
             continuation: bit(34),
             batch_consolidated: bit(35),
             scan_last: bit(36),

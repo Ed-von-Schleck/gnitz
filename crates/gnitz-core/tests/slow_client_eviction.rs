@@ -7,10 +7,12 @@
 
 use std::os::fd::RawFd;
 
-use gnitz_core::protocol::{encode_frame, hello_handshake, ClientTransport};
-use gnitz_core::{BatchAppender, ColumnDef, GnitzClient, Schema, TableProps, TypeCode, ZSetBatch};
+use gnitz_core::{encode_frame, hello_handshake, ClientTransport};
+use gnitz_core::{BatchAppender, GnitzClient, Schema, ZSetBatch};
+use gnitz_expr::SchemaFacts;
 use gnitz_foundation::posix_io::set_sockopt_int;
 use gnitz_test_harness::{unique_schema, ServerHandle};
+use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, WireConflictMode};
 
 /// Wait up to `deadline_ms` for the server to shut down its end of `fd`,
 /// detected via POLLHUP/POLLRDHUP without reading — reading would drain the
@@ -46,7 +48,9 @@ fn slow_scan_client_is_evicted_after_deadline() {
     for pk in 0..40_000u128 {
         app.add_row(pk, 1).i64_val(0).i64_val(0);
     }
-    client.push(table_id, &schema, &batch).unwrap();
+    client
+        .push(table_id, &schema, &batch, WireConflictMode::Update)
+        .unwrap();
 
     // A raw connection that issues the scan and never reads.
     let mut slow = ClientTransport::connect(srv.sock_path(), None).expect("connect");
@@ -56,9 +60,10 @@ fn slow_scan_client_is_evicted_after_deadline() {
     hello_handshake(&mut slow, None).expect("hello");
     let hdr = gnitz_wire::control::ControlHeader {
         target_id: table_id,
+        arg0: schema.layout_digest(),
         ..Default::default()
     };
-    let scan = encode_frame(hdr, &[], None, None);
+    let scan = encode_frame(hdr, &ReadSpec::all_rows(ReadBound::None).encode(), None, None);
     slow.send_frame(scan, None).expect("send scan");
 
     let evicted = peer_hung_up_within(slow.as_raw_fd(), 8000);
@@ -74,7 +79,11 @@ fn slow_scan_client_is_evicted_after_deadline() {
         .add_row(40_000, 1)
         .i64_val(0)
         .i64_val(0);
-    client.push(table_id, &schema, &more).unwrap();
-    let batch = client.scan(table_id).expect("scan after the eviction").batch;
+    client.push(table_id, &schema, &more, WireConflictMode::Update).unwrap();
+    let spec = ReadSpec::all_rows(ReadBound::None);
+    let batch = client
+        .scan_spec(table_id, &spec, &std::sync::Arc::new(schema.clone()))
+        .expect("scan after the eviction")
+        .batch;
     assert_eq!(batch.len(), 40_001);
 }

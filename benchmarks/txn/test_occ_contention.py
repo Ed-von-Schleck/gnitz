@@ -19,8 +19,8 @@ pytestmark = pytest.mark.multiworker
 CONTENTION_OPS = {"quick": 100, "full": 1000}
 
 
-def _positive(client, tid):
-    return [(r.pk, r.n) for r in client.scan(tid) if r._weight > 0]
+def _positive(client, tid, schema):
+    return [(r.pk, r.n) for r in client.scan(tid, schema) if r._weight > 0]
 
 
 @pytest.mark.parametrize("n_clients", OCC_CLIENTS)
@@ -48,8 +48,8 @@ def test_occ_contention(client, socket_path, schema_name, bench_timer, scale_mod
 
     # No lost update: every hot row incremented exactly once per committed op.
     expected = n_clients * ops
-    tid, _ = client.resolve_table(sn, "ctr")
-    rows = _positive(client, tid)
+    tid, schema = client.resolve_table(sn, "ctr")
+    rows = _positive(client, tid, schema)
     assert len(rows) == hot
     for pk, val in rows:
         assert val == expected, f"lost update: pk={pk} n={val} != {expected}"

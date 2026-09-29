@@ -6,7 +6,8 @@ use crate::bind::Catalog;
 use crate::error::GnitzSqlError;
 use crate::hir::plan_create_view;
 use crate::test_support::{col, ncol, parse_stmt, register, rel, table};
-use gnitz_core::{ColumnDef, PlannedView, RelClass, TypeCode};
+use gnitz_core::PlannedView;
+use gnitz_wire::{ColumnDef, RelClass, TypeCode};
 use std::sync::Arc;
 
 /// `t(id BIGINT PK, k BIGINT, a BIGINT, b BIGINT NULL, s TEXT, f DOUBLE)`,

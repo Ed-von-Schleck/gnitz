@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_core::ColType;
+use gnitz_wire::ColType;
 
 /// The `table_options` of a parsed `CREATE TABLE`, so the option tests below
 /// exercise the same AST shape `execute_create_table` receives.

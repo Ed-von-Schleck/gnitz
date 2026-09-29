@@ -1,6 +1,7 @@
 use super::*;
 use crate::ir::{BoundExpr, StrFunc};
-use gnitz_core::{ColumnDef, Schema, TypeCode};
+use gnitz_core::Schema;
+use gnitz_wire::{ColumnDef, TypeCode};
 
 #[test]
 fn validate_user_name_rejects_reserved_and_malformed() {
@@ -56,8 +57,8 @@ fn a_computed_string_projection_declares_a_string_column() {
 #[test]
 fn pk_list_arity_bounds() {
     reject_pk_list_arity("join key list", 0).unwrap();
-    reject_pk_list_arity("join key list", gnitz_core::PK_LIST_MAX_COLS).unwrap();
-    let over = reject_pk_list_arity("range JOIN output PK", gnitz_core::PK_LIST_MAX_COLS + 1).unwrap_err();
+    reject_pk_list_arity("join key list", gnitz_wire::PK_LIST_MAX_COLS).unwrap();
+    let over = reject_pk_list_arity("range JOIN output PK", gnitz_wire::PK_LIST_MAX_COLS + 1).unwrap_err();
     let GnitzSqlError::Rejected(msg) = over else {
         panic!("expected Unsupported, got {over:?}");
     };

@@ -4,8 +4,9 @@
 use crate::ast_util::agg_func_name;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
-use gnitz_core::{ColType, ColumnDef, Schema, TypeCode};
+use gnitz_core::Schema;
 use gnitz_wire::AggFunc as WireAggFunc;
+use gnitz_wire::{ColType, ColumnDef, TypeCode};
 
 #[derive(Clone, Debug, Copy, PartialEq)]
 pub(crate) enum AggFunc {

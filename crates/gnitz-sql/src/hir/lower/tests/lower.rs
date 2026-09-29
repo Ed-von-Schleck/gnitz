@@ -1,6 +1,6 @@
 use super::*;
 use crate::hir::{ColIdGen, EqPair};
-use gnitz_core::TypeCode;
+use gnitz_wire::TypeCode;
 
 /// A `Frame` over `U64` columns named `(name, nullable)`, its layout minted
 /// from `ids`.
@@ -44,7 +44,7 @@ fn a_pinned_side_keeps_its_pk_alone() {
     let range = super::super::HirRange {
         left: left.layout[0].unwrap(),
         right: right.layout[1].unwrap(),
-        op: gnitz_core::RangeRel::Lt,
+        op: gnitz_wire::RangeRel::Lt,
         tc: TypeCode::U64,
     };
     let cls = class(Vec::new(), Some(range));
@@ -119,7 +119,7 @@ fn a_band_nu_keeps_its_key_columns() {
     let range = super::super::HirRange {
         left: left.layout[2].unwrap(),
         right: right.layout[2].unwrap(),
-        op: gnitz_core::RangeRel::Le,
+        op: gnitz_wire::RangeRel::Le,
         tc: TypeCode::U64,
     };
     let sides = join_sides(

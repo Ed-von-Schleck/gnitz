@@ -1,8 +1,9 @@
 use super::*;
 use crate::ir::NumLit;
 use crate::test_support::lit;
-use gnitz_core::{ColumnDef, Schema, TypeCode};
+use gnitz_core::Schema;
 use gnitz_expr::{CmpOp, ExprValidateErr, FloatArithOp, IntUnaryOp, LogicalInstr, LogicalInstr as L, Sink};
+use gnitz_wire::{ColumnDef, TypeCode};
 
 fn col(name: &str, tc: TypeCode) -> ColumnDef {
     ColumnDef::new(name, tc, true)
@@ -1438,8 +1439,8 @@ fn decimal_schema() -> Schema {
     Schema {
         columns: vec![
             col("pk", TypeCode::U64),
-            ColumnDef::typed("p", gnitz_core::ColType::decimal(2), true),
-            ColumnDef::typed("q", gnitz_core::ColType::decimal(3), true),
+            ColumnDef::typed("p", gnitz_wire::ColType::decimal(2), true),
+            ColumnDef::typed("q", gnitz_wire::ColType::decimal(3), true),
             col("i", TypeCode::I64),
         ],
         pk_cols: vec![0],
@@ -1552,7 +1553,7 @@ fn decimal_casts_round_at_the_target_scale() {
     let (p, q, i) = (125, 5, 3);
     let c = |i: usize| BoundExpr::ColRef(i);
     let cast = |e: BoundExpr, to| BoundExpr::Cast { expr: Box::new(e), to };
-    let dec = gnitz_core::ColType::decimal;
+    let dec = gnitz_wire::ColType::decimal;
     assert_eq!(eval_decimal_row(&cast(c(3), dec(2)), p, q, i), Some(300));
     assert_eq!(eval_decimal_row(&cast(c(2), dec(2)), p, 5, i), Some(1)); // 0.005 → 0.01
     assert_eq!(eval_decimal_row(&cast(c(2), dec(2)), p, 4, i), Some(0));

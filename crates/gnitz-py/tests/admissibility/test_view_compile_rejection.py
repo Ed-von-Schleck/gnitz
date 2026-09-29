@@ -17,7 +17,7 @@ outcomes and neither can pass vacuously. No test pins the limit itself.
 import pytest
 import gnitz
 from _caps import conjunct_ladder, first_rejected, names_a_cap
-from _read import bag
+from _read import bag, scanned
 
 
 @pytest.fixture(scope="module")
@@ -102,7 +102,7 @@ def test_a_view_never_compiles_to_silently_empty(client, caps, ns, sql_for, expe
             assert names_a_cap(e), f"n={n}: rejection must name a limit, got: {e}"
             outcomes.add("error")
             continue
-        weights = list(bag(client.scan(client.resolve_table(caps, "v")[0])).values())
+        weights = list(bag(scanned(client, caps, "v")).values())
         client.drop_view(caps, "v")
         assert weights == [1] * expected_rows, f"n={n}: expected {expected_rows} rows at weight 1, got {weights}"
         outcomes.add("ok")

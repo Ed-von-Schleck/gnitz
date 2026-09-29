@@ -12,10 +12,11 @@ use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDate, PyDateTime, PyDict, PyString, PyTuple, PyType};
 
-use gnitz_core::{ColType, ScanReply, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{ScanReply, Schema, ZSetBatch};
 use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_wire::decimal::format_decimal;
 use gnitz_wire::format_uuid;
+use gnitz_wire::{ColType, TypeCode};
 
 use crate::schema::PySchema;
 

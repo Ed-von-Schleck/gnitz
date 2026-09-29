@@ -10,7 +10,8 @@ use crate::validate::{
     QueryEnvelope,
 };
 use crate::SqlResult;
-use gnitz_core::{GnitzClient, RelClass, ViewBundle, ViewProps};
+use gnitz_core::{GnitzClient, ViewBundle};
+use gnitz_wire::{RelClass, ViewProps};
 use sqlparser::ast::{CreateTableOptions, CreateView, Ident, ObjectName, Query, Value, ValueWithSpan};
 
 /// Binary units accepted by a `WITH (<option> = '<uint><unit>')` size string.

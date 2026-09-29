@@ -16,9 +16,10 @@ use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::BoundExpr;
 use crate::validate::{reject_unhonored_delete_clauses, reject_unhonored_update_clauses, require_class, ClassWant};
 use crate::SqlResult;
-use gnitz_core::{retraction_batch, ColType, ColumnDef, FixedInt, GnitzClient, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{retraction_batch, GnitzClient, Schema, ZSetBatch};
 use gnitz_expr::{ExprResults, ScalarEval, SchemaFacts};
 use gnitz_wire::{encode_german_string, german_string_content, null_word_get, null_word_set};
+use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
 use sqlparser::ast::{Assignment, AssignmentTarget, Delete, Expr, FromTable, TableWithJoins, Update};
 
 // ---------------------------------------------------------------------------

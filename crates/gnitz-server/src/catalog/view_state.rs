@@ -3,25 +3,13 @@
 //! wrappers that add what a caller cannot — the hydrator.
 
 use super::*;
-use gnitz_expr::SchemaFacts;
 use gnitz_store::read::SourceCursor;
 use gnitz_store::relation::Residency;
-use gnitz_wire::{ReadBound, ReadSpec};
+use gnitz_wire::ReadSpec;
 use rustc_hash::FxHashSet;
 use std::rc::Rc;
 
 impl CatalogEngine {
-    /// Every row of `table_id`, with this engine's own circuit layer as the hydrator.
-    pub(crate) fn scan(&mut self, table_id: u64) -> Result<Rc<Batch>, String> {
-        let schema = self.registry.relation_or_err(table_id)?.schema();
-        self.registry.scan_spec(
-            table_id,
-            ReadSpec::all_rows(ReadBound::None),
-            schema.layout_digest(),
-            Some(&mut self.dag),
-        )
-    }
-
     /// [`RelationRegistry::scan_spec`], hydrating.
     pub(crate) fn scan_spec(&mut self, target_id: u64, spec: ReadSpec, reply_layout: u64) -> Result<Rc<Batch>, String> {
         self.registry

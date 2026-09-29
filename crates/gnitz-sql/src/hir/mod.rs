@@ -26,8 +26,9 @@ use crate::agg::AggFunc;
 use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
-use gnitz_core::{ColType, ColumnDef, RangeRel, RelDescriptor, TypeCode, ViewBundle};
+use gnitz_core::{RelDescriptor, ViewBundle};
 use gnitz_wire::AggFunc as WireAggFunc;
+use gnitz_wire::{ColType, ColumnDef, RangeRel, TypeCode};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -801,7 +802,7 @@ impl RelExpr {
             return mapped;
         }
         match self {
-            RelExpr::Get { desc, cols } if desc.class == gnitz_core::RelClass::Table => {
+            RelExpr::Get { desc, cols } if desc.class == gnitz_wire::RelClass::Table => {
                 Some(desc.schema.pk_cols.iter().map(|&i| cols[i as usize].id).collect())
             }
             RelExpr::Reduce { group_cols, .. } => Some(group_cols.clone()),

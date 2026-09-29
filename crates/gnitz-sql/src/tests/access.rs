@@ -5,7 +5,7 @@ use crate::test_support::{
     in_list_expr, ncol, neg_num_expr, num_expr, parse_expr_sql, pk_schema, two_col, uuid_schema_payload,
     uuid_schema_pk,
 };
-use gnitz_core::{ColumnDef, PkBuf};
+use gnitz_wire::{ColumnDef, PkBuf};
 use sqlparser::ast::Expr;
 
 /// `v`'s key image in a `tc` column.
@@ -1034,7 +1034,7 @@ fn a_u64_pk_against_a_negative_literal() {
 fn a_decimal_pk_against_a_finer_literal() {
     let schema = Schema {
         columns: vec![
-            gnitz_core::ColumnDef::typed("d", gnitz_core::ColType::decimal(2), false),
+            gnitz_wire::ColumnDef::typed("d", gnitz_wire::ColType::decimal(2), false),
             col("v", TypeCode::I64),
         ],
         pk_cols: vec![0],

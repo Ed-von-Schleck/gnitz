@@ -1235,7 +1235,7 @@ fn only_a_scanned_table_holds_a_push_for_its_tick() {
 
     engine.ingest_unticked(tid, make_batch(&schema, &[(1, 1, 10)])).unwrap();
     assert!(engine.dag.take_unticked(tid).is_none());
-    assert_eq!(engine.scan(tid).unwrap().len(), 1);
+    assert_eq!(scan_all(&mut engine, tid).len(), 1);
 
     try_register_identity_view(&mut engine, tid, "v", &cols, 0, 0).unwrap();
     engine.ingest_unticked(tid, make_batch(&schema, &[(2, 1, 20)])).unwrap();

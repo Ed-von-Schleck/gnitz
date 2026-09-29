@@ -5,7 +5,8 @@
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use gnitz_core::{ClientError, GnitzClient, MirrorError, TypeCode, WireStatus};
+use gnitz_core::{ClientError, GnitzClient, MirrorError};
+use gnitz_wire::{TypeCode, WireStatus};
 
 mod async_transport;
 mod client;
@@ -156,5 +157,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("debug_assertions", cfg!(debug_assertions))?;
     m.add_class::<PyDeltaReply>()?;
     m.add_function(wrap_pyfunction!(type_codes, m)?)?;
+    m.add_function(wrap_pyfunction!(schema::sys_schema, m)?)?;
     Ok(())
 }

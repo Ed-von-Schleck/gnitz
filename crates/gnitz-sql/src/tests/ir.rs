@@ -1,6 +1,7 @@
 use super::*;
 use crate::test_support::lit;
-use gnitz_core::{ColumnDef, Schema};
+use gnitz_core::Schema;
+use gnitz_wire::ColumnDef;
 
 fn schema(cols: &[TypeCode]) -> Schema {
     Schema {

@@ -18,7 +18,7 @@ use crate::validate::{
     as_plain_select, computed_column_name, cte_body, non_recursive_ctes, reject_duplicate_projection_names,
     reject_unhonored_select_clauses, require_class, validate_user_name, ClassWant, HonoredClauses,
 };
-use gnitz_core::{ColumnDef, TypeCode};
+use gnitz_wire::{ColumnDef, TypeCode};
 use sqlparser::ast::{
     BinaryOperator, Expr, GroupByExpr, Ident, OrderBy, OrderByKind, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, TableWithJoins, WildcardAdditionalOptions,

@@ -1,7 +1,5 @@
 use super::*;
-use crate::protocol::TypeCode;
-use crate::SchemaFacts;
-use gnitz_wire::PkKeys;
+use gnitz_wire::TypeCode;
 
 fn kv_schema() -> Schema {
     Schema {
@@ -262,7 +260,7 @@ fn a_pk_set_restricts_the_buffered_side_to_its_keys() {
         3,
     )
     .unwrap();
-    let keys = PkKeys::from_keys(s.pk_stride(), [s.opk_key_cols(&[1]).pk_bytes()]);
+    let keys = PkColumn::from_natives(&s, [1]).keys();
     let out = overlay_of(&mut buf, ReadBound::PkSet(keys), Vec::new(), ZSetBatch::new(&s));
     assert_eq!(out, [(1, 11, 1)]);
 }
@@ -334,8 +332,7 @@ fn a_copied_catalog_row_differs_only_where_it_is_patched() {
         },
         1,
     );
-    let i = scanned.live_row_with_pk(schema, 7).expect("the row just written");
-    assert!(scanned.live_row_with_pk(schema, 8).is_none(), "an absent tid");
+    let i = 0;
 
     let mut pair = ZSetBatch::new(schema);
     pair.copy_row_at(&scanned, i, -1);

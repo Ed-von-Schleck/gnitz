@@ -37,26 +37,30 @@ def fact_dim(client, schema_name):
     client.execute_sql(
         "INSERT INTO fact VALUES "
         + ",".join(f"({i}, {i % NDIMS})" for i in range(NFACTS)), schema_name=sn)
-    return sn, client.resolve_table(sn, "jv")[0]
+    return sn, *client.resolve_table(sn, "jv")
 
 
 def test_a_join_view_seek_returns_every_row_of_its_key(client, fact_dim):
     """The ground truth is a full scan of the view grouped by key; a seek of each
     key must reproduce its whole group, weights included."""
-    _, vid = fact_dim
+    _, vid, schema = fact_dim
     groups = {}
-    for r in client.scan(vid).including_hidden():
+    before = client.requests_sent
+    for r in client.scan(vid, schema).including_hidden():
         groups.setdefault(r["_join_pk"], []).append(r)
+    assert client.requests_sent == before + 1, "a scan is one request"
     assert len(groups) == NDIMS, groups
 
     for key, want in groups.items():
         assert len(want) == NFACTS // NDIMS, f"fixture: key {key} -> {want}"
-        got = list(client.seek(vid, pk=key).including_hidden())
+        before = client.requests_sent
+        got = list(client.seek(vid, schema, pk=key).including_hidden())
+        assert client.requests_sent == before + 1, "a seek is one request"
         assert bag(got, "fid", "did") == bag(want, "fid", "did"), f"seek(jv, {key})"
         assert all(r["_join_pk"] == key for r in got)
 
     # An absent key is an empty answer, not an error.
-    assert list(client.seek(vid, pk=max(groups) + 1000)) == []
+    assert list(client.seek(vid, schema, pk=max(groups) + 1000)) == []
 
 
 @pytest.mark.parametrize("replicated", [False, True])
@@ -73,10 +77,10 @@ def test_a_base_table_seek_stays_one_row(client, schema_name, replicated):
     client.execute_sql(
         "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 10})" for i in range(NFACTS)),
         schema_name=sn)
-    tid = client.resolve_table(sn, "t")[0]
+    tid, schema = client.resolve_table(sn, "t")
     for i in range(NFACTS):
-        assert bag(client.seek(tid, pk=i)) == {(i, i * 10): 1}, f"seek(t, {i})"
-    assert list(client.seek(tid, pk=NFACTS + 7)) == []
+        assert bag(client.seek(tid, schema, pk=i)) == {(i, i * 10): 1}, f"seek(t, {i})"
+    assert list(client.seek(tid, schema, pk=NFACTS + 7)) == []
 
 
 def test_a_group_past_one_frame_is_returned_whole(client, schema_name):
@@ -106,8 +110,7 @@ def test_a_group_past_one_frame_is_returned_whole(client, schema_name):
         client.push(fact_id, gnitz.ZSetBatch(fact_schema).extend(
             {"id": fid, "k": 1, "s": f"{fid:08d}" + "x" * (width - 8)} for fid in fids))
 
-    vid = client.resolve_table(sn, "jv")[0]
-    assert len(list(client.seek(vid, pk=1))) == rows_per_push * npush
+    assert len(list(client.seek(*client.resolve_table(sn, "jv"), pk=1))) == rows_per_push * npush
 
     # The connection is intact: the next statement answers normally.
     assert bag(scanned(client, sn, "dim")) == {(1, 1): 1}

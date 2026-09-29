@@ -44,6 +44,10 @@ def _batch(rows):
     return gnitz.ZSetBatch(KV).extend(rows)
 
 
+# The schema of the system table the lifecycle tests read.
+_SCHEMAS = gnitz.sys_schema(gnitz.SCHEMA_TAB)
+
+
 # ---------------------------------------------------------------------------
 # Pipelining
 # ---------------------------------------------------------------------------
@@ -67,11 +71,11 @@ async def test_pipeline_mixes_operation_kinds(client, schema_name, aconn):
     push_lsn, empty_lsn, scan_a, scan_b, seek_a, seek_b, many = await asyncio.gather(
         aconn.push(a, _batch([{"pk": 42, "val": 4242}])),
         aconn.push(b, gnitz.ZSetBatch(KV)),
-        aconn.scan(a),
-        aconn.scan(b),
-        aconn.seek(a, 3),
-        aconn.seek(b, 2),
-        aconn.scan_many([b, a]),
+        aconn.scan(a, KV),
+        aconn.scan(b, KV),
+        aconn.seek(a, KV, 3),
+        aconn.seek(b, KV, 2),
+        aconn.scan_many([(b, KV), (a, KV)]),
     )
 
     rows_a = {(i, 100 + i): 1 for i in range(1, 6)} | {(42, 4242): 1}
@@ -104,7 +108,7 @@ async def test_a_gathered_burst_resolves_every_future(aconn, table):
     assert min(lsns) > 0 and lsns == sorted(lsns)
 
     expected = {(i, i): 1 for i in range(n)}
-    for result in await asyncio.gather(*[aconn.scan(table) for _ in range(10)]):
+    for result in await asyncio.gather(*[aconn.scan(table, KV) for _ in range(10)]):
         assert bag(result) == expected
 
 
@@ -119,7 +123,7 @@ async def test_an_abandoned_operation_is_not_a_cancellation(aconn, table):
     await asyncio.sleep(0)
 
     await aconn.push(table, _batch([{"pk": 2, "val": 20}]))
-    assert bag(await aconn.scan(table)) == {(1, 10): 1, (2, 20): 1}
+    assert bag(await aconn.scan(table, KV)) == {(1, 10): 1, (2, 20): 1}
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +148,8 @@ async def test_an_error_surfaces_from_a_gather_and_the_connection_survives(aconn
         )
 
     await aconn.push(table, _batch([{"pk": 7, "val": 70}]))
-    assert bag(await aconn.scan(table)).get((7, 70)) == 1
-    assert bag((await aconn.scan_many([table]))[0]).get((7, 70)) == 1
+    assert bag(await aconn.scan(table, KV)).get((7, 70)) == 1
+    assert bag((await aconn.scan_many([(table, KV)]))[0]).get((7, 70)) == 1
 
 
 @pytest.mark.asyncio
@@ -163,7 +167,7 @@ async def test_connection_loss_resolves_every_queued_request(disposable_server):
     proc.kill()
     proc.wait()
 
-    futs = [conn.scan(gnitz.SCHEMA_TAB) for _ in range(3000)]
+    futs = [conn.scan(gnitz.SCHEMA_TAB, _SCHEMAS) for _ in range(3000)]
     results = await asyncio.wait_for(
         asyncio.gather(*futs, return_exceptions=True), timeout=30)
     resolved_ok = [r for r in results if not isinstance(r, BaseException)]
@@ -174,7 +178,7 @@ async def test_connection_loss_resolves_every_queued_request(disposable_server):
 
     # A request submitted after the failure was observed must resolve too.
     with pytest.raises(gnitz.GnitzError):
-        await asyncio.wait_for(conn.scan(gnitz.SCHEMA_TAB), timeout=30)
+        await asyncio.wait_for(conn.scan(gnitz.SCHEMA_TAB, _SCHEMAS), timeout=30)
 
     await conn.aclose()
 
@@ -191,11 +195,12 @@ async def test_connect_shapes_close_and_refuse(server):
     resolve."""
     conn = await aio.connect(server)
     async with aio.connect(server) as other:
-        assert len(await conn.scan(gnitz.SCHEMA_TAB)) == len(await other.scan(gnitz.SCHEMA_TAB)) > 0
+        mine = await conn.scan(gnitz.SCHEMA_TAB, _SCHEMAS)
+        assert len(mine) == len(await other.scan(gnitz.SCHEMA_TAB, _SCHEMAS)) > 0
 
     await conn.aclose()
     await conn.aclose()          # idempotent
-    fut = conn.scan(gnitz.SCHEMA_TAB)   # refused through its future
+    fut = conn.scan(gnitz.SCHEMA_TAB, _SCHEMAS)   # refused through its future
     with pytest.raises(gnitz.GnitzError, match="connection closed"):
         await fut
 
@@ -217,12 +222,12 @@ async def test_a_dropped_connection_frees_its_socket(server):
     before = _open_sockets()      # the loop's self-pipe already exists
 
     conn = await aio.connect(server)
-    assert len(await conn.scan(gnitz.SCHEMA_TAB)) > 0
+    assert len(await conn.scan(gnitz.SCHEMA_TAB, _SCHEMAS)) > 0
     del conn
     await asyncio.sleep(0)
     assert _open_sockets() == before
 
-    fut = (await aio.connect(server)).scan(gnitz.SCHEMA_TAB)
+    fut = (await aio.connect(server)).scan(gnitz.SCHEMA_TAB, _SCHEMAS)
     assert len(await fut) > 0
     await asyncio.sleep(0)
     assert _open_sockets() == before
@@ -243,7 +248,8 @@ async def test_pushes_encoded_before_a_rename_land(aconn, client, schema_name):
     client.execute_sql("ALTER TABLE t RENAME COLUMN val TO amount", schema_name=schema_name)
 
     await asyncio.gather(*[aconn.push(tid, _batch([{"pk": 10 + i, "val": 100 + i}])) for i in range(3)])
-    assert bag(await aconn.scan(tid), "pk", "amount") == \
+    renamed = client.resolve_table(schema_name, "t")[1]
+    assert bag(await aconn.scan(tid, renamed), "pk", "amount") == \
         {(1, 1): 1, (10, 100): 1, (11, 101): 1, (12, 102): 1}
 
 
@@ -287,8 +293,8 @@ def batch(pk):
 
 async def main():
     async with aio.connect(target) as conn:
-        # One warm-up push, so the schema cache and the measured region are the
-        # same shape for every mode and for the n=0 baseline.
+        # One warm-up push, so the measured region is the same shape for every
+        # mode and for the n=0 baseline.
         await conn.push(tid, batch(0))
         if mode == "loop":
             for i in range(n):
@@ -365,13 +371,15 @@ def test_syscalls_per_operation(server, client, schema_name, tmp_path):
 
 _SHUTDOWN_CHILD = '''
 import asyncio, sys
+import gnitz
 from gnitz import aio
 
 async def main():
     conn = await aio.connect(sys.argv[1])
     # Work in flight when the exception escapes.
-    conn.scan(1)
-    conn.scan(1)
+    schemas = gnitz.sys_schema(gnitz.SCHEMA_TAB)
+    conn.scan(gnitz.SCHEMA_TAB, schemas)
+    conn.scan(gnitz.SCHEMA_TAB, schemas)
     raise RuntimeError("boom")
 
 asyncio.run(main())
