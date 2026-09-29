@@ -95,10 +95,7 @@ fn hashed_side(
         .slots(ids.iter().copied())?
         .into_iter()
         .zip(out)
-        .map(|(s, o)| {
-            let tc = o.def.ty.tc;
-            (s as u32, (frame.schema.columns[s].ty.tc != tc).then_some(tc))
-        })
+        .map(|(s, o)| (s as u32, o.def.ty.tc))
         .collect();
     Ok(cb.map_hash_row(node, &key))
 }

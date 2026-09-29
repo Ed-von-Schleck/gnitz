@@ -226,7 +226,7 @@ fn probe_fixture() -> ProbeFixture {
         col_def("a_id", TypeCode::U64),
         col_def("b_id", TypeCode::U64),
     ];
-    let circuit = crate::test_support::two_term_join_circuit(join_bases[0], join_bases[1]);
+    let circuit = crate::test_support::two_term_join_circuit(join_bases[0], join_bases[1], TypeCode::U64);
     let join = try_register_view(&mut engine, circuit, "bounded_join", &join_cols, 64 << 10, 0).unwrap();
     backfill(&mut engine, join, &join_bases);
 

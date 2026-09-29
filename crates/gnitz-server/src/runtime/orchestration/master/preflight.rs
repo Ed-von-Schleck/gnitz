@@ -22,7 +22,7 @@ use crate::catalog::{FkEdge, RowConstraints};
 use crate::runtime::orchestration::TxnFamily;
 use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_store::schema::key::PkBuf;
-use gnitz_store::schema::IndexKeySpec;
+use gnitz_store::schema::KeySpec;
 use gnitz_store::storage::MemBatch;
 use gnitz_wire::{PkKeys, WireConflictMode, WireProbeMode, WireStatus};
 
@@ -387,7 +387,7 @@ impl<'a> TxnBundle<'a> {
     /// Whether the bundle retires `holder`'s claim on `span` in `tid`'s index
     /// `spec`: its surviving state is deleted, or holds a NULL or another span
     /// there. A holder the bundle does not touch keeps its claim.
-    fn retires(&self, tid: u64, spec: &IndexKeySpec, holder: &[u8], span: &[u8], buf: &mut PkBuf) -> bool {
+    fn retires(&self, tid: u64, spec: &KeySpec, holder: &[u8], span: &[u8], buf: &mut PkBuf) -> bool {
         match self.fold(tid).get(holder).map(|e| e.last) {
             None => false,
             Some(FoldOp::Deleted) => true,
@@ -410,7 +410,7 @@ struct FkProbePlan {
 struct UniquePlan<'a> {
     tid: u64,
     col_indices: PkColList,
-    spec: IndexKeySpec,
+    spec: KeySpec,
     holders: Vec<&'a [u8]>,
 }
 
@@ -976,7 +976,7 @@ struct RestrictPlan {
     edge: FkEdge,
     /// Splits a reply entry into `[span ‖ holder PK]`, and re-encodes a
     /// surviving holder's own span for the exemption test.
-    spec: IndexKeySpec,
+    spec: KeySpec,
     /// The probed referenced values' key images, sorted: check batch row `j`
     /// encodes `values[j]`. A reply names a span, the rejection names a value.
     values: Vec<u128>,

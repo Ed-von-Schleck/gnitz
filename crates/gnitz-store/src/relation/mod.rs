@@ -52,7 +52,7 @@ pub struct SecondaryIndex {
     /// consumers do no per-call spec rebuild. It survives every column ALTER of
     /// the owner — [`RelationRegistry::swap_schema`] rejects any descriptor that
     /// would not leave it valid.
-    key_spec: crate::schema::IndexKeySpec,
+    key_spec: crate::schema::KeySpec,
     /// Every holder of this circuit.
     claims: Vec<IndexClaim>,
     /// Whether `cols` covers the owner's PK, so the index can never collide.
@@ -78,7 +78,7 @@ impl SecondaryIndex {
         *self.store.schema()
     }
 
-    pub fn key_spec(&self) -> crate::schema::IndexKeySpec {
+    pub fn key_spec(&self) -> crate::schema::KeySpec {
         self.key_spec
     }
 

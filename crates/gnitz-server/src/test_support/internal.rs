@@ -81,21 +81,21 @@ pub fn negate_chain(source: u64, n: usize) -> Circuit {
     circuit
 }
 
-/// `source` scanned and reindexed on its column 1, keeping its column 0, which
-/// it states as its scatter key.
-pub fn reindexed_on_col1(circuit: &mut Circuit, source: u64) -> gnitz_wire::NodeId {
-    let key = [(1, None)];
+/// `source` scanned and reindexed on its column 1, of type `tc`, keeping its
+/// column 0, which it states as its scatter key.
+pub fn reindexed_on_col1(circuit: &mut Circuit, source: u64, tc: gnitz_wire::TypeCode) -> gnitz_wire::NodeId {
+    let key = [(1, tc.reindex_output_type())];
     let scan = circuit.input_delta(source, gnitz_wire::ReadBound::None);
     let role = gnitz_wire::ReindexRole::ScatterKey { source, source_key: key.to_vec() };
     circuit.map_reindex(scan, &key, &[0], role, gnitz_wire::NullKeys::Keep)
 }
 
-/// An equi-join of `a` and `b` on their column 1, each side stating its scatter
-/// key where `keyed` says so.
-pub fn equi_join_circuit(a: u64, b: u64, keyed: [bool; 2]) -> Circuit {
+/// An equi-join of `a` and `b` on their column 1, of type `tc`, each side
+/// stating its scatter key where `keyed` says so.
+pub fn equi_join_circuit(a: u64, b: u64, tc: gnitz_wire::TypeCode, keyed: [bool; 2]) -> Circuit {
     let mut circuit = Circuit::default();
     let [ka, kb] = [(a, keyed[0]), (b, keyed[1])].map(|(source, keyed)| match keyed {
-        true => reindexed_on_col1(&mut circuit, source),
+        true => reindexed_on_col1(&mut circuit, source, tc),
         false => circuit.input_delta(source, gnitz_wire::ReadBound::None),
     });
     let tb = circuit.integrate_trace(kb);
@@ -104,11 +104,11 @@ pub fn equi_join_circuit(a: u64, b: u64, keyed: [bool; 2]) -> Circuit {
     circuit
 }
 
-/// A two-term inner equi-join of `a` and `b` on their column 1, output
-/// `[key, a.0, b.0]`.
-pub fn two_term_join_circuit(a: u64, b: u64) -> Circuit {
+/// A two-term inner equi-join of `a` and `b` on their column 1, of type `tc`,
+/// output `[key, a.0, b.0]`.
+pub fn two_term_join_circuit(a: u64, b: u64, tc: gnitz_wire::TypeCode) -> Circuit {
     let mut circuit = Circuit::default();
-    let deltas = [a, b].map(|source| reindexed_on_col1(&mut circuit, source));
+    let deltas = [a, b].map(|source| reindexed_on_col1(&mut circuit, source, tc));
     let traces = deltas.map(|d| circuit.integrate_trace(d));
     let joined = circuit.join_terms(deltas, traces, gnitz_wire::JoinKind::Equi);
     circuit.sink(joined);

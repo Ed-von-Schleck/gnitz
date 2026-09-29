@@ -95,7 +95,7 @@ fn a_view_whose_circuit_is_unroutable_or_over_cap_is_rejected_before_the_sal() {
 
     for (circuit, want) in [
         (
-            equi_join_circuit(a, b, [false, true]),
+            equi_join_circuit(a, b, TypeCode::I64, [false, true]),
             format!("source {a} feeds a join and states no scatter key"),
         ),
         (

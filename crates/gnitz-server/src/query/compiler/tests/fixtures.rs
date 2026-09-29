@@ -52,11 +52,10 @@ pub(in crate::query) fn scan_delta(source: u64) -> gnitz_wire::OpNode {
     }
 }
 
-/// A `ScatterKey` reindex on `cols`, stating `source`'s route as the same
-/// columns — what a spine that moves no column produces. A fixture turning on
+/// A `ScatterKey` reindex on `key`, stating `source`'s route as the same
+/// slots — what a spine that moves no column produces. A fixture turning on
 /// any other field spells the variant out instead.
-pub(in crate::query) fn scatter_reindex(source: u64, cols: &[u32]) -> gnitz_wire::OpNode {
-    let key: Vec<gnitz_wire::ReindexSlot> = cols.iter().map(|&c| (c, None)).collect();
+pub(in crate::query) fn scatter_reindex(source: u64, key: Vec<gnitz_wire::ReindexSlot>) -> gnitz_wire::OpNode {
     gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
         keep: vec![0],
         key: key.clone(),

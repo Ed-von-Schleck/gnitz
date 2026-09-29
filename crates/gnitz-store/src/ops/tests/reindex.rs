@@ -4,16 +4,12 @@ use crate::storage::{Batch, BatchBuilder};
 use crate::test_support::{le_cell, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string, opk_pk};
 
 /// Write `packer`'s key for every row of `src` into `out`'s PK region — what
-/// `ops::MapPlan`'s `PkSource::Pack` arm does in production, spelled here so
-/// the tests below drive the packer through a stored PK region rather than a
-/// scratch buffer.
-fn promote_into<R: RowSource>(packer: &ReindexPacker, src: &R, out: &mut Batch) {
+/// `ops::MapPlan`'s `PkSource::Pack` arm runs, so the tests below drive the
+/// packer through a stored PK region rather than a scratch buffer.
+fn promote_into<B: BatchView>(packer: &ReindexPacker, src: &B, out: &mut Batch) {
     assert_eq!(out.pk_stride() as usize, packer.out_stride);
     let (n, stride) = (out.count, packer.out_stride);
-    let pk = out.pk_data_mut();
-    for row in 0..n {
-        packer.pack_into(&mut pk[row * stride..(row + 1) * stride], src, row);
-    }
+    packer.pack_rows(out.pk_data_mut(), stride, src, 0, n);
 }
 
 /// Worker count the co-partition pins route against. Any count works — the
@@ -22,60 +18,30 @@ fn promote_into<R: RowSource>(packer: &ReindexPacker, src: &R, out: &mut Batch) 
 const NW: usize = 4;
 
 // -----------------------------------------------------------------------
-// german_string_promote_key — the content-hash arm's own contract
+// The content-hash arm's own contract
 // -----------------------------------------------------------------------
 
 #[test]
-fn test_german_string_promote_key_short_and_long() {
+fn a_string_key_packs_its_content_hash() {
     // Two rows: one short ("foo", inline) and one long string (> 12 bytes,
-    // stored in blob). Both German-string layouts execute, and distinct
-    // strings hash to distinct PKs.
+    // stored in blob), so both German-string layouts execute.
     let schema = make_schema_pk_u64_payload_string();
     let mut b = BatchBuilder::new(schema);
-
-    // Row 0: short string "foo" (3 bytes, inline).
-    b.begin_row(1u128, 1i64);
-    b.put_blob(b"foo");
-    b.end_row();
-
-    // Row 1: long string (15 bytes > SHORT_STRING_THRESHOLD=12), heap-allocated.
-    let long_str: &[u8] = b"hello-world-xyz";
-    b.begin_row(2u128, 1i64);
-    b.put_blob(long_str);
-    b.end_row();
+    let contents: [&[u8]; 2] = [b"foo", b"hello-world-xyz"];
+    for (r, content) in contents.iter().enumerate() {
+        b.begin_row(r as u128 + 1, 1i64);
+        b.put_blob(content);
+        b.end_row();
+    }
     let b = b.finish();
-
     let mb = b.as_mem_batch();
-    let pk_short = german_string_promote_key(mb.get_col_ptr(0, 0, 16), mb.blob);
-    let pk_long = german_string_promote_key(mb.get_col_ptr(1, 0, 16), mb.blob);
 
-    // The digest is deterministic but not pinned. What matters: non-empty
-    // content hashes non-zero, distinct content hashes distinctly, and the
-    // high half is populated (a real 128-bit hash, not a widened 64-bit one).
-    assert_ne!(pk_short, 0);
-    assert_ne!(pk_long, 0);
-    assert_ne!(pk_short, pk_long);
-    assert_ne!(
-        pk_short >> 64,
-        0,
-        "short string PK must populate high half via xxh3_128"
-    );
-    assert_ne!(pk_long >> 64, 0, "long string PK must populate high half via xxh3_128");
-}
-
-#[test]
-fn test_german_string_promote_key_empty_is_zero() {
-    // The hash early-returns 0 for length==0 — assert this is the contract,
-    // not an accidental side-effect of xxh on empty input.
-    let schema = make_schema_pk_u64_payload_string();
-    let mut b = BatchBuilder::new(schema);
-    b.begin_row(1, 1);
-    b.put_blob(b"");
-    b.end_row();
-    let b = b.finish();
-
-    let mb = b.as_mem_batch();
-    assert_eq!(german_string_promote_key(mb.get_col_ptr(0, 0, 16), mb.blob), 0);
+    let packer = ReindexPacker::new(&schema, &[(1, TypeCode::U128)]).unwrap();
+    for (row, content) in contents.iter().enumerate() {
+        let mut buf = [0u8; 16];
+        packer.pack_into(&mut buf, &mb, row);
+        assert_eq!(buf, gnitz_wire::checksum_128(content).to_be_bytes(), "row {row}");
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -175,16 +141,14 @@ fn packer_output_schema_pk_width_policy() {
             ],
             &[0],
         );
-        let node_schema = ReindexPacker::new(&in_schema, &[(1, None)])
+        let node_schema = ReindexPacker::new(&in_schema, &[(1, key_tc.reindex_output_type())])
             .unwrap()
             .output_schema(&in_schema, &[0, 1])
             .unwrap();
         assert_eq!(node_schema.columns[0].type_code, want_tc, "key {key_tc} → PK type");
         assert_eq!(node_schema.pk_stride(), want_stride, "key {key_tc} → pk_stride");
     }
-    // No float slot exists: the raw bits are equality-incorrect (±0.0) and the
-    // `order_bits` image is not what a self-derived key would land in, so the
-    // packer refuses one outright rather than picking either.
+    // A float key is refused: its raw bits are equality-incorrect (±0.0).
     for float_tc in [TypeCode::F32, TypeCode::F64] {
         let in_schema = SchemaDescriptor::new(
             &[
@@ -194,7 +158,7 @@ fn packer_output_schema_pk_width_policy() {
             &[0],
         );
         assert!(
-            ReindexPacker::new(&in_schema, &[(1, None)]).is_err(),
+            ReindexPacker::new(&in_schema, &[(1, float_tc.reindex_output_type())]).is_err(),
             "a float reindex key must be refused, not packed"
         );
         assert!(
@@ -215,7 +179,7 @@ fn packer_output_schema_compound() {
         ],
         &[0],
     );
-    let out = ReindexPacker::new(&in_schema, &[(1, None), (2, None)])
+    let out = ReindexPacker::new(&in_schema, &[(1, TypeCode::I32), (2, TypeCode::U128)])
         .unwrap()
         .output_schema(&in_schema, &[0, 1, 2])
         .unwrap();
@@ -233,7 +197,7 @@ fn packer_output_schema_compound() {
 #[test]
 fn packer_output_schema_cross_width_promotes() {
     // in_schema: [U64 pk, I32, I64]; reindex on (col1 I32, col2 I64) with
-    // slot 0 promoted to I64 (carried) and slot 1 self-deriving.
+    // slot 0 promoted to I64 and slot 1 self-typed.
     let in_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
@@ -242,12 +206,12 @@ fn packer_output_schema_cross_width_promotes() {
         ],
         &[0],
     );
-    let out = ReindexPacker::new(&in_schema, &[(1, Some(gnitz_wire::TypeCode::I64)), (2, None)])
+    let out = ReindexPacker::new(&in_schema, &[(1, TypeCode::I64), (2, TypeCode::I64)])
         .unwrap()
         .output_schema(&in_schema, &[0, 1, 2])
         .unwrap();
-    assert_eq!(out.columns[0].type_code, TypeCode::I64, "slot0 carried T = I64");
-    assert_eq!(out.columns[1].type_code, TypeCode::I64, "slot1 self-derives I64");
+    assert_eq!(out.columns[0].type_code, TypeCode::I64, "slot0 promoted to I64");
+    assert_eq!(out.columns[1].type_code, TypeCode::I64, "slot1 self-typed I64");
     assert_eq!(out.pk_stride(), 8 + 8, "both slots 8 bytes after promotion");
 }
 
@@ -263,7 +227,7 @@ fn packer_output_schema_payload_prune() {
         ],
         &[0],
     );
-    let out = ReindexPacker::new(&in_schema, &[(1, None)])
+    let out = ReindexPacker::new(&in_schema, &[(1, TypeCode::I32)])
         .unwrap()
         .output_schema(&in_schema, &[0, 3])
         .unwrap();
@@ -305,7 +269,7 @@ fn test_reindex_packer_multi_column_bytes() {
     let b = b.finish();
     let mb = b.as_mem_batch();
 
-    let packer = ReindexPacker::new(&schema, &[(1, None), (2, None), (3, None)]).unwrap();
+    let packer = ReindexPacker::new(&schema, &[(1, TypeCode::U64), (2, TypeCode::I32), (3, TypeCode::U128)]).unwrap();
     // out_stride = 8 (Pk U64) + 4 (I32) + 16 (U128) = 28.
     assert_eq!(packer.out_stride, 8 + 4 + 16);
 
@@ -326,12 +290,12 @@ fn test_reindex_packer_multi_column_bytes() {
 #[test]
 fn test_reindex_packer_arity1_byte_identity() {
     // The content-hash arm: a STRING and a BLOB key both pack to the
-    // big-endian image of `german_string_promote_key` over the column's
-    // content. The integer and PK-placement arms are the proptest's; this is
-    // the arm it cannot generate (`arb_pk_type` yields PK-eligible integers).
+    // big-endian image of `checksum_128` over the column's content. The
+    // integer and PK-placement arms are the proptest's; this is the arm it
+    // cannot generate (`arb_pk_type` yields PK-eligible integers).
     for schema in [make_schema_pk_u64_payload_string(), make_schema_pk_u64_payload_blob()] {
-        // Three rows with distinct content, one of them empty (the zero
-        // sentinel), exercising the per-row read.
+        // Three rows with distinct content, one of them empty, exercising the
+        // per-row read.
         let contents: [&[u8]; 3] = [b"abc", b"", b"hello-world-xyz"];
         let mut b = BatchBuilder::new(schema);
         for (r, content) in contents.iter().enumerate() {
@@ -343,13 +307,13 @@ fn test_reindex_packer_arity1_byte_identity() {
         let mb = b.as_mem_batch();
 
         let out_schema = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U128, false)], &[0]);
-        let packer = ReindexPacker::new(&schema, &[(1, None)]).unwrap();
+        let packer = ReindexPacker::new(&schema, &[(1, TypeCode::U128)]).unwrap();
         assert_eq!(packer.out_stride, 16, "a content-hash key is a 16-byte U128 slot");
         let mut out = Batch::zeroed(&out_schema, 3);
         promote_into(&packer, &mb, &mut out);
 
-        for row in 0..3 {
-            let want = german_string_promote_key(mb.get_col_ptr(row, 0, 16), mb.blob);
+        for (row, content) in contents.iter().enumerate() {
+            let want = gnitz_wire::checksum_128(content);
             assert_eq!(
                 out.get_pk_bytes(row),
                 &want.to_be_bytes()[..],
@@ -357,9 +321,7 @@ fn test_reindex_packer_arity1_byte_identity() {
                 schema.columns[1].type_code,
             );
         }
-        // The empty-content row is the zero sentinel, and the two non-empty
-        // rows do not collide with it or with each other.
-        assert_eq!(out.get_pk_bytes(1), &[0u8; 16], "empty content hashes to zero");
+        // No two contents collide, the empty one included.
         assert_ne!(out.get_pk_bytes(0), out.get_pk_bytes(2));
         assert_ne!(out.get_pk_bytes(0), out.get_pk_bytes(1));
     }
@@ -367,8 +329,8 @@ fn test_reindex_packer_arity1_byte_identity() {
 
 #[test]
 fn test_reindex_packer_copartition_contract() {
-    // The bytes the exchange scatter computes (pack_into into a scratch
-    // buffer) must be byte-identical to the `_join_pk` stored by promote_into,
+    // The bytes one row's pack computes (pack_into into a scratch buffer) must
+    // be byte-identical to the `_join_pk` stored by promote_into,
     // so the delta scatter and the reindexed trace land on the same partition.
     let schema = SchemaDescriptor::new(
         &[
@@ -396,8 +358,7 @@ fn test_reindex_packer_copartition_contract() {
     let b = b.finish();
     let mb = b.as_mem_batch();
 
-    let key: Vec<gnitz_wire::ReindexSlot> = cols.iter().map(|&c| (c, None)).collect();
-    let packer = ReindexPacker::new(&schema, &key).unwrap();
+    let packer = ReindexPacker::new(&schema, &crate::test_support::self_typed_slots(&schema, &cols)).unwrap();
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false), // col2 → U64
@@ -452,7 +413,7 @@ fn test_reindex_packer_copartition_contract_wide() {
     let mb = b.as_mem_batch();
 
     // Reindex on the three U64 payload columns → a 24-byte (3×U64) OPK key.
-    let packer = ReindexPacker::new(&schema, &[(1, None), (2, None), (3, None)]).unwrap();
+    let packer = ReindexPacker::new(&schema, &[(1, TypeCode::U64), (2, TypeCode::U64), (3, TypeCode::U64)]).unwrap();
     assert_eq!(packer.out_stride, 24, "3×U64 reindex key must be 24 bytes (wide)");
 
     // The reindex output schema = natural 3×U64 PK (what the reindex map stamps and
@@ -529,7 +490,7 @@ fn test_reindex_packer_null_key_determinism() {
     let b = b.finish();
     let mb = b.as_mem_batch();
 
-    let packer = ReindexPacker::new(&schema, &[(1, None)]).unwrap();
+    let packer = ReindexPacker::new(&schema, &[(1, TypeCode::U32)]).unwrap();
     assert_eq!(packer.out_stride, 4); // U32 key → 4-byte slot
 
     let mut buf0 = [0u8; crate::schema::MAX_PK_BYTES];
@@ -599,6 +560,40 @@ fn test_group_key_bitmap_bit_positions() {
     );
 }
 
+/// A group key packs every byte of its slot, bitmap and fold included, so
+/// `pack_rows` over a reused buffer leaves nothing of the previous rows.
+#[test]
+fn a_group_key_overwrites_its_whole_slot() {
+    let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
+    cols.extend([SchemaColumn::new(TypeCode::I32, true); 6]);
+    let schema = SchemaDescriptor::new(&cols, &[0]);
+    let mut b = BatchBuilder::new(schema);
+    for row in 0..40u64 {
+        b.begin_row(row as u128, 1);
+        for c in 0..6 {
+            match (row + c) % 5 {
+                0 => b.put_null(),
+                v => b.put_int(v as u128),
+            }
+        }
+        b.end_row();
+    }
+    let b = b.finish();
+    let mb = b.as_mem_batch();
+    // Two packed columns under a bitmap, and a key whose tail folds.
+    for group in [&[1u32, 2][..], &[1, 2, 3, 4, 5, 6]] {
+        let packer = ReindexPacker::new_group_key(&schema, group, &[]).unwrap().0;
+        let stride = packer.out_stride;
+        let mut dirty = vec![0xA5u8; mb.count * stride];
+        packer.pack_rows(&mut dirty, stride, &mb, 0, mb.count);
+        for (row, key) in dirty.chunks_exact(stride).enumerate() {
+            let mut clean = vec![0u8; stride];
+            packer.pack_into(&mut clean, &mb, row);
+            assert_eq!(key, &clean[..], "{group:?} row {row}");
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // ReindexPacker::pack_into — property test over every PK-eligible type
 // -----------------------------------------------------------------------
@@ -608,11 +603,11 @@ mod pack_proptest {
     use crate::test_support::{arb_pk_type, pk_only_schema};
     use proptest::prelude::*;
 
-    /// A legal carried promotion target: the widest slot of the source's own
-    /// signedness. For the already-widest codes that is the self-derived type,
-    /// so the two passes below are always legal, not always distinct.
-    fn carried_target(tc: TypeCode) -> gnitz_wire::TypeCode {
-        use gnitz_wire::TypeCode as T;
+    /// A legal promoted slot type: the widest slot of the source's own
+    /// signedness. For the already-widest codes that is the self-typed slot, so
+    /// the two passes below are always legal, not always distinct.
+    fn promoted_type(tc: TypeCode) -> TypeCode {
+        use TypeCode as T;
         match tc {
             TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => T::U64,
             TypeCode::I8
@@ -641,7 +636,7 @@ mod pack_proptest {
     }
 
     proptest! {
-        /// At every arity and every PK-eligible type, self-derived and carried:
+        /// At every arity and every PK-eligible type, self-typed and promoted:
         /// each slot equals its own wire encoder's output at the offset the
         /// running sum put it, **and** the two placements agree with each
         /// other. The second does not follow from the first — PK and payload
@@ -676,8 +671,8 @@ mod pack_proptest {
             let kb = kb.finish();
             let pk_mb = kb.as_mem_batch();
 
-            for carried in [false, true] {
-                let target = |tc| carried.then(|| carried_target(tc));
+            for promoted in [false, true] {
+                let target = |tc: TypeCode| if promoted { promoted_type(tc) } else { tc.reindex_output_type() };
                 let pay_key: Vec<gnitz_wire::ReindexSlot> =
                     types.iter().enumerate().map(|(i, &tc)| (i as u32 + 1, target(tc))).collect();
                 let pk_key: Vec<gnitz_wire::ReindexSlot> =
@@ -695,7 +690,7 @@ mod pack_proptest {
                 // (1) Absolute.
                 let mut off = 0usize;
                 for (i, &tc) in types.iter().enumerate() {
-                    let out_tc = gnitz_wire::resolve_reindex_type(tc, target(tc));
+                    let out_tc = target(tc);
                     let w = out_tc.wire_stride();
                     let src_w = tc.wire_stride();
 
@@ -716,7 +711,7 @@ mod pack_proptest {
         }
 
         /// `pack_rows` is `pack_into` row by row, over a window at an arbitrary
-        /// start, for both placements, self-derived and carried.
+        /// start, for both placements, self-typed and promoted.
         #[test]
         fn pack_rows_is_pack_into_per_row(
             (types, rows, bytes, start) in prop::collection::vec(arb_pk_type(), 1..=crate::schema::MAX_PK_COLUMNS)
@@ -753,8 +748,8 @@ mod pack_proptest {
             }
             let (pb, kb) = (pb.finish(), kb.finish());
             let n = rows - start;
-            for carried in [false, true] {
-                let target = |tc| carried.then(|| carried_target(tc));
+            for promoted in [false, true] {
+                let target = |tc: TypeCode| if promoted { promoted_type(tc) } else { tc.reindex_output_type() };
                 for (schema, batch, first) in [(&pay_schema, &pb, 1u32), (&pk_schema, &kb, 0)] {
                     let key: Vec<gnitz_wire::ReindexSlot> =
                         types.iter().enumerate().map(|(i, &tc)| (i as u32 + first, target(tc))).collect();
@@ -774,10 +769,10 @@ mod pack_proptest {
     }
 }
 
-/// Release-only microbench for `pack_into` — once per equijoin delta row and
-/// per scatter row. Both packer shapes: a 3-column join key (offset sum, no
-/// null word) and a nullable 2-column group key (bitmap + null-word read).
+/// Release-only microbench for `pack_rows` in `KEY_CHUNK`-row chunks, as
+/// `for_each_key` runs it, over join- and group-key shapes.
 /// `cd crates && cargo test -p gnitz-store --release reindex_pack_bench -- --ignored --nocapture --test-threads=1`
+/// `REINDEX_PACK=<name>` times one shape alone, for `perf stat`.
 #[test]
 #[ignore]
 fn reindex_pack_bench() {
@@ -787,13 +782,14 @@ fn reindex_pack_bench() {
     const N: usize = 1_000_000;
     const ITERS: usize = 20;
 
-    // --- 3-column join key: [U64 PK, U64, U64, U64], reindex on (1, 2, 3).
     let join_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
             SchemaColumn::new(TypeCode::U64, false),
             SchemaColumn::new(TypeCode::U64, false),
             SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::String, false),
         ],
         &[0],
     );
@@ -803,12 +799,20 @@ fn reindex_pack_bench() {
         jb.put_int((i.wrapping_mul(2_654_435_761)) as u128);
         jb.put_int((i.wrapping_mul(0x9E37_79B9_7F4A_7C15)) as u128);
         jb.put_int((!i) as u128);
+        jb.put_int((i as i32).wrapping_mul(-3) as u32 as u128);
+        jb.put_blob(format!("key-{}", i % 50_000).as_bytes());
         jb.end_row();
     }
     let jb = jb.finish();
     let jmb = jb.as_mem_batch();
-    let join_packer = ReindexPacker::new(&join_schema, &[(1, None), (2, None), (3, None)]).unwrap();
-    assert_eq!(join_packer.out_stride, 24);
+    let join3 = ReindexPacker::new(
+        &join_schema,
+        &[(1, TypeCode::U64), (2, TypeCode::U64), (3, TypeCode::U64)],
+    )
+    .unwrap();
+    assert_eq!(join3.out_stride, 24);
+    let promoted = ReindexPacker::new(&join_schema, &[(4, TypeCode::I64)]).unwrap();
+    let string = ReindexPacker::new(&join_schema, &[(5, TypeCode::U128)]).unwrap();
 
     // --- Nullable 2-column group key: [U64 PK, I64, U32 NULL], group on (1, 2).
     let grp_schema = SchemaDescriptor::new(
@@ -832,21 +836,30 @@ fn reindex_pack_bench() {
     }
     let gb = gb.finish();
     let gmb = gb.as_mem_batch();
-    let grp_packer = ReindexPacker::new_group_key(&grp_schema, &[1, 2], &[])
+    let group2 = ReindexPacker::new_group_key(&grp_schema, &[1, 2], &[])
         .expect("integer group columns")
         .0;
 
-    for (name, packer, mb) in [("join3", &join_packer, &jmb), ("group2-nullable", &grp_packer, &gmb)] {
+    for (name, packer, mb) in [
+        ("join3", &join3, &jmb),
+        ("promoted-i32", &promoted, &jmb),
+        ("string", &string, &jmb),
+        ("group2-nullable", &group2, &gmb),
+    ] {
+        if std::env::var("REINDEX_PACK").is_ok_and(|o| o != name) {
+            continue;
+        }
         let stride = packer.out_stride;
-        let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
+        let mut buf = vec![0u8; KEY_CHUNK * stride];
         // Warm up.
-        packer.pack_into(&mut buf[..stride], mb, 0);
+        packer.pack_rows(&mut buf, stride, mb, 0, KEY_CHUNK);
 
         let t = Instant::now();
         let mut acc = 0u64;
         for _ in 0..ITERS {
-            for row in 0..N {
-                packer.pack_into(&mut buf[..stride], mb, row);
+            for start in (0..N).step_by(KEY_CHUNK) {
+                let n = (N - start).min(KEY_CHUNK);
+                packer.pack_rows(&mut buf, stride, mb, start, n);
                 acc = acc.wrapping_add(black_box(buf[0]) as u64);
             }
         }

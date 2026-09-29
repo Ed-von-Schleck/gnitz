@@ -43,8 +43,8 @@ pub(crate) mod payload_order;
 /// The precomputed per-row read/encode plan for an index's OPK leading-key span.
 /// Lives in [`key`] with the rest of the native→OPK encoders it shares its byte
 /// contract with; re-exported here because a spec is derived from a pair of
-/// schemas, so call sites keep naming `crate::schema::IndexKeySpec`.
-pub use key::IndexKeySpec;
+/// schemas, so call sites keep naming `crate::schema::KeySpec`.
+pub use key::KeySpec;
 
 mod route;
 pub(crate) use route::worker_for_key;
@@ -722,7 +722,7 @@ impl Eq for SchemaDescriptor {}
 /// (full or leading-prefix), then reads the source PK bytes directly out of the
 /// index PK suffix. The 1-element list is the single-column index.
 ///
-/// The schema is the [`IndexKeySpec`]'s own, so a caller needing both builds the
+/// The schema is the [`KeySpec`]'s own, so a caller needing both builds the
 /// spec once and takes the schema off it rather than calling here.
 ///
 /// Total: every rejection is an `Err`, never the constructor's abort. An
@@ -735,12 +735,12 @@ pub fn make_index_schema(source_cols: &[u32], source: &SchemaDescriptor) -> Resu
     index_spec_and_schema(source_cols, source).map(|(_, schema)| schema)
 }
 
-/// [`make_index_schema`] keeping the [`IndexKeySpec`] it derives the schema from.
+/// [`make_index_schema`] keeping the [`KeySpec`] it derives the schema from.
 pub fn index_spec_and_schema(
     source_cols: &[u32],
     source: &SchemaDescriptor,
-) -> Result<(IndexKeySpec, SchemaDescriptor), String> {
-    let spec = IndexKeySpec::new(source_cols, source)?;
+) -> Result<(KeySpec, SchemaDescriptor), String> {
+    let spec = KeySpec::new(source_cols, source)?;
     let schema = spec
         .output_schema(source)
         .map_err(|e| format!("Index: composite key {e}"))?;

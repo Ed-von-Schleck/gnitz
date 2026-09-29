@@ -91,13 +91,12 @@ fn build_wide_input(schema: &SchemaDescriptor) -> Batch {
     b.finish()
 }
 
-/// The production bake for one extreme over `col` grouped by `grp`, reached the
-/// way the compiler reaches it — through the plan that owns the accumulators the
-/// bake reads.
-fn extreme_bake(schema: &SchemaDescriptor, col: u32, agg_op: AggFunc) -> AviBake {
-    let group = [1u32];
+/// The production bake for one extreme over `col` grouped by `group`, reached
+/// the way the compiler reaches it — through the plan that owns the
+/// accumulators the bake reads.
+fn extreme_bake(schema: &SchemaDescriptor, group: &[u32], col: u32, agg_op: AggFunc) -> AviBake {
     let aggs = [AggDescriptor { col_idx: col, agg_op }, AggDescriptor::COUNT_STAR];
-    ReducePlan::from_wire(schema, &group, &aggs, false)
+    ReducePlan::from_wire(schema, group, &aggs, false)
         .unwrap()
         .avi
         .expect("a MIN/MAX reduce is value-indexed")
@@ -128,7 +127,7 @@ fn secondary_index_avi_decomposition_bench() {
     let schema = src_schema();
     decompose(
         "AVI (U32 grp, I64 val)",
-        extreme_bake(&schema, 2, AggFunc::Min),
+        extreme_bake(&schema, &[1], 2, AggFunc::Min),
         build_input(&schema),
     );
 }
@@ -140,9 +139,48 @@ fn secondary_index_avi_wide_decomposition_bench() {
     let schema = wide_src_schema();
     decompose(
         "AVI (U32 grp, U128 val)",
-        extreme_bake(&schema, 2, AggFunc::Max),
+        extreme_bake(&schema, &[1], 2, AggFunc::Max),
         build_wide_input(&schema),
     );
+}
+
+/// One MIN over an I64 across packed group-key shapes.
+#[test]
+#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+fn secondary_index_avi_group_shape_bench() {
+    for (label, group) in [
+        ("I32 NOT NULL", &[(TypeCode::I32, false)][..]),
+        ("I32 nullable", &[(TypeCode::I32, true)][..]),
+        ("I64 nullable", &[(TypeCode::I64, true)][..]),
+        ("2xI32 NOT NULL", &[(TypeCode::I32, false); 2][..]),
+        ("2xI64 nullable", &[(TypeCode::I64, true); 2][..]),
+    ] {
+        let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
+        cols.extend(group.iter().map(|&(tc, nullable)| SchemaColumn::new(tc, nullable)));
+        cols.push(SchemaColumn::new(TypeCode::I64, false));
+        let schema = SchemaDescriptor::new(&cols, &[0]);
+        let mut b = BatchBuilder::new(schema);
+        for row in 0..N_ROWS as u64 {
+            b.begin_row(row as u128, 1);
+            for (i, &(tc, nullable)) in group.iter().enumerate() {
+                let g = (row + i as u64 * 7) % N_GROUPS;
+                match nullable && row % 16 == i as u64 {
+                    true => b.put_null(),
+                    false if tc == TypeCode::I32 => b.put_int((g as i32 - 5_000) as u32 as u128),
+                    false => b.put_int((g as i64 - 5_000) as u64 as u128),
+                }
+            }
+            b.put_int(((row.wrapping_mul(2654435761)) as i64) as u128);
+            b.end_row();
+        }
+        let group_cols: Vec<u32> = (1..=group.len() as u32).collect();
+        let val = group.len() as u32 + 1;
+        decompose(
+            &format!("AVI ({label} grp, I64 val)"),
+            extreme_bake(&schema, &group_cols, val, AggFunc::Min),
+            b.finish(),
+        );
+    }
 }
 
 /// The per-layer decomposition of one bake's population, timed and reported.
@@ -223,7 +261,7 @@ fn secondary_index_single_u64_pk_sort_bench() {
 }
 
 /// Per-row cost of composing one secondary-index entry key
-/// (`IndexKeySpec::write_entry` = leading-key span ‖ source-PK suffix).
+/// (`KeySpec::write_entry` = leading-key span ‖ source-PK suffix).
 ///
 /// Four shapes, chosen to separate the encode paths: a **U64 PK** source (no
 /// promotion — the span is a verbatim copy of the OPK bytes already in the PK
@@ -233,7 +271,7 @@ fn secondary_index_single_u64_pk_sort_bench() {
 #[test]
 #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
 fn index_write_span_bench() {
-    use crate::schema::IndexKeySpec;
+    use crate::schema::KeySpec;
 
     // `src_schema()` / `build_input` from the top of this file: U64 pk (col 0) |
     // U32 (col 1) | I64 (col 2), 500k rows. The four shapes map onto it directly.
@@ -241,14 +279,14 @@ fn index_write_span_bench() {
     let input = build_input(&src);
     let mb = input.as_mem_batch();
 
-    println!("\nIndexKeySpec::write_entry — per-row cost ({ITERS}x{N_ROWS} rows):");
+    println!("\nKeySpec::write_entry — per-row cost ({ITERS}x{N_ROWS} rows):");
     for (label, cols) in [
         ("U64 PK        (identity)", &[0u32][..]),
         ("I64 payload   (direct)  ", &[2][..]),
         ("U32 payload   (promoted)", &[1][..]),
         ("compound (PK, I64)      ", &[0, 2][..]),
     ] {
-        let spec = IndexKeySpec::new(cols, &src).unwrap();
+        let spec = KeySpec::new(cols, &src).unwrap();
         let elapsed = bench_time(ITERS, || {
             let mut key = [0u8; MAX_PK_BYTES];
             for row in 0..N_ROWS {

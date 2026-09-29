@@ -8,10 +8,9 @@ use std::cell::Cell;
 
 use gnitz_expr::{BatchView, RowSource};
 
-use crate::schema::key::EMPTY_LOC;
 use crate::schema::{
-    oob_col, ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_PK_BYTES,
-    MAX_PK_COLUMNS,
+    key::KeyCol, oob_col, ColumnLocator, DerivedSchema, KeySpec, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode,
+    MAX_PK_BYTES, MAX_PK_COLUMNS,
 };
 
 // ---------------------------------------------------------------------------
@@ -59,8 +58,7 @@ thread_local! {
     static FOLD_SCRATCH: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
 }
 
-/// Columns a fold assembles on the stack: the PK arity, which every real group
-/// set fits.
+/// Columns a fold assembles on the stack; a wider fold takes the scratch buffer.
 const FOLD_INLINE_COLS: usize = MAX_PK_COLUMNS;
 
 /// The columns one 128-bit row digest folds, and whether their key bytes fit
@@ -122,136 +120,42 @@ impl FoldCols {
 }
 
 // ---------------------------------------------------------------------------
-// ReindexPacker — the synthetic-key composer
-// ---------------------------------------------------------------------------
-
-/// Synthetic-PK / routing key for a German-string column's content. Both the
-/// reindex Map (setting a row's `_join_pk`) and the exchange scatter (routing the
-/// raw delta) reach it through the packer's `String` arm, so a string join key
-/// scatters to the worker that owns its own `_join_pk` partition. Empty content —
-/// including a NULL string, a zeroed German-string struct — hashes to 0.
-#[inline]
-pub(crate) fn german_string_promote_key(struct_bytes: &[u8], blob: &[u8]) -> u128 {
-    let content = gnitz_wire::german_string_content(struct_bytes, blob);
-    if content.is_empty() {
-        return 0; // NULL / empty-string sentinel
-    }
-    // A true 128-bit content hash. A 64-bit hash widened to 128 bits would carry
-    // only 2^64 of entropy — a ~2^32-row birthday bound past which two distinct
-    // strings collide to one `_join_pk` and the join's OPK byte-compare silently
-    // equijoins them.
-    gnitz_wire::checksum_128(content)
-}
-
-// ---------------------------------------------------------------------------
 // Packed group key
 // ---------------------------------------------------------------------------
 
 /// The two slots a packed group key carries besides its columns: a leading
-/// presence bitmap and a trailing overflow fold. Every width below is read back
-/// off these, so the schema, the stride and the pack offsets cannot disagree.
+/// presence bitmap and a trailing overflow fold.
 const BITMAP_COL: SchemaColumn = SchemaColumn::new(TypeCode::U8, false);
 const FOLD_COL: SchemaColumn = SchemaColumn::new(TypeCode::U128, false);
 const BITMAP_BYTES: usize = BITMAP_COL.size() as usize;
 const FOLD_BYTES: usize = FOLD_COL.size() as usize;
-// `pack_into` writes the bitmap as one bare byte and the fold as a `u128`'s
-// big-endian image, which are those columns' OPK images only at these widths.
-const _: () = assert!(BITMAP_BYTES == 1 && FOLD_BYTES == 16);
+// `pack_into` writes the bitmap as a `u8` and the fold as a `u128`.
+const _: () = assert!(BITMAP_BYTES == size_of::<u8>() && FOLD_BYTES == size_of::<u128>());
+// The bitmap has a bit for every column packed behind it.
+const _: () = assert!(MAX_PK_COLUMNS - 1 <= 8 * BITMAP_BYTES);
+// Any join key fits the PK region, so `new` checks no width.
+const _: () = assert!(MAX_PK_COLUMNS * TypeCode::U128.wire_stride() <= MAX_PK_BYTES);
 
-/// How one source column's bytes become key bytes. The group key's bitmap and
-/// fold are facts of the whole [`ReindexPacker`], not columns, and live there.
-#[derive(Clone, Copy)]
-enum PromoteKind {
-    /// Any scalar source column, at either width and either sign: the locator
-    /// says which region holds the bytes, and the encode differs only by that.
-    /// Never a float — both constructors reject one, because a reindex key is
-    /// compared as raw OPK bytes and no IEEE-754 image survives that.
-    Col(ColumnLocator),
-    /// STRING/BLOB payload: sign-agnostic XXH3 content-hash key. The only source
-    /// that is not a scalar cell the OPK encoders can consume.
-    String(ColumnLocator),
-}
+// ---------------------------------------------------------------------------
+// ReindexPacker — the synthetic-key composer
+// ---------------------------------------------------------------------------
 
-/// Per-column classifier for "read a source column, project it to OPK PK
-/// bytes". Runs once per column at construction; the resulting `PromoteKind` is
-/// stored on the `ColPromoter`, and the per-row work is the read + OPK encode
-/// `ReindexPacker::pack_into` performs.
-fn classify_promote(loc: ColumnLocator) -> PromoteKind {
-    match loc {
-        // BLOB shares the 16-byte German-string struct layout with STRING, so it
-        // takes the same hash path rather than a raw cell encode. Neither can be
-        // a PK column, so only the payload arm needs the test.
-        ColumnLocator::Payload { type_code, .. } if type_code.is_german_string() => PromoteKind::String(loc),
-        _ => PromoteKind::Col(loc),
-    }
-}
-
-/// One key column of a `ReindexPacker`: the output PK column it packs into —
-/// resolved once at construction, and its `size()` is the slot width, so the
-/// packed bytes and [`ReindexPacker::output_schema`] read one value rather than
-/// two — plus the `PromoteKind` that says where the source bytes come from.
-#[derive(Clone, Copy)]
-struct ColPromoter {
-    out_col: SchemaColumn,
-    /// Group key only: the source column is nullable, so a NULL packs a zeroed
-    /// slot and sets its bit in the presence bitmap.
-    nullable: bool,
-    kind: PromoteKind,
-}
-
-impl ColPromoter {
-    /// Unused slots of the fixed `cols` array, matching what `IndexKeySpec::new`
-    /// fills its own with: the schema layer's designated padding column and a
-    /// zeroed PK locator.
-    const PLACEHOLDER: ColPromoter = ColPromoter {
-        out_col: SchemaColumn::EMPTY,
-        nullable: false,
-        kind: PromoteKind::Col(EMPTY_LOC),
-    };
-
-    /// A slot packing into a `out_tc` output PK column. The one place the output
-    /// column is spelled, because it is never nullable while `nullable` — the
-    /// *source* column's — routinely is.
-    pub(crate) fn new(out_tc: TypeCode, nullable: bool, kind: PromoteKind) -> Self {
-        ColPromoter {
-            out_col: SchemaColumn::new(out_tc, false),
-            nullable,
-            kind,
-        }
-    }
-}
-
-/// Packs a reindex column list into a contiguous OPK PK region. The same packer
-/// drives both the reindex map (which writes the synthetic `_join_pk` at
-/// emission — `ops::MapPlan`'s `PkSource::Pack`) and the exchange scatter
-/// (which routes the raw delta by the same key), so the reindexed trace side and
-/// the delta scatter side co-partition byte-for-byte at every key arity and
-/// width.
+/// Packs a reindex column list into a contiguous OPK PK region.
 pub(crate) struct ReindexPacker {
-    cols: [ColPromoter; MAX_PK_COLUMNS], // first `num_cols` valid
-    num_cols: usize,
+    /// The packed columns, between the bitmap and the fold.
+    span: KeySpec,
     pub(crate) out_stride: usize,
-    /// Group-key only: a leading `U8` slot, bit *i* set iff packed column *i* is
-    /// NULL. Without it a NULL group and a `0` group collide on one output PK.
+    /// Group key only: a leading `U8` slot, bit *i* set iff packed column *i* is
+    /// NULL.
     has_bitmap: bool,
-    /// Group columns past the packed prefix, hashed into a trailing 16-byte
-    /// fold slot. Empty for a join key and for a group key with no fold.
+    /// Group key only: the columns past the packed ones, hashed into a trailing
+    /// 16-byte slot.
     fold: FoldCols,
 }
 
 impl ReindexPacker {
-    /// Build per-column promoters from the reindex column list (key order),
-    /// tightly packed with no inter-column padding. The **only** derivation of
-    /// that layout: [`Self::output_schema`] reads these same promoters, so the
-    /// two cannot disagree per slot while still agreeing on the total stride —
-    /// which would silently stop equal keys co-partitioning.
-    ///
-    /// The whole trust boundary for a key list off the wire: a forged circuit is
-    /// rejected, never panicked on.
-    ///
-    /// A carried target's domain is `join_key_common_type`'s codomain — the
-    /// *key* domain, whose collapse to U128 is what a `_join_pk` slot does to a
-    /// UUID pair, not the value domain `TypeCode::int_domain_fits` answers.
+    /// The packer for a join key: each slot's source column at its slot type,
+    /// tightly packed. A key list off the wire is refused, never panicked on.
     pub(crate) fn new(schema: &SchemaDescriptor, key: &[gnitz_wire::ReindexSlot]) -> Result<Self, String> {
         if key.len() > MAX_PK_COLUMNS {
             return Err(format!(
@@ -259,62 +163,50 @@ impl ReindexPacker {
                 key.len()
             ));
         }
-        let mut cols = [ColPromoter::PLACEHOLDER; MAX_PK_COLUMNS];
-        let mut stride = 0usize;
-        for (i, &(c, carried)) in key.iter().enumerate() {
+        let mut cols = Vec::with_capacity(key.len());
+        for &(c, t) in key {
             let loc = locate_key_col(schema, c, "reindex key")?;
-            if carried.is_some_and(|t| loc.type_code().join_key_common_type(t) != Some(t)) {
-                return Err(format!(
-                    "reindex key: column {c} does not promote to the carried target"
-                ));
+            let src = loc.type_code();
+            if !src.packs_at(t) {
+                return Err(format!("reindex key: column {c} of type {src} does not pack at {t}"));
             }
-            let kind = classify_promote(loc);
-            // Carried promotion target (`None` = self-derive); the slot type and
-            // width follow `resolve_reindex_type` so the scatter packer and the
-            // trace-side reindex Map derive identical widths.
-            let cp = ColPromoter::new(gnitz_wire::resolve_reindex_type(loc.type_code(), carried), false, kind);
-            // A payload slot right-aligns its source, so one narrower than the
-            // source would truncate it. `resolve_reindex_type` never derives that;
-            // debug-only because it is a type-system invariant, not input.
-            debug_assert!(
-                cp.out_col.size() as usize >= loc.type_code().wire_stride()
-                    || !matches!(kind, PromoteKind::Col(ColumnLocator::Payload { .. }))
-            );
-            stride += cp.out_col.size() as usize;
-            cols[i] = cp;
+            cols.push((loc, t));
         }
-        if stride > MAX_PK_BYTES {
-            return Err(format!(
-                "reindex key: {stride} PK bytes exceeds the {MAX_PK_BYTES}-byte limit"
-            ));
-        }
-        Ok(ReindexPacker {
-            cols,
-            num_cols: key.len(),
-            out_stride: stride,
-            has_bitmap: false,
-            fold: FoldCols::new(Vec::new()),
-        })
+        Ok(Self::finish(KeySpec::of(cols), false, FoldCols::new(Vec::new())))
     }
 
-    /// The output PK columns this packer's bytes fill, in key order. The
-    /// promoters are the only derivation of that layout, so a schema built from
-    /// these describes what `pack_into` writes by construction.
-    pub(crate) fn key_columns(&self) -> impl Iterator<Item = SchemaColumn> + '_ {
+    /// The packer over `span`, its stride the sum of [`Self::key_columns`].
+    fn finish(span: KeySpec, has_bitmap: bool, fold: FoldCols) -> Self {
+        let mut packer = ReindexPacker { span, out_stride: 0, has_bitmap, fold };
+        packer.out_stride = packer.key_columns().map(|c| c.size() as usize).sum();
+        packer
+    }
+
+    /// The output PK columns this packer's bytes fill, in key order.
+    fn key_columns(&self) -> impl Iterator<Item = SchemaColumn> + '_ {
         let bitmap = self.has_bitmap.then_some(BITMAP_COL);
         let fold = (!self.fold.is_empty()).then_some(FOLD_COL);
         bitmap
             .into_iter()
-            .chain(self.cols[..self.num_cols].iter().map(|cp| cp.out_col))
+            .chain(self.span.columns().iter().map(|c| c.out))
             .chain(fold)
     }
 
-    /// The reindex Map's output schema: the packer's own [`Self::key_columns`]
-    /// — so this schema's stride and `out_stride` are the same sum — then
-    /// `in_schema.columns[payload_cols[i]]`. `payload_cols` is what the reindex
-    /// program copies, so a join side skipping a dead column stops persisting it.
-    ///
-    /// The PK-side bounds are `new`'s; `payload_cols` is bounded here.
+    /// The columns, when the packed key is their own OPK images laid end to end.
+    pub(crate) fn identity_columns(&self) -> Option<Vec<ColumnLocator>> {
+        let identity = |c: &KeyCol| {
+            let (src, w) = (c.loc.type_code(), c.loc.size());
+            !src.is_german_string()
+                && c.out.size() as usize == w
+                && gnitz_wire::opk_bias(src, w) == gnitz_wire::opk_bias(c.out.type_code, w)
+        };
+        let cols = self.span.columns();
+        (!self.has_bitmap && self.fold.is_empty() && cols.iter().all(identity))
+            .then(|| cols.iter().map(|c| c.loc).collect())
+    }
+
+    /// The reindex Map's output schema: [`Self::key_columns`], then
+    /// `payload_cols` of `in_schema`.
     pub(crate) fn output_schema(
         &self,
         in_schema: &SchemaDescriptor,
@@ -337,10 +229,8 @@ impl ReindexPacker {
     /// Build the packer for a **group** key over `group_cols`, and the PK region
     /// of an index keyed by it: [`Self::key_columns`], then `suffix`.
     ///
-    /// Greedy: pack leading columns while the budget still leaves room for the
-    /// fold slot the rest would need. Unlike a join key this is total over
-    /// *arity* — the overflow folds into one hash slot — so no group set is
-    /// refused for being wide; it refuses what [`locate_key_col`] refuses.
+    /// Leading columns pack while the PK budget lasts; the rest fold into one
+    /// hash slot, so no group set is too wide.
     pub(crate) fn new_group_key(
         schema: &SchemaDescriptor,
         group_cols: &[u32],
@@ -352,7 +242,6 @@ impl ReindexPacker {
             max_cols >= 2 && max_bytes >= BITMAP_BYTES + FOLD_BYTES,
             "a group-key suffix must leave room for a bitmap byte and a fold slot",
         );
-        assert!(max_cols <= 9, "the one bitmap byte addresses at most 8 packed columns");
         let group: Vec<(SchemaColumn, ColumnLocator)> = group_cols
             .iter()
             .map(|&c| {
@@ -364,35 +253,21 @@ impl ReindexPacker {
 
         // The bitmap occupies one leading slot, so both budgets start spent by it.
         let lead = usize::from(has_bitmap);
-        let mut cols = [ColPromoter::PLACEHOLDER; MAX_PK_COLUMNS];
+        let mut packed = Vec::with_capacity(max_cols);
         let mut stride = lead * BITMAP_BYTES;
-        let mut n_packed = 0usize;
         for (i, &(col, loc)) in group.iter().enumerate() {
-            // A group column takes the same slot a join key's would; the float
-            // arm the two policies would differ on returned above.
             let out_tc = col.type_code.reindex_output_type();
             let w = out_tc.wire_stride();
-            // Room this column needs, plus the fold slot the columns behind it
-            // would still require. Reserving it here is what keeps the greedy
-            // walk from packing a column it would have to give back.
+            // Reserve the fold slot the columns behind this one would need.
             let tail_cols = usize::from(i + 1 < group.len());
-            if lead + n_packed + 1 + tail_cols > max_cols || stride + w + tail_cols * FOLD_BYTES > max_bytes {
+            if lead + packed.len() + 1 + tail_cols > max_cols || stride + w + tail_cols * FOLD_BYTES > max_bytes {
                 break;
             }
-            cols[n_packed] = ColPromoter::new(out_tc, col.nullable, classify_promote(loc));
+            packed.push((loc, out_tc));
             stride += w;
-            n_packed += 1;
         }
-        let fold = FoldCols::new(group[n_packed..].iter().map(|&(_, loc)| loc).collect());
-        stride += if fold.is_empty() { 0 } else { FOLD_BYTES };
-
-        let packer = ReindexPacker {
-            cols,
-            num_cols: n_packed,
-            out_stride: stride,
-            has_bitmap,
-            fold,
-        };
+        let fold = FoldCols::new(group[packed.len()..].iter().map(|&(_, loc)| loc).collect());
+        let packer = Self::finish(KeySpec::of(packed), has_bitmap, fold);
         let mut b = DerivedSchema::new();
         for c in packer.key_columns().chain(suffix.iter().copied()) {
             b.push_pk(c)
@@ -402,8 +277,7 @@ impl ReindexPacker {
     }
 
     /// [`Self::pack_into`] over the leading `out_stride` bytes of `buf`,
-    /// returning them — the prefix a group-keyed secondary index seeks by, so the
-    /// key's width is read off the packer rather than re-sliced per index.
+    /// returning them.
     #[inline]
     pub(crate) fn pack_prefix<'a, R: RowSource>(&self, buf: &'a mut [u8], batch: &R, row: usize) -> &'a [u8] {
         let n = self.out_stride;
@@ -411,36 +285,28 @@ impl ReindexPacker {
         &buf[..n]
     }
 
-    /// Pack the full reindex key (`out_stride` OPK bytes) for `row` into `dst`.
-    ///
-    /// One pass over the source columns, between the two key-level slots a
-    /// group key carries: the leading presence bitmap, whose bits are the NULL
-    /// tests the packed slots already perform, and the trailing fold.
-    #[inline]
-    pub(crate) fn pack_into<R: RowSource>(&self, dst: &mut [u8], batch: &R, row: usize) {
+    /// Pack `row`'s key into `dst`, all `out_stride` bytes of it.
+    #[inline(always)]
+    fn pack_into<R: RowSource>(&self, dst: &mut [u8], batch: &R, row: usize) {
         let null_word = batch.get_null_word(row);
         let mut off = usize::from(self.has_bitmap) * BITMAP_BYTES;
         let mut null_bits = 0u8;
-        for (i, cp) in self.cols[..self.num_cols].iter().enumerate() {
-            let w = cp.out_col.size() as usize;
-            let slot = &mut dst[off..off + w];
+        for (i, &KeyCol { loc, out }) in self.span.columns().iter().enumerate() {
+            let w = out.size() as usize;
+            let cell = &mut dst[off..off + w];
             off += w;
-            match cp.kind {
-                // A NULL packed column: zeroed slot, and its bit in the bitmap.
-                PromoteKind::Col(loc) | PromoteKind::String(loc) if cp.nullable && loc.is_null_word(null_word) => {
+            match loc {
+                _ if self.has_bitmap && loc.is_null_word(null_word) => {
                     null_bits |= 1 << i;
-                    slot.fill(0);
+                    cell.fill(0);
                 }
-                PromoteKind::Col(loc) => loc.encode_opk_promoted(batch, row, cp.out_col.type_code, slot),
-                PromoteKind::String(loc) => {
-                    let h = german_string_promote_key(loc.bytes(batch, row), batch.blob());
-                    slot.copy_from_slice(&h.to_be_bytes());
+                ColumnLocator::Payload { slot, type_code, .. } if type_code.is_german_string() => {
+                    let h = gnitz_wire::checksum_128(gnitz_expr::payload_bytes(batch, row, slot as usize));
+                    cell.copy_from_slice(&h.to_be_bytes());
                 }
+                _ => loc.encode_opk_promoted(batch, row, out.type_code, cell),
             }
         }
-        // Both unconditional per row for the keys that have them, so every slot
-        // of `dst` is fully overwritten — which is what lets a caller reuse one
-        // destination across rows with no inter-row clear.
         if self.has_bitmap {
             dst[0] = null_bits;
         }
@@ -463,14 +329,15 @@ impl ReindexPacker {
         }
     }
 
-    /// Whether [`Self::pack_rows`] packs a column at a time: every column a plain
-    /// integer, and no bitmap or fold.
+    /// Whether [`Self::pack_rows`] packs a column at a time.
     fn packs_by_column(&self) -> bool {
         !self.has_bitmap
             && self.fold.is_empty()
-            && self.cols[..self.num_cols]
+            && self
+                .span
+                .columns()
                 .iter()
-                .all(|cp| !cp.nullable && matches!(cp.kind, PromoteKind::Col(_)))
+                .all(|c| !c.loc.type_code().is_german_string())
     }
 
     /// [`Self::pack_into`] for `n` rows from `start`, into the fronts of `dst`'s
@@ -483,18 +350,14 @@ impl ReindexPacker {
             }
             return;
         }
-        let cols = &self.cols[..self.num_cols];
         let mut off = 0;
-        for cp in cols {
-            let PromoteKind::Col(loc) = cp.kind else {
-                unreachable!("a by-column key packs integer columns only")
-            };
-            let (sw, dw) = (loc.size(), cp.out_col.size() as usize);
+        for &KeyCol { loc, out } in self.span.columns() {
+            let (sw, dw) = (loc.size(), out.size() as usize);
             let col = IntCol {
                 dst: &mut *dst,
                 stride,
                 off,
-                bias: gnitz_wire::opk_bias(cp.out_col.type_code, dw),
+                bias: gnitz_wire::opk_bias(out.type_code, dw),
             };
             let signed = loc.type_code().is_signed_int();
             match loc {

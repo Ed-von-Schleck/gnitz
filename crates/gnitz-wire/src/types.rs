@@ -234,16 +234,7 @@ impl TypeCode {
         target.is_fixed_int() && self.int_domain_fits(target)
     }
 
-    /// Output PK type for an equijoin synthetic reindex key built from a key
-    /// column of this type: a ≤8-byte integer key keeps its native width (stride
-    /// 8 for U64), as does the signed-128 key; everything wider or non-integer —
-    /// U128/UUID, the STRING/BLOB 128-bit content hash, and PK-ineligible floats —
-    /// collapses to the unsigned 16-byte U128 key. Single source of truth for the
-    /// reindex / `_join_pk` PK width: the engine compiler (reindex Map output
-    /// schema) and the SQL planner (`_join_pk` stamp) both derive their col-0
-    /// stride from this, and they MUST agree or every cross-process consumer
-    /// re-derives a mismatched stride and the exchange wire decode hard-rejects
-    /// the block.
+    /// The key slot type of this column keyed alone.
     #[inline]
     pub const fn reindex_output_type(self) -> TypeCode {
         if self.is_fixed_int() || matches!(self, TypeCode::I128) {
@@ -253,87 +244,69 @@ impl TypeCode {
         }
     }
 
-    /// Common reindex output type for an equijoin key pair, or `None` if the pair
-    /// cannot co-partition under an existing type code. The returned type is the
-    /// reindex OUTPUT type directly (the promoted integer type with its true sign
-    /// for ≤8-byte ints; U128 for the unsigned-16B and german-string cases), so it
-    /// is exactly what the slot type, the `ColPromoter`, and the `_join_pk` stamp
-    /// all need.
-    pub const fn join_key_common_type(self, other: TypeCode) -> Option<TypeCode> {
+    /// Whether a key column of this type can pack into a `slot`-typed key slot.
+    pub const fn packs_at(self, slot: TypeCode) -> bool {
+        slot.as_wire() == self.reindex_output_type().as_wire()
+            || matches!(self.join_key_common_type(slot), Ok(t) if t.as_wire() == slot.as_wire())
+    }
+
+    /// The key slot type both sides of an equijoin key pair pack at.
+    pub const fn join_key_common_type(self, other: TypeCode) -> Result<TypeCode, JoinKeyRule> {
         let (l, r) = (self, other);
-        // Equal types: the reindex output type (identity for fixed ints; U128 for
-        // U128/UUID and STRING/BLOB content hashes). A float pair is the one equal
-        // pair that co-partitions under none: `±0.0` are byte-unequal but compare equal.
+        if l.is_float() || r.is_float() {
+            return Err(JoinKeyRule::Float);
+        }
+        if l.is_german_string() != r.is_german_string() {
+            return Err(JoinKeyRule::StringWithNative);
+        }
         if l.as_wire() == r.as_wire() {
-            return if l.is_pk_eligible() || l.is_german_string() {
-                Some(l.reindex_output_type())
-            } else {
-                None
-            };
+            return Ok(l.reindex_output_type());
         }
-        // Both german strings: a 16-byte XXH3 content hash (U128 slot). A one-sided
-        // string pair is rejected in validate_join_key_pair and never reaches here.
-        if l.is_german_string() && r.is_german_string() {
-            return Some(TypeCode::U128);
+        if l.is_german_string() {
+            return Ok(TypeCode::U128);
         }
-        // DATE counts days and TIMESTAMP microseconds: a key copy moves bytes and
-        // cannot convert one unit to the other.
         if l.is_temporal() && r.is_temporal() {
-            return None;
+            return Err(JoinKeyRule::UnitMismatch);
         }
-        // Both signed integers of at most 8 bytes → the wider signed type. Read
-        // through the storage type: a pair with one temporal side co-partitions as
-        // the integer both sides really are, never under the calendar name.
+        // A temporal side keys as its storage integer.
         if l.is_signed_int() && r.is_signed_int() {
             let (l, r) = (l.storage_type(), r.storage_type());
-            return Some(if l.wire_stride() >= r.wire_stride() { l } else { r });
+            return Ok(if l.wire_stride() >= r.wire_stride() { l } else { r });
         }
-        // Both unsigned (U8..U64 and the 16-byte U128/UUID) → the wider unsigned
-        // type; a 16-byte operand carries the pair to U128. `is_pk_eligible` is the
-        // integer-scalar set; minus the signed ones leaves the unsigned ones.
-        let l_unsigned = l.is_pk_eligible() && !l.is_signed_int();
-        let r_unsigned = r.is_pk_eligible() && !r.is_signed_int();
-        if l_unsigned && r_unsigned {
+        if !l.is_signed_int() && !r.is_signed_int() {
             let wider = if l.wire_stride() >= r.wire_stride() { l } else { r };
-            return Some(if wider.wire_stride() == 16 {
+            return Ok(if wider.wire_stride() == 16 {
                 TypeCode::U128
             } else {
                 wider
             });
         }
-        // Cross-sign integer keys: one side signed, the other unsigned. (Equal,
-        // both-signed, and both-unsigned pairs all returned above, so any remaining
-        // integer-scalar pair is opposite-sign.) The common type must be a SIGNED type
-        // (a) strictly wider than the unsigned operand — a signed type of equal width
-        // cannot represent the unsigned operand's full range, so distinct values
-        // would alias — and (b) at least as wide as the signed operand. The unsigned
-        // side zero-extends and the signed side sign-extends into it
-        // (`store_opk_image`), so equal numeric values pack byte-identically.
-        // wu ∈ {1,2,4,8,16}; only a U128/UUID unsigned operand (wu == 16) needs a
-        // signed-256 type that does not exist → None.
-        if l.is_pk_eligible() && r.is_pk_eligible() {
-            let (s, u) = if l.is_signed_int() { (l, r) } else { (r, l) };
-            let uw = u.wire_stride() * 2;
-            let common_w = if uw > s.wire_stride() { uw } else { s.wire_stride() };
-            return match common_w {
-                2 => Some(TypeCode::I16),
-                4 => Some(TypeCode::I32),
-                8 => Some(TypeCode::I64),
-                16 => Some(TypeCode::I128),
-                // wu == 16 (U128/UUID) ⇒ common_w == 32: a signed-256 type, none exists.
-                _ => None,
-            };
+        // Cross-sign: the narrowest signed type strictly wider than the unsigned
+        // side and at least as wide as the signed one.
+        let (s, u) = if l.is_signed_int() { (l, r) } else { (r, l) };
+        let uw = u.wire_stride() * 2;
+        let common_w = if uw > s.wire_stride() { uw } else { s.wire_stride() };
+        match common_w {
+            2 => Ok(TypeCode::I16),
+            4 => Ok(TypeCode::I32),
+            8 => Ok(TypeCode::I64),
+            16 => Ok(TypeCode::I128),
+            _ => Err(JoinKeyRule::NoSigned256),
         }
-        None
     }
+}
 
-    /// Inverse of [`resolve_reindex_type`]: the target to persist for a key
-    /// column of this source type whose pair resolved to `common`, or `None`
-    /// where this column already self-derives to it.
-    #[inline]
-    pub fn carried_reindex_tc(self, common: TypeCode) -> Option<TypeCode> {
-        (self.reindex_output_type() != common).then_some(common)
-    }
+/// Why an equijoin key pair has no common key type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKeyRule {
+    /// `±0.0` differ byte-wise but compare equal.
+    Float,
+    /// DATE counts days, TIMESTAMP microseconds; a key copy cannot convert.
+    UnitMismatch,
+    /// A content hash never equals a native key.
+    StringWithNative,
+    /// A cross-sign pair whose unsigned side is 128-bit needs a signed-256 type.
+    NoSigned256,
 }
 
 impl core::fmt::Display for TypeCode {
@@ -889,18 +862,6 @@ const _: () = {
         i += 1;
     }
 };
-
-/// Final reindex slot type for a key column: the carried promotion target when
-/// the planner disagreed with the per-column default policy, else that policy.
-/// The single home of the "carried-or-derive" rule, so the reindex Map's output
-/// schema and the `ReindexPacker` cannot derive divergent slot widths.
-#[inline]
-pub const fn resolve_reindex_type(src_tc: TypeCode, carried: Option<TypeCode>) -> TypeCode {
-    match carried {
-        Some(t) => t,
-        None => src_tc.reindex_output_type(),
-    }
-}
 
 #[cfg(test)]
 #[path = "tests/types.rs"]

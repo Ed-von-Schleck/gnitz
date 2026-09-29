@@ -1138,7 +1138,7 @@ impl Batch {
     /// all PK and no payload, so the entry *is* its key `(indexed col(s) [promoted]
     /// ‖ source PK)`, composed by `spec.write_entry` — which also decides the SQL
     /// NULL-distinctness skip.
-    pub fn project_index(&self, spec: &crate::schema::IndexKeySpec, idx_schema: &SchemaDescriptor) -> Batch {
+    pub fn project_index(&self, spec: &crate::schema::KeySpec, idx_schema: &SchemaDescriptor) -> Batch {
         let idx_stride = idx_schema.pk_stride();
         assert_eq!(
             idx_stride,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::{IndexKeySpec, Placement, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{KeySpec, Placement, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::BatchBuilder;
 use crate::test_support::{opk_pk, pk_only_schema};
 use gnitz_wire::{read_signed_exact, read_unsigned_exact, Cut, KeyRange, PkColList};
@@ -552,7 +552,7 @@ fn index_key_spec_skips_any_null_column() {
         bb.end_row();
     }
     let batch = bb.finish();
-    let spec = IndexKeySpec::new(&cols, &owner).unwrap();
+    let spec = KeySpec::new(&cols, &owner).unwrap();
     let mb = batch.as_mem_batch();
     let mut keybuf = PkBuf::zeroed(0);
     assert!(spec.key_bytes(&mb, 0, &mut keybuf), "both columns present ⇒ indexed");
@@ -599,12 +599,12 @@ fn key_bytes_reused_buffer_zeros_tail_when_narrowing() {
 
     // WIDE composite span over (col1, col2): two promoted U64 columns ⇒ 16 bytes.
     let wide_cols = [1u32, 2];
-    let wide = IndexKeySpec::new(&wide_cols, &owner).unwrap();
+    let wide = KeySpec::new(&wide_cols, &owner).unwrap();
     assert_eq!(wide.key_size(), 16, "two U64 index columns ⇒ 16-byte span");
 
     // NARROW span over (col2) alone: one promoted U64 column ⇒ 8 bytes.
     let narrow_cols = [2u32];
-    let narrow = IndexKeySpec::new(&narrow_cols, &owner).unwrap();
+    let narrow = KeySpec::new(&narrow_cols, &owner).unwrap();
     assert_eq!(narrow.key_size(), 8, "single U64 index column ⇒ 8-byte span");
 
     // ONE reused scratch buffer: wide first, then narrow.

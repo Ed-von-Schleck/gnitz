@@ -3,7 +3,9 @@ use crate::ops::group_key::GroupOutKey;
 use crate::schema::SchemaFacts;
 use crate::schema::{Placement, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
 use crate::storage::BatchBuilder;
-use crate::test_support::{make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64};
+use crate::test_support::{
+    make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64, self_typed_slots,
+};
 
 /// The worker `key`'s linear walk sends each row of `mb` to, in row order.
 fn workers(key: &ScatterPlan, mb: &MemBatch, nw: usize) -> Vec<usize> {
@@ -58,7 +60,7 @@ fn test_worker_filter_empty_in_empty_out() {
 }
 
 /// A join scatter's packed route equals the per-type OPK image of the same
-/// column — an integer's `opk_image`, a string's `german_string_promote_key`, a
+/// column — an integer's `opk_image`, a string's content hash, a
 /// compound-PK sub-column's group fold — which is what co-partitions the delta
 /// scatter with the reindexed trace. The NULL arms route by the
 /// canonically-zeroed key slot, where the reindex Map stamps them too.
@@ -69,8 +71,7 @@ fn test_scatter_key_packed_matches_image_routing() {
     // Run the join `ScatterPlan` over `row` and return its worker.
     const NW: usize = 4;
     fn packed(schema: &SchemaDescriptor, cols: &[u32], mb: &MemBatch, row: usize) -> usize {
-        let key: Vec<gnitz_wire::ReindexSlot> = cols.iter().map(|&c| (c, None)).collect();
-        let sk = ScatterPlan::join(schema, &key).expect("the fixture key routes");
+        let sk = ScatterPlan::join(schema, &self_typed_slots(schema, cols)).expect("the fixture key routes");
         workers(&sk, mb, NW)[row]
     }
 
@@ -118,11 +119,8 @@ fn test_scatter_key_packed_matches_image_routing() {
         let b = b.finish();
         let mb = b.as_mem_batch();
         for row in 0..2 {
-            // Image: string → german_string_promote_key → worker_for_key.
-            let image = worker_for_key(
-                crate::ops::reindex::german_string_promote_key(mb.get_col_ptr(row, 0, 16), mb.blob),
-                NW,
-            );
+            // Image: string → its content hash → worker_for_key.
+            let image = worker_for_key(gnitz_wire::checksum_128(gnitz_expr::payload_bytes(&mb, row, 0)), NW);
             assert_eq!(packed(&schema, &[1], &mb, row), image, "STRING row {row}");
         }
     }
@@ -190,11 +188,11 @@ fn scatter_key_refuses_a_key_this_schema_cannot_route() {
         "a group key naming a column the schema has not got"
     );
     assert!(
-        ScatterPlan::join(&schema, &[(7, None)]).is_err(),
+        ScatterPlan::join(&schema, &[(7, TypeCode::I64)]).is_err(),
         "a reindex key naming a column the schema has not got"
     );
     assert!(
-        ScatterPlan::join(&schema, &[(1, None)]).is_err(),
+        ScatterPlan::join(&schema, &[(1, TypeCode::U128)]).is_err(),
         "a reindex key over a float column, which no OPK packs"
     );
 }
@@ -301,11 +299,6 @@ fn three_col_batch(schema: &SchemaDescriptor, n: usize) -> Batch {
     b.finish()
 }
 
-/// The unpromoted key slots for `cols`.
-fn slots_of(cols: &[u32]) -> Vec<gnitz_wire::ReindexSlot> {
-    cols.iter().map(|&c| (c, None)).collect()
-}
-
 /// The predicate's whole promise: wherever it accepts, the scatter it describes
 /// routes every row to the worker the table-key router already placed it on.
 #[test]
@@ -317,7 +310,7 @@ fn every_accepted_spec_routes_each_row_to_its_tables_own_worker() {
         let b = three_col_batch(&schema, 24);
         let mb = b.as_mem_batch();
         for cols in [&[0u32][..], &[0, 1], &[0, 1, 2], &[1], &[1, 0]] {
-            let js = slots_of(cols);
+            let js = self_typed_slots(&schema, cols);
             for (kind, key) in [
                 ("group", ScatterPlan::group(&schema, cols)),
                 ("join", ScatterPlan::join(&schema, &js)),
@@ -350,7 +343,9 @@ fn a_proper_prefix_group_key_is_refused_and_does_route_elsewhere() {
     let schema = three_col_schema(Placement::Keyed { prefix_len: 2 });
     let cols = [0u32, 1];
     assert!(!ScatterPlan::group(&schema, &cols).is_ok_and(|p| p.routes_to_native_owner(&schema)));
-    assert!(ScatterPlan::join(&schema, &slots_of(&cols)).is_ok_and(|p| p.routes_to_native_owner(&schema)));
+    assert!(
+        ScatterPlan::join(&schema, &self_typed_slots(&schema, &cols)).is_ok_and(|p| p.routes_to_native_owner(&schema))
+    );
 
     let b = three_col_batch(&schema, 24);
     let mb = b.as_mem_batch();
@@ -362,26 +357,24 @@ fn a_proper_prefix_group_key_is_refused_and_does_route_elsewhere() {
     );
 }
 
-/// The distribution prefix must match exactly, carry no promotion, and belong to
-/// a relation `worker_for_pk` actually places.
+/// The distribution prefix must match exactly, pack each column at its own width
+/// and sign, and belong to a relation `worker_for_pk` actually places.
 #[test]
 fn routes_to_native_owner_is_the_exact_unpromoted_distribution_prefix() {
     for (k, want) in [(1u8, &[0u32][..]), (2, &[0, 1]), (0, &[0, 1, 2])] {
         let s = three_col_schema(Placement::Keyed { prefix_len: k }); // k = 0 is the default: the whole PK
         for cand in [&[][..], &[0], &[0, 1], &[0, 1, 2], &[1], &[1, 0]] {
             assert_eq!(
-                ScatterPlan::join(&s, &slots_of(cand)).is_ok_and(|p| p.routes_to_native_owner(&s)),
+                ScatterPlan::join(&s, &self_typed_slots(&s, cand)).is_ok_and(|p| p.routes_to_native_owner(&s)),
                 cand == want,
                 "k={k}: {cand:?} against the distribution key {want:?}"
             );
         }
-        let promoted: Vec<gnitz_wire::ReindexSlot> = want
-            .iter()
-            .map(|&c| (c, (c == 0).then_some(gnitz_wire::TypeCode::U64)))
-            .collect();
+        let mut promoted = self_typed_slots(&s, want);
+        promoted[0].1 = TypeCode::U64;
         assert!(
             !ScatterPlan::join(&s, &promoted).is_ok_and(|p| p.routes_to_native_owner(&s)),
-            "k={k}: a carried target moves the slot off its source column's width"
+            "k={k}: a widening promotion moves the slot off its source column's width"
         );
     }
     for p in [Placement::Replicated, Placement::Local] {
@@ -392,10 +385,30 @@ fn routes_to_native_owner_is_the_exact_unpromoted_distribution_prefix() {
                 "{p:?}: {cand:?}"
             );
             assert!(
-                !ScatterPlan::join(&s, &slots_of(cand)).is_ok_and(|p| p.routes_to_native_owner(&s)),
+                !ScatterPlan::join(&s, &self_typed_slots(&s, cand)).is_ok_and(|p| p.routes_to_native_owner(&s)),
                 "{p:?}: {cand:?}"
             );
         }
+    }
+}
+
+/// A slot typed at the storage integer of a DATE, TIMESTAMP or DECIMAL PK
+/// column packs that column's own OPK bytes, so it keeps the unpacked route.
+#[test]
+fn a_layout_identical_promotion_routes_natively() {
+    for (tc, slot) in [
+        (TypeCode::Date, TypeCode::I32),
+        (TypeCode::Timestamp, TypeCode::I64),
+        (TypeCode::Decimal, TypeCode::I64),
+    ] {
+        let s = SchemaDescriptor::new(
+            &[SchemaColumn::new(tc, false), SchemaColumn::new(TypeCode::I64, false)],
+            &[0],
+        );
+        assert!(
+            ScatterPlan::join(&s, &[(0, slot)]).is_ok_and(|p| p.routes_to_native_owner(&s)),
+            "{tc:?} typed {slot:?}"
+        );
     }
 }
 
@@ -492,7 +505,7 @@ fn an_unpromoted_pk_prefix_join_key_hashes_the_bytes_the_map_packs() {
         let b = b.finish();
         let mb = b.as_mem_batch();
         for k in [1usize, 2] {
-            let slots = slots_of(&[0, 1][..k]);
+            let slots = self_typed_slots(&schema, &[0, 1][..k]);
             let key = ScatterPlan::join(&schema, &slots).expect("the fixture key routes");
             let ScatterPlan(Key::Group(GroupKey::PkPrefix(n))) = key else {
                 panic!("{tc:?} k={k}: not a PK prefix")
@@ -518,7 +531,7 @@ fn a_single_column_join_key_routes_by_the_image_the_map_packs() {
     const NW: usize = 4;
     let check = |schema: &SchemaDescriptor, b: &Batch, c: u32| {
         let mb = b.as_mem_batch();
-        let slots = [(c, None)];
+        let slots = self_typed_slots(schema, &[c]);
         let key = ScatterPlan::join(schema, &slots).expect("the fixture key routes");
         assert!(
             matches!(key, ScatterPlan(Key::Group(GroupKey::Image(_)))),
@@ -600,7 +613,7 @@ fn a_packed_linear_route_hashes_each_rows_own_packed_key() {
     }
     let b = b.finish();
     let mb = b.as_mem_batch();
-    let slots = [(1, Some(gnitz_wire::TypeCode::I64)), (2, None)];
+    let slots = [(1, TypeCode::I64), (2, TypeCode::U16)];
     let key = ScatterPlan::join(&schema, &slots).unwrap();
     let packer = ReindexPacker::new(&schema, &slots).unwrap();
     let got = workers(&key, &mb, NW);
@@ -608,10 +621,7 @@ fn a_packed_linear_route_hashes_each_rows_own_packed_key() {
     for (row, &got) in got.iter().enumerate() {
         let want = match mb.get_weight(row) {
             0 => usize::MAX,
-            _ => {
-                packer.pack_into(&mut buf[..packer.out_stride], &mb, row);
-                worker_for_pk_bytes(&buf[..packer.out_stride], NW)
-            }
+            _ => worker_for_pk_bytes(packer.pack_prefix(&mut buf, &mb, row), NW),
         };
         assert_eq!(got, want, "row {row}");
     }

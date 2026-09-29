@@ -308,11 +308,9 @@ pub enum NullKeys {
 const NULL_KEYS_KEEP: u8 = 0;
 const NULL_KEYS_DROP: u8 = 1;
 
-/// One slot of a reindex or hash-row key list: a source column, and the
-/// promotion target the planner carried for it. What an absent target means is
-/// the field's rule, not this alias's — read [`MapKind::Reindex`] or
-/// [`MapKind::HashRow`].
-pub type ReindexSlot = (u32, Option<TypeCode>);
+/// One slot of a reindex or hash-row list: a source column, and the type the
+/// map gives it.
+pub type ReindexSlot = (u32, TypeCode);
 
 /// MAP sub-variant discriminant.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -323,22 +321,17 @@ pub enum MapKind {
     /// program against the declared slots.
     Compute(ComputeMap),
     /// Re-key onto a synthetic PK for equijoin/group pre-indexing: `key` is the
-    /// source columns in key order, each with its slot's promoted type, and
+    /// source columns in key order, each with the type its key slot packs at, and
     /// `keep` the columns surviving as payload behind them, in output order.
-    ///
-    /// `None` means the engine derives the slot type
-    /// (`reindex_output_type_code`), so only a *disagreement* with that travels —
-    /// otherwise the planner would be a second producer of a derived fact. `key`
-    /// is never empty: a map that re-keys nothing is a [`MapKind::Compute`].
+    /// `key` is never empty: a map that re-keys nothing is a [`MapKind::Compute`].
     Reindex {
         keep: Vec<u32>,
         key: Vec<ReindexSlot>,
         role: ReindexRole,
         nulls: NullKeys,
     },
-    /// A projection of `cols`, each widened to its target (`None` keeps the
-    /// source type), keyed by a hash of the row's content instead of the source
-    /// PK — so a row's identity is its projected content.
+    /// A projection of `cols`, each at its output column's type, keyed by a hash
+    /// of the row's content instead of the source PK.
     HashRow { cols: Vec<ReindexSlot> },
 }
 
@@ -788,19 +781,15 @@ pub(crate) fn read_cols(r: &mut Reader) -> Result<Vec<u32>, String> {
     Ok(cols)
 }
 
-/// A counted `(source column, promoted target type)` list; `0` on the wire is
-/// "no target". `TypeCode::from_wire` is the whole domain check here — which
-/// targets a particular node admits is that arm's own business.
+/// A counted `(source column, slot type)` list.
 fn read_cols_with_tcs(r: &mut Reader) -> Result<Vec<ReindexSlot>, String> {
     let n = read_count(r, "slot list", crate::MAX_COLUMNS)?;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let col = r.u32()?;
-        let target = match r.u8()? {
-            0 => None,
-            tc => Some(TypeCode::from_wire(tc).ok_or_else(|| format!("unknown promotion type code {tc}"))?),
-        };
-        out.push((col, target));
+        let tc = r.u8()?;
+        let tc = TypeCode::from_wire(tc).ok_or_else(|| format!("unknown slot type code {tc}"))?;
+        out.push((col, tc));
     }
     Ok(out)
 }
@@ -808,7 +797,7 @@ fn read_cols_with_tcs(r: &mut Reader) -> Result<Vec<ReindexSlot>, String> {
 fn write_cols_with_tcs(w: &mut Writer, slots: &[ReindexSlot]) {
     write_count(w, slots.len());
     for &(col, tc) in slots {
-        w.u32(col).u8(tc.map_or(0, TypeCode::as_wire));
+        w.u32(col).u8(tc.as_wire());
     }
 }
 

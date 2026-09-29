@@ -11,7 +11,7 @@ use rustc_hash::FxHashSet;
 use super::train::drain_rows;
 use super::*;
 use gnitz_store::schema::key::{probe_key, PkBuf};
-use gnitz_store::schema::IndexKeySpec;
+use gnitz_store::schema::KeySpec;
 
 /// Spans tracked per filter before it disables itself: `FxHashSet<u64>`'s
 /// 2^23-bucket table at its 7/8 load factor, the largest count that never grows
@@ -95,7 +95,7 @@ impl UniqueFilter {
 pub(super) fn extract_into_filter(
     filter: &mut UniqueFilter,
     batch: &gnitz_store::storage::MemBatch<'_>,
-    spec: &IndexKeySpec,
+    spec: &KeySpec,
 ) {
     let mut keybuf = PkBuf::zeroed(0);
     for row in 0..batch.len() {
@@ -169,11 +169,11 @@ impl MasterDispatcher {
     pub(super) async fn ensure_unique_filters_warm(
         &self,
         table_id: u64,
-        uniques: &[(PkColList, SchemaDescriptor, IndexKeySpec)],
+        uniques: &[(PkColList, SchemaDescriptor, KeySpec)],
     ) -> Result<(), WireFault> {
-        let missing: Vec<(PkColList, IndexKeySpec)> = {
+        let missing: Vec<(PkColList, KeySpec)> = {
             let mut filters = self.unique_filters.borrow_mut();
-            let missing: Vec<(PkColList, IndexKeySpec)> = uniques
+            let missing: Vec<(PkColList, KeySpec)> = uniques
                 .iter()
                 .filter(|(cols, ..)| !filters.get(&(table_id, *cols)).is_some_and(UniqueFilter::is_warm))
                 .map(|&(cols, _, spec)| (cols, spec))

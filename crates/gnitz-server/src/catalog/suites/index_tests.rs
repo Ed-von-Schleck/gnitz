@@ -1,6 +1,6 @@
 use super::*;
 use gnitz_expr::{ColumnTable, SchemaFacts};
-use gnitz_store::schema::{make_index_schema, IndexKeySpec};
+use gnitz_store::schema::{make_index_schema, KeySpec};
 use gnitz_wire::{key_image, MAX_PK_BYTES};
 
 // ── test_index_creation_and_fill ────────────────────────────────────────
@@ -1268,11 +1268,11 @@ fn test_make_index_schema_over_limit_errs_not_panics() {
 
 #[test]
 fn test_seek_prefix_matches_projection() {
-    // The seek encoder (IndexKeySpec::seek_prefix) and the projection encoder
+    // The seek encoder (KeySpec::seek_prefix) and the projection encoder
     // (`Batch::project_index`) must produce byte-identical leading-key bytes for the
     // same native values — that equality is what makes every composite seek find
     // the projected entry.
-    use gnitz_store::schema::{IndexKeySpec, SchemaColumn, SchemaDescriptor};
+    use gnitz_store::schema::{KeySpec, SchemaColumn, SchemaDescriptor};
     use gnitz_wire::TypeCode;
     let src = SchemaDescriptor::new(
         &[
@@ -1292,11 +1292,11 @@ fn test_seek_prefix_matches_projection() {
     bb.end_row();
     let projected = {
         let b = bb.finish();
-        b.project_index(&gnitz_store::schema::IndexKeySpec::new(&[1, 2], &src).unwrap(), &idx)
+        b.project_index(&gnitz_store::schema::KeySpec::new(&[1, 2], &src).unwrap(), &idx)
     };
     assert_eq!(projected.len(), 1);
 
-    let spec = IndexKeySpec::new(&[1, 2], &src).unwrap();
+    let spec = KeySpec::new(&[1, 2], &src).unwrap();
     let key_size = spec.key_size();
     let proj_key = &projected.get_pk_bytes(0)[..key_size];
 
@@ -1309,14 +1309,14 @@ fn test_seek_prefix_matches_projection() {
     );
 }
 
-/// `IndexKeySpec::key_bytes` produces exactly the leading `idx_key_size` bytes
+/// `KeySpec::key_bytes` produces exactly the leading `idx_key_size` bytes
 /// that `Batch::project_index` writes as the index PK prefix — so the in-memory
 /// key, the projected index entry, and the seek prefix all agree, across a
 /// signed / unsigned / U128 column mix.
 #[test]
 fn index_key_spec_equals_projected_leading_span() {
     use gnitz_store::schema::key::PkBuf;
-    use gnitz_store::schema::{IndexKeySpec, SchemaColumn, SchemaDescriptor};
+    use gnitz_store::schema::{KeySpec, SchemaColumn, SchemaDescriptor};
     use gnitz_wire::TypeCode;
     // Owner: PK id U64; a I64 (signed payload), b U128 (payload).
     let owner = SchemaDescriptor::new(
@@ -1330,7 +1330,7 @@ fn index_key_spec_equals_projected_leading_span() {
     // Composite unique on (a, b): promoted (I64→U64, U128→U128) = 8 + 16 = 24.
     let cols = [1u32, 2];
     let idx_schema = make_index_schema(&cols, &owner).unwrap();
-    let spec = IndexKeySpec::new(&cols, &owner).unwrap();
+    let spec = KeySpec::new(&cols, &owner).unwrap();
     let idx_key_size = spec.key_size();
     assert_eq!(idx_key_size, 8 + 16, "I64→U64 (8) + U128 (16)");
 
@@ -1345,7 +1345,7 @@ fn index_key_spec_equals_projected_leading_span() {
     let batch = bb.finish();
 
     // Reference: the projected index entry's leading idx_key_size bytes.
-    let projected = batch.project_index(&IndexKeySpec::new(&cols, &owner).unwrap(), &idx_schema);
+    let projected = batch.project_index(&KeySpec::new(&cols, &owner).unwrap(), &idx_schema);
     assert_eq!(projected.len(), rows.len());
 
     let mb = batch.as_mem_batch();
@@ -1370,7 +1370,7 @@ fn native_u128_at(v: i64, sz: usize) -> u128 {
 
 /// Project a single value (zero-extended native `u128`) through a one-column
 /// secondary index — `src` column 1 indexed by `idx` — returning the OPK
-/// leading-key span the write path (`IndexKeySpec::write_span` via
+/// leading-key span the write path (`KeySpec::write_span` via
 /// `Batch::project_index`) stores.
 fn project_leading_span(src: SchemaDescriptor, idx: &SchemaDescriptor, native: u128) -> Vec<u8> {
     let mut bb = BatchBuilder::new(src);
@@ -1379,7 +1379,7 @@ fn project_leading_span(src: SchemaDescriptor, idx: &SchemaDescriptor, native: u
     bb.end_row();
     let projected = {
         let b = bb.finish();
-        b.project_index(&gnitz_store::schema::IndexKeySpec::new(&[1], &src).unwrap(), idx)
+        b.project_index(&gnitz_store::schema::KeySpec::new(&[1], &src).unwrap(), idx)
     };
     let key_size = idx.columns[0].size() as usize;
     projected.get_pk_bytes(0)[..key_size].to_vec()
@@ -1423,7 +1423,7 @@ fn signed_index_width_ladder_promotes_to_i64_and_orders() {
     }
 }
 
-// ── IndexKeySpec::write_span byte-equivalence ───────────────────────────────
+// ── KeySpec::write_span byte-equivalence ───────────────────────────────
 //
 // A wrong `write_span` byte silently corrupts a secondary index, so both source
 // regions are pinned against an independent oracle.
@@ -1432,7 +1432,7 @@ fn signed_index_width_ladder_promotes_to_i64_and_orders() {
 /// through the seek side. `None` is the NULL skip.
 fn write_span_reference(
     owner: &SchemaDescriptor,
-    spec: &IndexKeySpec,
+    spec: &KeySpec,
     cols: &[u32],
     mb: &gnitz_store::storage::MemBatch<'_>,
     row: usize,
@@ -1466,7 +1466,7 @@ fn write_span_matches_the_oracle_on_compound_null_and_entry_shapes() {
     );
     let cols = [1u32, 2];
     let idx = make_index_schema(&cols, &src).unwrap();
-    let spec = IndexKeySpec::new(&cols, &src).unwrap();
+    let spec = KeySpec::new(&cols, &src).unwrap();
 
     let mut bb = BatchBuilder::new(src);
     for (i, &(a, v)) in [(7u32, -1i64), (0, 0), (u32::MAX, i64::MIN), (3, i64::MAX)]
@@ -1487,7 +1487,7 @@ fn write_span_matches_the_oracle_on_compound_null_and_entry_shapes() {
 
     let mb = b.as_mem_batch();
     let stride = src.pk_stride();
-    // The width `IndexKeySpec::split_entry` splits a stored entry at: the index
+    // The width `KeySpec::split_entry` splits a stored entry at: the index
     // stride is exactly span + source PK, so the two halves are the whole entry.
     assert_eq!(idx.pk_stride(), spec.key_size() + stride);
     for row in 0..b.len() {
@@ -1549,14 +1549,12 @@ fn write_span_matches_seek_prefix_across_type_ladder() {
         );
         let pk_idx = make_index_schema(&[0], &pk_src).unwrap();
         assert_eq!(pk_idx.columns[0].type_code, idx_type);
-        let pk_spec = IndexKeySpec::new(&[0], &pk_src).unwrap();
+        let pk_spec = KeySpec::new(&[0], &pk_src).unwrap();
 
         for &v in values {
             let native = native_u128_at(v, sz);
             let write_span = project_leading_span(src, &idx, native);
-            let seek = IndexKeySpec::new(&[1], &src)
-                .unwrap()
-                .seek_prefix(&[key_image(t, native)]);
+            let seek = KeySpec::new(&[1], &src).unwrap().seek_prefix(&[key_image(t, native)]);
             assert_eq!(
                 &write_span[..],
                 seek.padded(idx_size),
@@ -1595,7 +1593,7 @@ fn composite_index_signed_leading_unsigned_tiebreak_orders() {
         &[0],
     );
     let idx = make_index_schema(&[1, 2], &src).unwrap();
-    let key_size = IndexKeySpec::new(&[1, 2], &src).unwrap().key_size();
+    let key_size = KeySpec::new(&[1, 2], &src).unwrap().key_size();
     // (a, b) in strictly ascending numeric order — including same-`a` tie pairs.
     let rows: &[(i32, u64)] = &[(i32::MIN, 5), (-1, 0), (-1, 9), (0, 0), (0, 1), (1, 0), (i32::MAX, 7)];
     let mut spans: Vec<Vec<u8>> = Vec::new();
@@ -1607,7 +1605,7 @@ fn composite_index_signed_leading_unsigned_tiebreak_orders() {
         bb.end_row();
         let projected = {
             let b = bb.finish();
-            b.project_index(&gnitz_store::schema::IndexKeySpec::new(&[1, 2], &src).unwrap(), &idx)
+            b.project_index(&gnitz_store::schema::KeySpec::new(&[1, 2], &src).unwrap(), &idx)
         };
         spans.push(projected.get_pk_bytes(0)[..key_size].to_vec());
     }

@@ -1,7 +1,8 @@
 use gnitz_expr::{ExprValidateErr, LogicalProgram, Reg, Sink};
 
 use super::{MapPlan, PkSource};
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_COLUMNS};
+use crate::ops::reindex::FoldCols;
+use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_COLUMNS};
 use crate::storage::Batch;
 use crate::storage::BatchBuilder;
 
@@ -460,7 +461,7 @@ fn map_with_pack_pk_source_promotes_payload_to_pk() {
     let batch = make_batch(&schema, &[(1, 1, 200), (2, 1, 100), (3, 1, 300)]);
 
     // Projection plan: output keeps the same single payload column.
-    let packer = ReindexPacker::new(&schema, &[(1, None)]).unwrap();
+    let packer = ReindexPacker::new(&schema, &[(1, TypeCode::I64)]).unwrap();
     let mut plan = MapPlan::from_map(
         LogicalProgram::copy_cols(&[1]),
         &schema,
@@ -538,7 +539,7 @@ fn hash_row_keys_a_row_by_its_content_across_nulls_strings_and_blobs() {
         LogicalProgram::copy_cols(&[1, 2, 3]),
         &in_schema,
         &out_schema,
-        PkSource::HashRow,
+        PkSource::HashRow(FoldCols::new(out_schema.payload_locators())),
     )
     .unwrap();
     let out = plan.evaluate_map_batch(&batch);
@@ -677,7 +678,7 @@ fn map_ranges_bench() {
         rx_batch.end_row();
     }
     let rx_batch = rx_batch.finish();
-    let rx_packer = ReindexPacker::new(&rx_in, &[(1, None)]).unwrap();
+    let rx_packer = ReindexPacker::new(&rx_in, &[(1, TypeCode::I64)]).unwrap();
     let rx_out = rx_packer.output_schema(&rx_in, &[0, 1, 2]).unwrap();
     let mut rx_plan = MapPlan::from_map(
         LogicalProgram::copy_cols(&[0, 1, 2]),
@@ -780,11 +781,12 @@ fn map_ranges_bench() {
         }
         let batch = batch.finish();
         let cols: Vec<u32> = (1..=payload.len() as u32).collect();
+        let out_schema = make_schema(0, &out_tcs);
         let plan = MapPlan::from_map(
             LogicalProgram::copy_cols(&cols),
             &in_schema,
-            &make_schema(0, &out_tcs),
-            PkSource::HashRow,
+            &out_schema,
+            PkSource::HashRow(FoldCols::new(out_schema.payload_locators())),
         )
         .unwrap();
         (name, plan, batch)
@@ -900,7 +902,7 @@ fn a_projection_must_name_payload_columns_that_fit_one_schema() {
 #[test]
 fn a_hash_row_map_carrying_every_column_is_not_an_identity() {
     let s = make_schema(0, &[TypeCode::U128, TypeCode::I64]);
-    let plan = MapPlan::from_wire(&s, &gnitz_wire::MapKind::HashRow { cols: vec![(1, None)] })
+    let plan = MapPlan::from_wire(&s, &gnitz_wire::MapKind::HashRow { cols: vec![(1, TypeCode::I64)] })
         .expect("a well-formed hash-row map");
     assert_eq!(plan.out_schema(), &s, "the output layout is the input's");
     assert!(!plan.is_identity(), "a hash-row map is never an identity");
@@ -909,18 +911,27 @@ fn a_hash_row_map_carrying_every_column_is_not_an_identity() {
 }
 
 /// An auxiliary reindex on `key`, keeping `keep`.
-fn reindex_on(key: &[u32], keep: Vec<u32>, nulls: gnitz_wire::NullKeys) -> gnitz_wire::MapKind {
+fn reindex_slots(
+    key: Vec<gnitz_wire::ReindexSlot>,
+    keep: Vec<u32>,
+    nulls: gnitz_wire::NullKeys,
+) -> gnitz_wire::MapKind {
     gnitz_wire::MapKind::Reindex {
         keep,
-        key: key.iter().map(|&c| (c, None)).collect(),
+        key,
         role: gnitz_wire::ReindexRole::Auxiliary,
         nulls,
     }
 }
 
+/// [`reindex_slots`] on `key` of `s`, each slot self-typed.
+fn reindex_on(s: &SchemaDescriptor, key: &[u32], keep: Vec<u32>, nulls: gnitz_wire::NullKeys) -> gnitz_wire::MapKind {
+    reindex_slots(crate::test_support::self_typed_slots(s, key), keep, nulls)
+}
+
 #[test]
 fn reindex_key_and_kept_column_lists_are_bounds_checked() {
-    let reindex = |keep, key: Vec<u32>| reindex_on(&key, keep, gnitz_wire::NullKeys::Keep);
+    let reindex = |s: &SchemaDescriptor, keep, key: Vec<u32>| reindex_on(s, &key, keep, gnitz_wire::NullKeys::Keep);
     let three = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
@@ -932,24 +943,27 @@ fn reindex_key_and_kept_column_lists_are_bounds_checked() {
     // A compound key and a pruned payload both build — and neither is an
     // identity, since a reindex overwrites every row's PK.
     for (s, keep, key) in [(u64_i64(), vec![0, 1], vec![0, 1]), (three, vec![2], vec![0])] {
-        let plan = MapPlan::from_wire(&s, &reindex(keep, key)).expect("a well-formed reindex");
+        let plan = MapPlan::from_wire(&s, &reindex(&s, keep, key)).expect("a well-formed reindex");
         assert!(!plan.is_identity(), "a reindex is never an identity");
     }
 
     let s = u64_i64();
     assert_eq!(
-        wire_rejection(&s, reindex(vec![9], vec![0])),
+        wire_rejection(&s, reindex(&s, vec![9], vec![0])),
         "reindex map: payload column 9 out of range (2 cols)"
     );
     assert_eq!(
-        wire_rejection(&s, reindex(vec![0], vec![9])),
+        wire_rejection(
+            &s,
+            reindex_slots(vec![(9, TypeCode::I64)], vec![0], gnitz_wire::NullKeys::Keep)
+        ),
         "reindex key: column 9 out of range (2 cols)"
     );
     // A key longer than MAX_PK_COLUMNS overflows the output schema's fixed PK array.
     let n = crate::schema::MAX_PK_COLUMNS + 1;
     let wide = SchemaDescriptor::new(&vec![SchemaColumn::new(TypeCode::U64, false); n], &[0]);
     assert_eq!(
-        wire_rejection(&wide, reindex(vec![0], (0..n as u32).collect())),
+        wire_rejection(&wide, reindex(&wide, vec![0], (0..n as u32).collect())),
         format!("reindex key: {n} columns exceeds the {}-column PK limit", n - 1)
     );
 }
@@ -983,7 +997,7 @@ fn a_drop_reindex_is_filter_then_reindex_and_keep_keeps_null_keys() {
     let (batch, filtered) = (make_int_batch(&s, rows), make_int_batch(&s, &defined));
     for keep in [vec![2], vec![1, 2]] {
         let run = |nulls, b: &Batch| {
-            MapPlan::from_wire(&s, &reindex_on(&[1], keep.clone(), nulls))
+            MapPlan::from_wire(&s, &reindex_on(&s, &[1], keep.clone(), nulls))
                 .unwrap()
                 .evaluate_map_batch(b)
         };
@@ -994,7 +1008,7 @@ fn a_drop_reindex_is_filter_then_reindex_and_keep_keeps_null_keys() {
     }
     // Every row NULL-keyed: an empty output in the reindex's schema.
     let all_null = make_int_batch(&s, &[(1, 1, 0b01, &[0, 1])]);
-    let plan = &mut MapPlan::from_wire(&s, &reindex_on(&[1], vec![2], gnitz_wire::NullKeys::Drop)).unwrap();
+    let plan = &mut MapPlan::from_wire(&s, &reindex_on(&s, &[1], vec![2], gnitz_wire::NullKeys::Drop)).unwrap();
     let out = plan.evaluate_map_batch(&all_null);
     assert_eq!((out.count, out.schema()), (0, plan.out_schema()));
 }
@@ -1020,7 +1034,7 @@ fn a_drop_reindex_keeps_exactly_the_key_defined_rows_across_blocks() {
             .enumerate()
             .map(|(i, c)| (i as u64, 1, u64::from(is_null(i)), &c[..]))
             .collect();
-        let dropped = MapPlan::from_wire(&s, &reindex_on(&[1], vec![2], gnitz_wire::NullKeys::Drop))
+        let dropped = MapPlan::from_wire(&s, &reindex_on(&s, &[1], vec![2], gnitz_wire::NullKeys::Drop))
             .unwrap()
             .evaluate_map_batch(&make_int_batch(&s, &rows));
         let got: Vec<i64> = dropped
@@ -1048,7 +1062,7 @@ fn a_drop_reindex_over_a_not_null_key_has_no_mask() {
         &[0],
     );
     let mask = |key| {
-        MapPlan::from_wire(&s, &reindex_on(&[key], vec![2], gnitz_wire::NullKeys::Drop))
+        MapPlan::from_wire(&s, &reindex_on(&s, &[key], vec![2], gnitz_wire::NullKeys::Drop))
             .unwrap()
             .null_key_mask
     };
@@ -1062,7 +1076,7 @@ fn a_drop_reindex_over_a_not_null_key_has_no_mask() {
 /// cross-width pair (`I32 UNION I64`) hashes one physical layout.
 #[test]
 fn a_hash_row_map_promotes_within_the_copy_kernel_domain_or_is_rejected() {
-    let hash_row = |cols: Vec<u32>, tcs: Vec<Option<gnitz_wire::TypeCode>>| gnitz_wire::MapKind::HashRow {
+    let hash_row = |cols: Vec<u32>, tcs: Vec<TypeCode>| gnitz_wire::MapKind::HashRow {
         cols: cols.into_iter().zip(tcs).collect(),
     };
     let s = SchemaDescriptor::new(
@@ -1073,20 +1087,19 @@ fn a_hash_row_map_promotes_within_the_copy_kernel_domain_or_is_rejected() {
         &[0],
     );
     assert!(
-        MapPlan::from_wire(&s, &hash_row(vec![1], vec![None])).is_ok(),
+        MapPlan::from_wire(&s, &hash_row(vec![1], vec![TypeCode::U32])).is_ok(),
         "no promotion"
     );
     assert!(
-        MapPlan::from_wire(&s, &hash_row(vec![1], vec![Some(gnitz_wire::TypeCode::I64)])).is_ok(),
+        MapPlan::from_wire(&s, &hash_row(vec![1], vec![TypeCode::I64])).is_ok(),
         "U32 → I64 is the ≤8-byte widen the copy kernel supports"
     );
     assert_eq!(
-        wire_rejection(&s, hash_row(vec![9], vec![None])),
+        wire_rejection(&s, hash_row(vec![9], vec![TypeCode::U32])),
         "hash-row map: column 9 out of range (2 cols)"
     );
     assert!(
-        wire_rejection(&s, hash_row(vec![1], vec![Some(gnitz_wire::TypeCode::String)]))
-            .starts_with("map: program/schema mismatch"),
+        wire_rejection(&s, hash_row(vec![1], vec![TypeCode::String])).starts_with("map: program/schema mismatch"),
         "a German string is not a fixed-int widen"
     );
 }
@@ -1152,7 +1165,7 @@ fn reindex_drop_null_keys_bench() {
         gnitz_foundation::perf::Counter::instructions(),
         gnitz_foundation::perf::Counter::cycles(),
     ];
-    let plan = |nulls| MapPlan::from_wire(&s, &reindex_on(&[1], vec![1, 2, 3], nulls)).unwrap();
+    let plan = |nulls| MapPlan::from_wire(&s, &reindex_on(&s, &[1], vec![1, 2, 3], nulls)).unwrap();
     let mut not_null = LogicalProgram::new(
         vec![LogicalInstr::IsNull { col: 1, invert: true }],
         vec![Sink::Reg(Reg(0))],

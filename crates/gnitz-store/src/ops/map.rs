@@ -8,7 +8,7 @@
 use gnitz_expr::{ColCopy, ExprValidateErr, LogicalProgram, MapEval};
 
 use super::reindex::{locate_key_col, FoldCols, ReindexPacker};
-use crate::schema::{oob_col, ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
+use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
 use crate::storage::{copy_string_cells, Batch, HeapArm};
 
 /// One map step's row window: source rows `[src, src + n)` onto destination rows
@@ -42,8 +42,8 @@ pub(crate) enum PkSource {
     /// `_join_pk` of an equijoin / GROUP BY repartition. The output stride
     /// legitimately differs from the input's (U64 input → U128 synthetic PK).
     Pack(ReindexPacker),
-    /// Hash the full output row (every payload column) into each PK.
-    HashRow,
+    /// Hash each output row's payload columns into its PK.
+    HashRow(FoldCols),
 }
 
 // ---------------------------------------------------------------------------
@@ -213,7 +213,7 @@ fn key_defined_runs(batch: &Batch, mask: u64) -> Vec<(usize, usize)> {
 /// Set every row's PK to the [`FoldCols`] digest of its payload columns, so equal
 /// rows share a PK. Two distinct rows whose 128-bit digests collide become one
 /// element; accepted, not checked.
-fn reindex_hash_row(output: &mut Batch) {
+fn reindex_hash_row(output: &mut Batch, fold: &FoldCols) {
     let n = output.count;
     // The PK *is* the digest, so the OPK region is its big-endian bytes.
     const KEY_BYTES: usize = std::mem::size_of::<u128>();
@@ -226,7 +226,6 @@ fn reindex_hash_row(output: &mut Batch) {
     // per chunk.
     const CHUNK: usize = 256;
     let mut keys = [0u128; CHUNK];
-    let fold = FoldCols::new(output.schema().payload_locators());
     let mut start = 0;
     while start < n {
         let end = (start + CHUNK).min(n);
@@ -264,8 +263,8 @@ fn compute_map_output_schema(
 }
 
 /// Output schema of a HashRow Map: a U128 PK, then each projected column at its
-/// target type (the source's when absent) and its source nullability. Typed at
-/// the target, the promotion is what `from_map`'s `check_copy_types` screens.
+/// slot type and its source nullability. Typed at the slot, the promotion is
+/// what `from_map`'s `check_copy_types` screens.
 fn hashrow_output_schema(
     in_schema: &SchemaDescriptor,
     cols: &[gnitz_wire::ReindexSlot],
@@ -274,15 +273,12 @@ fn hashrow_output_schema(
     let mut b = DerivedSchema::new();
     b.push_pk(SchemaColumn::new(crate::schema::TypeCode::U128, false))
         .map_err(over)?;
-    for &(c, tgt) in cols {
+    for &(c, t) in cols {
         // A key column, not merely an in-range one — the screen the reindex and
         // top-N key kinds clear at this same boundary.
         locate_key_col(in_schema, c, "hash-row map")?;
-        let src = in_schema
-            .column(c as usize)
-            .ok_or_else(|| oob_col("hash-row map: column", c, in_schema))?;
-        b.push(SchemaColumn::new(tgt.unwrap_or(src.type_code), src.nullable))
-            .map_err(over)?;
+        let src = in_schema.columns[c as usize];
+        b.push(SchemaColumn::new(t, src.nullable)).map_err(over)?;
     }
     Ok(b.finish())
 }
@@ -298,11 +294,6 @@ impl MapPlan {
             gnitz_wire::MapKind::Compute(map) => return Self::from_compute_map(in_schema, map),
 
             gnitz_wire::MapKind::Reindex { keep, key, nulls, .. } => {
-                // The packer is built first because it *is* the layout: its output
-                // schema reads the promoters the per-row pack writes through, so
-                // the reindexed `_join_pk` and the delta scatter co-partition by
-                // construction. Same packer the exchange scatter builds from the
-                // circuit's own slots.
                 let packer = ReindexPacker::new(in_schema, key)?;
                 let out_schema = packer.output_schema(in_schema, keep)?;
                 if *nulls == gnitz_wire::NullKeys::Drop {
@@ -318,7 +309,8 @@ impl MapPlan {
             gnitz_wire::MapKind::HashRow { cols } => {
                 let out_schema = hashrow_output_schema(in_schema, cols)?;
                 let proj: Vec<u32> = cols.iter().map(|&(c, _)| c).collect();
-                (out_schema, LogicalProgram::copy_cols(&proj), PkSource::HashRow)
+                let fold = FoldCols::new(out_schema.payload_locators());
+                (out_schema, LogicalProgram::copy_cols(&proj), PkSource::HashRow(fold))
             }
 
             gnitz_wire::MapKind::Projection(cols) => {
@@ -432,8 +424,8 @@ impl MapPlan {
         // and every String/Blob struct shifted onto it.
         self.map_ranges_into(in_batch, &mut output, ranges, self.keeps_every_string);
         // The one source that keys on the finished output row.
-        if let PkSource::HashRow = self.pk_source {
-            reindex_hash_row(&mut output);
+        if let PkSource::HashRow(fold) = &self.pk_source {
+            reindex_hash_row(&mut output, fold);
         }
         output
     }
@@ -520,7 +512,7 @@ impl MapPlan {
             }
             // Hashes the finished output row, so `evaluate_map_batch` stamps it
             // once the payload below is written.
-            PkSource::HashRow => {}
+            PkSource::HashRow(_) => {}
         }
         output.weight_data_mut()[dst_base * 8..(dst_base + n) * 8]
             .copy_from_slice(&in_batch.weight_data()[src_start * 8..(src_start + n) * 8]);

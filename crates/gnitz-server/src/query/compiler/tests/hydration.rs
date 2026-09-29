@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{reindexed_on_col1, two_term_join_circuit};
-use gnitz_wire::{Circuit, JoinKind, OpNode, ReadBound};
+use gnitz_wire::{Circuit, JoinKind, OpNode, ReadBound, TypeCode};
 
 fn loaded(circuit: Circuit) -> LoadedCircuit {
     LoadedCircuit::new(circuit).expect("test circuit within the node limit")
@@ -10,7 +10,7 @@ fn loaded(circuit: Circuit) -> LoadedCircuit {
 /// sink's input out of `[da, db]` and `[ta, tb]`.
 fn join_with(sources: [u64; 2], terms: impl FnOnce(&mut Circuit, [NodeId; 2], [NodeId; 2]) -> NodeId) -> LoadedCircuit {
     let mut c = Circuit::default();
-    let deltas = sources.map(|s| reindexed_on_col1(&mut c, s));
+    let deltas = sources.map(|s| reindexed_on_col1(&mut c, s, TypeCode::I64));
     let traces = deltas.map(|d| c.integrate_trace(d));
     let out = terms(&mut c, deltas, traces);
     c.sink(out);
@@ -32,7 +32,7 @@ fn a_linear_chain_seeds_at_its_scan() {
 /// The two-term join seeds from the trace integrating side A's reindex.
 #[test]
 fn a_two_term_join_seeds_from_side_as_trace() {
-    let lc = loaded(two_term_join_circuit(100, 200));
+    let lc = loaded(two_term_join_circuit(100, 200, TypeCode::I64));
     let Ok(SeedAt::Trace { delta, trace }) = seed_node(&lc) else {
         panic!("a two-term join seeds at a trace");
     };
@@ -48,8 +48,8 @@ fn a_two_term_join_seeds_from_side_as_trace() {
 #[test]
 fn a_semi_join_term_is_accepted() {
     let mut c = Circuit::default();
-    let da = reindexed_on_col1(&mut c, 100);
-    let rb = reindexed_on_col1(&mut c, 200);
+    let da = reindexed_on_col1(&mut c, 100, TypeCode::I64);
+    let rb = reindexed_on_col1(&mut c, 200, TypeCode::I64);
     let db = c.distinct(rb);
     let ta = c.integrate_trace(da);
     let tb = c.integrate_trace(db);

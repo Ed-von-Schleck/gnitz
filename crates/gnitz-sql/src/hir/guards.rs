@@ -5,6 +5,7 @@ use super::{HirExpr, JoinShape, JoinType, SubqueryKind, SubqueryRef};
 use crate::error::GnitzSqlError;
 use crate::validate::reject_float_keys;
 use gnitz_core::{ColumnDef, TypeCode};
+use gnitz_wire::JoinKeyRule;
 
 /// `residual`, what a join's ON left unkeyed, applies only as a filter over an
 /// INNER product: `JoinClass` has nowhere to hold one, so `place()` drops it into
@@ -53,15 +54,32 @@ pub(crate) fn reject_join_shape(kind: JoinType, shape: JoinShape) -> Result<(), 
     }
 }
 
-/// Validate one equijoin key pair and return the pair's common reindex output
-/// type `T`. Float keys are rejected outright (IEEE-754 -0.0/+0.0 compare
-/// byte-unequal and NaN has no canonical form). A German string (STRING/BLOB) may
-/// only join another German string: it reindexes to a 16-byte content hash, which
-/// is byte-incompatible with the native U128/UUID encoding even though both
-/// collapse to the U128 output type. Everything else goes to
-/// [`TypeCode::join_key_common_type`].
+/// Validate one equijoin key pair and return the key type both sides pack at.
 pub(crate) fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCode, GnitzSqlError> {
-    reject_float_keys([left, right], "JOIN ON")?;
+    let t = left
+        .ty
+        .tc
+        .join_key_common_type(right.ty.tc)
+        .map_err(|rule| match rule {
+            JoinKeyRule::Float => {
+                reject_float_keys([left, right], "JOIN ON").expect_err("a Float pair holds a float column")
+            }
+            JoinKeyRule::UnitMismatch => GnitzSqlError::Rejected(format!(
+                "JOIN ON: join key columns '{}' ({}) and '{}' ({}) differ in unit (days vs microseconds)",
+                left.name, left.ty, right.name, right.ty
+            )),
+            JoinKeyRule::StringWithNative => GnitzSqlError::Rejected(format!(
+                "JOIN ON: cannot equijoin string/blob column '{}' ({}) with non-string \
+             column '{}' ({}); a string content hash never matches a native key",
+                left.name, left.ty, right.name, right.ty
+            )),
+            JoinKeyRule::NoSigned256 => GnitzSqlError::Rejected(format!(
+                "JOIN ON: join key columns '{}' ({}) and '{}' ({}) cannot co-partition; \
+             a cross-sign pair whose unsigned side is 128-bit (e.g. UINT128/UUID \
+             joined with a signed integer) needs a signed-256 type that does not exist",
+                left.name, left.ty, right.name, right.ty
+            )),
+        })?;
     if !left.ty.decimal_domains_match(right.ty) {
         return Err(GnitzSqlError::Rejected(format!(
             "JOIN ON: join key columns '{}' ({}) and '{}' ({}) differ; a DECIMAL joins only a \
@@ -69,32 +87,7 @@ pub(crate) fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Res
             left.name, left.ty, right.name, right.ty
         )));
     }
-    let (lt, rt) = (left.ty.tc, right.ty.tc);
-    if lt.is_temporal() && rt.is_temporal() && lt != rt {
-        return Err(GnitzSqlError::Rejected(format!(
-            "JOIN ON: join key columns '{}' ({}) and '{}' ({}) differ in unit (days vs microseconds)",
-            left.name, left.ty, right.name, right.ty
-        )));
-    }
-    // STRING/BLOB reindex to a 16-byte XXH3 content hash; U128/UUID reindex to the
-    // 16-byte native value. Both collapse to the U128 output type, so
-    // `join_key_common_type` cannot tell them apart — but a content hash never
-    // equals a native integer, so the join would silently match nothing.
-    if left.ty.tc.is_german_string() != right.ty.tc.is_german_string() {
-        return Err(GnitzSqlError::Rejected(format!(
-            "JOIN ON: cannot equijoin string/blob column '{}' ({}) with non-string \
-             column '{}' ({}); a string content hash never matches a native key",
-            left.name, left.ty, right.name, right.ty
-        )));
-    }
-    left.ty.tc.join_key_common_type(right.ty.tc).ok_or_else(|| {
-        GnitzSqlError::Rejected(format!(
-            "JOIN ON: join key columns '{}' ({}) and '{}' ({}) cannot co-partition; \
-             a cross-sign pair whose unsigned side is 128-bit (e.g. UINT128/UUID \
-             joined with a signed integer) needs a signed-256 type that does not exist",
-            left.name, left.ty, right.name, right.ty
-        ))
-    })
+    Ok(t)
 }
 
 /// Validate the range conjunct's key pair and return its common reindex output

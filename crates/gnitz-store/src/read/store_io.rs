@@ -5,7 +5,7 @@
 
 use super::SkeletonHydrator;
 use crate::relation::{Relation, RelationKind, RelationRegistry};
-use crate::schema::key::{compare_pk_bytes, sort_indices, IndexKeySpec};
+use crate::schema::key::{compare_pk_bytes, sort_indices, KeySpec};
 use crate::schema::{project_schema, ColumnLocator};
 use crate::schema::{ColumnTable, SchemaFacts};
 use crate::storage::{pk_group_end, Batch, PkSetGather, ReadCursor, SkeletonKeys};
@@ -213,7 +213,7 @@ pub struct BoundedIndexCursor {
     /// Positioned on the index range and clamped at its end.
     idx: ReadCursor,
     src: PkSetGather,
-    spec: IndexKeySpec,
+    spec: KeySpec,
     /// A refill's source PKs in index order, flat at `src`'s `pk_stride`.
     pks: Vec<u8>,
     order: Vec<u32>,

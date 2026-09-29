@@ -15,7 +15,7 @@ use gnitz_wire::{ReduceOutSlot, NARROW_PK_MAX_BYTES};
 
 /// A row's group key, as the output PK a reduce over the group set stamps.
 pub(super) enum GroupKey {
-    /// The leading `n` PK bytes: the whole PK, or a single leading PK column.
+    /// The leading `n` PK bytes.
     PkPrefix(usize),
     /// One column's OPK image, at that column's width.
     Image(ColumnLocator),

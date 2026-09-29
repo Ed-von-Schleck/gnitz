@@ -2,8 +2,7 @@
 //! kernels.
 
 use crate::ops::group_key::GroupKey;
-use crate::ops::reindex::{locate_key_col, FoldCols, ReindexPacker};
-use crate::schema::ColumnTable;
+use crate::ops::reindex::{FoldCols, ReindexPacker};
 use crate::schema::Slot;
 use crate::schema::{worker_for_key, worker_for_pk_bytes};
 use crate::schema::{ColumnLocator, SchemaDescriptor};
@@ -21,8 +20,8 @@ pub fn op_worker_filter(batch: &Batch, slot: Slot) -> Batch {
 pub struct ScatterPlan(Key);
 
 enum Key {
-    /// The output PK a reduce over the columns stamps — also what an unpromoted
-    /// PK-prefix or single-column join key packs to.
+    /// The output PK a reduce over the columns stamps — also what a join key
+    /// packing a PK prefix or one column's own image packs to.
     Group(GroupKey),
     /// The `_join_pk` the reindex Map packs.
     Packed(ReindexPacker),
@@ -36,28 +35,24 @@ impl ScatterPlan {
 
     /// An equi-join key, keyed by the `_join_pk` the reindex Map packs from `slots`.
     pub fn join(schema: &SchemaDescriptor, slots: &[gnitz_wire::ReindexSlot]) -> Result<Self, String> {
-        let pk = schema.pk_cols();
-        let key = match slots {
-            // Slots pack in slot order, so only the PK's leading columns in PK
-            // order, unpromoted, pack the PK's own bytes.
-            _ if slots.len() <= pk.len() && slots.iter().zip(pk).all(|(&(c, t), &p)| c == p && t.is_none()) => {
-                GroupKey::PkPrefix(
-                    slots
-                        .iter()
-                        .map(|&(c, _)| schema.columns[c as usize].size() as usize)
-                        .sum(),
-                )
+        let packer = ReindexPacker::new(schema, slots)?;
+        let key = packer.identity_columns().and_then(|locs| {
+            // The PK region holds the PK columns contiguously in PK order.
+            let mut at = 0;
+            let pk_prefix = locs.iter().all(|l| match *l {
+                ColumnLocator::Pk { byte_off, size, .. } if byte_off as usize == at => {
+                    at += size as usize;
+                    true
+                }
+                _ => false,
+            });
+            match &locs[..] {
+                _ if pk_prefix => Some(GroupKey::PkPrefix(at)),
+                &[loc] => Some(GroupKey::Image(loc)),
+                _ => None,
             }
-            &[(c, None)]
-                if schema
-                    .column(c as usize)
-                    .is_some_and(|col| col.type_code.is_pk_eligible()) =>
-            {
-                GroupKey::Image(locate_key_col(schema, c, "reindex key")?)
-            }
-            _ => return Ok(ScatterPlan(Key::Packed(ReindexPacker::new(schema, slots)?))),
-        };
-        Ok(ScatterPlan(Key::Group(key)))
+        });
+        Ok(ScatterPlan(key.map_or(Key::Packed(packer), Key::Group)))
     }
 
     /// The whole PK — what [`op_worker_filter`] keeps a broadcast delta's share by.

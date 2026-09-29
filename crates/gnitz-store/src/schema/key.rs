@@ -6,7 +6,7 @@
 //! image, compare two such images with a raw `memcmp`, pack a narrow region
 //! into a sort key, carry a width-tagged PK byte buffer, and derive the
 //! half-open key range a `KeyRange`'s cut pair denotes — and compose a
-//! secondary index's multi-column leading span ([`IndexKeySpec`]). None of them reaches
+//! multi-column key span ([`KeySpec`]). None of them reaches
 //! up into storage — the dependency runs `storage → schema::key`,
 //! the legitimate downward direction. This module is the one import path: every
 //! caller, storage included, names `crate::schema::key::X`.
@@ -208,7 +208,7 @@ pub(crate) fn leading_u64(pk_bytes: &[u8]) -> u64 {
 /// group-key emitters build one, so the width checks below cannot be skipped by
 /// hand-rolling `&pk.to_be_bytes()[16 - stride..]`, which silently truncates a
 /// value that overflows the stride. (A writer whose slot width is fixed by the
-/// schema — the packer's string and float arms, `AviBake::entry` — is
+/// schema — the packer's string arm, `AviBake::entry` — is
 /// width-total already and copies its `to_be_bytes` directly.) Zero-cost: a
 /// stack value, no allocation.
 pub(crate) struct NarrowPkOpk {
@@ -336,52 +336,61 @@ pub fn probe_key(opk: &[u8]) -> u64 {
 /// the one import path for the OPK vocabulary.
 pub use gnitz_wire::PkBuf;
 
-/// One indexed column: where the owner-side value lives (`locate` — a PK source
-/// is sliced from the OPK region, a payload column read from its dense slot),
-/// and the promoted key column it encodes at, whose `size()` is the slot width.
-/// Padding for this module's fixed-size locator arrays; names no real column.
-pub(crate) const EMPTY_LOC: ColumnLocator = ColumnLocator::Pk {
-    byte_off: 0,
-    size: 0,
-    type_code: TypeCode::U8,
-};
-
+/// One key column: where its source value lives, and the key column it packs
+/// into.
 #[derive(Clone, Copy)]
-struct IndexKeyCol {
-    loc: ColumnLocator,
-    out: SchemaColumn,
+pub(crate) struct KeyCol {
+    pub(crate) loc: ColumnLocator,
+    pub(crate) out: SchemaColumn,
 }
 
-impl IndexKeyCol {
-    /// Unused slots of the fixed array: the schema layer's designated padding
-    /// column and [`EMPTY_LOC`]. Nothing reads past `n`.
-    const EMPTY: IndexKeyCol = IndexKeyCol { loc: EMPTY_LOC, out: SchemaColumn::EMPTY };
-
-    fn new(loc: ColumnLocator, out: SchemaColumn) -> Self {
-        IndexKeyCol { loc, out }
-    }
+impl KeyCol {
+    /// Padding for the fixed array's unused slots; nothing reads past `n`.
+    const EMPTY: KeyCol = KeyCol {
+        loc: ColumnLocator::Pk {
+            byte_off: 0,
+            size: 0,
+            type_code: TypeCode::U8,
+        },
+        out: SchemaColumn::EMPTY,
+    };
 }
 
-/// The single definition of "what key do these columns map to": byte-equal ⟺
-/// value-equal at any width, byte-lexicographic order is the seek/merge order.
-/// Built once per circuit, `Copy`, so the row paths allocate nothing.
-/// [`Self::new`] is a secondary index's span, `Self::for_pk` a base table's
-/// own PK under the identity promotion.
+/// A key span: columns at their key types, packed tightly in order. Built once
+/// per circuit, `Copy`, so the row paths allocate nothing.
 #[derive(Clone, Copy)]
-pub struct IndexKeySpec {
+pub struct KeySpec {
     n: u8,
     /// Sum of the promoted column widths, so the row path re-sums nothing.
     key_size: u8,
     /// Sized by `MAX_PK_COLUMNS`, not the wire's `PK_LIST_MAX_COLS`: `for_pk`
     /// may be handed an index schema, whose PK arity reaches the engine limit.
-    cols: [IndexKeyCol; MAX_PK_COLUMNS],
+    cols: [KeyCol; MAX_PK_COLUMNS],
 }
 
-impl IndexKeySpec {
-    /// The span of a secondary index on `cols` of `owner`, and the **one**
-    /// promotion of an indexed column's type — `Self::output_schema` reads the
-    /// promoted columns back off this spec, so the entry bytes and the schema
-    /// they land in are one derivation.
+impl KeySpec {
+    /// The span of `cols`, each at its key type.
+    pub(crate) fn of(cols: impl IntoIterator<Item = (ColumnLocator, TypeCode)>) -> Self {
+        let mut spec = KeySpec {
+            n: 0,
+            key_size: 0,
+            cols: [KeyCol::EMPTY; MAX_PK_COLUMNS],
+        };
+        for (loc, tc) in cols {
+            let out = SchemaColumn::new(tc, false);
+            spec.cols[spec.n as usize] = KeyCol { loc, out };
+            spec.n += 1;
+            spec.key_size += out.size();
+        }
+        spec
+    }
+
+    /// The span's columns, in order.
+    pub(crate) fn columns(&self) -> &[KeyCol] {
+        &self.cols[..self.n as usize]
+    }
+
+    /// The span of a secondary index on `cols` of `owner`.
     ///
     /// `Err` on an arity outside `1..=MAX_PK_COLUMNS`, an out-of-range column, a
     /// type no index key carries, or a record over the PK arity/stride limits —
@@ -406,24 +415,12 @@ impl IndexKeySpec {
         }
         let promoted = gnitz_wire::index_key_types(&col_types, owner.pk_cols().len(), owner.pk_stride())
             .map_err(|r| r.to_string())?;
-        let mut spec = IndexKeySpec {
-            n: cols.len() as u8,
-            key_size: 0,
-            cols: [IndexKeyCol::EMPTY; MAX_PK_COLUMNS],
-        };
-        for (i, (&c, &t)) in cols.iter().zip(&promoted).enumerate() {
-            let out = SchemaColumn::new(t, false);
-            spec.cols[i] = IndexKeyCol::new(owner.locate(c as usize), out);
-            spec.key_size += out.size();
-        }
-        Ok(spec)
+        Ok(Self::of(cols.iter().map(|&c| owner.locate(c as usize)).zip(promoted)))
     }
 
-    /// The index schema this spec's entries land in: the promoted key columns in
-    /// declared order, then `source`'s PK columns, all in the PK with zero
-    /// payload. Built from the promoters [`Self::write_span`] encodes through, so
-    /// the schema's leading-key width *is* [`Self::key_size`]. `Err` only on the
-    /// limits [`Self::new`] has already checked.
+    /// The index schema this spec's entries land in: the key columns, then
+    /// `source`'s PK columns, all in the PK. `Err` only on the limits
+    /// [`Self::new`] has already checked.
     pub(in crate::schema) fn output_schema(&self, source: &SchemaDescriptor) -> Result<SchemaDescriptor, SchemaBound> {
         let mut b = DerivedSchema::new();
         for c in &self.cols[..self.n as usize] {
@@ -436,15 +433,7 @@ impl IndexKeySpec {
     /// A base table's own PK as the degenerate span, each column at its own type, so a
     /// PK range walk reads through [`Self::range_keys`] as an index walk does.
     pub(crate) fn for_pk(schema: &SchemaDescriptor) -> Self {
-        let mut spec = IndexKeySpec {
-            n: schema.pk_cols().len() as u8,
-            key_size: schema.pk_stride() as u8,
-            cols: [IndexKeyCol::EMPTY; MAX_PK_COLUMNS],
-        };
-        for (i, (ci, col)) in schema.pk_columns().enumerate() {
-            spec.cols[i] = IndexKeyCol::new(schema.locate(ci), *col);
-        }
-        spec
+        Self::of(schema.pk_columns().map(|(ci, c)| (schema.locate(ci), c.type_code)))
     }
 
     /// Span width in bytes (`idx_key_size`) — the sum of the promoted widths.
@@ -454,7 +443,7 @@ impl IndexKeySpec {
     }
 
     /// Write one row's leading-key span into `dst[..key_size()]` — the bytes
-    /// [`Self::seek_prefix`] and `ReindexPacker::pack_into` produce for the same values.
+    /// [`Self::seek_prefix`] produces for the same values.
     /// `false` when any indexed column is NULL: the row is unindexed, `dst` partly written.
     pub fn write_span(&self, mb: &impl RowSource, row: usize, dst: &mut [u8]) -> bool {
         debug_assert!(dst.len() >= self.key_size(), "write_span: dst shorter than the span");
@@ -658,7 +647,7 @@ impl SchemaDescriptor {
     /// The OPK key band `r` names over this schema's whole PK list; `None` when it
     /// names no key.
     pub fn pk_range_keys(&self, r: &KeyRange) -> Option<(PkBuf, Option<PkBuf>)> {
-        IndexKeySpec::for_pk(self).range_keys(self.pk_stride(), r)
+        KeySpec::for_pk(self).range_keys(self.pk_stride(), r)
     }
 }
 

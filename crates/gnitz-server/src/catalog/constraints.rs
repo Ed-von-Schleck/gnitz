@@ -2,14 +2,14 @@
 //! directions, and the unique secondary indexes a write must check.
 
 use super::*;
-use gnitz_store::schema::IndexKeySpec;
+use gnitz_store::schema::KeySpec;
 use gnitz_wire::PkColList;
 
 /// Every constraint on one table whose validation reads committed state.
 pub(crate) struct RowConstraints {
     pub(crate) fks_as_child: Vec<FkEdge>,
     pub(crate) fks_as_parent: Vec<FkEdge>,
-    pub(crate) uniques: Vec<(PkColList, SchemaDescriptor, IndexKeySpec)>,
+    pub(crate) uniques: Vec<(PkColList, SchemaDescriptor, KeySpec)>,
 }
 
 impl RowConstraints {

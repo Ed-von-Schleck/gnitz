@@ -200,8 +200,9 @@ fn join_key_common_type_accepts_ladders() {
         (String, Blob, U128),
     ];
     for &(l, r, t) in cases {
-        assert_eq!(l.join_key_common_type(r), Some(t), "common({l},{r}) should be {t}");
-        assert_eq!(r.join_key_common_type(l), Some(t), "common is symmetric for ({l},{r})");
+        assert_eq!(l.join_key_common_type(r), Ok(t), "common({l},{r}) should be {t}");
+        assert_eq!(r.join_key_common_type(l), Ok(t), "common is symmetric for ({l},{r})");
+        assert!(l.packs_at(t) && r.packs_at(t), "({l},{r}) cannot pack at {t}");
     }
 }
 
@@ -210,101 +211,66 @@ fn join_key_common_type_accepts_ladders() {
 /// faithfully holds both ranges — strictly wider than the unsigned operand and
 /// at least as wide as the signed one. A 128-bit unsigned operand (`U128` /
 /// `UUID`) would need a signed-256 type, which does not exist, so it is
-/// refused. Symmetric either way. (One-sided string and float pairs are
-/// screened out in the planner and are not this fn's job.)
+/// refused. Symmetric either way.
 #[test]
 fn join_key_common_type_over_cross_sign_pairs() {
     use TypeCode::*;
-    let cases: &[(TypeCode, TypeCode, Option<TypeCode>)] = &[
-        (U8, I8, Some(I16)),
-        (U8, I16, Some(I16)),
-        (U8, I32, Some(I32)),
-        (U8, I64, Some(I64)),
-        (U16, I8, Some(I32)),
-        (U16, I16, Some(I32)),
-        (U16, I32, Some(I32)),
-        (U16, I64, Some(I64)),
-        (U32, I8, Some(I64)),
-        (U32, I16, Some(I64)),
-        (U32, I32, Some(I64)),
-        (U32, I64, Some(I64)),
+    const NO: Result<TypeCode, JoinKeyRule> = Err(JoinKeyRule::NoSigned256);
+    let cases: &[(TypeCode, TypeCode, Result<TypeCode, JoinKeyRule>)] = &[
+        (U8, I8, Ok(I16)),
+        (U8, I16, Ok(I16)),
+        (U8, I32, Ok(I32)),
+        (U8, I64, Ok(I64)),
+        (U16, I8, Ok(I32)),
+        (U16, I16, Ok(I32)),
+        (U16, I32, Ok(I32)),
+        (U16, I64, Ok(I64)),
+        (U32, I8, Ok(I64)),
+        (U32, I16, Ok(I64)),
+        (U32, I32, Ok(I64)),
+        (U32, I64, Ok(I64)),
         // A U64 unsigned side carries the pair to the signed-128 type.
-        (U64, I8, Some(I128)),
-        (U64, I16, Some(I128)),
-        (U64, I32, Some(I128)),
-        (U64, I64, Some(I128)),
+        (U64, I8, Ok(I128)),
+        (U64, I16, Ok(I128)),
+        (U64, I32, Ok(I128)),
+        (U64, I64, Ok(I128)),
         // A 128-bit unsigned side has no faithful common type at any width.
-        (U128, I8, None),
-        (U128, I64, None),
-        (UUID, I32, None),
-        (UUID, I64, None),
-        (U128, I128, None),
-        (UUID, I128, None),
+        (U128, I8, NO),
+        (U128, I64, NO),
+        (UUID, I32, NO),
+        (UUID, I64, NO),
+        (U128, I128, NO),
+        (UUID, I128, NO),
     ];
     for &(u, s, want) in cases {
         assert_eq!(u.join_key_common_type(s), want, "cross-sign common({u},{s})");
         assert_eq!(s.join_key_common_type(u), want, "cross-sign is symmetric for ({u},{s})");
+        if let Ok(t) = want {
+            assert!(u.packs_at(t) && s.packs_at(t), "({u},{s}) cannot pack at {t}");
+        }
     }
 }
 
-/// DATE and TIMESTAMP are integers in different units, so no key copy
-/// co-partitions them.
+/// Each refusal names its rule, symmetric either way.
 #[test]
-fn join_key_common_type_refuses_date_with_timestamp() {
+fn join_key_common_type_names_each_refusal() {
     use TypeCode::*;
-    assert_eq!(Date.join_key_common_type(Timestamp), None);
-    assert_eq!(Timestamp.join_key_common_type(Date), None);
-}
-
-/// `TypeCode::carried_reindex_tc` and `resolve_reindex_type` are inverses: a
-/// slot that needs no promotion carries `None` ("derive from source"), a
-/// cross-width slot carries its target `T`, and resolving what was carried
-/// returns `T` either way.
-#[test]
-fn carried_reindex_tc_round_trips_with_resolve() {
-    use TypeCode::*;
-    // (source, promoted target T, whether T has to be carried)
-    let cases: &[(TypeCode, TypeCode, bool)] = &[
-        // Self-deriving slots: the per-column default policy already lands on T.
-        (I32, I32, false),
-        (U64, U64, false),
-        (String, U128, false),
-        (F64, U128, false),
-        (U128, U128, false),
-        (UUID, U128, false),
-        // Cross-width slots carry the promoted target.
-        (I8, I64, true),
-        (I32, I64, true),
-        (U8, U64, true),
-        (U32, U64, true),
-        (U32, U128, true),
-        // Cross-sign promotions: the unsigned side lands on a signed T.
-        (U8, I16, true),
-        (U16, I32, true),
-        (U32, I64, true),
-        // Every side reaching the signed-128 slot.
-        (U64, I128, true),
-        (I8, I128, true),
-        (I16, I128, true),
-        (I32, I128, true),
-        (I64, I128, true),
+    let cases: &[(TypeCode, TypeCode, JoinKeyRule)] = &[
+        (F64, F64, JoinKeyRule::Float),
+        (F32, I64, JoinKeyRule::Float),
+        (F64, String, JoinKeyRule::Float),
+        (Date, Timestamp, JoinKeyRule::UnitMismatch),
+        (String, U128, JoinKeyRule::StringWithNative),
+        (Blob, I64, JoinKeyRule::StringWithNative),
+        (U128, I64, JoinKeyRule::NoSigned256),
     ];
-    for &(src, t, want_carried) in cases {
-        let carried = src.carried_reindex_tc(t);
-        assert_eq!(carried, want_carried.then_some(t), "carried target for {src:?} → {t:?}");
-        assert_eq!(resolve_reindex_type(src, carried), t, "round-trip for {src:?} → {t:?}");
-        // A carried target re-derives to itself, which is how the compiler's
-        // `ReindexPacker::new` validates one without re-implementing the
-        // ladder. (A self-deriving slot carries nothing and is not validated
-        // this way.)
-        if carried.is_some() {
-            assert_eq!(
-                src.join_key_common_type(t),
-                Some(t),
-                "promotion not idempotent for {src:?} → {t:?}: \
-                 compiler carried-slot guard would diverge from the planner"
-            );
-        }
+    for &(l, r, rule) in cases {
+        assert_eq!(l.join_key_common_type(r), Err(rule), "common({l},{r})");
+        assert_eq!(
+            r.join_key_common_type(l),
+            Err(rule),
+            "common is symmetric for ({l},{r})"
+        );
     }
 }
 

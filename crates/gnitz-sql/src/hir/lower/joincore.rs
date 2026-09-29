@@ -8,12 +8,9 @@ use crate::validate::reject_column_overflow;
 use gnitz_core::{Circuit, ColumnDef, NodeId, NullKeys, RangeRel, ReindexRole, ReindexSlot, Schema, TypeCode};
 use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc, JoinKind};
 
-/// This side's reindex key over `cols`, each slot promoted to its `slot_tcs` type.
-fn side_reindex_key(cols: &[usize], coldefs: &[ColumnDef], slot_tcs: &[TypeCode]) -> Vec<ReindexSlot> {
-    cols.iter()
-        .zip(slot_tcs)
-        .map(|(&c, &t)| (c as u32, coldefs[c].ty.tc.carried_reindex_tc(t)))
-        .collect()
+/// This side's reindex key over `cols`, each slot typed at its `slot_tcs` type.
+fn side_reindex_key(cols: &[usize], slot_tcs: &[TypeCode]) -> Vec<ReindexSlot> {
+    cols.iter().zip(slot_tcs).map(|(&c, &t)| (c as u32, t)).collect()
 }
 
 /// `(all, reindex)`: `input` re-keyed onto its join key, `reindex` without its
@@ -25,7 +22,7 @@ fn keyed_side(
     tcs: &[TypeCode],
     emits_unmatched: bool,
 ) -> Result<(NodeId, NodeId), GnitzSqlError> {
-    let key = side_reindex_key(&side.key, &side.frame.schema.columns, tcs);
+    let key = side_reindex_key(&side.key, tcs);
     let role = side.scatter_key(&key)?;
     let reindex = cb.map_reindex(input, &key, &side.keep, role.clone(), NullKeys::Drop);
     let all = match emits_unmatched {
@@ -90,8 +87,8 @@ pub(super) fn equi_prologue(
 }
 
 /// The output PK columns a re-key onto source PKs mints: one per listed
-/// `(schema, pk column)`, typed by the reindex's self-derive output type,
-/// non-nullable, and hidden. The two producers below differ only in `name`.
+/// `(schema, pk column)`, at the column's own key slot type, non-nullable, and
+/// hidden. The two producers below differ only in `name`.
 fn rekey_pk_coldefs<'a>(
     cols: impl IntoIterator<Item = (&'a Schema, u32)>,
     name: impl Fn(usize, &ColumnDef) -> String,
@@ -130,7 +127,11 @@ pub(crate) fn src_pk_coldefs(schema: &Schema) -> Vec<ColumnDef> {
 fn rekey_pinned(cb: &mut Circuit, node: NodeId, lead: usize, sides: &[JoinSide]) -> NodeId {
     let (mut key, mut at) = (Vec::new(), lead);
     for s in sides {
-        key.extend((at..at + s.pa()).map(|c| (c as u32, None)));
+        let pinned = &s.keep[..s.pa()];
+        key.extend(pinned.iter().enumerate().map(|(j, &c)| {
+            let tc = s.frame.schema.columns[c as usize].ty.tc;
+            ((at + j) as u32, tc.reindex_output_type())
+        }));
         at += s.n();
     }
     let keep: Vec<u32> = (lead as u32..at as u32).collect();
@@ -146,7 +147,12 @@ pub(super) fn rekey_on_source_pk(
     side: &JoinSide,
     scatter: bool,
 ) -> Result<NodeId, GnitzSqlError> {
-    let key: Vec<ReindexSlot> = side.frame.schema.pk_cols.iter().map(|&c| (c, None)).collect();
+    let schema = &side.frame.schema;
+    let key: Vec<ReindexSlot> = schema
+        .pk_cols
+        .iter()
+        .map(|&c| (c, schema.columns[c as usize].ty.tc.reindex_output_type()))
+        .collect();
     let role = match scatter {
         true => side.scatter_key(&key)?,
         false => ReindexRole::Auxiliary,
@@ -188,6 +194,8 @@ pub(super) struct RangePrologue<'a> {
     /// The key arity: the eq prefix plus the one range slot — the width of the
     /// key region every term leads with.
     k: usize,
+    /// The range slot's key type.
+    range_tc: TypeCode,
     op: RangeRel,
 }
 
@@ -233,7 +241,8 @@ impl RangePrologue<'_> {
         // [_group_pk:U128, m:Tc, count]
         let red = cb.reduce_multi_local(keys, &[], &specs, false);
         // `m` is never NULL: B's NULL range keys never reached the reduce.
-        let reindex_m = cb.map_reindex(red, &[(1, None)], &[], ReindexRole::Auxiliary, NullKeys::Keep);
+        // `m` is a MIN/MAX of B's range slot.
+        let reindex_m = cb.map_reindex(red, &[(1, self.range_tc)], &[], ReindexRole::Auxiliary, NullKeys::Keep);
         let trace_m = cb.integrate_trace(reindex_m);
 
         // `m` carries no payload, so both terms are `[_join_pk × k, A]`.
@@ -312,6 +321,7 @@ pub(super) fn range_prologue<'a>(
         int_a,
         trace_a,
         k: tcs.len(),
+        range_tc: range.tc,
         op: range.op,
     })
 }
@@ -333,12 +343,11 @@ fn own_a(
     };
     let at = side.keep.iter().position(|&c| c as usize == range_slot);
     let at = side.pa() + at.expect("the keep rule keeps a pure range's range column");
-    let carried = side.frame.schema.columns[range_slot].ty.tc.carried_reindex_tc(range_tc);
     let keep: Vec<u32> = (side.pa() as u32..(side.pa() + side.n()) as u32).collect();
     // [range key, kept A]
     let int_a = cb.map_reindex(
         owned,
-        &[(at as u32, carried)],
+        &[(at as u32, range_tc)],
         &keep,
         ReindexRole::Auxiliary,
         NullKeys::Drop,

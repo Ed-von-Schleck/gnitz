@@ -78,8 +78,7 @@ impl SourceOrigin {
         by_id.or(by_pk)
     }
 
-    /// `key`, restated over the source relation. Each slot keeps its promotion
-    /// target: a pass-through copies its column's type.
+    /// `key`, restated over the source relation. Each slot keeps its type.
     pub(crate) fn scatter_role(&self, frame: &Frame, key: &[ReindexSlot]) -> Option<ReindexRole> {
         let source_key = key
             .iter()

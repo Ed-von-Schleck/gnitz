@@ -685,7 +685,7 @@ fn batch_release_bench() {
 /// carries that row's own weight, retractions included.
 #[test]
 fn project_index_drops_ghosts_and_carries_each_weight() {
-    use crate::schema::{make_index_schema, IndexKeySpec};
+    use crate::schema::{make_index_schema, KeySpec};
 
     let owner = SchemaDescriptor::new(
         &[
@@ -696,7 +696,7 @@ fn project_index_drops_ghosts_and_carries_each_weight() {
     );
     let cols = [1u32];
     let idx_schema = make_index_schema(&cols, &owner).unwrap();
-    let spec = IndexKeySpec::new(&cols, &owner).unwrap();
+    let spec = KeySpec::new(&cols, &owner).unwrap();
 
     let mut bb = crate::storage::BatchBuilder::new(owner);
     for &(id, a, w) in &[(1u128, 10i64, 1i64), (2, 20, 0), (3, 30, -1)] {

@@ -10,8 +10,8 @@ fn span_u64(v: u64) -> PkBuf {
 
 /// Span-extraction spec for a unique index on `cols`, promoted exactly as
 /// production circuit registration does.
-fn test_spec(cols: &[u32], schema: &SchemaDescriptor) -> IndexKeySpec {
-    IndexKeySpec::new(cols, schema).unwrap()
+fn test_spec(cols: &[u32], schema: &SchemaDescriptor) -> KeySpec {
+    KeySpec::new(cols, schema).unwrap()
 }
 
 /// The filter's whole contract: it never proves a present span absent, and past

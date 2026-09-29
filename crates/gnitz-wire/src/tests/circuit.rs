@@ -55,16 +55,16 @@ fn sample(op: Opcode) -> OpNode {
             out_cols: vec![(crate::TypeCode::I64, false), (crate::TypeCode::String, true)],
         })),
         Opcode::MapHashRow => OpNode::Map(MapKind::HashRow {
-            cols: vec![(1, None), (2, Some(TypeCode::I32))],
+            cols: vec![(1, TypeCode::String), (2, TypeCode::I32)],
         }),
         Opcode::WorkerFilter => OpNode::WorkerFilter,
         Opcode::PositivePart => OpNode::WeightClamp(ClampKind::PositivePart),
         Opcode::MapReindex => OpNode::Map(MapKind::Reindex {
             keep: vec![0],
-            key: vec![(2, None), (5, Some(TypeCode::I64))],
+            key: vec![(2, TypeCode::I64), (5, TypeCode::I64)],
             role: ReindexRole::ScatterKey {
                 source: 4,
-                source_key: vec![(1, None), (6, Some(TypeCode::I64))],
+                source_key: vec![(1, TypeCode::I64), (6, TypeCode::I64)],
             },
             nulls: NullKeys::Drop,
         }),
@@ -100,7 +100,7 @@ fn every_op_node_variant_roundtrips() {
         OpNode::ScanDelta { source: 7, bound: crate::ReadBound::None },
         OpNode::Map(MapKind::Projection(vec![])),
         OpNode::Map(MapKind::Compute(ComputeMap { program: vec![9, 9], out_cols: vec![] })),
-        OpNode::Map(MapKind::HashRow { cols: vec![(3, None)] }),
+        OpNode::Map(MapKind::HashRow { cols: vec![(3, TypeCode::U128)] }),
         OpNode::Reduce {
             group_cols: vec![],
             agg: vec![agg(AggFunc::Count, 0)],
@@ -118,16 +118,19 @@ fn every_op_node_variant_roundtrips() {
     // the two coordinate systems exist for — and both NULL-key rules.
     for role in [
         ReindexRole::Auxiliary,
-        ReindexRole::ScatterKey { source: 0, source_key: vec![(0, None)] },
+        ReindexRole::ScatterKey {
+            source: 0,
+            source_key: vec![(0, TypeCode::U32)],
+        },
         ReindexRole::ScatterKey {
             source: u64::MAX,
-            source_key: vec![(9, Some(TypeCode::I64)), (0, None)],
+            source_key: vec![(9, TypeCode::I64), (0, TypeCode::U128)],
         },
     ] {
         for nulls in [NullKeys::Keep, NullKeys::Drop] {
             nodes.push(OpNode::Map(MapKind::Reindex {
                 keep: vec![0],
-                key: vec![(2, None), (5, Some(TypeCode::I64))],
+                key: vec![(2, TypeCode::I64), (5, TypeCode::I64)],
                 role: role.clone(),
                 nulls,
             }));
@@ -235,11 +238,11 @@ fn decode_rejects_an_unknown_opcode() {
     assert!(decode_op_node(9999, None, None).unwrap_err().contains("unknown opcode"));
 }
 
-/// Which promotion targets a key slot admits is the plan builders' rule, which
-/// hold the source schema: an out-of-domain target decodes. An undecodable byte
-/// is refused on both, not decoded to "no target".
+/// Which slot types a key slot admits is the plan builders' rule, which hold the
+/// source schema: an out-of-domain type decodes. An undecodable byte is refused
+/// on both.
 #[test]
-fn decode_rejects_an_out_of_domain_reindex_target() {
+fn decode_rejects_an_undecodable_slot_type() {
     let reindex = |tc: u8| {
         let mut w = Vec::new();
         w.push(ROLE_AUXILIARY);
@@ -266,10 +269,15 @@ fn decode_rejects_an_out_of_domain_reindex_target() {
         "a hash-row target's domain is the copy kernel's, not this decode's",
     );
 
-    // An undecodable code is a refusal on both, not a decode to "no target".
-    for (op, params) in [(Opcode::MapReindex, reindex(200)), (Opcode::MapHashRow, hash_row(200))] {
-        let err = decode_op_node(op.as_wire(), None, Some(&params)).unwrap_err();
-        assert!(err.contains("unknown promotion type code"), "{op:?}: {err}");
+    // An undecodable code, `0` included, is a refusal on both.
+    for code in [0, 200] {
+        for (op, params) in [
+            (Opcode::MapReindex, reindex(code)),
+            (Opcode::MapHashRow, hash_row(code)),
+        ] {
+            let err = decode_op_node(op.as_wire(), None, Some(&params)).unwrap_err();
+            assert!(err.contains("unknown slot type code"), "{op:?}: {err}");
+        }
     }
 }
 
@@ -293,7 +301,7 @@ fn a_map_reindex_whose_role_rule_or_key_is_unusable_is_rejected() {
         w.extend(n_keys.to_le_bytes());
         for _ in 0..n_keys {
             w.extend(3u32.to_le_bytes());
-            w.push(0);
+            w.push(TypeCode::I64.as_wire());
         }
         w.extend(0u16.to_le_bytes()); // no kept columns
         w
@@ -316,7 +324,7 @@ fn a_map_reindex_whose_role_rule_or_key_is_unusable_is_rejected() {
     empty_route.extend(0u16.to_le_bytes()); // no source columns
     empty_route.extend(1u16.to_le_bytes()); // one key column
     empty_route.extend(3u32.to_le_bytes());
-    empty_route.push(0);
+    empty_route.push(TypeCode::I64.as_wire());
     empty_route.extend(0u16.to_le_bytes()); // no kept columns
     assert!(decode(empty_route)
         .unwrap_err()

@@ -286,7 +286,7 @@ fn a_share_is_what_the_round_routes_that_worker() {
         .map(|i| (i * 7 + 1, [1, 0, -2][i as usize % 3], i as i64 % 5))
         .collect();
     let batch = make_batch_raw(&schema, &rows);
-    let join = [(1u32, None)];
+    let join = [(1u32, TypeCode::I64)];
     for (label, plan) in [
         ("group [0]", ScatterPlan::group(&schema, &[0])),
         ("group [1]", ScatterPlan::group(&schema, &[1])),
@@ -430,7 +430,7 @@ fn compound_join_key_scatter_copartitions() {
         (6, -1, 1),
     ];
     let cb = make_join_key_batch(&schema, rows);
-    let key: Vec<gnitz_wire::ReindexSlot> = cols.iter().map(|&c| (c, None)).collect();
+    let key = [(cols[0], TypeCode::I64), (cols[1], TypeCode::U128)];
     let packer = ReindexPacker::new(&schema, &key).unwrap();
 
     let out = scatter(&cb, &ScatterPlan::join(cb.schema(), &key).unwrap(), num_workers);
@@ -462,7 +462,7 @@ fn promoted_single_join_key_scatter_copartitions() {
     }
     let mut b = b.finish();
     b.certify_layout(Layout::Consolidated);
-    let key = [(1u32, Some(TypeCode::I64))];
+    let key = [(1u32, TypeCode::I64)];
     let packer = ReindexPacker::new(&schema, &key).unwrap();
     let out = scatter(&b, &ScatterPlan::join(b.schema(), &key).unwrap(), num_workers);
     check_copartition(&out, &packer, num_workers, rows.len(), Some((1, 4)), "payload key");
@@ -487,7 +487,7 @@ fn promoted_single_join_key_scatter_copartitions() {
     }
     let mut pb = pb.finish();
     pb.certify_layout(Layout::Consolidated);
-    let pk_key = [(0u32, Some(TypeCode::I64))];
+    let pk_key = [(0u32, TypeCode::I64)];
     let pk_packer = ReindexPacker::new(&pk_schema, &pk_key).unwrap();
     let pk_out = scatter(&pb, &ScatterPlan::join(pb.schema(), &pk_key).unwrap(), num_workers);
     check_copartition(&pk_out, &pk_packer, num_workers, pk_rows.len(), None, "promoted PK key");
@@ -569,7 +569,7 @@ fn scatter_route_pk_bench() {
 #[ignore]
 fn scatter_route_image_join_bench() {
     route_kind_bench("image_join", &make_schema_u64_i64(), |s| {
-        ScatterPlan::join(s, &[(1, None)])
+        ScatterPlan::join(s, &[(1, TypeCode::I64)])
     });
 }
 
@@ -583,7 +583,7 @@ fn scatter_route_image_group_bench() {
 #[ignore]
 fn scatter_route_packed_bench() {
     route_kind_bench("packed", &make_schema_u64_2xi64(), |s| {
-        ScatterPlan::join(s, &[(1, None), (2, None)])
+        ScatterPlan::join(s, &[(1, TypeCode::I64), (2, TypeCode::I64)])
     });
 }
 

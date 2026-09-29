@@ -6597,6 +6597,83 @@ fn op_reduce_bench() {
     }
 }
 
+/// Times `op_reduce` over a 1M-row delta against a populated trace, for SUM and
+/// MIN across packed group-key shapes. `#[ignore]`; run release:
+///   cargo test -p gnitz-store --release op_reduce_group_sweep_bench -- --ignored --nocapture --test-threads=1
+/// `REDUCE_SWEEP=<label>` runs one alone, for `perf stat`.
+#[test]
+#[ignore]
+fn op_reduce_group_sweep_bench() {
+    const N: u64 = 1 << 20;
+    let only = std::env::var("REDUCE_SWEEP").ok();
+    let mix = |i: u64| i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let shapes: [(&str, &[(TypeCode, bool)]); 6] = [
+        ("i32_notnull", &[(TypeCode::I32, false)]),
+        ("i32_nullable", &[(TypeCode::I32, true)]),
+        ("i64_nullable", &[(TypeCode::I64, true)]),
+        ("2xi32_notnull", &[(TypeCode::I32, false); 2]),
+        ("2xi64_nullable", &[(TypeCode::I64, true); 2]),
+        ("3xi64_nullable", &[(TypeCode::I64, true); 3]),
+    ];
+    for (shape, group) in shapes {
+        let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
+        cols.extend(group.iter().map(|&(tc, nullable)| SchemaColumn::new(tc, nullable)));
+        cols.push(SchemaColumn::new(TypeCode::I64, false));
+        let schema = SchemaDescriptor::new(&cols, &[0]);
+        let group_cols: Vec<u32> = (1..=group.len() as u32).collect();
+        let val = group.len() as u32 + 1;
+        let rows = |salt: u64| {
+            let mut bb = BatchBuilder::new(schema);
+            for i in 0..N {
+                bb.begin_row(mix(i + salt * N) as u128, 1);
+                for (c, &(tc, nullable)) in group.iter().enumerate() {
+                    let g = (i >> (4 * c)) % 256;
+                    match nullable && i % 16 == c as u64 {
+                        true => bb.put_null(),
+                        false if tc == TypeCode::I32 => bb.put_int((g as i32 - 128) as u32 as u128),
+                        false => bb.put_int((g as i64 - 128) as u64 as u128),
+                    }
+                }
+                bb.put_int(mix(i ^ salt) as i64 as u128);
+                bb.end_row();
+            }
+            bb.finish()
+        };
+        let (d1, d2) = (rows(1), rows(2));
+        for agg_op in [AggFunc::Sum, AggFunc::Min] {
+            let label = format!("{shape}_{agg_op:?}").to_lowercase();
+            if only.as_deref().is_some_and(|o| o != label) {
+                continue;
+            }
+            let aggs = [AggDescriptor { col_idx: val, agg_op }, AggDescriptor::COUNT_STAR];
+            let plan = ReducePlan::from_wire(&schema, &group_cols, &aggs, false).unwrap();
+            let out_schema = out_schema_for(&schema, &group_cols, &aggs);
+            let tmp = tempfile::tempdir().unwrap();
+            let mut trace = scratch_table(tmp.path().to_str().unwrap(), out_schema);
+            {
+                let mut avi1 = plan
+                    .avi
+                    .is_some()
+                    .then(|| Avi::new(&schema, &group_cols, &aggs, &[&d1]));
+                let mut h1 = avi1.as_mut().map(|a| a.cursor());
+                let out1 = super::op_reduce::op_reduce(&d1, &mut trace.open_cursor(), h1.as_mut(), &plan);
+                trace.ingest_owned_batch(out1).unwrap();
+            }
+            let mut avi = plan
+                .avi
+                .is_some()
+                .then(|| Avi::new(&schema, &group_cols, &aggs, &[&d1, &d2]));
+            let mut history = avi.as_mut().map(|a| a.cursor());
+            let mut populated = trace.open_cursor();
+            let t = std::time::Instant::now();
+            let out = super::op_reduce::op_reduce(&d2, &mut populated, history.as_mut(), &plan);
+            let warm = t.elapsed();
+            std::hint::black_box(&out);
+            println!("op_reduce_group_sweep {label}: populated trace {warm:?}");
+        }
+    }
+}
+
 /// `op_reduce` over a three-run trace_out whose two older runs lie wholly below the
 /// delta's first output key: the delta touches every group of the newest run and
 /// adds a new group between each pair. `#[ignore]`; run release:

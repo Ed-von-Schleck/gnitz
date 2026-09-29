@@ -213,7 +213,7 @@ fn join_key(key: &[gnitz_wire::ReindexSlot], relay: JoinRelay) -> Result<Option<
 // Circuit walks
 // ---------------------------------------------------------------------------
 
-/// One reindex key: a `(source column, carried promotion target)` slot list, in
+/// One reindex key: a `(source column, slot type)` slot list, in
 /// the trace-side `ReindexPacker`'s own order.
 type ReindexKey = Vec<gnitz_wire::ReindexSlot>;
 

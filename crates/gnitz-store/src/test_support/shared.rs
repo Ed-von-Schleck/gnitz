@@ -20,6 +20,13 @@ pub fn pk_payload_schema(tcs: &[TypeCode]) -> SchemaDescriptor {
     SchemaDescriptor::new(&cols, &pk)
 }
 
+/// `cols` of `schema` as join-key slots, each at the column's own slot type.
+pub fn self_typed_slots(schema: &SchemaDescriptor, cols: &[u32]) -> Vec<gnitz_wire::ReindexSlot> {
+    cols.iter()
+        .map(|&c| (c, schema.columns[c as usize].type_code.reindex_output_type()))
+        .collect()
+}
+
 /// The canonical narrow test schema: U64 pk + a single I64 payload column.
 pub fn make_schema_u64_i64() -> SchemaDescriptor {
     pk_payload_schema(&[TypeCode::U64])

@@ -1,6 +1,6 @@
 use super::*;
 use crate::query::compiler::fixtures::*;
-use crate::test_support::{make_schema_u64_i64, pk_payload_schema};
+use crate::test_support::{make_schema_u64_i64, pk_payload_schema, self_typed_slots};
 use gnitz_store::ops::op_exchange_route;
 use gnitz_store::schema::Placement;
 use gnitz_store::storage::BatchBuilder;
@@ -149,9 +149,9 @@ fn a_replicated_delta_feeding_more_than_its_join_scatters_every_source() {
     let scatters = |also_union: bool| {
         let mut nodes = vec![
             (0, scan_delta(7)),
-            (1, scatter_reindex(7, &[1])),
+            (1, scatter_reindex(7, self_typed_slots(&make_schema_u64_i64(), &[1]))),
             (2, scan_delta(8)),
-            (3, scatter_reindex(8, &[1])),
+            (3, scatter_reindex(8, self_typed_slots(&make_schema_u64_i64(), &[1]))),
             (
                 4,
                 OpNode::Join {
@@ -193,11 +193,11 @@ fn an_owner_trimmed_source_is_refused_the_replicated_partner_skip() {
     let loaded = loaded_for_test(
         [
             (0, scan_delta(7)),
-            (1, scatter_reindex(7, &[1])),
+            (1, scatter_reindex(7, self_typed_slots(&make_schema_u64_i64(), &[1]))),
             (2, OpNode::WorkerFilter),
             (3, OpNode::IntegrateTrace),
             (4, scan_delta(9)),
-            (5, scatter_reindex(9, &[1])),
+            (5, scatter_reindex(9, self_typed_slots(&make_schema_u64_i64(), &[1]))),
             (
                 6,
                 OpNode::Join {
@@ -223,7 +223,11 @@ fn an_owner_trimmed_source_is_refused_the_replicated_partner_skip() {
     ]);
     let meta = derive(&loaded, &ext).unwrap();
     assert!(
-        routes_by(meta.source_route(7), &make_schema_u64_i64(), &[(1, None)]),
+        routes_by(
+            meta.source_route(7),
+            &make_schema_u64_i64(),
+            &self_typed_slots(&make_schema_u64_i64(), &[1])
+        ),
         "the trimmed source relays by the whole key it states"
     );
     assert!(
@@ -241,9 +245,9 @@ fn a_source_reached_by_two_scans_routes_by_one_key_or_refuses() {
         let loaded = loaded_for_test(
             [
                 (0, scan_delta(10)),
-                (1, scatter_reindex(10, key_a)),
+                (1, scatter_reindex(10, self_typed_slots(&wide_schema(), key_a))),
                 (2, scan_delta(10)),
-                (3, scatter_reindex(10, key_b)),
+                (3, scatter_reindex(10, self_typed_slots(&wide_schema(), key_b))),
                 (
                     4,
                     OpNode::Join {
@@ -265,7 +269,11 @@ fn a_source_reached_by_two_scans_routes_by_one_key_or_refuses() {
     };
 
     let agreed = two_scans(&[1], &[1]).expect("one key reached twice routes by that key");
-    assert!(routes_by(agreed.source_route(10), &wide_schema(), &[(1, None)]));
+    assert!(routes_by(
+        agreed.source_route(10),
+        &wide_schema(),
+        &self_typed_slots(&wide_schema(), &[1])
+    ));
     assert!(
         two_scans(&[1], &[2]).is_err(),
         "two distinct keys must refuse the compile, not pick one or concatenate them"
@@ -280,7 +288,7 @@ fn a_source_outside_every_join_states_no_route() {
     let loaded = loaded_for_test(
         [
             (0, scan_delta(10)),
-            (1, scatter_reindex(10, &[2])),
+            (1, scatter_reindex(10, self_typed_slots(&wide_schema(), &[2]))),
             (2, OpNode::IntegrateTrace),
             (
                 3,
@@ -304,7 +312,11 @@ fn a_source_outside_every_join_states_no_route() {
         ],
     );
     let meta = derive(&loaded, &sources([(10, wide_schema()), (20, wide_schema())])).unwrap();
-    assert!(routes_by(meta.source_route(10), &wide_schema(), &[(2, None)]));
+    assert!(routes_by(
+        meta.source_route(10),
+        &wide_schema(),
+        &self_typed_slots(&wide_schema(), &[2])
+    ));
     assert!(
         meta.source_route(20).is_none(),
         "a source outside every join has no route"
@@ -318,7 +330,7 @@ fn a_source_outside_every_join_states_no_route() {
 fn a_join_operand_whose_source_states_no_route_is_rejected() {
     let aux = OpNode::Map(MapKind::Reindex {
         keep: vec![0],
-        key: vec![(1, None)],
+        key: self_typed_slots(&wide_schema(), &[1]),
         role: gnitz_wire::ReindexRole::Auxiliary,
         nulls: gnitz_wire::NullKeys::Keep,
     });
@@ -357,8 +369,11 @@ fn a_join_operand_whose_source_states_no_route_is_rejected() {
 fn the_route_is_the_stated_one_not_the_reindex_nodes_own_key() {
     let reindex = OpNode::Map(MapKind::Reindex {
         keep: vec![0],
-        key: vec![(2, None)],
-        role: gnitz_wire::ReindexRole::ScatterKey { source: 7, source_key: vec![(5, None)] },
+        key: vec![(2, TypeCode::I64)],
+        role: gnitz_wire::ReindexRole::ScatterKey {
+            source: 7,
+            source_key: self_typed_slots(&wide_schema(), &[5]),
+        },
         nulls: gnitz_wire::NullKeys::Keep,
     });
     let loaded = loaded_for_test(
@@ -386,7 +401,11 @@ fn the_route_is_the_stated_one_not_the_reindex_nodes_own_key() {
         ],
     );
     let meta = derive(&loaded, &sources([(7, wide_schema())])).unwrap();
-    assert!(routes_by(meta.source_route(7), &wide_schema(), &[(5, None)]));
+    assert!(routes_by(
+        meta.source_route(7),
+        &wide_schema(),
+        &self_typed_slots(&wide_schema(), &[5])
+    ));
 }
 
 /// Workers scatter by the stated key mid-round, where a refusal is fatal. A
@@ -397,7 +416,7 @@ fn a_stated_route_the_relation_cannot_route_by_is_rejected() {
     let loaded = loaded_for_test(
         [
             (0, scan_delta(7)),
-            (1, scatter_reindex(7, &[9])),
+            (1, scatter_reindex(7, vec![(9, TypeCode::I64)])),
             (2, OpNode::IntegrateTrace),
             (
                 3,
@@ -430,9 +449,9 @@ fn a_stated_route_the_relation_cannot_route_by_is_rejected() {
 fn a_band_join_whose_n_eq_overruns_the_reindex_key_is_rejected() {
     let nodes: HashMap<NodeId, OpNode> = HashMap::from([
         (0, scan_delta(7)),
-        (1, scatter_reindex(7, &[1, 2])),
+        (1, scatter_reindex(7, self_typed_slots(&wide_schema(), &[1, 2]))),
         (2, scan_delta(9)),
-        (3, scatter_reindex(9, &[1, 2])),
+        (3, scatter_reindex(9, self_typed_slots(&wide_schema(), &[1, 2]))),
         (
             4,
             OpNode::Join {
@@ -478,7 +497,8 @@ fn join_meta_in(kind: JoinKind, key_cols: &[u32], distinct: [bool; 2], ext: Rela
             cur = d;
         }
         let rekey = nodes.len();
-        nodes.push((rekey, scatter_reindex(source, key_cols)));
+        let schema = ext.relation(source).expect("a registered source").schema();
+        nodes.push((rekey, scatter_reindex(source, self_typed_slots(&schema, key_cols))));
         edges.push((cur, rekey, SLOT_IN));
         operands.push(rekey);
     }
@@ -551,12 +571,20 @@ fn the_keyed_source_of_a_keyless_join_broadcasts() {
 fn a_band_join_routes_by_the_equality_prefix_and_an_equi_join_by_the_whole_key() {
     let band = join_meta(pure_range(1), &[3, 4]);
     assert!(
-        routes_by(band.source_route(7), &wide_schema(), &[(3, None)]),
+        routes_by(
+            band.source_route(7),
+            &wide_schema(),
+            &self_typed_slots(&wide_schema(), &[3])
+        ),
         "the trailing range slot must not route"
     );
 
     let equi = join_meta(JoinKind::Equi, &[3, 4]);
-    assert!(routes_by(equi.source_route(7), &wide_schema(), &[(3, None), (4, None)]));
+    assert!(routes_by(
+        equi.source_route(7),
+        &wide_schema(),
+        &self_typed_slots(&wide_schema(), &[3, 4])
+    ));
 }
 
 /// A band join's relay scatters by the truncated `[eq…]` key, so its skip turns
@@ -614,11 +642,11 @@ fn an_owner_trimmed_source_routes_by_its_pk_under_a_broadcast_join() {
         let loaded = loaded_for_test(
             [
                 (0, scan_delta(7)),
-                (1, scatter_reindex(7, &[0])),
+                (1, scatter_reindex(7, self_typed_slots(&schema, &[0]))),
                 (2, OpNode::WorkerFilter),
                 (3, OpNode::IntegrateTrace),
                 (4, scan_delta(9)),
-                (5, scatter_reindex(9, &[1])),
+                (5, scatter_reindex(9, self_typed_slots(&make_schema_u64_i64(), &[1]))),
                 (
                     6,
                     OpNode::Join {
@@ -648,7 +676,7 @@ fn an_owner_trimmed_source_routes_by_its_pk_under_a_broadcast_join() {
     let replicated = meta(schema);
     assert!(
         matches!(replicated.source_route(7), Some(Relay::Share(_)))
-            && routes_by(replicated.source_route(7), &schema, &[(0, None)]),
+            && routes_by(replicated.source_route(7), &schema, &self_typed_slots(&schema, &[0])),
         "a replicated copy is kept by key where it stands"
     );
 }
@@ -683,9 +711,9 @@ fn pk_source_names_only_the_relation_whose_pk_region_survives_to_the_sink() {
         pk_source_of(
             HashMap::from([
                 (0, scan_delta(7)),
-                (1, scatter_reindex(7, &[1])),
+                (1, scatter_reindex(7, self_typed_slots(&wide_schema(), &[1]))),
                 (2, scan_delta(9)),
-                (3, scatter_reindex(9, &[1])),
+                (3, scatter_reindex(9, self_typed_slots(&wide_schema(), &[1]))),
                 (
                     4,
                     OpNode::Join {
@@ -710,7 +738,7 @@ fn pk_source_names_only_the_relation_whose_pk_region_survives_to_the_sink() {
         pk_source_of(
             HashMap::from([
                 (0, scan_delta(7)),
-                (1, scatter_reindex(7, &[1])),
+                (1, scatter_reindex(7, self_typed_slots(&wide_schema(), &[1]))),
                 (2, OpNode::IntegrateSink),
             ]),
             vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
@@ -731,7 +759,7 @@ fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key()
     let loaded = loaded_for_test(
         [
             (0, scan_delta(7)),
-            (1, scatter_reindex(7, &[1])),
+            (1, scatter_reindex(7, self_typed_slots(&wide_schema(), &[1]))),
             (2, OpNode::ExchangeShard { shard_cols: vec![1] }),
             (
                 3,
@@ -844,7 +872,7 @@ fn the_shard_walk_crosses_row_local_nodes_and_nothing_else() {
         scan_through_row_local(&loaded_for_test(nodes, edges), shard)
     };
     let filter = || OpNode::Filter(dummy_expr_blob());
-    let rekey = || scatter_reindex(7, &[2]);
+    let rekey = || scatter_reindex(7, self_typed_slots(&wide_schema(), &[2]));
     let copy = || OpNode::Map(MapKind::Projection(vec![1]));
     let compute = || {
         OpNode::Map(MapKind::Compute(gnitz_wire::ComputeMap {
@@ -959,7 +987,7 @@ fn a_scatter_key_over_an_unscanned_source_is_rejected() {
     let loaded = loaded_for_test(
         [
             (0, scan_delta(7)),
-            (1, scatter_reindex(9, &[1])),
+            (1, scatter_reindex(9, self_typed_slots(&wide_schema(), &[1]))),
             (2, OpNode::IntegrateSink),
         ],
         vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],

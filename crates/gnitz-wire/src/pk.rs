@@ -103,7 +103,7 @@ pub fn opk_bias(tc: TypeCode, width: usize) -> u128 {
 /// (width `src_w`) is `image`. `target_tc` must hold every `src_tc` value.
 #[inline(always)]
 pub fn store_opk_image(image: u128, src_tc: TypeCode, src_w: usize, target_tc: TypeCode, dst: &mut [u8]) {
-    // Skipping the re-bias at identity measured −19% instructions on `reindex_pack_bench`.
+    // Skipping the re-bias at identity saves the two bias adds on the common unpromoted slot.
     let v = if src_tc == target_tc {
         image
     } else {

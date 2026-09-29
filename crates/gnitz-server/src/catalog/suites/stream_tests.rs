@@ -76,7 +76,7 @@ fn a_bounded_linear_view_over_a_stream_is_rejected_at_compile() {
         col_def("s_id", TypeCode::U64),
         col_def("t_id", TypeCode::U64),
     ];
-    let circuit = crate::test_support::two_term_join_circuit(sid, tid);
+    let circuit = crate::test_support::two_term_join_circuit(sid, tid, TypeCode::I64);
     let join = try_register_view(&mut engine, circuit, "bounded_join", &join_cols, 4 << 20, 0).unwrap();
     crate::query::preflight_compile(&engine.registry, join).expect("a bounded join over a stream compiles");
 

@@ -673,7 +673,7 @@ fn set_op_common_type(l: ColType, r: ColType) -> Option<ColType> {
     if !l.decimal_domains_match(r) {
         return None;
     }
-    let t = l.tc.join_key_common_type(r.tc)?;
+    let t = l.tc.join_key_common_type(r.tc).ok()?;
     let widens = |src: TypeCode| src.is_widening_promotion(t);
     (widens(l.tc) && widens(r.tc)).then_some(ColType::of(t))
 }
