@@ -115,7 +115,10 @@ fn a_closed_connection_drops_its_entry_and_closes_with_its_last_holder() {
         poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&fd)),
         "EOF must end the recv side and drop the reactor's entry"
     );
-    assert_eq!(conn.life(), Life::RecvEnded);
+    assert!(
+        !conn.is_gone(),
+        "the end of the recv side does not finish the connection"
+    );
     assert!(matches!(try_poll_once(conn.recv()), Some(None)), "recv reports the end");
 
     partner.set_nonblocking(true).expect("nonblocking");

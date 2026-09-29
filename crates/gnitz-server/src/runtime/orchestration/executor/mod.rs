@@ -543,25 +543,16 @@ async fn watchdog(shared: Rc<Shared>) {
 /// A failure in one trigger fails only that trigger; SAL emission is further
 /// guarded by `guard_panic` inside `run_tick`.
 async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
-    let mut triggers: Vec<TickTrigger> = Vec::new();
     // The batch's `Drain` repliers, held across the tick they are waiting on.
     let mut dones: Vec<oneshot::Sender<Result<(), WireFault>>> = Vec::new();
     // Reused across every tick; `drain_live_tick_rows_into` clears it before
     // refilling so capacity is retained.
     let mut tids_scratch: Vec<u64> = Vec::new();
     loop {
-        triggers.push(rx.recv().await);
-
-        // Drain anything already queued.
-        while let Some(more) = rx.try_recv() {
-            triggers.push(more);
-        }
-
-        // The batch's `Drain`s are answered after the tick below.
-        for trigger in triggers.drain(..) {
-            match trigger {
-                TickTrigger::Drain { done } => dones.push(done),
-                TickTrigger::Auto => {}
+        let first = rx.recv().await;
+        for t in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv())) {
+            if let TickTrigger::Drain { done } = t {
+                dones.push(done);
             }
         }
 

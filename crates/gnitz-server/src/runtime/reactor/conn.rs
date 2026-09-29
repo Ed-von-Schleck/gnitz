@@ -5,7 +5,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use gnitz_store::storage::PooledBuf;
 
-use super::io::{ClientConn, Life, RecvEnd, RecvFilter};
+use super::io::{ClientConn, RecvEnd, RecvFilter};
 use super::*;
 
 /// A connection with a recv armed on it — the reactor's whole per-connection
@@ -146,10 +146,13 @@ impl Reactor {
     pub(super) fn handle_recv_cqe(&self, fd: i32, res: i32) {
         let mut conns = self.inner.conns.borrow_mut();
         let Some(armed) = conns.get_mut(&fd) else { return };
+        if armed.conn.is_gone() {
+            // Retired while this recv was in flight: its bytes are discarded.
+            conns.remove(&fd);
+            return;
+        }
         let mut q = armed.conn.q.borrow_mut();
-        let next = if armed.conn.life() != Life::Open {
-            Err(RecvEnd::Closed)
-        } else if res < 0 {
+        let next = if res < 0 {
             Err(RecvEnd::Socket)
         } else if res == 0 {
             Err(RecvEnd::PeerClosed)
@@ -162,7 +165,7 @@ impl Reactor {
             Err(end) => {
                 let armed = conns.remove(&fd).expect("entry present");
                 drop(conns);
-                if end.is_clean() {
+                if matches!(end, RecvEnd::PeerClosed) {
                     gnitz_debug!("reactor: fd={fd} recv side ended: {end}");
                     armed.conn.end_recv();
                 } else {

@@ -1,10 +1,9 @@
 //! Single-threaded io_uring reactor: the master process's one event loop. A task's
 //! waker is its key (see `waker_wake`); one-CQE awaiters hold a [`oneshot`],
-//! next-of-many awaiters park in a [`wake_queue::WakeQueue`], and every deadline
-//! sits in one deadline map.
+//! next-of-many awaiters park in a [`wake_queue::WakeQueue`], an all-workers round
+//! parks on its ACK route, and every deadline sits in one deadline map.
 
 use std::cell::{Cell, RefCell};
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::os::fd::{AsRawFd, BorrowedFd};
@@ -115,14 +114,6 @@ const fn udata_kind(u: u64) -> u64 {
 #[inline]
 const fn udata_id(u: u64) -> u64 {
     u & ID_MASK
-}
-
-/// Leave `waker` in `slot` for the next wake, reusing the waker already there.
-fn park_waker(slot: &mut Option<Waker>, waker: &Waker) {
-    match slot {
-        Some(w) => w.clone_from(waker),
-        None => *slot = Some(waker.clone()),
-    }
 }
 
 // ---------------------------------------------------------------------------

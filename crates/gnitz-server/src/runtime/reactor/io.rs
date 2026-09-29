@@ -5,7 +5,6 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
-use std::task::Poll;
 
 use gnitz_wire::{Deframer, FrameLenError};
 
@@ -128,8 +127,6 @@ impl RecvBuf {
 pub(crate) enum RecvEnd {
     /// EOF or a `close_notify`: the peer is done.
     PeerClosed,
-    /// This end closed the connection.
-    Closed,
     /// The recv itself failed (`-ECONNRESET`, `-EBADF`, …).
     Socket,
     /// A declared frame payload above `MAX_FRAME_PAYLOAD`.
@@ -140,18 +137,10 @@ pub(crate) enum RecvEnd {
     Protocol,
 }
 
-impl RecvEnd {
-    /// The recv side ended in order rather than failing.
-    pub(crate) fn is_clean(self) -> bool {
-        matches!(self, RecvEnd::PeerClosed | RecvEnd::Closed)
-    }
-}
-
 impl std::fmt::Display for RecvEnd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RecvEnd::PeerClosed => f.write_str("the peer closed"),
-            RecvEnd::Closed => f.write_str("closed locally"),
             RecvEnd::Socket => f.write_str("the recv failed"),
             RecvEnd::Oversize => f.write_str("a frame over the payload ceiling"),
             RecvEnd::CapBreach { want } => write!(f, "a {want}-byte frame would pass the inbound cap"),
@@ -206,17 +195,6 @@ impl RecvQueue {
     }
 }
 
-/// Where a connection is in its life.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Life {
-    Open,
-    /// The client closed its sending side: the frames it sent are still handed
-    /// out, and replies still go out.
-    RecvEnded,
-    /// Finished: no frame is handed out.
-    Gone,
-}
-
 /// One client connection: its socket and the frames deframed off it. The socket
 /// closes with the last holder, and every SQE naming it is queued through one.
 pub(crate) struct ClientConn {
@@ -225,7 +203,7 @@ pub(crate) struct ClientConn {
     /// as the fd.
     _slot: Charge,
     pub(super) q: RefCell<RecvQueue>,
-    life: Cell<Life>,
+    gone: Cell<bool>,
     /// Wakes the task that sends on this socket outside requests, which then
     /// owns the shutdown.
     egress_owner: OnceCell<chan::Sender<()>>,
@@ -237,7 +215,7 @@ impl ClientConn {
             fd,
             _slot: slot,
             q: RefCell::new(RecvQueue::new(budget)),
-            life: Cell::new(Life::Open),
+            gone: Cell::new(false),
             egress_owner: OnceCell::new(),
         }
     }
@@ -252,32 +230,26 @@ impl ClientConn {
         let _ = gnitz_foundation::posix_io::retry_eintr(|| unsafe { libc::shutdown(self.fd(), libc::SHUT_RDWR) });
     }
 
-    pub(crate) fn life(&self) -> Life {
-        self.life.get()
-    }
-
     pub(crate) fn is_gone(&self) -> bool {
-        self.life.get() == Life::Gone
+        self.gone.get()
     }
 
-    /// The client closed its sending side. Frames already queued are still delivered.
+    /// The client closed its sending side. Frames already queued are still
+    /// delivered, and replies still go out.
     pub(super) fn end_recv(&self) {
-        if self.life.get() == Life::Open {
-            self.life.set(Life::RecvEnded);
-            self.q.borrow_mut().frames.wake();
-        }
+        self.q.borrow_mut().frames.close();
     }
 
     /// Finish the connection and discard the frames it queued. The egress owner,
     /// if any, shuts the socket down once it has shipped what it holds.
     pub(crate) fn retire(&self) {
-        if self.life.replace(Life::Gone) == Life::Gone {
+        if self.gone.replace(true) {
             return;
         }
         {
             let mut q = self.q.borrow_mut();
             q.frames.clear();
-            q.frames.wake();
+            q.frames.close();
         }
         match self.egress_owner.get() {
             Some(owner) => owner.send(()),
@@ -293,7 +265,7 @@ impl ClientConn {
 
     /// Hand egress to the task behind `owner`.
     pub(crate) fn set_egress_owner(&self, owner: chan::Sender<()>) {
-        debug_assert_eq!(self.life.get(), Life::Open, "egress handed over after the end");
+        debug_assert!(!self.is_gone(), "egress handed over after the end");
         assert!(self.egress_owner.set(owner).is_ok(), "egress has one owner");
     }
 
@@ -305,15 +277,7 @@ impl ClientConn {
 
     /// Next frame, or `None` once the recv side has ended and is drained.
     pub(crate) async fn recv(&self) -> Option<RecvBuf> {
-        std::future::poll_fn(|cx| {
-            let mut q = self.q.borrow_mut();
-            if self.life.get() != Life::Open {
-                Poll::Ready(q.frames.pop())
-            } else {
-                q.frames.poll(cx).map(Some)
-            }
-        })
-        .await
+        std::future::poll_fn(|cx| self.q.borrow_mut().frames.poll(cx)).await
     }
 
     /// The next already-deframed frame without parking. `None` means nothing is

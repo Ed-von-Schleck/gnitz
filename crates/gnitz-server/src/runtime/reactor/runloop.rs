@@ -87,16 +87,12 @@ impl Reactor {
     /// Wake every deadline that has passed.
     fn fire_deadlines(&self) {
         let now = Instant::now();
-        loop {
-            // One entry per borrow, so no borrow spans a wake.
-            let waker = {
-                let mut deadlines = self.inner.deadlines.borrow_mut();
-                match deadlines.first_entry() {
-                    Some(e) if e.key().0 <= now => e.remove(),
-                    _ => break,
-                }
-            };
-            waker.wake();
+        let mut d = self.inner.deadlines.borrow_mut();
+        while let Some(e) = d.first_entry() {
+            if e.key().0 > now {
+                break;
+            }
+            e.remove().wake();
         }
     }
 
@@ -255,7 +251,8 @@ const WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, waker_wake
 
 /// The waker for task `key`: the key itself *is* the waker's data pointer, so
 /// clone is a bitwise copy and drop is a no-op. Waking pushes the key onto the
-/// thread-local run queue.
+/// thread-local run queue. Waking only queues the key and never polls, so a wake
+/// may be issued under any reactor borrow.
 pub(super) fn make_waker(key: usize) -> Waker {
     let raw = RawWaker::new(key as *const (), &WAKER_VTABLE);
     unsafe { Waker::from_raw(raw) }

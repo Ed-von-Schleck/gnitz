@@ -43,12 +43,9 @@ pub mod oneshot {
         /// Send the result. A cancelled receiver is not an error: the value is
         /// parked in state nothing will read, and dropped with the `Rc`.
         pub fn send(self, v: T) {
-            let waker = {
-                let mut s = self.inner.borrow_mut();
-                s.value = Some(v);
-                s.waker.take()
-            };
-            if let Some(w) = waker {
+            let mut s = self.inner.borrow_mut();
+            s.value = Some(v);
+            if let Some(w) = s.waker.take() {
                 w.wake();
             }
         }
@@ -61,7 +58,7 @@ pub mod oneshot {
             if let Some(v) = s.value.take() {
                 return Poll::Ready(v);
             }
-            crate::runtime::reactor::park_waker(&mut s.waker, cx.waker());
+            s.waker = Some(cx.waker().clone());
             Poll::Pending
         }
     }
@@ -98,7 +95,13 @@ pub mod chan {
 
     impl<T> Receiver<T> {
         pub async fn recv(&mut self) -> T {
-            std::future::poll_fn(|cx| self.inner.borrow_mut().poll(cx)).await
+            std::future::poll_fn(|cx| {
+                self.inner
+                    .borrow_mut()
+                    .poll(cx)
+                    .map(|v| v.expect("a chan never closes"))
+            })
+            .await
         }
 
         pub fn try_recv(&mut self) -> Option<T> {
@@ -171,20 +174,16 @@ impl AsyncRwLock {
     /// parked reader when no writer waits.
     fn wake_next(&self) {
         let mut s = self.0.borrow_mut();
-        let next = if s.write_ok() {
-            s.write_waiters.front().cloned()
-        } else {
-            None
-        };
-        if let Some(slot) = next {
-            drop(s);
-            if let Some(waker) = slot.borrow_mut().take() {
-                waker.wake();
+        if s.write_ok() {
+            if let Some(slot) = s.write_waiters.front() {
+                if let Some(w) = slot.borrow_mut().take() {
+                    w.wake();
+                }
+                return;
             }
-        } else if s.read_ok() {
-            let queued = std::mem::take(&mut s.read_waiters);
-            drop(s);
-            for w in queued {
+        }
+        if s.read_ok() {
+            for w in s.read_waiters.drain(..) {
                 w.wake();
             }
         }
@@ -255,7 +254,7 @@ impl Future for WriteFuture {
             return Poll::Ready(WriteGuard { lock: lock.clone() });
         }
         match waiter {
-            Some(w) => crate::runtime::reactor::park_waker(&mut w.borrow_mut(), cx.waker()),
+            Some(w) => *w.borrow_mut() = Some(cx.waker().clone()),
             None => {
                 let w = Rc::new(RefCell::new(Some(cx.waker().clone())));
                 s.write_waiters.push_back(Rc::clone(&w));

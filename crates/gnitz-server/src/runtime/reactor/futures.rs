@@ -28,7 +28,7 @@ pub(super) struct AckRoute {
     /// The fault of the lowest-numbered worker that failed.
     fault: Option<(usize, WireFault)>,
     /// The `acks` awaiter parked on this id.
-    pub(super) waker: Option<Waker>,
+    waker: Option<Waker>,
 }
 
 impl AckRoute {
@@ -71,19 +71,13 @@ impl ReactorShared {
             }
             return;
         }
-        let waker = {
-            let mut acks = self.acks.borrow_mut();
-            let Some(r) = acks.get_mut(&id) else {
-                return;
-            };
-            r.record(w, slot.control().fault(slot.bytes()));
-            if !r.answered.covers(self.w2m.num_workers()) {
-                return;
+        let mut acks = self.acks.borrow_mut();
+        let Some(r) = acks.get_mut(&id) else { return };
+        r.record(w, slot.control().fault(slot.bytes()));
+        if r.answered.covers(self.w2m.num_workers()) {
+            if let Some(waker) = r.waker.take() {
+                waker.wake();
             }
-            r.waker.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
         }
     }
 }
@@ -163,7 +157,7 @@ impl AckLease {
             let mut acks = self.inner.acks.borrow_mut();
             let r = acks.get_mut(&self.id).expect("a leased id is routed");
             if !r.answered.covers(nw) {
-                park_waker(&mut r.waker, cx.waker());
+                r.waker = Some(cx.waker().clone());
                 return Poll::Pending;
             }
             drop(acks);
@@ -274,7 +268,11 @@ impl TrainLease {
         std::future::poll_fn(|cx| {
             let mut trains = self.inner.trains.borrow_mut();
             let route = trains.get_mut(&self.id).expect("a leased id is routed");
-            route.queue(w).expect("the train was written to `w`").poll(cx)
+            route
+                .queue(w)
+                .expect("the train was written to `w`")
+                .poll(cx)
+                .map(|v| v.expect("a train queue never closes"))
         })
         .await
     }
@@ -309,12 +307,10 @@ impl Future for TimerFuture {
         if Instant::now() >= self.deadline {
             return Poll::Ready(());
         }
-        match self.inner.deadlines.borrow_mut().entry((self.deadline, self.id)) {
-            Entry::Occupied(mut e) => e.get_mut().clone_from(cx.waker()),
-            Entry::Vacant(e) => {
-                e.insert(cx.waker().clone());
-            }
-        }
+        self.inner
+            .deadlines
+            .borrow_mut()
+            .insert((self.deadline, self.id), cx.waker().clone());
         Poll::Pending
     }
 }
