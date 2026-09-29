@@ -206,3 +206,120 @@ fn byte_total_tracks_pushes_and_folds() {
         "fold re-derives from the merged run"
     );
 }
+
+/// A 42-byte string payload naming `pk` at update generation `generation`;
+/// zero-padded, so a later generation sorts after an earlier one.
+fn churn_value(pk: u64, generation: u64) -> Vec<u8> {
+    format!("{pk:08}-{generation:08}-{}", "v".repeat(24)).into_bytes()
+}
+
+/// A consolidated `(U64 pk, STRING)` run of `(pk, weight, bytes)` rows.
+fn string_run(schema: &SchemaDescriptor, rows: &[(u64, i64, Vec<u8>)]) -> Batch {
+    let rows: Vec<(u64, i64, &[u8])> = rows.iter().map(|(k, w, v)| (*k, *w, &v[..])).collect();
+    crate::test_support::make_batch_bytes(schema, &rows)
+}
+
+/// Updates retract rows whose spans a carried heap keeps; every fold still
+/// leaves each stored run at most a quarter dead, and the set reads back the
+/// latest value of every key.
+#[test]
+fn a_fold_under_churn_keeps_every_run_at_most_a_quarter_dead() {
+    use crate::storage::repr::merge::heap_is_wasteful;
+    let schema = crate::test_support::make_schema_pk_u64_payload_string();
+    const KEYS: u64 = 1000;
+    let mut set = RunSet::new(usize::MAX);
+    let mut latest = vec![0u64; KEYS as usize];
+    let initial: Vec<_> = (0..KEYS).map(|pk| (pk, 1, churn_value(pk, 0))).collect();
+    set.push(TrimmedRun::new(string_run(&schema, &initial)), &schema);
+
+    let mut saw_dead = false;
+    for generation in 1..=300u64 {
+        let mut rows = Vec::new();
+        for i in 0..5 {
+            let pk = (i * 200 + generation * 7) % KEYS;
+            rows.push((pk, -1, churn_value(pk, latest[pk as usize])));
+            rows.push((pk, 1, churn_value(pk, generation)));
+            latest[pk as usize] = generation;
+        }
+        rows.sort_by(|a, b| (a.0, &a.2).cmp(&(b.0, &b.2)));
+        set.push(TrimmedRun::new(string_run(&schema, &rows)), &schema);
+        for run in set.runs() {
+            saw_dead |= run.dead_heap > 0;
+            assert!(
+                !heap_is_wasteful(run.dead_heap, run.blob().len()),
+                "a stored run is {} of {} bytes dead",
+                run.dead_heap,
+                run.blob().len()
+            );
+        }
+    }
+    assert!(
+        saw_dead,
+        "the churn must drive a fold that carries a heap with dead bytes"
+    );
+
+    let folded = set.fold_to_single(&schema).expect("every key survives");
+    let got: Vec<(u128, i64, Vec<u8>)> = (0..folded.count)
+        .map(|row| {
+            let s = crate::test_support::read_german_string(&folded, 0, row);
+            (folded.get_pk(row), folded.get_weight(row), s)
+        })
+        .collect();
+    let want: Vec<_> = (0..KEYS)
+        .map(|pk| (pk as u128, 1, churn_value(pk, latest[pk as usize])))
+        .collect();
+    assert_eq!(got, want);
+}
+
+/// Fold a 200k-row dominant run with fourteen 10k-row runs of 40-byte strings;
+/// only the fold is measured. `append` runs hold fresh keys only; `churn` runs
+/// are half retractions of dominant rows and half fresh keys.
+#[test]
+#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+fn run_set_fold_strings_bench() {
+    use gnitz_foundation::perf::Counter;
+    use std::hint::black_box;
+    use std::time::Instant;
+    const DOMINANT: u64 = 200_000;
+    const RUNS: u64 = 14;
+    const PER_RUN: u64 = 10_000;
+    let schema = crate::test_support::make_schema_pk_u64_payload_string();
+    let value = |pk: u64| format!("{pk:010}-{}", "s".repeat(29)).into_bytes();
+    let dominant = string_run(
+        &schema,
+        &(0..DOMINANT).map(|i| (2 * i, 1, value(2 * i))).collect::<Vec<_>>(),
+    );
+    let append: Vec<Batch> = (0..RUNS)
+        .map(|k| {
+            let keys = k * PER_RUN..(k + 1) * PER_RUN;
+            string_run(
+                &schema,
+                &keys.map(|j| (2 * j + 1, 1, value(2 * j + 1))).collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let churn: Vec<Batch> = (0..RUNS)
+        .map(|k| {
+            let rows: Vec<_> = (k * PER_RUN / 2..(k + 1) * PER_RUN / 2)
+                .flat_map(|j| [(2 * j, -1, value(2 * j)), (2 * j + 1, 1, value(2 * j + 1))])
+                .collect();
+            string_run(&schema, &rows)
+        })
+        .collect();
+    let instructions = Counter::instructions().unwrap();
+    for (shape, small) in [("append", &append), ("churn", &churn)] {
+        for _ in 0..5 {
+            let mut set = RunSet::new(usize::MAX);
+            set.push(TrimmedRun::new(dominant.clone()), &schema);
+            for run in small {
+                set.push(TrimmedRun::new(run.clone()), &schema);
+            }
+            assert_eq!(set.len(), 1 + RUNS as usize, "the fold must not have run yet");
+            let t = Instant::now();
+            let ((), i) = instructions.measure(|| set.fold(&schema));
+            let elapsed = t.elapsed();
+            black_box(set.runs());
+            println!("run_set_fold_strings {shape}: {i} instructions, {elapsed:?}");
+        }
+    }
+}

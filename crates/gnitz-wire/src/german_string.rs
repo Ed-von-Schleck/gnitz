@@ -46,16 +46,21 @@ pub fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
     st
 }
 
-/// Shift a **long** cell's heap offset by `delta` — what a concatenating
-/// appender owes each cell once the source arena has been appended onto the
-/// destination's. A short cell carries no offset and is left alone.
+/// Shift every **long** cell's heap offset in `cells`, a run of whole 16-byte
+/// cells, by `delta` — what a concatenating appender owes each cell once the
+/// source arena has been appended onto the destination's at `delta`. A short
+/// cell carries no offset and is left alone.
 #[inline]
-pub fn shift_german_string_heap(cell: &mut [u8], delta: usize) {
-    let None = german_string_inline(cell) else {
+pub fn shift_german_string_heaps(cells: &mut [u8], delta: usize) {
+    if delta == 0 {
         return;
-    };
-    let off = read_u64_le(cell, 8) + delta as u64;
-    write_u64_le(cell, 8, off);
+    }
+    for cell in cells.as_chunks_mut::<16>().0 {
+        if german_string_inline(cell).is_none() {
+            let off = read_u64_le(cell, 8) + delta as u64;
+            write_u64_le(cell, 8, off);
+        }
+    }
 }
 
 /// `[heap_offset, heap_offset + length)` if it lies inside a heap of `blob_len`

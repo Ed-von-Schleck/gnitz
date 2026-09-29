@@ -24,7 +24,7 @@ impl ZSetBatch {
 #[cfg(test)]
 pub(crate) fn encode_wal_block(batch: &ZSetBatch) -> Vec<u8> {
     let mut out = Vec::new();
-    gnitz_wire::wal::append_block(&batch.wire_regions(), &mut out);
+    gnitz_wire::wal::append_block(&batch.wire_regions(), 0, &mut out);
     out
 }
 
@@ -45,7 +45,7 @@ fn fixed_strides(schema: &Schema) -> impl Iterator<Item = usize> + '_ {
 
 /// Decode a WAL block under `schema`, appending its rows to `sink`.
 pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &Schema) -> Result<(), ProtocolError> {
-    let (rows, fixed, heap) = gnitz_wire::wal::parse_block(data, fixed_strides(schema).sum())
+    let (rows, fixed, heap, _) = gnitz_wire::wal::parse_block(data, fixed_strides(schema).sum())
         .map_err(|e| ProtocolError::DecodeError(format!("WAL {e}")))?;
     let mut regions = Regions::new();
     let mut at = 0;
@@ -112,7 +112,7 @@ fn append_regions(sink: &mut ZSetBatch, regions: &[&[u8]], count: usize, schema:
                         "column {ci}: German string cell is not in canonical form"
                     )));
                 }
-                gnitz_wire::shift_german_string_heap(cell, blob_base);
+                gnitz_wire::shift_german_string_heaps(cell, blob_base);
             }
         }
     }

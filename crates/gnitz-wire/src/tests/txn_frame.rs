@@ -26,7 +26,7 @@ fn regions() -> Regions<'static> {
 /// The same block framed — what a decoded item's data section must hold.
 fn block() -> Vec<u8> {
     let mut buf = Vec::new();
-    crate::wal::append_block(&regions(), &mut buf);
+    crate::wal::append_block(&regions(), 0, &mut buf);
     buf
 }
 

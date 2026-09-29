@@ -105,7 +105,7 @@ impl RowSource for Run {
     #[inline(always)]
     fn blob(&self) -> &[u8] {
         match self {
-            Run::Mem(b) => &b.blob,
+            Run::Mem(b) => b.blob(),
             Run::Shard(s) => s.blob(),
         }
     }

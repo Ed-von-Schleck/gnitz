@@ -118,12 +118,12 @@ fn encode_decode_string_column() {
 
     let mut s1 = [0u8; 16];
     s1.copy_from_slice(&db.col_data(1)[0..16]);
-    let str1 = try_decode_german_string(&s1, &db.blob).unwrap();
+    let str1 = try_decode_german_string(&s1, db.blob()).unwrap();
     assert_eq!(str1, b"hello");
 
     let mut s2 = [0u8; 16];
     s2.copy_from_slice(&db.col_data(1)[16..32]);
-    let str2 = try_decode_german_string(&s2, &db.blob).unwrap();
+    let str2 = try_decode_german_string(&s2, db.blob()).unwrap();
     assert_eq!(str2, long_str.as_bytes());
 }
 

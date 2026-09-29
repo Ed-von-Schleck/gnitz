@@ -9,7 +9,7 @@ use gnitz_expr::{ColCopy, ExprValidateErr, LogicalProgram, MapEval};
 
 use super::reindex::{locate_key_col, FoldCols, ReindexPacker};
 use crate::schema::{oob_col, ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
-use crate::storage::Batch;
+use crate::storage::{copy_string_cells, Batch, HeapArm};
 
 /// One map step's row window: source rows `[src, src + n)` onto destination rows
 /// `[dst, dst + n)`. The three travel together through every columnar body
@@ -20,20 +20,6 @@ struct RowWindow {
     src: usize,
     dst: usize,
     n: usize,
-}
-
-/// How a copy moves a German-string cell. The destination's blob identity and
-/// the dedup cache are one decision, so they are one value: `Verbatim` with a
-/// live cache is a state that cannot be built.
-enum BlobMode<'a> {
-    /// `output` already holds exactly `in_batch`'s heap, so every long string's
-    /// offset resolves the same on both sides and the 16-byte structs copy
-    /// through the ordinary equal-stride bulk copy.
-    Verbatim,
-    /// Relocate each cell's bytes into `output.blob` — else its heap offset
-    /// dangles once the source is dropped. The cache deduplicates identical
-    /// spans across every column and row of one map.
-    Relocate(&'a mut crate::storage::BlobCache),
 }
 
 /// Average survivor-run length below which a computing map copies its survivors
@@ -76,7 +62,7 @@ fn copy_column(
         slot: dst_payload,
         width: stride,
     }: &ColCopy,
-    blob: &mut BlobMode<'_>,
+    blob: &mut HeapArm<'_>,
     w: RowWindow,
 ) {
     let RowWindow { src: src_start, dst: dst_base, n } = w;
@@ -144,31 +130,19 @@ fn copy_column(
         ColumnLocator::Payload { slot, size, type_code } => {
             let in_pi = slot as usize;
             let src_stride = size as usize; // source read width
-            if let (true, BlobMode::Relocate(cache)) = (type_code.is_german_string(), blob) {
+            if type_code.is_german_string() {
                 // STRING and BLOB share the 16-byte German-string struct, whose
                 // heap-offset field points into the source batch's blob.
-                // Asserted, not assumed: the loop below reads and writes at that
-                // one width.
                 debug_assert_eq!(
                     (src_stride, stride),
                     (16, 16),
                     "German-string column moved at a non-16-byte stride",
                 );
-                let src_col = in_batch.col_data(in_pi);
-                // One split borrow, so the destination region is resolved once
-                // rather than per row.
+                let src = &in_batch.col_data(in_pi)[src_start * 16..(src_start + n) * 16];
+                // One split borrow, so the destination region is resolved once.
                 let (dst_col, _, dst_blob) = output.col_null_and_blob_mut(dst_payload);
-                for i in 0..n {
-                    let src_off = (src_start + i) * 16;
-                    let cell = crate::storage::relocate_german_string_vec(
-                        &src_col[src_off..src_off + 16],
-                        &in_batch.blob,
-                        dst_blob,
-                        Some(&mut **cache),
-                    );
-                    let dst_off = (dst_base + i) * 16;
-                    dst_col[dst_off..dst_off + 16].copy_from_slice(&cell);
-                }
+                let dst = &mut dst_col[dst_base * 16..(dst_base + n) * 16];
+                copy_string_cells(dst, src, in_batch.blob(), dst_blob, blob);
             } else if src_stride == stride {
                 debug_assert!(
                     (src_start + n) * stride <= in_batch.col_data(in_pi).len(),
@@ -432,7 +406,7 @@ impl MapPlan {
             matches!(self.pk_source, PkSource::Inherit),
             "append_map_ranges: any other source leaves the keeper's PK region unwritten",
         );
-        self.map_ranges_into(src, keeper, ranges);
+        self.map_ranges_into(src, keeper, ranges, false);
     }
 
     /// The map over `in_batch`, less a [`gnitz_wire::NullKeys::Drop`] reindex's
@@ -452,15 +426,11 @@ impl MapPlan {
             return Batch::empty_with_schema(&self.out_schema);
         }
         // Uninitialized: `validate` makes every map write every payload slot,
-        // and the two calls below cover the PK, weight and null regions.
+        // and the calls below cover the PK, weight and null regions.
         let mut output = Batch::with_capacity(&self.out_schema, n);
-        // When no string column is dropped, adopt the input blob wholesale; the
-        // shared `blob_id` is then what tells `map_ranges_into` to copy every
-        // String/Blob struct verbatim instead of relocating each cell.
-        if self.keeps_every_string {
-            output.share_blob_from(in_batch);
-        }
-        self.map_ranges_into(in_batch, &mut output, ranges);
+        // When no string column is dropped, the source heap can be carried whole
+        // and every String/Blob struct shifted onto it.
+        self.map_ranges_into(in_batch, &mut output, ranges, self.keeps_every_string);
         // The one source that keys on the finished output row.
         if let PkSource::HashRow = self.pk_source {
             reindex_hash_row(&mut output);
@@ -468,45 +438,49 @@ impl MapPlan {
         output
     }
 
-    /// Map `ranges` of `src` onto `out`'s tail.
-    fn map_ranges_into(&mut self, src: &Batch, out: &mut Batch, ranges: &[(usize, usize)]) {
+    /// Map `ranges` of `src` onto `out`'s tail, window by window, carrying
+    /// `src`'s heap when `carry` and [`Batch::carry_heap`] prefers it. Ranges
+    /// too short to feed the per-window kernel are gathered into one first.
+    fn map_ranges_into(&mut self, src: &Batch, out: &mut Batch, ranges: &[(usize, usize)], carry: bool) {
         let total = crate::storage::range_rows(ranges);
         if total == 0 {
             return;
         }
-        let blob_cap = crate::storage::prorated_blob_cap(src.blob.len(), src.count, total);
         let compact_below = match (self.ev.emits_anything(), &self.pk_source) {
             (true, _) => COMPACT_RUN_LEN,
             (false, PkSource::Pack(_)) => PACK_COMPACT_RUN_LEN,
             (false, _) => 0,
         };
         let starves_kernel = ranges.len() > 1 && total < ranges.len() * compact_below;
-        let compacted;
-        let (src, ranges) = if starves_kernel {
-            compacted = Batch::from_ranges(src, ranges, src.schema(), 0);
-            (&compacted, &[(0, total)][..])
-        } else {
-            (src, ranges)
+        let compacted = starves_kernel.then(|| Batch::from_ranges(src, ranges, src.schema(), 0));
+        let whole = [(0, total)];
+        let (src, ranges) = match &compacted {
+            Some(c) => (c, &whole[..]),
+            None => (src, ranges),
+        };
+        let heap_at = match carry {
+            true => out.carry_heap(&src.as_mem_batch(), src.schema().string_payload_slots(), ranges),
+            false => None,
         };
 
+        let blob_cap = crate::storage::prorated_blob_cap(src.blob().len(), src.count, total);
         let old = out.count;
         out.reserve_rows(total);
         // Publish the new rows up front: the `*_mut` accessors are `count`-bounded,
         // so `[old, old + total)` must be inside `count` before any write.
         out.count = old + total;
 
-        let shares_blob = out.shares_blob_with(&src.as_mem_batch());
         let mut cache = crate::storage::BlobCache::new(total);
         // For relocated copies and string emits alike.
-        if out.schema().has_german_string() && !shares_blob && blob_cap != 0 {
+        if out.schema().has_german_string() && heap_at.is_none() && blob_cap != 0 {
             out.reserve_blob(blob_cap);
         }
         let mut dst = old;
         for &(start, end) in ranges {
             let w = RowWindow { src: start, dst, n: end - start };
-            let blob = match shares_blob {
-                true => BlobMode::Verbatim,
-                false => BlobMode::Relocate(&mut cache),
+            let blob = match heap_at {
+                Some(base) => HeapArm::At(base),
+                None => HeapArm::Relocate(&mut cache),
             };
             self.map_rows_into(src, out, w, blob);
             dst += w.n;
@@ -521,7 +495,7 @@ impl MapPlan {
     /// Map one row window: PK, weight, column moves, then the null words and
     /// computed columns. `out.count` must already cover the destination window —
     /// every `*_mut` accessor is `count`-bounded.
-    fn map_rows_into(&mut self, in_batch: &Batch, output: &mut Batch, w: RowWindow, mut blob: BlobMode<'_>) {
+    fn map_rows_into(&mut self, in_batch: &Batch, output: &mut Batch, w: RowWindow, mut blob: HeapArm<'_>) {
         let RowWindow { src: src_start, dst: dst_base, n } = w;
         // Both PK sources that read the *input* row, so both belong to the
         // window rather than to a pass over the finished batch.

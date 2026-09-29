@@ -114,17 +114,15 @@ pub(in crate::storage) fn write_test_shard(
 }
 
 /// [`write_test_shard`] at any number of I64 payload columns, with explicit null
-/// words and a raw blob heap. Rows are `(opk_bytes, weight, null_word, payload)`.
+/// words. Rows are `(opk_bytes, weight, null_word, payload)`.
 #[cfg(test)]
 pub(in crate::storage) fn write_i64_shard(
     path: &str,
     schema: &SchemaDescriptor,
     rows: &[(Vec<u8>, i64, u64, Vec<i64>)],
-    blob: &[u8],
     opts: ShardWriteOpts,
 ) {
     let mut b = Batch::with_capacity(schema, rows.len().max(1));
-    b.blob.extend_from_slice(blob);
     for (pk, w, null_word, cols) in rows {
         debug_assert_eq!(cols.len(), schema.num_payload_cols());
         b.begin_row(pk, *w);
@@ -142,6 +140,11 @@ impl Batch {
         let schema = self.schema();
         let n = self.count;
         assert!(n > 0, "every writer skips an empty output");
+        // A shard carries no dead heap bytes.
+        if self.dead_heap != 0 && super::batch_wire::measure_dead_heap(&self.as_mem_batch(), schema) != 0 {
+            return self.compacted(0..n).write_as_shard(path, opts);
+        }
+        self.debug_verify_dead_heap();
         let mut regions = gnitz_wire::Regions::new();
         self.wire_regions(&mut regions);
         let npc = schema.num_payload_cols();

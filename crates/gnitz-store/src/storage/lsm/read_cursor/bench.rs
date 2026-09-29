@@ -875,7 +875,6 @@ fn for_range_drain_bench() {
                 &path,
                 &schema,
                 &rows,
-                &[],
                 crate::storage::repr::shard_file::ShardWriteOpts::COMPACTION,
             );
             Rc::new(MappedShard::open(&path, &schema).unwrap())

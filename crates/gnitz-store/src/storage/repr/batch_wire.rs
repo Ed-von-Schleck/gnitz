@@ -1,7 +1,7 @@
 //! Wire serialization for `Batch`: wire sizing and chunking, encoding, and
 //! WAL-block decoding with the validation it runs.
 
-use super::batch::{strides_from_schema, string_mask, Batch, MAX_BATCH_REGIONS, REG_PK};
+use super::batch::{strides_from_schema, Batch, MAX_BATCH_REGIONS, REG_PK};
 use super::batch_pool::{acquire_arena, recycle_buf};
 use super::merge::{blob_span_key, prorated_blob_cap, BlobCache, DirectWriter, MemBatch};
 use crate::schema::{SchemaDescriptor, SchemaFacts};
@@ -67,7 +67,7 @@ impl Batch {
             (WireChunk::Range { rows }, overhead + self.wire_byte_size_range(rows))
         } else {
             let rows = self.rows_with_heap(start..self.count, slots, overhead, budget);
-            let owned = self.wire_chunk(start, rows);
+            let owned = self.compacted(start..start + rows);
             let size = overhead + owned.wire_byte_size();
             (WireChunk::Owned(owned), size)
         };
@@ -84,19 +84,8 @@ impl Batch {
         if self.blob.is_empty() {
             0
         } else {
-            string_mask(self)
+            self.schema().string_payload_slots()
         }
-    }
-
-    /// Rows `[start, start + count)` as a batch of their own, heap compacted.
-    ///
-    /// A contiguous source-order subrange keeps order and distinctness, so the
-    /// source's layout claim survives the append's downgrade.
-    fn wire_chunk(&self, start: usize, count: usize) -> Batch {
-        let mut out = Batch::with_capacity(self.schema(), count);
-        out.append_batch(self, start, start + count);
-        out.inherit_layout(self);
-        out
     }
 
     /// Rows from `start` that fit `budget` by fixed width alone.
@@ -167,12 +156,13 @@ impl Batch {
         out.push(&self.blob);
     }
 
-    /// Encode self into WAL wire format at the front of `out`. Returns bytes
-    /// written.
+    /// Encode self into WAL wire format at the front of `out`, the header
+    /// stating this batch's dead-heap bound. Returns bytes written.
     pub fn encode_to_wire(&self, out: &mut [u8]) -> usize {
+        self.debug_verify_dead_heap();
         let mut r = Regions::new();
         self.wire_regions(&mut r);
-        wal::write_block(&r, out)
+        wal::write_block(&r, self.dead_heap, out)
     }
 
     /// Rows `[start, start + rows)` as one WAL block at the front of `out`,
@@ -182,7 +172,7 @@ impl Batch {
         let mut r = Regions::new();
         self.fixed_regions(start, rows, &mut r);
         r.push(&[]);
-        wal::write_block(&r, out)
+        wal::write_block(&r, 0, out)
     }
 
     /// The rows `indices` selects, in order, as one WAL block at the front of
@@ -220,7 +210,8 @@ impl Batch {
             return None;
         };
         dst.copy_from_slice(&heap);
-        let written = wal::write_head(out, count, fixed, heap.len());
+        // Relocated cell by cell, so every heap byte is referenced.
+        let written = wal::write_head(out, count, fixed, heap.len(), 0);
         recycle_buf(heap);
         Some(written)
     }
@@ -259,11 +250,11 @@ impl Batch {
     }
 
     /// [`Self::decode_from_wal_block`] for a block a peer wrote, validated
-    /// first.
+    /// first. The header's dead-heap bound is not trusted: the heap is measured.
     pub fn decode_foreign_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Self, &'static str> {
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
-        let mb = decode_mem_batch_from_wal_block(data, schema, &mut offsets)?;
-        validate_string_heap_extents(&mb, schema)?;
+        let mut mb = decode_mem_batch_from_wal_block(data, schema, &mut offsets)?;
+        mb.dead_heap = validate_string_heap_extents(&mb, schema)?;
         if gnitz_wire::first_not_null_violation(schema.not_null_payload_slots(), mb.null_bmp()).is_some() {
             return Err("a null bit on a NOT NULL column");
         }
@@ -286,29 +277,60 @@ pub(super) fn first_valued_null_cell(mb: &MemBatch<'_>, schema: &SchemaDescripto
 }
 
 /// Every German-string cell of `mb` is in canonical form against its own heap.
-fn validate_string_heap_extents(mb: &MemBatch<'_>, schema: &SchemaDescriptor) -> Result<(), &'static str> {
+/// Answers the heap's exact count of bytes no cell references.
+fn validate_string_heap_extents(mb: &MemBatch<'_>, schema: &SchemaDescriptor) -> Result<usize, &'static str> {
+    walk_heap_spans(mb, schema, |cell| gnitz_wire::german_string_cell_ok(cell, mb.blob))
+        .ok_or("data WAL German string is not in canonical form")
+}
+
+/// The exact count of `mb`'s heap bytes no long string cell references, a cell
+/// overrunning the heap referencing none.
+pub(super) fn measure_dead_heap(mb: &MemBatch<'_>, schema: &SchemaDescriptor) -> usize {
+    walk_heap_spans(mb, schema, |_| true).expect("an accepting walk")
+}
+
+/// Mark every German-string cell's heap span, after `accept` has passed the
+/// cell, and answer the heap bytes left unmarked; `None` at the first cell
+/// `accept` refuses.
+fn walk_heap_spans(mb: &MemBatch<'_>, schema: &SchemaDescriptor, accept: impl Fn(&[u8; 16]) -> bool) -> Option<usize> {
+    let heap = mb.blob.len();
     if !schema.has_german_string() {
-        return Ok(());
+        return Some(heap);
     }
+    let mut live = vec![0u64; heap.div_ceil(64)];
     for (pi, col) in schema.payload_columns() {
         if !col.type_code.is_german_string() {
             continue;
         }
         for cell in mb.col_data(pi, 16).as_chunks::<16>().0 {
-            if !gnitz_wire::german_string_cell_ok(cell, mb.blob) {
-                return Err("data WAL German string is not in canonical form");
+            if !accept(cell) {
+                return None;
+            }
+            if let Some(span) = gnitz_wire::german_string_heap(cell, heap) {
+                mark_bits(&mut live, span);
             }
         }
     }
-    Ok(())
+    let marked: usize = live.iter().map(|w| w.count_ones() as usize).sum();
+    Some(heap - marked)
+}
+
+/// Set bits `span` of the bitset `bits`.
+fn mark_bits(bits: &mut [u64], span: std::ops::Range<usize>) {
+    let (mut at, end) = (span.start, span.end);
+    while at < end {
+        let (word, bit) = (at / 64, at % 64);
+        let n = (64 - bit).min(end - at);
+        bits[word] |= gnitz_wire::low_bits_mask(n) << bit;
+        at += n;
+    }
 }
 
 /// A WAL block validated under `schema`, as a `MemBatch` borrowing `data`, its
 /// region offsets in `offsets`.
 ///
-/// String cells are not canonicalized: relocate them on the way in
-/// (`Batch::append_ranges`), validate them
-/// ([`Batch::decode_foreign_wal_block`]), or read no string column.
+/// Its string cells and dead-heap bound are taken as the engine wrote them; a
+/// block a peer wrote goes through [`Batch::decode_foreign_wal_block`].
 pub fn decode_mem_batch_from_wal_block<'a>(
     data: &'a [u8],
     schema: &SchemaDescriptor,
@@ -316,7 +338,7 @@ pub fn decode_mem_batch_from_wal_block<'a>(
 ) -> Result<MemBatch<'a>, &'static str> {
     let (strides, nr) = strides_from_schema(schema);
     let nr = nr as usize;
-    let (n, _, blob) = wal::parse_block(data, row_width(&strides[..nr]))?;
+    let (n, _, blob, dead_heap) = wal::parse_block(data, row_width(&strides[..nr]))?;
     wire_offsets(&strides, nr, n, offsets);
 
     Ok(MemBatch {
@@ -325,8 +347,7 @@ pub fn decode_mem_batch_from_wal_block<'a>(
         pk_stride: strides[REG_PK],
         blob,
         count: n,
-        // A borrowed wire view shares no blob identity with any batch.
-        blob_id: 0,
+        dead_heap,
     })
 }
 

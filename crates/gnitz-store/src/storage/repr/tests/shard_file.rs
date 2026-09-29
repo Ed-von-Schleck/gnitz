@@ -36,7 +36,7 @@ fn write_open_roundtrip() {
     let shard_path = path.to_str().unwrap().to_owned();
     let schema = make_schema_u64_i64();
     let rows = u64_rows(&pks, &vec![1; n], &vec![0; n], std::slice::from_ref(&vals));
-    write_i64_shard(&shard_path, &schema, &rows, &[], ShardWriteOpts::default());
+    write_i64_shard(&shard_path, &schema, &rows, ShardWriteOpts::default());
 
     let image = std::fs::read(&path).unwrap();
     assert_eq!(ShardHeader::read(&image).unwrap().row_count, n);
@@ -87,7 +87,7 @@ fn no_false_negatives_through_write_open_probe() {
     let vals: Vec<i64> = members.iter().map(|&p| p as i64).collect();
     let schema = make_schema_u64_i64();
     let rows = u64_rows(&members, &vec![1; n], &vec![0; n], &[vals]);
-    write_i64_shard(&shard_path, &schema, &rows, &[], ShardWriteOpts::default());
+    write_i64_shard(&shard_path, &schema, &rows, ShardWriteOpts::default());
     let shard = MappedShard::open(&shard_path, &schema).unwrap();
     assert!(shard.has_shard_filter());
 
@@ -110,15 +110,15 @@ fn no_false_negatives_through_write_open_probe() {
 #[test]
 fn encoding_selection_pins_all_roles() {
     let dir = tempfile::tempdir().unwrap();
-    let write_and_read = |schema: &SchemaDescriptor, rows: &Rows, blob: &[u8], name: &str| -> Vec<u8> {
+    let write_and_read = |schema: &SchemaDescriptor, rows: &Rows, name: &str| -> Vec<u8> {
         let path = dir.path().join(name);
         let shard_path = path.to_str().unwrap().to_owned();
-        write_i64_shard(&shard_path, schema, rows, blob, ShardWriteOpts::default());
+        write_i64_shard(&shard_path, schema, rows, ShardWriteOpts::default());
         std::fs::read(&path).unwrap()
     };
 
     // --- Shard A (Constant-heavy): constant PK, all-1 weight, all-0 nulls,
-    // one constant + one varying payload column, non-empty blob. ---
+    // one constant + one varying payload column. ---
     let schema_a = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false), // PK
@@ -128,14 +128,13 @@ fn encoding_selection_pins_all_roles() {
         &[0],
     );
     let n_a = 4usize;
-    let blob_a: Vec<u8> = vec![0xAA, 0xBB, 0xCC];
     let rows_a = u64_rows(
         &vec![7; n_a],
         &vec![1; n_a],
         &vec![0; n_a],
         &[vec![42; n_a], (0..n_a as i64).collect()],
     );
-    let img_a = write_and_read(&schema_a, &rows_a, &blob_a, "pin_a.db");
+    let img_a = write_and_read(&schema_a, &rows_a, "pin_a.db");
     assert_eq!(region_dir(&img_a, 0), (8, Encoding::Constant), "A pk constant");
     assert_eq!(region_dir(&img_a, 1), (8, Encoding::Constant), "A weight constant");
     assert_eq!(region_dir(&img_a, 2), (8, Encoding::Constant), "A null constant");
@@ -145,7 +144,7 @@ fn encoding_selection_pins_all_roles() {
         (n_a * 8, Encoding::Raw),
         "A payload varying → raw"
     );
-    assert_eq!(region_dir(&img_a, 5), (blob_a.len(), Encoding::Raw), "A blob raw");
+    assert_eq!(region_dir(&img_a, 5), (0, Encoding::Raw), "A blob raw");
 
     // --- Shard B (TwoValue weight, Raw nulls): distinct PKs, alternating
     // 1/-1 weights, a nullable column NULL on a subset so the null_bmp holds
@@ -164,7 +163,7 @@ fn encoding_selection_pins_all_roles() {
         &[1, 0, 1, 0], // col-0 null bit set on rows 0,2
         &[vec![10, 20, 30, 40]],
     );
-    let img_b = write_and_read(&schema_b, &rows_b, &[], "pin_b.db");
+    let img_b = write_and_read(&schema_b, &rows_b, "pin_b.db");
     assert_eq!(region_dir(&img_b, 0), (n_b * 8, Encoding::Raw), "B pk distinct → raw");
     assert_eq!(
         region_dir(&img_b, 1),
@@ -183,7 +182,7 @@ fn encoding_selection_pins_all_roles() {
     );
     let n_c = 3usize;
     let rows_c = u64_rows(&[1, 2, 3], &[1, -1, 2], &vec![0; n_c], &[vec![5, 6, 7]]);
-    let img_c = write_and_read(&schema_c, &rows_c, &[], "pin_c.db");
+    let img_c = write_and_read(&schema_c, &rows_c, "pin_c.db");
     assert_eq!(
         region_dir(&img_c, 1),
         (n_c * 8, Encoding::Raw),
@@ -195,7 +194,7 @@ fn encoding_selection_pins_all_roles() {
 /// `SHARD_EPOCH` bump.
 #[test]
 fn shard_bytes_are_pinned() {
-    const PINNED: (u64, u64) = (21, 14026387432709276183);
+    const PINNED: (u64, u64) = (21, 8604968671891605139);
     let n = 64usize;
     let schema = SchemaDescriptor::new(
         &[
@@ -218,13 +217,7 @@ fn shard_bytes_are_pinned() {
     );
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("golden.db");
-    write_i64_shard(
-        path.to_str().unwrap(),
-        &schema,
-        &rows,
-        b"heap",
-        ShardWriteOpts::COMPACTION,
-    );
+    write_i64_shard(path.to_str().unwrap(), &schema, &rows, ShardWriteOpts::COMPACTION);
     let mut bytes = std::fs::read(&path).unwrap();
 
     let encodings: Vec<Encoding> = (0..=gnitz_wire::num_regions(2))
@@ -276,7 +269,7 @@ fn write_refuses_an_existing_path_and_leaves_it_intact() {
     let path = path.to_str().unwrap();
     let schema = make_schema_u64_i64();
     let rows = u64_rows(&[1], &[1], &[0], &[vec![10]]);
-    write_i64_shard(path, &schema, &rows, &[], ShardWriteOpts::default());
+    write_i64_shard(path, &schema, &rows, ShardWriteOpts::default());
     let before = std::fs::read(path).unwrap();
 
     let other = crate::test_support::make_batch_opk(&schema, &[(&2u64.to_be_bytes()[..], 1, 20)]);

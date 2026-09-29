@@ -342,7 +342,7 @@ fn a_heap_heavy_round_is_sized_by_its_relocated_heap() {
     consolidated.certify_layout(Layout::Consolidated);
     let raw = string_batch(&rows_of(1).into_iter().rev().collect::<Vec<_>>());
     assert!(
-        consolidated.blob.len() > SMALL_OUTBOX,
+        consolidated.blob().len() > SMALL_OUTBOX,
         "the heap alone overflows a part"
     );
     let schema = string_schema();
@@ -384,33 +384,28 @@ fn routed_partition(per: [usize; 2], make: impl Fn(&[u64]) -> Batch) -> Batch {
 /// the next list has no room for a row and moves whole to the next part.
 #[test]
 fn a_list_that_fills_the_outbox_exactly_defers_the_next() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0],
+    let schema = string_schema();
+    let row_width = string_batch(&[(0, 1, String::new())]).wire_byte_size_range(1) - WAL_HEADER_SIZE;
+    let room = SMALL_OUTBOX - BLOCKS_AT - WAL_HEADER_SIZE;
+    // Fixed-width rows, and one long string whose heap bytes take up the rest.
+    let fill = room / row_width - 1;
+    let slack = room - fill * row_width;
+    assert!(
+        slack > gnitz_wire::SHORT_STRING_THRESHOLD,
+        "the slack spills to the heap"
     );
+    // The one long string sits on the smallest key worker 0 owns.
+    let anchor = {
+        let probe = string_batch(&(0..4096).map(|pk| (pk, 1, String::new())).collect::<Vec<_>>());
+        let mut lists = Vec::new();
+        probe.get_pk(op_exchange_route(&probe, &by_pk(&schema), &mut lists, 2)[0][0] as usize) as u64
+    };
     let make = |pks: &[u64]| {
-        let mut b = BatchBuilder::new(schema);
-        for &pk in pks {
-            b.begin_row(pk as u128, 1);
-            b.put_int(pk as u128);
-            b.put_int(7);
-            b.end_row();
-        }
-        let mut b = b.finish();
+        let text = |pk: u64| if pk == anchor { "l".repeat(slack) } else { String::new() };
+        let mut b = string_batch(&pks.iter().map(|&pk| (pk, 1, text(pk))).collect::<Vec<_>>());
         b.certify_layout(Layout::Consolidated);
         b
     };
-    let row_width = make(&[0]).wire_byte_size_range(1) - WAL_HEADER_SIZE;
-    let fill = (SMALL_OUTBOX - BLOCKS_AT - WAL_HEADER_SIZE) / row_width;
-    assert_eq!(
-        WAL_HEADER_SIZE + fill * row_width,
-        SMALL_OUTBOX - BLOCKS_AT,
-        "the schema's rows tile the outbox"
-    );
     let full = routed_partition([fill, 5], make);
     let mut mesh = super::fixtures::meshes(2, SMALL_OUTBOX);
     let pk = by_pk(&schema);

@@ -113,6 +113,15 @@ pub trait SchemaFacts: ColumnTable {
             .fold(0u64, |m, pi| m | 1u64 << pi)
     }
 
+    /// Bit `pi` set iff payload slot `pi`'s column is a German string (STRING
+    /// or BLOB).
+    fn string_payload_slots(&self) -> u64 {
+        (0..self.num_columns())
+            .filter(|&ci| self.col_type_code(ci).is_german_string())
+            .filter_map(|ci| self.payload_slot(ci))
+            .fold(0u64, |m, pi| m | 1u64 << pi)
+    }
+
     /// The null bits a conforming batch never sets: every payload slot's but
     /// the nullable ones'.
     fn not_null_payload_slots(&self) -> u64 {

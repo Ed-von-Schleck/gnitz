@@ -2107,3 +2107,38 @@ fn vertical_fold_touches_only_the_guards_its_extent_overlaps() {
     assert_ne!(after[0], names[0], "the overlapped guard was rewritten");
     assert_eq!(&after[1..], &names[1..], "the untouched guards kept their files");
 }
+
+/// A spilled run carrying dead heap bytes is compacted on the way to disk: the
+/// shard's heap holds only the spans its rows reference, and every row reads
+/// back.
+#[test]
+fn a_spilled_run_leaves_its_dead_heap_behind() {
+    use gnitz_expr::RowSource;
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_pk_u64_payload_string();
+    let mut idx = ShardIndex::open(
+        dir.path().to_str().unwrap(),
+        schema,
+        ShardBudget::Unbounded,
+        false,
+        None,
+    )
+    .unwrap();
+    let vals = [[b'a'; 20], [b'b'; 20]];
+    let rows: Vec<(u64, i64, &[u8])> = vec![(1, 1, &vals[0]), (2, 1, &vals[1])];
+    let mut run = crate::test_support::make_batch_bytes(&schema, &rows);
+    run.blob.extend_from_slice(&[0; 10]);
+    run.dead_heap = 10;
+    idx.append_l0_run(&run).unwrap();
+
+    for (pk, want) in [(1u128, &vals[0]), (2, &vals[1])] {
+        let mut hits = Vec::new();
+        idx.find_pk(pk, &mut |shard, row| hits.push((shard, row)));
+        let (shard, row) = hits.pop().expect("the key was spilled");
+        assert_eq!(shard.blob().len(), 40, "only the two referenced spans reach disk");
+        assert_eq!(
+            gnitz_wire::german_string_content(shard.get_col_ptr(row, 0, 16), shard.blob()),
+            want
+        );
+    }
+}

@@ -507,10 +507,8 @@ impl ZSetBatch {
         for (dst, src) in self.payload.iter_mut().zip(&mut other.payload) {
             let at = dst.bytes.len();
             dst.bytes.append(&mut src.bytes);
-            if dst.tc().is_german_string() && delta != 0 {
-                for cell in dst.bytes[at..].as_chunks_mut::<16>().0 {
-                    gnitz_wire::shift_german_string_heap(cell, delta);
-                }
+            if dst.tc().is_german_string() {
+                gnitz_wire::shift_german_string_heaps(&mut dst.bytes[at..], delta);
             }
         }
     }

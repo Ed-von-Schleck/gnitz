@@ -298,6 +298,10 @@ The PK region holds the **order-preserving key (OPK)** — the same encoding at 
 and in-engine: the PK columns concatenated in PK-list order, each big-endian with
 signed columns sign-flipped. PK columns are not repeated in the payload regions.
 
+The blob region may carry dead bytes in memory — bytes no string cell
+references; an engine WAL block states an upper bound on them in its header, and
+a shard carries none.
+
 Null bitmap uses **payload column indexing**: bit N is the N-th non-PK column in
 schema order. For a **single-PK** schema this is `payload_idx = ci if ci <
 pk_index else ci - 1`; with a **compound PK** the columns are renumbered around

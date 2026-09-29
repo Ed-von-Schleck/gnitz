@@ -13,10 +13,10 @@ use super::batch::{
 };
 use super::batch_pool::acquire_uninit;
 use super::layout::*;
-use super::merge::{prorated_blob_cap, should_relocate_blob, ColPtr, ColumnarSource, UnifiedSource};
+use super::merge::{carried_dead, prorated_blob_cap, row_long_bytes, ColPtr, ColumnarSource, UnifiedSource};
 use super::scatter::DecodedColumns;
 use super::shard_filter;
-use crate::schema::SchemaDescriptor;
+use crate::schema::{SchemaDescriptor, SchemaFacts};
 use crate::storage::error::StorageError;
 use gnitz_expr::RowSource;
 use gnitz_foundation::posix_io::Mmap;
@@ -276,16 +276,24 @@ impl MappedShard {
     }
 
     /// Copy a contiguous slice of rows into a batch under the schema this handle
-    /// is bound to, the blob arm picked by [`should_relocate_blob`].
+    /// is bound to, the blob arm picked by [`carried_dead`]. A shard holds no dead
+    /// bytes of its own; a carried heap charges the long bytes of the rows outside
+    /// the slice.
     #[inline]
     pub(crate) fn slice_to_owned_batch(&self, start: usize, row_count: usize) -> Batch {
-        let relocate = should_relocate_blob(self.blob().len(), self.header.row_count, row_count);
-        self.slice_to_owned_batch_with(start, row_count, relocate)
+        let n = self.header.row_count;
+        let carried = carried_dead(self.blob().len(), 0, n, row_count, || {
+            let mask = self.schema.string_payload_slots();
+            let outside = (0..start).chain(start + row_count..n);
+            outside.map(|row| row_long_bytes(self, mask, row)).sum()
+        });
+        self.slice_to_owned_batch_with(start, row_count, carried)
     }
 
     /// [`slice_to_owned_batch`](Self::slice_to_owned_batch) with the blob arm
-    /// passed in rather than derived, so both arms can be forced on one slice.
-    fn slice_to_owned_batch_with(&self, start: usize, row_count: usize, relocate: bool) -> Batch {
+    /// passed in rather than derived, so both arms can be forced on one slice:
+    /// `carried` is the dead-byte bound of a carried heap, `None` relocating.
+    fn slice_to_owned_batch_with(&self, start: usize, row_count: usize, carried: Option<usize>) -> Batch {
         assert!(
             !self.header.skeleton,
             "a skeleton shard has no payload to slice; hydrate its keys"
@@ -310,6 +318,7 @@ impl MappedShard {
                 dst.copy_from_slice(unsafe { std::slice::from_raw_parts(cp.row_ptr(start), dst.len()) });
             }
         };
+        let relocate = carried.is_none();
         let blob_cap = if relocate {
             prorated_blob_cap(blob.len(), self.header.row_count, row_count)
         } else {
@@ -348,10 +357,12 @@ impl MappedShard {
                 }
             }
             if !relocate {
-                w.copy_blob_verbatim(blob);
+                let base = w.adopt_heap(blob);
+                debug_assert_eq!(base, 0, "a fresh writer's heap is empty");
             }
             w.count = row_count;
         });
+        batch.charge_dead(carried.unwrap_or(0));
         batch.certify_layout(Layout::Consolidated);
         batch
     }
@@ -424,6 +435,7 @@ impl ColumnarSource for MappedShard {
             null_pad_mask: self.null_pad_mask,
             cols_off,
             blob: self.blob(),
+            heap_at: None,
         }
     }
 

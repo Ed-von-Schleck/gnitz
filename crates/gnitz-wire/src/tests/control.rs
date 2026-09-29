@@ -36,7 +36,7 @@ fn frame(hdr: &ControlHeader, blob: &[u8], schema_block: Option<&[u8]>, data: Op
 /// A one-row WAL block whose PK region is `pk`.
 fn wal_block(pk: &'static [u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    crate::wal::append_block(&[pk, &1i64.to_le_bytes(), &[0; 8], &[]], &mut out);
+    crate::wal::append_block(&[pk, &1i64.to_le_bytes(), &[0; 8], &[]], 0, &mut out);
     out
 }
 

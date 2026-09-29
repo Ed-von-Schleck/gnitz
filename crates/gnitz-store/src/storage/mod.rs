@@ -33,6 +33,6 @@ pub(crate) use lsm::read_cursor::create_read_cursor;
 pub(crate) use lsm::read_cursor::{empty_cursor, from_runs, SkeletonKeys};
 pub(crate) use lsm::table::{flush_barrier, RecoverySource, StoreBudgets, Table, DEFAULT_RAM_TIER_BYTES};
 pub(crate) use repr::batch::{range_rows, RowMark};
-pub(crate) use repr::merge::{merge_consolidated, prorated_blob_cap, relocate_german_string_vec, BlobCache};
+pub(crate) use repr::merge::{copy_string_cells, merge_consolidated, prorated_blob_cap, BlobCache, HeapArm};
 pub(crate) use repr::scatter::{reset_slots, UnifiedSet};
 pub(crate) use repr::seek::{pk_group_end, pk_prefix_group_end};

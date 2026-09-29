@@ -138,7 +138,9 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
     let mid = mid_start..mid_start + (((n - mid_start) / 2) | 1).min(n - mid_start);
     for relocate in [false, true] {
         for w in [0..n, 0..0, mid.clone()] {
-            let b = shard.slice_to_owned_batch_with(w.start, w.len(), relocate);
+            // A whole heap charged dead bounds any slice's.
+            let carried = (!relocate).then(|| shard.blob().len());
+            let b = shard.slice_to_owned_batch_with(w.start, w.len(), carried);
             assert_eq!(
                 rows_of(&b, |r| b.get_weight(r), schema),
                 want_rows[w.clone()],
@@ -441,7 +443,7 @@ fn shard_wider_than_reader_schema_opens() {
         .map(|p| (p.to_be_bytes().to_vec(), 1, 0, vec![p as i64 * 10, p as i64 * 11]))
         .collect();
     let shard_path = path.to_str().unwrap().to_owned();
-    write_i64_shard(&shard_path, &wide, &rows, &[], ShardWriteOpts::default());
+    write_i64_shard(&shard_path, &wide, &rows, ShardWriteOpts::default());
 
     let narrow = make_schema_u64_i64();
     let shard = MappedShard::open(&shard_path, &narrow).unwrap();
@@ -496,7 +498,6 @@ fn a_widened_all_pk_shard_is_not_a_skeleton() {
         &shard_path,
         &all_pk,
         &[(1u64.to_be_bytes().to_vec(), 1, 0, vec![])],
-        &[],
         ShardWriteOpts::default(),
     );
     let shard = MappedShard::open(&shard_path, &widened).unwrap();
@@ -570,18 +571,18 @@ fn an_encoding_a_role_may_not_carry_is_rejected() {
 // -----------------------------------------------------------------------
 
 /// The blob arm, both ways on one shard. 128 rows of 64-byte strings, of which
-/// rows 0 and 1 share a span, is a 8128-byte heap at 63 bytes/row, so
-/// `should_relocate_blob` cuts over at 15 sliced rows. Below it the slice
-/// carries only its own rows' bytes — once per *distinct* span, since the
-/// relocation dedup cache keys on `(src_blob, offset, length)`. At and past it,
-/// and for the whole shard, it copies the region verbatim. Every arm decodes
-/// back to the original strings.
+/// rows 0 and 1 share a span, is a 8128-byte heap. A slice carries the whole
+/// heap only once the rows it leaves out would not make it wasteful: from 97
+/// rows, which leave 31 × 64 bytes — under a quarter — behind. Below that the
+/// slice carries only its own rows' bytes — once per *distinct* span, since the
+/// relocation dedup cache keys on `(src_blob, offset, length)`. Every arm
+/// decodes back to the original strings.
 #[test]
 fn slice_relocates_only_its_own_strings() {
     let dir = tempfile::tempdir().unwrap();
     const N: usize = 128;
     const W: usize = 64;
-    const CUT: usize = 14;
+    const CUT: usize = 97;
     let schema = make_schema_pk_u64_payload_string();
     let mut batch = Batch::with_capacity(&schema, N);
     // Row 1 reuses row 0's cell verbatim, so the two share one heap span — which
@@ -604,22 +605,26 @@ fn slice_relocates_only_its_own_strings() {
     assert_eq!(one.blob.len(), W, "a one-row slice carries one string");
     assert_eq!(string(&one, 0), wide_string(37, W));
 
-    let under = shard.slice_to_owned_batch(0, CUT);
+    let under = shard.slice_to_owned_batch(0, CUT - 1);
     assert_eq!(
-        under.blob.len(),
-        (CUT - 1) * W,
+        (under.blob.len(), under.dead_heap),
+        ((CUT - 2) * W, 0),
         "relocates, and rows 0/1 share one span"
     );
     // Rows 0 and 1 both resolve to row 0's string, through the one copied span.
     assert_eq!(string(&under, 0), wide_string(0, W));
     assert_eq!(string(&under, 1), wide_string(0, W));
 
-    let at = shard.slice_to_owned_batch(0, CUT + 1);
-    assert_eq!(at.blob.len(), (N - 1) * W, "at the cut the whole region is copied");
+    let at = shard.slice_to_owned_batch(0, CUT);
+    assert_eq!(
+        (at.blob.len(), at.dead_heap),
+        ((N - 1) * W, (N - CUT) * W),
+        "at the cut the whole region is copied, the rows left out charged dead"
+    );
     let full = shard.slice_to_owned_batch(0, N);
     assert_eq!(full.blob.as_slice(), shard.blob(), "whole shard: verbatim");
 
-    for i in 2..CUT {
+    for i in 2..CUT - 1 {
         assert_eq!(string(&under, i), wide_string(i, W), "relocated row {i}");
         assert_eq!(string(&at, i), wide_string(i, W), "whole-region row {i}");
     }
@@ -638,11 +643,12 @@ fn slice_blob_relocate_bench() {
     const ITERS: usize = 50;
 
     let time_arm = |shard: &MappedShard, rc: usize, relocate: bool| -> f64 {
+        let carried = (!relocate).then(|| shard.blob().len());
         // One untimed pass faults in the cold mmap pages.
-        std::hint::black_box(shard.slice_to_owned_batch_with(0, rc, relocate));
+        std::hint::black_box(shard.slice_to_owned_batch_with(0, rc, carried));
         let t = Instant::now();
         for _ in 0..ITERS {
-            std::hint::black_box(shard.slice_to_owned_batch_with(0, rc, relocate));
+            std::hint::black_box(shard.slice_to_owned_batch_with(0, rc, carried));
         }
         t.elapsed().as_secs_f64() * 1e9 / ITERS as f64
     };
@@ -1041,7 +1047,7 @@ fn for_point_touch_bench() {
             )
         })
         .collect();
-    write_i64_shard(&path, &schema, &rows, &[], ShardWriteOpts::COMPACTION);
+    write_i64_shard(&path, &schema, &rows, ShardWriteOpts::COMPACTION);
     let shard = MappedShard::open(&path, &schema).unwrap();
     let (cycles, instructions) = (Counter::cycles().unwrap(), Counter::instructions().unwrap());
     let read = || {

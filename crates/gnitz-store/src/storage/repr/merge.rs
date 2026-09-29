@@ -72,6 +72,9 @@ pub(crate) struct UnifiedSource<'a> {
     /// per call, whatever the schema's real column count.
     pub cols_off: usize,
     pub blob: &'a [u8],
+    /// Where `blob` already lies in the scatter's destination heap, when carried
+    /// whole; `None` relocates each cell.
+    pub heap_at: Option<usize>,
 }
 
 /// Derive a `UnifiedSource` view over an in-memory `MemBatch`: every region
@@ -105,6 +108,7 @@ pub(crate) fn mem_batch_to_unified<'a>(
         null_pad_mask: 0,
         cols_off,
         blob: mb.blob,
+        heap_at: None,
     }
 }
 
@@ -144,13 +148,88 @@ const RELOCATE_CELL_COST_BYTES: usize = 500;
 /// share of the heap (`src_blob / src_rows` per row); the whole-heap copy,
 /// `src_blob` regardless of how few rows are kept. Expressing the per-cell
 /// rewrite as [`RELOCATE_CELL_COST_BYTES`] of memcpy makes that one comparison.
-///
-/// Only worth consulting where both arms are available — a destination that
-/// cannot carry the source's heap verbatim (different blob identity, gathered
-/// rather than contiguous rows, a result that is shipped) must relocate
-/// regardless.
 pub(crate) fn should_relocate_blob(src_blob: usize, src_rows: usize, out_rows: usize) -> bool {
     src_rows > 0 && src_blob > out_rows.saturating_mul(RELOCATE_CELL_COST_BYTES + src_blob / src_rows)
+}
+
+/// A heap more than a quarter dead is compacted rather than carried.
+pub(crate) fn heap_is_wasteful(dead: usize, heap: usize) -> bool {
+    dead.saturating_mul(4) > heap
+}
+
+/// The dead-byte bound a destination takes on by carrying a source's whole
+/// heap to copy `kept_rows` of its `src_rows` rows, or `None` when those rows'
+/// cells are relocated instead: the cheaper copy by [`should_relocate_blob`],
+/// or a carried heap that would be [wasteful](heap_is_wasteful).
+///
+/// `dead` is the source's own bound; `excluded` sums the long bytes of the rows
+/// left behind, and runs only once the row-prorated share of those rows has not
+/// already refused the carry — so a small slice of a large source never walks
+/// the rest of it.
+pub(super) fn carried_dead(
+    heap: usize,
+    dead: usize,
+    src_rows: usize,
+    kept_rows: usize,
+    excluded: impl FnOnce() -> usize,
+) -> Option<usize> {
+    if kept_rows == 0 {
+        return None;
+    }
+    if heap == 0 {
+        return Some(0);
+    }
+    let left = src_rows - kept_rows;
+    if should_relocate_blob(heap, src_rows, kept_rows)
+        || heap_is_wasteful(dead + prorated_blob_cap(heap, src_rows, left), heap)
+    {
+        return None;
+    }
+    let dead = if left == 0 { dead } else { dead + excluded() };
+    (!heap_is_wasteful(dead, heap)).then_some(dead)
+}
+
+/// The heap bytes `row`'s long cells in the German-string slots `mask` name.
+/// A span two cells share counts twice.
+#[inline]
+pub(super) fn row_long_bytes<S: RowSource>(src: &S, mask: u64, row: usize) -> usize {
+    gnitz_wire::BitIter(mask)
+        .filter_map(|pi| gnitz_wire::german_string_heap(src.get_col_ptr(row, pi, 16), usize::MAX))
+        .map(|span| span.len())
+        .sum()
+}
+
+/// Where a copy's German-string cells find their bytes. The dedup cache belongs
+/// to relocation alone, so it lives in that arm.
+pub(crate) enum HeapArm<'c> {
+    /// Each cell's span, copied into the destination heap once under the cache.
+    Relocate(&'c mut BlobCache),
+    /// The source's heap, already in the destination's at this base.
+    At(usize),
+}
+
+/// Copy the German-string cells `src` (whole 16-byte cells, their spans in
+/// `src_blob`) onto `dst` as `heap` says: shifted onto the carried heap, or
+/// each relocated into `dst_blob`.
+#[inline]
+pub(crate) fn copy_string_cells(
+    dst: &mut [u8],
+    src: &[u8],
+    src_blob: &[u8],
+    dst_blob: &mut Vec<u8>,
+    heap: &mut HeapArm<'_>,
+) {
+    match heap {
+        HeapArm::At(base) => {
+            dst.copy_from_slice(src);
+            gnitz_wire::shift_german_string_heaps(dst, *base);
+        }
+        HeapArm::Relocate(cache) => {
+            for (d, s) in dst.as_chunks_mut::<16>().0.iter_mut().zip(src.as_chunks::<16>().0) {
+                *d = relocate_german_string_vec(s, src_blob, dst_blob, Some(&mut **cache));
+            }
+        }
+    }
 }
 
 /// `src_cell` rebased onto `dst_blob`: a short cell with its pad zeroed, a long
@@ -279,12 +358,8 @@ pub struct MemBatch<'a> {
     pub(crate) blob: &'a [u8],
     /// Row count of the view. Read from outside through [`MemBatch::len`].
     pub(crate) count: usize,
-    /// The source [`Batch::blob_id`], carried so an appending destination can
-    /// recognize its *own* blob and copy German-string structs verbatim instead
-    /// of relocating each cell (see `Batch::append_ranges_inner`). A borrowed
-    /// wire view has no such identity and uses `0`, which no live batch ever has
-    /// (the counter starts at 1).
-    pub(crate) blob_id: u64,
+    /// An upper bound on the bytes of `blob` no cell references.
+    pub(in crate::storage) dead_heap: usize,
 }
 
 impl<'a> MemBatch<'a> {
@@ -613,11 +688,12 @@ impl<'a> DirectWriter<'a> {
         self.col_bufs[payload_col][off..off + 16].copy_from_slice(&dest);
     }
 
-    /// Carry a source heap whole into this writer's empty heap, so German-string
-    /// cells copied verbatim keep valid offsets.
-    pub(super) fn copy_blob_verbatim(&mut self, src_blob: &[u8]) {
-        debug_assert!(self.blob.is_empty(), "verbatim heap copy into a heap already written");
+    /// Carry a source heap whole onto the end of this writer's heap. Returns the
+    /// base the caller shifts its copied cells' offsets by.
+    pub(super) fn adopt_heap(&mut self, src_blob: &[u8]) -> usize {
+        let base = self.blob.len();
         self.blob.extend_from_slice(src_blob);
+        base
     }
 }
 
@@ -659,10 +735,10 @@ pub(crate) fn run_merge<S: ColumnarSource>(
 }
 
 /// Z-set `+` of `sources`, each consolidated, as one consolidated batch.
-pub(crate) fn merge_consolidated<S: ColumnarSource>(sources: &[S], schema: &SchemaDescriptor) -> Batch {
-    let mut rows: Vec<(u32, u32, i64)> = Vec::with_capacity(sources.iter().map(|s| s.row_count()).sum());
+pub(crate) fn merge_consolidated(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
+    let mut rows: Vec<(u32, u32, i64)> = Vec::with_capacity(sources.iter().map(|s| s.count).sum());
     run_merge(sources, schema, |src, row, w| rows.push((src as u32, row as u32, w)));
-    let mut out = super::scatter::UnifiedSet::whole(sources, schema).materialize(&rows, rows.len());
+    let mut out = super::scatter::materialize_carrying(sources, schema, &rows);
     out.certify_layout(Layout::Consolidated);
     out
 }
@@ -889,6 +965,8 @@ fn merged_consolidated_body<P: PayloadOrder>(a: &Batch, b: &Batch, schema: &Sche
         // One session for the whole merge: expected run length is 2 for a set
         // operation's uniform 128-bit PKs, so per-run setup would dominate.
         let mut sink = out.append_session(n_a + n_b);
+        let carry_a = sink.carry(&mb_a, &[(0, n_a)]);
+        let carry_b = sink.carry(&mb_b, &[(0, n_b)]);
         let (mut ia, mut jb) = (0usize, 0usize);
         while ia < n_a && jb < n_b {
             match compare_pk_ordering(a.get_pk_bytes(ia), b.get_pk_bytes(jb)) {
@@ -896,12 +974,12 @@ fn merged_consolidated_body<P: PayloadOrder>(a: &Batch, b: &Batch, schema: &Sche
                 Ordering::Less => {
                     let s = ia;
                     ia = a.advance_to(b.get_pk_bytes(jb), ia);
-                    sink.push_range(&mb_a, s, ia);
+                    sink.push_ranges(&mb_a, carry_a, &[(s, ia)]);
                 }
                 Ordering::Greater => {
                     let s = jb;
                     jb = b.advance_to(a.get_pk_bytes(ia), jb);
-                    sink.push_range(&mb_b, s, jb);
+                    sink.push_ranges(&mb_b, carry_b, &[(s, jb)]);
                 }
                 // A shared PK: bracket both equal-PK groups and interleave them
                 // by payload. The only arm that folds, and the only one that
@@ -919,8 +997,8 @@ fn merged_consolidated_body<P: PayloadOrder>(a: &Batch, b: &Batch, schema: &Sche
                     macro_rules! flush {
                         () => {
                             match std::mem::replace(&mut open, Open::None) {
-                                Open::A(s) => sink.push_range(&mb_a, s, ia),
-                                Open::B(s) => sink.push_range(&mb_b, s, jb),
+                                Open::A(s) => sink.push_ranges(&mb_a, carry_a, &[(s, ia)]),
+                                Open::B(s) => sink.push_ranges(&mb_b, carry_b, &[(s, jb)]),
                                 Open::None => {}
                             }
                         };
@@ -946,7 +1024,9 @@ fn merged_consolidated_body<P: PayloadOrder>(a: &Batch, b: &Batch, schema: &Sche
                             // which is why this merge can emit fewer rows than it read.
                             Ordering::Equal => {
                                 flush!();
-                                sink.push_row(&mb_a, ia, a.get_weight(ia) + b.get_weight(jb));
+                                let w = a.get_weight(ia) + b.get_weight(jb);
+                                sink.push_row_at(&mb_a, carry_a, ia, w);
+                                sink.leave_out(&mb_b, carry_b, jb);
                                 ia += 1;
                                 jb += 1;
                             }
@@ -957,16 +1037,16 @@ fn merged_consolidated_body<P: PayloadOrder>(a: &Batch, b: &Batch, schema: &Sche
                     // nothing left can fold against — follows.
                     match open {
                         Open::A(s) => {
-                            sink.push_range(&mb_a, s, ga);
-                            sink.push_range(&mb_b, jb, gb);
+                            sink.push_ranges(&mb_a, carry_a, &[(s, ga)]);
+                            sink.push_ranges(&mb_b, carry_b, &[(jb, gb)]);
                         }
                         Open::B(s) => {
-                            sink.push_range(&mb_b, s, gb);
-                            sink.push_range(&mb_a, ia, ga);
+                            sink.push_ranges(&mb_b, carry_b, &[(s, gb)]);
+                            sink.push_ranges(&mb_a, carry_a, &[(ia, ga)]);
                         }
                         Open::None => {
-                            sink.push_range(&mb_a, ia, ga);
-                            sink.push_range(&mb_b, jb, gb);
+                            sink.push_ranges(&mb_a, carry_a, &[(ia, ga)]);
+                            sink.push_ranges(&mb_b, carry_b, &[(jb, gb)]);
                         }
                     }
                     // The only advance that is not an `advance_to`.
@@ -975,8 +1055,8 @@ fn merged_consolidated_body<P: PayloadOrder>(a: &Batch, b: &Batch, schema: &Sche
                 }
             }
         }
-        sink.push_range(&mb_a, ia, n_a);
-        sink.push_range(&mb_b, jb, n_b);
+        sink.push_ranges(&mb_a, carry_a, &[(ia, n_a)]);
+        sink.push_ranges(&mb_b, carry_b, &[(jb, n_b)]);
     }
     out
 }

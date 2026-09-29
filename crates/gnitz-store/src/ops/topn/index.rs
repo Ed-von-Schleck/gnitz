@@ -115,7 +115,7 @@ impl TopNIndex {
         // One entry per row, and every carried string plus every wide image lands
         // in this heap — so the source's own heap is the presize the crate's
         // string-emitting operators all take.
-        let mut out = Batch::with_capacity_blob(&self.schema, delta.count.max(1), delta.blob.len());
+        let mut out = Batch::with_capacity_blob(&self.schema, delta.count.max(1), delta.blob().len());
         let k = self.order.len();
         let stride = self.key_packer.out_stride;
         let mut image = Vec::new();

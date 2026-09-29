@@ -15,8 +15,13 @@ fn slices(regions: &[Vec<u8>]) -> Vec<&[u8]> {
 
 /// Frame `regions` into a fresh buffer, as a SAL slot would.
 fn encode(regions: &[&[u8]]) -> Vec<u8> {
+    encode_dead(regions, 0)
+}
+
+/// [`encode`] with a heap declared `heap_dead` bytes dead.
+fn encode_dead(regions: &[&[u8]], heap_dead: usize) -> Vec<u8> {
     let mut buf = vec![0u8; block_size(regions)];
-    assert_eq!(write_block(regions, &mut buf), buf.len());
+    assert_eq!(write_block(regions, heap_dead, &mut buf), buf.len());
     buf
 }
 
@@ -30,8 +35,9 @@ fn parse_block_returns_rows_fixed_bytes_and_heap() {
 
     let mut buf = encode(&regions);
     assert_eq!(buf.len(), WAL_HEADER_SIZE + ROWS * ROW_WIDTH + heap.len());
-    let (rows, fixed, got_heap) = parse_block(&buf, ROW_WIDTH).unwrap();
+    let (rows, fixed, got_heap, dead) = parse_block(&buf, ROW_WIDTH).unwrap();
     assert_eq!(rows, ROWS);
+    assert_eq!(dead, 0);
     assert_eq!(fixed, fixed_regions.concat());
     assert_eq!(got_heap, *heap);
 
@@ -53,7 +59,7 @@ fn append_block_matches_write_block() {
     let empty: [&[u8]; 4] = [&[], &[], &[], &[]];
     for list in [&with_heap[..], &no_heap[..], &empty[..]] {
         let mut appended = vec![0xAB];
-        append_block(list, &mut appended);
+        append_block(list, 0, &mut appended);
         assert_eq!(appended[1..], encode(list), "{} regions", list.len());
     }
 }
@@ -62,8 +68,27 @@ fn append_block_matches_write_block() {
 #[test]
 fn a_zero_row_blocks_heap_is_dropped() {
     let buf = encode(&[&[], &[], &[], b"orphan heap"]);
-    let (rows, fixed, heap) = parse_block(&buf, ROW_WIDTH).unwrap();
-    assert_eq!((rows, fixed, heap), (0, &[][..], &[][..]));
+    let (rows, fixed, heap, dead) = parse_block(&buf, ROW_WIDTH).unwrap();
+    assert_eq!((rows, fixed, heap, dead), (0, &[][..], &[][..], 0));
+}
+
+/// The header is five words, and the dead-byte bound comes back as written, up
+/// to and including the whole heap.
+#[test]
+fn heap_dead_round_trips() {
+    assert_eq!(WAL_HEADER_SIZE, 20);
+    assert_eq!(WAL_OFF_HEAP_DEAD + 4, WAL_HEADER_SIZE);
+    let f = fixture();
+    let regions = slices(&f);
+    let heap_len = regions.last().unwrap().len();
+    for dead in [0, 1, heap_len] {
+        let buf = encode_dead(&regions, dead);
+        assert_eq!(read_u32_le(&buf, WAL_OFF_HEAP_DEAD) as usize, dead);
+        assert_eq!(parse_block(&buf, ROW_WIDTH).unwrap().3, dead);
+    }
+    let mut appended = Vec::new();
+    append_block(&regions, 3, &mut appended);
+    assert_eq!(appended, encode_dead(&regions, 3));
 }
 
 /// Every guard, against the block that trips it — including a forgery of each
@@ -97,6 +122,11 @@ fn each_guard_rejects_its_forgery() {
         ),
         ("one row more".into(), forged(WAL_OFF_ROWS, &|r| r + 1), mismatch),
         ("one row fewer".into(), forged(WAL_OFF_ROWS, &|r| r - 1), mismatch),
+        (
+            "more dead than heap".into(),
+            forged(WAL_OFF_HEAP_DEAD, &|_| b"a heap".len() as u32 + 1),
+            "block declares more dead heap than heap",
+        ),
     ];
     for bit in 0..32 {
         cases.push((

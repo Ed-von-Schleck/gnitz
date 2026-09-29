@@ -121,7 +121,7 @@ pub fn stored_payload0_i64(fr: &crate::storage::StoredRow) -> i64 {
 pub fn read_german_string(batch: &Batch, col: usize, row: usize) -> Vec<u8> {
     let off = row * 16;
     let gs: &[u8; 16] = batch.col_data(col)[off..off + 16].try_into().unwrap();
-    gnitz_wire::try_decode_german_string(gs, &batch.blob).unwrap()
+    gnitz_wire::try_decode_german_string(gs, batch.blob()).unwrap()
 }
 
 /// I64 pk + I64 payload schema — the signed-PK exercise of the order-preserving
@@ -149,6 +149,16 @@ pub fn make_batch_i64pk(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> 
 /// U64 pk + a single STRING payload column.
 pub fn make_schema_pk_u64_payload_string() -> SchemaDescriptor {
     u64_pk_schema(SchemaColumn::new(TypeCode::String, false))
+}
+
+/// [`make_batch_bytes`] under [`make_schema_pk_u64_payload_string`].
+pub fn make_string_batch(rows: &[(u64, i64, &[u8])]) -> Batch {
+    make_batch_bytes(&make_schema_pk_u64_payload_string(), rows)
+}
+
+/// Payload column 0's string on every row, in order.
+pub fn read_strings(batch: &Batch) -> Vec<Vec<u8>> {
+    (0..batch.count).map(|row| read_german_string(batch, 0, row)).collect()
 }
 
 /// U64 pk + a single BLOB payload column.

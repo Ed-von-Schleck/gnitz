@@ -1,7 +1,7 @@
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::BatchBuilder;
-use crate::test_support::{pk_payload_schema, wide_pk_3xu64_schema};
+use crate::test_support::{make_string_batch, pk_payload_schema, read_strings, wide_pk_3xu64_schema};
 use gnitz_expr::payload_string;
 
 #[test]
@@ -423,7 +423,7 @@ fn truncate_to_poisons_dropped_rows() {
 }
 
 /// A batch whose buffers hold more than twice what its rows need comes back as
-/// a tight copy with its layout and blob identity; a tight one comes back as
+/// a tight copy with its layout; a tight one comes back as
 /// the same allocation.
 #[test]
 fn trimmed_copies_only_oversized_batches() {
@@ -433,12 +433,11 @@ fn trimmed_copies_only_oversized_batches() {
     let mut loose = Batch::with_capacity(&schema, 1000);
     loose.append_batch(&src, 0, 1);
     loose.certify_layout(Layout::Consolidated);
-    let (cap, blob_id) = (loose.data_capacity(), loose.blob_id);
+    let cap = loose.data_capacity();
     let trimmed = loose.trimmed();
     assert!(trimmed.data_capacity() < cap, "an oversized batch is copied down");
     assert_eq!(trimmed.count, 1);
     assert_eq!(trimmed.layout, Layout::Consolidated);
-    assert_eq!(trimmed.blob_id, blob_id);
 
     let ptr = trimmed.data.as_ptr();
     let again = trimmed.trimmed();
@@ -773,4 +772,118 @@ fn negate_flips_every_weight() {
         .collect();
     assert_eq!(got, vec![(-3, 10), (1, 20), (i64::MIN, 30)]);
     assert!(out.is_consolidated());
+}
+
+// ── Dead heap bytes: sharing, truncation, concatenation, trimming ───────
+
+/// `b`'s rows over its heap padded with `pad` unreferenced bytes, charged dead.
+fn padded(mut b: Batch, pad: usize) -> Batch {
+    b.blob.extend(std::iter::repeat_n(0u8, pad));
+    b.dead_heap += pad;
+    b
+}
+
+/// Carrying a heap for a subset charges exactly the long bytes of the rows left
+/// out, on top of what the source already held dead; a short cell costs nothing.
+/// A carry that would leave the heap wasteful, or that keeps nothing, is refused.
+#[test]
+fn carry_heap_charges_exactly_the_excluded_rows() {
+    let mut rows: Vec<(u64, i64, &[u8])> = (1..=8).map(|pk| (pk, 1, &[b'x'; 40][..])).collect();
+    rows[2].2 = &[b'c'; 30];
+    rows[3].2 = b"short";
+    let src = padded(make_string_batch(&rows), 5);
+    let mask = src.schema().string_payload_slots();
+    let mb = src.as_mem_batch();
+
+    let mut out = Batch::with_capacity(src.schema(), 8);
+    assert_eq!(out.carry_heap(&mb, mask, &[(0, 2), (3, 8)]), Some(0));
+    assert_eq!(out.dead_heap, 5 + 30, "row 2's span and the source's own padding");
+
+    let mut short = Batch::with_capacity(src.schema(), 8);
+    assert_eq!(short.carry_heap(&mb, mask, &[(0, 3), (4, 8)]), Some(0));
+    assert_eq!(short.dead_heap, 5, "a short row leaves no span behind");
+
+    let mut all = Batch::with_capacity(src.schema(), 8);
+    assert_eq!(all.carry_heap(&mb, mask, &[(0, 8)]), Some(0));
+    assert_eq!(all.dead_heap, 5, "keeping every row charges only the padding");
+
+    for kept in [&[][..], &[(0, 2)][..]] {
+        let mut refused = Batch::with_capacity(src.schema(), 8);
+        assert_eq!(refused.carry_heap(&mb, mask, kept), None, "{kept:?}");
+        assert_eq!((refused.blob.len(), refused.dead_heap), (0, 0));
+    }
+}
+
+/// Truncation drops the heap appended since the mark along with its rows.
+#[test]
+fn truncate_to_drops_the_heap_appended_since_the_mark() {
+    let src = make_string_batch(&[(1, 1, &[b'a'; 20]), (2, 1, &[b'b'; 30]), (3, 1, &[b'c'; 40])]);
+    let mut out = Batch::concat(src.schema(), std::iter::once(src.as_mem_batch()));
+    assert_eq!((out.blob.len(), out.dead_heap), (src.blob.len(), 0));
+    let shared = out.mark();
+
+    let fresh = make_string_batch(&[(4, 1, &[b'e'; 50])]);
+    out.append_batch(&fresh, 0, 1);
+    assert!(out.blob.len() > shared.blob_len);
+    out.truncate_to(shared);
+    assert_eq!((out.blob.len(), out.dead_heap), (src.blob.len(), 0));
+    assert_eq!(read_strings(&out), read_strings(&src));
+}
+
+/// Concatenation carries each heap whole: every string reads back, the output
+/// heap is the sum of its inputs', and so is its dead-byte bound.
+#[test]
+fn concat_carries_every_heap_whole() {
+    let a = padded(make_string_batch(&[(1, 1, &[b'a'; 20]), (2, 1, b"tiny")]), 3);
+    let b = padded(make_string_batch(&[(3, 1, &[b'b'; 30]), (4, 1, &[b'c'; 25])]), 4);
+    let out = Batch::concat(a.schema(), [a.as_mem_batch(), b.as_mem_batch()].into_iter());
+    assert_eq!(
+        read_strings(&out),
+        [vec![b'a'; 20], b"tiny".to_vec(), vec![b'b'; 30], vec![b'c'; 25]]
+    );
+    assert_eq!(out.blob.len(), a.blob.len() + b.blob.len());
+    assert_eq!(out.dead_heap, 3 + 4);
+}
+
+/// A source more than a quarter dead is relocated cell by cell, not carried: its
+/// padding never reaches the output.
+#[test]
+fn a_wasteful_source_relocates_rather_than_adopts() {
+    let live = make_string_batch(&[(1, 1, &[b'a'; 20])]);
+    let wasteful = padded(make_string_batch(&[(2, 1, &[b'b'; 20])]), 100);
+    assert!(super::super::merge::heap_is_wasteful(
+        wasteful.dead_heap,
+        wasteful.blob.len()
+    ));
+    let out = Batch::concat(
+        live.schema(),
+        [live.as_mem_batch(), wasteful.as_mem_batch()].into_iter(),
+    );
+    assert_eq!(read_strings(&out), [vec![b'a'; 20], vec![b'b'; 20]]);
+    assert_eq!(out.blob.len(), 40, "the carried heap and the relocated span alone");
+    assert_eq!(out.dead_heap, 0);
+}
+
+/// `trimmed` keeps a heap at most a quarter dead and compacts one past it,
+/// keeping rows, order and layout.
+#[test]
+fn trimmed_compacts_past_a_quarter_dead() {
+    // 60 live bytes: 20 dead is exactly a quarter of 80, 21 is past it.
+    let rows: [(u64, i64, &[u8]); 2] = [(1, 1, &[b'a'; 20]), (2, 1, &[b'b'; 40])];
+    let kept = padded(make_string_batch(&rows), 20).trimmed();
+    assert_eq!((kept.blob.len(), kept.dead_heap), (80, 20), "a quarter dead is carried");
+
+    let mut overcounted = make_string_batch(&rows);
+    overcounted.dead_heap = 60;
+    let measured = overcounted.trimmed();
+    assert_eq!(
+        (measured.blob.len(), measured.dead_heap),
+        (60, 0),
+        "an overcount is measured down"
+    );
+
+    let compacted = padded(make_string_batch(&rows), 21).trimmed();
+    assert_eq!((compacted.blob.len(), compacted.dead_heap), (60, 0));
+    assert_eq!(read_strings(&compacted), [vec![b'a'; 20], vec![b'b'; 40]]);
+    assert_eq!(compacted.layout, Layout::Consolidated);
 }

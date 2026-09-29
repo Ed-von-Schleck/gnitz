@@ -113,7 +113,8 @@ pub fn append_frame(
     out.resize(at + frame_head_size(blob.len(), schema.map(<[u8]>::len)), 0);
     encode_frame_head(&mut out[at..], hdr, blob, schema, data.is_some());
     if let Some(regions) = data {
-        crate::wal::append_block(regions, out);
+        // A client claims no dead heap bytes.
+        crate::wal::append_block(regions, 0, out);
     }
 }
 

@@ -333,7 +333,7 @@ fn write_3col_shard(path: &str, rows: &[(u64, i64, i64, i64)], schema: &SchemaDe
         .iter()
         .map(|&(pk, w, c1, c2)| (pk.to_be_bytes().to_vec(), w, 0, vec![c1, c2]))
         .collect();
-    shard_file::write_i64_shard(path, schema, &rows, &[], ShardWriteOpts::default());
+    shard_file::write_i64_shard(path, schema, &rows, ShardWriteOpts::default());
 }
 
 /// Read all rows from a 3-col shard as (pk, weight, col1, col2).
@@ -1184,7 +1184,7 @@ fn for_compaction_bench() {
                 let rows: Vec<_> = (0..per)
                     .map(|i| ((i as u64).to_be_bytes().to_vec(), 1, 0, vec![s as i64, 3 * i as i64]))
                     .collect();
-                shard_file::write_i64_shard(&path, &schema, &rows, &[], ShardWriteOpts::COMPACTION);
+                shard_file::write_i64_shard(&path, &schema, &rows, ShardWriteOpts::COMPACTION);
                 MappedShard::open(&path, &schema).unwrap()
             })
             .collect();

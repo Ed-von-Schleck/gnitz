@@ -133,7 +133,7 @@ use crate::schema::key::compare_pk_bytes;
 use crate::schema::payload_order::compare_full_rows;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::BatchBuilder;
-use crate::test_support::{make_schema_u128_i64, pk_payload_schema, pk_u64_two_i64_schema};
+use crate::test_support::{make_schema_u128_i64, make_string_batch, pk_payload_schema, pk_u64_two_i64_schema};
 
 /// Build an owned `Batch` from a row tuple list. Tests obtain a `MemBatch`
 /// view via `batch.as_mem_batch()`.
@@ -1367,5 +1367,85 @@ mod opk_consolidate_proptest {
             let s = schemas()[si];
             assert_consolidate_matches_reference(&s, &rows);
         }
+    }
+}
+
+// ── Carried heaps: dead-byte accounting and read-back ───────────────────
+
+/// Every row as `(pk, weight, bytes)`.
+fn rows_of(b: &Batch) -> Vec<(u128, i64, Vec<u8>)> {
+    (0..b.count)
+        .map(|row| {
+            let s = crate::test_support::read_german_string(b, 0, row);
+            (b.get_pk(row), b.get_weight(row), s)
+        })
+        .collect()
+}
+
+/// A pair that cancels leaves both its rows' spans behind; a pair that sums
+/// keeps one and leaves the other's.
+#[test]
+fn merged_consolidated_charges_the_rows_the_fold_drops() {
+    let schema = crate::test_support::make_schema_pk_u64_payload_string();
+    let (x, y) = ([b'x'; 20], [b'y'; 30]);
+    let a = make_string_batch(&[(1, 1, &x), (2, 1, &y)]);
+
+    let cancel = a.merged_consolidated(&make_string_batch(&[(1, -1, &x)]), &schema);
+    assert_eq!(rows_of(&cancel), [(2, 1, y.to_vec())]);
+    assert_eq!(cancel.dead_heap, 2 * x.len(), "both rows of the cancelled pair");
+
+    let summed = a.merged_consolidated(&make_string_batch(&[(1, 2, &x)]), &schema);
+    assert_eq!(rows_of(&summed), [(1, 3, x.to_vec()), (2, 1, y.to_vec())]);
+    assert_eq!(summed.dead_heap, x.len(), "the other side's copy of the summed row");
+}
+
+/// A merge that drops nothing carries both heaps whole with nothing dead.
+#[test]
+fn an_append_only_merge_charges_nothing() {
+    let schema = crate::test_support::make_schema_pk_u64_payload_string();
+    let a = make_string_batch(&[(1, 1, &[b'a'; 20]), (3, 1, &[b'c'; 20])]);
+    let b = make_string_batch(&[(2, 1, &[b'b'; 20]), (4, 1, &[b'd'; 20])]);
+    let out = a.merged_consolidated(&b, &schema);
+    assert_eq!(out.dead_heap, 0);
+    assert_eq!(out.blob().len(), a.blob().len() + b.blob().len());
+    assert_eq!(out.count, 4);
+}
+
+/// The carried arm reads back what Z-set `+` defines, across galloped runs of
+/// either side and a shared-PK group that interleaves both sides and folds an
+/// equal element — for both carried heaps, and with each side relocating.
+#[test]
+fn a_carried_merge_reads_back_every_string() {
+    use std::collections::BTreeMap;
+    let schema = crate::test_support::make_schema_pk_u64_payload_string();
+    let v = |c: u8, n: usize| vec![c; n];
+    let (p, q, r, s, t) = (v(b'p', 14), v(b'q', 40), v(b'r', 25), v(b's', 33), v(b't', 17));
+    let a_rows: Vec<(u64, i64, &[u8])> = vec![(1, 1, &p), (2, 1, b"short"), (5, 1, &q), (5, 2, &s), (9, 1, &t)];
+    let b_rows: Vec<(u64, i64, &[u8])> = vec![(3, 1, &r), (4, 1, &p), (5, 1, &r), (5, -2, &s), (8, 1, &q)];
+    let mut want: BTreeMap<(u128, Vec<u8>), i64> = BTreeMap::new();
+    for &(pk, w, bytes) in a_rows.iter().chain(&b_rows) {
+        *want.entry((pk as u128, bytes.to_vec())).or_default() += w;
+    }
+    let want: Vec<(u128, i64, Vec<u8>)> = want
+        .into_iter()
+        .filter(|&(_, w)| w != 0)
+        .map(|((pk, bytes), w)| (pk, w, bytes))
+        .collect();
+
+    for (pad_a, pad_b) in [(0, 0), (1000, 0), (0, 1000)] {
+        let pad = |b: Batch, n: usize| {
+            let mut b = b;
+            b.blob.extend(std::iter::repeat_n(0u8, n));
+            b.dead_heap += n;
+            b
+        };
+        let a = pad(make_string_batch(&a_rows), pad_a);
+        let b = pad(make_string_batch(&b_rows), pad_b);
+        let out = a.merged_consolidated(&b, &schema);
+        assert_eq!(rows_of(&out), want, "padding ({pad_a}, {pad_b})");
+        assert!(
+            out.blob().len() < 1000,
+            "a wasteful side relocates rather than carrying its padding"
+        );
     }
 }

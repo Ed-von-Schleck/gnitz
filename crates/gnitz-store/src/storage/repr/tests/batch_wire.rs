@@ -115,6 +115,7 @@ fn a_zero_row_block_carrying_heap_bytes_decodes_to_an_empty_heap() {
     let schema = make_schema_pk_u64_payload_string();
     let mut empty = Batch::empty_with_schema(&schema);
     empty.blob.extend_from_slice(b"heap bytes no row references");
+    empty.dead_heap = empty.blob.len();
     let block = encode_to_wire_vec(&empty);
 
     let decoded = Batch::decode_from_wal_block(&block, &schema).expect("a zero-row block decodes");
@@ -189,7 +190,7 @@ fn string_rows(rows: &[(u64, &str)]) -> (SchemaDescriptor, Batch) {
 /// its own rows reference, keeps every cell's content, and keeps the source's
 /// layout claim — which is what the frame encoder stamps into the wire flags.
 #[test]
-fn wire_chunk_compacts_the_heap_and_inherits_the_layout() {
+fn a_compacted_subrange_carries_only_its_spans_and_the_layout() {
     let (_schema, mut src) = string_rows(&[
         (1, "the first long value"),
         (2, "the second long value"),
@@ -198,7 +199,7 @@ fn wire_chunk_compacts_the_heap_and_inherits_the_layout() {
     ]);
     src.certify_layout(super::super::batch::Layout::Consolidated);
 
-    let chunk = src.wire_chunk(1, 2);
+    let chunk = src.compacted(1..3);
     assert_eq!(chunk.len(), 2);
     assert!(
         chunk.blob.len() < src.blob.len(),
@@ -342,4 +343,67 @@ fn a_scattered_block_that_overflows_its_buffer_is_refused() {
     );
     let mut out = vec![0u8; fixed + 200];
     assert_eq!(src.encode_scattered_to_wire(&[0, 1], &mut out), Some(fixed + 200));
+}
+
+/// An engine block states its batch's dead-byte bound and the engine decode
+/// adopts it.
+#[test]
+fn dead_heap_round_trips_an_engine_block() {
+    use crate::test_support::{make_batch_bytes, make_schema_pk_u64_payload_string};
+    let schema = make_schema_pk_u64_payload_string();
+    let mut b = make_batch_bytes(&schema, &[(1, 1, &[b'a'; 20]), (2, 1, &[b'b'; 30])]);
+    b.blob.extend_from_slice(&[0; 7]);
+    b.dead_heap = 7;
+    let block = encode_to_wire_vec(&b);
+    assert_eq!(gnitz_wire::read_u32_le(&block, wal::WAL_OFF_HEAP_DEAD), 7);
+    let decoded = Batch::decode_from_wal_block(&block, &schema).unwrap();
+    assert_eq!((decoded.dead_heap, decoded.blob.len()), (7, b.blob.len()));
+}
+
+/// A foreign block's header is not trusted: the decode measures the heap,
+/// counting a span two cells share once, the overlap of two spans once, and an
+/// unreferenced tail whole.
+#[test]
+fn a_foreign_decode_measures_the_dead_heap_exactly() {
+    use crate::test_support::make_schema_pk_u64_payload_string;
+    let schema = make_schema_pk_u64_payload_string();
+    let heap: Vec<u8> = (0..62u8).collect();
+    let cell = |start: usize, len: usize| {
+        let mut c = [0u8; 16];
+        c[..4].copy_from_slice(&(len as u32).to_le_bytes());
+        c[4..8].copy_from_slice(&heap[start..start + 4]);
+        c[8..].copy_from_slice(&(start as u64).to_le_bytes());
+        c
+    };
+    // [0, 20) twice, [10, 30) overlapping it: bytes [30, 62) are dead.
+    let cells = [cell(0, 20), cell(0, 20), cell(10, 20)].concat();
+    let pks: Vec<u8> = (1..=3u64).flat_map(|k| k.to_be_bytes()).collect();
+    let weights: Vec<u8> = (0..3).flat_map(|_| 1i64.to_le_bytes()).collect();
+    let nulls = [0u8; 24];
+    let regions: [&[u8]; 5] = [&pks, &weights, &nulls, &cells, &heap];
+    for claimed in [0, 5, heap.len()] {
+        let mut block = vec![0u8; wal::block_size(&regions)];
+        wal::write_block(&regions, claimed, &mut block);
+        let decoded = Batch::decode_foreign_wal_block(&block, &schema).unwrap();
+        assert_eq!(decoded.dead_heap, 32, "header claimed {claimed}");
+        assert_eq!(
+            Batch::decode_from_wal_block(&block, &schema).unwrap().dead_heap,
+            claimed
+        );
+    }
+}
+
+/// A block declaring more dead heap bytes than it has heap is refused.
+#[test]
+fn a_block_declaring_more_dead_than_heap_is_refused() {
+    use crate::test_support::{make_batch_bytes, make_schema_pk_u64_payload_string};
+    let schema = make_schema_pk_u64_payload_string();
+    let b = make_batch_bytes(&schema, &[(1, 1, &[b'a'; 20])]);
+    let mut block = encode_to_wire_vec(&b);
+    gnitz_wire::write_u32_le(&mut block, wal::WAL_OFF_HEAP_DEAD, b.blob.len() as u32 + 1);
+    let mut offsets = [0usize; MAX_BATCH_REGIONS];
+    assert_eq!(
+        decode_mem_batch_from_wal_block(&block, &schema, &mut offsets).err(),
+        Some("block declares more dead heap than heap")
+    );
 }

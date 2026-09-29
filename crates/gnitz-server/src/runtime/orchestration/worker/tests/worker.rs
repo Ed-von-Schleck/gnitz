@@ -445,15 +445,23 @@ fn fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
 
 /// A `fifo` reply that fits goes out as ONE frame over the SOURCE batch —
 /// no sub-batch, so no copy and no heap relocation on the path every `scan_many`
-/// relation takes. The source carries dead heap bytes (what a blob-sharing
-/// filter produces), which a sub-batch would compact away: the frame's byte size
+/// relation takes. The source carries dead heap bytes, which a sub-batch would
+/// compact away: the frame's byte size
 /// is what tells the two paths apart.
 #[test]
 fn fifo_emits_a_fitting_reply_over_the_source_batch() {
     let schema = string_schema();
-    let mut batch = long_string_batch(&schema, &[(1, "a long enough value"), (2, "another long value")]);
-    batch.blob.extend_from_slice(&[0u8; 4096]);
-    let batch = Rc::new(batch);
+    let live = long_string_batch(&schema, &[(1, "a long enough value"), (2, "another long value")]);
+    // The same rows over a heap padded with 4096 unreferenced bytes, framed as
+    // an engine block that states them.
+    let mut wire = gnitz_wire::Regions::new();
+    live.wire_regions(&mut wire);
+    let padded = [live.blob(), &[0u8; 4096]].concat();
+    let mut regions: Vec<&[u8]> = wire.to_vec();
+    *regions.last_mut().unwrap() = &padded;
+    let mut block = vec![0u8; gnitz_wire::wal::block_size(&regions)];
+    gnitz_wire::wal::write_block(&regions, 4096, &mut block);
+    let batch = Rc::new(Batch::decode_from_wal_block(&block, &schema).unwrap());
     let (chunk, _) = batch.wire_chunk_within(0, 0, usize::MAX);
     let gnitz_store::storage::WireChunk::Owned(compacted) = chunk else {
         panic!("a heap-bearing batch must relocate into a chunk of its own");
@@ -683,7 +691,7 @@ fn a_long_string_train_reassembles_with_its_weights() {
         .map(|i| (i, format!("value-{i}-{}", "p".repeat(40))))
         .collect();
     let source = long_string_batch(&schema, &rows.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>());
-    assert!(!source.blob.is_empty(), "40+ byte values must live in the heap");
+    assert!(!source.blob().is_empty(), "40+ byte values must live in the heap");
 
     // ~230 B per row, so a 2 KiB budget puts a handful of rows in each frame.
     let budget = 2048;

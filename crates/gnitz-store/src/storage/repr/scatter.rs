@@ -10,8 +10,10 @@ use std::ops::Range;
 
 use super::batch::{write_to_batch, Batch, FIXED_REGION_BYTES};
 use super::batch_pool::PooledBuf;
-use super::merge::{prorated_blob_cap, ColPtr, ColumnarSource, DirectWriter, MemBatch, UnifiedSource};
-use crate::schema::SchemaDescriptor;
+use super::merge::{
+    carried_dead, prorated_blob_cap, row_long_bytes, ColPtr, ColumnarSource, DirectWriter, MemBatch, UnifiedSource,
+};
+use crate::schema::{SchemaDescriptor, SchemaFacts};
 
 /// Instantiate `$f` at the const width matching `$w`, which is also passed on.
 /// The literal width keeps the per-row copy a load/store instead of a `memcpy`
@@ -195,11 +197,17 @@ pub(crate) fn scatter_unified_sources(
     for (pi, col) in schema.payload_columns() {
         let cs = col.size() as usize;
         if col.type_code.is_german_string() {
-            // Blob relocation is per-row regardless; no way to batch.
             for (out, &(si, ri, _)) in rows.iter().enumerate() {
                 let src = unsafe { sources.get_unchecked(si as usize) };
                 let src_struct = unsafe { cols.get_unchecked(src.cols_off + pi).row(ri as usize, 16) };
-                writer.write_string_cell(pi, src_struct, src.blob, base + out);
+                match src.heap_at {
+                    Some(heap_at) => {
+                        let dst = &mut writer.col_bufs[pi][(base + out) * 16..(base + out + 1) * 16];
+                        dst.copy_from_slice(src_struct);
+                        gnitz_wire::shift_german_string_heaps(dst, heap_at);
+                    }
+                    None => writer.write_string_cell(pi, src_struct, src.blob, base + out),
+                }
             }
         } else {
             let dst = &mut writer.col_bufs[pi][base * cs..];
@@ -351,6 +359,60 @@ impl<'a> UnifiedSet<'a> {
             scatter_unified_sources(&self.sources, &self.cols, rows, writer);
         })
     }
+}
+
+/// [`UnifiedSet::materialize`] over whole `sources`, each heap carried whole
+/// when [`carried_dead`] prefers it for the rows `rows` keeps of that source.
+pub(crate) fn materialize_carrying(
+    sources: &[MemBatch<'_>],
+    schema: &SchemaDescriptor,
+    rows: &[(u32, u32, i64)],
+) -> Batch {
+    let mut set = UnifiedSet::whole(sources, schema);
+    let mask = schema.string_payload_slots();
+    if mask == 0 {
+        return set.materialize(rows, rows.len());
+    }
+    let mut kept = vec![0usize; sources.len()];
+    for &(si, _, _) in rows {
+        kept[si as usize] += 1;
+    }
+    // A carried heap lands after the ones before it in a fresh, empty heap.
+    let (mut heap_end, mut dead) = (0, 0);
+    let (mut relocated_blob, mut relocated_rows, mut relocated_out) = (0, 0, 0);
+    for (si, s) in sources.iter().enumerate() {
+        let excluded = || {
+            let all: usize = (0..s.count).map(|row| row_long_bytes(s, mask, row)).sum();
+            let rows = rows.iter().filter(|&&(src, _, _)| src as usize == si);
+            all - rows
+                .map(|&(_, row, _)| row_long_bytes(s, mask, row as usize))
+                .sum::<usize>()
+        };
+        match carried_dead(s.blob.len(), s.dead_heap, s.count, kept[si], excluded) {
+            Some(d) => {
+                set.sources[si].heap_at = Some(heap_end);
+                heap_end += s.blob.len();
+                dead += d;
+            }
+            None => {
+                relocated_blob += s.blob.len();
+                relocated_rows += s.count;
+                relocated_out += kept[si];
+            }
+        }
+    }
+    let blob_cap = heap_end + prorated_blob_cap(relocated_blob, relocated_rows, relocated_out);
+    let mut out = write_to_batch(schema, rows.len(), blob_cap, |writer| {
+        for (src, view) in sources.iter().zip(&set.sources) {
+            if let Some(at) = view.heap_at {
+                let base = writer.adopt_heap(src.blob);
+                debug_assert_eq!(base, at, "carried heaps land in source order");
+            }
+        }
+        scatter_unified_sources(&set.sources, &set.cols, rows, writer);
+    });
+    out.charge_dead(dead);
+    out
 }
 
 // ===========================================================================

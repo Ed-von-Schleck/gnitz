@@ -129,8 +129,7 @@ fn test_map_blob_passthrough_and_fallback() {
         assert_eq!(crate::test_support::read_german_string(&out, 1, 1), b"cd");
     }
 
-    // (B) Drop the long string s2 → passthrough gated OFF (a dropped string column
-    // would leave dead heap in a shared blob), so the relocate path runs and the
+    // (B) Drop the long string s2 → passthrough gated OFF, so the relocate path runs and the
     // output blob carries only the referenced (here empty, short-inline) spans.
     {
         let batch = build(&in_schema);
@@ -142,10 +141,10 @@ fn test_map_blob_passthrough_and_fallback() {
         assert_eq!(crate::test_support::read_german_string(&out, 0, 0), b"ab");
         assert_eq!(crate::test_support::read_german_string(&out, 0, 1), b"cd");
         assert!(
-            out.blob.len() < batch.blob.len(),
+            out.blob().len() < batch.blob().len(),
             "dropped-string relocate must not copy the dead heap ({} vs {})",
-            out.blob.len(),
-            batch.blob.len(),
+            out.blob().len(),
+            batch.blob().len(),
         );
     }
 }
@@ -409,10 +408,6 @@ fn string_emit_composes_with_blob_passthrough() {
         b"A-LONG-VALUE-PAST-TWELVE"
     );
     assert_eq!(crate::test_support::read_german_string(&out, 1, 1), b"SHORT");
-    assert!(
-        !out.shares_blob_with(&batch.as_mem_batch()),
-        "appending the emitted bytes must end the sharing, so a later append relocates"
-    );
 }
 
 /// A NULL string row must ship a zeroed cell *and* its bitmap bit — a
@@ -818,7 +813,7 @@ fn map_ranges_bench() {
         n_selected += 1;
         for _ in 0..passes {
             let out = plan.evaluate_map_batch(black_box(src));
-            acc = acc.wrapping_add(out.count).wrapping_add(out.blob.len());
+            acc = acc.wrapping_add(out.count).wrapping_add(out.blob().len());
             black_box(&out);
         }
     }
@@ -838,7 +833,7 @@ fn map_ranges_bench() {
             for _ in 0..passes {
                 keeper.clear();
                 plan.append_map_ranges(black_box(src), &mut keeper, ranges);
-                acc = acc.wrapping_add(keeper.count).wrapping_add(keeper.blob.len());
+                acc = acc.wrapping_add(keeper.count).wrapping_add(keeper.blob().len());
             }
             let survivors: usize = ranges.iter().map(|&(s, e)| e - s).sum();
             println!(
