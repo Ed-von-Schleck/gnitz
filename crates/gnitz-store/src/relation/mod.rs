@@ -98,9 +98,8 @@ impl SecondaryIndex {
         self.store.held().open_cursor()
     }
 
-    /// A cursor positioned on the key band `r` names under this index's key spec,
-    /// and the raw entry count in it.
-    pub(crate) fn cursor_over(&self, r: &gnitz_wire::KeyRange) -> (ReadCursor, usize) {
+    /// A cursor positioned on the key band `r` names under this index's key spec.
+    pub(crate) fn cursor_over(&self, r: &gnitz_wire::KeyRange) -> ReadCursor {
         let t = self.store.held();
         t.range_cursor(self.key_spec.range_keys(t.schema().pk_stride(), r))
     }
@@ -305,7 +304,7 @@ impl Relation {
             KeyCut::above(prefix),
             table.schema().pk_stride(),
         );
-        table.range_cursor(band).0.for_each_positive_while(|_| true, f);
+        table.range_cursor(band).for_each_positive_while(|_| true, f);
     }
 
     /// Materialize every row of this relation's store whose net weight is non-zero.

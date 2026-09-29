@@ -756,14 +756,10 @@ fn a_long_string_whose_offset_overruns_the_blob_reads_back_empty() {
 }
 
 // ---------------------------------------------------------------------------
-// seek_range_bytes' raw window count — the index-vs-full-scan gate reads the
-// range size off the seek that positions the cursor, so it must be exact over
-// raw entries.
+// The range seek's size estimate
 // ---------------------------------------------------------------------------
 
-/// Count `[start, end)` the expensive way: drive the merge and count the groups
-/// a walk would step over, raw (every run's entry, ghosts and duplicates
-/// included) rather than consolidated.
+/// Count `[start, end)` raw: every run's entry, ghosts and duplicates included.
 fn counted_walk_raw(
     batches: &[Rc<Batch>],
     shards: &[Rc<MappedShard>],
@@ -793,47 +789,43 @@ fn counted_walk_raw(
     n
 }
 
-/// Over a multi-run cursor (memtable runs + a shard), the count `seek_range_bytes`
-/// returns equals a counted walk of `[start, end)` — including a run that holds no
-/// entry in range, and an `end = None` arm that counts to the end of every run.
-/// A fresh cursor per range, because the window only ever narrows.
+/// After a range seek, `estimated_length()` lies between the live rows the walk
+/// emits and the raw window.
 #[test]
-fn seek_range_bytes_counts_the_raw_window() {
+fn range_seek_estimate_brackets_the_walk() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u128_i64();
 
-    // Overlapping runs: run A and the shard both hold pk=20 (a cross-run
-    // duplicate the raw count counts twice, by contract), and run C holds
-    // nothing inside [10, 40).
+    // (20, 200) is a cross-run duplicate, (10, 100) a ghost; C holds nothing in [10, 40).
     let a = make_batch(&[(5, 1, 50), (20, 1, 200), (30, 1, 300)]);
-    let b = make_batch(&[(10, 1, 100), (25, 1, 250), (60, 1, 600)]);
+    let b = make_batch(&[(10, -1, 100), (25, 1, 250), (60, 1, 600)]);
     let c = make_batch(&[(80, 1, 800), (90, 1, 900)]);
-    let shard = write_test_shard(&dir, &schema, 0, &[(20, 1, 201), (35, 1, 350), (70, 1, 700)]);
+    let d = make_batch(&[(10, 1, 100)]);
+    let shard = write_test_shard(&dir, &schema, 0, &[(20, 1, 200), (35, 1, 350), (70, 1, 700)]);
 
-    let batches = [Rc::clone(&a), Rc::clone(&b), Rc::clone(&c)];
+    let batches = [Rc::clone(&a), Rc::clone(&b), Rc::clone(&c), Rc::clone(&d)];
     let shards = [Rc::clone(&shard)];
 
     for (lo, hi) in [
-        (10u128, Some(40u128)), // spans all four runs; C contributes 0
+        (10u128, Some(40u128)), // spans every run; C contributes 0
         (0, Some(1000)),        // everything
         (0, Some(0)),           // empty
         (100, Some(200)),       // past every entry
-        (20, Some(21)),         // the cross-run duplicate group alone
+        (10, Some(11)),         // the ghost alone
+        (20, Some(21)),         // the cross-run duplicate alone
         (10, None),             // unbounded arm — to the end of every run
         (0, None),
     ] {
-        let want = counted_walk_raw(&batches, &shards, schema, lo, hi);
+        let raw = counted_walk_raw(&batches, &shards, schema, lo, hi);
         let mut cursor = create_read_cursor(&batches, &shards, schema);
-        let got = cursor.seek_range_bytes(&lo.to_be_bytes(), hi.map(|h| h.to_be_bytes()).as_ref().map(|k| &k[..]));
-        assert_eq!(got, want, "seek_range_bytes([{lo}, {hi:?}))");
+        cursor.seek_range_bytes(&lo.to_be_bytes(), hi.map(|h| h.to_be_bytes()).as_ref().map(|k| &k[..]));
+        let estimate = cursor.estimated_length();
+        let live = cursor.materialize().count;
+        assert!(
+            live <= estimate && estimate <= raw,
+            "[{lo}, {hi:?}): live {live}, estimate {estimate}, raw {raw}"
+        );
     }
-    // The cross-run duplicate is counted raw, once per run — the gate's inputs
-    // are both raw counts, so both err the same direction.
-    let mut cursor = create_read_cursor(&batches, &shards, schema);
-    assert_eq!(
-        cursor.seek_range_bytes(&20u128.to_be_bytes(), Some(&21u128.to_be_bytes()[..])),
-        2
-    );
 }
 
 // -- Live-source mode derivation ---------------------------------------

@@ -129,7 +129,7 @@ impl RelationRegistry {
             KeyCut::above(&cut_tick.to_be_bytes()),
             feed.schema().pk_stride(),
         );
-        Ok(Rc::new(feed.range_cursor(band).0.materialize().unstamped(&view)))
+        Ok(Rc::new(feed.range_cursor(band).materialize().unstamped(&view)))
     }
 }
 

@@ -53,7 +53,7 @@ impl CircuitState {
             .into_iter()
             .map(|(child, schema)| {
                 // Unbounded: a bounded view's hydration reads these traces back.
-                reg.open_child(
+                reg.open_child_as(
                     view_id,
                     ChildKind::Scratch(&child),
                     schema,

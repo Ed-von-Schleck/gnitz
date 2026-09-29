@@ -127,12 +127,12 @@ fn open_range(entry: &Relation, r: KeyRange) -> Result<(SourceCursor, ReadBound)
     let cols = entry.bound_cols(r.cols(), "open_bound")?;
     let schema = entry.schema();
     if r.walks_pk(schema.pk_cols()) {
-        let (cursor, _) = entry.store().held().range_cursor(schema.pk_range_keys(&r));
+        let cursor = entry.store().held().range_cursor(schema.pk_range_keys(&r));
         return Ok((SourceCursor::Full(Box::new(cursor)), ReadBound::None));
     }
     if let Some(ic) = entry.index_on(cols.as_slice()) {
-        let (idx, matches) = ic.cursor_over(&r);
-        if matches <= entry.store().held().estimated_rows() / INDEX_SCAN_RATIO {
+        let idx = ic.cursor_over(&r);
+        if idx.estimated_length() <= entry.store().held().estimated_rows() / INDEX_SCAN_RATIO {
             let walk = BoundedIndexCursor {
                 idx,
                 src: PkSetGather::new(entry.cursor(), PkKeys::from_sorted(schema.pk_stride(), Vec::new())),

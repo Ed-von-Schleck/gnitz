@@ -20,9 +20,6 @@ impl RelationRegistry {
     /// `Err`, entering nothing, otherwise.
     pub fn reopen_view(&mut self, spec: RelationSpec) -> Result<(), String> {
         let stores = self.build_relation_store(spec, true)?;
-        if !stores.0.held().resumed_from_checkpoint() {
-            return Err(format!("view {} did not reopen from its manifest", spec.id));
-        }
         self.enter(spec, stores);
         Ok(())
     }
@@ -90,7 +87,7 @@ impl RelationRegistry {
                 )
             }
         };
-        let rows = self.open_child(id, ChildKind::Rows, schema, recovery, budgets)?;
+        let rows = self.open_child_as(id, ChildKind::Rows, schema, recovery, budgets)?;
         let delta = match feed {
             Some(budget) if schema.placement().counts_on(self.slot.rank) => {
                 // Admitted by the catalog precheck; a host registering outside it gets the refusal here.
@@ -109,6 +106,25 @@ impl RelationRegistry {
             _ => None,
         };
         Ok((Store::Held(Box::new(rows)), delta))
+    }
+
+    /// [`Self::open_child`], `Err` unless the store opened under `recovery` itself —
+    /// a resume that found no manifest at its generation.
+    pub(super) fn open_child_as(
+        &self,
+        id: u64,
+        kind: ChildKind<'_>,
+        schema: SchemaDescriptor,
+        recovery: RecoverySource,
+        budgets: StoreBudgets,
+    ) -> Result<Table, String> {
+        let table = self.open_child(id, kind, schema, recovery, budgets)?;
+        if table.recovery_source() != recovery {
+            return Err(format!(
+                "relation {id}: {kind:?} store did not resume from its manifest"
+            ));
+        }
+        Ok(table)
     }
 
     /// This process's `kind` child store of relation `id`.

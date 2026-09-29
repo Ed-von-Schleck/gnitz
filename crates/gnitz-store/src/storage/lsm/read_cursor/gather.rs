@@ -5,8 +5,9 @@
 
 use gnitz_wire::PkKeys;
 
-use super::{ReadCursor, SkeletonKeys};
+use super::{empty_cursor, from_runs_at, ReadCursor, SkeletonKeys};
 use crate::schema::SchemaDescriptor;
+use crate::storage::lsm::run::Run;
 use crate::storage::repr::batch::{Batch, Layout};
 
 pub struct PkSetGather {
@@ -23,6 +24,21 @@ impl PkSetGather {
         let mut gather = PkSetGather { cursor, keys, next: 0 };
         gather.position();
         gather
+    }
+
+    /// A gather of `keys` over a cursor it opens on `runs` at the first key.
+    pub(crate) fn over_runs(
+        runs: impl IntoIterator<Item = Run>,
+        schema: SchemaDescriptor,
+        cap: usize,
+        keys: PkKeys,
+    ) -> Self {
+        debug_assert_eq!(keys.stride(), schema.pk_stride());
+        let cursor = match keys.iter().next() {
+            Some(first) => from_runs_at(runs, schema, cap, first),
+            None => empty_cursor(schema),
+        };
+        PkSetGather { cursor, keys, next: 0 }
     }
 
     /// Start over on `keys` against the same snapshot.

@@ -167,27 +167,18 @@ impl ReadCursor {
         self.advance_merge_with(payload);
     }
 
-    /// Position the cursor on the half-open OPK range `[start, end)` and report the
-    /// **raw** entry count in that window — cross-run duplicates and ghosts
-    /// included, so an upper bound on the live groups a walk emits, and free,
-    /// being the byproduct of the searches the seek runs anyway. Clamping each
-    /// source at `end` is what makes every walk exhaust at the cut with no per-row
-    /// boundary check; the bound only narrows, and `rewind` keeps it.
-    pub(crate) fn seek_range_bytes(&mut self, start: &[u8], end: Option<&[u8]>) -> usize {
+    /// Position the cursor on the half-open OPK range `[start, end)`, clamping every
+    /// source at `end` for the cursor's life, `rewind` included.
+    pub(crate) fn seek_range_bytes(&mut self, start: &[u8], end: Option<&[u8]>) {
         debug_assert_eq!(start.len(), self.schema.pk_stride());
         debug_assert!(end.is_none_or(|e| e.len() == self.schema.pk_stride()));
-        let mut raw = 0usize;
         for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
             state.position = src.find_lower_bound_bytes(start);
             if let Some(end) = end {
                 state.count = state.count.min(src.find_lower_bound_bytes(end));
             }
-            // Each run is sorted, so the clamped count never sorts below the
-            // lower bound.
-            raw += state.count.saturating_sub(state.position);
         }
         self.rebuild_and_advance();
-        raw
     }
 
     /// Reset every source to its first row, positioning the cursor at the first
@@ -694,28 +685,16 @@ pub(crate) fn from_runs_at(
     build(runs, schema, cap, |c| c.reposition_to(key))
 }
 
-/// [`from_runs`] positioned on the OPK band `[start, end)`, and its raw entry count
-/// as [`ReadCursor::seek_range_bytes`] reports it.
+/// [`from_runs`] positioned on the OPK band `[start, end)`, as
+/// [`ReadCursor::seek_range_bytes`].
 pub(crate) fn from_runs_in_band(
     runs: impl IntoIterator<Item = Run>,
     schema: SchemaDescriptor,
     cap: usize,
     start: &[u8],
     end: Option<&[u8]>,
-) -> (ReadCursor, usize) {
-    let mut raw = 0;
-    let cursor = build(runs, schema, cap, |c| raw = c.seek_range_bytes(start, end));
-    (cursor, raw)
-}
-
-/// [`from_runs`] without the initial positioning: the cursor stays invalid until
-/// something seeks it.
-pub(crate) fn from_runs_unpositioned(
-    runs: impl IntoIterator<Item = Run>,
-    schema: SchemaDescriptor,
-    cap: usize,
 ) -> ReadCursor {
-    build(runs, schema, cap, |_| {})
+    build(runs, schema, cap, |c| c.seek_range_bytes(start, end))
 }
 
 #[inline]

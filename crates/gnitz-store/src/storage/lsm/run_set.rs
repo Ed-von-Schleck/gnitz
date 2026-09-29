@@ -13,7 +13,7 @@ use std::cell::OnceCell;
 use std::rc::Rc;
 
 use super::bloom::BloomFilter;
-use crate::schema::key::probe_key;
+use crate::schema::key::{pk_bytes_eq, pk_in_range, pk_ranges_overlap, probe_key, PkBuf};
 use crate::schema::SchemaDescriptor;
 use crate::storage::repr::batch::Batch;
 use crate::storage::repr::merge::{self, MemBatch};
@@ -24,6 +24,14 @@ pub(super) const FOLD_THRESHOLD: usize = 16;
 
 /// Rough bytes per row, used to size the bloom from a byte budget.
 const EST_BYTES_PER_ROW: usize = 40;
+
+fn pk_min(run: &Batch) -> &[u8] {
+    run.get_pk_bytes(0)
+}
+
+fn pk_max(run: &Batch) -> &[u8] {
+    run.get_pk_bytes(run.count - 1)
+}
 
 /// A batch as a [`RunSet`] holds it: [`Batch::trimmed`], since the set charges
 /// only its rows' bytes.
@@ -84,8 +92,33 @@ impl RunSet {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn runs(&self) -> &[Rc<Batch>] {
         &self.runs
+    }
+
+    /// The runs whose PK extent meets the inclusive `bound`; `None` takes them all.
+    pub(super) fn runs_overlapping(&self, bound: Option<(PkBuf, PkBuf)>) -> impl Iterator<Item = &Rc<Batch>> {
+        self.runs.iter().filter(move |run| {
+            bound.is_none_or(|(lo, hi)| pk_ranges_overlap(pk_min(run), pk_max(run), lo.pk_bytes(), hi.pk_bytes()))
+        })
+    }
+
+    /// Visit each run holding `key`, newest first, with the row its matches start
+    /// at; `fingerprint` is `key`'s [`probe_key`].
+    pub(super) fn find_pk_bytes(&self, key: &[u8], fingerprint: u64, mut visitor: impl FnMut(&Rc<Batch>, usize)) {
+        if !self.may_contain(fingerprint) {
+            return;
+        }
+        for run in self.runs.iter().rev() {
+            if !pk_in_range(pk_min(run), pk_max(run), key) {
+                continue;
+            }
+            let start = run.find_lower_bound_bytes(key);
+            if start < run.count && pk_bytes_eq(run.get_pk_bytes(start), key) {
+                visitor(run, start);
+            }
+        }
     }
 
     /// How many runs this set holds — one cursor source each.
@@ -191,10 +224,9 @@ impl RunSet {
         self.runs.first().map(|run| TrimmedRun(Rc::clone(run)))
     }
 
-    /// Bloom probe for a PK by its [`probe_key`] — derived by the caller,
-    /// which probes both RAM tiers and every shard with the same key. The first
-    /// probe builds the filter from all live runs.
-    pub(super) fn may_contain(&self, probe_key: u64) -> bool {
+    /// Bloom probe for a PK by its [`probe_key`]. The first probe builds the
+    /// filter from all live runs.
+    fn may_contain(&self, probe_key: u64) -> bool {
         // Answered without building a budget-sized filter.
         if self.runs.is_empty() {
             return false;

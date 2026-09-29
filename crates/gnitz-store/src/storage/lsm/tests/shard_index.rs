@@ -1529,8 +1529,7 @@ fn the_guard_count_comes_back_down_after_the_bytes_do() {
     assert_all_found(&idx, (1..=keys).step_by(101));
 }
 
-/// A read whose key bound is known before the open reaches only the guards
-/// that can own it — where a whole-index gather is Θ(shards) per open.
+/// A range open takes only the shards whose extent meets the range.
 #[test]
 fn a_range_gather_visits_only_the_guards_that_can_own_it() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1552,10 +1551,11 @@ fn a_range_gather_visits_only_the_guards_that_can_own_it() {
     };
 
     assert_eq!(idx.all_shard_arcs_iter().count(), 4);
-    assert_eq!(count(1500, Some(1500)), 1, "a point read routes to one guard");
-    assert_eq!(count(1500, Some(2500)), 2, "a range takes the run it spans");
+    assert_eq!(count(1100, Some(1100)), 1, "a point read routes to one guard");
+    assert_eq!(count(1100, Some(2100)), 2, "a range takes the run it spans");
     assert_eq!(count(0, None), 4, "an open end takes the rest of the key space");
-    assert_eq!(count(0, Some(0)), 1, "below every guard key, guard 0 owns the tail");
+    assert_eq!(count(1500, Some(1500)), 0, "a guard's shard is rejected by its extent");
+    assert_eq!(count(1500, Some(2100)), 1, "an edge guard is rejected by its extent");
 }
 
 // -----------------------------------------------------------------------

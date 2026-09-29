@@ -128,28 +128,22 @@ impl ShardIndex {
         self.all_entries().map(|e| Rc::clone(&e.shard))
     }
 
-    /// Every shard that can hold a key in `[lo, hi]`. Complete because guards
-    /// partition the key line: a key is reachable from exactly one guard per
-    /// level.
+    /// Every shard whose PK extent meets `[lo, hi]`.
     pub(crate) fn shard_arcs_in_range(&self, lo: PkBuf, hi: PkBuf) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
-        let l0 = self
-            .l0
-            .iter()
-            .filter(move |e| pk_ranges_overlap(e.pk_min.pk_bytes(), e.pk_max.pk_bytes(), lo.pk_bytes(), hi.pk_bytes()))
-            .map(|e| Rc::clone(&e.shard));
         let deep = self.levels.iter().flat_map(move |level| {
             let run = level.find_guards_for_range(lo.pk_bytes(), hi.pk_bytes());
-            level.guards[run]
-                .iter()
-                .flat_map(|g| g.entries.iter().map(|e| Rc::clone(&e.shard)))
+            level.guards[run].iter().flat_map(|g| g.entries.iter())
         });
-        l0.chain(deep)
+        self.l0
+            .iter()
+            .chain(deep)
+            .filter(move |e| pk_ranges_overlap(e.pk_min.pk_bytes(), e.pk_max.pk_bytes(), lo.pk_bytes(), hi.pk_bytes()))
+            .map(|e| Rc::clone(&e.shard))
     }
 
-    /// A capacity hint for a cursor over a narrow key range: every L0 shard and one
-    /// per deeper level.
+    /// A capacity hint for a cursor over a range inside one guard per level.
     pub(crate) fn narrow_range_shards(&self) -> usize {
-        self.l0.len() + FLSM_LEVELS
+        self.l0.len() + (FLSM_LEVELS - 1) * GUARD_FILE_THRESHOLD + 1
     }
 
     /// Registered shards across every tier — one cursor source each, which is

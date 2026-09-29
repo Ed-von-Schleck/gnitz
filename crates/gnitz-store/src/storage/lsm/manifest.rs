@@ -177,6 +177,11 @@ pub(crate) fn read_intact(dir: &str) -> Result<Option<Manifest>, StorageError> {
     }
 }
 
+/// The intact manifest in `dir` iff it carries `generation`.
+pub(crate) fn read_at(dir: &str, generation: u64) -> Result<Option<Manifest>, StorageError> {
+    Ok(read_intact(dir)?.filter(|m| m.checkpoint_mark == generation))
+}
+
 /// Stage `bytes` (an [`encode`]d manifest) beside `dir`'s manifest. Does NOT
 /// fdatasync or rename.
 pub(crate) fn prepare(dir: &str, bytes: &[u8]) -> Result<(), StorageError> {

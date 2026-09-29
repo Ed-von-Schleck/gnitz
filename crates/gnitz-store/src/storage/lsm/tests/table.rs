@@ -1513,7 +1513,7 @@ fn a_range_opened_cursor_sees_every_row_the_whole_index_would() {
         let (lo_b, hi_b) = (lo.to_be_bytes(), hi.to_be_bytes());
         let mut whole = t.open_cursor();
         whole.seek_range_bytes(&lo_b, Some(&hi_b));
-        let (mut ranged, _) = t.range_cursor(Some((PkBuf::from_bytes(&lo_b), Some(PkBuf::from_bytes(&hi_b)))));
+        let mut ranged = t.range_cursor(Some((PkBuf::from_bytes(&lo_b), Some(PkBuf::from_bytes(&hi_b)))));
         assert_eq!(drain(&mut ranged), drain(&mut whole), "range [{lo}, {hi})");
     }
 }

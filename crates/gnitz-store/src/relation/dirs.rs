@@ -12,7 +12,7 @@ use gnitz_wire::PkColList;
 
 use super::RelationRegistry;
 use crate::schema::Slot;
-use crate::storage::{manifest_path, read_intact, retire_store, StorageError};
+use crate::storage::{manifest_path, read_at, read_intact, retire_store, StorageError};
 
 /// What a child directory holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -109,7 +109,7 @@ pub(super) fn children_at_generation(rel_dir: &str, num_workers: u32, generation
     cluster_children(num_workers)
         .map(|c| c.dir(rel_dir))
         .chain(scratch.map(|n| format!("{rel_dir}/{n}")))
-        .all(|d| matches!(read_intact(&d), Ok(Some(m)) if m.checkpoint_mark == generation))
+        .all(|d| matches!(read_at(&d, generation), Ok(Some(_))))
 }
 
 /// The caller record of `slot`'s rows child under `rel_dir`; `Ok(None)` without

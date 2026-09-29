@@ -218,7 +218,7 @@ fn a_fed_view_retains_each_round_at_its_own_weight() {
     let stride = feed.schema().pk_stride();
     let mut rounds: Vec<(u64, i64)> = Vec::new();
     let floor = vec![0u8; stride];
-    let (mut cur, _) = feed.range_cursor(Some((gnitz_wire::PkBuf::from_bytes(&floor), None)));
+    let mut cur = feed.range_cursor(Some((gnitz_wire::PkBuf::from_bytes(&floor), None)));
     while cur.valid {
         // The delta PK is `round` big-endian, then the view's own PK.
         let tick = u64::from_be_bytes(cur.current_pk_bytes()[..8].try_into().unwrap());
@@ -350,4 +350,62 @@ fn reopen_view_refuses_a_view_with_no_manifest() {
     registry.reopen_view(spec(7)).expect("a published view reopens");
     assert!(registry.reopen_view(spec(8)).is_err());
     assert!(registry.relation(8).is_none(), "a refused view is not entered");
+}
+
+/// A registered view, its rows and one declared trace `t` published at the
+/// resume generation; returns the view's spec and relation directory.
+fn published_traced_view(registry: &mut RelationRegistry, id: u64) -> (RelationSpec, String) {
+    let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
+    let spec = RelationSpec {
+        id,
+        kind: RelationKind::View(ViewProps::Plain),
+        schema,
+    };
+    let dir = register_entry(registry, id, schema, spec.kind);
+    let mut layout = StateLayout::default();
+    layout.declare("t".to_string(), schema);
+    let mut state = CircuitState::open(registry, id, layout).unwrap();
+    registry.checkpoint_ephemeral([&mut state]).unwrap();
+    (spec, dir)
+}
+
+/// A worker told to resume a view whose rows manifest is gone fails its store
+/// open.
+#[test]
+fn open_stores_refuses_a_resumed_view_without_its_rows() {
+    let base = relation_test_dir("open_stores_resume");
+    let (spec, dir) = published_traced_view(&mut RelationRegistry::new(&base, Slot::SOLO, StoreConfig::default()), 7);
+    let open = || {
+        let mut master = RelationRegistry::master(&base, 1, StoreConfig::default());
+        master.register(spec).unwrap();
+        master.reconcile_child_dirs().unwrap();
+        master.open_stores(0, Residency::Worker, |_| true).map(drop)
+    };
+    open().expect("a published view resumes");
+
+    std::fs::remove_file(ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO }.manifest(&dir)).unwrap();
+    assert!(open().is_err());
+}
+
+/// A resumed view whose declared trace has no manifest at the generation its
+/// rows resumed from refuses to open its operator state.
+#[test]
+fn circuit_state_refuses_a_resumed_trace_without_its_manifest() {
+    let base = relation_test_dir("circuit_state_resume");
+    let (spec, dir) = published_traced_view(&mut RelationRegistry::new(&base, Slot::SOLO, StoreConfig::default()), 7);
+    let open = || {
+        let mut registry = RelationRegistry::new(&base, Slot::SOLO, StoreConfig::default());
+        registry.reopen_view(spec).unwrap();
+        let mut layout = StateLayout::default();
+        layout.declare("t".to_string(), spec.schema);
+        CircuitState::open(&registry, spec.id, layout).map(drop)
+    };
+    open().expect("a published trace resumes");
+
+    let trace = ChildAddr {
+        kind: ChildKind::Scratch("t"),
+        slot: Slot::SOLO,
+    };
+    std::fs::remove_file(trace.manifest(&dir)).unwrap();
+    assert!(open().is_err());
 }
