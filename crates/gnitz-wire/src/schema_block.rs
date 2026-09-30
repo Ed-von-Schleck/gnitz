@@ -144,36 +144,27 @@ pub fn check_same_types(got: &[u8], want: &[u8]) -> Result<(), String> {
     if got == want {
         return Ok(());
     }
-    let mut w = Reader::new(want);
-    let first_difference = decode_all(got, "schema record", |g| {
-        let (want_count, want_pk) = take_header(&mut w)?;
-        let (count, pk) = take_header(g)?;
-        if count != want_count {
-            return Ok(Some(format!("expected {want_count} columns, got {count}")));
-        }
-        if pk != want_pk {
-            return Ok(Some(format!(
-                "expected PK columns {:?}, got {:?}",
-                want_pk.as_slice(),
-                pk.as_slice()
-            )));
-        }
-        let null = |nullable: bool| if nullable { "NULL" } else { "NOT NULL" };
-        for ci in 0..count {
-            let (want_col, col) = (take_col(&mut w)?, take_col(g)?);
-            if col.ty != want_col.ty || col.nullable != want_col.nullable {
-                return Ok(Some(format!(
-                    "column {ci}: expected {} {}, got {} {}",
-                    want_col.ty,
-                    null(want_col.nullable),
-                    col.ty,
-                    null(col.nullable),
-                )));
-            }
-        }
-        Ok(None)
-    })?;
-    first_difference.map_or(Ok(()), |d| Err(format!("Schema mismatch: {d}")))
+    fn layout(record: &[u8]) -> Result<(Vec<(ColType, bool)>, PkIndices), String> {
+        let mut cols = Vec::new();
+        let pk = decode(record, |c| {
+            cols.push((c.ty, c.nullable));
+            Ok(())
+        })?;
+        Ok((cols, pk))
+    }
+    let (want_cols, want_pk) = layout(want)?;
+    let (cols, pk) = layout(got)?;
+    let null = |nullable: bool| if nullable { "NULL" } else { "NOT NULL" };
+    let difference = if cols.len() != want_cols.len() {
+        format!("expected {} columns, got {}", want_cols.len(), cols.len())
+    } else if pk != want_pk {
+        format!("expected PK columns {:?}, got {:?}", want_pk.as_slice(), pk.as_slice())
+    } else if let Some((ci, ((wt, wn), (t, n)))) = want_cols.iter().zip(&cols).enumerate().find(|(_, (w, g))| w != g) {
+        format!("column {ci}: expected {wt} {}, got {t} {}", null(*wn), null(*n))
+    } else {
+        return Ok(());
+    };
+    Err(format!("Schema mismatch: {difference}"))
 }
 
 #[cfg(test)]

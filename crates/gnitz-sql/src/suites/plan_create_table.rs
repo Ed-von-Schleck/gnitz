@@ -3,7 +3,7 @@
 //! and the bundle a plan carries.
 
 use gnitz_core::{FkTarget, InlineForeignKey, InlineUniqueIndex};
-use gnitz_wire::{RelClass, TypeCode};
+use gnitz_wire::{RelClass, TableDistribution, TypeCode};
 
 use super::*;
 
@@ -47,8 +47,91 @@ fn fk_catalog() -> Catalog<'static> {
 
 // ── the PRIMARY KEY precedence table ─────────────────────────────────────────
 
-/// Every ordering the two PK spellings can be written in. Rows 1-3 and 5 are
-/// also pinned end-to-end in `engine_ddl.rs`; row 4 is pinned only here.
+/// The PK list, not column order, decides the key order; every PK column is an
+/// integer made NOT NULL, one to four columns of any width.
+#[test]
+fn primary_key_admission() {
+    use TypeCode::*;
+    let cat = catalog(vec![]);
+    for (sql, want) in [
+        ("CREATE TABLE t (id INT PRIMARY KEY)", &[(0, I32)][..]),
+        ("CREATE TABLE t (id SMALLINT PRIMARY KEY)", &[(0, I16)]),
+        ("CREATE TABLE t (id BIGINT, name TEXT, PRIMARY KEY (ID))", &[(0, I64)]),
+        (
+            "CREATE TABLE t (a BIGINT UNSIGNED, b INT UNSIGNED, PRIMARY KEY (a, b))",
+            &[(0, U64), (1, U32)],
+        ),
+        (
+            "CREATE TABLE t (v BIGINT NOT NULL, a BIGINT UNSIGNED, b BIGINT UNSIGNED, PRIMARY KEY (b, a))",
+            &[(2, U64), (1, U64)],
+        ),
+        (
+            "CREATE TABLE t (a UUID, b UUID, c UUID, d UUID, v BIGINT, PRIMARY KEY (a, b, c, d))",
+            &[(0, UUID), (1, UUID), (2, UUID), (3, UUID)],
+        ),
+    ] {
+        let s = created(&cat, sql).schema;
+        let got: Vec<(u32, TypeCode)> = s.pk_cols.iter().map(|&c| (c, s.columns[c as usize].ty.tc)).collect();
+        assert_eq!(got, want, "{sql}");
+        assert!(s.pk_cols.iter().all(|&c| !s.columns[c as usize].is_nullable), "{sql}");
+    }
+    for (sql, needle) in [
+        ("CREATE TABLE t (id INT)", "primary key must name at least one column"),
+        (
+            "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, PRIMARY KEY (a, a))",
+            "duplicate column",
+        ),
+        (
+            "CREATE TABLE t (a TINYINT UNSIGNED, b TINYINT UNSIGNED, c TINYINT UNSIGNED, d TINYINT UNSIGNED, \
+             e TINYINT UNSIGNED, PRIMARY KEY (a, b, c, d, e))",
+            "out of range 1..=4",
+        ),
+        ("CREATE TABLE t (a TEXT, b INT UNSIGNED, PRIMARY KEY (a, b))", "'a'"),
+        ("CREATE TABLE t (id REAL PRIMARY KEY)", "'id'"),
+        ("CREATE TABLE t (id DOUBLE PRIMARY KEY)", "'id'"),
+    ] {
+        assert_rejects(sql, plan_table(&cat, sql), "Rejected", needle);
+    }
+}
+
+/// `CLUSTER BY` names a leading prefix of the PK list, which becomes the
+/// table's distribution prefix.
+#[test]
+fn cluster_by_is_a_leading_pk_prefix() {
+    let cat = catalog(vec![]);
+    let two = "a BIGINT UNSIGNED, b BIGINT UNSIGNED, v BIGINT NOT NULL, PRIMARY KEY (a, b)";
+    for (clause, prefix_len) in [("CLUSTER BY a", 1), ("CLUSTER BY a, b", 2)] {
+        let c = created(&cat, &format!("CREATE TABLE t ({two}) {clause}"));
+        assert_eq!(
+            c.props.distribution,
+            TableDistribution::Keyed { prefix_len },
+            "{clause}"
+        );
+    }
+    for (sql, needle) in [
+        (format!("CREATE TABLE t ({two}) CLUSTER BY b"), "leading prefix"),
+        (format!("CREATE TABLE t ({two}) CLUSTER BY b, a"), "leading prefix"),
+        (
+            format!("CREATE TABLE t ({two}) CLUSTER BY v"),
+            "is not a PRIMARY KEY column",
+        ),
+        (format!("CREATE TABLE t ({two}) CLUSTER BY nope"), "not found"),
+        (
+            format!("CREATE TABLE t ({two}) WITH (replicated = true) CLUSTER BY a"),
+            "mutually exclusive",
+        ),
+        (
+            "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, c BIGINT UNSIGNED, PRIMARY KEY (a, b, c)) \
+             CLUSTER BY a, c"
+                .to_string(),
+            "leading prefix",
+        ),
+    ] {
+        assert_rejects(&sql, plan_table(&cat, &sql), "Rejected", needle);
+    }
+}
+
+/// Every ordering the two PK spellings can be written in.
 #[test]
 fn primary_key_precedence() {
     let cat = catalog(vec![]);
@@ -108,6 +191,28 @@ fn a_repeated_unique_is_rejected_in_both_spellings() {
         "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT UNIQUE, UNIQUE(a))",
     ] {
         assert_rejects(sql, plan_table(&cat, sql), "Rejected", "duplicate UNIQUE constraint");
+    }
+}
+
+/// An inline UNIQUE builds an index, so it takes only what an index takes: an
+/// indexable column, a user name, and an index record (the columns plus the
+/// source PK) within the key arity limit.
+#[test]
+fn an_inline_unique_must_be_an_admissible_index() {
+    let cat = catalog(vec![]);
+    for (sql, needle) in [
+        ("CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT UNIQUE)", "'name'"),
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, CONSTRAINT _my_idx UNIQUE(a))",
+            "cannot start with '_'",
+        ),
+        (
+            "CREATE TABLE t (a BIGINT, b BIGINT, c BIGINT, d BIGINT, e BIGINT, f BIGINT, \
+             UNIQUE(e, f), PRIMARY KEY (a, b, c, d))",
+            "index arity",
+        ),
+    ] {
+        assert_rejects(sql, plan_table(&cat, sql), "Rejected", needle);
     }
 }
 

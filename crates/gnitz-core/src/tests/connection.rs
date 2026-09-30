@@ -214,6 +214,13 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
     let sa = schema_a();
     let ddl = [(12345, ZSetBatch::new(&sa))];
     let wrong_layout = batch_b(&[1]);
+    // One cell alone past the server's ingress cap, refused before it is sent.
+    let sb = schema_b();
+    let mut oversize = ZSetBatch::new(&sb);
+    BatchAppender::new(&mut oversize, &sb)
+        .add_row(1, 1)
+        .str_val(&"x".repeat(gnitz_wire::MAX_FRAME_PAYLOAD))
+        .f64_val(0.0);
     for (what, req) in [
         ("a DDL family that is no system table", Request::DdlTxn(&ddl)),
         (
@@ -222,6 +229,15 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
                 target_id: 4,
                 schema: &sa,
                 batch: &wrong_layout,
+                mode: WireConflictMode::Update,
+            },
+        ),
+        (
+            "a push whose frame is past the server's ingress cap",
+            Request::Push {
+                target_id: 4,
+                schema: &sb,
+                batch: &oversize,
                 mode: WireConflictMode::Update,
             },
         ),

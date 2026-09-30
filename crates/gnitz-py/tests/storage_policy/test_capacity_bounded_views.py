@@ -15,7 +15,7 @@ These tests need the store to reach the *disk* regime, which `sweeping_server`
 reaches on a few thousand rows by shrinking the RAM-tier ceiling.
 
 What a `WITH (capacity = …)` clause *refuses*: the eligible-body rule is the
-engine's, tested in `crates/gnitz-sql/tests/engine_views.rs`. The leaf rule and
+engine's, tested in `crates/gnitz-sql/tests/engine/views.rs`. The leaf rule and
 the option grammar are the planner's, in `plan_view_rejections.rs`.
 """
 import glob

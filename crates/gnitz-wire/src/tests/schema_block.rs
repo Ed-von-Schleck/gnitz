@@ -153,8 +153,9 @@ fn the_record_layout_is_fixed() {
     assert_eq!((got, pk.as_slice()), (cols.to_vec(), &[1u32, 0][..]));
 }
 
-/// Each difference `check_same_types` compares is refused, and each names itself
-/// distinctly — pairwise distinctness tests the message without pinning prose.
+/// Each difference `check_same_types` compares is refused as a mismatch, and
+/// each names itself distinctly — pairwise distinctness tests the message
+/// without pinning prose.
 /// What it does not compare (names, the hidden flag) is admitted.
 #[test]
 fn check_same_types_names_each_mismatch_distinctly() {
@@ -208,6 +209,7 @@ fn check_same_types_names_each_mismatch_distinctly() {
     msgs.push(check_same_types(&decimal(2), &decimal(4)).expect_err("scale"));
 
     for i in 0..msgs.len() {
+        assert!(msgs[i].starts_with("Schema mismatch: "), "case {i}: {}", msgs[i]);
         for j in (i + 1)..msgs.len() {
             assert_ne!(msgs[i], msgs[j], "cases {i} and {j} report the same message");
         }

@@ -1,0 +1,399 @@
+//! `CREATE TABLE` / `CREATE INDEX` / `ALTER` / `DROP` through the planner into
+//! the engine: what the catalog holds afterwards, and which statements are
+//! refused by which guard.
+
+use super::*;
+use gnitz_wire::WireStatus::{Error, IntegrityViolation, NotFound};
+
+// ── CREATE TABLE ─────────────────────────────────────────────────────────────
+
+/// A foreign key refuses an orphan child row until its parent lands.
+#[test]
+fn a_foreign_key_refuses_an_orphan_until_its_parent_lands() {
+    let mut db = Db::boot(1);
+    db.exec(
+        "CREATE TABLE parent (id BIGINT PRIMARY KEY, name TEXT);
+         CREATE TABLE child (cid INT PRIMARY KEY, p_id INT REFERENCES parent(id))",
+    );
+    db.refuses("INSERT INTO child VALUES (1, 99)", Refused(IntegrityViolation), "");
+    db.exec("INSERT INTO parent VALUES (99, 'p'); INSERT INTO child VALUES (1, 99)");
+    assert_eq!(db.rows("SELECT cid, p_id FROM child", &["cid", "p_id"]), [[1, 99, 1]]);
+}
+
+/// Every honored UNIQUE spelling lands as exactly one unique index: none for the
+/// lone PK, and the FK's own index promoted rather than a second one added. Each
+/// is droppable by the name that was written or minted.
+#[test]
+fn inline_uniques_land_as_one_index_each() {
+    let mut db = Db::boot(1);
+    db.exec(
+        "CREATE TABLE par (x BIGINT PRIMARY KEY);
+         CREATE TABLE u (id BIGINT PRIMARY KEY UNIQUE, a BIGINT UNIQUE, b BIGINT, c BIGINT, \
+         d BIGINT, e_f BIGINT, d_e BIGINT, f BIGINT, refc BIGINT UNIQUE REFERENCES par(x), \
+         g BIGINT CONSTRAINT uq_g UNIQUE, \
+         UNIQUE(b), CONSTRAINT u_c UNIQUE(c), UNIQUE(d, e_f), UNIQUE(d_e, f));
+         CREATE TABLE uc (a BIGINT UNSIGNED, b BIGINT UNSIGNED, PRIMARY KEY(a, b), UNIQUE(a))",
+    );
+    let unique = |cols: &[&str]| (cols.iter().map(|c| c.to_string()).collect::<Vec<_>>(), true);
+    assert_eq!(
+        db.indexes("u"),
+        [
+            unique(&["a"]),
+            unique(&["b"]),
+            unique(&["c"]),
+            unique(&["d", "e_f"]),
+            unique(&["d_e", "f"]),
+            unique(&["g"]),
+            unique(&["refc"]),
+        ]
+    );
+    assert_eq!(db.indexes("uc"), [unique(&["a"])]);
+
+    let sn = db.sn.clone();
+    db.exec(&format!(
+        "DROP INDEX u_c; DROP INDEX uq_g; DROP INDEX {sn}__u__idx_d_e_f; DROP INDEX {sn}__u__idx_d_e_f_2"
+    ));
+    assert_eq!(db.indexes("u"), [unique(&["a"]), unique(&["b"]), unique(&["refc"])]);
+}
+
+#[test]
+fn relation_names_are_case_insensitive() {
+    let mut db = Db::boot(1);
+    db.exec("CREATE TABLE Foo (id BIGINT PRIMARY KEY); INSERT INTO FOO (id) VALUES (1)");
+    assert_eq!(db.rows("SELECT id FROM foo", &["id"]), [[1, 1]]);
+    db.refuses(
+        "CREATE TABLE foo (id BIGINT PRIMARY KEY)",
+        Refused(Error),
+        "already exists",
+    );
+    db.exec("DROP TABLE fOO");
+    assert!(!db.exists("foo"));
+}
+
+/// Every SQL surface reports an absent relation as the one classified `NotFound`,
+/// naming the relation as the statement spelled it.
+#[test]
+fn an_absent_relation_is_one_not_found_everywhere() {
+    let mut db = Db::boot(1);
+    let sn = db.sn.clone();
+    for (sql, name) in [
+        ("SELECT * FROM nope", "nope"),
+        ("SELECT * FROM NoPe", "NoPe"),
+        ("ALTER TABLE nope ADD COLUMN x BIGINT", "nope"),
+        ("INSERT INTO NoPe VALUES (1)", "NoPe"),
+        ("UPDATE NoPe SET x = 1", "NoPe"),
+        ("DELETE FROM NoPe", "NoPe"),
+        ("DROP TABLE NoPe", "NoPe"),
+    ] {
+        db.refuses(sql, Refused(NotFound), &format!("{sn}.{name}"));
+    }
+}
+
+/// `__fk_` is reserved nowhere: an FK index has no name at all, so every
+/// surface that mints a user name accepts the infix.
+#[test]
+fn the_fk_infix_is_reserved_nowhere() {
+    let mut db = Db::boot(1);
+    let sn = db.sn.clone();
+    db.exec(&format!(
+        "CREATE TABLE a__fk_b (id BIGINT PRIMARY KEY, x BIGINT);
+         CREATE TABLE ok1 (id BIGINT PRIMARY KEY, a__fk_b BIGINT);
+         CREATE VIEW v__fk_w AS SELECT x FROM a__fk_b;
+         CREATE TABLE alt (id BIGINT PRIMARY KEY, a BIGINT, CONSTRAINT my__fk_thing UNIQUE(a));
+         DROP INDEX my__fk_thing;
+         ALTER TABLE alt ADD COLUMN c__fk_d BIGINT;
+         ALTER TABLE alt RENAME COLUMN a TO e__fk_f;
+         CREATE INDEX ON alt (c__fk_d);
+         DROP INDEX {sn}__alt__idx_c__fk_d"
+    ));
+}
+
+// ── CREATE INDEX ─────────────────────────────────────────────────────────────
+
+#[test]
+fn create_index_naming_and_rejections() {
+    let mut db = Db::boot(1);
+    let sn = db.sn.clone();
+    db.exec(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b_c BIGINT, a_b BIGINT, c BIGINT, s TEXT, \
+         f DOUBLE PRECISION);
+         CREATE TABLE st (id BIGINT PRIMARY KEY, v BIGINT) WITH (stream = true);
+         CREATE INDEX my_idx ON t(a)",
+    );
+    // A named index does not carry the auto-name, so the auto-named one on the
+    // same column coexists with it.
+    db.refuses(&format!("DROP INDEX {sn}__t__idx_a"), Refused(NotFound), "not found");
+    db.exec("CREATE INDEX ON t(a)");
+    db.refuses("CREATE INDEX ON t(a)", Rejected, "already exists");
+    db.refuses("CREATE INDEX my_idx ON t(c)", Refused(Error), "already exists");
+    // `(a, b_c)` and `(a_b, c)` render the same base; the second gets `_2`.
+    db.exec(&format!(
+        "DROP INDEX my_idx; DROP INDEX {sn}__t__idx_a;
+         CREATE INDEX ON t(a, b_c); CREATE INDEX ON t(a_b, c);
+         DROP INDEX {sn}__t__idx_a_b_c; DROP INDEX {sn}__t__idx_a_b_c_2"
+    ));
+    assert!(db.indexes("t").is_empty());
+
+    for (sql, needle) in [
+        ("CREATE INDEX _bad ON t(a)", "cannot start with '_'"),
+        ("DROP INDEX \"__invalid\"", "cannot start with '_'"),
+        // Every DROP clause gnitz does not honor, named rather than dropped.
+        ("DROP TABLE t CASCADE", "CASCADE"),
+        ("DROP TABLE t RESTRICT", "RESTRICT"),
+        ("DROP TABLE t PURGE", "PURGE"),
+        // An ineligible column is named, on both index surfaces.
+        ("CREATE INDEX ON t(s)", "'s'"),
+        ("CREATE INDEX ON t(f)", "'f'"),
+        ("CREATE UNIQUE INDEX ON t(s)", "'s'"),
+        ("CREATE INDEX ON t(ghost)", "ghost"),
+        ("CREATE INDEX ON t(a, a)", "duplicate column"),
+        ("CREATE INDEX ix ON t (a) WHERE a > 0", "partial index"),
+        // A stream holds no rows to index.
+        ("CREATE INDEX ON st(v)", "is a stream"),
+    ] {
+        db.refuses(sql, Rejected, needle);
+    }
+    // BTREE is the one index method, so naming it is accepted.
+    db.exec("CREATE INDEX ixb ON t USING BTREE (c)");
+    assert_eq!(db.indexes("t"), [(vec!["c".to_string()], false)]);
+}
+
+// ── ALTER ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn alter_results_and_if_exists_no_ops() {
+    let mut db = Db::boot(4);
+    db.exec(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT, a BIGINT NOT NULL, b BIGINT);
+         INSERT INTO t VALUES (1, 10, 1, 100), (2, 20, 2, 200), (3, 30, 3, 300);
+         CREATE VIEW vw AS SELECT id, v FROM t WHERE v >= 20;
+         ALTER TABLE t RENAME TO t2",
+    );
+    db.refuses("SELECT * FROM t", Refused(NotFound), "not found");
+    assert_eq!(
+        db.scan("t2", &["id", "v"]),
+        at_weight_one(&[vec![1, 10], vec![2, 20], vec![3, 30]])
+    );
+    // RENAME COLUMN is allowed under a dependent view: views bind columns by
+    // ordinal.
+    db.exec("ALTER TABLE t2 RENAME COLUMN v TO w; ALTER TABLE vw RENAME TO vw2");
+    assert_eq!(visible_names(&db.read("SELECT * FROM t2").0), ["id", "w", "a", "b"]);
+    assert_eq!(db.scan("vw2", &["id", "v"]), at_weight_one(&[vec![2, 20], vec![3, 30]]));
+
+    db.exec("ALTER TABLE t2 ADD CONSTRAINT uq UNIQUE (b)");
+    db.refuses(
+        "INSERT INTO t2 VALUES (4, 40, 4, 100)",
+        Refused(IntegrityViolation),
+        "Unique index violation",
+    );
+    db.exec("ALTER TABLE t2 DROP CONSTRAINT uq; INSERT INTO t2 VALUES (4, 40, 4, 100)");
+
+    db.exec("ALTER VIEW vw2 AS SELECT id, w FROM t2 WHERE w >= 30");
+    assert_eq!(db.scan("vw2", &["id", "w"]), at_weight_one(&[vec![3, 30], vec![4, 40]]));
+    db.exec("DROP VIEW vw2; ALTER TABLE t2 DROP COLUMN b");
+    assert_eq!(visible_names(&db.read("SELECT * FROM t2").0), ["id", "w", "a"]);
+    db.exec("INSERT INTO t2 VALUES (5, 50, 5)");
+    assert_eq!(
+        db.rows("SELECT id, w, a FROM t2 WHERE id >= 4", &["id", "w", "a"]),
+        at_weight_one(&[vec![4, 40, 4], vec![5, 50, 5]])
+    );
+    db.refuses("SELECT b FROM t2", Rejected, "not found");
+
+    db.exec("ALTER TABLE t2 ALTER COLUMN a DROP NOT NULL; INSERT INTO t2 VALUES (6, 60, NULL)");
+    assert_eq!(
+        db.rows("SELECT id, a FROM t2 WHERE id = 6", &["id", "a"]),
+        [[6, NULL, 1]]
+    );
+
+    // A bounded view keeps its capacity across a rename, so it stays a leaf.
+    db.exec("CREATE VIEW bv WITH (capacity = '1 MB') AS SELECT id, w FROM t2; ALTER TABLE bv RENAME TO bv2");
+    db.refuses("CREATE VIEW over AS SELECT id FROM bv2", Rejected, "capacity-bounded");
+
+    db.exec(
+        "ALTER TABLE IF EXISTS nope RENAME TO x;
+         ALTER TABLE IF EXISTS nope DROP COLUMN a;
+         ALTER TABLE IF EXISTS nope ADD CONSTRAINT cq UNIQUE (v);
+         ALTER TABLE t2 DROP CONSTRAINT IF EXISTS nope",
+    );
+}
+
+#[test]
+fn alter_rejection_matrix() {
+    let mut db = Db::boot(1);
+    db.exec(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT NOT NULL, b BIGINT, c BIGINT);
+         CREATE VIEW vw AS SELECT id, b FROM t;
+         CREATE VIEW base AS SELECT id, c FROM t;
+         CREATE VIEW dep AS SELECT id, c FROM base;
+         CREATE INDEX ix ON t (c);
+         CREATE TABLE u (id BIGINT PRIMARY KEY, v BIGINT);
+         CREATE UNIQUE INDEX uq ON u (v);
+         CREATE TABLE st (id BIGINT PRIMARY KEY, v BIGINT) WITH (stream = true)",
+    );
+    for (sql, want, needle) in [
+        // ADD COLUMN honours a bare nullable append; each refused clause would
+        // need a value for the rows already there, a second catalog object, or a
+        // physical move, and names what to write instead where there is one.
+        ("ALTER TABLE t ADD COLUMN x BIGINT NOT NULL", Rejected, "NOT NULL"),
+        ("ALTER TABLE t ADD COLUMN x SERIAL", Rejected, "SERIAL"),
+        ("ALTER TABLE t ADD COLUMN x BIGINT DEFAULT 0", Rejected, "DEFAULT"),
+        ("ALTER TABLE t ADD COLUMN x BIGINT PRIMARY KEY", Rejected, "PRIMARY KEY"),
+        (
+            "ALTER TABLE t ADD COLUMN x BIGINT UNIQUE",
+            Rejected,
+            "CREATE UNIQUE INDEX",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN x BIGINT REFERENCES t (id)",
+            Rejected,
+            "ADD CONSTRAINT",
+        ),
+        ("ALTER TABLE t ADD COLUMN x BIGINT CHECK (x > 0)", Rejected, "CHECK"),
+        ("ALTER TABLE t ADD COLUMN x BIGINT COLLATE utf8", Rejected, "COLLATE"),
+        (
+            "ALTER TABLE t ADD COLUMN IF NOT EXISTS x BIGINT",
+            Rejected,
+            "IF NOT EXISTS",
+        ),
+        ("ALTER TABLE t ADD COLUMN x BIGINT FIRST", Rejected, "FIRST/AFTER"),
+        ("ALTER TABLE t ADD COLUMN x BIGINT AFTER a", Rejected, "FIRST/AFTER"),
+        (
+            "ALTER TABLE t ADD COLUMN a BIGINT",
+            Refused(Error),
+            "duplicate column name",
+        ),
+        ("ALTER TABLE st ADD COLUMN x BIGINT", Rejected, "is a stream"),
+        ("ALTER TABLE st ADD CONSTRAINT su UNIQUE (v)", Rejected, "is a stream"),
+        ("ALTER TABLE t RENAME TO otherschema.t2", Rejected, "cross-schema"),
+        // The new name is checked before the IF EXISTS no-op.
+        (
+            "ALTER TABLE IF EXISTS nope RENAME TO _x",
+            Rejected,
+            "cannot start with '_'",
+        ),
+        (
+            "ALTER TABLE t RENAME COLUMN a TO b",
+            Refused(Error),
+            "duplicate column name",
+        ),
+        ("ALTER TABLE t RENAME COLUMN nope TO z", Rejected, "not found"),
+        ("ALTER TABLE vw RENAME COLUMN b TO w", Rejected, "base table"),
+        (
+            "ALTER TABLE t ADD CONSTRAINT cq UNIQUE (b) NOT VALID",
+            Rejected,
+            "NOT VALID",
+        ),
+        ("ALTER TABLE t ADD CONSTRAINT cq CHECK (b > 0)", Rejected, "UNIQUE"),
+        ("ALTER TABLE t DROP CONSTRAINT nope", Refused(NotFound), "not found"),
+        ("ALTER TABLE t DROP CONSTRAINT ix CASCADE", Rejected, "CASCADE"),
+        // DROP CONSTRAINT drops a UNIQUE index of its own table only.
+        (
+            "ALTER TABLE t DROP CONSTRAINT ix",
+            Refused(NotFound),
+            "constraint 'ix' not found",
+        ),
+        ("ALTER TABLE t DROP CONSTRAINT uq", Refused(NotFound), "not found"),
+        (
+            "ALTER VIEW base AS SELECT id, c FROM t WHERE c > 0",
+            Refused(Error),
+            "dependency",
+        ),
+        ("ALTER TABLE t ALTER COLUMN b SET NOT NULL", Rejected, "SET NOT NULL"),
+        (
+            "ALTER TABLE t ALTER COLUMN b SET DATA TYPE INT",
+            Rejected,
+            "SET DATA TYPE",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN b ADD GENERATED ALWAYS AS IDENTITY",
+            Rejected,
+            "GENERATED",
+        ),
+        (
+            "ALTER TABLE t RENAME COLUMN a TO a2, RENAME COLUMN b TO b2",
+            Rejected,
+            "more than one operation",
+        ),
+        ("ALTER TABLE ONLY t RENAME TO t2", Rejected, "ONLY"),
+        ("ALTER TABLE t DROP COLUMN id", Refused(Error), "primary-key"),
+        ("ALTER TABLE t DROP COLUMN b CASCADE", Rejected, "CASCADE"),
+        ("ALTER TABLE t DROP COLUMN c", Refused(Error), "secondary index"),
+        (
+            "ALTER TABLE t ALTER COLUMN id DROP NOT NULL",
+            Refused(Error),
+            "primary-key",
+        ),
+        // A dependent view blocks a column drop and a nullability change of any
+        // column: its traces hold rows under the old comparator.
+        ("ALTER TABLE t DROP COLUMN b", Refused(Error), "dependent view"),
+        (
+            "ALTER TABLE t ALTER COLUMN a DROP NOT NULL",
+            Refused(Error),
+            "dependent view",
+        ),
+    ] {
+        db.refuses(sql, want, needle);
+    }
+    // The misdirected constraint drop left `uq` standing.
+    assert_eq!(db.indexes("u"), [(vec!["v".to_string()], true)]);
+}
+
+// ── DROP ─────────────────────────────────────────────────────────────────────
+
+/// One `DROP` statement is one DDL zone: every name goes or none does, and the
+/// dependency guards see the whole batch.
+#[test]
+fn a_multi_name_drop_is_one_atomic_zone() {
+    let mut db = Db::boot(1);
+    db.exec(
+        "CREATE TABLE a (id BIGINT PRIMARY KEY);
+         CREATE TABLE b (id BIGINT PRIMARY KEY);
+         CREATE TABLE parent (id BIGINT PRIMARY KEY);
+         CREATE TABLE child (id BIGINT PRIMARY KEY, p BIGINT REFERENCES parent(id));
+         CREATE VIEW keeper AS SELECT id FROM b",
+    );
+
+    // `b` is read by a view, so its drop refuses — and `a` survives with it.
+    db.refuses("DROP TABLE a, b", Refused(Error), "View dependency");
+    assert!(db.exists("a"), "a is untouched");
+
+    // Two `-1`s on one catalog PK is not a retraction the engine accepts.
+    db.refuses("DROP TABLE a, A", Rejected, "named more than once");
+
+    // A FK child co-dropped in the same batch is self-resolving, so the pair
+    // drops in either written order.
+    db.exec("DROP TABLE parent, child");
+    assert!(!db.exists("parent") && !db.exists("child"));
+
+    db.exec("DROP VIEW keeper; DROP TABLE a, b");
+    assert!(!db.exists("a") && !db.exists("b"));
+}
+
+/// A qualifier naming the session schema is accepted on every name surface;
+/// any other is a cross-schema reference, and an index name — being global —
+/// takes none at all.
+#[test]
+fn a_name_qualifier_is_matched_not_dropped() {
+    let mut db = Db::boot(1);
+    let sn = db.sn.clone();
+    db.exec(&format!(
+        "CREATE TABLE {sn}.t (id BIGINT PRIMARY KEY, v BIGINT);
+         INSERT INTO {sn}.t VALUES (1, 10);
+         CREATE VIEW {sn}.vw AS SELECT id FROM {sn}.t"
+    ));
+    assert_eq!(db.rows(&format!("SELECT id FROM {sn}.vw"), &["id"]), [[1, 1]]);
+    db.exec(&format!("DROP VIEW {sn}.vw"));
+
+    for (sql, needle) in [
+        ("SELECT id FROM other.t", "cross-schema"),
+        ("INSERT INTO other.t VALUES (2, 20)", "cross-schema"),
+        ("DROP TABLE other.t", "cross-schema"),
+        ("CREATE INDEX ON other.t (v)", "cross-schema"),
+        // An index name is global, so a qualifier on one scopes nothing.
+        ("CREATE INDEX other.ix ON t (v)", "no qualifier"),
+        ("DROP INDEX other.ix", "no qualifier"),
+        (&format!("DROP INDEX {sn}.ix"), "no qualifier"),
+    ] {
+        db.refuses(sql, Rejected, needle);
+    }
+}
