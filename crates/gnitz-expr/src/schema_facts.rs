@@ -155,6 +155,7 @@ pub trait SchemaFacts: ColumnTable {
     }
 
     /// [`Self::opk_key`] from one native value per PK column, in PK-list order.
+    /// A signed value is passed sign-extended (`v as u128`).
     fn opk_key_cols(&self, natives: &[u128]) -> gnitz_wire::PkBuf {
         debug_assert_eq!(
             natives.len(),
@@ -163,6 +164,14 @@ pub trait SchemaFacts: ColumnTable {
         );
         gnitz_wire::encode_pk_images(self.pk_cols().iter().zip(natives).map(|(&p, &v)| {
             let tc = self.col_type_code(p as usize);
+            debug_assert!(
+                {
+                    let w = tc.wire_stride();
+                    let dropped = v.checked_shr(w as u32 * 8).unwrap_or(0);
+                    dropped == 0 || dropped == u128::MAX >> (w * 8)
+                },
+                "opk_key_cols: {v:#x} does not fit a {tc:?} column",
+            );
             (tc, tc, gnitz_wire::key_image(tc, v))
         }))
     }

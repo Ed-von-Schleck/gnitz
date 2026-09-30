@@ -13,9 +13,10 @@ use super::batch::{
 };
 use super::batch_pool::acquire_uninit;
 use super::layout::*;
-use super::merge::{carried_dead, long_bytes_outside, prorated_blob_cap, ColPtr, ColumnarSource, UnifiedSource};
+use super::merge::{ColPtr, ColumnarSource, UnifiedSource};
 use super::scatter::DecodedColumns;
 use super::shard_filter;
+use super::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap};
 use crate::schema::{SchemaDescriptor, SchemaFacts};
 use crate::storage::error::StorageError;
 use gnitz_expr::RowSource;

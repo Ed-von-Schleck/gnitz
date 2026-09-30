@@ -341,8 +341,19 @@ fn child_rows(dir: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: u64) ->
     let registry = child_registry(dir, k, of, schema, tid);
     let batch = registry.relation_or_err(tid).unwrap().cursor().materialize();
     (0..batch.len())
-        .map(|i| (batch.get_pk(i), batch.get_weight(i)))
+        .map(|i| (native_pk(&schema, batch.get_pk_bytes(i)), batch.get_weight(i)))
         .collect()
+}
+
+/// A test PK: the PK columns' native little-endian images, packed in PK-list
+/// order into one `u128`.
+fn opk_of(schema: &SchemaDescriptor, pk: u128) -> gnitz_wire::PkBuf {
+    schema.opk_key(&pk.to_le_bytes())
+}
+
+/// The inverse of [`opk_of`].
+fn native_pk(schema: &SchemaDescriptor, opk: &[u8]) -> u128 {
+    u128::from_le_bytes(schema.native_le_key(opk)[..16].try_into().unwrap())
 }
 
 /// The subset of `rows` worker `k` of `of` holds, by the engine's own router.
@@ -350,7 +361,7 @@ fn owned_rows(schema: &SchemaDescriptor, rows: &[(u128, i64)], of: u32, k: u32) 
     rows.iter()
         .copied()
         .filter(|&(pk, _)| {
-            let opk = schema.opk_key(&pk.to_le_bytes());
+            let opk = opk_of(schema, pk);
             schema.placement().is_replicated() || schema.worker_for_pk(opk.pk_bytes(), of as usize) == k as usize
         })
         .collect()
@@ -377,7 +388,7 @@ fn fill_child(registry: &mut RelationRegistry, tid: u64, schema: SchemaDescripto
     if !rows.is_empty() {
         let mut bb = BatchBuilder::new(schema);
         for &(pk, x) in rows {
-            bb.begin_row(pk, 1);
+            bb.begin_row_bytes(opk_of(&schema, pk).pk_bytes(), 1);
             bb.put_int(x as u128);
             bb.end_row();
         }
@@ -539,8 +550,7 @@ fn repartition_handles_a_relation_with_empty_children() {
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
-    // `opk_key` reads the packed native value in PK-list order, so PK column 0
-    // (`a`) is the LOW u128 half: `a = 1` for every row, `b` varies.
+    // PK column 0 (`a`) is the low u128 half: `a = 1` for every row, `b` varies.
     let rows: Vec<(u128, i64)> = (0..20u128).map(|b| (1u128 | (b << 64), b as i64)).collect();
     seed_set(&dir, 3, schema, tid, &rows);
     let occupied = (0..3)

@@ -1,15 +1,14 @@
 use super::*;
 use crate::schema::{ColumnTable, SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::storage::{Batch, BatchBuilder};
+use crate::storage::BatchBuilder;
 use crate::test_support::{le_cell, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string, opk_pk};
 
-/// Write `packer`'s key for every row of `src` into `out`'s PK region — what
-/// `ops::MapPlan`'s `PkSource::Pack` arm runs, so the tests below drive the
-/// packer through a stored PK region rather than a scratch buffer.
-fn promote_into<B: BatchView>(packer: &ReindexPacker, src: &B, out: &mut Batch) {
-    assert_eq!(out.pk_stride() as usize, packer.out_stride);
-    let (n, stride) = (out.count, packer.out_stride);
-    packer.pack_rows(out.pk_data_mut(), stride, src, 0, n);
+/// `packer`'s key for each of the first `n` rows of `src`, through `pack_rows`.
+fn packed_keys<B: BatchView>(packer: &ReindexPacker, src: &B, n: usize) -> Vec<Vec<u8>> {
+    let stride = packer.out_stride;
+    let mut region = vec![0u8; n * stride];
+    packer.pack_rows(&mut region, stride, src, 0, n);
+    region.chunks(stride).map(<[u8]>::to_vec).collect()
 }
 
 /// Worker count the co-partition pins route against. Any count works — the
@@ -306,31 +305,29 @@ fn test_reindex_packer_arity1_byte_identity() {
         let b = b.finish();
         let mb = b.as_mem_batch();
 
-        let out_schema = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U128, false)], &[0]);
         let packer = ReindexPacker::new(&schema, &[(1, TypeCode::U128)]).unwrap();
         assert_eq!(packer.out_stride, 16, "a content-hash key is a 16-byte U128 slot");
-        let mut out = Batch::zeroed(&out_schema, 3);
-        promote_into(&packer, &mb, &mut out);
+        let keys = packed_keys(&packer, &mb, 3);
 
         for (row, content) in contents.iter().enumerate() {
             let want = gnitz_wire::checksum_128(content);
             assert_eq!(
-                out.get_pk_bytes(row),
-                &want.to_be_bytes()[..],
+                keys[row],
+                want.to_be_bytes(),
                 "{} row {row}: packed key is BE(content hash)",
                 schema.columns[1].type_code,
             );
         }
         // No two contents collide, the empty one included.
-        assert_ne!(out.get_pk_bytes(0), out.get_pk_bytes(2));
-        assert_ne!(out.get_pk_bytes(0), out.get_pk_bytes(1));
+        assert_ne!(keys[0], keys[2]);
+        assert_ne!(keys[0], keys[1]);
     }
 }
 
 #[test]
 fn test_reindex_packer_copartition_contract() {
     // The bytes one row's pack computes (pack_into into a scratch buffer) must
-    // be byte-identical to the `_join_pk` stored by promote_into,
+    // be byte-identical to the `_join_pk` stored by packed_keys,
     // so the delta scatter and the reindexed trace land on the same partition.
     let schema = SchemaDescriptor::new(
         &[
@@ -359,36 +356,23 @@ fn test_reindex_packer_copartition_contract() {
     let mb = b.as_mem_batch();
 
     let packer = ReindexPacker::new(&schema, &crate::test_support::self_typed_slots(&schema, &cols)).unwrap();
-    let out_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false), // col2 → U64
-            SchemaColumn::new(TypeCode::I32, false), // col1 → I32
-        ],
-        &[0, 1],
-    );
-    let mut out = Batch::zeroed(&out_schema, rows.len());
-    promote_into(&packer, &mb, &mut out);
+    let keys = packed_keys(&packer, &mb, rows.len());
 
-    for row in 0..rows.len() {
+    for (row, key) in keys.iter().enumerate() {
         let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
         packer.pack_into(&mut buf[..packer.out_stride], &mb, row);
         // Trace side (stored _join_pk) == scatter side (scratch buffer).
-        assert_eq!(out.get_pk_bytes(row), &buf[..packer.out_stride], "row {row} key bytes");
-        assert_eq!(
-            crate::schema::worker_for_pk_bytes(out.get_pk_bytes(row), NW),
-            crate::schema::worker_for_pk_bytes(&buf[..packer.out_stride], NW),
-            "row {row} co-partition",
-        );
+        assert_eq!(key, &buf[..packer.out_stride], "row {row} key bytes");
     }
     // Rows 0 and 1 share col2 but differ in col1 → distinct keys.
-    assert_ne!(out.get_pk_bytes(0), out.get_pk_bytes(1));
+    assert_ne!(keys[0], keys[1]);
 }
 
 #[test]
 fn test_reindex_packer_copartition_contract_wide() {
     // WIDE-branch (24-byte key) co-partition pin: three independent builders
     // must agree on the bytes — the scatter (`pack_into`), the trace store
-    // (`promote_into`), and the ingest OPK encoder (`opk_pk`, which never
+    // (`packed_keys`), and the ingest OPK encoder (`opk_pk`, which never
     // touches `ReindexPacker`) — and the formula pin below catches a fork in
     // the wide routing arm, which byte-equality alone cannot.
     let schema = SchemaDescriptor::new(
@@ -429,10 +413,8 @@ fn test_reindex_packer_copartition_contract_wide() {
     );
     assert!(out_schema.pk_stride() > 16, "test invariant: 24-byte key is wide");
 
-    // PATH 1 — trace store: promote_into stamps the `_join_pk`; read it back.
-    let mut out = Batch::zeroed(&out_schema, 1);
-    promote_into(&packer, &mb, &mut out);
-    let consumer = out.get_pk_bytes(0);
+    // PATH 1 — trace store: the stamped `_join_pk`.
+    let consumer = &packed_keys(&packer, &mb, 1)[0][..];
 
     // PATH 2 — exchange scatter: pack_into into a scratch buffer.
     let mut buf = [0u8; crate::schema::MAX_PK_BYTES];

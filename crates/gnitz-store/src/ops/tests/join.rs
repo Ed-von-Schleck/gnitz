@@ -7,8 +7,8 @@ use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, BatchBuilder, Layout};
 use crate::test_support::{
-    make_batch, make_batch_i64pk as make_signed_batch, make_batch_opk, make_schema_i64pk_i64 as make_schema_signed,
-    make_schema_u64_i64, opk_pk, pk_only_schema, pk_payload_schema, row_key, trace_cursor, zset_of, RowKey,
+    make_batch, make_batch_opk, make_schema_i64pk_i64 as make_schema_signed, make_schema_u64_i64, opk_pk,
+    pk_only_schema, pk_payload_schema, row_key, trace_cursor, zset_of, RowKey,
 };
 use gnitz_wire::read_i64_le;
 
@@ -420,10 +420,10 @@ fn range_join_suffix_pointer_widens_across_the_delta_group() {
 #[test]
 fn range_join_orders_a_signed_key_by_its_opk_image() {
     let schema = make_schema_signed();
-    let trace_rows = [(-100i64, 1i64, 1i64), (0, 1, 2), (50, 1, 3)];
-    let delta = make_signed_batch(&schema, &[(0, 1, 9)]);
+    let trace_rows = [(-100i64 as u64, 1, 1), (0, 1, 2), (50, 1, 3)];
+    let delta = make_batch(&schema, &[(0, 1, 9)]);
     for (rel, want) in [(RangeRel::Gt, vec![3]), (RangeRel::Lt, vec![1])] {
-        let mut ch = trace_cursor(make_signed_batch(&schema, &trace_rows), schema);
+        let mut ch = trace_cursor(make_batch(&schema, &trace_rows), schema);
         let out = range_join(&schema, 0, rel, &delta, &mut ch);
         let got: Vec<i64> = out_triples(&out).into_iter().map(|(t, _, _)| t).collect();
         assert_eq!(got, want, "rel {rel:?}");

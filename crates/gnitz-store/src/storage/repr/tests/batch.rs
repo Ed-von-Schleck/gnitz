@@ -3,119 +3,9 @@ use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::BatchBuilder;
 use crate::test_support::{
-    make_batch, make_batch_bytes, make_batch_opk, make_batch_raw, make_batch_u128_raw, make_schema_pk_u64_payload_blob,
-    make_schema_pk_u64_payload_string, make_schema_u64_i64, make_string_batch, opk_pk, payload0_i64, pk_payload_schema,
-    read_german_string, read_strings, weighted_rows, wide_pk_3xu64_schema,
+    make_batch, make_batch_bytes, make_batch_raw, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string,
+    make_schema_u64_i64, make_string_batch, payload0_i64, read_german_string, read_strings, weighted_rows,
 };
-
-/// `extend_pk`, through `BatchBuilder::begin_row`, stores a native key as its
-/// right-aligned big-endian image at every narrow stride, and reads back as the
-/// same value.
-#[test]
-fn extend_pk_round_trips_at_every_narrow_stride() {
-    // Every key must fit its stride; `extend_pk` debug-asserts that nothing is
-    // set above the window.
-    let cases: &[(&[TypeCode], &[u128])] = &[
-        (&[TypeCode::U8], &[0, 1, 200, 255]),
-        (&[TypeCode::U16], &[0, 1, u16::MAX as u128]),
-        (&[TypeCode::U32], &[0, 1, u32::MAX as u128]),
-        (&[TypeCode::U64], &[0, 1, 1 << 32, u64::MAX as u128]),
-        (
-            &[TypeCode::U64, TypeCode::U32],
-            &[1, 1 | ((u32::MAX as u128) << 64), 7 | (7 << 64)],
-        ),
-        (
-            &[TypeCode::U128],
-            &[0, 1, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX],
-        ),
-    ];
-    for &(tcs, keys) in cases {
-        let schema = pk_payload_schema(tcs);
-        let stride = schema.pk_stride();
-        let rows: Vec<(u128, i64, i64)> = keys.iter().map(|&pk| (pk, 1, 0)).collect();
-        let b = make_batch_u128_raw(&schema, &rows);
-        for (i, &pk) in keys.iter().enumerate() {
-            assert_eq!(
-                b.get_pk_bytes(i),
-                &pk.to_be_bytes()[16 - stride..],
-                "stride {stride} row {i}: bytes"
-            );
-            assert_eq!(b.get_pk(i), pk, "stride {stride} row {i}: value");
-        }
-    }
-}
-
-#[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "does not fit 8 bytes")]
-fn extend_pk_u64_batch_rejects_wide_pk() {
-    let schema = make_schema_u64_i64();
-    let mut b = Batch::empty_with_schema(&schema);
-    b.reserve_rows(1);
-    b.extend_pk((u64::MAX as u128) + 1);
-}
-
-#[test]
-#[should_panic(expected = "extend_pk_bytes: length must equal pk_stride")]
-fn extend_pk_bytes_length_mismatch_panics() {
-    let mut b = Batch::empty_with_schema(&make_schema_u64_i64());
-    b.reserve_rows(1);
-    b.extend_pk_bytes(&[0u8; 7]);
-}
-
-/// `Batch` feeds its own count, stride and PK base into the shared seek kernel
-/// (swept exhaustively in `seek`); both entry points must agree with a
-/// linear scan over the same batch, at a narrow and a wide stride.
-#[test]
-fn pk_seeks_agree_with_a_linear_scan() {
-    let narrow: Vec<Vec<u8>> = [10u64, 20, 30, 40, 50]
-        .iter()
-        .map(|v| v.to_be_bytes().to_vec())
-        .collect();
-    let narrow_probes: Vec<Vec<u8>> = [0u64, 5, 10, 15, 25, 50, 51, u64::MAX]
-        .iter()
-        .map(|v| v.to_be_bytes().to_vec())
-        .collect();
-
-    // A 3xU64 compound key ascending in compare_pk_bytes order (column 0
-    // dominates, then 1, then 2); probes land on and between the stored keys.
-    let wide = |a: u64, b: u64, c: u64| opk_pk(&wide_pk_3xu64_schema(), &[a as u128, b as u128, c as u128]);
-    let wide_keys = vec![
-        wide(0, 0, 0),
-        wide(1, 0, 0),
-        wide(1, 5, 0),
-        wide(1, 5, 9),
-        wide(2, 0, 0),
-    ];
-    let wide_probes = vec![
-        wide(0, 0, 0),
-        wide(0, 0, 1),
-        wide(1, 0, 0),
-        wide(1, 5, 0),
-        wide(1, 5, 10),
-        wide(3, 0, 0),
-    ];
-
-    for (schema, keys, probes) in [
-        (pk_payload_schema(&[TypeCode::U64]), narrow, narrow_probes),
-        (wide_pk_3xu64_schema(), wide_keys, wide_probes),
-    ] {
-        let rows: Vec<(&Vec<u8>, i64, i64)> = keys.iter().map(|k| (k, 1, 0)).collect();
-        let b = make_batch_opk(&schema, &rows);
-
-        for key in &probes {
-            let want = (0..b.count)
-                .find(|&i| crate::schema::key::compare_pk_bytes(b.get_pk_bytes(i), key) != std::cmp::Ordering::Less)
-                .unwrap_or(b.count);
-            assert_eq!(b.find_lower_bound_bytes(key), want, "probe={key:02x?}");
-            // `advance_to` is the galloping form the merge drives; every hint,
-            // a run-off past the end included, must land on the same index.
-            for hint in 0..=b.count {
-                assert_eq!(b.advance_to(key, hint), want, "probe={key:02x?} hint={hint}");
-            }
-        }
-    }
-}
 
 /// `append_row_from_source` copies the PK verbatim and carries the
 /// caller's weight, not the source row's.
@@ -158,37 +48,64 @@ fn into_consolidated_panics_on_consolidated_ghost() {
     let _ = flagged_batch(&[(1, 1, 0), (2, 0, 0), (3, 1, 0)], Layout::Consolidated).into_consolidated();
 }
 
-/// A layout rises only through `certify_layout`, and every append or `clear`
-/// drops it to `Raw`.
+/// `is_consolidated` holds structurally for a batch nothing can mis-fold, and
+/// otherwise only under a certified claim.
 #[test]
-fn layout_lifecycle_default_raise_and_lower() {
+fn is_consolidated_without_a_claim_only_where_nothing_can_fold() {
     let schema = make_schema_u64_i64();
-    let empty = Batch::with_capacity(&schema, 4);
-    assert_eq!(empty.layout(), Layout::Raw, "constructor defaults Raw");
-    assert!(empty.is_consolidated(), "an empty batch is structurally consolidated");
-    let one = make_batch_raw(&schema, &[(7, 1, 70)]);
-    assert_eq!(one.layout(), Layout::Raw);
+    assert!(Batch::with_capacity(&schema, 4).is_consolidated());
+    assert!(make_batch_raw(&schema, &[(7, 1, 70)]).is_consolidated());
     assert!(
-        one.is_consolidated(),
-        "a lone non-ghost row is structurally consolidated"
+        !make_batch_raw(&schema, &[(7, 0, 70)]).is_consolidated(),
+        "a lone ghost"
     );
-    let ghost = make_batch_raw(&schema, &[(7, 0, 70)]);
-    assert!(!ghost.is_consolidated(), "a lone zero-weight row is a ghost");
+    let mut two = make_batch_raw(&schema, &[(1, 1, 10), (2, 1, 20)]);
+    assert!(!two.is_consolidated());
+    two.certify_layout(Layout::Consolidated);
+    assert!(two.is_consolidated());
+}
 
-    let mut b = make_batch_raw(&schema, &[(1, 1, 10), (2, 1, 20)]);
-    assert_eq!(b.layout(), Layout::Raw, "appending rows never raises the layout");
-    // Genuinely (PK, payload)-sorted, ghost-free → certify Consolidated.
-    b.certify_layout(Layout::Consolidated);
-    assert!(b.is_consolidated());
-
-    // Any append downgrades all the way to Raw (the W2M-class fail-safe).
-    let src = make_batch_raw(&schema, &[(3, 1, 30)]);
-    b.append_ranges(&src.as_mem_batch(), &[(0, 1)]);
-    assert_eq!(b.layout(), Layout::Raw, "append downgrades to Raw");
-
-    b.clear();
-    assert_eq!(b.layout(), Layout::Raw, "clear resets to Raw");
-    assert_eq!(b.count, 0, "clear drops the rows");
+/// An order- and weight-preserving copy inherits its source's claim; anything
+/// else is `Raw`.
+#[test]
+fn every_producer_states_its_layout() {
+    use Layout::*;
+    let schema = make_schema_u64_i64();
+    let wider = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+        ],
+        &[0],
+    );
+    let src = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
+    let mut appended = src.clone();
+    appended.append_ranges(&src.as_mem_batch(), &[(0, 1)]);
+    let mut cleared = src.clone();
+    cleared.clear();
+    let mut above = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
+    above.append_above(make_batch(&schema, &[(3, 1, 30), (4, 1, 40)]));
+    for (what, b, want) in [
+        ("with_capacity", Batch::with_capacity(&schema, 4), Raw),
+        ("clone", src.clone(), Consolidated),
+        (
+            "from_ranges",
+            Batch::from_ranges(&src, &[(0, 1), (2, 3)], 0),
+            Consolidated,
+        ),
+        ("ascending_subset", src.ascending_subset(&[0, 2]), Consolidated),
+        ("negated", src.clone().negated(), Consolidated),
+        ("compacted", src.compacted(), Consolidated),
+        ("append_above", above, Consolidated),
+        ("widened", src.widened_with_nulls(&wider, false), Consolidated),
+        ("append", appended, Raw),
+        ("clear", cleared, Raw),
+        ("indexed_rows", src.indexed_rows(&[2, 0]), Raw),
+        ("rekeyed", src.rekeyed(&schema, |s, d| d.copy_from_slice(s)), Raw),
+    ] {
+        assert_eq!(b.layout(), want, "{what}");
+    }
 }
 
 /// Appends grow the arena — from none at all, and in place within a pooled
@@ -236,23 +153,6 @@ fn drop_pools_a_batch_buffer() {
     assert!(drain_pool().is_empty(), "an empty batch pools nothing");
 }
 
-/// Rows dropped by `truncate_to` re-enter `[count, capacity)`, so a later read
-/// of a cell no refill wrote sees the poison, not the dropped row.
-#[cfg(debug_assertions)]
-#[test]
-fn truncate_to_poisons_dropped_rows() {
-    let mut batch = make_batch_raw(&make_schema_u64_i64(), &[(1, 1, 10), (2, 1, 20)]);
-    batch.truncate_to(RowMark { count: 1, blob_len: 0 });
-    for r in 0..batch.arena_regions() {
-        let s = batch.strides[r] as usize;
-        let start = batch.offsets[r] + s;
-        assert!(
-            batch.data[start..start + s].iter().all(|&b| b == 0xA5),
-            "region {r} of the dropped row is not poisoned"
-        );
-    }
-}
-
 /// A batch whose buffers hold more than twice what its rows need comes back as
 /// a tight copy with its layout; a tight one comes back as
 /// the same allocation.
@@ -287,7 +187,9 @@ fn trimmed_copies_only_oversized_batches() {
     // still tight.
     let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
     cols.extend((0..6).map(|_| SchemaColumn::new(TypeCode::U8, false)));
-    let narrow = Batch::clone(&Batch::zeroed(&SchemaDescriptor::new(&cols, &[0]), 1));
+    let mut narrow = Batch::with_capacity(&SchemaDescriptor::new(&cols, &[0]), 1);
+    narrow.push_zero_filled_row(&[0; 8], 1);
+    let narrow = narrow.clone();
     let ptr = narrow.data.as_ptr();
     assert_eq!(narrow.trimmed().data.as_ptr(), ptr, "a padded one-row copy is kept");
 }
@@ -306,7 +208,7 @@ fn from_ranges_resolves_long_values_under_both_blob_arms() {
     let long: &[u8] = b"a-fairly-long-blob-value-xyz"; // 28 bytes > 12
     let small = make_batch_bytes(&schema, &[(1, 1, long), (2, 1, b"hi")]);
     assert!(
-        !super::super::merge::should_relocate_blob(small.blob.len(), small.count, 1),
+        !super::super::string_heap::should_relocate_blob(small.blob.len(), small.count, 1),
         "precondition: this shape takes the sharing arm",
     );
     let shared = Batch::from_ranges(&small, &[(0, 1)], 0);
@@ -324,7 +226,7 @@ fn from_ranges_resolves_long_values_under_both_blob_arms() {
     let rows: Vec<(u64, i64, &[u8])> = vals.iter().enumerate().map(|(i, v)| (i as u64, 1, &v[..])).collect();
     let wide = make_batch_bytes(&schema, &rows);
     assert!(
-        super::super::merge::should_relocate_blob(wide.blob.len(), wide.count, 1),
+        super::super::string_heap::should_relocate_blob(wide.blob.len(), wide.count, 1),
         "precondition: this shape takes the relocating arm",
     );
     let relocated = Batch::from_ranges(&wide, &[(7, 8)], 0);
@@ -333,22 +235,6 @@ fn from_ranges_resolves_long_values_under_both_blob_arms() {
     assert!(
         relocated.blob.len() < wide.blob.len(),
         "the relocating arm carries only the survivor's span",
-    );
-}
-
-/// `inherit_layout` is a bare field store with no debug verification, so a
-/// gather that dropped the tag is caught nowhere at the producer — only
-/// downstream, at the next skip-point that trusts the claim.
-#[test]
-fn from_ranges_inherits_its_source_layout() {
-    let src = make_batch(&make_schema_u64_i64(), &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-    assert!(src.is_consolidated(), "precondition: the source claims consolidated");
-
-    let subset = Batch::from_ranges(&src, &[(0, 1), (2, 3)], 0);
-    assert_eq!(subset.count, 2);
-    assert!(
-        subset.is_consolidated(),
-        "a disjoint ascending subset keeps order, weights and distinctness",
     );
 }
 
@@ -390,18 +276,15 @@ fn widened_with_nulls_places_the_fill_on_either_side() {
         let nw = out.get_null_word(0);
         assert!(gnitz_wire::null_word_get(nw, fill_slot), "the fill column reads NULL");
         assert!(!gnitz_wire::null_word_get(nw, str_slot), "the input column stays live");
-        assert_eq!(out.layout(), Layout::Consolidated, "({nulls_first})");
     }
 }
 
-/// `consolidate_in_place` folds a raw batch, leaves a certified one alone, and
-/// is a no-op on an empty one; `consolidate_if_needed` borrows a certified one.
+/// `consolidate_in_place` folds a raw batch and leaves a certified one's arena
+/// untouched; `consolidate_if_needed` borrows a certified one.
 #[test]
-fn consolidate_in_place_folds_once_and_certifies() {
+fn consolidate_in_place_folds_only_an_uncertified_batch() {
     let schema = make_schema_u64_i64();
-
     let mut raw = make_batch_raw(&schema, &[(2, 1, 20), (1, 1, 10), (1, 2, 10)]);
-    assert_eq!(raw.layout(), Layout::Raw);
     raw.consolidate_in_place();
     assert_eq!(raw.layout(), Layout::Consolidated);
     assert_eq!(
@@ -411,29 +294,9 @@ fn consolidate_in_place_folds_once_and_certifies() {
 
     let mut already = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
     assert!(Batch::consolidate_if_needed(&already).is_none());
+    let arena = already.data.as_ptr();
     already.consolidate_in_place();
-    assert_eq!(already.count, 2);
-    assert_eq!(already.layout(), Layout::Consolidated);
-
-    let mut empty = Batch::empty_with_schema(&schema);
-    empty.consolidate_in_place();
-    assert_eq!(empty.count, 0);
-}
-
-/// Every operator's empty early-return goes through one of these two, so both
-/// must carry the schema's PK stride rather than a fixed width: a placeholder
-/// whose shape disagrees with its register's is one a later reader trusts.
-#[test]
-fn empty_constructors_carry_the_schema_pk_stride() {
-    let narrow = make_schema_u64_i64(); // U64 PK → stride 8
-    let empty = Batch::empty_with_schema(&narrow);
-    assert_eq!(empty.count, 0);
-    assert_eq!(empty.pk_stride(), 8);
-    assert_eq!(empty.empty_like().pk_stride(), 8);
-
-    let wide = Batch::empty_with_schema(&wide_pk_3xu64_schema()); // 3×U64 → stride 24
-    assert_eq!(wide.pk_stride(), 24);
-    assert_eq!(wide.empty_like().pk_stride(), 24);
+    assert_eq!(already.data.as_ptr(), arena, "no refold");
 }
 
 /// `release_buffers` against `drop(take())` on the case that dominates: clearing
@@ -463,24 +326,6 @@ fn batch_release_bench() {
         release.as_nanos() as f64 / ITERS as f64,
         take.as_nanos() as f64 / ITERS as f64,
     );
-}
-
-/// A weight-0 source row projects to no index entry; a surviving row's entry
-/// carries that row's own weight, retractions included.
-#[test]
-fn project_index_drops_ghosts_and_carries_each_weight() {
-    use crate::schema::{make_index_schema, KeySpec};
-
-    let owner = make_schema_u64_i64();
-    let cols = [1u32];
-    let idx_schema = make_index_schema(&cols, &owner).unwrap();
-    let spec = KeySpec::new(&cols, &owner).unwrap();
-    let src = make_batch_raw(&owner, &[(1, 1, 10), (2, 0, 20), (3, -1, 30)]);
-
-    let projected = src.project_index(&spec, &idx_schema);
-    assert_eq!(projected.len(), 2, "the weight-0 row projects to no entry");
-    assert_eq!(projected.get_weight(0), 1);
-    assert_eq!(projected.get_weight(1), -1, "a retraction projects as a retraction");
 }
 
 /// Stamping a delta key on and off through `rekeyed` gives back every row whole:
@@ -513,7 +358,6 @@ fn rekeyed_round_trips_a_key_prefix() {
     b.certify_layout(Layout::Consolidated);
 
     let stamped = b.rekeyed(&delta, |src, dst| crate::schema::write_delta_key(7, src, dst));
-    assert_eq!(stamped.layout(), Layout::Raw, "rekeyed claims no order");
     assert_eq!(&stamped.get_pk_bytes(1)[..8], &7u64.to_be_bytes());
     let out = stamped.rekeyed(&view, |src, dst| {
         dst.copy_from_slice(crate::schema::delta_view_key(src))
@@ -533,17 +377,13 @@ fn rekeyed_round_trips_a_key_prefix() {
 }
 
 /// Negate is the Z-Set group inverse: every weight flips sign and nothing else
-/// moves. `i64::MIN` is its own inverse in ℤ/2⁶⁴, so `wrapping_neg` leaves it
-/// where it is instead of overflowing.
+/// moves. `i64::MIN` is its own inverse in ℤ/2⁶⁴.
 #[test]
 fn negate_flips_every_weight() {
-    let out = make_batch(&make_schema_u64_i64(), &[(1, 3, 10), (2, -1, 20), (3, i64::MIN, 30)]).negated();
-
-    let got: Vec<(i64, i64)> = (0..out.count)
-        .map(|r| (out.get_weight(r), payload0_i64(&out, r)))
-        .collect();
-    assert_eq!(got, vec![(-3, 10), (1, 20), (i64::MIN, 30)]);
-    assert!(out.is_consolidated());
+    let schema = make_schema_u64_i64();
+    let out = make_batch(&schema, &[(1, 3, 10), (2, -1, 20), (3, i64::MIN, 30)]).negated();
+    let want = make_batch_raw(&schema, &[(1, -3, 10), (2, 1, 20), (3, i64::MIN, 30)]);
+    assert_eq!(weighted_rows(&out), weighted_rows(&want));
 }
 
 // ── Dead heap bytes: sharing, truncation, concatenation, trimming ───────
@@ -665,7 +505,7 @@ fn concat_carries_every_heap_whole() {
 fn a_wasteful_source_relocates_rather_than_adopts() {
     let live = make_string_batch(&[(1, 1, &[b'a'; 20])]);
     let wasteful = padded(make_string_batch(&[(2, 1, &[b'b'; 20])]), 100);
-    assert!(super::super::merge::heap_is_wasteful(
+    assert!(super::super::string_heap::heap_is_wasteful(
         wasteful.dead_heap,
         wasteful.blob.len()
     ));

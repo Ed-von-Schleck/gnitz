@@ -9,6 +9,9 @@ pub(crate) struct HeapNode {
     pub row: u32,
 }
 
+// `step_top` swaps whole nodes on every merge step.
+const _: () = assert!(std::mem::size_of::<HeapNode>() == 8);
+
 /// Not a player: a padding leaf, or a source that has run out. `row` is unread.
 const SENTINEL: u32 = u32::MAX;
 
@@ -118,5 +121,5 @@ impl LoserTree {
 }
 
 #[cfg(test)]
-#[path = "tests/heap.rs"]
+#[path = "tests/loser_tree.rs"]
 mod tests;

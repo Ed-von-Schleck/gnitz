@@ -2080,7 +2080,7 @@ fn test_reduce_min_max_i64_boundary() {
 
 /// Build a raw `Batch` (`sorted = false`, `consolidated = false`) with
 /// one I64 payload column. `pk_encode` maps the row's PK type to the
-/// u128 that `extend_pk` expects (e.g. `|pk: i64| (pk as u64) as u128`
+/// native u128 `begin_row_opk` takes (e.g. `|pk: i64| (pk as u64) as u128`
 /// for signed, `|pk: u64| pk as u128` for unsigned).
 fn make_batch_raw_pk<T: Copy>(
     schema: &SchemaDescriptor,

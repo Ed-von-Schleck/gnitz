@@ -35,18 +35,8 @@ pub fn pk_u64_two_i64_schema() -> SchemaDescriptor {
     )
 }
 
-/// Build a consolidated wide-PK batch from native `(c0, c1, c2, weight, payload)`
-/// tuples. The PK is OPK-encoded via [`Batch::extend_pk_opk`] (big-endian per
-/// column — the at-rest region layout), so the bytes are byte-identical to an
-/// ingested row and to what `worker_for_pk_bytes` routes.
-///
-/// `rows` must be OPK-sorted (non-decreasing PK). The explicit assert below runs
-/// in every build (unlike `certify_layout`'s debug-only verify) and gives a
-/// targeted message: a dropped big-endian flip in the encoder (which sorts e.g.
-/// 256 before 1) trips it here rather than silently scattering scrambled bytes
-/// past a test's self-referential checks. Equal PKs with differing payloads are
-/// allowed (multiset deltas), so only a strictly *decreasing* PK is rejected;
-/// `certify_layout(Consolidated)` then debug-verifies the full (PK, payload) order.
+/// A consolidated batch over [`wide_pk_3xu64_schema`] from native
+/// `(c0, c1, c2, weight, payload)` rows, which must be OPK-sorted.
 pub fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i64)]) -> Batch {
     let mut b = BatchBuilder::new(*schema);
     for &(c0, c1, c2, w, val) in rows {
@@ -91,15 +81,8 @@ pub fn trace_cursor(batch: Batch, schema: SchemaDescriptor) -> ReadCursor {
     crate::storage::create_read_cursor(&[std::rc::Rc::new(batch)], &[], schema)
 }
 
-/// Read row `i`'s PK out of a raw `stride`-wide OPK region as its native
-/// unsigned value — the read-back twin of `Batch::extend_pk` for tests that
-/// inspect a scatter/merge destination buffer directly.
-pub fn read_pk_opk(region: &[u8], i: usize, stride: usize) -> u128 {
-    gnitz_wire::widen_pk_be(&region[i * stride..(i + 1) * stride])
-}
-
 /// Decode a single signed I64 PK column from its OPK (big-endian, sign-flipped)
-/// bytes back to the native value — the inverse of `extend_pk_opk` for an I64 PK.
+/// bytes back to the native value — the inverse of `BatchBuilder::begin_row` for an I64 PK.
 pub fn opk_pk_i64(opk_bytes: &[u8]) -> i64 {
     gnitz_wire::decode_opk_i64(&opk_bytes[..8], gnitz_wire::FixedInt::I64)
 }
@@ -118,22 +101,6 @@ pub fn stored_payload0_i64(fr: &crate::storage::StoredRow) -> i64 {
 /// key (negatives sort before positives only because the encoder sign-flips).
 pub fn make_schema_i64pk_i64() -> SchemaDescriptor {
     pk_payload_schema(&[TypeCode::I64])
-}
-
-/// Build a sorted, consolidated batch with an I64 PK and a single I64 payload
-/// from native `(pk, weight, payload)` tuples. The PK is OPK-encoded via
-/// [`Batch::extend_pk_opk`] (sign-flipped big-endian), so the bytes match an
-/// ingested row; callers must pass OPK-sorted rows.
-pub fn make_batch_i64pk(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
-    for &(pk, w, val) in rows {
-        b.begin_row_opk(&[(pk as u64) as u128], w);
-        b.put_int(val as u128);
-        b.end_row();
-    }
-    let mut b = b.finish();
-    b.certify_layout(Layout::Consolidated);
-    b
 }
 
 // ---------------------------------------------------------------------------

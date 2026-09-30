@@ -13,7 +13,7 @@ use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 #[cfg(test)]
 use crate::storage::repr::batch::Batch;
-use crate::storage::repr::heap::{HeapNode, LoserTree};
+use crate::storage::repr::loser_tree::{HeapNode, LoserTree};
 use crate::storage::repr::merge::MemBatch;
 use crate::storage::repr::merge::{self, ColumnarSource, PosCursor};
 use crate::storage::repr::seek::gallop_by;

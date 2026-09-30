@@ -3,7 +3,8 @@
 
 use super::batch::{row_width, strides_from_schema, Batch, MAX_BATCH_REGIONS, REG_PAYLOAD_START, REG_PK};
 use super::batch_pool::{acquire_arena, recycle_buf};
-use super::merge::{blob_span_key, copy_string_cells, prorated_blob_cap, BlobCache, DirectWriter, MemBatch};
+use super::merge::{DirectWriter, MemBatch};
+use super::string_heap::{blob_span_key, copy_string_cells, prorated_blob_cap, walk_heap_spans, BlobCache};
 use crate::schema::{SchemaDescriptor, SchemaFacts};
 use gnitz_wire::wal;
 use gnitz_wire::{Regions, TypeCode};
@@ -315,53 +316,6 @@ fn validate_string_cells(mb: &MemBatch<'_>, schema: &SchemaDescriptor) -> Result
     .ok_or("data WAL German string is not in canonical form")?;
     simdutf8::basic::from_utf8(&text).map_err(|_| "a STRING cell is not UTF-8")?;
     Ok(dead)
-}
-
-/// The exact count of `mb`'s heap bytes no long string cell references, a cell
-/// overrunning the heap referencing none.
-pub(super) fn measure_dead_heap(mb: &MemBatch<'_>, schema: &SchemaDescriptor) -> usize {
-    walk_heap_spans(mb, schema, |_, _| true).expect("an accepting walk")
-}
-
-/// Mark every German-string cell's heap span, after `accept` has passed the
-/// cell, and answer the heap bytes left unmarked; `None` at the first cell
-/// `accept` refuses.
-fn walk_heap_spans(
-    mb: &MemBatch<'_>,
-    schema: &SchemaDescriptor,
-    mut accept: impl FnMut(&[u8; 16], TypeCode) -> bool,
-) -> Option<usize> {
-    let heap = mb.blob.len();
-    if !schema.has_german_string() {
-        return Some(heap);
-    }
-    let mut live = vec![0u64; heap.div_ceil(64)];
-    for (pi, col) in schema.payload_columns() {
-        if !col.type_code.is_german_string() {
-            continue;
-        }
-        for cell in mb.col_data(pi, 16).as_chunks::<16>().0 {
-            if !accept(cell, col.type_code) {
-                return None;
-            }
-            if let Some(span) = gnitz_wire::german_string_heap(cell, heap) {
-                mark_bits(&mut live, span);
-            }
-        }
-    }
-    let marked: usize = live.iter().map(|w| w.count_ones() as usize).sum();
-    Some(heap - marked)
-}
-
-/// Set bits `span` of the bitset `bits`.
-fn mark_bits(bits: &mut [u64], span: std::ops::Range<usize>) {
-    let (mut at, end) = (span.start, span.end);
-    while at < end {
-        let (word, bit) = (at / 64, at % 64);
-        let n = (64 - bit).min(end - at);
-        bits[word] |= gnitz_wire::low_bits_mask(n) << bit;
-        at += n;
-    }
 }
 
 /// A WAL block validated under `schema`, borrowing `data`, with the region

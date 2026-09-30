@@ -1,7 +1,6 @@
 //! The borrowed batch view [`MemBatch`], the columnar source abstraction and
-//! the direct row writer over it, German-string blob relocation, and the merges
-//! built on them: the N-way run merge, in-batch consolidation, and the two-way
-//! batch merge.
+//! the direct row writer over it, and the merges built on them: the N-way run
+//! merge, in-batch consolidation, and the two-way batch merge.
 //!
 //! Operates on flat columnar buffers: pk[OPK big-endian, `pk_stride` B/row],
 //! weight[i64 LE], null_bitmap[u64 LE], payload columns, blob arena.
@@ -11,22 +10,19 @@
 //! are dropped. [`Batch::merged_consolidated`] is the two-input counterpart over
 //! the same comparator family — Z-Set `+`, fold included.
 
-use std::cell::Cell;
 use std::cmp::Ordering;
-use std::collections::VecDeque;
 use std::ops::{ControlFlow, Range};
 
 use super::batch::{Batch, Layout};
-use super::batch_pool::tls_pool;
-use super::heap::{HeapNode, LoserTree};
+use super::loser_tree::{HeapNode, LoserTree};
 use super::scatter::DecodedColumns;
 use super::seek::pk_group_end;
+use super::string_heap::{rebase_string_cell, BlobCache};
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, pk_width_dispatch, PkSortKey};
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::{BatchView, RowSource};
-use gnitz_wire::{read_u64_le, write_u64_le};
-use rustc_hash::FxHashMap;
+use gnitz_wire::read_u64_le;
 
 // ---------------------------------------------------------------------------
 // ColPtr / UnifiedSource: type-erased column accessors, one `(base, stride)`
@@ -109,256 +105,6 @@ pub(crate) fn mem_batch_to_unified<'a>(
         cols_off,
         blob: mb.blob,
         heap_at: None,
-    }
-}
-
-type SpanKey = (usize, usize, usize);
-type SpanMap = FxHashMap<SpanKey, usize>;
-
-/// One source span, identified by the heap it lives in. Shared so a sizing pass
-/// charges exactly the spans a relocation copies.
-#[inline]
-pub(super) fn blob_span_key(src_blob: &[u8], start: usize, length: usize) -> SpanKey {
-    (src_blob.as_ptr() as usize, start, length)
-}
-
-/// Reserve hint for a destination heap taking `out_rows` of a `src_rows`-row
-/// source whose heap is `src_blob` bytes: that slice's row-proportional share,
-/// rounded up, and at most the whole heap.
-pub(crate) fn prorated_blob_cap(src_blob: usize, src_rows: usize, out_rows: usize) -> usize {
-    if src_blob == 0 || src_rows == 0 {
-        return 0;
-    }
-    let per_row = src_blob.div_ceil(src_rows) as u128;
-    (per_row * out_rows as u128).min(src_blob as u128) as usize
-}
-
-/// Cost of relocating one German-string cell, in bytes of whole-heap memcpy — the
-/// unit that lets [`should_relocate_blob`] weigh the two arms with one
-/// comparison. Set from `slice_blob_relocate_bench`, which sweeps both arms over
-/// slice fraction × string width; the resulting crossovers (~3 % of a 16-byte-string
-/// source, ~7 % at 40 bytes, ~34 % at 256, ~67 % at 1024) are what this value fits.
-const RELOCATE_CELL_COST_BYTES: usize = 500;
-
-/// Whether copying `out_rows` rows out of a `src_rows`-row source whose heap is
-/// `src_blob` bytes should relocate the slice's own string cells rather than
-/// carry the source's whole heap.
-///
-/// The two arms cost: relocation, one cell rewrite per row plus the slice's own
-/// share of the heap (`src_blob / src_rows` per row); the whole-heap copy,
-/// `src_blob` regardless of how few rows are kept. Expressing the per-cell
-/// rewrite as [`RELOCATE_CELL_COST_BYTES`] of memcpy makes that one comparison.
-pub(crate) fn should_relocate_blob(src_blob: usize, src_rows: usize, out_rows: usize) -> bool {
-    src_rows > 0 && src_blob > out_rows.saturating_mul(RELOCATE_CELL_COST_BYTES + src_blob / src_rows)
-}
-
-/// A heap more than a quarter dead is compacted rather than carried.
-pub(crate) fn heap_is_wasteful(dead: usize, heap: usize) -> bool {
-    dead.saturating_mul(4) > heap
-}
-
-/// The dead-byte bound a destination takes on by carrying a source's whole
-/// heap to copy `kept_rows` of its `src_rows` rows, or `None` when those rows'
-/// cells are relocated instead: the cheaper copy by [`should_relocate_blob`],
-/// or a carried heap that would be [wasteful](heap_is_wasteful).
-///
-/// `dead` is the source's own bound; `excluded` sums the long bytes of the rows
-/// left behind, and runs only once the row-prorated share of those rows has not
-/// already refused the carry — so a small slice of a large source never walks
-/// the rest of it.
-pub(super) fn carried_dead(
-    heap: usize,
-    dead: usize,
-    src_rows: usize,
-    kept_rows: usize,
-    excluded: impl FnOnce() -> usize,
-) -> Option<usize> {
-    if kept_rows == 0 {
-        return None;
-    }
-    if heap == 0 {
-        return Some(0);
-    }
-    let left = src_rows - kept_rows;
-    if should_relocate_blob(heap, src_rows, kept_rows)
-        || heap_is_wasteful(dead + prorated_blob_cap(heap, src_rows, left), heap)
-    {
-        return None;
-    }
-    let dead = if left == 0 { dead } else { dead + excluded() };
-    (!heap_is_wasteful(dead, heap)).then_some(dead)
-}
-
-/// The heap bytes a long German-string cell names; none for a short one.
-#[inline]
-pub(super) fn cell_long_bytes(cell: &[u8]) -> usize {
-    gnitz_wire::german_string_heap(cell, usize::MAX).map_or(0, |span| span.len())
-}
-
-/// [`row_long_bytes`] summed over every row of `src` outside the ascending,
-/// disjoint `kept` ranges.
-pub(super) fn long_bytes_outside<S: RowSource>(src: &S, mask: u64, kept: &[(usize, usize)]) -> usize {
-    let bounds = kept.iter().copied().chain([(src.row_count(), src.row_count())]);
-    let gaps = bounds.scan(0, |next, (start, end)| {
-        let gap = *next..start;
-        *next = end;
-        Some(gap)
-    });
-    gaps.flatten().map(|row| row_long_bytes(src, mask, row)).sum()
-}
-
-/// The heap bytes `row`'s long cells in the German-string slots `mask` name.
-/// A span two cells share counts twice.
-#[inline]
-pub(super) fn row_long_bytes<S: RowSource>(src: &S, mask: u64, row: usize) -> usize {
-    gnitz_wire::BitIter(mask)
-        .map(|pi| cell_long_bytes(src.get_col_ptr(row, pi, 16)))
-        .sum()
-}
-
-/// Copy the whole German-string cells `src` onto `dst`, each rebased as
-/// [`rebase_string_cell`] rebases one: the carried arm shifts them in bulk.
-#[inline]
-pub(crate) fn copy_string_cells(
-    dst: &mut [u8],
-    src: &[u8],
-    src_blob: &[u8],
-    dst_blob: &mut Vec<u8>,
-    heap_at: Option<usize>,
-    cache: &mut BlobCache,
-) {
-    match heap_at {
-        Some(base) => {
-            dst.copy_from_slice(src);
-            gnitz_wire::shift_german_string_heaps(dst, base);
-        }
-        None => {
-            for (d, s) in dst.as_chunks_mut::<16>().0.iter_mut().zip(src.as_chunks::<16>().0) {
-                *d = relocate_german_string_vec(s, src_blob, dst_blob, Some(&mut *cache));
-            }
-        }
-    }
-}
-
-/// Write `src_cell` into `dst`, rebased onto the destination heap: shifted
-/// onto `src_blob` carried there at `heap_at`, or relocated into `dst_blob`
-/// under `cache`.
-#[inline(always)]
-fn rebase_string_cell(
-    dst: &mut [u8],
-    src_cell: &[u8],
-    src_blob: &[u8],
-    dst_blob: &mut Vec<u8>,
-    heap_at: Option<usize>,
-    cache: &mut BlobCache,
-) {
-    match heap_at {
-        Some(base) => {
-            dst.copy_from_slice(&src_cell[..16]);
-            gnitz_wire::shift_german_string_heaps(dst, base);
-        }
-        None => dst.copy_from_slice(&relocate_german_string_vec(src_cell, src_blob, dst_blob, Some(cache))),
-    }
-}
-
-/// `src_cell` rebased onto `dst_blob`: a short cell with its pad zeroed, a long
-/// one with its content appended to `dst_blob` — once per source span when
-/// `cache` is `Some`. A long cell overrunning `src_blob` becomes the empty
-/// string.
-#[inline]
-pub(crate) fn relocate_german_string_vec(
-    src_cell: &[u8],
-    src_blob: &[u8],
-    dst_blob: &mut Vec<u8>,
-    cache: Option<&mut BlobCache>,
-) -> [u8; 16] {
-    let src: &[u8; 16] = src_cell[..16]
-        .try_into()
-        .expect("relocate_german_string_vec: src must be a 16-byte German string cell");
-    if let Some(cell) = gnitz_wire::canonical_short_cell(src) {
-        return cell;
-    }
-    relocate_long_german_string(src, src_blob, dst_blob, cache)
-}
-
-/// The long arm of `relocate_german_string_vec`, out of line so the short arm
-/// inlines alone.
-fn relocate_long_german_string(
-    src: &[u8; 16],
-    src_blob: &[u8],
-    dst_blob: &mut Vec<u8>,
-    cache: Option<&mut BlobCache>,
-) -> [u8; 16] {
-    let mut dest = [0u8; 16];
-    let Some(span) = gnitz_wire::german_string_heap(src, src_blob.len()) else {
-        return dest;
-    };
-    let length = span.end - span.start;
-    // A long cell's length and prefix carry through; only its offset moves.
-    dest[0..8].copy_from_slice(&src[0..8]);
-    let new_offset = dst_blob.len();
-    let off = match cache {
-        Some(cache) => {
-            let key = blob_span_key(src_blob, span.start, length);
-            *cache.map().entry(key).or_insert_with(|| {
-                dst_blob.extend_from_slice(&src_blob[span]);
-                new_offset
-            })
-        }
-        None => {
-            dst_blob.extend_from_slice(&src_blob[span]);
-            new_offset
-        }
-    };
-    write_u64_le(&mut dest, 8, off as u64);
-    dest
-}
-
-// ---------------------------------------------------------------------------
-// Blob cache
-// ---------------------------------------------------------------------------
-
-/// The most entries a [`BlobCache`] reserves up front. Callers pass a row count,
-/// but only long strings reach the map.
-const BLOB_CACHE_RESERVE_CAP: usize = 4096;
-
-thread_local! {
-    static BLOB_CACHE_POOL: Cell<VecDeque<SpanMap>> = const { Cell::new(VecDeque::new()) };
-}
-
-/// Dedups long-string spans relocated into one destination heap, so each is
-/// copied once. Its map is pooled, and taken at the first relocation.
-pub(crate) struct BlobCache {
-    map: Option<SpanMap>,
-    reserve: usize,
-}
-
-impl BlobCache {
-    pub(crate) fn new(rows: usize) -> Self {
-        BlobCache {
-            map: None,
-            reserve: rows.min(BLOB_CACHE_RESERVE_CAP),
-        }
-    }
-
-    #[inline]
-    pub(super) fn map(&mut self) -> &mut SpanMap {
-        let reserve = self.reserve;
-        self.map.get_or_insert_with(|| {
-            let mut map = tls_pool::take(&BLOB_CACHE_POOL, |_| true).unwrap_or_default();
-            map.reserve(reserve);
-            map
-        })
-    }
-}
-
-impl Drop for BlobCache {
-    fn drop(&mut self) {
-        if let Some(mut map) = self.map.take() {
-            let bytes = map.capacity() * std::mem::size_of::<(SpanKey, usize)>();
-            map.clear();
-            tls_pool::recycle(&BLOB_CACHE_POOL, map, bytes);
-        }
     }
 }
 

@@ -8,7 +8,7 @@ use super::*;
 use crate::runtime::reactor::make_reactor;
 use crate::runtime::reactor::Reactor;
 use crate::runtime::test_support::try_poll_once;
-use crate::test_support::make_schema_u64_i64;
+use crate::test_support::{make_batch_raw, make_schema_u64_i64};
 use gnitz_wire::{WireConflictMode, WireStatus};
 
 fn fault(text: &str) -> WireFault {
@@ -19,7 +19,7 @@ fn fault(text: &str) -> WireFault {
 }
 
 fn batch_of(rows: usize) -> Batch {
-    Batch::zeroed(&make_schema_u64_i64(), rows)
+    make_batch_raw(&make_schema_u64_i64(), &vec![(0, 1, 0); rows])
 }
 
 /// A push of `rows` rows. Its client's receiver is dropped: nothing here reads a

@@ -6,8 +6,8 @@
 use std::ops::Range;
 
 use super::batch_pool::{acquire_arena, acquire_uninit, is_tight, recycle_buf};
-use super::merge::{self, copy_string_cells, relocate_german_string_vec, BlobCache, ColPtr, MemBatch};
-use crate::schema::key::NarrowPkOpk;
+use super::merge::{self, ColPtr, MemBatch};
+use super::string_heap::{self, copy_string_cells, relocate_german_string_vec, BlobCache};
 use crate::schema::{ColumnLocator, SchemaDescriptor, SchemaFacts};
 use gnitz_expr::RowSource;
 use gnitz_wire::{read_i64_le, read_u64_le, write_u64_le, TypeCode};
@@ -165,9 +165,7 @@ pub struct Batch {
     offsets: [usize; MAX_BATCH_REGIONS],
     strides: [u8; MAX_BATCH_REGIONS],
     capacity: usize,
-    /// Live row count. In-crate code reads and advances it directly; outside,
-    /// [`Batch::len`] reads it and the row appenders are the only writers, so
-    /// no counted row can exist without every region written for it.
+    /// Live row count; [`Batch::len`] outside the crate.
     pub(crate) count: usize,
     /// Cached row-layout claim (private; mutated only through the layout API).
     /// Fresh batches default to `Raw` — a forgotten raise degrades to a safe
@@ -251,19 +249,6 @@ impl Batch {
             0 => self.blob = acquire_arena(bytes),
             _ => self.blob.reserve(bytes),
         }
-    }
-
-    /// `rows` all-zero rows, already published. The one shape [`Self::with_capacity`]
-    /// cannot serve: a test that needs a batch of a given wire size but no
-    /// particular content, and so writes no rows at all.
-    pub fn zeroed(schema: &SchemaDescriptor, rows: usize) -> Self {
-        let (strides, nr) = strides_from_schema(schema);
-        let mut b = Self::empty_from(strides, schema);
-        b.capacity = rows.max(1);
-        b.count = rows;
-        let total_size = compute_offsets_into(&strides, nr as usize, rows.max(1), &mut b.offsets);
-        b.data = vec![0u8; total_size];
-        b
     }
 
     /// An owned, tightly packed copy of `mb`'s `count` rows and its whole heap,
@@ -616,14 +601,6 @@ impl Batch {
     }
 
     #[inline]
-    pub(crate) fn extend_weight(&mut self, d: &[u8]) {
-        self.extend_region(REG_WEIGHT, d);
-    }
-    #[inline]
-    pub(crate) fn extend_null_bmp(&mut self, d: &[u8]) {
-        self.extend_region(REG_NULL_BMP, d);
-    }
-    #[inline]
     pub(crate) fn extend_col(&mut self, pi: usize, d: &[u8]) {
         self.extend_region(REG_PAYLOAD_START + pi, d);
     }
@@ -636,41 +613,18 @@ impl Batch {
         self.extend_col(pi, &cell);
     }
 
-    /// Append a narrow PK from a `u128` — the [`NarrowPkOpk`] image (right-aligned
-    /// big-endian) appended through [`Self::extend_pk_bytes`]. Valid for an
-    /// **all-unsigned** PK only: OPK == BE there, so `widen_pk_be(extend_pk(v))`
-    /// round-trips and a compound key is just the big-endian concatenation a
-    /// packed `u128` already spells. A signed column anywhere needs
-    /// `extend_pk_opk` / `extend_pk_bytes`; the assert below holds every call
-    /// site to that.
-    #[inline]
-    pub(crate) fn extend_pk(&mut self, pk: u128) {
-        debug_assert!(
-            !self.schema.pk_columns().any(|(_, c)| c.is_signed()),
-            "extend_pk writes an unflipped right-aligned big-endian key: a PK with a signed column \
-             must use extend_pk_opk / extend_pk_bytes",
-        );
-        let key = NarrowPkOpk::new(pk, self.strides[REG_PK] as usize);
-        self.extend_pk_bytes(key.bytes());
-    }
-
-    #[inline]
-    pub(crate) fn extend_pk_bytes(&mut self, bytes: &[u8]) {
-        assert_eq!(
-            bytes.len(),
-            self.strides[REG_PK] as usize,
-            "extend_pk_bytes: length must equal pk_stride",
-        );
-        self.extend_region(REG_PK, bytes);
-    }
-
     /// Open a row: PK region (exactly `pk_stride` OPK bytes) and weight. The
     /// caller then writes every payload column, in any order, and closes with
     /// [`Self::commit_row`].
     #[inline(always)]
     pub(crate) fn begin_row(&mut self, pk_bytes: &[u8], weight: i64) {
-        self.extend_pk_bytes(pk_bytes);
-        self.extend_weight(&weight.to_le_bytes());
+        assert_eq!(
+            pk_bytes.len(),
+            self.strides[REG_PK] as usize,
+            "begin_row: the key must be exactly pk_stride bytes",
+        );
+        self.extend_region(REG_PK, pk_bytes);
+        self.extend_region(REG_WEIGHT, &weight.to_le_bytes());
     }
 
     /// Close the row [`Self::begin_row`] opened: the NULL word, then the count,
@@ -678,7 +632,7 @@ impl Batch {
     /// row before every region carries it.
     #[inline(always)]
     pub(crate) fn commit_row(&mut self, null_word: u64) {
-        self.extend_null_bmp(&null_word.to_le_bytes());
+        self.extend_region(REG_NULL_BMP, &null_word.to_le_bytes());
         self.count += 1;
         self.layout = Layout::Raw;
     }
@@ -705,20 +659,6 @@ impl Batch {
             self.fill_col_zero(pi);
         }
         self.commit_row(0);
-    }
-
-    /// Append a row's PK from native per-column values, OPK-encoding them
-    /// (big-endian, with the sign-bit flip for signed columns) before the
-    /// bytes are written. `native_col_vals` holds one native value per PK
-    /// column in `pk_columns()` order. Use for signed or compound PK test
-    /// tables where `extend_pk` (no sign flip) writes incorrect OPK bytes.
-    ///
-    /// Encodes through the production `schema::key` encoder — a layer *below*
-    /// storage — so this stays a downward edge. Not test-only: it is what
-    /// `BatchBuilder::begin_row_opk`, and through it the `SysRowSink` the
-    /// catalog writes rows with, dispatches to.
-    pub(crate) fn extend_pk_opk(&mut self, native_col_vals: &[u128]) {
-        self.extend_pk_bytes(self.schema.opk_key_cols(native_col_vals).pk_bytes());
     }
 
     /// Zero-fill payload column `pi` at the current row position.
@@ -784,7 +724,7 @@ impl Batch {
         if heap_at.is_none() && !src.blob.is_empty() {
             // The rows this call copies, not the whole source heap: a many-run merge
             // appends into one output, and the whole heap per run ratchets capacity.
-            self.reserve_blob(merge::prorated_blob_cap(src.blob.len(), src.count, total));
+            self.reserve_blob(string_heap::prorated_blob_cap(src.blob.len(), src.count, total));
         }
         for &(start, end) in ranges {
             let n = end - start;
@@ -866,7 +806,7 @@ impl AppendSession<'_> {
     /// `heap_at` but the row is not copied.
     pub(crate) fn leave_out(&mut self, src: &MemBatch<'_>, heap_at: Option<usize>, row: usize) {
         if heap_at.is_some() {
-            self.dst.charge_dead(merge::row_long_bytes(src, self.mask, row));
+            self.dst.charge_dead(string_heap::row_long_bytes(src, self.mask, row));
         }
     }
 }
@@ -919,33 +859,19 @@ impl Batch {
     /// verified on the way in.
     #[inline]
     pub(crate) fn consolidated_verified(&self) -> bool {
-        #[cfg(debug_assertions)]
         if self.layout == Layout::Consolidated {
-            self.debug_verify_consolidated(&self.schema);
+            self.debug_verify_consolidated();
         }
         self.is_consolidated()
     }
 
-    /// Raise this batch's layout to `layout`, debug-verifying the data first. The
-    /// ONLY way the guarantee goes up. Both provenance kernels and the wire-decode
-    /// trust boundary call it, so an over-claiming kernel and a lying wire frame
-    /// are caught identically — at the producer, schema in hand.
-    ///
-    /// **In release the verification does not run** — the `debug_verify_*` calls
-    /// below are `#[cfg(debug_assertions)]`, so this is a single field store and
-    /// the claim is entirely the caller's. Claiming `Consolidated` over data that
-    /// is not sorted-and-summed makes every downstream skip-point fold weights
-    /// against the wrong element, with no error and no assertion. Call it only
-    /// where the code just produced the property it names.
-    #[cfg_attr(not(debug_assertions), allow(unused_variables))]
+    /// Raise this batch's layout to `layout`, the only way it goes up. A debug
+    /// build verifies the claim; a release build takes it on trust.
     #[inline]
     pub fn certify_layout(&mut self, layout: Layout) {
-        #[cfg(debug_assertions)]
-        self.debug_verify_null_bits(&self.schema);
-        #[cfg(debug_assertions)]
-        match layout {
-            Layout::Raw => {}
-            Layout::Consolidated => self.debug_verify_consolidated(&self.schema),
+        self.debug_verify_null_bits();
+        if layout == Layout::Consolidated {
+            self.debug_verify_consolidated();
         }
         self.layout = layout;
     }
@@ -1014,10 +940,13 @@ impl Batch {
         self.layout = layout;
     }
 
-    /// Debug-only: every null bit sits under a payload column `schema` declares
+    /// Debug-only: every null bit sits under a payload column the schema declares
     /// nullable, over a zeroed cell — what wire ingress checks in release.
-    #[cfg(debug_assertions)]
-    fn debug_verify_null_bits(&self, schema: &SchemaDescriptor) {
+    fn debug_verify_null_bits(&self) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let schema = &self.schema;
         let violation = gnitz_wire::first_not_null_violation(schema.not_null_payload_slots(), self.null_bmp_data());
         debug_assert!(
             violation.is_none(),
@@ -1036,8 +965,10 @@ impl Batch {
     /// Debug-only: assert the data is fully consolidated — strictly increasing by
     /// (PK, payload) (no unfolded duplicate) AND no zero-weight row (ghost
     /// eliminated, §2).
-    #[cfg(debug_assertions)]
-    pub(crate) fn debug_verify_consolidated(&self, schema: &SchemaDescriptor) {
+    pub(crate) fn debug_verify_consolidated(&self) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
         for i in 0..self.count {
             debug_assert_ne!(
                 self.get_weight(i),
@@ -1045,7 +976,7 @@ impl Batch {
                 "batch flagged consolidated, but row {i} has weight 0 (ghost not eliminated)"
             );
             if i + 1 < self.count {
-                let ord = crate::schema::payload_order::compare_full_rows(schema, self, i, self, i + 1);
+                let ord = crate::schema::payload_order::compare_full_rows(&self.schema, self, i, self, i + 1);
                 debug_assert_eq!(
                     ord,
                     std::cmp::Ordering::Less,
@@ -1067,7 +998,7 @@ impl Batch {
     /// The rows `indices` names, in that order, at their own weights; none may be
     /// weight 0.
     pub(crate) fn indexed_rows(&self, indices: &[u32]) -> Self {
-        let blob_cap = merge::prorated_blob_cap(self.blob.len(), self.count, indices.len());
+        let blob_cap = string_heap::prorated_blob_cap(self.blob.len(), self.count, indices.len());
         write_to_batch(&self.schema, indices.len(), blob_cap, |writer| {
             super::scatter::scatter_copy(&self.as_mem_batch(), indices, writer);
         })
@@ -1086,39 +1017,6 @@ impl Batch {
         );
         let mut out = self.indexed_rows(indices);
         out.inherit_layout(self);
-        out
-    }
-
-    /// Project every live row into one secondary-index entry. An index schema is
-    /// all PK and no payload, so the entry *is* its key `(indexed col(s) [promoted]
-    /// ‖ source PK)`, composed by `spec.write_entry` — which also decides the SQL
-    /// NULL-distinctness skip.
-    pub fn project_index(&self, spec: &crate::schema::KeySpec, idx_schema: &SchemaDescriptor) -> Batch {
-        let idx_stride = idx_schema.pk_stride();
-        assert_eq!(
-            idx_stride,
-            spec.key_size() + self.schema.pk_stride(),
-            "index schema of another spec"
-        );
-
-        let mut out = Batch::with_capacity(idx_schema, self.count);
-        // `SchemaDescriptor::new` bounds every index `pk_stride` by `MAX_PK_BYTES`.
-        let mut idx_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
-
-        let mb = self.as_mem_batch();
-
-        for row in 0..self.count {
-            let weight = mb.get_weight(row);
-            if weight == 0 {
-                continue;
-            }
-            if !spec.write_entry(&mb, row, &mut idx_pk_buf) {
-                continue;
-            }
-            out.push_key_row(&idx_pk_buf[..idx_stride], weight);
-        }
-
-        // Left `Raw`: entries arrive in source order, and the index ingest folds them.
         out
     }
 
@@ -1371,15 +1269,15 @@ impl Batch {
             let cells = src.col_data(pi, 16).as_chunks::<16>().0;
             for &(start, end) in kept {
                 for run in cells[start..end].chunks(DEAD_CHECK_CELLS) {
-                    dead += run.iter().map(|cell| merge::cell_long_bytes(cell)).sum::<usize>();
-                    if merge::heap_is_wasteful(dead, heap) {
+                    dead += run.iter().map(|cell| string_heap::cell_long_bytes(cell)).sum::<usize>();
+                    if string_heap::heap_is_wasteful(dead, heap) {
                         return None;
                     }
                 }
             }
         }
-        let excluded = || merge::long_bytes_outside(src, mask, kept);
-        let dead = merge::carried_dead(heap, dead, src.count, range_rows(kept), excluded)?;
+        let excluded = || string_heap::long_bytes_outside(src, mask, kept);
+        let dead = string_heap::carried_dead(heap, dead, src.count, range_rows(kept), excluded)?;
         let base = self.blob.len();
         self.reserve_blob(src.blob.len());
         self.blob.extend_from_slice(src.blob);
@@ -1547,14 +1445,14 @@ impl Batch {
     }
 
     /// `self`, or a tight copy when its buffers are not [`is_tight`] for its rows
-    /// — a [`Self::compacted`] one when its heap is [`merge::heap_is_wasteful`].
+    /// — a [`Self::compacted`] one when its heap is [`string_heap::heap_is_wasteful`].
     /// The bound counts a span several cells share once per cell, so a wasteful
     /// one is measured before a compaction is paid for.
     pub(crate) fn trimmed(mut self) -> Batch {
         self.debug_verify_dead_heap();
-        if merge::heap_is_wasteful(self.dead_heap, self.blob.len()) {
-            self.dead_heap = super::batch_wire::measure_dead_heap(&self.as_mem_batch(), &self.schema);
-            if merge::heap_is_wasteful(self.dead_heap, self.blob.len()) {
+        if string_heap::heap_is_wasteful(self.dead_heap, self.blob.len()) {
+            self.dead_heap = string_heap::measure_dead_heap(&self.as_mem_batch(), &self.schema);
+            if string_heap::heap_is_wasteful(self.dead_heap, self.blob.len()) {
                 return self.compacted();
             }
         }
@@ -1580,7 +1478,7 @@ impl Batch {
     /// Debug-only: `dead_heap` bounds the heap's unreferenced bytes from above.
     pub(super) fn debug_verify_dead_heap(&self) {
         if cfg!(debug_assertions) {
-            let measured = super::batch_wire::measure_dead_heap(&self.as_mem_batch(), &self.schema);
+            let measured = string_heap::measure_dead_heap(&self.as_mem_batch(), &self.schema);
             debug_assert!(
                 measured <= self.dead_heap,
                 "heap holds {measured} unreferenced bytes, past its bound of {} ({} bytes, {} rows)",

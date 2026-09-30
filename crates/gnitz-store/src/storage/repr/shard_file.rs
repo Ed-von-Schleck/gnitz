@@ -139,14 +139,13 @@ impl Batch {
         let n = self.count;
         assert!(n > 0, "every writer skips an empty output");
         // A shard carries no dead heap bytes.
-        if self.dead_heap != 0 && super::batch_wire::measure_dead_heap(&self.as_mem_batch(), schema) != 0 {
+        if self.dead_heap != 0 && super::string_heap::measure_dead_heap(&self.as_mem_batch(), schema) != 0 {
             return self.compacted().write_as_shard(path, opts);
         }
         self.debug_verify_dead_heap();
         let regions = self.wire_regions();
         let npc = schema.num_payload_cols();
-        #[cfg(debug_assertions)]
-        self.debug_verify_consolidated(schema);
+        self.debug_verify_consolidated();
         debug_assert!(
             !opts.skeleton || npc == 0,
             "a skeleton shard must be written under the PK-only projection of its relation's schema",

@@ -358,3 +358,22 @@ fn circuit_state_refuses_a_resumed_trace_without_its_manifest() {
     std::fs::remove_file(trace.manifest(&dir)).unwrap();
     assert!(open().is_err());
 }
+
+/// Each nonzero-weight source row projects to exactly its `write_entry` key at
+/// its own weight, retractions included; a weight-0 row projects to nothing.
+#[test]
+fn project_index_writes_each_entry_at_its_rows_weight() {
+    let owner = crate::test_support::make_schema_u64_i64();
+    let (spec, idx_schema) = crate::schema::index_spec_and_schema(&[1], &owner).unwrap();
+    let src = crate::test_support::make_batch_raw(&owner, &[(1, 1, 10), (2, 0, 20), (3, -1, 30)]);
+    let entry = |row: usize| {
+        let mut e = vec![0u8; idx_schema.pk_stride()];
+        assert!(spec.write_entry(&src.as_mem_batch(), row, &mut e));
+        e
+    };
+    let projected = project_index(&src, &spec, &idx_schema);
+    let got: Vec<(Vec<u8>, i64)> = (0..projected.len())
+        .map(|r| (projected.get_pk_bytes(r).to_vec(), projected.get_weight(r)))
+        .collect();
+    assert_eq!(got, [(entry(0), 1), (entry(2), -1)]);
+}

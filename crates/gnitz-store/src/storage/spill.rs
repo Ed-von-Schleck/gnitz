@@ -8,7 +8,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 
-use super::repr::heap::{HeapNode, LoserTree};
+use super::repr::loser_tree::{HeapNode, LoserTree};
 use gnitz_foundation::posix_io::Mmap;
 use gnitz_wire::MAX_PK_BYTES;
 

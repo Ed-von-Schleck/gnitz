@@ -9,7 +9,7 @@ use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::error::StorageError;
 use crate::test_support::{
     make_batch, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64, pk_only_schema,
-    read_german_string, u64_pk_schema,
+    read_german_string, sweep_bit_flips, u64_pk_schema,
 };
 use gnitz_wire::num_regions;
 use gnitz_wire::{read_i64_le, write_u64_le};
@@ -164,8 +164,13 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
             shard.shard_filter_may_contain(crate::schema::key::probe_key(key)),
             "{label}: PK filter false negative on row {r}"
         );
-        let lb = want.find_lower_bound_bytes(key);
+        let lb = (0..n).find(|&i| want.get_pk_bytes(i) == key).unwrap();
         assert_eq!(shard.find_lower_bound_bytes(key), lb, "{label}: lower bound row {r}");
+        assert_eq!(
+            want.find_lower_bound_bytes(key),
+            lb,
+            "{label}: batch lower bound row {r}"
+        );
         for hint in [0, lb] {
             assert_eq!(
                 shard.advance_to(key, hint),
@@ -216,6 +221,19 @@ fn shapes() -> Vec<Shape> {
     let wide_key = |i: usize| (u64::MAX as u128 - 2 + i as u128) * 3;
 
     vec![
+        // One row: every region Constant-encoded.
+        Shape {
+            label: "all-constant",
+            written: make_batch(&u64_i64, &[(1, 1, 7)]),
+            reader: u64_i64,
+            pack: false,
+            encodings: vec![
+                (REG_PK, Constant),
+                (REG_WEIGHT, Constant),
+                (REG_NULL_BMP, Constant),
+                (REG_PAYLOAD_START, Constant),
+            ],
+        },
         Shape {
             label: "raw weight, nullable raw i64",
             written: build(nullable_i64, 30, |b, i| {
@@ -334,11 +352,22 @@ fn shapes() -> Vec<Shape> {
     ]
 }
 
+/// Every shape written under `dir`, with its path.
+fn written_shapes(dir: &std::path::Path) -> Vec<(Shape, String)> {
+    shapes()
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let path = write(dir, &format!("shape_{i}.db"), &s.written, s.pack);
+            (s, path)
+        })
+        .collect()
+}
+
 #[test]
 fn every_shape_reads_back_through_every_surface() {
     let dir = tempfile::tempdir().unwrap();
-    for (i, s) in shapes().into_iter().enumerate() {
-        let path = write(dir.path(), &format!("shape_{i}.db"), &s.written, s.pack);
+    for (s, path) in written_shapes(dir.path()) {
         let image = std::fs::read(&path).unwrap();
         for &(region, enc) in &s.encodings {
             assert_eq!(region_dir(&image, region).1, enc, "{}: region {region}", s.label);
@@ -583,7 +612,7 @@ fn slice_blob_relocate_bench() {
             let rc = (N * pct / 100).max(1);
             let reloc = time_arm(&shard, rc, true);
             let copy = time_arm(&shard, rc, false);
-            let picks = if super::super::merge::should_relocate_blob(shard.blob().len(), shard.row_count(), rc) {
+            let picks = if super::super::string_heap::should_relocate_blob(shard.blob().len(), shard.row_count(), rc) {
                 "relocate"
             } else {
                 "memcpy  "
@@ -719,62 +748,6 @@ fn the_digest_seed_separates_names_not_directories() {
     );
 }
 
-/// The shard shapes the sweeps below run over: one per *region count*, since
-/// that is what sets the digest's span, plus the encodings that vary within
-/// one. `(label, path, schema)`.
-fn sweep_shapes(dir: &std::path::Path) -> Vec<(&'static str, String, SchemaDescriptor)> {
-    let n = 32usize;
-    let u64_i64 = make_schema_u64_i64();
-    let string = make_schema_pk_u64_payload_string();
-    let all_pk = pk_only_schema(&[TypeCode::U64]);
-    vec![
-        // One row: a repeated PK is not a consolidated run, so that is the only
-        // shape whose every region is Constant-encoded.
-        (
-            "all-constant",
-            write(dir, "sw_const.db", &make_batch(&u64_i64, &[(1, 1, 7)]), false),
-            u64_i64,
-        ),
-        (
-            "two-value weight, for-packed payload",
-            write(
-                dir,
-                "sw_twoval_for.db",
-                &build(u64_i64, n, |b, i| {
-                    b.begin_row(i as u128 + 1, if i % 2 == 0 { 1 } else { -1 });
-                    b.put_int((5_000_000 + i as i64) as u128);
-                }),
-                true,
-            ),
-            u64_i64,
-        ),
-        // A blob region with real content.
-        (
-            "string payload",
-            write(
-                dir,
-                "sw_string.db",
-                &build(string, 24, |b, i| {
-                    b.begin_row(i as u128 + 1, 1);
-                    b.put_string(&wide_string(i, 48));
-                }),
-                false,
-            ),
-            string,
-        ),
-        (
-            "all-pk (4 regions)",
-            write(
-                dir,
-                "sw_pkonly.db",
-                &build(all_pk, n, |b, i| b.begin_row(i as u128 + 1, 1)),
-                false,
-            ),
-            all_pk,
-        ),
-    ]
-}
-
 /// The verdicts a corruption at `off` inside the prefix may produce: a header
 /// field `ShardHeader::read` checks can fail its own check before the digest.
 fn prefix_verdicts(off: usize) -> &'static [StorageError] {
@@ -799,20 +772,23 @@ fn prefix_verdicts(off: usize) -> &'static [StorageError] {
 #[test]
 fn every_single_bit_flip_in_the_prefix_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    for (label, path, schema) in sweep_shapes(dir.path()) {
-        let base = std::fs::read(&path).unwrap();
-        let n_desc = desc_len(schema.num_payload_cols());
-        assert!(n_desc <= base.len());
-        for off in 0..n_desc {
-            for bit in 0..8u32 {
-                let got = open_patched(&path, &schema, &base, |d| d[off] ^= 1 << bit).err();
+    for (s, path) in written_shapes(dir.path()) {
+        let schema = s.written.schema();
+        let mut image = std::fs::read(&path).unwrap();
+        sweep_bit_flips(
+            &mut image,
+            0..desc_len(schema.num_payload_cols()),
+            |off, bit, damaged| {
+                std::fs::write(&path, damaged).unwrap();
+                let got = MappedShard::open(&path, schema).err();
                 let want = prefix_verdicts(off);
                 assert!(
                     got.is_some_and(|e| want.contains(&e)),
-                    "{label}: byte {off} bit {bit}: got {got:?}, want one of {want:?}",
+                    "{}: byte {off} bit {bit}: got {got:?}, want one of {want:?}",
+                    s.label,
                 );
-            }
-        }
+            },
+        );
     }
 }
 
@@ -821,10 +797,11 @@ fn every_single_bit_flip_in_the_prefix_is_rejected() {
 #[test]
 fn every_body_region_and_its_padding_is_inside_the_body_checksum() {
     let dir = tempfile::tempdir().unwrap();
-    for (label, path, schema) in sweep_shapes(dir.path()) {
+    for (s, path) in written_shapes(dir.path()) {
+        let (label, schema) = (s.label, s.written.schema());
         let base = std::fs::read(&path).unwrap();
         assert_eq!(
-            MappedShard::open(&path, &schema).unwrap().verify_body(),
+            MappedShard::open(&path, schema).unwrap().verify_body(),
             Ok(()),
             "{label}"
         );
@@ -841,7 +818,7 @@ fn every_body_region_and_its_padding_is_inside_the_body_checksum() {
             .map(|(i, s)| (format!("region {i}"), s.off + s.size - 1))
             .chain([("padding".to_owned(), pad)]);
         for (what, at) in targets {
-            let shard = open_patched(&path, &schema, &base, |d| d[at] ^= 0x01).unwrap();
+            let shard = open_patched(&path, schema, &base, |d| d[at] ^= 0x01).unwrap();
             assert_eq!(
                 shard.verify_body(),
                 Err(StorageError::Corrupt("body checksum")),
@@ -852,52 +829,24 @@ fn every_body_region_and_its_padding_is_inside_the_body_checksum() {
 }
 
 /// A directory size a byte off what the row count and encoding determine is
-/// refused, for every encoding a sized region takes.
+/// refused, for every fixed region of every shape. A size that pushes the
+/// regions after it past the end of the file is refused there first.
 #[test]
 fn a_region_size_that_disagrees_with_the_row_count_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u64_i64();
-    let direct = small_shard(dir.path(), 10, 3);
-    let packed = write(
-        dir.path(),
-        "packed_size.db",
-        &build(schema, 64, |b, i| {
-            b.begin_row(i as u128 + 1, if i % 2 == 0 { 1 } else { -1 });
-            b.put_int((2_000 + (i % 5) as i64) as u128);
-        }),
-        true,
-    );
-    assert_eq!(
-        region_dir(&std::fs::read(&packed).unwrap(), REG_WEIGHT).1,
-        Encoding::TwoValue
-    );
-    assert_eq!(
-        region_dir(&std::fs::read(&packed).unwrap(), REG_PAYLOAD_START).1,
-        Encoding::For
-    );
-
-    for (what, path, regions) in [
-        (
-            "direct",
-            direct,
-            &[REG_PK, REG_WEIGHT, REG_NULL_BMP, REG_PAYLOAD_START][..],
-        ),
-        (
-            "two-value weight, for payload",
-            packed,
-            &[REG_WEIGHT, REG_PAYLOAD_START][..],
-        ),
-    ] {
+    for (s, path) in written_shapes(dir.path()) {
+        let schema = s.written.schema();
         let base = std::fs::read(&path).unwrap();
-        for &region in regions {
-            let (sz, _) = region_dir(&base, region);
+        for region in REG_PK..REG_PAYLOAD_START + schema.num_payload_cols() {
+            let (sz, enc) = region_dir(&base, region);
             for delta in [-1isize, 1] {
                 let forged = sz.checked_add_signed(delta).unwrap();
-                assert_eq!(
-                    open_patched_restamped(&path, &schema, &base, |d| patch_entry(d, region, |e| e.size = forged))
-                        .err(),
-                    Some(StorageError::Corrupt("region size")),
-                    "{what}: region {region} size {sz}{delta:+}",
+                let got = open_patched_restamped(&path, schema, &base, |d| patch_entry(d, region, |e| e.size = forged));
+                assert!(
+                    matches!(got, Err(StorageError::Corrupt("region size" | "region past the end"))),
+                    "{}: region {region} ({enc:?}) size {sz}{delta:+}: {:?}",
+                    s.label,
+                    got.err(),
                 );
             }
         }

@@ -274,7 +274,7 @@ fn string_run(schema: &SchemaDescriptor, rows: &[(u64, i64, Vec<u8>)]) -> Batch 
 /// latest value of every key.
 #[test]
 fn a_fold_under_churn_keeps_every_run_at_most_a_quarter_dead() {
-    use crate::storage::repr::merge::heap_is_wasteful;
+    use crate::storage::repr::string_heap::heap_is_wasteful;
     let schema = crate::test_support::make_schema_pk_u64_payload_string();
     const KEYS: u64 = 1000;
     let mut set = RunSet::new(usize::MAX);

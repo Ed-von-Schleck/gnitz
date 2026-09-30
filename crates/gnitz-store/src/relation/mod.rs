@@ -101,7 +101,7 @@ impl SecondaryIndex {
     /// a non-empty `source` can still project to nothing.
     pub(crate) fn project_and_ingest(&mut self, source: &Batch) -> Result<bool, StorageError> {
         let table = self.store.held_mut();
-        let projected = source.project_index(&self.key_spec, table.schema());
+        let projected = project_index(source, &self.key_spec, table.schema());
         if projected.is_empty() {
             return Ok(false);
         }
@@ -113,6 +113,27 @@ impl SecondaryIndex {
     pub fn resumed(&self) -> bool {
         self.store.held().resumed_from_checkpoint()
     }
+}
+
+/// Each nonzero-weight row of `source` that `spec` indexes, as its index entry at
+/// that row's weight, in source order.
+fn project_index(source: &Batch, spec: &crate::schema::KeySpec, idx_schema: &SchemaDescriptor) -> Batch {
+    let idx_stride = idx_schema.pk_stride();
+    assert_eq!(
+        idx_stride,
+        spec.key_size() + source.schema().pk_stride(),
+        "index schema of another spec"
+    );
+    let mut out = Batch::with_capacity(idx_schema, source.len());
+    let mut entry = [0u8; crate::schema::MAX_PK_BYTES];
+    let mb = source.as_mem_batch();
+    for row in 0..source.len() {
+        let weight = source.get_weight(row);
+        if weight != 0 && spec.write_entry(&mb, row, &mut entry) {
+            out.push_key_row(&entry[..idx_stride], weight);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

@@ -15,7 +15,7 @@
 
 use proptest::prelude::*;
 
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES, MAX_PK_COLUMNS};
+use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_PK_BYTES, MAX_PK_COLUMNS};
 use crate::storage::{Batch, RecoverySource, StoreBudgets, Table};
 use crate::test_support::{arb_pk_type, arb_type_code, row_key, zset_of};
 use gnitz_expr::RowSource;
@@ -86,18 +86,19 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
     // (= row ordinal). That keeps PKs distinct (the ordinal `< n ≤ 64 < 256 ≤
     // 2^(8·width)` of the narrowest column, so no truncation collision) and,
     // for wide PKs, makes every row share a `≥ 16`-byte OPK prefix.
-    let leading: Vec<u128> = (0..pk_count.saturating_sub(1)).map(|_| rng.gen_u128()).collect();
+    let leading: Vec<u128> = schema
+        .pk_columns()
+        .take(pk_count - 1)
+        .map(|(_, c)| rng.gen_u128() & gnitz_wire::image_mask(c.size() as usize))
+        .collect();
 
     for i in 0..n {
-        // PK: fixed leading columns + trailing ordinal. extend_pk_opk OPK-encodes
-        // (big-endian, sign-flip for signed columns) via the production encoder.
+        // PK: fixed leading columns + trailing ordinal, OPK-encoded by the
+        // production encoder. Positive weight (base-table positivity, §1).
         let mut pk_vals = leading.clone();
         pk_vals.push(i as u128);
-        batch.extend_pk_opk(&pk_vals);
-
-        // Positive weight (base-table positivity, §1).
         let w = 1 + rng.gen_range(4) as i64;
-        batch.extend_weight(&w.to_le_bytes());
+        batch.begin_row(schema.opk_key_cols(&pk_vals).pk_bytes(), w);
 
         // Null bitmap: a null bit only where the column is nullable.
         let mut nw: u64 = 0;
@@ -121,8 +122,7 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
         batch.commit_row(nw);
     }
 
-    // extend_* did not touch the flags and the constructor defaults to Raw; a
-    // fresh batch is already Raw so ingest_owned_batch will sort + consolidate.
+    // Raw, so ingest_owned_batch sorts and consolidates it.
     (batch, leading)
 }
 

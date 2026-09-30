@@ -2,7 +2,7 @@ use super::super::merge::mem_batch_to_unified;
 use super::*;
 use crate::schema::{SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, BatchBuilder};
-use crate::test_support::{make_batch_opk, make_schema_u64_i64, payload0_i64, pk_payload_schema};
+use crate::test_support::{make_batch_opk, payload0_i64, pk_payload_schema};
 
 /// One row read back out of a scatter destination: the PK bytes verbatim, the
 /// weight, and the single I64 payload.
@@ -53,68 +53,40 @@ fn both_kernels_gather_rows_at_every_pk_width() {
     }
 }
 
-/// `route_rows_by_pk` hashes only the distribution prefix, so rows sharing it
-/// co-partition; weight-0 rows are dropped.
+/// Each live row lands in the slot of the worker its PK routes to — one slot
+/// for a replicated relation — and a weight-0 row in none.
 #[test]
-fn route_rows_by_pk_follows_the_distribution_prefix() {
+fn route_rows_by_pk_places_each_live_row_by_its_placement() {
     use crate::schema::{Placement, SchemaColumn};
-    use crate::test_support::opk_pk;
     const NW: usize = 4;
-
     let cols = [SchemaColumn::new(TypeCode::U64, false); 2];
-    let by_prefix = SchemaDescriptor::new_with_placement(&cols, &[0, 1], Placement::Keyed { prefix_len: 1 });
-    let by_full = SchemaDescriptor::new_with_placement(&cols, &[0, 1], Placement::Keyed { prefix_len: 2 });
-
-    // One `a` group spread over many `b`s, plus a weight-0 row.
-    let mut bb = BatchBuilder::new(by_prefix);
-    for b in 0..8u128 {
-        bb.begin_row_opk(&[7, b], if b == 3 { 0 } else { 1 });
-        bb.end_row();
+    for placement in [
+        Placement::Keyed { prefix_len: 1 },
+        Placement::Keyed { prefix_len: 2 },
+        Placement::Replicated,
+    ] {
+        let schema = SchemaDescriptor::new_with_placement(&cols, &[0, 1], placement);
+        let mut bb = BatchBuilder::new(schema);
+        for b in 0..8u128 {
+            bb.begin_row_opk(&[7 + b % 2, b], if b == 3 { 0 } else { 1 });
+            bb.end_row();
+        }
+        let batch = bb.finish();
+        let live = (0..8u32).filter(|&i| i != 3);
+        let want = match placement {
+            Placement::Replicated => vec![live.collect::<Vec<_>>()],
+            _ => {
+                let mut want = vec![Vec::new(); NW];
+                for i in live {
+                    want[schema.worker_for_pk(batch.get_pk_bytes(i as usize), NW)].push(i);
+                }
+                want
+            }
+        };
+        let mut out = Vec::new();
+        let slots = route_rows_by_pk(&batch.as_mem_batch(), &schema, &mut out, NW);
+        assert_eq!(slots, &want[..], "{placement:?}");
     }
-    let batch = bb.finish();
-
-    let mut rows = Vec::new();
-    let slots = route_rows_by_pk(&batch.as_mem_batch(), &by_prefix, &mut rows, NW);
-    let want = by_prefix.worker_for_pk(&opk_pk(&by_prefix, &[7, 0]), NW);
-    assert_eq!(
-        slots[want],
-        vec![0, 1, 2, 4, 5, 6, 7],
-        "one `a` group lands whole on one worker"
-    );
-    assert_eq!(
-        slots.iter().map(Vec::len).sum::<usize>(),
-        7,
-        "the weight-0 row is dropped"
-    );
-
-    // Hashing the whole PK spreads that same group instead.
-    let mut full_rows = Vec::new();
-    let full_slots = route_rows_by_pk(&batch.as_mem_batch(), &by_full, &mut full_rows, NW);
-    assert!(
-        full_slots.iter().filter(|s| !s.is_empty()).count() > 1,
-        "the full-PK placement must not co-locate the group"
-    );
-}
-
-/// A replicated relation is held whole by every worker, so the router sends it
-/// as one slot of every live row.
-#[test]
-fn route_rows_by_pk_sends_a_replicated_batch_whole() {
-    use crate::schema::Placement;
-    const NW: usize = 4;
-
-    let schema = make_schema_u64_i64().with_placement(Placement::Replicated);
-    let mut bb = BatchBuilder::new(schema);
-    for (pk, weight) in [(1, 1), (2, 0), (3, 2)] {
-        bb.begin_row(pk, weight);
-        bb.put_int(pk);
-        bb.end_row();
-    }
-    let batch = bb.finish();
-
-    let mut rows = Vec::new();
-    let slots = route_rows_by_pk(&batch.as_mem_batch(), &schema, &mut rows, NW);
-    assert_eq!(slots, [vec![0, 2]], "one slot of the live rows");
 }
 
 /// Carrying two whole heaps charges each source's rows the output leaves out —

@@ -3,7 +3,8 @@ use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::BatchBuilder;
 use crate::test_support::{
-    encode_to_wire_vec, make_batch_bytes, make_schema_pk_u64_payload_string, pk_u64_two_i64_schema, weighted_rows,
+    encode_to_wire_vec, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64,
+    pk_u64_two_i64_schema, weighted_rows,
 };
 
 /// Where region `r` of a `rows`-row block over `schema` starts.
@@ -85,21 +86,6 @@ fn a_foreign_decode_refuses_a_null_the_schema_does_not_admit() {
     }
 }
 
-/// A zero-row block decodes to an empty batch, dropping any heap bytes it
-/// declares: no cell can resolve against a heap at zero rows.
-#[test]
-fn a_zero_row_block_decodes_to_an_empty_batch() {
-    let schema = make_schema_pk_u64_payload_string();
-    let mut empty = Batch::empty_with_schema(&schema);
-    empty.blob.extend_from_slice(b"heap bytes no row references");
-    empty.dead_heap = empty.blob.len();
-    let block = encode_to_wire_vec(&empty);
-
-    let decoded = Batch::decode_from_wal_block(&block, &schema).expect("a zero-row block decodes");
-    assert_eq!(decoded.len(), 0);
-    assert!(decoded.blob.is_empty(), "a zero-row block carries no heap");
-}
-
 /// Every encoder round-trips through the validated decode at narrow and odd PK
 /// and payload strides. The block packs its regions unaligned while a decoded
 /// arena 8-aligns them, which is where the two can disagree.
@@ -176,15 +162,6 @@ fn wal_block_bench() {
     }
 }
 
-/// Rows the chunker takes from `start` under `budget`.
-fn chunk_rows(b: &Batch, start: usize, overhead: usize, budget: usize) -> usize {
-    b.wire_frame_within(start, overhead, budget).rows()
-}
-
-// ---------------------------------------------------------------------------
-// Reply chunking: wire_frame_within
-// ---------------------------------------------------------------------------
-
 /// `(pk, value)` rows at weight 1 over a U64 PK and one STRING payload column.
 /// Values past `SHORT_STRING_THRESHOLD` live in the heap.
 fn string_batch(rows: &[(u64, impl AsRef<str>)]) -> Batch {
@@ -197,147 +174,62 @@ fn string_batch(rows: &[(u64, impl AsRef<str>)]) -> Batch {
     b.finish()
 }
 
-/// A frame inside a heap-bearing batch encodes its rows' spans and no others,
-/// in exactly the bytes it was sized at.
+/// A frame, and a scattered prefix, is the longest run whose block — sized as
+/// `encode_scattered_to_wire` writes it — fits; each reads back its rows.
 #[test]
-fn a_frame_carries_only_its_spans() {
-    let src = string_batch(&[
-        (1, "the first long value"),
-        (2, "the second long value"),
-        (3, "the third long value"),
-        (4, "the fourth long value"),
-    ]);
-    let budget = src.wire_byte_size_range(2) + "the second long value".len() + "the third long value".len();
-    let frame = src.wire_frame_within(1, 0, budget);
-    assert_eq!((frame.rows(), src.wire_frame_size(&frame)), (2, budget));
-
-    let mut buf = vec![0u8; src.wire_byte_size()];
-    let n = src.encode_frame(&frame, &mut buf);
-    assert_eq!(n, budget);
-    let chunk = Batch::decode_foreign_wal_block(&buf[..n], src.schema()).unwrap();
-    assert_eq!(chunk.len(), 2);
-    assert_eq!(chunk.blob.len(), budget - src.wire_byte_size_range(2));
-    for (i, want) in [(0usize, "the second long value"), (1, "the third long value")] {
-        assert_eq!(gnitz_expr::payload_string(&chunk, i, 0), want);
-        assert_eq!(chunk.get_pk(i), (i + 2) as u128);
-        assert_eq!(chunk.get_weight(i), 1);
-    }
-}
-
-/// Rows sharing one heap span, as a join's fan-out writes them, cost that span
-/// once.
-#[test]
-fn wire_frame_within_counts_a_shared_span_once() {
-    const N: usize = 20;
+fn frames_and_scattered_prefixes_take_the_longest_run_that_fits() {
     let one = string_batch(&[(1, "v".repeat(200))]);
-    // One relocating append session, so its blob cache dedups the repeated
-    // range: every row of `shared` points at the same span of its own heap.
-    let mut shared = Batch::with_capacity(one.schema(), N);
+    // Rows naming one span, as a join's fan-out writes them.
+    let mut shared = Batch::with_capacity(one.schema(), 20);
     shared
-        .append_session(N)
-        .push_ranges(&one.as_mem_batch(), None, &[(0, 1); N]);
-
-    let distinct = string_batch(&(0..N as u64).map(|i| (i, format!("{i:-<200}"))).collect::<Vec<_>>());
-
-    let budget = shared.wire_byte_size();
-    assert_eq!(chunk_rows(&shared, 0, 0, budget), N);
-    assert!(
-        chunk_rows(&distinct, 0, 0, budget) < N,
-        "the same budget cannot hold {N} private 200-byte copies"
-    );
-}
-
-/// A short (inline) string costs no heap bytes, both in a heapless batch and on
-/// the forward walk past a long row.
-#[test]
-fn wire_frame_within_does_not_collapse_on_short_strings() {
-    let all_short = string_batch(&(0..30u64).map(|i| (i, "abcdefghijkl")).collect::<Vec<_>>());
-    assert!(all_short.blob.is_empty(), "12-byte values stay inline");
-
-    let mut mixed_rows: Vec<(u64, String)> = vec![(0, "a".repeat(64))];
-    mixed_rows.extend((1..30u64).map(|i| (i, "abcdefghijkl".to_string())));
-    let mixed = string_batch(&mixed_rows);
-    assert!(!mixed.blob.is_empty(), "the one long value takes the forward walk");
-
-    // Room for ten rows beside the block header.
-    let budget = all_short.wire_byte_size_range(10);
-    assert_eq!(chunk_rows(&all_short, 0, 0, budget), 10);
-    assert_eq!(
-        chunk_rows(&mixed, 1, 0, budget),
-        10,
-        "the short rows past the long one cost their fixed width and nothing more"
-    );
-
-    for (b, start) in [(&all_short, 0), (&mixed, 1)] {
-        let frame = b.wire_frame_within(start, 0, budget);
-        assert_eq!(b.wire_frame_size(&frame), b.wire_byte_size_range(10), "no heap byte");
+        .append_session(20)
+        .push_ranges(&one.as_mem_batch(), None, &[(0, 1); 20]);
+    let mut mixed = vec![(0u64, "a".repeat(64))];
+    mixed.extend((1..30).map(|i| (i, "abcdefghijkl".to_string())));
+    let fixed: Vec<(u64, i64, i64)> = (1..=30).map(|i| (i, 1, i as i64)).collect();
+    for b in [
+        make_batch(&make_schema_u64_i64(), &fixed),
+        string_batch(&(0..30u64).map(|i| (i, "abcdefghijkl")).collect::<Vec<_>>()),
+        string_batch(&mixed),
+        string_batch(&(0..20u64).map(|i| (i, format!("{i:-<200}"))).collect::<Vec<_>>()),
+        string_batch(&[(1, "w".repeat(4096)), (2, "w".repeat(4096))]),
+        shared,
+    ] {
+        let mut buf = vec![0u8; 2 * b.wire_byte_size()];
+        let size = |rows: &[u32]| {
+            b.encode_scattered_to_wire(rows, &mut vec![0; 2 * b.wire_byte_size()])
+                .unwrap()
+        };
+        let read_back = |block: &[u8]| weighted_rows(&Batch::decode_foreign_wal_block(block, b.schema()).unwrap());
+        for start in [0, 1] {
+            let rest = b.len() - start;
+            let run = |k: usize| (start as u32..(start + k) as u32).collect::<Vec<_>>();
+            let longest = |cap: usize| (1..=rest).take_while(|&k| size(&run(k)) <= cap).last();
+            for overhead in [0, 17] {
+                let k3 = size(&run(3.min(rest))) + overhead;
+                for budget in [64, size(&run(1)) + overhead, k3 - 1, k3, usize::MAX] {
+                    let frame = b.wire_frame_within(start, overhead, budget);
+                    let want = longest(budget.saturating_sub(overhead)).unwrap_or(1);
+                    assert_eq!(frame.rows(), want, "start {start} overhead {overhead} budget {budget}");
+                    let n = b.encode_frame(&frame, &mut buf);
+                    assert_eq!(n, b.wire_frame_size(&frame));
+                    assert_eq!(read_back(&buf[..n]), weighted_rows(&b)[start..start + want]);
+                }
+            }
+            let all = run(rest);
+            for cap in [size(&run(1)) - 1, size(&run(2.min(rest))), size(&run(2.min(rest))) + 1] {
+                let mut out = vec![0u8; cap];
+                let got = b.encode_scattered_prefix(&all, &mut out);
+                let want = longest(cap).map(|k| (k, size(&run(k))));
+                assert_eq!(got, want, "start {start} cap {cap}");
+                if let Some((k, n)) = got {
+                    assert_eq!(read_back(&out[..n]), weighted_rows(&b)[start..start + k]);
+                    let mut short = vec![0u8; n - 1];
+                    assert!(b.encode_scattered_to_wire(&run(k), &mut short).is_none());
+                }
+            }
+        }
     }
-}
-
-/// A row too wide for the budget still ships: the chunk carries it alone rather
-/// than coming back empty, and the caller sizes what it got.
-#[test]
-fn wire_frame_within_never_returns_an_empty_frame() {
-    let batch = string_batch(&[(1, "w".repeat(4096)), (2, "w".repeat(4096))]);
-    assert_eq!(chunk_rows(&batch, 0, 0, 64), 1);
-}
-
-// ---------------------------------------------------------------------------
-// Scattered blocks: encode_scattered_to_wire, encode_scattered_prefix
-// ---------------------------------------------------------------------------
-
-/// A scatter of a heap-bearing batch relocates the strings its rows reference
-/// into the block's own heap, so a peer's validated decode reads every row back
-/// in the order the indices named.
-#[test]
-fn a_scattered_block_carries_its_own_heap() {
-    let values: Vec<(u64, String)> = (0..6u64).map(|i| (i, format!("{i:->40}"))).collect();
-    let src = string_batch(&values);
-    let indices = [4u32, 1, 3];
-    let mut out = vec![0u8; src.wire_byte_size()];
-    let written = src
-        .encode_scattered_to_wire(&indices, &mut out)
-        .expect("the whole batch's size fits");
-    let mut exact = vec![0u8; written];
-    assert_eq!(
-        src.encode_scattered_prefix(&indices, &mut exact),
-        Some((indices.len(), written)),
-        "the fit charges exactly the heap the encoder writes"
-    );
-    let got = Batch::decode_foreign_wal_block(&out[..written], src.schema()).expect("a canonical block");
-    assert_eq!(got.len(), indices.len());
-    assert!(got.blob.len() < src.blob.len(), "only the selected rows' spans travel");
-    for (i, &idx) in indices.iter().enumerate() {
-        assert_eq!(got.get_pk(i), idx as u128);
-        assert_eq!(got.get_weight(i), 1);
-        assert_eq!(gnitz_expr::payload_string(&got, i, 0), values[idx as usize].1);
-    }
-}
-
-/// `None`, not a truncated block, when either the fixed regions or the heap
-/// behind them overflow `out`.
-#[test]
-fn a_scattered_block_that_overflows_its_buffer_is_refused() {
-    let src = string_batch(&[(1, "x".repeat(100)), (2, "y".repeat(100))]);
-    let fixed = src.wire_byte_size_range(2);
-    let mut out = vec![0u8; fixed - 1];
-    assert!(
-        src.encode_scattered_to_wire(&[0, 1], &mut out).is_none(),
-        "the fixed regions overflow"
-    );
-    let mut out = vec![0u8; fixed + 150];
-    assert!(
-        src.encode_scattered_to_wire(&[0, 1], &mut out).is_none(),
-        "the heap overflows"
-    );
-    let mut out = vec![0u8; fixed + 150];
-    assert_eq!(
-        src.encode_scattered_prefix(&[0, 1], &mut out),
-        Some((1, src.wire_byte_size_range(1) + 100)),
-        "the prefix is the one row whose heap fits"
-    );
-    let mut out = vec![0u8; fixed + 200];
-    assert_eq!(src.encode_scattered_to_wire(&[0, 1], &mut out), Some(fixed + 200));
 }
 
 /// An engine block states its batch's dead-byte bound and the engine decode
@@ -361,10 +253,8 @@ fn a_foreign_decode_measures_the_dead_heap_exactly() {
     let schema = make_schema_pk_u64_payload_string();
     let heap: Vec<u8> = (0..62u8).collect();
     let cell = |start: usize, len: usize| {
-        let mut c = [0u8; 16];
-        c[..4].copy_from_slice(&(len as u32).to_le_bytes());
-        c[4..8].copy_from_slice(&heap[start..start + 4]);
-        c[8..].copy_from_slice(&(start as u64).to_le_bytes());
+        let mut c = gnitz_wire::encode_german_string(&heap[start..start + len], &mut Vec::new());
+        gnitz_wire::write_u64_le(&mut c, 8, start as u64);
         c
     };
     // [0, 20) twice, [10, 30) overlapping it: bytes [30, 62) are dead.

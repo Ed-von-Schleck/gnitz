@@ -6,8 +6,8 @@ use crate::schema::{ground_owner, worker_for_pk_bytes};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::storage::BatchBuilder;
 use crate::test_support::{
-    make_batch, make_batch_i64pk, make_batch_opk, make_batch_raw, make_batch_u128, make_schema_i64pk_i64,
-    make_schema_u128_i64, make_schema_u64_i64, make_wide_batch, opk_pk, pk_payload_schema, wide_pk_3xu64_schema,
+    make_batch, make_batch_opk, make_batch_raw, make_batch_u128, make_schema_i64pk_i64, make_schema_u128_i64,
+    make_schema_u64_i64, make_wide_batch, opk_pk, pk_payload_schema, wide_pk_3xu64_schema,
 };
 use gnitz_wire::TypeCode;
 use std::cmp::Ordering;
@@ -126,8 +126,8 @@ fn pk_routed_scatter_routes_every_row_to_its_owner() {
             "i64 pk, two consolidated sources",
             &[0],
             vec![
-                make_batch_i64pk(&i64_s, &[(-100, 1, 10), (-1, 1, 11), (5, 1, 12)]),
-                make_batch_i64pk(&i64_s, &[(-50, 1, 20), (0, 1, 21), (100, 1, 22)]),
+                make_batch(&i64_s, &[(-100i64 as u64, 1, 10), (-1i64 as u64, 1, 11), (5, 1, 12)]),
+                make_batch(&i64_s, &[(-50i64 as u64, 1, 20), (0, 1, 21), (100, 1, 22)]),
             ],
             true,
         ),

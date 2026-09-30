@@ -206,7 +206,7 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
 fn reply_trains_drain_fifo_and_reassemble_exactly() {
     let fixed = make_schema_u64_i64();
     let strings = make_schema_pk_u64_payload_string();
-    let budget = frame_size(&Batch::zeroed(&fixed, 4));
+    let budget = frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 4]));
 
     let a = make_batch_raw(&fixed, &(0..10).map(|i| (i, weight(i), i as i64)).collect::<Vec<_>>());
     let b_vals: Vec<String> = (0..25).map(|i| format!("value-{i}-{}", "p".repeat(40))).collect();
@@ -280,7 +280,11 @@ fn reply_trains_drain_fifo_and_reassemble_exactly() {
     // Fixed width: every non-terminal frame fills the budget exactly.
     assert_eq!(
         sizes(11),
-        [(4, budget), (4, budget), (2, frame_size(&Batch::zeroed(&fixed, 2)))]
+        [
+            (4, budget),
+            (4, budget),
+            (2, frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 2])))
+        ]
     );
     // Heap strings: several rows a frame, each frame compacted to its own heap.
     let b_sizes = sizes(22);

@@ -10,9 +10,8 @@ use std::ops::Range;
 
 use super::batch::{write_to_batch, Batch, FIXED_REGION_BYTES};
 use super::batch_pool::PooledBuf;
-use super::merge::{
-    carried_dead, prorated_blob_cap, row_long_bytes, ColPtr, ColumnarSource, DirectWriter, MemBatch, UnifiedSource,
-};
+use super::merge::{ColPtr, ColumnarSource, DirectWriter, MemBatch, UnifiedSource};
+use super::string_heap::{carried_dead, prorated_blob_cap, row_long_bytes};
 use crate::schema::{SchemaDescriptor, SchemaFacts};
 
 /// Instantiate `$f` at the const width matching `$w`, which is also passed on.

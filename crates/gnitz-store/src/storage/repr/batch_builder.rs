@@ -3,7 +3,7 @@
 //! the same shape over a pre-carved arena.
 
 use super::batch::Batch;
-use crate::schema::SchemaDescriptor;
+use crate::schema::{SchemaDescriptor, SchemaFacts};
 
 /// Lightweight row-by-row builder for constructing Batch in Rust.
 /// Operates on Batch directly; the schema lives on the batch itself.
@@ -48,35 +48,23 @@ impl BatchBuilder {
         }
     }
 
-    /// Begin a new row with the given single-column PK and weight.
+    /// Begin a new row with the given single-column PK and weight: `pk` is the
+    /// column's native value, as [`Self::begin_row_opk`] takes it.
     pub fn begin_row(&mut self, pk: u128, weight: i64) {
-        self.batch.extend_pk(pk);
-        self.begin_row_tail(weight);
+        self.begin_row_opk(&[pk], weight);
     }
 
     /// [`Self::begin_row`] for a **compound** PK: `natives` are the PK columns'
     /// native values in PK-list order, OPK-encoded into the packed PK region.
-    /// Without this, every compound-PK test hand-rolls the
-    /// `extend_pk_opk`/`extend_weight`/…/`count += 1`
-    /// protocol — and a native-LE concatenation into `extend_pk_bytes` (the
-    /// obvious wrong spelling) is not the at-rest form at all.
     pub fn begin_row_opk(&mut self, natives: &[u128], weight: i64) {
-        self.batch.extend_pk_opk(natives);
-        self.begin_row_tail(weight);
+        let key = self.schema().opk_key_cols(natives);
+        self.begin_row_bytes(key.pk_bytes(), weight);
     }
 
     /// [`Self::begin_row`] for a PK already in its at-rest OPK image: `pk` is
-    /// written verbatim and must be exactly `pk_stride` bytes. For a caller
-    /// holding native column values, [`Self::begin_row_opk`] encodes them.
+    /// written verbatim and must be exactly `pk_stride` bytes.
     pub fn begin_row_bytes(&mut self, pk: &[u8], weight: i64) {
-        self.batch.extend_pk_bytes(pk);
-        self.begin_row_tail(weight);
-    }
-
-    /// The weight half of [`Batch::begin_row`], plus the per-row column state.
-    /// The three entry points above differ only in how they encode the PK.
-    fn begin_row_tail(&mut self, weight: i64) {
-        self.batch.extend_weight(&weight.to_le_bytes());
+        self.batch.begin_row(pk, weight);
         self.curr_null_word = 0;
         self.curr_col = 0;
     }
@@ -87,7 +75,7 @@ impl BatchBuilder {
     ///
     /// Signed values are passed as `v as u128`: sign-extending to 128 bits leaves
     /// the low `size()` bytes exactly the two's-complement image the column
-    /// holds. That is the same native convention [`Batch::extend_pk_opk`] takes
+    /// holds. That is the same native convention [`Self::begin_row_opk`] takes
     /// for PK columns.
     pub fn put_int(&mut self, val: u128) {
         let col_size = self.schema().columns[self.physical_col_idx()].size() as usize;

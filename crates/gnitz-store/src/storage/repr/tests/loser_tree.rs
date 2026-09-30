@@ -27,13 +27,6 @@ fn drain(runs: &[Vec<u128>], t: &mut LoserTree, pos: &mut [usize], limit: usize)
     out
 }
 
-/// `step_top` swaps whole nodes up the tree on every merge, so the node must
-/// stay register-sized: a re-introduced cached key or a `usize` field fails here.
-#[test]
-fn heap_node_is_8_bytes() {
-    assert_eq!(std::mem::size_of::<HeapNode>(), 8);
-}
-
 /// Random k-way merges drain in `(key, source)` order, also across a `rebuild`
 /// partway through.
 #[test]

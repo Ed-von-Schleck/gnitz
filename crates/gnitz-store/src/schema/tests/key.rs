@@ -360,13 +360,10 @@ fn index_spans_equal_the_seek_prefix_and_sort_as_the_values() {
                 bb.put_int(if c == 0 { 0 } else { native });
                 bb.end_row();
                 let b = bb.finish();
-                let (spec, idx) = crate::schema::index_spec_and_schema(&[c], &src).unwrap();
-                let projected = b.project_index(&spec, &idx);
-                assert_eq!(
-                    &projected.get_pk_bytes(0)[..spec.key_size()],
-                    seek.pk_bytes(),
-                    "{t} {native:#x}"
-                );
+                let spec = KeySpec::new(&[c], &src).unwrap();
+                let mut entry = [0u8; MAX_PK_BYTES];
+                assert!(spec.write_entry(&b.as_mem_batch(), 0, &mut entry));
+                assert_eq!(&entry[..spec.key_size()], seek.pk_bytes(), "{t} {native:#x}");
             }
             if let Some(p) = &prev {
                 assert!(p[..] < *seek.pk_bytes(), "{t}: spans out of value order at {native:#x}");
