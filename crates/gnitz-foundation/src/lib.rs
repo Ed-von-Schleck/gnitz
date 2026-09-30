@@ -1,15 +1,16 @@
 //! The process and the OS under it — everything a gnitz crate needs from
 //! `libc` or the environment, and nothing else. Sibling leaves, NOT a unifying
 //! facade: each keeps its own narrow surface.
-//!   - `log`        — level/tag state. The four `gnitz_*!` macros it backs are
+//!   - `log`        — level/tag state. The `gnitz_*!` macros it backs are
 //!     `#[macro_export]`ed, so they land at this crate's root, not in `log`
 //!   - `env`        — `GNITZ_*` environment-variable overrides
 //!   - `fault`      — debug-only `GNITZ_INJECT_*` fault-injection seams
 //!   - `host`       — what the machine or container will give us (RAM budget)
 //!   - `posix_io`   — file-I/O, mmap and the syscall idioms around them,
 //!     including the anonymous and reserved mappings the server builds its SAL
-//!     and W2M rings on. The socket tier is not here; it lives beside the
-//!     reactor that owns the fds, in `gnitz-server`
+//!     and W2M rings on, and the socket option client and server share. The
+//!     reactor's socket tier is not here; it lives beside the reactor that owns
+//!     the fds, in `gnitz-server`
 //!   - `perf`       — cost probes: instructions retired, context switches and
 //!     resident-set bytes, for benchmarks and cost-claim tests
 //!

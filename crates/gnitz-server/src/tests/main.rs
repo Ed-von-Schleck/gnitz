@@ -36,7 +36,7 @@ fn parse_args_rejects_a_bad_level() {
     let args = parse_args(&argv(&["--log-level=debug", "/data", "/sock"]), Some("quiet")).unwrap();
     assert_eq!(
         args.level,
-        gnitz_foundation::log::DEBUG,
+        gnitz_foundation::log::Level::Debug,
         "the flag overrides the environment"
     );
 }

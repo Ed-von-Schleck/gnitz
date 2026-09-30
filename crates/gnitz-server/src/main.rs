@@ -39,6 +39,7 @@ mod fatal;
 
 mod runtime;
 
+use gnitz_foundation::log::Level;
 use std::env;
 use std::process;
 
@@ -92,11 +93,11 @@ Environment:
                            than a client waits for its own connect).
 ";
 
-fn parse_level(s: &str) -> Result<u32, String> {
+fn parse_level(s: &str) -> Result<Level, String> {
     match s.to_ascii_lowercase().as_str() {
-        "quiet" | "0" => Ok(gnitz_foundation::log::QUIET),
-        "normal" | "1" => Ok(gnitz_foundation::log::NORMAL),
-        "verbose" | "debug" | "2" => Ok(gnitz_foundation::log::DEBUG),
+        "quiet" | "0" => Ok(Level::Quiet),
+        "normal" | "1" => Ok(Level::Normal),
+        "verbose" | "debug" | "2" => Ok(Level::Debug),
         _ => Err(format!("invalid log level {s:?} (expected quiet, normal or verbose)")),
     }
 }
@@ -116,16 +117,13 @@ struct Args {
     data_dir: String,
     socket_path: String,
     workers: u32,
-    level: u32,
+    level: Level,
     tls: runtime::TlsArgs,
 }
 
 /// Parse argv (program name excluded), with `GNITZ_LOG_LEVEL` as `env_level`.
 fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> {
-    let mut level = env_level
-        .map(parse_level)
-        .transpose()?
-        .unwrap_or(gnitz_foundation::log::QUIET);
+    let mut level = env_level.map(parse_level).transpose()?.unwrap_or(Level::Quiet);
     let mut workers = 1;
     let mut tls = runtime::TlsArgs::default();
     let mut positional: Vec<&String> = Vec::new();
@@ -179,7 +177,7 @@ fn main() {
         eprintln!("Try 'gnitz-server --help' for usage information");
         process::exit(1);
     });
-    gnitz_foundation::log::init(args.level, b"M");
+    gnitz_foundation::log::init(args.level, gnitz_foundation::log::Tag::Master);
     process::exit(runtime::server_main(
         &args.data_dir,
         &args.socket_path,

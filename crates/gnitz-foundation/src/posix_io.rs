@@ -1,4 +1,4 @@
-//! POSIX file-I/O and mmap wrappers. A call whose failure a caller acts on
+//! POSIX syscall idioms: file I/O, mmap, the fd rlimit and socket options. A call whose failure a caller acts on
 //! returns `io::Result`, the errno captured at the syscall so no caller reads it
 //! back out of ambient state; a best-effort call returns `()`.
 
@@ -74,15 +74,6 @@ pub fn try_set_nocow(path: &str) {
     }
 }
 
-/// Size of the file behind `fd` (fstat), in bytes.
-pub(crate) fn fd_size(fd: c_int) -> std::io::Result<usize> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut st) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(st.st_size as usize)
-}
-
 /// Create `dir` and any missing parent; whether this call created `dir`.
 pub fn create_dir(dir: &str) -> std::io::Result<bool> {
     let path = std::path::Path::new(dir);
@@ -102,14 +93,11 @@ pub fn fsync_dir(dir: &str) -> std::io::Result<()> {
 }
 
 /// Hint the kernel to back [ptr, ptr+size) with transparent hugepages.
-/// Best-effort: ignores errors and is a no-op for null ptr or size 0.
+/// Best-effort: ignores errors.
 /// For anonymous private memory: requires `enabled` = `madvise` or `always`.
 /// For memfd/shmem: requires `shmem_enabled` = `advise` or `within_size`.
 /// For writable file-backed mmap: silently ignored by the kernel.
 pub fn madvise_hugepage(ptr: *mut u8, size: usize) {
-    if ptr.is_null() || size == 0 {
-        return;
-    }
     unsafe {
         libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_HUGEPAGE);
     }
@@ -144,14 +132,13 @@ pub fn map_anon_shared(size: usize) -> std::io::Result<*mut u8> {
     Ok(ptr as *mut u8)
 }
 
-/// mmap `size` bytes of `fd` `MAP_SHARED` read-write, `fallocate`ing the file to
-/// `size` first: `mmap` past the end of a file succeeds and the first store into
-/// the resulting hole raises `SIGBUS`, which nothing here handles. Reserving the
-/// blocks also means a later store cannot fail for want of disk space.
+/// mmap `size` bytes of `fd` `MAP_SHARED` read-write, `fallocate`ing `[0, size)`
+/// first: `mmap` past the end of a file succeeds and the first store into the
+/// resulting hole raises `SIGBUS`, which nothing here handles. Reserving the
+/// blocks also means a later store cannot fail for want of disk space. A file
+/// already longer than `size` keeps its length and contents.
 pub fn map_file_reserved(fd: c_int, size: usize) -> std::io::Result<*mut u8> {
-    if fd_size(fd)? < size {
-        retry_eintr(|| unsafe { libc::fallocate(fd, 0, 0, size as libc::off_t) })?;
-    }
+    retry_eintr(|| unsafe { libc::fallocate(fd, 0, 0, size as libc::off_t) })?;
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -168,19 +155,21 @@ pub fn map_file_reserved(fd: c_int, size: usize) -> std::io::Result<*mut u8> {
     Ok(ptr as *mut u8)
 }
 
-/// RAII handle for a read-only mmap'd file region, so the unmap path lives in
-/// exactly one place — no consumer's error return or Drop repeats the `munmap`.
+/// RAII handle for a read-only mmap'd file, so the unmap path of a read-only
+/// mapping lives in exactly one place — no consumer's error return or Drop
+/// repeats the `munmap`.
 pub struct Mmap {
     ptr: *mut u8,
     len: usize,
 }
 
 impl Mmap {
-    /// mmap `[0, len)` of `fd` read-only. `len` must be `> 0`. The mapping holds
-    /// its own reference to the inode, so the caller may close `fd` immediately
-    /// after.
-    pub fn from_fd(fd: c_int, len: usize) -> std::io::Result<Self> {
-        debug_assert!(len > 0);
+    /// mmap the whole of `file` read-only. The mapping holds its own reference
+    /// to the inode, so the caller may close `file` immediately after. An empty
+    /// file is refused (`EINVAL`: the kernel maps no zero-length region).
+    pub fn from_file(file: &std::fs::File) -> std::io::Result<Self> {
+        let len = file.metadata()?.len() as usize;
+        let fd = std::os::fd::AsRawFd::as_raw_fd(file);
         let raw = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
         if raw == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error());
@@ -196,22 +185,14 @@ impl Mmap {
         }
     }
 
-    /// Open `path` read-only and mmap the whole (non-empty) file.
-    pub fn open_ro(path: &std::path::Path) -> std::io::Result<Self> {
-        let file = std::fs::File::open(path)?;
-        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
-        let len = fd_size(fd)?;
-        if len == 0 {
-            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
-        }
-        let map = Self::from_fd(fd, len)?;
-        madvise_hugepage(map.ptr, map.len);
-        Ok(map)
+    /// [`madvise_hugepage`] over the mapping.
+    pub fn advise_hugepage(&self) {
+        madvise_hugepage(self.ptr, self.len);
     }
 
-    /// The mapped bytes. Never empty: `from_fd` requires a non-zero length and
-    /// `open_ro` refuses an empty file, so a caller after the length reads
-    /// `as_slice().len()` rather than a second accessor.
+    /// The mapped bytes. Never empty, since `from_file` refuses an empty file,
+    /// so a caller after the length reads `as_slice().len()` rather than a
+    /// second accessor.
     #[inline(always)]
     pub fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }

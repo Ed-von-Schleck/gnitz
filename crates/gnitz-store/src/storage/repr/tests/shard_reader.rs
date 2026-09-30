@@ -678,6 +678,7 @@ fn each_forgery_is_refused_with_its_own_verdict() {
             Box::new(|d| d.truncate(d.len() - 1)),
             "region past the end",
         ),
+        ("empty file", false, Box::new(|d| d.clear()), "empty file"),
         (
             "truncated directory",
             false,

@@ -360,7 +360,7 @@ fn run_worker_child(
     // Re-tag logging as this worker before any boot work, so every line the
     // recovery below emits carries `W{w}` rather than the inherited master tag.
     // Only the tag: the level is a process-wide static the fork already copied.
-    gnitz_foundation::log::set_tag(format!("W{w}").as_bytes());
+    gnitz_foundation::log::set_tag(gnitz_foundation::log::Tag::Worker(w as u32));
 
     let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w]);
     let catalog_ptr: *mut CatalogEngine = catalog;

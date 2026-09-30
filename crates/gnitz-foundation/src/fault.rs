@@ -41,9 +41,10 @@ impl Seam {
         }
     }
 
-    /// True while the seam is set to any value.
+    /// True while the seam is set, under `env`'s flag rule: `0` or the empty
+    /// string leaves it disarmed.
     pub fn armed(&self) -> bool {
-        self.setting().is_some()
+        self.setting().is_some_and(crate::env::flag)
     }
 
     /// True while the seam names this stage — for seams that pick one of several
@@ -53,10 +54,10 @@ impl Seam {
     }
 
     /// The seam's setting as a positive count (milliseconds, rows, bytes —
-    /// whatever the caller's unit is). A zero or unparseable value reads as
-    /// unset, matching `env`'s rule that an override never zeroes a knob.
+    /// whatever the caller's unit is), under `env`'s rule: a zero or
+    /// unparseable value reads as unset.
     pub fn count(&self) -> Option<u64> {
-        self.setting()?.parse::<u64>().ok().filter(|&n| n > 0)
+        self.setting().and_then(crate::env::positive)
     }
 
     /// Consume the seam's one-shot latch: true on the first call while armed,
@@ -65,3 +66,8 @@ impl Seam {
         self.armed() && !self.spent.swap(true, Ordering::Relaxed)
     }
 }
+
+// The seams read `None` in release, so their tests hold in debug only.
+#[cfg(all(test, debug_assertions))]
+#[path = "tests/fault.rs"]
+mod tests;

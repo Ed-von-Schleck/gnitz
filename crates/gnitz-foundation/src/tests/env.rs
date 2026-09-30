@@ -1,10 +1,18 @@
 use super::*;
 
-/// An unset variable is whatever the reader asked for, either way round.
-/// Hermetic: nothing here mutates the process environment, which the
-/// thread-per-test runner would let another test observe.
 #[test]
-fn an_unset_flag_reads_as_its_default() {
-    assert!(env_flag("GNITZ_UNSET_FLAG_FOR_TEST", true));
-    assert!(!env_flag("GNITZ_UNSET_FLAG_FOR_TEST", false));
+fn positive_refuses_zero_negative_and_garbage() {
+    assert_eq!(positive::<u64>("5"), Some(5));
+    assert_eq!(positive::<i64>("-1"), None);
+    for v in ["0", "", "x", "5 "] {
+        assert_eq!(positive::<u64>(v), None, "{v:?}");
+    }
+}
+
+#[test]
+fn flag_is_off_only_for_zero_and_empty() {
+    assert!(!flag("0"));
+    assert!(!flag(""));
+    assert!(flag("1"));
+    assert!(flag("no"));
 }

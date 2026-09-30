@@ -4,7 +4,6 @@
 //! verifies the body.
 
 use std::cell::OnceCell;
-use std::io::ErrorKind;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -98,10 +97,12 @@ fn direct_region(data: &[u8], span: &Span, count: usize, width: usize) -> Result
 
 impl MappedShard {
     pub(crate) fn open(path: &str, schema: &SchemaDescriptor) -> Result<Self, StorageError> {
-        let mmap = Mmap::open_ro(std::path::Path::new(path)).map_err(|e| match e.kind() {
-            ErrorKind::UnexpectedEof => Corrupt("empty file"),
-            _ => e.into(),
-        })?;
+        let file = std::fs::File::open(path)?;
+        if file.metadata()?.len() == 0 {
+            return Err(Corrupt("empty file"));
+        }
+        let mmap = Mmap::from_file(&file)?;
+        mmap.advise_hugepage();
         let data = mmap.as_slice();
         let header = ShardHeader::read(data)?;
         let prefix = data

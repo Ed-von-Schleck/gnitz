@@ -5,7 +5,6 @@
 use std::cmp::Ordering;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 
 use super::repr::loser_tree::{HeapNode, LoserTree};
@@ -43,7 +42,6 @@ pub struct SpillSort {
     dir: String,
     flat: Vec<u8>,
     spill: Option<File>,
-    spilled_bytes: usize,
 }
 
 impl SpillSort {
@@ -61,7 +59,6 @@ impl SpillSort {
             dir: dir.to_string(),
             flat: Vec::new(),
             spill: None,
-            spilled_bytes: 0,
         }
     }
 
@@ -90,7 +87,6 @@ impl SpillSort {
         };
         file.write_all(&self.flat)
             .map_err(|e| format!("external sort: spill write failed: {e}"))?;
-        self.spilled_bytes += self.flat.len();
         self.flat.clear();
         Ok(())
     }
@@ -104,8 +100,7 @@ impl SpillSort {
             self.spill_run()?;
             let file = self.spill.take().expect("spilled");
             // The mapping keeps the inode alive after `file` closes.
-            let map = Mmap::from_fd(file.as_raw_fd(), self.spilled_bytes)
-                .map_err(|e| format!("external sort: mmap spill file failed: {e}"))?;
+            let map = Mmap::from_file(&file).map_err(|e| format!("external sort: mmap spill file failed: {e}"))?;
             map.advise_sequential();
             Records::Mapped(map)
         };

@@ -20,20 +20,25 @@ pub fn available_memory_bytes() -> usize {
 }
 
 /// The tightest finite cgroup v2 `memory.max` from this process's own cgroup up
-/// to the root; `None` when nothing on the path sets one — which is also what a
-/// v1/hybrid host yields, since it writes one line per controller rather than
-/// the unified `0::<path>` matched below.
+/// to the root; `None` when nothing on the path sets one.
 fn cgroup_v2_memory_max() -> Option<usize> {
     // The path must come from here: `/sys/fs/cgroup` alone names the *root*
     // cgroup, which sets no `memory.max` on a systemd host, so a `MemoryMax=`d
     // unit would read as host RAM.
     let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    tightest_memory_max(&cgroup, std::path::Path::new("/sys/fs/cgroup"))
+}
+
+/// The tightest finite `memory.max` on the path `proc_cgroup` (the contents of
+/// `/proc/<pid>/cgroup`) names under the cgroup v2 mount `root`. A v1/hybrid
+/// host yields `None`, since it writes one line per controller rather than the
+/// unified `0::<path>` matched below.
+fn tightest_memory_max(proc_cgroup: &str, root: &std::path::Path) -> Option<usize> {
     // The v2 path is absolute; `join` would discard the mount point.
-    let rel = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
-    std::path::Path::new("/sys/fs/cgroup")
-        .join(rel.trim_start_matches('/'))
+    let rel = proc_cgroup.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    root.join(rel.trim_start_matches('/'))
         .ancestors()
-        .take_while(|d| d.starts_with("/sys/fs/cgroup"))
+        .take_while(|d| d.starts_with(root))
         // The literal `"max"` (unlimited at this level) fails the parse, as
         // does an absent file; both are skipped.
         .filter_map(|d| std::fs::read_to_string(d.join("memory.max")).ok())
@@ -41,3 +46,7 @@ fn cgroup_v2_memory_max() -> Option<usize> {
         .filter(|&v| v > 0)
         .min()
 }
+
+#[cfg(test)]
+#[path = "tests/host.rs"]
+mod tests;
