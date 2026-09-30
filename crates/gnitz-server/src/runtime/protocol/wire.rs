@@ -106,8 +106,7 @@ impl<'a> WireData<'a> {
         }
     }
 
-    /// The batch this frame's layout claim is read off — for a `Range`, the
-    /// source, whose claim a contiguous subrange keeps.
+    /// The source batch, whose layout claim the frame carries.
     fn batch(&self) -> Option<&'a Batch> {
         match *self {
             WireData::None => None,
@@ -131,9 +130,15 @@ impl<'a> WireData<'a> {
             WireData::None => 0,
             WireData::Whole(b) => b.encode_to_wire(out),
             WireData::Frame { batch, frame } => batch.encode_frame(&frame, out),
-            WireData::Scattered { batch, indices } => batch
-                .encode_scattered_to_wire(indices, out)
-                .expect("a heap-free scatter fits the bytes its size reserved"),
+            WireData::Scattered { batch, indices } => {
+                debug_assert!(
+                    batch.layout() == Layout::Raw || indices.is_sorted_by(|a, b| a < b),
+                    "a scattered subset keeps its source's layout claim only in ascending order"
+                );
+                batch
+                    .encode_scattered_to_wire(indices, out)
+                    .expect("a heap-free scatter fits the bytes its size reserved")
+            }
         }
     }
 }

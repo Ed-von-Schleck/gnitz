@@ -39,12 +39,10 @@ impl Reactor {
     }
 }
 
-/// A reactor over `n` fresh W2M rings, with the writer of each. The rings
-/// are leaked: a `W2mSlot` a failing assert leaves routed writes through its
-/// ring on drop, so never unmapping makes teardown order irrelevant.
+/// A reactor over `n` fresh W2M rings, with the writer of each.
 pub(crate) fn reactor_with_rings(n: usize) -> (Reactor, Vec<W2mWriter>) {
     let ptrs: Vec<*mut u8> = (0..n)
-        .map(|_| unsafe { crate::runtime::w2m::fixtures::test_ring(64 * 1024) }.leak())
+        .map(|_| crate::runtime::w2m::fixtures::test_ring(64 * 1024))
         .collect();
     let writers = ptrs.iter().map(|&p| W2mWriter::new(p)).collect();
     let r = make_reactor_over(W2mReceiver::new(ptrs));
@@ -52,9 +50,9 @@ pub(crate) fn reactor_with_rings(n: usize) -> (Reactor, Vec<W2mWriter>) {
 }
 
 /// A fresh ring holding one frame whose error text is `pad` bytes, read back as a
-/// slot. The ring is leaked, so the slot outlives any test scope.
+/// slot.
 pub(crate) fn ring_slot(pad: usize) -> (W2mReceiver, W2mSlot) {
-    let ptr = unsafe { crate::runtime::w2m::fixtures::test_ring(256 * 1024) }.leak();
+    let ptr = crate::runtime::w2m::fixtures::test_ring(256 * 1024);
     let text = vec![0x42u8; pad];
     let msg = crate::runtime::wire::WireMsg { blob: &text, ..Default::default() };
     W2mWriter::new(ptr).send_msg(1, &msg);

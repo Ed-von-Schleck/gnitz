@@ -155,9 +155,7 @@ fn a_dropped_lease_unblocks_a_streaming_writer() {
 
     const TOTAL: usize = 8;
 
-    // Ring sized for exactly 2 small frames; declared first so it unmaps last.
-    let region = unsafe { make_ring(ipc::WireMsg::default().size(), 2, 8) };
-    let ptr = region.ptr();
+    let ptr = make_ring(ipc::WireMsg::default().size(), 2, 8);
 
     let r = make_reactor_over(W2mReceiver::new(vec![ptr]));
     let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::ScanSpec);

@@ -12,9 +12,6 @@ use crate::runtime::test_support::SharedRegion;
 use crate::runtime::w2m::SalWake;
 use crate::runtime::wire as ipc;
 
-/// Each worker ring's size: room for a few control frames, which is all a SAL
-/// test ever sends back over one.
-const RING_BYTES: usize = 64 * 1024;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 
@@ -25,7 +22,6 @@ pub(crate) struct TestLog {
     anchor: *mut u8,
     pub(crate) writer: SalWriter,
     /// One W2M ring per worker, carrying the park the writer's wakes land on.
-    /// Leaked, as the `'static` wakes require.
     rings: Vec<*mut u8>,
 }
 
@@ -35,9 +31,9 @@ impl TestLog {
     pub(crate) fn new(size: usize, workers: usize, epoch: u32) -> TestLog {
         let file = SharedRegion::new(ANCHOR_BYTES + size);
         let rings: Vec<*mut u8> = (0..workers)
-            .map(|_| unsafe { crate::runtime::w2m::fixtures::test_ring(RING_BYTES) }.leak())
+            .map(|_| crate::runtime::w2m::fixtures::test_ring(4096))
             .collect();
-        // SAFETY: every ring is initialized above and leaked.
+        // SAFETY: a test ring is never unmapped.
         let wakes = rings.iter().map(|&p| unsafe { SalWake::new(p) }).collect();
         // SAFETY: the region is leaked below, so it is mapped and its fd open for
         // the rest of the process.

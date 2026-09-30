@@ -273,6 +273,53 @@ pub fn make_schema_u128_i64() -> SchemaDescriptor {
     pk_payload_schema(&[TypeCode::U128])
 }
 
+/// Payload column `col`'s string on row `row`.
+pub fn read_german_string(batch: &Batch, col: usize, row: usize) -> Vec<u8> {
+    let off = row * 16;
+    let gs: &[u8; 16] = batch.col_data(col)[off..off + 16].try_into().unwrap();
+    gnitz_wire::try_decode_german_string(gs, batch.blob()).unwrap()
+}
+
+/// U64 pk + a single STRING payload column.
+pub fn make_schema_pk_u64_payload_string() -> SchemaDescriptor {
+    u64_pk_schema(SchemaColumn::new(TypeCode::String, false))
+}
+
+/// [`make_batch_bytes`] under [`make_schema_pk_u64_payload_string`].
+pub fn make_string_batch(rows: &[(u64, i64, &[u8])]) -> Batch {
+    make_batch_bytes(&make_schema_pk_u64_payload_string(), rows)
+}
+
+/// Payload column 0's string on every row, in order.
+pub fn read_strings(batch: &Batch) -> Vec<Vec<u8>> {
+    (0..batch.len()).map(|row| read_german_string(batch, 0, row)).collect()
+}
+
+/// U64 pk + a single BLOB payload column.
+pub fn make_schema_pk_u64_payload_blob() -> SchemaDescriptor {
+    u64_pk_schema(SchemaColumn::new(TypeCode::Blob, false))
+}
+
+/// [`make_batch_bytes_raw`] certified `Consolidated`: the rows must already be in
+/// (PK, payload) order.
+pub fn make_batch_bytes(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> Batch {
+    let mut b = make_batch_bytes_raw(schema, rows);
+    b.certify_layout(Layout::Consolidated);
+    b
+}
+
+/// A `(U64 pk, STRING|BLOB payload)` batch of `(pk, weight, bytes)` rows, in the
+/// order given.
+pub fn make_batch_bytes_raw(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> Batch {
+    let mut b = BatchBuilder::new(*schema);
+    for &(pk, w, val) in rows {
+        b.begin_row(pk as u128, w);
+        b.put_blob(val);
+        b.end_row();
+    }
+    b.finish()
+}
+
 /// The batch as the Z-Set it denotes: `Σ weight` per logical row identity, with
 /// the net-zero entries dropped. Emission order and the physical encoding of a
 /// string both drop out, which is what lets two independently produced batches
@@ -284,6 +331,14 @@ pub fn zset_of(batch: &Batch, schema: &SchemaDescriptor) -> std::collections::Ha
     }
     z.retain(|_, w| *w != 0);
     z
+}
+
+/// Every row of `batch` as its logical identity and weight, in batch order —
+/// [`zset_of`] for a comparison where order and unfolded duplicates count.
+pub fn weighted_rows(batch: &Batch) -> Vec<(RowKey, i64)> {
+    (0..batch.len())
+        .map(|row| (row_key(batch, batch.schema(), row), batch.get_weight(row)))
+        .collect()
 }
 
 /// `batch` framed as one WAL block in a buffer of its own.

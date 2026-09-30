@@ -187,8 +187,7 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
     const N_MESSAGES: u64 = 500;
     const TIMEOUT: Duration = Duration::from_secs(30);
 
-    let region = unsafe { crate::runtime::w2m::fixtures::test_ring(64 * 1024) };
-    let ptr = region.ptr();
+    let ptr = crate::runtime::w2m::fixtures::test_ring(64 * 1024);
 
     let child = || {
         // Publish a monotonic req_id stream as fast as possible. The
@@ -231,25 +230,6 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
     unsafe { crate::runtime::test_support::assert_child_exited_ok(pid) };
 }
 
-/// An unread publish must make the arm refuse, so the reactor drains instead of
-/// arming a `FUTEX_WAITV` for a wake that already happened. The publish lands
-/// before the arm, so there is no race to lose.
-#[test]
-fn arm_waitv_refuses_while_data_is_unread() {
-    use crate::runtime::w2m::W2mWriter;
-
-    let region = unsafe { crate::runtime::w2m::fixtures::test_ring(64 * 1024) };
-    let ptr = region.ptr();
-    W2mWriter::new(ptr).send_status(0, 1, WireStatus::Ok, &[]);
-
-    let receiver = W2mReceiver::new(vec![ptr]);
-    let mut out = [FutexWaitV::new(); 1];
-    assert!(
-        receiver.arm_waitv(&mut out).is_none(),
-        "an unread publish must refuse the arm — arming it would be a lost wake",
-    );
-}
-
 /// A publish on a ring past the first wakes a reactor parked on all of them: the
 /// child answers on ring 0, waits until the reactor parks, then answers on ring 1.
 #[test]
@@ -259,8 +239,8 @@ fn a_publish_on_a_later_ring_wakes_the_reactor() {
 
     const TIMEOUT: Duration = Duration::from_secs(30);
 
-    let r0 = unsafe { test_ring(64 * 1024) }.leak();
-    let r1 = unsafe { test_ring(64 * 1024) }.leak();
+    let r0 = test_ring(64 * 1024);
+    let r1 = test_ring(64 * 1024);
 
     let child = || {
         W2mWriter::new(r0).send_status(0, 1, WireStatus::Ok, &[]);

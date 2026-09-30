@@ -1,7 +1,9 @@
 use super::*;
 use crate::runtime::sal::fixtures::bare_message;
 use crate::runtime::w2m::{self, W2mReceiver};
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, u64_pk_schema};
+use crate::test_support::{
+    make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, u64_pk_schema,
+};
 use gnitz_store::schema::SchemaColumn;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::BatchBuilder;
@@ -11,8 +13,7 @@ use gnitz_wire::TypeCode;
 /// on the ring prefix of the request id it was handed.
 #[test]
 fn send_helpers_publish_on_the_request_id() {
-    let (region, w2m_writer) = ring_and_writer();
-    let region_ptr = region.ptr();
+    let (ring, w2m_writer) = ring_and_writer();
 
     let mut wp = make_test_worker(std::ptr::null_mut(), w2m_writer);
 
@@ -24,7 +25,7 @@ fn send_helpers_publish_on_the_request_id() {
     wp.send_reply(route(8, req_resp), Batch::empty_with_schema(&schema));
     wp.send_fault(&gnitz_wire::WireFault::from("boom"), req_err);
 
-    let decoded_ids: Vec<u32> = walk_frames(region_ptr).iter().map(|(id, _)| *id).collect();
+    let decoded_ids: Vec<u32> = walk_frames(ring).iter().map(|(id, _)| *id).collect();
     assert_eq!(decoded_ids, vec![req_ack, req_resp, req_err]);
 }
 
@@ -140,8 +141,7 @@ fn reads_defer_inside_exchange_in_request_order() {
 /// round every peer waits on.
 #[test]
 fn a_queued_train_is_not_emitted_inside_an_exchange_wait() {
-    let (region, writer) = ring_and_writer();
-    let ptr = region.ptr();
+    let (ptr, writer) = ring_and_writer();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.send_reply(fifo_route(1, 5), make_n_row_batch(make_schema_u64_i64(), 3));
 
@@ -157,13 +157,13 @@ fn a_queued_train_is_not_emitted_inside_an_exchange_wait() {
 fn a_sequences_ddl_sync_runs_inline_inside_an_exchange_wait() {
     let dir = crate::test_support::scratch_dir("worker", "sequences_ddl_sync_inline");
     let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
-    let (region, writer) = ring_and_writer();
+    let (ring, writer) = ring_and_writer();
     let mut wp = make_test_worker(&mut engine, writer);
     let tid = SysFamily::Sequence.id();
 
     dispatch_in_eval(&mut wp, SalMessageKind::DdlSync, tid, control_frame(tid));
     assert!(wp.deferred.is_empty(), "a `_sequences` DdlSync must not park");
-    assert!(walk_frames(region.ptr()).is_empty(), "a DdlSync is never answered");
+    assert!(walk_frames(ring).is_empty(), "a DdlSync is never answered");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -179,8 +179,7 @@ fn flush_and_push_run_inline_inside_exchange() {
     let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
     // `Flush` rewinds the reader before flushing, so it needs a real log.
     let sal = TestLog::new(SAL_SIZE, 1, 1);
-    let (region, writer) = ring_and_writer();
-    let ptr = region.ptr();
+    let (ptr, writer) = ring_and_writer();
     let mut wp = make_test_worker(&mut engine, writer);
     wp.sal_reader = SalReader::new(sal.log(), 0, 1);
 
@@ -214,7 +213,7 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
             .dag
             .buffer_unticked(tid, make_batch_raw(&schema, &[(tid, 1, 10)]));
     }
-    let (region, writer) = ring_and_writer();
+    let (ring, writer) = ring_and_writer();
     let mut wp = make_test_worker(&mut engine, writer);
 
     let req = wp.decode_request(&bare_message(SalMessageKind::Tick, 0), tick_frame(&[500, 501], 7));
@@ -223,7 +222,7 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
     for tid in [500, 501] {
         assert!(wp.cat().dag.take_unticked(tid).is_none(), "tid {tid} was ticked");
     }
-    let frames = walk_frames(region.ptr());
+    let frames = walk_frames(ring);
     assert_eq!(frames.len(), 1, "the group ACKs once");
     let ctrl = gnitz_wire::control::peek_control_block(&frames[0].1).unwrap();
     assert_eq!(ctrl.hdr.status, WireStatus::Ok);
@@ -279,12 +278,10 @@ fn the_sal_reader_gates_on_the_epoch() {
 
 // -- pending stream chunking tests -----------------------------------------------
 
-/// A ring and its writer, sized well past anything these tests publish — the
-/// largest is a few KiB.
-fn ring_and_writer() -> (crate::runtime::test_support::SharedRegion, W2mWriter) {
-    let region = unsafe { w2m::fixtures::test_ring(1 << 22) };
-    let writer = W2mWriter::new(region.ptr());
-    (region, writer)
+/// A ring and its writer, sized well past anything these tests publish.
+fn ring_and_writer() -> (*mut u8, W2mWriter) {
+    let ring = w2m::fixtures::test_ring(1 << 22);
+    (ring, W2mWriter::new(ring))
 }
 
 /// A U64 PK with a stride-4 payload column: the shape whose wire block pads
@@ -303,25 +300,6 @@ fn make_n_row_batch(schema: SchemaDescriptor, n: usize) -> Batch {
         for _ in 0..schema.num_payload_cols() {
             b.put_int(i);
         }
-        b.end_row();
-    }
-    b.finish()
-}
-
-/// A U64 PK with one STRING payload column — the shape whose batches carry a
-/// live blob heap, so every frame of a train over one must compact it.
-fn string_schema() -> SchemaDescriptor {
-    u64_pk_schema(SchemaColumn::new(TypeCode::String, false))
-}
-
-/// `(pk, string)` rows over [`string_schema`] at weight 1. Values past
-/// `SHORT_STRING_THRESHOLD` (12 bytes) land in the heap; shorter ones stay
-/// inline and leave the heap empty.
-fn long_string_batch(schema: &SchemaDescriptor, rows: &[(u64, &str)]) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
-    for &(pk, v) in rows {
-        b.begin_row(pk as u128, 1);
-        b.put_string(v);
         b.end_row();
     }
     b.finish()
@@ -361,8 +339,7 @@ fn train_frames_fill_the_budget_to_within_one_row() {
         let per_row = frame_size(schema, 2) - frame_size(schema, 1);
         let budget = frame_size(schema, 4);
 
-        let (region, writer) = ring_and_writer();
-        let ptr = region.ptr();
+        let (ptr, writer) = ring_and_writer();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
         wp.reply_frame_budget = budget;
         wp.pending_streams.push_back(PendingScan {
@@ -403,8 +380,7 @@ fn train_frames_fill_the_budget_to_within_one_row() {
 fn fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
     let schema = make_schema_u64_i64();
     for fifo in [false, true] {
-        let (region, writer) = ring_and_writer();
-        let ptr = region.ptr();
+        let (ptr, writer) = ring_and_writer();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
 
         let r = if fifo { fifo_route(1, 3) } else { route(1, 3) };
@@ -440,8 +416,11 @@ fn fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
 /// is what tells the two paths apart.
 #[test]
 fn fifo_emits_a_fitting_reply_over_the_source_batch() {
-    let schema = string_schema();
-    let live = long_string_batch(&schema, &[(1, "a long enough value"), (2, "another long value")]);
+    let schema = make_schema_pk_u64_payload_string();
+    let live = make_batch_bytes_raw(
+        &schema,
+        &[(1, 1, b"a long enough value"), (2, 1, b"another long value")],
+    );
     // The same rows over a heap padded with 4096 unreferenced bytes, framed as
     // an engine block that states them.
     let mut wire = gnitz_wire::Regions::new();
@@ -459,8 +438,7 @@ fn fifo_emits_a_fitting_reply_over_the_source_batch() {
         "the fixture must have a dedupable heap for the size test to discriminate"
     );
 
-    let (region, writer) = ring_and_writer();
-    let ptr = region.ptr();
+    let (ptr, writer) = ring_and_writer();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.send_reply(fifo_route(1, 5), Rc::clone(&batch));
     assert_eq!(wp.pending_streams.len(), 1, "fifo queues even a fitting reply");
@@ -519,8 +497,7 @@ fn pending_streams_drain_two_trains_fifo() {
     // Budget: exactly 4 of A's rows, so train A's 10 rows span several frames.
     let budget = frame_size(schema_a, 4);
 
-    let (region, writer) = ring_and_writer();
-    let ptr = region.ptr();
+    let (ptr, writer) = ring_and_writer();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.pending_streams.push_back(PendingScan {
         batch: Rc::new(batch_a),
@@ -579,8 +556,7 @@ fn an_oversized_reply_enqueues_a_train() {
     let rows = (gnitz_wire::MAX_FRAME_PAYLOAD / 32) + 4096;
     let batch = Batch::zeroed(&schema, rows);
 
-    let (region, writer) = ring_and_writer();
-    let ptr = region.ptr();
+    let (ptr, writer) = ring_and_writer();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.send_reply(route(3, 5), batch);
     assert_eq!(wp.pending_streams.len(), 1);
@@ -597,11 +573,13 @@ fn an_oversized_reply_enqueues_a_train() {
 /// frame, with no fault.
 #[test]
 fn a_row_wider_than_the_budget_ships_one_over_budget_frame() {
-    let schema = string_schema();
-    let batch = long_string_batch(&schema, &[(1, &"x".repeat(4096)), (2, &"y".repeat(4096))]);
+    let schema = make_schema_pk_u64_payload_string();
+    let batch = make_batch_bytes_raw(
+        &schema,
+        &[(1, 1, "x".repeat(4096).as_bytes()), (2, 1, "y".repeat(4096).as_bytes())],
+    );
 
-    let (region, writer) = ring_and_writer();
-    let ptr = region.ptr();
+    let (ptr, writer) = ring_and_writer();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.reply_frame_budget = 512;
     wp.send_reply(route(1, 5), batch);
@@ -629,12 +607,14 @@ fn a_row_wider_than_the_budget_ships_one_over_budget_frame() {
 /// oversize fault.
 #[test]
 fn a_row_wider_than_the_frame_cap_faults() {
-    let schema = string_schema();
+    let schema = make_schema_pk_u64_payload_string();
     // One row whose string alone exceeds what a client can read in one frame.
-    let batch = long_string_batch(&schema, &[(1, &"z".repeat(gnitz_wire::MAX_FRAME_PAYLOAD + 4096))]);
+    let batch = make_batch_bytes_raw(
+        &schema,
+        &[(1, 1, "z".repeat(gnitz_wire::MAX_FRAME_PAYLOAD + 4096).as_bytes())],
+    );
 
-    let (region, writer) = ring_and_writer();
-    let ptr = region.ptr();
+    let (ptr, writer) = ring_and_writer();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.send_reply(route(1, 5), batch);
     assert_eq!(
@@ -664,18 +644,20 @@ fn a_row_wider_than_the_frame_cap_faults() {
 /// comparison would test nothing.
 #[test]
 fn a_long_string_train_reassembles_with_its_weights() {
-    let schema = string_schema();
+    let schema = make_schema_pk_u64_payload_string();
     let rows: Vec<(u64, String)> = (0..25u64)
         .map(|i| (i, format!("value-{i}-{}", "p".repeat(40))))
         .collect();
-    let source = long_string_batch(&schema, &rows.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>());
+    let source = make_batch_bytes_raw(
+        &schema,
+        &rows.iter().map(|(k, v)| (*k, 1, v.as_bytes())).collect::<Vec<_>>(),
+    );
     assert!(!source.blob().is_empty(), "40+ byte values must live in the heap");
 
     // ~230 B per row, so a 2 KiB budget puts a handful of rows in each frame.
     let budget = 2048;
 
-    let (region, writer) = ring_and_writer();
-    let ptr = region.ptr();
+    let (ptr, writer) = ring_and_writer();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.reply_frame_budget = budget;
     wp.send_reply(route(1, 5), source);

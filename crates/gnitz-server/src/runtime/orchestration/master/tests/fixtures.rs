@@ -40,7 +40,7 @@ pub(super) fn make_row_batch(schema: SchemaDescriptor, rows: &[(u128, i64, Optio
     bb.finish()
 }
 
-/// A dispatcher over empty, leaked W2M rings nothing parks on. `catalog` may be
+/// A dispatcher over empty W2M rings nothing parks on. `catalog` may be
 /// null where the path under test never calls `cat()`.
 pub(super) fn test_dispatcher(worker_pids: Vec<i32>, catalog: *mut CatalogEngine) -> MasterDispatcher {
     inert_dispatcher(worker_pids, catalog).0
@@ -53,14 +53,13 @@ pub(super) fn test_dispatcher_with_writers(worker_pids: Vec<i32>) -> (MasterDisp
 }
 
 fn inert_dispatcher(worker_pids: Vec<i32>, catalog: *mut CatalogEngine) -> (MasterDispatcher, Vec<W2mWriter>) {
-    const RING_CAP: usize = 64 * 1024;
     const SAL_SIZE: usize = 4096;
     let nw = worker_pids.len();
     let rings: Vec<*mut u8> = (0..nw)
-        .map(|_| unsafe { crate::runtime::w2m::fixtures::test_ring(RING_CAP) }.leak())
+        .map(|_| crate::runtime::w2m::fixtures::test_ring(64 * 1024))
         .collect();
     let writers = rings.iter().map(|&p| W2mWriter::new(p)).collect();
-    // SAFETY: every ring is initialized above and leaked.
+    // SAFETY: a test ring is never unmapped.
     let wakes = rings.iter().map(|&p| unsafe { SalWake::new(p) }).collect();
     let reactor = crate::runtime::test_support::make_reactor_over(W2mReceiver::new(rings));
     let region = SharedRegion::new(ANCHOR_BYTES + SAL_SIZE);

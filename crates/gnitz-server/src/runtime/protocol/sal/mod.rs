@@ -410,6 +410,10 @@ fn effective_max(kind: SalMessageKind, ring_len: usize) -> usize {
 /// Floor for a `GNITZ_SAL_BYTES` override — must comfortably exceed one DDL zone
 /// plus the checkpoint headroom.
 const MIN_SAL_BYTES: usize = 16 << 20;
+const _: () = assert!(
+    PREFIX_BYTES + CHECKPOINT_RESERVE < MIN_SAL_BYTES / 64,
+    "the checkpoint reserve must leave ordinary groups nearly all of the smallest SAL"
+);
 
 /// `SAL_MMAP_SIZE` (1 GiB), or `GNITZ_SAL_BYTES` clamped into
 /// `[MIN_SAL_BYTES, SAL_MMAP_SIZE]` and logged when the clamp moves it. The

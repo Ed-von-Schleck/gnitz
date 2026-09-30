@@ -2,7 +2,8 @@ use super::fixtures::*;
 use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{
-    col_def, make_schema_u64_i64, pk_only_schema, scratch_dir, u64_pk_schema, write_circuit, write_identity_circuit,
+    col_def, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema, scratch_dir, u64_pk_schema,
+    write_circuit, write_identity_circuit,
 };
 use gnitz_expr::SchemaFacts;
 use gnitz_store::schema::SchemaColumn;
@@ -208,13 +209,7 @@ fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
     );
 
     let view_schema = pk_only_schema(&[TypeCode::U64]);
-    let string_payload = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::String, false),
-        ],
-        &[0],
-    );
+    let string_payload = make_schema_pk_u64_payload_string();
     let against = |view_schema: &SchemaDescriptor, vid: u64| {
         let loaded = load_circuit(&engine.registry, vid)?;
         compile_view(&loaded, &engine.registry, view_schema, false).map(drop)

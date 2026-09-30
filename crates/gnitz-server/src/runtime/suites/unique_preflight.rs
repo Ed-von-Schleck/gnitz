@@ -53,8 +53,7 @@ fn producer_of(keys: &[PkBuf]) -> KeyProducer {
 fn with_test_ring(f: impl FnOnce(&W2mWriter, &W2mReceiver)) {
     // Room for a whole pre-flight train at once, so a test drains it without
     // ever racing the writer against backpressure.
-    let region = unsafe { make_ring(1 << 16, 16, 8) };
-    let ptr = region.ptr();
+    let ptr = make_ring(1 << 16, 16, 8);
     let writer = W2mWriter::new(ptr);
     let receiver = W2mReceiver::new(vec![ptr]);
     f(&writer, &receiver);

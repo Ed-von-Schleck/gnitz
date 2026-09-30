@@ -14,7 +14,7 @@ use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, BatchBuilder, Layout, ReadCursor, RecoverySource, StoreBudgets, Table};
 use gnitz_wire::TypeCode;
 
-use super::shared::{arb_type_code, pk_payload_schema, u64_pk_schema};
+use super::shared::{arb_type_code, pk_payload_schema};
 
 /// The canonical wide-PK test schema: a 3×U64 compound primary key
 /// (`pk_stride = 24`, wide) with a single I64 payload column.
@@ -113,17 +113,6 @@ pub fn stored_payload0_i64(fr: &crate::storage::StoredRow) -> i64 {
     payload0_i64(&fr.run, fr.row)
 }
 
-/// Read a German-string payload cell (16-byte struct at payload `col`, `row`)
-/// back to its content bytes — the test-side readback inverse of
-/// `gnitz_wire::encode_german_string`, via the production decoder. `unwrap`s:
-/// a test that writes a cell through the encoder and cannot read it back has
-/// found a bug, not a corrupt input.
-pub fn read_german_string(batch: &Batch, col: usize, row: usize) -> Vec<u8> {
-    let off = row * 16;
-    let gs: &[u8; 16] = batch.col_data(col)[off..off + 16].try_into().unwrap();
-    gnitz_wire::try_decode_german_string(gs, batch.blob()).unwrap()
-}
-
 /// I64 pk + I64 payload schema — the signed-PK exercise of the order-preserving
 /// key (negatives sort before positives only because the encoder sign-flips).
 pub fn make_schema_i64pk_i64() -> SchemaDescriptor {
@@ -139,41 +128,6 @@ pub fn make_batch_i64pk(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> 
     for &(pk, w, val) in rows {
         b.begin_row_opk(&[(pk as u64) as u128], w);
         b.put_int(val as u128);
-        b.end_row();
-    }
-    let mut b = b.finish();
-    b.certify_layout(Layout::Consolidated);
-    b
-}
-
-/// U64 pk + a single STRING payload column.
-pub fn make_schema_pk_u64_payload_string() -> SchemaDescriptor {
-    u64_pk_schema(SchemaColumn::new(TypeCode::String, false))
-}
-
-/// [`make_batch_bytes`] under [`make_schema_pk_u64_payload_string`].
-pub fn make_string_batch(rows: &[(u64, i64, &[u8])]) -> Batch {
-    make_batch_bytes(&make_schema_pk_u64_payload_string(), rows)
-}
-
-/// Payload column 0's string on every row, in order.
-pub fn read_strings(batch: &Batch) -> Vec<Vec<u8>> {
-    (0..batch.count).map(|row| read_german_string(batch, 0, row)).collect()
-}
-
-/// U64 pk + a single BLOB payload column.
-pub fn make_schema_pk_u64_payload_blob() -> SchemaDescriptor {
-    u64_pk_schema(SchemaColumn::new(TypeCode::Blob, false))
-}
-
-/// Build a sorted, consolidated batch for a `(U64 pk, STRING|BLOB payload)` schema
-/// from `(pk, weight, bytes)` rows, already in (PK, payload) order. Values over 12
-/// bytes land in the blob heap, so this is the builder for blob-propagation tests.
-pub fn make_batch_bytes(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
-    for &(pk, w, val) in rows {
-        b.begin_row(pk as u128, w);
-        b.put_blob(val);
         b.end_row();
     }
     let mut b = b.finish();
