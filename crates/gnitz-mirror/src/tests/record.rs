@@ -5,7 +5,7 @@ use gnitz_wire::{ColumnDef, TypeCode};
 
 use super::*;
 
-fn schema_block() -> Vec<u8> {
+fn record(cursor: Option<DeltaCursor>) -> MirrorRecord {
     let schema = Schema {
         columns: vec![
             ColumnDef::new("id", TypeCode::U64, false),
@@ -13,14 +13,10 @@ fn schema_block() -> Vec<u8> {
         ],
         pk_cols: vec![0],
     };
-    schema.to_block()
-}
-
-fn record(cursor: Option<DeltaCursor>) -> MirrorRecord {
     MirrorRecord {
         schema_name: "public".to_string(),
         name: "recent".to_string(),
-        block: schema_block(),
+        block: schema.to_block(),
         cursor,
     }
 }
@@ -32,56 +28,40 @@ fn one_cursor() -> Option<DeltaCursor> {
     })
 }
 
+/// A registration round-trips with its cursor, and one with no feed position
+/// comes back with none rather than as a cursor at round 0 — which the next poll
+/// would answer off a copy the gate is there to refuse.
 #[test]
-fn a_record_with_a_cursor_round_trips() {
-    let rec = record(one_cursor());
-    assert_eq!(MirrorRecord::decode(&rec.encode()).map(|(r, _)| r), Some(rec));
-}
-
-/// A registration with no feed position comes back with none, rather than as a
-/// cursor at round 0 — which the next poll would answer off a copy the gate is
-/// there to refuse.
-#[test]
-fn a_record_without_a_cursor_reads_back_without_one() {
-    let rec = record(None);
-    assert_eq!(MirrorRecord::decode(&rec.encode()).map(|(r, _)| r), Some(rec));
-}
-
-#[test]
-fn truncated_or_overlong_bytes_are_refused() {
-    let bytes = record(one_cursor()).encode();
-    for cut in 0..bytes.len() {
-        assert_eq!(
-            MirrorRecord::decode(&bytes[..cut]).map(|(r, _)| r),
-            None,
-            "bytes cut at {cut}"
-        );
+fn a_record_round_trips() {
+    for cursor in [one_cursor(), None] {
+        let rec = record(cursor);
+        assert_eq!(MirrorRecord::decode(&rec.encode()).map(|(r, _)| r), Some(rec));
     }
-    let mut longer = bytes;
-    longer.push(0);
-    assert_eq!(MirrorRecord::decode(&longer).map(|(r, _)| r), None);
 }
 
 #[test]
-fn an_unknown_cursor_flag_is_refused() {
-    let mut bytes = record(one_cursor()).encode();
-    bytes[0] = 2;
-    assert_eq!(MirrorRecord::decode(&bytes).map(|(r, _)| r), None);
-}
-
-#[test]
-fn a_block_describing_no_layout_is_refused() {
-    let rec = MirrorRecord {
+fn bytes_encode_did_not_produce_are_refused() {
+    let good = record(one_cursor()).encode();
+    let mut refused: Vec<(String, Vec<u8>)> = (0..good.len())
+        .map(|cut| (format!("cut at {cut}"), good[..cut].to_vec()))
+        .collect();
+    let mut overlong = good.clone();
+    overlong.push(0);
+    refused.push(("a trailing byte".into(), overlong));
+    let mut flag = good.clone();
+    flag[0] = 2;
+    refused.push(("an unknown cursor flag".into(), flag));
+    // The flag byte, then the tag, then the tick.
+    let mut round_0 = good.clone();
+    round_0[9..17].fill(0);
+    refused.push(("a cursor at round 0".into(), round_0));
+    let no_layout = MirrorRecord {
         block: vec![0xAB; 20],
         ..record(one_cursor())
     };
-    assert_eq!(MirrorRecord::decode(&rec.encode()).map(|(r, _)| r), None);
-}
+    refused.push(("a block describing no layout".into(), no_layout.encode()));
 
-#[test]
-fn a_cursor_at_round_0_is_refused() {
-    let mut bytes = record(one_cursor()).encode();
-    // The flag byte, then the tag, then the tick.
-    bytes[9..17].fill(0);
-    assert_eq!(MirrorRecord::decode(&bytes).map(|(r, _)| r), None);
+    for (what, bytes) in refused {
+        assert!(MirrorRecord::decode(&bytes).is_none(), "{what}");
+    }
 }

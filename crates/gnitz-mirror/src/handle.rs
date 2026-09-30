@@ -22,14 +22,6 @@ use crate::record::{descriptor_of_block, MirrorRecord};
 /// `GNITZ_MIRROR_CHECKPOINT_BYTES` overrides it.
 const DEFAULT_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 
-/// `GNITZ_INJECT_MIRROR_CHECKPOINT_ERROR`: fail the next checkpoint once, before
-/// anything durable moved. Debug-only.
-static CHECKPOINT_ERROR: Seam = Seam::new("GNITZ_INJECT_MIRROR_CHECKPOINT_ERROR");
-
-/// `GNITZ_INJECT_MIRROR_BOOTSTRAP_ERROR`: fail the next `Invalidate::Copy` once,
-/// after the cursor is dropped and the copy erased. Debug-only.
-static BOOTSTRAP_ERROR: Seam = Seam::new("GNITZ_INJECT_MIRROR_BOOTSTRAP_ERROR");
-
 /// `GNITZ_INJECT_MIRROR_INGEST_PANIC`: panic once on an advance, idle polls
 /// included. A panic rather than an `Err`: nothing else reaches
 /// [`Mirror::touching`]'s guard arm.
@@ -252,9 +244,6 @@ impl MirrorStore for Mirror {
                 }
             };
             erased.map_err(|e| m.poison(format!("erasing the copy of {tid} failed: {e}")))?;
-            if level == Invalidate::Copy && BOOTSTRAP_ERROR.take_once() {
-                return Err(MirrorError::Engine("injected bootstrap failure".to_string()));
-            }
             Ok(())
         })
     }
@@ -323,9 +312,6 @@ impl MirrorStore for Mirror {
     fn checkpoint(&mut self) -> Result<(), MirrorError> {
         self.touching("checkpointing", |m| {
             m.applied_bytes = 0;
-            if CHECKPOINT_ERROR.take_once() {
-                return Err(MirrorError::Engine("injected checkpoint failure".to_string()));
-            }
             for (&tid, rec) in &m.records {
                 m.registry
                     .set_caller_record(tid, rec.encode())

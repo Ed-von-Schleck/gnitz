@@ -3,8 +3,7 @@
 //!
 //! A Rust integration test rather than a pytest: it reaches a real server through
 //! `gnitz-test-harness` and builds its `ReadSpec`s through `gnitz-sql`, both
-//! **dev**-dependencies — neither is in the crate's dependency graph, and
-//! neither closes a cycle, since nothing depends on `gnitz-mirror`.
+//! **dev**-dependencies, so neither enters the crate's dependency graph.
 //!
 //! `tests/store.rs` beside it covers the store alone, with no server and no
 //! client.
@@ -12,18 +11,21 @@
 //! **No test runs at one worker.** At W=1 there is one slice, so a mirror that
 //! mishandled the concatenation of W slices would still pass, and the
 //! replicated-vs-keyed routing split collapses to the same thing. Four is the
-//! default; one case runs at two, which moves that split rather than removing
-//! it.
+//! default; the shape cases also run at two, which moves that split rather than
+//! removing it.
 
 mod support;
+
+use std::sync::Arc;
 
 use gnitz_core::{ClientError, GnitzClient, MirrorError, PollOutcome, PollResult, Schema, ZSetBatch};
 use gnitz_mirror::Mirror;
 use gnitz_sql::GnitzSqlError;
 use gnitz_store_testkit::{assert_child_ok, run_test_in_child, CHILD_OK};
 use gnitz_test_harness::ServerHandle;
-use support::common::{copy_dir, has_manifest, manifest_path};
-use support::{assert_same_sequence, assert_same_zset, canonical, query, serial, sql, EnvVar};
+use gnitz_wire::WireStatus;
+use support::common::{has_copy, has_manifest, manifest_path};
+use support::{canonical, canonical_rows, differential, query, sql, Answer};
 
 /// Four workers, because that is the only count that exercises the fan-out.
 const WORKERS: usize = 4;
@@ -50,18 +52,14 @@ fn mirroring_client(target: &str, dir: &str) -> GnitzClient {
     client
 }
 
-/// A four-worker server, or a panic naming what is missing. The harness answers
-/// `None` when the binary is absent, and an early `return` on that would report
-/// green having run nothing — with no CI, that silence has no beneficiary.
-fn start_server() -> ServerHandle {
-    start_server_with(WORKERS, &[])
-}
-
-/// The same, at a chosen worker count and with server-side environment of its
-/// own — the harness sets it on the server process alone, so a seam one test
-/// needs cannot race a sibling through the process env.
-fn start_server_with(workers: usize, env: &[(&str, &str)]) -> ServerHandle {
-    ServerHandle::start_with_env(workers, env)
+/// Create `schema.name` as a view over `body` that keeps a delta feed — the only
+/// kind a client can mirror.
+fn fed_view(client: &mut GnitzClient, schema: &str, name: &str, body: &str) {
+    sql(
+        client,
+        schema,
+        &format!("CREATE VIEW {name} WITH (delta = '{FEED}') AS {body}"),
+    );
 }
 
 impl Fixture {
@@ -69,8 +67,10 @@ impl Fixture {
         Fixture::start_with(WORKERS, &[])
     }
 
+    /// At a chosen worker count, with server-side environment of its own — the
+    /// harness sets it on the server process alone.
     fn start_with(workers: usize, env: &[(&str, &str)]) -> Fixture {
-        let server = start_server_with(workers, env);
+        let server = ServerHandle::start_with_env(workers, env);
         let dir = tempfile::tempdir().unwrap();
         let mut direct = GnitzClient::connect(server.sock_path()).unwrap();
         seed(&mut direct);
@@ -98,11 +98,22 @@ impl Fixture {
         self.mirror().reconnect(&target).expect("reconnect");
     }
 
-    /// Close the client's store — the exit checkpoint — and open a fresh one on
-    /// the same directory.
-    fn reopen(&mut self) {
+    /// Restart the server, and give the direct client a live connection.
+    fn restart_server(&mut self) {
+        self.server.restart();
+        self.direct = GnitzClient::connect(self.server.sock_path()).unwrap();
+    }
+
+    /// Close the client's store — the exit checkpoint — and release the
+    /// directory.
+    fn close(&mut self) {
         let mut client = self.mirror.take().expect("a client to close");
         client.close_mirror().expect("exit checkpoint");
+    }
+
+    /// [`Fixture::close`], then a fresh client on the same directory.
+    fn reopen(&mut self) {
+        self.close();
         self.open();
     }
 
@@ -115,19 +126,23 @@ impl Fixture {
     }
 
     /// Make the named views of `schema` emit the rounds the pushes so far
-    /// produced, then carry them into the copies.
-    ///
-    /// The order is not cosmetic and it is the whole freshness contract: a poll
-    /// does **not** drive a tick and a read against the server does, so a push
-    /// ACKed but not yet ticked is in the server's answer and not in the copy.
-    /// Reading first drains, so the rounds exist before the poll that collects
-    /// them. `COUNT(*)` because only the drain is wanted: it folds server-side
-    /// and replies with one row per worker where `SELECT *` ships the view.
-    fn drain(&mut self, schema: &str, views: &[impl AsRef<str>]) -> Vec<PollOutcome> {
+    /// produced: a read against the server drains its pending ticks. `COUNT(*)`
+    /// because only the drain is wanted: it folds server-side and replies with
+    /// one row per worker where `SELECT *` ships the view.
+    fn tick(&mut self, schema: &str, views: &[impl AsRef<str>]) {
         for v in views {
             let name = v.as_ref();
             let _ = query(&mut self.direct, schema, &format!("SELECT COUNT(*) AS n FROM {name}"));
         }
+    }
+
+    /// [`Fixture::tick`], then carry the rounds into the copies.
+    ///
+    /// The order is not cosmetic and it is the whole freshness contract: a poll
+    /// does **not** drive a tick and a read against the server does, so a push
+    /// ACKed but not yet ticked is in the server's answer and not in the copy.
+    fn drain(&mut self, schema: &str, views: &[impl AsRef<str>]) -> Vec<PollOutcome> {
+        self.tick(schema, views);
         self.mirror().poll_mirror().expect("poll")
     }
 
@@ -138,22 +153,28 @@ impl Fixture {
 
     /// `m` mirrored delta-fed views of `t`, named `<prefix>0..m`, each selecting
     /// `cols` where `v >= i` — so they differ only in a `WHERE` and a
-    /// misdirected reply lands rows that are individually plausible. Drained, so
-    /// every copy holds a round.
-    fn many_views(&mut self, prefix: &str, m: usize, cols: &str) -> Vec<String> {
+    /// misdirected reply lands rows that are individually plausible. Each first
+    /// registration bootstraps; drained, so every copy holds a round.
+    fn many_views(&mut self, prefix: &str, m: usize, cols: &str) -> Vec<(String, u64)> {
         let names: Vec<String> = (0..m).map(|i| format!("{prefix}{i}")).collect();
         for (i, name) in names.iter().enumerate() {
-            sql(
+            fed_view(
                 &mut self.direct,
                 "s",
-                &format!("CREATE VIEW {name} WITH (delta = '{FEED}') AS SELECT {cols} FROM t WHERE v >= {i}"),
+                name,
+                &format!("SELECT {cols} FROM t WHERE v >= {i}"),
             );
         }
-        for name in &names {
-            self.mirror().mirror_view("s", name).expect("mirror");
-        }
-        self.drain("s", &names);
-        names
+        let views: Vec<(String, u64)> = names
+            .into_iter()
+            .map(|name| {
+                let out = self.mirror().mirror_view("s", &name).expect("mirror");
+                assert!(out.result.reseeded(), "{name}: a first registration bootstraps");
+                (name, out.view_id)
+            })
+            .collect();
+        self.drain("s", &views.iter().map(|(n, _)| n).collect::<Vec<_>>());
+        views
     }
 
     /// Mirror both views of the shared schema, and return their ids. Nearly
@@ -166,27 +187,30 @@ impl Fixture {
     }
 
     /// Run one `SELECT` through the mirroring client.
-    fn local(&mut self, sql_text: &str) -> (std::sync::Arc<Schema>, ZSetBatch) {
-        query(self.mirror.as_mut().unwrap(), "s", sql_text)
+    fn local(&mut self, sql_text: &str) -> (Arc<Schema>, ZSetBatch) {
+        query(self.mirror(), "s", sql_text)
     }
 
-    /// Assert a query answers identically locally and against the server, and
-    /// return how many rows that agreement covered. The vacuous pass is refused
-    /// inside `assert_same_zset`; the count is here so a caller comparing several
-    /// queries can hold their sum to a floor of its own.
+    /// [`differential`] for a relation the mirroring client holds a valid copy of.
     fn differential(&mut self, schema: &str, sql_text: &str) -> usize {
-        let local = query(self.mirror.as_mut().unwrap(), schema, sql_text);
-        let remote = query(&mut self.direct, schema, sql_text);
-        assert_same_zset(sql_text, (&local.0, &local.1), (&remote.0, &remote.1))
+        differential(
+            self.mirror.as_mut().unwrap(),
+            &mut self.direct,
+            schema,
+            sql_text,
+            Answer::Local,
+        )
     }
 
-    /// The same, comparing the reply as a **sequence** — for an `ORDER BY` query,
-    /// where the multiset comparison would accept the right rows in the wrong
-    /// order.
-    fn ordered_differential(&mut self, schema: &str, sql_text: &str) -> usize {
-        let local = query(self.mirror.as_mut().unwrap(), schema, sql_text);
-        let remote = query(&mut self.direct, schema, sql_text);
-        assert_same_sequence(sql_text, (&local.0, &local.1), (&remote.0, &remote.1))
+    /// [`differential`] for a relation the mirroring client must delegate.
+    fn delegated(&mut self, schema: &str, sql_text: &str) -> usize {
+        differential(
+            self.mirror.as_mut().unwrap(),
+            &mut self.direct,
+            schema,
+            sql_text,
+            Answer::Upstream,
+        )
     }
 }
 
@@ -208,16 +232,8 @@ fn seed(client: &mut GnitzClient) {
         "s",
         "CREATE TABLE r (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL) WITH (replicated = true)",
     );
-    sql(
-        client,
-        "s",
-        &format!("CREATE VIEW v_keyed WITH (delta = '{FEED}') AS SELECT a, b, v, f, body FROM t WHERE v >= 0"),
-    );
-    sql(
-        client,
-        "s",
-        &format!("CREATE VIEW v_repl WITH (delta = '{FEED}') AS SELECT id, v FROM r WHERE v > 3"),
-    );
+    fed_view(client, "s", "v_keyed", "SELECT a, b, v, f, body FROM t WHERE v >= 0");
+    fed_view(client, "s", "v_repl", "SELECT id, v FROM r WHERE v > 3");
 }
 
 /// Inserts, then an UPDATE and a DELETE over part of the range — so a round
@@ -245,184 +261,234 @@ fn churn(client: &mut GnitzClient, lo: i64, hi: i64) {
     );
 }
 
+/// A stream in the shared schema.
+const STREAM: &str = "CREATE TABLE ev (id BIGINT NOT NULL PRIMARY KEY, kind BIGINT NOT NULL, \
+                      amount BIGINT NOT NULL) WITH (stream = true)";
+
 // ---------------------------------------------------------------------------
 // The differential
 // ---------------------------------------------------------------------------
 
-/// A mirrored read equals the same read against the server, over every sink a
-/// direct SELECT can land on: the whole-relation read, the bounded/projected rows sink,
-/// and the aggregate fold.
+/// Every sink a direct SELECT can land on — the whole-relation read, the
+/// bounded/projected rows sink and the aggregate fold — and ordered windows,
+/// including `LIMIT … OFFSET` over a tie-heavy sort key where a different
+/// tie-break selects different rows.
+const MENU: &[&str] = &[
+    "SELECT * FROM v_keyed",
+    "SELECT a, b, v FROM v_keyed WHERE a = 42",
+    "SELECT a, v FROM v_keyed WHERE a > 100 AND a < 140",
+    "SELECT b, COUNT(*) AS n, SUM(v) AS total, MIN(a) AS lo, MAX(a) AS hi FROM v_keyed GROUP BY b",
+    "SELECT COUNT(*) AS n, SUM(v) AS total FROM v_keyed",
+    "SELECT DISTINCT b FROM v_keyed",
+    "SELECT b, SUM(v) AS total FROM v_keyed GROUP BY b HAVING SUM(v) > 1000",
+    "SELECT * FROM v_repl",
+    "SELECT COUNT(*) AS n, SUM(v) AS total FROM v_repl",
+    "SELECT a, b, v FROM v_keyed ORDER BY a DESC, b ASC",
+    "SELECT a, b, body FROM v_keyed WHERE v > 100 ORDER BY a ASC, b DESC LIMIT 23",
+    // `b` is `a % 7`, so the sort key ties in blocks of ~40 rows: which rows the
+    // window selects depends on the whole tie-break, not just on `b`.
+    "SELECT a, b FROM v_keyed ORDER BY b ASC, a ASC LIMIT 19 OFFSET 31",
+    "SELECT a, b FROM v_keyed ORDER BY b DESC, a DESC LIMIT 19 OFFSET 31",
+    "SELECT id, v FROM v_repl ORDER BY v DESC, id ASC LIMIT 15 OFFSET 7",
+];
+
+/// A mirrored read equals the same read against the server, over the whole
+/// [`MENU`], after the bootstrap and after each of two polls that each span
+/// several rounds hitting keys the copy already holds: one round's reply is
+/// sorted and distinct, a multi-round reply is neither.
 ///
 /// The comparison runs after the ordinary client-side finishing on both sides,
 /// which is the point: the local reply is a single-worker reply, and the
 /// finishers take it unchanged.
 #[test]
 fn a_mirrored_read_equals_the_server_read() {
-    let _g = serial();
     let mut fx = Fixture::start();
-
     churn(&mut fx.direct, 1, 200);
     fx.mirror_both();
     fx.quiesce();
 
-    let mut compared = 0;
-    for q in [
-        "SELECT * FROM v_keyed",
-        "SELECT a, b, v FROM v_keyed WHERE a = 42",
-        "SELECT a, v FROM v_keyed WHERE a > 100 AND a < 140",
-        "SELECT b, COUNT(*) AS n, SUM(v) AS total, MIN(a) AS lo, MAX(a) AS hi FROM v_keyed GROUP BY b",
-        "SELECT COUNT(*) AS n, SUM(v) AS total FROM v_keyed",
-        "SELECT DISTINCT b FROM v_keyed",
-        "SELECT b, SUM(v) AS total FROM v_keyed GROUP BY b HAVING SUM(v) > 1000",
-        "SELECT * FROM v_repl",
-        "SELECT COUNT(*) AS n, SUM(v) AS total FROM v_repl",
-    ] {
-        compared += fx.differential("s", q);
-    }
-    assert!(compared > 300, "the differential compared only {compared} rows");
-}
-
-/// The poll arm over a compound-PK view, polled only after several rounds that
-/// hit the same keys: one round's reply is sorted and distinct, a multi-round
-/// reply is neither.
-#[test]
-fn a_multi_round_poll_over_repeated_keys_stays_weight_exact() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-
-    churn(&mut fx.direct, 1, 60);
-    fx.mirror_both();
-    fx.quiesce();
-    fx.differential("s", "SELECT * FROM v_keyed");
-
     for round in 0..3 {
-        // Three ticks per poll, all hitting keys the copy already holds.
-        for step in 0..3 {
-            let lo = 1 + round * 20;
-            sql(
-                &mut fx.direct,
-                "s",
-                &format!("UPDATE t SET v = v + {} WHERE a >= {lo} AND a < {}", step + 1, lo + 25),
-            );
+        if round > 0 {
+            for step in 1..=3 {
+                let lo = round * 40;
+                sql(
+                    &mut fx.direct,
+                    "s",
+                    &format!("UPDATE t SET v = v + {step} WHERE a >= {lo} AND a < {}", lo + 25),
+                );
+            }
+            let lo = 161 + round * 40;
+            churn(&mut fx.direct, lo, lo + 39);
+            fx.quiesce();
         }
-        churn(&mut fx.direct, 61 + round * 40, 100 + round * 40);
-        fx.quiesce();
-        fx.differential("s", "SELECT * FROM v_keyed");
-        fx.differential("s", "SELECT * FROM v_repl");
+        let compared: usize = MENU.iter().map(|q| fx.differential("s", q)).sum();
+        assert!(
+            compared > 300,
+            "round {round}: the differential compared only {compared} rows"
+        );
+        assert_floats_close(&mut fx, "SELECT b, SUM(f) AS tf, AVG(f) AS af FROM v_keyed GROUP BY b");
     }
 }
 
-/// Many views of one table, advanced by one batched poll, stay weight-exact.
-///
-/// They differ only in a `WHERE`, so a misdirected position lands rows that are
-/// individually plausible: only the weights say otherwise.
-#[test]
-fn one_poll_over_many_views_of_one_table_stays_weight_exact() {
-    const M: usize = 6;
-    let _g = serial();
-    let mut fx = Fixture::start();
-
-    churn(&mut fx.direct, 1, 120);
-    let names = fx.many_views("m", M, "a, b, v");
-
-    // A second round, so the poll carries a delta with retractions in it.
-    churn(&mut fx.direct, 121, 240);
-    let report = fx.drain("s", &names);
-    assert_eq!(report.len(), M, "one entry per view: {report:?}");
-    assert!(
-        report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
-        "every view advances: {report:?}",
-    );
-
-    let mut compared = 0;
-    for name in &names {
-        compared += fx.differential("s", &format!("SELECT * FROM {name}"));
-    }
-    assert!(compared > M, "the comparison covered {compared} rows");
-}
-
-/// Integer aggregates match exactly; a float aggregate is compared within
-/// tolerance.
+/// Assert a float aggregate reads the same groups at the same weights locally and
+/// on the server, with each value within reassociation tolerance.
 ///
 /// Float SUM/AVG is order-dependent — addition is non-associative — and the
 /// mirror is one partition where the server is W. This is the same divergence
 /// the server already has between two worker counts, not a mirror defect.
-#[test]
-fn integer_aggregates_are_exact_and_floats_are_close() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-
-    churn(&mut fx.direct, 1, 300);
-    fx.mirror_both();
-    fx.quiesce();
-
-    fx.differential("s", "SELECT b, COUNT(*) AS n, SUM(v) AS total FROM v_keyed GROUP BY b");
-
-    let q = "SELECT b, SUM(f) AS tf, AVG(f) AS af FROM v_keyed GROUP BY b";
-    let local = fx.local(q);
-    let remote = query(&mut fx.direct, "s", q);
-    let (la, ra) = (canonical(&local.1), canonical(&remote.1));
-    assert_eq!(la.len(), ra.len(), "float aggregate must produce the same groups");
-    for ((lk, lw), (rk, rw)) in la.iter().zip(ra.iter()) {
-        assert_eq!(lk.0, rk.0, "float aggregate groups must line up by key");
-        assert_eq!(lw, rw, "an aggregate row's weight is exact whatever its value");
-        for (lc, rc) in lk.1.iter().zip(rk.1.iter()) {
-            let (Some(lb), Some(rb)) = (lc, rc) else { continue };
+fn assert_floats_close(fx: &mut Fixture, q: &str) {
+    let local = canonical(&fx.local(q).1);
+    let remote = canonical(&query(&mut fx.direct, "s", q).1);
+    assert_eq!(local.len(), remote.len(), "{q}: the same groups");
+    for ((lk, lw), (rk, rw)) in local.iter().zip(&remote) {
+        assert_eq!((&lk.0, lw), (&rk.0, rw), "{q}: groups line up by key, at exact weights");
+        for (lc, rc) in lk.1.iter().zip(&rk.1) {
+            let (Some(lb), Some(rb)) = (lc, rc) else {
+                assert_eq!(lc, rc, "{q}: a null on one side only");
+                continue;
+            };
             let (lv, rv) = (f64_of(lb), f64_of(rb));
             assert!(
                 (lv - rv).abs() <= 1e-6 * rv.abs().max(1.0),
-                "float aggregate diverged beyond reassociation: {lv} vs {rv}",
+                "{q}: diverged beyond reassociation: {lv} vs {rv}",
             );
         }
     }
 }
 
 fn f64_of(b: &[u8]) -> f64 {
-    f64::from_le_bytes(b.try_into().expect("a DOUBLE cell is eight bytes"))
+    f64::from_le_bytes(b.try_into().expect("an eight-byte cell"))
+}
+
+/// Many views of one table: registration is idempotent, a poll with nothing
+/// pushed moves nothing, and one batched poll advances every view weight-exact.
+///
+/// They differ only in a `WHERE`, so a misdirected position lands rows that are
+/// individually plausible: only the weights say otherwise.
+#[test]
+fn many_views_of_one_table_advance_in_one_poll() {
+    const M: usize = 6;
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 120);
+    let views = fx.many_views("m", M, "a, b, v");
+    let cursors = |fx: &mut Fixture| {
+        views
+            .iter()
+            .map(|(_, id)| fx.mirror().cursor_of(*id))
+            .collect::<Vec<_>>()
+    };
+    let settled = cursors(&mut fx);
+
+    for (name, id) in &views {
+        let out = fx.mirror().mirror_view("s", name).expect("re-register");
+        assert_eq!(out.view_id, *id, "{name}: the same relation keeps its id");
+        assert!(!out.result.reseeded(), "{name}: a re-registration resumes");
+    }
+    let report = fx.mirror().poll_mirror().expect("an empty poll");
+    assert_eq!(report.len(), M, "one entry per view: {report:?}");
+    assert!(
+        !report.iter().any(|o| o.result.reseeded()),
+        "an empty poll reseeds nothing"
+    );
+    assert_eq!(
+        cursors(&mut fx),
+        settled,
+        "neither a re-registration nor an empty poll moves a cursor",
+    );
+
+    // A round with retractions in it.
+    churn(&mut fx.direct, 121, 240);
+    let names: Vec<&str> = views.iter().map(|(n, _)| n.as_str()).collect();
+    let report = fx.drain("s", &names);
+    assert_eq!(report.len(), M, "one entry per view: {report:?}");
+    assert!(
+        report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
+        "every view advances: {report:?}",
+    );
+    let compared: usize = names
+        .iter()
+        .map(|name| fx.differential("s", &format!("SELECT * FROM {name}")))
+        .sum();
+    assert!(compared > M * 100, "the comparison covered {compared} rows");
+}
+
+/// A mirrored `GROUP BY` honours the store's group cap: the mirror reads every
+/// `StoreConfig` knob, not just the RAM tier, and a copy ignoring this one would
+/// fail a wide `GROUP BY` with no knob to turn. The server's own cap is far
+/// above the seven groups folded here, so the refusal can only be the copy's.
+///
+/// In a child, because the cap is read from the environment at open.
+#[test]
+fn a_mirrored_group_by_honours_the_group_cap() {
+    let (server, dir) = child_fixture();
+    run_child(
+        "group_cap_child",
+        &server,
+        &dir,
+        &[("GNITZ_MIRROR_ADHOC_GROUP_CAP", "3")],
+        "the copy's fold must refuse past its own cap",
+    );
+}
+
+/// Runs only in the child the test above spawns.
+#[test]
+fn group_cap_child() {
+    let Some((sock, dir)) = child_target() else { return };
+    let mut mirror = mirroring_client(&sock, &dir);
+    mirror.mirror_view("s", "v_keyed").expect("mirror v_keyed");
+    // `b` is `a % 7`, so this folds seven groups.
+    let err = gnitz_sql::execute(&mut mirror, "s", "SELECT b, COUNT(*) AS n FROM v_keyed GROUP BY b")
+        .expect_err("seven groups must not fit a cap of three");
+    assert!(err.to_string().contains("exceeds 3 distinct groups"), "{err}");
+    println!("{CHILD_OK}");
 }
 
 // ---------------------------------------------------------------------------
 // The round trip
 // ---------------------------------------------------------------------------
 
-/// A registered view is described out of the local registration; an unregistered
-/// name delegates. The planner asks for exactly one descriptor per relation, so
-/// this call is what keeps a mirrored SELECT round-trip-free.
+/// What each mirror call costs in requests — counts, not clocks.
+///
+/// Mirroring a view is one RESOLVE and one bootstrap read, first sighting of its
+/// schema or not: the store mints no ids, so no registration reaches upstream
+/// for one. A mirrored SELECT issues none, and neither does its `EXPLAIN` —
+/// routed to the connection it would fail with the server down, and describe a
+/// plan against a relation the statement will not read. A delegated read
+/// resolves its relation once.
 #[test]
-fn a_registered_view_is_described_locally() {
-    let _g = serial();
+fn each_mirror_call_costs_what_it_must() {
     let mut fx = Fixture::start();
-    churn(&mut fx.direct, 1, 10);
-    let (keyed, _) = fx.mirror_both();
-    fx.quiesce();
+    churn(&mut fx.direct, 1, 40);
+    fx.tick("s", &["v_keyed", "v_repl"]);
+    let m = fx.mirror();
 
-    let m = fx.mirror.as_mut().unwrap();
-    let before = m.requests_sent();
-    let desc = m
-        .resolve_local_first("s", "v_keyed")
-        .expect("a registered view describes")
-        .expect("and is present");
-    assert_eq!(
-        m.requests_sent(),
-        before,
-        "describing a registered view must issue no request"
-    );
-    assert_eq!(desc.tid, keyed, "the copy is held under the server's id");
-    assert_eq!(
-        desc.class,
-        gnitz_wire::RelClass::FedView,
-        "only a fed view can be mirrored"
-    );
-    assert!(desc.indexes.is_empty(), "only a base table may own an index");
+    for view in ["v_keyed", "v_repl"] {
+        let (_, sent) = cost(m, |m| m.mirror_view("s", view).expect("mirror"));
+        assert_eq!(sent, 2, "{view}: one RESOLVE and one bootstrap read");
+    }
+    let (_, sent) = cost(m, |m| query(m, "s", "SELECT a, b, v FROM v_keyed WHERE a = 7"));
+    assert_eq!(sent, 0, "a mirrored SELECT issues no request at all");
 
-    // An unregistered relation goes upstream: one RESOLVE, answered by the server.
-    let before = m.requests_sent();
-    let delegated = m
-        .resolve_local_first("s", "t")
-        .expect("a delegated describe")
-        .expect("and the table is present");
-    assert_eq!(m.requests_sent() - before, 1, "a delegated describe costs one RESOLVE");
-    assert!(!delegated.class.is_view());
+    let ((_, plan), sent) = cost(m, |m| query(m, "s", "EXPLAIN SELECT a, b, v FROM v_keyed WHERE a = 7"));
+    assert_eq!(sent, 0, "nor does its EXPLAIN");
+    let lines: Vec<String> = canonical_rows(&plan)
+        .into_iter()
+        .filter_map(|((_, cells), _)| Some(String::from_utf8_lossy(cells.first()?.as_ref()?).into_owned()))
+        .collect();
+    assert!(
+        lines.iter().any(|l| l == "read view v_keyed (local copy)"),
+        "the plan names the local copy: {lines:?}",
+    );
+
+    let (_, sent) = cost(m, |m| query(m, "s", "SELECT a, b, v FROM t WHERE a = 7"));
+    assert_eq!(sent, 2, "a delegated read costs one RESOLVE and one read");
+}
+
+/// `f`'s result, and how many requests it sent through `client`.
+fn cost<T>(client: &mut GnitzClient, f: impl FnOnce(&mut GnitzClient) -> T) -> (T, u64) {
+    let before = client.requests_sent();
+    let out = f(client);
+    (out, client.requests_sent() - before)
 }
 
 /// A `CREATE VIEW` over a mirrored view binds the server's id, not the local
@@ -431,7 +497,6 @@ fn a_registered_view_is_described_locally() {
 /// upstream under a fresh id here; the new view must read that one.
 #[test]
 fn a_view_created_over_a_mirrored_view_binds_the_servers_id() {
-    let _g = serial();
     let mut fx = Fixture::start();
     churn(&mut fx.direct, 1, 10);
     fx.mirror_both();
@@ -443,19 +508,18 @@ fn a_view_created_over_a_mirrored_view_binds_the_servers_id() {
     // Recreate the mirrored view upstream: same name, fresh id. Nothing tells the
     // mirror, so its registration still binds the retired one.
     sql(&mut fx.direct, "s", "DROP VIEW v_keyed");
-    sql(
+    fed_view(
         &mut fx.direct,
         "s",
-        &format!("CREATE VIEW v_keyed WITH (delta = '{FEED}') AS SELECT a, b, v, f, body FROM t WHERE v >= 0"),
+        "v_keyed",
+        "SELECT a, b, v, f, body FROM t WHERE v >= 0",
     );
 
-    {
-        let m = fx.mirror.as_mut().unwrap();
-        let before = m.requests_sent();
+    let (_, sent) = cost(fx.mirror(), |m| {
         gnitz_sql::execute(m, "s", "CREATE VIEW over_mirror AS SELECT a, b FROM v_keyed")
-            .expect("a view over the recreated relation");
-        assert!(m.requests_sent() > before, "a DDL statement must resolve upstream");
-    }
+            .expect("a view over the recreated relation")
+    });
+    assert!(sent > 0, "a DDL statement must resolve upstream");
 
     // Bound to the retired id the new view would backfill from a relation that no
     // longer exists and come back empty.
@@ -463,223 +527,48 @@ fn a_view_created_over_a_mirrored_view_binds_the_servers_id() {
     assert_eq!(got, live, "the new view reads the live v_keyed, not the retired one");
 }
 
-/// A mirrored SELECT issues no request; a delegated one issues exactly one.
-///
-/// The first covers the local `describe_relation`: a delegated resolve would show
-/// up as one request per statement and nothing else in this suite would notice.
-/// The second pins that a statement resolves each relation once.
-///
-/// Both are counts, not clocks.
-#[test]
-fn a_mirrored_select_issues_no_request() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-
-    churn(&mut fx.direct, 1, 40);
-    fx.mirror_both();
-    fx.quiesce();
-
-    let m = fx.mirror.as_mut().unwrap();
-    let before = m.requests_sent();
-    let _ = query(m, "s", "SELECT a, b, v FROM v_keyed WHERE a = 7");
-    let after = m.requests_sent();
-    assert_eq!(after, before, "a mirrored SELECT must issue no request at all");
-
-    // The `EXPLAIN` of one is served by the copy as well. Routed to the
-    // connection it would cost a round trip, fail with the server down, and
-    // describe a plan against a relation the statement will not read.
-    let before = m.requests_sent();
-    let (_, plan) = query(m, "s", "EXPLAIN SELECT a, b, v FROM v_keyed WHERE a = 7");
-    assert!(!plan.weights.is_empty(), "EXPLAIN must describe a plan");
-    // ... and it describes the read the copy serves, not a server read.
-    let lines: Vec<&[u8]> = (0..plan.len())
-        .map(|r| gnitz_wire::german_string_content(&plan.payload[0].bytes[r * 16..(r + 1) * 16], &plan.blob))
-        .collect();
-    assert!(
-        lines.contains(&&b"read view v_keyed (local copy)"[..]),
-        "the plan must name the local copy: {lines:?}",
-    );
-    assert_eq!(
-        m.requests_sent(),
-        before,
-        "EXPLAIN of a mirrored SELECT must issue no request either",
-    );
-
-    // An unmirrored relation read through the same call: one RESOLVE plus the
-    // read itself is two frames, so assert the delta rather than a bare zero —
-    // what this pins is that the resolve is *one*.
-    let before = m.requests_sent();
-    let _ = query(m, "s", "SELECT a, b, v FROM t WHERE a = 7");
-    let delegated = m.requests_sent() - before;
-    assert_eq!(delegated, 2, "a delegated read costs one RESOLVE and one read",);
-}
-
 // ---------------------------------------------------------------------------
 // Refusals
 // ---------------------------------------------------------------------------
 
-/// A second store on a *held directory* is refused, in this process and across
-/// processes alike — the data-directory `flock` is the only thing that refuses
-/// one, and it does not care which process the second opener is in. The refusal
-/// lands on the open, before any client attaches.
+/// Only a view with a delta feed can be mirrored, only by a client with a store
+/// attached, and a store is attached once. Every refusal says why.
 #[test]
-fn a_second_handle_on_one_directory_is_refused() {
-    let _g = serial();
+fn every_refusal_says_why() {
     let mut fx = Fixture::start();
-
-    // In-process. A second open takes a fresh open file description, which
-    // `flock` treats as a conflict — unlike a forked worker's inherited one.
-    assert!(
-        Mirror::open(&fx.base_dir()).is_err(),
-        "a second store on a directory this process holds must be refused",
-    );
-
-    // Cross-process, with the first client dropped so only the flock can refuse.
-    let dir = fx.base_dir();
-    fx.mirror = None;
-    let held = Mirror::open(&dir).expect("the directory is free again");
-    let out = run_test_in_child(
-        module_path!(),
-        "second_process_open_child",
-        &[("GNITZ_MIRROR_DIR", &dir)],
-    );
-    assert_child_ok(&out, "the second-process child must run to the end");
-    let printed = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        printed.contains("is already held"),
-        "a second process on a held directory must be refused: {printed}",
-    );
-    drop(held);
-}
-
-/// Two mirroring clients on two directories, in one process, each resuming its
-/// own copy.
-///
-#[test]
-fn two_handles_on_two_directories_keep_their_own_state() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-    let second_dir = tempfile::tempdir().unwrap();
-    let mut second = mirroring_client(fx.server.sock_path(), second_dir.path().to_str().unwrap());
-
-    churn(&mut fx.direct, 1, 80);
-    fx.mirror().mirror_view("s", "v_keyed").expect("mirror v_keyed");
-    second.mirror_view("s", "v_repl").expect("mirror v_repl");
-    fx.quiesce();
-    second.poll_mirror().expect("poll the second handle");
-
-    churn(&mut fx.direct, 81, 100);
-    fx.quiesce();
-
-    // Both checkpoint on the way out, then both come back.
-    second.close_mirror().expect("close the second handle");
-    fx.reopen();
-    let mut second = mirroring_client(fx.server.sock_path(), second_dir.path().to_str().unwrap());
-
-    let keyed = fx.mirror().mirror_view("s", "v_keyed").expect("re-mirror v_keyed");
-    let repl = second.mirror_view("s", "v_repl").expect("re-mirror v_repl");
-    for (view, outcome) in [("v_keyed", keyed), ("v_repl", repl)] {
-        assert!(
-            !outcome.result.reseeded(),
-            "{view} was checkpointed and must resume, not bootstrap",
-        );
-    }
-
-    fx.differential("s", "SELECT * FROM v_keyed");
-    let sql_text = "SELECT * FROM v_repl";
-    let local = query(&mut second, "s", sql_text);
-    let remote = query(&mut fx.direct, "s", sql_text);
-    assert_same_zset(sql_text, (&local.0, &local.1), (&remote.0, &remote.1));
-}
-
-/// A view forgotten after its last checkpoint, then abandoned without another,
-/// bootstraps when mirrored again.
-#[test]
-fn a_view_forgotten_after_its_checkpoint_bootstraps() {
-    let _g = serial();
-    let (server, dir) = child_fixture();
-
-    run_child(
-        "forget_after_checkpoint_child",
-        &server,
-        &dir,
-        &[],
-        "the child must checkpoint, forget the view, and exit without checkpointing again",
-    );
-
-    let mut mirror = mirroring_client(server.sock_path(), dir.path().to_str().unwrap());
-    let outcome = mirror.mirror_view("s", "v_keyed").expect("re-mirror v_keyed");
-    assert!(
-        outcome.result.reseeded(),
-        "a cursor over a copy that never came back must bootstrap, not advance",
-    );
-    let mut direct = GnitzClient::connect(server.sock_path()).unwrap();
-    let sql_text = "SELECT * FROM v_keyed";
-    let local = query(&mut mirror, "s", sql_text);
-    let remote = query(&mut direct, "s", sql_text);
-    assert_same_zset(sql_text, (&local.0, &local.1), (&remote.0, &remote.1));
-}
-
-/// Runs only in the child `a_view_forgotten_after_its_checkpoint_bootstraps` spawns.
-///
-/// Checkpoints, forgets, and exits without checkpointing again.
-#[test]
-fn forget_after_checkpoint_child() {
-    let Some((sock, dir)) = child_target() else { return };
-    let mut mirror = mirroring_client(&sock, &dir);
-    let tid = mirror.mirror_view("s", "v_keyed").expect("mirror v_keyed").view_id;
-    mirror.checkpoint_mirror().expect("checkpoint the copy and its cursor");
-    mirror.forget_view(tid).expect("forget v_keyed");
-    println!("{CHILD_OK}");
-}
-
-/// Forgetting a view and mirroring it again — same server id, same layout —
-/// leaves a working copy.
-///
-/// The retraction removes the record and the directory; the re-registration
-/// enters a fresh one under the same id. Nothing weaker catches a mistake
-/// there: a view recreated upstream takes a *new* id.
-#[test]
-fn a_forgotten_view_can_be_mirrored_again() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-
-    churn(&mut fx.direct, 1, 60);
-    let tid = fx.mirror().mirror_view("s", "v_keyed").expect("mirror v_keyed").view_id;
-    fx.quiesce();
-    let before = fx.differential("s", "SELECT * FROM v_keyed");
-
-    fx.mirror().forget_view(tid).expect("forget");
-    assert!(
-        !fx.mirror().mirrors(tid),
-        "a forgotten view is no longer answered locally"
-    );
-
-    assert_eq!(
-        fx.mirror().mirror_view("s", "v_keyed").expect("re-mirror").view_id,
-        tid,
-        "the same relation comes back under the same server id",
-    );
-    fx.quiesce();
-    assert_eq!(
-        fx.differential("s", "SELECT * FROM v_keyed"),
-        before,
-        "the rebuilt copy must hold what it held before",
-    );
-}
-
-/// A relation with no feed cannot be mirrored, and neither can a base table.
-#[test]
-fn only_a_fed_view_can_be_mirrored() {
-    let _g = serial();
-    let mut fx = Fixture::start();
+    sql(&mut fx.direct, "s", STREAM);
     sql(&mut fx.direct, "s", "CREATE VIEW plain AS SELECT a, b, v FROM t");
+    sql(
+        &mut fx.direct,
+        "s",
+        "CREATE VIEW bounded WITH (capacity = '4 MB') AS SELECT a, b, v FROM t WHERE v > 0",
+    );
+    for (name, why) in [
+        ("t", "is a table; only a view can be mirrored"),
+        ("ev", "is a stream; only a view can be mirrored"),
+        ("plain", "keeps no delta feed"),
+        ("bounded", "is capacity-bounded"),
+    ] {
+        let e = fx.mirror().mirror_view("s", name).unwrap_err().to_string();
+        assert!(e.contains(why), "{name}: {e}");
+    }
+    assert!(fx.mirror().mirrored_ids().is_empty(), "a refusal registers nothing");
 
-    let m = fx.mirror.as_mut().unwrap();
-    let e = m.mirror_view("s", "t").unwrap_err().to_string();
-    assert!(e.contains("only a view can be mirrored"), "{e}");
-    let e = m.mirror_view("s", "plain").unwrap_err().to_string();
-    assert!(e.contains("keeps no delta feed"), "{e}");
+    let mut plain = GnitzClient::connect(fx.server.sock_path()).unwrap();
+    let e = plain.mirror_view("s", "v_keyed").unwrap_err();
+    assert!(
+        matches!(&e, ClientError::Refused(f) if f.text.contains("mirrors nothing")),
+        "a client with no store says so: {e}"
+    );
+
+    let held = fx.base_dir();
+    let second_dir = tempfile::tempdir().unwrap();
+    let second_path = second_dir.path().to_str().unwrap();
+    let store = Mirror::open(second_path).expect("a second directory opens");
+    let e = fx.mirror().attach_mirror(store).unwrap_err().to_string();
+    assert!(e.contains(&held), "the refusal must name the path already held: {e}");
+    // The refused store was dropped with the call, which released its lock.
+    Mirror::open(second_path).expect("a refused attach must release the store it was passed");
 }
 
 /// A storage fault reaches the host as an error and degrades one copy; the
@@ -687,26 +576,22 @@ fn only_a_fed_view_can_be_mirrored() {
 ///
 /// This is the acceptance test for making the engine safe to link, and it drives
 /// the `Err` channel — the one that holds in both build profiles. The seam
-/// substitutes an `Err` at exactly the ingest site the engine used to `_exit`
-/// from, and it exists precisely so the fail-stop path can be driven without a
-/// real disk fault: no tmpfs and no privileges.
+/// substitutes an `Err` at the engine's own ingest site, so the path runs
+/// without a real disk fault.
 ///
-/// It runs in a child process because a fault seam is read once per process into
-/// a latch, so setting the variable in this one would race every sibling test.
+/// In a child process, because a fault seam is read once per process.
 #[test]
 fn a_storage_fault_does_not_kill_the_host() {
-    let _g = serial();
     if !cfg!(debug_assertions) {
         return; // the seam folds away in a release build
     }
     let (server, dir) = child_fixture();
-
     run_child(
-        "a_storage_fault_degrades_one_copy_child",
+        "storage_fault_child",
         &server,
         &dir,
         &[("GNITZ_INJECT_INGEST_APPLY_ERROR", "store")],
-        "the host must survive a storage fault and see an error; exit 134 is the abort this replaced",
+        "the host must survive a storage fault and see an error",
     );
 }
 
@@ -714,7 +599,7 @@ fn a_storage_fault_does_not_kill_the_host() {
 /// store ingest in this process, so no sibling copy survives here;
 /// `tests/store.rs` covers that.
 #[test]
-fn a_storage_fault_degrades_one_copy_child() {
+fn storage_fault_child() {
     let Some((sock, dir)) = child_target() else { return };
     let mut direct = GnitzClient::connect(&sock).unwrap();
     let mut mirror = mirroring_client(&sock, &dir);
@@ -727,19 +612,13 @@ fn a_storage_fault_degrades_one_copy_child() {
     );
     assert!(mirror.mirror_poisoned().is_none(), "the handle stays usable");
 
-    // The copy was erased, so the read is delegated rather than answered off a
-    // copy with a hole in it.
+    // The registration outlives the failed bootstrap; the copy behind it does
+    // not, so the read is delegated rather than answered off an erased copy.
     let [tid] = mirror.mirrored_ids()[..] else {
         panic!("the failed ingest must leave exactly its own registration behind")
     };
     assert!(!mirror.mirrors(tid), "an erased copy is not answered locally");
-    let local = query(&mut mirror, "s", "SELECT * FROM v_keyed");
-    let remote = query(&mut direct, "s", "SELECT * FROM v_keyed");
-    assert_same_zset(
-        "the read must be delegated, not answered off the erased copy",
-        (&local.0, &local.1),
-        (&remote.0, &remote.1),
-    );
+    differential(&mut mirror, &mut direct, "s", "SELECT * FROM v_keyed", Answer::Upstream);
 
     // The store is intact, so it still publishes.
     mirror
@@ -748,136 +627,15 @@ fn a_storage_fault_degrades_one_copy_child() {
     // A poll succeeds at the call level, with that view's failure inside.
     let report = mirror.poll_mirror().expect("a per-view fault is not the call's");
     assert!(
-        report.iter().all(|o| !o.result.reseeded()),
+        matches!(&report[..], [o] if o.view_id == tid && matches!(o.result, PollResult::Failed(_))),
         "the armed seam refuses every re-bootstrap too: {report:?}",
     );
-    drop(mirror);
     println!("{CHILD_OK}");
 }
 
-/// A registration whose bootstrap could not finish answers no read locally.
-///
-/// A read gated on the registration alone answers the erased copy with zero
-/// rows, no request and no error — and keeps doing it, since the refusal behind
-/// it is repeatable. Seam-driven: the server's only refusal here is an oversized
-/// reply.
-#[test]
-fn a_failed_bootstrap_answers_no_read_locally() {
-    let _g = serial();
-    if !cfg!(debug_assertions) {
-        return; // the seam folds away in a release build
-    }
-    let (server, dir) = child_fixture();
-
-    run_child(
-        "failed_bootstrap_child",
-        &server,
-        &dir,
-        &[("GNITZ_INJECT_MIRROR_BOOTSTRAP_ERROR", "1")],
-        "a read over a copy that never arrived must delegate rather than answer empty",
-    );
-}
-
-/// Runs only in the child the test above spawns.
-#[test]
-fn failed_bootstrap_child() {
-    let Some((sock, dir)) = child_target() else { return };
-    let mut direct = GnitzClient::connect(&sock).unwrap();
-    let mut mirror = mirroring_client(&sock, &dir);
-
-    let err = mirror
-        .mirror_view("s", "v_keyed")
-        .expect_err("the armed seam must fail the bootstrap read");
-    assert!(
-        !matches!(err, ClientError::Mirror(MirrorError::Poisoned(_))),
-        "a failed bootstrap is not a poisoning: {err}",
-    );
-    assert!(mirror.mirror_poisoned().is_none(), "the client stays usable");
-
-    // The registration outlives the failed bootstrap, which is what makes the
-    // window reachable at all; the copy behind it does not.
-    let [tid] = mirror.mirrored_ids()[..] else {
-        panic!("the failed bootstrap must leave exactly its own registration behind")
-    };
-    assert!(
-        !mirror.mirrors(tid),
-        "a registration with no valid copy is not answered locally"
-    );
-
-    let local = query(&mut mirror, "s", "SELECT * FROM v_keyed");
-    let remote = query(&mut direct, "s", "SELECT * FROM v_keyed");
-    assert_same_zset(
-        "the read must be delegated, not answered off the erased copy",
-        (&local.0, &local.1),
-        (&remote.0, &remote.1),
-    );
-
-    // The seam is one-shot, so the next poll is a real bootstrap: the handle
-    // recovers rather than delegating forever.
-    mirror.poll_mirror().expect("the next poll bootstraps for real");
-    assert!(
-        mirror.mirrors(tid),
-        "a completed bootstrap makes the copy answerable again"
-    );
-    let local = query(&mut mirror, "s", "SELECT * FROM v_keyed");
-    assert_same_zset(
-        "the recovered copy answers what the server does",
-        (&local.0, &local.1),
-        (&remote.0, &remote.1),
-    );
-    println!("{CHILD_OK}");
-}
-
-/// The whole durability path runs with `io_uring` unavailable: open, checkpoint,
-/// and a reopen that resumes.
-#[test]
-fn the_blocking_fsync_fallback_carries_durability() {
-    let _g = serial();
-    let (server, dir) = child_fixture();
-
-    run_child(
-        "blocking_fsync_fallback_child",
-        &server,
-        &dir,
-        &[("GNITZ_DISABLE_IO_URING", "1")],
-        "the blocking fallback must carry the full path",
-    );
-}
-
-/// Runs only in the child the test above spawns.
-#[test]
-fn blocking_fsync_fallback_child() {
-    let Some((sock, dir)) = child_target() else { return };
-    let open = |dir: &str| mirroring_client(&sock, dir);
-    let mut mirror = open(&dir);
-    let tid = mirror.mirror_view("s", "v_keyed").expect("mirror").view_id;
-    mirror.poll_mirror().expect("poll");
-    mirror
-        .checkpoint_mirror()
-        .expect("checkpoint under the blocking fallback");
-    let before = query(&mut mirror, "s", "SELECT * FROM v_keyed");
-    let cursor = mirror.cursor_of(tid).expect("a cursor");
-    drop(mirror);
-
-    let mut mirror = open(&dir);
-    assert_eq!(
-        mirror.mirror_view("s", "v_keyed").expect("re-mirror").view_id,
-        tid,
-        "the reopen must land on the same id",
-    );
-    assert_eq!(
-        mirror.cursor_of(tid).map(|c| c.tick >= cursor.tick),
-        Some(true),
-        "the reopen must continue the persisted cursor rather than restart it",
-    );
-    let after = query(&mut mirror, "s", "SELECT * FROM v_keyed");
-    assert_eq!(
-        canonical(&before.1),
-        canonical(&after.1),
-        "the resumed copy must hold what the checkpoint made durable",
-    );
-    println!("{CHILD_OK}");
-}
+// ---------------------------------------------------------------------------
+// Benchmarks
+// ---------------------------------------------------------------------------
 
 /// The round trip, measured as instructions retired: a narrowly-bounded read
 /// against the mirror versus the same read against the server.
@@ -891,7 +649,7 @@ fn blocking_fsync_fallback_child() {
 /// mirror removes from a caller is the caller's own syscall, socket and wakeup
 /// work. The W workers' work behind a served read is outside it by construction,
 /// and the falsifiable form of "no round trip at all" is the request count that
-/// `a_mirrored_select_issues_no_request` pins, not this.
+/// `each_mirror_call_costs_what_it_must` pins, not this.
 ///
 /// **The read must be one the bound narrows.** A full scan measures the wrong
 /// thing: the mirror does on one thread what the server splits W ways, so
@@ -901,7 +659,6 @@ fn blocking_fsync_fallback_child() {
 #[test]
 #[ignore]
 fn round_trip_cost_bench() {
-    let _g = serial();
     let mut fx = Fixture::start();
     let Some(counter) = gnitz_foundation::perf::Counter::instructions() else {
         println!("perf_event_open refused; skipping the instruction count");
@@ -941,7 +698,6 @@ fn idle_poll_client_cost_bench() {
     const M: usize = 16;
     const K: usize = 200;
 
-    let _g = serial();
     let mut fx = Fixture::start();
     let Some(counter) = gnitz_foundation::perf::Counter::instructions() else {
         println!("perf_event_open refused; skipping the instruction count");
@@ -973,1008 +729,17 @@ fn idle_poll_client_cost_bench() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Persistence and recovery
-// ---------------------------------------------------------------------------
-
-/// A restart resumes rather than reseeds: the store comes back from its manifest
-/// and the first poll continues from the persisted cursor.
-///
-/// Observed as the poll's returned rows, not by inspecting handle state — a
-/// bootstrap would erase and re-read, so a copy that came back complete *and*
-/// whose cursor moved forward rather than restarting is the observable
-/// difference.
-#[test]
-fn a_restart_resumes_rather_than_reseeds() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-
-    churn(&mut fx.direct, 1, 120);
-    let (tid, _) = fx.mirror_both();
-    fx.quiesce();
-    fx.mirror().checkpoint_mirror().expect("checkpoint");
-    let before = fx.local("SELECT * FROM v_keyed");
-    let cursor = fx.mirror().cursor_of(tid).expect("a cursor");
-
-    fx.reopen();
-    assert_eq!(
-        fx.mirror().mirror_view("s", "v_keyed").expect("re-mirror").view_id,
-        tid,
-        "the reopen must land on the same id",
-    );
-    assert!(
-        fx.mirror().cursor_of(tid).is_some_and(|c| c.tick >= cursor.tick),
-        "the first poll must continue the persisted cursor, not restart from a bootstrap",
-    );
-    assert!(
-        has_manifest(&fx.base_dir(), tid),
-        "a resumed copy keeps the manifest its checkpoint published; a reseed would have unlinked it",
-    );
-    let after = fx.local("SELECT * FROM v_keyed");
-    assert_eq!(
-        canonical(&before.1),
-        canonical(&after.1),
-        "a resumed copy must hold exactly what it held before the restart",
-    );
-    fx.mirror().mirror_view("s", "v_repl").expect("re-mirror v_repl");
-    fx.differential("s", "SELECT * FROM v_keyed");
-}
-
-/// An apply past the byte threshold checkpoints on its own — the 64 MB default
-/// puts it out of every other test's reach. The observable is the manifest, which
-/// only a checkpoint publishes, and this test calls none.
-#[test]
-fn an_applied_delta_drives_its_own_checkpoint() {
-    let _g = serial();
-    // Declared before the fixture so it is removed after the handle it governs
-    // is dropped.
-    let _threshold = EnvVar::set("GNITZ_MIRROR_CHECKPOINT_BYTES", "1");
-    let mut fx = Fixture::start();
-
-    churn(&mut fx.direct, 1, 40);
-    let (tid, _) = fx.mirror_both();
-    fx.quiesce();
-
-    assert!(
-        has_manifest(&fx.base_dir(), tid),
-        "an apply past the threshold must publish the copy's manifest with no explicit checkpoint",
-    );
-    fx.differential("s", "SELECT * FROM v_keyed");
-}
-
-/// A checkpoint by a handle that re-registered only some of its views keeps every
-/// cursor.
-#[test]
-fn a_partially_registered_reopen_keeps_every_cursor() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-
-    churn(&mut fx.direct, 1, 60);
-    fx.mirror().mirror_view("s", "v_keyed").expect("mirror v_keyed");
-    fx.mirror().mirror_view("s", "v_repl").expect("mirror v_repl");
-    fx.quiesce();
-    fx.mirror().checkpoint_mirror().expect("checkpoint");
-
-    // Reopen holding both copies, claim only one, and checkpoint again.
-    fx.reopen();
-    fx.mirror().mirror_view("s", "v_keyed").expect("re-mirror v_keyed");
-    fx.mirror()
-        .checkpoint_mirror()
-        .expect("checkpoint with v_repl unclaimed");
-
-    fx.reopen();
-    let repl = fx.mirror().mirror_view("s", "v_repl").expect("re-mirror v_repl");
-    assert!(
-        !repl.result.reseeded(),
-        "the unclaimed view's cursor must survive the checkpoint that republished its copy",
-    );
-    fx.mirror().mirror_view("s", "v_keyed").expect("re-mirror v_keyed");
-    fx.quiesce();
-    fx.differential("s", "SELECT * FROM v_repl");
-    fx.differential("s", "SELECT * FROM v_keyed");
-}
-
-/// A server restart erases the copy: the stored cursor tag no longer matches the
-/// one the next reply carries, and the recovery reseeds under the same id.
-#[test]
-fn a_server_restart_reseeds_the_copy() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-
-    churn(&mut fx.direct, 1, 60);
-    let (tid, _) = fx.mirror_both();
-    fx.quiesce();
-
-    fx.server.restart();
-    fx.direct = GnitzClient::connect(fx.server.sock_path()).unwrap();
-    fx.reconnect_mirror();
-    churn(&mut fx.direct, 61, 120);
-    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_keyed");
-    fx.mirror()
-        .poll_mirror()
-        .expect("the poll must recover from a foreign tag by itself");
-    assert!(fx.mirror().mirrors(tid), "the id is unchanged across a server restart");
-    fx.quiesce();
-    fx.differential("s", "SELECT * FROM v_keyed");
-    fx.differential("s", "SELECT * FROM v_repl");
-}
-
-// ---------------------------------------------------------------------------
-// Store shapes
-// ---------------------------------------------------------------------------
-
-/// The schema the shape cases seed for themselves: two base tables where
-/// `u.tid` covers only the lower part of `t.id`, so an outer join has unmatched
-/// rows and an `EXCEPT` is non-empty.
-///
-/// Beside the shared `seed` rather than folded into it: every other test would
-/// otherwise carry two more relations through every churn.
-const SH: &str = "sh";
-
-fn seed_shapes(client: &mut GnitzClient) {
-    client.create_schema(SH).unwrap();
-    sql(
-        client,
-        SH,
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL, body TEXT NOT NULL)",
-    );
-    sql(
-        client,
-        SH,
-        "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, tid BIGINT NOT NULL, w BIGINT NOT NULL)",
-    );
-}
-
-/// Fresh keys in both tables, `u` reaching only halfway up `t`'s range.
-fn churn_shapes(client: &mut GnitzClient, lo: i64, hi: i64) {
-    let t: Vec<String> = (lo..=hi)
-        .map(|i| format!("({i}, {}, 'body-{i:0>20}')", i * 3))
-        .collect();
-    sql(client, SH, &format!("INSERT INTO t VALUES {}", t.join(",")));
-    let mid = lo + (hi - lo) / 2;
-    let u: Vec<String> = (lo..=mid).map(|i| format!("({i}, {i}, {})", i * 7)).collect();
-    sql(client, SH, &format!("INSERT INTO u VALUES {}", u.join(",")));
-}
-
-/// A round that touches only keys the copies already hold — the retract/insert
-/// pair a PK-conflicting update produces, plus a pure retraction. A poll that
-/// covered only fresh keys would never fold a weight onto an existing element.
-fn rechurn_shapes(client: &mut GnitzClient, lo: i64, hi: i64) {
-    sql(
-        client,
-        SH,
-        &format!("UPDATE t SET v = v + 7 WHERE id >= {lo} AND id <= {hi}"),
-    );
-    sql(
-        client,
-        SH,
-        &format!("UPDATE u SET w = w + 11 WHERE id >= {lo} AND id <= {hi}"),
-    );
-    sql(client, SH, &format!("DELETE FROM t WHERE id = {lo}"));
-    sql(client, SH, &format!("DELETE FROM u WHERE id = {}", lo + 1));
-}
-
-/// The seven view bodies of S1, each with the read that reaches past its `SELECT *`.
-const SHAPE_VIEWS: &[(&str, &str, &str)] = &[
-    (
-        "v_join",
-        "SELECT t.id, t.body, u.w FROM t JOIN u ON t.id = u.tid",
-        "SELECT id, w FROM v_join WHERE w > 200",
-    ),
-    (
-        "v_left",
-        "SELECT t.id, t.v, u.w FROM t LEFT JOIN u ON t.id = u.tid",
-        "SELECT id, v, w FROM v_left WHERE w IS NULL",
-    ),
-    (
-        "v_group",
-        "SELECT tid, COUNT(*) AS n, SUM(w) AS total FROM u GROUP BY tid",
-        "SELECT tid, total FROM v_group WHERE total > 200",
-    ),
-    (
-        // `w` is null-filled by the outer join, so this keys by `_group_pk`.
-        "v_group_null",
-        "SELECT w, COUNT(*) AS n FROM v_left GROUP BY w",
-        "SELECT w, n FROM v_group_null WHERE n > 1",
-    ),
-    (
-        "v_except",
-        "SELECT id FROM t EXCEPT SELECT tid FROM u",
-        "SELECT id FROM v_except WHERE id > 30",
-    ),
-    (
-        "v_distinct",
-        "SELECT DISTINCT v FROM t",
-        "SELECT v FROM v_distinct WHERE v > 100",
-    ),
-    (
-        // Over `v_group`, so the copy is fed by a view whose own source is a
-        // maintained view rather than a base table.
-        "v_chain",
-        "SELECT tid, total FROM v_group WHERE total > 100",
-        "SELECT tid FROM v_chain WHERE tid > 20",
-    ),
-];
-
-/// Every store shape a view body produces, mirrored in one handle.
-///
-/// Each puts a hidden synthetic key (`_join_pk`, `_group_pk`, `_set_pk`) or a
-/// nullable payload through local registration, `pk_stride` and the null
-/// bitmap, where a wrong shape is silently wrong rather than an error.
-#[test]
-fn every_view_body_shape_mirrors() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-    seed_shapes(&mut fx.direct);
-    churn_shapes(&mut fx.direct, 1, 80);
-    for (name, body, _) in SHAPE_VIEWS {
-        sql(
-            &mut fx.direct,
-            SH,
-            &format!("CREATE VIEW {name} WITH (delta = '{FEED}') AS {body}"),
-        );
-    }
-
-    let names: Vec<&str> = SHAPE_VIEWS.iter().map(|(n, _, _)| *n).collect();
-    for name in &names {
-        let out = fx.mirror().mirror_view(SH, name).expect(name);
-        assert!(out.result.reseeded(), "{name}: a first registration bootstraps");
-        assert!(fx.mirror().mirrors(out.view_id), "{name}: the copy must answer locally");
-    }
-
-    let mut compared = 0;
-    for round in 0..3 {
-        if round > 0 {
-            rechurn_shapes(&mut fx.direct, 2 + round as i64 * 10, 40 + round as i64 * 10);
-        }
-        fx.drain(SH, &names);
-        for (name, _, extra) in SHAPE_VIEWS {
-            compared += fx.differential(SH, &format!("SELECT * FROM {name}"));
-            compared += fx.differential(SH, extra);
-        }
-    }
-    assert!(compared > 500, "the shape differential compared only {compared} rows");
-}
-
-/// Nullable payloads of every width, and the reads that single them out.
-///
-/// A `BLOB` payload joins them only through the binary `create_table` API:
-/// `sql_type_to_typecode` produces `TypeCode::Blob` for no SQL type, so
-/// `b BLOB` in a `CREATE TABLE` is rejected outright.
-#[test]
-fn nullable_payloads_of_every_width_survive_the_copy() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-    fx.direct.create_schema("nl").unwrap();
-    sql(
-        &mut fx.direct,
-        "nl",
-        "CREATE TABLE n (id BIGINT NOT NULL PRIMARY KEY, i BIGINT, s TEXT, d DOUBLE PRECISION, r REAL)",
-    );
-    // Every column null on one row, none on the next.
-    let rows: Vec<String> = (1..=120)
-        .map(|i| {
-            if i % 3 == 0 {
-                format!("({i}, NULL, NULL, NULL, NULL)")
-            } else {
-                format!("({i}, {}, 'text-{i:0>12}', {i}.25, {i}.5)", i * 3)
-            }
-        })
-        .collect();
-    sql(
-        &mut fx.direct,
-        "nl",
-        &format!("INSERT INTO n VALUES {}", rows.join(",")),
-    );
-
-    // The BLOB table: created and seeded through the binary API, then read and
-    // retracted through SQL like any other.
-    let cols = vec![
-        gnitz_wire::ColumnDef::new("id", gnitz_wire::TypeCode::I64, false),
-        gnitz_wire::ColumnDef::new("b", gnitz_wire::TypeCode::Blob, true),
-    ];
-    fx.direct
-        .create_table(
-            "nl",
-            "blb",
-            &Schema { columns: cols, pk_cols: vec![0] },
-            &[],
-            gnitz_wire::TableProps::default(),
-            &[],
-        )
-        .expect("a BLOB column is admissible through the binary API");
-    let rel = fx.direct.resolve_relation("nl", "blb").unwrap();
-    let (blb_tid, blb_schema) = (rel.tid, rel.schema.clone());
-    let mut batch = gnitz_core::ZSetBatch::new(&blb_schema);
-    {
-        let mut app = gnitz_core::BatchAppender::new(&mut batch, &blb_schema);
-        for i in 1i64..=120 {
-            app.add_row(i as u128, 1);
-            if i % 4 == 0 {
-                app.null();
-            } else {
-                app.bytes_val(&vec![(i % 251) as u8; 1 + (i as usize % 17)]);
-            }
-        }
-    }
-    fx.direct
-        .push(blb_tid, &blb_schema, &batch, gnitz_wire::WireConflictMode::Update)
-        .expect("push blobs");
-
-    sql(
-        &mut fx.direct,
-        "nl",
-        &format!("CREATE VIEW v_null WITH (delta = '{FEED}') AS SELECT id, i, s, d, r FROM n"),
-    );
-    sql(
-        &mut fx.direct,
-        "nl",
-        &format!("CREATE VIEW v_blob WITH (delta = '{FEED}') AS SELECT id, b FROM blb"),
-    );
-    fx.mirror().mirror_view("nl", "v_null").expect("mirror v_null");
-    fx.mirror().mirror_view("nl", "v_blob").expect("mirror v_blob");
-
-    let views = ["v_null", "v_blob"];
-    let reads = [
-        "SELECT * FROM v_null",
-        "SELECT id, i FROM v_null WHERE i IS NULL",
-        "SELECT id, s FROM v_null WHERE s IS NULL",
-        "SELECT id, d, r FROM v_null WHERE d IS NOT NULL",
-        "SELECT * FROM v_blob",
-        "SELECT id, b FROM v_blob WHERE b IS NULL",
-    ];
-    fx.drain("nl", &views);
-    let mut compared = 0;
-    for q in reads {
-        compared += fx.differential("nl", q);
-    }
-
-    // A round that turns present values into nulls, and one that retracts rows.
-    sql(&mut fx.direct, "nl", "UPDATE n SET i = NULL, s = NULL WHERE id < 40");
-    sql(
-        &mut fx.direct,
-        "nl",
-        "UPDATE n SET d = NULL, r = NULL WHERE id >= 40 AND id < 70",
-    );
-    sql(&mut fx.direct, "nl", "DELETE FROM n WHERE id > 100");
-    sql(&mut fx.direct, "nl", "DELETE FROM blb WHERE id > 100");
-    fx.drain("nl", &views);
-    for q in reads {
-        compared += fx.differential("nl", q);
-    }
-    assert!(
-        compared > 200,
-        "the nullable differential compared only {compared} rows"
-    );
-}
-
-/// A four-column PK carrying negative and mixed-sign values — the OPK sign flip
-/// — read as a full scan, a point lookup and a range.
-#[test]
-fn a_compound_signed_pk_reads_the_same_locally() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-    fx.direct.create_schema("pk").unwrap();
-    sql(
-        &mut fx.direct,
-        "pk",
-        "CREATE TABLE k (a BIGINT NOT NULL, b INTEGER NOT NULL, c SMALLINT NOT NULL, \
-                         d BIGINT NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (a, b, c, d))",
-    );
-    let rows: Vec<String> = (-40i64..=40)
-        .map(|i| format!("({i}, {}, {}, {}, {})", -i, i % 7, i * 2, i * 11))
-        .collect();
-    sql(
-        &mut fx.direct,
-        "pk",
-        &format!("INSERT INTO k VALUES {}", rows.join(",")),
-    );
-    sql(
-        &mut fx.direct,
-        "pk",
-        &format!("CREATE VIEW v_pk WITH (delta = '{FEED}') AS SELECT a, b, c, d, v FROM k"),
-    );
-    fx.mirror().mirror_view("pk", "v_pk").expect("mirror v_pk");
-    fx.drain("pk", &["v_pk"]);
-
-    let mut compared = 0;
-    for q in [
-        "SELECT * FROM v_pk",
-        "SELECT a, b, c, d, v FROM v_pk WHERE a = -17 AND b = 17 AND c = -3 AND d = -34",
-        "SELECT a, v FROM v_pk WHERE a > -12 AND a < 12",
-    ] {
-        compared += fx.differential("pk", q);
-    }
-
-    sql(&mut fx.direct, "pk", "UPDATE k SET v = v - 1 WHERE a < 0");
-    sql(&mut fx.direct, "pk", "DELETE FROM k WHERE a > 30");
-    fx.drain("pk", &["v_pk"]);
-    compared += fx.differential("pk", "SELECT * FROM v_pk");
-    assert!(
-        compared > 100,
-        "the compound-PK differential compared only {compared} rows"
-    );
-}
-
-/// Ordered reads come back in order, including a `LIMIT` and a `LIMIT … OFFSET`
-/// over a tie-heavy sort key where a different tie-break selects different rows.
-///
-/// Unordered queries stay multiset comparisons throughout this suite, and that
-/// is deliberate: their row order is unspecified, and the mirror is one
-/// partition where the server is W, so the sequences do differ.
-#[test]
-fn ordered_reads_are_ordered() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-    churn(&mut fx.direct, 1, 300);
-    fx.mirror_both();
-    fx.quiesce();
-
-    let mut compared = 0;
-    for q in [
-        "SELECT a, b, v FROM v_keyed ORDER BY a DESC, b ASC",
-        "SELECT a, b, body FROM v_keyed WHERE v > 100 ORDER BY a ASC, b DESC LIMIT 23",
-        // `b` is `a % 7`, so the sort key ties in blocks of ~40 rows: which rows
-        // the window selects depends on the whole tie-break, not just on `b`.
-        "SELECT a, b FROM v_keyed ORDER BY b ASC, a ASC LIMIT 19 OFFSET 31",
-        "SELECT a, b FROM v_keyed ORDER BY b DESC, a DESC LIMIT 19 OFFSET 31",
-        "SELECT id, v FROM v_repl ORDER BY v DESC, id ASC LIMIT 15 OFFSET 7",
-    ] {
-        compared += fx.ordered_differential("s", q);
-    }
-    assert!(compared > 100, "the ordered differential compared only {compared} rows");
-}
-
-/// The join body against a server at **two** workers.
-///
-/// The other split where a mishandled concatenation of per-worker bootstrap
-/// trains is real. Not one worker: at one slice the server's partitioning
-/// matches the mirror's, so a copy that assumed the two agree passes.
-#[test]
-fn a_second_worker_count_mirrors_the_same() {
-    let _g = serial();
-    let mut fx = Fixture::start_with(2, &[]);
-    seed_shapes(&mut fx.direct);
-    churn_shapes(&mut fx.direct, 1, 120);
-    sql(
-        &mut fx.direct,
-        SH,
-        &format!(
-            "CREATE VIEW v_join WITH (delta = '{FEED}') AS \
-             SELECT t.id, t.body, u.w FROM t JOIN u ON t.id = u.tid"
-        ),
-    );
-    fx.mirror().mirror_view(SH, "v_join").expect("mirror v_join");
-    fx.drain(SH, &["v_join"]);
-    let mut compared = fx.differential(SH, "SELECT * FROM v_join");
-
-    rechurn_shapes(&mut fx.direct, 2, 60);
-    fx.drain(SH, &["v_join"]);
-    compared += fx.differential(SH, "SELECT * FROM v_join");
-    compared += fx.differential(SH, "SELECT COUNT(*) AS n, SUM(w) AS total FROM v_join");
-    assert!(
-        compared > 100,
-        "the two-worker differential compared only {compared} rows"
-    );
-}
-
-/// A bootstrap and a poll that each span many reply frames, over an
-/// all-fixed-width view: every frame's data block is a pure region copy, with no
-/// heap to relocate. A loop that stopped at the first block loses rows silently.
-///
-/// The view is created over an already-populated table, so this also covers the
-/// first bootstrap of a view whose rows all arrived through a `CREATE VIEW`
-/// backfill — rows the delta feed never carries.
-#[test]
-fn a_bootstrap_and_a_poll_span_many_frames() {
-    let _g = serial();
-    let mut fx = Fixture::start_with(WORKERS, &[("GNITZ_REPLY_FRAME_BUDGET", "16384")]);
-    fx.direct.create_schema("fr").unwrap();
-    sql(
-        &mut fx.direct,
-        "fr",
-        "CREATE TABLE w (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL, c BIGINT NOT NULL)",
-    );
-    let fill = |client: &mut GnitzClient, lo: i64, hi: i64| {
-        for chunk in (lo..=hi).step_by(1000) {
-            let end = (chunk + 999).min(hi);
-            let rows: Vec<String> = (chunk..=end)
-                .map(|i| format!("({i}, {}, {}, {})", i * 2, i * 3, i * 5))
-                .collect();
-            sql(client, "fr", &format!("INSERT INTO w VALUES {}", rows.join(",")));
-        }
-    };
-    fill(&mut fx.direct, 1, 20_000);
-    sql(
-        &mut fx.direct,
-        "fr",
-        &format!("CREATE VIEW v_wide WITH (delta = '{FEED}') AS SELECT id, a, b, c FROM w WHERE a >= 0"),
-    );
-
-    fx.mirror().mirror_view("fr", "v_wide").expect("mirror v_wide");
-    fx.drain("fr", &["v_wide"]);
-    let bootstrapped = fx.differential("fr", "SELECT * FROM v_wide");
-    assert!(bootstrapped >= 20_000, "the bootstrap carried only {bootstrapped} rows");
-
-    fill(&mut fx.direct, 20_001, 40_000);
-    fx.drain("fr", &["v_wide"]);
-    let polled = fx.differential("fr", "SELECT * FROM v_wide");
-    assert!(polled >= 40_000, "the poll carried only {polled} rows");
-}
-
-/// The same, over long TEXT: every row points into the batch's string heap, so
-/// each frame ships a heap compacted to its own rows. A bootstrap reads the view
-/// whole and cannot narrow, so this is the shape that used to be unmirrorable.
-#[test]
-fn a_long_text_view_mirrors_across_many_frames() {
-    let _g = serial();
-    let mut fx = Fixture::start_with(WORKERS, &[("GNITZ_REPLY_FRAME_BUDGET", "16384")]);
-    fx.direct.create_schema("tx").unwrap();
-    sql(
-        &mut fx.direct,
-        "tx",
-        "CREATE TABLE d (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, body TEXT NOT NULL)",
-    );
-    // 200 bytes per row of heap, so 5 000 rows is ~1 MB across four workers —
-    // ~16× the frame budget on each of them.
-    let fill = |client: &mut GnitzClient, lo: i64, hi: i64| {
-        for chunk in (lo..=hi).step_by(500) {
-            let end = (chunk + 499).min(hi);
-            let rows: Vec<String> = (chunk..=end)
-                .map(|i| format!("({i}, {}, '{}')", i % 7, format_args!("row-{i}-{}", "z".repeat(200))))
-                .collect();
-            sql(client, "tx", &format!("INSERT INTO d VALUES {}", rows.join(",")));
-        }
-    };
-    fill(&mut fx.direct, 1, 5_000);
-    sql(
-        &mut fx.direct,
-        "tx",
-        &format!("CREATE VIEW v_text WITH (delta = '{FEED}') AS SELECT id, k, body FROM d WHERE k >= 0"),
-    );
-
-    fx.mirror().mirror_view("tx", "v_text").expect("mirror v_text");
-    fx.drain("tx", &["v_text"]);
-    let bootstrapped = fx.differential("tx", "SELECT * FROM v_text");
-    assert!(bootstrapped >= 5_000, "the bootstrap carried only {bootstrapped} rows");
-
-    fill(&mut fx.direct, 5_001, 10_000);
-    fx.drain("tx", &["v_text"]);
-    let polled = fx.differential("tx", "SELECT * FROM v_text");
-    assert!(polled >= 10_000, "the poll carried only {polled} rows");
-    // The strings themselves, not just the row count.
-    fx.ordered_differential("tx", "SELECT id, body FROM v_text WHERE k = 3 ORDER BY id");
-}
-
-/// Two schemas in one handle, and forgetting a view out of one.
-///
-/// A record carries its own schema name and the store enters no schema of its
-/// own, so a retraction takes down exactly one view and leaves every other view
-/// of that schema readable.
-#[test]
-fn two_schemas_share_one_handle() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-    seed_shapes(&mut fx.direct);
-    churn_shapes(&mut fx.direct, 1, 60);
-    churn(&mut fx.direct, 1, 60);
-    sql(
-        &mut fx.direct,
-        SH,
-        &format!("CREATE VIEW v_lin WITH (delta = '{FEED}') AS SELECT id, v, body FROM t WHERE v > 10"),
-    );
-    sql(
-        &mut fx.direct,
-        SH,
-        &format!("CREATE VIEW v_grp WITH (delta = '{FEED}') AS SELECT tid, SUM(w) AS total FROM u GROUP BY tid"),
-    );
-
-    let (keyed, _) = fx.mirror_both();
-    let lin = fx.mirror().mirror_view(SH, "v_lin").expect("mirror v_lin").view_id;
-    fx.mirror().mirror_view(SH, "v_grp").expect("mirror v_grp");
-    fx.quiesce();
-    fx.drain(SH, &["v_lin", "v_grp"]);
-    fx.differential("s", "SELECT * FROM v_keyed");
-    fx.differential(SH, "SELECT * FROM v_lin");
-    fx.differential(SH, "SELECT * FROM v_grp");
-
-    fx.mirror().forget_view(lin).expect("forget v_lin");
-    assert!(!fx.mirror().mirrors(lin));
-    assert!(
-        fx.mirror().mirrors(keyed),
-        "forgetting one view must not disturb another schema's copy"
-    );
-    fx.drain(SH, &["v_grp"]);
-    fx.differential(SH, "SELECT * FROM v_grp");
-    fx.differential("s", "SELECT * FROM v_keyed");
-    // Delegated now, and still correct.
-    fx.differential(SH, "SELECT * FROM v_lin");
-}
-
-/// A view dropped upstream fails its own poll forever, and nothing else stops.
-///
-/// Both halves come off the returned report — a `Failed` entry at the dropped
-/// view's id and an `Advanced` one at the survivor's, with the round the
-/// survivor now answers at beside it. The dropped view's copy **keeps answering
-/// locally** until it is forgotten: the copy answers as of its last poll and that
-/// round is real.
-#[test]
-fn a_view_dropped_upstream_names_itself_and_stops_nothing_else() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-    churn(&mut fx.direct, 1, 60);
-    let (keyed, repl_id) = fx.mirror_both();
-    fx.quiesce();
-    let before_repl = fx.local("SELECT * FROM v_repl");
-    let before_keyed = fx.mirror().cursor_of(keyed).expect("a cursor");
-
-    sql(&mut fx.direct, "s", "DROP VIEW v_repl");
-    churn(&mut fx.direct, 61, 120);
-    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_keyed");
-
-    let report = fx
-        .mirror()
-        .poll_mirror()
-        .expect("a per-view failure is not a failure of the call");
-    let dead = report
-        .iter()
-        .find(|o| o.view_id == repl_id)
-        .expect("the dropped view is reported under its own id");
-    let PollResult::Failed(e) = &dead.result else {
-        panic!("the dropped view must fail: {:?}", dead.result)
-    };
-    // The id carries the identification now; the message need not.
-    assert!(!e.to_string().is_empty(), "a failed view reports why");
-
-    let alive = report
-        .iter()
-        .find(|o| o.view_id == keyed)
-        .expect("every view is attempted");
-    assert!(matches!(alive.result, PollResult::Advanced));
-    assert!(
-        alive.cursor.is_some_and(|c| c.tick > before_keyed.tick),
-        "the survivor advanced, and the report says to which round",
-    );
-    assert_eq!(
-        alive.cursor,
-        fx.mirror().cursor_of(keyed),
-        "the reported round is the one the copy answers at",
-    );
-    fx.differential("s", "SELECT * FROM v_keyed");
-
-    let still = fx.local("SELECT * FROM v_repl");
-    assert_eq!(
-        canonical(&before_repl.1),
-        canonical(&still.1),
-        "the dropped view's copy answers its last round until it is forgotten",
-    );
-
-    fx.mirror().forget_view(repl_id).expect("forget the dead registration");
-    let report = fx
-        .mirror()
-        .poll_mirror()
-        .expect("the poll recovers once the dead view is gone");
-    assert!(
-        report.iter().all(|o| !matches!(o.result, PollResult::Failed(_))),
-        "nothing fails once the dead registration is gone",
-    );
-    assert!(
-        report.iter().any(|o| o.view_id == keyed),
-        "the survivor is reported again"
-    );
-}
-
-/// A view recreated under the same name with a **different column set**.
-///
-/// The poll re-resolves, finds the descriptor no longer matches, retracts the
-/// old registration, registers the new one, reseeds, and reads correctly under
-/// the new shape — all inside the poll, without the host re-registering. This is
-/// the reachable form of a schema change under a live mirror: `ALTER TABLE` is
-/// refused while a dependent view exists, so a mirrored view's base can never
-/// change shape beneath it.
-///
-/// It also covers the recreated-view *id* move on its own: the tag stops
-/// continuing for the reason a server restart does not, so a recovery that
-/// bootstrapped in place would read a relation that no longer exists.
-#[test]
-fn a_view_recreated_with_a_different_column_set_reseeds_under_the_new_shape() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-    churn(&mut fx.direct, 1, 60);
-    let (old, _) = fx.mirror_both();
-    fx.quiesce();
-    assert_eq!(
-        fx.local("SELECT * FROM v_keyed").0.columns.len(),
-        5,
-        "the original view projects five columns",
-    );
-
-    sql(&mut fx.direct, "s", "DROP VIEW v_keyed");
-    sql(
-        &mut fx.direct,
-        "s",
-        &format!("CREATE VIEW v_keyed WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE v >= 0"),
-    );
-    churn(&mut fx.direct, 61, 120);
-    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_keyed");
-
-    fx.mirror()
-        .poll_mirror()
-        .expect("the poll re-registers under the new shape");
-    let new = fx
-        .mirror()
-        .mirrored_ids()
-        .into_iter()
-        .find(|&t| t != old)
-        .expect("the recreated view must be mirrored under a fresh id");
-    assert!(!fx.mirror().mirrors(old), "the old id must be gone");
-    assert!(fx.mirror().mirrors(new));
-    assert_eq!(
-        fx.local("SELECT * FROM v_keyed").0.columns.len(),
-        3,
-        "the copy must read under the new column set",
-    );
-    fx.quiesce();
-    fx.differential("s", "SELECT * FROM v_keyed");
-    fx.differential("s", "SELECT a, v FROM v_keyed WHERE a > 20 AND a < 60");
-}
-
-/// Registration is idempotent, and a poll with nothing pushed is a no-op.
-#[test]
-fn registration_is_idempotent_and_an_empty_poll_moves_nothing() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-    churn(&mut fx.direct, 1, 60);
-    for i in 0..10 {
-        sql(
-            &mut fx.direct,
-            "s",
-            &format!("CREATE VIEW v{i} WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE v > {i}"),
-        );
-    }
-    let names: Vec<String> = (0..10).map(|i| format!("v{i}")).collect();
-    let mut ids = Vec::new();
-    for name in &names {
-        let out = fx.mirror().mirror_view("s", name).expect(name);
-        assert!(out.result.reseeded(), "{name}: a first registration bootstraps");
-        ids.push(out.view_id);
-    }
-
-    fx.drain("s", &names);
-    let mut compared = 0;
-    for name in &names {
-        compared += fx.differential("s", &format!("SELECT * FROM {name}"));
-    }
-    assert!(compared > 100, "ten views compared only {compared} rows");
-
-    // A second registration: same id, no reseed, cursor unmoved.
-    let before: Vec<_> = ids.iter().map(|&t| fx.mirror().cursor_of(t).unwrap()).collect();
-    for (i, name) in names.iter().enumerate() {
-        let out = fx.mirror().mirror_view("s", name).expect("re-register");
-        assert_eq!(out.view_id, ids[i], "{name}: the same relation keeps its id");
-        assert!(
-            !out.result.reseeded(),
-            "{name}: a re-registration resumes rather than reseeds"
-        );
-    }
-    let after: Vec<_> = ids.iter().map(|&t| fx.mirror().cursor_of(t).unwrap()).collect();
-    assert_eq!(before, after, "a re-registration with nothing pushed moves no cursor");
-
-    let report = fx.mirror().poll_mirror().expect("an empty poll");
-    assert_eq!(report.len(), ids.len(), "one poll reports every registration");
-    assert!(
-        !report.iter().any(|o| o.result.reseeded()),
-        "an empty poll reseeds nothing"
-    );
-    let again: Vec<_> = ids.iter().map(|&t| fx.mirror().cursor_of(t).unwrap()).collect();
-    assert_eq!(after, again, "an empty poll moves no cursor");
-}
-
-/// A view over a stream, across a restart.
-///
-/// The view returns to the value it would have if the stream had never received
-/// a row, and the copy must follow it *there*: the tag stops continuing and the
-/// reseed reads the reset view. A mirror that resumed its copy across that
-/// restart holds rows the server no longer has.
-///
-/// The restart kills the socket, so the handle is given a fresh connection
-/// first — a poll on the dead one reports a transport failure rather than the
-/// foreign tag this is about.
-#[test]
-fn a_view_over_a_stream_follows_its_reset_across_a_restart() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-    sql(
-        &mut fx.direct,
-        "s",
-        "CREATE TABLE ev (id BIGINT NOT NULL PRIMARY KEY, kind BIGINT NOT NULL, amount BIGINT NOT NULL) \
-         WITH (stream = true)",
-    );
-    sql(
-        &mut fx.direct,
-        "s",
-        &format!(
-            "CREATE VIEW v_stream WITH (delta = '{FEED}') AS SELECT kind, SUM(amount) AS total FROM ev GROUP BY kind"
-        ),
-    );
-    for round in 0..4 {
-        let rows: Vec<String> = (0..40)
-            .map(|i| format!("({}, {}, {})", round * 40 + i, i % 5, i + 1))
-            .collect();
-        sql(
-            &mut fx.direct,
-            "s",
-            &format!("INSERT INTO ev VALUES {}", rows.join(",")),
-        );
-    }
-    let tid = fx
-        .mirror()
-        .mirror_view("s", "v_stream")
-        .expect("mirror v_stream")
-        .view_id;
-    fx.drain("s", &["v_stream"]);
-    let before = fx.local("SELECT * FROM v_stream");
-    assert!(
-        !canonical(&before.1).is_empty(),
-        "the copy must hold the stream's aggregate before the restart",
-    );
-
-    fx.server.restart();
-    fx.direct = GnitzClient::connect(fx.server.sock_path()).unwrap();
-    fx.reconnect_mirror();
-    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_stream");
-    let report = fx
-        .mirror()
-        .poll_mirror()
-        .expect("the poll recovers from the foreign tag");
-    assert!(
-        report.iter().any(|o| o.view_id == tid && o.result.reseeded()),
-        "a tag that stopped continuing must be reported as a reseed",
-    );
-
-    // Spelled out rather than run through the differential: both sides are empty
-    // afterwards, and `assert_same_zset` refuses that as a pass that agrees
-    // about nothing.
-    let after = fx.local("SELECT * FROM v_stream");
-    assert!(
-        canonical(&after.1).is_empty(),
-        "a view over a stream comes back with zero rows, and the copy must follow it there",
-    );
-}
-
-/// A relation the handle does **not** hold still reads correctly through it.
-///
-/// The mirror is a client too, and a read it delegates must lose nothing. The
-/// gate is one boolean per relation, so a delegated read reaches the connection
-/// by the same path whatever its shape — a few shapes stand for all of them,
-/// and the mirrored side of the same menu is covered by
-/// `a_mirrored_read_equals_the_server_read`.
-#[test]
-fn delegation_is_correct_for_every_read_shape() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-    churn(&mut fx.direct, 1, 200);
-    fx.mirror_both();
-    fx.quiesce();
-
-    // `t` and `r` are base tables: mirrored by nothing, so every read is delegated.
-    let mut compared = 0;
-    for q in [
-        "SELECT * FROM t",
-        "SELECT b, COUNT(*) AS n, SUM(v) AS total, MIN(a) AS lo, MAX(a) AS hi FROM t GROUP BY b",
-        "SELECT * FROM r",
-    ] {
-        compared += fx.differential("s", q);
-    }
-    compared += fx.ordered_differential("s", "SELECT a, v FROM t ORDER BY v DESC, a ASC LIMIT 9 OFFSET 5");
-    assert!(
-        compared > 300,
-        "the delegated differential compared only {compared} rows"
-    );
-}
-
-/// The mirror reads every `StoreConfig` knob, not just the RAM tier.
-///
-/// `adhoc_group_cap` bounds the fold fallibly, so a copy ignoring it fails a wide
-/// `GROUP BY` with no knob to turn. Driven by lowering the cap.
-#[test]
-fn a_mirrored_group_by_honours_the_group_cap() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-    churn(&mut fx.direct, 1, 60);
-    // `b` is `a % 7`, so this folds seven groups.
-    let grouped = "SELECT b, COUNT(*) AS n FROM v_keyed GROUP BY b";
-    fx.mirror_both();
-    fx.quiesce();
-    fx.differential("s", grouped);
-
-    // A cap below the group count: the local fold refuses.
-    {
-        fx.mirror = None;
-        let _cap = EnvVar::set("GNITZ_MIRROR_ADHOC_GROUP_CAP", "3");
-        fx.open();
-        fx.mirror_both();
-        fx.quiesce();
-        let err = gnitz_sql::execute(fx.mirror.as_mut().unwrap(), "s", grouped)
-            .expect_err("seven groups must not fit a cap of three");
-        assert!(!err.to_string().is_empty(), "the refusal must say something: {err}");
-    }
-
-    // Raised past the group count, the same read answers what the server does.
-    fx.mirror = None;
-    let _cap = EnvVar::set("GNITZ_MIRROR_ADHOC_GROUP_CAP", "4096");
-    fx.open();
-    fx.mirror_both();
-    fx.quiesce();
-    fx.differential("s", grouped);
-}
-
-/// A failing checkpoint is reported, and the handle survives it.
-#[test]
-fn a_failing_checkpoint_leaves_the_handle_usable() {
-    let _g = serial();
-    if !cfg!(debug_assertions) {
-        return; // the seam folds away in a release build
-    }
-    let (server, dir) = child_fixture();
-    run_child(
-        "failing_checkpoint_child",
-        &server,
-        &dir,
-        &[("GNITZ_INJECT_MIRROR_CHECKPOINT_ERROR", "1")],
-        "a failed checkpoint must be reported rather than poison the handle",
-    );
-}
-
-/// Runs only in the child the test above spawns.
-#[test]
-fn failing_checkpoint_child() {
-    let Some((sock, dir)) = child_target() else { return };
-    let mut direct = GnitzClient::connect(&sock).unwrap();
-    let mut mirror = mirroring_client(&sock, &dir);
-    let tid = mirror.mirror_view("s", "v_keyed").expect("mirror").view_id;
-
-    let err = mirror
-        .checkpoint_mirror()
-        .expect_err("the armed seam must fail the checkpoint");
-    assert!(
-        !matches!(err, ClientError::Mirror(MirrorError::Poisoned(_))),
-        "a failed checkpoint is not a poisoning: {err}",
-    );
-    assert!(mirror.mirror_poisoned().is_none(), "the client stays usable");
-    assert!(
-        !has_manifest(&dir, tid),
-        "the failed checkpoint must have published nothing",
-    );
-
-    // The copy is intact in the RAM tier, so reads are unaffected.
-    let local = query(&mut mirror, "s", "SELECT * FROM v_keyed");
-    let remote = query(&mut direct, "s", "SELECT * FROM v_keyed");
-    assert_same_zset(
-        "a failed checkpoint must not disturb the copy",
-        (&local.0, &local.1),
-        (&remote.0, &remote.1),
-    );
-
-    // The seam is one-shot, so the retry is the real thing.
-    mirror
-        .checkpoint_mirror()
-        .expect("the retry after a one-shot fault succeeds");
-    assert!(has_manifest(&dir, tid), "the successful retry must publish a manifest",);
-    println!("{CHILD_OK}");
-}
-
 /// The copy is a store, not a resident Z-set.
 ///
 /// `#[ignore]`d, run with `--nocapture`, and in a child process, because the RAM
-/// ceiling is a read-once-per-process latch. **It is not a gate**: a checkpoint
-/// publishes shard files whatever the RAM ceiling is, so their presence proves
-/// nothing, and an RSS threshold is not sound enough to fail a build on. The
-/// number is the statement of the claim.
+/// ceiling is read from the environment at open, and the host RSS measured is
+/// the child's alone. **It is not a gate**: a checkpoint publishes shard files
+/// whatever the RAM ceiling is, so their presence proves nothing, and an RSS
+/// threshold is not sound enough to fail a build on. The number is the
+/// statement of the claim.
 #[test]
 #[ignore]
 fn resident_footprint_bench() {
-    let _g = serial();
     let (server, dir) = child_fixture();
     print!(
         "{}",
@@ -2036,73 +801,777 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// One client, one copy
+// Persistence and recovery
 // ---------------------------------------------------------------------------
 
-/// A store is attached once, and a mirror verb without one is refused.
+/// A reopen resumes each copy from its checkpoint rather than reseeding; two
+/// stores on two directories in one process each keep their own; and a close
+/// that changes nothing writes nothing — a publish renames a fresh inode in, so
+/// an unchanged inode is a skipped publish.
 #[test]
-fn attaching_a_store_is_once_and_a_mirror_verb_needs_one() {
-    let _g = serial();
+fn a_reopen_resumes_every_copy_and_a_quiet_close_writes_nothing() {
     let mut fx = Fixture::start();
-
-    let mut plain = GnitzClient::connect(fx.server.sock_path()).unwrap();
-    let e = plain.mirror_view("s", "v_keyed").unwrap_err();
-    assert!(
-        matches!(&e, ClientError::Refused(f) if f.text.contains("mirrors nothing")),
-        "a client with no store says so: {e}"
-    );
-
-    let held = fx.base_dir();
     let second_dir = tempfile::tempdir().unwrap();
     let second_path = second_dir.path().to_str().unwrap().to_string();
-    let store = Mirror::open(&second_path).expect("a second directory opens");
-    let e = fx.mirror().attach_mirror(store).unwrap_err().to_string();
-    assert!(e.contains(&held), "the refusal must name the path already held: {e}");
-    // The refused store was dropped with the call, which released its lock.
-    Mirror::open(&second_path).expect("a refused attach must release the store it was passed");
+    let mut second = mirroring_client(fx.server.sock_path(), &second_path);
+
+    churn(&mut fx.direct, 1, 80);
+    let keyed = fx.mirror().mirror_view("s", "v_keyed").expect("mirror v_keyed").view_id;
+    let repl = second.mirror_view("s", "v_repl").expect("mirror v_repl").view_id;
+    churn(&mut fx.direct, 81, 120);
+    fx.quiesce();
+    second.poll_mirror().expect("poll the second store");
+    fx.mirror().checkpoint_mirror().expect("checkpoint");
+    second.checkpoint_mirror().expect("checkpoint the second store");
+    let inodes = |base_dir: &str| [manifest_inode(base_dir, keyed), manifest_inode(&second_path, repl)];
+    let published = inodes(&fx.base_dir());
+
+    // Both close — the exit checkpoint — with nothing moved since the last one.
+    fx.reopen();
+    second.close_mirror().expect("close the second store");
+    assert_eq!(
+        inodes(&fx.base_dir()),
+        published,
+        "closing a store whose copies did not move must write nothing",
+    );
+    second
+        .attach_mirror(Mirror::open(&second_path).expect("the second directory reopens"))
+        .expect("a later attach on the same connection is legal");
+
+    for (client, view, id) in [(fx.mirror(), "v_keyed", keyed), (&mut second, "v_repl", repl)] {
+        let out = client.mirror_view("s", view).expect("re-mirror");
+        assert_eq!(out.view_id, id, "{view}: the reopen lands on the same id");
+        assert!(
+            !out.result.reseeded(),
+            "{view} was checkpointed and must resume, not bootstrap"
+        );
+    }
+    fx.differential("s", "SELECT * FROM v_keyed");
+    differential(&mut second, &mut fx.direct, "s", "SELECT * FROM v_repl", Answer::Local);
 }
 
-/// `DROP VIEW` **through the mirroring client** stops that view answering
-/// locally, and `ALTER VIEW … AS` cannot reach one at all.
+/// The inode of the mirrored copy of `view_id`'s manifest.
+fn manifest_inode(base_dir: &str, view_id: u64) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(manifest_path(base_dir, view_id))
+        .expect("a published manifest")
+        .ino()
+}
+
+/// A server restart ends every feed, so a cursor checkpointed before it carries a
+/// tag the new boot does not continue: re-mirroring reseeds each copy under its
+/// id, inside the call.
 ///
-/// The copy and the DDL path share one object, so without the derivation a
-/// `SELECT` after a `DROP VIEW` on this same client answers rows off a view it
-/// just dropped. The second case is closed one layer up: retargeting a view that
-/// carries a delta feed is refused, and a feed is what makes a view mirrorable
-/// at all.
+/// A view over a stream comes back at the value it would have if the stream had
+/// never received a row, and the copy must follow it *there*: one that resumed
+/// across the restart would hold rows the server no longer has.
+///
+/// The store is closed and reopened, not reconnected: a reconnect drops every
+/// cursor, and the cursor-less poll that follows never meets the foreign tag.
 #[test]
-fn ddl_through_the_mirroring_client_retires_its_own_copy() {
-    let _g = serial();
+fn a_cursor_from_before_a_server_restart_reseeds() {
     let mut fx = Fixture::start();
-    churn(&mut fx.direct, 1, 40);
+    sql(&mut fx.direct, "s", STREAM);
+    fed_view(
+        &mut fx.direct,
+        "s",
+        "v_stream",
+        "SELECT kind, SUM(amount) AS total FROM ev GROUP BY kind",
+    );
+    let events: Vec<String> = (0..160).map(|i| format!("({i}, {}, {})", i % 5, i + 1)).collect();
     sql(
         &mut fx.direct,
         "s",
-        &format!("CREATE VIEW v_drop WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE v >= 0"),
+        &format!("INSERT INTO ev VALUES {}", events.join(",")),
     );
-    let tid = fx.mirror().mirror_view("s", "v_drop").expect("v_drop").view_id;
-    fx.drain("s", &["v_drop"]);
-    assert!(fx.mirror().mirrors(tid), "the copy answers before the DDL");
+    churn(&mut fx.direct, 1, 60);
+    let (keyed, repl) = fx.mirror_both();
+    let stream = fx
+        .mirror()
+        .mirror_view("s", "v_stream")
+        .expect("mirror v_stream")
+        .view_id;
+    let views = [("v_keyed", keyed), ("v_repl", repl), ("v_stream", stream)];
+    let names = views.map(|(name, _)| name);
+    fx.drain("s", &names);
+    fx.differential("s", "SELECT * FROM v_stream");
 
-    sql(fx.mirror(), "s", "DROP VIEW v_drop");
+    fx.close();
+    fx.restart_server();
+    churn(&mut fx.direct, 61, 120);
+    fx.tick("s", &names);
+    fx.open();
+    for (name, id) in views {
+        let out = fx.mirror().mirror_view("s", name).expect(name);
+        assert_eq!(out.view_id, id, "{name}: a restart keeps the id");
+        assert!(out.result.reseeded(), "{name}: a foreign tag must reseed, not advance");
+    }
+    fx.differential("s", "SELECT * FROM v_keyed");
+    fx.differential("s", "SELECT * FROM v_repl");
+    // Spelled out rather than run through the differential: both sides are empty,
+    // which it refuses as a pass that agrees about nothing.
+    assert!(fx.mirror().mirrors(stream), "the stream view's copy answers locally");
     assert!(
-        !fx.mirror().mirrors(tid),
-        "the copy must stop answering once this client retired it",
+        canonical(&fx.local("SELECT * FROM v_stream").1).is_empty(),
+        "a view over a stream comes back with zero rows, and the copy must follow it there",
     );
-    assert!(
-        !fx.mirror().mirrored_ids().contains(&tid),
-        "and the registration goes with it",
+}
+
+// ---------------------------------------------------------------------------
+// Store shapes
+// ---------------------------------------------------------------------------
+
+/// The schema the shape cases seed for themselves: two base tables where
+/// `u.tid` covers only the lower part of `t.id`, so an outer join has unmatched
+/// rows and an `EXCEPT` is non-empty.
+///
+/// Beside the shared `seed` rather than folded into it: every other test would
+/// otherwise carry two more relations through every churn.
+const SH: &str = "sh";
+
+fn seed_shapes(client: &mut GnitzClient) {
+    client.create_schema(SH).unwrap();
+    sql(
+        client,
+        SH,
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL, body TEXT NOT NULL)",
+    );
+    sql(
+        client,
+        SH,
+        "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, tid BIGINT NOT NULL, w BIGINT NOT NULL)",
+    );
+}
+
+/// Fresh keys in both tables, `u` reaching only halfway up `t`'s range.
+fn churn_shapes(client: &mut GnitzClient, lo: i64, hi: i64) {
+    let t: Vec<String> = (lo..=hi)
+        .map(|i| format!("({i}, {}, 'body-{i:0>20}')", i * 3))
+        .collect();
+    sql(client, SH, &format!("INSERT INTO t VALUES {}", t.join(",")));
+    let mid = lo + (hi - lo) / 2;
+    let u: Vec<String> = (lo..=mid).map(|i| format!("({i}, {i}, {})", i * 7)).collect();
+    sql(client, SH, &format!("INSERT INTO u VALUES {}", u.join(",")));
+}
+
+/// A round that touches only keys the copies already hold — the retract/insert
+/// pair a PK-conflicting update produces, plus a pure retraction. A poll that
+/// covered only fresh keys would never fold a weight onto an existing element.
+fn rechurn_shapes(client: &mut GnitzClient, lo: i64, hi: i64) {
+    sql(
+        client,
+        SH,
+        &format!("UPDATE t SET v = v + 7 WHERE id >= {lo} AND id <= {hi}"),
+    );
+    sql(
+        client,
+        SH,
+        &format!("UPDATE u SET w = w + 11 WHERE id >= {lo} AND id <= {hi}"),
+    );
+    sql(client, SH, &format!("DELETE FROM t WHERE id = {lo}"));
+    sql(client, SH, &format!("DELETE FROM u WHERE id = {}", lo + 1));
+}
+
+/// The view bodies, each with the read that reaches past its `SELECT *`.
+const SHAPE_VIEWS: &[(&str, &str, &str)] = &[
+    (
+        "v_join",
+        "SELECT t.id, t.body, u.w FROM t JOIN u ON t.id = u.tid",
+        "SELECT id, w FROM v_join WHERE w > 200",
+    ),
+    (
+        "v_left",
+        "SELECT t.id, t.v, u.w FROM t LEFT JOIN u ON t.id = u.tid",
+        "SELECT id, v, w FROM v_left WHERE w IS NULL",
+    ),
+    (
+        "v_group",
+        "SELECT tid, COUNT(*) AS n, SUM(w) AS total FROM u GROUP BY tid",
+        "SELECT tid, total FROM v_group WHERE total > 200",
+    ),
+    (
+        // `w` is null-filled by the outer join, so this keys by `_group_pk`.
+        "v_group_null",
+        "SELECT w, COUNT(*) AS n FROM v_left GROUP BY w",
+        "SELECT w, n FROM v_group_null WHERE n > 1",
+    ),
+    (
+        "v_except",
+        "SELECT id FROM t EXCEPT SELECT tid FROM u",
+        "SELECT id FROM v_except WHERE id > 30",
+    ),
+    (
+        "v_distinct",
+        "SELECT DISTINCT v FROM t",
+        "SELECT v FROM v_distinct WHERE v > 100",
+    ),
+    (
+        // An id `u` covers appears in both arms, so its element carries weight
+        // 2: a copy with set semantics would still hold every row.
+        "v_bag",
+        "SELECT id FROM t UNION ALL SELECT tid FROM u",
+        "SELECT id FROM v_bag WHERE id > 20",
+    ),
+    (
+        // Over `v_group`, so the copy is fed by a view whose own source is a
+        // maintained view rather than a base table.
+        "v_chain",
+        "SELECT tid, total FROM v_group WHERE total > 100",
+        "SELECT tid FROM v_chain WHERE tid > 20",
+    ),
+];
+
+/// Every store shape a view body produces, mirrored in one handle, against a
+/// server at four workers and at two.
+///
+/// Each puts a hidden synthetic key (`_join_pk`, `_group_pk`, `_set_pk`) or a
+/// nullable payload through local registration, `pk_stride` and the null
+/// bitmap, where a wrong shape is silently wrong rather than an error. Two
+/// workers is the other split where a mishandled concatenation of per-worker
+/// bootstrap trains is real.
+#[test]
+fn every_view_body_shape_mirrors() {
+    for workers in [WORKERS, 2] {
+        let mut fx = Fixture::start_with(workers, &[]);
+        seed_shapes(&mut fx.direct);
+        churn_shapes(&mut fx.direct, 1, 80);
+        for (name, body, _) in SHAPE_VIEWS {
+            fed_view(&mut fx.direct, SH, name, body);
+        }
+
+        let names: Vec<&str> = SHAPE_VIEWS.iter().map(|(n, _, _)| *n).collect();
+        for name in &names {
+            let out = fx.mirror().mirror_view(SH, name).expect(name);
+            assert!(out.result.reseeded(), "{name}: a first registration bootstraps");
+        }
+
+        let mut compared = 0;
+        for round in 0..3 {
+            if round > 0 {
+                rechurn_shapes(&mut fx.direct, 2 + round * 10, 40 + round * 10);
+            }
+            fx.drain(SH, &names);
+            for (name, _, extra) in SHAPE_VIEWS {
+                compared += fx.differential(SH, &format!("SELECT * FROM {name}"));
+                compared += fx.differential(SH, extra);
+            }
+        }
+        assert!(
+            compared > 500,
+            "W={workers}: the shape differential compared only {compared} rows"
+        );
+    }
+}
+
+/// Nullable payloads of every width, and the reads that single them out.
+///
+/// A `BLOB` payload joins them only through the binary `create_table` API:
+/// `sql_type_to_typecode` produces `TypeCode::Blob` for no SQL type, so
+/// `b BLOB` in a `CREATE TABLE` is rejected outright.
+#[test]
+fn nullable_payloads_of_every_width_survive_the_copy() {
+    let mut fx = Fixture::start();
+    fx.direct.create_schema("nl").unwrap();
+    sql(
+        &mut fx.direct,
+        "nl",
+        "CREATE TABLE n (id BIGINT NOT NULL PRIMARY KEY, i BIGINT, s TEXT, d DOUBLE PRECISION, r REAL)",
+    );
+    // Every column null on one row, none on the next.
+    let rows: Vec<String> = (1..=120)
+        .map(|i| {
+            if i % 3 == 0 {
+                format!("({i}, NULL, NULL, NULL, NULL)")
+            } else {
+                format!("({i}, {}, 'text-{i:0>12}', {i}.25, {i}.5)", i * 3)
+            }
+        })
+        .collect();
+    sql(
+        &mut fx.direct,
+        "nl",
+        &format!("INSERT INTO n VALUES {}", rows.join(",")),
     );
 
-    // A mirrored view cannot be retargeted, so no copy is ever left behind one.
-    fx.mirror().mirror_view("s", "v_keyed").expect("mirror v_keyed");
-    let e = gnitz_sql::execute(
-        fx.mirror(),
+    // The BLOB table: created and seeded through the binary API, then read and
+    // retracted through SQL like any other.
+    let cols = vec![
+        gnitz_wire::ColumnDef::new("id", gnitz_wire::TypeCode::I64, false),
+        gnitz_wire::ColumnDef::new("b", gnitz_wire::TypeCode::Blob, true),
+    ];
+    fx.direct
+        .create_table(
+            "nl",
+            "blb",
+            &Schema { columns: cols, pk_cols: vec![0] },
+            &[],
+            gnitz_wire::TableProps::default(),
+            &[],
+        )
+        .expect("a BLOB column is admissible through the binary API");
+    let rel = fx.direct.resolve_relation("nl", "blb").unwrap();
+    let (blb_tid, blb_schema) = (rel.tid, rel.schema.clone());
+    let mut batch = gnitz_core::ZSetBatch::new(&blb_schema);
+    {
+        let mut app = gnitz_core::BatchAppender::new(&mut batch, &blb_schema);
+        for i in 1i64..=120 {
+            app.add_row(i as u128, 1);
+            if i % 4 == 0 {
+                app.null();
+            } else {
+                app.bytes_val(&vec![(i % 251) as u8; 1 + (i as usize % 17)]);
+            }
+        }
+    }
+    fx.direct
+        .push(blb_tid, &blb_schema, &batch, gnitz_wire::WireConflictMode::Update)
+        .expect("push blobs");
+
+    fed_view(&mut fx.direct, "nl", "v_null", "SELECT id, i, s, d, r FROM n");
+    fed_view(&mut fx.direct, "nl", "v_blob", "SELECT id, b FROM blb");
+    fx.mirror().mirror_view("nl", "v_null").expect("mirror v_null");
+    fx.mirror().mirror_view("nl", "v_blob").expect("mirror v_blob");
+
+    let views = ["v_null", "v_blob"];
+    let reads = [
+        "SELECT * FROM v_null",
+        "SELECT id, i FROM v_null WHERE i IS NULL",
+        "SELECT id, s FROM v_null WHERE s IS NULL",
+        "SELECT id, d, r FROM v_null WHERE d IS NOT NULL",
+        "SELECT * FROM v_blob",
+        "SELECT id, b FROM v_blob WHERE b IS NULL",
+    ];
+    fx.drain("nl", &views);
+    let mut compared = 0;
+    for q in reads {
+        compared += fx.differential("nl", q);
+    }
+
+    // A round that turns present values into nulls, and one that retracts rows.
+    sql(&mut fx.direct, "nl", "UPDATE n SET i = NULL, s = NULL WHERE id < 40");
+    sql(
+        &mut fx.direct,
+        "nl",
+        "UPDATE n SET d = NULL, r = NULL WHERE id >= 40 AND id < 70",
+    );
+    sql(&mut fx.direct, "nl", "DELETE FROM n WHERE id > 100");
+    sql(&mut fx.direct, "nl", "DELETE FROM blb WHERE id > 100");
+    fx.drain("nl", &views);
+    for q in reads {
+        compared += fx.differential("nl", q);
+    }
+    assert!(
+        compared > 200,
+        "the nullable differential compared only {compared} rows"
+    );
+}
+
+/// A four-column PK carrying negative and mixed-sign values — the OPK sign flip
+/// — read as a full scan, a point lookup and a range.
+#[test]
+fn a_compound_signed_pk_reads_the_same_locally() {
+    let mut fx = Fixture::start();
+    fx.direct.create_schema("pk").unwrap();
+    sql(
+        &mut fx.direct,
+        "pk",
+        "CREATE TABLE k (a BIGINT NOT NULL, b INTEGER NOT NULL, c SMALLINT NOT NULL, \
+                         d BIGINT NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (a, b, c, d))",
+    );
+    let rows: Vec<String> = (-40i64..=40)
+        .map(|i| format!("({i}, {}, {}, {}, {})", -i, i % 7, i * 2, i * 11))
+        .collect();
+    sql(
+        &mut fx.direct,
+        "pk",
+        &format!("INSERT INTO k VALUES {}", rows.join(",")),
+    );
+    fed_view(&mut fx.direct, "pk", "v_pk", "SELECT a, b, c, d, v FROM k");
+    fx.mirror().mirror_view("pk", "v_pk").expect("mirror v_pk");
+    fx.drain("pk", &["v_pk"]);
+
+    let mut compared = 0;
+    for q in [
+        "SELECT * FROM v_pk",
+        "SELECT a, b, c, d, v FROM v_pk WHERE a = -17 AND b = 17 AND c = -3 AND d = -34",
+        "SELECT a, v FROM v_pk WHERE a > -12 AND a < 12",
+    ] {
+        compared += fx.differential("pk", q);
+    }
+
+    sql(&mut fx.direct, "pk", "UPDATE k SET v = v - 1 WHERE a < 0");
+    sql(&mut fx.direct, "pk", "DELETE FROM k WHERE a > 30");
+    fx.drain("pk", &["v_pk"]);
+    compared += fx.differential("pk", "SELECT * FROM v_pk");
+    assert!(
+        compared > 100,
+        "the compound-PK differential compared only {compared} rows"
+    );
+}
+
+/// A bootstrap and a poll that each span many reply frames, over an
+/// all-fixed-width view — every frame's data block a pure region copy, with no
+/// heap to relocate — and over long TEXT, where every row points into the
+/// batch's string heap and each frame ships a heap compacted to its own rows. A
+/// loop that stopped at the first block loses rows silently.
+///
+/// The views are created over already-populated tables, so this also covers a
+/// first bootstrap whose rows all arrived through a `CREATE VIEW` backfill —
+/// rows the delta feed never carries.
+#[test]
+fn a_bootstrap_and_a_poll_span_many_frames() {
+    let mut fx = Fixture::start_with(WORKERS, &[("GNITZ_REPLY_FRAME_BUDGET", "16384")]);
+    fx.direct.create_schema("fr").unwrap();
+    sql(
+        &mut fx.direct,
+        "fr",
+        "CREATE TABLE w (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL, c BIGINT NOT NULL)",
+    );
+    sql(
+        &mut fx.direct,
+        "fr",
+        "CREATE TABLE d (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, body TEXT NOT NULL)",
+    );
+    // Rows per round. 200 bytes of heap per TEXT row, so a round of them is
+    // ~1 MB across four workers — ~16× the frame budget on each of them.
+    const WIDE: i64 = 20_000;
+    const TEXT: i64 = 5_000;
+    let fill = |client: &mut GnitzClient, round: i64| {
+        for lo in (round * WIDE + 1..=(round + 1) * WIDE).step_by(1_000) {
+            let rows: Vec<String> = (lo..lo + 1_000)
+                .map(|i| format!("({i}, {}, {}, {})", i * 2, i * 3, i * 5))
+                .collect();
+            sql(client, "fr", &format!("INSERT INTO w VALUES {}", rows.join(",")));
+        }
+        for lo in (round * TEXT + 1..=(round + 1) * TEXT).step_by(500) {
+            let rows: Vec<String> = (lo..lo + 500)
+                .map(|i| format!("({i}, {}, 'row-{i}-{}')", i % 7, "z".repeat(200)))
+                .collect();
+            sql(client, "fr", &format!("INSERT INTO d VALUES {}", rows.join(",")));
+        }
+    };
+    fill(&mut fx.direct, 0);
+    fed_view(&mut fx.direct, "fr", "v_wide", "SELECT id, a, b, c FROM w WHERE a >= 0");
+    fed_view(&mut fx.direct, "fr", "v_text", "SELECT id, k, body FROM d WHERE k >= 0");
+
+    let views = [("v_wide", WIDE), ("v_text", TEXT)];
+    for (view, _) in views {
+        fx.mirror().mirror_view("fr", view).expect(view);
+    }
+    for round in 1..=2 {
+        if round == 2 {
+            fill(&mut fx.direct, 1);
+        }
+        fx.drain("fr", &views.map(|(view, _)| view));
+        for (view, per_round) in views {
+            let n = fx.differential("fr", &format!("SELECT * FROM {view}"));
+            assert!(
+                n as i64 >= per_round * round,
+                "{view}: round {round} carried only {n} rows"
+            );
+        }
+    }
+}
+
+/// Two schemas in one handle, and forgetting a view out of one.
+///
+/// A record carries its own schema name and the store enters no schema of its
+/// own, so a retraction takes down exactly one view and leaves every other view
+/// of that schema readable. Mirrored again — same server id, same layout — the
+/// forgotten view bootstraps a fresh copy: the retraction removed the record and
+/// the directory, and nothing weaker catches a mistake there, since a view
+/// recreated upstream takes a *new* id.
+#[test]
+fn two_schemas_share_one_handle() {
+    let mut fx = Fixture::start();
+    seed_shapes(&mut fx.direct);
+    churn_shapes(&mut fx.direct, 1, 60);
+    churn(&mut fx.direct, 1, 60);
+    fed_view(&mut fx.direct, SH, "v_lin", "SELECT id, v, body FROM t WHERE v > 10");
+    fed_view(
+        &mut fx.direct,
+        SH,
+        "v_grp",
+        "SELECT tid, SUM(w) AS total FROM u GROUP BY tid",
+    );
+
+    let (keyed, _) = fx.mirror_both();
+    let lin = fx.mirror().mirror_view(SH, "v_lin").expect("mirror v_lin").view_id;
+    fx.mirror().mirror_view(SH, "v_grp").expect("mirror v_grp");
+    fx.quiesce();
+    fx.drain(SH, &["v_lin", "v_grp"]);
+    fx.differential("s", "SELECT * FROM v_keyed");
+    fx.differential(SH, "SELECT * FROM v_lin");
+    fx.differential(SH, "SELECT * FROM v_grp");
+
+    fx.mirror().forget_view(lin).expect("forget v_lin");
+    assert!(
+        fx.mirror().mirrors(keyed),
+        "forgetting one view must not disturb another schema's copy"
+    );
+    fx.drain(SH, &["v_grp"]);
+    fx.differential(SH, "SELECT * FROM v_grp");
+    fx.differential("s", "SELECT * FROM v_keyed");
+    fx.delegated(SH, "SELECT * FROM v_lin");
+
+    let again = fx.mirror().mirror_view(SH, "v_lin").expect("re-mirror v_lin");
+    assert_eq!(again.view_id, lin, "the same relation comes back under the same id");
+    assert!(again.result.reseeded(), "a forgotten copy bootstraps afresh");
+    fx.differential(SH, "SELECT * FROM v_lin");
+}
+
+/// A view dropped upstream fails its own poll forever, and nothing else stops.
+///
+/// Both halves come off the returned report — a `Failed` entry at the dropped
+/// view's id and an `Advanced` one at the survivor's, with the round the
+/// survivor now answers at beside it. The dropped view's copy **keeps answering
+/// locally** until it is forgotten: the copy answers as of its last poll and that
+/// round is real.
+#[test]
+fn a_view_dropped_upstream_names_itself_and_stops_nothing_else() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 60);
+    let (keyed, repl_id) = fx.mirror_both();
+    fx.quiesce();
+    let before_repl = fx.local("SELECT * FROM v_repl");
+    let before_keyed = fx.mirror().cursor_of(keyed).expect("a cursor");
+
+    sql(&mut fx.direct, "s", "DROP VIEW v_repl");
+    churn(&mut fx.direct, 61, 120);
+    let report = fx.drain("s", &["v_keyed"]);
+    let dead = report
+        .iter()
+        .find(|o| o.view_id == repl_id)
+        .expect("the dropped view is reported under its own id");
+    assert!(
+        matches!(&dead.result, PollResult::Failed(ClientError::Refused(f)) if f.status == WireStatus::NotFound),
+        "the dropped view fails as not found: {:?}",
+        dead.result,
+    );
+
+    let alive = report
+        .iter()
+        .find(|o| o.view_id == keyed)
+        .expect("every view is attempted");
+    assert!(matches!(alive.result, PollResult::Advanced));
+    assert!(
+        alive.cursor.is_some_and(|c| c.tick > before_keyed.tick),
+        "the survivor advanced, and the report says to which round",
+    );
+    assert_eq!(
+        alive.cursor,
+        fx.mirror().cursor_of(keyed),
+        "the reported round is the one the copy answers at",
+    );
+    fx.differential("s", "SELECT * FROM v_keyed");
+
+    let still = fx.local("SELECT * FROM v_repl");
+    assert_eq!(
+        canonical(&before_repl.1),
+        canonical(&still.1),
+        "the dropped view's copy answers its last round until it is forgotten",
+    );
+
+    fx.mirror().forget_view(repl_id).expect("forget the dead registration");
+    let report = fx
+        .mirror()
+        .poll_mirror()
+        .expect("the poll recovers once the dead view is gone");
+    assert!(
+        matches!(&report[..], [o] if o.view_id == keyed && matches!(o.result, PollResult::Advanced)),
+        "only the survivor is reported, and it advances: {report:?}",
+    );
+}
+
+/// A view recreated upstream under the same name takes a fresh id, and the poll
+/// follows it there — re-resolving, retracting the old registration, registering
+/// and reseeding the new one — without the host re-registering. A recovery that
+/// bootstrapped in place would read a relation that no longer exists.
+///
+/// Both arms that reach it: a poll whose cursor names an id the server no longer
+/// knows, and a cursor-less poll after a reconnect. Each recreation changes the
+/// column set too — the reachable form of a schema change under a live mirror,
+/// since `ALTER TABLE` is refused while a dependent view exists.
+#[test]
+fn a_recreated_view_is_followed_to_its_new_id() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 60);
+    let (mut old, repl) = fx.mirror_both();
+    fx.quiesce();
+
+    let rounds: [(i64, &[&str], bool); 2] = [(1, &["a", "b", "v"], false), (2, &["a", "b", "v", "f", "body"], true)];
+    for (round, cols, reconnect) in rounds {
+        sql(&mut fx.direct, "s", "DROP VIEW v_keyed");
+        fed_view(
+            &mut fx.direct,
+            "s",
+            "v_keyed",
+            &format!("SELECT {} FROM t WHERE v >= 0", cols.join(", ")),
+        );
+        churn(&mut fx.direct, 1 + round * 60, 60 + round * 60);
+        fx.tick("s", &["v_keyed"]);
+        if reconnect {
+            fx.reconnect_mirror();
+        }
+
+        let report = fx.mirror().poll_mirror().expect("the poll follows the view");
+        let new = report
+            .iter()
+            .find(|o| o.view_id != old && o.view_id != repl)
+            .unwrap_or_else(|| panic!("round {round}: the recreated view is reported at a fresh id: {report:?}"));
+        assert!(new.result.reseeded(), "round {round}: and it reseeded");
+        let new = new.view_id;
+        assert!(
+            !fx.mirror().mirrored_ids().contains(&old),
+            "round {round}: the stale id is retracted, not kept beside the new one",
+        );
+        assert!(fx.mirror().mirrors(new));
+        assert_eq!(
+            fx.local("SELECT * FROM v_keyed").0.columns.len(),
+            cols.len(),
+            "round {round}: the copy reads under the new column set",
+        );
+        fx.quiesce();
+        fx.differential("s", "SELECT * FROM v_keyed");
+        fx.differential("s", "SELECT a, v FROM v_keyed WHERE a > 20 AND a < 60");
+        old = new;
+    }
+}
+
+/// A reconnect keeps every registration, is refused inside a transaction, and
+/// **closes the read gate** until the next poll, which reseeds every view.
+///
+/// The park hook is a client field `reconnect` carries into the rebuilt client.
+#[test]
+fn a_reconnect_keeps_the_registrations_and_closes_the_read_gate() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 60);
+    let (keyed, repl) = fx.mirror_both();
+    fx.quiesce();
+
+    let target = fx.server.sock_path().to_string();
+    fx.mirror().txn_begin().expect("begin");
+    assert!(
+        fx.mirror().reconnect(&target).is_err(),
+        "a reconnect inside a transaction is refused",
+    );
+    fx.mirror().txn_rollback().expect("rollback");
+
+    fx.reconnect_mirror();
+    let ids: std::collections::BTreeSet<u64> = fx.mirror().mirrored_ids().into_iter().collect();
+    assert_eq!(ids, [keyed, repl].into(), "the poll's work list survives a reconnect");
+    for tid in [keyed, repl] {
+        assert!(
+            !fx.mirror().mirrors(tid),
+            "every cursor is dropped, so the gate is shut"
+        );
+    }
+    fx.delegated("s", "SELECT * FROM v_keyed");
+
+    let report = fx.mirror().poll_mirror().expect("the poll after a reconnect");
+    assert_eq!(report.len(), 2);
+    assert!(
+        report.iter().all(|o| o.result.reseeded()),
+        "every view reseeds, and the report says so",
+    );
+    fx.quiesce();
+    fx.differential("s", "SELECT * FROM v_keyed");
+    fx.differential("s", "SELECT * FROM v_repl");
+}
+
+/// An expired cursor — one the retention sweep has rolled past — is recovered
+/// inside the poll.
+///
+/// The server refuses it with its own status; the handle discards the copy and
+/// re-reads it whole, and the host sees a `Reseeded` rather than an error whose
+/// advice it has no way to act on.
+#[test]
+fn an_expired_cursor_reseeds_inside_the_poll() {
+    // A delta store spills once its RAM tier crosses this ceiling; shrinking it
+    // is how the capacity sweep is reached on modest data.
+    let mut fx = Fixture::start_with(
+        WORKERS,
+        &[("GNITZ_RAM_TIER_BYTES", "1024"), ("GNITZ_CHECKPOINT_BYTES", "32768")],
+    );
+    sql(
+        &mut fx.direct,
         "s",
-        "ALTER VIEW v_keyed AS SELECT a, b, v FROM t WHERE v > 1",
-    )
-    .expect_err("a fed view cannot be retargeted");
-    assert!(e.to_string().contains("delta feed"), "{e}");
+        "CREATE VIEW v_tiny WITH (delta = '1 KB') AS SELECT a, b, v, body FROM t WHERE v >= 0",
+    );
+    churn(&mut fx.direct, 1, 60);
+    let tid = fx.mirror().mirror_view("s", "v_tiny").expect("mirror v_tiny").view_id;
+    fx.drain("s", &["v_tiny"]);
+
+    // Push the workers' retention floor past the copy's cursor, without polling.
+    // Wide rows and many rounds, so what the sweep drops is measured in hundreds
+    // of kilobytes against a one-kilobyte budget.
+    let body = "x".repeat(200);
+    for k in 0..20 {
+        let lo = 1_000 + k * 200;
+        let rows: Vec<String> = (lo..lo + 200)
+            .map(|i| format!("({i}, {}, {i}, 0.5, '{body}')", i % 7))
+            .collect();
+        sql(&mut fx.direct, "s", &format!("INSERT INTO t VALUES {}", rows.join(",")));
+    }
+
+    let report = fx.drain("s", &["v_tiny"]);
+    assert!(
+        report.iter().any(|o| o.view_id == tid && o.result.reseeded()),
+        "an expired cursor is recovered by reseeding: {report:?}",
+    );
+    fx.drain("s", &["v_tiny"]);
+    fx.differential("s", "SELECT * FROM v_tiny");
+    fx.differential("s", "SELECT a, v FROM v_tiny WHERE a > 4000");
+}
+
+// ---------------------------------------------------------------------------
+// Upstream DDL
+// ---------------------------------------------------------------------------
+
+/// Every DDL bundle **through the mirroring client** that retires a view retires
+/// its copy, whatever verb built it — the VIEW_TAB batch the statement pushed is
+/// what says so, so no verb carries a teardown of its own.
+///
+/// The copy and the DDL path share one object, so without it a `SELECT` after a
+/// `DROP VIEW` on this same client answers rows off a view it just dropped.
+#[test]
+fn a_ddl_that_retires_a_view_retires_its_copy() {
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+    fed_view(&mut fx.direct, "s", "v_drop", "SELECT a, b, v FROM t WHERE v >= 0");
+    fed_view(&mut fx.direct, "s", "v_rep", "SELECT a, b, v FROM t WHERE b = 1");
+    fx.direct.create_schema("s2").expect("a second schema");
+    sql(
+        &mut fx.direct,
+        "s2",
+        "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+    );
+    sql(&mut fx.direct, "s2", "INSERT INTO u VALUES (1, 10), (2, 20), (3, 30)");
+    fed_view(&mut fx.direct, "s2", "v_u", "SELECT id, v FROM u WHERE v > 0");
+
+    let replace = format!("CREATE OR REPLACE VIEW v_rep WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE b = 2");
+    /// `(schema, view, the DDL that retires it)`.
+    type Case<'a> = (&'a str, &'a str, &'a dyn Fn(&mut GnitzClient));
+    let cases: [Case; 3] = [
+        ("s", "v_drop", &|m| sql(m, "s", "DROP VIEW v_drop")),
+        // The retired view's lone `-1` rides the same batch as the replacement's
+        // `+1`s, which take a fresh id.
+        ("s", "v_rep", &|m| sql(m, "s", &replace)),
+        // One `-1` per member view, all in one bundle.
+        ("s2", "v_u", &|m| m.drop_schema("s2").expect("drop the schema")),
+    ];
+    for (schema, view, retire) in cases {
+        let tid = fx.mirror().mirror_view(schema, view).expect(view).view_id;
+        fx.drain(schema, &[view]);
+        assert!(fx.mirror().mirrors(tid), "{view}: the copy answers before the DDL");
+        retire(fx.mirror());
+        assert!(!fx.mirror().mirrors(tid), "{view}: the copy stops answering");
+        assert!(
+            !fx.mirror().mirrored_ids().contains(&tid),
+            "{view}: and the registration goes with it",
+        );
+    }
+    fx.delegated("s", "SELECT * FROM v_rep");
 }
 
 /// A rename **through the mirroring client** renames the copy rather than
@@ -2115,7 +1584,6 @@ fn ddl_through_the_mirroring_client_retires_its_own_copy() {
 /// connection is the one that issued it.
 #[test]
 fn a_rename_through_the_mirroring_client_keeps_the_copy() {
-    let _g = serial();
     let mut fx = Fixture::start();
     churn(&mut fx.direct, 1, 40);
     let tid = fx.mirror().mirror_view("s", "v_keyed").expect("mirror").view_id;
@@ -2124,14 +1592,10 @@ fn a_rename_through_the_mirroring_client_keeps_the_copy() {
 
     sql(fx.mirror(), "s", "ALTER TABLE v_keyed RENAME TO v_moved");
 
-    assert!(
-        fx.mirror().mirrors(tid),
-        "the copy survives a rename this client issued",
-    );
     assert_eq!(
         fx.mirror().cursor_of(tid),
         Some(before),
-        "and keeps the feed position it had",
+        "the copy survives a rename this client issued, at the feed position it had",
     );
     fx.differential("s", "SELECT * FROM v_moved");
     // The old name is gone rather than answering off the copy.
@@ -2161,7 +1625,6 @@ fn a_rename_through_the_mirroring_client_keeps_the_copy() {
 /// different view created under it.
 #[test]
 fn a_rename_by_a_client_that_never_claimed_the_copy_retracts_the_record() {
-    let _g = serial();
     let mut fx = Fixture::start();
     churn(&mut fx.direct, 1, 40);
     let tid = fx.mirror().mirror_view("s", "v_keyed").expect("mirror").view_id;
@@ -2172,24 +1635,19 @@ fn a_rename_by_a_client_that_never_claimed_the_copy_retracts_the_record() {
         !fx.mirror().mirrored_ids().contains(&tid),
         "the new session claimed nothing",
     );
-    let dir = copy_dir(&fx.base_dir(), tid);
     assert!(
-        std::path::Path::new(&dir).exists(),
-        "but the store still holds the replayed copy",
+        has_copy(&fx.base_dir(), tid),
+        "but the store still holds the replayed copy"
     );
 
     sql(fx.mirror(), "s", "ALTER TABLE v_keyed RENAME TO v_moved");
     assert!(
-        !std::path::Path::new(&dir).exists(),
+        !has_copy(&fx.base_dir(), tid),
         "an unclaimed record is retracted with its directory, not left naming the old name",
     );
 
     // The freed name is now genuinely free: a new view under it mirrors clean.
-    sql(
-        &mut fx.direct,
-        "s",
-        &format!("CREATE VIEW v_keyed WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE b = 3"),
-    );
+    fed_view(&mut fx.direct, "s", "v_keyed", "SELECT a, b, v FROM t WHERE b = 3");
     let fresh = fx
         .mirror()
         .mirror_view("s", "v_keyed")
@@ -2198,60 +1656,6 @@ fn a_rename_by_a_client_that_never_claimed_the_copy_retracts_the_record() {
     assert_ne!(fresh, tid);
     fx.drain("s", &["v_keyed"]);
     fx.differential("s", "SELECT * FROM v_keyed");
-}
-
-/// Every DDL bundle that retires a view retires its copy, whatever verb built
-/// it — the VIEW_TAB batch the statement pushed is what says so, so no verb
-/// carries a teardown of its own.
-#[test]
-fn a_bundle_that_retires_a_view_retires_its_copy() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-    churn(&mut fx.direct, 1, 40);
-
-    // `CREATE OR REPLACE VIEW`: the retired view's lone `-1` rides the same
-    // batch as the replacement's `+1`s, which take a fresh id.
-    sql(
-        &mut fx.direct,
-        "s",
-        &format!("CREATE VIEW v_rep WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE b = 1"),
-    );
-    let replaced = fx.mirror().mirror_view("s", "v_rep").expect("mirror v_rep").view_id;
-    fx.drain("s", &["v_rep"]);
-    assert!(fx.mirror().mirrors(replaced));
-    sql(
-        fx.mirror(),
-        "s",
-        &format!("CREATE OR REPLACE VIEW v_rep WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE b = 2"),
-    );
-    assert!(
-        !fx.mirror().mirrors(replaced),
-        "the replaced view's copy must stop answering",
-    );
-    fx.differential("s", "SELECT * FROM v_rep");
-
-    // `DROP SCHEMA`: one `-1` per member view, all in one bundle.
-    fx.mirror().create_schema("s2").expect("a second schema");
-    sql(
-        &mut fx.direct,
-        "s2",
-        "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-    );
-    sql(&mut fx.direct, "s2", "INSERT INTO u VALUES (1, 10), (2, 20), (3, 30)");
-    sql(
-        &mut fx.direct,
-        "s2",
-        &format!("CREATE VIEW v_u WITH (delta = '{FEED}') AS SELECT id, v FROM u WHERE v > 0"),
-    );
-    let dropped = fx.mirror().mirror_view("s2", "v_u").expect("mirror v_u").view_id;
-    fx.drain("s2", &["v_u"]);
-    assert!(fx.mirror().mirrors(dropped));
-    fx.mirror().drop_schema("s2").expect("drop the schema");
-    assert!(
-        !fx.mirror().mirrors(dropped),
-        "a DROP SCHEMA must retire every copy it retired upstream",
-    );
-    assert!(!fx.mirror().mirrored_ids().contains(&dropped));
 }
 
 /// `DROP VIEW v_a; ALTER VIEW v_b RENAME TO v_a` upstream, with both mirrored.
@@ -2264,128 +1668,40 @@ fn a_bundle_that_retires_a_view_retires_its_copy() {
 /// differential rather than a shape assertion.
 #[test]
 fn a_drop_and_a_rename_into_the_freed_name_report_once_each() {
-    let _g = serial();
     let mut fx = Fixture::start();
     churn(&mut fx.direct, 1, 60);
     for (name, pred) in [("v_a", "b = 1"), ("v_b", "b = 2")] {
-        sql(
+        fed_view(
             &mut fx.direct,
             "s",
-            &format!("CREATE VIEW {name} WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE {pred}"),
+            name,
+            &format!("SELECT a, b, v FROM t WHERE {pred}"),
         );
     }
     let a = fx.mirror().mirror_view("s", "v_a").expect("mirror v_a").view_id;
     let b = fx.mirror().mirror_view("s", "v_b").expect("mirror v_b").view_id;
     fx.drain("s", &["v_a", "v_b"]);
-    let b_dir = copy_dir(&fx.base_dir(), b);
 
     // Rounds both copies are behind on, so phase one really does hold `B`'s
     // reply when `A`'s poll comes back refused.
     churn(&mut fx.direct, 61, 120);
     sql(&mut fx.direct, "s", "DROP VIEW v_a");
     sql(&mut fx.direct, "s", "ALTER TABLE v_b RENAME TO v_a");
-    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_a");
-
-    let report = fx
-        .mirror()
-        .poll_mirror()
-        .expect("a recovered view is not the call's failure");
-    assert_eq!(
-        report.len(),
-        1,
+    let report = fx.drain("s", &["v_a"]);
+    assert!(
+        matches!(&report[..], [o] if o.view_id == b),
         "one entry per mirrored view, at the id it ended up under: {report:?}",
     );
-    assert_eq!(report[0].view_id, b, "the survivor is reported under its own id");
     assert!(
         !fx.mirror().mirrored_ids().contains(&a),
         "the dropped view's registration moved rather than staying beside it",
     );
     assert!(
-        std::path::Path::new(&b_dir).exists(),
+        has_copy(&fx.base_dir(), b),
         "the survivor's copy must not be erased by the other view's recovery",
     );
     fx.drain("s", &["v_a"]);
     fx.differential("s", "SELECT * FROM v_a");
-}
-
-/// A cursor the retention sweep has rolled past is recovered inside the poll.
-///
-/// The server refuses it with its own status; the handle discards the copy and
-/// re-reads it whole, and the host sees a `Reseeded` rather than an error whose
-/// advice it has no way to act on.
-#[test]
-fn an_expired_cursor_reseeds_inside_the_poll() {
-    let _g = serial();
-    // A delta store spills once its RAM tier crosses this ceiling; shrinking it
-    // is how the capacity sweep is reached on modest data.
-    let mut fx = Fixture::start_with(
-        WORKERS,
-        &[("GNITZ_RAM_TIER_BYTES", "1024"), ("GNITZ_CHECKPOINT_BYTES", "32768")],
-    );
-    sql(
-        &mut fx.direct,
-        "s",
-        "CREATE VIEW v_tiny WITH (delta = '1 KB') AS SELECT a, b, v, body FROM t WHERE v >= 0",
-    );
-    churn(&mut fx.direct, 1, 60);
-    let tid = fx.mirror().mirror_view("s", "v_tiny").expect("mirror v_tiny").view_id;
-    fx.drain("s", &["v_tiny"]);
-
-    // Push the workers' retention floor past the copy's cursor, without polling.
-    // Wide rows and many rounds, so what the sweep drops is measured in hundreds
-    // of kilobytes against a one-kilobyte budget.
-    let body = "x".repeat(200);
-    for k in 0..20 {
-        let lo = 1_000 + k * 200;
-        let rows: Vec<String> = (lo..lo + 200)
-            .map(|i| format!("({i}, {}, {i}, 0.5, '{body}')", i % 7))
-            .collect();
-        sql(&mut fx.direct, "s", &format!("INSERT INTO t VALUES {}", rows.join(",")));
-    }
-    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_tiny");
-
-    let report = fx.mirror().poll_mirror().expect("the handle owns this recovery");
-    assert!(
-        report.iter().any(|o| o.view_id == tid && o.result.reseeded()),
-        "an expired cursor is recovered by reseeding: {report:?}",
-    );
-    fx.drain("s", &["v_tiny"]);
-    fx.differential("s", "SELECT * FROM v_tiny");
-    fx.differential("s", "SELECT a, v FROM v_tiny WHERE a > 4000");
-}
-
-/// A close that changes nothing publishes no manifest; a publish renames a fresh
-/// inode in.
-#[test]
-fn a_close_that_changes_nothing_writes_nothing() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-    churn(&mut fx.direct, 1, 40);
-    let (keyed, repl) = fx.mirror_both();
-    fx.quiesce();
-    fx.mirror().checkpoint_mirror().expect("checkpoint");
-    let inodes = |base_dir: &str| [keyed, repl].map(|tid| manifest_inode(base_dir, tid));
-    let published = inodes(&fx.base_dir());
-
-    // `reopen` is an exit checkpoint plus a fresh open on the same directory.
-    fx.reopen();
-    assert_eq!(
-        inodes(&fx.base_dir()),
-        published,
-        "closing a store whose copies did not move must write nothing",
-    );
-
-    fx.mirror_both();
-    fx.quiesce();
-    fx.differential("s", "SELECT * FROM v_keyed");
-}
-
-/// The inode of the mirrored copy of `view_id`'s manifest.
-fn manifest_inode(base_dir: &str, view_id: u64) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(manifest_path(base_dir, view_id))
-        .expect("a published manifest")
-        .ino()
 }
 
 /// A view another client renamed keeps its copy when this client re-mirrors it
@@ -2393,19 +1709,14 @@ fn manifest_inode(base_dir: &str, view_id: u64) -> u64 {
 /// the record's name is refreshed, so the new view does not match it.
 #[test]
 fn a_view_renamed_upstream_survives_a_new_view_under_its_old_name() {
-    let _g = serial();
     let mut fx = Fixture::start();
     churn(&mut fx.direct, 1, 60);
     let renamed = fx.mirror().mirror_view("s", "v_keyed").expect("mirror v_keyed").view_id;
     fx.quiesce();
 
     sql(&mut fx.direct, "s", "ALTER TABLE v_keyed RENAME TO v_moved");
-    sql(
-        &mut fx.direct,
-        "s",
-        &format!("CREATE VIEW v_keyed WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE b = 3"),
-    );
-    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_keyed");
+    fed_view(&mut fx.direct, "s", "v_keyed", "SELECT a, b, v FROM t WHERE b = 3");
+    fx.tick("s", &["v_keyed"]);
 
     assert_eq!(
         fx.mirror()
@@ -2422,10 +1733,9 @@ fn a_view_renamed_upstream_survives_a_new_view_under_its_old_name() {
         .view_id;
     assert_ne!(fresh, renamed);
     assert!(
-        fx.mirror().mirrored_ids().contains(&renamed),
-        "the renamed view's registration must survive a new view under its old name",
+        fx.mirror().mirrors(renamed),
+        "the renamed view's copy must survive a new view under its old name",
     );
-    assert!(fx.mirror().mirrors(renamed), "and its copy still answers");
     assert!(fx.mirror().mirrors(fresh));
     fx.quiesce();
     fx.differential("s", "SELECT * FROM v_moved");
@@ -2437,25 +1747,24 @@ fn a_view_renamed_upstream_survives_a_new_view_under_its_old_name() {
 /// the registration at `v_b`'s id takes the rename-in-place arm.
 #[test]
 fn a_cross_rename_retracts_the_copy_that_lost_its_name() {
-    let _g = serial();
     let mut fx = Fixture::start();
     churn(&mut fx.direct, 1, 60);
     for (name, pred) in [("v_a", "b = 1"), ("v_b", "b = 2")] {
-        sql(
+        fed_view(
             &mut fx.direct,
             "s",
-            &format!("CREATE VIEW {name} WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE {pred}"),
+            name,
+            &format!("SELECT a, b, v FROM t WHERE {pred}"),
         );
     }
     let a = fx.mirror().mirror_view("s", "v_a").expect("mirror v_a").view_id;
     let b = fx.mirror().mirror_view("s", "v_b").expect("mirror v_b").view_id;
     fx.drain("s", &["v_a", "v_b"]);
-    let a_dir = copy_dir(&fx.base_dir(), a);
-    assert!(std::path::Path::new(&a_dir).exists(), "v_a's copy is on disk");
+    assert!(has_copy(&fx.base_dir(), a), "v_a's copy is on disk");
 
     sql(&mut fx.direct, "s", "ALTER TABLE v_a RENAME TO v_c");
     sql(&mut fx.direct, "s", "ALTER TABLE v_b RENAME TO v_a");
-    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_a");
+    fx.tick("s", &["v_a"]);
 
     let out = fx.mirror().mirror_view("s", "v_a").expect("re-mirror");
     assert_eq!(out.view_id, b, "the reused name now resolves to the other view");
@@ -2467,143 +1776,30 @@ fn a_cross_rename_retracts_the_copy_that_lost_its_name() {
         "the record at this id stands, so the rename is in place: {:?}",
         out.result
     );
-    assert!(!fx.mirror().mirrors(a), "the displaced copy no longer answers");
     assert!(
         !fx.mirror().mirrored_ids().contains(&a),
-        "and the client drops its binding with it",
+        "the client drops the displaced copy's binding",
     );
     assert!(
-        !std::path::Path::new(&a_dir).exists(),
-        "the displaced copy's directory is gone, not left behind",
+        !has_copy(&fx.base_dir(), a),
+        "and the displaced copy's directory is gone, not left behind",
     );
     fx.drain("s", &["v_a"]);
     fx.differential("s", "SELECT * FROM v_a");
 }
 
-/// A reconnect keeps every registration, is refused inside a transaction, and
-/// **closes the read gate** until the next poll.
-///
-/// The park hook is a client field `reconnect` carries into the rebuilt client.
-#[test]
-fn a_reconnect_keeps_the_registrations_and_closes_the_read_gate() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-    churn(&mut fx.direct, 1, 60);
-    let (keyed, repl) = fx.mirror_both();
-    fx.quiesce();
-
-    let target = fx.server.sock_path().to_string();
-    fx.mirror().txn_begin().expect("begin");
-    assert!(
-        fx.mirror().reconnect(&target).is_err(),
-        "a reconnect inside a transaction is refused",
-    );
-    fx.mirror().txn_rollback().expect("rollback");
-
-    fx.reconnect_mirror();
-
-    let mut ids = fx.mirror().mirrored_ids();
-    ids.sort_unstable();
-    let mut want = vec![keyed, repl];
-    want.sort_unstable();
-    assert_eq!(ids, want, "the poll's work list survives a reconnect");
-    for tid in [keyed, repl] {
-        assert!(
-            !fx.mirror().mirrors(tid),
-            "every cursor is dropped, so the gate is shut"
-        );
-        assert!(fx.mirror().cursor_of(tid).is_none());
-    }
-
-    let before_reqs = fx.mirror().requests_sent();
-    fx.differential("s", "SELECT * FROM v_keyed");
-    assert!(
-        fx.mirror().requests_sent() > before_reqs,
-        "a read between the reconnect and the next poll goes upstream",
-    );
-    let report = fx.mirror().poll_mirror().expect("the poll after a reconnect");
-    assert_eq!(report.len(), 2);
-    assert!(
-        report.iter().all(|o| o.result.reseeded()),
-        "every view reseeds, and the report says so",
-    );
-    fx.quiesce();
-    fx.differential("s", "SELECT * FROM v_keyed");
-    fx.differential("s", "SELECT * FROM v_repl");
-}
-
-/// A poll whose id no longer resolves upstream re-resolves by name rather than
-/// bootstrapping at the stale id.
-///
-/// The reachable form of the cursor-less arm: a reconnect drops every cursor,
-/// and the view was recreated upstream under a fresh id meanwhile. A bootstrap
-/// in place would read a relation that no longer exists.
-#[test]
-fn a_cursor_less_poll_re_resolves_rather_than_bootstrapping_in_place() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-    churn(&mut fx.direct, 1, 60);
-    let (old, _) = fx.mirror_both();
-    fx.quiesce();
-
-    sql(&mut fx.direct, "s", "DROP VIEW v_keyed");
-    sql(
-        &mut fx.direct,
-        "s",
-        &format!("CREATE VIEW v_keyed WITH (delta = '{FEED}') AS SELECT a, b, v, f, body FROM t WHERE v >= 0"),
-    );
-    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_keyed");
-
-    fx.reconnect_mirror();
-    let report = fx.mirror().poll_mirror().expect("the poll re-resolves by name");
-    let moved = report
-        .iter()
-        .find(|o| o.view_id != old && o.result.reseeded())
-        .expect("the recreated view must be mirrored under its fresh id");
-    assert!(
-        !fx.mirror().mirrored_ids().contains(&old),
-        "the stale id must be retracted, not kept beside the new one",
-    );
-    assert!(fx.mirror().mirrors(moved.view_id));
-    fx.differential("s", "SELECT * FROM v_keyed");
-}
-
-/// Mirroring a view costs one RESOLVE and one bootstrap read, and nothing else
-/// — no `SCHEMA_TAB` scan, first sighting of a schema or not.
-///
-/// The store mints no ids, so it needs no schema id, so no registration reaches
-/// upstream for one. The assertion is on both views, not just the second: a
-/// first-sighting scan would show up on the first alone.
-#[test]
-fn mirroring_a_view_costs_one_resolve_and_one_bootstrap() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-    churn(&mut fx.direct, 1, 20);
-    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_keyed");
-    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_repl");
-
-    let before = fx.mirror().requests_sent();
-    fx.mirror().mirror_view("s", "v_keyed").expect("the first view");
-    let first = fx.mirror().requests_sent() - before;
-    fx.mirror().mirror_view("s", "v_repl").expect("the second view");
-    let second = fx.mirror().requests_sent() - before - first;
-
-    assert_eq!(second, 2, "one RESOLVE and one bootstrap read");
-    assert_eq!(
-        first, 2,
-        "and the first sighting of a schema costs no more than the second"
-    );
-}
+// ---------------------------------------------------------------------------
+// Poison
+// ---------------------------------------------------------------------------
 
 /// A poisoned store refuses a mirrored read rather than answering it, an unheld
 /// relation still reads through the same client, and `close_mirror` is the way
 /// out.
 ///
-/// In a child because the seam is a per-process latch. It is also the first test
-/// the panic guard has: nothing but a panic reaches its arm.
+/// In a child because the seam is read once per process. It is the one test of
+/// the panic guard: nothing but a panic reaches its arm.
 #[test]
 fn a_poisoned_store_refuses_the_reads_it_would_answer() {
-    let _g = serial();
     if !cfg!(debug_assertions) {
         return; // the seam folds away in a release build
     }
@@ -2653,13 +1849,7 @@ fn poisoned_read_child() {
 
     // A relation the copy does not hold is unaffected: poison must not take
     // every read on the connection down with it.
-    let local = query(&mut mirror, "s", "SELECT * FROM t");
-    let remote = query(&mut direct, "s", "SELECT * FROM t");
-    assert_same_zset(
-        "an unheld relation still reads through a poisoned client",
-        (&local.0, &local.1),
-        (&remote.0, &remote.1),
-    );
+    differential(&mut mirror, &mut direct, "s", "SELECT * FROM t", Answer::Upstream);
 
     // A DDL that retires the mirrored view must not fail because the store
     // refuses the teardown: the client-side gate is what stops the copy
@@ -2676,8 +1866,6 @@ fn poisoned_read_child() {
         "a poisoned store must publish nothing on the way out",
     );
     assert!(mirror.mirror_poisoned().is_none(), "the poison went with the store");
-    let second = mirroring_client(&sock, &dir);
-    drop(second);
     mirror
         .attach_mirror(Mirror::open(&dir).expect("the directory came back"))
         .expect("a later attach on the same connection is legal");
@@ -2693,7 +1881,7 @@ fn poisoned_read_child() {
 /// A seeded, churned server and an empty mirror directory — the setup every
 /// parent of a child test needs before it can hand the pair over.
 fn child_fixture() -> (ServerHandle, tempfile::TempDir) {
-    let server = start_server();
+    let server = ServerHandle::start_n(WORKERS);
     let dir = tempfile::tempdir().unwrap();
     let mut direct = GnitzClient::connect(server.sock_path()).unwrap();
     seed(&mut direct);
@@ -2724,19 +1912,4 @@ fn child_target() -> Option<(String, String)> {
         std::env::var("GNITZ_MIRROR_SOCK").ok()?,
         std::env::var("GNITZ_MIRROR_DIR").ok()?,
     ))
-}
-
-/// Runs only in the child `a_second_handle_on_one_directory_is_refused` spawns.
-/// A bare `Mirror::open` — it takes the same `flock` the parent holds, and needs
-/// no server, so it takes only the directory a parent hands over.
-#[test]
-fn second_process_open_child() {
-    let Ok(dir) = std::env::var("GNITZ_MIRROR_DIR") else {
-        return;
-    };
-    match Mirror::open(&dir) {
-        Ok(_) => println!("second open unexpectedly succeeded"),
-        Err(e) => println!("{e}"),
-    }
-    println!("{CHILD_OK}");
 }
