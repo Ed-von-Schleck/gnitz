@@ -1,49 +1,45 @@
-//! Shared `#[cfg(test)]` scaffolding: the socketpair loopback and the raw
+//! Shared `#[cfg(test)]` scaffolding: the socketpair loopback and the
 //! framing helpers a scripted peer is written with. They sit at the crate root
 //! because the suites that read them are spread over three directories — a
 //! `tests` module is private to its parent, so none of them can host the rest.
 
 use gnitz_expr::SchemaFacts;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 
 use crate::protocol::transport::ClientTransport;
 use crate::Session;
 
-/// Both ends of a connected Unix socketpair — the loopback every framing test
-/// runs over.
-pub(crate) fn make_socketpair() -> (OwnedFd, OwnedFd) {
-    use std::os::fd::FromRawFd;
-    let mut fds = [0i32; 2];
-    // SAFETY: socketpair fills two fresh fds we take sole ownership of.
-    unsafe {
-        assert_eq!(
-            libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()),
-            0
-        );
-        (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
-    }
-}
-
-/// [`make_socketpair`] as a transport pair; dropping them closes the fds.
-pub(crate) fn make_transport_pair() -> (ClientTransport, ClientTransport) {
-    let (a, b) = make_socketpair();
-    (ClientTransport::from_unix_fd(a), ClientTransport::from_unix_fd(b))
-}
-
-/// A scripted peer: the raw far end of a socketpair a [`Session`] runs over.
-pub(crate) struct Peer(pub(crate) OwnedFd);
+/// A scripted peer: the blocking far end of the socketpair a transport runs over.
+pub(crate) struct Peer(pub(crate) UnixStream);
 
 impl Peer {
     /// Write one length-prefixed frame.
     pub(crate) fn send(&self, payload: &[u8]) {
-        raw_send(&self.0, &framed(payload));
+        write_frame(&self.0, payload);
+    }
+
+    /// Write `bytes` verbatim, however many frames or fragments they hold.
+    pub(crate) fn send_bytes(&self, bytes: &[u8]) {
+        (&self.0).write_all(bytes).unwrap();
+    }
+
+    /// Read one length-prefixed frame.
+    pub(crate) fn recv(&self) -> Vec<u8> {
+        read_frame(&self.0)
     }
 }
 
-/// A session over one end of a socketpair, and the peer on the other.
+/// A transport over one end of a Unix socketpair, and the peer on the other.
+pub(crate) fn transport_pair() -> (ClientTransport, Peer) {
+    let (a, b) = UnixStream::pair().unwrap();
+    (ClientTransport::unix(a).unwrap(), Peer(b))
+}
+
+/// [`transport_pair`] with a session over the transport.
 pub(crate) fn session_pair() -> (Session, Peer) {
-    let (a, b) = make_socketpair();
-    (Session::over(ClientTransport::from_unix_fd(a)), Peer(b))
+    let (t, peer) = transport_pair();
+    (Session::over(t), peer)
 }
 
 /// A control-only reply frame carrying `lsn` in `arg0` — the terminal a
@@ -64,48 +60,26 @@ pub(crate) fn framed(payload: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Raw `send(2)` of all of `bytes` on `fd`: what a scripted peer writes.
-pub(crate) fn raw_send(fd: &OwnedFd, bytes: &[u8]) {
-    let mut off = 0;
-    while off < bytes.len() {
-        // SAFETY: valid fd and buffer.
-        let n = unsafe {
-            libc::send(
-                fd.as_raw_fd(),
-                bytes[off..].as_ptr() as *const libc::c_void,
-                bytes.len() - off,
-                0,
-            )
-        };
-        assert!(n > 0, "send failed: {}", std::io::Error::last_os_error());
-        off += n as usize;
+/// The I/O error kind `r` failed with, if it failed with one.
+pub(crate) fn io_kind<T>(r: &Result<T, crate::protocol::error::ProtocolError>) -> Option<std::io::ErrorKind> {
+    match r {
+        Err(crate::protocol::error::ProtocolError::IoError(e)) => Some(e.kind()),
+        _ => None,
     }
 }
 
-/// Raw `recv(2)` of exactly `buf.len()` bytes on `fd`.
-pub(crate) fn raw_read_exact(fd: &OwnedFd, buf: &mut [u8]) {
-    let mut off = 0;
-    while off < buf.len() {
-        // SAFETY: valid fd and buffer.
-        let n = unsafe {
-            libc::recv(
-                fd.as_raw_fd(),
-                buf[off..].as_mut_ptr() as *mut libc::c_void,
-                buf.len() - off,
-                0,
-            )
-        };
-        assert!(n > 0, "recv failed: {}", std::io::Error::last_os_error());
-        off += n as usize;
-    }
+/// Write one length-prefixed frame to a blocking stream.
+pub(crate) fn write_frame(mut w: impl Write, payload: &[u8]) {
+    w.write_all(&framed(payload)).unwrap();
+    w.flush().unwrap();
 }
 
-/// One length-prefixed frame off `fd`, as a scripted peer reads a request.
-pub(crate) fn raw_read_frame(fd: &OwnedFd) -> Vec<u8> {
-    let mut hdr = [0u8; 4];
-    raw_read_exact(fd, &mut hdr);
+/// Read one length-prefixed frame off a blocking stream.
+pub(crate) fn read_frame(mut r: impl Read) -> Vec<u8> {
+    let mut hdr = [0u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES];
+    r.read_exact(&mut hdr).unwrap();
     let mut payload = vec![0u8; u32::from_le_bytes(hdr) as usize];
-    raw_read_exact(fd, &mut payload);
+    r.read_exact(&mut payload).unwrap();
     payload
 }
 

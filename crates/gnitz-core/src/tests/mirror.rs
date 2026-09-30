@@ -12,7 +12,7 @@ use super::*;
 use crate::connection::{Request, Session};
 use crate::protocol::message::encode_frame;
 use crate::protocol::transport::poll_fd;
-use crate::test_support::{raw_read_frame, session_pair, Peer};
+use crate::test_support::{session_pair, Peer};
 use gnitz_wire::control::peek_control_block;
 use gnitz_wire::control::ControlHeader;
 use gnitz_wire::RelDescriptorBlob;
@@ -160,7 +160,7 @@ impl Peer {
     /// Whether another request frame arrives within `d`. An expired timeout is
     /// `WouldBlock`, which is the "nothing came" answer rather than a failure.
     fn waits(&self, d: Duration) -> bool {
-        match poll_fd(self.0.as_raw_fd(), libc::POLLIN, Some(Instant::now() + d), true) {
+        match poll_fd(self.0.as_raw_fd(), libc::POLLIN, Some(Instant::now() + d)) {
             Ok(revents) => revents & libc::POLLIN != 0,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
             Err(e) => panic!("poll on the peer fd: {e}"),
@@ -170,14 +170,14 @@ impl Peer {
     /// The target id of the next request, which must already be on its way.
     fn expect_request(&self, what: &str) -> u64 {
         assert!(self.waits(PATIENCE), "{what}: the request never arrived");
-        let frame = raw_read_frame(&self.0);
+        let frame = self.recv();
         peek_control_block(&frame).expect("a control header").hdr.target_id
     }
 
     /// The view ids one DELTA_POLL frame names, in request order.
     fn expect_poll(&self, what: &str) -> Vec<u64> {
         assert!(self.waits(PATIENCE), "{what}: the poll never arrived");
-        let frame = raw_read_frame(&self.0);
+        let frame = self.recv();
         let ctrl = peek_control_block(&frame).expect("a control header");
         gnitz_wire::txn_frame::decode_delta_poll(&frame[ctrl.body])
             .expect("a delta poll")

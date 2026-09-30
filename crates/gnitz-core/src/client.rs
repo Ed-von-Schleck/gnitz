@@ -1338,7 +1338,7 @@ pub(crate) fn park(session: &Session, hook: &mut Option<ParkHook>) -> Result<Int
     let interest = session.interest();
     assert!(!interest.is_empty(), "park with nothing outstanding");
     loop {
-        match poll_fd(session.as_raw_fd(), interest.poll_events(), None, false) {
+        match poll_fd(session.as_raw_fd(), interest.poll_events(), None) {
             Ok(revents) => return Ok(Interest::from_revents(revents)),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                 if let Some(hook) = hook.as_mut() {

@@ -619,15 +619,11 @@ impl Session {
         if self.ended.is_some() {
             return done;
         }
-        if ready.read {
-            self.transport.begin_read();
-        }
         let mut result = self.read_frames(ready.read, sink.as_deref_mut(), &mut done);
         // Last, so the ciphertext a read queues goes out with this flush.
         if result.is_ok() && ready.write {
             if let Err(e) = self.transport.flush() {
                 // A peer gone after answering is still readable.
-                self.transport.begin_read();
                 let _ = self.read_frames(true, sink, &mut done);
                 result = Err(e);
             }
@@ -639,14 +635,14 @@ impl Session {
     }
 
     /// Feed every frame the transport can complete, reading the fd only when
-    /// `may_read`.
+    /// `may_read` and until a read proves it drained.
     fn read_frames(
         &mut self,
-        may_read: bool,
+        mut may_read: bool,
         mut sink: Option<&mut PollSink<'_>>,
         done: &mut Completions,
     ) -> Result<(), ProtocolError> {
-        while let Next::Frame(buf) = self.transport.next_frame(may_read)? {
+        while let Next::Frame(buf) = self.transport.next_frame(&mut may_read)? {
             // The sink runs after `feed` has returned, so an unwind out of the
             // caller's code finds the session consistent. No sink is an
             // abandoned poll — an interrupt, or an unwind past its driver — and

@@ -109,9 +109,11 @@ fn build_client_config(target: &Target) -> io::Result<Arc<ClientConfig>> {
                 .and_then(|it| it.collect::<Result<Vec<_>, _>>())
                 .map_err(|e| bad_file(path, e))?;
             let mut roots = RootCertStore::empty();
-            roots.add_parsable_certificates(certs);
+            for cert in certs {
+                roots.add(cert).map_err(|e| bad_file(path, e))?;
+            }
             if roots.is_empty() {
-                return Err(bad_file(path, "no usable certificates"));
+                return Err(bad_file(path, "no certificates"));
             }
             roots
         }

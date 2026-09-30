@@ -14,10 +14,6 @@
 //! The fd is `O_NONBLOCK` always; the wrappers emulate blocking under an
 //! `until` instant the caller passes, so one deadline covers a whole call
 //! however many parks it takes.
-//!
-//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
-//! they cover, so each stays that module's own `tests` child and reaches its
-//! private items.
 
 use std::collections::VecDeque;
 use std::io::{IoSlice, Write};
@@ -154,41 +150,28 @@ fn timed_out() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::WouldBlock, "socket operation timed out")
 }
 
-/// `poll(2)` on one fd for `events` until `until`; `None` waits untimed.
-/// Expiry surfaces as `WouldBlock`, as a deadlined blocking call would.
-pub(crate) fn poll_fd(
-    fd: RawFd,
-    events: libc::c_short,
-    until: Option<Instant>,
-    retry_eintr: bool,
-) -> std::io::Result<libc::c_short> {
-    loop {
-        let timeout_ms: libc::c_int = match until {
-            None => -1,
-            Some(t) => {
-                let left = t.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return Err(timed_out());
-                }
-                // Rounded up: `poll` takes whole milliseconds, and truncating
-                // would let it time out before the deadline it was given.
-                left.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as libc::c_int
+/// One `poll(2)` on one fd for `events` until `until`; `None` waits untimed.
+/// Expiry surfaces as `WouldBlock`, as a deadlined blocking call would; `EINTR`
+/// is returned, and since `until` is absolute a caller may simply call again.
+pub(crate) fn poll_fd(fd: RawFd, events: libc::c_short, until: Option<Instant>) -> std::io::Result<libc::c_short> {
+    let timeout_ms: libc::c_int = match until {
+        None => -1,
+        Some(t) => {
+            let left = t.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(timed_out());
             }
-        };
-        let mut pfd = libc::pollfd { fd, events, revents: 0 };
-        // SAFETY: one valid pollfd, count 1.
-        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if rc < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted && retry_eintr {
-                continue;
-            }
-            return Err(e);
+            // Rounded up: `poll` takes whole milliseconds, and truncating
+            // would let it time out before the deadline it was given.
+            left.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as libc::c_int
         }
-        if rc == 0 {
-            return Err(timed_out());
-        }
-        return Ok(pfd.revents);
+    };
+    let mut pfd = libc::pollfd { fd, events, revents: 0 };
+    // SAFETY: one valid pollfd, count 1.
+    match unsafe { libc::poll(&mut pfd, 1, timeout_ms) } {
+        rc if rc < 0 => Err(std::io::Error::last_os_error()),
+        0 => Err(timed_out()),
+        _ => Ok(pfd.revents),
     }
 }
 
@@ -212,21 +195,16 @@ impl ClientTransport {
     /// `QUERY` is `&`-separated, each at most once: `ca=PATH` (PEM roots, default
     /// webpki), `cert=PATH` and `key=PATH` (mTLS). `until` bounds a TCP connect.
     pub fn connect(target: &str, until: Option<Instant>) -> Result<Self, ProtocolError> {
-        if let Some(rest) = target.strip_prefix("tls://") {
-            return tls::connect_tls(rest, until);
+        match target.strip_prefix("tls://") {
+            Some(rest) => tls::connect_tls(rest, until),
+            None => ClientTransport::unix(UnixStream::connect(target)?),
         }
-        let stream = UnixStream::connect(target)?;
-        stream.set_nonblocking(true)?;
-        Ok(ClientTransport::new(Inner::Unix(stream)))
     }
 
-    /// Wrap an already-connected AF_UNIX stream socket (the transport closes
-    /// it on drop).
-    #[cfg(test)]
-    pub(crate) fn from_unix_fd(fd: OwnedFd) -> Self {
-        let stream = UnixStream::from(fd);
-        stream.set_nonblocking(true).expect("O_NONBLOCK on a fresh socket");
-        ClientTransport::new(Inner::Unix(stream))
+    /// Wrap a connected AF_UNIX stream socket, which the transport closes on drop.
+    pub(crate) fn unix(stream: UnixStream) -> Result<Self, ProtocolError> {
+        stream.set_nonblocking(true)?;
+        Ok(ClientTransport::new(Inner::Unix(stream)))
     }
 
     /// The stream socket every driver polls: the AF_UNIX socket, or the
@@ -245,9 +223,12 @@ impl ClientTransport {
     /// Park until the fd reports `events`, no longer than `until`: expiry
     /// surfaces as `WouldBlock`.
     fn park(&self, events: libc::c_short, until: Option<Instant>) -> Result<(), ProtocolError> {
-        poll_fd(self.as_raw_fd(), events, until, true)
-            .map(|_| ())
-            .map_err(ProtocolError::from)
+        loop {
+            match poll_fd(self.as_raw_fd(), events, until) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                r => return Ok(r.map(|_| ())?),
+            }
+        }
     }
 
     /// Queue an owned frame behind everything already queued. Nothing is
@@ -281,7 +262,7 @@ impl ClientTransport {
 
     /// `flush` inside the `POLLOUT` park-and-retry loop: returns once nothing
     /// is pending, or with `WouldBlock` at `until` with the cursor intact.
-    pub(crate) fn flush_blocking(&mut self, until: Option<Instant>) -> Result<(), ProtocolError> {
+    fn flush_blocking(&mut self, until: Option<Instant>) -> Result<(), ProtocolError> {
         while self.flush()? {
             self.park(libc::POLLOUT, until)?;
         }
@@ -311,10 +292,12 @@ impl ClientTransport {
         let _ = unsafe { libc::shutdown(self.as_raw_fd(), libc::SHUT_RDWR) };
     }
 
-    /// The next complete frame, reading the fd only when `may_read`. Returns
-    /// `Pending` once the source is proven drained (or would block) and no
-    /// frame can be completed from what is buffered.
-    pub(crate) fn next_frame(&mut self, may_read: bool) -> Result<Next, ProtocolError> {
+    /// The next complete frame, reading the fd only while `*may_read`. A read
+    /// that proves the source drained clears it, so a loop over one wakeup
+    /// stops reading there; each wakeup starts its pass with a fresh flag.
+    /// Returns `Pending` once nothing buffered completes a frame and no read
+    /// is allowed or the read would block.
+    pub(crate) fn next_frame(&mut self, may_read: &mut bool) -> Result<Next, ProtocolError> {
         let ClientTransport { inner, reader, .. } = self;
         reader.next_frame(inner, may_read)
     }
@@ -323,7 +306,7 @@ impl ClientTransport {
     /// `until`. The ceiling is enforced on the prefix, before any allocation.
     pub fn recv_framed(&mut self, until: Option<Instant>) -> Result<Vec<u8>, ProtocolError> {
         loop {
-            match self.next_frame(true)? {
+            match self.next_frame(&mut true)? {
                 Next::Frame(f) => return Ok(f),
                 Next::Pending => {
                     // A read can queue ciphertext nothing else will send: during the handshake,
@@ -334,18 +317,9 @@ impl ClientTransport {
                         libc::POLLIN
                     };
                     self.park(events, until)?;
-                    self.begin_read();
                 }
             }
         }
-    }
-
-    /// Forget the drained proof the last read left: after a park the source
-    /// may have refilled, so the next `next_frame` must read again rather
-    /// than report `Pending` off a stale observation. Every driver calls it
-    /// once per wakeup, before its reads.
-    pub(crate) fn begin_read(&mut self) {
-        self.reader.drained = false;
     }
 }
 
@@ -370,13 +344,6 @@ struct FrameReader {
     /// The initialised, not-yet-consumed bytes of `scratch`.
     carry: Range<usize>,
     deframer: Deframer<Box<[MaybeUninit<u8>]>>,
-    /// A read returned 0. Raised once nothing buffered can advance a frame,
-    /// so the frame delivered by the same read is not lost.
-    eof: bool,
-    /// The last read returned less than it asked for: the source was drained
-    /// at that instant. Cleared by `begin_read` at every wakeup, so the
-    /// attempt after a park reads again.
-    drained: bool,
 }
 
 impl FrameReader {
@@ -385,23 +352,10 @@ impl FrameReader {
             scratch: Box::new_uninit_slice(SCRATCH_BYTES),
             carry: 0..0,
             deframer: Deframer::default(),
-            eof: false,
-            drained: false,
         }
     }
 
-    fn eof_error(mid_frame: bool) -> ProtocolError {
-        ProtocolError::from(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            if mid_frame {
-                "connection closed mid-frame"
-            } else {
-                "connection closed"
-            },
-        ))
-    }
-
-    fn next_frame(&mut self, inner: &mut Inner, may_read: bool) -> Result<Next, ProtocolError> {
+    fn next_frame(&mut self, inner: &mut Inner, may_read: &mut bool) -> Result<Next, ProtocolError> {
         loop {
             // SAFETY: `carry` covers exactly the bytes a read initialised.
             let mut src = unsafe { self.scratch[self.carry.clone()].assume_init_ref() };
@@ -414,19 +368,21 @@ impl FrameReader {
                 // SAFETY: the deframer hands a payload out only once every byte is written.
                 return Ok(Next::Frame(unsafe { b.assume_init() }.into_vec()));
             }
-            if !may_read {
-                return Ok(Next::Pending);
-            }
-            if self.eof {
-                return Err(Self::eof_error(self.deframer.is_mid_frame()));
-            }
-            if self.drained {
+            if !*may_read {
                 return Ok(Next::Pending);
             }
             match self.read_more(inner)? {
-                ReadOutcome::Data { .. } => {}
+                ReadOutcome::Data { drained, .. } => *may_read = !drained,
                 ReadOutcome::WouldBlock => return Ok(Next::Pending),
-                ReadOutcome::Eof => self.eof = true,
+                // The read landed nothing, so nothing buffered can complete a frame.
+                ReadOutcome::Eof => {
+                    let msg = if self.deframer.is_mid_frame() {
+                        "connection closed mid-frame"
+                    } else {
+                        "connection closed"
+                    };
+                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, msg).into());
+                }
             }
         }
     }
@@ -435,7 +391,7 @@ impl FrameReader {
     /// whole scratch.
     fn read_more(&mut self, inner: &mut Inner) -> Result<ReadOutcome, ProtocolError> {
         debug_assert!(self.carry.is_empty(), "a read would land ahead of carried bytes");
-        let outcome = match self.deframer.payload_tail() {
+        Ok(match self.deframer.payload_tail() {
             Some(tail) => {
                 let outcome = inner.read_into(tail)?;
                 if let ReadOutcome::Data { n, .. } = outcome {
@@ -451,11 +407,7 @@ impl FrameReader {
                 }
                 outcome
             }
-        };
-        if let ReadOutcome::Data { drained, .. } = outcome {
-            self.drained = drained;
-        }
-        Ok(outcome)
+        })
     }
 }
 

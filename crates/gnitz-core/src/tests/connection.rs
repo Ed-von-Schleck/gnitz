@@ -5,19 +5,12 @@ mod spine_tests {
     use crate::connection::*;
     use crate::protocol::message::encode_frame;
     use crate::protocol::transport::poll_fd;
-    use crate::test_support::{framed, raw_read_frame, raw_send, reply_ctrl, session_pair as pair, Peer};
+    use crate::test_support::{framed, reply_ctrl, session_pair as pair};
     use crate::BatchAppender;
     use crate::GnitzClient;
     use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode, WireFault, WireStatus};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-
-    impl Peer {
-        /// Read one request frame the session wrote.
-        fn drain_request(&self) -> Vec<u8> {
-            raw_read_frame(&self.0)
-        }
-    }
 
     /// Submit a read of every row of `tid`, decoded under `schema`.
     fn submit_scan(s: &mut Session, tid: u64, schema: &Arc<Schema>) -> Result<SlotId, ClientError> {
@@ -107,7 +100,6 @@ mod spine_tests {
                 s.as_raw_fd(),
                 interest.poll_events(),
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
-                true,
             )
             .expect("poll");
             ready = Interest::from_revents(rev);
@@ -122,7 +114,7 @@ mod spine_tests {
         assert_eq!(s.interest(), Interest::BOTH);
         assert!(s.step(Interest::WRITE).is_empty());
         assert_eq!(s.interest(), Interest::READ);
-        peer.drain_request();
+        peer.recv();
 
         // Three frames, one per step: nothing completes until the terminal.
         peer.send(&reply_rows(7, &batch_a(&[1, 2]), 0, true));
@@ -149,7 +141,7 @@ mod spine_tests {
         // two-frame train for relation 2 included.
         let slot = s.submit(Request::ScanMulti(&[(1, &sa), (2, &sb)])).unwrap();
         s.step(Interest::WRITE);
-        let req = peer.drain_request();
+        let req = peer.recv();
         let ctrl = peek_control_block(&req).unwrap();
         let items = gnitz_wire::txn_frame::decode_scan_multi(&req[ctrl.body]).unwrap();
         let layouts: Vec<(u64, u64)> = items.iter().map(|i| (i.tid, i.reply_layout)).collect();
@@ -187,7 +179,7 @@ mod spine_tests {
         let sa = schema_a();
         let slot = submit_scan(&mut s, 7, &sa).unwrap();
         s.step(Interest::WRITE);
-        peer.drain_request();
+        peer.recv();
         peer.send(&encode_frame(
             reply_header(7, 0, false),
             &[],
@@ -209,7 +201,7 @@ mod spine_tests {
         let sa = schema_a();
         let slot = s.submit(Request::ScanMulti(&[(1, &sa), (2, &sa), (3, &sa)])).unwrap();
         s.step(Interest::WRITE);
-        peer.drain_request();
+        peer.recv();
         peer.send(&reply_rows(1, &batch_a(&[1]), 0, false));
         // The second train is replaced by one error frame and nothing follows.
         peer.send(&reply_status(WireStatus::Error, "relation 2 vanished", 0));
@@ -220,7 +212,7 @@ mod spine_tests {
         // The next request on the same connection completes normally.
         let slot = submit_scan(&mut s, 3, &sa).unwrap();
         s.step(Interest::WRITE);
-        peer.drain_request();
+        peer.recv();
         peer.send(&reply_rows(3, &batch_a(&[5]), 42, false));
         let Reply::Scan(r) = drive(&mut s, slot).unwrap() else {
             panic!("scan")
@@ -236,7 +228,7 @@ mod spine_tests {
         let sa = schema_a();
         let slot = s.submit(Request::ScanMulti(&[])).unwrap();
         s.step(Interest::WRITE);
-        peer.drain_request();
+        peer.recv();
         peer.send(&reply_status(WireStatus::Error, "SCAN_MULTI: empty item list", 0));
         let r = drive(&mut s, slot);
         assert!(
@@ -248,7 +240,7 @@ mod spine_tests {
 
         let slot = submit_scan(&mut s, 3, &sa).unwrap();
         s.step(Interest::WRITE);
-        peer.drain_request();
+        peer.recv();
         peer.send(&reply_rows(3, &batch_a(&[5]), 42, false));
         let Reply::Scan(r) = drive(&mut s, slot).unwrap() else {
             panic!("scan")
@@ -263,12 +255,12 @@ mod spine_tests {
         let s1 = submit_scan(&mut s, 1, &sa).unwrap();
         let s2 = submit_scan(&mut s, 2, &sa).unwrap();
         s.step(Interest::WRITE);
-        peer.drain_request();
-        peer.drain_request();
+        peer.recv();
+        peer.recv();
         let empty = ZSetBatch::new(&sa);
         let mut both = framed(&reply_rows(1, &empty, 11, false));
         both.extend(framed(&reply_rows(2, &empty, 22, false)));
-        raw_send(&peer.0, &both);
+        peer.send_bytes(&both);
         let done = s.step(Interest::READ);
         let ids: Vec<SlotId> = done.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec![s1, s2], "in request order");
@@ -285,7 +277,7 @@ mod spine_tests {
         let (mut s, peer) = pair();
         let slot = s.submit(Request::RawFrame(reply_ctrl(0, 0))).unwrap();
         s.step(Interest::WRITE);
-        peer.drain_request();
+        peer.recv();
         peer.send(&reply_status(WireStatus::TxnConflict, "conflict", 77));
         let r = drive(&mut s, slot);
         assert!(
@@ -338,11 +330,11 @@ mod spine_tests {
             })
             .unwrap();
         assert!(s.step(Interest::WRITE).is_empty());
-        peer.drain_request();
-        peer.drain_request();
+        peer.recv();
+        peer.recv();
         let mut both = framed(&reply_ctrl(0, 11));
         both.extend(framed(&reply_ctrl(6, 1)));
-        raw_send(&peer.0, &both);
+        peer.send_bytes(&both);
         let done = s.step(Interest::READ);
         assert_eq!(done.len(), 2);
         assert_eq!(done[0].0, a);
@@ -366,7 +358,7 @@ mod spine_tests {
         let (mut s, peer) = pair();
         let a = s.submit(Request::RawFrame(reply_ctrl(0, 0))).unwrap();
         assert!(s.step(Interest::WRITE).is_empty());
-        peer.drain_request();
+        peer.recv();
         peer.send(&reply_ctrl(0, 11));
         drop(peer);
         let b = submit_scan(&mut s, 5, &schema_a()).unwrap();
@@ -394,7 +386,6 @@ mod spine_tests {
             s.as_raw_fd(),
             Interest::READ.poll_events(),
             Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
-            true,
         )
         .expect("poll");
         assert!(Interest::from_revents(rev).read, "a hangup wakes a read park");
@@ -533,10 +524,10 @@ mod spine_tests {
 
         // The peer answers both requests; the second call must get the second.
         let empty = ZSetBatch::new(&sa);
-        peer.drain_request();
+        peer.recv();
         peer.send(&reply_rows(1, &empty, 100, false));
         let h = std::thread::spawn(move || {
-            peer.drain_request();
+            peer.recv();
             peer.send(&reply_rows(1, &empty, 200, false));
             peer
         });
@@ -552,7 +543,7 @@ mod spine_tests {
         let sa = schema_a();
         let want = sa.layout_digest();
         let h = std::thread::spawn(move || {
-            let req = peer.drain_request();
+            let req = peer.recv();
             let ctrl = peek_control_block(&req).unwrap();
             let items = gnitz_wire::txn_frame::decode_delta_poll(&req[ctrl.body]).unwrap();
             assert_eq!(items[0].reply_layout, want, "the reply layout rides the request");
