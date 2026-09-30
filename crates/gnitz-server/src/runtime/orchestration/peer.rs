@@ -14,7 +14,7 @@ use gnitz_store::storage::PooledBuf;
 /// Ceiling on a concatenation of client-bound frames (coalesced scan heads, corked
 /// replies): the copy paid to save per-frame sends. `fanout_coalesced_egress_bench`
 /// measures the trade.
-pub(crate) const COALESCE_MAX_BYTES: usize = 32 * 1024;
+const COALESCE_MAX_BYTES: usize = 32 * 1024;
 
 /// Transport-neutral handle to one client connection. Owned by the connection
 /// task; handlers borrow it to send replies. A `PeerGone` from any send or flush
@@ -73,12 +73,12 @@ impl Peer {
     }
 
     /// Append `frame`'s bytes. See [`Self::cork_with`].
-    pub fn cork(&self, frame: &[u8]) {
+    fn cork(&self, frame: &[u8]) {
         self.cork_with(|acc| acc.extend_from_slice(frame));
     }
 
     /// Bytes currently corked.
-    pub fn corked_len(&self) -> usize {
+    fn corked_len(&self) -> usize {
         self.egress.borrow().as_ref().map_or(0, |b| b.0.len())
     }
 

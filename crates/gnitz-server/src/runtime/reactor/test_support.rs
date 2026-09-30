@@ -12,7 +12,7 @@ pub(super) use crate::runtime::test_support::within;
 use crate::runtime::w2m::W2mWriter;
 
 /// A reactor with no W2M rings, for the tests that route no worker traffic.
-pub(crate) fn make_reactor() -> Reactor {
+pub(super) fn make_reactor() -> Reactor {
     make_reactor_with(Limits::TEST)
 }
 
@@ -161,7 +161,7 @@ pub(crate) fn read_nonblocking(s: &UnixStream, cap: usize) -> Option<Vec<u8>> {
 }
 
 /// Build a length-prefixed wire frame: LE payload length + payload.
-pub(super) fn framed(payload: &[u8]) -> Vec<u8> {
+pub(crate) fn framed(payload: &[u8]) -> Vec<u8> {
     [&gnitz_wire::frame_len_prefix(payload.len())[..], payload].concat()
 }
 

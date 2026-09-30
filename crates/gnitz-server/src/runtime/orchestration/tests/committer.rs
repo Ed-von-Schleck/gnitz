@@ -1,29 +1,15 @@
-//! The committer's two pure parts: how one batch is drained off the request
-//! channel, and how a unit's groups resolve into its clients' verdicts.
-//!
-//! The SAL layout, the checkpoint sequence and the barrier partition need a live
-//! dispatcher and worker ACKs, so they stay covered end to end.
+//! How one committer batch is drained off the request channel. The SAL layout and
+//! the checkpoint sequence need a live dispatcher and worker ACKs, so they are
+//! covered end to end.
 
 use super::*;
-use crate::runtime::reactor::make_reactor;
-use crate::runtime::reactor::Reactor;
-use crate::runtime::test_support::try_poll_once;
 use crate::test_support::{make_batch_raw, make_schema_u64_i64};
-use gnitz_wire::{WireConflictMode, WireStatus};
-
-fn fault(text: &str) -> WireFault {
-    WireFault {
-        status: WireStatus::Error,
-        text: text.to_string(),
-    }
-}
+use gnitz_wire::WireConflictMode;
 
 fn batch_of(rows: usize) -> Batch {
     make_batch_raw(&make_schema_u64_i64(), &vec![(0, 1, 0); rows])
 }
 
-/// A push of `rows` rows. Its client's receiver is dropped: nothing here reads a
-/// push's verdict, and a cancelled receiver leaves the sender usable.
 fn push_of(rows: usize) -> CommitRequest {
     let (done, _rx) = oneshot::channel();
     CommitRequest::Push(PendingPush {
@@ -56,155 +42,34 @@ fn barrier_of(kind: BarrierKind) -> CommitRequest {
     CommitRequest::Barrier { kind, done }
 }
 
-/// The cap is tested *before* the receive, so it bounds the batch at
-/// `MAX_PENDING_ROWS` plus one whole request rather than at `MAX_PENDING_ROWS` —
-/// the overshoot the constant's doc claims, here driven to nearly double.
+/// A batch drains what is queued until the row cap — tested before each receive,
+/// so the request that crosses it is admitted whole, and a transaction counts
+/// every family's rows — or until a barrier, wherever it lands.
 #[test]
-fn the_row_cap_admits_one_whole_request_past_itself() {
-    let rows = MAX_PENDING_ROWS - 1;
-    let (tx, mut rx) = chan::unbounded::<CommitRequest>();
-    for _ in 0..3 {
-        tx.send(push_of(rows));
-    }
-
-    let first = rx.try_recv().expect("three requests are queued");
-    let batch = drain_ready_batch(&mut rx, first);
-
-    assert_eq!(batch.pushes.len(), 2);
-    let drained: usize = batch.pushes.iter().map(|p| p.batch.len()).sum();
-    assert_eq!(drained, 2 * rows, "the second request is admitted whole");
-    assert!(drained > MAX_PENDING_ROWS);
-    assert!(rx.try_recv().is_some(), "the third push rides the next batch");
-}
-
-/// A transaction is one indivisible entry, but every family's rows count against
-/// the cap — the sum the classification used to spell twice.
-#[test]
-fn a_transactions_families_all_count_towards_the_row_cap() {
+fn a_batch_ends_at_the_row_cap_or_a_barrier() {
+    use BarrierKind::{Ddl, Shutdown};
+    // One family alone stays under the cap; two cross it.
     let half = MAX_PENDING_ROWS / 2 + 1;
-    let (tx, mut rx) = chan::unbounded::<CommitRequest>();
-    tx.send(txn_of(&[half, half]));
-    tx.send(push_of(1));
-
-    let first = rx.try_recv().expect("queued");
-    let batch = drain_ready_batch(&mut rx, first);
-
-    assert_eq!(batch.txns.len(), 1);
-    assert!(
-        batch.pushes.is_empty(),
-        "two families of {half} rows already cross the cap; counting one would not"
-    );
-    assert!(rx.try_recv().is_some(), "the push rides the next batch");
-}
-
-#[test]
-fn a_barrier_ends_the_batch_and_leaves_what_is_behind_it() {
-    let (tx, mut rx) = chan::unbounded::<CommitRequest>();
-    tx.send(push_of(1));
-    tx.send(barrier_of(BarrierKind::Ddl));
-    tx.send(push_of(1));
-
-    let first = rx.try_recv().expect("queued");
-    let batch = drain_ready_batch(&mut rx, first);
-
-    assert_eq!(batch.pushes.len(), 1, "the push ahead of the barrier rides this batch");
-    assert!(
-        matches!(batch.barriers[..], [(BarrierKind::Ddl, _)]),
-        "the barrier itself rides it, kind intact"
-    );
-    assert!(rx.try_recv().is_some(), "the push behind it does not");
-}
-
-/// The rule holds for a barrier that arrives *first* — the case the duplicated
-/// classification used to except, draining every push queued behind it.
-#[test]
-fn a_leading_barrier_ends_the_batch_alone() {
-    let (tx, mut rx) = chan::unbounded::<CommitRequest>();
-    tx.send(barrier_of(BarrierKind::Shutdown));
-    tx.send(push_of(1));
-
-    let first = rx.try_recv().expect("queued");
-    let batch = drain_ready_batch(&mut rx, first);
-
-    assert_eq!(batch.barriers.len(), 1);
-    assert!(batch.pushes.is_empty(), "a barrier ends the batch wherever it lands");
-    assert!(rx.try_recv().is_some(), "the push behind it rides the next batch");
-}
-
-fn group_of(reactor: &Reactor, tid: u64, write_err: Option<WireFault>) -> GroupInfo {
-    GroupInfo {
-        tid,
-        recoverable: true,
-        lease: reactor.lease_acks("commit"),
-        merged: Batch::empty_with_schema(&make_schema_u64_i64()),
-        write_err,
-    }
-}
-
-#[test]
-fn every_coalesced_client_of_a_push_unit_resolves_exactly_once() {
-    let reactor = make_reactor();
-    let (d0, mut rx0) = oneshot::channel();
-    let (d1, mut rx1) = oneshot::channel();
-    CommitUnit {
-        groups: vec![group_of(&reactor, 7, None)],
-        outcome: Outcome::Pushes(vec![d0, d1]),
-    }
-    .resolve(42);
-
-    for rx in [&mut rx0, &mut rx1] {
-        assert!(matches!(try_poll_once(&mut *rx), Some(Ok(42))));
-        // `send` consumes the sender and the poll took its value, so a second poll
-        // parks — one verdict per client, never two.
-        assert!(try_poll_once(&mut *rx).is_none());
-    }
-}
-
-#[test]
-fn a_push_units_group_error_reaches_every_client() {
-    let reactor = make_reactor();
-    let (d0, mut rx0) = oneshot::channel();
-    let (d1, mut rx1) = oneshot::channel();
-    CommitUnit {
-        groups: vec![group_of(&reactor, 7, Some(fault("SAL full")))],
-        outcome: Outcome::Pushes(vec![d0, d1]),
-    }
-    .resolve(42);
-
-    for rx in [&mut rx0, &mut rx1] {
-        match try_poll_once(&mut *rx) {
-            Some(Err(e)) => assert_eq!(e.text, "SAL full"),
-            _ => panic!("every coalesced client is owed the group's error"),
+    let cases = [
+        // (queued, (pushes, txns, barrier, left behind))
+        (vec![push_of(1), CommitRequest::Reclaim, push_of(1)], (2, 0, None, 0)),
+        (
+            vec![push_of(MAX_PENDING_ROWS - 1), push_of(2), push_of(1)],
+            (2, 0, None, 1),
+        ),
+        (vec![txn_of(&[half, half]), push_of(1)], (0, 1, None, 1)),
+        (vec![push_of(1), barrier_of(Ddl), push_of(1)], (1, 0, Some(Ddl), 1)),
+        (vec![barrier_of(Shutdown), push_of(1)], (0, 0, Some(Shutdown), 1)),
+    ];
+    for (i, (queued, want)) in cases.into_iter().enumerate() {
+        let (tx, mut rx) = chan::unbounded();
+        for r in queued {
+            tx.send(r);
         }
-    }
-}
-
-#[test]
-fn a_transaction_resolves_ok_only_when_every_family_committed() {
-    let reactor = make_reactor();
-
-    let (done, mut rx) = oneshot::channel();
-    CommitUnit {
-        groups: vec![group_of(&reactor, 1, None), group_of(&reactor, 2, None)],
-        outcome: Outcome::Txn(done),
-    }
-    .resolve(9);
-    assert!(matches!(try_poll_once(&mut rx), Some(Ok(9))));
-
-    // One failed family fails the bundle, and the first error wins — the group
-    // order, not the last one seen.
-    let (done, mut rx) = oneshot::channel();
-    CommitUnit {
-        groups: vec![
-            group_of(&reactor, 1, None),
-            group_of(&reactor, 2, Some(fault("second family"))),
-            group_of(&reactor, 3, Some(fault("third family"))),
-        ],
-        outcome: Outcome::Txn(done),
-    }
-    .resolve(9);
-    match try_poll_once(&mut rx) {
-        Some(Err(e)) => assert_eq!(e.text, "second family"),
-        _ => panic!("a transaction with a failed family resolves Err"),
+        let first = rx.try_recv().expect("queued");
+        let b = drain_ready_batch(&mut rx, first);
+        let left = std::iter::from_fn(|| rx.try_recv()).count();
+        let got = (b.pushes.len(), b.txns.len(), b.barrier.map(|(k, _)| k), left);
+        assert_eq!(got, want, "case {i}");
     }
 }

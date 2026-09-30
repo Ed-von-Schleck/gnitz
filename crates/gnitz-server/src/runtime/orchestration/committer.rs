@@ -59,8 +59,8 @@ pub enum CommitRequest {
 }
 
 /// One buffered atomic transaction awaiting commit: its families in frame order
-/// and one `done` resolving `Ok(zone_lsn)` for the whole bundle (or the first family
-/// error on an abort before the zone commits). Every family is `recoverable` — the executor
+/// and one `done` resolving `Ok(zone_lsn)` for the whole bundle, or the error that
+/// rolled it back. Every family is `recoverable` — the executor
 /// refuses a stream target — so a transaction always opens a zone.
 pub struct PendingTxn {
     pub families: Vec<TxnFamily>,
@@ -69,7 +69,7 @@ pub struct PendingTxn {
 
 /// Who issued a `CommitRequest::Barrier`, and therefore whether its batch runs a
 /// checkpoint sequence.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BarrierKind {
     /// DDL drain from `handle_ddl_txn`.
     Ddl,
@@ -97,7 +97,7 @@ pub struct PendingPush {
 /// The committer task loop. Returns when the reactor shutdown drops this task.
 ///
 /// For checkpoint flush rounds the lock is held across the ENTIRE round
-/// (write + ACK wait + reset; see `flush_round`), but released across the
+/// (write + ACK wait + reset; see `MasterDispatcher::flush`), but released across the
 /// sequence's drain step so the tick loop can acquire it per tick.
 pub async fn run(mut rx: chan::Receiver<CommitRequest>, shared: Rc<Shared>) {
     loop {
@@ -115,12 +115,12 @@ pub async fn run(mut rx: chan::Receiver<CommitRequest>, shared: Rc<Shared>) {
             run_checkpoint_sequence(&shared).await;
         }
 
-        let PendingBatch { pushes, txns, barriers } = batch;
+        let PendingBatch { pushes, txns, barrier } = batch;
         if !pushes.is_empty() || !txns.is_empty() {
             commit_pushes(&shared, pushes, txns).await;
         }
 
-        for (_, b) in barriers {
+        if let Some((_, b)) = barrier {
             b.send(());
         }
     }
@@ -128,18 +128,18 @@ pub async fn run(mut rx: chan::Receiver<CommitRequest>, shared: Rc<Shared>) {
 
 /// Whether this batch warrants the full checkpoint sequence.
 fn checkpoint_warranted(shared: &Shared, batch: &PendingBatch) -> bool {
-    batch.barriers.iter().any(|(k, _)| matches!(k, BarrierKind::Shutdown)) || shared.disp().sal().needs_checkpoint()
+    matches!(batch.barrier, Some((BarrierKind::Shutdown, _))) || shared.disp().sal().needs_checkpoint()
 }
 
-/// One committer batch: the single pushes to group-commit, the atomic
-/// transactions to commit, plus the barrier senders to signal once the batch
-/// (and any checkpoint sequence) completes.
+/// One committer batch: the single pushes to group-commit and the atomic
+/// transactions to commit.
+#[derive(Default)]
 struct PendingBatch {
     pushes: Vec<PendingPush>,
     txns: Vec<PendingTxn>,
-    /// The barriers to signal once the batch — and any checkpoint sequence —
-    /// has committed.
-    barriers: Vec<(BarrierKind, oneshot::Sender<()>)>,
+    /// The barrier that ended this batch, if one did: signalled once the batch —
+    /// and any checkpoint sequence — has committed.
+    barrier: Option<(BarrierKind, oneshot::Sender<()>)>,
 }
 
 /// Sort `first` into the batch, then keep draining requests already queued
@@ -151,11 +151,7 @@ struct PendingBatch {
 /// the barrier wait on a commit it has no ordering interest in. It rides the
 /// next `rx.recv()`, which this loop reaches immediately.
 fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitRequest) -> PendingBatch {
-    let mut b = PendingBatch {
-        pushes: Vec::new(),
-        txns: Vec::new(),
-        barriers: Vec::new(),
-    };
+    let mut b = PendingBatch::default();
     let mut row_count = 0usize;
     let mut next = Some(first);
     while let Some(req) = next {
@@ -171,7 +167,7 @@ fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitReques
                 b.txns.push(t);
             }
             CommitRequest::Barrier { kind, done } => {
-                b.barriers.push((kind, done));
+                b.barrier = Some((kind, done));
                 break;
             }
             CommitRequest::Reclaim => {}
@@ -181,19 +177,12 @@ fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitReques
     b
 }
 
-/// One checkpoint round. Aborts on failure: the workers are re-epoched against an
-/// un-reset SAL, which only a restart's replay repairs.
-async fn flush_round(shared: &Rc<Shared>, round: FlushRound) {
-    shared
-        .disp()
-        .flush(round)
-        .await
-        .unwrap_or_else(|e| gnitz_fatal_abort!("{e}"));
-}
-
 /// The full steady-state checkpoint sequence: gen bump → base round → drain →
 /// tick gate → ephemeral round. Requests arriving meanwhile wait in the channel,
 /// so the pushes `batch` holds are the only ones the sequence runs ahead of.
+///
+/// A failed round aborts: the workers are re-epoched against an un-reset SAL,
+/// which only a restart's replay repairs.
 async fn run_checkpoint_sequence(shared: &Rc<Shared>) {
     // A DDL holding the tick gate has uncommitted families step 1 must not flush.
     if shared.tick_gate.is_write_held() {
@@ -217,60 +206,52 @@ async fn run_checkpoint_sequence(shared: &Rc<Shared>) {
 
     // Step 3 — EPHEMERAL ROUND, with no tick running.
     let _park = shared.tick_gate.write().await;
-    flush_round(shared, FlushRound::Ephemeral).await;
+    shared
+        .disp()
+        .flush(FlushRound::Ephemeral)
+        .await
+        .unwrap_or_else(|e| gnitz_fatal_abort!("{e}"));
 }
 
 /// One single-tid SAL group: a merged run of single pushes, or one transaction
 /// family.
 struct GroupInfo {
     tid: u64,
-    /// See `CommitRequest::Push::recoverable`. A merged run is homogeneous in
+    /// See `PendingPush::recoverable`. A merged run is homogeneous in
     /// `tid`, so one flag per group is exact.
     recoverable: bool,
     lease: AckLease,
     merged: Batch,
-    write_err: Option<WireFault>,
 }
 
-/// One client-visible commit unit: the SAL groups it emits and the clients
-/// waiting on their shared verdict.
+/// One client-visible commit unit, all-or-nothing: the SAL groups it emits and
+/// the clients waiting on their shared verdict.
 struct CommitUnit {
     /// One group for a merged single-push run; one per family, in frame order,
     /// for a transaction.
     groups: Vec<GroupInfo>,
-    outcome: Outcome,
-}
-
-/// Who is owed this unit's verdict.
-enum Outcome {
-    /// The coalesced clients of one merged run.
-    Pushes(Vec<oneshot::Sender<Result<u64, WireFault>>>),
-    /// One transaction. Its contract is "Err ⇒ nothing committed".
-    Txn(oneshot::Sender<Result<u64, WireFault>>),
+    /// The coalesced clients of a merged run, or a transaction's one client.
+    dones: Vec<oneshot::Sender<Result<u64, WireFault>>>,
+    /// Why none of `groups` committed.
+    failed: Option<WireFault>,
 }
 
 impl CommitUnit {
-    /// This unit's groups with no error against them: what the SAL admitted,
-    /// and past Phase C what every worker also took. The one spelling: a group
-    /// awaited that no worker was sent would park forever.
-    fn live(&self) -> impl Iterator<Item = &GroupInfo> {
-        self.groups.iter().filter(|g| g.write_err.is_none())
+    /// This unit's groups if it has not failed: what the SAL admitted, and past
+    /// Phase C what every worker also took. The one spelling: a group awaited
+    /// that no worker was sent would park forever.
+    fn live(&self) -> &[GroupInfo] {
+        if self.failed.is_some() {
+            &[]
+        } else {
+            &self.groups
+        }
     }
 
-    /// Resolve every `done` of this unit exactly once: `Ok(zone_lsn)` iff all of
-    /// its groups committed, else the first group error.
     fn resolve(self, zone_lsn: u64) {
-        let result = match self.groups.iter().find_map(|g| g.write_err.clone()) {
-            Some(e) => Err(e),
-            None => Ok(zone_lsn),
-        };
-        match self.outcome {
-            Outcome::Pushes(dones) => {
-                for done in dones {
-                    done.send(result.clone());
-                }
-            }
-            Outcome::Txn(done) => done.send(result),
+        let result = self.failed.map_or(Ok(zone_lsn), Err);
+        for done in self.dones {
+            done.send(result.clone());
         }
     }
 }
@@ -301,10 +282,10 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
                     recoverable: true,
                     lease: lease_acks(),
                     merged: fam.batch,
-                    write_err: None,
                 })
                 .collect(),
-            outcome: Outcome::Txn(done),
+            dones: vec![done],
+            failed: None,
         });
     }
 
@@ -329,38 +310,33 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
         // A single push ships the client's batch as it stands; a coalesced run
         // concatenates into one. The concat reads client-supplied batches, so it
         // is guarded.
+        // A failed concat leaves a failed unit with no group to lay out.
         let merged = if tail.is_empty() {
-            head
+            Ok(head)
         } else {
-            match guard_panic("commit_merge", || {
+            guard_panic("commit_merge", || {
                 Ok::<_, String>(Batch::concat(
                     &shared.disp().schema_desc_for(tid),
                     std::iter::once(&head).chain(tail.iter()).map(Batch::as_mem_batch),
                 ))
-            }) {
-                Ok(m) => m,
-                Err(panic_msg) => {
-                    // Phase A runs before the lock and before any SAL write: nothing
-                    // was written and no worker was told anything, so answer the
-                    // coalesced clients and emit no group.
-                    let e = WireFault::from(panic_msg);
-                    for done in dones {
-                        done.send(Err(e.clone()));
-                    }
-                    continue;
-                }
-            }
+            })
         };
-
-        units.push(CommitUnit {
-            groups: vec![GroupInfo {
-                tid,
-                recoverable,
-                lease: lease_acks(),
-                merged,
-                write_err: None,
-            }],
-            outcome: Outcome::Pushes(dones),
+        units.push(match merged {
+            Ok(merged) => CommitUnit {
+                groups: vec![GroupInfo {
+                    tid,
+                    recoverable,
+                    lease: lease_acks(),
+                    merged,
+                }],
+                dones,
+                failed: None,
+            },
+            Err(panic_msg) => CommitUnit {
+                groups: Vec::new(),
+                dones,
+                failed: Some(WireFault::from(panic_msg)),
+            },
         });
     }
 
@@ -386,14 +362,11 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
         // back to where it started, and the families before it were never
         // published. A single-push unit has one group, so the same rule refuses
         // that push alone.
-        for unit in &mut units {
+        for unit in units.iter_mut().filter(|u| u.failed.is_none()) {
             let savepoint = scope.savepoint();
-            let failure = unit.groups.iter().find_map(|g| lay_out_group(shared, &scope, g).err());
-            if let Some(e) = failure {
+            unit.failed = unit.groups.iter().find_map(|g| lay_out_group(shared, &scope, g).err());
+            if unit.failed.is_some() {
                 scope.roll_back(savepoint);
-                for g in &mut unit.groups {
-                    g.write_err = Some(e.clone());
-                }
             }
         }
 
@@ -445,9 +418,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
         }
     }
 
-    // Send responses. A single-push unit resolves each coalesced client's `done`
-    // from its one group; a transaction's single `done` resolves `Ok` iff every
-    // family group committed.
+    // Send responses: every client of a unit gets the unit's verdict.
     for unit in units {
         unit.resolve(zone_lsn);
     }

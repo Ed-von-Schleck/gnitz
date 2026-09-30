@@ -172,3 +172,29 @@ def test_a_bundle_into_a_table_dropped_before_commit_is_not_found(client, schema
             txn.push(tid, gnitz.ZSetBatch(KV).extend([{"pk": 1, "val": 1}]), "update")
             with gnitz.connect(server) as other:
                 other.execute_sql("DROP TABLE gone", schema_name=schema_name)
+
+
+def test_a_bundle_the_sal_cannot_hold_rolls_back_whole(tiny_sal_server):
+    """Each family fits the 16 MiB SAL alone, the two together do not: the
+    second one's refusal takes back the first, already laid out, and the SAL is
+    left able to commit the next write."""
+    target, _proc = tiny_sal_server
+    schema = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
+                           gnitz.ColumnDef("pad", gnitz.TypeCode.STRING)], [0])
+    pad = "x" * 8_000
+
+    def wide(n):  # ~10 MB of rows
+        return gnitz.ZSetBatch(schema).extend([{"pk": i, "pad": pad} for i in range(n)])
+
+    with gnitz.connect(target) as client:
+        sn = "sal"
+        client.create_schema(sn)
+        a, b = (client.create_table(sn, n, schema) for n in "ab")
+        with pytest.raises(gnitz.GnitzSalFullError):
+            with client.transaction() as txn:
+                txn.push(a, wide(1_300), "update")
+                txn.push(b, wide(1_300), "update")
+        assert (bag(scanned(client, sn, "a")), bag(scanned(client, sn, "b"))) == ({}, {})
+
+        client.push(a, gnitz.ZSetBatch(schema).extend([{"pk": 1, "pad": "y"}]))
+        assert bag(scanned(client, sn, "a")) == {(1, "y"): 1}

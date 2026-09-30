@@ -1,124 +1,84 @@
 //! Corked egress: what waits in `Peer`'s accumulator, what it leaves behind, and
 //! how a finished connection refuses it.
 
-use std::rc::Rc;
+use std::io::Write;
 use std::time::{Duration, Instant};
 
-use gnitz_store::storage::PooledBuf;
-
 use super::*;
-use crate::runtime::reactor::{egress_pair, read_nonblocking, ring_slot, select2, spawn_drain, Either, Limits};
+use crate::runtime::reactor::{egress_pair, framed, read_nonblocking, ring_slot, select2, spawn_drain, Either, Limits};
 
-/// Corked replies put nothing on the wire until something flushes, and then
-/// leave as one send: the far end reads the whole concatenation in one `read`.
+/// `send` corks a slot that fits beside the cork, ships the cork first when the
+/// slot would overflow it, and sends a slot over half the ceiling alone; the bytes
+/// reach the wire in call order whichever it does.
 #[test]
-fn corked_replies_leave_as_one_send() {
-    let (r, conn, receiver) = egress_pair(Limits::TEST, None);
-    let receiver = Rc::new(receiver);
-    let peer = Peer::new(&r, conn, None);
-    let frames: Vec<Vec<u8>> = (0..8u8).map(|i| vec![0xD0 | i; 200]).collect();
-    let expected: Vec<u8> = frames.iter().flatten().copied().collect();
+fn send_corks_what_fits_and_never_reorders() {
+    const CAP: usize = COALESCE_MAX_BYTES;
+    // What the send itself puts on the wire.
+    enum Ships {
+        Nothing,
+        Cork,
+        Both,
+    }
+    for (pre, pad, ships) in [
+        (0, 64, Ships::Nothing),
+        (128, 64, Ships::Nothing),
+        (0, CAP, Ships::Both),
+        (128, CAP, Ships::Both),
+        (CAP - 128, CAP / 4, Ships::Cork),
+    ] {
+        let (_ring, slot) = ring_slot(pad);
+        let all = [vec![0x5Au8; pre], slot.frame_bytes().to_vec()].concat();
+        let (r, conn, receiver) = egress_pair(Limits::TEST, None);
+        let peer = Peer::new(&r, conn, None);
+        peer.cork(&all[..pre]);
+        let peer = r.block_on(async move {
+            peer.send(slot).await.expect("an open peer");
+            peer
+        });
 
-    let rx = Rc::clone(&receiver);
-    r.block_on(async move {
-        for frame in &frames {
-            peer.cork(frame);
-        }
-        assert!(
-            read_nonblocking(&rx, 4096).is_none(),
-            "corking must put nothing on the wire before a flush",
+        let wire = read_nonblocking(&receiver, 256 * 1024).unwrap_or_default();
+        let (want_wire, want_corked) = match ships {
+            Ships::Nothing => (&[][..], all.len()),
+            Ships::Cork => (&all[..pre], all.len() - pre),
+            Ships::Both => (&all[..], 0),
+        };
+        assert_eq!(
+            (&wire[..], peer.corked_len()),
+            (want_wire, want_corked),
+            "pre={pre} pad={pad}"
         );
-        peer.flush_egress().await.expect("the flush must send");
-    });
 
-    assert_eq!(
-        read_nonblocking(&receiver, 4096).expect("bytes on the wire"),
-        expected,
-        "one flush is one send carrying every corked frame in order",
-    );
-    drop(receiver);
+        r.block_on(async move { peer.flush_egress().await.expect("an open peer") });
+        let rest = read_nonblocking(&receiver, 256 * 1024).unwrap_or_default();
+        assert_eq!([wire, rest].concat(), all, "pre={pre} pad={pad}: call order");
+    }
 }
 
-/// A slot too large to cork, sent with bytes corked, puts the corked bytes on the
-/// wire first: a zero-copy forward may not overtake a reply already written.
+/// Corking is unbounded on its own; `flush_if_full` ships the cork once it
+/// reaches the ceiling, and not a byte before.
 #[test]
-fn a_slot_forward_cannot_overtake_a_corked_reply() {
-    let (_ring, slot) = ring_slot(COALESCE_MAX_BYTES);
-    let slot_bytes = slot.frame_bytes().to_vec();
-    assert!(slot_bytes.len() > COALESCE_MAX_BYTES, "the slot goes out alone");
-
-    let (r, conn, receiver) = egress_pair(Limits::TEST, None);
-    let peer = Peer::new(&r, conn, None);
-    let corked = vec![0x5Au8; 128];
-
-    let c = corked.clone();
-    r.block_on(async move {
-        peer.cork(&c);
-        peer.send(slot).await.expect("the slot forward must send");
-        assert_eq!(peer.corked_len(), 0, "the slot went out alone, not corked");
-    });
-
-    let seen = read_nonblocking(&receiver, 256 * 1024).expect("bytes on the wire");
-    let mut expected = corked;
-    expected.extend_from_slice(&slot_bytes);
-    assert_eq!(seen, expected, "the corked bytes precede the forwarded slot");
-    drop(receiver);
+fn flush_if_full_ships_only_a_full_cork() {
+    for corked in [COALESCE_MAX_BYTES - 1, COALESCE_MAX_BYTES] {
+        let (r, conn, receiver) = egress_pair(Limits::TEST, None);
+        let peer = Peer::new(&r, conn, None);
+        peer.cork(&vec![0x3Cu8; corked]);
+        let left = r.block_on(async move {
+            peer.flush_if_full().await.expect("an open peer");
+            peer.corked_len()
+        });
+        let wire = read_nonblocking(&receiver, 64 * 1024).map_or(0, |b| b.len());
+        let full = corked == COALESCE_MAX_BYTES;
+        assert_eq!(
+            (wire, left),
+            if full { (corked, 0) } else { (0, corked) },
+            "corked={corked}"
+        );
+    }
 }
 
-/// A small slot sent with bytes corked joins them: nothing reaches the wire until
-/// a flush, and that one flush carries both.
-#[test]
-fn a_small_slot_is_corked_behind_corked_bytes() {
-    let (_ring, slot) = ring_slot(64);
-    let slot_bytes = slot.frame_bytes().to_vec();
-
-    let (r, conn, receiver) = egress_pair(Limits::TEST, None);
-    let receiver = Rc::new(receiver);
-    let peer = Peer::new(&r, conn, None);
-    let corked = vec![0x5Au8; 128];
-
-    let (c, rx) = (corked.clone(), Rc::clone(&receiver));
-    let both = corked.len() + slot_bytes.len();
-    r.block_on(async move {
-        peer.cork(&c);
-        peer.send(slot).await.expect("corking cannot fail");
-        assert_eq!(peer.corked_len(), both, "a small slot is corked, not sent");
-        assert!(read_nonblocking(&rx, 4096).is_none(), "nothing is on the wire yet");
-        peer.flush_egress().await.expect("the flush must send");
-    });
-
-    let mut expected = corked;
-    expected.extend_from_slice(&slot_bytes);
-    assert_eq!(
-        read_nonblocking(&receiver, 4096).expect("bytes on the wire"),
-        expected,
-        "one flush carries both, in order"
-    );
-    drop(receiver);
-}
-
-/// Corking is unbounded on its own; `flush_if_full` is what ships a long run,
-/// and it leaves nothing behind once it does.
-#[test]
-fn a_full_accumulator_ships_between_messages() {
-    let (r, conn, receiver) = egress_pair(Limits::TEST, None);
-    let peer = Peer::new(&r, conn, None);
-    let drain = spawn_drain(receiver, COALESCE_MAX_BYTES);
-    let frame = vec![0x3Cu8; 4096];
-
-    r.block_on(async move {
-        while peer.corked_len() < COALESCE_MAX_BYTES {
-            peer.cork(&frame);
-        }
-        peer.flush_if_full().await.expect("the flush must send");
-        assert_eq!(peer.corked_len(), 0, "the flush ships everything corked");
-    });
-
-    assert_eq!(drain.join().expect("drain"), COALESCE_MAX_BYTES as u64);
-}
-
-/// A failed send finishes the peer: every later send and flush refuses, nothing
-/// stays corked, and no further request is handed out.
+/// A corked frame reports a gone peer at its flush; the failure finishes the
+/// peer, so every later send and flush refuses, nothing stays corked, and no
+/// further request is handed out.
 #[test]
 fn a_failed_send_finishes_the_peer() {
     let (_big_ring, big) = ring_slot(COALESCE_MAX_BYTES);
@@ -129,9 +89,10 @@ fn a_failed_send_finishes_the_peer() {
     drop(receiver);
 
     r.block_on(async move {
-        assert_eq!(peer.send(big).await, Err(PeerGone), "a send to a closed partner fails");
-        assert_eq!(peer.send(small).await, Err(PeerGone), "a later small send refuses");
-        assert_eq!(peer.corked_len(), 0, "and corks nothing");
+        assert_eq!(peer.send(small).await, Ok(()), "a small slot is corked, not sent");
+        assert_eq!(peer.flush_egress().await, Err(PeerGone), "its flush fails");
+        assert_eq!(peer.corked_len(), 0);
+        assert_eq!(peer.send(big).await, Err(PeerGone));
         assert_eq!(peer.flush_if_full().await, Err(PeerGone));
         assert_eq!(peer.flush_egress().await, Err(PeerGone));
         assert!(
@@ -139,6 +100,27 @@ fn a_failed_send_finishes_the_peer() {
             "no request follows a finished peer"
         );
     });
+}
+
+/// While a request is already queued `next_request` hands it out and leaves the
+/// cork alone, so a pipelined run of replies leaves as one send.
+#[test]
+fn next_request_keeps_the_cork_while_requests_are_queued() {
+    let (r, conn, partner) = egress_pair(Limits::TEST, None);
+    let peer = Peer::new(&r, conn, None);
+    (&partner)
+        .write_all(&[framed(b"a"), framed(b"b")].concat())
+        .expect("write");
+
+    let corked = r.block_on(async move {
+        peer.next_request().await.expect("the first request");
+        peer.cork(b"reply");
+        peer.next_request().await.expect("the second request, already queued");
+        peer.corked_len()
+    });
+
+    assert_eq!(corked, 5, "the reply stays corked");
+    assert!(read_nonblocking(&partner, 64).is_none(), "nothing shipped");
 }
 
 /// With nothing queued, `next_request` ships what is corked before it parks on
@@ -164,7 +146,7 @@ fn next_request_ships_before_parking() {
     );
 }
 
-/// W frames as W sends versus one send of their concatenation, the trade
+/// W frames as W sends versus `Peer` corking them into one send, the trade
 /// `COALESCE_MAX_BYTES` is set from. Only the ratio is meaningful.
 ///
 /// `cd crates && cargo test -p gnitz-server --release fanout_coalesced_egress_bench -- --ignored --nocapture --test-threads=1`
@@ -179,6 +161,7 @@ fn fanout_coalesced_egress_bench() {
         for total in [4 * 1024usize, 32 * 1024, 64 * 1024, 128 * 1024] {
             let per_frame = total / w;
             let (r, conn, receiver) = egress_pair(Limits::TEST, None);
+            let peer = Peer::new(&r, Rc::clone(&conn), None);
             // Both arms push `total` bytes per sample; the reader keeps
             // the socket buffers from ever stalling a send, so the timed
             // region is kernel-op cost, not backpressure.
@@ -203,11 +186,10 @@ fn fanout_coalesced_egress_bench() {
                     };
                     let run_coalesced = async || {
                         let t = Instant::now();
-                        let mut buf = PooledBuf::with_capacity(total);
                         for _ in 0..w {
-                            buf.0.extend_from_slice(&frame);
+                            peer.cork(&frame);
                         }
-                        let _ = black_box(r2.send_owned(&conn, SendBody::Pooled(buf)).await);
+                        let _ = black_box(peer.flush_egress().await);
                         t.elapsed()
                     };
                     if i % 2 == 0 {
