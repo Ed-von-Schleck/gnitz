@@ -1,5 +1,6 @@
 mod alter_tests;
 mod atomicity_tests;
+mod bundle_precheck_tests;
 mod compound_pk_smoke;
 mod ddl_fixture;
 use ddl_fixture::make_secondary_index_name;

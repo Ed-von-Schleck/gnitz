@@ -194,3 +194,16 @@ fn a_rewrite_pair_may_change_only_the_fields_its_family_declares() {
         assert!(err.contains("admits no rewrite pair"), "{family:?}: {err}");
     }
 }
+
+// ── Bundle rules ────────────────────────────────────────────────────────────
+
+/// A circuit `+1` under a view its bundle does not create would inject nodes
+/// into a running view's circuit, or make its source's dependents permanently
+/// true.
+#[test]
+fn a_circuit_row_must_name_a_view_its_bundle_creates() {
+    let rows = circuit_batch(&[(20, 0, 1)]);
+    let err = check_circuit_rows(&rows, &[]).unwrap_err();
+    assert!(err.contains("view 20, which this transaction does not create"), "{err}");
+    check_circuit_rows(&rows, &[20]).unwrap();
+}

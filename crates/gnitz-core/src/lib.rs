@@ -24,13 +24,10 @@ pub use connection::{
 pub use error::ClientError;
 pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult};
 pub use protocol::error::ProtocolError;
-pub use protocol::message::{encode_ddl_txn, encode_frame, encode_push_txn, PushFamily};
+pub use protocol::message::{encode_ddl_txn, PushFamily};
+pub(crate) use protocol::message::{encode_frame, encode_push_txn};
+pub(crate) use protocol::transport::{hello_handshake, ClientTransport};
 pub use protocol::types::{
     push_zero_cell, sys_schema, BatchAppender, BatchMark, FkTarget, PayloadColumn, PkColumn, Schema, ZSetBatch,
 };
 pub use protocol::wal_block::decode_regions_into;
-// Public to the `integration` suite alone.
-#[cfg(any(test, feature = "integration"))]
-pub use protocol::transport::{hello_handshake, ClientTransport};
-#[cfg(not(any(test, feature = "integration")))]
-pub(crate) use protocol::transport::{hello_handshake, ClientTransport};

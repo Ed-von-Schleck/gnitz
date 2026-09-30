@@ -475,10 +475,11 @@ fn a_serial_table_has_one_narrow_integer_pk() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A malformed ADD COLUMN is reported as malformed even when the table has a
-/// dependent view.
+/// Two visible columns of one name make the relation unregisterable at the next
+/// boot, so an ADD COLUMN or a RENAME COLUMN onto a visible name is refused —
+/// named as malformed even when the table has a dependent view.
 #[test]
-fn a_duplicate_add_column_is_named_before_dependent_views() {
+fn a_duplicate_visible_column_name_is_named_before_dependent_views() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
     let (mut engine, tid, dir) = table_fixture("alter_add_dup_dep", &cols);
     register_identity_view(&mut engine, tid, "vw", &cols);
@@ -486,7 +487,11 @@ fn a_duplicate_add_column_is_named_before_dependent_views() {
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
     nullable_def("v", TypeCode::U64).write_col_tab_row(&mut bb, tid, 2, 1);
     let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
-    assert!(err.contains("duplicate column name"), "{err}");
+    assert!(err.contains("duplicate column name"), "add: {err}");
+    let err = engine
+        .precheck_family(SysFamily::Column, &col_alter_pair(tid, 1, &cols[1], rename_to("id")))
+        .unwrap_err();
+    assert!(err.contains("duplicate column name"), "rename: {err}");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

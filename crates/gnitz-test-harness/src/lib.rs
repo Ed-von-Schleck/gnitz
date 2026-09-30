@@ -84,16 +84,6 @@ impl ServerHandle {
         Self::start_inner(workers, &[], Some("127.0.0.1:0"), true)
     }
 
-    /// Spawn a server with a raw TLS argv: the ready handle, or the stderr tail
-    /// of a server that exited during boot.
-    pub fn try_start_tls(workers: usize, tls_args: &[&str]) -> Result<Self, String> {
-        let scaffold = boot_scaffold();
-        let args: Vec<String> = tls_args.iter().map(|s| s.to_string()).collect();
-        // On the failure path `scaffold` (with its tmpdir) drops here, cleaning up.
-        let process = spawn_and_wait_ready(&scaffold.paths, workers, &[], &args)?;
-        Ok(Self::assemble(process, scaffold, workers, args, Vec::new(), None))
-    }
-
     fn start_inner(workers: usize, extra_env: &[(&str, &str)], tls_listen: Option<&str>, mtls: bool) -> Self {
         let scaffold = boot_scaffold();
         let env: Vec<(String, String)> = extra_env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();

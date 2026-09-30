@@ -1,17 +1,10 @@
-#![cfg(feature = "integration")]
-
 //! [`GnitzClient::read_modify_write`] against a real server: two connections on
 //! one table `t(pk, val)` holding `(1, 0)`, and `a` incrementing pk 1's `val` in
 //! autocommit while `b` writes around it.
 
-use std::sync::Arc;
-
-use gnitz_core::Schema;
-use gnitz_core::{BatchAppender, ClientError, GnitzClient, PkColumn, RelDescriptor, ZSetBatch, RMW_MAX_ATTEMPTS};
-use gnitz_test_harness::{unique_schema, ServerHandle};
-use gnitz_wire::{read_i64_le, ReadBound};
-use gnitz_wire::{ColumnDef, TypeCode};
-use gnitz_wire::{ReadSpec, TableProps, WireConflictMode, WireFault, WireStatus};
+use super::*;
+use gnitz_core::{PkColumn, RelDescriptor, RMW_MAX_ATTEMPTS};
+use gnitz_wire::{WireFault, WireStatus};
 
 struct Fixture {
     _srv: ServerHandle,
@@ -25,21 +18,7 @@ fn boot() -> Fixture {
     let srv = ServerHandle::start_n(2);
     let mut a = GnitzClient::connect(srv.sock_path()).unwrap();
     let b = GnitzClient::connect(srv.sock_path()).unwrap();
-    let schema_name = unique_schema("rmw");
-    a.create_schema(&schema_name).unwrap();
-    let cols = vec![
-        ColumnDef::new("pk", TypeCode::I64, false),
-        ColumnDef::new("val", TypeCode::I64, false),
-    ];
-    a.create_table(
-        &schema_name,
-        "t",
-        &Schema { columns: cols, pk_cols: vec![0] },
-        &[],
-        TableProps::default(),
-        &[],
-    )
-    .unwrap();
+    let (schema_name, ..) = create_table(&mut a, schema_of(&[("pk", TypeCode::I64), ("val", TypeCode::I64)]));
     let target = a.resolve_relation(&schema_name, "t").unwrap();
     commit(&mut a, &target, 1, 0);
     Fixture { _srv: srv, schema_name, a, b, target }
@@ -77,17 +56,16 @@ fn run_increment(
 
 /// Every row of `t` at pk 1, as `(val, weight)`.
 fn row_1(client: &mut GnitzClient, target: &RelDescriptor) -> Vec<(i64, i64)> {
-    let spec = ReadSpec::all_rows(ReadBound::None);
-    let b = client.scan_spec(target.tid, &spec, &target.schema).unwrap().batch;
-    let s = &target.schema;
-    (0..b.len())
-        .filter(|&i| b.pks.get(s, i) == 1)
-        .map(|i| (read_i64_le(&b.payload[0].bytes, i * 8), b.weights[i]))
+    let b = scan_all(client, target.tid, &target.schema);
+    weighted_rows(&b, &target.schema)
+        .into_iter()
+        .filter(|&(pk, ..)| pk == 1)
+        .map(|(_, cells, w)| (cells[0], w))
         .collect()
 }
 
-/// A write landing after every read exhausts the bound, and the conflict names
-/// the table.
+/// A write landing after every read exhausts the bound, the conflict names the
+/// table, and none of the attempts' increments landed.
 #[test]
 fn sustained_contention_surfaces_a_conflict_naming_the_table() {
     let mut f = boot();
@@ -102,6 +80,7 @@ fn sustained_contention_surfaces_a_conflict_naming_the_table() {
     );
     assert!(err.to_string().contains(&format!("'{}.t'", f.schema_name)), "{err}");
     assert_eq!(attempts, RMW_MAX_ATTEMPTS);
+    assert_eq!(row_1(&mut f.a, &f.target), [(0, 1)]);
 }
 
 /// A write landing after the first read forces one retry, which re-reads: the

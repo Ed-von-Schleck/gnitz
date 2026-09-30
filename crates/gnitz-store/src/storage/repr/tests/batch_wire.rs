@@ -41,9 +41,11 @@ fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
     }
 }
 
-/// The foreign decode refuses a NULL over a non-zero cell.
+/// The foreign decode refuses the two NULL encodings the schema does not admit:
+/// a NULL over a non-zero cell, and a null bit on a NOT NULL column — each over
+/// a block that breaks that rule alone.
 #[test]
-fn a_foreign_decode_refuses_a_non_zero_cell_under_a_null() {
+fn a_foreign_decode_refuses_a_null_the_schema_does_not_admit() {
     // `(U64 pk, I64 NOT NULL, I64 NULL)`: the nullable column is payload slot 1.
     let schema = SchemaDescriptor::new(
         &[
@@ -53,23 +55,34 @@ fn a_foreign_decode_refuses_a_non_zero_cell_under_a_null() {
         ],
         &[0],
     );
-    let mut b = BatchBuilder::new(schema);
-    for pk in [1u128, 2] {
-        b.begin_row(pk, 1);
-        b.put_int(pk * 10);
-        b.put_null();
-        b.end_row();
-    }
-    let clean = encode_to_wire_vec(&b.finish());
+    // Row 2's NOT NULL cell is zero, the NULL encoding should its bit be set.
+    let block = |not_null_bit: bool| {
+        let mut b = BatchBuilder::new(schema);
+        for pk in [1u128, 2] {
+            b.begin_row(pk, 1);
+            if pk == 2 && not_null_bit {
+                b.put_null();
+            } else {
+                b.put_int((pk - 1) * 10);
+            }
+            b.put_null();
+            b.end_row();
+        }
+        encode_to_wire_vec(&b.finish())
+    };
+    let clean = block(false);
     assert_eq!(Batch::decode_foreign_wal_block(&clean, &schema).map(|b| b.len()), Ok(2));
+
     let cell = region_offset(&schema, 2, REG_PAYLOAD_START + 1) + 8;
-    let mut forged = clean.clone();
-    forged[cell..cell + 8].fill(0xFF);
-    assert!(Batch::decode_from_wal_block(&forged, &schema).is_ok());
-    assert_eq!(
-        Batch::decode_foreign_wal_block(&forged, &schema).err(),
-        Some("a non-zero cell under a NULL")
-    );
+    let mut valued_null = clean.clone();
+    valued_null[cell..cell + 8].fill(0xFF);
+    for (forged, why) in [
+        (valued_null, "a non-zero cell under a NULL"),
+        (block(true), "a null bit on a NOT NULL column"),
+    ] {
+        assert!(Batch::decode_from_wal_block(&forged, &schema).is_ok(), "{why}");
+        assert_eq!(Batch::decode_foreign_wal_block(&forged, &schema).err(), Some(why));
+    }
 }
 
 /// A zero-row block decodes to an empty batch, dropping any heap bytes it

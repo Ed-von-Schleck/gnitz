@@ -227,6 +227,23 @@ fn a_client_frame_keeps_no_claim_and_needs_a_schema() {
         Some("refused")
     );
 
+    // A client's block is decoded as a foreign one, so a null bit on the NOT
+    // NULL payload is refused.
+    let mut bb = BatchBuilder::new(sd);
+    bb.begin_row(1, 1);
+    bb.put_null();
+    bb.end_row();
+    let nulled = rel
+        .frame(WireMsg {
+            data: WireData::Whole(&bb.finish()),
+            ..Default::default()
+        })
+        .encode_to_vec();
+    assert_eq!(
+        decode(&nulled, None, unknown).err().as_deref(),
+        Some("a null bit on a NOT NULL column")
+    );
+
     let bare = WireMsg {
         target_id: 3,
         data: WireData::Whole(&batch),
