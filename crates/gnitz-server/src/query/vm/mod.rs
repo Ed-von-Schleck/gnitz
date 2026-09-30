@@ -17,9 +17,9 @@ mod exec;
 
 #[cfg(test)]
 #[path = "tests/fixtures.rs"]
-pub(in crate::query) mod fixtures;
+mod fixtures;
 
-pub(in crate::query) use builder::build;
+pub(in crate::query) use builder::ProgramBuilder;
 pub(in crate::query) use exec::{execute_epoch_multi, replay_chunk};
 
 // ---------------------------------------------------------------------------
@@ -27,9 +27,10 @@ pub(in crate::query) use exec::{execute_epoch_multi, replay_chunk};
 // ---------------------------------------------------------------------------
 
 /// A register whose batch an instruction reads or writes — the one index space
-/// a `Program` has, a trace being named by the [`StateIdx`] of its store.
+/// a `Program` has, a trace being named by the [`StateIdx`] of its store. Minted
+/// only by [`ProgramBuilder`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(in crate::query) struct DeltaReg(pub u16);
+pub(in crate::query) struct DeltaReg(u16);
 
 impl DeltaReg {
     #[inline]
@@ -40,7 +41,7 @@ impl DeltaReg {
 
 /// One VM instruction: the delta it reads, the delta it writes, and the
 /// operator between them with all operator-specific data pre-resolved.
-pub(in crate::query) struct Instr {
+struct Instr {
     in_reg: DeltaReg,
     out_reg: DeltaReg,
     op: Op,
@@ -60,7 +61,7 @@ pub(in crate::query) enum Op {
     /// Shared instruction for `distinct` and `positive_part`: per consolidated
     /// (PK, payload), emit `clamp(w_new) − clamp(w_old)` at `kind`'s bounds.
     WeightClamp {
-        /// The history trace `I(in)`, which `build` integrates.
+        /// The history trace `I(in)`, which `finish` integrates.
         hist: StateIdx,
         kind: ClampKind,
     },
@@ -95,7 +96,7 @@ pub(in crate::query) enum Op {
 /// One `Op::Reduce`'s baked operator data: the plan and the table its combined
 /// value index lives in.
 pub(in crate::query) struct BakedReduce {
-    pub(in crate::query) plan: ops::ReducePlan,
+    plan: ops::ReducePlan,
     avi_table: Option<StateIdx>,
 }
 
@@ -167,11 +168,6 @@ fn facts(op: &Op) -> OpFacts {
 }
 
 impl Instr {
-    pub(in crate::query) fn new(in_reg: DeltaReg, out_reg: DeltaReg, op: Op) -> Instr {
-        let inert_on_empty = facts(&op).inert_on_empty;
-        Instr { in_reg, out_reg, op, inert_on_empty }
-    }
-
     /// The registers whose batch this instruction reads, in operand order. No
     /// `..` in the match: an opcode that gains a delta operand must fail to
     /// compile here.
@@ -194,7 +190,7 @@ impl Instr {
 
     /// The trace this instruction's op owns as the integral of one of its own
     /// registers — the clamp's input history, a reduce's or top-N's output — which
-    /// `build` schedules as an integrate. No `_` arm, as in [`Self::reads`]: a new
+    /// `finish` schedules as an integrate. No `_` arm, as in [`Self::reads`]: a new
     /// opcode must say whether it owns one.
     fn own_integral(&self) -> Option<(DeltaReg, StateIdx)> {
         match &self.op {
@@ -259,7 +255,7 @@ enum LastRead {
     Integrate(usize),
 }
 
-/// What `build` derived about one register.
+/// What [`ProgramBuilder::finish`] derived about one register.
 struct Reg {
     schema: SchemaDescriptor,
     /// Some instruction reads it at net weights, so it is folded when written.
@@ -298,24 +294,6 @@ impl Program {
     /// A batch written to `reg` is folded.
     pub(in crate::query) fn folds(&self, reg: DeltaReg) -> bool {
         self.regs[reg.at()].fold
-    }
-
-    /// The register the epoch's output is extracted from.
-    #[cfg(test)]
-    pub(in crate::query) fn out_reg(&self) -> DeltaReg {
-        self.out_reg
-    }
-
-    /// Every instruction with, per operand, whether it is that operand's last
-    /// reader — the take verdict the dispatch acts on.
-    #[cfg(test)]
-    pub(in crate::query) fn take_verdicts(&self) -> impl Iterator<Item = (&Op, [Option<bool>; 2])> + '_ {
-        self.instructions.iter().enumerate().map(|(pc, instr)| {
-            let takes = instr
-                .reads()
-                .map(|r| r.map(|r| self.regs[r.at()].last_read == LastRead::Instr(pc)));
-            (&instr.op, takes)
-        })
     }
 
     /// True iff some instruction trims the delta to this worker's own rows, so

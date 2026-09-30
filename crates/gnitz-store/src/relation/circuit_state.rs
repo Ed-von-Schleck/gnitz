@@ -35,7 +35,6 @@ impl StateLayout {
 
 /// The rederived operator state of one compiled circuit: the stores its stateful
 /// operators read and write, addressed by [`StateIdx`].
-#[derive(Default)]
 pub struct CircuitState {
     tables: Vec<Table>,
 }

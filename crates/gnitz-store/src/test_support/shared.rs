@@ -341,6 +341,82 @@ pub fn weighted_rows(batch: &Batch) -> Vec<(RowKey, i64)> {
         .collect()
 }
 
+/// Whether the kind admits the pair of PK regions `(dpk, tpk)`. `rel` relates the
+/// **left** slot to the right one, so the delta's side decides the operand order.
+fn join_pair_matches(kind: gnitz_wire::JoinKind, delta_is_right: bool, eq_size: usize, dpk: &[u8], tpk: &[u8]) -> bool {
+    match kind {
+        gnitz_wire::JoinKind::Cross => true,
+        gnitz_wire::JoinKind::Equi => dpk == tpk,
+        gnitz_wire::JoinKind::Range { rel, .. } => {
+            if dpk[..eq_size] != tpk[..eq_size] {
+                return false;
+            }
+            // Equal-width OPK slot slices, so a raw byte compare IS the typed
+            // comparison the relation names.
+            let (d, s) = (&dpk[eq_size..], &tpk[eq_size..]);
+            let (l, r) = match delta_is_right {
+                true => (s, d),
+                false => (d, s),
+            };
+            match rel {
+                gnitz_wire::RangeRel::Lt => l < r,
+                gnitz_wire::RangeRel::Le => l <= r,
+                gnitz_wire::RangeRel::Gt => l > r,
+                gnitz_wire::RangeRel::Ge => l >= r,
+            }
+        }
+    }
+}
+
+/// Brute-force reference: every `(delta row, trace row)` pair the kind admits,
+/// composed at weight `w_d · w_t` into the key, the left side's payload cells and
+/// then the right's — spelled out independently of the join kernel.
+/// Returns the Z-Set it denotes and the number of pairs with a non-zero product.
+pub fn join_reference(
+    kind: gnitz_wire::JoinKind,
+    delta_is_right: bool,
+    delta_schema: &SchemaDescriptor,
+    trace_schema: &SchemaDescriptor,
+    delta: &Batch,
+    trace: &Batch,
+) -> (std::collections::HashMap<RowKey, i64>, usize) {
+    let eq_size = match kind {
+        gnitz_wire::JoinKind::Range { n_eq, .. } => 8 * n_eq as usize,
+        _ => 0,
+    };
+    let mut m: std::collections::HashMap<RowKey, i64> = std::collections::HashMap::new();
+    let mut rows = 0usize;
+    for i in 0..delta.len() {
+        let dpk = delta.get_pk_bytes(i);
+        for j in 0..trace.len() {
+            let tpk = trace.get_pk_bytes(j);
+            if !join_pair_matches(kind, delta_is_right, eq_size, dpk, tpk) {
+                continue;
+            }
+            let w = delta.get_weight(i).wrapping_mul(trace.get_weight(j));
+            if w == 0 {
+                continue;
+            }
+            rows += 1;
+            let key: Vec<u8> = match (kind, delta_is_right) {
+                (gnitz_wire::JoinKind::Cross, true) => [tpk, dpk].concat(),
+                (gnitz_wire::JoinKind::Cross, false) => [dpk, tpk].concat(),
+                _ => dpk.to_vec(),
+            };
+            let d_cells = row_key(delta, delta_schema, i).1;
+            let t_cells = row_key(trace, trace_schema, j).1;
+            let (mut cells, tail) = match delta_is_right {
+                true => (t_cells, d_cells),
+                false => (d_cells, t_cells),
+            };
+            cells.extend(tail);
+            *m.entry((key, cells)).or_insert(0) += w;
+        }
+    }
+    m.retain(|_, w| *w != 0);
+    (m, rows)
+}
+
 /// `batch` framed as one WAL block in a buffer of its own.
 pub fn encode_to_wire_vec(batch: &Batch) -> Vec<u8> {
     let mut out = vec![0u8; batch.wire_byte_size()];

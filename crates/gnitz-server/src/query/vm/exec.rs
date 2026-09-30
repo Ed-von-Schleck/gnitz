@@ -209,7 +209,7 @@ fn run_instructions(vm: &mut Vm, state: &mut CircuitState, start_pc: usize) -> R
 
         // After the release, so a fold never runs beside an input this
         // instruction was the last reader of. `out_reg` is none of its reads:
-        // `build` checks each register is written once, before any read.
+        // `ProgramBuilder::push` gives every instruction a fresh one.
         fold_written(batches, regs, out_reg);
     }
 

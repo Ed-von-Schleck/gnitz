@@ -1,108 +1,112 @@
 use super::fixtures::*;
 use super::*;
-use crate::test_support::make_schema_u128_i64;
-use gnitz_wire::{AggDescriptor, AggFunc};
+use crate::test_support::{make_batch_u128, make_schema_u128_i64, zset_of};
+use gnitz_store::schema::SchemaColumn;
+use gnitz_store::storage::{BatchBuilder, Layout};
+use gnitz_wire::TypeCode;
 
-/// An integrate runs after every instruction, so it takes its register and the
-/// instructions reading it copy — unless that register is the sink.
+/// An integrate runs after every instruction, so it takes its register from the
+/// instructions reading it — unless that register is the sink, which the epoch
+/// extracts after the integrates.
 #[test]
 fn an_integrate_takes_its_register_unless_it_is_the_sink() {
-    let dir = tempfile::tempdir().unwrap();
-    let registry = vm_registry(dir.path());
     let schema = make_schema_u128_i64();
     let mut p = TestPlan::default();
+    let r0 = p.seed(schema);
+    let r1 = p.push(r0, schema, Op::Negate);
+    let r2 = p.push(r1, schema, Op::Negate);
+    let traces = [r0, r1, r2].map(|r| {
+        let t = p.table(&format!("t{}", r.at()), schema);
+        p.integrate(r, t);
+        t
+    });
+    let mut vm = p.open(r2);
 
-    let t0 = p.table("t0", schema);
-    let t1 = p.table("t1", schema);
-    let t2 = p.table("t2", schema);
-    p.push(0, 1, Op::Negate);
-    p.push(1, 2, Op::Negate);
-    p.integrate(0, t0);
-    p.integrate(1, t1);
-    p.integrate(2, t2);
-
-    let vm = p.build_in(&registry, vec![schema; 3], 2);
-    let last_reads: Vec<LastRead> = vm.program.regs.iter().map(|r| r.last_read).collect();
-    assert_eq!(
-        last_reads,
-        vec![LastRead::Integrate(0), LastRead::Integrate(1), LastRead::Nobody],
-        "an integrate reads after every instruction, and the sink is never taken \
-         out from under the epoch epilogue",
-    );
+    let input = [(1, 1, 10), (2, 3, 20)];
+    let negated = [(1, -1, 10), (2, -3, 20)];
+    assert_rows(&vm.epoch([(r0, make_batch_u128(&schema, &input))]), &input);
+    for (t, rows) in traces.into_iter().zip([&input, &negated, &input]) {
+        assert_eq!(vm.trace(t), zset_of(&make_batch_u128(&schema, rows), &schema));
+    }
 }
 
-/// A register is folded iff some instruction reads it at net weights — not
-/// merely because a cheaper instruction reads it too.
+/// An instruction takes a register only as its last reader, and never the sink:
+/// each op below reads `r0` before a later `Negate` does, and must leave it a
+/// full batch to read.
 #[test]
-fn only_a_register_read_at_net_weights_is_folded() {
-    let dir = tempfile::tempdir().unwrap();
-    let registry = vm_registry(dir.path());
+fn only_the_last_reader_takes_a_register() {
     let schema = make_schema_u128_i64();
+    let input = [(1, 1, 10), (2, 3, 20)];
+    let negated = [(1, -1, 10), (2, -3, 20)];
+    let early_readers: [fn(&SchemaDescriptor, DeltaReg, DeltaReg) -> Op; 4] = [
+        // Every row passes, so the filter hands its input on.
+        |s, _, _| filter_gt(s, 1, 0),
+        |_, _, _| Op::Negate,
+        |_, r0, _| Op::Union { in_b: r0 },
+        |_, _, empty| Op::Union { in_b: empty },
+    ];
+    for reader in early_readers {
+        let mut p = TestPlan::default();
+        let r0 = p.seed(schema);
+        let empty = p.seed(schema);
+        let op = reader(&schema, r0, empty);
+        p.push(r0, schema, op);
+        let out = p.push(r0, schema, Op::Negate);
+        let mut vm = p.open(out);
+        assert_rows(&vm.epoch([(r0, make_batch_u128(&schema, &input))]), &negated);
+    }
+
+    // A union reading the sink, which the epoch extracts after every
+    // instruction, must not take it — or the epoch would emit nothing.
     let mut p = TestPlan::default();
+    let r0 = p.seed(schema);
+    let sink = p.push(r0, schema, Op::Negate);
+    p.push(sink, schema, Op::Union { in_b: r0 });
+    let mut vm = p.open(sink);
+    assert_rows(&vm.epoch([(r0, make_batch_u128(&schema, &input))]), &negated);
+}
 
-    let hist = p.table("hist", schema);
-    let join_trace = p.table("jt", schema);
-    let red_trace = p.table("rt", schema);
-    let lin_trace = p.table("lt", schema);
+/// A register some instruction reads at net weights is folded when written — an
+/// instruction's output as much as a seed, and whatever reader follows. Here the
+/// projection collapses two rows onto one, which the distinct must see as one
+/// row of weight 2.
+#[test]
+fn a_register_read_at_net_weights_is_folded_when_written() {
+    let pk = SchemaColumn::new(TypeCode::U128, false);
+    let int = SchemaColumn::new(TypeCode::I64, false);
+    let wide = SchemaDescriptor::new(&[pk, int, int], &[0]);
+    let map = ops::MapPlan::from_wire(&wide, &gnitz_wire::MapKind::Projection(vec![2])).unwrap();
+    let narrow = *map.out_schema();
 
-    // MIN carries a value index, so `op_reduce` consolidates; COUNT alone does
-    // not.
-    let avi_plan = gnitz_store::ops::ReducePlan::from_wire(
-        &schema,
-        &[],
-        &[
-            AggDescriptor { col_idx: 1, agg_op: AggFunc::Min },
-            AggDescriptor::COUNT_STAR,
-        ],
-        false,
-    )
-    .unwrap();
-    assert!(!avi_plan.is_exact_linear());
-    let avi_table = p.table("avi", avi_plan.avi.as_ref().unwrap().schema);
-
-    let linear_plan =
-        gnitz_store::ops::ReducePlan::from_wire(&schema, &[], &[AggDescriptor::COUNT_STAR], false).unwrap();
-    assert!(linear_plan.is_exact_linear());
-
-    let probe = gnitz_store::ops::JoinPlan::from_wire(gnitz_wire::JoinKind::Equi, false, &schema, &schema)
-        .unwrap()
-        .probe;
-
-    // reg 0 = clamp input, reg 2 = join delta, reg 4 = avi-reduce input,
-    // reg 6 = linear-reduce input, each also read by a negate.
-    p.push(0, 1, Op::Negate);
-    p.push(
-        0,
-        8,
+    let mut p = TestPlan::default();
+    let hist = p.table("hist", narrow);
+    let r0 = p.seed(wide);
+    let projected = p.push(r0, narrow, Op::Map(Box::new(map)));
+    let distinct = p.push(
+        projected,
+        narrow,
         Op::WeightClamp {
             hist,
             kind: gnitz_wire::ClampKind::Distinct,
         },
     );
-    p.push(2, 3, Op::Negate);
-    p.push(2, 9, Op::JoinDT { trace: join_trace, probe });
-    p.push(4, 5, Op::Negate);
-    p.push(
-        4,
-        10,
-        Op::Reduce {
-            out_trace: red_trace,
-            plan: Box::new(BakedReduce::new(avi_plan, Some(avi_table))),
-        },
-    );
-    p.push(6, 7, Op::Negate);
-    p.push(
-        6,
-        11,
-        Op::Reduce {
-            out_trace: lin_trace,
-            plan: Box::new(BakedReduce::new(linear_plan, None)),
-        },
-    );
+    // A later reader that reads at any weights.
+    p.push(projected, narrow, Op::Negate);
+    let mut vm = p.open(distinct);
 
-    let vm = p.build_in(&registry, vec![schema; 12], 11);
-    let folded: Vec<usize> = (0..12).filter(|&r| vm.program.regs[r].fold).collect();
-    // The clamp input, the join delta and the value-indexed reduce's input. The
-    // linear reduce's input (reg 6) is absent.
-    assert_eq!(folded, vec![0, 2, 4]);
+    let mut b = BatchBuilder::new(wide);
+    for c0 in [10, 20] {
+        b.begin_row(1u128, 1);
+        b.put_int(c0);
+        b.put_int(100);
+        b.end_row();
+    }
+    let mut input = b.finish();
+    input.certify_layout(Layout::Consolidated);
+
+    assert_rows(&vm.epoch([(r0, input)]), &[(1, 1, 100)]);
+    assert_eq!(
+        vm.trace(hist),
+        zset_of(&make_batch_u128(&narrow, &[(1, 2, 100)]), &narrow)
+    );
 }

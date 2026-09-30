@@ -8,7 +8,7 @@
 //! read them.
 
 use super::*;
-use crate::query::vm::{BakedReduce, BakedTopN, Instr, Op};
+use crate::query::vm::{BakedReduce, BakedTopN, Op, ProgramBuilder};
 use gnitz_store::ops::JoinPlan;
 use gnitz_store::relation::StateLayout;
 
@@ -30,9 +30,7 @@ pub(super) struct EmitCtx<'a> {
     registry: &'a RelationRegistry,
     /// Every child the view's sub-plans declare, in one index space.
     layout: &'a mut StateLayout,
-    instructions: Vec<Instr>,
-    integrates: Vec<(DeltaReg, StateIdx)>,
-    delta_schemas: Vec<SchemaDescriptor>,
+    prog: ProgramBuilder,
     out_reg_of: Vec<Option<OutReg>>,
     source_reg_map: FxHashMap<u64, DeltaReg>,
 }
@@ -68,14 +66,6 @@ impl EmitCtx<'_> {
         self.layout.declare(format!("{kind}_{nid}"), schema)
     }
 
-    /// Push `op` over `in_reg`, writing a fresh register of `out_schema` — the
-    /// one way an instruction gets its output register, so each is written once.
-    fn push(&mut self, in_reg: DeltaReg, out_schema: SchemaDescriptor, op: Op) -> DeltaReg {
-        let out_reg = self.push_delta_reg(out_schema);
-        self.instructions.push(Instr::new(in_reg, out_reg, op));
-        out_reg
-    }
-
     /// The register `src` produced. The one rejection left after the load held
     /// every node to `OpNode::arity()`: a plan covers a *slice* of the circuit, so
     /// a producer outside this side has no register at all.
@@ -103,24 +93,6 @@ impl EmitCtx<'_> {
         let (d, t) = self.loaded.inputs(nid).binary();
         Ok((self.reg_of(d)?.delta()?, self.reg_of(t)?.trace()?))
     }
-
-    /// The schema register `r` is labelled with.
-    fn reg_schema(&self, r: DeltaReg) -> SchemaDescriptor {
-        self.delta_schemas[r.at()]
-    }
-
-    /// Allocate a fresh delta register and return its id. An instruction's output
-    /// register comes from [`EmitCtx::push`].
-    fn push_delta_reg(&mut self, schema: SchemaDescriptor) -> DeltaReg {
-        assert!(
-            self.delta_schemas.len() < u16::MAX as usize,
-            "register count exceeds u16::MAX; `LoadedCircuit::new` caps a circuit at {} nodes",
-            super::MAX_CIRCUIT_NODES,
-        );
-        let id = DeltaReg(self.delta_schemas.len() as u16);
-        self.delta_schemas.push(schema);
-        id
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +112,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             // A circuit scanning an unknown table is corrupt: the planner
             // registers every source before shipping the circuit.
             let schema = ctx.registry.relation_or_err(*tid)?.schema();
-            let reg = ctx.push_delta_reg(schema);
+            let reg = ctx.prog.seed(schema);
             // The driver seeds one register per source, so a second scan would
             // silently see nothing.
             if ctx.source_reg_map.insert(*tid, reg).is_some() {
@@ -151,34 +123,43 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
 
         gnitz_wire::OpNode::Filter(blob) => {
             let in_reg = ctx.unary_delta_in(nid)?;
-            let in_schema = ctx.reg_schema(in_reg);
+            let in_schema = ctx.prog.schema_of(in_reg);
             // A present-but-corrupt blob, or a rejected program, is catalog
             // corruption. Falling back to pass-all would silently turn a WHERE
             // into WHERE TRUE; fail the compile instead.
             let pred = LogicalProgram::from_blob(blob)
                 .and_then(|p| p.resolve_filter(&in_schema))
                 .map_err(|e| format!("filter: invalid predicate program: {e}"))?;
-            Ok(OutReg::Delta(ctx.push(in_reg, in_schema, Op::Filter(Box::new(pred)))))
+            Ok(OutReg::Delta(ctx.prog.push(
+                in_reg,
+                in_schema,
+                Op::Filter(Box::new(pred)),
+            )))
         }
 
         gnitz_wire::OpNode::Map(mk) => emit_map(ctx, nid, mk),
 
         gnitz_wire::OpNode::Negate => {
             let in_reg = ctx.unary_delta_in(nid)?;
-            Ok(OutReg::Delta(ctx.push(in_reg, ctx.reg_schema(in_reg), Op::Negate)))
+            Ok(OutReg::Delta(ctx.prog.push(
+                in_reg,
+                ctx.prog.schema_of(in_reg),
+                Op::Negate,
+            )))
         }
 
         gnitz_wire::OpNode::Union => {
             let (in_a, in_b) = ctx.binary_delta_in(nid)?;
-            let out_schema = gnitz_store::ops::union_nullability_merge(&ctx.reg_schema(in_a), &ctx.reg_schema(in_b))?;
-            Ok(OutReg::Delta(ctx.push(in_a, out_schema, Op::Union { in_b })))
+            let out_schema =
+                gnitz_store::ops::union_nullability_merge(&ctx.prog.schema_of(in_a), &ctx.prog.schema_of(in_b))?;
+            Ok(OutReg::Delta(ctx.prog.push(in_a, out_schema, Op::Union { in_b })))
         }
 
         gnitz_wire::OpNode::WeightClamp(kind) => {
             let in_reg = ctx.unary_delta_in(nid)?;
-            let schema = ctx.reg_schema(in_reg);
+            let schema = ctx.prog.schema_of(in_reg);
             let hist = ctx.declare_child("hist", nid, schema);
-            Ok(OutReg::Delta(ctx.push(
+            Ok(OutReg::Delta(ctx.prog.push(
                 in_reg,
                 schema,
                 Op::WeightClamp { hist, kind: *kind },
@@ -191,7 +172,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
 
         gnitz_wire::OpNode::TopN { group_cols, order, limit, offset } => {
             let in_reg = ctx.unary_delta_in(nid)?;
-            let in_schema = ctx.reg_schema(in_reg);
+            let in_schema = ctx.prog.schema_of(in_reg);
             let plan = match ctx.reads_partials(nid) {
                 true => gnitz_store::ops::TopNPlan::combine(&in_schema, order, *limit, *offset)?,
                 false => gnitz_store::ops::TopNPlan::from_wire(&in_schema, group_cols, order, *limit, *offset)?,
@@ -205,10 +186,10 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             let plan = JoinPlan::from_wire(
                 *kind,
                 *delta_is_right,
-                &ctx.reg_schema(delta_reg),
+                &ctx.prog.schema_of(delta_reg),
                 ctx.layout.schema_of(trace),
             )?;
-            Ok(OutReg::Delta(ctx.push(
+            Ok(OutReg::Delta(ctx.prog.push(
                 delta_reg,
                 plan.out_schema,
                 Op::JoinDT { trace, probe: plan.probe },
@@ -223,9 +204,9 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
 
         gnitz_wire::OpNode::IntegrateTrace => {
             let in_reg = ctx.unary_delta_in(nid)?;
-            let in_reg_schema = ctx.reg_schema(in_reg);
+            let in_reg_schema = ctx.prog.schema_of(in_reg);
             let trace = ctx.declare_child("int", nid, in_reg_schema);
-            ctx.integrates.push((in_reg, trace));
+            ctx.prog.integrate(in_reg, trace);
             Ok(OutReg::Trace(trace))
         }
 
@@ -239,9 +220,9 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
                 return Ok(OutReg::Delta(in_reg));
             }
             let slot = ctx.registry.slot();
-            Ok(OutReg::Delta(ctx.push(
+            Ok(OutReg::Delta(ctx.prog.push(
                 in_reg,
-                ctx.reg_schema(in_reg),
+                ctx.prog.schema_of(in_reg),
                 Op::WorkerFilter { slot },
             )))
         }
@@ -249,9 +230,9 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
         gnitz_wire::OpNode::NullExtend { type_codes, nulls_first } => {
             let in_reg = ctx.unary_delta_in(nid)?;
             let out_schema =
-                gnitz_store::ops::null_extend_output_schema(&ctx.reg_schema(in_reg), type_codes, *nulls_first)?;
+                gnitz_store::ops::null_extend_output_schema(&ctx.prog.schema_of(in_reg), type_codes, *nulls_first)?;
             let op = Op::NullExtend { nulls_first: *nulls_first };
-            Ok(OutReg::Delta(ctx.push(in_reg, out_schema, op)))
+            Ok(OutReg::Delta(ctx.prog.push(in_reg, out_schema, op)))
         }
     }
 }
@@ -265,14 +246,18 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
 /// and either elides it or allocates a register for it.
 fn emit_map(ctx: &mut EmitCtx, nid: NodeId, mk: &gnitz_wire::MapKind) -> Result<OutReg, String> {
     let in_reg = ctx.unary_delta_in(nid)?;
-    let plan = MapPlan::from_wire(&ctx.reg_schema(in_reg), mk)?;
+    let plan = MapPlan::from_wire(&ctx.prog.schema_of(in_reg), mk)?;
     // A MAP that reproduces its input row verbatim emits nothing; the node's
     // consumers read the input register instead.
     if plan.is_identity() {
         return Ok(OutReg::Delta(in_reg));
     }
     let out_schema = *plan.out_schema();
-    Ok(OutReg::Delta(ctx.push(in_reg, out_schema, Op::Map(Box::new(plan)))))
+    Ok(OutReg::Delta(ctx.prog.push(
+        in_reg,
+        out_schema,
+        Op::Map(Box::new(plan)),
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -287,7 +272,7 @@ fn emit_reduce(
     global_ground: bool,
 ) -> Result<OutReg, String> {
     let in_reg = ctx.unary_delta_in(nid)?;
-    let in_schema = ctx.reg_schema(in_reg);
+    let in_schema = ctx.prog.schema_of(in_reg);
     let seeds_ground = global_ground && owns_ground(ctx, nid)?;
     let plan = match ctx.reads_partials(nid) {
         true => gnitz_store::ops::ReducePlan::combine(&in_schema, agg, seeds_ground)?,
@@ -337,7 +322,7 @@ fn push_reduce(
         .as_ref()
         .map(|bake| ctx.declare_child(index_kind, nid, bake.schema));
     let baked = Box::new(BakedReduce::new(plan, avi_table));
-    ctx.push(in_reg, out_schema, Op::Reduce { out_trace, plan: baked })
+    ctx.prog.push(in_reg, out_schema, Op::Reduce { out_trace, plan: baked })
 }
 
 /// Declare `plan`'s children under `kinds`, and push the top-N over `in_reg`.
@@ -353,7 +338,7 @@ fn push_topn(
     // The ordered index of every input row — the operator's whole history.
     let index_table = ctx.declare_child(index_kind, nid, plan.index.schema);
     let baked = Box::new(BakedTopN { plan, index_table });
-    ctx.push(in_reg, out_schema, Op::TopN { out_trace, plan: baked })
+    ctx.prog.push(in_reg, out_schema, Op::TopN { out_trace, plan: baked })
 }
 
 /// `consumer`'s per-worker partial over its shard's input, or `None` for a reduce
@@ -361,7 +346,7 @@ fn push_topn(
 fn emit_partial(ctx: &mut EmitCtx, consumer: NodeId) -> Result<Option<DeltaReg>, String> {
     let shard = ctx.loaded.inputs(consumer).unary();
     let in_reg = ctx.unary_delta_in(shard)?;
-    let in_schema = ctx.reg_schema(in_reg);
+    let in_schema = ctx.prog.schema_of(in_reg);
     Ok(match ctx.loaded.op(consumer) {
         gnitz_wire::OpNode::Reduce { agg, .. } => gnitz_store::ops::ReducePlan::partial(&in_schema, agg)?
             .map(|plan| push_reduce(ctx, shard, PARTIAL, in_reg, plan)),
@@ -421,14 +406,12 @@ pub(super) fn build_plan(
         partial_seeds: seeds.iter().filter(|s| s.partials).map(|s| s.shard).collect(),
         registry,
         layout,
-        instructions: Vec::new(),
-        integrates: Vec::new(),
-        delta_schemas: Vec::new(),
+        prog: ProgramBuilder::default(),
         out_reg_of: vec![None; loaded.len()],
         source_reg_map: FxHashMap::default(),
     };
     for seed in seeds {
-        let reg = ctx.push_delta_reg(seed.schema);
+        let reg = ctx.prog.seed(seed.schema);
         ctx.out_reg_of[seed.shard] = Some(OutReg::Delta(reg));
     }
     for &nid in ordered {
@@ -442,18 +425,8 @@ pub(super) fn build_plan(
             None => (ctx.unary_delta_in(loaded.inputs(consumer).unary())?, false),
         },
     };
-    let EmitCtx {
-        instructions,
-        integrates,
-        delta_schemas,
-        source_reg_map,
-        out_reg_of,
-        ..
-    } = ctx;
-    let plan = SubPlan {
-        vm: crate::query::vm::build(instructions, integrates, delta_schemas, out_reg),
-        source_reg_map,
-    };
+    let EmitCtx { prog, source_reg_map, out_reg_of, .. } = ctx;
+    let plan = SubPlan { vm: prog.finish(out_reg), source_reg_map };
     Ok(Built { plan, regs: out_reg_of, partial })
 }
 

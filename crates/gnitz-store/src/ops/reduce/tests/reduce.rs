@@ -67,9 +67,9 @@ fn op_reduce(
 /// The value index a non-linear reduce reads its history from, populated
 /// through the production integrate path.
 ///
-/// `history` must include the delta the reduce is about to consume: the
-/// compiler emits the AVI `Integrate` ahead of the `Reduce`, so a prefix seek
-/// returns the *post*-delta extreme. Each call is a separate ingest, and the
+/// `history` must include the delta the reduce is about to consume — the
+/// caller ingests that delta's index entries before opening the cursor — so a
+/// prefix seek returns the *post*-delta extreme. Each call is a separate ingest, and the
 /// cursor's two-tier consolidation sums weights across them — so a retracted
 /// extreme nets to zero and is skipped by the seek.
 struct Avi {

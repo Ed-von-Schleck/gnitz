@@ -4,7 +4,6 @@ use crate::test_support::{make_schema_u64_i64, pk_only_schema, pk_payload_schema
 use gnitz_store::relation::StateLayout;
 use gnitz_store::schema::SchemaColumn;
 use gnitz_wire::TypeCode;
-use std::collections::HashMap;
 
 // ── Fixtures ────────────────────────────────────────────────────────────
 
@@ -71,9 +70,9 @@ fn build(
 
 // ── The plan's output ───────────────────────────────────────────────────
 
-/// A plan's output register is the named node's, which its node list must hold.
+/// A plan's output node must be in its node list.
 #[test]
-fn a_plan_outputs_the_named_node_which_its_node_list_must_hold() {
+fn a_plan_refuses_an_output_node_outside_its_node_list() {
     let loaded = loaded_for_test(
         [
             (0, scan_delta(10)),
@@ -93,15 +92,7 @@ fn a_plan_outputs_the_named_node_which_its_node_list_must_hold() {
         )
     };
 
-    let (carved, out_reg_of) = plan(&subgraph_ordered(&loaded, 1)).expect("the carve production performs");
-    assert_eq!(
-        carved.vm.program.out_reg(),
-        out_reg_of[1]
-            .expect("node 1 is in the plan")
-            .delta()
-            .expect("node 1 is a delta"),
-        "a subgraph outputs the register of the node it names"
-    );
+    assert!(plan(&subgraph_ordered(&loaded, 1)).is_ok());
     assert_eq!(rejection(plan(&[0])), "operand is produced outside this plan");
 }
 
@@ -478,114 +469,6 @@ fn a_wide_pk_join_compiles() {
         3
     )
     .is_ok());
-}
-
-// ── Destructive-register liveness ───────────────────────────────────────
-//
-// A register may be emptied in place iff it has no later reader and is not the
-// sink the epoch extracts — a property of the emitted list, decided per input
-// register rather than per view.
-
-/// Every destructive opcode's take verdict in program order, labelled by its
-/// slot; a `Union` contributes both operands.
-fn consume_flags(plan: &SubPlan) -> Vec<(&'static str, bool)> {
-    plan.vm
-        .program
-        .take_verdicts()
-        .flat_map(|(op, takes)| {
-            let label = match op {
-                Op::Union { .. } => ["union.a", "union.b"],
-                Op::Negate => ["negate", ""],
-                _ => return Vec::new(),
-            };
-            takes
-                .into_iter()
-                .enumerate()
-                .filter_map(|(slot, takes)| Some((label[slot], takes?)))
-                .collect()
-        })
-        .collect()
-}
-
-/// The INTERSECT/EXCEPT fan-out shape: ScanDelta(10)'s register fans into two
-/// destructive readers. Instructions are emitted in node-id order, so the later
-/// one takes and the earlier one clones — whichever of them the plan outputs.
-#[test]
-fn a_destructive_op_takes_its_input_only_when_it_is_the_last_reader() {
-    for (out_id, other_id) in [(2, 1), (1, 2)] {
-        let loaded = loaded_for_test(
-            [
-                (0, scan_delta(10)),
-                (out_id, gnitz_wire::OpNode::Negate),
-                (other_id, gnitz_wire::OpNode::Negate),
-            ],
-            vec![(0, out_id, SLOT_IN), (0, other_id, SLOT_IN)],
-        );
-        let (plan, _) = build(
-            &loaded,
-            &loaded.ordered_where(|_| true),
-            &sources([(10, make_schema_u64_i64())]),
-            SELF_CONTAINED,
-            &[],
-            out_id,
-        )
-        .expect("both orderings compile");
-        assert_eq!(
-            consume_flags(&plan),
-            vec![("negate", false), ("negate", true)],
-            "the first reader must clone while the second still has to read; the \
-             second's take is then free (plan output: node {out_id})"
-        );
-    }
-}
-
-/// The set-operation shape: two sources meet at one `Union`, neither operand has
-/// a later reader, so both sides are taken. And the epoch-end output extraction
-/// reads the sink register without being an instruction — so a `Union` whose
-/// operand *is* the sink must not take it, or it would emit nothing, silently,
-/// every epoch.
-#[test]
-fn a_union_takes_each_unread_operand_but_never_the_sink_register() {
-    let two_col = make_schema_u64_i64();
-    let flags = |nodes: HashMap<NodeId, gnitz_wire::OpNode>, edges: Vec<(NodeId, NodeId, usize)>, out: NodeId| {
-        let loaded = loaded_for_test(nodes, edges);
-        let plan = build(
-            &loaded,
-            &loaded.ordered_where(|_| true),
-            &sources([(10, two_col), (11, two_col)]),
-            SELF_CONTAINED,
-            &[],
-            out,
-        )
-        .expect("a union plan compiles")
-        .0;
-        consume_flags(&plan)
-    };
-
-    assert_eq!(
-        flags(
-            HashMap::from([(0, scan_delta(10)), (1, scan_delta(11)), (2, gnitz_wire::OpNode::Union),]),
-            vec![(0, 2, SLOT_IN), (1, 2, SLOT_B)],
-            2,
-        ),
-        vec![("union.a", true), ("union.b", true)],
-        "neither operand has a later reader, so both are taken"
-    );
-
-    assert_eq!(
-        flags(
-            HashMap::from([
-                (0, scan_delta(10)),
-                (1, gnitz_wire::OpNode::Negate),
-                (2, gnitz_wire::OpNode::Union),
-            ]),
-            vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (0, 2, SLOT_B)],
-            1,
-        ),
-        vec![("negate", false), ("union.a", false), ("union.b", true)],
-        "operand A is the sink and must not be taken; the Negate's own input is \
-         still read by operand B, which has no later reader of its own",
-    );
 }
 
 // ── Replica sides ───────────────────────────────────────────────────────

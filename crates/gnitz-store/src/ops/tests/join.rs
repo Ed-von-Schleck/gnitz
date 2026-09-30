@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use proptest::prelude::*;
@@ -7,8 +6,8 @@ use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{create_read_cursor, Batch, BatchBuilder};
 use crate::test_support::{
-    make_batch, make_batch_opk, make_schema_i64pk_i64, make_schema_u128_i64, make_schema_u64_i64, opk_pk,
-    pk_only_schema, pk_payload_schema, row_key, trace_cursor, zset_of, RowKey,
+    join_reference, make_batch, make_batch_opk, make_schema_i64pk_i64, make_schema_u128_i64, make_schema_u64_i64,
+    opk_pk, pk_only_schema, pk_payload_schema, trace_cursor, zset_of,
 };
 use gnitz_wire::read_i64_le;
 
@@ -456,83 +455,7 @@ fn out_triples(out: &Batch) -> Vec<(i64, i64, i64)> {
         .collect()
 }
 
-/// Whether the kind admits the pair of PK regions `(dpk, tpk)`. `rel` relates the
-/// **left** slot to the right one, so the delta's side decides the operand order.
-fn pair_matches(kind: JoinKind, delta_is_right: bool, eq_size: usize, dpk: &[u8], tpk: &[u8]) -> bool {
-    match kind {
-        JoinKind::Cross => true,
-        JoinKind::Equi => dpk == tpk,
-        JoinKind::Range { rel, .. } => {
-            if dpk[..eq_size] != tpk[..eq_size] {
-                return false;
-            }
-            // Equal-width OPK slot slices, so a raw byte compare IS the typed
-            // comparison the relation names.
-            let (d, s) = (&dpk[eq_size..], &tpk[eq_size..]);
-            let (l, r) = match delta_is_right {
-                true => (s, d),
-                false => (d, s),
-            };
-            match rel {
-                RangeRel::Lt => l < r,
-                RangeRel::Le => l <= r,
-                RangeRel::Gt => l > r,
-                RangeRel::Ge => l >= r,
-            }
-        }
-    }
-}
-
-/// Brute-force reference: every `(delta row, trace row)` pair the kind admits,
-/// composed at weight `w_d · w_t` into the key, the left side's payload cells and
-/// then the right's — spelled out independently of the emit loop under test.
-/// Returns the Z-Set it denotes and the number of pairs with a non-zero product.
-fn reference(
-    kind: JoinKind,
-    delta_is_right: bool,
-    delta_schema: &SchemaDescriptor,
-    trace_schema: &SchemaDescriptor,
-    delta: &Batch,
-    trace: &Batch,
-) -> (HashMap<RowKey, i64>, usize) {
-    let eq_size = match kind {
-        JoinKind::Range { n_eq, .. } => 8 * n_eq as usize,
-        _ => 0,
-    };
-    let mut m: HashMap<RowKey, i64> = HashMap::new();
-    let mut rows = 0usize;
-    for i in 0..delta.count {
-        let dpk = delta.get_pk_bytes(i);
-        for j in 0..trace.count {
-            let tpk = trace.get_pk_bytes(j);
-            if !pair_matches(kind, delta_is_right, eq_size, dpk, tpk) {
-                continue;
-            }
-            let w = delta.get_weight(i).wrapping_mul(trace.get_weight(j));
-            if w == 0 {
-                continue;
-            }
-            rows += 1;
-            let key: Vec<u8> = match (kind, delta_is_right) {
-                (JoinKind::Cross, true) => [tpk, dpk].concat(),
-                (JoinKind::Cross, false) => [dpk, tpk].concat(),
-                _ => dpk.to_vec(),
-            };
-            let d_cells = row_key(delta, delta_schema, i).1;
-            let t_cells = row_key(trace, trace_schema, j).1;
-            let (mut cells, tail) = match delta_is_right {
-                true => (t_cells, d_cells),
-                false => (d_cells, t_cells),
-            };
-            cells.extend(tail);
-            *m.entry((key, cells)).or_insert(0) += w;
-        }
-    }
-    m.retain(|_, w| *w != 0);
-    (m, rows)
-}
-
-/// Assert the join's output matches [`reference`] on the Z-Set it denotes *and*
+/// Assert the join's output matches [`join_reference`] on the Z-Set it denotes *and*
 /// on the raw row count — the count is what catches an equal-and-opposite
 /// miss/spurious pair that the folded Z-Set alone hides — over the trace as one
 /// consolidated run and as its raw rows dealt round-robin into three, each
@@ -551,7 +474,7 @@ fn assert_matches_reference(
     let cs = Batch::consolidate_if_needed(delta);
     let delta = cs.as_ref().unwrap_or(delta);
     let folded = Batch::clone(trace).into_consolidated();
-    let (want, want_rows) = reference(kind, delta_is_right, &delta_schema, &trace_schema, delta, &folded);
+    let (want, want_rows) = join_reference(kind, delta_is_right, &delta_schema, &trace_schema, delta, &folded);
 
     let dealt: Vec<Rc<Batch>> = (0..3)
         .map(|k| {
