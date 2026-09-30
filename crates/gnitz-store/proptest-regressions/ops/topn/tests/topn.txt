@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9eee4274b8f9939797bb7bb595357f7fdf1a79b67875fa5350b1a6ce5d3ca2d0 # shrinks to gi = 0, keys = [OrderKey { col: 0, desc: false, nulls_first: false }], limit = 1, offset = 3, ticks = [[((0, 0, None, None, 9223372036854775808), 2)]]
+cc 201df878ebd6718b81d4ff8deaa832bb9535d54706a358c5786f4f4ccc908006 # shrinks to keys = [OrderKey { col: 0, desc: false, nulls_first: false }], limit = 1, offset = 2, ticks = [[((0, 0, None, None, 9223372036854775808), 2)]]
