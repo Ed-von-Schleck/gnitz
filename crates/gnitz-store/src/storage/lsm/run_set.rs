@@ -73,7 +73,7 @@ impl RunSet {
     }
 
     /// Append a consolidated run, folding the set when it gets crowded. Empty
-    /// runs are never stored, so `is_empty()` is exactly "no rows".
+    /// runs are never stored.
     pub(crate) fn push(&mut self, TrimmedRun(run): TrimmedRun, schema: &SchemaDescriptor) {
         debug_assert!(run.consolidated_verified(), "RunSet::push requires a consolidated run",);
         if run.count == 0 {
@@ -87,11 +87,6 @@ impl RunSet {
         if self.runs.len() >= FOLD_THRESHOLD {
             self.fold(schema);
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn runs(&self) -> &[Rc<Batch>] {
-        &self.runs
     }
 
     /// The runs whose PK extent meets the inclusive `bound`; `None` takes them all.
@@ -123,26 +118,9 @@ impl RunSet {
         self.runs.len()
     }
 
-    #[cfg(test)]
-    pub(super) fn is_empty(&self) -> bool {
-        self.runs.is_empty()
-    }
-
-    #[cfg(test)]
-    pub(super) fn bytes(&self) -> usize {
-        self.bytes
-    }
-
     /// The set has outgrown its heap budget and must be drained by its owner.
     pub(super) fn is_full(&self) -> bool {
         self.bytes > self.budget
-    }
-
-    /// Rebind the ceiling a drain is judged against.
-    #[cfg(test)]
-    pub(super) fn set_budget(&mut self, budget: usize) {
-        self.budget = budget;
-        self.bloom.take(); // its key capacity was sized from the old budget
     }
 
     pub(super) fn row_count(&self) -> usize {
@@ -199,11 +177,11 @@ impl RunSet {
         if merged.count != input_rows {
             self.bloom.take();
         }
+        self.bytes = 0;
         if merged.count > 0 {
-            self.bytes = merged.total_bytes();
-            self.runs.push(TrimmedRun::new(merged).0);
-        } else {
-            self.bytes = 0;
+            let run = TrimmedRun::new(merged).0;
+            self.bytes = run.total_bytes();
+            self.runs.push(run);
         }
     }
 
@@ -230,7 +208,7 @@ impl RunSet {
         }
         let bloom = self.bloom.get_or_init(|| {
             // Sized to the budget, not the current rows: later pushes add to it.
-            let mut bloom = BloomFilter::new((self.budget / EST_BYTES_PER_ROW).max(16) as u32);
+            let mut bloom = BloomFilter::new((self.budget / EST_BYTES_PER_ROW).max(16));
             for run in &self.runs {
                 bloom_add_batch(&mut bloom, run);
             }

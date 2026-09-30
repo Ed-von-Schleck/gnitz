@@ -85,51 +85,12 @@ pub(crate) struct ShardWriteOpts {
 
 impl ShardWriteOpts {
     /// The compaction write policy: FoR-packed integer payload regions. The
-    /// differential-test oracles reuse it so they cannot drift from the
-    /// production write; the shard index overrides `skip_pk_filter` per store.
+    /// shard index overrides `skip_pk_filter` per store.
     pub(crate) const COMPACTION: Self = ShardWriteOpts {
         pack_ints: true,
         skeleton: false,
         skip_pk_filter: false,
     };
-}
-
-/// A single-I64-payload shard of `(opk_bytes, weight, payload)` rows, written by
-/// the production [`Batch::write_as_shard`]. Several I64 payload columns go
-/// through [`write_i64_shard`].
-#[cfg(test)]
-pub(in crate::storage) fn write_test_shard(
-    path: &std::path::Path,
-    schema: &SchemaDescriptor,
-    rows: &[(impl AsRef<[u8]>, i64, i64)],
-    opts: ShardWriteOpts,
-) -> String {
-    let path = path.to_str().unwrap().to_owned();
-    crate::test_support::make_batch_opk(schema, rows)
-        .write_as_shard(&path, opts)
-        .unwrap();
-    path
-}
-
-/// [`write_test_shard`] at any number of I64 payload columns, with explicit null
-/// words. Rows are `(opk_bytes, weight, null_word, payload)`.
-#[cfg(test)]
-pub(in crate::storage) fn write_i64_shard(
-    path: &str,
-    schema: &SchemaDescriptor,
-    rows: &[(Vec<u8>, i64, u64, Vec<i64>)],
-    opts: ShardWriteOpts,
-) {
-    let mut b = Batch::with_capacity(schema, rows.len().max(1));
-    for (pk, w, null_word, cols) in rows {
-        debug_assert_eq!(cols.len(), schema.num_payload_cols());
-        b.begin_row(pk, *w);
-        for (pi, v) in cols.iter().enumerate() {
-            b.extend_col(pi, &v.to_le_bytes());
-        }
-        b.commit_row(*null_word);
-    }
-    b.write_as_shard(path, opts).unwrap();
 }
 
 impl Batch {

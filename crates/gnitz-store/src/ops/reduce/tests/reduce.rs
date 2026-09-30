@@ -2435,7 +2435,7 @@ fn avi_two_groups_distinct_byte_form_keys() {
             b.begin_row_bytes(&key, 1i64);
             b.end_row();
         }
-        b.finish()
+        b.finish().into_consolidated()
     };
 
     let mut avi_ch = trace_cursor(avi_batch, avi_schema);
@@ -4525,7 +4525,7 @@ fn global_lone_min_avi_empty_prefix() {
             b.begin_row_bytes(&key, 1i64);
             b.end_row();
         }
-        b.finish()
+        b.finish().into_consolidated()
     };
 
     let g_min_avi = |delta: &Batch, to: &mut crate::storage::ReadCursor, avi: &[i64]| {

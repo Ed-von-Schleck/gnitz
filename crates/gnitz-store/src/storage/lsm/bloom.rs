@@ -17,8 +17,8 @@ pub(crate) struct BloomFilter {
 }
 
 impl BloomFilter {
-    pub(crate) fn new(expected_n: u32) -> Self {
-        let n = (expected_n as usize).max(1);
+    pub(crate) fn new(expected_n: usize) -> Self {
+        let n = expected_n.max(1);
         let m = n * BITS_PER_KEY;
         let num_bytes_raw = ((m + 7) >> 3).max(8);
         // Round up to a power-of-two byte count so num_bits is also a power of

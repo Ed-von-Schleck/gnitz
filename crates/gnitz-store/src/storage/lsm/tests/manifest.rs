@@ -38,11 +38,6 @@ fn roundtrips_at_zero_one_and_many_entries() {
     }
 }
 
-#[test]
-fn encode_is_deterministic() {
-    assert_eq!(encode(&sample(5)), encode(&sample(5)));
-}
-
 /// The magic and version words every manifest opens with.
 const IDENTITY: usize = 16;
 
@@ -54,8 +49,28 @@ fn forged_identity(magic: u64, version: u64) -> Vec<u8> {
     buf
 }
 
+/// `body` behind a valid identity and digest.
+fn sealed(body: &[u8]) -> Vec<u8> {
+    let mut buf = forged_identity(MAGIC, VERSION)[..IDENTITY].to_vec();
+    buf.extend_from_slice(body);
+    let digest = gnitz_wire::checksum(&buf);
+    buf.extend_from_slice(&digest.to_le_bytes());
+    buf
+}
+
 #[test]
-fn decode_rejects_a_malformed_identity() {
+fn decode_rejects_a_malformed_manifest() {
+    let header = |w: &mut Writer| {
+        w.u64(0).u64(0).bytes32(&[]);
+    };
+    let mut too_wide = Writer::new();
+    header(&mut too_wide);
+    too_wide.u64(1).u64(1).u64(1).bytes32(&[0; MAX_PK_BYTES + 1]);
+    let mut torn = Writer::new();
+    header(&mut torn);
+    torn.u64(1).u64(1);
+    let mut trailing = encode(&sample(2));
+    trailing.extend_from_slice(&[0u8; 16]);
     let cases: &[(&str, Vec<u8>, StorageError)] = &[
         (
             "bad magic",
@@ -73,17 +88,21 @@ fn decode_rejects_a_malformed_identity() {
             forged_identity(MAGIC, VERSION)[..IDENTITY + 7].to_vec(),
             StorageError::Corrupt("manifest truncated"),
         ),
+        ("trailing bytes", trailing, StorageError::Corrupt("manifest checksum")),
+        (
+            "guard key too wide",
+            sealed(&too_wide.into_vec()),
+            StorageError::Corrupt("manifest body"),
+        ),
+        (
+            "torn entry",
+            sealed(&torn.into_vec()),
+            StorageError::Corrupt("manifest body"),
+        ),
     ];
     for (name, buf, want) in cases {
         assert_eq!(decode(buf).unwrap_err(), *want, "{name}");
     }
-}
-
-#[test]
-fn trailing_bytes_report_checksum_mismatch() {
-    let mut buf = encode(&sample(2));
-    buf.extend_from_slice(&[0u8; 16]);
-    assert_eq!(decode(&buf).unwrap_err(), StorageError::Corrupt("manifest checksum"));
 }
 
 #[test]

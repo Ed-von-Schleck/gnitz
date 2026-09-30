@@ -63,3 +63,20 @@ fn write_refuses_an_existing_path_and_leaves_it_intact() {
     );
     assert_eq!(std::fs::read(path).unwrap(), before);
 }
+
+/// A shard carries no dead heap bytes: a run whose fold left dead spans behind
+/// writes only the spans its rows reference, and every row reads back.
+#[test]
+fn a_shard_drops_its_runs_dead_heap() {
+    use crate::test_support::{make_schema_pk_u64_payload_string, make_string_batch, map_shard, read_strings};
+    use gnitz_expr::RowSource;
+    let (x, y) = ([b'x'; 20], [b'y'; 20]);
+    let a = make_string_batch(&[(1, 1, &x), (2, 1, &y)]);
+    let run = a.merged_consolidated(&make_string_batch(&[(1, -1, &x)]), &make_schema_pk_u64_payload_string());
+    assert!(run.dead_heap > 0, "premise: the fold left dead bytes");
+
+    let dir = tempfile::tempdir().unwrap();
+    let shard = map_shard(&dir.path().join("s.db"), &run, ShardWriteOpts::default());
+    assert_eq!(shard.blob().len(), y.len(), "only the referenced span reaches disk");
+    assert_eq!(read_strings(&shard.slice_to_owned_batch(0, 1)), [y.to_vec()]);
+}

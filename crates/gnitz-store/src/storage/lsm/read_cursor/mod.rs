@@ -725,8 +725,7 @@ pub(crate) fn empty_cursor(schema: SchemaDescriptor) -> ReadCursor {
     from_runs(std::iter::empty(), schema, 0)
 }
 
-/// Test-only shorthand for [`from_runs`] over a batch slice and a shard slice,
-/// folding any batch that is not yet folded.
+/// Test-only shorthand for [`from_runs`] over a batch slice and a shard slice.
 #[cfg(test)]
 pub(crate) fn create_read_cursor(
     batches: &[Rc<Batch>],
@@ -736,7 +735,7 @@ pub(crate) fn create_read_cursor(
     from_runs(
         batches
             .iter()
-            .map(|b| Run::Mem(Batch::consolidate_if_needed(b).map_or_else(|| Rc::clone(b), Rc::new)))
+            .map(|b| Run::Mem(Rc::clone(b)))
             .chain(shard_arcs.iter().cloned().map(Run::Shard)),
         schema,
         batches.len() + shard_arcs.len(),
@@ -746,5 +745,5 @@ pub(crate) fn create_read_cursor(
 #[cfg(test)]
 mod bench;
 #[cfg(test)]
-#[path = "../tests/read_cursor.rs"]
+#[path = "tests/read_cursor.rs"]
 mod tests;

@@ -1,4 +1,5 @@
 use super::*;
+use std::os::fd::FromRawFd;
 
 fn open_written(dir: &Path, name: &str) -> File {
     use std::io::Write;
@@ -54,10 +55,10 @@ fn batch_sync_waits_out_a_short_submit() {
         .expect("a second batch on the same ring");
 }
 
-/// Two full chunks plus a tail, through one ring.
+/// Two full chunks plus a tail, through a ring and through the blocking
+/// fallback, and a directory.
 #[test]
 fn sync_paths_spans_several_chunks() {
-    let Some(mut ring) = ring_or_skip() else { return };
     let dir = tempfile::tempdir().unwrap();
     let paths: Vec<_> = (0..2 * FD_CHUNK_THRESHOLD + 1)
         .map(|i| {
@@ -66,22 +67,22 @@ fn sync_paths_spans_several_chunks() {
             dir.path().join(name)
         })
         .collect();
-
-    sync_paths(&mut ring, &paths, DATASYNC).expect("chunked fdatasync");
+    for mut ring in [ring_or_skip().flatten(), None] {
+        sync_paths(&mut ring, &paths, DATASYNC).expect("chunked fdatasync");
+        sync_paths(&mut ring, [dir.path()], FsyncFlags::empty()).expect("directory fsync");
+    }
 }
 
-/// The blocking fallback, for files and a directory.
+/// A failed fsync surfaces its errno, from a CQE and from the fallback alike.
 #[test]
-fn sync_paths_without_a_ring() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths: Vec<_> = (0..FD_CHUNK_THRESHOLD + 1)
-        .map(|i| {
-            let name = format!("blocking_{i}.bin");
-            open_written(dir.path(), &name);
-            dir.path().join(name)
-        })
-        .collect();
-
-    sync_paths(&mut None, &paths, DATASYNC).expect("blocking fdatasync");
-    sync_paths(&mut None, [dir.path()], FsyncFlags::empty()).expect("blocking directory fsync");
+fn a_failed_fsync_reports_its_errno() {
+    let mut fds = [0; 2];
+    // SAFETY: `fds` holds the two descriptors `pipe` writes.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: each descriptor is fresh and owned by exactly one `File`.
+    let files: Vec<File> = fds.iter().map(|&fd| unsafe { File::from_raw_fd(fd) }).collect();
+    for mut ring in [ring_or_skip().flatten(), None] {
+        let got = batch_sync_with(&mut ring, &files, DATASYNC, |r, want| r.submit_and_wait(want));
+        assert_eq!(got, Err(StorageError::Io(libc::EINVAL)), "a pipe cannot be synced");
+    }
 }

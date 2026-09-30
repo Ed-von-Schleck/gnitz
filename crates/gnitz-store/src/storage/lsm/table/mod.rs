@@ -206,13 +206,6 @@ impl Table {
         })
     }
 
-    /// Shrink the memtable budget so a test outside `lsm` can drive the drain
-    /// path without ingesting megabytes.
-    #[cfg(test)]
-    pub(crate) fn set_memtable_budget(&mut self, budget: usize) {
-        self.memtable.set_budget(budget);
-    }
-
     /// The schema this store's rows are read in.
     pub(crate) fn schema(&self) -> &SchemaDescriptor {
         &self.shard_index.schema
@@ -498,5 +491,5 @@ impl Table {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[path = "../tests/table.rs"]
+#[path = "tests/table.rs"]
 mod tests;

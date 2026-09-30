@@ -37,3 +37,5 @@ pub(crate) use repr::merge::merge_consolidated;
 pub(crate) use repr::scatter::{materialize_carrying, reset_slots};
 pub(crate) use repr::seek::{pk_group_end, pk_prefix_group_end};
 pub(crate) use repr::string_heap::{copy_string_cells, prorated_blob_cap, BlobCache};
+#[cfg(test)]
+pub(crate) use repr::{shard_file::ShardWriteOpts, shard_reader::MappedShard};

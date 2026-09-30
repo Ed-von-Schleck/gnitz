@@ -26,20 +26,17 @@ pub(super) fn skeleton_schema(schema: &SchemaDescriptor) -> SchemaDescriptor {
     crate::schema::project_schema(schema, &[]).expect("a schema's own PK fits the PK limit")
 }
 
+/// Slot owning `key` in a sorted guard list: the last guard `≤ key`, saturating
+/// to slot 0 for keys below the first guard.
+pub(super) fn guard_slot<T>(guards: &[T], key: &[u8], gk: impl Fn(&T) -> &[u8]) -> usize {
+    guards
+        .partition_point(|g| compare_pk_ordering(gk(g), key).is_le())
+        .saturating_sub(1)
+}
+
 /// Fold `bucket` — one guard's (PK, payload)-sorted survivor slice — into one
-/// `(PK, Σweight)` row per key, dropping net-zero keys. The per-PK fold is what
-/// makes the output one row per key even on a guard's *first* dehydration, whose
-/// survivors are still (PK, payload) groups; it also strips the payload
-/// breakdown of hydrated groups sinking into an already-dehydrated guard.
-///
-/// A fold's per-PK sum is the PK-projection of the view integral over a
-/// per-key time prefix of the store's history (fold totality: L0 is consumed
-/// whole, a guard fold takes all of the guard's entries, a vertical takes the
-/// whole source guard plus every overlapping destination guard), and the
-/// integral is positive — so a retraction's balancing insertion is always inside
-/// the prefix and the sum is never negative. `debug_assert!(w > 0)` is the
-/// tripwire: a future *partial* compaction that broke fold totality would trip
-/// it instead of silently corrupting bounded views.
+/// `(PK, Σweight)` row per key, dropping net-zero keys. Every fold takes a
+/// per-key time prefix of a positive integral, so no sum is negative.
 fn fold_bucket_per_pk(shards: &[&MappedShard], bucket: &[(u32, u32, i64)]) -> Vec<(u32, u32, i64)> {
     let pk_of = |&(src, row, _): &(u32, u32, i64)| shards[src as usize].get_pk_bytes(row as usize);
     bucket
@@ -73,26 +70,18 @@ pub(super) fn merge_and_route(
     }
     let total_rows: usize = shards.iter().map(|s| s.row_count()).sum(); // survivor upper bound
 
-    // Phase 1 — merge into survivors, sorted (PK, payload). The merge order is
-    // the guard order, so each guard's survivors are one contiguous run and the
-    // split points below are `guards.len()` binary searches rather than a guard
-    // lookup per row.
+    // Phase 1 — merge into survivors, sorted (PK, payload). `guard_slot` is
+    // monotone in the key, so each guard's survivors are one contiguous run and
+    // the split points below are binary searches rather than a lookup per row.
     let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(total_rows);
     run_merge(shards, schema, |src, row, w| {
         survivors.push((src as u32, row as u32, w));
     });
 
-    // `bounds[g]..bounds[g + 1]` is guard `g`'s slice: guard `g` owns
-    // `key >= guards[g]`, and guard 0 also owns everything below its own key —
-    // the read router's saturating guard slot. Keys are compared off the mmap,
-    // whole, so two rows differing past byte 16 route apart.
+    // `bounds[g]..bounds[g + 1]` is guard `g`'s slice.
     let pk_at = |&(src, row, _): &(u32, u32, i64)| shards[src as usize].get_pk_bytes(row as usize);
-    let bounds: Vec<usize> = std::iter::once(0)
-        .chain(
-            (1..guards.len())
-                .map(|g| survivors.partition_point(|s| compare_pk_ordering(pk_at(s), guards[g].0.pk_bytes()).is_lt())),
-        )
-        .chain(std::iter::once(survivors.len()))
+    let bounds: Vec<usize> = (0..=guards.len())
+        .map(|g| survivors.partition_point(|s| guard_slot(guards, pk_at(s), |(k, _)| k.pk_bytes()) < g))
         .collect();
 
     // Phase 2 — one batch per guard, each scattered column-at-a-time from its

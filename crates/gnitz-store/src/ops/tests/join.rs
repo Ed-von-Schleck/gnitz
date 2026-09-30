@@ -445,11 +445,11 @@ fn range_join_reuses_a_stale_trace_cursor() {
         (vec![3], 9, 1, 39),
     ];
     for &rel in RELS {
-        let mut fresh_ch = trace_cursor(make_range_batch(&schema, &trace_rows), schema);
+        let mut fresh_ch = trace_cursor(make_range_batch(&schema, &trace_rows).into_consolidated(), schema);
         let want = range_join(&schema, 1, rel, &delta, &mut fresh_ch);
 
         for park_past_end in [false, true] {
-            let mut ch = trace_cursor(make_range_batch(&schema, &trace_rows), schema);
+            let mut ch = trace_cursor(make_range_batch(&schema, &trace_rows).into_consolidated(), schema);
             ch.advance_to(&opk_pk(&schema, &[3, 9]));
             if park_past_end {
                 ch.advance();

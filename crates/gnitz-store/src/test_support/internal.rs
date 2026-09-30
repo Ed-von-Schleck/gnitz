@@ -6,15 +6,20 @@
 //! here, where the shared file would have had to publish it.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::path::Path;
+use std::rc::Rc;
 
 use proptest::prelude::*;
 
-use crate::schema::key::compare_pk_bytes;
+use crate::schema::payload_order::compare_full_rows;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, BatchBuilder, Layout, ReadCursor, RecoverySource, StoreBudgets, Table};
+use crate::storage::{
+    Batch, BatchBuilder, Layout, MappedShard, ReadCursor, RecoverySource, ShardWriteOpts, StoreBudgets, Table,
+};
 use gnitz_wire::TypeCode;
 
-use super::shared::{arb_type_code, pk_payload_schema};
+use super::shared::{arb_type_code, pk_payload_schema, zset_of, RowKey};
 
 /// The canonical wide-PK test schema: a 3×U64 compound primary key
 /// (`pk_stride = 24`, wide) with a single I64 payload column.
@@ -36,7 +41,7 @@ pub fn pk_u64_two_i64_schema() -> SchemaDescriptor {
 }
 
 /// A consolidated batch over [`wide_pk_3xu64_schema`] from native
-/// `(c0, c1, c2, weight, payload)` rows, which must be OPK-sorted.
+/// `(c0, c1, c2, weight, payload)` rows, which must be (PK, payload)-sorted.
 pub fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i64)]) -> Batch {
     let mut b = BatchBuilder::new(*schema);
     for &(c0, c1, c2, w, val) in rows {
@@ -45,13 +50,6 @@ pub fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i
         b.end_row();
     }
     let mut b = b.finish();
-    for r in 1..b.count {
-        assert_ne!(
-            compare_pk_bytes(b.get_pk_bytes(r - 1), b.get_pk_bytes(r)),
-            Ordering::Greater,
-            "make_wide_batch row {r}: non-OPK-sorted PK (encoder regression?)",
-        );
-    }
     b.certify_layout(Layout::Consolidated);
     b
 }
@@ -207,4 +205,126 @@ pub(crate) fn random_schema(rng: &mut crate::test_rng::Rng, payload: &[TypeCode]
         placed[p as usize] = *c;
     }
     SchemaDescriptor::new(&placed, &pos[..n_pk])
+}
+
+/// `batch` written to `path` under `opts` and mapped back, as a store maps the
+/// shards it writes.
+pub(crate) fn map_shard(path: &Path, batch: &Batch, opts: ShardWriteOpts) -> Rc<MappedShard> {
+    let path = path.to_str().unwrap();
+    batch.write_as_shard(path, opts).unwrap();
+    Rc::new(MappedShard::open(path, batch.schema()).unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// The Z-set fold oracle
+// ---------------------------------------------------------------------------
+
+/// The Z-set sum of `inputs`, net-zero elements dropped.
+pub(crate) fn zset_sum(inputs: &[Batch], schema: &SchemaDescriptor) -> HashMap<RowKey, i64> {
+    let mut want: HashMap<RowKey, i64> = HashMap::new();
+    for b in inputs {
+        for (key, w) in zset_of(b, schema) {
+            *want.entry(key).or_insert(0) += w;
+        }
+    }
+    want.retain(|_, w| *w != 0);
+    want
+}
+
+/// `got` is the Z-set sum of `inputs`: one row per element, strictly ascending
+/// in (PK, payload) order.
+pub(crate) fn assert_folds(inputs: &[Batch], got: &Batch, what: &str) {
+    let schema = got.schema();
+    let want = zset_sum(inputs, schema);
+    assert_eq!(zset_of(got, schema), want, "{what}: the Z-set sum");
+    assert_eq!(got.count, want.len(), "{what}: one row per element");
+    let mb = got.as_mem_batch();
+    for r in 1..got.count {
+        assert_eq!(
+            compare_full_rows(schema, &mb, r - 1, &mb, r),
+            Ordering::Less,
+            "{what}: rows {} and {r} out of order",
+            r - 1
+        );
+    }
+}
+
+/// One fixed-int schema per `pk_width_dispatch` arm — `≤8` (strides 1, 4, 8),
+/// `9..=16`, `17..=32` and the `>32` fallback — and a nullable-string schema
+/// under the generic comparator at a narrow and a wide PK.
+pub(crate) fn fold_schemas() -> Vec<SchemaDescriptor> {
+    use TypeCode::*;
+    let generic = |pk: &[TypeCode]| {
+        let mut cols: Vec<SchemaColumn> = pk.iter().map(|&t| SchemaColumn::new(t, false)).collect();
+        cols.extend([SchemaColumn::new(String, true), SchemaColumn::new(I64, true)]);
+        SchemaDescriptor::new(&cols, &(0..pk.len() as u32).collect::<Vec<_>>())
+    };
+    vec![
+        pk_payload_schema(&[U8]),
+        pk_payload_schema(&[I64]),
+        pk_payload_schema(&[I32]),
+        pk_payload_schema(&[U32, U64]),
+        pk_payload_schema(&[U64, I32]),
+        pk_payload_schema(&[U64; 3]),
+        pk_payload_schema(&[U128; 5]),
+        generic(&[U64]),
+        generic(&[U64; 3]),
+    ]
+}
+
+/// `(pk bytes, weight, string, int)`; `None` is NULL.
+pub(crate) type FoldRow = (Vec<u8>, i64, Option<u8>, Option<i64>);
+
+const FOLD_STRS: [&[u8]; 3] = [b"inline", b"a-long-string-that-spills", b"another-long-spilling-value"];
+
+/// An index into [`fold_schemas`] and rows over eight keys of its stride that
+/// differ only in their first and last byte, with small weight and payload
+/// domains, so folds and ghost cancels are common.
+pub(crate) fn arb_fold_case() -> impl Strategy<Value = (usize, Vec<FoldRow>)> {
+    (0..fold_schemas().len()).prop_flat_map(|si| {
+        let stride = fold_schemas()[si].pk_stride();
+        let row = (
+            0u8..2,
+            0u8..4,
+            -3i64..=3,
+            prop::option::of(0u8..3),
+            prop::option::of(0i64..2),
+        );
+        let rows = (
+            prop::collection::vec(any::<u8>(), stride),
+            prop::collection::vec(row, 0..40),
+        )
+            .prop_map(move |(base, rows)| {
+                rows.into_iter()
+                    .map(|(lead, tail, w, s, v)| {
+                        let mut pk = base.clone();
+                        pk[0] = lead;
+                        pk[stride - 1] = base[stride - 1].wrapping_add(tail);
+                        (pk, w, s, v)
+                    })
+                    .collect()
+            });
+        (Just(si), rows)
+    })
+}
+
+/// `rows` as a `Raw` batch over a [`fold_schemas`] schema. A NULL and a zero
+/// hold the same cell bytes and must not fold; each long string lands at its
+/// own heap offset, and equal ones must.
+pub(crate) fn fold_batch(schema: &SchemaDescriptor, rows: &[FoldRow]) -> Batch {
+    let mut b = BatchBuilder::new(*schema);
+    for (pk, w, s, v) in rows {
+        b.begin_row_bytes(pk, *w);
+        if schema.num_payload_cols() == 2 {
+            match s {
+                Some(i) => b.put_blob(FOLD_STRS[*i as usize]),
+                None => b.put_null(),
+            }
+            b.put_opt_int(v.map(|v| v as u128));
+        } else {
+            b.put_int(v.unwrap_or(0) as u128);
+        }
+        b.end_row();
+    }
+    b.finish()
 }

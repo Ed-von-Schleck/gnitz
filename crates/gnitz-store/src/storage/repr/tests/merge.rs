@@ -1,10 +1,12 @@
 use super::*;
-use crate::schema::payload_order::compare_full_rows;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::storage::repr::shard_file::ShardWriteOpts;
+use crate::storage::repr::shard_reader::MappedShard;
 use crate::storage::BatchBuilder;
 use crate::test_support::{
-    bench_time, make_batch_u128_raw, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64,
-    make_string_batch, payload0_i64, pk_payload_schema, pk_u64_two_i64_schema, zset_of, RowKey,
+    arb_fold_case, assert_folds, bench_time, fold_batch, fold_schemas, make_batch_u128_raw,
+    make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64, make_string_batch, map_shard,
+    payload0_i64, pk_u64_two_i64_schema,
 };
 
 /// `MemBatch`'s per-row accessors address the cells its region accessors hold:
@@ -153,8 +155,8 @@ fn merge_consolidated_skewed_bench() {
 // ── The Z-set fold, over every path that runs it ────────────────────────
 
 /// The N-way merge's survivors, materialized with every string relocated.
-fn merge_relocating(batches: &[MemBatch], schema: &SchemaDescriptor) -> Batch {
-    let total = batches.iter().map(|b| b.count).sum();
+fn merge_relocating<S: ColumnarSource>(batches: &[S], schema: &SchemaDescriptor) -> Batch {
+    let total = batches.iter().map(|b| b.row_count()).sum();
     let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(total);
     run_merge(batches, schema, |src, row, w| {
         survivors.push((src as u32, row as u32, w))
@@ -162,39 +164,30 @@ fn merge_relocating(batches: &[MemBatch], schema: &SchemaDescriptor) -> Batch {
     super::super::scatter::UnifiedSet::whole(batches, schema).materialize(&survivors, total)
 }
 
-/// `got` is the Z-set sum of `inputs`: one row per element, strictly ascending
-/// in (PK, payload) order.
-fn assert_folds(inputs: &[Batch], got: &Batch, what: &str) {
-    let schema = got.schema();
-    let mut want: std::collections::HashMap<RowKey, i64> = std::collections::HashMap::new();
-    for b in inputs {
-        for (key, w) in zset_of(b, schema) {
-            *want.entry(key).or_insert(0) += w;
-        }
-    }
-    want.retain(|_, w| *w != 0);
-    assert_eq!(zset_of(got, schema), want, "{what}: the Z-set sum");
-    assert_eq!(got.count, want.len(), "{what}: one row per element");
-    let mb = got.as_mem_batch();
-    for r in 1..got.count {
-        assert_eq!(
-            compare_full_rows(schema, &mb, r - 1, &mb, r),
-            Ordering::Less,
-            "{what}: rows {} and {r} out of order",
-            r - 1
-        );
-    }
-    got.debug_verify_dead_heap();
-}
-
 /// Every fold the engine runs over `runs`, each sorted by (PK, payload): in-batch
-/// consolidation of their concatenation, both N-way scatters, and the pairwise
-/// merge. Each is checked to reach their Z-set sum.
+/// consolidation of their concatenation, both N-way scatters over batches, the
+/// relocating one over each run folded into a shard (every other one FoR-packed),
+/// and the pairwise merge. Each is checked to reach their Z-set sum.
 fn every_fold(schema: &SchemaDescriptor, runs: &[Batch]) -> Vec<(&'static str, Batch)> {
     let mem: Vec<MemBatch> = runs.iter().map(Batch::as_mem_batch).collect();
     let pairwise = runs.iter().fold(Batch::empty_with_schema(schema), |acc, b| {
         acc.merged_consolidated(&b.clone().into_consolidated(), schema)
     });
+    let dir = tempfile::tempdir().unwrap();
+    let shards: Vec<_> = runs
+        .iter()
+        .map(|b| b.clone().into_consolidated())
+        .filter(|b| b.count > 0)
+        .enumerate()
+        .map(|(i, b)| {
+            let opts = ShardWriteOpts {
+                pack_ints: i % 2 == 1,
+                ..ShardWriteOpts::default()
+            };
+            map_shard(&dir.path().join(format!("{i}.db")), &b, opts)
+        })
+        .collect();
+    let shards: Vec<&MappedShard> = shards.iter().map(|s| &**s).collect();
     let folds = vec![
         (
             "consolidate",
@@ -202,10 +195,12 @@ fn every_fold(schema: &SchemaDescriptor, runs: &[Batch]) -> Vec<(&'static str, B
         ),
         ("N-way relocating", merge_relocating(&mem, schema)),
         ("N-way carrying", merge_consolidated(&mem, schema)),
+        ("N-way over shards", merge_relocating(&shards, schema)),
         ("pairwise", pairwise),
     ];
     for (what, got) in &folds {
         assert_folds(runs, got, what);
+        got.debug_verify_dead_heap();
     }
     folds
 }
@@ -292,96 +287,12 @@ fn every_fold_path_reaches_each_fold_case() {
     }
 }
 
-mod fold_proptest {
-    use super::*;
-    use proptest::prelude::*;
-
-    const STRS: [&[u8]; 3] = [b"inline", b"a-long-string-that-spills", b"another-long-spilling-value"];
-
-    /// One fixed-int schema per `pk_width_dispatch` arm — `≤8` (strides 1, 4, 8),
-    /// `9..=16`, `17..=32` and the `>32` fallback — and a nullable-string schema
-    /// under the generic comparator at a narrow and a wide PK.
-    fn schemas() -> Vec<SchemaDescriptor> {
-        use TypeCode::*;
-        let generic = |pk: &[TypeCode]| {
-            let mut cols: Vec<SchemaColumn> = pk.iter().map(|&t| SchemaColumn::new(t, false)).collect();
-            cols.extend([SchemaColumn::new(String, true), SchemaColumn::new(I64, true)]);
-            SchemaDescriptor::new(&cols, &(0..pk.len() as u32).collect::<Vec<_>>())
-        };
-        vec![
-            pk_payload_schema(&[U8]),
-            pk_payload_schema(&[I64]),
-            pk_payload_schema(&[I32]),
-            pk_payload_schema(&[U32, U64]),
-            pk_payload_schema(&[U64, I32]),
-            pk_payload_schema(&[U64; 3]),
-            pk_payload_schema(&[U128; 5]),
-            generic(&[U64]),
-            generic(&[U64; 3]),
-        ]
-    }
-
-    /// `(pk bytes, weight, string, int)`; `None` is NULL.
-    type Row = (Vec<u8>, i64, Option<u8>, Option<i64>);
-
-    /// Rows over eight keys differing only in their first and last byte, with
-    /// small weight and payload domains, so folds and ghost cancels are common.
-    fn arb_rows(stride: usize) -> impl Strategy<Value = Vec<Row>> {
-        let row = (
-            0u8..2,
-            0u8..4,
-            -3i64..=3,
-            prop::option::of(0u8..3),
-            prop::option::of(0i64..2),
-        );
-        (
-            prop::collection::vec(any::<u8>(), stride),
-            prop::collection::vec(row, 0..40),
-        )
-            .prop_map(move |(base, rows)| {
-                rows.into_iter()
-                    .map(|(lead, tail, w, s, v)| {
-                        let mut pk = base.clone();
-                        pk[0] = lead;
-                        pk[stride - 1] = base[stride - 1].wrapping_add(tail);
-                        (pk, w, s, v)
-                    })
-                    .collect()
-            })
-    }
-
-    /// A NULL and a zero hold the same cell bytes, and must not fold; each long
-    /// string lands at its own heap offset, and equal ones must.
-    fn batch(schema: &SchemaDescriptor, rows: &[Row]) -> Batch {
-        let mut b = BatchBuilder::new(*schema);
-        for (pk, w, s, v) in rows {
-            b.begin_row_bytes(pk, *w);
-            if schema.num_payload_cols() == 2 {
-                match s {
-                    Some(i) => b.put_blob(STRS[*i as usize]),
-                    None => b.put_null(),
-                }
-                b.put_opt_int(v.map(|v| v as u128));
-            } else {
-                b.put_int(v.unwrap_or(0) as u128);
-            }
-            b.end_row();
-        }
-        b.finish()
-    }
-
-    proptest! {
-        #[test]
-        fn every_fold_path_reaches_the_zset(
-            (si, rows) in (0usize..schemas().len()).prop_flat_map(|si| {
-                let stride = schemas()[si].pk_stride();
-                (Just(si), arb_rows(stride))
-            })
-        ) {
-            let s = schemas()[si];
-            let runs: Vec<Batch> = rows.chunks(13).map(|c| batch(&s, c).into_consolidated()).collect();
-            every_fold(&s, &runs);
-        }
+proptest::proptest! {
+    #[test]
+    fn every_fold_path_reaches_the_zset((si, rows) in arb_fold_case()) {
+        let s = fold_schemas()[si];
+        let runs: Vec<Batch> = rows.chunks(13).map(|c| fold_batch(&s, c).into_consolidated()).collect();
+        every_fold(&s, &runs);
     }
 }
 
@@ -403,6 +314,7 @@ fn merged_consolidated_charges_exactly_the_dropped_rows() {
         let b = make_string_batch(b_rows);
         let out = a.merged_consolidated(&b, &schema);
         assert_folds(&[a.clone(), b.clone()], &out, "merge");
+        out.debug_verify_dead_heap();
         assert_eq!(
             (out.dead_heap, out.blob().len()),
             (dead, a.blob().len() + b.blob().len()),
@@ -431,6 +343,7 @@ fn a_carried_merge_reads_back_every_string() {
         let (a, b) = (padded(&a_rows, pad_a), padded(&b_rows, pad_b));
         let out = a.merged_consolidated(&b, &schema);
         assert_folds(&[a, b], &out, &format!("padding ({pad_a}, {pad_b})"));
+        out.debug_verify_dead_heap();
         assert!(
             out.blob().len() < 1000,
             "a wasteful side relocates rather than carrying its padding"

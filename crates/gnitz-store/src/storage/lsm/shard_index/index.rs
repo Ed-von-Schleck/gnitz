@@ -43,7 +43,7 @@ impl ShardIndex {
 
     /// Write `batch` as an unpublished shard named by a fresh seq. `newest`
     /// defaults to that seq.
-    pub(super) fn write_shard(
+    fn write_shard(
         &mut self,
         batch: &Batch,
         opts: ShardWriteOpts,
@@ -274,7 +274,7 @@ impl ShardIndex {
     /// Fold L0 into L1, rebalance every level's guards against their byte
     /// targets, then drain L1 down to its own. Observing `R` first is what makes
     /// those targets reflect the fold this call is about to perform.
-    pub(crate) fn run_compact(&mut self) -> Result<(), StorageError> {
+    fn run_compact(&mut self) -> Result<(), StorageError> {
         let inputs = Self::compaction_inputs(&self.l0);
         self.l0_run_bytes = self.l0_run_bytes.max(inputs.bytes);
         let guards: Vec<(PkBuf, bool)> = self.l1_guard_keys().into_iter().map(|k| (k, false)).collect();
@@ -301,7 +301,7 @@ impl ShardIndex {
     /// is the granularity `enforce_capacity` evicts at. The clamp keeps a very
     /// large or very small `capacity` from naming a target outside
     /// `[MIN_GUARD_BYTES, R]`.
-    pub(super) fn guard_target_bytes(&self, level_idx: usize) -> u64 {
+    fn guard_target_bytes(&self, level_idx: usize) -> u64 {
         match self.budget.cap() {
             Some(cap) if level_idx == TERMINAL_LEVEL_IDX => {
                 (cap / SWEEP_STEPS).clamp(MIN_GUARD_BYTES, self.l0_run_bytes)
@@ -328,7 +328,7 @@ impl ShardIndex {
     /// `l2_bytes × r` overflows a `u64` at the design point, hence the `u128`;
     /// the `2` stays outside the root so the extremes saturate rather than
     /// overflow it in turn.
-    pub(super) fn balanced_l1_target(l2_bytes: u64, r: u64) -> u64 {
+    fn balanced_l1_target(l2_bytes: u64, r: u64) -> u64 {
         let balanced = 2 * (u128::from(l2_bytes) * u128::from(r)).isqrt();
         u64::try_from(balanced).unwrap_or(u64::MAX).max(16u64.saturating_mul(r))
     }
@@ -349,7 +349,7 @@ impl ShardIndex {
 
     /// The keys an L0 fold routes into. A guard key is a whole OPK key, compared
     /// as one byte string, so the partition is exact at every PK width.
-    pub(super) fn l1_guard_keys(&self) -> Vec<PkBuf> {
+    fn l1_guard_keys(&self) -> Vec<PkBuf> {
         if !self.levels[0].guards.is_empty() {
             // Below-first-guard keys saturate to bucket 0 on both routing paths
             // (`merge_and_route`'s write split, `FLSMLevel::slot`'s read), so the
@@ -367,7 +367,7 @@ impl ShardIndex {
 
     /// Hold every level's partition at its byte target, in the order the two
     /// passes have to run: a merge must see the sizes a split left.
-    pub(super) fn rebalance_guards(&mut self) -> Result<(), StorageError> {
+    fn rebalance_guards(&mut self) -> Result<(), StorageError> {
         for li in 0..FLSM_LEVELS {
             self.split_overfull_guards(li)?;
             self.merge_underfull_guards(li)?;
@@ -409,7 +409,7 @@ impl ShardIndex {
     /// Fold every guard in `level_idx` that is over the file threshold or its
     /// byte target, cutting the byte-overfull ones at their own key quantiles —
     /// a guard over the file threshold alone folds to one shard in place.
-    pub(super) fn split_overfull_guards(&mut self, level_idx: usize) -> Result<(), StorageError> {
+    fn split_overfull_guards(&mut self, level_idx: usize) -> Result<(), StorageError> {
         let target = self.guard_target_bytes(level_idx);
         // Descending, so each fold reshapes only indices above the guards still to go.
         for gi in (0..self.levels[level_idx].guards.len()).rev() {
@@ -452,7 +452,7 @@ impl ShardIndex {
     ///
     /// Half the target is the hysteresis: a merged run is under the split trigger
     /// by construction, so the two passes cannot trade the same bytes forever.
-    pub(super) fn merge_underfull_guards(&mut self, level_idx: usize) -> Result<(), StorageError> {
+    fn merge_underfull_guards(&mut self, level_idx: usize) -> Result<(), StorageError> {
         let bound = self.guard_target_bytes(level_idx) / 2;
         // Descending, so each drain shifts only indices above the runs still to go.
         for run in self.underfull_runs(level_idx, bound).into_iter().rev() {
@@ -465,7 +465,7 @@ impl ShardIndex {
     /// The sweep's first dehydration of a hydrated terminal guard: one skeleton
     /// shard in place, never split — the output is one row per key, so a part
     /// count derived from the hydrated input would shatter it.
-    pub(super) fn dehydrate_guard(&mut self, guard_idx: usize) -> Result<(), StorageError> {
+    fn dehydrate_guard(&mut self, guard_idx: usize) -> Result<(), StorageError> {
         let key = self.levels[TERMINAL_LEVEL_IDX].guards[guard_idx].guard_key;
         self.fold_guards(
             TERMINAL_LEVEL_IDX,
@@ -509,7 +509,7 @@ impl ShardIndex {
     /// Atomic per band, not per call: a failure in band *k* leaves bands `0..k`
     /// folded, every intermediate state a valid partition, and the next spill
     /// redoes the rest.
-    pub(super) fn vertical_fold(&mut self, src_guard_idx: usize) -> Result<(), StorageError> {
+    fn vertical_fold(&mut self, src_guard_idx: usize) -> Result<(), StorageError> {
         let keys = self.vertical_band_keys(src_guard_idx);
         let bands = match keys.len() {
             1 => 1,
@@ -571,7 +571,7 @@ impl ShardIndex {
     /// Sum of every registered shard's file size — the quantity a
     /// capacity-bounded store is held under. The published superseded files
     /// awaiting the barrier's drain are on disk but not counted.
-    pub(crate) fn resident_bytes(&self) -> u64 {
+    fn resident_bytes(&self) -> u64 {
         self.all_entries().map(|e| e.shard.file_len()).sum()
     }
 
@@ -593,7 +593,7 @@ impl ShardIndex {
     /// the push-down runs at most once. The fixpoint across calls is the skeleton
     /// floor — or, for a dropping store, an empty one, since a drop leaves no
     /// residue to stop at.
-    pub(super) fn enforce_capacity(&mut self) -> Result<(), StorageError> {
+    fn enforce_capacity(&mut self) -> Result<(), StorageError> {
         let Some(cap) = self.budget.cap() else {
             return Ok(());
         };
@@ -639,3 +639,7 @@ impl ShardIndex {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/index.rs"]
+mod tests;

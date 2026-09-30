@@ -8,13 +8,49 @@
 //! cargo test -p gnitz-store --release _bench -- --ignored --nocapture --test-threads=1
 //! ```
 
-use super::tests::{adv_assert_cursor_oracle, adv_key, write_test_shard};
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::storage::repr::shard_file::ShardWriteOpts;
 use crate::storage::BatchBuilder;
 use crate::storage::Layout;
-use crate::test_support::{make_schema_u128_i64, make_schema_u64_i64, wide_pk_3xu64_schema};
+use crate::test_support::{
+    make_batch_opk, make_batch_u128, make_schema_u128_i64, make_schema_u64_i64, map_shard, wide_pk_3xu64_schema,
+};
 use std::rc::Rc;
+
+/// Key `n` at `stride`: its big-endian image right-aligned in zero bytes, so
+/// ascending in `n` at every stride.
+#[inline]
+fn adv_key(n: u64, stride: usize) -> [u8; 40] {
+    let mut k = [0u8; 40];
+    k[stride - 8..stride].copy_from_slice(&n.to_be_bytes());
+    k
+}
+
+/// Drive one reused cursor through `keys`, asserting each `advance_to` lands where
+/// a from-scratch `seek_bytes` on a fresh `mk()` cursor would — at any probe order.
+/// Weight included, which is what pins cross-source ghost folding.
+fn adv_assert_cursor_oracle(mk: impl Fn() -> ReadCursor, stride: usize, keys: &[u64]) {
+    let mut adv = mk();
+    for &v in keys {
+        let k = adv_key(v, stride);
+        adv.advance_to(&k[..stride]);
+        let mut fresh = mk();
+        fresh.seek_bytes(&k[..stride]);
+        assert_eq!(adv.valid, fresh.valid, "advance_to oracle valid v={v}");
+        if adv.valid {
+            assert_eq!(
+                adv.current_pk_bytes(),
+                fresh.current_pk_bytes(),
+                "advance_to oracle pk v={v}"
+            );
+            assert_eq!(
+                adv.current_weight, fresh.current_weight,
+                "advance_to oracle weight v={v}"
+            );
+        }
+    }
+}
 
 /// Baseline: shard-backed merge-scan throughput. Four overlapping-key shards
 /// of 256K rows each (U64 PK; I64, nullable I64, STRING payload) built via the
@@ -113,7 +149,11 @@ fn shard_point_probe_bench() {
     // Sparse (even) shard keys so odd probes resolve a lower bound *between*
     // two present keys. Construction + open outside the timed region.
     let rows: Vec<(u128, i64, i64)> = (0..N).map(|i| ((i * 2) as u128, 1, i as i64)).collect();
-    let shard = write_test_shard(&dir, &schema, 0, &rows);
+    let shard = map_shard(
+        &dir.path().join("probe.db"),
+        &make_batch_u128(&schema, &rows),
+        ShardWriteOpts::default(),
+    );
 
     // Shuffled 50/50 present (even) / absent (odd, between keys) probes.
     let mut rng = crate::test_rng::Rng::new(0xC0DE_1234_5678_9ABC);
@@ -302,10 +342,8 @@ fn adv_flush_cache(scratch: &mut [u8]) {
 }
 
 /// Stream `(pk_bytes, weight, val)` regions to a freshly-written shard and open it.
-/// `pks` is `count × pk_stride` packed OPK bytes (any width — the compound-PK
-/// writer the single-integer `write_test_shard*` helpers lack). `pks` must be
-/// OPK-sorted. `name` is a unique base (fixtures share one tmpdir, so a reused
-/// name would alias a live mmap).
+/// `pks` is `count × pk_stride` packed OPK bytes, OPK-sorted. `name` is a unique
+/// base (fixtures share one tmpdir, so a reused name would alias a live mmap).
 fn adv_write_shard(
     dir: &tempfile::TempDir,
     schema: &SchemaDescriptor,
@@ -314,20 +352,16 @@ fn adv_write_shard(
     weights: &[i64],
     vals: &[i64],
 ) -> Rc<MappedShard> {
-    debug_assert_eq!(pks.len(), weights.len() * schema.pk_stride());
-    debug_assert_eq!(vals.len(), weights.len());
-    let rows: Vec<(Vec<u8>, i64, i64)> = pks
+    let rows: Vec<(&[u8], i64, i64)> = pks
         .chunks_exact(schema.pk_stride())
         .zip(weights.iter().zip(vals))
-        .map(|(pk, (&w, &v))| (pk.to_vec(), w, v))
+        .map(|(pk, (&w, &v))| (pk, w, v))
         .collect();
-    let shard_path = crate::storage::repr::shard_file::write_test_shard(
+    map_shard(
         &dir.path().join(format!("{name}.db")),
-        schema,
-        &rows,
-        crate::storage::repr::shard_file::ShardWriteOpts::default(),
-    );
-    Rc::new(MappedShard::open(&shard_path, schema).unwrap())
+        &make_batch_opk(schema, &rows),
+        ShardWriteOpts::default(),
+    )
 }
 
 /// `n` shards whose keys interleave `[0, total)` round-robin (shard `s` owns keys
@@ -860,24 +894,18 @@ fn for_range_drain_bench() {
     let dir = tempfile::tempdir().unwrap();
     let shards: Vec<Rc<MappedShard>> = (0..2u64)
         .map(|s| {
-            let path = dir.path().join(format!("range_{s}.db")).to_str().unwrap().to_owned();
-            let rows: Vec<_> = (0..N)
-                .map(|i| {
-                    (
-                        (2 * i as u64 + s).to_be_bytes().to_vec(),
-                        1,
-                        0,
-                        vec![(i % 1000) as i64, 3 * i as i64],
-                    )
-                })
-                .collect();
-            crate::storage::repr::shard_file::write_i64_shard(
-                &path,
-                &schema,
-                &rows,
-                crate::storage::repr::shard_file::ShardWriteOpts::COMPACTION,
-            );
-            Rc::new(MappedShard::open(&path, &schema).unwrap())
+            let mut b = BatchBuilder::new(schema);
+            for i in 0..N {
+                b.begin_row(2 * i as u128 + s as u128, 1);
+                b.put_int((i % 1000) as u128);
+                b.put_int(3 * i as u128);
+                b.end_row();
+            }
+            map_shard(
+                &dir.path().join(format!("range_{s}.db")),
+                &b.finish(),
+                ShardWriteOpts::COMPACTION,
+            )
         })
         .collect();
     let (cycles, instructions) = (Counter::cycles().unwrap(), Counter::instructions().unwrap());

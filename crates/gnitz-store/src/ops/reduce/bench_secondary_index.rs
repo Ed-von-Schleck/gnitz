@@ -13,7 +13,7 @@
 //!
 //! The numbers describe one shape — a single 500k-row batch, one MIN over an I64
 //! payload grouped by a U32 payload (AVI stride 13, inside the `u128` sort-key
-//! arm), into a fresh table whose memtable never flushes mid-run. Production
+//! arm), into a fresh table at the default budgets. Production
 //! `GROUP BY <BIGINT>` is stride 17, one byte past that arm, and a view backfill
 //! chunks at ~16k rows per worker, where the sort's share is lower. A second
 //! shape runs the same decomposition over a wide MAX, whose key slot and BLOB
@@ -32,14 +32,6 @@ use gnitz_wire::AggFunc;
 const N_ROWS: usize = 500_000;
 const N_GROUPS: u64 = 10_000;
 const ITERS: usize = 40;
-
-/// Memtable byte budget. Default 1 GiB isolates the in-memory cost (no flush
-/// during the timed region). Override with `GNITZ_BENCH_MEMTABLE_KB` to measure
-/// the production-representative path, where the real budget (a few hundred KiB)
-/// flushes shards to disk mid-population.
-fn memtable_budget() -> usize {
-    gnitz_foundation::env::env_num("GNITZ_BENCH_MEMTABLE_KB", 1 << 20) * 1024
-}
 
 /// Source schema: U64 pk (col 0) | U32 grp (col 1) | I64 val (col 2).
 /// AVI groups by col 1 and aggregates MIN over col 2.
@@ -205,11 +197,7 @@ fn decompose(label: &str, bake: AviBake, input: Batch) {
     // growth, not the population.
     let full = bench_time_each(
         ITERS,
-        || {
-            let mut t = scratch_table(tmp.path().to_str().unwrap(), avi_schema);
-            t.set_memtable_budget(memtable_budget());
-            t
-        },
+        || scratch_table(tmp.path().to_str().unwrap(), avi_schema),
         |mut t| {
             t.ingest_owned_batch(avi_batch(input, bake)).unwrap();
             std::hint::black_box(&t);

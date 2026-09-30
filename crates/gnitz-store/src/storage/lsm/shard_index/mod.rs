@@ -4,9 +4,10 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use super::compact::guard_slot;
 use super::manifest::{self, ManifestEntry, ShardSet};
 use crate::schema::key::PkBuf;
-use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, pk_in_range};
+use crate::schema::key::{pk_bytes_eq, pk_in_range};
 use crate::schema::SchemaDescriptor;
 use crate::storage::error::StorageError;
 use crate::storage::repr::merge::ColumnarSource;
@@ -125,17 +126,6 @@ impl ShardIndex {
     pub(crate) fn level_shape(&self) -> (usize, [usize; FLSM_LEVELS]) {
         (self.l0.len(), std::array::from_fn(|i| self.levels[i].guards.len()))
     }
-
-    /// Basenames of the shards registered below L0: every compaction output and
-    /// terminal run, where an L0 shard is a spill.
-    pub(crate) fn level_shard_names(&self) -> Vec<String> {
-        self.levels
-            .iter()
-            .flat_map(|l| &l.guards)
-            .flat_map(|g| &g.entries)
-            .map(|e| manifest::shard_name(e.seq))
-            .collect()
-    }
 }
 
 /// Guarded levels below L0 — L1 and L2.
@@ -160,16 +150,6 @@ const SPLIT_SAMPLES: usize = 1024;
 /// Most destination buckets one fold may write — one output shard each.
 const MAX_PARTS: u64 = 64;
 
-/// Slot owning `key` in a sorted guard list: the last guard `≤ key`, saturating
-/// to slot 0 for keys below the first guard. `compact::merge_and_route` derives
-/// the same slots independently, and `compact`'s differential oracle checks the
-/// two — which is why this stays a named function.
-pub(super) fn guard_slot<T>(guards: &[T], key: &[u8], gk: impl Fn(&T) -> &[u8]) -> usize {
-    guards
-        .partition_point(|g| compare_pk_ordering(gk(g), key).is_le())
-        .saturating_sub(1)
-}
-
 /// One compaction's input set, as [`ShardIndex::compaction_inputs`] gathers it.
 #[derive(Default)]
 pub(super) struct CompactionInputs {
@@ -177,8 +157,8 @@ pub(super) struct CompactionInputs {
     shards: Vec<Rc<MappedShard>>,
     /// The highest `newest` over the inputs, which every output inherits.
     newest: u64,
-    /// Registered bytes of the inputs — the amplification bench's read side,
-    /// taken from the entries rather than re-`stat`ed off the paths.
+    /// Registered bytes of the inputs, taken from the entries rather than
+    /// re-`stat`ed off the paths: what an L0 fold observes as `R`.
     bytes: u64,
 }
 
@@ -491,7 +471,3 @@ impl ShardIndex {
         self.all_entries().try_for_each(|e| e.shard.verify_body())
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/shard_index.rs"]
-mod tests;
