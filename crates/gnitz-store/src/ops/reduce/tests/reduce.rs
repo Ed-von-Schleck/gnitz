@@ -1,7 +1,6 @@
 //! Reduce operator tests. Imports submodule items by name; helpers live in this
 //! file rather than a shared `common.rs` so the tests file stays self-contained.
 
-use crate::ops::map::PkSource;
 use crate::schema::ColumnTable;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, BatchBuilder, Layout, ReadCursor};
@@ -456,14 +455,6 @@ fn linear_sum_only_new_all_null_group_present() {
         ],
         &[0],
     );
-    // Finalize projects [grp, sum]; cnn and the count companion are stripped.
-    let fin_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I64, true), // sum (nullable)
-        ],
-        &[0],
-    );
     // sum / (cnn != 0) → fin payload 0, NULL when cnn is 0.
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 2 }, // r0 = cnn
@@ -476,15 +467,13 @@ fn linear_sum_only_new_all_null_group_present() {
             b: Reg(2),
         }, // r4 = sum / gate
     ];
-    // fin payload 0 = the gated sum.
+    // Finalize projects [grp, sum]; cnn and the count companion are stripped.
     let sinks = vec![Sink::Reg(Reg(4))];
-    let mut fin_func = crate::ops::MapPlan::from_map(
-        LogicalProgram::new(instrs, sinks, vec![]),
-        &out_schema,
-        &fin_schema,
-        PkSource::Inherit,
-    )
-    .unwrap();
+    let fin_map = gnitz_wire::ComputeMap {
+        program: LogicalProgram::new(instrs, sinks, vec![]).to_blob_bytes(),
+        out_cols: vec![(TypeCode::I64, true)],
+    };
+    let mut fin_func = crate::ops::MapPlan::from_compute_map(&out_schema, &fin_map).unwrap();
 
     let aggs = [
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Sum },
@@ -615,16 +604,6 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         &[0],
     );
 
-    // Finalized output projects [grp, count, sum] — companion stripped.
-    let fin_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::I64, false), // grp
-            SchemaColumn::new(TypeCode::I64, false), // count
-            SchemaColumn::new(TypeCode::I64, true),  // sum (nullable)
-        ],
-        &[0],
-    );
-
     // Finalize program (full reduce-output column indices; resolved below):
     //   copy count(col 1) → fin payload 0,
     //   emit sum-gate = sum(col 2) / (cnn(col 3) != 0) → fin payload 1.
@@ -640,15 +619,13 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
             b: Reg(2),
         }, // r4 = sum / gate (NULL when gate == 0)
     ];
-    // fin payload 0 = count, 1 = the gated sum.
+    // Finalized output projects [grp, count, sum] — companion stripped.
     let sinks = vec![Sink::Col(1), Sink::Reg(Reg(4))];
-    let mut fin_func = crate::ops::MapPlan::from_map(
-        LogicalProgram::new(instrs, sinks, vec![]),
-        &out_schema,
-        &fin_schema,
-        PkSource::Inherit,
-    )
-    .unwrap();
+    let fin_map = gnitz_wire::ComputeMap {
+        program: LogicalProgram::new(instrs, sinks, vec![]).to_blob_bytes(),
+        out_cols: vec![(TypeCode::I64, false), (TypeCode::I64, true)],
+    };
+    let mut fin_func = crate::ops::MapPlan::from_compute_map(&out_schema, &fin_map).unwrap();
 
     let aggs = [
         AggDescriptor::COUNT_STAR,

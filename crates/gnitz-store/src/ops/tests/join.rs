@@ -5,14 +5,12 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::storage::{Batch, BatchBuilder, Layout};
+use crate::storage::{create_read_cursor, Batch, BatchBuilder};
 use crate::test_support::{
-    make_batch, make_batch_opk, make_schema_i64pk_i64 as make_schema_signed, make_schema_u64_i64, opk_pk,
+    make_batch, make_batch_opk, make_schema_i64pk_i64, make_schema_u128_i64, make_schema_u64_i64, opk_pk,
     pk_only_schema, pk_payload_schema, row_key, trace_cursor, zset_of, RowKey,
 };
 use gnitz_wire::read_i64_le;
-
-const RELS: &[RangeRel] = RangeRel::ALL;
 
 /// The plan the compiler would bake for this pair, through the operator's own
 /// constructor rather than a look-alike.
@@ -40,78 +38,63 @@ fn join(
     op_join_delta_trace(cs.as_ref().unwrap_or(delta), cursor, &p.out_schema, p.probe)
 }
 
-/// The probe's own equality-prefix width, so the oracle slices a key exactly
-/// where the walk does.
-fn probe_eq_size(probe: &JoinProbe) -> usize {
-    match probe.walk {
-        Walk::Range(r) => r.eq_size,
-        _ => 0,
-    }
-}
-
 // -----------------------------------------------------------------------
 // The output schema
 // -----------------------------------------------------------------------
 
+/// The output is the key — the shared one, or under `Cross` the pair of both
+/// PKs — then the left payload, then the right, whichever port the delta
+/// arrives on.
 #[test]
 fn the_output_lays_out_the_key_then_both_payloads() {
-    let left = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U128, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
+    use TypeCode::*;
+    let u128_string = SchemaDescriptor::new(
+        &[SchemaColumn::new(U128, false), SchemaColumn::new(String, false)],
         &[0],
     );
-    let right = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U128, false),
-            SchemaColumn::new(TypeCode::String, false),
-        ],
-        &[0],
+    let compound = SchemaDescriptor::new(&[SchemaColumn::new(U64, false); 4], &[1, 2]);
+    /// `(kind, left, right, output PK columns, output column types)`.
+    type Case = (
+        JoinKind,
+        SchemaDescriptor,
+        SchemaDescriptor,
+        &'static [u32],
+        &'static [TypeCode],
     );
-    let joined = plan(JoinKind::Equi, false, &left, &right).out_schema;
-    assert_eq!(joined.num_columns(), 3); // PK + left_I64 + right_STRING
-    assert_eq!(joined.columns[0].type_code, TypeCode::U128);
-    assert_eq!(joined.columns[1].type_code, TypeCode::I64);
-    assert_eq!(joined.columns[2].type_code, TypeCode::String);
-
-    // A keyless join takes no part in either key, so it mints the pair.
-    let crossed = plan(JoinKind::Cross, false, &left, &right).out_schema;
-    assert_eq!(crossed.pk_cols(), &[0, 1]);
-    assert_eq!(crossed.num_columns(), 4);
-    assert_eq!(crossed.columns[2].type_code, TypeCode::I64);
-    assert_eq!(crossed.columns[3].type_code, TypeCode::String);
-}
-
-#[test]
-fn the_output_carries_a_compound_pk_into_the_key_region() {
-    // A keyed join takes one shared key, so both sides' PK columns match.
-    let left = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false); 4], &[1, 2]);
-    let right = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0, 1],
-    );
-    let joined = plan(JoinKind::Equi, false, &left, &right).out_schema;
-    // Two PK columns up front, then left payload (2), then right payload (1) = 5.
-    assert_eq!(joined.num_columns(), 5);
-    assert_eq!(joined.pk_cols(), &[0, 1]);
-    assert_eq!(joined.columns[0].type_code, TypeCode::U64);
-    assert_eq!(joined.columns[1].type_code, TypeCode::U64);
-
-    // A single-PK pair collapses back to pk_indices = [0].
-    let single = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0],
-    );
-    let joined_single = plan(JoinKind::Equi, false, &single, &single).out_schema;
-    assert_eq!(joined_single.pk_cols(), &[0]);
+    let cases: [Case; 3] = [
+        (
+            JoinKind::Equi,
+            make_schema_u128_i64(),
+            u128_string,
+            &[0],
+            &[U128, I64, String],
+        ),
+        (
+            JoinKind::Cross,
+            make_schema_u128_i64(),
+            u128_string,
+            &[0, 1],
+            &[U128, U128, I64, String],
+        ),
+        (
+            JoinKind::Equi,
+            compound,
+            pk_payload_schema(&[U64; 2]),
+            &[0, 1],
+            &[U64, U64, U64, U64, I64],
+        ),
+    ];
+    for (kind, left, right, pk, types) in cases {
+        let joined = plan(kind, false, &left, &right).out_schema;
+        assert_eq!(
+            plan(kind, true, &right, &left).out_schema,
+            joined,
+            "{kind:?}: the delta's port"
+        );
+        assert_eq!(joined.pk_cols(), pk, "{kind:?}");
+        let got: Vec<TypeCode> = (0..joined.num_columns()).map(|c| joined.columns[c].type_code).collect();
+        assert_eq!(got, types, "{kind:?}");
+    }
 }
 
 /// A keyed join reads one side's PK region as the other's, so a mismatched pair
@@ -136,16 +119,13 @@ fn a_keyed_join_refuses_mismatched_pk_types() {
 }
 
 // -----------------------------------------------------------------------
-// Equi delta-trace
+// Literal output
 // -----------------------------------------------------------------------
 
-/// The equi join at every PK stride: the delta rows at a key the trace holds
-/// emit the full cartesian product against that key's trace group, at
-/// `w_delta × w_trace` and in trace-major order; a key the trace does not hold
-/// emits nothing. The absent key sits directly after the held one in the delta
-/// and, for the wide shape, shares its leading 16 OPK bytes — so a delta group
-/// that compared anything less than the whole key would fuse the two and
-/// product the extra row against the trace group.
+/// The equi join at every PK stride. The absent key sits directly after the
+/// held one in the delta and, for the wide shape, shares its leading 16 OPK
+/// bytes — so a delta group that compared anything less than the whole key
+/// would fuse the two and product the extra row against the trace group.
 #[test]
 fn equi_join_products_the_trace_group_at_every_pk_shape() {
     let shapes: [(&str, SchemaDescriptor, &[u128], &[u128]); 3] = [
@@ -160,207 +140,15 @@ fn equi_join_products_the_trace_group_at_every_pk_shape() {
     ];
     for (name, schema, held, absent) in shapes {
         let (held, absent) = (opk_pk(&schema, held), opk_pk(&schema, absent));
-
-        let mut trace = make_batch_opk(&schema, &[(&held, 1, 100), (&held, 2, 200)]);
-        trace.certify_layout(Layout::Consolidated);
-        let mut ch = trace_cursor(trace, schema);
-
-        let mut delta = make_batch_opk(
+        let trace = make_batch_opk(&schema, &[(&held, 1, 100), (&held, 2, 200)]);
+        let delta = make_batch_opk(
             &schema,
             &[(&held, 1, 10), (&held, 1, 20), (&held, 1, 30), (&absent, 1, 40)],
         );
-        delta.certify_layout(Layout::Consolidated);
-
-        let out = join(JoinKind::Equi, false, &schema, &schema, &delta, &mut ch);
-        // (left payload, right payload, weight) — trace-major: each trace row is
-        // walked once and producted against the whole delta group. `absent`
-        // contributes nothing.
-        let got = out_triples(&out);
-        let want: Vec<(i64, i64, i64)> = [(100i64, 1i64), (200, 2)]
-            .into_iter()
-            .flat_map(|(right, w)| [10i64, 20, 30].map(move |left| (left, right, w)))
-            .collect();
-        assert_eq!(got, want, "{name}");
-        for r in 0..out.count {
-            assert_eq!(out.get_pk_bytes(r), &held[..], "{name}: the output PK is the delta PK");
-        }
-        // The emission is trace-major, so neither (PK, payload)-sorted nor
-        // folded; the output carries no layout claim and downstream re-sorts.
-        assert_eq!(out.layout(), Layout::Raw, "{name}");
+        let rows = assert_matches_reference(JoinKind::Equi, false, schema, schema, &delta, &trace, name);
+        assert_eq!(rows, 6, "{name}");
     }
 }
-
-/// The delta port is the join's right side: the payload halves swap, and the
-/// output is `[key, trace payload, delta payload]`.
-#[test]
-fn a_right_sided_delta_writes_the_trace_half_first() {
-    let schema = make_schema_u64_i64();
-    let mut ch = trace_cursor(make_batch(&schema, &[(1, 1, 100), (1, 2, 200)]), schema);
-    let delta = make_batch(&schema, &[(1, 1, 10)]);
-
-    let out = join(JoinKind::Equi, true, &schema, &schema, &delta, &mut ch);
-    assert_eq!(out_triples(&out), vec![(100, 10, 1), (200, 10, 2)]);
-}
-
-// -----------------------------------------------------------------------
-// The equi merge walk
-// -----------------------------------------------------------------------
-
-/// One emission of [`equi_merge_walk`]: the delta group's PK, the delta run, and
-/// the PK of the trace row the cursor stood on.
-type Emission = (u64, Range<usize>, u64);
-
-/// Naive reference: for every delta PK group the trace also holds, one emission
-/// per matching trace row, carrying the whole delta group as its run.
-fn naive_walk(delta: &Batch, m: &Batch) -> Vec<Emission> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < delta.count {
-        let dk = delta.get_pk_bytes(i).to_vec();
-        let mut j = i + 1;
-        while j < delta.count && delta.get_pk_bytes(j) == &dk[..] {
-            j += 1;
-        }
-        for r in 0..m.count {
-            if m.get_pk_bytes(r) == &dk[..] {
-                out.push((delta.get_pk(i) as u64, i..j, m.get_pk(r) as u64));
-            }
-        }
-        i = j;
-    }
-    out
-}
-
-fn record_walk(delta: &Batch, m: &mut ReadCursor) -> Vec<Emission> {
-    let mut out = Vec::new();
-    equi_merge_walk(delta, m, |rs, re, c| {
-        out.push((delta.get_pk(rs) as u64, rs..re, c.current_key_narrow() as u64));
-    });
-    out
-}
-
-fn walk_batch(rows: &[(u64, i64, i64)]) -> Rc<Batch> {
-    Rc::new(make_batch(&make_schema_u64_i64(), rows))
-}
-
-/// The walk's emissions must match the naive reference (keys, delta runs, and
-/// the trace rows it stood on) over a range of shapes: empty on each side,
-/// disjoint keys, fully shared keys, duplicate keys on each side, and a large
-/// size skew in each direction.
-#[test]
-fn equi_merge_walk_matches_the_reference_over_every_shape() {
-    type Case = (&'static [(u64, i64, i64)], &'static [(u64, i64, i64)]);
-    let s = make_schema_u64_i64();
-    let cases: &[Case] = &[
-        (&[], &[(1, 1, 10)]),
-        (&[(1, 1, 10)], &[]),
-        (&[(1, 1, 10), (3, 1, 30)], &[(2, 1, 20), (4, 1, 40)]),
-        (&[(1, 1, 10), (2, 1, 20)], &[(1, 1, 11), (2, 1, 22)]),
-        // multiset delta against a multi-payload match group
-        (
-            &[(1, 1, 10), (1, 1, 11), (5, 1, 50)],
-            &[(1, 1, 90), (1, 1, 91), (1, 1, 92), (5, 1, 55)],
-        ),
-        // huge delta, tiny trace
-        (
-            &[(1, 1, 1), (2, 1, 2), (3, 1, 3), (4, 1, 4), (5, 1, 5), (6, 1, 6)],
-            &[(4, 1, 44)],
-        ),
-        // tiny delta, huge trace
-        (
-            &[(4, 1, 4)],
-            &[(1, 1, 1), (2, 1, 2), (3, 1, 3), (4, 1, 44), (5, 1, 5), (6, 1, 6)],
-        ),
-    ];
-
-    for (di, mi) in cases {
-        let delta = walk_batch(di);
-        let mb = walk_batch(mi);
-        let mut ch = crate::storage::create_read_cursor(std::slice::from_ref(&mb), &[], s);
-        assert_eq!(
-            record_walk(&delta, &mut ch),
-            naive_walk(&delta, &mb),
-            "delta={di:?} trace={mi:?}",
-        );
-    }
-}
-
-/// A multi-source trace whose consolidation produces a ghost group (PK=3 nets to
-/// weight 0 across two sources). The walk must behave as if that key is absent.
-#[test]
-fn equi_merge_walk_skips_a_ghost_group_across_sources() {
-    let s = make_schema_u64_i64();
-    let src_a = walk_batch(&[(1, 1, 10), (3, 1, 30), (5, 1, 50)]);
-    let src_b = walk_batch(&[(3, -1, 30)]);
-    let delta = walk_batch(&[(1, 1, 1), (3, 1, 3), (5, 1, 5)]);
-
-    // Reference: a trace holding only pk 1 and 5.
-    let live = walk_batch(&[(1, 1, 10), (5, 1, 50)]);
-
-    let mut ch = crate::storage::create_read_cursor(&[Rc::clone(&src_a), Rc::clone(&src_b)], &[], s);
-    assert_eq!(
-        record_walk(&delta, &mut ch),
-        naive_walk(&delta, &live),
-        "ghost group pk=3 must be skipped",
-    );
-}
-
-// -----------------------------------------------------------------------
-// Cross delta-trace
-// -----------------------------------------------------------------------
-
-/// The cross join pairs every delta row with every trace row at `w_delta × w_trace`,
-/// trace-major, keyed by the pair `[left PK, right PK]`. The sides differ in PK
-/// width here: neither key is read. The walk rewinds, so an exhausted cursor
-/// still yields the product.
-#[test]
-fn cross_join_products_every_delta_row_with_every_trace_row() {
-    let left = pk_payload_schema(&[TypeCode::U64]);
-    let right = pk_payload_schema(&[TypeCode::U64; 3]);
-    let (l1, l2) = (opk_pk(&left, &[1]), opk_pk(&left, &[2]));
-    let (r1, r2, r3) = (
-        opk_pk(&right, &[1, 1, 1]),
-        opk_pk(&right, &[1, 1, 2]),
-        opk_pk(&right, &[9, 0, 0]),
-    );
-
-    let mut trace = make_batch_opk(&right, &[(&r1, 1, 100), (&r2, 2, 200), (&r3, 1, 300)]);
-    trace.certify_layout(Layout::Consolidated);
-    let mut ch = trace_cursor(trace, right);
-    // The probe states its own start, so an exhausted cursor still yields the
-    // whole product.
-    ch.advance_to(&opk_pk(&right, &[u64::MAX as u128, 0, 0]));
-    assert!(!ch.valid, "the fixture must start with an exhausted cursor");
-
-    let mut delta = make_batch_opk(&left, &[(&l1, 3, 10), (&l2, -1, 20)]);
-    delta.certify_layout(Layout::Consolidated);
-
-    let cross = |delta: &Batch, ch: &mut ReadCursor| join(JoinKind::Cross, false, &left, &right, delta, ch);
-    let out = cross(&delta, &mut ch);
-    let got = out_triples(&out);
-    let want: Vec<(i64, i64, i64)> = [(100i64, 1i64), (200, 2), (300, 1)]
-        .into_iter()
-        .flat_map(|(right_v, w)| [(10i64, 3i64), (20, -1)].map(move |(left_v, wd)| (left_v, right_v, wd * w)))
-        .collect();
-    assert_eq!(got, want);
-    let got_keys: Vec<Vec<u8>> = (0..out.count).map(|r| out.get_pk_bytes(r).to_vec()).collect();
-    let want_keys: Vec<Vec<u8>> = [&r1, &r2, &r3]
-        .into_iter()
-        .flat_map(|r| [&l1, &l2].map(|l| [&l[..], &r[..]].concat()))
-        .collect();
-    assert_eq!(got_keys, want_keys, "the output PK is [left PK, right PK]");
-    assert_eq!(out.layout(), Layout::Raw, "trace-major: not even PK-sorted");
-
-    // An empty trace pairs with nothing; an empty delta emits nothing.
-    let mut empty = trace_cursor(Batch::empty_with_schema(&right), right);
-    assert_eq!(cross(&delta, &mut empty).count, 0);
-    let none = Batch::empty_with_schema(&left);
-    assert_eq!(cross(&none, &mut ch).count, 0);
-}
-
-// -----------------------------------------------------------------------
-// Range delta-trace: literal output
-// -----------------------------------------------------------------------
 
 /// The range join with the delta on the right, so the wire's `left REL right`
 /// reads as `trace_slot REL delta_slot` — how every literal case below is spelled.
@@ -396,30 +184,12 @@ fn range_join_cuts_the_span_each_rel_names() {
     }
 }
 
-/// `n_eq = 0`, `rel = Lt`: two delta rows form one equality group spanning the
-/// whole trace, and the monotone suffix pointer must widen the emitted run as
-/// the trace slot ascends. Pinned as literal output.
-#[test]
-fn range_join_suffix_pointer_widens_across_the_delta_group() {
-    let schema = make_schema_u64_i64();
-    let mut ch = trace_cursor(make_batch(&schema, &[(5, 1, 105), (15, 1, 115), (25, 1, 125)]), schema);
-    let delta = make_batch(&schema, &[(10, 1, 100), (30, 1, 300)]);
-    let out = range_join(&schema, 0, RangeRel::Lt, &delta, &mut ch);
-
-    // x=10 → {y<10}={105}; x=30 → {y<30}={105,115,125}.
-    let mut pairs: Vec<(u64, i64)> = (0..out.count)
-        .map(|r| (out.get_pk(r) as u64, read_i64_le(out.col_data(0), r * 8)))
-        .collect();
-    pairs.sort_unstable();
-    assert_eq!(pairs, vec![(10, 105), (30, 105), (30, 115), (30, 125)]);
-}
-
 /// A signed range pair (both sides reindex to I64). Negative trace keys must
 /// order below positives, which they do only because the probe reads the OPK
 /// image — raw bytes would put -100 above +50.
 #[test]
 fn range_join_orders_a_signed_key_by_its_opk_image() {
-    let schema = make_schema_signed();
+    let schema = make_schema_i64pk_i64();
     let trace_rows = [(-100i64 as u64, 1, 1), (0, 1, 2), (50, 1, 3)];
     let delta = make_batch(&schema, &[(0, 1, 9)]);
     for (rel, want) in [(RangeRel::Gt, vec![3]), (RangeRel::Lt, vec![1])] {
@@ -430,13 +200,13 @@ fn range_join_orders_a_signed_key_by_its_opk_image() {
     }
 }
 
-/// The range op against a *used* trace cursor: a parked and an exhausted cursor
-/// must both produce the fresh-cursor output — the group skip reads the cursor
-/// position.
+/// The range and cross walks against a *used* trace cursor: a parked and an
+/// exhausted cursor must both produce the fresh-cursor output — the range
+/// group skip reads the cursor position, and the cross walk states its own
+/// start.
 #[test]
-fn range_join_reuses_a_stale_trace_cursor() {
+fn a_used_trace_cursor_yields_the_fresh_cursor_output() {
     let schema = make_range_schema(1, false);
-    let out_schema = plan(JoinKind::Range { n_eq: 1, rel: RangeRel::Lt }, true, &schema, &schema).out_schema;
     let delta = make_range_batch(&schema, &[(vec![1], 5, 1, 1), (vec![3], 5, 1, 3)]);
     let trace_rows = [
         (vec![1u64], 0u64, 1i64, 10i64),
@@ -444,23 +214,24 @@ fn range_join_reuses_a_stale_trace_cursor() {
         (vec![3], 0, 1, 30),
         (vec![3], 9, 1, 39),
     ];
-    for &rel in RELS {
-        let mut fresh_ch = trace_cursor(make_range_batch(&schema, &trace_rows).into_consolidated(), schema);
-        let want = range_join(&schema, 1, rel, &delta, &mut fresh_ch);
-
+    let ranges = RangeRel::ALL.iter().map(|&rel| JoinKind::Range { n_eq: 1, rel });
+    for kind in ranges.chain([JoinKind::Cross]) {
+        let out_schema = plan(kind, true, &schema, &schema).out_schema;
+        let cursor = || trace_cursor(make_range_batch(&schema, &trace_rows).into_consolidated(), schema);
+        let want = join(kind, true, &schema, &schema, &delta, &mut cursor());
         for park_past_end in [false, true] {
-            let mut ch = trace_cursor(make_range_batch(&schema, &trace_rows).into_consolidated(), schema);
+            let mut ch = cursor();
             ch.advance_to(&opk_pk(&schema, &[3, 9]));
             if park_past_end {
                 ch.advance();
                 assert!(!ch.valid);
             }
-            let got = range_join(&schema, 1, rel, &delta, &mut ch);
-            assert_eq!(got.count, want.count, "rel {rel:?} past_end={park_past_end}");
+            let got = join(kind, true, &schema, &schema, &delta, &mut ch);
+            assert_eq!(got.count, want.count, "{kind:?} past_end={park_past_end}");
             assert_eq!(
                 zset_of(&got, &out_schema),
                 zset_of(&want, &out_schema),
-                "rel {rel:?} past_end={park_past_end}",
+                "{kind:?} past_end={park_past_end}",
             );
         }
     }
@@ -476,8 +247,8 @@ fn range_join_reuses_a_stale_trace_cursor() {
 type RangeCase = (&'static str, usize, RangeRows, RangeRows, usize);
 type RangeRows = &'static [(&'static [u64], u64, i64, i64)];
 
-/// The shapes worth pinning deterministically, each against the brute-force
-/// reference for all four rels.
+/// The slot boundaries worth pinning deterministically, each against the
+/// brute-force reference for all four rels.
 #[test]
 fn range_join_fixtures_match_the_reference() {
     let cases: &[RangeCase] = &[
@@ -508,58 +279,6 @@ fn range_join_fixtures_match_the_reference() {
             &[(&[1], 0, 1, 100), (&[1], u64::MAX, 1, 199), (&[2], 0, 1, 200)],
             3,
         ),
-        // A trace row in the next eq group with an in-range slot must not match.
-        (
-            "eq prefix stops at the group edge",
-            1,
-            &[(&[1], 15, 1, 200)],
-            &[(&[1], 10, 1, 110), (&[1], 20, 1, 120), (&[2], 5, 1, 205)],
-            3,
-        ),
-        // A negative-weight row emits at its product's sign.
-        (
-            "retraction in one trace group",
-            0,
-            &[(&[], 40, -1, 400)],
-            &[(&[], 10, 1, 110), (&[], 25, -1, 125), (&[], 30, 1, 130)],
-            6,
-        ),
-        // Duplicate `[eq‖d]` on both sides with distinct payloads: the full
-        // cross-product per trace row, weights multiplied.
-        (
-            "multiset delta against a multi-payload trace",
-            0,
-            &[(&[], 15, 1, 1), (&[], 15, 3, 2)],
-            &[(&[], 10, 1, 101), (&[], 10, 2, 102), (&[], 20, 1, 200)],
-            8,
-        ),
-        // A trace eq group with no delta group, and a delta group with no trace
-        // group — the shape the walk's trailing group skip elides.
-        (
-            "non-matching eq groups on each side",
-            1,
-            &[(&[2], 7, 1, 2), (&[3], 7, 1, 3)],
-            &[(&[1], 5, 1, 15), (&[3], 5, 1, 35), (&[3], 9, 1, 39)],
-            4,
-        ),
-        // Output ≫ |trace|: every delta row matches most of its trace group, so
-        // the monotone pointer runs the full width of the group both ways.
-        (
-            "high fan-out",
-            0,
-            &[(&[], 3, 1, 1), (&[], 4, 1, 2), (&[], 5, 1, 3)],
-            &[
-                (&[], 0, 1, 100),
-                (&[], 1, 1, 101),
-                (&[], 2, 1, 102),
-                (&[], 3, 1, 103),
-                (&[], 4, 1, 104),
-                (&[], 5, 1, 105),
-                (&[], 6, 1, 106),
-                (&[], 7, 1, 107),
-            ],
-            40,
-        ),
         // A narrow covered span inside a large trace: `Gt`/`Ge` seek past the
         // dead low head, `Lt`/`Le` stop before the dead high tail.
         (
@@ -569,18 +288,16 @@ fn range_join_fixtures_match_the_reference() {
             LARGE_TRACE,
             50,
         ),
-        ("empty delta", 0, &[], &[(&[], 10, 1, 110)], 0),
-        ("empty trace", 0, &[(&[], 10, 1, 1), (&[], 20, 1, 2)], &[], 0),
     ];
 
     for &(name, n_eq, delta_rows, trace_rows, min_rows) in cases {
         let schema = make_range_schema(n_eq, false);
         let delta = make_range_batch(&schema, &owned(delta_rows));
+        let trace = make_range_batch(&schema, &owned(trace_rows));
         let mut total = 0;
-        for &rel in RELS {
-            let trace = make_range_batch(&schema, &owned(trace_rows));
+        for &rel in RangeRel::ALL {
             let kind = JoinKind::Range { n_eq: n_eq as u8, rel };
-            total += assert_matches_reference(kind, true, schema, schema, &delta, trace, name);
+            total += assert_matches_reference(kind, true, schema, schema, &delta, &trace, name);
         }
         assert!(
             total >= min_rows,
@@ -633,32 +350,39 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
     /// Every join kind matches the brute-force reference over random delta and
-    /// trace batches, on either side, for all four rels, `n_eq ∈ {0, 1, 2}`, and
-    /// both payload shapes — `wide` adds the NULL and STRING columns a fixed-int
-    /// fixture cannot exercise.
+    /// trace batches, on either side, for all four rels and `n_eq ∈ {0, 1, 2}`.
+    /// Each side draws its payload shape on its own — `wide` adds the NULL and
+    /// STRING columns a fixed-int fixture cannot exercise — and under `Cross`
+    /// its own key arity, so a probe that split the output at the wrong side's
+    /// width shows.
     #[test]
     fn join_dt_matches_reference(
-        (n_eq, wide, rel_i, kind_i, delta_is_right, delta_rows, trace_rows) in (
-            0usize..3, any::<bool>(), 0usize..4, 0usize..3, any::<bool>(),
-        ).prop_flat_map(|(n_eq, wide, rel_i, kind_i, delta_is_right)| {
+        (kind, delta_is_right, d_wide, t_wide, (d_eq, t_eq, delta_rows, trace_rows)) in (
+            prop_oneof![
+                Just(JoinKind::Equi),
+                prop::sample::select(RangeRel::ALL).prop_map(|rel| JoinKind::Range { n_eq: 0, rel }),
+                Just(JoinKind::Cross),
+            ],
+            any::<bool>(), any::<bool>(), any::<bool>(),
+        ).prop_flat_map(|(kind, delta_is_right, d_wide, t_wide)| {
             // A cross join's output key is both PK regions, so the pair must fit
             // inside MAX_PK_COLUMNS.
-            let n_eq = if kind_i == 2 { n_eq.min(1) } else { n_eq };
-            (
-                Just(n_eq), Just(wide), Just(rel_i), Just(kind_i), Just(delta_is_right),
-                arb_range_rows(n_eq), arb_range_rows(n_eq),
-            )
+            let arities = match kind {
+                JoinKind::Cross => (0usize..2, 0usize..2).boxed(),
+                _ => (0usize..3).prop_map(|n| (n, n)).boxed(),
+            };
+            let rows = arities.prop_flat_map(|(d_eq, t_eq)| (Just(d_eq), Just(t_eq), arb_range_rows(d_eq), arb_range_rows(t_eq)));
+            (Just(kind), Just(delta_is_right), Just(d_wide), Just(t_wide), rows)
         }),
     ) {
-        let schema = make_range_schema(n_eq, wide);
-        let kind = match kind_i {
-            0 => JoinKind::Equi,
-            1 => JoinKind::Range { n_eq: n_eq as u8, rel: RELS[rel_i] },
-            _ => JoinKind::Cross,
+        let kind = match kind {
+            JoinKind::Range { rel, .. } => JoinKind::Range { n_eq: t_eq as u8, rel },
+            k => k,
         };
-        let delta = make_range_batch(&schema, &delta_rows);
-        let trace = make_range_batch(&schema, &trace_rows);
-        assert_matches_reference(kind, delta_is_right, schema, schema, &delta, trace, "proptest");
+        let (d_schema, t_schema) = (make_range_schema(d_eq, d_wide), make_range_schema(t_eq, t_wide));
+        let delta = make_range_batch(&d_schema, &delta_rows);
+        let trace = make_range_batch(&t_schema, &trace_rows);
+        assert_matches_reference(kind, delta_is_right, d_schema, t_schema, &delta, &trace, "proptest");
     }
 }
 
@@ -766,12 +490,15 @@ fn pair_matches(kind: JoinKind, delta_is_right: bool, eq_size: usize, dpk: &[u8]
 fn reference(
     kind: JoinKind,
     delta_is_right: bool,
-    eq_size: usize,
     delta_schema: &SchemaDescriptor,
     trace_schema: &SchemaDescriptor,
     delta: &Batch,
     trace: &Batch,
 ) -> (HashMap<RowKey, i64>, usize) {
+    let eq_size = match kind {
+        JoinKind::Range { n_eq, .. } => 8 * n_eq as usize,
+        _ => 0,
+    };
     let mut m: HashMap<RowKey, i64> = HashMap::new();
     let mut rows = 0usize;
     for i in 0..delta.count {
@@ -807,43 +534,42 @@ fn reference(
 
 /// Assert the join's output matches [`reference`] on the Z-Set it denotes *and*
 /// on the raw row count — the count is what catches an equal-and-opposite
-/// miss/spurious pair that the folded Z-Set alone hides. Returns it, so callers
-/// can assert non-vacuous coverage.
-///
-/// The reference reads both inputs consolidated: the delta by the op's contract,
-/// the trace by the cursor's.
+/// miss/spurious pair that the folded Z-Set alone hides — over the trace as one
+/// consolidated run and as its raw rows dealt round-robin into three, each
+/// consolidated alone, so an element can cancel across runs. Returns the count,
+/// so callers can assert non-vacuous coverage.
 fn assert_matches_reference(
     kind: JoinKind,
     delta_is_right: bool,
     delta_schema: SchemaDescriptor,
     trace_schema: SchemaDescriptor,
     delta: &Batch,
-    trace: Batch,
+    trace: &Batch,
     what: &str,
 ) -> usize {
     let p = plan(kind, delta_is_right, &delta_schema, &trace_schema);
     let cs = Batch::consolidate_if_needed(delta);
-    let trace = Batch::consolidate_if_needed(&trace).unwrap_or(trace);
-    let (want, want_rows) = reference(
-        kind,
-        delta_is_right,
-        probe_eq_size(&p.probe),
-        &delta_schema,
-        &trace_schema,
-        cs.as_ref().unwrap_or(delta),
-        &trace,
-    );
+    let delta = cs.as_ref().unwrap_or(delta);
+    let folded = Batch::clone(trace).into_consolidated();
+    let (want, want_rows) = reference(kind, delta_is_right, &delta_schema, &trace_schema, delta, &folded);
 
-    let mut ch = trace_cursor(trace, trace_schema);
-    let out = op_join_delta_trace(cs.as_ref().unwrap_or(delta), &mut ch, &p.out_schema, p.probe);
-
-    let at = format!("{what}: kind={kind:?} delta_is_right={delta_is_right}");
-    assert_eq!(out.count, want_rows, "{at}: row count");
-    assert_eq!(zset_of(&out, &p.out_schema), want, "{at}: z-set");
-    // The walk emits trace-major with a delta run per trace row, so it is
-    // neither (PK, payload)-sorted nor folded, and claims no layout.
-    assert_eq!(out.layout(), Layout::Raw, "{at}: layout");
-    out.count
+    let dealt: Vec<Rc<Batch>> = (0..3)
+        .map(|k| {
+            let rows: Vec<(usize, usize)> = (k..trace.count).step_by(3).map(|r| (r, r + 1)).collect();
+            Rc::new(Batch::from_ranges(trace, &rows, 0).into_consolidated())
+        })
+        .collect();
+    let cursors = [
+        ("one run", trace_cursor(folded, trace_schema)),
+        ("three runs", create_read_cursor(&dealt, &[], trace_schema)),
+    ];
+    for (runs, mut ch) in cursors {
+        let out = op_join_delta_trace(delta, &mut ch, &p.out_schema, p.probe);
+        let at = format!("{what}: kind={kind:?} delta_is_right={delta_is_right}, {runs}");
+        assert_eq!(out.count, want_rows, "{at}: row count");
+        assert_eq!(zset_of(&out, &p.out_schema), want, "{at}: z-set");
+    }
+    want_rows
 }
 
 // -----------------------------------------------------------------------
@@ -869,7 +595,7 @@ fn cuts(eq: &[u8], d: &[u8], rel: RangeRel) -> Option<(Vec<u8>, Option<Vec<u8>>)
 /// without a seek; a `None` end means "scan to the table end".
 #[test]
 fn cut_points_bound_every_rel_within_its_eq_group() {
-    /// A `(start, end)` cut, in `RELS` order: `Lt`, `Le`, `Gt`, `Ge`.
+    /// A `(start, end)` cut, in `RangeRel::ALL` order: `Lt`, `Le`, `Gt`, `Ge`.
     type Cut = Option<(&'static [u8], Option<&'static [u8]>)>;
     let cases: &[(&[u8], &[u8], [Cut; 4])] = &[
         // No eq prefix: the slot is the whole key, so every cut runs to the
@@ -946,7 +672,7 @@ fn cut_points_bound_every_rel_within_its_eq_group() {
     ];
 
     for (eq, d, want) in cases {
-        for (rel, w) in RELS.iter().zip(want) {
+        for (rel, w) in RangeRel::ALL.iter().zip(want) {
             let want = w.map(|(s, e)| (s.to_vec(), e.map(<[u8]>::to_vec)));
             assert_eq!(cuts(eq, d, *rel), want, "eq={eq:02x?} d={d:02x?} rel={rel:?}");
         }

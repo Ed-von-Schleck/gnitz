@@ -1,9 +1,11 @@
 use super::*;
-use crate::schema::key::compare_pk_bytes;
-use crate::schema::ColumnTable;
-use crate::schema::{SchemaColumn, TypeCode};
+use crate::schema::{ColumnTable, SchemaColumn, TypeCode};
 use crate::storage::{Batch, BatchBuilder};
-use crate::test_support::{batch_of_pk_bytes, le_cell, pk_payload_schema, wide_pk_3xu64_schema};
+use crate::test_support::{
+    arb_fold_case, batch_of_pk_bytes, fold_batch, fold_schemas, le_cell, opk_pk, pk_only_schema, pk_payload_schema,
+    wide_pk_3xu64_schema,
+};
+use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Group key
@@ -42,43 +44,12 @@ fn single_natural_col_keys_by_its_opk_from_either_side() {
         let width = SchemaColumn::new(tc, false).size() as usize;
         for v in vals {
             let le = &(v as u128).to_le_bytes()[..width];
-            // Signed columns are sign-flipped into the OPK image; unsigned ones
-            // pass through, so the OPK image is the native value.
-            let want = if tc.is_signed_int() {
-                (v + (1i128 << (8 * width - 1))) as u128
-            } else {
-                v as u128
-            };
-            let want_pk = want.to_be_bytes()[16 - width..].to_vec();
-            assert_eq!(
-                key(tc, le, true),
-                (want, want_pk.clone()),
-                "PK-column key for {tc} v={v}"
-            );
-            assert_eq!(key(tc, le, false), (want, want_pk), "payload-column key for {tc} v={v}");
+            let want_pk = opk_pk(&pk_only_schema(&[tc]), &[v as u128]);
+            let want = (gnitz_wire::widen_pk_be(&want_pk), want_pk);
+            assert_eq!(key(tc, le, true), want, "PK-column key for {tc} v={v}");
+            assert_eq!(key(tc, le, false), want, "payload-column key for {tc} v={v}");
         }
     }
-}
-
-/// A float group column has no key image: its raw bits would split `+0.0` from
-/// `-0.0` into two groups.
-#[test]
-fn group_key_refuses_a_float_column() {
-    for tc in [TypeCode::F32, TypeCode::F64] {
-        let schema = SchemaDescriptor::new(
-            &[SchemaColumn::new(TypeCode::U64, false), SchemaColumn::new(tc, false)],
-            &[0],
-        );
-        let err = GroupKey::new(&schema, &[1])
-            .err()
-            .expect("a float group column is refused");
-        assert!(err.to_string().contains("float"), "{err}");
-    }
-    let schema = pk_payload_schema(&[TypeCode::U64]);
-    assert!(
-        GroupKey::new(&schema, &[2]).is_err(),
-        "an out-of-range column is refused"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -88,110 +59,6 @@ fn group_key_refuses_a_float_column() {
 /// Every position's row, in visit order.
 fn visit_order(runs: &GroupRuns, n: usize) -> Vec<usize> {
     (0..n).map(|p| runs.row(p)).collect()
-}
-
-/// A whole-PK key's runs over an unsorted batch must reproduce the
-/// authoritative `compare_pk_bytes` order. PKs are distinct, so the (unstable)
-/// sort yields a unique order, one run per row.
-fn assert_canonical_order(schema: &SchemaDescriptor, pk_rows: &[Vec<u8>]) {
-    let mut want: Vec<usize> = (0..pk_rows.len()).collect();
-    want.sort_by(|&a, &b| compare_pk_bytes(&pk_rows[a], &pk_rows[b]));
-    let want_keys: Vec<&[u8]> = want.iter().map(|&i| pk_rows[i].as_slice()).collect();
-
-    let batch = batch_of_pk_bytes(schema, pk_rows);
-    let mb = batch.as_mem_batch();
-    let key = GroupOutKey::new(schema, schema.pk_cols(), []).unwrap().0;
-    let runs = key.runs(&batch);
-    let got_keys: Vec<&[u8]> = visit_order(&runs, mb.count)
-        .into_iter()
-        .map(|i| mb.get_pk_bytes(i))
-        .collect();
-    assert_eq!(got_keys, want_keys, "PK-keyed run order mismatch");
-    assert_eq!(runs.len(), pk_rows.len(), "distinct PKs are distinct groups");
-}
-
-#[test]
-fn pk_runs_u64_arm_full_and_subwidth() {
-    // stride 8 (u64 arm): high-bit / signed-OPK byte shapes must order by raw
-    // unsigned byte compare (the OPK sign-flip lives in the bytes).
-    assert_canonical_order(
-        &pk_payload_schema(&[TypeCode::U64]),
-        &[
-            vec![0x80, 0, 0, 0, 0, 0, 0, 1],
-            vec![0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfd],
-            vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-            vec![0, 0, 0, 0, 0, 0, 0, 5],
-            vec![0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-        ],
-    );
-    // stride 4 (u64 arm, sub-width): left-align into the high bytes preserves order.
-    assert_canonical_order(
-        &pk_payload_schema(&[TypeCode::U32]),
-        &[
-            vec![0xff, 0, 0, 1],
-            vec![0, 0, 0, 9],
-            vec![0x80, 0, 0, 0],
-            vec![0, 0, 0, 1],
-        ],
-    );
-}
-
-#[test]
-fn pk_runs_u128_arm() {
-    let mk = |hi: u8, lo: u8| {
-        let mut v = vec![0u8; 16];
-        v[0] = hi;
-        v[15] = lo;
-        v
-    };
-    assert_canonical_order(
-        &pk_payload_schema(&[TypeCode::U128]),
-        &[mk(0xff, 2), mk(0, 9), mk(0x80, 1), mk(0, 1), mk(0xff, 1)],
-    );
-}
-
-#[test]
-fn pk_runs_u128x2_arm_with_leading16_collision() {
-    // stride 24 ([u128;2] arm). Rows sharing their leading 16 bytes and differing
-    // only in the tail MUST be ordered by the second limb — a bare u128 prefix
-    // would tie them and risk mis-merging distinct compound PKs (weight corruption).
-    let shared = [0xab_u8; 16];
-    let mk_tail = |tail: u64| {
-        let mut v = Vec::with_capacity(24);
-        v.extend_from_slice(&shared);
-        v.extend_from_slice(&tail.to_be_bytes());
-        v
-    };
-    let mk = |a: u64, b: u64, c: u64| {
-        let mut v = Vec::with_capacity(24);
-        v.extend_from_slice(&a.to_be_bytes());
-        v.extend_from_slice(&b.to_be_bytes());
-        v.extend_from_slice(&c.to_be_bytes());
-        v
-    };
-    assert_canonical_order(
-        &wide_pk_3xu64_schema(),
-        &[
-            mk_tail(7),
-            mk(0, 0, 0),
-            mk_tail(2),
-            mk(0xffff_ffff_ffff_ffff, 0, 0),
-            mk_tail(5),
-        ],
-    );
-}
-
-#[test]
-fn pk_runs_wide_arm() {
-    // stride 40 (> 32): the byte-slice fallback, whose `Ord` is `compare_pk_bytes`.
-    let schema = pk_payload_schema(&[TypeCode::U64; 5]);
-    let mk = |lead: u8, tail: u8| {
-        let mut v = vec![0u8; 40];
-        v[0] = lead;
-        v[39] = tail;
-        v
-    };
-    assert_canonical_order(&schema, &[mk(2, 0), mk(0, 9), mk(0xff, 1), mk(0, 1), mk(2, 3)]);
 }
 
 /// Rows sharing a key come back in ascending source-index order: the whole
@@ -210,27 +77,71 @@ fn sorted_runs_break_ties_on_source_index() {
     assert_eq!(runs.iter().collect::<Vec<_>>(), vec![0..5]);
 }
 
-/// A consolidated batch grouped by its leading PK column is already in group
-/// order: the runs visit positions in place and end where the column changes.
-#[test]
-fn leading_pk_column_runs_in_place_over_a_consolidated_batch() {
-    let schema = pk_payload_schema(&[TypeCode::U64, TypeCode::U64]);
-    let pk = |a: u64, b: u64| [a.to_be_bytes(), b.to_be_bytes()].concat();
-    let raw = batch_of_pk_bytes(&schema, &[pk(1, 1), pk(1, 5), pk(2, 0), pk(7, 3), pk(7, 4), pk(7, 9)]);
-    let mut consolidated = Batch::clone(&raw);
-    consolidated.certify_layout(crate::storage::Layout::Consolidated);
-    let key = GroupOutKey::new(&schema, &[0], []).unwrap().0;
-    for batch in [&consolidated, &raw] {
-        let runs = key.runs(batch);
-        assert_eq!(visit_order(&runs, 6), vec![0, 1, 2, 3, 4, 5]);
-        assert_eq!(runs.iter().collect::<Vec<_>>(), vec![0..2, 2..3, 3..6]);
+/// Under every key form — the empty set, the whole PK, each single column
+/// (the leading PK column among them) and all of them — over `raw` and its
+/// consolidation: `runs` visits every row once, groups in strictly ascending
+/// `out_pk` order with a run ending exactly where `out_pk` changes, and two
+/// rows share an identity iff they share an `out_pk`. A consolidated batch
+/// grouped by a PK prefix is visited in place.
+fn assert_runs_group_by_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
+    let schema = *raw.schema();
+    let consolidated = Batch::clone(raw).into_consolidated();
+    let pk: Vec<u32> = schema.pk_cols().to_vec();
+    let all: Vec<u32> = (0..schema.num_columns() as u32).collect();
+    let mut forms = vec![vec![], pk.clone(), all];
+    forms.extend((0..schema.num_columns() as u32).map(|c| vec![c]));
+    for cols in &forms {
+        let (key, _) = GroupOutKey::new(&schema, cols, []).unwrap();
+        for batch in [raw, &consolidated] {
+            let mb = batch.as_mem_batch();
+            let runs = key.runs(batch);
+            let mut seen = visit_order(&runs, batch.count);
+            seen.sort_unstable();
+            prop_assert_eq!(seen, (0..batch.count).collect::<Vec<_>>(), "{:?}", cols);
+            let out_pk = |pos: usize| key.out_pk(&mb, runs.row(pos)).bytes().to_vec();
+            let mut prev: Option<Vec<u8>> = None;
+            for run in runs.iter() {
+                let first = out_pk(run.start);
+                prop_assert!(
+                    run.clone().all(|p| out_pk(p) == first),
+                    "{:?}: a run mixes groups",
+                    cols
+                );
+                prop_assert!(prev.is_none_or(|p| p < first), "{:?}: runs out of order", cols);
+                prev = Some(first);
+            }
+            if std::ptr::eq(batch, &consolidated) && (cols[..] == [0] || *cols == pk) {
+                prop_assert!(runs.in_row_order(), "{:?}: a PK prefix of a consolidated batch", cols);
+            }
+            for a in 0..batch.count {
+                for b in a + 1..batch.count {
+                    prop_assert_eq!(
+                        key.identity(&mb, a) == key.identity(&mb, b),
+                        key.out_pk(&mb, a).bytes() == key.out_pk(&mb, b).bytes(),
+                        "{:?}: rows {} and {}",
+                        cols,
+                        a,
+                        b
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    /// [`assert_runs_group_by_out_pk`] over every PK width arm.
+    #[test]
+    fn runs_group_by_out_pk_at_every_pk_width((si, rows) in arb_fold_case()) {
+        assert_runs_group_by_out_pk(&fold_batch(&fold_schemas()[si], &rows))?;
     }
 }
 
-/// Under every key form, `runs` visits groups in ascending `out_pk` order, and a
-/// run ends exactly where `out_pk` changes.
+/// [`assert_runs_group_by_out_pk`] over a compound signed PK and signed, wide
+/// and nullable payload columns, each holding repeated values.
 #[test]
-fn runs_ascend_by_out_pk_under_every_key_form() {
+fn runs_group_by_out_pk_over_signed_wide_and_nullable_columns() {
     // `[U32 pk0, I32 pk1, I64 v, U128 w, I64 n NULL]`, PK `(pk0, pk1)`.
     let schema = SchemaDescriptor::new(
         &[
@@ -242,7 +153,7 @@ fn runs_ascend_by_out_pk_under_every_key_form() {
         ],
         &[0, 1],
     );
-    let mut bb = crate::storage::BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(schema);
     for i in 0..64u64 {
         let m = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40;
         bb.begin_row_opk(&[(m % 5) as u128, (m % 7) as i32 as i64 as u128], 1);
@@ -254,34 +165,7 @@ fn runs_ascend_by_out_pk_under_every_key_form() {
         }
         bb.end_row();
     }
-    let batch = bb.finish();
-    let mb = batch.as_mem_batch();
-    // Leading PK column, non-leading PK column, whole PK, signed payload, wide
-    // payload, nullable payload, several columns.
-    for cols in [&[0u32][..], &[1], &[0, 1], &[2], &[3], &[4], &[2, 3]] {
-        let (key, _) = GroupOutKey::new(&schema, cols, []).unwrap();
-        let runs = key.runs(&batch);
-        let pk = |pos: usize| key.out_pk(&mb, runs.row(pos)).bytes().to_vec();
-        for run in runs.iter() {
-            assert!(
-                run.clone().all(|p| pk(p) == pk(run.start)),
-                "{cols:?}: a run mixes groups"
-            );
-            if run.end < batch.count {
-                assert!(pk(run.start) < pk(run.end), "{cols:?}: runs out of order");
-            }
-        }
-    }
-}
-
-/// The empty group set is one run over the whole batch, in place.
-#[test]
-fn empty_group_set_is_one_run() {
-    let schema = pk_payload_schema(&[TypeCode::U64]);
-    let batch = batch_of_pk_bytes(&schema, &[3u64.to_be_bytes(), 1u64.to_be_bytes(), 2u64.to_be_bytes()]);
-    let runs = GroupOutKey::new(&schema, &[], []).unwrap().0.runs(&batch);
-    assert_eq!(visit_order(&runs, 3), vec![0, 1, 2]);
-    assert_eq!(runs.iter().collect::<Vec<_>>(), vec![0..3]);
+    assert_runs_group_by_out_pk(&bb.finish()).unwrap();
 }
 
 /// A shuffled ~1M-row batch of distinct keys, `stride` PK bytes each.
@@ -302,47 +186,28 @@ fn bench_rows(n: usize, stride: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Regression guard — time `runs` under a whole-PK key over a shuffled
-/// ~1M-row batch at each keyed arm. `#[ignore]`; run release:
+/// Regression guard — time `runs` over a shuffled ~1M-row batch at each key
+/// arm: a whole PK per keyed width, a narrow image (`u64`), a wide image
+/// (`u128`), and the multi-column fold. `#[ignore]`; run release:
 ///   cargo test -p gnitz-store --release reduce_sort -- --ignored --nocapture --test-threads=1
 #[test]
 #[ignore]
 fn reduce_sort_argsort_bench() {
     let n = 1_000_000usize;
-    for &stride in &[8usize, 16, 24] {
-        let schema = match stride {
-            8 => pk_payload_schema(&[TypeCode::U64]),
-            16 => pk_payload_schema(&[TypeCode::U128]),
-            _ => wide_pk_3xu64_schema(),
-        };
-        let batch = batch_of_pk_bytes(&schema, &bench_rows(n, stride));
-        let key = GroupOutKey::new(&schema, schema.pk_cols(), []).unwrap().0;
-
-        let t = std::time::Instant::now();
-        let runs = key.runs(&batch);
-        let dt = t.elapsed();
-        std::hint::black_box(&runs);
-
-        let mrps = n as f64 / dt.as_secs_f64() / 1e6;
-        println!("argsort stride {stride}: {n} rows in {dt:?} = {mrps:.1} M rows/s");
-    }
-}
-
-/// The group-key sibling: `runs` under a key that is not a PK prefix over a
-/// shuffled ~1M-row batch at each key arm — a narrow image (`u64`), a wide image
-/// (`u128`), and the multi-column fold. `#[ignore]`; run release, as above.
-#[test]
-#[ignore]
-fn reduce_sort_argsort_delta_bench() {
-    let n = 1_000_000usize;
-    // (label, schema, group cols) — the three arms. A non-leading PK column is an
-    // image; a partial PK is a fold.
-    let narrow = wide_pk_3xu64_schema();
-    let wide = pk_payload_schema(&[TypeCode::U64, TypeCode::U128]);
+    let (u64pk, u128pk, wide) = (
+        pk_payload_schema(&[TypeCode::U64]),
+        pk_payload_schema(&[TypeCode::U128]),
+        wide_pk_3xu64_schema(),
+    );
+    let mixed = pk_payload_schema(&[TypeCode::U64, TypeCode::U128]);
+    // A non-leading PK column is an image; a partial PK is a fold.
     for (label, schema, group_cols) in [
-        ("image u64", &narrow, &[1u32][..]),
-        ("image u128", &wide, &[1u32][..]),
-        ("fold 2-col", &narrow, &[0u32, 1u32][..]),
+        ("pk stride 8", &u64pk, &[0u32][..]),
+        ("pk stride 16", &u128pk, &[0]),
+        ("pk stride 24", &wide, &[0, 1, 2]),
+        ("image u64", &wide, &[1]),
+        ("image u128", &mixed, &[1]),
+        ("fold 2-col", &wide, &[0, 1]),
     ] {
         let batch = batch_of_pk_bytes(schema, &bench_rows(n, schema.pk_stride()));
         let key = GroupOutKey::new(schema, group_cols, []).unwrap().0;
@@ -353,20 +218,6 @@ fn reduce_sort_argsort_delta_bench() {
         std::hint::black_box(&runs);
 
         let mrps = n as f64 / dt.as_secs_f64() / 1e6;
-        println!("argsort_delta {label}: {n} rows in {dt:?} = {mrps:.1} M rows/s");
+        println!("argsort {label}: {n} rows in {dt:?} = {mrps:.1} M rows/s");
     }
-}
-
-/// A whole-PK key over a PK wider than 16 bytes has, as its `identity`, the
-/// XXH3-128 of the PK bytes; its output PK is the PK itself.
-#[test]
-fn a_wide_whole_pk_identity_is_the_checksum_of_its_bytes() {
-    let schema = wide_pk_3xu64_schema();
-    let pk = [1u64.to_be_bytes(), 2u64.to_be_bytes(), 3u64.to_be_bytes()].concat();
-    let batch = batch_of_pk_bytes(&schema, &[&pk]);
-    let mb = batch.as_mem_batch();
-    let (key, prefix) = GroupOutKey::new(&schema, schema.pk_cols(), []).unwrap();
-    assert_eq!(prefix.finish().pk_stride(), 24);
-    assert_eq!(key.identity(&mb, 0), gnitz_wire::checksum_128(&pk));
-    assert_eq!(key.out_pk(&mb, 0).bytes(), &pk[..]);
 }

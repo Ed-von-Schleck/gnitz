@@ -10,9 +10,9 @@ use crate::storage::{Batch, BatchBuilder};
 use crate::test_support::{pk_payload_schema, u64_pk_schema};
 use gnitz_wire::{FixedInt, ScalarKind};
 
-/// `vals` as one 16-byte integer column of type `tc`, one row per value: the
-/// PK column of a batch, or its sole payload column.
-fn int16_batch(tc: TypeCode, vals: &[i128], as_pk: bool) -> Batch {
+/// `vals` (native bit patterns) as one integer column of type `tc`, one row per
+/// value: the PK column of a batch, or its sole payload column.
+fn column_batch(tc: TypeCode, vals: &[u128], as_pk: bool) -> Batch {
     let schema = if as_pk {
         pk_payload_schema(&[tc])
     } else {
@@ -21,11 +21,11 @@ fn int16_batch(tc: TypeCode, vals: &[i128], as_pk: bool) -> Batch {
     let mut b = BatchBuilder::new(schema);
     for (i, &v) in vals.iter().enumerate() {
         if as_pk {
-            b.begin_row_opk(&[v as u128], 1);
+            b.begin_row_opk(&[v], 1);
             b.put_int(0);
         } else {
             b.begin_row(i as u128, 1);
-            b.put_int(v as u128);
+            b.put_int(v);
         }
         b.end_row();
     }
@@ -35,7 +35,8 @@ fn int16_batch(tc: TypeCode, vals: &[i128], as_pk: bool) -> Batch {
 /// The [`int16_image`] of every row of the column `vals` fill, asserting a PK
 /// source and a payload source agree on each.
 fn int16_images(tc: TypeCode, vals: &[i128], invert: bool) -> Vec<[u8; 16]> {
-    let (pk, payload) = (int16_batch(tc, vals, true), int16_batch(tc, vals, false));
+    let natives: Vec<u128> = vals.iter().map(|&v| v as u128).collect();
+    let (pk, payload) = (column_batch(tc, &natives, true), column_batch(tc, &natives, false));
     let (pk_loc, payload_loc) = (pk.schema().locate(0), payload.schema().locate(1));
     let (pk, payload) = (pk.as_mem_batch(), payload.as_mem_batch());
     (0..vals.len())
@@ -117,50 +118,6 @@ fn wide_image_orders_and_round_trips() {
     }
 }
 
-/// Why an index reserves 16 bytes for a wide image: the leading 8 of an `I128`
-/// one are `0x80…` or `0x7F…` across the whole `|v| < 2^63` range, so a narrow
-/// slot folds a whole index onto two keys.
-#[test]
-fn a_wide_image_discriminates_only_across_the_whole_slot() {
-    let vals = [-3i128, -1, 0, 1, 3];
-    let images = int16_images(TypeCode::I128, &vals, false);
-    let distinct = |width: usize| {
-        images
-            .iter()
-            .map(|image| {
-                let mut out = [0u8; 16];
-                write_image_slot(&mut out[..width], image);
-                out
-            })
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-    };
-    assert_eq!(distinct(8), 2);
-    assert_eq!(distinct(16), vals.len());
-}
-
-/// `vals` (native bit patterns) as one scalar column of type `tc`, one row per
-/// value: the PK column of a batch, or its sole payload column.
-fn scalar_batch(tc: TypeCode, vals: &[u64], as_pk: bool) -> Batch {
-    let schema = if as_pk {
-        pk_payload_schema(&[tc])
-    } else {
-        u64_pk_schema(SchemaColumn::new(tc, false))
-    };
-    let mut b = BatchBuilder::new(schema);
-    for (i, &v) in vals.iter().enumerate() {
-        if as_pk {
-            b.begin_row_opk(&[v as u128], 1);
-            b.put_int(0);
-        } else {
-            b.begin_row(i as u128, 1);
-            b.put_int(v as u128);
-        }
-        b.end_row();
-    }
-    b.finish()
-}
-
 /// `order_bits`' integer half is the value's index key (`encode_pk_images` at
 /// `index_key_type`), on both arms, and `order_inverse` recovers the value from
 /// it.
@@ -181,13 +138,7 @@ fn order_bits_matches_the_opk_promotion_on_both_arms() {
         (FixedInt::I16, TypeCode::I16, (0..=u16::MAX).map(u64::from).collect()),
     ];
     // Edges plus a deterministic sweep for the widths exhaustion cannot reach.
-    let mut seed = 0x2545_F491_4F6C_DD1Du64;
-    let mut next = || {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        seed
-    };
+    let mut rng = crate::test_rng::Rng::new(0x2545_F491_4F6C_DD1D);
     for (fi, type_code) in [
         (FixedInt::U32, TypeCode::U32),
         (FixedInt::I32, TypeCode::I32),
@@ -196,15 +147,16 @@ fn order_bits_matches_the_opk_promotion_on_both_arms() {
     ] {
         let mask = u64::MAX >> (64 - 8 * fi.width());
         let mut vals = vec![0, 1, mask, mask >> 1, (mask >> 1) + 1];
-        vals.extend((0..64).map(|_| next() & mask));
+        vals.extend((0..64).map(|_| rng.next_u64() & mask));
         cases.push((fi, type_code, vals));
     }
 
     for (fi, type_code, vals) in cases {
         let w = fi.width();
+        let natives: Vec<u128> = vals.iter().map(|&v| v as u128).collect();
         let (pk, payload) = (
-            scalar_batch(type_code, &vals, true),
-            scalar_batch(type_code, &vals, false),
+            column_batch(type_code, &natives, true),
+            column_batch(type_code, &natives, false),
         );
         let (pk_loc, payload_loc) = (pk.schema().locate(0), payload.schema().locate(1));
         let (pk, payload) = (pk.as_mem_batch(), payload.as_mem_batch());

@@ -77,18 +77,16 @@ pub fn null_extend_output_schema(
 ///
 /// `out_schema` is the UNION's own, not either input's — it is the comparator the
 /// merge folds and certifies under.
-pub fn op_union(batch_a: Batch, batch_b: &Batch, out_schema: &SchemaDescriptor) -> Batch {
-    if batch_b.count == 0 {
-        // O(1) pass-through: no allocation, the layout claim preserved.
-        return batch_a;
-    }
-    if batch_a.consolidated_verified() && batch_b.consolidated_verified() {
+pub fn op_union(mut batch_a: Batch, batch_b: &Batch, out_schema: &SchemaDescriptor) -> Batch {
+    if batch_a.consolidated_verified() && batch_b.consolidated_verified() && batch_b.count > 0 {
         return batch_a.merged_consolidated(batch_b, out_schema);
     }
-    let mut output = batch_a;
-    output.set_schema(out_schema);
-    output.append_batch(batch_b);
-    output
+    // An empty `b` passes `a` through with no allocation, its layout claim
+    // preserved: `out_schema` only ORs in nullability, which reorders nothing
+    // `a` holds.
+    batch_a.set_schema(out_schema);
+    batch_a.append_batch(batch_b);
+    batch_a
 }
 
 // ---------------------------------------------------------------------------

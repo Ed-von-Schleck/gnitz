@@ -34,7 +34,7 @@ const PACK_COMPACT_RUN_LEN: usize = 24;
 /// Where a map's output PK region comes from. Owned by the plan rather than
 /// passed per call, so the region cannot be left unwritten between two
 /// statements and no caller can pair a plan with the wrong stamp.
-pub(crate) enum PkSource {
+enum PkSource {
     /// Copy the input PK region verbatim, into an output schema whose PK is the
     /// input's.
     Inherit,
@@ -353,7 +353,7 @@ impl MapPlan {
     /// special case where the program computes nothing and every sink is a
     /// column copy (see [`LogicalProgram::copy_cols`]): the plan reduces to the
     /// copy list and the resolved program's null permutation.
-    pub(crate) fn from_map(
+    fn from_map(
         logical: LogicalProgram,
         in_schema: &SchemaDescriptor,
         out_schema: &SchemaDescriptor,

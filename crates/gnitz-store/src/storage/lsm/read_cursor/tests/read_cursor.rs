@@ -5,8 +5,8 @@ use crate::storage::repr::shard_file::ShardWriteOpts;
 use crate::storage::BatchBuilder;
 use crate::test_support::{
     arb_fold_case, assert_folds, fold_batch, fold_schemas, make_batch_u128, make_schema_pk_u64_payload_string,
-    make_schema_u128_i64, make_schema_u64_i64, map_shard, payload0_i64, read_german_string, u64_pk_schema,
-    weighted_rows, RowKey,
+    make_schema_u128_i64, make_schema_u64_i64, map_shard, payload0_i64, read_german_string, row_key, u64_pk_schema,
+    weighted_rows, zset_of, RowKey,
 };
 use gnitz_wire::PkKeys;
 use proptest::prelude::*;
@@ -93,6 +93,17 @@ proptest! {
             drained.extend(weighted_rows(&b));
         }
         prop_assert_eq!(&drained, &want);
+
+        // Element weights, probed with each run's own rows — an element one run
+        // holds may have folded away in the sum.
+        let sum = zset_of(&mat, &s);
+        for b in &batches {
+            let mut got = Vec::new();
+            open().for_each_mem_row_weight(&b.as_mem_batch(), |i, w| got.push((i, w)));
+            let want_w: Vec<(usize, i64)> =
+                (0..b.count).map(|i| (i, sum.get(&row_key(b, &s, i)).copied().unwrap_or(0))).collect();
+            prop_assert_eq!(got, want_w);
+        }
 
         let mut keys: Vec<Vec<u8>> = vec![vec![0; stride], vec![0xff; stride]];
         for (i, d) in probes.iter().filter(|_| !rows.is_empty()) {
