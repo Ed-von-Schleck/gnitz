@@ -1,6 +1,6 @@
 use super::*;
-use crate::storage::{flush_barrier, RecoverySource, StoreBudgets, Table};
-use crate::test_support::make_schema_u64_i64;
+use crate::storage::flush_barrier;
+use crate::test_support::{make_schema_u64_i64, scratch_table};
 
 #[test]
 fn parse_inverts_name_for_every_grammar() {
@@ -16,7 +16,6 @@ fn parse_inverts_name_for_every_grammar() {
             let addr = ChildAddr { kind, slot };
             let name = addr.name();
             assert_eq!(ChildAddr::parse(&name), Some(addr), "round-trip of {name}");
-            assert_eq!(addr.manifest("/d"), format!("/d/{name}/manifest.bin"));
         }
     }
 }
@@ -56,25 +55,9 @@ fn parse_rejects_names_in_no_grammar() {
     }
 }
 
-#[test]
-fn ownership_follows_the_launched_count() {
-    let owned = |name: &str, n: u32| ChildAddr::parse(name).unwrap().slot.of == n;
-    for name in ["w2of3", "scratch_agg_w1of3", "delta_w0of3", "idx_7_w2of3"] {
-        assert!(owned(name, 3), "{name} at 3");
-        assert!(!owned(name, 4), "{name} at 4");
-    }
-}
-
 /// Publish an empty store at `dir` under checkpoint mark `generation`.
 fn stamp(dir: &str, generation: u64) {
-    let mut t = Table::new(
-        dir,
-        make_schema_u64_i64(),
-        RecoverySource::Rederive { resume_at: None },
-        StoreBudgets::default(),
-    )
-    .unwrap();
-    flush_barrier([&mut t], generation).unwrap();
+    flush_barrier([&mut scratch_table(dir, make_schema_u64_i64())], generation).unwrap();
 }
 
 #[test]

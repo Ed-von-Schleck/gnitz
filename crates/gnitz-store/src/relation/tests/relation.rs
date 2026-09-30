@@ -1,70 +1,42 @@
 use super::*;
-use crate::storage::BatchBuilder;
+use crate::schema::TypeCode;
+use crate::storage::{manifest_path, read_at, read_intact};
+use crate::test_support::{
+    flip_last_byte_in_place, make_batch_raw, make_schema_u64_i64, pk_only_schema, pk_u64_two_i64_schema, zset_of,
+};
 
-/// A one-worker registry over a fresh base directory named `name`.
-fn solo_registry(name: &str) -> RelationRegistry {
-    RelationRegistry::new(&relation_test_dir(name), Slot::SOLO, StoreConfig::default())
+/// A one-worker registry over `base`.
+fn solo(base: &std::path::Path) -> RelationRegistry {
+    RelationRegistry::new(base.to_str().unwrap(), Slot::SOLO, StoreConfig::default())
 }
 
-/// A scratch directory for one test. `scratch_dir` removes it on entry, so
-/// nothing here cleans up on exit: the dirs are small, carry no SAL, and
-/// surviving a run is what makes a failure investigable.
-fn relation_test_dir(name: &str) -> String {
-    crate::test_support::scratch_dir("relation", name)
+fn table(id: u64, schema: SchemaDescriptor) -> RelationSpec {
+    RelationSpec {
+        id,
+        kind: RelationKind::BaseTable,
+        schema,
+    }
 }
 
-/// Enter `id` and open its store; returns its relation directory, which
-/// `add_index` also opens its index children under.
-fn register_entry(registry: &mut RelationRegistry, id: u64, schema: SchemaDescriptor, kind: RelationKind) -> String {
-    let spec = RelationSpec { id, kind, schema };
-    registry.register(spec).unwrap();
-    relation_dir(registry.base_dir(), id)
+fn view(id: u64) -> RelationSpec {
+    RelationSpec {
+        id,
+        kind: RelationKind::View(ViewProps::Plain),
+        schema: pk_only_schema(&[TypeCode::U64]),
+    }
 }
 
-#[test]
-fn test_register_unregister_table() {
-    let mut registry = solo_registry("reg_unreg");
-    let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
-    register_entry(&mut registry, 100, schema, RelationKind::BaseTable);
-    assert!(registry.has_id(100));
-
-    registry.unregister(100);
-    assert!(!registry.has_id(100));
-}
-
-#[test]
-fn test_add_remove_index_circuit() {
-    let mut registry = solo_registry("idx_parent_owner");
-    // A real 3-column owner schema: registration precomputes the circuit's
-    // `key_spec` from it, which locates indexed column 2.
-    let schema = SchemaDescriptor::new(
-        &[crate::schema::SchemaColumn::new(crate::schema::TypeCode::U64, false); 3],
-        &[0],
-    );
-    register_entry(&mut registry, 50, schema, RelationKind::BaseTable);
-    registry
-        .add_index(50, IndexClaim::Index { id: 999, unique: false }, &[2])
-        .unwrap();
-    assert_eq!(registry.relation(50).unwrap().indexes().len(), 1);
-
-    registry.release_index(50, 999);
-    assert_eq!(registry.relation(50).unwrap().indexes().len(), 0);
+fn index(id: u64, unique: bool) -> IndexClaim {
+    IndexClaim::Index { id, unique }
 }
 
 #[test]
 fn a_circuit_lives_while_one_claim_remains() {
-    let mut registry = solo_registry("idx_claims_owner");
-    let schema = SchemaDescriptor::new(
-        &[crate::schema::SchemaColumn::new(crate::schema::TypeCode::U64, false); 3],
-        &[0],
-    );
-    register_entry(&mut registry, 50, schema, RelationKind::BaseTable);
-    registry
-        .add_index(50, IndexClaim::Index { id: 70, unique: false }, &[2])
-        .unwrap();
-    registry
-        .add_index(50, IndexClaim::Index { id: 71, unique: true }, &[2])
-        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut registry = solo(tmp.path());
+    registry.register(table(50, pk_u64_two_i64_schema())).unwrap();
+    registry.add_index(50, index(70, false), &[2]).unwrap();
+    registry.add_index(50, index(71, true), &[2]).unwrap();
     let circuit = |r: &RelationRegistry| r.relation(50).unwrap().index_on(&[2]).map(|ix| ix.is_unique());
     assert_eq!(
         registry.relation(50).unwrap().indexes().len(),
@@ -85,193 +57,141 @@ fn a_circuit_lives_while_one_claim_remains() {
     assert_eq!(circuit(&registry), Some(false), "an unknown claim or owner is a no-op");
 
     registry.release_index(50, 70);
-    assert_eq!(circuit(&registry), None, "the last release drops the circuit");
+    assert!(
+        registry.relation(50).unwrap().indexes().is_empty(),
+        "the last release drops the circuit"
+    );
+}
+
+/// A master creates each relation's directory, so it exists once the DDL is
+/// acknowledged, and opens no child store under it.
+#[test]
+fn a_master_creates_the_relation_directory_and_no_child() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut registry = RelationRegistry::master(tmp.path().to_str().unwrap(), 1, StoreConfig::default());
+    registry.register(table(50, make_schema_u64_i64())).unwrap();
+    registry.add_index(50, index(999, false), &[1]).unwrap();
+    let dir = relation_dir(registry.base_dir(), 50);
+    assert!(std::path::Path::new(&dir).is_dir());
+    assert_eq!(super::dirs::subdir_names(&dir).unwrap(), Vec::<String>::new());
 }
 
 #[test]
-fn a_master_creates_no_index_directory() {
-    let mut registry = RelationRegistry::master(&relation_test_dir("idx_master_dir"), 1, StoreConfig::default());
-    let schema = SchemaDescriptor::new(
-        &[crate::schema::SchemaColumn::new(crate::schema::TypeCode::U64, false); 2],
-        &[0],
-    );
-    let owner_dir = register_entry(&mut registry, 50, schema, RelationKind::BaseTable);
-    registry
-        .add_index(50, IndexClaim::Index { id: 999, unique: false }, &[1])
-        .unwrap();
-    let index = ChildAddr {
-        kind: ChildKind::Index(gnitz_wire::PkColList::from_slice(&[1])),
-        slot: Slot::SOLO,
+fn bound_cols_admits_only_the_relations_columns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut registry = solo(tmp.path());
+    registry.register(table(50, pk_u64_two_i64_schema())).unwrap();
+    let r = registry.relation(50).unwrap();
+    let bound = |cols: &[u32]| {
+        r.bound_cols(PkColList::from_slice(cols), "op")
+            .map(|c| c.as_slice().to_vec())
     };
-    assert!(!std::path::Path::new(&index.dir(&owner_dir)).exists());
-}
-
-/// `UniquePreflight` hands `index_cols` its `arg1` raw, where `HasPk` would
-/// have read `0` through `probe_key_columns` as the relation's own PK store.
-/// Neither `0` nor a garbage non-zero word names a column list.
-#[test]
-fn a_flag_clear_arg1_names_no_index() {
-    let mut registry = solo_registry("arg1_zero_owner");
-    let schema = SchemaDescriptor::new(
-        &[crate::schema::SchemaColumn::new(crate::schema::TypeCode::U64, false); 3],
-        &[0],
-    );
-    register_entry(&mut registry, 50, schema, RelationKind::BaseTable);
-    registry
-        .add_index(50, IndexClaim::Index { id: 999, unique: false }, &[2])
-        .unwrap();
-
-    assert!(registry
-        .index_cols(50, gnitz_wire::pack_pk_cols(&[2]), "unique pre-flight")
-        .is_ok());
-    for raw in [gnitz_wire::PROBE_KEYSPACE_PK, 2] {
-        let err = registry
-            .index_cols(50, raw, "unique pre-flight")
-            .expect_err("a flag-clear word names no column list");
-        assert!(err.to_string().contains("invalid column list"), "{raw}: {err}");
+    assert_eq!(bound(&[2, 0]), Ok(vec![2, 0]));
+    for cols in [&[3][..], &[0, 3]] {
+        assert!(bound(cols).is_err(), "{cols:?}");
     }
-}
-
-/// An index store is rederived, so the base round never visits it; the
-/// ephemeral round is what force-persists it, index circuits included.
-#[test]
-fn ephemeral_flush_includes_index_circuits() {
-    let mut registry = solo_registry("flush_ic_owner");
-    // A real 2-column owner schema: registration precomputes the circuit's
-    // `key_spec` from it, which locates indexed column 1.
-    let parent_schema = SchemaDescriptor::new(
-        &[crate::schema::SchemaColumn::new(crate::schema::TypeCode::U64, false); 2],
-        &[0],
-    );
-    let owner_dir = register_entry(&mut registry, 70, parent_schema, RelationKind::BaseTable);
-    registry
-        .add_index(70, IndexClaim::Index { id: 999, unique: false }, &[1])
-        .unwrap();
-
-    // Put one row in the index table's memtable.
-    {
-        let mut batch = BatchBuilder::new(parent_schema);
-        batch.begin_row(1u128, 1i64);
-        batch.put_int(7);
-        batch.end_row();
-        let batch = batch.finish();
-        let ic = registry.relation_mut(70).and_then(|r| r.index_on_mut(&[1])).unwrap();
-        assert!(ic.project_and_ingest(&batch).unwrap(), "the projection is not empty");
-    }
-
-    registry.set_resume_generation(1);
-    registry.checkpoint_ephemeral([]).unwrap();
-    let store_dir = ChildAddr {
-        kind: ChildKind::Index(gnitz_wire::PkColList::from_slice(&[1])),
-        slot: Slot::SOLO,
-    }
-    .dir(&owner_dir);
-    let shard_count = std::fs::read_dir(&store_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_str().unwrap_or("").starts_with("shard_"))
-        .count();
-    assert!(
-        shard_count > 0,
-        "the ephemeral round must publish the index circuit's shard"
-    );
-}
-
-// A storage error while applying committed data is returned rather than
-// swallowed, so the process that owns the recovery decision is the one that
-// makes it. Driven via the `GNITZ_INJECT_INGEST_APPLY_ERROR` debug seam.
-#[test]
-fn test_ingest_apply_error_is_returned() {
-    let out = crate::test_support::run_test_in_child(
-        module_path!(),
-        "ingest_apply_error_returned_internal",
-        &[("GNITZ_INJECT_INGEST_APPLY_ERROR", "store")],
-    );
-    crate::test_support::assert_child_ok(
-        &out,
-        "the seam-armed child must return the error rather than swallow it",
-    );
-}
-
-// Runs only in the re-exec'd child, which is where the armed seam is read.
-// Registers a view and ingests one row; the "store" seam substitutes Err for
-// the store ingest. `View`, not `BaseTable`: a base table would run
-// `enforce_unique_pk` against the fixture's store first.
-#[test]
-fn ingest_apply_error_returned_internal() {
-    if !crate::test_support::in_child_test() {
-        return;
-    }
-    let mut registry = solo_registry("seam_abort");
-    let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
-    let tid = gnitz_wire::FIRST_USER_TABLE_ID;
-    register_entry(&mut registry, tid, schema, RelationKind::View(ViewProps::Plain));
-    let mut batch = BatchBuilder::new(schema);
-    batch.begin_row(1u128, 1i64);
-    batch.end_row();
-    let batch = batch.finish();
-    assert!(
-        matches!(registry.ingest(tid, batch), Err(e) if e.contains("io error")),
-        "the ingest must return the storage error when the seam is armed",
-    );
-    println!("{}", crate::test_support::CHILD_OK);
 }
 
 /// Not unique, or covering the PK: either one excludes an index.
 #[test]
 fn a_unique_index_covering_the_pk_has_nothing_left_to_check() {
-    let mut registry = solo_registry("unique_to_check");
-    let schema = SchemaDescriptor::new(
-        &[crate::schema::SchemaColumn::new(crate::schema::TypeCode::U64, false); 3],
-        &[0],
-    );
-    register_entry(&mut registry, 60, schema, RelationKind::BaseTable);
-    registry
-        .add_index(60, IndexClaim::Index { id: 901, unique: true }, &[0])
-        .unwrap(); // exactly the PK
-    registry
-        .add_index(60, IndexClaim::Index { id: 902, unique: true }, &[2, 0])
-        .unwrap(); // the PK plus a payload column
-    registry
-        .add_index(60, IndexClaim::Index { id: 903, unique: true }, &[1])
-        .unwrap(); // the only real check
-    registry
-        .add_index(60, IndexClaim::Index { id: 904, unique: false }, &[2])
-        .unwrap(); // not unique at all
+    let tmp = tempfile::tempdir().unwrap();
+    let mut registry = solo(tmp.path());
+    registry.register(table(60, pk_u64_two_i64_schema())).unwrap();
+    registry.add_index(60, index(901, true), &[0]).unwrap(); // exactly the PK
+    registry.add_index(60, index(902, true), &[2, 0]).unwrap(); // the PK plus a payload column
+    registry.add_index(60, index(903, true), &[1]).unwrap(); // the only real check
+    registry.add_index(60, index(904, false), &[2]).unwrap(); // not unique at all
 
-    let r = registry.relation(60).unwrap();
-    let cols: Vec<Vec<u32>> = r
+    let cols: Vec<Vec<u32>> = registry
+        .relation(60)
+        .unwrap()
         .unique_indexes_to_check()
         .map(|ic| ic.cols().as_slice().to_vec())
         .collect();
     assert_eq!(cols, vec![vec![1u32]]);
 }
 
+/// The append path sizes by the store's region count, so a batch of another
+/// payload arity is refused before anything is written.
+#[test]
+fn ingest_refuses_a_batch_of_another_arity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut registry = solo(tmp.path());
+    registry.register(table(50, make_schema_u64_i64())).unwrap();
+    let mut wide = crate::storage::BatchBuilder::new(pk_u64_two_i64_schema());
+    wide.begin_row(1, 1);
+    wide.put_int(1);
+    wide.put_int(2);
+    wide.end_row();
+    assert!(registry.ingest(50, wide.finish()).is_err());
+    assert_eq!(
+        registry.relation(50).unwrap().full_scan().count,
+        0,
+        "nothing was written"
+    );
+}
+
+/// An index is fed the batch as the PK rule left it, so an upsert moves the
+/// entry: only the live row's entry remains, at weight 1.
+#[test]
+fn an_upsert_moves_the_index_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut registry = solo(tmp.path());
+    let schema = make_schema_u64_i64();
+    registry.register(table(50, schema)).unwrap();
+    registry.add_index(50, index(51, false), &[1]).unwrap();
+    registry.ingest(50, make_batch_raw(&schema, &[(1, 1, 10)])).unwrap();
+    registry.ingest(50, make_batch_raw(&schema, &[(1, 1, 20)])).unwrap();
+
+    let ix = registry.relation(50).unwrap().index_on(&[1]).unwrap();
+    let want = project_index(&make_batch_raw(&schema, &[(1, 1, 20)]), &ix.key_spec(), &ix.schema());
+    assert_eq!(
+        zset_of(&ix.cursor().materialize(), &ix.schema()),
+        zset_of(&want, &ix.schema())
+    );
+}
+
+/// An index store is rederived: the base round leaves it, the ephemeral round
+/// publishes it at the resume generation.
+#[test]
+fn only_the_ephemeral_round_publishes_an_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut registry = solo(tmp.path());
+    registry.register(table(70, make_schema_u64_i64())).unwrap();
+    registry.add_index(70, index(999, false), &[1]).unwrap();
+    let dir = registry.child_dir(70, ChildKind::Index(PkColList::from_slice(&[1])));
+
+    registry.set_resume_generation(3);
+    registry.checkpoint_base().unwrap();
+    assert!(read_intact(&dir).unwrap().is_none(), "the base round skips it");
+    registry.checkpoint_ephemeral([]).unwrap();
+    assert!(read_at(&dir, 3).unwrap().is_some());
+}
+
 /// Only a directory named exactly as a relation's is read, and a damaged
 /// manifest holds no record.
 #[test]
 fn persisted_records_reads_well_formed_relation_manifests() {
-    let mut registry = solo_registry("persisted_records");
-    let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
-    let view = RelationKind::View(ViewProps::Plain);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut registry = solo(tmp.path());
     let (good, damaged) = (123, 124);
-    let good_dir = register_entry(&mut registry, good, schema, view);
-    let damaged_dir = register_entry(&mut registry, damaged, schema, view);
+    registry.register(view(good)).unwrap();
+    registry.register(view(damaged)).unwrap();
     registry.set_caller_record(good, b"good".to_vec()).unwrap();
     registry.set_caller_record(damaged, b"damaged".to_vec()).unwrap();
     registry.checkpoint_ephemeral([]).unwrap();
 
-    let rows = ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO };
-    let manifest = rows.manifest(&damaged_dir);
-    let mut bytes = std::fs::read(&manifest).unwrap();
-    let last = bytes.len() - 1;
-    bytes[last] ^= 1;
-    std::fs::write(&manifest, bytes).unwrap();
+    flip_last_byte_in_place(manifest_path(&registry.child_dir(damaged, ChildKind::Rows)));
     // A name that parses to `good`'s id but is not the name its directory has.
-    let alias = format!("{}/0{good}", relations_dir(&registry.base_dir));
-    let alias_rows = rows.dir(&alias);
-    std::fs::create_dir_all(&alias_rows).unwrap();
-    std::fs::copy(rows.manifest(&good_dir), rows.manifest(&alias)).unwrap();
+    let rows = ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO };
+    let alias = format!("{}/0{good}", relations_dir(registry.base_dir()));
+    std::fs::create_dir_all(rows.dir(&alias)).unwrap();
+    std::fs::copy(
+        manifest_path(&registry.child_dir(good, ChildKind::Rows)),
+        rows.manifest(&alias),
+    )
+    .unwrap();
 
     let records: Vec<(u64, Vec<u8>)> = registry
         .persisted_records()
@@ -282,90 +202,59 @@ fn persisted_records_reads_well_formed_relation_manifests() {
     assert_eq!(records, vec![(good, b"good".to_vec())]);
 }
 
-/// `reopen_view` enters a view only when its rows open from the manifest.
+/// A view told to resume opens only from its manifests: its store from the
+/// rows', whichever opener asks, its operator state from each declared trace's.
+/// Told to rebuild, a worker opens it regardless.
 #[test]
-fn reopen_view_refuses_a_view_with_no_manifest() {
-    let mut registry = solo_registry("reopen_view");
-    let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
-    let spec = |id| RelationSpec {
-        id,
-        kind: RelationKind::View(ViewProps::Plain),
-        schema,
+fn a_resumed_view_refuses_a_missing_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_str().unwrap();
+    let spec = view(7);
+    let layout = || {
+        let mut l = StateLayout::default();
+        l.declare("t".to_string(), spec.schema);
+        l
     };
-    register_entry(&mut registry, 7, schema, RelationKind::View(ViewProps::Plain));
-    registry.checkpoint_ephemeral([]).unwrap();
-    registry.unregister(7);
-
-    registry.reopen_view(spec(7)).expect("a published view reopens");
-    assert!(registry.reopen_view(spec(8)).is_err());
-    assert!(registry.relation(8).is_none(), "a refused view is not entered");
-}
-
-/// A registered view, its rows and one declared trace `t` published at the
-/// resume generation; returns the view's spec and relation directory.
-fn published_traced_view(registry: &mut RelationRegistry, id: u64) -> (RelationSpec, String) {
-    let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
-    let spec = RelationSpec {
-        id,
-        kind: RelationKind::View(ViewProps::Plain),
-        schema,
+    {
+        let mut origin = solo(tmp.path());
+        origin.register(spec).unwrap();
+        let mut state = CircuitState::open(&origin, 7, layout()).unwrap();
+        origin.checkpoint_ephemeral([&mut state]).unwrap();
+    }
+    let reopen = || {
+        let mut r = solo(tmp.path());
+        r.reopen_view(spec).map(|()| r)
     };
-    let dir = register_entry(registry, id, schema, spec.kind);
-    let mut layout = StateLayout::default();
-    layout.declare("t".to_string(), schema);
-    let mut state = CircuitState::open(registry, id, layout).unwrap();
-    registry.checkpoint_ephemeral([&mut state]).unwrap();
-    (spec, dir)
-}
-
-/// A worker told to resume a view whose rows manifest is gone fails its store
-/// open.
-#[test]
-fn open_stores_refuses_a_resumed_view_without_its_rows() {
-    let base = relation_test_dir("open_stores_resume");
-    let (spec, dir) = published_traced_view(&mut RelationRegistry::new(&base, Slot::SOLO, StoreConfig::default()), 7);
-    let open = || {
-        let mut master = RelationRegistry::master(&base, 1, StoreConfig::default());
+    let trace = |r: &RelationRegistry| CircuitState::open(r, 7, layout()).map(drop);
+    let worker = |resume: bool| {
+        let mut master = RelationRegistry::master(base, 1, StoreConfig::default());
         master.register(spec).unwrap();
         master.reconcile_child_dirs().unwrap();
-        master.open_stores(0, Residency::Worker, |_| true).map(drop)
+        master.open_stores(0, Residency::Worker, |_| resume).map(drop)
     };
-    open().expect("a published view resumes");
+    let child = |kind| manifest_path(&solo(tmp.path()).child_dir(7, kind));
+    trace(&reopen().unwrap()).expect("a published trace resumes");
+    worker(true).expect("a published view resumes on a worker");
 
-    std::fs::remove_file(ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO }.manifest(&dir)).unwrap();
-    assert!(open().is_err());
-}
+    std::fs::remove_file(child(ChildKind::Scratch("t"))).unwrap();
+    assert!(trace(&reopen().expect("the rows resume without the trace")).is_err());
 
-/// A resumed view whose declared trace has no manifest at the generation its
-/// rows resumed from refuses to open its operator state.
-#[test]
-fn circuit_state_refuses_a_resumed_trace_without_its_manifest() {
-    let base = relation_test_dir("circuit_state_resume");
-    let (spec, dir) = published_traced_view(&mut RelationRegistry::new(&base, Slot::SOLO, StoreConfig::default()), 7);
-    let open = || {
-        let mut registry = RelationRegistry::new(&base, Slot::SOLO, StoreConfig::default());
-        registry.reopen_view(spec).unwrap();
-        let mut layout = StateLayout::default();
-        layout.declare("t".to_string(), spec.schema);
-        CircuitState::open(&registry, spec.id, layout).map(drop)
-    };
-    open().expect("a published trace resumes");
-
-    let trace = ChildAddr {
-        kind: ChildKind::Scratch("t"),
-        slot: Slot::SOLO,
-    };
-    std::fs::remove_file(trace.manifest(&dir)).unwrap();
-    assert!(open().is_err());
+    std::fs::remove_file(child(ChildKind::Rows)).unwrap();
+    let mut r = solo(tmp.path());
+    assert!(r.reopen_view(spec).is_err());
+    assert!(!r.has_id(7), "a refused view is not entered");
+    assert!(worker(true).is_err());
+    // Last: a rebuild erases the traces.
+    worker(false).expect("told to rebuild, a worker opens the view");
 }
 
 /// Each nonzero-weight source row projects to exactly its `write_entry` key at
 /// its own weight, retractions included; a weight-0 row projects to nothing.
 #[test]
 fn project_index_writes_each_entry_at_its_rows_weight() {
-    let owner = crate::test_support::make_schema_u64_i64();
+    let owner = make_schema_u64_i64();
     let (spec, idx_schema) = crate::schema::index_spec_and_schema(&[1], &owner).unwrap();
-    let src = crate::test_support::make_batch_raw(&owner, &[(1, 1, 10), (2, 0, 20), (3, -1, 30)]);
+    let src = make_batch_raw(&owner, &[(1, 1, 10), (2, 0, 20), (3, -1, 30)]);
     let entry = |row: usize| {
         let mut e = vec![0u8; idx_schema.pk_stride()];
         assert!(spec.write_entry(&src.as_mem_batch(), row, &mut e));

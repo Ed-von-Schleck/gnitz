@@ -560,6 +560,11 @@ impl RelationRegistry {
         self.slot
     }
 
+    /// This process's `kind` child directory of relation `id`.
+    pub fn child_dir(&self, id: u64, kind: ChildKind<'_>) -> String {
+        ChildAddr { kind, slot: self.slot }.dir(&relation_dir(&self.base_dir, id))
+    }
+
     /// What this process is to the stores it registered.
     pub fn residency(&self) -> Residency {
         self.residency
@@ -628,13 +633,6 @@ impl RelationRegistry {
             .filter(|(_, e)| e.kind.is_view())
             .map(|(&id, _)| id)
             .collect()
-    }
-
-    /// The column list a `pack_pk_cols` word names, admitted by [`Relation::bound_cols`].
-    pub fn index_cols(&self, id: u64, packed: u64, op: &str) -> Result<PkColList, String> {
-        let cols =
-            gnitz_wire::unpack_pk_cols(packed).map_err(|_| format!("{op}: invalid column list for table {id}"))?;
-        self.relation_or_err(id)?.bound_cols(cols, op)
     }
 
     // ── The resume fence ────────────────────────────────────────────────

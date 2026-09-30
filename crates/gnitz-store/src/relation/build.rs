@@ -136,7 +136,7 @@ impl RelationRegistry {
         recovery: RecoverySource,
         budgets: StoreBudgets,
     ) -> Result<Table, String> {
-        let dir = ChildAddr { kind, slot: self.slot }.dir(&relation_dir(&self.base_dir, id));
+        let dir = self.child_dir(id, kind);
         Table::new(&dir, schema, recovery, budgets).map_err(|e| format!("open store '{dir}': {e}"))
     }
 }

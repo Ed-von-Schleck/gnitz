@@ -197,7 +197,7 @@ fn decompose(label: &str, bake: AviBake, input: Batch) {
     // growth, not the population.
     let full = bench_time_each(
         ITERS,
-        || scratch_table(tmp.path().to_str().unwrap(), avi_schema),
+        || scratch_table(tmp.path(), avi_schema),
         |mut t| {
             t.ingest_owned_batch(avi_batch(input, bake)).unwrap();
             std::hint::black_box(&t);

@@ -146,9 +146,9 @@ pub fn bench_time_each<S>(iters: usize, mut setup: impl FnMut() -> S, mut body: 
 /// A rederived table under `dir` at the default budgets — nothing a test puts
 /// here spills, since that needs the whole 32 MiB RAM tier. For a test that just
 /// needs somewhere to put rows.
-pub(crate) fn scratch_table(dir: &str, schema: SchemaDescriptor) -> Table {
+pub(crate) fn scratch_table(dir: impl AsRef<Path>, schema: SchemaDescriptor) -> Table {
     Table::new(
-        dir,
+        dir.as_ref().to_str().unwrap(),
         schema,
         RecoverySource::Rederive { resume_at: None },
         StoreBudgets::default(),
@@ -158,7 +158,7 @@ pub(crate) fn scratch_table(dir: &str, schema: SchemaDescriptor) -> Table {
 
 /// Flip the low bit of `path`'s last byte with a `pwrite`, which a live mapping
 /// of the file sees; a truncating rewrite would fault that mapping instead.
-pub(crate) fn flip_last_byte_in_place(path: &std::path::Path) {
+pub(crate) fn flip_last_byte_in_place(path: impl AsRef<Path>) {
     use std::os::unix::fs::FileExt;
     let file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
     let last = file.metadata().unwrap().len() - 1;

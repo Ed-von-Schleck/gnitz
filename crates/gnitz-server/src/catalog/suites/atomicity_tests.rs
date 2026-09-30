@@ -809,12 +809,9 @@ fn compensated_create_table_leaves_no_trace() {
     }
     assert!(engine.registry.relation(tid).unwrap().index_on(&[1]).is_some());
 
-    let reldir = relation_dir(&dir, tid);
-    let blocker = ChildAddr {
-        kind: ChildKind::Index(gnitz_wire::PkColList::from_slice(&[2])),
-        slot: engine.registry.slot(),
-    }
-    .dir(&reldir);
+    let blocker = engine
+        .registry
+        .child_dir(tid, ChildKind::Index(gnitz_wire::PkColList::from_slice(&[2])));
     fs::write(&blocker, b"not a directory").unwrap();
     let idx = idx_tab_batch(
         idx_id,
@@ -837,7 +834,7 @@ fn compensated_create_table_leaves_no_trace() {
     assert_eq!(counts(&engine), before, "no system family may keep a row of the table");
     engine.reclaim_orphan_dirs();
     assert!(
-        !std::path::Path::new(&reldir).exists(),
+        !std::path::Path::new(&relation_dir(&dir, tid)).exists(),
         "the sweep must reclaim the uncreated table's directory"
     );
 

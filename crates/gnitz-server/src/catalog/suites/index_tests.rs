@@ -121,11 +121,9 @@ fn test_failed_create_index_rolls_back() {
     // The id `create_index` is about to allocate.
     let failed_idx_id = engine.next_id;
     // A file where this process's index store goes.
-    let index = ChildAddr {
-        kind: ChildKind::Index(gnitz_wire::PkColList::from_slice(&[1])),
-        slot: engine.registry.slot(),
-    };
-    let blocker = index.dir(&relation_dir(&dir, tid));
+    let blocker = engine
+        .registry
+        .child_dir(tid, ChildKind::Index(gnitz_wire::PkColList::from_slice(&[1])));
     fs::write(&blocker, b"not a directory").unwrap();
     let idx_name = make_secondary_index_name("public", "t", "val");
 

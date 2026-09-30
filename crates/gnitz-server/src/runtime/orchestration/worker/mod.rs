@@ -215,7 +215,8 @@ impl WorkerProcess {
                 let Some(batch) = batch else {
                     return Err("has_pk: a probe carries its keys".into());
                 };
-                let result = self.handle_has_pk(target_id, batch, hdr.arg1, hdr.flags.probe_mode, hdr.arg0 as usize)?;
+                let keyspace = gnitz_wire::ProbeKeyspace::from_arg1(hdr.arg1).map_err(|e| format!("has_pk: {e}"))?;
+                let result = self.handle_has_pk(target_id, batch, keyspace, hdr.flags.probe_mode, hdr.arg0 as usize)?;
                 self.send_reply(route, result);
                 Ok(())
             }
@@ -263,10 +264,8 @@ impl WorkerProcess {
             }
 
             SalMessageKind::UniquePreflight => {
-                let cols = self
-                    .cat()
-                    .registry
-                    .index_cols(target_id, hdr.arg1, "unique pre-flight")?;
+                let cols = gnitz_wire::unpack_pk_cols(hdr.arg1)
+                    .map_err(|e| format!("unique pre-flight on table {target_id}: {e}"))?;
                 self.handle_unique_preflight(target_id, cols.as_slice(), request_id)?;
                 Ok(())
             }
@@ -398,24 +397,22 @@ impl WorkerProcess {
     }
 
     /// Answer one HasPk probe over the keys that exist committed on this
-    /// worker; `mode` decides what a match is answered with. `key_cols` names
-    /// the store probed: the table's own PK store, or a secondary index on the
-    /// packed column list (single- or multi-column; a composite index is located
-    /// by its exact list). Unique and non-unique alike — the FK parent-delete
-    /// check probes a child's FK auto-index, which is never unique.
+    /// worker; `mode` decides what a match is answered with, `keyspace` which
+    /// store is probed (a composite index is located by its exact list). Unique
+    /// and non-unique alike — the FK parent-delete check probes a child's FK
+    /// auto-index, which is never unique.
     fn handle_has_pk(
         &mut self,
         target_id: u64,
         batch: Batch,
-        key_cols: u64,
+        keyspace: gnitz_wire::ProbeKeyspace,
         mode: gnitz_wire::WireProbeMode,
         mode_param: usize,
     ) -> Result<Batch, gnitz_wire::WireFault> {
-        let index_cols = gnitz_wire::probe_key_columns(key_cols);
         if let gnitz_wire::WireProbeMode::Project = mode {
-            // `arg1` is the PK sentinel here, so the column to project rides the
-            // per-mode parameter word instead.
-            if index_cols.is_some() {
+            // `arg1` names the own PK store here, so the column to project rides
+            // the per-mode parameter word instead.
+            if keyspace != gnitz_wire::ProbeKeyspace::OwnPk {
                 return Err("has_pk: a projecting probe reads the table's own PK store".into());
             }
             let ref_col = mode_param as u8;
@@ -427,7 +424,7 @@ impl WorkerProcess {
         // batch arena above 2 MiB. For an index probe the schema is the INDEX
         // table's, `(indexed_col, src_pk…)` — NOT the owner table's.
         let mut result = Batch::empty_with_schema(batch.schema());
-        let Some(packed) = index_cols else {
+        let gnitz_wire::ProbeKeyspace::Index(cols) = keyspace else {
             let relation = self.cat().registry.relation(target_id);
             for i in 0..batch.len() {
                 let pkb = batch.get_pk_bytes(i);
@@ -438,7 +435,6 @@ impl WorkerProcess {
             }
             return Ok(result);
         };
-        let cols = self.cat().registry.index_cols(target_id, packed, "has_pk")?;
         // One resolution of `(target_id, cols)`: the circuit carries the index
         // table and the span width.
         let ic = self

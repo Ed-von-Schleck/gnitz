@@ -72,8 +72,8 @@ struct Harness {
 impl Harness {
     fn new(plan: TopNPlan, group_cols: &[u32]) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let index = scratch_table(dir.path().join("idx").to_str().unwrap(), plan.index.schema);
-        let trace_out = scratch_table(dir.path().join("out").to_str().unwrap(), plan.output_schema);
+        let index = scratch_table(dir.path().join("idx"), plan.index.schema);
+        let trace_out = scratch_table(dir.path().join("out"), plan.output_schema);
         let layout = schema()
             .reduce_out_key(group_cols)
             .output_layout(group_cols, 0..5)

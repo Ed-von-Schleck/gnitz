@@ -24,35 +24,11 @@ use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::KeySpec;
 use gnitz_store::storage::MemBatch;
-use gnitz_wire::{PkKeys, WireConflictMode, WireProbeMode, WireStatus};
+use gnitz_wire::{PkColList, PkKeys, ProbeKeyspace, WireConflictMode, WireProbeMode, WireStatus};
 
 // ---------------------------------------------------------------------------
 // Pipelined validation checks
 // ---------------------------------------------------------------------------
-
-/// Which keyspace a check probes, and so how its rows must reach the workers.
-/// Index entries are placed by their OWNER's PK, not by the span they carry,
-/// so an index probe cannot be scattered by its own key.
-enum Keyspace {
-    /// The relation's own PK store: scattered, each worker sent the keys it holds.
-    OwnPk,
-    /// A secondary index, as `pack_pk_cols(&[col…])`: broadcast.
-    Index(u64),
-}
-
-impl Keyspace {
-    fn index(cols: &[u32]) -> Self {
-        Keyspace::Index(gnitz_wire::pack_pk_cols(cols))
-    }
-
-    /// The worker's `arg1`, which `gnitz_wire::probe_key_columns` reads back.
-    fn arg1(&self) -> u64 {
-        match self {
-            Keyspace::OwnPk => gnitz_wire::PROBE_KEYSPACE_PK,
-            Keyspace::Index(packed) => *packed,
-        }
-    }
-}
 
 /// What a probe answers each matched key with.
 enum Probe {
@@ -77,7 +53,7 @@ enum Probe {
 /// and the owner's own schema would give the wrong key width. It is always
 /// payload-free, so `batch` is built row-by-key.
 struct PipelinedCheck {
-    keyspace: Keyspace,
+    keyspace: ProbeKeyspace,
     probe: Probe,
     batch: Batch,
     schema: wire::WireSchema,
@@ -443,7 +419,7 @@ async fn execute_probe_burst(
                 match check.keyspace {
                     // Each worker is sent the keys it holds; one holding none is
                     // not sent the probe.
-                    Keyspace::OwnPk => with_routed(&check.batch, &check.schema, nw, |rows, data| {
+                    ProbeKeyspace::OwnPk => with_routed(&check.batch, &check.schema, nw, |rows, data| {
                         let holders = rows
                             .iter()
                             .enumerate()
@@ -460,7 +436,7 @@ async fn execute_probe_burst(
                     })?,
                     // Index entries are partitioned independently of the probe
                     // key, so every worker holding the relation is probed.
-                    Keyspace::Index(_) => cut.read(DirectGroup {
+                    ProbeKeyspace::Index(_) => cut.read(DirectGroup {
                         template,
                         data: GroupData::Same(wire::WireData::Whole(&check.batch)),
                         ..DirectGroup::new(SalMessageKind::HasPk)
@@ -612,7 +588,7 @@ fn plan_pk_checks(b: &TxnBundle<'_>, checks: &mut Vec<PipelinedCheck>) -> Vec<u6
         }
         let pk_only = probe_schema(&t.schema);
         checks.push(PipelinedCheck {
-            keyspace: Keyspace::OwnPk,
+            keyspace: ProbeKeyspace::OwnPk,
             probe: Probe::Exists,
             batch: build_check_batch_pk_bytes(&pk_only, keys.into_iter()),
             schema: wire::WireSchema::encoded(t.tid, pk_only),
@@ -703,7 +679,7 @@ fn plan_unique_checks<'a>(
                 continue;
             }
             checks.push(PipelinedCheck {
-                keyspace: Keyspace::index(cols),
+                keyspace: ProbeKeyspace::Index(col_indices),
                 // The reply must name the committed holder of each occupied
                 // span, not echo the probe key back.
                 probe: Probe::FirstHolder,
@@ -780,7 +756,7 @@ fn plan_fk_existence(
         let parent_schema = disp.cat().registry.relation_or_err(parent_tid)?.schema();
         let ref_tc = loc.type_code();
         let (key_schema, keyspace) = if parent_schema.lone_pk_col() == Some(parent_col) {
-            (probe_schema(&parent_schema), Keyspace::OwnPk)
+            (probe_schema(&parent_schema), ProbeKeyspace::OwnPk)
         } else {
             let idx_schema = disp
                 .cat()
@@ -789,7 +765,10 @@ fn plan_fk_existence(
                 .and_then(|r| r.index_on(&[parent_col as u32]))
                 .map(|ic| ic.schema())
                 .ok_or_else(|| format!("FK check: no unique index on parent {parent_tid} col {parent_col}"))?;
-            (idx_schema, Keyspace::index(&[parent_col as u32]))
+            (
+                idx_schema,
+                ProbeKeyspace::Index(PkColList::from_slice(&[parent_col as u32])),
+            )
         };
         checks.push(PipelinedCheck {
             keyspace,
@@ -886,7 +865,7 @@ async fn resolve_parent_deltas(
         // region ahead of it.
         locators.push(reply.locate(reply.payload_col_idx(0)));
         checks.push(PipelinedCheck {
-            keyspace: Keyspace::OwnPk,
+            keyspace: ProbeKeyspace::OwnPk,
             probe: Probe::Project { col: pcol, reply: Box::new(reply) },
             batch: build_check_batch_pk_bytes(&pk_only, keys.iter()),
             schema: wire::WireSchema::encoded(ptid, pk_only),
@@ -1041,7 +1020,7 @@ async fn txn_check_fk_restrict(
             Probe::Exists
         };
         checks.push(PipelinedCheck {
-            keyspace: Keyspace::index(&[fk_col as u32]),
+            keyspace: ProbeKeyspace::Index(PkColList::from_slice(&[fk_col as u32])),
             probe,
             batch,
             schema: wire::WireSchema::encoded(child_tid, idx_schema),

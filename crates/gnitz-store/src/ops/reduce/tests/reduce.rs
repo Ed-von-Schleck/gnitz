@@ -89,7 +89,7 @@ impl Avi {
         // position `j` in that subset exactly as production has it.
         let bake = make_bake(in_schema, group_cols, agg_descs);
         let dir = tempfile::tempdir().unwrap();
-        let mut table = scratch_table(dir.path().to_str().unwrap(), bake.schema);
+        let mut table = scratch_table(dir.path(), bake.schema);
         for b in history {
             use super::avi::avi_batch;
             table.ingest_owned_batch(avi_batch(b, &bake)).unwrap();
@@ -4814,7 +4814,7 @@ fn build_combined_avi(
     deltas: &[&Batch],
 ) -> crate::storage::Table {
     let avi_schema = avi_schema(in_schema, group_cols);
-    let mut t = scratch_table(dir.to_str().unwrap(), avi_schema);
+    let mut t = scratch_table(dir, avi_schema);
     let bake = make_bake(in_schema, group_cols, agg_descs);
     for d in deltas {
         use super::avi::avi_batch;
@@ -5354,7 +5354,7 @@ fn run_reduce_trace_epochs(
 ) -> (std::rc::Rc<Batch>, usize) {
     // A fresh tempdir per call isolates shard files, so a constant table_id is
     // collision-free.
-    let mut trace = scratch_table(dir.to_str().unwrap(), *out_schema);
+    let mut trace = scratch_table(dir, *out_schema);
     let mut max_sources = 0usize;
     for (i, d) in epochs.iter().enumerate() {
         // Sources the cursor for THIS epoch's probe sees: memtable runs + folded
@@ -6577,7 +6577,7 @@ fn op_reduce_bench() {
         let cold = t.elapsed();
         std::hint::black_box(&out);
 
-        let mut trace = scratch_table(tmp.path().to_str().unwrap(), out_schema);
+        let mut trace = scratch_table(tmp.path(), out_schema);
         let mut avi = plan.avi.is_some().then(|| Avi::new(schema, group, aggs, &[&d1, &d2]));
         {
             let mut avi1 = plan.avi.is_some().then(|| Avi::new(schema, group, aggs, &[&d1]));
@@ -6649,7 +6649,7 @@ fn op_reduce_group_sweep_bench() {
             let plan = ReducePlan::from_wire(&schema, &group_cols, &aggs, false).unwrap();
             let out_schema = out_schema_for(&schema, &group_cols, &aggs);
             let tmp = tempfile::tempdir().unwrap();
-            let mut trace = scratch_table(tmp.path().to_str().unwrap(), out_schema);
+            let mut trace = scratch_table(tmp.path(), out_schema);
             {
                 let mut avi1 = plan
                     .avi
@@ -6703,7 +6703,7 @@ fn op_reduce_multi_run_bench() {
         b
     };
     let tmp = tempfile::tempdir().unwrap();
-    let mut trace = crate::test_support::scratch_table(tmp.path().to_str().unwrap(), out_schema);
+    let mut trace = crate::test_support::scratch_table(tmp.path(), out_schema);
     let runs: [Vec<u64>; 3] = [
         (0..2 * G).step_by(2).collect(),
         (1..2 * G).step_by(2).collect(),

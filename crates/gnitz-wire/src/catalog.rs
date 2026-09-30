@@ -579,19 +579,34 @@ const _: () = assert!(
 /// reading a shape.
 pub const PK_LIST_PACKED_FLAG: u64 = 1 << 63;
 
-/// The `arg1` value naming the relation's own PK store — see
-/// [`probe_key_columns`].
-pub const PROBE_KEYSPACE_PK: u64 = 0;
+/// The store a `HasPk` probe reads, as its group's `arg1` carries it.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ProbeKeyspace {
+    /// The relation's own PK store, carried as `0`.
+    OwnPk,
+    /// The secondary index on this exact column list, carried packed.
+    Index(PkColList),
+}
 
-/// The keyspace a `HasPk` group's `arg1` names: `None` for the
-/// relation's own PK store, `Some(packed column list)` for a secondary index.
-///
-/// [`pack_pk_cols`] lays a count of `1..=PK_LIST_MAX_COLS` in the low bits, so a
-/// real column list is never [`PROBE_KEYSPACE_PK`]. Both ends of that hop decode
-/// through here, so the sentinel has one spelling.
-#[inline]
-pub fn probe_key_columns(arg1: u64) -> Option<u64> {
-    (arg1 != PROBE_KEYSPACE_PK).then_some(arg1)
+impl ProbeKeyspace {
+    /// The `arg1` word. [`pack_pk_cols`] sets [`PK_LIST_PACKED_FLAG`], so an index
+    /// word is never `0`.
+    pub fn arg1(self) -> u64 {
+        match self {
+            ProbeKeyspace::OwnPk => 0,
+            ProbeKeyspace::Index(cols) => pack_pk_cols(cols.as_slice()),
+        }
+    }
+
+    /// Decode an `arg1` word; a nonzero word must be a packed column list.
+    pub fn from_arg1(arg1: u64) -> Result<Self, String> {
+        if arg1 == 0 {
+            return Ok(ProbeKeyspace::OwnPk);
+        }
+        unpack_pk_cols(arg1)
+            .map(ProbeKeyspace::Index)
+            .map_err(|e| e.for_role(crate::PkListRole::ColumnList))
+    }
 }
 
 /// A PK column list, `1..=PK_LIST_MAX_COLS` entries, inline. Constructing one is

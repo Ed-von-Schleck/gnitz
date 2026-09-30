@@ -401,7 +401,7 @@ fn weight_clamp_bench() {
     for shape in shapes {
         let schema = bench_schema(shape.payload_cols, shape.strings);
         let tmp = tempfile::tempdir().unwrap();
-        let mut trace = crate::test_support::scratch_table(tmp.path().to_str().unwrap(), schema);
+        let mut trace = crate::test_support::scratch_table(tmp.path(), schema);
         for run in &shape.runs {
             trace.ingest_owned_batch(bench_batch(&schema, run)).unwrap();
         }

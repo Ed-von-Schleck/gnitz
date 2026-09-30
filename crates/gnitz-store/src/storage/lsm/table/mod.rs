@@ -405,14 +405,6 @@ impl Table {
         self.ram_tiers().iter().map(|s| s.row_count()).sum::<usize>() + self.shard_index.total_rows()
     }
 
-    /// `(registered shards, how many carry a PK filter)`.
-    #[cfg(test)]
-    pub(crate) fn pk_filter_census(&self) -> (usize, usize) {
-        self.shard_index.all_shard_arcs_iter().fold((0, 0), |(n, filtered), s| {
-            (n + 1, filtered + usize::from(s.has_shard_filter()))
-        })
-    }
-
     /// Every registered shard.
     #[cfg(test)]
     pub(crate) fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {

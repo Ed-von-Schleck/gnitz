@@ -83,7 +83,7 @@ fn a_mixed_scalar_and_wide_bake_reads_both_ordinals_back() {
 fn index_and_seed(plan: &ReducePlan, delta: &Batch) -> Vec<Accumulator> {
     let bake = plan.avi.as_ref().expect("a MIN/MAX reduce bakes an AVI");
     let tmp = tempfile::tempdir().unwrap();
-    let mut table = scratch_table(tmp.path().to_str().unwrap(), bake.schema);
+    let mut table = scratch_table(tmp.path(), bake.schema);
     table.ingest_owned_batch(avi_batch(delta, bake)).unwrap();
     let mut accs = plan.shape.acc_template.clone();
     bake.seed_extremes(&mut table.open_cursor(), &delta.as_mem_batch(), 0, &mut accs);

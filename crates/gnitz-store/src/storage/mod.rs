@@ -27,6 +27,8 @@ pub use repr::merge::MemBatch;
 pub use repr::scatter::route_rows_by_pk;
 pub use spill::{KeyProducer, SpillSort};
 
+#[cfg(test)]
+pub(crate) use lsm::manifest::shard_path;
 pub(crate) use lsm::manifest::{link_store, manifest_path, read_at, read_intact, retire_store};
 #[cfg(test)]
 pub(crate) use lsm::read_cursor::create_read_cursor;

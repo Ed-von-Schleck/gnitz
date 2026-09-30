@@ -32,7 +32,7 @@ fn delta_ingest_bench() {
     // Untimed warmup: thread-local batch pool + arena.
     {
         let dir = tempfile::tempdir().unwrap();
-        let mut t = scratch_table(dir.path().join("warm").to_str().unwrap(), schema);
+        let mut t = scratch_table(dir.path().join("warm"), schema);
         for k in 0..8 {
             t.ingest_owned_batch(make_delta(&schema, k * 1000, 1000)).unwrap();
         }
@@ -67,7 +67,7 @@ fn delta_ingest_bench() {
 
         // Phase B — the store ingest, into a table that grows across the run.
         let dir = tempfile::tempdir().unwrap();
-        let mut table = scratch_table(dir.path().join(format!("ingest{id}")).to_str().unwrap(), schema);
+        let mut table = scratch_table(dir.path().join(format!("ingest{id}")), schema);
         let t1 = Instant::now();
         for b in batches {
             table.ingest_owned_batch(b).unwrap();
@@ -110,7 +110,7 @@ fn delta_ingest_bench() {
             batches.push(make_delta(&schema, (j * n) as u64, n));
         }
         let dir = tempfile::tempdir().unwrap();
-        let mut table = scratch_table(dir.path().join(format!("q{id}")).to_str().unwrap(), schema);
+        let mut table = scratch_table(dir.path().join(format!("q{id}")), schema);
         let t = Instant::now();
         for b in batches {
             table.ingest_owned_batch(b).unwrap();
@@ -162,7 +162,7 @@ fn delta_ingest_bench() {
             batches.push(make_batch_raw(&schema, &rows));
         }
         let dir = tempfile::tempdir().unwrap();
-        let mut table = scratch_table(dir.path().join(format!("c{id}")).to_str().unwrap(), schema);
+        let mut table = scratch_table(dir.path().join(format!("c{id}")), schema);
         let t = Instant::now();
         for b in batches {
             table.ingest_owned_batch(b).unwrap();

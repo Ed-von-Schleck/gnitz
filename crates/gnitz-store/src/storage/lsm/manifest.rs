@@ -134,7 +134,7 @@ pub(super) fn shard_name(seq: u64) -> String {
 }
 
 /// The path of the shard drawn at `seq` in the store at `dir`.
-pub(super) fn shard_path(dir: &str, seq: u64) -> String {
+pub(crate) fn shard_path(dir: &str, seq: u64) -> String {
     format!("{dir}/{}", shard_name(seq))
 }
 

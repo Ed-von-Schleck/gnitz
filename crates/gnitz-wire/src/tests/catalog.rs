@@ -18,7 +18,7 @@ fn system_table_keys_are_valid_for_their_columns() {
 }
 
 /// The in-memory constructor and the persisted codec are the same list at every
-/// arity, and no packed list is the PK-store sentinel. The word is persisted, so
+/// arity, and a probe keyspace round-trips through its `arg1` word. The word is persisted, so
 /// its layout is pinned as a literal.
 #[test]
 fn a_pk_col_list_roundtrips_through_its_packed_word() {
@@ -27,13 +27,14 @@ fn a_pk_col_list_roundtrips_through_its_packed_word() {
         assert_eq!(list.as_slice(), cols);
         let packed = pack_pk_cols(cols);
         assert_eq!(unpack_pk_cols(packed), Ok(list), "{cols:?}");
-        assert_eq!(
-            probe_key_columns(packed),
-            Some(packed),
-            "{cols:?}: never the PK sentinel"
-        );
+        let index = ProbeKeyspace::Index(list);
+        assert_eq!(ProbeKeyspace::from_arg1(index.arg1()), Ok(index), "{cols:?}");
     }
-    assert_eq!(probe_key_columns(PROBE_KEYSPACE_PK), None);
+    assert_eq!(
+        ProbeKeyspace::from_arg1(ProbeKeyspace::OwnPk.arg1()),
+        Ok(ProbeKeyspace::OwnPk)
+    );
+    assert!(ProbeKeyspace::from_arg1(7).is_err(), "a nonzero word must be packed");
     assert_eq!(pack_pk_cols(&[3, 9]), 1 << 63 | 9 << 11 | 3 << 4 | 2);
 }
 
