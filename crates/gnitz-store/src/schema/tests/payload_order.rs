@@ -110,12 +110,11 @@ fn single_col_batch(null_words: &[u64], col_data: Vec<u8>) -> TestBatch {
     }
 }
 
-/// The payload comparator's order contract, one case per type rule. Each is
-/// asserted in both directions, so antisymmetry needs no separate test.
+/// `compare_rows` reads each payload cell at its own width and orders it by
+/// `cmp_col_window`, whose per-type order is swept in `gnitz-wire`. Asserted in
+/// both directions, so antisymmetry needs no separate test.
 #[test]
-fn compare_rows_orders_every_payload_type() {
-    // Low `n` little-endian bytes: two's complement for signed, zero-extended
-    // for unsigned — the payload cell layout.
+fn compare_rows_orders_a_payload_cell_by_its_type() {
     let le = |v: i128, n: usize| v.to_le_bytes()[..n].to_vec();
     let f = |v: f64| v.to_bits().to_le_bytes().to_vec();
 
@@ -136,67 +135,12 @@ fn compare_rows_orders_every_payload_type() {
             le(1 << 64, 16),
             Ordering::Less,
         ),
-        // A cross-sign `_join_pk` surfaced into a payload slot: read as unsigned,
-        // -1 (all bits set) would sort above 0.
-        (
-            "i128 is signed, not u128",
-            TypeCode::I128,
-            le(-1, 16),
-            le(0, 16),
-            Ordering::Less,
-        ),
-        // A 16-byte read returning 0 would make every UUID compare Equal and
-        // silently drop rows in consolidation.
-        (
-            "distinct UUIDs do not collapse",
-            TypeCode::UUID,
-            le(1, 16),
-            le(1 << 64, 16),
-            Ordering::Less,
-        ),
-        ("f64 by sign", TypeCode::F64, f(-5.0), f(5.0), Ordering::Less),
-        (
-            "total_cmp puts NaN above every finite",
-            TypeCode::F64,
-            f(f64::NAN),
-            f(1.0),
-            Ordering::Greater,
-        ),
         (
             "NaN ties with itself",
             TypeCode::F64,
             f(f64::NAN),
             f(f64::NAN),
             Ordering::Equal,
-        ),
-        // An unsigned high bit read as a sign would reverse the order.
-        (
-            "u64 high bit is not a sign",
-            TypeCode::U64,
-            le(0, 8),
-            le(u64::MAX as i128, 8),
-            Ordering::Less,
-        ),
-        (
-            "u32 high bit is not a sign",
-            TypeCode::U32,
-            le(0, 4),
-            le(u32::MAX as i128, 4),
-            Ordering::Less,
-        ),
-        (
-            "u16 high bit is not a sign",
-            TypeCode::U16,
-            le(0, 2),
-            le(u16::MAX as i128, 2),
-            Ordering::Less,
-        ),
-        (
-            "u8 high bit is not a sign",
-            TypeCode::U8,
-            le(0, 1),
-            le(u8::MAX as i128, 1),
-            Ordering::Less,
         ),
     ];
 

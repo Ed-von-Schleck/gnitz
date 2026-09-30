@@ -1,14 +1,8 @@
 use super::*;
 
-/// A peer of any version reads the version from these bytes.
-#[test]
-fn hello_layout_is_version_independent() {
-    assert_eq!(HELLO[..4], *b"GNTZ");
-    assert_eq!(HELLO[4..], WAL_FORMAT_VERSION.to_le_bytes());
-}
-
 #[test]
 fn check_hello_accepts_its_own_and_classifies_the_rest() {
+    assert_eq!(&HELLO[..4], b"GNTZ");
     assert_eq!(check_hello(&HELLO), Ok(()));
 
     let mut forged = HELLO;
@@ -19,8 +13,11 @@ fn check_hello_accepts_its_own_and_classifies_the_rest() {
     long.push(0);
     assert_eq!(check_hello(&long), Err(HelloError::Malformed));
 
+    // The version is the little-endian word at offset 4.
     let mut other = HELLO;
     other[4] ^= 1;
-    let peer = crate::read_u32_le(&other, 4);
-    assert_eq!(check_hello(&other), Err(HelloError::Version { peer }));
+    assert_eq!(
+        check_hello(&other),
+        Err(HelloError::Version { peer: WAL_FORMAT_VERSION ^ 1 })
+    );
 }

@@ -449,17 +449,13 @@ pub fn index_key_type(field_type: TypeCode) -> Option<TypeCode> {
 /// Promote every indexed column type via [`index_key_type`] and validate the
 /// resulting index-record layout. An index schema is
 /// `(promoted_0, …, promoted_{n-1}, src_pk_0, …)` with every column in the PK,
-/// so its PK arity is `n + src_pk_count` (capped by `MAX_PK_COLUMNS`) and its
-/// PK stride is `Σ wire_stride(promoted_i) + src_pk_stride` (capped by
-/// `MAX_PK_BYTES`). Returns the promoted type list. The single source of truth
+/// so its PK arity is `n + src_pk_count`, capped by `MAX_PK_COLUMNS` — which
+/// also keeps its stride within `MAX_PK_BYTES`, every key type being at most 16
+/// bytes. Returns the promoted type list. The single source of truth
 /// shared by the SQL planner's CREATE INDEX pre-check and the engine's
 /// `make_index_schema`, so the friendly planner error and the engine backstop
 /// can never disagree on a column's promoted width or the limits.
-pub fn index_key_types(
-    col_types: &[TypeCode],
-    src_pk_count: usize,
-    src_pk_stride: usize,
-) -> Result<Vec<TypeCode>, IndexKeyRule> {
+pub fn index_key_types(col_types: &[TypeCode], src_pk_count: usize) -> Result<Vec<TypeCode>, IndexKeyRule> {
     let mut promoted: Vec<TypeCode> = Vec::with_capacity(col_types.len());
     for (col, &t) in col_types.iter().enumerate() {
         // Indexed by position, so the layer above can name the SQL column that
@@ -470,10 +466,6 @@ pub fn index_key_types(
     let n = promoted.len();
     if n + src_pk_count > crate::MAX_PK_COLUMNS {
         return Err(IndexKeyRule::ArityOutOfRange { n, src_pk_count });
-    }
-    let stride: usize = promoted.iter().map(|t| t.wire_stride()).sum::<usize>() + src_pk_stride;
-    if stride > crate::MAX_PK_BYTES {
-        return Err(IndexKeyRule::StrideOutOfRange { stride });
     }
     Ok(promoted)
 }
@@ -491,8 +483,6 @@ pub enum IndexKeyRule {
     /// of them is a PK column, so their total arity is capped by
     /// [`crate::MAX_PK_COLUMNS`].
     ArityOutOfRange { n: usize, src_pk_count: usize },
-    /// The same record's packed PK region must fit [`crate::MAX_PK_BYTES`].
-    StrideOutOfRange { stride: usize },
 }
 
 impl core::fmt::Display for IndexKeyRule {
@@ -506,11 +496,6 @@ impl core::fmt::Display for IndexKeyRule {
                 f,
                 "index arity {n} + source PK arity {src_pk_count} exceeds the limit of {}",
                 crate::MAX_PK_COLUMNS
-            ),
-            IndexKeyRule::StrideOutOfRange { stride } => write!(
-                f,
-                "index record stride {stride} exceeds the limit of {} bytes",
-                crate::MAX_PK_BYTES
             ),
         }
     }
@@ -542,8 +527,6 @@ pub enum PkRule {
     NotEligible { col: u32, type_code: TypeCode },
     /// The PK region carries no null bitmap, so a NULL has nowhere to live.
     Nullable { col: u32 },
-    /// The packed PK region must fit [`crate::MAX_PK_BYTES`].
-    StrideOutOfRange { stride: usize },
 }
 
 /// Which list a [`PkRule`] is about: [`validate_pk_indices`]' four structural
@@ -583,10 +566,6 @@ impl PkRule {
                  (String, Blob, and float columns cannot)"
             ),
             PkRule::Nullable { col } => format!("{what} column {col} must not be nullable"),
-            PkRule::StrideOutOfRange { stride } => format!(
-                "{what} total stride must be 1..={} bytes, got {stride}",
-                crate::MAX_PK_BYTES
-            ),
         }
     }
 }
@@ -608,7 +587,7 @@ impl core::fmt::Display for PkRule {
 /// `max_pk` is the caller's own arity cap: [`crate::PK_LIST_MAX_COLS`] for a
 /// user-declared key, which must round-trip through the persisted PK-list word,
 /// and [`crate::MAX_PK_COLUMNS`] for an engine schema derived from one.
-pub fn validate_pk_indices(pk_cols: &[u32], ncols: usize, max_pk: usize) -> Result<(), PkRule> {
+pub(crate) fn validate_pk_indices(pk_cols: &[u32], ncols: usize, max_pk: usize) -> Result<(), PkRule> {
     if pk_cols.is_empty() {
         return Err(PkRule::Empty);
     }
@@ -626,11 +605,19 @@ pub fn validate_pk_indices(pk_cols: &[u32], ncols: usize, max_pk: usize) -> Resu
     Ok(())
 }
 
-/// The typed half of [`validate_pk_tuple`], which runs the structural half
-/// first, so `col` may assume its index is in range. Returns the validated
-/// `pk_stride`. Base-table counterpart of [`index_key_types`].
-fn validate_pk_column_types(pk_cols: &[u32], col: impl Fn(u32) -> (TypeCode, bool)) -> Result<usize, PkRule> {
-    let mut stride = 0usize;
+/// Both halves of the primary-key admission rule — the structural half, then
+/// each column's type and nullability — for the callers that hold the columns up
+/// front. Returns the validated `pk_stride`, within `MAX_PK_BYTES` since `max_pk`
+/// is at most `MAX_PK_COLUMNS` and every PK-eligible type at most 16 bytes.
+pub fn validate_pk_tuple(
+    pk_cols: &[u32],
+    ncols: usize,
+    max_pk: usize,
+    col: impl Fn(u32) -> (TypeCode, bool),
+) -> Result<usize, PkRule> {
+    debug_assert!(max_pk <= crate::MAX_PK_COLUMNS);
+    validate_pk_indices(pk_cols, ncols, max_pk)?;
+    let mut stride = 0;
     for &c in pk_cols {
         let (type_code, nullable) = col(c);
         if !type_code.is_pk_eligible() {
@@ -641,25 +628,7 @@ fn validate_pk_column_types(pk_cols: &[u32], col: impl Fn(u32) -> (TypeCode, boo
         }
         stride += type_code.wire_stride();
     }
-    // `stride == 0` is unreachable once every column passed `is_pk_eligible`
-    // (each eligible type is ≥ 1 byte); rejected explicitly so an empty list
-    // reaching here through the typed half alone cannot pass.
-    if stride == 0 || stride > crate::MAX_PK_BYTES {
-        return Err(PkRule::StrideOutOfRange { stride });
-    }
     Ok(stride)
-}
-
-/// Both halves of the primary-key admission rule, for the callers that hold the
-/// columns up front. Returns the validated `pk_stride`.
-pub fn validate_pk_tuple(
-    pk_cols: &[u32],
-    ncols: usize,
-    max_pk: usize,
-    col: impl Fn(u32) -> (TypeCode, bool),
-) -> Result<usize, PkRule> {
-    validate_pk_indices(pk_cols, ncols, max_pk)?;
-    validate_pk_column_types(pk_cols, col)
 }
 
 /// A fixed-width integer column type — ≤ 8 bytes, any sign. This is the exact
@@ -840,10 +809,6 @@ const _: () = {
         assert!(
             tc.wire_stride() == tc.storage_type().wire_stride(),
             "a type must have its storage type's width"
-        );
-        assert!(
-            tc.is_signed_int() == tc.storage_type().is_signed_int(),
-            "a type must have its storage type's sign"
         );
         if let Some(fi) = FixedInt::from_type_code(tc) {
             assert!(

@@ -18,63 +18,47 @@ fn system_table_keys_are_valid_for_their_columns() {
 }
 
 /// The in-memory constructor and the persisted codec are the same list at every
-/// arity: `from_slice` and `pack`→`unpack` must agree, and both must read back
-/// the columns they were given.
+/// arity, and no packed list is the PK-store sentinel. The word is persisted, so
+/// its layout is pinned as a literal.
 #[test]
-fn from_slice_and_the_packed_codec_agree_at_every_arity() {
-    for cols in [
-        vec![0u32],
-        vec![3u32],
-        vec![1u32, PK_LIST_COL_MAX],
-        vec![2u32, 5, 7],
-        vec![9u32, 1, 4, 6],
-    ] {
-        let list = PkColList::from_slice(&cols);
-        assert_eq!(list.as_slice(), cols.as_slice());
-        assert_eq!(unpack_pk_cols(pack_pk_cols(&cols)), Ok(list), "{cols:?}");
-    }
-}
-
-/// A crafted packed word can name a count of zero or one past the cap. Both are
-/// refused at the decode, so no `PkColList` with such a count is ever built.
-#[test]
-fn a_crafted_pk_col_count_is_rejected_at_unpack() {
-    let over = [PK_LIST_MAX_COLS + 1, (1 << PK_LIST_COUNT_BITS) - 1];
-    assert_eq!(unpack_pk_cols(PK_LIST_PACKED_FLAG), Err(crate::PkRule::Empty));
-    for n in over {
-        assert_eq!(
-            unpack_pk_cols(PK_LIST_PACKED_FLAG | n as u64),
-            Err(crate::PkRule::TooManyColumns { count: n, max: PK_LIST_MAX_COLS })
-        );
-    }
-}
-
-/// A flag-clear word names no column list, whatever its other bits say. `0` is
-/// the one an `arg1` carries when it means the relation's own PK store,
-/// and a non-zero one would otherwise read as "the index on column 7".
-#[test]
-fn a_flag_clear_word_is_refused() {
-    for raw in [0u64, 7] {
-        assert_eq!(unpack_pk_cols(raw), Err(crate::PkRule::NotPacked), "{raw}");
-    }
-}
-
-/// A packed list occupies the low 32 bits plus the flag at bit 63, leaving bits
-/// [32..63) clear — room for any later directive in the same word. The count
-/// field makes it non-zero, which is what keeps `PROBE_KEYSPACE_PK` a keyspace
-/// no column list can name.
-#[test]
-fn a_packed_list_leaves_the_reserved_bits_clear() {
-    assert_eq!(crate::probe_key_columns(crate::PROBE_KEYSPACE_PK), None);
-    for cols in [&[0u32][..], &[3][..], &[3, 9, 40, 64][..]] {
+fn a_pk_col_list_roundtrips_through_its_packed_word() {
+    for cols in [&[0u32][..], &[3], &[1, PK_LIST_COL_MAX], &[2, 5, 7], &[9, 1, 4, 6]] {
+        let list = PkColList::from_slice(cols);
+        assert_eq!(list.as_slice(), cols);
         let packed = pack_pk_cols(cols);
-        assert_eq!(packed >> 63, 1, "{cols:?}: the packed flag is bit 63");
-        assert_eq!((packed >> 32) & 0x7FFF_FFFF, 0, "{cols:?}: bits [32..63) are reserved");
+        assert_eq!(unpack_pk_cols(packed), Ok(list), "{cols:?}");
         assert_eq!(
-            crate::probe_key_columns(packed),
+            probe_key_columns(packed),
             Some(packed),
             "{cols:?}: never the PK sentinel"
         );
+    }
+    assert_eq!(probe_key_columns(PROBE_KEYSPACE_PK), None);
+    assert_eq!(pack_pk_cols(&[3, 9]), 1 << 63 | 9 << 11 | 3 << 4 | 2);
+}
+
+/// A flag-clear word names no column list, whatever its other bits say — `0` is
+/// the one an `arg1` carries when it means the relation's own PK store — and a
+/// crafted count of zero or past the cap is refused, so no `PkColList` with such
+/// a count is ever built.
+#[test]
+fn unpack_refuses_an_untagged_word_and_a_crafted_count() {
+    use crate::PkRule::*;
+    let over = PK_LIST_MAX_COLS + 1;
+    for (w, want) in [
+        (0, NotPacked),
+        (7, NotPacked),
+        (PK_LIST_PACKED_FLAG, Empty),
+        (
+            PK_LIST_PACKED_FLAG | over as u64,
+            TooManyColumns { count: over, max: PK_LIST_MAX_COLS },
+        ),
+        (
+            PK_LIST_PACKED_FLAG | 15,
+            TooManyColumns { count: 15, max: PK_LIST_MAX_COLS },
+        ),
+    ] {
+        assert_eq!(unpack_pk_cols(w), Err(want), "{w:#x}");
     }
 }
 
@@ -104,46 +88,74 @@ fn validate_dist_prefix_accepts_leading_rejects_rest() {
     assert!(validate_dist_prefix(&[0, 1], &[5]).is_err(), "non-PK column");
 }
 
+/// Each catalog flags word round-trips, pins its persisted bits as literals —
+/// comparing against the constants the packer is written from would hold for any
+/// value it gave them — and accepts exactly the single bits its layout defines.
 #[test]
-fn table_flags_roundtrip() {
-    // Default (not replicated, not a stream, k = 0 = full PK) is all-clear.
-    assert_eq!(TableProps::default().pack(), 0);
-    let keyed = |stream, prefix_len| TableProps {
-        stream,
-        serial: false,
-        distribution: TableDistribution::Keyed { prefix_len },
-    };
-    let replicated = |stream| TableProps {
-        stream,
-        serial: false,
-        distribution: TableDistribution::Replicated,
-    };
-    // Every field combination survives, and k rides in byte 1 clear of the bits.
-    for &stream in &[false, true] {
-        for serial in [false, true] {
-            let r = TableProps { serial, ..replicated(stream) };
-            assert_eq!(TableProps::from_flags(r.pack()).unwrap(), r);
-            for prefix_len in 0..=PK_LIST_MAX_COLS as u8 {
-                let p = TableProps { serial, ..keyed(stream, prefix_len) };
-                assert_eq!(TableProps::from_flags(p.pack()).unwrap(), p);
+fn catalog_flag_words_roundtrip_pin_and_refuse_undefined_bits() {
+    let dists = (0..=PK_LIST_MAX_COLS as u8)
+        .map(|prefix_len| TableDistribution::Keyed { prefix_len })
+        .chain([TableDistribution::Replicated]);
+    for distribution in dists {
+        for stream in [false, true] {
+            for serial in [false, true] {
+                let p = TableProps { stream, serial, distribution };
+                assert_eq!(TableProps::from_flags(p.pack()), Ok(p));
             }
         }
     }
-    // `TABLE_TAB.flags` is persisted, so the bit *positions* are a wire
-    // contract: pinned as literals, since comparing against the constants the
-    // packer is written from would hold for any value it gave them.
-    assert_eq!(replicated(false).pack(), 0b01);
-    assert_eq!(keyed(true, 0).pack(), 0b10);
-    assert_eq!(keyed(false, 2).pack(), 2 << 8);
-    assert_eq!(replicated(true).pack(), 0b11);
-    assert_eq!(keyed(true, 2).pack(), 0b10 | (2 << 8));
-    assert_eq!(TableProps { serial: true, ..keyed(false, 0) }.pack(), 0b100);
+    for b in [false, true] {
+        assert_eq!(
+            ViewFlags::from_flags(ViewFlags { pk_repeats: b }.pack()),
+            Ok(ViewFlags { pk_repeats: b })
+        );
+        assert_eq!(
+            IndexProps::from_flags(IndexProps { is_unique: b }.pack()),
+            Ok(IndexProps { is_unique: b })
+        );
+    }
+
+    let t = |stream, serial, distribution| TableProps { stream, serial, distribution }.pack();
+    assert_eq!(TableProps::default().pack(), 0);
+    assert_eq!(t(false, false, TableDistribution::Replicated), 0b001);
+    assert_eq!(t(true, false, TableDistribution::default()), 0b010);
+    assert_eq!(t(false, true, TableDistribution::default()), 0b100);
+    assert_eq!(t(false, false, TableDistribution::Keyed { prefix_len: 2 }), 2 << 8);
+    assert_eq!(
+        (
+            ViewFlags { pk_repeats: true }.pack(),
+            IndexProps { is_unique: true }.pack()
+        ),
+        (1, 1)
+    );
+
+    for bit in 0..64u32 {
+        let w = 1u64 << bit;
+        assert_eq!(
+            TableProps::from_flags(w).is_ok(),
+            bit <= 2 || (8..16).contains(&bit),
+            "table bit {bit}"
+        );
+        assert_eq!(ViewFlags::from_flags(w).is_ok(), bit == 0, "view bit {bit}");
+        assert_eq!(IndexProps::from_flags(w).is_ok(), bit == 0, "index bit {bit}");
+    }
+    // The one state the packing can hold and `TableProps` cannot.
+    assert!(TableProps::from_flags(0b01 | 2 << 8)
+        .unwrap_err()
+        .contains("mutually exclusive"));
 }
 
-/// A SERIAL table is a table keyed by its one generated column: `validate`
-/// refuses the flag on a stream and over a compound PK.
+/// `validate` refuses what the flags word can hold but the table cannot: a
+/// distribution prefix longer than the PK, and a SERIAL table that is a stream
+/// or whose PK is not its one generated column.
 #[test]
-fn table_props_validate_refuses_a_serial_stream_and_a_compound_serial_pk() {
+fn table_props_validate_refuses_what_the_pk_cannot_carry() {
+    let keyed = |prefix_len| TableProps {
+        distribution: TableDistribution::Keyed { prefix_len },
+        ..TableProps::default()
+    };
+    assert_eq!(keyed(3).validate(3), Ok(()));
+    assert!(keyed(4).validate(3).unwrap_err().contains("exceeds PK column count"));
     let serial = TableProps { serial: true, ..TableProps::default() };
     assert_eq!(serial.validate(1), Ok(()));
     assert!(serial.validate(2).unwrap_err().contains("one SERIAL column"));
@@ -151,34 +163,25 @@ fn table_props_validate_refuses_a_serial_stream_and_a_compound_serial_pk() {
     assert!(stream.validate(1).unwrap_err().contains("a stream cannot be SERIAL"));
 }
 
-/// `VIEW_TAB.flags` round-trips, pins its persisted bit position, and refuses
-/// every other bit.
+/// The system-shape digest moves with every axis of a family's stored identity.
 #[test]
-fn view_flags_round_trip_and_refuse_reserved_bits() {
-    for pk_repeats in [false, true] {
-        let f = ViewFlags { pk_repeats };
-        assert_eq!(ViewFlags::from_flags(f.pack()).unwrap(), f);
+fn fold_family_separates_every_stored_axis() {
+    const A: &[WireSysCol] = &[col("id", TypeCode::U64, false), col("v", TypeCode::U64, false)];
+    const RENAMED: &[WireSysCol] = &[col("id", TypeCode::U64, false), col("w", TypeCode::U64, false)];
+    const RETYPED: &[WireSysCol] = &[col("id", TypeCode::U64, false), col("v", TypeCode::I64, false)];
+    const NULLABLE: &[WireSysCol] = &[col("id", TypeCode::U64, false), col("v", TypeCode::U64, true)];
+    let base = fold_family(0, &fam(1, "_t", A, LEADING_COL_PK));
+    let others = [
+        fam(2, "_t", A, LEADING_COL_PK),
+        fam(1, "_u", A, LEADING_COL_PK),
+        fam(1, "_t", RENAMED, LEADING_COL_PK),
+        fam(1, "_t", RETYPED, LEADING_COL_PK),
+        fam(1, "_t", NULLABLE, LEADING_COL_PK),
+        fam(1, "_t", A, LEADING_PAIR_PK),
+    ];
+    for (i, other) in others.iter().enumerate() {
+        assert_ne!(fold_family(0, other), base, "variant {i}");
     }
-    assert_eq!(ViewFlags { pk_repeats: true }.pack(), 0b1);
-    for reserved in [1u64 << 1, 1 << 8, 1 << 63] {
-        assert!(ViewFlags::from_flags(reserved).is_err(), "bit {reserved:#x}");
-    }
-}
-
-/// A bit outside the defined set is refused, not ignored.
-#[test]
-fn table_flags_refuse_reserved_bits() {
-    for reserved in [1u64 << 3, 1 << 7, 1 << 16, 1 << 63] {
-        assert!(TableProps::from_flags(reserved).is_err(), "bit {reserved:#x}");
-    }
-}
-
-/// A replicated table carrying a distribution prefix is the one state the
-/// packing can hold and `TableProps` cannot.
-#[test]
-fn table_flags_refuse_replicated_with_a_prefix() {
-    let err = TableProps::from_flags(0b01 | (2 << 8)).unwrap_err();
-    assert!(err.contains("mutually exclusive"), "{err}");
 }
 
 /// Every PK list of up to 4 distinct indices, in every order, over 1..=6
@@ -232,4 +235,6 @@ fn a_user_identifier_is_nonempty_charset_and_not_underscore_led() {
     ] {
         assert!(validate_user_identifier(name).is_err(), "accepted invalid: {name}");
     }
+    assert_eq!(canonical_identifier("MyTab_1"), Ok("mytab_1".into()));
+    assert!(canonical_identifier("_x").is_err());
 }

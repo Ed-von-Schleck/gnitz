@@ -8,10 +8,8 @@ pub const SHORT_STRING_THRESHOLD: usize = 12;
 /// Where a short cell's content starts: right after its `u32` length.
 pub const GERMAN_INLINE_OFF: usize = 4;
 
-/// Encode a byte slice as a 16-byte German String struct destined for a heap
-/// whose current end is `heap_off`, returning the cell and the bytes it spills
-/// there — empty while the value fits inline. Returning the spill rather than
-/// appending it lets a caller writing into a pre-sized slice place it directly.
+/// Encode a byte slice as a 16-byte German String struct, appending its
+/// content to `blob` when it does not fit inline.
 ///
 /// Layout:
 ///   [0..4]  length (u32 LE)
@@ -19,7 +17,7 @@ pub const GERMAN_INLINE_OFF: usize = 4;
 ///   [8..16] if len ≤ 12: suffix bytes [4..len], zero-padded
 ///           if len > 12: blob arena offset (u64 LE)
 #[inline]
-pub(crate) fn encode_german_string_cell(s: &[u8], heap_off: usize) -> ([u8; 16], &[u8]) {
+pub fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
     let len = s.len();
     assert!(
         len <= u32::MAX as usize,
@@ -29,20 +27,12 @@ pub(crate) fn encode_german_string_cell(s: &[u8], heap_off: usize) -> ([u8; 16],
     write_u32_le(&mut st, 0, len as u32);
     if len > SHORT_STRING_THRESHOLD {
         st[4..8].copy_from_slice(&s[..4]);
-        write_u64_le(&mut st, 8, heap_off as u64);
-        return (st, s);
+        write_u64_le(&mut st, 8, blob.len() as u64);
+        blob.extend_from_slice(s);
+    } else {
+        // Prefix and suffix are one run: the whole value, inline.
+        st[GERMAN_INLINE_OFF..GERMAN_INLINE_OFF + len].copy_from_slice(s);
     }
-    // Prefix and suffix are one run: the whole value, inline.
-    st[GERMAN_INLINE_OFF..GERMAN_INLINE_OFF + len].copy_from_slice(s);
-    (st, &[])
-}
-
-/// `encode_german_string_cell` against a growable arena: the spill, if any,
-/// is appended to `blob`.
-#[inline]
-pub fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
-    let (st, spill) = encode_german_string_cell(s, blob.len());
-    blob.extend_from_slice(spill);
     st
 }
 

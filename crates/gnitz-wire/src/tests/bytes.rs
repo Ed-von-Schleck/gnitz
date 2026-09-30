@@ -33,25 +33,16 @@ fn bit_iter_yields_set_bits_lowest_first() {
     assert_eq!(BitIter(low_bits_mask(64)).count(), 64);
 }
 
+/// The signed reader sign-extends and the unsigned one zero-extends, at every width.
 #[test]
-fn read_unsigned_zero_extends() {
-    // size 1: high-bit-set vs small — must match u8.cmp.
-    assert_eq!(read_unsigned_exact(&[0xFF]), 0xFF);
-    assert_eq!(read_unsigned_exact(&[0x01]), 0x01);
-    assert!(read_unsigned_exact(&[0xFF]) > read_unsigned_exact(&[0x01]));
-
-    // size 2: 0xFFFE > 0x0001 as unsigned (sign-extension would invert).
-    assert_eq!(read_unsigned_exact(&0xFFFEu16.to_le_bytes()), 0xFFFE);
-    assert_eq!(read_unsigned_exact(&0x0001u16.to_le_bytes()), 0x0001);
-    assert!(read_unsigned_exact(&0xFFFEu16.to_le_bytes()) > read_unsigned_exact(&0x0001u16.to_le_bytes()),);
-
-    // size 4.
-    let big: u32 = 0xFFFF_FFFE;
-    let small: u32 = 0x0000_0001;
-    assert_eq!(read_unsigned_exact(&big.to_le_bytes()), big as u64);
-    assert!(read_unsigned_exact(&big.to_le_bytes()) > read_unsigned_exact(&small.to_le_bytes()),);
-
-    // size 8: full u64 round-trip.
-    let v: u64 = 0xDEAD_BEEF_CAFE_BABE;
-    assert_eq!(read_unsigned_exact(&v.to_le_bytes()), v);
+fn exact_readers_widen_by_their_signedness() {
+    for (cell, s, u) in [
+        (&[0xFF][..], -1i64, 0xFFu64),
+        (&[0x7F][..], 127, 127),
+        (&0xFFFEu16.to_le_bytes()[..], -2, 0xFFFE),
+        (&0xFFFF_FFFEu32.to_le_bytes()[..], -2, 0xFFFF_FFFE),
+        (&u64::MAX.to_le_bytes()[..], -1, u64::MAX),
+    ] {
+        assert_eq!((read_signed_exact(cell), read_unsigned_exact(cell)), (s, u), "{cell:?}");
+    }
 }

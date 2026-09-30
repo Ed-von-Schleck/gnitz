@@ -14,88 +14,63 @@ fn slices(regions: &[Vec<u8>]) -> Vec<&[u8]> {
 }
 
 /// Frame `regions` into a fresh buffer, as a SAL slot would.
-fn encode(regions: &[&[u8]]) -> Vec<u8> {
-    encode_dead(regions, 0)
-}
-
-/// [`encode`] with a heap declared `heap_dead` bytes dead.
 fn encode_dead(regions: &[&[u8]], heap_dead: usize) -> Vec<u8> {
     let mut buf = vec![0u8; block_size(regions)];
     assert_eq!(write_block(regions, heap_dead, &mut buf), buf.len());
     buf
 }
 
-/// The row count, the fixed regions and the heap come back, and a second block
-/// appends behind the first and is recovered by its own `SIZE` field.
+/// Rows, fixed regions, heap and dead-byte bound come back as written, up to a
+/// wholly dead heap; the appending framer writes the same bytes as the in-place
+/// one; and a second block appends behind the first and is recovered by its own
+/// `SIZE` field.
 #[test]
-fn parse_block_returns_rows_fixed_bytes_and_heap() {
+fn a_block_round_trips_through_both_framers() {
     let f = fixture();
     let regions = slices(&f);
     let (heap, fixed_regions) = regions.split_last().unwrap();
-
-    let mut buf = encode(&regions);
-    assert_eq!(buf.len(), WAL_HEADER_SIZE + ROWS * ROW_WIDTH + heap.len());
-    let (rows, fixed, got_heap, dead) = parse_block(&buf, ROW_WIDTH).unwrap();
-    assert_eq!(rows, ROWS);
-    assert_eq!(dead, 0);
-    assert_eq!(fixed, fixed_regions.concat());
-    assert_eq!(got_heap, *heap);
-
-    let end1 = buf.len();
-    buf.extend_from_slice(&encode(&regions));
-    for off in [0, end1] {
-        let block = block_slice(&buf[off..]).expect("a framed block");
-        assert_eq!(parse_block(block, ROW_WIDTH).unwrap().0, ROWS);
+    for dead in [0, 1, heap.len()] {
+        let buf = encode_dead(&regions, dead);
+        let mut appended = vec![0xAB];
+        append_block(&regions, dead, &mut appended);
+        assert_eq!(appended[1..], buf, "dead={dead}");
+        assert_eq!(
+            parse_block(&buf, ROW_WIDTH),
+            Ok((ROWS, &fixed_regions.concat()[..], *heap, dead)),
+            "dead={dead}"
+        );
     }
-}
 
-/// The appending and the in-place framer produce the same bytes.
-#[test]
-fn append_block_matches_write_block() {
-    let f = fixture();
-    let with_heap = slices(&f);
-    let mut no_heap = with_heap.clone();
+    let mut no_heap = regions.clone();
     *no_heap.last_mut().unwrap() = &[];
     let empty: [&[u8]; 4] = [&[], &[], &[], &[]];
-    for list in [&with_heap[..], &no_heap[..], &empty[..]] {
-        let mut appended = vec![0xAB];
+    for list in [&no_heap[..], &empty[..]] {
+        let mut appended = Vec::new();
         append_block(list, 0, &mut appended);
-        assert_eq!(appended[1..], encode(list), "{} regions", list.len());
+        assert_eq!(appended, encode_dead(list, 0), "{} regions", list.len());
+    }
+
+    let mut two = encode_dead(&regions, 0);
+    let end1 = two.len();
+    two.extend_from_slice(&encode_dead(&regions, 0));
+    for off in [0, end1] {
+        let block = block_slice(&two[off..]).expect("a framed block");
+        assert_eq!(parse_block(block, ROW_WIDTH).unwrap().0, ROWS);
     }
 }
 
 /// A zero-row block's heap is dropped: no cell can reference it.
 #[test]
 fn a_zero_row_blocks_heap_is_dropped() {
-    let buf = encode(&[&[], &[], &[], b"orphan heap"]);
-    let (rows, fixed, heap, dead) = parse_block(&buf, ROW_WIDTH).unwrap();
-    assert_eq!((rows, fixed, heap, dead), (0, &[][..], &[][..], 0));
+    let buf = encode_dead(&[&[], &[], &[], b"orphan heap"], 3);
+    assert_eq!(parse_block(&buf, ROW_WIDTH), Ok((0, &[][..], &[][..], 0)));
 }
 
-/// The header is five words, and the dead-byte bound comes back as written, up
-/// to and including the whole heap.
-#[test]
-fn heap_dead_round_trips() {
-    assert_eq!(WAL_HEADER_SIZE, 20);
-    assert_eq!(WAL_OFF_HEAP_DEAD + 4, WAL_HEADER_SIZE);
-    let f = fixture();
-    let regions = slices(&f);
-    let heap_len = regions.last().unwrap().len();
-    for dead in [0, 1, heap_len] {
-        let buf = encode_dead(&regions, dead);
-        assert_eq!(read_u32_le(&buf, WAL_OFF_HEAP_DEAD) as usize, dead);
-        assert_eq!(parse_block(&buf, ROW_WIDTH).unwrap().3, dead);
-    }
-    let mut appended = Vec::new();
-    append_block(&regions, 3, &mut appended);
-    assert_eq!(appended, encode_dead(&regions, 3));
-}
-
-/// Every guard, against the block that trips it — including a forgery of each
-/// counted field by one bit, and of `ROWS` by one row.
+/// Every guard, against the block that trips it — including every one-bit
+/// forgery of every header word, and of `ROWS` by one row.
 #[test]
 fn each_guard_rejects_its_forgery() {
-    let clean = encode(&slices(&fixture()));
+    let clean = encode_dead(&slices(&fixture()), 0);
     let forged = |off: usize, f: &dyn Fn(u32) -> u32| {
         let mut buf = clean.clone();
         let v = f(read_u32_le(&buf, off));
@@ -104,50 +79,41 @@ fn each_guard_rejects_its_forgery() {
     };
     let mismatch = "block size does not match its rows and heap";
 
-    let mut cases: Vec<(String, Vec<u8>, &str)> = vec![
+    let heap_len = b"a heap".len();
+    let mut cases: Vec<(String, Vec<u8>, Option<&str>)> = vec![
         (
             "short of a header".into(),
             clean[..WAL_HEADER_SIZE - 1].to_vec(),
-            "block shorter than header",
-        ),
-        (
-            "unknown version".into(),
-            forged(WAL_OFF_VERSION, &|v| v ^ 1),
-            "unknown block version",
+            Some("block shorter than header"),
         ),
         (
             "size past the buffer".into(),
             clean[..clean.len() - 1].to_vec(),
-            "declared size past buffer",
+            Some("declared size past buffer"),
         ),
-        ("one row more".into(), forged(WAL_OFF_ROWS, &|r| r + 1), mismatch),
-        ("one row fewer".into(), forged(WAL_OFF_ROWS, &|r| r - 1), mismatch),
-        (
-            "more dead than heap".into(),
-            forged(WAL_OFF_HEAP_DEAD, &|_| b"a heap".len() as u32 + 1),
-            "block declares more dead heap than heap",
-        ),
+        ("one row fewer".into(), forged(WAL_OFF_ROWS, &|r| r - 1), Some(mismatch)),
     ];
     for bit in 0..32 {
-        cases.push((
-            format!("ROWS bit {bit}"),
-            forged(WAL_OFF_ROWS, &|r| r ^ (1 << bit)),
-            mismatch,
-        ));
-        cases.push((
-            format!("HEAP_LEN bit {bit}"),
-            forged(WAL_OFF_HEAP_LEN, &|h| h ^ (1 << bit)),
-            mismatch,
-        ));
-        let block = forged(WAL_OFF_SIZE, &|s| s ^ (1 << bit));
-        let want = if read_u32_le(&block, WAL_OFF_SIZE) as usize > clean.len() {
+        let flip = |off| forged(off, &|v| v ^ (1 << bit));
+        let block = flip(WAL_OFF_SIZE);
+        let size_err = if read_u32_le(&block, WAL_OFF_SIZE) as usize > clean.len() {
             "declared size past buffer"
         } else {
             mismatch
         };
-        cases.push((format!("SIZE bit {bit}"), block, want));
+        cases.push((format!("SIZE bit {bit}"), block, Some(size_err)));
+        cases.push((
+            format!("VERSION bit {bit}"),
+            flip(WAL_OFF_VERSION),
+            Some("unknown block version"),
+        ));
+        cases.push((format!("ROWS bit {bit}"), flip(WAL_OFF_ROWS), Some(mismatch)));
+        cases.push((format!("HEAP_LEN bit {bit}"), flip(WAL_OFF_HEAP_LEN), Some(mismatch)));
+        // A dead-byte bound within the heap is a legitimate claim.
+        let dead_err = ((1usize << bit) > heap_len).then_some("block declares more dead heap than heap");
+        cases.push((format!("HEAP_DEAD bit {bit}"), flip(WAL_OFF_HEAP_DEAD), dead_err));
     }
     for (what, block, want) in &cases {
-        assert_eq!(parse_block(block, ROW_WIDTH).err(), Some(*want), "{what}");
+        assert_eq!(parse_block(block, ROW_WIDTH).err(), *want, "{what}");
     }
 }

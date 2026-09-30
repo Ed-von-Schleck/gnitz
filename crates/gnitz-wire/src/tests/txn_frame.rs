@@ -55,10 +55,18 @@ fn family(tid: u64, conflict_mode: WireConflictMode, basis: u64, schema: &[u8]) 
     }
 }
 
-/// Peek `frame`'s prologue, check it as a client frame, and decode its body.
+/// Peek `frame`'s prologue — it carries only its verb, and its body starts right
+/// after it — check it as a client frame, and decode its body.
 fn peeked<'a, T>(frame: &'a [u8], decode: impl Fn(&'a [u8]) -> Result<T, String>) -> Result<T, String> {
     let ctrl = peek_control_block(frame)?;
-    ctrl.client_verb().map_err(str::to_string)?;
+    let verb = ctrl.client_verb().map_err(str::to_string)?;
+    let prologue = ControlHeader {
+        flags: WireFlags { verb, ..Default::default() },
+        ..Default::default()
+    };
+    assert_eq!(ctrl.hdr, prologue, "only the verb is set");
+    assert!(ctrl.blob.is_empty());
+    assert_eq!(ctrl.body, CTRL_HEADER_SIZE..frame.len());
     decode(&frame[ctrl.body.clone()])
 }
 
@@ -68,35 +76,6 @@ fn ddl(body: &[u8]) -> Result<Vec<(&[u8], DecodedControl)>, String> {
 
 fn push(body: &[u8]) -> Result<Vec<(&[u8], DecodedControl)>, String> {
     decode_items(body, ClientVerb::PushTxn)
-}
-
-/// Every frame's prologue carries only its verb; its body starts right after it.
-#[test]
-fn the_prologue_carries_only_the_verb() {
-    let d = b"schema".to_vec();
-    let frames = [
-        (encode_items(ClientVerb::DdlTxn, &[ddl_item(16)]), ClientVerb::DdlTxn),
-        (
-            encode_items(ClientVerb::PushTxn, &[family(16, WireConflictMode::Update, 42, &d)]),
-            ClientVerb::PushTxn,
-        ),
-        (encode_scan_multi(&[rel(7, 0)]), ClientVerb::ScanMulti),
-        (encode_delta_poll(&[item(7, 3, 2)]), ClientVerb::DeltaPoll),
-    ];
-    for (frame, verb) in frames {
-        let c = peek_control_block(&frame).unwrap();
-        assert_eq!(
-            c.hdr,
-            ControlHeader {
-                flags: WireFlags { verb, ..Default::default() },
-                ..Default::default()
-            },
-            "only the verb is set"
-        );
-        assert!(c.blob.is_empty());
-        assert_eq!(c.body, CTRL_HEADER_SIZE..frame.len());
-        assert_eq!(c.client_verb(), Ok(verb));
-    }
 }
 
 /// Each item is its own frame: its bytes end where its last section does, its
@@ -144,111 +123,28 @@ fn push_txn_roundtrips_families_modes_and_bases() {
 
 #[test]
 fn scan_multi_roundtrips_order_and_layouts() {
-    let rels = [rel(7, 0), rel(8, 3), rel(9, u64::MAX)];
+    // A repeated id is two positions, answered separately.
+    let rels = [rel(7, 0), rel(8, 3), rel(9, u64::MAX), rel(7, 0)];
     assert_eq!(peeked(&encode_scan_multi(&rels), decode_scan_multi).unwrap(), rels);
 }
 
 #[test]
 fn delta_poll_roundtrips_every_view_in_order() {
-    let views: Vec<DeltaPollItem> = (0..3)
-        .map(|i| item(i as u64 + 1, [0, 42, u64::MAX][i], [1, u64::MAX, 7][i]))
-        .collect();
+    let views = [
+        item(1, 0, 1),
+        item(2, 42, u64::MAX),
+        item(3, u64::MAX, 7),
+        item(1, 0, 1),
+    ];
     let frame = encode_delta_poll(&views);
     assert_eq!(peeked(&frame, decode_delta_poll).unwrap(), views);
 }
 
-/// Every frame names at least one item; a delta poll names no view `0`; a
-/// repeated id is two positions, answered separately.
+/// A delta poll names no view `0`: it is the id of a fault ending the request.
 #[test]
-fn the_item_rules_are_the_decoders() {
-    let empty = |verb| encode_items(verb, &[]);
-    let want = "empty item list";
-    let errs = [
-        peeked(&empty(ClientVerb::DdlTxn), ddl).err(),
-        peeked(&empty(ClientVerb::PushTxn), push).err(),
-        peeked(&empty(ClientVerb::ScanMulti), decode_scan_multi).err(),
-        peeked(&empty(ClientVerb::DeltaPoll), decode_delta_poll).err(),
-    ];
-    for err in errs {
-        let err = err.expect(want);
-        assert!(err.contains(want), "{err:?} does not name {want:?}");
-    }
-
+fn a_delta_poll_refuses_view_id_zero() {
     let err = peeked(&encode_delta_poll(&[item(1, 0, 9), item(0, 0, 9)]), decode_delta_poll).expect_err("view id 0");
     assert!(err.contains("view id 0"), "{err:?}");
-
-    let views = [item(4, 0, 9), item(4, 0, 9)];
-    assert_eq!(peeked(&encode_delta_poll(&views), decode_delta_poll).unwrap(), views);
-    let rels = [rel(4, 0), rel(4, 0)];
-    assert_eq!(peeked(&encode_scan_multi(&rels), decode_scan_multi).unwrap(), rels);
-}
-
-/// A frame at its format's cap round-trips, and one past it is refused by the
-/// decoder.
-#[test]
-fn a_frame_past_its_cap_is_refused_by_the_decoder() {
-    let views: Vec<DeltaPollItem> = (1..=DELTA_POLL_MAX_VIEWS as u64).map(|id| item(id, 5, 9)).collect();
-    assert_eq!(
-        peeked(&encode_delta_poll(&views), decode_delta_poll).unwrap().len(),
-        views.len()
-    );
-    let mut over = views.clone();
-    over.push(item(u64::MAX, 5, 9));
-    let err = peeked(&encode_delta_poll(&over), decode_delta_poll).expect_err("past the cap");
-    assert!(err.contains("too many items"), "{err:?}");
-
-    let rels: Vec<ScanMultiItem> = (1..=SCAN_MULTI_MAX_RELATIONS as u64).map(|id| rel(id, 0)).collect();
-    assert_eq!(
-        peeked(&encode_scan_multi(&rels), decode_scan_multi).unwrap().len(),
-        rels.len()
-    );
-    let mut over = rels.clone();
-    over.push(rel(u64::MAX, 0));
-    let err = peeked(&encode_scan_multi(&over), decode_scan_multi).expect_err("past the cap");
-    assert!(err.contains("too many items"), "{err:?}");
-}
-
-/// Every frame must reject a truncation inside an item rather than panic or
-/// silently return a short list. A cut exactly on an item boundary is a shorter
-/// well-formed frame, since items run to the frame's end.
-#[test]
-fn a_truncation_inside_an_item_is_a_decode_error() {
-    /// `two` holds `one`'s item twice; no prefix of it decodes but `one`.
-    fn check<'a, T>(name: &str, one: &'a [u8], two: &'a [u8], decode: impl Fn(&'a [u8]) -> Result<T, String> + Copy) {
-        assert!(peeked(one, decode).is_ok(), "{name} single item");
-        for cut in CTRL_HEADER_SIZE + 1..two.len() {
-            if cut != one.len() {
-                assert!(peeked(&two[..cut], decode).is_err(), "{name} cut at {cut}");
-            }
-        }
-    }
-    let s = block();
-    let fam = || family(16, WireConflictMode::Update, 1, &s);
-    check(
-        "PUSH_TXN",
-        &encode_items(ClientVerb::PushTxn, &[fam()]),
-        &encode_items(ClientVerb::PushTxn, &[fam(), fam()]),
-        push,
-    );
-    check(
-        "DDL_TXN",
-        &encode_items(ClientVerb::DdlTxn, &[ddl_item(16)]),
-        &encode_items(ClientVerb::DdlTxn, &[ddl_item(16), ddl_item(16)]),
-        ddl,
-    );
-    check(
-        "SCAN_MULTI",
-        &encode_scan_multi(&[rel(7, 0)]),
-        &encode_scan_multi(&[rel(7, 0), rel(7, 0)]),
-        decode_scan_multi,
-    );
-    let v = item(7, 3, 4);
-    check(
-        "DELTA_POLL",
-        &encode_delta_poll(&[v]),
-        &encode_delta_poll(&[v, v]),
-        decode_delta_poll,
-    );
 }
 
 /// A body of one hand-built item: `hdr` (status and verb as given), `blob`,
@@ -266,29 +162,48 @@ fn one_item(hdr: ControlHeader, blob: &[u8], schema: bool, data: bool) -> Vec<u8
     out
 }
 
-/// Each verb refuses an item whose sections differ from its shape, one that
-/// names another verb, one under a non-`Ok` status and one carrying a blob.
+/// Each verb's items: a list at its cap decodes and one past it is refused; an
+/// empty list is refused; a truncation inside an item is an error rather than a
+/// short list (a cut on an item boundary is a shorter well-formed body, since
+/// items run to the end); and an item is refused whose sections differ from the
+/// verb's shape, that names another verb, that carries a non-`Ok` status, or
+/// that carries a blob.
 #[test]
-fn an_item_off_its_verbs_shape_is_refused() {
-    let shapes = [
-        (ClientVerb::DdlTxn, false, true),
-        (ClientVerb::PushTxn, true, true),
-        (ClientVerb::ScanMulti, false, false),
-        (ClientVerb::DeltaPoll, false, false),
-    ];
-    for (verb, schema, data) in shapes {
+fn decode_items_enforces_each_verbs_item_rules() {
+    let multi: Vec<ClientVerb> = ClientVerb::ALL
+        .iter()
+        .copied()
+        .filter(|&v| item_shape(v).is_some())
+        .collect();
+    assert_eq!(multi.len(), 4);
+    for verb in multi {
+        let (schema, data, cap) = item_shape(verb).unwrap();
         let hdr = ControlHeader {
             target_id: 7,
             flags: WireFlags { verb, ..Default::default() },
             ..Default::default()
         };
-        assert!(
-            decode_items(&one_item(hdr, b"", schema, data), verb).is_ok(),
-            "{verb:?}"
-        );
+        let refused = |body: &[u8], want: &str| {
+            let err = decode_items(body, verb).expect_err(want);
+            assert!(err.contains(want), "{verb:?}: {err:?} does not name {want:?}");
+        };
+        let one = one_item(hdr, b"", schema, data);
+
+        let n = cap.min(3);
+        assert_eq!(decode_items(&one.repeat(n), verb).unwrap().len(), n, "{verb:?}");
+        if cap != usize::MAX {
+            refused(&one.repeat(cap + 1), "too many items");
+        }
+        refused(&[], "empty item list");
+
+        let two = one.repeat(2);
+        for cut in (1..two.len()).filter(|&c| c != one.len()) {
+            assert!(decode_items(&two[..cut], verb).is_err(), "{verb:?} cut at {cut}");
+        }
+
         for (s, d) in [(false, false), (true, false), (false, true), (true, true)] {
             if (s, d) != (schema, data) {
-                let err = decode_items(&one_item(hdr, b"", s, d), verb).expect_err("wrong sections");
+                let err = decode_items(&one_item(hdr, b"", s, d), verb).unwrap_err();
                 assert!(
                     err.contains("schema record") || err.contains("data block"),
                     "{verb:?}: {err}"
@@ -297,27 +212,27 @@ fn an_item_off_its_verbs_shape_is_refused() {
         }
         let other = ControlHeader {
             flags: WireFlags {
-                verb: if verb == ClientVerb::ScanSpec {
-                    ClientVerb::Push
-                } else {
-                    ClientVerb::ScanSpec
-                },
+                verb: ClientVerb::Push,
                 ..Default::default()
             },
             ..hdr
         };
-        let err = decode_items(&one_item(other, b"", schema, data), verb).expect_err("other verb");
-        assert!(err.contains("names verb"), "{verb:?}: {err}");
-        let fault = ControlHeader { status: WireStatus::Error, ..hdr };
-        let err = decode_items(&one_item(fault, b"boom", schema, data), verb).expect_err("fault");
-        assert!(err.contains("status"), "{verb:?}: {err}");
-        let err = decode_items(&one_item(hdr, b"blob", schema, data), verb).expect_err("blob");
-        assert!(err.contains("blob"), "{verb:?}: {err}");
+        refused(&one_item(other, b"", schema, data), "names verb");
+        refused(
+            &one_item(
+                ControlHeader { status: WireStatus::Error, ..hdr },
+                b"boom",
+                schema,
+                data,
+            ),
+            "status",
+        );
+        refused(&one_item(hdr, b"blob", schema, data), "blob");
     }
     let err = decode_items(
         &one_item(ControlHeader::default(), b"", false, false),
         ClientVerb::ScanSpec,
     )
-    .expect_err("a single-item verb");
+    .unwrap_err();
     assert!(err.contains("not a multi-item verb"), "{err}");
 }

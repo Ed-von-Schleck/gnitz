@@ -60,10 +60,7 @@ impl DecodedControl {
         if self.data.is_some() && verb != ClientVerb::Push {
             return Err("frame carries a data block on a verb other than PUSH");
         }
-        let items = matches!(
-            verb,
-            ClientVerb::DdlTxn | ClientVerb::PushTxn | ClientVerb::ScanMulti | ClientVerb::DeltaPoll
-        );
+        let items = crate::txn_frame::item_shape(verb).is_some();
         if items && (!self.blob.is_empty() || self.schema.is_some() || self.hdr.target_id != 0) {
             return Err("a multi-item frame carries nothing but its items");
         }

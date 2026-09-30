@@ -61,16 +61,24 @@ pub fn encode_items(verb: ClientVerb, items: &[FrameItem<'_>]) -> Vec<u8> {
     out
 }
 
+/// A multi-item verb's item shape — whether each item carries a schema record
+/// and a data block — and its item cap; `None` for a single-item verb.
+pub(crate) const fn item_shape(verb: ClientVerb) -> Option<(bool, bool, usize)> {
+    match verb {
+        ClientVerb::DdlTxn => Some((false, true, usize::MAX)),
+        ClientVerb::PushTxn => Some((true, true, usize::MAX)),
+        ClientVerb::ScanMulti => Some((false, false, SCAN_MULTI_MAX_RELATIONS)),
+        ClientVerb::DeltaPoll => Some((false, false, DELTA_POLL_MAX_VIEWS)),
+        _ => None,
+    }
+}
+
 /// Split a multi-item `verb` frame's body into its items, in send order: each
 /// item's own frame bytes and its peeked control. An item's `body` is the empty
 /// range at its end.
 pub fn decode_items(body: &[u8], verb: ClientVerb) -> Result<Vec<(&[u8], DecodedControl)>, String> {
-    let (schema, data, cap) = match verb {
-        ClientVerb::DdlTxn => (false, true, usize::MAX),
-        ClientVerb::PushTxn => (true, true, usize::MAX),
-        ClientVerb::ScanMulti => (false, false, SCAN_MULTI_MAX_RELATIONS),
-        ClientVerb::DeltaPoll => (false, false, DELTA_POLL_MAX_VIEWS),
-        other => return Err(format!("{other:?} is not a multi-item verb")),
+    let Some((schema, data, cap)) = item_shape(verb) else {
+        return Err(format!("{verb:?} is not a multi-item verb"));
     };
     let item = |rest: &[u8]| -> Result<DecodedControl, String> {
         let ctrl = peek_control_block(rest)?;

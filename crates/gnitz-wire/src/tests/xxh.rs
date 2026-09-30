@@ -1,15 +1,15 @@
 use super::*;
 
+/// Shard, manifest and SAL header digests and the global group key are
+/// persisted, so they are only stable while XXH3's output is. Reference values
+/// from python-xxhash.
 #[test]
-fn checksum_128_full_image_deterministic_and_distinct() {
-    // Deterministic, and the full 128-bit image is populated (not a 64-bit
-    // hash widened to 128 bits) — the high half is non-zero for typical input.
-    let a = checksum_128(b"hello world");
-    assert_eq!(a, checksum_128(b"hello world"));
-    assert_ne!(a, checksum_128(b"hello worle"));
-    assert_ne!(a >> 64, 0, "128-bit hash must populate the high half");
-    // Distinct content → distinct 128-bit keys (no truncation collision).
-    assert_ne!(checksum_128(b"abc"), checksum_128(b"abd"));
+fn xxh3_matches_the_reference_vectors() {
+    let ramp: Vec<u8> = (0..=255u8).collect();
+    assert_eq!(checksum(b""), 0x2D06_8005_38D3_94C2);
+    assert_eq!(checksum(&ramp), 0x9408_A443_3B95_2D71);
+    assert_eq!(global_group_key(), 0x99AA_06D3_0147_98D8_6001_C324_468D_497F);
+    assert_eq!(checksum_128(&ramp), 0xF1F8_A93F_5084_9AC3_9408_A443_3B95_2D71);
 }
 
 #[test]
@@ -36,38 +36,11 @@ fn digest_with_hole_equals_checksum_over_the_spliced_bytes() {
     }
 }
 
-#[test]
-fn digest_with_hole_ignores_the_hole_and_separates_seeds() {
-    let mut buf: Vec<u8> = (0..128u8).collect();
-    let base = digest_with_hole(b"a.db", &buf, 24);
-    buf[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
-    assert_eq!(digest_with_hole(b"a.db", &buf, 24), base, "the hole is excluded");
-    assert_ne!(digest_with_hole(b"b.db", &buf, 24), base, "the seed is included");
-}
-
-/// `checksum` must agree byte-for-byte with the C/Python `XXH3_64bits` the
-/// other end of the wire runs — the interop contract this crate defines.
-#[test]
-fn checksum_matches_c_xxh3_64bits() {
-    let body_hex = "9800000008000000a000000008000000a800000008000000b000000008000000b800000008000000c000000008000000c800000008000000d000000008000000d800000008000000e000000008000000e800000008000000f00000001000000000010000000000000000000000000000000000000000000001000000000000008000000000000000000000000000000001000000000000000300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
-    let body: Vec<u8> = (0..body_hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&body_hex[i..i + 2], 16).unwrap())
-        .collect();
-    assert_eq!(body.len(), 208);
-    let computed = checksum(&body);
-    assert_eq!(
-        computed, 0x741C9E0BA1D8A9FD_u64,
-        "xxhash-rust and C XXH3_64bits disagree: got 0x{computed:016X}"
-    );
-}
-
 /// A layout digest moves with the column count, the PK list and any type code.
 #[test]
 fn layout_digest_separates_every_layout_axis() {
     use crate::TypeCode::{String as Str, I64, U64};
     let base = layout_digest(&[0], [U64, I64]);
-    assert_eq!(base, layout_digest(&[0], [U64, I64]));
     assert_ne!(base, layout_digest(&[0], [U64, I64, I64]), "column count");
     assert_ne!(base, layout_digest(&[0], [U64]), "column count");
     assert_ne!(base, layout_digest(&[1], [U64, I64]), "PK index");

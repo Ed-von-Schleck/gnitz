@@ -158,20 +158,12 @@ fn dist_stride_sums_leading_prefix_columns() {
     assert_eq!(s2.dist_stride(), 12);
 }
 
+/// A distribution prefix past the PK is only reachable from a forged catalog
+/// flag, which `TableProps::validate` refuses; the descriptor's own prefix sum
+/// walks the PK columns it has, so such a prefix cannot run `dist_stride` past
+/// `pk_stride`.
 #[test]
-fn dist_prefix_out_of_range_is_rejected_at_the_decode_boundary() {
-    // A k past |PK| is only reachable from a corrupted or forged catalog flag,
-    // and is refused where that row can be named — not silently normalized to
-    // the full PK here, which would route a corrupt row as if it were sound.
-    let props = gnitz_wire::TableProps {
-        stream: false,
-        serial: false,
-        distribution: gnitz_wire::TableDistribution::Keyed { prefix_len: 99 },
-    };
-    assert!(props.validate(3).is_err(), "k=99 over a 3-column PK");
-    assert!(props.validate(99).is_ok(), "k == |PK| is the full-PK route");
-    // The descriptor's own prefix sum stays in range regardless: it walks the PK
-    // columns it has, so a forged k cannot run `dist_stride` past `pk_stride`.
+fn a_forged_dist_prefix_cannot_run_past_the_pk() {
     assert_eq!(
         three_col_pk_schema(99).dist_stride(),
         three_col_pk_schema(0).pk_stride()

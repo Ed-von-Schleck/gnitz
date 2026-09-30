@@ -187,12 +187,11 @@ pub(crate) fn reject_unbuildable_index_key(
     names: &[&str],
     types: &[TypeCode],
     src_pk_count: usize,
-    src_pk_stride: usize,
     role: &str,
 ) -> Result<(), GnitzSqlError> {
-    gnitz_wire::index_key_types(types, src_pk_count, src_pk_stride).map_err(|rule| match rule {
+    gnitz_wire::index_key_types(types, src_pk_count).map_err(|rule| match rule {
         gnitz_wire::IndexKeyRule::NotEligible { col, .. } => non_key_eligible_error(names[col], types[col], role),
-        arity_or_stride => GnitzSqlError::Rejected(arity_or_stride.to_string()),
+        arity @ gnitz_wire::IndexKeyRule::ArityOutOfRange { .. } => GnitzSqlError::Rejected(arity.to_string()),
     })?;
     Ok(())
 }

@@ -378,8 +378,8 @@ impl KeySpec {
     /// The span of a secondary index on `cols` of `owner`.
     ///
     /// `Err` on an arity outside `1..=MAX_PK_COLUMNS`, an out-of-range column, a
-    /// type no index key carries, or a record over the PK arity/stride limits —
-    /// the last three through [`gnitz_wire::index_key_types`], shared with the
+    /// type no index key carries, or a record over the PK arity limit — the last
+    /// two through [`gnitz_wire::index_key_types`], shared with the
     /// SQL planner's CREATE INDEX pre-check.
     pub fn new(cols: &[u32], owner: &SchemaDescriptor) -> Result<Self, String> {
         // `index_key_types` has no lower bound, and a zero-column spec would
@@ -398,8 +398,7 @@ impl KeySpec {
             }
             col_types.push(owner.columns[c as usize].type_code);
         }
-        let promoted = gnitz_wire::index_key_types(&col_types, owner.pk_cols().len(), owner.pk_stride())
-            .map_err(|r| r.to_string())?;
+        let promoted = gnitz_wire::index_key_types(&col_types, owner.pk_cols().len()).map_err(|r| r.to_string())?;
         Ok(Self::of(cols.iter().map(|&c| owner.locate(c as usize)).zip(promoted)))
     }
 

@@ -24,7 +24,6 @@ fn validate_enforces_full_rule_set() {
         ColumnDef::new("b", TypeCode::I32, false),    // 1: eligible, non-null
         ColumnDef::new("s", TypeCode::String, false), // 2: ineligible type
         ColumnDef::new("n", TypeCode::U64, true),     // 3: nullable
-        ColumnDef::new("f", TypeCode::F64, false),    // 4: ineligible type
     ];
 
     let schema = |pk: &[u32], columns: &[ColumnDef]| Schema {
@@ -35,15 +34,13 @@ fn validate_enforces_full_rule_set() {
     assert!(schema(&[0], &cols).validate().is_ok());
     assert!(schema(&[0, 1], &cols).validate().is_ok());
 
-    // Each rule rejects, and names itself. The wording is `PkRule`'s.
+    // The rule set is `gnitz_wire::validate_pk_tuple`'s, tested there; these
+    // pin what this caller hands it — its arity cap and each column's type and
+    // nullability.
     for (pk, want) in [
-        (&[][..], "at least one column"),             // empty
-        (&[0, 1, 0, 1, 0][..], "out of range 1..=4"), // over-long
-        (&[9][..], "index 9 out of bounds"),          // out of range
-        (&[0, 0][..], "column 0 twice"),              // duplicate
-        (&[3][..], "must not be nullable"),           // nullable column
-        (&[2][..], "only fixed-width integer"),       // STRING is ineligible
-        (&[4][..], "only fixed-width integer"),       // F64 is ineligible
+        (&[0, 1, 0, 1, 0][..], "out of range 1..=4"),
+        (&[3][..], "must not be nullable"),
+        (&[2][..], "only fixed-width integer"),
     ] {
         let got = schema(pk, &cols).validate().unwrap_err();
         assert!(got.contains(want), "pk {pk:?}: {got:?} does not mention {want:?}");

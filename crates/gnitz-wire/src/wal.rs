@@ -27,6 +27,7 @@ pub const WAL_OFF_ROWS: usize = 8;
 pub const WAL_OFF_HEAP_LEN: usize = 12;
 /// An upper bound on the heap bytes no string cell of the block references.
 pub const WAL_OFF_HEAP_DEAD: usize = 16;
+const _: () = assert!(WAL_OFF_HEAP_DEAD + 4 == WAL_HEADER_SIZE);
 
 /// The framed size of a block over the canonical region list `regions`.
 pub fn block_size(regions: &[&[u8]]) -> usize {
@@ -56,17 +57,21 @@ fn region_rows(regions: &[&[u8]]) -> usize {
     w / 8
 }
 
+/// The header of the block framing the canonical region list `regions`, and
+/// that block's total size.
+fn head(regions: &[&[u8]], heap_dead: usize) -> ([u8; WAL_HEADER_SIZE], usize) {
+    let (heap, fixed) = regions.split_last().expect("a region list ends with its heap");
+    let mut head = [0u8; WAL_HEADER_SIZE];
+    let fixed_len = fixed.iter().map(|r| r.len()).sum();
+    let total = write_head(&mut head, region_rows(regions), fixed_len, heap.len(), heap_dead);
+    (head, total)
+}
+
 /// Frame the canonical region list `regions` into `dst`, its heap at most
 /// `heap_dead` bytes unreferenced. Returns the bytes written.
 pub fn write_block(regions: &[&[u8]], heap_dead: usize, dst: &mut [u8]) -> usize {
-    let (heap, fixed) = regions.split_last().expect("a region list ends with its heap");
-    let total = write_head(
-        dst,
-        region_rows(regions),
-        fixed.iter().map(|r| r.len()).sum(),
-        heap.len(),
-        heap_dead,
-    );
+    let (head, total) = head(regions, heap_dead);
+    dst[..WAL_HEADER_SIZE].copy_from_slice(&head);
     let mut at = WAL_HEADER_SIZE;
     for r in regions {
         dst[at..at + r.len()].copy_from_slice(r);
@@ -78,15 +83,7 @@ pub fn write_block(regions: &[&[u8]], heap_dead: usize, dst: &mut [u8]) -> usize
 
 /// [`write_block`] onto the end of `out`.
 pub fn append_block(regions: &[&[u8]], heap_dead: usize, out: &mut Vec<u8>) {
-    let (heap, fixed) = regions.split_last().expect("a region list ends with its heap");
-    let mut head = [0u8; WAL_HEADER_SIZE];
-    let total = write_head(
-        &mut head,
-        region_rows(regions),
-        fixed.iter().map(|r| r.len()).sum(),
-        heap.len(),
-        heap_dead,
-    );
+    let (head, total) = head(regions, heap_dead);
     out.reserve(total);
     out.extend_from_slice(&head);
     for r in regions {

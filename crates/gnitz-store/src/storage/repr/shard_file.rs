@@ -145,8 +145,7 @@ impl Batch {
             return self.compacted().write_as_shard(path, opts);
         }
         self.debug_verify_dead_heap();
-        let mut regions = gnitz_wire::Regions::new();
-        self.wire_regions(&mut regions);
+        let regions = self.wire_regions();
         let npc = schema.num_payload_cols();
         #[cfg(debug_assertions)]
         self.debug_verify_consolidated(schema);

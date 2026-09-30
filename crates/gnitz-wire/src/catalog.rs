@@ -244,35 +244,36 @@ pub const SEQTAB_PAY_VALUE: usize = pay_index_in_fam(SEQ_TAB, "next_val");
 // Stored-shape digest
 // ---------------------------------------------------------------------------
 
+const FNV_PRIME: u64 = 0x100_0000_01b3;
+
+/// One FNV-1a step per byte of `b`.
+const fn fnv_bytes(mut h: u64, b: &[u8]) -> u64 {
+    let mut i = 0;
+    while i < b.len() {
+        h = (h ^ b[i] as u64).wrapping_mul(FNV_PRIME);
+        i += 1;
+    }
+    h
+}
+
 /// FNV-1a over one family's stored identity: its id, its shard directory
 /// (`name`), each column's name/type/nullability, and its key columns. Renaming
 /// a family orphans its shards and boots on an empty store, which is why `name`
 /// is in here.
 const fn fold_family(mut h: u64, f: &WireSysFamily) -> u64 {
-    const PRIME: u64 = 0x100_0000_01b3;
     let (cols, pk) = (f.cols, f.pk_cols);
-    h = (h ^ f.id).wrapping_mul(PRIME);
-    let dir = f.name.as_bytes();
-    let mut d = 0;
-    while d < dir.len() {
-        h = (h ^ dir[d] as u64).wrapping_mul(PRIME);
-        d += 1;
-    }
+    h = (h ^ f.id).wrapping_mul(FNV_PRIME);
+    h = fnv_bytes(h, f.name.as_bytes());
     let mut i = 0;
     while i < cols.len() {
-        let name = cols[i].name.as_bytes();
-        let mut j = 0;
-        while j < name.len() {
-            h = (h ^ name[j] as u64).wrapping_mul(PRIME);
-            j += 1;
-        }
-        h = (h ^ cols[i].type_code as u64).wrapping_mul(PRIME);
-        h = (h ^ cols[i].nullable as u64).wrapping_mul(PRIME);
+        h = fnv_bytes(h, cols[i].name.as_bytes());
+        h = (h ^ cols[i].type_code as u64).wrapping_mul(FNV_PRIME);
+        h = (h ^ cols[i].nullable as u64).wrapping_mul(FNV_PRIME);
         i += 1;
     }
     let mut k = 0;
     while k < pk.len() {
-        h = (h ^ pk[k] as u64).wrapping_mul(PRIME);
+        h = (h ^ pk[k] as u64).wrapping_mul(FNV_PRIME);
         k += 1;
     }
     h
@@ -290,15 +291,14 @@ const fn fold_family(mut h: u64, f: &WireSysFamily) -> u64 {
 /// fold cannot see: a `Blob` column's bytes are as durable as its neighbours',
 /// but its internal layout is invisible to a fold over names and types.
 pub const SYS_SCHEMA_DIGEST: u64 = {
-    const PRIME: u64 = 0x100_0000_01b3;
     let mut h = 0xcbf2_9ce4_8422_2325;
     let mut i = 0;
     while i < SYS_FAMILIES.len() {
         h = fold_family(h, &SYS_FAMILIES[i]);
         i += 1;
     }
-    h = (h ^ crate::circuit::CIRCUIT_PARAMS_VERSION as u64).wrapping_mul(PRIME);
-    h = (h ^ EXPR_BLOB_VERSION as u64).wrapping_mul(PRIME);
+    h = (h ^ crate::circuit::CIRCUIT_PARAMS_VERSION as u64).wrapping_mul(FNV_PRIME);
+    h = (h ^ EXPR_BLOB_VERSION as u64).wrapping_mul(FNV_PRIME);
     h
 };
 
@@ -638,7 +638,7 @@ pub fn validate_pk_col_list(cols: &[u32], ncols: usize) -> Result<(), String> {
     // The rule itself is `validate_pk_indices`. Only the wording differs — these
     // lists are also secondary-index column lists, which "primary key ..." would
     // misname.
-    crate::validate_pk_indices(cols, ncols, crate::PK_LIST_MAX_COLS)
+    crate::validate_pk_indices(cols, ncols, PK_LIST_MAX_COLS)
         .map_err(|rule| rule.for_role(crate::PkListRole::ColumnList))
 }
 

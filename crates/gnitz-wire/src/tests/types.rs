@@ -6,32 +6,33 @@ use super::*;
 #[test]
 fn type_predicates_partition_the_type_table() {
     /// `(type, fixed_int, signed_int, int, float, german_string, wide_int,
-    /// pk_eligible)` — one row per `TypeCode`, one column per predicate.
-    type Row = (TypeCode, bool, bool, bool, bool, bool, bool, bool);
+    /// pk_eligible, serial_eligible)` — one row per `TypeCode`, one column per
+    /// predicate. A SERIAL key is exactly the plain integers of at most 8 bytes:
+    /// not a DATE's days, a DECIMAL's scaled units, nor a 16-byte type.
+    type Row = (TypeCode, bool, bool, bool, bool, bool, bool, bool, bool);
     let table: &[Row] = &[
-        (TypeCode::U8, true, false, true, false, false, false, true),
-        (TypeCode::I8, true, true, true, false, false, false, true),
-        (TypeCode::U16, true, false, true, false, false, false, true),
-        (TypeCode::I16, true, true, true, false, false, false, true),
-        (TypeCode::U32, true, false, true, false, false, false, true),
-        (TypeCode::I32, true, true, true, false, false, false, true),
-        (TypeCode::F32, false, false, false, true, false, false, false),
-        (TypeCode::U64, true, false, true, false, false, false, true),
-        (TypeCode::I64, true, true, true, false, false, false, true),
-        (TypeCode::F64, false, false, false, true, false, false, false),
-        (TypeCode::String, false, false, false, false, true, false, false),
-        (TypeCode::U128, false, false, true, false, false, true, true),
-        (TypeCode::UUID, false, false, false, false, false, true, true),
-        (TypeCode::Blob, false, false, false, false, true, false, false),
-        (TypeCode::I128, false, true, true, false, false, true, true),
-        (TypeCode::Date, true, true, true, false, false, false, true),
-        (TypeCode::Timestamp, true, true, true, false, false, false, true),
-        (TypeCode::Decimal, true, true, true, false, false, false, true),
+        (TypeCode::U8, true, false, true, false, false, false, true, true),
+        (TypeCode::I8, true, true, true, false, false, false, true, true),
+        (TypeCode::U16, true, false, true, false, false, false, true, true),
+        (TypeCode::I16, true, true, true, false, false, false, true, true),
+        (TypeCode::U32, true, false, true, false, false, false, true, true),
+        (TypeCode::I32, true, true, true, false, false, false, true, true),
+        (TypeCode::F32, false, false, false, true, false, false, false, false),
+        (TypeCode::U64, true, false, true, false, false, false, true, true),
+        (TypeCode::I64, true, true, true, false, false, false, true, true),
+        (TypeCode::F64, false, false, false, true, false, false, false, false),
+        (TypeCode::String, false, false, false, false, true, false, false, false),
+        (TypeCode::U128, false, false, true, false, false, true, true, false),
+        (TypeCode::UUID, false, false, false, false, false, true, true, false),
+        (TypeCode::Blob, false, false, false, false, true, false, false, false),
+        (TypeCode::I128, false, true, true, false, false, true, true, false),
+        (TypeCode::Date, true, true, true, false, false, false, true, false),
+        (TypeCode::Timestamp, true, true, true, false, false, false, true, false),
+        (TypeCode::Decimal, true, true, true, false, false, false, true, false),
     ];
     assert_eq!(table.len(), TypeCode::ALL.len(), "a TypeCode variant is unclassified");
 
-    for &(tc, fixed, signed, int, float, german, wide, pk) in table {
-        assert_eq!(TypeCode::from_wire(tc.as_wire()), Some(tc), "{tc:?} must decode");
+    for &(tc, fixed, signed, int, float, german, wide, pk, serial) in table {
         assert_eq!(tc.is_fixed_int(), fixed, "is_fixed_int({tc:?})");
         assert_eq!(tc.is_signed_int(), signed, "is_signed_int({tc:?})");
         assert_eq!(tc.is_int(), int, "is_int({tc:?})");
@@ -39,11 +40,7 @@ fn type_predicates_partition_the_type_table() {
         assert_eq!(tc.is_german_string(), german, "is_german_string({tc:?})");
         assert_eq!(tc.is_wide_int(), wide, "is_wide_int({tc:?})");
         assert_eq!(tc.is_pk_eligible(), pk, "is_pk_eligible({tc:?})");
-    }
-
-    let known: Vec<u8> = table.iter().map(|r| r.0.as_wire()).collect();
-    for raw in (0u8..=u8::MAX).filter(|r| !known.contains(r)) {
-        assert_eq!(TypeCode::from_wire(raw), None, "code {raw} must not decode");
+        assert_eq!(tc.is_serial_eligible(), serial, "is_serial_eligible({tc:?})");
     }
 }
 
@@ -85,24 +82,6 @@ fn index_key_type_pins_the_whole_promotion_map() {
             None => assert!(index_key_type(tc).is_none(), "tc={tc} must be index-ineligible"),
         }
     }
-    // I128 is PK-eligible (produced only as a cross-sign equijoin `_join_pk`)
-    // yet has no index promotion — the one type on both sides of that line.
-    assert!(T::I128.is_pk_eligible() && index_key_type(T::I128).is_none());
-}
-
-/// A SERIAL key is exactly the plain integers of at most 8 bytes: not a DATE's
-/// days, a DECIMAL's scaled units, nor a 16-byte type.
-#[test]
-fn serial_eligible_is_the_narrow_plain_integers() {
-    use TypeCode as T;
-    let want = [T::U8, T::I8, T::U16, T::I16, T::U32, T::I32, T::U64, T::I64];
-    for &tc in TypeCode::ALL {
-        assert_eq!(
-            tc.is_serial_eligible(),
-            want.contains(&tc),
-            "is_serial_eligible({tc:?})"
-        );
-    }
 }
 
 /// Membership and the discriminant round-trip are `wire_enum!`'s; only the
@@ -113,6 +92,42 @@ fn type_code_wire_names_are_distinct() {
     names.sort_unstable();
     names.dedup();
     assert_eq!(names.len(), TypeCode::ALL.len(), "duplicate wire_name in ALL");
+}
+
+/// `[min, max]` of an integer type's values, read through its storage type;
+/// `None` for UUID and every non-integer.
+fn int_bounds(tc: TypeCode) -> Option<(i128, u128)> {
+    match tc.storage_type() {
+        TypeCode::U128 => Some((0, u128::MAX)),
+        TypeCode::I128 => Some((i128::MIN, i128::MAX as u128)),
+        t => FixedInt::from_type_code(t).map(|fi| {
+            let (lo, hi) = fi.range();
+            (lo, hi as u128)
+        }),
+    }
+}
+
+/// The bounds a type's key image spans: a UUID keys as the U128 it is stored as.
+fn key_bounds(tc: TypeCode) -> (i128, u128) {
+    int_bounds(if tc == TypeCode::UUID { TypeCode::U128 } else { tc }).expect("an integer key type")
+}
+
+fn contains(outer: (i128, u128), inner: (i128, u128)) -> bool {
+    outer.0 <= inner.0 && inner.1 <= outer.1
+}
+
+/// A rewrite is admitted exactly when no value of `src` can fall outside
+/// `target`; `is_widening_promotion` narrows that to a ≤8-byte slot, the
+/// column-copy caller's scope.
+#[test]
+fn int_domain_fits_is_bounds_containment() {
+    for &s in TypeCode::ALL {
+        for &t in TypeCode::ALL {
+            let want = matches!((int_bounds(s), int_bounds(t)), (Some(a), Some(b)) if contains(b, a));
+            assert_eq!(s.int_domain_fits(t), want, "{s} -> {t}");
+            assert_eq!(s.is_widening_promotion(t), want && t.is_fixed_int(), "{s} -> {t}");
+        }
+    }
 }
 
 /// The reindex / `_join_pk` width policy (the single source of truth the engine
@@ -156,210 +171,185 @@ fn reindex_output_type_policy() {
     }
 }
 
-/// Every accepted same-sign-class ladder pair promotes to the wider type
-/// (U128 for any 16-byte unsigned operand), and the result is symmetric.
+/// The key slot both sides of an equijoin key pack at: a refusal for a float, a
+/// string against a native key, or two calendar units; the content hash for two
+/// strings; and otherwise the narrowest slot holding both sides' values — a
+/// 128-bit unsigned side against a signed one would need a signed-256 type,
+/// which does not exist. Symmetric, and both sides pack at it.
 #[test]
-fn join_key_common_type_accepts_ladders() {
+fn join_key_common_type_is_the_narrowest_faithful_slot() {
     use TypeCode::*;
-    let cases: &[(TypeCode, TypeCode, TypeCode)] = &[
-        // a temporal code joins its storage type's ladder as that integer
-        (Date, I32, I32),
-        (Date, I64, I64),
-        (Timestamp, I64, I64),
-        // signed ladder → wider signed
-        (I8, I16, I16),
-        (I8, I32, I32),
-        (I8, I64, I64),
-        (I16, I32, I32),
-        (I16, I64, I64),
-        (I32, I64, I64),
-        // signed ladder reaching the 16-byte signed type
-        (I8, I128, I128),
-        (I64, I128, I128),
-        (I128, I128, I128),
-        // unsigned ladder → wider unsigned
-        (U8, U16, U16),
-        (U8, U32, U32),
-        (U8, U64, U64),
-        (U16, U32, U32),
-        (U16, U64, U64),
-        (U32, U64, U64),
-        // unsigned with a 16-byte operand → U128
-        (U32, U128, U128),
-        (U64, U128, U128),
-        (U32, UUID, U128),
-        (U8, U128, U128),
-        // same type → identity (fixed ints) / U128 (16-byte / string)
-        (I32, I32, I32),
-        (U64, U64, U64),
-        (U128, U128, U128),
-        (UUID, UUID, U128),
-        (String, String, U128),
-        (Blob, Blob, U128),
-        // both german strings (different variants) → U128 content hash
-        (String, Blob, U128),
-    ];
-    for &(l, r, t) in cases {
-        assert_eq!(l.join_key_common_type(r), Ok(t), "common({l},{r}) should be {t}");
-        assert_eq!(r.join_key_common_type(l), Ok(t), "common is symmetric for ({l},{r})");
-        assert!(l.packs_at(t) && r.packs_at(t), "({l},{r}) cannot pack at {t}");
-    }
-}
-
-/// The cross-sign rule, accepted and refused sides in one table. A pair whose
-/// unsigned operand is ≤ 8 bytes promotes to the narrowest signed type that
-/// faithfully holds both ranges — strictly wider than the unsigned operand and
-/// at least as wide as the signed one. A 128-bit unsigned operand (`U128` /
-/// `UUID`) would need a signed-256 type, which does not exist, so it is
-/// refused. Symmetric either way.
-#[test]
-fn join_key_common_type_over_cross_sign_pairs() {
-    use TypeCode::*;
-    const NO: Result<TypeCode, JoinKeyRule> = Err(JoinKeyRule::NoSigned256);
-    let cases: &[(TypeCode, TypeCode, Result<TypeCode, JoinKeyRule>)] = &[
-        (U8, I8, Ok(I16)),
-        (U8, I16, Ok(I16)),
-        (U8, I32, Ok(I32)),
-        (U8, I64, Ok(I64)),
-        (U16, I8, Ok(I32)),
-        (U16, I16, Ok(I32)),
-        (U16, I32, Ok(I32)),
-        (U16, I64, Ok(I64)),
-        (U32, I8, Ok(I64)),
-        (U32, I16, Ok(I64)),
-        (U32, I32, Ok(I64)),
-        (U32, I64, Ok(I64)),
-        // A U64 unsigned side carries the pair to the signed-128 type.
-        (U64, I8, Ok(I128)),
-        (U64, I16, Ok(I128)),
-        (U64, I32, Ok(I128)),
-        (U64, I64, Ok(I128)),
-        // A 128-bit unsigned side has no faithful common type at any width.
-        (U128, I8, NO),
-        (U128, I64, NO),
-        (UUID, I32, NO),
-        (UUID, I64, NO),
-        (U128, I128, NO),
-        (UUID, I128, NO),
-    ];
-    for &(u, s, want) in cases {
-        assert_eq!(u.join_key_common_type(s), want, "cross-sign common({u},{s})");
-        assert_eq!(s.join_key_common_type(u), want, "cross-sign is symmetric for ({u},{s})");
-        if let Ok(t) = want {
-            assert!(u.packs_at(t) && s.packs_at(t), "({u},{s}) cannot pack at {t}");
+    let want = |l: TypeCode, r: TypeCode| {
+        if l.is_float() || r.is_float() {
+            return Err(JoinKeyRule::Float);
+        }
+        if l.is_german_string() != r.is_german_string() {
+            return Err(JoinKeyRule::StringWithNative);
+        }
+        if l == r {
+            return Ok(l.reindex_output_type());
+        }
+        if l.is_german_string() {
+            return Ok(U128);
+        }
+        if l.is_temporal() && r.is_temporal() {
+            return Err(JoinKeyRule::UnitMismatch);
+        }
+        let (a, b) = (key_bounds(l), key_bounds(r));
+        let both = (a.0.min(b.0), a.1.max(b.1));
+        [U8, I8, U16, I16, U32, I32, U64, I64, U128, I128]
+            .into_iter()
+            .find(|&c| contains(int_bounds(c).unwrap(), both))
+            .ok_or(JoinKeyRule::NoSigned256)
+    };
+    for &l in TypeCode::ALL {
+        for &r in TypeCode::ALL {
+            let got = l.join_key_common_type(r);
+            assert_eq!(got, want(l, r), "({l},{r})");
+            assert_eq!(got, r.join_key_common_type(l), "symmetric ({l},{r})");
+            if let Ok(t) = got {
+                assert!(l.packs_at(t) && r.packs_at(t), "({l},{r}) at {t}");
+            }
         }
     }
 }
 
-/// Each refusal names its rule, symmetric either way.
+/// Equal values on both sides of an accepted join key pair pack byte-identically
+/// at the common slot, so they co-partition and match; and distinct values never
+/// collide — including the native-byte aliasing trap (U8 255 and I8 -1 share all
+/// 0xFF native bytes).
 #[test]
-fn join_key_common_type_names_each_refusal() {
-    use TypeCode::*;
-    let cases: &[(TypeCode, TypeCode, JoinKeyRule)] = &[
-        (F64, F64, JoinKeyRule::Float),
-        (F32, I64, JoinKeyRule::Float),
-        (F64, String, JoinKeyRule::Float),
-        (Date, Timestamp, JoinKeyRule::UnitMismatch),
-        (String, U128, JoinKeyRule::StringWithNative),
-        (Blob, I64, JoinKeyRule::StringWithNative),
-        (U128, I64, JoinKeyRule::NoSigned256),
+fn every_accepted_join_key_pair_copartitions() {
+    const PROBES: &[i128] = &[
+        i128::MIN,
+        i64::MIN as i128,
+        i32::MIN as i128,
+        -32768,
+        -129,
+        -128,
+        -56,
+        -1,
+        0,
+        1,
+        127,
+        128,
+        200,
+        255,
+        256,
+        32767,
+        65535,
+        i32::MAX as i128,
+        u32::MAX as i128,
+        i64::MAX as i128,
+        u64::MAX as i128,
+        i128::MAX,
     ];
-    for &(l, r, rule) in cases {
-        assert_eq!(l.join_key_common_type(r), Err(rule), "common({l},{r})");
-        assert_eq!(
-            r.join_key_common_type(l),
-            Err(rule),
-            "common is symmetric for ({l},{r})"
-        );
+    let pk: Vec<TypeCode> = TypeCode::ALL.iter().copied().filter(|t| t.is_pk_eligible()).collect();
+    for &l in &pk {
+        for &r in &pk {
+            let Ok(t) = l.join_key_common_type(r) else { continue };
+            let keys: Vec<(i128, crate::PkBuf)> = [l, r]
+                .into_iter()
+                .flat_map(|tc| {
+                    let (lo, hi) = key_bounds(tc);
+                    PROBES
+                        .iter()
+                        .filter(move |&&v| lo <= v && (v < 0 || v as u128 <= hi))
+                        .map(move |&v| (v, crate::encode_pk_images([(tc, t, crate::key_image(tc, v as u128))])))
+                })
+                .collect();
+            for (va, ka) in &keys {
+                for (vb, kb) in &keys {
+                    assert_eq!(ka.pk_bytes() == kb.pk_bytes(), va == vb, "{l}/{r} at {t}: {va} vs {vb}");
+                }
+            }
+        }
     }
 }
 
-/// [`cmp_col_window`] over two fixed-width windows, which read no blob.
-fn cmp(a: &[u8], b: &[u8], tc: TypeCode) -> core::cmp::Ordering {
-    cmp_col_window(a, &[], b, &[], tc)
+/// The PK admission rule, one refusal per rule, and the stride it returns.
+#[test]
+fn validate_pk_tuple_names_each_rule() {
+    use TypeCode::*;
+    // (type, nullable) per column.
+    let cols = [(U64, false), (I32, false), (String, false), (F64, false), (I64, true)];
+    let check = |pk: &[u32], max| validate_pk_tuple(pk, cols.len(), max, |c| cols[c as usize]);
+    assert_eq!(check(&[0, 1], 4), Ok(12));
+    for (pk, max, want) in [
+        (&[][..], 4, PkRule::Empty),
+        (&[0, 1], 1, PkRule::TooManyColumns { count: 2, max: 1 }),
+        (&[5], 4, PkRule::IndexOutOfRange { col: 5 }),
+        (&[1, 1], 4, PkRule::Duplicate { col: 1 }),
+        (&[2], 4, PkRule::NotEligible { col: 2, type_code: String }),
+        (&[3], 4, PkRule::NotEligible { col: 3, type_code: F64 }),
+        (&[4], 4, PkRule::Nullable { col: 4 }),
+    ] {
+        assert_eq!(check(pk, max), Err(want), "{pk:?}");
+    }
 }
 
+/// An index key promotes each column, and its record — the key columns plus the
+/// source PK — is capped in arity.
 #[test]
-fn cmp_col_window_unsigned_and_signed_widths() {
-    use core::cmp::Ordering;
-    // Unsigned: plain magnitude order.
-    assert_eq!(cmp(&[1u8], &[2u8], TypeCode::U8), Ordering::Less);
+fn index_key_types_promote_and_cap_the_record() {
+    use TypeCode::*;
+    assert_eq!(index_key_types(&[U8, I32], 1), Ok(vec![U64, I64]));
     assert_eq!(
-        cmp(&256u16.to_le_bytes(), &1u16.to_le_bytes(), TypeCode::U16),
-        Ordering::Greater,
-        "multi-byte LE: 256 > 1 (guards a byte-swapped or first-byte-only compare)"
+        index_key_types(&[I64, String], 1),
+        Err(IndexKeyRule::NotEligible { col: 1, type_code: String })
     );
-    // Signed: negatives sort below non-negatives at every width.
+    let n = crate::MAX_PK_COLUMNS;
+    assert_eq!(index_key_types(&[U64; 1], n - 1), Ok(vec![U64]));
     assert_eq!(
-        cmp(&(-1i8 as u8).to_le_bytes(), &0u8.to_le_bytes(), TypeCode::I8),
-        Ordering::Less
-    );
-    assert_eq!(
-        cmp(&(-5i32).to_le_bytes(), &5i32.to_le_bytes(), TypeCode::I32),
-        Ordering::Less
-    );
-    assert_eq!(
-        cmp(&i64::MIN.to_le_bytes(), &i64::MAX.to_le_bytes(), TypeCode::I64),
-        Ordering::Less
-    );
-}
-
-#[test]
-fn cmp_col_window_u64_high_bit_sorts_last() {
-    use core::cmp::Ordering;
-    // The decode_le_i64 trap: `u64::MAX` must sort GREATER than 0, not first.
-    assert_eq!(
-        cmp(&u64::MAX.to_le_bytes(), &0u64.to_le_bytes(), TypeCode::U64),
-        Ordering::Greater
-    );
-    assert_eq!(
-        cmp(&u64::MAX.to_le_bytes(), &1u64.to_le_bytes(), TypeCode::U64),
-        Ordering::Greater
+        index_key_types(&[U64; 1], n),
+        Err(IndexKeyRule::ArityOutOfRange { n: 1, src_pk_count: n })
     );
 }
 
+/// Each fixed-width type's order, both directions: unsigned magnitude at every
+/// width (the high bit last), signed with negatives first, a calendar or
+/// decimal type as its storage integer, 128-bit values across the limb, and
+/// floats by `total_cmp` (-0.0 < +0.0, NaN ordered and equal to itself).
 #[test]
-fn cmp_col_window_floats_total_cmp() {
-    use core::cmp::Ordering;
-    // total_cmp: -0.0 < +0.0, and NaN is ordered (does not collapse to Equal).
-    assert_eq!(
-        cmp(&(-0.0f64).to_le_bytes(), &0.0f64.to_le_bytes(), TypeCode::F64),
-        Ordering::Less
-    );
-    assert_eq!(
-        cmp(&f64::NAN.to_le_bytes(), &f64::INFINITY.to_le_bytes(), TypeCode::F64),
-        Ordering::Greater
-    );
-    assert_eq!(
-        cmp(&1.5f32.to_le_bytes(), &2.5f32.to_le_bytes(), TypeCode::F32),
-        Ordering::Less
-    );
-}
-
-#[test]
-fn cmp_col_window_wide_ints() {
-    use core::cmp::Ordering;
-    assert_eq!(
-        cmp(&1u128.to_le_bytes(), &2u128.to_le_bytes(), TypeCode::U128),
-        Ordering::Less
-    );
-    assert_eq!(
-        cmp(&u128::MAX.to_le_bytes(), &0u128.to_le_bytes(), TypeCode::UUID),
-        Ordering::Greater
-    );
-    // I128 signed: a negative sorts below zero.
-    assert_eq!(
-        cmp(&(-1i128).to_le_bytes(), &0i128.to_le_bytes(), TypeCode::I128),
-        Ordering::Less
-    );
+fn cmp_col_window_orders_every_fixed_width_type() {
+    use core::cmp::Ordering::{self, *};
+    use TypeCode::*;
+    let le = |v: i128, n: usize| v.to_le_bytes()[..n].to_vec();
+    let f = |v: f64| v.to_le_bytes().to_vec();
+    let cases: &[(TypeCode, Vec<u8>, Vec<u8>, Ordering)] = &[
+        (U8, le(0, 1), le(0xFF, 1), Less),
+        (U16, le(1, 2), le(256, 2), Less),
+        (U32, le(0, 4), le(u32::MAX as i128, 4), Less),
+        (U64, le(1, 8), le(u64::MAX as i128, 8), Less),
+        (U128, le(1, 16), le(1 << 64, 16), Less),
+        (UUID, le(1, 16), le(1 << 64, 16), Less),
+        (I8, le(-1, 1), le(0, 1), Less),
+        (I16, le(-1, 2), le(0, 2), Less),
+        (I32, le(-5, 4), le(5, 4), Less),
+        (I64, le(i64::MIN as i128, 8), le(i64::MAX as i128, 8), Less),
+        (I128, le(-1, 16), le(0, 16), Less),
+        (Date, le(-1, 4), le(0, 4), Less),
+        (Timestamp, le(-1, 8), le(0, 8), Less),
+        (Decimal, le(-1, 8), le(0, 8), Less),
+        (F64, f(-0.0), f(0.0), Less),
+        (F64, f(f64::INFINITY), f(f64::NAN), Less),
+        (F64, f(f64::NAN), f(f64::NAN), Equal),
+        (F32, 1.5f32.to_le_bytes().to_vec(), 2.5f32.to_le_bytes().to_vec(), Less),
+    ];
+    for (tc, a, b, want) in cases {
+        assert_eq!(cmp_col_window(a, &[], b, &[], *tc), *want, "{tc}");
+        assert_eq!(cmp_col_window(b, &[], a, &[], *tc), want.reverse(), "{tc} reversed");
+    }
 }
 
 /// `decode_le_i64` reads the column's own width into the i64 register; `pack`
 /// is its encode-side inverse over `range()`, writing an in-range value into
 /// exactly the low `width()` bytes — so `-1` on an `I8` column packs to `0xFF`,
-/// not to a sign-extended `0xFFFF…`.
+/// not to a sign-extended `0xFFFF…`; and `unpack` answers what `decode_le_i64`
+/// answers over any `u128`'s bytes, its unsigned arm masking the bits past the
+/// width.
 #[test]
-fn fixed_int_packs_and_decodes_its_own_width() {
+fn fixed_int_packs_unpacks_and_decodes_its_own_width() {
     assert_eq!(FixedInt::U8.decode_le_i64(&[0xff]), 255i64);
     assert_eq!(FixedInt::I8.decode_le_i64(&[0xff]), -1i64);
     assert_eq!(FixedInt::U16.decode_le_i64(&[0xff, 0x00]), 255i64);
@@ -370,7 +360,6 @@ fn fixed_int_packs_and_decodes_its_own_width() {
     assert_eq!(FixedInt::U64.decode_le_i64(&u64::MAX.to_le_bytes()), -1i64);
     assert_eq!(FixedInt::I64.decode_le_i64(&i64::MIN.to_le_bytes()), i64::MIN);
 
-    assert_eq!(FixedInt::I8.pack(-1), 0xFF, "a signed value packs at its own width");
     for fi in [
         FixedInt::U8,
         FixedInt::I8,
@@ -382,77 +371,13 @@ fn fixed_int_packs_and_decodes_its_own_width() {
         FixedInt::I64,
     ] {
         let (lo, hi) = fi.range();
-        assert!(lo <= 0 && hi > 0, "{fi:?}: range must bracket zero");
         for v in [lo, 0, hi] {
             let packed = fi.pack(v);
             assert_eq!(packed >> (8 * fi.width()), 0, "{fi:?}: pack spilled past its width");
-            assert_eq!(fi.decode_le_i64(&packed.to_le_bytes()), v as i64, "{fi:?} v={v}");
             assert_eq!(fi.unpack(packed), v as i64, "{fi:?} v={v}");
         }
-    }
-}
-
-/// `unpack` answers what `decode_le_i64` answers over the value's bytes, for
-/// every `u128` — its unsigned arm masks the bits past the width.
-#[test]
-fn fixed_int_unpack_agrees_with_decode_le_i64() {
-    for fi in [
-        FixedInt::U8,
-        FixedInt::I8,
-        FixedInt::U16,
-        FixedInt::I16,
-        FixedInt::U32,
-        FixedInt::I32,
-        FixedInt::U64,
-        FixedInt::I64,
-    ] {
         for v in [0u128, 1, 0x7F, 0x80, 0xFF, 0x100, u64::MAX as u128, u128::MAX] {
             assert_eq!(fi.unpack(v), fi.decode_le_i64(&v.to_le_bytes()), "{fi:?} v={v:#x}");
         }
     }
-}
-
-/// `int_domain_fits` over the sign/width ladder: a rewrite is admitted only when
-/// no value of `src` can fall outside `target`. Also pins that
-/// `is_widening_promotion` narrows it to a ≤8-byte slot.
-#[test]
-fn int_domain_fits_admits_exactly_the_lossless_rewrites() {
-    for (src, target) in [
-        (TypeCode::I32, TypeCode::I64),  // signed widen
-        (TypeCode::U32, TypeCode::I64),  // unsigned into strictly wider signed
-        (TypeCode::U8, TypeCode::U16),   // unsigned widen
-        (TypeCode::I32, TypeCode::I32),  // identity
-        (TypeCode::U64, TypeCode::U64),  // identity
-        (TypeCode::U64, TypeCode::I128), // u64 fits i128
-    ] {
-        assert!(src.int_domain_fits(target), "{src:?} -> {target:?} fits");
-    }
-    for (src, target) in [
-        (TypeCode::U64, TypeCode::I64), // same width, unsigned into signed
-        (TypeCode::U32, TypeCode::I32),
-        (TypeCode::U8, TypeCode::I8),
-        (TypeCode::U128, TypeCode::I128),
-        (TypeCode::I64, TypeCode::U64), // signed into unsigned, at any width
-        (TypeCode::I32, TypeCode::U32),
-        (TypeCode::I64, TypeCode::I32), // narrowing
-    ] {
-        assert!(!src.int_domain_fits(target), "{src:?} -> {target:?} does not fit");
-    }
-    // No non-integer pair is in the domain — UUID shares U128's width and a
-    // STRING/BLOB FK is admitted by exact equality, never by this rule.
-    for tc in [
-        TypeCode::UUID,
-        TypeCode::F64,
-        TypeCode::F32,
-        TypeCode::String,
-        TypeCode::Blob,
-    ] {
-        assert!(!tc.int_domain_fits(tc), "{tc:?} is in no integer domain");
-        assert!(!tc.int_domain_fits(TypeCode::I128), "{tc:?} -> I128");
-        assert!(!TypeCode::I64.int_domain_fits(tc), "I64 -> {tc:?}");
-    }
-    // The column-slot gate is the caller's scope, not part of the rule.
-    assert!(TypeCode::U64.int_domain_fits(TypeCode::I128));
-    assert!(!TypeCode::U64.is_widening_promotion(TypeCode::I128));
-    assert!(TypeCode::U32.is_widening_promotion(TypeCode::I64));
 }

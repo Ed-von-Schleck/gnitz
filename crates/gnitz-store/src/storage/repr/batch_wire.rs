@@ -136,27 +136,27 @@ impl Batch {
 
     /// Every fixed region narrowed to rows `[start, start + rows)`, in canonical
     /// order, with no blob slot yet.
-    fn fixed_regions<'s>(&'s self, start: usize, rows: usize, out: &mut Regions<'s>) {
-        out.clear();
+    fn fixed_regions(&self, start: usize, rows: usize) -> Regions<'_> {
+        let mut out = Regions::new();
         for (r, &stride) in self.strides().iter().enumerate() {
             let stride = stride as usize;
             out.push(&self.region_at(r)[start * stride..(start + rows) * stride]);
         }
+        out
     }
 
     /// Every fixed region followed by the blob heap, in canonical order.
-    pub fn wire_regions<'s>(&'s self, out: &mut Regions<'s>) {
-        self.fixed_regions(0, self.count, out);
+    pub fn wire_regions(&self) -> Regions<'_> {
+        let mut out = self.fixed_regions(0, self.count);
         out.push(&self.blob);
+        out
     }
 
     /// Encode self into WAL wire format at the front of `out`, the header
     /// stating this batch's dead-heap bound. Returns bytes written.
     pub fn encode_to_wire(&self, out: &mut [u8]) -> usize {
         self.debug_verify_dead_heap();
-        let mut r = Regions::new();
-        self.wire_regions(&mut r);
-        wal::write_block(&r, self.dead_heap, out)
+        wal::write_block(&self.wire_regions(), self.dead_heap, out)
     }
 
     /// `frame` as one WAL block at the front of `out`, its strings relocated
@@ -165,8 +165,7 @@ impl Batch {
         let WireFrame { start, rows, .. } = *frame;
         let slots = self.heap_referencing_slots();
         if slots == 0 {
-            let mut r = Regions::new();
-            self.fixed_regions(start, rows, &mut r);
+            let mut r = self.fixed_regions(start, rows);
             r.push(&[]);
             return wal::write_block(&r, 0, out);
         }

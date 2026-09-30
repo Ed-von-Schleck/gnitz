@@ -423,13 +423,11 @@ fn fifo_emits_a_fitting_reply_over_the_source_batch() {
     );
     // The same rows over a heap padded with 4096 unreferenced bytes, framed as
     // an engine block that states them.
-    let mut wire = gnitz_wire::Regions::new();
-    live.wire_regions(&mut wire);
     let padded = [live.blob(), &[0u8; 4096]].concat();
-    let mut regions: Vec<&[u8]> = wire.to_vec();
+    let mut regions: Vec<&[u8]> = live.wire_regions().to_vec();
     *regions.last_mut().unwrap() = &padded;
-    let mut block = vec![0u8; gnitz_wire::wal::block_size(&regions)];
-    gnitz_wire::wal::write_block(&regions, 4096, &mut block);
+    let mut block = Vec::new();
+    gnitz_wire::wal::append_block(&regions, 4096, &mut block);
     let batch = Rc::new(Batch::decode_from_wal_block(&block, &schema).unwrap());
     let frame = batch.wire_frame_within(0, 0, usize::MAX);
     assert_eq!(frame.rows(), batch.len());

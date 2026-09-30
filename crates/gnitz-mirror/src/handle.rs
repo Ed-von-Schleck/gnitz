@@ -299,8 +299,7 @@ impl MirrorStore for Mirror {
                 .registry
                 .scan_spec(tid, spec, reply_schema.layout_digest(), None)
                 .map_err(MirrorError::Engine)?;
-            let mut regions = gnitz_wire::Regions::new();
-            batch.wire_regions(&mut regions);
+            let regions = batch.wire_regions();
             let mut rows = ZSetBatch::new(reply_schema);
             // The client's own block decoder: a local and a remote reply decode by one rule.
             decode_regions_into(&mut rows, &regions, batch.len(), reply_schema)

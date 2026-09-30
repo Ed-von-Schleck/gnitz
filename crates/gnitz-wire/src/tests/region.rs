@@ -1,28 +1,13 @@
 use super::*;
 
 #[test]
-fn num_regions_counts_the_fixed_three_the_payload_and_the_heap() {
-    assert_eq!(num_regions(0), REG_PAYLOAD_START + 1);
-    assert_eq!(num_regions(2), REG_PAYLOAD_START + 3);
-    assert_eq!(MAX_WIRE_REGIONS, num_regions(crate::MAX_COLUMNS));
-}
-
-/// A filled list reads back as the slice it was pushed from, and `clear` makes
-/// it reusable: an out-param filler would otherwise append behind the last fill.
-#[test]
-fn a_region_list_fills_reads_back_and_clears() {
+fn a_region_list_reads_back_what_was_pushed() {
     let (a, b) = ([1u8, 2, 3], [4u8; 8]);
     let mut regions = Regions::new();
     assert!(regions.is_empty());
-
     regions.push(&a);
     regions.push(&b);
     assert_eq!(&*regions, &[&a[..], &b[..]]);
-
-    regions.clear();
-    assert!(regions.is_empty());
-    regions.push(&b);
-    assert_eq!(&*regions, &[&b[..]]);
 }
 
 #[test]
@@ -38,6 +23,9 @@ fn null_word_get_set_roundtrip() {
     assert!(!null_word_get(w, 3));
     assert!(null_word_get(w, 5));
     assert_eq!(w, 0b100000);
+
+    assert_eq!(null_word_at(0b101, 2), 0b10100);
+    assert_eq!(null_word_at(!0, 64), 0);
 }
 
 #[test]

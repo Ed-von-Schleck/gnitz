@@ -5,9 +5,7 @@ use super::*;
 type Buf = Box<[MaybeUninit<u8>]>;
 
 fn framed(payload: &[u8]) -> Vec<u8> {
-    let mut v = (payload.len() as u32).to_le_bytes().to_vec();
-    v.extend_from_slice(payload);
-    v
+    [&frame_len_prefix(payload.len())[..], payload].concat()
 }
 
 fn alloc(len: usize) -> Result<Buf, FrameLenError> {
@@ -24,66 +22,62 @@ fn feed_one(d: &mut Deframer<Buf>, src: &mut &[u8]) -> Option<Vec<u8>> {
     d.feed(src, alloc).expect("no refusal").map(bytes)
 }
 
-/// A frame split at every byte offset — inside the prefix and inside the payload
-/// alike — completes exactly once, on the second half.
+/// A pipelined run split at every byte offset — inside a prefix, inside a
+/// payload, or on a frame boundary — yields each frame exactly once, in order,
+/// and is mid-frame after the first half iff the split is not on a boundary.
 #[test]
-fn a_frame_split_at_every_offset_completes_once() {
-    let payload: Vec<u8> = (0..40u8).collect();
-    let wire = framed(&payload);
-    for split in 1..wire.len() {
+fn a_pipelined_run_split_anywhere_yields_each_frame_once() {
+    let payloads: Vec<Vec<u8>> = (1..=3u8).map(|i| vec![i; i as usize * 7]).collect();
+    let wire: Vec<u8> = payloads.iter().flat_map(|p| framed(p)).collect();
+    let boundaries: Vec<usize> = payloads
+        .iter()
+        .scan(0, |end, p| {
+            *end += FRAME_LEN_PREFIX_BYTES + p.len();
+            Some(*end)
+        })
+        .collect();
+    for split in 0..=wire.len() {
         let mut d = Deframer::<Buf>::default();
-        let mut src = &wire[..split];
-        assert_eq!(feed_one(&mut d, &mut src), None, "split={split}");
-        assert!(src.is_empty(), "split={split}: the first half is consumed whole");
-        assert!(d.is_mid_frame(), "split={split}");
-
-        let mut src = &wire[split..];
-        assert_eq!(feed_one(&mut d, &mut src), Some(payload.clone()), "split={split}");
-        assert!(src.is_empty());
+        let mut got = Vec::new();
+        for (i, half) in [&wire[..split], &wire[split..]].into_iter().enumerate() {
+            let mut src = half;
+            while let Some(p) = feed_one(&mut d, &mut src) {
+                got.push(p);
+            }
+            assert!(src.is_empty(), "split={split}: each half is consumed whole");
+            if i == 0 {
+                let on_boundary = split == 0 || boundaries.contains(&split);
+                assert_eq!(d.is_mid_frame(), !on_boundary, "split={split}");
+            }
+        }
+        assert_eq!(got, payloads, "split={split}");
         assert!(!d.is_mid_frame(), "split={split}: nothing left buffered");
     }
 }
 
-/// A pipelined run yields one frame per call, in order, and then `None`.
+/// A zero prefix and a prefix over the ceiling are refused before any
+/// allocation and leave nothing buffered; a prefix of exactly the ceiling
+/// allocates once and opens a payload.
 #[test]
-fn a_pipelined_run_yields_one_frame_per_call() {
-    let payloads: Vec<Vec<u8>> = (1..=5u8).map(|i| vec![i; i as usize * 3]).collect();
-    let wire: Vec<u8> = payloads.iter().flat_map(|p| framed(p)).collect();
-    let mut d = Deframer::<Buf>::default();
-    let mut src = &wire[..];
-    for p in &payloads {
-        assert_eq!(feed_one(&mut d, &mut src).as_ref(), Some(p));
-    }
-    assert_eq!(feed_one(&mut d, &mut src), None);
-    assert!(src.is_empty());
-}
-
-/// A zero prefix and a prefix over the ceiling are refused before any allocation.
-#[test]
-fn a_bad_prefix_is_refused_before_allocating() {
-    let refuse = |wire: &[u8]| {
+fn a_prefix_is_bounded_before_allocating() {
+    let open = |len: usize| {
         let mut d = Deframer::<Buf>::default();
-        let mut src = wire;
-        d.feed(&mut src, |_| -> Result<Buf, FrameLenError> {
-            panic!("alloc on a refused prefix")
-        })
-        .expect_err("refused")
+        let mut allocs = 0;
+        let prefix = (len as u32).to_le_bytes();
+        let got = d
+            .feed(&mut &prefix[..], |n| {
+                allocs += 1;
+                alloc(n)
+            })
+            .map(|p| p.is_some());
+        (got, allocs, d.is_mid_frame())
     };
-    assert_eq!(refuse(&0u32.to_le_bytes()), FrameLenError::Zero);
+    assert_eq!(open(0), (Err(FrameLenError::Zero), 0, false));
     assert_eq!(
-        refuse(&((MAX_FRAME_PAYLOAD + 1) as u32).to_le_bytes()),
-        FrameLenError::Oversize { len: MAX_FRAME_PAYLOAD + 1 }
+        open(MAX_FRAME_PAYLOAD + 1),
+        (Err(FrameLenError::Oversize { len: MAX_FRAME_PAYLOAD + 1 }), 0, false)
     );
-}
-
-/// A prefix of exactly the ceiling is accepted and opens a payload.
-#[test]
-fn a_prefix_at_the_ceiling_is_accepted() {
-    let mut d = Deframer::<Buf>::default();
-    let prefix = (MAX_FRAME_PAYLOAD as u32).to_le_bytes();
-    let mut src = &prefix[..];
-    assert!(matches!(d.feed(&mut src, alloc), Ok(None)));
-    assert!(d.is_mid_frame());
+    assert_eq!(open(MAX_FRAME_PAYLOAD), (Ok(false), 1, true));
 }
 
 /// Bytes written straight into the payload tail complete the frame on the next

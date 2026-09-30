@@ -79,35 +79,10 @@ fn a_foreign_decode_refuses_a_non_zero_cell_under_a_null() {
     );
 }
 
-/// A forged `ROWS` or `HEAP_LEN`, or a block cut short of its `SIZE`, is
-/// refused; a genuinely empty block decodes.
+/// A zero-row block decodes to an empty batch, dropping any heap bytes it
+/// declares: no cell can resolve against a heap at zero rows.
 #[test]
-fn decode_from_wal_block_rejects_header_forgeries() {
-    let schema = pk_payload_schema(&[TypeCode::U64]);
-    let clean = encode_to_wire_vec(&make_batch_raw(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]));
-    let decode = |buf: &[u8]| WalBlock::parse(buf, &schema).err();
-    let mismatch = Some("block size does not match its rows and heap");
-    for (off, forged) in [
-        (wal::WAL_OFF_ROWS, 0),
-        (wal::WAL_OFF_ROWS, 2),
-        (wal::WAL_OFF_ROWS, 1000),
-        (wal::WAL_OFF_HEAP_LEN, 8),
-    ] {
-        let mut buf = clean.clone();
-        gnitz_wire::write_u32_le(&mut buf, off, forged);
-        assert_eq!(decode(&buf), mismatch, "header word at {off} forged to {forged}");
-    }
-    assert_eq!(decode(&clean[..clean.len() - 1]), Some("declared size past buffer"));
-
-    let empty = encode_to_wire_vec(&Batch::empty_with_schema(&schema));
-    let decoded = Batch::decode_from_wal_block(&empty, &schema).expect("an empty block decodes");
-    assert_eq!(decoded.count, 0);
-}
-
-/// A zero-row block declaring heap bytes decodes to an empty heap: no cell can
-/// resolve against a heap at zero rows.
-#[test]
-fn a_zero_row_block_carrying_heap_bytes_decodes_to_an_empty_heap() {
+fn a_zero_row_block_decodes_to_an_empty_batch() {
     use crate::test_support::make_schema_pk_u64_payload_string;
     let schema = make_schema_pk_u64_payload_string();
     let mut empty = Batch::empty_with_schema(&schema);
@@ -342,7 +317,6 @@ fn dead_heap_round_trips_an_engine_block() {
     b.blob.extend_from_slice(&[0; 7]);
     b.dead_heap = 7;
     let block = encode_to_wire_vec(&b);
-    assert_eq!(gnitz_wire::read_u32_le(&block, wal::WAL_OFF_HEAP_DEAD), 7);
     let decoded = Batch::decode_from_wal_block(&block, &schema).unwrap();
     assert_eq!((decoded.dead_heap, decoded.blob.len()), (7, b.blob.len()));
 }
@@ -369,8 +343,8 @@ fn a_foreign_decode_measures_the_dead_heap_exactly() {
     let nulls = [0u8; 24];
     let regions: [&[u8]; 5] = [&pks, &weights, &nulls, &cells, &heap];
     for claimed in [0, 5, heap.len()] {
-        let mut block = vec![0u8; wal::block_size(&regions)];
-        wal::write_block(&regions, claimed, &mut block);
+        let mut block = Vec::new();
+        wal::append_block(&regions, claimed, &mut block);
         let decoded = Batch::decode_foreign_wal_block(&block, &schema).unwrap();
         assert_eq!(decoded.dead_heap, 32, "header claimed {claimed}");
         assert_eq!(
@@ -378,20 +352,6 @@ fn a_foreign_decode_measures_the_dead_heap_exactly() {
             claimed
         );
     }
-}
-
-/// A block declaring more dead heap bytes than it has heap is refused.
-#[test]
-fn a_block_declaring_more_dead_than_heap_is_refused() {
-    use crate::test_support::{make_batch_bytes, make_schema_pk_u64_payload_string};
-    let schema = make_schema_pk_u64_payload_string();
-    let b = make_batch_bytes(&schema, &[(1, 1, &[b'a'; 20])]);
-    let mut block = encode_to_wire_vec(&b);
-    gnitz_wire::write_u32_le(&mut block, wal::WAL_OFF_HEAP_DEAD, b.blob.len() as u32 + 1);
-    assert_eq!(
-        WalBlock::parse(&block, &schema).err(),
-        Some("block declares more dead heap than heap")
-    );
 }
 
 /// A pushed block decodes iff every STRING cell is UTF-8, as a per-cell

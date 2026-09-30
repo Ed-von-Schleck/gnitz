@@ -1,8 +1,6 @@
-// ---------------------------------------------------------------------------
-// ReadSpec — an ad-hoc bounded read: a bound, a predicate, then a sink (rows or a
-// fold). The master routes a request blob by `peek_bound`; the worker's `decode`
-// is the trust boundary.
-// ---------------------------------------------------------------------------
+//! ReadSpec — an ad-hoc bounded read: a bound, a predicate, then a sink (rows or a
+//! fold). The master routes a request blob by `peek_bound`; the worker's `decode`
+//! is the trust boundary.
 
 use crate::circuit::{read_aggs, read_cols, read_compute_map, write_aggs, write_cols, write_compute_map};
 use crate::circuit::{read_order_keys, write_order_keys, AggDescriptor, ComputeMap};
@@ -271,7 +269,7 @@ fn read_pk_set<'a>(r: &mut Reader<'a>) -> Result<(usize, &'a [u8]), String> {
         return Err(format!("PkSet stride {stride} outside 1..={MAX_PK_BYTES}"));
     }
     let count = r.u32()? as usize;
-    let keys = r.take(count.checked_mul(stride).ok_or("PkSet key count overflows")?)?;
+    let keys = r.take(count * stride)?;
     Ok((stride, keys))
 }
 
@@ -334,6 +332,10 @@ impl PkSetPeek<'_> {
     /// [`Self::keys`] — so still strictly ascending — and every other byte
     /// copied verbatim: it decodes to the same spec over those keys.
     pub fn with_keys(&self, keys: &[u8]) -> Vec<u8> {
+        debug_assert!(
+            strictly_ascending(keys, self.stride),
+            "a subsequence of the peeked keys"
+        );
         let mut w = Writer::with_capacity(self.blob.len() - self.keys.len() + keys.len());
         w.raw(&self.blob[..self.span.start]);
         write_pk_set(&mut w, self.stride, keys);

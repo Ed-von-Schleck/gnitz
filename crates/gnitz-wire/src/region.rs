@@ -39,10 +39,6 @@ impl<'a> Regions<'a> {
         self.slots[self.len].write(region);
         self.len += 1;
     }
-
-    pub fn clear(&mut self) {
-        self.len = 0;
-    }
 }
 
 impl Default for Regions<'_> {

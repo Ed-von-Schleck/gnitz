@@ -536,7 +536,7 @@ pub(crate) fn plan_create_table(
         cols[i as usize].is_nullable = false;
     }
 
-    let pk_stride = gnitz_wire::validate_pk_tuple(&pk_indices, cols.len(), gnitz_wire::PK_LIST_MAX_COLS, |c| {
+    gnitz_wire::validate_pk_tuple(&pk_indices, cols.len(), gnitz_wire::PK_LIST_MAX_COLS, |c| {
         let cd = &cols[c as usize];
         (cd.ty.tc, cd.is_nullable)
     })
@@ -565,7 +565,7 @@ pub(crate) fn plan_create_table(
     for u in &unique {
         let names: Vec<&str> = u.cols.iter().map(|&c| cols[c as usize].name.as_str()).collect();
         let types: Vec<TypeCode> = u.cols.iter().map(|&c| cols[c as usize].ty.tc).collect();
-        reject_unbuildable_index_key(&names, &types, pk_indices.len(), pk_stride, "UNIQUE")?;
+        reject_unbuildable_index_key(&names, &types, pk_indices.len(), "UNIQUE")?;
     }
 
     // CLUSTER BY (hash distribution key). The named columns must be the PK's
@@ -744,7 +744,7 @@ pub(crate) fn create_index_core(
     // The same rule the engine applies, run here for the message: it names the
     // offending column, which the engine cannot.
     let col_types: Vec<TypeCode> = col_indices.iter().map(|&c| schema.columns[c as usize].ty.tc).collect();
-    reject_unbuildable_index_key(&col_names, &col_types, schema.pk_cols.len(), schema.pk_stride(), ctx)?;
+    reject_unbuildable_index_key(&col_names, &col_types, schema.pk_cols.len(), ctx)?;
 
     let index_name = match explicit_name {
         Some(name) => {

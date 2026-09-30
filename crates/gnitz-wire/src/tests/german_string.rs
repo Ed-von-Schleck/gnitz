@@ -4,7 +4,9 @@ use std::cmp::Ordering;
 /// Encode → decode at one length, out of an arena that already holds `prefix`
 /// bytes: a heap payload must be found at its own non-zero offset, not at 0.
 /// The two readers — the fallible `try_decode_german_string` and the infallible
-/// `german_string_content` — must agree on every class.
+/// `german_string_content` — must agree on every class; the encoded cell is
+/// canonical; the short-cell accessors classify it; and shifting it by the
+/// bytes an appender put in front of its arena keeps its content.
 fn roundtrip(s: &[u8], prefix: usize) {
     let mut blob = vec![0xEEu8; prefix];
     let st = encode_german_string(s, &mut blob);
@@ -30,6 +32,14 @@ fn roundtrip(s: &[u8], prefix: usize) {
     } else {
         assert_eq!(blob.len(), prefix, "an inline payload must not touch the arena");
     }
+    assert!(german_string_cell_ok(&st, &blob), "canonical cell rejected: {s:?}");
+    let short = s.len() <= SHORT_STRING_THRESHOLD;
+    assert_eq!(canonical_short_cell(&st), short.then_some(st));
+    assert_eq!(german_string_short_ascii(&st), short && s.is_ascii());
+    let mut shifted = st;
+    shift_german_string_heaps(&mut shifted, 7);
+    let grown = [&[0u8; 7][..], &blob].concat();
+    assert_eq!(german_string_content(&shifted, &grown), s, "shifted by 7");
 }
 
 #[test]
@@ -41,6 +51,7 @@ fn roundtrip_across_length_boundaries() {
         roundtrip(b"a", prefix); // 1 (prefix only)
         roundtrip(b"abcd", prefix); // 4 (prefix exactly full)
         roundtrip(b"abcde", prefix); // 5 (prefix + 1 suffix byte)
+        roundtrip(b"\xc3\xa9", prefix); // short, not ASCII
         roundtrip(b"abcdefghijkl", prefix); // 12 == SHORT_STRING_THRESHOLD (fully inline)
         roundtrip(b"abcdefghijklm", prefix); // 13 (first length that spills to blob)
         roundtrip(b"abcdefghijklmnopqrstuvwxyz", prefix); // 26
@@ -68,12 +79,10 @@ fn blob_extent_truth_table() {
 fn compare_corrupt_long_cell_degrades_to_empty_without_panic() {
     // Two long-string cells with out-of-range heap offsets. Both contents
     // degrade to empty, so the comparison resolves rather than slicing OOB.
-    let mut a = [0u8; 16];
-    crate::write_u32_le(&mut a, 0, 20);
-    a[4..8].copy_from_slice(b"abcd");
-    crate::write_u64_le(&mut a, 8, 500);
+    let mut a = encode_german_string(&[b'a'; 20], &mut Vec::new());
+    write_u64_le(&mut a, 8, 500);
     let mut b = a;
-    crate::write_u64_le(&mut b, 8, 900);
+    write_u64_le(&mut b, 8, 900);
     let blob = vec![0u8; 4];
     assert_eq!(german_string_content(&a, &blob), &[] as &[u8]);
     assert_eq!(compare_german_strings(&a, &blob, &b, &blob), Ordering::Equal);
@@ -84,25 +93,13 @@ fn compare_corrupt_long_cell_degrades_to_empty_without_panic() {
 }
 
 /// `german_string_cell_ok` is "could `encode_german_string` have produced
-/// this?". The two rejection cases are the ones the comparator's 4-byte
+/// this?" — the round-trip above covers the acceptances. The two rejection cases are the ones the comparator's 4-byte
 /// prefix fast path can observe but `german_string_content` cannot — a cell
 /// that passes content-equality yet orders unequal would split one Z-set
 /// element's weight across two rows that consolidation never merges.
 #[test]
 fn cell_ok_accepts_canonical_and_rejects_compare_visible_corruption() {
     let mut blob = vec![0x7Fu8; 3];
-    for d in [
-        &b""[..],
-        b"a",
-        b"abcd",
-        b"abcde",
-        b"abcdefghijkl",
-        b"abcdefghijklmnopqrstuvwxyz",
-    ] {
-        let cell = encode_german_string(d, &mut blob);
-        assert!(german_string_cell_ok(&cell, &blob), "canonical cell rejected: {d:?}");
-    }
-
     // Short cell with a dirty prefix pad: identical content, different order.
     let clean = encode_german_string(b"ab", &mut blob);
     let mut dirty = clean;
@@ -132,14 +129,16 @@ fn cell_ok_accepts_canonical_and_rejects_compare_visible_corruption() {
 }
 
 /// `compare_german_strings` is plain `[u8]` lexicographic order. The inline
-/// and heap cells reach that verdict through different bytes — the prefix
-/// u32 fast path, then a content compare that resolves out of the cell or
-/// out of the blob — so the classes must agree pairwise. One shared blob
-/// gives every long payload its own non-zero offset, which is what pins the
-/// content origin; a same-class comparison shifts both operands equally and
-/// cannot see it.
+/// and heap cells reach that verdict through different bytes — the prefix u32
+/// fast path, then a content compare that resolves out of the cell or out of
+/// its blob — so the classes must agree pairwise. The merge heap and the
+/// cursor-vs-exemplar compare always hold **two** blob arenas, one per run, so
+/// each side's payload must resolve out of its own heap: the arenas here start
+/// at different lengths, so equal payloads land at different offsets, and a
+/// comparator reading both sides from one arena, or at offset 0, reports the
+/// wrong order.
 #[test]
-fn compare_matches_byte_order_across_length_classes() {
+fn compare_matches_byte_order_across_classes_and_arenas() {
     let data: &[&[u8]] = &[
         b"",
         b"a",
@@ -157,47 +156,21 @@ fn compare_matches_byte_order_across_length_classes() {
         b"abcd\0fghijklmnopqrst",      // 20, embedded NUL right past the prefix
         b"zyxwvutsrqponmlkjihgfedcba", // 26, prefix differs at byte 0
     ];
-    let mut blob = vec![0x7Fu8; 3];
-    let cells: Vec<[u8; 16]> = data.iter().map(|d| encode_german_string(d, &mut blob)).collect();
-
-    for (i, di) in data.iter().enumerate() {
-        for (j, dj) in data.iter().enumerate() {
-            assert_eq!(
-                compare_german_strings(&cells[i], &blob, &cells[j], &blob),
-                di.cmp(dj),
-                "compare mismatch for {di:?} vs {dj:?}",
-            );
-        }
-    }
-}
-
-/// The merge heap and the cursor-vs-exemplar compare always hold **two** blob
-/// arenas — one per run — so the comparator must resolve each side's payload out
-/// of its own heap. The two arenas here start at different lengths, so equal
-/// payloads land at different offsets and a comparator reading both sides from
-/// one arena reports the wrong order.
-#[test]
-fn compare_resolves_each_side_from_its_own_blob() {
-    let data: &[&[u8]] = &[
-        b"",
-        b"abcd",
-        b"abcdefghijkl",               // 12 — last inline length
-        b"abcdefghijklm",              // 13 — first heap length
-        b"abcdefghijklmnopqrst",       // 20, shares the 12-byte prefix
-        b"abcdefghijklmnopqrsu",       // 20, differs at the last byte
-        b"zyxwvutsrqponmlkjihgfedcba", // 26, differs at byte 0
-    ];
-    let (mut blob_a, mut blob_b) = (vec![0x11u8; 3], vec![0x22u8; 41]);
-    let cells_a: Vec<[u8; 16]> = data.iter().map(|d| encode_german_string(d, &mut blob_a)).collect();
-    let cells_b: Vec<[u8; 16]> = data.iter().map(|d| encode_german_string(d, &mut blob_b)).collect();
-
-    for (i, di) in data.iter().enumerate() {
-        for (j, dj) in data.iter().enumerate() {
-            assert_eq!(
-                compare_german_strings(&cells_a[i], &blob_a, &cells_b[j], &blob_b),
-                di.cmp(dj),
-                "cross-arena compare mismatch for {di:?} vs {dj:?}",
-            );
+    let arena = |prefix: usize| {
+        let mut blob = vec![0x7Fu8; prefix];
+        let cells: Vec<[u8; 16]> = data.iter().map(|d| encode_german_string(d, &mut blob)).collect();
+        (cells, blob)
+    };
+    let (a, b) = (arena(3), arena(41));
+    for (x, y) in [(&a, &a), (&a, &b), (&b, &a)] {
+        for (i, di) in data.iter().enumerate() {
+            for (j, dj) in data.iter().enumerate() {
+                assert_eq!(
+                    compare_german_strings(&x.0[i], &x.1, &y.0[j], &y.1),
+                    di.cmp(dj),
+                    "compare mismatch for {di:?} vs {dj:?}",
+                );
+            }
         }
     }
 }

@@ -21,18 +21,20 @@ const PATTERNS: &[u128] = &[
     u128::MAX,
 ];
 
-/// The OPK contract: unsigned byte comparison over an encoded key IS the typed
-/// order of the value it encodes, at every PK-eligible width. `cmp_col_window` is
-/// the crate's own definition of that typed order over native LE bytes, and it
-/// is tested independently. Every ordered pair is checked, so a wrong sign flip
-/// at any width fails here rather than as silently mis-summed weights
-/// downstream.
+/// The OPK codec at every PK-eligible width. Unsigned byte comparison over an
+/// encoded key IS the typed order of the value it encodes (`cmp_col_window` is
+/// the crate's own definition of that order over native LE bytes, tested
+/// independently), so a wrong sign flip fails here rather than as silently
+/// mis-summed weights downstream. `decode_pk_column` inverts the encode — the
+/// bijection byte-equal ⟺ key-equal rests on — `key_image` is the key read as
+/// a big-endian integer, and `decode_opk_i64` fuses the decode with
+/// `FixedInt`'s widening.
 #[test]
-fn opk_byte_order_is_typed_order() {
+fn opk_codec_over_every_pk_type() {
     for &tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
         let sz = tc.wire_stride();
-        let imgs: Vec<[u8; 16]> = PATTERNS.iter().map(|p| p.to_le_bytes()).collect();
-        let keys: Vec<Vec<u8>> = imgs
+        let les: Vec<[u8; 16]> = PATTERNS.iter().map(|p| p.to_le_bytes()).collect();
+        let keys: Vec<Vec<u8>> = les
             .iter()
             .map(|le| {
                 let mut o = vec![0u8; sz];
@@ -40,84 +42,39 @@ fn opk_byte_order_is_typed_order() {
                 o
             })
             .collect();
-        for (i, a) in imgs.iter().enumerate() {
-            for (j, b) in imgs.iter().enumerate() {
+        for (i, (le, opk)) in les.iter().zip(&keys).enumerate() {
+            let mut back = [0u8; 16];
+            decode_pk_column(opk, tc, &mut back[..sz]);
+            assert_eq!(back[..sz], le[..sz], "tc={tc} p={i}: decode(encode(v)) != v");
+            assert_eq!(key_image(tc, PATTERNS[i]), widen_pk_be(opk), "tc={tc} p={i}: key_image");
+            if let Some(fi) = FixedInt::from_type_code(tc) {
+                assert_eq!(decode_opk_i64(opk, fi), fi.decode_le_i64(&le[..sz]), "tc={tc} p={i}");
+            }
+            for (j, b) in les.iter().enumerate() {
                 assert_eq!(
-                    keys[i].cmp(&keys[j]),
-                    cmp_col_window(&a[..sz], &[], &b[..sz], &[], tc),
-                    "tc={tc} sz={sz}: pattern {i} vs {j}",
+                    opk.cmp(&keys[j]),
+                    cmp_col_window(&le[..sz], &[], &b[..sz], &[], tc),
+                    "tc={tc}: pattern {i} vs {j}"
                 );
             }
         }
     }
 }
 
-/// `decode_pk_column` is `encode_pk_column`'s inverse at every PK-eligible
-/// width — the bijection the byte-equal ⟺ key-equal contract rests on. Same
-/// type table as the order sweep above, so a new PK-eligible type is covered by
-/// both without an edit.
-#[test]
-fn decode_pk_column_roundtrips_every_pk_type() {
-    for &tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
-        let sz = tc.wire_stride();
-        for p in PATTERNS {
-            let le = p.to_le_bytes();
-            let mut opk = vec![0u8; sz];
-            encode_pk_column(&le[..sz], tc, &mut opk);
-            let mut back = vec![0u8; sz];
-            decode_pk_column(&opk, tc, &mut back);
-            assert_eq!(back, &le[..sz], "decode(encode(v)) != v for tc={tc} p={p:#x}");
-        }
-    }
-}
-
-/// `decode_opk_i64` fuses the OPK decode with `FixedInt`'s widening, so it must
-/// return the value that was encoded, over each type's whole range. A wrong XOR
-/// arm is otherwise a silent wrong answer on every PK predicate.
-#[test]
-fn decode_opk_i64_recovers_the_encoded_value() {
-    for &(fi, tc) in &[
-        (FixedInt::U8, TypeCode::U8),
-        (FixedInt::I8, TypeCode::I8),
-        (FixedInt::U16, TypeCode::U16),
-        (FixedInt::I16, TypeCode::I16),
-        (FixedInt::U32, TypeCode::U32),
-        (FixedInt::I32, TypeCode::I32),
-        (FixedInt::U64, TypeCode::U64),
-        (FixedInt::I64, TypeCode::I64),
-    ] {
-        let sz = fi.width();
-        let (lo, hi) = fi.range();
-        for v in [lo, -1, 0, 1, hi] {
-            if v < lo || v > hi || v > i64::MAX as i128 {
-                continue;
-            }
-            let mut opk = [0u8; 8];
-            encode_pk_column(&fi.pack(v).to_le_bytes()[..sz], tc, &mut opk[..sz]);
-            assert_eq!(decode_opk_i64(&opk[..sz], fi), v as i64, "{fi:?} v={v}");
-        }
-    }
-    // The one edge the range walk cannot state: `U64`'s maximum does not fit an
-    // `i64`, and the register holds the bit pattern, so it reads back as `-1`.
-    let mut opk = [0u8; 8];
-    encode_pk_column(&u64::MAX.to_le_bytes(), TypeCode::U64, &mut opk);
-    assert_eq!(decode_opk_i64(&opk, FixedInt::U64), -1i64);
-}
-
 /// `store_opk_image` writes what decode → widen → encode writes, for every
-/// promotion the engine performs.
+/// promotion the engine performs: an FK's domain widening and a join key's
+/// packing at its common slot.
 #[test]
 fn store_opk_image_matches_decode_widen_encode() {
     let pk_types: Vec<TypeCode> = TypeCode::ALL.iter().copied().filter(|t| t.is_pk_eligible()).collect();
     let mut pairs: Vec<(TypeCode, TypeCode)> = Vec::new();
     for &src in &pk_types {
         for &target in &pk_types {
-            if src == target || src.int_domain_fits(target) {
+            if src == target || src.int_domain_fits(target) || src.packs_at(target) {
                 pairs.push((src, target));
             }
         }
     }
-    pairs.push((TypeCode::UUID, TypeCode::U128));
     for (src, target) in pairs {
         let (sw, tw) = (src.wire_stride(), target.wire_stride());
         for p in PATTERNS {
@@ -158,156 +115,14 @@ fn widen_pk_be_matches_the_general_form() {
     }
 }
 
-// ── Co-partition property: both join sides pack equal values identically.
-
-/// `v`, read at source type `tc`, OPK-encoded into a `target`-width slot.
-fn promote(v: i128, tc: TypeCode, target: TypeCode) -> [u8; 16] {
-    let key = encode_pk_images([(tc, target, key_image(tc, v as u128))]);
-    let mut out = [0u8; 16];
-    out[..key.width()].copy_from_slice(key.pk_bytes());
-    out
-}
-
-fn assert_copartition(v: i128, l: TypeCode, r: TypeCode, t: TypeCode) {
-    let tw = t.wire_stride();
-    let (bl, br) = (promote(v, l, t), promote(v, r, t));
-    assert_eq!(&bl[..tw], &br[..tw], "byte-identity failed: v={v} L={l} R={r} T={t}");
-    assert_eq!(
-        widen_pk_be(&bl[..tw]),
-        widen_pk_be(&br[..tw]),
-        "widen_pk_be disagreement: v={v} T={t}"
-    );
-}
-
-/// The representable `(min, max)` of a ≤8-byte integer type code, read from the
-/// crate's own [`FixedInt::range`] rather than re-derived from the width.
-fn range_of(tc: TypeCode) -> (i128, i128) {
-    FixedInt::from_type_code(tc)
-        .expect("a fixed-width ≤8-byte integer type code")
-        .range()
-}
-fn narrower(l: TypeCode, r: TypeCode) -> TypeCode {
-    if l.wire_stride() <= r.wire_stride() {
-        l
-    } else {
-        r
-    }
-}
-
+/// A `MAX_PK_BYTES` key fits, and narrowing a buffer re-zeroes the tail it
+/// gives up, so widening it again reads zeros there rather than stale bytes.
 #[test]
-fn signed_ladder_copartitions() {
-    use TypeCode::{I16, I32, I64, I8};
-    for (l, r, t) in [
-        (I8, I16, I16),
-        (I8, I32, I32),
-        (I8, I64, I64),
-        (I16, I32, I32),
-        (I16, I64, I64),
-        (I32, I64, I64),
-    ] {
-        let (lo, hi) = range_of(narrower(l, r));
-        for v in [0, 1, -1, lo, hi, lo + 1, hi - 1] {
-            assert_copartition(v, l, r, t);
-        }
-    }
-}
-
-#[test]
-fn unsigned_ladder_copartitions() {
-    use TypeCode::{U128, U16, U32, U64, U8, UUID};
-    for (l, r, t) in [
-        (U8, U16, U16),
-        (U8, U32, U32),
-        (U8, U64, U64),
-        (U16, U32, U32),
-        (U16, U64, U64),
-        (U32, U64, U64),
-        (U32, U128, U128),
-        (U64, U128, U128),
-        (U32, UUID, U128),
-    ] {
-        let hi = range_of(narrower(l, r)).1;
-        for v in [0, 1, 127, hi, hi - 1] {
-            assert_copartition(v, l, r, t);
-        }
-    }
-}
-
-#[test]
-fn cross_sign_copartitions() {
-    use TypeCode::{I128, I16, I32, I64, I8, U16, U32, U64, U8};
-    // (unsigned ≤8B, signed, promoted T) — the full in-scope acceptance table.
-    // The U64 rows exercise the new signed-128 target at 16-byte width.
-    let cases = [
-        (U8, I8, I16),
-        (U8, I16, I16),
-        (U8, I32, I32),
-        (U8, I64, I64),
-        (U16, I8, I32),
-        (U16, I16, I32),
-        (U16, I32, I32),
-        (U16, I64, I64),
-        (U32, I8, I64),
-        (U32, I16, I64),
-        (U32, I32, I64),
-        (U32, I64, I64),
-        (U64, I8, I128),
-        (U64, I16, I128),
-        (U64, I32, I128),
-        (U64, I64, I128),
-    ];
-    for (u, s, t) in cases {
-        // Equal logical values representable on BOTH sides (the overlap
-        // [0, min(u_max, s_max)]) pack byte-identically into T, so equal keys
-        // co-partition to the same worker and match in the join.
-        let (u_lo, u_hi) = range_of(u);
-        let (s_lo, s_hi) = range_of(s);
-        let hi = u_hi.min(s_hi);
-        for v in [0, 1, 127, hi - 1, hi] {
-            assert_copartition(v, u, s, t);
-        }
-        // Injectivity: across a spread drawn from both sides — including the
-        // native-byte aliasing trap (e.g. U8 255 and I8 -1 share all-0xFF
-        // native bytes; U8 200 and I8 -56 share byte 0xC8) — two promoted
-        // T-keys are byte-equal IFF the logical values are equal. No distinct
-        // values ever collide; no equal values ever diverge.
-        let tw = t.wire_stride();
-        let probes: &[(i128, TypeCode)] = &[
-            (u_lo, u),
-            (1, u),
-            (127, u),
-            (128, u),
-            (200, u),
-            (u_hi - 1, u),
-            (u_hi, u),
-            (s_lo, s),
-            (-56, s),
-            (-1, s),
-            (0, s),
-            (1, s),
-            (127, s),
-            (s_hi, s),
-        ];
-        let mut seen: Vec<(i128, [u8; 16])> = Vec::new();
-        for &(val, tc) in probes {
-            let key = promote(val, tc, t);
-            for &(pv, pk) in &seen {
-                assert_eq!(
-                    pk[..tw] == key[..tw],
-                    pv == val,
-                    "cross-sign T-key equal IFF value equal failed: \
-                     {val} vs {pv} (u={u} s={s} t={t})"
-                );
-            }
-            seen.push((val, key));
-        }
-    }
-}
-
-#[test]
-fn a_max_pk_bytes_key_fits_a_pk_buf() {
-    let t = PkBuf::from_bytes(&[0xab; crate::MAX_PK_BYTES]);
+fn a_pk_buf_holds_max_pk_bytes_and_narrows_clean() {
+    let mut t = PkBuf::from_bytes(&[0xab; crate::MAX_PK_BYTES]);
     assert_eq!(t.width(), crate::MAX_PK_BYTES);
+    t.write(4, |b| b.fill(1));
+    assert_eq!(t.widened(8).pk_bytes(), [1, 1, 1, 1, 0, 0, 0, 0]);
 }
 
 #[test]

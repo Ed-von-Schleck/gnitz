@@ -1,12 +1,11 @@
 use super::*;
 use crate::{
     CIRCNODES_PAY_INPUT_0, CIRCNODES_PAY_INPUT_1, CIRCNODES_PAY_OPCODE, CIRCNODES_PAY_PARAMS,
-    CIRCNODES_PAY_SOURCE_TABLE, CIRCUIT_NODES_COLS, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID,
-    COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE,
-    COL_TAB_COLS, IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB_COLS,
-    RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB_COLS, TABLE_TAB_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX,
-    VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_FLAGS, VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX,
-    VIEW_TAB_COLS,
+    CIRCNODES_PAY_SOURCE_TABLE, CIRCUIT_NODES_TAB, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN,
+    COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, COL_TAB, IDXTAB_PAY_FLAGS,
+    IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID,
+    SCHEMATAB_PAY_NAME, SCHEMA_TAB, TABLE_TAB, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY,
+    VIEWTAB_PAY_DELTA, VIEWTAB_PAY_FLAGS, VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX, VIEW_TAB,
 };
 
 /// A sink that records what a writer emitted, so the tests below read the
@@ -50,13 +49,19 @@ impl SysRowSink for Recorder {
 }
 
 impl Recorder {
-    /// The recorded payload slots, after the two halves every writer owes its
-    /// consumer: exactly one value per payload column of `cols` (a family with
-    /// `pk_cols` key columns), and a closed row. An under-filled row desyncs a
-    /// columnar builder and only surfaces later as an un-attributed length
-    /// error, so every family below reads its slots through here.
-    fn row(&self, cols: &[crate::WireSysCol], pk_cols: usize) -> &[Val] {
-        assert_eq!(self.vals.len(), cols.len() - pk_cols, "one value per payload column");
+    /// The recorded payload slots, after what every writer owes its consumer:
+    /// one key value per PK column and one value per payload column of
+    /// `family`, and a closed row. An under-filled row desyncs a columnar
+    /// builder and only surfaces later as an un-attributed length error, so
+    /// every family below reads its slots through here.
+    fn row(&self, family: u64) -> &[Val] {
+        let f = &crate::SYS_FAMILIES[crate::sys_family_index(family).unwrap()];
+        assert_eq!(self.pk.len(), f.pk_cols.len(), "one key value per PK column");
+        assert_eq!(
+            self.vals.len(),
+            f.cols.len() - f.pk_cols.len(),
+            "one value per payload column"
+        );
         assert!(self.closed, "the writer must close the row");
         &self.vals
     }
@@ -69,7 +74,7 @@ fn assert_col_tab_slots(r: &ColTabRow, weight: i64) {
     write_col_tab_row(&mut rec, r, weight);
     assert_eq!(rec.pk, [r.owner_id as u128, r.col_idx as u128]);
     assert_eq!(rec.weight, weight);
-    let v = rec.row(COL_TAB_COLS, 2); // compound PK: two key columns
+    let v = rec.row(COL_TAB);
     assert_eq!(v[COLTAB_PAY_NAME], Val::Str(r.col.name.clone()));
     assert_eq!(v[COLTAB_PAY_TYPE_CODE], Val::U64(r.col.ty.tc.as_wire() as u64));
     assert_eq!(v[COLTAB_PAY_IS_NULLABLE], Val::U64(r.col.is_nullable as u64));
@@ -112,7 +117,7 @@ fn values_land_in_their_named_payload_slots() {
         1,
     );
     assert_eq!(r.pk, [100]);
-    let v = r.row(IDX_TAB_COLS, 1);
+    let v = r.row(IDX_TAB);
     assert_eq!(v[IDXTAB_PAY_OWNER_ID], Val::U64(16));
     assert_eq!(v[IDXTAB_PAY_SOURCE_COLS], Val::U64(9));
     assert_eq!(v[IDXTAB_PAY_NAME], Val::Str("idx_t_b".into()));
@@ -133,7 +138,7 @@ fn values_land_in_their_named_payload_slots() {
         1,
     );
     assert_eq!(r.pk, [16]);
-    let v = r.row(TABLE_TAB_COLS, 1);
+    let v = r.row(TABLE_TAB);
     assert_eq!(v[RELTAB_PAY_SCHEMA_ID], Val::U64(3));
     assert_eq!(v[RELTAB_PAY_NAME], Val::Str("t".into()));
     assert_eq!(v[TABTAB_PAY_PK_COL_IDX], Val::U64(5));
@@ -154,7 +159,7 @@ fn values_land_in_their_named_payload_slots() {
         1,
     );
     assert_eq!(r.pk, [20]);
-    let v = r.row(VIEW_TAB_COLS, 1);
+    let v = r.row(VIEW_TAB);
     assert_eq!(v[RELTAB_PAY_SCHEMA_ID], Val::U64(4));
     assert_eq!(v[RELTAB_PAY_NAME], Val::Str("v".into()));
     assert_eq!(v[VIEWTAB_PAY_PK_COL_IDX], Val::U64(6));
@@ -169,12 +174,10 @@ fn values_land_in_their_named_payload_slots() {
     let mut r = Recorder::default();
     write_schema_tab_row(&mut r, &SchemaTabRow { schema_id: 3, name: "public" }, 1);
     assert_eq!(r.pk, [3]);
-    assert_eq!(r.row(SCHEMA_TAB_COLS, 1)[0], Val::Str("public".into()));
+    assert_eq!(r.row(SCHEMA_TAB)[SCHEMATAB_PAY_NAME], Val::Str("public".into()));
 
-    // The circuit family. `view_id` must occupy the LOW u128 half of the
-    // compound key: the PK region OPK-encodes each column independently, low
-    // bytes first, so that is what puts view_id in the leading at-rest bytes
-    // the engine's per-view prefix seek reads.
+    // The circuit family: `view_id` leads the compound key, so the engine's
+    // per-view prefix seek reads it.
     let mut r = Recorder::default();
     write_circuit_node_row(
         &mut r,
@@ -189,7 +192,7 @@ fn values_land_in_their_named_payload_slots() {
         1,
     );
     assert_eq!(r.pk, [7, 5]);
-    let v = r.row(CIRCUIT_NODES_COLS, 2); // compound PK: two key columns
+    let v = r.row(CIRCUIT_NODES_TAB);
     assert_eq!(v[CIRCNODES_PAY_OPCODE], Val::U64(9));
     assert_eq!(v[CIRCNODES_PAY_SOURCE_TABLE], Val::U64(31));
     assert_eq!(v[CIRCNODES_PAY_INPUT_0], Val::U64(4));
@@ -211,7 +214,7 @@ fn values_land_in_their_named_payload_slots() {
         },
         1,
     );
-    let v = r.row(CIRCUIT_NODES_COLS, 2);
+    let v = r.row(CIRCUIT_NODES_TAB);
     assert_eq!(v[CIRCNODES_PAY_SOURCE_TABLE], Val::Null);
     assert_eq!(v[CIRCNODES_PAY_INPUT_0], Val::U64(4));
     assert_eq!(v[CIRCNODES_PAY_INPUT_1], Val::Null);
@@ -262,6 +265,12 @@ fn push_row_rebuilds_the_rows_and_refuses_a_gap() {
         rebuilt.push_row(&gap).unwrap_err(),
         "circuit node ids are not dense from 0"
     );
+}
+
+/// A row's scan source is its source-table cell, on a scan alone.
+#[test]
+fn scan_source_is_a_scans_source_table_cell() {
+    use crate::Opcode;
 
     let row = |opcode: Opcode, source_table| CircuitNodeRow {
         view_id: 1,
