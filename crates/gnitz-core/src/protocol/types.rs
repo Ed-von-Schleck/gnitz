@@ -695,7 +695,7 @@ pub struct BatchAppender<'a> {
 /// `gnitz_wire::sys_rows` writes a system-table row into.
 impl gnitz_wire::sys_rows::SysRowSink for BatchAppender<'_> {
     fn begin_row(&mut self, pk: &[u128], weight: i64) {
-        self.add_row_cols(pk, weight);
+        self.add_row_natives(pk, weight);
     }
     fn put_u64(&mut self, v: u64) {
         self.u64_val(v);
@@ -728,17 +728,14 @@ impl<'a> BatchAppender<'a> {
 
     /// [`Self::add_row`] for a **compound** PK: `natives` are the PK columns'
     /// native values in PK-list order.
-    fn add_row_cols(&mut self, natives: &[u128], weight: i64) -> &mut Self {
+    pub fn add_row_natives(&mut self, natives: &[u128], weight: i64) -> &mut Self {
         self.open_row(weight);
         self.batch.pks.push_natives(self.schema, natives);
         self
     }
 
-    /// A row takes exactly one push per payload column — the `SysRowSink`
-    /// contract's `end_row`, where an under-pushed row would otherwise desync the
-    /// column regions and surface later as an un-attributed `validate` length
-    /// error. A `debug_assert`, since `validate` rejects the batch safely
-    /// anyway; this only attributes it.
+    /// A row takes exactly one push per payload column; names the row `validate` would reject
+    /// later as a bare region-length error.
     fn check_row_complete(&self) {
         debug_assert_eq!(
             self.cursor,
@@ -756,10 +753,7 @@ impl<'a> BatchAppender<'a> {
         self.cursor = 0;
     }
 
-    /// Append one fixed-width cell to the next column: `bytes` is the column's
-    /// whole wire region entry, so its length must be the declared stride —
-    /// otherwise the region ends up the wrong size and every later row reads at
-    /// the wrong offset.
+    /// Append one fixed-width cell, exactly the column's stride wide, to the next column.
     fn fixed_val(&mut self, bytes: &[u8]) -> &mut Self {
         let pi = self.col_index();
         let col = &mut self.batch.payload[pi];
@@ -777,6 +771,17 @@ impl<'a> BatchAppender<'a> {
         col.bytes.extend_from_slice(bytes);
         self.cursor += 1;
         self
+    }
+
+    /// Append an integer to the next ≤8-byte integer column, at that column's
+    /// own width and signedness; `v` must lie in the column type's range.
+    pub fn int_val(&mut self, v: i128) -> &mut Self {
+        let tc = self.batch.payload[self.col_index()].tc();
+        let fi = gnitz_wire::FixedInt::from_type_code(tc)
+            .unwrap_or_else(|| panic!("BatchAppender: {tc:?} is not an integer column"));
+        let (lo, hi) = fi.range();
+        assert!((lo..=hi).contains(&v), "BatchAppender: {v} is out of range for {tc:?}");
+        self.fixed_val(&fi.pack(v).to_le_bytes()[..fi.width()])
     }
 
     /// Append a u64 value to the next column.
@@ -827,12 +832,7 @@ impl<'a> BatchAppender<'a> {
         self
     }
 
-    /// Append a SQL NULL to the next column, whatever its type: a zeroed cell
-    /// plus the row bitmap bit. Self-sufficient — no out-of-band `null_mask`
-    /// call.
-    ///
-    /// The read side gates on `nulls[row] & (1 << payload_idx)` and reads the
-    /// cell only when that bit is clear, so the two must agree.
+    /// Append a SQL NULL to the next column, whatever its type: a zeroed cell under its bitmap bit.
     pub fn null(&mut self) -> &mut Self {
         let pi = self.col_index();
         self.batch.payload[pi].push_zero();

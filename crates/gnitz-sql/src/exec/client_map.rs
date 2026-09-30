@@ -44,12 +44,6 @@ impl ClientMap {
         &self.out_schema
     }
 
-    /// Whether the map reproduces its input, so [`Self::apply`] hands the batch back.
-    #[cfg(test)]
-    pub(crate) fn is_identity(&self) -> bool {
-        self.ev.is_identity()
-    }
-
     /// The map over every row of `src`, each row keeping its PK and weight.
     pub(crate) fn apply(&mut self, src: ZSetBatch) -> ZSetBatch {
         if self.ev.is_identity() {

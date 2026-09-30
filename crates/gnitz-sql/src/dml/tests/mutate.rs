@@ -428,12 +428,9 @@ fn a_decimal_source_rounds_into_an_integer_column() {
 #[test]
 fn a_date_source_converts_into_a_timestamp_column() {
     let schema = table(vec![ncol("d", TypeCode::Date), ncol("ts", TypeCode::Timestamp)]);
-    let mut rows = ZSetBatch::new(&schema);
-    rows.pks.push_u128(&schema, 1);
-    rows.weights.push(1);
-    rows.nulls.push(0);
-    rows.payload[0].bytes.extend_from_slice(&2i32.to_le_bytes());
-    rows.payload[1].bytes.extend_from_slice(&0i64.to_le_bytes());
+    let rows = rows_of(&schema, 1, |a, _| {
+        a.int_val(2).i64_val(0);
+    });
     let out = run("ts = d", &schema, rows).unwrap();
     assert_eq!(payload_u64(&out, 0, 1) as i64, 2 * 86_400_000_000);
 }

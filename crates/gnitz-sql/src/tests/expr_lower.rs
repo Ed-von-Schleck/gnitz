@@ -1694,23 +1694,15 @@ fn eval_sql_rows(sql: &str, tcs: &[TypeCode], rows: &[Vec<Option<i128>>]) -> Vec
     let expr = crate::bind::bind_single_table(&crate::test_support::parse_expr_sql(sql), &schema, "t")
         .unwrap_or_else(|e| panic!("{sql}: {e}"));
     let mut batch = gnitz_core::ZSetBatch::new(&schema);
+    let mut app = gnitz_core::BatchAppender::new(&mut batch, &schema);
     for (r, row) in rows.iter().enumerate() {
-        batch.pks.push_u128(&schema, r as u128);
-        batch.weights.push(1);
-        let mut nulls = 0u64;
-        for (pi, (v, tc)) in row.iter().zip(tcs).enumerate() {
-            let fi = FixedInt::from_type_code(*tc).expect("an integer-stored column");
-            match v {
-                Some(v) => batch.payload[pi]
-                    .bytes
-                    .extend_from_slice(&fi.pack(*v).to_le_bytes()[..fi.width()]),
-                None => {
-                    batch.payload[pi].push_zero();
-                    gnitz_wire::null_word_set(&mut nulls, pi, true);
-                }
-            }
+        app.add_row(r as u128, 1);
+        for v in row {
+            match *v {
+                Some(v) => app.int_val(v),
+                None => app.null(),
+            };
         }
-        batch.nulls.push(nulls);
     }
     let mut ev = compile_scalar_evaluator(&expr, &schema).unwrap_or_else(|e| panic!("{sql}: {e}"));
     match ev.eval_all(&batch) {
@@ -2055,15 +2047,9 @@ fn a_signed_pk_residual_reads_back_through_the_opk_region() {
 fn a_compound_pk_residual_reads_each_column_at_its_offset() {
     let schema = crate::test_support::compound_schema_u64_u64();
     let mut batch = gnitz_core::ZSetBatch::new(&schema);
-    let mut pk_bytes = [0u8; 16];
-    pk_bytes[..8].copy_from_slice(&7u64.to_le_bytes());
-    pk_bytes[8..16].copy_from_slice(&9u64.to_le_bytes());
-    // Not `BatchAppender::add_row`: its scalar `u128` PK would sign-extend
-    // across the second column of a compound key.
-    batch.pks.push_bytes(&schema, &pk_bytes);
-    batch.weights.push(1);
-    batch.nulls.push(0);
-    gnitz_core::BatchAppender::new(&mut batch, &schema).i64_val(42);
+    gnitz_core::BatchAppender::new(&mut batch, &schema)
+        .add_row_natives(&[7, 9], 1)
+        .i64_val(42);
     let none = gnitz_wire::ReadBound::None;
     // Both PK columns and the payload, as one three-conjunct AND chain.
     let (a, b, v) = (col_eq(0, 7), col_eq(1, 9), col_eq(2, 42));

@@ -1,8 +1,5 @@
-//! The client-side read path: the aggregate-fold finisher (`agg_finish::FoldFinish`) and the
-//! batch reshaping (`client_map`, and the ORDER BY / OFFSET / LIMIT sink
-//! `order`) that `dml` drives after a seek/scan reply. Sinks only into the shared
-//! lower layers (`bind`, `codec`, `agg`, `expr_lower`); holds no edge back up into
-//! `dml` or the `hir` view compiler.
+//! What `dml` runs client-side over a seek/scan reply: the aggregate-fold finisher, the
+//! projection map, and the ORDER BY / OFFSET / LIMIT sink.
 
 pub(crate) mod agg_finish;
 pub(crate) mod client_map;

@@ -263,6 +263,45 @@ fn the_appender_writes_each_value_into_its_slot() {
     batch.validate(&schema).unwrap();
 }
 
+/// `int_val` writes each integer at its own column's width — two's complement
+/// for a signed one, DATE as its I32 day count.
+#[test]
+fn int_val_writes_at_the_column_width() {
+    let schema = Schema {
+        columns: vec![
+            ColumnDef::new("pk", TypeCode::U64, false),
+            ColumnDef::new("n", TypeCode::I16, false),
+            ColumnDef::new("d", TypeCode::Date, false),
+            ColumnDef::new("u", TypeCode::U8, false),
+        ],
+        pk_cols: vec![0],
+    };
+    let mut batch = ZSetBatch::new(&schema);
+    BatchAppender::new(&mut batch, &schema)
+        .add_row(1, 1)
+        .int_val(-2)
+        .int_val(-1)
+        .int_val(255);
+    assert_eq!(batch.payload[0].bytes, (-2i16).to_le_bytes());
+    assert_eq!(batch.payload[1].bytes, (-1i32).to_le_bytes());
+    assert_eq!(batch.payload[2].bytes, [255]);
+    batch.validate(&schema).unwrap();
+}
+
+#[test]
+#[should_panic(expected = "256 is out of range for U8")]
+fn int_val_refuses_a_value_its_column_cannot_hold() {
+    let schema = Schema {
+        columns: vec![
+            ColumnDef::new("pk", TypeCode::U64, false),
+            ColumnDef::new("u", TypeCode::U8, false),
+        ],
+        pk_cols: vec![0],
+    };
+    let mut batch = ZSetBatch::new(&schema);
+    BatchAppender::new(&mut batch, &schema).add_row(1, 1).int_val(256);
+}
+
 /// A fixed-width value written into a German-string column panics before the
 /// region can go out of shape — one message for `u64_val`/`i64_val`/`u128_val`,
 /// since they share one body.

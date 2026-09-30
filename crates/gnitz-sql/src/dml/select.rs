@@ -118,7 +118,7 @@ impl ReadPlan {
     fn out_schema(&self) -> &Arc<Schema> {
         match &self.case {
             ReadCase::Rows { reply_schema, .. } => reply_schema,
-            ReadCase::Fold { finish, .. } => &finish.out_schema,
+            ReadCase::Fold { finish, .. } => finish.out_schema(),
             ReadCase::Constant { schema, .. } => schema,
         }
     }
@@ -304,8 +304,8 @@ fn plan_fold(
     // The finalize items follow the output's key.
     let order = wire_keys(
         &keys,
-        &finish.out_schema.columns,
-        order_cols.iter().map(|&at| finish.out_schema.pk_cols.len() + at),
+        &finish.out_schema().columns,
+        order_cols.iter().map(|&at| finish.out_schema().pk_cols.len() + at),
     )?;
     Ok(Some(FoldPlan {
         sink,
@@ -347,7 +347,7 @@ fn plan_constant(query: &Query, select: &Select) -> Result<(Arc<Schema>, ZSetBat
     let mut finish = FoldFinish::new(Arc::new(ground), [], &[], items)?;
     let mut ground_row = ZSetBatch::with_capacity(&finish.partial_schema, 1);
     BatchAppender::new(&mut ground_row, &finish.partial_schema).add_row(gnitz_wire::global_group_key(), 1);
-    Ok((Arc::clone(&finish.out_schema), finish.apply(ground_row)))
+    Ok((Arc::clone(finish.out_schema()), finish.finish(ground_row)))
 }
 
 // ---------------------------------------------------------------------------
@@ -377,7 +377,7 @@ pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result
             let partial = client
                 .scan_spec_local_first(read.desc.tid, read.spec, &finish.partial_schema)?
                 .batch;
-            (Arc::clone(&finish.out_schema), finish.apply(finish.combine(partial)))
+            (Arc::clone(finish.out_schema()), finish.finish(partial))
         }
     };
     let batch = order_and_window(&schema, batch, &order, window);

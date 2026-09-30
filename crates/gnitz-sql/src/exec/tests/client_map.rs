@@ -1,23 +1,37 @@
 use super::*;
 use crate::codec::project_schema::{reply_program, ProjItem};
-use crate::test_support::{col, ncol};
-use gnitz_wire::TypeCode;
+use crate::test_support::{col, ncol, parse_expr_sql};
+use gnitz_core::BatchAppender;
+use gnitz_expr::{payload_is_null, payload_string, payload_u64};
+use gnitz_wire::{ColumnDef, TypeCode};
 
-/// `(k I64 PK, v I64 NULL)`.
+/// A spilled body, and one the map computes.
+const LONG: &str = "a string past the inline prefix";
+const FALLBACK: &str = "a computed fallback past the inline prefix";
+
+/// `(k I64 PK, v I64 NULL, s STRING NULL)`.
 fn source() -> Schema {
     Schema {
-        columns: vec![col("k", TypeCode::I64), ncol("v", TypeCode::I64)],
+        columns: vec![
+            col("k", TypeCode::I64),
+            ncol("v", TypeCode::I64),
+            ncol("s", TypeCode::String),
+        ],
         pk_cols: vec![0],
     }
 }
 
-/// `SELECT v, k`'s reply map over [`source`]: the hidden key, then `v`, then `k`.
-fn v_then_k(src: &Schema) -> ClientMap {
-    let items = vec![
-        ProjItem::PassThrough { src_col: 1 },
-        ProjItem::PassThrough { src_col: 0 },
-    ];
-    let cols = vec![src.columns[1].clone(), src.columns[0].clone()];
+/// The reply map of the SELECT list `sql` over [`source`]: the hidden key, then the items.
+fn map_of(src: &Schema, sql: &[&str]) -> ClientMap {
+    let (items, cols): (Vec<ProjItem>, Vec<ColumnDef>) = sql
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let bound = crate::bind::bind_single_table(&parse_expr_sql(e), src, "t").unwrap();
+            let def = ColumnDef::new(format!("c{i}"), bound.infer_ty(&src.columns).tc, true);
+            (ProjItem::from_bound(bound), def)
+        })
+        .unzip();
     let (out, program) = reply_program(&items, cols, src).unwrap();
     ClientMap::new(program, src, Arc::new(out)).unwrap()
 }
@@ -28,23 +42,44 @@ fn v_then_k(src: &Schema) -> ClientMap {
 fn a_key_copy_decodes_and_a_payload_copy_moves() {
     let src = source();
     let mut b = ZSetBatch::new(&src);
-    for (k, v, w) in [(-5i64, Some(7i64), 1i64), (3, None, 2)] {
-        b.pks.push_natives(&src, &[k as u128]);
-        b.weights.push(w);
-        b.nulls.push(v.is_none() as u64);
-        b.payload[0].bytes.extend_from_slice(&v.unwrap_or(0).to_le_bytes());
-    }
-    let pks = b.pks.region().to_vec();
-    let mut map = v_then_k(&src);
-    let out = map.apply(b);
-    assert_eq!(out.pks.region(), &pks[..]);
-    assert_eq!(out.weights, vec![1, 2]);
-    let cell = |pi: usize, r: usize| i64::from_le_bytes(out.payload[pi].bytes[r * 8..r * 8 + 8].try_into().unwrap());
-    assert_eq!((cell(0, 0), cell(1, 0)), (7, -5));
-    assert_eq!(cell(1, 1), 3);
+    let mut app = BatchAppender::new(&mut b, &src);
+    app.add_row((-5i64) as u128, 1).i64_val(7).null();
+    app.add_row(3, 2).null().null();
+    let pks = b.pks.clone();
+
+    let out = map_of(&src, &["v", "k"]).apply(b);
+
+    assert_eq!(out.pks, pks);
+    assert_eq!(out.weights, [1, 2]);
+    assert_eq!(payload_u64(&out, 0, 0) as i64, 7);
+    assert!(payload_is_null(&out, 1, 0));
     assert_eq!(
-        out.nulls,
-        vec![0, 1],
-        "the NULL `v` stays NULL; a key copy is never NULL"
+        [payload_u64(&out, 0, 1) as i64, payload_u64(&out, 1, 1) as i64],
+        [-5, 3]
+    );
+    assert!(!payload_is_null(&out, 1, 1), "a key copy is never NULL");
+}
+
+/// A computed string spills into the output arena while a copied one keeps its
+/// offset into the source's, so both must read back in one batch.
+#[test]
+fn a_computed_string_spills_beside_a_copied_one() {
+    let src = source();
+    let mut b = ZSetBatch::new(&src);
+    let mut app = BatchAppender::new(&mut b, &src);
+    app.add_row(1, 1).i64_val(0).str_val(LONG);
+    app.add_row(2, 1).null().null();
+
+    let out = map_of(
+        &src,
+        &["s", &format!("COALESCE(CASE WHEN v IS NULL THEN s END, '{FALLBACK}')")],
+    )
+    .apply(b);
+
+    assert_eq!(payload_string(&out, 0, 0), LONG);
+    assert!(payload_is_null(&out, 1, 0));
+    assert_eq!(
+        [payload_string(&out, 0, 1), payload_string(&out, 1, 1)],
+        [FALLBACK, FALLBACK]
     );
 }

@@ -1,19 +1,6 @@
 //! Client-side finishing for an ad-hoc aggregate / DISTINCT SELECT, and for a
 //! FROM-less SELECT's constant row.
-//!
-//! The workers return one concatenated `ZSetBatch` of per-worker partial reduce
-//! rows, in the layout the fold lowering declares.
-//! [`FoldFinish::combine`] folds them into one row per group in place.
-//! [`FoldFinish::apply`] then runs the two
-//! operators a grouped view runs over its reduce output — the HAVING filter and
-//! the finalize map, compiled as a view's are. Every output row keeps the
-//! output key, which makes a tied ORDER BY / LIMIT a function of the
-//! data alone.
-//!
-//! A float SUM adds the partials in reply order, so its low bits follow the
-//! worker count.
 
-use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
@@ -34,11 +21,8 @@ use crate::ir::BoundExpr;
 pub(crate) struct FoldFinish {
     /// The partial reply layout; the combined groups keep it, HAVING and finalize read it.
     pub(crate) partial_schema: Arc<Schema>,
-    /// The finalized result, keyed by the output key.
-    pub(crate) out_schema: Arc<Schema>,
-    /// Per physical agg spec, in partial order: the ordering by which a partial replaces the
-    /// held value, `None` for a summing merge.
-    merge: Vec<Option<Ordering>>,
+    /// Per aggregate column, in partial order.
+    merge: Vec<Merge>,
     pub(crate) having: Option<RowFilter>,
     finalize: ClientMap,
 }
@@ -53,10 +37,9 @@ impl FoldFinish {
         let merge = ops
             .into_iter()
             .map(|op| match op.merge_op() {
-                WireAggFunc::Sum => None,
-                WireAggFunc::Min => Some(Ordering::Less),
-                WireAggFunc::Max => Some(Ordering::Greater),
-                WireAggFunc::Count | WireAggFunc::CountNonNull => unreachable!("merge_op never yields a count"),
+                WireAggFunc::Min => Merge::Min,
+                WireAggFunc::Max => Merge::Max,
+                _ => Merge::Add,
             })
             .collect();
         let having = compile_filter_program(having, &partial_schema.columns)?
@@ -68,18 +51,29 @@ impl FoldFinish {
             .unzip();
         let (out_schema, program) = reply_program(&items, cols, &partial_schema)?;
         let finalize = ClientMap::new(program, &partial_schema, Arc::new(out_schema))?;
-        Ok(FoldFinish {
-            partial_schema,
-            out_schema: Arc::clone(finalize.out_schema()),
-            merge,
-            having,
-            finalize,
-        })
+        Ok(FoldFinish { partial_schema, merge, having, finalize })
     }
 
-    /// The concatenated worker partials as one row per group. A group's first row absorbs every
-    /// later row of the group, in reply order; the absorbed rows are then dropped.
-    pub(crate) fn combine(&self, mut partial: ZSetBatch) -> ZSetBatch {
+    /// The finalized result, keyed by the output key.
+    pub(crate) fn out_schema(&self) -> &Arc<Schema> {
+        self.finalize.out_schema()
+    }
+
+    /// The concatenated worker partials (in `partial_schema`) to the result: combined, then
+    /// HAVING, then finalize.
+    pub(crate) fn finish(&mut self, partial: ZSetBatch) -> ZSetBatch {
+        let mut groups = self.combine(partial);
+        if let Some(ev) = &mut self.having {
+            let mut ranges = Vec::new();
+            ev.ranges(&groups, &mut ranges);
+            groups.retain_ranges(&ranges);
+        }
+        self.finalize.apply(groups)
+    }
+
+    /// The partials as one row per group. A group's first row absorbs every later row of the
+    /// group, in reply order; the absorbed rows are then dropped.
+    fn combine(&self, mut partial: ZSetBatch) -> ZSetBatch {
         let schema = self.partial_schema.as_ref();
         let n_group = schema.num_payload_cols() - self.merge.len();
         let payload = schema.payload_locators();
@@ -94,8 +88,8 @@ impl FoldFinish {
             match first_of.entry(key) {
                 Entry::Occupied(e) => {
                     let first = *e.get();
-                    for (k, (loc, &wins)) in agg_locs.iter().zip(&self.merge).enumerate() {
-                        merge_cell(&mut partial, first, row, n_group + k, wins, loc);
+                    for (k, (loc, &merge)) in agg_locs.iter().zip(&self.merge).enumerate() {
+                        merge_cell(&mut partial, first, row, n_group + k, merge, loc);
                     }
                 }
                 Entry::Vacant(e) => {
@@ -110,30 +104,28 @@ impl FoldFinish {
         partial.retain_ranges(&keep);
         partial
     }
-
-    /// HAVING, then finalize, over `groups` (in `partial_schema`).
-    pub(crate) fn apply(&mut self, mut groups: ZSetBatch) -> ZSetBatch {
-        if let Some(ev) = &mut self.having {
-            let mut ranges = Vec::new();
-            ev.ranges(&groups, &mut ranges);
-            groups.retain_ranges(&ranges);
-        }
-        self.finalize.apply(groups)
-    }
 }
 
-/// Merge row `row`'s cell at payload slot `pi` into row `first`. `wins` is the ordering by
-/// which a partial replaces the held value (MIN: `Less`, MAX: `Greater`); `None` sums. NULL is
-/// every merge's identity. Both rows share one arena, so a winning cell moves verbatim.
-fn merge_cell(b: &mut ZSetBatch, first: usize, row: usize, pi: usize, wins: Option<Ordering>, loc: &ColumnLocator) {
+/// How two partials of one aggregate combine.
+#[derive(Clone, Copy)]
+enum Merge {
+    Add,
+    Min,
+    Max,
+}
+
+/// Merge row `row`'s cell at payload slot `pi` into row `first`; NULL is every merge's identity.
+fn merge_cell(b: &mut ZSetBatch, first: usize, row: usize, pi: usize, merge: Merge, loc: &ColumnLocator) {
     if loc.is_null_word(b.nulls[row]) {
         return;
     }
-    let replace = match wins {
+    let replace = match merge {
         _ if loc.is_null_word(b.nulls[first]) => true,
-        Some(wins) => loc.cmp_non_null(&*b, row, &*b, first) == wins,
-        // 8-byte cells: F64, or the sum mod 2^64, wrapping as the engine accumulator does.
-        None => {
+        Merge::Min => loc.cmp_non_null(&*b, row, &*b, first).is_lt(),
+        Merge::Max => loc.cmp_non_null(&*b, row, &*b, first).is_gt(),
+        // F64 adds in reply order, so its low bits follow the worker count; an integer wraps
+        // mod 2^64 as the engine accumulator does.
+        Merge::Add => {
             let col = &mut b.payload[pi].bytes;
             let (acc, add) = (read_u64_le(col, first * 8), read_u64_le(col, row * 8));
             let sum = if loc.type_code().is_float() {
@@ -146,6 +138,7 @@ fn merge_cell(b: &mut ZSetBatch, first: usize, row: usize, pi: usize, wins: Opti
         }
     };
     if replace {
+        // Both rows share one arena, so a string cell moves verbatim.
         let w = loc.size();
         b.payload[pi].bytes.copy_within(row * w..(row + 1) * w, first * w);
         gnitz_wire::null_word_set(&mut b.nulls[first], pi, false);
