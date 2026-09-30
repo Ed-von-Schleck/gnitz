@@ -1,5 +1,5 @@
-//! Helpers shared by `runtime`'s test suites, across `orchestration`,
-//! `protocol` and `suites`.
+//! Helpers shared by `runtime`'s tests, across `orchestration`, `protocol` and
+//! `reactor`.
 //!
 //! Here rather than in the engine's testkit because nothing below this crate
 //! uses them: a ring is a `runtime` shape, and a helper that crosses no crate
@@ -42,10 +42,11 @@ pub(crate) unsafe fn assert_child_exited_ok(pid: libc::pid_t) {
     );
 }
 
-/// Run `f` on its own thread and fail if it has not returned within `limit`, so
-/// a tick that sleeps when it must not fails the test instead of wedging the
-/// run. A timed-out thread is left blocked; the harness exits past it.
-pub(crate) fn within(limit: std::time::Duration, f: impl FnOnce() + Send + 'static) {
+/// Run `f` on its own thread and fail if it has not returned within 30s, so a
+/// tick that sleeps when it must not fails the test instead of wedging the run.
+/// A timed-out thread is left blocked; the harness exits past it.
+pub(crate) fn within(f: impl FnOnce() + Send + 'static) {
+    let limit = std::time::Duration::from_secs(30);
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
         f();
@@ -73,55 +74,6 @@ pub(crate) fn try_poll_once<T>(fut: impl std::future::Future<Output = T>) -> Opt
     match fut.as_mut().poll(&mut cx) {
         Poll::Ready(r) => Some(r),
         Poll::Pending => None,
-    }
-}
-
-/// A `memfd` mapped `MAP_SHARED` for IPC-shaped tests — a real fd, so a writer
-/// can `fdatasync` it; unmapped and closed on drop. A child that `_exit`s never
-/// runs drops, so only the parent does.
-pub(crate) struct SharedRegion {
-    fd: i32,
-    ptr: *mut u8,
-    size: usize,
-}
-
-impl SharedRegion {
-    pub(crate) fn new(size: usize) -> Self {
-        let fd = unsafe { libc::memfd_create(c"shared_region".as_ptr(), libc::MFD_CLOEXEC) };
-        assert!(fd >= 0, "memfd_create failed: {}", std::io::Error::last_os_error());
-        let ptr = gnitz_foundation::posix_io::map_file_reserved(fd, size).expect("SharedRegion mmap failed");
-        SharedRegion { fd, ptr, size }
-    }
-
-    pub(crate) fn ptr(&self) -> *mut u8 {
-        self.ptr
-    }
-
-    pub(crate) fn fd(&self) -> i32 {
-        self.fd
-    }
-
-    pub(crate) fn size(&self) -> usize {
-        self.size
-    }
-
-    /// The region's base pointer, mapped for the rest of the process. For the
-    /// fixtures that hand a raw pointer to something outliving no scope in
-    /// particular — a `W2mReceiver` or a `SalWriter`, neither of which owns what
-    /// it points at — so there is no unmap for a stale pointer to outlive.
-    pub(crate) fn leak(self) -> *mut u8 {
-        let ptr = self.ptr;
-        std::mem::forget(self);
-        ptr
-    }
-}
-
-impl Drop for SharedRegion {
-    fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.ptr as *mut libc::c_void, self.size);
-            libc::close(self.fd);
-        }
     }
 }
 

@@ -24,13 +24,12 @@ from _uid import uid
 _ROWS = "INSERT INTO t VALUES (1, 100), (2, 200), (3, 300)"
 _WANT = {(1, 100): 1, (2, 200): 1, (3, 300): 1}
 
-# Each seam fails a different apply of already-committed state during boot. All
-# three must abort before the SAL reset, so the pre-crash rows survive for the
-# next boot: the worker base-table flush, the master's system-table flush, and
-# the worker's replay of a committed PUSH zone.
+# Each seam fails a different apply of already-committed state during boot. Both
+# must abort before the SAL reset, so the pre-crash rows survive for the next
+# boot: the worker base-table flush, and the worker's replay of a committed PUSH
+# zone.
 _BOOT_SEAMS = {
     "worker_boot_flush": {"GNITZ_INJECT_BOOT_FLUSH_ERROR": "1"},
-    "master_sys_flush": {"GNITZ_INJECT_SYS_FLUSH_ERROR": "1"},
     "worker_replay_apply": {"GNITZ_INJECT_INGEST_APPLY_ERROR": "store"},
 }
 

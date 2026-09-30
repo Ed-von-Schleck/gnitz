@@ -8,28 +8,28 @@
 use std::os::fd::BorrowedFd;
 
 use super::*;
-use crate::runtime::test_support::{try_poll_once, SharedRegion};
+use crate::catalog::SysFamily;
+use crate::runtime::test_support::try_poll_once;
 use crate::runtime::w2m::SalWake;
-
-use gnitz_store::schema::SchemaDescriptor;
 
 /// A writer over a fresh `size`-byte ring whose groups carry one slot per ring
 /// in `rings`, each worker's wake landing on its ring. Unrewound, as a boot's
 /// writer is before [`SalExcl::boot_rewind`].
 pub(crate) fn test_writer(size: usize, rings: &[*mut u8]) -> SalWriter {
-    let file = SharedRegion::new(ANCHOR_BYTES + size);
+    let len = ANCHOR_BYTES + size;
+    // A real fd, so the writer can `fdatasync` it; mapped and open for the rest
+    // of the process.
+    let fd = unsafe { libc::memfd_create(c"test_sal".as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+    let ptr = gnitz_foundation::posix_io::map_file_reserved(fd, len).expect("map the test SAL");
     // SAFETY: a test ring is never unmapped.
     let wakes = rings.iter().map(|&p| unsafe { SalWake::new(p) }).collect();
-    // SAFETY: the region is leaked below, so it is mapped and its fd open for
-    // the rest of the process.
-    let writer = SalWriter::new(
-        unsafe { SalLog::new(file.ptr(), file.size()) },
-        unsafe { BorrowedFd::borrow_raw(file.fd()) },
+    SalWriter::new(
+        unsafe { SalLog::new(ptr, len) },
+        unsafe { BorrowedFd::borrow_raw(fd) },
         rings.len(),
         wakes,
-    );
-    file.leak();
-    writer
+    )
 }
 
 /// A SAL over its own file.
@@ -138,15 +138,15 @@ impl TestLog {
 
     /// One committed, synced zone of `DdlSync` groups, as a DDL's broadcasts
     /// write it. Returns its LSN.
-    pub(crate) fn ddl_zone(&self, groups: &[(u64, SchemaDescriptor, &Batch)]) -> u64 {
+    pub(crate) fn ddl_zone(&self, groups: &[(SysFamily, &Batch)]) -> u64 {
         let relations: Vec<WireSchema> = groups
             .iter()
-            .map(|&(tid, schema, _)| WireSchema::encoded(tid, schema))
+            .map(|(family, _)| WireSchema::encoded(family.id(), *family.schema()))
             .collect();
         let groups: Vec<DirectGroup> = relations
             .iter()
             .zip(groups)
-            .map(|(relation, &(_, _, batch))| DirectGroup::ddl_sync(relation, batch))
+            .map(|(relation, &(_, batch))| DirectGroup::ddl_sync(relation, batch))
             .collect();
         let (lsn, _) = self.commit_zone(&groups);
         self.synced_through(self.cursor());

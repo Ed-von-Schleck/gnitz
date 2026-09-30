@@ -197,3 +197,23 @@ fn admission_refuses_what_the_constructor_aborts_on() {
     }
     assert!(SchemaDescriptor::try_new(&[k, k], &[1, 0]).is_ok());
 }
+
+/// A schema record's arity prefix carries no redundancy of its own, so every
+/// flip in it must either be refused or change the descriptor.
+#[test]
+fn no_flip_in_a_schema_records_arity_prefix_is_silently_inert() {
+    let cols = [
+        col(TypeCode::U64),
+        col(TypeCode::I64),
+        SchemaColumn::new(TypeCode::I64, true),
+        SchemaColumn::new(TypeCode::F64, true),
+    ];
+    let reference = SchemaDescriptor::new(&cols, &[0]);
+    let mut buf = encode_schema_block(&reference);
+    let prefix = 4 + 1 + reference.pk_cols().len();
+    crate::test_support::sweep_bit_flips(&mut buf, 0..prefix, |byte, bit, buf| {
+        if let Ok(decoded) = decode_schema_block(buf) {
+            assert_ne!(decoded, reference, "prefix byte {byte} bit {bit} changed nothing");
+        }
+    });
+}

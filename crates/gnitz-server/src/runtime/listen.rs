@@ -9,8 +9,8 @@ use crate::runtime::tls::TlsConfig;
 
 /// `<data_dir>/<name>` files a TLS listener is described by: the bound `IP:PORT`,
 /// and the public PEM of a minted dev certificate.
-pub(crate) const TLS_ENDPOINT_FILE: &str = "tls_endpoint";
-pub(crate) const TLS_DEV_CERT_FILE: &str = "tls_dev_cert.pem";
+const TLS_ENDPOINT_FILE: &str = "tls_endpoint";
+const TLS_DEV_CERT_FILE: &str = "tls_dev_cert.pem";
 
 /// A bound, listening, non-blocking socket, and the rustls config its connections are
 /// served under (`None`: the AF_UNIX socket, served in plaintext).

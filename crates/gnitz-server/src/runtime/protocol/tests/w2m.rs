@@ -1,6 +1,6 @@
 use super::fixtures::{make_ring, master_parked};
 use super::*;
-use crate::runtime::test_support::{assert_child_exited_ok, fork_child, within, SharedRegion};
+use crate::runtime::test_support::{assert_child_exited_ok, fork_child, within};
 use gnitz_wire::control::CTRL_HEADER_SIZE;
 use gnitz_wire::WireStatus;
 use proptest::prelude::*;
@@ -163,7 +163,7 @@ fn a_retired_slot_unparks_the_writer() {
     let ptr = make_ring(CTRL_HEADER_SIZE, 1, 8);
     assert!(unsafe { publish(ptr, CTRL_HEADER_SIZE, 0, |s| s[0] = 1) });
     let ring = ptr as usize;
-    within(Duration::from_secs(30), move || {
+    within(move || {
         let ptr = ring as *mut u8;
         let receiver = W2mReceiver::new(vec![ptr]);
         let writer = std::thread::spawn(move || {
@@ -229,8 +229,7 @@ fn w2m_publish_drain_bench() {
     let ptr = make_ring(CTRL_HEADER_SIZE, RING_FRAMES, 8);
     // Two u64s the child fills before `_exit`: publishes that found a master
     // park armed, and the child's own elapsed nanos.
-    let counters = SharedRegion::new(4096);
-    let cptr = counters.ptr() as *mut u64;
+    let cptr = gnitz_foundation::posix_io::map_anon_shared(4096).unwrap() as *mut u64;
 
     let child = || {
         let writer = W2mWriter::new(ptr);
@@ -370,7 +369,7 @@ fn a_parked_worker_wakes_on_a_forked_masters_sal_wake() {
     };
     let pid = unsafe { fork_child(child) };
     let ring = ptr as usize;
-    within(Duration::from_secs(30), move || {
+    within(move || {
         let ptr = ring as *mut u8;
         let seq = || unsafe { super::fixtures::sal_wake_seq(ptr) };
         // The wake sequence stands in for the SAL the worker re-tests.

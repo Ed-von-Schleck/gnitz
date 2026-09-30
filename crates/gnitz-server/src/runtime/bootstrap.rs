@@ -29,24 +29,27 @@ use crate::runtime::worker::WorkerProcess;
 use gnitz_store::relation::{Relation, Residency};
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::schema::Slot;
+use gnitz_store::storage::Batch;
 
 // ---------------------------------------------------------------------------
 // SAL recovery: both drivers below read the log through `sal::zone::CommittedTail`
 // and differ only in which groups are theirs and what they do with the bytes.
 // ---------------------------------------------------------------------------
 
-/// Decode one committed group slot; one that does not decode fails the boot.
+/// Decode one committed group slot's batch, `None` if it carries no rows; one
+/// that does not decode fails the boot.
 fn decode_group_slot(
     msg: &SalMessage,
     data: &[u8],
     known: impl FnOnce(u64, &[u8]) -> Option<SchemaDescriptor>,
-) -> Result<ipc::DecodedWire, String> {
-    ipc::decode_sal_slot(data, known).map_err(|e| {
+) -> Result<Option<Batch>, String> {
+    let decoded = ipc::decode_sal_slot(data, known).map_err(|e| {
         format!(
             "SAL replay: corrupt block at offset={} lsn={} target={}: {e}",
             msg.base, msg.lsn, msg.target_id
         )
-    })
+    })?;
+    Ok(decoded.data_batch.filter(|b| !b.is_empty()))
 }
 
 /// Stage every committed DdlSync group above its family's replay floor into the
@@ -54,7 +57,7 @@ fn decode_group_slot(
 fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Result<(), String> {
     let floors = catalog.system_replay_floors();
     let mine = |msg: &SalMessage| {
-        msg.kind == SalMessageKind::DdlSync && floors.get(&{ msg.target_id }).is_some_and(|&f| msg.lsn > f)
+        msg.kind == SalMessageKind::DdlSync && floors.get(&msg.target_id).is_some_and(|&f| msg.lsn > f)
     };
 
     let mut replayed: u32 = 0;
@@ -66,8 +69,7 @@ fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Re
                 msg.base, msg.lsn
             ));
         };
-        let decoded = decode_group_slot(&msg, data, |_, _| None)?;
-        let Some(batch) = decoded.data_batch.filter(|b| !b.is_empty()) else {
+        let Some(batch) = decode_group_slot(&msg, data, |_, _| None)? else {
             continue;
         };
         // Master-validated rows that already carry a drop's children.
@@ -90,11 +92,11 @@ fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Re
 /// stage, so the crash-window E2E tests can cut boot at a precise point.
 static RECOVERY_PANIC: Seam = Seam::new("GNITZ_INJECT_RECOVERY_PANIC");
 
-/// `GNITZ_INJECT_BOOT_FLUSH_ERROR` / `GNITZ_INJECT_SYS_FLUSH_ERROR`: fail the
-/// base-table or system-table boot flush, whose swallowed failure would destroy
-/// the replayed DDL's only durable copy at the SAL reset.
+/// `GNITZ_INJECT_BOOT_FLUSH_ERROR`: fail a worker's boot recovery after its base
+/// flush, so the error rides the startup ACK as a real flush failure's would —
+/// one that, swallowed, would let the SAL reset destroy the replayed rows' only
+/// durable copy.
 static BOOT_FLUSH_ERROR: Seam = Seam::new("GNITZ_INJECT_BOOT_FLUSH_ERROR");
-static SYS_FLUSH_ERROR: Seam = Seam::new("GNITZ_INJECT_SYS_FLUSH_ERROR");
 
 fn inject_recovery_panic(stage: &str) {
     if RECOVERY_PANIC.at(stage) {
@@ -168,8 +170,7 @@ fn recover_from_sal(
         }
         let mut applied = false;
         for (_, data) in msg.slots_written().filter(|(w, _)| wanted.contains(w)) {
-            let decoded = decode_group_slot(&msg, data, |tid, record| catalog.known_decode(tid, record))?;
-            let Some(batch) = decoded.data_batch.filter(|b| !b.is_empty()) else {
+            let Some(batch) = decode_group_slot(&msg, data, |tid, record| catalog.known_decode(tid, record))? else {
                 continue;
             };
             let mut owned = if reslice {
@@ -327,6 +328,7 @@ fn run_worker_child(
     catalog: &mut CatalogEngine,
     ipc: &SharedIpc,
     swept_bases: &[u64],
+    pinning: Option<&affinity::Pinning>,
 ) -> ! {
     let w = slot.rank as usize;
 
@@ -338,22 +340,10 @@ fn run_worker_child(
         unsafe { libc::_exit(0) };
     }
 
-    // Redirect stdout/stderr to worker log file
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        if let Ok(f) = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o644)
-            .open(format!("{data_dir}/worker_{w}.log"))
-        {
-            let log_fd = std::os::fd::IntoRawFd::into_raw_fd(f);
-            unsafe {
-                libc::dup2(log_fd, 1);
-                libc::dup2(log_fd, 2);
-                libc::close(log_fd);
-            }
+    if let Ok(log) = std::fs::File::create(format!("{data_dir}/worker_{w}.log")) {
+        unsafe {
+            libc::dup2(log.as_raw_fd(), 1);
+            libc::dup2(log.as_raw_fd(), 2);
         }
     }
 
@@ -365,7 +355,11 @@ fn run_worker_child(
     let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w]);
     let catalog_ptr: *mut CatalogEngine = catalog;
 
-    if let Err(e) = worker_boot_recovery(catalog, ipc.tail, slot, swept_bases) {
+    // Pinned before the recovery below allocates, so its pages land on this core's node.
+    let boot = pinning
+        .map_or(Ok(()), |p| p.enter_worker(w))
+        .and_then(|()| worker_boot_recovery(catalog, ipc.tail, slot, swept_bases));
+    if let Err(e) = boot {
         // The master reads this frame off the shared ring, which outlives the
         // process that wrote it.
         gnitz_error!("{e}");
@@ -396,9 +390,6 @@ fn master_pre_fork_recovery(catalog: &mut CatalogEngine) -> Result<Vec<u64>, Str
     // G → G+1, the resume generation left at G: until `boot_checkpoint`
     // restamps at G+1, a crash rebuilds every view instead of resuming it.
     catalog.advance_durable_generation()?;
-    if SYS_FLUSH_ERROR.armed() {
-        return Err("injected system table flush fault".to_string());
-    }
     inject_recovery_panic("genbump");
 
     catalog
@@ -426,10 +417,6 @@ fn fork_workers(
     let master_pid = unsafe { libc::getpid() };
     let mut worker_pids: Vec<i32> = Vec::with_capacity(num_workers as usize);
     for w in 0..num_workers {
-        // The child inherits this mask, so it is pinned from its first instruction.
-        if let Some(p) = pinning {
-            p.enter_worker(w as usize)?;
-        }
         match unsafe { libc::fork() } {
             -1 => return Err("fork failed".to_string()),
             0 => run_worker_child(
@@ -439,12 +426,10 @@ fn fork_workers(
                 catalog,
                 ipc,
                 swept_bases,
+                pinning,
             ),
             pid => worker_pids.push(pid),
         }
-    }
-    if let Some(p) = pinning {
-        p.enter_master()?;
     }
     Ok(worker_pids)
 }

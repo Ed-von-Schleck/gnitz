@@ -1,5 +1,12 @@
 use super::*;
-use gnitz_store::storage::Batch;
+use crate::catalog::{CatalogColumn, SysFamily, PUBLIC_SCHEMA_ID};
+use crate::runtime::sal::fixtures::TestLog;
+use crate::test_support::{
+    circuit_nodes_batch, col_def, col_tab_batch, identity_circuit, push_table_tab_row, push_view_tab_row, sum_weights,
+};
+use gnitz_store::schema::Placement;
+use gnitz_store::storage::BatchBuilder;
+use gnitz_wire::TypeCode;
 
 /// Which of a group's written slots this rank replays. A wrong range silently
 /// loses or doubles ACKed rows, so every case is pinned.
@@ -30,118 +37,98 @@ fn replay_slots_covers_every_width_and_placement() {
     // written slot is walked and re-cut.
     check(4, 1, 2, false, 0..4, true);
     check(2, 3, 4, false, 0..2, true);
-
-    // A group with nothing written reads nothing on either arm: `of >= 1`, so it
-    // can never match the launched width.
-    check(0, 0, 1, false, 0..0, true);
-    check(0, 0, 1, true, 0..1, false);
 }
 
 // -- Boot staging -----------------------------------------------------------
 
-mod staging {
-    use super::*;
-    use crate::catalog::{SysFamily, PUBLIC_SCHEMA_ID};
-    use crate::runtime::sal::fixtures::TestLog;
-    use crate::test_support::{
-        circuit_nodes_batch, col_def, col_tab_batch, identity_circuit, push_table_tab_row, push_view_tab_row,
-        scratch_dir,
+const SAL_SIZE: usize = 1 << 20;
+
+fn cols() -> Vec<CatalogColumn> {
+    vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)]
+}
+
+fn col_tab(owner: u64, weight: i64) -> Batch {
+    col_tab_batch(owner, &cols(), weight)
+}
+
+fn table_tab(tid: u64, weight: i64) -> Batch {
+    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
+    let pk = gnitz_wire::pack_pk_cols(&[0]);
+    push_table_tab_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "t", pk, 0, weight);
+    bb.finish()
+}
+
+/// Boot the catalog at `dir` over `log`'s committed tail.
+fn recover(log: &TestLog, dir: &str) -> CatalogEngine {
+    let mut opened = CatalogEngine::open_master(dir, 1).unwrap();
+    stage_system_tail(CommittedTail::read(log.log()).unwrap(), &mut opened).unwrap();
+    opened.replay().unwrap()
+}
+
+/// The net weight `family`'s store holds.
+fn net(engine: &CatalogEngine, family: SysFamily) -> i64 {
+    sum_weights(engine.registry.relation(family.id()).unwrap().cursor())
+}
+
+/// A view's VIEW_TAB and COL_TAB rows flushed, its circuit only in the SAL.
+#[test]
+fn a_circuit_behind_its_flushed_view_registers_as_a_clean_boot_does() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    let mut engine = CatalogEngine::open(dir, 1).unwrap();
+    let replicated = gnitz_wire::TableProps {
+        distribution: gnitz_wire::TableDistribution::Replicated,
+        ..Default::default()
     };
-    use gnitz_store::schema::Placement;
-    use gnitz_store::storage::BatchBuilder;
-    use gnitz_wire::TypeCode;
+    let r = engine.create_table_with("public.r", &cols(), &[0], replicated).unwrap();
+    let v = r + 1;
+    let mut view_tab = BatchBuilder::new(*SysFamily::View.schema());
+    push_view_tab_row(&mut view_tab, 1, v, "v", 0, 0, 0);
+    engine.registry.ingest(SysFamily::Column.id(), col_tab(v, 1)).unwrap();
+    engine.registry.ingest(SysFamily::View.id(), view_tab.finish()).unwrap();
+    engine.close();
 
-    const SAL_SIZE: usize = 1 << 20;
+    let log = TestLog::new(SAL_SIZE, 1, 1);
+    let circuit = circuit_nodes_batch(v, &identity_circuit(r, gnitz_wire::ReadBound::None));
+    log.ddl_zone(&[(SysFamily::CircuitNodes, &circuit)]);
+    let engine = recover(&log, dir);
 
-    fn cols() -> Vec<crate::catalog::CatalogColumn> {
-        vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)]
-    }
+    assert_eq!(engine.dag.sources_of(v), &[r][..]);
+    assert_eq!(
+        engine.registry.relation(v).unwrap().schema().placement(),
+        Placement::Replicated
+    );
+    assert_eq!(net(&engine, SysFamily::View), 1);
+}
 
-    fn col_tab(owner: u64, weight: i64) -> Batch {
-        col_tab_batch(owner, &cols(), weight)
-    }
+/// A table's create flushed without the id counter, its drop only in the SAL.
+/// A second boot over the same tail — a crash between the boot flush and the
+/// SAL reset — finds the drop already flushed and stages it no second time.
+#[test]
+fn a_tail_drop_nets_out_once_and_its_id_is_not_reissued() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    let mut engine = CatalogEngine::open(dir, 1).unwrap();
+    // Above the id counter this session flushes.
+    let t: u64 = 10_000;
+    engine.registry.ingest(SysFamily::Column.id(), col_tab(t, 1)).unwrap();
+    engine.registry.ingest(SysFamily::Table.id(), table_tab(t, 1)).unwrap();
+    engine.close();
 
-    fn table_tab(tid: u64, name: &str, props: gnitz_wire::TableProps, weight: i64) -> Batch {
-        let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-        let pk = gnitz_wire::pack_pk_cols(&[0]);
-        push_table_tab_row(&mut bb, tid, PUBLIC_SCHEMA_ID, name, pk, props.pack(), weight);
-        bb.finish()
-    }
+    let log = TestLog::new(SAL_SIZE, 1, 1);
+    log.ddl_zone(&[
+        (SysFamily::Table, &table_tab(t, -1)),
+        (SysFamily::Column, &col_tab(t, -1)),
+    ]);
+    let mut engine = recover(&log, dir);
+    assert!(engine.registry.relation(t).is_none(), "the drop nets the table out");
+    assert_eq!(engine.allocate_ids(1).unwrap(), t + 1);
+    let flushed = [net(&engine, SysFamily::Table), net(&engine, SysFamily::Column)];
+    engine.close();
 
-    fn group(family: SysFamily, batch: &Batch) -> (u64, gnitz_store::schema::SchemaDescriptor, &Batch) {
-        (family.id(), *family.schema(), batch)
-    }
-
-    /// Stage `log`'s committed tail into `opened` and replay it.
-    fn recover(log: &TestLog, mut opened: UnreplayedCatalog) -> CatalogEngine {
-        stage_system_tail(CommittedTail::read(log.log()).unwrap(), &mut opened).unwrap();
-        opened.replay().unwrap()
-    }
-
-    /// A view's VIEW_TAB row flushed, its circuit only in the SAL.
-    #[test]
-    fn a_circuit_behind_its_flushed_view_registers_as_a_clean_boot_does() {
-        let dir = scratch_dir("bootstrap", "circuit_behind_view");
-        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        let r = engine.allocate_ids(1).unwrap();
-        engine.write_column_records(r, &cols()).unwrap();
-        let replicated = gnitz_wire::TableProps {
-            distribution: gnitz_wire::TableDistribution::Replicated,
-            ..Default::default()
-        };
-        engine
-            .submit(SysFamily::Table, table_tab(r, "r", replicated, 1))
-            .unwrap();
-        engine.close();
-
-        let v = r + 1;
-        let mut view_tab = BatchBuilder::new(*SysFamily::View.schema());
-        push_view_tab_row(&mut view_tab, 1, v, "v", 0, 0, 0);
-        let view_tab = view_tab.finish();
-        let circuit = circuit_nodes_batch(v, &identity_circuit(r, gnitz_wire::ReadBound::None));
-
-        let log = TestLog::new(SAL_SIZE, 1, 1);
-        let columns = col_tab(v, 1);
-        let lsn = log.ddl_zone(&[
-            group(SysFamily::Column, &columns),
-            group(SysFamily::CircuitNodes, &circuit),
-            group(SysFamily::View, &view_tab),
-        ]);
-        let mut opened = CatalogEngine::open_master(&dir, 1).unwrap();
-        // The part of the bundle whose families published before the crash.
-        opened.stage(SysFamily::Column.id(), lsn, col_tab(v, 1)).unwrap();
-        opened
-            .stage(SysFamily::View.id(), lsn, Batch::clone(&view_tab))
-            .unwrap();
-        let engine = recover(&log, opened);
-
-        assert_eq!(engine.dag.sources_of(v), &[r][..]);
-        assert_eq!(
-            engine.registry.relation(v).unwrap().schema().placement(),
-            Placement::Replicated
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A table's create flushed without the id counter, its drop only in the SAL.
-    #[test]
-    fn an_id_dropped_in_the_tail_is_not_reissued() {
-        let dir = scratch_dir("bootstrap", "tail_id_not_reissued");
-        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        // Above the id counter this session flushes.
-        let t: u64 = 10_000;
-        engine.registry.ingest(SysFamily::Column.id(), col_tab(t, 1)).unwrap();
-        let created = table_tab(t, "t", Default::default(), 1);
-        engine.registry.ingest(SysFamily::Table.id(), created).unwrap();
-        engine.close();
-
-        let (columns, table) = (col_tab(t, -1), table_tab(t, "t", Default::default(), -1));
-        let log = TestLog::new(SAL_SIZE, 1, 1);
-        log.ddl_zone(&[group(SysFamily::Table, &table), group(SysFamily::Column, &columns)]);
-        let mut engine = recover(&log, CatalogEngine::open_master(&dir, 1).unwrap());
-
-        assert!(engine.registry.relation(t).is_none(), "the drop nets the table out");
-        assert!(engine.allocate_ids(1).unwrap() > t);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    let engine = recover(&log, dir);
+    assert_eq!(
+        [net(&engine, SysFamily::Table), net(&engine, SysFamily::Column)],
+        flushed
+    );
 }

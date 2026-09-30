@@ -211,7 +211,7 @@ fn send_owned_evicts_a_client_that_never_drains() {
 /// An attached listener hands each connection it accepts to its channel.
 #[test]
 fn an_attached_listener_delivers_accepted_connections() {
-    within(Duration::from_secs(30), || {
+    within(|| {
         let r = make_reactor();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");

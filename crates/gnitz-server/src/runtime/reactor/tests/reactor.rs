@@ -94,7 +94,7 @@ fn lease_ids_wrap_past_zero_and_skip_live_ids() {
 /// must then run on instead of arming and sleeping.
 #[test]
 fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
-    within(Duration::from_secs(30), || {
+    within(|| {
         let (r, mut writers) = reactor_with_rings(1);
         let writer = writers.pop().expect("one ring");
         let lease = r.lease_acks("test");
@@ -117,7 +117,7 @@ fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
 /// `request_shutdown` from inside a task keeps that very tick from sleeping.
 #[test]
 fn request_shutdown_keeps_the_current_tick_from_sleeping() {
-    within(Duration::from_secs(30), || {
+    within(|| {
         let r = Rc::new(make_reactor());
         let r2 = Rc::clone(&r);
         r.spawn(async move {
@@ -133,7 +133,7 @@ fn request_shutdown_keeps_the_current_tick_from_sleeping() {
 /// forever, not past it, and not for a later one — with no CQE involved.
 #[test]
 fn a_sleeping_tick_wakes_at_the_earliest_deadline() {
-    within(Duration::from_secs(30), || {
+    within(|| {
         let r = Rc::new(make_reactor());
         let start = Instant::now();
         let fired = Rc::new(Cell::new(false));

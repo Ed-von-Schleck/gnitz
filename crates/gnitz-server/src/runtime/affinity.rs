@@ -25,11 +25,6 @@ impl Pinning {
     pub fn enter_worker(&self, w: usize) -> Result<(), String> {
         pin_self(&format!("W{w}"), &self.workers[w])
     }
-
-    /// Confine the calling process to the CPUs no worker owns.
-    pub fn enter_master(&self) -> Result<(), String> {
-        pin_self("master", &self.master)
-    }
 }
 
 /// Plan the placement, log it, and pin the calling (master) process to its
@@ -49,7 +44,7 @@ pub fn pin_master(workers: usize) -> Result<Option<Pinning>, String> {
         gnitz_note!("affinity: W{w} {}", fmt_cpu_list(core));
     }
     gnitz_note!("affinity: master {}", fmt_cpu_list(&p.master));
-    p.enter_master()?;
+    pin_self("master", &p.master)?;
     Ok(Some(p))
 }
 
@@ -161,18 +156,11 @@ fn pin_self(who: &str, cpus: &[u32]) -> Result<(), String> {
 
 /// `[0, 1, 2, 3, 8]` → `"0-3,8"`, the sysfs spelling `parse_cpu_list` reads.
 fn fmt_cpu_list(cpus: &[u32]) -> String {
-    use std::fmt::Write;
-    let mut out = String::new();
-    for run in cpus.chunk_by(|a, b| a + 1 == *b) {
-        let sep = if out.is_empty() { "" } else { "," };
-        let (lo, hi) = (run[0], run[run.len() - 1]);
-        let _ = if lo == hi {
-            write!(out, "{sep}{lo}")
-        } else {
-            write!(out, "{sep}{lo}-{hi}")
-        };
-    }
-    out
+    let run = |r: &[u32]| match r {
+        [lo, .., hi] => format!("{lo}-{hi}"),
+        _ => r[0].to_string(),
+    };
+    cpus.chunk_by(|a, b| a + 1 == *b).map(run).collect::<Vec<_>>().join(",")
 }
 
 #[cfg(test)]

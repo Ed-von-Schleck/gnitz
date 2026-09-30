@@ -3,10 +3,6 @@
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
-//!
-//! Tests no single module owns live in `suites/`, a declared `mod suites;` child
-//! of this module: they reach this subsystem's surface, not any one module's
-//! private items.
 
 // This module is the `runtime` rung, the topmost of the crate's three: `main.rs`
 // parses argv and calls `server_main`. Nothing links this crate, so `pub` on an
@@ -37,7 +33,5 @@ pub(crate) use bootstrap::server_main;
 pub(crate) use sal::MAX_WORKERS;
 pub(crate) use tls::TlsArgs;
 
-#[cfg(test)]
-mod suites;
 #[cfg(test)]
 mod test_support;

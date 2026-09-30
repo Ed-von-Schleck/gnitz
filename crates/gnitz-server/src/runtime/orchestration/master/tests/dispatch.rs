@@ -1,5 +1,4 @@
 use std::rc::Rc;
-use std::time::Duration;
 
 use super::super::fixtures::test_dispatcher;
 use super::FlushRound;
@@ -65,7 +64,7 @@ fn a_round_ends_on_its_acks_or_its_first_failure() {
         ErrorAck,
         Dead,
     }
-    within(Duration::from_secs(30), || {
+    within(|| {
         for answer in [Answer::Acks, Answer::Refused, Answer::ErrorAck, Answer::Dead] {
             let pids = match answer {
                 Answer::Dead => vec![spawn_and_reap_dead(), 0],
