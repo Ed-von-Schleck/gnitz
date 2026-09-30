@@ -98,9 +98,7 @@ fn unique_pk_bench() {
 
     let mut shuffled: Vec<u64> = (0..TOTAL_ROWS as u64).collect();
     let mut rng = Rng::new(0x5EED_1234);
-    for i in (1..shuffled.len()).rev() {
-        shuffled.swap(i, rng.gen_range(i as u64 + 1) as usize);
-    }
+    rng.shuffle(&mut shuffled);
     // Keys are random where they repeat: a monotone stream would warm each
     // probe's page for the next, which production arrival order does not.
     let arms = [

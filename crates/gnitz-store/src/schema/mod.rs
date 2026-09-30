@@ -59,7 +59,6 @@ pub(crate) enum SchemaBound {
     /// dense `0..pk_len` PK list cannot express.
     PkAfterPayload,
     PkColumns,
-    PkBytes,
     /// A key column whose type has no order-preserving encoding.
     PkType(TypeCode),
     PkNullable,
@@ -71,7 +70,6 @@ impl std::fmt::Display for SchemaBound {
             SchemaBound::Columns => write!(f, "exceeds MAX_COLUMNS ({MAX_COLUMNS})"),
             SchemaBound::PkAfterPayload => write!(f, "places a key column behind a payload column"),
             SchemaBound::PkColumns => write!(f, "key exceeds MAX_PK_COLUMNS ({MAX_PK_COLUMNS})"),
-            SchemaBound::PkBytes => write!(f, "key exceeds MAX_PK_BYTES ({MAX_PK_BYTES})"),
             SchemaBound::PkType(tc) => write!(f, "keys on column type {tc}, which is not PK-eligible"),
             SchemaBound::PkNullable => write!(f, "keys on a nullable column"),
         }
@@ -92,7 +90,6 @@ pub(crate) struct DerivedSchema {
     cols: [SchemaColumn; MAX_COLUMNS],
     n: usize,
     pk_len: usize,
-    pk_bytes: usize,
 }
 
 impl DerivedSchema {
@@ -101,7 +98,6 @@ impl DerivedSchema {
             cols: [SchemaColumn::EMPTY; MAX_COLUMNS],
             n: 0,
             pk_len: 0,
-            pk_bytes: 0,
         }
     }
 
@@ -126,9 +122,6 @@ impl DerivedSchema {
         if self.pk_len == MAX_PK_COLUMNS {
             return Err(SchemaBound::PkColumns);
         }
-        if self.pk_bytes + col.size() as usize > MAX_PK_BYTES {
-            return Err(SchemaBound::PkBytes);
-        }
         if !col.type_code.is_pk_eligible() {
             return Err(SchemaBound::PkType(col.type_code));
         }
@@ -137,7 +130,6 @@ impl DerivedSchema {
         }
         self.push(col)?;
         self.pk_len += 1;
-        self.pk_bytes += col.size() as usize;
         Ok(())
     }
 
@@ -174,6 +166,9 @@ pub struct SchemaColumn {
     is_signed: u8,
 }
 
+// `SchemaDescriptor` holds `MAX_COLUMNS` of these by value.
+const _: () = assert!(std::mem::size_of::<SchemaColumn>() == 4);
+
 impl SchemaColumn {
     /// The unused-slot filler for the fixed `[SchemaColumn; MAX_COLUMNS]` arrays
     /// every schema and schema builder carries. Padding: `size == 0`; nothing
@@ -201,7 +196,7 @@ impl SchemaColumn {
         self.size
     }
 
-    /// True iff this column is a signed integer (I8/I16/I32/I64). Derived from
+    /// True iff this column's type is [`TypeCode::is_signed_int`]. Derived from
     /// `type_code` in `new()` (like `size`); read by the fixed-int fast-path
     /// comparator to pick the order-preserving sign-flip mask without a
     /// per-column type-code branch.
@@ -300,7 +295,7 @@ pub struct SchemaDescriptor {
     /// Total bytes per row of the PK region — sum of
     /// `columns[pk_indices[k]].size()` for k in 0..pk_count. Precomputed once in
     /// `new()` so per-row hot loops never re-run the sum. `u8` matches
-    /// `Batch::pk_stride()`; `new` asserts the width holds.
+    /// `Batch::pk_stride()`; the const assert below proves the width holds.
     pk_stride: u8,
     /// Byte width of the **distribution prefix** — the OPK bytes of the leading
     /// PK columns the placement keys by, the slice every write-side table-key
@@ -335,6 +330,18 @@ pub struct SchemaDescriptor {
 // a field added here is paid for at every copy — a cost the three fixed-capacity
 // arrays make invisible at the definition. The bound is a boundary, not slack.
 const _: () = assert!(std::mem::size_of::<SchemaDescriptor>() <= 360);
+
+// No column is wider than 16 bytes, so a PK within `MAX_PK_COLUMNS` is within
+// `MAX_PK_BYTES` — what every `[0u8; MAX_PK_BYTES]` scratch key relies on — and
+// its stride fits the `u8` field.
+const _: () = {
+    let mut i = 0;
+    while i < TypeCode::ALL.len() {
+        assert!(TypeCode::ALL[i].wire_stride() <= 16);
+        i += 1;
+    }
+    assert!(MAX_PK_COLUMNS * 16 <= MAX_PK_BYTES && MAX_PK_BYTES <= u8::MAX as usize);
+};
 
 const fn compute_payload_to_ci(num_columns: usize, pk_indices: &[u32]) -> [u8; MAX_COLUMNS] {
     let mut payload_to_ci = [0u8; MAX_COLUMNS];
@@ -381,18 +388,17 @@ impl SchemaDescriptor {
     /// **A `const fn` whose `assert!`s fire in release and abort the process.**
     /// An untrusted column list goes through [`Self::try_new`], which rejects
     /// what this would abort on.
-    /// A `Keyed` prefix is **normalized**: `0` (the persisted "default"
-    /// sentinel) and any value past `|PK|` (only reachable from a corrupted
-    /// catalog flag) both clamp to the full PK, so `dist_stride == pk_stride` and
-    /// routing stays byte-identical to the full-PK default. Every derived schema
+    /// A `Keyed { prefix_len: 0 }` (the persisted "default" sentinel) is
+    /// normalized to the full PK, so `dist_stride == pk_stride` and routing is
+    /// byte-identical to the full-PK default. Every derived schema
     /// (join/map/reduce/projection output, built via `new`) gets that default and
     /// is never table-key-routed.
     #[track_caller]
     pub const fn new_with_placement(cols: &[SchemaColumn], pk_indices: &[u32], placement: Placement) -> Self {
         assert!(cols.len() <= MAX_COLUMNS, "new: too many columns");
         assert!(
-            pk_indices.len() <= MAX_PK_COLUMNS,
-            "new: pk_indices.len() exceeds MAX_PK_COLUMNS",
+            !pk_indices.is_empty() && pk_indices.len() <= MAX_PK_COLUMNS,
+            "new: pk_indices.len() is outside 1..=MAX_PK_COLUMNS",
         );
 
         let (placement, dist_k) = placement.resolve(pk_indices.len());
@@ -441,20 +447,12 @@ impl SchemaDescriptor {
             stride_acc += col_size;
             // PK-list order with no inter-column padding ⇒ the running sum of the
             // first `dist_k` PK column widths is exactly the OPK byte width of the
-            // distribution prefix (`key::encode_order_preserving_pk` layout).
+            // distribution prefix (`gnitz_wire::encode_pk_tuple` layout).
             if k < dist_k {
                 dist_stride_acc += col_size;
             }
             k += 1;
         }
-        assert!(stride_acc <= u8::MAX as u16, "new: pk_stride exceeds u8 width",);
-        // Wide-path routines allocate
-        // `[0u8; MAX_PK_BYTES]` and index up to `stride`; a stride in
-        // (MAX_PK_BYTES, 255] would construct here but panic at runtime.
-        assert!(
-            stride_acc as usize <= MAX_PK_BYTES,
-            "new: pk_stride exceeds MAX_PK_BYTES",
-        );
         let pk_stride = stride_acc as u8;
         let payload_to_ci = compute_payload_to_ci(cols.len(), pk_indices);
         let payload_cmp = payload_order::compute_payload_cmp(cols, &payload_to_ci, cols.len() - pk_indices.len());
@@ -741,10 +739,7 @@ pub fn index_spec_and_schema(
     source: &SchemaDescriptor,
 ) -> Result<(KeySpec, SchemaDescriptor), String> {
     let spec = KeySpec::new(source_cols, source)?;
-    let schema = spec
-        .output_schema(source)
-        .map_err(|e| format!("Index: composite key {e}"))?;
-    Ok((spec, schema))
+    Ok((spec, spec.output_schema(source)))
 }
 
 /// Rebuild a [`SchemaDescriptor`] from a meta-schema record. Column names are
@@ -793,7 +788,8 @@ pub(crate) fn write_delta_key(round: u64, view_key: &[u8], delta_key: &mut [u8])
 
 /// The round a delta key was recorded in.
 pub(crate) fn delta_round(delta_key: &[u8]) -> u64 {
-    u64::from_be_bytes(delta_key[..8].try_into().expect("a delta key leads with its round"))
+    let tick = &delta_key[..DELTA_TICK_COL.size() as usize];
+    u64::from_be_bytes(tick.try_into().expect("a delta key leads with its round"))
 }
 
 /// The view key inside a delta key.
@@ -816,12 +812,10 @@ pub(crate) fn make_delta_schema(view: &SchemaDescriptor) -> Option<SchemaDescrip
 }
 
 const _: () = {
-    // The stamp is one U64 column ahead of a view PK, which is at most
-    // `PK_LIST_MAX_COLS` columns of at most 16 bytes each.
-    const STAMPED_COLS: usize = 1 + gnitz_wire::PK_LIST_MAX_COLS;
-    const STAMPED_BYTES: usize = 8 + gnitz_wire::PK_LIST_MAX_COLS * 16;
+    // The stamp is one U64 column ahead of a view PK of at most
+    // `PK_LIST_MAX_COLS` columns.
     assert!(
-        STAMPED_COLS <= MAX_PK_COLUMNS && STAMPED_BYTES <= MAX_PK_BYTES,
+        gnitz_wire::PK_LIST_MAX_COLS < MAX_PK_COLUMNS,
         "a _tick stamp on the widest view PK no longer fits the PK limits"
     );
 };

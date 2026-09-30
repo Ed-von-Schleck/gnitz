@@ -20,8 +20,7 @@ use gnitz_expr::RowSource;
 use gnitz_wire::{KeyRange, NARROW_PK_MAX_BYTES};
 
 use crate::schema::{
-    oob_col, ColumnLocator, DerivedSchema, SchemaBound, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode,
-    MAX_PK_COLUMNS,
+    oob_col, ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_PK_COLUMNS,
 };
 
 // ---------------------------------------------------------------------------
@@ -118,8 +117,8 @@ pub(crate) fn pk_ranges_overlap(min: &[u8], max: &[u8], lo: &[u8], hi: &[u8]) ->
 /// The `{2, 4, 8, ≥16}` arms load the dominant scalar and `U128`/wide-prefix
 /// widths straight into a register, value-equal to the pad-and-copy (a narrow
 /// value occupies the high bits, the low bits zero; `≥16` reads the
-/// order-preserving leading 16 bytes) — pinned by
-/// `pack_pk_be_specialization_matches_naive`, which covers every width. The
+/// order-preserving leading 16 bytes) — pinned at every width by
+/// `opk_byte_primitives_agree_with_memcmp_at_every_width`. The
 /// remaining arms compose the same fixed-width loads: none copies through a
 /// runtime length, which would be an out-of-line `memcpy` per key.
 ///
@@ -403,15 +402,17 @@ impl KeySpec {
     }
 
     /// The index schema this spec's entries land in: the key columns, then
-    /// `source`'s PK columns, all in the PK. `Err` only on the limits
-    /// [`Self::new`] has already checked.
-    pub(in crate::schema) fn output_schema(&self, source: &SchemaDescriptor) -> Result<SchemaDescriptor, SchemaBound> {
+    /// `source`'s PK columns, all in the PK. Infallible for a spec from
+    /// [`Self::new`], whose `index_key_types` check bounds the combined arity and
+    /// promotes every key column to a PK-eligible type.
+    pub(in crate::schema) fn output_schema(&self, source: &SchemaDescriptor) -> SchemaDescriptor {
         let mut b = DerivedSchema::new();
-        for c in &self.cols[..self.n as usize] {
-            b.push_pk(c.out)?;
-        }
-        b.push_pk_of(source)?;
-        Ok(b.finish())
+        self.columns()
+            .iter()
+            .try_for_each(|c| b.push_pk(c.out))
+            .and_then(|()| b.push_pk_of(source))
+            .expect("KeySpec::new bounds the index schema");
+        b.finish()
     }
 
     /// A base table's own PK as the degenerate span, each column at its own type, so a

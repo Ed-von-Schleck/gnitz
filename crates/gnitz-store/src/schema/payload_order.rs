@@ -129,7 +129,7 @@ impl PayloadOrder for FixedIntNonnull {
         );
         for (payload_col, col) in s.payload_columns() {
             let cs = col.size() as usize;
-            // `cs*8-1 ∈ {7,15,31,63}`: `FixedIntNonnull` admits only the eight
+            // `cs*8-1 ∈ {7,15,31,63}`: `FixedIntNonnull` admits only
             // `is_fixed_int` type codes, which are exactly the 1/2/4/8-byte
             // widths. `is_signed` is 0 for unsigned columns, so the XOR is then
             // a no-op; for signed ones it flips the MSB, putting two's-complement

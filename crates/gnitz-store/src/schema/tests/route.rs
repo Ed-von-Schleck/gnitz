@@ -1,5 +1,6 @@
 use super::*;
-use gnitz_wire::{encode_pk_column, TypeCode};
+use crate::test_rng::Rng;
+use gnitz_wire::{key_image, TypeCode};
 
 /// The largest worker count a server launches.
 const NW_MAX: usize = 64;
@@ -20,9 +21,9 @@ fn load_spread(keys: &[u128], nw: usize) -> f64 {
 fn router_spreads_structured_keys_evenly() {
     const N: u128 = 100_000;
     let sequential: Vec<u128> = (0..N).collect();
-    // i64 spanning zero, as OPK images (sign-flipped).
+    // i64 spanning zero, as key images.
     let signed: Vec<u128> = (0..N)
-        .map(|i| (i as i64 - N as i64 / 2) as u64 as u128 ^ (1u128 << 63))
+        .map(|i| key_image(TypeCode::I64, (i as i64 - N as i64 / 2) as u64 as u128))
         .collect();
     let strided: Vec<u128> = (0..N).map(|i| i * 4096).collect();
     // Compound OPK: (hi, lo) packed as one u128, one half held constant. Halves
@@ -45,73 +46,43 @@ fn router_spreads_structured_keys_evenly() {
     }
 }
 
-/// A PK region wider than `NARROW_PK_MAX_BYTES` routes on all its bytes.
-#[test]
-fn worker_for_pk_bytes_reads_a_whole_wide_region() {
-    let mut head = [0u8; 16];
-    encode_pk_column(&7u64.to_le_bytes(), TypeCode::U64, &mut head[..8]);
-    encode_pk_column(&9u64.to_le_bytes(), TypeCode::U64, &mut head[8..]);
-
-    let mut seen = std::collections::HashSet::new();
-    for tail in 0..64u64 {
-        let mut opk = [0u8; 24];
-        opk[..16].copy_from_slice(&head);
-        encode_pk_column(&tail.to_le_bytes(), TypeCode::U64, &mut opk[16..]);
-        assert!(opk.len() > NARROW_PK_MAX_BYTES);
-        for nw in [1usize, 2, 3, 7, NW_MAX] {
-            assert!(worker_for_pk_bytes(&opk, nw) < nw, "route out of range at nw={nw}");
-        }
-        seen.insert(worker_for_pk_bytes(&opk, 8));
-    }
-    assert!(seen.len() > 1, "the region past 16 bytes must reach the route");
-}
-
 /// Independent 128-bit keys (the UUID shape) spread evenly; their sampling
 /// noise needs a looser bound than the structured shapes.
 #[test]
 fn router_spreads_random_keys_evenly() {
-    const N: usize = 500_000;
-    // SplitMix64-style stream over both halves — deterministic, no rand dep.
-    let mut s: u64 = 0x243f_6a88_85a3_08d3;
-    let mut next = || {
-        s = s.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = s;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    };
-    let keys: Vec<u128> = (0..N).map(|_| ((next() as u128) << 64) | next() as u128).collect();
+    let mut rng = Rng::new(0x243f_6a88_85a3_08d3);
+    let keys: Vec<u128> = (0..500_000).map(|_| rng.gen_u128()).collect();
     for nw in [1, 2, 3, 4, 8, 16, 32, NW_MAX] {
         let spread = load_spread(&keys, nw);
         assert!(spread <= 1.05, "random keys: {spread:.4}x the mean at nw={nw}");
     }
 }
 
-/// A narrow OPK region routes as `worker_for_key` of its widened value.
+/// A narrow OPK region routes as the key image it spells, at every width that
+/// holds it — so the route is a function of the key, never of its physical
+/// width. A wide region routes on all its bytes.
 #[test]
-fn worker_for_pk_bytes_matches_widened_key() {
-    for &(tc, sz) in &[
-        (TypeCode::U8, 1usize),
-        (TypeCode::I8, 1),
-        (TypeCode::U16, 2),
-        (TypeCode::I16, 2),
-        (TypeCode::U32, 4),
-        (TypeCode::I32, 4),
-        (TypeCode::U64, 8),
-        (TypeCode::I64, 8),
-        (TypeCode::U128, 16),
-    ] {
-        for v in [0i128, 1, -1, 7, -7, 127, -128, 1000, -1000, i32::MAX as i128] {
-            let le = (v as u128).to_le_bytes();
-            let mut opk = [0u8; 16];
-            encode_pk_column(&le[..sz], tc, &mut opk[..sz]);
-            for nw in [1usize, 2, 3, 4, 7, 16, NW_MAX] {
+fn worker_for_pk_bytes_routes_a_narrow_region_by_its_value() {
+    for v in [0u128, 1, 0x7F, 0x80, 0xFFFF, 1 << 63, u64::MAX as u128, u128::MAX] {
+        let be = v.to_be_bytes();
+        let min_width = 16 - (v.leading_zeros() as usize / 8);
+        for nw in [1, 3, 7, NW_MAX] {
+            for w in min_width.max(1)..=NARROW_PK_MAX_BYTES {
                 assert_eq!(
-                    worker_for_pk_bytes(&opk[..sz], nw),
-                    worker_for_key(widen_pk_be(&opk[..sz]), nw),
-                    "tc={tc} v={v} nw={nw}",
+                    worker_for_pk_bytes(&be[16 - w..], nw),
+                    worker_for_key(v, nw),
+                    "v={v:#x} width={w} nw={nw}"
                 );
             }
         }
     }
+
+    let routes: std::collections::HashSet<usize> = (0..64u8)
+        .map(|tail| {
+            let mut wide = [7u8; NARROW_PK_MAX_BYTES + 8];
+            wide[NARROW_PK_MAX_BYTES + 7] = tail;
+            worker_for_pk_bytes(&wide, 8)
+        })
+        .collect();
+    assert!(routes.len() > 1, "the bytes past 16 must reach the route");
 }

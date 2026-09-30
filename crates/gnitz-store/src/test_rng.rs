@@ -27,4 +27,16 @@ impl Rng {
     pub(crate) fn gen_range(&mut self, max: u64) -> u64 {
         self.next_u64() % max
     }
+
+    /// A uniformly drawn element of `items`.
+    pub(crate) fn pick<T: Clone>(&mut self, items: &[T]) -> T {
+        items[self.gen_range(items.len() as u64) as usize].clone()
+    }
+
+    /// Fisher–Yates, in place.
+    pub(crate) fn shuffle<T>(&mut self, items: &mut [T]) {
+        for i in (1..items.len()).rev() {
+            items.swap(i, self.gen_range(i as u64 + 1) as usize);
+        }
+    }
 }

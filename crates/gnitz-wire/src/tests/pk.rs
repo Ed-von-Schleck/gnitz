@@ -116,13 +116,18 @@ fn widen_pk_be_matches_the_general_form() {
 }
 
 /// A `MAX_PK_BYTES` key fits, and narrowing a buffer re-zeroes the tail it
-/// gives up, so widening it again reads zeros there rather than stale bytes.
+/// gives up, so widening it again reads zeros there rather than stale bytes, and
+/// the narrowed key equals, hashes and looks up as a fresh one.
 #[test]
 fn a_pk_buf_holds_max_pk_bytes_and_narrows_clean() {
     let mut t = PkBuf::from_bytes(&[0xab; crate::MAX_PK_BYTES]);
     assert_eq!(t.width(), crate::MAX_PK_BYTES);
     t.write(4, |b| b.fill(1));
     assert_eq!(t.widened(8).pk_bytes(), [1, 1, 1, 1, 0, 0, 0, 0]);
+    let fresh = PkBuf::from_bytes(&[1; 4]);
+    assert_eq!(t, fresh);
+    let set = std::collections::HashSet::from([fresh]);
+    assert!(set.contains(&t) && set.contains(&[1u8; 4][..]));
 }
 
 #[test]
