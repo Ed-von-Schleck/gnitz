@@ -42,6 +42,22 @@ fn parse_args_rejects_a_bad_level() {
 }
 
 #[test]
+fn parse_args_checks_the_tls_flags_against_each_other() {
+    assert!(parse_args(&argv(&["/data", "/sock"]), None).unwrap().tls.is_none());
+    for (flags, names) in [
+        (&["--tls-listen=127.0.0.1:0", "--tls-cert=c.pem"][..], "--tls-key"),
+        (&["--tls-listen=127.0.0.1:0", "--tls-key=k.pem"][..], "--tls-cert"),
+        (&["--allow-unauthenticated"][..], "--tls-listen"),
+        (&["--tls-client-ca=ca.pem"][..], "--tls-listen"),
+    ] {
+        let e = parse_args(&argv(&[flags, &["/data", "/sock"]].concat()), None)
+            .err()
+            .unwrap_or_else(|| panic!("{flags:?} is refused"));
+        assert!(e.contains(names), "{flags:?}: {e}");
+    }
+}
+
+#[test]
 fn parse_args_collects_the_tls_flags() {
     let args = parse_args(
         &argv(&[
@@ -61,10 +77,9 @@ fn parse_args_collects_the_tls_flags() {
         (args.data_dir.as_str(), args.socket_path.as_str(), args.workers),
         ("/data", "/sock", 3)
     );
-    let tls = args.tls;
-    assert_eq!(tls.listen, Some("127.0.0.1:0".parse().unwrap()));
-    assert_eq!(tls.cert.as_deref(), Some("c.pem"));
-    assert_eq!(tls.key.as_deref(), Some("k.pem"));
+    let tls = args.tls.expect("--tls-listen asks for a listener");
+    assert_eq!(tls.listen, "127.0.0.1:0".parse().unwrap());
+    assert_eq!(tls.cert_key, Some(("c.pem".to_string(), "k.pem".to_string())));
     assert_eq!(tls.client_ca.as_deref(), Some("ca.pem"));
     assert!(tls.allow_unauthenticated);
 }

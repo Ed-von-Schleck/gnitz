@@ -28,8 +28,8 @@ pub struct Peer {
 }
 
 enum Transport {
-    /// AF_UNIX stream connection: the reactor sends on the socket directly.
-    Unix(Rc<Reactor>),
+    /// The socket's own bytes: the reactor sends on it directly.
+    Plain(Rc<Reactor>),
     /// TLS 1.3 over TCP; record I/O lives in `runtime::tls`.
     Tls(Rc<TlsShared>),
 }
@@ -41,7 +41,7 @@ impl Peer {
         let transport = match tls {
             None => {
                 reactor.register_conn(&conn, Box::new(Plain::new()));
-                Transport::Unix(Rc::clone(reactor))
+                Transport::Plain(Rc::clone(reactor))
             }
             Some(cfg) => Transport::Tls(TlsShared::start(Rc::clone(reactor), Rc::clone(&conn), Arc::clone(cfg))),
         };
@@ -130,7 +130,7 @@ impl Peer {
 
     async fn send_raw(&self, body: SendBody) -> Result<(), PeerGone> {
         match &self.transport {
-            Transport::Unix(r) => r.send_owned(&self.conn, body).await,
+            Transport::Plain(r) => r.send_owned(&self.conn, body).await,
             Transport::Tls(t) => t.send(body).await,
         }
     }

@@ -150,6 +150,22 @@ fn close_ends_an_armed_recv() {
     );
 }
 
+/// Under an egress owner, `retire` leaves the socket open to it and wakes it
+/// once; `fail` shuts the socket down now, whoever owns egress.
+#[test]
+fn retire_defers_the_shutdown_to_the_egress_owner_and_fail_does_not() {
+    let r = make_reactor();
+    let (conn, partner) = client_pair(&r);
+    let (owner, mut woken) = chan::unbounded::<()>();
+    conn.set_egress_owner(owner);
+
+    conn.retire();
+    assert!(woken.try_recv().is_some() && woken.try_recv().is_none(), "one wake");
+    assert_eq!(read_nonblocking(&partner, 1), None, "the socket stays open");
+    conn.fail();
+    assert_eq!(read_nonblocking(&partner, 1), Some(vec![]), "fail shuts it down");
+}
+
 /// A payload far larger than the socket buffers completes across many short sends.
 #[test]
 fn send_owned_loops_until_full_payload_sent_over_socketpair() {

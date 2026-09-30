@@ -23,9 +23,9 @@ const CIPHER_WINDOW_BYTES: usize = 64 * 1024;
 
 /// The most plaintext one TLS record carries.
 const TLS_MAX_FRAGMENT: usize = 16 * 1024;
-/// A TLS 1.2 AEAD record's bytes beyond its plaintext: header, explicit nonce,
-/// tag.
-const TLS_RECORD_OVERHEAD: usize = 5 + 8 + 16;
+/// A TLS 1.3 record's bytes beyond its plaintext: header, inner content type,
+/// AEAD tag.
+const TLS_RECORD_OVERHEAD: usize = 5 + 1 + 16;
 
 /// Feed one socket chunk of ciphertext through rustls, enqueueing the plaintext
 /// frames it yields on `q`.
@@ -65,7 +65,8 @@ pub(crate) struct TlsShared {
     conn: Rc<ClientConn>,
     /// The codec state, and nothing else. Never borrowed across an await.
     state: RefCell<rustls::ServerConnection>,
-    /// Held across every ciphertext extraction and send. Teardown never takes it.
+    /// Held across every ciphertext extraction and send. `ClientConn::retire` and
+    /// `fail` never take it, so an eviction never waits on a stalled send.
     send_lock: AsyncRwLock,
 }
 
@@ -77,8 +78,8 @@ impl TlsShared {
         /// so how much ciphertext one encrypt-and-send turn carries.
         const SEND_BUFFER_BYTES: usize = 256 * 1024;
 
-        let mut sess =
-            rustls::ServerConnection::new(cfg).expect("server_crypto built a session from this config at boot");
+        let mut sess = rustls::ServerConnection::new(cfg)
+            .expect("a session fails to build only on a max_fragment_size TlsArgs::resolve never sets");
         sess.set_buffer_limit(Some(SEND_BUFFER_BYTES));
         let (flush_tx, flush_rx) = chan::unbounded::<()>();
         let tls = Rc::new(TlsShared {
@@ -112,25 +113,18 @@ impl TlsShared {
         self.reactor.send_owned(&self.conn, SendBody::Pooled(out)).await
     }
 
-    async fn flush_queued(&self) {
-        let send = self.send_lock.write().await;
-        let _ = self.flush_records(&send, 0).await;
-    }
-
     /// Encrypt and send `body` under one `send_lock` hold; rustls sizes the chunks.
     pub(crate) async fn send(&self, body: SendBody) -> Result<(), PeerGone> {
         let send = self.send_lock.write().await;
-        let len = body.bytes().len();
         let mut off = 0;
-        let mut flushed = 0;
-        while off < len {
-            {
+        while off < body.bytes().len() {
+            let n = {
                 let mut sess = self.state.borrow_mut();
                 if self.conn.is_gone() {
                     return Err(PeerGone);
                 }
                 match sess.writer().write(&body.bytes()[off..]) {
-                    Ok(n) if n > 0 => off += n,
+                    Ok(n) if n > 0 => n,
                     // rustls short-writes only on a full outgoing buffer, which the
                     // previous turn's flush emptied: a zero here is a wedged session.
                     _ => {
@@ -138,16 +132,16 @@ impl TlsShared {
                         return Err(PeerGone);
                     }
                 }
+            };
+            off += n;
+            if off == body.bytes().len() {
+                // rustls holds every byte now: release the body — a W2M slot — before the send.
+                drop(body);
+                return self.flush_records(&send, n).await;
             }
-            if off == len {
-                break;
-            }
-            self.flush_records(&send, off - flushed).await?;
-            flushed = off;
+            self.flush_records(&send, n).await?;
         }
-        // rustls holds every byte now: release the body — a W2M slot — before the send.
-        drop(body);
-        self.flush_records(&send, off - flushed).await
+        Ok(())
     }
 }
 
@@ -165,9 +159,6 @@ impl RecvFilter for TlsIngress {
     }
 
     fn ingest(&mut self, n: usize, q: &mut RecvQueue) -> Result<(), RecvEnd> {
-        // The queue wakes the waiter itself, and only on a completed frame — a
-        // large push therefore parks `connection_loop` once per frame, not once
-        // per window of ciphertext.
         let mut sess = self.tls.state.borrow_mut();
         // SAFETY: `n` counts bytes the completed recv wrote into the window.
         let cipher = unsafe { self.cipher[..n].assume_init_ref() };
@@ -181,17 +172,22 @@ impl RecvFilter for TlsIngress {
 
 /// Ships what rustls queues outside a send — handshake flights, alerts, the
 /// close_notify — and shuts the socket down once the connection is gone.
-async fn flusher(conn: Rc<TlsShared>, mut rx: chan::Receiver<()>) {
-    while !conn.conn.is_gone() {
-        conn.flush_queued().await;
+async fn flusher(tls: Rc<TlsShared>, mut rx: chan::Receiver<()>) {
+    loop {
+        let gone = tls.conn.is_gone();
+        if gone {
+            tls.state.borrow_mut().send_close_notify();
+        }
+        let _ = tls.flush_records(&tls.send_lock.write().await, 0).await;
+        if gone {
+            tls.conn.shutdown();
+            return;
+        }
         // The queue is a flag, not a stream: park on the next notification, then
         // drop whatever piled up behind it.
         rx.recv().await;
         while rx.try_recv().is_some() {}
     }
-    conn.state.borrow_mut().send_close_notify();
-    conn.flush_queued().await;
-    conn.conn.shutdown();
 }
 
 #[cfg(test)]

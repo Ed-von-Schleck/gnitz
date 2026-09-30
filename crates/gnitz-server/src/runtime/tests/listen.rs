@@ -31,13 +31,8 @@ fn bind_listeners_publishes_the_tls_files_and_accepted_sockets_inherit_the_optio
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().to_str().unwrap();
     let sock = dir.path().join("s.sock");
-    let tls = TlsArgs {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        ..TlsArgs::default()
-    }
-    .resolve()
-    .unwrap();
-    let mut listeners = bind_listeners(data_dir, sock.to_str().unwrap(), tls).expect("bind");
+    let tls = TlsArgs::on("127.0.0.1:0").resolve().unwrap();
+    let mut listeners = bind_listeners(data_dir, sock.to_str().unwrap(), Some(tls)).expect("bind");
 
     let endpoint = std::fs::read_to_string(dir.path().join(TLS_ENDPOINT_FILE)).unwrap();
     let addr: SocketAddr = endpoint.trim().parse().expect("a connectable address");
@@ -80,13 +75,8 @@ fn a_failed_tcp_bind_exposes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("s.sock");
     let taken = TcpListener::bind("127.0.0.1:0").unwrap();
-    let tls = TlsArgs {
-        listen: Some(taken.local_addr().unwrap()),
-        ..TlsArgs::default()
-    }
-    .resolve()
-    .unwrap();
-    assert!(bind_listeners(dir.path().to_str().unwrap(), sock.to_str().unwrap(), tls).is_err());
+    let tls = TlsArgs::on(&taken.local_addr().unwrap().to_string()).resolve().unwrap();
+    assert!(bind_listeners(dir.path().to_str().unwrap(), sock.to_str().unwrap(), Some(tls)).is_err());
     for path in [
         sock,
         dir.path().join(TLS_ENDPOINT_FILE),

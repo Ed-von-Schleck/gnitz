@@ -112,20 +112,22 @@ fn parse_workers(val: &str) -> Result<u32, String> {
     }
 }
 
-/// What argv asks for, checked for syntax only.
+/// What argv asks for: each flag parsed, and the TLS flags checked against each
+/// other. `tls` is `None` when no TLS listener was asked for.
 struct Args {
     data_dir: String,
     socket_path: String,
     workers: u32,
     level: Level,
-    tls: runtime::TlsArgs,
+    tls: Option<runtime::TlsArgs>,
 }
 
 /// Parse argv (program name excluded), with `GNITZ_LOG_LEVEL` as `env_level`.
 fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> {
     let mut level = env_level.map(parse_level).transpose()?.unwrap_or(Level::Quiet);
     let mut workers = 1;
-    let mut tls = runtime::TlsArgs::default();
+    let (mut tls_listen, mut cert, mut key, mut client_ca) = (None, None, None, None);
+    let mut allow_unauthenticated = false;
     let mut positional: Vec<&String> = Vec::new();
     for arg in args {
         if let Some(val) = arg.strip_prefix("--log-level=") {
@@ -136,15 +138,15 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
             let addr = val
                 .parse()
                 .map_err(|_| format!("invalid --tls-listen address {val:?} (expected IP:PORT)"))?;
-            tls.listen = Some(addr);
+            tls_listen = Some(addr);
         } else if let Some(val) = arg.strip_prefix("--tls-cert=") {
-            tls.cert = Some(val.to_string());
+            cert = Some(val.to_string());
         } else if let Some(val) = arg.strip_prefix("--tls-key=") {
-            tls.key = Some(val.to_string());
+            key = Some(val.to_string());
         } else if let Some(val) = arg.strip_prefix("--tls-client-ca=") {
-            tls.client_ca = Some(val.to_string());
+            client_ca = Some(val.to_string());
         } else if arg == "--allow-unauthenticated" {
-            tls.allow_unauthenticated = true;
+            allow_unauthenticated = true;
         } else if arg.starts_with('-') {
             return Err(format!("unknown option {arg:?}"));
         } else if positional.len() == 2 {
@@ -155,6 +157,24 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
     }
     let [data_dir, socket_path] = positional[..] else {
         return Err("missing required arguments <data_dir> <socket_path>".to_string());
+    };
+    let tls = match tls_listen {
+        Some(listen) => Some(runtime::TlsArgs {
+            listen,
+            cert_key: match (cert, key) {
+                (None, None) => None,
+                (Some(c), Some(k)) => Some((c, k)),
+                _ => return Err("--tls-cert and --tls-key must be given together".to_string()),
+            },
+            client_ca,
+            allow_unauthenticated,
+        }),
+        None if cert.is_some() || key.is_some() || client_ca.is_some() || allow_unauthenticated => {
+            return Err(
+                "--tls-cert, --tls-key, --tls-client-ca and --allow-unauthenticated require --tls-listen".to_string(),
+            );
+        }
+        None => None,
     };
     Ok(Args {
         data_dir: data_dir.clone(),

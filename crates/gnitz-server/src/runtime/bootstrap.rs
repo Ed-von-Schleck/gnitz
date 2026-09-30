@@ -256,7 +256,7 @@ fn worker_boot_recovery(
 /// enters the executor event loop.
 ///
 /// Returns 0 on clean exit, non-zero on error.
-pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, tls: TlsArgs) -> i32 {
+pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<TlsArgs>) -> i32 {
     match run_server(data_dir, socket_path, num_workers, tls) {
         Ok(rc) => rc,
         Err(e) => {
@@ -483,8 +483,8 @@ async fn master_post_fork_recovery(
     Ok(())
 }
 
-fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: TlsArgs) -> Result<i32, String> {
-    let tls = tls.resolve()?;
+fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<TlsArgs>) -> Result<i32, String> {
+    let tls = tls.map(TlsArgs::resolve).transpose()?;
 
     // Child directories + shard files.
     posix_io::raise_fd_limit(65536);
