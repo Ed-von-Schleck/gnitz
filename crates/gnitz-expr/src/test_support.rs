@@ -1,10 +1,6 @@
-//! Owned-buffer stand-ins for a physical batch and schema, so the evaluator's
-//! tests run entirely inside this crate.
-//!
-//! The store's and the client's batches both live in crates that depend on this
-//! one, so neither is reachable from here — and driving every kernel through a
-//! batch and a schema they were not written for is what holds the addressing
-//! paths to the [`BatchView`] / [`ColumnTable`] contracts alone.
+//! Owned-buffer stand-ins for a physical batch and schema. The real ones live in
+//! crates that depend on this one, and a stand-in holds the kernels to the
+//! [`BatchView`] / [`ColumnTable`] contracts alone.
 
 use std::fmt::Debug;
 
@@ -13,14 +9,12 @@ use gnitz_wire::TypeCode;
 use crate::batch::MORSEL;
 use crate::eval::Resolved;
 use crate::{
-    BatchView, ColumnTable, ExprResults, LogicalInstr, LogicalProgram, MapEval, MapTarget, Reg, RowFilter, RowSource,
-    ScalarEval, SchemaFacts, Sink,
+    BatchView, ColumnLocator, ColumnTable, ExprResults, LogicalInstr, LogicalProgram, MapEval, MapTarget, Reg,
+    RowFilter, RowSource, ScalarEval, SchemaFacts, Sink,
 };
 
-/// A [`BatchView`] over owned buffers, laid out region-wise like the physical
-/// batch: one packed OPK PK region, one null-bitmap word per row, and one
-/// contiguous buffer per payload slot. Also a [`MapTarget`], so a map writes
-/// into the same layout a test reads through the production locators.
+/// A [`BatchView`] and [`MapTarget`] over owned buffers, laid out region-wise
+/// like the physical batch.
 pub struct TestView {
     rows: usize,
     pk_stride: usize,
@@ -46,22 +40,28 @@ impl TestView {
             blob: Vec::new(),
         };
         for row in 0..rows {
-            v.set_key(schema, row, &vec![row as u128 + 1; schema.pk_cols().len()]);
+            for &ci in schema.pk_cols() {
+                v.set_native(schema, row, ci as usize, row as u128 + 1);
+            }
         }
         v
     }
 
-    /// Write `row`'s key from one native value per PK column, in PK-list order,
-    /// through the schema's own key encoder.
-    pub fn set_key(&mut self, schema: &TestSchema, row: usize, natives: &[u128]) {
-        let key = schema.opk_key_cols(natives);
-        self.pk[row * self.pk_stride..(row + 1) * self.pk_stride].copy_from_slice(key.pk_bytes());
+    /// Write column `ci` of `row` from the low bytes of `native`, wherever the
+    /// schema places the column.
+    pub fn set_native(&mut self, schema: &TestSchema, row: usize, ci: usize, native: u128) {
+        let loc = schema.locate(ci);
+        let bytes = &native.to_le_bytes()[..loc.size()];
+        match loc {
+            ColumnLocator::Pk { byte_off, type_code, .. } => {
+                let at = row * self.pk_stride + byte_off as usize;
+                gnitz_wire::encode_pk_column(bytes, type_code, &mut self.pk[at..at + bytes.len()]);
+            }
+            ColumnLocator::Payload { slot, .. } => self.set_payload(row, slot as usize, bytes),
+        }
     }
 
     /// Write `native` into the low bytes of `row`'s cell in payload slot `pi`.
-    /// The cell stride comes from the column buffer, not from `native.len()`, so
-    /// a narrower value lands correctly in a wider cell instead of shifting
-    /// every subsequent row.
     pub fn set_payload(&mut self, row: usize, pi: usize, native: &[u8]) {
         let base = row * self.stride(pi);
         self.cols[pi][base..base + native.len()].copy_from_slice(native);
@@ -92,17 +92,14 @@ impl TestView {
         gnitz_wire::write_u64_le(&mut self.nulls, row * 8, word);
     }
 
-    /// A `len`-row view whose row `i` is this one's row `map(i)`. A string cell
-    /// keeps its heap offset, so the blob is shared verbatim.
-    pub fn tiled(&self, len: usize, map: impl Fn(usize) -> usize) -> TestView {
+    /// A view whose row `i` is this one's row `source[i]`. A string cell keeps
+    /// its heap offset, so the blob is shared verbatim.
+    pub fn tiled(&self, source: &[usize]) -> TestView {
         let copy = |src: &[u8], w: usize| -> Vec<u8> {
-            (0..len)
-                .flat_map(|i| &src[map(i) * w..(map(i) + 1) * w])
-                .copied()
-                .collect()
+            source.iter().flat_map(|&r| &src[r * w..(r + 1) * w]).copied().collect()
         };
         TestView {
-            rows: len,
+            rows: source.len(),
             pk_stride: self.pk_stride,
             pk: copy(&self.pk, self.pk_stride),
             nulls: copy(&self.nulls, 8),
@@ -295,13 +292,17 @@ pub fn map_prog(
         .expect("test map must validate")
 }
 
-/// `read(ev, mb)`, held to what makes a per-row result trustworthy beyond the
-/// rows `mb` happens to hold: a row's result is a function of that row alone,
-/// whichever word or morsel it lands in, and the `no_nulls` arm agrees with the
-/// nullable one it skips. So every read is repeated over `mb`'s rows cycled
-/// across several morsels, and over each row repeated to fill whole 64-row
-/// words — the regime where a word-at-a-time kernel takes its uniform-word
-/// shortcuts — on each arm the program can run.
+/// Which of `n` rows each row of a longer batch copies: the rows cycled across
+/// several morsels, and each row repeated to fill a whole word.
+fn placements(n: usize) -> [(&'static str, Vec<usize>); 2] {
+    [
+        ("cycled across morsels", (0..2 * MORSEL + 37).map(|i| i % n).collect()),
+        ("filling whole words", (0..n.min(128) * 64).map(|i| i / 64).collect()),
+    ]
+}
+
+/// `read(ev, mb)`, asserted to give each row the same result wherever it is
+/// placed and on every arm the program can run.
 fn checked<E: Resolved, T: PartialEq + Debug>(
     ev: &mut E,
     mb: &TestView,
@@ -309,27 +310,18 @@ fn checked<E: Resolved, T: PartialEq + Debug>(
 ) -> Vec<T> {
     let n = mb.row_count();
     let want = read(ev, mb);
+    if n == 0 {
+        return want;
+    }
     let fast = ev.no_nulls();
     let arms: &[bool] = if fast { &[true, false] } else { &[false] };
     for &no_nulls in arms {
         ev.set_no_nulls(no_nulls);
-        assert_eq!(read(ev, mb), want, "the nullable arm disagrees with no_nulls");
-        if n == 0 {
-            continue;
-        }
-        for (label, len, blocked) in [
-            ("cycled", 2 * MORSEL + 37, false),
-            ("word-blocked", n.min(128) * 64, true),
-        ] {
-            let map = |i: usize| if blocked { i / 64 } else { i % n };
-            let got = read(ev, &mb.tiled(len, map));
-            for (i, got) in got.iter().enumerate() {
-                assert_eq!(
-                    got,
-                    &want[map(i)],
-                    "{label} row {i} (base row {}), no_nulls={no_nulls}",
-                    map(i)
-                );
+        assert_eq!(read(ev, mb), want, "no_nulls={no_nulls}");
+        for (label, source) in placements(n) {
+            let got = read(ev, &mb.tiled(&source));
+            for (i, (got, &r)) in got.iter().zip(&source).enumerate() {
+                assert_eq!(got, &want[r], "{label}: row {i} is row {r}, no_nulls={no_nulls}");
             }
         }
     }
@@ -354,9 +346,7 @@ pub fn row_strs(ev: &mut ScalarEval, mb: &TestView) -> Vec<Option<Vec<u8>>> {
     })
 }
 
-/// Run `ev` as a filter and report a per-row verdict — the shape almost every
-/// filter test wants, since `RowFilter::ranges` reports runs rather than rows.
-/// See [`checked`].
+/// Each row's filter verdict — see [`checked`].
 pub fn passing_rows(ev: &mut RowFilter, mb: &TestView) -> Vec<bool> {
     checked(ev, mb, |ev, mb| {
         let mut passed = vec![false; mb.row_count()];
@@ -367,11 +357,22 @@ pub fn passing_rows(ev: &mut RowFilter, mb: &TestView) -> Vec<bool> {
     })
 }
 
-/// The runs `ev` reports, verbatim, each checked to be a non-empty run inside
-/// the batch. The buffer is seeded with a stale entry, so a `ranges` that
-/// appended rather than cleared fails here.
+/// The maximal runs of `true` in `verdicts`, half-open.
+pub fn runs(verdicts: &[bool]) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for (row, _) in verdicts.iter().enumerate().filter(|(_, &v)| v) {
+        match out.last_mut() {
+            Some((_, e)) if *e == row => *e += 1,
+            _ => out.push((row, row + 1)),
+        }
+    }
+    out
+}
+
+/// The runs `ev` reports, each checked to be a non-empty run inside the batch.
 pub fn passing_ranges(ev: &mut RowFilter, mb: &TestView) -> Vec<(usize, usize)> {
-    let mut ranges = vec![(usize::MAX, usize::MAX)];
+    let stale = (usize::MAX, usize::MAX);
+    let mut ranges = vec![stale];
     ev.ranges(mb, &mut ranges);
     let n = mb.row_count();
     for &(s, e) in &ranges {
@@ -380,10 +381,6 @@ pub fn passing_ranges(ev: &mut RowFilter, mb: &TestView) -> Vec<(usize, usize)> 
     ranges
 }
 
-/// `IS NULL` / `IS NOT NULL` over column `col`. The two read one null-bitmap bit
-/// at opposite polarity and share one instruction, so a fixture names the
-/// polarity rather than spelling the struct literal — which rustfmt would break
-/// across four lines at every call site.
 pub fn is_null_op(col: u32) -> LogicalInstr {
     LogicalInstr::IsNull { col, invert: false }
 }

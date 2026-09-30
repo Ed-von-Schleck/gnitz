@@ -112,11 +112,8 @@ fn each_op_answers_its_calendar_anchor() {
     assert!(days_to_micros(i64::MAX / 2).1, "a day count past i64 micros is NULL");
 }
 
-/// The laws tying the ops together, over days across both eras and times of
-/// day at both ends: a DATE and a TIMESTAMP on the same day answer every date
-/// field alike, a truncation is idempotent, lands at or below its operand and
-/// keeps the field of its own unit, the week starts on a Monday, and a year and
-/// a month on their first day.
+/// The laws tying the ops together, over days of both eras and times of day at
+/// both ends.
 #[test]
 fn every_op_obeys_the_calendar_laws() {
     use CalendarOp as C;

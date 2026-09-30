@@ -6,12 +6,8 @@ use crate::test_support::{TestSchema, TestView};
 use crate::{cmp_order_keys, order_locators, ColumnLocator, OrderLocator, SchemaFacts};
 use gnitz_wire::{FixedInt, OrderKey, TypeCode};
 
-/// Every read a locator offers, over every PK-eligible type, from both regions
-/// holding the same values: a PK column at a non-zero offset of a compound key,
-/// and a payload slot numbered past another. Each read is held to the value's
-/// own encoding rather than to the other arm — the OPK image, the native bytes,
-/// the widened integer, the key promoted to every type that can hold it, the
-/// order between any two rows — and only the payload arm reads its null bit.
+/// Every locator read of every key type, from a key column and from a payload
+/// slot holding the same values, against the value's own encoding.
 #[test]
 fn every_locator_read_agrees_with_the_values_encoding() {
     const PATTERNS: &[u128] = &[
@@ -38,16 +34,19 @@ fn every_locator_read_agrees_with_the_values_encoding() {
     for &tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
         let w = tc.wire_stride();
         let schema = TestSchema::new(
-            &[(TypeCode::U16, false), (tc, false), (TypeCode::I64, true), (tc, true)],
+            &[
+                (TypeCode::U16, false), // key column 0
+                (tc, false),            // key column 1, at byte 2
+                (TypeCode::I64, true),  // payload slot 0
+                (tc, true),             // payload slot 1
+            ],
             &[0, 1],
         );
         let natives: Vec<Vec<u8>> = PATTERNS.iter().map(|p| p.to_le_bytes()[..w].to_vec()).collect();
         let mut v = TestView::for_schema(&schema, PATTERNS.len());
-        for (row, native) in natives.iter().enumerate() {
-            let mut wide = [0u8; 16];
-            wide[..w].copy_from_slice(native);
-            v.set_key(&schema, row, &[7, u128::from_le_bytes(wide)]);
-            v.set_payload(row, 1, native);
+        for (row, &p) in PATTERNS.iter().enumerate() {
+            v.set_native(&schema, row, 1, p);
+            v.set_native(&schema, row, 3, p);
             v.set_null_word(row, u64::from(row % 2 == 0) | u64::from(row % 3 == 0) << 1);
         }
         let (from_pk, from_payload) = (schema.locate(1), schema.locate(3));

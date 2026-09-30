@@ -1,16 +1,11 @@
-//! Retired-instruction benchmarks for the evaluator's kernels — `#[ignore]`d, so
-//! `make test` never runs them, and meaningless in a debug build.
+//! Retired-instruction benchmarks for the evaluator's kernels, `#[ignore]`d and
+//! meaningful only in release. Build first, so `perf` does not count the
+//! compile, then run a bench at two pass counts and difference them:
 //!
-//! Each prints nothing useful on its own: run it at two `GNITZ_BENCH_PASSES`
-//! counts and difference them, so batch setup and process start cancel out. Each
-//! bench's own doc carries its `perf` invocation. Wall-clock on the development
-//! machines swings far wider than the effects being measured, so it is never
-//! reported — judge on `perf stat -e instructions:u`.
-//!
-//! Every bench still *builds and checks* every shape it knows; the `GNITZ_BENCH_*`
-//! selectors cut only the driven loop, so a differenced pair attributes its cost
-//! to the one shape named rather than to their sum. [`selected`] is what makes a
-//! misspelled selector fail loudly instead of differencing to a 0 % effect.
+//!   cargo build -p gnitz-expr --release --tests
+//!   GNITZ_BENCH_PASSES=<1, then 201> <GNITZ_BENCH_* selectors> \
+//!     perf stat -e instructions:u cargo test -p gnitz-expr --release <bench> \
+//!     -- --ignored --nocapture --test-threads=1
 
 use gnitz_wire::{FixedInt, TypeCode};
 
@@ -26,11 +21,47 @@ use crate::{
     RowFilter, ScalarEval, Sink,
 };
 
-/// Assert the `GNITZ_BENCH_*` selector matched at least one of the shapes the
-/// bench built. A misspelled selector would otherwise drive nothing and
-/// difference to a 0 % effect instead of failing.
-fn selected(var: &str, only: &str, count: usize) {
-    assert!(count > 0, "{var} matched nothing: {only:?}");
+/// The one case a `GNITZ_BENCH_*` variable drives, every case when unset; every
+/// case is still built and checked. A value that names no case fails the bench,
+/// listing the cases.
+struct Selector {
+    var: &'static str,
+    value: String,
+    cases: Vec<String>,
+    hit: bool,
+}
+
+impl Selector {
+    fn new(var: &'static str) -> Self {
+        let value = std::env::var(var).unwrap_or_else(|_| "all".to_string());
+        Selector {
+            var,
+            value,
+            cases: Vec::new(),
+            hit: false,
+        }
+    }
+
+    fn drives(&mut self, case: &str) -> bool {
+        if !self.cases.iter().any(|c| c == case) {
+            self.cases.push(case.to_string());
+        }
+        let hit = self.value == "all" || self.value == case;
+        self.hit |= hit;
+        hit
+    }
+}
+
+impl Drop for Selector {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            assert!(
+                self.hit,
+                "{}={:?} names no case of {:?}",
+                self.var, self.value, self.cases
+            );
+        }
+    }
 }
 
 /// `build()` twice: as resolved, which must be the `no_nulls` arm, and forced
@@ -59,41 +90,16 @@ fn drive_filter(f: &mut RowFilter, view: &TestView, passes: usize) {
     std::hint::black_box(runs);
 }
 
-/// The evidence for keeping the fused `StrColConst` opcode over the
-/// register channel on the `col <op> 'const'` filter loop — ~1M rows,
-/// non-nullable STRING. Both channels are built for every domain and their hits
-/// asserted equal; `GNITZ_BENCH_CHANNEL` and `GNITZ_BENCH_DOMAIN` then cut the
-/// *driven* region down to one, so a `perf stat` over two pass counts
-/// differences to one channel's retired instructions on one domain.
-///
-/// Differenced over two `GNITZ_BENCH_PASSES` counts, the register channel
-/// retires more instructions per row than the fused one on every domain.
-///
-/// The controlled pair is `digits-first` against `abcd-shared-prefix`: same
-/// lengths, same content bytes, differing only in whether the 4-byte prefix
-/// collides. Only the cell form can short-circuit on that prefix — a `StrView`
-/// carries none — so the fused cost moves between the two and the register cost
-/// does not, and the gap remaining at `abcd*` is the register lane's own cost of
-/// materialising each row into a `MORSEL`-wide lane. Matching the lengths is
-/// what makes that attributable.
-///
-///   for d in mixed long digits-first abcd-shared-prefix; do
-///     for c in fused registers; do for p in 1 201; do \
-///       GNITZ_BENCH_DOMAIN=$d GNITZ_BENCH_CHANNEL=$c GNITZ_BENCH_PASSES=$p \
-///       perf stat -e instructions:u cargo test -p gnitz-expr --release \
-///         str_const_filter_bench -- --ignored --nocapture --test-threads=1
-///   done; done; done
+/// The fused `StrColConst` against the register channel (`GNITZ_BENCH_CHANNEL`)
+/// on `col <op> 'const'` over ~1M NOT NULL strings, per `GNITZ_BENCH_DOMAIN`.
+/// `digits-first` and `abcd-shared-prefix` differ only in whether the prefix the
+/// fused compare short-circuits on collides.
 #[test]
 #[ignore]
 fn str_const_filter_bench() {
     let passes = bench_passes();
-    let channel = std::env::var("GNITZ_BENCH_CHANNEL").unwrap_or_else(|_| "both".to_string());
-    assert!(
-        matches!(channel.as_str(), "both" | "fused" | "registers"),
-        "GNITZ_BENCH_CHANNEL must be both/fused/registers, got {channel:?}"
-    );
-    let only = std::env::var("GNITZ_BENCH_DOMAIN").unwrap_or_else(|_| "all".to_string());
-    let (run_fused, run_regs) = (channel != "registers", channel != "fused");
+    let mut channel = Selector::new("GNITZ_BENCH_CHANNEL");
+    let mut only = Selector::new("GNITZ_BENCH_DOMAIN");
 
     let schema = schema_pk_strings(1, false);
     let n = 1_000_000usize;
@@ -119,7 +125,6 @@ fn str_const_filter_bench() {
         ("abcd-shared-prefix", "abcd42", |row| format!("abcd{}", row % 97)),
     ];
 
-    let mut n_selected = 0usize;
     for (domain, constant, value) in domains {
         let mb = make_string_view(&schema, n, |row, _| value(row), |_, _| false);
 
@@ -140,8 +145,7 @@ fn str_const_filter_bench() {
                 consts,
             );
 
-            // Also the warm-up, and outside the driven region — so both channels
-            // are still built and compared even when only one is driven.
+            // Also the warm-up, outside the driven region.
             let passed = passing_rows(&mut fused, &mb);
             assert_eq!(
                 passed,
@@ -149,16 +153,14 @@ fn str_const_filter_bench() {
                 "{domain}/{name}: the channels disagree"
             );
             let hits = passed.iter().filter(|&&p| p).count();
-            for (want, ev) in [(run_fused, &mut fused), (run_regs, &mut regs)] {
-                if want && (only == "all" || only == domain) {
-                    n_selected += 1;
+            for (chan, ev) in [("fused", &mut fused), ("registers", &mut regs)] {
+                if only.drives(domain) && channel.drives(chan) {
                     drive_filter(ev, &mb, passes);
                 }
             }
             println!("str_const_filter_bench {domain}/{name}: passes={passes} n={n} hits={hits}");
         }
     }
-    selected("GNITZ_BENCH_DOMAIN", &only, n_selected);
 }
 
 /// The pass count the `#[ignore]`d benches loop over, from `GNITZ_BENCH_PASSES`.
@@ -168,21 +170,12 @@ fn bench_passes() -> usize {
     std::env::var("GNITZ_BENCH_PASSES").map_or(1, |v| v.parse().expect("GNITZ_BENCH_PASSES must be a count"))
 }
 
-/// Retired-instruction harness for the filter kernels.
-///
-///   for s in pk pk_i64 i32 nullable literals; do for p in 1 501; do \
-///     GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
-///     cargo test -p gnitz-expr --release filter_kernel_bench -- --ignored --nocapture
-///   done; done
+/// The filter kernels, per `GNITZ_BENCH_SHAPE`.
 #[test]
 #[ignore]
 fn filter_kernel_bench() {
     let passes = bench_passes();
-    // Every shape is still built and checked; only the driven loop is skipped,
-    // so a `perf stat` over the process attributes its pass-count difference to
-    // the one named here rather than to their sum.
-    let only = std::env::var("GNITZ_BENCH_SHAPE").unwrap_or_else(|_| "all".to_string());
-    let driven = |name: &str| only == "all" || only == name;
+    let mut shape = Selector::new("GNITZ_BENCH_SHAPE");
     let n = 200_000usize;
 
     // `col <op> k` over one column of `schema`.
@@ -268,7 +261,6 @@ fn filter_kernel_bench() {
     }
     let mut lit_filter = filter_prog(&lit_schema, lit_instrs, vec![]);
 
-    let mut n_selected = 0usize;
     for (name, ev, view) in [
         ("pk", &mut pk_filter, &pk_view),
         ("pk_i64", &mut pk_i64_filter, &pk_i64_view),
@@ -276,22 +268,15 @@ fn filter_kernel_bench() {
         ("nullable", &mut nn_filter, &nn_view),
         ("literals", &mut lit_filter, &lit_view),
     ] {
-        if !driven(name) {
-            continue;
+        if shape.drives(name) {
+            drive_filter(ev, view, passes);
         }
-        n_selected += 1;
-        drive_filter(ev, view, passes);
     }
     println!("filter_kernel_bench passes={passes} n={n}");
-    // A misspelled shape would otherwise drive nothing and difference to a 0 %
-    // effect instead of failing.
-    selected("GNITZ_BENCH_SHAPE", &only, n_selected);
 }
 
-/// `col1 IS NULL AND col2 > k AND ... ` over `is_null_bench_schema`: `n_cmp`
-/// compares of NOT NULL columns hung off one null test, so the whole predicate
-/// still resolves `no_nulls`. `n_cmp` sets the chain depth, which is what scales
-/// the per-conjunct cost the arms are being compared on.
+/// `col1 IS NULL AND col2 > k AND …` over `n_cmp` NOT NULL columns, so the
+/// whole predicate resolves `no_nulls`.
 fn is_null_chain(k: i64, n_cmp: u32) -> Vec<LogicalInstr> {
     let mut instrs = vec![is_null_op(1)];
     if n_cmp == 0 {
@@ -313,71 +298,26 @@ fn is_null_chain(k: i64, n_cmp: u32) -> Vec<LogicalInstr> {
     instrs
 }
 
-/// One nullable column (the null test's) plus four NOT NULL ones (the
-/// compares'). Mixing the two is what the bench is about: a compare over a
-/// nullable column would hold the program on the nullable arm through its own
-/// load, whatever the null test is classified as.
+/// One nullable column for the null test, four NOT NULL ones for the compares.
 fn is_null_bench_schema() -> TestSchema {
     let mut cols = vec![(TypeCode::U64, false), (TypeCode::I64, true)];
     cols.extend(std::iter::repeat_n((TypeCode::I64, false), 4));
     TestSchema::new(&cols, &[0])
 }
 
-/// A/B for the arm an `IS [NOT] NULL` predicate lands on. Each shape is built
-/// twice from one instruction stream — once as resolution classifies it
-/// (`no_nulls`), once forced onto the nullable arm — and the two are asserted to
-/// select the same rows before either is driven. Prints no measurement itself,
-/// like [`filter_kernel_bench`]: `GNITZ_BENCH_SHAPE` and `GNITZ_BENCH_ARM` cut
-/// the run down to one driven loop, and differencing two pass counts under
-/// `perf` cancels fixture construction, the warm-up and process start.
-///
-///   for s in bare one_and chain_spread chain_clustered \
-///            chain_nonselective chain_rare map; do
-///     for arm in fast nullable; do for p in 1 201; do \
-///       GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_ARM=$arm GNITZ_BENCH_PASSES=$p \
-///       perf stat -e instructions:u,cycles:u cargo test -p gnitz-expr --release \
-///         is_null_arm_bench -- --ignored --nocapture --test-threads=1
-///   done; done; done
-///
-/// Moving to the fast arm is cheaper on every shape here, least on `map` and
-/// `bare`, more on `one_and`, most across the four 4-conjunct chains; the
-/// magnitudes move between builds, so re-measure before trading on one. What
-/// separates the chain shapes from each other is only their NULL arrangement, and it barely
-/// separates them at all — the arms run the same kernels over the same word
-/// count. The compares read NOT NULL columns, which are outside
-/// `nullable_slots`, so the nullable arm clears their null words rather than
-/// gathering per row; what is left is the null bookkeeping the fast arm has
-/// none of.
-///
-/// Take both events. `instructions:u` repeats here to under 0.001 %, `cycles:u`
-/// to a few percent; the first is the reproducible one, the second is the one
-/// that sees a stall. Neither is a constant — batch size, NULL rate and
-/// clustering all move them.
+/// The `no_nulls` arm against the nullable one (`GNITZ_BENCH_ARM`) for an
+/// `IS [NOT] NULL` predicate, per `GNITZ_BENCH_SHAPE`. Take `cycles:u` too: only
+/// it sees a stall.
 #[test]
 #[ignore]
 fn is_null_arm_bench() {
     let passes = bench_passes();
-    let arm = std::env::var("GNITZ_BENCH_ARM").unwrap_or_else(|_| "both".to_string());
-    let (run_fast, run_nullable) = (arm != "nullable", arm != "fast");
-    // Which shape to drive. Every shape is still built and checked; only the
-    // driven loop is skipped, so a `perf stat` over the process attributes its
-    // pass-count difference to the one named here.
-    let only = std::env::var("GNITZ_BENCH_SHAPE").unwrap_or_else(|_| "all".to_string());
-    // Both selectors are decoded by inequality, so a typo would silently drive
-    // nothing (or both arms) and read out as a 0 % effect rather than an error.
-    assert!(
-        matches!(arm.as_str(), "both" | "fast" | "nullable"),
-        "GNITZ_BENCH_ARM must be both/fast/nullable, got {arm:?}"
-    );
-    let driven = |name: &str, want: bool| want && (only == "all" || only == name);
+    let mut arm = Selector::new("GNITZ_BENCH_ARM");
+    let mut shape = Selector::new("GNITZ_BENCH_SHAPE");
     let n = 200_000usize;
     let schema = is_null_bench_schema();
 
-    // Three views, shared by the shapes that want the same NULL arrangement.
-    // They span how the NULLs are distributed rather than just how many there
-    // are: `spread` puts 16 per morsel, `rare` 4, and `clustered` gives 7 of
-    // every 8 morsels no NULL at all — the arrangement a morsel-granular
-    // optimization would be most sensitive to.
+    // NULLs 16 per morsel, 4 per morsel, and none in 7 of every 8 morsels.
     let value = |row: usize, col: usize| ((row * 7 + col * 13) % 100) as i64;
     let spread = make_n_col_view(&schema, n, value, |row, col| col == 0 && row.is_multiple_of(16));
     let clustered = make_n_col_view(&schema, n, value, |row, col| {
@@ -396,16 +336,13 @@ fn is_null_arm_bench() {
         ("chain_rare", &rare, is_null_chain(50, 4)),
     ];
 
-    let mut n_selected = 0usize;
     for (name, view, instrs) in &shapes {
         let (mut fast, mut nullable) = both_arms(name, || filter_prog(&schema, instrs.clone(), vec![]));
-        // Also the warm-up, and outside the driven region; the read holds the
-        // nullable arm to the fast one's rows.
+        // Also the warm-up, outside the driven region.
         let hits = passing_rows(&mut fast, view).iter().filter(|&&p| p).count();
 
-        for (want, ev) in [(run_fast, &mut fast), (run_nullable, &mut nullable)] {
-            if driven(name, want) {
-                n_selected += 1;
+        for (arm_name, ev) in [("fast", &mut fast), ("nullable", &mut nullable)] {
+            if shape.drives(name) && arm.drives(arm_name) {
                 drive_filter(ev, view, passes);
             }
         }
@@ -438,23 +375,16 @@ fn is_null_arm_bench() {
         }
         std::hint::black_box(acc);
     };
-    for (want, ev) in [(run_fast, &mut fast), (run_nullable, &mut nullable)] {
-        if driven("map", want) {
-            n_selected += 1;
+    for (arm_name, ev) in [("fast", &mut fast), ("nullable", &mut nullable)] {
+        if shape.drives("map") && arm.drives(arm_name) {
             run(ev);
         }
     }
     println!("is_null_arm_bench map: passes={passes} n={n}");
-    // A misspelled shape name would otherwise drive nothing at all, and the two
-    // pass counts would difference to a 0 % effect instead of failing.
-    selected("GNITZ_BENCH_SHAPE", &only, n_selected);
 }
 
-/// One `len`-byte haystack per row in the single STRING payload slot: `unit`
-/// repeated, with one ASCII byte per row overwritten by a digit so every row differs
-/// and no matcher can be hoisted out of the row loop. A fixed length is what
-/// makes a per-byte slope readable, where [`str_bench_view`]'s alternating
-/// widths average two regimes.
+/// `n` rows of `unit` repeated to `len` bytes, one ASCII byte per row turned
+/// into a digit so no matcher hoists out of the row loop.
 fn fixed_len_str_view(schema: &TestSchema, n: usize, len: usize, unit: &[u8]) -> TestView {
     let base: Vec<u8> = unit.iter().copied().cycle().take(len).collect();
     make_string_view(
@@ -486,44 +416,13 @@ fn str_bench_view(schema: &TestSchema, n: usize) -> TestView {
     )
 }
 
-/// Retired-instruction harness for the kernels [`filter_kernel_bench`] cannot
-/// reach: the ones whose result is not a predicate. Same protocol — run at two
-/// pass counts and difference, never report wall-clock.
-///
-///   for s in int_cast int_div select str_len str_upper str_like str_substr \
-///            str_concat int_to_str map \
-///            str_contains_12 str_contains_128 str_contains_512 \
-///            str_generic_12 str_generic_128 str_generic_512 \
-///            str_contains_freq_128 str_contains_freq_512 \
-///            str_icontains_12 str_icontains_512 str_iprefix_128 \
-///            str_generic_resume_128 str_generic_resume_512 \
-///            str_strpos_128 str_strpos_512 \
-///            str_side_64 str_side_512 \
-///            str_chars_12 str_chars_128 str_chars_512 str_like_any3 \
-///            str_reverse_128 str_reverse_utf8_128 str_lpad_12 \
-///            str_left200 str_right200 str_substr_far; do
-///     for p in 1 501; do \
-///       GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
-///       cargo test -p gnitz-expr --release expr_kernel_bench -- --ignored --nocapture
-///   done; done
-///
-/// One shape per opcode family, never combined: a scalar `idiv` swamps a cast by
-/// an order of magnitude, so a shared shape would difference to that one arm.
-///
-/// The three suffixed families carry a haystack length because their cost is a
-/// slope in it, not a constant: `Contains` and `Generic` scan the value, and
-/// `RIGHT` walks it. `str_like`'s own `%boundary` pattern specializes to
-/// `Suffix`, which answers off the tail alone and enters neither scan.
-///
-/// `_freq`, `_resume` and `strpos` meet a false candidate every few bytes
-/// (`xxxxxxxn`, `nexn`); the `i` shapes are ILIKE over `xxxNxxxn`.
+/// The kernels whose result is not a predicate, per `GNITZ_BENCH_SHAPE`; a
+/// numeric suffix is the haystack length the family's cost is a slope in.
 #[test]
 #[ignore]
 fn expr_kernel_bench() {
     let passes = bench_passes();
-    let only = std::env::var("GNITZ_BENCH_SHAPE").unwrap_or_else(|_| "all".to_string());
-    let driven = |name: &str| only == "all" || only == name;
-    let mut n_selected = 0usize;
+    let mut shape = Selector::new("GNITZ_BENCH_SHAPE");
     let n = 200_000usize;
 
     // --- scalar shapes over two nullable I64 columns ---
@@ -764,8 +663,7 @@ fn expr_kernel_bench() {
     );
 
     let mut acc = 0i64;
-    if driven("map") {
-        n_selected += 1;
+    if shape.drives("map") {
         let mut out = TestView::for_schema(&map_out, n);
         for _ in 0..passes {
             map.write_computed(&map_view, 0, n, &mut out, 0);
@@ -822,10 +720,9 @@ fn expr_kernel_bench() {
         ("str_like_any3".into(), like_prog("%___", false), &utf8_views[1]),
     ]);
     for (name, mut ev, view) in scalar_shapes {
-        if !driven(&name) {
+        if !shape.drives(&name) {
             continue;
         }
-        n_selected += 1;
         let reg = ev.result_reg();
         for _ in 0..passes {
             ev.eval_morsels(view, 0, n, |_, out| acc += out.reg_values(reg).iter().sum::<i64>());
@@ -847,10 +744,9 @@ fn expr_kernel_bench() {
         ("str_substr_far", str_substr_far, &utf8_views[2]),
     ];
     for (name, mut ev, view) in str_shapes {
-        if !driven(name) {
+        if !shape.drives(name) {
             continue;
         }
-        n_selected += 1;
         let reg = ev.result_reg();
         for _ in 0..passes {
             ev.eval_morsels(view, 0, n, |_, out| {
@@ -864,25 +760,10 @@ fn expr_kernel_bench() {
         "expr_kernel_bench passes={passes} n={n} acc={}",
         std::hint::black_box(acc)
     );
-    selected("GNITZ_BENCH_SHAPE", &only, n_selected);
 }
 
-/// Retired instructions for the per-request decode of an ad-hoc predicate:
-/// `from_blob` plus the `resolve_filter` that decodes its const pool. A
-/// predicate-only read reaches every worker, so this pair runs once per request
-/// per worker.
-///
-/// An `IN` list over a non-PK integer column stays in the residual, riding one
-/// pool entry of 8 bytes per item; only the request frame bounds the item count.
-///
-/// Build first — `perf stat` around a cold `cargo test` measures the compile,
-/// not the bench.
-///
-///   cargo build -p gnitz-expr --release --tests
-///   for p in 1 201; do \
-///     GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
-///     cargo test -p gnitz-expr --release from_blob_bench -- --ignored --nocapture
-///   done
+/// The decode a predicate-only read pays per request per worker: `from_blob`
+/// and the `resolve_filter` that decodes an IN list's pool entry.
 #[test]
 #[ignore]
 fn from_blob_bench() {

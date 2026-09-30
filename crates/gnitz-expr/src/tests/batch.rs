@@ -5,28 +5,55 @@ use super::{decode_f64, encode_f64, eval_batch, scan_filter_bits, with_str_bufs,
 use crate::eval::Resolved;
 use crate::program::{FloatUnaryOp, IntUnaryOp};
 use crate::test_support::{
-    filter_prog, make_string_view, passing_rows, row_strs, row_values, scalar_prog, schema_pk_strings, TestSchema,
-    TestView,
+    filter_prog, make_string_view, passing_rows, row_strs, row_values, runs, scalar_prog, schema_pk_strings,
+    TestSchema, TestView,
 };
-use crate::{CalendarOp, CmpOp, ColumnTable, LogicalInstr, ScalarEval};
+use crate::{CalendarOp, CmpOp, LogicalInstr, ScalarEval};
 
 // ---------------------------------------------------------------------------
 // The harness: one U64 PK plus the operand columns a program loads in order
 // ---------------------------------------------------------------------------
 
-/// One operand column: its type and each row's value, `None` for NULL. A column
-/// holding a NULL is declared nullable and every other NOT NULL, so a program
-/// over NULL-free operands resolves onto the `no_nulls` arm — and the read-backs
-/// hold that arm to the nullable one.
+/// One operand column: its type and each row's cell, `None` for NULL.
 #[derive(Clone)]
-enum Col {
-    /// An integer column's values; a float column's `f64` bit patterns.
-    Num(TypeCode, Vec<Option<i64>>),
-    Str(Vec<Option<Vec<u8>>>),
+struct Col {
+    tc: TypeCode,
+    cells: Vec<Option<Cell>>,
+}
+
+/// An integer, a float's `f64` bit pattern, or a string.
+#[derive(Clone)]
+enum Cell {
+    Num(i64),
+    Str(Vec<u8>),
+}
+
+impl Col {
+    fn nullable(&self) -> bool {
+        self.cells.iter().any(Option::is_none)
+    }
+
+    /// What a NULL cell stores: a value no live row holds, truthy and past the
+    /// string inline threshold, so a kernel that read it shows in its result.
+    fn poison(&self) -> Cell {
+        match self.tc {
+            TypeCode::String => Cell::Str(b"poison-in-a-null-cell".to_vec()),
+            _ => Cell::Num(0x2A2A_2A2A_2A2A_2A2A),
+        }
+    }
+
+    fn load(&self, col: u32) -> LogicalInstr {
+        match self.tc {
+            TypeCode::String => LogicalInstr::LoadColStr { col },
+            TypeCode::F32 | TypeCode::F64 => LogicalInstr::LoadColFloat { col },
+            _ => LogicalInstr::LoadColInt { col },
+        }
+    }
 }
 
 fn int<T: Into<Option<i64>>>(tc: TypeCode, vals: impl IntoIterator<Item = T>) -> Col {
-    Col::Num(tc, vals.into_iter().map(Into::into).collect())
+    let cells = vals.into_iter().map(|v| v.into().map(Cell::Num)).collect();
+    Col { tc, cells }
 }
 
 fn i64s<T: Into<Option<i64>>>(vals: impl IntoIterator<Item = T>) -> Col {
@@ -34,69 +61,36 @@ fn i64s<T: Into<Option<i64>>>(vals: impl IntoIterator<Item = T>) -> Col {
 }
 
 fn f64s<T: Into<Option<f64>>>(vals: impl IntoIterator<Item = T>) -> Col {
-    Col::Num(
-        TypeCode::F64,
-        vals.into_iter().map(|v| v.into().map(encode_f64)).collect(),
-    )
+    int(TypeCode::F64, vals.into_iter().map(|v| v.into().map(encode_f64)))
 }
 
 fn text<'a, T: Into<Option<&'a str>>>(vals: impl IntoIterator<Item = T>) -> Col {
-    Col::Str(
-        vals.into_iter()
-            .map(|v| v.into().map(|s| s.as_bytes().to_vec()))
-            .collect(),
-    )
+    let cells = vals
+        .into_iter()
+        .map(|v| v.into().map(|s| Cell::Str(s.as_bytes().to_vec())))
+        .collect();
+    Col { tc: TypeCode::String, cells }
 }
 
-/// What a NULL cell stores: a truthy value no live row holds, and a string past
-/// the inline threshold, so a kernel that read a NULL row's bytes shows in its
-/// result.
-const POISON_INT: i64 = 0x2A2A_2A2A_2A2A_2A2A;
-const POISON_STR: &[u8] = b"poison-in-a-null-cell";
-
-/// A program over `cols`: each is loaded into its own register, in order, and
-/// `mk` appends the instructions under test to those registers; the last one is
-/// the result.
+/// A program loading each of `cols` into its own register, in order, then `mk`'s
+/// instructions over those registers; the last is the result.
 fn prog(cols: &[Col], consts: Vec<Vec<u8>>, mk: impl FnOnce(&[Reg]) -> Vec<LogicalInstr>) -> (ScalarEval, TestView) {
-    let nullable = |c: &Col| match c {
-        Col::Num(_, v) => v.contains(&None),
-        Col::Str(v) => v.contains(&None),
-    };
     let mut schema_cols = vec![(TypeCode::U64, false)];
-    schema_cols.extend(cols.iter().map(|c| match c {
-        Col::Num(tc, _) => (*tc, nullable(c)),
-        Col::Str(_) => (TypeCode::String, nullable(c)),
-    }));
+    schema_cols.extend(cols.iter().map(|c| (c.tc, c.nullable())));
     let schema = TestSchema::new(&schema_cols, &[0]);
-    let rows = match &cols[0] {
-        Col::Num(_, v) => v.len(),
-        Col::Str(v) => v.len(),
-    };
-    let mut view = TestView::for_schema(&schema, rows);
+    let mut view = TestView::for_schema(&schema, cols[0].cells.len());
     for (pi, c) in cols.iter().enumerate() {
-        for row in 0..rows {
-            let is_null = match c {
-                Col::Num(_, v) => {
-                    view.set_int(row, pi, v[row].unwrap_or(POISON_INT));
-                    v[row].is_none()
-                }
-                Col::Str(v) => {
-                    view.set_string(row, pi, v[row].as_deref().unwrap_or(POISON_STR));
-                    v[row].is_none()
-                }
-            };
-            if is_null {
+        for (row, cell) in c.cells.iter().enumerate() {
+            match cell.clone().unwrap_or_else(|| c.poison()) {
+                Cell::Num(x) => view.set_int(row, pi, x),
+                Cell::Str(s) => view.set_string(row, pi, &s),
+            }
+            if cell.is_none() {
                 view.set_null(row, pi);
             }
         }
     }
-    let mut instrs: Vec<LogicalInstr> = (1..=cols.len() as u32)
-        .map(|col| match schema.col_type_code(col as usize) {
-            TypeCode::String => LogicalInstr::LoadColStr { col },
-            TypeCode::F32 | TypeCode::F64 => LogicalInstr::LoadColFloat { col },
-            _ => LogicalInstr::LoadColInt { col },
-        })
-        .collect();
+    let mut instrs: Vec<LogicalInstr> = cols.iter().zip(1..).map(|(c, col)| c.load(col)).collect();
     let regs: Vec<Reg> = (0..cols.len() as u16).map(Reg).collect();
     instrs.extend(mk(&regs));
     (scalar_prog(&schema, instrs, consts), view)
@@ -140,10 +134,8 @@ fn pairs<T: Copy>(corpus: &[T]) -> (Vec<T>, Vec<T>) {
 // SELECT (CASE blend)
 // ---------------------------------------------------------------------------
 
-/// SELECT against a per-row 3VL reference: the chosen branch's value and null
-/// bit, a NULL condition choosing `b`. NOT NULL branches take `no_nulls` and
-/// blend values alone, while the nullable arm blends null masks at word
-/// granularity and values row by row.
+/// SELECT takes the chosen branch's value and null bit; a NULL condition
+/// chooses `b`.
 #[test]
 fn select_takes_the_chosen_branch() {
     let n = 77;
@@ -212,11 +204,8 @@ fn a_boolean_feeding_arithmetic_lands_in_regs() {
 // Register loads
 // ---------------------------------------------------------------------------
 
-/// Every fixed-width integer type, read by `LoadColInt` from each region it can
-/// sit in: a payload slot ahead of the PK, a PK column at a non-zero offset of a
-/// compound key, and a payload slot numbered around both PK columns. Each loads
-/// the value's register image — sign-extended from a signed type, zero-extended
-/// from an unsigned one — over bit patterns straddling every width's sign bit.
+/// Every fixed-width integer type loads its register image from a payload slot
+/// on either side of a compound key, and from that key's second column.
 #[test]
 fn every_int_load_reads_its_value_from_either_region() {
     const PATTERNS: [u64; 10] = [
@@ -242,27 +231,29 @@ fn every_int_load_reads_its_value_from_either_region() {
         FixedInt::I64,
     ] {
         let tc = fi.type_code();
-        // Column 1 is a U16 filler leading the PK list, so column 2's key bytes
-        // start at offset 2; payload slots 0 and 1 are columns 0 and 3.
         let schema = TestSchema::new(
-            &[(tc, false), (TypeCode::U16, false), (tc, false), (tc, false)],
+            &[
+                (tc, false),            // payload slot 0
+                (TypeCode::U16, false), // key column 0
+                (tc, false),            // key column 1, at byte 2
+                (tc, false),            // payload slot 1
+            ],
             &[1, 2],
         );
-        let image = |p: u64| fi.unpack(u128::from(p));
+        // Each column's value on the row holding `p`, distinct per slot.
+        let value = |col: u32, p: u64| if col == 3 { p.rotate_left(8) } else { p };
         let mut view = TestView::for_schema(&schema, PATTERNS.len());
         for (row, &p) in PATTERNS.iter().enumerate() {
-            view.set_key(
-                &schema,
-                row,
-                &[0xBEEF, u128::from(p) & gnitz_wire::image_mask(fi.width())],
-            );
-            view.set_int(row, 0, p as i64);
-            view.set_int(row, 1, p.rotate_left(8) as i64);
+            for col in [0, 2, 3] {
+                view.set_native(&schema, row, col, value(col as u32, p).into());
+            }
         }
-        // (column, how far its value is rotated from the pattern)
-        for (col, rotate) in [(0, 0), (2, 0), (3, 8)] {
+        for col in [0, 2, 3] {
             let mut ev = scalar_prog(&schema, vec![LogicalInstr::LoadColInt { col }], vec![]);
-            let want: Vec<Option<i64>> = PATTERNS.iter().map(|&p| Some(image(p.rotate_left(rotate)))).collect();
+            let want: Vec<Option<i64>> = PATTERNS
+                .iter()
+                .map(|&p| Some(fi.unpack(u128::from(value(col, p)))))
+                .collect();
             assert_eq!(int_rows(&mut ev, &view), want, "{tc} column {col}");
         }
     }
@@ -286,11 +277,7 @@ fn canonical_bits(x: f64) -> u64 {
     }
 }
 
-/// Every integer arithmetic and unary op against the Rust operation it is
-/// defined as, over every pair of a corpus straddling zero and both extremes:
-/// `+ - *`, negation and `ABS` wrap at the register width, and `/` `%` NULL the
-/// row on a zero divisor rather than trapping. A trailing row with a NULL
-/// operand is NULL out.
+/// Every integer op is the wrapping Rust op, and `/` `%` NULL a zero divisor.
 #[test]
 fn int_arithmetic_is_the_wrapping_rust_op() {
     let corpus = [i64::MIN, -7, -1, 0, 1, 3, i64::MAX];
@@ -338,10 +325,7 @@ fn int_arithmetic_is_the_wrapping_rust_op() {
     );
 }
 
-/// Every float arithmetic op against its IEEE operation over every pair of a
-/// corpus holding both zeroes, the infinities and NaN — except that a zero
-/// divisor NULLs the row, as the integer divide does. A domain error is NaN or
-/// an infinity, never NULL.
+/// Every float op is the IEEE op, and `/` NULLs a zero divisor.
 #[test]
 fn float_arithmetic_is_the_ieee_op() {
     let corpus = [0.0f64, -0.0, 1.5, -2.0, 10.0, f64::INFINITY, f64::NAN];
@@ -362,10 +346,7 @@ fn float_arithmetic_is_the_ieee_op() {
     }
 }
 
-/// Every `FloatUnaryOp` against the `f64` method it is defined as. Swept rather
-/// than sampled: the ties-to-even and signed-zero cells are the only ones where
-/// several ops differ from each other, and the domain edges are where the
-/// transcendentals answer NaN or an infinity rather than NULL.
+/// Every `FloatUnaryOp` is the `f64` method it is named for.
 #[test]
 fn float_unary_ops_match_ieee() {
     let inputs = [-0.0f64, 0.0, 2.5, 3.5, -2.5, -1.7, 4.0, 1000.0, f64::INFINITY, f64::NAN];
@@ -516,12 +497,7 @@ fn float_to_int_truncates_then_range_checks() {
     }
 }
 
-/// Every arm of the integer and float compare kernels, against the Rust
-/// operator on the same values. `Instr::Cmp` branches on `(op, order)` and
-/// `Instr::FCmp` on `op`, so the axes are swept rather than sampled: a
-/// hand-picked pair per operator leaves the arms that only differ on extreme
-/// values — the unsigned ones above `2^63`, and every float comparison against
-/// NaN — reading as covered while never being evaluated.
+/// `op` over an ordering, as the compare kernels answer it.
 fn cmp_want(op: CmpOp, ord: std::cmp::Ordering) -> i64 {
     i64::from(match op {
         CmpOp::Eq => ord.is_eq(),
@@ -614,10 +590,8 @@ fn float_minmax2_uses_total_cmp_order() {
     assert_eq!(fold(false), bits([5.0, 2.0, -0.0, f64::INFINITY]));
 }
 
-/// A calendar op over a DATE column reads days, and over a TIMESTAMP column
-/// microseconds, each against [`crate::calendar::eval`] on the same value; the
-/// one op that can NULL does so exactly where the day count leaves `i64`
-/// microseconds, and a NULL operand is NULL out.
+/// A calendar op reads a DATE column as days and a TIMESTAMP one as
+/// microseconds; `ToMicros` NULLs a day count past `i64` microseconds.
 #[test]
 fn calendar_ops_read_their_columns_representation() {
     use crate::calendar::{days_to_micros, eval, MICROS_PER_DAY};
@@ -671,16 +645,7 @@ fn calendar_ops_read_their_columns_representation() {
 /// and clear, and runs crossing and ending on word boundaries.
 #[test]
 fn scan_filter_bits_reports_every_maximal_run() {
-    let naive = |bits: &[u64], n: usize| {
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        for i in (0..n).filter(|&i| bits[i / 64] >> (i % 64) & 1 != 0) {
-            match runs.last_mut() {
-                Some((_, e)) if *e == i => *e += 1,
-                _ => runs.push((i, i + 1)),
-            }
-        }
-        runs
-    };
+    let naive = |bits: &[u64], n: usize| runs(&(0..n).map(|i| bits[i / 64] >> (i % 64) & 1 != 0).collect::<Vec<_>>());
     let words = [
         0,
         u64::MAX,
@@ -711,10 +676,8 @@ fn scan_filter_bits_reports_every_maximal_run() {
 // String registers
 // ---------------------------------------------------------------------------
 
-/// Far more distinct string columns than a program is likely to name: every one
-/// addresses its own column region in place, because the buffer slot *is* the
-/// payload slot. A short cell's view points into the column region and a long
-/// one into the blob — no column is ever copied into the arena on load.
+/// Every loaded string column is addressed in place — a short cell in its
+/// column region, a long one in the blob — never copied into the arena.
 #[test]
 fn every_string_column_addresses_its_own_region_in_place() {
     const N: usize = 12;
@@ -828,19 +791,14 @@ fn length_counts_characters_and_octets_separately() {
     assert_eq!(len(false), [Some(3), Some(3), Some(18), None]);
 }
 
-/// `SUBSTRING(s FROM start [FOR len])` over 1-based character positions: the
-/// window `[start, start + len)` clipped to the string, a negative length NULL
-/// (PostgreSQL errors; here every domain error is a NULL), and a NULL bound
-/// NULL. Swept against that definition over starts and lengths at both i64
-/// extremes — every endpoint is clamped in i128 before any narrowing, so no pair
-/// can panic or read out of the string — and over strings whose byte length
-/// exceeds their character count.
+/// SUBSTRING is the character window `[start, start + len)` clipped to the
+/// string, over bounds at both `i64` extremes.
 #[test]
 fn substring_is_the_clipped_character_window() {
     let window = |s: &str, start: i64, len: Option<i64>| -> Option<String> {
         let n = s.chars().count() as i128;
         let end = match len {
-            Some(l) if l < 0 => return None,
+            Some(l) if l < 0 => return None, // PostgreSQL errors; every domain error here is NULL
             Some(l) => i128::from(start) + i128::from(l),
             None => i128::MAX,
         };
@@ -984,22 +942,9 @@ fn concat_null_rules_differ_by_operand_side() {
     assert_eq!(concat(true), texts(&[Some("abcd"), None, Some("ab")]));
 }
 
-/// All three string-compare channels must agree with `compare_german_strings`,
-/// which is the order consolidation uses. A disagreement would split one Z-set
-/// element's weight across rows that never merge.
-///
-/// The channels are separate kernels reaching the same comparator: `StrCmp`
-/// reads two registers, while `StrColCol` and `StrColConst` compare cells in
-/// place and can short-circuit on the 4-byte inline prefix that a register lane
-/// does not carry. Sweeping one corpus across all three is what holds the
-/// prefix fast path to the same answer as the general one — the corpus is built
-/// around that boundary, with pairs agreeing and diverging inside the first
-/// four bytes, at the 12-byte inline/heap threshold, and past it. Every pair is
-/// a row of one batch, so inline and heap cells alternate within a morsel.
-///
-/// Over NOT NULL columns and over nullable ones holding NULLs on either side,
-/// where every channel must answer NULL whatever the NULL cell's bytes compare
-/// as — the fused kernels then take the masked route.
+/// The three string-compare channels agree with `compare_german_strings`, the
+/// order consolidation uses, over pairs diverging inside and past the 4-byte
+/// prefix a fused compare short-circuits on — with and without NULLs.
 #[test]
 fn every_string_compare_channel_agrees_with_the_cell_comparator() {
     let corpus: &[&[u8]] = &[
@@ -1071,18 +1016,8 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
     }
 }
 
-/// A cell index is not a const-pool index. `resolve` encodes a cell only for
-/// the constants a `StrColConst` names, and numbers them by first reference —
-/// so `WHERE pk IN (2,3) AND t = 'b' AND s = 'a'` puts the packed `IN` set at
-/// pool 0 with no cell, and pool 2 ahead of pool 1 in `const_cells`. Every
-/// index here differs from the pool index it came from, so a resolver that
-/// passed the pool index through would read past a two-element vector.
-///
-/// Both constants are past `SHORT_STRING_THRESHOLD`, so their cells carry heap
-/// offsets into the program's own constant arena — the second at a non-zero
-/// one — not into the batch's blob, where row 0 holds other long values: a
-/// constant resolved against the batch's blob lands on unrelated bytes rather
-/// than matching by luck.
+/// The fused compares name pool entries 2 then 1 behind an IN set at 0, so no
+/// cell index equals its pool index; both constants live on the program's heap.
 #[test]
 fn a_cell_index_is_dense_over_the_constants_the_fused_compare_names() {
     let schema = schema_pk_strings(2, false);
@@ -1117,10 +1052,8 @@ fn a_cell_index_is_dense_over_the_constants_the_fused_compare_names() {
 
 #[test]
 fn int_to_text_reads_the_source_signedness_from_the_register_tracking() {
-    // A U64 column above i64::MAX has a negative i64 bit pattern, so the
-    // resolve-time tracking is the only thing that keeps the text unsigned.
-    // Row 1 pins the digit loop's own edges: zero is the one magnitude with no
-    // significant digit, and -7 is the one-digit negative.
+    // Above i64::MAX, only the register's U64 tracking keeps the text unsigned;
+    // 0 and -7 are the digit loop's shortest outputs.
     let to_text = |col: Col| strs(&[col], |r| vec![LogicalInstr::IntToStr { a: r[0] }]);
     assert_eq!(
         to_text(int(TypeCode::U64, [u64::MAX as i64, 0])),
@@ -1132,10 +1065,8 @@ fn int_to_text_reads_the_source_signedness_from_the_register_tracking() {
     );
 }
 
-/// The magnitude switch is what bounds the output: Rust's positional `Display`
-/// renders `1e300` as 301 digits. Every value must also survive the round trip
-/// back through the parse — the sign of zero included, which is what keeps a
-/// retraction cancelling.
+/// A float's text is at most 24 bytes and parses back to the same bits, the
+/// sign of zero included.
 #[test]
 fn float_to_text_is_bounded_and_round_trips() {
     let vals = [
@@ -1387,11 +1318,8 @@ fn replace_over_arena_operands_rewrites_correctly() {
     assert_eq!(got, texts(&[Some("AYYBYYC")]));
 }
 
-/// LPAD/RPAD measure in characters, cycle the fill, truncate a longer subject
-/// to its first `n` characters, and pad nothing for an empty fill. A pad whose
-/// result would pass the byte ceiling is NULL, found before any byte is
-/// written — whether the character count or the fill's byte width is what
-/// overflows.
+/// LPAD/RPAD measure in characters, cycle the fill, truncate a longer subject,
+/// and NULL a result past the byte ceiling.
 #[test]
 fn pad_measures_characters_and_truncates_a_long_subject() {
     let pad = |left: bool| {
@@ -1399,6 +1327,7 @@ fn pad_measures_characters_and_truncates_a_long_subject() {
             &[
                 text(["hé", "hé", "hello", "a", "a", "a", "a", "a", "a", "a"]),
                 text(["xy", "éx", "x", "x", "", "x", "xyz", "xyz", "x", "é"]),
+                // The last two pass the byte ceiling by count, and by fill width.
                 i64s([5, 5, 3, 0, 3, -2, 8, 2, 5_000_000_000, 4_000_000_000]),
             ],
             |r| vec![LogicalInstr::StrPad { s: r[0], n_reg: r[2], fill: r[1], left }],

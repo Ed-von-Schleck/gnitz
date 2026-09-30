@@ -7,15 +7,13 @@ use gnitz_wire::{FixedInt, TypeCode};
 use crate::batch::{encode_f64, MORSEL};
 use crate::eval::Resolved;
 use crate::test_support::{
-    filter_prog, is_not_null_op, is_null_op, make_n_col_view, map_prog, passing_ranges, passing_rows, row_values,
+    filter_prog, is_not_null_op, is_null_op, make_n_col_view, map_prog, passing_ranges, passing_rows, row_values, runs,
     scalar_prog, schema_pk_ints, TestSchema, TestView,
 };
 use crate::{payload_bytes, payload_u64, CmpOp, IntArithOp, LogicalInstr, RowSource, SchemaFacts};
 
-/// A map writes every computed slot at `dst_start` on — a narrowed integer, a
-/// string, and a boolean — across a morsel boundary, and moves each copied
-/// column's null bit into its output slot; the copied bytes themselves are the
-/// caller's. A NULL result sets its slot's bit and zeroes the cell.
+/// A map writes each computed slot from `dst_start` on — zeroing a NULL result's
+/// cell — and moves each copied column's null bit into its slot.
 #[test]
 fn a_map_writes_its_computed_slots_and_moves_the_copied_null_bits() {
     let in_schema = TestSchema::new(
@@ -122,17 +120,8 @@ fn a_map_writes_its_computed_slots_and_moves_the_copied_null_bits() {
     assert!(!projection.emits_anything());
 }
 
-/// `filter` reports maximal *runs*, not per-row verdicts: every other test here
-/// collapses them into a `Vec<bool>`, which cannot tell one run from two
-/// adjacent ones. Assert the exact `(start, end)` list — half-open, `end`
-/// exclusive — across a leading gap, an interior gap, and a run that reaches the
-/// last row, plus one spanning a morsel boundary so the per-morsel bitmap words
-/// are stitched rather than flushed at 256.
-///
-/// Run over both nullability arms: they pack `filter_bits` by different routes
-/// (`no_nulls` reads `regs`, the nullable arm merges `bool_bits & !null_bits`),
-/// and `n = MORSEL + 8` gives the second morsel an 8-row tail, so a route that
-/// mishandled a partial word would split or drop the run reaching row `n`.
+/// `ranges` reports maximal half-open runs, stitched across a morsel boundary,
+/// on both arms.
 #[test]
 fn filter_emits_exact_maximal_ranges() {
     let n = MORSEL + 8;
@@ -183,11 +172,8 @@ fn or3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
     }
 }
 
-/// The left-deep chain `col0 > 1 AND col1 > 1 AND col2 > 1`, as a filter and as
-/// a scalar, against a per-row 3VL reference. The scalar read is the one that
-/// tells NULL from FALSE; a filter drops both. NULLs spread through every word,
-/// fill every word, or — over a NOT NULL schema, on the `no_nulls` arm — are
-/// absent.
+/// A three-deep AND chain, as a filter and as a scalar, against 3VL — with
+/// NULLs scattered, everywhere, and absent on the `no_nulls` arm.
 #[test]
 fn three_and_chain_matches_the_three_valued_reference() {
     // The columns cycle mod 5, not mod 4: with `> 1` on three columns whose
@@ -234,44 +220,36 @@ fn three_and_chain_matches_the_three_valued_reference() {
     }
 }
 
-/// The complete `{TRUE, FALSE, NULL}²` table for every boolean combinator, as a
-/// filter and as a scalar, against the references above. Swept rather than
-/// hand-listed: the asymmetric cells are the whole content of 3VL, and a
-/// hand-written list of them silently omitted `T AND T` and `F OR F`.
-///
-/// TRUE is stored as `-5`, so truthiness is `!= 0` rather than `== 1`; a NULL
-/// row stores that same truthy value, so only the null bit keeps it out of the
-/// definite-true term. The bare load is a filter whose result register no bool
-/// producer wrote, so the filter packs its truthiness itself — and as a scalar
-/// it is the stored value, not a boolean, so it is read as a filter only.
+/// Every boolean combinator over the whole `{TRUE, FALSE, NULL}²` table, as a
+/// filter and as a scalar.
 #[test]
 fn every_boolean_combinator_covers_the_whole_three_valued_table() {
     let schema = schema_pk_ints(2, true);
     const STATES: [Option<bool>; 3] = [Some(true), Some(false), None];
-    let cells: Vec<(Option<bool>, Option<bool>)> = STATES.iter().flat_map(|&a| STATES.map(|b| (a, b))).collect();
+    // Truthy but not 1, and stored under a NULL too, where only the null bit
+    // keeps it from reading as TRUE.
+    const TRUTHY: i64 = -5;
+    let cells: Vec<[Option<bool>; 2]> = STATES.iter().flat_map(|&a| STATES.map(|b| [a, b])).collect();
     let mb = make_n_col_view(
         &schema,
         cells.len(),
-        |row, col| {
-            let (a, b) = cells[row];
-            if [a, b][col] == Some(false) {
-                0
-            } else {
-                -5
-            }
-        },
-        |row, col| [cells[row].0, cells[row].1][col].is_none(),
+        |row, col| if cells[row][col] == Some(false) { 0 } else { TRUTHY },
+        |row, col| cells[row][col].is_none(),
     );
+    let verdicts = |want: &[Option<bool>]| want.iter().map(|&w| w == Some(true)).collect::<Vec<_>>();
 
     let (a, b) = (LogicalInstr::LoadColInt { col: 1 }, LogicalInstr::LoadColInt { col: 2 });
-    let binary = |is_or| LogicalInstr::BoolBinary { is_or, a: Reg(0), b: Reg(1) };
-    type Combinator = (
-        &'static str,
-        Vec<LogicalInstr>,
-        fn(Option<bool>, Option<bool>) -> Option<bool>,
+    // A bare load as a filter: no boolean producer wrote it, so the filter packs
+    // its truthiness itself.
+    let want: Vec<Option<bool>> = cells.iter().map(|c| c[0]).collect();
+    assert_eq!(
+        passing_rows(&mut filter_prog(&schema, vec![a], vec![]), &mb),
+        verdicts(&want)
     );
-    let combinators: [Combinator; 4] = [
-        ("a", vec![a], |a, _| a),
+
+    let binary = |is_or| LogicalInstr::BoolBinary { is_or, a: Reg(0), b: Reg(1) };
+    type Reference = fn(Option<bool>, Option<bool>) -> Option<bool>;
+    let combinators: [(&str, Vec<LogicalInstr>, Reference); 3] = [
         ("NOT a", vec![a, LogicalInstr::BoolNot { a: Reg(0) }], |a, _| {
             a.map(|a| !a)
         }),
@@ -279,40 +257,25 @@ fn every_boolean_combinator_covers_the_whole_three_valued_table() {
         ("a OR b", vec![a, b, binary(true)], or3),
     ];
     for (name, instrs, reference) in combinators {
-        let want: Vec<Option<bool>> = cells.iter().map(|&(a, b)| reference(a, b)).collect();
+        let want: Vec<Option<bool>> = cells.iter().map(|&[a, b]| reference(a, b)).collect();
         assert_eq!(
             passing_rows(&mut filter_prog(&schema, instrs.clone(), vec![]), &mb),
-            want.iter().map(|&w| w == Some(true)).collect::<Vec<_>>(),
+            verdicts(&want),
             "{name} as a filter"
         );
-        if instrs.len() > 1 {
-            assert_eq!(
-                row_values(&mut scalar_prog(&schema, instrs, vec![]), &mb),
-                want.iter().map(|w| w.map(i128::from)).collect::<Vec<_>>(),
-                "{name} as a scalar"
-            );
-        }
+        assert_eq!(
+            row_values(&mut scalar_prog(&schema, instrs, vec![]), &mb),
+            want.iter().map(|w| w.map(i128::from)).collect::<Vec<_>>(),
+            "{name} as a scalar"
+        );
     }
 }
 
-/// The filter's nullable-arm tail mask. `BoolNot` is the op that dirties the
-/// tail: it complements whole `bool_bits` words (`!va & !na`), so every bit
-/// above `m % 64` of the last word comes out set, and the word merge into
-/// `filter_bits` carries them through. The loaded nullable column is what keeps
-/// the program off the `no_nulls` arm, where the verdict is packed out of `regs`
-/// and no such word exists.
-///
-/// A phantom bit cannot pass a real row — it sits at row `n` or above, so the
-/// run it opens reaches past the batch, which `passing_ranges` refuses. That
-/// only bites when the row directly under the tail *fails*: otherwise the
-/// phantom merges into a real run ending at `n`. Row 299 fails here, and so does
-/// the last row of each longer batch `passing_rows` retiles these rows into.
+/// NOT sets bits past the batch's last row; a failing last row still ends every
+/// run inside the batch.
 #[test]
-fn bool_not_tail_mask() {
+fn not_leaves_no_run_past_the_last_row() {
     let schema = schema_pk_ints(1, true);
-    let n = 300;
-    // NOT (col1 >= 0), with col1 cycling -1, 0, 1 and NULL every 5th row.
-    let mb = make_n_col_view(&schema, n, |row, _| (row % 3) as i64 - 1, |row, _| row % 5 == 0);
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
         LogicalInstr::LoadConst { val: 0, unsigned: false },
@@ -321,14 +284,16 @@ fn bool_not_tail_mask() {
     ];
     let mut ev = filter_prog(&schema, instrs, vec![]);
     assert!(!ev.prog().no_nulls);
-    // 3VL: NOT NULL is NULL, which the filter drops.
-    let want: Vec<bool> = (0..n).map(|row| row % 5 != 0 && row % 3 == 0).collect();
-    assert_eq!(passing_rows(&mut ev, &mb), want);
+    for n in [1, 63, 64, 65, 300] {
+        // The last row, 0, fails NOT (v >= 0).
+        let v = |row: usize| if row == n - 1 { 0 } else { (row % 3) as i64 - 1 };
+        let mb = make_n_col_view(&schema, n, |row, _| v(row), |row, _| row % 5 == 1);
+        let want: Vec<bool> = (0..n).map(|row| row % 5 != 1 && v(row) < 0).collect();
+        assert_eq!(passing_ranges(&mut ev, &mb), runs(&want), "n={n}");
+    }
 }
 
-/// The null arrangements a null test is swept over: the two extremes, where
-/// every test is definite for a whole morsel, and NULLs scattered through every
-/// word.
+/// No NULL, all NULL, and NULLs scattered through every word.
 const NULL_ARRANGEMENTS: [(&str, NullAt); 3] = [
     ("none", |_, _| false),
     ("all", |_, _| true),
@@ -338,11 +303,8 @@ const NULL_ARRANGEMENTS: [(&str, NullAt); 3] = [
 /// A null-test predicate's verdict given whether each column is NULL.
 type NullReference = fn(&dyn Fn(u32) -> bool) -> bool;
 
-/// A program whose only contact with a nullable column is `IS [NOT] NULL`
-/// resolves onto the `no_nulls` arm, and must select the reference rows there —
-/// `passing_rows` holds the nullable arm to the same answer. The two are
-/// different code: the fast arm computes in `regs` and packs the verdict once,
-/// the nullable arm computes in packed `bool_bits`/`null_bits`.
+/// Programs whose only contact with a nullable column is `IS [NOT] NULL`
+/// resolve `no_nulls` and select the reference rows.
 #[test]
 fn is_null_shapes_select_the_reference_rows() {
     let schema = schema_pk_ints(3, true);
@@ -375,9 +337,7 @@ fn is_null_shapes_select_the_reference_rows() {
             vec![is_null_op(1), is_null_op(2), and(0, 1), is_null_op(3), and(2, 3)],
             |n| n(1) && n(2) && n(3),
         ),
-        // CASE WHEN col1 IS NULL THEN 1 ELSE 0 END — the null test as a SELECT
-        // condition, which the nullable arm reads out of `bool_bits` and the
-        // `no_nulls` arm out of `regs`.
+        // CASE WHEN col1 IS NULL THEN 1 ELSE 0 END.
         (
             "case_cond",
             vec![
@@ -438,16 +398,8 @@ fn is_null_into_a_register_sink_reads_back_per_row() {
     }
 }
 
-/// `nullable_slots` is indexed by payload slot, not column index, so an
-/// all-`NOT NULL` schema — where the mask is empty — cannot catch an off-by-one
-/// in how it is built. Load a nullable column beside a `NOT NULL` one, which is
-/// also what keeps the program on the nullable arm without forcing it, and pin
-/// each register's NULL rows absolutely.
-///
-/// Every `NOT NULL` slot carries a forged bit in the batch's bitmap, on a
-/// different row set than its nullable neighbour, so a gather against a
-/// misaligned mask — or a `NOT NULL` load that read the bitmap at all — reports
-/// NULL on rows the right one never touches.
+/// Each register is NULL on exactly its nullable source's rows: a NOT NULL
+/// column's null bit is never read, and each nullable one's is read at its slot.
 #[test]
 fn nullable_and_not_null_columns_side_by_side() {
     let schema = TestSchema::new(
@@ -462,9 +414,8 @@ fn nullable_and_not_null_columns_side_by_side() {
         ],
         &[0],
     );
-    // Which rows carry a set bit for each payload slot. The odd slots are
-    // declared NOT NULL, so theirs are forged — and set on rows their nullable
-    // neighbour's are not.
+    // The rows each payload slot's bit is set on; the odd slots are NOT NULL, so
+    // theirs are forged, on rows their nullable neighbour's are not.
     let slot_bit = |pi: usize, row: usize| match pi {
         0 => row.is_multiple_of(3),
         1 => row % 3 == 1,
@@ -507,8 +458,7 @@ fn nullable_and_not_null_columns_side_by_side() {
     let mut ev = scalar_prog(&schema, instrs, vec![b"m".to_vec()]);
     assert!(!ev.prog().no_nulls);
 
-    // Per register, the rows it must report NULL on. Every `NOT NULL` load and
-    // compare reports none, forged bit or not.
+    // The rows each register must report NULL on.
     let want_null = |reg: usize, row: usize| match reg {
         0 => slot_bit(0, row),     // nullable I64
         2 => slot_bit(4, row),     // nullable F32
@@ -530,11 +480,8 @@ fn nullable_and_not_null_columns_side_by_side() {
     }
 }
 
-/// An integer result widens by the result register's resolve-time U64 tracking,
-/// and every opcode with an unsigned form takes it when an operand is tracked
-/// unsigned: a U64 load, an unsigned constant, and arithmetic, division, the
-/// float lift, a CASE blend and a MIN/MAX fold over one read unsigned; a signed
-/// load or constant, a comparison and a cast to a signed type do not.
+/// An integer result reads back unsigned exactly when its register is tracked
+/// U64.
 #[test]
 fn int_results_widen_by_the_result_registers_signedness() {
     let schema = TestSchema::new(
@@ -618,10 +565,8 @@ fn int_results_widen_by_the_result_registers_signedness() {
     }
 }
 
-/// A read's filter over `pk U64, v I64 nullable` — `pk = row + 1`, `v = row`,
-/// NULL on every fifth row — for every predicate × bound pair: a row survives
-/// iff it passes both, and the filter is the pass-through exactly when neither
-/// can drop a row. An index range walks its own column, which holds no NULL.
+/// A read's filter keeps the rows passing both its predicate and its bound, and
+/// is the pass-through exactly when neither can drop a row.
 #[test]
 fn row_filter_keeps_the_intersection_of_its_predicate_and_its_bound() {
     use gnitz_wire::{key_image, Cut, KeyRange, PkColList, PkKeys, ReadBound};

@@ -24,7 +24,8 @@ fn test_view_satisfies_the_region_per_row_contract() {
     let k1: [u128; 3] = [-1i64 as u128, 0, i64::MIN as u128];
     let mut v = TestView::for_schema(&schema, 3);
     for row in 0..3 {
-        v.set_key(&schema, row, &[k0[row], k1[row]]);
+        v.set_native(&schema, row, 0, k0[row]);
+        v.set_native(&schema, row, 1, k1[row]);
     }
     assert_batchview_consistent(
         &v,
@@ -35,9 +36,7 @@ fn test_view_satisfies_the_region_per_row_contract() {
 }
 
 /// A view whose per-row accessor addresses a different payload slot than its
-/// region accessor — the failure mode the harness exists for, since the
-/// implementor it guards (a client adapter mapping payload slots onto a foreign
-/// column representation) computes the two addresses independently.
+/// region accessor — what a client adapter computing the two apart can get wrong.
 struct MisMappedSlot(TestView);
 
 impl RowSource for MisMappedSlot {

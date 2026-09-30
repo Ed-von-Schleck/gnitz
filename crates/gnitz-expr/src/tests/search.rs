@@ -15,11 +15,8 @@ fn words(alphabet: &[u8], max: u32) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Both searches against the first window equal to the needle — `Some(0)` for
-/// an empty one — over every short haystack and needle of a two-letter
-/// alphabet, and over each short haystack repeated past the cutoff where the
-/// byte loop hands over to the vectorised scan, against needles long enough to
-/// take the `memcmp` compare.
+/// Both searches against the first window equal to the needle, over haystacks
+/// both sides of the cutoff where the byte loop hands over to the vector scan.
 #[test]
 fn find_is_the_first_window_equal_to_the_needle() {
     let first_window = |h: &[u8], n: &[u8]| match n.is_empty() {

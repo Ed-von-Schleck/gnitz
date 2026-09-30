@@ -1,7 +1,5 @@
 use gnitz_wire::{FixedInt, TypeCode};
 
-// `tests/program.rs` is `#[path]`-attached to `program.rs`, so `super` is that
-// module — one import line rather than three spellings of it.
 use super::{ColKind, ExprOp, FloatUnaryOp, IntUnaryOp, INSTR_WORDS, MAX_CONST_POOL, SINK_WORDS};
 use crate::eval::Resolved;
 use crate::test_support::{
@@ -13,9 +11,7 @@ use crate::{
     PoolEntry, Reg, ScalarEval, Sink, TrimMode,
 };
 
-/// The phrase a `ColKindMismatch` renders for `kind`, read from its one source
-/// rather than re-spelled here — so widening a kind's predicate without its
-/// wording fails these tests instead of passing them.
+/// The phrase a `ColKindMismatch` renders for `kind`, from its one source.
 fn type_phrase(kind: ColKind) -> &'static str {
     kind.type_test().expect("a kind whose rejection has a sentence").1
 }
@@ -35,12 +31,8 @@ fn a_program_whose_sinks_do_not_fit_its_role_is_refused() {
     assert!(LogicalProgram::copy_cols(&[1]).resolve_map(&schema, &schema).is_ok());
 }
 
-/// `analyze` puts a program on the `no_nulls` arm exactly when nothing in it can
-/// produce a NULL against the schema. A nullable column loaded or compared
-/// carries its NULL into a register; `LoadNull` and the domain-checked producers
-/// manufacture one. A null test, a PK column (which has no null bit, even
-/// declared nullable — which `TestSchema`, validating nothing, can state) and the
-/// total transforms add none. Each program's result is its last instruction.
+/// A program resolves `no_nulls` exactly when nothing in it can produce a NULL
+/// against the schema.
 #[test]
 fn no_nulls_holds_exactly_when_nothing_can_produce_a_null() {
     use LogicalInstr as L;
@@ -240,10 +232,8 @@ fn a_select_feeding_a_boolean_is_read_as_its_truthiness() {
 }
 
 // ---------------------------------------------------------------------------
-// Expr-program validation (ExprValidateErr): one crafted input per vector.
-// Wire code is flat five-word instructions `[opcode, selector, a1, a2, a3]`;
-// several opcodes read an operand word as a full u32 (col / const_idx), not as a
-// register's truncated u16.
+// Expr-program validation (ExprValidateErr): one crafted input per vector,
+// over five-word instructions `[opcode, selector, a1, a2, a3]`.
 // ---------------------------------------------------------------------------
 
 /// The instruction words of `(opcode, selector, operands)` entries, each
@@ -435,9 +425,7 @@ fn a_const_pool_at_the_cap_is_accepted() {
 /// two the encoder writes.
 #[test]
 fn from_blob_rejects_an_unknown_opcode_or_sink_kind() {
-    // 0 and u32::MAX are holes permanently. Deliberately NOT "one past the
-    // current maximum": that couples the test to every opcode addition while
-    // adding no coverage a new opcode's own decode test does not already give.
+    // 0 and u32::MAX are never opcodes.
     for op in [0, u32::MAX] {
         assert_eq!(
             from_regions(&[[op, 0, 0, 0, 0]], &[], vec![]).unwrap_err(),
@@ -516,18 +504,14 @@ fn validate_rejects_an_out_of_range_column() {
     );
 }
 
-/// Each column-reading opcode's type rule, over every type code. An integer load
-/// decodes little-endian integers a register holds; a float load branches on
-/// width alone, so an integer column would make it slice an 8-byte stride out of
-/// a narrower region; the string opcodes read 16-byte German-string cells; a
-/// null test reads the bitmap alone, so any column will do. All but the integer
-/// load and the null test are payload-only.
+/// Each column-reading opcode's type rule over every type code, and whether it
+/// reads a key column.
 #[test]
 fn each_column_opcode_admits_exactly_its_column_kinds() {
     use LogicalInstr as L;
     use TypeCode as T;
     // The calendar types and DECIMAL are fixed-width integers under other names.
-    let ints = [
+    const INTS: &[TypeCode] = &[
         T::U8,
         T::I8,
         T::U16,
@@ -540,89 +524,102 @@ fn each_column_opcode_admits_exactly_its_column_kinds() {
         T::Timestamp,
         T::Decimal,
     ];
-    let strs = [T::String, T::Blob];
-    // (opcode, the instruction over column `c`, the kind its mismatch names, the
-    // accepted types, whether a PK column is accepted)
-    type Rule<'a> = (&'a str, fn(u32) -> LogicalInstr, ColKind, &'a [TypeCode], bool);
-    let rules: [Rule<'_>; 7] = [
-        (
-            "LoadColInt",
-            |c| L::LoadColInt { col: c },
-            ColKind::FixedIntCol,
-            &ints,
-            true,
-        ),
-        (
-            "LoadColFloat",
-            |c| L::LoadColFloat { col: c },
-            ColKind::FloatPayload,
-            &[T::F32, T::F64],
-            false,
-        ),
-        (
-            "LoadColStr",
-            |c| L::LoadColStr { col: c },
-            ColKind::StringPayload,
-            &strs,
-            false,
-        ),
-        (
-            "StrColConst",
-            |c| L::StrColConst {
+    const STRS: &[TypeCode] = &[T::String, T::Blob];
+    const PK: u32 = 0;
+    const SUBJECT: u32 = 1;
+    const OTHER_STRING: u32 = 2;
+    struct Rule {
+        name: &'static str,
+        over: fn(u32) -> LogicalInstr,
+        mismatch: ColKind,
+        accepts: &'static [TypeCode],
+        reads_pk: bool,
+    }
+    let rules = [
+        Rule {
+            name: "LoadColInt",
+            over: |col| L::LoadColInt { col },
+            mismatch: ColKind::FixedIntCol,
+            accepts: INTS,
+            reads_pk: true,
+        },
+        Rule {
+            name: "LoadColFloat",
+            over: |col| L::LoadColFloat { col },
+            mismatch: ColKind::FloatPayload,
+            accepts: &[T::F32, T::F64],
+            reads_pk: false,
+        },
+        Rule {
+            name: "LoadColStr",
+            over: |col| L::LoadColStr { col },
+            mismatch: ColKind::StringPayload,
+            accepts: STRS,
+            reads_pk: false,
+        },
+        Rule {
+            name: "StrColConst",
+            over: |col| L::StrColConst {
                 op: CmpOp::Eq,
-                col: c,
+                col,
                 const_idx: ConstIdx(0),
             },
-            ColKind::StringPayload,
-            &strs,
-            false,
-        ),
-        (
-            "StrColCol a",
-            |c| L::StrColCol { op: CmpOp::Eq, col_a: c, col_b: 2 },
-            ColKind::StringPayload,
-            &strs,
-            false,
-        ),
-        (
-            "StrColCol b",
-            |c| L::StrColCol { op: CmpOp::Eq, col_a: 2, col_b: c },
-            ColKind::StringPayload,
-            &strs,
-            false,
-        ),
-        (
-            "IsNull",
-            |c| L::IsNull { col: c, invert: false },
-            ColKind::AnyCol,
-            T::ALL,
-            true,
-        ),
+            mismatch: ColKind::StringPayload,
+            accepts: STRS,
+            reads_pk: false,
+        },
+        Rule {
+            name: "StrColCol a",
+            over: |col_a| L::StrColCol {
+                op: CmpOp::Eq,
+                col_a,
+                col_b: OTHER_STRING,
+            },
+            mismatch: ColKind::StringPayload,
+            accepts: STRS,
+            reads_pk: false,
+        },
+        Rule {
+            name: "StrColCol b",
+            over: |col_b| L::StrColCol {
+                op: CmpOp::Eq,
+                col_a: OTHER_STRING,
+                col_b,
+            },
+            mismatch: ColKind::StringPayload,
+            accepts: STRS,
+            reads_pk: false,
+        },
+        Rule {
+            name: "IsNull",
+            over: |col| L::IsNull { col, invert: false },
+            mismatch: ColKind::AnyCol,
+            accepts: T::ALL,
+            reads_pk: true,
+        },
     ];
-    // Column 0 is a U64 PK, column 1 the subject, column 2 the string the column
-    // pair compares against.
     let validate = |tc: TypeCode, instr: LogicalInstr| {
-        let schema = TestSchema::with_pk_at(0, &[T::U64, tc, T::String]);
+        let schema = TestSchema::with_pk_at(PK as usize, &[T::U64, tc, T::String]);
         LogicalProgram::new(vec![instr], vec![], vec![b"x".to_vec()]).validate(&schema, None)
     };
-    for (name, instr, kind, accepted, pk_ok) in rules {
+    for rule in rules {
+        let name = rule.name;
         for &tc in T::ALL {
-            let want = match accepted.contains(&tc) {
+            let want = match rule.accepts.contains(&tc) {
                 true => Ok(()),
                 false => Err(ExprValidateErr::ColKindMismatch {
-                    col: 1,
+                    col: SUBJECT,
                     type_code: tc,
-                    want: type_phrase(kind),
+                    want: type_phrase(rule.mismatch),
                 }),
             };
-            assert_eq!(validate(tc, instr(1)), want, "{name} over {tc}");
+            assert_eq!(validate(tc, (rule.over)(SUBJECT)), want, "{name} over {tc}");
         }
-        let want = if pk_ok {
-            Ok(())
-        } else {
-            Err(ExprValidateErr::ColNotPayload { col: 0 })
+        let want = match rule.reads_pk {
+            true => Ok(()),
+            false => Err(ExprValidateErr::ColNotPayload { col: PK }),
         };
-        assert_eq!(validate(T::I64, instr(0)), want, "{name} over the PK");
+        assert_eq!(validate(T::I64, (rule.over)(PK)), want, "{name} over the PK");
     }
 }
 
@@ -672,11 +669,8 @@ fn copy_col_admits_only_a_widening_destination() {
     assert_eq!(prog.validate(&in_pk, None), Ok(()));
 }
 
-/// A register sink's slot must hold what its register does: the register's class,
-/// and its whole 8-byte image — or fewer bytes exactly when the producer
-/// range-checked the value to that integer width, where the low bytes are the
-/// whole value. A string slot is refused on class before the width rule; the two
-/// errors name different faults.
+/// A register sink's slot holds the register's class and whole value: fewer
+/// bytes only where the producer range-checked the value to that width.
 #[test]
 fn a_register_sinks_slot_holds_its_whole_value() {
     use TypeCode as T;
@@ -715,10 +709,7 @@ fn a_register_sinks_slot_holds_its_whole_value() {
     }
 }
 
-/// Output coverage: with an `out_schema`, the sink list must be exactly as long
-/// as the declared payload. A sink writes the slot at its own position, so a
-/// permuted or duplicated destination cannot be expressed and a short list is
-/// the only failure left.
+/// With an output schema, the sinks cover exactly its payload slots.
 #[test]
 fn validate_rejects_a_sink_list_that_does_not_cover_the_output() {
     // in/out: [U64 PK, I64, I64] — two output payload slots.
@@ -752,52 +743,40 @@ fn in_set_prog(col_tc: TypeCode, set: &[i64]) -> (TestSchema, ScalarEval) {
     (schema, prog)
 }
 
-/// Membership at every pool shape that can change the answer, plus the 3VL rule
-/// that a NULL operand is NULL out whatever the pool holds.
-///
-/// The `U64` case is the one that is not plain integer comparison: the column
-/// loads as a bare bit-reinterpret and the folded literal `-1` is `i64::-1`, so
-/// `u64::MAX` matches — the same bit-equality `col = -1` gives. The 1000-element
-/// pool is here because membership is a binary search rather than an OR-chain,
-/// so pool size costs no registers; at ~4000 registers the OR-chain form would
-/// exceed the cap.
+/// IN over every pool shape that can change the answer; a NULL operand is NULL.
+/// A U64 column holding `u64::MAX` matches `-1` bit for bit, as `col = -1` does.
 #[test]
 fn int_in_set_membership_over_every_pool_shape() {
-    // (column type, pool, [(value, expected membership)]) — aliased because the
-    // inline tuple trips `clippy::type_complexity`.
-    type Case<'a> = (TypeCode, &'a [i64], &'a [(i64, i128)]);
-    let big: Vec<i64> = (0..1000).collect();
-    let cases: [Case<'_>; 4] = [
+    for (col_tc, pool, probes) in [
         (
             TypeCode::I64,
-            &[-5, -1, 0, 3],
-            &[(-5, 1), (-1, 1), (0, 1), (3, 1), (2, 0), (100, 0)],
+            vec![-5, -1, 0, 3],
+            vec![(-5, 1), (-1, 1), (0, 1), (3, 1), (2, 0), (100, 0)],
         ),
-        (TypeCode::U64, &[-1], &[(u64::MAX as i64, 1), (7, 0)]),
-        (TypeCode::I64, &[], &[(42, 0)]),
-        (TypeCode::I64, &big, &[(0, 1), (777, 1), (999, 1), (1000, 0), (-1, 0)]),
-    ];
-
-    for (col_tc, pool, probes) in cases {
-        let (schema, mut prog) = in_set_prog(col_tc, pool);
+        (TypeCode::U64, vec![-1], vec![(u64::MAX as i64, 1), (7, 0)]),
+        (TypeCode::I64, vec![], vec![(42, 0)]),
+        (
+            TypeCode::I64,
+            (0..1000).collect(),
+            vec![(0, 1), (777, 1), (999, 1), (1000, 0), (-1, 0)],
+        ),
+    ] {
+        let (schema, mut prog) = in_set_prog(col_tc, &pool);
         // One row per probe, then a NULL operand.
         let n = probes.len() + 1;
         let mb = make_n_col_view(
             &schema,
             n,
-            |row, _| probes.get(row).map_or(0, |p| p.0),
+            |row, _| probes.get(row).map_or(0, |&(value, _)| value),
             |row, _| row == n - 1,
         );
-        let want: Vec<Option<i128>> = probes.iter().map(|p| Some(p.1)).chain([None]).collect();
+        let want: Vec<Option<i128>> = probes.iter().map(|&(_, member)| Some(member)).chain([None]).collect();
         assert_eq!(row_values(&mut prog, &mb), want, "tc={col_tc} pool_len={}", pool.len());
     }
 }
 
-/// A const-pool entry is held to what its opcode reads it as: a STRING value and
-/// a LIKE pattern's text are UTF-8 (`LIKE ''` included), a TRIM set is ASCII, an
-/// IN set is strictly ascending 8-byte integers, and a compare constant, which
-/// also serves BLOB columns, is any bytes. An index past the pool is refused
-/// whichever opcode names it.
+/// A const-pool entry is held to what its opcode reads it as, and an index past
+/// the pool is refused whichever opcode names it.
 #[test]
 fn a_pool_entry_is_held_to_its_kind() {
     use crate::like::{ANY_MANY, ANY_ONE};
@@ -893,12 +872,8 @@ fn a_forged_selector_is_refused_at_decode() {
     }
 }
 
-/// A register is the index of the instruction that writes it, so an operand at
-/// or above its reader's own index is a forward reference into a lane the morsel
-/// has not filled — which covers the out-of-range, the self-referencing and the
-/// not-yet-written operand alike. Placed first, every decodable instruction's
-/// register operands are all such references, so each must be refused unless it
-/// reads none; that is what catches an operand `operands()` leaves out.
+/// Every decodable instruction placed first reads only registers not yet
+/// written, so it is refused unless it reads none.
 #[test]
 fn every_register_operand_is_checked_read_before_write() {
     use LogicalInstr as L;
@@ -932,10 +907,8 @@ fn every_register_operand_is_checked_read_before_write() {
 // Register classes
 // ---------------------------------------------------------------------------
 
-/// A mixed-class register operand is refused whichever way round it goes: a
-/// string opcode reading the scalar file would resolve a lane that was never
-/// written, and an integer opcode reading a string register would interpret
-/// whatever i64 sits at that index.
+/// A register operand of the wrong class is refused, whichever class the opcode
+/// wants.
 #[test]
 fn operand_class_is_enforced_in_both_directions() {
     use LogicalInstr as L;
@@ -1207,11 +1180,9 @@ fn is_identity_map_requires_an_in_order_copy_over_one_layout() {
     assert!(LogicalProgram::copy_cols(&[]).is_identity_map(&pk_only, &pk_only));
 }
 
-/// [`NullPerm`] against a bit-by-bit move: each output slot's bit is its copy
-/// source's, or clear for a source that cannot carry one — a PK column, or a
-/// `NOT NULL` payload slot whatever its bit says. Every row of the window is
-/// written and none outside it, across the permutation's 256-row blocks. The
-/// copy list collapses to the cheapest shape that does this.
+/// [`NullPerm`] against a bit-by-bit move over a window spanning several
+/// blocks: a source that cannot carry a bit — a PK column or a NOT NULL slot —
+/// clears its slot.
 #[test]
 fn null_perm_moves_each_copied_bit_into_its_slot() {
     let payload = |slot: u8| ColumnLocator::Payload { slot, size: 8, type_code: TypeCode::I64 };

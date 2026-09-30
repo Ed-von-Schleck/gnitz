@@ -8,10 +8,8 @@ fn hit(m: &LikeMatcher, h: &[u8]) -> bool {
     m.matches(h, &mut Vec::new())
 }
 
-/// The LIKE definition, read straight off the encoded pattern: `ANY_MANY` tries
-/// every character boundary, `ANY_ONE` steps one character, any other byte is a
-/// literal, compared ASCII-folded under ILIKE. Shares nothing with the matcher —
-/// not the tokenizer, not the search. Exponential in the `%` count.
+/// The LIKE definition over the encoded pattern, sharing nothing with the
+/// matcher. Exponential in the `%` count.
 fn glob(p: &[u8], h: &[u8], ci: bool) -> bool {
     let fold = |b: u8| if ci { b.to_ascii_lowercase() } else { b };
     match p.split_first() {
@@ -54,12 +52,10 @@ fn words(alphabet: &[&str], max: u32) -> Vec<String> {
 }
 
 /// Every pattern of up to four symbols against every haystack of up to four
-/// characters, LIKE and ILIKE. The pattern holds an upper-case literal and a
-/// two-byte one; the haystack both cases of `a`, and `é` beside `É`, which ASCII
-/// folding must keep apart — so every specialization, every backtrack and every
-/// one-character step over a multi-byte character is reached.
+/// characters, LIKE and ILIKE.
 #[test]
 fn every_short_pattern_agrees_with_the_definition() {
+    // `É` beside `é`: ASCII folding must keep them apart.
     let haystacks = words(&["a", "A", "b", "é", "É"], 4);
     for pattern in words(&["a", "B", "é", "%", "_"], 4) {
         let p = encode(&pattern, None).unwrap();
@@ -111,11 +107,8 @@ fn the_anchor_walk_terminates() {
     assert!(!hit(&like("%a%a%a%a%a%ab"), &[b'a'; 400]));
 }
 
-/// The encoding of `sql` under `escape`: the wildcards become bytes UTF-8 text
-/// never contains, the escape makes the next character literal — a wildcard, an
-/// ordinary or a multi-byte one, or itself — and an escape that is itself a
-/// wildcard stops being one while the other stays live. A trailing live escape
-/// is refused.
+/// Each SQL pattern's encoding under its escape; a trailing live escape is
+/// refused.
 #[test]
 fn each_pattern_encodes_to_its_bytes() {
     let e = Some('\\');
@@ -138,10 +131,8 @@ fn each_pattern_encodes_to_its_bytes() {
     }
 }
 
-/// The shape each pattern specializes to — a performance contract: the
-/// anchored shapes compare in place, and only a pattern the table cannot express
-/// takes the backtracking walk. Adjacent `%` collapse and escaped bytes merge
-/// into one literal before the table is consulted; a `_` never joins a literal.
+/// The shape each pattern compiles to: only a pattern no anchored shape
+/// expresses takes the backtracking walk.
 #[test]
 fn each_pattern_specializes_to_its_shape() {
     let shape = |pattern: &str| {
