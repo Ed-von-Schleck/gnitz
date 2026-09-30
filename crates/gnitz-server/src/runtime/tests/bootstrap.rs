@@ -44,11 +44,11 @@ mod staging {
     use crate::catalog::{SysFamily, PUBLIC_SCHEMA_ID};
     use crate::runtime::sal::fixtures::TestLog;
     use crate::test_support::{
-        col_def, col_tab_batch, identity_circuit, push_table_tab_row, push_view_tab_row, scratch_dir,
+        circuit_nodes_batch, col_def, col_tab_batch, identity_circuit, push_table_tab_row, push_view_tab_row,
+        scratch_dir,
     };
     use gnitz_store::schema::Placement;
     use gnitz_store::storage::BatchBuilder;
-    use gnitz_wire::sys_rows::write_circuit_rows;
     use gnitz_wire::TypeCode;
 
     const SAL_SIZE: usize = 1 << 20;
@@ -98,9 +98,7 @@ mod staging {
         let mut view_tab = BatchBuilder::new(*SysFamily::View.schema());
         push_view_tab_row(&mut view_tab, 1, v, "v", 0, 0, 0);
         let view_tab = view_tab.finish();
-        let mut circuit = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
-        write_circuit_rows(&mut circuit, v, &identity_circuit(r, gnitz_wire::ReadBound::None));
-        let circuit = circuit.finish();
+        let circuit = circuit_nodes_batch(v, &identity_circuit(r, gnitz_wire::ReadBound::None));
 
         let log = TestLog::new(SAL_SIZE, 1, 1);
         let columns = col_tab(v, 1);

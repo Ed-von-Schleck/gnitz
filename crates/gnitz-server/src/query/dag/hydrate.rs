@@ -31,3 +31,7 @@ impl SkeletonHydrator for DagEngine {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/hydrate.rs"]
+mod tests;

@@ -131,7 +131,8 @@ fn run_side(
 impl DagEngine {
     /// One [`Step`] per dependency edge out of `source_id`'s forward closure, in
     /// execution order, skipping non-resumable views: their backfill fills them.
-    /// Worker-identical, which keeps the workers in lockstep.
+    /// The skipped set is closed under dependents, so no step reads a skipped
+    /// producer. Worker-identical, which keeps the workers in lockstep.
     fn tick_schedule(&self, source_id: u64) -> Vec<Step> {
         let mut schedule: Vec<Step> = Vec::new();
         for producer in std::iter::once(source_id).chain(self.dependent_closure(vec![source_id])) {

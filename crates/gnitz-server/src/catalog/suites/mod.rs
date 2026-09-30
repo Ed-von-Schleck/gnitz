@@ -31,27 +31,6 @@ use gnitz_wire::{pack_pk_cols, TypeCode, PK_LIST_PACKED_FLAG};
 
 use std::fs;
 
-/// Every row of `tid` under `bound`, in the relation's own layout.
-fn read_rows(
-    engine: &mut CatalogEngine,
-    tid: u64,
-    bound: gnitz_wire::ReadBound,
-) -> std::rc::Rc<gnitz_store::storage::Batch> {
-    let schema = engine
-        .registry
-        .relation(tid)
-        .map(gnitz_store::relation::Relation::schema)
-        .expect("a registered relation");
-    engine
-        .scan_spec(tid, gnitz_wire::ReadSpec::all_rows(bound), schema.layout_digest())
-        .expect("a read")
-}
-
-/// Every row of `tid`.
-fn scan_all(engine: &mut CatalogEngine, tid: u64) -> std::rc::Rc<gnitz_store::storage::Batch> {
-    read_rows(engine, tid, gnitz_wire::ReadBound::None)
-}
-
 /// Every live row of `opk`'s PK group, read as a one-key `PkSet`.
 fn pk_group(engine: &mut CatalogEngine, tid: u64, opk: &[u8]) -> std::rc::Rc<gnitz_store::storage::Batch> {
     let keys = gnitz_wire::PkKeys::from_keys(opk.len(), [opk]);
@@ -71,9 +50,9 @@ fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> std::rc::
 
 use crate::test_support::{
     col_def, col_tab_batch, equi_join_circuit, fk_def, idx_tab_batch, negate_chain, nullable_def, opk_pk,
-    pk_payload_schema, push_table_tab_row, push_view_tab_row, register_identity_view, schema_tab_batch, scratch_dir,
-    seek_by_index, seek_by_index_range, sum_weights, try_register_identity_view, try_register_view, uuid_def,
-    write_circuit, write_identity_circuit, LocalDrive,
+    pk_payload_schema, push_table_tab_row, push_view_tab_row, read_rows, register_identity_view, scan_all,
+    schema_tab_batch, scratch_dir, seek_by_index, seek_by_index_range, sum_weights, try_register_identity_view,
+    try_register_view, uuid_def, write_circuit, write_identity_circuit, LocalDrive,
 };
 
 /// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table

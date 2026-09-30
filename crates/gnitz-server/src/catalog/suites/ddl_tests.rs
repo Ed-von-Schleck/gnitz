@@ -1127,45 +1127,6 @@ fn a_view_create_at_a_registered_table_id_is_refused() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── bounded view hydration against unticked ingests ─────────────────────────
-
-/// A linear bounded view hydrates from its source as of the source's last tick.
-#[test]
-fn a_table_seed_reads_the_source_as_of_its_last_tick() {
-    use crate::test_support::{make_batch, zset_of};
-    use gnitz_store::read::SkeletonHydrator;
-    let cols = [col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
-    let (mut engine, tid, dir) = table_fixture("seed_as_of_last_tick", &cols);
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    let rows: Vec<(u64, i64, i64)> = (1..=8).map(|id| (id, 1, id as i64 * 10)).collect();
-    engine.ingest_to_family(tid, &make_batch(&schema, &rows)).unwrap();
-
-    let view = try_register_identity_view(&mut engine, tid, "bounded", &cols, 1 << 20, 0).unwrap();
-    backfill(&mut engine, view, &[tid]);
-
-    // Row 8 lies outside every gathered range below.
-    let push = make_batch(&schema, &[(3, -1, 30), (5, -1, 50), (5, 1, 55), (8, -1, 80)]);
-    engine.ingest_unticked(tid, push).unwrap();
-
-    let hydrate = |engine: &mut CatalogEngine, ids: &[u64]| {
-        let keys = gnitz_wire::PkKeys::from_sorted(8, ids.iter().flat_map(|k| k.to_be_bytes()).collect());
-        let out = engine.dag.hydrate_keys(&engine.registry, view, keys).unwrap();
-        zset_of(&out, &schema)
-    };
-    let expect = |rows: &[(u64, i64, i64)]| zset_of(&make_batch(&schema, rows), &schema);
-    assert_eq!(hydrate(&mut engine, &[3, 5]), expect(&[(3, 1, 30), (5, 1, 50)]));
-    assert_eq!(hydrate(&mut engine, &[5]), expect(&[(5, 1, 50)]));
-
-    let delta = engine.dag.take_unticked(tid).unwrap();
-    let what = crate::query::Drive::Tick { source: tid, round: 1 };
-    crate::query::drive(&mut LocalDrive(&mut engine), what, delta).unwrap();
-    assert_eq!(hydrate(&mut engine, &[3, 5]), expect(&[(5, 1, 55)]));
-    assert_eq!(hydrate(&mut engine, &[5]), expect(&[(5, 1, 55)]));
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
 #[test]
 fn only_a_scanned_table_holds_a_push_for_its_tick() {
     use crate::test_support::make_batch;

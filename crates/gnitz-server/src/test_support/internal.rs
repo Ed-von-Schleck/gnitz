@@ -40,6 +40,23 @@ pub fn fk_def(name: &str, type_code: TypeCode, parent_tid: u64, parent_col: u32)
     }
 }
 
+/// Every row of `tid` under `bound`, in the relation's own layout.
+pub fn read_rows(engine: &mut CatalogEngine, tid: u64, bound: gnitz_wire::ReadBound) -> std::rc::Rc<Batch> {
+    let schema = engine
+        .registry
+        .relation(tid)
+        .map(gnitz_store::relation::Relation::schema)
+        .expect("a registered relation");
+    engine
+        .scan_spec(tid, gnitz_wire::ReadSpec::all_rows(bound), schema.layout_digest())
+        .expect("a read")
+}
+
+/// Every row of `tid`.
+pub fn scan_all(engine: &mut CatalogEngine, tid: u64) -> std::rc::Rc<Batch> {
+    read_rows(engine, tid, gnitz_wire::ReadBound::None)
+}
+
 /// Net weight summed over every (PK, payload) a store's cursor yields — what a
 /// Z-set store actually holds. A row *count* would hide a double-drive, which
 /// leaves the row set identical and only doubles the weights.
@@ -56,12 +73,19 @@ pub fn sum_weights(mut c: ReadCursor) -> i64 {
 // Circuit + view fixtures
 // ---------------------------------------------------------------------------
 
-/// Write `vid`'s circuit through the applied-delta path, through the row writer
-/// the client commits with.
-pub fn write_circuit(engine: &mut CatalogEngine, vid: u64, circuit: Circuit) {
+/// `circuit` as `vid`'s CIRCUIT_NODES batch, through the row writer the client
+/// commits with.
+pub fn circuit_nodes_batch(vid: u64, circuit: &Circuit) -> Batch {
     let mut bb = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
-    write_circuit_rows(&mut bb, vid, &circuit);
-    engine.submit(SysFamily::CircuitNodes, bb.finish()).unwrap();
+    write_circuit_rows(&mut bb, vid, circuit);
+    bb.finish()
+}
+
+/// Write `vid`'s circuit through the applied-delta path.
+pub fn write_circuit(engine: &mut CatalogEngine, vid: u64, circuit: Circuit) {
+    engine
+        .submit(SysFamily::CircuitNodes, circuit_nodes_batch(vid, &circuit))
+        .unwrap();
 }
 
 /// The minimal identity circuit `ScanDelta(source, bound) → Integrate`.
@@ -69,6 +93,18 @@ pub fn identity_circuit(source_tid: u64, bound: gnitz_wire::ReadBound) -> Circui
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(source_tid, bound);
     circuit.sink(scan);
+    circuit
+}
+
+/// One unbounded `ScanDelta` per source, the first sunk: the dependency-map
+/// shape of a view over `sources`.
+pub fn scanning_circuit(sources: &[u64]) -> Circuit {
+    let mut circuit = Circuit::default();
+    let scans: Vec<_> = sources
+        .iter()
+        .map(|&s| circuit.input_delta(s, gnitz_wire::ReadBound::None))
+        .collect();
+    circuit.sink(scans[0]);
     circuit
 }
 

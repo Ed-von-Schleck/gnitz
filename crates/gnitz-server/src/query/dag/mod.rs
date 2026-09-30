@@ -129,11 +129,6 @@ impl DagEngine {
         self.unticked.remove(&tid)
     }
 
-    /// Apply one `CircuitNodes` delta to the dependency map.
-    pub(crate) fn apply_circuit_delta(&mut self, batch: &Batch) {
-        self.dep.apply(batch);
-    }
-
     // ── Compilation ─────────────────────────────────────────────────────
 
     /// [`ensure_compiled`] for a caller that cannot name a compiled plan:

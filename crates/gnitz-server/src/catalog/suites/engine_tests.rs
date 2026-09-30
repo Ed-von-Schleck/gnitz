@@ -482,84 +482,20 @@ fn test_fk_index_metadata_queries() {
 }
 
 #[test]
-fn test_dep_map_is_the_scan_delta_nodes() {
-    // The dep map is derived from the circuit's `ScanDelta` nodes: the view id
-    // off the compound PK region, the source off the `source_table` column. Two
-    // distinct sources give two edges; a repeated source gives one; and a
-    // non-`ScanDelta` node carrying a `source_table` gives none.
-    let dir = temp_dir("dep_map_scan_delta");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    // Raw rows, not a `Circuit`: a sink carrying a `source_table` is a shape no
-    // circuit encodes to.
-    let mut bb = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
-    for (node_id, (opcode, source)) in [
-        (gnitz_wire::Opcode::ScanDelta, 100),
-        (gnitz_wire::Opcode::ScanDelta, 200),
-        (gnitz_wire::Opcode::ScanDelta, 100),
-        (gnitz_wire::Opcode::IntegrateSink, 300),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        gnitz_wire::sys_rows::write_circuit_node_row(
-            &mut bb,
-            &gnitz_wire::sys_rows::CircuitNodeRow {
-                view_id: 400,
-                node_id: node_id as u64,
-                opcode: opcode.as_wire(),
-                source_table: Some(source),
-                inputs: [None; 2],
-                params: None,
-            },
-            1,
-        );
-    }
-    engine.submit(SysFamily::CircuitNodes, bb.finish()).unwrap();
-
-    assert_eq!(
-        engine.dag.dependents_of(100),
-        &[400u64][..],
-        "the repeated source yields one edge"
-    );
-    assert_eq!(
-        engine.dag.dependents_of(200),
-        &[400u64][..],
-        "table 200 must feed view 400"
-    );
-    assert!(
-        engine.dag.dependents_of(300).is_empty(),
-        "a non-ScanDelta node contributes no edge"
-    );
-
-    let mut sources = engine.dag.sources_of(400).to_vec();
-    sources.sort_unstable();
-    assert_eq!(sources, vec![100, 200], "both ScanDelta sources of view 400");
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn test_dep_map_view_on_view_chain() {
-    // A view over a view: each segment's own `ScanDelta` is its edge, in both
-    // map directions.
+    // Submitted circuit rows reach the map, and boot replays them into it.
     let dir = temp_dir("dep_map_view_chain");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     write_identity_circuit(&mut engine, 107, 100, gnitz_wire::ReadBound::None);
     write_identity_circuit(&mut engine, 108, 107, gnitz_wire::ReadBound::None);
-
-    assert_eq!(engine.dag.dependents_of(100), &[107u64][..], "base 100 feeds view 107");
-    assert_eq!(engine.dag.dependents_of(107), &[108u64][..], "view 107 feeds view 108");
-    assert_eq!(engine.dag.sources_of(107), &[100u64][..]);
-    assert_eq!(engine.dag.sources_of(108), &[107u64][..]);
+    assert_eq!(engine.dag.dependents_of(107), [108]);
     engine.close();
 
-    // Boot replays the circuit rows into the map.
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert_eq!(engine.dag.sources_of(107), &[100u64][..]);
-    assert_eq!(engine.dag.sources_of(108), &[107u64][..]);
+    assert_eq!(engine.dag.dependents_of(100), [107]);
+    assert_eq!(engine.dag.dependents_of(107), [108]);
+    assert_eq!(engine.dag.sources_of(108), [107]);
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
