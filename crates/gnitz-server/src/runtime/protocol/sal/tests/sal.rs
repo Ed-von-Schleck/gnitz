@@ -219,7 +219,13 @@ fn sal_cross_process_checkpoint() {
             };
             // Round 2 is written at cursor 0 of the next epoch.
             reader.rewind();
-            writer.send_status(slot[0] as u64, msg.lsn as u32, gnitz_wire::WireStatus::Ok, b"");
+            writer.send_msg(
+                msg.lsn as u32,
+                &crate::runtime::wire::WireMsg {
+                    target_id: slot[0] as u64,
+                    ..Default::default()
+                },
+            );
         }
     };
 

@@ -369,7 +369,7 @@ fn run_worker_child(
         // The master reads this frame off the shared ring, which outlives the
         // process that wrote it.
         gnitz_error!("{e}");
-        w2m_writer.send_status(0, BOOT_READY_REQUEST_ID, gnitz_wire::WireStatus::Error, e.as_bytes());
+        w2m_writer.send_status(BOOT_READY_REQUEST_ID, gnitz_wire::WireStatus::Error, e.as_bytes());
         unsafe { libc::_exit(1) };
     }
 

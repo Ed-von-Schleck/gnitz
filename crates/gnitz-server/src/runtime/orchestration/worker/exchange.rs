@@ -50,8 +50,7 @@ impl WorkerProcess {
             self.w2m_writer
                 .sal_park()
                 .park(|| self.sal_reader.is_empty() && !self.mesh.complete());
-            while let Some((msg, wire)) = self.sal_reader.next() {
-                let req = self.decode_request(&msg, wire);
+            while let Some(req) = self.next_request() {
                 self.dispatch_in_eval(req);
             }
             if self.mesh.complete() {
@@ -82,11 +81,8 @@ impl WorkerProcess {
             // A drive writes no base-table key.
             HasPk => self.handle_request(req),
             Shutdown => self.handle_request(req),
-            // A serial-range reservation, which takes no tick gate: dropped unread.
-            DdlSync if SysFamily::from_id(req.wire.control.hdr.target_id) == Some(SysFamily::Sequence) => {
-                self.handle_request(req)
-            }
-            // Never sent beside a drive.
+            // Never sent beside a drive. (A `_sequences` DdlSync — a serial-range
+            // reservation, which takes no tick gate — is skipped before dispatch.)
             DdlSync | Tick | FlushEph | Backfill | UniquePreflight => {
                 gnitz_fatal_abort!("{:?} inside an exchange wait — diverged from the master", req.kind)
             }

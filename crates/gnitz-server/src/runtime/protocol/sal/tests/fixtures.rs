@@ -185,19 +185,3 @@ pub(crate) fn group_in(log: SalLog, base: u64, epoch: u32) -> SalMessage {
 pub(crate) fn group_at(log: SalLog, base: u64) -> SalMessage {
     group_in(log, base, log.anchor().expect("the anchor verifies").0)
 }
-
-/// A payload-less group outside every zone.
-pub(crate) fn bare_message(kind: SalMessageKind, target_id: u64) -> SalMessage {
-    SalMessage {
-        lsn: 0,
-        kind,
-        zone_end: false,
-        target_id,
-        base: 0,
-        end: 0,
-        request_id: 0,
-        in_request_order: false,
-        payload: &[],
-        dir: &[],
-    }
-}

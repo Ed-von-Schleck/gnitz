@@ -41,7 +41,7 @@ fn a_lease_routes_its_id_until_dropped() {
 fn an_ack_landing_before_its_awaiter_is_kept() {
     let (r, writers) = reactor_with_rings(1);
     let lease = r.lease_acks("test");
-    writers[0].send_status(0, lease.id(), WireStatus::Error, b"boom");
+    writers[0].send_status(lease.id(), WireStatus::Error, b"boom");
     r.drain_all_w2m();
 
     assert!(
@@ -61,14 +61,14 @@ fn acks_resolve_on_the_last_ack_and_name_the_faulting_ring() {
     let mut cx = Context::from_waker(&waker);
     assert!(fut.as_mut().poll(&mut cx).is_pending());
 
-    writers[1].send_status(0, lease.id(), WireStatus::Error, b"boom");
+    writers[1].send_status(lease.id(), WireStatus::Error, b"boom");
     r.drain_all_w2m();
     assert!(
         fut.as_mut().poll(&mut cx).is_pending(),
         "one of two ACKs must not resolve"
     );
 
-    writers[0].send_status(0, lease.id(), WireStatus::Ok, &[]);
+    writers[0].send_status(lease.id(), WireStatus::Ok, &[]);
     r.drain_all_w2m();
     assert!(is_queued(0), "the last ACK wakes the awaiter");
     match fut.as_mut().poll(&mut cx) {
@@ -85,7 +85,7 @@ fn acks_resolve_on_the_last_ack_and_name_the_faulting_ring() {
 #[test]
 fn an_unrouted_frame_is_released_undecoded() {
     let (r, writers) = reactor_with_rings(1);
-    writers[0].send_status(0, 77, WireStatus::Ok, &[]);
+    writers[0].send_status(77, WireStatus::Ok, &[]);
     let before = r.inner.w2m.release_cursor(0);
     r.drain_all_w2m();
     assert!(r.inner.w2m.release_cursor(0) > before, "the slot is released");
@@ -121,7 +121,7 @@ fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
         let d = Rc::clone(&done);
         r.spawn(async move {
             // Published during the poll, after this tick's own drain.
-            writer.send_status(0, id, WireStatus::Ok, &[]);
+            writer.send_status(id, WireStatus::Ok, &[]);
             lease.acks().await.expect("an OK ACK");
             d.set(true);
         });
@@ -195,7 +195,7 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
         // drain-refresh-arm race pressure.
         let writer = W2mWriter::new(ptr);
         for req_id in 1..=N_MESSAGES {
-            writer.send_status(req_id, req_id as u32, WireStatus::Ok, &[]);
+            writer.send_status(req_id as u32, WireStatus::Ok, &[]);
         }
     };
 
@@ -243,13 +243,13 @@ fn a_publish_on_a_later_ring_wakes_the_reactor() {
     let r1 = test_ring(64 * 1024);
 
     let child = || {
-        W2mWriter::new(r0).send_status(0, 1, WireStatus::Ok, &[]);
+        W2mWriter::new(r0).send_status(1, WireStatus::Ok, &[]);
         let deadline = Instant::now() + TIMEOUT;
         while !unsafe { master_parked(r1) } {
             assert!(Instant::now() < deadline, "the reactor never parked on ring 1");
             std::thread::yield_now();
         }
-        W2mWriter::new(r1).send_status(0, 1, WireStatus::Ok, &[]);
+        W2mWriter::new(r1).send_status(1, WireStatus::Ok, &[]);
     };
     let pid = unsafe { fork_child(child) };
 

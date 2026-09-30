@@ -11,7 +11,7 @@ use std::rc::Rc;
 use crate::catalog::{CatalogEngine, SysFamily};
 use crate::query::{DagEngine, Drive, DriveHost};
 use crate::runtime::mesh::Mesh;
-use crate::runtime::sal::{SalMessage, SalMessageKind, SalReader};
+use crate::runtime::sal::{SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{self as ipc};
 use gnitz_foundation::fault::Seam;
@@ -21,25 +21,11 @@ use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 use gnitz_wire::{WireFlags, WireStatus};
 
-/// Lookup target for HasPk requests.
-enum HasPkLookup {
-    /// Check the table's primary-key store.
-    PrimaryKey,
-    /// Check a secondary index on the carried column list (single- or
-    /// multi-column; a composite index is located by its exact list). Unique and
-    /// non-unique alike — the FK parent-delete check probes a child's FK
-    /// auto-index, which is never unique.
-    SecondaryIndex { cols: gnitz_wire::PkColList },
-}
-
 /// One dispatched request. Fully owned — a parked request must not borrow the
 /// SAL mapping, which an inline `Flush` resets.
 struct Request {
     kind: SalMessageKind,
-    /// The group's request id, which every reply answers on.
-    request_id: u32,
-    /// Whether each reply must reach the ring in request order.
-    fifo: bool,
+    route: ReplyRoute,
     wire: ipc::DecodedWire,
 }
 
@@ -116,7 +102,7 @@ impl WorkerProcess {
     /// the fork child reports it on the W2M ring and exits. The ready ACK answers
     /// `ready_request_id`, which the master leases before it collects.
     pub fn run(&mut self, ready_request_id: u32) -> i32 {
-        self.send_ack(0, ready_request_id);
+        self.send_ack(ready_request_id);
 
         loop {
             // A queued train emits its next frame without waiting on the SAL.
@@ -132,8 +118,7 @@ impl WorkerProcess {
     fn drain_sal(&mut self) {
         // One frame per pass, so requests keep being served between frames.
         self.emit_pending_scan_chunk();
-        while let Some((msg, wire)) = self.sal_reader.next() {
-            let req = self.decode_request(&msg, wire);
+        while let Some(req) = self.next_request() {
             self.handle_request(req);
             // Before the next group, so a deferred read sees the state it was
             // sent against.
@@ -144,50 +129,47 @@ impl WorkerProcess {
         }
     }
 
-    /// Decode one SAL group's slot into an owned [`Request`]. The single decode
-    /// point: both drain loops and every parked request come through here.
-    fn decode_request(&mut self, msg: &SalMessage, wire: &'static [u8]) -> Request {
-        // The kinds the master frames with their target's catalog record.
-        let catalog_record = matches!(msg.kind, SalMessageKind::Push | SalMessageKind::DdlSync);
-        let known = |tid, record: &[u8]| catalog_record.then(|| self.cat().known_decode(tid, record)).flatten();
-        // Fail-stop: a dropped group diverges this worker from the master.
-        match ipc::decode_sal_slot(wire, known) {
-            Ok(w) => Request {
-                kind: msg.kind,
-                request_id: msg.request_id,
-                fifo: msg.in_request_order,
-                wire: w,
-            },
-            Err(e) => gnitz_fatal_abort!("failed to decode {:?} for tid={}: {e}", msg.kind, msg.target_id),
+    /// The next SAL group this worker acts on, decoded into an owned
+    /// [`Request`]: the single decode point of both drain loops. A `_sequences`
+    /// DdlSync is skipped unread — `_sequences` is master state, which no worker
+    /// reads.
+    fn next_request(&mut self) -> Option<Request> {
+        loop {
+            let (msg, wire) = self.sal_reader.next()?;
+            if msg.kind == SalMessageKind::DdlSync && SysFamily::from_id(msg.target_id) == Some(SysFamily::Sequence) {
+                continue;
+            }
+            // The kinds the master frames with their target's catalog record.
+            let catalog_record = matches!(msg.kind, SalMessageKind::Push | SalMessageKind::DdlSync);
+            let known = |tid, record: &[u8]| catalog_record.then(|| self.cat().known_decode(tid, record)).flatten();
+            // Fail-stop: a dropped group diverges this worker from the master.
+            return match ipc::decode_sal_slot(wire, known) {
+                Ok(w) => Some(Request {
+                    kind: msg.kind,
+                    route: ReplyRoute {
+                        target_id: w.control.hdr.target_id,
+                        request_id: msg.request_id,
+                        fifo: msg.in_request_order,
+                    },
+                    wire: w,
+                }),
+                Err(e) => gnitz_fatal_abort!("failed to decode {:?} for tid={}: {e}", msg.kind, msg.target_id),
+            };
         }
     }
 
     /// Run one request, with a failure sent back on its own request id — the one
-    /// place a worker's reply status is chosen, and the one fatal path a failed
-    /// DDL takes.
+    /// place a worker's reply status is chosen.
     fn handle_request(&mut self, req: Request) {
-        let (kind, request_id, target_id) = (req.kind, req.request_id, req.wire.control.hdr.target_id);
+        let request_id = req.route.request_id;
         if let Err(fault) = self.dispatch_inner(req) {
             self.send_fault(&fault, request_id);
-            if kind == SalMessageKind::DdlSync {
-                // DDL application failure on trusted master→worker IPC means
-                // memory corruption or an engine bug; continuing would leave
-                // this worker with a permanently stale catalog — silently wrong
-                // results.
-                gnitz_fatal_abort!("DdlSync application failed for tid={target_id}: {fault}");
-            }
         }
     }
 
     fn dispatch_inner(&mut self, req: Request) -> Result<(), gnitz_wire::WireFault> {
-        let Request { kind, request_id, fifo, wire: decoded } = req;
-        let hdr = decoded.control.hdr;
-        let target_id = hdr.target_id;
-        let route = ReplyRoute {
-            target_id: hdr.target_id,
-            request_id,
-            fifo,
-        };
+        let Request { kind, route, wire: decoded } = req;
+        let (hdr, target_id, request_id) = (decoded.control.hdr, route.target_id, route.request_id);
         let blob = decoded.blob;
         let batch = decoded.data_batch;
 
@@ -196,28 +178,28 @@ impl WorkerProcess {
 
             SalMessageKind::Flush => {
                 self.sal_reader.rewind();
-                self.handle_flush_all()?;
-                self.send_ack(0, request_id);
+                self.cat().registry.checkpoint_base()?;
+                self.send_ack(request_id);
                 Ok(())
             }
 
             SalMessageKind::FlushEph => {
                 self.sal_reader.rewind();
                 self.cat().flush_ephemeral_round(hdr.arg0)?;
-                self.send_ack(0, request_id);
+                self.send_ack(request_id);
                 Ok(())
             }
 
+            // Unaddressed, so a failure has no one to answer: DDL application
+            // failure on trusted master→worker IPC means memory corruption or an
+            // engine bug, and continuing would leave this worker with a
+            // permanently stale catalog — silently wrong results.
             SalMessageKind::DdlSync => {
-                // `_sequences` is master state: no worker reads it.
-                if SysFamily::from_id(target_id) == Some(SysFamily::Sequence) {
-                    return Ok(());
-                }
-                if let Some(batch) = batch {
-                    if !batch.is_empty() {
-                        self.cat().ddl_sync(target_id, batch)?;
-                        gnitz_debug!("ddl_sync tid={}", target_id);
+                if let Some(batch) = batch.filter(|b| !b.is_empty()) {
+                    if let Err(e) = self.cat().ddl_sync(target_id, batch) {
+                        gnitz_fatal_abort!("DdlSync application failed for tid={target_id}: {e}");
                     }
+                    gnitz_debug!("ddl_sync tid={}", target_id);
                 }
                 Ok(())
             }
@@ -225,7 +207,7 @@ impl WorkerProcess {
             SalMessageKind::Backfill => {
                 // Stop-the-world (the DDL parks the reactor): no yield.
                 self.handle_backfill(target_id, hdr.arg0)?;
-                self.send_ack(target_id, request_id);
+                self.send_ack(request_id);
                 Ok(())
             }
 
@@ -233,22 +215,16 @@ impl WorkerProcess {
                 let Some(batch) = batch else {
                     return Err("has_pk: a probe carries its keys".into());
                 };
-                let lookup = match gnitz_wire::probe_key_columns(hdr.arg1) {
-                    None => HasPkLookup::PrimaryKey,
-                    Some(packed) => HasPkLookup::SecondaryIndex {
-                        cols: self.cat().registry.index_cols(target_id, packed, "has_pk")?,
-                    },
-                };
-                self.handle_has_pk(route, batch, lookup, hdr.flags.probe_mode, hdr.arg0 as usize)
+                let result = self.handle_has_pk(target_id, batch, hdr.arg1, hdr.flags.probe_mode, hdr.arg0 as usize)?;
+                self.send_reply(route, result);
+                Ok(())
             }
 
             SalMessageKind::Push => {
-                if let Some(batch) = batch {
-                    if !batch.is_empty() {
-                        self.handle_push(target_id, batch);
-                    }
+                if let Some(batch) = batch.filter(|b| !b.is_empty()) {
+                    self.handle_push(target_id, batch);
                 }
-                self.send_ack(target_id, request_id);
+                self.send_ack(request_id);
                 Ok(())
             }
 
@@ -263,12 +239,28 @@ impl WorkerProcess {
                 for (i, &tid) in tids.iter().enumerate() {
                     self.handle_tick(tid, hdr.arg0 + i as u64);
                 }
-                self.send_ack(target_id, request_id);
+                self.send_ack(request_id);
                 Ok(())
             }
 
-            SalMessageKind::ScanSpec => self.answer_scan_spec(route, &blob, hdr.arg0),
-            SalMessageKind::DeltaRead => self.answer_delta_read(route, hdr.arg1, hdr.arg0, &blob),
+            SalMessageKind::ScanSpec => {
+                let keeper = self
+                    .cat()
+                    .scan_spec(target_id, gnitz_wire::ReadSpec::decode(&blob)?, hdr.arg0)?;
+                self.send_reply(route, keeper);
+                Ok(())
+            }
+
+            // Its deltas in rounds `(arg1, arg0]`.
+            SalMessageKind::DeltaRead => {
+                let reply_layout = gnitz_wire::decode_all(&blob, "delta read", |r| r.u64())?;
+                let keeper = self
+                    .cat()
+                    .registry
+                    .delta_read(target_id, hdr.arg1, hdr.arg0, reply_layout)?;
+                self.send_reply(route, keeper);
+                Ok(())
+            }
 
             SalMessageKind::UniquePreflight => {
                 let cols = self
@@ -319,38 +311,6 @@ impl WorkerProcess {
             }
         };
         self.drive_dag(Drive::Tick { source: target_id, round }, delta, false);
-    }
-
-    /// Answer one `ReadSpec` read, streaming the keeper back.
-    fn answer_scan_spec(
-        &mut self,
-        route: ReplyRoute,
-        blob: &[u8],
-        reply_layout: u64,
-    ) -> Result<(), gnitz_wire::WireFault> {
-        let target_id = route.target_id;
-        let spec = gnitz_wire::ReadSpec::decode(blob)?;
-        let keeper = self.cat().scan_spec(target_id, spec, reply_layout)?;
-        self.send_reply(route, keeper);
-        Ok(())
-    }
-
-    /// Answer one DELTA_POLL view: its deltas in rounds `(after_tick, cut_tick]`.
-    fn answer_delta_read(
-        &mut self,
-        route: ReplyRoute,
-        after_tick: u64,
-        cut_tick: u64,
-        blob: &[u8],
-    ) -> Result<(), gnitz_wire::WireFault> {
-        let target_id = route.target_id;
-        let reply_layout = gnitz_wire::decode_all(blob, "delta read", |r| r.u64())?;
-        let keeper = self
-            .cat()
-            .registry
-            .delta_read(target_id, after_tick, cut_tick, reply_layout)?;
-        self.send_reply(route, keeper);
-        Ok(())
     }
 
     /// Distributed CREATE-VIEW backfill, worker side: drives this worker's
@@ -425,7 +385,6 @@ impl WorkerProcess {
         }
 
         let mut producer = sorter.finish()?;
-        debug_assert!(self.pending_streams.is_empty(), "pre-flight train behind a scan train");
         send_unique_preflight_keys(
             &self.w2m_writer,
             owner_id,
@@ -439,102 +398,86 @@ impl WorkerProcess {
     }
 
     /// Answer one HasPk probe over the keys that exist committed on this
-    /// worker; `mode` decides what a match is answered with.
+    /// worker; `mode` decides what a match is answered with. `key_cols` names
+    /// the store probed: the table's own PK store, or a secondary index on the
+    /// packed column list (single- or multi-column; a composite index is located
+    /// by its exact list). Unique and non-unique alike — the FK parent-delete
+    /// check probes a child's FK auto-index, which is never unique.
     fn handle_has_pk(
         &mut self,
-        route: ReplyRoute,
+        target_id: u64,
         batch: Batch,
-        lookup: HasPkLookup,
+        key_cols: u64,
         mode: gnitz_wire::WireProbeMode,
         mode_param: usize,
-    ) -> Result<(), gnitz_wire::WireFault> {
-        let target_id = route.target_id;
-        let n = batch.len();
+    ) -> Result<Batch, gnitz_wire::WireFault> {
+        let index_cols = gnitz_wire::probe_key_columns(key_cols);
         if let gnitz_wire::WireProbeMode::Project = mode {
             // `arg1` is the PK sentinel here, so the column to project rides the
             // per-mode parameter word instead.
-            if !matches!(lookup, HasPkLookup::PrimaryKey) {
+            if index_cols.is_some() {
                 return Err("has_pk: a projecting probe reads the table's own PK store".into());
             }
             let ref_col = mode_param as u8;
             let keys = gnitz_wire::PkKeys::from_sorted(batch.schema().pk_stride(), batch.pk_data().to_vec());
-            let result = self.cat().registry.gather_bytes(target_id, keys, ref_col)?;
-            self.send_reply(route, result);
-            return Ok(());
+            return Ok(self.cat().registry.gather_bytes(target_id, keys, ref_col)?);
         }
-        match lookup {
-            HasPkLookup::SecondaryIndex { cols } => {
-                let result = {
-                    // One resolution of `(target_id, cols)`: the circuit carries
-                    // the index table and the span width.
-                    let ic = self
-                        .cat()
-                        .registry
-                        .relation(target_id)
-                        .and_then(|r| r.index_on(cols.as_slice()))
-                        .ok_or_else(|| format!("No index on columns {:?} for table {}", cols.as_slice(), target_id))?;
-                    // The probe's schema is the INDEX table's,
-                    // `(indexed_col, src_pk…)` — NOT the owner table's schema.
-                    let schema = *batch.schema();
-                    // Index layout: PK = (indexed-key span, src_pk_cols). Any
-                    // positive-weight match means the value is already in the
-                    // index. `open_cursor` keeps a compaction Io/Corrupt
-                    // failure from silently turning a present key into "absent".
-                    let mut cursor = ic.cursor();
-                    // Prefix-match the WHOLE indexed-value span: OPK puts the
-                    // distinguishing bytes last, so a source-width prefix would
-                    // match only the zero high bytes. Width off the circuit's own
-                    // key spec, so no width crosses the process boundary.
-                    let idx_key_size = ic.key_spec().key_size();
-                    // Grown on demand, not reserved at the probe count: the
-                    // expected hit count on a fresh-key insert is zero, and
-                    // `with_capacity` bypasses the batch arena above 2 MiB.
-                    let mut result = Batch::empty_with_schema(&schema);
-                    for i in 0..n {
-                        let pkb = batch.get_pk_bytes(i);
-                        let prefix = &pkb[..idx_key_size];
-                        // `[span ‖ holder PK]` verbatim: `KeySpec::write_entry`
-                        // wrote the source PK at `idx_key_size`, so the caller
-                        // splits it back out without decoding anything.
-                        if let gnitz_wire::WireProbeMode::AllHolders = mode {
-                            // Capped by the asking write's size; at least one,
-                            // or an occupied span would answer "no holders".
-                            cursor.for_each_positive_with_prefix_capped(prefix, mode_param.max(1), |c| {
-                                result.push_key_row(c.current_pk_bytes(), 1);
-                            });
-                            continue;
-                        }
-                        if !cursor.seek_first_positive_with_prefix(prefix) {
-                            continue;
-                        }
-                        let holder = matches!(mode, gnitz_wire::WireProbeMode::FirstHolder);
-                        result.push_key_row(if holder { cursor.current_pk_bytes() } else { pkb }, 1);
-                    }
-                    result
-                };
-                self.send_reply(route, result);
-                Ok(())
-            }
-            HasPkLookup::PrimaryKey => {
-                let relation = self.cat().registry.relation(target_id);
-                // Grown on demand — see the index arm above.
-                let mut result = Batch::empty_with_schema(batch.schema());
-                for i in 0..n {
-                    let pkb = batch.get_pk_bytes(i);
-                    // `false` for an id this worker has not registered.
-                    if relation.is_some_and(|r| r.has_pk(pkb)) {
-                        result.push_key_row(pkb, 1);
-                    }
+        // Grown on demand, not reserved at the probe count: the expected hit
+        // count on a fresh-key insert is zero, and `with_capacity` bypasses the
+        // batch arena above 2 MiB. For an index probe the schema is the INDEX
+        // table's, `(indexed_col, src_pk…)` — NOT the owner table's.
+        let mut result = Batch::empty_with_schema(batch.schema());
+        let Some(packed) = index_cols else {
+            let relation = self.cat().registry.relation(target_id);
+            for i in 0..batch.len() {
+                let pkb = batch.get_pk_bytes(i);
+                // `false` for an id this worker has not registered.
+                if relation.is_some_and(|r| r.has_pk(pkb)) {
+                    result.push_key_row(pkb, 1);
                 }
-                self.send_reply(route, result);
-                Ok(())
             }
+            return Ok(result);
+        };
+        let cols = self.cat().registry.index_cols(target_id, packed, "has_pk")?;
+        // One resolution of `(target_id, cols)`: the circuit carries the index
+        // table and the span width.
+        let ic = self
+            .cat()
+            .registry
+            .relation(target_id)
+            .and_then(|r| r.index_on(cols.as_slice()))
+            .ok_or_else(|| format!("No index on columns {:?} for table {}", cols.as_slice(), target_id))?;
+        // Index layout: PK = (indexed-key span, src_pk_cols). Any positive-weight
+        // match means the value is already in the index. `open_cursor` keeps a
+        // compaction Io/Corrupt failure from silently turning a present key into
+        // "absent".
+        let mut cursor = ic.cursor();
+        // Prefix-match the WHOLE indexed-value span: OPK puts the distinguishing
+        // bytes last, so a source-width prefix would match only the zero high
+        // bytes. Width off the circuit's own key spec, so no width crosses the
+        // process boundary.
+        let idx_key_size = ic.key_spec().key_size();
+        for i in 0..batch.len() {
+            let pkb = batch.get_pk_bytes(i);
+            let prefix = &pkb[..idx_key_size];
+            // `[span ‖ holder PK]` verbatim: `KeySpec::write_entry` wrote the
+            // source PK at `idx_key_size`, so the caller splits it back out
+            // without decoding anything.
+            if let gnitz_wire::WireProbeMode::AllHolders = mode {
+                // Capped by the asking write's size; at least one, or an occupied
+                // span would answer "no holders".
+                cursor.for_each_positive_with_prefix_capped(prefix, mode_param.max(1), |c| {
+                    result.push_key_row(c.current_pk_bytes(), 1);
+                });
+                continue;
+            }
+            if !cursor.seek_first_positive_with_prefix(prefix) {
+                continue;
+            }
+            let holder = matches!(mode, gnitz_wire::WireProbeMode::FirstHolder);
+            result.push_key_row(if holder { cursor.current_pk_bytes() } else { pkb }, 1);
         }
-    }
-
-    /// Base checkpoint round.
-    fn handle_flush_all(&mut self) -> Result<(), String> {
-        self.cat().registry.checkpoint_base()
+        Ok(result)
     }
 
     /// Run one DAG drive with the exchange context, returning its

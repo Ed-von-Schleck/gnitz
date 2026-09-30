@@ -41,14 +41,14 @@ impl PendingScan {
 impl WorkerProcess {
     // ── W2M response helpers ───────────────────────────────────────────
 
-    pub(super) fn send_ack(&self, target_id: u64, request_id: u32) {
-        self.w2m_writer.send_status(target_id, request_id, WireStatus::Ok, &[]);
+    pub(super) fn send_ack(&self, request_id: u32) {
+        self.w2m_writer.send_status(request_id, WireStatus::Ok, &[]);
     }
 
     /// A control-only frame carrying the fault's own status.
     pub(super) fn send_fault(&self, fault: &gnitz_wire::WireFault, request_id: u32) {
         self.w2m_writer
-            .send_status(0, request_id, fault.status, fault.text.as_bytes());
+            .send_status(request_id, fault.status, fault.text.as_bytes());
     }
 
     /// Reply with `batch`: one frame now when it fits and `route.fifo` is clear,

@@ -167,7 +167,7 @@ fn a_retired_slot_unparks_the_writer() {
         let ptr = ring as *mut u8;
         let receiver = W2mReceiver::new(vec![ptr]);
         let writer = std::thread::spawn(move || {
-            W2mWriter::new(ring as *mut u8).send_status(0, 1, WireStatus::Ok, &[]);
+            W2mWriter::new(ring as *mut u8).send_status(1, WireStatus::Ok, &[]);
         });
         while receiver.header(0).writer_park.flags.load(Ordering::Acquire) & FLAG_WRITER_PARKED == 0 {
             std::thread::yield_now();
@@ -241,7 +241,7 @@ fn w2m_publish_drain_bench() {
             if hdr.master_park.armed() {
                 woke_master += 1;
             }
-            writer.send_status(0, req as u32, gnitz_wire::WireStatus::Ok, &[]);
+            writer.send_status(req as u32, gnitz_wire::WireStatus::Ok, &[]);
         }
         unsafe {
             cptr.write(woke_master);
@@ -304,7 +304,7 @@ fn concurrent_publishes_drain_in_order() {
         let writer = std::thread::spawn(move || {
             let writer = W2mWriter::new(ring as *mut u8);
             for req_id in 1..=n {
-                writer.send_status(0, req_id, WireStatus::Ok, &pad_w);
+                writer.send_status(req_id, WireStatus::Ok, &pad_w);
             }
         });
 
@@ -336,7 +336,7 @@ fn concurrent_publishes_drain_in_order() {
 #[test]
 fn a_slot_names_the_worker_whose_ring_it_was_read_from() {
     let (a, b) = (make_ring(CTRL_HEADER_SIZE, 2, 8), make_ring(CTRL_HEADER_SIZE, 2, 8));
-    W2mWriter::new(b).send_status(0, 7, WireStatus::Ok, b"");
+    W2mWriter::new(b).send_status(7, WireStatus::Ok, b"");
     let receiver = W2mReceiver::new(vec![a, b]);
     assert!(receiver.try_read_slot(0).is_none());
     assert_eq!(receiver.try_read_slot(1).expect("worker 1's frame").worker, 1);

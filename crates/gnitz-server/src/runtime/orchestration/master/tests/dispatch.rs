@@ -92,7 +92,7 @@ fn a_round_fails_on_a_worker_error_without_the_other_acks() {
                 let GroupTargets::Leased { request_id, .. } = targets else {
                     unreachable!("a round broadcasts")
                 };
-                writers[0].send_status(0, request_id, WireStatus::Error, b"boom");
+                writers[0].send_status(request_id, WireStatus::Error, b"boom");
                 Ok(())
             })
             .await
@@ -136,7 +136,7 @@ fn a_round_lets_other_tasks_run() {
         let (id_tx, id_rx) = oneshot::channel::<u32>();
         disp.reactor().spawn(async move {
             let id = id_rx.await;
-            writer.send_status(0, id, WireStatus::Ok, &[]);
+            writer.send_status(id, WireStatus::Ok, &[]);
         });
         let d = Rc::clone(&disp);
         disp.reactor()
