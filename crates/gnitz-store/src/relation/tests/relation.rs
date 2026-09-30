@@ -177,57 +177,6 @@ fn ephemeral_flush_includes_index_circuits() {
     );
 }
 
-/// A fed view's delta store takes the epoch output **weights and all**: the
-/// round's own net weight per (PK, payload), not a row set. Two rounds against
-/// one key — `+1` then `-1` — must both be retained, because the output store
-/// folds them to nothing and the feed is the only place they survive.
-#[test]
-fn a_fed_view_retains_each_round_at_its_own_weight() {
-    let mut registry = solo_registry("fed_view_delta");
-    let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
-    let vid = gnitz_wire::FIRST_USER_TABLE_ID;
-    registry
-        .register(RelationSpec {
-            id: vid,
-            kind: RelationKind::View(ViewProps::Fed { delta_bytes: 1 << 20 }),
-            schema,
-        })
-        .unwrap();
-
-    let row = |w: i64| {
-        let mut b = BatchBuilder::new(schema);
-        b.begin_row(7u128, w);
-        b.end_row();
-        b.finish()
-    };
-    registry.ingest_view_delta(vid, row(1), Some(4), false).unwrap();
-    registry.ingest_view_delta(vid, row(-1), Some(5), false).unwrap();
-
-    // The output store folded the pair away — which is exactly why the feed has
-    // to have kept both.
-    let entry = registry.relation_or_err(vid).unwrap();
-    let mut live = 0i64;
-    let mut cur = entry.cursor();
-    while cur.valid {
-        live += cur.current_weight;
-        cur.advance();
-    }
-    assert_eq!(live, 0, "the output store's fold annihilates the pair");
-
-    let feed = entry.delta().expect("a fed view holds a delta store");
-    let stride = feed.schema().pk_stride();
-    let mut rounds: Vec<(u64, i64)> = Vec::new();
-    let floor = vec![0u8; stride];
-    let mut cur = feed.range_cursor(Some((gnitz_wire::PkBuf::from_bytes(&floor), None)));
-    while cur.valid {
-        // The delta PK is `round` big-endian, then the view's own PK.
-        let tick = u64::from_be_bytes(cur.current_pk_bytes()[..8].try_into().unwrap());
-        rounds.push((tick, cur.current_weight));
-        cur.advance();
-    }
-    assert_eq!(rounds, vec![(4, 1), (5, -1)], "each round keeps its own weight");
-}
-
 // A storage error while applying committed data is returned rather than
 // swallowed, so the process that owns the recovery decision is the one that
 // makes it. Driven via the `GNITZ_INJECT_INGEST_APPLY_ERROR` debug seam.

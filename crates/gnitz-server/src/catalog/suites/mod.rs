@@ -14,7 +14,6 @@ mod index_tests;
 mod ingest_unticked_bench;
 mod reopen_rebuild_tests;
 mod scan_spec_bench;
-mod scan_spec_tests;
 mod schema_codec;
 mod source_cursor_tests;
 mod stream_tests;

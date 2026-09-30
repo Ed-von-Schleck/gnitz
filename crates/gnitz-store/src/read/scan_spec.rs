@@ -3,18 +3,17 @@
 //! view's rows hydrate chunk by chunk as the sink drains them.
 
 use crate::schema::SchemaFacts;
-use gnitz_wire::{ReadBound, ReadSpec, SinkKind, WireFault, WireStatus};
+use gnitz_wire::{PkKeys, ReadBound, ReadSpec, SinkKind, WireFault, WireStatus};
 
 use std::rc::Rc;
 
-use super::store_io::LiveSource;
-use super::SkeletonHydrator;
+use super::{SkeletonHydrator, SourceCursor};
 use crate::ops::AdhocFold;
 use crate::ops::MapPlan;
 use crate::relation::RelationRegistry;
 use crate::schema::key::{key_range_between_cuts, KeyCut};
 use crate::schema::{delta_round, delta_round_prefix, delta_view_key, SchemaDescriptor};
-use crate::storage::Batch;
+use crate::storage::{Batch, SkeletonKeys};
 use gnitz_expr::{cmp_order_keys, order_locators, OrderLocator, RowFilter};
 
 impl RelationRegistry {
@@ -52,7 +51,10 @@ impl RelationRegistry {
             .map_err(|e| format!("scan_spec map: {e}"))?;
         let sink_in = map.as_ref().map_or(src_schema, |m| *m.out_schema());
         let mut rows = Survivors {
-            source: LiveSource::new(self, target_id, source, hydrator),
+            registry: self,
+            id: target_id,
+            source,
+            hydrator,
             filter,
             ranges: Vec::new(),
         };
@@ -108,13 +110,14 @@ impl RelationRegistry {
         let view = entry.schema();
         check_layout(reply_layout, &view)?;
         if after_tick == 0 {
-            return Ok(entry.cursor().materialize());
+            return Ok(entry.full_scan());
         }
         let feed = entry
             .delta()
             .ok_or_else(|| format!("delta_read: this process holds no delta store for relation {id}"))?;
         let dropped_through = delta_round(feed.dropped_max().pk_bytes());
-        if delta_cursor_expired(after_tick, dropped_through) {
+        // A cursor at the floor has lost nothing.
+        if after_tick < dropped_through {
             return Err(WireFault {
                 status: WireStatus::DeltaExpired,
                 text: format!(
@@ -144,12 +147,6 @@ fn check_layout(reply_layout: u64, produced: &SchemaDescriptor) -> Result<(), St
     Ok(())
 }
 
-/// Whether a walk over rounds `(after_tick, cut]` misses a round this worker
-/// dropped: a cursor at the floor has lost nothing.
-fn delta_cursor_expired(after_tick: u64, dropped_through: u64) -> bool {
-    after_tick < dropped_through
-}
-
 /// The client's `limit_k` (`0` = unbounded) as an `i64` weight window, saturated:
 /// a wrapped negative window would truncate the answer.
 fn saturated_window(limit_k: u64) -> i64 {
@@ -160,9 +157,13 @@ fn saturated_window(limit_k: u64) -> i64 {
 type SurvivorChunk<'r> = (Batch, &'r mut Vec<(usize, usize)>);
 
 /// The rows surviving the bound and the predicate, one source chunk at a time —
-/// the one input every sink reads.
+/// the one input every sink reads. Each skeleton row a chunk meets is replaced by
+/// that key's rows, recomputed through `hydrator`.
 struct Survivors<'a, 'h> {
-    source: LiveSource<'a, 'h>,
+    registry: &'a RelationRegistry,
+    id: u64,
+    source: SourceCursor,
+    hydrator: Option<&'h mut dyn SkeletonHydrator>,
     /// The predicate, and the part of the bound the source did not apply.
     filter: RowFilter,
     /// The current chunk's surviving row ranges; scratch reused across chunks.
@@ -171,14 +172,70 @@ struct Survivors<'a, 'h> {
 
 impl Survivors<'_, '_> {
     /// The next source chunk and its surviving row ranges; `None` once the source is
-    /// exhausted.
+    /// exhausted. `max_rows` bounds the merge groups visited; a skeleton row counts
+    /// once however many rows it hydrates to.
     fn next(&mut self, max_rows: usize) -> Result<Option<SurvivorChunk<'_>>, String> {
-        let Some(chunk) = self.source.next_chunk(max_rows)? else {
+        let mut skeletons = SkeletonKeys::default();
+        let Some(mut chunk) = self.source.drain_live_chunk(max_rows, &mut skeletons) else {
             return Ok(None);
         };
+        if !skeletons.keys.is_empty() {
+            chunk = self.hydrate(chunk, skeletons)?;
+        }
         self.filter.ranges(&chunk.as_mem_batch(), &mut self.ranges);
         Ok(Some((chunk, &mut self.ranges)))
     }
+
+    /// `live` merged with the rows recomputed at `skeletons`' keys.
+    fn hydrate(&mut self, live: Batch, mut skeletons: SkeletonKeys) -> Result<Batch, String> {
+        let Some(hydrator) = self.hydrator.as_deref_mut() else {
+            return Err(format!(
+                "relation {} holds skeleton rows but this process maintains no circuit",
+                self.id
+            ));
+        };
+        let keys = PkKeys::from_sorted(live.schema().pk_stride(), std::mem::take(&mut skeletons.keys));
+        #[cfg(debug_assertions)]
+        let asked = keys.clone();
+        let hydrated = hydrator
+            .hydrate_keys(self.registry, self.id, keys)
+            .map_err(|e| format!("hydrate: view {}: {e}", self.id))?;
+        #[cfg(debug_assertions)]
+        assert_hydration_matches(&hydrated, &asked, &skeletons.coarse);
+        // Both consolidated and PK-disjoint.
+        let schema = *live.schema();
+        Ok(match live.is_empty() {
+            true => hydrated,
+            false => hydrated.merged_consolidated(&live, &schema),
+        })
+    }
+}
+
+/// Tripwire: the replay's per-PK weight sum must equal the coarse weight the
+/// skeleton row carried, by linearity of the PK projection. `keys` and `out` are
+/// both ascending, so one co-walk checks every key and catches a PK no key named.
+#[cfg(debug_assertions)]
+fn assert_hydration_matches(out: &Batch, keys: &PkKeys, coarse: &[i64]) {
+    assert_eq!(keys.len(), coarse.len());
+    let mut expected = keys.iter().zip(coarse).peekable();
+    let mut i = 0;
+    while i < out.len() {
+        let pk = out.get_pk_bytes(i);
+        if let Some((key, _)) = expected.next_if(|(key, _)| crate::schema::key::compare_pk_bytes(key, pk).is_lt()) {
+            panic!("hydration produced no rows for skeleton key {key:?}");
+        }
+        let Some((_, &weight)) = expected.next().filter(|(key, _)| *key == pk) else {
+            panic!("hydration produced rows for a PK no skeleton row named");
+        };
+        let j = crate::storage::pk_group_end(out, i);
+        let sum = out.as_mem_batch().sum_weights(i, j);
+        assert_eq!(sum, weight, "hydration weight mismatch for key {pk:?}");
+        i = j;
+    }
+    assert!(
+        expected.next().is_none(),
+        "hydration produced no rows for a trailing skeleton key"
+    );
 }
 
 /// Fold every surviving chunk, through `map` when there is one, into partial

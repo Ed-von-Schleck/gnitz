@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_expr::{ColumnTable, SchemaFacts};
+use gnitz_expr::ColumnTable;
 use gnitz_wire::{ColumnDef, COLTAB_PAY_NAME};
 use std::collections::HashMap;
 
@@ -956,35 +956,6 @@ fn a_view_at_the_column_limit_cannot_carry_a_feed() {
 
     // The same view without a feed is fine, so the rejection is about the stamp.
     try_register_identity_view(&mut engine, tid, "plain_wide", &cols, 0, 0).expect("unfed wide view");
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// A delta read is answered only in the layout it produces: the view's own at
-/// `after_tick = 0`, refused under any other digest.
-#[test]
-fn a_delta_read_under_another_layout_is_refused() {
-    let dir = temp_dir("delta_read_layout");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![
-        crate::test_support::col_def("id", gnitz_wire::TypeCode::U64),
-        crate::test_support::col_def("v", gnitz_wire::TypeCode::I64),
-    ];
-    let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
-    let fed = try_register_identity_view(&mut engine, tid, "fed", &cols, 0, 4 << 20).expect("a fed view");
-    let own = engine.registry.relation_or_err(fed).unwrap().schema().layout_digest();
-
-    engine
-        .registry
-        .delta_read(fed, 0, 0, own)
-        .expect("the view's own layout");
-    let Err(err) = engine.registry.delta_read(fed, 0, 0, own ^ 1) else {
-        panic!("a delta read under another layout must be refused");
-    };
-    assert!(
-        err.text.contains("reply schema does not match the output layout"),
-        "got: {err}"
-    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

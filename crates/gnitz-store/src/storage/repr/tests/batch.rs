@@ -134,6 +134,7 @@ fn append_row_from_source_copies_pk_weight_and_payload() {
 }
 
 /// `rows` stamped `layout` unverified: a lying tag for the debug verifier to catch.
+#[cfg(debug_assertions)]
 fn flagged_batch(rows: &[(u64, i64, i64)], layout: Layout) -> Batch {
     let mut b = make_batch_raw(&make_schema_u64_i64(), rows);
     b.set_layout_unchecked(layout);

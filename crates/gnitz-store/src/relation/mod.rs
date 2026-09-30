@@ -60,14 +60,6 @@ pub struct SecondaryIndex {
 }
 
 impl SecondaryIndex {
-    /// Write index rows directly, in the index's own layout — the one write that
-    /// does not ride a projection of the owner, for a test that needs an entry no
-    /// projection of the owner could produce.
-    #[cfg(test)]
-    pub(crate) fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), crate::storage::StorageError> {
-        self.store.held_mut().ingest_owned_batch(batch)
-    }
-
     /// By value, not as a slice: `PkColList` is `Copy`, so the list can be keyed
     /// on or held past the borrow of the registry that produced it.
     pub fn cols(&self) -> PkColList {
