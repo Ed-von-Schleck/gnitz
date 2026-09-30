@@ -1150,11 +1150,8 @@ fn trailing_gk(pk_cols: usize, i: u64) -> PkBuf {
 
 /// One batch of rows `base..base + n` at [`trailing_gk`]'s keys.
 fn trailing_key_batch(pk_cols: usize, base: u64, n: u64) -> Batch {
-    let keys: Vec<PkBuf> = (base..base + n).map(|i| trailing_gk(pk_cols, i)).collect();
-    let rows: Vec<(&[u8], i64, i64)> = keys
-        .iter()
-        .zip(base..)
-        .map(|(k, i)| (k.pk_bytes(), 1, i as i64))
+    let rows: Vec<_> = (base..base + n)
+        .map(|i| (trailing_gk(pk_cols, i).pk_bytes().to_vec(), 1, i as i64))
         .collect();
     make_batch_opk(&stride_schema(pk_cols), &rows)
 }

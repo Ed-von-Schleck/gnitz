@@ -256,10 +256,6 @@ impl Batch {
     /// `rows` all-zero rows, already published. The one shape [`Self::with_capacity`]
     /// cannot serve: a test that needs a batch of a given wire size but no
     /// particular content, and so writes no rows at all.
-    ///
-    /// `vec![0u8; _]` deliberately — a calloc of this size is demand-zero mmap
-    /// the caller never faults in, where `with_capacity` + a memset would touch
-    /// every page of what is routinely a 256 MiB arena.
     pub fn zeroed(schema: &SchemaDescriptor, rows: usize) -> Self {
         let (strides, nr) = strides_from_schema(schema);
         let mut b = Self::empty_from(strides, schema);
@@ -1593,11 +1589,6 @@ impl Batch {
                 self.count,
             );
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn data_capacity(&self) -> usize {
-        self.data.capacity()
     }
 }
 

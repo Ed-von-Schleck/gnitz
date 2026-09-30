@@ -73,12 +73,13 @@ pub fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i
 /// as an opaque ordered byte string, so this one builder serves every stride —
 /// which is what keeps a new PK width from growing another near-identical
 /// builder. [`opk_pk`] produces the bytes from native column values.
-pub fn make_batch_opk(schema: &SchemaDescriptor, rows: &[(&[u8], i64, i64)]) -> Batch {
+pub fn make_batch_opk(schema: &SchemaDescriptor, rows: &[(impl AsRef<[u8]>, i64, i64)]) -> Batch {
     let mut b = BatchBuilder::new(*schema);
-    for &(pk, w, val) in rows {
+    for (pk, w, val) in rows {
+        let pk = pk.as_ref();
         assert_eq!(pk.len(), schema.pk_stride(), "PK bytes must be exactly one stride wide");
-        b.begin_row_bytes(pk, w);
-        b.put_int(val as u128);
+        b.begin_row_bytes(pk, *w);
+        b.put_int(*val as u128);
         b.end_row();
     }
     b.finish()

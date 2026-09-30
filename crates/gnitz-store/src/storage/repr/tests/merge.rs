@@ -1,7 +1,4 @@
-// The malformed-long-string fallback must zero both the length field
-// (dest[0..4]) and the prefix field (dest[4..8]) — a prefix left holding the
-// corrupt source cell's bytes would compare unequal to a canonical empty
-// string that reads identically.
+/// A malformed long cell relocates to the canonical empty string.
 #[test]
 fn test_malformed_long_string_fallback_clean_header() {
     let mut src_cell = [0u8; 16];
@@ -28,10 +25,8 @@ fn test_malformed_long_string_fallback_clean_header() {
     assert!(gnitz_wire::german_string_cell_ok(&result, &dst_blob));
 }
 
-/// The relocator rebuilds a cell rather than copying its bytes, so a skewed
-/// pad — compare-visible but invisible to `german_string_content`, i.e. the
-/// shape that splits one Z-set element's weight across two rows — cannot
-/// survive a merge, scatter or map projection.
+/// A relocated cell is rebuilt, so a skewed pad, which would split one element's
+/// weight across two rows, does not survive it.
 #[test]
 fn test_relocate_canonicalizes_pad_bytes() {
     let mut dst_blob: Vec<u8> = Vec::new();
@@ -127,30 +122,18 @@ fn blob_cache_takes_a_pooled_map_only_when_it_relocates() {
     BLOB_CACHE_POOL.with(|p| p.take());
 }
 
-use super::super::batch::{Batch, Layout};
 use super::*;
-use crate::schema::key::compare_pk_bytes;
 use crate::schema::payload_order::compare_full_rows;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::BatchBuilder;
-use crate::test_support::{make_schema_u128_i64, make_string_batch, pk_payload_schema, pk_u64_two_i64_schema};
+use crate::test_support::{
+    bench_time, make_batch_opk, make_batch_u128_raw, make_schema_pk_u64_payload_string, make_schema_u128_i64,
+    make_schema_u64_i64, make_string_batch, opk_pk, payload0_i64, pk_payload_schema, pk_u64_two_i64_schema,
+    read_german_string, zset_of, RowKey,
+};
 
-/// Build an owned `Batch` from a row tuple list. Tests obtain a `MemBatch`
-/// view via `batch.as_mem_batch()`.
-fn make_batch_i64(rows: &[(u128, i64, i64)]) -> Batch {
-    crate::test_support::make_batch_u128_raw(&make_schema_u128_i64(), rows)
-}
-
-/// `MemBatch`'s per-row accessors must address exactly the cell its region
-/// accessors hold — the [`BatchView`] contract, checked through the shared
-/// assertion so this batch and every other implementor (notably the client
-/// adapter, whose `col_data` is a slot map rather than a flat region) are
-/// held to one rule by one piece of code. Here it is near-tautological: both
-/// sides derive the same payload-region offset, so it catches an index typo.
-///
-/// It lives in `merge.rs`, not `schema.rs`: constructing a `Batch` there would
-/// be the first `schema → storage` code reference in that file, the up-edge
-/// the locator/batch split exists to prevent. `#[cfg(test)]` does not exempt it.
+/// `MemBatch`'s per-row accessors address the cells its region accessors hold:
+/// the [`BatchView`] contract.
 #[test]
 fn batchview_row_matches_region() {
     let schema = SchemaDescriptor::new(
@@ -186,63 +169,37 @@ fn batchview_row_matches_region() {
     );
 }
 
-/// Build a large sorted `(PK | I64)` batch with a high duplicate-PK rate:
-/// `dup` consecutive rows share a PK with distinct ascending payloads, which
-/// puts the equal-PK payload tiebreak and the group fold on the measured path.
-/// The schema's `pk_stride` selects the width.
+/// `n` sorted rows in PK groups of `dup`, distinct only in the last payload
+/// column, so every compare within a group walks the whole payload.
 fn bench_sorted_batch(schema: &SchemaDescriptor, n: usize, dup: usize) -> Batch {
+    let last = schema.num_payload_cols() - 1;
     let mut b = BatchBuilder::new(*schema);
     for i in 0..n {
-        b.begin_row((i / dup) as u128, 1i64);
-        b.put_int(i as i64 as u128);
+        let group = (i / dup) as u128;
+        b.begin_row(group, 1);
+        for (pi, col) in schema.payload_columns() {
+            match (pi == last, col.type_code) {
+                (true, _) => b.put_int(i as u128),
+                (false, TypeCode::F64) => b.put_float(group as f64),
+                (false, _) => b.put_int(group),
+            }
+        }
         b.end_row();
     }
     b.finish()
 }
 
-/// Throughput of `run_merge`'s comparator-driven N-way merge at stride 8 and
-/// 16 with a high duplicate-PK rate, using a cheap emit (no materialization) so
-/// the measured cost is the loser-tree compare loop, not the row copy. A
-/// regression guard for `compare_pk_ordering` (the merge has no `current_key`,
-/// so this is the comparator change undiluted).
+/// `run_merge`'s compare loop alone — the emit materializes nothing — under a
+/// high duplicate-PK rate, over each payload comparator arm.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn run_merge_dup_pk_bench() {
-    use std::time::Instant;
     const K: usize = 4;
     const N: usize = 200_000;
     const DUP: usize = 8;
     const ITERS: usize = 20;
-    let s8 = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0],
-    );
-    for (label, schema) in [("stride8", s8), ("stride16", make_schema_u128_i64())] {
-        let batches: Vec<Batch> = (0..K).map(|_| bench_sorted_batch(&schema, N, DUP)).collect();
-        let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
-        let sorted: Vec<MemBatch> = mem.to_vec();
-        let mut sink = 0i64;
-        let t = Instant::now();
-        for _ in 0..ITERS {
-            run_merge(&sorted, &schema, |_s, _r, w| {
-                sink = sink.wrapping_add(std::hint::black_box(w));
-            });
-        }
-        let secs = t.elapsed().as_secs_f64();
-        std::hint::black_box(sink);
-        let rows = K * N;
-        let rps = (ITERS as f64 * rows as f64) / secs;
-        println!("run_merge_{label}: {rows} rows × {ITERS} iters in {secs:.3}s = {rps:.0} rows/s");
-    }
-}
-
-/// A payload that forces `compare_rows` onto its `Generic` arm: a float, a
-/// 128-bit column and a nullable one each disqualify the fixed-int fast path.
-fn bench_generic_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
+    // A float, a U128 and a nullable column each force the `Generic` arm.
+    let generic = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
             SchemaColumn::new(TypeCode::F64, false),
@@ -250,48 +207,25 @@ fn bench_generic_schema() -> SchemaDescriptor {
             SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
-    )
-}
-
-/// [`bench_sorted_batch`] for [`bench_generic_schema`]: the two leading payload
-/// columns are constant within a PK group, so a tie walks the float and the
-/// 128-bit dispatch before the trailing I64 resolves it.
-fn bench_sorted_generic_batch(schema: &SchemaDescriptor, n: usize, dup: usize) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
-    for i in 0..n {
-        let group = (i / dup) as u64;
-        b.begin_row(group as u128, 1);
-        b.put_float(group as f64);
-        b.put_int(group as u128);
-        b.put_int(i as u128);
-        b.end_row();
-    }
-    b.finish()
-}
-
-/// [`run_merge_dup_pk_bench`] over the `Generic` payload comparator, which the
-/// benches above never reach: their non-nullable `I64` payload takes the
-/// fixed-int fast path instead of `cmp_col_window`.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn run_merge_dup_pk_generic_bench() {
-    const K: usize = 4;
-    const N: usize = 200_000;
-    const DUP: usize = 8;
-    const ITERS: usize = 20;
-    let schema = bench_generic_schema();
-    let batches: Vec<Batch> = (0..K).map(|_| bench_sorted_generic_batch(&schema, N, DUP)).collect();
-    let sorted: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
-    let mut sink = 0i64;
-    let elapsed = crate::test_support::bench_time(ITERS, || {
-        run_merge(&sorted, &schema, |_s, _r, w| {
-            sink = sink.wrapping_add(std::hint::black_box(w));
+    );
+    for (label, schema) in [
+        ("fixed_int_stride8", make_schema_u64_i64()),
+        ("fixed_int_stride16", make_schema_u128_i64()),
+        ("generic", generic),
+    ] {
+        let batches: Vec<Batch> = (0..K).map(|_| bench_sorted_batch(&schema, N, DUP)).collect();
+        let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
+        let mut sink = 0i64;
+        let elapsed = bench_time(ITERS, || {
+            run_merge(&mem, &schema, |_s, _r, w| {
+                sink = sink.wrapping_add(std::hint::black_box(w));
+            });
         });
-    });
-    std::hint::black_box(sink);
-    let (rows, secs) = (K * N, elapsed.as_secs_f64());
-    let rps = (ITERS as f64 * rows as f64) / secs;
-    println!("run_merge_generic: {rows} rows × {ITERS} iters in {secs:.3}s = {rps:.0} rows/s");
+        std::hint::black_box(sink);
+        let (rows, secs) = (K * N, elapsed.as_secs_f64());
+        let rps = (ITERS as f64 * rows as f64) / secs;
+        println!("run_merge_{label}: {rows} rows × {ITERS} iters in {secs:.3}s = {rps:.0} rows/s");
+    }
 }
 
 /// Build an owned `Batch` of `n` rows for `make_schema_flush`: PK from
@@ -308,15 +242,12 @@ fn bench_flush_batch(schema: &SchemaDescriptor, n: usize, key_fn: impl Fn(usize)
     b.finish()
 }
 
-/// The N-way merge over **1 big run + 4 small runs**, priced per small-run row.
-/// Big run = `N` even keys; each small run = `d` odd keys uniformly interleaved
-/// across the big range (distinct per run via a `+2j` offset), so no
-/// (PK,payload) ties and consolidation drops nothing.
+/// The N-way merge of one big run of even keys with four small runs of distinct
+/// odd keys spread across it, priced per small-run row.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn merge_batches_skewed_bench() {
     use std::hint::black_box;
-    use std::time::Instant;
 
     let schema = pk_u64_two_i64_schema();
     for (n, d, iters) in [
@@ -336,17 +267,13 @@ fn merge_batches_skewed_bench() {
         }
 
         let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
-        let sorted: Vec<MemBatch> = mem.to_vec();
-        let total_rows: usize = sorted.iter().map(|b| b.count).sum();
+        let total_rows: usize = mem.iter().map(|b| b.count).sum();
 
-        // Warm up the path once (allocator, batch pool, page-in); untimed.
-        black_box(merge_batches(&sorted, &schema));
-
-        let t = Instant::now();
-        for _ in 0..iters {
-            black_box(merge_batches(&sorted, &schema));
-        }
-        let secs = t.elapsed().as_secs_f64();
+        // The untimed warmup takes the allocator, batch pool and page-in.
+        let secs = bench_time(iters, || {
+            black_box(merge_batches(&mem, &schema));
+        })
+        .as_secs_f64();
 
         let rps = (iters as f64 * total_rows as f64) / secs;
         let ns_per_delta = secs * 1e9 / (iters as f64 * 4.0 * d as f64);
@@ -354,27 +281,70 @@ fn merge_batches_skewed_bench() {
     }
 }
 
-/// A merge/consolidate result as native `(PK, weight, payload)` rows.
-fn narrow(rows: Vec<(Vec<u8>, i64, i64)>, pk_stride: usize) -> Vec<(u128, i64, i64)> {
-    rows.into_iter()
-        .map(|(pk, w, v)| (crate::test_support::read_pk_opk(&pk, 0, pk_stride), w, v))
+/// The `(pk_bytes, weight, i64_payload)` of each row of a single-payload-column
+/// batch, at any PK stride.
+fn i64_rows(b: &Batch) -> Vec<(Vec<u8>, i64, i64)> {
+    (0..b.count)
+        .map(|i| (b.get_pk_bytes(i).to_vec(), b.get_weight(i), payload0_i64(b, i)))
         .collect()
 }
 
-fn merge_to_rows(batches: &[Batch], schema: &SchemaDescriptor) -> Vec<(u128, i64, i64)> {
-    narrow(merge_to_rows_wide(batches, schema), schema.pk_stride())
+/// [`i64_rows`] with each PK widened to its native unsigned value.
+fn narrow(b: &Batch) -> Vec<(u128, i64, i64)> {
+    i64_rows(b)
+        .into_iter()
+        .map(|(pk, w, v)| (gnitz_wire::widen_pk_be(&pk), w, v))
+        .collect()
 }
 
-fn run_consolidate(b: &Batch, schema: &SchemaDescriptor) -> Vec<(u128, i64, i64)> {
-    narrow(run_consolidate_bytes(b), schema.pk_stride())
+/// The N-way merge's survivors, materialized with every string relocated.
+fn merge_batches(batches: &[MemBatch], schema: &SchemaDescriptor) -> Batch {
+    let total = batches.iter().map(|b| b.count).sum();
+    let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(total);
+    run_merge(batches, schema, |src, row, w| {
+        survivors.push((src as u32, row as u32, w))
+    });
+    super::super::scatter::UnifiedSet::whole(batches, schema).materialize(&survivors, total)
 }
 
-/// The Z-set fold, as `(inputs, expected output)`. Weights of matching
-/// (PK, payload) elements sum, net-zero elements drop, and rows sharing a PK but
-/// differing in payload stay distinct and order by payload. These are properties
-/// of the fold alone — `merge::drive`'s group boundary is width-agnostic (an
-/// OPK byte compare plus the payload comparator), which the width sweep below
-/// covers.
+fn merge_all(batches: &[Batch], schema: &SchemaDescriptor) -> Batch {
+    let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
+    merge_batches(&mem, schema)
+}
+
+/// The two-way Z-set `+`, folded left over consolidated operands. Addition is
+/// associative, so it reaches the N-way merge's result.
+fn merged_pairwise(batches: &[Batch], schema: &SchemaDescriptor) -> Batch {
+    batches.iter().fold(Batch::empty_with_schema(schema), |acc, b| {
+        acc.merged_consolidated(&b.clone().into_consolidated(), schema)
+    })
+}
+
+/// `got` is the Z-set sum of `inputs`: one row per element, strictly ascending
+/// in (PK, payload) order.
+fn assert_folds(inputs: &[Batch], got: &Batch, what: &str) {
+    let schema = got.schema();
+    let mut want: std::collections::HashMap<RowKey, i64> = std::collections::HashMap::new();
+    for b in inputs {
+        for (key, w) in zset_of(b, schema) {
+            *want.entry(key).or_insert(0) += w;
+        }
+    }
+    want.retain(|_, w| *w != 0);
+    assert_eq!(zset_of(got, schema), want, "{what}: the Z-set sum");
+    assert_eq!(got.count, want.len(), "{what}: one row per element");
+    let mb = got.as_mem_batch();
+    for r in 1..got.count {
+        assert_eq!(
+            compare_full_rows(schema, &mb, r - 1, &mb, r),
+            Ordering::Less,
+            "{what}: rows {} and {r} out of order",
+            r - 1
+        );
+    }
+}
+
+/// The Z-set fold, as `(label, inputs, expected output)`.
 type FoldCase<'a> = (&'a str, &'a [&'a [(u128, i64, i64)]], &'a [(u128, i64, i64)]);
 
 const FOLD_CASES: &[FoldCase] = &[
@@ -431,6 +401,11 @@ const FOLD_CASES: &[FoldCase] = &[
         &[(10, 2, 100), (20, 1, 200)],
     ),
     (
+        "one PK's payloads interleave across sources and fold apart",
+        &[&[(5, 1, 100)], &[(5, 1, 200)], &[(5, -1, 100)]],
+        &[(5, 1, 200)],
+    ),
+    (
         "one PK with distinct payloads stays distinct",
         &[&[(10, 1, 100), (10, 1, 200), (20, 1, 300)]],
         &[(10, 1, 100), (10, 1, 200), (20, 1, 300)],
@@ -441,8 +416,9 @@ const FOLD_CASES: &[FoldCase] = &[
 fn nway_merge_folds_the_zset() {
     let schema = make_schema_u128_i64();
     for &(what, inputs, want) in FOLD_CASES {
-        let batches: Vec<Batch> = inputs.iter().map(|rows| make_batch_i64(rows)).collect();
-        assert_eq!(merge_to_rows(&batches, &schema), want, "{what}");
+        let batches: Vec<Batch> = inputs.iter().map(|rows| make_batch_u128_raw(&schema, rows)).collect();
+        assert_eq!(narrow(&merge_all(&batches, &schema)), want, "{what}");
+        assert_eq!(narrow(&merged_pairwise(&batches, &schema)), want, "{what}: pairwise");
     }
 }
 
@@ -455,146 +431,13 @@ fn consolidate_groups_folds_the_zset() {
     for &(what, inputs, want) in FOLD_CASES {
         let mut rows: Vec<(u128, i64, i64)> = inputs.concat();
         rows.reverse(); // arrive unsorted; the sort is the point
-        assert_eq!(run_consolidate(&make_batch_i64(&rows), &schema), want, "{what}");
-    }
-}
-
-// -----------------------------------------------------------------------
-// Narrow-region merge dispatch: signed / narrow-unsigned / compound
-// -----------------------------------------------------------------------
-
-/// OPK-encode a single PK column's native little-endian bytes. The PK region is
-/// OPK at rest, so a fixture must store OPK bytes for the merge/sort path to
-/// order it the way an ingested row would be ordered.
-fn opk_pk(le: &[u8], tc: TypeCode) -> Vec<u8> {
-    let mut out = vec![0u8; le.len()];
-    gnitz_wire::encode_pk_column(le, tc, &mut out);
-    out
-}
-
-/// Build a batch from owned `(pk_bytes, weight, payload)` rows.
-fn make_batch_bytes(schema: &SchemaDescriptor, rows: &[(Vec<u8>, i64, i64)]) -> Batch {
-    let borrowed: Vec<(&[u8], i64, i64)> = rows.iter().map(|(pk, w, v)| (&pk[..], *w, *v)).collect();
-    crate::test_support::make_batch_opk(schema, &borrowed)
-}
-
-/// The payload column of each output row, which every ordering case below uses
-/// to record the rank its PK should land at.
-fn ranks(rows: &[(Vec<u8>, i64, i64)]) -> Vec<i64> {
-    rows.iter().map(|r| r.2).collect()
-}
-
-/// Every PK width, through all three entry points, ordered against its OPK bytes.
-///
-/// What varies here is *width*, not type. On the PK axis the merge is type-blind
-/// — it compares OPK bytes and dispatches only on the stride — so the strides
-/// below cover one case per `pk_width_dispatch` arm (`≤8`, `9..=16`, `17..=32`,
-/// `>32`). That a given type's OPK image sorts like its native values is a
-/// property of the encoder, pinned in `schema::key`, not re-derived here.
-#[test]
-fn every_pk_width_orders_by_opk_bytes() {
-    // Signed values are passed as their two's-complement image: `opk_pk` reads
-    // the low `size()` little-endian bytes and applies the sign flip.
-    let s8 = |v: i8| (v as u8) as u128;
-    let s64 = |v: i64| (v as u64) as u128;
-
-    // (PK column types, PK column values in strictly ascending OPK order).
-    let cases: Vec<(&[TypeCode], Vec<Vec<u128>>)> = vec![
-        (&[TypeCode::U8], vec![vec![0], vec![1], vec![127], vec![128], vec![255]]),
-        // The sign flip is the only reason negatives sort first.
-        (
-            &[TypeCode::I8],
-            vec![vec![s8(-128)], vec![s8(-1)], vec![0], vec![1], vec![s8(127)]],
-        ),
-        (
-            &[TypeCode::U16],
-            vec![vec![0], vec![1], vec![256], vec![32768], vec![65535]],
-        ),
-        (
-            &[TypeCode::U32],
-            vec![vec![0], vec![1], vec![1 << 16], vec![1 << 31], vec![u32::MAX as u128]],
-        ),
-        (
-            &[TypeCode::I64],
-            vec![
-                vec![s64(i64::MIN)],
-                vec![s64(-1)],
-                vec![0],
-                vec![1],
-                vec![s64(i64::MAX)],
-            ],
-        ),
-        // Compound, stride 8: the leading column dominates.
-        (
-            &[TypeCode::U32, TypeCode::U32],
-            vec![vec![1, 9], vec![1, 10], vec![2, 0]],
-        ),
-        // Stride 11 — a width that is neither a power of two nor a register size.
-        (
-            &[TypeCode::U64, TypeCode::U16, TypeCode::U8],
-            vec![vec![1, 2, 2], vec![1, 2, 3], vec![1, 3, 0], vec![2, 0, 0]],
-        ),
-        // Stride 16: col0 must dominate. A regression to a plain numeric compare
-        // over the packed u128 would order col1-major and disagree here.
-        (
-            &[TypeCode::U64, TypeCode::U64],
-            vec![vec![1, 256], vec![1, 257], vec![256, 1], vec![256, 2]],
-        ),
-        // Past 16 bytes the leading-prefix compare ties and the byte tiebreak
-        // decides: every pair below agrees on its first two columns.
-        (
-            WIDE_24,
-            vec![vec![1, 1, 0], vec![1, 1, 100], vec![1, 2, 0], vec![2, 0, 0]],
-        ),
-        (
-            WIDE_80,
-            vec![vec![1, 1, 0, 0, 0], vec![1, 1, 0, 0, 5], vec![1, 1, 0, 1, 0]],
-        ),
-    ];
-
-    for (tcs, vals) in cases {
-        let schema = pk_payload_schema(tcs);
-        let stride = schema.pk_stride();
-        let n = vals.len();
-        let opk = |i: usize| crate::test_support::opk_pk(&schema, &vals[i]);
-        let want: Vec<i64> = (0..n as i64).collect();
-        // Feed every path in descending order, so nothing passes by arriving sorted.
-        let shuffled: Vec<(Vec<u8>, i64, i64)> = (0..n).rev().map(|i| (opk(i), 1, i as i64)).collect();
-        let sorted: Vec<(Vec<u8>, i64, i64)> = (0..n).map(|i| (opk(i), 1, i as i64)).collect();
-
-        // One single-row source per key: the N-way merge orders them.
-        let batches: Vec<Batch> = shuffled
-            .iter()
-            .map(|r| make_batch_bytes(&schema, std::slice::from_ref(r)))
-            .collect();
-        let m = merge_to_rows_wide(&batches, &schema);
-        assert_eq!(ranks(&m), want, "stride {stride}: merge");
-
-        let c = run_consolidate_bytes(&make_batch_bytes(&schema, &shuffled));
-        assert_eq!(ranks(&c), want, "stride {stride}: consolidate_groups");
-
-        // Already in order on the way in: the sort must be a no-op, not a
-        // reshuffle of the equal-key groups.
-        let f = run_consolidate_bytes(&make_batch_bytes(&schema, &sorted));
-        assert_eq!(ranks(&f), want, "stride {stride}: consolidate_groups (pre-sorted)");
-
-        // The PK survives as its OPK image, not as some re-packing of it.
-        let got_pks: Vec<Vec<u8>> = m.into_iter().map(|r| r.0).collect();
         assert_eq!(
-            got_pks,
-            (0..n).map(opk).collect::<Vec<_>>(),
-            "stride {stride}: pk bytes"
+            narrow(&make_batch_u128_raw(&schema, &rows).into_consolidated()),
+            want,
+            "{what}"
         );
     }
 }
-
-// -----------------------------------------------------------------------
-// Wide-region merge dispatch (pk_stride > 16). Ordering and group detection
-// rest on `compare_pk_bytes` over the whole key. The PKs below are built so the
-// leading 16 bytes collide while a later column differs, which keeps the
-// leading-prefix fast reject from firing and puts the full-byte compare on the
-// path.
-// -----------------------------------------------------------------------
 
 // `MAX_PK_COLUMNS == 5`, so the 64/80-byte strides use U128 PK columns
 // rather than 8/10 U64 columns.
@@ -608,643 +451,143 @@ const WIDE_80: &[TypeCode] = &[
     TypeCode::U128,
 ];
 
-/// OPK PK bytes: col0 = `lead`, last col = `tail`, all middle columns 0.
-/// Each unsigned column is stored big-endian (its OPK form), concatenated
-/// in pk-list order. The packed low-16 prefix is fully determined by the
-/// leading columns (col0, plus zeros), so two PKs sharing `lead` but
-/// differing in `tail` collide in the prefix yet are distinct under
-/// `compare_pk_bytes` (which orders col0 → … → last). Holds for every
-/// stride here.
-fn wpk(tcs: &[TypeCode], lead: u128, tail: u128) -> Vec<u8> {
-    let last = tcs.len() - 1;
-    let mut v = Vec::new();
-    for (i, &tc) in tcs.iter().enumerate() {
-        let val: u128 = if i == 0 {
-            lead
-        } else if i == last {
-            tail
-        } else {
-            0
-        };
-        let cw = tc.wire_stride();
-        // Big-endian = OPK for an unsigned column: take the low `cw` bytes
-        // of the BE u128 representation (the value fits within `cw` here).
-        v.extend_from_slice(&val.to_be_bytes()[16 - cw..]);
-    }
-    v
-}
-
-/// The `(pk_bytes, weight, i64_payload)` of each row of a single-payload-column
-/// batch. Width-agnostic: reads narrow and wide strides alike (callers build
-/// the schema explicitly).
-fn i64_rows(b: &Batch) -> Vec<(Vec<u8>, i64, i64)> {
-    (0..b.count)
-        .map(|i| {
-            (
-                b.get_pk_bytes(i).to_vec(),
-                b.get_weight(i),
-                gnitz_wire::read_i64_le(b.col_data(0), i * 8),
-            )
-        })
-        .collect()
-}
-
-/// The N-way merge's survivors, materialized with every string relocated.
-fn merge_batches(batches: &[MemBatch], schema: &SchemaDescriptor) -> Batch {
-    let total = batches.iter().map(|b| b.count).sum();
-    let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(total);
-    run_merge(batches, schema, |src, row, w| {
-        survivors.push((src as u32, row as u32, w))
-    });
-    super::super::scatter::UnifiedSet::whole(batches, schema).materialize(&survivors, total)
-}
-
-fn merge_to_rows_wide(batches: &[Batch], schema: &SchemaDescriptor) -> Vec<(Vec<u8>, i64, i64)> {
-    let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
-    i64_rows(&merge_batches(&mem, schema))
-}
-
-/// Byte-form consolidation harness: returns `(pk_bytes, weight, i64_payload)`
-/// per output row. Width-agnostic (sibling of the packed-`u64` `run_consolidate`
-/// above, for PK shapes whose bytes don't fit a single `u64`).
-fn run_consolidate_bytes(b: &Batch) -> Vec<(Vec<u8>, i64, i64)> {
-    i64_rows(&b.clone().into_consolidated())
-}
-
+/// Every `pk_width_dispatch` arm orders by OPK bytes through all three entry
+/// points. The payloads are all equal, so only the PK compare keeps keys apart.
 #[test]
-fn wide_nway_merge_ordering_low16_collision() {
-    for (tcs, want_stride) in [(WIDE_24, 24usize), (WIDE_64, 64), (WIDE_80, 80)] {
-        let s = pk_payload_schema(tcs);
-        assert_eq!(s.pk_stride(), want_stride);
-        // A < B < C < D < E by compare_pk_bytes. B,C,D share col0
-        // (= the low-16 prefix); only the trailing column distinguishes
-        // them, so the packed-prefix reject cannot separate them.
-        let a = wpk(tcs, 0, 0);
-        let b = wpk(tcs, 1, 0);
-        let c = wpk(tcs, 1, 1);
-        let d = wpk(tcs, 1, 2);
-        let e = wpk(tcs, 2, 0);
-        // Three sorted batches, each internally ordered.
-        let b1 = make_batch_bytes(&s, &[(a.clone(), 1, 0), (c.clone(), 1, 2)]);
-        let b2 = make_batch_bytes(&s, &[(b.clone(), 1, 1), (e.clone(), 1, 4)]);
-        let b3 = make_batch_bytes(&s, &[(d.clone(), 1, 3)]);
-        let out = merge_to_rows_wide(&[b1, b2, b3], &s);
+fn every_pk_width_orders_by_opk_bytes() {
+    use TypeCode::*;
+    // (PK column types, PK column values in strictly ascending OPK order).
+    let cases: &[(&[TypeCode], &[&[u128]])] = &[
+        (&[U8], &[&[0], &[1], &[127], &[128], &[255]]),
+        (&[U16], &[&[0], &[1], &[256], &[32768], &[65535]]),
+        (&[U32], &[&[0], &[1], &[1 << 16], &[1 << 31], &[u32::MAX as u128]]),
+        // Compound, stride 8: the leading column dominates.
+        (&[U32, U32], &[&[1, 9], &[1, 10], &[2, 0]]),
+        // Stride 11 — a width that is neither a power of two nor a register size.
+        (&[U64, U16, U8], &[&[1, 2, 2], &[1, 2, 3], &[1, 3, 0], &[2, 0, 0]]),
+        // Stride 16: col0 must dominate. A regression to a plain numeric compare
+        // over the packed u128 would order col1-major and disagree here.
+        (&[U64, U64], &[&[1, 256], &[1, 257], &[256, 1], &[256, 2]]),
+        // Past 16 bytes, keys sharing their leading 16.
+        (WIDE_24, &[&[1, 1, 0], &[1, 1, 100], &[1, 2, 0], &[2, 0, 0]]),
+        (WIDE_64, &[&[1, 0, 0, 0], &[1, 0, 0, 1], &[1, 0, 0, 2], &[2, 0, 0, 0]]),
+        (WIDE_80, &[&[1, 1, 0, 0, 0], &[1, 1, 0, 0, 5], &[1, 1, 0, 1, 0]]),
+    ];
+
+    for &(tcs, vals) in cases {
+        let schema = pk_payload_schema(tcs);
+        let stride = schema.pk_stride();
+        let want: Vec<Vec<u8>> = vals.iter().map(|v| opk_pk(&schema, v)).collect();
+        let pks = |b: Batch| -> Vec<Vec<u8>> { (0..b.count).map(|i| b.get_pk_bytes(i).to_vec()).collect() };
+        // Fed in descending order, so nothing passes by arriving sorted.
+        let desc: Vec<(&Vec<u8>, i64, i64)> = want.iter().rev().map(|k| (k, 1, 0)).collect();
+        let asc: Vec<(&Vec<u8>, i64, i64)> = want.iter().map(|k| (k, 1, 0)).collect();
+
+        // One single-row source per key: the N-way merge orders them.
+        let batches: Vec<Batch> = desc
+            .iter()
+            .map(|r| make_batch_opk(&schema, std::slice::from_ref(r)))
+            .collect();
+        assert_eq!(pks(merge_all(&batches, &schema)), want, "stride {stride}: merge");
         assert_eq!(
-            out.len(),
-            5,
-            "stride={want_stride}: distinct low16-colliding PKs must not fold"
-        );
-        assert_eq!(
-            out.iter().map(|r| r.2).collect::<Vec<_>>(),
-            vec![0, 1, 2, 3, 4],
-            "stride={want_stride}: payload order tracks compare_pk_bytes order",
-        );
-        let expect_pks = [a, b, c, d, e];
-        for (i, r) in out.iter().enumerate() {
-            assert_eq!(r.0, expect_pks[i], "stride={want_stride}: pk row {i}");
-            assert_eq!(r.1, 1, "stride={want_stride}: weight row {i}");
-        }
-        // Output is fully ordered under the column-aware comparator.
-        for w in out.windows(2) {
-            assert_eq!(
-                compare_pk_bytes(&w[0].0, &w[1].0),
-                Ordering::Less,
-                "stride={want_stride}: output not strictly ordered by compare_pk_bytes",
-            );
-        }
-    }
-}
-
-#[test]
-fn wide_distinct_pk_identical_payload_not_folded() {
-    // Different wide PKs sharing their 16-byte prefix, carrying an identical
-    // payload — so `eq_payload` cannot hold them apart and only the `same_pk`
-    // closure's full-byte compare can. A prefix-only compare folds them.
-    let tcs = WIDE_24;
-    let s = pk_payload_schema(tcs);
-    let p1 = wpk(tcs, 7, 0);
-    let p2 = wpk(tcs, 7, 1);
-    let b1 = make_batch_bytes(&s, &[(p1.clone(), 1, 42)]);
-    let b2 = make_batch_bytes(&s, &[(p2.clone(), 1, 42)]);
-    let out = merge_to_rows_wide(&[b1, b2], &s);
-    assert_eq!(out.len(), 2, "prefix-colliding distinct PKs must stay separate");
-    assert_eq!(out[0], (p1, 1, 42));
-    assert_eq!(out[1], (p2, 1, 42));
-}
-
-#[test]
-fn test_merge_same_pk_nonadjacent_payload_interleave() {
-    let schema = make_schema_u128_i64();
-    let b1 = make_batch_i64(&[(5, 1, 100)]);
-    let b2 = make_batch_i64(&[(5, 1, 200)]);
-    let b3 = make_batch_i64(&[(5, -1, 100)]);
-
-    let result = merge_to_rows(&[b1, b2, b3], &schema);
-    assert_eq!(
-        result.len(),
-        1,
-        "val=100 +1/-1 pair must cancel; only val=200 survives, got {result:?}"
-    );
-    assert_eq!(result[0], (5, 1, 200));
-}
-
-#[test]
-fn wide_consolidate_prefix_collision_and_identical_payload() {
-    let tcs = WIDE_24;
-    let s = pk_payload_schema(tcs);
-    // Pre-sorted: (1,1,0) and (1,1,1) collide in low 16 AND carry an
-    // identical payload (val=0); they must remain two distinct rows.
-    // (1,1,2) is a third distinct PK.
-    let p0 = wpk(tcs, 1, 0);
-    let p1 = wpk(tcs, 1, 1);
-    let p2 = wpk(tcs, 1, 2);
-    let b = make_batch_bytes(&s, &[(p0.clone(), 1, 0), (p1.clone(), 1, 0), (p2.clone(), 1, 5)]);
-    let out = run_consolidate_bytes(&b);
-    assert_eq!(out.len(), 3, "distinct prefix-colliding PKs must not fold");
-    assert_eq!(out[0], (p0, 1, 0));
-    assert_eq!(out[1], (p1, 1, 0));
-    assert_eq!(out[2], (p2, 1, 5));
-
-    // Adjacent same PK + same payload DOES fold; net-zero drops.
-    let q = wpk(tcs, 2, 2);
-    let r = wpk(tcs, 3, 3);
-    let b2 = make_batch_bytes(
-        &s,
-        &[
-            (q.clone(), 1, 7),
-            (q.clone(), 1, 7),
-            (r.clone(), 1, -1),
-            (r.clone(), -1, -1),
-        ],
-    );
-    let out2 = run_consolidate_bytes(&b2);
-    assert_eq!(out2, vec![(q, 2, 7)]);
-}
-
-// -----------------------------------------------------------------------
-// Columnar materialization against an independent oracle
-//
-// `run_merge` + `scatter_unified_sources` is the tree's only column-at-a-time
-// materializer, and this is its adversarial exercise: a schema of two
-// German-string columns plus a nullable int, over runs carrying long / inline /
-// empty / duplicate strings, and null STRING and int cells.
-// The oracle is the same argsort-fold-drop-ghosts reference `consolidate_*`
-// checks against, generalized to this schema and run over the runs'
-// concatenation, so it shares no code with the merge it judges.
-//
-// Every assertion is on decoded content, never on raw blob/struct bytes: those
-// differ once two STRING columns spill into one heap.
-// -----------------------------------------------------------------------
-mod merge_materialize_vs_reference {
-    use super::*;
-
-    /// A payload cell for a German-string column.
-    enum S {
-        /// Non-null value with this content.
-        V(Vec<u8>),
-        Null,
-    }
-
-    /// A payload cell for the nullable fixed-width int column.
-    enum I {
-        V(i64),
-        Null,
-    }
-
-    struct RowSpec {
-        pk: Vec<u8>,
-        w: i64,
-        c0: S,
-        c1: S,
-        c2: I,
-    }
-
-    fn put_str(b: &mut BatchBuilder, c: &S) {
-        match c {
-            S::V(bytes) => b.put_blob(bytes),
-            S::Null => b.put_null(),
-        }
-    }
-
-    /// Build a consolidated run. Rows must be in ascending PK order (PKs are
-    /// distinct within a run here, so PK order == (PK, payload) order) and carry
-    /// non-zero weights — the certify debug-verifies both.
-    fn build_run(schema: &SchemaDescriptor, rows: Vec<RowSpec>) -> Batch {
-        let mut b = BatchBuilder::new(*schema);
-        for row in &rows {
-            b.begin_row_bytes(&row.pk, row.w);
-            put_str(&mut b, &row.c0);
-            put_str(&mut b, &row.c1);
-            match row.c2 {
-                I::V(v) => b.put_int(v as u128),
-                I::Null => b.put_null(),
-            }
-            b.end_row();
-        }
-        let mut b = b.finish();
-        b.certify_layout(Layout::Consolidated);
-        b
-    }
-
-    #[derive(Debug, PartialEq)]
-    enum CellVal {
-        Null,
-        Str(Vec<u8>),
-        Int(i64),
-    }
-
-    /// One decoded row: `(pk_bytes, weight, null_word, cells)`. Null cells decode
-    /// to `Null` from the null bit alone (cell bytes ignored); strings decode to
-    /// content against `blob` — never the raw struct/offset bytes, which two
-    /// independent materializations legitimately place differently.
-    type Row = (Vec<u8>, i64, u64, Vec<CellVal>);
-
-    fn decode_cells(
-        schema: &SchemaDescriptor,
-        nw: u64,
-        blob: &[u8],
-        cell: impl Fn(usize, usize) -> Vec<u8>,
-    ) -> Vec<CellVal> {
-        schema
-            .payload_columns()
-            .map(|(pi, col)| {
-                let cs = col.size() as usize;
-                if gnitz_wire::null_word_get(nw, pi) {
-                    CellVal::Null
-                } else if col.type_code.is_german_string() {
-                    let st: [u8; 16] = cell(pi, 16).try_into().unwrap();
-                    CellVal::Str(gnitz_wire::try_decode_german_string(&st, blob).expect("valid string"))
-                } else {
-                    CellVal::Int(i64::from_le_bytes(cell(pi, cs).try_into().unwrap()))
-                }
-            })
-            .collect()
-    }
-
-    fn decode(schema: &SchemaDescriptor, out: &Batch) -> Vec<Row> {
-        (0..out.count)
-            .map(|i| {
-                let nw = out.get_null_word(i);
-                let cells = decode_cells(schema, nw, out.blob(), |pi, cs| out.get_col_ptr(i, pi, cs).to_vec());
-                (out.get_pk_bytes(i).to_vec(), out.get_weight(i), nw, cells)
-            })
-            .collect()
-    }
-
-    /// The independent oracle: concatenate the runs into one batch, argsort it by
-    /// `compare_full_rows`, fold equal (PK, payload) groups and
-    /// drop the net-zero ones — the same reference shape `consolidate_reference`
-    /// uses, decoded to this module's three-payload-column rows.
-    fn reference_fold(schema: &SchemaDescriptor, runs: &[Batch]) -> Vec<Row> {
-        let mut all = Batch::with_capacity(schema, runs.iter().map(|b| b.count).sum());
-        for r in runs {
-            all.append_batch(r);
-        }
-        let mb = all.as_mem_batch();
-        let n = mb.count;
-        let mut idx: Vec<usize> = (0..n).collect();
-        idx.sort_by(|&x, &y| compare_full_rows(schema, &mb, x, &mb, y));
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < n {
-            let head = idx[i];
-            let mut w = mb.get_weight(head);
-            i += 1;
-            while i < n && compare_full_rows(schema, &mb, head, &mb, idx[i]) == Ordering::Equal {
-                w += mb.get_weight(idx[i]);
-                i += 1;
-            }
-            if w != 0 {
-                let nw = mb.get_null_word(head);
-                let cells = decode_cells(schema, nw, mb.blob, |pi, cs| mb.get_col_ptr(head, pi, cs).to_vec());
-                out.push((mb.get_pk_bytes(head).to_vec(), w, nw, cells));
-            }
-        }
-        out
-    }
-
-    /// Materialize `runs` through the merge + columnar scatter, once relocating
-    /// every string and once carrying each heap where the verdict prefers it,
-    /// and assert both match the oracle. Returns the decoded survivors for
-    /// caller-specific assertions.
-    fn assert_matches_reference(schema: &SchemaDescriptor, runs: Vec<Batch>) -> Vec<Row> {
-        let mem: Vec<MemBatch<'_>> = runs.iter().map(|b| b.as_mem_batch()).collect();
-        let want = reference_fold(schema, &runs);
-        let got = decode(schema, &merge_batches(&mem, schema));
-        assert!(!got.is_empty(), "merge produced no survivors");
-        assert_eq!(
-            got, want,
-            "merge + relocating scatter diverged from the argsort/fold reference"
-        );
-        assert_eq!(
-            decode(schema, &merge_consolidated(&mem, schema)),
+            pks(make_batch_opk(&schema, &desc).into_consolidated()),
             want,
-            "merge + carrying scatter diverged from the argsort/fold reference"
+            "stride {stride}: consolidate_groups"
         );
-        got
-    }
-
-    const LONG_A: &[u8] = b"long_string_value_A_padpadpadpad"; // > 12 → spills to blob
-    const LONG_DUP: &[u8] = b"duplicated_long_string_payload_zz"; // > 12, reused across columns
-
-    /// The shared adversarial dataset, parameterized by a PK encoder so the
-    /// same survivors drive both the stride-16 (single U128 PK) and stride-24
-    /// (compound 3×U64 PK → scatter dynamic arm) schemas.
-    fn build_dataset(schema: &SchemaDescriptor, pk: impl Fn(u64) -> Vec<u8>) -> Vec<Batch> {
-        let a = build_run(
-            schema,
-            vec![
-                RowSpec {
-                    pk: pk(10),
-                    w: 1,
-                    c0: S::V(b"".to_vec()),
-                    c1: S::V(LONG_A.to_vec()),
-                    c2: I::V(100),
-                },
-                RowSpec {
-                    pk: pk(20),
-                    w: 2,
-                    c0: S::V(b"short".to_vec()),
-                    c1: S::V(LONG_DUP.to_vec()),
-                    c2: I::Null,
-                },
-                RowSpec {
-                    pk: pk(30),
-                    w: 1,
-                    c0: S::Null,
-                    c1: S::V(b"abc".to_vec()),
-                    c2: I::V(-5),
-                },
-                RowSpec {
-                    pk: pk(40),
-                    w: 1,
-                    c0: S::V(b"ghost".to_vec()),
-                    c1: S::V(b"ghost2".to_vec()),
-                    c2: I::V(1),
-                },
-            ],
-        );
-        // Run B: pk=10 repeats Run A's (PK, payload) by *content* (a different
-        // blob offset) → the merge folds them to w=4.
-        let b = build_run(
-            schema,
-            vec![
-                RowSpec {
-                    pk: pk(10),
-                    w: 3,
-                    c0: S::V(b"".to_vec()),
-                    c1: S::V(LONG_A.to_vec()),
-                    c2: I::V(100),
-                },
-                RowSpec {
-                    pk: pk(25),
-                    w: 1,
-                    c0: S::V(LONG_DUP.to_vec()),
-                    c1: S::V(b"x".to_vec()),
-                    c2: I::V(9),
-                },
-                RowSpec {
-                    pk: pk(50),
-                    w: 1,
-                    c0: S::V(b"last".to_vec()),
-                    c1: S::Null,
-                    c2: I::Null,
-                },
-            ],
-        );
-        // Run C carries the null STRING cell; its pk=40 cancels Run A's (net
-        // zero → dropped).
-        let c = build_run(
-            schema,
-            vec![
-                RowSpec {
-                    pk: pk(40),
-                    w: -1,
-                    c0: S::V(b"ghost".to_vec()),
-                    c1: S::V(b"ghost2".to_vec()),
-                    c2: I::V(1),
-                },
-                RowSpec {
-                    pk: pk(60),
-                    w: 1,
-                    c0: S::Null,
-                    c1: S::V(b"tail".to_vec()),
-                    c2: I::Null,
-                },
-            ],
-        );
-        vec![a, b, c]
-    }
-
-    fn schema_simple() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(TypeCode::U128, false),
-                SchemaColumn::new(TypeCode::String, true),
-                SchemaColumn::new(TypeCode::Blob, true),
-                SchemaColumn::new(TypeCode::I64, true),
-            ],
-            &[0],
-        )
-    }
-
-    fn schema_compound() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(TypeCode::U64, false),
-                SchemaColumn::new(TypeCode::U64, false),
-                SchemaColumn::new(TypeCode::U64, false),
-                SchemaColumn::new(TypeCode::String, true),
-                SchemaColumn::new(TypeCode::Blob, true),
-                SchemaColumn::new(TypeCode::I64, true),
-            ],
-            &[0, 1, 2],
-        )
-    }
-
-    #[test]
-    fn single_pk_stride16_matches_reference() {
-        let s = schema_simple();
-        assert_eq!(s.pk_stride(), 16);
-        let runs = build_dataset(&s, |v| (v as u128).to_be_bytes().to_vec());
-        let rows = assert_matches_reference(&s, runs);
-
-        // Concrete pins: pk=40 ghost dropped, pk=10 folded across runs to w=4.
-        assert_eq!(rows.len(), 6, "expected 6 survivors (pk=40 cancels)");
-        let pk10 = (10u128).to_be_bytes().to_vec();
-        let row10 = rows.iter().find(|r| r.0 == pk10).expect("pk=10 present");
-        assert_eq!(row10.1, 4, "pk=10 weight folds across runs");
+        // Already in order on the way in: the sort must be a no-op, not a
+        // reshuffle of the equal-key groups.
         assert_eq!(
-            row10.3[0],
-            CellVal::Str(b"".to_vec()),
-            "empty string survives as empty, not null"
+            pks(make_batch_opk(&schema, &asc).into_consolidated()),
+            want,
+            "stride {stride}: consolidate_groups (pre-sorted)"
         );
-        assert_eq!(row10.3[1], CellVal::Str(LONG_A.to_vec()), "spilled long-string content");
-        assert_eq!(row10.3[2], CellVal::Int(100));
-        assert!(
-            !rows.iter().any(|r| r.0 == (40u128).to_be_bytes().to_vec()),
-            "pk=40 ghost must be dropped",
-        );
-    }
-
-    #[test]
-    fn compound_pk_stride24_dynamic_arm_matches_reference() {
-        let s = schema_compound();
-        assert_eq!(s.pk_stride(), 24, "stride 24 → scatter dynamic arm");
-        // col0 = col1 = 0, col2 = value: ascending value == ascending PK, and
-        // every PK shares the low-16 prefix (col0||col1) — also exercises the
-        // merge's compare_pk_bytes tiebreak.
-        let runs = build_dataset(&s, |v| {
-            let mut p = Vec::with_capacity(24);
-            p.extend_from_slice(&0u64.to_be_bytes());
-            p.extend_from_slice(&0u64.to_be_bytes());
-            p.extend_from_slice(&v.to_be_bytes());
-            p
-        });
-        let rows = assert_matches_reference(&s, runs);
-        assert_eq!(rows.len(), 6, "expected 6 survivors (pk=40 cancels)");
     }
 }
 
 // -----------------------------------------------------------------------
-// OPK consolidation-output equivalence (signed / compound / wide)
-//
-// `consolidate_groups` sorts by an order-preserving key rather than a
-// per-comparison typed column decode. These tests pin that the consolidated
-// output is identical to an independent reference built directly from
-// `compare_pk_bytes` + `compare_rows` — the canonical total order — for the
-// signed, compound, and wide PK shapes the sort key covers.
+// Columnar materialization of strings and NULLs
 // -----------------------------------------------------------------------
 
-/// Independent reference: argsort by `compare_full_rows`,
-/// fold consecutive equal `(PK, payload)` groups, drop net-zero ghosts.
-fn consolidate_reference(b: &Batch, schema: &SchemaDescriptor) -> Vec<(Vec<u8>, i64, i64)> {
-    let mb = b.as_mem_batch();
-    let n = mb.count;
-    let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&x, &y| compare_full_rows(schema, &mb, x, &mb, y));
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < n {
-        let head = idx[i];
-        let mut w = mb.get_weight(head);
-        i += 1;
-        while i < n && compare_full_rows(schema, &mb, head, &mb, idx[i]) == Ordering::Equal {
-            w += mb.get_weight(idx[i]);
-            i += 1;
-        }
-        if w != 0 {
-            let pk = mb.get_pk_bytes(head).to_vec();
-            let v = gnitz_wire::read_signed_exact(mb.get_col_ptr(head, 0, 8));
-            out.push((pk, w, v));
-        }
-    }
-    out
-}
+/// `(pk, weight, string, blob, int)`; `None` is NULL.
+type MatRow = (u64, i64, Option<&'static [u8]>, Option<&'static [u8]>, Option<i64>);
 
-fn assert_consolidate_matches_reference(schema: &SchemaDescriptor, rows: &[(Vec<u8>, i64, i64)]) {
-    let b = make_batch_bytes(schema, rows);
-    let got = run_consolidate_bytes(&b);
-    let want = consolidate_reference(&b, schema);
-    assert_eq!(got, want, "OPK consolidated output diverged from reference");
-    // Independent of the reference's grouping: the OPK sort must leave the
-    // output non-descending under the canonical column-aware comparator.
-    for w in got.windows(2) {
-        assert_ne!(
-            compare_pk_bytes(&w[0].0, &w[1].0),
-            Ordering::Greater,
-            "OPK output not ordered by compare_pk_bytes",
+const LONG_A: &[u8] = b"long_string_value_A_padpadpadpad"; // > 12 → spills to blob
+const LONG_DUP: &[u8] = b"duplicated_long_string_payload_zz"; // > 12, reused across columns
+
+/// Three consolidated runs: pk=10 folds by string content across runs, pk=40
+/// cancels.
+const MAT_RUNS: [&[MatRow]; 3] = [
+    &[
+        (10, 1, Some(b""), Some(LONG_A), Some(100)),
+        (20, 2, Some(b"short"), Some(LONG_DUP), None),
+        (30, 1, None, Some(b"abc"), Some(-5)),
+        (40, 1, Some(b"ghost"), Some(b"ghost2"), Some(1)),
+    ],
+    &[
+        (10, 3, Some(b""), Some(LONG_A), Some(100)),
+        (25, 1, Some(LONG_DUP), Some(b"x"), Some(9)),
+        (50, 1, Some(b"last"), None, None),
+    ],
+    &[
+        (40, -1, Some(b"ghost"), Some(b"ghost2"), Some(1)),
+        (60, 1, None, Some(b"tail"), None),
+    ],
+];
+
+/// The relocating and the carrying scatter both materialize the Z-set sum, at a
+/// stride-16 PK and at a stride-24 one whose keys share their leading 16 bytes.
+#[test]
+fn merge_materializes_the_zset_sum() {
+    for pk_cols in [&[TypeCode::U128][..], &[TypeCode::U64; 3]] {
+        let mut cols: Vec<SchemaColumn> = pk_cols.iter().map(|&tc| SchemaColumn::new(tc, false)).collect();
+        cols.extend([
+            SchemaColumn::new(TypeCode::String, true),
+            SchemaColumn::new(TypeCode::Blob, true),
+            SchemaColumn::new(TypeCode::I64, true),
+        ]);
+        let pk: Vec<u32> = (0..pk_cols.len() as u32).collect();
+        let schema = SchemaDescriptor::new(&cols, &pk);
+
+        let runs: Vec<Batch> = MAT_RUNS
+            .iter()
+            .map(|rows| {
+                let mut b = BatchBuilder::new(schema);
+                for &(k, w, s, x, n) in rows.iter() {
+                    let mut key = vec![0u128; pk_cols.len()];
+                    key[pk_cols.len() - 1] = k as u128;
+                    b.begin_row_bytes(&opk_pk(&schema, &key), w);
+                    for cell in [s, x] {
+                        match cell {
+                            Some(v) => b.put_blob(v),
+                            None => b.put_null(),
+                        }
+                    }
+                    b.put_opt_int(n.map(|v| v as u128));
+                    b.end_row();
+                }
+                let mut b = b.finish();
+                b.certify_layout(Layout::Consolidated);
+                b
+            })
+            .collect();
+        let mem: Vec<MemBatch<'_>> = runs.iter().map(|b| b.as_mem_batch()).collect();
+        let stride = schema.pk_stride();
+        let relocated = merge_batches(&mem, &schema);
+        assert_folds(&runs, &relocated, &format!("stride {stride}: relocating scatter"));
+        assert_folds(
+            &runs,
+            &merge_consolidated(&mem, &schema),
+            &format!("stride {stride}: carrying scatter"),
         );
+        assert_eq!(relocated.count, 6, "stride {stride}: pk=10 folds, pk=40 cancels");
     }
 }
 
-/// OPK bytes for a single I64 PK column (BE with the sign bit flipped).
-fn i64_pk(v: i64) -> Vec<u8> {
-    opk_pk(&v.to_le_bytes(), TypeCode::I64)
-}
+// -----------------------------------------------------------------------
+// Random batches at every PK width
+// -----------------------------------------------------------------------
 
-/// Decode a single-column OPK PK back to its native I64 value.
-#[test]
-fn opk_single_signed_i64_negatives() {
-    let s = pk_payload_schema(&[TypeCode::I64]);
-    // Unsorted, spanning negatives and extremes, with a fold and a ghost.
-    let rows = vec![
-        (i64_pk(5), 1, 50),
-        (i64_pk(-1), 1, 10),
-        (i64_pk(i64::MIN), 1, 99),
-        (i64_pk(-1), 2, 10), // folds with row 1 → weight 3
-        (i64_pk(i64::MAX), 1, 7),
-        (i64_pk(0), 1, 0),
-        (i64_pk(5), -1, 50), // ghost-cancels row 0
-        (i64_pk(-100), 1, 3),
-    ];
-    assert_consolidate_matches_reference(&s, &rows);
-    // Concrete order check: negatives precede non-negatives.
-    let out = run_consolidate_bytes(&make_batch_bytes(&s, &rows));
-    let pks: Vec<i64> = out.iter().map(|r| crate::test_support::opk_pk_i64(&r.0)).collect();
-    assert_eq!(pks, vec![i64::MIN, -100, -1, 0, i64::MAX]);
-}
-
-#[test]
-fn opk_compound_unsigned_first_column_dominates() {
-    let s = pk_payload_schema(&[TypeCode::U32, TypeCode::U64]);
-    // OPK: each unsigned column big-endian, concatenated in pk-list order.
-    let mk = |a: u32, b: u64| {
-        let mut v = Vec::with_capacity(12);
-        v.extend_from_slice(&a.to_be_bytes());
-        v.extend_from_slice(&b.to_be_bytes());
-        v
-    };
-    // Second column large enough to invert order under a raw LE u128 compare;
-    // first column must still dominate.
-    let rows = vec![
-        (mk(2, 1), 1, 20),
-        (mk(1, u64::MAX), 1, 10),
-        (mk(1, u64::MAX), 1, 10), // fold → weight 2
-        (mk(1, 5), 1, 11),
-    ];
-    assert_consolidate_matches_reference(&s, &rows);
-}
-
-#[test]
-fn opk_compound_mixed_signed_negative_second_column() {
-    let s = pk_payload_schema(&[TypeCode::U64, TypeCode::I32]);
-    // OPK per column: U64 big-endian, I32 big-endian with sign bit flipped.
-    let mk = |a: u64, b: i32| {
-        let mut v = Vec::with_capacity(12);
-        v.extend_from_slice(&a.to_be_bytes());
-        v.extend_from_slice(&opk_pk(&b.to_le_bytes(), TypeCode::I32));
-        v
-    };
-    let rows = vec![
-        (mk(1, 0), 1, 1),
-        (mk(1, -5), 1, 2), // negative second column sorts before 0
-        (mk(1, i32::MIN), 1, 3),
-        (mk(0, i32::MAX), 1, 4),
-        (mk(1, -5), -1, 2), // ghost
-    ];
-    assert_consolidate_matches_reference(&s, &rows);
-}
-
-#[test]
-fn opk_wide_prefix_straddle_and_collision() {
-    // WIDE_24: col straddling byte 16 is the third U64. wpk shares the
-    // 16-byte OPK prefix when `lead` matches, so the encoder's BE prefix
-    // must still order by the trailing column.
-    let tcs = WIDE_24;
-    let s = pk_payload_schema(tcs);
-    let rows = vec![
-        (wpk(tcs, 4, 4), 1, 30),
-        (wpk(tcs, 1, 2), 1, 20),
-        (wpk(tcs, 1, 0), 1, 10),
-        (wpk(tcs, 1, 0), 2, 10),  // fold
-        (wpk(tcs, 4, 4), -1, 30), // ghost
-        (wpk(tcs, 1, 9), 1, 99),
-    ];
-    assert_consolidate_matches_reference(&s, &rows);
-}
-
-mod opk_consolidate_proptest {
+mod fold_proptest {
     use super::*;
     use proptest::prelude::*;
 
@@ -1257,30 +600,47 @@ mod opk_consolidate_proptest {
             pk_payload_schema(&[TypeCode::I32]),
             pk_payload_schema(&[TypeCode::U32, TypeCode::U64]),
             pk_payload_schema(&[TypeCode::U64, TypeCode::I32]),
-            pk_payload_schema(&[TypeCode::U64, TypeCode::U64, TypeCode::U64]),
+            pk_payload_schema(WIDE_24),
             pk_payload_schema(WIDE_80),
         ]
     }
 
+    /// Rows over eight keys differing only in their first and last byte, with
+    /// small weight and payload domains, so folds and ghost cancels are common.
     fn arb_rows(stride: usize) -> impl Strategy<Value = Vec<(Vec<u8>, i64, i64)>> {
-        // Small weight and payload domains make folds and ghost-cancels
-        // likely; random PK bytes exercise the full ordering.
-        let row = (prop::collection::vec(any::<u8>(), stride), -3i64..=3i64, 0i64..4i64);
-        prop::collection::vec(row, 0..40)
+        let row = (0u8..2, 0u8..4, -3i64..=3i64, 0i64..4i64);
+        (
+            prop::collection::vec(any::<u8>(), stride),
+            prop::collection::vec(row, 0..40),
+        )
+            .prop_map(move |(base, rows)| {
+                rows.into_iter()
+                    .map(|(lead, tail, w, v)| {
+                        let mut pk = base.clone();
+                        pk[0] = lead;
+                        pk[stride - 1] = base[stride - 1].wrapping_add(tail);
+                        (pk, w, v)
+                    })
+                    .collect()
+            })
     }
 
     proptest! {
-        /// New `consolidate_groups` output equals the `compare_pk_bytes`
-        /// reference for every covered PK shape, over random batches.
+        /// `consolidate_groups` over one batch, and the N-way and pairwise
+        /// merges over its consolidated chunks, all materialize its Z-set.
         #[test]
-        fn consolidate_matches_reference(
+        fn every_fold_path_reaches_the_zset(
             (si, rows) in (0usize..schemas().len()).prop_flat_map(|si| {
                 let stride = schemas()[si].pk_stride();
                 (Just(si), arb_rows(stride))
             })
         ) {
             let s = schemas()[si];
-            assert_consolidate_matches_reference(&s, &rows);
+            let whole = make_batch_opk(&s, &rows);
+            assert_folds(std::slice::from_ref(&whole), &whole.clone().into_consolidated(), "consolidate");
+            let runs: Vec<Batch> = rows.chunks(13).map(|c| make_batch_opk(&s, c).into_consolidated()).collect();
+            assert_folds(&runs, &merge_all(&runs, &s), "N-way merge");
+            assert_folds(&runs, &merged_pairwise(&runs, &s), "pairwise merge");
         }
     }
 }
@@ -1291,7 +651,7 @@ mod opk_consolidate_proptest {
 fn rows_of(b: &Batch) -> Vec<(u128, i64, Vec<u8>)> {
     (0..b.count)
         .map(|row| {
-            let s = crate::test_support::read_german_string(b, 0, row);
+            let s = read_german_string(b, 0, row);
             (b.get_pk(row), b.get_weight(row), s)
         })
         .collect()
@@ -1301,7 +661,7 @@ fn rows_of(b: &Batch) -> Vec<(u128, i64, Vec<u8>)> {
 /// keeps one and leaves the other's.
 #[test]
 fn merged_consolidated_charges_the_rows_the_fold_drops() {
-    let schema = crate::test_support::make_schema_pk_u64_payload_string();
+    let schema = make_schema_pk_u64_payload_string();
     let (x, y) = ([b'x'; 20], [b'y'; 30]);
     let a = make_string_batch(&[(1, 1, &x), (2, 1, &y)]);
 
@@ -1317,7 +677,7 @@ fn merged_consolidated_charges_the_rows_the_fold_drops() {
 /// A merge that drops nothing carries both heaps whole with nothing dead.
 #[test]
 fn an_append_only_merge_charges_nothing() {
-    let schema = crate::test_support::make_schema_pk_u64_payload_string();
+    let schema = make_schema_pk_u64_payload_string();
     let a = make_string_batch(&[(1, 1, &[b'a'; 20]), (3, 1, &[b'c'; 20])]);
     let b = make_string_batch(&[(2, 1, &[b'b'; 20]), (4, 1, &[b'd'; 20])]);
     let out = a.merged_consolidated(&b, &schema);
@@ -1332,7 +692,7 @@ fn an_append_only_merge_charges_nothing() {
 #[test]
 fn a_carried_merge_reads_back_every_string() {
     use std::collections::BTreeMap;
-    let schema = crate::test_support::make_schema_pk_u64_payload_string();
+    let schema = make_schema_pk_u64_payload_string();
     let v = |c: u8, n: usize| vec![c; n];
     let (p, q, r, s, t) = (v(b'p', 14), v(b'q', 40), v(b'r', 25), v(b's', 33), v(b't', 17));
     let a_rows: Vec<(u64, i64, &[u8])> = vec![(1, 1, &p), (2, 1, b"short"), (5, 1, &q), (5, 2, &s), (9, 1, &t)];

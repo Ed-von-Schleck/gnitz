@@ -1,7 +1,10 @@
 use super::super::batch::REG_PAYLOAD_START;
 use super::*;
-use crate::schema::{SchemaDescriptor, TypeCode};
-use crate::test_support::{encode_to_wire_vec, make_batch_raw, pk_payload_schema};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::storage::BatchBuilder;
+use crate::test_support::{
+    encode_to_wire_vec, make_batch_bytes, make_schema_pk_u64_payload_string, pk_u64_two_i64_schema, weighted_rows,
+};
 
 /// Where region `r` of a `rows`-row block over `schema` starts.
 fn region_offset(schema: &SchemaDescriptor, rows: usize, r: usize) -> usize {
@@ -14,7 +17,6 @@ fn region_offset(schema: &SchemaDescriptor, rows: usize, r: usize) -> usize {
 /// The foreign decode refuses a non-canonical string cell the engine's own decode admits.
 #[test]
 fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
-    use crate::test_support::{make_batch_bytes, make_schema_pk_u64_payload_string};
     let schema = make_schema_pk_u64_payload_string();
     let long: &[u8] = b"a string long enough to spill";
     let clean = encode_to_wire_vec(&make_batch_bytes(&schema, &[(1, 1, b"short"), (2, 1, long)]));
@@ -42,7 +44,6 @@ fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
 /// The foreign decode refuses a NULL over a non-zero cell.
 #[test]
 fn a_foreign_decode_refuses_a_non_zero_cell_under_a_null() {
-    use crate::schema::SchemaColumn;
     // `(U64 pk, I64 NOT NULL, I64 NULL)`: the nullable column is payload slot 1.
     let schema = SchemaDescriptor::new(
         &[
@@ -52,7 +53,7 @@ fn a_foreign_decode_refuses_a_non_zero_cell_under_a_null() {
         ],
         &[0],
     );
-    let mut b = super::super::batch_builder::BatchBuilder::new(schema);
+    let mut b = BatchBuilder::new(schema);
     for pk in [1u128, 2] {
         b.begin_row(pk, 1);
         b.put_int(pk * 10);
@@ -69,21 +70,12 @@ fn a_foreign_decode_refuses_a_non_zero_cell_under_a_null() {
         Batch::decode_foreign_wal_block(&forged, &schema).err(),
         Some("a non-zero cell under a NULL")
     );
-
-    // A NOT NULL-only schema carries no null bit to test under.
-    let not_null = pk_payload_schema(&[TypeCode::U64]);
-    let block = encode_to_wire_vec(&make_batch_raw(&not_null, &[(1, 1, -1), (2, 1, 0)]));
-    assert_eq!(
-        Batch::decode_foreign_wal_block(&block, &not_null).map(|b| b.len()),
-        Ok(2)
-    );
 }
 
 /// A zero-row block decodes to an empty batch, dropping any heap bytes it
 /// declares: no cell can resolve against a heap at zero rows.
 #[test]
 fn a_zero_row_block_decodes_to_an_empty_batch() {
-    use crate::test_support::make_schema_pk_u64_payload_string;
     let schema = make_schema_pk_u64_payload_string();
     let mut empty = Batch::empty_with_schema(&schema);
     empty.blob.extend_from_slice(b"heap bytes no row references");
@@ -95,24 +87,61 @@ fn a_zero_row_block_decodes_to_an_empty_batch() {
     assert!(decoded.blob.is_empty(), "a zero-row block carries no heap");
 }
 
+/// Every encoder round-trips through the validated decode at narrow and odd PK
+/// and payload strides. The block packs its regions unaligned while a decoded
+/// arena 8-aligns them, which is where the two can disagree.
+#[test]
+fn every_encoder_round_trips_at_narrow_strides() {
+    use TypeCode::*;
+    for (pk, payload) in [
+        (&[U8][..], I16),
+        (&[U16], U8),
+        (&[U32], I32),
+        (&[U64, U32], U16),
+        (&[U64], I64),
+    ] {
+        let mut cols: Vec<SchemaColumn> = pk.iter().map(|&tc| SchemaColumn::new(tc, false)).collect();
+        cols.extend([SchemaColumn::new(payload, true), SchemaColumn::new(String, false)]);
+        let key: Vec<u32> = (0..pk.len() as u32).collect();
+        let schema = SchemaDescriptor::new(&cols, &key);
+        let mut b = BatchBuilder::new(schema);
+        for i in 0..5u128 {
+            b.begin_row_opk(&vec![i + 1; pk.len()], [1, -2, 3][i as usize % 3]);
+            b.put_opt_int((i % 2 == 0).then_some(i * 7));
+            b.put_string(&format!("row {i} holds a string past the inline limit"));
+            b.end_row();
+        }
+        let src = b.finish();
+        let stride = schema.pk_stride();
+        let decode = |block: &[u8]| weighted_rows(&Batch::decode_foreign_wal_block(block, &schema).unwrap());
+
+        assert_eq!(
+            decode(&encode_to_wire_vec(&src)),
+            weighted_rows(&src),
+            "stride {stride}: whole"
+        );
+
+        let mut buf = vec![0u8; src.wire_byte_size()];
+        let frame = src.wire_frame_within(1, 0, src.wire_byte_size());
+        let n = src.encode_frame(&frame, &mut buf);
+        assert_eq!(decode(&buf[..n]), weighted_rows(&src)[1..], "stride {stride}: frame");
+
+        let n = src.encode_scattered_to_wire(&[4, 0, 2], &mut buf).unwrap();
+        let picked = src.indexed_rows(&[4, 0, 2]);
+        assert_eq!(decode(&buf[..n]), weighted_rows(&picked), "stride {stride}: scattered");
+    }
+}
+
 /// Encode then decode 1-row and 100-row blocks of a (u64 PK, two i64 payload)
 /// schema: the per-block constant of the framer and the decoder.
 #[test]
 #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
 fn wal_block_bench() {
     use std::hint::black_box;
-    use std::time::Instant;
     const ITERS: usize = 1_000_000;
-    let schema = SchemaDescriptor::new(
-        &[
-            crate::schema::SchemaColumn::new(TypeCode::U64, false),
-            crate::schema::SchemaColumn::new(TypeCode::I64, false),
-            crate::schema::SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0],
-    );
+    let schema = pk_u64_two_i64_schema();
     for rows in [1usize, 100] {
-        let mut b = super::super::batch_builder::BatchBuilder::new(schema);
+        let mut b = BatchBuilder::new(schema);
         for i in 0..rows as u64 {
             b.begin_row(i as u128, 1);
             b.put_int(i as u128);
@@ -122,15 +151,14 @@ fn wal_block_bench() {
         let batch = b.finish();
         let mut buf = vec![0u8; batch.wire_byte_size()];
 
-        let t = Instant::now();
-        for _ in 0..ITERS {
+        let t = crate::test_support::bench_time(ITERS, || {
             let n = black_box(&batch).encode_to_wire(black_box(&mut buf));
             let block = WalBlock::parse(black_box(&buf[..n]), &schema).unwrap();
             black_box(block.view().count);
-        }
+        });
         println!(
             "wal block {rows} rows: encode + decode {:.1} ns",
-            t.elapsed().as_nanos() as f64 / ITERS as f64
+            t.as_nanos() as f64 / ITERS as f64
         );
     }
 }
@@ -144,24 +172,23 @@ fn chunk_rows(b: &Batch, start: usize, overhead: usize, budget: usize) -> usize 
 // Reply chunking: wire_frame_within
 // ---------------------------------------------------------------------------
 
-/// A U64 PK with one STRING payload column, and `(pk, value)` rows at weight 1
-/// over it. Values past `SHORT_STRING_THRESHOLD` live in the heap.
-fn string_rows(rows: &[(u64, &str)]) -> (SchemaDescriptor, Batch) {
-    let schema = crate::test_support::u64_pk_schema(crate::schema::SchemaColumn::new(TypeCode::String, false));
-    let mut b = super::super::batch_builder::BatchBuilder::new(schema);
-    for &(pk, v) in rows {
-        b.begin_row(pk as u128, 1);
-        b.put_string(v);
+/// `(pk, value)` rows at weight 1 over a U64 PK and one STRING payload column.
+/// Values past `SHORT_STRING_THRESHOLD` live in the heap.
+fn string_batch(rows: &[(u64, impl AsRef<str>)]) -> Batch {
+    let mut b = BatchBuilder::new(make_schema_pk_u64_payload_string());
+    for (pk, v) in rows {
+        b.begin_row(*pk as u128, 1);
+        b.put_string(v.as_ref());
         b.end_row();
     }
-    (schema, b.finish())
+    b.finish()
 }
 
 /// A frame inside a heap-bearing batch encodes its rows' spans and no others,
 /// in exactly the bytes it was sized at.
 #[test]
 fn a_frame_carries_only_its_spans() {
-    let (schema, src) = string_rows(&[
+    let src = string_batch(&[
         (1, "the first long value"),
         (2, "the second long value"),
         (3, "the third long value"),
@@ -174,7 +201,7 @@ fn a_frame_carries_only_its_spans() {
     let mut buf = vec![0u8; src.wire_byte_size()];
     let n = src.encode_frame(&frame, &mut buf);
     assert_eq!(n, budget);
-    let chunk = Batch::decode_foreign_wal_block(&buf[..n], &schema).unwrap();
+    let chunk = Batch::decode_foreign_wal_block(&buf[..n], src.schema()).unwrap();
     assert_eq!(chunk.len(), 2);
     assert_eq!(chunk.blob.len(), budget - src.wire_byte_size_range(2));
     for (i, want) in [(0usize, "the second long value"), (1, "the third long value")] {
@@ -184,23 +211,20 @@ fn a_frame_carries_only_its_spans() {
     }
 }
 
-/// Rows pointing at ONE source span cost that span once — the shape a join's
-/// fan-out produces, where `scatter_copy` writes a left row's string once and
-/// points every output row at it. Counting per row instead would size each frame
-/// as if every row carried a private copy, and emit far too many frames.
+/// Rows sharing one heap span, as a join's fan-out writes them, cost that span
+/// once.
 #[test]
 fn wire_frame_within_counts_a_shared_span_once() {
     const N: usize = 20;
-    let (schema, one) = string_rows(&[(1, &"v".repeat(200))]);
+    let one = string_batch(&[(1, "v".repeat(200))]);
     // One relocating append session, so its blob cache dedups the repeated
     // range: every row of `shared` points at the same span of its own heap.
-    let mut shared = Batch::with_capacity(&schema, N);
+    let mut shared = Batch::with_capacity(one.schema(), N);
     shared
         .append_session(N)
         .push_ranges(&one.as_mem_batch(), None, &[(0, 1); N]);
 
-    let distinct_rows: Vec<(u64, String)> = (0..N as u64).map(|i| (i, format!("{i:-<200}"))).collect();
-    let (_, distinct) = string_rows(&distinct_rows.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>());
+    let distinct = string_batch(&(0..N as u64).map(|i| (i, format!("{i:-<200}"))).collect::<Vec<_>>());
 
     let budget = shared.wire_byte_size();
     assert_eq!(chunk_rows(&shared, 0, 0, budget), N);
@@ -210,20 +234,16 @@ fn wire_frame_within_counts_a_shared_span_once() {
     );
 }
 
-/// A short (inline) string contributes no heap bytes. Reading a heap extent off
-/// one instead — its bytes 8..16 are content, not an offset — yields a bogus
-/// span and one row per frame. Both arms are covered: an all-short batch has an
-/// empty heap and inverts exactly, and one long row puts the rest on the
-/// forward walk.
+/// A short (inline) string costs no heap bytes, both in a heapless batch and on
+/// the forward walk past a long row.
 #[test]
 fn wire_frame_within_does_not_collapse_on_short_strings() {
-    let short_rows: Vec<(u64, &str)> = (0..30u64).map(|i| (i, "abcdefghijkl")).collect();
-    let (_, all_short) = string_rows(&short_rows);
+    let all_short = string_batch(&(0..30u64).map(|i| (i, "abcdefghijkl")).collect::<Vec<_>>());
     assert!(all_short.blob.is_empty(), "12-byte values stay inline");
 
     let mut mixed_rows: Vec<(u64, String)> = vec![(0, "a".repeat(64))];
     mixed_rows.extend((1..30u64).map(|i| (i, "abcdefghijkl".to_string())));
-    let (_, mixed) = string_rows(&mixed_rows.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>());
+    let mixed = string_batch(&mixed_rows);
     assert!(!mixed.blob.is_empty(), "the one long value takes the forward walk");
 
     // Room for ten rows beside the block header.
@@ -245,7 +265,7 @@ fn wire_frame_within_does_not_collapse_on_short_strings() {
 /// than coming back empty, and the caller sizes what it got.
 #[test]
 fn wire_frame_within_never_returns_an_empty_frame() {
-    let (_, batch) = string_rows(&[(1, &"w".repeat(4096)), (2, &"w".repeat(4096))]);
+    let batch = string_batch(&[(1, "w".repeat(4096)), (2, "w".repeat(4096))]);
     assert_eq!(chunk_rows(&batch, 0, 0, 64), 1);
 }
 
@@ -259,7 +279,7 @@ fn wire_frame_within_never_returns_an_empty_frame() {
 #[test]
 fn a_scattered_block_carries_its_own_heap() {
     let values: Vec<(u64, String)> = (0..6u64).map(|i| (i, format!("{i:->40}"))).collect();
-    let (schema, src) = string_rows(&values.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>());
+    let src = string_batch(&values);
     let indices = [4u32, 1, 3];
     let mut out = vec![0u8; src.wire_byte_size()];
     let written = src
@@ -271,7 +291,7 @@ fn a_scattered_block_carries_its_own_heap() {
         Some((indices.len(), written)),
         "the fit charges exactly the heap the encoder writes"
     );
-    let got = Batch::decode_foreign_wal_block(&out[..written], &schema).expect("a canonical block");
+    let got = Batch::decode_foreign_wal_block(&out[..written], src.schema()).expect("a canonical block");
     assert_eq!(got.len(), indices.len());
     assert!(got.blob.len() < src.blob.len(), "only the selected rows' spans travel");
     for (i, &idx) in indices.iter().enumerate() {
@@ -285,7 +305,7 @@ fn a_scattered_block_carries_its_own_heap() {
 /// behind them overflow `out`.
 #[test]
 fn a_scattered_block_that_overflows_its_buffer_is_refused() {
-    let (_, src) = string_rows(&[(1, &"x".repeat(100)), (2, &"y".repeat(100))]);
+    let src = string_batch(&[(1, "x".repeat(100)), (2, "y".repeat(100))]);
     let fixed = src.wire_byte_size_range(2);
     let mut out = vec![0u8; fixed - 1];
     assert!(
@@ -311,7 +331,6 @@ fn a_scattered_block_that_overflows_its_buffer_is_refused() {
 /// adopts it.
 #[test]
 fn dead_heap_round_trips_an_engine_block() {
-    use crate::test_support::{make_batch_bytes, make_schema_pk_u64_payload_string};
     let schema = make_schema_pk_u64_payload_string();
     let mut b = make_batch_bytes(&schema, &[(1, 1, &[b'a'; 20]), (2, 1, &[b'b'; 30])]);
     b.blob.extend_from_slice(&[0; 7]);
@@ -326,7 +345,6 @@ fn dead_heap_round_trips_an_engine_block() {
 /// unreferenced tail whole.
 #[test]
 fn a_foreign_decode_measures_the_dead_heap_exactly() {
-    use crate::test_support::make_schema_pk_u64_payload_string;
     let schema = make_schema_pk_u64_payload_string();
     let heap: Vec<u8> = (0..62u8).collect();
     let cell = |start: usize, len: usize| {
@@ -359,7 +377,6 @@ fn a_foreign_decode_measures_the_dead_heap_exactly() {
 /// ones. A BLOB column between the two STRING columns may hold anything.
 #[test]
 fn foreign_decode_utf8_matches_per_cell_oracle() {
-    use crate::schema::SchemaColumn;
     let schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
@@ -383,17 +400,12 @@ fn foreign_decode_utf8_matches_per_cell_oracle() {
         &[0xA9],
         b"0123456789",
     ];
-    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
-    let mut rnd = |m: u64| {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        seed % m
-    };
+    let mut rng = crate::test_rng::Rng::new(0x9E37_79B9_7F4A_7C15);
+    let mut rnd = |m: u64| rng.gen_range(m);
     let (mut ok_n, mut bad_n) = (0, 0);
     for _ in 0..20000 {
         let rows = 1 + rnd(4);
-        let mut b = super::super::batch_builder::BatchBuilder::new(schema);
+        let mut b = BatchBuilder::new(schema);
         let mut valid = true;
         for i in 0..rows {
             b.begin_row(i as u128, 1);
@@ -432,7 +444,6 @@ fn foreign_decode_utf8_matches_per_cell_oracle() {
 /// may span two cells, or a cell and the heap bytes beside it.
 #[test]
 fn foreign_decode_utf8_spans_split_across_cells() {
-    use crate::schema::SchemaColumn;
     let schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(TypeCode::U64, false),
@@ -442,7 +453,7 @@ fn foreign_decode_utf8_spans_split_across_cells() {
         &[0],
     );
     let accepts = |rows: &[(&[u8], &[u8])]| {
-        let mut b = super::super::batch_builder::BatchBuilder::new(schema);
+        let mut b = BatchBuilder::new(schema);
         for (i, (s, x)) in rows.iter().enumerate() {
             b.begin_row(i as u128, 1);
             b.put_blob(s);
@@ -485,8 +496,8 @@ fn foreign_decode_string_bench() {
         "u512" => "aéb€".repeat(73),
         other => panic!("GNITZ_BENCH_SHAPE must be s12/u9/s64/m64/u64/s512/u512, got {other:?}"),
     };
-    let schema = crate::test_support::u64_pk_schema(crate::schema::SchemaColumn::new(TypeCode::String, false));
-    let mut b = super::super::batch_builder::BatchBuilder::new(schema);
+    let schema = make_schema_pk_u64_payload_string();
+    let mut b = BatchBuilder::new(schema);
     for i in 0..1000u64 {
         b.begin_row(i as u128, 1);
         let mut v = unit.clone().into_bytes();
@@ -516,18 +527,16 @@ fn foreign_decode_string_bench() {
 #[test]
 #[ignore]
 fn reply_chunk_strings_bench() {
-    use crate::schema::SchemaColumn;
     const N: usize = 100_000;
     const BUDGET: usize = 64 << 10;
 
-    let values: Vec<(u64, String)> = (0..N as u64).map(|i| (i, format!("{i:040}"))).collect();
-    let (_, long) = string_rows(&values.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>());
+    let long = string_batch(&(0..N as u64).map(|i| (i, format!("{i:040}"))).collect::<Vec<_>>());
 
     let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
     cols.extend([SchemaColumn::new(TypeCode::I64, false); 6]);
     cols.push(SchemaColumn::new(TypeCode::String, false));
     let wide_schema = SchemaDescriptor::new(&cols, &[0]);
-    let mut b = super::super::batch_builder::BatchBuilder::new(wide_schema);
+    let mut b = BatchBuilder::new(wide_schema);
     for i in 0..N as u64 {
         b.begin_row(i as u128, 1);
         for c in 0..6u64 {

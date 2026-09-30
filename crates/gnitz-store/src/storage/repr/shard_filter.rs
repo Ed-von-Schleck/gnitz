@@ -85,7 +85,7 @@ pub(crate) fn is_valid(region: &[u8]) -> bool {
     };
     // Field order is the LE layout the write side's `dma_copy_descriptor_to`
     // produces and `BinaryFuse8Ref::from_dma` reads back;
-    // `a_filter_round_trips_through_its_region` pins it.
+    // `no_key_set_produces_a_false_negative_through_its_region` pins it.
     validate(
         &Descriptor {
             seed: read_u64_le(d, 0),

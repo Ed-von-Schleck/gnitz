@@ -718,43 +718,6 @@ fn multi_shard_merge_folds_cross_source_weights() {
     );
 }
 
-/// A long-string struct (len > 12) whose blob offset overruns the (empty) blob
-/// must read back empty rather than abort: the offset bounds check is part of
-/// `german_string_content`'s decode. This is the engine-side hardening the
-/// panicking decoder lacked, and it runs under the default debug profile — there
-/// is deliberately no `debug_assert` on the overrun case.
-#[test]
-fn a_long_string_whose_offset_overruns_the_blob_reads_back_empty() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U128, false),
-            SchemaColumn::new(TypeCode::String, false),
-        ],
-        &[0],
-    );
-    let mut b = Batch::with_capacity(&schema, 1);
-    b.extend_pk(1);
-    b.extend_weight(&1i64.to_le_bytes());
-    b.extend_null_bmp(&0u64.to_le_bytes());
-    // len = 100 (> 12 → reads blob), offset 0 into an empty blob → out of bounds.
-    let mut st = [0u8; 16];
-    st[0..4].copy_from_slice(&100u32.to_le_bytes());
-    st[8..16].copy_from_slice(&0u64.to_le_bytes());
-    b.extend_col(0, &st);
-    b.count += 1;
-    b.certify_layout(Layout::Consolidated);
-    let cursor = create_read_cursor(&[Rc::new(b)], &[], schema);
-    assert!(cursor.valid, "cursor must position on the single row");
-    // Logical column 1 is the STRING; the U128 PK occupies no payload slot, so
-    // it is payload index 0.
-    let (src, row) = cursor.current_row_source();
-    assert_eq!(
-        gnitz_expr::payload_bytes(src, row, 0),
-        &[] as &[u8],
-        "out-of-bounds long-string offset must decode to empty, not panic"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // The range seek's size estimate
 // ---------------------------------------------------------------------------

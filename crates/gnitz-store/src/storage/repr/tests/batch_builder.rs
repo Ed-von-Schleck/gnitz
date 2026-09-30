@@ -1,34 +1,33 @@
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 
-/// The column list `(type_code, nullable)` pairs describe, with `pk_index` the
-/// single PK column — the shape every builder case below is written against.
-fn make_schema_cols(cols: &[(TypeCode, bool)], pk_index: u32) -> SchemaDescriptor {
-    let mut columns = [SchemaColumn::EMPTY; crate::schema::MAX_COLUMNS];
-    for (i, &(tc, nullable)) in cols.iter().enumerate() {
-        columns[i] = SchemaColumn::new(tc, nullable);
-    }
-    SchemaDescriptor::new(&columns[..cols.len()], &[pk_index])
+/// The schema `(type_code, nullable)` pairs describe, keyed on `pk`.
+fn schema_of(cols: &[(TypeCode, bool)], pk: &[u32]) -> SchemaDescriptor {
+    let cols: Vec<SchemaColumn> = cols
+        .iter()
+        .map(|&(tc, nullable)| SchemaColumn::new(tc, nullable))
+        .collect();
+    SchemaDescriptor::new(&cols, pk)
 }
 
-// With a non-leading compound PK the payload slots are renumbered around every
-// PK position, so `payload_idx = ci - 1` does not hold. For pk_indices=[1, 2]
-// over four columns, payload slot 0 maps to logical column 0 and slot 1 to
-// logical column 3 — never to 0 and 1.
+/// Payload slots skip every PK column, so slot 1 is column 3. Every column has
+/// its own width, so a slot mapped to the wrong column misplaces its cells.
 #[test]
-fn batch_builder_physical_col_idx_compound_pk() {
-    let cols = [
-        SchemaColumn::new(TypeCode::U64, false),
-        SchemaColumn::new(TypeCode::U64, false),
-        SchemaColumn::new(TypeCode::U64, false),
-        SchemaColumn::new(TypeCode::U64, false),
-    ];
-    let schema = SchemaDescriptor::new(&cols, &[1, 2]);
+fn batch_builder_writes_payload_around_a_non_leading_compound_pk() {
+    use TypeCode::*;
+    let schema = schema_of(&[(U8, false), (U64, false), (U32, false), (I16, false)], &[1, 2]);
     let mut bb = BatchBuilder::new(schema);
-    assert_eq!(bb.curr_col, 0);
-    assert_eq!(bb.physical_col_idx(), 0);
-    bb.curr_col = 1;
-    assert_eq!(bb.physical_col_idx(), 3);
+    for (k, a, b) in [(1u128, 0xAB_u128, -5i16), (2, 0xCD, 300)] {
+        bb.begin_row_opk(&[k, k * 10], 1);
+        bb.put_int(a);
+        bb.put_int(b as u128);
+        bb.end_row();
+    }
+    let batch = bb.finish();
+    for (row, (a, b)) in [(0xABu8, -5i16), (0xCD, 300)].into_iter().enumerate() {
+        assert_eq!(batch.get_col_ptr(row, 0, 1), &[a], "row {row} slot 0");
+        assert_eq!(batch.get_col_ptr(row, 1, 2), &b.to_le_bytes(), "row {row} slot 1");
+    }
 }
 
 /// `BatchBuilder` over two nullable STRING columns: inline cells, cells that
@@ -36,13 +35,13 @@ fn batch_builder_physical_col_idx_compound_pk() {
 /// zeroed rather than left holding the previous row's bytes.
 #[test]
 fn batch_builder_writes_string_cells_and_nulls() {
-    let schema = make_schema_cols(
+    let schema = schema_of(
         &[
             (TypeCode::U64, false),
             (TypeCode::String, true),
             (TypeCode::String, true),
         ],
-        0,
+        &[0],
     );
 
     // (col 0, col 1). Long values (> 12 bytes) land in the blob heap, short
@@ -91,13 +90,10 @@ fn batch_builder_writes_string_cells_and_nulls() {
     }
 }
 
-// 3.14 / 2.718 are test-fixture values exercising f32/f64 round-trip, not
-// approximations of PI/E.
 #[test]
-#[allow(clippy::approx_constant)]
 fn batch_builder_writes_every_payload_type_at_its_own_width() {
     // U64 pk, then one of each remaining type at payload index 0..=11.
-    let schema = make_schema_cols(
+    let schema = schema_of(
         &[
             (TypeCode::U64, false),    // pk
             (TypeCode::U8, false),     // pi 0
@@ -113,7 +109,7 @@ fn batch_builder_writes_every_payload_type_at_its_own_width() {
             (TypeCode::String, false), // pi 10
             (TypeCode::I128, false),   // pi 11
         ],
-        0,
+        &[0],
     );
 
     // A negative 16-byte payload (a cross-sign `_join_pk` surfaced into a
@@ -125,10 +121,10 @@ fn batch_builder_writes_every_payload_type_at_its_own_width() {
     for v in [42i128, -7, 1000, -500, 70000, -12345] {
         bb.put_int(v as u128);
     }
-    bb.put_float(3.14);
+    bb.put_float(1.5);
     bb.put_int(0x1234_5678_9ABC_DEF0u128);
     bb.put_int(-99999i128 as u128);
-    bb.put_float(2.718281828);
+    bb.put_float(-2.25);
     bb.put_blob(b"hello world!");
     bb.put_int(i128_val as u128);
     bb.end_row();
@@ -141,12 +137,10 @@ fn batch_builder_writes_every_payload_type_at_its_own_width() {
     assert_eq!(batch.get_col_ptr(0, 3, 2), &(-500i16).to_le_bytes());
     assert_eq!(batch.get_col_ptr(0, 4, 4), &70000u32.to_le_bytes());
     assert_eq!(batch.get_col_ptr(0, 5, 4), &(-12345i32).to_le_bytes());
-    let f32_val = f32::from_le_bytes(batch.get_col_ptr(0, 6, 4).try_into().unwrap());
-    assert!((f32_val - 3.14f32).abs() < 1e-5, "f32: {f32_val}");
+    assert_eq!(batch.get_col_ptr(0, 6, 4), &1.5f32.to_le_bytes());
     assert_eq!(batch.get_col_ptr(0, 7, 8), &0x1234_5678_9ABC_DEF0u64.to_le_bytes());
     assert_eq!(batch.get_col_ptr(0, 8, 8), &(-99999i64).to_le_bytes());
-    let f64_val = f64::from_le_bytes(batch.get_col_ptr(0, 9, 8).try_into().unwrap());
-    assert!((f64_val - 2.718281828).abs() < 1e-9, "f64: {f64_val}");
+    assert_eq!(batch.get_col_ptr(0, 9, 8), &(-2.25f64).to_le_bytes());
     assert_eq!(crate::test_support::read_german_string(&batch, 10, 0), b"hello world!");
     let got = i128::from_le_bytes(batch.get_col_ptr(0, 11, 16).try_into().unwrap());
     assert_eq!(got, i128_val, "a 16-byte payload round-trips at its full width");

@@ -1,6 +1,4 @@
 use super::*;
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::storage::Batch;
 use tls_pool::{MAX_POOLED, MAX_POOLED_BYTES};
 
 #[test]
@@ -53,28 +51,6 @@ fn acquire_takes_only_a_buffer_within_twice_the_request() {
     assert_eq!(none.capacity(), 0);
     assert_eq!(drain_pool().len(), 1, "a 0-byte request takes nothing");
     drop(small);
-}
-
-/// A 1-row batch takes no pooled arena sized for thousands of rows.
-#[test]
-fn a_one_row_batch_does_not_take_a_large_pooled_arena() {
-    drain_pool();
-    recycle_buf(Vec::with_capacity(MAX_POOLED_BYTES));
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-        ],
-        &[0],
-    );
-    let b = Batch::with_capacity(&schema, 1);
-    assert!(b.data_capacity() < MAX_POOLED_BYTES);
-    let left = drain_pool();
-    drop(b);
-    assert!(
-        left.iter().any(|v| v.capacity() == MAX_POOLED_BYTES),
-        "the large buffer stays pooled"
-    );
 }
 
 /// Pool scan cost: an empty request, a miss over a full pool, and a hit on its

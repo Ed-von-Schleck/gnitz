@@ -34,8 +34,7 @@ fn key_of(schema: &SchemaDescriptor, keys: &[i128; 8], i: usize) -> Vec<u8> {
 /// A `Consolidated` batch over `schema` from case rows, which must already be in
 /// (PK, payload) order.
 fn batch(schema: &SchemaDescriptor, keys: &[i128; 8], rows: Rows) -> Batch {
-    let pks: Vec<Vec<u8>> = rows.iter().map(|&(i, ..)| key_of(schema, keys, i)).collect();
-    let opk: Vec<(&[u8], i64, i64)> = pks.iter().zip(rows).map(|(k, &(_, w, v))| (&k[..], w, v)).collect();
+    let opk: Vec<_> = rows.iter().map(|&(i, w, v)| (key_of(schema, keys, i), w, v)).collect();
     let mut b = make_batch_opk(schema, &opk);
     b.certify_layout(Layout::Consolidated);
     b

@@ -59,8 +59,7 @@ fn build_shard_filter_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<B
     // identity) are adjacent — skipping chunks byte-equal to their predecessor
     // is an allocation-free O(n) pre-shrink that bounds `build`'s sort at the
     // number of *distinct* PKs in the region rather than its row count.
-    // `probe_key` owns the narrow/wide derivation the probe side must
-    // match exactly.
+    // `probe_key` is the derivation the probe side must match exactly.
     let mut keys: Vec<u64> = Vec::with_capacity(pk_bytes.len() / stride);
     let mut prev: Option<&[u8]> = None;
     for chunk in pk_bytes.chunks_exact(stride) {
@@ -102,12 +101,11 @@ impl ShardWriteOpts {
 pub(in crate::storage) fn write_test_shard(
     path: &std::path::Path,
     schema: &SchemaDescriptor,
-    rows: &[(Vec<u8>, i64, i64)],
+    rows: &[(impl AsRef<[u8]>, i64, i64)],
     opts: ShardWriteOpts,
 ) -> String {
     let path = path.to_str().unwrap().to_owned();
-    let rows: Vec<(&[u8], i64, i64)> = rows.iter().map(|(pk, w, v)| (pk.as_slice(), *w, *v)).collect();
-    crate::test_support::make_batch_opk(schema, &rows)
+    crate::test_support::make_batch_opk(schema, rows)
         .write_as_shard(&path, opts)
         .unwrap();
     path

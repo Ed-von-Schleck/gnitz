@@ -1,27 +1,17 @@
 use super::*;
+use crate::test_rng::Rng;
 
 /// A `u128` PK through the real key derivation, as its OPK bytes.
 fn key_u128(k: u128) -> u64 {
     crate::schema::key::probe_key(&k.to_be_bytes())
 }
 
-fn build_u128(pks: &[u128]) -> Option<BinaryFuse8> {
-    build(pks.iter().copied().map(key_u128).collect())
-}
-
-/// A built filter as the reader sees it: its region bytes, checked valid.
-fn through_the_region(pks: &[u128]) -> Vec<u8> {
-    let region = serialize(&build_u128(pks).unwrap());
-    assert!(is_valid(&region), "a freshly built filter parses back");
-    region
-}
-
-/// No key set may produce a false negative through its serialized region. The
-/// descriptor is written by the dependency's `dma_copy_descriptor_to`, validated
-/// by [`validate`]'s own parse and read back by `BinaryFuse8Ref::from_dma`, so a
-/// field-order change moves those apart and a probe over the region notices.
+/// Through its serialized region, no key set produces a false negative, and
+/// absent keys pass under 1% of the time (nominal ~0.4%).
 #[test]
 fn no_key_set_produces_a_false_negative_through_its_region() {
+    let mut rng = Rng::new(0xF11E_5EED);
+    let absent: Vec<u128> = (0..100_000).map(|_| rng.gen_u128()).collect();
     for (what, pks) in [
         ("dense", (0u128..1000).collect::<Vec<_>>()),
         ("two keys", vec![100, 200]),
@@ -29,26 +19,19 @@ fn no_key_set_produces_a_false_negative_through_its_region() {
             "across the u64 boundary",
             vec![0, 1, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX],
         ),
+        (
+            "200k random, a wider segment geometry",
+            (0..200_000).map(|_| rng.gen_u128()).collect(),
+        ),
     ] {
-        let built = build_u128(&pks).unwrap();
-        let region = serialize(&built);
+        let region = serialize(&build(pks.iter().copied().map(key_u128).collect()).unwrap());
         assert!(is_valid(&region), "{what}: a freshly built filter parses back");
-        assert_eq!(region.len(), Descriptor::DMA_LEN + built.fingerprints.len(), "{what}");
         for &pk in &pks {
             assert!(may_contain(&region, key_u128(pk)), "{what}: {pk:#034x}");
         }
+        let fp = absent.iter().filter(|&&k| may_contain(&region, key_u128(k))).count();
+        assert!(fp * 100 < absent.len(), "{what}: false-positive rate above 1%: {fp}");
     }
-}
-
-#[test]
-fn false_positive_rate() {
-    let pks: Vec<u128> = (0u128..2000).collect();
-    let region = through_the_region(&pks);
-    let fp = (10_000u128..20_000)
-        .filter(|&i| may_contain(&region, key_u128(i)))
-        .count();
-    // BinaryFuse8 theoretical FPR ~0.39%. Allow up to 2%.
-    assert!(fp < 200, "FPR too high: {fp}/10000");
 }
 
 #[test]

@@ -200,8 +200,8 @@ proptest! {
         let (original, leading) = arb_batch(&schema, rows, seed);
 
         // Absent prefix-twin: same leading PK columns, trailing ordinal == rows
-        // (never used by a real row). For wide PKs it shares the 16-byte bloom
-        // prefix, so the bloom may report a false positive the scan must reject.
+        // (never used by a real row): the PK filter may report it as a false
+        // positive, which the scan must reject.
         let mut absent_vals = leading.clone();
         absent_vals.push(rows as u128);
         let absent = crate::test_support::opk_pk(&schema, &absent_vals);
