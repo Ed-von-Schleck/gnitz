@@ -6,17 +6,21 @@
 //! batch and a schema they were not written for is what holds the addressing
 //! paths to the [`BatchView`] / [`ColumnTable`] contracts alone.
 
+use std::fmt::Debug;
+
 use gnitz_wire::TypeCode;
 
+use crate::batch::MORSEL;
 use crate::eval::Resolved;
 use crate::{
-    BatchView, ColumnLocator, ColumnTable, ExprResults, LogicalInstr, LogicalProgram, MapEval, MapTarget, Reg,
-    RowFilter, RowSource, ScalarEval, SchemaFacts, Sink,
+    BatchView, ColumnTable, ExprResults, LogicalInstr, LogicalProgram, MapEval, MapTarget, Reg, RowFilter, RowSource,
+    ScalarEval, SchemaFacts, Sink,
 };
 
 /// A [`BatchView`] over owned buffers, laid out region-wise like the physical
 /// batch: one packed OPK PK region, one null-bitmap word per row, and one
-/// contiguous buffer per payload slot.
+/// contiguous buffer per payload slot. Also a [`MapTarget`], so a map writes
+/// into the same layout a test reads through the production locators.
 pub struct TestView {
     rows: usize,
     pk_stride: usize,
@@ -28,58 +32,30 @@ pub struct TestView {
 }
 
 impl TestView {
-    pub fn new(rows: usize, pk_stride: usize) -> Self {
-        TestView {
-            rows,
-            pk_stride,
-            pk: vec![0u8; rows * pk_stride],
-            nulls: vec![0u8; rows * 8],
-            cols: Vec::new(),
-            blob: Vec::new(),
-        }
-    }
-
     /// `rows` rows over `schema`: one payload column per slot, sized from its
-    /// declared type, row `r`'s PK `r + 1`, nothing NULL.
+    /// declared type, every PK column of row `r` holding `r + 1`, nothing NULL.
     pub fn for_schema(schema: &TestSchema, rows: usize) -> Self {
-        let mut v = TestView::new(rows, schema.pk_stride());
-        for pi in 0..schema.num_payload_cols() {
-            v.push_col(schema.locate(schema.payload_col_idx(pi)).size());
-        }
+        let mut v = TestView {
+            rows,
+            pk_stride: schema.pk_stride(),
+            pk: vec![0u8; rows * schema.pk_stride()],
+            nulls: vec![0u8; rows * 8],
+            cols: (0..schema.num_payload_cols())
+                .map(|pi| vec![0u8; rows * schema.locate(schema.payload_col_idx(pi)).size()])
+                .collect(),
+            blob: Vec::new(),
+        };
         for row in 0..rows {
-            v.set_pk(schema, row, row as u64 + 1);
+            v.set_key(schema, row, &vec![row as u128 + 1; schema.pk_cols().len()]);
         }
         v
     }
 
-    /// Append a payload column whose cells are `col_size` bytes wide.
-    pub fn push_col(&mut self, col_size: usize) {
-        self.cols.push(vec![0u8; self.rows * col_size]);
-    }
-
-    /// Write `pk` into every PK column of `row`, addressed through the schema's
-    /// own locator, so a fixture cannot disagree with the addressing the kernels
-    /// use. A compound PK gets the same source value in each column, truncated to
-    /// that column's width; `pk` is a bit pattern, so a signed column reads it
-    /// two's-complement.
-    pub fn set_pk(&mut self, schema: &TestSchema, row: usize, pk: u64) {
-        for ci in 0..schema.num_columns() {
-            if let ColumnLocator::Pk { byte_off, size, type_code } = schema.locate(ci) {
-                self.set_pk_col(
-                    row,
-                    byte_off as usize,
-                    &pk.to_le_bytes()[..(size as usize).min(8)],
-                    type_code,
-                );
-            }
-        }
-    }
-
-    /// OPK-encode `native` (native-LE bytes of type `type_code`) into the PK
-    /// region of `row` at `byte_off`.
-    pub fn set_pk_col(&mut self, row: usize, byte_off: usize, native: &[u8], type_code: TypeCode) {
-        let base = row * self.pk_stride + byte_off;
-        gnitz_wire::encode_pk_column(native, type_code, &mut self.pk[base..base + native.len()]);
+    /// Write `row`'s key from one native value per PK column, in PK-list order,
+    /// through the schema's own key encoder.
+    pub fn set_key(&mut self, schema: &TestSchema, row: usize, natives: &[u128]) {
+        let key = schema.opk_key_cols(natives);
+        self.pk[row * self.pk_stride..(row + 1) * self.pk_stride].copy_from_slice(key.pk_bytes());
     }
 
     /// Write `native` into the low bytes of `row`'s cell in payload slot `pi`.
@@ -87,15 +63,14 @@ impl TestView {
     /// a narrower value lands correctly in a wider cell instead of shifting
     /// every subsequent row.
     pub fn set_payload(&mut self, row: usize, pi: usize, native: &[u8]) {
-        let stride = self.cols[pi].len() / self.rows;
-        let base = row * stride;
+        let base = row * self.stride(pi);
         self.cols[pi][base..base + native.len()].copy_from_slice(native);
     }
 
     /// Store `val` little-endian into the low bytes of `row`'s cell in slot `pi`,
     /// truncated to a narrower cell.
     pub fn set_int(&mut self, row: usize, pi: usize, val: i64) {
-        let w = (self.cols[pi].len() / self.rows).min(8);
+        let w = self.stride(pi).min(8);
         self.set_payload(row, pi, &val.to_le_bytes()[..w]);
     }
 
@@ -103,7 +78,7 @@ impl TestView {
     /// German-string cell in payload slot `pi` of `row`.
     pub fn set_string(&mut self, row: usize, pi: usize, s: &[u8]) {
         let cell = gnitz_wire::encode_german_string(s, &mut self.blob);
-        self.cols[pi][row * 16..row * 16 + 16].copy_from_slice(&cell);
+        self.set_payload(row, pi, &cell);
     }
 
     pub fn set_null(&mut self, row: usize, slot: usize) {
@@ -115,6 +90,31 @@ impl TestView {
     /// Overwrite `row`'s whole null word (bit N = payload slot N is NULL).
     pub fn set_null_word(&mut self, row: usize, word: u64) {
         gnitz_wire::write_u64_le(&mut self.nulls, row * 8, word);
+    }
+
+    /// A `len`-row view whose row `i` is this one's row `map(i)`. A string cell
+    /// keeps its heap offset, so the blob is shared verbatim.
+    pub fn tiled(&self, len: usize, map: impl Fn(usize) -> usize) -> TestView {
+        let copy = |src: &[u8], w: usize| -> Vec<u8> {
+            (0..len)
+                .flat_map(|i| &src[map(i) * w..(map(i) + 1) * w])
+                .copied()
+                .collect()
+        };
+        TestView {
+            rows: len,
+            pk_stride: self.pk_stride,
+            pk: copy(&self.pk, self.pk_stride),
+            nulls: copy(&self.nulls, 8),
+            cols: (0..self.cols.len())
+                .map(|pi| copy(&self.cols[pi], self.stride(pi)))
+                .collect(),
+            blob: self.blob.clone(),
+        }
+    }
+
+    fn stride(&self, pi: usize) -> usize {
+        self.cols[pi].len() / self.rows
     }
 }
 
@@ -148,6 +148,15 @@ impl BatchView for TestView {
     }
     fn pk_region(&self) -> (&[u8], usize) {
         (&self.pk, self.pk_stride)
+    }
+}
+
+impl MapTarget for TestView {
+    fn null_bmp_mut(&mut self) -> &mut [u8] {
+        &mut self.nulls
+    }
+    fn slot_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
+        (&mut self.cols[pi], &mut self.nulls, &mut self.blob)
     }
 }
 
@@ -186,29 +195,48 @@ impl ColumnTable for TestSchema {
     }
 }
 
-/// Build a [`TestView`] of `(pk, null_word, payload values)` rows against
-/// `schema`: each payload column is sized from its declared type and each row's
-/// `i64` value is stored little-endian into the low bytes of its cell.
-pub fn make_int_view(schema: &TestSchema, rows: &[(u64, u64, &[i64])]) -> TestView {
-    let mut v = TestView::for_schema(schema, rows.len());
-    for (row, &(pk, null_word, cols)) in rows.iter().enumerate() {
-        v.set_pk(schema, row, pk);
-        v.set_null_word(row, null_word);
-        for (pi, &val) in cols.iter().enumerate() {
-            v.set_int(row, pi, val);
-        }
-    }
-    v
+/// An `n`-row view over `schema`'s German-string payload columns: slot `c` of
+/// `row` holds `cell(row, c)`, NULL when `null_pred(row, c)`. PKs are `1..=n`.
+pub fn make_string_view<S: AsRef<[u8]>>(
+    schema: &TestSchema,
+    n: usize,
+    cell: impl Fn(usize, usize) -> S,
+    null_pred: impl Fn(usize, usize) -> bool,
+) -> TestView {
+    make_view(
+        schema,
+        n,
+        |v, row, pi| v.set_string(row, pi, cell(row, pi).as_ref()),
+        null_pred,
+    )
 }
 
-/// An `n`-row view over `schema`'s German-string payload columns: slot `c` of
-/// `row` holds `cell(row, c)`. PKs are `1..=n`, nothing is NULL.
-pub fn make_string_view<S: AsRef<[u8]>>(schema: &TestSchema, n: usize, cell: impl Fn(usize, usize) -> S) -> TestView {
+/// An `n`-row view over `schema`'s integer payload columns: column `col` of
+/// `row` holds `f(row, col)`, truncated to its cell, NULL when
+/// `null_pred(row, col)`. PKs are `1..=n`.
+pub fn make_n_col_view(
+    schema: &TestSchema,
+    n: usize,
+    f: impl Fn(usize, usize) -> i64,
+    null_pred: impl Fn(usize, usize) -> bool,
+) -> TestView {
+    make_view(schema, n, |v, row, pi| v.set_int(row, pi, f(row, pi)), null_pred)
+}
+
+fn make_view(
+    schema: &TestSchema,
+    n: usize,
+    set: impl Fn(&mut TestView, usize, usize),
+    null_pred: impl Fn(usize, usize) -> bool,
+) -> TestView {
     let mut v = TestView::for_schema(schema, n);
     for row in 0..n {
+        let mut null_word = 0u64;
         for pi in 0..schema.num_payload_cols() {
-            v.set_string(row, pi, cell(row, pi).as_ref());
+            gnitz_wire::null_word_set(&mut null_word, pi, null_pred(row, pi));
+            set(&mut v, row, pi);
         }
+        v.set_null_word(row, null_word);
     }
     v
 }
@@ -230,53 +258,25 @@ fn schema_pk_cols(payload_tc: TypeCode, n: usize, nullable: bool) -> TestSchema 
     TestSchema::new(&cols, &[0])
 }
 
-/// An `n`-row view over `schema`'s `I64` payload columns: column `col` of `row`
-/// holds `f(row, col)`, and its null bit is set when `null_pred(row, col)`.
-/// PKs are `1..=n`.
-pub fn make_n_col_view(
-    schema: &TestSchema,
-    n: usize,
-    f: impl Fn(usize, usize) -> i64,
-    null_pred: impl Fn(usize, usize) -> bool,
-) -> TestView {
-    let mut v = TestView::for_schema(schema, n);
-    for row in 0..n {
-        let mut null_word = 0u64;
-        for col in 0..schema.num_payload_cols() {
-            gnitz_wire::null_word_set(&mut null_word, col, null_pred(row, col));
-            v.set_int(row, col, f(row, col));
-        }
-        v.set_null_word(row, null_word);
-    }
-    v
+/// `instrs` as a program whose one register sink is its last instruction.
+fn result_prog(instrs: Vec<LogicalInstr>, const_strings: Vec<Vec<u8>>) -> LogicalProgram {
+    let result = Reg(instrs.len() as u16 - 1);
+    LogicalProgram::new(instrs, vec![Sink::Reg(result)], const_strings)
 }
 
-/// Build and resolve a scalar (non-filter, no output plan) program. A test
-/// program that fails validation is a bug in the test, so it unwraps here rather
-/// than at every site.
-pub fn scalar_prog(
-    schema: &TestSchema,
-    instrs: Vec<LogicalInstr>,
-    result_reg: Reg,
-    const_strings: Vec<Vec<u8>>,
-) -> ScalarEval {
-    LogicalProgram::new(instrs, vec![Sink::Reg(result_reg)], const_strings)
+/// Build and resolve a scalar program; its result is its last instruction. A
+/// test program that fails validation is a bug in the test, so it unwraps here
+/// rather than at every site.
+pub fn scalar_prog(schema: &TestSchema, instrs: Vec<LogicalInstr>, const_strings: Vec<Vec<u8>>) -> ScalarEval {
+    result_prog(instrs, const_strings)
         .resolve_scalar(schema)
         .expect("test program must validate")
 }
 
-/// A predicate as [`filter_prog`] takes it: `(instrs, result_reg)`.
-pub type FilterShape = (Vec<LogicalInstr>, Reg);
-
-/// Build and resolve a filter program — the arm where `result_reg` stays
-/// bit_only-eligible. Same unwrap rule as [`scalar_prog`].
-pub fn filter_prog(
-    schema: &TestSchema,
-    instrs: Vec<LogicalInstr>,
-    result_reg: Reg,
-    const_strings: Vec<Vec<u8>>,
-) -> RowFilter {
-    LogicalProgram::new(instrs, vec![Sink::Reg(result_reg)], const_strings)
+/// Build and resolve a filter program; its verdict is its last instruction.
+/// Same unwrap rule as [`scalar_prog`].
+pub fn filter_prog(schema: &TestSchema, instrs: Vec<LogicalInstr>, const_strings: Vec<Vec<u8>>) -> RowFilter {
+    result_prog(instrs, const_strings)
         .resolve_filter(schema)
         .expect("test predicate must validate")
 }
@@ -295,30 +295,76 @@ pub fn map_prog(
         .expect("test map must validate")
 }
 
-/// Every row's integer result of a scalar program.
-pub fn row_values(ev: &mut ScalarEval, mb: &dyn BatchView) -> Vec<Option<i128>> {
-    match ev.eval_all(mb) {
-        ExprResults::Int(vals) => vals,
-        ExprResults::Str { .. } => panic!("row_values over a string-valued program; use row_strs"),
+/// `read(ev, mb)`, held to what makes a per-row result trustworthy beyond the
+/// rows `mb` happens to hold: a row's result is a function of that row alone,
+/// whichever word or morsel it lands in, and the `no_nulls` arm agrees with the
+/// nullable one it skips. So every read is repeated over `mb`'s rows cycled
+/// across several morsels, and over each row repeated to fill whole 64-row
+/// words — the regime where a word-at-a-time kernel takes its uniform-word
+/// shortcuts — on each arm the program can run.
+fn checked<E: Resolved, T: PartialEq + Debug>(
+    ev: &mut E,
+    mb: &TestView,
+    read: impl Fn(&mut E, &TestView) -> Vec<T>,
+) -> Vec<T> {
+    let n = mb.row_count();
+    let want = read(ev, mb);
+    let fast = ev.no_nulls();
+    let arms: &[bool] = if fast { &[true, false] } else { &[false] };
+    for &no_nulls in arms {
+        ev.set_no_nulls(no_nulls);
+        assert_eq!(read(ev, mb), want, "the nullable arm disagrees with no_nulls");
+        if n == 0 {
+            continue;
+        }
+        for (label, len, blocked) in [
+            ("cycled", 2 * MORSEL + 37, false),
+            ("word-blocked", n.min(128) * 64, true),
+        ] {
+            let map = |i: usize| if blocked { i / 64 } else { i % n };
+            let got = read(ev, &mb.tiled(len, map));
+            for (i, got) in got.iter().enumerate() {
+                assert_eq!(
+                    got,
+                    &want[map(i)],
+                    "{label} row {i} (base row {}), no_nulls={no_nulls}",
+                    map(i)
+                );
+            }
+        }
     }
+    ev.set_no_nulls(fast);
+    want
 }
 
-/// Every row's string result of a scalar program, `None` for NULL.
-pub fn row_strs(ev: &mut ScalarEval, mb: &dyn BatchView) -> Vec<Option<Vec<u8>>> {
-    match ev.eval_all(mb) {
+/// Every row's integer result of a scalar program — see [`checked`].
+pub fn row_values(ev: &mut ScalarEval, mb: &TestView) -> Vec<Option<i128>> {
+    checked(ev, mb, |ev, mb| match ev.eval_all(mb) {
+        ExprResults::Int(vals) => vals,
+        ExprResults::Str { .. } => panic!("row_values over a string-valued program; use row_strs"),
+    })
+}
+
+/// Every row's string result of a scalar program, `None` for NULL — see
+/// [`checked`].
+pub fn row_strs(ev: &mut ScalarEval, mb: &TestView) -> Vec<Option<Vec<u8>>> {
+    checked(ev, mb, |ev, mb| match ev.eval_all(mb) {
         ExprResults::Str { bytes, spans } => spans.iter().map(|s| s.map(|(o, l)| bytes[o..o + l].to_vec())).collect(),
         ExprResults::Int(_) => panic!("row_strs over a scalar program; use row_values"),
-    }
+    })
 }
 
 /// Run `ev` as a filter and report a per-row verdict — the shape almost every
 /// filter test wants, since `RowFilter::ranges` reports runs rather than rows.
+/// See [`checked`].
 pub fn passing_rows(ev: &mut RowFilter, mb: &TestView) -> Vec<bool> {
-    let mut passed = vec![false; mb.row_count()];
-    for (s, e) in passing_ranges(ev, mb) {
-        passed[s..e].fill(true);
-    }
-    passed
+    checked(ev, mb, |ev, mb| {
+        let mut passed = vec![false; mb.row_count()];
+        for (s, e) in passing_ranges(ev, mb) {
+            passed[s..e].fill(true);
+        }
+        passed
+    })
 }
 
 /// The runs `ev` reports, verbatim, each checked to be a non-empty run inside
@@ -332,69 +378,6 @@ pub fn passing_ranges(ev: &mut RowFilter, mb: &TestView) -> Vec<(usize, usize)> 
         assert!(s < e && e <= n, "run ({s}, {e}) is not a non-empty run of 0..{n}");
     }
     ranges
-}
-
-/// `build()` twice: as resolved, which must be the `no_nulls` arm, and forced
-/// onto the nullable arm — a differential baseline running the kernels the fast
-/// arm skips.
-pub fn both_arms<E: Resolved>(label: &str, build: impl Fn() -> E) -> (E, E) {
-    let fast = build();
-    assert!(fast.prog().no_nulls, "{label}: the fast side must resolve no_nulls");
-    let mut nullable = build();
-    nullable.force_nullable_arm();
-    (fast, nullable)
-}
-
-/// A [`MapTarget`] over owned buffers: one null word per row, one buffer per
-/// output payload slot, and the heap a string cell spills into.
-pub struct TestOut {
-    pub nulls: Vec<u8>,
-    pub cols: Vec<Vec<u8>>,
-    pub blob: Vec<u8>,
-}
-
-impl TestOut {
-    /// `rows` rows of output slots `strides[pi]` bytes wide.
-    pub fn new(rows: usize, strides: &[usize]) -> Self {
-        TestOut {
-            nulls: vec![0; rows * 8],
-            cols: strides.iter().map(|&w| vec![0; rows * w]).collect(),
-            blob: Vec::new(),
-        }
-    }
-}
-
-impl MapTarget for TestOut {
-    fn null_bmp_mut(&mut self) -> &mut [u8] {
-        &mut self.nulls
-    }
-    fn slot_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
-        (&mut self.cols[pi], &mut self.nulls, &mut self.blob)
-    }
-}
-
-/// A three-row view with a compound `(U32, I64)` PK and payload slots
-/// `0: I32`, `1: U128`, `2: U64`, and its schema.
-pub fn locator_fixture() -> (TestSchema, TestView) {
-    let schema = TestSchema::new(
-        &[
-            (TypeCode::U32, false),
-            (TypeCode::I64, false),
-            (TypeCode::I32, true),
-            (TypeCode::U128, true),
-            (TypeCode::U64, true),
-        ],
-        &[0, 1],
-    );
-    let mut v = TestView::for_schema(&schema, 3);
-    for (row, (a, b)) in [(7u32, -1i64), (0, 0), (u32::MAX, i64::MIN)].into_iter().enumerate() {
-        v.set_pk_col(row, 0, &a.to_le_bytes(), TypeCode::U32);
-        v.set_pk_col(row, 4, &b.to_le_bytes(), TypeCode::I64);
-        v.set_payload(row, 0, &(-3i32).to_le_bytes());
-        v.set_payload(row, 1, &(1u128 << 100).to_le_bytes());
-        v.set_payload(row, 2, &(row as u64).to_le_bytes());
-    }
-    (schema, v)
 }
 
 /// `IS NULL` / `IS NOT NULL` over column `col`. The two read one null-bitmap bit

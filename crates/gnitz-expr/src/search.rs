@@ -83,3 +83,7 @@ pub(crate) fn fields<'a>(s: &'a [u8], d: &'a [u8]) -> impl Iterator<Item = (usiz
         Some((start, end))
     })
 }
+
+#[cfg(test)]
+#[path = "tests/search.rs"]
+mod tests;

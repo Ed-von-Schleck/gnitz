@@ -4,195 +4,106 @@ fn encode(p: &str, escape: Option<char>) -> Option<Vec<u8>> {
     LikePattern::encode(p, escape).map(|p| p.as_bytes().to_vec())
 }
 
-/// `p` encoded under the default escape, as the SQL binder supplies it.
-fn enc(p: &str) -> Vec<u8> {
-    encode(p, Some('\\')).unwrap()
-}
-
-/// `p` encoded with escaping disabled — for patterns that contain no escape.
-fn raw(p: &str) -> Vec<u8> {
-    encode(p, None).unwrap()
-}
-
-fn like(pattern: &str) -> LikeMatcher {
-    LikeMatcher::compile(&enc(pattern), false)
-}
-
-fn ilike(pattern: &str) -> LikeMatcher {
-    LikeMatcher::compile(&enc(pattern), true)
-}
-
 fn hit(m: &LikeMatcher, h: &[u8]) -> bool {
     m.matches(h, &mut Vec::new())
 }
 
-/// The matcher shape a pattern compiles to, as text — what the specialization
-/// pins assert on.
-fn shape(pattern: &str) -> String {
-    let text = |l: &[u8]| String::from_utf8_lossy(l).into_owned();
-    match &like(pattern).kind {
-        LikeKind::Exact(l) => format!("Exact({})", text(l)),
-        LikeKind::Prefix(l) => format!("Prefix({})", text(l)),
-        LikeKind::Suffix(l) => format!("Suffix({})", text(l)),
-        LikeKind::Contains(f) => format!("Contains({})", text(f.needle())),
-        LikeKind::Generic(_) => "Generic".to_string(),
+/// The LIKE definition, read straight off the encoded pattern: `ANY_MANY` tries
+/// every character boundary, `ANY_ONE` steps one character, any other byte is a
+/// literal, compared ASCII-folded under ILIKE. Shares nothing with the matcher —
+/// not the tokenizer, not the search. Exponential in the `%` count.
+fn glob(p: &[u8], h: &[u8], ci: bool) -> bool {
+    let fold = |b: u8| if ci { b.to_ascii_lowercase() } else { b };
+    match p.split_first() {
+        None => h.is_empty(),
+        Some((&ANY_MANY, rest)) => (0..=h.len())
+            .filter(|&i| h.get(i).is_none_or(|&b| b & 0xC0 != 0x80))
+            .any(|i| glob(rest, &h[i..], ci)),
+        Some((&ANY_ONE, rest)) => std::str::from_utf8(h)
+            .expect("a wildcard is reached on a character boundary")
+            .chars()
+            .next()
+            .is_some_and(|c| glob(rest, &h[c.len_utf8()..], ci)),
+        Some((&b, rest)) => h.first().is_some_and(|&x| fold(x) == fold(b)) && glob(rest, &h[1..], ci),
     }
 }
 
-// ---------------------------------------------------------------------------
-// Specialization
-// ---------------------------------------------------------------------------
-
-#[test]
-fn specialization_table_matches_the_token_sequence() {
-    assert_eq!(shape(""), "Exact()");
-    assert_eq!(shape("abc"), "Exact(abc)");
-    assert_eq!(shape("lit%"), "Prefix(lit)");
-    assert_eq!(shape("%"), "Prefix()");
-    assert_eq!(shape("%lit"), "Suffix(lit)");
-    assert_eq!(shape("%lit%"), "Contains(lit)");
+fn agrees(p: &[u8], h: &[u8]) {
+    for ci in [false, true] {
+        assert_eq!(
+            hit(&LikeMatcher::compile(p, ci), h),
+            glob(p, h, ci),
+            "{:?} (ci={ci}) on {:?}",
+            String::from_utf8_lossy(p),
+            String::from_utf8_lossy(h)
+        );
+    }
 }
 
-#[test]
-fn a_wildcard_inside_a_run_stays_generic() {
-    // Never `Prefix("a_c")` — the `_` is a token, not a literal byte.
-    assert_eq!(shape("a_c%"), "Generic");
-    // Never `Contains("abc")`, which would wrongly accept `"abc"` itself.
-    assert_eq!(shape("%_abc%"), "Generic");
-    assert_eq!(shape("_"), "Generic");
-    assert_eq!(shape("%_%"), "Generic");
+/// Every string of up to `max` characters over `alphabet`.
+fn words(alphabet: &[&str], max: u32) -> Vec<String> {
+    (0..=max)
+        .flat_map(|len| {
+            (0..alphabet.len().pow(len)).map(move |code| {
+                (0..len)
+                    .map(|i| alphabet[code / alphabet.len().pow(i) % alphabet.len()])
+                    .collect()
+            })
+        })
+        .collect()
 }
 
+/// Every pattern of up to four symbols against every haystack of up to four
+/// characters, LIKE and ILIKE. The pattern holds an upper-case literal and a
+/// two-byte one; the haystack both cases of `a`, and `é` beside `É`, which ASCII
+/// folding must keep apart — so every specialization, every backtrack and every
+/// one-character step over a multi-byte character is reached.
 #[test]
-fn redundant_spellings_still_reach_the_table() {
-    // Adjacent `%` collapse …
-    assert_eq!(shape("%%a"), "Suffix(a)");
-    assert_eq!(shape("%%lit%%"), "Contains(lit)");
-    // … and adjacent literal bytes merge into one run.
-    assert_eq!(shape(r"\%"), "Exact(%)");
-    assert_eq!(shape(r"a\%b"), "Exact(a%b)");
+fn every_short_pattern_agrees_with_the_definition() {
+    let haystacks = words(&["a", "A", "b", "é", "É"], 4);
+    for pattern in words(&["a", "B", "é", "%", "_"], 4) {
+        let p = encode(&pattern, None).unwrap();
+        for ci in [false, true] {
+            let m = LikeMatcher::compile(&p, ci);
+            for h in &haystacks {
+                assert_eq!(
+                    hit(&m, h.as_bytes()),
+                    glob(&p, h.as_bytes(), ci),
+                    "{pattern:?} (ci={ci}) on {h:?}"
+                );
+            }
+        }
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Matching
-// ---------------------------------------------------------------------------
-
-/// Every pattern against haystacks either side of its answer: the compiled
-/// matcher, whatever shape it specializes to, and the oracle must both give the
-/// verdict.
+/// Haystacks past the short-haystack cutoff, so the literals are searched by
+/// the vectorised finder: dense false candidates, a hit at the end, a hit that
+/// only folding finds, and one broken a byte before its end.
 #[test]
-fn each_pattern_matches_exactly_its_haystacks() {
-    const E: Option<char> = Some('\\');
+fn long_haystacks_agree_with_the_definition() {
     let mut needle = vec![b'x'; 64];
     needle[40..46].copy_from_slice(b"nEEDLE");
     let mut broken = needle.clone();
     broken[45] = b'x';
-    // (pattern, escape, ILIKE, haystack, verdict)
-    type Case<'a> = (&'a str, Option<char>, bool, &'a [u8], bool);
-    let cases: &[Case<'_>] = &[
-        // Each specialization, both ways.
-        ("abc", E, false, b"abc", true),
-        ("abc", E, false, b"abcd", false),
-        ("abc", E, false, b"ab", false),
-        ("ab%", E, false, b"abcd", true),
-        ("ab%", E, false, b"ab", true),
-        ("ab%", E, false, b"ac", false),
-        ("%cd", E, false, b"abcd", true),
-        ("%cd", E, false, b"cd", true),
-        ("%cd", E, false, b"abce", false),
-        ("%bc%", E, false, b"abcd", true),
-        ("%bc%", E, false, b"bc", true),
-        ("%bc%", E, false, b"abd", false),
-        // An occurrence overlapping a failed candidate is still found.
-        ("%ab%", E, false, b"aXab", true),
-        ("%ab%", E, false, b"aab", true),
-        ("%aB%", E, true, b"AxaB", true),
-        // `''` matches only `''`, `%` everything, and `%_%` needs one character.
-        ("", E, false, b"", true),
-        ("", E, false, b"a", false),
-        ("%", E, false, b"", true),
-        ("%", E, false, b"anything", true),
-        ("%_%", E, false, b"", false),
-        ("%_%", E, false, b"a", true),
-        // `_` consumes one character, not one byte.
-        ("_ö_", E, false, "aöb".as_bytes(), true),
-        ("_", E, false, "é".as_bytes(), true),
-        ("_", E, false, "éé".as_bytes(), false),
-        ("_%_", E, false, b"ab", true),
-        ("_%_", E, false, b"a", false),
-        ("a%_%_%b", E, false, b"axyb", true),
-        ("a%_%_%b", E, false, b"axb", false),
-        // Backtracking, down to an `AnyOne` with no haystack left.
-        ("%a_c%", E, false, b"xxabcyy", true),
-        ("%a_c%", E, false, b"aabcc", true),
-        ("%a_c%", E, false, b"xxabbcyy", false),
-        ("%aa%aa%", E, false, b"aaaaa", true),
-        ("%aa%aa%", E, false, b"aaa", false),
-        ("%a_", E, false, b"xa", false),
-        // A literal longer than the remaining haystack.
-        ("%aBcDeF", E, true, b"ab", false),
-        ("%x%aBcDeF%", E, true, b"xab", false),
-        // The escape makes the next character literal, an ordinary one included.
-        (r"100\%", E, false, b"100%", true),
-        (r"100\%", E, false, b"1000", false),
-        (r"a\_b", E, false, b"a_b", true),
-        (r"a\_b", E, false, b"axb", false),
-        (r"a\\b", E, false, br"a\b", true),
-        (r"\a", E, false, b"a", true),
-        // With escaping disabled `\` is an ordinary byte, and `%` still a wildcard.
-        (r"100\%", None, false, br"100\", true),
-        (r"100\%", None, false, br"100\abc", true),
-        (r"100\%", None, false, b"100%", false),
-        // An escape that is itself a wildcard stops being one; the other stays
-        // live.
-        ("%%a_", Some('%'), false, b"%ab", true),
-        ("%%a_", Some('%'), false, b"%a", false),
-        ("__%", Some('_'), false, b"_xyz", true),
-        ("__%", Some('_'), false, b"ax", false),
-        ("100§%§§", Some('§'), false, "100%§".as_bytes(), true),
-        // ILIKE folds ASCII case in every shape, and ASCII only: ß is the same
-        // bytes on both sides, where ẞ and SS are other text.
-        ("AbC", E, true, b"aBc", true),
-        ("AbC", E, true, b"aBcd", false),
-        ("aB%", E, true, b"AbCd", true),
-        ("%cD", E, true, b"abCD", true),
-        ("%Bc%", E, true, b"aBCd", true),
-        ("%a_C%", E, true, b"xxAbcyy", true),
-        ("%NeEdLe%", E, true, &needle, true),
-        ("%NeEdLe%", E, false, &needle, false),
-        ("%NeEdLe%", E, true, &broken, false),
-        ("straße%", E, true, "STRAßEN".as_bytes(), true),
-        ("straße%", E, true, "STRAẞEN".as_bytes(), false),
-        ("straße%", E, true, "STRASSEN".as_bytes(), false),
-        // With `ESCAPE 'X'`, `aXb` is the literal `ab`; folding it must not
-        // revive the `X`.
-        ("aXb", Some('X'), true, b"ab", true),
-        ("aXb", Some('X'), true, b"AB", true),
-        ("aXb", Some('X'), true, b"axb", false),
+    let dense = b"nexn".repeat(20);
+    let haystacks = [
+        needle,
+        broken,
+        [dense.as_slice(), b"nxq"].concat(),
+        [b"NEXN".repeat(20).as_slice(), b"NxQ"].concat(),
+        [dense.as_slice(), b"xq"].concat(),
+        dense,
     ];
-    for &(pattern, escape, ci, h, want) in cases {
-        let p = encode(pattern, escape).unwrap();
-        let label = format!(
-            "{pattern:?} (escape {escape:?}, ci={ci}) on {:?}",
-            String::from_utf8_lossy(h)
-        );
-        assert_eq!(hit(&LikeMatcher::compile(&p, ci), h), want, "{label}");
-        assert_eq!(ref_match(&tokenize(&p, ci), h, ci), want, "{label}: the oracle");
+    for pattern in ["%NeEdLe%", "%needle", "%n_q%", "%ne%xq", "%nexn%nexn", "%x%yz", "x%x_q"] {
+        for h in &haystacks {
+            agrees(&encode(pattern, None).unwrap(), h);
+        }
     }
 }
 
 #[test]
-fn a_wildcard_run_is_its_underscores_then_one_skip() {
-    let toks = tokenize(&raw("%_%_a"), false);
-    assert!(
-        matches!(toks.as_slice(), [LikeTok::AnyOne, LikeTok::AnyOne, LikeTok::SkipTo(_)]),
-        "the run is its two `_`s, then its `%` joined to the literal"
-    );
-    agrees_with_reference(&raw("%_%a%__%"), &[b"xa", b"xaaa", "éaéé".as_bytes(), b"a"]);
-}
-
-#[test]
 fn the_anchor_walk_terminates() {
+    let like = |p| LikeMatcher::compile(&encode(p, None).unwrap(), false);
     // No `b` anywhere: the anchor walks to end-of-haystack and the walk ends.
     assert!(!hit(&like("%a%b"), &[b'a'; 64]));
     // The classic backtracking-regex bait costs one anchor walk, not an
@@ -200,121 +111,70 @@ fn the_anchor_walk_terminates() {
     assert!(!hit(&like("%a%a%a%a%a%ab"), &[b'a'; 400]));
 }
 
-// ---------------------------------------------------------------------------
-// Escape
-// ---------------------------------------------------------------------------
-
+/// The encoding of `sql` under `escape`: the wildcards become bytes UTF-8 text
+/// never contains, the escape makes the next character literal — a wildcard, an
+/// ordinary or a multi-byte one, or itself — and an escape that is itself a
+/// wildcard stops being one while the other stays live. A trailing live escape
+/// is refused.
 #[test]
-fn an_escape_that_is_itself_a_wildcard() {
-    // The escape is checked before the wildcards, so the chosen character stops
-    // being one and the other stays live.
-    assert_eq!(encode("%%a_", Some('%')).unwrap(), [b'%', b'a', ANY_ONE]);
-    assert_eq!(encode("__%", Some('_')).unwrap(), [b'_', ANY_MANY]);
-}
-
-#[test]
-fn a_trailing_live_escape_is_refused_by_the_encoder() {
-    // Two characters: the trailing `\` is live, with nothing left to make literal.
-    assert_eq!(encode(r"a\", Some('\\')), None);
-    // Three: the second `\` is escaped by the first, so the pattern is the
-    // literal `a\` and is legal.
-    assert_eq!(encode(r"a\\", Some('\\')).unwrap(), br"a\");
-    // With escaping disabled nothing is ever a live escape.
-    assert_eq!(encode(r"a\", None).unwrap(), br"a\");
-}
-
-#[test]
-fn a_multi_byte_escape_character() {
-    assert_eq!(encode("100§%§§", Some('§')).unwrap(), "100%§".as_bytes());
-    // The escape makes a multi-byte character literal too.
-    assert_eq!(encode("a\\éb", Some('\\')).unwrap(), "aéb".as_bytes());
-}
-
-#[test]
-fn the_wildcards_encode_to_bytes_utf8_text_never_contains() {
-    assert_eq!(raw("a%b_c"), [b'a', ANY_MANY, b'b', ANY_ONE, b'c']);
-}
-
-// ---------------------------------------------------------------------------
-// The `Generic` walk against an oracle
-// ---------------------------------------------------------------------------
-
-/// Plain backtracking recursion, sharing none of the walk's resume rule.
-/// Exponential in the `%` count, so short haystacks only.
-fn ref_match(toks: &[LikeTok], h: &[u8], ci: bool) -> bool {
-    match toks.first() {
-        None => h.is_empty(),
-        Some(LikeTok::AnyRest) => true,
-        Some(LikeTok::SkipTo(l)) => {
-            let l = l.needle();
-            (0..=h.len().saturating_sub(l.len())).any(|k| {
-                h.len() >= k + l.len()
-                    && anchored_eq(&h[k..k + l.len()], l, ci)
-                    && ref_match(&toks[1..], &h[k + l.len()..], ci)
-            })
-        }
-        // The walk's own character step: the two differ only in how they
-        // backtrack.
-        Some(LikeTok::AnyOne) => !h.is_empty() && ref_match(&toks[1..], &h[crate::chars::char_offset(h, 1)..], ci),
-        // On the unfolded haystack, so the oracle stays independent of the fold.
-        Some(LikeTok::Lit(l)) => {
-            let l = l.needle();
-            h.len() >= l.len() && anchored_eq(&h[..l.len()], l, ci) && ref_match(&toks[1..], &h[l.len()..], ci)
-        }
+fn each_pattern_encodes_to_its_bytes() {
+    let e = Some('\\');
+    for (sql, escape, want) in [
+        ("a%b_c", None, Some(vec![b'a', ANY_MANY, b'b', ANY_ONE, b'c'])),
+        (r"100\%", e, Some(b"100%".to_vec())),
+        (r"a\_b", e, Some(b"a_b".to_vec())),
+        (r"a\\b", e, Some(br"a\b".to_vec())),
+        (r"\a", e, Some(b"a".to_vec())),
+        ("a\\éb", e, Some("aéb".as_bytes().to_vec())),
+        (r"a\", e, None),
+        (r"a\", None, Some(br"a\".to_vec())),
+        (r"100\%", None, Some([br"100\".as_slice(), &[ANY_MANY]].concat())),
+        ("%%a_", Some('%'), Some(vec![b'%', b'a', ANY_ONE])),
+        ("__%", Some('_'), Some(vec![b'_', ANY_MANY])),
+        ("100§%§§", Some('§'), Some("100%§".as_bytes().to_vec())),
+        ("aXb", Some('X'), Some(b"ab".to_vec())),
+    ] {
+        assert_eq!(encode(sql, escape), want, "{sql:?} under {escape:?}");
     }
 }
 
-/// The compiled matcher agrees with the oracle on every haystack, LIKE and ILIKE
-/// alike.
-fn agrees_with_reference(pattern: &[u8], haystacks: &[&[u8]]) {
-    for ci in [false, true] {
-        let toks = tokenize(pattern, ci);
-        let m = LikeMatcher::compile(pattern, ci);
-        for h in haystacks {
-            assert_eq!(
-                hit(&m, h),
-                ref_match(&toks, h, ci),
-                "pattern {:?} (ci={ci}) disagrees with the reference on {h:?}",
-                String::from_utf8_lossy(pattern),
-            );
+/// The shape each pattern specializes to — a performance contract: the
+/// anchored shapes compare in place, and only a pattern the table cannot express
+/// takes the backtracking walk. Adjacent `%` collapse and escaped bytes merge
+/// into one literal before the table is consulted; a `_` never joins a literal.
+#[test]
+fn each_pattern_specializes_to_its_shape() {
+    let shape = |pattern: &str| {
+        let text = |l: &[u8]| String::from_utf8_lossy(l).into_owned();
+        match LikeMatcher::compile(&encode(pattern, Some('\\')).unwrap(), false).kind {
+            LikeKind::Exact(l) => format!("Exact({})", text(&l)),
+            LikeKind::Prefix(l) => format!("Prefix({})", text(&l)),
+            LikeKind::Suffix(l) => format!("Suffix({})", text(&l)),
+            LikeKind::Contains(f) => format!("Contains({})", text(f.needle())),
+            LikeKind::Generic(_) => "Generic".to_string(),
         }
+    };
+    for (pattern, want) in [
+        ("", "Exact()"),
+        ("abc", "Exact(abc)"),
+        (r"a\%b", "Exact(a%b)"),
+        ("lit%", "Prefix(lit)"),
+        ("%", "Prefix()"),
+        ("%lit", "Suffix(lit)"),
+        ("%%a", "Suffix(a)"),
+        ("%lit%", "Contains(lit)"),
+        ("%%lit%%", "Contains(lit)"),
+        ("a_c%", "Generic"),
+        ("%_abc%", "Generic"),
+        ("_", "Generic"),
+        ("%_%", "Generic"),
+    ] {
+        assert_eq!(shape(pattern), want, "{pattern:?}");
     }
 }
 
-/// Every place the anchor literal can sit.
-#[test]
-fn the_generic_walk_agrees_with_the_oracle() {
-    // A `%` ahead of a `_`.
-    agrees_with_reference(&raw("%_abc%"), &[b"abc", b"xabc", b"xxabcyy", b"", b"_abc", b"AXABC"]);
-    // The anchor literal never occurs.
-    agrees_with_reference(
-        &raw("%foo%bar%"),
-        &[b"xxxxxxxxxxxx", b"foo", b"barfoo", b"a foo b bar c", b"FOO..BAR"],
-    );
-    // It occurs only overlapping a partial match.
-    agrees_with_reference(&raw("%ab%ab%"), &[b"aXab", b"abab", b"aabab", b"ab", b"aab", b"aAbAB"]);
-    // A `_` between the anchor literal and the next `%`.
-    agrees_with_reference(
-        &raw("%a_c%d%"),
-        &[b"abcd", b"zabczzd", b"abc", b"dabc", b"a_cd", b"ZABCZZD"],
-    );
-    // A trailing literal, with no `%` after it.
-    agrees_with_reference(&raw("%x%yz"), &[b"xyz", b"xxyz", b"xyzz", b"yz", b"XxYZ"]);
-    // Long haystacks: dense false candidates, a hit at the end, and none at all.
-    let dense = b"nexn".repeat(20);
-    let tail = [dense.as_slice(), b"nxq"].concat();
-    let upper = [b"NEXN".repeat(20).as_slice(), b"NxQ"].concat();
-    agrees_with_reference(&raw("%n_q%"), &[&dense, &tail, &upper]);
-    agrees_with_reference(
-        &raw("%ne%xq"),
-        &[&dense, &tail, &upper, &[dense.as_slice(), b"xq"].concat()],
-    );
-}
-
-// ---------------------------------------------------------------------------
-// ILIKE
-// ---------------------------------------------------------------------------
-
+/// ILIKE folds the haystack only for the scanning shapes; an anchored one reads
+/// just the literal's length of it in place.
 #[test]
 fn only_the_scanning_shapes_fold_the_haystack() {
     for (pattern, folds) in [
@@ -325,7 +185,7 @@ fn only_the_scanning_shapes_fold_the_haystack() {
         ("%a_B%", true),
     ] {
         let mut folded = Vec::new();
-        ilike(pattern).matches(b"xAbx", &mut folded);
+        LikeMatcher::compile(&encode(pattern, None).unwrap(), true).matches(b"xAbx", &mut folded);
         assert_eq!(!folded.is_empty(), folds, "{pattern:?}");
     }
 }

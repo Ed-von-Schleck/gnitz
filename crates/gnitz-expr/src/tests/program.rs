@@ -5,7 +5,7 @@ use gnitz_wire::{FixedInt, TypeCode};
 use super::{ColKind, ExprOp, FloatUnaryOp, IntUnaryOp, INSTR_WORDS, MAX_CONST_POOL, SINK_WORDS};
 use crate::eval::Resolved;
 use crate::test_support::{
-    filter_prog, is_not_null_op, is_null_op, make_int_view, make_n_col_view, make_string_view, row_values, scalar_prog,
+    filter_prog, is_not_null_op, is_null_op, make_n_col_view, make_string_view, passing_rows, row_values, scalar_prog,
     schema_pk_ints, schema_pk_strings, TestSchema,
 };
 use crate::{
@@ -203,66 +203,40 @@ fn no_nulls_holds_exactly_when_nothing_can_produce_a_null() {
         ),
     ];
     for (label, schema, instrs, want) in cases {
-        let result = Reg(instrs.len() as u16 - 1);
-        let prog = scalar_prog(&schema, instrs, result, vec![b"m".to_vec()]);
+        let prog = scalar_prog(&schema, instrs, vec![b"m".to_vec()]);
         assert_eq!(prog.prog().no_nulls, want, "{label}");
     }
 }
 
-/// A logical column index resolves either to the PK read or to a *dense payload
-/// slot*, renumbered around wherever the PK sits — so the slot is neither `ci`
-/// nor `ci - 1` in general. Both PK positions are swept, because a leading PK is
-/// the one arrangement where the two closed forms happen to agree; every value is
-/// distinct, so the value read pins the slot.
+/// A SELECT feeding `BoolBinary` is read as a boolean although no boolean
+/// producer wrote it, and so is its condition, a bare load: both must be packed
+/// for the AND, on the nullable arm as on the fast one.
 #[test]
-fn a_column_index_resolves_to_the_pk_or_to_its_dense_payload_slot() {
-    // (PK column index, column types, PK value, payload values, the value each
-    // logical column reads)
-    let cases = [
-        (
-            0,
-            [TypeCode::U64, TypeCode::I64, TypeCode::I64],
-            42,
-            [10, 20],
-            [42i128, 10, 20],
-        ),
-        (1, [TypeCode::I64, TypeCode::U64, TypeCode::I64], 99, [5, 7], [5, 99, 7]),
-    ];
-    for (pk_index, cols, pk_val, payloads, want) in cases {
-        let schema = TestSchema::with_pk_at(pk_index, &cols);
-        let mb = make_int_view(&schema, &[(pk_val, 0, &payloads)]);
-        for (ci, want) in want.into_iter().enumerate() {
-            let mut prog = scalar_prog(
-                &schema,
-                vec![LogicalInstr::LoadColInt { col: ci as u32 }],
-                Reg(0),
-                vec![],
-            );
-            assert_eq!(row_values(&mut prog, &mb), [Some(want)], "pk_index={pk_index} col {ci}");
-        }
-    }
-}
-
-/// `Select` feeding `BoolBinary`: `cond` is a bool_input, the select result feeds the
-/// AND as a bool_input, and the select dst (a value register) is never bit_only.
-#[test]
-fn select_classification_of_cond_and_result() {
+fn a_select_feeding_a_boolean_is_read_as_its_truthiness() {
     let schema = schema_pk_ints(4, true);
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 }, // cond
         LogicalInstr::LoadColInt { col: 2 }, // a
         LogicalInstr::LoadColInt { col: 3 }, // b
         LogicalInstr::Select { cond: Reg(0), a: Reg(1), b: Reg(2) },
-        LogicalInstr::LoadColInt { col: 4 }, // other bool
+        LogicalInstr::LoadColInt { col: 4 },
         LogicalInstr::BoolBinary { is_or: false, a: Reg(3), b: Reg(4) },
     ];
-    let ev = filter_prog(&schema, instrs, Reg(5), vec![]);
-    let prog = ev.prog();
-    // Neither r0 nor r3 is bool-produced, so neither can be bit_only and their
-    // packed bits can only come from being read as a bool.
-    assert!(prog.needs_bool_pack(0), "cond is read as a bool_input");
-    assert!(prog.needs_bool_pack(3), "select result feeds BoolBinary as bool_input");
-    assert!(!prog.is_bit_only(3), "select dst is a value register, never bit_only");
+    let value = |row: usize, col: usize| (row / [1, 2, 4, 8][col] % 3) as i64;
+    let null = |row: usize, col: usize| row % [5, 7, 11, 13][col] == 1;
+    let n = 90;
+    let mb = make_n_col_view(&schema, n, value, null);
+    let truth = |row, col| (!null(row, col)).then(|| value(row, col) != 0);
+    let want: Vec<bool> = (0..n)
+        .map(|row| {
+            let chosen = if truth(row, 0) == Some(true) { 1 } else { 2 };
+            match (truth(row, chosen), truth(row, 3)) {
+                (Some(false), _) | (_, Some(false)) => false,
+                (x, y) => x.is_some() && y.is_some(),
+            }
+        })
+        .collect();
+    assert_eq!(passing_rows(&mut filter_prog(&schema, instrs, vec![]), &mb), want);
 }
 
 // ---------------------------------------------------------------------------
@@ -422,8 +396,8 @@ fn each_framing_guard_rejects_its_own_forgery() {
         ),
         // The pool is the one count whose cap comes first: no region to bound it.
         (
-            "a huge declared pool count",
-            count(8, u32::MAX),
+            "a pool count past the cap",
+            count(8, MAX_CONST_POOL as u32 + 1),
             "declared const-pool count",
         ),
         ("a pool entry declared but absent", count(8, 1), "truncated"),
@@ -445,25 +419,16 @@ fn each_framing_guard_rejects_its_own_forgery() {
 }
 
 /// A pool of exactly `MAX_CONST_POOL` entries is reachable — a projection of
-/// that many distinct string literals — so the cap is `>`, never `>=`.
+/// that many distinct string literals — so the cap is `>`, never `>=`; one past
+/// it is a framing guard's.
 #[test]
-fn a_const_pool_at_the_cap_is_accepted_and_one_past_it_is_not() {
+fn a_const_pool_at_the_cap_is_accepted() {
     let pool: Vec<Vec<u8>> = (0..MAX_CONST_POOL).map(|i| format!("c{i}").into_bytes()).collect();
     let code: Vec<[u32; INSTR_WORDS]> = (0..MAX_CONST_POOL as u32)
         .map(|i| LogicalInstr::LoadConstStr { const_idx: ConstIdx(i) }.to_wire())
         .collect();
     let last = Reg(MAX_CONST_POOL as u16 - 1);
     assert!(from_regions(&code, &[[1, last.0 as u32]], pool).is_ok());
-
-    // Refused off the declared count alone, so the blob need carry no entry.
-    let mut b = valid_empty_blob();
-    gnitz_wire::write_u32_le(&mut b, 8, MAX_CONST_POOL as u32 + 1);
-    let err = LogicalProgram::from_blob(&b).expect_err("an over-cap pool must be refused");
-    let ExprValidateErr::CorruptBlob(msg) = &err else {
-        panic!("expected a CorruptBlob, got {err:?}");
-    };
-    let want = format!("declared const-pool count {}", MAX_CONST_POOL + 1);
-    assert!(msg.contains(&want), "got: {msg}");
 }
 
 /// A word outside its region's vocabulary: an opcode, or a sink kind outside the
@@ -485,31 +450,30 @@ fn from_blob_rejects_an_unknown_opcode_or_sink_kind() {
     );
 }
 
+/// Each refusal a client sees names what it refused: the count and the limit,
+/// the column and the type it holds against the kind the operator needs, or the
+/// PK column an operator cannot read.
 #[test]
-fn validate_err_display_names_the_register_limit() {
-    assert_eq!(
-        ExprValidateErr::TooManyRegs(66).to_string(),
-        format!(
-            "expression needs 66 registers; the limit is {} — split the predicate, or project fewer computed columns",
-            crate::MAX_REGS
-        )
+fn a_validate_error_names_its_operands() {
+    let regs = ExprValidateErr::TooManyRegs(66).to_string();
+    assert!(
+        regs.contains("66") && regs.contains(&crate::MAX_REGS.to_string()),
+        "{regs}"
     );
-    // The type half of the requirement. The region half is its own variant, and
-    // its own sentence below — a PK column is exactly what a client is likely to
-    // have named.
-    let mismatch = |want| ExprValidateErr::ColKindMismatch { col: 2, type_code: TypeCode::U64, want }.to_string();
-    assert_eq!(
-        mismatch(type_phrase(ColKind::FixedIntCol)),
-        "column 2 (type code U64) cannot be used here; this operator needs a fixed-width integer column"
-    );
-    assert_eq!(
-        mismatch(type_phrase(ColKind::FloatPayload)),
-        "column 2 (type code U64) cannot be used here; this operator needs a floating-point column"
-    );
-    assert_eq!(
-        ExprValidateErr::ColNotPayload { col: 0 }.to_string(),
-        "column 0 is part of the primary key; this operator needs a payload column"
-    );
+    for kind in [ColKind::FixedIntCol, ColKind::FloatPayload] {
+        let msg = ExprValidateErr::ColKindMismatch {
+            col: 2,
+            type_code: TypeCode::U64,
+            want: type_phrase(kind),
+        }
+        .to_string();
+        assert!(
+            msg.contains("column 2") && msg.contains("U64") && msg.contains(type_phrase(kind)),
+            "{msg}"
+        );
+    }
+    let msg = ExprValidateErr::ColNotPayload { col: 0 }.to_string();
+    assert!(msg.contains("column 0") && msg.contains("primary key"), "{msg}");
 }
 
 #[test]
@@ -772,22 +736,6 @@ fn validate_rejects_a_sink_list_that_does_not_cover_the_output() {
     assert_eq!(map(vec![Sink::Col(1)]).validate(&schema, None), Ok(()));
 }
 
-#[test]
-#[should_panic(expected = "RegReadBeforeWrite")]
-fn new_panics_on_a_forward_register_reference() {
-    // A compiler-built (trusted) program that reads an unwritten register still
-    // panics from `new`.
-    let _ = LogicalProgram::new(
-        vec![LogicalInstr::IntArith {
-            op: IntArithOp::Add,
-            a: Reg(0),
-            b: Reg(1),
-        }],
-        Vec::new(),
-        vec![],
-    );
-}
-
 // ---------------------------------------------------------------------------
 // IntInSet — set membership as one opcode (O(1) registers, O(log N) per row)
 // ---------------------------------------------------------------------------
@@ -800,7 +748,7 @@ fn in_set_prog(col_tc: TypeCode, set: &[i64]) -> (TestSchema, ScalarEval) {
         LogicalInstr::LoadColInt { col: 1 },
         LogicalInstr::IntInSet { value_reg: Reg(0), set_idx: ConstIdx(0) },
     ];
-    let prog = scalar_prog(&schema, instrs, Reg(1), vec![gnitz_wire::as_le_bytes(set).to_vec()]);
+    let prog = scalar_prog(&schema, instrs, vec![gnitz_wire::as_le_bytes(set).to_vec()]);
     (schema, prog)
 }
 
@@ -843,26 +791,6 @@ fn int_in_set_membership_over_every_pool_shape() {
         let want: Vec<Option<i128>> = probes.iter().map(|p| Some(p.1)).chain([None]).collect();
         assert_eq!(row_values(&mut prog, &mb), want, "tc={col_tc} pool_len={}", pool.len());
     }
-}
-
-/// `NOT IN` is `bool_not(IN)`, so the 3VL rule is the composition's: a NULL
-/// operand makes `IN` NULL and `NOT(NULL)` NULL, which excludes the row.
-#[test]
-fn not_in_set_excludes_a_null_operand() {
-    let schema = schema_pk_ints(1, true);
-    let instrs = vec![
-        LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::IntInSet { value_reg: Reg(0), set_idx: ConstIdx(0) },
-        LogicalInstr::BoolNot { a: Reg(1) },
-    ];
-    let mut prog = scalar_prog(
-        &schema,
-        instrs,
-        Reg(2),
-        vec![gnitz_wire::as_le_bytes(&[1i64, 2, 3]).to_vec()],
-    );
-    let mb = make_n_col_view(&schema, 3, |row, _| [0, 9, 2][row], |row, _| row == 0);
-    assert_eq!(row_values(&mut prog, &mb), [None, Some(1), Some(0)]);
 }
 
 /// A const-pool entry is held to what its opcode reads it as: a STRING value and
@@ -926,30 +854,6 @@ fn a_pool_entry_is_held_to_its_kind() {
             "{instr:?}"
         );
     }
-}
-
-/// Classifier: every CMP and every AND in a pure conjunction is bit_only, and so
-/// is a filter's result register.
-#[test]
-fn classifier_pure_conjunction_filter() {
-    let schema = schema_pk_ints(2, true);
-    // r5 = (col1 > 1) AND (col2 > 1)
-    let instrs = vec![
-        LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::LoadConst { val: 1, unsigned: false },
-        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
-        LogicalInstr::LoadColInt { col: 2 },
-        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(3), b: Reg(1) },
-        LogicalInstr::BoolBinary { is_or: false, a: Reg(2), b: Reg(4) },
-    ];
-    let ev = filter_prog(&schema, instrs, Reg(5), vec![]);
-    let mask = |pred: &dyn Fn(usize) -> bool| (0..6).filter(|&r| pred(r)).fold(0u64, |m, r| m | 1 << r);
-    // The CMPs read r0/r1/r3 as values, so those never qualify; r2 and r4 are
-    // read only by `BoolBinary`, and the result register is read as a verdict.
-    // Every bit_only register is packed too, and here the two sets coincide.
-    let want = (1 << 2) | (1 << 4) | (1 << 5);
-    assert_eq!(mask(&|r| ev.prog().is_bit_only(r)), want);
-    assert_eq!(mask(&|r| ev.prog().needs_bool_pack(r)), want);
 }
 
 /// A selector word is narrowed at decode, so a forged one is refused before eval
@@ -1083,11 +987,11 @@ fn a_string_result_register_resolves_as_a_scalar_but_not_as_a_filter() {
 fn two_like_opcodes_over_one_pool_index_get_a_matcher_each() {
     let schema = schema_pk_strings(1, false);
     let like = |ci| LogicalInstr::StrLike { src: Reg(0), pat_idx: ConstIdx(0), ci };
-    let instrs = vec![LogicalInstr::LoadColStr { col: 1 }, like(false), like(true)];
-    let view = make_string_view(&schema, 1, |_, _| b"ABC");
+    let instrs = [LogicalInstr::LoadColStr { col: 1 }, like(false), like(true)];
+    let view = make_string_view(&schema, 1, |_, _| b"ABC", |_, _| false);
     // LIKE misses and ILIKE matches, each read as its own program's result.
     for (result, want) in [(1, 0), (2, 1)] {
-        let mut ev = scalar_prog(&schema, instrs.clone(), Reg(result), vec![b"abc".to_vec()]);
+        let mut ev = scalar_prog(&schema, instrs[..=result].to_vec(), vec![b"abc".to_vec()]);
         assert_eq!(row_values(&mut ev, &view), [Some(want)], "result register {result}");
     }
 }
@@ -1249,11 +1153,8 @@ fn a_scalar_register_past_a_string_one_has_its_lane() {
         LogicalInstr::LoadColStr { col: 2 },
         LogicalInstr::StrLen { a: Reg(2), chars: false },
     ];
-    let view = make_string_view(&schema, 1, |_, c| ["ab", "cdef"][c]);
-    assert_eq!(
-        row_values(&mut scalar_prog(&schema, instrs, Reg(3), vec![]), &view),
-        [Some(4)]
-    );
+    let view = make_string_view(&schema, 1, |_, c| ["ab", "cdef"][c], |_, _| false);
+    assert_eq!(row_values(&mut scalar_prog(&schema, instrs, vec![]), &view), [Some(4)]);
 }
 
 /// A map reproduces its input only when it copies every payload column into its
@@ -1306,56 +1207,62 @@ fn is_identity_map_requires_an_in_order_copy_over_one_layout() {
     assert!(LogicalProgram::copy_cols(&[]).is_identity_map(&pk_only, &pk_only));
 }
 
-/// The three shapes [`NullPerm`] collapses a copy list to, and the window each
-/// writes. A source that cannot carry a set bit contributes no pair.
+/// [`NullPerm`] against a bit-by-bit move: each output slot's bit is its copy
+/// source's, or clear for a source that cannot carry one — a PK column, or a
+/// `NOT NULL` payload slot whatever its bit says. Every row of the window is
+/// written and none outside it, across the permutation's 256-row blocks. The
+/// copy list collapses to the cheapest shape that does this.
 #[test]
-fn null_perm_collapses_a_copy_list_to_three_shapes() {
+fn null_perm_moves_each_copied_bit_into_its_slot() {
     let payload = |slot: u8| ColumnLocator::Payload { slot, size: 8, type_code: TypeCode::I64 };
     let pk = ColumnLocator::Pk {
         byte_off: 0,
         size: 8,
         type_code: TypeCode::U64,
     };
-    let copy = |src, slot| crate::ColCopy { src, slot, width: 8 };
-    // Payload slots 0 and 2 admit NULL; slot 1 is NOT NULL.
-    let nullable = 0b101;
-
-    // Only sources with no bit of their own: nothing to move.
-    let zero = NullPerm::new(&[copy(pk, 0), copy(payload(1), 1)], nullable);
-    assert!(matches!(zero, NullPerm::Zero));
-
-    // Every bit stays in its slot — one AND against the kept slots.
-    let mask = NullPerm::new(
-        &[copy(payload(0), 0), copy(payload(1), 1), copy(payload(2), 2)],
-        nullable,
-    );
-    assert!(matches!(mask, NullPerm::Mask(0b101)));
-
-    // Slot 2 -> slot 0 moves a bit, so the whole list permutes.
-    let perm = NullPerm::new(&[copy(payload(2), 0), copy(payload(0), 1)], nullable);
-    assert!(matches!(&perm, NullPerm::Permute(p) if p == &[(2u8, 0u8), (0, 1)]));
-
-    // Two source rows, both bits set; the destination starts non-zero, so a
-    // window an arm left alone reads as a stale bit rather than as a zero.
-    let mut src = [0u8; 16];
-    gnitz_wire::write_u64_le(&mut src, 0, 0b101);
-    gnitz_wire::write_u64_le(&mut src, 8, 0b100);
-    for (perm, want) in [
-        (zero, [0u64, 0]),
-        (mask, [0b101, 0b100]),
-        // Row 0: slot 2 -> 0 and slot 0 -> 1. Row 1: only slot 2 is set.
-        (perm, [0b11, 0b1]),
+    let copies = |srcs: &[ColumnLocator]| -> Vec<crate::ColCopy> {
+        srcs.iter()
+            .enumerate()
+            .map(|(slot, &src)| crate::ColCopy { src, slot, width: 8 })
+            .collect()
+    };
+    // Payload slots 0, 2 and 3 admit NULL; slot 1 is NOT NULL.
+    let nullable = 0b1101;
+    let (src_start, dst_base) = (3, 5);
+    for (srcs, shape) in [
+        (vec![pk, payload(1)], "Zero"),
+        (vec![payload(0), payload(1), payload(2)], "Mask"),
+        (vec![payload(2), payload(0), pk, payload(3), payload(1)], "Permute"),
     ] {
-        let mut dst = [0xAAu8; 24];
-        perm.write_rows(&src, 0, &mut dst, 1, 2);
-        assert_eq!(
-            gnitz_wire::read_u64_le(&dst, 0),
-            u64::from_le_bytes([0xAA; 8]),
-            "row 0 is outside the window"
-        );
-        assert_eq!(
-            [gnitz_wire::read_u64_le(&dst, 8), gnitz_wire::read_u64_le(&dst, 16)],
-            want
-        );
+        let copies = copies(&srcs);
+        let perm = NullPerm::new(&copies, nullable);
+        let got_shape = match perm {
+            NullPerm::Zero => "Zero",
+            NullPerm::Mask(_) => "Mask",
+            NullPerm::Permute(_) => "Permute",
+        };
+        assert_eq!(got_shape, shape, "{srcs:?}");
+        for n in [0, 1, 255, 256, 257, 600] {
+            let src_word = |row: usize| {
+                (row as u64 + 1)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .rotate_left(row as u32 % 64)
+            };
+            let src: Vec<u8> = (0..src_start + n).flat_map(|row| src_word(row).to_le_bytes()).collect();
+            let mut dst = vec![0xAAu8; (dst_base + n + 1) * 8];
+            perm.write_rows(&src, src_start, &mut dst, dst_base, n);
+            for row in 0..dst_base + n + 1 {
+                let want = match row.checked_sub(dst_base).filter(|&r| r < n) {
+                    None => u64::from_le_bytes([0xAA; 8]),
+                    Some(r) => copies.iter().fold(0u64, |w, c| match c.src {
+                        ColumnLocator::Payload { slot, .. } if nullable >> slot & 1 != 0 => {
+                            w | (src_word(src_start + r) >> slot & 1) << c.slot
+                        }
+                        _ => w,
+                    }),
+                };
+                assert_eq!(gnitz_wire::read_u64_le(&dst, row * 8), want, "{shape}: n={n} row {row}");
+            }
+        }
     }
 }

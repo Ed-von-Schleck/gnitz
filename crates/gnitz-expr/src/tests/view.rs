@@ -3,17 +3,29 @@
 
 use gnitz_wire::TypeCode;
 
-use crate::test_support::{locator_fixture as fixture, TestView};
+use crate::test_support::{TestSchema, TestView};
 use crate::{assert_batchview_consistent, BatchView, RowSource};
 
 #[test]
 fn test_view_satisfies_the_region_per_row_contract() {
-    let (_, v) = fixture();
-    // The fixture's two PK columns, at their PK-list offsets, with the native
-    // values it wrote — sign-extended, so the signed column's expectation is
-    // spelled the same way as the unsigned one's.
+    let schema = TestSchema::new(
+        &[
+            (TypeCode::U32, false),
+            (TypeCode::I64, false),
+            (TypeCode::I32, true),
+            (TypeCode::U128, true),
+            (TypeCode::U64, true),
+        ],
+        &[0, 1],
+    );
+    // The two PK columns' native values, sign-extended, so the signed column's
+    // expectation is spelled the same way as the unsigned one's.
     let k0: [u128; 3] = [7, 0, u32::MAX as u128];
     let k1: [u128; 3] = [-1i64 as u128, 0, i64::MIN as u128];
+    let mut v = TestView::for_schema(&schema, 3);
+    for row in 0..3 {
+        v.set_key(&schema, row, &[k0[row], k1[row]]);
+    }
     assert_batchview_consistent(
         &v,
         3,
@@ -65,9 +77,11 @@ impl BatchView for MisMappedSlot {
 #[test]
 #[should_panic(expected = "get_col_ptr")]
 fn contract_harness_rejects_a_mismapped_payload_slot() {
-    let mut v = TestView::new(2, 8);
-    v.push_col(8);
-    v.push_col(8);
+    let schema = TestSchema::new(
+        &[(TypeCode::U64, false), (TypeCode::U64, true), (TypeCode::U64, true)],
+        &[0],
+    );
+    let mut v = TestView::for_schema(&schema, 2);
     for row in 0..2 {
         v.set_payload(row, 0, &(row as u64).to_le_bytes());
         v.set_payload(row, 1, &(100 + row as u64).to_le_bytes());

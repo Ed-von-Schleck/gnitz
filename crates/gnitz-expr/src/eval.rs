@@ -124,10 +124,11 @@ impl Evaluator {
         });
     }
 
-    /// Test hook: run this program on the nullable arm.
+    /// Test hook: run this program on the `no_nulls` arm or the nullable one.
+    /// Only a program that resolved `no_nulls` may be put back on it.
     #[cfg(test)]
-    pub(crate) fn force_nullable_arm(&mut self) {
-        self.prog.no_nulls = false;
+    pub(crate) fn set_no_nulls(&mut self, no_nulls: bool) {
+        self.prog.no_nulls = no_nulls;
         self.scratch = EvalScratch::new(&self.prog);
     }
 }
@@ -262,6 +263,12 @@ impl ScalarEval {
         ExprResults::Str { bytes, spans }
     }
 
+    /// Test hook: the register [`Self::eval_all`] reads back.
+    #[cfg(test)]
+    pub(crate) fn result_reg(&self) -> usize {
+        self.result_reg
+    }
+
     /// Whether [`Self::eval_all`] hands back [`ExprResults::Str`].
     pub fn result_is_str(&self) -> bool {
         matches!(self.class, ResultClass::Str)
@@ -325,59 +332,61 @@ impl MapEval {
     }
 }
 
-/// The evaluator behind each public type, for tests that drive its registers
-/// directly.
+/// The evaluator behind each public type, for tests that read its resolved
+/// program or switch its arm. A filter without a predicate has neither.
 #[cfg(test)]
 pub(crate) trait Resolved {
-    fn ev(&mut self) -> &mut Evaluator;
-    fn prog(&self) -> &ResolvedProgram;
-    fn into_prog(self) -> ResolvedProgram;
+    fn ev(&self) -> Option<&Evaluator>;
+    fn ev_mut(&mut self) -> Option<&mut Evaluator>;
 
-    fn eval_morsels(&mut self, mb: &dyn BatchView, start: usize, n: usize, f: impl FnMut(usize, &MorselOut<'_>)) {
-        self.ev().eval_morsels(mb, start, n, f)
+    fn prog(&self) -> &ResolvedProgram {
+        &self.ev().expect("an evaluated program").prog
     }
 
-    fn force_nullable_arm(&mut self) {
-        self.ev().force_nullable_arm()
+    fn no_nulls(&self) -> bool {
+        self.ev().is_some_and(|ev| ev.prog.no_nulls)
+    }
+
+    fn set_no_nulls(&mut self, no_nulls: bool) {
+        if let Some(ev) = self.ev_mut() {
+            ev.set_no_nulls(no_nulls)
+        }
+    }
+
+    fn eval_morsels(&mut self, mb: &dyn BatchView, start: usize, n: usize, f: impl FnMut(usize, &MorselOut<'_>)) {
+        self.ev_mut()
+            .expect("an evaluated program")
+            .eval_morsels(mb, start, n, f)
     }
 }
 
 #[cfg(test)]
 impl Resolved for RowFilter {
-    fn ev(&mut self) -> &mut Evaluator {
-        &mut self.pred.as_mut().expect("a RowFilter with a predicate").ev
+    fn ev(&self) -> Option<&Evaluator> {
+        self.pred.as_ref().map(|p| &p.ev)
     }
-    fn prog(&self) -> &ResolvedProgram {
-        &self.pred.as_ref().expect("a RowFilter with a predicate").ev.prog
-    }
-    fn into_prog(self) -> ResolvedProgram {
-        self.pred.expect("a RowFilter with a predicate").ev.prog
+    fn ev_mut(&mut self) -> Option<&mut Evaluator> {
+        self.pred.as_mut().map(|p| &mut p.ev)
     }
 }
 
 #[cfg(test)]
 impl Resolved for ScalarEval {
-    fn ev(&mut self) -> &mut Evaluator {
-        &mut self.ev
+    fn ev(&self) -> Option<&Evaluator> {
+        Some(&self.ev)
     }
-    fn prog(&self) -> &ResolvedProgram {
-        &self.ev.prog
-    }
-    fn into_prog(self) -> ResolvedProgram {
-        self.ev.prog
+    fn ev_mut(&mut self) -> Option<&mut Evaluator> {
+        Some(&mut self.ev)
     }
 }
 
 #[cfg(test)]
 impl Resolved for MapEval {
-    fn ev(&mut self) -> &mut Evaluator {
-        &mut self.ev
+    fn ev(&self) -> Option<&Evaluator> {
+        Some(&self.ev)
     }
-    fn prog(&self) -> &ResolvedProgram {
-        &self.ev.prog
-    }
-    fn into_prog(self) -> ResolvedProgram {
-        self.ev.prog
+    fn ev_mut(&mut self) -> Option<&mut Evaluator> {
+        Some(&mut self.ev)
     }
 }
 

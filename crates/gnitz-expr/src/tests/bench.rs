@@ -18,12 +18,12 @@ use crate::batch::MORSEL;
 
 use crate::eval::Resolved;
 use crate::test_support::{
-    both_arms, filter_prog, is_null_op, make_n_col_view, make_string_view, map_prog, passing_rows, scalar_prog,
-    schema_pk_ints, schema_pk_strings, FilterShape, TestOut, TestSchema, TestView,
+    filter_prog, is_null_op, make_n_col_view, make_string_view, map_prog, passing_rows, scalar_prog, schema_pk_ints,
+    schema_pk_strings, TestSchema, TestView,
 };
 use crate::{
-    CmpOp, ConstIdx, ExprBuilder, IntArithOp, LikePattern, LogicalInstr, LogicalProgram, MapEval, Reg, RowFilter,
-    ScalarEval, Sink,
+    payload_u64, CmpOp, ConstIdx, ExprBuilder, IntArithOp, LikePattern, LogicalInstr, LogicalProgram, MapEval, Reg,
+    RowFilter, ScalarEval, Sink,
 };
 
 /// Assert the `GNITZ_BENCH_*` selector matched at least one of the shapes the
@@ -31,6 +31,21 @@ use crate::{
 /// difference to a 0 % effect instead of failing.
 fn selected(var: &str, only: &str, count: usize) {
     assert!(count > 0, "{var} matched nothing: {only:?}");
+}
+
+/// `build()` twice: as resolved, which must be the `no_nulls` arm, and forced
+/// onto the nullable arm — the pair an arm A/B drives.
+fn both_arms<E: Resolved>(label: &str, build: impl Fn() -> E) -> (E, E) {
+    let fast = build();
+    assert!(fast.prog().no_nulls, "{label}: the fast side must resolve no_nulls");
+    let mut nullable = build();
+    nullable.set_no_nulls(false);
+    (fast, nullable)
+}
+
+/// The register a program's result lands in: its last instruction's.
+fn last(instrs: &[LogicalInstr]) -> Reg {
+    Reg(instrs.len() as u16 - 1)
 }
 
 /// Run `f` over `view` `passes` times, the driven region of every filter bench.
@@ -46,9 +61,8 @@ fn drive_filter(f: &mut RowFilter, view: &TestView, passes: usize) {
 
 /// The evidence for keeping the fused `StrColConst` opcode over the
 /// register channel on the `col <op> 'const'` filter loop — ~1M rows,
-/// non-nullable STRING. Both channels are built for every domain and their hit
-/// counts asserted equal, which is the only differential correctness check
-/// between them; `GNITZ_BENCH_CHANNEL` and `GNITZ_BENCH_DOMAIN` then cut the
+/// non-nullable STRING. Both channels are built for every domain and their hits
+/// asserted equal; `GNITZ_BENCH_CHANNEL` and `GNITZ_BENCH_DOMAIN` then cut the
 /// *driven* region down to one, so a `perf stat` over two pass counts
 /// differences to one channel's retired instructions on one domain.
 ///
@@ -107,14 +121,13 @@ fn str_const_filter_bench() {
 
     let mut n_selected = 0usize;
     for (domain, constant, value) in domains {
-        let mb = make_string_view(&schema, n, |row, _| value(row));
+        let mb = make_string_view(&schema, n, |row, _| value(row), |_, _| false);
 
         for (name, op) in [("eq", CmpOp::Eq), ("lt", CmpOp::Lt)] {
             let consts = vec![constant.as_bytes().to_vec()];
             let mut fused = filter_prog(
                 &schema,
                 vec![LogicalInstr::StrColConst { op, col: 1, const_idx: ConstIdx(0) }],
-                Reg(0),
                 consts.clone(),
             );
             let mut regs = filter_prog(
@@ -124,7 +137,6 @@ fn str_const_filter_bench() {
                     LogicalInstr::LoadConstStr { const_idx: ConstIdx(0) },
                     LogicalInstr::StrCmp { op, a: Reg(0), b: Reg(1) },
                 ],
-                Reg(2),
                 consts,
             );
 
@@ -173,49 +185,32 @@ fn filter_kernel_bench() {
     let driven = |name: &str| only == "all" || only == name;
     let n = 200_000usize;
 
+    // `col <op> k` over one column of `schema`.
+    let col_cmp = |schema: &TestSchema, col: u32, op, val| {
+        let instrs = vec![
+            LogicalInstr::LoadColInt { col },
+            LogicalInstr::LoadConst { val, unsigned: false },
+            LogicalInstr::Cmp { op, a: Reg(0), b: Reg(1) },
+        ];
+        filter_prog(schema, instrs, vec![])
+    };
+
     // `pk > n/2` — the PK-region load.
     let pk_schema = schema_pk_ints(1, false);
     let pk_view = make_n_col_view(&pk_schema, n, |_, _| 1, |_, _| false);
-    let mut pk_filter = filter_prog(
-        &pk_schema,
-        vec![
-            LogicalInstr::LoadColInt { col: 0 },
-            LogicalInstr::LoadConst { val: (n / 2) as i64, unsigned: false },
-            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
-        ],
-        Reg(2),
-        vec![],
-    );
+    let mut pk_filter = col_cmp(&pk_schema, 0, CmpOp::Gt, (n / 2) as i64);
 
     // The same compare over an `I64` PK: the signed OPK decode, which `pk`'s
     // `U64` key does not reach.
     let pk_i64_schema = TestSchema::new(&[(TypeCode::I64, false), (TypeCode::I64, false)], &[0]);
     let pk_i64_view = make_n_col_view(&pk_i64_schema, n, |_, _| 1, |_, _| false);
-    let mut pk_i64_filter = filter_prog(
-        &pk_i64_schema,
-        vec![
-            LogicalInstr::LoadColInt { col: 0 },
-            LogicalInstr::LoadConst { val: (n / 2) as i64, unsigned: false },
-            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
-        ],
-        Reg(2),
-        vec![],
-    );
+    let mut pk_i64_filter = col_cmp(&pk_i64_schema, 0, CmpOp::Gt, (n / 2) as i64);
 
     // `a > 500` over one NOT NULL `I32` payload column: a payload load narrower
     // than the 8-byte arm every other shape reads.
     let i32_schema = TestSchema::new(&[(TypeCode::U64, false), (TypeCode::I32, false)], &[0]);
     let i32_view = make_n_col_view(&i32_schema, n, |row, _| (row % 1000) as i64, |_, _| false);
-    let mut i32_filter = filter_prog(
-        &i32_schema,
-        vec![
-            LogicalInstr::LoadColInt { col: 1 },
-            LogicalInstr::LoadConst { val: 500, unsigned: false },
-            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
-        ],
-        Reg(2),
-        vec![],
-    );
+    let mut i32_filter = col_cmp(&i32_schema, 1, CmpOp::Gt, 500);
 
     // `-a > 0 AND b < 80` over nullable columns — unary, the 3VL AND, and the
     // per-column null-bit gather.
@@ -241,7 +236,6 @@ fn filter_kernel_bench() {
             LogicalInstr::Cmp { op: CmpOp::Lt, a: Reg(4), b: Reg(5) },
             LogicalInstr::BoolBinary { is_or: false, a: Reg(3), b: Reg(6) },
         ],
-        Reg(7),
         vec![],
     );
 
@@ -251,32 +245,28 @@ fn filter_kernel_bench() {
     let lit_schema = schema_pk_ints(1, false);
     let lit_view = make_n_col_view(&lit_schema, n, |row, _| (row % 1000) as i64, |_, _| false);
     let mut lit_instrs = vec![LogicalInstr::LoadColInt { col: 1 }];
-    let mut acc_reg = None;
-    for (op, val) in [
+    for (i, (op, val)) in [
         (CmpOp::Gt, 1i64),
         (CmpOp::Lt, 999),
         (CmpOp::Ne, 5),
         (CmpOp::Ne, 7),
         (CmpOp::Ne, 9),
-    ] {
-        // A register IS the index of the instruction that writes it, and the
-        // `BoolBinary` pushes make that index no function of the loop counter —
-        // so each one is read off the stream immediately before its push.
-        let k = lit_instrs.len() as u16;
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let acc = last(&lit_instrs);
         lit_instrs.push(LogicalInstr::LoadConst { val, unsigned: false });
-        let c = lit_instrs.len() as u16;
-        lit_instrs.push(LogicalInstr::Cmp { op, a: Reg(0), b: Reg(k) });
-        acc_reg = Some(match acc_reg {
-            None => c,
-            Some(prev) => {
-                let d = lit_instrs.len() as u16;
-                lit_instrs.push(LogicalInstr::BoolBinary { is_or: false, a: Reg(prev), b: Reg(c) });
-                d
-            }
-        });
+        lit_instrs.push(LogicalInstr::Cmp { op, a: Reg(0), b: last(&lit_instrs) });
+        if i > 0 {
+            lit_instrs.push(LogicalInstr::BoolBinary {
+                is_or: false,
+                a: acc,
+                b: last(&lit_instrs),
+            });
+        }
     }
-    let lit_result = acc_reg.expect("the literal chain has at least one compare");
-    let mut lit_filter = filter_prog(&lit_schema, lit_instrs, Reg(lit_result), vec![]);
+    let mut lit_filter = filter_prog(&lit_schema, lit_instrs, vec![]);
 
     let mut n_selected = 0usize;
     for (name, ev, view) in [
@@ -302,27 +292,25 @@ fn filter_kernel_bench() {
 /// compares of NOT NULL columns hung off one null test, so the whole predicate
 /// still resolves `no_nulls`. `n_cmp` sets the chain depth, which is what scales
 /// the per-conjunct cost the arms are being compared on.
-fn is_null_chain(k: i64, n_cmp: u16) -> FilterShape {
+fn is_null_chain(k: i64, n_cmp: u32) -> Vec<LogicalInstr> {
     let mut instrs = vec![is_null_op(1)];
     if n_cmp == 0 {
         // No compare, so no constant to load — an unread `LoadConst` would still
         // cost a register write per morsel and blunt the bare shape's figure.
-        return (instrs, Reg(0));
+        return instrs;
     }
     instrs.push(LogicalInstr::LoadConst { val: k, unsigned: false });
-    let mut acc = 0u16;
-    for i in 0..n_cmp {
-        let base = 2 + i * 3;
-        instrs.push(LogicalInstr::LoadColInt { col: u32::from(i) + 2 });
-        instrs.push(LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(base), b: Reg(1) });
-        instrs.push(LogicalInstr::BoolBinary {
-            is_or: false,
-            a: Reg(acc),
-            b: Reg(base + 1),
+    for col in 2..n_cmp + 2 {
+        let acc = if col == 2 { Reg(0) } else { last(&instrs) };
+        instrs.push(LogicalInstr::LoadColInt { col });
+        instrs.push(LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            a: last(&instrs),
+            b: Reg(1),
         });
-        acc = base + 2;
+        instrs.push(LogicalInstr::BoolBinary { is_or: false, a: acc, b: last(&instrs) });
     }
-    (instrs, Reg(acc))
+    instrs
 }
 
 /// One nullable column (the null test's) plus four NOT NULL ones (the
@@ -399,7 +387,7 @@ fn is_null_arm_bench() {
 
     // `k = 50` passes about half the rows; `k = -1` passes every row, which is
     // the non-selective variant.
-    let shapes: [(&str, &TestView, FilterShape); 6] = [
+    let shapes: [(&str, &TestView, Vec<LogicalInstr>); 6] = [
         ("bare", &spread, is_null_chain(50, 0)),
         ("one_and", &spread, is_null_chain(50, 1)),
         ("chain_spread", &spread, is_null_chain(50, 4)),
@@ -409,12 +397,11 @@ fn is_null_arm_bench() {
     ];
 
     let mut n_selected = 0usize;
-    for (name, view, (instrs, result_reg)) in &shapes {
-        let (mut fast, mut nullable) = both_arms(name, || filter_prog(&schema, instrs.clone(), *result_reg, vec![]));
-        // Also the warm-up, and outside the driven region.
-        let passed = passing_rows(&mut fast, view);
-        assert_eq!(passed, passing_rows(&mut nullable, view), "{name}: the arms disagree");
-        let hits = passed.iter().filter(|&&p| p).count();
+    for (name, view, instrs) in &shapes {
+        let (mut fast, mut nullable) = both_arms(name, || filter_prog(&schema, instrs.clone(), vec![]));
+        // Also the warm-up, and outside the driven region; the read holds the
+        // nullable arm to the fast one's rows.
+        let hits = passing_rows(&mut fast, view).iter().filter(|&&p| p).count();
 
         for (want, ev) in [(run_fast, &mut fast), (run_nullable, &mut nullable)] {
             if driven(name, want) {
@@ -470,23 +457,33 @@ fn is_null_arm_bench() {
 /// widths average two regimes.
 fn fixed_len_str_view(schema: &TestSchema, n: usize, len: usize, unit: &[u8]) -> TestView {
     let base: Vec<u8> = unit.iter().copied().cycle().take(len).collect();
-    make_string_view(schema, n, |row, _| {
-        let mut s = base.clone();
-        if s[row % len].is_ascii() {
-            s[row % len] = b'0' + (row % 10) as u8;
-        }
-        s
-    })
+    make_string_view(
+        schema,
+        n,
+        |row, _| {
+            let mut s = base.clone();
+            if s[row % len].is_ascii() {
+                s[row % len] = b'0' + (row % 10) as u8;
+            }
+            s
+        },
+        |_, _| false,
+    )
 }
 
 /// One German string per payload slot, alternating either side of
 /// the 12-byte inline boundary so a string bench drives both the in-place inline
 /// view and the blob view.
 fn str_bench_view(schema: &TestSchema, n: usize) -> TestView {
-    make_string_view(schema, n, |row, pi| match row % 3 {
-        0 => format!("row-{row}-col-{pi}-past-the-inline-boundary"),
-        _ => format!("r{}{pi}", row % 100),
-    })
+    make_string_view(
+        schema,
+        n,
+        |row, pi| match row % 3 {
+            0 => format!("row-{row}-col-{pi}-past-the-inline-boundary"),
+            _ => format!("r{}{pi}", row % 100),
+        },
+        |_, _| false,
+    )
 }
 
 /// Retired-instruction harness for the kernels [`filter_kernel_bench`] cannot
@@ -542,7 +539,6 @@ fn expr_kernel_bench() {
     let int_cast = scalar_prog(
         &ints,
         vec![load2(1), LogicalInstr::IntCast { a: Reg(0), fi: FixedInt::I32 }],
-        Reg(1),
         vec![],
     );
     let int_div = scalar_prog(
@@ -556,7 +552,6 @@ fn expr_kernel_bench() {
                 b: Reg(1),
             },
         ],
-        Reg(2),
         vec![],
     );
     // `CASE WHEN a > b THEN a ELSE b END` over nullable columns — the blend's
@@ -569,15 +564,9 @@ fn expr_kernel_bench() {
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
             LogicalInstr::Select { cond: Reg(2), a: Reg(0), b: Reg(1) },
         ],
-        Reg(3),
         vec![],
     );
-    let int_to_str = scalar_prog(
-        &ints,
-        vec![load2(1), LogicalInstr::IntToStr { a: Reg(0) }],
-        Reg(1),
-        vec![],
-    );
+    let int_to_str = scalar_prog(&ints, vec![load2(1), LogicalInstr::IntToStr { a: Reg(0) }], vec![]);
 
     // --- string shapes over two NOT NULL STRING columns ---
     let strs = schema_pk_strings(2, false);
@@ -587,13 +576,11 @@ fn expr_kernel_bench() {
     let str_len = scalar_prog(
         &strs,
         vec![load_str(1), LogicalInstr::StrLen { a: Reg(0), chars: false }],
-        Reg(1),
         vec![],
     );
     let str_upper = scalar_prog(
         &strs,
         vec![load_str(1), LogicalInstr::StrCase { a: Reg(0), upper: true }],
-        Reg(1),
         vec![],
     );
     let str_like = scalar_prog(
@@ -606,7 +593,6 @@ fn expr_kernel_bench() {
                 ci: false,
             },
         ],
-        Reg(1),
         vec![LikePattern::encode("%boundary", None).unwrap().as_bytes().to_vec()],
     );
     let str_substr = scalar_prog(
@@ -621,7 +607,6 @@ fn expr_kernel_bench() {
                 len_reg: Some(Reg(2)),
             },
         ],
-        Reg(3),
         vec![],
     );
     let str_concat = scalar_prog(
@@ -631,7 +616,6 @@ fn expr_kernel_bench() {
             load_str(2),
             LogicalInstr::StrConcat { a: Reg(0), b: Reg(1), skip_null: false },
         ],
-        Reg(2),
         vec![],
     );
 
@@ -650,7 +634,6 @@ fn expr_kernel_bench() {
                 load_str(1),
                 LogicalInstr::StrLike { src: Reg(0), pat_idx: ConstIdx(0), ci },
             ],
-            Reg(1),
             vec![LikePattern::encode(pat, None).unwrap().as_bytes().to_vec()],
         )
     };
@@ -662,7 +645,6 @@ fn expr_kernel_bench() {
                 LogicalInstr::LoadConstStr { const_idx: ConstIdx(0) },
                 LogicalInstr::StrPos { hay: Reg(0), needle: Reg(1) },
             ],
-            Reg(2),
             vec![b"needle".to_vec()],
         )
     };
@@ -690,7 +672,6 @@ fn expr_kernel_bench() {
                 LogicalInstr::LoadConst { val: 10, unsigned: false },
                 LogicalInstr::StrSide { src: Reg(0), n_reg: Reg(1), left: false },
             ],
-            Reg(2),
             vec![],
         )
     };
@@ -704,18 +685,10 @@ fn expr_kernel_bench() {
         scalar_prog(
             &str1,
             vec![load_str(1), LogicalInstr::StrLen { a: Reg(0), chars: true }],
-            Reg(1),
             vec![],
         )
     };
-    let str_reverse = || {
-        scalar_prog(
-            &str1,
-            vec![load_str(1), LogicalInstr::StrReverse { a: Reg(0) }],
-            Reg(1),
-            vec![],
-        )
-    };
+    let str_reverse = || scalar_prog(&str1, vec![load_str(1), LogicalInstr::StrReverse { a: Reg(0) }], vec![]);
     let str_lpad = scalar_prog(
         &str1,
         vec![
@@ -729,7 +702,6 @@ fn expr_kernel_bench() {
                 left: true,
             },
         ],
-        Reg(3),
         vec![b" ".to_vec()],
     );
     // Windows far into the string, where the offset walks skip whole words.
@@ -741,7 +713,6 @@ fn expr_kernel_bench() {
                 LogicalInstr::LoadConst { val: 200, unsigned: false },
                 LogicalInstr::StrSide { src: Reg(0), n_reg: Reg(1), left },
             ],
-            Reg(2),
             vec![],
         )
     };
@@ -757,7 +728,6 @@ fn expr_kernel_bench() {
                 len_reg: Some(Reg(2)),
             },
         ],
-        Reg(3),
         vec![],
     );
 
@@ -796,83 +766,92 @@ fn expr_kernel_bench() {
     let mut acc = 0i64;
     if driven("map") {
         n_selected += 1;
-        let mut out = TestOut::new(n, &[8, 8]);
+        let mut out = TestView::for_schema(&map_out, n);
         for _ in 0..passes {
             map.write_computed(&map_view, 0, n, &mut out, 0);
-            acc += out.cols[0][0] as i64;
+            acc += payload_u64(&out, 0, 0) as i64;
         }
     }
     // Scalar-result shapes: sum the result register, as a register sink into an
     // 8-byte slot would read it. Each resolves its own evaluator, outside the
     // driven region.
-    let mut scalar_shapes: Vec<(&str, ScalarEval, &TestView, usize)> = vec![
-        ("int_cast", int_cast, &int_view, 1usize),
-        ("int_div", int_div, &int_view, 2),
-        ("select", select, &int_view, 3),
-        ("str_len", str_len, &str_view, 1),
-        ("str_like", str_like, &str_view, 1),
+    let mut scalar_shapes: Vec<(String, ScalarEval, &TestView)> = vec![
+        ("int_cast".into(), int_cast, &int_view),
+        ("int_div".into(), int_div, &int_view),
+        ("select".into(), select, &int_view),
+        ("str_len".into(), str_len, &str_view),
+        ("str_like".into(), str_like, &str_view),
     ];
     // Named per length, so one `perf` pair reads one point of the slope.
-    for (k, name) in ["str_contains_12", "str_contains_128", "str_contains_512"]
-        .into_iter()
-        .enumerate()
-    {
-        scalar_shapes.push((name, like_prog("%needle%", false), &like_views[k], 1));
-    }
-    for (k, name) in ["str_generic_12", "str_generic_128", "str_generic_512"]
-        .into_iter()
-        .enumerate()
-    {
-        scalar_shapes.push((name, like_prog("%a%b%", false), &like_views[k], 1));
-    }
-    for (k, name) in ["str_chars_12", "str_chars_128", "str_chars_512"]
-        .into_iter()
-        .enumerate()
-    {
-        scalar_shapes.push((name, str_chars(), &utf8_views[k], 1));
+    for (k, len) in like_lens.into_iter().enumerate() {
+        scalar_shapes.push((
+            format!("str_contains_{len}"),
+            like_prog("%needle%", false),
+            &like_views[k],
+        ));
+        scalar_shapes.push((format!("str_generic_{len}"), like_prog("%a%b%", false), &like_views[k]));
+        scalar_shapes.push((format!("str_chars_{len}"), str_chars(), &utf8_views[k]));
     }
     scalar_shapes.extend([
-        ("str_contains_freq_128", like_prog("%needle%", false), &freq_views[0], 1),
-        ("str_contains_freq_512", like_prog("%needle%", false), &freq_views[1], 1),
-        ("str_icontains_12", like_prog("%NeedLe%", true), &mixed_views[0], 1),
-        ("str_icontains_512", like_prog("%NeedLe%", true), &mixed_views[2], 1),
-        ("str_iprefix_128", like_prog("NeedLe%", true), &mixed_views[1], 1),
-        ("str_generic_resume_128", like_prog("%n_q%", false), &dense_views[0], 1),
-        ("str_generic_resume_512", like_prog("%n_q%", false), &dense_views[1], 1),
-        ("str_strpos_128", strpos(), &freq_views[0], 2),
-        ("str_strpos_512", strpos(), &freq_views[1], 2),
+        (
+            "str_contains_freq_128".into(),
+            like_prog("%needle%", false),
+            &freq_views[0],
+        ),
+        (
+            "str_contains_freq_512".into(),
+            like_prog("%needle%", false),
+            &freq_views[1],
+        ),
+        ("str_icontains_12".into(), like_prog("%NeedLe%", true), &mixed_views[0]),
+        ("str_icontains_512".into(), like_prog("%NeedLe%", true), &mixed_views[2]),
+        ("str_iprefix_128".into(), like_prog("NeedLe%", true), &mixed_views[1]),
+        (
+            "str_generic_resume_128".into(),
+            like_prog("%n_q%", false),
+            &dense_views[0],
+        ),
+        (
+            "str_generic_resume_512".into(),
+            like_prog("%n_q%", false),
+            &dense_views[1],
+        ),
+        ("str_strpos_128".into(), strpos(), &freq_views[0]),
+        ("str_strpos_512".into(), strpos(), &freq_views[1]),
         // A `%` ahead of `_`s.
-        ("str_like_any3", like_prog("%___", false), &utf8_views[1], 1),
+        ("str_like_any3".into(), like_prog("%___", false), &utf8_views[1]),
     ]);
-    for (name, mut ev, view, reg) in scalar_shapes {
-        if !driven(name) {
+    for (name, mut ev, view) in scalar_shapes {
+        if !driven(&name) {
             continue;
         }
         n_selected += 1;
+        let reg = ev.result_reg();
         for _ in 0..passes {
             ev.eval_morsels(view, 0, n, |_, out| acc += out.reg_values(reg).iter().sum::<i64>());
         }
     }
     // String-result shapes: resolve every view, as a string sink does.
-    let str_shapes: Vec<(&str, ScalarEval, &TestView, usize)> = vec![
-        ("int_to_str", int_to_str, &int_view, 1usize),
-        ("str_upper", str_upper, &str_view, 1),
-        ("str_substr", str_substr, &str_view, 3),
-        ("str_concat", str_concat, &str_view, 2),
-        ("str_side_64", str_side(), &side_64, 2),
-        ("str_side_512", str_side(), &like_views[2], 2),
-        ("str_reverse_128", str_reverse(), &like_views[1], 1),
-        ("str_reverse_utf8_128", str_reverse(), &utf8_views[1], 1),
-        ("str_lpad_12", str_lpad, &like_views[0], 3),
-        ("str_left200", side200(true), &utf8_views[2], 2),
-        ("str_right200", side200(false), &utf8_views[2], 2),
-        ("str_substr_far", str_substr_far, &utf8_views[2], 3),
+    let str_shapes: Vec<(&str, ScalarEval, &TestView)> = vec![
+        ("int_to_str", int_to_str, &int_view),
+        ("str_upper", str_upper, &str_view),
+        ("str_substr", str_substr, &str_view),
+        ("str_concat", str_concat, &str_view),
+        ("str_side_64", str_side(), &side_64),
+        ("str_side_512", str_side(), &like_views[2]),
+        ("str_reverse_128", str_reverse(), &like_views[1]),
+        ("str_reverse_utf8_128", str_reverse(), &utf8_views[1]),
+        ("str_lpad_12", str_lpad, &like_views[0]),
+        ("str_left200", side200(true), &utf8_views[2]),
+        ("str_right200", side200(false), &utf8_views[2]),
+        ("str_substr_far", str_substr_far, &utf8_views[2]),
     ];
-    for (name, mut ev, view, reg) in str_shapes {
+    for (name, mut ev, view) in str_shapes {
         if !driven(name) {
             continue;
         }
         n_selected += 1;
+        let reg = ev.result_reg();
         for _ in 0..passes {
             ev.eval_morsels(view, 0, n, |_, out| {
                 for i in 0..out.rows() {
