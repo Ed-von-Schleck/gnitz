@@ -11,9 +11,10 @@
 //!
 //! An image is one rank byte placing NULLs, then the column's order image, byte-
 //! complemented for DESC. Images are prefix-free, and a BLOB payload compares by
-//! content, so the store's own `(PK, payload)` order *is* the ORDER BY order; the
-//! leading image bytes in the PK keep one group's entries off the merge's
-//! row-by-row equal-PK arm, exactly as the AVI's value column does.
+//! content, so the store's own `(PK, payload)` order *is* the ORDER BY order. The
+//! PK's lead slot holds `image_0`'s rank byte and as many image bytes as fit
+//! after it, so only rows whose images agree on those share a PK and fall to the
+//! merge's row-by-row equal-PK arm.
 
 use crate::ops::reindex::ReindexPacker;
 use crate::schema::{oob_col, ColumnLocator, SchemaDescriptor, SchemaFacts};
