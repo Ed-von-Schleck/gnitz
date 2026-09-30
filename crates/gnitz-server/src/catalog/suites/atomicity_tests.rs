@@ -5,14 +5,6 @@ use std::fs;
 // Helpers (supplement the shared helpers in mod.rs)
 // ---------------------------------------------------------------------------
 
-fn build_schema_tab_row(sid: u64, name: &str) -> Batch {
-    let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
-    bb.begin_row(sid as u128, 1);
-    bb.put_string(name);
-    bb.end_row();
-    bb.finish()
-}
-
 /// A rejected relation CREATE must leave the catalog exactly as it was: no
 /// name/id cache entry, no DAG registration, and no orphaned row in the
 /// family's memtable. `init_rows` is the family's row count taken before the
@@ -425,7 +417,7 @@ fn test_next_id_advances_on_schema_register() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let large_sid = engine.next_id + 500;
-    let batch = build_schema_tab_row(large_sid, "recovered_schema");
+    let batch = schema_tab_batch(&[(large_sid, "recovered_schema", 1)]);
     engine.ingest_to_family(gnitz_wire::SCHEMA_TAB, &batch).unwrap();
 
     assert!(
@@ -462,7 +454,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
     );
 
     engine
-        .submit(SysFamily::Schema, build_schema_tab_row(tid, "victim"))
+        .submit(SysFamily::Schema, schema_tab_batch(&[(tid, "victim", 1)]))
         .unwrap();
     assert_eq!(
         engine.schema_id("victim").expect("the schema exists"),
@@ -485,43 +477,6 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
 // DDL_TXN bundle rollback: `submit` per family, then `compensate_stage_a`, as
 // `handle_ddl_txn` does.
 // ---------------------------------------------------------------------------
-
-/// A client chooses the id its row carries, so `precheck_family` holds the id
-/// ceiling before any mutation.
-#[test]
-fn precheck_rejects_relation_id_at_or_above_ceiling() {
-    let dir = temp_dir("relation_id_ceiling_reject");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    for (label, tid) in [
-        ("at the ceiling", gnitz_wire::CATALOG_ID_CEILING),
-        ("above the ceiling", gnitz_wire::CATALOG_ID_CEILING + 4096),
-    ] {
-        let table_batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "banded");
-        let err = engine
-            .precheck_family(SysFamily::Table, &table_batch)
-            .expect_err(&format!("TABLE_TAB id at/above the ceiling must be rejected ({label})"));
-        assert!(err.contains("id ceiling"), "error must name the cause, got: {err}");
-
-        let view_batch = build_view_tab_row(tid, "bandedview");
-        let err = engine
-            .precheck_family(SysFamily::View, &view_batch)
-            .expect_err(&format!("VIEW_TAB id at/above the ceiling must be rejected ({label})"));
-        assert!(err.contains("id ceiling"), "error must name the cause, got: {err}");
-    }
-
-    // A ceiling, not a blanket ban: an ordinary durable id below it still passes
-    // this guard (it fails later for unrelated reasons, if at all).
-    let ok_batch = build_table_tab_row(gnitz_wire::CATALOG_ID_CEILING - 1, pack_pk_cols(&[0]), "just_below");
-    let err = engine
-        .precheck_family(SysFamily::Table, &ok_batch)
-        .err()
-        .unwrap_or_default();
-    assert!(
-        !err.contains("id ceiling"),
-        "an id below the ceiling must not trip the ceiling guard, got: {err}"
-    );
-}
 
 /// A CREATE bundle `[COL_TAB, TABLE_TAB]` whose TABLE_TAB fails **precheck**
 /// (duplicate name) must leave neither an orphan COL_TAB nor a ghost `-1` TABLE_TAB.
@@ -795,11 +750,9 @@ fn zero_weight_catalog_row_rejected() {
     let err = engine.submit(SysFamily::Table, bb.finish()).unwrap_err();
     assert!(err.contains("zero-weight row"), "unexpected error: {err}");
 
-    let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
-    bb.begin_row(sid as u128, 0);
-    bb.put_string("public");
-    bb.end_row();
-    let err = engine.submit(SysFamily::Schema, bb.finish()).unwrap_err();
+    let err = engine
+        .submit(SysFamily::Schema, schema_tab_batch(&[(sid, "public", 0)]))
+        .unwrap_err();
     assert!(err.contains("zero-weight row"), "unexpected error: {err}");
 
     assert_eq!(

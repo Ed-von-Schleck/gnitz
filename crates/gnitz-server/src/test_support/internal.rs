@@ -8,7 +8,8 @@ use crate::catalog::{CatalogColumn, CatalogEngine, SysFamily, PUBLIC_SCHEMA_ID};
 use gnitz_expr::SchemaFacts;
 use gnitz_store::storage::{Batch, BatchBuilder, ReadCursor};
 use gnitz_wire::sys_rows::{
-    write_circuit_rows, write_idx_tab_row, write_table_tab_row, IdxTabRow, SysRowSink, TableTabRow,
+    write_circuit_rows, write_idx_tab_row, write_schema_tab_row, write_table_tab_row, IdxTabRow, SchemaTabRow,
+    SysRowSink, TableTabRow,
 };
 use gnitz_wire::Circuit;
 use gnitz_wire::{ColumnDef, TypeCode};
@@ -170,6 +171,15 @@ pub fn push_table_tab_row(
         },
         weight,
     );
+}
+
+/// A SCHEMA_TAB batch of `(schema_id, name, weight)` rows.
+pub fn schema_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
+    let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
+    for &(schema_id, name, weight) in rows {
+        write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id, name }, weight);
+    }
+    bb.finish()
 }
 
 /// `defs` as `owner_id`'s COL_TAB batch at `weight`, numbered by position.

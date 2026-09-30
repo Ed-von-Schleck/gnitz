@@ -8,9 +8,8 @@
 //! without a server.
 
 use super::super::*;
-use crate::test_support::{col_tab_batch, idx_tab_batch, push_table_tab_row};
+use crate::test_support::{col_tab_batch, idx_tab_batch, push_table_tab_row, schema_tab_batch};
 use gnitz_wire::pack_pk_cols;
-use gnitz_wire::sys_rows::{write_schema_tab_row, SchemaTabRow};
 
 /// Split `schema.name`, defaulting the schema half. Only these direct entry
 /// points take qualified-name strings; the wire path ships schema and entity ids
@@ -79,15 +78,7 @@ impl CatalogEngine {
         }
         let sid = self.allocate_ids(1).unwrap();
 
-        // Write schema record
-        let schema = SysFamily::Schema.schema();
-        let mut bb = BatchBuilder::new(*schema);
-        write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id: sid, name }, 1);
-        let batch = bb.finish();
-
-        // Submit the schemas-family delta (triggers hook).
-        self.submit(SysFamily::Schema, batch)?;
-
+        self.submit(SysFamily::Schema, schema_tab_batch(&[(sid, name, 1)]))?;
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 //! ALTER (rename) catalog mechanics driven directly at the `CatalogEngine`
 //! layer: the reconciling register hooks (a rename pair fires no cascade), the
-//! post-image retraction contract (CAS, per-PK net, system-range rewrite guard)
+//! post-image retraction contract (CAS, system-range rewrite guard)
 //! exercised with names longer than 12 bytes so the German-string blob heap is on
 //! the CAS path, and the id-only directory resume
 //! across a reopen. The end-to-end SQL surface is in
@@ -167,27 +167,6 @@ fn stale_snapshot_rename_rejected_long_name() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn duplicate_live_head_rejected() {
-    let dir = temp_dir("alter_dup_head");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", TypeCode::U64)];
-    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    // A bare `+1` re-ingest of the live row → net weight 2 (a duplicate live head).
-    let row = live_table_row(&engine, tid);
-    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-    push_table_row(&mut bb, tid, &row, &row.name, 1);
-    let err = engine
-        .ingest_to_family(gnitz_wire::TABLE_TAB, &bb.finish())
-        .unwrap_err();
-    assert!(
-        err.contains("net weight 2") || err.contains("expected 0 or 1"),
-        "a duplicate live head must be rejected: {err}"
-    );
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
 /// The guard keys on the id space, not the batch shape: every sign is rejected,
 /// on both relation families, at an id the SQL layer cannot even name. Each
 /// batch reproduces the bootstrap row byte-for-byte where it carries a `-1`, so
@@ -281,12 +260,8 @@ fn system_range_schema_mutations_rejected() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     for sid in [SYSTEM_SCHEMA_ID, PUBLIC_SCHEMA_ID] {
-        let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
-        bb.begin_row(sid as u128, -1);
-        bb.put_string("gone");
-        bb.end_row();
         let err = engine
-            .ingest_to_family(gnitz_wire::SCHEMA_TAB, &bb.finish())
+            .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_tab_batch(&[(sid, "gone", -1)]))
             .unwrap_err();
         assert!(err.contains("cannot DROP a system schema"), "{err}");
         assert!(engine.caches.schema_by_id.contains_key(&sid), "schema {sid} dropped");

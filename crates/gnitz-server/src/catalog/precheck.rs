@@ -10,14 +10,10 @@ use gnitz_store::schema::make_index_schema;
 use gnitz_wire::{low_bits_mask, BitIter, TypeCode, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME};
 use gnitz_wire::{ViewProps, MAX_COLUMNS};
 
-/// The name rules a relation or index row must satisfy to be *stored*: non-empty
-/// `[A-Za-z0-9_]` and already canonical (every cache key here is compared
-/// byte-wise against the client's folded form).
-///
-/// Deliberately **not** `validate_user_identifier`, whose leading-`_` reservation
-/// is client-side *policy*: the engine must accept the `_seg…` segment rows the
-/// client writes. The residual — a raw bundle naming a relation `_foo` — is
-/// unreferenceable from SQL and lives in a directory named by its id.
+/// The name rules a catalog row must satisfy to be *stored*: non-empty
+/// `[A-Za-z0-9_]` and already canonical, since every cache key is compared
+/// byte-wise against the client's folded form. Unlike `validate_user_identifier`
+/// it admits a leading `_`, which the names the client mints carry.
 fn reject_unstorable_name(name: &str, noun: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err(format!("{noun} name cannot be empty"));
@@ -25,13 +21,6 @@ fn reject_unstorable_name(name: &str, noun: &str) -> Result<(), String> {
     if !name.bytes().all(gnitz_wire::is_valid_ident_char) {
         return Err(format!("{noun} name contains invalid characters: {name}"));
     }
-    reject_non_canonical(name, noun)
-}
-
-/// Reject a name that is not already ASCII-lowercase. Every cache key and
-/// qualified name here is compared byte-wise against the folded form the client
-/// stores, so a mixed-case row would register a relation no lookup finds.
-fn reject_non_canonical(name: &str, noun: &str) -> Result<(), String> {
     if name.bytes().any(|c| c.is_ascii_uppercase()) {
         return Err(format!(
             "{noun} name '{name}' is not canonical: catalog names are stored ASCII-lowercase"
@@ -120,12 +109,9 @@ fn check_row_weights(family: SysFamily, batch: &Batch) -> Result<(), String> {
     Ok(())
 }
 
-/// A family that admits a rewrite pair takes at most one row per sign; one that
-/// admits none takes at most one row per PK. For the circuit family this is
-/// the whole batch-local contract: two `+1` rows on one `(view_id, node_id)`
-/// consolidate to weight 2, and the drop's `-1` band would leave one behind.
+/// At most one row per sign: two `+1` rows on one PK consolidate to weight 2.
 fn check_pk_multiplicity(family: SysFamily, sig: &PkSignature) -> Result<(), String> {
-    if sig.repeats_a_sign || (family.pair_change_mask().is_none() && sig.is_pair()) {
+    if sig.repeats_a_sign {
         return Err(format!(
             "system-catalog write carries more than one row for {} {}",
             family.row_noun(),
@@ -182,15 +168,18 @@ fn payload_differs(
 }
 
 /// A rewrite pair's `+1` may differ from its `-1` only in the family's declared
-/// mask. Comparing the two batch rows is equivalent to comparing the live row
-/// against the `+1`, because the CAS proved the `-1` content-equals live.
+/// mask; a family declaring none admits no pair.
 fn check_pair_fields(family: SysFamily, batch: &Batch, sig: &PkSignature) -> Result<(), String> {
     let (Some(nj), Some(pj)) = (sig.neg, sig.pos) else {
         return Ok(());
     };
-    let mask = family
-        .pair_change_mask()
-        .expect("check_pk_multiplicity rejects a pair in a family declaring no mask");
+    let Some(mask) = family.pair_change_mask() else {
+        return Err(format!(
+            "a {} admits no rewrite pair ({})",
+            family.row_noun(),
+            family.pk_label(sig.pk)
+        ));
+    };
     if payload_differs(family.schema(), mask, batch, nj, batch, pj) {
         return Err(format!(
             "a system-catalog rewrite pair on {} {} changes a field it may not",
@@ -199,6 +188,25 @@ fn check_pair_fields(family: SysFamily, batch: &Batch, sig: &PkSignature) -> Res
         ));
     }
     Ok(())
+}
+
+/// The rules a system batch must satisfy on its own, before any store is read.
+fn check_batch_shape(family: SysFamily, batch: &Batch) -> Result<Vec<PkSignature>, String> {
+    check_row_weights(family, batch)?;
+    let sigs = pk_signatures(family, batch);
+    for sig in &sigs {
+        check_pk_multiplicity(family, sig)?;
+        if family.retracts_with_owner() && sig.pos.is_none() && sig.neg.is_some() {
+            return Err(format!(
+                "a {} is retracted only with its owner ({})",
+                family.row_noun(),
+                family.pk_label(sig.pk)
+            ));
+        }
+        check_id_range(family, sig)?;
+        check_pair_fields(family, batch, sig)?;
+    }
+    Ok(sigs)
 }
 
 /// A circuit `+1` may only name a view this same transaction creates — one under
@@ -369,38 +377,17 @@ impl CatalogEngine {
         Ok(net)
     }
 
-    /// The shape rules every system row passes before its family's arm runs, in
-    /// the order each becomes checkable. `check_pk_multiplicity` is what lets the
-    /// two rules after it index `sig.neg` / `sig.pos` directly rather than
-    /// rescanning: it makes those the only rows of their sign. A family whose rows
-    /// are retracted only with their owner refuses an unpaired `-1`.
-    ///
-    /// Returns the per-PK signatures and the PKs whose net is dead — the genuine
-    /// drops, which the drop guards key on so a rename pair's net-live `-1` is
-    /// never read as one — a list only the single-column-key arms read, so it
-    /// carries the whole key rather than [`PkSignature::leading`].
+    /// [`check_batch_shape`], then the CAS and net bound per PK against the live
+    /// store. Returns the per-PK signatures and the sorted PKs whose net is dead:
+    /// the genuine drops, which a rename pair's net-live `-1` is not.
     fn check_family_contract(&self, family: SysFamily, batch: &Batch) -> Result<(Vec<PkSignature>, Vec<u64>), String> {
-        check_row_weights(family, batch)?;
-        let sigs = pk_signatures(family, batch);
+        let sigs = check_batch_shape(family, batch)?;
         let mut net_dead: Vec<u64> = Vec::new();
         for sig in &sigs {
-            check_pk_multiplicity(family, sig)?;
-            if family.retracts_with_owner() && sig.pos.is_none() && sig.neg.is_some() {
-                return Err(format!(
-                    "a {} is retracted only with its owner ({})",
-                    family.row_noun(),
-                    family.pk_label(sig.pk)
-                ));
-            }
-            check_id_range(family, sig)?;
             if self.check_cas_and_net(family, batch, sig)? <= 0 {
-                net_dead.push(sig.pk as u64);
+                net_dead.push(sig.leading);
             }
-            check_pair_fields(family, batch, sig)?;
         }
-        // Sorted so the two drop guards can `binary_search` it
-        // (`precheck_qname_unique` reads it linearly); one entry per distinct PK
-        // already, from `pk_signatures`.
         net_dead.sort_unstable();
         Ok((sigs, net_dead))
     }
@@ -711,7 +698,7 @@ impl CatalogEngine {
             // The full identifier rule, leading-`_` included. Nothing synthesizes
             // a schema name, so the reserved `_` prefix applies with no carve-out.
             validate_user_identifier(&name)?;
-            reject_non_canonical(&name, "schema")?;
+            reject_unstorable_name(&name, "schema")?;
             if self.has_schema(&name) {
                 return Err(format!("Schema already exists: {name}"));
             }
@@ -748,20 +735,14 @@ impl CatalogEngine {
         let is_table = family == SysFamily::Table;
         let mut claimed: FxHashSet<String> = FxHashSet::default();
         // Sorted for `validate_view_owner`'s probe, which runs per `+1` row.
-        let mut view_creates: Vec<u64> = if is_table {
-            Vec::new()
-        } else {
-            sigs.iter()
-                .filter(|s| s.pos.is_some() && s.neg.is_none())
-                .map(|s| s.leading)
-                .collect()
-        };
-        view_creates.sort_unstable();
-
-        for sig in sigs.iter().filter(|s| s.pos.is_some() && s.neg.is_none()) {
-            if self.registry.has_id(sig.leading) {
-                return Err(format!("relation id {} already exists", sig.leading));
-            }
+        let mut creates: Vec<u64> = sigs
+            .iter()
+            .filter(|s| s.pos.is_some() && s.neg.is_none())
+            .map(|s| s.leading)
+            .collect();
+        creates.sort_unstable();
+        if let Some(id) = creates.iter().find(|&&id| self.registry.has_id(id)) {
+            return Err(format!("relation id {id} already exists"));
         }
 
         for i in batch.live_rows() {
@@ -777,7 +758,7 @@ impl CatalogEngine {
                 // all-negative bundle sorts descending but carries no `+1` VIEW_TAB
                 // row to validate.
                 self.validate_view_options(id, v.name, v.props, v.owner_view_id)?;
-                self.validate_view_owner(id, v.name, v.owner_view_id, &view_creates)?;
+                self.validate_view_owner(id, v.name, v.owner_view_id, &creates)?;
                 (v.schema_id, v.name, v.pk, RelationKind::View(v.props), false)
             };
             check_col_defs(kind, &col_defs)

@@ -342,13 +342,9 @@ fn test_ddl_sync() {
     engine.create_schema("app").unwrap();
     assert!(engine.has_schema("app"));
 
-    // Simulate DDL sync: create batch mimicking a schema record
-    let schema = SysFamily::Schema.schema();
-    let mut bb = BatchBuilder::new(*schema);
-    bb.begin_row(100u128, 1); // sid=100
-    bb.put_string("synced");
-    bb.end_row();
-    engine.ddl_sync(gnitz_wire::SCHEMA_TAB, bb.finish()).unwrap();
+    engine
+        .ddl_sync(gnitz_wire::SCHEMA_TAB, schema_tab_batch(&[(100, "synced", 1)]))
+        .unwrap();
 
     // Hooks should have registered the schema
     assert!(engine.has_schema("synced"));
@@ -402,11 +398,9 @@ fn replayed_ddl_sync_group_is_not_replayed_after_a_flush() {
     let dir = temp_dir("catalog_ddl_sync_pin");
     let mut unreplayed = CatalogEngine::open_master(&dir, 1).unwrap();
 
-    let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
-    bb.begin_row(100u128, 1);
-    bb.put_string("synced");
-    bb.end_row();
-    unreplayed.stage(gnitz_wire::SCHEMA_TAB, 500, bb.finish()).unwrap();
+    unreplayed
+        .stage(gnitz_wire::SCHEMA_TAB, 500, schema_tab_batch(&[(100, "synced", 1)]))
+        .unwrap();
 
     unreplayed.replay().unwrap().close();
     let engine = CatalogEngine::open(&dir, 1).unwrap();

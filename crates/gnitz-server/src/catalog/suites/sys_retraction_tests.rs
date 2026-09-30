@@ -11,15 +11,6 @@ use super::*;
 use gnitz_wire::IDXTAB_PAY_NAME;
 use std::path::Path;
 
-/// A one-row SCHEMA_TAB batch (the family's only payload column is the name).
-fn schema_tab_batch(sid: u64, weight: i64, name: &str) -> Batch {
-    let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
-    bb.begin_row(sid as u128, weight);
-    bb.put_string(name);
-    bb.end_row();
-    bb.finish()
-}
-
 /// The live IDX_TAB payload for one index. Named fields rather than a tuple
 /// because these tests hand the row around and mutate one field of it, which a
 /// positional `.2` makes silently easy to get wrong.
@@ -78,7 +69,7 @@ fn stale_schema_retraction_spares_the_live_schemas_directory() {
     assert!(Path::new(&tbl_dir).exists());
 
     let err = engine
-        .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_tab_batch(old_sid, -1, "s"))
+        .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_tab_batch(&[(old_sid, "s", -1)]))
         .unwrap_err();
     assert!(
         err.contains("catalog changed concurrently"),
@@ -112,7 +103,7 @@ fn schema_retraction_under_another_schemas_name_rejected() {
     let b_dir = relation_dir(&dir, tid);
 
     let err = engine
-        .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_tab_batch(sid_a, -1, "b"))
+        .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_tab_batch(&[(sid_a, "b", -1)]))
         .unwrap_err();
     assert!(
         err.contains("catalog changed concurrently"),
@@ -283,7 +274,7 @@ fn duplicate_live_head_rejected_for_index_and_schema() {
     engine.create_schema("s").unwrap();
     let sid = engine.schema_id("s").expect("the schema exists");
     let err = engine
-        .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_tab_batch(sid, 1, "s"))
+        .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_tab_batch(&[(sid, "s", 1)]))
         .unwrap_err();
     assert!(
         err.contains("net weight 2"),

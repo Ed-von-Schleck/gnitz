@@ -2,7 +2,7 @@ mod alter_tests;
 mod atomicity_tests;
 mod compound_pk_smoke;
 mod ddl_fixture;
-use ddl_fixture::{make_secondary_index_name, parse_qualified_name};
+use ddl_fixture::make_secondary_index_name;
 use gnitz_expr::SchemaFacts;
 mod ddl_tests;
 mod dir_deletion_tests;
@@ -71,9 +71,9 @@ fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> std::rc::
 
 use crate::test_support::{
     col_def, col_tab_batch, equi_join_circuit, fk_def, idx_tab_batch, negate_chain, nullable_def, opk_pk,
-    pk_payload_schema, push_table_tab_row, push_view_tab_row, register_identity_view, scratch_dir, seek_by_index,
-    seek_by_index_range, sum_weights, try_register_identity_view, try_register_view, uuid_def, write_circuit,
-    write_identity_circuit, LocalDrive,
+    pk_payload_schema, push_table_tab_row, push_view_tab_row, register_identity_view, schema_tab_batch, scratch_dir,
+    seek_by_index, seek_by_index_range, sum_weights, try_register_identity_view, try_register_view, uuid_def,
+    write_circuit, write_identity_circuit, LocalDrive,
 };
 
 /// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table

@@ -3,37 +3,6 @@ use gnitz_expr::{ColumnTable, SchemaFacts};
 use gnitz_wire::{ColumnDef, COLTAB_PAY_NAME};
 use std::collections::HashMap;
 
-// ── test_identifiers ─────────────────────────────────────────────────
-
-#[test]
-fn test_identifiers() {
-    // Valid names
-    for name in &["orders", "Orders123", "my_table", "a", "A1_b2", "1a", "99_problems"] {
-        assert!(validate_user_identifier(name).is_ok(), "Rejected valid: {name}");
-    }
-    // Invalid names
-    for name in &[
-        "_private",
-        "_",
-        "_system",
-        "__init__",
-        "",
-        "has space",
-        "has-dash",
-        "has.dot",
-        "has@",
-        "table$",
-    ] {
-        assert!(validate_user_identifier(name).is_err(), "Accepted invalid: {name}");
-    }
-    // Qualified name parsing
-    assert_eq!(parse_qualified_name("orders", "public"), ("public", "orders"));
-    assert_eq!(parse_qualified_name("sales.orders", "public"), ("sales", "orders"));
-    // Boundary slicing
-    assert_eq!(parse_qualified_name(".table", "def"), ("", "table"));
-    assert_eq!(parse_qualified_name("schema.", "def"), ("schema", ""));
-}
-
 // ── test_bootstrap ───────────────────────────────────────────────────
 
 #[test]

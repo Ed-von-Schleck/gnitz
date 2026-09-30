@@ -432,7 +432,7 @@ pub fn canonical_identifier(name: &str) -> Result<String, String> {
 /// The canonical `"schema.relation"` key, from names **already canonical**.
 ///
 /// It must not fold: a mixed-case name that slipped past the engine's
-/// `reject_non_canonical` would then key the cache while mismatching the store,
+/// `reject_unstorable_name` would then key the cache while mismatching the store,
 /// turning a loud rejection into silent divergence. `.` is outside
 /// [`is_valid_ident_char`], so no pair can produce another pair's key.
 pub fn qualified_key(schema_name: &str, name: &str) -> String {

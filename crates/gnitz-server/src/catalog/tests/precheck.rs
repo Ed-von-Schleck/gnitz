@@ -1,15 +1,10 @@
-//! The name rules and the per-PK family contract — the two halves of the
-//! precheck that are a property of a row's shape, independent of what the row
-//! means. Each rule of [`CatalogEngine::check_family_contract`] is driven on its
-//! own, and on a family whose declared facts make it the rule that fires.
+//! The name rules and [`check_batch_shape`], each rule driven on a family whose
+//! declared facts make it the one that fires.
 
 use super::*;
-use crate::test_support::{col_def, push_table_tab_row, scratch_dir};
-use gnitz_wire::pack_pk_cols;
-use gnitz_wire::sys_rows::{write_circuit_node_row, write_idx_tab_row, write_schema_tab_row};
-use gnitz_wire::sys_rows::{CircuitNodeRow, IdxTabRow, SchemaTabRow};
-use gnitz_wire::TypeCode;
-use std::fs;
+use crate::test_support::{col_def, idx_tab_batch, push_table_tab_row, push_view_tab_row, schema_tab_batch};
+use gnitz_wire::sys_rows::{write_circuit_node_row, CircuitNodeRow};
+use gnitz_wire::{pack_pk_cols, IndexProps, TypeCode};
 
 // ── The name rules ──────────────────────────────────────────────────────────
 
@@ -22,53 +17,15 @@ fn an_unstorable_name_is_rejected_and_a_leading_underscore_is_not() {
         ("a/b", "invalid characters"),
         ("MixedCase", "not canonical"),
     ] {
-        let err = reject_unstorable_name(name, "table").expect_err("{name} must be refused");
+        let err = reject_unstorable_name(name, "table").unwrap_err();
         assert!(err.contains(fragment), "name {name:?} gave: {err}");
     }
-    // The engine's rule is deliberately weaker than the client's identifier
-    // policy: it must accept the internal names the planner and the FK hook
-    // mint, all of which lead with `_`.
-    reject_unstorable_name("_foo", "table").unwrap();
-    reject_unstorable_name("_seg4096", "view").unwrap();
-    reject_unstorable_name("_fk_16_1", "index").unwrap();
-}
-
-#[test]
-fn only_an_ascii_uppercase_byte_makes_a_name_non_canonical() {
-    reject_non_canonical("a_b_9", "schema").unwrap();
-    reject_non_canonical("_", "schema").unwrap();
-    assert!(reject_non_canonical("aB", "schema").is_err());
-}
-
-// ── Contract fixtures ───────────────────────────────────────────────────────
-
-/// A SCHEMA_TAB batch of `(schema_id, name, weight)` rows.
-fn schema_batch(rows: &[(u64, &str, i64)]) -> Batch {
-    let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
-    for &(schema_id, name, weight) in rows {
-        write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id, name }, weight);
+    for name in ["_", "_foo", "_seg4096", "_fk_16_1", "a_b_9"] {
+        reject_unstorable_name(name, "table").unwrap();
     }
-    bb.finish()
 }
 
-/// An IDX_TAB batch of `(index_id, weight)` rows over one owner and column.
-fn idx_batch(rows: &[(u64, i64)]) -> Batch {
-    let mut bb = BatchBuilder::new(*SysFamily::Index.schema());
-    for &(index_id, weight) in rows {
-        write_idx_tab_row(
-            &mut bb,
-            &IdxTabRow {
-                index_id,
-                owner_id: 16,
-                source_col_idx: gnitz_wire::pack_pk_cols(&[1]),
-                name: "ix",
-                flags: 0,
-            },
-            weight,
-        );
-    }
-    bb.finish()
-}
+// ── Fixtures ────────────────────────────────────────────────────────────────
 
 /// A CIRCUIT_NODES batch of `(view_id, node_id, weight)` rows.
 fn circuit_batch(rows: &[(u64, u64, i64)]) -> Batch {
@@ -90,269 +47,150 @@ fn circuit_batch(rows: &[(u64, u64, i64)]) -> Batch {
     bb.finish()
 }
 
-/// A one-row SEQ_TAB batch.
-fn seq_batch(seq_id: u64, value: u64, weight: i64) -> Batch {
-    let mut bb = BatchBuilder::new(*SysFamily::Sequence.schema());
-    bb.begin_row(seq_id as u128, weight);
-    bb.put_u64(value);
-    bb.end_row();
+/// A TABLE_TAB batch of `(table_id, schema_id, name, weight)` rows.
+fn table_batch(rows: &[(u64, u64, &str, i64)]) -> Batch {
+    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
+    for &(tid, sid, name, weight) in rows {
+        push_table_tab_row(
+            &mut bb,
+            tid,
+            sid,
+            name,
+            pack_pk_cols(&[0]),
+            gnitz_wire::TableProps::default().pack(),
+            weight,
+        );
+    }
     bb.finish()
 }
 
-/// A TABLE_TAB row reproducing what `create_table` writes for `tid` — so a `-1`
-/// built from it satisfies the CAS and a `+1` differs only where the test says.
-fn table_row(bb: &mut BatchBuilder, tid: u64, sid: u64, name: &str, weight: i64) {
-    push_table_tab_row(
-        bb,
-        tid,
-        sid,
-        name,
-        pack_pk_cols(&[0]),
-        gnitz_wire::TableProps::default().pack(),
-        weight,
-    );
+fn index_batch(index_id: u64, weight: i64) -> Batch {
+    idx_tab_batch(index_id, 16, pack_pk_cols(&[1]), "ix", IndexProps::default(), weight)
 }
 
-fn open(name: &str) -> (CatalogEngine, String) {
-    let dir = scratch_dir("catalog", name);
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
-    (engine, dir)
+fn shape_err(family: SysFamily, batch: &Batch) -> String {
+    check_batch_shape(family, batch)
+        .err()
+        .expect("the shape rules must reject this batch")
 }
 
-fn contract_err(engine: &CatalogEngine, family: SysFamily, batch: &Batch) -> String {
-    match engine.check_family_contract(family, batch) {
-        Ok(_) => panic!("the contract must reject this batch"),
-        Err(e) => e,
-    }
-}
+// ── Row weights ─────────────────────────────────────────────────────────────
 
-// ── Rules 1 and 2: the weight of every row ──────────────────────────────────
-
-#[test]
-fn a_zero_weight_row_is_not_a_zset_element() {
-    let (engine, dir) = open("precheck_zero_weight");
-    let err = contract_err(&engine, SysFamily::Schema, &schema_batch(&[(20, "s", 0)]));
-    assert!(err.contains("zero-weight"), "{err}");
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// A system store runs no `enforce_unique_pk`, so a weight outside `{0, 1}` is a
-/// duplicate live head or a persistent negative ghost.
 #[test]
 fn a_system_row_may_only_be_written_at_weight_one() {
-    let (engine, dir) = open("precheck_weight_one");
-    for w in [2i64, -2, i64::MIN] {
-        let err = contract_err(&engine, SysFamily::Schema, &schema_batch(&[(20, "s", w)]));
-        assert!(err.contains(&format!("at weight {w}")), "w={w}: {err}");
+    check_batch_shape(SysFamily::Schema, &schema_tab_batch(&[(20, "s", 1)])).unwrap();
+    for w in [0i64, 2, -2, i64::MIN] {
+        shape_err(SysFamily::Schema, &schema_tab_batch(&[(20, "s", w)]));
     }
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
 }
 
-// ── Rule 3: per-PK multiplicity ─────────────────────────────────────────────
+// ── Per-PK multiplicity ─────────────────────────────────────────────────────
 
-/// A pair-capable family takes at most one row per sign.
 #[test]
-fn a_repeated_sign_on_one_pk_is_rejected_for_a_pair_capable_family() {
-    let (mut engine, dir) = open("precheck_repeat_sign");
-    let cols = vec![col_def("id", TypeCode::U64)];
-    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-
-    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-    table_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "a", 1);
-    table_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "b", 1);
-    let err = contract_err(&engine, SysFamily::Table, &bb.finish());
-    assert!(err.contains("more than one row for table"), "{err}");
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+fn a_repeated_sign_on_one_pk_is_rejected() {
+    for (family, batch) in [
+        (
+            SysFamily::Table,
+            table_batch(&[(20, PUBLIC_SCHEMA_ID, "a", 1), (20, PUBLIC_SCHEMA_ID, "b", 1)]),
+        ),
+        (SysFamily::CircuitNodes, circuit_batch(&[(20, 0, 1), (20, 0, 1)])),
+    ] {
+        let err = shape_err(family, &batch);
+        assert!(err.contains("more than one row"), "{family:?}: {err}");
+    }
 }
 
-/// A family declaring no pair mask takes at most one row per PK, whatever the
-/// signs: neither SCHEMA_TAB nor IDX_TAB has a rename surface.
-#[test]
-fn a_rewrite_pair_is_rejected_for_a_family_with_no_pair_mask() {
-    let (engine, dir) = open("precheck_no_pair");
-    let err = contract_err(
-        &engine,
-        SysFamily::Schema,
-        &schema_batch(&[(20, "s", -1), (20, "s2", 1)]),
-    );
-    assert!(err.contains("more than one row for schema"), "{err}");
-    let err = contract_err(&engine, SysFamily::Index, &idx_batch(&[(7, -1), (7, 1)]));
-    assert!(err.contains("more than one row for index"), "{err}");
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// Two `+1` rows on one `(view_id, node_id)` consolidate to weight 2, and the
-/// drop's `-1` band would leave one behind, so rule 3 is the circuit family's
-/// whole batch-local contract.
-#[test]
-fn a_duplicate_circuit_key_is_rejected_and_a_distinct_one_is_not() {
-    let (engine, dir) = open("precheck_circuit_dup");
-    let err = contract_err(
-        &engine,
-        SysFamily::CircuitNodes,
-        &circuit_batch(&[(20, 0, 1), (20, 0, 1)]),
-    );
-    assert!(err.contains("more than one row for circuit row"), "{err}");
-    assert!(err.contains("view 20 node 0"), "the message names both halves: {err}");
-
-    // Two nodes of one view are distinct keys; that their view exists is the
-    // bundle guard's rule.
-    engine
-        .check_family_contract(SysFamily::CircuitNodes, &circuit_batch(&[(20, 0, 1), (20, 1, 1)]))
-        .unwrap();
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// Circuit and column rows leave only as their owner's band, which the drop cascade
-/// applies without the precheck, so a client `-1` for one is always a forgery.
 #[test]
 fn a_row_retracted_only_with_its_owner_refuses_an_unpaired_retraction() {
-    let (engine, dir) = open("precheck_owner_retraction");
-    let err = contract_err(&engine, SysFamily::CircuitNodes, &circuit_batch(&[(20, 0, -1)]));
+    let err = shape_err(SysFamily::CircuitNodes, &circuit_batch(&[(20, 0, -1)]));
     assert!(err.contains("retracted only with its owner"), "{err}");
-    assert!(err.contains("view 20 node 0"), "{err}");
 
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
     col_def("v", TypeCode::U64).write_col_tab_row(&mut bb, 300, 1, -1);
-    let err = contract_err(&engine, SysFamily::Column, &bb.finish());
+    let err = shape_err(SysFamily::Column, &bb.finish());
     assert!(err.contains("retracted only with its owner"), "{err}");
     assert!(err.contains("column 1 of owner 300"), "{err}");
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
 }
 
-// ── Rule 4: the id range ────────────────────────────────────────────────────
+// ── The id range ────────────────────────────────────────────────────────────
 
-/// The floor is a property of the id space, not of the mutation's shape, so it
-/// covers every sign and every family that declares one.
 #[test]
 fn an_id_below_a_familys_first_user_id_is_rejected_whatever_its_sign() {
-    let (engine, dir) = open("precheck_id_floor");
-
     for w in [1i64, -1] {
-        let err = contract_err(
-            &engine,
+        let err = shape_err(
             SysFamily::Schema,
-            &schema_batch(&[(SYSTEM_SCHEMA_ID, "_system", w)]),
+            &schema_tab_batch(&[(SYSTEM_SCHEMA_ID, "_system", w)]),
         );
         assert!(err.contains("a system schema"), "w={w}: {err}");
     }
 
-    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-    table_row(&mut bb, gnitz_wire::IDX_TAB, SYSTEM_SCHEMA_ID, "_indices", 1);
-    let err = contract_err(&engine, SysFamily::Table, &bb.finish());
+    let err = shape_err(
+        SysFamily::Table,
+        &table_batch(&[(gnitz_wire::IDX_TAB, SYSTEM_SCHEMA_ID, "_indices", 1)]),
+    );
     assert!(err.contains("a system table"), "{err}");
 
-    let err = contract_err(&engine, SysFamily::Index, &idx_batch(&[(0, 1)]));
+    let err = shape_err(SysFamily::Index, &index_batch(0, 1));
     assert!(err.contains("a system index"), "{err}");
 
-    // A user SERIAL sequence is keyed by its table id; the catalog's own
-    // counters live below that floor.
-    let err = contract_err(&engine, SysFamily::Sequence, &seq_batch(SEQ_ID_NEXT_ID, 99, 1));
+    let mut bb = BatchBuilder::new(*SysFamily::Sequence.schema());
+    bb.begin_row(SEQ_ID_NEXT_ID as u128, 1);
+    bb.put_u64(99);
+    bb.end_row();
+    let err = shape_err(SysFamily::Sequence, &bb.finish());
     assert!(err.contains("a system sequence"), "{err}");
 
-    // COL_TAB packs the owner into its PK, so its floor is the packed word —
-    // and the message renders both halves rather than that word.
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
     col_def("id", TypeCode::U64).write_col_tab_row(&mut bb, gnitz_wire::IDX_TAB, 0, 1);
-    let err = contract_err(&engine, SysFamily::Column, &bb.finish());
+    let err = shape_err(SysFamily::Column, &bb.finish());
     assert!(err.contains("a system column"), "{err}");
     assert!(
         err.contains(&format!("column 0 of owner {}", gnitz_wire::IDX_TAB)),
         "{err}"
     );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
 }
 
-/// The ceiling runs where an id ENTERS a catalog namespace.
 #[test]
 fn an_id_at_or_above_a_familys_ceiling_is_rejected() {
-    let (engine, dir) = open("precheck_id_ceiling");
     let ceiling = gnitz_wire::CATALOG_ID_CEILING;
+    check_batch_shape(SysFamily::Schema, &schema_tab_batch(&[(ceiling - 1, "s", 1)])).unwrap();
 
-    for id in [ceiling, ceiling + 4096] {
-        let err = contract_err(&engine, SysFamily::Schema, &schema_batch(&[(id, "s", 1)]));
-        assert!(err.contains("id ceiling"), "schema {id}: {err}");
-
-        let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-        table_row(&mut bb, id, PUBLIC_SCHEMA_ID, "t", 1);
-        let err = contract_err(&engine, SysFamily::Table, &bb.finish());
-        assert!(err.contains("id ceiling"), "table {id}: {err}");
-
-        let err = contract_err(&engine, SysFamily::Index, &idx_batch(&[(id, 1)]));
-        assert!(err.contains("id ceiling"), "index {id}: {err}");
+    let mut view = BatchBuilder::new(*SysFamily::View.schema());
+    push_view_tab_row(&mut view, 1, ceiling, "v", 0, 0, 0);
+    for (family, batch) in [
+        (SysFamily::Schema, schema_tab_batch(&[(ceiling, "s", 1)])),
+        (SysFamily::Table, table_batch(&[(ceiling, PUBLIC_SCHEMA_ID, "t", 1)])),
+        (SysFamily::View, view.finish()),
+        (SysFamily::Index, index_batch(ceiling, 1)),
+    ] {
+        let err = shape_err(family, &batch);
+        assert!(err.contains("id ceiling"), "{family:?}: {err}");
     }
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
 }
 
-// ── Rule 5: the CAS and the per-PK net bound ────────────────────────────────
-
-#[test]
-fn a_retraction_needs_a_live_row_that_content_equals_it() {
-    let (mut engine, dir) = open("precheck_cas");
-    engine
-        .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_batch(&[(20, "live", 1)]))
-        .unwrap();
-
-    let err = contract_err(&engine, SysFamily::Schema, &schema_batch(&[(21, "absent", -1)]));
-    assert!(err.contains("no longer exists"), "{err}");
-
-    let err = contract_err(&engine, SysFamily::Schema, &schema_batch(&[(20, "stale", -1)]));
-    assert!(err.contains("differs from the current one"), "{err}");
-
-    engine
-        .check_family_contract(SysFamily::Schema, &schema_batch(&[(20, "live", -1)]))
-        .unwrap();
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// The sys stores run no `enforce_unique_pk`, so this bound is the only thing
-/// stopping a duplicate live head or a persistent negative ghost.
-#[test]
-fn a_write_may_not_leave_a_pk_outside_net_weight_zero_or_one() {
-    let (mut engine, dir) = open("precheck_net");
-    engine
-        .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_batch(&[(20, "live", 1)]))
-        .unwrap();
-
-    let err = contract_err(&engine, SysFamily::Schema, &schema_batch(&[(20, "live", 1)]));
-    assert!(err.contains("net weight 2"), "{err}");
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── Rule 6: what a rewrite pair may change ──────────────────────────────────
+// ── What a rewrite pair may change ──────────────────────────────────────────
 
 #[test]
 fn a_rewrite_pair_may_change_only_the_fields_its_family_declares() {
-    let (mut engine, dir) = open("precheck_pair_mask");
-    let cols = vec![col_def("id", TypeCode::U64)];
-    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    check_batch_shape(
+        SysFamily::Table,
+        &table_batch(&[(20, PUBLIC_SCHEMA_ID, "t", -1), (20, PUBLIC_SCHEMA_ID, "t2", 1)]),
+    )
+    .unwrap();
 
-    // A rename is the whole of TABLE_TAB's mask, so it passes.
-    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-    table_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "t", -1);
-    table_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "t2", 1);
-    engine.check_family_contract(SysFamily::Table, &bb.finish()).unwrap();
-
-    // Re-homing the relation into another schema is not.
-    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-    table_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "t", -1);
-    table_row(&mut bb, tid, SYSTEM_SCHEMA_ID, "t", 1);
-    let err = contract_err(&engine, SysFamily::Table, &bb.finish());
+    let err = shape_err(
+        SysFamily::Table,
+        &table_batch(&[(20, PUBLIC_SCHEMA_ID, "t", -1), (20, SYSTEM_SCHEMA_ID, "t", 1)]),
+    );
     assert!(err.contains("changes a field it may not"), "{err}");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    let mut index_pair = index_batch(20, -1);
+    index_pair.append_batch(&index_batch(20, 1));
+    for (family, batch) in [
+        (SysFamily::Schema, schema_tab_batch(&[(20, "s", -1), (20, "s", 1)])),
+        (SysFamily::Index, index_pair),
+    ] {
+        let err = shape_err(family, &batch);
+        assert!(err.contains("admits no rewrite pair"), "{family:?}: {err}");
+    }
 }

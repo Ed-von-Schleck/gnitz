@@ -215,10 +215,7 @@ pub(crate) fn write_col_tab_rows(bb: &mut BatchBuilder, owner_id: u64, defs: &[C
 }
 
 /// What one delta does to one PK: where its `-1` and `+1` rows are, and the
-/// summed weight. A PK carrying both signs is a **rewrite pair** (a rename) —
-/// the shape the sign-partition and the net-live gates key on. This is the
-/// one decoding of that shape; every
-/// precheck guard and pair-sensitive hook reads it instead of rescanning.
+/// summed weight. A PK carrying both signs is a **rewrite pair** (a rename).
 pub(super) struct PkSignature {
     pub(super) pk: u128,
     /// [`SysFamily::leading_id`] of `pk`, so no consumer re-derives it.
@@ -228,7 +225,7 @@ pub(super) struct PkSignature {
     /// First `-1` / `+1` row index for this PK.
     pub(super) neg: Option<usize>,
     pub(super) pos: Option<usize>,
-    /// A sign occurs on more than one row (never legitimate for COL_TAB).
+    /// A sign occurs on more than one row.
     pub(super) repeats_a_sign: bool,
     pub(super) sum: i64,
 }
