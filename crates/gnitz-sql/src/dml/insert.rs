@@ -238,9 +238,6 @@ pub(crate) fn execute_insert(
             // a column the list left out is NULL too.
             let cell = slot_of[ci].map_or(&null, |s| &cells[s]);
             let is_null = matches!(cell, BExpr::LitNull);
-            // The check is here for the *conflicting* row of an ON CONFLICT DO
-            // UPDATE: its incoming NULL is consumed into the merged row and is
-            // never pushed, so the wire boundary's own check never sees it.
             check_not_null(col_def, is_null)?;
             if is_null {
                 gnitz_wire::null_word_set(&mut null_bits, payload_idx, true);

@@ -177,14 +177,12 @@ fn a_cast_types_as_its_register_or_its_range_checked_target() {
     assert_eq!(cast(ColType::decimal(3)), ColType::decimal(3));
 }
 
-/// A temporal literal types as its temporal type, spells its storage integer,
-/// and is never NULL.
+/// A temporal literal types as its temporal type and is never NULL.
 #[test]
 fn a_temporal_literal_is_a_typed_non_null_integer() {
     let s = schema(&[TypeCode::U64]);
     let date = BoundExpr::LitTemporal { tc: TypeCode::Date, v: 18262 };
     assert_eq!(date.infer_ty(&s.columns), TypeCode::Date.into());
-    assert_eq!(date.int_literal(), Some(18262));
     assert!(date.never_null_with(&|_: &usize| true));
 }
 

@@ -27,7 +27,8 @@ pub fn rescale(v: i128, from: u8, to: u8) -> Option<i64> {
 
 /// The digits and scale a plain decimal spelling carries — an optional sign,
 /// digits, an optional fraction — as `(unscaled, scale)`. `None` for anything
-/// else, an exponent included, and for more than 38 digits.
+/// else, an exponent included, for a value past `i128`, and for more than 38
+/// fractional digits.
 pub fn parse_decimal_text(s: &str) -> Option<(i128, u8)> {
     let (neg, body) = match s.as_bytes().first()? {
         b'-' => (true, &s[1..]),
@@ -35,12 +36,12 @@ pub fn parse_decimal_text(s: &str) -> Option<(i128, u8)> {
         _ => (false, s),
     };
     let (int, frac) = body.split_once('.').unwrap_or((body, ""));
-    if int.is_empty() && frac.is_empty() || int.len() + frac.len() > 38 {
+    if int.is_empty() && frac.is_empty() || frac.len() > 38 {
         return None;
     }
     let mut v: i128 = 0;
     for b in int.bytes().chain(frac.bytes()) {
-        v = v * 10 + (b as char).to_digit(10)? as i128;
+        v = v.checked_mul(10)?.checked_add((b as char).to_digit(10)?.into())?;
     }
     Some((if neg { -v } else { v }, frac.len() as u8))
 }

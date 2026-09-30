@@ -1,5 +1,5 @@
 use super::*;
-use crate::codec::project_schema::{reply_program, ProjItem};
+use crate::codec::project_schema::reply_program;
 use crate::test_support::{col, ncol, parse_expr_sql};
 use gnitz_core::BatchAppender;
 use gnitz_expr::{payload_is_null, payload_string, payload_u64};
@@ -23,16 +23,16 @@ fn source() -> Schema {
 
 /// The reply map of the SELECT list `sql` over [`source`]: the hidden key, then the items.
 fn map_of(src: &Schema, sql: &[&str]) -> ClientMap {
-    let (items, cols): (Vec<ProjItem>, Vec<ColumnDef>) = sql
+    let payload: Vec<_> = sql
         .iter()
         .enumerate()
         .map(|(i, e)| {
             let bound = crate::bind::bind_single_table(&parse_expr_sql(e), src, "t").unwrap();
             let def = ColumnDef::new(format!("c{i}"), bound.infer_ty(&src.columns).tc, true);
-            (ProjItem::from_bound(bound), def)
+            (bound, def)
         })
-        .unzip();
-    let (out, program) = reply_program(&items, cols, src).unwrap();
+        .collect();
+    let (out, program) = reply_program(payload, src).unwrap();
     ClientMap::new(program, src, Arc::new(out)).unwrap()
 }
 

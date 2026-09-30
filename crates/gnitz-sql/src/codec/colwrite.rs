@@ -20,64 +20,21 @@ pub(crate) fn append_value_to_col<R>(
     lit: &BExpr<R>,
 ) -> Result<(), GnitzSqlError> {
     let tc = def.ty.tc;
-    let refuse = |m: &str| Err(GnitzSqlError::Rejected(format!("column '{}': {m}", def.name)));
-    // NULL is the one value every column type encodes alike: a zeroed cell of
-    // the type's own stride, with the null bit set by the caller.
-    if matches!(lit, BExpr::LitNull) {
-        push_zero_cell(col, tc);
-        return Ok(());
-    }
-    match tc {
-        TypeCode::F32 | TypeCode::F64 => {
-            let Some(v) = float_value(lit) else {
-                return refuse("string literal for non-string column");
-            };
-            // F32 rounds through binary64, as `ZSetBatch::append` does for a
-            // Python float, so the two ingest paths agree bit for bit.
-            match tc {
-                TypeCode::F32 => col.extend_from_slice(&(v as f32).to_le_bytes()),
-                _ => col.extend_from_slice(&v.to_le_bytes()),
-            }
-            Ok(())
+    match (lit, tc) {
+        // NULL is the one value every column type encodes alike: a zeroed cell
+        // of the type's own stride, with the null bit set by the caller.
+        (BExpr::LitNull, _) => push_zero_cell(col, tc),
+        (BExpr::LitStr(s), TypeCode::String) => {
+            col.extend_from_slice(&gnitz_wire::encode_german_string(s.as_bytes(), blob))
         }
-        TypeCode::String => match lit {
-            BExpr::LitStr(s) => {
-                col.extend_from_slice(&gnitz_wire::encode_german_string(s.as_bytes(), blob));
-                Ok(())
-            }
-            _ => refuse("number literal for string column"),
-        },
-        // A BLOB column is *not* text-writable: it takes bytes, and a written
-        // literal spells none.
-        TypeCode::Blob => match lit {
-            BExpr::LitStr(_) => refuse("string literal for non-string column"),
-            _ => refuse("number literal for blob column"),
-        },
-        _ => {
-            let v = native_value(lit, def)?;
-            col.extend_from_slice(&v.to_le_bytes()[..tc.wire_stride()]);
-            Ok(())
-        }
+        _ => col.extend_from_slice(&native_value(lit, def)?.to_le_bytes()[..tc.wire_stride()]),
     }
+    Ok(())
 }
 
-/// A literal as the native image of a column stored as an integer.
+/// A literal as the native image of a column's cell, refused naming the column.
 pub(crate) fn native_value<R>(lit: &BExpr<R>, def: &ColumnDef) -> Result<u128, GnitzSqlError> {
     assign(lit, def.ty).map_err(|m| GnitzSqlError::Rejected(format!("column '{}': {m}", def.name)))
-}
-
-/// A float column's value; `None` for a string. A magnitude past `i128` is
-/// included, which a DOUBLE holds and no integer parse would.
-fn float_value<R>(lit: &BExpr<R>) -> Option<f64> {
-    if let Some(v) = lit.int_literal() {
-        return Some(v as f64);
-    }
-    match lit {
-        BExpr::LitFloat { v, .. } => Some(*v),
-        BExpr::LitWide(n) if n.neg => Some(-(n.mag as f64)),
-        BExpr::LitWide(n) => Some(n.mag as f64),
-        _ => None,
-    }
 }
 
 /// Reject a NULL destined for a NOT NULL column, naming it.

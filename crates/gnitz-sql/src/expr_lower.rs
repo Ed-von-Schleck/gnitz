@@ -6,7 +6,7 @@
 //! projection expression it emits.
 
 use crate::bind::structural::str_func_name;
-use crate::codec::literal::{assign, invalid_literal, place, Placed};
+use crate::codec::literal::{assign, invalid_literal, place, Compared, Placed};
 use crate::error::GnitzSqlError;
 use crate::ir::{
     blend_type, decimal_compute_type, operand_ty_pair, operand_tys, temporal_arith_type, BExpr, BinOp, BoundExpr,
@@ -722,18 +722,10 @@ impl OpcodeBackend<'_> {
             return Ok(None);
         }
         let c = self.lower_int_operand(other, ty)?;
-        let int = |v: u128| fi.unpack(v);
-        // `c = c` / `c <> c`: true / false on every row, NULL on a NULL one.
-        let always = |holds: bool| (if holds { CmpOp::Eq } else { CmpOp::Ne }, None);
-        let (op, k) = match p {
-            Placed::At(v) => (cmp, Some(int(v))),
-            Placed::Between { lo, hi, .. } => match cmp {
-                CmpOp::Eq | CmpOp::Ne => always(cmp == CmpOp::Ne),
-                CmpOp::Lt | CmpOp::Ge => (cmp, Some(int(hi))),
-                CmpOp::Gt | CmpOp::Le => (cmp, Some(int(lo))),
-            },
-            Placed::Below { .. } => always(matches!(cmp, CmpOp::Ne | CmpOp::Gt | CmpOp::Ge)),
-            Placed::Above { .. } => always(matches!(cmp, CmpOp::Ne | CmpOp::Lt | CmpOp::Le)),
+        let (op, k) = match p.compare(cmp) {
+            Compared::Cmp(op, v) => (op, Some(fi.unpack(v))),
+            // `c = c` / `c <> c`: true / false on every row, NULL on a NULL one.
+            Compared::Always(holds) => (if holds { CmpOp::Eq } else { CmpOp::Ne }, None),
         };
         let b = match k {
             Some(val) => self.eb.emit(L::LoadConst { val, unsigned: fi == FixedInt::U64 }),

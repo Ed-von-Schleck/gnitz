@@ -1,7 +1,6 @@
 use super::*;
 use crate::test_support::{
-    col, compound_schema_u64_u64, extract_pk_value, ncol, neg_num_expr, num_expr, parse_expr_sql, pk_schema, two_col,
-    uuid_schema_pk, uuid_str_expr,
+    col, compound_schema_u64_u64, extract_pk_value, ncol, parse_expr_sql, pk_schema, two_col, uuid_schema_pk,
 };
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::TypeCode;
@@ -127,7 +126,7 @@ fn compound_schema_u64_u64_u128() -> Schema {
 #[test]
 fn test_uuid_pk_string_literal_accepted() {
     let schema = uuid_schema_pk();
-    let row = vec![uuid_str_expr("550e8400-e29b-41d4-a716-446655440000")];
+    let row = vec![parse_expr_sql("'550e8400-e29b-41d4-a716-446655440000'")];
     let pk = extract_pk_value(&row, &schema).unwrap();
     assert_eq!(pk, schema.opk_key_cols(&[0x550e8400_e29b_41d4_a716_446655440000_u128]));
 }
@@ -135,7 +134,7 @@ fn test_uuid_pk_string_literal_accepted() {
 #[test]
 fn compound_pk_extract_pk_value_packs_opk_bytes() {
     let schema = compound_schema_u64_u64();
-    let row = vec![num_expr("1"), num_expr("2"), num_expr("99")];
+    let row = vec![parse_expr_sql("1"), parse_expr_sql("2"), parse_expr_sql("99")];
     let pk = extract_pk_value(&row, &schema).unwrap();
     assert_eq!(pk.width(), 16);
     let mut expect = [0u8; 16];
@@ -147,7 +146,12 @@ fn compound_pk_extract_pk_value_packs_opk_bytes() {
 #[test]
 fn compound_pk_extract_pk_value_wide_region() {
     let schema = compound_schema_u64_u64_u128();
-    let row = vec![num_expr("1"), num_expr("2"), num_expr("3"), num_expr("99")];
+    let row = vec![
+        parse_expr_sql("1"),
+        parse_expr_sql("2"),
+        parse_expr_sql("3"),
+        parse_expr_sql("99"),
+    ];
     let pk = extract_pk_value(&row, &schema).unwrap();
     // pk_stride = 8 + 8 + 16 = 32 → wide-region path.
     assert_eq!(pk.width(), 32);
@@ -161,7 +165,7 @@ fn compound_pk_extract_pk_value_wide_region() {
 #[test]
 fn extract_pk_value_u64_rejects_negative() {
     let schema = pk_schema(TypeCode::U64);
-    let row = vec![neg_num_expr("1"), num_expr("0")];
+    let row = vec![parse_expr_sql("-1"), parse_expr_sql("0")];
     let err = extract_pk_value(&row, &schema).expect_err("U64 PK must reject negative literal");
     let m = err.to_string();
     assert!(m.contains("out of range") && m.contains("'id'"), "error: {m}");
@@ -170,7 +174,7 @@ fn extract_pk_value_u64_rejects_negative() {
 #[test]
 fn extract_pk_value_u128_rejects_negative() {
     let schema = pk_schema(TypeCode::U128);
-    let row = vec![neg_num_expr("1"), num_expr("0")];
+    let row = vec![parse_expr_sql("-1"), parse_expr_sql("0")];
     assert!(extract_pk_value(&row, &schema).is_err());
 }
 
@@ -179,7 +183,7 @@ fn extract_pk_value_u128_rejects_negative() {
 #[test]
 fn an_invalid_uuid_pk_string_names_the_column() {
     let schema = uuid_schema_pk();
-    let row = vec![uuid_str_expr("not-a-uuid")];
+    let row = vec![parse_expr_sql("'not-a-uuid'")];
     let err = extract_pk_value(&row, &schema).expect_err("an invalid UUID PK literal must be rejected");
     let m = err.to_string();
     assert!(m.contains("invalid UUID") && m.contains("'id'"), "error: {m}");
@@ -190,7 +194,7 @@ fn an_invalid_uuid_pk_string_names_the_column() {
 fn negative_zero_is_accepted_by_an_unsigned_wide_pk() {
     for tc in [TypeCode::U128, TypeCode::UUID] {
         let schema = pk_schema(tc);
-        let row = vec![neg_num_expr("0"), num_expr("0")];
+        let row = vec![parse_expr_sql("-0"), parse_expr_sql("0")];
         let pk = extract_pk_value(&row, &schema).unwrap_or_else(|e| panic!("{tc:?}: {e}"));
         assert_eq!(pk, schema.opk_key_cols(&[0]), "{tc:?}");
     }
@@ -200,7 +204,7 @@ fn negative_zero_is_accepted_by_an_unsigned_wide_pk() {
 #[test]
 fn a_null_pk_cell_violates_not_null() {
     let schema = pk_schema(TypeCode::I64);
-    let err = extract_pk_value(&[parse_expr_sql("NULL"), num_expr("0")], &schema).unwrap_err();
+    let err = extract_pk_value(&[parse_expr_sql("NULL"), parse_expr_sql("0")], &schema).unwrap_err();
     assert!(err.to_string().contains("violates NOT NULL"), "error: {err}");
 }
 

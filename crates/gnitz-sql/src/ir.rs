@@ -268,10 +268,6 @@ pub(crate) struct NumLit {
 }
 
 impl NumLit {
-    pub(crate) fn of_i128(v: i128) -> Self {
-        NumLit { mag: v.unsigned_abs(), neg: v < 0 }
-    }
-
     pub(crate) fn is_negative(self) -> bool {
         self.neg && self.mag != 0
     }
@@ -435,15 +431,6 @@ impl<R> BExpr<R> {
                 value,
             )],
             else_: Some(Box::new(fallback)),
-        }
-    }
-
-    /// The integer a literal spells: a `LitInt`, or a temporal literal's storage
-    /// integer.
-    pub(crate) fn int_literal(&self) -> Option<i64> {
-        match self {
-            BExpr::LitInt(v) | BExpr::LitTemporal { v, .. } => Some(*v),
-            _ => None,
         }
     }
 

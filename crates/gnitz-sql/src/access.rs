@@ -3,10 +3,10 @@
 //!
 //! An **AST-free leaf** — `ir`, `codec::literal` and the client crates, nothing else.
 
-use crate::codec::literal::{place, Placed};
+use crate::codec::literal::{place, Compared, Placed};
 use crate::ir::{BExpr, BinOp, BoundExpr};
 use gnitz_core::Schema;
-use gnitz_expr::SchemaFacts;
+use gnitz_expr::{CmpOp, SchemaFacts};
 use gnitz_wire::{image_mask, key_image, Cut, KeyRange, PkColList, PkKeys, ReadBound};
 use gnitz_wire::{RelIndex, TypeCode, PK_LIST_MAX_COLS};
 use std::cmp::Reverse;
@@ -83,29 +83,23 @@ fn term(conjunct: &BoundExpr, schema: &Schema) -> Option<(usize, Pin)> {
         return Some((*col, Pin::In(keys)));
     }
     let (col, p, op) = bound_col_vs_literal(conjunct, schema)?;
+    let cmp = op.as_cmp().filter(|c| *c != CmpOp::Ne)?;
     let tc = schema.columns[col].ty.tc;
     let max = image_max(tc)?;
-    let image = |v| key_image(tc, v);
-    if op == BinOp::Eq {
-        let admits = match p {
-            Placed::At(v) => image(v)..=image(v),
-            _ => NOTHING,
-        };
-        return Some((col, Pin::Range(admits)));
-    }
-    let rel = op.as_range_rel()?;
-    let admits = match (p, rel.bounds_below()) {
-        (Placed::At(v), true) if rel.admits_equal() => image(v)..=max,
-        (Placed::At(v), true) => match image(v) {
-            i if i < max => i + 1..=max,
-            _ => NOTHING,
-        },
-        (Placed::At(v), false) if rel.admits_equal() => 0..=image(v),
-        (Placed::At(v), false) => image(v).checked_sub(1).map_or(NOTHING, |last| 0..=last),
-        (Placed::Between { lo, .. }, true) => image(lo) + 1..=max,
-        (Placed::Between { lo, .. }, false) => 0..=image(lo),
-        (Placed::Below { .. }, true) | (Placed::Above { .. }, false) => 0..=max,
-        (Placed::Below { .. }, false) | (Placed::Above { .. }, true) => NOTHING,
+    let admits = match p.compare(cmp) {
+        Compared::Always(true) => 0..=max,
+        Compared::Always(false) => NOTHING,
+        Compared::Cmp(cmp, v) => {
+            let i = key_image(tc, v);
+            match cmp {
+                CmpOp::Eq => i..=i,
+                CmpOp::Ge => i..=max,
+                CmpOp::Gt if i < max => i + 1..=max,
+                CmpOp::Le => 0..=i,
+                CmpOp::Lt if i > 0 => 0..=i - 1,
+                _ => NOTHING,
+            }
+        }
     };
     Some((col, Pin::Range(admits)))
 }

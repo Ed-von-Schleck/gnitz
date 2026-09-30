@@ -2,215 +2,207 @@ use super::*;
 use crate::bind::structural::bind_constant;
 use crate::test_support::parse_expr_sql;
 use std::convert::Infallible;
+use Placed::*;
 
 fn lit(src: &str) -> BExpr<Infallible> {
     bind_constant(&parse_expr_sql(src)).unwrap_or_else(|e| panic!("{src}: {e}"))
 }
 
-fn at(tc: TypeCode, src: &str) -> Option<Placed> {
-    place(&lit(src), ColType::of(tc))
-}
+const BELOW: Option<Placed> = Some(Below { nearest: None });
+const ABOVE: Option<Placed> = Some(Above { nearest: None });
+const U128_MAX: &str = "340282366920938463463374607431768211455";
+/// 2020-01-02 as DATE storage.
+const D: i128 = 18263;
+const DAY: i128 = MICROS_PER_DAY as i128;
 
-fn packed(fi: FixedInt, v: i128) -> u128 {
-    fi.pack(v)
+fn i8(v: i128) -> u128 {
+    FixedInt::I8.pack(v)
 }
-
-#[test]
-fn an_integer_is_at_its_value_or_outside_the_type() {
-    use Placed::*;
-    let i8 = |v| packed(FixedInt::I8, v);
-    assert_eq!(at(TypeCode::I8, "-128"), Some(At(i8(-128))));
-    assert_eq!(at(TypeCode::I8, "127"), Some(At(i8(127))));
-    assert_eq!(at(TypeCode::I8, "-129"), Some(Below { nearest: None }));
-    assert_eq!(at(TypeCode::I8, "128"), Some(Above { nearest: None }));
-    assert_eq!(at(TypeCode::U8, "-1"), Some(Below { nearest: None }));
-    assert_eq!(at(TypeCode::U8, "255"), Some(At(255)));
-    assert_eq!(at(TypeCode::U8, "300"), Some(Above { nearest: None }));
-    assert_eq!(at(TypeCode::I32, "3000000000"), Some(Above { nearest: None }));
-    assert_eq!(at(TypeCode::I32, "-5"), Some(At(packed(FixedInt::I32, -5))));
-    assert_eq!(
-        at(TypeCode::U64, "18446744073709551615"),
-        Some(At(u128::from(u64::MAX)))
-    );
-    assert_eq!(at(TypeCode::U64, "18446744073709551616"), Some(Above { nearest: None }));
-    assert_eq!(at(TypeCode::U64, "-0"), Some(At(0)));
-    // Past `i128`, both signs.
-    let huge = "340282366920938463463374607431768211455";
-    assert_eq!(at(TypeCode::I64, huge), Some(Above { nearest: None }));
-    assert_eq!(at(TypeCode::I64, &format!("-{huge}")), Some(Below { nearest: None }));
+fn i32(v: i128) -> u128 {
+    FixedInt::I32.pack(v)
+}
+fn i64(v: i128) -> u128 {
+    FixedInt::I64.pack(v)
 }
 
 #[test]
-fn a_sixteen_byte_type_takes_integers_only() {
-    use Placed::*;
-    assert_eq!(at(TypeCode::I128, "-5"), Some(At(-5i128 as u128)));
-    assert_eq!(at(TypeCode::U128, "-0"), Some(At(0)));
-    assert_eq!(at(TypeCode::U128, "-1"), Some(Below { nearest: None }));
-    assert_eq!(
-        at(TypeCode::U128, "340282366920938463463374607431768211455"),
-        Some(At(u128::MAX))
-    );
-    assert_eq!(
-        at(TypeCode::I128, "340282366920938463463374607431768211455"),
-        Some(Above { nearest: None })
-    );
-    assert_eq!(at(TypeCode::U128, "1.5"), None);
-    assert_eq!(
-        at(TypeCode::UUID, "'550e8400-e29b-41d4-a716-446655440000'"),
-        Some(At(0x550e8400_e29b_41d4_a716_446655440000_u128))
-    );
-    assert_eq!(at(TypeCode::UUID, "'not-a-uuid'"), None);
-}
-
-#[test]
-fn a_fraction_is_between_two_values_and_rounds_half_away_from_zero() {
-    use Placed::*;
-    let i64v = |v| packed(FixedInt::I64, v);
-    assert_eq!(
-        at(TypeCode::I64, "2.5"),
-        Some(Between {
-            lo: i64v(2),
-            hi: i64v(3),
-            nearest: i64v(3)
-        })
-    );
-    assert_eq!(
-        at(TypeCode::I64, "-2.5"),
-        Some(Between {
-            lo: i64v(-3),
-            hi: i64v(-2),
-            nearest: i64v(-3)
-        })
-    );
-    assert_eq!(
-        at(TypeCode::I64, "2.4"),
-        Some(Between {
-            lo: i64v(2),
-            hi: i64v(3),
-            nearest: i64v(2)
-        })
-    );
-    assert_eq!(
-        at(TypeCode::I64, "-2.4"),
-        Some(Between {
-            lo: i64v(-3),
-            hi: i64v(-2),
-            nearest: i64v(-2)
-        })
-    );
-    assert_eq!(at(TypeCode::I64, "1e3"), Some(At(i64v(1000))));
-    // A U64 neighbour above `i64::MAX`.
-    assert_eq!(
-        at(TypeCode::U64, "9223372036854775807.5"),
-        Some(Between {
-            lo: 9223372036854775807,
-            hi: 9223372036854775808,
-            nearest: 9223372036854775808
-        })
-    );
-    // `den = 10^38`: 38 fractional digits, either side of one half.
+fn a_literal_is_placed_among_the_values_of_the_type() {
     let d0 = ColType::decimal(0);
-    assert_eq!(
-        place(&lit("'.49999999999999999999999999999999999999'"), d0),
-        Some(Between { lo: 0, hi: 1, nearest: 0 })
-    );
-    assert_eq!(
-        place(&lit("'-.50000000000000000000000000000000000000'"), d0),
-        Some(Between { lo: i64v(-1), hi: 0, nearest: i64v(-1) })
-    );
-}
-
-#[test]
-fn rounding_at_a_type_edge_keeps_the_edge_as_nearest() {
-    use Placed::*;
-    let i8 = |v| packed(FixedInt::I8, v);
-    assert_eq!(at(TypeCode::I8, "127.4"), Some(Above { nearest: Some(i8(127)) }));
-    assert_eq!(at(TypeCode::I8, "-128.4"), Some(Below { nearest: Some(i8(-128)) }));
-    assert_eq!(at(TypeCode::I8, "127.5"), Some(Above { nearest: None }));
-    assert_eq!(at(TypeCode::I8, "-128.5"), Some(Below { nearest: None }));
-}
-
-#[test]
-fn a_decimal_reads_a_literal_at_its_scale() {
-    use Placed::*;
     let d2 = ColType::decimal(2);
-    let dec = |src: &str| place(&lit(src), d2);
-    assert_eq!(dec("1.5"), Some(At(150)));
-    assert_eq!(dec("'1.50'"), Some(At(150)));
-    assert_eq!(dec("1.005"), Some(Between { lo: 100, hi: 101, nearest: 101 }));
-    assert_eq!(dec("1234567890123456.78"), Some(At(123456789012345678)));
-    assert_eq!(
-        dec("0.1234567890123456789"),
-        Some(Between { lo: 12, hi: 13, nearest: 12 })
-    );
-    // Rounds onto `i64::MAX` from just past it.
-    assert_eq!(
-        dec("92233720368547758.071"),
-        Some(Above { nearest: Some(i64::MAX as u128) })
-    );
-    assert_eq!(dec("'abc'"), None);
-    assert_eq!(dec("NULL"), None);
+    let neg_huge = format!("-{U128_MAX}");
+    for (ty, src, want) in [
+        // An integer is at its value or outside the type.
+        (TypeCode::I8.into(), "-128", Some(At(i8(-128)))),
+        (TypeCode::I8.into(), "127", Some(At(i8(127)))),
+        (TypeCode::I8.into(), "-129", BELOW),
+        (TypeCode::I8.into(), "128", ABOVE),
+        (TypeCode::U8.into(), "-1", BELOW),
+        (TypeCode::U8.into(), "255", Some(At(255))),
+        (TypeCode::U8.into(), "300", ABOVE),
+        (TypeCode::I32.into(), "3000000000", ABOVE),
+        (TypeCode::U64.into(), "18446744073709551615", Some(At(u64::MAX.into()))),
+        (TypeCode::U64.into(), "18446744073709551616", ABOVE),
+        (TypeCode::U64.into(), "-0", Some(At(0))),
+        (TypeCode::I64.into(), U128_MAX, ABOVE),
+        (TypeCode::I64.into(), &neg_huge, BELOW),
+        (TypeCode::I64.into(), "1e3", Some(At(i64(1000)))),
+        // A fraction lies between two values; `nearest` rounds half away from zero.
+        (
+            TypeCode::I64.into(),
+            "2.5",
+            Some(Between { lo: i64(2), nearest: i64(3) }),
+        ),
+        (
+            TypeCode::I64.into(),
+            "-2.5",
+            Some(Between { lo: i64(-3), nearest: i64(-3) }),
+        ),
+        (
+            TypeCode::I64.into(),
+            "2.4",
+            Some(Between { lo: i64(2), nearest: i64(2) }),
+        ),
+        (
+            TypeCode::I64.into(),
+            "-2.4",
+            Some(Between { lo: i64(-3), nearest: i64(-2) }),
+        ),
+        // A U64 neighbour above `i64::MAX`.
+        (
+            TypeCode::U64.into(),
+            "9223372036854775807.5",
+            Some(Between { lo: i64::MAX as u128, nearest: 1 << 63 }),
+        ),
+        // Rounding lands on a type's edge from just past it, and not from further.
+        (TypeCode::I8.into(), "127.4", Some(Above { nearest: Some(i8(127)) })),
+        (TypeCode::I8.into(), "-128.4", Some(Below { nearest: Some(i8(-128)) })),
+        (TypeCode::I8.into(), "127.5", ABOVE),
+        (TypeCode::I8.into(), "-128.5", BELOW),
+        // A 16-byte type takes whole numbers, and a UUID its string spelling.
+        (TypeCode::I128.into(), "-5", Some(At(-5i128 as u128))),
+        (TypeCode::I128.into(), U128_MAX, ABOVE),
+        (TypeCode::U128.into(), "-0", Some(At(0))),
+        (TypeCode::U128.into(), "-1", BELOW),
+        (TypeCode::U128.into(), U128_MAX, Some(At(u128::MAX))),
+        (TypeCode::U128.into(), "1e3", Some(At(1000))),
+        (TypeCode::U128.into(), "1.5", None),
+        (
+            TypeCode::UUID.into(),
+            "'550e8400-e29b-41d4-a716-446655440000'",
+            Some(At(0x550e8400_e29b_41d4_a716_446655440000)),
+        ),
+        (TypeCode::UUID.into(), "'not-a-uuid'", None),
+        // A DECIMAL reads a literal, or its string spelling, at its scale.
+        (d2, "1.5", Some(At(150))),
+        (d2, "'1.50'", Some(At(150))),
+        (d2, "1.005", Some(Between { lo: 100, nearest: 101 })),
+        (d2, "1234567890123456.78", Some(At(123456789012345678))),
+        (d2, "0.1234567890123456789", Some(Between { lo: 12, nearest: 12 })),
+        (
+            d2,
+            "92233720368547758.071",
+            Some(Above { nearest: Some(i64::MAX as u128) }),
+        ),
+        // Scaling up past `i128`.
+        (d2, "'170141183460469231731687303715884105727'", ABOVE),
+        (d2, "'-170141183460469231731687303715884105727'", BELOW),
+        (d2, "'abc'", None),
+        (d2, "NULL", None),
+        // `den = 10^38`: 38 fractional digits, either side of one half.
+        (
+            d0,
+            "'.49999999999999999999999999999999999999'",
+            Some(Between { lo: 0, nearest: 0 }),
+        ),
+        (
+            d0,
+            "0.49999999999999999999999999999999999999",
+            Some(Between { lo: 0, nearest: 0 }),
+        ),
+        (
+            d0,
+            "'-.50000000000000000000000000000000000000'",
+            Some(Between { lo: i64(-1), nearest: i64(-1) }),
+        ),
+        // A DATE and a TIMESTAMP convert between units, flooring before 1970.
+        (TypeCode::Timestamp.into(), "DATE '2020-01-02'", Some(At(i64(D * DAY)))),
+        (
+            TypeCode::Date.into(),
+            "TIMESTAMP '2020-01-02 00:00:00'",
+            Some(At(i32(D))),
+        ),
+        (
+            TypeCode::Date.into(),
+            "TIMESTAMP '2020-01-02 12:00:00'",
+            Some(Between { lo: i32(D), nearest: i32(D) }),
+        ),
+        (
+            TypeCode::Date.into(),
+            "TIMESTAMP '1969-12-31 12:00:00'",
+            Some(Between { lo: i32(-1), nearest: i32(-1) }),
+        ),
+        // A string is the temporal type's own spelling, a number its storage value.
+        (TypeCode::Date.into(), "'2020-01-02'", Some(At(i32(D)))),
+        (
+            TypeCode::Timestamp.into(),
+            "'2020-01-02 00:00:01'",
+            Some(At(i64(D * DAY + 1_000_000))),
+        ),
+        (TypeCode::Date.into(), "7", Some(At(7))),
+        (TypeCode::Date.into(), "1e1", Some(At(10))),
+        (TypeCode::Date.into(), "1.5", None),
+        (TypeCode::Date.into(), "'2020-02-30'", None),
+        // A temporal literal into a numeric column is its storage integer.
+        (TypeCode::I64.into(), "DATE '2020-01-02'", Some(At(i64(D)))),
+        // A type not stored as an integer places nothing.
+        (TypeCode::F64.into(), "1", None),
+        (TypeCode::String.into(), "'a'", None),
+    ] {
+        assert_eq!(place(&lit(src), ty), want, "{ty} {src}");
+    }
 }
 
 #[test]
-fn a_date_and_a_timestamp_convert_between_units() {
-    use Placed::*;
-    let day = i128::from(MICROS_PER_DAY);
-    let d = parse_temporal(TypeCode::Date, "2020-01-02").unwrap();
-    assert_eq!(
-        at(TypeCode::Timestamp, "DATE '2020-01-02'"),
-        Some(At(packed(FixedInt::I64, i128::from(d) * day)))
-    );
-    assert_eq!(
-        at(TypeCode::Date, "TIMESTAMP '2020-01-02 00:00:00'"),
-        Some(At(packed(FixedInt::I32, d.into())))
-    );
-    assert_eq!(
-        at(TypeCode::Date, "TIMESTAMP '2020-01-02 12:00:00'"),
-        Some(Between {
-            lo: packed(FixedInt::I32, d.into()),
-            hi: packed(FixedInt::I32, i128::from(d) + 1),
-            nearest: packed(FixedInt::I32, d.into())
-        })
-    );
-    // Before 1970 the floor goes down, not toward zero.
-    let pre = parse_temporal(TypeCode::Date, "1969-12-31").unwrap();
-    assert_eq!(
-        at(TypeCode::Date, "TIMESTAMP '1969-12-31 12:00:00'"),
-        Some(Between {
-            lo: packed(FixedInt::I32, pre.into()),
-            hi: packed(FixedInt::I32, i128::from(pre) + 1),
-            nearest: packed(FixedInt::I32, pre.into())
-        })
-    );
-    // A string is the column type's own spelling; an integer its storage value.
-    assert_eq!(
-        at(TypeCode::Date, "'2020-01-02'"),
-        Some(At(packed(FixedInt::I32, d.into())))
-    );
-    assert_eq!(at(TypeCode::Date, "7"), Some(At(7)));
-    assert_eq!(at(TypeCode::Date, "1.5"), None);
-    assert_eq!(at(TypeCode::Date, "'garbage'"), None);
+fn an_assignment_stores_the_nearest_value_or_names_the_refusal() {
+    for (tc, src, want) in [
+        (TypeCode::I64, "-2.5", Ok(i64(-3))),
+        (TypeCode::I8, "127.4", Ok(i8(127))),
+        (TypeCode::I8, "-128.4", Ok(i8(-128))),
+        (TypeCode::F64, "-0.0", Ok((-0.0f64).to_bits().into())),
+        (TypeCode::I8, "127.5", Err("I8 value out of range: 127.5")),
+        (TypeCode::Date, "1.5", Err("1.5 is not a DATE value")),
+        (TypeCode::U32, "'5'", Err("invalid U32 literal: '5'")),
+        (TypeCode::F64, "'5'", Err("invalid F64 literal: '5'")),
+        (TypeCode::String, "5", Err("5 is not a STRING value")),
+        (TypeCode::Blob, "'5'", Err("invalid BLOB literal: '5'")),
+    ] {
+        let got = assign(&lit(src), ColType::of(tc));
+        assert_eq!(got, want.map_err(String::from), "{tc:?} {src}");
+    }
 }
 
-/// The parsers themselves are `gnitz-expr`'s; what is this crate's is that each
-/// temporal type reaches its own one, and that every other type spells nothing.
+/// `x CMP lit` against a value of `x`'s type, or a verdict for every value.
 #[test]
-fn a_temporal_spelling_routes_to_its_parser() {
-    assert_eq!(
-        parse_temporal(TypeCode::Date, "2024-02-29"),
-        gnitz_expr::calendar::parse_date("2024-02-29").map(i64::from)
-    );
-    assert!(parse_temporal(TypeCode::Date, "2024-02-29").is_some());
-    assert_eq!(
-        parse_temporal(TypeCode::Timestamp, "2024-02-29 13:45:07"),
-        gnitz_expr::calendar::parse_timestamp("2024-02-29 13:45:07")
-    );
-    assert!(parse_temporal(TypeCode::Timestamp, "2024-02-29 13:45:07").is_some());
-    assert_eq!(
-        parse_temporal(TypeCode::Date, "2024-02-30"),
-        None,
-        "2024 has no 30th of February"
-    );
-    assert_eq!(parse_temporal(TypeCode::I64, "2024-02-29"), None);
+fn a_comparison_with_a_placed_literal_is_one_against_a_value_or_a_constant() {
+    use CmpOp::*;
+    let between = Between { lo: 2, nearest: 3 };
+    let below = Below { nearest: None };
+    let above = Above { nearest: Some(9) };
+    for (p, cmp, want) in [
+        (At(5), Lt, Compared::Cmp(Lt, 5)),
+        (between, Eq, Compared::Always(false)),
+        (between, Ne, Compared::Always(true)),
+        (between, Lt, Compared::Cmp(Le, 2)),
+        (between, Le, Compared::Cmp(Le, 2)),
+        (between, Gt, Compared::Cmp(Gt, 2)),
+        (between, Ge, Compared::Cmp(Gt, 2)),
+        (below, Gt, Compared::Always(true)),
+        (below, Le, Compared::Always(false)),
+        (below, Eq, Compared::Always(false)),
+        (above, Lt, Compared::Always(true)),
+        (above, Ge, Compared::Always(false)),
+        (above, Ne, Compared::Always(true)),
+    ] {
+        assert_eq!(p.compare(cmp), want, "{p:?} {cmp:?}");
+    }
 }

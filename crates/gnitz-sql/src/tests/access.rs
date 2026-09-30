@@ -2,8 +2,7 @@ use super::*;
 use crate::bind::bind_single_table;
 use crate::test_support::{
     bind_conjunct, bind_where, col, compound_schema_u64_u64, eq_expr, extract_pk_value, idx_metas, idx_metas_flagged,
-    in_list_expr, ncol, neg_num_expr, num_expr, parse_expr_sql, pk_schema, two_col, uuid_schema_payload,
-    uuid_schema_pk,
+    in_list_expr, ncol, parse_expr_sql, pk_schema, two_col, uuid_schema_payload, uuid_schema_pk,
 };
 use gnitz_wire::{ColumnDef, PkBuf};
 use sqlparser::ast::Expr;
@@ -532,7 +531,7 @@ fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
     let schema = pk_schema(pk_tc);
 
     // 1. extract_pk_value (INSERT row), AST-based.
-    let row = vec![literal.clone(), num_expr("0")];
+    let row = vec![literal.clone(), parse_expr_sql("0")];
     let got_insert: PkBuf =
         extract_pk_value(&row, &schema).unwrap_or_else(|e| panic!("extract_pk_value({pk_tc:?}): {e}"));
     assert_eq!(got_insert, schema.opk_key_cols(&[expected]), "extract_pk_value");
@@ -554,26 +553,26 @@ fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
 #[test]
 fn every_pk_type_routes_to_one_packed_key() {
     for (tc, literal, expected) in [
-        (TypeCode::I8, neg_num_expr("1"), (-1i8 as u8) as u128),
-        (TypeCode::I16, neg_num_expr("1"), (-1i16 as u16) as u128),
-        (TypeCode::I32, neg_num_expr("1"), (-1i32 as u32) as u128),
-        (TypeCode::I64, neg_num_expr("1"), ((-1i64) as u64) as u128),
+        (TypeCode::I8, parse_expr_sql("-1"), (-1i8 as u8) as u128),
+        (TypeCode::I16, parse_expr_sql("-1"), (-1i16 as u16) as u128),
+        (TypeCode::I32, parse_expr_sql("-1"), (-1i32 as u32) as u128),
+        (TypeCode::I64, parse_expr_sql("-1"), ((-1i64) as u64) as u128),
         // The prepend-`-` parse rule: the `i64::MIN` magnitude overflows i64 →
         // `LitWide`, and every path parses it byte-exactly.
         (
             TypeCode::I64,
-            neg_num_expr("9223372036854775808"),
+            parse_expr_sql("-9223372036854775808"),
             (i64::MIN as u64) as u128,
         ),
-        (TypeCode::U16, num_expr("65535"), 65535u128),
-        (TypeCode::U32, num_expr("4294967295"), 4294967295u128),
+        (TypeCode::U16, parse_expr_sql("65535"), 65535u128),
+        (TypeCode::U32, parse_expr_sql("4294967295"), 4294967295u128),
         // u64::MAX binds to `LitWide` for the WHERE seeks; INSERT parses it directly.
-        (TypeCode::U64, num_expr("18446744073709551615"), u64::MAX as u128),
+        (TypeCode::U64, parse_expr_sql("18446744073709551615"), u64::MAX as u128),
         // `-0` names the value `0`: the sign carries no information for an
         // integer, so an unsigned column takes it on every path. `-1` does not
         // (`extract_pk_value_u128_rejects_negative`).
-        (TypeCode::U128, neg_num_expr("0"), 0),
-        (TypeCode::UUID, neg_num_expr("0"), 0),
+        (TypeCode::U128, parse_expr_sql("-0"), 0),
+        (TypeCode::UUID, parse_expr_sql("-0"), 0),
     ] {
         check_pk_parity(tc, literal, expected);
     }

@@ -10,7 +10,7 @@ use gnitz_wire::{read_u64_le, write_u64_le, AggFunc as WireAggFunc};
 use gnitz_wire::{ColumnDef, PkBuf};
 use rustc_hash::FxHashMap;
 
-use crate::codec::project_schema::{reply_program, ProjItem};
+use crate::codec::project_schema::reply_program;
 use crate::error::GnitzSqlError;
 use crate::exec::client_map::ClientMap;
 use crate::expr_lower::compile_filter_program;
@@ -45,11 +45,7 @@ impl FoldFinish {
         let having = compile_filter_program(having, &partial_schema.columns)?
             .map(|p| p.resolve_filter(partial_schema.as_ref()))
             .transpose()?;
-        let (items, cols): (Vec<ProjItem>, Vec<ColumnDef>) = finalize
-            .into_iter()
-            .map(|(expr, def)| (ProjItem::from_bound(expr), def))
-            .unzip();
-        let (out_schema, program) = reply_program(&items, cols, &partial_schema)?;
+        let (out_schema, program) = reply_program(finalize, &partial_schema)?;
         let finalize = ClientMap::new(program, &partial_schema, Arc::new(out_schema))?;
         Ok(FoldFinish { partial_schema, merge, having, finalize })
     }

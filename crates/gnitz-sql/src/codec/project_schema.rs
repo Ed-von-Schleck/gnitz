@@ -109,14 +109,18 @@ fn compile_projection_map(
     Ok(eb.build(sinks)?)
 }
 
-/// The `(schema, payload program)` a projection over `source` produces: `source`'s PK,
-/// hidden, then the payload columns the program fills.
+/// The `(schema, payload program)` of a projection of `payload` over `source`:
+/// `source`'s PK, hidden, then one payload column per expression, which the
+/// program fills.
 pub(crate) fn reply_program(
-    payload_items: &[ProjItem],
-    payload_cols: Vec<ColumnDef>,
+    payload: impl IntoIterator<Item = (BoundExpr, ColumnDef)>,
     source: &Schema,
 ) -> Result<(Schema, LogicalProgram), GnitzSqlError> {
-    let program = compile_projection_map(payload_items, &payload_cols, source)?;
-    let columns = source.hidden_key_columns().chain(payload_cols).collect();
+    let (items, cols): (Vec<ProjItem>, Vec<ColumnDef>) = payload
+        .into_iter()
+        .map(|(e, def)| (ProjItem::from_bound(e), def))
+        .unzip();
+    let program = compile_projection_map(&items, &cols, source)?;
+    let columns = source.hidden_key_columns().chain(cols).collect();
     Ok((leading_schema(columns, source.pk_cols.len())?, program))
 }

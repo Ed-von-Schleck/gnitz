@@ -1667,8 +1667,8 @@ fn a_comparison_against_a_finer_literal_is_exact() {
             instrs[..],
             [
                 L::LoadColInt { .. },
-                L::LoadConst { val: 101, unsigned: false },
-                L::Cmp { op: CmpOp::Lt, .. }
+                L::LoadConst { val: 100, unsigned: false },
+                L::Cmp { op: CmpOp::Le, .. }
             ]
         ),
         "{instrs:?}"

@@ -8,7 +8,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use gnitz_core::{PkColumn, PlannedView, RelDescriptor, Schema, ZSetBatch};
 use gnitz_wire::{ColumnDef, PkBuf, PkColList, RelClass, RelIndex, TypeCode};
-use sqlparser::ast::{BinaryOperator, Expr, Ident, UnaryOperator, Value};
+use sqlparser::ast::{BinaryOperator, Expr, Ident, Value};
 use std::sync::Arc;
 
 /// The schema every test catalog resolves under.
@@ -159,24 +159,6 @@ pub(crate) fn compound_schema_u64_u64() -> Schema {
 /// A numeric literal bound as the binder binds it, e.g. `lit("1.5")`.
 pub(crate) fn lit(n: &str) -> BoundExpr {
     crate::ast_util::bind_literal(&Value::Number(n.into(), false)).expect("a numeric literal")
-}
-
-/// An unsigned decimal literal, e.g. `42`.
-pub(crate) fn num_expr(n: &str) -> Expr {
-    Expr::value(Value::Number(n.into(), false))
-}
-
-/// A negated decimal literal, e.g. `-1` (a `UnaryOp(Minus)` over a number).
-pub(crate) fn neg_num_expr(n: &str) -> Expr {
-    Expr::UnaryOp {
-        op: UnaryOperator::Minus,
-        expr: Box::new(num_expr(n)),
-    }
-}
-
-/// A single-quoted string literal (a valid UUID seek key).
-pub(crate) fn uuid_str_expr(s: &str) -> Expr {
-    Expr::value(Value::SingleQuotedString(s.into()))
 }
 
 /// A `col = rhs` equality expression (AST), for building recognizer/parity inputs.
