@@ -38,3 +38,7 @@ pub(crate) fn with_routed<R>(
         f(rows, data)
     })
 }
+
+#[cfg(test)]
+#[path = "tests/scatter.rs"]
+mod tests;

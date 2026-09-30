@@ -1,5 +1,6 @@
 use super::*;
 use crate::runtime::sal::fixtures::TestLog;
+use crate::runtime::sal::DirectGroup;
 use crate::runtime::w2m::{self, W2mReceiver};
 use crate::test_support::{
     make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, weighted_rows,
@@ -8,25 +9,20 @@ use gnitz_wire::control::{peek_control_block, DecodedControl};
 
 // -- fixtures ---------------------------------------------------------------
 
-/// A worker over a real SAL and a real W2M ring, through the production
-/// constructor so a new field cannot be missed here, with the receiver that
-/// reads its ring. The budget is pinned rather than read from the environment,
+/// A worker over a real SAL and a real W2M ring — the one ring its replies and
+/// its SAL wakes share, as in production — through the production constructor
+/// so a new field cannot be missed here, with the receiver that reads its ring. The budget is pinned rather than read from the environment,
 /// so a shell that exports `GNITZ_REPLY_FRAME_BUDGET` does not reshape these
 /// frames.
 fn test_worker(catalog: *mut CatalogEngine) -> (WorkerProcess, TestLog, W2mReceiver) {
-    let sal = TestLog::new(1 << 20, 1, 1);
     let ring = w2m::fixtures::test_ring(1 << 22);
+    let sal = TestLog::with_rings(1 << 20, vec![ring], 1);
     let mesh = crate::runtime::mesh::fixtures::meshes(1, crate::runtime::mesh::OUTBOX_BYTES)
         .pop()
         .unwrap();
     let mut wp = WorkerProcess::new(catalog, SalReader::new(sal.log(), 0, 1), W2mWriter::new(ring), mesh);
     wp.reply_frame_budget = gnitz_wire::MAX_FRAME_PAYLOAD;
     (wp, sal, W2mReceiver::new(vec![ring]))
-}
-
-/// A bare control block stamped with the `target_id` a dispatcher reads it from.
-fn control_slot(target_id: u64) -> Vec<u8> {
-    ipc::WireMsg { target_id, ..Default::default() }.encode_to_vec()
 }
 
 fn route(target_id: u64, request_id: u32) -> ReplyRoute {
@@ -131,8 +127,13 @@ fn in_wait_dispositions() {
         (SalMessageKind::DdlSync, seq),
         (SalMessageKind::Flush, 7),
     ];
-    for (lsn, (kind, target)) in groups.into_iter().enumerate() {
-        sal.write(target, lsn as u64, kind, &[&control_slot(target)]);
+    for (kind, target_id) in groups {
+        sal.excl()
+            .write(&DirectGroup {
+                template: ipc::WireMsg { target_id, ..Default::default() },
+                ..DirectGroup::new(kind)
+            })
+            .expect("group fits");
     }
     while let Some(req) = wp.next_request() {
         wp.dispatch_in_eval(req);
@@ -172,13 +173,16 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
     // The first round in `arg0`, the tids in the blob, as `write_tick_group`
     // lays them out.
     let tids: Vec<u8> = [500u64, 501].iter().flat_map(|t| t.to_le_bytes()).collect();
-    let slot = ipc::WireMsg {
-        arg0: 7,
-        blob: &tids,
-        ..Default::default()
-    }
-    .encode_to_vec();
-    sal.write(0, 0, SalMessageKind::Tick, &[&slot]);
+    sal.excl()
+        .write(&DirectGroup {
+            template: ipc::WireMsg {
+                arg0: 7,
+                blob: &tids,
+                ..Default::default()
+            },
+            ..DirectGroup::new(SalMessageKind::Tick)
+        })
+        .expect("group fits");
     wp.drain_sal();
 
     for tid in [500, 501] {

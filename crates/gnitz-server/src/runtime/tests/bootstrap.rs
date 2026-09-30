@@ -52,8 +52,6 @@ mod staging {
     use gnitz_wire::TypeCode;
 
     const SAL_SIZE: usize = 1 << 20;
-    /// Above every family's replay floor after a one-DDL session.
-    const ZONE_LSN: u64 = 1_000;
 
     fn cols() -> Vec<crate::catalog::CatalogColumn> {
         vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)]
@@ -104,22 +102,19 @@ mod staging {
         write_circuit_rows(&mut circuit, v, &identity_circuit(r, gnitz_wire::ReadBound::None));
         let circuit = circuit.finish();
 
-        let mut opened = CatalogEngine::open_master(&dir, 1).unwrap();
-        // The part of the bundle whose families published before the crash.
-        opened.stage(SysFamily::Column.id(), ZONE_LSN, col_tab(v, 1)).unwrap();
-        opened
-            .stage(SysFamily::View.id(), ZONE_LSN, Batch::clone(&view_tab))
-            .unwrap();
         let log = TestLog::new(SAL_SIZE, 1, 1);
         let columns = col_tab(v, 1);
-        log.ddl_zone(
-            ZONE_LSN,
-            &[
-                group(SysFamily::Column, &columns),
-                group(SysFamily::CircuitNodes, &circuit),
-                group(SysFamily::View, &view_tab),
-            ],
-        );
+        let lsn = log.ddl_zone(&[
+            group(SysFamily::Column, &columns),
+            group(SysFamily::CircuitNodes, &circuit),
+            group(SysFamily::View, &view_tab),
+        ]);
+        let mut opened = CatalogEngine::open_master(&dir, 1).unwrap();
+        // The part of the bundle whose families published before the crash.
+        opened.stage(SysFamily::Column.id(), lsn, col_tab(v, 1)).unwrap();
+        opened
+            .stage(SysFamily::View.id(), lsn, Batch::clone(&view_tab))
+            .unwrap();
         let engine = recover(&log, opened);
 
         assert_eq!(engine.dag.sources_of(v), &[r][..]);
@@ -144,10 +139,7 @@ mod staging {
 
         let (columns, table) = (col_tab(t, -1), table_tab(t, "t", Default::default(), -1));
         let log = TestLog::new(SAL_SIZE, 1, 1);
-        log.ddl_zone(
-            ZONE_LSN,
-            &[group(SysFamily::Table, &table), group(SysFamily::Column, &columns)],
-        );
+        log.ddl_zone(&[group(SysFamily::Table, &table), group(SysFamily::Column, &columns)]);
         let mut engine = recover(&log, CatalogEngine::open_master(&dir, 1).unwrap());
 
         assert!(engine.registry.relation(t).is_none(), "the drop nets the table out");

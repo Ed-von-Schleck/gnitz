@@ -274,14 +274,7 @@ impl MasterDispatcher {
     /// nothing; that is the scope's commit.
     pub(crate) fn broadcast_ddl(&self, scope: &SalScope, target_id: u64, batch: &Batch) -> Result<(), WireFault> {
         let relation = wire::WireSchema::from_catalog(self.cat(), target_id);
-        scope.write(
-            &DirectGroup {
-                template: relation.frame(wire::WireMsg::default()),
-                data: GroupData::Same(wire::WireData::Whole(batch)),
-                ..DirectGroup::new(SalMessageKind::DdlSync)
-            },
-            true,
-        )?;
+        scope.write(&DirectGroup::ddl_sync(&relation, batch), true)?;
         gnitz_debug!("broadcast_ddl tid={} rows={}", target_id, batch.len());
         Ok(())
     }
@@ -454,15 +447,7 @@ impl MasterDispatcher {
         }
         let relation = wire::WireSchema::from_catalog(self.cat(), target_id);
         with_routed(batch, &relation, self.num_workers(), |_, data| {
-            scope.write(
-                &DirectGroup {
-                    template: relation.frame(wire::WireMsg::default()),
-                    data,
-                    targets: GroupTargets::all(request_id),
-                    ..DirectGroup::new(SalMessageKind::Push)
-                },
-                recoverable,
-            )
+            scope.write(&DirectGroup::push(&relation, data, request_id), recoverable)
         })
     }
 

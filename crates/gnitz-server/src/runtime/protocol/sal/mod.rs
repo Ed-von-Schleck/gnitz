@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::runtime::reactor::{AsyncRwLock, Reactor, WriteGuard};
 use crate::runtime::w2m::SalWake;
-use crate::runtime::wire::{WireData, WireMsg};
+use crate::runtime::wire::{WireData, WireMsg, WireSchema};
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io;
 use gnitz_store::storage::Batch;
@@ -301,6 +301,25 @@ impl<'a> DirectGroup<'a> {
         }
     }
 
+    /// A push of `data` into `relation`, every worker answering on `request_id`.
+    pub(crate) fn push(relation: &'a WireSchema, data: GroupData<'a>, request_id: u32) -> Self {
+        DirectGroup {
+            template: relation.frame(WireMsg::default()),
+            data,
+            targets: GroupTargets::all(request_id),
+            ..Self::new(SalMessageKind::Push)
+        }
+    }
+
+    /// A catalog mutation of `relation`: `batch`, sent whole to every worker.
+    pub(crate) fn ddl_sync(relation: &'a WireSchema, batch: &'a Batch) -> Self {
+        DirectGroup {
+            template: relation.frame(WireMsg::default()),
+            data: GroupData::Same(WireData::Whole(batch)),
+            ..Self::new(SalMessageKind::DdlSync)
+        }
+    }
+
     /// Worker `w`'s message. The one definition — sizing and encoding both go
     /// through it, so a slot's size and its bytes cannot disagree.
     ///
@@ -400,11 +419,9 @@ const fn held_back(kind: SalMessageKind) -> usize {
         }
 }
 
-/// The highest byte a group of this kind may occupy. Saturating because nothing
-/// structurally bounds a [`SalWriter::new`] below `CHECKPOINT_RESERVE`, and a
-/// release build would otherwise wrap to a cap past the end of the mapping.
+/// The highest byte a group of this kind may occupy.
 fn effective_max(kind: SalMessageKind, ring_len: usize) -> usize {
-    ring_len.saturating_sub(held_back(kind))
+    ring_len - held_back(kind)
 }
 
 /// Floor for a `GNITZ_SAL_BYTES` override — must comfortably exceed one DDL zone
@@ -836,6 +853,14 @@ impl SalWriter {
     /// written before the boot [`SalExcl::boot_rewind`] sets the live epoch.
     pub(crate) fn new(log: SalLog, fd: BorrowedFd<'static>, num_workers: usize, wakes: Vec<SalWake>) -> Self {
         assert_eq!(wakes.len(), num_workers, "one SAL wake per worker");
+        assert!(
+            num_workers <= MAX_WORKERS,
+            "a SAL group cannot carry more than MAX_WORKERS slots"
+        );
+        assert!(
+            log.ring_len > PREFIX_BYTES + CHECKPOINT_RESERVE,
+            "the ring must hold the checkpoint band"
+        );
         let checkpoint_threshold =
             gnitz_foundation::env::env_num("GNITZ_CHECKPOINT_BYTES", (log.ring_len as u64 * 3) >> 2);
         SalWriter {
@@ -884,10 +909,6 @@ impl SalWriter {
         sizes: &[u32],
         mut fill: impl FnMut(usize, &mut [u8]),
     ) -> Result<usize, WireFault> {
-        assert!(
-            sizes.len() <= MAX_WORKERS,
-            "a SAL group cannot carry more than MAX_WORKERS slots"
-        );
         let epoch = self.epoch.get();
         assert!(
             epoch >= 1,
@@ -1003,22 +1024,6 @@ impl SalWriter {
         stamp_digest(base, hdr);
     }
 
-    /// Open a publication scope at zone LSN `lsn`: groups laid out in it are
-    /// invisible until [`SalScope::commit`], and an uncommitted drop discards
-    /// the span. `tag` names the scope for [`ZONE_PANIC`]. Live scopes take
-    /// their LSN from [`SalExcl::begin`]; only tests pick one.
-    fn begin(&self, lsn: u64, tag: &'static str) -> SalScope<'_> {
-        debug_assert!(lsn != 0, "LSN 0 marks a group outside every zone");
-        SalScope {
-            writer: self,
-            from: self.write_cursor.get(),
-            lsn,
-            tag,
-            last_member: Cell::new(None),
-            committed: false,
-        }
-    }
-
     /// Encode a group's per-worker wire messages directly into the SAL mmap and
     /// publish it, outside every zone.
     fn write(&self, g: &DirectGroup) -> Result<(), WireFault> {
@@ -1130,10 +1135,20 @@ impl<'a> SalExcl<'a> {
         self.writer.write(g)
     }
 
-    /// See [`SalWriter::begin`], at the log's next zone LSN. `&mut`, so no scope
-    /// overlaps another, a rewind or a [`Self::sync`].
+    /// Open a publication scope at the log's next zone LSN: groups laid out in
+    /// it are invisible until [`SalScope::commit`], and an uncommitted drop
+    /// discards the span. `tag` names the scope for [`ZONE_PANIC`]. `&mut`, so
+    /// no scope overlaps another, a rewind or a [`Self::sync`].
     pub(crate) fn begin(&mut self, tag: &'static str) -> SalScope<'_> {
-        self.writer.begin(self.writer.next_zone_lsn(), tag)
+        let w = self.writer;
+        SalScope {
+            writer: w,
+            from: w.write_cursor.get(),
+            lsn: w.next_zone_lsn(),
+            tag,
+            last_member: Cell::new(None),
+            committed: false,
+        }
     }
 
     /// `fdatasync` the log, fatal on failure; once done, anchor the cursor at

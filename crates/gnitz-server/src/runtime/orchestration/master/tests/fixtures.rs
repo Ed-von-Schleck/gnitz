@@ -1,4 +1,3 @@
-use std::os::fd::BorrowedFd;
 use std::rc::Rc;
 
 use crate::catalog::CatalogEngine;
@@ -8,9 +7,8 @@ use gnitz_store::storage::{Batch, BatchBuilder};
 use gnitz_wire::TypeCode;
 
 use super::MasterDispatcher;
-use crate::runtime::sal::{SalLog, SalWriter, ANCHOR_BYTES};
-use crate::runtime::test_support::SharedRegion;
-use crate::runtime::w2m::{SalWake, W2mReceiver, W2mWriter};
+use crate::runtime::sal::fixtures::test_writer;
+use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 
 /// The OPK leading-key span of an unsigned integer value at `width` bytes —
 /// unsigned OPK is plain big-endian, so this is exactly what `key_bytes`
@@ -53,27 +51,13 @@ pub(super) fn test_dispatcher_with_writers(worker_pids: Vec<i32>) -> (MasterDisp
 }
 
 fn inert_dispatcher(worker_pids: Vec<i32>, catalog: *mut CatalogEngine) -> (MasterDispatcher, Vec<W2mWriter>) {
-    const SAL_SIZE: usize = 4096;
-    let nw = worker_pids.len();
-    let rings: Vec<*mut u8> = (0..nw)
+    let rings: Vec<*mut u8> = worker_pids
+        .iter()
         .map(|_| crate::runtime::w2m::fixtures::test_ring(64 * 1024))
         .collect();
     let writers = rings.iter().map(|&p| W2mWriter::new(p)).collect();
-    // SAFETY: a test ring is never unmapped.
-    let wakes = rings.iter().map(|&p| unsafe { SalWake::new(p) }).collect();
+    let sal = test_writer(1 << 20, &rings);
     let reactor = crate::runtime::test_support::make_reactor_over(W2mReceiver::new(rings));
-    let region = SharedRegion::new(ANCHOR_BYTES + SAL_SIZE);
-    // SAFETY: leaked below, so mapped for the rest of the process.
-    let sal = unsafe { SalLog::new(region.ptr(), region.size()) };
-    // SAFETY: the region is leaked below, so its fd stays open for the process's life.
-    let fd = unsafe { BorrowedFd::borrow_raw(region.fd()) };
-    region.leak();
-    let disp = MasterDispatcher::new(
-        worker_pids,
-        catalog,
-        0,
-        SalWriter::new(sal, fd, nw, wakes),
-        Rc::new(reactor),
-    );
+    let disp = MasterDispatcher::new(worker_pids, catalog, 0, sal, Rc::new(reactor));
     (disp, writers)
 }
