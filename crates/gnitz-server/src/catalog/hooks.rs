@@ -1,7 +1,6 @@
 use super::cache::RelationEntry;
 use super::*;
 use gnitz_expr::ColumnTable;
-use gnitz_expr::SchemaFacts;
 use std::collections::hash_map::Entry;
 
 impl CatalogEngine {
@@ -58,8 +57,10 @@ impl CatalogEngine {
         self.registry.register(RelationSpec { id, kind, schema })?;
         self.enter_relation(id, kind, schema.pk_cols(), &col_defs, facts);
         // Derived, not stored: every process builds the same FK circuits from the same
-        // column records.
-        for ci in self.fk_circuit_cols(id) {
+        // column records. Every FK column carries one, a PK column included — a
+        // parent's RESTRICT probe reads the child through it.
+        let fk_cols: Vec<usize> = self.fk_constraints_of(id).iter().map(|e| e.fk_col).collect();
+        for ci in fk_cols {
             self.registry
                 .add_index(id, IndexClaim::ForeignKey, &[ci as u32])
                 .map_err(|e| format!("{} '{name}' (id={id}) FK index on column {ci}: {e}", kind.noun()))?;
@@ -94,19 +95,6 @@ impl CatalogEngine {
         self.caches
             .relations
             .insert(id, RelationEntry::new(pk, defs, fks, facts));
-    }
-
-    /// The FK columns of `id` that carry a derived index circuit: those outside its
-    /// PK, whose region already stores them.
-    fn fk_circuit_cols(&self, id: u64) -> Vec<usize> {
-        let Some(schema) = self.registry.relation(id).map(Relation::schema) else {
-            return Vec::new();
-        };
-        self.fk_constraints_of(id)
-            .iter()
-            .map(|e| e.fk_col)
-            .filter(|&c| !schema.is_pk_col(c))
-            .collect()
     }
 
     /// Tear relation `id` out of the registry. Its owned system rows are retracted by

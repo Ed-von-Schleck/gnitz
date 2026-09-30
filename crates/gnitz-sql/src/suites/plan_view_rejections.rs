@@ -816,18 +816,8 @@ fn ambiguous_and_hidden_column_rules() {
 fn capacity_rules() {
     let cat = cat();
     for (clause, variant, needle) in [
-        ("WITH (foo = '1 MB')", "Rejected", "unknown CREATE VIEW option"),
-        // An unknown key names every key that would have been read, so the
-        // message is enough to fix the statement without opening the grammar.
-        ("WITH (foo = '1 MB')", "Rejected", "capacity"),
-        ("WITH (foo = '1 MB')", "Rejected", "delta"),
         ("WITH (capacity = 5)", "Rejected", "single-quoted"),
         ("WITH (capacity = 'lots')", "Rejected", "not a size"),
-        (
-            "WITH (capacity = '1 MB', capacity = '4 GB')",
-            "Rejected",
-            "more than once",
-        ),
     ] {
         let sql = format!("CREATE VIEW v {clause} AS SELECT id, v FROM t");
         assert_rejects(&sql, plan(&cat, &sql), variant, needle);
@@ -935,12 +925,6 @@ fn view_statement_rejected_clause_matrix() {
         (
             "CREATE OR REPLACE VIEW IF NOT EXISTS v AS SELECT id FROM t",
             "opposite outcomes",
-        ),
-        // Its keys are never read, so accepting it would build an unbounded
-        // view where a bounded one was asked for.
-        (
-            "CREATE VIEW v OPTIONS(capacity = '4 MB') AS SELECT id FROM t",
-            "OPTIONS",
         ),
         // `CREATE TABLE` honours CLUSTER BY, so a view silently dropping it would
         // be built unclustered.

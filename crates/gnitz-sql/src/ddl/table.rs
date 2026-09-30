@@ -50,8 +50,7 @@ fn disambiguate_index_name(base: String, taken: &HashSet<String>) -> String {
 /// The FK child-type rule: a child adopts the referenced type, so its type must
 /// equal it or hold a domain that fits inside it, and under DECIMAL adopting
 /// another scale would restate its values.
-fn check_fk_type_compat(fk_col: &ColumnDef, parent_col: &ColumnDef) -> Result<(), GnitzSqlError> {
-    let (fk_col_type, parent_col_type) = (fk_col.ty, parent_col.ty);
+fn check_fk_type_compat(fk_col_type: ColType, parent_col_type: ColType) -> Result<(), GnitzSqlError> {
     let fits = fk_col_type.decimal_domains_match(parent_col_type)
         && (fk_col_type.tc == parent_col_type.tc || fk_col_type.tc.int_domain_fits(parent_col_type.tc));
     if !fits {
@@ -129,7 +128,7 @@ fn resolve_referred_column(
 
 /// Resolve a self-referencing FK against the in-flight column list (the table
 /// is not yet registered in the catalog). The referenced column must be the
-/// table's lone PK column, and may not be the child column itself.
+/// table's lone PK column.
 fn resolve_fk_target_inline(
     current_cols: &[ColumnDef],
     current_pk_cols: &[u32],
@@ -147,19 +146,7 @@ fn resolve_fk_target_inline(
         )));
     }
 
-    // A column referencing itself is a tautology every row satisfies by
-    // construction, and it has no index to validate against: the referenced
-    // column is the lone PK, so the child column would be a PK column too, and
-    // the FK auto-index skips PK columns (the PK region already
-    // stores them). Every parent delete would then fail on a missing child
-    // index. Rejecting it keeps the self-FK column non-PK and its index present.
-    if ref_col_idx == site.col_idx {
-        return Err(GnitzSqlError::Rejected(
-            "a self-referencing FK column must not be the referenced column itself".into(),
-        ));
-    }
-
-    check_fk_type_compat(&current_cols[site.col_idx], &current_cols[ref_col_idx])?;
+    check_fk_type_compat(current_cols[site.col_idx].ty, current_cols[ref_col_idx].ty)?;
     Ok((
         FkTarget::SelfTable { col: ref_col_idx as u32 },
         current_cols[ref_col_idx].ty,
@@ -215,7 +202,7 @@ fn resolve_fk_target(
     }
 
     // Child column widens to the referenced parent column's type.
-    check_fk_type_compat(&current_cols[site.col_idx], &ref_schema.columns[ref_col_idx])?;
+    check_fk_type_compat(current_cols[site.col_idx].ty, ref_schema.columns[ref_col_idx].ty)?;
 
     Ok((
         FkTarget::Table { id: ref_tid, col: ref_col_idx as u32 },

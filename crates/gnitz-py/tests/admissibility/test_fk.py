@@ -107,6 +107,13 @@ _TWO_COLUMNS = (
     "CREATE TABLE c2 (cid BIGINT PRIMARY KEY, eref BIGINT UNSIGNED REFERENCES p(email))")
 _TWO_COLUMN_ROWS = {"p": [(1, 1001, 7001), (2, 1002, 7002), (3, 1003, 7003)],
                     "c1": [(1, 1001)], "c2": [(1, 7002)]}
+# An FK column inside the child's PK, alone or as a non-leading member.
+_PK_CHILD = ("CREATE TABLE parent (id BIGINT UNSIGNED PRIMARY KEY); "
+             "CREATE TABLE child (cid BIGINT UNSIGNED PRIMARY KEY REFERENCES parent(id))")
+_MEMBER_CHILD = ("CREATE TABLE parent (id BIGINT UNSIGNED PRIMARY KEY); "
+                 "CREATE TABLE child (a BIGINT UNSIGNED REFERENCES parent(id), b BIGINT UNSIGNED,"
+                 " PRIMARY KEY (b, a))")
+_LOOP = "CREATE TABLE loop (id BIGINT PRIMARY KEY REFERENCES loop(id))"
 
 # `(ddl, rows seeded per table, statements, every table's rows after — or None
 # where the statements are refused and every table keeps its seed)`.
@@ -184,6 +191,18 @@ _STATEMENTS = {
     "a row neither child references": (
         _TWO_COLUMNS, _TWO_COLUMN_ROWS, "DELETE FROM p WHERE pid = 3",
         {**_TWO_COLUMN_ROWS, "p": _TWO_COLUMN_ROWS["p"][:2]}),
+    "a parent its PK child references": (
+        _PK_CHILD, {"parent": [(1,), (2,)], "child": [(1,)]}, "DELETE FROM parent WHERE id = 1", None),
+    "a parent no PK child references": (
+        _PK_CHILD, {"parent": [(1,), (2,)], "child": [(1,)]}, "DELETE FROM parent WHERE id = 2",
+        {"parent": [(1,)], "child": [(1,)]}),
+    "a parent a PK member references": (
+        _MEMBER_CHILD, {"parent": [(1,), (2,)], "child": [(1, 7)]}, "DELETE FROM parent WHERE id = 1", None),
+    "a parent no PK member references": (
+        _MEMBER_CHILD, {"parent": [(1,), (2,)], "child": [(1, 7)]}, "DELETE FROM parent WHERE id = 2",
+        {"parent": [(1,)], "child": [(1, 7)]}),
+    # A row referencing itself exempts itself.
+    "a self-referencing PK row": (_LOOP, {"loop": [(1,)]}, "DELETE FROM loop", {"loop": []}),
 }
 
 

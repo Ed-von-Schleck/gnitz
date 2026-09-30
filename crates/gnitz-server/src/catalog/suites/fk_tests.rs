@@ -425,12 +425,13 @@ fn test_fk_multiple_children_same_parent() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── test_fk_auto_index_skips_non_leading_pk_column ───────────────────
-// Every PK column is skipped, not just the leading one.
+// ── test_fk_auto_index_covers_pk_members ─────────────────────────────
+// A parent's RESTRICT probe reads every child through its FK circuit, so a PK
+// member carries one exactly as a plain column does.
 
 #[test]
-fn test_fk_auto_index_skips_non_leading_pk_column() {
-    let dir = temp_dir("fk_compound_pk_skip");
+fn test_fk_auto_index_covers_pk_members() {
+    let dir = temp_dir("fk_compound_pk_member");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
@@ -438,19 +439,18 @@ fn test_fk_auto_index_skips_non_leading_pk_column() {
         .unwrap();
     let fk_col = |name: &str| fk_def(name, TypeCode::U64, parent_tid, 0);
 
-    // PK = (a, pid_fk): the FK is PK column 1, not 0. `plain_fk` is not a PK column.
+    // PK = (a, pid_fk): the FK is PK column 1. `plain_fk` is not a PK column.
     let child_cols = vec![col_def("a", TypeCode::U64), fk_col("pid_fk"), fk_col("plain_fk")];
     let child_tid = engine.create_table("public.child", &child_cols, &[0, 1]).unwrap();
 
     let child = engine.registry.relation(child_tid).unwrap();
-    assert!(
-        child.index_on(&[1]).is_none(),
-        "an FK at a non-leading PK position is covered by the PK region — no circuit",
-    );
-    assert!(
-        child.index_on(&[2]).is_some(),
-        "an FK on a non-PK column must still get its circuit",
-    );
+    for c in [1, 2] {
+        assert_eq!(
+            child.index_on(&[c]).map(|ix| ix.claims().to_vec()),
+            Some(vec![IndexClaim::ForeignKey]),
+            "col {c}"
+        );
+    }
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

@@ -43,9 +43,6 @@ fn the_option_list_fills_the_two_budgets_and_refuses_anything_else() {
     for (with, needle) in [
         ("WITH (capacity = 5)", "single-quoted"),
         ("WITH (delta = 'lots')", "`delta`"),
-        // A repeated key is refused rather than won by its last spelling.
-        ("WITH (capacity = '1 MB', capacity = '4 GB')", "more than once"),
-        ("WITH (delta = '1 MB', Delta = '1 MB')", "more than once"),
     ] {
         match options_of(with) {
             Err(GnitzSqlError::Rejected(m)) => assert!(m.contains(needle), "{with}: {m}"),

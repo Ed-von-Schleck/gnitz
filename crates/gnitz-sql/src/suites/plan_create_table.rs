@@ -248,6 +248,11 @@ fn an_unhonoured_clause_or_fk_target_is_named() {
             "not found",
         ),
         (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT UNSIGNED REFERENCES p(id))",
+            "Rejected",
+            "FK type mismatch",
+        ),
+        (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES st(id))",
             "Rejected",
             "is a stream",
@@ -336,6 +341,62 @@ fn an_fk_child_adopts_the_parent_type_before_the_index_is_checked() {
     );
     let sql = "CREATE TABLE c3 (id BIGINT PRIMARY KEY, r BIGINT REFERENCES q(u))";
     assert_rejects(sql, plan_table(&cat, sql), "Rejected", "UNIQUE index");
+}
+
+/// A self-referencing FK resolves against the in-flight columns: it targets the
+/// table's lone PK, and its child adopts the PK's type like any other FK child.
+#[test]
+fn a_self_fk_targets_the_lone_pk_and_adopts_its_type() {
+    let cat = catalog(vec![]);
+    for (sql, col_idx) in [
+        // An omitted column list defaults to the lone PK.
+        (
+            "CREATE TABLE tree (id BIGINT PRIMARY KEY, parent_id INT REFERENCES tree)",
+            1,
+        ),
+        // A tautology every row satisfies.
+        ("CREATE TABLE tree (id BIGINT PRIMARY KEY REFERENCES tree(id))", 0),
+    ] {
+        let c = created(&cat, sql);
+        let target = FkTarget::SelfTable { col: 0 };
+        assert_eq!(c.fks, vec![InlineForeignKey { col_idx, target }], "{sql}");
+        assert_eq!(c.schema.columns[col_idx as usize].ty.tc, TypeCode::I64, "{sql}");
+    }
+    for (sql, needle) in [
+        (
+            "CREATE TABLE tree (id BIGINT PRIMARY KEY, tag BIGINT, p BIGINT REFERENCES tree(tag))",
+            "column 'tag' is not the lone PK",
+        ),
+        // A compound PK has no lone column: named, a member is not it; omitted,
+        // there is no default.
+        (
+            "CREATE TABLE tree (a BIGINT, b BIGINT, p BIGINT REFERENCES tree(a), PRIMARY KEY (a, b))",
+            "column 'a' is not the lone PK",
+        ),
+        (
+            "CREATE TABLE tree (a BIGINT, b BIGINT, p BIGINT REFERENCES tree, PRIMARY KEY (a, b))",
+            "must name the referenced column",
+        ),
+        (
+            "CREATE TABLE tree (id BIGINT PRIMARY KEY, p BIGINT UNSIGNED REFERENCES tree(id))",
+            "FK type mismatch",
+        ),
+    ] {
+        assert_rejects(sql, plan_table(&cat, sql), "Rejected", needle);
+    }
+}
+
+/// A repeated column is the definition's error, reported before a column list
+/// resolves the name as ambiguous, and named as the repeat was written.
+#[test]
+fn a_repeated_column_name_is_rejected_before_it_is_resolved() {
+    let sql = "CREATE TABLE t (a BIGINT, b BIGINT, A BIGINT, PRIMARY KEY (a))";
+    assert_rejects(
+        sql,
+        plan_table(&catalog(vec![]), sql),
+        "Rejected",
+        "duplicate column name 'A' in table definition",
+    );
 }
 
 /// Distinct column sets can render the same auto-name base when a column name
