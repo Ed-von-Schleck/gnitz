@@ -8,7 +8,6 @@ use crate::test_support::{
 };
 use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
 use gnitz_wire::TypeCode;
-use std::collections::HashMap;
 
 /// Write `batch` to `log` as the master's push of it to relation 16, handing
 /// `inspect` the layout the scatter picked.
@@ -21,8 +20,9 @@ fn push(log: &TestLog, batch: &Batch, inspect: impl FnOnce(&GroupData)) {
     .expect("group fits");
 }
 
-/// A keyed push's slots sum to the pushed rows, each of a replicated push's
-/// slots holds its live rows, and only a slot with rows carries a schema block.
+/// A keyed push's slots sum to the pushed rows, each row in its owner's slot;
+/// each of a replicated push's slots holds its live rows; and only a slot with
+/// rows carries a schema block.
 #[test]
 fn a_push_group_decodes_to_each_workers_rows() {
     let nw = 4;
@@ -86,7 +86,7 @@ fn a_push_group_decodes_to_each_workers_rows() {
         let schema = *batch.schema();
         let log = TestLog::new(1 << 20, nw, 1);
         push(&log, batch, |g| assert!(laid_out(g, batch), "{case}"));
-        let slots: Vec<Batch> = group_at(log.log(), 0)
+        let slots: Vec<(usize, Batch)> = group_at(log.log(), 0)
             .slots_written()
             .filter_map(|(w, bytes)| {
                 let decoded = decode_sal_slot(bytes, |_, _| None).expect("every written slot decodes");
@@ -96,7 +96,7 @@ fn a_push_group_decodes_to_each_workers_rows() {
                     rows.is_some(),
                     "{case}: slot {w}'s schema block"
                 );
-                rows
+                rows.map(|rows| (w as usize, rows))
             })
             .collect();
         if schema.placement() == Placement::Replicated {
@@ -106,15 +106,25 @@ fn a_push_group_decodes_to_each_workers_rows() {
                 .collect::<Vec<_>>();
             assert_eq!(slots.len(), nw, "{case}: every worker is sent the rows");
             assert!(
-                slots.iter().all(|s| weighted_rows(s) == live),
+                slots.iter().all(|(_, s)| weighted_rows(s) == live),
                 "{case}: every worker holds the live rows"
             );
         } else {
-            let mut z = HashMap::new();
-            for (k, w) in slots.iter().flat_map(|s| zset_of(s, &schema)) {
-                *z.entry(k).or_insert(0) += w;
+            for (w, s) in &slots {
+                for row in 0..s.len() {
+                    assert_eq!(
+                        schema.worker_for_pk(s.get_pk_bytes(row), nw),
+                        *w,
+                        "{case}: a row in slot {w}"
+                    );
+                }
             }
-            assert_eq!(z, zset_of(batch, &schema), "{case}: the slots sum to the pushed rows");
+            let sent = Batch::concat(&schema, slots.iter().map(|(_, s)| s.as_mem_batch()));
+            assert_eq!(
+                zset_of(&sent, &schema),
+                zset_of(batch, &schema),
+                "{case}: the slots sum to the pushed rows"
+            );
         }
     }
 }

@@ -124,3 +124,13 @@ impl Drop for SharedRegion {
         }
     }
 }
+
+/// The worker's sorted-span producer over `stride`-byte `keys`, sorted in RAM
+/// — the budget is never reached, so the spill dir is never touched.
+pub(crate) fn key_producer(stride: usize, keys: &[impl AsRef<[u8]>]) -> gnitz_store::storage::KeyProducer {
+    let mut sort = gnitz_store::storage::SpillSort::new("", stride, usize::MAX);
+    for k in keys {
+        sort.push(k.as_ref()).unwrap();
+    }
+    sort.finish().unwrap()
+}

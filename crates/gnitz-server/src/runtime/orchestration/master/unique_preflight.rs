@@ -1,7 +1,6 @@
 //! The DDL-time pre-flight for `CREATE UNIQUE INDEX`: the fan-out
 //! (`validate_unique_index_create`), the per-worker sorted-span streams
-//! (`PreflightKeyStream`), their k-way merge (`merge_index_scan`) and the
-//! per-key accounting it feeds (`PreflightAccumulator`).
+//! (`PreflightKeyStream`) and their k-way merge (`merge_index_scan`).
 //!
 //! Nothing here is on the write path — `preflight.rs` holds that — and the only
 //! state shared with it is the `UniqueFilter` this pre-flight seeds.
@@ -10,7 +9,6 @@ use super::*;
 
 use std::ops::Range;
 
-use super::unique_filter::UNIQUE_FILTER_CAP;
 use crate::runtime::reactor::TrainFrame;
 use gnitz_store::relation::Relation;
 use gnitz_store::schema::key::PkBuf;
@@ -50,57 +48,14 @@ impl PreflightKeyStream<'_> {
     }
 }
 
-/// Per-key accounting for the pre-flight merge: duplicate verdict + inline
-/// seed collection, fed keys in globally-sorted merge order. Split from the
-/// frame-pulling loop so the verdict and the all-or-nothing seed rule are
-/// directly testable with a small cap.
-pub(super) struct PreflightAccumulator {
-    prev: Option<PkBuf>,
-    pub(super) duplicate: bool,
-    /// The filter this pre-flight will publish.
-    filter: UniqueFilter,
-}
-
-impl PreflightAccumulator {
-    pub(super) fn new(cap: usize) -> Self {
-        PreflightAccumulator {
-            prev: None,
-            duplicate: false,
-            filter: UniqueFilter::with_cap(cap),
-        }
-    }
-
-    /// Offer the next span in globally-sorted merge order. Returns `false`
-    /// once a duplicate is found — the verdict is monotonic, so the caller
-    /// stops merging useful spans (but still drains every worker's train).
-    /// Spans are byte-equal iff value-equal, so equality is a plain compare.
-    pub(super) fn offer(&mut self, key: PkBuf) -> bool {
-        if self.duplicate {
-            return false;
-        }
-        if self.prev == Some(key) {
-            self.duplicate = true;
-            return false;
-        }
-        self.prev = Some(key);
-        let _ = self.filter.insert(key.pk_bytes());
-        true
-    }
-
-    /// The filter holding every distinct span this pre-flight saw, ready to
-    /// publish.
-    pub(super) fn into_seed(self) -> UniqueFilter {
-        self.filter
-    }
-}
-
 /// Streaming k-way merge over the workers' sorted span trains, holding one frame
-/// per worker, stopping at the first error or duplicate. Equal spans pop
-/// adjacently whether one worker or two hold them.
+/// per worker. Equal spans pop adjacently whether one worker or two hold them, so
+/// the first adjacent equal pair is a duplicate: `None`, the rest of the trains
+/// left for the lease drop. Otherwise the filter of every distinct span.
 async fn merge_index_scan(
     scan: &TrainLease,
     frame_schema: &SchemaDescriptor,
-) -> Result<PreflightAccumulator, WireFault> {
+) -> Result<Option<UniqueFilter>, WireFault> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
@@ -117,16 +72,19 @@ async fn merge_index_scan(
         }
     }
 
-    let mut acc = PreflightAccumulator::new(UNIQUE_FILTER_CAP);
+    let (mut seed, mut prev) = (UniqueFilter::new(), None);
     while let Some(Reverse((key, i))) = heap.pop() {
-        if !acc.offer(key) {
-            break;
-        } // first duplicate is conclusive
+        // Spans are byte-equal iff value-equal.
+        if prev == Some(key) {
+            return Ok(None);
+        }
+        prev = Some(key);
+        seed.insert(key.pk_bytes());
         if let Some(next) = streams[i].next_key(frame_schema).await? {
             heap.push(Reverse((next, i)));
         }
     }
-    Ok(acc)
+    Ok(Some(seed))
 }
 
 impl MasterDispatcher {
@@ -166,7 +124,7 @@ impl MasterDispatcher {
 
         // The read routes a REPLICATED owner to one worker: under a fan-out each
         // distinct value would arrive `nw` times and pop adjacently in the merge
-        // — `PreflightAccumulator::offer` reads that as a duplicate and fails the
+        // — the merge reads that as a duplicate and fails the
         // CREATE on a genuinely unique table. The count-agnostic merge still
         // catches real within-copy duplicates via the same adjacent-equal
         // check, and the seed reflects true cardinality. Hashed owners keep the
@@ -186,8 +144,7 @@ impl MasterDispatcher {
             })
             .await?;
 
-        let merged = merge_index_scan(&lease, &frame_schema).await?;
-        if merged.duplicate {
+        let Some(seed) = merge_index_scan(&lease, &frame_schema).await? else {
             let cat = self.cat();
             return Err(WireFault {
                 status: gnitz_wire::WireStatus::IntegrityViolation,
@@ -197,8 +154,8 @@ impl MasterDispatcher {
                     cat.column_names(owner_id, col_indices),
                 ),
             });
-        }
-        Ok(Some(merged.into_seed()))
+        };
+        Ok(Some(seed))
     }
 }
 

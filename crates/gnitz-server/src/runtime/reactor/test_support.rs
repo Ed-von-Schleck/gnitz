@@ -43,17 +43,6 @@ impl Reactor {
         }
         panic!("reactor: {MAX_TICKS} ticks without reaching idle — lost wake or deadlock");
     }
-
-    /// Route every frame the W2M rings hold, as a tick's drain does — for a
-    /// fixture that publishes frames and never ticks.
-    pub(crate) fn route_w2m_for_test(&self) {
-        self.drain_all_w2m();
-    }
-
-    /// Worker `w`'s W2M release cursor.
-    pub(crate) fn release_cursor_for_test(&self, w: usize) -> u64 {
-        self.inner.w2m.release_cursor(w)
-    }
 }
 
 /// A reactor over `n` fresh W2M rings, with the writer of each.

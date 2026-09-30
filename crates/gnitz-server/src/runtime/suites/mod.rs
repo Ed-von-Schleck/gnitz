@@ -4,4 +4,3 @@
 //! module goes in that module's own `tests/<module>.rs`.
 
 mod block_integrity;
-mod unique_preflight;

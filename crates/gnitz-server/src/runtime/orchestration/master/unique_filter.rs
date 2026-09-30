@@ -18,12 +18,13 @@ use gnitz_wire::{ReadBound, ReadSpec};
 /// Spans tracked per filter before it disables itself: `FxHashSet<u64>`'s
 /// 2^23-bucket table at its 7/8 load factor, the largest count that never grows
 /// to the next power of two.
-pub(super) const UNIQUE_FILTER_CAP: usize = (1 << 23) * 7 / 8;
+const UNIQUE_FILTER_CAP: usize = (1 << 23) * 7 / 8;
 
 pub(crate) struct UniqueFilter {
     /// `probe_key` fingerprints of the spans known present, or `None` once the
     /// filter capped.
     values: Option<FxHashSet<u64>>,
+    /// [`UNIQUE_FILTER_CAP`], held per filter so a test can reach it in a few spans.
     cap: usize,
     /// Whether `values` holds every committed span, and so may prove absence.
     warm: bool,
@@ -31,20 +32,11 @@ pub(crate) struct UniqueFilter {
 
 impl UniqueFilter {
     pub(super) fn new() -> Self {
-        Self::with_cap(UNIQUE_FILTER_CAP)
-    }
-
-    pub(super) fn with_cap(cap: usize) -> Self {
         UniqueFilter {
             values: Some(FxHashSet::default()),
-            cap,
+            cap: UNIQUE_FILTER_CAP,
             warm: false,
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn capped(&self) -> bool {
-        self.values.is_none()
     }
 
     pub(super) fn is_warm(&self) -> bool {
@@ -83,12 +75,6 @@ impl UniqueFilter {
         self.values
             .as_ref()
             .is_none_or(|values| values.contains(&probe_key(span)))
-    }
-
-    /// Distinct spans tracked — zero once capped.
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.values.as_ref().map_or(0, |values| values.len())
     }
 }
 

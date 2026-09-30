@@ -1,94 +1,51 @@
 use super::*;
-use gnitz_expr::ColumnTable;
-use gnitz_store::schema::SchemaColumn;
+use crate::test_support::{make_schema_u64_i64, opk_pk, pk_only_schema, pk_payload_schema};
 use gnitz_wire::TypeCode;
 
-/// An I32 `-1` image lands as the I64 `-1` an index key holds, source-PK suffix zero.
+/// Row `j` of the check batch holds `keys[j]` once the call returns — the order
+/// F1/F2 map replies back by — each image promoted into the leading key column,
+/// the source-PK suffix zero.
 #[test]
-fn build_check_batch_promotes_the_key_image_into_the_leading_column() {
-    let cols = vec![
-        SchemaColumn::new(TypeCode::I64, false),
-        SchemaColumn::new(TypeCode::U64, false),
-    ];
-    let idx = SchemaDescriptor::new(&cols, &[0, 1]);
+fn build_check_batch_sorts_the_keys_into_its_rows() {
+    let idx = pk_only_schema(&[TypeCode::I64, TypeCode::U64]);
+    let mut keys = [5i32, -1, 0].map(|v| gnitz_wire::key_image(TypeCode::I32, v as u128));
 
-    let batch = build_check_batch(&idx, &mut [0x7FFF_FFFFu128], TypeCode::I32);
+    let batch = build_check_batch(&idx, &mut keys, TypeCode::I32);
 
-    assert_eq!(batch.len(), 1);
-    let mut expected = [0u8; 8];
-    gnitz_wire::encode_pk_column(&(-1i64).to_le_bytes(), TypeCode::I64, &mut expected);
-    let key = batch.get_pk_bytes(0);
-    assert_eq!(&key[..8], &expected[..], "the leading column holds the promoted value");
-    assert_eq!(&key[8..], &[0u8; 8], "the source-PK suffix stays zero");
+    assert!(keys.is_sorted());
+    let rows: Vec<&[u8]> = (0..batch.len()).map(|j| batch.get_pk_bytes(j)).collect();
+    let want: Vec<Vec<u8>> = [-1i64, 0, 5].iter().map(|&v| opk_pk(&idx, &[v as u128, 0])).collect();
+    assert_eq!(rows, want);
 }
 
-/// A probe batch carries the target's KEY and nothing else, whatever the
-/// table's payload is: `handle_has_pk` reads back `get_pk_bytes` alone, so a
-/// payload region would be SAL bytes and a zero-fill per column per row for
-/// data no one reads. `push_key_row` asserts the schema is payload-free, so
-/// this pins the projection that makes it so.
+/// A probe batch carries the target's key and nothing else, whatever the
+/// table's payload: `handle_has_pk` reads back `get_pk_bytes` alone. And it is
+/// routed as the source is: `project_schema` stamps `KEYED_DEFAULT`, which on a
+/// `CLUSTER BY` table is a different router width, so probe rows would scatter
+/// to workers that do not store the key — and `PartialEq for SchemaDescriptor`
+/// ignores `placement`, so nothing downstream would catch it. A replicated
+/// source's probe is instead hash-spread over the full PK, since every worker
+/// holds it whole.
 #[test]
-fn probe_schema_keeps_the_key_and_drops_every_payload_column() {
-    let cols = vec![
-        SchemaColumn::new(TypeCode::U64, false),
-        SchemaColumn::new(TypeCode::I64, false),
-        SchemaColumn::new(TypeCode::String, true),
-    ];
-    let schema = SchemaDescriptor::new(&cols, &[0]);
-    let pk_only = probe_schema(&schema);
-
-    assert_eq!(pk_only.num_payload_cols(), 0);
-    assert_eq!(pk_only.pk_stride(), schema.pk_stride());
-    assert_eq!(pk_only.pk_cols(), &[0]);
-
-    let batch = build_check_batch(&pk_only, &mut [42u128], TypeCode::U64);
-    assert_eq!(batch.len(), 1);
-    let mut expected = [0u8; 8];
-    gnitz_wire::encode_pk_column(&42u64.to_le_bytes(), TypeCode::U64, &mut expected);
-    assert_eq!(batch.get_pk_bytes(0), &expected[..]);
-}
-
-/// The placement re-stamp. `project_schema` finishes through
-/// `SchemaDescriptor::new`, which stamps `KEYED_DEFAULT`; on a `CLUSTER BY`
-/// table that resolves to a different router width, so probe rows would
-/// scatter to workers that do not store the key and every present key would
-/// read as absent. `PartialEq for SchemaDescriptor` ignores `placement`, so no
-/// schema guard downstream can catch it. A replicated source's probe is instead
-/// hash-spread over the full PK, since every worker holds it whole.
-#[test]
-fn probe_schema_carries_the_source_placement() {
-    let cols = vec![
-        SchemaColumn::new(TypeCode::U64, false),
-        SchemaColumn::new(TypeCode::U64, false),
-        SchemaColumn::new(TypeCode::I64, false),
-    ];
-    let clustered =
-        SchemaDescriptor::new(&cols, &[0, 1]).with_placement(gnitz_store::schema::Placement::Keyed { prefix_len: 1 });
-
-    let pk_only = probe_schema(&clustered);
-    assert_eq!(pk_only.placement(), clustered.placement());
-    assert_eq!(
-        pk_only.dist_stride(),
-        clustered.dist_stride(),
-        "the router width must survive the projection"
-    );
-    assert_ne!(
-        pk_only.dist_stride(),
-        pk_only.pk_stride(),
-        "the fixture must actually be CLUSTER BY, or the test proves nothing"
-    );
-
-    let replicated = SchemaDescriptor::new(&cols, &[0, 1]).with_placement(gnitz_store::schema::Placement::Replicated);
-    let spread = probe_schema(&replicated);
-    assert!(
-        !spread.placement().is_replicated(),
-        "a replicated source's probe is spread, not sent to one worker"
-    );
-    assert_eq!(
-        spread.dist_stride(),
-        spread.pk_stride(),
-        "the spread hashes the full PK"
-    );
+fn probe_schema_keeps_the_key_and_the_sources_routing() {
+    let source = pk_payload_schema(&[TypeCode::U64, TypeCode::U64]);
+    for (placement, spread) in [
+        (source.placement(), false),
+        (Placement::Keyed { prefix_len: 1 }, false),
+        (Placement::Replicated, true),
+    ] {
+        let source = source.with_placement(placement);
+        let probe = probe_schema(&source);
+        assert_eq!(probe.num_payload_cols(), 0, "{placement:?}");
+        assert_eq!(probe.pk_stride(), source.pk_stride(), "{placement:?}");
+        if spread {
+            assert!(!probe.placement().is_replicated());
+            assert_eq!(probe.dist_stride(), probe.pk_stride(), "the spread hashes the full PK");
+        } else {
+            assert_eq!(probe.placement(), placement);
+            assert_eq!(probe.dist_stride(), source.dist_stride(), "{placement:?}");
+        }
+    }
 }
 
 /// The check-batch allocation path, each round over the arena the previous
@@ -104,11 +61,7 @@ fn check_batch_build_bench() {
     const ROWS: usize = 20_000;
     const ROUNDS: usize = 2_000;
 
-    let cols = vec![
-        SchemaColumn::new(TypeCode::U64, false),
-        SchemaColumn::new(TypeCode::I64, false),
-    ];
-    let schema = probe_schema(&SchemaDescriptor::new(&cols, &[0]));
+    let schema = probe_schema(&make_schema_u64_i64());
     let keys: Vec<[u8; 8]> = (0..ROWS as u64).map(|i| i.to_be_bytes()).collect();
 
     // One warm round, so the pooled arena is already the right size and the
@@ -126,8 +79,8 @@ fn check_batch_build_bench() {
 
 #[test]
 fn rows_of_names_every_row_a_key_prefixes() {
-    let schema = crate::test_support::pk_only_schema(&[TypeCode::U64, TypeCode::U64]);
-    let key = |a: u64, b: u64| [a.to_be_bytes(), b.to_be_bytes()].concat();
+    let schema = pk_only_schema(&[TypeCode::U64, TypeCode::U64]);
+    let key = |a: u64, b: u64| opk_pk(&schema, &[a as u128, b as u128]);
     let keys = [key(1, 0), key(3, 1), key(3, 1), key(3, 9), key(7, 0)];
     let check = PipelinedCheck {
         keyspace: Keyspace::OwnPk,

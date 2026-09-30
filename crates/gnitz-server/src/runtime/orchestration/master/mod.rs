@@ -10,8 +10,7 @@ mod train;
 mod unique_filter;
 mod unique_preflight;
 
-/// Fixtures shared by the `master` submodules' unit tests: the batch/schema
-/// builders and the inert dispatcher those suites construct.
+/// The inert dispatcher the `master` submodules' unit tests construct.
 #[cfg(test)]
 #[path = "tests/fixtures.rs"]
 mod fixtures;
@@ -183,3 +182,7 @@ impl MasterDispatcher {
         Ok(leases.pop().expect("one read, one lease"))
     }
 }
+
+#[cfg(test)]
+#[path = "tests/master.rs"]
+mod tests;

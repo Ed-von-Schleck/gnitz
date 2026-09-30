@@ -1,60 +1,50 @@
-use super::super::fixtures::span_uint;
 use super::*;
+use crate::runtime::reactor::reactor_with_rings;
+use crate::runtime::test_support::key_producer;
+use crate::runtime::worker::send_unique_preflight_keys;
+use crate::test_support::pk_only_schema;
+use gnitz_wire::TypeCode;
 
-/// OPK leading-key span of a single U128 value (U128 OPK == big-endian).
-fn span(v: u128) -> PkBuf {
-    span_uint(v, 16)
-}
-
-fn offer_all(acc: &mut PreflightAccumulator, keys: &[PkBuf]) -> bool {
-    for &k in keys {
-        if !acc.offer(k) {
-            return false;
-        }
-    }
-    true
-}
-
-/// Adjacent equal spans — within one worker's run or as two workers' equal
-/// heads, indistinguishable at this layer — flip the verdict; the verdict is
-/// monotonic thereafter.
-#[test]
-fn accumulator_adjacent_equal_is_duplicate() {
-    let mut acc = PreflightAccumulator::new(1000);
-    assert!(offer_all(&mut acc, &[span(1), span(2), span(3)]));
-    assert!(!acc.offer(span(3)), "equal to prev ⇒ duplicate");
-    assert!(!acc.offer(span(4)), "verdict is monotonic");
-    assert!(acc.duplicate);
-}
-
-#[test]
-fn accumulator_distinct_keys_no_duplicate() {
-    let mut acc = PreflightAccumulator::new(1000);
-    let keys: Vec<PkBuf> = [1u128, 2, 3, 100, u128::MAX].into_iter().map(span).collect();
-    assert!(offer_all(&mut acc, &keys));
-    assert!(!acc.duplicate);
-    let mut seed = acc.into_seed();
-    assert!(!seed.capped(), "under-cap seed must not report capped");
-    seed.mark_warm(); // as `unique_filter_seed` publishes it
-    for k in &keys {
-        assert!(
-            !seed.proves_all_absent([k.pk_bytes()].into_iter()),
-            "seed under cap holds every span"
+/// Merge the trains the workers send for `partitions[w]`, two spans a frame.
+fn merge(partitions: &[&[u64]]) -> Option<UniqueFilter> {
+    let frame_schema = pk_only_schema(&[TypeCode::U64]);
+    let (reactor, writers) = reactor_with_rings(partitions.len());
+    let lease = reactor.lease_train(WorkerSet::ALL, SalMessageKind::UniquePreflight);
+    for (writer, keys) in writers.iter().zip(partitions) {
+        let keys: Vec<[u8; 8]> = keys.iter().map(|k| k.to_be_bytes()).collect();
+        let mut producer = key_producer(8, &keys);
+        send_unique_preflight_keys(
+            writer,
+            1,
+            &frame_schema,
+            lease.id(),
+            gnitz_wire::MAX_FRAME_PAYLOAD,
+            2,
+            &mut producer,
         );
     }
-    assert!(
-        seed.proves_all_absent([span(999).pk_bytes()].into_iter()),
-        "and nothing else"
-    );
+    reactor.block_on(async move { merge_index_scan(&lease, &frame_schema).await.expect("no fault") })
 }
 
-/// A duplicate found after the cap has been crossed is still detected — the
-/// verdict never depends on the seed.
+/// An equal pair is a duplicate whether two workers hold it or one worker's
+/// frames split it.
 #[test]
-fn accumulator_duplicate_after_cap_crossing() {
-    let mut acc = PreflightAccumulator::new(2);
-    assert!(offer_all(&mut acc, &[span(1), span(2), span(3), span(4)]));
-    assert!(!acc.offer(span(4)));
-    assert!(acc.duplicate);
-    assert!(acc.into_seed().capped());
+fn merge_finds_a_duplicate_within_or_across_workers() {
+    assert!(merge(&[&[1, 3, 7], &[2, 3]]).is_none(), "across workers");
+    assert!(merge(&[&[1, 2, 2, 4], &[3]]).is_none(), "across one worker's frames");
+}
+
+/// A duplicate-free merge seeds the filter with exactly the distinct spans,
+/// empty partitions included.
+#[test]
+fn a_duplicate_free_merge_seeds_every_span() {
+    let mut seed = merge(&[&[1, 4, 6, 9, 11], &[], &[2, 3, 10]]).expect("no duplicate");
+    seed.mark_warm();
+    let absent = |k: u64| seed.proves_all_absent([&k.to_be_bytes()[..]].into_iter());
+    for k in [1, 2, 3, 4, 6, 9, 10, 11] {
+        assert!(!absent(k), "{k} is seeded");
+    }
+    for k in [0, 5, 7, 12] {
+        assert!(absent(k), "{k} is not");
+    }
 }

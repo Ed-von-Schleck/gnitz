@@ -106,6 +106,49 @@ fn a_dropped_lease_releases_the_frames_it_holds() {
     assert_eq!(r.inner.w2m.release_cursor(0), r.inner.w2m.write_cursor(0));
 }
 
+/// `next` yields exactly the frames that carry rows, workers in ascending order,
+/// and ends once every worker's terminal frame is read — a row-less one
+/// included. Every slot it passes over is released at its ring.
+#[test]
+fn next_yields_the_row_frames_and_releases_the_rest() {
+    let (r, writers) = reactor_with_rings(2);
+    let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::ScanSpec);
+    let schema = crate::test_support::make_schema_u64_i64();
+    let rows = |pk| crate::test_support::make_batch(&schema, &[(pk, 1, 0)]);
+    let send = |w: usize, last, batch: Option<&gnitz_store::storage::Batch>| {
+        let msg = crate::runtime::wire::WireMsg {
+            flags: gnitz_wire::WireFlags::train_frame(last),
+            data: batch.map_or(
+                crate::runtime::wire::WireData::None,
+                crate::runtime::wire::WireData::Whole,
+            ),
+            ..Default::default()
+        };
+        writers[w].send_msg(lease.id(), &msg);
+    };
+    send(0, false, None);
+    send(0, false, Some(&rows(1)));
+    send(0, true, None);
+    send(1, true, Some(&rows(2)));
+    r.drain_all_w2m();
+
+    for (w, pk) in [(0u32, 1u64), (1, 2)] {
+        let f = try_poll_once(lease.next())
+            .expect("routed")
+            .expect("no fault")
+            .expect("a row frame");
+        assert_eq!(f.slot.worker, w, "frames arrive in worker order");
+        assert_eq!(f.rows(&schema).view().get_pk_bytes(0), pk.to_be_bytes());
+    }
+    assert!(try_poll_once(lease.next())
+        .expect("routed")
+        .expect("no fault")
+        .is_none());
+    for w in 0..2 {
+        assert_eq!(r.inner.w2m.release_cursor(w), r.inner.w2m.write_cursor(w), "worker {w}");
+    }
+}
+
 /// Instructions retired per op round trip: submit, pending poll, CQE, ready poll.
 /// Run under `perf stat -e instructions:u`.
 #[test]
