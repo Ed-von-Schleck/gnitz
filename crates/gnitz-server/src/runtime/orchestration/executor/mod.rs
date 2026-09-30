@@ -707,19 +707,15 @@ fn decode_push_frame(
 /// Handle a client push: decode the frame, then commit it under the catalog read
 /// lock and the target's table lock(s).
 ///
-/// One handler for both batch shapes. An empty batch is a legitimate empty Z-Set
-/// delta, so it is ACKed with the "nothing written" LSN `0` — but only after the
-/// same existence + writability gate a non-empty push passes, so a client bug
-/// that happens to produce an empty batch (a `delete` with an empty pk list)
-/// fails the way a non-empty one would instead of being masked by a no-op ACK.
-async fn handle_push(
-    shared: &Rc<Shared>,
-    peer: &Peer,
-    buf: RecvBuf,
-    ctrl: gnitz_wire::control::DecodedControl,
-) -> Result<(), WireFault> {
+/// One handler for both batch shapes. An empty delta — a frame with no data
+/// block — is ACKed with the "nothing written" LSN `0`, but only after the same
+/// existence, writability and stream-mode gates a non-empty push passes, so a
+/// client bug that happens to produce an empty batch (a `delete` with an empty
+/// pk list) fails the way a non-empty one would instead of being masked by a
+/// no-op ACK.
+async fn handle_push(shared: &Rc<Shared>, peer: &Peer, buf: RecvBuf, ctrl: DecodedControl) -> Result<(), WireFault> {
     let target_id = ctrl.hdr.target_id;
-    let flags = ctrl.hdr.flags;
+    let mode = ctrl.hdr.flags.conflict_mode;
 
     let (decoded, _charge) = buf.decode(|data| decode_push_frame(shared.cat(), data, ctrl));
     let (decoded, seen) = decoded?;
@@ -727,40 +723,31 @@ async fn handle_push(
         hold_push_for_ddl(shared, target_id, &seen).await;
     }
     let catalog = shared.catalog_rwlock.read().await;
-    let kind = target_kind(shared, target_id, Access::Write)?;
+    // Under the catalog guard, not at decode: a dropped id can be re-created as
+    // a stream between the two, and the stream rules below read the kind.
+    let is_stream = target_kind(shared, target_id, Access::Write)? == RelationKind::Stream;
+    if is_stream {
+        check_stream_push(target_id, decoded.data_batch.as_ref(), mode)?;
+    }
 
-    let batch = match decoded.data_batch {
-        Some(b) if !b.is_empty() => b,
-        _ => {
-            send_push_ack(peer, target_id, 0);
-            return Ok(());
-        }
+    let Some(batch) = decoded.data_batch else {
+        send_push_ack(peer, target_id, 0);
+        return Ok(());
     };
 
     shared.cat().recheck_record(target_id, &seen)?;
-
-    let mode = flags.conflict_mode;
-
-    // Not at the decode boundary: the block validator runs there without a
-    // relation kind, and must keep admitting a base table's retractions.
-    if kind == RelationKind::Stream {
-        if let Some(e) = stream_push_error(target_id, &batch, mode) {
-            return Err(e.into());
-        }
-    }
 
     // The validator's own predicate decides the guard: a push that reads no
     // committed state cannot be invalidated by a concurrent one, so it may share
     // its table's lock and reach the committer alongside other pushes to the same
     // table, which fold into one SAL zone and one fsync. Every other push takes
     // all FK-related table locks exclusively.
-    let reads_committed = shared.cat().push_reads_committed_state(target_id, mode);
-    let held = if !reads_committed {
-        shared.lock_table_shared(target_id).await
-    } else {
+    let held = if shared.cat().push_reads_committed_state(target_id, mode) {
         shared
             .lock_tables_exclusive(shared.cat().fk_lock_set(target_id).collect())
             .await
+    } else {
+        shared.lock_table_shared(target_id).await
     };
 
     // Distributed validation (PK / FK / unique indices). A plain push is a
@@ -774,7 +761,6 @@ async fn handle_push(
         .await?;
     let TxnFamily { batch, .. } = family;
 
-    let is_stream = kind == RelationKind::Stream;
     let zone_lsn = shared
         .commit(&catalog, &held, [target_id], |done| {
             CommitRequest::Push(PendingPush {
@@ -811,21 +797,12 @@ async fn handle_push_txn(
     //    catalog-dependent rules per family.
     let catalog = shared.catalog_rwlock.read().await;
     for head in &heads {
-        let tid = head.tid;
-        // The plain-push arm's gate. Refusing a stream keeps every family
-        // `recoverable`, so a transaction always opens a zone.
-        let kind = target_kind(shared, tid, Access::Write)?;
-        if kind == RelationKind::Stream {
-            return Err(format!("table {tid} is a stream: a stream cannot be written inside a transaction").into());
-        }
-        shared.cat().recheck_record(tid, &head.seen)?;
+        target_kind(shared, head.tid, Access::TxnWrite)?;
+        shared.cat().recheck_record(head.tid, &head.seen)?;
     }
 
     // 3. Acquire the per-table lock union ⋃ fk_lock_set(tid) exclusively.
-    let mut union: Vec<u64> = Vec::new();
-    for fam in &families {
-        union.extend(shared.cat().fk_lock_set(fam.tid));
-    }
+    let union = families.iter().flat_map(|f| shared.cat().fk_lock_set(f.tid)).collect();
     let held = shared.lock_tables_exclusive(union).await;
 
     // 3b. OCC. A blind family's `BLIND` basis no commit exceeds.
@@ -879,11 +856,6 @@ fn decode_push_txn_frame(cat: &CatalogEngine, body: &[u8]) -> Result<DecodedTxn,
             ..e
         })?;
         let batch = wire.data_batch.expect("a PUSH_TXN item carries a data block");
-        // A zero-row block passes the item shape check, and an empty family
-        // would open a zone and bump its tables' commit LSN.
-        if batch.is_empty() {
-            return Err(format!("TXN: empty batch for table {tid}").into());
-        }
         heads.push(TxnHead { tid, basis, seen });
         families.push(TxnFamily { tid, mode, batch });
     }
@@ -907,11 +879,15 @@ enum Access {
     /// concatenate W identical trains and inflate every row's weight W-fold.
     UserRead,
     Write,
+    /// A write inside a `PUSH_TXN`. Refusing a stream keeps every family
+    /// `recoverable`, so a transaction always opens a zone.
+    TxnWrite,
 }
 
 /// Resolve `target_id`'s kind, rejecting one that cannot serve `access`.
 ///
-/// A stream holds no rows, so it may be written but not read. A view may be read
+/// A stream holds no rows, so it may be written (outside a transaction) but not
+/// read. A view may be read
 /// but not written: a push would commit rows its circuit never produced.
 ///
 /// Enforced here even though the SQL binder refuses both: the C and Python bindings
@@ -931,8 +907,11 @@ fn target_kind(shared: &Shared, target_id: u64, access: Access) -> Result<Relati
         Access::UserRead if kind == RelationKind::SystemCatalog => {
             Err(format!("table {target_id} is a system catalog family: this read has only a fan-out form").into())
         }
-        Access::Write if !kind.is_ingestion_point() => {
+        Access::Write | Access::TxnWrite if !kind.is_ingestion_point() => {
             Err(format!("table {target_id} is not writable: pushes must target a base table or a stream").into())
+        }
+        Access::TxnWrite if kind == RelationKind::Stream => {
+            Err(format!("table {target_id} is a stream: a stream cannot be written inside a transaction").into())
         }
         _ => Ok(kind),
     }
@@ -1397,25 +1376,26 @@ fn send_fault(peer: &Peer, target_id: u64, fault: &WireFault) {
     )
 }
 
-/// Why a stream cannot accept this push, or `None` if it can. Both rules restate
-/// what a stream lacks — a unique primary key, and any retraction at all — and
-/// rejecting `Error` mode is what keeps `push_reads_committed_state` false, and
-/// with it the shared table lock and the unread mode field.
-fn stream_push_error(target_id: u64, batch: &Batch, mode: gnitz_wire::WireConflictMode) -> Option<String> {
+/// Refuse a push a stream cannot accept; `batch` is `None` for an empty delta.
+/// Both rules restate what a stream lacks — a unique primary key, and any
+/// retraction at all — and rejecting `Error` mode is what keeps
+/// `push_reads_committed_state` false, and with it the shared table lock and a
+/// validator that would probe a stream's absent store.
+fn check_stream_push(target_id: u64, batch: Option<&Batch>, mode: gnitz_wire::WireConflictMode) -> Result<(), String> {
     if mode == gnitz_wire::WireConflictMode::Error {
-        return Some(format!(
+        return Err(format!(
             "table {target_id} is a stream: conflict mode 'error' asserts a primary-key \
              uniqueness a stream does not have"
         ));
     }
-    if batch.all_weights_positive() {
-        return None;
-    }
+    let Some(batch) = batch.filter(|b| !b.all_weights_positive()) else {
+        return Ok(());
+    };
     // Located again only to name it in the message.
     let i = (0..batch.len())
         .find(|&i| batch.get_weight(i) <= 0)
         .expect("just found one");
-    Some(format!(
+    Err(format!(
         "table {target_id} is a stream: a stream is append-only, but row {i} of this push carries \
          weight {}",
         batch.get_weight(i)

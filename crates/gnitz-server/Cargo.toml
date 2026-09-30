@@ -21,7 +21,7 @@ rcgen.workspace = true
 [dev-dependencies]
 # Dev-only, and deliberately not a real dependency: the client half of the
 # DDL-bundle client→server pairing and of the layout-digest agreement (the
-# schema-codec suite), and the client batches the executor tests push.
+# schema-codec suite).
 gnitz-core = { path = "../gnitz-core" }
 gnitz-store-testkit = { path = "../gnitz-store-testkit" }
 proptest.workspace = true

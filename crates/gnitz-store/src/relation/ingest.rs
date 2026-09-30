@@ -116,16 +116,14 @@ impl RelationRegistry {
         needed: bool,
     ) -> Result<Option<Batch>, String> {
         let (id, kind) = (entry.id(), entry.kind);
-        // A stream's rows exist only as the deltas they produce.
-        if kind == RelationKind::Stream {
-            return Ok(needed.then_some(batch));
-        }
         let effective = match kind {
+            // A stream's rows exist only as the deltas they produce.
+            RelationKind::Stream => return Ok(needed.then_some(batch)),
             RelationKind::BaseTable => super::unique_pk::enforce_unique_pk(entry.store.held(), batch),
             // Folded once for the store, the delta capture and every reader of the
             // echo, which all read a view's output at net weights.
             RelationKind::View(_) => batch.into_consolidated(),
-            RelationKind::SystemCatalog | RelationKind::Stream => batch,
+            RelationKind::SystemCatalog => batch,
         };
         if effective.count == 0 {
             return Ok(needed.then_some(effective));

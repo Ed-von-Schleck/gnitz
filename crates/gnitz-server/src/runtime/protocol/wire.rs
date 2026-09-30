@@ -249,6 +249,10 @@ pub fn unknown(_: &[u8]) -> Result<Option<SchemaDescriptor>, String> {
 /// trusted. `recordless` lays out a frame that carries no record; `known` answers
 /// what a record decodes to when that is already known (`Ok(None)`: decode it),
 /// or refuses the frame.
+///
+/// A data block with no rows is refused: an empty delta ships no block (as
+/// [`WireMsg`] encodes one), so a present block always carries a row, and no
+/// handler opens a zone or bumps a commit LSN for nothing.
 pub fn decode_client_frame(
     data: &[u8],
     control: DecodedControl,
@@ -256,7 +260,11 @@ pub fn decode_client_frame(
     known: impl FnOnce(&[u8]) -> Result<Option<SchemaDescriptor>, String>,
 ) -> Result<DecodedWire, String> {
     decode_frame(data, control, recordless, known, |b, s| {
-        Batch::decode_foreign_wal_block(b, s)
+        let batch = Batch::decode_foreign_wal_block(b, s)?;
+        if batch.is_empty() {
+            return Err("a data block with no rows");
+        }
+        Ok(batch)
     })
 }
 

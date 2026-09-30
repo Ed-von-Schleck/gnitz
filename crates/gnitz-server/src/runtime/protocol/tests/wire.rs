@@ -2,7 +2,7 @@ use crate::runtime::wire::{decode_client_frame, decode_sal_slot, unknown, WireDa
 use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, make_string_batch, weighted_rows};
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder, Layout};
-use gnitz_wire::control::{peek_control_block, ControlHeader};
+use gnitz_wire::control::{encode_frame_head, frame_head_size, peek_control_block, ControlHeader};
 use gnitz_wire::{ClientVerb, TypeCode, WireFlags, WireStatus};
 
 /// The source batch and the rows of it `data` sends, in the order it sends them.
@@ -242,4 +242,14 @@ fn a_client_frame_keeps_no_claim_and_needs_a_schema() {
         .data_batch
         .expect("rows");
     assert_eq!(weighted_rows(&got), weighted_rows(&batch));
+
+    // A well-formed block of zero rows, which `WireMsg` never emits.
+    let empty = make_batch(&sd, &[]);
+    let mut hollow = vec![0; frame_head_size(0, None) + empty.wire_byte_size()];
+    let pos = encode_frame_head(&mut hollow, &ControlHeader::default(), &[], None, true);
+    empty.encode_to_wire(&mut hollow[pos..]);
+    assert_eq!(
+        decode(&hollow, Some(&sd), unknown).err().as_deref(),
+        Some("a data block with no rows")
+    );
 }
