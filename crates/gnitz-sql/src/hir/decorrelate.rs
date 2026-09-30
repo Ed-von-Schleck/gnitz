@@ -2,7 +2,6 @@
 //! Bind reads each subquery through its column ([`SubqueryRef::id`]); its join
 //! produces that column.
 
-use super::guards::reject_nullable_in;
 use super::{as_col, split_filter, ColId, HirExpr, JoinType, ProjEntry, RelExpr, SubqueryKind, SubqueryRef};
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
@@ -147,4 +146,28 @@ fn zero_absent_counts(e: HirExpr, counts: &[ColId]) -> HirExpr {
         })
     });
     out
+}
+
+/// An IN over a nullable operand is three-valued; only a top-level conjunct — a
+/// semi-join, where WHERE reads NULL as false — computes it exactly.
+fn reject_nullable_in(kind: JoinType, s: &SubqueryRef) -> Result<(), GnitzSqlError> {
+    if !matches!(s.kind, SubqueryKind::Exists { nullable: true }) {
+        return Ok(());
+    }
+    match kind {
+        JoinType::Anti => Err(GnitzSqlError::Rejected(
+            "NOT IN (SELECT …) requires the outer operand and the subquery column to be \
+             NOT NULL (SQL's NULL semantics diverge from the anti-join otherwise); \
+             use NOT EXISTS with an explicit equality instead"
+                .into(),
+        )),
+        JoinType::Mark(_) => Err(GnitzSqlError::Rejected(
+            "IN (SELECT …) in a mark position (under OR/NOT, in CASE, or projected) requires \
+             the outer operand and the subquery column to be NOT NULL — SQL's 3VL diverges \
+             from the two-valued mark; use a top-level AND `x IN (SELECT …)` conjunct, or \
+             NOT EXISTS with an explicit equality"
+                .into(),
+        )),
+        _ => Ok(()),
+    }
 }

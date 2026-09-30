@@ -142,23 +142,6 @@ def test_a_grouped_or_joined_decimal_key_keeps_its_scale(client, priced):
     assert bag(scanned(client, sn, "j"), "id", "label") == {(1, 90): 1, (2, 91): 1}
 
 
-def test_two_decimals_meet_only_at_one_scale(client, priced):
-    """A set operation and an equijoin both compare stored integers, and two
-    scales make that comparison meaningless — 1.20 at scale 2 is 120, at scale 3
-    it is 1200. Each pair is refused at plan time rather than compared wrongly,
-    and an integer is refused for the same reason: it carries no scale at all."""
-    client.execute_sql(
-        "CREATE TABLE t2 (id BIGINT NOT NULL PRIMARY KEY, qty NUMERIC(8, 3) NOT NULL)",
-        schema_name=priced)
-    for body, message in (
-        ("SELECT price FROM t UNION SELECT qty FROM t", "type mismatch"),
-        ("SELECT a.id FROM t a JOIN t2 ON a.price = t2.qty", "same scale"),
-        ("SELECT a.id FROM t a JOIN t2 ON a.price = t2.id", "same scale"),
-    ):
-        with pytest.raises(gnitz.GnitzError, match=message):
-            client.execute_sql(f"CREATE VIEW v AS {body}", schema_name=priced)
-
-
 def test_a_literal_is_the_decimal_it_spells(client, schema_name):
     """A numeric literal carries every digit it was written with, not a float's
     shortest print: a cell keeps digits past 17 and rounds from all of them, and

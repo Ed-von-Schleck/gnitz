@@ -10,6 +10,7 @@ mod plan_read;
 mod plan_view_circuit;
 mod plan_view_rejections;
 mod plan_view_schema;
+mod plan_view_window;
 
 use std::cell::RefCell;
 

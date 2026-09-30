@@ -29,24 +29,13 @@ fn a_size_is_a_positive_integer_and_a_binary_unit() {
 }
 
 #[test]
-fn the_option_list_fills_the_two_budgets_and_refuses_anything_else() {
-    let both = options_of("WITH (capacity = '1 MB', delta = '2 MB')");
-    assert!(matches!(both, Err(GnitzSqlError::Rejected(ref m)) if m.contains("delta feed")));
-    let cap = options_of("WITH (capacity = '1 MB')").unwrap();
-    assert_eq!(cap, ViewProps::Bounded { capacity_bytes: 1 << 20 });
-    let delta = options_of("WITH (DELTA = '2 KB')").unwrap();
-    assert_eq!(delta, ViewProps::Fed { delta_bytes: 2 << 10 });
-    match options_of("WITH (foo = '1 MB')") {
-        Err(GnitzSqlError::Rejected(m)) => assert!(m.contains("unknown CREATE VIEW option 'foo'"), "{m}"),
-        other => panic!("{other:?}"),
-    }
-    for (with, needle) in [
-        ("WITH (capacity = 5)", "single-quoted"),
-        ("WITH (delta = 'lots')", "`delta`"),
-    ] {
-        match options_of(with) {
-            Err(GnitzSqlError::Rejected(m)) => assert!(m.contains(needle), "{with}: {m}"),
-            other => panic!("{with}: {other:?}"),
-        }
-    }
+fn each_budget_decodes_to_its_view_class() {
+    assert_eq!(
+        options_of("WITH (capacity = '1 MB')").unwrap(),
+        ViewProps::Bounded { capacity_bytes: 1 << 20 }
+    );
+    assert_eq!(
+        options_of("WITH (delta = '2 KB')").unwrap(),
+        ViewProps::Fed { delta_bytes: 2 << 10 }
+    );
 }

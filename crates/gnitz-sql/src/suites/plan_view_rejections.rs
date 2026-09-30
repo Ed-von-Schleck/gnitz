@@ -9,7 +9,8 @@ use gnitz_wire::{ColType, ColumnDef, RelClass, TypeCode, PK_LIST_MAX_COLS};
 /// `m` (integer and float payloads for grouped bodies), `p3` (a three-column
 /// PK), `wide_a`/`wide_b` (one join key past the arity cap), `wl`/`wr` (33
 /// columns each), `st` (a stream), `x` (a DATE and two DECIMAL columns beside an
-/// integer, a float and a string), `tt` (a TIMESTAMP), and two join views over duplicated names —
+/// integer, a float and a string), `tt` (a TIMESTAMP), `xd` (a DECIMAL at `x.qty`'s
+/// scale), and two join views over duplicated names —
 /// `jv`, where `id` and `v` each appear twice, and `ju`, where only `v` does.
 fn cat() -> Catalog<'static> {
     let i = TypeCode::I64;
@@ -84,6 +85,17 @@ fn cat() -> Catalog<'static> {
         (
             "tt",
             table(52, vec![col("id", i), ncol("ts", TypeCode::Timestamp)], vec![0]),
+        ),
+        (
+            "xd",
+            table(
+                54,
+                vec![
+                    col("id", i),
+                    ColumnDef::typed("q3", ColType { tc: TypeCode::Decimal, scale: 3 }, false),
+                ],
+                vec![0],
+            ),
         ),
         (
             "w64",
@@ -170,6 +182,18 @@ fn join_key_rules() {
                 "may be keyless",
             ),
             ("SELECT * FROM ty JOIN w ON ty.s < w.s", "Rejected", "order-preserving"),
+            (
+                "SELECT x.id FROM x JOIN xd ON x.price = xd.q3",
+                "Rejected",
+                "same scale",
+            ),
+            ("SELECT x.id FROM x JOIN xd ON x.i = xd.q3", "Rejected", "same scale"),
+            (
+                "SELECT a.id FROM a JOIN b USING (v)",
+                "Rejected",
+                "not found on the right of the join",
+            ),
+            ("SELECT a.id FROM a, LATERAL (SELECT k FROM b) d", "Rejected", "LATERAL"),
             (
                 "SELECT * FROM p3 JOIN c ON p3.x < c.v",
                 "Rejected",
@@ -287,6 +311,9 @@ fn subquery_rules() {
         &[
             ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND a.v > 5)", "Rejected", "hoist it into the view's own WHERE"),
             ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w <> a.v)", "Rejected", "match-existence"),
+            ("SELECT * FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w <> a.v)", "Rejected", "match-existence"),
+            ("SELECT * FROM a WHERE v = 1 OR EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w <> a.v)", "Rejected", "match-existence"),
+            ("SELECT a.id FROM a WHERE a.v < ANY (SELECT v FROM n)", "Rejected", "must be NOT NULL"),
             ("SELECT * FROM n WHERE k NOT IN (SELECT k FROM b)", "Rejected", "NOT NULL"),
             ("SELECT * FROM a WHERE k NOT IN (SELECT k FROM n)", "Rejected", "NOT NULL"),
             ("SELECT * FROM a WHERE (k, v) IN (SELECT k, w FROM b)", "Rejected", "tuple"),
@@ -448,6 +475,27 @@ fn grouped_body_rules() {
                 "names a wildcard",
             ),
             ("SELECT v FROM t GROUP BY ALL", "Rejected", "GROUP BY"),
+            // Every DISTINCT aggregate of a body rides one distinct set.
+            (
+                "SELECT COUNT(DISTINCT a), COUNT(DISTINCT b) FROM m",
+                "Rejected",
+                "same argument",
+            ),
+            (
+                "SELECT COUNT(DISTINCT a), COUNT(*) FROM m",
+                "Rejected",
+                "plain aggregate",
+            ),
+            ("SELECT COUNT(DISTINCT a), SUM(a) FROM m", "Rejected", "plain aggregate"),
+            (
+                "SELECT COUNT(DISTINCT a), COUNT(a) FROM m",
+                "Rejected",
+                "plain aggregate",
+            ),
+            // MIN/MAX rides the set only for the argument the set is built from.
+            ("SELECT COUNT(DISTINCT a), MAX(b) FROM m", "Rejected", "plain aggregate"),
+            ("SELECT COUNT(DISTINCT f) FROM m", "Rejected", "cannot be a key"),
+            ("SELECT COUNT(DISTINCT *) FROM m", "Rejected", "needs a column argument"),
         ],
     );
 }
@@ -470,7 +518,18 @@ fn a_date_never_pairs_with_a_timestamp_key() {
                 "differ in unit (days vs microseconds)",
             ),
             (
+                "SELECT x.id FROM x JOIN tt ON x.d < tt.ts",
+                "Rejected",
+                "differ in unit (days vs microseconds)",
+            ),
+            (
                 "SELECT id, d FROM x UNION ALL SELECT id, ts FROM tt",
+                "Rejected",
+                "column 1 type mismatch",
+            ),
+            // Nor does either union with its storage integer.
+            (
+                "SELECT id, d FROM x UNION ALL SELECT id, i32c FROM ty",
                 "Rejected",
                 "column 1 type mismatch",
             ),
@@ -540,6 +599,11 @@ fn set_op_and_distinct_rules() {
             ),
             (
                 "SELECT id, g FROM t UNION ALL SELECT id, s FROM ty",
+                "Rejected",
+                "type mismatch",
+            ),
+            (
+                "SELECT price FROM x UNION SELECT qty FROM x",
                 "Rejected",
                 "type mismatch",
             ),
@@ -801,6 +865,8 @@ fn ambiguous_and_hidden_column_rules() {
             ("SELECT _join_pk FROM jv", "Rejected", "not found"),
             // A qualifier naming no relation in scope is not a decoration.
             ("SELECT b.id FROM t", "Rejected", "not found"),
+            ("SELECT id FROM t WHERE b.id = 1", "Rejected", "not found"),
+            ("SELECT id FROM t AS x WHERE t.id = 1", "Rejected", "not found"),
             (
                 "SELECT t.id AS x FROM t JOIN u ON t.id = u.id JOIN a USING (v)",
                 "Rejected",

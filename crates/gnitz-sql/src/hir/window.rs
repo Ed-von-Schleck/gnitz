@@ -417,6 +417,12 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
                  order-preserving, so it cannot bound the band join the window folds over"
             )));
         }
+        if slot == KeySlot::Residual && tc.is_wide_int() {
+            return Err(GnitzSqlError::Rejected(format!(
+                "{role}: a 128-bit key can only be the first ORDER BY key; a later key is \
+                 compared in an expression, which a 128-bit value cannot enter"
+            )));
+        }
         if !self.never_null(e) {
             return Err(GnitzSqlError::Rejected(format!(
                 "{role}: the key must be provably NOT NULL (a NOT NULL column, or an expression over \

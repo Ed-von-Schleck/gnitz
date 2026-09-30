@@ -176,7 +176,3 @@ fn place_pk_front(slots: &mut Vec<(ProjItem, Option<ColId>, ColumnDef)>, source:
         slots.insert(target, slot);
     }
 }
-
-#[cfg(test)]
-#[path = "tests/physical.rs"]
-mod tests;

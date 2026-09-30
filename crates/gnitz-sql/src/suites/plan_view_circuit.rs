@@ -31,6 +31,7 @@ enum Node {
     WorkerFilter,
     NullExtend,
     Filter,
+    TopN,
 }
 use Node::*;
 
@@ -46,6 +47,7 @@ impl Node {
         WorkerFilter,
         NullExtend,
         Filter,
+        TopN,
     ];
 
     fn matches(self, op: &OpNode) -> bool {
@@ -60,6 +62,7 @@ impl Node {
             WorkerFilter => matches!(op, OpNode::WorkerFilter),
             NullExtend => matches!(op, OpNode::NullExtend { .. }),
             Filter => matches!(op, OpNode::Filter(_)),
+            TopN => matches!(op, OpNode::TopN { .. }),
         }
     }
 }
@@ -211,6 +214,16 @@ const SHAPES: &[Row] = &[
     ("SELECT k, COUNT(*) AS n FROM (SELECT id, g AS k FROM t) d GROUP BY k", 1, &[&[1]], &[(Reduce, 1)]),
     ("SELECT DISTINCT g + 1 AS g1, v FROM t", 1, &[&[0]], &[(Distinct, 1)]),
     ("SELECT v * 2 AS x FROM t EXCEPT SELECT g FROM u", 1, &[&[0], &[0]], &[(Distinct, 1), (PositivePart, 1)]),
+    // Window: a whole-partition frame joins the source to one reduce over it; a
+    // cumulative frame folds over a band self-join first.
+    ("SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM t", 2, &[&[1]], &[(EquiJoin, 2), (Reduce, 1)]),
+    ("SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS s FROM t", 2, &[&[1]], &[(EquiJoin, 2), (Reduce, 1)]),
+    ("SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v) AS s FROM t", 5, &[&[0, 1], &[1, 2], &[2, 3]], &[(EquiJoin, 2), (RangeJoin, 2), (Reduce, 2)]),
+    // A QUALIFY bounding an unprojected ROW_NUMBER is a top-N per partition,
+    // with no band join; a projected one is the ranking desugar.
+    ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) <= 2", 2, &[&[1]], &[(TopN, 1)]),
+    ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) < 3", 2, &[&[1]], &[(TopN, 1)]),
+    ("SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t QUALIFY rn <= 2", 5, &[&[0, 1], &[1, 2, 0], &[2, 3, 4, 5]], &[(EquiJoin, 2), (RangeJoin, 2), (Reduce, 2), (Filter, 2)]),
 ];
 
 #[test]

@@ -12,7 +12,6 @@
 mod bind;
 mod create;
 mod decorrelate;
-mod guards;
 mod lower;
 mod physical;
 mod place;
@@ -666,12 +665,13 @@ impl JoinClass {
 /// Per-column common type for a set-op pair, or `None` to keep the exact-match
 /// type-mismatch error. A differing pair is admitted only where the lowering's
 /// column copy can widen into the target, which `check_copy_types` decides with
-/// this same predicate.
+/// this same predicate. A DATE or TIMESTAMP pairs only with itself: the join-key
+/// ladder reads it as its storage integer, which would retype the column.
 fn set_op_common_type(l: ColType, r: ColType) -> Option<ColType> {
     if l == r {
         return Some(l);
     }
-    if !l.decimal_domains_match(r) {
+    if !l.decimal_domains_match(r) || l.tc.is_temporal() || r.tc.is_temporal() {
         return None;
     }
     let t = l.tc.join_key_common_type(r.tc).ok()?;

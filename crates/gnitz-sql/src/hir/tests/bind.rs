@@ -35,16 +35,12 @@ pub(in crate::hir) fn bound(sql: &str) -> Result<Rc<RelExpr>, GnitzSqlError> {
     bind_body(&mut cx, body)
 }
 
-/// Bind one `CREATE VIEW` body and return its output columns.
-fn bound_cols(sql: &str) -> Result<Vec<HirCol>, GnitzSqlError> {
-    bound(sql).map(|r| r.cols())
-}
-
 /// `(name, type, nullable)` of every output column — what a projection item's
 /// def declares, and what the view schema publishes.
 fn shape(sql: &str) -> Vec<(String, TypeCode, bool)> {
-    bound_cols(sql)
+    bound(sql)
         .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+        .cols()
         .iter()
         .map(|c| (c.def.name.clone(), c.def.ty.tc, c.def.is_nullable))
         .collect()
@@ -54,36 +50,10 @@ fn s(name: &str, tc: TypeCode, nullable: bool) -> (String, TypeCode, bool) {
     (name.to_string(), tc, nullable)
 }
 
+/// A RIGHT join widens the left side's columns, and the projection resolves
+/// against that widened scope.
 #[test]
-fn a_linear_body_names_and_types_its_projection() {
-    assert_eq!(
-        shape("SELECT id, b AS bee, a + 1 FROM t"),
-        vec![
-            s("id", TypeCode::I64, false),
-            s("bee", TypeCode::I64, true),
-            // A computed column is always declared nullable, never inferred.
-            s("_expr2", TypeCode::I64, true),
-        ]
-    );
-    assert_eq!(
-        shape("SELECT * FROM t"),
-        vec![
-            s("id", TypeCode::I64, false),
-            s("a", TypeCode::I64, false),
-            s("b", TypeCode::I64, true),
-            s("f", TypeCode::F64, true),
-        ]
-    );
-}
-
-/// A LEFT join widens the preserved-away side's columns, and the projection
-/// resolves against that widened scope.
-#[test]
-fn a_join_body_projects_the_widened_scope() {
-    assert_eq!(
-        shape("SELECT t.id, u.a FROM t LEFT JOIN u ON t.a = u.a"),
-        vec![s("id", TypeCode::I64, false), s("a", TypeCode::I64, true)]
-    );
+fn a_right_join_body_projects_the_widened_scope() {
     assert_eq!(
         shape("SELECT t.id, u.a FROM t RIGHT JOIN u ON t.a = u.a"),
         vec![s("id", TypeCode::I64, true), s("a", TypeCode::I64, false)]
@@ -116,181 +86,85 @@ fn a_grouped_body_types_computed_keys_and_arguments() {
         // finalize is nullable.
         vec![s("_expr0", TypeCode::I64, true), s("_sum1", TypeCode::I64, true)]
     );
-    // A nullable SUM argument carries a COUNT companion, so the finalize is
-    // nullable; COUNT never is.
-    assert_eq!(
-        shape("SELECT a, SUM(b), COUNT(b) FROM t GROUP BY a"),
-        vec![
-            s("a", TypeCode::I64, false),
-            s("_sum1", TypeCode::I64, true),
-            s("_count2", TypeCode::I64, false),
-        ]
-    );
 }
 
-/// AVG renders F64 whatever its argument's type, and is nullable through its
-/// COUNT companion.
-#[test]
-fn avg_renders_f64_and_is_nullable() {
-    assert_eq!(
-        shape("SELECT AVG(a) AS m, AVG(f) AS n FROM t"),
-        vec![s("m", TypeCode::F64, true), s("n", TypeCode::F64, true)]
-    );
-}
-
-#[test]
-fn distinct_and_set_operations_publish_their_projections() {
-    assert_eq!(
-        shape("SELECT DISTINCT a, b FROM t"),
-        vec![s("a", TypeCode::I64, false), s("b", TypeCode::I64, true)]
-    );
-    // A set operation pairs positionally and takes the left side's names; UNION
-    // widens nullability across the pair.
-    assert_eq!(
-        shape("SELECT a FROM t UNION SELECT b FROM t"),
-        vec![s("a", TypeCode::I64, true)]
-    );
-}
-
-/// A qualifier that names no relation in scope is a rejection, not a silently
-/// ignored decoration.
-#[test]
-fn a_mismatched_qualifier_is_rejected() {
-    for sql in [
-        "SELECT b.a FROM t",
-        "SELECT a FROM t WHERE b.a = 1",
-        "SELECT a FROM t AS x WHERE t.a = 1",
-    ] {
-        assert!(bound_cols(sql).is_err(), "{sql} should not bind");
-    }
-}
-
-/// The projection under the reduce's `Distinct`, naming a materialized column
-/// `<computed>`, or `None` when the reduce reads its input directly.
-fn reduce_over_distinct(sql: &str) -> Option<Vec<String>> {
+/// The bound body's reduce, under its HAVING filter if any: its input, and the
+/// physical op of each aggregate column.
+fn reduce_of(sql: &str) -> (Rc<RelExpr>, Vec<gnitz_wire::AggFunc>) {
     let rel = bound(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
     let RelExpr::Project { input, .. } = rel.as_ref() else {
         panic!("{sql}: no projection")
     };
-    let RelExpr::Reduce { input, .. } = input.as_ref() else {
+    let input = match input.as_ref() {
+        RelExpr::Filter { input, .. } => input,
+        _ => input,
+    };
+    let RelExpr::Reduce { input, aggs, .. } = input.as_ref() else {
         panic!("{sql}: no reduce")
     };
-    let RelExpr::Distinct { input } = input.as_ref() else {
-        return None;
-    };
-    let RelExpr::Project { items, .. } = input.as_ref() else {
-        panic!("{sql}: no distinct projection")
-    };
-    Some(
-        items
-            .iter()
-            .map(|e| match e.out.def.is_hidden {
-                true => "<computed>".to_string(),
-                false => e.out.def.name.clone(),
-            })
-            .collect(),
-    )
+    (Rc::clone(input), aggs.iter().map(|c| c.op).collect())
 }
 
-/// A DISTINCT aggregate is the plain aggregate over `Distinct(group cols, arg)`,
-/// whose projection carries exactly the group columns and the argument.
+/// A DISTINCT aggregate is the plain aggregate over `Distinct(group cols, arg)`;
+/// every DISTINCT aggregate of one body rides that one set, HAVING's included.
+/// `MIN`/`MAX(DISTINCT x)` is `MIN`/`MAX(x)`, so it needs no set, and neither
+/// does an argument that keeps the source's PK. Each row names the projection
+/// under the `Distinct` (`<computed>` for a materialized column), or `None`
+/// when the reduce reads its input directly.
 #[test]
-fn a_distinct_aggregate_reduces_over_a_distinct_input() {
-    let names = |sql: &str| reduce_over_distinct(sql).unwrap_or_else(|| panic!("{sql}: no distinct"));
-    assert_eq!(names("SELECT a, COUNT(DISTINCT b) FROM t GROUP BY a"), ["a", "b"]);
-    assert_eq!(names("SELECT COUNT(DISTINCT b) FROM t"), ["b"]);
-    assert_eq!(
-        names("SELECT COUNT(DISTINCT a + 1) FROM t GROUP BY b"),
-        ["b", "<computed>"]
-    );
-    // A group column that is also the argument is carried once.
-    assert_eq!(names("SELECT a, COUNT(DISTINCT a) FROM t GROUP BY a"), ["a"]);
-}
-
-/// Every DISTINCT aggregate of one body rides that one distinct set, and a
-/// MIN/MAX of its argument may ride it too.
-#[test]
-fn distinct_aggregates_of_one_argument_share_the_set() {
-    assert_eq!(
-        reduce_over_distinct("SELECT a, COUNT(DISTINCT b), SUM(DISTINCT b), MAX(DISTINCT b) FROM t GROUP BY a"),
-        Some(vec!["a".to_string(), "b".to_string()])
-    );
-    assert_eq!(
-        shape(
-            "SELECT a, COUNT(DISTINCT b) AS n, SUM(DISTINCT b) AS s, MAX(DISTINCT b) AS m FROM t GROUP BY a \
-             HAVING COUNT(DISTINCT b) > 1"
+fn a_distinct_aggregate_reduces_over_one_distinct_input() {
+    for (sql, want) in [
+        ("SELECT a, COUNT(DISTINCT b) FROM t GROUP BY a", Some(&["a", "b"][..])),
+        ("SELECT COUNT(DISTINCT b) FROM t", Some(&["b"])),
+        (
+            "SELECT COUNT(DISTINCT a + 1) FROM t GROUP BY b",
+            Some(&["b", "<computed>"]),
         ),
-        vec![
-            s("a", TypeCode::I64, false),
-            s("n", TypeCode::I64, false),
-            s("s", TypeCode::I64, true),
-            s("m", TypeCode::I64, true),
-        ]
-    );
-}
-
-/// `MIN`/`MAX(DISTINCT x)` is `MIN`/`MAX(x)`, so the binder drops the qualifier:
-/// such a body plans as its unqualified twin, and keeps company the
-/// all-or-nothing DISTINCT rule would otherwise refuse.
-#[test]
-fn an_inert_distinct_on_min_max_is_dropped() {
-    for sql in [
-        "SELECT a, MAX(DISTINCT b) FROM t GROUP BY a",
-        "SELECT MIN(DISTINCT b), MAX(DISTINCT a) FROM t",
-        "SELECT a, MAX(DISTINCT b), COUNT(*) FROM t GROUP BY a",
+        (
+            "SELECT a, COUNT(DISTINCT b), SUM(DISTINCT b), MAX(DISTINCT b) FROM t GROUP BY a \
+             HAVING COUNT(DISTINCT b) > 1",
+            Some(&["a", "b"]),
+        ),
+        ("SELECT a, MAX(DISTINCT b) FROM t GROUP BY a", None),
+        ("SELECT MIN(DISTINCT b), MAX(DISTINCT a) FROM t", None),
+        // Keeps company the all-or-nothing DISTINCT rule would otherwise refuse.
+        ("SELECT a, MAX(DISTINCT b), COUNT(*) FROM t GROUP BY a", None),
         // A float argument is no key here, because nothing hashes it.
-        "SELECT MIN(DISTINCT f) FROM t",
+        ("SELECT MIN(DISTINCT f) FROM t", None),
+        ("SELECT a, COUNT(DISTINCT id) FROM t GROUP BY a", None),
     ] {
-        assert_eq!(reduce_over_distinct(sql), None, "{sql} should need no distinct set");
-    }
-    // A projection keeping `t`'s PK is already a set, so it is reduced in place.
-    assert_eq!(
-        reduce_over_distinct("SELECT a, COUNT(DISTINCT id) FROM t GROUP BY a"),
-        None
-    );
-    // The qualified and unqualified spellings are one aggregate, not two.
-    assert_eq!(
-        shape("SELECT a, MAX(DISTINCT b) AS m1, MAX(b) AS m2 FROM t GROUP BY a"),
-        vec![
-            s("a", TypeCode::I64, false),
-            s("m1", TypeCode::I64, true),
-            s("m2", TypeCode::I64, true),
-        ]
-    );
-}
-
-#[test]
-fn a_distinct_aggregate_that_cannot_share_one_distinct_set_is_rejected() {
-    for (sql, needle) in [
-        ("SELECT COUNT(DISTINCT a), COUNT(DISTINCT b) FROM t", "same argument"),
-        ("SELECT COUNT(DISTINCT a), COUNT(*) FROM t", "plain aggregate"),
-        ("SELECT COUNT(DISTINCT a), SUM(a) FROM t", "plain aggregate"),
-        ("SELECT COUNT(DISTINCT a), COUNT(a) FROM t", "plain aggregate"),
-        // MIN/MAX rides the set only for the argument the set is built from.
-        ("SELECT COUNT(DISTINCT a), MAX(b) FROM t", "plain aggregate"),
-        ("SELECT COUNT(DISTINCT f) FROM t", "cannot be a key"),
-        ("SELECT COUNT(DISTINCT *) FROM t", "needs a column argument"),
-    ] {
-        match bound_cols(sql).map(|_| ()) {
-            Err(GnitzSqlError::Rejected(m)) => assert!(m.contains(needle), "{sql}: {m}"),
-            other => panic!("{sql}: {other:?}"),
-        }
+        let (input, _) = reduce_of(sql);
+        let got = match input.as_ref() {
+            RelExpr::Distinct { input } => {
+                let RelExpr::Project { items, .. } = input.as_ref() else {
+                    panic!("{sql}: no distinct projection")
+                };
+                let names = items.iter().map(|e| match e.out.def.is_hidden {
+                    true => "<computed>",
+                    false => e.out.def.name.as_str(),
+                });
+                Some(names.collect::<Vec<_>>())
+            }
+            _ => None,
+        };
+        assert_eq!(got.as_deref(), want, "{sql}");
     }
 }
 
 /// Aggregates of one reduce computing the same op over the same argument share
 /// one physical column: over a nullable `b`, SUM's companion, AVG's two columns
-/// and COUNT(b) are the one `Sum(b)` and the one `CountNonNull(b)`.
+/// and COUNT(b) are the one `Sum(b)` and the one `CountNonNull(b)`; a MAX with
+/// and without an inert DISTINCT is one `Max(b)`.
 #[test]
 fn aggregates_of_one_reduce_share_their_physical_columns() {
-    let rel = bound("SELECT SUM(b), AVG(b), COUNT(b) FROM t GROUP BY a").unwrap();
-    let RelExpr::Project { input, items } = rel.as_ref() else {
-        panic!("no projection")
-    };
-    assert_eq!(items.len(), 3);
-    let RelExpr::Reduce { aggs, .. } = input.as_ref() else {
-        panic!("no reduce")
-    };
-    let ops: Vec<_> = aggs.iter().map(|c| c.op).collect();
-    assert_eq!(ops, [gnitz_wire::AggFunc::Sum, gnitz_wire::AggFunc::CountNonNull]);
+    use gnitz_wire::AggFunc::{CountNonNull, Max, Sum};
+    for (sql, want) in [
+        (
+            "SELECT SUM(b), AVG(b), COUNT(b) FROM t GROUP BY a",
+            &[Sum, CountNonNull][..],
+        ),
+        ("SELECT a, MAX(DISTINCT b), MAX(b) FROM t GROUP BY a", &[Max]),
+    ] {
+        assert_eq!(reduce_of(sql).1, want, "{sql}");
+    }
 }
