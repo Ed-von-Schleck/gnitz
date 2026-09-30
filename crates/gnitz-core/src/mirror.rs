@@ -83,11 +83,11 @@ pub trait MirrorStore: Send {
 
     /// Fill `tid`'s erased copy with `blocks`, the view's whole value at `cursor`.
     /// Refused unless the copy holds neither a cursor nor a row.
-    fn reseed(&mut self, tid: u64, blocks: Vec<RawBlock>, cursor: DeltaCursor) -> Result<(), MirrorError>;
+    fn reseed(&mut self, tid: u64, blocks: &[&[u8]], cursor: DeltaCursor) -> Result<(), MirrorError>;
 
     /// Apply `blocks`, the view's deltas after the copy's cursor, and advance it to
     /// `next`. Refused for a copy holding no cursor.
-    fn advance(&mut self, tid: u64, blocks: Vec<RawBlock>, next: DeltaCursor) -> Result<(), MirrorError>;
+    fn advance(&mut self, tid: u64, blocks: &[&[u8]], next: DeltaCursor) -> Result<(), MirrorError>;
 
     /// Run `spec` against `tid`'s copy, replying under `reply_schema`.
     fn scan_spec(
@@ -285,7 +285,8 @@ impl MirrorState {
     ) -> Result<PollResult, ClientError> {
         let (blocks, at) = fetched?;
         let next = prev.advanced_to(at)?;
-        self.store.advance(tid, blocks, next)?;
+        self.store
+            .advance(tid, &blocks.iter().map(RawBlock::block).collect::<Vec<_>>(), next)?;
         Ok(PollResult::Advanced)
     }
 }
@@ -352,7 +353,7 @@ impl GnitzClient {
     /// The one entry that takes **host-supplied** names, so the canonical fold
     /// every catalog gateway applies happens here: a record spelled differently
     /// from the server's row would never match a later local resolve.
-    pub(crate) fn reconcile_registration(&mut self, schema_name: &str, name: &str) -> Result<u64, ClientError> {
+    fn reconcile_registration(&mut self, schema_name: &str, name: &str) -> Result<u64, ClientError> {
         let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
         let name = gnitz_wire::canonical_identifier(name)?;
         let rel = self.resolve_relation(&schema_name, &name)?;
@@ -435,6 +436,8 @@ impl GnitzClient {
             e @ ClientError::Refused(WireFault { status: WireStatus::NotFound, .. }) => {
                 match self.relation_id_moved(tid) {
                     Ok(true) => self.reseed_by_name(tid),
+                    // An interrupt is the call's, not the view's.
+                    Err(i @ ClientError::Interrupted(_)) => Err(i),
                     // Not recreated, or the probe failed too: either way the poll's
                     // own error is the one that says what happened to this view.
                     Ok(false) | Err(_) => Err(e),
@@ -480,7 +483,8 @@ impl GnitzClient {
         let item = self.mirrored_view(tid)?.poll_item(0);
         let (blocks, cursor) = self.delta_read_raw(item)?;
         let m = self.mirror_state()?;
-        m.store.reseed(tid, blocks, cursor)?;
+        m.store
+            .reseed(tid, &blocks.iter().map(RawBlock::block).collect::<Vec<_>>(), cursor)?;
         m.owed_reseed.insert(tid);
         Ok((tid, PollResult::Reseeded))
     }

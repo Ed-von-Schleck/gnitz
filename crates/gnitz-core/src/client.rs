@@ -54,7 +54,7 @@ pub fn not_found(noun: &'static str, schema_name: &str, name: &str) -> ClientErr
 }
 
 /// A `WireStatus::NotFound` refusal raised on this side, worded by the caller.
-pub(crate) fn absent(text: String) -> ClientError {
+fn absent(text: String) -> ClientError {
     ClientError::Refused(WireFault { status: WireStatus::NotFound, text })
 }
 
@@ -1303,7 +1303,7 @@ impl GnitzClient {
     /// Resolve `schema_name` (already canonicalized) to its SCHEMA_TAB id. A
     /// missing row — or an entirely empty SCHEMA_TAB — is a
     /// `NotFound` refusal, like every other catalog absence.
-    pub(crate) fn lookup_schema_id(&mut self, schema_name: &str) -> Result<u64, ClientError> {
+    fn lookup_schema_id(&mut self, schema_name: &str) -> Result<u64, ClientError> {
         let batch = self.sys_rows(SCHEMA_TAB, ReadBound::None)?;
         find_schema_id(&batch, schema_name)?.ok_or_else(|| absent(format!("schema '{schema_name}' not found")))
     }
@@ -1473,13 +1473,6 @@ impl TxnBuffer {
             }
             f.indexed = f.batch.len();
         }
-    }
-
-    /// How many buffered rows are currently folded into the read index — `0`
-    /// for a transaction that has never read its own writes.
-    #[cfg(test)]
-    pub(crate) fn indexed_rows(&self) -> usize {
-        self.families.iter().map(|f| f.indexed).sum()
     }
 
     /// `committed`, a server read of `tid` under `spec`, as this transaction sees

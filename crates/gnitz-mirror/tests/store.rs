@@ -9,9 +9,8 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
-use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RawBlock, Schema, ZSetBatch};
+use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, Schema, ZSetBatch};
 use gnitz_mirror::Mirror;
-use gnitz_store::storage::Batch;
 use gnitz_store_testkit::{
     assert_child_ok, in_child_test, make_batch, make_schema_u64_i64, run_test_in_child, scratch_dir, CHILD_OK,
 };
@@ -49,16 +48,10 @@ fn cursor(tick: u64) -> DeltaCursor {
     }
 }
 
-/// One wire block holding `batch`, as a reply frame would have carried it.
-fn block_of(batch: &Batch) -> RawBlock {
-    RawBlock::from_block(gnitz_store_testkit::encode_to_wire_vec(batch))
-}
-
-/// A train of the view's own rows, in the view's own schema — the shape a
-/// bootstrap and a poll both reply in.
-fn plain(rows: &[(u64, i64, i64)]) -> Vec<RawBlock> {
-    let desc = make_schema_u64_i64();
-    vec![block_of(&make_batch(&desc, rows))]
+/// One wire block of the view's own rows, in the view's own schema — the shape
+/// a bootstrap and a poll both reply in.
+fn plain(rows: &[(u64, i64, i64)]) -> Vec<u8> {
+    gnitz_store_testkit::encode_to_wire_vec(&make_batch(&make_schema_u64_i64(), rows))
 }
 
 /// A store on a fresh directory with `TID` registered under `s.v`.
@@ -106,8 +99,8 @@ fn two_checkpointed_copies(name: &str) -> String {
     let mut store = Mirror::open(&dir).expect("a fresh store");
     store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
     store.register(OTHER_TID, SCHEMA, "w", &view_schema()).unwrap();
-    store.reseed(TID, plain(&[(1, 1, 10)]), cursor(4)).unwrap();
-    store.reseed(OTHER_TID, plain(&[(9, 1, 90)]), cursor(4)).unwrap();
+    store.reseed(TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
+    store.reseed(OTHER_TID, &[&plain(&[(9, 1, 90)])], cursor(4)).unwrap();
     store.checkpoint().unwrap();
     dir
 }
@@ -141,7 +134,7 @@ fn a_registration_stands_and_a_moved_name_retracts_the_incumbent() {
     let _g = serial();
     let (mut store, _dir) = registered("registration");
 
-    store.reseed(TID, plain(&[(1, 1, 10)]), cursor(4)).unwrap();
+    store.reseed(TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
     store
         .register(TID, SCHEMA, "v", &view_schema())
         .expect("a second registration");
@@ -170,39 +163,45 @@ fn the_invalidate_ladder_stops_where_it_is_asked() {
     let _g = serial();
     {
         let (mut store, _dir) = registered("ladder_Cursor");
-        store.reseed(TID, plain(&[(1, 1, 10), (2, 1, 20)]), cursor(4)).unwrap();
+        store
+            .reseed(TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(4))
+            .unwrap();
         store.invalidate(TID, Invalidate::Cursor).unwrap();
         assert_eq!(store.cursor_of(TID), None, "Cursor drops the cursor");
         assert_eq!(held(&mut store, TID).len(), 2, "and keeps the rows");
         assert!(
-            store.advance(TID, plain(&[(3, 1, 30)]), cursor(5)).is_err(),
+            store.advance(TID, &[&plain(&[(3, 1, 30)])], cursor(5)).is_err(),
             "no cursor, so no delta continues it",
         );
         assert!(
-            store.reseed(TID, plain(&[(1, 1, 10)]), cursor(5)).is_err(),
+            store.reseed(TID, &[&plain(&[(1, 1, 10)])], cursor(5)).is_err(),
             "a whole value never lands on the rows it replaces",
         );
         assert_eq!(held(&mut store, TID).len(), 2, "neither refusal touched a row");
     }
     {
         let (mut store, _dir) = registered("ladder_Copy");
-        store.reseed(TID, plain(&[(1, 1, 10), (2, 1, 20)]), cursor(4)).unwrap();
+        store
+            .reseed(TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(4))
+            .unwrap();
         store.invalidate(TID, Invalidate::Copy).unwrap();
         assert_eq!(store.cursor_of(TID), None, "Copy drops the cursor");
         assert!(held(&mut store, TID).is_empty(), "and the rows");
         store
-            .reseed(TID, plain(&[(1, 1, 10)]), cursor(5))
+            .reseed(TID, &[&plain(&[(1, 1, 10)])], cursor(5))
             .expect("an erased copy takes a reseed");
         assert_eq!(held(&mut store, TID), BTreeMap::from([((1, 10), 1)]));
     }
 
     let (mut store, _dir) = registered("ladder_registration");
-    store.reseed(TID, plain(&[(1, 1, 10), (2, 1, 20)]), cursor(4)).unwrap();
+    store
+        .reseed(TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(4))
+        .unwrap();
     store.invalidate(TID, Invalidate::Registration).unwrap();
     assert_eq!(store.cursor_of(TID), None);
     assert!(whole_copy(&mut store, TID).is_err(), "the copy is gone");
     assert!(
-        store.reseed(TID, plain(&[(1, 1, 10)]), cursor(5)).is_err(),
+        store.reseed(TID, &[&plain(&[(1, 1, 10)])], cursor(5)).is_err(),
         "and so is the registration that named its shape",
     );
     store
@@ -219,10 +218,14 @@ fn the_invalidate_ladder_stops_where_it_is_asked() {
 fn an_advance_applies_before_it_moves_the_cursor() {
     let _g = serial();
     let (mut store, _dir) = registered("advance");
-    store.reseed(TID, plain(&[(1, 1, 10), (2, 1, 20)]), cursor(4)).unwrap();
+    store
+        .reseed(TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(4))
+        .unwrap();
     assert_eq!(store.cursor_of(TID), Some(cursor(4)));
 
-    store.advance(TID, plain(&[(1, 1, 10), (3, 1, 30)]), cursor(5)).unwrap();
+    store
+        .advance(TID, &[&plain(&[(1, 1, 10), (3, 1, 30)])], cursor(5))
+        .unwrap();
     assert_eq!(store.cursor_of(TID), Some(cursor(5)));
     assert_eq!(
         held(&mut store, TID),
@@ -237,7 +240,7 @@ fn an_advance_applies_before_it_moves_the_cursor() {
 fn a_reply_schema_wider_than_the_engine_column_limit_is_an_error() {
     let _g = serial();
     let (mut store, _dir) = registered("wide_reply");
-    store.reseed(TID, plain(&[(1, 1, 10)]), cursor(4)).unwrap();
+    store.reseed(TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
     let wide = Schema {
         columns: (0..=gnitz_wire::MAX_COLUMNS)
             .map(|i| ColumnDef::new(format!("c{i}"), TypeCode::U64, false))
@@ -258,8 +261,8 @@ fn a_checkpoint_covers_a_cursor_this_session_never_claimed() {
         let mut store = Mirror::open(&dir).expect("a fresh store");
         store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
         store.register(OTHER_TID, SCHEMA, "w", &view_schema()).unwrap();
-        store.reseed(TID, plain(&[(1, 1, 10)]), cursor(4)).unwrap();
-        store.reseed(OTHER_TID, plain(&[(9, 1, 90)]), cursor(4)).unwrap();
+        store.reseed(TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
+        store.reseed(OTHER_TID, &[&plain(&[(9, 1, 90)])], cursor(4)).unwrap();
         store.checkpoint().unwrap();
     }
     {
@@ -270,7 +273,7 @@ fn a_checkpoint_covers_a_cursor_this_session_never_claimed() {
             "both positions came back",
         );
         store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
-        store.advance(TID, plain(&[(1, 1, 10)]), cursor(5)).unwrap();
+        store.advance(TID, &[&plain(&[(1, 1, 10)])], cursor(5)).unwrap();
         store.checkpoint().unwrap();
     }
 
@@ -295,11 +298,13 @@ fn a_failed_apply_erases_that_copy_and_spares_the_rest() {
     let mut store = Mirror::open(&dir).expect("a fresh store");
     store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
     store.register(OTHER_TID, SCHEMA, "w", &view_schema()).unwrap();
-    store.reseed(TID, plain(&[(1, 1, 10), (2, 1, 20)]), cursor(4)).unwrap();
-    store.reseed(OTHER_TID, plain(&[(9, 1, 90)]), cursor(4)).unwrap();
+    store
+        .reseed(TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(4))
+        .unwrap();
+    store.reseed(OTHER_TID, &[&plain(&[(9, 1, 90)])], cursor(4)).unwrap();
 
     let err = store
-        .advance(TID, vec![RawBlock::from_block(vec![0xFF; 64])], cursor(5))
+        .advance(TID, &[&[0xFF; 64]], cursor(5))
         .expect_err("an undecodable block must fail the advance");
     assert!(
         !matches!(err, MirrorError::Poisoned(_)),
@@ -324,7 +329,9 @@ fn a_failed_apply_erases_that_copy_and_spares_the_rest() {
         .expect("a store holding one erased copy is still safe to publish");
 
     // With no cursor the next poll bootstraps, onto the erased copy.
-    store.reseed(TID, plain(&[(1, 1, 10), (2, 1, 20)]), cursor(9)).unwrap();
+    store
+        .reseed(TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(9))
+        .unwrap();
     assert_eq!(
         held(&mut store, TID),
         BTreeMap::from([((1, 10), 1), ((2, 20), 1)]),
@@ -342,7 +349,7 @@ fn a_null_bit_on_a_not_null_column_is_refused() {
     // Row 0's null word, past the header, the one PK and the one weight.
     block[gnitz_wire::wal::WAL_HEADER_SIZE + 8 + 8] = 1;
     let err = store
-        .reseed(TID, vec![RawBlock::from_block(block)], cursor(4))
+        .reseed(TID, &[&block], cursor(4))
         .expect_err("the bit must be refused");
     assert!(err.to_string().contains("NOT NULL"), "{err}");
     assert_eq!(store.cursor_of(TID), None);
@@ -379,10 +386,10 @@ fn an_unopenable_copy_bootstraps_and_its_siblings_resume() {
 fn a_copy_erased_and_refilled_to_the_same_cursor_is_published() {
     let _g = serial();
     let (mut store, dir) = registered("erased_and_refilled");
-    store.reseed(TID, plain(&[(1, 1, 10)]), cursor(4)).unwrap();
+    store.reseed(TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
     store.checkpoint().unwrap();
     store.invalidate(TID, Invalidate::Copy).unwrap();
-    store.reseed(TID, plain(&[(1, 1, 10)]), cursor(4)).unwrap();
+    store.reseed(TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
     store.checkpoint().unwrap();
     drop(store);
 
@@ -478,7 +485,7 @@ fn failed_copy_teardown_child() {
     {
         let mut store = Mirror::open(&dir).expect("a fresh store");
         store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
-        store.reseed(TID, plain(&[(1, 1, 10)]), cursor(4)).unwrap();
+        store.reseed(TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
         store.checkpoint().expect("the cursor is durable before the failure");
 
         store
@@ -536,7 +543,7 @@ fn auto_checkpoint_failure_child() {
     store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
 
     store
-        .reseed(TID, plain(&[(1, 1, 10), (2, 1, 20)]), cursor(4))
+        .reseed(TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(4))
         .expect("the byte threshold drives a checkpoint, and its failure is not the apply's");
     assert!(!has_manifest(&dir, TID), "the armed seam failed that checkpoint");
     assert!(store.poisoned().is_none(), "a failed checkpoint is not a poisoning");
@@ -549,7 +556,7 @@ fn auto_checkpoint_failure_child() {
 
     // The seam is one-shot, so this round's own checkpoint is the real thing.
     store
-        .advance(TID, plain(&[(2, 1, 20)]), cursor(5))
+        .advance(TID, &[&plain(&[(2, 1, 20)])], cursor(5))
         .expect("the next round applies");
     assert!(
         has_manifest(&dir, TID),
@@ -611,24 +618,24 @@ fn failed_checkpoint_byte_counter_child() {
 
     let rows: Vec<(u64, i64, i64)> = (0..40).map(|i| (i as u64, 1, i as i64 * 10)).collect();
     let big = plain(&rows);
-    let big_bytes: usize = big.iter().map(|b| b.block().len()).sum();
     assert!(
-        big_bytes > THRESHOLD,
-        "the first train must cross the threshold: {big_bytes}"
+        big.len() > THRESHOLD,
+        "the first train must cross the threshold: {}",
+        big.len()
     );
     store
-        .reseed(TID, big, cursor(4))
+        .reseed(TID, &[&big], cursor(4))
         .expect("crossing the threshold drives a checkpoint, and its failure is not the apply's");
     assert!(store.poisoned().is_none(), "a failed checkpoint is not a poisoning");
     assert!(!has_manifest(&dir, TID), "the failed checkpoint published nothing");
 
     let small = plain(&[(1, 1, 10)]);
-    let small_bytes: usize = small.iter().map(|b| b.block().len()).sum();
     assert!(
-        small_bytes < THRESHOLD,
-        "the second train must stay under it: {small_bytes}"
+        small.len() < THRESHOLD,
+        "the second train must stay under it: {}",
+        small.len()
     );
-    store.advance(TID, small, cursor(5)).expect("a sub-threshold apply");
+    store.advance(TID, &[&small], cursor(5)).expect("a sub-threshold apply");
     assert!(
         !has_manifest(&dir, TID),
         "a sub-threshold apply must drive no checkpoint; the counter was left over threshold",

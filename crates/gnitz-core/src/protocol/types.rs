@@ -290,12 +290,6 @@ impl PkColumn {
         debug_assert_eq!(self.stride, src.stride);
         self.buf.extend_from_slice(src.get_bytes(i));
     }
-
-    /// Every key decoded, for `assert_eq!(pks.to_vec_u128(schema), expected)`.
-    #[cfg(test)]
-    pub fn to_vec_u128(&self, schema: &Schema) -> Vec<u128> {
-        (0..self.len()).map(|i| self.get(schema, i)).collect()
-    }
 }
 
 /// Append one zero-filled cell of wire type `tc` to a payload region — the NULL

@@ -5,7 +5,7 @@ use gnitz_store::schema::SchemaFacts;
 use std::collections::HashMap;
 
 use gnitz_core::decode_regions_into;
-use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RawBlock, Schema, ZSetBatch};
+use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, Schema, ZSetBatch};
 use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::{gnitz_debug, gnitz_error};
@@ -109,11 +109,11 @@ impl Mirror {
     /// Apply `blocks`, set the cursor to `next`, then checkpoint if due. A failed
     /// apply erases the copy; a failed auto-checkpoint is logged, and the next
     /// one retries.
-    fn apply(&mut self, tid: u64, blocks: Vec<RawBlock>, next: DeltaCursor) -> Result<(), MirrorError> {
+    fn apply(&mut self, tid: u64, blocks: &[&[u8]], next: DeltaCursor) -> Result<(), MirrorError> {
         let schema = self.copy(tid).schema();
-        for raw in blocks {
-            self.applied_bytes += raw.block().len();
-            let applied = Batch::decode_foreign_wal_block(raw.block(), &schema)
+        for &block in blocks {
+            self.applied_bytes += block.len();
+            let applied = Batch::decode_foreign_wal_block(block, &schema)
                 .map_err(|e| format!("decoding a delta for {tid}: {e}"))
                 .and_then(|b| {
                     self.registry
@@ -259,7 +259,7 @@ impl MirrorStore for Mirror {
         })
     }
 
-    fn reseed(&mut self, tid: u64, blocks: Vec<RawBlock>, cursor: DeltaCursor) -> Result<(), MirrorError> {
+    fn reseed(&mut self, tid: u64, blocks: &[&[u8]], cursor: DeltaCursor) -> Result<(), MirrorError> {
         self.touching("reseeding a copy", |m| {
             let Some(rec) = m.records.get(&tid) else {
                 return Err(MirrorError::Engine(format!("relation {tid} is not mirrored")));
@@ -273,7 +273,7 @@ impl MirrorStore for Mirror {
         })
     }
 
-    fn advance(&mut self, tid: u64, blocks: Vec<RawBlock>, next: DeltaCursor) -> Result<(), MirrorError> {
+    fn advance(&mut self, tid: u64, blocks: &[&[u8]], next: DeltaCursor) -> Result<(), MirrorError> {
         self.touching("advancing a copy", |m| {
             if m.cursor_of(tid).is_none() {
                 return Err(MirrorError::Engine(format!(

@@ -64,23 +64,15 @@ pub struct RelDescriptor {
 /// One reply frame's data block, kept undecoded: the owned frame buffer and the
 /// block's extent within it. `block()` is the block itself.
 #[derive(Debug)]
-pub struct RawBlock {
+pub(crate) struct RawBlock {
     frame: Vec<u8>,
     block: std::ops::Range<usize>,
 }
 
 impl RawBlock {
     /// The data block's bytes, ready to decode against the reply schema.
-    pub fn block(&self) -> &[u8] {
+    pub(crate) fn block(&self) -> &[u8] {
         &self.frame[self.block.clone()]
-    }
-
-    /// A block that owns its whole buffer, for a producer that is not a reply
-    /// frame. [`MirrorStore::reseed`](crate::MirrorStore::reseed) and
-    /// [`MirrorStore::advance`](crate::MirrorStore::advance) take these, so
-    /// a store's own tests need a way to build one.
-    pub fn from_block(block: Vec<u8>) -> RawBlock {
-        RawBlock { block: 0..block.len(), frame: block }
     }
 }
 
@@ -175,11 +167,6 @@ pub enum Request<'a> {
     /// family's relation was written after that family's `basis`. Completes as
     /// [`Reply::Lsn`].
     PushTxn { families: &'a [PushFamily<'a>] },
-    /// A frame the caller encoded itself, for the scripted-peer tests that
-    /// drive bytes the library would never build. Test-only, so no production
-    /// path reaches an encoder behind `submit`'s back. Uncorrelated.
-    #[cfg(test)]
-    RawFrame(Vec<u8>),
     /// RESOLVE — describe one relation. Uncorrelated on the wire, because a
     /// by-name resolve names no id.
     Resolve(RelTarget<'a>),
@@ -498,8 +485,6 @@ impl Session {
                 }
                 (encode_push_txn(families), SlotKind::Commit)
             }
-            #[cfg(test)]
-            Request::RawFrame(frame) => (frame, SlotKind::Commit),
             Request::Resolve(target) => {
                 // The wire lets the name win over the id, so the name rides the blob.
                 let (target_id, qname) = match target {

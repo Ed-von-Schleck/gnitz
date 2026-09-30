@@ -1,20 +1,35 @@
 use super::*;
 use crate::protocol::wal_block::decode_wal_block_into;
 use crate::retraction_batch;
-use crate::test_support::{encode_wal_block, german_col, payload_of};
+use crate::test_support::{encode_wal_block, kv_schema};
 use gnitz_expr::{
     payload_str, payload_u64, BatchView, CmpOp, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Reg, ScalarEval,
     SchemaFacts, Sink,
 };
 
-fn kv_schema(v: TypeCode) -> Schema {
-    Schema {
-        columns: vec![
-            ColumnDef::new("pk", TypeCode::U64, false),
-            ColumnDef::new("v", v, false),
-        ],
-        pk_cols: vec![0],
+/// A STRING/BLOB column region from its values, spilling into `blob`; `None` is
+/// a NULL cell, which the region zero-fills.
+fn german_col(vals: &[Option<&[u8]>], blob: &mut Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() * 16);
+    for v in vals {
+        out.extend_from_slice(&gnitz_wire::encode_german_string(v.unwrap_or(&[]), blob));
     }
+    out
+}
+
+/// `schema`'s payload regions holding `regions`, one per payload slot in slot
+/// order, each typed as its schema column.
+fn payload_of(schema: &Schema, regions: Vec<Vec<u8>>) -> Vec<PayloadColumn> {
+    assert_eq!(regions.len(), schema.num_payload_cols(), "one region per payload slot");
+    schema
+        .payload_columns()
+        .zip(regions)
+        .map(|((_, _, c), bytes)| {
+            let mut col = PayloadColumn::new(c.ty.tc);
+            col.bytes = bytes;
+            col
+        })
+        .collect()
 }
 
 #[test]
@@ -180,7 +195,8 @@ fn extend_from_owned_concatenates() {
     let mut acc = build(1);
     acc.extend_from_owned(build(10));
 
-    assert_eq!(acc.pks.to_vec_u128(&schema), [1, 2, 10, 11]);
+    let pks: Vec<u128> = (0..acc.len()).map(|r| acc.pks.get(&schema, r)).collect();
+    assert_eq!(pks, [1, 2, 10, 11]);
     assert_eq!(acc.weights, [1, -1, 1, -1]);
     let strs: Vec<&str> = (0..acc.len()).map(|r| payload_str(&acc, r, 0)).collect();
     assert_eq!(strs, [long(1).as_str(), "short", long(10).as_str(), "short"]);
@@ -376,6 +392,23 @@ fn a_cut_gather_matches_a_row_by_row_rebuild() {
     assert_eq!(rows(&schema, &got), rows(&schema, &want));
     assert_eq!(got.blob.len(), want.blob.len(), "only the survivors' heap bytes");
     got.validate(&schema).unwrap();
+}
+
+/// A row copied at two weights and patched in one cell of the second copy
+/// differs only there: a string cell, spilled in the source, and an integer one.
+#[test]
+fn a_copied_row_differs_only_where_it_is_patched() {
+    let (schema, b) = string_batch();
+    let mut pair = ZSetBatch::new(&schema);
+    pair.copy_row_at(&b, 0, -1);
+    pair.copy_row_at(&b, 0, 1);
+    pair.set_string_cell(1, 0, "patched");
+    pair.set_u64_cell(1, 1, 77);
+    pair.validate(&schema).unwrap();
+    assert_eq!(
+        rows(&schema, &pair),
+        [(0, -1, GATHER_VALS[0].to_owned(), 0), (0, 1, "patched".to_owned(), 77)]
+    );
 }
 
 /// A gather naming every row in place at its own weight is the batch itself; one

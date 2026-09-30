@@ -9,16 +9,18 @@
 //! test see.
 
 use super::*;
-use crate::connection::{Request, Session};
 use crate::protocol::message::encode_frame;
 use crate::protocol::transport::poll_fd;
-use crate::test_support::{session_pair, Peer};
+use crate::test_support::{interrupt_self_until, kv_schema, reply_ctrl, reply_status, session_pair, Peer};
 use gnitz_wire::control::peek_control_block;
 use gnitz_wire::control::ControlHeader;
+use gnitz_wire::txn_frame::DELTA_POLL_MAX_VIEWS;
 use gnitz_wire::RelDescriptorBlob;
-use gnitz_wire::{ColumnDef, TypeCode, WireStatus};
+use gnitz_wire::{TypeCode, WireStatus};
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,7 +35,6 @@ const TAG: u64 = 0xFEED;
 /// One call the state machine made through the seam.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ev {
-    Register(u64, String),
     Invalidate(u64, Invalidate),
     /// `(tid, the round the copy was filled at)`.
     Reseed(u64, u64),
@@ -73,8 +74,7 @@ impl MirrorStore for StubStore {
 
     fn register(&mut self, tid: u64, schema_name: &str, name: &str, _s: &Schema) -> Result<Option<u64>, MirrorError> {
         let qname = format!("{schema_name}.{name}");
-        self.log.push(Ev::Register(tid, qname.clone()));
-        // The live store's rule: a record under this name at another id lost it.
+        // The live store's name rule; its layout rule is not modelled.
         let renamed = self
             .names
             .iter()
@@ -97,7 +97,7 @@ impl MirrorStore for StubStore {
     }
 
     /// The live store's cursor rules.
-    fn reseed(&mut self, tid: u64, _b: Vec<RawBlock>, cursor: DeltaCursor) -> Result<(), MirrorError> {
+    fn reseed(&mut self, tid: u64, _b: &[&[u8]], cursor: DeltaCursor) -> Result<(), MirrorError> {
         if self.cursors.contains_key(&tid) {
             return Err(MirrorError::Engine(format!(
                 "stub: reseed of {tid}, which holds a cursor"
@@ -108,7 +108,7 @@ impl MirrorStore for StubStore {
         Ok(())
     }
 
-    fn advance(&mut self, tid: u64, _b: Vec<RawBlock>, next: DeltaCursor) -> Result<(), MirrorError> {
+    fn advance(&mut self, tid: u64, _b: &[&[u8]], next: DeltaCursor) -> Result<(), MirrorError> {
         if !self.cursors.contains_key(&tid) {
             return Err(MirrorError::Engine(format!(
                 "stub: advance of {tid}, which holds no cursor"
@@ -152,42 +152,36 @@ impl MirrorStore for StubStore {
 /// How long a request that is on its way may take. Only ever paid in full by a
 /// regression, which then fails rather than hangs.
 const PATIENCE: Duration = Duration::from_secs(5);
-/// How long to wait before concluding nothing more is coming. The client is
-/// either already blocked in `poll(2)` or writing, so this is slack, not a race.
-const QUIET: Duration = Duration::from_millis(500);
 
+// A script's peer is dropped when the script ends, so a request it does not
+// expect fails fast instead of parking the client; each test counts
+// `requests_sent` to catch one.
 impl Peer {
-    /// Whether another request frame arrives within `d`. An expired timeout is
-    /// `WouldBlock`, which is the "nothing came" answer rather than a failure.
-    fn waits(&self, d: Duration) -> bool {
-        match poll_fd(self.0.as_raw_fd(), libc::POLLIN, Some(Instant::now() + d)) {
-            Ok(revents) => revents & libc::POLLIN != 0,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
-            Err(e) => panic!("poll on the peer fd: {e}"),
-        }
+    /// The next request frame, which must already be on its way.
+    fn expect_frame(&self, what: &str) -> Vec<u8> {
+        let ready = poll_fd(self.0.as_raw_fd(), libc::POLLIN, Some(Instant::now() + PATIENCE));
+        assert!(
+            ready.is_ok_and(|revents| revents & libc::POLLIN != 0),
+            "{what}: the request never arrived"
+        );
+        self.recv()
     }
 
-    /// The target id of the next request, which must already be on its way.
+    /// The target id of the next request.
     fn expect_request(&self, what: &str) -> u64 {
-        assert!(self.waits(PATIENCE), "{what}: the request never arrived");
-        let frame = self.recv();
+        let frame = self.expect_frame(what);
         peek_control_block(&frame).expect("a control header").hdr.target_id
     }
 
-    /// The view ids one DELTA_POLL frame names, in request order.
+    /// The view ids the next request, a DELTA_POLL, names in request order.
     fn expect_poll(&self, what: &str) -> Vec<u64> {
-        assert!(self.waits(PATIENCE), "{what}: the poll never arrived");
-        let frame = self.recv();
+        let frame = self.expect_frame(what);
         let ctrl = peek_control_block(&frame).expect("a control header");
         gnitz_wire::txn_frame::decode_delta_poll(&frame[ctrl.body])
             .expect("a delta poll")
             .into_iter()
             .map(|v| v.view_id)
             .collect()
-    }
-
-    fn quiet(&self, what: &str) {
-        assert!(!self.waits(QUIET), "{what}: an unexpected extra request");
     }
 
     /// One view's answer inside a poll: a control-only terminal frame naming the
@@ -202,31 +196,20 @@ impl Peer {
         self.send(&encode_frame(h, &[], None, None));
     }
 
-    fn reply_status(&self, target_id: u64, status: WireStatus, text: &str) {
-        let h = ControlHeader { status, target_id, ..Default::default() };
-        self.send(&encode_frame(h, text.as_bytes(), None, None));
-    }
-
-    /// A RESOLVE answering "no such relation": an empty descriptor blob.
-    fn reply_absent(&self) {
-        self.send(&encode_frame(ControlHeader::default(), &[], None, None));
-    }
-
     /// A RESOLVE answering with `tid`: the schema block plus a view descriptor
     /// carrying a feed.
     fn reply_resolved(&self, tid: u64) {
-        let schema = view_schema();
+        let schema = kv_schema(TypeCode::I64);
         let blob = RelDescriptorBlob {
             class: RelClass::FedView,
             ..Default::default()
         };
-        let empty = ZSetBatch::new(&schema);
         let hdr = ControlHeader { target_id: tid, ..Default::default() };
         self.send(&encode_frame(
             hdr,
             &blob.encode(),
             Some(&schema.to_block()),
-            Some(&empty),
+            Some(&ZSetBatch::new(&schema)),
         ));
     }
 }
@@ -235,103 +218,90 @@ impl Peer {
 // The fixture
 // ---------------------------------------------------------------------------
 
-fn view_schema() -> Schema {
-    Schema {
-        columns: vec![
-            ColumnDef::new("pk", TypeCode::U64, false),
-            ColumnDef::new("val", TypeCode::I64, false),
-        ],
-        pk_cols: vec![0],
-    }
-}
-
-/// A client on a scripted peer with `views` mirrored: each `(tid, name, tick)`
-/// gets a registration and, at a non-zero tick, a feed position.
-///
-/// The registrations are installed directly rather than through `mirror_view`,
-/// so a test scripts only the traffic it is about. `prime` runs on the session
-/// first, for the one test that needs a slot left pending behind the client's
-/// back.
-fn fixture_priming(views: &[(u64, &str, u64)], prime: impl FnOnce(&mut Session)) -> (GnitzClient, Peer, Log) {
-    let (mut session, peer) = session_pair();
-    prime(&mut session);
-    let mut client = GnitzClient::from_session(session);
-
-    let log = Log::default();
-    let mut store = StubStore {
-        cursors: HashMap::new(),
-        names: HashMap::new(),
-        log: log.clone(),
-    };
-    for &(tid, name, tick) in views {
-        store.names.insert(tid, format!("s.{name}"));
-        if let Some(tick) = std::num::NonZeroU64::new(tick) {
-            store.cursors.insert(tid, DeltaCursor { tag: TAG, tick });
-        }
-    }
-    client.attach_mirror(store).unwrap();
-
-    let schema = Arc::new(view_schema());
-    for &(tid, name, _) in views {
-        let entry = MirroredView {
-            schema_name: "s".to_string(),
-            name: name.to_string(),
-            desc: Arc::new(RelDescriptor {
-                tid,
-                class: RelClass::FedView,
-                pk_repeats: false,
-                serial: false,
-                schema: Arc::clone(&schema),
-                indexes: Vec::new(),
-            }),
-        };
-        client.mirror.as_deref_mut().unwrap().views.insert(tid, entry);
-    }
-    log.take();
-    (client, peer, log)
-}
-
+/// A client on a scripted peer with `views` mirrored through `bind`: each
+/// `(tid, name, tick)` is registered under `s.name` and, at a non-zero tick,
+/// holds a feed position. Nothing goes over the wire.
 fn fixture(views: &[(u64, &str, u64)]) -> (GnitzClient, Peer, Log) {
-    fixture_priming(views, |_| {})
+    let (session, peer) = session_pair();
+    let mut client = GnitzClient::from_session(session);
+    let log = Log::default();
+    let cursors = views
+        .iter()
+        .filter_map(|&(tid, _, tick)| NonZeroU64::new(tick).map(|tick| (tid, DeltaCursor { tag: TAG, tick })))
+        .collect();
+    client
+        .attach_mirror(StubStore {
+            cursors,
+            names: HashMap::new(),
+            log: log.clone(),
+        })
+        .unwrap();
+    let schema = Arc::new(kv_schema(TypeCode::I64));
+    for &(tid, name, _) in views {
+        let desc = RelDescriptor {
+            tid,
+            class: RelClass::FedView,
+            pk_repeats: false,
+            serial: false,
+            schema: Arc::clone(&schema),
+            indexes: Vec::new(),
+        };
+        client.bind("s", name, Arc::new(desc)).unwrap();
+    }
+    assert!(log.take().is_empty(), "registration tears nothing down");
+    (client, peer, log)
 }
 
 // ---------------------------------------------------------------------------
 // Frame count
 // ---------------------------------------------------------------------------
 
-/// One poll over M views writes exactly **one** request naming all of them.
+/// One poll names every view in as few requests as the per-request cap allows —
+/// one up to the cap, a second past it — and every view advances.
 #[test]
-fn one_poll_writes_one_request_naming_every_view() {
-    const M: usize = 6;
-    let names: Vec<String> = (0..M).map(|i| format!("v{i}")).collect();
-    let views: Vec<(u64, &str, u64)> = names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (100 + i as u64, n.as_str(), 4))
-        .collect();
-    let (mut client, peer, _log) = fixture(&views);
+fn one_poll_writes_one_request_per_chunk_of_views() {
+    for want in [vec![6], vec![DELTA_POLL_MAX_VIEWS, 1]] {
+        let m: usize = want.iter().sum();
+        let names: Vec<String> = (0..m).map(|i| format!("v{i}")).collect();
+        let views: Vec<(u64, &str, u64)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (100 + i as u64, n.as_str(), 4))
+            .collect();
+        let (mut client, peer, _log) = fixture(&views);
 
-    let h = std::thread::spawn(move || {
-        let ids = peer.expect_poll("the poll");
-        peer.quiet("one frame for all M views");
-        let mut sorted = ids.clone();
-        sorted.sort_unstable();
+        let chunks = want.len();
+        let h = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..chunks {
+                let ids = peer.expect_poll("a chunk");
+                for &id in &ids {
+                    peer.reply_watermark(id, TAG, 9);
+                }
+                seen.push(ids);
+            }
+            seen
+        });
+        let report = client.poll_mirror().expect("every view advances");
+        let seen = h.join().unwrap();
+
+        assert_eq!(client.requests_sent(), chunks as u64, "{m} views");
+        assert_eq!(seen.iter().map(Vec::len).collect::<Vec<_>>(), want);
+        let mut ids = seen.concat();
+        ids.sort_unstable();
         assert_eq!(
-            sorted,
-            (100..100 + M as u64).collect::<Vec<_>>(),
-            "every view rides the one request"
+            ids,
+            (100..100 + m as u64).collect::<Vec<_>>(),
+            "every view rides a request"
         );
-        for id in ids {
-            peer.reply_watermark(id, TAG, 9);
-        }
-        peer
-    });
-    let report = client.poll_mirror().expect("every view advances");
-    let _peer = h.join().unwrap();
-
-    assert_eq!(report.len(), M, "one entry per view");
-    assert!(report.iter().all(|o| matches!(o.result, PollResult::Advanced)));
-    assert!(report.iter().all(|o| o.cursor.is_some_and(|c| c.tick.get() == 9)));
+        assert_eq!(report.len(), m, "one entry per view");
+        assert!(
+            report
+                .iter()
+                .all(|o| matches!(o.result, PollResult::Advanced) && o.cursor.is_some_and(|c| c.tick.get() == 9)),
+            "{m} views: {report:?}"
+        );
+    }
 }
 
 /// A refusal naming a vanished relation pays exactly one probe; every other
@@ -339,27 +309,20 @@ fn one_poll_writes_one_request_naming_every_view() {
 /// doomed round trip.
 #[test]
 fn only_a_vanished_relation_pays_a_probe() {
-    for (status, expected) in [(WireStatus::NotFound, true), (WireStatus::Error, false)] {
+    for (status, requests) in [(WireStatus::NotFound, 2), (WireStatus::Error, 1)] {
         let (mut client, peer, _log) = fixture(&[(7, "v", 4)]);
         let h = std::thread::spawn(move || {
             assert_eq!(peer.expect_poll("the poll"), vec![7]);
-            peer.reply_status(7, status, "gone");
-            // Answer any probe with "no such relation", so the recovery is a
-            // `Failed` either way and the two runs differ only in the count.
-            let probed = peer.waits(QUIET);
-            if probed {
+            peer.send(&reply_status(7, status, "gone"));
+            if status == WireStatus::NotFound {
+                // "No such relation", so the recovery is a `Failed` either way.
                 peer.expect_request("the probe");
-                peer.reply_absent();
-                peer.quiet("one probe, not two");
+                peer.send(&reply_ctrl(0, 0));
             }
-            probed
         });
         let report = client.poll_mirror().expect("a per-view failure is not the call's");
-        assert_eq!(
-            h.join().unwrap(),
-            expected,
-            "status {status:?} probed the wrong number of times"
-        );
+        h.join().unwrap();
+        assert_eq!(client.requests_sent(), requests, "status {status:?}");
         assert!(
             matches!(report.as_slice(), [o] if o.view_id == 7 && matches!(o.result, PollResult::Failed(_))),
             "status {status:?}: got {report:?}",
@@ -375,52 +338,47 @@ fn only_a_vanished_relation_pays_a_probe() {
 // Slot correlation
 // ---------------------------------------------------------------------------
 
-/// A leftover pending slot from an aborted call does not misdirect a reply.
+/// A leftover delta poll from an aborted call does not misdirect a reply.
 ///
 /// Both views carry the same schema, so a block delivered to the wrong one would
 /// decode cleanly and apply the other's rows and weights with no error. What
 /// separates them here is the round each reply names.
 #[test]
-fn a_leftover_slot_does_not_shift_the_replies() {
-    let schema = Arc::new(view_schema());
-    let rs = Arc::clone(&schema);
-    let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None);
-    // A slot submitted and never drained: what an aborting park leaves behind.
-    let (mut client, peer, _log) = fixture_priming(&[(7, "a", 4), (8, "b", 4)], |s| {
-        s.submit(Request::ScanSpec {
-            target_id: 7,
-            spec: &spec,
-            reply_schema: &rs,
-        })
+fn a_leftover_poll_does_not_shift_the_replies() {
+    let (mut client, peer, log) = fixture(&[(7, "a", 4), (8, "b", 4)]);
+    // A poll submitted and never drained: what an aborting park leaves behind.
+    let layout = kv_schema(TypeCode::I64).layout_digest();
+    client
+        .session
+        .submit_delta_poll(&[DeltaPollItem {
+            view_id: 7,
+            after_tick: 4,
+            reply_layout: layout,
+        }])
         .unwrap();
-    });
 
     let h = std::thread::spawn(move || {
-        assert_eq!(peer.expect_request("the abandoned scan"), 7);
+        assert_eq!(peer.expect_poll("the abandoned poll"), vec![7]);
         let ids = peer.expect_poll("the poll");
         // The abandoned train first, then one terminal per view, each at a round
         // derived from the view that asked — so a shifted reply lands visibly
         // wrong.
-        peer.reply_watermark(7, 0, 0);
+        peer.reply_watermark(7, TAG, 50);
         for &tid in &ids {
             peer.reply_watermark(tid, TAG, 100 + tid);
         }
-        peer
     });
-    let report = client
+    client
         .poll_mirror()
         .expect("the leftover train is drained, not applied");
-    let _peer = h.join().unwrap();
+    h.join().unwrap();
 
-    let mut ticks: Vec<(u64, u64)> = report
-        .iter()
-        .map(|o| (o.view_id, o.cursor.expect("a round").tick.get()))
-        .collect();
-    ticks.sort_unstable();
+    let mut applied = log.take();
+    applied.sort_unstable_by_key(|e| format!("{e:?}"));
     assert_eq!(
-        ticks,
-        vec![(7, 107), (8, 108)],
-        "each view took the reply its own request opened",
+        applied,
+        [Ev::Advance(7, 107), Ev::Advance(8, 108)],
+        "each view took the reply its own request opened, and nothing else",
     );
 }
 
@@ -440,9 +398,8 @@ fn no_recovery_runs_before_every_ingest_has() {
 
     let h = std::thread::spawn(move || {
         let ids = peer.expect_poll("the poll");
-        peer.quiet("both views ride one request");
         // The first position's view is the one that vanished.
-        peer.reply_status(ids[0], WireStatus::NotFound, "gone");
+        peer.send(&reply_status(ids[0], WireStatus::NotFound, "gone"));
         peer.reply_watermark(ids[1], TAG, 11);
         // Phase 2: the probe, the re-resolve it feeds, and the bootstrap.
         peer.expect_request("the probe");
@@ -451,12 +408,13 @@ fn no_recovery_runs_before_every_ingest_has() {
         peer.reply_resolved(9);
         assert_eq!(peer.expect_poll("the bootstrap"), vec![9]);
         peer.reply_watermark(9, TAG, 20);
-        (peer, ids[0], ids[1])
+        (ids[0], ids[1])
     });
     let report = client
         .poll_mirror()
         .expect("a recovered view is not the call's failure");
-    let (_peer, gone, alive) = h.join().unwrap();
+    let (gone, alive) = h.join().unwrap();
+    assert_eq!(client.requests_sent(), 4, "both views ride one request");
 
     let events = log.take();
     let first_ingest = events
@@ -480,14 +438,11 @@ fn no_recovery_runs_before_every_ingest_has() {
 }
 
 /// `reseed_by_name` onto an id that already holds a cursor advances it instead
-/// of erasing a good copy.
-///
-/// The cursor-less registration's name now resolves to a view this same poll
-/// already advanced. The old tail bootstrapped it unconditionally, discarding a
-/// copy that was correct and re-reading the whole view.
+/// of erasing a good copy: the cursor-less registration's name now resolves to
+/// a view this same poll already advanced.
 #[test]
 fn a_reseed_onto_a_live_copy_does_not_erase_it() {
-    let (mut client, peer, log) = fixture(&[(7, "a", 0), (8, "a", 4)]);
+    let (mut client, peer, log) = fixture(&[(7, "a", 0), (8, "b", 4)]);
 
     let h = std::thread::spawn(move || {
         assert_eq!(
@@ -502,85 +457,132 @@ fn a_reseed_onto_a_live_copy_does_not_erase_it() {
         peer.reply_resolved(8);
         assert_eq!(peer.expect_poll("the follow-up poll"), vec![8]);
         peer.reply_watermark(8, TAG, 12);
-        peer.quiet("the live copy is not re-read");
-        peer
     });
     let report = client.poll_mirror().expect("the reseed lands on a live copy");
-    let _peer = h.join().unwrap();
+    h.join().unwrap();
+    assert_eq!(client.requests_sent(), 3, "the live copy is not re-read");
 
     let events = log.take();
     assert!(
-        !events.iter().any(|e| matches!(e, Ev::Invalidate(8, Invalidate::Copy))),
-        "the live copy must not be erased: {events:?}",
-    );
-    assert!(
-        !events.iter().any(|e| matches!(e, Ev::Reseed(8, _))),
-        "and must not be re-read whole: {events:?}",
+        !events
+            .iter()
+            .any(|e| matches!(e, Ev::Invalidate(8, Invalidate::Copy) | Ev::Reseed(8, _))),
+        "the live copy must be neither erased nor re-read whole: {events:?}",
     );
     assert!(
         matches!(report.as_slice(), [o] if o.view_id == 8 && o.cursor.is_some_and(|c| c.tick.get() == 12)),
         "one entry, at the id the view ended up under: {report:?}",
     );
-    assert!(!client.mirrored_ids().contains(&7), "the retired registration is gone");
+    assert_eq!(client.mirrored_ids(), [8], "the retired registration is gone");
 }
 
-/// A reply whose terminals arrive in the wrong order is refused, not ingested:
-/// both views share a schema, so a misdirected block would decode cleanly and
-/// leave a copy holding another view's rows.
+/// An interrupted poll discards its report, so a reseed it ran is still owed:
+/// the next poll reports that view `Reseeded`, and the one after that does not.
 #[test]
-fn a_misdirected_view_reply_is_refused_rather_than_ingested() {
-    let (mut client, peer, log) = fixture(&[(7, "a", 4), (8, "b", 4)]);
+fn an_interrupted_poll_reannounces_its_reseed() {
+    let (mut client, peer, log) = fixture(&[(7, "a", 0), (8, "b", 4)]);
+    let watched = log.clone();
+    client.set_park_hook(Some(Box::new(move || {
+        if watched.saw(|e| matches!(e, Ev::Reseed(7, _))) {
+            Err("interrupted".into())
+        } else {
+            Ok(())
+        }
+    })));
+    let stop = Arc::new(AtomicBool::new(false));
+    let sig = interrupt_self_until(Arc::clone(&stop));
 
     let h = std::thread::spawn(move || {
-        let ids = peer.expect_poll("the poll");
-        // The second position's view, answered at the first.
-        peer.reply_watermark(ids[1], TAG, 11);
+        assert_eq!(peer.expect_poll("the poll"), vec![8]);
+        peer.send(&reply_status(8, WireStatus::NotFound, "gone"));
+        // Phase 2 recovers the cursor-less view first: re-resolve, bootstrap.
+        peer.expect_request("the re-resolve");
+        peer.reply_resolved(7);
+        assert_eq!(peer.expect_poll("the bootstrap"), vec![7]);
+        peer.reply_watermark(7, TAG, 20);
+        // 8's probe is never answered, so the call parks and is interrupted.
+        peer.expect_request("the probe");
         peer
     });
-    let report = client.poll_mirror().expect("a protocol error is reported per view");
-    let _peer = h.join().unwrap();
+    let r = client.poll_mirror();
+    assert!(matches!(r, Err(ClientError::Interrupted(_))), "{r:?}");
+    stop.store(true, Ordering::Relaxed);
+    sig.join().unwrap();
+    client.set_park_hook(None);
+    let peer = h.join().unwrap();
 
-    assert!(
-        report.iter().all(|o| matches!(o.result, PollResult::Failed(_))),
-        "no view may be advanced off a misdirected reply: {report:?}",
-    );
-    assert!(
-        !log.saw(|e| matches!(e, Ev::Reseed(..) | Ev::Advance(..))),
-        "and nothing may be applied",
+    let h = std::thread::spawn(move || {
+        peer.send(&reply_ctrl(0, 0)); // the abandoned probe
+        for tick in [21, 22] {
+            for id in peer.expect_poll("a poll") {
+                peer.reply_watermark(id, TAG, tick);
+            }
+        }
+    });
+    let mut results = Vec::new();
+    for _ in 0..2 {
+        let mut report: Vec<(u64, bool)> = client
+            .poll_mirror()
+            .expect("both views advance")
+            .iter()
+            .map(|o| (o.view_id, o.result.reseeded()))
+            .collect();
+        report.sort_unstable();
+        results.push(report);
+    }
+    h.join().unwrap();
+    assert_eq!(
+        results,
+        [vec![(7, true), (8, false)], vec![(7, false), (8, false)]],
+        "the owed reseed is announced once, on the next report that reaches a caller",
     );
 }
 
-/// A batch that answers fewer views than it named fails the rest rather than
-/// reporting them as advanced.
+/// A poll reply that goes wrong part-way fails every view it did not answer
+/// rather than raising, and ingests nothing under them: a terminal naming the
+/// wrong view (both share a schema, so a misdirected block would decode
+/// cleanly), a batch cut short by the peer going away, and a fault naming no
+/// view, which fails the request but not the connection.
 #[test]
-fn a_short_batch_reply_fails_the_views_it_never_answered() {
-    let (mut client, peer, log) = fixture(&[(7, "a", 4), (8, "b", 4)]);
+fn a_broken_poll_reply_fails_the_views_it_never_answered() {
+    type Script = fn(&Peer, &[u64]);
+    let cases: [(&str, Script, usize, bool); 3] = [
+        ("misdirected", |p, ids| p.reply_watermark(ids[1], TAG, 11), 0, true),
+        ("short", |p, ids| p.reply_watermark(ids[0], TAG, 11), 1, true),
+        (
+            "a request-level fault",
+            |p, _| p.send(&reply_status(0, WireStatus::Error, "refused")),
+            0,
+            false,
+        ),
+    ];
+    for (what, script, answered, closes) in cases {
+        let (mut client, peer, log) = fixture(&[(7, "a", 4), (8, "b", 4)]);
+        let h = std::thread::spawn(move || {
+            let ids = peer.expect_poll("the poll");
+            script(&peer, &ids);
+            ids
+        });
+        let report = client.poll_mirror().expect("a broken reply is reported per view");
+        let ids = h.join().unwrap();
 
-    let h = std::thread::spawn(move || {
-        let ids = peer.expect_poll("the poll");
-        peer.reply_watermark(ids[0], TAG, 11);
-        drop(peer); // the rest of the batch never comes
-        ids
-    });
-    let report = client
-        .poll_mirror()
-        .expect("a short reply is not the call's own failure");
-    let ids = h.join().unwrap();
-
-    let answered = report.iter().find(|o| o.view_id == ids[0]).expect("an entry");
-    assert!(
-        matches!(answered.result, PollResult::Advanced) && answered.cursor.is_some_and(|c| c.tick.get() == 11),
-        "the view that was answered keeps its round: {report:?}",
-    );
-    let missing = report.iter().find(|o| o.view_id == ids[1]).expect("an entry");
-    assert!(
-        matches!(missing.result, PollResult::Failed(_)),
-        "the view that was not answered fails: {report:?}",
-    );
-    assert!(
-        !log.saw(|e| matches!(e, Ev::Reseed(t, _) | Ev::Advance(t, _) if *t == ids[1])),
-        "and nothing is ingested under it",
-    );
+        for (i, id) in ids.iter().enumerate() {
+            let o = report.iter().find(|o| o.view_id == *id).expect("an entry per view");
+            if i < answered {
+                assert!(
+                    matches!(o.result, PollResult::Advanced) && o.cursor.is_some_and(|c| c.tick.get() == 11),
+                    "{what}: the view that was answered keeps its round: {report:?}",
+                );
+            } else {
+                assert!(matches!(o.result, PollResult::Failed(_)), "{what}: {report:?}");
+                assert!(
+                    !log.saw(|e| matches!(e, Ev::Reseed(t, _) | Ev::Advance(t, _) if t == id)),
+                    "{what}: nothing is ingested under an unanswered view",
+                );
+            }
+        }
+        assert_eq!(client.session.is_closed(), closes, "{what}");
+    }
 }
 
 /// A view's blocks are ingested as its terminal arrives, not once the whole
@@ -596,107 +598,51 @@ fn each_view_is_ingested_before_the_next_one_is_answered() {
         peer.reply_watermark(ids[0], TAG, 11);
         // Nothing else is on the wire, so an ingest seen before the second
         // terminal goes out ran off the first position's.
-        let deadline = std::time::Instant::now() + PATIENCE;
+        let deadline = Instant::now() + PATIENCE;
         while !watched.saw(|e| matches!(e, Ev::Reseed(t, _) | Ev::Advance(t, _) if *t == ids[0])) {
             assert!(
-                std::time::Instant::now() < deadline,
+                Instant::now() < deadline,
                 "the first view's blocks must reach the store before the second view is answered",
             );
             std::thread::sleep(Duration::from_millis(1));
         }
         peer.reply_watermark(ids[1], TAG, 12);
-        peer
     });
     let report = client.poll_mirror().expect("both views advance");
-    let _peer = h.join().unwrap();
+    h.join().unwrap();
 
     assert!(report.iter().all(|o| matches!(o.result, PollResult::Advanced)));
 }
 
-/// A host holding more views than one request may name chunks, and every view
-/// still advances — asserted here rather than against a real server, where the
-/// same claim would cost 65 `CREATE VIEW`s and their backfills.
-#[test]
-fn a_view_count_past_the_batch_cap_chunks() {
-    let m = gnitz_wire::txn_frame::DELTA_POLL_MAX_VIEWS + 1;
-    let names: Vec<String> = (0..m).map(|i| format!("v{i}")).collect();
-    let views: Vec<(u64, &str, u64)> = names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (100 + i as u64, n.as_str(), 4))
-        .collect();
-    let (mut client, peer, _log) = fixture(&views);
-
-    let h = std::thread::spawn(move || {
-        let mut seen = Vec::new();
-        for what in ["the full chunk", "the remainder"] {
-            let ids = peer.expect_poll(what);
-            for &id in &ids {
-                peer.reply_watermark(id, TAG, 9);
-            }
-            seen.push(ids);
-        }
-        peer.quiet("two requests cover every view");
-        (peer, seen)
-    });
-    let report = client.poll_mirror().expect("poll");
-    let (_peer, seen) = h.join().unwrap();
-
-    assert_eq!(
-        seen.iter().map(Vec::len).collect::<Vec<_>>(),
-        vec![gnitz_wire::txn_frame::DELTA_POLL_MAX_VIEWS, 1],
-        "the cap fills the first request and the rest opens a second",
-    );
-    assert_eq!(report.len(), m, "one entry per view");
-    assert!(
-        report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
-        "every view advances across the chunk boundary: {report:?}",
-    );
-}
-
-/// A dead connection fails **every view's** poll rather than raising.
-///
-/// Batching the requests must not turn one transport failure into the call's:
-/// the copies are intact, and every entry in the report is still worth reading.
+/// A dead connection fails **every view's** poll with the loss rather than
+/// raising or parking — whether the poll is what finds it dead, or an earlier
+/// verb already did. The copies are intact, and every entry is worth reading.
 #[test]
 fn a_dead_connection_fails_each_view_rather_than_the_call() {
-    let (mut client, peer, _log) = fixture(&[(7, "a", 4), (8, "b", 4)]);
-    drop(peer);
+    for lost_before in [false, true] {
+        let (mut client, peer, _log) = fixture(&[(7, "a", 4), (8, "b", 4)]);
+        drop(peer);
+        if lost_before {
+            let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None);
+            let r = client.scan_spec(1, &spec, &Arc::new(kv_schema(TypeCode::I64)));
+            assert!(matches!(r, Err(ClientError::ConnectionLost(_))), "{r:?}");
+        }
 
-    let report = client
-        .poll_mirror()
-        .expect("a dead socket is not the call's own failure");
-    let mut ids: Vec<u64> = report.iter().map(|o| o.view_id).collect();
-    ids.sort_unstable();
-    assert_eq!(ids, vec![7, 8], "one entry per view: {report:?}");
-    assert!(
-        report.iter().all(|o| matches!(o.result, PollResult::Failed(_))),
-        "each view names its own failure: {report:?}",
-    );
-    assert!(
-        client.mirrors(7) && client.mirrors(8),
-        "and both copies still answer at the round they reached",
-    );
-}
-
-/// A poll after an earlier verb lost the connection returns, every view failed
-/// with the loss, instead of parking forever.
-#[test]
-fn a_poll_after_the_connection_was_lost_fails_every_view() {
-    let (mut client, peer, _log) = fixture(&[(7, "a", 4), (8, "b", 4)]);
-    drop(peer);
-    let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None);
-    let r = client.scan_spec(1, &spec, &Arc::new(view_schema()));
-    assert!(matches!(r, Err(ClientError::ConnectionLost(_))), "{r:?}");
-
-    let report = client.poll_mirror().expect("a lost connection fails each view");
-    let mut ids: Vec<u64> = report.iter().map(|o| o.view_id).collect();
-    ids.sort_unstable();
-    assert_eq!(ids, vec![7, 8], "one entry per view: {report:?}");
-    assert!(
-        report
-            .iter()
-            .all(|o| matches!(o.result, PollResult::Failed(ClientError::ConnectionLost(_)))),
-        "each view carries the loss: {report:?}",
-    );
+        let report = client
+            .poll_mirror()
+            .expect("a dead socket is not the call's own failure");
+        let mut ids: Vec<u64> = report.iter().map(|o| o.view_id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![7, 8], "one entry per view: {report:?}");
+        assert!(
+            report
+                .iter()
+                .all(|o| matches!(o.result, PollResult::Failed(ClientError::ConnectionLost(_)))),
+            "lost before: {lost_before}: {report:?}",
+        );
+        assert!(
+            client.mirrors(7) && client.mirrors(8),
+            "and both copies still answer at the round they reached",
+        );
+    }
 }

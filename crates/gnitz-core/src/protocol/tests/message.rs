@@ -1,29 +1,9 @@
 use super::*;
-use crate::test_support::decode_wal_block;
-use crate::{retraction_batch, BatchAppender, PkColumn, Schema, ZSetBatch};
+use crate::test_support::{decode_wal_block, kv_rows, kv_schema};
+use crate::{retraction_batch, PkColumn, Schema, ZSetBatch};
 use gnitz_wire::control::{peek_control_block, DecodedControl};
+use gnitz_wire::TypeCode;
 use gnitz_wire::{ClientVerb, WireConflictMode};
-use gnitz_wire::{ColumnDef, TypeCode};
-
-fn kv_schema() -> Schema {
-    Schema {
-        columns: vec![
-            ColumnDef::new("pk", TypeCode::U64, false),
-            ColumnDef::new("val", TypeCode::I64, false),
-        ],
-        pk_cols: vec![0],
-    }
-}
-
-/// `(pk, val)` rows at weight 1.
-fn kv_batch(schema: &Schema, rows: &[(u128, i64)]) -> ZSetBatch {
-    let mut b = ZSetBatch::new(schema);
-    let mut a = BatchAppender::new(&mut b, schema);
-    for &(pk, v) in rows {
-        a.add_row(pk, 1).i64_val(v);
-    }
-    b
-}
 
 /// A frame's schema block, decoded.
 fn frame_schema(buf: &[u8], ctrl: &DecodedControl) -> Option<Schema> {
@@ -45,9 +25,9 @@ fn frame_data(buf: &[u8], ctrl: &DecodedControl, schema: &Schema) -> Option<ZSet
 /// from *that* family's schema, batch, tid and basis, in that order.
 #[test]
 fn push_txn_families_carry_their_own_schema_and_batch() {
-    let schema = kv_schema();
-    let b0 = kv_batch(&schema, &[(1, 10), (2, 20)]);
-    let b1 = kv_batch(&schema, &[(3, 30)]);
+    let schema = kv_schema(TypeCode::I64);
+    let b0 = kv_rows(&[(1, 10, 1), (2, 20, 1)]);
+    let b1 = kv_rows(&[(3, 30, 1)]);
     let b2 = retraction_batch(&schema, PkColumn::from_natives(&schema, [4]));
 
     let family = |tid, batch, mode, basis| PushFamily { tid, schema: &schema, batch, mode, basis };
@@ -75,10 +55,10 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
 /// the schema, but no data block.
 #[test]
 fn a_frame_carries_its_schema_and_its_rows_unless_empty() {
-    let schema = kv_schema();
+    let schema = kv_schema(TypeCode::I64);
     let hdr = ControlHeader { target_id: 42, ..Default::default() };
     for batch in [
-        kv_batch(&schema, &[(1, 100), (2, 200), (3, 300)]),
+        kv_rows(&[(1, 100, 1), (2, 200, 1), (3, 300, 1)]),
         ZSetBatch::new(&schema),
     ] {
         let buf = encode_frame(hdr, &[], Some(&schema.to_block()), Some(&batch));

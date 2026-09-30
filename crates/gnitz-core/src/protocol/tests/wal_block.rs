@@ -1,17 +1,7 @@
 use super::*;
-use crate::test_support::{decode_wal_block, encode_wal_block};
-use crate::{BatchAppender, Schema, ZSetBatch};
-use gnitz_wire::{ColumnDef, TypeCode};
-
-fn kv_schema(v: TypeCode) -> Schema {
-    Schema {
-        columns: vec![
-            ColumnDef::new("pk", TypeCode::U64, false),
-            ColumnDef::new("v", v, false),
-        ],
-        pk_cols: vec![0],
-    }
-}
+use crate::test_support::{decode_wal_block, encode_wal_block, kv_schema};
+use crate::{BatchAppender, ZSetBatch};
+use gnitz_wire::TypeCode;
 
 /// A German cell whose heap offset overruns the heap is a `DecodeError`, and
 /// leaves the sink as it was although the block's rows were already appended.
