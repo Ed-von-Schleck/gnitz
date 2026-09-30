@@ -6,15 +6,18 @@ use super::joincore::{
     emit_range_null_fill_tail, equi_prologue, join_pk_coldefs, pair_pk_coldefs, range_prologue, rekey_on_source_pk,
     src_pk_coldefs,
 };
-use super::{emit_filter, emit_join_inputs, project_front, Demand, EmitPieces, JoinSide, ViewChain};
+use super::spine::{self, SourceOrigin, Spine, Top};
+use super::{emit_filter, materialize, project_front, Demand, EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
 use crate::hir::physical::Frame;
 use crate::ir::BExpr;
 use crate::validate::reject_pk_list_arity;
 
 use gnitz_wire::JoinKind;
-use gnitz_wire::{Circuit, ColumnDef, NodeId};
+use gnitz_wire::{Circuit, ColumnDef, NodeId, TypeCode};
 use std::borrow::Cow;
+use std::collections::HashSet;
+use std::rc::Rc;
 
 /// One branch an emitter hands the shell: its node over the join frame, and a mark
 /// branch's `0/1` constant.
@@ -95,6 +98,184 @@ pub(super) fn lower_join_view(
         OutKey::OuterPk { .. } => sides[0].pk_repeats(),
     };
     Ok(EmitPieces { circuit: cb, top: node, out, pk_repeats })
+}
+
+/// A join's two inputs opened through the spine and emitted into `cb`, each
+/// carrying what `down` reads and its own keys, and kept under [`join_keep`].
+fn emit_join_inputs(
+    chain: &mut ViewChain,
+    cb: &mut Circuit,
+    down: Demand<'_>,
+    [left, right]: [&Rc<RelExpr>; 2],
+    kind: JoinType,
+    class: &JoinClass,
+) -> Result<([NodeId; 2], [JoinSide; 2]), GnitzSqlError> {
+    let live = |is_left: bool| {
+        let mut live = HashSet::new();
+        down.refs(&mut live);
+        live.extend(class.key_cols(is_left));
+        live
+    };
+    let (live_l, live_r) = (live(true), live(false));
+    let mut l = spine::open(chain, left, &live_l)?;
+    let mut r = spine::open(chain, right, &live_r)?;
+    // A join reads two distinct sources, one delta per epoch: a right side over the
+    // left's source is re-read as a second relation.
+    if l.tid() == r.tid() {
+        r = Spine::segment(materialize(chain, right, &live_r)?);
+    }
+    // A key the spine computes (`ON x.s = u.k` over `SELECT a + 1 AS s`) is no
+    // column of the scanned relation, so nothing over that relation can state
+    // where its delta scatters. Cut to a segment, the computed column is one.
+    let mut origin_l = l.origin();
+    if !class.key_cols(true).all(|id| origin_l.resolves(id)) {
+        l = Spine::segment(materialize(chain, left, &live_l)?);
+        origin_l = l.origin();
+    }
+    let mut origin_r = r.origin();
+    if !class.key_cols(false).all(|id| origin_r.resolves(id)) {
+        r = Spine::segment(materialize(chain, right, &live_r)?);
+        origin_r = r.origin();
+    }
+    let (a, left_frame) = l.emit(cb, Top::Slots)?;
+    let (b, right_frame) = r.emit(cb, Top::Slots)?;
+    let frames = [left_frame, right_frame];
+    let [kept_l, kept_r] = join_keep(down, class, kind, &frames)?;
+    let [frame_l, frame_r] = frames;
+    let side = |frame: Frame, origin, (keep, pk_arity), is_left| -> Result<JoinSide, GnitzSqlError> {
+        Ok(JoinSide {
+            key: frame.slots(class.key_cols(is_left))?,
+            keep,
+            pk_arity,
+            frame,
+            origin,
+        })
+    };
+    Ok((
+        [a, b],
+        [
+            side(frame_l, origin_l, kept_l, true)?,
+            side(frame_r, origin_r, kept_r, false)?,
+        ],
+    ))
+}
+
+/// One side of a join as [`join_keep`] left it.
+pub(super) struct JoinSide {
+    pub(super) frame: Frame,
+    /// The reindex payload, in emission order.
+    pub(super) keep: Vec<u32>,
+    /// The join key columns, [`JoinClass::key_cols`] order, as `frame` slots.
+    pub(super) key: Vec<usize>,
+    pk_arity: usize,
+    origin: SourceOrigin,
+}
+
+impl JoinSide {
+    /// `key`, this side's reindex key in its own emitted layout, restated over
+    /// the relation the master scatters.
+    pub(super) fn scatter_key(
+        &self,
+        key: &[gnitz_wire::ReindexSlot],
+    ) -> Result<gnitz_wire::ReindexRole, GnitzSqlError> {
+        self.origin.scatter_role(&self.frame, key).ok_or_else(|| {
+            GnitzSqlError::Internal("a join key column is not a column of the relation it scatters".into())
+        })
+    }
+
+    /// The kept payload width.
+    pub(super) fn n(&self) -> usize {
+        self.keep.len()
+    }
+
+    /// The pinned source PK's arity — `0` when this shape packs no PK out of the
+    /// payload.
+    pub(super) fn pa(&self) -> usize {
+        self.pk_arity
+    }
+
+    /// Whether two of this side's source rows may share their leading key.
+    pub(super) fn pk_repeats(&self) -> bool {
+        self.origin.src.pk_repeats()
+    }
+
+    /// The kept payload's `ColId`s, in keep order.
+    pub(super) fn ids(&self) -> impl Iterator<Item = Option<ColId>> + '_ {
+        self.keep.iter().map(|&i| self.frame.layout[i as usize])
+    }
+
+    /// The kept payload columns' defs, in keep order.
+    pub(super) fn kept_defs(&self) -> impl Iterator<Item = &ColumnDef> + '_ {
+        self.keep.iter().map(|&i| &self.frame.schema.columns[i as usize])
+    }
+
+    /// The type codes of the kept payload columns — what `null_extend` needs to
+    /// synthesize this side's NULL region.
+    pub(super) fn kept_type_codes(&self) -> Vec<TypeCode> {
+        self.kept_defs().map(|c| c.ty.tc).collect()
+    }
+}
+
+/// Each side's reindex payload under the keep rule — which source columns survive
+/// into the join's traces, and so onto disk — and its pinned source PK's arity.
+/// A keep list is the pinned PK, then every other kept column in source order: it
+/// need not ascend, and the PK at the front is what makes every pair-PK slot list
+/// a range. A wildcard projection is already expanded into `ProjEntry` column
+/// refs by bind, so Rule 1 covers `SELECT *`.
+fn join_keep(
+    down: Demand<'_>,
+    class: &JoinClass,
+    kind: JoinType,
+    frames: &[Frame; 2],
+) -> Result<[(Vec<u32>, usize); 2], GnitzSqlError> {
+    let mut keep = frames.each_ref().map(|f| vec![false; f.layout.len()]);
+    // Rules 1 + 2: the projection and the WHERE over the join. The mark column is
+    // in neither layout: the shell substitutes it per branch by its `0/1` constant.
+    let mut referenced: HashSet<ColId> = HashSet::new();
+    down.refs(&mut referenced);
+    if let JoinType::Mark(mark) = kind {
+        referenced.remove(&mark);
+    }
+    for id in referenced {
+        let side = usize::from(!frames[0].layout.contains(&Some(id)));
+        keep[side][frames[side].slot(id)?] = true;
+    }
+    let pins = class.out_key(kind).pins();
+    let banded = matches!(class.shape(), JoinShape::Band | JoinShape::PureRange);
+    for (side, is_left) in [(0, true), (1, false)] {
+        // Rule 3: a band or pure-range side with a ν keeps its key columns. A band
+        // ν is keyed by the source PK, which a bag-valued side repeats; a pure
+        // range re-keys its owned A slice onto the range column.
+        if banded && kind.has_nu(is_left) {
+            for pos in frames[side].slots(class.key_cols(is_left))? {
+                keep[side][pos] = true;
+            }
+        }
+        // Rule 4: a side whose source PK the output key packs out of the payload
+        // keeps it, at the front.
+        if pins[side] {
+            for &c in &frames[side].schema.pk_cols {
+                keep[side][c as usize] = true;
+            }
+        }
+    }
+    // Rule 5, the fallback: a side with a ν needs an identity to subtract on. A
+    // side without a ν keeps nothing — column 0 would split one trace element per
+    // key into one per row.
+    for (side, is_left) in [(0, true), (1, false)] {
+        if kind.has_nu(is_left) && !keep[side].contains(&true) {
+            keep[side][0] = true;
+        }
+    }
+    // A join reading nothing from either side still emits rows.
+    if !keep[0].contains(&true) && !keep[1].contains(&true) {
+        keep[0][0] = true;
+    }
+    Ok([0, 1].map(|side| {
+        let pinned: &[u32] = if pins[side] { &frames[side].schema.pk_cols } else { &[] };
+        let rest = (0..keep[side].len() as u32).filter(|&i| keep[side][i as usize] && !pinned.contains(&i));
+        (pinned.iter().copied().chain(rest).collect(), pinned.len())
+    }))
 }
 
 /// Substitute `ColRef(mark_id)` with `LitInt(val)` throughout an expression —
@@ -270,3 +451,7 @@ fn join_frame(pk_cols: Vec<ColumnDef>, sides: &[JoinSide; 2], kind: JoinType) ->
         sides[0].ids().chain(sides[1].ids()).zip(l.into_iter().chain(r)),
     )
 }
+
+#[cfg(test)]
+#[path = "tests/join.rs"]
+mod tests;

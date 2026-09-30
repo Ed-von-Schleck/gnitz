@@ -1,7 +1,7 @@
 //! The circuit primitives the join shell in [`super::join`] composes.
 
 use super::super::{JoinClass, JoinType};
-use super::JoinSide;
+use super::join::JoinSide;
 use crate::error::GnitzSqlError;
 use crate::validate::reject_column_overflow;
 

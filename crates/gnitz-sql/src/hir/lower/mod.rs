@@ -8,7 +8,6 @@
 //! * segment cut — [`cut_segment`];
 //! * source collision — [`materialize`];
 //! * reduce derivation — [`resolve_reduce_specs`], [`keyed_frame`];
-//! * join keep — [`join_sides`];
 //! * addressing — `physical::Frame`, [`project_front`].
 
 mod chain;
@@ -22,7 +21,6 @@ mod topn;
 
 use super::physical::{self, Frame, Rename};
 use super::{col_by_id, split_filter, AggCol, ColId, HirCol, HirExpr, ProjEntry, RelExpr};
-use super::{JoinClass, JoinShape, JoinType};
 use crate::agg::group_pk_def;
 use crate::codec::project_schema::{compute_map, payload_program, ProjItem};
 use crate::error::GnitzSqlError;
@@ -32,7 +30,6 @@ use gnitz_core::{RelDescriptor, Schema, ViewBundle};
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::ColumnDef;
 use gnitz_wire::{AggDescriptor, ReduceOutSlot};
-use spine::SourceOrigin;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -361,192 +358,3 @@ pub(crate) fn emit_filter(
 ) -> Result<gnitz_wire::NodeId, GnitzSqlError> {
     filter(cb, node, &frame.resolve_preds(preds)?, &frame.schema)
 }
-
-/// A join's two inputs opened through the spine and emitted into `cb`, each
-/// carrying what `down` reads and its own keys, and kept under [`join_sides`].
-pub(crate) fn emit_join_inputs(
-    chain: &mut ViewChain,
-    cb: &mut gnitz_wire::Circuit,
-    down: Demand<'_>,
-    [left, right]: [&Rc<RelExpr>; 2],
-    kind: JoinType,
-    class: &JoinClass,
-) -> Result<([gnitz_wire::NodeId; 2], [JoinSide; 2]), GnitzSqlError> {
-    let live = |is_left: bool| {
-        let mut live = HashSet::new();
-        down.refs(&mut live);
-        live.extend(class.key_cols(is_left));
-        live
-    };
-    let (live_l, live_r) = (live(true), live(false));
-    let mut l = spine::open(chain, left, &live_l)?;
-    let mut r = spine::open(chain, right, &live_r)?;
-    // A join reads two distinct sources, one delta per epoch: a right side over the
-    // left's source is re-read as a second relation.
-    if l.tid() == r.tid() {
-        r = spine::Spine::segment(materialize(chain, right, &live_r)?);
-    }
-    // A key the spine computes (`ON x.s = u.k` over `SELECT a + 1 AS s`) is no
-    // column of the scanned relation, so nothing over that relation can state
-    // where its delta scatters. Cut to a segment, the computed column is one.
-    if !l.keys_reach_source(class.key_cols(true)) {
-        l = spine::Spine::segment(materialize(chain, left, &live_l)?);
-    }
-    if !r.keys_reach_source(class.key_cols(false)) {
-        r = spine::Spine::segment(materialize(chain, right, &live_r)?);
-    }
-    let (origin_l, origin_r) = (l.origin(), r.origin());
-    let (a, left_frame) = l.emit(cb, spine::Top::Slots)?;
-    let (b, right_frame) = r.emit(cb, spine::Top::Slots)?;
-    Ok((
-        [a, b],
-        join_sides(down, class, kind, [left_frame, right_frame], [origin_l, origin_r])?,
-    ))
-}
-
-/// One side of a join as [`join_sides`] left it.
-pub(crate) struct JoinSide {
-    pub(crate) frame: Frame,
-    /// The reindex payload, in emission order.
-    pub(crate) keep: Vec<u32>,
-    /// The join key columns, [`JoinClass::key_cols`] order, as `frame` slots.
-    pub(crate) key: Vec<usize>,
-    pk_arity: usize,
-    origin: SourceOrigin,
-}
-
-impl JoinSide {
-    /// `key`, this side's reindex key in its own emitted layout, restated over
-    /// the relation the master scatters.
-    pub(crate) fn scatter_key(
-        &self,
-        key: &[gnitz_wire::ReindexSlot],
-    ) -> Result<gnitz_wire::ReindexRole, GnitzSqlError> {
-        self.origin.scatter_role(&self.frame, key).ok_or_else(|| {
-            GnitzSqlError::Internal("a join key column is not a column of the relation it scatters".into())
-        })
-    }
-
-    /// The kept payload width.
-    pub(crate) fn n(&self) -> usize {
-        self.keep.len()
-    }
-
-    /// The pinned source PK's arity — `0` when this shape packs no PK out of the
-    /// payload.
-    pub(crate) fn pa(&self) -> usize {
-        self.pk_arity
-    }
-
-    /// Whether two of this side's source rows may share their leading key.
-    pub(crate) fn pk_repeats(&self) -> bool {
-        self.origin.src.pk_repeats()
-    }
-
-    /// The kept payload's `ColId`s, in keep order.
-    pub(crate) fn ids(&self) -> impl Iterator<Item = Option<ColId>> + '_ {
-        self.keep.iter().map(|&i| self.frame.layout[i as usize])
-    }
-
-    /// The kept payload columns' defs, in keep order.
-    pub(crate) fn kept_defs(&self) -> impl Iterator<Item = &ColumnDef> + '_ {
-        self.keep.iter().map(|&i| &self.frame.schema.columns[i as usize])
-    }
-
-    /// The type codes of the kept payload columns — what `null_extend` needs to
-    /// synthesize this side's NULL region.
-    pub(crate) fn kept_type_codes(&self) -> Vec<gnitz_wire::TypeCode> {
-        self.kept_defs().map(|c| c.ty.tc).collect()
-    }
-}
-
-/// Both sides of a join step under the keep rule: which source columns survive
-/// into the join's traces, and so onto disk. The five contributors are marked in
-/// order below; a wildcard projection is already expanded into `ProjEntry` column
-/// refs by bind, so Rule 1 covers `SELECT *`.
-pub(crate) fn join_sides(
-    down: Demand<'_>,
-    class: &JoinClass,
-    kind: JoinType,
-    inputs: [Frame; 2],
-    origins: [SourceOrigin; 2],
-) -> Result<[JoinSide; 2], GnitzSqlError> {
-    let [left, right] = inputs;
-    let [origin_l, origin_r] = origins;
-    let keys = [left.slots(class.key_cols(true))?, right.slots(class.key_cols(false))?];
-    // One keep list per side, so a rule cannot write into the region another rule
-    // owns.
-    let mut keep = [vec![false; left.layout.len()], vec![false; right.layout.len()]];
-    let mark = |keep: &mut [Vec<bool>; 2], id: ColId| {
-        if let Ok(p) = left.slot(id) {
-            keep[0][p] = true;
-        } else if let Ok(p) = right.slot(id) {
-            keep[1][p] = true;
-        }
-        // An id in neither layout is the mark column, which the shell substitutes
-        // per branch by its `0/1` constant before resolving anything.
-    };
-    // Rules 1 + 2: the projection and the WHERE over the join.
-    let mut referenced: HashSet<ColId> = HashSet::new();
-    down.refs(&mut referenced);
-    for id in referenced {
-        mark(&mut keep, id);
-    }
-    // Rule 3: a band or pure-range side with a ν keeps its key columns. A band ν
-    // is keyed by the source PK, which a bag-valued side repeats; a pure range
-    // re-keys its owned A slice onto the range column.
-    if matches!(class.shape(), JoinShape::Band | JoinShape::PureRange) {
-        for (side, is_left) in [(0, true), (1, false)] {
-            if kind.has_nu(is_left) {
-                for &pos in &keys[side] {
-                    keep[side][pos] = true;
-                }
-            }
-        }
-    }
-    // Rule 4: a side whose source PK the output key packs out of the payload pins
-    // it to the front of its keep list, which `one_side` prepends.
-    let pins = class.out_key(kind).pins();
-    // Rule 5, the fallback: a side with a ν needs an identity to subtract on, and
-    // a pinned side already has one. A side without a ν keeps nothing — column 0
-    // would split one trace element per key into one per row.
-    for (side, is_left) in [(0, true), (1, false)] {
-        if kind.has_nu(is_left) && !pins[side] && !keep[side].iter().any(|&b| b) {
-            keep[side][0] = true;
-        }
-    }
-    // A join reading nothing from either side still emits rows. `pins[1]` implies
-    // `pins[0]`, so the left pin alone answers for both.
-    if !pins[0] && !keep[0].iter().any(|&b| b) && !keep[1].iter().any(|&b| b) {
-        keep[0][0] = true;
-    }
-    let ([kl, kr], [key_l, key_r]) = (keep, keys);
-    Ok([
-        one_side(left, origin_l, &kl, key_l, pins[0]),
-        one_side(right, origin_r, &kr, key_r, pins[1]),
-    ])
-}
-
-/// One side's keep list in emission order: its pinned PK columns first, then every
-/// other kept column in source order. A keep list need not ascend, and the PK at
-/// the front is what makes every pair-PK slot list a range.
-fn one_side(frame: Frame, origin: SourceOrigin, keep: &[bool], key: Vec<usize>, pin_pk: bool) -> JoinSide {
-    let pinned: Vec<u32> = if pin_pk {
-        frame.schema.pk_cols.clone()
-    } else {
-        Vec::new()
-    };
-    let mut cols = pinned.clone();
-    cols.extend((0..keep.len() as u32).filter(|i| keep[*i as usize] && !pinned.contains(i)));
-    JoinSide {
-        pk_arity: pinned.len(),
-        frame,
-        keep: cols,
-        key,
-        origin,
-    }
-}
-
-#[cfg(test)]
-#[path = "tests/lower.rs"]
-mod tests;

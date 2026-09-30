@@ -189,12 +189,6 @@ impl Spine<'_> {
         }
     }
 
-    /// True iff a key over `keys` can be stated over the opened relation.
-    pub(crate) fn keys_reach_source(&self, keys: impl Iterator<Item = ColId>) -> bool {
-        let origin = self.origin();
-        keys.into_iter().all(|id| origin.resolves(id))
-    }
-
     /// Emit the levels into `cb`. A rename-only projection relabels the frame
     /// instead of emitting a node, except the outermost one under `Top::Output`.
     pub(crate) fn emit(self, cb: &mut Circuit, top: Top) -> Result<(NodeId, Frame), GnitzSqlError> {
