@@ -196,11 +196,6 @@ impl RunQueue {
         self.queue.len()
     }
 
-    #[cfg(test)]
-    pub(super) fn is_queued(&self, key: usize) -> bool {
-        self.queued.contains(&key)
-    }
-
     fn clear(&mut self) {
         self.queue.clear();
         self.queued.clear();
@@ -211,7 +206,7 @@ thread_local! {
     /// The run queue of the reactor on this thread, for the waker vtable to reach
     /// without per-wake `Rc` traffic. A wake with no reactor live lands here
     /// harmlessly; `claim_thread` clears what a dropped reactor left.
-    pub(super) static RUN_QUEUE: RefCell<RunQueue> = const { RefCell::new(RunQueue::new()) };
+    static RUN_QUEUE: RefCell<RunQueue> = const { RefCell::new(RunQueue::new()) };
     /// A reactor is live on this thread.
     static REACTOR_LIVE: Cell<bool> = const { Cell::new(false) };
 }
@@ -253,7 +248,7 @@ const WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, waker_wake
 /// clone is a bitwise copy and drop is a no-op. Waking pushes the key onto the
 /// thread-local run queue. Waking only queues the key and never polls, so a wake
 /// may be issued under any reactor borrow.
-pub(super) fn make_waker(key: usize) -> Waker {
+fn make_waker(key: usize) -> Waker {
     let raw = RawWaker::new(key as *const (), &WAKER_VTABLE);
     unsafe { Waker::from_raw(raw) }
 }

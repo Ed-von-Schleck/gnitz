@@ -1,10 +1,9 @@
 //! The single-threaded async primitives: `oneshot`, `chan`, `AsyncRwLock` and
 //! the cancellation shapes each must survive.
 
-use std::cell::Cell as StdCell;
-
 use super::super::test_support::*;
 use super::super::*;
+use crate::runtime::test_support::try_poll_once;
 
 // ------------------------------------------------------------------
 // Primitives: oneshot / chan / AsyncRwLock
@@ -13,7 +12,7 @@ use super::super::*;
 #[test]
 fn oneshot_deliver_value() {
     let r = make_reactor();
-    let got: Rc<StdCell<i32>> = Rc::new(StdCell::new(0));
+    let got = Rc::new(Cell::new(0));
     let got2 = Rc::clone(&got);
     let (tx, rx) = oneshot::channel::<i32>();
     r.spawn(async move {
@@ -31,8 +30,8 @@ fn oneshot_deliver_value() {
 /// the value is parked where nothing will read it and dropped with the channel.
 #[test]
 fn oneshot_send_to_dropped_receiver_is_a_noop() {
-    let dropped: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
-    struct Tattle(Rc<StdCell<bool>>);
+    let dropped = Rc::new(Cell::new(false));
+    struct Tattle(Rc<Cell<bool>>);
     impl Drop for Tattle {
         fn drop(&mut self) {
             self.0.set(true);
@@ -44,136 +43,39 @@ fn oneshot_send_to_dropped_receiver_is_a_noop() {
     assert!(dropped.get(), "the undeliverable value must be dropped, not leaked");
 }
 
-#[test]
-fn async_rwlock_write_serializes_access() {
-    let r = make_reactor();
-    let order: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
-    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
-    for i in 0u32..3 {
-        let m = Rc::clone(&lock);
-        let ord = Rc::clone(&order);
-        r.spawn(async move {
-            let g = m.write().await;
-            let len = ord.borrow().len();
-            ord.borrow_mut().push(i);
-            // Fail loudly if another task entered the section while this
-            // one held the lock.
-            assert_eq!(ord.borrow().len(), len + 1);
-            drop(g);
-        });
-    }
-    r.block_until_idle();
-    assert_eq!(*order.borrow(), vec![0, 1, 2], "tasks must serialize, in lock order");
-}
-
+/// Every reader admitted while no writer holds or waits enters at once.
 #[test]
 fn async_rwlock_multiple_readers() {
     let r = make_reactor();
-    let active: Rc<StdCell<u32>> = Rc::new(StdCell::new(0));
-    let max: Rc<StdCell<u32>> = Rc::new(StdCell::new(0));
-    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
+    let active = Rc::new(Cell::new(0u32));
+    let max = Rc::new(Cell::new(0u32));
+    let lock = AsyncRwLock::default();
     for _ in 0..4 {
-        let l = Rc::clone(&lock);
+        let l = lock.clone();
         let a = Rc::clone(&active);
         let m = Rc::clone(&max);
         r.spawn(async move {
             let _g = l.read().await;
             a.set(a.get() + 1);
-            if a.get() > m.get() {
-                m.set(a.get());
-            }
+            m.set(m.get().max(a.get()));
             // Yield once to let other tasks acquire too.
             YieldOnce::new().await;
             a.set(a.get() - 1);
         });
     }
     r.block_until_idle();
-    assert!(max.get() >= 2, "readers must overlap, got max={}", max.get());
+    assert_eq!(max.get(), 4, "all four readers must hold the lock together");
 }
-
-#[test]
-fn async_rwlock_writer_waits_for_readers() {
-    let r = make_reactor();
-    let order: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
-    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
-    let l1 = Rc::clone(&lock);
-    let o1 = Rc::clone(&order);
-    r.spawn(async move {
-        let _g = l1.read().await;
-        o1.borrow_mut().push("R_start");
-        YieldOnce::new().await;
-        o1.borrow_mut().push("R_end");
-    });
-    let l2 = Rc::clone(&lock);
-    let o2 = Rc::clone(&order);
-    r.spawn(async move {
-        let _g = l2.write().await;
-        o2.borrow_mut().push("W_start");
-    });
-    r.block_until_idle();
-    let o = order.borrow().clone();
-    // R_start before W_start, R_end also before W_start (writer waits).
-    let r_end_pos = o.iter().position(|&s| s == "R_end").unwrap();
-    let w_start_pos = o.iter().position(|&s| s == "W_start").unwrap();
-    assert!(r_end_pos < w_start_pos, "writer must run after reader finishes: {o:?}");
-}
-
-/// A `WriteFuture` dropped while parked (e.g. via `select2`) takes its queue entry
-/// with it, and must hand the lock on: absorbing the release into an entry nobody
-/// polls again would block every live waiter forever.
-#[test]
-fn async_rwlock_cancelled_waiter_does_not_block_remaining() {
-    let r = make_reactor();
-    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
-    let done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
-
-    // Task A: holds the lock, yields once (letting B and C park), then releases.
-    let m_a = Rc::clone(&lock);
-    r.spawn(async move {
-        let _g = m_a.write().await;
-        YieldOnce::new().await;
-    });
-
-    // Task B: races lock acquisition against an immediately-ready future.
-    // `select2` polls the lock future first (it parks its waker), then
-    // `ready()` resolves, dropping the lock future while it is queued.
-    let m_b = Rc::clone(&lock);
-    r.spawn(async move {
-        let _ = select2(m_b.write(), std::future::ready(())).await;
-    });
-
-    // Task C: must acquire the lock once A releases, B's cancellation
-    // notwithstanding.
-    let m_c = Rc::clone(&lock);
-    let d = Rc::clone(&done);
-    r.spawn(async move {
-        let _g = m_c.write().await;
-        d.set(true);
-    });
-
-    for _ in 0..20 {
-        r.tick(false);
-    }
-    assert!(
-        done.get(),
-        "task C must acquire the lock after task B's cancelled waiter"
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────
-// AsyncRwLock writer-preference: new readers blocked by a parked
-// writer.
-// ─────────────────────────────────────────────────────────────────
 
 /// A waiting writer blocks a new reader, and acquires the lock before it.
 #[test]
 fn async_rwlock_new_readers_blocked_by_waiting_writer() {
     let r = make_reactor();
-    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
-    let order: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+    let lock = AsyncRwLock::default();
+    let order: Rc<RefCell<Vec<&'static str>>> = Rc::default();
 
     // Task A: holds read lock, yields once.
-    let l_a = Rc::clone(&lock);
+    let l_a = lock.clone();
     let o_a = Rc::clone(&order);
     r.spawn(async move {
         let _g = l_a.read().await;
@@ -182,7 +84,7 @@ fn async_rwlock_new_readers_blocked_by_waiting_writer() {
     });
 
     // Task B: writer — parks while A holds the read lock.
-    let l_b = Rc::clone(&lock);
+    let l_b = lock.clone();
     let o_b = Rc::clone(&order);
     r.spawn(async move {
         let _g = l_b.write().await;
@@ -191,7 +93,7 @@ fn async_rwlock_new_readers_blocked_by_waiting_writer() {
 
     // Task C: new reader — must be blocked by the waiting writer
     // (writer-preference) and only enter after B releases.
-    let l_c = Rc::clone(&lock);
+    let l_c = lock.clone();
     let o_c = Rc::clone(&order);
     r.spawn(async move {
         let _g = l_c.read().await;
@@ -199,73 +101,60 @@ fn async_rwlock_new_readers_blocked_by_waiting_writer() {
     });
 
     r.block_until_idle();
-    let o = order.borrow().clone();
-    let w_pos = o.iter().position(|&s| s == "W").expect("W not seen");
-    let r2_pos = o.iter().position(|&s| s == "R2").expect("R2 not seen");
-    assert!(
-        w_pos < r2_pos,
-        "writer-preference violated: W must precede R2, got {o:?}"
-    );
+    assert_eq!(*order.borrow(), ["R1", "W", "R2"], "writer-preference violated");
 }
 
 /// Readers hold the lock and the cancelled `WriteFuture` was the last waiting
-/// writer: the readers it was blocking must now enter.
+/// writer: the readers it was blocking must enter at once, not when the holder
+/// releases.
 #[test]
 fn async_rwlock_last_write_waiter_cancelled_unblocks_pending_readers() {
     let r = make_reactor();
-    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
-    let done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
-
-    // cancel channel: sending on it resolves select2 in Task B.
+    let lock = AsyncRwLock::default();
+    let done = Rc::new(Cell::new(false));
+    let (release_tx, release_rx) = oneshot::channel::<()>();
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
-    // Task A: holds read lock for many ticks so B stays parked.
-    let l_a = Rc::clone(&lock);
+    // Task A: holds the read lock until released.
+    let l_a = lock.clone();
     r.spawn(async move {
         let _g = l_a.read().await;
-        for _ in 0..10 {
-            YieldOnce::new().await;
-        }
+        release_rx.await;
     });
 
-    // Task B: races write acquisition vs cancel_rx. The WriteFuture parks;
-    // cancel_rx stays Pending until cancel_tx sends.
-    let l_b = Rc::clone(&lock);
+    // Task B: races write acquisition against `cancel_rx`, so its WriteFuture
+    // parks until the cancel.
+    let l_b = lock.clone();
     r.spawn(async move {
         let _ = select2(l_b.write(), cancel_rx).await;
     });
 
-    // Task C: new reader; parks in read_waiters while B is alive.
-    let l_c = Rc::clone(&lock);
+    // Task C: new reader; parks behind B.
+    let l_c = lock.clone();
     let d = Rc::clone(&done);
     r.spawn(async move {
         let _g = l_c.read().await;
         d.set(true);
     });
 
-    // Let A, B, C all park (A acquires read, B parks write, C parks read).
-    for _ in 0..5 {
-        r.tick(false);
-    }
+    r.tick(false); // A acquires, B and C park
     assert!(!done.get(), "C must be blocked while write waiter B is alive");
 
-    // Cancel B: dropping the last live write waiter must wake C.
     cancel_tx.send(());
-    for _ in 0..5 {
-        r.tick(false);
-    }
-    assert!(done.get(), "C must unblock when the last write waiter (B) is cancelled");
+    assert!(
+        poll_until(&r, || done.get()),
+        "C must unblock when the last write waiter (B) is cancelled"
+    );
+    release_tx.send(());
+    r.block_until_idle();
 }
 
 /// The reader/writer/cancellation state space, enumerated rather than sampled:
 /// every task mix over the four shapes, for every length up to `MAX_TASKS`.
-/// Whatever the mix, every task must run to completion and the lock must end
-/// holding nothing.
-///
-/// `is_quiescent` is the whole assertion: it is blind to `read_waiters`, which
-/// legitimately retains stale wakers at rest.
+/// Whatever the mix, no writer shares the lock, every task runs to completion,
+/// and the lock ends admitting both a reader and a writer.
 #[test]
-fn async_rwlock_every_task_mix_finishes_and_leaves_the_lock_idle() {
+fn async_rwlock_every_task_mix_excludes_finishes_and_leaves_the_lock_idle() {
     const SHAPES: u32 = 4;
     const MAX_TASKS: u32 = 5;
 
@@ -276,22 +165,32 @@ fn async_rwlock_every_task_mix_finishes_and_leaves_the_lock_idle() {
 
     for len in 2..=MAX_TASKS {
         for mix in 0..SHAPES.pow(len) {
-            let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
-            let done: Rc<StdCell<usize>> = Rc::new(StdCell::new(0));
+            let lock = AsyncRwLock::default();
+            let done = Rc::new(Cell::new(0usize));
+            // (readers, writers) inside the lock.
+            let held = Rc::new(Cell::new((0u32, 0u32)));
 
             for i in 0..len {
-                let l = Rc::clone(&lock);
-                let d = Rc::clone(&done);
+                let l = lock.clone();
+                let (d, h) = (Rc::clone(&done), Rc::clone(&held));
                 match (mix / SHAPES.pow(i)) % SHAPES {
                     // Hold the lock across an await, so the rest must park.
-                    0 => r.spawn(async move {
-                        let _g = l.read().await;
+                    shape @ (0 | 1) => r.spawn(async move {
+                        let (_g, me) = if shape == 1 {
+                            (Either::B(l.write().await), (0, 1))
+                        } else {
+                            (Either::A(l.read().await), (1, 0))
+                        };
+                        let (rd, wr) = h.get();
+                        let inside = (rd + me.0, wr + me.1);
+                        assert!(
+                            inside.1 == 0 || inside == (0, 1),
+                            "mix {mix} of {len}: {inside:?} (readers, writers) inside the lock"
+                        );
+                        h.set(inside);
                         YieldOnce::new().await;
-                        d.set(d.get() + 1);
-                    }),
-                    1 => r.spawn(async move {
-                        let _g = l.write().await;
-                        YieldOnce::new().await;
+                        let (rd, wr) = h.get();
+                        h.set((rd - me.0, wr - me.1));
                         d.set(d.get() + 1);
                     }),
                     // Cancel the acquire: the loser's Drop is the whole point.
@@ -307,10 +206,17 @@ fn async_rwlock_every_task_mix_finishes_and_leaves_the_lock_idle() {
             }
 
             // `block_until_idle` panics on a lost wake; these catch a task that
-            // finished without acquiring, and a guard that leaked its state.
+            // finished without acquiring, and a guard or waiter that leaked.
             r.block_until_idle();
             assert_eq!(done.get(), len as usize, "mix {mix} of {len}: a task never ran");
-            assert!(lock.is_quiescent(), "mix {mix} of {len}: the lock did not end idle");
+            assert!(
+                try_poll_once(lock.read()).is_some(),
+                "mix {mix} of {len}: a reader is refused"
+            );
+            assert!(
+                try_poll_once(lock.write()).is_some(),
+                "mix {mix} of {len}: a writer is refused"
+            );
         }
     }
 }
@@ -326,11 +232,11 @@ fn async_rwlock_every_task_mix_finishes_and_leaves_the_lock_idle() {
 fn async_rwlock_write_release_admits_one_writer() {
     const N: usize = 16;
     let r = make_reactor();
-    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
-    let polls: Rc<StdCell<usize>> = Rc::new(StdCell::new(0));
+    let lock = AsyncRwLock::default();
+    let polls = Rc::new(Cell::new(0usize));
 
     for _ in 0..N {
-        let l = Rc::clone(&lock);
+        let l = lock.clone();
         let c = Rc::clone(&polls);
         r.spawn(async move {
             let mut acquire = std::pin::pin!(l.write());
@@ -345,11 +251,7 @@ fn async_rwlock_write_release_admits_one_writer() {
     }
 
     r.block_until_idle();
-    assert!(
-        polls.get() <= 3 * N,
-        "each release must wake one writer: {} polls for {N} writers",
-        polls.get()
-    );
+    assert_eq!(polls.get(), 2 * N - 1, "each release must wake one writer");
 }
 
 // ─────────────────────────────────────────────────────────────────

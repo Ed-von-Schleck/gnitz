@@ -28,7 +28,10 @@ mod sync;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
-pub(crate) use test_support::{egress_pair, poll_until, reactor_with_rings, read_nonblocking, ring_slot, spawn_drain};
+pub(crate) use test_support::{
+    client_pair, egress_pair, make_reactor, make_reactor_over, poll_until, reactor_with_rings, read_nonblocking,
+    ring_slot, spawn_drain,
+};
 mod uring;
 mod wake_queue;
 
@@ -55,9 +58,8 @@ pub(crate) struct Limits {
     /// One kernel send making no progress for this long evicts the client, whose
     /// stalled sends would otherwise pin W2M ring space and block a worker.
     pub client_send_timeout: std::time::Duration,
-    /// How long a listener whose multishot accept was cancelled on fd
-    /// exhaustion waits before re-arming, so closing connections get a window
-    /// to free fds.
+    /// How long a listener whose multishot accept ended on an error waits
+    /// before re-arming, so closing connections get a window to free fds.
     pub accept_rearm_backoff: std::time::Duration,
     /// Ceiling on open client connections, across every listener and
     /// transport (`GNITZ_MAX_CONNS`). A connection accepted past it is closed

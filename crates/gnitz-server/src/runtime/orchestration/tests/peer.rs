@@ -4,6 +4,8 @@
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use gnitz_store::storage::PooledBuf;
+
 use super::*;
 use crate::runtime::reactor::{egress_pair, read_nonblocking, ring_slot, select2, spawn_drain, Either, Limits};
 
@@ -11,9 +13,9 @@ use crate::runtime::reactor::{egress_pair, read_nonblocking, ring_slot, select2,
 /// leave as one send: the far end reads the whole concatenation in one `read`.
 #[test]
 fn corked_replies_leave_as_one_send() {
-    let (r, sender, receiver) = egress_pair(Limits::TEST, None);
+    let (r, conn, receiver) = egress_pair(Limits::TEST, None);
     let receiver = Rc::new(receiver);
-    let peer = Peer::new(&r, r.client_conn(sender).expect("under the cap"), None);
+    let peer = Peer::new(&r, conn, None);
     let frames: Vec<Vec<u8>> = (0..8u8).map(|i| vec![0xD0 | i; 200]).collect();
     let expected: Vec<u8> = frames.iter().flatten().copied().collect();
 
@@ -45,8 +47,8 @@ fn a_slot_forward_cannot_overtake_a_corked_reply() {
     let slot_bytes = slot.frame_bytes().to_vec();
     assert!(slot_bytes.len() > COALESCE_MAX_BYTES, "the slot goes out alone");
 
-    let (r, sender, receiver) = egress_pair(Limits::TEST, None);
-    let peer = Peer::new(&r, r.client_conn(sender).expect("under the cap"), None);
+    let (r, conn, receiver) = egress_pair(Limits::TEST, None);
+    let peer = Peer::new(&r, conn, None);
     let corked = vec![0x5Au8; 128];
 
     let c = corked.clone();
@@ -70,9 +72,9 @@ fn a_small_slot_is_corked_behind_corked_bytes() {
     let (_ring, slot) = ring_slot(64);
     let slot_bytes = slot.frame_bytes().to_vec();
 
-    let (r, sender, receiver) = egress_pair(Limits::TEST, None);
+    let (r, conn, receiver) = egress_pair(Limits::TEST, None);
     let receiver = Rc::new(receiver);
-    let peer = Peer::new(&r, r.client_conn(sender).expect("under the cap"), None);
+    let peer = Peer::new(&r, conn, None);
     let corked = vec![0x5Au8; 128];
 
     let (c, rx) = (corked.clone(), Rc::clone(&receiver));
@@ -99,8 +101,8 @@ fn a_small_slot_is_corked_behind_corked_bytes() {
 /// and it leaves nothing behind once it does.
 #[test]
 fn a_full_accumulator_ships_between_messages() {
-    let (r, sender, receiver) = egress_pair(Limits::TEST, None);
-    let peer = Peer::new(&r, r.client_conn(sender).expect("under the cap"), None);
+    let (r, conn, receiver) = egress_pair(Limits::TEST, None);
+    let peer = Peer::new(&r, conn, None);
     let drain = spawn_drain(receiver, COALESCE_MAX_BYTES);
     let frame = vec![0x3Cu8; 4096];
 
@@ -112,7 +114,7 @@ fn a_full_accumulator_ships_between_messages() {
         assert_eq!(peer.corked_len(), 0, "the flush ships everything corked");
     });
 
-    assert!(drain.join().expect("drain") >= COALESCE_MAX_BYTES);
+    assert_eq!(drain.join().expect("drain"), COALESCE_MAX_BYTES as u64);
 }
 
 /// A failed send finishes the peer: every later send and flush refuses, nothing
@@ -122,8 +124,8 @@ fn a_failed_send_finishes_the_peer() {
     let (_big_ring, big) = ring_slot(COALESCE_MAX_BYTES);
     let (_small_ring, small) = ring_slot(64);
 
-    let (r, sender, receiver) = egress_pair(Limits::TEST, None);
-    let peer = Peer::new(&r, r.client_conn(sender).expect("under the cap"), None);
+    let (r, conn, receiver) = egress_pair(Limits::TEST, None);
+    let peer = Peer::new(&r, conn, None);
     drop(receiver);
 
     r.block_on(async move {
@@ -143,8 +145,8 @@ fn a_failed_send_finishes_the_peer() {
 /// the client.
 #[test]
 fn next_request_ships_before_parking() {
-    let (r, sender, receiver) = egress_pair(Limits::TEST, None);
-    let peer = Peer::new(&r, r.client_conn(sender).expect("under the cap"), None);
+    let (r, conn, receiver) = egress_pair(Limits::TEST, None);
+    let peer = Peer::new(&r, conn, None);
     let frame = vec![0x6Bu8; 300];
     peer.cork(&frame);
 
@@ -160,4 +162,76 @@ fn next_request_ships_before_parking() {
         frame,
         "the corked frame left before the park"
     );
+}
+
+/// W frames as W sends versus one send of their concatenation, the trade
+/// `COALESCE_MAX_BYTES` is set from. Only the ratio is meaningful.
+///
+/// `cd crates && cargo test -p gnitz-server --release fanout_coalesced_egress_bench -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore]
+fn fanout_coalesced_egress_bench() {
+    use std::hint::black_box;
+
+    const ITERS: usize = 3000;
+
+    for w in [2usize, 4, 8] {
+        for total in [4 * 1024usize, 32 * 1024, 64 * 1024, 128 * 1024] {
+            let per_frame = total / w;
+            let (r, conn, receiver) = egress_pair(Limits::TEST, None);
+            // Both arms push `total` bytes per sample; the reader keeps
+            // the socket buffers from ever stalling a send, so the timed
+            // region is kernel-op cost, not backpressure.
+            let expect = 2 * ITERS * total;
+            let drain_t = spawn_drain(receiver, expect);
+
+            let frame = vec![0xA5u8; per_frame];
+            let r2 = Rc::clone(&r);
+            let (per_frame_dur, coalesced_dur) = r.block_on(async move {
+                let (mut a, mut b) = (Duration::ZERO, Duration::ZERO);
+                for i in 0..ITERS {
+                    // Source buffers are filled outside the timed region
+                    // on both arms except the concatenation itself,
+                    // which is the copy under test.
+                    let bufs: Vec<PooledBuf> = (0..w).map(|_| PooledBuf(frame.clone())).collect();
+                    let run_per_frame = async |bufs: Vec<PooledBuf>| {
+                        let t = Instant::now();
+                        for buf in bufs {
+                            let _ = black_box(r2.send_owned(&conn, SendBody::Pooled(buf)).await);
+                        }
+                        t.elapsed()
+                    };
+                    let run_coalesced = async || {
+                        let t = Instant::now();
+                        let mut buf = PooledBuf::with_capacity(total);
+                        for _ in 0..w {
+                            buf.0.extend_from_slice(&frame);
+                        }
+                        let _ = black_box(r2.send_owned(&conn, SendBody::Pooled(buf)).await);
+                        t.elapsed()
+                    };
+                    if i % 2 == 0 {
+                        a += run_per_frame(bufs).await;
+                        b += run_coalesced().await;
+                    } else {
+                        b += run_coalesced().await;
+                        a += run_per_frame(bufs).await;
+                    }
+                }
+                (a, b)
+            });
+
+            let seen = drain_t.join().expect("drain thread");
+            assert_eq!(seen, expect as u64, "reader must observe every byte both arms sent");
+
+            let delta = coalesced_dur.as_secs_f64() / per_frame_dur.as_secs_f64() - 1.0;
+            println!(
+                "coalesced egress W={w} total={total}B: coalesced vs per-frame {:+.1}% \
+                 (per-frame {:?}/batch, coalesced {:?}/batch)",
+                delta * 100.0,
+                per_frame_dur / ITERS as u32,
+                coalesced_dur / ITERS as u32,
+            );
+        }
+    }
 }

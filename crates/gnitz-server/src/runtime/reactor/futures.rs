@@ -74,7 +74,7 @@ impl ReactorShared {
         let mut acks = self.acks.borrow_mut();
         let Some(r) = acks.get_mut(&id) else { return };
         r.record(w, slot.control().fault(slot.bytes()));
-        if r.answered.covers(self.w2m.num_workers()) {
+        if r.fault.is_some() || r.answered.covers(self.w2m.num_workers()) {
             if let Some(waker) = r.waker.take() {
                 waker.wake();
             }
@@ -150,26 +150,24 @@ impl AckLease {
         self.ctx
     }
 
-    /// Once every worker has ACKed, the first failed ACK as `Err`.
+    /// `Ok` once every worker has ACKed; `Err` as soon as one has failed, without
+    /// waiting for the rest — the fault of the lowest-numbered failed worker among
+    /// those that answered.
     pub(crate) async fn acks(&self) -> Result<(), WireFault> {
         let nw = self.inner.w2m.num_workers();
         std::future::poll_fn(|cx| {
             let mut acks = self.inner.acks.borrow_mut();
             let r = acks.get_mut(&self.id).expect("a leased id is routed");
-            if !r.answered.covers(nw) {
-                r.waker = Some(cx.waker().clone());
-                return Poll::Pending;
+            if let Some((w, f)) = &r.fault {
+                return Poll::Ready(Err(worker_fault(*w, self.ctx, f.clone())));
             }
-            drop(acks);
-            Poll::Ready(self.first_error().map_or(Ok(()), Err))
+            if r.answered.covers(nw) {
+                return Poll::Ready(Ok(()));
+            }
+            r.waker = Some(cx.waker().clone());
+            Poll::Pending
         })
         .await
-    }
-
-    /// The failed ACK of the lowest-numbered worker among those that answered.
-    pub(crate) fn first_error(&self) -> Option<WireFault> {
-        let (w, f) = self.inner.acks.borrow()[&self.id].fault.clone()?;
-        Some(worker_fault(w, self.ctx, f))
     }
 }
 

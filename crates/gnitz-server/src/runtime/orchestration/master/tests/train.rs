@@ -1,6 +1,6 @@
 use super::super::fixtures::{make_row_batch, two_col_schema};
 use super::*;
-use crate::runtime::reactor::{reactor_with_rings, Reactor};
+use crate::runtime::reactor::{client_pair, reactor_with_rings, Reactor};
 use crate::runtime::test_support::try_poll_once;
 use gnitz_wire::WireStatus;
 
@@ -17,11 +17,7 @@ impl DrainFixture {
         let (reactor, writers) = reactor_with_rings(n_workers);
         let reactor = Rc::new(reactor);
         let lease = reactor.lease_train(crate::runtime::sal::WorkerSet::ALL, SalMessageKind::ScanSpec);
-        let (peer_sock, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-        drop(partner);
-        let conn = reactor
-            .client_conn(std::os::fd::OwnedFd::from(peer_sock))
-            .expect("under the cap");
+        let (conn, _) = client_pair(&reactor);
         let peer = Peer::new(&reactor, conn, None);
         (DrainFixture { reactor, peer, lease }, writers)
     }

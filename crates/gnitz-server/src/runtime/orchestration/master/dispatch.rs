@@ -111,23 +111,18 @@ impl MasterDispatcher {
     /// Wait until every worker has answered `lease`. Fails on a worker's error
     /// ACK or death.
     pub(crate) async fn collect_round(&self, lease: &AckLease) -> Result<(), WireFault> {
-        match select2(lease.acks(), self.round_failure(lease)).await {
+        match select2(lease.acks(), self.worker_death(lease.ctx())).await {
             Either::A(r) => r,
             Either::B(e) => Err(e),
         }
     }
 
-    /// Resolves once a worker has answered `lease` with an error or has died, probing
-    /// every `WORKER_WATCH`. A worker failing before it joins a round leaves the others
-    /// in their exchange wait, so an error must end the round without the other ACKs.
-    async fn round_failure(&self, lease: &AckLease) -> WireFault {
+    /// Resolves once a worker has died, probing every `WORKER_WATCH`.
+    async fn worker_death(&self, ctx: &str) -> WireFault {
         loop {
             self.reactor.timer(Instant::now() + WORKER_WATCH).await;
-            if let Some(e) = lease.first_error() {
-                return e;
-            }
             if let Some(w) = self.check_workers() {
-                return format!("worker {w} exited during {}", lease.ctx()).into();
+                return format!("worker {w} exited during {ctx}").into();
             }
         }
     }

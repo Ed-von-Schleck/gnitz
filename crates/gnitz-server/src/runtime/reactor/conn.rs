@@ -101,13 +101,14 @@ impl Reactor {
         if io_uring::cqueue::more(flags) {
             return;
         }
-        if res != -libc::EMFILE && res != -libc::ENFILE {
+        if res >= 0 {
             arm_accept(&self.inner, id);
             return;
         }
-        // Out of fds: back off before re-arming so closing connections get a
-        // window to free fds. One task per cancelled listener — exhaustion is
-        // global, so both can cancel at once and each is owed a full backoff.
+        // Failed: back off before re-arming, so an error that persists (fd
+        // exhaustion, above all, which closing connections relieve) is not
+        // re-armed into a hot loop. One task per cancelled listener — exhaustion
+        // is global, so both can cancel at once and each is owed a full backoff.
         let backoff = self.timer(Instant::now() + self.inner.limits.accept_rearm_backoff);
         let inner = Rc::clone(&self.inner);
         self.spawn(async move {

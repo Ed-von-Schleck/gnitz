@@ -198,14 +198,6 @@ impl AsyncRwLock {
         self.0.borrow_mut().has_writer = false;
         self.wake_next();
     }
-
-    /// True iff nothing holds or waits for the lock. `read_waiters` is not part
-    /// of it: it retains stale wakers by design; see its own doc.
-    #[cfg(test)]
-    pub(super) fn is_quiescent(&self) -> bool {
-        let s = self.0.borrow();
-        s.readers == 0 && !s.has_writer && s.write_waiters.is_empty()
-    }
 }
 
 pub struct ReadFuture {

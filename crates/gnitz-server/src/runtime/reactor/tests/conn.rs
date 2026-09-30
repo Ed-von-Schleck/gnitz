@@ -1,9 +1,8 @@
 //! Client connections: accept dispatch, the send loop, its CQE and its eviction
 //! deadline, and how a connection's recv side ends and its socket closes.
 
-use std::io::Read;
-use std::io::Write;
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+use std::io::{Read, Write};
+use std::os::fd::OwnedFd;
 use std::time::Duration;
 
 use super::super::test_support::*;
@@ -11,25 +10,9 @@ use super::*;
 use crate::runtime::test_support::try_poll_once;
 use gnitz_store::storage::PooledBuf;
 
-/// One whole-payload client send, with nothing racing it.
-async fn owned_send(r: &Reactor, conn: &Rc<ClientConn>, payload: Vec<u8>) -> Result<(), PeerGone> {
-    r.send_owned(conn, SendBody::Pooled(PooledBuf(payload))).await
-}
-
-/// A pooled send buffer holding `bytes`.
-fn pooled(bytes: &[u8]) -> PooledBuf {
-    let mut b = PooledBuf::with_capacity(bytes.len());
-    b.0.extend_from_slice(bytes);
-    b
-}
-
 /// A send's carry: `body`, over a connection of its own.
 fn outbound(r: &Reactor, body: SendBody) -> Outbound {
-    let (local, _) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-    Outbound {
-        _conn: r.client_conn(OwnedFd::from(local)).expect("under the cap"),
-        body,
-    }
+    Outbound { _conn: client_pair(r).0, body }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -44,16 +27,17 @@ fn outbound(r: &Reactor, body: SendBody) -> Outbound {
 // ─────────────────────────────────────────────────────────────────
 
 #[test]
-fn send_cqe_wakes_its_waker_and_returns_the_body() {
+fn send_cqe_retires_its_entry_wakes_its_awaiter_and_returns_the_body() {
     let r = make_reactor();
-    let (id, mut fut) = bare_op(&r, Some(outbound(&r, SendBody::Pooled(pooled(&[0xAB; 16])))));
+    let (u, mut fut) = r.install_op(Some(outbound(&r, SendBody::Pooled(PooledBuf(vec![0xAB; 16])))));
     let mut fut = Pin::new(&mut fut);
-    let waker = make_waker(11);
+    let (flag, waker) = WakeFlag::new();
     let mut cx = Context::from_waker(&waker);
     assert!(fut.as_mut().poll(&mut cx).is_pending());
 
-    cqe(&r, KIND_OP, id, 16);
-    assert!(is_queued(11), "KIND_OP must wake the op future");
+    r.dispatch_cqe(u, 16, 0);
+    assert!(r.inner.ops.borrow().is_empty(), "the CQE alone retires the entry");
+    assert!(flag.woken(), "KIND_OP must wake the op future");
     match fut.as_mut().poll(&mut cx) {
         Poll::Ready((rc, body)) => {
             assert_eq!(rc, 16, "KIND_OP must deliver the CQE rc verbatim");
@@ -65,7 +49,6 @@ fn send_cqe_wakes_its_waker_and_returns_the_body() {
         }
         Poll::Pending => panic!("a completed send must resolve"),
     }
-    assert_eq!(r.inner.ops.borrow().len(), 0, "a resolved send must retire its entry");
 }
 
 /// A dropped send keeps its connection and body until the late CQE — a ring slot
@@ -78,7 +61,7 @@ fn dropped_send_future_keeps_its_body_until_the_cqe() {
     let r = make_reactor();
     let out = outbound(&r, SendBody::Slot(slot));
     let conn = Rc::clone(&out._conn);
-    let (id, mut fut) = bare_op(&r, Some(out));
+    let (u, mut fut) = r.install_op(Some(out));
     assert!(try_poll_once(&mut fut).is_none());
     drop(fut);
     assert_eq!(r.inner.ops.borrow().len(), 1, "drop must leave the entry to its CQE");
@@ -89,7 +72,7 @@ fn dropped_send_future_keeps_its_body_until_the_cqe() {
         "the kernel may still read the body — it must outlive the future"
     );
 
-    cqe(&r, KIND_OP, id, 64);
+    r.dispatch_cqe(u, 64, 0);
     assert_eq!(r.inner.ops.borrow().len(), 0, "the late CQE must retire the entry");
     assert!(receiver.release_cursor(0) > held, "and free the body");
     assert_eq!(Rc::strong_count(&conn), 1, "and release the connection");
@@ -99,27 +82,26 @@ fn dropped_send_future_keeps_its_body_until_the_cqe() {
 // The recv side and the socket's lifetime.
 // ─────────────────────────────────────────────────────────────────
 
-/// A recv that completes with EOF removes the reactor's entry, but the socket
-/// stays open for as long as any holder keeps the connection, and closes with
-/// the last. Observed from the partner end, so no fd number is probed.
+/// A peer's half-close ends the recv side once the frames ahead of it are
+/// delivered, and the reactor lets go of the connection; but the socket stays open
+/// for as long as any holder keeps the connection, and closes with the last.
+/// Observed from the partner end, so no fd number is probed.
 #[test]
-fn a_closed_connection_drops_its_entry_and_closes_with_its_last_holder() {
-    let (local, mut partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+fn a_closed_connection_delivers_its_queue_and_closes_with_its_last_holder() {
     let r = make_reactor();
-    let conn = r.client_conn(OwnedFd::from(local)).expect("under the cap");
-    let fd = conn.fd();
-    r.register_conn(&conn, Box::new(Plain::new()));
-
+    let (conn, mut partner) = registered(&r);
+    (&partner).write_all(&framed(b"last")).expect("write");
     partner.shutdown(std::net::Shutdown::Write).expect("half-close");
-    assert!(
-        poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&fd)),
-        "EOF must end the recv side and drop the reactor's entry"
-    );
+
+    let c = Rc::clone(&conn);
+    let (last, end) = r.block_on(async move { (c.recv().await, c.recv().await) });
+    assert_eq!(last.expect("the queued frame").as_slice(), b"last");
+    assert!(end.is_none(), "then recv reports the end");
+    assert_eq!(Rc::strong_count(&conn), 1, "the reactor let go of the connection");
     assert!(
         !conn.is_gone(),
         "the end of the recv side does not finish the connection"
     );
-    assert!(matches!(try_poll_once(conn.recv()), Some(None)), "recv reports the end");
 
     partner.set_nonblocking(true).expect("nonblocking");
     let mut buf = [0u8; 1];
@@ -156,62 +138,22 @@ fn the_connection_cap_refuses_past_it_until_a_connection_drops() {
 /// peer cannot pin the connection.
 #[test]
 fn close_ends_an_armed_recv() {
-    let (local, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
     let r = make_reactor();
-    let conn = r.client_conn(OwnedFd::from(local)).expect("under the cap");
-    let fd = conn.fd();
-    r.register_conn(&conn, Box::new(Plain::new()));
+    let (conn, _partner) = registered(&r);
     conn.fail();
 
     // The peer neither writes nor closes: only the shutdown can complete the
     // recv.
     assert!(
-        poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&fd)),
-        "close must end the armed recv; without it the entry lives until the peer acts"
+        poll_until(&r, || Rc::strong_count(&conn) == 1),
+        "close must end the armed recv; without it the reactor holds the connection until the peer acts"
     );
-    drop(partner);
-}
-
-/// A refused recv side runs nothing it queued: the frames ahead of the refusal are
-/// discarded and refunded at once, and the socket is shut down so the peer — and
-/// any task parked in a send to it — sees the end now.
-#[test]
-fn a_refused_recv_discards_its_queue_and_shuts_down() {
-    let (local, mut partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-    let r = make_reactor();
-    let conn = r.client_conn(OwnedFd::from(local)).expect("under the cap");
-    let fd = conn.fd();
-    r.register_conn(&conn, Box::new(Plain::new()));
-
-    let mut wire = framed(&[0x42u8; 100]);
-    wire.extend_from_slice(&((gnitz_wire::MAX_FRAME_PAYLOAD + 1) as u32).to_le_bytes());
-    (&partner).write_all(&wire).expect("write");
-
-    assert!(
-        poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&fd)),
-        "the oversize prefix ends the recv side"
-    );
-    assert!(conn.is_gone(), "and finishes the connection");
-    assert!(conn.try_recv().is_none(), "the frame ahead of the refusal is discarded");
-    assert_eq!(
-        r.inner.inbound.held(),
-        0,
-        "and refunded while the connection is still held"
-    );
-
-    partner
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("timeout");
-    let mut buf = [0u8; 1];
-    assert_eq!(partner.read(&mut buf).ok(), Some(0), "the partner reads EOF");
-    drop(conn);
 }
 
 /// A payload far larger than the socket buffers completes across many short sends.
 #[test]
 fn send_owned_loops_until_full_payload_sent_over_socketpair() {
-    let (r, sender, receiver) = egress_pair(Limits::TEST, Some(8 * 1024));
-    let conn = r.client_conn(sender).expect("under the cap");
+    let (r, conn, receiver) = egress_pair(Limits::TEST, Some(8 * 1024));
     let payload = vec![0x5Au8; 200 * 1024];
     let payload_len = payload.len();
     let drain_t = spawn_drain(receiver, payload_len);
@@ -220,14 +162,15 @@ fn send_owned_loops_until_full_payload_sent_over_socketpair() {
     // `conn` drops with the task, closing the sender before the join: on the
     // truncated send this test exists to catch, the drain's blocking `read`
     // would otherwise never return and the whole binary would hang.
-    let sent = r.block_on(async move { owned_send(&r2, &conn, payload).await });
+    let sent = r.block_on(async move { r2.send_owned(&conn, SendBody::Pooled(PooledBuf(payload))).await });
     let received = drain_t.join().expect("drain thread");
-    assert!(
-        sent.is_ok(),
+    assert_eq!(
+        sent,
+        Ok(()),
         "send_owned must loop on partial CQEs until the full payload is sent"
     );
     assert_eq!(
-        received, payload_len,
+        received, payload_len as u64,
         "receiver must observe every byte — a truncated send would leave the \
          client blocked waiting for bytes that never arrive"
     );
@@ -241,140 +184,47 @@ fn send_owned_evicts_a_client_that_never_drains() {
         client_send_timeout: TIMEOUT,
         ..Limits::TEST
     };
-    let (r, sender, _receiver) = egress_pair(limits, Some(4 * 1024));
-    let conn = r.client_conn(sender).expect("under the cap");
+    let (r, conn, _receiver) = egress_pair(limits, Some(4 * 1024));
 
     // Far larger than both buffers, and nothing ever reads the other
     // end — the send stalls partway and only the deadline can end it.
     let payload = vec![0x7Au8; 1024 * 1024];
     let (r2, c2) = (Rc::clone(&r), Rc::clone(&conn));
     let start = Instant::now();
-    let res = r.block_on(async move { owned_send(&r2, &c2, payload).await });
+    let res = r.block_on(async move { r2.send_owned(&c2, SendBody::Pooled(PooledBuf(payload))).await });
     let elapsed = start.elapsed();
 
-    assert!(res.is_err(), "a client that never drains must be evicted");
+    assert_eq!(res, Err(PeerGone), "a client that never drains must be evicted");
     assert!(conn.is_gone(), "eviction finishes the connection");
     assert!(
         elapsed >= TIMEOUT,
         "eviction must wait out the full deadline ({TIMEOUT:?}), took {elapsed:?}"
     );
-    // The eviction path shuts the socket down, so nothing more can be
-    // written to it — that is what releases the send's held resources.
-    let probe = unsafe {
-        libc::send(
-            conn.fd(),
-            [0u8; 1].as_ptr() as *const libc::c_void,
-            1,
-            libc::MSG_NOSIGNAL,
-        )
-    };
-    assert_eq!(probe, -1, "evicted fd must be shut down for send");
-}
-
-/// W frames as W sends versus one send of their concatenation, the trade
-/// `COALESCE_MAX_BYTES` is set from. Only the ratio is meaningful.
-///
-/// `cd crates && cargo test -p gnitz-server --release fanout_coalesced_egress_bench -- --ignored --nocapture --test-threads=1`
-#[test]
-#[ignore]
-fn fanout_coalesced_egress_bench() {
-    use std::hint::black_box;
-
-    const ITERS: usize = 3000;
-
-    for w in [2usize, 4, 8] {
-        for total in [4 * 1024usize, 32 * 1024, 64 * 1024, 128 * 1024] {
-            let per_frame = total / w;
-            let (r, sender, receiver) = egress_pair(Limits::TEST, None);
-            let conn = r.client_conn(sender).expect("under the cap");
-            // Both arms push `total` bytes per sample; the reader keeps
-            // the socket buffers from ever stalling a send, so the timed
-            // region is kernel-op cost, not backpressure.
-            let expect = 2 * ITERS * total;
-            let drain_t = spawn_drain(receiver, expect);
-
-            let frame = vec![0xA5u8; per_frame];
-            let r2 = Rc::clone(&r);
-            let (per_frame_dur, coalesced_dur) = r.block_on(async move {
-                let (mut a, mut b) = (Duration::ZERO, Duration::ZERO);
-                for i in 0..ITERS {
-                    // Source buffers are filled outside the timed region
-                    // on both arms except the concatenation itself,
-                    // which is the copy under test.
-                    let bufs: Vec<PooledBuf> = (0..w).map(|_| pooled(&frame)).collect();
-                    let run_per_frame = async |bufs: Vec<PooledBuf>| {
-                        let t = Instant::now();
-                        for buf in bufs {
-                            let _ = black_box(r2.send_owned(&conn, SendBody::Pooled(buf)).await);
-                        }
-                        t.elapsed()
-                    };
-                    let run_coalesced = async || {
-                        let t = Instant::now();
-                        let mut buf = PooledBuf::with_capacity(total);
-                        for _ in 0..w {
-                            buf.0.extend_from_slice(&frame);
-                        }
-                        let _ = black_box(r2.send_owned(&conn, SendBody::Pooled(buf)).await);
-                        t.elapsed()
-                    };
-                    if i % 2 == 0 {
-                        a += run_per_frame(bufs).await;
-                        b += run_coalesced().await;
-                    } else {
-                        b += run_coalesced().await;
-                        a += run_per_frame(bufs).await;
-                    }
-                }
-                (a, b)
-            });
-
-            let seen = drain_t.join().expect("drain thread");
-            assert_eq!(seen, expect, "reader must observe every byte both arms sent");
-
-            let delta = coalesced_dur.as_secs_f64() / per_frame_dur.as_secs_f64() - 1.0;
-            println!(
-                "coalesced egress W={w} total={total}B: coalesced vs per-frame {:+.1}% \
-                 (per-frame {:?}/batch, coalesced {:?}/batch)",
-                delta * 100.0,
-                per_frame_dur / ITERS as u32,
-                coalesced_dur / ITERS as u32,
-            );
-        }
-    }
-}
-
-/// The accept dispatch arm: a failed accept queues nothing on its listener's
-/// channel and wakes nobody; a successful one hands the accepted fd to the
-/// parked awaiter.
-#[test]
-fn dispatch_accept_queues_successes_and_wakes_the_awaiter() {
-    let r = make_reactor();
-    let listener = fake_listener();
-    let mut rx = r.attach_listener(listener);
-    let waker = make_waker(42);
-    let mut fut = std::pin::pin!(rx.recv());
-    assert!(fut.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
-
-    cqe(&r, KIND_ACCEPT, 0, -libc::ECONNABORTED);
-    assert!(!is_queued(42), "res<0 must wake nobody");
+    // The eviction shuts the socket down, so the abandoned send completes and
+    // releases the connection it held.
     assert!(
-        fut.as_mut().poll(&mut Context::from_waker(&waker)).is_pending(),
-        "nor queue anything for the awaiter"
+        poll_until(&r, || Rc::strong_count(&conn) == 1),
+        "the abandoned send must complete and let go of the connection"
     );
-
-    let accepted = fake_listener().into_raw_fd();
-    cqe(&r, KIND_ACCEPT, 0, accepted);
-    assert!(is_queued(42), "res>=0 must wake the parked accept future");
-    match fut.as_mut().poll(&mut Context::from_waker(&waker)) {
-        Poll::Ready(fd) => assert_eq!(fd.as_raw_fd(), accepted, "carrying the accepted fd"),
-        Poll::Pending => panic!("a queued fd must resolve"),
-    }
 }
 
-/// fd exhaustion cancels a listener's multishot accept, and the re-arm is
+/// An attached listener hands each connection it accepts to its channel.
+#[test]
+fn an_attached_listener_delivers_accepted_connections() {
+    within(Duration::from_secs(30), || {
+        let r = make_reactor();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let mut rx = r.attach_listener(OwnedFd::from(listener));
+        let client = std::net::TcpStream::connect(addr).expect("connect");
+        let accepted = std::net::TcpStream::from(r.block_on(async move { rx.recv().await }));
+        assert_eq!(accepted.peer_addr().ok(), client.local_addr().ok());
+    });
+}
+
+/// A failed accept ends a listener's multishot accept, and the re-arm is
 /// deferred behind a backoff so closing connections get a window. Both
-/// listeners can cancel in the same window — exhaustion is global — and each
+/// listeners can fail in the same window — fd exhaustion is global — and each
 /// must come back.
 #[test]
 fn both_listeners_rearm_after_an_fd_exhaustion_backoff() {
@@ -400,34 +250,4 @@ fn both_listeners_rearm_after_an_fd_exhaustion_backoff() {
         r.inner.tasks.borrow().is_empty(),
         "both backoff tasks must fire and re-arm their listener"
     );
-}
-
-/// N frames written in one `write` are all queued off a single recv completion:
-/// a pipelined run costs one read, not one per frame.
-#[test]
-fn one_recv_completion_queues_a_whole_pipelined_run() {
-    let (local, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-    let r = make_reactor();
-    let conn = r.client_conn(OwnedFd::from(local)).expect("under the cap");
-    r.register_conn(&conn, Box::new(Plain::new()));
-
-    const N: usize = 12;
-    let wire: Vec<u8> = (0..N).flat_map(|i| framed(&vec![i as u8; 600])).collect();
-    (&partner).write_all(&wire).expect("write");
-
-    let mut got = Vec::new();
-    assert!(
-        poll_until(&r, 10_000, || {
-            got.extend(std::iter::from_fn(|| conn.try_recv()));
-            !got.is_empty()
-        }),
-        "the run must be deframed"
-    );
-    assert_eq!(
-        got.len(),
-        N,
-        "the first completion must queue every frame the read carried, not one",
-    );
-    assert_eq!(got[0].as_slice()[0], 0, "in order");
-    drop(partner);
 }

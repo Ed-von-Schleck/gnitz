@@ -57,7 +57,7 @@ fn inert_dispatcher(worker_pids: Vec<i32>, catalog: *mut CatalogEngine) -> (Mast
         .collect();
     let writers = rings.iter().map(|&p| W2mWriter::new(p)).collect();
     let sal = test_writer(1 << 20, &rings);
-    let reactor = crate::runtime::test_support::make_reactor_over(W2mReceiver::new(rings));
+    let reactor = crate::runtime::reactor::make_reactor_over(W2mReceiver::new(rings));
     let disp = MasterDispatcher::new(worker_pids, catalog, 0, sal, Rc::new(reactor));
     (disp, writers)
 }

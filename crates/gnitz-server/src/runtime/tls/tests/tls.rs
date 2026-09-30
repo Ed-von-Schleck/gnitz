@@ -9,7 +9,8 @@
 //! are fed into the server session and drained through `ingest_cipher`. The
 //! teardown tests run a `TlsShared` over a socketpair.
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::io::Write as _;
+use std::os::unix::net::UnixStream;
 
 use super::*;
 use crate::runtime::reactor::{egress_pair, poll_until, read_nonblocking, Budget, Limits};
@@ -66,7 +67,10 @@ fn test_queue() -> RecvQueue {
 fn encrypt_frames(client: &mut rustls::ClientConnection, frames: &[&[u8]]) -> Vec<u8> {
     client.set_buffer_limit(None);
     for f in frames {
-        client.writer().write_all(&(f.len() as u32).to_le_bytes()).unwrap();
+        client
+            .writer()
+            .write_all(&gnitz_wire::frame_len_prefix(f.len()))
+            .unwrap();
         client.writer().write_all(f).unwrap();
     }
     let mut out = Vec::new();
@@ -113,9 +117,8 @@ fn split_ciphertext_delivery_reassembles() {
 }
 
 /// A `TlsShared` over one end of a socketpair; the other end is the client.
-fn tls_over_socketpair() -> (Rc<Reactor>, Rc<ClientConn>, OwnedFd) {
-    let (r, sender, receiver) = egress_pair(Limits::TEST, None);
-    let conn = r.client_conn(sender).expect("under the cap");
+fn tls_over_socketpair() -> (Rc<Reactor>, Rc<ClientConn>, UnixStream) {
+    let (r, conn, receiver) = egress_pair(Limits::TEST, None);
     let (cfg, _) = config::server_crypto(None, None).unwrap();
     TlsShared::start(Rc::clone(&r), Rc::clone(&conn), cfg);
     (r, conn, receiver)
@@ -123,9 +126,9 @@ fn tls_over_socketpair() -> (Rc<Reactor>, Rc<ClientConn>, OwnedFd) {
 
 /// Tick until the client end reads EOF, returning every byte before it; `None`
 /// if the EOF never comes.
-fn read_until_eof(r: &Reactor, fd: &OwnedFd) -> Option<Vec<u8>> {
+fn read_until_eof(r: &Reactor, fd: &UnixStream) -> Option<Vec<u8>> {
     let mut seen = Vec::new();
-    let eof = poll_until(r, 10_000, || {
+    let eof = poll_until(r, || {
         while let Some(bytes) = read_nonblocking(fd, 4096) {
             if bytes.is_empty() {
                 return true;
@@ -145,11 +148,7 @@ const ALERT: u8 = 0x15;
 #[test]
 fn a_protocol_error_reaches_the_client_as_an_alert() {
     let (r, _conn, client) = tls_over_socketpair();
-    let n = unsafe {
-        let req = b"GET / HTTP/1.1\r\n\r\n";
-        libc::write(client.as_raw_fd(), req.as_ptr() as *const libc::c_void, req.len())
-    };
-    assert!(n > 0, "write");
+    (&client).write_all(b"GET / HTTP/1.1\r\n\r\n").expect("write");
 
     let seen = read_until_eof(&r, &client).expect("the session ends");
     assert_eq!(seen.first(), Some(&ALERT), "an alert precedes the EOF, got {seen:?}");

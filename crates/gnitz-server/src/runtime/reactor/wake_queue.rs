@@ -71,9 +71,4 @@ impl<T> WakeQueue<T> {
     pub(super) fn clear(&mut self) {
         self.queue = VecDeque::new();
     }
-
-    #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
-        self.queue.len()
-    }
 }

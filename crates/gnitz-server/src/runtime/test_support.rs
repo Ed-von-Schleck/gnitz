@@ -42,28 +42,6 @@ pub(crate) unsafe fn assert_child_exited_ok(pid: libc::pid_t) {
     );
 }
 
-/// A reactor with no W2M rings, for the tests that route no worker traffic.
-pub(crate) fn make_reactor() -> crate::runtime::reactor::Reactor {
-    make_reactor_with(crate::runtime::reactor::Limits::TEST)
-}
-
-/// [`make_reactor`] built with `limits`.
-pub(crate) fn make_reactor_with(limits: crate::runtime::reactor::Limits) -> crate::runtime::reactor::Reactor {
-    build_reactor(limits, crate::runtime::w2m::W2mReceiver::new(vec![]))
-}
-
-/// A test reactor reading the rings `w2m` covers.
-pub(crate) fn make_reactor_over(w2m: crate::runtime::w2m::W2mReceiver) -> crate::runtime::reactor::Reactor {
-    build_reactor(crate::runtime::reactor::Limits::TEST, w2m)
-}
-
-fn build_reactor(
-    limits: crate::runtime::reactor::Limits,
-    w2m: crate::runtime::w2m::W2mReceiver,
-) -> crate::runtime::reactor::Reactor {
-    crate::runtime::reactor::Reactor::new(16, limits, w2m).expect("reactor")
-}
-
 /// Run `f` on its own thread and fail if it has not returned within `limit`, so
 /// a tick that sleeps when it must not fails the test instead of wedging the
 /// run. A timed-out thread is left blocked; the harness exits past it.

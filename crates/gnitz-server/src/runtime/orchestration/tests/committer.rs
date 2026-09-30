@@ -5,8 +5,9 @@
 //! dispatcher and worker ACKs, so they stay covered end to end.
 
 use super::*;
+use crate::runtime::reactor::make_reactor;
 use crate::runtime::reactor::Reactor;
-use crate::runtime::test_support::{make_reactor, try_poll_once};
+use crate::runtime::test_support::try_poll_once;
 use crate::test_support::make_schema_u64_i64;
 use gnitz_wire::{WireConflictMode, WireStatus};
 
