@@ -179,12 +179,25 @@ pub(crate) fn in_list_expr(col: &str, items: Vec<Expr>) -> Expr {
     }
 }
 
-/// Parse + bind a WHERE predicate against `schema` into its bound conjuncts —
-/// the production shape, and the input of the `access` recognizers. The relation
-/// is `t`, which is what every qualified reference in these tests writes.
+/// Parse + bind an expression against `schema` as relation `t`, which is what
+/// every qualified reference in these tests writes.
+pub(crate) fn bind_sql(sql: &str, schema: &Schema) -> Result<BoundExpr, GnitzSqlError> {
+    crate::bind::bind_single_table(&parse_expr_sql(sql), schema, "t")
+}
+
+/// The message of the `Rejected` error `r` must be.
+pub(crate) fn rejected<T>(r: Result<T, GnitzSqlError>) -> String {
+    match r {
+        Err(GnitzSqlError::Rejected(m)) => m,
+        Err(e) => panic!("expected Rejected, got {e:?}"),
+        Ok(_) => panic!("expected Rejected, got Ok"),
+    }
+}
+
+/// [`bind_sql`] of a WHERE predicate, as its bound conjuncts — the production
+/// shape, and the input of the `access` recognizers.
 pub(crate) fn bind_where(sql: &str, schema: &Schema) -> Vec<BoundExpr> {
-    crate::bind::bind_conjuncts(&parse_expr_sql(sql), &crate::bind::SingleTable { schema, alias: "t" })
-        .expect("bind WHERE")
+    bind_sql(sql, schema).expect("bind WHERE").conjuncts()
 }
 
 /// [`bind_where`] for a predicate that is one conjunct — the input of the

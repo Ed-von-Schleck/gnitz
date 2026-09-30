@@ -1,6 +1,6 @@
 use super::*;
 use crate::codec::project_schema::reply_program;
-use crate::test_support::{col, ncol, parse_expr_sql};
+use crate::test_support::{col, ncol};
 use gnitz_core::BatchAppender;
 use gnitz_expr::{payload_is_null, payload_string, payload_u64};
 use gnitz_wire::{ColumnDef, TypeCode};
@@ -27,7 +27,7 @@ fn map_of(src: &Schema, sql: &[&str]) -> ClientMap {
         .iter()
         .enumerate()
         .map(|(i, e)| {
-            let bound = crate::bind::bind_single_table(&parse_expr_sql(e), src, "t").unwrap();
+            let bound = crate::test_support::bind_sql(e, src).unwrap();
             let def = ColumnDef::new(format!("c{i}"), bound.infer_ty(&src.columns).tc, true);
             (bound, def)
         })

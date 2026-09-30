@@ -48,15 +48,16 @@ pub(crate) fn require_column<'a>(
         .ok_or_else(|| GnitzSqlError::Rejected(format!("column '{col_name}' not found")))
 }
 
-/// The output column `e` names, if it names one. Matched by name alone: an
-/// output column carries no qualifier to check against.
+/// The output column `e` names, if it names one. Only an unqualified name can:
+/// an output column belongs to no relation, so a qualified reference is left to
+/// the caller's scope, which checks the qualifier.
 pub(crate) fn output_column<'a>(
     e: &Expr,
     cols: impl IntoIterator<Item = &'a ColumnDef>,
 ) -> Result<Option<usize>, GnitzSqlError> {
     match col_ref_parts(e) {
-        Some((_, name)) => find_unique_column(cols, name),
-        None => Ok(None),
+        Some((None, name)) => find_unique_column(cols, name),
+        _ => Ok(None),
     }
 }
 

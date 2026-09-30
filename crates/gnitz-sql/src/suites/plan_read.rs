@@ -792,6 +792,14 @@ fn a_cte_expands_to_the_flat_query() {
             "Rejected",
             "column 'g' not found",
         ),
+        // A qualified ORDER BY key names a relation's column, never an output
+        // column, so its qualifier is checked.
+        (
+            "SELECT v FROM t ORDER BY zzz.v",
+            "Rejected",
+            "table alias 'zzz' not found",
+        ),
+        ("SELECT v AS w FROM t ORDER BY t.w", "Rejected", "'w' not found"),
         (
             "WITH x(i) AS (SELECT id, v FROM t) SELECT i FROM x",
             "Rejected",

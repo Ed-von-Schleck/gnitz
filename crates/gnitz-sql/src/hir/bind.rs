@@ -658,12 +658,9 @@ impl LeafBinder<ColId> for ScopeLeaf<'_> {
     }
 
     fn bind_function(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
-        // Classify first, so an unknown or malformed call is named as such —
-        // reaching past it means the name really is an aggregate.
-        classify_agg_call(f)?;
         Err(clause_error(
             self.clause,
-            GnitzSqlError::Rejected("aggregate functions are not allowed here".to_string()),
+            crate::bind::structural::aggregate_not_allowed(f),
         ))
     }
 

@@ -1,695 +1,266 @@
 use super::*;
 use crate::ir::NumLit;
-use crate::test_support::parse_expr_sql;
-use gnitz_core::Schema;
-use gnitz_wire::{ColumnDef, TypeCode};
+use crate::test_support::{bind_sql, col, in_list_expr, ncol, parse_expr_sql, rejected};
+use gnitz_wire::TypeCode;
 
-/// Bind against `schema` as relation `t` — the alias every qualified reference
-/// in this file writes.
-fn bind1(e: &Expr, schema: &Schema) -> Result<BoundExpr, GnitzSqlError> {
-    bind_single_table(e, schema, "t")
-}
-
-fn col(name: &str, tc: TypeCode) -> ColumnDef {
-    ColumnDef::new(name, tc, false)
-}
-
-fn schema_with_val(val_tc: TypeCode) -> Schema {
+/// `(pk U64, c I64 nullable, n I64 NOT NULL)`. The binder reads a column's
+/// position and nullability only, so one schema serves the numeric and the
+/// string surface alike.
+fn schema() -> Schema {
     Schema {
-        columns: vec![col("pk", TypeCode::U64), col("c", val_tc)],
-        pk_cols: vec![0],
-    }
-}
-
-fn assert_unsupported(r: Result<BoundExpr, GnitzSqlError>, want_substr: &str) {
-    match r.unwrap_err() {
-        GnitzSqlError::Rejected(msg) => {
-            assert!(
-                msg.contains(want_substr),
-                "got Unsupported({msg:?}), expected to contain {want_substr:?}"
-            );
-        }
-        e => panic!("expected Unsupported, got {e:?}"),
-    }
-}
-
-/// A null test on a PK column never survives binding: a PK column is always
-/// non-nullable, so `null_test` settles it as a literal.
-#[test]
-fn null_test_on_pk_column_folds_to_a_literal() {
-    let schema = schema_with_val(TypeCode::I64); // pk is NOT NULL
-    assert!(matches!(
-        bind1(&parse_expr_sql("pk IS NULL"), &schema).unwrap(),
-        BoundExpr::LitInt(0)
-    ));
-    assert!(matches!(
-        bind1(&parse_expr_sql("pk IS NOT NULL"), &schema).unwrap(),
-        BoundExpr::LitInt(1)
-    ));
-}
-
-#[test]
-fn test_bind_between_desugars_to_comparison_tree() {
-    let schema = schema_with_val(TypeCode::I64); // (pk U64, c I64)
-                                                 // `c BETWEEN 1 AND 9` ≡ `c >= 1 AND c <= 9` — a residual BETWEEN now binds
-                                                 // (regression guard for the new Expr::Between arm) instead of Unsupported.
-    match bind1(&parse_expr_sql("c BETWEEN 1 AND 9"), &schema).unwrap() {
-        BoundExpr::BinOp(l, BinOp::And, r) => {
-            assert!(matches!(*l, BoundExpr::BinOp(_, BinOp::Ge, _)));
-            assert!(matches!(*r, BoundExpr::BinOp(_, BinOp::Le, _)));
-        }
-        other => panic!("expected And(Ge, Le), got {other:?}"),
-    }
-    // `c NOT BETWEEN 1 AND 9` ≡ NOT(c >= 1 AND c <= 9).
-    match bind1(&parse_expr_sql("c NOT BETWEEN 1 AND 9"), &schema).unwrap() {
-        BoundExpr::Not(inner) => {
-            assert!(matches!(*inner, BoundExpr::BinOp(_, BinOp::And, _)))
-        }
-        other => panic!("expected Not(And(..)), got {other:?}"),
-    }
-}
-
-/// `t.x IS [NOT] NULL` on a *qualified* (CompoundIdentifier) column binds
-/// like the unqualified form on every `bind_structural` surface — the unified
-/// core reaches the shared null-test leaf, which a bare-`Identifier`-only arm
-/// would reject with "IS NULL on non-column expression".
-#[test]
-fn test_compound_identifier_null_test_binds() {
-    // Non-nullable column: folds to the constant (0 for IS NULL, 1 for IS NOT NULL).
-    let nn = schema_with_val(TypeCode::I64); // (pk U64 NOT NULL, c I64 NOT NULL)
-    assert!(matches!(
-        bind1(&parse_expr_sql("t.c IS NULL"), &nn).unwrap(),
-        BoundExpr::LitInt(0)
-    ));
-    assert!(matches!(
-        bind1(&parse_expr_sql("t.c IS NOT NULL"), &nn).unwrap(),
-        BoundExpr::LitInt(1)
-    ));
-    // Nullable column: a null test over the column reference.
-    let nullable = Schema {
-        columns: vec![col("pk", TypeCode::U64), ColumnDef::new("c", TypeCode::I64, true)],
-        pk_cols: vec![0],
-    };
-    assert!(matches!(
-        bind1(&parse_expr_sql("t.c IS NULL"), &nullable).unwrap(),
-        BoundExpr::NullTest { inner: _, want_null: true }
-    ));
-    assert!(matches!(
-        bind1(&parse_expr_sql("t.c IS NOT NULL"), &nullable).unwrap(),
-        BoundExpr::NullTest { inner: _, want_null: false }
-    ));
-}
-
-/// Every aggregate qualifier the binder does not implement must be rejected,
-/// not silently dropped to the plain aggregate. Exercised through
-/// `bind_single_table` so the guard's wiring into `bind_function` is covered,
-/// not just the helper in isolation. DISTINCT is a qualifier the grouped binder
-/// honours, so here it is the aggregate itself that is out of place.
-#[test]
-fn test_binder_rejects_aggregate_qualifiers() {
-    let schema = schema_with_val(TypeCode::I64); // (pk U64, c I64)
-    for (src, want) in [
-        ("COUNT(DISTINCT c)", "aggregate function not allowed"),
-        ("SUM(c) FILTER (WHERE c > 0)", "FILTER"),
-        ("SUM(c) OVER (PARTITION BY pk)", "OVER"),
-    ] {
-        assert_unsupported(bind1(&parse_expr_sql(src), &schema), want);
-    }
-}
-
-/// `c IN (…)` with two or more items binds faithfully to an `InList` node
-/// (un-desugared); a one-item list folds to the `Eq` it is; `NOT IN` wraps the
-/// result in `Not`. The tested operand is bound once as `inner`; every list
-/// item is bound in order into `items`. Lowering — not binding — chooses the
-/// `IntInSet` fast path vs the OR-chain fallback.
-#[test]
-fn test_bind_in_list_folds_one_item_else_binds_faithful() {
-    let schema = schema_with_val(TypeCode::I64); // (pk U64, c I64)
-    match bind1(&parse_expr_sql("c IN (1, 2)"), &schema).unwrap() {
-        BoundExpr::InList { inner, items } => {
-            assert!(matches!(*inner, BoundExpr::ColRef(1)));
-            assert_eq!(items.len(), 2);
-            assert!(matches!(items[0], BoundExpr::LitInt(1)));
-            assert!(matches!(items[1], BoundExpr::LitInt(2)));
-        }
-        other => panic!("expected InList, got {other:?}"),
-    }
-    // A single element folds to the equality it spells — the shape the `access`
-    // recognizers match on, identical to what `c = 7` binds to.
-    match bind1(&parse_expr_sql("c IN (7)"), &schema).unwrap() {
-        BoundExpr::BinOp(inner, BinOp::Eq, item) => {
-            assert!(matches!(*inner, BoundExpr::ColRef(1)));
-            assert!(matches!(*item, BoundExpr::LitInt(7)));
-        }
-        other => panic!("expected Eq, got {other:?}"),
-    }
-    // NOT IN wraps whichever node the arity picked.
-    for (src, folded) in [("c NOT IN (7)", true), ("c NOT IN (1, 2)", false)] {
-        match bind1(&parse_expr_sql(src), &schema).unwrap() {
-            BoundExpr::Not(inner) => {
-                assert_eq!(matches!(*inner, BoundExpr::BinOp(_, BinOp::Eq, _)), folded, "{src}")
-            }
-            other => panic!("{src}: expected Not(_), got {other:?}"),
-        }
-    }
-    // sqlparser lexes the minus separately; the binder folds it into the
-    // literal, so every consumer reads one constant shape.
-    match bind1(&parse_expr_sql("c IN (-1, -2)"), &schema).unwrap() {
-        BoundExpr::InList { items, .. } => {
-            assert_eq!(items, vec![BoundExpr::LitInt(-1), BoundExpr::LitInt(-2)]);
-        }
-        other => panic!("expected InList, got {other:?}"),
-    }
-}
-
-/// String and float list elements bind through the same literal leaves plain
-/// `=` uses; an empty list is rejected (constructed directly — the parser
-/// won't produce one).
-#[test]
-fn test_bind_in_list_string_float_and_empty() {
-    let s = schema_with_val(TypeCode::String);
-    assert!(bind1(&parse_expr_sql("c IN ('a', 'b')"), &s).is_ok());
-    let f = schema_with_val(TypeCode::F64);
-    assert!(bind1(&parse_expr_sql("c IN (1.5, 2.5)"), &f).is_ok());
-    let empty = Expr::InList {
-        expr: Box::new(parse_expr_sql("c")),
-        list: vec![],
-        negated: false,
-    };
-    assert_unsupported(bind1(&empty, &f), "empty list");
-}
-
-/// Subquery expressions get the targeted per-kind message from the default
-/// `bind_subquery` leaf, not the generic catch-all. (The HIR view leaf
-/// overrides `bind_subquery` to record the node for decorrelation instead.)
-#[test]
-fn test_bind_rejects_subquery_expressions_with_targeted_messages() {
-    let schema = schema_with_val(TypeCode::I64);
-    for src in [
-        "EXISTS (SELECT c FROM t)",
-        "NOT EXISTS (SELECT c FROM t)",
-        "c IN (SELECT c FROM t)",
-        "c NOT IN (SELECT c FROM t)",
-        "c = 1 OR EXISTS (SELECT c FROM t)",
-    ] {
-        assert_unsupported(
-            bind1(&parse_expr_sql(src), &schema),
-            "only supported in a single-table CREATE VIEW",
-        );
-    }
-    assert_unsupported(
-        bind1(&parse_expr_sql("c = ANY (SELECT c FROM t)"), &schema),
-        "ANY/SOME/ALL",
-    );
-    assert_unsupported(
-        bind1(&parse_expr_sql("c > ALL (SELECT c FROM t)"), &schema),
-        "ANY/SOME/ALL",
-    );
-    assert_unsupported(
-        bind1(&parse_expr_sql("(SELECT c FROM t) = 1"), &schema),
-        "scalar subqueries",
-    );
-}
-
-fn nullable_schema(val_tc: TypeCode) -> Schema {
-    Schema {
-        columns: vec![col("pk", TypeCode::U64), ColumnDef::new("c", val_tc, true)],
-        pk_cols: vec![0],
-    }
-}
-
-/// Searched `CASE WHEN … THEN … [ELSE …] END` binds each branch; a missing
-/// ELSE is `else_ = None` (implicit NULL).
-#[test]
-fn test_bind_searched_case() {
-    let s = nullable_schema(TypeCode::I64);
-    match bind1(
-        &parse_expr_sql("CASE WHEN c > 0 THEN 1 WHEN c < 0 THEN 2 ELSE 3 END"),
-        &s,
-    )
-    .unwrap()
-    {
-        BoundExpr::Case { branches, else_ } => {
-            assert_eq!(branches.len(), 2);
-            assert!(matches!(branches[0].0, BoundExpr::BinOp(_, BinOp::Gt, _)));
-            assert!(matches!(branches[0].1, BoundExpr::LitInt(1)));
-            assert!(matches!(branches[1].0, BoundExpr::BinOp(_, BinOp::Lt, _)));
-            assert!(matches!(else_.as_deref(), Some(BoundExpr::LitInt(3))));
-        }
-        other => panic!("expected Case, got {other:?}"),
-    }
-    // Missing ELSE → else_ = None.
-    match bind1(&parse_expr_sql("CASE WHEN c > 0 THEN 1 END"), &s).unwrap() {
-        BoundExpr::Case { else_, .. } => assert!(else_.is_none(), "missing ELSE → None"),
-        other => panic!("expected Case, got {other:?}"),
-    }
-}
-
-/// Simple-operand `CASE c WHEN v THEN … END` desugars each WHEN to `c = v`.
-#[test]
-fn test_bind_simple_case_desugars_to_operand_eq() {
-    let s = nullable_schema(TypeCode::I64);
-    match bind1(&parse_expr_sql("CASE c WHEN 1 THEN 10 WHEN 2 THEN 20 END"), &s).unwrap() {
-        BoundExpr::Case { branches, else_ } => {
-            assert_eq!(branches.len(), 2);
-            assert!(matches!(branches[0].0, BoundExpr::BinOp(_, BinOp::Eq, _)));
-            assert!(matches!(branches[1].0, BoundExpr::BinOp(_, BinOp::Eq, _)));
-            assert!(else_.is_none());
-        }
-        other => panic!("expected Case, got {other:?}"),
-    }
-}
-
-/// COALESCE base cases and shape.
-#[test]
-fn test_bind_coalesce_base_cases() {
-    let s = nullable_schema(TypeCode::I64);
-    // COALESCE(c) → c.
-    assert!(matches!(
-        bind1(&parse_expr_sql("COALESCE(c)"), &s).unwrap(),
-        BoundExpr::ColRef(1)
-    ));
-    // COALESCE(NULL, c) → c (a NULL literal contributes nothing).
-    assert!(matches!(
-        bind1(&parse_expr_sql("COALESCE(NULL, c)"), &s).unwrap(),
-        BoundExpr::ColRef(1)
-    ));
-    // COALESCE(c, 0) → Case{[(c IS NOT NULL, c)], else: 0}.
-    match bind1(&parse_expr_sql("COALESCE(c, 0)"), &s).unwrap() {
-        BoundExpr::Case { branches, else_ } => {
-            assert_eq!(branches.len(), 1);
-            assert!(matches!(
-                branches[0].0,
-                BoundExpr::NullTest { inner: _, want_null: false }
-            ));
-            assert!(matches!(branches[0].1, BoundExpr::ColRef(1)));
-            assert!(matches!(else_.as_deref(), Some(BoundExpr::LitInt(0))));
-        }
-        other => panic!("expected Case, got {other:?}"),
-    }
-    // A NOT NULL column folds COALESCE(c, 0) to c directly (provably non-null).
-    let nn = schema_with_val(TypeCode::I64);
-    assert!(matches!(
-        bind1(&parse_expr_sql("COALESCE(c, 0)"), &nn).unwrap(),
-        BoundExpr::ColRef(1)
-    ));
-    // sqlparser accepts the empty argument list, so the arity check is what
-    // rejects it — a bare NULL would silently type the whole expression.
-    assert_unsupported(bind1(&parse_expr_sql("COALESCE()"), &s), "at least one argument");
-}
-
-/// `scalar_call` matches before the leaf ever sees a call, so a name in both
-/// tables would shadow the aggregate in every binding context at once.
-#[test]
-fn no_scalar_call_name_is_also_an_aggregate_name() {
-    for (name, _) in SCALAR_CALLS {
-        assert!(
-            crate::ast_util::agg_func_from_name(name).is_none(),
-            "'{name}' is both a scalar call and an aggregate"
-        );
-    }
-}
-
-/// A 3-arg COALESCE nests right-to-left.
-#[test]
-fn test_bind_coalesce_nested_three_arg() {
-    let s = Schema {
         columns: vec![
             col("pk", TypeCode::U64),
-            ColumnDef::new("a", TypeCode::I64, true),
-            ColumnDef::new("b", TypeCode::I64, true),
+            ncol("c", TypeCode::I64),
+            col("n", TypeCode::I64),
         ],
         pk_cols: vec![0],
-    };
-    match bind1(&parse_expr_sql("COALESCE(a, b, 0)"), &s).unwrap() {
-        BoundExpr::Case { branches, else_ } => {
-            assert!(matches!(
-                branches[0].0,
-                BoundExpr::NullTest { inner: _, want_null: false }
-            ));
-            match else_.as_deref() {
-                Some(BoundExpr::Case { branches: inner, else_: inner_else }) => {
-                    assert!(matches!(inner[0].0, BoundExpr::NullTest { inner: _, want_null: false }));
-                    assert!(matches!(inner_else.as_deref(), Some(BoundExpr::LitInt(0))));
-                }
-                other => panic!("expected nested Case, got {other:?}"),
-            }
-        }
-        other => panic!("expected Case, got {other:?}"),
     }
 }
 
-/// A computed COALESCE operand (`c + 1`) is null-tested over its own value: the
-/// leaf declines it and the condition is a `NullTest` over the `BinOp`.
-#[test]
-fn test_bind_coalesce_computed_operand_tests_its_value() {
-    let s = nullable_schema(TypeCode::I64);
-    match bind1(&parse_expr_sql("COALESCE(c + 1, 0)"), &s).unwrap() {
-        BoundExpr::Case { branches, else_ } => {
-            assert_eq!(branches.len(), 1);
-            match &branches[0].0 {
-                BoundExpr::NullTest { inner, want_null: false } => {
-                    assert!(matches!(**inner, BoundExpr::BinOp(_, BinOp::Add, _)));
-                }
-                other => panic!("expected NullTest over the sum, got {other:?}"),
-            }
-            assert!(matches!(branches[0].1, BoundExpr::BinOp(_, BinOp::Add, _)));
-            assert!(matches!(else_.as_deref(), Some(BoundExpr::LitInt(0))));
-        }
-        other => panic!("expected Case, got {other:?}"),
-    }
+fn b(src: &str) -> BoundExpr {
+    bind_sql(src, &schema()).unwrap_or_else(|e| panic!("{src}: {e}"))
 }
 
-/// `NULLIF(a, b)` → `CASE WHEN a = b THEN NULL ELSE a END`; wrong arity errors.
-#[test]
-fn test_bind_nullif() {
-    let s = nullable_schema(TypeCode::I64);
-    match bind1(&parse_expr_sql("NULLIF(c, 0)"), &s).unwrap() {
-        BoundExpr::Case { branches, else_ } => {
-            assert_eq!(branches.len(), 1);
-            assert!(matches!(branches[0].0, BoundExpr::BinOp(_, BinOp::Eq, _)));
-            assert!(matches!(branches[0].1, BoundExpr::LitNull));
-            assert!(matches!(else_.as_deref(), Some(BoundExpr::ColRef(1))));
-        }
-        other => panic!("expected Case, got {other:?}"),
-    }
-    // Both operands bind through bind_structural, so a computed operand is fine.
-    assert!(bind1(&parse_expr_sql("NULLIF(c + 1, 0)"), &s).is_ok());
-    // Wrong arity rejected.
-    assert_unsupported(bind1(&parse_expr_sql("NULLIF(c)"), &s), "exactly two");
+fn b_err(src: &str) -> String {
+    rejected(bind_sql(src, &schema()))
 }
 
-/// Only a grouped context admits an aggregate; the single-table leaf rejects
-/// every well-formed one — including the accepted `ALL` qualifier — by name,
-/// after the qualifier check has had its say.
+const C: BoundExpr = BoundExpr::ColRef(1);
+
+fn bx(e: BoundExpr) -> Box<BoundExpr> {
+    Box::new(e)
+}
+
+/// Every desugar and alias binds to exactly the tree its written-out form
+/// binds to, so a desugar that swaps or drops an operand shows up here.
 #[test]
-fn aggregates_are_rejected_outside_a_grouped_context() {
-    let schema = schema_with_val(TypeCode::I64);
-    for src in [
-        "COUNT(*)",
-        "COUNT(c)",
-        "COUNT(ALL c)",
-        "SUM(c)",
-        "MIN(c)",
-        "MAX(c)",
-        "AVG(c)",
-        "ABS(SUM(c))",
+fn each_sugar_binds_to_the_tree_its_plain_spelling_binds_to() {
+    for (sugar, plain) in [
+        ("c BETWEEN 1 AND 9", "c >= 1 AND c <= 9"),
+        ("c NOT BETWEEN 1 AND 9", "NOT (c >= 1 AND c <= 9)"),
+        // A one-item list is the equality the access recognizers match on.
+        ("c IN (7)", "c = 7"),
+        ("c NOT IN (7)", "NOT (c = 7)"),
+        ("c NOT IN (1, 2)", "NOT (c IN (1, 2))"),
+        (
+            "CASE c WHEN 1 THEN 10 WHEN 2 THEN 20 END",
+            "CASE WHEN c = 1 THEN 10 WHEN c = 2 THEN 20 END",
+        ),
+        ("NULLIF(c, 0)", "CASE WHEN c = 0 THEN NULL ELSE c END"),
+        ("IF(c > 1, 10, 20)", "CASE WHEN c > 1 THEN 10 ELSE 20 END"),
+        // COALESCE stops at the first operand provably never NULL and skips a NULL one.
+        ("COALESCE(c)", "c"),
+        ("COALESCE(NULL, c)", "c"),
+        ("COALESCE(n, c)", "n"),
+        ("COALESCE(c, 0)", "CASE WHEN c IS NOT NULL THEN c ELSE 0 END"),
+        (
+            "COALESCE(c + 1, 0)",
+            "CASE WHEN (c + 1) IS NOT NULL THEN c + 1 ELSE 0 END",
+        ),
+        ("COALESCE(c, c, 0)", "COALESCE(c, COALESCE(c, 0))"),
+        ("IFNULL(c, 0)", "COALESCE(c, 0)"),
+        ("NVL(c, 0)", "COALESCE(c, 0)"),
+        (
+            "c IS DISTINCT FROM pk",
+            "CASE WHEN c IS NULL OR pk IS NULL THEN (c IS NULL) <> (pk IS NULL) ELSE c <> pk END",
+        ),
+        (
+            "c IS NOT DISTINCT FROM pk",
+            "CASE WHEN c IS NULL OR pk IS NULL THEN (c IS NULL) = (pk IS NULL) ELSE c = pk END",
+        ),
+        ("pk IS DISTINCT FROM 1", "pk <> 1"),
+        // A null test whose answer is settled at bind time is that literal.
+        ("pk IS NULL", "0"),
+        ("t.n IS NOT NULL", "1"),
+        ("n + 1 IS NULL", "0"),
+        ("NULL IS NULL", "1"),
+        ("NULL IS NOT NULL", "0"),
+        ("1 IS NULL", "0"),
+        ("T.c IS NULL", "c IS NULL"),
+        ("MOD(c, 2)", "c % 2"),
+        ("pow(c, 2)", "POWER(c, 2)"),
+        ("CEILING(c)", "CEIL(c)"),
+        ("POSITION('x' IN c)", "STRPOS(c, 'x')"),
+        ("SUBSTRING(c FROM 2 FOR 3)", "SUBSTR(c, 2, 3)"),
+        ("SUBSTRING(c, 2, 3)", "SUBSTR(c, 2, 3)"),
+        ("SUBSTR(c FROM 2 FOR 3)", "SUBSTR(c, 2, 3)"),
+        ("SUBSTRING(c)", "SUBSTR(c, 1)"),
+        ("LPAD(c, 5)", "LPAD(c, 5, ' ')"),
+        ("RPAD(c, 5)", "RPAD(c, 5, ' ')"),
+        ("TRIM(c)", "TRIM(BOTH ' ' FROM c)"),
+        ("TRIM(BOTH c)", "TRIM(BOTH ' ' FROM c)"),
+        ("TRIM('xy' FROM c)", "TRIM(BOTH 'xy' FROM c)"),
+        ("TRIM(LEADING c)", "TRIM(LEADING ' ' FROM c)"),
+        ("TRIM(TRAILING c)", "TRIM(TRAILING ' ' FROM c)"),
+        ("LTRIM(c)", "TRIM(LEADING ' ' FROM c)"),
+        ("RTRIM(c)", "TRIM(TRAILING ' ' FROM c)"),
+        ("LTRIM(c, 'xy')", "TRIM(LEADING 'xy' FROM c)"),
+        ("RTRIM(c, ('xy'))", "TRIM(TRAILING 'xy' FROM c)"),
+        ("DATE '2020-01-01'", "CAST('2020-01-01' AS DATE)"),
+        ("c::BIGINT", "CAST(c AS BIGINT)"),
+        ("TRY_CAST(c AS BIGINT)", "CAST(c AS BIGINT)"),
+        ("SAFE_CAST(c AS BIGINT)", "CAST(c AS BIGINT)"),
+        ("c NOT ILIKE 'a%'", "NOT (c ILIKE 'a%')"),
+        ("c LIKE ('a%')", "c LIKE 'a%'"),
+        ("EXTRACT(years FROM c)", "EXTRACT(YEAR FROM c)"),
+        ("DATE_PART('Year', c)", "EXTRACT(YEAR FROM c)"),
     ] {
-        assert_unsupported(bind1(&parse_expr_sql(src), &schema), "aggregate function not allowed");
+        assert_eq!(b(sugar), b(plain), "{sugar} ≡ {plain}");
     }
 }
 
-// -----------------------------------------------------------------------
-// Numeric scalar functions and numeric CAST
-// -----------------------------------------------------------------------
-
-fn bind_num(src: &str) -> Result<BoundExpr, GnitzSqlError> {
-    bind1(&parse_expr_sql(src), &schema_with_val(TypeCode::I64))
-}
-
-/// The transcendental names and SIGN reach the unary node; POWER and POW are
-/// the `Pow` operator.
+/// The ground rows under the equivalences above, so both sides of one cannot
+/// be wrong together.
 #[test]
-fn transcendental_names_bind_to_their_function() {
+fn plain_forms_bind_to_their_node() {
+    use BoundExpr as E;
+    let lit_str = |s: &str| E::LitStr(s.into());
     for (src, want) in [
-        ("SQRT(c)", NumFunc::Unary(FloatUnaryOp::Sqrt)),
-        ("ln(c)", NumFunc::Unary(FloatUnaryOp::Ln)),
-        ("LOG(c)", NumFunc::Unary(FloatUnaryOp::Log10)),
-        ("EXP(c)", NumFunc::Unary(FloatUnaryOp::Exp)),
-        ("SIGN(c)", NumFunc::Unary(FloatUnaryOp::Sign)),
+        ("c IS NULL", E::NullTest { inner: bx(C), want_null: true }),
+        (
+            "c IN (-1, 2)",
+            E::InList {
+                inner: bx(C),
+                items: vec![E::LitInt(-1), E::LitInt(2)],
+            },
+        ),
+        (
+            "CASE WHEN c > 0 THEN 1 ELSE 3 END",
+            E::Case {
+                branches: vec![(E::bin(C, BinOp::Gt, E::LitInt(0)), E::LitInt(1))],
+                else_: Some(bx(E::LitInt(3))),
+            },
+        ),
+        (
+            "CASE WHEN c > 0 THEN 1 END",
+            E::Case {
+                branches: vec![(E::bin(C, BinOp::Gt, E::LitInt(0)), E::LitInt(1))],
+                else_: None,
+            },
+        ),
+        (
+            "GREATEST(c, c + 1, -1, NULL)",
+            E::MinMaxN {
+                is_max: true,
+                args: vec![C, E::bin(C, BinOp::Add, E::LitInt(1)), E::LitInt(-1), E::LitNull],
+            },
+        ),
+        ("LEAST(c)", E::MinMaxN { is_max: false, args: vec![C] }),
+        ("POWER(c, 2)", E::bin(C, BinOp::Pow, E::LitInt(2))),
+        (
+            "CONCAT(c, 'x', 42)",
+            E::ConcatN {
+                args: vec![C, lit_str("x"), E::LitInt(42)],
+            },
+        ),
+        ("c || 'x'", E::bin(C, BinOp::Concat, lit_str("x"))),
+        (
+            "STRPOS(c, 'x')",
+            E::StrCall {
+                f: StrFunc::Pos,
+                args: vec![C, lit_str("x")],
+            },
+        ),
+        (
+            "SUBSTR(c, 2, 3)",
+            E::StrCall {
+                f: StrFunc::Substr,
+                args: vec![C, E::LitInt(2), E::LitInt(3)],
+            },
+        ),
+        (
+            "LPAD(c, 5, ' ')",
+            E::StrCall {
+                f: StrFunc::Lpad,
+                args: vec![C, E::LitInt(5), lit_str(" ")],
+            },
+        ),
+        (
+            "TRIM(LEADING 'xy' FROM c)",
+            E::TrimCall {
+                s: bx(C),
+                mode: TrimMode::Leading,
+                set: "xy".into(),
+            },
+        ),
+        ("CAST(c AS BIGINT)", E::Cast { expr: bx(C), to: TypeCode::I64.into() }),
+        // A 16-byte target binds; it is the lowering that refuses it.
+        ("CAST(c AS UUID)", E::Cast { expr: bx(C), to: TypeCode::UUID.into() }),
+        ("EXTRACT(YEAR FROM c)", E::Calendar { op: CalendarOp::Year, arg: bx(C) }),
+        (
+            "DATE_TRUNC('month', c)",
+            E::Calendar {
+                op: CalendarOp::Month.trunc_of().unwrap(),
+                arg: bx(C),
+            },
+        ),
+        ("NULL", E::LitNull),
+        ("ROUND(c, 2)", E::Func { f: NumFunc::Round(2), arg: bx(C) }),
+        ("ROUND(c, -2)", E::Func { f: NumFunc::Round(-2), arg: bx(C) }),
+        ("ROUND(c, +15)", E::Func { f: NumFunc::Round(15), arg: bx(C) }),
     ] {
-        match bind_num(src).unwrap() {
-            BoundExpr::Func { f, .. } => assert_eq!(f, want, "{src}"),
-            other => panic!("{src}: expected Func, got {other:?}"),
-        }
+        assert_eq!(b(src), want, "{src}");
     }
-    for src in ["POWER(c, 2)", "pow(c, 2)"] {
-        assert!(
-            matches!(bind_num(src).unwrap(), BoundExpr::BinOp(_, BinOp::Pow, _)),
-            "{src}"
+}
+
+/// Every binary operator lands on its own `BinOp` with its operands in place.
+#[test]
+fn each_binary_operator_maps_to_its_binop() {
+    for (op, want) in [
+        ("+", BinOp::Add),
+        ("-", BinOp::Sub),
+        ("*", BinOp::Mul),
+        ("/", BinOp::Div),
+        ("%", BinOp::Mod),
+        ("=", BinOp::Eq),
+        ("<>", BinOp::Ne),
+        ("!=", BinOp::Ne),
+        (">", BinOp::Gt),
+        (">=", BinOp::Ge),
+        ("<", BinOp::Lt),
+        ("<=", BinOp::Le),
+        ("AND", BinOp::And),
+        ("OR", BinOp::Or),
+        ("||", BinOp::Concat),
+    ] {
+        assert_eq!(
+            b(&format!("c {op} n")),
+            BoundExpr::bin(C, want, BoundExpr::ColRef(2)),
+            "{op}"
         );
     }
-    assert_unsupported(bind_num("POWER(c)"), "exactly two arguments");
-    assert_unsupported(bind_num("LOG(c, 2)"), "exactly one argument");
 }
 
-fn assert_plan_err(r: Result<BoundExpr, GnitzSqlError>, want_substr: &str) {
-    match r.unwrap_err() {
-        GnitzSqlError::Rejected(msg) => assert!(
-            msg.contains(want_substr),
-            "got Plan({msg:?}), expected to contain {want_substr:?}"
-        ),
-        e => panic!("expected Plan, got {e:?}"),
-    }
-}
-
-/// Every unary numeric name binds to its `NumFunc`. `CEIL`/`FLOOR` arrive as
-/// their own AST nodes and `CEILING` as a plain call — all three must land on
-/// the same two IR nodes.
+/// Every unary numeric name binds to its `NumFunc` over its one argument.
+/// `CEIL`/`FLOOR` arrive as their own AST nodes, the rest as plain calls.
 #[test]
 fn unary_numeric_functions_bind_to_their_numfunc() {
-    for (src, want) in [
-        ("ABS(c)", NumFunc::Unary(FloatUnaryOp::Abs)),
-        ("abs(c)", NumFunc::Unary(FloatUnaryOp::Abs)),
-        ("CEIL(c)", NumFunc::Unary(FloatUnaryOp::Ceil)),
-        ("CEILING(c)", NumFunc::Unary(FloatUnaryOp::Ceil)),
-        ("FLOOR(c)", NumFunc::Unary(FloatUnaryOp::Floor)),
-        ("TRUNC(c)", NumFunc::Unary(FloatUnaryOp::Trunc)),
-        ("ROUND(c)", NumFunc::Unary(FloatUnaryOp::Round)),
-        ("ROUND(c, 2)", NumFunc::Round(2)),
+    use FloatUnaryOp as F;
+    for (src, op) in [
+        ("ABS(c)", F::Abs),
+        ("abs(c)", F::Abs),
+        ("CEIL(c)", F::Ceil),
+        ("FLOOR(c)", F::Floor),
+        ("TRUNC(c)", F::Trunc),
+        ("ROUND(c)", F::Round),
+        ("SQRT(c)", F::Sqrt),
+        ("ln(c)", F::Ln),
+        ("LOG(c)", F::Log10),
+        ("EXP(c)", F::Exp),
+        ("SIGN(c)", F::Sign),
+        ("-c", F::Neg),
     ] {
-        match bind_num(src).unwrap() {
-            BoundExpr::Func { f, arg } => {
-                assert_eq!(f, want, "{src}");
-                assert!(matches!(*arg, BoundExpr::ColRef(1)), "{src}");
-            }
-            other => panic!("{src}: expected Func, got {other:?}"),
-        }
+        assert_eq!(b(src), BoundExpr::Func { f: NumFunc::Unary(op), arg: bx(C) }, "{src}");
     }
-    assert_unsupported(bind_num("ABS(c, 1)"), "exactly one argument");
-    assert_unsupported(bind_num("TRUNC(c, 2)"), "exactly one argument");
 }
 
-/// `CEIL(x TO DAY)` and `CEIL(x, 2)` parse into the same node with a
-/// non-empty field; dropping it would silently compute plain `CEIL(x)`.
+/// Every string function name reaches its IR node, whichever spelling is
+/// written, and the spelling `str_func_name` reads back binds to the same node.
+/// `LENGTH` and its SQL-standard aliases must land on the *character* measure
+/// and `OCTET_LENGTH` on the byte one — swapping them is invisible until a
+/// multibyte value shows up.
 #[test]
-fn ceil_floor_reject_the_field_carrying_forms() {
-    assert_unsupported(bind_num("CEIL(c TO DAY)"), "CEIL");
-    assert_unsupported(bind_num("FLOOR(c TO DAY)"), "FLOOR");
-    assert_unsupported(bind_num("CEIL(c, 2)"), "CEIL");
-}
-
-#[test]
-fn round_scale_must_be_a_small_integer_literal() {
-    for (src, want) in [("ROUND(c, 2)", 2i8), ("ROUND(c, -2)", -2), ("ROUND(c, +15)", 15)] {
-        match bind_num(src).unwrap() {
-            BoundExpr::Func { f: NumFunc::Round(n), .. } => assert_eq!(n, want, "{src}"),
-            other => panic!("{src}: expected Round, got {other:?}"),
-        }
-    }
-    for src in ["ROUND(c, 16)", "ROUND(c, -16)", "ROUND(c, 2.5)", "ROUND(c, c)"] {
-        assert_plan_err(bind_num(src), "scale must be an integer literal");
-    }
-    assert_unsupported(bind_num("ROUND(c, 1, 2)"), "one or two arguments");
-}
-
-/// MOD is a pure desugar onto `%`, so it inherits `IntArith`'s `Mod` total semantics
-/// (zero divisor NULLs the row) with no opcode of its own.
-#[test]
-fn mod_desugars_to_the_modulo_binop() {
-    match bind_num("MOD(c, 2)").unwrap() {
-        BoundExpr::BinOp(l, BinOp::Mod, r) => {
-            assert!(matches!(*l, BoundExpr::ColRef(1)));
-            assert!(matches!(*r, BoundExpr::LitInt(2)));
-        }
-        other => panic!("expected BinOp(Mod), got {other:?}"),
-    }
-    assert_unsupported(bind_num("MOD(c)"), "exactly two arguments");
-}
-
-/// GREATEST/LEAST keep every argument as written — no literal or column
-/// restriction, and no null-test rewrite: NULL skipping is the opcode's.
-#[test]
-fn greatest_least_bind_n_ary_with_computed_args() {
-    match bind_num("GREATEST(c, c + 1, -1, NULL)").unwrap() {
-        BoundExpr::MinMaxN { is_max, args } => {
-            assert!(is_max);
-            assert_eq!(args.len(), 4);
-            assert!(matches!(args[1], BoundExpr::BinOp(_, BinOp::Add, _)));
-            assert_eq!(args[2], BoundExpr::LitInt(-1));
-            assert!(matches!(args[3], BoundExpr::LitNull));
-        }
-        other => panic!("expected MinMaxN, got {other:?}"),
-    }
-    assert!(matches!(
-        bind_num("LEAST(c)").unwrap(),
-        BoundExpr::MinMaxN { is_max: false, .. }
-    ));
-}
-
-/// The `NULL` literal is an ordinary value, not a GREATEST/LEAST special
-/// case: it binds wherever a literal does — under `IS NULL` too, as a null
-/// test over the literal's value.
-#[test]
-fn null_literal_binds_wherever_a_literal_does() {
-    for src in [
-        "NULL",
-        "CASE WHEN c > 0 THEN 1 ELSE NULL END",
-        "CASE WHEN c > 0 THEN NULL ELSE 1 END",
-        "GREATEST(c, NULL)",
-        "COALESCE(NULL, c)",
-        "CAST(NULL AS BIGINT)",
-        "ABS(NULL)",
-    ] {
-        assert!(bind_num(src).is_ok(), "expected {src} to bind");
-    }
-    assert!(matches!(bind_num("NULL").unwrap(), BoundExpr::LitNull));
-    // COALESCE folds a leading NULL away rather than making it the result.
-    assert!(matches!(bind_num("COALESCE(NULL, c)").unwrap(), BoundExpr::ColRef(1)));
-    // A NULL literal's null test is settled at bind time, as a literal's is.
-    assert!(matches!(bind_num("NULL IS NULL").unwrap(), BoundExpr::LitInt(1)));
-    assert!(matches!(bind_num("NULL IS NOT NULL").unwrap(), BoundExpr::LitInt(0)));
-    assert!(matches!(bind_num("1 IS NULL").unwrap(), BoundExpr::LitInt(0)));
-}
-
-/// All four cast kinds mean the same thing here — a failed cast is a NULL,
-/// which is what TRY_CAST/SAFE_CAST are documented to do.
-#[test]
-fn every_cast_kind_binds_to_one_node() {
-    for src in [
-        "CAST(c AS BIGINT)",
-        "c::BIGINT",
-        "TRY_CAST(c AS BIGINT)",
-        "SAFE_CAST(c AS BIGINT)",
-    ] {
-        match bind_num(src).unwrap() {
-            BoundExpr::Cast { expr, to } => {
-                assert_eq!(to, TypeCode::I64.into(), "{src}");
-                assert!(matches!(*expr, BoundExpr::ColRef(1)), "{src}");
-            }
-            other => panic!("{src}: expected Cast, got {other:?}"),
-        }
-    }
-}
-
-#[test]
-fn cast_accepts_every_numeric_target_and_rejects_the_rest() {
-    for (src, want) in [
-        ("CAST(c AS TINYINT)", TypeCode::I8),
-        ("CAST(c AS SMALLINT)", TypeCode::I16),
-        ("CAST(c AS INT)", TypeCode::I32),
-        ("CAST(c AS TINYINT UNSIGNED)", TypeCode::U8),
-        ("CAST(c AS INT UNSIGNED)", TypeCode::U32),
-        ("CAST(c AS BIGINT UNSIGNED)", TypeCode::U64),
-        ("CAST(c AS FLOAT)", TypeCode::F32),
-        ("CAST(c AS DOUBLE)", TypeCode::F64),
-        ("CAST(c AS REAL)", TypeCode::F64),
-    ] {
-        match bind_num(src).unwrap() {
-            BoundExpr::Cast { to, .. } => assert_eq!(to, want.into(), "{src}"),
-            other => panic!("{src}: expected Cast, got {other:?}"),
-        }
-    }
-    // STRING is a cast target too — the VM has a string register class.
-    for src in ["CAST(c AS TEXT)", "CAST(c AS VARCHAR(10))", "CAST(c AS CHAR(4))"] {
-        match bind_num(src).unwrap() {
-            BoundExpr::Cast { to, .. } => assert_eq!(to, TypeCode::String.into(), "{src}"),
-            other => panic!("{src}: expected Cast, got {other:?}"),
-        }
-    }
-    // A 16-byte target binds; it is the lowering that refuses it.
-    for src in ["CAST(c AS UUID)", "CAST(c AS UINT128)"] {
-        assert!(matches!(bind_num(src).unwrap(), BoundExpr::Cast { .. }), "{src}");
-    }
-    // BOOLEAN has no gnitz type at all, so it rejects one level earlier.
-    assert!(bind_num("CAST(c AS BOOLEAN)").is_err());
-    assert_unsupported(bind_num("CAST(c AS INT ARRAY)"), "ARRAY");
-}
-
-/// The shared qualifier inventory applies to the new names too — a dropped
-/// `FILTER`/`OVER`/`DISTINCT` would compute the plain call.
-#[test]
-fn scalar_functions_reject_call_qualifiers() {
-    assert_unsupported(bind_num("ABS(DISTINCT c)"), "DISTINCT");
-    assert_unsupported(bind_num("ABS(c) OVER ()"), "OVER");
-    assert_unsupported(bind_num("GREATEST(c) FILTER (WHERE c > 0)"), "FILTER");
-}
-
-/// Bind against a schema whose `c` is a STRING, for the string surface.
-fn bind_str(src: &str) -> Result<BoundExpr, GnitzSqlError> {
-    bind1(&parse_expr_sql(src), &schema_with_val(TypeCode::String))
-}
-
-/// The `(pattern, ci, negated)` a LIKE bound to, unwrapping a `NOT` if one is
-/// there.
-fn like_parts(src: &str) -> (LikePattern, bool, bool) {
-    let (e, negated) = match bind_str(src).unwrap() {
-        BoundExpr::Not(inner) => (*inner, true),
-        other => (other, false),
-    };
-    match e {
-        BoundExpr::Like { pattern, ci, .. } => (pattern, ci, negated),
-        other => panic!("expected Like, got {other:?}"),
-    }
-}
-
-/// The pattern bytes a LIKE bound to.
-fn like_bytes(src: &str) -> Vec<u8> {
-    like_parts(src).0.as_bytes().to_vec()
-}
-
-#[test]
-fn like_binds_its_pattern_escape_and_case_folding() {
-    let a = || LikePattern::encode("a%", None).unwrap();
-    assert_eq!(like_parts("c LIKE 'a%'"), (a(), false, false));
-    assert_eq!(like_parts("c ILIKE 'a%'"), (a(), true, false));
-    assert_eq!(like_parts("c NOT LIKE 'a%'"), (a(), false, true));
-    assert_eq!(like_parts("c NOT ILIKE 'a%'"), (a(), true, true));
-    // The default escape is `\`, `ESCAPE ''` disables escaping, and any other
-    // single character overrides it — a multi-byte one or NUL included.
-    assert_eq!(like_bytes(r"c LIKE 'a\%'"), b"a%");
-    assert_eq!(
-        like_parts(r"c LIKE 'a\%' ESCAPE ''").0,
-        LikePattern::encode(r"a\%", None).unwrap()
-    );
-    assert_eq!(like_bytes("c LIKE 'a!%' ESCAPE '!'"), b"a%");
-    assert_eq!(like_bytes("c LIKE 'aé%b' ESCAPE 'é'"), b"a%b");
-    assert_eq!(like_bytes("c LIKE 'a\0%' ESCAPE '\0'"), b"a%");
-    // Parentheses around the literal are peeled, as they are in an operand
-    // position.
-    assert_eq!(like_parts("c LIKE ('a%')").0, a());
-}
-
-#[test]
-fn like_rejects_what_it_cannot_bake_in() {
-    assert_unsupported(bind_str("c LIKE c"), "LIKE pattern must be a string literal");
-    assert_unsupported(bind_str("c LIKE NULL"), "LIKE pattern must be a string literal");
-    assert_unsupported(bind_str("c LIKE 1"), "LIKE pattern must be a string literal");
-    assert_unsupported(bind_str("c LIKE ANY ('a%')"), "LIKE: ANY is not supported");
-    // Two characters and a non-string are rejected escapes.
-    for esc in ["'ab'", "1"] {
-        assert_unsupported(bind_str(&format!("c LIKE 'a' ESCAPE {esc}")), "ESCAPE must be a single");
-    }
-}
-
-/// A pattern ending in a *live* escape is rejected; one whose trailing escape
-/// is itself escaped is legal.
-#[test]
-fn like_rejects_a_pattern_ending_in_a_live_escape() {
-    match bind_str(r"c LIKE 'ab\'").unwrap_err() {
-        GnitzSqlError::Rejected(msg) => assert_eq!(msg, "LIKE pattern must not end with escape character"),
-        e => panic!("expected Plan, got {e:?}"),
-    }
-    assert_eq!(like_bytes(r"c LIKE 'ab\\'"), br"ab\");
-    assert_eq!(like_bytes(r"c LIKE 'ab\' ESCAPE ''"), br"ab\");
-}
-
-/// Every string function name reaches the same IR node, whichever of its
-/// spellings is written. `LENGTH` and its two SQL-standard aliases must land
-/// on the *character* measure and `OCTET_LENGTH` on the byte one — swapping
-/// them is invisible until a multibyte value shows up.
-#[test]
-fn string_function_names_bind_to_their_measure_and_transform() {
+fn string_function_names_bind_to_their_function() {
     for (src, want) in [
         ("UPPER(c)", StrFunc::Upper),
         ("lower(c)", StrFunc::Lower),
@@ -702,230 +273,48 @@ fn string_function_names_bind_to_their_measure_and_transform() {
         ("right(c, 2)", StrFunc::Right),
         ("STRPOS(c, 'x')", StrFunc::Pos),
         ("REPLACE(c, 'a', 'b')", StrFunc::Replace),
-        ("LPAD(c, 5)", StrFunc::Lpad),
+        ("LPAD(c, 5, 'ab')", StrFunc::Lpad),
         ("RPAD(c, 5, 'ab')", StrFunc::Rpad),
         ("SPLIT_PART(c, ',', 2)", StrFunc::SplitPart),
+        ("SUBSTR(c, 2, 3)", StrFunc::Substr),
     ] {
-        match bind_str(src).unwrap() {
-            BExpr::StrCall { f, args } => {
-                assert_eq!(f, want, "{src}");
-                assert_eq!(args.len(), f.signature().len(), "{src}: sized by the signature");
-            }
-            other => panic!("{src}: expected StrCall, got {other:?}"),
-        }
+        let bound = b(src);
+        assert!(
+            matches!(bound, BoundExpr::StrCall { f, .. } if f == want),
+            "{src}: {bound:?}"
+        );
+        let args = &src[src.find('(').unwrap()..];
+        assert_eq!(b(&format!("{}{args}", str_func_name(want))), bound, "{src}");
     }
-    for src in ["UPPER()", "UPPER(c, c)", "LENGTH()"] {
-        assert_unsupported(bind_str(src), "exactly one argument");
-    }
-    assert_unsupported(bind_str("LEFT(c)"), "exactly two arguments");
-    assert_unsupported(bind_str("REPLACE(c, 'a')"), "exactly three arguments");
-    assert_unsupported(bind_str("LPAD(c)"), "two or three arguments");
-    assert_unsupported(bind_str("RPAD(c, 1, 'x', 'y')"), "two or three arguments");
 }
 
-/// Every string function's spelling reads back out of the name table, and
-/// re-binds to the same function — the two directions of one map.
+/// The LIKE pattern is encoded under the escape the binder settled on: `\` by
+/// default, none for `ESCAPE ''`, else the one character written — multi-byte
+/// or NUL included.
 #[test]
-fn every_string_function_has_a_spelling_that_binds_back() {
-    for f in [
-        StrFunc::Upper,
-        StrFunc::Lower,
-        StrFunc::LenBytes,
-        StrFunc::LenChars,
-        StrFunc::Reverse,
-        StrFunc::Left,
-        StrFunc::Right,
-        StrFunc::Pos,
-        StrFunc::Replace,
-        StrFunc::Lpad,
-        StrFunc::Rpad,
-        StrFunc::SplitPart,
+fn like_encodes_its_pattern_under_the_written_escape() {
+    for (src, pattern, escape, ci) in [
+        ("c LIKE 'a%'", "a%", Some('\\'), false),
+        ("c ILIKE 'a%'", "a%", Some('\\'), true),
+        (r"c LIKE 'ab\\'", r"ab\\", Some('\\'), false),
+        (r"c LIKE 'a\%' ESCAPE ''", r"a\%", None, false),
+        ("c LIKE 'a!%' ESCAPE '!'", "a!%", Some('!'), false),
+        ("c LIKE 'aé%b' ESCAPE 'é'", "aé%b", Some('é'), false),
+        ("c LIKE 'a\0%' ESCAPE '\0'", "a\0%", Some('\0'), false),
     ] {
-        let name = str_func_name(f);
-        let args = ["c", "c, 1", "c, c", "c, 'a', 'b'", "c, 1, 'x'", "c, ',', 1"]
-            .into_iter()
-            .find(|a| a.split(',').count() == f.signature().len() && (f != StrFunc::Pos || *a == "c, c"))
-            .unwrap();
-        let src = format!("{name}({args})");
-        match bind_str(&src).unwrap() {
-            BExpr::StrCall { f: bound, .. } => assert_eq!(bound, f, "{src}"),
-            other => panic!("{src}: expected StrCall, got {other:?}"),
-        }
-    }
-}
-
-/// `LPAD`/`RPAD` without a fill carry one space as their third argument, so
-/// the node always holds the full signature.
-#[test]
-fn pad_without_a_fill_defaults_to_one_space() {
-    match bind_str("LPAD(c, 5)").unwrap() {
-        BExpr::StrCall { args, .. } => assert_eq!(args[2], BoundExpr::LitStr(" ".into())),
-        other => panic!("expected StrCall, got {other:?}"),
-    }
-}
-
-/// `POSITION(needle IN hay)` is `STRPOS(hay, needle)`: the same node with the
-/// arguments swapped into call order.
-#[test]
-fn position_binds_as_strpos_with_swapped_arguments() {
-    match bind_str("POSITION('x' IN c)").unwrap() {
-        BExpr::StrCall { f: StrFunc::Pos, args } => {
-            assert!(matches!(args[0], BoundExpr::ColRef(1)));
-            assert_eq!(args[1], BoundExpr::LitStr("x".into()));
-        }
-        other => panic!("expected STRPOS, got {other:?}"),
-    }
-}
-
-/// `IF(c, a, b)` is a one-branch CASE; `IFNULL`/`NVL` are two-argument COALESCE.
-#[test]
-fn if_ifnull_and_nvl_desugar_onto_case_and_coalesce() {
-    let s = nullable_schema(TypeCode::I64);
-    match bind1(&parse_expr_sql("IF(c > 1, 10, 20)"), &s).unwrap() {
-        BoundExpr::Case { branches, else_ } => {
-            assert_eq!(branches.len(), 1);
-            assert!(matches!(branches[0].0, BoundExpr::BinOp(_, BinOp::Gt, _)));
-            assert!(matches!(branches[0].1, BoundExpr::LitInt(10)));
-            assert!(matches!(else_.as_deref(), Some(BoundExpr::LitInt(20))));
-        }
-        other => panic!("expected Case, got {other:?}"),
-    }
-    for src in ["IFNULL(c, 0)", "NVL(c, 0)"] {
-        let coalesce = bind1(&parse_expr_sql("COALESCE(c, 0)"), &s).unwrap();
-        assert_eq!(bind1(&parse_expr_sql(src), &s).unwrap(), coalesce, "{src}");
-    }
-    assert_unsupported(bind1(&parse_expr_sql("IFNULL(c, 0, 1)"), &s), "exactly two arguments");
-    assert_unsupported(bind1(&parse_expr_sql("IF(c, 1)"), &s), "exactly three arguments");
-}
-
-/// `a IS [NOT] DISTINCT FROM b` is one definite CASE for both polarities: with
-/// a NULL on either side the null flags are compared with the same operator
-/// as the values. A never-null operand folds its null test to a constant, as
-/// any null test does, and two never-null operands are the plain comparison.
-#[test]
-fn is_distinct_from_desugars_to_a_definite_case() {
-    let s = nullable_schema(TypeCode::I64);
-    for (src, op) in [
-        ("c IS DISTINCT FROM pk", BinOp::Ne),
-        ("c IS NOT DISTINCT FROM pk", BinOp::Eq),
-    ] {
-        match bind1(&parse_expr_sql(src), &s).unwrap() {
-            BoundExpr::Case { branches, else_ } => {
-                assert_eq!(branches.len(), 1, "{src}");
-                // `c IS NULL` over the nullable column is a real test; `pk IS
-                // NULL` over the never-null PK folds to 0.
-                let (cond, then) = &branches[0];
-                assert!(
-                    matches!(cond, BoundExpr::BinOp(a, BinOp::Or, b)
-                        if matches!(**a, BoundExpr::NullTest { want_null: true, .. }) && matches!(**b, BoundExpr::LitInt(0))),
-                    "{src}: {cond:?}"
-                );
-                assert!(matches!(then, BoundExpr::BinOp(_, o, _) if *o == op), "{src}: {then:?}");
-                assert!(
-                    matches!(else_.as_deref(), Some(BoundExpr::BinOp(_, o, _)) if *o == op),
-                    "{src}"
-                );
-            }
-            other => panic!("{src}: expected Case, got {other:?}"),
-        }
-    }
-    assert!(matches!(
-        bind1(&parse_expr_sql("pk IS DISTINCT FROM 1"), &s).unwrap(),
-        BoundExpr::BinOp(_, BinOp::Ne, _)
-    ));
-}
-
-/// `IS NULL` over anything but a column is a null test over the value.
-#[test]
-fn null_test_over_a_computed_operand_tests_its_value() {
-    let s = nullable_schema(TypeCode::I64);
-    match bind1(&parse_expr_sql("(c + 1) IS NOT NULL"), &s).unwrap() {
-        BoundExpr::NullTest { inner, want_null: false } => {
-            assert!(matches!(*inner, BoundExpr::BinOp(_, BinOp::Add, _)));
-        }
-        other => panic!("expected NullTest, got {other:?}"),
-    }
-    // A name that does not resolve is still that error, not a null test over
-    // nothing.
-    assert!(bind1(&parse_expr_sql("nope IS NULL"), &s).is_err());
-}
-
-/// The full TRIM syntax matrix collapses to `(mode, set)`. The keyword form
-/// and the `LTRIM`/`RTRIM` calls must agree, since they lower identically.
-#[test]
-fn trim_syntax_matrix_collapses_to_a_mode_and_a_byte_set() {
-    for (src, mode, set) in [
-        ("TRIM(c)", TrimMode::Both, " "),
-        ("TRIM(BOTH c)", TrimMode::Both, " "),
-        ("TRIM(LEADING c)", TrimMode::Leading, " "),
-        ("TRIM(TRAILING c)", TrimMode::Trailing, " "),
-        ("TRIM(LEADING 'xy' FROM c)", TrimMode::Leading, "xy"),
-        ("TRIM(TRAILING 'xy' FROM c)", TrimMode::Trailing, "xy"),
-        ("TRIM('xy' FROM c)", TrimMode::Both, "xy"),
-        ("LTRIM(c)", TrimMode::Leading, " "),
-        ("RTRIM(c)", TrimMode::Trailing, " "),
-        ("LTRIM(c, 'xy')", TrimMode::Leading, "xy"),
-        ("RTRIM(c, 'xy')", TrimMode::Trailing, "xy"),
-    ] {
-        match bind_str(src).unwrap() {
-            BExpr::TrimCall { mode: m, set: st, .. } => assert_eq!((m, st.as_str()), (mode, set), "{src}"),
-            other => panic!("{src}: expected TrimCall, got {other:?}"),
-        }
-    }
-}
-
-/// The trim set is compile-time data the engine bakes into a membership
-/// table, so it must be a literal — and ASCII, which is what keeps a
-/// byte-wise strip from splitting a UTF-8 sequence.
-#[test]
-fn trim_set_must_be_an_ascii_literal() {
-    for src in ["TRIM(c FROM c)", "LTRIM(c, c)", "TRIM('ä' FROM c)", "TRIM(NULL FROM c)"] {
-        assert_unsupported(bind_str(src), "ASCII string literal");
-    }
-    // Parentheses around the literal are peeled, as they are in an operand
-    // position.
-    match bind_str("LTRIM(c, ('ab'))").unwrap() {
-        BoundExpr::TrimCall { set, .. } => assert_eq!(set, "ab"),
-        other => panic!("expected TrimCall, got {other:?}"),
-    }
-}
-
-/// `SUBSTR` and `SUBSTRING`, the `FROM/FOR` form and the comma form, all
-/// arrive as one AST node; an absent FROM starts the window at 1.
-#[test]
-fn substring_spellings_bind_to_one_node() {
-    for src in [
-        "SUBSTRING(c FROM 2 FOR 3)",
-        "SUBSTRING(c, 2, 3)",
-        "SUBSTR(c, 2, 3)",
-        "SUBSTR(c FROM 2 FOR 3)",
-    ] {
-        match bind_str(src).unwrap() {
-            BExpr::StrCall { f: StrFunc::Substr, args } => {
-                assert!(
-                    matches!(args.as_slice(), [_, BExpr::LitInt(2), BExpr::LitInt(3)]),
-                    "{src}"
-                );
-            }
-            other => panic!("{src}: expected Substr, got {other:?}"),
-        }
-    }
-    match bind_str("SUBSTRING(c)").unwrap() {
-        BExpr::StrCall { f: StrFunc::Substr, args } => assert!(
-            matches!(args.as_slice(), [_, BExpr::LitInt(1)]),
-            "an absent FROM starts at 1 and an absent FOR stays absent"
-        ),
-        other => panic!("expected Substr, got {other:?}"),
+        let want = BoundExpr::Like {
+            s: bx(C),
+            pattern: LikePattern::encode(pattern, escape).unwrap(),
+            ci,
+        };
+        assert_eq!(b(src), want, "{src}");
     }
 }
 
 /// A minus over a literal folds into it at bind, keeping `LitWide`'s invariant
-/// that its value does not fit `i64`; over anything else it is the numeric
-/// negation function.
+/// that its value does not fit `i64`.
 #[test]
 fn a_negated_literal_folds_and_keeps_the_wide_invariant() {
-    let schema = schema_with_val(TypeCode::I64);
-    let b = |src| bind1(&parse_expr_sql(src), &schema).unwrap();
     assert_eq!(b("-9223372036854775808"), BExpr::LitInt(i64::MIN));
     assert_eq!(
         b("-(-9223372036854775808)"),
@@ -936,53 +325,181 @@ fn a_negated_literal_folds_and_keeps_the_wide_invariant() {
         BExpr::LitWide(NumLit { mag: 1 << 127, neg: true })
     );
     assert_eq!(b("-1.5"), BExpr::LitFloat { v: -1.5, dec: Some((-15, 1)) });
+}
+
+/// A constant position peels parentheses and signs, in any order, into the
+/// literal they spell; anything else — including shapes the binder folds to a
+/// literal — is refused.
+#[test]
+fn bind_constant_reads_a_literal_through_parens_and_signs() {
+    let constant = |src| bind_constant(&parse_expr_sql(src));
+    for (src, want) in [
+        ("5", 5),
+        ("+5", 5),
+        ("-5", -5),
+        ("((-5))", -5),
+        ("(-(5))", -5),
+        ("-(-5)", 5),
+        ("-(+5)", -5),
+        ("-0", 0),
+    ] {
+        assert_eq!(constant(src).unwrap(), BExpr::LitInt(want), "{src}");
+    }
+    // A sign over NULL is the NULL it spells, which is what an INSERT cell reads.
+    for src in ["+NULL", "-NULL", "NULL"] {
+        assert_eq!(constant(src).unwrap(), BExpr::LitNull, "{src}");
+    }
+    assert_eq!(constant("'abc'").unwrap(), BExpr::LitStr("abc".into()));
     assert_eq!(
-        b("-c"),
-        BExpr::Func {
-            f: NumFunc::Unary(FloatUnaryOp::Neg),
-            arg: Box::new(BExpr::ColRef(1)),
-        }
+        constant("DATE '2020-01-01'").unwrap(),
+        BExpr::LitTemporal { tc: TypeCode::Date, v: 18262 }
+    );
+    for (src, want) in [
+        ("-'abc'", "expected a constant"),
+        ("+'abc'", "unary operator + not supported"),
+        ("a", "expected a constant"),
+        ("1 + 1", "expected a constant"),
+        ("-(a)", "expected a constant"),
+        ("ABS(1)", "expected a constant"),
+        ("COALESCE(2, x)", "expected a constant"),
+        ("NULL IS NULL", "expected a constant"),
+        ("CAST(5 AS INT)", "expected a constant"),
+    ] {
+        let msg = rejected(constant(src));
+        assert!(msg.contains(want), "{src}: {msg}");
+    }
+}
+
+/// Every refusal names what it refuses — never a silently dropped qualifier,
+/// argument or field.
+#[test]
+fn each_unsupported_form_is_rejected_by_name() {
+    const AGG: &str = "aggregate functions are not allowed here";
+    const WINDOW: &str = "window functions (OVER) are only supported";
+    const SUBQUERY: &str = "only supported in a single-table CREATE VIEW";
+    for (src, want) in [
+        // Columns.
+        ("nope", "column 'nope' not found"),
+        ("nope IS NULL", "column 'nope' not found"),
+        ("x.c", "table alias 'x' not found (the relation in scope is 't')"),
+        ("a.b.c", "expected a column reference"),
+        // Names.
+        ("FOO(c)", "function 'foo' not supported"),
+        ("RANDOM()", "RANDOM: a non-deterministic function is not supported"),
+        ("now()", "NOW: a non-deterministic function is not supported"),
+        // Only a grouped context admits an aggregate — `ALL` and `DISTINCT` included.
+        ("COUNT(*)", AGG),
+        ("COUNT(ALL c)", AGG),
+        ("COUNT(DISTINCT c)", AGG),
+        ("MIN(c)", AGG),
+        ("ABS(SUM(c))", AGG),
+        ("SUM(c) FILTER (WHERE c > 0)", "FILTER (WHERE …) is not supported"),
+        ("SUM(c) OVER (PARTITION BY pk)", WINDOW),
+        ("ABS(c) OVER ()", WINDOW),
+        ("ABS(DISTINCT c)", "ABS: DISTINCT is not supported"),
+        (
+            "GREATEST(c) FILTER (WHERE c > 0)",
+            "GREATEST: FILTER (WHERE …) is not supported",
+        ),
+        // Subqueries.
+        ("EXISTS (SELECT c FROM t)", SUBQUERY),
+        ("NOT EXISTS (SELECT c FROM t)", SUBQUERY),
+        ("c IN (SELECT c FROM t)", SUBQUERY),
+        ("c NOT IN (SELECT c FROM t)", SUBQUERY),
+        ("c = 1 OR EXISTS (SELECT c FROM t)", SUBQUERY),
+        ("c = ANY (SELECT c FROM t)", "ANY/SOME/ALL"),
+        ("c > ALL (SELECT c FROM t)", "ANY/SOME/ALL"),
+        ("(SELECT c FROM t) = 1", "scalar subqueries"),
+        // Operators and forms. Unary `+` folds over a numeric literal only.
+        ("+c", "unary operator + not supported"),
+        ("+(c > 1)", "unary operator + not supported"),
+        ("c & 1", "binary operator & not supported"),
+        ("c IS TRUE", "expression not supported: c IS TRUE"),
+        // Arity. A call reads its arguments by position, so an extra one would
+        // be dropped silently.
+        ("COALESCE()", "at least one argument"),
+        ("CONCAT()", "at least one argument"),
+        ("NULLIF(c)", "exactly two arguments"),
+        ("IFNULL(c, 0, 1)", "exactly two arguments"),
+        ("IF(c, 1)", "exactly three arguments"),
+        ("POWER(c)", "exactly two arguments"),
+        ("MOD(c)", "exactly two arguments"),
+        ("LOG(c, 2)", "exactly one argument"),
+        ("ABS(c, 1)", "exactly one argument"),
+        ("TRUNC(c, 2)", "exactly one argument"),
+        ("UPPER()", "exactly one argument"),
+        ("UPPER(c, c)", "exactly one argument"),
+        ("LEFT(c)", "exactly two arguments"),
+        ("REPLACE(c, 'a')", "exactly three arguments"),
+        ("LPAD(c)", "two or three arguments"),
+        ("RPAD(c, 1, 'x', 'y')", "two or three arguments"),
+        ("ROUND(c, 1, 2)", "one or two arguments"),
+        // ROUND's scale, and the field CEIL/FLOOR would drop.
+        ("ROUND(c, 16)", "scale must be an integer literal"),
+        ("ROUND(c, -16)", "scale must be an integer literal"),
+        ("ROUND(c, 2.5)", "scale must be an integer literal"),
+        ("ROUND(c, c)", "scale must be an integer literal"),
+        ("CEIL(c TO DAY)", "CEIL: only the plain CEIL(x) form is supported"),
+        ("CEIL(c, 2)", "CEIL: only the plain CEIL(x) form is supported"),
+        ("FLOOR(c TO DAY)", "FLOOR: only the plain FLOOR(x) form is supported"),
+        // CAST and typed literals.
+        ("CAST(c AS INT ARRAY)", "CAST: an ARRAY target type is not supported"),
+        ("CAST(c AS INT FORMAT 'x')", "CAST: FORMAT is not supported"),
+        ("CAST('2020-13-01' AS DATE)", "invalid DATE literal: '2020-13-01'"),
+        ("DATE 5", "must be a single-quoted string"),
+        ("DATE NULL", "must be a single-quoted string"),
+        // Calendar units.
+        (
+            "EXTRACT(MILLISECOND FROM c)",
+            "EXTRACT: field MILLISECOND is not supported",
+        ),
+        ("DATE_TRUNC('dow', c)", r#"DATE_TRUNC: unit "dow" is not supported"#),
+        ("DATE_TRUNC(c, c)", "DATE_TRUNC: the unit must be a string literal"),
+        // LIKE's pattern and escape are baked in, so each must be a literal.
+        ("c LIKE c", "LIKE pattern must be a string literal"),
+        ("c LIKE NULL", "LIKE pattern must be a string literal"),
+        ("c LIKE 1", "LIKE pattern must be a string literal"),
+        ("c LIKE ANY ('a%')", "LIKE: ANY is not supported"),
+        ("c LIKE 'a' ESCAPE 'ab'", "ESCAPE must be a single"),
+        ("c LIKE 'a' ESCAPE 1", "ESCAPE must be a single"),
+        (r"c LIKE 'ab\'", "LIKE pattern must not end with escape character"),
+        // The trim set is baked into a membership table, and must be ASCII so a
+        // byte-wise strip cannot split a UTF-8 sequence.
+        ("TRIM(c FROM c)", "ASCII string literal"),
+        ("LTRIM(c, c)", "ASCII string literal"),
+        ("TRIM('ä' FROM c)", "ASCII string literal"),
+        ("TRIM(NULL FROM c)", "ASCII string literal"),
+        ("TRIM(c, 'xy')", "TRIM: the (… , <characters>) form is not supported"),
+    ] {
+        let msg = b_err(src);
+        assert!(msg.contains(want), "{src}: {msg}");
+    }
+    // The parser never produces an empty list; the binder still refuses one.
+    let empty = in_list_expr("c", vec![]);
+    assert!(rejected(bind_single_table(&empty, &schema(), "t")).contains("empty list"));
+    // No relation in scope: there is no alias a qualifier could name.
+    assert_eq!(
+        rejected(bind_single_table(&parse_expr_sql("t.c"), &schema(), "")),
+        "column 't.c' not found (no relation is in scope)"
     );
 }
 
+/// `scalar_call` matches before the leaf ever sees a call, so a name in two
+/// tables would silently bind as the scalar call in every context at once.
 #[test]
-fn concat_binds_any_arity_and_the_operator_maps_to_its_own_binop() {
-    match bind_str("CONCAT(c, 'x', 42)").unwrap() {
-        BExpr::ConcatN { args } => assert_eq!(args.len(), 3),
-        other => panic!("expected ConcatN, got {other:?}"),
-    }
-    assert!(matches!(bind_str("CONCAT(c)").unwrap(), BExpr::ConcatN { .. }));
-    assert_unsupported(bind_str("CONCAT()"), "at least one argument");
-    assert!(matches!(
-        bind_str("c || 'x'").unwrap(),
-        BExpr::BinOp(_, BinOp::Concat, _)
-    ));
-}
-
-/// The walkers see through the two keyword-dispatched nodes. `EXCLUDED` is
-/// the observable: a reference the walk cannot reach is one the `EXCLUDED`
-/// guard and the aggregate collectors would silently miss.
-#[test]
-fn expr_operands_reaches_inside_substring_and_trim() {
-    use crate::ast_util::expr_operands;
-    for src in [
-        "SUBSTRING(EXCLUDED.c FROM 1)",
-        "SUBSTRING(c FROM EXCLUDED.n)",
-        "SUBSTRING(c FROM 1 FOR EXCLUDED.n)",
-        "TRIM(EXCLUDED.c)",
-        "TRIM('x' FROM EXCLUDED.c)",
-    ] {
-        let e = parse_expr_sql(src);
-        let found = expr_operands(&e).iter().any(|o| format!("{o}").contains("EXCLUDED"));
-        assert!(found, "{src}: the walker must reach the EXCLUDED reference");
-    }
-}
-
-/// Only a quoted string is a typed literal: the parser fills a typed string
-/// with any value, and `DATE 5` / `DATE NULL` are no spelling of a date.
-#[test]
-fn a_typed_literal_must_be_a_quoted_string() {
-    for src in ["DATE 5", "DATE NULL"] {
-        assert_unsupported(bind_num(src), "must be a single-quoted string");
+fn every_structurally_bound_name_is_unique() {
+    for (i, (name, _)) in SCALAR_CALLS.iter().enumerate() {
+        assert!(
+            SCALAR_CALLS[..i].iter().all(|(n, _)| !n.eq_ignore_ascii_case(name)),
+            "'{name}' twice"
+        );
+        assert!(
+            crate::ast_util::agg_func_from_name(name).is_none(),
+            "'{name}' is an aggregate"
+        );
+        assert!(
+            !VOLATILE_FNS.iter().any(|v| v.eq_ignore_ascii_case(name)),
+            "'{name}' is volatile"
+        );
     }
 }

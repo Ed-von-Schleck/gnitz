@@ -1691,8 +1691,7 @@ fn typed_schema(tcs: &[TypeCode]) -> Schema {
 /// payload columns' values (`None` is NULL).
 fn eval_sql_rows(sql: &str, tcs: &[TypeCode], rows: &[Vec<Option<i128>>]) -> Vec<Option<i128>> {
     let schema = typed_schema(tcs);
-    let expr = crate::bind::bind_single_table(&crate::test_support::parse_expr_sql(sql), &schema, "t")
-        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let expr = crate::test_support::bind_sql(sql, &schema).unwrap_or_else(|e| panic!("{sql}: {e}"));
     let mut batch = gnitz_core::ZSetBatch::new(&schema);
     let mut app = gnitz_core::BatchAppender::new(&mut batch, &schema);
     for (r, row) in rows.iter().enumerate() {
@@ -1853,12 +1852,7 @@ fn a_u64_and_a_signed_column_compare_exactly() {
 #[test]
 fn a_float_compare_lifts_a_u64_literal_unsigned() {
     let schema = typed_schema(&[TypeCode::F64]);
-    let expr = crate::bind::bind_single_table(
-        &crate::test_support::parse_expr_sql("c1 < 18446744073709551615"),
-        &schema,
-        "t",
-    )
-    .unwrap();
+    let expr = crate::test_support::bind_sql("c1 < 18446744073709551615", &schema).unwrap();
     let instrs = lower_instrs(&expr, &schema);
     assert!(has(
         &instrs,
@@ -1897,7 +1891,7 @@ fn a_date_meets_a_timestamp_in_microseconds() {
         vec![Some(10 * day), Some(10 * day + day / 2)]
     );
     let schema = typed_schema(&tcs);
-    let bound = crate::bind::bind_single_table(&crate::test_support::parse_expr_sql(case), &schema, "t").unwrap();
+    let bound = crate::test_support::bind_sql(case, &schema).unwrap();
     assert_eq!(bound.infer_ty(&schema.columns).tc, TypeCode::Timestamp);
 }
 
@@ -1913,7 +1907,7 @@ fn temporal_arithmetic_outside_the_allow_list_is_refused() {
         ("c1 + c1", "not supported on a DATE/TIMESTAMP operand"),
         ("CASE WHEN c3 = 1 THEN c1 ELSE 1.5 END", "cannot mix DATE with F64"),
     ] {
-        let expr = crate::bind::bind_single_table(&crate::test_support::parse_expr_sql(sql), &schema, "t").unwrap();
+        let expr = crate::test_support::bind_sql(sql, &schema).unwrap();
         let err = compile_bound_expr_to_program(&expr, &schema.columns).expect_err(sql);
         assert!(err.to_string().contains(needle), "{sql}: {err}");
     }
@@ -1924,12 +1918,7 @@ fn temporal_arithmetic_outside_the_allow_list_is_refused() {
 #[test]
 fn a_typed_string_and_a_literal_cast_to_date_evaluate() {
     let row = [vec![Some(1)]];
-    let bound = crate::bind::bind_single_table(
-        &crate::test_support::parse_expr_sql("CAST(NULL AS DATE)"),
-        &typed_schema(&[TypeCode::I64]),
-        "t",
-    )
-    .unwrap();
+    let bound = crate::test_support::bind_sql("CAST(NULL AS DATE)", &typed_schema(&[TypeCode::I64])).unwrap();
     assert!(matches!(bound, BExpr::Cast { .. }), "{bound:?}");
     for (sql, want) in [
         ("CAST(NULL AS DATE)", None),
@@ -1950,8 +1939,7 @@ fn a_cast_to_a_16_byte_type_is_refused_by_lowering() {
         "CAST(c1 AS UINT128)",
         "UUID '00000000-0000-0000-0000-000000000001'",
     ] {
-        let expr = crate::bind::bind_single_table(&crate::test_support::parse_expr_sql(sql), &schema, "t")
-            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let expr = crate::test_support::bind_sql(sql, &schema).unwrap_or_else(|e| panic!("{sql}: {e}"));
         let err = compile_bound_expr_to_program(&expr, &schema.columns).expect_err(sql);
         assert!(err.to_string().contains("is not supported"), "{sql}: {err}");
     }
@@ -1966,7 +1954,7 @@ fn a_string_that_spells_no_value_of_the_operand_type_is_refused() {
         ("p = 'abc'", "invalid DECIMAL(18, 2) literal: 'abc'"),
         ("i = 'abc'", "invalid I64 literal: 'abc'"),
     ] {
-        let expr = crate::bind::bind_single_table(&crate::test_support::parse_expr_sql(sql), &schema, "t").unwrap();
+        let expr = crate::test_support::bind_sql(sql, &schema).unwrap();
         let err = compile_bound_expr_to_program(&expr, &schema.columns).expect_err(sql);
         assert!(err.to_string().contains(needle), "{sql}: {err}");
     }

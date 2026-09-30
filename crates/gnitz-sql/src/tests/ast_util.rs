@@ -1,5 +1,4 @@
 use super::*;
-use crate::bind::structural::bind_constant;
 use crate::error::GnitzSqlError;
 use crate::test_support::{lit, parse_expr_sql};
 use gnitz_wire::TypeCode;
@@ -27,6 +26,8 @@ fn expr_operands_reaches_every_position_the_binder_recurses_into() {
         "SUBSTRING(s FROM 1 FOR SUM(x))",
         "POSITION(MIN(s) IN s)",
         "POSITION('a' IN MIN(s))",
+        "TRIM(MIN(s))",
+        "TRIM('x' FROM MIN(s))",
         // Operators and parentheses.
         "SUM(x) + 1",
         "1 + SUM(x)",
@@ -169,70 +170,9 @@ fn bind_literal_accepts_fractional_and_exponent_floats() {
     assert!(matches!(lit("1e3"), BExpr::LitFloat { dec: Some((1000, 0)), .. }));
 }
 
-/// A written temporal constant is the same literal an expression binds, so a
-/// VALUES cell and a WHERE operand cannot disagree on what `DATE '…'` is.
-#[test]
-fn bind_constant_binds_a_date_to_its_temporal_literal() {
-    let c = bind_constant(&parse_expr_sql("DATE '2020-01-01'")).expect("a constant");
-    assert!(matches!(c, BExpr::LitTemporal { tc: TypeCode::Date, v: 18262 }));
-}
-
 #[test]
 fn bind_literal_accepts_in_range_integer() {
     assert!(matches!(lit("42"), BExpr::LitInt(42)));
-}
-
-/// A constant position peels parentheses and signs, in any order, into the
-/// signed literal.
-#[test]
-fn bind_constant_folds_parens_and_signs() {
-    for (src, want) in [
-        ("5", 5),
-        ("+5", 5),
-        ("-5", -5),
-        ("((-5))", -5),
-        ("(-(5))", -5),
-        ("-(-5)", 5),
-        ("-(+5)", -5),
-        ("-0", 0),
-    ] {
-        let c = bind_constant(&parse_expr_sql(src)).unwrap_or_else(|e| panic!("{src}: {e}"));
-        assert_eq!(c, BExpr::LitInt(want), "{src}");
-    }
-}
-
-/// A sign over a string is refused. Either sign used to be discarded silently.
-#[test]
-fn bind_constant_refuses_a_sign_on_a_string() {
-    assert!(bind_constant(&parse_expr_sql("-'abc'")).is_err());
-    assert!(bind_constant(&parse_expr_sql("+'abc'")).is_err());
-    assert!(matches!(
-        bind_constant(&parse_expr_sql("'abc'")).unwrap(),
-        BExpr::LitStr(_)
-    ));
-    // A sign over NULL is the NULL it spells, which is what an INSERT cell reads.
-    for src in ["+NULL", "-NULL", "NULL"] {
-        assert!(
-            matches!(bind_constant(&parse_expr_sql(src)).unwrap(), BExpr::LitNull),
-            "{src}"
-        );
-    }
-}
-
-/// Anything but a literal is refused, including shapes the binder folds to one.
-#[test]
-fn bind_constant_rejects_a_non_constant() {
-    for src in [
-        "a",
-        "1 + 1",
-        "-(a)",
-        "ABS(1)",
-        "COALESCE(2, x)",
-        "NULL IS NULL",
-        "CAST(5 AS INT)",
-    ] {
-        assert!(bind_constant(&parse_expr_sql(src)).is_err(), "{src}");
-    }
 }
 
 /// LIMIT/OFFSET read the same decoder, so `(10)` and `+10` are counts; a

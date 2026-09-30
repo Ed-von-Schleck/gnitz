@@ -60,14 +60,9 @@ pub(crate) trait LeafBinder<R> {
     /// An `Identifier` / `CompoundIdentifier` column reference.
     fn bind_column(&self, e: &Expr) -> Result<BExpr<R>, GnitzSqlError>;
     /// A function call. Only a grouped context admits an aggregate, so the
-    /// default rejects one — after `classify_agg_call`, so an unknown or
-    /// malformed call is named as such and reaching past it means the name
-    /// really is an aggregate.
+    /// default rejects one.
     fn bind_function(&self, f: &Function) -> Result<BExpr<R>, GnitzSqlError> {
-        classify_agg_call(f)?;
-        Err(GnitzSqlError::Rejected(
-            "aggregate function not allowed in expression context".to_string(),
-        ))
+        Err(aggregate_not_allowed(f))
     }
     /// Whether the value a leaf reference names can be NULL — the one
     /// nullability fact a leaf owns, which [`nullness`] folds a test by.
@@ -87,6 +82,17 @@ pub(crate) trait LeafBinder<R> {
     /// context (DML, HAVING, ad-hoc reads) keeps the per-kind placement rejection.
     fn bind_subquery(&self, e: &Expr) -> Result<BExpr<R>, GnitzSqlError> {
         Err(unsupported_subquery(e))
+    }
+}
+
+/// The rejection of a call in a context that admits no aggregate — the
+/// [`LeafBinder::bind_function`] default. Classified first, so an unknown or
+/// malformed call is named as such and the aggregate message goes only to a
+/// name that really is one.
+pub(crate) fn aggregate_not_allowed(f: &Function) -> GnitzSqlError {
+    match classify_agg_call(f) {
+        Err(e) => e,
+        Ok(_) => GnitzSqlError::Rejected("aggregate functions are not allowed here".to_string()),
     }
 }
 
@@ -318,7 +324,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
                     UnaryOperator::Plus,
                     inner @ (BExpr::LitInt(_) | BExpr::LitFloat { .. } | BExpr::LitWide(_) | BExpr::LitNull),
                 ) => Ok(inner),
-                (o, _) => Err(GnitzSqlError::Rejected(format!("unary operator {o:?} not supported"))),
+                (o, _) => Err(GnitzSqlError::Rejected(format!("unary operator {o} not supported"))),
             }
         }
         // `e BETWEEN lo AND hi` ≡ `e >= lo AND e <= hi`; NOT BETWEEN negates it.
@@ -333,9 +339,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         }
         // `e IN (l)` IS `e = l` — the same structural desugar as BETWEEN above. Two or
         // more items keep the faithful `InList` node for lowering to shape. `NOT IN`
-        // wraps whichever node the arity picked. Item
-        // binding is eager, so a NULL/string/non-literal item errors in its written
-        // position.
+        // wraps whichever node the arity picked.
         Expr::InList { expr: e, list, negated } => {
             let node = match list.as_slice() {
                 [] => return Err(GnitzSqlError::Rejected("IN with an empty list".into())),
@@ -758,7 +762,7 @@ fn map_binop(op: &BinaryOperator) -> Result<BinOp, GnitzSqlError> {
         BinaryOperator::And => BinOp::And,
         BinaryOperator::Or => BinOp::Or,
         BinaryOperator::StringConcat => BinOp::Concat,
-        o => return Err(GnitzSqlError::Rejected(format!("binary operator {o:?} not supported"))),
+        o => return Err(GnitzSqlError::Rejected(format!("binary operator {o} not supported"))),
     })
 }
 
@@ -855,15 +859,13 @@ pub(crate) struct SingleTable<'a> {
     pub alias: &'a str,
 }
 
-impl SingleTable<'_> {
-    fn idx(&self, e: &Expr) -> Result<usize, GnitzSqlError> {
-        single_relation_col_idx(&self.schema.columns, self.alias, e)
-    }
-}
-
 impl LeafBinder<usize> for SingleTable<'_> {
     fn bind_column(&self, e: &Expr) -> Result<BoundExpr, GnitzSqlError> {
-        Ok(BoundExpr::ColRef(self.idx(e)?))
+        Ok(BoundExpr::ColRef(single_relation_col_idx(
+            &self.schema.columns,
+            self.alias,
+            e,
+        )?))
     }
     fn is_nullable(&self, r: &usize) -> bool {
         self.schema.columns[*r].is_nullable

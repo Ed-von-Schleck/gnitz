@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{col, ncol, parse_expr_sql, parse_stmt};
+use crate::test_support::{col, ncol, parse_expr_sql, parse_stmt, rejected};
 use gnitz_core::BatchAppender;
 use gnitz_expr::{payload_bytes, payload_is_null, payload_u64};
 use gnitz_wire::TypeCode;
@@ -42,14 +42,6 @@ fn rows_of(schema: &Schema, n: usize, mut fill: impl FnMut(&mut BatchAppender<'_
     b
 }
 
-fn bind_err(r: Result<impl Sized, GnitzSqlError>) -> String {
-    match r {
-        Err(GnitzSqlError::Rejected(m)) => m,
-        Err(e) => panic!("expected Bind, got {e:?}"),
-        Ok(_) => panic!("expected Bind, got Ok"),
-    }
-}
-
 // ------------------------------------------------------------------
 // Binding the target list
 // ------------------------------------------------------------------
@@ -57,7 +49,7 @@ fn bind_err(r: Result<impl Sized, GnitzSqlError>) -> String {
 #[test]
 fn a_column_assigned_twice_is_rejected() {
     let schema = table(vec![ncol("val", TypeCode::I64)]);
-    let m = bind_err(compile("val = 1, val = 2", &schema));
+    let m = rejected(compile("val = 1, val = 2", &schema));
     assert!(m.contains("multiple assignments to column 'val'"), "{m}");
 }
 
@@ -81,7 +73,7 @@ fn a_qualified_target_is_rejected() {
 #[test]
 fn a_constant_set_value_is_range_checked_at_bind() {
     let schema = table(vec![ncol("val", TypeCode::U8)]);
-    let m = bind_err(compile("val = 300", &schema));
+    let m = rejected(compile("val = 300", &schema));
     assert!(m.contains("out of range"), "{m}");
     let set = compile("val = 255", &schema).unwrap();
     assert!(matches!(&set[0].rhs, SetRhs::Const { cell, .. } if cell == &[255]));
@@ -94,7 +86,7 @@ fn a_float_or_string_literal_into_an_integer_column() {
     let schema = table(vec![ncol("i", TypeCode::I64)]);
     let set = compile("i = 1.5", &schema).unwrap();
     assert!(matches!(&set[0].rhs, SetRhs::Const { cell, .. } if cell == &2i64.to_le_bytes()));
-    let m = bind_err(compile("i = 'abc'", &schema));
+    let m = rejected(compile("i = 'abc'", &schema));
     assert!(m.contains("column 'i': invalid I64 literal: 'abc'"), "{m}");
 }
 
@@ -142,7 +134,7 @@ fn a_decimal_literal_rounds_to_the_column_scale() {
 fn a_wide_negative_literal_keeps_its_sign() {
     for tc in [TypeCode::U64, TypeCode::U128] {
         let schema = table(vec![ncol("u", tc)]);
-        let m = bind_err(compile("u = -18446744073709551615", &schema));
+        let m = rejected(compile("u = -18446744073709551615", &schema));
         assert!(m.contains("out of range"), "{tc:?}: {m}");
     }
     let schema = table(vec![ncol("f", TypeCode::F64)]);
@@ -327,7 +319,7 @@ fn a_computed_string_evaluates_to_a_string() {
 fn a_string_rhs_against_an_integer_column_is_rejected() {
     let schema = table(vec![ncol("val", TypeCode::I64)]);
     let concat = BoundExpr::ConcatN { args: vec![BoundExpr::LitInt(1)] };
-    bind_err(classify_set_rhs(&concat, Scope::Existing, 1, &schema));
+    rejected(classify_set_rhs(&concat, Scope::Existing, 1, &schema));
 }
 
 /// A computed value outside its column's range is rejected per row, not
@@ -348,7 +340,7 @@ fn a_computed_value_is_range_checked_and_encodes_natively() {
         let rows = rows_of(&schema, 1, |a, _| {
             a.i64_val(v).null();
         });
-        let m = bind_err(run("dst = src + 0", &schema, rows));
+        let m = rejected(run("dst = src + 0", &schema, rows));
         assert!(m.contains("out of range"), "{tc:?} {v}: {m}");
     }
     for (tc, src_tc, v, want) in [
@@ -408,7 +400,7 @@ fn a_u64_value_past_i64_max_is_out_of_range_for_i64() {
     let rows = rows_of(&schema, 1, |a, _| {
         a.i64_val(0).u64_val(1 << 63);
     });
-    let m = bind_err(run("i = u", &schema, rows));
+    let m = rejected(run("i = u", &schema, rows));
     assert!(m.contains("out of range"), "{m}");
 }
 

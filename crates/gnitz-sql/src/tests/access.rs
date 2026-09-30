@@ -1,8 +1,8 @@
 use super::*;
 use crate::bind::bind_single_table;
 use crate::test_support::{
-    bind_conjunct, bind_where, col, compound_schema_u64_u64, eq_expr, extract_pk_value, idx_metas, idx_metas_flagged,
-    in_list_expr, ncol, parse_expr_sql, pk_schema, two_col, uuid_schema_payload, uuid_schema_pk,
+    bind_conjunct, bind_sql, bind_where, col, compound_schema_u64_u64, eq_expr, extract_pk_value, idx_metas,
+    idx_metas_flagged, in_list_expr, ncol, parse_expr_sql, pk_schema, two_col, uuid_schema_payload, uuid_schema_pk,
 };
 use gnitz_wire::{ColumnDef, PkBuf};
 use sqlparser::ast::Expr;
@@ -15,12 +15,6 @@ fn img(tc: TypeCode, v: i128) -> u128 {
 /// The point `v` over the key list `cols`, `eq` pinning its leading columns.
 fn pt(cols: &[u32], eq: &[u128], v: u128) -> KeyRange {
     KeyRange::point(PkColList::from_slice(cols), eq, v)
-}
-
-/// Bind against `schema` as relation `t` — the alias every qualified reference
-/// in this file writes.
-fn bind1(e: &Expr, schema: &gnitz_core::Schema) -> Result<crate::ir::BoundExpr, crate::error::GnitzSqlError> {
-    bind_single_table(e, schema, "t")
 }
 
 /// `(id U64 pk, a tc, b tc)` — indexable cols a=1, b=2, `b` nullable per arg.
@@ -154,14 +148,11 @@ fn an_equality_packs_its_key_at_the_columns_width() {
 #[test]
 fn double_quoted_uuid_binds_as_column_ref_not_seek() {
     let schema = uuid_schema_payload();
-    let sq = bind1(&parse_expr_sql("uid = '550e8400-e29b-41d4-a716-446655440000'"), &schema).unwrap();
+    let sq = bind_sql("uid = '550e8400-e29b-41d4-a716-446655440000'", &schema).unwrap();
     assert!(eq_of(&sq, &schema).is_some(), "single-quoted UUID is a seek key");
 
-    let err = bind1(
-        &parse_expr_sql("uid = \"550e8400-e29b-41d4-a716-446655440000\""),
-        &schema,
-    )
-    .expect_err("double-quoted token must not bind as a literal");
+    let err = bind_sql("uid = \"550e8400-e29b-41d4-a716-446655440000\"", &schema)
+        .expect_err("double-quoted token must not bind as a literal");
     assert!(matches!(err, crate::GnitzSqlError::Rejected(_)), "got {err:?}");
 }
 
@@ -537,7 +528,7 @@ fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
     assert_eq!(got_insert, schema.opk_key_cols(&[expected]), "extract_pk_value");
 
     // 2. The equality term (bound WHERE pk = literal).
-    let eq = bind1(&eq_expr("id", literal.clone()), &schema).expect("bind eq");
+    let eq = bind_single_table(&eq_expr("id", literal.clone()), &schema, "t").expect("bind eq");
     assert_eq!(
         eq_of(&eq, &schema),
         Some((0, key_image(pk_tc, expected))),
@@ -546,7 +537,7 @@ fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
 
     // 3. The key set — the repeat keeps it an `InList` (a one-item list folds to
     // the `Eq` leg 2 already covers); the dedup collapses it to one key.
-    let in_e = bind1(&in_list_expr("id", vec![literal.clone(), literal]), &schema).expect("bind in");
+    let in_e = bind_single_table(&in_list_expr("id", vec![literal.clone(), literal]), &schema, "t").expect("bind in");
     assert_eq!(set_keys_of(&[in_e], &schema), Some(vec![expected]), "key set");
 }
 
