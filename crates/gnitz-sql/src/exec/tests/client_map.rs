@@ -1,5 +1,5 @@
 use super::*;
-use crate::codec::project_schema::reply_program;
+use crate::project::reply_program;
 use crate::test_support::{col, ncol, schema};
 use gnitz_core::BatchAppender;
 use gnitz_expr::{payload_is_null, payload_string, payload_u64};

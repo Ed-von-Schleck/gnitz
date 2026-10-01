@@ -41,14 +41,12 @@
 use super::bind::{bind_projection, ItemLeaf};
 use super::{col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinType, ProjEntry, RelExpr, TopNKey};
 use crate::agg::default_agg_name;
-use crate::agg::AggFunc;
-use crate::ast_util::{
-    agg_func_from_name, classify_agg_shape, peel_nested, single_fn_name, unknown_function, CallSurface, PlainCall,
-};
+use crate::agg::{agg_func_from_name, AggFunc};
+use crate::ast_util::{classify_agg_shape, peel_nested, single_fn_name, unknown_function, CallSurface, PlainCall};
 use crate::bind::{bind_structural, LeafBinder};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::ir::{BExpr, BinOp};
-use crate::validate::reject_float_key_of;
+use crate::rules::reject_float_key_of;
 use gnitz_wire::{ColType, ColumnDef, TypeCode};
 use sqlparser::ast::{
     Expr, Function, Ident, NamedWindowDefinition, NamedWindowExpr, OrderByExpr, OrderByOptions, Select, WindowFrame,
@@ -511,8 +509,8 @@ impl<L: ItemLeaf> ItemLeaf for WindowLeaf<'_, L> {
     fn project(&self, source: Rc<RelExpr>, items: Vec<ProjEntry>) -> Result<Rc<RelExpr>, GnitzSqlError> {
         self.inner.project(source, items)
     }
-    fn wildcard_cols(&self) -> Option<Vec<&HirCol>> {
-        self.inner.wildcard_cols()
+    fn wildcard_cols(&self, qualifier: Option<&str>) -> Result<Option<Vec<&HirCol>>, GnitzSqlError> {
+        self.inner.wildcard_cols(qualifier)
     }
     fn call_item(
         &self,

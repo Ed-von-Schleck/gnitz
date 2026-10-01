@@ -5,14 +5,12 @@
 //! (`RelExpr` → DBSP circuit) and calls into this one for every filter, map and
 //! projection expression it emits.
 
-use crate::bind::structural::str_func_name;
 use crate::codec::literal::{assign, invalid_literal, place, Compared, Placed};
 use crate::error::GnitzSqlError;
 use crate::ir::{
-    blend_type, decimal_compute_type, operand_ty_pair, operand_tys, temporal_arith_type, BExpr, BinOp, BoundExpr,
-    NumFunc, StrArg, StrFunc, TrimMode,
+    blend_type, check_decimal_scale, decimal_compute_type, operand_ty_pair, operand_tys, temporal_arith_type, BExpr,
+    BinOp, BoundExpr, NumFunc, StrArg, StrFunc, TrimMode,
 };
-use crate::validate::check_decimal_scale;
 use gnitz_core::Schema;
 use gnitz_expr::{
     CalendarOp, CmpOp, ExprBuilder, FloatArithOp, FloatUnaryOp, IntArithOp, IntUnaryOp, LikePattern, LogicalInstr as L,
@@ -414,7 +412,7 @@ impl OpcodeBackend<'_> {
             regs.push(match kind {
                 StrArg::Str | StrArg::StrOr(_) => self.str_operand(a, false)?,
                 StrArg::Int | StrArg::IntOpt => {
-                    self.int_operand(a, || format!("{}: argument {}", str_func_name(f), k + 1))?
+                    self.int_operand(a, || format!("{}: argument {}", f.sql_name(), k + 1))?
                 }
             });
         }

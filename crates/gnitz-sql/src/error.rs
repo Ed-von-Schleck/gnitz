@@ -61,3 +61,12 @@ pub(crate) fn reject_if(present: bool, context: &str, clause: &str) -> Result<()
     }
     Ok(())
 }
+
+/// An ad-hoc SELECT reads one relation; this query derives a new one, which a view
+/// maintains. `construct` names what was detected.
+pub(crate) fn derivation(construct: &str) -> GnitzSqlError {
+    GnitzSqlError::Rejected(format!(
+        "ad-hoc SELECT reads a single relation; this query derives a new one ({construct}).\n\
+         CREATE VIEW <name> AS <your query> — the engine maintains it incrementally — then SELECT from it."
+    ))
+}

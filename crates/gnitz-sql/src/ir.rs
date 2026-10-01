@@ -198,6 +198,26 @@ impl StrFunc {
         }
     }
 
+    /// The SQL spelling an error names this function by — one of the names the
+    /// binder accepts for it.
+    pub(crate) fn sql_name(self) -> &'static str {
+        match self {
+            StrFunc::Upper => "UPPER",
+            StrFunc::Lower => "LOWER",
+            StrFunc::LenBytes => "OCTET_LENGTH",
+            StrFunc::LenChars => "LENGTH",
+            StrFunc::Reverse => "REVERSE",
+            StrFunc::Left => "LEFT",
+            StrFunc::Right => "RIGHT",
+            StrFunc::Pos => "STRPOS",
+            StrFunc::Replace => "REPLACE",
+            StrFunc::Lpad => "LPAD",
+            StrFunc::Rpad => "RPAD",
+            StrFunc::SplitPart => "SPLIT_PART",
+            StrFunc::Substr => "SUBSTRING",
+        }
+    }
+
     /// The argument classes in call order — the one statement of each
     /// function's arity, which the binder sizes the list by and lowering reads
     /// the operands through.
@@ -349,6 +369,17 @@ pub(crate) fn decimal_compute_type(op: BinOp, lt: ColType, rt: ColType) -> ColTy
         BinOp::Mul => ColType::decimal(lt.scale.saturating_add(rt.scale)),
         _ => blend,
     }
+}
+
+/// A scale a DECIMAL register can hold: past `MAX_DECIMAL_SCALE`, `10^scale`
+/// overflows `i64`.
+pub(crate) fn check_decimal_scale(scale: u8) -> Result<(), crate::error::GnitzSqlError> {
+    if scale > MAX_DECIMAL_SCALE {
+        return Err(crate::error::GnitzSqlError::Rejected(format!(
+            "DECIMAL scale {scale} exceeds {MAX_DECIMAL_SCALE}; CAST an operand to a narrower scale"
+        )));
+    }
+    Ok(())
 }
 
 /// The types of a node's operands as it combines them: each its own, except a

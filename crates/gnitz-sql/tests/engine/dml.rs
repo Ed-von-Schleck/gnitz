@@ -232,3 +232,44 @@ fn update_and_delete_in_a_transaction_match_committed_and_buffered_rows() {
         assert_eq!(db.rows(&sql, &["id"]), [[id, 1]], "{sql}");
     }
 }
+
+/// An ORDER BY key over a CTE names the CTE's column, whatever the source calls it.
+#[test]
+fn an_order_by_over_a_cte_names_the_cte_column() {
+    let mut db = Db::boot(4);
+    db.exec("CREATE TABLE t (id BIGINT PRIMARY KEY, w BIGINT NOT NULL)");
+    db.insert("t", &["id", "w"], &[vec![1, 30], vec![2, 20], vec![3, 10]]);
+    // x.id is t.w and x.w is t.id. The smallest x.id is 10, on the row whose x.w is 3.
+    for sql in [
+        "WITH x AS (SELECT w AS id, id AS w FROM t) SELECT w FROM x ORDER BY id LIMIT 1",
+        "WITH x AS (SELECT w AS id, id AS w FROM t) SELECT * FROM x ORDER BY x.w DESC LIMIT 1",
+    ] {
+        assert_eq!(db.rows(sql, &["w"]), at_weight_one(&[vec![3]]), "`{sql}`");
+    }
+}
+
+/// An ad-hoc read through CTEs returns what the flat query returns.
+#[test]
+fn a_read_through_ctes_matches_the_flat_query() {
+    let mut db = Db::boot(4);
+    db.exec("CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT NOT NULL, v BIGINT)");
+    let rows: Vec<Vec<i64>> = (1..=200).map(|i| vec![i, i % 7, (i * 37) % 101]).collect();
+    db.insert("t", &["id", "g", "v"], &rows);
+    for (cte, flat, cols) in [
+        ("WITH x AS (SELECT g, COUNT(*) AS n, SUM(v) AS s FROM t GROUP BY g) SELECT g, n, s FROM x",
+         "SELECT g, COUNT(*) AS n, SUM(v) AS s FROM t GROUP BY g", vec!["g", "n", "s"]),
+        ("WITH x AS (SELECT g, SUM(v) AS s FROM t WHERE id > 30 GROUP BY g) SELECT g, s * 2 AS d FROM x WHERE s > 1150",
+         "SELECT g, SUM(v) * 2 AS d FROM t WHERE id > 30 GROUP BY g HAVING SUM(v) > 1150", vec!["g", "d"]),
+        ("WITH x AS (SELECT id, v + 1 AS q, g FROM t WHERE g < 5), y AS (SELECT q * 2 AS r, g FROM x WHERE id > 10) SELECT g, SUM(r) AS s FROM y GROUP BY g",
+         "SELECT g, SUM((v + 1) * 2) AS s FROM t WHERE g < 5 AND id > 10 GROUP BY g", vec!["g", "s"]),
+        ("WITH x AS (SELECT v AS id, id AS v FROM t) SELECT v FROM x ORDER BY id DESC, v LIMIT 5",
+         "SELECT id AS v FROM t ORDER BY t.v DESC, t.id LIMIT 5", vec!["v"]),
+        ("WITH x AS (SELECT 40 + 2 AS a) SELECT a + 1 AS b FROM x", "SELECT 43 AS b", vec!["b"]),
+        ("WITH x AS (SELECT * FROM t) SELECT DISTINCT x.g FROM x WHERE x.v > 50", "SELECT DISTINCT g FROM t WHERE v > 50", vec!["g"]),
+        ("WITH x AS (SELECT * FROM t) SELECT x.* FROM x WHERE id < 4", "SELECT * FROM t WHERE id < 4", vec!["id", "g", "v"]),
+    ] {
+        let (c, f) = (db.rows(cte, &cols), db.rows(flat, &cols));
+        assert!(!f.is_empty(), "`{flat}` selects nothing");
+        assert_eq!(c, f, "`{cte}`");
+    }
+}

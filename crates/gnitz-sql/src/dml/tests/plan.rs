@@ -73,7 +73,19 @@ fn rows_reply_of(sql: &str, desc: &Arc<RelDescriptor>) -> RowsReply {
     let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() else {
         panic!("`{sql}` is not a plain SELECT");
     };
-    rows_reply(&sel.projection, q.order_by.as_ref(), desc, "t").unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
+    let cat = crate::test_support::catalog(vec![("t", Arc::clone(desc))]);
+    let keys = crate::tail::parse_order_by(q.order_by.as_ref()).unwrap();
+    let exprs = crate::tail::order_exprs(&keys);
+    let read =
+        crate::hir::bind_adhoc_read(&cat, &q, sel, "SELECT", &exprs).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+    let crate::hir::AdhocRead::Relation {
+        shape: crate::hir::AdhocShape::Rows(rows),
+        ..
+    } = read
+    else {
+        panic!("`{sql}` is not a rows read");
+    };
+    rows_reply(rows, &keys, desc).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
 }
 
 /// A projection reproducing the relation replies in its layout with no program, its

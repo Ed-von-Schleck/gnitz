@@ -1,16 +1,14 @@
 //! `ALTER TABLE`: rename table/view/column, ADD/DROP COLUMN, DROP NOT NULL,
 //! ADD/DROP CONSTRAINT (mapped to the CREATE/DROP INDEX paths). `ALTER VIEW … AS`
-//! lives in `crate::hir::create` (it recompiles a query). Every rule that reads
+//! lives in `ddl::view` (it recompiles a query). Every rule that reads
 //! the catalog is the engine precheck's.
 
+use super::guard::{reject_unhonored_column_options, reject_unhonored_unique_fields, ColumnOptionSite};
 use crate::ast_util::extract_object_name;
 use crate::bind::{find_unique_column, require_column};
 use crate::error::{missing_relation, reject_if, unsupported_clause, GnitzSqlError};
+use crate::rules::{require_class, validate_user_name, ClassWant};
 use crate::types::column_def;
-use crate::validate::{
-    reject_unhonored_alter_table_clauses, reject_unhonored_column_options, reject_unhonored_unique_fields,
-    require_class, validate_user_name, ClassWant, ColumnOptionSite,
-};
 use crate::SqlResult;
 use gnitz_core::GnitzClient;
 use sqlparser::ast::{
@@ -44,6 +42,37 @@ enum Action<'a> {
         name: &'a str,
         if_exists: bool,
     },
+}
+
+/// Reject every `ALTER TABLE` envelope clause gnitz does not honor: `ONLY`
+/// (silently scopes out partition children), a Hive `SET LOCATION`, `ON CLUSTER`,
+/// and a non-`None` `table_type` (Iceberg/Dynamic — a different storage engine).
+/// The operation itself is [`parse`]'s. Exhaustive destructure (no `..`):
+/// a future sqlparser field stops the build until it is classified.
+fn reject_unhonored_alter_table_clauses(alter: &sqlparser::ast::AlterTable) -> Result<(), GnitzSqlError> {
+    const CTX: &str = "ALTER TABLE";
+    let sqlparser::ast::AlterTable {
+        // Consumed by the dispatcher.
+        name: _,
+        operations: _,
+        if_exists: _,
+        // Inert: the statement-terminator token.
+        end_token: _,
+        // Rejected.
+        only,
+        location,
+        on_cluster,
+        table_type,
+    } = alter;
+    reject_if(*only, CTX, "ONLY")?;
+    reject_if(location.is_some(), CTX, "SET LOCATION")?;
+    reject_if(on_cluster.is_some(), CTX, "ON CLUSTER")?;
+    reject_if(
+        table_type.is_some(),
+        CTX,
+        "a non-default table type (Iceberg/Dynamic/External)",
+    )?;
+    Ok(())
 }
 
 pub(crate) fn execute_alter_table(

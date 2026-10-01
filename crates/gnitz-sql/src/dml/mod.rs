@@ -5,7 +5,6 @@
 //! Transactions need no special casing in the verbs: the client buffers every
 //! write while one is open, and a read-modify-write reads through that buffer.
 
-mod cte;
 mod explain;
 mod insert;
 mod mutate;
@@ -20,12 +19,3 @@ pub(crate) use mutate::{execute_mutation, plan_delete, plan_update};
 #[cfg(test)]
 pub(crate) use select::ReadPlan;
 pub(crate) use select::{execute_select, plan_read};
-
-/// An ad-hoc SELECT reads one relation; this query derives a new one, which a view
-/// maintains. `construct` names what was detected.
-fn derivation(construct: &str) -> crate::error::GnitzSqlError {
-    crate::error::GnitzSqlError::Rejected(format!(
-        "ad-hoc SELECT reads a single relation; this query derives a new one ({construct}).\n\
-         CREATE VIEW <name> AS <your query> — the engine maintains it incrementally — then SELECT from it."
-    ))
-}

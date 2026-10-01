@@ -1,14 +1,13 @@
-//! CREATE / ALTER VIEW front door: validate the query envelope, then drive the
-//! HIR pipeline — the CTE phase (`hir::bind::bind_ctes`) and then
-//! `bind_and_lower` of the body — into a view bundle committed atomically.
+//! CREATE / ALTER VIEW: decode the statement's own clauses and options, compile
+//! the body (`hir::bind_and_lower`) into a view bundle, and commit it atomically.
 
+use super::guard::kv_options;
+use crate::ast_util::extract_object_name;
 use crate::bind::Catalog;
 use crate::error::{reject_if, GnitzSqlError};
-use crate::hir::bind::ViewBody;
-use crate::validate::{
-    kv_options, reject_unhonored_create_view_clauses, reject_unhonored_query_clauses, require_class, ClassWant,
-    QueryEnvelope,
-};
+use crate::hir::ViewBody;
+use crate::rules::{require_class, ClassWant};
+use crate::validate::{reject_unhonored_query_clauses, QueryEnvelope};
 use crate::SqlResult;
 use gnitz_core::{GnitzClient, ViewBundle};
 use gnitz_wire::{RelClass, ViewProps};
@@ -69,6 +68,56 @@ fn parse_size(option: &str, text: &str) -> Result<u64, GnitzSqlError> {
     }
 }
 
+/// Reject every `CREATE VIEW` clause the planner does not consume. Exhaustive
+/// destructure (no `..`): a future `sqlparser` field stops the build.
+fn reject_unhonored_create_view_clauses(cv: &sqlparser::ast::CreateView) -> Result<(), GnitzSqlError> {
+    const CTX: &str = "CREATE VIEW";
+    let sqlparser::ast::CreateView {
+        name: _,
+        query: _,
+        options: _,
+        materialized: _, // accepted: names gnitz's real behavior
+        // Consumed here (they are mutually exclusive) and by the planner's
+        // replace / skip routes.
+        or_replace,
+        if_not_exists,
+        name_before_not_exists: _, // positional flag for if_not_exists
+        with_no_schema_binding: _, // no-op optimizer hint
+        secure: _,                 // Snowflake SECURE modifier: no result impact
+        copy_grants: _,            // Snowflake COPY GRANTS: no result impact
+        columns,                   // consumed: positional output aliases, checked for decorations below
+        params: _,                 // cannot populate under GenericDialect
+        // Rejected: each would be silently dropped.
+        cluster_by,
+        comment,
+        or_alter,
+        temporary,
+        to,
+    } = cv;
+    reject_if(*or_alter, CTX, "OR ALTER (spell it OR REPLACE)")?;
+    reject_if(*temporary, CTX, "TEMPORARY")?;
+    reject_if(to.is_some(), CTX, "TO (target table)")?;
+    // `CREATE TABLE` honours CLUSTER BY; a view would silently build unclustered.
+    reject_if(!cluster_by.is_empty(), CTX, "CLUSTER BY")?;
+    reject_if(comment.is_some(), CTX, "COMMENT")?;
+    // A view column alias names a column and nothing else: a declared type or a
+    // column option would have to be checked against the body's derived type or
+    // silently ignored, and gnitz does neither.
+    for col in columns {
+        let sqlparser::ast::ViewColumnDef { name: _, data_type, options } = col;
+        reject_if(data_type.is_some(), CTX, "a type on an output column alias")?;
+        reject_if(options.is_some(), CTX, "an option list on an output column alias")?;
+    }
+    // `sqlparser` parses the pair; no dialect defines it.
+    if *or_replace && *if_not_exists {
+        return Err(GnitzSqlError::Rejected(format!(
+            "{CTX}: OR REPLACE and IF NOT EXISTS ask for opposite outcomes — replace what \
+             is there, or leave what is there alone. Write one of them."
+        )));
+    }
+    Ok(())
+}
+
 /// A planned view: its segment bundle, and the view it supersedes.
 pub(crate) struct PlannedChain {
     pub(crate) name: String,
@@ -81,7 +130,7 @@ pub(crate) struct PlannedChain {
 /// Plan a `CREATE VIEW`; `None` when `IF NOT EXISTS` finds the name taken.
 pub(crate) fn plan_create_view(cv: &CreateView, cat: &Catalog<'_>) -> Result<Option<PlannedChain>, GnitzSqlError> {
     reject_unhonored_create_view_clauses(cv)?;
-    let view_name = crate::ast_util::extract_object_name(&cv.name, cat.schema_name(), "CREATE VIEW")?;
+    let view_name = extract_object_name(&cv.name, cat.schema_name(), "CREATE VIEW")?;
 
     // Each clause tests the name alone: a view's catalog rows hold its circuit, not its text.
     let replacing = if cv.if_not_exists {
@@ -126,7 +175,7 @@ pub(crate) fn plan_alter_view(
 ) -> Result<PlannedChain, GnitzSqlError> {
     // Only `CREATE OR REPLACE VIEW` states a view's options.
     reject_if(!with_options.is_empty(), "ALTER VIEW", "WITH options")?;
-    let view_name = crate::ast_util::extract_object_name(name, cat.schema_name(), "ALTER VIEW")?;
+    let view_name = extract_object_name(name, cat.schema_name(), "ALTER VIEW")?;
     let old_vid = resolve_view_id(cat, &view_name)?;
     let view = ViewBody {
         stmt: "ALTER VIEW",
@@ -183,5 +232,5 @@ fn resolve_view_id(cat: &Catalog<'_>, name: &str) -> Result<u64, GnitzSqlError> 
 }
 
 #[cfg(test)]
-#[path = "tests/create.rs"]
+#[path = "tests/view.rs"]
 mod tests;

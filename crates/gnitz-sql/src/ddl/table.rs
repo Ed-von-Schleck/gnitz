@@ -1,16 +1,18 @@
 //! DDL: CREATE TABLE (with FK resolution, UNIQUE, CLUSTER BY, REPLICATED), DROP,
-//! and CREATE INDEX. The compile side's only non-view surface.
+//! and CREATE INDEX.
 
+use super::guard::{
+    kv_options, reject_index_type_and_options, reject_unhonored_column_options, reject_unhonored_fk_fields,
+    reject_unhonored_pk_fields, reject_unhonored_unique_fields, ColumnOptionSite,
+};
 use crate::ast_util::{extract_index_name, extract_object_name, index_column_ident, simple_ident_expr};
 use crate::bind::{find_unique_column, Catalog};
-use crate::error::GnitzSqlError;
-use crate::types::column_def;
-use crate::validate::{
-    canonical_user_name, kv_options, non_key_eligible_error, reject_column_overflow, reject_duplicate_names,
-    reject_repeated_object, reject_unbuildable_index_key, reject_unhonored_column_options,
-    reject_unhonored_create_index_clauses, reject_unhonored_create_table_clauses, reject_unhonored_table_constraints,
-    require_class, ClassWant, ColumnOptionSite,
+use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
+use crate::rules::{
+    canonical_user_name, non_key_eligible_error, reject_column_overflow, reject_duplicate_names,
+    reject_repeated_object, reject_unbuildable_index_key, require_class, ClassWant,
 };
+use crate::types::column_def;
 use crate::SqlResult;
 use gnitz_core::{FkTarget, GnitzClient, InlineForeignKey, InlineUniqueIndex, Schema};
 use gnitz_expr::SchemaFacts;
@@ -471,6 +473,116 @@ pub(crate) struct TablePlan {
     pub(crate) unique_indexes: Vec<InlineUniqueIndex>,
 }
 
+/// Reject every `CREATE TABLE` clause the planner does not consume. Exhaustive
+/// destructure (no `..`): a future `sqlparser` field stops the build.
+fn reject_unhonored_create_table_clauses(create: &sqlparser::ast::CreateTable) -> Result<(), GnitzSqlError> {
+    const CTX: &str = "CREATE TABLE";
+    let sqlparser::ast::CreateTable {
+        // Consumed (column/constraint contents further guarded by the column-option and table-constraint guards).
+        name: _,
+        columns: _,
+        constraints: _,
+        cluster_by: _,
+        table_options: _,
+        // Consumed: `plan_create_table`'s skip route.
+        if_not_exists: _,
+        // Rejected: each silently changes the result if dropped.
+        or_replace,
+        temporary,
+        global,
+        query,
+        like,
+        clone,
+        inherits,
+        on_commit,
+        primary_key,
+        partition_of,
+        for_values,
+        // No gnitz-honorable semantics — storage/engine/vendor metadata accepted as no-ops.
+        external: _,
+        dynamic: _,
+        transient: _,
+        volatile: _,
+        iceberg: _,
+        snapshot: _,
+        hive_distribution: _,
+        hive_formats: _,
+        file_format: _,
+        location: _,
+        version: _,
+        without_rowid: _,
+        comment: _,
+        on_cluster: _,
+        order_by: _,
+        partition_by: _,
+        clustered_by: _,
+        strict: _,
+        copy_grants: _,
+        enable_schema_evolution: _,
+        change_tracking: _,
+        data_retention_time_in_days: _,
+        max_data_extension_time_in_days: _,
+        default_ddl_collation: _,
+        with_aggregation_policy: _,
+        with_row_access_policy: _,
+        with_storage_lifecycle_policy: _,
+        with_tags: _,
+        external_volume: _,
+        base_location: _,
+        catalog: _,
+        catalog_sync: _,
+        storage_serialization_policy: _,
+        target_lag: _,
+        warehouse: _,
+        refresh_mode: _,
+        initialize: _,
+        require_user: _,
+        diststyle: _,
+        distkey: _,
+        sortkey: _,
+        backup: _,
+    } = create;
+
+    reject_if(query.is_some(), CTX, "AS SELECT (CTAS)")?;
+    reject_if(*or_replace, CTX, "OR REPLACE (it would discard the table's rows)")?;
+    reject_if(*temporary, CTX, "TEMPORARY")?;
+    reject_if(global.is_some(), CTX, "GLOBAL/LOCAL")?;
+    reject_if(like.is_some(), CTX, "LIKE")?;
+    reject_if(clone.is_some(), CTX, "CLONE")?;
+    reject_if(inherits.is_some(), CTX, "INHERITS")?;
+    reject_if(on_commit.is_some(), CTX, "ON COMMIT")?;
+    reject_if(primary_key.is_some(), CTX, "PRIMARY KEY expression")?;
+    reject_if(partition_of.is_some() || for_values.is_some(), CTX, "PARTITION OF")?;
+    Ok(())
+}
+
+/// Reject every table constraint CREATE TABLE does not honor. Honored: PRIMARY KEY, UNIQUE,
+/// FOREIGN KEY target — each honored variant is descended into
+/// (`reject_unhonored_{pk,unique,fk}_fields`) so an unimplemented field inside it (a referential
+/// action, DEFERRABLE, NULLS NOT DISTINCT, …) is rejected too. `CHECK`, inline `INDEX`,
+/// `FULLTEXT`/`SPATIAL` indexes, and the Postgres `{PRIMARY KEY,UNIQUE} USING INDEX` promotions (no
+/// pre-existing index at CREATE TABLE) are rejected. Exhaustive over all 8 `TableConstraint`
+/// variants (no `_`).
+fn reject_unhonored_table_constraints(constraints: &[sqlparser::ast::TableConstraint]) -> Result<(), GnitzSqlError> {
+    const CTX: &str = "table constraint";
+    use sqlparser::ast::TableConstraint as C;
+    for c in constraints {
+        match c {
+            // Consumed, but only the column list / constraint name — descend so an
+            // unimplemented field is rejected, not silently dropped.
+            C::PrimaryKey(pk) => reject_unhonored_pk_fields(pk, CTX)?,
+            C::Unique(u) => reject_unhonored_unique_fields(u, CTX)?,
+            C::ForeignKey(fk) => reject_unhonored_fk_fields(fk, CTX)?,
+            C::Check(_) => return Err(unsupported_clause(CTX, "CHECK constraint")),
+            C::Index(_) => return Err(unsupported_clause(CTX, "INDEX in table definition")),
+            C::FulltextOrSpatial(_) => return Err(unsupported_clause(CTX, "FULLTEXT/SPATIAL index")),
+            C::PrimaryKeyUsingIndex(_) => return Err(unsupported_clause(CTX, "PRIMARY KEY USING INDEX")),
+            C::UniqueUsingIndex(_) => return Err(unsupported_clause(CTX, "UNIQUE USING INDEX")),
+        }
+    }
+    Ok(())
+}
+
 /// Plan a `CREATE TABLE` into the bundle its commit writes; `None` when
 /// `IF NOT EXISTS` finds the name taken. [`collect_declarations`] reads the statement; everything below it
 /// resolves, admits and names.
@@ -643,7 +755,7 @@ pub(crate) fn execute_drop(
 ) -> Result<SqlResult, GnitzSqlError> {
     // The kind is the statement's, not each name's, so it is settled once.
     if !matches!(object_type, ObjectType::Table | ObjectType::View | ObjectType::Index) {
-        return Err(crate::error::unsupported_clause("DROP", &object_type.to_string()));
+        return Err(unsupported_clause("DROP", &object_type.to_string()));
     }
     let mut targets: Vec<String> = Vec::with_capacity(names.len());
     for obj_name in names {
@@ -706,6 +818,38 @@ pub(crate) struct IndexRequest<'a> {
     pub(crate) columns: &'a [sqlparser::ast::IndexColumn],
     pub(crate) explicit_name: Option<String>,
     pub(crate) site: IndexSite,
+}
+
+/// Reject every `CreateIndex` field `execute_create_index` does not consume (`name`, `table_name`,
+/// `columns`, `unique`). `using` is accepted only for the BTree default (gnitz's index is ordered /
+/// range-scannable); any other type, plus `predicate` (partial index → full index), `concurrently`
+/// (no non-blocking-build guarantee), `include`/`nulls_distinct`/`with` (silent default semantics)
+/// are rejected. `if_not_exists` is consumed (the dispatcher's skip route).
+fn reject_unhonored_create_index_clauses(ci: &sqlparser::ast::CreateIndex) -> Result<(), GnitzSqlError> {
+    const CTX: &str = "CREATE INDEX";
+    let sqlparser::ast::CreateIndex {
+        name: _,
+        table_name: _,
+        columns: _,
+        unique: _,
+        if_not_exists: _, // consumed: the dispatcher's skip route
+        using,
+        concurrently,
+        include,
+        nulls_distinct,
+        with,
+        predicate,
+        index_options,
+        alter_options,
+    } = ci;
+    reject_if(predicate.is_some(), CTX, "WHERE (partial index)")?;
+    reject_if(!alter_options.is_empty(), CTX, "ALTER options (ALGORITHM / LOCK)")?;
+    reject_index_type_and_options(using, index_options, CTX)?;
+    reject_if(*concurrently, CTX, "CONCURRENTLY")?;
+    reject_if(!include.is_empty(), CTX, "INCLUDE (covering columns)")?;
+    reject_if(nulls_distinct.is_some(), CTX, "NULLS [NOT] DISTINCT")?;
+    reject_if(!with.is_empty(), CTX, "WITH (storage parameters)")?;
+    Ok(())
 }
 
 pub(crate) fn execute_create_index(

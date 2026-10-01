@@ -598,16 +598,6 @@ fn calendar_field(name: &str) -> Option<CalendarOp> {
     }
 }
 
-/// The SQL spelling of a string function, read back out of [`SCALAR_CALLS`] —
-/// its first entry, for the names with aliases — so an error names the
-/// function as the parser accepts it. The `AGG_NAMES` / `agg_func_name` shape.
-pub(crate) fn str_func_name(f: StrFunc) -> &'static str {
-    SCALAR_CALLS
-        .iter()
-        .find_map(|&(n, c)| matches!(c, Call::Str(g) if g == f).then_some(n))
-        .expect("every StrFunc has a spelling in SCALAR_CALLS")
-}
-
 fn scalar_call(f: &Function) -> Option<(&'static str, Call)> {
     let n = single_fn_name(f)?;
     SCALAR_CALLS

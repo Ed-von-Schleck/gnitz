@@ -1,7 +1,7 @@
 use super::*;
-use crate::hir::bind_and_lower_fold;
+use crate::hir::{bind_adhoc_read, AdhocShape};
 use crate::test_support::Cell::{self, Int, Null, Str, F64};
-use crate::test_support::{col, ncol, parse_query, rows_of, table};
+use crate::test_support::{catalog, col, ncol, parse_query, rows_of, table};
 use gnitz_core::{BatchAppender, PkColumn, RelDescriptor};
 use gnitz_wire::{global_group_key, TypeCode};
 
@@ -28,10 +28,15 @@ fn t() -> Arc<RelDescriptor> {
 
 /// The finisher the ad-hoc read path plans for `sql` over `rel`, bound as `t`.
 fn plan(sql: &str, rel: &Arc<RelDescriptor>) -> FoldFinish {
-    let sqlparser::ast::SetExpr::Select(select) = *parse_query(sql).body else {
+    let query = parse_query(sql);
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
         panic!("{sql}: not a SELECT");
     };
-    let (pieces, _) = bind_and_lower_fold(&select, rel, "t", &[]).unwrap().expect("a fold");
+    let cat = catalog(vec![("t", Arc::clone(rel))]);
+    let read = bind_adhoc_read(&cat, &query, select, "SELECT", &[]).unwrap();
+    let crate::hir::AdhocRead::Relation { shape: AdhocShape::Fold(pieces, _), .. } = read else {
+        panic!("{sql}: not a fold");
+    };
     FoldFinish::new(
         pieces.partial_schema,
         pieces.agg.aggs.iter().map(|d| d.agg_op),

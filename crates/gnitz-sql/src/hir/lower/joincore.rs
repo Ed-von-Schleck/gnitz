@@ -3,7 +3,7 @@
 use super::super::{JoinClass, JoinType};
 use super::join::JoinSide;
 use crate::error::GnitzSqlError;
-use crate::validate::reject_column_overflow;
+use crate::rules::reject_column_overflow;
 
 use gnitz_core::Schema;
 use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc, JoinKind};

@@ -11,7 +11,7 @@ use super::{emit_filter, materialize, project_front, Demand, EmitPieces, ViewCha
 use crate::error::GnitzSqlError;
 use crate::hir::physical::Frame;
 use crate::ir::BExpr;
-use crate::validate::reject_pk_list_arity;
+use crate::rules::reject_pk_list_arity;
 
 use gnitz_wire::JoinKind;
 use gnitz_wire::{Circuit, ColumnDef, NodeId, TypeCode};

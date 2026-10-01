@@ -255,7 +255,7 @@ fn unary_numeric_functions_bind_to_their_numfunc() {
 }
 
 /// Every string function name reaches its IR node, whichever spelling is
-/// written, and the spelling `str_func_name` reads back binds to the same node.
+/// written, and the spelling `StrFunc::sql_name` gives binds to the same node.
 /// `LENGTH` and its SQL-standard aliases must land on the *character* measure
 /// and `OCTET_LENGTH` on the byte one — swapping them is invisible until a
 /// multibyte value shows up.
@@ -284,7 +284,7 @@ fn string_function_names_bind_to_their_function() {
             "{src}: {bound:?}"
         );
         let args = &src[src.find('(').unwrap()..];
-        assert_eq!(b(&format!("{}{args}", str_func_name(want))), bound, "{src}");
+        assert_eq!(b(&format!("{}{args}", want.sql_name())), bound, "{src}");
     }
 }
 
@@ -498,7 +498,7 @@ fn every_structurally_bound_name_is_unique() {
             "'{name}' twice"
         );
         assert!(
-            crate::ast_util::agg_func_from_name(name).is_none(),
+            crate::agg::agg_func_from_name(name).is_none(),
             "'{name}' is an aggregate"
         );
         assert!(

@@ -1,14 +1,15 @@
 //! HIR → fold lowering: the ad-hoc read's reduce — or `SELECT DISTINCT`, a fold
 //! with no aggregate — as layout for a stateless fold the client finishes. It
 //! shares `lower::reduce`'s rules, output key included, and builds no evaluator.
-//! A DISTINCT the binder dropped, over rows already a set, lowers to no fold.
+//! Its input is the flat body [`super::read`] composes: the reduce, or the
+//! DISTINCT's projection, directly over the relation read.
 
 use super::super::physical::{self, Frame};
 use super::super::{as_col, split_filter, AggCol, ColId, HirExpr, ProjEntry, RelExpr};
 use super::{keyed_frame, resolve_reduce_specs, ReduceSpecs};
-use crate::codec::project_schema::{compute_map, payload_program};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr};
+use crate::project::{compute_map, payload_program};
 use gnitz_core::Schema;
 use gnitz_wire::ColumnDef;
 use gnitz_wire::{AggReadSpec, ComputeMap};
@@ -52,11 +53,9 @@ fn source_frame(base: &RelExpr) -> Result<Frame, GnitzSqlError> {
     Ok(Frame::scan(desc, cols))
 }
 
-/// Lower a bound ad-hoc grouped or `SELECT DISTINCT` body to its fold pieces; `None`
-/// for a DISTINCT the binder dropped.
-pub(crate) fn lower_fold(rel: &RelExpr) -> Result<Option<FoldPieces>, GnitzSqlError> {
+/// Lower a flat ad-hoc grouped or `SELECT DISTINCT` body to its fold pieces.
+pub(crate) fn lower_fold(rel: &RelExpr) -> Result<FoldPieces, GnitzSqlError> {
     match rel {
-        RelExpr::Project { input, .. } if matches!(input.as_ref(), RelExpr::Get { .. }) => Ok(None),
         RelExpr::Distinct { input } => {
             let RelExpr::Project { input: base, items } = input.as_ref() else {
                 return Err(GnitzSqlError::Internal(
@@ -79,7 +78,7 @@ pub(crate) fn lower_fold(rel: &RelExpr) -> Result<Option<FoldPieces>, GnitzSqlEr
                     out: e.out.clone(),
                 })
                 .collect();
-            fold(base, pre, &group_cols, &[], &[], &finalize).map(Some)
+            fold(base, pre, &group_cols, &[], &[], &finalize)
         }
         RelExpr::Project { input, items } => {
             // HAVING is a Filter between the projection and the reduce.
@@ -91,7 +90,7 @@ pub(crate) fn lower_fold(rel: &RelExpr) -> Result<Option<FoldPieces>, GnitzSqlEr
                 RelExpr::Project { input, items } => (Some(items.as_slice()), input),
                 _ => (None, input),
             };
-            fold(base, pre, group_cols, aggs, having, items).map(Some)
+            fold(base, pre, group_cols, aggs, having, items)
         }
         _ => Err(GnitzSqlError::Internal(
             "ad-hoc grouped body is not a projection".into(),

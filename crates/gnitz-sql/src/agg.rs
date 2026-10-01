@@ -1,7 +1,6 @@
-//! The per-aggregate rules the binder, both reduce lowerings and the client
-//! finisher share. A sibling of `ir`, so `exec` reaches it without `hir`.
+//! The per-aggregate rules the binder, both reduce lowerings and the window
+//! desugar share, and the one SQL-name ↔ aggregate map. It reads no SQL text.
 
-use crate::ast_util::agg_func_name;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
 use gnitz_core::Schema;
@@ -15,6 +14,34 @@ pub(crate) enum AggFunc {
     Min,
     Max,
     Avg,
+}
+
+/// The one SQL-name ↔ aggregate map, read in both directions by
+/// [`agg_func_from_name`] and [`agg_func_name`] — a bijection, so a name can
+/// never drift between the two directions.
+const AGG_NAMES: [(&str, AggFunc); 5] = [
+    ("count", AggFunc::Count),
+    ("sum", AggFunc::Sum),
+    ("min", AggFunc::Min),
+    ("max", AggFunc::Max),
+    ("avg", AggFunc::Avg),
+];
+
+/// The `AggFunc` a function name denotes (`count`, `sum`, `min`, `max`, `avg`),
+/// matched case-insensitively without allocating; `None` for any other name.
+pub(crate) fn agg_func_from_name(name: &str) -> Option<AggFunc> {
+    AGG_NAMES
+        .into_iter()
+        .find_map(|(n, f)| name.eq_ignore_ascii_case(n).then_some(f))
+}
+
+/// The canonical lowercase SQL name of an aggregate — [`agg_func_from_name`]
+/// inverted over the same table.
+pub(crate) fn agg_func_name(f: AggFunc) -> &'static str {
+    AGG_NAMES
+        .iter()
+        .find_map(|&(n, g)| (g == f).then_some(n))
+        .expect("every AggFunc spelling is in AGG_NAMES")
 }
 
 /// An aggregate's physical value op, and the count op its null-ness is read off

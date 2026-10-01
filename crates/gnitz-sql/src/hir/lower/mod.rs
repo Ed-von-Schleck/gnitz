@@ -1,6 +1,7 @@
 //! HIR → circuit lowering: one circuit per combine-class node and the linear
-//! nodes around it, with nested combine subtrees cut to hidden segments. [`fold`]
-//! lowers the same `Reduce` to an ad-hoc read's fold sink instead.
+//! nodes around it, with nested combine subtrees cut to hidden segments. [`read`]
+//! lowers an ad-hoc SELECT to one read of one relation instead, its `Reduce`
+//! through [`fold`] to the fold sink.
 //!
 //! The rules every shell obeys, one home each:
 //!
@@ -14,6 +15,7 @@ mod chain;
 pub(crate) mod fold;
 mod join;
 mod joincore;
+pub(crate) mod read;
 mod reduce;
 mod setop;
 mod spine;
@@ -22,9 +24,9 @@ mod topn;
 use super::physical::{self, Frame, Rename};
 use super::{col_by_id, split_filter, AggCol, ColId, HirCol, HirExpr, ProjEntry, RelExpr};
 use crate::agg::group_pk_def;
-use crate::codec::project_schema::{compute_map, payload_program, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
+use crate::project::{compute_map, payload_program, ProjItem};
 pub(crate) use chain::{EmitPieces, ViewChain};
 use gnitz_core::{RelDescriptor, Schema, ViewBundle};
 use gnitz_expr::SchemaFacts;

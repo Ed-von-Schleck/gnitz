@@ -15,9 +15,9 @@ mod plan_view_window;
 use std::cell::RefCell;
 
 use crate::bind::Catalog;
+use crate::ddl::{plan_alter_view, plan_create_view, PlannedChain};
 use crate::dml::ReadPlan;
 use crate::error::GnitzSqlError;
-use crate::hir::{plan_alter_view, plan_create_view, PlannedChain};
 use crate::test_support::*;
 use gnitz_core::PlannedView;
 use gnitz_wire::{Circuit, OpNode, RelClass, TypeCode};

@@ -2,13 +2,13 @@
 //! more surfaces must agree on it, so its doc states the rule it enforces —
 //! never who calls it, which rots the moment a caller moves.
 
-use crate::agg::AggFunc;
+use crate::agg::{agg_func_from_name, agg_func_name, AggFunc};
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::ir::{BExpr, NumLit};
-use crate::validate::{first_duplicate, validate_user_name};
+use crate::rules::{first_duplicate, validate_user_name};
 use gnitz_wire::decimal::decimal_of_number_text;
 use gnitz_wire::ColumnDef;
-use sqlparser::ast::{ExcludeSelectItem, Expr, RenameSelectItem, SelectItem, Value, WildcardAdditionalOptions};
+use sqlparser::ast::{ExcludeSelectItem, RenameSelectItem, SelectItem, Value, WildcardAdditionalOptions};
 
 /// The identifier of an `ObjectName`'s last part, or `None` when that part is
 /// not a plain identifier.
@@ -135,21 +135,6 @@ pub(crate) fn bind_literal<R>(v: &Value) -> Result<BExpr<R>, GnitzSqlError> {
     }
 }
 
-/// Parse `e` as a non-negative integer literal, or error — silently degrading a
-/// LIMIT returns every row. `what` names the clause for the message.
-pub(crate) fn expr_usize_literal(e: &Expr, what: &str) -> Result<usize, GnitzSqlError> {
-    let not_a_literal = || GnitzSqlError::Rejected(format!("{what} must be an integer literal, not an expression"));
-    let c = crate::bind::structural::bind_constant(e).map_err(|_| not_a_literal())?;
-    match c {
-        BExpr::LitInt(n) if n >= 0 => Ok(n as usize),
-        BExpr::LitInt(_) | BExpr::LitFloat { .. } | BExpr::LitWide(_) => Err(GnitzSqlError::Rejected(format!(
-            "{what} must be a non-negative integer literal, got '{}'",
-            c.literal_text()
-        ))),
-        _ => Err(not_a_literal()),
-    }
-}
-
 /// The bare name of an unqualified single-part function call, or `None` for a
 /// qualified (`schema.fn`) name.
 pub(crate) fn single_fn_name(f: &sqlparser::ast::Function) -> Option<&str> {
@@ -157,34 +142,6 @@ pub(crate) fn single_fn_name(f: &sqlparser::ast::Function) -> Option<&str> {
         [part] => part.as_ident().map(|i| i.value.as_str()),
         _ => None,
     }
-}
-
-/// The one SQL-name ↔ aggregate map, read in both directions by
-/// [`agg_func_from_name`] and [`agg_func_name`] — a bijection, so a name can
-/// never drift between the two directions.
-const AGG_NAMES: [(&str, AggFunc); 5] = [
-    ("count", AggFunc::Count),
-    ("sum", AggFunc::Sum),
-    ("min", AggFunc::Min),
-    ("max", AggFunc::Max),
-    ("avg", AggFunc::Avg),
-];
-
-/// The `AggFunc` a function name denotes (`count`, `sum`, `min`, `max`, `avg`),
-/// matched case-insensitively without allocating; `None` for any other name.
-pub(crate) fn agg_func_from_name(name: &str) -> Option<AggFunc> {
-    AGG_NAMES
-        .into_iter()
-        .find_map(|(n, f)| name.eq_ignore_ascii_case(n).then_some(f))
-}
-
-/// The canonical lowercase SQL name of an aggregate — [`agg_func_from_name`]
-/// inverted over the same table.
-pub(crate) fn agg_func_name(f: AggFunc) -> &'static str {
-    AGG_NAMES
-        .iter()
-        .find_map(|&(n, g)| (g == f).then_some(n))
-        .expect("every AggFunc spelling is in AGG_NAMES")
 }
 
 /// An aggregate call's argument. `COUNT(*)` is the only argument-less shape and
@@ -410,15 +367,10 @@ pub(crate) fn expr_any(e: &sqlparser::ast::Expr, p: &impl Fn(&sqlparser::ast::Ex
     p(e) || expr_operands(e).into_iter().any(|o| expr_any(o, p))
 }
 
-/// The node count of `e` over the same node set.
-pub(crate) fn expr_node_count(e: &sqlparser::ast::Expr) -> usize {
-    1 + expr_operands(e).into_iter().map(expr_node_count).sum::<usize>()
-}
-
 /// Recursively test whether an expression contains an aggregate function call:
 /// the call itself, or — for a non-aggregate wrapper over one (`abs(SUM(x))`,
 /// still a grouped shape) — any of its operands.
-fn expr_has_aggregate(e: &sqlparser::ast::Expr) -> bool {
+pub(crate) fn expr_has_aggregate(e: &sqlparser::ast::Expr) -> bool {
     expr_any(e, &|e| matches!(e, sqlparser::ast::Expr::Function(f) if is_agg_call(f)))
 }
 
@@ -504,146 +456,78 @@ pub(crate) fn group_by_exprs(select: &sqlparser::ast::Select) -> Result<&[sqlpar
     }
 }
 
-/// The 1-based position a clause item names, or `None` when it is not an integer
-/// literal. ORDER BY and GROUP BY share this rule; LIMIT and OFFSET call
-/// [`expr_usize_literal`] directly, since a literal is the only form legal there.
-///
-/// The gate is a *bare* `Value::Number`, deliberately narrower than
-/// [`bind_constant`](crate::bind::structural::bind_constant): `ORDER BY (1)` and
-/// `ORDER BY +1` are expressions.
-pub(crate) fn clause_position(e: &Expr, what: &str) -> Result<Option<usize>, GnitzSqlError> {
-    match e {
-        Expr::Value(v) if matches!(v.value, Value::Number(..)) => Ok(Some(expr_usize_literal(e, what)?)),
-        _ => Ok(None),
-    }
-}
-
-/// Reject a 1-based clause position outside `1..=len`. ORDER BY resolves a
-/// position into the visible output columns and GROUP BY into the SELECT list,
-/// but out of range reads the same either way, so it is worded once.
-pub(crate) fn reject_position_out_of_range(pos: usize, len: usize, what: &str) -> Result<(), GnitzSqlError> {
-    if pos == 0 || pos > len {
-        return Err(GnitzSqlError::Rejected(format!(
-            "{what} position {pos} is out of range (1..={len})"
-        )));
-    }
-    Ok(())
-}
-
-/// A GROUP BY item, peeled of parens, with a 1-based SELECT-list position resolved
-/// to the item it names; everything else passes through. `GROUP BY 1` is the first
-/// projected expression, as in every other dialect — reading it as the constant `1`
-/// would silently group everything into one group. A position must name a scalar,
-/// aggregate-free item.
-pub(crate) fn group_by_target<'a>(
-    ge: &'a sqlparser::ast::Expr,
-    select: &'a sqlparser::ast::Select,
-) -> Result<&'a sqlparser::ast::Expr, GnitzSqlError> {
-    let ge = peel_nested(ge);
-    let Some(pos) = clause_position(ge, "GROUP BY position")? else {
-        return Ok(ge);
-    };
-    reject_position_out_of_range(pos, select.projection.len(), "GROUP BY")?;
-    let target = projection_item_expr(&select.projection[pos - 1]).ok_or_else(|| {
-        GnitzSqlError::Rejected(format!(
-            "GROUP BY position {pos} names a wildcard, which is not a group key"
-        ))
-    })?;
-    if expr_has_aggregate(target) {
-        return Err(GnitzSqlError::Rejected(format!(
-            "GROUP BY position {pos} names an aggregate, which cannot be a group key"
-        )));
-    }
-    Ok(peel_nested(target))
-}
-
-/// The one body of [`expr_operands`] and [`expr_operands_mut`], instantiated for
-/// `&` and for `&mut`, so a rewriter substitutes at exactly the positions a
-/// reader sees.
-macro_rules! operands {
-    ($e:expr, $unbox:ident, $deref:ident, $iter:ident $(, $m:tt)?) => {{
-        use sqlparser::ast::{CaseWhen, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, WindowType};
-        match $e {
-            Expr::BinaryOp { left, right, .. } => vec![left.$unbox(), right.$unbox()],
-            Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
-                vec![expr.$unbox()]
-            }
-            Expr::Between { expr, low, high, .. } => vec![expr.$unbox(), low.$unbox(), high.$unbox()],
-            Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => vec![a.$unbox(), b.$unbox()],
-            Expr::Position { expr, r#in } => vec![expr.$unbox(), r#in.$unbox()],
-            // Keyword-dispatched: sqlparser gives these their own node rather than an
-            // `Expr::Function`, so their operand is named here explicitly.
-            Expr::Ceil { expr, .. }
-            | Expr::Floor { expr, .. }
-            | Expr::Cast { expr, .. }
-            | Expr::Extract { expr, .. } => vec![expr.$unbox()],
-            // SUBSTRING and TRIM are keyword-dispatched too. TRIM's `trim_what` is a
-            // literal by the time the binder accepts it, but it is a bound operand
-            // position and belongs in the walk regardless.
-            Expr::Substring { expr, substring_from, substring_for, .. } => std::iter::once(expr.$unbox())
-                .chain(substring_from.$deref())
-                .chain(substring_for.$deref())
-                .collect(),
-            Expr::Trim { expr, trim_what, .. } => std::iter::once(expr.$unbox()).chain(trim_what.$deref()).collect(),
-            // Same for LIKE's pattern. Its `escape_char` is a `Value`, not an `Expr`,
-            // so it contributes nothing.
-            Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-                vec![expr.$unbox(), pattern.$unbox()]
-            }
-            Expr::InList { expr, list, .. } => std::iter::once(expr.$unbox()).chain(list).collect(),
-            Expr::Case {
-                operand,
-                conditions,
-                else_result,
-                case_token: _,
-                end_token: _,
-            } => {
-                let mut ops = Vec::new();
-                ops.extend(operand.$deref());
-                for CaseWhen { condition, result } in conditions {
-                    ops.push(condition);
-                    ops.push(result);
-                }
-                ops.extend(else_result.$deref());
-                ops
-            }
-            // An inline window specification's keys ([`window_spec_keys`]) are
-            // operands too, so the walkers see the aggregate in `ORDER BY SUM(x)`
-            // and a subquery written there.
-            Expr::Function(f) => {
-                let mut ops: Vec<_> = match &$($m)? f.args {
-                    FunctionArguments::List(list) => list
-                        .args
-                        .$iter()
-                        .filter_map(|a| match a {
-                            FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => Some(inner),
-                            _ => None,
-                        })
-                        .collect(),
-                    _ => Vec::new(),
-                };
-                if let Some(WindowType::WindowSpec(spec)) = &$($m)? f.over {
-                    ops.extend(spec.partition_by.$iter());
-                    ops.extend(spec.order_by.$iter().map(|o| &$($m)? o.expr));
-                }
-                ops
-            }
-            _ => Vec::new(),
-        }
-    }};
-}
-
 /// The direct operand subexpressions of `e`. Subquery nodes contribute none: no
 /// walker may silently descend into a subquery. Must cover every node
 /// `bind_structural` recurses through — only this module's tests enforce that,
 /// and a node it misses is invisible to every walker, silently.
 pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Expr> {
-    operands!(e, as_ref, as_deref, iter)
-}
-
-/// [`expr_operands`] over `&mut`, for a rewriter.
-pub(crate) fn expr_operands_mut(e: &mut sqlparser::ast::Expr) -> Vec<&mut sqlparser::ast::Expr> {
-    operands!(e, as_mut, as_deref_mut, iter_mut, mut)
+    use sqlparser::ast::{CaseWhen, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, WindowType};
+    match e {
+        Expr::BinaryOp { left, right, .. } => vec![left.as_ref(), right.as_ref()],
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
+            vec![expr.as_ref()]
+        }
+        Expr::Between { expr, low, high, .. } => vec![expr.as_ref(), low.as_ref(), high.as_ref()],
+        Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => vec![a.as_ref(), b.as_ref()],
+        Expr::Position { expr, r#in } => vec![expr.as_ref(), r#in.as_ref()],
+        // Keyword-dispatched: sqlparser gives these their own node rather than an
+        // `Expr::Function`, so their operand is named here explicitly.
+        Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } | Expr::Cast { expr, .. } | Expr::Extract { expr, .. } => {
+            vec![expr.as_ref()]
+        }
+        // SUBSTRING and TRIM are keyword-dispatched too. TRIM's `trim_what` is a
+        // literal by the time the binder accepts it, but it is a bound operand
+        // position and belongs in the walk regardless.
+        Expr::Substring { expr, substring_from, substring_for, .. } => std::iter::once(expr.as_ref())
+            .chain(substring_from.as_deref())
+            .chain(substring_for.as_deref())
+            .collect(),
+        Expr::Trim { expr, trim_what, .. } => std::iter::once(expr.as_ref()).chain(trim_what.as_deref()).collect(),
+        // Same for LIKE's pattern. Its `escape_char` is a `Value`, not an `Expr`,
+        // so it contributes nothing.
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            vec![expr.as_ref(), pattern.as_ref()]
+        }
+        Expr::InList { expr, list, .. } => std::iter::once(expr.as_ref()).chain(list).collect(),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            case_token: _,
+            end_token: _,
+        } => {
+            let mut ops = Vec::new();
+            ops.extend(operand.as_deref());
+            for CaseWhen { condition, result } in conditions {
+                ops.push(condition);
+                ops.push(result);
+            }
+            ops.extend(else_result.as_deref());
+            ops
+        }
+        // An inline window specification's keys ([`window_spec_keys`]) are
+        // operands too, so the walkers see the aggregate in `ORDER BY SUM(x)`
+        // and a subquery written there.
+        Expr::Function(f) => {
+            let mut ops: Vec<_> = match &f.args {
+                FunctionArguments::List(list) => list
+                    .args
+                    .iter()
+                    .filter_map(|a| match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => Some(inner),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if let Some(WindowType::WindowSpec(spec)) = &f.over {
+                ops.extend(spec.partition_by.iter());
+                ops.extend(spec.order_by.iter().map(|o| &o.expr));
+            }
+            ops
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// The scalar expression of a projection item, or `None` for a wildcard.
@@ -867,8 +751,6 @@ pub(crate) fn col_ref_parts(e: &sqlparser::ast::Expr) -> Option<(Option<&str>, &
 /// cannot reach one reader and miss another — the destructure is exhaustive and
 /// every reader goes through this struct.
 struct WildcardMods<'a> {
-    /// A modifier was written, so the item is not a plain `*`.
-    present: bool,
     /// A modifier gnitz does not honor, spelled for the rejection.
     refused: Option<&'static str>,
     /// `EXCEPT` ∪ `EXCLUDE` — synonyms (ClickHouse/BigQuery vs Snowflake).
@@ -914,12 +796,6 @@ fn wildcard_mods(o: &WildcardAdditionalOptions) -> WildcardMods<'_> {
         None => {}
     }
     WildcardMods {
-        present: opt_ilike.is_some()
-            || opt_exclude.is_some()
-            || opt_except.is_some()
-            || opt_replace.is_some()
-            || opt_rename.is_some()
-            || opt_alias.is_some(),
         // gnitz honors neither a computed value substitution nor a name-pattern
         // filter, so expanding a plain `*` in their place would answer a
         // different query than the one written.
@@ -946,7 +822,7 @@ pub(crate) fn expand_wildcard_item<'a, I>(
 where
     I: IntoIterator<Item = &'a ColumnDef> + Clone,
 {
-    let WildcardMods { refused, drop, rename, .. } = wildcard_mods(o);
+    let WildcardMods { refused, drop, rename } = wildcard_mods(o);
     if let Some(what) = refused {
         return Err(crate::error::unsupported_clause(ctx, what));
     }
@@ -1004,14 +880,6 @@ pub(crate) fn has_visible_column<'a>(cols: impl IntoIterator<Item = &'a ColumnDe
 /// rejected. `RENAME` names its output, so it gets the duplicate check.
 pub(crate) fn is_name_preserving_wildcard_projection(projection: &[SelectItem]) -> bool {
     matches!(projection, [SelectItem::Wildcard(o)] if wildcard_mods(o).rename.is_empty())
-}
-
-/// True when the projection is a plain `*` — the identity expansion the no-op
-/// passthrough fast paths need; anything else falls through to
-/// [`expand_wildcard_item`]. Both predicates match *one* item, so `SELECT *, *`
-/// reaches the duplicate-name gate that `SELECT id, a, a` is rejected by.
-pub(crate) fn is_bare_wildcard_projection(projection: &[SelectItem]) -> bool {
-    matches!(projection, [SelectItem::Wildcard(o)] if !wildcard_mods(o).present)
 }
 
 #[cfg(test)]

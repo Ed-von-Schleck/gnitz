@@ -14,10 +14,10 @@ use crate::ast_util::{
 use crate::bind::{bind_single_table, find_unique_column, Catalog};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
 use crate::dml::plan::access_path;
-use crate::error::GnitzSqlError;
+use crate::error::{reject_if, GnitzSqlError};
 use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::BoundExpr;
-use crate::validate::{reject_unhonored_delete_clauses, reject_unhonored_update_clauses, require_class, ClassWant};
+use crate::rules::{require_class, ClassWant};
 use crate::SqlResult;
 use gnitz_core::{retraction_batch, GnitzClient, RelDescriptor, Schema, ZSetBatch};
 use gnitz_expr::{ExprResults, ScalarEval, SchemaFacts};
@@ -53,6 +53,66 @@ pub(crate) fn plan_delete(del: &Delete, cat: &Catalog<'_>) -> Result<MutationPla
     reject_unhonored_delete_clauses(del)?;
     let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = &del.from;
     plan_mutation(from, del.selection.as_ref(), None, cat)
+}
+
+/// Reject every `UPDATE` clause `plan_mutation` does not consume. It reads `table`, `assignments`,
+/// `selection`; `from` (UPDATE … FROM join-update), `returning`, and `or` (SQLite conflict) all parse
+/// under `GenericDialect` and were dropped — the join-update silently binds SET/WHERE against the
+/// wrong relation set.
+fn reject_unhonored_update_clauses(update: &sqlparser::ast::Update) -> Result<(), GnitzSqlError> {
+    const CTX: &str = "UPDATE";
+    let sqlparser::ast::Update {
+        // Consumed by `plan_mutation` — `table` whole: it classifies the FROM
+        // shape, so a join written there is rejected rather than dropped.
+        table: _,
+        assignments: _,
+        selection: _,
+        // Inert: the `UPDATE` token and advisory-only comment hints.
+        update_token: _,
+        optimizer_hints: _,
+        // Rejected: each is a clause `plan_mutation` does not implement.
+        from,
+        returning,
+        output,
+        or,
+        order_by,
+        limit,
+    } = update;
+    reject_if(from.is_some(), CTX, "FROM (join-update)")?;
+    reject_if(returning.is_some(), CTX, "RETURNING")?;
+    reject_if(output.is_some(), CTX, "OUTPUT")?;
+    reject_if(or.is_some(), CTX, "OR (conflict clause)")?;
+    reject_if(!order_by.is_empty(), CTX, "ORDER BY")?;
+    reject_if(limit.is_some(), CTX, "LIMIT")?;
+    Ok(())
+}
+
+/// Reject every `DELETE` clause `plan_mutation` does not consume. It reads `from` and `selection`;
+/// `tables` (multi-table), `using` (join-delete), `returning`, `order_by`, and `limit` all parse
+/// under `GenericDialect` and were dropped — a dropped `LIMIT` deletes every matched row (data loss),
+/// a dropped `USING` binds WHERE against the wrong relation set.
+fn reject_unhonored_delete_clauses(del: &sqlparser::ast::Delete) -> Result<(), GnitzSqlError> {
+    const CTX: &str = "DELETE";
+    let sqlparser::ast::Delete {
+        from: _,
+        selection: _,
+        // Inert: the `DELETE` token and advisory-only comment hints.
+        delete_token: _,
+        optimizer_hints: _,
+        tables,
+        using,
+        returning,
+        output,
+        order_by,
+        limit,
+    } = del;
+    reject_if(!tables.is_empty(), CTX, "multi-table delete")?;
+    reject_if(using.is_some(), CTX, "USING (join-delete)")?;
+    reject_if(returning.is_some(), CTX, "RETURNING")?;
+    reject_if(output.is_some(), CTX, "OUTPUT")?;
+    reject_if(!order_by.is_empty(), CTX, "ORDER BY")?;
+    reject_if(limit.is_some(), CTX, "LIMIT")?;
+    Ok(())
 }
 
 fn plan_mutation(

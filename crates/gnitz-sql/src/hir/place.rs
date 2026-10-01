@@ -5,7 +5,7 @@
 use super::{cross_comparison, side, EqPair, HirCol, HirExpr, HirRange, JoinClass, JoinShape, JoinType, RelExpr, Side};
 use crate::error::GnitzSqlError;
 use crate::ir::BinOp;
-use crate::validate::{reject_float_keys, reject_pk_list_arity};
+use crate::rules::{reject_float_keys, reject_pk_list_arity};
 use gnitz_wire::{ColumnDef, JoinKeyRule, TypeCode};
 use std::rc::Rc;
 

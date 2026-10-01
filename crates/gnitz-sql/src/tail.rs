@@ -1,12 +1,83 @@
 //! The query tail — `ORDER BY`, `LIMIT`, `OFFSET` — read off the sqlparser AST
-//! into key specs and counts. More than one surface carries a tail and they must
-//! agree on it, so it sits below all of them: no surface reaches into another for
-//! the rule, and a rejection here cannot name a surface it does not know.
+//! into key specs and counts, and the 1-based positions ORDER BY and GROUP BY
+//! share. More than one surface carries a tail and they must agree on it, so it
+//! sits below all of them: no surface reaches into another for the rule, and a
+//! rejection here cannot name a surface it does not know.
 
-use crate::ast_util::{clause_position, expr_usize_literal, reject_position_out_of_range};
+use crate::ast_util::{expr_has_aggregate, peel_nested, projection_item_expr};
+use crate::bind::structural::bind_constant;
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
+use crate::ir::BExpr;
 use gnitz_wire::ColumnDef;
-use sqlparser::ast::{Expr, LimitClause, OrderBy, OrderByExpr, OrderByKind, OrderByOptions};
+use sqlparser::ast::{Expr, LimitClause, OrderBy, OrderByExpr, OrderByKind, OrderByOptions, Value};
+
+/// Parse `e` as a non-negative integer literal, or error — silently degrading a
+/// LIMIT returns every row. `what` names the clause for the message.
+pub(crate) fn expr_usize_literal(e: &Expr, what: &str) -> Result<usize, GnitzSqlError> {
+    let not_a_literal = || GnitzSqlError::Rejected(format!("{what} must be an integer literal, not an expression"));
+    let c = bind_constant(e).map_err(|_| not_a_literal())?;
+    match c {
+        BExpr::LitInt(n) if n >= 0 => Ok(n as usize),
+        BExpr::LitInt(_) | BExpr::LitFloat { .. } | BExpr::LitWide(_) => Err(GnitzSqlError::Rejected(format!(
+            "{what} must be a non-negative integer literal, got '{}'",
+            c.literal_text()
+        ))),
+        _ => Err(not_a_literal()),
+    }
+}
+
+/// The 1-based position a clause item names, or `None` when it is not an integer
+/// literal. ORDER BY and GROUP BY share this rule; LIMIT and OFFSET call
+/// [`expr_usize_literal`] directly, since a literal is the only form legal there.
+///
+/// The gate is a *bare* `Value::Number`, deliberately narrower than
+/// [`bind_constant`]: `ORDER BY (1)` and
+/// `ORDER BY +1` are expressions.
+pub(crate) fn clause_position(e: &Expr, what: &str) -> Result<Option<usize>, GnitzSqlError> {
+    match e {
+        Expr::Value(v) if matches!(v.value, Value::Number(..)) => Ok(Some(expr_usize_literal(e, what)?)),
+        _ => Ok(None),
+    }
+}
+
+/// Reject a 1-based clause position outside `1..=len`. ORDER BY resolves a
+/// position into the visible output columns and GROUP BY into the SELECT list,
+/// but out of range reads the same either way, so it is worded once.
+pub(crate) fn reject_position_out_of_range(pos: usize, len: usize, what: &str) -> Result<(), GnitzSqlError> {
+    if pos == 0 || pos > len {
+        return Err(GnitzSqlError::Rejected(format!(
+            "{what} position {pos} is out of range (1..={len})"
+        )));
+    }
+    Ok(())
+}
+
+/// A GROUP BY item, peeled of parens, with a 1-based SELECT-list position resolved
+/// to the item it names; everything else passes through. `GROUP BY 1` is the first
+/// projected expression, as in every other dialect — reading it as the constant `1`
+/// would silently group everything into one group. A position must name a scalar,
+/// aggregate-free item.
+pub(crate) fn group_by_target<'a>(
+    ge: &'a sqlparser::ast::Expr,
+    select: &'a sqlparser::ast::Select,
+) -> Result<&'a sqlparser::ast::Expr, GnitzSqlError> {
+    let ge = peel_nested(ge);
+    let Some(pos) = clause_position(ge, "GROUP BY position")? else {
+        return Ok(ge);
+    };
+    reject_position_out_of_range(pos, select.projection.len(), "GROUP BY")?;
+    let target = projection_item_expr(&select.projection[pos - 1]).ok_or_else(|| {
+        GnitzSqlError::Rejected(format!(
+            "GROUP BY position {pos} names a wildcard, which is not a group key"
+        ))
+    })?;
+    if expr_has_aggregate(target) {
+        return Err(GnitzSqlError::Rejected(format!(
+            "GROUP BY position {pos} names an aggregate, which cannot be a group key"
+        )));
+    }
+    Ok(peel_nested(target))
+}
 
 /// What an ORDER BY key names: a 1-based visible-output position, or an
 /// expression — a bare or qualified name resolving output-first, anything else

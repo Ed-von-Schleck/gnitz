@@ -19,7 +19,8 @@ use crate::dml::plan::{rows_reply, RowsReply};
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::exec::client_map::ClientMap;
 use crate::ir::BExpr;
-use crate::validate::{reject_unhonored_insert_clauses, require_class, ClassWant};
+use crate::rules::{require_class, ClassWant};
+use crate::validate::{reject_unhonored_query_clauses, QueryEnvelope};
 use crate::SqlResult;
 use gnitz_core::{GnitzClient, PkColumn, RelDescriptor, Schema, ZSetBatch};
 use gnitz_expr::SchemaFacts;
@@ -126,6 +127,81 @@ pub(crate) struct InsertPlan {
 /// The table's SERIAL column, whose keys the server assigns.
 fn serial_col(target: &RelDescriptor) -> Option<usize> {
     target.schema.lone_pk_col().filter(|_| target.serial)
+}
+
+/// Reject every `Insert`-statement clause the INSERT planner does not consume. It reads only
+/// `table`, `source`, `columns`, `on` (ON CONFLICT) and `returning`; every other field is a
+/// conflict / overwrite / partition clause parsed under `GenericDialect` and
+/// silently reinterpreted as a plain append. The `source` is a full `Query` whose envelope (LIMIT,
+/// ORDER BY, FETCH, a `WITH`, …) an INSERT equally cannot honor, so it is routed through
+/// `reject_unhonored_query_clauses` here too.
+///
+/// Exhaustive destructure (no `..`): a future `sqlparser` `Insert` field stops the build here.
+fn reject_unhonored_insert_clauses(insert: &sqlparser::ast::Insert) -> Result<(), GnitzSqlError> {
+    const CTX: &str = "INSERT";
+    let sqlparser::ast::Insert {
+        // Consumed by `plan_insert`; `source`'s `Query` envelope is additionally checked below.
+        table: _,
+        source,
+        columns: _,
+        on: _,
+        // Inert keyword markers (`INTO` / `TABLE`, the `INSERT` token) and
+        // advisory-only comment hints: positional flags, no droppable semantics.
+        into: _,
+        has_table_keyword: _,
+        insert_token: _,
+        optimizer_hints: _,
+        // Consumed by `plan_insert`: INSERT ... RETURNING is supported (projected
+        // client-side from the just-built batch).
+        returning: _,
+        // Rejected: each is a clause the engine does not implement.
+        or,
+        ignore,
+        overwrite,
+        partitioned,
+        replace_into,
+        priority,
+        insert_alias,
+        table_alias,
+        assignments,
+        after_columns,
+        settings,
+        format_clause,
+        output,
+        multi_table_insert_type,
+        multi_table_into_clauses,
+        multi_table_when_clauses,
+        multi_table_else_clause,
+    } = insert;
+
+    reject_if(or.is_some(), CTX, "OR (conflict clause)")?;
+    reject_if(*ignore, CTX, "IGNORE")?;
+    reject_if(*overwrite, CTX, "OVERWRITE")?;
+    reject_if(*replace_into, CTX, "REPLACE INTO")?;
+    reject_if(partitioned.is_some(), CTX, "PARTITION")?;
+    reject_if(priority.is_some(), CTX, "priority (LOW_PRIORITY/HIGH_PRIORITY/DELAYED)")?;
+    reject_if(insert_alias.is_some(), CTX, "row alias (AS alias)")?;
+    reject_if(table_alias.is_some(), CTX, "table alias")?;
+    reject_if(!assignments.is_empty(), CTX, "SET")?;
+    reject_if(!after_columns.is_empty(), CTX, "AFTER columns")?;
+    reject_if(settings.is_some(), CTX, "SETTINGS")?;
+    reject_if(format_clause.is_some(), CTX, "FORMAT")?;
+    reject_if(output.is_some(), CTX, "OUTPUT")?;
+    reject_if(
+        multi_table_insert_type.is_some()
+            || !multi_table_into_clauses.is_empty()
+            || !multi_table_when_clauses.is_empty()
+            || multi_table_else_clause.is_some(),
+        CTX,
+        "multi-table INSERT (ALL/FIRST)",
+    )?;
+    // The `source` is a full `Query`; an INSERT honors no envelope clause on it (LIMIT/OFFSET,
+    // ORDER BY, FETCH, FOR UPDATE/SHARE, SETTINGS, FORMAT, a `WITH`). Route it through the shared
+    // `Query` guard so a dropped envelope clause is a clean error, not a silent full-table insert.
+    if let Some(src) = source {
+        reject_unhonored_query_clauses(src, QueryEnvelope::Bare, CTX)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn plan_insert(insert: &Insert, cat: &Catalog<'_>) -> Result<InsertPlan, GnitzSqlError> {
@@ -275,7 +351,8 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &Catalog<'_>) -> Result<InsertPl
         .returning
         .as_deref()
         .map(|items| {
-            let RowsReply { schema: out_schema, program, .. } = rows_reply(items, None, &target, &table_name)?;
+            let RowsReply { schema: out_schema, program, .. } =
+                rows_reply(crate::hir::bind_returning(items, &target, &table_name)?, &[], &target)?;
             let map = program
                 .map(|p| ClientMap::new(p, schema, Arc::clone(&out_schema)))
                 .transpose()?;

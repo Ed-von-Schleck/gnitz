@@ -519,7 +519,7 @@ fn projection_and_envelope_rules() {
         &[
             ("SELECT g, g FROM t", "duplicate column name"),
             ("SELECT *, * FROM t", "duplicate column name"),
-            ("SELECT t.*, t.* FROM t", "SELECT item"),
+            ("SELECT t.*, t.* FROM t", "duplicate column name"),
             ("SELECT * FROM t LIMIT 10", "LIMIT"),
             ("SELECT * EXCEPT (nope) FROM t", "nope"),
             ("SELECT * EXCEPT (g) RENAME (g AS v) FROM t", "excluded"),

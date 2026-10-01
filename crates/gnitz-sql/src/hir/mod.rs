@@ -1,6 +1,9 @@
-//! The view-body HIR: one IR between the sqlparser AST and the `Circuit`
-//! call sequence, compiled by `bind → lower`; bind places each predicate
-//! (`place.rs`) and joins in each subquery (`decorrelate.rs`) as it builds.
+//! The relational HIR: one IR between the sqlparser AST and what a query
+//! lowers to, compiled by `bind → lower`; bind places each predicate
+//! (`place.rs`) and joins in each subquery (`decorrelate.rs`) as it builds. A
+//! view body lowers to its `Circuit`s ([`bind_and_lower`]); an ad-hoc SELECT
+//! binds through the same binder and lowers to one read of one relation
+//! ([`bind_adhoc_read`]).
 //!
 //! The discipline: a column is an **opaque `ColId`** minted once at bind and
 //! never renumbered, so a resolved reference survives every tree built over it
@@ -10,19 +13,15 @@
 //! PK-front convention and the `ColId → ColRef(position)` substitution.
 
 mod bind;
-mod create;
 mod decorrelate;
 mod lower;
 mod physical;
 mod place;
 mod window;
 
-#[cfg(test)]
-pub(crate) use create::PlannedChain;
-pub(crate) use create::{execute_view_chain, plan_alter_view, plan_create_view};
+pub(crate) use bind::ViewBody;
 
 use crate::agg::AggFunc;
-use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
 use gnitz_core::{RelDescriptor, ViewBundle};
@@ -52,55 +51,36 @@ pub(crate) fn bind_and_lower<'a>(
     lower::lower(rel, bounded, &names)
 }
 
-/// The ad-hoc read path's entry to the same core: bind a single-relation grouped
-/// or `SELECT DISTINCT` body and lower it to fold pieces instead of to a
-/// circuit. One binder, two sinks — which is what makes `SELECT … GROUP BY …`
-/// and `CREATE VIEW AS SELECT … GROUP BY …` accept the same statements and
-/// compute them the same way, DISTINCT included.
-///
-/// Returns the fold's pieces and the finalize item each key of `order_exprs`
-/// sorts on, or `None` when the DISTINCT was dropped because the rows are already
-/// a set. The bound tree is `Distinct(Project(Get))`, `Project(Get)` (the dropped
-/// DISTINCT) or `Project(Filter_having?(Reduce(…)))`: the ad-hoc router rejects
-/// every subquery and join shape first.
-pub(crate) fn bind_and_lower_fold(
+pub(crate) use lower::fold::FoldPieces;
+pub(crate) use lower::read::{AdhocRead, AdhocRows, AdhocShape};
+
+/// The ad-hoc read path's entry to the same core: bind a query that reads one
+/// relation — its CTEs, then its body — and lower it to one read of that
+/// relation. One binder, two sinks, so a statement means the same thing as an
+/// ad-hoc read and as a view body.
+pub(crate) fn bind_adhoc_read(
+    cat: &crate::bind::Catalog<'_>,
+    query: &sqlparser::ast::Query,
     select: &sqlparser::ast::Select,
-    desc: &Arc<RelDescriptor>,
-    alias: &str,
+    op: &'static str,
     order_exprs: &[&sqlparser::ast::Expr],
-) -> Result<Option<(lower::fold::FoldPieces, Vec<usize>)>, GnitzSqlError> {
+) -> Result<AdhocRead, GnitzSqlError> {
     let ids = ColIdGen::new();
-    let (rel, order_cols) = bind::bind_adhoc_fold(&ids, select, Arc::clone(desc), alias, order_exprs)?;
-    Ok(lower::fold::lower_fold(&rel)?.map(|pieces| (pieces, order_cols)))
+    let mut cx = bind::BindCx::adhoc(cat, &ids, op);
+    bind::bind_ctes(&mut cx, query)?;
+    let (rel, placed) = bind::bind_select(&mut cx, select, order_exprs)?;
+    lower::read::lower_read(&rel, placed, &cx.names)
 }
 
-/// An ad-hoc rows read's reply items, as [`bind_adhoc_rows`] binds them.
-pub(crate) struct AdhocRows {
-    /// The source PK hidden in front, then the SELECT list, then a hidden item per
-    /// ORDER BY expression no item already computes.
-    pub items: Vec<ProjItem>,
-    /// The output column of each item.
-    pub cols: Vec<ColumnDef>,
-    /// The item each ORDER BY expression key sorts on.
-    pub placed: Vec<usize>,
-}
-
-/// The ad-hoc rows read's entry to the same binder.
-pub(crate) fn bind_adhoc_rows(
+/// An `INSERT … RETURNING` list as the reply items of a read of `desc`.
+pub(crate) fn bind_returning(
     projection: &[sqlparser::ast::SelectItem],
     desc: &Arc<RelDescriptor>,
     alias: &str,
-    order_exprs: &[&sqlparser::ast::Expr],
 ) -> Result<AdhocRows, GnitzSqlError> {
     let ids = ColIdGen::new();
-    let bound = bind::bind_adhoc_projection(&ids, projection, Arc::clone(desc), alias, order_exprs)?;
-    let slots = physical::project_slots(&bound.items, &physical::Frame::scan(desc, &bound.source))?;
-    debug_assert!(
-        slots.iter().map(|s| s.1).eq(bound.items.iter().map(|e| Some(e.out.id))),
-        "`placed` indexes the bound items, so pinning the PK must move none of them"
-    );
-    let (items, cols) = slots.into_iter().map(|(item, _, def)| (item, def)).unzip();
-    Ok(AdhocRows { items, cols, placed: bound.placed })
+    let (source, items) = bind::bind_returning(&ids, projection, Arc::clone(desc), alias)?;
+    lower::read::reply_rows(desc, &source, items, Vec::new())
 }
 
 /// Opaque column identity, unique within one `bind_and_lower` invocation, never
@@ -245,6 +225,9 @@ pub(crate) struct ProjEntry {
 /// columns (its ids are minted once and must stay stable); every other node's
 /// output columns are derived on demand by [`RelExpr::cols`].
 pub(crate) enum RelExpr {
+    /// The one row of no columns a FROM-less SELECT reads. Only an ad-hoc read
+    /// binds one.
+    Unit,
     Get {
         desc: Arc<RelDescriptor>,
         cols: Vec<HirCol>,
@@ -719,7 +702,7 @@ impl RelExpr {
     /// already a set. The one home of the float rule for a DISTINCT row identity,
     /// which the lowering keys on a hash of.
     pub(crate) fn distinct(input: Rc<RelExpr>) -> Result<Rc<RelExpr>, GnitzSqlError> {
-        crate::validate::reject_float_keys(input.cols().iter().map(|c| &c.def), "SELECT DISTINCT")?;
+        crate::rules::reject_float_keys(input.cols().iter().map(|c| &c.def), "SELECT DISTINCT")?;
         // Already a set: nothing to deduplicate.
         if input.unique_key().is_some() {
             return Ok(input);
@@ -772,6 +755,7 @@ impl RelExpr {
             RelExpr::Filter { .. } | RelExpr::Project { .. } | RelExpr::Alias { .. } => {
                 unreachable!("key_through maps a pass-through node")
             }
+            RelExpr::Unit => Some(Vec::new()),
             RelExpr::Reduce { group_cols, .. } => Some(group_cols.clone()),
             RelExpr::Distinct { input } => Some(input.cols().iter().map(|c| c.id).collect()),
             RelExpr::SetOp { out, .. } => Some(out.iter().map(|c| c.id).collect()),
@@ -802,6 +786,7 @@ impl RelExpr {
             return mapped;
         }
         match self {
+            RelExpr::Unit => Some(Vec::new()),
             RelExpr::Get { desc, cols } if desc.class == gnitz_wire::RelClass::Table => {
                 Some(desc.schema.pk_cols.iter().map(|&i| cols[i as usize].id).collect())
             }
@@ -875,13 +860,14 @@ impl RelExpr {
             def.is_nullable = is_nullable;
             out.push(HirCol::new(ids.next(), def));
         }
-        crate::validate::reject_float_keys(out.iter().map(|c| &c.def), "set operation")?;
+        crate::rules::reject_float_keys(out.iter().map(|c| &c.def), "set operation")?;
         Ok(Rc::new(RelExpr::SetOp { op, all, left, right, out }))
     }
 
     /// The node's output columns.
     pub(crate) fn cols(&self) -> Vec<HirCol> {
         match self {
+            RelExpr::Unit => Vec::new(),
             RelExpr::Get { cols, .. } => cols.clone(),
             RelExpr::Filter { input, .. } => input.cols(),
             RelExpr::Project { items, .. } => items.iter().map(|e| e.out.clone()).collect(),

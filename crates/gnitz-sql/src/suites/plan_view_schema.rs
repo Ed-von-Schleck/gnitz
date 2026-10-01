@@ -238,6 +238,18 @@ fn wildcard_modifiers_rewrite_the_expansion() {
             sh(&[("_join_pk", true, false), ("x", false, false), ("bv", false, false)]),
             &[0],
         ),
+        // `alias.*` is that relation's columns, in place among the other items.
+        (
+            "SELECT jb.*, ja.av FROM ja JOIN jb ON ja.k = jb.k",
+            sh(&[
+                ("_join_pk", true, false),
+                ("id", false, false),
+                ("k", false, false),
+                ("bv", false, false),
+                ("av", false, false),
+            ]),
+            &[0],
+        ),
         (
             "SELECT * EXCEPT (x) FROM l JOIN r ON l.id = r.id",
             sh(&[

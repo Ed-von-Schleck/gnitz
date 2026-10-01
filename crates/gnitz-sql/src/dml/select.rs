@@ -8,43 +8,41 @@
 //! computed at plan time.
 //!
 //! A query that *derives* a new relation — a JOIN, a set operation, an EXISTS/IN
-//! or scalar subquery, a derived table, a grouped CTE — has no single-relation
-//! sink; [`plan_query`] rejects it from the AST alone
-//! ([`super::derivation`]), pointing at CREATE VIEW. A read the direct
-//! path merely cannot express is a feature-named rejection, never that
-//! template. A `WITH` is expanded into the body first (`dml::cte`), so a CTE
-//! reads through the flat query's sink.
+//! or scalar subquery, a derived table — has no single-relation sink and is
+//! rejected ([`crate::error::derivation`]), pointing at CREATE VIEW:
+//! [`plan_query`] refuses the body's own shape from the AST alone, and the read
+//! lowering refuses a CTE that derives. A read the direct path merely cannot
+//! express is a feature-named rejection, never that template. The body and its
+//! CTEs bind through the view binder (`hir::bind_adhoc_read`), so a CTE reads
+//! through the sink of the flat query it composes to.
 //!
 //! Planning is separate from dispatch, and the seam is [`ReadPlan`]:
 //! [`plan_read`] validates, resolves, and decides the sink's access and reply
 //! shape without reaching a server; [`execute_select`] runs the resulting plan and
 //! `dml::explain` formats the same plan instead of dispatching it.
 
-use super::derivation;
 use crate::agg::ground_partial_schema;
 use crate::ast_util::{
     body_is_grouped, classify_from, extract_table_name_and_alias, has_exists_in_subquery, has_scalar_subquery,
-    reject_position_out_of_range, scalar_projection_item, select_is_distinct, FromShape,
+    select_is_distinct, FromShape,
 };
-use crate::bind::{bind_single_table, output_column, Catalog};
-use crate::codec::project_schema::compute_map;
-use crate::dml::cte::inline_ctes;
-use crate::dml::plan::{access_path, rows_reply, RowsReply};
-use crate::error::{reject_if, GnitzSqlError};
+use crate::bind::Catalog;
+use crate::dml::plan::{bound_and_predicate, rows_reply, RowsReply};
+use crate::error::{derivation, reject_if, GnitzSqlError};
 use crate::exec::agg_finish::FoldFinish;
 use crate::exec::order::{order_and_window, Window};
 use crate::expr_lower::compile_scalar_evaluator;
-use crate::hir::bind_and_lower_fold;
+use crate::hir::{bind_adhoc_read, AdhocRead, AdhocShape, FoldPieces};
 use crate::ir::BoundExpr;
-use crate::tail::{extract_limit, extract_offset, order_exprs, parse_order_by, wire_keys, OrderTarget};
+use crate::project::compute_map;
+use crate::tail::{extract_limit, extract_offset, key_slots, order_exprs, parse_order_by, wire_keys};
 use crate::validate::{
-    as_plain_select, computed_column, reject_duplicate_projection_names, reject_unhonored_query_clauses,
-    reject_unhonored_select_clauses, require_class, ClassWant, HonoredClauses, QueryEnvelope,
+    as_plain_select, reject_unhonored_query_clauses, reject_unhonored_select_clauses, HonoredClauses, QueryEnvelope,
 };
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, GnitzClient, RelDescriptor, Schema, ZSetBatch};
 use gnitz_wire::{ReadSink, ReadSpec, SinkKind};
-use sqlparser::ast::{OrderBy, Query, Select, SetExpr, Statement};
+use sqlparser::ast::{Query, SetExpr, Statement};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -82,7 +80,7 @@ pub(super) enum ReadCase {
 
 /// The relation a `ReadSpec` names, and what ships.
 pub(super) struct SpecRead {
-    /// As written in FROM.
+    /// As the query names it.
     pub(super) name: String,
     pub(super) desc: Arc<RelDescriptor>,
     pub(super) spec: ReadSpec,
@@ -169,11 +167,10 @@ pub(crate) fn plan_read(stmt: &Statement, cat: &Catalog<'_>) -> Result<ReadPlan,
             ))
         }
     };
-    let flat = inline_ctes(cat, query)?;
-    plan_query(cat, flat.as_ref().unwrap_or(query))
+    plan_query(cat, query)
 }
 
-/// Validate an ad-hoc SELECT's shape, resolve the one relation it reads, and
+/// Validate an ad-hoc SELECT's shape, bind it to the one relation it reads, and
 /// decide its access and sink.
 fn plan_query(cat: &Catalog<'_>, query: &Query) -> Result<ReadPlan, GnitzSqlError> {
     // ORDER BY / LIMIT / OFFSET are the client finish's; any other query clause is refused.
@@ -194,19 +191,6 @@ fn plan_query(cat: &Catalog<'_>, query: &Query) -> Result<ReadPlan, GnitzSqlErro
         limit: extract_limit(query)?,
         offset: extract_offset(query)?,
     };
-    let factor = match classify_from(&select.from) {
-        FromShape::Empty => {
-            let (schema, row) = plan_constant(query, select)?;
-            return Ok(ReadPlan {
-                case: ReadCase::Constant { schema, row },
-                order: Vec::new(),
-                window,
-            });
-        }
-        FromShape::SinglePlainRelation(f) => f,
-        FromShape::Derived(construct) => return Err(derivation(construct)),
-    };
-    let (name, alias) = extract_table_name_and_alias(factor, cat.schema_name(), "FROM")?;
     // DISTINCT wins the split: its fold does not group, so DISTINCT + GROUP BY keeps the
     // GROUP BY rejection.
     let distinct = select_is_distinct(select);
@@ -218,24 +202,43 @@ fn plan_query(cat: &Catalog<'_>, query: &Query) -> Result<ReadPlan, GnitzSqlErro
     } else {
         "direct SELECT"
     };
-    reject_unhonored_select_clauses(select, HonoredClauses::for_body(fold, distinct), ctx)?;
-    let desc = cat.probe_relation(&name)?;
-    require_class(&desc, &name, ClassWant::Readable, ctx)?;
-    // WHERE → access before either sink's shape, so a query unsupported on both axes names
-    // the same one whichever sink it lands on.
-    let (bound, predicate) = access_path(&desc.schema, &alias, select.selection.as_ref(), &desc.indexes)?;
-    let folded = if fold {
-        plan_fold(select, query.order_by.as_ref(), &alias, &desc)?
-    } else {
-        None
+    match classify_from(&select.from) {
+        FromShape::Empty => {
+            const CTX: &str = "SELECT without FROM";
+            reject_unhonored_select_clauses(select, HonoredClauses::PLAIN, CTX)?;
+            reject_if(select.selection.is_some(), CTX, "WHERE")?;
+        }
+        FromShape::SinglePlainRelation(factor) => {
+            // The FROM name is checked before the clause gate.
+            extract_table_name_and_alias(factor, cat.schema_name(), "FROM")?;
+            reject_unhonored_select_clauses(select, HonoredClauses::for_body(fold, distinct), ctx)?;
+        }
+        FromShape::Derived(construct) => return Err(derivation(construct)),
+    }
+    let keys = parse_order_by(query.order_by.as_ref())?;
+    let (desc, name, conjuncts, shape) = match bind_adhoc_read(cat, query, select, ctx, &order_exprs(&keys))? {
+        AdhocRead::Relation { desc, name, conjuncts, shape } => (desc, name, conjuncts, shape),
+        AdhocRead::Constant(items) => {
+            // One row sorts to itself: a positional key is range-checked and no key
+            // is placed, so an expression key's slot is never read.
+            key_slots(&keys, items.iter().map(|(_, d)| d), std::iter::repeat(0))?;
+            let (schema, row) = plan_constant(items)?;
+            return Ok(ReadPlan {
+                case: ReadCase::Constant { schema, row },
+                order: Vec::new(),
+                window,
+            });
+        }
     };
+    let (bound, predicate) = bound_and_predicate(&desc.schema, &conjuncts, &desc.indexes)?;
     let read = |sink| SpecRead {
         name,
         desc: Arc::clone(&desc),
         spec: ReadSpec { bound, predicate, sink },
     };
-    let (case, order) = match folded {
-        Some(FoldPlan { sink, finish, reduce_schema, order }) => {
+    let (case, order) = match shape {
+        AdhocShape::Fold(pieces, order_cols) => {
+            let FoldPlan { sink, finish, reduce_schema, order } = plan_fold(*pieces, &keys, &order_cols)?;
             let case = ReadCase::Fold {
                 read: read(sink),
                 finish: Box::new(finish),
@@ -244,9 +247,8 @@ fn plan_query(cat: &Catalog<'_>, query: &Query) -> Result<ReadPlan, GnitzSqlErro
             };
             (case, order)
         }
-        None => {
-            let RowsReply { schema: reply_schema, program, order } =
-                rows_reply(&select.projection, query.order_by.as_ref(), &desc, &alias)?;
+        AdhocShape::Rows(rows) => {
+            let RowsReply { schema: reply_schema, program, order } = rows_reply(rows, &keys, &desc)?;
             // OFFSET+LIMIT logical rows; `0` = unbounded (an OFFSET with no LIMIT too).
             let limit_k = window.end().map_or(0, |e| e as u64);
             let sink = ReadSink {
@@ -272,21 +274,12 @@ struct FoldPlan {
     order: Vec<gnitz_wire::OrderKey>,
 }
 
-/// A GROUP BY / global aggregate / HAVING / DISTINCT read, bound by the front end a
-/// grouped `CREATE VIEW` body uses. `None` when the DISTINCT was dropped over rows
-/// already a set, which read as rows instead.
+/// A GROUP BY / global aggregate / HAVING / DISTINCT read's sink and client finish.
 fn plan_fold(
-    select: &Select,
-    order_by: Option<&OrderBy>,
-    alias: &str,
-    desc: &Arc<RelDescriptor>,
-) -> Result<Option<FoldPlan>, GnitzSqlError> {
-    // The keys bind with the SELECT list, so one over a column the grouping does
-    // not cover rejects before the fold is dispatched, as HAVING already does.
-    let keys = parse_order_by(order_by)?;
-    let Some((pieces, order_cols)) = bind_and_lower_fold(select, desc, alias, &order_exprs(&keys))? else {
-        return Ok(None);
-    };
+    pieces: FoldPieces,
+    keys: &[crate::tail::OrderKey<'_>],
+    order_cols: &[usize],
+) -> Result<FoldPlan, GnitzSqlError> {
     // Compiled here rather than at finish, so every rejection is pre-dispatch — and
     // the same one a view gives, the finalize being compiled as a view's map is.
     let finish = FoldFinish::new(
@@ -303,46 +296,26 @@ fn plan_fold(
     };
     // The finalize items follow the output's key.
     let order = wire_keys(
-        &keys,
+        keys,
         &finish.out_schema().columns,
         order_cols.iter().map(|&at| finish.out_schema().pk_cols.len() + at),
     )?;
-    Ok(Some(FoldPlan {
+    Ok(FoldPlan {
         sink,
         finish,
         reduce_schema: pieces.reduce_schema,
         order,
-    }))
+    })
 }
 
 /// A FROM-less SELECT's one row, finished at plan time: each item is a constant
-/// expression, compiled as a fold's finalize item over the ground row.
-fn plan_constant(query: &Query, select: &Select) -> Result<(Arc<Schema>, ZSetBatch), GnitzSqlError> {
-    const CTX: &str = "SELECT without FROM";
-    reject_unhonored_select_clauses(select, HonoredClauses::PLAIN, CTX)?;
-    reject_if(select.selection.is_some(), CTX, "WHERE")?;
+/// expression, compiled as a fold's finalize item over the ground row. A hidden
+/// item is an ORDER BY key, which is compiled and dropped.
+fn plan_constant(items: Vec<(BoundExpr, gnitz_wire::ColumnDef)>) -> Result<(Arc<Schema>, ZSetBatch), GnitzSqlError> {
     let ground = ground_partial_schema();
-    // No relation is in scope: the ground row's one column is hidden, so every
-    // written name is unresolvable, a qualified one included.
-    let bind = |e: &sqlparser::ast::Expr| bind_single_table(e, &ground, "");
-    let mut items: Vec<(BoundExpr, gnitz_wire::ColumnDef)> = Vec::new();
-    for (idx, item) in select.projection.iter().enumerate() {
-        let (expr, alias) = scalar_projection_item(item, CTX)?;
-        let bound = bind(expr)?;
-        let def = computed_column(alias, idx, bound.infer_ty(&ground.columns))?;
-        items.push((bound, def));
-    }
-    reject_duplicate_projection_names(&select.projection, items.iter().map(|(_, d)| d), CTX)?;
-    // One row sorts to itself: a key is refused where invalid, never placed.
-    for key in &parse_order_by(query.order_by.as_ref())? {
-        match key.target {
-            OrderTarget::Position(pos) => reject_position_out_of_range(pos, items.len(), "ORDER BY")?,
-            OrderTarget::Expr(e) => {
-                if output_column(e, items.iter().map(|(_, d)| d))?.is_none() {
-                    compile_scalar_evaluator(&bind(e)?, &ground)?;
-                }
-            }
-        }
+    let (keys, items): (Vec<_>, Vec<_>) = items.into_iter().partition(|(_, def)| def.is_hidden);
+    for (key, _) in &keys {
+        compile_scalar_evaluator(key, &ground)?;
     }
     let mut finish = FoldFinish::new(Arc::new(ground), [], &[], items)?;
     let mut ground_row = ZSetBatch::with_capacity(&finish.partial_schema, 1);

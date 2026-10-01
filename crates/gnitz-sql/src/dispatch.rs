@@ -1,12 +1,11 @@
-//! Statement dispatch — the one module that reaches both the compile side
-//! (`ddl` and the `hir` view compiler) and the execute side (`dml`). Routes a
-//! `Statement` to the matching handler.
+//! Statement dispatch: routes a `Statement` to its handler in `ddl` or `dml`,
+//! each planned against the statement's catalog and then run on the client.
 
 use crate::bind::Catalog;
 use crate::error::reject_if;
 use crate::error::GnitzSqlError;
 use crate::SqlResult;
-use crate::{ddl, dml, hir};
+use crate::{ddl, dml};
 use gnitz_core::{ClientError, GnitzClient, RelDescriptor};
 use sqlparser::ast::Statement;
 use std::cell::RefCell;
@@ -144,9 +143,9 @@ pub(crate) fn execute_statement(
         }
         Statement::CreateView(cv) => {
             match planned(client, schema_name, GnitzClient::resolve, |cat| {
-                hir::plan_create_view(cv, cat)
+                ddl::plan_create_view(cv, cat)
             })? {
-                Some(chain) => hir::execute_view_chain(client, schema_name, chain),
+                Some(chain) => ddl::execute_view_chain(client, schema_name, chain),
                 None => Ok(SqlResult::Ddl),
             }
         }
@@ -154,9 +153,9 @@ pub(crate) fn execute_statement(
         Statement::AlterTable(a) => ddl::execute_alter_table(client, schema_name, a),
         Statement::AlterView { name, query, columns, with_options } => {
             let chain = planned(client, schema_name, GnitzClient::resolve, |cat| {
-                hir::plan_alter_view(name, columns, query, with_options, cat)
+                ddl::plan_alter_view(name, columns, query, with_options, cat)
             })?;
-            hir::execute_view_chain(client, schema_name, chain)
+            ddl::execute_view_chain(client, schema_name, chain)
         }
         _ => Err(GnitzSqlError::Rejected(format!("unsupported SQL statement: {stmt}"))),
     }

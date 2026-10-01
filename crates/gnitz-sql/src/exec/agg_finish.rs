@@ -10,11 +10,11 @@ use gnitz_wire::{read_u64_le, write_u64_le, AggFunc as WireAggFunc};
 use gnitz_wire::{ColumnDef, PkBuf};
 use rustc_hash::FxHashMap;
 
-use crate::codec::project_schema::reply_program;
 use crate::error::GnitzSqlError;
 use crate::exec::client_map::ClientMap;
 use crate::expr_lower::compile_filter_program;
 use crate::ir::BoundExpr;
+use crate::project::reply_program;
 
 /// An ad-hoc fold's reply, or a FROM-less SELECT's ground row, to its result: combine the
 /// partials, then the HAVING filter and finalize map a grouped view runs over its reduce output.

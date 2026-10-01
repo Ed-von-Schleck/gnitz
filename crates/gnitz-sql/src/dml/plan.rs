@@ -5,16 +5,17 @@
 use std::sync::Arc;
 
 use crate::access::{candidates, residual, Candidate};
-use crate::codec::project_schema::{leading_schema, payload_program, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_wire_conjuncts;
+use crate::hir::AdhocRows;
 use crate::ir::BoundExpr;
-use crate::tail::{order_exprs, parse_order_by, wire_keys};
+use crate::project::{leading_schema, payload_program, ProjItem};
+use crate::tail::wire_keys;
 use gnitz_core::{RelDescriptor, Schema};
 use gnitz_expr::{LogicalProgram, SchemaFacts};
 use gnitz_wire::{ColumnDef, RelIndex};
 use gnitz_wire::{OrderKey, ReadBound};
-use sqlparser::ast::{Expr, OrderBy, SelectItem};
+use sqlparser::ast::Expr;
 
 // ---------------------------------------------------------------------------
 // The access-path ladder
@@ -38,7 +39,7 @@ pub(super) fn access_path(
 /// Bind-once WHERE → the access path that serves it: the first of [`candidates`]
 /// whose residual compiles, else an unbounded scan under the whole WHERE.
 /// `indexes` is the relation's declared secondary-index list.
-fn bound_and_predicate(
+pub(super) fn bound_and_predicate(
     schema: &Schema,
     conjuncts: &[BoundExpr],
     indexes: &[RelIndex],
@@ -76,18 +77,15 @@ pub(crate) struct RowsReply {
     pub(crate) order: Vec<OrderKey>,
 }
 
-/// The rows reply `projection` produces over `desc`, ordered by `order_by`.
+/// The rows reply `rows` produces over `desc`, ordered by `keys`.
 pub(crate) fn rows_reply(
-    projection: &[SelectItem],
-    order_by: Option<&OrderBy>,
+    rows: AdhocRows,
+    keys: &[crate::tail::OrderKey<'_>],
     desc: &Arc<RelDescriptor>,
-    alias: &str,
 ) -> Result<RowsReply, GnitzSqlError> {
-    let keys = parse_order_by(order_by)?;
-    let crate::hir::AdhocRows { items, cols: out_cols, placed } =
-        crate::hir::bind_adhoc_rows(projection, desc, alias, &order_exprs(&keys))?;
+    let AdhocRows { items, cols: out_cols, placed } = rows;
     let schema = &desc.schema;
-    let mut order = wire_keys(&keys, &out_cols, placed)?;
+    let mut order = wire_keys(keys, &out_cols, placed)?;
     let k = schema.pk_cols.len();
     if reproduces(schema, &items[k..], &out_cols[k..]) {
         for key in &mut order {

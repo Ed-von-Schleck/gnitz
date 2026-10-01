@@ -5,7 +5,7 @@ use super::super::{ColId, RelExpr};
 use super::spine::{open, Top};
 use super::{keyed_frame, EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
-use crate::validate::reject_float_keys;
+use crate::rules::reject_float_keys;
 use gnitz_wire::Circuit;
 use gnitz_wire::OrderKey;
 use std::collections::HashSet;

@@ -636,14 +636,14 @@ fn a_read_the_planner_rejects_names_its_rule() {
         ("SELECT * FROM st", "is a stream"),
         ("WITH c AS (SELECT id FROM st) SELECT id FROM c", "is a stream"),
         ("SELECT w, COUNT(*) FROM tw GROUP BY w HAVING w > 5", "128-bit"),
-        ("WITH x AS (SELECT DISTINCT v FROM t) SELECT v FROM x", "CTE 'x'"),
+        ("WITH x AS (SELECT DISTINCT v FROM t) SELECT v FROM x", "(DISTINCT CTE)"),
         ("SELECT v AS x, w AS x FROM t", "duplicate column name 'x'"),
         ("SELECT DISTINCT v AS x, w AS x FROM t", "duplicate column name 'x'"),
         ("SELECT id, v, v FROM t", "duplicate column name 'v'"),
         ("SELECT *, * FROM t", "duplicate column name"),
         ("SELECT *, * FROM t WHERE v > 0", "duplicate column name"),
         ("SELECT DISTINCT *, * FROM t", "duplicate column name"),
-        ("SELECT t.*, t.* FROM t", "SELECT item"),
+        ("SELECT t.*, t.* FROM t", "duplicate column name"),
         // `AS d(x, y)` renames the columns positionally; honoring only the
         // relation alias would answer under `t`'s own column names.
         ("SELECT * FROM t AS d(x, y)", "positional column aliases"),
@@ -724,6 +724,16 @@ fn a_cte_expands_to_the_flat_query() {
             "WITH x AS (SELECT * EXCEPT (g) FROM t) SELECT * FROM x",
             "SELECT id, v FROM t",
         ),
+        ("WITH x AS (SELECT * FROM t) SELECT x.* FROM x", "SELECT t.* FROM t"),
+        // An ORDER BY key names the CTE's column, whatever the source calls it.
+        (
+            "WITH x AS (SELECT id, g AS v, v AS g FROM t) SELECT id FROM x ORDER BY v",
+            "SELECT id FROM t ORDER BY g",
+        ),
+        (
+            "WITH x AS (SELECT id, g AS v, v AS g FROM t) SELECT v FROM x ORDER BY x.g",
+            "SELECT g AS v FROM t ORDER BY t.v",
+        ),
     ] {
         let c = read(&cat, cte).unwrap_or_else(|e| panic!("`{cte}`: {e:?}"));
         let f = read(&cat, flat).unwrap_or_else(|e| panic!("`{flat}`: {e:?}"));
@@ -754,8 +764,8 @@ fn a_cte_expands_to_the_flat_query() {
             "duplicate column name 'v'",
         ),
         (
-            "WITH x AS (SELECT g, COUNT(*) AS n FROM t GROUP BY g) SELECT g FROM x",
-            "derives a new one (grouped CTE)",
+            "WITH x AS (SELECT g, COUNT(*) AS n FROM t GROUP BY g) SELECT n, COUNT(*) FROM x GROUP BY n",
+            "derives a new one (an aggregate over a grouped CTE)",
         ),
         (
             "WITH x AS (SELECT t.id FROM t JOIN u ON t.g = u.g) SELECT id FROM x",
@@ -789,13 +799,16 @@ fn a_cte_expands_to_the_flat_query() {
     for sql in [
         "SELECT v FROM jv",
         "WITH x AS (SELECT * EXCEPT (id) FROM jv) SELECT v FROM x",
-        // `*` over such a CTE is the one shape a macro cannot carry: expansion
-        // has to write the names down, so it reaches the same ambiguity the flat
-        // wildcard passes positionally — a rejection, never a silent first match.
-        "WITH x AS (SELECT * EXCEPT (id) FROM jv) SELECT * FROM x",
     ] {
         assert_rejects(sql, read(&jv, sql), "'v' is ambiguous");
     }
+    // `*` over such a CTE carries the duplicate through positionally, as the flat
+    // wildcard does.
+    let (cte, flat) = (
+        "WITH x AS (SELECT * EXCEPT (id) FROM jv) SELECT * FROM x",
+        "SELECT * EXCEPT (id) FROM jv",
+    );
+    assert_eq!(read(&jv, cte).unwrap().spec(), read(&jv, flat).unwrap().spec());
 }
 
 /// A chain naming its predecessor's column twice doubles per level, so the
@@ -814,7 +827,7 @@ fn a_cte_chain_that_doubles_each_level_is_refused() {
     let ok = chain(10);
     read(&cat, &ok).unwrap_or_else(|e| panic!("`{ok}`: {e:?}"));
     let big = chain(30);
-    assert_rejects(&big, read(&cat, &big), "expression nodes");
+    assert_rejects(&big, read(&cat, &big), "column references");
 }
 
 /// An ORDER BY key that is not an output column binds in the SELECT list's own
@@ -908,6 +921,7 @@ fn a_from_less_select_plans_a_constant_row() {
         ("SELECT 1 AS one, 'x' AS s, 2 + 3", vec!["one", "s", "_expr2"]),
         ("SELECT 1 AS a ORDER BY a DESC LIMIT 1", vec!["a"]),
         ("SELECT 1 AS a ORDER BY 1 + 1", vec!["a"]),
+        ("WITH x AS (SELECT 40 + 2 AS a) SELECT a + 1 AS b FROM x", vec!["b"]),
     ] {
         let plan = read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
         assert_eq!(explain(&cat, sql)[0], "read nothing (constant row)", "`{sql}`");
@@ -926,7 +940,7 @@ fn a_from_less_select_plans_a_constant_row() {
     );
     for (sql, msg) in [
         ("SELECT x", "column 'x' not found"),
-        ("SELECT 1 + t.x", "column 't.x' not found"),
+        ("SELECT 1 + t.x", "table alias 't' not found"),
         ("SELECT *", "SELECT * is not a supported SELECT item"),
         ("SELECT 1 WHERE 1 = 1", "SELECT without FROM: WHERE is not supported"),
         ("SELECT COUNT(*)", "aggregate"),
@@ -1004,5 +1018,28 @@ fn a_plan_resolves_only_the_relations_it_reads() {
         });
         rejected(plan);
         assert!(asked.is_empty(), "`{sql}` costs no resolve, asked: {asked:?}");
+    }
+}
+
+/// A grouped CTE is the fold its body is: what the query filters and projects
+/// over it is that fold's HAVING and finalize.
+#[test]
+fn a_grouped_cte_reads_as_its_fold() {
+    let cat = base();
+    for (cte, flat) in [
+        (
+            "WITH x AS (SELECT g, COUNT(*) AS n FROM t GROUP BY g) SELECT g, n FROM x",
+            "SELECT g, COUNT(*) AS n FROM t GROUP BY g",
+        ),
+        (
+            "WITH x AS (SELECT g, SUM(v) AS s FROM t WHERE id > 3 GROUP BY g) SELECT g, s * 2 AS d FROM x WHERE s > 10 ORDER BY g",
+            "SELECT g, SUM(v) * 2 AS d FROM t WHERE id > 3 GROUP BY g HAVING SUM(v) > 10 ORDER BY g",
+        ),
+    ] {
+        let c = read(&cat, cte).unwrap_or_else(|e| panic!("`{cte}`: {e:?}"));
+        let f = read(&cat, flat).unwrap_or_else(|e| panic!("`{flat}`: {e:?}"));
+        assert_eq!(explain_lines(&c, false), explain_lines(&f, false), "`{cte}`");
+        assert_eq!(c.spec(), f.spec(), "`{cte}`");
+        assert_eq!(visible(c.reply_schema()), visible(f.reply_schema()), "`{cte}`");
     }
 }

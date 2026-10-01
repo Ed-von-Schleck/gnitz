@@ -179,37 +179,3 @@ fn a_numeric_literal_binds_as_its_narrowest_exact_form() {
         assert_eq!(got, want, "{src}");
     }
 }
-
-/// LIMIT/OFFSET read the same decoder, so `(10)` and `+10` are counts; a
-/// negative or fractional one names itself in the message.
-#[test]
-fn expr_usize_literal_reads_the_constant_decoder() {
-    for src in ["10", "+10", "(10)", "((+10))"] {
-        assert_eq!(expr_usize_literal(&parse_expr_sql(src), "LIMIT").unwrap(), 10, "{src}");
-    }
-    for (src, want) in [
-        ("-1", "'-1'"),
-        ("1.5", "'1.5'"),
-        ("'x'", "not an expression"),
-        ("NULL", "not an expression"),
-        ("a", "not an expression"),
-        ("1 + 1", "not an expression"),
-    ] {
-        let m = rejected(expr_usize_literal(&parse_expr_sql(src), "LIMIT"));
-        assert!(m.contains(want), "{src}: {m}");
-    }
-}
-
-/// ORDER BY / GROUP BY positions stay narrower than a constant on purpose:
-/// `(1)` and `+1` are expressions over the output, not positions into it.
-#[test]
-fn clause_position_is_narrower_than_a_constant() {
-    assert_eq!(clause_position(&parse_expr_sql("1"), "ORDER BY").unwrap(), Some(1));
-    for src in ["(1)", "+1", "a"] {
-        assert_eq!(
-            clause_position(&parse_expr_sql(src), "ORDER BY").unwrap(),
-            None,
-            "{src}"
-        );
-    }
-}

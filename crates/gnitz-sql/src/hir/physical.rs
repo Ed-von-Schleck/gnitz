@@ -5,9 +5,9 @@
 //! split + the PK-front convention, whose single home is `place_pk_front`).
 
 use super::{as_col, ColId, HirCol, HirExpr, ProjEntry};
-use crate::codec::project_schema::{leading_schema, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
+use crate::project::{leading_schema, ProjItem};
 use gnitz_core::{RelDescriptor, Schema};
 use gnitz_wire::ColumnDef;
 use std::collections::HashSet;

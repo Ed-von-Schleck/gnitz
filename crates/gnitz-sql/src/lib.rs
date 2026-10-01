@@ -19,6 +19,8 @@ mod exec;
 mod expr_lower;
 mod hir;
 mod ir;
+mod project;
+mod rules;
 #[cfg(test)]
 mod suites;
 mod tail;
