@@ -69,7 +69,11 @@ impl Schema {
             let cd = &self.columns[c as usize];
             (cd.ty.tc, cd.is_nullable)
         })
-        .map_err(|r| r.for_role(gnitz_wire::PkListRole::PrimaryKey))
+        .map_err(|r| {
+            r.named(gnitz_wire::PkListRole::PrimaryKey, |c| {
+                self.columns.get(c as usize).map(|cd| cd.name.as_str())
+            })
+        })
     }
 
     /// Fallible constructor for a schema assembled from untrusted parts — a

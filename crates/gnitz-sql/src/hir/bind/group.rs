@@ -1,9 +1,8 @@
 //! GROUP BY / aggregate / HAVING binding: the reduce, the pre-map under it and
 //! the leaf its HAVING and SELECT list bind through.
 
-use super::super::{as_col, hircol_of, ColId, ColIdGen, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr};
+use super::super::{as_col, hircol_of, ColId, ColIdGen, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr, Value};
 use super::{bind_projection, clause_error, place_order_keys, ItemLeaf, ScopeLeaf, Surface};
-use crate::agg::default_agg_name;
 use crate::agg::AggFunc;
 use crate::ast_util::{
     classify_agg_call, col_ref_parts, for_each_agg_call, group_by_exprs, is_agg_call, projection_item_expr,
@@ -12,7 +11,7 @@ use crate::ast_util::{
 use crate::bind::{bind_structural, LeafBinder};
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
-use crate::rules::reject_float_key;
+use crate::rules::reject_float_keys;
 use crate::tail::group_by_target;
 use gnitz_wire::{ColType, ColumnDef};
 use sqlparser::ast::{Expr, Function, NamedWindowExpr, Select};
@@ -104,7 +103,7 @@ fn resolve_group_cols(
         // The key binds through the FROM leaf, whose rejection names the column but
         // not the clause it was written in.
         let id = pre.column_for(target, leaf).map_err(|e| clause_error("GROUP BY", e))?;
-        reject_float_key(&hircol_of(&pre.env, id).def, "GROUP BY")?;
+        reject_float_keys([&hircol_of(&pre.env, id).def], "GROUP BY")?;
         cols.push(id);
     }
     Ok(cols)
@@ -239,10 +238,7 @@ pub(super) fn bind_grouped_suffix(
         }
     }
     let input = match distinct {
-        Some(arg) => {
-            reject_float_key(&hircol_of(&pre.env, arg).def, "DISTINCT aggregate")?;
-            RelExpr::distinct(RelExpr::project(input, pre.items_for(&reads)))?
-        }
+        Some(_) => RelExpr::distinct(RelExpr::project(input, pre.items_for(&reads)), "DISTINCT aggregate")?,
         None if pre.extra.is_empty() => input,
         None => RelExpr::project(input, pre.items_for(&reads)),
     };
@@ -341,25 +337,9 @@ impl ItemLeaf for GroupedLeaf<'_> {
     fn wildcard_cols(&self, _: Option<&str>) -> Result<Option<Vec<&HirCol>>, GnitzSqlError> {
         Ok(None)
     }
-    /// An item that *is* an aggregate call takes that aggregate's own name,
-    /// type and nullability — kept out of the computed branch, which hardcodes
-    /// nullability to `true` and would declare a COUNT column nullable.
-    fn call_item(
-        &self,
-        f: &Function,
-        alias: &Option<String>,
-        idx: usize,
-    ) -> Option<Result<(HirExpr, ColumnDef), GnitzSqlError>> {
-        if !is_agg_call(f) {
-            return None;
-        }
-        Some(self.find_agg(f).map(|agg| {
-            let name = alias.clone().unwrap_or_else(|| default_agg_name(agg.func, idx));
-            (
-                agg.finalize(),
-                ColumnDef::typed(name, agg.view_type(), agg.view_nullable()),
-            )
-        }))
+    /// An aggregate call item takes that aggregate's own type and nullability.
+    fn call_item(&self, f: &Function) -> Option<Result<Value, GnitzSqlError>> {
+        is_agg_call(f).then(|| self.find_agg(f).map(HirAgg::as_value))
     }
 }
 

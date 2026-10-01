@@ -288,6 +288,47 @@ fn validate_pk_tuple_names_each_rule() {
     }
 }
 
+/// A rule names a column by the name its caller holds for it, and by its index
+/// where the caller holds none.
+#[test]
+fn a_pk_rule_names_the_columns_its_caller_can() {
+    let names = ["id", "price"];
+    let name = |c: u32| names.get(c as usize).copied();
+    let role = PkListRole::PrimaryKey;
+    for (rule, named, positional) in [
+        (
+            PkRule::Duplicate { col: 1 },
+            "primary key names column 'price' twice",
+            "primary key names column 1 twice",
+        ),
+        (
+            PkRule::Nullable { col: 0 },
+            "primary key column 'id' must not be nullable",
+            "primary key column 0 must not be nullable",
+        ),
+        (
+            PkRule::Nullable { col: 7 },
+            "primary key column 7 must not be nullable",
+            "primary key column 7 must not be nullable",
+        ),
+        (
+            PkRule::IndexOutOfRange { col: 1 },
+            "primary key index 1 out of bounds",
+            "primary key index 1 out of bounds",
+        ),
+    ] {
+        assert_eq!(rule.named(role, name), named, "{rule:?}");
+        assert_eq!(rule.for_role(role), positional, "{rule:?}");
+    }
+    let float = PkRule::NotEligible { col: 1, type_code: TypeCode::F64 };
+    assert!(float
+        .named(role, name)
+        .starts_with("primary key column 'price' has type_code F64;"));
+    assert!(float
+        .for_role(role)
+        .starts_with("primary key column 1 has type_code F64;"));
+}
+
 /// An index key promotes each column, and its record — the key columns plus the
 /// source PK — is capped in arity.
 #[test]

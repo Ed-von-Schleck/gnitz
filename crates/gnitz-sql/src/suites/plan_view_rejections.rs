@@ -589,6 +589,22 @@ fn scalar_expression_rules() {
     }
     // Summing day counts yields a number that is not a date.
     rejects(&cat, &[("SELECT SUM(d) AS y FROM x", "DATE column")]);
+    // The over-scale product is refused as itself wherever it is written — below a
+    // reduce or a window as much as in the SELECT list.
+    let q7 = "q3 * q3 * q3 * q3 * q3 * q3 * q3";
+    for body in [
+        format!("SELECT {q7} AS k, COUNT(*) AS n FROM xd GROUP BY {q7}"),
+        format!("SELECT SUM({q7}) AS s FROM xd"),
+        format!("SELECT id, SUM({q7}) OVER (PARTITION BY id) AS s FROM xd"),
+        format!("SELECT id, COUNT(*) OVER (PARTITION BY {q7}) AS n FROM xd"),
+    ] {
+        let sql = format!("CREATE VIEW v AS {body}");
+        assert_eq!(
+            rejected(plan(&cat, &sql)),
+            "DECIMAL scale 21 exceeds 18; CAST an operand to a narrower scale",
+            "{body}"
+        );
+    }
 }
 
 #[test]
@@ -615,10 +631,6 @@ fn cte_and_derived_table_rules() {
             ),
             (
                 "WITH _cte AS (SELECT id FROM t WHERE id > 0) SELECT id FROM _cte",
-                "cannot start with '_'",
-            ),
-            (
-                "SELECT x FROM (SELECT id AS x FROM t) AS _seg4096",
                 "cannot start with '_'",
             ),
             ("SELECT * FROM _seg4096", "cannot start with '_'"),
@@ -757,17 +769,30 @@ fn capacity_rules() {
     rejects(
         &cat,
         &[
-            ("SELECT id, v FROM bv", "capacity-bounded"),
+            (
+                "SELECT id, v FROM bv",
+                "'bv' is a capacity-bounded view; CREATE VIEW requires a relation a view can be created over \
+                 (a capacity-bounded view is a leaf)",
+            ),
             ("SELECT bv.id, u.v FROM bv JOIN u ON bv.id = u.g", "capacity-bounded"),
             ("SELECT id FROM t WHERE id IN (SELECT id FROM bv)", "capacity-bounded"),
             ("WITH x AS (SELECT id, v FROM bv) SELECT id FROM x", "capacity-bounded"),
         ],
     );
     let sql = "ALTER VIEW bv AS SELECT id, v FROM t WHERE v > 0";
-    assert_rejects(sql, plan(&cat, sql), "capacity-bounded");
+    assert_rejects(
+        sql,
+        plan(&cat, sql),
+        "'bv' is a capacity-bounded view; ALTER VIEW requires a view created without WITH options \
+         (DROP and CREATE the view instead)",
+    );
     // A fed view cannot be retargeted either: its feed would be silently dropped.
     let sql = "ALTER VIEW fv AS SELECT id, v FROM t WHERE v > 0";
-    assert_rejects(sql, plan(&cat, sql), "delta feed");
+    assert_rejects(
+        sql,
+        plan(&cat, sql),
+        "'fv' is a view with a delta feed; ALTER VIEW requires a view created without WITH options",
+    );
 }
 
 /// Both retarget spellings: never onto a body that reads the view itself, and

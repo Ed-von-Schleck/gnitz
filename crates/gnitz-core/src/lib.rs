@@ -14,8 +14,8 @@ mod protocol;
 mod test_support;
 
 pub use client::{
-    key_reply, not_found, qualified_name, retraction_batch, segment_id, FkTarget, GnitzClient, InlineForeignKey,
-    InlineUniqueIndex, ParkHook, PlannedView, ViewBundle, MAX_CHAIN_SEGMENTS, RMW_MAX_ATTEMPTS,
+    key_reply, not_found, qualified_name, retraction_batch, segment_id, FkTarget, GnitzClient, IndexRow,
+    InlineForeignKey, InlineUniqueIndex, ParkHook, PlannedView, ViewBundle, MAX_CHAIN_SEGMENTS, RMW_MAX_ATTEMPTS,
 };
 pub use connection::{
     Completions, DeltaCursor, Encoded, IdRun, Interest, RelDescriptor, RelTarget, Reply, Request, ScanReply,

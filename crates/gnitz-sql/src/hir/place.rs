@@ -5,7 +5,7 @@
 use super::{cross_comparison, side, EqPair, HirCol, HirExpr, HirRange, JoinClass, JoinShape, JoinType, RelExpr, Side};
 use crate::error::GnitzSqlError;
 use crate::ir::BinOp;
-use crate::rules::{reject_float_keys, reject_pk_list_arity};
+use crate::rules::{reject_arity, reject_float_keys};
 use gnitz_wire::{ColumnDef, JoinKeyRule, TypeCode};
 use std::rc::Rc;
 
@@ -26,9 +26,10 @@ impl RelExpr {
     ) -> Result<Rc<RelExpr>, GnitzSqlError> {
         let on = on.into_iter().flat_map(HirExpr::conjuncts).collect();
         let placed = place(&left, &right, kind, JoinClass::default(), on, Origin::On)?;
-        reject_pk_list_arity(
+        reject_arity(
             "join key list",
             placed.class.eq.len() + usize::from(placed.class.range.is_some()),
+            gnitz_wire::PK_LIST_MAX_COLS,
         )?;
         reject_join_shape(kind, placed.class.shape())?;
         reject_outer_with_residual(kind, &placed.above)?;

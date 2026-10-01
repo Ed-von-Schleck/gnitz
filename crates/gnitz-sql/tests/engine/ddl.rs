@@ -127,13 +127,38 @@ fn create_index_naming_and_rejections() {
     db.exec("CREATE INDEX ON t(a)");
     db.refuses("CREATE INDEX ON t(a)", Rejected, "already exists");
     db.refuses("CREATE INDEX my_idx ON t(c)", Refused(Error), "already exists");
-    // `(a, b_c)` and `(a_b, c)` render the same base; the second gets `_2`.
+    // `(a, b_c)` and `(a_b, c)` render the same base; the second gets `_2`, and
+    // is recognized under it when it is asked for again.
     db.exec(&format!(
         "DROP INDEX my_idx; DROP INDEX {sn}__t__idx_a;
-         CREATE INDEX ON t(a, b_c); CREATE INDEX ON t(a_b, c);
-         DROP INDEX {sn}__t__idx_a_b_c; DROP INDEX {sn}__t__idx_a_b_c_2"
+         CREATE INDEX ON t(a, b_c); CREATE INDEX ON t(a_b, c)"
+    ));
+    db.refuses(
+        "CREATE INDEX ON t(a_b, c)",
+        Rejected,
+        &format!("already exists as '{sn}__t__idx_a_b_c_2'"),
+    );
+    db.exec(&format!(
+        "DROP INDEX {sn}__t__idx_a_b_c; DROP INDEX {sn}__t__idx_a_b_c_2"
     ));
     assert!(db.indexes("t").is_empty());
+
+    // A plain auto-named index does not stand in for a unique one on its column,
+    // while the unique one stands in for both. The two share one circuit.
+    db.exec("CREATE INDEX ON t(c)");
+    assert_eq!(db.indexes("t"), [(vec!["c".to_string()], false)]);
+    db.exec("ALTER TABLE t ADD UNIQUE (c)");
+    assert_eq!(db.indexes("t"), [(vec!["c".to_string()], true)]);
+    db.refuses("ALTER TABLE t ADD UNIQUE (c)", Rejected, &format!("'{sn}__t__idx_c_2'"));
+    db.refuses("CREATE INDEX ON t(c)", Rejected, &format!("'{sn}__t__idx_c'"));
+    db.exec(&format!("DROP INDEX {sn}__t__idx_c; DROP INDEX {sn}__t__idx_c_2"));
+    assert!(db.indexes("t").is_empty());
+
+    // A quoted column name is not an identifier; the index name built from it is.
+    db.exec(&format!(
+        "CREATE TABLE q (id BIGINT PRIMARY KEY, \"a b\" BIGINT);
+         CREATE INDEX ON q(\"a b\"); DROP INDEX {sn}__q__idx_a_b; DROP TABLE q"
+    ));
 
     for (sql, needle) in [
         ("CREATE INDEX _bad ON t(a)", "cannot start with '_'"),
@@ -144,7 +169,10 @@ fn create_index_naming_and_rejections() {
         ("DROP TABLE t PURGE", "PURGE"),
         // An ineligible column is named, on both index surfaces.
         ("CREATE INDEX ON t(s)", "'s'"),
-        ("CREATE INDEX ON t(f)", "'f'"),
+        (
+            "CREATE INDEX ON t(f)",
+            "CREATE INDEX: column 'f' of type F64 cannot be an index key",
+        ),
         ("CREATE UNIQUE INDEX ON t(s)", "'s'"),
         ("CREATE INDEX ON t(ghost)", "ghost"),
         ("CREATE INDEX ON t(a, a)", "duplicate column"),
@@ -361,16 +389,17 @@ fn a_multi_name_drop_is_one_atomic_zone() {
     db.refuses("DROP TABLE a, b", Refused(Error), "View dependency");
     assert!(db.exists("a"), "a is untouched");
 
-    // Two `-1`s on one catalog PK is not a retraction the engine accepts.
-    db.refuses("DROP TABLE a, A", Rejected, "named more than once");
+    // A name written twice retires once.
+    db.exec("DROP TABLE a, A");
+    assert!(!db.exists("a"));
 
     // A FK child co-dropped in the same batch is self-resolving, so the pair
     // drops in either written order.
     db.exec("DROP TABLE parent, child");
     assert!(!db.exists("parent") && !db.exists("child"));
 
-    db.exec("DROP VIEW keeper; DROP TABLE a, b");
-    assert!(!db.exists("a") && !db.exists("b"));
+    db.exec("DROP VIEW keeper, keeper; DROP TABLE b");
+    assert!(!db.exists("keeper") && !db.exists("b"));
 }
 
 /// A qualifier naming the session schema is accepted on every name surface;

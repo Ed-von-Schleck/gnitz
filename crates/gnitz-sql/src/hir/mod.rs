@@ -337,6 +337,10 @@ impl IntoIterator for AggCols {
     }
 }
 
+/// A value column: what computes it, and the type and nullability it is declared
+/// with.
+pub(crate) type Value = (HirExpr, ColType, bool);
+
 /// One aggregate over a reduce: the logical `func(arg)`, and the physical value
 /// and count columns ([`crate::agg::agg_ops`]) it may share with other aggregates.
 #[derive(Clone)]
@@ -419,9 +423,8 @@ impl HirAgg {
         self.companion.is_some() || self.out.col.def.is_nullable
     }
 
-    /// This aggregate as a view-facing value column: what computes it, and the
-    /// type and nullability that value is declared with.
-    pub(crate) fn as_value(&self) -> (HirExpr, ColType, bool) {
+    /// This aggregate as a view-facing value column.
+    pub(crate) fn as_value(&self) -> Value {
         (self.finalize(), self.view_type(), self.view_nullable())
     }
 }
@@ -698,11 +701,10 @@ impl RelExpr {
         Rc::new(RelExpr::Reduce { input, group_cols, aggs })
     }
 
-    /// A DISTINCT over every column of its input, or the input itself when it is
-    /// already a set. The one home of the float rule for a DISTINCT row identity,
-    /// which the lowering keys on a hash of.
-    pub(crate) fn distinct(input: Rc<RelExpr>) -> Result<Rc<RelExpr>, GnitzSqlError> {
-        crate::rules::reject_float_keys(input.cols().iter().map(|c| &c.def), "SELECT DISTINCT")?;
+    /// A DISTINCT over every column of `input`, or `input` itself when it is
+    /// already a set. `role` names the clause in the refusal of a float column.
+    pub(crate) fn distinct(input: Rc<RelExpr>, role: &str) -> Result<Rc<RelExpr>, GnitzSqlError> {
+        crate::rules::reject_float_keys(input.cols().iter().map(|c| &c.def), role)?;
         // Already a set: nothing to deduplicate.
         if input.unique_key().is_some() {
             return Ok(input);

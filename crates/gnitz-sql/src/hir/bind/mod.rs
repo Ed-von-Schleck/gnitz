@@ -16,25 +16,24 @@ mod subquery;
 
 use super::{
     as_col, col_by_id, hircol_of, ColId, ColIdGen, HirCol, HirExpr, JoinType, ProjEntry, RelExpr, SetOpKind,
-    SubqueryKind, SubqueryRef, TopNKey,
+    SubqueryKind, SubqueryRef, TopNKey, Value,
 };
 use crate::ast_util::{
-    aliased_def, body_is_grouped, col_ref_parts, expand_wildcard_item, extract_table_name_and_alias,
-    has_exists_in_subquery, has_scalar_subquery, has_visible_column, peel_nested, scalar_projection_item,
-    select_has_window, select_is_distinct,
+    body_is_grouped, col_ref_parts, expand_wildcard_item, extract_table_name_and_alias, has_exists_in_subquery,
+    has_scalar_subquery, has_visible_column, peel_nested, scalar_projection_item, select_has_window,
+    select_is_distinct, single_fn_name,
 };
 use crate::bind::apply_positional_aliases;
 use crate::bind::{bind_conjuncts, bind_structural, find_unique_column, output_column, Catalog, LeafBinder};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::ir::BExpr;
-use crate::rules::{require_class, validate_user_name, ClassWant};
+use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, ClassWant};
 use crate::tail::{extract_limit, extract_offset, key_slots, order_exprs, parse_order_by, OrderKey};
 use crate::validate::{
-    cte_body, non_recursive_ctes, reject_duplicate_projection_names, reject_query_envelope_body,
-    reject_unhonored_select_clauses, HonoredClauses,
+    cte_body, non_recursive_ctes, reject_query_envelope_body, reject_unhonored_select_clauses, HonoredClauses,
 };
 use gnitz_core::RelDescriptor;
-use gnitz_wire::{ColType, ColumnDef, RelClass, TypeCode};
+use gnitz_wire::{ColType, ColumnDef, TypeCode};
 use group::bind_grouped_suffix;
 use join::{fold_join_step, join_keys_and_type};
 use sqlparser::ast::{
@@ -54,15 +53,15 @@ use subquery::bind_linear_subquery_body;
 /// defines it: a CTE shadows a catalog name, and a later CTE sees earlier ones.
 pub(crate) fn bind_ctes(cx: &mut BindCx<'_>, query: &Query) -> Result<(), GnitzSqlError> {
     for cte in non_recursive_ctes(query)? {
-        let name = cte.alias.name.value.clone();
+        let name = &cte.alias.name.value;
         // A CTE name is a relation name later references resolve, so it is held
         // to the reserved-prefix rule every such name passes.
-        validate_user_name(&name)?;
+        let canonical = canonical_user_name(name)?;
         let ctx = format!("CTE '{name}'");
         let rel = bind_body(cx, cte_body(cte, &ctx)?)?;
         let (rel, mut defs) = collapse_identity(rel);
         apply_positional_aliases(cte.alias.columns.iter().map(|a| &a.name), defs.iter_mut(), &ctx)?;
-        cx.ctes.insert(name.to_ascii_lowercase(), Cte { rel, defs });
+        cx.ctes.insert(canonical, Cte { rel, defs });
     }
     Ok(())
 }
@@ -165,17 +164,11 @@ fn resolve_relation(cx: &mut BindCx<'_>, name: &str) -> Result<Rc<RelExpr>, Gnit
             cx.cat.schema_name()
         )));
     }
-    match (cx.surface, rel.class) {
-        (Surface::AdhocRead { op }, _) => require_class(&rel, name, ClassWant::Readable, op)?,
-        // Leaf rule: a bounded view's skeleton rows hydrate by replaying its sources,
-        // which a view over it cannot reach.
-        (Surface::ViewBody, RelClass::BoundedView) => {
-            return Err(GnitzSqlError::Rejected(format!(
-                "'{name}' is a capacity-bounded view; views cannot be created over it"
-            )))
-        }
-        (Surface::ViewBody, RelClass::Table | RelClass::Stream | RelClass::View | RelClass::FedView) => {}
-    }
+    let (want, op) = match cx.surface {
+        Surface::AdhocRead { op } => (ClassWant::Readable, op),
+        Surface::ViewBody => (ClassWant::ViewSource, cx.view.stmt),
+    };
+    require_class(&rel, name, want, op)?;
     cx.names.push((rel.tid, name.to_string()));
     Ok(RelExpr::get(cx.ids, rel))
 }
@@ -309,10 +302,6 @@ fn resolve_table_factor(
                 "a derived table (subquery in FROM) needs an alias".to_string(),
             ));
         };
-        // The alias is a user-visible name, so it is held to the general
-        // user-identifier rule (a leading `_` is reserved for the `_seg…`
-        // hidden-segment namespace).
-        validate_user_name(&alias.name.value)?;
         let ctx = format!("derived table '{}'", alias.name.value);
         reject_if(*lateral, &ctx, "LATERAL")?;
         // Silently dropping TABLESAMPLE would return all rows — a wrong result.
@@ -461,7 +450,7 @@ fn bind_body_suffix(
         return Ok((projected, placed));
     }
     reject_unselected_distinct_keys(&projected, &placed, ctx)?;
-    Ok((RelExpr::distinct(projected)?, placed))
+    Ok((RelExpr::distinct(projected, "SELECT DISTINCT")?, placed))
 }
 
 /// DISTINCT dedups the selected columns, so an ORDER BY key that is not one of them —
@@ -494,13 +483,10 @@ fn expand_wildcard(
         .collect())
 }
 
-/// The leaf a SELECT list binds through, beyond expression binding: the
-/// columns it types, whether a bare `*` is an item, and what a top-level call
-/// item's output column is. One rule for the linear, grouped and windowed
-/// projections, so an item means the same thing wherever it is written.
+/// What a SELECT list needs of the leaf it binds through, beyond expression
+/// binding.
 pub(crate) trait ItemLeaf: LeafBinder<ColId> {
-    /// The columns in scope — the typing table for every `ColId` this leaf
-    /// hands out.
+    /// The source columns in scope.
     fn env(&self) -> &[HirCol];
     /// The projection of `items` over `source`. The subquery-binding leaf joins in
     /// the subqueries its items and `source`'s filter read.
@@ -511,21 +497,15 @@ pub(crate) trait ItemLeaf: LeafBinder<ColId> {
     /// wildcard is not an item: a grouped body, where every item is a group key
     /// or an aggregate, and a body reading no relation.
     fn wildcard_cols(&self, qualifier: Option<&str>) -> Result<Option<Vec<&HirCol>>, GnitzSqlError>;
-    /// A top-level function-call item's value and output def — an aggregate in
-    /// a grouped body takes its own name, type and nullability, a window call
-    /// its placeholder's — or `None` to bind the item as any other expression.
-    fn call_item(
-        &self,
-        _f: &Function,
-        _alias: &Option<String>,
-        _idx: usize,
-    ) -> Option<Result<(HirExpr, ColumnDef), GnitzSqlError>> {
+    /// A top-level function-call item's value, type and nullability — or `None` to
+    /// bind the item as any other expression.
+    fn call_item(&self, _f: &Function) -> Option<Result<Value, GnitzSqlError>> {
         None
     }
 }
 
 /// Resolve every SELECT item into a `ProjEntry` in SELECT order, expanding a bare
-/// `*` via [`expand_wildcard`], and refuse two visible items of one name.
+/// `*` via [`expand_wildcard`], and refuse two items of one name.
 pub(crate) fn bind_projection<L: ItemLeaf>(
     projection: &[SelectItem],
     leaf: &L,
@@ -552,13 +532,16 @@ pub(crate) fn bind_projection<L: ItemLeaf>(
         let (expr, alias) = scalar_projection_item(item, ctx)?;
         items.push(bind_scalar_item(expr, alias, idx, leaf, ids)?);
     }
-    reject_duplicate_projection_names(projection, items.iter().map(|e| &e.out.def), ctx)?;
+    // A projection naming nothing of its own (`*`, `* EXCEPT/EXCLUDE`) is exempt: a
+    // duplicate among the source's own names rides through positionally.
+    if !crate::ast_util::is_name_preserving_wildcard_projection(projection) {
+        reject_duplicate_names(items.iter().map(|e| e.out.def.name.as_str()), ctx)?;
+    }
     Ok(items)
 }
 
-/// Bind one scalar item: a top-level call the leaf claims (an aggregate in a
-/// grouped body) takes the leaf's own value and def; anything else binds as an
-/// expression.
+/// Bind one scalar SELECT item to its output column. Unaliased, the item at
+/// position `idx` is named `_{stem}{idx}`.
 fn bind_scalar_item<L: ItemLeaf>(
     expr: &Expr,
     alias: Option<String>,
@@ -566,47 +549,30 @@ fn bind_scalar_item<L: ItemLeaf>(
     leaf: &L,
     ids: &ColIdGen,
 ) -> Result<ProjEntry, GnitzSqlError> {
+    let default = |stem: &str| format!("_{stem}{idx}");
     if let Expr::Function(f) = peel_nested(expr) {
-        if let Some(call) = leaf.call_item(f, &alias, idx) {
-            let (expr, def) = call?;
+        if let Some(call) = leaf.call_item(f) {
+            let (expr, ty, nullable) = call?;
+            let stem = single_fn_name(f).unwrap_or("expr").to_ascii_lowercase();
+            let def = ColumnDef::typed(alias.unwrap_or_else(|| default(&stem)), ty, nullable);
             return Ok(ProjEntry { expr, out: HirCol::new(ids.next(), def) });
         }
     }
-    bind_proj_expr(expr, alias, idx, leaf, ids)
-}
-
-/// Bind one non-wildcard SELECT expression into a `ProjEntry`. A bare (possibly
-/// aliased/qualified/parenthesized) column reference binds to a pass-through
-/// carrying the source column's def (alias only renames); anything else is a
-/// computed column, named and typed by [`crate::rules::computed_column`].
-///
-/// A hidden column has no name the user wrote, so it takes a computed column's
-/// name — but it is still copied through, so it keeps its own type and
-/// nullability. Only the grouped leaf can reach one — it resolves a written
-/// composite GROUP BY key to the pre-map column holding it — since every other
-/// leaf resolves names through `find_unique_column`, which skips hidden columns.
-fn bind_proj_expr<L: ItemLeaf>(
-    expr: &Expr,
-    alias: Option<String>,
-    idx: usize,
-    leaf: &L,
-    ids: &ColIdGen,
-) -> Result<ProjEntry, GnitzSqlError> {
     let bound = bind_structural(expr, leaf)?;
-    // A column the leaf minted (a window value, a subquery) is not in its env.
-    let src_def = as_col(&bound).and_then(|id| col_by_id(leaf.env(), id)).map(|c| &c.def);
-    let out_def = match src_def {
-        Some(d) if !d.is_hidden => aliased_def(d, alias),
-        Some(d) => ColumnDef::typed(
-            alias.unwrap_or_else(|| crate::rules::computed_column_name(idx)),
-            d.ty,
-            d.is_nullable,
-        ),
-        None => crate::rules::computed_column(alias, idx, bound.infer_ty_with(&|r| leaf.type_of(r)))?,
-    };
+    let copied = as_col(&bound);
+    // `None` for a column the leaf minted.
+    let src = copied.and_then(|id| col_by_id(leaf.env(), id));
+    let src_name = src.filter(|c| !c.def.is_hidden).map(|c| c.def.name.clone());
+    let ty = bound.infer_ty_with(&|r| leaf.type_of(r));
+    let def = ColumnDef::typed(
+        alias.or(src_name).unwrap_or_else(|| default("expr")),
+        // A copied column keeps its type; a computed one is stored as its register.
+        if copied.is_some() { ty } else { ty.register_image() },
+        src.is_none_or(|c| c.def.is_nullable),
+    );
     Ok(ProjEntry {
         expr: bound,
-        out: HirCol::new(ids.next(), out_def),
+        out: HirCol::new(ids.next(), def),
     })
 }
 
@@ -875,12 +841,10 @@ pub(crate) fn bind_returning(
 /// Which statement a body is bound for.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Surface {
-    /// A `CREATE VIEW` body: admits window calls and DISTINCT aggregates, and
-    /// reads anything but a capacity-bounded view.
+    /// A view body.
     ViewBody,
-    /// An ad-hoc read, which lowers to one stateless read of one relation: it
-    /// admits neither window calls nor DISTINCT aggregates, and reads only a
-    /// relation holding rows. `op` names the read in a class rejection.
+    /// An ad-hoc read, which lowers to one stateless read of one relation. `op`
+    /// names the read in a class rejection.
     AdhocRead { op: &'static str },
 }
 
@@ -901,7 +865,7 @@ pub(super) fn place_order_keys<L: ItemLeaf>(
         }
         // A leaf that registers while binding (a window call, a subquery) hands back a
         // column no existing item names, so such an entry never matches and is appended.
-        let mut entry = bind_scalar_item(e, Some(crate::rules::order_column_name(i)), i, leaf, ids)?;
+        let mut entry = bind_scalar_item(e, Some(format!("_order{i}")), i, leaf, ids)?;
         cols.push(match items.iter().position(|it| it.expr == entry.expr) {
             Some(at) => at,
             None => {

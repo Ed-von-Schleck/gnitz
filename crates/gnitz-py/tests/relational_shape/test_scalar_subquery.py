@@ -74,6 +74,9 @@ _VIEWS = [
     "avg_cmp AS SELECT a.id FROM a WHERE a.v < (SELECT AVG(w) FROM b)",
     "or_global AS SELECT a.id FROM a WHERE a.v = 0 OR a.v > (SELECT MIN(w) FROM b)",
     "shifted AS SELECT a.id FROM a WHERE a.v + 1 < (SELECT MAX(w) FROM b)",
+    # A bare extremum item is copied, so its column is as narrow as the one it reads.
+    "narrow AS SELECT a.id, (SELECT MAX(i) FROM n WHERE n.k = a.k) AS mi, "
+    "(SELECT MIN(f) FROM n WHERE n.k = a.k) AS mf FROM a",
 ]
 
 _CHURN = [
@@ -83,10 +86,15 @@ _CHURN = [
     ("INSERT INTO b VALUES (1, 10, 4), (2, 10, 10)", "b", {1: (10, 4), 2: (10, 10)}),
     # A genuine 0 minimum over the whole of b.
     ("INSERT INTO b VALUES (3, 20, 0)", "b", {3: (20, 0)}),
+    ("INSERT INTO n VALUES (1, 10, 7, 1.5), (2, 10, -3, -2.25), (3, 20, 2147483647, 0.5)", "n",
+     {1: (10, 7, 1.5), 2: (10, -3, -2.25), 3: (20, 2147483647, 0.5)}),
     ("INSERT INTO d VALUES (1, 5)", "d", {1: (5,)}),
     ("INSERT INTO d VALUES (2, NULL)", "d", {2: (None,)}),
     # The MIN of group 10 is retracted and re-derives from history.
     ("DELETE FROM b WHERE id = 1", "b", {1: None}),
+    # Both extrema of group 10 are retracted and re-derive at their own width.
+    ("DELETE FROM n WHERE id = 1", "n", {1: None}),
+    ("DELETE FROM n WHERE id = 2", "n", {2: None}),
     # Only a NULL left in d: SUM is NULL again.
     ("DELETE FROM d WHERE id = 1", "d", {1: None}),
     ("DELETE FROM b", "b", {2: None, 3: None}),
@@ -102,19 +110,21 @@ def test_a_scalar_subquery_reads_its_groups_ground_value_through_churn(client):
     what makes a negated ANY over an empty group TRUE. The uncorrelated forms join
     on the finalized ground value: NULL for MIN/MAX/SUM, so `v < MAX` and
     `v = MIN` admit nothing where a raw 0 would admit `v = 0` and `v < 0`, and 0
-    for COUNT."""
+    for COUNT. A bare MIN/MAX item over an INT and a FLOAT column is stored at that
+    column's width."""
     client.execute_sql(
         "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL); "
         "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, w BIGINT NOT NULL); "
         "CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, x BIGINT NOT NULL); "
         "CREATE TABLE d (id BIGINT NOT NULL PRIMARY KEY, y BIGINT); "
+        "CREATE TABLE n (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, i INT NOT NULL, f FLOAT NOT NULL); "
         + "; ".join(f"CREATE VIEW {v}" for v in _VIEWS) + "; "
         # k=10 sums to 105, so only a row that is its whole group reaches `own_group`;
         # v = 0 and v = -7 are the values a raw 0 ground would admit.
         "INSERT INTO a VALUES (1, 10, 100), (2, 10, 5), (3, 20, 7), (4, 30, 0), (5, 40, -7)")
     a = {1: (10, 100), 2: (10, 5), 3: (20, 7), 4: (30, 0), 5: (40, -7)}
 
-    state = {"b": {}, "c": {}, "d": {}}
+    state = {"b": {}, "c": {}, "d": {}, "n": {}}
     for sql in churn(client, state, _CHURN):
         b, c, d = state["b"], state["c"], state["d"]
         ws = {i: [w for bk, w in b.values() if bk == k] for i, (k, _) in a.items()}
@@ -164,3 +174,7 @@ def test_a_scalar_subquery_reads_its_groups_ground_value_through_churn(client):
             lambda i, k, v: bool(every_w) and v < sum(every_w) / len(every_w)), sql
         assert bag(scanned(client, "or_global"), "id") == ids(lambda i, k, v: v == 0 or _gt(v, low)), sql
         assert bag(scanned(client, "shifted"), "id") == ids(lambda i, k, v: _gt(top, v + 1)), sql
+        ns = {i: [(ni, nf) for nk, ni, nf in state["n"].values() if nk == k] for i, (k, _) in a.items()}
+        assert bag(scanned(client, "narrow"), "id", "mi", "mf") == {
+            (i, max((ni for ni, _ in g), default=None), min((nf for _, nf in g), default=None)): 1
+            for i, g in ns.items()}, sql

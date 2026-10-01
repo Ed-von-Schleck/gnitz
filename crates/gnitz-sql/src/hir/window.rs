@@ -39,14 +39,13 @@
 //! holds the band self-join's traces over `G`, one row per peer group.
 
 use super::bind::{bind_projection, ItemLeaf};
-use super::{col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinType, ProjEntry, RelExpr, TopNKey};
-use crate::agg::default_agg_name;
+use super::{col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinType, ProjEntry, RelExpr, TopNKey, Value};
 use crate::agg::{agg_func_from_name, AggFunc};
 use crate::ast_util::{classify_agg_shape, peel_nested, single_fn_name, unknown_function, CallSurface, PlainCall};
 use crate::bind::{bind_structural, LeafBinder};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::ir::{BExpr, BinOp};
-use crate::rules::reject_float_key_of;
+use crate::rules::reject_float_key;
 use gnitz_wire::{ColType, ColumnDef, TypeCode};
 use sqlparser::ast::{
     Expr, Function, Ident, NamedWindowDefinition, NamedWindowExpr, OrderByExpr, OrderByOptions, Select, WindowFrame,
@@ -251,16 +250,6 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
             .map(|c| (c.out.def.ty, c.out.def.is_nullable))
     }
 
-    /// The function the call behind placeholder `id` computes.
-    fn func_of(&self, id: ColId) -> Option<WinFunc> {
-        self.state
-            .borrow()
-            .calls
-            .iter()
-            .find(|c| c.out.id == id)
-            .map(|c| c.func)
-    }
-
     fn never_null(&self, e: &HirExpr) -> bool {
         e.never_null_with(&|r| self.inner.is_nullable(r), &|r| self.inner.type_of(r))
     }
@@ -406,9 +395,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
     /// join the user never wrote.
     fn check_key(&self, e: &HirExpr, role: &str, slot: KeySlot) -> Result<(), GnitzSqlError> {
         let tc = e.infer_ty_with(&|r| self.type_of(r)).tc;
-        if tc.is_float() {
-            return Err(reject_float_key_of("a float-valued expression", role));
-        }
+        reject_float_key(tc, None, role)?;
         if slot == KeySlot::Band && tc.is_german_string() {
             return Err(GnitzSqlError::Rejected(format!(
                 "{role}: a string cannot be the first ORDER BY key; its content hash is not \
@@ -512,25 +499,14 @@ impl<L: ItemLeaf> ItemLeaf for WindowLeaf<'_, L> {
     fn wildcard_cols(&self, qualifier: Option<&str>) -> Result<Option<Vec<&HirCol>>, GnitzSqlError> {
         self.inner.wildcard_cols(qualifier)
     }
-    fn call_item(
-        &self,
-        f: &Function,
-        alias: &Option<String>,
-        idx: usize,
-    ) -> Option<Result<(HirExpr, ColumnDef), GnitzSqlError>> {
+    fn call_item(&self, f: &Function) -> Option<Result<Value, GnitzSqlError>> {
         if f.over.is_none() {
-            return self.inner.call_item(f, alias, idx);
+            return self.inner.call_item(f);
         }
-        Some(self.bind_window_call(f).map(|out| {
-            // A windowed aggregate is named as the same aggregate written in a
-            // GROUP BY is, so one name↔aggregate table serves both.
-            let name = alias.clone().unwrap_or_else(|| match self.func_of(out.id) {
-                Some(WinFunc::Agg(agg)) => default_agg_name(agg, idx),
-                _ => format!("_{}{idx}", single_fn_name(f).unwrap_or("window").to_ascii_lowercase()),
-            });
-            let def = ColumnDef::typed(name, out.def.ty, out.def.is_nullable);
-            (BExpr::ColRef(out.id), def)
-        }))
+        Some(
+            self.bind_window_call(f)
+                .map(|out| (BExpr::ColRef(out.id), out.def.ty, out.def.is_nullable)),
+        )
     }
 }
 
@@ -769,9 +745,6 @@ struct Windowed {
     keys: Vec<(ColId, ColId)>,
     values: Vec<(ColId, ColId)>,
 }
-
-/// A value column of a reduce's projection: its expression, type, nullability.
-type Value = (HirExpr, ColType, bool);
 
 /// A reduce's aggregate list, deduplicated by `(function, argument)`, with each
 /// aggregate's index handed back so a value can address it.

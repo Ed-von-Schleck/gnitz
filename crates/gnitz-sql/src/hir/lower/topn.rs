@@ -5,7 +5,6 @@ use super::super::{ColId, RelExpr};
 use super::spine::{open, Top};
 use super::{keyed_frame, EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
-use crate::rules::reject_float_keys;
 use gnitz_wire::Circuit;
 use gnitz_wire::OrderKey;
 use std::collections::HashSet;
@@ -31,7 +30,6 @@ pub(super) fn lower_topn(chain: &mut ViewChain, rel: &RelExpr) -> Result<EmitPie
     );
 
     let group = frame.reduce_group(partition)?;
-    reject_float_keys(group.iter().map(|&c| &frame.schema.columns[c as usize]), "PARTITION BY")?;
     if order.len() > gnitz_wire::MAX_ORDER_KEYS {
         return Err(GnitzSqlError::Rejected(format!(
             "ORDER BY: more than {} keys",

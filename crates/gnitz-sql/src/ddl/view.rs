@@ -10,7 +10,7 @@ use crate::rules::{require_class, ClassWant};
 use crate::validate::{reject_unhonored_query_clauses, QueryEnvelope};
 use crate::SqlResult;
 use gnitz_core::{GnitzClient, ViewBundle};
-use gnitz_wire::{RelClass, ViewProps};
+use gnitz_wire::ViewProps;
 use sqlparser::ast::{CreateTableOptions, CreateView, Ident, ObjectName, Query, Value, ValueWithSpan};
 
 /// Binary units accepted by a `WITH (<option> = '<uint><unit>')` size string.
@@ -176,7 +176,9 @@ pub(crate) fn plan_alter_view(
     // Only `CREATE OR REPLACE VIEW` states a view's options.
     reject_if(!with_options.is_empty(), "ALTER VIEW", "WITH options")?;
     let view_name = extract_object_name(name, cat.schema_name(), "ALTER VIEW")?;
-    let old_vid = resolve_view_id(cat, &view_name)?;
+    let old = cat.probe_relation(&view_name)?;
+    require_class(&old, &view_name, ClassWant::PlainView, "ALTER VIEW")?;
+    let old_vid = old.tid;
     let view = ViewBody {
         stmt: "ALTER VIEW",
         replacing: Some(old_vid),
@@ -213,22 +215,6 @@ pub(crate) fn execute_view_chain(
 ) -> Result<SqlResult, GnitzSqlError> {
     client.create_view_chain(schema_name, &chain.name, chain.bundle, chain.props, chain.replacing)?;
     Ok(SqlResult::Ddl)
-}
-
-/// Resolve `name` to the id of a VIEW `ALTER VIEW … AS` may retarget.
-fn resolve_view_id(cat: &Catalog<'_>, name: &str) -> Result<u64, GnitzSqlError> {
-    let rel = cat.probe_relation(name)?;
-    require_class(&rel, name, ClassWant::View, "ALTER VIEW")?;
-    // `ALTER VIEW` states no options, so it would drop these.
-    let option = match rel.class {
-        RelClass::BoundedView => "a capacity-bounded view",
-        RelClass::FedView => "a view with a delta feed",
-        RelClass::View => return Ok(rel.tid),
-        RelClass::Table | RelClass::Stream => unreachable!("require_class admits views only"),
-    };
-    Err(GnitzSqlError::Rejected(format!(
-        "ALTER VIEW cannot retarget {option}; DROP and CREATE '{name}' instead"
-    )))
 }
 
 #[cfg(test)]

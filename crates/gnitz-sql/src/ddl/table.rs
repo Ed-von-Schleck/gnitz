@@ -8,10 +8,7 @@ use super::guard::{
 use crate::ast_util::{extract_index_name, extract_object_name, index_column_ident, simple_ident_expr};
 use crate::bind::{find_unique_column, Catalog};
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
-use crate::rules::{
-    canonical_user_name, non_key_eligible_error, reject_column_overflow, reject_duplicate_names,
-    reject_repeated_object, reject_unbuildable_index_key, require_class, ClassWant,
-};
+use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, ClassWant};
 use crate::types::column_def;
 use crate::SqlResult;
 use gnitz_core::{FkTarget, GnitzClient, InlineForeignKey, InlineUniqueIndex, Schema};
@@ -25,18 +22,23 @@ use sqlparser::ast::{
 };
 use std::collections::HashSet;
 
-/// Catalog name for an auto-generated (unnamed) secondary index:
-/// `{schema}__{table}__idx_{col1}_{col2}…`. `DROP INDEX <name>` resolves this
-/// exact string, so the format is a stable contract. Lowercased, so the base is
-/// canonical and [`disambiguate_index_name`] compares like with like.
+/// The canonical catalog name of an unnamed index:
+/// `{schema}__{table}__idx_{col1}_{col2}…`.
 fn default_index_name(schema_name: &str, table_name: &str, col_names: &[&str]) -> String {
-    format!("{schema_name}__{table_name}__idx_{}", col_names.join("_")).to_ascii_lowercase()
+    let name = format!("{schema_name}__{table_name}__idx_{}", col_names.join("_"));
+    // A quoted column name holds any byte; an index name holds identifier bytes.
+    name.bytes()
+        .map(|b| {
+            if gnitz_wire::is_valid_ident_char(b) {
+                b.to_ascii_lowercase() as char
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
-/// Return `base` if free, else the first `{base}_{n}` (n ≥ 2) not in `taken` —
-/// PostgreSQL's scheme, keeping the readable base for the common non-colliding
-/// case. Both are canonical: `base` comes from [`default_index_name`], `taken`
-/// from the catalog.
+/// `base` if free, else the first `{base}_{n}` (n ≥ 2) not in `taken`.
 fn disambiguate_index_name(base: String, taken: &HashSet<String>) -> String {
     if !taken.contains(&base) {
         return base;
@@ -48,6 +50,38 @@ fn disambiguate_index_name(base: String, taken: &HashSet<String>) -> String {
         }
     }
     unreachable!("u32 range exhausted")
+}
+
+/// Whether [`disambiguate_index_name`] can have named an index `name` from `base`.
+fn is_auto_name(name: &str, base: &str) -> bool {
+    match name.strip_prefix(base) {
+        Some("") => true,
+        Some(rest) => rest
+            .strip_prefix('_')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+        None => false,
+    }
+}
+
+/// Reject `key`, column indices into `cols`, as an index key the engine could not
+/// build, naming the column.
+fn reject_unbuildable_index_key(
+    cols: &[ColumnDef],
+    key: &[u32],
+    src_pk_count: usize,
+    role: &str,
+) -> Result<(), GnitzSqlError> {
+    let types: Vec<TypeCode> = key.iter().map(|&c| cols[c as usize].ty.tc).collect();
+    match gnitz_wire::index_key_types(&types, src_pk_count) {
+        Ok(_) => Ok(()),
+        Err(gnitz_wire::IndexKeyRule::NotEligible { col, type_code }) => Err(GnitzSqlError::Rejected(format!(
+            "{role}: column '{}' of type {type_code} cannot be an index key",
+            cols[key[col] as usize].name
+        ))),
+        Err(arity @ gnitz_wire::IndexKeyRule::ArityOutOfRange { .. }) => {
+            Err(GnitzSqlError::Rejected(arity.to_string()))
+        }
+    }
 }
 
 /// The FK child-type rule: a child adopts the referenced type, so its type must
@@ -239,10 +273,10 @@ fn parse_table_options(table_options: &CreateTableOptions) -> Result<TableProps,
 
 /// One UNIQUE constraint as written: the column list — one element for a
 /// column-level `UNIQUE`, the whole ordered list for a table-level one — and the
-/// `CONSTRAINT <name>` it carried, still in the user's own spelling.
+/// `CONSTRAINT <name>` it carried, canonical.
 struct UniqueDecl {
     cols: Vec<u32>,
-    raw_name: Option<String>,
+    name: Option<String>,
 }
 
 /// Record a UNIQUE constraint, refusing a column set already recorded:
@@ -252,7 +286,7 @@ fn push_unique(
     unique: &mut Vec<UniqueDecl>,
     cols: Vec<u32>,
     col_names: &[&str],
-    raw_name: Option<String>,
+    name: Option<&sqlparser::ast::Ident>,
 ) -> Result<(), GnitzSqlError> {
     if unique.iter().any(|u| u.cols == cols) {
         return Err(GnitzSqlError::Rejected(format!(
@@ -260,7 +294,8 @@ fn push_unique(
             col_names.join(", ")
         )));
     }
-    unique.push(UniqueDecl { cols, raw_name });
+    let name = name.map(|n| canonical_user_name(&n.value)).transpose()?;
+    unique.push(UniqueDecl { cols, name });
     Ok(())
 }
 
@@ -304,7 +339,7 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
                     &mut unique,
                     vec![i as u32],
                     &[col.name.value.as_str()],
-                    opt.name.as_ref().map(|n| n.value.clone()),
+                    opt.name.as_ref(),
                 )?,
                 _ => {}
             }
@@ -352,12 +387,7 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
                     return Err(GnitzSqlError::Rejected("UNIQUE constraint cannot be empty".into()));
                 }
                 let (col_names, col_indices) = resolve_index_columns(columns, &cols, "UNIQUE")?;
-                push_unique(
-                    &mut unique,
-                    col_indices,
-                    &col_names,
-                    name_ident.as_ref().map(|n| n.value.clone()),
-                )?;
+                push_unique(&mut unique, col_indices, &col_names, name_ident.as_ref())?;
             }
             _ => {}
         }
@@ -413,11 +443,14 @@ fn drop_unique_covered_by_pk(
     pk: &[u32],
 ) -> Result<(), GnitzSqlError> {
     let covered = pk_covered_unique(pk);
-    if let Some(u) = unique.iter().find(|u| u.cols == covered && u.raw_name.is_some()) {
+    if let Some(name) = unique
+        .iter()
+        .find(|u| u.cols == covered)
+        .and_then(|u| u.name.as_deref())
+    {
         return Err(GnitzSqlError::Rejected(format!(
-            "UNIQUE constraint '{}' on the primary-key column '{}' names no index: the primary \
+            "UNIQUE constraint '{name}' on the primary-key column '{}' names no index: the primary \
              key already provides the constraint",
-            u.raw_name.as_deref().unwrap_or_default(),
             cols[covered[0] as usize].name
         )));
     }
@@ -426,9 +459,7 @@ fn drop_unique_covered_by_pk(
 }
 
 /// Give each UNIQUE constraint the catalog name its index will carry: the written
-/// `CONSTRAINT <name>`, or [`default_index_name`] disambiguated against the rest
-/// of this bundle. Two written names folding to one canonical name are rejected —
-/// only one of the two IDX_TAB rows would be reachable by name.
+/// `CONSTRAINT <name>`, which no two may share, or an auto-name free in this bundle.
 fn name_unique_indexes(
     unique: Vec<UniqueDecl>,
     cols: &[ColumnDef],
@@ -438,17 +469,17 @@ fn name_unique_indexes(
     // Written names first: they are the fixed points auto-names route around.
     let mut taken: HashSet<String> = HashSet::new();
     for u in &unique {
-        if let Some(raw) = &u.raw_name {
-            if !taken.insert(canonical_user_name(raw)?) {
-                return Err(GnitzSqlError::Rejected(format!("duplicate constraint name '{raw}'")));
+        if let Some(name) = &u.name {
+            if !taken.insert(name.clone()) {
+                return Err(GnitzSqlError::Rejected(format!("duplicate constraint name '{name}'")));
             }
         }
     }
-    unique
+    Ok(unique
         .into_iter()
         .map(|u| {
-            let name = match u.raw_name {
-                Some(raw) => canonical_user_name(&raw)?,
+            let name = match u.name {
+                Some(name) => name,
                 None => {
                     let col_names: Vec<&str> = u.cols.iter().map(|&c| cols[c as usize].name.as_str()).collect();
                     let base = default_index_name(schema_name, table_name, &col_names);
@@ -457,9 +488,9 @@ fn name_unique_indexes(
                     name
                 }
             };
-            Ok(InlineUniqueIndex { col_indices: u.cols, name })
+            InlineUniqueIndex { col_indices: u.cols, name }
         })
-        .collect()
+        .collect())
 }
 
 /// A `CREATE TABLE`'s bundle: the table and its inline unique indexes.
@@ -606,8 +637,6 @@ pub(crate) fn plan_create_table(
         return Ok(None);
     }
 
-    // The column cap is O(1) over the AST; the fold below is per column.
-    reject_column_overflow("table definition", create.columns.len())?;
     // Before any column list is resolved: a repeat would otherwise surface as an
     // ambiguous *reference*, when it is the definition that is wrong.
     reject_duplicate_names(create.columns.iter().map(|c| c.name.value.as_str()), "table definition")?;
@@ -663,17 +692,8 @@ pub(crate) fn plan_create_table(
         cols[i as usize].is_nullable = false;
     }
 
-    gnitz_wire::validate_pk_tuple(&pk_indices, cols.len(), gnitz_wire::PK_LIST_MAX_COLS, |c| {
-        let cd = &cols[c as usize];
-        (cd.ty.tc, cd.is_nullable)
-    })
-    .map_err(|rule| match rule {
-        gnitz_wire::PkRule::NotEligible { col, .. } => {
-            let cd = &cols[col as usize];
-            non_key_eligible_error(&cd.name, cd.ty.tc, "PRIMARY KEY")
-        }
-        other => GnitzSqlError::Rejected(other.for_role(gnitz_wire::PkListRole::PrimaryKey)),
-    })?;
+    let schema = Schema::from_parts(cols, pk_indices).map_err(GnitzSqlError::Rejected)?;
+    let (cols, pk_indices) = (&schema.columns, &schema.pk_cols);
 
     // The generated id has no compound form: a column spelled SERIAL is the table's
     // whole primary key.
@@ -685,19 +705,14 @@ pub(crate) fn plan_create_table(
     }
     props.serial = !serial.is_empty();
 
-    drop_unique_covered_by_pk(&mut unique, &cols, &pk_indices)?;
+    drop_unique_covered_by_pk(&mut unique, cols, pk_indices)?;
 
-    // The same `gnitz-wire` rule the engine applies, run here to name the
-    // offending column — which the engine's id-only message cannot.
     for u in &unique {
-        let names: Vec<&str> = u.cols.iter().map(|&c| cols[c as usize].name.as_str()).collect();
-        let types: Vec<TypeCode> = u.cols.iter().map(|&c| cols[c as usize].ty.tc).collect();
-        reject_unbuildable_index_key(&names, &types, pk_indices.len(), "UNIQUE")?;
+        reject_unbuildable_index_key(cols, &u.cols, pk_indices.len(), "UNIQUE")?;
     }
     // Every FK column carries an index of its own.
     for fk in &fks {
-        let cd = &cols[fk.col_idx as usize];
-        reject_unbuildable_index_key(&[cd.name.as_str()], &[cd.ty.tc], pk_indices.len(), "FOREIGN KEY")?;
+        reject_unbuildable_index_key(cols, &[fk.col_idx], pk_indices.len(), "FOREIGN KEY")?;
     }
 
     // CLUSTER BY (hash distribution key). The named columns must be the PK's
@@ -709,12 +724,12 @@ pub(crate) fn plan_create_table(
         let mut cluster_indices: Vec<u32> = Vec::with_capacity(exprs.len());
         for expr in exprs {
             let col_name = simple_ident_expr(expr, "CLUSTER BY")?;
-            let idx = find_unique_column(&cols, col_name)?
+            let idx = find_unique_column(cols, col_name)?
                 .ok_or_else(|| GnitzSqlError::Rejected(format!("CLUSTER BY column '{col_name}' not found")))?;
             cluster_indices.push(idx as u32);
         }
         let prefix_len =
-            gnitz_wire::validate_dist_prefix(&pk_indices, &cluster_indices).map_err(GnitzSqlError::Rejected)?;
+            gnitz_wire::validate_dist_prefix(pk_indices, &cluster_indices).map_err(GnitzSqlError::Rejected)?;
         // `validate_dist_prefix` bounded the prefix by the PK arity, so the `u8`
         // is lossless.
         let prefix_len = prefix_len as u8;
@@ -725,10 +740,10 @@ pub(crate) fn plan_create_table(
     }
     props.validate(pk_indices.len()).map_err(GnitzSqlError::Rejected)?;
 
-    let unique_indexes = name_unique_indexes(unique, &cols, schema_name, &table_name)?;
+    let unique_indexes = name_unique_indexes(unique, cols, schema_name, &table_name)?;
     Ok(Some(TablePlan {
         name: table_name,
-        schema: Schema { columns: cols, pk_cols: pk_indices },
+        schema,
         fks,
         props,
         unique_indexes,
@@ -766,7 +781,6 @@ pub(crate) fn execute_drop(
             _ => extract_object_name(obj_name, schema_name, "DROP")?,
         });
     }
-    reject_repeated_object(targets.iter().map(String::as_str), "DROP")?;
     let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
 
     // `IF EXISTS` rides the verb, which resolves its own targets — the one place
@@ -816,6 +830,7 @@ impl IndexSite {
 pub(crate) struct IndexRequest<'a> {
     pub(crate) table_name: &'a str,
     pub(crate) columns: &'a [sqlparser::ast::IndexColumn],
+    /// The written index or constraint name, canonical.
     pub(crate) explicit_name: Option<String>,
     pub(crate) site: IndexSite,
 }
@@ -893,11 +908,6 @@ pub(crate) fn create_index_core(
     req: &IndexRequest<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     let ctx = req.site.context();
-    // The name reaches the IDX_TAB row, so a malformed one would persist and be
-    // undroppable. Folded here because the catalog stores the folded form, which
-    // the `IF NOT EXISTS` test below compares against.
-    let explicit_name = req.explicit_name.as_deref().map(canonical_user_name).transpose()?;
-
     if req.columns.is_empty() {
         return Err(GnitzSqlError::Rejected(format!("{ctx}: at least one column required")));
     }
@@ -905,17 +915,14 @@ pub(crate) fn create_index_core(
     let (table_id, schema) = (target.tid, &target.schema);
     let (col_names, col_indices) = resolve_index_columns(req.columns, &schema.columns, ctx)?;
 
-    // The same rule the engine applies, run here for the message: it names the
-    // offending column, which the engine cannot.
-    let col_types: Vec<TypeCode> = col_indices.iter().map(|&c| schema.columns[c as usize].ty.tc).collect();
-    reject_unbuildable_index_key(&col_names, &col_types, schema.pk_cols.len(), ctx)?;
+    reject_unbuildable_index_key(&schema.columns, &col_indices, schema.pk_cols.len(), ctx)?;
 
-    let index_name = match explicit_name {
+    let index_name = match req.explicit_name.clone() {
         Some(name) => {
             // Index names are globally unique, so a name already standing — on
             // this table or any other — means this CREATE would fail; the clause
             // says skip it. Without it the collision errors in `create_index`.
-            if req.site.if_not_exists() && client.index_rows()?.iter().any(|(_, n, _)| n == &name) {
+            if req.site.if_not_exists() && client.index_rows()?.iter().any(|r| r.name == name) {
                 return Ok(SqlResult::Ddl);
             }
             name
@@ -923,18 +930,21 @@ pub(crate) fn create_index_core(
         None => {
             let base = default_index_name(schema_name, req.table_name, &col_names);
             let existing = client.index_rows()?;
-            // A prior *auto-named* index on this exact column set is the same index.
-            // An explicitly-named index on these columns carries a different
-            // name, so it never blocks a distinct auto-name.
-            if existing
+            let serves_request = |r: &gnitz_core::IndexRow| {
+                r.owner == table_id
+                    && r.cols.as_slice() == col_indices.as_slice()
+                    && (r.is_unique || !req.site.is_unique())
+            };
+            if let Some(same) = existing
                 .iter()
-                .any(|(_, name, cols)| name == &base && cols.as_slice() == col_indices.as_slice())
+                .find(|r| is_auto_name(&r.name, &base) && serves_request(r))
             {
                 return Err(GnitzSqlError::Rejected(format!(
-                    "an index on these columns already exists as '{base}'"
+                    "an index on these columns already exists as '{}'",
+                    same.name
                 )));
             }
-            let taken: HashSet<String> = existing.into_iter().map(|(_, n, _)| n).collect();
+            let taken: HashSet<String> = existing.into_iter().map(|r| r.name).collect();
             disambiguate_index_name(base, &taken)
         }
     };

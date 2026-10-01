@@ -63,3 +63,21 @@ fn an_fk_child_type_must_fit_the_parent_type() {
         );
     }
 }
+
+/// Every name disambiguation hands out is recognized as an auto-name of its
+/// base, and no other base's or a written name is.
+#[test]
+fn an_auto_name_is_recognized_from_its_base() {
+    let base = default_index_name("s", "t", &["a", "B c"]);
+    assert_eq!(base, "s__t__idx_a_b_c");
+    let mut taken = HashSet::new();
+    for want in ["s__t__idx_a_b_c", "s__t__idx_a_b_c_2", "s__t__idx_a_b_c_3"] {
+        let name = disambiguate_index_name(base.clone(), &taken);
+        assert_eq!(name, want);
+        assert!(is_auto_name(&name, &base));
+        taken.insert(name);
+    }
+    for other in ["s__t__idx_a_b_c_", "s__t__idx_a_b_c_d", "s__t__idx_a_b", "my_idx"] {
+        assert!(!is_auto_name(other, &base), "{other}");
+    }
+}

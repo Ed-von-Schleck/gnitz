@@ -165,6 +165,11 @@ fn a_statement_resolves_each_relation_once() {
             "resolve, read",
         ),
         ("INSERT INTO nope (id) VALUES (1)", 1, "resolve"),
+        (
+            "ALTER TABLE w ADD CONSTRAINT _bad UNIQUE (id)",
+            0,
+            "a malformed name is refused by the statement alone",
+        ),
         ("ALTER TABLE w ADD COLUMN c BIGINT", 2, "resolve, push"),
         ("ALTER TABLE w DROP COLUMN c", 3, "resolve, seek, push"),
         (

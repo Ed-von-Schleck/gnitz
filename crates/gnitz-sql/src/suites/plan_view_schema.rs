@@ -695,6 +695,78 @@ fn an_aggregate_output_column_is_typed_by_its_argument_and_grouping() {
     }
 }
 
+/// A copied column keeps its type, whatever minted it; a computed one is
+/// nullable, at its register image, under its alias or `_expr{idx}`.
+#[test]
+fn an_item_is_declared_by_whether_it_is_copied_or_computed() {
+    use TypeCode::{String as Str, F32, F64, I32, I64};
+    let cat = catalog(vec![
+        ("o", table(30, vec![col("id", I64), col("k", I64)], vec![0])),
+        (
+            "d",
+            table(
+                31,
+                vec![
+                    col("id", I64),
+                    col("k", I64),
+                    col("w", I32),
+                    col("f", F32),
+                    col("s", Str),
+                ],
+                vec![0],
+            ),
+        ),
+    ]);
+    // `(body, column, type, nullable)`.
+    let rows: &[(&str, &str, TypeCode, bool)] = &[
+        (
+            "SELECT o.id, (SELECT MAX(w) FROM d WHERE d.k = o.k) AS mx FROM o",
+            "mx",
+            I32,
+            true,
+        ),
+        (
+            "SELECT o.id, (SELECT MIN(f) FROM d WHERE d.k = o.k) AS mf FROM o",
+            "mf",
+            F32,
+            true,
+        ),
+        (
+            "SELECT o.id, (SELECT COUNT(*) FROM d WHERE d.k = o.k) AS n FROM o",
+            "n",
+            I64,
+            true,
+        ),
+        (
+            "SELECT id, COALESCE(MIN(w) OVER (PARTITION BY k), 0) AS m FROM d",
+            "m",
+            I32,
+            true,
+        ),
+        ("SELECT id, MIN(w) OVER (PARTITION BY k) AS m FROM d", "m", I32, false),
+        // The raw count is NOT NULL, and COALESCE over it is that column.
+        (
+            "SELECT k, COALESCE(COUNT(*), 0) AS n FROM d GROUP BY k",
+            "n",
+            I64,
+            false,
+        ),
+        ("SELECT id, s || 'x' FROM d", "_expr1", Str, true),
+        ("SELECT id, k, CAST(k AS SMALLINT) FROM d", "_expr2", I64, true),
+        ("SELECT id, CAST(k AS FLOAT) AS x FROM d", "x", F64, true),
+        ("SELECT id, w + 1 AS x FROM d", "x", I64, true),
+    ];
+    for &(body, name, tc, nullable) in rows {
+        let chain = view(&cat, body);
+        let cols = &final_view(&chain).schema.columns;
+        let c = cols
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("`{body}`: no column '{name}'"));
+        assert_eq!((c.ty.tc, c.is_nullable), (tc, nullable), "{body}");
+    }
+}
+
 // ── joins ────────────────────────────────────────────────────────────────────
 
 /// A join view's PK is its synthetic `_join_pk` — one hidden column per equi

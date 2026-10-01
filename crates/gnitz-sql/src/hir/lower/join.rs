@@ -11,7 +11,7 @@ use super::{emit_filter, materialize, project_front, Demand, EmitPieces, ViewCha
 use crate::error::GnitzSqlError;
 use crate::hir::physical::Frame;
 use crate::ir::BExpr;
-use crate::rules::reject_pk_list_arity;
+use crate::rules::reject_arity;
 
 use gnitz_wire::JoinKind;
 use gnitz_wire::{Circuit, ColumnDef, NodeId, TypeCode};
@@ -49,7 +49,7 @@ pub(super) fn lower_join_view(
                 JoinShape::Cross => "CROSS JOIN output PK",
                 _ => "range JOIN output PK",
             };
-            reject_pk_list_arity(surface, sides[0].pa() + sides[1].pa())?;
+            reject_arity(surface, sides[0].pa() + sides[1].pa(), gnitz_wire::PK_LIST_MAX_COLS)?;
             pair_pk_coldefs(&sides[0].frame.schema, &sides[1].frame.schema)
         }
         OutKey::OuterPk { .. } => src_pk_coldefs(&sides[0].frame.schema),

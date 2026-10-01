@@ -7,7 +7,7 @@ use super::guard::{reject_unhonored_column_options, reject_unhonored_unique_fiel
 use crate::ast_util::extract_object_name;
 use crate::bind::{find_unique_column, require_column};
 use crate::error::{missing_relation, reject_if, unsupported_clause, GnitzSqlError};
-use crate::rules::{require_class, validate_user_name, ClassWant};
+use crate::rules::{canonical_user_name, require_class, validate_user_name, ClassWant};
 use crate::types::column_def;
 use crate::SqlResult;
 use gnitz_core::GnitzClient;
@@ -221,7 +221,7 @@ fn parse<'a>(
                 CTX,
                 Action::AddUnique {
                     columns: &u.columns,
-                    explicit_name: u.name.as_ref().map(|n| n.value.clone()),
+                    explicit_name: u.name.as_ref().map(|n| canonical_user_name(&n.value)).transpose()?,
                 },
             ))
         }

@@ -84,9 +84,18 @@ fn primary_key_admission() {
              e TINYINT UNSIGNED, PRIMARY KEY (a, b, c, d, e))",
             "out of range 1..=4",
         ),
-        ("CREATE TABLE t (a TEXT, b INT UNSIGNED, PRIMARY KEY (a, b))", "'a'"),
-        ("CREATE TABLE t (id REAL PRIMARY KEY)", "'id'"),
-        ("CREATE TABLE t (id DOUBLE PRIMARY KEY)", "'id'"),
+        (
+            "CREATE TABLE t (a TEXT, b INT UNSIGNED, PRIMARY KEY (a, b))",
+            "primary key column 'a' has type_code STRING",
+        ),
+        (
+            "CREATE TABLE t (id REAL PRIMARY KEY)",
+            "primary key column 'id' has type_code F64",
+        ),
+        (
+            "CREATE TABLE t (id DOUBLE PRIMARY KEY)",
+            "primary key column 'id' has type_code F64",
+        ),
     ] {
         assert_rejects(sql, plan_table(&cat, sql), needle);
     }
@@ -244,7 +253,7 @@ fn a_table_past_the_column_cap_is_unsupported() {
     let cat = catalog(vec![]);
     let cols: Vec<String> = (0..66).map(|i| format!("c{i} BIGINT")).collect();
     let sql = format!("CREATE TABLE t (id BIGINT PRIMARY KEY, {})", cols.join(", "));
-    assert_rejects(&sql, plan_table(&cat, &sql), "65");
+    assert_rejects(&sql, plan_table(&cat, &sql), "column count 67 exceeds MAX_COLUMNS (65)");
 }
 
 /// `OR REPLACE` would discard the table's rows; `DROP TABLE` says that out loud.
@@ -485,7 +494,7 @@ fn an_fk_column_must_be_an_admissible_index_key() {
     assert_rejects(
         sql,
         plan_table(&cat, sql),
-        "FOREIGN KEY column 'p' of type I128 cannot be a FOREIGN KEY key",
+        "FOREIGN KEY: column 'p' of type I128 cannot be an index key",
     );
 }
 
@@ -523,6 +532,24 @@ fn colliding_auto_names_are_disambiguated_within_the_bundle() {
     let sql = "CREATE TABLE u (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT, \
                CONSTRAINT MyIdx UNIQUE(a), CONSTRAINT myidx UNIQUE(b))";
     assert_rejects(sql, plan_table(&cat, sql), "'myidx'");
+}
+
+/// A quoted column name is any string, and the index name built from it is an
+/// identifier: each byte outside the identifier charset becomes `_`.
+#[test]
+fn an_auto_name_over_a_quoted_column_is_an_identifier() {
+    let cat = catalog(vec![]);
+    let c = created(
+        &cat,
+        r#"CREATE TABLE t (id BIGINT PRIMARY KEY, "a b" INT UNIQUE, "c-d" INT, e INT, UNIQUE("c-d", e))"#,
+    );
+    assert_eq!(
+        c.unique_indexes,
+        vec![
+            unique(&[1], &format!("{SN}__t__idx_a_b")),
+            unique(&[2, 3], &format!("{SN}__t__idx_c_d_e")),
+        ]
+    );
 }
 
 /// `IF NOT EXISTS` tests the name, whatever kind stands under it — and the

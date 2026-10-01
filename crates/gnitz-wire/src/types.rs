@@ -469,12 +469,7 @@ impl core::fmt::Display for IndexKeyRule {
     }
 }
 
-/// Which rule a candidate primary key broke. Returned by
-/// [`validate_pk_indices`] / [`validate_pk_tuple`] instead of a formatted
-/// string, so the *rule set* stays in one place while a layer that can say more
-/// than the rule knows renders its own message. Only the SQL planner does: it
-/// names the offending column by its SQL identifier. The client and the engine
-/// catalog both take [`PkRule::for_role`]'s wording.
+/// Which rule a candidate primary key broke, worded by [`PkRule::named`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkRule {
     /// The word carries no [`crate::PK_LIST_PACKED_FLAG`]. The one rule about the
@@ -517,9 +512,20 @@ impl PkListRole {
 }
 
 impl PkRule {
-    /// This rule's message, worded for the list it is about.
+    /// This rule's message, worded for the list it is about, with every column
+    /// rendered positionally.
     pub fn for_role(&self, role: PkListRole) -> String {
+        self.named(role, |_| None)
+    }
+
+    /// [`Self::for_role`] with each column rendered as `'name'` where `name`
+    /// answers its index, and as the index where it does not.
+    pub fn named<'a>(&self, role: PkListRole, name: impl Fn(u32) -> Option<&'a str>) -> String {
         let what = role.noun();
+        let col = |c: u32| match name(c) {
+            Some(n) => format!("'{n}'"),
+            None => c.to_string(),
+        };
         match *self {
             PkRule::NotPacked => format!("{what} word carries no packed-list flag"),
             PkRule::Empty => format!("{what} must name at least one column"),
@@ -527,13 +533,14 @@ impl PkRule {
                 format!("{what} column count {count} out of range 1..={max}")
             }
             PkRule::IndexOutOfRange { col } => format!("{what} index {col} out of bounds"),
-            PkRule::Duplicate { col } => format!("{what} names column {col} twice"),
-            PkRule::NotEligible { col, type_code } => format!(
-                "{what} column {col} has type_code {type_code}; only fixed-width integer, \
+            PkRule::Duplicate { col: c } => format!("{what} names column {} twice", col(c)),
+            PkRule::NotEligible { col: c, type_code } => format!(
+                "{what} column {} has type_code {type_code}; only fixed-width integer, \
                  U128, UUID, and I128 columns can be PK columns \
-                 (String, Blob, and float columns cannot)"
+                 (String, Blob, and float columns cannot)",
+                col(c)
             ),
-            PkRule::Nullable { col } => format!("{what} column {col} must not be nullable"),
+            PkRule::Nullable { col: c } => format!("{what} column {} must not be nullable", col(c)),
         }
     }
 }

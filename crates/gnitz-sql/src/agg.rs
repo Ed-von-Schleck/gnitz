@@ -110,15 +110,6 @@ pub(crate) fn ground_partial_schema() -> Schema {
     Schema::from_parts(vec![group_pk_def()], vec![0]).expect("one hidden U128 key is a valid schema")
 }
 
-/// The default output column name for an unaliased aggregate at SELECT position
-/// `idx` — `_` + the aggregate's canonical SQL name + the position. User-visible
-/// — it names a column in a view's schema and in an ad-hoc result alike —
-/// and derived from the one name↔aggregate table, so it cannot drift from the
-/// spelling the parser accepts.
-pub(crate) fn default_agg_name(func: AggFunc, idx: usize) -> String {
-    format!("_{}{idx}", agg_func_name(func))
-}
-
 /// An aggregate's SELECT/HAVING value from its raw value and count ([`agg_ops`]).
 /// A zero count renders NULL in both shapes.
 pub(crate) fn finalize_agg_bexpr<R>(value: BExpr<R>, count: Option<BExpr<R>>, func: AggFunc) -> BExpr<R> {

@@ -54,8 +54,11 @@ fn validate_enforces_full_rule_set() {
     // nullability.
     for (pk, want) in [
         (&[0, 1, 0, 1, 0][..], "out of range 1..=4"),
-        (&[3][..], "must not be nullable"),
-        (&[2][..], "only fixed-width integer"),
+        (&[3][..], "primary key column 'n' must not be nullable"),
+        (
+            &[2][..],
+            "primary key column 's' has type_code STRING; only fixed-width integer",
+        ),
     ] {
         let got = schema(pk, &cols).validate().unwrap_err();
         assert!(got.contains(want), "pk {pk:?}: {got:?} does not mention {want:?}");

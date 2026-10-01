@@ -5,7 +5,7 @@
 use crate::agg::{agg_func_from_name, agg_func_name, AggFunc};
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::ir::{BExpr, NumLit};
-use crate::rules::{first_duplicate, validate_user_name};
+use crate::rules::{canonical_user_name, first_duplicate, validate_user_name};
 use gnitz_wire::decimal::decimal_of_number_text;
 use gnitz_wire::ColumnDef;
 use sqlparser::ast::{ExcludeSelectItem, RenameSelectItem, SelectItem, Value, WildcardAdditionalOptions};
@@ -73,15 +73,10 @@ pub(crate) fn extract_object_name(
     Ok(n.to_string())
 }
 
-/// An index name, which is global rather than schema-scoped — so a qualifier
-/// would read as a scoping that does not exist, and is rejected. The name is
-/// checked by [`validate_user_name`], as a relation name is.
+/// An index name, canonical. Index names are global, so it takes no qualifier.
 pub(crate) fn extract_index_name(name: &sqlparser::ast::ObjectName, context: &str) -> Result<String, GnitzSqlError> {
     match object_name_parts(name, context)?.as_slice() {
-        [n] => {
-            validate_user_name(n)?;
-            Ok((*n).to_string())
-        }
+        [n] => canonical_user_name(n),
         _ => Err(GnitzSqlError::Rejected(format!(
             "{context}: an index name takes no qualifier (index names are global, not schema-scoped)"
         ))),
@@ -561,15 +556,6 @@ pub(crate) fn scalar_projection_item<'a>(
             "{ctx}: SELECT <table>.* is not a supported SELECT item"
         ))),
     }
-}
-
-/// A source column re-emitted as an output column: an alias only renames it.
-pub(crate) fn aliased_def(src: &ColumnDef, alias: Option<String>) -> ColumnDef {
-    let mut def = src.clone();
-    if let Some(name) = alias {
-        def.name = name;
-    }
-    def
 }
 
 /// The expression surfaces subquery and window detection scan — a SELECT's

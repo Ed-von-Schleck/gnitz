@@ -99,6 +99,16 @@ pub struct InlineUniqueIndex {
     pub name: String,
 }
 
+/// One live secondary index, as its IDX_TAB row states it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexRow {
+    /// The id of the table it indexes.
+    pub owner: u64,
+    pub name: String,
+    pub cols: gnitz_wire::PkColList,
+    pub is_unique: bool,
+}
+
 /// The column a FOREIGN KEY column references. `SelfTable` names the table
 /// being created, which has no id yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -608,9 +618,9 @@ impl GnitzClient {
         self.push_ddl_txn(&[(IDX_TAB, batch)])
     }
 
-    /// `(id, name, indexed columns)` of every live secondary index. Names come back
-    /// canonical (lowercase): every writer folds them at store time.
-    pub fn index_rows(&mut self) -> Result<Vec<(u64, String, gnitz_wire::PkColList)>, ClientError> {
+    /// Every live secondary index. Names come back canonical (lowercase): every
+    /// writer folds them at store time.
+    pub fn index_rows(&mut self) -> Result<Vec<IndexRow>, ClientError> {
         let idx_batch = self.sys_rows(IDX_TAB, ReadBound::None)?;
         let mut out = Vec::new();
         for i in idx_batch.live_rows() {
@@ -622,7 +632,16 @@ impl GnitzClient {
                         rule.for_role(gnitz_wire::PkListRole::ColumnList)
                     ))
                 })?;
-            out.push((idx_batch.pks.get(i) as u64, name, cols));
+            let flags = payload_u64(&idx_batch, i, IDXTAB_PAY_FLAGS);
+            let is_unique = gnitz_wire::IndexProps::from_flags(flags)
+                .map_err(|e| ProtocolError::DecodeError(format!("index '{name}': {e}")))?
+                .is_unique;
+            out.push(IndexRow {
+                owner: payload_u64(&idx_batch, i, IDXTAB_PAY_OWNER_ID),
+                name,
+                cols,
+                is_unique,
+            });
         }
         Ok(out)
     }

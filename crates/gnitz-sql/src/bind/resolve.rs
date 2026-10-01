@@ -141,7 +141,10 @@ pub(crate) fn apply_positional_aliases<'a, 'b>(
     for (col, alias) in visible.iter_mut().zip(aliases) {
         col.name = alias.value.clone();
     }
-    crate::rules::reject_duplicate_column_names(visible.iter().map(|c| &**c), &format!("{ctx} column aliases"))
+    crate::rules::reject_duplicate_names(
+        visible.iter().map(|c| c.name.as_str()),
+        &format!("{ctx} column aliases"),
+    )
 }
 
 #[cfg(test)]

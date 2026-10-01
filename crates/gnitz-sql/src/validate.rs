@@ -16,22 +16,6 @@
 //! What a *surface* consumes is passed in — `HonoredClauses`, `QueryEnvelope`.
 
 use crate::error::{reject_if, GnitzSqlError};
-use crate::rules::reject_duplicate_column_names;
-use gnitz_wire::ColumnDef;
-
-/// [`reject_duplicate_column_names`] over what a SELECT projection produces. A
-/// projection naming nothing of its own (`*`, `* EXCEPT/EXCLUDE`) is exempt: a
-/// duplicate among the source's own names rides through positionally.
-pub(crate) fn reject_duplicate_projection_names<'a>(
-    projection: &[sqlparser::ast::SelectItem],
-    cols: impl Iterator<Item = &'a ColumnDef>,
-    context: &str,
-) -> Result<(), GnitzSqlError> {
-    if crate::ast_util::is_name_preserving_wildcard_projection(projection) {
-        return Ok(());
-    }
-    reject_duplicate_column_names(cols, context)
-}
 
 /// The `Select` clauses a shape legitimately consumes, beyond the universal
 /// `from` + `projection` + `WHERE` (every surface binds a top-level WHERE).

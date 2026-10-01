@@ -3,7 +3,7 @@
 use super::super::{JoinClass, JoinType};
 use super::join::JoinSide;
 use crate::error::GnitzSqlError;
-use crate::rules::reject_column_overflow;
+use crate::rules::reject_arity;
 
 use gnitz_core::Schema;
 use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc, JoinKind};
@@ -295,7 +295,11 @@ pub(super) fn range_prologue<'a>(
     let range = class.range.expect("range_prologue receives a range class");
     let tcs = class.key_tcs();
     // No frame covers the terms: the join frame's key may be narrower than theirs.
-    reject_column_overflow("range JOIN terms", tcs.len() + sides[0].n() + sides[1].n())?;
+    reject_arity(
+        "range JOIN terms",
+        tcs.len() + sides[0].n() + sides[1].n(),
+        gnitz_wire::MAX_COLUMNS,
+    )?;
     let pure = class.eq.is_empty();
     let reindex = |cb: &mut Circuit, i: usize| keyed_side(cb, &sides[i], inputs[i], &tcs, false).map(|(_, r)| r);
     let reindex_a = match pure && kind.is_decorrelated() {

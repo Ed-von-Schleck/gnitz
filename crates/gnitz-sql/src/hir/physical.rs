@@ -136,6 +136,8 @@ pub(crate) fn project_slots(
     let mut slots = items
         .iter()
         .map(|e| {
+            // The expression's error: the schema's would name a hidden column.
+            crate::ir::check_decimal_scale(e.out.def.ty.scale)?;
             Ok((
                 ProjItem::from_bound(input.resolve(&e.expr)?),
                 Some(e.out.id),
