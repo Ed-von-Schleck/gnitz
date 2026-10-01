@@ -81,7 +81,7 @@ fn a_view_row_names_a_real_owner_and_a_canonical_name() {
     let vid = engine.allocate_ids(1).unwrap();
     engine.write_column_records(vid, &id_v()).unwrap();
     let view_row = |name: &str, owner_view_id: u64| {
-        let mut bb = BatchBuilder::new(*SysFamily::View.schema());
+        let mut bb = BatchBuilder::new(SysFamily::View.schema());
         push_view_tab_row(&mut bb, 1, vid, name, 0, 0, owner_view_id);
         bb.finish()
     };
@@ -138,7 +138,7 @@ fn a_circuit_block_names_only_views_its_bundle_creates() {
     circuits.append_batch(&crate::test_support::circuit_nodes_batch(20, &negate_chain(16, 2)));
     families[SysFamily::CircuitNodes.index()] = Some(circuits);
     let mut views = |rows: &[(i64, u64)]| {
-        let mut bb = BatchBuilder::new(*SysFamily::View.schema());
+        let mut bb = BatchBuilder::new(SysFamily::View.schema());
         for &(weight, vid) in rows {
             push_view_tab_row(&mut bb, weight, vid, "v", 0, 0, 0);
         }

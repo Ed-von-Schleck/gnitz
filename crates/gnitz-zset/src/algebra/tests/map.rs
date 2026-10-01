@@ -10,7 +10,7 @@ use crate::test_support::{
 
 /// `(pk, weight, payload cells)` rows against `schema`, `None` a NULL cell.
 fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, &[Option<i64>])]) -> Batch {
-    let mut batch = BatchBuilder::new(*schema);
+    let mut batch = BatchBuilder::new(schema);
     for &(pk, weight, cells) in rows {
         batch.begin_row(pk as u128, weight);
         for &cell in cells {
@@ -92,7 +92,7 @@ fn a_computed_map_copies_and_computes_every_row_at_its_weight() {
 fn test_map_blob_passthrough_and_fallback() {
     // Input: [U64 PK, STRING s1 (short inline), STRING s2 (long, heap-backed)].
     let in_schema = make_schema(&[TypeCode::U64, TypeCode::String, TypeCode::String]);
-    let mut batch = BatchBuilder::new(in_schema);
+    let mut batch = BatchBuilder::new(&in_schema);
     for (pk, s1, s2) in [
         (1u128, b"ab".as_slice(), b"long-string-one-xyz".as_slice()),
         (2u128, b"cd".as_slice(), b"long-string-two-abcdef".as_slice()),
@@ -143,7 +143,7 @@ fn test_map_copy_col_widens_into_promoted_slot() {
         &[0, 1],
     );
     let (c0, c1, c2, c3): (u16, i16, i8, u8) = (0xBEEF, -300, -7, 0xFE);
-    let mut batch = BatchBuilder::new(in_schema);
+    let mut batch = BatchBuilder::new(&in_schema);
     batch.begin_row_opk(&[c0 as u128, c1 as u16 as u128], 1i64);
     batch.put_int(c2 as u128);
     batch.put_int(c3 as u128);
@@ -175,7 +175,7 @@ fn test_map_copy_col_widens_into_promoted_slot() {
 fn a_string_emit_composes_with_a_copy_of_its_source() {
     let in_schema = make_schema(&[TypeCode::U64, TypeCode::String]);
     let long = b"a-long-value-past-twelve".as_slice();
-    let mut batch = BatchBuilder::new(in_schema);
+    let mut batch = BatchBuilder::new(&in_schema);
     for (pk, s) in [(1u128, long), (2, b"short"), (3, b"def")] {
         batch.begin_row(pk, 1);
         batch.put_blob(s);
@@ -196,7 +196,7 @@ fn a_string_emit_composes_with_a_copy_of_its_source() {
     let mut plan = compute(&in_schema, prog, &[(TypeCode::String, true); 2]);
     let out = plan.evaluate_map_batch(&batch);
 
-    let mut want = BatchBuilder::new(*plan.out_schema());
+    let mut want = BatchBuilder::new(plan.out_schema());
     for (pk, cells) in [
         (1u128, Some((long, b"A-LONG-VALUE-PAST-TWELVE".as_slice()))),
         (2, Some((b"short", b"SHORT"))),
@@ -224,7 +224,7 @@ fn a_string_emit_composes_with_a_copy_of_its_source() {
 }
 
 /// A reindex stamps each row's PK with the OPK image of its key column — the
-/// sign flip included — keeps the row's weight, and drops the layout claim.
+/// sign flip included — keeps the row's weight, and drops the consolidated claim.
 #[test]
 fn a_reindex_keys_each_row_by_the_opk_image_of_its_key_column() {
     let schema = make_schema_u64_i64();
@@ -239,7 +239,7 @@ fn a_reindex_keys_each_row_by_the_opk_image_of_its_key_column() {
         assert_eq!(out.get_weight(r), w);
         assert_eq!(gnitz_wire::read_i64_le(out.col_data(0), r * 8), v);
     }
-    assert!(!out.is_consolidated(), "a stamped PK must drop the layout claim");
+    assert!(!out.is_consolidated(), "a stamped PK must drop the consolidated claim");
 }
 
 /// A hash-row map keys a row by its payload *content*, not by its cell bytes:
@@ -275,7 +275,7 @@ fn hash_row_keys_a_row_by_its_content_across_nulls_strings_and_blobs() {
     // The rows repeat past the map's key chunk, so every chunk must key alike.
     const REPEATS: usize = 60;
     let in_schema = make_schema(&[TypeCode::U64, TypeCode::I64, TypeCode::String, TypeCode::Blob]);
-    let mut batch = BatchBuilder::new(in_schema);
+    let mut batch = BatchBuilder::new(&in_schema);
     for row in 0..rows.len() * REPEATS {
         let (v, is_null, s, b) = rows[row % rows.len()];
         batch.begin_row(row as u128, 1);
@@ -349,7 +349,7 @@ fn a_compound_permuted_pk_decodes_at_every_width() {
         ([-1, 40_000, -1, u64::MAX as i128, -1], -1),
         ([i8::MAX as i128, u16::MAX as i128, i32::MAX as i128, 1, i128::MAX], 2),
     ];
-    let mut batch = BatchBuilder::new(in_schema);
+    let mut batch = BatchBuilder::new(&in_schema);
     for (vals, w) in &rows {
         let natives: Vec<u128> = pk_order.iter().map(|&ci| vals[ci as usize] as u128).collect();
         batch.begin_row_opk(&natives, *w);
@@ -603,7 +603,7 @@ fn compute_map_refuses_an_over_wide_declaration() {
 /// Difference two pass counts, one shape per process:
 ///
 ///   cargo build -p gnitz-zset --release --tests
-///   for s in reindex permute proj_keep_str proj_drop_str int3_whole int3_r16 upper_r16; do for p in 1 21; do \
+///   for s in reindex permute proj_keep_str proj_drop_str int3_whole int3_r16 upper_r16 permute_r1; do for p in 1 21; do \
 ///     GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
 ///     cargo test -p gnitz-zset --release map_ranges_bench -- --ignored --nocapture
 ///   done; done
@@ -626,7 +626,7 @@ fn map_ranges_bench() {
     // Column 0 is what puts a `ColumnLocator::Pk` copy in the loop; the keep-set
     // rules retain the source PK on every one of those.
     let rx_in = make_schema(&[TypeCode::U64, TypeCode::I64, TypeCode::I64]);
-    let mut rx_batch = BatchBuilder::new(rx_in);
+    let mut rx_batch = BatchBuilder::new(&rx_in);
     for i in 0..N as u64 {
         rx_batch.begin_row(i as u128, 1i64);
         rx_batch.put_int(i.wrapping_mul(2_654_435_761) as u128);
@@ -639,7 +639,7 @@ fn map_ranges_bench() {
     // --- String source: [U64 PK, STRING], every cell past the inline threshold
     // so every one is heap-backed and an emit grows the output blob.
     let str_in = make_schema(&[TypeCode::U64, TypeCode::String]);
-    let mut str_batch = BatchBuilder::new(str_in);
+    let mut str_batch = BatchBuilder::new(&str_in);
     for i in 0..N {
         str_batch.begin_row(i as u128, 1i64);
         str_batch.put_blob(format!("row-{i:012}-payload").as_bytes());
@@ -662,7 +662,7 @@ fn map_ranges_bench() {
     // --- Integer source: [U64 PK, I64, I64, I64], and a map computing three
     // columns out of it.
     let int_in = make_schema(&[TypeCode::U64, TypeCode::I64, TypeCode::I64, TypeCode::I64]);
-    let mut int_batch = BatchBuilder::new(int_in);
+    let mut int_batch = BatchBuilder::new(&int_in);
     for i in 0..N as u64 {
         int_batch.begin_row(i as u128, 1);
         for pi in 0..3u64 {
@@ -697,7 +697,7 @@ fn map_ranges_bench() {
         let mut in_tcs = vec![TypeCode::U64];
         in_tcs.extend_from_slice(payload);
         let in_schema = make_schema(&in_tcs);
-        let mut batch = BatchBuilder::new(in_schema);
+        let mut batch = BatchBuilder::new(&in_schema);
         for i in 0..N as u64 {
             batch.begin_row(i as u128, 1);
             for (pi, &tc) in payload.iter().enumerate() {
@@ -726,7 +726,7 @@ fn map_ranges_bench() {
     // --- Two heap-backed string columns, [U64 PK, STRING, STRING], and a
     // projection keeping both, or only the first.
     let str2_in = make_schema(&[TypeCode::U64, TypeCode::String, TypeCode::String]);
-    let mut str2_batch = BatchBuilder::new(str2_in);
+    let mut str2_batch = BatchBuilder::new(&str2_in);
     for i in 0..N {
         str2_batch.begin_row(i as u128, 1i64);
         str2_batch.put_string(&format!("first-{i:016}-payload-first"));
@@ -762,8 +762,12 @@ fn map_ranges_bench() {
     // `GAP`-row gaps.
     let runs = |r: usize| -> Vec<(usize, usize)> { (0..N).step_by(r + GAP).map(|s| (s, (s + r).min(N))).collect() };
     let mut shapes: Vec<(String, Vec<(usize, usize)>)> = vec![("whole".to_string(), vec![(0, N)])];
-    shapes.extend([4usize, 16, 64, 128, 256].map(|r| (format!("r{r}"), runs(r))));
-    for (family, mut plan, src) in [("int3", int3(), &int_batch), ("upper", upper(), &str_batch)] {
+    shapes.extend([1usize, 4, 16, 64, 128, 256].map(|r| (format!("r{r}"), runs(r))));
+    for (family, mut plan, src) in [
+        ("int3", int3(), &int_batch),
+        ("upper", upper(), &str_batch),
+        ("permute", project(&int_in, &[3, 1, 2]), &int_batch),
+    ] {
         let mut keeper = Batch::empty_with_schema(plan.out_schema());
         for (suffix, ranges) in &shapes {
             if !driven(&format!("{family}_{suffix}")) {

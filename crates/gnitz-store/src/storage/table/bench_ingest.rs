@@ -13,7 +13,7 @@ use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// One delta of `n` rows at consecutive PKs from `base`, all weight +1. Raw, not
-/// `Consolidated`: certifying it would short-circuit `into_consolidated` and the
+/// consolidated: certifying it would short-circuit `into_consolidated` and the
 /// bench would stop measuring the kernel ingest actually runs.
 fn make_delta(schema: &SchemaDescriptor, base: u64, n: usize) -> Batch {
     let rows: Vec<(u64, i64, i64)> = (0..n as u64).map(|i| (base + i, 1, (base + i) as i64)).collect();

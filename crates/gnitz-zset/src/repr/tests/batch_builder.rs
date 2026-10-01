@@ -16,7 +16,7 @@ fn schema_of(cols: &[(TypeCode, bool)], pk: &[u32]) -> SchemaDescriptor {
 fn batch_builder_writes_payload_around_a_non_leading_compound_pk() {
     use TypeCode::*;
     let schema = schema_of(&[(U8, false), (U64, false), (U32, false), (I16, false)], &[1, 2]);
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     for (k, a, b) in [(1u128, 0xAB_u128, -5i16), (2, 0xCD, 300)] {
         bb.begin_row_opk(&[k, k * 10], 1);
         bb.put_int(a);
@@ -54,7 +54,7 @@ fn batch_builder_writes_string_cells_and_nulls() {
         (None, Some(b"another long one for blob storage")),
     ];
 
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     for (pk, &(a, b)) in cases.iter().enumerate() {
         bb.begin_row(pk as u128, 1);
         for cell in [a, b] {
@@ -116,7 +116,7 @@ fn batch_builder_writes_every_payload_type_at_its_own_width() {
     // payload slot), with bits in both halves.
     let i128_val: i128 = -0x0123_4567_89AB_CDEF_1122_3344_5566_7788;
 
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     bb.begin_row(100, 1);
     for v in [42i128, -7, 1000, -500, 70000, -12345] {
         bb.put_int(v as u128);

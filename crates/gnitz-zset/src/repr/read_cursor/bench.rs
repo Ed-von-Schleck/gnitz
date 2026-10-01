@@ -10,7 +10,7 @@
 
 use super::*;
 use crate::repr::shard_file::ShardWriteOpts;
-use crate::repr::{Batch, BatchBuilder, Layout, MappedShard};
+use crate::repr::{Batch, BatchBuilder, MappedShard};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{create_read_cursor, make_batch_u128, make_schema_u64_i64, map_shard, pk_payload_schema};
 use std::rc::Rc;
@@ -82,7 +82,7 @@ fn shard_merge_scan_bench() {
     // Construction + open outside the timed region.
     let shards: Vec<Rc<MappedShard>> = (0..N_SHARDS as u64)
         .map(|s| {
-            let mut bb = BatchBuilder::new(schema);
+            let mut bb = BatchBuilder::new(&schema);
             for i in 0..PER_SHARD {
                 let key = i + s * OFFSET;
                 bb.begin_row(key as u128, 1);
@@ -324,14 +324,14 @@ fn adv_build_batch_dense(schema: SchemaDescriptor, count: usize) -> Rc<Batch> {
 /// the caller), OPK-encoding each PK. The delta source of the `Multi` fixture.
 fn adv_build_batch_rows(schema: SchemaDescriptor, rows: impl IntoIterator<Item = (u64, i64, i64)>) -> Rc<Batch> {
     let stride = schema.pk_stride();
-    let mut b = BatchBuilder::new(schema);
+    let mut b = BatchBuilder::new(&schema);
     for (pk, w, v) in rows {
         b.begin_row_bytes(&adv_key(pk, stride)[..stride], w);
         b.put_int(v as u128);
         b.end_row();
     }
     let mut b = b.finish();
-    b.certify_layout(Layout::Consolidated);
+    b.certify_consolidated();
     Rc::new(b)
 }
 
@@ -802,7 +802,7 @@ fn for_range_drain_bench() {
     let dir = tempfile::tempdir().unwrap();
     let shards: Vec<Rc<MappedShard>> = (0..2u64)
         .map(|s| {
-            let mut b = BatchBuilder::new(schema);
+            let mut b = BatchBuilder::new(&schema);
             for i in 0..N {
                 b.begin_row(2 * i as u128 + s as u128, 1);
                 b.put_int((i % 1000) as u128);

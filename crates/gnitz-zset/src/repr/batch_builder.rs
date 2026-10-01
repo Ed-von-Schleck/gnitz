@@ -1,6 +1,5 @@
 //! [`BatchBuilder`] — the row-at-a-time writer the system-table mutations build
-//! their rows with. It owns its `Batch` and grows it; `merge::DirectWriter` is
-//! the same shape over a pre-carved arena.
+//! their rows with. It owns its `Batch` and grows it.
 
 use super::batch::Batch;
 use crate::schema::{SchemaDescriptor, SchemaFacts};
@@ -38,11 +37,11 @@ impl gnitz_wire::sys_rows::SysRowSink for BatchBuilder {
 }
 
 impl BatchBuilder {
-    pub fn new(schema: SchemaDescriptor) -> Self {
+    pub fn new(schema: &SchemaDescriptor) -> Self {
         BatchBuilder {
             // Uninitialized, like every batch arena: every row writes every
             // column (`put_null` zero-fills rather than skipping).
-            batch: Batch::with_capacity(&schema, 8),
+            batch: Batch::with_capacity(schema, 8),
             curr_null_word: 0,
             curr_col: 0,
         }

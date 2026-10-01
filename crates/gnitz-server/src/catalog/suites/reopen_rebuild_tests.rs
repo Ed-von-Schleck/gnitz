@@ -22,7 +22,7 @@ fn seed_base(engine: &mut CatalogEngine, name: &str) -> (u64, Vec<CatalogColumn>
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table(name, &cols, &[0]).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     for i in 0..N as u64 {
         bb.begin_row(i as u128, 1);
         bb.put_u64(i * 10);
@@ -62,7 +62,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     for i in 0..N as u64 {
         bb.begin_row(i as u128, 1);
         bb.put_u64(i * 10);
@@ -147,7 +147,7 @@ fn index_rebuilds_across_chunk_boundary() {
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     let mut next = 0usize;
     while next < n {
-        let mut bb = BatchBuilder::new(schema);
+        let mut bb = BatchBuilder::new(&schema);
         for i in next..(next + 8192).min(n) {
             bb.begin_row(i as u128, 1);
             bb.put_u64((i * 10) as u64);
@@ -322,7 +322,7 @@ fn view_traces_resume_with_their_output_store() {
     engine.dag.open_plan(&engine.registry, vid).unwrap();
 
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     bb.begin_row(0, 1);
     bb.put_u64(0);
     bb.end_row();

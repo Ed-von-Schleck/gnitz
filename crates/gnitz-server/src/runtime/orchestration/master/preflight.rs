@@ -76,7 +76,7 @@ impl PipelinedCheck {
     /// bound is the prefix's.
     fn rows_of(&self, key: &[u8]) -> Range<usize> {
         let b = &self.batch;
-        let lo = b.find_lower_bound_bytes(PkBuf::from_bytes(key).padded(b.pk_stride() as usize));
+        let lo = b.find_lower_bound_bytes(PkBuf::from_bytes(key).padded(b.schema().pk_stride()));
         lo..lo
             + (lo..b.len())
                 .take_while(|&j| b.get_pk_bytes(j).starts_with(key))
@@ -445,7 +445,7 @@ async fn execute_probe_burst(
                     // key, so every worker holding the relation is probed.
                     ProbeKeyspace::Index(_) => cut.read(DirectGroup {
                         template,
-                        data: GroupData::Same(wire::WireData::Whole(&check.batch)),
+                        data: GroupData::Same(check.batch.wire_whole()),
                         ..DirectGroup::new(SalMessageKind::HasPk)
                     })?,
                 }

@@ -85,7 +85,7 @@ fn drain_trains(wp: &mut WorkerProcess) {
 /// Wire size of `batch` sent whole as one frame.
 fn frame_size(batch: &Batch) -> usize {
     ipc::WireMsg {
-        data: ipc::WireData::Whole(batch),
+        data: batch.wire_whole(),
         ..Default::default()
     }
     .size()
@@ -318,11 +318,9 @@ fn fifo_emits_a_fitting_reply_over_the_source_batch() {
     let mut block = Vec::new();
     gnitz_wire::wal::append_block(&regions, 4096, &mut block);
     let batch = Rc::new(Batch::decode_from_wal_block(&block, &schema).unwrap());
-    let frame = batch.wire_frame_within(0, 0, usize::MAX);
-    assert_eq!(frame.rows(), batch.len());
     assert!(
-        batch.wire_frame_size(&frame) < batch.wire_byte_size(),
-        "the fixture must have a dedupable heap for the size test to discriminate"
+        batch.dead_heap() > 0,
+        "the fixture must have dead heap bytes for the size test to discriminate"
     );
 
     let (mut wp, _sal, rx) = test_worker(std::ptr::null_mut());

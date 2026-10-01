@@ -24,7 +24,7 @@ use super::avi::{avi_batch, AviBake};
 use super::op_reduce::op_reduce;
 use super::plan::ReducePlan;
 use super::tests::Harness;
-use crate::repr::{Batch, BatchBuilder, Layout};
+use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{ColumnTable, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
 use crate::test_support::{bench_time, bench_time_each, pk_payload_schema, pk_u64_two_i64_schema, TestTrace};
 use gnitz_wire::AggDescriptor;
@@ -48,7 +48,7 @@ fn src_schema() -> SchemaDescriptor {
 }
 
 fn build_input(schema: &SchemaDescriptor) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
+    let mut b = BatchBuilder::new(schema);
     for row in 0..N_ROWS as u64 {
         b.begin_row(row as u128, 1i64);
         b.put_int(((row % N_GROUPS) as u32) as u128);
@@ -73,7 +73,7 @@ fn wide_src_schema() -> SchemaDescriptor {
 /// [`build_input`] over [`wide_src_schema`], the value scrambled across the
 /// whole 128-bit range.
 fn build_wide_input(schema: &SchemaDescriptor) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
+    let mut b = BatchBuilder::new(schema);
     for row in 0..N_ROWS as u64 {
         let v = (row.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128) << 64 | row as u128;
         b.begin_row(row as u128, 1);
@@ -152,7 +152,7 @@ fn secondary_index_avi_group_shape_bench() {
         cols.extend(group.iter().map(|&(tc, nullable)| SchemaColumn::new(tc, nullable)));
         cols.push(SchemaColumn::new(TypeCode::I64, false));
         let schema = SchemaDescriptor::new(&cols, &[0]);
-        let mut b = BatchBuilder::new(schema);
+        let mut b = BatchBuilder::new(&schema);
         for row in 0..N_ROWS as u64 {
             b.begin_row(row as u128, 1);
             for (i, &(tc, nullable)) in group.iter().enumerate() {
@@ -328,7 +328,7 @@ fn op_reduce_bench() {
 
     // `[U64 pk, I64 grp, I64 val]` rows, raw.
     let grp_rows = |salt: u64, grp: &dyn Fn(u64) -> u64| {
-        let mut bb = BatchBuilder::new(grp_val);
+        let mut bb = BatchBuilder::new(&grp_val);
         for i in 0..N {
             bb.begin_row(mix(i + salt * N) as u128, 1);
             bb.put_int(grp(i) as u128);
@@ -340,7 +340,7 @@ fn op_reduce_bench() {
     // PK-sorted rows over `schema` (one or two U64 PK columns, one I64 value),
     // certified consolidated.
     let sorted_rows = |schema: SchemaDescriptor, salt: u64| {
-        let mut bb = BatchBuilder::new(schema);
+        let mut bb = BatchBuilder::new(&schema);
         for i in 0..N {
             match schema.pk_cols().len() {
                 1 => bb.begin_row(i as u128, 1),
@@ -350,7 +350,7 @@ fn op_reduce_bench() {
             bb.end_row();
         }
         let mut b = bb.finish();
-        b.certify_layout(Layout::Consolidated);
+        b.certify_consolidated();
         b
     };
 
@@ -446,7 +446,7 @@ fn op_reduce_group_sweep_bench() {
         let group_cols: Vec<u32> = (1..=group.len() as u32).collect();
         let val = group.len() as u32 + 1;
         let rows = |salt: u64| {
-            let mut bb = BatchBuilder::new(schema);
+            let mut bb = BatchBuilder::new(&schema);
             for i in 0..N {
                 bb.begin_row(mix(i + salt * N) as u128, 1);
                 for (c, &(tc, nullable)) in group.iter().enumerate() {
@@ -492,14 +492,14 @@ fn op_reduce_multi_run_bench() {
         AggDescriptor::COUNT_STAR,
     ];
     let rows = |keys: &[u64]| {
-        let mut bb = BatchBuilder::new(schema);
+        let mut bb = BatchBuilder::new(&schema);
         for &k in keys {
             bb.begin_row(k as u128, 1);
             bb.put_int(k as u128);
             bb.end_row();
         }
         let mut b = bb.finish();
-        b.certify_layout(Layout::Consolidated);
+        b.certify_consolidated();
         b
     };
     let mut h = Harness::new(ReducePlan::from_wire(&schema, &[0], &aggs, false).unwrap());

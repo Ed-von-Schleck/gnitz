@@ -73,7 +73,7 @@ fn cells(r: &Row) -> Cells {
 }
 
 fn batch(rows: &[(Row, i64)]) -> Batch {
-    let mut b = BatchBuilder::new(schema());
+    let mut b = BatchBuilder::new(&schema());
     for &(r, w) in rows {
         b.begin_row_opk(&[r.id as u128, r.grp as u128], w);
         b.put_opt_int(r.val.map(|v| v as u128));

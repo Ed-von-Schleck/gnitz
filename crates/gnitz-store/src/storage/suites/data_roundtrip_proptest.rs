@@ -28,7 +28,7 @@ use gnitz_zset::schema::SchemaDescriptor;
 /// single-column PK), so a caller can synthesize an absent prefix-twin key.
 fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128>) {
     let mut rng = crate::test_support::Rng::new(seed);
-    let mut batch = BatchBuilder::new(*schema);
+    let mut batch = BatchBuilder::new(schema);
 
     let pk_widths: Vec<usize> = schema
         .pk_cols()

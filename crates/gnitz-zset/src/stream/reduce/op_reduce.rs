@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 
-use crate::repr::{Batch, Layout, ReadCursor, RowMark};
+use crate::repr::{Batch, ReadCursor, RowMark};
 use crate::schema::payload_order::compare_rows;
 use crate::schema::SchemaDescriptor;
 
@@ -114,7 +114,7 @@ pub fn op_reduce(
 
     gnitz_debug!("op_reduce: in={} groups={} out={}", delta.count, runs.len(), out.count);
 
-    out.certify_layout(Layout::Consolidated);
+    out.certify_consolidated();
     out
 }
 

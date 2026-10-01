@@ -18,7 +18,7 @@ fn column_batch(tc: TypeCode, vals: &[u128], as_pk: bool) -> Batch {
     } else {
         u64_pk_schema(SchemaColumn::new(tc, false))
     };
-    let mut b = BatchBuilder::new(schema);
+    let mut b = BatchBuilder::new(&schema);
     for (i, &v) in vals.iter().enumerate() {
         if as_pk {
             b.begin_row_opk(&[v], 1);
@@ -205,7 +205,7 @@ fn order_bits_gives_floats_the_total_order() {
                 }
             })
             .collect();
-        let mut b = BatchBuilder::new(u64_pk_schema(SchemaColumn::new(type_code, false)));
+        let mut b = BatchBuilder::new(&u64_pk_schema(SchemaColumn::new(type_code, false)));
         for (i, &f) in FLOATS.iter().enumerate() {
             b.begin_row(i as u128, 1);
             b.put_float(f);

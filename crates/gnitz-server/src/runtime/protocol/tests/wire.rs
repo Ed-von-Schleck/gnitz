@@ -1,22 +1,12 @@
-use crate::runtime::wire::{decode_client_frame, decode_sal_slot, unknown, WireData, WireMsg, WireSchema};
-use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, make_string_batch, weighted_rows};
+use crate::runtime::wire::{decode_client_frame, decode_sal_slot, unknown, WireMsg, WireSchema};
+use crate::test_support::{
+    encode_to_wire_vec, make_batch, make_batch_raw, make_schema_u64_i64, make_string_batch, weighted_rows,
+};
 use gnitz_wire::control::{encode_frame_head, frame_head_size, peek_control_block, ControlHeader};
+use gnitz_wire::wal::WAL_HEADER_SIZE;
 use gnitz_wire::{ClientVerb, TypeCode, WireFlags, WireStatus};
-use gnitz_zset::repr::{Batch, BatchBuilder, Layout};
+use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
-
-/// The source batch and the rows of it `data` sends, in the order it sends them.
-fn sent(data: WireData<'_>) -> Option<(&Batch, Vec<usize>)> {
-    match data {
-        WireData::None => None,
-        WireData::Whole(b) => Some((b, (0..b.len()).collect::<Vec<_>>())),
-        WireData::Frame { batch, frame } => {
-            Some((batch, (frame.end() - frame.rows()..frame.end()).collect::<Vec<_>>()))
-        }
-        WireData::Scattered { batch, indices } => Some((batch, indices.iter().map(|&i| i as usize).collect())),
-    }
-    .filter(|(_, rows)| !rows.is_empty())
-}
 
 /// Eight rows whose regions a block pads between: a 4-byte PK, then stride-4 and
 /// stride-2 payloads.
@@ -29,7 +19,7 @@ fn padded_batch() -> Batch {
         ],
         &[0],
     );
-    let mut bb = BatchBuilder::new(sd);
+    let mut bb = BatchBuilder::new(&sd);
     for i in 0..8u32 {
         bb.begin_row(i as u128, i as i64 + 1);
         bb.put_int(i as u128 * 10);
@@ -53,18 +43,18 @@ fn every_frame_shape_round_trips_and_no_prefix_decodes() {
     let long = b"a string long enough to leave the inline prefix".as_slice();
     let strings = make_string_batch(&[(1, 1, b"inline".as_slice()), (2, -2, long), (3, 1, long)]);
     let padded = padded_batch();
-    let frame = raw.wire_frame_within(2, 0, raw.wire_byte_size_range(3));
-    assert_eq!(frame.rows(), 3, "a budget of three rows frames three");
+    let row_width = (raw.wire_whole().unwrap().byte_size() - WAL_HEADER_SIZE) / raw.len();
+    let range = raw.wire_rows_within(2, WAL_HEADER_SIZE + 3 * row_width).unwrap();
+    assert_eq!(range.rows(), 3, "a budget of three rows frames three");
+    let whole = |b: &Batch| (0..b.len()).collect::<Vec<_>>();
 
     // Each relation beside the schema its block was encoded from.
     let rel = |tid, schema: &SchemaDescriptor| (WireSchema::encoded(tid, schema), *schema);
     let fixed_rel = rel(5, &fixed);
     let string_rel = rel(6, strings.schema());
     let padded_rel = rel(7, padded.schema());
-    let claims_consolidated = WireFlags {
-        batch_consolidated: true,
-        ..Default::default()
-    };
+    // Each message beside the source batch and the rows of it the message sends,
+    // in the order it sends them.
     let shapes = [
         (
             None,
@@ -73,49 +63,55 @@ fn every_frame_shape_round_trips_and_no_prefix_decodes() {
                 flags: WireFlags {
                     verb: ClientVerb::PushTxn,
                     continuation: true,
-                    ..claims_consolidated
+                    ..Default::default()
                 },
                 arg0: 0x1111_2222_3333_4444,
                 arg1: 0x5555,
                 ..Default::default()
             },
+            None,
         ),
-        (Some(&fixed_rel), WireMsg::default()),
+        (Some(&fixed_rel), WireMsg::default(), None),
         (
             Some(&fixed_rel),
             WireMsg {
-                data: WireData::Whole(&consolidated),
+                data: consolidated.wire_whole(),
                 ..Default::default()
             },
+            Some((&consolidated, whole(&consolidated))),
         ),
         (
             Some(&fixed_rel),
             WireMsg {
-                data: WireData::Whole(&empty),
+                data: empty.wire_whole(),
                 ..Default::default()
             },
+            None,
         ),
         (
             Some(&string_rel),
             WireMsg {
-                data: WireData::Whole(&strings),
+                data: strings.wire_whole(),
                 ..Default::default()
             },
+            Some((&strings, whole(&strings))),
         ),
         (
             Some(&fixed_rel),
             WireMsg {
-                flags: claims_consolidated,
-                data: WireData::Frame { batch: &raw, frame },
+                flags: WireFlags::train_frame(true),
+                data: Some(range),
                 ..Default::default()
             },
+            Some((&raw, vec![2, 3, 4])),
         ),
         (
             Some(&padded_rel),
             WireMsg {
-                data: WireData::Scattered { batch: &padded, indices: &[6, 1, 3] },
+                data: padded.wire_listed(&[6, 1, 3]),
                 ..Default::default()
             },
+            Some((&padded, vec![6, 1, 3])),
         ),
         (
             None,
@@ -125,22 +121,18 @@ fn every_frame_shape_round_trips_and_no_prefix_decodes() {
                 blob: b"something went wrong",
                 ..Default::default()
             },
+            None,
         ),
     ];
 
-    for (shape, (rel, msg)) in shapes.into_iter().enumerate() {
+    for (shape, (rel, msg, sent)) in shapes.into_iter().enumerate() {
         let msg = rel.map_or(msg, |(r, _)| r.frame(msg));
         let wire = msg.encode_to_vec();
         let d = decode_sal_slot(&wire, |_, _| None).unwrap_or_else(|e| panic!("shape {shape}: {e}"));
-        let sent = sent(msg.data);
-        let consolidated = sent.as_ref().is_some_and(|(b, _)| b.layout() == Layout::Consolidated);
         let hdr = ControlHeader {
             status: msg.status,
             target_id: msg.target_id,
-            flags: WireFlags {
-                batch_consolidated: consolidated,
-                ..msg.flags
-            },
+            flags: msg.flags,
             arg0: msg.arg0,
             arg1: msg.arg1,
         };
@@ -153,7 +145,6 @@ fn every_frame_shape_round_trips_and_no_prefix_decodes() {
                 let all = weighted_rows(src);
                 let want: Vec<_> = rows.iter().map(|&i| all[i].clone()).collect();
                 assert_eq!(weighted_rows(&got), want, "shape {shape}");
-                assert_eq!(got.layout(), src.layout(), "shape {shape}");
             }
             (want, got) => panic!(
                 "shape {shape}: sent rows {}, decoded rows {}",
@@ -181,7 +172,7 @@ fn a_sal_slot_lays_its_rows_out_under_the_known_schema() {
     let wire = WireMsg {
         target_id: 77,
         schema_block: Some(&junk),
-        data: WireData::Whole(&batch),
+        data: batch.wire_whole(),
         ..Default::default()
     }
     .encode_to_vec();
@@ -198,9 +189,10 @@ fn a_sal_slot_lays_its_rows_out_under_the_known_schema() {
     );
 }
 
-/// A client frame's consolidation claim is dropped, and its rows need a schema.
+/// A decoded client frame carries no consolidation claim, and its rows need a
+/// schema.
 #[test]
-fn a_client_frame_keeps_no_claim_and_needs_a_schema() {
+fn a_client_frame_carries_no_claim_and_needs_a_schema() {
     let sd = make_schema_u64_i64();
     let batch = make_batch(&sd, &[(1, 1, 10), (2, 3, 20)]);
     let rel = WireSchema::encoded(3, &sd);
@@ -210,7 +202,7 @@ fn a_client_frame_keeps_no_claim_and_needs_a_schema() {
 
     let framed = rel
         .frame(WireMsg {
-            data: WireData::Whole(&batch),
+            data: batch.wire_whole(),
             ..Default::default()
         })
         .encode_to_vec();
@@ -218,11 +210,7 @@ fn a_client_frame_keeps_no_claim_and_needs_a_schema() {
         .expect("decodes")
         .data_batch
         .expect("rows");
-    assert_eq!(
-        got.layout(),
-        Layout::Raw,
-        "a client's consolidation claim is not trusted"
-    );
+    assert!(!got.is_consolidated(), "a decoded frame carries no claim");
     assert_eq!(weighted_rows(&got), weighted_rows(&batch));
     assert_eq!(
         decode(&framed, None, |_| Err("refused".into())).err().as_deref(),
@@ -231,13 +219,13 @@ fn a_client_frame_keeps_no_claim_and_needs_a_schema() {
 
     // A client's block is decoded as a foreign one, so a null bit on the NOT
     // NULL payload is refused.
-    let mut bb = BatchBuilder::new(sd);
+    let mut bb = BatchBuilder::new(&sd);
     bb.begin_row(1, 1);
     bb.put_null();
     bb.end_row();
     let nulled = rel
         .frame(WireMsg {
-            data: WireData::Whole(&bb.finish()),
+            data: bb.finish().wire_whole(),
             ..Default::default()
         })
         .encode_to_vec();
@@ -248,7 +236,7 @@ fn a_client_frame_keeps_no_claim_and_needs_a_schema() {
 
     let bare = WireMsg {
         target_id: 3,
-        data: WireData::Whole(&batch),
+        data: batch.wire_whole(),
         ..Default::default()
     }
     .encode_to_vec();
@@ -263,10 +251,10 @@ fn a_client_frame_keeps_no_claim_and_needs_a_schema() {
     assert_eq!(weighted_rows(&got), weighted_rows(&batch));
 
     // A well-formed block of zero rows, which `WireMsg` never emits.
-    let empty = make_batch(&sd, &[]);
-    let mut hollow = vec![0; frame_head_size(0, None) + empty.wire_byte_size()];
+    let block = encode_to_wire_vec(&make_batch(&sd, &[]));
+    let mut hollow = vec![0; frame_head_size(0, None) + block.len()];
     let pos = encode_frame_head(&mut hollow, &ControlHeader::default(), &[], None, true);
-    empty.encode_to_wire(&mut hollow[pos..]);
+    hollow[pos..].copy_from_slice(&block);
     assert_eq!(
         decode(&hollow, Some(&sd), unknown).err().as_deref(),
         Some("a data block with no rows")

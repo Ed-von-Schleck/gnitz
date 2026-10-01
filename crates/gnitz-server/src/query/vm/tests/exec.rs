@@ -111,7 +111,7 @@ fn a_union_runs_and_leaves_under_its_merged_schema() {
     assert_eq!(*identity.schema(), merged);
     assert_rows(&identity, &[(1, 1, -3)]);
 
-    let mut rb = BatchBuilder::new(nullable);
+    let mut rb = BatchBuilder::new(&nullable);
     rb.begin_row(1u128, 1);
     rb.put_null();
     rb.end_row();

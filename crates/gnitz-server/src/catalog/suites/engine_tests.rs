@@ -222,7 +222,7 @@ fn test_sequence_gap_recovery() {
             .unwrap();
 
         // Inject column record for tid=250
-        let mut cbb = BatchBuilder::new(*SysFamily::Column.schema());
+        let mut cbb = BatchBuilder::new(SysFamily::Column.schema());
         col_def("id", TypeCode::U64).write_col_tab_row(&mut cbb, 250, 0, 1);
         engine.registry.ingest(SysFamily::Column.id(), cbb.finish()).unwrap();
 
@@ -253,7 +253,7 @@ fn test_ingest_scan_seek_family() {
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
     // Ingest via CatalogEngine (user table path)
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(100);
     bb.end_row();
@@ -315,7 +315,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
     // Insert row with PK=1, val=100
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(100);
     bb.end_row();
@@ -323,7 +323,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     engine.registry.checkpoint_base().unwrap();
 
     // Insert row with PK=1 again, val=200 (should retract old + insert new)
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(200);
     bb.end_row();
@@ -527,7 +527,7 @@ fn test_dep_map_drops_a_retired_views_edges() {
     let v2 = engine.allocate_ids(1).unwrap();
     write_identity_circuit(&mut engine, v2, tid, gnitz_wire::ReadBound::None);
     engine.write_column_records(v2, &cols).unwrap();
-    let mut bb = BatchBuilder::new(*SysFamily::View.schema());
+    let mut bb = BatchBuilder::new(SysFamily::View.schema());
     push_view_tab_row(&mut bb, -1, v1, "v1", 0, 0, 0);
     push_view_tab_row(&mut bb, 1, v2, "v1", 0, 0, 0);
     engine.ingest_to_family(gnitz_wire::VIEW_TAB, &bb.finish()).unwrap();
@@ -563,7 +563,7 @@ fn test_dependent_view_restricts_fire_from_circuit_rows() {
     // DROP NOT NULL on `val` — an `is_nullable 0→1` rewrite pair.
     let mut nullable = cols[1].clone();
     nullable.def.is_nullable = true;
-    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
+    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
     cols[1].write_col_tab_row(&mut bb, tid, 1, -1);
     nullable.write_col_tab_row(&mut bb, tid, 1, 1);
     let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();

@@ -228,7 +228,7 @@ impl RangeProbe {
 /// Emission is trace-major under every probe: each trace row is walked once and
 /// producted against a contiguous, random-access delta run. So the output is
 /// unfolded and not (PK, payload)-sorted — under `Cross` not even PK-sorted,
-/// since each trace row re-emits the whole delta; it carries no layout claim,
+/// since each trace row re-emits the whole delta; it carries no consolidated claim,
 /// and downstream re-sorts and consolidates.
 pub fn op_join_delta_trace(
     delta: &Batch,
@@ -354,7 +354,7 @@ fn range_merge_walk(
     mut emit: impl FnMut(usize, usize, &ReadCursor),
 ) {
     let (eq_size, above) = (probe.eq_size, probe.above);
-    let (stride, last) = (delta.pk_stride() as usize, probe.last_before_split());
+    let (stride, last) = (delta.schema().pk_stride(), probe.last_before_split());
     // A group's lower bound: its equality prefix over an all-zero range slot,
     // so only the prefix is ever rewritten.
     let mut group_lb = [0u8; MAX_PK_BYTES];

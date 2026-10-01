@@ -22,7 +22,7 @@ fn schema() -> SchemaDescriptor {
 /// both signs, a NULL beside a zero and beside an empty string, an inline and a
 /// heap string, and weights of both signs and zero.
 fn batch(schema: &SchemaDescriptor) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
+    let mut b = BatchBuilder::new(schema);
     for i in 0..600u64 {
         let neg = |m: u64| (i % m) as i64 - (m / 2) as i64;
         b.begin_row_opk(
@@ -284,7 +284,7 @@ fn a_layout_identical_promotion_routes_natively() {
 /// `n` rows over a U64-PK, all-I64-payload `schema`, PKs `0..n`, each payload a
 /// spread function of the PK.
 fn bench_stripe(schema: &SchemaDescriptor, n: usize) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
+    let mut b = BatchBuilder::new(schema);
     for pk in 0..n as u64 {
         b.begin_row(pk as u128, 1);
         for c in 1..=schema.num_payload_cols() as i64 {
@@ -300,7 +300,7 @@ fn bench_stripe(schema: &SchemaDescriptor, n: usize) -> Batch {
 #[test]
 fn the_native_plan_places_each_live_row_by_its_placement() {
     let schema = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false); 2], &[0, 1]);
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     for b in 0..8u128 {
         bb.begin_row_opk(&[7 + b % 2, b], if b == 3 { 0 } else { 1 });
         bb.end_row();

@@ -7,14 +7,13 @@ fn wire_flags_roundtrip_every_combination() {
     for &verb in ClientVerb::ALL {
         for &conflict_mode in WireConflictMode::ALL {
             for &probe_mode in WireProbeMode::ALL {
-                for bits in 0..8u8 {
+                for bits in 0..4u8 {
                     let f = WireFlags {
                         verb,
                         conflict_mode,
                         probe_mode,
                         continuation: bits & 1 != 0,
-                        batch_consolidated: bits & 2 != 0,
-                        scan_last: bits & 4 != 0,
+                        scan_last: bits & 2 != 0,
                     };
                     assert_eq!(WireFlags::unpack(f.pack()), Ok(f), "{f:?}");
                 }
@@ -28,7 +27,7 @@ fn wire_flags_roundtrip_every_combination() {
 /// mode the server does not implement into a silent upsert on a client's push.
 #[test]
 fn wire_flags_reject_unknown() {
-    for bit in (16..32).chain(39..64) {
+    for bit in (16..32).chain(38..64) {
         assert!(WireFlags::unpack(1 << bit).is_err(), "bit {bit}");
     }
     // Bits 32/33 are the control codec's, so the flags word neither refuses nor

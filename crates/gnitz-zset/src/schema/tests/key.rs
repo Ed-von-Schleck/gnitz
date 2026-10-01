@@ -224,7 +224,7 @@ fn write_span_matches_the_reference_on_compound_null_and_entry_shapes() {
         ],
         &[0, 1],
     );
-    let mut bb = BatchBuilder::new(src);
+    let mut bb = BatchBuilder::new(&src);
     for (i, (a, v)) in [(7u32, -1i64), (0, 0), (u32::MAX, i64::MIN), (3, i64::MAX)]
         .into_iter()
         .enumerate()
@@ -299,7 +299,7 @@ fn index_spans_equal_the_seek_prefix_and_sort_as_the_values() {
                 .unwrap()
                 .seek_prefix(&[key_image(t, native)]);
             for (src, c) in [(payload_src, 1u32), (pk_src, 0)] {
-                let mut bb = BatchBuilder::new(src);
+                let mut bb = BatchBuilder::new(&src);
                 bb.begin_row_opk(&[if c == 0 { native } else { 1 }], 1);
                 bb.put_int(if c == 0 { 0 } else { native });
                 bb.end_row();

@@ -73,7 +73,7 @@ fn random_cell(rng: &mut Rng, col: &SchemaColumn, bb: &mut BatchBuilder) -> Opti
 fn random_row(rng: &mut Rng, s: &SchemaDescriptor) -> (Batch, Model) {
     let natives: Vec<u128> = s.pk_columns().map(|_| rng.pick(&[0, 1, u128::MAX])).collect();
     let pk = opk_pk(s, &natives);
-    let mut bb = BatchBuilder::new(*s);
+    let mut bb = BatchBuilder::new(s);
     bb.begin_row_bytes(&pk, 1);
     let cells = s.payload_columns().map(|(_, c)| random_cell(rng, c, &mut bb)).collect();
     bb.end_row();

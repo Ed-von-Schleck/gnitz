@@ -72,7 +72,7 @@ fn ingest_fixture(
 ) -> RelationFixture {
     let mut r = relation_fixture(RelationKind::BaseTable, schema, &[], Batch::empty_with_schema(&schema));
     for round in 0..INGEST_ROUNDS {
-        let mut bb = BatchBuilder::new(schema);
+        let mut bb = BatchBuilder::new(&schema);
         for id in (round..n).step_by(INGEST_ROUNDS as usize) {
             bb.begin_row(id as u128, 1);
             put_row(&mut bb, id);

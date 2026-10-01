@@ -23,7 +23,7 @@ use crate::runtime::sal::MAX_WORKERS;
 use crate::runtime::w2m::SalWake;
 use gnitz_foundation::posix_io;
 use gnitz_zset::algebra::{op_exchange_gather, ScatterPlan};
-use gnitz_zset::repr::{Batch, Layout, WalBlock};
+use gnitz_zset::repr::{Batch, WalBlock};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// The default and largest virtual size of one outbox.
@@ -197,7 +197,7 @@ impl Mesh {
             view,
             schema: *batch.schema(),
             drained,
-            consolidated: fold && batch.layout() == Layout::Consolidated,
+            consolidated: fold && batch.is_consolidated(),
             unsent: Some(Cursor { lists, list: 0, offset: 0 }),
             saved: Vec::new(),
             saved_consolidated: true,

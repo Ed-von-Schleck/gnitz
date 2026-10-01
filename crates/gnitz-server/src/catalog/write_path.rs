@@ -76,7 +76,7 @@ impl CatalogEngine {
     /// for a pair.
     pub(in crate::catalog) fn retract_under(&self, family: SysFamily, ids: &[u64]) -> Batch {
         debug_assert!(ids.windows(2).all(|w| w[0] < w[1]));
-        let mut batch = Batch::with_capacity(family.schema(), 0);
+        let mut batch = Batch::empty_with_schema(family.schema());
         for &id in ids {
             self.for_each_row_under(family, id, |c| c.copy_current_row_into(&mut batch, -c.current_weight));
         }

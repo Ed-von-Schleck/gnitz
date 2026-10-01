@@ -37,7 +37,7 @@ fn echo_fold_bench() {
 
         let mut instructions = 0u64;
         for round in 0..TICKS {
-            let mut bb = BatchBuilder::new(schema);
+            let mut bb = BatchBuilder::new(&schema);
             for i in 0..ROWS {
                 // Descending ids, so every tick reaches the view unsorted.
                 let id = round * ROWS + (ROWS - 1 - i);

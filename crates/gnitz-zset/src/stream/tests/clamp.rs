@@ -122,7 +122,7 @@ fn bench_schema(n: usize, strings: bool) -> SchemaDescriptor {
 }
 
 fn bench_batch(schema: &SchemaDescriptor, rows: &[ClampRow]) -> Batch {
-    let mut b = crate::repr::BatchBuilder::new(*schema);
+    let mut b = crate::repr::BatchBuilder::new(schema);
     for &(pk, w, val) in rows {
         b.begin_row(pk as u128, w);
         for (_, col) in schema.payload_columns() {

@@ -122,7 +122,7 @@ fn ingest_refuses_a_batch_of_another_arity() {
     let tmp = tempfile::tempdir().unwrap();
     let mut registry = solo(tmp.path());
     registry.register(table(50, make_schema_u64_i64())).unwrap();
-    let mut wide = gnitz_zset::repr::BatchBuilder::new(pk_u64_two_i64_schema());
+    let mut wide = gnitz_zset::repr::BatchBuilder::new(&pk_u64_two_i64_schema());
     wide.begin_row(1, 1);
     wide.put_int(1);
     wide.put_int(2);

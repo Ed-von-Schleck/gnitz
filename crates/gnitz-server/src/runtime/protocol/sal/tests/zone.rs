@@ -1,7 +1,7 @@
 use super::*;
 use crate::runtime::sal::fixtures::{group_at, TestLog};
 use crate::runtime::sal::{DirectGroup, GroupData, SalMessageKind, ANCHOR_BYTES, ANCHOR_RECORD, PREFIX_BYTES};
-use crate::runtime::wire::{WireData, WireMsg, WireSchema};
+use crate::runtime::wire::{WireMsg, WireSchema};
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_zset::repr::Batch;
 
@@ -255,7 +255,7 @@ fn slot_damage_in_an_unzoned_group_does_not_stop_the_walk() {
         WireSchema::encoded(TID, batch.schema()),
         WireSchema::encoded(TID + 1, batch.schema()),
     );
-    let data = GroupData::Same(WireData::Whole(&batch));
+    let data = GroupData::Same(batch.wire_whole());
     let (member, stream) = (DirectGroup::push(&member, data, 0), DirectGroup::push(&stream, data, 0));
     let mut excl = log.excl();
     let scope = excl.begin("test");
@@ -309,7 +309,7 @@ impl TestLog {
             .collect();
         let groups: Vec<DirectGroup> = relations
             .iter()
-            .map(|r| DirectGroup::push(r, GroupData::Same(WireData::Whole(&batch)), 0))
+            .map(|r| DirectGroup::push(r, GroupData::Same(batch.wire_whole()), 0))
             .collect();
         self.commit_zone(&groups)
     }

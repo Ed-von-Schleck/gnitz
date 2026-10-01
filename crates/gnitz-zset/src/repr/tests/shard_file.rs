@@ -7,7 +7,7 @@ use crate::test_support::{make_batch, make_schema_u64_i64, pk_u64_two_i64_schema
 #[test]
 fn shard_bytes_are_pinned() {
     const PINNED: (u64, u64) = (21, 8604968671891605139);
-    let mut b = BatchBuilder::new(pk_u64_two_i64_schema());
+    let mut b = BatchBuilder::new(&pk_u64_two_i64_schema());
     for i in 0..64i64 {
         b.begin_row((i * 3 + 1) as u128, 1 + i % 2);
         // A narrow range packs as FoR, a full-range one stays Raw.

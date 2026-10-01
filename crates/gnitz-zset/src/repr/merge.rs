@@ -13,7 +13,7 @@
 use std::cmp::Ordering;
 use std::ops::{ControlFlow, Range};
 
-use super::batch::{Batch, Layout};
+use super::batch::Batch;
 use super::loser_tree::{HeapNode, LoserTree};
 use super::scatter::DecodedColumns;
 use super::seek::pk_group_end;
@@ -64,7 +64,7 @@ pub(crate) struct UnifiedSource<'a> {
     pub null_pad_mask: u64,
     /// Index of this source's first payload `ColPtr` in the caller-owned table
     /// the scatter reads through: column `pi` is `cols[cols_off + pi]`. Out of
-    /// line because a by-value `[ColPtr; MAX_COLUMNS]` is 1 KiB zeroed per source
+    /// line because a by-value `[ColPtr; MAX_COLUMNS]` would be zeroed per source
     /// per call, whatever the schema's real column count.
     pub cols_off: usize,
     pub blob: &'a [u8],
@@ -124,7 +124,7 @@ pub(crate) fn mem_batch_to_unified<'a>(
 #[derive(Clone)]
 pub struct MemBatch<'a> {
     pub(crate) data: &'a [u8],
-    /// Borrowed, not owned: `usize` × `MAX_BATCH_REGIONS` is ~½ KiB, and this
+    /// Borrowed, not owned: the array is sized for `MAX_BATCH_REGIONS`, and this
     /// view exists to be derived per range, per chunk and per operator call.
     /// `Batch` already holds the array inline, so `as_mem_batch` lends it; the
     /// one view with no owning `Batch`, a borrowed wire frame, borrows it from
@@ -356,9 +356,8 @@ pub(crate) struct DirectWriter<'a> {
     blob: &'a mut Vec<u8>,
     blob_cache: BlobCache,
     pub(super) count: usize,
-    /// Borrowed, not owned: the scatter reads it per column, and a
-    /// `SchemaDescriptor` is 360 bytes (pinned in `schema`) — copying it in would
-    /// put a `memcpy` of that size on every writer open.
+    /// Borrowed, not owned: the scatter reads it per column, and copying it in
+    /// would put a `memcpy` on every writer open.
     pub schema: &'a SchemaDescriptor,
 }
 
@@ -474,7 +473,7 @@ pub fn merge_consolidated(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -
     let mut rows: Vec<(u32, u32, i64)> = Vec::with_capacity(sources.iter().map(|s| s.count).sum());
     run_merge(sources, schema, |src, row, w| rows.push((src as u32, row as u32, w)));
     let mut out = super::scatter::materialize_carrying(sources, schema, &rows);
-    out.certify_layout(Layout::Consolidated);
+    out.certify_consolidated();
     out
 }
 
@@ -685,7 +684,7 @@ impl Batch {
             "merged_consolidated: both inputs must be consolidated",
         );
         let mut out = with_payload_cmp!(schema, merged_consolidated_body, self, other, schema);
-        out.certify_layout(Layout::Consolidated);
+        out.certify_consolidated();
         out
     }
 }

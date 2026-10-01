@@ -79,7 +79,7 @@ fn a_circuit_behind_its_flushed_view_registers_as_a_clean_boot_does() {
     };
     let r = engine.create_table_with("public.r", &cols(), &[0], replicated).unwrap();
     let v = r + 1;
-    let mut view_tab = BatchBuilder::new(*SysFamily::View.schema());
+    let mut view_tab = BatchBuilder::new(SysFamily::View.schema());
     push_view_tab_row(&mut view_tab, 1, v, "v", 0, 0, 0);
     engine.registry.ingest(SysFamily::Column.id(), col_tab(v, 1)).unwrap();
     engine.registry.ingest(SysFamily::View.id(), view_tab.finish()).unwrap();

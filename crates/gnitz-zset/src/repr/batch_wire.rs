@@ -1,8 +1,8 @@
-//! Wire serialization for `Batch`: wire sizing and chunking, encoding, and
-//! WAL-block decoding with the validation it runs.
+//! Wire serialization for `Batch`: [`WireRows`], the row selection that sizes
+//! and encodes itself, and WAL-block decoding with the validation it runs.
 
 use super::batch::{row_width, strides_from_schema, Batch, MAX_BATCH_REGIONS, REG_PAYLOAD_START, REG_PK};
-use super::batch_pool::{acquire_arena, recycle_buf};
+use super::batch_pool::PooledBuf;
 use super::merge::{DirectWriter, MemBatch};
 use super::string_heap::{blob_span_key, copy_string_cells, prorated_blob_cap, walk_heap_spans, BlobCache};
 use crate::schema::{SchemaDescriptor, SchemaFacts};
@@ -18,59 +18,111 @@ fn wire_offsets(strides: &[u8], nr: usize, rows: usize, offsets: &mut [usize; MA
     }
 }
 
-/// The rows of one reply frame, as [`Batch::wire_frame_within`] sized them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WireFrame {
-    start: usize,
-    rows: usize,
-    /// Heap bytes the encode relocates for the rows.
+/// One or more rows of a batch as one WAL block: which rows, and the heap
+/// bytes the block holds for them. Its size and its bytes are read off the
+/// same value.
+#[derive(Clone, Copy)]
+pub struct WireRows<'a> {
+    batch: &'a Batch,
+    pick: Pick<'a>,
     heap: usize,
 }
 
-impl WireFrame {
+#[derive(Clone, Copy)]
+enum Pick<'a> {
+    /// Every row, over the batch's heap as it stands.
+    Whole,
+    /// Rows `[start, start + rows)`, their strings relocated.
+    Range { start: usize, rows: usize },
+    /// The listed rows of a batch whose cells reference no heap.
+    Listed(&'a [u32]),
+}
+
+impl WireRows<'_> {
+    /// Rows the block holds; never zero.
     pub fn rows(&self) -> usize {
-        self.rows
+        match self.pick {
+            Pick::Whole => self.batch.count,
+            Pick::Range { rows, .. } => rows,
+            Pick::Listed(indices) => indices.len(),
+        }
     }
 
-    /// The row after the frame's last.
-    pub fn end(&self) -> usize {
-        self.start + self.rows
+    /// Bytes [`Self::encode`] writes.
+    pub fn byte_size(&self) -> usize {
+        wal::WAL_HEADER_SIZE + self.rows() * row_width(self.batch.strides()) + self.heap
+    }
+
+    /// The block at the front of `out`. Returns bytes written.
+    pub fn encode(&self, out: &mut [u8]) -> usize {
+        let b = self.batch;
+        match self.pick {
+            Pick::Whole => {
+                b.debug_verify_dead_heap();
+                wal::write_block(&b.wire_regions(), b.dead_heap, out)
+            }
+            Pick::Range { start, rows } => b
+                .encode_relocating(rows, out, |data, offsets, heap| {
+                    b.copy_range(start, rows, data, offsets, heap)
+                })
+                .expect("a sized range fits the bytes its size reserved"),
+            Pick::Listed(indices) => b
+                .encode_listed(indices, out)
+                .expect("a heap-free list fits the bytes its size reserved"),
+        }
     }
 }
 
 impl Batch {
     // ── Wire serialization (used by the server's SAL and frame codecs) ─────
 
-    /// Byte count of the WAL-block encoding for this batch.
-    pub fn wire_byte_size(&self) -> usize {
-        self.wire_byte_size_range(self.count) + self.blob.len()
+    /// Every row, over the heap as it stands and under its dead-byte bound;
+    /// `None` for an empty batch.
+    pub fn wire_whole(&self) -> Option<WireRows<'_>> {
+        self.wire_rows_within(0, usize::MAX)
     }
 
-    /// Byte count of the WAL-block encoding for `count` rows from this batch,
-    /// with an empty heap.
-    pub fn wire_byte_size_range(&self, count: usize) -> usize {
-        wal::WAL_HEADER_SIZE + count * row_width(self.strides())
-    }
-
-    /// The frame from `start` that fits `budget` beside `overhead` bytes of
-    /// frame around it; at least one row while any remain, however wide.
-    pub fn wire_frame_within(&self, start: usize, overhead: usize, budget: usize) -> WireFrame {
-        let slots = self.heap_referencing_slots();
-        let (rows, heap) = match slots {
-            0 => (self.rows_by_width(start, overhead, budget), 0),
-            _ => self.rows_with_heap(start..self.count, slots, overhead, budget),
+    /// The longest run of rows from `start` whose block fits `budget`: at least
+    /// one row, however wide, and `None` once no row remains. The whole batch,
+    /// when it fits, goes over its heap as it stands.
+    pub fn wire_rows_within(&self, start: usize, budget: usize) -> Option<WireRows<'_>> {
+        if start == self.count {
+            return None;
+        }
+        let whole = WireRows {
+            batch: self,
+            pick: Pick::Whole,
+            heap: self.blob.len(),
         };
-        let frame = WireFrame { start, rows, heap };
+        if start == 0 && whole.byte_size() <= budget {
+            return Some(whole);
+        }
+        let (rows, heap) = match self.heap_referencing_slots() {
+            0 => (self.rows_by_width(start, budget), 0),
+            slots => self.rows_with_heap(start..self.count, slots, budget),
+        };
+        let out = WireRows {
+            batch: self,
+            pick: Pick::Range { start, rows },
+            heap,
+        };
         debug_assert!(
-            rows <= 1 || overhead + self.wire_frame_size(&frame) <= budget,
-            "a frame of {rows} rows encodes past {budget}",
+            rows <= 1 || out.byte_size() <= budget,
+            "a run of {rows} rows encodes past {budget}"
         );
-        frame
+        Some(out)
     }
 
-    /// Bytes [`Self::encode_frame`] writes for `frame`.
-    pub fn wire_frame_size(&self, frame: &WireFrame) -> usize {
-        self.wire_byte_size_range(frame.rows) + frame.heap
+    /// The rows `indices` lists, in that order; `None` for an empty list. No cell
+    /// of `self` references a heap, so the block holds none: a relocated heap is
+    /// sized only by the pass [`Self::encode_scattered_prefix`] runs.
+    pub fn wire_listed<'a>(&'a self, indices: &'a [u32]) -> Option<WireRows<'a>> {
+        debug_assert_eq!(self.heap_referencing_slots(), 0, "wire_listed: the batch has a heap");
+        (!indices.is_empty()).then_some(WireRows {
+            batch: self,
+            pick: Pick::Listed(indices),
+            heap: 0,
+        })
     }
 
     /// Payload slots whose cells can reference this batch's heap.
@@ -83,23 +135,17 @@ impl Batch {
     }
 
     /// Rows from `start` that fit `budget` by fixed width alone.
-    fn rows_by_width(&self, start: usize, overhead: usize, budget: usize) -> usize {
+    fn rows_by_width(&self, start: usize, budget: usize) -> usize {
         let slope = row_width(self.strides());
-        (self.count - start).min((budget.saturating_sub(overhead + wal::WAL_HEADER_SIZE) / slope).max(1))
+        (self.count - start).min((budget.saturating_sub(wal::WAL_HEADER_SIZE) / slope).max(1))
     }
 
     /// How many of `rows`, from the front, fit `budget` once the heap bytes they
     /// relocate are charged, and those heap bytes. `slots` names the
     /// German-string payload slots.
-    fn rows_with_heap(
-        &self,
-        rows: impl ExactSizeIterator<Item = usize>,
-        slots: u64,
-        overhead: usize,
-        budget: usize,
-    ) -> (usize, usize) {
+    fn rows_with_heap(&self, rows: impl ExactSizeIterator<Item = usize>, slots: u64, budget: usize) -> (usize, usize) {
         let slope = row_width(self.strides());
-        let base = overhead + wal::WAL_HEADER_SIZE;
+        let base = wal::WAL_HEADER_SIZE;
         let mut seen = BlobCache::new(rows.len());
         let mut heap = 0usize;
         let mut fit = 0usize;
@@ -135,62 +181,36 @@ impl Batch {
         cost
     }
 
-    /// Every fixed region narrowed to rows `[start, start + rows)`, in canonical
-    /// order, with no blob slot yet.
-    fn fixed_regions(&self, start: usize, rows: usize) -> Regions<'_> {
-        let mut out = Regions::new();
-        for (r, &stride) in self.strides().iter().enumerate() {
-            let stride = stride as usize;
-            out.push(&self.region_at(r)[start * stride..(start + rows) * stride]);
-        }
-        out
-    }
-
     /// Every fixed region followed by the blob heap, in canonical order.
     pub fn wire_regions(&self) -> Regions<'_> {
-        let mut out = self.fixed_regions(0, self.count);
+        let mut out = Regions::new();
+        for r in 0..self.strides().len() {
+            out.push(self.region_at(r));
+        }
         out.push(&self.blob);
         out
     }
 
-    /// Encode self into WAL wire format at the front of `out`, the header
-    /// stating this batch's dead-heap bound. Returns bytes written.
-    pub fn encode_to_wire(&self, out: &mut [u8]) -> usize {
-        self.debug_verify_dead_heap();
-        wal::write_block(&self.wire_regions(), self.dead_heap, out)
-    }
-
-    /// `frame` as one WAL block at the front of `out`, its strings relocated
-    /// into the block's own heap. Returns bytes written.
-    pub fn encode_frame(&self, frame: &WireFrame, out: &mut [u8]) -> usize {
-        let WireFrame { start, rows, .. } = *frame;
+    /// Rows `[start, start + rows)` into a block's regions at `offsets`, their
+    /// string cells relocated into `heap`.
+    fn copy_range(&self, start: usize, rows: usize, data: &mut [u8], offsets: &[usize], heap: &mut Vec<u8>) {
         let slots = self.heap_referencing_slots();
-        if slots == 0 {
-            let mut r = self.fixed_regions(start, rows);
-            r.push(&[]);
-            return wal::write_block(&r, 0, out);
-        }
-        self.encode_relocating(rows, out, |data, offsets, heap| {
-            let mut cache = BlobCache::new(rows);
-            for (r, &stride) in self.strides().iter().enumerate() {
-                let len = rows * stride as usize;
-                let src = &self.region_at(r)[start * stride as usize..][..len];
-                let dst = &mut data[offsets[r]..offsets[r] + len];
-                match r.checked_sub(REG_PAYLOAD_START) {
-                    Some(pi) if (slots >> pi) & 1 != 0 => {
-                        copy_string_cells(dst, src, &self.blob, heap, None, &mut cache)
-                    }
-                    _ => dst.copy_from_slice(src),
-                }
+        let mut cache = BlobCache::new(rows);
+        for (r, &stride) in self.strides().iter().enumerate() {
+            let stride = stride as usize;
+            let src = &self.region_at(r)[start * stride..][..rows * stride];
+            let dst = &mut data[offsets[r]..][..rows * stride];
+            match r.checked_sub(REG_PAYLOAD_START) {
+                Some(pi) if (slots >> pi) & 1 != 0 => copy_string_cells(dst, src, &self.blob, heap, None, &mut cache),
+                _ => dst.copy_from_slice(src),
             }
-        })
-        .expect("encode_frame: the block does not fit `out`")
+        }
     }
 
     /// The rows `indices` selects, in order, as one WAL block at the front of
     /// `out`, their strings relocated into the block's own heap. Returns bytes
     /// written; `None` when the block does not fit `out`.
-    pub fn encode_scattered_to_wire(&self, indices: &[u32], out: &mut [u8]) -> Option<usize> {
+    fn encode_listed(&self, indices: &[u32], out: &mut [u8]) -> Option<usize> {
         let count = indices.len();
         self.encode_relocating(count, out, |data, offsets, heap| {
             let mut writer = DirectWriter::over_regions(data, offsets, self.strides(), count, self.schema(), heap);
@@ -215,52 +235,45 @@ impl Batch {
         }
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
         wire_offsets(strides, strides.len(), count, &mut offsets);
-        let cap = match self.heap_referencing_slots() {
-            0 => 0,
-            _ => prorated_blob_cap(self.blob.len(), self.count, count),
-        };
-        let mut heap = acquire_arena(cap);
-        fill(&mut out[..heap_at], &offsets[..strides.len()], &mut heap);
-        let total = heap_at + heap.len();
-        let Some(dst) = out.get_mut(heap_at..total) else {
-            recycle_buf(heap);
-            return None;
-        };
-        dst.copy_from_slice(&heap);
+        let mut heap = PooledBuf::with_capacity(prorated_blob_cap(self.blob.len(), self.count, count));
+        fill(&mut out[..heap_at], &offsets[..strides.len()], &mut heap.0);
+        let total = heap_at + heap.0.len();
+        out.get_mut(heap_at..total)?.copy_from_slice(&heap.0);
         // Relocated cell by cell, so every heap byte is referenced.
-        let written = wal::write_head(out, count, fixed, heap.len(), 0);
-        recycle_buf(heap);
-        Some(written)
+        Some(wal::write_head(out, count, fixed, heap.0.len(), 0))
     }
 
     /// The longest front run of the rows `indices` selects, ascending, that fits
     /// `out` as one block, written there: its row count and bytes. `None` when
     /// not even the first row fits.
     pub fn encode_scattered_prefix(&self, indices: &[u32], out: &mut [u8]) -> Option<(usize, usize)> {
-        let fixed_fit = out.len().saturating_sub(wal::WAL_HEADER_SIZE) / row_width(self.strides());
+        let width = row_width(self.strides());
+        let fixed_fit = out.len().saturating_sub(wal::WAL_HEADER_SIZE) / width;
         let rows = &indices[..indices.len().min(fixed_fit)];
         if rows.is_empty() {
             return None;
         }
         // Every row, ascending, is the batch itself: framed whole, heap as it is.
-        if indices.len() == self.count && self.wire_byte_size() <= out.len() {
-            return Some((self.count, self.encode_to_wire(out)));
+        if indices.len() == self.count {
+            if let Some(whole) = self.wire_whole().filter(|w| w.byte_size() <= out.len()) {
+                return Some((self.count, whole.encode(out)));
+            }
         }
         let slots = self.heap_referencing_slots();
         // A heap-free block fits by width alone, and the sizing pass is skipped
         // when the source's whole heap fits too.
-        if slots == 0 || self.wire_byte_size_range(rows.len()) + self.blob.len() <= out.len() {
-            if let Some(len) = self.encode_scattered_to_wire(rows, out) {
+        if slots == 0 || wal::WAL_HEADER_SIZE + rows.len() * width + self.blob.len() <= out.len() {
+            if let Some(len) = self.encode_listed(rows, out) {
                 return Some((rows.len(), len));
             }
         }
         let n = self
-            .rows_with_heap(rows.iter().map(|&i| i as usize), slots, 0, out.len())
+            .rows_with_heap(rows.iter().map(|&i| i as usize), slots, out.len())
             .0;
-        self.encode_scattered_to_wire(&rows[..n], out).map(|len| (n, len))
+        self.encode_listed(&rows[..n], out).map(|len| (n, len))
     }
 
-    /// Decode a WAL block the engine wrote into an owned `Raw` batch. String
+    /// Decode a WAL block the engine wrote into an owned unconsolidated batch. String
     /// cells are copied verbatim with their heap.
     pub fn decode_from_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Self, &'static str> {
         Ok(Batch::from_mem_batch(&WalBlock::parse(data, schema)?.view(), schema))
@@ -334,8 +347,8 @@ pub struct WalBlock<'a> {
 
 impl<'a> WalBlock<'a> {
     pub fn parse(data: &'a [u8], schema: &SchemaDescriptor) -> Result<Self, &'static str> {
-        let (strides, nr) = strides_from_schema(schema);
-        let nr = nr as usize;
+        let strides = strides_from_schema(schema);
+        let nr = REG_PAYLOAD_START + schema.num_payload_cols();
         let (count, _, blob, dead_heap) = wal::parse_block(data, row_width(&strides[..nr]))?;
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
         wire_offsets(&strides, nr, count, &mut offsets);

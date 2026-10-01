@@ -6,7 +6,7 @@
 use gnitz_wire::PkKeys;
 
 use super::{empty_cursor, from_runs_at, ReadCursor, SkeletonKeys};
-use crate::repr::batch::{Batch, Layout};
+use crate::repr::batch::Batch;
 use crate::repr::run::Run;
 use crate::schema::{project_schema, ColumnLocator, SchemaDescriptor, SchemaFacts};
 
@@ -92,7 +92,7 @@ impl PkSetGather {
                 c.copy_current_row_into(&mut out, c.current_weight);
             }
         });
-        out.certify_layout(Layout::Consolidated);
+        out.certify_consolidated();
         (visited > 0).then_some(out)
     }
 

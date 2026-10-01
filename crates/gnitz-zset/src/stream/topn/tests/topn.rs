@@ -44,7 +44,7 @@ fn cells(&(id, grp, val, s, f): &Row) -> Cells {
 }
 
 fn batch(rows: &[(Row, i64)]) -> Batch {
-    let mut b = BatchBuilder::new(schema());
+    let mut b = BatchBuilder::new(&schema());
     for &((id, grp, val, s, f), w) in rows {
         b.begin_row(id as u128, w);
         b.put_int(grp as u128);

@@ -32,7 +32,7 @@ fn a_malformed_create_is_refused_at_the_precheck() {
     let too_wide = with_cols(&too_wide);
     // Column records at indices 0 and 2: `col_tab_batch` numbers by position.
     let gapped = engine.allocate_ids(1).unwrap();
-    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
+    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
     for col_idx in [0, 2] {
         col_def("c", TypeCode::U64).write_col_tab_row(&mut bb, gapped, col_idx, 1);
     }

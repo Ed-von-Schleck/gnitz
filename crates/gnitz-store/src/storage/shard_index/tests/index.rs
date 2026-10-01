@@ -60,7 +60,7 @@ fn dense_batch(base: u64, n: u64) -> Batch {
 /// `n` rows of a `width`-byte STRING payload, which a fold cannot pack smaller.
 fn fat_batch(base: u64, n: u64, width: usize) -> Batch {
     let schema = make_schema_pk_u64_payload_string();
-    let mut b = BatchBuilder::new(schema);
+    let mut b = BatchBuilder::new(&schema);
     for pk in base..base + n {
         // Vary the body per row so the text carries no run the writer can fold.
         let body: Vec<u8> = (0..width).map(|i| b'a' + ((pk as usize + i) % 26) as u8).collect();

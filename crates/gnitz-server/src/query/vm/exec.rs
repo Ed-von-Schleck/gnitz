@@ -226,7 +226,7 @@ fn run_integrates(vm: &mut Vm, state: &mut CircuitState) -> Result<(), String> {
     for (i, &(reg, trace)) in program.integrates.iter().enumerate() {
         let take = program.regs[reg.at()].last_read == LastRead::Integrate(i);
         gnitz_debug!("vm: INTEGRATE in_count={}", batches[reg.at()].len());
-        // Not `take_or_clone`: for a `Raw` register its clone arm would cost a
+        // Not `take_or_clone`: for an unconsolidated register its clone arm would cost a
         // clone plus the trace's own consolidate, where moving costs one.
         let res = match take {
             true => state.ingest_owned(trace, batches[reg.at()].take()),

@@ -821,7 +821,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     }
 
     // One VIEW_TAB batch, consumers first — the dependency-reversed row order.
-    let mut bb = BatchBuilder::new(*SysFamily::View.schema());
+    let mut bb = BatchBuilder::new(SysFamily::View.schema());
     for (vid, name) in [
         (r_consumer, "rv2"),
         (p_consumer, "pv2"),
@@ -1018,7 +1018,7 @@ fn view_with_segment(engine: &mut CatalogEngine) -> (u64, u64) {
         let vid = engine.next_id;
         write_identity_circuit(engine, vid, base, gnitz_wire::ReadBound::None);
         engine.write_column_records(vid, &cols).unwrap();
-        let mut bb = BatchBuilder::new(*SysFamily::View.schema());
+        let mut bb = BatchBuilder::new(SysFamily::View.schema());
         push_view_tab_row(&mut bb, 1, vid, name, 0, 0, owner);
         engine.submit(SysFamily::View, bb.finish()).unwrap();
         vid

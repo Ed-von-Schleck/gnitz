@@ -141,7 +141,7 @@ fn hydrate_seek_bench() {
     cell("single-key seek", &mut engine, seek);
 
     // Each upsert takes effect as a retraction and an insert.
-    let mut bb = BatchBuilder::new(engine.registry.relation(base).map(Relation::schema).unwrap());
+    let mut bb = BatchBuilder::new(&engine.registry.relation(base).map(Relation::schema).unwrap());
     for id in key - UNTICKED_IDS / 2..key + UNTICKED_IDS / 2 {
         bb.begin_row(id as u128, 1);
         for c in 0..PAYLOAD_COLS {
@@ -190,7 +190,7 @@ fn join_base(engine: &mut CatalogEngine, name: &str) -> u64 {
     let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
     let tid = engine.create_table(&format!("public.{name}"), &cols, &[0]).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     for id in 0..ROWS {
         bb.begin_row(id as u128, 1);
         bb.put_u64(scramble(id));
@@ -273,7 +273,7 @@ fn print_shards(dir: &str) {
 /// `k` so every probe finds a match; its instructions, ingest excluded.
 fn push_epoch(engine: &mut CatalogEngine, base: u64, id: u64) -> u64 {
     let schema = engine.registry.relation(base).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     bb.begin_row(id as u128, 1);
     bb.put_u64(scramble(id - ROWS));
     bb.end_row();

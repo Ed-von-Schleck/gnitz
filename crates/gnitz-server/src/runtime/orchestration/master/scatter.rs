@@ -7,7 +7,6 @@ use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::repr::Batch;
 
 use crate::runtime::sal::GroupData;
-use crate::runtime::wire::WireData;
 use gnitz_zset::schema::Placement;
 
 // Reuse the row lists across calls.
@@ -28,7 +27,7 @@ pub(crate) fn with_routed<R>(
         let rows = ScatterPlan::native(placement).route(batch, &mut pool, num_workers);
         let subs: Vec<Batch>;
         let data = match rows {
-            [all] if all.len() == batch.len() => GroupData::Same(WireData::Whole(batch)),
+            [all] if all.len() == batch.len() => GroupData::Same(batch.wire_whole()),
             [_, _, ..] if batch.heap_referencing_slots() == 0 => GroupData::Scattered { batch, rows },
             _ => {
                 subs = rows.iter().map(|r| batch.ascending_subset(r)).collect();

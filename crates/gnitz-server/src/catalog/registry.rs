@@ -179,7 +179,7 @@ impl CatalogEngine {
     /// empty when it already holds `new`.
     pub(in crate::catalog) fn sequence_delta(&self, seq_id: u64, new: u64) -> Batch {
         let old = self.sequence_value(seq_id);
-        let mut bb = BatchBuilder::new(*SysFamily::Sequence.schema());
+        let mut bb = BatchBuilder::new(SysFamily::Sequence.schema());
         if old != Some(new) {
             for (value, w) in old.map(|v| (v, -1)).into_iter().chain([(new, 1)]) {
                 bb.begin_row(seq_id as u128, w);

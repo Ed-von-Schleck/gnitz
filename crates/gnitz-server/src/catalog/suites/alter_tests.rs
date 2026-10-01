@@ -12,7 +12,7 @@ use std::path::Path;
 /// `-1` copies the live row, the `+1` differs from it only in `name`.
 fn table_rename_rows(engine: &CatalogEngine, tid: u64, new_name: &str) -> [Batch; 2] {
     let minus = engine.retract_under(SysFamily::Table, &[tid]);
-    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
+    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
     let row = TableTabRow {
         table_id: tid,
         schema_id: payload_u64(&minus, 0, RELTAB_PAY_SCHEMA_ID),
@@ -72,7 +72,7 @@ fn rename_then_reopen_resolves_flushed_data() {
         tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
         // Flush a row so only the on-disk (id-only) path can serve it after reopen.
         let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-        let mut bb = BatchBuilder::new(schema);
+        let mut bb = BatchBuilder::new(&schema);
         bb.begin_row(7u128, 1);
         bb.put_u64(70);
         bb.end_row();
@@ -280,7 +280,7 @@ fn a_duplicate_visible_column_name_is_named_before_dependent_views() {
     let (mut engine, tid, dir) = table_fixture("alter_add_dup_dep", &cols);
     register_identity_view(&mut engine, tid, "vw", &cols);
 
-    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
+    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
     nullable_def("v", TypeCode::U64).write_col_tab_row(&mut bb, tid, 2, 1);
     let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
     assert!(err.contains("duplicate column name"), "add: {err}");
@@ -386,7 +386,7 @@ fn a_column_alter_must_be_its_bundles_only_change() {
     };
 
     // An append bundled with an index family.
-    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
+    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
     append(tid, &mut bb);
     let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
     families[SysFamily::Column.index()] = Some(bb.finish());
@@ -402,7 +402,7 @@ fn a_column_alter_must_be_its_bundles_only_change() {
     assert!(err.contains("only change"), "{err}");
 
     // One column block altering two owners.
-    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
+    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
     append(tid, &mut bb);
     append(other, &mut bb);
     let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);

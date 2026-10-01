@@ -142,7 +142,7 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
 #[test]
 fn a_pk_prefix_range_walks_the_store_over_a_matching_index() {
     let schema = pk_only_schema(&[TypeCode::U64, TypeCode::U64]);
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     for a in 0..8u128 {
         for b in 0..3u128 {
             bb.begin_row_opk(&[a, b], 1);

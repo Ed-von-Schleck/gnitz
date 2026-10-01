@@ -8,7 +8,7 @@ use gnitz_zset::repr::BatchBuilder;
 #[test]
 fn a_pair_keyed_familys_at_rest_pk_leads_with_its_owner() {
     for family in [SysFamily::CircuitNodes, SysFamily::Column] {
-        let mut bb = BatchBuilder::new(*family.schema());
+        let mut bb = BatchBuilder::new(family.schema());
         push_sys_row(&mut bb, family, [0x1122, 0xAABB], 1, |_| 0);
         let batch = bb.finish();
         assert_eq!(
@@ -53,7 +53,7 @@ fn idx_tab_partition_carries_each_rows_column_list() {
         ));
     }
     // A row whose column list does not decode is in neither list.
-    let mut undecodable = BatchBuilder::new(*SysFamily::Index.schema());
+    let mut undecodable = BatchBuilder::new(SysFamily::Index.schema());
     push_sys_row(&mut undecodable, SysFamily::Index, [53, 0], 1, |_| 0);
     batch.append_batch(&undecodable.finish());
 
@@ -73,7 +73,7 @@ fn idx_tab_partition_carries_each_rows_column_list() {
 #[test]
 fn read_col_tab_row_refuses_forged_words() {
     let read = |forged: Option<(usize, u64)>| {
-        let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
+        let mut bb = BatchBuilder::new(SysFamily::Column.schema());
         push_sys_row(&mut bb, SysFamily::Column, [16, 0], 1, |pi| match forged {
             Some((slot, word)) if slot == pi => word,
             _ if pi == COLTAB_PAY_TYPE_CODE => gnitz_wire::TypeCode::I64.as_wire() as u64,
@@ -101,7 +101,7 @@ fn read_col_tab_row_refuses_forged_words() {
 /// An IDX_TAB word that is not a packed list is refused as a column list.
 #[test]
 fn read_idx_tab_row_refuses_an_unpacked_column_list() {
-    let mut bb = BatchBuilder::new(*SysFamily::Index.schema());
+    let mut bb = BatchBuilder::new(SysFamily::Index.schema());
     push_sys_row(&mut bb, SysFamily::Index, [53, 0], 1, |pi| {
         if pi == IDXTAB_PAY_SOURCE_COLS {
             gnitz_wire::pack_pk_cols(&[1]) & !gnitz_wire::PK_LIST_PACKED_FLAG

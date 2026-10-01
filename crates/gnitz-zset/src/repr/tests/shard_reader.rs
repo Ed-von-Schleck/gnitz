@@ -193,7 +193,7 @@ struct Shape {
 
 /// A batch over `schema` of `n` rows, row `i` begun and filled by `row`.
 fn build(schema: SchemaDescriptor, n: usize, mut row: impl FnMut(&mut BatchBuilder, usize)) -> Batch {
-    let mut b = BatchBuilder::new(schema);
+    let mut b = BatchBuilder::new(&schema);
     for i in 0..n {
         row(&mut b, i);
         b.end_row();

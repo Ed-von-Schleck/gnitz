@@ -100,7 +100,7 @@ pub fn sum_weights(mut c: ReadCursor) -> i64 {
 /// `circuit` as `vid`'s CIRCUIT_NODES batch, through the row writer the client
 /// commits with.
 pub fn circuit_nodes_batch(vid: u64, circuit: &Circuit) -> Batch {
-    let mut bb = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
+    let mut bb = BatchBuilder::new(SysFamily::CircuitNodes.schema());
     write_circuit_rows(&mut bb, vid, circuit);
     bb.finish()
 }
@@ -230,7 +230,7 @@ pub fn push_sys_row(bb: &mut BatchBuilder, family: SysFamily, key: [u64; 2], wei
 /// A TABLE_TAB batch of `(table_id, name, weight)` rows: `public` tables keyed
 /// on column 0, under default props.
 pub fn table_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
-    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
+    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
     for &(table_id, name, weight) in rows {
         let row = TableTabRow {
             table_id,
@@ -246,7 +246,7 @@ pub fn table_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
 
 /// A SCHEMA_TAB batch of `(schema_id, name, weight)` rows.
 pub fn schema_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
-    let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
+    let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
     for &(schema_id, name, weight) in rows {
         write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id, name }, weight);
     }
@@ -255,7 +255,7 @@ pub fn schema_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
 
 /// `defs` as `owner_id`'s COL_TAB batch at `weight`, numbered by position.
 pub fn col_tab_batch(owner_id: u64, defs: &[CatalogColumn], weight: i64) -> Batch {
-    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
+    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
     crate::catalog::write_col_tab_rows(&mut bb, owner_id, defs, weight);
     bb.finish()
 }
@@ -269,7 +269,7 @@ pub fn idx_tab_batch(
     props: gnitz_wire::IndexProps,
     weight: i64,
 ) -> Batch {
-    let mut bb = BatchBuilder::new(*SysFamily::Index.schema());
+    let mut bb = BatchBuilder::new(SysFamily::Index.schema());
     write_idx_tab_row(
         &mut bb,
         &IdxTabRow {
@@ -321,7 +321,7 @@ pub fn try_register_view(
     let vid = engine.allocate_ids(1).unwrap();
     write_circuit(engine, vid, circuit);
     engine.write_column_records(vid, cols).unwrap();
-    let mut bb = BatchBuilder::new(*SysFamily::View.schema());
+    let mut bb = BatchBuilder::new(SysFamily::View.schema());
     push_view_tab_row(&mut bb, 1, vid, name, capacity_bytes, delta_bytes, 0);
     engine.submit(SysFamily::View, bb.finish())?;
     Ok(vid)

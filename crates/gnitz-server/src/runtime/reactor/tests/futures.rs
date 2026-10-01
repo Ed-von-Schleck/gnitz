@@ -118,10 +118,7 @@ fn next_yields_the_row_frames_and_releases_the_rest() {
     let send = |w: usize, last, batch: Option<&gnitz_zset::repr::Batch>| {
         let msg = crate::runtime::wire::WireMsg {
             flags: gnitz_wire::WireFlags::train_frame(last),
-            data: batch.map_or(
-                crate::runtime::wire::WireData::None,
-                crate::runtime::wire::WireData::Whole,
-            ),
+            data: batch.and_then(gnitz_zset::repr::Batch::wire_whole),
             ..Default::default()
         };
         writers[w].send_msg(lease.id(), &msg);

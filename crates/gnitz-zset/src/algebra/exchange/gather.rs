@@ -1,6 +1,6 @@
 //! The receiving end of an exchange round: [`op_exchange_gather`].
 
-use crate::repr::{merge_consolidated, Batch, Layout, MemBatch};
+use crate::repr::{merge_consolidated, Batch, MemBatch};
 use crate::schema::SchemaDescriptor;
 
 /// Z-set `+` over one receiver's slices of an exchange round: merged when
@@ -11,7 +11,7 @@ pub fn op_exchange_gather(slices: &[MemBatch], schema: &SchemaDescriptor, consol
     }
     let mut out = Batch::concat(schema, slices.iter().cloned());
     if consolidated {
-        out.certify_layout(Layout::Consolidated);
+        out.certify_consolidated();
     }
     out
 }

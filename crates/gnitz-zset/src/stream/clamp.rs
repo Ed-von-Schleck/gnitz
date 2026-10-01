@@ -2,7 +2,7 @@
 
 use gnitz_wire::ClampKind;
 
-use crate::repr::{materialize_carrying, Batch, Layout, ReadCursor};
+use crate::repr::{materialize_carrying, Batch, ReadCursor};
 
 /// The weight a clamp caps at; every clamp's floor is 0.
 fn cap(kind: ClampKind) -> i64 {
@@ -36,7 +36,7 @@ pub fn op_weight_clamp(delta: &Batch, cursor: &mut ReadCursor, kind: ClampKind) 
     }
     let mut out = materialize_carrying(std::slice::from_ref(&mb), delta.schema(), &rows);
     // One row per transitioning element, in delta order: (PK, payload)-sorted, no ghosts.
-    out.certify_layout(Layout::Consolidated);
+    out.certify_consolidated();
     out
 }
 

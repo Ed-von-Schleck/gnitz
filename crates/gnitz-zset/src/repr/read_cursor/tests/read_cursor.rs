@@ -227,7 +227,7 @@ fn mode_follows_the_live_source_set() {
 /// A consolidated U64 PK / STRING run of `pk → "{pk:0>len}"` over the
 /// ascending `pks` at `weight`.
 fn string_run(pks: impl Iterator<Item = u64>, len: usize, weight: i64) -> Batch {
-    let mut bb = BatchBuilder::new(make_schema_pk_u64_payload_string());
+    let mut bb = BatchBuilder::new(&make_schema_pk_u64_payload_string());
     for pk in pks {
         bb.begin_row(pk as u128, weight);
         bb.put_string(&format!("{pk:0>len$}"));
@@ -316,7 +316,7 @@ fn a_skeleton_row_coarsens_its_whole_pk_group() {
         // PK 1: skeleton (coarse +3) plus two newer hydrated rows, one of which
         // compares `Equal` to a skeleton row under this arm. PK 2: hydrated only.
         // PK 3: skeleton whose coarse weight cancels.
-        let mut sk = BatchBuilder::new(schema.pk_only());
+        let mut sk = BatchBuilder::new(&schema.pk_only());
         for (pk, w) in [(1u128, 3), (3, 2)] {
             sk.begin_row(pk, w);
             sk.end_row();
@@ -327,7 +327,7 @@ fn a_skeleton_row_coarsens_its_whole_pk_group() {
         let opts = ShardWriteOpts { skeleton: true, ..Default::default() };
         sk.finish().write_as_shard(sk_path, opts).unwrap();
         let sk = Rc::new(MappedShard::open(sk_path, &schema).unwrap());
-        let mut bb = BatchBuilder::new(schema);
+        let mut bb = BatchBuilder::new(&schema);
         for (pk, w, v) in [(1u128, 5, None), (1, 7, Some(9)), (2, 4, Some(1)), (3, -2, None)] {
             bb.begin_row(pk, w);
             match (name, v) {

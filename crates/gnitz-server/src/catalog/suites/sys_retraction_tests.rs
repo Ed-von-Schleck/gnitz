@@ -49,7 +49,7 @@ fn a_write_must_retract_the_live_row_and_leave_one_or_none() {
             continue;
         }
         let retraction = |leading: u64| {
-            let mut bb = BatchBuilder::new(*family.schema());
+            let mut bb = BatchBuilder::new(family.schema());
             push_sys_row(&mut bb, family, [leading, 0], -1, |_| 7);
             if family.pair_change_mask().is_some() {
                 push_sys_row(&mut bb, family, [leading, 0], 1, |_| 7);

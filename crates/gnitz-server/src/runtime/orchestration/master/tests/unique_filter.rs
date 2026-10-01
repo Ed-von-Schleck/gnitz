@@ -38,7 +38,7 @@ fn filter_proves_absence_only_until_it_caps() {
 #[test]
 fn extract_into_filter_takes_only_live_non_null_spans() {
     let schema = u64_pk_schema(SchemaColumn::new(TypeCode::U64, true));
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     for (pk, weight, payload) in [(1, 1, Some(100)), (2, 1, None), (3, -1, Some(300))] {
         bb.begin_row(pk, weight);
         bb.put_opt_int(payload);

@@ -9,7 +9,7 @@ use proptest::prelude::*;
 
 use gnitz_expr::RowSource;
 use gnitz_wire::TypeCode;
-use gnitz_zset::repr::{Batch, BatchBuilder, Layout};
+use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts};
 
 /// A schema with one PK column per type code in `tcs`, plus a single trailing
@@ -36,22 +36,22 @@ pub fn make_schema_u64_i64() -> SchemaDescriptor {
 }
 
 /// Build a batch over [`make_schema_u64_i64`]-shaped schemas from native
-/// `(pk, weight, payload)` tuples and certify it `Consolidated`. **Rows must
+/// `(pk, weight, payload)` tuples and certify it consolidated. **Rows must
 /// arrive pre-sorted by (PK, payload) with no net-zero duplicates** — the
-/// certification is a claim the caller makes, and `certify_layout` only
+/// certification is a claim the caller makes, and `certify_consolidated` only
 /// debug-verifies it; a lying claim would let a consumer skip-point silently
 /// mis-fold weights.
 pub fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
     let mut b = make_batch_raw(schema, rows);
-    b.certify_layout(Layout::Consolidated);
+    b.certify_consolidated();
     b
 }
 
-/// [`make_batch`] without the `Consolidated` certification: the batch stays
-/// honestly `Raw`, for tests whose rows are unsorted or that exercise the
+/// [`make_batch`] without the consolidated certification: the batch stays
+/// honestly unconsolidated, for tests whose rows are unsorted or that exercise the
 /// sort/fold paths themselves.
 pub fn make_batch_raw(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
+    let mut b = BatchBuilder::new(schema);
     for &(pk, w, val) in rows {
         b.begin_row(pk as u128, w);
         b.put_int(val as u128);
@@ -241,9 +241,9 @@ pub fn opk_pk(schema: &SchemaDescriptor, vals: &[u128]) -> Vec<u8> {
 }
 
 /// [`make_batch_raw`] over [`make_schema_u128_i64`]-shaped schemas — native
-/// u128 PKs, rows left `Raw` in the order given.
+/// u128 PKs, rows left unconsolidated in the order given.
 pub fn make_batch_u128_raw(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)]) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
+    let mut b = BatchBuilder::new(schema);
     for &(pk, w, val) in rows {
         b.begin_row(pk, w);
         b.put_int(val as u128);
@@ -252,13 +252,13 @@ pub fn make_batch_u128_raw(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)])
     b.finish()
 }
 
-/// [`make_batch_u128_raw`] plus the `Consolidated` certification. **Rows must
+/// [`make_batch_u128_raw`] plus the consolidated certification. **Rows must
 /// arrive pre-sorted by (PK, payload) with no net-zero duplicates** — the
-/// certification is a claim the caller makes, and `certify_layout` only
+/// certification is a claim the caller makes, and `certify_consolidated` only
 /// debug-verifies it.
 pub fn make_batch_u128(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)]) -> Batch {
     let mut b = make_batch_u128_raw(schema, rows);
-    b.certify_layout(Layout::Consolidated);
+    b.certify_consolidated();
     b
 }
 
@@ -285,18 +285,18 @@ pub fn make_string_batch(rows: &[(u64, i64, &[u8])]) -> Batch {
     make_batch_bytes(&make_schema_pk_u64_payload_string(), rows)
 }
 
-/// [`make_batch_bytes_raw`] certified `Consolidated`: the rows must already be in
+/// [`make_batch_bytes_raw`] certified consolidated: the rows must already be in
 /// (PK, payload) order.
 pub fn make_batch_bytes(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> Batch {
     let mut b = make_batch_bytes_raw(schema, rows);
-    b.certify_layout(Layout::Consolidated);
+    b.certify_consolidated();
     b
 }
 
 /// A `(U64 pk, STRING|BLOB payload)` batch of `(pk, weight, bytes)` rows, in the
 /// order given.
 pub fn make_batch_bytes_raw(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
+    let mut b = BatchBuilder::new(schema);
     for &(pk, w, val) in rows {
         b.begin_row(pk as u128, w);
         b.put_blob(val);
@@ -404,12 +404,8 @@ pub fn join_reference(
 
 /// `batch` framed as one WAL block in a buffer of its own.
 pub fn encode_to_wire_vec(batch: &Batch) -> Vec<u8> {
-    let mut out = vec![0u8; batch.wire_byte_size()];
-    assert_eq!(
-        batch.encode_to_wire(&mut out),
-        out.len(),
-        "wire_byte_size must size its own encode"
-    );
+    let mut out = Vec::new();
+    gnitz_wire::wal::append_block(&batch.wire_regions(), batch.dead_heap(), &mut out);
     out
 }
 
@@ -434,7 +430,7 @@ pub fn pk_u64_two_i64_schema() -> SchemaDescriptor {
 /// which is what keeps a new PK width from growing another near-identical
 /// builder. [`opk_pk`] produces the bytes from native column values.
 pub fn make_batch_opk(schema: &SchemaDescriptor, rows: &[(impl AsRef<[u8]>, i64, i64)]) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
+    let mut b = BatchBuilder::new(schema);
     for (pk, w, val) in rows {
         let pk = pk.as_ref();
         assert_eq!(pk.len(), schema.pk_stride(), "PK bytes must be exactly one stride wide");
@@ -538,11 +534,11 @@ pub fn arb_fold_case() -> impl Strategy<Value = (usize, Vec<FoldRow>)> {
     })
 }
 
-/// `rows` as a `Raw` batch over a [`fold_schemas`] schema. A NULL and a zero
+/// `rows` as an unconsolidated batch over a [`fold_schemas`] schema. A NULL and a zero
 /// hold the same cell bytes and must not fold; each long string lands at its
 /// own heap offset, and equal ones must.
 pub fn fold_batch(schema: &SchemaDescriptor, rows: &[FoldRow]) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
+    let mut b = BatchBuilder::new(schema);
     for (pk, w, s, v) in rows {
         b.begin_row_bytes(pk, *w);
         if schema.num_payload_cols() == 2 {

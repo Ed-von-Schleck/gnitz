@@ -75,7 +75,7 @@ fn a_push_group_decodes_to_each_workers_rows() {
         (
             "replicated live rows: the batch itself",
             replicated(make_batch(&fixed, &[(1, 1, 10), (2, 2, 20), (3, -1, 30)])),
-            |g, batch| matches!(g, GroupData::Same(WireData::Whole(b)) if std::ptr::eq(*b, batch)),
+            |g, batch| matches!(g, GroupData::Same(Some(d)) if d.rows() == batch.len()),
         ),
         (
             "replicated with a weight-0 row: one whole batch",
@@ -83,7 +83,7 @@ fn a_push_group_decodes_to_each_workers_rows() {
                 &string,
                 &[(1, 1, long[0].as_bytes()), (2, 0, b"dropped"), (3, 2, b"c")],
             )),
-            |g, _| matches!(g, GroupData::Same(WireData::Whole(_))),
+            |g, _| matches!(g, GroupData::Same(Some(_))),
         ),
     ];
 
@@ -152,7 +152,7 @@ fn push_group_layout_bench() {
     let fixed = make_schema_u64_i64();
     let string = make_schema_pk_u64_payload_string();
     let build = |schema: SchemaDescriptor| {
-        let mut bb = BatchBuilder::new(schema);
+        let mut bb = BatchBuilder::new(&schema);
         for pk in 0..ROWS {
             bb.begin_row(pk, 1);
             if schema.has_german_string() {

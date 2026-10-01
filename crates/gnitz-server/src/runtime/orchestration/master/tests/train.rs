@@ -2,7 +2,7 @@ use super::*;
 use crate::runtime::reactor::{client_pair, reactor_with_rings, read_nonblocking};
 use crate::runtime::test_support::try_poll_once;
 use crate::runtime::w2m::W2mWriter;
-use crate::runtime::wire::{WireData, WireMsg};
+use crate::runtime::wire::WireMsg;
 use crate::test_support::{make_batch, make_schema_u64_i64, weighted_rows};
 use gnitz_wire::WireStatus;
 use gnitz_zset::repr::Batch;
@@ -21,7 +21,7 @@ fn frame(writer: &W2mWriter, req: u32, last: bool, batch: Option<&Batch>) -> Vec
     let msg = WireMsg {
         target_id: 1,
         flags: WireFlags::train_frame(last),
-        data: batch.map_or(WireData::None, WireData::Whole),
+        data: batch.and_then(Batch::wire_whole),
         ..Default::default()
     };
     writer.send_msg(req, &msg);

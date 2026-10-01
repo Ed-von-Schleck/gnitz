@@ -56,7 +56,7 @@ fn assert_routes_by(relay: Option<&Relay>, schema: &SchemaDescriptor, cols: &[u3
     let Some(Relay::Round(got) | Relay::Share(got)) = relay else {
         panic!("a keyed relay");
     };
-    let mut bb = BatchBuilder::new(*schema);
+    let mut bb = BatchBuilder::new(schema);
     for i in 0..64u64 {
         bb.begin_row(i as u128, 1);
         for c in 0..schema.num_payload_cols() as u64 {

@@ -17,7 +17,7 @@ fn new_table(dir: &Path, schema: SchemaDescriptor, rs: RecoverySource, ram_tier_
     Table::new(dir.to_str().unwrap(), schema, rs, StoreBudgets::new(ram_tier_bytes)).unwrap()
 }
 
-/// `Raw` rows over [`make_schema_u64_i64`]; the ingest path runs the sort+fold.
+/// unconsolidated rows over [`make_schema_u64_i64`]; the ingest path runs the sort+fold.
 fn rows(rows: &[(u64, i64, i64)]) -> Batch {
     make_batch_raw(&make_schema_u64_i64(), rows)
 }

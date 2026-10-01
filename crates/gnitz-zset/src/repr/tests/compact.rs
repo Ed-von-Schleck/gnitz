@@ -185,7 +185,7 @@ fn for_compaction_bench() {
         let per = TOTAL / sources;
         let inputs: Vec<Rc<MappedShard>> = (0..sources)
             .map(|s| {
-                let mut b = BatchBuilder::new(schema);
+                let mut b = BatchBuilder::new(&schema);
                 for i in 0..per {
                     b.begin_row(i as u128, 1);
                     b.put_int(s as u128);

@@ -34,8 +34,7 @@ fn join(
 ) -> Batch {
     let p = plan(kind, delta_is_right, delta_schema, trace_schema);
     // The VM hands the kernel a folded register; these fixtures build raw ones.
-    let cs = Batch::consolidate_if_needed(delta);
-    op_join_delta_trace(cs.as_ref().unwrap_or(delta), cursor, &p.out_schema, p.probe)
+    op_join_delta_trace(&delta.to_consolidated(), cursor, &p.out_schema, p.probe)
 }
 
 // -----------------------------------------------------------------------
@@ -439,7 +438,7 @@ fn make_range_schema(n_eq: usize, wide: bool) -> SchemaDescriptor {
 /// (PK, payload) order.
 fn make_range_batch(schema: &SchemaDescriptor, rows: &[(Vec<u64>, u64, i64, i64)]) -> Batch {
     let wide = schema.num_payload_cols() > 1;
-    let mut b = BatchBuilder::new(*schema);
+    let mut b = BatchBuilder::new(schema);
     for (eq, range, w, val) in rows {
         let mut vals: Vec<u128> = eq.iter().map(|&x| x as u128).collect();
         vals.push(*range as u128);
@@ -488,8 +487,7 @@ fn assert_matches_reference(
     what: &str,
 ) -> usize {
     let p = plan(kind, delta_is_right, &delta_schema, &trace_schema);
-    let cs = Batch::consolidate_if_needed(delta);
-    let delta = cs.as_ref().unwrap_or(delta);
+    let delta = &delta.to_consolidated();
     let folded = Batch::clone(trace).into_consolidated();
     let (want, want_rows) = join_reference(kind, delta_is_right, &delta_schema, &trace_schema, delta, &folded);
 

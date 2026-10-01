@@ -1111,11 +1111,7 @@ async fn handle_scan_spec(
             ipc::WireMsg {
                 target_id,
                 arg0: read_watermark(shared, kind),
-                data: if rows.is_empty() {
-                    ipc::WireData::None
-                } else {
-                    ipc::WireData::Whole(&rows)
-                },
+                data: rows.wire_whole(),
                 ..Default::default()
             },
         );

@@ -7,9 +7,7 @@ use std::cell::OnceCell;
 use std::ops::Range;
 use std::rc::Rc;
 
-use super::batch::{
-    write_to_batch, Batch, Layout, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
-};
+use super::batch::{write_to_batch, Batch, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::batch_pool::acquire_uninit;
 use super::layout::*;
 use super::merge::{ColPtr, ColumnarSource, UnifiedSource};
@@ -372,7 +370,7 @@ impl MappedShard {
             w.count = row_count;
         });
         batch.charge_dead(carried.unwrap_or(0));
-        batch.certify_layout(Layout::Consolidated);
+        batch.certify_consolidated();
         batch
     }
 }

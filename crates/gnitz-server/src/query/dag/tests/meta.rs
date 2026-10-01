@@ -49,7 +49,7 @@ fn the_closures_walk_both_directions_transitively() {
 fn the_dep_map_follows_circuit_deltas_idempotently() {
     // Raw rows, not a `Circuit`: a sink carrying a `source_table` is a shape no
     // circuit encodes to.
-    let mut bb = gnitz_zset::repr::BatchBuilder::new(*crate::catalog::SysFamily::CircuitNodes.schema());
+    let mut bb = gnitz_zset::repr::BatchBuilder::new(crate::catalog::SysFamily::CircuitNodes.schema());
     for (node_id, (opcode, source)) in [
         (gnitz_wire::Opcode::ScanDelta, 1),
         (gnitz_wire::Opcode::ScanDelta, 1),

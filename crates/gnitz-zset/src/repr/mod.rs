@@ -44,10 +44,10 @@ mod shard_reader;
 mod spill;
 mod string_heap;
 
-pub use batch::{Batch, Layout};
+pub use batch::Batch;
 pub use batch_builder::BatchBuilder;
 pub use batch_pool::PooledBuf;
-pub use batch_wire::{WalBlock, WireFrame};
+pub use batch_wire::{WalBlock, WireRows};
 pub use compact::{guard_slot, merge_and_route, EmitGuard};
 pub use error::StorageError;
 pub use merge::{merge_consolidated, MemBatch};

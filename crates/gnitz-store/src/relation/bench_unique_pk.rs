@@ -51,7 +51,7 @@ fn pushes(
     let seqs: Vec<u64> = seqs.collect();
     seqs.chunks(per)
         .map(|chunk| {
-            let mut bb = BatchBuilder::new(*schema);
+            let mut bb = BatchBuilder::new(schema);
             for &seq in chunk {
                 let (pk, w, v) = row(seq);
                 bb.begin_row(pk as u128, w);

@@ -27,7 +27,7 @@ proptest! {
         let got = op_exchange_gather(&mem, &schema, consolidated);
         if consolidated {
             assert_folds(&slices, &got, "consolidated slices");
-            prop_assert_eq!(got.layout(), Layout::Consolidated);
+            prop_assert!(got.is_consolidated());
         } else {
             let concatenated: Vec<_> = slices.iter().flat_map(weighted_rows).collect();
             prop_assert_eq!(weighted_rows(&got), concatenated);
@@ -37,7 +37,7 @@ proptest! {
 
 /// Release-only microbench of [`op_exchange_gather`] over K senders' slices, over
 /// both arms: `raw` is the production default, a base-table delta reaching the
-/// round `Raw` and an output round ending at a reindex `Map` that downgrades. K=1
+/// round unconsolidated and an output round ending at a reindex `Map` that clears the claim. K=1
 /// (one sender with rows for this receiver) and K=4 are the reachable range, K=16
 /// the headroom point; each sender holds a disjoint stripe of one ascending key
 /// space, so the merge genuinely interleaves them.

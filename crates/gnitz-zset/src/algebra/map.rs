@@ -81,7 +81,7 @@ fn copy_column(
             // and big-endian-encoded columns. Both regions are resolved once, as
             // in the Payload arms below.
             let pk = in_batch.pk_data();
-            let pk_stride = in_batch.pk_stride() as usize;
+            let pk_stride = in_batch.schema().pk_stride();
             let dst = output.col_data_mut(dst_payload);
             let pk_off = byte_off as usize;
             let src_stride = size as usize;
@@ -217,7 +217,7 @@ fn reindex_hash_row(output: &mut Batch, fold: &FoldCols) {
     // The PK *is* the digest, so the OPK region is its big-endian bytes.
     const KEY_BYTES: usize = std::mem::size_of::<u128>();
     assert_eq!(
-        output.pk_stride() as usize,
+        output.schema().pk_stride(),
         KEY_BYTES,
         "a hash-row PK is one U128 column"
     );
@@ -240,8 +240,6 @@ fn reindex_hash_row(output: &mut Batch, fold: &FoldCols) {
         }
         start = end;
     }
-    // An in-place PK rewrite can break (PK, payload) order.
-    output.downgrade();
 }
 
 /// Output schema of a computed-projection `Map`: the input's PK region (the map
@@ -381,7 +379,7 @@ impl MapPlan {
     }
 
     /// The map over `in_batch`, less a [`gnitz_wire::NullKeys::Drop`] reindex's
-    /// NULL-keyed rows, into a fresh `Raw` output.
+    /// NULL-keyed rows, into a fresh unconsolidated output.
     pub fn evaluate_map_batch(&mut self, in_batch: &Batch) -> Batch {
         let whole = [(0, in_batch.count)];
         let runs;
@@ -451,10 +449,6 @@ impl MapPlan {
             self.map_rows_into(src, out, w, heap_at, &mut cache);
             dst += w.n;
         }
-
-        // A payload-reordering projection over a duplicate-PK input breaks
-        // (PK, payload) order.
-        out.downgrade();
     }
 
     /// Map one row window: PK, weight, column moves, then the null words and
@@ -476,22 +470,20 @@ impl MapPlan {
         // window rather than to a pass over the finished batch.
         match &self.pk_source {
             PkSource::Inherit => {
-                let pk_st = in_batch.pk_stride() as usize;
+                let pk_st = in_batch.schema().pk_stride();
                 debug_assert_eq!(
                     pk_st,
-                    output.pk_stride() as usize,
+                    output.schema().pk_stride(),
                     "PkSource::Inherit: PK stride mismatch"
                 );
                 output.pk_data_mut()[dst_base * pk_st..(dst_base + n) * pk_st]
                     .copy_from_slice(&in_batch.pk_data()[src_start * pk_st..(src_start + n) * pk_st]);
             }
             PkSource::Pack(packer) => {
-                debug_assert_eq!(output.pk_stride() as usize, packer.out_stride);
+                debug_assert_eq!(output.schema().pk_stride(), packer.out_stride);
                 let stride = packer.out_stride;
                 let pk = &mut output.pk_data_mut()[dst_base * stride..];
                 packer.pack_rows(pk, stride, &in_batch.as_mem_batch(), src_start, n);
-                // An in-place PK rewrite can break (PK, payload) order.
-                output.downgrade();
             }
             // Hashes the finished output row, so `evaluate_map_batch` stamps it
             // once the payload below is written.

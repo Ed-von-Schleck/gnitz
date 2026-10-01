@@ -43,7 +43,7 @@ fn undecodable_row(bb: &mut BatchBuilder, view_id: u64, node_id: u64, opcode: u6
 /// row too, for the gap the first left, and report that instead.
 #[test]
 fn the_first_refused_row_aborts_the_load_and_is_the_one_reported() {
-    let mut bb = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
+    let mut bb = BatchBuilder::new(SysFamily::CircuitNodes.schema());
     undecodable_row(&mut bb, VIEW_ID, 0, 9999);
     undecodable_row(&mut bb, VIEW_ID, 1, 8888);
     assert_eq!(rejection(load(bb.finish())), "circuit params: unknown opcode 9999");
@@ -64,7 +64,7 @@ fn the_load_returns_one_views_circuit_as_written() {
 
     let mut rows = circuit_nodes_batch(VIEW_ID, &c);
     // Undecodable, so a load that ignored the view prefix would fail outright.
-    let mut foreign = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
+    let mut foreign = BatchBuilder::new(SysFamily::CircuitNodes.schema());
     undecodable_row(&mut foreign, VIEW_ID + 1, 0, 9999);
     rows.append_batch(&foreign.finish());
 

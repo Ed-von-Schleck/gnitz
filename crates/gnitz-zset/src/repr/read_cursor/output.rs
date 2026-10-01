@@ -4,14 +4,14 @@ use std::rc::Rc;
 
 use super::super::run::Run;
 use super::{ReadCursor, SkeletonKeys};
-use crate::repr::batch::{Batch, Layout};
+use crate::repr::batch::Batch;
 use crate::repr::merge::ColumnarSource;
 use crate::repr::scatter::UnifiedSet;
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use gnitz_expr::RowSource;
 
 impl ReadCursor {
-    /// Copy the current row into `batch` at `weight`, downgrading `batch` to `Raw`.
+    /// Copy the current row into `batch` at `weight`, clearing its consolidated claim.
     pub fn copy_current_row_into(&self, batch: &mut Batch, weight: i64) {
         debug_assert!(self.valid, "copy_current_row_into on an invalid cursor");
         debug_assert!(
@@ -62,7 +62,7 @@ impl ReadCursor {
         }
         let set = UnifiedSet::of(&self.sources, &self.schema, windows.iter().cloned());
         let mut batch = set.materialize(&order, set.src_rows());
-        batch.certify_layout(Layout::Consolidated);
+        batch.certify_consolidated();
         self.merge_order = order;
         self.drain_windows = windows;
         Some(batch)

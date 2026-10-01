@@ -268,7 +268,7 @@ impl Table {
     }
 
     /// The tail both entry points share, taking a batch already certified
-    /// `Consolidated`.
+    /// consolidated.
     fn push_memtable(&mut self, batch: Batch) -> Result<(), StorageError> {
         if batch.is_empty() {
             return Ok(());

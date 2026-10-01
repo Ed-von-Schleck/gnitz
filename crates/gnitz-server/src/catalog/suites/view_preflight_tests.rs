@@ -138,7 +138,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     engine.write_column_records(new_vid, &cols).unwrap();
 
     // Reusing the live name without retiring the incumbent is still a collision.
-    let mut bb = BatchBuilder::new(*SysFamily::View.schema());
+    let mut bb = BatchBuilder::new(SysFamily::View.schema());
     push_view_tab_row(&mut bb, 1, new_vid, "vw", 0, 0, 0);
     let collide = bb.finish();
     assert!(
@@ -149,7 +149,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     // The same `+1` preceded by the incumbent's `-1` — one ALTER VIEW bundle —
     // is admitted. The `-1` reproduces the live row's full payload, which the
     // the retraction CAS requires.
-    let mut bb = BatchBuilder::new(*SysFamily::View.schema());
+    let mut bb = BatchBuilder::new(SysFamily::View.schema());
     push_view_tab_row(&mut bb, -1, old_vid, "vw", 0, 0, 0);
     push_view_tab_row(&mut bb, 1, new_vid, "vw", 0, 0, 0);
     let replace = bb.finish();
@@ -191,7 +191,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     );
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     engine.write_column_records(new_vid, &cols).unwrap();
-    let mut bb = BatchBuilder::new(*SysFamily::View.schema());
+    let mut bb = BatchBuilder::new(SysFamily::View.schema());
     push_view_tab_row(&mut bb, -1, old_vid, "vw", 0, 0, 0);
     push_view_tab_row(&mut bb, 1, new_vid, "vw", 0, 0, 0);
     engine.ingest_to_family(gnitz_wire::VIEW_TAB, &bb.finish()).unwrap();

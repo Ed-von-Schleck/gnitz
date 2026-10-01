@@ -19,13 +19,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::runtime::reactor::{AsyncRwLock, Reactor, WriteGuard};
 use crate::runtime::w2m::SalWake;
-use crate::runtime::wire::{WireData, WireMsg, WireSchema};
+use crate::runtime::wire::{WireMsg, WireSchema};
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io;
 use gnitz_wire::control::frame_head_size;
 use gnitz_wire::{low_bits_mask, read_u32_le, read_u64_le, write_u32_le, write_u64_le, BitIter};
 use gnitz_wire::{WireFault, WireStatus};
-use gnitz_zset::repr::Batch;
+use gnitz_zset::repr::{Batch, WireRows};
 
 /// `GNITZ_INJECT_SAL_ZONE_PANIC=<scope tag>`: crash the master between a zone's
 /// groups publishing and its closing member. The tag (`"ddl"` / `"commit"`)
@@ -230,7 +230,7 @@ impl GroupTargets {
 #[derive(Clone, Copy)]
 pub(crate) enum GroupData<'a> {
     /// Every slot carries this payload.
-    Same(WireData<'a>),
+    Same(Option<WireRows<'a>>),
     /// Slot `w` carries `batches[w]`; one batch per worker.
     Batches(&'a [Batch]),
     /// Slot `w` carries the rows `rows[w]` of `batch`; one list per worker.
@@ -239,12 +239,12 @@ pub(crate) enum GroupData<'a> {
 
 impl<'a> GroupData<'a> {
     /// A control-only group: every slot is a bare control block.
-    pub(crate) const NONE: Self = Self::Same(WireData::None);
+    pub(crate) const NONE: Self = Self::Same(None);
 
     /// Slot `w` carries `b[w]`; a single batch is sent to every worker.
     pub(crate) fn batches(b: &'a [Batch]) -> Self {
         match b {
-            [one] => Self::Same(WireData::Whole(one)),
+            [one] => Self::Same(one.wire_whole()),
             each => Self::Batches(each),
         }
     }
@@ -252,7 +252,7 @@ impl<'a> GroupData<'a> {
     /// True when no slot carries a row — the one shape allowed to omit a schema.
     fn is_dataless(&self) -> bool {
         match *self {
-            Self::Same(d) => d.row_count() == 0,
+            Self::Same(d) => d.is_none(),
             Self::Batches(b) => b.iter().all(Batch::is_empty),
             Self::Scattered { rows, .. } => rows.iter().all(Vec::is_empty),
         }
@@ -315,7 +315,7 @@ impl<'a> DirectGroup<'a> {
     pub(crate) fn ddl_sync(relation: &'a WireSchema, batch: &'a Batch) -> Self {
         DirectGroup {
             template: relation.frame(WireMsg::default()),
-            data: GroupData::Same(WireData::Whole(batch)),
+            data: GroupData::Same(batch.wire_whole()),
             ..Self::new(SalMessageKind::DdlSync)
         }
     }
@@ -327,17 +327,17 @@ impl<'a> DirectGroup<'a> {
     #[inline]
     fn msg(&self, w: usize) -> WireMsg<'a> {
         debug_assert!(
-            matches!(self.template.data, WireData::None),
+            self.template.data.is_none(),
             "DirectGroup template must leave `data` to the per-worker fill"
         );
         let data = match self.data {
             GroupData::Same(d) => d,
-            GroupData::Batches(b) => WireData::Whole(&b[w]),
-            GroupData::Scattered { batch, rows } => WireData::Scattered { batch, indices: &rows[w] },
+            GroupData::Batches(b) => b[w].wire_whole(),
+            GroupData::Scattered { batch, rows } => batch.wire_listed(&rows[w]),
         };
         WireMsg {
             data,
-            schema_block: self.template.schema_block.filter(|_| data.row_count() > 0),
+            schema_block: self.template.schema_block.filter(|_| data.is_some()),
             blob: self.extras.map_or(self.template.blob, |e| &e[w]),
             ..self.template
         }

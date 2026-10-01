@@ -81,7 +81,7 @@ fn gather_one(mesh: &mut Mesh, round: u64, spec: &ScatterPlan, drained: [bool; N
         weighted_rows(&expected_of(&parts, spec, r)),
         "round {round}: worker {r}"
     );
-    assert_eq!(got.layout(), Layout::Consolidated, "round {round}: worker {r}");
+    assert!(got.is_consolidated(), "round {round}: worker {r}");
     assert_eq!(all_drained, drained.iter().all(|&d| d), "round {round}: worker {r}");
 }
 
@@ -184,8 +184,7 @@ fn an_oversize_round_crosses_in_parts() {
             let (got, count) = run_round(&mut mesh, &parts, spec, &drained, fold);
             assert!(count > 2, "1000 rows per sender take several parts, not {count}");
             for (r, (got, all_drained)) in got.into_iter().enumerate() {
-                let layout = if fold { Layout::Consolidated } else { Layout::Raw };
-                assert_eq!(got.layout(), layout, "receiver {r}, fold {fold}");
+                assert_eq!(got.is_consolidated(), fold, "receiver {r}, fold {fold}");
                 assert_eq!(all_drained, drained.iter().all(|&d| d), "receiver {r}");
                 let want = weighted_rows(&expected_of(&parts, spec, r));
                 assert_eq!(
@@ -219,9 +218,8 @@ fn a_sender_with_nothing_left_sends_empty_parts() {
                 weighted_rows(&expected_of(&parts, spec, r)),
                 "receiver {r}"
             );
-            assert_eq!(
-                got.layout(),
-                Layout::Consolidated,
+            assert!(
+                got.is_consolidated(),
                 "receiver {r}: the empty raw sender wrote no block"
             );
             assert!(!drained, "receiver {r}: worker 0 was not drained");
@@ -258,7 +256,7 @@ fn a_heap_heavy_round_is_sized_by_its_relocated_heap() {
             "12 KiB of strings per sender take several parts, not {count}"
         );
         for (r, (got, _)) in got.into_iter().enumerate() {
-            assert_eq!(got.layout(), Layout::Raw, "receiver {r}: a raw sender's rows stay raw");
+            assert!(!got.is_consolidated(), "receiver {r}: a raw sender's rows stay raw");
             let want = expected_of(&parts, spec, r);
             assert!(
                 (0..want.len()).all(|i| want.get_weight(i) == 3),
@@ -290,7 +288,7 @@ fn string_partition(mut pks: Vec<u64>, text: impl Fn(u64) -> String) -> Batch {
 #[test]
 fn a_list_that_fills_the_outbox_exactly_defers_the_next() {
     let schema = make_schema_pk_u64_payload_string();
-    let row_width = make_string_batch(&[(0, 1, b"")]).wire_byte_size_range(1) - WAL_HEADER_SIZE;
+    let row_width = make_string_batch(&[(0, 1, b"")]).wire_whole().unwrap().byte_size() - WAL_HEADER_SIZE;
     let room = SMALL_OUTBOX - BLOCKS_AT - WAL_HEADER_SIZE;
     // Fixed-width rows, and one long string whose heap bytes take up the rest.
     let fill = room / row_width - 1;

@@ -24,29 +24,30 @@ fn append_row_from_source_carries_the_callers_weight() {
     assert_eq!(payload0_i64(&dst, 0), 0x4242);
 }
 
-/// `rows` stamped `layout` unverified: a lying tag for the debug verifier to catch.
+/// `rows` claimed consolidated unverified: a lying claim for the debug verifier
+/// to catch.
 #[cfg(debug_assertions)]
-fn flagged_batch(rows: &[(u64, i64, i64)], layout: Layout) -> Batch {
+fn flagged_batch(rows: &[(u64, i64, i64)]) -> Batch {
     let mut b = make_batch_raw(&make_schema_u64_i64(), rows);
-    b.set_layout_unchecked(layout);
+    b.set_consolidated_unchecked();
     b
 }
 
-// The consolidated short-circuit trusts the Consolidated tag: an adjacent-equal
-// (PK, payload) duplicate under that stamp must trip the verifier.
+// The consolidated short-circuit trusts the claim: an adjacent-equal
+// (PK, payload) duplicate under it must trip the verifier.
 #[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "not strictly")]
 fn into_consolidated_panics_on_lying_consolidated_dup() {
-    let _ = flagged_batch(&[(1, 1, 5), (1, 1, 5)], Layout::Consolidated).into_consolidated();
+    let _ = flagged_batch(&[(1, 1, 5), (1, 1, 5)]).into_consolidated();
 }
 
-// Ghost clause: strictly ordered, but carrying a net-zero row under Consolidated.
+// Ghost clause: strictly ordered, but carrying a net-zero row under the claim.
 #[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "ghost not eliminated")]
 fn into_consolidated_panics_on_consolidated_ghost() {
-    let _ = flagged_batch(&[(1, 1, 0), (2, 0, 0), (3, 1, 0)], Layout::Consolidated).into_consolidated();
+    let _ = flagged_batch(&[(1, 1, 0), (2, 0, 0), (3, 1, 0)]).into_consolidated();
 }
 
 /// `is_consolidated` holds structurally for a batch nothing can mis-fold, and
@@ -62,15 +63,16 @@ fn is_consolidated_without_a_claim_only_where_nothing_can_fold() {
     );
     let mut two = make_batch_raw(&schema, &[(1, 1, 10), (2, 1, 20)]);
     assert!(!two.is_consolidated());
-    two.certify_layout(Layout::Consolidated);
+    two.certify_consolidated();
     assert!(two.is_consolidated());
 }
 
 /// An order- and weight-preserving copy inherits its source's claim; anything
-/// else is `Raw`.
+/// else carries none.
 #[test]
-fn every_producer_states_its_layout() {
-    use Layout::*;
+fn every_producer_states_its_claim() {
+    const RAW: bool = false;
+    const CONSOLIDATED: bool = true;
     let schema = make_schema_u64_i64();
     let wider = SchemaDescriptor::new(
         &[
@@ -88,24 +90,24 @@ fn every_producer_states_its_layout() {
     let mut above = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
     above.append_above(make_batch(&schema, &[(3, 1, 30), (4, 1, 40)]));
     for (what, b, want) in [
-        ("with_capacity", Batch::with_capacity(&schema, 4), Raw),
-        ("clone", src.clone(), Consolidated),
+        ("with_capacity", Batch::with_capacity(&schema, 4), RAW),
+        ("clone", src.clone(), CONSOLIDATED),
         (
             "from_ranges",
             Batch::from_ranges(&src, &[(0, 1), (2, 3)], 0),
-            Consolidated,
+            CONSOLIDATED,
         ),
-        ("ascending_subset", src.ascending_subset(&[0, 2]), Consolidated),
-        ("negated", src.clone().negated(), Consolidated),
-        ("compacted", src.compacted(), Consolidated),
-        ("append_above", above, Consolidated),
-        ("widened", src.widened_with_nulls(&wider, false), Consolidated),
-        ("append", appended, Raw),
-        ("clear", cleared, Raw),
-        ("indexed_rows", src.indexed_rows(&[2, 0]), Raw),
-        ("rekeyed", src.rekeyed(&schema, |s, d| d.copy_from_slice(s)), Raw),
+        ("ascending_subset", src.ascending_subset(&[0, 2]), CONSOLIDATED),
+        ("negated", src.clone().negated(), CONSOLIDATED),
+        ("compacted", src.compacted(), CONSOLIDATED),
+        ("append_above", above, CONSOLIDATED),
+        ("widened", src.widened_with_nulls(&wider, false), CONSOLIDATED),
+        ("append", appended, RAW),
+        ("clear", cleared, RAW),
+        ("indexed_rows", src.indexed_rows(&[2, 0]), RAW),
+        ("rekeyed", src.rekeyed(&schema, |s, d| d.copy_from_slice(s)), RAW),
     ] {
-        assert_eq!(b.layout(), want, "{what}");
+        assert_eq!(b.consolidated, want, "{what}");
     }
 }
 
@@ -164,12 +166,12 @@ fn trimmed_copies_only_oversized_batches() {
 
     let mut loose = Batch::with_capacity(&schema, 1000);
     loose.append_ranges(&src.as_mem_batch(), &[(0, 1)]);
-    loose.certify_layout(Layout::Consolidated);
+    loose.certify_consolidated();
     let cap = loose.data.capacity();
     let trimmed = loose.trimmed();
     assert!(trimmed.data.capacity() < cap, "an oversized batch is copied down");
     assert_eq!(trimmed.count, 1);
-    assert_eq!(trimmed.layout, Layout::Consolidated);
+    assert!(trimmed.consolidated);
 
     let ptr = trimmed.data.as_ptr();
     let again = trimmed.trimmed();
@@ -281,20 +283,19 @@ fn widened_with_nulls_places_the_fill_on_either_side() {
 }
 
 /// `consolidate_in_place` folds a raw batch and leaves a certified one's arena
-/// untouched; `consolidate_if_needed` borrows a certified one.
+/// untouched.
 #[test]
 fn consolidate_in_place_folds_only_an_uncertified_batch() {
     let schema = make_schema_u64_i64();
     let mut raw = make_batch_raw(&schema, &[(2, 1, 20), (1, 1, 10), (1, 2, 10)]);
     raw.consolidate_in_place();
-    assert_eq!(raw.layout(), Layout::Consolidated);
+    assert!(raw.consolidated);
     assert_eq!(
         weighted_rows(&raw),
         weighted_rows(&make_batch(&schema, &[(1, 3, 10), (2, 1, 20)]))
     );
 
     let mut already = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
-    assert!(Batch::consolidate_if_needed(&already).is_none());
     let arena = already.data.as_ptr();
     already.consolidate_in_place();
     assert_eq!(already.data.as_ptr(), arena, "no refold");
@@ -350,7 +351,7 @@ fn a_key_prefix_round_trips() {
     let long: &[u8] = b"a-fairly-long-string-value"; // 26 bytes > 12
     let rows: [Row; 2] = [(1, 7, 1, long, Some(5)), (2, 3, -2, b"hi", None)];
 
-    let mut b = BatchBuilder::new(view);
+    let mut b = BatchBuilder::new(&view);
     for &(k0, k1, w, s, n) in &rows {
         b.begin_row_opk(&[k0 as u128, k1 as u128], w);
         b.put_blob(s);
@@ -358,13 +359,13 @@ fn a_key_prefix_round_trips() {
         b.end_row();
     }
     let mut b = b.finish();
-    b.certify_layout(Layout::Consolidated);
+    b.certify_consolidated();
 
     let stamped = b.with_key_prefix(&stamped_schema, &7u64.to_be_bytes());
-    assert_eq!(stamped.layout(), Layout::Consolidated);
+    assert!(stamped.consolidated);
     assert_eq!(&stamped.get_pk_bytes(1)[..8], &7u64.to_be_bytes());
     let out = stamped.without_key_prefix(&view);
-    assert_eq!(out.layout(), Layout::Raw);
+    assert!(!out.consolidated);
     assert_eq!(out.count, b.count);
     for (i, row) in rows.iter().enumerate() {
         assert_eq!(out.get_pk_bytes(i), b.get_pk_bytes(i), "row {i}: key");
@@ -448,7 +449,7 @@ fn carry_heap_charges_the_dropped_slots() {
         ],
         &[0],
     );
-    let mut b = BatchBuilder::new(schema);
+    let mut b = BatchBuilder::new(&schema);
     for pk in 1..=4u128 {
         b.begin_row(pk, 1);
         b.put_blob(&[b'a'; 100]);
@@ -542,7 +543,7 @@ fn trimmed_compacts_past_a_quarter_dead() {
     let compacted = padded(make_string_batch(&rows), 21).trimmed();
     assert_eq!((compacted.blob.len(), compacted.dead_heap), (60, 0));
     assert_eq!(read_strings(&compacted), [vec![b'a'; 20], vec![b'b'; 40]]);
-    assert_eq!(compacted.layout, Layout::Consolidated);
+    assert!(compacted.consolidated);
 }
 
 /// Retired instructions of `append_batch` over a string-bearing source: a 64-row

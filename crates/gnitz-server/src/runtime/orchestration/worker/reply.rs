@@ -5,7 +5,7 @@ use super::*;
 
 use std::borrow::Borrow;
 
-use ipc::{WireData, WireMsg};
+use ipc::WireMsg;
 
 // ---------------------------------------------------------------------------
 // PendingScan
@@ -54,8 +54,16 @@ impl WorkerProcess {
     /// Reply with `batch`: one frame now when it fits and `route.fifo` is clear,
     /// else a train queued behind the others.
     pub(super) fn send_reply(&mut self, route: ReplyRoute, batch: impl Borrow<Batch> + Into<Rc<Batch>>) {
-        if !route.fifo && emit_whole_if_fits(&self.w2m_writer, route, batch.borrow(), self.reply_frame_budget, true) {
-            return;
+        if !route.fifo {
+            let b: &Batch = batch.borrow();
+            let msg = WireMsg {
+                data: b.wire_whole(),
+                ..reply_frame(route, true)
+            };
+            if msg.data.is_none() || msg.size() <= self.reply_frame_budget {
+                self.w2m_writer.send_msg(route.request_id, &msg);
+                return;
+            }
         }
         self.pending_streams
             .push_back(PendingScan { batch: batch.into(), route, next_row: 0 });
@@ -81,21 +89,6 @@ impl WorkerProcess {
     }
 }
 
-/// Emit `batch` whole as one frame if it fits `budget` — heap and all, over the
-/// source batch, so no sub-batch is built. `ends_train`: its last frame is the
-/// train's.
-fn emit_whole_if_fits(w2m: &W2mWriter, route: ReplyRoute, batch: &Batch, budget: usize, ends_train: bool) -> bool {
-    let msg = WireMsg {
-        data: WireData::Whole(batch),
-        ..reply_frame(route, ends_train)
-    };
-    if !batch.is_empty() && msg.size() > budget {
-        return false;
-    }
-    w2m.send_msg(route.request_id, &msg);
-    true
-}
-
 /// Send the frame of `batch` that starts at row `start`, flagged last when it
 /// reaches the end and `ends_train`; `Ok` is the row after it. `Err` is a row
 /// too wide for any frame.
@@ -107,13 +100,11 @@ fn send_train_frame(
     budget: usize,
     ends_train: bool,
 ) -> Result<usize, gnitz_wire::WireFault> {
-    if start == 0 && emit_whole_if_fits(w2m, route, batch, budget, ends_train) {
-        return Ok(batch.len());
-    }
-    let frame = batch.wire_frame_within(start, reply_frame(route, false).size(), budget);
-    let end = frame.end();
+    let head = reply_frame(route, false).size();
+    let rows = batch.wire_rows_within(start, budget.saturating_sub(head));
+    let end = start + rows.map_or(0, |r| r.rows());
     let msg = WireMsg {
-        data: WireData::Frame { batch, frame },
+        data: rows,
         ..reply_frame(route, ends_train && end == batch.len())
     };
     if msg.size() > gnitz_wire::MAX_FRAME_PAYLOAD {

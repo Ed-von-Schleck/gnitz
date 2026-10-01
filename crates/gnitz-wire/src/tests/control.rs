@@ -11,7 +11,6 @@ fn probe_header() -> ControlHeader {
             continuation: true,
             scan_last: true,
             probe_mode: crate::WireProbeMode::AllHolders,
-            ..Default::default()
         },
         arg0: 0xDDDD_EEEE_FFFF_0011,
         arg1: 0xAA_BB_CC_DD_EE_FF_00_11,

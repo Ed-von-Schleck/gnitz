@@ -23,7 +23,7 @@ fn batchview_row_matches_region() {
         &[0],
     );
     const ROWS: usize = 5;
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     for row in 0..ROWS {
         bb.begin_row(row as u128, 1);
         bb.put_int(-(row as i32) as u128);
@@ -46,7 +46,7 @@ fn batchview_row_matches_region() {
 /// column, so every compare within a group walks the whole payload.
 fn bench_sorted_batch(schema: &SchemaDescriptor, n: usize, dup: usize) -> Batch {
     let last = schema.num_payload_cols() - 1;
-    let mut b = BatchBuilder::new(*schema);
+    let mut b = BatchBuilder::new(schema);
     for i in 0..n {
         let group = (i / dup) as u128;
         b.begin_row(group, 1);
@@ -103,7 +103,7 @@ fn run_merge_dup_pk_bench() {
 
 /// `n` rows over [`pk_u64_two_i64_schema`], PK `key_fn(i)`, weight 1.
 fn bench_flush_batch(schema: &SchemaDescriptor, n: usize, key_fn: impl Fn(usize) -> u64) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
+    let mut b = BatchBuilder::new(schema);
     for i in 0..n {
         b.begin_row(key_fn(i) as u128, 1i64);
         b.put_int(i as i64 as u128);

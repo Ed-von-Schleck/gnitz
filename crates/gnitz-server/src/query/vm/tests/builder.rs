@@ -2,7 +2,7 @@ use super::fixtures::*;
 use super::*;
 use crate::test_support::{make_batch_u128, make_schema_u128_i64, zset_of};
 use gnitz_wire::TypeCode;
-use gnitz_zset::repr::{BatchBuilder, Layout};
+use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::SchemaColumn;
 
 /// An integrate runs after every instruction, so it takes its register from the
@@ -94,7 +94,7 @@ fn a_register_read_at_net_weights_is_folded_when_written() {
     p.push(projected, narrow, Op::Negate);
     let mut vm = p.open(distinct);
 
-    let mut b = BatchBuilder::new(wide);
+    let mut b = BatchBuilder::new(&wide);
     for c0 in [10, 20] {
         b.begin_row(1u128, 1);
         b.put_int(c0);
@@ -102,7 +102,7 @@ fn a_register_read_at_net_weights_is_folded_when_written() {
         b.end_row();
     }
     let mut input = b.finish();
-    input.certify_layout(Layout::Consolidated);
+    input.certify_consolidated();
 
     assert_rows(&vm.epoch([(r0, input)]), &[(1, 1, 100)]);
     assert_eq!(

@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::{WireFlags, WireStatus};
-use gnitz_zset::repr::{Batch, Layout, WireFrame};
+use gnitz_zset::repr::{Batch, WireRows};
 use gnitz_zset::schema::{decode_schema_block, encode_schema_block, SchemaDescriptor};
 
 /// The error text for a reply past [`gnitz_wire::MAX_FRAME_PAYLOAD`].
@@ -64,75 +64,6 @@ impl WireSchema {
 // WireMsg
 // ---------------------------------------------------------------------------
 
-/// The data payload of one wire message: which rows of a batch it carries, and
-/// how they are gathered — the only axis on which the encode shapes differ.
-#[derive(Clone, Copy, Default)]
-pub enum WireData<'a> {
-    #[default]
-    None,
-    Whole(&'a Batch),
-    /// One reply frame of `batch`.
-    Frame {
-        batch: &'a Batch,
-        frame: WireFrame,
-    },
-    /// The rows `indices` selects, in that order, encoded straight into the
-    /// destination — no per-worker sub-`Batch` in between. `batch` has no heap,
-    /// so no cell of those rows references one.
-    Scattered {
-        batch: &'a Batch,
-        indices: &'a [u32],
-    },
-}
-
-impl<'a> WireData<'a> {
-    /// Rows this payload carries; `0` means the slot or frame is dataless.
-    pub(crate) fn row_count(&self) -> usize {
-        match *self {
-            WireData::None => 0,
-            WireData::Whole(b) => b.len(),
-            WireData::Frame { frame, .. } => frame.rows(),
-            WireData::Scattered { indices, .. } => indices.len(),
-        }
-    }
-
-    /// The source batch, whose layout claim the frame carries.
-    fn batch(&self) -> Option<&'a Batch> {
-        match *self {
-            WireData::None => None,
-            WireData::Whole(b) | WireData::Frame { batch: b, .. } | WireData::Scattered { batch: b, .. } => Some(b),
-        }
-    }
-
-    /// Bytes [`Self::encode`] writes.
-    pub(crate) fn wire_byte_size(&self) -> usize {
-        match *self {
-            WireData::None => 0,
-            WireData::Whole(b) => b.wire_byte_size(),
-            WireData::Frame { batch, frame } => batch.wire_frame_size(&frame),
-            WireData::Scattered { batch, indices } => batch.wire_byte_size_range(indices.len()),
-        }
-    }
-
-    /// The rows as one WAL block at the front of `out`; returns bytes written.
-    pub(crate) fn encode(&self, out: &mut [u8]) -> usize {
-        match *self {
-            WireData::None => 0,
-            WireData::Whole(b) => b.encode_to_wire(out),
-            WireData::Frame { batch, frame } => batch.encode_frame(&frame, out),
-            WireData::Scattered { batch, indices } => {
-                debug_assert!(
-                    batch.layout() == Layout::Raw || indices.is_sorted_by(|a, b| a < b),
-                    "a scattered subset keeps its source's layout claim only in ascending order"
-                );
-                batch
-                    .encode_scattered_to_wire(indices, out)
-                    .expect("a heap-free scatter fits the bytes its size reserved")
-            }
-        }
-    }
-}
-
 /// One IPC/WAL wire message. Build it once, then [`size`](WireMsg::size) it and
 /// encode it: both read the same value, so the byte count a caller reserves and
 /// the bytes the encoder writes cannot disagree.
@@ -151,7 +82,8 @@ pub struct WireMsg<'a> {
     pub arg0: u64,
     pub arg1: u64,
     pub status: WireStatus,
-    pub data: WireData<'a>,
+    /// The frame's data block; an empty delta ships none.
+    pub data: Option<WireRows<'a>>,
     /// These bytes *are* the frame's schema record, and their length sizes the
     /// prefix that announces it; `None` emits none and leaves the frame's schema
     /// bit clear. Usually from a [`WireSchema`], which pairs them with the
@@ -161,47 +93,30 @@ pub struct WireMsg<'a> {
 }
 
 impl<'a> WireMsg<'a> {
-    fn has_data(&self) -> bool {
-        self.data.row_count() > 0
-    }
-
     /// Total encoded size, without allocating.
     pub fn size(&self) -> usize {
-        let mut total = gnitz_wire::control::frame_head_size(self.blob.len(), self.schema_block.map(<[u8]>::len));
-        if self.has_data() {
-            total += self.data.wire_byte_size();
-        }
-        total
+        gnitz_wire::control::frame_head_size(self.blob.len(), self.schema_block.map(<[u8]>::len))
+            + self.data.map_or(0, |d| d.byte_size())
     }
 
     /// Encode into `out`, which must be exactly [`size`](WireMsg::size) bytes.
     pub fn encode(&self, out: &mut [u8]) {
-        let has_data = self.has_data();
-
-        let wire_flags = WireFlags {
-            // Maps `b.layout()` with no re-verify: a non-`Raw` tag was certified
-            // (debug-verified) at its producer, so the shipped claim is
-            // verified-by-construction.
-            batch_consolidated: has_data && self.data.batch().is_some_and(|b| b.layout() == Layout::Consolidated),
-            ..self.flags
-        };
-
         let mut pos = gnitz_wire::control::encode_frame_head(
             out,
             &gnitz_wire::control::ControlHeader {
                 status: self.status,
                 target_id: self.target_id,
-                flags: wire_flags,
+                flags: self.flags,
                 arg0: self.arg0,
                 arg1: self.arg1,
             },
             self.blob,
             self.schema_block,
-            has_data,
+            self.data.is_some(),
         );
 
-        if has_data {
-            pos += self.data.encode(&mut out[pos..]);
+        if let Some(d) = self.data {
+            pos += d.encode(&mut out[pos..]);
         }
 
         assert_eq!(pos, out.len(), "WireMsg::size and encode disagree");
@@ -227,8 +142,7 @@ pub fn unknown(_: &[u8]) -> Result<Option<SchemaDescriptor>, String> {
     Ok(None)
 }
 
-/// Decode a client frame. The batch stays `Raw`: a client's layout claim is not
-/// trusted. `recordless` lays out a frame that carries no record; `known` answers
+/// Decode a client frame. `recordless` lays out a frame that carries no record; `known` answers
 /// what a record decodes to when that is already known (`Ok(None)`: decode it),
 /// or refuses the frame.
 ///
@@ -257,32 +171,17 @@ pub fn decode_sal_slot(
 ) -> Result<DecodedWire, String> {
     let control = peek_control_block(data)?;
     let tid = control.hdr.target_id;
-    let mut decoded = decode_frame(
+    let decoded = decode_frame(
         data,
         control,
         None,
         |record: &[u8]| Ok(known(tid, record)),
         Batch::decode_from_wal_block,
     )?;
-    certify_engine_frame(&mut decoded);
-    Ok(decoded)
-}
-
-/// Install an engine-authored frame's layout claim: its `batch_consolidated`
-/// bit is real, and skipping the re-fold is the point of sending it, so the batch
-/// is raised off `Raw`. `certify_layout`
-/// debug-verifies what it installs, which is why the client path
-/// (`decode_client_frame`) never comes through here — a lying client frame
-/// must be answered with an error, not a debug-build abort.
-fn certify_engine_frame(decoded: &mut DecodedWire) {
-    let layout = if decoded.control.hdr.flags.batch_consolidated {
-        Layout::Consolidated
-    } else {
-        Layout::Raw
-    };
-    if let Some(b) = decoded.data_batch.as_mut() {
-        b.certify_layout(layout);
+    if let Some(b) = &decoded.data_batch {
+        b.debug_verify_null_bits();
     }
+    Ok(decoded)
 }
 
 /// A frame decoded into its `DecodedWire`, every field built in the slot it

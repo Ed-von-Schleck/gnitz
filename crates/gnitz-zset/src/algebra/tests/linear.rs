@@ -1,14 +1,14 @@
 use super::*;
-use crate::repr::{BatchBuilder, Layout};
+use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{
     assert_folds, make_batch, make_schema_u64_i64, pk_payload_schema, weighted_rows, zset_of, zset_sum,
 };
 
 /// `(pk, weight, payload)` rows over `schema`, `None` a NULL payload, certified
-/// `Consolidated` when `consolidated` (the rows are in (PK, payload) order).
+/// consolidated when `consolidated` (the rows are in (PK, payload) order).
 fn opt_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, Option<i64>)], consolidated: bool) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
+    let mut b = BatchBuilder::new(schema);
     for &(pk, w, v) in rows {
         b.begin_row(pk as u128, w);
         b.put_opt_int(v.map(|v| v as u128));
@@ -16,14 +16,14 @@ fn opt_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, Option<i64>)], consol
     }
     let mut b = b.finish();
     if consolidated {
-        b.certify_layout(Layout::Consolidated);
+        b.certify_consolidated();
     }
     b
 }
 
 /// Union is Z-Set `+` under the union's own schema, whichever way it gets
 /// there: two consolidated inputs merge into a consolidated fold, anything else
-/// concatenates and stays `Raw`, and an empty side keeps the other's layout. A
+/// concatenates and stays unconsolidated, and an empty side keeps the other's claim. A
 /// NULL and a zero hold the same bytes, so only the nullability the union
 /// merges in keeps them two elements; equal elements at opposite weights cancel.
 #[test]
@@ -113,7 +113,7 @@ fn union_merge_bench() {
     let schema = make_schema_u64_i64();
 
     // Each side is built strictly (PK, payload)-ascending, so `make_batch`'s
-    // `Consolidated` certification is honest and `op_union` takes its merge.
+    // consolidated certification is honest and `op_union` takes its merge.
     let side = |f: RowGen| -> Batch { make_batch(&schema, &(0..N).map(f).collect::<Vec<_>>()) };
 
     let cases: [(&str, RowGen, RowGen); 4] = [

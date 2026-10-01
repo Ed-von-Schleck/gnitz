@@ -92,7 +92,7 @@ fn gc_reclaims_orphan_table_dir() {
 
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(10);
     bb.end_row();
@@ -194,7 +194,7 @@ fn gc_leaves_live_entities_untouched() {
 
     let t1 = engine.create_table("public.flushed", &cols, &[0]).unwrap();
     let schema = engine.registry.relation(t1).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(7);
     bb.end_row();
@@ -277,7 +277,7 @@ fn replicated_table_with_a_shard(engine: &mut CatalogEngine, flush: bool) -> (u6
     let rt = create_flagged_table(engine, "rt", &cols, &[0], replicated_flags());
 
     let rel_dir = relation_dir(engine.registry.base_dir(), rt);
-    let mut bb = BatchBuilder::new(engine.registry.relation(rt).map(Relation::schema).unwrap());
+    let mut bb = BatchBuilder::new(&engine.registry.relation(rt).map(Relation::schema).unwrap());
     bb.begin_row(1u128, 1);
     bb.put_int(7);
     bb.end_row();
@@ -415,7 +415,7 @@ fn expected(schema: &SchemaDescriptor, placement: Placement, rows: &[(u128, i64)
 /// the same call just created, so the rule finds nothing to retract.
 fn fill_child(registry: &mut RelationRegistry, tid: u64, schema: SchemaDescriptor, rows: &[(u128, i64)]) {
     if !rows.is_empty() {
-        let mut bb = BatchBuilder::new(schema);
+        let mut bb = BatchBuilder::new(&schema);
         for &(pk, x) in rows {
             bb.begin_row_bytes(opk_of(&schema, pk).pk_bytes(), 1);
             bb.put_int(x as u128);

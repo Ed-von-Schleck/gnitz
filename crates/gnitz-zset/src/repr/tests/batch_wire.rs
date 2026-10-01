@@ -9,9 +9,14 @@ use crate::test_support::{
 
 /// Where region `r` of a `rows`-row block over `schema` starts.
 fn region_offset(schema: &SchemaDescriptor, rows: usize, r: usize) -> usize {
-    let (strides, nr) = strides_from_schema(schema);
+    let strides = strides_from_schema(schema);
     let mut offsets = [0usize; MAX_BATCH_REGIONS];
-    wire_offsets(&strides, nr as usize, rows, &mut offsets);
+    wire_offsets(
+        &strides,
+        REG_PAYLOAD_START + schema.num_payload_cols(),
+        rows,
+        &mut offsets,
+    );
     offsets[r]
 }
 
@@ -58,7 +63,7 @@ fn a_foreign_decode_refuses_a_null_the_schema_does_not_admit() {
     );
     // Row 2's NOT NULL cell is zero, the NULL encoding should its bit be set.
     let block = |not_null_bit: bool| {
-        let mut b = BatchBuilder::new(schema);
+        let mut b = BatchBuilder::new(&schema);
         for pk in [1u128, 2] {
             b.begin_row(pk, 1);
             if pk == 2 && not_null_bit {
@@ -103,7 +108,7 @@ fn every_encoder_round_trips_at_narrow_strides() {
         cols.extend([SchemaColumn::new(payload, true), SchemaColumn::new(String, false)]);
         let key: Vec<u32> = (0..pk.len() as u32).collect();
         let schema = SchemaDescriptor::new(&cols, &key);
-        let mut b = BatchBuilder::new(schema);
+        let mut b = BatchBuilder::new(&schema);
         for i in 0..5u128 {
             b.begin_row_opk(&vec![i + 1; pk.len()], [1, -2, 3][i as usize % 3]);
             b.put_opt_int((i % 2 == 0).then_some(i * 7));
@@ -120,12 +125,13 @@ fn every_encoder_round_trips_at_narrow_strides() {
             "stride {stride}: whole"
         );
 
-        let mut buf = vec![0u8; src.wire_byte_size()];
-        let frame = src.wire_frame_within(1, 0, src.wire_byte_size());
-        let n = src.encode_frame(&frame, &mut buf);
-        assert_eq!(decode(&buf[..n]), weighted_rows(&src)[1..], "stride {stride}: frame");
+        let mut buf = vec![0u8; src.wire_whole().unwrap().byte_size()];
+        let range = src.wire_rows_within(1, usize::MAX).unwrap();
+        let n = range.encode(&mut buf);
+        assert_eq!(n, range.byte_size(), "stride {stride}: range size");
+        assert_eq!(decode(&buf[..n]), weighted_rows(&src)[1..], "stride {stride}: range");
 
-        let n = src.encode_scattered_to_wire(&[4, 0, 2], &mut buf).unwrap();
+        let n = src.encode_listed(&[4, 0, 2], &mut buf).unwrap();
         let picked = src.indexed_rows(&[4, 0, 2]);
         assert_eq!(decode(&buf[..n]), weighted_rows(&picked), "stride {stride}: scattered");
     }
@@ -140,7 +146,7 @@ fn wal_block_bench() {
     const ITERS: usize = 1_000_000;
     let schema = pk_u64_two_i64_schema();
     for rows in [1usize, 100] {
-        let mut b = BatchBuilder::new(schema);
+        let mut b = BatchBuilder::new(&schema);
         for i in 0..rows as u64 {
             b.begin_row(i as u128, 1);
             b.put_int(i as u128);
@@ -148,10 +154,10 @@ fn wal_block_bench() {
             b.end_row();
         }
         let batch = b.finish();
-        let mut buf = vec![0u8; batch.wire_byte_size()];
+        let mut buf = vec![0u8; batch.wire_whole().unwrap().byte_size()];
 
         let t = crate::test_support::bench_time(ITERS, || {
-            let n = black_box(&batch).encode_to_wire(black_box(&mut buf));
+            let n = black_box(&batch).wire_whole().unwrap().encode(black_box(&mut buf));
             let block = WalBlock::parse(black_box(&buf[..n]), &schema).unwrap();
             black_box(block.view().count);
         });
@@ -165,7 +171,7 @@ fn wal_block_bench() {
 /// `(pk, value)` rows at weight 1 over a U64 PK and one STRING payload column.
 /// Values past `SHORT_STRING_THRESHOLD` live in the heap.
 fn string_batch(rows: &[(u64, impl AsRef<str>)]) -> Batch {
-    let mut b = BatchBuilder::new(make_schema_pk_u64_payload_string());
+    let mut b = BatchBuilder::new(&make_schema_pk_u64_payload_string());
     for (pk, v) in rows {
         b.begin_row(*pk as u128, 1);
         b.put_string(v.as_ref());
@@ -174,10 +180,11 @@ fn string_batch(rows: &[(u64, impl AsRef<str>)]) -> Batch {
     b.finish()
 }
 
-/// A frame, and a scattered prefix, is the longest run whose block — sized as
-/// `encode_scattered_to_wire` writes it — fits; each reads back its rows.
+/// A row run, and a scattered prefix, is the longest run whose block — sized as
+/// `encode_listed` writes it — fits; each reads back its rows. No rows is no
+/// block.
 #[test]
-fn frames_and_scattered_prefixes_take_the_longest_run_that_fits() {
+fn row_runs_and_scattered_prefixes_take_the_longest_run_that_fits() {
     let one = string_batch(&[(1, "v".repeat(200))]);
     // Rows naming one span, as a join's fan-out writes them.
     let mut shared = Batch::with_capacity(one.schema(), 20);
@@ -195,26 +202,24 @@ fn frames_and_scattered_prefixes_take_the_longest_run_that_fits() {
         string_batch(&[(1, "w".repeat(4096)), (2, "w".repeat(4096))]),
         shared,
     ] {
-        let mut buf = vec![0u8; 2 * b.wire_byte_size()];
-        let size = |rows: &[u32]| {
-            b.encode_scattered_to_wire(rows, &mut vec![0; 2 * b.wire_byte_size()])
-                .unwrap()
-        };
+        let whole = b.wire_whole().unwrap().byte_size();
+        let mut buf = vec![0u8; 2 * whole];
+        let size = |rows: &[u32]| b.encode_listed(rows, &mut vec![0; 2 * whole]).unwrap();
+        assert!(b.wire_rows_within(b.len(), usize::MAX).is_none());
+        assert!(Batch::empty_with_schema(b.schema()).wire_whole().is_none());
         let read_back = |block: &[u8]| weighted_rows(&Batch::decode_foreign_wal_block(block, b.schema()).unwrap());
         for start in [0, 1] {
             let rest = b.len() - start;
             let run = |k: usize| (start as u32..(start + k) as u32).collect::<Vec<_>>();
             let longest = |cap: usize| (1..=rest).take_while(|&k| size(&run(k)) <= cap).last();
-            for overhead in [0, 17] {
-                let k3 = size(&run(3.min(rest))) + overhead;
-                for budget in [64, size(&run(1)) + overhead, k3 - 1, k3, usize::MAX] {
-                    let frame = b.wire_frame_within(start, overhead, budget);
-                    let want = longest(budget.saturating_sub(overhead)).unwrap_or(1);
-                    assert_eq!(frame.rows(), want, "start {start} overhead {overhead} budget {budget}");
-                    let n = b.encode_frame(&frame, &mut buf);
-                    assert_eq!(n, b.wire_frame_size(&frame));
-                    assert_eq!(read_back(&buf[..n]), weighted_rows(&b)[start..start + want]);
-                }
+            let k3 = size(&run(3.min(rest)));
+            for budget in [64, size(&run(1)), k3 - 1, k3, usize::MAX] {
+                let rows = b.wire_rows_within(start, budget).unwrap();
+                let want = longest(budget).unwrap_or(1);
+                assert_eq!(rows.rows(), want, "start {start} budget {budget}");
+                let n = rows.encode(&mut buf);
+                assert_eq!(n, rows.byte_size());
+                assert_eq!(read_back(&buf[..n]), weighted_rows(&b)[start..start + want]);
             }
             let all = run(rest);
             for cap in [size(&run(1)) - 1, size(&run(2.min(rest))), size(&run(2.min(rest))) + 1] {
@@ -225,7 +230,7 @@ fn frames_and_scattered_prefixes_take_the_longest_run_that_fits() {
                 if let Some((k, n)) = got {
                     assert_eq!(read_back(&out[..n]), weighted_rows(&b)[start..start + k]);
                     let mut short = vec![0u8; n - 1];
-                    assert!(b.encode_scattered_to_wire(&run(k), &mut short).is_none());
+                    assert!(b.encode_listed(&run(k), &mut short).is_none());
                 }
             }
         }
@@ -310,7 +315,7 @@ fn foreign_decode_utf8_matches_per_cell_oracle() {
     let (mut ok_n, mut bad_n) = (0, 0);
     for _ in 0..20000 {
         let rows = 1 + rnd(4);
-        let mut b = BatchBuilder::new(schema);
+        let mut b = BatchBuilder::new(&schema);
         let mut valid = true;
         for i in 0..rows {
             b.begin_row(i as u128, 1);
@@ -358,7 +363,7 @@ fn foreign_decode_utf8_spans_split_across_cells() {
         &[0],
     );
     let accepts = |rows: &[(&[u8], &[u8])]| {
-        let mut b = BatchBuilder::new(schema);
+        let mut b = BatchBuilder::new(&schema);
         for (i, (s, x)) in rows.iter().enumerate() {
             b.begin_row(i as u128, 1);
             b.put_blob(s);
@@ -402,7 +407,7 @@ fn foreign_decode_string_bench() {
         other => panic!("GNITZ_BENCH_SHAPE must be s12/u9/s64/m64/u64/s512/u512, got {other:?}"),
     };
     let schema = make_schema_pk_u64_payload_string();
-    let mut b = BatchBuilder::new(schema);
+    let mut b = BatchBuilder::new(&schema);
     for i in 0..1000u64 {
         b.begin_row(i as u128, 1);
         let mut v = unit.clone().into_bytes();
@@ -424,7 +429,7 @@ fn foreign_decode_string_bench() {
 }
 
 /// Retired instructions to drain a 10⁵-row batch frame by frame at a 64 KiB
-/// budget, each frame sized by `wire_frame_within` and then encoded. Two shapes:
+/// budget, each frame sized by `wire_rows_within` and then encoded. Two shapes:
 /// every row a long 40-byte string, and a wide fixed row whose string is short
 /// on all but one row in 64.
 /// `#[ignore]`; run release:
@@ -441,7 +446,7 @@ fn reply_chunk_strings_bench() {
     cols.extend([SchemaColumn::new(TypeCode::I64, false); 6]);
     cols.push(SchemaColumn::new(TypeCode::String, false));
     let wide_schema = SchemaDescriptor::new(&cols, &[0]);
-    let mut b = BatchBuilder::new(wide_schema);
+    let mut b = BatchBuilder::new(&wide_schema);
     for i in 0..N as u64 {
         b.begin_row(i as u128, 1);
         for c in 0..6u64 {
@@ -460,10 +465,9 @@ fn reply_chunk_strings_bench() {
     for (name, batch) in [("long", &long), ("wide_short", &wide)] {
         let ((frames, bytes), instructions) = counter.measure(|| {
             let (mut start, mut frames, mut bytes) = (0, 0, 0);
-            while start < batch.len() {
-                let frame = batch.wire_frame_within(start, 0, BUDGET);
-                bytes += batch.encode_frame(&frame, &mut buf);
-                start = frame.end();
+            while let Some(frame) = batch.wire_rows_within(start, BUDGET) {
+                bytes += frame.encode(&mut buf);
+                start += frame.rows();
                 frames += 1;
             }
             (frames, bytes)

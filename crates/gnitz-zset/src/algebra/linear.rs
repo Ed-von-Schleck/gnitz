@@ -69,7 +69,7 @@ pub fn null_extend_output_schema(
 /// Union: algebraic addition of two Z-Set streams. Two consolidated inputs take an
 /// O(N) merge that sums equal elements' weights, so the output is consolidated and
 /// may hold *fewer* rows than the two inputs together. Anything else concatenates
-/// and stays `Raw`: the outer- and band-join lowering chains `op_union` over `Raw`
+/// and stays unconsolidated: the outer- and band-join lowering chains `op_union` over unconsolidated
 /// operands, and sorting each link would pay for a fold the consumer runs once.
 ///
 /// `out_schema` is the UNION's own, not either input's — it is the comparator the
@@ -78,7 +78,7 @@ pub fn op_union(mut batch_a: Batch, batch_b: &Batch, out_schema: &SchemaDescript
     if batch_a.consolidated_verified() && batch_b.consolidated_verified() && batch_b.count > 0 {
         return batch_a.merged_consolidated(batch_b, out_schema);
     }
-    // An empty `b` passes `a` through with no allocation, its layout claim
+    // An empty `b` passes `a` through with no allocation, its consolidated claim
     // preserved: `out_schema` only ORs in nullability, which reorders nothing
     // `a` holds.
     batch_a.set_schema(out_schema);

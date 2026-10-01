@@ -20,7 +20,7 @@ fn single_natural_col_keys_by_its_opk_from_either_side() {
     let key = |tc: TypeCode, le: &[u8], col1_is_pk: bool| -> (u128, Vec<u8>) {
         let cols = [SchemaColumn::new(TypeCode::U64, false), SchemaColumn::new(tc, false)];
         let schema = SchemaDescriptor::new(&cols, if col1_is_pk { &[0, 1] } else { &[0] });
-        let mut b = BatchBuilder::new(schema);
+        let mut b = BatchBuilder::new(&schema);
         match col1_is_pk {
             true => b.begin_row_opk(&[0, le_cell(le)], 1),
             false => {
@@ -158,7 +158,7 @@ fn runs_group_by_out_pk_over_signed_wide_and_nullable_columns() {
         ],
         &[0, 1],
     );
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     for i in 0..64u64 {
         let m = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40;
         bb.begin_row_opk(&[(m % 5) as u128, (m % 7) as i32 as i64 as u128], 1);

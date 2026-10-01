@@ -28,7 +28,7 @@ fn fold_rows_matches_step_from_batch() {
     cols.extend(tcs.iter().map(|&tc| SchemaColumn::new(tc, true)));
     let schema = SchemaDescriptor::new(&cols, &[0]);
     let mut rng = crate::test_support::Rng::new(0x5eed);
-    let mut b = BatchBuilder::new(schema);
+    let mut b = BatchBuilder::new(&schema);
     for row in 0..N {
         b.begin_row(row as u128, rng.gen_range(5) as i64 + 1);
         let nulls = rng.next_u64() & ((1 << tcs.len()) - 1);

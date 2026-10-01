@@ -325,7 +325,7 @@ fn an_index_walk_returns_exactly_its_range() {
         ],
         &[0],
     );
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     for id in 0..WALK_ROWS {
         let (val, big) = walk_row(id);
         bb.begin_row(id as u128, 1);
@@ -411,7 +411,7 @@ fn map_fixture(
     mut put_row: impl FnMut(&mut BatchBuilder, u64),
 ) -> RelationFixture {
     let schema = SchemaDescriptor::new(cols, &[0]);
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     for id in 0..n {
         bb.begin_row(id as u128, 1);
         put_row(&mut bb, id);

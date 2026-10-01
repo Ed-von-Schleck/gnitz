@@ -14,14 +14,14 @@
 //! `PayloadCmpKind::Generic` schema**, so both comparator monomorphizations are
 //! compiled and timed.
 //!
-//! The delta is certified `Consolidated`, so the timed region is the probe and
+//! The delta is certified consolidated, so the timed region is the probe and
 //! the emit, not a sort.
 
 use std::rc::Rc;
 use std::time::Duration;
 
 use super::{op_join_delta_trace, JoinPlan};
-use crate::repr::{Batch, BatchBuilder, Layout, ReadCursor};
+use crate::repr::{Batch, BatchBuilder, ReadCursor};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::bench_time_each;
 use gnitz_wire::{JoinKind, RangeRel};
@@ -86,14 +86,14 @@ fn schema_for(pk_types: &[TypeCode], p: Payload) -> SchemaDescriptor {
 /// both orders it within its PK group and seeds the extra payload column.
 type Row = (Vec<u128>, i64);
 
-/// Build a batch over `schema_for(_, p)` and certify it `Consolidated`. `rows`
+/// Build a batch over `schema_for(_, p)` and certify it consolidated. `rows`
 /// must arrive sorted by `(PK, ord)`; every weight is `+1`.
 ///
 /// The long strings are 24 bytes — past `SHORT_STRING_THRESHOLD`, so they land
 /// in the blob heap and the emit path must relocate rather than copy them
 /// inline. Every fourth nullable cell is NULL.
 fn build(schema: &SchemaDescriptor, p: Payload, rows: &[Row]) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
+    let mut b = BatchBuilder::new(schema);
     for (i, (pk, ord)) in rows.iter().enumerate() {
         b.begin_row_opk(pk, 1);
         b.put_int(*ord as u128);
@@ -109,7 +109,7 @@ fn build(schema: &SchemaDescriptor, p: Payload, rows: &[Row]) -> Batch {
         b.end_row();
     }
     let mut b = b.finish();
-    b.certify_layout(Layout::Consolidated);
+    b.certify_consolidated();
     b
 }
 

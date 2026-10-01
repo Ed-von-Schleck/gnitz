@@ -95,7 +95,7 @@ impl CatalogEngine {
             if self.sys_relation(family).cursor().valid {
                 continue;
             }
-            let mut bb = BatchBuilder::new(*family.schema());
+            let mut bb = BatchBuilder::new(family.schema());
             family.write_seed_rows(&mut bb);
             self.registry
                 .ingest(family.id(), bb.finish())

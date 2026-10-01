@@ -17,7 +17,7 @@ fn wide_unique_schema() -> SchemaDescriptor {
 
 /// Build a batch for `wide_unique_schema`: rows of (pk, val, weight).
 fn wide_val_batch(schema: &SchemaDescriptor, rows: &[([u8; 24], u64, i64)]) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
+    let mut b = BatchBuilder::new(schema);
     for &(pk, val, w) in rows {
         b.begin_row_bytes(&pk, w);
         b.put_int(val as u128);
@@ -137,7 +137,7 @@ fn native_and_byte_point_reads_agree_narrow() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     for i in 1..=3u64 {
         bb.begin_row(i as u128, 1);
         bb.put_u64(i * 10);
@@ -147,7 +147,7 @@ fn native_and_byte_point_reads_agree_narrow() {
     engine.registry.checkpoint_base().unwrap();
 
     // Retract key 2 so it is present-but-dead.
-    let mut del = BatchBuilder::new(schema);
+    let mut del = BatchBuilder::new(&schema);
     del.begin_row(2u128, -1);
     del.put_u64(20);
     del.end_row();

@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::{arb_fold_case, fold_batch, fold_schemas, zset_of, zset_sum};
 use gnitz_zset::repr::pk_group_end;
-use gnitz_zset::repr::{BatchBuilder, Layout};
+use gnitz_zset::repr::BatchBuilder;
 use proptest::prelude::*;
 
 proptest! {
@@ -67,14 +67,14 @@ fn a_fold_merges_runs_of_different_nullability_under_its_own_schema() {
     };
     let (not_null, nullable) = (label(false), label(true));
     let run = |schema: SchemaDescriptor, rows: &[(u128, Option<i64>, i64)]| {
-        let mut b = BatchBuilder::new(schema);
+        let mut b = BatchBuilder::new(&schema);
         for &(pk, v, w) in rows {
             b.begin_row(pk, w);
             b.put_opt_int(v.map(|v| v as u128));
             b.end_row();
         }
         let mut b = b.finish();
-        b.certify_layout(Layout::Consolidated);
+        b.certify_consolidated();
         TrimmedRun::new(b)
     };
 

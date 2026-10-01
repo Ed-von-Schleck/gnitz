@@ -33,7 +33,7 @@ fn hash_fold_stack_arm_matches_the_scratch_arm() {
         ],
         &[0],
     );
-    let mut b = BatchBuilder::new(schema);
+    let mut b = BatchBuilder::new(&schema);
     // Row 0: nothing NULL. Row 1: the two nullable columns NULL, so both the
     // marker-only arm and the marker+route-key arm run in one row.
     for (pk, nulls) in [(7u128, false), (8u128, true)] {
@@ -153,7 +153,7 @@ fn test_reindex_packer_arity1_byte_identity() {
         // Three rows with distinct content, one of them empty, exercising the
         // per-row read.
         let contents: [&[u8]; 3] = [b"abc", b"", b"hello-world-xyz"];
-        let mut b = BatchBuilder::new(schema);
+        let mut b = BatchBuilder::new(&schema);
         for (r, content) in contents.iter().enumerate() {
             b.begin_row((r + 1) as u128 * 11, 1i64);
             b.put_blob(content);
@@ -200,7 +200,7 @@ fn test_group_key_bitmap_bit_positions() {
         &[0],
     );
     // Row 0: B is NULL (payload slot 1 → null-word bit 1). Row 1: B == 0.
-    let mut b = BatchBuilder::new(schema);
+    let mut b = BatchBuilder::new(&schema);
     for (pk, b_null) in [(10u128, true), (20u128, false)] {
         b.begin_row(pk, 1);
         b.put_int(7); // A, same in both rows
@@ -246,7 +246,7 @@ fn a_group_key_overwrites_its_whole_slot() {
     let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
     cols.extend([SchemaColumn::new(TypeCode::I32, true); 6]);
     let schema = SchemaDescriptor::new(&cols, &[0]);
-    let mut b = BatchBuilder::new(schema);
+    let mut b = BatchBuilder::new(&schema);
     for row in 0..40u64 {
         b.begin_row(row as u128, 1);
         for c in 0..6 {
@@ -328,7 +328,7 @@ mod pack_proptest {
             cols.extend(types.iter().map(|&tc| SchemaColumn::new(tc, false)));
             let pay_schema = SchemaDescriptor::new(&cols, &[0]);
             let pk_schema = pk_only_schema(&types);
-            let (mut pb, mut kb) = (BatchBuilder::new(pay_schema), BatchBuilder::new(pk_schema));
+            let (mut pb, mut kb) = (BatchBuilder::new(&pay_schema), BatchBuilder::new(&pk_schema));
             for r in 0..rows {
                 let natives: Vec<u128> = (0..types.len()).map(|i| le_cell(cell(r, i))).collect();
                 pb.begin_row(r as u128, 1);
@@ -406,7 +406,7 @@ fn reindex_pack_bench() {
         ],
         &[0],
     );
-    let mut jb = BatchBuilder::new(join_schema);
+    let mut jb = BatchBuilder::new(&join_schema);
     for i in 0..N as u64 {
         jb.begin_row(i as u128, 1i64);
         jb.put_int((i.wrapping_mul(2_654_435_761)) as u128);
@@ -436,7 +436,7 @@ fn reindex_pack_bench() {
         ],
         &[0],
     );
-    let mut gb = BatchBuilder::new(grp_schema);
+    let mut gb = BatchBuilder::new(&grp_schema);
     for i in 0..N as u64 {
         gb.begin_row(i as u128, 1);
         gb.put_int((i as i64).wrapping_mul(-7) as u128);

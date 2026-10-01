@@ -29,7 +29,7 @@ fn ingest_unticked_bench() {
         let pushes = TOTAL_ROWS / rows_per_push;
         let batches: Vec<Batch> = (0..pushes)
             .map(|p| {
-                let mut bb = BatchBuilder::new(schema);
+                let mut bb = BatchBuilder::new(&schema);
                 for i in 0..rows_per_push {
                     let id = p * rows_per_push + i;
                     bb.begin_row(id as u128, 1);

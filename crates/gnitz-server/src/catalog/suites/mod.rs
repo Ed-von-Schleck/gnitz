@@ -105,7 +105,7 @@ fn count_records(mut c: ReadCursor) -> usize {
 /// A single-row unbounded-VIEW_TAB batch for tests that register a view via the
 /// raw system-table path.
 fn build_view_tab_row(vid: u64, view_name: &str) -> Batch {
-    let mut bb = BatchBuilder::new(*SysFamily::View.schema());
+    let mut bb = BatchBuilder::new(SysFamily::View.schema());
     push_view_tab_row(&mut bb, 1, vid, view_name, 0, 0, 0);
     bb.finish()
 }
@@ -167,7 +167,7 @@ fn ingest_fixture(
 ) -> (CatalogEngine, u64) {
     let (mut engine, tid, _dir) = table_fixture(name, cols);
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(&schema);
     for id in 0..n {
         bb.begin_row(id as u128, 1);
         put_row(&mut bb, id);
@@ -180,7 +180,7 @@ fn ingest_fixture(
 /// A one-row `public` TABLE_TAB `+1` under explicit packed `pk_col_idx` and
 /// `flags` words — the shapes `create_table` cannot make.
 fn table_tab_row_words(tid: u64, table_name: &str, pk_col_idx: u64, flags: u64) -> Batch {
-    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
+    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
     let row = gnitz_wire::sys_rows::TableTabRow {
         table_id: tid,
         schema_id: PUBLIC_SCHEMA_ID,
@@ -239,7 +239,7 @@ fn stream_flags() -> u64 {
 fn col_alter_pair(owner_id: u64, col_idx: i64, old: &CatalogColumn, mutate: impl FnOnce(&mut CatalogColumn)) -> Batch {
     let mut altered = old.clone();
     mutate(&mut altered);
-    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
+    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
     old.write_col_tab_row(&mut bb, owner_id, col_idx as usize, -1);
     altered.write_col_tab_row(&mut bb, owner_id, col_idx as usize, 1);
     bb.finish()

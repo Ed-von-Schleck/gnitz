@@ -156,7 +156,7 @@ impl CatalogEngine {
 
         // Columns first: the table's register hook reads them.
         self.write_column_records(tid, col_defs)?;
-        let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
+        let mut bb = BatchBuilder::new(SysFamily::Table.schema());
         let row = TableTabRow {
             table_id: tid,
             schema_id: sid,
@@ -298,7 +298,7 @@ impl CatalogEngine {
         let col_batch = col_tab_batch(tid, cols, 1);
         self.ddl_sync(SysFamily::Column.id(), col_batch)?;
 
-        let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
+        let mut bb = BatchBuilder::new(SysFamily::Table.schema());
         let row = TableTabRow {
             table_id: tid,
             schema_id,

@@ -33,7 +33,7 @@ const ID: u64 = 20;
 fn shape(family: SysFamily, rows: &[(u64, i64, &str)]) -> String {
     let wire = family.wire();
     let payload = &wire.cols[wire.pk_cols.len()..];
-    let mut bb = BatchBuilder::new(*family.schema());
+    let mut bb = BatchBuilder::new(family.schema());
     for &(id, weight, differing) in rows {
         push_sys_row(&mut bb, family, [id, 0], weight, |pi| {
             (payload[pi].name == differing) as u64

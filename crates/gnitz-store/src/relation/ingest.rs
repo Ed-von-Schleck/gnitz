@@ -107,7 +107,7 @@ impl RelationRegistry {
     /// Apply `batch` to one resolved relation: its PK rule, its index
     /// projections, its own store and its delta capture.
     ///
-    /// `#[inline]`: it returns a 1 KiB `Batch` by value, so a call would cost an
+    /// `#[inline]`: it returns a `Batch` by value, so a call would cost an
     /// extra sret move at every site.
     #[inline]
     fn ingest_into(

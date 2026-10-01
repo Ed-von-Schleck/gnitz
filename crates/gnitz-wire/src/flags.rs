@@ -56,19 +56,17 @@ pub struct WireFlags {
     /// frame, absent on the master's terminal frame.
     pub continuation: bool,
     // Engine-authored.
-    /// Bit 35: the frame's batch claims the consolidated layout.
-    pub batch_consolidated: bool,
-    /// Bit 36: a worker's last frame of a train.
+    /// Bit 35: a worker's last frame of a train.
     pub scan_last: bool,
-    /// Bits 37-38: what a `HasPk` probe answers a matched key with.
+    /// Bits 36-37: what a `HasPk` probe answers a matched key with.
     pub probe_mode: WireProbeMode,
 }
 
 pub(crate) const FLAG_HAS_SCHEMA: u64 = 1 << 32;
 pub(crate) const FLAG_HAS_DATA: u64 = 1 << 33;
 
-/// Bits 16-31 and 39-63: no field.
-const RESERVED_BITS: u64 = !crate::low_bits_mask(39) | (crate::low_bits_mask(32) & !crate::low_bits_mask(16));
+/// Bits 16-31 and 38-63: no field.
+const RESERVED_BITS: u64 = !crate::low_bits_mask(38) | (crate::low_bits_mask(32) & !crate::low_bits_mask(16));
 
 impl WireFlags {
     /// A frame of a worker's reply train: `continuation` always, since the master's terminal
@@ -78,7 +76,6 @@ impl WireFlags {
             verb: ClientVerb::ScanSpec,
             conflict_mode: WireConflictMode::Update,
             continuation: true,
-            batch_consolidated: false,
             scan_last: last,
             probe_mode: WireProbeMode::Exists,
         }
@@ -88,9 +85,8 @@ impl WireFlags {
         self.verb as u64
             | (self.conflict_mode as u64) << 8
             | (self.continuation as u64) << 34
-            | (self.batch_consolidated as u64) << 35
-            | (self.scan_last as u64) << 36
-            | (self.probe_mode as u64) << 37
+            | (self.scan_last as u64) << 35
+            | (self.probe_mode as u64) << 36
     }
 
     /// Rejects a word naming a verb or mode this build does not define, or setting a
@@ -104,9 +100,8 @@ impl WireFlags {
             verb: ClientVerb::from_wire(w as u8).ok_or("flags: unknown request verb")?,
             conflict_mode: WireConflictMode::from_wire((w >> 8) as u8).ok_or("flags: unknown conflict mode")?,
             continuation: bit(34),
-            batch_consolidated: bit(35),
-            scan_last: bit(36),
-            probe_mode: WireProbeMode::from_wire(((w >> 37) & 3) as u8).ok_or("flags: unknown probe mode")?,
+            scan_last: bit(35),
+            probe_mode: WireProbeMode::from_wire(((w >> 36) & 3) as u8).ok_or("flags: unknown probe mode")?,
         })
     }
 }
