@@ -842,3 +842,73 @@ fn for_range_drain_bench() {
         );
     }
 }
+
+/// Instructions per gathered row of a `pk IN (…)` drain, over one and four
+/// in-memory runs, fixed-width and string payloads, dense and sparse key lists.
+#[test]
+#[ignore]
+fn pk_set_gather_drain_bench() {
+    use crate::repr::Run;
+    use gnitz_foundation::perf::Counter;
+    use gnitz_wire::PkKeys;
+
+    const N: u64 = 1 << 20;
+    let counter = Counter::instructions().expect("instructions counter");
+    for (label, with_str) in [("3xI64", false), ("2xI64+string", true)] {
+        let last = if with_str { TypeCode::String } else { TypeCode::I64 };
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(TypeCode::I64, false),
+                SchemaColumn::new(TypeCode::I64, true),
+                SchemaColumn::new(last, false),
+            ],
+            &[0],
+        );
+        for srcs in [1u64, 4] {
+            let runs: Vec<Run> = (0..srcs)
+                .map(|s| {
+                    let mut b = BatchBuilder::new(&schema);
+                    for i in (s..N).step_by(srcs as usize) {
+                        b.begin_row(i as u128, 1);
+                        b.put_int(i as u128);
+                        match i % 7 {
+                            0 => b.put_null(),
+                            _ => b.put_int((i * 3) as u128),
+                        }
+                        match with_str {
+                            true => b.put_string(&format!("gather-bench-payload-{:05}", i % 64)),
+                            false => b.put_int((i * 5) as u128),
+                        }
+                        b.end_row();
+                    }
+                    let mut b = b.finish();
+                    b.certify_consolidated();
+                    Run::Mem(Rc::new(b))
+                })
+                .collect();
+            for every in [1u64, 16] {
+                let keys: Vec<u8> = (0..N).step_by(every as usize).flat_map(u64::to_be_bytes).collect();
+                let n_keys = (keys.len() / 8) as f64;
+                let mut best = u64::MAX;
+                for _ in 0..3 {
+                    let keys = PkKeys::from_sorted(8, keys.clone());
+                    let mut g = PkSetGather::over_runs(runs.iter().cloned(), schema, runs.len(), keys);
+                    let (rows, instructions) = counter.measure(|| {
+                        let mut rows = 0;
+                        while let Some(c) = g.drain_chunk(65_536) {
+                            rows += c.len();
+                        }
+                        rows
+                    });
+                    assert_eq!(rows as f64, n_keys);
+                    best = best.min(instructions);
+                }
+                println!(
+                    "pk-set gather {label:<13} src={srcs} every={every:<2} {:>7.1} instr/row",
+                    best as f64 / n_keys
+                );
+            }
+        }
+    }
+}

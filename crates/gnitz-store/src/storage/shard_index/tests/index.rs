@@ -62,8 +62,9 @@ fn fat_batch(base: u64, n: u64, width: usize) -> Batch {
     let schema = make_schema_pk_u64_payload_string();
     let mut b = BatchBuilder::new(&schema);
     for pk in base..base + n {
-        // Vary the body per row so the text carries no run the writer can fold.
-        let body: Vec<u8> = (0..width).map(|i| b'a' + ((pk as usize + i) % 26) as u8).collect();
+        // No two rows share a body, so the writer has no value to store once.
+        let mut body = pk.to_string().into_bytes();
+        body.extend((body.len()..width).map(|i| b'a' + ((pk as usize + i) % 26) as u8));
         b.begin_row(pk as u128, 1);
         b.put_blob(&body);
         b.end_row();

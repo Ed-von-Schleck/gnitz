@@ -11,6 +11,9 @@ mod emit;
 mod shape;
 
 pub(crate) use adhoc_fold::AdhocFold;
-pub(crate) use agg::{Accumulator, ExtremeSpec};
+pub(crate) use agg::{Accumulator, ExtremeSpec, GroupedState};
 pub(crate) use emit::emit_reduce_row;
 pub(crate) use shape::ReduceShape;
+
+#[cfg(test)]
+mod bench;

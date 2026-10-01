@@ -601,6 +601,12 @@ make bench WORKERS=4 PERF=1         # knobs: WORKERS, CLIENTS, FULL=1, PERF=1
 `make help` lists the rest. Results land in the gitignored `benchmarks/results/`;
 `benchmarks/report.py` turns them into report tables.
 
+`make bench-disk` measures bytes instead of time: it loads a string-heavy table
+under two views, lets the shutdown checkpoint put every store on disk, and prints
+`gnitz-server --disk-usage <data_dir>` — the data directory by relation, store,
+LSM level and shard region. That flag reads the files alone, so it also answers
+for any other data directory, a live server's included.
+
 Workflow: `make bench` → change → commit → `make bench` → compare `summary.json`.
 
 ### Rust micro-benchmarks

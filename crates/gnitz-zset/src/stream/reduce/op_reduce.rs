@@ -2,14 +2,15 @@
 
 use std::cmp::Ordering;
 
-use crate::repr::{Batch, ReadCursor, RowMark};
+use crate::repr::{Batch, MemBatch, ReadCursor, RowMark};
 use crate::schema::payload_order::compare_rows;
 use crate::schema::SchemaDescriptor;
 
+use super::avi::AviBake;
 use super::plan::ReducePlan;
 use crate::algebra::emit_reduce_row;
 use crate::algebra::ground_pk;
-use crate::algebra::Accumulator;
+use crate::algebra::{Accumulator, GroupOrdinals, GroupedState};
 
 /// A group with more delta rows than this skips the pre-step and probes the
 /// value index: one seek in place of stepping every row.
@@ -17,6 +18,10 @@ const PRESTEP_CAP: usize = 128;
 
 /// Incremental DBSP REDUCE: δ_out = Agg(history + δ_in) - Agg(history), emitted
 /// consolidated.
+///
+/// The delta is folded a column at a time, each aggregate over its own column:
+/// over row ranges where the delta already stands in group order and its groups
+/// are long enough to pay for a range each, else over one group ordinal per row.
 pub fn op_reduce(
     delta: &Batch,
     trace_out_cursor: &mut ReadCursor,
@@ -45,77 +50,134 @@ pub fn op_reduce(
     }
 
     let mb = delta.as_mem_batch();
-    let runs = shape.key.runs(delta);
-
-    // A group emits at most its retraction and its new row.
-    let mut out = Batch::with_capacity(output_schema, 2 * runs.len());
-    let mut accs = shape.acc_template.clone();
-    let mut avi = plan.avi.as_ref().map(|bake| {
+    let weights = mb.weight().as_chunks::<8>().0;
+    let retracts = |w: &[u8; 8]| i64::from_le_bytes(*w) <= 0;
+    let avi = plan.avi.as_ref().map(|bake| {
         let cursor = history.expect("a value-indexed reduce is handed a cursor over the index its plan describes");
         (bake, cursor)
     });
-    let fold_runs = avi.is_none() && runs.in_row_order() && 2 * runs.len() <= delta.count;
-    for run in runs.iter() {
-        let first = runs.row(run.start);
-        let out_pk = shape.key.out_pk(&mb, first);
+    let indexed = avi.is_some();
+    let mut accs = shape.acc_template.clone();
+
+    let groups = match shape.key.runs(delta) {
+        Some(runs) if runs.len() == 1 || 2 * runs.len() <= delta.count => {
+            let mut groups = GroupEmit::new(plan, &mb, trace_out_cursor, avi, runs.len());
+            for run in runs.iter() {
+                accs.iter_mut().for_each(Accumulator::reset);
+                // An extreme recedes only on a retraction, so an all-insert group's
+                // extremes are its rows' and its stored row's: no probe.
+                let prestep = indexed && run.len() <= PRESTEP_CAP && !weights[run.clone()].iter().any(retracts);
+                Accumulator::fold_rows(&mut accs, &mb, run.clone(), prestep);
+                groups.emit(run.start, &mut accs, indexed && !prestep);
+            }
+            return groups.finish();
+        }
+        Some(runs) => GroupOrdinals::of_runs(&runs),
+        None => shape.key.numbered(delta),
+    };
+
+    let mut states: Vec<GroupedState> = shape.acc_template.iter().map(Accumulator::grouped).collect();
+    let whole = [(0, delta.count)];
+    for (acc, state) in shape.acc_template.iter().zip(&mut states) {
+        state.resize(groups.len(), acc);
+        acc.fold_grouped(&mb, &whole, &groups.ord, state);
+    }
+    // Per group, whether its extremes come off the index: too many rows to have
+    // pre-stepped, or a retraction among them.
+    let mut probes = vec![false; if indexed { groups.len() } else { 0 }];
+    if indexed {
+        let mut rows = vec![0u32; groups.len()];
+        for (&g, w) in groups.ord.iter().zip(weights) {
+            let g = g as usize;
+            rows[g] += 1;
+            probes[g] |= retracts(w) || rows[g] as usize > PRESTEP_CAP;
+        }
+    }
+
+    let mut emit = GroupEmit::new(plan, &mb, trace_out_cursor, avi, groups.len());
+    for &g in &groups.by_pk {
+        let g = g as usize;
+        for (acc, state) in accs.iter_mut().zip(&mut states) {
+            state.take(g, acc);
+        }
+        emit.emit(groups.first[g] as usize, &mut accs, indexed && probes[g]);
+    }
+    emit.finish()
+}
+
+/// The output of one `op_reduce` call under construction: each group's folded
+/// delta is merged with its history and written as a retraction and a new row.
+struct GroupEmit<'a, 'c> {
+    plan: &'a ReducePlan,
+    delta: &'a MemBatch<'a>,
+    trace_out: &'c mut ReadCursor,
+    avi: Option<(&'a AviBake, &'c mut ReadCursor)>,
+    groups: usize,
+    out: Batch,
+}
+
+impl<'a, 'c> GroupEmit<'a, 'c> {
+    fn new(
+        plan: &'a ReducePlan,
+        delta: &'a MemBatch<'a>,
+        trace_out: &'c mut ReadCursor,
+        avi: Option<(&'a AviBake, &'c mut ReadCursor)>,
+        groups: usize,
+    ) -> Self {
+        // A group emits at most its retraction and its new row.
+        let out = Batch::with_capacity(&plan.shape.output_schema, 2 * groups);
+        GroupEmit { plan, delta, trace_out, avi, groups, out }
+    }
+
+    /// Emit the group of delta row `first`, whose delta `accs` hold. Under
+    /// `probe` its extremes are read off the value index, whatever `accs` hold
+    /// for them. Groups arrive in ascending output-PK order.
+    #[inline(always)]
+    fn emit(&mut self, first: usize, accs: &mut [Accumulator], probe: bool) {
+        let shape = &self.plan.shape;
+        let out_pk = shape.key.out_pk(self.delta, first);
         let out_pk_bytes: &[u8] = out_pk.bytes();
 
-        for acc in accs.iter_mut() {
-            acc.reset();
-        }
-        // An extreme recedes only on a retraction, so an all-insert group's
-        // extremes are its rows' and its stored row's: no probe.
-        let prestep = avi.is_some() && run.len() <= PRESTEP_CAP;
-        let mut saw_negative = false;
-        if fold_runs {
-            Accumulator::fold_rows(&mut accs, &mb, run.clone());
-        } else {
-            for pos in run.clone() {
-                let row = runs.row(pos);
-                let w = mb.get_weight(row);
-                saw_negative |= w <= 0;
-                let extremes = prestep && !saw_negative;
-                for acc in accs.iter_mut() {
-                    if acc.is_linear() || extremes {
-                        acc.step_from_batch(&mb, row, w);
-                    }
-                }
-            }
-        }
-        let probe = !prestep || saw_negative;
-
-        let mark = out.mark();
-        if trace_out_cursor.seek_pk_group_ascending(out_pk_bytes) {
+        let mark = self.out.mark();
+        if self.trace_out.seek_pk_group_ascending(out_pk_bytes) {
             // −Agg(history) is the stored row, copied byte-identical at −1.
-            trace_out_cursor.copy_current_row_into(&mut out, -1);
-            let (stored_row, stored_idx) = trace_out_cursor.current_row_source();
+            self.trace_out.copy_current_row_into(&mut self.out, -1);
+            let (stored_row, stored_idx) = self.trace_out.current_row_source();
             for acc in accs.iter_mut().filter(|a| a.is_linear() || !probe) {
                 acc.fold_stored(stored_row, stored_idx);
             }
         }
         if probe {
-            if let Some((bake, cursor)) = &mut avi {
-                bake.seed_extremes(cursor, &mb, first, &mut accs);
+            if let Some((bake, cursor)) = &mut self.avi {
+                bake.seed_extremes(cursor, self.delta, first, accs);
             }
         }
 
+        let cardinality = accs[self.plan.cardinality].count_value();
         debug_assert!(
-            accs[plan.cardinality].count_value() >= 0,
-            "reduce input must be bag-positive: negative group cardinality",
+            cardinality >= 0,
+            "reduce input must be bag-positive: negative group cardinality"
         );
-        if accs[plan.cardinality].count_value() > 0 {
-            emit_reduce_row(&mut out, Some((&mb, first, shape.key.carried())), out_pk_bytes, &accs);
-        } else if plan.seeds_ground {
+        if cardinality > 0 {
+            let group = Some((self.delta, first, shape.key.carried()));
+            emit_reduce_row(&mut self.out, group, out_pk_bytes, accs);
+        } else if self.plan.seeds_ground {
             // An emptied global aggregate still publishes one row.
-            emit_reduce_row(&mut out, None, out_pk_bytes, &shape.acc_template);
+            emit_reduce_row(&mut self.out, None, out_pk_bytes, &shape.acc_template);
         }
-        consolidate_group(&mut out, output_schema, mark);
+        consolidate_group(&mut self.out, &shape.output_schema, mark);
     }
 
-    gnitz_debug!("op_reduce: in={} groups={} out={}", delta.count, runs.len(), out.count);
-
-    out.certify_consolidated();
-    out
+    fn finish(mut self) -> Batch {
+        gnitz_debug!(
+            "op_reduce: in={} groups={} out={}",
+            self.delta.count,
+            self.groups,
+            self.out.count
+        );
+        self.out.certify_consolidated();
+        self.out
+    }
 }
 
 /// Consolidate the rows one group wrote since `mark`: at most a retraction and

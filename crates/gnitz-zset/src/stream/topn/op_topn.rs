@@ -19,23 +19,32 @@ pub fn op_topn(delta: &Batch, trace_out: &mut ReadCursor, history: &mut ReadCurs
     let n = delta.count;
     let mb = delta.as_mem_batch();
 
-    let runs = plan.key.runs(delta);
+    let groups = plan.key.ordinals(delta);
+    // Each group's first live row; a group whose every delta row is a ghost was
+    // not touched.
+    const UNTOUCHED: u32 = u32::MAX;
+    let mut exemplars = vec![UNTOUCHED; groups.len()];
+    for (row, &g) in groups.ord.iter().enumerate() {
+        if exemplars[g as usize] == UNTOUCHED && mb.get_weight(row) != 0 {
+            exemplars[g as usize] = row as u32;
+        }
+    }
 
     // A retracted and a re-emitted window per touched group.
     let window = usize::try_from(plan.limit).map_or(usize::MAX, |l| l.saturating_mul(2));
     let cap = window
-        .saturating_mul(runs.len())
+        .saturating_mul(groups.len())
         .min(n)
         .max(window)
         .min(MAX_TOPN_CAP_HINT);
     let mut out = Batch::with_capacity(output_schema, cap);
     let mut key = [0u8; MAX_PK_BYTES];
 
-    // Runs ascend in output-PK order, so the `trace_out` probes do too.
-    for run in runs.iter() {
-        // A group whose every delta row is a ghost was not touched.
-        let Some(exemplar) = run.map(|p| runs.row(p)).find(|&r| mb.get_weight(r) != 0) else {
-            continue;
+    // Groups ascend in output-PK order, so the `trace_out` probes do too.
+    for &g in &groups.by_pk {
+        let exemplar = match exemplars[g as usize] {
+            UNTOUCHED => continue,
+            row => row as usize,
         };
         let out_pk = plan.key.out_pk(&mb, exemplar);
         let out_pk_bytes = out_pk.bytes();
@@ -69,6 +78,6 @@ pub fn op_topn(delta: &Batch, trace_out: &mut ReadCursor, history: &mut ReadCurs
     }
 
     let out = out.into_consolidated();
-    gnitz_debug!("op_topn: in={} groups={} out={}", n, runs.len(), out.count);
+    gnitz_debug!("op_topn: in={} groups={} out={}", n, groups.len(), out.count);
     out
 }

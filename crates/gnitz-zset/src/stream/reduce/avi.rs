@@ -15,7 +15,7 @@ use crate::algebra::{
     IMAGE_COL,
 };
 use crate::algebra::{Accumulator, ExtremeSpec};
-use crate::repr::{Batch, MemBatch, ReadCursor};
+use crate::repr::{range_rows, Batch, ReadCursor};
 use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_PK_BYTES};
 use gnitz_expr::payload_bytes;
 use gnitz_expr::RowSource;
@@ -50,7 +50,6 @@ pub(super) struct AviBake {
     aggs: Vec<AviAgg>,
     /// Width of the value slot, shared by every ordinal.
     value_bytes: usize,
-    has_wide: bool,
 }
 
 impl AviBake {
@@ -85,7 +84,6 @@ impl AviBake {
             key_packer,
             aggs,
             value_bytes: suffix[1].size() as usize,
-            has_wide,
         }))
     }
 
@@ -94,14 +92,6 @@ impl AviBake {
     fn prefix<'a>(&self, buf: &'a mut [u8], ord: u8) -> &'a [u8] {
         buf[self.key_packer.out_stride] = ord;
         &buf[..self.key_packer.out_stride + ORDINAL_BYTES]
-    }
-
-    /// `group ‖ ordinal ‖ image` over the same buffer.
-    #[inline]
-    fn entry<'a>(&self, buf: &'a mut [u8], ord: u8, image: &[u8]) -> &'a [u8] {
-        let n = self.prefix(buf, ord).len();
-        write_image_slot(&mut buf[n..n + self.value_bytes], image);
-        &buf[..n + self.value_bytes]
     }
 
     /// Seed every value-indexed accumulator of `row`'s group with its extreme
@@ -137,102 +127,91 @@ impl AviBake {
 // Population
 // ---------------------------------------------------------------------------
 
-/// The index entries `delta` contributes, each at its row's weight, unsorted.
+/// The index entries `delta` contributes, each at its row's weight, unsorted:
+/// one ordinal at a time, each of its regions in one pass.
 pub(super) fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
     // The VM folds this register before any reader, so no row is a ghost.
     debug_assert!(delta.is_consolidated());
-    if bake.has_wide {
-        avi_entries::<true>(delta, bake)
-    } else {
-        avi_entries::<false>(delta, bake)
-    }
-}
-
-/// Without wide ordinals, the (never-taken) wide arm stays out of the loop.
-fn avi_entries<const HAS_WIDE: bool>(delta: &Batch, bake: &AviBake) -> Batch {
     let mb = delta.as_mem_batch();
-    let mut out = Batch::with_capacity(&bake.schema, (delta.count * bake.aggs.len()).max(1));
+    let n = delta.count;
+    let stride = bake.key_packer.out_stride;
+    let value = stride + ORDINAL_BYTES..stride + ORDINAL_BYTES + bake.value_bytes;
+    let width = value.end;
+    let has_payload = bake.schema.num_payload_cols() != 0;
+    let mut out = Batch::with_capacity(&bake.schema, (n * bake.aggs.len()).max(1));
+    // A string ordinal's images, back to back, and each one's end.
+    let (mut images, mut ends) = (Vec::new(), Vec::new());
 
-    let width = bake.key_packer.out_stride + ORDINAL_BYTES + bake.value_bytes;
-    let mut image = Vec::new();
-    bake.key_packer.for_each_key(&mb, width, |row, key| {
-        let weight = mb.get_weight(row);
-        for (j, a) in bake.aggs.iter().enumerate() {
-            let ExtremeSpec { loc, kind, max } = a.spec;
-            // A NULL has no image: MIN/MAX skips it.
-            if loc.is_null(&mb, row) {
-                continue;
+    for (j, a) in bake.aggs.iter().enumerate() {
+        let ExtremeSpec { loc, kind, max } = a.spec;
+        // A NULL has no image: MIN/MAX skips it.
+        let runs = delta.runs_without_nulls(match loc {
+            ColumnLocator::Payload { slot, .. } => 1 << slot,
+            ColumnLocator::Pk { .. } => 0,
+        });
+        let rows = range_rows(&runs);
+        let base = out.grow_rows(rows);
+        let live = || runs.iter().flat_map(|&(s, e)| s..e);
+
+        if let ImageKind::Wide(WideKind::Bytes) = kind {
+            images.clear();
+            ends.clear();
+            for row in live() {
+                append_image(&loc, kind, max, &mb, row, &mut images);
+                ends.push(images.len());
             }
-            match kind {
-                ImageKind::Scalar(kind) => {
-                    let image = scalar_image(&loc, kind, max, &mb, row).to_be_bytes();
-                    out.push_zero_filled_row(bake.entry(key, j as u8, &image), weight);
+        }
+
+        let mut at = base;
+        for &(s, e) in &runs {
+            let keys = &mut out.pk_data_mut()[at * width..(at + (e - s)) * width];
+            bake.key_packer.pack_rows(keys, width, &mb, s, e - s);
+            out.weight_data_mut()[at * 8..(at + (e - s)) * 8].copy_from_slice(&delta.weight_data()[s * 8..e * 8]);
+            at += e - s;
+        }
+        let keys = out.pk_data_mut()[base * width..].chunks_exact_mut(width);
+        match kind {
+            ImageKind::Scalar(kind) => {
+                for (key, row) in keys.zip(live()) {
+                    key[stride] = j as u8;
+                    write_image_slot(
+                        &mut key[value.clone()],
+                        &scalar_image(&loc, kind, max, &mb, row).to_be_bytes(),
+                    );
                 }
-                ImageKind::Wide(kind) => {
-                    let entry = WideEntry {
-                        bake,
-                        ord: j as u8,
-                        loc: &loc,
-                        kind,
-                        max,
-                        mb: &mb,
-                        row,
-                        weight,
-                    };
-                    if HAS_WIDE {
-                        entry.push(&mut out, key, &mut image);
-                    } else {
-                        entry.push_outlined(&mut out, key, &mut image);
+            }
+            ImageKind::Wide(WideKind::Fixed(_)) => {
+                for (key, row) in keys.zip(live()) {
+                    key[stride] = j as u8;
+                    write_image_slot(&mut key[value.clone()], &int16_image(&loc, max, &mb, row));
+                }
+            }
+            ImageKind::Wide(WideKind::Bytes) => {
+                let mut start = 0;
+                for (key, &end) in keys.zip(&ends) {
+                    key[stride] = j as u8;
+                    write_image_slot(&mut key[value.clone()], &images[start..end]);
+                    start = end;
+                }
+            }
+        }
+
+        if has_payload {
+            // The whole image of a string ordinal; nothing for any other.
+            let (cells, _, blob) = out.col_null_and_blob_mut(IMAGE_SLOT);
+            let cells = &mut cells[base * 16..];
+            match kind {
+                ImageKind::Wide(WideKind::Bytes) => {
+                    let mut start = 0;
+                    for (cell, &end) in cells.as_chunks_mut::<16>().0.iter_mut().zip(&ends) {
+                        *cell = gnitz_wire::encode_german_string(&images[start..end], blob);
+                        start = end;
                     }
                 }
+                _ => cells.fill(0),
             }
         }
-    });
+    }
+    out.null_bmp_data_mut().fill(0);
     out
-}
-
-/// One wide ordinal's index entry for one row.
-struct WideEntry<'a> {
-    bake: &'a AviBake,
-    ord: u8,
-    loc: &'a ColumnLocator,
-    kind: WideKind,
-    max: bool,
-    mb: &'a MemBatch<'a>,
-    row: usize,
-    weight: i64,
-}
-
-impl WideEntry<'_> {
-    #[inline(always)]
-    fn push(&self, out: &mut Batch, key: &mut [u8], image: &mut Vec<u8>) {
-        let Self {
-            bake,
-            ord,
-            loc,
-            kind,
-            max,
-            mb,
-            row,
-            weight,
-        } = *self;
-        match kind {
-            WideKind::Fixed(_) => {
-                let image = int16_image(loc, max, mb, row);
-                out.push_zero_filled_row(bake.entry(key, ord, &image), weight);
-            }
-            WideKind::Bytes => {
-                image.clear();
-                append_image(loc, ImageKind::Wide(kind), max, mb, row, image);
-                out.begin_row(bake.entry(key, ord, image), weight);
-                out.extend_col_blob(IMAGE_SLOT, image);
-                out.commit_row(0);
-            }
-        }
-    }
-
-    #[inline(never)]
-    fn push_outlined(&self, out: &mut Batch, key: &mut [u8], image: &mut Vec<u8>) {
-        self.push(out, key, image)
-    }
 }

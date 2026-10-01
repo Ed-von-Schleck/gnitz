@@ -198,6 +198,25 @@ def server_binary():
     return binary
 
 
+def disk_usage(data_dir):
+    """`gnitz-server --disk-usage data_dir`, which reads the files alone and so
+    runs beside a live server: the report, and each of its store lines — one per
+    relation, store and LSM level — as a dict."""
+    report = subprocess.run(
+        [server_binary(), "--disk-usage", str(data_dir)], check=True, capture_output=True, text=True
+    ).stdout
+    stores = []
+    for line in report.splitlines():
+        f = line.split(maxsplit=8)
+        if f and f[0].isdigit():
+            stores.append({
+                "relation": int(f[0]), "store": f[1], "level": f[2], "files": int(f[3]),
+                "skeletons": int(f[4]), "rows": int(f[5]), "bytes": int(f[6]),
+                "regions": f[8] if len(f) > 8 else "", "line": line,
+            })
+    return report, stores
+
+
 class ServerProc:
     """One gnitz-server process over a fixed `(data_dir, sock_path)` pair.
 

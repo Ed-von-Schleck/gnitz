@@ -2,7 +2,7 @@
 //! primitives over them. A store owns its directory, so every shard and staging
 //! file in it is the store's.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 
@@ -157,6 +157,22 @@ pub(super) fn remove_stale_files(dir: &str, keep: &HashSet<String>) -> io::Resul
         }
     }
     Ok(())
+}
+
+/// Every file in `dir` named as a shard, with the level `dir`'s intact manifest
+/// places it at — `None` for one the manifest does not name.
+pub(crate) fn shard_files(dir: &str) -> Result<Vec<(String, Option<u64>)>, StorageError> {
+    let entries = read_intact(dir)?.map_or(Vec::new(), |m| m.shards.entries);
+    let levels: HashMap<String, u64> = entries.iter().map(|e| (shard_name(e.seq), e.level)).collect();
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str().filter(|n| n.starts_with(SHARD_PREFIX)) else {
+            continue;
+        };
+        files.push((format!("{dir}/{name}"), levels.get(name).copied()));
+    }
+    Ok(files)
 }
 
 /// Read and decode `dir`'s manifest. `Ok(None)` when it does not exist yet;

@@ -3,7 +3,7 @@
 //! One opcode over a compiler-baked [`JoinProbe`]: `Equi` co-groups the delta
 //! against the trace on equal key, `Range` walks an ordered half-open span per
 //! delta equality group, `Cross` walks the whole trace once against the whole
-//! delta. All three drive the same emission — the product of a contiguous
+//! delta. All three name the same emission — the product of a contiguous
 //! delta run with the cursor's current trace row — and all write
 //! `[key, left payload…, right payload…]` over the SQL sides, keyed by the delta
 //! PK, or by `[left PK…, right PK…]` under `Cross`.
@@ -12,9 +12,12 @@ use crate::schema::ColumnTable;
 use std::cmp::Ordering;
 use std::ops::Range;
 
-use crate::repr::{pk_group_end, pk_prefix_group_end, Batch, BlobCache, ReadCursor};
+use crate::repr::{
+    copy_string_cells, pk_group_end, pk_prefix_group_end, relocate_german_string_vec, runs_where, should_relocate_blob,
+    width_dispatch, Batch, BlobCache, ReadCursor,
+};
 use crate::schema::key::{compare_pk_ordering, key_range_between_cuts, KeyCut, PkBuf};
-use crate::schema::{DerivedSchema, SchemaDescriptor, MAX_PK_BYTES};
+use crate::schema::{DerivedSchema, SchemaDescriptor, SchemaFacts, MAX_PK_BYTES};
 
 use gnitz_expr::RowSource;
 use gnitz_wire::{null_word_at, JoinKind, RangeRel, TypeCode};
@@ -222,14 +225,39 @@ impl RangeProbe {
 // The operator
 // ---------------------------------------------------------------------------
 
+/// One emission of a walk: the delta run `[rs, re)` against one trace row, named
+/// by its cursor position.
+#[derive(Clone, Copy)]
+struct Pairing {
+    rs: u32,
+    re: u32,
+    src: u32,
+    row: u32,
+    w_trace: i64,
+}
+
+impl Pairing {
+    #[inline(always)]
+    fn delta_rows(&self) -> std::ops::Range<usize> {
+        self.rs as usize..self.re as usize
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        (self.re - self.rs) as usize
+    }
+}
+
 /// Join delta rows against the trace, writing `[key, left payload…, right
 /// payload…]` under the `out_schema` [`JoinPlan::from_wire`] derived above.
 ///
-/// Emission is trace-major under every probe: each trace row is walked once and
-/// producted against a contiguous, random-access delta run. So the output is
-/// unfolded and not (PK, payload)-sorted — under `Cross` not even PK-sorted,
-/// since each trace row re-emits the whole delta; it carries no consolidated claim,
-/// and downstream re-sorts and consolidates.
+/// The walk only records which delta run meets which trace row; the output is
+/// then written one region at a time over that list. Emission is trace-major
+/// under every probe: each trace row is walked once and producted against a
+/// contiguous delta run. So the output is unfolded and not (PK, payload)-sorted
+/// — under `Cross` not even PK-sorted, since each trace row re-emits the whole
+/// delta; it carries no consolidated claim, and downstream re-sorts and
+/// consolidates.
 pub fn op_join_delta_trace(
     delta: &Batch,
     cursor: &mut ReadCursor,
@@ -242,79 +270,198 @@ pub fn op_join_delta_trace(
     if n == 0 {
         return Batch::empty_with_schema(out_schema);
     }
-    let delta_mb = delta.as_mem_batch();
-    // Widened once: the emit reads both ends per output row.
-    let (d_slots, t_slots) = (probe.d_slots.range(), probe.t_slots.range());
-
-    // The keyless probe reads no key and emits exactly `n × |trace|` rows;
-    // for a keyed probe `n` is only a hint.
-    let (rows, mut pair) = match probe.walk {
-        Walk::Cross { pk_len, d_key, t_key } => {
-            cursor.rewind();
-            let key = PairKey {
-                buf: [0u8; MAX_PK_BYTES],
-                len: pk_len as usize,
-                delta: d_key.range(),
-                trace: t_key.range(),
-            };
-            (n.saturating_mul(cursor.estimated_length()), Some(key))
-        }
-        _ => (n, None),
-    };
-
-    let mut output = Batch::with_capacity(out_schema, rows);
-    let mut cache = BlobCache::new(rows);
-
+    // Grown, not pre-sized: a walk can match nothing.
+    let mut pairs: Vec<Pairing> = Vec::new();
+    let mut rows = 0usize;
     let mut emit = |rs: usize, re: usize, c: &ReadCursor| {
-        let w_trace = c.current_weight;
-        let (t_src, t_row) = c.current_row_source();
-        let t_null = t_src.get_null_word(t_row);
-        // Every row this call writes shares one trace row, so its null bits
-        // rebase once rather than per delta row.
-        let t_bits = null_word_at(t_null, t_slots.start);
-        if let Some(k) = pair.as_mut() {
-            k.buf[k.trace.clone()].copy_from_slice(c.current_pk_bytes());
+        if rs == re {
+            return;
         }
-        for i in rs..re {
-            let w_out = delta_mb.get_weight(i).wrapping_mul(w_trace);
-            if w_out == 0 {
-                continue;
-            }
-            let d_pk_bytes = delta_mb.get_pk_bytes(i);
-            let pk = match pair.as_mut() {
-                Some(k) => {
-                    k.buf[k.delta.clone()].copy_from_slice(d_pk_bytes);
-                    &k.buf[..k.len]
-                }
-                None => d_pk_bytes,
-            };
-            output.begin_row(pk, w_out);
-
-            let d_null = delta_mb.get_null_word(i);
-            output.append_payload_cols(d_slots.clone(), &delta_mb, i, Some(&mut cache));
-            output.append_payload_cols(t_slots.clone(), t_src, t_row, Some(&mut cache));
-            // Each half's null bits rebase onto the slot its columns landed at.
-            output.commit_row(t_bits | null_word_at(d_null, d_slots.start));
-        }
+        let (src, row) = c.current_position();
+        pairs.push(Pairing {
+            rs: rs as u32,
+            re: re as u32,
+            src: src as u32,
+            row: row as u32,
+            w_trace: c.current_weight,
+        });
+        rows += re - rs;
     };
-
     match probe.walk {
         Walk::Equi => equi_merge_walk(delta, cursor, emit),
         Walk::Range(range) => range_merge_walk(delta, cursor, range, emit),
-        Walk::Cross { .. } => cursor.for_each_row_while(|_| true, |c| emit(0, n, c)),
+        Walk::Cross { .. } => {
+            cursor.rewind();
+            cursor.for_each_row_while(|_| true, |c| emit(0, n, c));
+        }
     }
-
-    output
+    write_pairings(delta, cursor, out_schema, probe, &pairs, rows)
 }
 
-/// `Cross`'s output key under construction: the pair `[left PK…, right PK…]`,
-/// assembled per row because neither source key is the output's. A keyed probe
-/// has none — its key is the delta's PK region verbatim.
-struct PairKey {
-    buf: [u8; MAX_PK_BYTES],
-    len: usize,
-    delta: Range<usize>,
-    trace: Range<usize>,
+/// The `rows` output rows `pairs` names, in list order, one region at a time.
+fn write_pairings(
+    delta: &Batch,
+    cursor: &ReadCursor,
+    out_schema: &SchemaDescriptor,
+    probe: JoinProbe,
+    pairs: &[Pairing],
+    rows: usize,
+) -> Batch {
+    if rows == 0 {
+        return Batch::empty_with_schema(out_schema);
+    }
+    let d_schema = delta.schema();
+    let (d_first, t_first) = (probe.d_slots.start as usize, probe.t_slots.start as usize);
+    let trace_row = |p: &Pairing| (cursor.source_at(p.src as usize), p.row as usize);
+    let mut out = Batch::with_capacity(out_schema, rows);
+    out.grow_rows(rows);
+
+    match probe.walk {
+        // No key decides a match, so the pair `[left PK…, right PK…]` is minted
+        // per row.
+        Walk::Cross { pk_len, d_key, t_key } => {
+            let (d_key, t_key) = (d_key.range(), t_key.range());
+            let mut keys = out.pk_data_mut().chunks_exact_mut(pk_len as usize);
+            for p in pairs {
+                let (t_src, t_row) = trace_row(p);
+                let t_pk = t_src.get_pk_bytes(t_row);
+                for i in p.delta_rows() {
+                    let key = keys.next().expect("one key per output row");
+                    key[d_key.clone()].copy_from_slice(delta.get_pk_bytes(i));
+                    key[t_key.clone()].copy_from_slice(t_pk);
+                }
+            }
+        }
+        // A keyed probe's output key is the delta's PK region verbatim.
+        _ => width_dispatch!(
+            d_schema.pk_stride(),
+            copy_runs,
+            delta.pk_data(),
+            out.pk_data_mut(),
+            pairs
+        ),
+    }
+
+    let mut any_ghost = false;
+    {
+        let src = delta.weight_data().as_chunks::<8>().0;
+        let mut dst = out.weight_data_mut().as_chunks_mut::<8>().0.iter_mut();
+        for p in pairs {
+            for (w_delta, w_out) in src[p.delta_rows()].iter().zip(&mut dst) {
+                let w = i64::from_le_bytes(*w_delta).wrapping_mul(p.w_trace);
+                any_ghost |= w == 0;
+                *w_out = w.to_le_bytes();
+            }
+        }
+    }
+    {
+        // Each half's null bits rebase onto the slot its columns land at.
+        let src = delta.null_bmp_data().as_chunks::<8>().0;
+        let mut dst = out.null_bmp_data_mut().as_chunks_mut::<8>().0.iter_mut();
+        for p in pairs {
+            let (t_src, t_row) = trace_row(p);
+            let t_bits = null_word_at(t_src.get_null_word(t_row), t_first);
+            for (d_null, word) in src[p.delta_rows()].iter().zip(&mut dst) {
+                *word = (t_bits | null_word_at(u64::from_le_bytes(*d_null), d_first)).to_le_bytes();
+            }
+        }
+    }
+
+    // The delta's heap rides whole unless relocating the emitted cells is
+    // cheaper; the rows no pairing names are what it then holds dead.
+    let strings = d_schema.string_payload_slots();
+    let heap_at = match strings != 0 && !should_relocate_blob(delta.blob().len(), delta.count, rows) {
+        true => {
+            let mut emitted = vec![false; delta.count];
+            pairs.iter().for_each(|p| emitted[p.delta_rows()].fill(true));
+            let kept = runs_where(delta.count, |row| emitted[row]);
+            out.carry_heap(&delta.as_mem_batch(), strings, strings, &kept)
+        }
+        false => None,
+    };
+    let mut cache = BlobCache::new(rows);
+
+    for (pi, col) in d_schema.payload_columns() {
+        let src = delta.col_data(pi);
+        let (dst, _, dst_blob) = out.col_null_and_blob_mut(d_first + pi);
+        if !col.type_code.is_german_string() {
+            width_dispatch!(col.size() as usize, copy_runs, src, dst, pairs);
+            continue;
+        }
+        let mut at = 0;
+        for p in pairs {
+            let (run, end) = (p.delta_rows(), at + p.len());
+            copy_string_cells(
+                &mut dst[at * 16..end * 16],
+                &src[run.start * 16..run.end * 16],
+                delta.blob(),
+                dst_blob,
+                heap_at,
+                &mut cache,
+            );
+            at = end;
+        }
+    }
+
+    for (pi, col) in cursor.schema.payload_columns() {
+        let (dst, _, dst_blob) = out.col_null_and_blob_mut(t_first + pi);
+        if !col.type_code.is_german_string() {
+            width_dispatch!(col.size() as usize, repeat_cells, cursor, pi, dst, pairs);
+            continue;
+        }
+        // One relocation per trace row, whatever its fan-out.
+        let mut cells = dst.as_chunks_mut::<16>().0.iter_mut();
+        for p in pairs {
+            let (t_src, t_row) = trace_row(p);
+            let cell = relocate_german_string_vec(
+                t_src.get_col_ptr(t_row, pi, 16),
+                t_src.blob(),
+                dst_blob,
+                Some(&mut cache),
+            );
+            cells.by_ref().take(p.len()).for_each(|c| *c = cell);
+        }
+    }
+
+    if any_ghost {
+        // A weight product that wrapped to zero is not a Z-set element.
+        let live = runs_where(rows, |row| out.get_weight(row) != 0);
+        return Batch::from_ranges(&out, &live, 0);
+    }
+    out
+}
+
+/// Each pairing's delta run of `width`-byte cells, copied out of `src` onto
+/// `dst` back to back.
+#[inline(always)]
+fn copy_runs<const N: usize>(src: &[u8], dst: &mut [u8], pairs: &[Pairing], width: usize) {
+    // `N = 0` is the runtime width a compound PK stride takes.
+    let w = if N == 0 { width } else { N };
+    let mut at = 0usize;
+    for p in pairs {
+        let (rs, n) = (p.rs as usize, p.len());
+        if n == 1 && N != 0 {
+            // A constant width keeps the one-row run a load and a store.
+            let cell: [u8; N] = src[rs * N..rs * N + N].try_into().unwrap();
+            dst[at * N..at * N + N].copy_from_slice(&cell);
+        } else {
+            dst[at * w..(at + n) * w].copy_from_slice(&src[rs * w..(rs + n) * w]);
+        }
+        at += n;
+    }
+}
+
+/// Each pairing's trace cell of payload column `pi`, written once per row of its
+/// delta run.
+#[inline(always)]
+fn repeat_cells<const N: usize>(cursor: &ReadCursor, pi: usize, dst: &mut [u8], pairs: &[Pairing], width: usize) {
+    assert!(N != 0, "a payload column is 1, 2, 4, 8 or 16 bytes, not {width}");
+    let mut cells = dst.as_chunks_mut::<N>().0.iter_mut();
+    for p in pairs {
+        let src = cursor.source_at(p.src as usize);
+        let cell: [u8; N] = src.get_col_ptr(p.row as usize, pi, N).try_into().unwrap();
+        cells.by_ref().take(p.len()).for_each(|c| *c = cell);
+    }
 }
 
 // ---------------------------------------------------------------------------

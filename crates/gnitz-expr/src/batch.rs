@@ -1596,47 +1596,6 @@ fn str_cmp<A: Cells, B: Cells>(
 // eval_batch — single morsel
 // ---------------------------------------------------------------------------
 
-/// `$body` once per [`FixedInt`] variant, with `$c` that variant as a `const`,
-/// so a width or codec call on it is a literal inside the row loop.
-macro_rules! for_each_fixed_int {
-    ($fi:expr, |$c:ident| $body:block) => {
-        match $fi {
-            FixedInt::U8 => {
-                const $c: FixedInt = FixedInt::U8;
-                $body
-            }
-            FixedInt::I8 => {
-                const $c: FixedInt = FixedInt::I8;
-                $body
-            }
-            FixedInt::U16 => {
-                const $c: FixedInt = FixedInt::U16;
-                $body
-            }
-            FixedInt::I16 => {
-                const $c: FixedInt = FixedInt::I16;
-                $body
-            }
-            FixedInt::U32 => {
-                const $c: FixedInt = FixedInt::U32;
-                $body
-            }
-            FixedInt::I32 => {
-                const $c: FixedInt = FixedInt::I32;
-                $body
-            }
-            FixedInt::U64 => {
-                const $c: FixedInt = FixedInt::U64;
-                $body
-            }
-            FixedInt::I64 => {
-                const $c: FixedInt = FixedInt::I64;
-                $body
-            }
-        }
-    };
-}
-
 /// Decode PK column `fi` at byte `off` of each of the morsel's rows into register
 /// `dst`, undoing the OPK encoding.
 fn load_pk(
@@ -1649,7 +1608,7 @@ fn load_pk(
 ) {
     let rows = &pk[mo.start * stride..(mo.start + mo.m) * stride];
     let dst_reg = scratch.reg_mut(dst, mo.m);
-    for_each_fixed_int!(fi, |FI| {
+    gnitz_wire::for_each_fixed_int!(fi, |FI| {
         const W: usize = FI.width();
         assert!(off + W <= stride, "a PK column lies inside the PK");
         // A single-column PK is a fixed-stride array.
@@ -1705,7 +1664,7 @@ pub(crate) fn eval_batch(
             Instr::LoadPayloadInt { pi, fi } => {
                 let col_data = mb.col_data(pi as usize, fi.width());
                 let dst_reg = scratch.reg_mut(dst, m);
-                for_each_fixed_int!(fi, |FI| {
+                gnitz_wire::for_each_fixed_int!(fi, |FI| {
                     const W: usize = FI.width();
                     let b = &col_data[morsel_start * W..(morsel_start + m) * W];
                     for (r, c) in dst_reg.iter_mut().zip(b.as_chunks::<W>().0) {

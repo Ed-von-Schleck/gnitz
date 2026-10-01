@@ -213,7 +213,7 @@ fn write_span_reference(
 /// Over a compound PK, so an indexed PK column sits at a non-zero byte offset,
 /// and a nullable payload column indexed leading and trailing: `write_span`
 /// writes the reference span and skips exactly the row NULL in an indexed
-/// column, and `write_entry` appends the row's own OPK PK to it.
+/// column.
 #[test]
 fn write_span_matches_the_reference_on_compound_null_and_entry_shapes() {
     let src = SchemaDescriptor::new(
@@ -259,17 +259,6 @@ fn write_span_matches_the_reference_on_compound_null_and_entry_shapes() {
                 written.then(|| &span[..spec.key_size()]),
                 "{cols:?} row={row}"
             );
-
-            let mut entry = [0u8; MAX_PK_BYTES];
-            assert_eq!(spec.write_entry(&mb, row, &mut entry), written);
-            if written {
-                let (e_span, e_pk) = spec.split_entry(&entry[..spec.key_size() + stride]);
-                assert_eq!(
-                    (e_span, e_pk),
-                    (&span[..spec.key_size()], mb.get_pk_bytes(row)),
-                    "{cols:?} row={row}"
-                );
-            }
         }
     }
 }
@@ -306,7 +295,7 @@ fn index_spans_equal_the_seek_prefix_and_sort_as_the_values() {
                 let b = bb.finish();
                 let spec = KeySpec::new(&[c], &src).unwrap();
                 let mut entry = [0u8; MAX_PK_BYTES];
-                assert!(spec.write_entry(&b.as_mem_batch(), 0, &mut entry));
+                assert!(spec.write_span(&b.as_mem_batch(), 0, &mut entry));
                 assert_eq!(&entry[..spec.key_size()], seek.pk_bytes(), "{t} {native:#x}");
             }
             if let Some(p) = &prev {

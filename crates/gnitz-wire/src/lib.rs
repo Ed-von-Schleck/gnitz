@@ -25,6 +25,48 @@
 #[cfg(not(target_endian = "little"))]
 compile_error!("GnitzDB requires a little-endian target; the wire format is LE-only.");
 
+/// `$body` once per [`FixedInt`] variant, with `$c` that variant as a `const`,
+/// so a width or codec call on it is a literal inside the row loop.
+#[macro_export]
+macro_rules! for_each_fixed_int {
+    ($fi:expr, |$c:ident| $body:block) => {
+        match $fi {
+            $crate::FixedInt::U8 => {
+                const $c: $crate::FixedInt = $crate::FixedInt::U8;
+                $body
+            }
+            $crate::FixedInt::I8 => {
+                const $c: $crate::FixedInt = $crate::FixedInt::I8;
+                $body
+            }
+            $crate::FixedInt::U16 => {
+                const $c: $crate::FixedInt = $crate::FixedInt::U16;
+                $body
+            }
+            $crate::FixedInt::I16 => {
+                const $c: $crate::FixedInt = $crate::FixedInt::I16;
+                $body
+            }
+            $crate::FixedInt::U32 => {
+                const $c: $crate::FixedInt = $crate::FixedInt::U32;
+                $body
+            }
+            $crate::FixedInt::I32 => {
+                const $c: $crate::FixedInt = $crate::FixedInt::I32;
+                $body
+            }
+            $crate::FixedInt::U64 => {
+                const $c: $crate::FixedInt = $crate::FixedInt::U64;
+                $body
+            }
+            $crate::FixedInt::I64 => {
+                const $c: $crate::FixedInt = $crate::FixedInt::I64;
+                $body
+            }
+        }
+    };
+}
+
 /// Declare a **wire enum**: a closed set of values crossing the wire, with the
 /// total encode and partial decode every such set needs.
 ///

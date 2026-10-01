@@ -35,18 +35,34 @@ pub struct ChildAddr<'a> {
     pub slot: Slot,
 }
 
+impl ChildKind<'_> {
+    /// What a child directory's name carries ahead of its slot; none for the
+    /// relation's own rows.
+    fn prefix(&self) -> Option<String> {
+        match self {
+            ChildKind::Rows => None,
+            ChildKind::Scratch(child) => Some(format!("scratch_{child}")),
+            ChildKind::Delta => Some("delta".to_string()),
+            ChildKind::Index(cols) => {
+                let list: Vec<String> = cols.as_slice().iter().map(u32::to_string).collect();
+                Some(format!("idx_{}", list.join("-")))
+            }
+        }
+    }
+
+    /// The kind's name in a report that sums a store over its slots.
+    pub(super) fn label(&self) -> String {
+        self.prefix().unwrap_or_else(|| "rows".to_string())
+    }
+}
+
 impl<'a> ChildAddr<'a> {
     /// The directory name, relative to the relation's directory.
     fn name(&self) -> String {
         let Slot { rank, of } = self.slot;
-        match self.kind {
-            ChildKind::Rows => format!("w{rank}of{of}"),
-            ChildKind::Scratch(child) => format!("scratch_{child}_w{rank}of{of}"),
-            ChildKind::Delta => format!("delta_w{rank}of{of}"),
-            ChildKind::Index(cols) => {
-                let list: Vec<String> = cols.as_slice().iter().map(u32::to_string).collect();
-                format!("idx_{}_w{rank}of{of}", list.join("-"))
-            }
+        match self.kind.prefix() {
+            None => format!("w{rank}of{of}"),
+            Some(prefix) => format!("{prefix}_w{rank}of{of}"),
         }
     }
 
@@ -167,7 +183,7 @@ pub fn relation_dir(base_dir: &str, id: u64) -> String {
 
 /// The relation id `name` denotes, or `None` unless [`relation_dir`] gives that
 /// id exactly this name.
-fn parse_relation_dir_name(name: &str) -> Option<u64> {
+pub(super) fn parse_relation_dir_name(name: &str) -> Option<u64> {
     name.parse().ok().filter(|id: &u64| id.to_string() == name)
 }
 

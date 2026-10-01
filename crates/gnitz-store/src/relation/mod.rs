@@ -19,6 +19,7 @@ mod build;
 mod circuit_state;
 mod delta;
 mod dirs;
+mod disk_usage;
 mod ingest;
 mod repartition;
 mod store;
@@ -29,6 +30,7 @@ pub use circuit_state::{CircuitState, StateIdx, StateLayout};
 pub(crate) use delta::{delta_round, delta_round_prefix};
 pub(crate) use dirs::ensure_dir;
 pub use dirs::{lock_data_dir, relation_dir, relations_dir, ChildAddr, ChildKind, DirLock};
+pub use disk_usage::{disk_usage, DiskUsage};
 pub(crate) use store::Store;
 
 // ---------------------------------------------------------------------------

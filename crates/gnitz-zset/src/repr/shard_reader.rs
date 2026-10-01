@@ -33,6 +33,9 @@ pub(crate) enum PayloadRegion {
     /// (its null bit comes from `null_pad_mask`).
     Mapped(ColPtr),
     Packed(PackedRegion),
+    /// An [`Encoding::Dict`] region of the mapping: a per-row read answers out
+    /// of the dictionary in place, a bulk read decodes its own window.
+    Dict(DictImage<'static>),
 }
 
 /// What every row of a column the file predates reads.
@@ -79,13 +82,54 @@ pub struct MappedShard {
     shard_filter: Option<*const [u8]>,
 }
 
+/// A shard's header and directory, read under no schema.
+pub struct ShardDirectory {
+    pub rows: usize,
+    pub skeleton: bool,
+    /// The digest the writer recorded over the body: two shards of one length
+    /// that agree on it hold the same regions.
+    pub body_checksum: u64,
+    /// Each directory entry's role, encoding name and stored bytes.
+    pub regions: Vec<(String, &'static str, usize)>,
+}
+
+impl ShardDirectory {
+    /// The directory of the shard at `path`, checked as [`MappedShard::open`]
+    /// checks it.
+    pub fn read(path: &str) -> Result<Self, StorageError> {
+        let (mmap, header) = MappedShard::map(path)?;
+        let spans = region_spans(mmap.as_slice(), header.file_npc)?;
+        let regions = spans
+            .iter()
+            .enumerate()
+            .map(|(i, span)| {
+                let role = match i {
+                    REG_PK => "pk".to_string(),
+                    REG_WEIGHT => "weight".to_string(),
+                    REG_NULL_BMP => "null".to_string(),
+                    _ if i == spans.len() - 2 => "blob".to_string(),
+                    _ if i == spans.len() - 1 => "filter".to_string(),
+                    _ => format!("p{}", i - REG_PAYLOAD_START),
+                };
+                (role, span.encoding.name(), span.size)
+            })
+            .collect();
+        Ok(ShardDirectory {
+            rows: header.row_count,
+            skeleton: header.skeleton,
+            body_checksum: header.body_checksum,
+            regions,
+        })
+    }
+}
+
 /// A Raw (`count` elements) or Constant (one element, stride 0) region of
 /// `width`-byte elements.
 fn direct_region(data: &[u8], span: &Span, count: usize, width: usize) -> Result<ColPtr, StorageError> {
     let (stride, size) = match span.encoding {
         Encoding::Raw => (width, count * width),
         Encoding::Constant => (0, width),
-        Encoding::TwoValue | Encoding::For => return Err(Corrupt("encoding")),
+        Encoding::TwoValue | Encoding::For | Encoding::Dict => return Err(Corrupt("encoding")),
     };
     if span.size != size {
         return Err(Corrupt("region size"));
@@ -112,12 +156,19 @@ impl MappedShard {
     }
 
     pub fn open(path: &str, schema: &SchemaDescriptor) -> Result<Self, StorageError> {
+        let (mmap, header) = Self::map(path)?;
+        mmap.advise_hugepage();
+        Self::bind(Rc::new(mmap), header, schema)
+    }
+
+    /// The file at `path` mapped, and its header, once its descriptive prefix
+    /// matches the digest stamped over it.
+    fn map(path: &str) -> Result<(Mmap, ShardHeader), StorageError> {
         let file = std::fs::File::open(path)?;
         if file.metadata()?.len() == 0 {
             return Err(Corrupt("empty file"));
         }
         let mmap = Mmap::from_file(&file)?;
-        mmap.advise_hugepage();
         let data = mmap.as_slice();
         let header = ShardHeader::read(data)?;
         let prefix = data
@@ -126,7 +177,7 @@ impl MappedShard {
         if desc_digest(path, prefix) != read_u64_le(prefix, OFF_DESC_CHECKSUM) {
             return Err(Corrupt("descriptor digest"));
         }
-        Self::bind(Rc::new(mmap), header, schema)
+        Ok((mmap, header))
     }
 
     /// This shard's mapping bound to `schema`, with no file I/O.
@@ -164,6 +215,17 @@ impl MappedShard {
                     return Ok(PayloadRegion::Mapped(ColPtr { base: ZERO_CELL.as_ptr(), stride: 0 }));
                 }
                 let span = &spans[REG_PAYLOAD_START + pi];
+                if span.encoding == Encoding::Dict {
+                    if !col.type_code.is_german_string() {
+                        return Err(Corrupt("encoding"));
+                    }
+                    // SAFETY: the image lies in the mapping `mmap` keeps alive,
+                    // and every read of the region borrows this handle.
+                    let image: &'static [u8] = unsafe { &*(span.bytes(data) as *const [u8]) };
+                    return DictImage::parse(image, count)
+                        .map(PayloadRegion::Dict)
+                        .ok_or(Corrupt("region size"));
+                }
                 if span.encoding != Encoding::For {
                     return direct_region(data, span, count, width).map(PayloadRegion::Mapped);
                 }
@@ -259,7 +321,7 @@ impl MappedShard {
     fn decoded_blocks(&self, pi: usize) -> usize {
         match &self.col_regions[pi] {
             PayloadRegion::Packed(p) => p.blocks.iter().filter(|b| b.get().is_some()).count(),
-            PayloadRegion::Mapped(_) => 0,
+            PayloadRegion::Mapped(_) | PayloadRegion::Dict(_) => 0,
         }
     }
 
@@ -354,6 +416,16 @@ impl MappedShard {
                         for_decode(self.mapped(p.image), p.bw, p.elem_width, start, w.col_bufs[pi]);
                         continue;
                     }
+                    PayloadRegion::Dict(d) => {
+                        if relocate {
+                            for i in 0..row_count {
+                                w.write_string_cell(pi, d.cell(start + i), blob, None, i);
+                            }
+                        } else {
+                            d.decode(start, w.col_bufs[pi]);
+                        }
+                        continue;
+                    }
                 };
                 if relocate && col.type_code.is_german_string() {
                     for i in 0..row_count {
@@ -394,6 +466,7 @@ impl RowSource for MappedShard {
         match &self.col_regions[payload_col] {
             PayloadRegion::Mapped(cp) => unsafe { cp.row(row, col_size) },
             PayloadRegion::Packed(p) => self.packed_cell(p, row, col_size),
+            PayloadRegion::Dict(d) => &d.cell(row)[..col_size],
         }
     }
 
@@ -432,6 +505,15 @@ impl ColumnarSource for MappedShard {
                         ColPtr {
                             base: decoded.hold(column).wrapping_sub(window.start * w),
                             stride: w,
+                        }
+                    }
+                    PayloadRegion::Dict(d) => {
+                        // SAFETY: `decode` writes every cell of `column`.
+                        let mut column = unsafe { acquire_uninit(window.len() * 16) };
+                        d.decode(window.start, &mut column);
+                        ColPtr {
+                            base: decoded.hold(column).wrapping_sub(window.start * 16),
+                            stride: 16,
                         }
                     }
                 }),

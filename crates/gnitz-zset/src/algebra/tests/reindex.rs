@@ -484,21 +484,120 @@ fn reindex_pack_bench() {
     }
 }
 
-/// Each nonzero-weight source row projects to exactly its `write_entry` key at
-/// its own weight, retractions included; a weight-0 row projects to nothing.
+/// Over a compound PK and a nullable indexed column of every indexable width:
+/// the projection holds exactly the rows `write_span` admits, each as its span
+/// followed by its own PK, in source order.
 #[test]
-fn index_entries_writes_each_entry_at_its_rows_weight() {
-    let owner = crate::test_support::make_schema_u64_i64();
-    let (spec, idx_schema) = crate::schema::index_spec_and_schema(&[1], &owner).unwrap();
-    let src = crate::test_support::make_batch_raw(&owner, &[(1, 1, 10), (2, 0, 20), (3, -1, 30)]);
-    let entry = |row: usize| {
-        let mut e = vec![0u8; idx_schema.pk_stride()];
-        assert!(spec.write_entry(&src.as_mem_batch(), row, &mut e));
-        e
-    };
-    let projected = index_entries(&src, &spec, &idx_schema);
-    let got: Vec<(Vec<u8>, i64)> = (0..projected.len())
-        .map(|r| (projected.get_pk_bytes(r).to_vec(), projected.get_weight(r)))
-        .collect();
-    assert_eq!(got, [(entry(0), 1), (entry(2), -1)]);
+fn index_entries_are_each_admitted_rows_span_and_pk() {
+    use crate::repr::BatchBuilder;
+    use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
+    let mut rng = crate::test_support::Rng::new(0x1dc5);
+    for tc in [
+        TypeCode::U8,
+        TypeCode::I16,
+        TypeCode::U32,
+        TypeCode::I64,
+        TypeCode::U128,
+    ] {
+        let cols = [
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(tc, true),
+            SchemaColumn::new(TypeCode::I32, false),
+        ];
+        let owner = SchemaDescriptor::new(&cols, &[0, 1]);
+        let width = cols[2].size() as usize;
+        let mut b = BatchBuilder::new(&owner);
+        for row in 0..300u64 {
+            // Runs of live rows broken by ghosts and by NULLs.
+            let weight = [1, 1, 1, 0, -2, 1][(row % 6) as usize];
+            b.begin_row_opk(&[row as u128, rng.next_u64() as u128], weight);
+            let v = rng.gen_u128();
+            match rng.gen_range(5) {
+                0 => b.put_null(),
+                _ if width == 16 => b.put_int(v),
+                _ => b.put_int(v & ((1u128 << (8 * width)) - 1)),
+            }
+            b.put_int(row as u128);
+            b.end_row();
+        }
+        let src = b.finish();
+        let mb = src.as_mem_batch();
+        for indexed in [&[2u32][..], &[2, 3], &[1, 2]] {
+            let (spec, idx_schema) = crate::schema::index_spec_and_schema(indexed, &owner).unwrap();
+            let mut want: Vec<(Vec<u8>, i64)> = Vec::new();
+            for row in 0..src.len() {
+                let mut e = [0u8; MAX_PK_BYTES];
+                if src.get_weight(row) != 0 && spec.write_span(&mb, row, &mut e) {
+                    let mut e = e[..spec.key_size()].to_vec();
+                    e.extend_from_slice(src.get_pk_bytes(row));
+                    want.push((e, src.get_weight(row)));
+                }
+            }
+            let got = index_entries(&src, &spec, &idx_schema);
+            let got: Vec<(Vec<u8>, i64)> = (0..got.len())
+                .map(|r| (got.get_pk_bytes(r).to_vec(), got.get_weight(r)))
+                .collect();
+            assert_eq!(got, want, "{tc} indexed on {indexed:?}");
+        }
+    }
+}
+
+/// A nullable group key packs the same bytes a column at a time as a row at a
+/// time, at every integer width, signed and unsigned.
+#[test]
+fn a_nullable_group_key_packs_by_column_as_by_row() {
+    use crate::repr::BatchBuilder;
+    use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
+    let tcs = [
+        TypeCode::U8,
+        TypeCode::I8,
+        TypeCode::U16,
+        TypeCode::I16,
+        TypeCode::U32,
+        TypeCode::I32,
+        TypeCode::U64,
+        TypeCode::I64,
+        TypeCode::U128,
+        TypeCode::I128,
+    ];
+    let mut rng = crate::test_support::Rng::new(0xb17);
+    for pair in tcs.windows(2) {
+        for nullable in [[true, true], [true, false], [false, true]] {
+            let cols = [
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(pair[0], nullable[0]),
+                SchemaColumn::new(pair[1], nullable[1]),
+            ];
+            let schema = SchemaDescriptor::new(&cols, &[0]);
+            const N: usize = 700;
+            let mut b = BatchBuilder::new(&schema);
+            for row in 0..N {
+                b.begin_row(row as u128, 1);
+                for (col, nullable) in cols[1..].iter().zip(nullable) {
+                    let v = rng.gen_u128();
+                    let w = col.size() as usize;
+                    match nullable && rng.gen_range(4) == 0 {
+                        true => b.put_null(),
+                        false if w == 16 => b.put_int(v),
+                        false => b.put_int(v & ((1u128 << (8 * w)) - 1)),
+                    }
+                }
+                b.end_row();
+            }
+            let batch = b.finish();
+            let mb = batch.as_mem_batch();
+            let (packer, _) = ReindexPacker::new_group_key(&schema, &[1, 2], &[]).unwrap();
+            assert!(packer.has_bitmap && packer.packs_by_column());
+            // Wider than the key, as an index entry's slot is.
+            let stride = packer.out_stride + 3;
+            let mut by_col = vec![0xEEu8; N * stride];
+            packer.pack_rows(&mut by_col, stride, &mb, 0, N);
+            for (row, key) in by_col.chunks_exact(stride).enumerate() {
+                let mut by_row = [0u8; MAX_PK_BYTES];
+                let want = packer.pack_prefix(&mut by_row, &mb, row);
+                assert_eq!(&key[..packer.out_stride], want, "{pair:?} {nullable:?} row {row}");
+            }
+        }
+    }
 }

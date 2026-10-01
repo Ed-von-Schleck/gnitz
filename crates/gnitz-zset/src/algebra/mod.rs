@@ -39,8 +39,8 @@ pub use map::MapPlan;
 pub use reindex::index_entries;
 pub use sink::SinkPlan;
 
-pub(crate) use aggregate::{emit_reduce_row, Accumulator, ExtremeSpec, ReduceShape};
-pub(crate) use group_key::{ground_pk, GroupOutKey};
+pub(crate) use aggregate::{emit_reduce_row, Accumulator, ExtremeSpec, GroupedState, ReduceShape};
+pub(crate) use group_key::{ground_pk, GroupOrdinals, GroupOutKey};
 pub(crate) use order_image::{
     append_image, has_fixed_image, image_slot_col, int16_image, scalar_image, write_image_slot, ImageKind, WideKind,
     IMAGE_COL,

@@ -413,19 +413,8 @@ impl KeySpec {
         true
     }
 
-    /// One row's index entry `[span ‖ src_pk]` in `dst[..key_size() + pk_stride]`,
-    /// or `false` where [`Self::write_span`] returns `false`.
-    pub(crate) fn write_entry(&self, mb: &impl RowSource, row: usize, dst: &mut [u8]) -> bool {
-        if !self.write_span(mb, row, dst) {
-            return false;
-        }
-        let pk = mb.get_pk_bytes(row);
-        dst[self.key_size()..self.key_size() + pk.len()].copy_from_slice(pk);
-        true
-    }
-
-    /// Split a stored index entry back into `(span, source PK)` — the read-side
-    /// inverse of [`Self::write_entry`], which put the PK at `key_size()`. The
+    /// Split a stored index entry back into `(span, source PK)`: an entry is the
+    /// span followed by the source PK, which therefore sits at `key_size()`. The
     /// split is exact by layout (an index schema is the promoted indexed columns
     /// followed by the source PK columns, so its stride is `key_size() +
     /// src_pk_stride`), so nothing is decoded.

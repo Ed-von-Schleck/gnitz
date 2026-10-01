@@ -189,26 +189,6 @@ pub struct MapPlan {
     out_schema: SchemaDescriptor,
 }
 
-/// The `[start, end)` runs of `batch`'s rows with no bit of `mask` set.
-fn key_defined_runs(batch: &Batch, mask: u64) -> Vec<(usize, usize)> {
-    let words = batch.null_bmp_data().as_chunks::<8>().0;
-    // A batch with no NULL key takes only this branch-free pass.
-    if words.iter().fold(0u64, |a, w| a | u64::from_le_bytes(*w)) & mask == 0 {
-        return vec![(0, batch.count)];
-    }
-    let defined: Vec<u64> = words
-        .chunks(64)
-        .map(|block| {
-            block.iter().enumerate().fold(0, |bits, (i, w)| {
-                bits | u64::from(u64::from_le_bytes(*w) & mask == 0) << i
-            })
-        })
-        .collect();
-    let mut runs = Vec::new();
-    gnitz_expr::scan_filter_bits(&defined, batch.count, &mut runs);
-    runs
-}
-
 /// Set every row's PK to the [`FoldCols`] digest of its payload columns, so equal
 /// rows share a PK. Two distinct rows whose 128-bit digests collide become one
 /// element; accepted, not checked.
@@ -386,7 +366,7 @@ impl MapPlan {
         let ranges: &[(usize, usize)] = match self.null_key_mask {
             0 => &whole,
             mask => {
-                runs = key_defined_runs(in_batch, mask);
+                runs = in_batch.runs_without_nulls(mask);
                 &runs
             }
         };
@@ -432,11 +412,7 @@ impl MapPlan {
         );
 
         let blob_cap = crate::repr::prorated_blob_cap(src.blob().len(), src.count, total);
-        let old = out.count;
-        out.reserve_rows(total);
-        // Publish the new rows up front: the `*_mut` accessors are `count`-bounded,
-        // so `[old, old + total)` must be inside `count` before any write.
-        out.count = old + total;
+        let old = out.grow_rows(total);
 
         let mut cache = BlobCache::new(total);
         // For relocated copies and string emits alike.

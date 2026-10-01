@@ -339,6 +339,20 @@ impl ReadCursor {
         (&self.sources[self.current_entry_idx], self.current_row)
     }
 
+    /// The current row as `(source index, row)`: with [`Self::source_at`], a
+    /// handle on the row that stays readable after the cursor moves on.
+    #[inline]
+    pub(crate) fn current_position(&self) -> (usize, usize) {
+        debug_assert!(self.valid, "current_position on an invalid cursor");
+        (self.current_entry_idx, self.current_row)
+    }
+
+    /// The source [`Self::current_position`] indexes.
+    #[inline(always)]
+    pub(crate) fn source_at(&self, idx: usize) -> &Run {
+        &self.sources[idx]
+    }
+
     /// The current row's PK as its native scalar value. Only narrow
     /// (`pk_stride ≤ 16`) relations have one; panics above that width.
     #[inline]

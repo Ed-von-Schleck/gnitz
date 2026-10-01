@@ -4,7 +4,8 @@
 //! carries each source row's own. [`scatter_unified_sources`] takes it from the
 //! caller's `(src, row, weight)` triple: a `UnifiedSource` has no weight region,
 //! so the triple is the only channel for a merge fold's net weight — which is
-//! not any one source row's weight.
+//! not any one source row's weight. [`gather_rows`] takes the same triples and
+//! reads each cell through its source, for picks sparse in their sources.
 
 use std::ops::Range;
 
@@ -31,6 +32,7 @@ macro_rules! width_dispatch {
         }
     }};
 }
+pub(crate) use width_dispatch;
 
 /// Copy the rows `indices` names, in the order given, each carrying its own
 /// weight. A caller supplying its own weights wants [`scatter_unified_sources`].
@@ -219,6 +221,69 @@ fn gather_unified_col<const N: usize>(
         let src = unsafe { sources.get_unchecked(si as usize) };
         let ptr = unsafe { cols.get_unchecked(src.cols_off + pi).row_ptr(ri as usize) };
         unsafe { std::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr().add(out * N), N) };
+    }
+}
+
+/// Copy the rows `picks` names out of `sources`, in the order given, each at
+/// the weight its triple carries, into a fresh batch claiming no layout.
+///
+/// Every cell is read through its source's row accessor, so a packed shard
+/// column decodes only the blocks the picks land in: the kernel for picks
+/// sparse in their sources, where [`UnifiedSet`] would decode whole windows.
+pub(crate) fn gather_rows(
+    sources: &[impl ColumnarSource],
+    schema: &SchemaDescriptor,
+    picks: &[(u32, u32, i64)],
+) -> Batch {
+    write_to_batch(schema, picks.len(), 0, |w| {
+        width_dispatch!(schema.pk_stride(), gather_pk_wt_nbm, sources, picks, w);
+        for (pi, col) in schema.payload_columns() {
+            if col.type_code.is_german_string() {
+                for (out, &(si, ri, _)) in picks.iter().enumerate() {
+                    let s = &sources[si as usize];
+                    w.write_string_cell_plain(pi, s.get_col_ptr(ri as usize, pi, 16), s.blob(), out);
+                }
+            } else {
+                let dst = &mut w.col_bufs[pi][..];
+                width_dispatch!(col.size() as usize, gather_cells, sources, picks, pi, dst);
+            }
+        }
+        w.count = picks.len();
+    })
+}
+
+#[inline(always)]
+fn gather_pk_wt_nbm<const PKS: usize>(
+    sources: &[impl ColumnarSource],
+    picks: &[(u32, u32, i64)],
+    w: &mut DirectWriter<'_>,
+    width: usize,
+) {
+    let pks = if PKS == 0 { width } else { PKS };
+    let keep = gnitz_wire::low_bits_mask(w.schema.num_payload_cols());
+    let weights = w.weight.as_chunks_mut::<8>().0.iter_mut();
+    let nulls = w.null_bmp.as_chunks_mut::<8>().0.iter_mut();
+    let pk = w.pk.chunks_exact_mut(pks);
+    for (((&(si, ri, weight), pk), wt), nb) in picks.iter().zip(pk).zip(weights).zip(nulls) {
+        debug_assert_ne!(weight, 0, "gather_rows: zero-weight row (filter before gather)");
+        let s = &sources[si as usize];
+        pk.copy_from_slice(&s.get_pk_bytes(ri as usize)[..pks]);
+        *wt = weight.to_le_bytes();
+        *nb = (s.get_null_word(ri as usize) & keep).to_le_bytes();
+    }
+}
+
+#[inline(always)]
+fn gather_cells<const N: usize>(
+    sources: &[impl ColumnarSource],
+    picks: &[(u32, u32, i64)],
+    pi: usize,
+    dst: &mut [u8],
+    width: usize,
+) {
+    assert!(N != 0, "a payload column is 1, 2, 4, 8 or 16 bytes, not {width}");
+    for (&(si, ri, _), cell) in picks.iter().zip(dst.as_chunks_mut::<N>().0) {
+        *cell = sources[si as usize].get_col_ptr(ri as usize, pi, N).try_into().unwrap();
     }
 }
 

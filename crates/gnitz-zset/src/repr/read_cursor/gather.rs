@@ -8,6 +8,7 @@ use gnitz_wire::PkKeys;
 use super::{empty_cursor, from_runs_at, ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
 use crate::repr::run::Run;
+use crate::repr::scatter::gather_rows;
 use crate::schema::{project_schema, ColumnLocator, SchemaDescriptor, SchemaFacts};
 
 pub struct PkSetGather {
@@ -83,15 +84,17 @@ impl PkSetGather {
         if self.remaining_keys() == 0 {
             return None;
         }
-        let mut out = Batch::with_capacity(&self.cursor.schema, self.remaining_keys().min(max_rows));
         let split = self.cursor.any_skeleton;
+        let mut picks: Vec<(u32, u32, i64)> = Vec::with_capacity(self.remaining_keys().min(max_rows));
         let visited = self.for_each_live_row(max_rows, |c| {
             if split && c.current_is_skeleton() {
                 skeletons.push(c.current_pk_bytes(), c.current_weight);
             } else {
-                c.copy_current_row_into(&mut out, c.current_weight);
+                let (src, row) = c.current_position();
+                picks.push((src as u32, row as u32, c.current_weight));
             }
         });
+        let mut out = gather_rows(&self.cursor.sources, &self.cursor.schema, &picks);
         out.certify_consolidated();
         (visited > 0).then_some(out)
     }

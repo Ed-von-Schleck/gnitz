@@ -422,6 +422,20 @@ impl<'a> DirectWriter<'a> {
         rebase_string_cell(dst, src_struct, src_blob, self.blob, heap_at, &mut self.blob_cache);
     }
 
+    /// [`Self::write_string_cell`] relocating without the span dedup, whose
+    /// probe costs more than the copy it saves when spans rarely repeat.
+    #[inline]
+    pub(super) fn write_string_cell_plain(
+        &mut self,
+        payload_col: usize,
+        src_struct: &[u8],
+        src_blob: &[u8],
+        out_row: usize,
+    ) {
+        let cell = super::string_heap::relocate_german_string_vec(src_struct, src_blob, self.blob, None);
+        self.col_bufs[payload_col][out_row * 16..(out_row + 1) * 16].copy_from_slice(&cell);
+    }
+
     /// Carry a source heap whole onto the end of this writer's heap. Returns the
     /// base the caller shifts its copied cells' offsets by.
     pub(super) fn adopt_heap(&mut self, src_blob: &[u8]) -> usize {

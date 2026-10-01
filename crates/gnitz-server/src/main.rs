@@ -38,6 +38,7 @@ gnitz-server — GnitzDB database server
 
 Usage:
   gnitz-server [OPTIONS] <data_dir> <socket_path>
+  gnitz-server --disk-usage <data_dir>
 
 Arguments:
   <data_dir>      Path to the database data directory (created if absent)
@@ -69,6 +70,11 @@ Options:
                        loopback bind trusts every local UID (like the always-on
                        AF_UNIX socket), gated only by network reachability and
                        filesystem permissions.
+  --disk-usage         Start no server: print what <data_dir> holds on disk, by
+                       relation id, store and LSM level, with each shard
+                       region's share and the shards two stores hold byte for
+                       byte. Reads the files alone, so it also runs beside a
+                       live server.
   --help, -h           Show this help message and exit
 
 Environment:
@@ -177,6 +183,18 @@ fn main() {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print!("{HELP_TEXT}");
         process::exit(0);
+    }
+    if let [flag, data_dir] = &args[..] {
+        if flag == "--disk-usage" {
+            match gnitz_store::relation::disk_usage(data_dir) {
+                Ok(usage) => print!("{usage}"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            }
+            process::exit(0);
+        }
     }
     let env_level = env::var("GNITZ_LOG_LEVEL").ok();
     let args = parse_args(&args, env_level.as_deref()).unwrap_or_else(|e| {

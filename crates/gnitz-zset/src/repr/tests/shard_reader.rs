@@ -202,13 +202,16 @@ fn build(schema: SchemaDescriptor, n: usize, mut row: impl FnMut(&mut BatchBuild
 }
 
 fn shapes() -> Vec<Shape> {
-    use Encoding::{Constant, For, Raw, TwoValue};
+    use Encoding::{Constant, Dict, For, Raw, TwoValue};
     let u64_i64 = make_schema_u64_i64();
     let nullable_i64 = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
     let u64_i32 = u64_pk_schema(SchemaColumn::new(TypeCode::I32, false));
     let u128_i64 = make_schema_u128_i64();
     let all_pk = pk_only_schema(&[TypeCode::U64; 3]);
     let string = make_schema_pk_u64_payload_string();
+    let nullable_string = u64_pk_schema(SchemaColumn::new(TypeCode::String, true));
+    let str_col = SchemaColumn::new(TypeCode::String, false);
+    let two_strings = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false), str_col, str_col], &[0]);
     let for_i64 = |b: &mut BatchBuilder, i: usize| {
         b.begin_row(i as u128, 1);
         b.put_int((1_000_000 + (i % 300) as i64) as u128);
@@ -304,7 +307,80 @@ fn shapes() -> Vec<Shape> {
             }),
             reader: string,
             pack: true,
+            encodings: vec![(REG_PAYLOAD_START, Dict)],
+        },
+        Shape {
+            label: "strings, no value twice",
+            written: build(string, 24, |b, i| {
+                b.begin_row(i as u128, 1);
+                match i % 3 {
+                    0 => b.put_string(&format!("s{i}")),
+                    _ => b.put_string(&wide_string(i, 20 + i)),
+                }
+            }),
+            reader: string,
+            pack: false,
             encodings: vec![(REG_PAYLOAD_START, Raw)],
+        },
+        Shape {
+            label: "one long string in every row",
+            written: build(string, 9, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_string(&wide_string(0, 40));
+            }),
+            reader: string,
+            pack: false,
+            encodings: vec![(REG_PAYLOAD_START, Constant)],
+        },
+        // Too few rows for a dictionary to be the smaller image.
+        Shape {
+            label: "a repeated string in three rows",
+            written: build(string, 3, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_string(&wide_string(i / 2, 40));
+            }),
+            reader: string,
+            pack: false,
+            encodings: vec![(REG_PAYLOAD_START, Raw)],
+        },
+        Shape {
+            label: "dictionary of two-byte codes",
+            written: build(string, 1500, |b, i| {
+                b.begin_row(i as u128, 1);
+                match i % 400 {
+                    v if v % 2 == 0 => b.put_string(&format!("v{v}")),
+                    v => b.put_string(&wide_string(v, 13 + v % 50)),
+                }
+            }),
+            reader: string,
+            pack: false,
+            encodings: vec![(REG_PAYLOAD_START, Dict)],
+        },
+        Shape {
+            label: "nullable dictionary",
+            written: build(nullable_string, 60, |b, i| {
+                b.begin_row(i as u128, 1);
+                match i % 5 {
+                    0 => b.put_null(),
+                    v => b.put_string(&wide_string(v, 10 * v)),
+                }
+            }),
+            reader: nullable_string,
+            pack: false,
+            encodings: vec![(REG_NULL_BMP, Raw), (REG_PAYLOAD_START, Dict)],
+        },
+        // The second column's sample repeats nothing, so it is copied onto the
+        // heap the first one's dictionary is packed over.
+        Shape {
+            label: "a repeating string column beside a distinct one",
+            written: build(two_strings, 70, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_string(&wide_string(i % 4, 30));
+                b.put_string(&wide_string(i, 25));
+            }),
+            reader: two_strings,
+            pack: false,
+            encodings: vec![(REG_PAYLOAD_START, Dict), (REG_PAYLOAD_START + 1, Raw)],
         },
         Shape {
             label: "u128 pk across the u64 boundary",
@@ -375,6 +451,51 @@ fn every_shape_reads_back_through_every_surface() {
         let shard = MappedShard::open(&path, &s.reader).unwrap();
         assert_reads_as(s.label, &shard, &s.written.widened_with_nulls(&s.reader, false));
     }
+}
+
+/// The schema-free directory read agrees with the image on every shape, and
+/// refuses a prefix the digest does not cover.
+#[test]
+fn the_directory_reads_without_a_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    for (s, path) in written_shapes(dir.path()) {
+        let image = std::fs::read(&path).unwrap();
+        let d = ShardDirectory::read(&path).unwrap();
+        assert_eq!(d.rows, s.written.count, "{}", s.label);
+        assert!(!d.skeleton, "{}", s.label);
+        let npc = s.written.schema().num_payload_cols();
+        assert_eq!(d.regions.len(), num_regions(npc) + 1, "{}", s.label);
+        assert_eq!(
+            d.body_checksum,
+            gnitz_wire::checksum(&image[desc_len(npc)..]),
+            "{}",
+            s.label
+        );
+        let roles = ["pk", "weight", "null"].into_iter().map(String::from);
+        let roles = roles.chain((0..npc).map(|pi| format!("p{pi}")));
+        let want: Vec<(String, &str, usize)> = roles
+            .chain(["blob", "filter"].map(String::from))
+            .enumerate()
+            .map(|(i, role)| {
+                let (size, enc) = region_dir(&image, i);
+                (role, enc.name(), size)
+            })
+            .collect();
+        assert_eq!(d.regions, want, "{}", s.label);
+    }
+    let path = small_shard(dir.path(), 4, 1);
+    let mut image = std::fs::read(&path).unwrap();
+    patch_entry(&mut image, REG_PK, |e| e.size += 1);
+    std::fs::write(&path, &image).unwrap();
+    assert_eq!(
+        ShardDirectory::read(&path).err(),
+        Some(StorageError::Corrupt("descriptor digest"))
+    );
+    std::fs::write(&path, &image[..HEADER_SIZE + 3]).unwrap();
+    assert_eq!(
+        ShardDirectory::read(&path).err(),
+        Some(StorageError::Corrupt("shorter than its directory"))
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -492,6 +613,12 @@ fn an_encoding_a_role_may_not_carry_is_rejected() {
         (REG_NULL_BMP, Encoding::For as u8),
         (blob, Encoding::For as u8),
         (REG_PAYLOAD_START, Encoding::TwoValue as u8),
+        (REG_PK, Encoding::Dict as u8),
+        (REG_WEIGHT, Encoding::Dict as u8),
+        (REG_NULL_BMP, Encoding::Dict as u8),
+        // An integer column: only a string column may be a dictionary.
+        (REG_PAYLOAD_START, Encoding::Dict as u8),
+        (blob, Encoding::Dict as u8),
         (blob, Encoding::Constant as u8),
         (filter, Encoding::Constant as u8),
     ];
@@ -910,5 +1037,128 @@ fn for_point_touch_bench() {
         let (((), i), c) = cycles.measure(|| instructions.measure(read));
         let retained = settled_rss().saturating_sub(rss0);
         println!("{label}: {i} instructions, {c} cycles; {retained} bytes retained");
+    }
+}
+
+/// What one shard of each string shape costs on disk, to write and to read
+/// back. Per row: the file's bytes, then instructions to write it, to slice it
+/// whole and in 1024-row windows, to read every string cell through the per-row
+/// accessor, and to materialize it through a `UnifiedSet` as a compaction does.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn shard_string_footprint_bench() {
+    use crate::test_support::Rng;
+    use gnitz_foundation::perf::Counter;
+    use std::hint::black_box;
+    const N: usize = 200_000;
+    let str_col = SchemaColumn::new(TypeCode::String, false);
+    let events = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            str_col,
+            str_col,
+            str_col,
+            str_col,
+            SchemaColumn::new(TypeCode::I64, false),
+        ],
+        &[0],
+    );
+    let one_string = make_schema_pk_u64_payload_string();
+
+    let tenants: Vec<String> = (0..50).map(|i| format!("tenant-{i:03}")).collect();
+    let urls: Vec<String> = (0..2_000)
+        .map(|i| format!("https://app.example.com/api/v2/resources/{:09}/items/{i:05}", i * 7919))
+        .collect();
+    let agents: Vec<String> = (0..30)
+        .map(|i| format!("Mozilla/5.0 (X11; Linux x86_64; rv:{i}.0) Gecko/20100101 Firefox/{i}.0 build-{i:04}"))
+        .collect();
+    let statuses = ["ok", "ok", "ok", "client_error", "server_error_upstream_timeout"];
+
+    let mut rng = Rng::new(7);
+    let mut pick = |n: usize| rng.gen_range(n as u64) as usize;
+    let shapes: Vec<(&str, Batch)> = vec![
+        (
+            "four repeating columns (50 inline, 2000 long, 30 long, 3 mixed) and an i64",
+            build(events, N, |b, i| {
+                b.begin_row(i as u128 + 1, 1);
+                b.put_string(&tenants[pick(50)]);
+                b.put_string(&urls[pick(2_000)]);
+                b.put_string(&agents[pick(30)]);
+                b.put_string(statuses[pick(5)]);
+                b.put_int(pick(1000) as u128);
+            }),
+        ),
+        (
+            "one column, distinct 60-byte values",
+            build(one_string, N, |b, i| {
+                b.begin_row(i as u128 + 1, 1);
+                b.put_string(&wide_string(i, 60));
+            }),
+        ),
+        (
+            "one column, distinct inline values",
+            build(one_string, N, |b, i| {
+                b.begin_row(i as u128 + 1, 1);
+                b.put_string(&format!("r{i:09}"));
+            }),
+        ),
+        (
+            "one column, 60-byte values drawn from N/2",
+            build(one_string, N, |b, i| {
+                b.begin_row(i as u128 + 1, 1);
+                b.put_string(&wide_string(pick(N / 2), 60));
+            }),
+        ),
+    ];
+
+    let instructions = Counter::instructions().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    for (si, (label, batch)) in shapes.iter().enumerate() {
+        let schema = *batch.schema();
+        let name = format!("{si}.db");
+        let (path, write_i) = instructions.measure(|| write(dir.path(), &name, batch, false));
+        let image = std::fs::read(&path).unwrap();
+        let regions: Vec<String> = (0..=num_regions(schema.num_payload_cols()))
+            .map(|r| {
+                let (size, enc) = region_dir(&image, r);
+                format!("{size}/{enc:?}")
+            })
+            .collect();
+        let shard = MappedShard::open(&path, &schema).unwrap();
+        let (_, slice_i) = instructions.measure(|| black_box(shard.slice_to_owned_batch(0, N)));
+        let (_, window_i) = instructions.measure(|| {
+            for start in (0..N).step_by(1024) {
+                black_box(shard.slice_to_owned_batch(start, 1024.min(N - start)));
+            }
+        });
+        let (content, cell_i) = instructions.measure(|| {
+            let mut content = 0usize;
+            for row in 0..N {
+                for (pi, col) in schema.payload_columns() {
+                    if col.type_code.is_german_string() {
+                        content += gnitz_expr::payload_bytes(&shard, row, pi).len();
+                    }
+                }
+            }
+            content
+        });
+        let rows: Vec<(u32, u32, i64)> = (0..N as u32).map(|r| (0, r, 1)).collect();
+        let (_, merge_i) = instructions.measure(|| {
+            let set = UnifiedSet::whole(std::slice::from_ref(&shard), &schema);
+            black_box(set.materialize(&rows, N))
+        });
+        let per_row = |i: u64| i / N as u64;
+        println!(
+            "{label}: {N} rows of {content} string bytes\n  {} bytes, {:.1} per row; instructions per row: \
+             write {}, slice {}, windows {}, cells {}, materialize {}\n  regions {}",
+            image.len(),
+            image.len() as f64 / N as f64,
+            per_row(write_i),
+            per_row(slice_i),
+            per_row(window_i),
+            per_row(cell_i),
+            per_row(merge_i),
+            regions.join(" "),
+        );
     }
 }

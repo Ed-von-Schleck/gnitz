@@ -249,26 +249,6 @@ fn probe_fixture() -> ProbeFixture {
     }
 }
 
-/// Shard files under `dir`, per directory that holds any: the regime check that
-/// every trace was measured on disk.
-fn print_shards(dir: &str) {
-    let mut stack = vec![std::path::PathBuf::from(dir)];
-    while let Some(d) = stack.pop() {
-        let mut shards = 0;
-        for e in fs::read_dir(&d).unwrap().flatten() {
-            let path = e.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if e.file_name().to_string_lossy().starts_with("shard_") {
-                shards += 1;
-            }
-        }
-        if shards > 0 {
-            println!("  {shards:>4} shard(s) in {}", d.display());
-        }
-    }
-}
-
 /// One tick of `base` over a one-row push of a fresh `id`, keyed onto an existing
 /// `k` so every probe finds a match; its instructions, ingest excluded.
 fn push_epoch(engine: &mut CatalogEngine, base: u64, id: u64) -> u64 {
@@ -296,7 +276,8 @@ fn hydrate_trace_probe_bench() {
         join_bases,
         distinct_base,
     } = probe_fixture();
-    print_shards(&dir);
+    // The regime check: every trace was measured on disk.
+    print!("{}", gnitz_store::relation::disk_usage(&dir).unwrap());
 
     let schema = engine.registry.relation(join).map(Relation::schema).unwrap();
     let spec = ReadSpec::all_rows(ReadBound::Range(KeyRange::point(

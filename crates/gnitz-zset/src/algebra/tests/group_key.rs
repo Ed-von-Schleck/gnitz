@@ -53,38 +53,33 @@ fn single_natural_col_keys_by_its_opk_from_either_side() {
 }
 
 // ---------------------------------------------------------------------------
-// Group runs
+// Group runs and ordinals
 // ---------------------------------------------------------------------------
 
-/// Every position's row, in visit order.
-fn visit_order(runs: &GroupRuns, n: usize) -> Vec<usize> {
-    (0..n).map(|p| runs.row(p)).collect()
-}
-
-/// Rows sharing a key come back in ascending source-index order: the whole
-/// `(key, index)` pair is the sort key, so the index breaks every tie. That
-/// is what makes a float SUM over a group reproducible for a fixed access path.
-/// A run ends exactly where the key changes.
+/// Sorting numbers the groups in ascending key order, and a group's first row is
+/// its first in the batch: the whole `(key, index)` pair is the sort key, so the
+/// index breaks every tie.
 #[test]
-fn sorted_runs_break_ties_on_source_index() {
-    // Three keys, four rows each, interleaved.
-    let runs = GroupRuns::sorted(12, |i| i % 3);
-    assert_eq!(visit_order(&runs, 12), vec![0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11]);
-    assert_eq!(runs.iter().collect::<Vec<_>>(), vec![0..4, 4..8, 8..12]);
-    // Every row one key: the identity permutation, one run.
-    let runs = GroupRuns::sorted(5, |_| 0u64);
-    assert_eq!(visit_order(&runs, 5), vec![0, 1, 2, 3, 4]);
-    assert_eq!(runs.iter().collect::<Vec<_>>(), vec![0..5]);
+fn sorted_ordinals_number_groups_by_key_and_keep_the_first_row() {
+    // Three keys, descending, four rows each, interleaved.
+    let groups = GroupOrdinals::sorted(12, |i| 2 - i % 3);
+    assert_eq!(groups.ord, [2, 1, 0, 2, 1, 0, 2, 1, 0, 2, 1, 0]);
+    assert_eq!(groups.first, [2, 1, 0]);
+    assert_eq!(groups.by_pk, [0, 1, 2]);
+    // Every row one key: one group.
+    let groups = GroupOrdinals::sorted(5, |_| 0u64);
+    assert_eq!((groups.ord, groups.first, groups.by_pk), (vec![0; 5], vec![0], vec![0]));
 }
 
 /// Under every key form — the empty set, the whole PK, each single column
 /// (the leading PK column among them) and all of them — over `raw` and its
-/// consolidation: `runs` visits every row once, groups in strictly ascending
-/// `out_pk` order with a run ending exactly where `out_pk` changes, and two
-/// rows share an `out_pk` iff they share their group columns' values, and iff
-/// they share an identity. A consolidated batch grouped by a PK prefix is
-/// visited in place.
-fn assert_runs_group_by_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
+/// consolidation: `ordinals` gives two rows one ordinal iff they share an
+/// `out_pk`, names each group's first row, and lists the groups in strictly
+/// ascending `out_pk` order; two rows share an `out_pk` iff they share their
+/// group columns' values, and iff they share an identity. `runs`, where it
+/// answers, cuts the rows at exactly the ordinals' boundaries, and it answers
+/// for a consolidated batch grouped by a PK prefix.
+fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
     let schema = *raw.schema();
     let consolidated = Batch::clone(raw).into_consolidated();
     let pk: Vec<u32> = schema.pk_cols().to_vec();
@@ -95,31 +90,55 @@ fn assert_runs_group_by_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
         let (key, _) = GroupOutKey::new(&schema, cols, []).unwrap();
         for batch in [raw, &consolidated] {
             let mb = batch.as_mem_batch();
-            let runs = key.runs(batch);
-            let mut seen = visit_order(&runs, batch.count);
+            let out_pk = |row: usize| key.out_pk(&mb, row).bytes().to_vec();
+            let groups = key.ordinals(batch);
+            prop_assert_eq!(groups.ord.len(), batch.count, "{:?}", cols);
+            for (row, &g) in groups.ord.iter().enumerate() {
+                let first = groups.first[g as usize] as usize;
+                prop_assert!(first <= row, "{:?}: row {} precedes its group's first", cols, row);
+                prop_assert_eq!(out_pk(first), out_pk(row), "{:?}: a group mixes keys", cols);
+            }
+            let mut seen = groups.by_pk.clone();
             seen.sort_unstable();
-            prop_assert_eq!(seen, (0..batch.count).collect::<Vec<_>>(), "{:?}", cols);
-            let out_pk = |pos: usize| key.out_pk(&mb, runs.row(pos)).bytes().to_vec();
-            let mut prev: Option<Vec<u8>> = None;
-            for run in runs.iter() {
-                let first = out_pk(run.start);
-                prop_assert!(
-                    run.clone().all(|p| out_pk(p) == first),
-                    "{:?}: a run mixes groups",
-                    cols
-                );
-                prop_assert!(prev.is_none_or(|p| p < first), "{:?}: runs out of order", cols);
-                prev = Some(first);
+            prop_assert_eq!(seen, (0..groups.len() as u32).collect::<Vec<_>>(), "{:?}", cols);
+            let pks: Vec<Vec<u8>> = groups
+                .by_pk
+                .iter()
+                .map(|&g| out_pk(groups.first[g as usize] as usize))
+                .collect();
+            prop_assert!(pks.windows(2).all(|w| w[0] < w[1]), "{:?}: groups out of order", cols);
+
+            let runs = key.runs(batch);
+            if let Some(runs) = &runs {
+                prop_assert_eq!(runs.len(), groups.len(), "{:?}", cols);
+                for (g, run) in runs.iter().enumerate() {
+                    prop_assert!(
+                        run.clone().all(|row| groups.ord[row] == g as u32),
+                        "{:?}: run {} is not group {}",
+                        cols,
+                        g,
+                        g
+                    );
+                }
             }
             if std::ptr::eq(batch, &consolidated) && (cols[..] == pk[..1] || *cols == pk) {
-                prop_assert!(runs.in_row_order(), "{:?}: a PK prefix of a consolidated batch", cols);
+                prop_assert!(runs.is_some(), "{:?}: a PK prefix of a consolidated batch", cols);
             }
+
             let group =
                 |r: usize| -> Vec<_> { cols.iter().map(|&c| cell(&mb, schema.locate(c as usize), r)).collect() };
             for a in 0..batch.count {
                 for b in a + 1..batch.count {
-                    let same_out_pk = key.out_pk(&mb, a).bytes() == key.out_pk(&mb, b).bytes();
+                    let same_out_pk = out_pk(a) == out_pk(b);
                     prop_assert_eq!(group(a) == group(b), same_out_pk, "{:?}: rows {} and {}", cols, a, b);
+                    prop_assert_eq!(
+                        groups.ord[a] == groups.ord[b],
+                        same_out_pk,
+                        "{:?}: rows {} and {}",
+                        cols,
+                        a,
+                        b
+                    );
                     prop_assert_eq!(
                         key.identity(&mb, a) == key.identity(&mb, b),
                         same_out_pk,
@@ -136,17 +155,18 @@ fn assert_runs_group_by_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
 }
 
 proptest! {
-    /// [`assert_runs_group_by_out_pk`] over every PK width arm.
+    /// [`assert_groups_follow_out_pk`] over every PK width arm.
     #[test]
-    fn runs_group_by_out_pk_at_every_pk_width((si, rows) in arb_fold_case()) {
-        assert_runs_group_by_out_pk(&fold_batch(&fold_schemas()[si], &rows))?;
+    fn groups_follow_out_pk_at_every_pk_width((si, rows) in arb_fold_case()) {
+        assert_groups_follow_out_pk(&fold_batch(&fold_schemas()[si], &rows))?;
     }
 }
 
-/// [`assert_runs_group_by_out_pk`] over a compound signed PK and signed, wide
-/// and nullable payload columns, each holding repeated values.
+/// [`assert_groups_follow_out_pk`] over a compound signed PK and signed, wide
+/// and nullable payload columns, each holding repeated values: 64 rows, so both
+/// the hashed and the sorted numbering are taken, by group count.
 #[test]
-fn runs_group_by_out_pk_over_signed_wide_and_nullable_columns() {
+fn groups_follow_out_pk_over_signed_wide_and_nullable_columns() {
     // `[U32 pk0, I32 pk1, I64 v, U128 w, I64 n NULL]`, PK `(pk0, pk1)`.
     let schema = SchemaDescriptor::new(
         &[
@@ -170,7 +190,7 @@ fn runs_group_by_out_pk_over_signed_wide_and_nullable_columns() {
         }
         bb.end_row();
     }
-    assert_runs_group_by_out_pk(&bb.finish()).unwrap();
+    assert_groups_follow_out_pk(&bb.finish()).unwrap();
 }
 
 /// A shuffled ~1M-row batch of distinct keys, `stride` PK bytes each.
@@ -191,9 +211,10 @@ fn bench_rows(n: usize, stride: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Regression guard — time `runs` over a shuffled ~1M-row batch at each key
-/// arm: a whole PK per keyed width, a narrow image (`u64`), a wide image
-/// (`u128`), and the multi-column fold. `#[ignore]`; run release:
+/// Regression guard — time `ordinals` over a shuffled ~1M-row batch of distinct
+/// keys, which every arm sorts: a whole PK per keyed width, a narrow image
+/// (`u64`), a wide image (`u128`), and the multi-column fold. `#[ignore]`; run
+/// release:
 ///   cargo test -p gnitz-zset --release reduce_sort -- --ignored --nocapture --test-threads=1
 #[test]
 #[ignore]
@@ -221,9 +242,9 @@ fn reduce_sort_argsort_bench() {
         let key = GroupOutKey::new(schema, group_cols, []).unwrap().0;
 
         let t = std::time::Instant::now();
-        let runs = key.runs(&batch);
+        let groups = key.ordinals(&batch);
         let dt = t.elapsed();
-        std::hint::black_box(&runs);
+        std::hint::black_box(&groups.ord);
 
         let mrps = n as f64 / dt.as_secs_f64() / 1e6;
         println!("argsort {label}: {n} rows in {dt:?} = {mrps:.1} M rows/s");

@@ -44,6 +44,17 @@ pub(crate) fn range_rows(ranges: &[(usize, usize)]) -> usize {
     ranges.iter().map(|&(s, e)| e - s).sum()
 }
 
+/// The maximal `[start, end)` runs of `0..n` whose rows `keep` admits, ascending.
+pub(crate) fn runs_where(n: usize, keep: impl Fn(usize) -> bool) -> Vec<(usize, usize)> {
+    let kept: Vec<u64> = (0..n)
+        .step_by(64)
+        .map(|base| (base..n.min(base + 64)).fold(0, |bits, row| bits | u64::from(keep(row)) << (row - base)))
+        .collect();
+    let mut runs = Vec::new();
+    gnitz_expr::scan_filter_bits(&kept, n, &mut runs);
+    runs
+}
+
 /// Write each region's byte offset into `offsets`, returning the total arena
 /// size. Entries past `num_regions` are untouched; every caller passes an
 /// all-zero array. An out-parameter rather than a return: the array is
@@ -325,6 +336,16 @@ impl Batch {
     pub(crate) fn null_bmp_data(&self) -> &[u8] {
         self.region_at(REG_NULL_BMP)
     }
+
+    /// The `[start, end)` runs of rows with no null bit of `mask` set.
+    pub(crate) fn runs_without_nulls(&self, mask: u64) -> Vec<(usize, usize)> {
+        let words = self.null_bmp_data().as_chunks::<8>().0;
+        // A batch with none of them set takes only this branch-free pass.
+        if words.iter().fold(0u64, |a, w| a | u64::from_le_bytes(*w)) & mask == 0 {
+            return vec![(0, self.count)];
+        }
+        runs_where(self.count, |row| u64::from_le_bytes(words[row]) & mask == 0)
+    }
     #[inline]
     pub fn col_data(&self, pi: usize) -> &[u8] {
         self.region_at(REG_PAYLOAD_START + pi)
@@ -513,6 +534,17 @@ impl Batch {
         self.offsets = new_offsets;
         self.capacity = new_cap;
         self.debug_poison_rows(self.count..new_cap);
+    }
+
+    /// Count `n` more rows and return the first one's index. Their regions are
+    /// uninitialized (see [`Self::with_capacity`]): the caller writes every one
+    /// through the region accessors, which reach a row only once it is counted.
+    pub(crate) fn grow_rows(&mut self, n: usize) -> usize {
+        self.reserve_rows(n);
+        let at = self.count;
+        self.count += n;
+        self.consolidated = false;
+        at
     }
 
     /// In debug builds, fill `rows` of every region with `0xA5`, so reading a row
@@ -950,7 +982,7 @@ impl Batch {
         );
         let n = self.count;
         let mut out = Self::with_capacity(out_schema, n);
-        out.count = n;
+        out.grow_rows(n);
         let mask = in_schema.string_payload_slots();
         let heap_at = out.carry_heap(&self.as_mem_batch(), mask, mask, &[(0, n)]);
         let mut cache = BlobCache::new(n);
@@ -1243,33 +1275,19 @@ impl Batch {
         weight: i64,
         source: &S,
         row: usize,
-        blob_cache: Option<&mut BlobCache>,
+        mut blob_cache: Option<&mut BlobCache>,
     ) {
         if weight == 0 {
             return;
         }
         self.begin_row(source.get_pk_bytes(row), weight);
-        self.append_payload_cols(0..self.schema.num_payload_cols(), source, row, blob_cache);
-        self.commit_row(source.get_null_word(row));
-    }
-
-    /// Append `src`'s row `row` payload columns into output slots `out`, fed from
-    /// source slot `out_pi - out.start`.
-    #[inline]
-    pub(crate) fn append_payload_cols<S: RowSource>(
-        &mut self,
-        out: Range<usize>,
-        src: &S,
-        row: usize,
-        mut blob_cache: Option<&mut BlobCache>,
-    ) {
-        let src_blob = src.blob();
-        let base = out.start;
-        for out_pi in out {
-            let col = self.schema.columns[self.schema.payload_col_idx(out_pi)];
-            let cell = src.get_col_ptr(row, out_pi - base, col.size() as usize);
-            self.append_payload_cell(out_pi, col.type_code, cell, src_blob, blob_cache.as_deref_mut());
+        let src_blob = source.blob();
+        for pi in 0..self.schema.num_payload_cols() {
+            let col = self.schema.columns[self.schema.payload_col_idx(pi)];
+            let cell = source.get_col_ptr(row, pi, col.size() as usize);
+            self.append_payload_cell(pi, col.type_code, cell, src_blob, blob_cache.as_deref_mut());
         }
+        self.commit_row(source.get_null_word(row));
     }
 
     /// Append `cell` into output slot `out_pi`, relocating a STRING/BLOB struct

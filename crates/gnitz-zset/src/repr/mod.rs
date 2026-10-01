@@ -58,10 +58,12 @@ pub use read_cursor::{
 pub use run::{first_live_payload_group, Run, StoredRow};
 pub use seek::pk_group_end;
 pub use shard_file::ShardWriteOpts;
-pub use shard_reader::MappedShard;
+pub use shard_reader::{MappedShard, ShardDirectory};
 pub use spill::{KeyProducer, SpillSort};
 
-pub(crate) use batch::{range_rows, RowMark};
-pub(crate) use scatter::materialize_carrying;
+pub(crate) use batch::{range_rows, runs_where, RowMark};
+pub(crate) use scatter::{materialize_carrying, width_dispatch};
 pub(crate) use seek::pk_prefix_group_end;
-pub(crate) use string_heap::{copy_string_cells, prorated_blob_cap, BlobCache};
+pub(crate) use string_heap::{
+    copy_string_cells, prorated_blob_cap, relocate_german_string_vec, should_relocate_blob, BlobCache,
+};

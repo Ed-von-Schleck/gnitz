@@ -452,7 +452,7 @@ impl WorkerProcess {
         for i in 0..batch.len() {
             let pkb = batch.get_pk_bytes(i);
             let prefix = &pkb[..idx_key_size];
-            // `[span ‖ holder PK]` verbatim: `KeySpec::write_entry` wrote the
+            // `[span ‖ holder PK]` verbatim: an index entry holds the
             // source PK at `idx_key_size`, so the caller splits it back out
             // without decoding anything.
             if let gnitz_wire::WireProbeMode::AllHolders = mode {

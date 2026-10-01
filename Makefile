@@ -15,6 +15,8 @@ CLIENTS    ?= 1
 FULL       ?=
 PERF       ?=
 PERF_DWARF ?=
+ROWS       ?=                                # bench-disk: events loaded
+RAM_TIER   ?=                                # bench-disk: GNITZ_RAM_TIER_BYTES for its server
 T          ?=                                # cargo test name filter
 K          ?=                                # pytest -k expression
 
@@ -31,7 +33,7 @@ TARGET_CPU ?= x86-64-v3
         server release-server checked-server pyext pyext-release e2e e2e-tls e2e-release \
         e2e-checked e2e-debug release-test \
         clean distclean \
-        bench-rust bench bench-full bench-features bench-txn bench-sweep bench-sweep-dwarf \
+        bench-rust bench bench-disk bench-full bench-features bench-txn bench-sweep bench-sweep-dwarf \
         bench-perf bench-perf-dwarf bench-native bench-profile profiling-server profiling-server-dwarf
 
 all: test
@@ -166,6 +168,14 @@ bench: release-server pyext-release ## Run the SQL benchmark suite
 		$(if $(K),-k '$(K)') \
 		$(if $(PERF),--perf --perf-stat) \
 		$(if $(PERF_DWARF),--perf-dwarf)
+
+# Bytes, not time: a run prints what the data directory holds once the final
+# checkpoint has put every store on disk.
+bench-disk: WORKERS = 4
+bench-disk: release-server pyext-release ## Disk footprint of a string-heavy table and its views (knobs: WORKERS, ROWS, RAM_TIER)
+	cd crates/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release \
+		uv run python ../../benchmarks/disk.py --workers=$(WORKERS) \
+		$(if $(ROWS),--rows=$(ROWS)) $(if $(RAM_TIER),--ram-tier-bytes=$(RAM_TIER))
 
 bench-full: WORKERS = 4
 bench-full: FULL    = 1

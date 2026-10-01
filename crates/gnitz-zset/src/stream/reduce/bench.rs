@@ -25,7 +25,7 @@ use super::op_reduce::op_reduce;
 use super::plan::ReducePlan;
 use super::tests::Harness;
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{ColumnTable, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
+use crate::schema::{ColumnTable, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{bench_time, bench_time_each, pk_payload_schema, pk_u64_two_i64_schema, TestTrace};
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
@@ -245,42 +245,38 @@ fn secondary_index_single_u64_pk_sort_bench() {
     });
 }
 
-/// Per-row cost of composing one secondary-index entry key
-/// (`KeySpec::write_entry` = leading-key span ‖ source-PK suffix).
+/// Per-row cost of projecting a secondary index's entries (`index_entries` =
+/// leading-key span ‖ source-PK suffix, per live row).
 ///
 /// Four shapes, chosen to separate the encode paths: a **U64 PK** source (no
-/// promotion — the span is a verbatim copy of the OPK bytes already in the PK
-/// region), an **I64 payload** source (no promotion, native LE straight into the
-/// encoder), a **U32 payload → U64** source (real width promotion), and a
-/// **compound (U64 PK, I64 payload)** two-column span.
+/// promotion — the span is the OPK bytes already in the PK region), an **I64
+/// payload** source (no promotion, native LE into the encoder), a **U32 payload
+/// → U64** source (real width promotion), and a **compound (U64 PK, I64
+/// payload)** two-column span.
 #[test]
 #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
-fn index_write_span_bench() {
-    use crate::schema::KeySpec;
+fn index_entries_bench() {
+    use crate::algebra::index_entries;
+    use crate::schema::index_spec_and_schema;
 
     // `src_schema()` / `build_input` from the top of this file: U64 pk (col 0) |
     // U32 (col 1) | I64 (col 2), 500k rows. The four shapes map onto it directly.
     let src = src_schema();
     let input = build_input(&src);
-    let mb = input.as_mem_batch();
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
 
-    println!("\nKeySpec::write_entry — per-row cost ({ITERS}x{N_ROWS} rows):");
+    println!("\nindex_entries — per-row cost ({N_ROWS} rows):");
     for (label, cols) in [
         ("U64 PK        (identity)", &[0u32][..]),
         ("I64 payload   (direct)  ", &[2][..]),
         ("U32 payload   (promoted)", &[1][..]),
         ("compound (PK, I64)      ", &[0, 2][..]),
     ] {
-        let spec = KeySpec::new(cols, &src).unwrap();
-        let elapsed = bench_time(ITERS, || {
-            let mut key = [0u8; MAX_PK_BYTES];
-            for row in 0..N_ROWS {
-                std::hint::black_box(spec.write_entry(&mb, row, &mut key));
-                std::hint::black_box(&key);
-            }
-        });
-        let ns = ns_per_row(elapsed);
-        println!("  {label}  {ns:7.2} ns/row   ({:.2} Mrows/s)", 1000.0 / ns);
+        let (spec, idx_schema) = index_spec_and_schema(cols, &src).unwrap();
+        std::hint::black_box(index_entries(&input, &spec, &idx_schema));
+        let (out, instructions) = counter.measure(|| index_entries(&input, &spec, &idx_schema));
+        std::hint::black_box(out);
+        println!("  {label}  {:7.1} instr/row", instructions as f64 / N_ROWS as f64);
     }
 }
 
@@ -293,14 +289,19 @@ fn time_op_reduce(h: &mut Harness, delta: &Batch) -> (Batch, Duration) {
     (out, start.elapsed())
 }
 
-/// `op_reduce` over `d2`, against the state `d1` left behind.
-fn time_second_epoch(plan: ReducePlan, d1: &Batch, d2: &Batch) -> Duration {
+/// `op_reduce` over `d2`, against the state `d1` left behind: its wall time and
+/// the instructions it retired.
+fn time_second_epoch(plan: ReducePlan, d1: &Batch, d2: &Batch) -> (Duration, u64) {
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
     let mut h = Harness::new(plan);
     let (out, _) = time_op_reduce(&mut h, d1);
     h.trace_out.ingest(out);
-    let (out, warm) = time_op_reduce(&mut h, d2);
+    let (mut trace_out, mut history) = h.cursors(d2);
+    let start = Instant::now();
+    let (out, instructions) = counter.measure(|| op_reduce(d2, &mut trace_out, history.as_mut(), &h.plan));
+    let warm = start.elapsed();
     std::hint::black_box(out);
-    warm
+    (warm, instructions)
 }
 
 /// `delta` as the VM hands it to `plan`'s reduce: folded unless every aggregate
@@ -369,6 +370,36 @@ fn op_reduce_bench() {
             agg(2, AggFunc::Sum),
             Box::new(|s| grp_rows(s, &|i| i % 65_536)),
         ),
+        // Unsorted groups at the row counts per group the hashed and the sorted
+        // group numbering trade places at.
+        (
+            "keyed_distinct_sum",
+            grp_val,
+            vec![1],
+            agg(2, AggFunc::Sum),
+            Box::new(|s| grp_rows(s, &|i| mix(i ^ 0x55))),
+        ),
+        (
+            "keyed_2_per_group_sum",
+            grp_val,
+            vec![1],
+            agg(2, AggFunc::Sum),
+            Box::new(|s| grp_rows(s, &|i| mix((i / 2) ^ 0x55))),
+        ),
+        (
+            "keyed_4_scattered_sum",
+            grp_val,
+            vec![1],
+            agg(2, AggFunc::Sum),
+            Box::new(|s| grp_rows(s, &|i| mix(i % (N / 4)))),
+        ),
+        (
+            "keyed_256_sum",
+            grp_val,
+            vec![1],
+            agg(2, AggFunc::Sum),
+            Box::new(|s| grp_rows(s, &|i| mix(i) % 256)),
+        ),
         (
             "source_pk",
             single_pk,
@@ -381,6 +412,13 @@ fn op_reduce_bench() {
             compound_pk,
             vec![0],
             agg(2, AggFunc::Sum),
+            Box::new(|s| sorted_rows(compound_pk, s)),
+        ),
+        (
+            "leading_pk_min",
+            compound_pk,
+            vec![0],
+            agg(2, AggFunc::Min),
             Box::new(|s| sorted_rows(compound_pk, s)),
         ),
         (
@@ -415,8 +453,9 @@ fn op_reduce_bench() {
         let (d1, d2) = (as_read(&plan(), make(1)), as_read(&plan(), make(2)));
         let (out, cold) = time_op_reduce(&mut Harness::new(plan()), &d2);
         std::hint::black_box(out);
-        let warm = time_second_epoch(plan(), &d1, &d2);
-        println!("op_reduce {label}: empty trace {cold:?}, populated trace {warm:?}");
+        let (warm, instructions) = time_second_epoch(plan(), &d1, &d2);
+        let per_row = instructions as f64 / d2.count as f64;
+        println!("op_reduce {label}: empty trace {cold:?}, populated trace {warm:?}, {per_row:.1} instr/row");
     }
 }
 
@@ -471,7 +510,7 @@ fn op_reduce_group_sweep_bench() {
             let aggs = [AggDescriptor { col_idx: val, agg_op }, AggDescriptor::COUNT_STAR];
             let plan = ReducePlan::from_wire(&schema, &group_cols, &aggs, false).unwrap();
             let (d1, d2) = (as_read(&plan, rows(1)), as_read(&plan, rows(2)));
-            let warm = time_second_epoch(plan, &d1, &d2);
+            let (warm, _) = time_second_epoch(plan, &d1, &d2);
             println!("op_reduce_group_sweep {label}: populated trace {warm:?}");
         }
     }

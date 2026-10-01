@@ -6,10 +6,11 @@ use std::ops::Range;
 use crate::repr::{Batch, MemBatch};
 use crate::schema::{ColumnLocator, TypeCode};
 use gnitz_expr::RowSource;
-use gnitz_wire::{AggFunc, FixedInt, ScalarKind};
+use gnitz_wire::{for_each_fixed_int, AggFunc, FixedInt, ScalarKind};
 
 use crate::algebra::order_image::{
-    scalar_image, scalar_native_of_image, wide_native, wide_native_of_image, ImageKind, WideKind,
+    ieee_order_bits, ieee_order_bits_f32, order_bits, scalar_image, scalar_native_of_image, wide_native,
+    wide_native_of_image, ImageKind, WideKind,
 };
 
 /// The value-index parameters of one MIN/MAX aggregate: the column the index
@@ -74,8 +75,8 @@ impl StepKind {
     }
 }
 
-/// `AdhocFold` holds `groups × aggregates` of these, with `groups` bounded by
-/// the registry's `adhoc_group_cap`.
+/// A reduce holds one per aggregate, and a fold of one of the kinds no column
+/// kernel steps one per group.
 const _: () = assert!(std::mem::size_of::<Accumulator>() <= 40);
 
 impl Accumulator {
@@ -211,9 +212,10 @@ impl Accumulator {
         }
     }
 
-    /// Step `accs` over `rows`, each by its column kernel where one exists.
-    pub(crate) fn fold_rows(accs: &mut [Self], mb: &MemBatch, rows: Range<usize>) {
-        for acc in accs {
+    /// Step the linear accumulators of `accs` over `rows`, and under `extremes`
+    /// the others too, each by its column kernel where one exists.
+    pub(crate) fn fold_rows(accs: &mut [Self], mb: &MemBatch, rows: Range<usize>, extremes: bool) {
+        for acc in accs.iter_mut().filter(|a| extremes || a.is_linear()) {
             let step = acc.bulk_step();
             step(acc, mb, rows.clone());
         }
@@ -227,16 +229,13 @@ impl Accumulator {
             // Reads no column.
             StepKind::Count => Self::count_rows,
             StepKind::CountNonNull if payload => Self::count_non_null_rows,
-            StepKind::Sum(ScalarKind::Int(fi)) if payload => match fi {
-                FixedInt::U8 => Self::sum_int_rows::<1, false>,
-                FixedInt::I8 => Self::sum_int_rows::<1, true>,
-                FixedInt::U16 => Self::sum_int_rows::<2, false>,
-                FixedInt::I16 => Self::sum_int_rows::<2, true>,
-                FixedInt::U32 => Self::sum_int_rows::<4, false>,
-                FixedInt::I32 => Self::sum_int_rows::<4, true>,
-                // A wrapping 64-bit sum is the same bits signed or unsigned.
-                FixedInt::U64 | FixedInt::I64 => Self::sum_int_rows::<8, true>,
-            },
+            StepKind::Sum(ScalarKind::Int(fi)) if payload => for_each_fixed_int!(fi, |FI| {
+                |acc: &mut Self, mb: &MemBatch, rows: Range<usize>| {
+                    acc.acc = fold_col::<{ FI.width() }, _>(mb, acc.src, rows, acc.acc, |a, v, w, null| {
+                        a.wrapping_add(if null { 0 } else { FI.decode_le_i64(&v).wrapping_mul(w) })
+                    });
+                }
+            }),
             StepKind::Sum(ScalarKind::F32) if payload => Self::sum_float_rows::<4>,
             StepKind::Sum(ScalarKind::F64) if payload => Self::sum_float_rows::<8>,
             _ => Self::step_each,
@@ -259,22 +258,6 @@ impl Accumulator {
         });
     }
 
-    /// SUM over an `N`-byte integer column, sign-extended when `SIGNED`.
-    fn sum_int_rows<const N: usize, const SIGNED: bool>(&mut self, mb: &MemBatch, rows: Range<usize>) {
-        let shift = 64 - 8 * N as u32;
-        self.acc = fold_col::<N, _>(mb, self.src, rows, self.acc, |a, v, w, null| {
-            let mut le = [0u8; 8];
-            le[..N].copy_from_slice(&v);
-            let bits = u64::from_le_bytes(le) << shift;
-            let v = if SIGNED {
-                (bits as i64) >> shift
-            } else {
-                (bits >> shift) as i64
-            };
-            a.wrapping_add(if null { 0 } else { v.wrapping_mul(w) })
-        });
-    }
-
     /// SUM over an `f32` (`N = 4`) or `f64` (`N = 8`) column; the slot holds
     /// `f64` bits either way.
     fn sum_float_rows<const N: usize>(&mut self, mb: &MemBatch, rows: Range<usize>) {
@@ -292,9 +275,110 @@ impl Accumulator {
         self.acc = sum.to_bits() as i64;
     }
 
-    #[inline(always)]
-    pub(crate) fn step_from_batch(&mut self, mb: &impl RowSource, row: usize, weight: i64) {
-        self.apply(self.kind, self.src, mb, row, weight);
+    /// This aggregate's state for a fold over many groups at once, holding none.
+    pub(crate) fn grouped(&self) -> GroupedState {
+        let payload = matches!(self.src, ColumnLocator::Payload { .. });
+        match self.kind {
+            StepKind::Count | StepKind::CountNonNull => GroupedState::Bits(Vec::new()),
+            StepKind::Sum(_) if payload => GroupedState::Bits(Vec::new()),
+            StepKind::Extreme { kind: ImageKind::Scalar(_), .. } => GroupedState::Extreme(Vec::new(), Vec::new()),
+            _ => GroupedState::Each(Vec::new()),
+        }
+    }
+
+    /// Step this aggregate over rows `ranges` of `mb`, the `i`-th of which
+    /// belongs to group `ord[i]`: one pass over its column, in row order, into
+    /// `state` — this aggregate's own, sized to the group count. A row at a
+    /// non-positive weight steps no extreme.
+    pub(crate) fn fold_grouped(&self, mb: &MemBatch, ranges: &[(usize, usize)], ord: &[u32], state: &mut GroupedState) {
+        let (kind, src) = (self.kind, self.src);
+        match state {
+            GroupedState::Bits(out) => {
+                let add_float = |slot: &mut i64, v: f64, w: i64| {
+                    *slot = (f64::from_bits(*slot as u64) + v * w as f64).to_bits() as i64;
+                };
+                match kind {
+                    // A PK column is never NULL, so its non-NULL count is the count.
+                    StepKind::Count | StepKind::CountNonNull => {
+                        let counted = match kind {
+                            StepKind::Count => None,
+                            _ => payload_slot(src),
+                        };
+                        grouped_rows::<0>(mb, counted, ranges, ord, |g, _, w, null| {
+                            let slot = &mut out[g];
+                            *slot = slot.wrapping_add(if null { 0 } else { w });
+                        })
+                    }
+                    StepKind::Sum(ScalarKind::Int(fi)) => for_each_fixed_int!(fi, |FI| {
+                        grouped_col::<{ FI.width() }>(mb, src, ranges, ord, |g, v, w, null| {
+                            let slot = &mut out[g];
+                            *slot = slot.wrapping_add(if null { 0 } else { FI.decode_le_i64(&v).wrapping_mul(w) });
+                        })
+                    }),
+                    StepKind::Sum(ScalarKind::F32) => grouped_col::<4>(mb, src, ranges, ord, |g, v, w, null| {
+                        if !null {
+                            add_float(&mut out[g], f32::from_le_bytes(v) as f64, w);
+                        }
+                    }),
+                    StepKind::Sum(ScalarKind::F64) => grouped_col::<8>(mb, src, ranges, ord, |g, v, w, null| {
+                        if !null {
+                            add_float(&mut out[g], f64::from_le_bytes(v), w);
+                        }
+                    }),
+                    StepKind::Extreme { .. } => unreachable!("an extreme holds no register sum"),
+                }
+            }
+            GroupedState::Extreme(out, has) => {
+                let StepKind::Extreme { max, kind: ImageKind::Scalar(scalar) } = kind else {
+                    unreachable!("a scalar extreme's state")
+                };
+                // `bits` is the value's order image; a MAX keeps the smallest
+                // complement, as the value index does.
+                let mut step = |g: usize, bits: u64| {
+                    let image = if max { !bits } else { bits };
+                    if !has[g] || image < out[g] as u64 {
+                        out[g] = image as i64;
+                        has[g] = true;
+                    }
+                };
+                match (payload_slot(src), scalar) {
+                    (Some(_), ScalarKind::Int(fi)) => for_each_fixed_int!(fi, |FI| {
+                        grouped_col::<{ FI.width() }>(mb, src, ranges, ord, |g, v, w, null| {
+                            if w > 0 && !null {
+                                step(g, FI.decode_le_i64(&v) as u64 ^ (FI.is_signed() as u64) << 63);
+                            }
+                        })
+                    }),
+                    (Some(_), ScalarKind::F32) => grouped_col::<4>(mb, src, ranges, ord, |g, v, w, null| {
+                        if w > 0 && !null {
+                            step(g, ieee_order_bits_f32(u32::from_le_bytes(v)));
+                        }
+                    }),
+                    (Some(_), ScalarKind::F64) => grouped_col::<8>(mb, src, ranges, ord, |g, v, w, null| {
+                        if w > 0 && !null {
+                            step(g, ieee_order_bits(u64::from_le_bytes(v)));
+                        }
+                    }),
+                    // A PK column: OPK bytes, decoded a row at a time.
+                    (None, _) => {
+                        for (row, &g) in ranges.iter().flat_map(|&(s, e)| s..e).zip(ord) {
+                            if mb.get_weight(row) > 0 {
+                                step(g as usize, order_bits(&src, mb, row, scalar));
+                            }
+                        }
+                    }
+                }
+            }
+            GroupedState::Each(accs) => {
+                let linear = self.is_linear();
+                for (row, &g) in ranges.iter().flat_map(|&(s, e)| s..e).zip(ord) {
+                    let w = mb.get_weight(row);
+                    if linear || w > 0 {
+                        accs[g as usize].apply(kind, src, mb, row, w);
+                    }
+                }
+            }
+        }
     }
 
     /// Fold in this aggregate's value from a previously-emitted output row.
@@ -325,6 +409,110 @@ impl Accumulator {
     fn add_float(&mut self, v: f64, weight: i64) {
         let cur = f64::from_bits(self.acc as u64);
         self.acc = f64::to_bits(cur + v * weight as f64) as i64;
+    }
+}
+
+/// One aggregate's running value for every group of a fold: what
+/// [`Accumulator::fold_grouped`] steps and [`Self::take`] hands back to an
+/// accumulator, group by group.
+pub(crate) enum GroupedState {
+    /// A count's or a sum's register image.
+    Bits(Vec<i64>),
+    /// A scalar extreme's image, and whether the group has one.
+    Extreme(Vec<i64>, Vec<bool>),
+    /// One accumulator per group: the kinds no column kernel steps.
+    Each(Vec<Accumulator>),
+}
+
+impl GroupedState {
+    /// Grow to `groups` groups, each new one empty. `template` is the
+    /// accumulator this state belongs to, in its empty state.
+    pub(crate) fn resize(&mut self, groups: usize, template: &Accumulator) {
+        match self {
+            GroupedState::Bits(vals) => vals.resize(groups, 0),
+            GroupedState::Extreme(vals, has) => {
+                vals.resize(groups, 0);
+                has.resize(groups, false);
+            }
+            GroupedState::Each(accs) => accs.resize(groups, template.clone()),
+        }
+    }
+
+    /// Move group `g`'s value into `acc`, replacing what it held. The group's
+    /// own value is left unspecified: a group is taken once.
+    #[inline]
+    pub(crate) fn take(&mut self, g: usize, acc: &mut Accumulator) {
+        match self {
+            GroupedState::Bits(vals) => {
+                acc.acc = vals[g];
+                acc.has_extreme = false;
+            }
+            GroupedState::Extreme(vals, has) => {
+                acc.acc = vals[g];
+                acc.has_extreme = has[g];
+            }
+            GroupedState::Each(accs) => std::mem::swap(acc, &mut accs[g]),
+        }
+    }
+}
+
+/// The payload slot `src` names, or `None` for a PK column.
+fn payload_slot(src: ColumnLocator) -> Option<usize> {
+    match src {
+        ColumnLocator::Payload { slot, .. } => Some(slot as usize),
+        ColumnLocator::Pk { .. } => None,
+    }
+}
+
+/// [`grouped_rows`] over payload column `src`.
+#[inline(always)]
+fn grouped_col<const N: usize>(
+    mb: &MemBatch,
+    src: ColumnLocator,
+    ranges: &[(usize, usize)],
+    ord: &[u32],
+    f: impl FnMut(usize, [u8; N], i64, bool),
+) {
+    let slot = payload_slot(src).expect("a grouped kernel folds a payload column only");
+    grouped_rows(mb, Some(slot), ranges, ord, f)
+}
+
+/// Rows `ranges` of `N`-byte payload column `slot` as `(group, value, weight,
+/// is NULL)`, in row order; the `i`-th row's group is `ord[i]`. `N = 0` reads no
+/// value, and no `slot` no NULL either.
+#[inline(always)]
+fn grouped_rows<const N: usize>(
+    mb: &MemBatch,
+    slot: Option<usize>,
+    ranges: &[(usize, usize)],
+    ord: &[u32],
+    mut f: impl FnMut(usize, [u8; N], i64, bool),
+) {
+    let weights = mb.weight().as_chunks::<8>().0;
+    let nulls = mb.null_bmp().as_chunks::<8>().0;
+    let vals = match (N, slot) {
+        (0, _) | (_, None) => &[][..],
+        (_, Some(slot)) => mb.col_data(slot, N).as_chunks::<N>().0,
+    };
+    let mut at = 0;
+    for &(s, e) in ranges {
+        let ord = &ord[at..at + (e - s)];
+        at += e - s;
+        let rows = ord
+            .iter()
+            .zip(weights[s..e].iter().zip(&nulls[s..e]))
+            .map(|(&g, (w, nw))| {
+                let null = slot.is_some_and(|slot| gnitz_wire::null_word_get(u64::from_le_bytes(*nw), slot));
+                (g as usize, i64::from_le_bytes(*w), null)
+            });
+        if N == 0 {
+            rows.for_each(|(g, w, null)| f(g, [0; N], w, null));
+        } else {
+            vals[s..e]
+                .iter()
+                .zip(rows)
+                .for_each(|(v, (g, w, null))| f(g, *v, w, null));
+        }
     }
 }
 

@@ -18,20 +18,11 @@ What a `WITH (capacity = …)` clause *refuses*: the eligible-body rule is the
 engine's, tested in `crates/gnitz-sql/tests/engine/views.rs`. The leaf rule and
 the option grammar are the planner's, in `plan_view_rejections.rs`.
 """
-import glob
-import os
-import struct
-
 import pytest
 import gnitz
 from _feedviews import JOIN, LINEAR, SWEEP_ENV, base_tables, churn
-from _paths import relation_dir
 from _read import bag, rows
-
-# A skeleton shard sets bit 0 of its header's flags word. Nothing on the
-# wire reports dehydration, so this is the one way to prove a sweep happened.
-_OFF_FLAGS = 40
-_SHARD_FLAG_SKELETON = 1
+from _serverproc import disk_usage
 
 # An inner equi-join whose right input is a filtered derived table, which fuses
 # into the join's own circuit rather than cutting a segment.
@@ -53,20 +44,20 @@ def sweeping(own_server):
     return own_server.start()
 
 
-def _shard_files(data_dir, view_id):
-    """Every shard of `view_id`'s output store, on every worker."""
-    out = glob.glob(os.path.join(relation_dir(data_dir, view_id), "w*of*", "*.db"))
-    assert out, f"no output shard of view {view_id} under {data_dir}"
+def _output_shards(data_dir, view_id):
+    """`view_id`'s output store on disk, summed over its workers: a line of the
+    disk-usage report per LSM level."""
+    report, stores = disk_usage(data_dir)
+    out = [s for s in stores if s["relation"] == view_id and s["store"] == "rows"]
+    assert out, f"no output shard of view {view_id} under {data_dir}\n{report}"
     return out
 
 
 def _any_skeleton(data_dir, view_id):
-    def is_skeleton(path):
-        with open(path, "rb") as fh:
-            fh.seek(_OFF_FLAGS)
-            return bool(struct.unpack("<Q", fh.read(8))[0] & _SHARD_FLAG_SKELETON)
-
-    return any(is_skeleton(p) for p in _shard_files(data_dir, view_id))
+    """Whether a shard of the view's output store holds skeleton rows. Nothing
+    on the wire reports dehydration, so this is the one way to prove a sweep
+    happened."""
+    return any(s["skeletons"] for s in _output_shards(data_dir, view_id))
 
 
 def _twin(client, name, body, capacity="1 KB"):
@@ -273,7 +264,7 @@ def test_a_tight_capacity_holds_the_registered_bytes_down_across_restarts(sweepi
 
         # Twice the floor is the headroom: a shard carries a header and the sweep
         # stops one guard above the fixpoint.
-        bounded = sum(os.path.getsize(p) for p in _shard_files(sweeping.data_dir, bid[0]))
+        bounded = sum(s["bytes"] for s in _output_shards(sweeping.data_dir, bid[0]))
         floor = len(live) * _SKELETON_ROW_BYTES
         assert bounded <= 2 * max(1024, floor), (
             f"through {hi}: {bounded} bytes over {len(live)} keys, against a declared "

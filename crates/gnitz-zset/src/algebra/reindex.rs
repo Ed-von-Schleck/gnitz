@@ -10,7 +10,7 @@ use std::cell::Cell;
 
 use gnitz_expr::{BatchView, RowSource};
 
-use crate::repr::Batch;
+use crate::repr::{range_rows, runs_where, Batch};
 
 use crate::schema::{
     key::KeyCol, oob_col, ColumnLocator, DerivedSchema, KeySpec, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode,
@@ -176,7 +176,12 @@ impl ReindexPacker {
             }
             cols.push((loc, t));
         }
-        Ok(Self::finish(KeySpec::of(cols), false, FoldCols::new(Vec::new())))
+        Ok(Self::of_span(KeySpec::of(cols)))
+    }
+
+    /// The packer of `span` alone: no bitmap, no fold.
+    pub(crate) fn of_span(span: KeySpec) -> Self {
+        Self::finish(span, false, FoldCols::new(Vec::new()))
     }
 
     /// The packer over `span`, its stride the sum of [`Self::key_columns`].
@@ -332,8 +337,7 @@ impl ReindexPacker {
 
     /// Whether [`Self::pack_rows`] packs a column at a time.
     fn packs_by_column(&self) -> bool {
-        !self.has_bitmap
-            && self.fold.is_empty()
+        self.fold.is_empty()
             && self
                 .span
                 .columns()
@@ -351,8 +355,11 @@ impl ReindexPacker {
             }
             return;
         }
-        let mut off = 0;
-        for &KeyCol { loc, out } in self.span.columns() {
+        let mut off = usize::from(self.has_bitmap) * BITMAP_BYTES;
+        if self.has_bitmap {
+            dst.chunks_exact_mut(stride).for_each(|key| key[0] = 0);
+        }
+        for (i, &KeyCol { loc, out }) in self.span.columns().iter().enumerate() {
             let (sw, dw) = (loc.size(), out.size() as usize);
             let col = IntCol {
                 dst: &mut *dst,
@@ -370,6 +377,16 @@ impl ReindexPacker {
                 ColumnLocator::Payload { slot, .. } => {
                     let src = &batch.col_data(slot as usize, sw)[start * sw..(start + n) * sw];
                     col.dispatch::<false>(sw, dw, signed, src, sw, 0);
+                    if self.has_bitmap {
+                        // A NULL packs as a zeroed slot under its bitmap bit.
+                        let nulls = batch.null_bmp()[start * 8..(start + n) * 8].as_chunks::<8>().0;
+                        for (key, word) in dst.chunks_exact_mut(stride).zip(nulls) {
+                            if gnitz_wire::null_word_get(u64::from_le_bytes(*word), slot as usize) {
+                                key[0] |= 1 << i;
+                                key[off..off + dw].fill(0);
+                            }
+                        }
+                    }
                 }
             }
             off += dw;
@@ -474,24 +491,44 @@ impl IntCol<'_> {
 // Secondary-index entries
 // ---------------------------------------------------------------------------
 
-/// Each nonzero-weight row of `source` that `spec` indexes, as its index entry at
-/// that row's weight, in source order.
+/// Each nonzero-weight row of `source` that `spec` indexes, as its index entry
+/// `[span ‖ source PK]` at that row's weight, in source order. A row NULL in an
+/// indexed column has no entry.
 pub fn index_entries(source: &Batch, spec: &KeySpec, idx_schema: &SchemaDescriptor) -> Batch {
-    let idx_stride = idx_schema.pk_stride();
-    assert_eq!(
-        idx_stride,
-        spec.key_size() + source.schema().pk_stride(),
-        "index schema of another spec"
-    );
-    let mut out = Batch::with_capacity(idx_schema, source.len());
-    let mut entry = [0u8; MAX_PK_BYTES];
+    let (idx_stride, key_size) = (idx_schema.pk_stride(), spec.key_size());
+    let src_stride = source.schema().pk_stride();
+    assert_eq!(idx_stride, key_size + src_stride, "index schema of another spec");
     let mb = source.as_mem_batch();
-    for row in 0..source.len() {
-        let weight = source.get_weight(row);
-        if weight != 0 && spec.write_entry(&mb, row, &mut entry) {
-            out.push_key_row(&entry[..idx_stride], weight);
-        }
+    let indexed_slots = spec.columns().iter().fold(0u64, |slots, c| match c.loc {
+        ColumnLocator::Payload { slot, .. } => slots | 1u64 << slot,
+        ColumnLocator::Pk { .. } => slots,
+    });
+    let weights = source.weight_data().as_chunks::<8>().0;
+    let nulls = source.null_bmp_data().as_chunks::<8>().0;
+    let runs = runs_where(source.len(), |row| {
+        weights[row] != [0; 8] && u64::from_le_bytes(nulls[row]) & indexed_slots == 0
+    });
+    let rows = range_rows(&runs);
+    if rows == 0 {
+        return Batch::empty_with_schema(idx_schema);
     }
+    let packer = ReindexPacker::of_span(*spec);
+    let mut out = Batch::with_capacity(idx_schema, rows);
+    out.grow_rows(rows);
+    let mut at = 0;
+    for &(s, e) in &runs {
+        let end = at + (e - s);
+        let entries = &mut out.pk_data_mut()[at * idx_stride..end * idx_stride];
+        packer.pack_rows(entries, idx_stride, &mb, s, e - s);
+        let pks = source.pk_data()[s * src_stride..e * src_stride].chunks_exact(src_stride);
+        for (entry, pk) in entries.chunks_exact_mut(idx_stride).zip(pks) {
+            entry[key_size..].copy_from_slice(pk);
+        }
+        out.weight_data_mut()[at * 8..end * 8].copy_from_slice(&source.weight_data()[s * 8..e * 8]);
+        at = end;
+    }
+    // An index entry is all key: it has no payload column to be NULL.
+    out.null_bmp_data_mut().fill(0);
     out
 }
 

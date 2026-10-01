@@ -9,7 +9,7 @@ use StorageError::Corrupt;
 pub(crate) const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
 /// Bumped by hand for any change to the bytes a writer produces;
 /// `shard_bytes_are_pinned` fails until it is.
-pub(crate) const SHARD_EPOCH: u64 = 21;
+pub(crate) const SHARD_EPOCH: u64 = 22;
 
 /// Compared for equality at open. A shard sizes its regions from the live
 /// schema, so a system-table shape change must refuse the file, not reinterpret it.
@@ -246,16 +246,11 @@ pub(crate) fn for_image_bw(size: usize, count: usize, elem_width: usize) -> Opti
 /// The FoR image of a fixed-int region, framed on its minimum; or `None` when it
 /// would not shrink the region's aligned footprint.
 pub(crate) fn for_encode(src: &[u8], fi: FixedInt) -> Option<Vec<u8>> {
-    match fi {
-        // A 1-byte cell has no narrower offset width.
-        FixedInt::U8 | FixedInt::I8 => None,
-        FixedInt::U16 => for_encode_cells::<2, false>(src),
-        FixedInt::I16 => for_encode_cells::<2, true>(src),
-        FixedInt::U32 => for_encode_cells::<4, false>(src),
-        FixedInt::I32 => for_encode_cells::<4, true>(src),
-        FixedInt::U64 => for_encode_cells::<8, false>(src),
-        FixedInt::I64 => for_encode_cells::<8, true>(src),
+    // A 1-byte cell has no narrower offset width.
+    if fi.width() == 1 {
+        return None;
     }
+    gnitz_wire::for_each_fixed_int!(fi, |FI| { for_encode_cells::<{ FI.width() }, { FI.is_signed() }>(src) })
 }
 
 fn for_encode_cells<const W: usize, const SIGNED: bool>(src: &[u8]) -> Option<Vec<u8>> {
@@ -328,6 +323,98 @@ fn for_decode_cells<const W: usize>(image: &[u8], bw: usize, first_row: usize, o
     }
 }
 
+// A Dict image: the entry count (u64 LE), the 16-byte entries, then each row's
+// code — one byte while every code fits one, else two (LE).
+const DICT_ENTRIES_AT: usize = 8;
+
+/// The most entries a dictionary holds: what a two-byte code addresses.
+pub(crate) const DICT_MAX_ENTRIES: usize = 1 << 16;
+
+const fn dict_code_width(entries: usize) -> usize {
+    if entries <= 1 << 8 {
+        1
+    } else {
+        2
+    }
+}
+
+pub(crate) const fn dict_image_len(count: usize, entries: usize) -> usize {
+    DICT_ENTRIES_AT + entries * 16 + count * dict_code_width(entries)
+}
+
+/// The Dict image of a column whose row `i` holds `entries[ids[i]]`.
+pub(crate) fn dict_encode(entries: &[[u8; 16]], ids: &[u32]) -> Vec<u8> {
+    assert!((1..=DICT_MAX_ENTRIES).contains(&entries.len()));
+    let mut image = Vec::with_capacity(dict_image_len(ids.len(), entries.len()));
+    image.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    image.extend_from_slice(entries.as_flattened());
+    if dict_code_width(entries.len()) == 1 {
+        image.extend(ids.iter().map(|&id| id as u8));
+    } else {
+        image.extend(ids.iter().flat_map(|&id| (id as u16).to_le_bytes()));
+    }
+    image
+}
+
+/// A Dict image taken apart: its entries, and its codes at their width.
+#[derive(Clone, Copy)]
+pub(crate) struct DictImage<'a> {
+    entries: &'a [[u8; 16]],
+    codes: &'a [u8],
+    wide: bool,
+}
+
+impl<'a> DictImage<'a> {
+    /// `image` as the dictionary of `count` rows, or `None` unless its entry
+    /// count gives exactly that size.
+    pub(crate) fn parse(image: &'a [u8], count: usize) -> Option<Self> {
+        let n = usize::try_from(read_u64_le(image.get(..DICT_ENTRIES_AT)?, 0)).ok()?;
+        if !(1..=DICT_MAX_ENTRIES).contains(&n) || image.len() != dict_image_len(count, n) {
+            return None;
+        }
+        let (entries, codes) = image[DICT_ENTRIES_AT..].split_at(n * 16);
+        Some(DictImage {
+            entries: entries.as_chunks().0,
+            codes,
+            wide: dict_code_width(n) == 2,
+        })
+    }
+
+    /// The entry `code` names. The codes are body bytes no open verifies, so a
+    /// code past the last entry reads the last.
+    #[inline(always)]
+    fn entry(&self, code: usize) -> &'a [u8; 16] {
+        // SAFETY: `parse` admits no empty dictionary, and the index is clamped into it.
+        unsafe { self.entries.get_unchecked(code.min(self.entries.len() - 1)) }
+    }
+
+    /// Row `row`'s cell.
+    #[inline(always)]
+    pub(crate) fn cell(&self, row: usize) -> &'a [u8; 16] {
+        if self.wide {
+            self.entry(u16::from_le_bytes(self.codes.as_chunks::<2>().0[row]) as usize)
+        } else {
+            self.entry(self.codes[row] as usize)
+        }
+    }
+
+    /// Decode rows `first_row..` to their cells, `out.len() / 16` rows.
+    pub(crate) fn decode(&self, first_row: usize, out: &mut [u8]) {
+        let out = out.as_chunks_mut::<16>().0;
+        if self.wide {
+            let codes = &self.codes.as_chunks::<2>().0[first_row..first_row + out.len()];
+            for (cell, code) in out.iter_mut().zip(codes) {
+                *cell = *self.entry(u16::from_le_bytes(*code) as usize);
+            }
+        } else {
+            let codes = &self.codes[first_row..first_row + out.len()];
+            for (cell, &code) in out.iter_mut().zip(codes) {
+                *cell = *self.entry(code as usize);
+            }
+        }
+    }
+}
+
 /// Header plus directory, by the file's own payload arity.
 pub(crate) const fn desc_len(file_npc: usize) -> usize {
     dir_entry_off(gnitz_wire::num_regions(file_npc) + 1)
@@ -352,15 +439,30 @@ pub(crate) enum Encoding {
     TwoValue = 2,
     /// Frame-of-reference: a payload column of a 2-, 4- or 8-byte integer type.
     For = 3,
+    /// Dictionary: a German-string payload column as its distinct cells and one
+    /// code per row.
+    Dict = 4,
 }
 
 impl Encoding {
+    /// The encoding's name in a disk-usage report.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Encoding::Raw => "raw",
+            Encoding::Constant => "constant",
+            Encoding::TwoValue => "two-value",
+            Encoding::For => "for",
+            Encoding::Dict => "dict",
+        }
+    }
+
     pub(crate) fn from_byte(b: u8) -> Option<Self> {
         Some(match b {
             0 => Encoding::Raw,
             1 => Encoding::Constant,
             2 => Encoding::TwoValue,
             3 => Encoding::For,
+            4 => Encoding::Dict,
             _ => return None,
         })
     }
