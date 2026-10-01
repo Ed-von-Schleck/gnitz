@@ -44,7 +44,7 @@ exists to overwrite a standard-database assumption that is **wrong here**:
 |---|---|---|
 | A row is present or absent | A row carries an integer **weight**, which may be negative | §1 |
 | A row is identified by its PK | Identity is **(PK, all payload columns)** | §1 |
-| A PK is unique | Unique for base tables and reduce output only; intermediate batches routinely repeat a PK | §1 |
+| A PK is unique | Unique only in the accumulated state of a base table or a reduce output; batches routinely repeat a PK | §1 |
 | A PK is a typed tuple, compared by dispatching on type | A PK is an **opaque ordered byte string**; every comparison is one `memcmp` | §1, §4 |
 | Sorting by key is enough to group | Sorting by PK alone **silently corrupts weights** | §2 |
 | A query recomputes over current state | Operators consume and emit **deltas**; state lives in a separate integral | §3 |
@@ -60,26 +60,27 @@ pointwise addition — every DBSP theorem below depends on that group structure.
 Here *D* is the set of rows of a table schema, and an element is identified by
 **(PK, all payload columns)**. The PK alone does *not* identify an element.
 
-**Weights.** Accumulated base-table weights are always ≥ 0, enforced by the DML
-layer (INSERT = +1, DELETE = retraction, UPDATE = retract + insert).
+**Weights.** Accumulated base-table weights are always ≥ 0, enforced by the
+engine on ingest: whatever a client pushes, the effective delta of an INSERT is
++1, of a DELETE a retraction, of an UPDATE a retraction plus an insert.
 Intermediate circuit nodes may produce negative weights; base-table traces never
-accumulate one. Load-bearing: `distinct` assumes it, and DBSP Propositions
-4.4/4.5 (the distinct-elimination rules) require positive inputs.
+accumulate one. Load-bearing: DBSP Propositions 4.4/4.5 (the
+distinct-elimination rules) require positive inputs.
 
 **Indexed Z-Sets** map keys to Z-Sets, `K → (V → ℤ)`. GROUP BY produces one via a
 grouping function that is **linear**, so GROUP BY itself needs no state and is
 incrementally free; only the aggregation within each group needs the integral.
-Repartitioning by group/join key is its physical form.
 
 **PK uniqueness is not a general invariant.** The PK region is a sort/routing
-key. It is unique for base-table batches (enforced on ingest) and for reduce
-output (one row per group). It is **not** unique for intermediate batches:
-repartitioning overwrites the PK region with a join/group column value, and join
-output inherits the left input's PK. Every operator uses full (PK, payload)
-identity; none may assume PK uniqueness.
+key. It is unique in the accumulated state of a base table (enforced on ingest)
+and of a reduce output (one row per group) — a *delta* of either can still carry
+a retraction and an insert under one PK. It is **not** unique for intermediate
+batches: a join re-keys its inputs on the join key, which many rows share. Every
+operator uses full (PK, payload) identity; none may assume PK uniqueness.
 
-**PK columns** are an ordered list of fixed-width integer scalars, signed or
-unsigned, non-nullable. STRING, BLOB and float columns cannot be PK columns —
+**PK columns** are an ordered list of fixed-width integer-stored scalars — the
+integer types, signed or unsigned, and the types stored as one, such as UUID or
+DECIMAL — non-nullable. STRING, BLOB and float columns cannot be PK columns —
 IEEE-754 breaks the byte-equal key contract, since ±0.0 differ byte-wise but
 compare equal numerically, and NaN has no canonical bit pattern.
 
@@ -116,14 +117,13 @@ position.
 
 > **Every merge and consolidation path must sort by (PK, payload), never by PK
 > alone.** PK-only ordering interleaves rows that share a PK but differ in
-> payload, so weights accumulate against the wrong element. It bites the
-> non-linear aggregates hardest: MIN/MAX secondary-index entries routinely share
-> a PK while varying in payload.
+> payload, so weights accumulate against the wrong element.
 
 > **Every batch entering an N-way merge must already be sorted by (PK, payload).**
 > A merge reads each input linearly; an unsorted input makes the heap deliver
 > duplicates non-adjacently and the accumulator produces *wrong weights
-> silently* — no error, no assertion.
+> silently* — a release build checks nothing; only debug and checked builds
+> verify a batch's layout.
 
 ## 3. DBSP: Incremental Computation on Z-Sets
 
@@ -150,15 +150,14 @@ delta.
 
 **Single-source-per-epoch.** An epoch carries one input delta from one source —
 a circuit never sees simultaneous deltas from two sources. This makes the
-bilinear cross-delta term `dA ⋈ dB` always zero and keeps trace cursors
-(snapshotted at tick start) valid throughout.
+bilinear cross-delta term `dA ⋈ dB` always zero.
 
 ### Linear operators
 
 `L(A + B) = L(A) + L(B)`: filter, map, negate, UNION ALL, delay (z⁻¹).
 Incrementalization adds no state (Theorem 3.3) — delay holds one tick by
 definition, but nothing *extra*. Consolidation before a linear operator is
-optional.
+optional. Delay is the paper's operator; no GnitzDB operator implements it.
 
 ### Bilinear operators
 
@@ -183,21 +182,23 @@ reaches the two join inputs in two *separate* epochs and trace cursors are
 rebuilt each epoch, so the later epoch joins against a trace that already
 absorbed the earlier delta — the asymmetric form realized across epochs, with the
 cross-term emitted exactly once. The one shape that would put two deltas in one
-epoch, the same source feeding both inputs, is rejected by the planner (the self-join
-guard; the discriminator is source-id equality, not base-table overlap).
+epoch, the same source feeding both inputs, never reaches a circuit: the planner
+turns a self-join into the shared-source shape above (the discriminator is
+source-id equality, not base-table overlap).
 
 **Join output schema** is `[key, left_payload..., right_payload...]` over the
 **SQL sides**, not the delta/trace ports — so both terms of the symmetric form
-share one schema. The key is the shared join key; the other input's PK region is
-not duplicated. Original table PKs survive as payload columns.
+share one schema. For a keyed join the key is the shared join key; the other
+input's PK region is not duplicated.
 
 **Keyless (cross) joins** are INNER only. The product is computed
-partition-locally under a broadcast of the delta, with no second exchange, so
-every epoch emits `|Δ| × |other side|` rows.
+partition-locally under a broadcast of the delta — no exchange co-locates the
+two operands — so every epoch emits `|Δ| × |other side|` rows.
 
 ### Outer joins (LEFT / RIGHT / FULL)
 
-Described for LEFT; RIGHT is the mirror, FULL does both sides. For each delta
+Described for LEFT; RIGHT is the mirror, FULL does both sides — for the join
+shapes that support them; the planner rejects the rest. For each delta
 row: if inner matches exist, emit them at `w_delta × w_trace`; if none, emit one
 null-filled row at `w_delta`. This is **not bilinear** — output weight depends on
 match *existence*, not on weight arithmetic alone.
@@ -228,7 +229,8 @@ is `weight > 0 → 1, else 0`, and the transition test is `> 0` against `≤ 0`,
 at weight −1, the new at +1.
 
 - **SUM and COUNT are linear**, so `new = old + delta_contribution`: no history
-  replay, and consolidating the input delta is skippable.
+  replay, and consolidating the input delta is skippable for a reduce of only
+  these, where each is exact — which a float SUM is not.
 - **MIN and MAX are not.** Retracting the current extremum needs the next value
   from history, so they carry a secondary value index instead of scanning the trace.
 - **Float SUM/AVG is order-dependent** — addition is non-associative, so the value
@@ -245,17 +247,18 @@ null-fills, and band EXISTS/IN are the only `positive_part` users.
 
 ### The integral (trace)
 
-`I(A)_t = Σ(dA_0..dA_t)`. Each tick's delta is added to a persistent or ephemeral
-store; an operator reads it back through a cursor that merges the in-memory and
-on-disk tiers on the fly, summing weights of matching (PK, payload) entries and
-dropping ghosts — so every tier depends on §2's sort invariant. Trace cursors are
-snapshotted at tick start, so an operator sees `z⁻¹(I(X))`, the integral *before*
-the current delta.
+`I(A)_t = Σ(dA_0..dA_t)`. Each delta is added to a store; an operator reads it
+back through a cursor that merges the in-memory and on-disk tiers on the fly,
+summing weights of matching (PK, payload) entries and dropping ghosts — so every
+tier depends on §2's sort invariant. An operator reading a trace sees
+`z⁻¹(I(X))`, the integral *before* the current delta.
 
 ## 4. The Region Convention
 
 Column buffers are flat (pointer, size) pairs in canonical order — the layout of
-both WAL blocks and shard files. `pk_stride` is the encoded key width: the sum of
+a batch in memory and in a WAL block. A shard file keeps the same regions in the
+same order but may encode each one compactly, so the sizes below are a batch's.
+`pk_stride` is the encoded key width: the sum of
 the PK columns' encoded widths, tightly packed, fixed for a given schema.
 
 ```
@@ -337,7 +340,7 @@ crate graph rather than a convention: a host holding a mirrored view links
 | `gnitz-zset` | The Z-set kernel: the schema, columnar batches and the shard image, the cursor over runs, and the operators |
 | `gnitz-store` | The Z-set store: the LSM, the relation registry, the `ReadSpec` executor |
 | `gnitz-server` | The multi-process server binary: the DBSP layer — circuit compiler, bytecode VM, epoch execution, system-table catalog — under the `runtime` rung that drives it |
-| `gnitz-mirror` | The mirror store: the local copy a client reads through, and the one implementor of `gnitz-core`'s `MirrorStore` — the one crate on both sides, and a leaf. Drives `gnitz-store` directly and links no DBSP layer |
+| `gnitz-mirror` | The mirror store: the local copy a client reads through, and the one implementor of `gnitz-core`'s `MirrorStore` — the one crate on both sides. Drives `gnitz-store` directly and links no DBSP layer |
 | `gnitz-zset-testkit` | Dev-only: `gnitz-zset`'s test helpers, compiled as a library so other crates' tests reach them |
 | `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests |
 
@@ -369,10 +372,11 @@ names one.
 
 Each crate is one compilation unit, so the ladder among its own rungs is pinned
 by a source-text test rather than by the crate graph. `catalog` and `query`
-cannot end the process: every fallible path in them returns its error.
+cannot fail-stop the process — the abort is private to `runtime` — so every
+fallible path in them returns its error.
 
-Each subsystem's `mod.rs` header states its own surface, its internal split, and
-what is deliberately closed off. Read that rather than a summary here.
+A subsystem's surface and internal split are documented in its `mod.rs` header,
+not here.
 
 `gnitz-foundation`, `gnitz-wire` and `gnitz-expr` sit **below this whole
 table**: they are separate crates.
@@ -431,8 +435,8 @@ For temporary logging: `gnitz_debug!` / `gnitz_info!` macros. Remove before comm
 
 ### Where test logs go
 
-Everything is under the gitignored `<repo>/tmp` and is overwritten by the next
-run — copy out what you need before re-running.
+Everything is under the gitignored `<repo>/tmp` — copy out what you need before
+re-running.
 
 - **Session server stderr:** `tmp/server_debug.log`, on disk regardless of
   pytest's capture mode (`-s` does not show it).
@@ -457,7 +461,7 @@ output store as **skeleton rows**: the PK and one coarse summed weight, no
 payload. A read touching such a key recomputes it from the view's operator traces
 (join) or source store (linear), which stay full-fidelity.
 
-Capacity bounds one store's on-disk bytes on one worker — not the traces, not
+Capacity bounds one store's shard bytes on one worker — not the traces, not
 the cluster, and not read peak. Bounded views are **leaf** views: nothing may be
 created over one.
 
@@ -493,7 +497,7 @@ every view reaching a stream is reset and rebuilt at boot. The stream's
 *definition* is ordinary durable catalog state. Target: log-structured ingestion,
 where the raw log lives upstream and only the derived view state is worth keeping.
 
-A stream push skips the pre-ACK `fdatasync` and the durable write.
+A stream push needs no pre-ACK `fdatasync` and makes no durable write.
 
 **A stream is append-only.** Pushed weights must be `>= 1`; the engine rejects a
 batch containing any weight `<= 0`, which is what keeps §1's positivity invariant
@@ -519,7 +523,8 @@ ticked yet — a stream push exactly as a table's.
 ## Window functions
 
 A window call (`f(…) OVER (…)`, `QUALIFY`, `WINDOW`) desugars in the planner into
-ordinary joins and reduces, and is legal only in a view body. Partition and order
+operators that exist without it, and is legal only in a view body. Partition and
+order
 keys are join keys and carry the join-key rules; `ROW_NUMBER` is `RANK` over the
 ORDER BY extended by the input's row key, so it needs one.
 
@@ -546,7 +551,8 @@ read in the host's process at its last polled round: not read-your-own-writes,
 and two mirrors are no consistent cut; a relation the copy does not hold is
 delegated upstream. The copy lives in a store (`gnitz-mirror`) the host opens and
 attaches to a client. An ingest error costs the one copy it hit, which bootstraps
-again; a store whose copy may be torn refuses reads until it is closed.
+again; a store whose copy may be torn refuses the reads it would have answered
+until it is closed.
 
 **A poll reports, per view, whether it reseeded** — discarded the copy and read
 the view whole. That is a discontinuity every subscriber has to react to, and no
@@ -555,20 +561,19 @@ the tick forward, which is exactly what an ordinary advance looks like.
 
 ## SAL durability contract
 
-**Rule: an ACK to a client implies fdatasync iff the operation wrote something a
-restart must recover.**
+**Rule: an operation that wrote something a restart must recover is ACKed only
+after its fdatasync; nothing else needs one.**
 
 The SAL (Shared Append-Only Log) carries both data writes and ephemeral
-commands. Workers see every SAL entry immediately — fdatasync is irrelevant for
-cross-process visibility. It exists solely for crash recovery.
+commands. Workers see a SAL entry as soon as it is published — fdatasync is
+irrelevant for cross-process visibility. It exists solely for crash recovery.
 
 Durable operations are atomic: crash recovery applies an operation in full
 or not at all, so a crash never leaves a half-written DDL or push behind.
-They fdatasync before the ACK and reply with their zone LSN.
-Everything else wakes the workers without a sync and replies LSN `0`: the
-command-only operations — view ticks, scans, seeks, backfills, validation
-queries — plus a push to a **stream**, which upserts nothing that survives a
-restart. The dichotomy is what must be recovered, not what carries rows.
+They fdatasync before the ACK. Everything else needs no sync: the command-only
+operations — view ticks, scans, seeks, backfills, validation queries — plus a
+push to a **stream**, which upserts nothing that survives a restart. The
+dichotomy is what must be recovered, not what carries rows.
 
 The **checkpoint** is the sole shard-durability point: between checkpoints the
 fsynced SAL alone carries durability. A checkpoint persists the base and system
@@ -581,9 +586,9 @@ SAL tail is fed through the circuit — the view is never re-derived from the
 base. A view is valid only if every view it scans is, and a crash at any point
 must force a rebuild rather than a silently-stale resume.
 
-A restart at a **different worker count** relays each base relation's stores
-onto the launched count before any store opens; a crash at any point leaves the
-older set intact and the next boot redoes the work.
+A restart at a **different worker count** relays each base relation's rows onto
+the launched count before any worker opens a store. The old set is removed only
+once the new one is durable, so a crash at any point leaves one complete set.
 
 ## Benchmarking
 
@@ -601,8 +606,8 @@ Workflow: `make bench` → change → commit → `make bench` → compare `summa
 ### Rust micro-benchmarks
 
 `make bench` is end-to-end (full server + IPC), so it can't isolate a tight
-in-process loop. For that, the engine carries `#[ignore]`d timing tests that
-print throughput and must be run in `--release`.
+in-process loop. For that, the engine carries `#[ignore]`d benchmark tests that
+print what they measured and must be run in `--release`.
 
 `make bench-rust` runs the set, `make bench-rust T=<name>` one of them. It builds
 the whole workspace in release, so iterate on a single crate with cargo directly:
@@ -614,8 +619,9 @@ cd crates && cargo test -p gnitz-zset --release <name>_bench \
 ```
 
 Add one alongside the others: name the test `*_bench`, mark it `#[ignore]`,
-time only the hot region with `std::time::Instant`, and `std::hint::black_box`
-anything the optimizer could elide.
+measure only the hot region — instructions retired where the question is cost,
+wall clock where it is latency — and `std::hint::black_box` anything the
+optimizer could elide.
 
 ## Debugging failures
 
@@ -642,8 +648,9 @@ anything the optimizer could elide.
 6. **Read the master and worker logs side by side** — the master log shows what
    was dispatched, the worker log what was processed. Discrepancies in ordering
    between them are usually the smoking gun.
-7. **Use the debug binary.** Release builds silently clamp corrupt values and
-   hide the real failure mode.
+7. **Use the debug binary.** Release compiles out the debug assertions and the
+   layout verifiers, so a corrupt batch flows on silently and the real failure
+   mode is hidden.
 8. **Isolate with 1 worker.** Pass with W=1 but fail with W=4 → bug is in
    exchange/fanout, not computation.
 9. **Bisect by sub-path.** Disable the new fast-path to confirm the bug is in
