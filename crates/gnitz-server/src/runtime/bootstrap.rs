@@ -26,7 +26,7 @@ use crate::runtime::tls::TlsArgs;
 use crate::runtime::w2m::{self, SalWake, W2mReceiver, W2mWriter, BOOT_READY_REQUEST_ID};
 use crate::runtime::wire as ipc;
 use crate::runtime::worker::WorkerProcess;
-use gnitz_store::relation::{Relation, Residency};
+use gnitz_store::relation::Residency;
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 use gnitz_zset::schema::Slot;
@@ -156,14 +156,12 @@ fn recover_from_sal(
     let mut resliced_from: Option<u32> = None;
     for msg in tail.groups().filter(|m| m.kind == SalMessageKind::Push) {
         let tid = msg.target_id;
-        // The catalog's schema, not the wire's: only the catalog stamps the
-        // `replicated` bit the branch below reads. `SchemaDescriptor` is `Copy`, so
-        // this holds no borrow on `catalog` across the `&mut` ingest. A table
-        // dropped later in the tail has none, and nothing to recover into.
-        let Some(schema) = catalog.registry.relation(tid).map(Relation::schema) else {
+        // A table dropped later in the tail has no relation, and nothing to
+        // recover into.
+        let Some((schema, placement)) = catalog.registry.relation(tid).map(|r| (r.schema(), r.placement())) else {
             continue;
         };
-        let (wanted, reslice) = replay_slots(msg.slots(), slot, schema.placement().is_replicated());
+        let (wanted, reslice) = replay_slots(msg.slots(), slot, placement.is_replicated());
         if reslice {
             resliced_from = Some(msg.slots());
         }
@@ -176,7 +174,7 @@ fn recover_from_sal(
                 // The write path's own router, so what survives is exactly what the master
                 // would have written to this rank's slot. It reads only weights and PK
                 // bytes, so it cuts before the widening below.
-                gnitz_zset::algebra::ScatterPlan::native(&schema).share(&batch, slot)
+                gnitz_zset::algebra::ScatterPlan::native(placement).share(&batch, slot)
             } else {
                 batch
             };

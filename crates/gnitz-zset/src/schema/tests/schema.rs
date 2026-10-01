@@ -30,43 +30,25 @@ fn cached_layout_matches_the_derivation() {
     }
 }
 
-/// The distribution prefix is the leading PK columns' OPK width; the `0`
-/// sentinel and a placement no router slices take the full PK.
-#[test]
-fn placement_sets_the_distribution_prefix() {
-    use TypeCode::{I64, U32, U64};
-    // PK (U32, U64, U64): distinct widths, so each prefix stride is unambiguous.
-    let cols = [col(U32), col(U64), col(U64), col(I64)];
-    let keyed = |prefix_len| Placement::Keyed { prefix_len };
-    for (placement, resolved, dist) in [
-        (Placement::KEYED_DEFAULT, keyed(3), 20),
-        (keyed(3), keyed(3), 20),
-        (keyed(2), keyed(2), 12),
-        (keyed(1), keyed(1), 4),
-        (Placement::Replicated, Placement::Replicated, 20),
-        (Placement::Local, Placement::Local, 20),
-    ] {
-        let s = SchemaDescriptor::new_with_placement(&cols, &[0, 1, 2], placement);
-        assert_eq!((s.placement(), s.dist_stride()), (resolved, dist), "{placement:?}");
-    }
-}
-
 // ── Derived schemas ──────────────────────────────────────────────────────
 
 /// The PK columns in PK-list order, then each named payload column in the order
-/// named: a PK or out-of-range entry skipped, a repeat kept.
+/// named, a repeat kept. An entry naming a PK column or no column is refused.
 #[test]
 fn project_schema_places_the_pk_then_the_named_payload() {
     use TypeCode::{I32, I64, U32, U64};
     let opt = SchemaColumn::new(I64, true);
     let input = SchemaDescriptor::new(&[col(I32), col(U64), opt, col(U32)], &[3, 1]);
     assert_eq!(
-        project_schema(&input, &[2, 3, 0, 99, 2]).unwrap(),
+        project_schema(&input, &[2, 0, 2]).unwrap(),
         SchemaDescriptor::new(&[col(U32), col(U64), opt, col(I32), opt], &[0, 1]),
     );
+    assert!(project_schema(&input, &[2, 3]).is_err(), "a PK entry");
+    assert!(project_schema(&input, &[2, 99]).is_err(), "an out-of-range entry");
     // The bound is PK-inclusive: a payload count that alone fits still
     // overflows once the PK columns are prepended.
-    assert_eq!(project_schema(&input, &[0; MAX_COLUMNS - 1]), None);
+    assert!(project_schema(&input, &[0; MAX_COLUMNS - 1]).is_err());
+    assert_eq!(input.pk_only(), SchemaDescriptor::new(&[col(U32), col(U64)], &[0, 1]));
 }
 
 /// A schema is a trailing append of another iff every earlier column keeps its
@@ -155,9 +137,8 @@ fn covers_pk_accepts_any_superset_of_the_pk_columns() {
 
 // ── Admission ────────────────────────────────────────────────────────────
 
-/// Every shape the constructor aborts on, `try_new` refuses and a schema record
-/// carrying it fails to decode — the two paths an untrusted column list takes.
-/// The wire codec admits each such record; the refusal is this crate's.
+/// Every inadmissible shape is refused by `try_new`, and by the decode of a
+/// schema record carrying it.
 #[test]
 fn admission_refuses_what_the_constructor_aborts_on() {
     let k = col(TypeCode::U64);
@@ -180,10 +161,6 @@ fn admission_refuses_what_the_constructor_aborts_on() {
     ];
     for (what, cols, pk) in &cases {
         assert!(SchemaDescriptor::try_new(cols, pk).is_err(), "try_new: {what}");
-        assert!(
-            std::panic::catch_unwind(|| SchemaDescriptor::new(cols, pk)).is_err(),
-            "new: {what}"
-        );
         let record = gnitz_wire::schema_block::encode(
             cols.iter().map(|c| SchemaBlockCol {
                 ty: ColType::of(c.type_code),
@@ -196,6 +173,10 @@ fn admission_refuses_what_the_constructor_aborts_on() {
         assert!(decode_schema_block(&record).is_err(), "decode: {what}");
     }
     assert!(SchemaDescriptor::try_new(&[k, k], &[1, 0]).is_ok());
+
+    let mut keyless = DerivedSchema::new();
+    keyless.push(k);
+    assert!(keyless.finish().is_err(), "a builder finished with no key column");
 }
 
 /// A schema record's arity prefix carries no redundancy of its own, so every

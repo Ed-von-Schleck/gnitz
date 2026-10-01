@@ -98,16 +98,15 @@ impl JoinPlan {
             true => (trace, delta),
             false => (delta, trace),
         };
-        let over = |e| format!("join: merged schema {e}");
         let mut b = DerivedSchema::new();
-        b.push_pk_of(left).map_err(over)?;
+        b.push_pk_of(left);
         if kind == JoinKind::Cross {
             // The keyless join matches on neither key, so it mints the pair.
-            b.push_pk_of(right).map_err(over)?;
+            b.push_pk_of(right);
         }
-        b.push_payload_of(left).map_err(over)?;
-        b.push_payload_of(right).map_err(over)?;
-        let out_schema = b.finish();
+        b.push_payload_of(left);
+        b.push_payload_of(right);
+        let out_schema = b.finish().map_err(|e| format!("join: merged schema {e}"))?;
 
         // Both regions run the left SQL side first, so one split serves either.
         let halves = |l: usize, total: usize| match delta_is_right {

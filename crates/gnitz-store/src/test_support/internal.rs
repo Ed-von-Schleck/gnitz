@@ -8,7 +8,7 @@ use crate::storage::{RecoverySource, StoreBudgets, Table};
 use gnitz_expr::LogicalProgram;
 use gnitz_wire::{ComputeMap, OrderKey, ReadBound, ReadSink, ReadSpec, SinkKind};
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::{SchemaDescriptor, Slot};
+use gnitz_zset::schema::{Placement, SchemaDescriptor, Slot};
 
 /// A rederived table under `dir` at the default budgets — nothing a test puts
 /// here spills, since that needs the whole 32 MiB RAM tier. For a test that just
@@ -66,7 +66,14 @@ pub(crate) fn relation_fixture(
 ) -> RelationFixture {
     let dir = tempfile::tempdir().unwrap();
     let mut registry = RelationRegistry::new(dir.path().to_str().unwrap(), Slot::SOLO, StoreConfig::default());
-    registry.register(RelationSpec { id: TID, kind, schema }).unwrap();
+    registry
+        .register(RelationSpec {
+            id: TID,
+            kind,
+            schema,
+            placement: Placement::full_pk(&schema),
+        })
+        .unwrap();
     for (id, &col) in (TID + 1..).zip(indexed) {
         registry
             .add_index(TID, IndexClaim::Index { id, unique: false }, &[col])

@@ -7,9 +7,9 @@ use rustc_hash::FxHashSet;
 use super::*;
 use gnitz_expr::{RowSource, SchemaFacts};
 use gnitz_wire::sys_rows::FkRef;
-use gnitz_wire::{low_bits_mask, BitIter, ColType, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME};
+use gnitz_wire::{low_bits_mask, BitIter, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME};
 use gnitz_wire::{ViewProps, MAX_COLUMNS};
-use gnitz_zset::schema::make_index_schema;
+use gnitz_zset::schema::KeySpec;
 
 /// The name rules a catalog row must satisfy to be *stored*: non-empty
 /// `[A-Za-z0-9_]` and already canonical, since every cache key is compared
@@ -65,30 +65,19 @@ fn check_col_defs(kind: RelationKind, col_defs: &[CatalogColumn]) -> Result<(), 
     Ok(())
 }
 
-/// `gnitz-wire`'s PK rule set, in wire's own wording.
-fn validate_pk_against_cols(col_defs: &[CatalogColumn], pk_cols: &[u32]) -> Result<(), String> {
-    gnitz_wire::validate_pk_tuple(pk_cols, col_defs.len(), gnitz_wire::PK_LIST_MAX_COLS, |c| {
-        let cd = &col_defs[c as usize];
-        (cd.def.ty.tc, cd.def.is_nullable)
-    })
-    .map_err(|rule| rule.for_role(gnitz_wire::PkListRole::PrimaryKey))
-}
-
 /// The `SchemaDescriptor` COL_TAB records describe, or the first admissibility
 /// rule they break.
 pub(in crate::catalog) fn build_schema_from_col_defs(
     kind: RelationKind,
     col_defs: &[CatalogColumn],
     pk_cols: &[u32],
-    placement: Placement,
 ) -> Result<SchemaDescriptor, String> {
     check_col_defs(kind, col_defs)?;
-    validate_pk_against_cols(col_defs, pk_cols)?;
     let cols: Vec<SchemaColumn> = col_defs
         .iter()
         .map(|cd| SchemaColumn::new(cd.def.ty.tc, cd.def.is_nullable))
         .collect();
-    Ok(SchemaDescriptor::new_with_placement(&cols, pk_cols, placement))
+    SchemaDescriptor::try_new(&cols, pk_cols)
 }
 
 /// A system row carries weight ±1: a zero weight carries no contract, and the
@@ -222,21 +211,19 @@ fn check_circuit_rows(batch: &Batch, mut created: Vec<u64>) -> Result<(), String
 }
 
 impl CatalogEngine {
-    /// Check every FK-carrying column of a relation about to be registered.
-    /// `pk` must already have passed [`validate_pk_against_cols`], which is what
-    /// makes `pk[0]` an in-bounds, PK-eligible column index. `net_dead` is what the
-    /// same TABLE_TAB delta drops.
+    /// Check every FK-carrying column of relation `tid`, about to be registered
+    /// with `schema` over `col_defs`. `net_dead` is what the same TABLE_TAB delta
+    /// drops.
     pub(super) fn validate_fk_columns(
         &self,
         tid: u64,
         col_defs: &[CatalogColumn],
-        pk: &[u32],
+        schema: &SchemaDescriptor,
         net_dead: &[u64],
     ) -> Result<(), String> {
-        let self_pk_type = col_defs[pk[0] as usize].def.ty;
         for cd in col_defs {
             if let Some(fk) = cd.fk {
-                self.validate_fk_column(cd, fk, tid, pk, self_pk_type, net_dead)?;
+                self.validate_fk_column(cd, fk, tid, col_defs, schema, net_dead)?;
             }
         }
         Ok(())
@@ -247,8 +234,8 @@ impl CatalogEngine {
         col: &CatalogColumn,
         fk: FkRef,
         self_table_id: u64,
-        self_pk: &[u32],
-        self_pk_type: ColType,
+        self_cols: &[CatalogColumn],
+        self_schema: &SchemaDescriptor,
         net_dead: &[u64],
     ) -> Result<(), String> {
         // The target is a legal reference iff it is the parent's lone PK column,
@@ -258,10 +245,10 @@ impl CatalogEngine {
             // target must be its lone PK column. The downstream probe reads the
             // referenced value out of the packed PK region, which is the whole
             // key only when the PK is a single column.
-            if self_pk != [fk.col] {
+            if self_schema.lone_pk_col() != Some(fk.col as usize) {
                 return Err("FK must reference the primary key or a UNIQUE-indexed column".into());
             }
-            self_pk_type
+            self_cols[fk.col as usize].def.ty
         } else {
             if net_dead.contains(&fk.table_id) {
                 return Err(format!(
@@ -744,7 +731,7 @@ impl CatalogEngine {
             let col_defs = self.read_column_defs(id)?;
             let (sid, name, pk, kind, table) = if is_table {
                 let r = read_table_tab_row(batch, i).map_err(|e| format!("{e} (tid={id})"))?;
-                (r.schema_id, r.name, r.pk, r.kind, Some((r.facts.serial, r.placement)))
+                (r.schema_id, r.name, r.pk, r.kind, Some(r.facts.serial))
             } else {
                 let v = read_view_tab_row(batch, i).map_err(|e| format!("{e} (vid={id})"))?;
                 // `topo_priority` applies CircuitNodes (2) before View (6) in a
@@ -755,12 +742,12 @@ impl CatalogEngine {
                 self.validate_view_owner(id, v.name, v.owner_view_id, &creates)?;
                 (v.schema_id, v.name, v.pk, RelationKind::View(v.props), None)
             };
-            check_col_defs(kind, &col_defs)
-                .and_then(|()| validate_pk_against_cols(&col_defs, pk.as_slice()))
-                .map_err(|e| format!("{} '{name}' (id={id}) {e}", kind.noun()))?;
-            reject_unstorable_name(name, kind.noun())?;
+            let noun = kind.noun();
+            let schema = build_schema_from_col_defs(kind, &col_defs, pk.as_slice())
+                .map_err(|e| format!("{noun} '{name}' (id={id}) {e}"))?;
+            reject_unstorable_name(name, noun)?;
 
-            if let Some((serial, placement)) = table {
+            if let Some(serial) = table {
                 // A stream push must stay a pure append: an FK would probe a
                 // parent store, putting a store read on every one.
                 if kind == RelationKind::Stream {
@@ -776,17 +763,11 @@ impl CatalogEngine {
                     gnitz_wire::validate_serial_key(pk_cols.map(|cd| (cd.def.name.as_str(), cd.def.ty)))
                         .map_err(|e| format!("table '{name}' (id={id}): {e}"))?;
                 }
-                // `validate_pk_against_cols` above proved the PK list non-empty
-                // and in range, which is what makes the self-reference type
-                // lookup inside sound.
-                self.validate_fk_columns(id, &col_defs, pk.as_slice(), net_dead)?;
+                self.validate_fk_columns(id, &col_defs, &schema, net_dead)?;
                 // The register hook indexes every FK column; an index it cannot
                 // build is refused here, before anything is applied.
-                let noun = kind.noun();
-                let schema = build_schema_from_col_defs(kind, &col_defs, pk.as_slice(), placement)
-                    .map_err(|e| format!("{noun} '{name}' (id={id}) {e}"))?;
                 for (ci, _) in col_defs.iter().enumerate().filter(|(_, cd)| cd.fk.is_some()) {
-                    make_index_schema(&[ci as u32], &schema)
+                    KeySpec::new(&[ci as u32], &schema)
                         .map_err(|e| format!("{noun} '{name}' (id={id}) FK column {ci}: {e}"))?;
                 }
             }
@@ -827,10 +808,10 @@ impl CatalogEngine {
     }
 
     /// The owner and column rules of a CREATE INDEX on `owner_id`, and the
-    /// index schema they admit.
-    pub(crate) fn validate_index_create(&self, owner_id: u64, cols: &[u32]) -> Result<SchemaDescriptor, String> {
+    /// key span they admit.
+    pub(crate) fn validate_index_create(&self, owner_id: u64, cols: &[u32]) -> Result<KeySpec, String> {
         let entry = self.registry.index_owner(owner_id)?;
-        let idx_schema = make_index_schema(cols, &entry.schema()).map_err(|e| {
+        let spec = KeySpec::new(cols, &entry.schema()).map_err(|e| {
             format!(
                 "{e} for table '{}' (tid={owner_id})",
                 self.qualified_name_or_unknown(owner_id).1
@@ -843,7 +824,7 @@ impl CatalogEngine {
         {
             return Err(format!("Index: column {c} of table {owner_id} is dropped"));
         }
-        Ok(idx_schema)
+        Ok(spec)
     }
 
     /// IDX_TAB: a CREATE must name a base-table owner with an admissible column

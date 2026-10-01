@@ -54,11 +54,13 @@ impl TestPlan {
         const VIEW_ID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
         let dir = tempfile::tempdir().unwrap();
         let mut registry = RelationRegistry::new(dir.path().to_str().unwrap(), Slot::SOLO, StoreConfig::default());
+        let schema = crate::test_support::make_schema_u128_i64();
         registry
             .register(RelationSpec {
                 id: VIEW_ID,
                 kind: RelationKind::View(ViewProps::Plain),
-                schema: crate::test_support::make_schema_u128_i64(),
+                schema,
+                placement: gnitz_zset::schema::Placement::full_pk(&schema),
             })
             .unwrap();
         TestVm {

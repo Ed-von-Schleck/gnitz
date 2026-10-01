@@ -86,12 +86,9 @@ impl TopNIndex {
             .collect::<Result<_, String>>()?;
         let suffix = [image_slot_col(matches!(order[0].kind, ImageKind::Wide(_)))];
         let (key_packer, mut b) = ReindexPacker::new_group_key(input, group_cols, &suffix)?;
-        let over = |e| format!("top-n: index {e}");
-        for _ in &order {
-            b.push(IMAGE_COL).map_err(over)?;
-        }
-        b.push_payload_of(output).map_err(over)?;
-        let schema = b.finish();
+        order.iter().for_each(|_| b.push(IMAGE_COL));
+        b.push_payload_of(output);
+        let schema = b.finish().map_err(|e| format!("top-n: index {e}"))?;
         let tail = schema.num_columns() - output.num_payload_cols();
         Ok(TopNIndex {
             key_packer,

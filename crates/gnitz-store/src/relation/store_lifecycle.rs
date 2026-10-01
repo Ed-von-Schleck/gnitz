@@ -46,6 +46,7 @@ impl RelationRegistry {
                 id: tid,
                 kind: e.kind(),
                 schema: e.schema(),
+                placement: e.placement(),
             };
             let (store, delta) = self.build_relation_store(spec, may_resume)?;
             let index_stores = e
@@ -96,6 +97,7 @@ impl RelationRegistry {
             super::repartition::repartition_relation(
                 &relation_dir(&self.base_dir, id),
                 &entry.schema(),
+                entry.placement(),
                 self.slot.of,
                 self.config.ram_tier_bytes,
                 self.config.scan_chunk_rows,

@@ -123,7 +123,7 @@ proptest! {
             let Some((_, got_skeleton, batch)) = got else { continue };
             prop_assert_eq!(got_skeleton, skeleton);
             if skeleton {
-                prop_assert_eq!(*batch.schema(), skeleton_schema(&s));
+                prop_assert_eq!(*batch.schema(), s.pk_only());
                 let rows: Vec<(Vec<u8>, i64)> =
                     (0..batch.count).map(|r| (batch.get_pk_bytes(r).to_vec(), batch.get_weight(r))).collect();
                 prop_assert_eq!(rows, want_skeleton, "{}", what);

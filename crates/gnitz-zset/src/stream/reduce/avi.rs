@@ -76,10 +76,9 @@ impl AviBake {
         let suffix = [ORDINAL_COL, image_slot_col(has_wide)];
         let (key_packer, mut b) = ReindexPacker::new_group_key(src, group_by_cols, &suffix)?;
         if has_payload {
-            b.push(IMAGE_COL)
-                .expect("one payload column fits behind a PK-only schema");
+            b.push(IMAGE_COL);
         }
-        let schema = b.finish();
+        let schema = b.finish().map_err(|e| format!("min/max index: {e}"))?;
         debug_assert!(!has_payload || schema.payload_slot(schema.num_columns() - 1) == Some(IMAGE_SLOT));
         Ok(Some(AviBake {
             schema,

@@ -5,7 +5,7 @@
 use super::*;
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
 use gnitz_wire::Circuit;
-use gnitz_zset::schema::Slot;
+use gnitz_zset::schema::{Placement, Slot};
 
 pub(super) fn loaded(circuit: Circuit) -> LoadedCircuit {
     LoadedCircuit::new(circuit).expect("test circuit within the node limit")
@@ -31,19 +31,49 @@ pub(super) fn rejection<T>(r: Result<T, String>) -> String {
     r.map(|_| "a plan").expect_err("expected a rejection")
 }
 
+/// A source relation to register: its schema, and where its rows live. From a
+/// bare schema, keyed by its whole PK.
+#[derive(Clone, Copy)]
+pub(super) struct Source {
+    pub(super) schema: SchemaDescriptor,
+    pub(super) placement: Placement,
+}
+
+impl From<SchemaDescriptor> for Source {
+    fn from(schema: SchemaDescriptor) -> Self {
+        Source {
+            schema,
+            placement: Placement::full_pk(&schema),
+        }
+    }
+}
+
+impl Source {
+    /// This source's schema, placed by `placement`.
+    pub(super) fn placed(self, placement: Placement) -> Source {
+        Source { placement, ..self }
+    }
+}
+
 /// A registry for worker `slot` holding only `rows`, each registered as a stream —
 /// a storeless kind, so a compile finds its schemas without opening a store.
-pub(super) fn sources_at(slot: Slot, rows: impl IntoIterator<Item = (u64, SchemaDescriptor)>) -> RelationRegistry {
+pub(super) fn sources_at<S: Into<Source>>(slot: Slot, rows: impl IntoIterator<Item = (u64, S)>) -> RelationRegistry {
     let mut registry = RelationRegistry::new("", slot, StoreConfig::default());
-    for (id, schema) in rows {
-        let spec = RelationSpec { id, kind: RelationKind::Stream, schema };
+    for (id, source) in rows {
+        let Source { schema, placement } = source.into();
+        let spec = RelationSpec {
+            id,
+            kind: RelationKind::Stream,
+            schema,
+            placement,
+        };
         registry.register(spec).expect("a stream registers without a store");
     }
     registry
 }
 
 /// [`sources_at`] the one worker of a single-worker process.
-pub(super) fn sources(rows: impl IntoIterator<Item = (u64, SchemaDescriptor)>) -> RelationRegistry {
+pub(super) fn sources<S: Into<Source>>(rows: impl IntoIterator<Item = (u64, S)>) -> RelationRegistry {
     sources_at(Slot::SOLO, rows)
 }
 

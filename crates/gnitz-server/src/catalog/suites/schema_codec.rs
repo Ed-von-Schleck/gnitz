@@ -4,15 +4,15 @@
 //! It lives on this side because nothing links this crate, so the client is the
 //! half that can be pulled in — as a dev-dependency.
 
-use crate::catalog::cache::CatalogRecord;
+use crate::catalog::cache::encode_record;
 use crate::catalog::CatalogColumn;
 use crate::test_support::arb_schema;
 use gnitz_expr::{ColumnTable, SchemaFacts};
+use gnitz_wire::schema_block::check_same_types;
 use gnitz_wire::{ColumnDef, TypeCode, MAX_PK_COLUMNS};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
 use proptest::prelude::*;
-use proptest::test_runner::TestCaseError;
 
 /// The catalog's column records for `schema`, named `c{i}`.
 fn catalog_defs(schema: &SchemaDescriptor) -> Vec<CatalogColumn> {
@@ -34,52 +34,29 @@ fn column_defs(schema: &SchemaDescriptor) -> impl Iterator<Item = ColumnDef> + '
         .map(|(i, c)| ColumnDef::new(format!("c{i}"), c.type_code, c.nullable))
 }
 
-fn assert_descriptor_eq(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Result<(), TestCaseError> {
-    prop_assert_eq!(
-        a.pk_cols(),
-        b.pk_cols(),
-        "pk_indices (declared order) changed on round-trip"
-    );
-    prop_assert_eq!(a.num_columns(), b.num_columns(), "column count changed on round-trip");
-    for i in 0..a.num_columns() {
-        prop_assert_eq!(
-            a.columns[i].type_code,
-            b.columns[i].type_code,
-            "type_code at col {} changed",
-            i
-        );
-        prop_assert_eq!(
-            a.columns[i].nullable,
-            b.columns[i].nullable,
-            "nullable at col {} changed",
-            i
-        );
-    }
-    Ok(())
-}
-
 proptest! {
     /// Catalog encoder → catalog decoder.
     #[test]
     fn schema_roundtrip_catalog_codec(schema in arb_schema(MAX_PK_COLUMNS)) {
-        let wire = CatalogRecord::new(schema.pk_cols(), &catalog_defs(&schema)).bytes;
-        let decoded = decode_schema_block(&wire)
-            .expect("decode must succeed for any valid schema");
-        assert_descriptor_eq(&schema, &decoded)?;
+        let record = encode_record(schema.pk_cols(), &catalog_defs(&schema));
+        prop_assert_eq!(decode_schema_block(&record).unwrap(), schema);
     }
 
     /// A record the catalog admits for a relation — names and hidden flags free
-    /// to differ — decodes to exactly what decoding it would give.
+    /// to differ — decodes to the relation's own schema.
     #[test]
     fn an_admitted_record_decodes_as_itself(schema in arb_schema(MAX_PK_COLUMNS), hidden in any::<bool>()) {
-        let catalog = CatalogRecord::new(schema.pk_cols(), &catalog_defs(&schema));
         let mut client = client_schema(&schema);
         for c in &mut client.columns {
             c.name = format!("renamed_{}", c.name);
             c.is_hidden = hidden;
         }
         let frame = client.to_block();
-        prop_assert_eq!(catalog.decode_of(&frame).unwrap(), decode_schema_block(&frame).unwrap());
+        prop_assert_eq!(
+            check_same_types(&frame, &encode_record(schema.pk_cols(), &catalog_defs(&schema))),
+            Ok(())
+        );
+        prop_assert_eq!(decode_schema_block(&frame).unwrap(), schema);
     }
 }
 

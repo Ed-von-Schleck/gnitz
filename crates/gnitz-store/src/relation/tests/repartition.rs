@@ -42,7 +42,7 @@ fn a_relayout_writes_filtered_terminal_runs() {
 
     let seeded = seed_set(rel, 400);
     // Each target passes the 4 KiB RAM tier only after several 64-row chunks.
-    repartition_relation(rel, &schema, 2, 4096, 64).unwrap();
+    repartition_relation(rel, &schema, Placement::full_pk(&schema), 2, 4096, 64).unwrap();
 
     let mut got = std::collections::HashMap::new();
     for k in 0..2 {
@@ -76,8 +76,9 @@ fn a_corrupt_source_body_fails_the_relayout_and_keeps_the_source_set() {
     let shard = shard_path(&source, entries[0].seq);
     crate::test_support::flip_last_byte_in_place(&shard);
 
+    let schema = make_schema_u64_i64();
     assert!(matches!(
-        repartition_relation(rel, &make_schema_u64_i64(), 2, 4096, 64),
+        repartition_relation(rel, &schema, Placement::full_pk(&schema), 2, 4096, 64),
         Err(e) if e.contains("corrupt: body checksum")
     ));
     assert!(std::path::Path::new(&shard).exists(), "the source shard survives");

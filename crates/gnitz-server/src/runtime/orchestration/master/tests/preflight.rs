@@ -18,33 +18,25 @@ fn build_check_batch_sorts_the_keys_into_its_rows() {
     assert_eq!(rows, want);
 }
 
-/// A probe batch carries the target's key and nothing else, whatever the
-/// table's payload: `handle_has_pk` reads back `get_pk_bytes` alone. And it is
-/// routed as the source is: `project_schema` stamps `KEYED_DEFAULT`, which on a
-/// `CLUSTER BY` table is a different router width, so probe rows would scatter
-/// to workers that do not store the key — and `PartialEq for SchemaDescriptor`
-/// ignores `placement`, so nothing downstream would catch it. A replicated
-/// source's probe is instead hash-spread over the full PK, since every worker
-/// holds it whole.
+/// An own-PK probe goes where the relation's keys are held. A replicated
+/// relation's is spread over the full PK instead, since every worker holds it
+/// whole.
 #[test]
-fn probe_schema_keeps_the_key_and_the_sources_routing() {
-    let source = pk_payload_schema(&[TypeCode::U64, TypeCode::U64]);
-    for (placement, spread) in [
-        (source.placement(), false),
-        (Placement::Keyed { prefix_len: 1 }, false),
-        (Placement::Replicated, true),
-    ] {
-        let source = source.with_placement(placement);
-        let probe = probe_schema(&source);
-        assert_eq!(probe.num_payload_cols(), 0, "{placement:?}");
-        assert_eq!(probe.pk_stride(), source.pk_stride(), "{placement:?}");
-        if spread {
-            assert!(!probe.placement().is_replicated());
-            assert_eq!(probe.dist_stride(), probe.pk_stride(), "the spread hashes the full PK");
-        } else {
-            assert_eq!(probe.placement(), placement);
-            assert_eq!(probe.dist_stride(), source.dist_stride(), "{placement:?}");
-        }
+fn an_own_pk_probe_follows_a_keyed_placement_and_spreads_a_replicated_one() {
+    use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StoreConfig};
+    let schema = pk_payload_schema(&[TypeCode::U64, TypeCode::U64]);
+    let (full, prefix) = (Placement::full_pk(&schema), Placement::keyed(&schema, 1));
+    for (placement, want) in [(full, full), (prefix, prefix), (Placement::Replicated, full)] {
+        // A stream is storeless, so it registers without a directory.
+        let mut registry = RelationRegistry::new("", gnitz_zset::schema::Slot::SOLO, StoreConfig::default());
+        let spec = RelationSpec {
+            id: 16,
+            kind: RelationKind::Stream,
+            schema,
+            placement,
+        };
+        registry.register(spec).unwrap();
+        assert_eq!(probe_placement(registry.relation(16).unwrap()), want, "{placement:?}");
     }
 }
 
@@ -61,7 +53,7 @@ fn check_batch_build_bench() {
     const ROWS: usize = 20_000;
     const ROUNDS: usize = 2_000;
 
-    let schema = probe_schema(&make_schema_u64_i64());
+    let schema = make_schema_u64_i64().pk_only();
     let keys: Vec<[u8; 8]> = (0..ROWS as u64).map(|i| i.to_be_bytes()).collect();
 
     // One warm round, so the pooled arena is already the right size and the
@@ -86,7 +78,7 @@ fn rows_of_names_every_row_a_key_prefixes() {
         keyspace: ProbeKeyspace::OwnPk,
         probe: Probe::Exists,
         batch: build_check_batch_pk_bytes(&schema, keys.iter().map(|k| &k[..])),
-        schema: wire::WireSchema::encoded(1, schema),
+        schema: wire::WireSchema::encoded(1, &schema),
     };
     assert_eq!(check.rows_of(&key(3, 1)), 1..3, "a duplicate key");
     assert_eq!(check.rows_of(&key(3, 2)), 3..3, "an absent key");

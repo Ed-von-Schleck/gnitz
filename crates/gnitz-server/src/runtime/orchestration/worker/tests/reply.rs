@@ -2,7 +2,6 @@ use super::send_unique_preflight_keys;
 use crate::runtime::test_support::key_producer;
 use crate::runtime::w2m::fixtures::make_ring;
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
-use crate::runtime::wire::unique_preflight_wire_schema;
 use crate::test_support::pk_only_schema;
 use gnitz_wire::{TypeCode, WireStatus};
 use gnitz_zset::schema::SchemaDescriptor;
@@ -41,8 +40,8 @@ fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, request_
 /// full one.
 #[test]
 fn a_preflight_train_carries_every_span_and_ends_once() {
-    // Two U64 index columns → a 16-byte composite span, derived as both ends do.
-    let frame_schema = unique_preflight_wire_schema(&pk_only_schema(&[TypeCode::U64; 3]), 2);
+    // Two U64 index columns → a 16-byte composite span.
+    let frame_schema = pk_only_schema(&[TypeCode::U64; 2]);
     let extremes = [
         0u128,
         1,

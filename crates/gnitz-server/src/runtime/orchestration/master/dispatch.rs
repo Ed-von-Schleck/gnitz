@@ -440,8 +440,14 @@ impl MasterDispatcher {
         if recoverable {
             self.unflushed_pushes.set(true);
         }
-        let relation = wire::WireSchema::from_catalog(self.cat(), target_id);
-        with_routed(batch, &relation, self.num_workers(), |_, data| {
+        let cat = self.cat();
+        let relation = wire::WireSchema::from_catalog(cat, target_id);
+        let placement = cat
+            .registry
+            .relation(target_id)
+            .expect("a push target is registered under the catalog lock")
+            .placement();
+        with_routed(batch, placement, self.num_workers(), |_, data| {
             scope.write(&DirectGroup::push(&relation, data, request_id), recoverable)
         })
     }

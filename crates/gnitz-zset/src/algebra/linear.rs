@@ -54,19 +54,16 @@ pub fn null_extend_output_schema(
     nulls_first: bool,
 ) -> Result<SchemaDescriptor, String> {
     let mut b = DerivedSchema::new();
-    let over = |e| format!("null-extend: merged schema {e}");
-    b.push_pk_of(in_schema).map_err(over)?;
-    let fill = |b: &mut DerivedSchema| {
-        type_codes
-            .iter()
-            .try_for_each(|&tc| b.push(SchemaColumn::new(tc, true)))
-    };
-    match nulls_first {
-        true => fill(&mut b).and_then(|()| b.push_payload_of(in_schema)),
-        false => b.push_payload_of(in_schema).and_then(|()| fill(&mut b)),
+    b.push_pk_of(in_schema);
+    let fill = |b: &mut DerivedSchema| type_codes.iter().for_each(|&tc| b.push(SchemaColumn::new(tc, true)));
+    if nulls_first {
+        fill(&mut b);
+        b.push_payload_of(in_schema);
+    } else {
+        b.push_payload_of(in_schema);
+        fill(&mut b);
     }
-    .map_err(over)?;
-    Ok(b.finish())
+    b.finish().map_err(|e| format!("null-extend: merged schema {e}"))
 }
 
 /// Union: algebraic addition of two Z-Set streams. Two consolidated inputs take an

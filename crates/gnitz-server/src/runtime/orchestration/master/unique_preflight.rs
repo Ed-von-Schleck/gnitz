@@ -105,7 +105,7 @@ impl MasterDispatcher {
         owner_id: u64,
         col_indices: &[u32],
     ) -> Result<Option<UniqueFilter>, WireFault> {
-        let (idx_schema, packed) = {
+        let (spec, packed) = {
             let cat = self.cat();
             let Some(owner_schema) = cat.registry.relation(owner_id).map(Relation::schema) else {
                 // Created in this same bundle, so empty: seed it and spare the
@@ -113,14 +113,14 @@ impl MasterDispatcher {
                 return Ok(Some(UniqueFilter::new()));
             };
             // What the IDX_TAB precheck refuses is refused before any scan.
-            let idx_schema = cat.validate_index_create(owner_id, col_indices)?;
+            let spec = cat.validate_index_create(owner_id, col_indices)?;
             // A PK-covering index skips the scan, and every check it would ever plan.
             if owner_schema.covers_pk(col_indices) {
                 return Ok(None);
             }
-            (idx_schema, gnitz_wire::pack_pk_cols(col_indices))
+            (spec, gnitz_wire::pack_pk_cols(col_indices))
         };
-        let frame_schema = wire::unique_preflight_wire_schema(&idx_schema, col_indices.len());
+        let frame_schema = spec.span_schema();
 
         // The read routes a REPLICATED owner to one worker: under a fan-out each
         // distinct value would arrive `nw` times and pop adjacently in the merge

@@ -421,15 +421,9 @@ pub fn index_key_type(field_type: TypeCode) -> Option<TypeCode> {
     }
 }
 
-/// Promote every indexed column type via [`index_key_type`] and validate the
-/// resulting index-record layout. An index schema is
-/// `(promoted_0, …, promoted_{n-1}, src_pk_0, …)` with every column in the PK,
-/// so its PK arity is `n + src_pk_count`, capped by `MAX_PK_COLUMNS` — which
-/// also keeps its stride within `MAX_PK_BYTES`, every key type being at most 16
-/// bytes. Returns the promoted type list. The single source of truth
-/// shared by the SQL planner's CREATE INDEX pre-check and the engine's
-/// `make_index_schema`, so the friendly planner error and the engine backstop
-/// can never disagree on a column's promoted width or the limits.
+/// The promoted key type of each indexed column, or the rule the index breaks.
+/// An index record keys on the promoted columns then the source PK, so its PK
+/// arity is `col_types.len() + src_pk_count`.
 pub fn index_key_types(col_types: &[TypeCode], src_pk_count: usize) -> Result<Vec<TypeCode>, IndexKeyRule> {
     let mut promoted: Vec<TypeCode> = Vec::with_capacity(col_types.len());
     for (col, &t) in col_types.iter().enumerate() {

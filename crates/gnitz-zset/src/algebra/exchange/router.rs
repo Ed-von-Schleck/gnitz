@@ -6,7 +6,7 @@ use crate::algebra::reindex::{FoldCols, ReindexPacker};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::Slot;
 use crate::schema::{worker_for_key, worker_for_pk_bytes};
-use crate::schema::{ColumnLocator, SchemaDescriptor};
+use crate::schema::{ColumnLocator, Placement, SchemaDescriptor};
 
 /// Keep only the live rows `slot` owns: those whose PK `worker_for_pk_bytes`
 /// routes to it, the hash the equality scatter routes a join key by. A broadcast
@@ -57,12 +57,13 @@ impl ScatterPlan {
         Ok(ScatterPlan(key.map_or(Key::Packed(packer), Key::Group)))
     }
 
-    /// The route `schema`'s own rows are placed by: the distribution prefix
-    /// `worker_for_pk` hashes, or every worker for a replicated relation.
-    pub fn native(schema: &SchemaDescriptor) -> Self {
-        match schema.placement().is_replicated() {
-            true => Self::broadcast(),
-            false => ScatterPlan(Key::Group(GroupKey::PkPrefix(schema.dist_stride()))),
+    /// The route a relation's own rows are placed by. Panics on `Placement::Local`,
+    /// whose rows have no key owner.
+    pub fn native(placement: Placement) -> Self {
+        match placement {
+            Placement::Replicated => Self::broadcast(),
+            Placement::Keyed { dist_stride } => ScatterPlan(Key::Group(GroupKey::PkPrefix(dist_stride as usize))),
+            Placement::Local => panic!("ScatterPlan::native: a Local relation's rows have no key owner"),
         }
     }
 
@@ -76,12 +77,11 @@ impl ScatterPlan {
         ScatterPlan(Key::Group(GroupKey::PkPrefix(schema.pk_stride())))
     }
 
-    /// When true, the exchange this plan describes moves nothing: it hashes
-    /// exactly the bytes `worker_for_pk` placed `schema`'s rows by, `schema` being
-    /// the relation whose PK region the plan's input carries.
-    pub fn routes_to_native_owner(&self, schema: &SchemaDescriptor) -> bool {
-        schema.placement().is_key_routed()
-            && matches!(self.0, Key::Group(GroupKey::PkPrefix(n)) if n == schema.dist_stride())
+    /// True when this plan hashes exactly the bytes `placement` places rows by,
+    /// so an exchange by it over rows so placed moves nothing.
+    pub fn routes_to_native_owner(&self, placement: Placement) -> bool {
+        matches!((&self.0, placement),
+            (Key::Group(GroupKey::PkPrefix(n)), Placement::Keyed { dist_stride }) if *n == dist_stride as usize)
     }
 
     /// Reset `out` to one ascending list per worker of the live rows of `batch`

@@ -1859,6 +1859,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
             id: tid,
             kind: RelationKind::BaseTable,
             schema,
+            placement: Placement::full_pk(&schema),
         })
         .unwrap();
     engine

@@ -100,7 +100,13 @@ fn a_circuit_no_plan_can_be_carved_from_is_rejected() {
     for (build, guard) in cases {
         let mut c = Circuit::default();
         build(&mut c);
-        let compiled = compile_view(&loaded(c), &sources([(10, schema), (11, schema)]), &schema, false);
+        let compiled = compile_view(
+            &loaded(c),
+            &sources([(10, schema), (11, schema)]),
+            &schema,
+            Placement::full_pk(&schema),
+            false,
+        );
         assert_eq!(rejection(compiled), guard);
     }
 }
@@ -125,7 +131,13 @@ fn a_circuit_over_the_node_limit_is_rejected() {
 fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
     let compile = |source: SchemaDescriptor, view: SchemaDescriptor| {
         let circuit = loaded(identity_circuit(10, ReadBound::None));
-        compile_view(&circuit, &sources([(10, source)]), &view, false)
+        compile_view(
+            &circuit,
+            &sources([(10, source)]),
+            &view,
+            Placement::full_pk(&view),
+            false,
+        )
     };
     let pk_only = pk_only_schema(&[TypeCode::U64]);
     assert!(compile(pk_only, pk_only).is_ok(), "an equal pair compiles");
@@ -155,7 +167,13 @@ fn a_float_shard_column_is_rejected() {
         let a = scan(&mut c, 10);
         let s = c.shard(a, &[shard_col]);
         c.sink(s);
-        compile_view(&loaded(c), &sources([(10, schema)]), &schema, false)
+        compile_view(
+            &loaded(c),
+            &sources([(10, schema)]),
+            &schema,
+            Placement::full_pk(&schema),
+            false,
+        )
     };
     assert!(compile(0).is_ok(), "an integer shard column compiles");
     assert_eq!(
@@ -170,11 +188,12 @@ fn a_float_shard_column_is_rejected() {
 /// every worker computed the same rows, and takes a round otherwise.
 #[test]
 fn a_side_relays_only_what_is_not_already_in_place() {
-    let keyed = make_schema_u64_i64();
-    let replicated = keyed.with_placement(Placement::Replicated);
+    let view = make_schema_u64_i64();
+    let keyed = Source::from(view);
+    let replicated = keyed.placed(Placement::Replicated);
     // One `ScanDelta → [mid] → ExchangeShard(cols)` side per source, unioned into
     // the sink of a partitioned view; the relays in circuit order.
-    let relays = |of: u32, sides: &[(SchemaDescriptor, Option<OpNode>, &[u32])]| {
+    let relays = |of: u32, sides: &[(Source, Option<OpNode>, &[u32])]| {
         let mut c = Circuit::default();
         let shards: Vec<NodeId> = (10..)
             .zip(sides)
@@ -189,7 +208,8 @@ fn a_side_relays_only_what_is_not_already_in_place() {
         let out = shards.into_iter().reduce(|a, b| c.union(a, b)).unwrap();
         c.sink(out);
         let registry = sources_at(Slot::new(0, of), (10..).zip(sides.iter().map(|s| s.0)));
-        let (out, _) = compile_view(&loaded(c), &registry, &keyed, false).expect("the fixture compiles");
+        let (out, _) =
+            compile_view(&loaded(c), &registry, &view, Placement::full_pk(&view), false).expect("the fixture compiles");
         out.sides.iter().map(|s| route(s.relay.as_ref())).collect::<Vec<_>>()
     };
     let negate = || Some(OpNode::Negate);
@@ -250,26 +270,37 @@ fn global_circuit(op: &OpNode, shard: Option<&[u32]>) -> Circuit {
 
 /// Compile a [`global_circuit`] over `source` as worker `slot`, into a view placed
 /// as `source` is.
-fn compile_global(circuit: Circuit, source: SchemaDescriptor, slot: Slot) -> Result<CompileOutput, String> {
+fn compile_global(circuit: Circuit, source: Source, slot: Slot) -> Result<CompileOutput, String> {
+    let Source { schema, placement } = source;
     let view = circuit
         .nodes()
         .iter()
         .find_map(|n| match &n.op {
             OpNode::Reduce { agg, .. } => Some(
-                *gnitz_zset::stream::ReducePlan::from_wire(&source, &[], agg, true)
+                *gnitz_zset::stream::ReducePlan::from_wire(&schema, &[], agg, true)
                     .unwrap()
                     .output_schema(),
             ),
             OpNode::TopN { order, limit, offset, .. } => Some(
-                gnitz_zset::stream::TopNPlan::from_wire(&source, &[], order, *limit, *offset)
+                gnitz_zset::stream::TopNPlan::from_wire(&schema, &[], order, *limit, *offset)
                     .unwrap()
                     .output_schema,
             ),
             _ => None,
         })
-        .expect("a global operator")
-        .with_placement(source.placement());
-    compile_view(&loaded(circuit), &sources_at(slot, [(10, source)]), &view, false).map(|(out, _)| out)
+        .expect("a global operator");
+    let view_placement = match placement {
+        Placement::Keyed { .. } => Placement::full_pk(&view),
+        p => p,
+    };
+    compile_view(
+        &loaded(circuit),
+        &sources_at(slot, [(10, source)]),
+        &view,
+        view_placement,
+        false,
+    )
+    .map(|(out, _)| out)
 }
 
 /// A side ends in its global operator's partial — a layout of its own — exactly
@@ -277,11 +308,11 @@ fn compile_global(circuit: Circuit, source: SchemaDescriptor, slot: Slot) -> Res
 /// its input as is.
 #[test]
 fn a_global_operator_splits_only_where_partials_combine_and_workers_differ() {
-    let keyed = make_schema_u64_i64();
-    let replicated = keyed.with_placement(Placement::Replicated);
-    let split = |circuit: Circuit, source: SchemaDescriptor, of: u32| {
+    let keyed = Source::from(make_schema_u64_i64());
+    let replicated = keyed.placed(Placement::Replicated);
+    let split = |circuit: Circuit, source: Source, of: u32| {
         let out = compile_global(circuit, source, Slot::new(0, of)).expect("the fixture compiles");
-        !out.sides[0].plan.vm.program.out_schema().same_layout(&source)
+        !out.sides[0].plan.vm.program.out_schema().same_layout(&source.schema)
     };
     for (why, op, source, of, want) in [
         ("a partitioned SUM", global_reduce(AggFunc::Sum), keyed, 4, true),
@@ -317,14 +348,14 @@ fn a_global_operator_splits_only_where_partials_combine_and_workers_differ() {
 /// sends every row to.
 #[test]
 fn the_ground_row_is_seeded_where_the_whole_input_arrives() {
-    let keyed = make_schema_u64_i64();
+    let keyed = Source::from(make_schema_u64_i64());
     let op = global_reduce(AggFunc::Min);
-    let seeds = |shard: Option<&[u32]>, source: SchemaDescriptor, slot: Slot| {
+    let seeds = |shard: Option<&[u32]>, source: Source, slot: Slot| {
         compile_global(global_circuit(&op, shard), source, slot).map(|out| out.post.vm.pending_ground_row)
     };
     assert_eq!(seeds(None, keyed, Slot::SOLO), Ok(true), "one worker");
     assert_eq!(
-        seeds(None, keyed.with_placement(Placement::Replicated), Slot::new(2, 4)),
+        seeds(None, keyed.placed(Placement::Replicated), Slot::new(2, 4)),
         Ok(true),
         "a replicated view"
     );
@@ -339,7 +370,7 @@ fn the_ground_row_is_seeded_where_the_whole_input_arrives() {
         "reduce: a global aggregate under a keyed exchange shard"
     );
 
-    let probe = make_batch(&keyed, &[(1, 1, 1)]);
+    let probe = make_batch(&keyed.schema, &[(1, 1, 1)]);
     let (seeded, receives): (Vec<bool>, Vec<bool>) = (0..4)
         .map(|rank| {
             let slot = Slot::new(rank, 4);

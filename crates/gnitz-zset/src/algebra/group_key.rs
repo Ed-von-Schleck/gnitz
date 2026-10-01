@@ -9,7 +9,7 @@ use super::reindex::{locate_key_col, FoldCols};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::key::{pk_width_dispatch, NarrowPkOpk, PkSortKey};
 use crate::schema::{
-    ColumnLocator, DerivedSchema, ReduceOutKey, SchemaBound, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode,
+    ColumnLocator, DerivedSchema, ReduceOutKey, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode,
 };
 use gnitz_wire::{ReduceOutSlot, NARROW_PK_MAX_BYTES};
 
@@ -97,7 +97,6 @@ impl GroupOutKey {
             GroupKey::Fold(_) => ReduceOutKey::SyntheticFold,
             _ => ReduceOutKey::Natural,
         };
-        let over = |e: SchemaBound| format!("group key: output {e}");
         let mut b = DerivedSchema::new();
         let mut carried = Vec::new();
         for slot in kind.output_layout(group_cols, row) {
@@ -109,7 +108,6 @@ impl GroupOutKey {
                     b.push(input.columns[c as usize])
                 }
             }
-            .map_err(over)?;
         }
         Ok((GroupOutKey { key, carried }, b))
     }

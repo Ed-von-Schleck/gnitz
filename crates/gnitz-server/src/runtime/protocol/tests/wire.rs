@@ -56,9 +56,11 @@ fn every_frame_shape_round_trips_and_no_prefix_decodes() {
     let frame = raw.wire_frame_within(2, 0, raw.wire_byte_size_range(3));
     assert_eq!(frame.rows(), 3, "a budget of three rows frames three");
 
-    let fixed_rel = WireSchema::encoded(5, fixed);
-    let string_rel = WireSchema::encoded(6, *strings.schema());
-    let padded_rel = WireSchema::encoded(7, *padded.schema());
+    // Each relation beside the schema its block was encoded from.
+    let rel = |tid, schema: &SchemaDescriptor| (WireSchema::encoded(tid, schema), *schema);
+    let fixed_rel = rel(5, &fixed);
+    let string_rel = rel(6, strings.schema());
+    let padded_rel = rel(7, padded.schema());
     let claims_consolidated = WireFlags {
         batch_consolidated: true,
         ..Default::default()
@@ -127,7 +129,7 @@ fn every_frame_shape_round_trips_and_no_prefix_decodes() {
     ];
 
     for (shape, (rel, msg)) in shapes.into_iter().enumerate() {
-        let msg = rel.map_or(msg, |r| r.frame(msg));
+        let msg = rel.map_or(msg, |(r, _)| r.frame(msg));
         let wire = msg.encode_to_vec();
         let d = decode_sal_slot(&wire, |_, _| None).unwrap_or_else(|e| panic!("shape {shape}: {e}"));
         let sent = sent(msg.data);
@@ -144,7 +146,7 @@ fn every_frame_shape_round_trips_and_no_prefix_decodes() {
         };
         assert_eq!(d.control.hdr, hdr, "shape {shape}");
         assert_eq!(d.blob, msg.blob, "shape {shape}");
-        assert_eq!(d.schema, rel.map(|r| *r.descriptor()), "shape {shape}");
+        assert_eq!(d.schema, rel.map(|(_, schema)| *schema), "shape {shape}");
         match (sent, d.data_batch) {
             (None, None) => {}
             (Some((src, rows)), Some(got)) => {
@@ -201,7 +203,7 @@ fn a_sal_slot_lays_its_rows_out_under_the_known_schema() {
 fn a_client_frame_keeps_no_claim_and_needs_a_schema() {
     let sd = make_schema_u64_i64();
     let batch = make_batch(&sd, &[(1, 1, 10), (2, 3, 20)]);
-    let rel = WireSchema::encoded(3, sd);
+    let rel = WireSchema::encoded(3, &sd);
     let decode = |wire: &[u8], recordless: Option<&SchemaDescriptor>, known: fn(&[u8]) -> _| {
         decode_client_frame(wire, peek_control_block(wire)?, recordless, known)
     };

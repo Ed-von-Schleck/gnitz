@@ -2,7 +2,7 @@
 //! recorded them.
 
 use gnitz_wire::TypeCode;
-use gnitz_zset::schema::{key_prefixed_schema, Placement, SchemaColumn, SchemaDescriptor};
+use gnitz_zset::schema::{key_prefixed_schema, SchemaColumn, SchemaDescriptor};
 
 /// The delta store's stamp column: the `_tick` round number, leading the delta
 /// schema's PK. Named so its width is read off the column rather than written as
@@ -27,10 +27,8 @@ pub(crate) fn delta_round(delta_key: &[u8]) -> u64 {
 /// view's PK, then its payload, so the view's payload space is the delta's.
 /// Derived rather than persisted, as an index schema is. `None` for a view with
 /// no column to spare for the stamp.
-///
-/// [`Placement::Local`]: each row lives on the worker that produced it.
 pub(crate) fn make_delta_schema(view: &SchemaDescriptor) -> Option<SchemaDescriptor> {
-    Some(key_prefixed_schema(DELTA_TICK_COL, view)?.with_placement(Placement::Local))
+    key_prefixed_schema(DELTA_TICK_COL, view)
 }
 
 // The stamp is one U64 column ahead of a view PK of at most `PK_LIST_MAX_COLS`

@@ -8,14 +8,14 @@ use std::hint::black_box;
 /// PK `(U32, I32, U64, U64)` — 24 bytes, so the whole PK routes by the wide
 /// hash and every proper prefix by its narrow image — over
 /// `[I64, I64 NULL, STRING NULL, U128, I16]` at columns 4..=8.
-fn schema(placement: Placement) -> SchemaDescriptor {
+fn schema() -> SchemaDescriptor {
     use TypeCode::*;
     let cols = [U32, I32, U64, U64, I64, I64, String, U128, I16];
     let cols: Vec<SchemaColumn> = (0..)
         .zip(cols)
         .map(|(c, tc)| SchemaColumn::new(tc, c == 5 || c == 6))
         .collect();
-    SchemaDescriptor::new(&cols, &[0, 1, 2, 3]).with_placement(placement)
+    SchemaDescriptor::new(&cols, &[0, 1, 2, 3])
 }
 
 /// Rows past two packer chunks: every key column repeats values across rows,
@@ -71,7 +71,7 @@ const NW: usize = 4;
 /// its group by: a PK prefix, one column's image, or the NULL-distinct fold.
 #[test]
 fn a_group_scatter_routes_each_row_to_its_output_pks_owner() {
-    let schema = schema(Placement::KEYED_DEFAULT);
+    let schema = schema();
     let (b, empty) = (batch(&schema), Batch::empty_with_schema(&schema));
     for cols in [
         &[][..],
@@ -100,7 +100,7 @@ fn a_group_scatter_routes_each_row_to_its_output_pks_owner() {
 /// worker the compiler lets seed a global aggregate's ground row.
 #[test]
 fn a_keyless_group_scatter_routes_every_row_to_the_ground_owner() {
-    let schema = schema(Placement::KEYED_DEFAULT);
+    let schema = schema();
     let (b, plan) = (batch(&schema), ScatterPlan::group(&schema, &[]).unwrap());
     for nw in [1, 2, 3, 4, 7, 16, 64] {
         assert_routes(&plan, &b, nw, &format!("nw={nw}"), |_, _| ground_owner(nw));
@@ -113,7 +113,7 @@ fn a_keyless_group_scatter_routes_every_row_to_the_ground_owner() {
 #[test]
 fn a_join_scatter_routes_each_row_to_its_packed_keys_owner() {
     use TypeCode::{I64, U128};
-    let schema = schema(Placement::KEYED_DEFAULT);
+    let schema = schema();
     let b = batch(&schema);
     let own = |cols: &[u32]| self_typed_slots(&schema, cols);
     for (slots, packed) in [
@@ -140,11 +140,10 @@ fn a_join_scatter_routes_each_row_to_its_packed_keys_owner() {
     }
 }
 
-/// The worker filter keeps a rank's share by the whole PK, whatever prefix the
-/// schema distributes by.
+/// The worker filter keeps a rank's share by the whole PK.
 #[test]
 fn the_worker_filter_keeps_the_whole_pk_share() {
-    let schema = schema(Placement::Keyed { prefix_len: 1 });
+    let schema = schema();
     let b = batch(&schema);
     let whole_pk = ScatterPlan::group(&schema, &[0, 1, 2, 3]).unwrap();
     for nw in [1, NW as u32] {
@@ -198,24 +197,21 @@ fn a_key_the_schema_cannot_route_is_refused() {
 
 // ── routes_to_native_owner: the exchange-elision predicate ──────────────
 
-/// The predicate accepts exactly a key that hashes the bytes `worker_for_pk`
-/// placed the relation's rows by — a join key over the whole distribution
-/// prefix, and a group key there only where its output PK is those bytes, one
-/// column or the whole PK — and every plan it accepts does route each row to its
-/// table's own worker.
+/// The predicate accepts exactly the plans that hash the bytes the placement
+/// places rows by, and each plan it accepts routes every row to its owner.
 #[test]
 fn a_plan_routes_natively_exactly_over_the_distribution_prefix() {
     let pk = [0u32, 1, 2, 3];
+    let schema = schema();
+    let b = batch(&schema);
     for (placement, dist) in [
-        (Placement::Keyed { prefix_len: 1 }, Some(&pk[..1])),
-        (Placement::Keyed { prefix_len: 2 }, Some(&pk[..2])),
-        (Placement::Keyed { prefix_len: 3 }, Some(&pk[..3])),
-        (Placement::KEYED_DEFAULT, Some(&pk[..])),
+        (Placement::keyed(&schema, 1), Some(&pk[..1])),
+        (Placement::keyed(&schema, 2), Some(&pk[..2])),
+        (Placement::keyed(&schema, 3), Some(&pk[..3])),
+        (Placement::full_pk(&schema), Some(&pk[..])),
         (Placement::Replicated, None),
         (Placement::Local, None),
     ] {
-        let schema = schema(placement);
-        let b = batch(&schema);
         for cols in [&[][..], &[0], &[0, 1], &[0, 1, 2], &[0, 1, 2, 3], &[1], &[1, 0]] {
             let on_prefix = dist == Some(cols);
             let natural = cols.len() == 1 || cols.len() == pk.len();
@@ -229,10 +225,10 @@ fn a_plan_routes_natively_exactly_over_the_distribution_prefix() {
             ] {
                 let what = format!("{placement:?}, {kind} {cols:?}");
                 let plan = plan.expect("the fixture key routes");
-                assert_eq!(plan.routes_to_native_owner(&schema), want, "{what}");
+                assert_eq!(plan.routes_to_native_owner(placement), want, "{what}");
                 if want {
                     assert_routes(&plan, &b, NW, &what, |mb, row| {
-                        schema.worker_for_pk(mb.get_pk_bytes(row), NW)
+                        placement.owner(mb.get_pk_bytes(row), NW).unwrap()
                     });
                 }
             }
@@ -242,7 +238,7 @@ fn a_plan_routes_natively_exactly_over_the_distribution_prefix() {
             let mut promoted = self_typed_slots(&schema, dist);
             promoted[0].1 = TypeCode::U64;
             assert!(
-                !ScatterPlan::join(&schema, &promoted).is_ok_and(|p| p.routes_to_native_owner(&schema)),
+                !ScatterPlan::join(&schema, &promoted).is_ok_and(|p| p.routes_to_native_owner(placement)),
                 "{placement:?}: promoted"
             );
         }
@@ -253,13 +249,14 @@ fn a_plan_routes_natively_exactly_over_the_distribution_prefix() {
 /// hash, not the width: the fold does land rows off their table's worker.
 #[test]
 fn a_proper_prefix_group_key_routes_off_the_tables_worker() {
-    let schema = schema(Placement::Keyed { prefix_len: 2 });
+    let schema = schema();
+    let placement = Placement::keyed(&schema, 2);
     let b = batch(&schema);
     let mb = b.as_mem_batch();
     let (gk, _) = GroupOutKey::new(&schema, &[0, 1], []).unwrap();
     assert!(
-        (0..mb.count).any(|row| worker_for_pk_bytes(gk.out_pk(&mb, row).bytes(), NW)
-            != schema.worker_for_pk(mb.get_pk_bytes(row), NW)),
+        (0..mb.count).any(|row| Some(worker_for_pk_bytes(gk.out_pk(&mb, row).bytes(), NW))
+            != placement.owner(mb.get_pk_bytes(row), NW)),
         "the fold must disagree with the prefix hash somewhere"
     );
 }
@@ -278,7 +275,7 @@ fn a_layout_identical_promotion_routes_natively() {
             &[0],
         );
         assert!(
-            ScatterPlan::join(&s, &[(0, slot)]).is_ok_and(|p| p.routes_to_native_owner(&s)),
+            ScatterPlan::join(&s, &[(0, slot)]).is_ok_and(|p| p.routes_to_native_owner(Placement::full_pk(&s))),
             "{tc:?} typed {slot:?}"
         );
     }
@@ -298,40 +295,44 @@ fn bench_stripe(schema: &SchemaDescriptor, n: usize) -> Batch {
     b.finish()
 }
 
-/// Each live row lands in the slot of the worker its PK routes to — one slot
-/// for a replicated relation — and a weight-0 row in none.
+/// Each live row lands in the slot of the worker its placement owns it by —
+/// one slot for a replicated relation — and a weight-0 row in none.
 #[test]
 fn the_native_plan_places_each_live_row_by_its_placement() {
-    use crate::schema::Placement;
-    const NW: usize = 4;
-    let cols = [SchemaColumn::new(TypeCode::U64, false); 2];
+    let schema = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false); 2], &[0, 1]);
+    let mut bb = BatchBuilder::new(schema);
+    for b in 0..8u128 {
+        bb.begin_row_opk(&[7 + b % 2, b], if b == 3 { 0 } else { 1 });
+        bb.end_row();
+    }
+    let batch = bb.finish();
     for placement in [
-        Placement::Keyed { prefix_len: 1 },
-        Placement::Keyed { prefix_len: 2 },
+        Placement::keyed(&schema, 1),
+        Placement::full_pk(&schema),
         Placement::Replicated,
     ] {
-        let schema = SchemaDescriptor::new_with_placement(&cols, &[0, 1], placement);
-        let mut bb = BatchBuilder::new(schema);
-        for b in 0..8u128 {
-            bb.begin_row_opk(&[7 + b % 2, b], if b == 3 { 0 } else { 1 });
-            bb.end_row();
-        }
-        let batch = bb.finish();
         let live = (0..8u32).filter(|&i| i != 3);
         let want = match placement {
             Placement::Replicated => vec![live.collect::<Vec<_>>()],
             _ => {
                 let mut want = vec![Vec::new(); NW];
                 for i in live {
-                    want[schema.worker_for_pk(batch.get_pk_bytes(i as usize), NW)].push(i);
+                    want[placement.owner(batch.get_pk_bytes(i as usize), NW).unwrap()].push(i);
                 }
                 want
             }
         };
         let mut out = Vec::new();
-        let slots = ScatterPlan::native(&schema).route(&batch, &mut out, NW);
+        let slots = ScatterPlan::native(placement).route(&batch, &mut out, NW);
         assert_eq!(slots, &want[..], "{placement:?}");
     }
+}
+
+/// A `Local` relation's rows have no key owner, so no native plan exists.
+#[test]
+#[should_panic(expected = "a Local relation's rows have no key owner")]
+fn the_native_plan_of_a_local_relation_panics() {
+    ScatterPlan::native(Placement::Local);
 }
 
 /// Instructions per [`ScatterPlan::route`] call, and per row, for each routing

@@ -783,7 +783,7 @@ fn dropped_name_resolves_to_its_recreation() {
 }
 
 // ── replicated_bit_is_transitive_and_survives_replay ─────────────────
-// A view is stamped replicated iff every source it scans is, so the property
+// A view is replicated iff every source it scans is, so the property
 // climbs a view chain: base → producer → consumer. Registration reads its
 // sources' already-registered state, so `hook_relation_register` must process a batch
 // in dependency order — which neither order it sees is. Both are reproduced here:
@@ -832,7 +832,6 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     }
     engine.ingest_to_family(gnitz_wire::VIEW_TAB, &bb.finish()).unwrap();
 
-    // Whether a registered relation is stamped replicated.
     let stamp = |e: &mut CatalogEngine, id: u64| e.registry.relation_or_err(id).expect("registered").is_replicated();
     let assert_stamps = |e: &mut CatalogEngine, when: &str| {
         assert!(stamp(e, rt), "replicated base table ({when})");

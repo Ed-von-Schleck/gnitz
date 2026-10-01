@@ -14,7 +14,7 @@ use gnitz_store::relation::{
 };
 use gnitz_wire::ViewProps;
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::{SchemaDescriptor, Slot};
+use gnitz_zset::schema::{Placement, SchemaDescriptor, Slot};
 
 use crate::record::{descriptor_of_block, MirrorRecord};
 
@@ -358,5 +358,6 @@ fn copy_spec(tid: u64, schema: SchemaDescriptor) -> RelationSpec {
         id: tid,
         kind: RelationKind::View(ViewProps::Plain),
         schema,
+        placement: Placement::Local,
     }
 }

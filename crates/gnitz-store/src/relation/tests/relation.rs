@@ -15,14 +15,17 @@ fn table(id: u64, schema: SchemaDescriptor) -> RelationSpec {
         id,
         kind: RelationKind::BaseTable,
         schema,
+        placement: Placement::full_pk(&schema),
     }
 }
 
 fn view(id: u64) -> RelationSpec {
+    let schema = pk_only_schema(&[TypeCode::U64]);
     RelationSpec {
         id,
         kind: RelationKind::View(ViewProps::Plain),
-        schema: pk_only_schema(&[TypeCode::U64]),
+        schema,
+        placement: Placement::full_pk(&schema),
     }
 }
 

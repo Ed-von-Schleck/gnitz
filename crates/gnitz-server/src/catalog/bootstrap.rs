@@ -57,6 +57,8 @@ impl CatalogEngine {
                     id: family.id(),
                     kind: RelationKind::SystemCatalog,
                     schema: *family.schema(),
+                    // DDL is master-broadcast, so each worker holds a full copy.
+                    placement: Placement::Replicated,
                 })
                 .map_err(|e| format!("Failed to create system table '{}': error {e}", family.name()))?;
             engine.enter_relation(

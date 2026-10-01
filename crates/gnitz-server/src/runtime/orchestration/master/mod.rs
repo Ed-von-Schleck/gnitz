@@ -79,25 +79,28 @@ struct ReadRoute {
     per_worker: Option<Vec<Vec<u8>>>,
 }
 
-/// Which workers answer a read of a relation with `schema` bounded by `blob`,
-/// and what each is sent. A replicated relation is read off worker 0. A key set
-/// reaches the owners of its keys, each sent its own; an empty one is answered
-/// by worker 0.
-fn route_read(schema: &SchemaDescriptor, blob: Option<&[u8]>, nw: usize) -> ReadRoute {
+/// Which workers answer a read, bounded by `blob`, of a relation with `schema`
+/// placed by `placement`, and what each is sent.
+fn route_read(schema: &SchemaDescriptor, placement: Placement, blob: Option<&[u8]>, nw: usize) -> ReadRoute {
     let whole = |set| ReadRoute { set, per_worker: None };
-    match (schema.placement(), blob.and_then(gnitz_wire::peek_bound)) {
+    let owner = |k: &[u8]| placement.owner(k, nw).expect("a key-routed placement owns every key");
+    match (placement, blob.and_then(gnitz_wire::peek_bound)) {
         (Placement::Replicated, _) => whole(WorkerSet::one(Placement::REPLICA_OWNER as usize)),
-        (_, Some(BoundPeek::Range(r))) => whole(schema.confined_worker(&r, nw).map_or(WorkerSet::ALL, WorkerSet::one)),
-        (Placement::Keyed { .. }, Some(BoundPeek::PkSet(s))) if s.stride == schema.pk_stride() => {
+        (_, Some(BoundPeek::Range(r))) => whole(
+            placement
+                .confined_worker(schema, &r, nw)
+                .map_or(WorkerSet::ALL, WorkerSet::one),
+        ),
+        (_, Some(BoundPeek::PkSet(s))) if placement.is_key_routed() && s.stride == schema.pk_stride() => {
             let keys = || s.keys.chunks_exact(s.stride);
-            let set = keys().fold(WorkerSet::EMPTY, |set, k| set.with(schema.worker_for_pk(k, nw)));
+            let set = keys().fold(WorkerSet::EMPTY, |set, k| set.with(owner(k)));
             match set.len() {
                 0 => whole(WorkerSet::one(0)),
                 1 => whole(set),
                 _ => {
                     let mut by_owner = vec![Vec::new(); nw];
                     for k in keys() {
-                        by_owner[schema.worker_for_pk(k, nw)].extend_from_slice(k);
+                        by_owner[owner(k)].extend_from_slice(k);
                     }
                     let per_worker = by_owner
                         .iter()
@@ -145,8 +148,15 @@ impl<'d> ScanCut<'d> {
     /// own key set when the bound splits one.
     pub(crate) fn read(&mut self, group: DirectGroup<'_>) -> Result<(), WireFault> {
         let bound = group.kind.carries_read_bound().then_some(group.template.blob);
-        let schema = self.disp.schema_desc_for(group.template.target_id);
-        let route = route_read(&schema, bound, self.disp.num_workers());
+        let tid = group.template.target_id;
+        let (schema, placement) = self
+            .disp
+            .cat()
+            .registry
+            .relation(tid)
+            .map(|rel| (rel.schema(), rel.placement()))
+            .unwrap_or_else(|| panic!("master: no relation for target_id={tid}"));
+        let route = route_read(&schema, placement, bound, self.disp.num_workers());
         self.push(group.kind, route.set, |excl, targets| {
             excl.write(&DirectGroup {
                 extras: route.per_worker.as_deref(),

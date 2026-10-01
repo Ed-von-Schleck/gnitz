@@ -37,7 +37,7 @@ impl TopNPlan {
             return Err("top-n: a zero limit selects nothing".to_string());
         }
         let (key, prefix) = GroupOutKey::new(input_schema, group_cols, 0..input_schema.num_columns() as u32)?;
-        let output_schema = prefix.finish();
+        let output_schema = prefix.finish().map_err(|e| format!("top-n: output {e}"))?;
         let index = TopNIndex::new(input_schema, group_cols, order, &output_schema)?;
         Ok(TopNPlan { output_schema, key, offset, limit, index })
     }

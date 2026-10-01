@@ -15,7 +15,7 @@ impl RelationRegistry {
     /// column `ref_col`.
     pub fn gather_bytes(&self, id: u64, keys: PkKeys, ref_col: u8) -> Result<Batch, String> {
         let entry = self.relation_or_err(id)?;
-        Ok(entry.gather(keys, None).project_live(&[ref_col as u32]))
+        entry.gather(keys, None).project_live(&[ref_col as u32])
     }
 
     /// Open `bound`'s source over `id`, without walking it, and the part of `bound`

@@ -216,18 +216,15 @@ impl ReindexPacker {
         in_schema: &SchemaDescriptor,
         payload_cols: &[u32],
     ) -> Result<SchemaDescriptor, String> {
-        let over = |e| format!("reindex map: output {e}");
         let mut b = DerivedSchema::new();
-        for c in self.key_columns() {
-            b.push_pk(c).map_err(over)?;
-        }
+        self.key_columns().for_each(|c| b.push_pk(c));
         for &c in payload_cols {
             let col = in_schema
                 .column(c as usize)
                 .ok_or_else(|| oob_col("reindex map: payload column", c, in_schema))?;
-            b.push(col).map_err(over)?;
+            b.push(col);
         }
-        Ok(b.finish())
+        b.finish().map_err(|e| format!("reindex map: output {e}"))
     }
 
     /// Build the packer for a **group** key over `group_cols`, and the PK region
@@ -273,10 +270,10 @@ impl ReindexPacker {
         let fold = FoldCols::new(group[packed.len()..].iter().map(|&(_, loc)| loc).collect());
         let packer = Self::finish(KeySpec::of(packed), has_bitmap, fold);
         let mut b = DerivedSchema::new();
-        for c in packer.key_columns().chain(suffix.iter().copied()) {
-            b.push_pk(c)
-                .expect("a group key packed inside the suffix's budget, plus the suffix, is non-null PK-eligible");
-        }
+        packer
+            .key_columns()
+            .chain(suffix.iter().copied())
+            .for_each(|c| b.push_pk(c));
         Ok((packer, b))
     }
 

@@ -77,7 +77,7 @@ async fn hold_push_for_ddl(shared: &Shared, target_id: u64, seen: &Rc<[u8]>) {
         shared
             .cat()
             .schema_record(target_id)
-            .is_none_or(|now| !Rc::ptr_eq(seen, &now.bytes))
+            .is_none_or(|now| !Rc::ptr_eq(seen, &now))
     })
     .await
 }
@@ -699,9 +699,16 @@ fn decode_push_frame(
 ) -> Result<(ipc::DecodedWire, Rc<[u8]>), WireFault> {
     let tid = ctrl.hdr.target_id;
     let target = cat.schema_record(tid).ok_or_else(|| not_found(tid))?;
-    let wire = ipc::decode_client_frame(data, ctrl, None, |record| target.decode_of(record).map(Some))
-        .map_err(|e| format!("decode error: {e}"))?;
-    Ok((wire, target.bytes))
+    let schema = cat
+        .registry
+        .relation(tid)
+        .map(Relation::schema)
+        .ok_or_else(|| not_found(tid))?;
+    let wire = ipc::decode_client_frame(data, ctrl, None, |record| {
+        gnitz_wire::schema_block::check_same_types(record, &target).map(|()| Some(schema))
+    })
+    .map_err(|e| format!("decode error: {e}"))?;
+    Ok((wire, target))
 }
 
 /// Handle a client push: decode the frame, then commit it under the catalog read

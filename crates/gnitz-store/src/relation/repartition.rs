@@ -1,11 +1,9 @@
 //! Boot-time relayout of a base relation's children onto the launched worker
 //! count.
 //!
-//! A child's *contents* depend on the worker count — `w{k}of{n}` holds exactly
-//! the rows `worker_for_pk(pk, n) == k` — so a restart at a different count has
-//! to move data: the launched-count set is written beside a complete source set,
-//! which is removed only once the target is durable, so a crash leaves the
-//! source intact. Runs on the master pre-fork, before the relation's store opens.
+//! A child `w{k}of{n}` holds the rows worker `k` of `n` owns, so a restart at a
+//! different count moves data: the launched-count set is written beside a
+//! complete source set, which is removed only once the target is durable.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -17,7 +15,7 @@ use super::{ChildAddr, ChildKind};
 use crate::storage::{flush_barrier, link_store, retire_store, RecoverySource, StoreBudgets, Table};
 use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::repr::{from_runs, Batch, StorageError};
-use gnitz_zset::schema::{SchemaDescriptor, Slot};
+use gnitz_zset::schema::{Placement, SchemaDescriptor, Slot};
 
 /// The worker count of the complete child set to relay onto `launched`; `None`
 /// when nothing moves. A set missing a rank's manifest never finished a
@@ -66,6 +64,7 @@ fn relay_source(rel_dir: &str, launched: u32) -> Result<Option<u32>, String> {
 pub(super) fn repartition_relation(
     rel_dir: &str,
     schema: &SchemaDescriptor,
+    placement: Placement,
     launched: u32,
     ram_tier_bytes: usize,
     chunk_rows: usize,
@@ -74,13 +73,14 @@ pub(super) fn repartition_relation(
         return Ok(());
     };
     gnitz_info!("repartition: {} from {} to {} worker(s)", rel_dir, source, launched);
-    relay(rel_dir, schema, source, launched, ram_tier_bytes, chunk_rows)
+    relay(rel_dir, schema, placement, source, launched, ram_tier_bytes, chunk_rows)
         .map_err(|e| format!("repartition {rel_dir} to {launched} worker(s): {e}"))
 }
 
 fn relay(
     rel_dir: &str,
     schema: &SchemaDescriptor,
+    placement: Placement,
     source: u32,
     launched: u32,
     ram_tier_bytes: usize,
@@ -88,10 +88,10 @@ fn relay(
 ) -> Result<(), StorageError> {
     // A crashed attempt's partial target would double every row it holds.
     remove_set(rel_dir, launched)?;
-    if schema.placement().is_replicated() {
+    if placement.is_replicated() {
         link_targets(rel_dir, source, launched)?;
     } else {
-        rewrite_targets(rel_dir, schema, source, launched, ram_tier_bytes, chunk_rows)?;
+        rewrite_targets(rel_dir, schema, placement, source, launched, ram_tier_bytes, chunk_rows)?;
     }
     fsync_dir(rel_dir)?;
     remove_set(rel_dir, source)
@@ -117,6 +117,7 @@ fn link_targets(rel_dir: &str, source: u32, launched: u32) -> Result<(), Storage
 fn rewrite_targets(
     rel_dir: &str,
     schema: &SchemaDescriptor,
+    placement: Placement,
     source: u32,
     launched: u32,
     ram_tier_bytes: usize,
@@ -135,7 +136,7 @@ fn rewrite_targets(
     let mut cursor = from_runs(sources.iter().flat_map(Table::runs), *schema, 0);
     let mut targets = open(launched)?;
     let mut buffers: Vec<Batch> = targets.iter().map(|_| Batch::empty_with_schema(schema)).collect();
-    let plan = ScatterPlan::native(schema);
+    let plan = ScatterPlan::native(placement);
     let mut rows: Vec<Vec<u32>> = Vec::new();
     while let Some(chunk) = cursor.drain_chunk(chunk_rows) {
         let slots = plan.route(&chunk, &mut rows, launched as usize);

@@ -15,7 +15,7 @@ use crate::query::vm;
 use gnitz_store::relation::{CircuitState, Relation, RelationRegistry, StateLayout};
 use gnitz_zset::algebra::{self, ScatterPlan};
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::Placement;
+use gnitz_zset::schema::{Placement, SchemaDescriptor};
 
 mod exec;
 mod hydrate;
@@ -74,10 +74,10 @@ impl DagEngine {
         &mut self,
         registry: &RelationRegistry,
         view_id: u64,
-        pk_arity: usize,
+        view: &SchemaDescriptor,
     ) -> Result<Placement, String> {
         let loaded = compiler::load_circuit(registry, view_id)?;
-        let (meta, placement) = ViewMeta::derive(&loaded, registry, pk_arity)?;
+        let (meta, placement) = ViewMeta::derive(&loaded, registry, view)?;
         self.views.insert(view_id, RegisteredView { meta, plan: None });
         Ok(placement)
     }
@@ -167,7 +167,7 @@ fn unregistered(view_id: u64) -> String {
 /// Load and compile `view`'s circuit. Opens nothing.
 fn compile(registry: &RelationRegistry, view: &Relation) -> Result<(CompileOutput, StateLayout), String> {
     let loaded = compiler::load_circuit(registry, view.id())?;
-    compiler::compile_view(&loaded, registry, &view.schema(), view.is_bounded())
+    compiler::compile_view(&loaded, registry, &view.schema(), view.placement(), view.is_bounded())
 }
 
 /// This view's metadata and its compiled plan, compiling and opening its

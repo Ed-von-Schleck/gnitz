@@ -368,8 +368,8 @@ impl WorkerProcess {
         let e = self.cat().registry.relation_or_err(owner_id)?;
         let (schema, mut handle) = (e.schema(), e.cursor());
         let dir = gnitz_store::relation::relation_dir(self.cat().registry.base_dir(), owner_id);
-        let (spec, idx_schema) = gnitz_zset::schema::index_spec_and_schema(col_indices, &schema)?;
-        let frame_schema = crate::runtime::wire::unique_preflight_wire_schema(&idx_schema, col_indices.len());
+        let spec = gnitz_zset::schema::KeySpec::new(col_indices, &schema)?;
+        let frame_schema = spec.span_schema();
 
         let stride = spec.key_size();
         let chunk_rows = self.cat().registry.scan_chunk_rows();

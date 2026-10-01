@@ -118,8 +118,7 @@ pub fn decode<'a>(
     })
 }
 
-/// The header both records open with: column count and PK list, validated as
-/// [`decode`] validates them.
+/// The record's header: column count and PK list.
 fn take_header(r: &mut Reader<'_>) -> Result<(usize, PkIndices), String> {
     let count = r.u32()? as usize;
     if count == 0 || count > MAX_COLUMNS {

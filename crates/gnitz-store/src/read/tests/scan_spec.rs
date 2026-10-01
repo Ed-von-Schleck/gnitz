@@ -11,7 +11,7 @@ use gnitz_wire::TypeCode;
 use gnitz_wire::{key_image, AggDescriptor, AggReadSpec, Cut, KeyRange, OrderKey, PkColList, ReadSink};
 use gnitz_wire::{PkKeys, ViewProps};
 use gnitz_zset::repr::BatchBuilder;
-use gnitz_zset::schema::SchemaColumn;
+use gnitz_zset::schema::{Placement, SchemaColumn};
 
 /// [`relation_fixture`] over a plain `(id U64 PK | val I64)` view holding the
 /// `(id, weight, val)` `rows`. A view's store runs no `enforce_unique_pk`, so a PK
@@ -750,6 +750,7 @@ fn a_delta_read_answers_the_rounds_past_its_cursor() {
         id: TID + 1,
         kind: RelationKind::View(ViewProps::Plain),
         schema,
+        placement: Placement::full_pk(&schema),
     })
     .unwrap();
     for (id, after_tick, layout) in [(TID, 0, own ^ 1), (TID, 3, own ^ 1), (TID + 1, 0, own)] {

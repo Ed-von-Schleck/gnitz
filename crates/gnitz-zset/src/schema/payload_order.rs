@@ -4,7 +4,7 @@
 
 use std::cmp::Ordering;
 
-use super::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
+use super::{SchemaColumn, SchemaDescriptor};
 use gnitz_expr::RowSource;
 use gnitz_wire::{cmp_col_window, null_word_get, read_unsigned_exact};
 
@@ -20,22 +20,14 @@ pub(crate) enum PayloadCmpKind {
     Generic,
 }
 
-/// Walks payload columns only. PK columns must not be examined: U128/UUID are
-/// PK-eligible but not `is_fixed_int`, so a U128 PK would wrongly force `Generic`.
-pub(super) const fn compute_payload_cmp(
-    cols: &[SchemaColumn],
-    payload_to_ci: &[u8; MAX_COLUMNS],
-    num_payload: usize,
-) -> PayloadCmpKind {
-    let mut pi = 0;
-    while pi < num_payload {
-        let col = cols[payload_to_ci[pi] as usize];
-        if col.nullable || !col.type_code.is_fixed_int() {
-            return PayloadCmpKind::Generic;
+impl PayloadCmpKind {
+    /// The comparator for a schema whose payload columns are `payload`.
+    pub(super) fn of(mut payload: impl Iterator<Item = SchemaColumn>) -> Self {
+        match payload.all(|c| !c.nullable && c.type_code.is_fixed_int()) {
+            true => PayloadCmpKind::FixedIntNonnull,
+            false => PayloadCmpKind::Generic,
         }
-        pi += 1;
     }
-    PayloadCmpKind::FixedIntNonnull
 }
 
 /// Compare two rows in the full (PK, payload) order.

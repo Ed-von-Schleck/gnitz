@@ -37,6 +37,7 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: u64, base_rows: &[([u8; 24
             id: tid,
             kind: RelationKind::BaseTable,
             schema,
+            placement: Placement::full_pk(&schema),
         })
         .unwrap();
     engine
@@ -104,6 +105,7 @@ fn wide_pk_seek_family_resolves_non_pk_col() {
             id: parent_tid,
             kind: RelationKind::BaseTable,
             schema: parent_schema,
+            placement: Placement::full_pk(&parent_schema),
         })
         .unwrap();
     engine.registry.ingest(parent_tid, pb).unwrap();

@@ -35,7 +35,6 @@ fn the_delta_schema_stamps_the_view_key_and_keeps_its_payload_space() {
     );
     assert_eq!(delta.pk_cols(), [0, 1, 2]);
     assert_eq!(delta.pk_stride(), 8 + view.pk_stride());
-    assert_eq!(delta.placement(), Placement::Local);
     let payload = |s: &SchemaDescriptor| -> Vec<TypeCode> { s.payload_columns().map(|(_, c)| c.type_code).collect() };
     assert_eq!(payload(&delta), payload(&view));
 }

@@ -20,10 +20,6 @@ use crate::schema::{
     oob_col, ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_PK_COLUMNS,
 };
 
-// ---------------------------------------------------------------------------
-// Column-aware PK byte-region comparator
-// ---------------------------------------------------------------------------
-
 /// Raw byte comparator for PK regions.
 ///
 /// Unsigned byte order over OPK regions, which is the typed PK order at any width.
@@ -129,12 +125,8 @@ pub fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
         len if len >= 16 => u128::from_be_bytes(pk_bytes[..16].try_into().unwrap()),
         4 => (u32::from_be_bytes(pk_bytes[..4].try_into().unwrap()) as u128) << 96,
         2 => (u16::from_be_bytes(pk_bytes[..2].try_into().unwrap()) as u128) << 112,
-        // 9..=15: two overlapping big-endian loads instead of a runtime-length
-        // `copy_from_slice`, which lowers to an out-of-line `memcpy` per key. With
-        // `m = len - 8`, the low `m` bytes of the tail load are exactly
-        // `pk_bytes[8..len]`, since `len - m == 8`. Measured ~3x on this band —
-        // the merge and AVI paths sit here (`GROUP BY <INT>` is 13,
-        // `PRIMARY KEY (BIGINT, INT)` is 12).
+        // Two overlapping loads: the low `m` bytes of the tail load are
+        // `pk_bytes[8..len]`.
         len @ 9..=15 => {
             let m = len - 8;
             let hi = u64::from_be_bytes(pk_bytes[..8].try_into().unwrap()) as u128;
@@ -178,20 +170,8 @@ pub(crate) fn leading_u64(pk_bytes: &[u8]) -> u64 {
     }
 }
 
-/// The `stride` OPK bytes of a narrow PK value that is **already in OPK/route
-/// space** — the widened image `widen_pk_be` produces, sign-flipped for a signed
-/// key. Right-aligning it big-endian reproduces the key's OPK region at any
-/// width. A *native* value must be encoded through [`SchemaFacts::opk_key`]
-/// instead, which applies the per-column sign flip this does not.
-///
-/// The home for "right-align a `u128` into an OPK of width `stride`" wherever
-/// the stride is a runtime value — the batch PK setters and the reduce
-/// group-key emitters build one, so the width checks below cannot be skipped by
-/// hand-rolling `&pk.to_be_bytes()[16 - stride..]`, which silently truncates a
-/// value that overflows the stride. (A writer whose slot width is fixed by the
-/// schema — the packer's string arm, `AviBake::entry` — is
-/// width-total already and copies its `to_be_bytes` directly.) Zero-cost: a
-/// stack value, no allocation.
+/// The `stride`-byte OPK region of a narrow key, from its `u128` image: the
+/// inverse of `gnitz_wire::widen_pk_be`.
 pub(crate) struct NarrowPkOpk {
     be: [u8; 16],
     stride: usize,
@@ -199,18 +179,18 @@ pub(crate) struct NarrowPkOpk {
 
 impl NarrowPkOpk {
     #[inline(always)]
-    pub(crate) fn new(pk: u128, stride: usize) -> Self {
+    pub(crate) fn new(image: u128, stride: usize) -> Self {
         // Static message: `#[inline(always)]` puts this in every per-row caller,
         // and an `Arguments` value costs a stack slot even on a cold panic path.
         assert!(
             stride <= NARROW_PK_MAX_BYTES,
-            "NarrowPkOpk::new: stride exceeds NARROW_PK_MAX_BYTES; use the raw-OPK-bytes setter"
+            "NarrowPkOpk::new: stride exceeds NARROW_PK_MAX_BYTES"
         );
         debug_assert!(
-            stride == 16 || (pk >> (stride * 8)) == 0,
-            "narrow PK {pk} does not fit {stride} bytes",
+            stride == 16 || (image >> (stride * 8)) == 0,
+            "narrow PK image {image} does not fit {stride} bytes",
         );
-        NarrowPkOpk { be: pk.to_be_bytes(), stride }
+        NarrowPkOpk { be: image.to_be_bytes(), stride }
     }
 
     /// The `stride` order-preserving bytes — a full PK region for one row.
@@ -279,18 +259,12 @@ impl<'a> PkSortKey<'a> for &'a [u8] {
 impl PkSortKey<'_> for [u128; 2] {
     #[inline(always)]
     fn from_opk(opk: &[u8]) -> [u128; 2] {
-        // Dispatched only for 17..=32-byte strides: hi = the full leading 16 bytes
-        // (always a register load), lo = the trailing 1..=16 left-aligned. Array
-        // `Ord` is lexicographic, so the low limb settles a leading-16-byte tie a
-        // bare `u128` prefix would tie on.
+        // The leading 16 bytes, then the trailing 1..=16 left-aligned: array `Ord`
+        // is lexicographic, as byte order is.
         let hi = u128::from_be_bytes(opk[..16].try_into().unwrap());
         if opk.len() == 32 {
             [hi, u128::from_be_bytes(opk[16..32].try_into().unwrap())]
         } else {
-            // `pack_pk_be` is left-align-into-a-`u128`, so its width arms give the
-            // partial limb register loads where a runtime-length copy lowered to a
-            // `memcpy` call. Measured per key build, against that copy: -48% at
-            // stride 24, -37% at 20, -3% at 31, +2% at 17.
             [hi, pack_pk_be(&opk[16..])]
         }
     }
@@ -307,10 +281,6 @@ impl PkSortKey<'_> for [u128; 2] {
 pub fn probe_key(opk: &[u8]) -> u64 {
     gnitz_wire::checksum(opk)
 }
-
-// ---------------------------------------------------------------------------
-// Width-tagged PK byte buffer
-// ---------------------------------------------------------------------------
 
 /// The OPK byte container, homed in `gnitz-wire` beside `MAX_PK_BYTES` and the
 /// per-column codec whose output it carries. Re-exported because this module is
@@ -344,8 +314,7 @@ pub struct KeySpec {
     n: u8,
     /// Sum of the promoted column widths, so the row path re-sums nothing.
     key_size: u8,
-    /// Sized by `MAX_PK_COLUMNS`, not the wire's `PK_LIST_MAX_COLS`: `for_pk`
-    /// may be handed an index schema, whose PK arity reaches the engine limit.
+    /// Sized by `MAX_PK_COLUMNS` because a reindex key reaches that arity.
     cols: [KeyCol; MAX_PK_COLUMNS],
 }
 
@@ -399,17 +368,19 @@ impl KeySpec {
     }
 
     /// The index schema this spec's entries land in: the key columns, then
-    /// `source`'s PK columns, all in the PK. Infallible for a spec from
-    /// [`Self::new`], whose `index_key_types` check bounds the combined arity and
-    /// promotes every key column to a PK-eligible type.
+    /// `source`'s PK columns, all in the PK.
     pub(in crate::schema) fn output_schema(&self, source: &SchemaDescriptor) -> SchemaDescriptor {
         let mut b = DerivedSchema::new();
-        self.columns()
-            .iter()
-            .try_for_each(|c| b.push_pk(c.out))
-            .and_then(|()| b.push_pk_of(source))
-            .expect("KeySpec::new bounds the index schema");
-        b.finish()
+        self.columns().iter().for_each(|c| b.push_pk(c.out));
+        b.push_pk_of(source);
+        b.finish().expect("KeySpec::new bounds the index schema")
+    }
+
+    /// The key columns alone, all in the PK: one row's PK region is one span.
+    pub fn span_schema(&self) -> SchemaDescriptor {
+        let mut b = DerivedSchema::new();
+        self.columns().iter().for_each(|c| b.push_pk(c.out));
+        b.finish().expect("KeySpec::new admits its key columns")
     }
 
     /// A base table's own PK as the degenerate span, each column at its own type, so a
@@ -597,7 +568,7 @@ pub fn key_range_between_cuts(start: KeyCut, end: KeyCut, stride: usize) -> Opti
 /// Whether every key of a non-empty band `[start, end)` shares its leading `prefix`
 /// bytes — the bytes a worker owner hashes. OPK order is byte order, so the first and
 /// last keys decide; a band with no `end` runs to the all-`0xFF` key.
-fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: usize) -> bool {
+pub(crate) fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: usize) -> bool {
     let last = match end {
         Some(e) => {
             let mut l = *e;
@@ -610,22 +581,6 @@ fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: usize) -> boo
 }
 
 impl SchemaDescriptor {
-    /// The one worker that can answer `range`, when one provably can. Any worker
-    /// answers an empty range, so worker 0 does.
-    pub fn confined_worker(&self, range: &KeyRange, num_workers: usize) -> Option<usize> {
-        if !range.walks_pk(self.pk_cols()) {
-            return None;
-        }
-        let Some((start, end)) = self.pk_range_keys(range) else {
-            return Some(0);
-        };
-        if !self.placement().is_key_routed() {
-            return None;
-        }
-        range_shares_prefix(&start, end.as_ref(), self.dist_stride())
-            .then(|| self.worker_for_pk(start.pk_bytes(), num_workers))
-    }
-
     /// The OPK key band `r` names over this schema's whole PK list; `None` when it
     /// names no key.
     pub fn pk_range_keys(&self, r: &KeyRange) -> Option<(PkBuf, Option<PkBuf>)> {

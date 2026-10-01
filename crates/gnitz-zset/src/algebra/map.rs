@@ -252,13 +252,12 @@ fn compute_map_output_schema(
     in_schema: &SchemaDescriptor,
     out_cols: &[(TypeCode, bool)],
 ) -> Result<SchemaDescriptor, String> {
-    let over = |e| format!("compute map: output {e}");
     let mut b = DerivedSchema::new();
-    b.push_pk_of(in_schema).map_err(over)?;
+    b.push_pk_of(in_schema);
     for &(tc, nullable) in out_cols {
-        b.push(SchemaColumn::new(tc, nullable)).map_err(over)?;
+        b.push(SchemaColumn::new(tc, nullable));
     }
-    Ok(b.finish())
+    b.finish().map_err(|e| format!("compute map: output {e}"))
 }
 
 /// Output schema of a HashRow Map: a U128 PK, then each projected column at its
@@ -268,18 +267,16 @@ fn hashrow_output_schema(
     in_schema: &SchemaDescriptor,
     cols: &[gnitz_wire::ReindexSlot],
 ) -> Result<SchemaDescriptor, String> {
-    let over = |e| format!("hash-row map: output {e}");
     let mut b = DerivedSchema::new();
-    b.push_pk(SchemaColumn::new(crate::schema::TypeCode::U128, false))
-        .map_err(over)?;
+    b.push_pk(SchemaColumn::new(crate::schema::TypeCode::U128, false));
     for &(c, t) in cols {
         // A key column, not merely an in-range one — the screen the reindex and
         // top-N key kinds clear at this same boundary.
         locate_key_col(in_schema, c, "hash-row map")?;
         let src = in_schema.columns[c as usize];
-        b.push(SchemaColumn::new(t, src.nullable)).map_err(over)?;
+        b.push(SchemaColumn::new(t, src.nullable));
     }
-    Ok(b.finish())
+    b.finish().map_err(|e| format!("hash-row map: output {e}"))
 }
 
 impl MapPlan {
@@ -313,20 +310,8 @@ impl MapPlan {
             }
 
             gnitz_wire::MapKind::Projection(cols) => {
-                // A *payload* column, not merely an in-range one: `project_schema`
-                // skips a PK index while `copy_cols` still numbers a sink for it.
-                for &c in cols {
-                    if in_schema.payload_slot(c as usize).is_none() {
-                        return Err(format!(
-                            "projection map: column {c} is not a payload column of a {}-column schema",
-                            in_schema.num_columns()
-                        ));
-                    }
-                }
-                // `cols` is bounded per entry but not in length, and duplicates
-                // are legal, so a long list still overruns the fixed schema array.
-                let out_schema = crate::schema::project_schema(in_schema, cols)
-                    .ok_or_else(|| "projection map: output exceeds MAX_COLUMNS".to_string())?;
+                let out_schema =
+                    crate::schema::project_schema(in_schema, cols).map_err(|e| format!("projection map: {e}"))?;
                 (out_schema, LogicalProgram::copy_cols(cols), PkSource::Inherit)
             }
         };

@@ -32,15 +32,15 @@ pub(crate) struct ViewMeta {
 }
 
 impl ViewMeta {
-    /// Derive `loaded`'s routing metadata, and the placement a view of `pk_arity`
-    /// PK columns over it registers under.
+    /// Derive `loaded`'s routing metadata, and the placement a view of schema
+    /// `view` over it registers under.
     pub(in crate::query) fn derive(
         loaded: &LoadedCircuit,
         registry: &RelationRegistry,
-        pk_arity: usize,
+        view: &SchemaDescriptor,
     ) -> Result<(ViewMeta, Placement), String> {
         let (uses, circuit_relay) = source_uses(loaded)?;
-        let schemas = scanned_schemas(&uses, registry)?;
+        let sources = scanned_relations(&uses, registry)?;
         // The lowest offender, so every process reports the same one.
         if let Some(tid) = uses
             .iter()
@@ -61,9 +61,9 @@ impl ViewMeta {
             None if loaded.exchange_shards().next().is_some() || circuit_relay.is_some() => RowHome::OwnKey,
             None => RowHome::Producer,
         };
-        let placement = placement(&schemas, rows, pk_arity);
+        let placement = placement(&sources, rows, view);
 
-        let replicated = |tid: u64| schemas[&tid].placement().is_replicated();
+        let replicated = |tid: u64| sources[&tid].is_replicated();
         let keyed = || uses.iter().filter_map(|(&tid, u)| Some((tid, u, u.key.as_deref()?)));
         // A replicated partner holds every row on every worker, so each match is
         // made once, on the other side's own worker — unless the circuit also
@@ -80,7 +80,7 @@ impl ViewMeta {
                 true => JoinRelay::WholeKey,
                 false => circuit_relay.unwrap_or(JoinRelay::WholeKey),
             };
-            let schema = schemas[&tid];
+            let source = sources[&tid];
             let partner_makes_every_match = has_replicated_partner
                 // An owner filter drops every row the relay did not place.
                 && !use_.owner_trimmed
@@ -97,9 +97,9 @@ impl ViewMeta {
                     if partner_makes_every_match {
                         continue;
                     }
-                    let plan =
-                        ScatterPlan::join(&schema, slots).map_err(|e| format!("source {tid} scatter key: {e}"))?;
-                    if plan.routes_to_native_owner(&schema) {
+                    let plan = ScatterPlan::join(&source.schema(), slots)
+                        .map_err(|e| format!("source {tid} scatter key: {e}"))?;
+                    if plan.routes_to_native_owner(source.placement()) {
                         continue;
                     }
                     match replicated(tid) {
@@ -145,12 +145,11 @@ enum RowHome {
     Producer,
 }
 
-/// The schema of each source `uses` names: every one a scanned, registered
-/// relation.
-fn scanned_schemas(
+/// Each source `uses` names: every one a scanned, registered relation.
+fn scanned_relations<'r>(
     uses: &FxHashMap<u64, SourceUse>,
-    registry: &RelationRegistry,
-) -> Result<FxHashMap<u64, SchemaDescriptor>, String> {
+    registry: &'r RelationRegistry,
+) -> Result<FxHashMap<u64, &'r Relation>, String> {
     let mut ids: Vec<u64> = uses.keys().copied().collect();
     // Ascending, so every process reports the same offender.
     ids.sort_unstable();
@@ -159,32 +158,31 @@ fn scanned_schemas(
             if uses[&tid].bound.is_none() {
                 return Err(format!("source {tid} states a scatter key but is not scanned"));
             }
-            let relation = registry.relation_or_err(tid)?;
-            Ok((tid, relation.schema()))
+            Ok((tid, registry.relation_or_err(tid)?))
         })
         .collect()
 }
 
-/// Where a view's rows live, folded from its sources' placements and where its
-/// circuit leaves its `rows`.
-fn placement(sources: &FxHashMap<u64, SchemaDescriptor>, rows: RowHome, pk_arity: usize) -> Placement {
+/// Where the rows of a view of schema `view` live, folded from its sources'
+/// placements and where its circuit leaves its `rows`.
+fn placement(sources: &FxHashMap<u64, &Relation>, rows: RowHome, view: &SchemaDescriptor) -> Placement {
     if sources.is_empty() {
-        return Placement::KEYED_DEFAULT;
+        return Placement::full_pk(view);
     }
     // Every worker computes the whole result from its own full copies.
-    if sources.values().all(|s| s.placement().is_replicated()) {
+    if sources.values().all(|s| s.is_replicated()) {
         return Placement::Replicated;
     }
     if sources.values().any(|s| !s.placement().is_key_routed()) {
         return Placement::Local;
     }
     let mut only = sources.iter();
-    let (Some((&src, schema)), None) = (only.next(), only.next()) else {
-        return Placement::KEYED_DEFAULT;
+    let (Some((&src, rel)), None) = (only.next(), only.next()) else {
+        return Placement::full_pk(view);
     };
     match rows {
-        RowHome::OwnKey => Placement::KEYED_DEFAULT,
-        RowHome::SourcePk(tid) if tid == src && schema.pk_cols().len() == pk_arity => schema.placement(),
+        RowHome::OwnKey => Placement::full_pk(view),
+        RowHome::SourcePk(tid) if tid == src && rel.schema().pk_cols().len() == view.pk_cols().len() => rel.placement(),
         RowHome::SourcePk(_) | RowHome::Producer => Placement::Local,
     }
 }
@@ -356,7 +354,7 @@ pub(super) fn skips_output_exchange(
 ) -> bool {
     scan_through_row_local(loaded, enid)
         .and_then(|tid| registry.relation(tid))
-        .is_some_and(|source| scatter.routes_to_native_owner(&source.schema()))
+        .is_some_and(|source| scatter.routes_to_native_owner(source.placement()))
 }
 
 /// The relay one `Join` node's kind calls for.

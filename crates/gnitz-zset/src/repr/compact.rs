@@ -16,16 +16,6 @@ use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, PkBuf};
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::RowSource;
 
-/// The PK-only projection of `schema`: the same PK columns in the same PK-list
-/// order — hence the same `pk_stride` and the same OPK bytes — and no payload.
-/// A skeleton shard is serialized under this, so its regions are
-/// `[pk, weight, null, blob]`.
-pub(crate) fn skeleton_schema(schema: &SchemaDescriptor) -> SchemaDescriptor {
-    // An empty projection adds no column, so only the source PK is pushed and
-    // the builder's bounds cannot be reached.
-    crate::schema::project_schema(schema, &[]).expect("a schema's own PK fits the PK limit")
-}
-
 /// Slot owning `key` in a sorted guard list: the last guard `≤ key`, saturating
 /// to slot 0 for keys below the first guard.
 pub fn guard_slot<T>(guards: &[T], key: &[u8], gk: impl Fn(&T) -> &[u8]) -> usize {
@@ -58,8 +48,7 @@ pub type EmitGuard<'a> = dyn FnMut(&(PkBuf, bool), Batch) -> Result<(), StorageE
 
 /// Merge `shards` by (PK, payload) and hand `emit` each `(guard_key, skeleton)`
 /// destination's non-empty slice as one batch, in guard order. A skeleton
-/// destination's batch is one `(PK, Σweight)` row per key, under
-/// [`skeleton_schema`].
+/// destination's batch is one PK-only `(PK, Σweight)` row per key.
 pub fn merge_and_route(
     shards: &[&MappedShard],
     guards: &[(PkBuf, bool)],
@@ -98,7 +87,7 @@ pub fn merge_and_route(
     let skeletal = guards
         .iter()
         .any(|&(_, s)| s)
-        .then(|| UnifiedSet::whole(shards, &skeleton_schema(schema)));
+        .then(|| UnifiedSet::whole(shards, &schema.pk_only()));
     let nsurv = survivors.len();
 
     for (g, dest @ &(_, skeleton)) in guards.iter().enumerate() {

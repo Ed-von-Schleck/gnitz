@@ -16,47 +16,37 @@ pub(crate) fn oversized_frame_message(sz: usize) -> String {
     )
 }
 
-/// A relation's wire identity: the target id, the schema, and the encoded block
-/// describing that schema — one value, so the descriptor a slot is routed and
-/// sized by and the block it is framed with cannot disagree.
+/// A relation's wire identity: the target id and the encoded block describing
+/// its schema.
 pub(crate) struct WireSchema {
     /// The relation id, as the catalog keys it. Narrowing to the block's and the
     /// frame's widths happens here and nowhere else.
     tid: u64,
-    descriptor: SchemaDescriptor,
     block: Rc<[u8]>,
 }
 
 impl WireSchema {
     /// A one-off **anonymous** block, encoded here from `descriptor` and cached
     /// nowhere: the only option for a schema no catalog entry describes.
-    pub(crate) fn encoded(tid: u64, descriptor: SchemaDescriptor) -> Self {
+    pub(crate) fn encoded(tid: u64, descriptor: &SchemaDescriptor) -> Self {
         WireSchema {
             tid,
-            block: Rc::from(encode_schema_block(&descriptor)),
-            descriptor,
+            block: Rc::from(encode_schema_block(descriptor)),
         }
     }
 
-    /// `tid`'s registry descriptor and its catalog entry's *named* block.
+    /// `tid` and its catalog entry's *named* block.
     pub(crate) fn from_catalog(cat: &crate::catalog::CatalogEngine, tid: u64) -> Self {
-        let descriptor = cat
-            .registry
-            .relation(tid)
-            .expect("a wire target is registered under the catalog lock")
-            .schema();
         WireSchema {
             tid,
-            descriptor,
             block: cat
                 .schema_record(tid)
-                .expect("a wire target is registered under the catalog lock")
-                .bytes,
+                .expect("a wire target is registered under the catalog lock"),
         }
     }
 
-    pub(crate) fn descriptor(&self) -> &SchemaDescriptor {
-        &self.descriptor
+    pub(crate) fn tid(&self) -> u64 {
+        self.tid
     }
 
     /// `rest` addressed to this relation: its target id and schema block, with
@@ -221,14 +211,6 @@ impl<'a> WireMsg<'a> {
 // ---------------------------------------------------------------------------
 // Decode
 // ---------------------------------------------------------------------------
-
-/// Wire schema of a unique pre-flight reply frame: the leading `n_promoted`
-/// columns of `idx_schema`, all PK, so a row's PK region is one indexed-key span.
-pub(crate) fn unique_preflight_wire_schema(idx_schema: &SchemaDescriptor, n_promoted: usize) -> SchemaDescriptor {
-    let cols = &idx_schema.columns[..n_promoted];
-    let pks: Vec<u32> = (0..n_promoted as u32).collect();
-    SchemaDescriptor::new(cols, &pks)
-}
 
 /// Full decoded wire message.
 pub struct DecodedWire {

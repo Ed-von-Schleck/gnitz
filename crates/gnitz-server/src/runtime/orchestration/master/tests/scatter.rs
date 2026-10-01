@@ -1,7 +1,7 @@
 use super::*;
 use crate::runtime::sal::fixtures::{group_at, TestLog};
 use crate::runtime::sal::DirectGroup;
-use crate::runtime::wire::decode_sal_slot;
+use crate::runtime::wire::{decode_sal_slot, WireSchema};
 use crate::test_support::{
     make_batch, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
     weighted_rows, zset_of,
@@ -9,11 +9,11 @@ use crate::test_support::{
 use gnitz_wire::TypeCode;
 use gnitz_zset::schema::{Placement, SchemaColumn, SchemaDescriptor};
 
-/// Write `batch` to `log` as the master's push of it to relation 16, handing
-/// `inspect` the layout the scatter picked.
-fn push(log: &TestLog, batch: &Batch, inspect: impl FnOnce(&GroupData)) {
-    let relation = WireSchema::encoded(16, *batch.schema());
-    with_routed(batch, &relation, log.writer.num_workers(), |_, data| {
+/// Write `batch` to `log` as the master's push of it to relation 16, placed by
+/// `placement`, handing `inspect` the layout the scatter picked.
+fn push(log: &TestLog, batch: &Batch, placement: Placement, inspect: impl FnOnce(&GroupData)) {
+    let relation = WireSchema::encoded(16, batch.schema());
+    with_routed(batch, placement, log.writer.num_workers(), |_, data| {
         inspect(&data);
         log.excl().write(&DirectGroup::push(&relation, data, 0))
     })
@@ -37,55 +37,60 @@ fn a_push_group_decodes_to_each_workers_rows() {
     let long: Vec<String> = (0..8)
         .map(|pk| format!("a string past the inline prefix {pk}"))
         .collect();
-    let replicated = make_schema_u64_i64().with_placement(Placement::Replicated);
+    let fixed = make_schema_u64_i64();
+    let keyed = |b: Batch| (Placement::full_pk(b.schema()), b);
+    let replicated = |b: Batch| (Placement::Replicated, b);
     type LaidOut = fn(&GroupData, &Batch) -> bool;
-    let cases: [(&str, Batch, LaidOut); 6] = [
+    let cases: [(&str, (Placement, Batch), LaidOut); 6] = [
         (
             "keyed single row: one-copy scatter, three rowless slots",
-            make_batch(&make_schema_u64_i64(), &[(1, 1, 10)]),
+            keyed(make_batch(&fixed, &[(1, 1, 10)])),
             |g, _| matches!(g, GroupData::Scattered { .. }),
         ),
         (
             "keyed fixed-width: one-copy scatter",
-            make_batch_raw(&narrow, &[(0, 1, 0), (1, 1, 1), (2, 1, 2)]),
+            keyed(make_batch_raw(&narrow, &[(0, 1, 0), (1, 1, 1), (2, 1, 2)])),
             |g, _| matches!(g, GroupData::Scattered { .. }),
         ),
         (
             "keyed inline strings: one-copy scatter",
-            make_batch_bytes_raw(&string, &[(1, 1, b"a"), (2, 3, b"twelve bytes"), (3, 1, b"")]),
+            keyed(make_batch_bytes_raw(
+                &string,
+                &[(1, 1, b"a"), (2, 3, b"twelve bytes"), (3, 1, b"")],
+            )),
             |g, _| matches!(g, GroupData::Scattered { .. }),
         ),
         (
             "keyed heap strings: a sub-batch per worker",
-            make_batch_bytes_raw(
+            keyed(make_batch_bytes_raw(
                 &string,
                 &long
                     .iter()
                     .enumerate()
                     .map(|(pk, s)| (pk as u64, 1, s.as_bytes()))
                     .collect::<Vec<_>>(),
-            ),
+            )),
             |g, _| matches!(g, GroupData::Batches(b) if b.len() == 4),
         ),
         (
             "replicated live rows: the batch itself",
-            make_batch(&replicated, &[(1, 1, 10), (2, 2, 20), (3, -1, 30)]),
+            replicated(make_batch(&fixed, &[(1, 1, 10), (2, 2, 20), (3, -1, 30)])),
             |g, batch| matches!(g, GroupData::Same(WireData::Whole(b)) if std::ptr::eq(*b, batch)),
         ),
         (
             "replicated with a weight-0 row: one whole batch",
-            make_batch_bytes_raw(
-                &string.with_placement(Placement::Replicated),
+            replicated(make_batch_bytes_raw(
+                &string,
                 &[(1, 1, long[0].as_bytes()), (2, 0, b"dropped"), (3, 2, b"c")],
-            ),
+            )),
             |g, _| matches!(g, GroupData::Same(WireData::Whole(_))),
         ),
     ];
 
-    for (case, batch, laid_out) in &cases {
+    for (case, (placement, batch), laid_out) in &cases {
         let schema = *batch.schema();
         let log = TestLog::new(1 << 20, nw, 1);
-        push(&log, batch, |g| assert!(laid_out(g, batch), "{case}"));
+        push(&log, batch, *placement, |g| assert!(laid_out(g, batch), "{case}"));
         let slots: Vec<(usize, Batch)> = group_at(log.log(), 0)
             .slots_written()
             .filter_map(|(w, bytes)| {
@@ -99,7 +104,7 @@ fn a_push_group_decodes_to_each_workers_rows() {
                 rows.map(|rows| (w as usize, rows))
             })
             .collect();
-        if schema.placement() == Placement::Replicated {
+        if placement.is_replicated() {
             let live = weighted_rows(batch)
                 .into_iter()
                 .filter(|&(_, w)| w != 0)
@@ -113,8 +118,8 @@ fn a_push_group_decodes_to_each_workers_rows() {
             for (w, s) in &slots {
                 for row in 0..s.len() {
                     assert_eq!(
-                        schema.worker_for_pk(s.get_pk_bytes(row), nw),
-                        *w,
+                        placement.owner(s.get_pk_bytes(row), nw),
+                        Some(*w),
                         "{case}: a row in slot {w}"
                     );
                 }
@@ -160,21 +165,18 @@ fn push_group_layout_bench() {
         bb.finish()
     };
     let cases = [
-        ("replicated (U64, I64)", fixed.with_placement(Placement::Replicated)),
-        (
-            "replicated (U64, String <= 12 B)",
-            string.with_placement(Placement::Replicated),
-        ),
-        ("keyed (U64, String <= 12 B)", string),
+        ("replicated (U64, I64)", fixed, Placement::Replicated),
+        ("replicated (U64, String <= 12 B)", string, Placement::Replicated),
+        ("keyed (U64, String <= 12 B)", string, Placement::full_pk(&string)),
     ];
 
     let log = TestLog::new(64 << 20, NW, 1);
-    for (name, schema) in cases {
+    for (name, schema, placement) in cases {
         let batch = build(schema);
         let start = Instant::now();
         for _ in 0..ITERS {
             log.seek(0);
-            push(&log, &batch, |_| ());
+            push(&log, &batch, placement, |_| ());
             black_box(log.cursor());
         }
         let per = start.elapsed() / ITERS;

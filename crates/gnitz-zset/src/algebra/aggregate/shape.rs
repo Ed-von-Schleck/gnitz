@@ -2,7 +2,7 @@
 //! and the ad-hoc fold.
 
 use crate::schema::SchemaFacts;
-use crate::schema::{oob_col, DerivedSchema, SchemaBound, SchemaColumn, SchemaDescriptor};
+use crate::schema::{oob_col, DerivedSchema, SchemaColumn, SchemaDescriptor};
 
 use super::agg::Accumulator;
 use crate::algebra::group_key::GroupOutKey;
@@ -27,21 +27,18 @@ impl ReduceShape {
         mut prefix: DerivedSchema,
         aggs: &[AggDescriptor],
     ) -> Result<Self, String> {
-        let over = |e: SchemaBound| format!("reduce: output {e}");
         for d in aggs {
             let src = input
                 .column(d.col_idx as usize)
                 .ok_or_else(|| oob_col("reduce: aggregate column", d.col_idx, input))?;
             let tc = gnitz_wire::agg_output_type(d.agg_op, src.type_code)
                 .ok_or_else(|| format!("reduce: {:?} is not defined over type code {}", d.agg_op, src.type_code))?;
-            prefix
-                .push(SchemaColumn::new(
-                    tc,
-                    d.agg_op.raw_output_nullable(src.nullable, key.is_global()),
-                ))
-                .map_err(over)?;
+            prefix.push(SchemaColumn::new(
+                tc,
+                d.agg_op.raw_output_nullable(src.nullable, key.is_global()),
+            ));
         }
-        let output_schema = prefix.finish();
+        let output_schema = prefix.finish().map_err(|e| format!("reduce: output {e}"))?;
         // The aggregates are the trailing output columns.
         let cbase = output_schema.num_columns() - aggs.len();
         let acc_template = aggs

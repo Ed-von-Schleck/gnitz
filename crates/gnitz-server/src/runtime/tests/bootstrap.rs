@@ -91,10 +91,7 @@ fn a_circuit_behind_its_flushed_view_registers_as_a_clean_boot_does() {
     let engine = recover(&log, dir);
 
     assert_eq!(engine.dag.sources_of(v), &[r][..]);
-    assert_eq!(
-        engine.registry.relation(v).unwrap().schema().placement(),
-        Placement::Replicated
-    );
+    assert_eq!(engine.registry.relation(v).unwrap().placement(), Placement::Replicated);
     assert_eq!(net(&engine, SysFamily::View), 1);
 }
 

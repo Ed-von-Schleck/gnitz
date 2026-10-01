@@ -25,7 +25,7 @@ impl RelationRegistry {
     }
 
     fn enter(&mut self, spec: RelationSpec, (store, delta): (Store, Option<Box<Table>>)) {
-        let RelationSpec { id, kind, .. } = spec;
+        let RelationSpec { id, kind, placement, .. } = spec;
         let prev = self.tables.insert(
             id,
             Relation {
@@ -34,6 +34,7 @@ impl RelationRegistry {
                 delta,
                 indexes: Vec::new(),
                 kind,
+                placement,
             },
         );
         debug_assert!(prev.is_none(), "relation {id} registered twice");
@@ -46,7 +47,7 @@ impl RelationRegistry {
         spec: RelationSpec,
         resume: bool,
     ) -> Result<(Store, Option<Box<Table>>), String> {
-        let RelationSpec { id, kind, schema } = spec;
+        let RelationSpec { id, kind, schema, placement } = spec;
         let absent = || Ok((Store::Absent(Box::new(schema)), None));
         let (recovery, budgets, feed) = match kind {
             RelationKind::Stream => return absent(),
@@ -89,7 +90,7 @@ impl RelationRegistry {
         };
         let rows = self.open_child_as(id, ChildKind::Rows, schema, recovery, budgets)?;
         let delta = match feed {
-            Some(budget) if schema.placement().counts_on(self.slot.rank) => {
+            Some(budget) if placement.counts_on(self.slot.rank) => {
                 // Admitted by the catalog precheck; a host registering outside it gets the refusal here.
                 let delta_schema = super::delta::make_delta_schema(&schema)
                     .ok_or_else(|| format!("view {id} has too many columns to carry a delta feed"))?;

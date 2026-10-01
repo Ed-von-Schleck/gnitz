@@ -7,7 +7,7 @@ use gnitz_zset::schema::{Placement, SchemaColumn};
 
 /// `derive`'s routing metadata, placed as a one-column-PK view.
 fn derive(c: Circuit, registry: &RelationRegistry) -> Result<ViewMeta, String> {
-    ViewMeta::derive(&loaded(c), registry, 1).map(|(meta, _)| meta)
+    ViewMeta::derive(&loaded(c), registry, &make_schema_u64_i64()).map(|(meta, _)| meta)
 }
 
 /// A U64 PK and five I64 payload columns: every key a fixture names is payload.
@@ -17,10 +17,15 @@ fn wide_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(&cols, &[0])
 }
 
-/// 3-column compound PK `(U32, U64, U64)` + one payload, distributed by its
-/// leading PK column.
+/// 3-column compound PK `(U32, U64, U64)` + one payload.
 fn clustered_schema() -> SchemaDescriptor {
-    pk_payload_schema(&[TypeCode::U32, TypeCode::U64, TypeCode::U64]).with_placement(Placement::Keyed { prefix_len: 1 })
+    pk_payload_schema(&[TypeCode::U32, TypeCode::U64, TypeCode::U64])
+}
+
+/// [`clustered_schema`], placed by its leading PK column.
+fn clustered_source() -> Source {
+    let schema = clustered_schema();
+    Source::from(schema).placed(Placement::keyed(&schema, 1))
 }
 
 fn range(n_eq: u8) -> JoinKind {
@@ -95,23 +100,31 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
     let key_only = SchemaDescriptor::new(&[u64], &[0]);
     let rekeyed = SchemaDescriptor::new(&[i64, i64], &[0]);
     // (why, the source, the walk, the schema it hands the shard, shard columns, skipped)
-    type Case = (
-        &'static str,
-        SchemaDescriptor,
-        Mid,
-        SchemaDescriptor,
-        &'static [u32],
-        bool,
-    );
+    type Case = (&'static str, Source, Mid, SchemaDescriptor, &'static [u32], bool);
+    let clustered_by_prefix = clustered_source();
     let cases: [Case; 14] = [
-        ("a bare scan", pk_last, |_, n| n, pk_last, &[2], true),
-        ("a payload column", pk_last, |_, n| n, pk_last, &[0], false),
-        ("an empty key", pk_last, |_, n| n, pk_last, &[], false),
-        ("the CLUSTER BY prefix", clustered, |_, n| n, clustered, &[0], true),
-        ("not the leading PK column", clustered, |_, n| n, clustered, &[1], false),
+        ("a bare scan", pk_last.into(), |_, n| n, pk_last, &[2], true),
+        ("a payload column", pk_last.into(), |_, n| n, pk_last, &[0], false),
+        ("an empty key", pk_last.into(), |_, n| n, pk_last, &[], false),
+        (
+            "the CLUSTER BY prefix",
+            clustered_by_prefix,
+            |_, n| n,
+            clustered,
+            &[0],
+            true,
+        ),
+        (
+            "not the leading PK column",
+            clustered_by_prefix,
+            |_, n| n,
+            clustered,
+            &[1],
+            false,
+        ),
         (
             "a filter is transparent",
-            pk_last,
+            pk_last.into(),
             |c, n| c.filter(n, dummy_expr_blob()),
             pk_last,
             &[2],
@@ -119,7 +132,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
         ),
         (
             "a copy list carries the PK region to its leading slot",
-            pk_last,
+            pk_last.into(),
             |c, n| c.map(n, &[0, 1]),
             mapped,
             &[0],
@@ -127,7 +140,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
         ),
         (
             "a payload slot behind a map",
-            pk_last,
+            pk_last.into(),
             |c, n| c.map(n, &[0, 1]),
             mapped,
             &[1],
@@ -135,7 +148,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
         ),
         (
             "an expression map carries the PK region",
-            pk_last,
+            pk_last.into(),
             compute,
             key_only,
             &[0],
@@ -143,7 +156,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
         ),
         (
             "filters and maps interleave",
-            pk_last,
+            pk_last.into(),
             |c, n| {
                 let f = c.filter(n, dummy_expr_blob());
                 let m = c.map(f, &[0, 1]);
@@ -155,7 +168,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
         ),
         (
             "a reindex re-keys the PK",
-            pk_last,
+            pk_last.into(),
             |c, n| aux_reindex(c, n, &[(0, TypeCode::I64)]),
             rekeyed,
             &[0],
@@ -163,7 +176,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
         ),
         (
             "a WorkerFilter is not a Filter",
-            pk_last,
+            pk_last.into(),
             |c, n| c.worker_filter(n),
             pk_last,
             &[2],
@@ -171,7 +184,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
         ),
         (
             "a fan-in draws from two sources",
-            pk_last,
+            pk_last.into(),
             |c, n| {
                 let other = scan(c, 8);
                 c.union(n, other)
@@ -182,7 +195,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
         ),
         (
             "a filter over a fan-in",
-            pk_last,
+            pk_last.into(),
             |c, n| {
                 let other = scan(c, 8);
                 let u = c.union(n, other);
@@ -239,19 +252,19 @@ fn join_meta_in(kind: JoinKind, key_cols: &[u32], distinct: [bool; 2], ext: Rela
 #[test]
 fn a_joins_sources_relay_only_where_their_matches_are_not_already_local() {
     use Route::{Broadcast, Round, Stays};
-    let base = make_schema_u64_i64();
-    let replicated = base.with_placement(Placement::Replicated);
+    let base = Source::from(make_schema_u64_i64());
+    let replicated = base.placed(Placement::Replicated);
     // Compound PK (a, b) at columns 0, 1; column 2 is payload.
-    let compound = pk_payload_schema(&[TypeCode::U64; 2]);
-    let clustered = compound.with_placement(Placement::Keyed { prefix_len: 1 });
+    let compound = Source::from(pk_payload_schema(&[TypeCode::U64; 2]));
+    let clustered = compound.placed(Placement::keyed(&compound.schema, 1));
     let plain = [false; 2];
-    /// `(why, join kind, key columns, set-clamped sides, schemas of 7 and 9, their routes)`.
+    /// `(why, join kind, key columns, set-clamped sides, sources 7 and 9, their routes)`.
     type Case = (
         &'static str,
         JoinKind,
         &'static [u32],
         [bool; 2],
-        [SchemaDescriptor; 2],
+        [Source; 2],
         [Route; 2],
     );
     let cases: [Case; 14] = [
@@ -325,7 +338,7 @@ fn a_joins_sources_relay_only_where_their_matches_are_not_already_local() {
             range(1),
             &[0, 1],
             plain,
-            [compound.with_placement(Placement::Replicated), compound],
+            [compound.placed(Placement::Replicated), compound],
             [Stays, Stays],
         ),
         (
@@ -393,7 +406,7 @@ fn a_replicated_delta_feeding_more_than_its_join_scatters_every_source() {
     let joined = c.join(a, tb, JoinKind::Equi, false);
     let both = c.union(a, joined);
     c.sink(both);
-    let ext = sources([(7, base.with_placement(Placement::Replicated)), (9, base)]);
+    let ext = sources([(7, Source::from(base).placed(Placement::Replicated)), (9, base.into())]);
     let meta = derive(c, &ext).unwrap();
     assert_eq!(
         [7, 9].map(|tid| route(meta.source_route(tid))),
@@ -409,14 +422,14 @@ fn a_replicated_delta_feeding_more_than_its_join_scatters_every_source() {
 ///   ScanDelta(9) → Map(reindex [1]) ────────────────────────────────────→ Join(kind)
 #[test]
 fn an_owner_trimmed_source_routes_by_the_key_it_states() {
-    let base = make_schema_u64_i64();
-    let replicated = base.with_placement(Placement::Replicated);
-    let trimmed = |kind: JoinKind, key_cols: &[u32], [a, b]: [SchemaDescriptor; 2]| {
+    let base = Source::from(make_schema_u64_i64());
+    let replicated = base.placed(Placement::Replicated);
+    let trimmed = |kind: JoinKind, key_cols: &[u32], [a, b]: [Source; 2]| {
         let mut c = Circuit::default();
-        let keyed = scan_keyed(&mut c, 7, &self_typed_slots(&a, key_cols));
+        let keyed = scan_keyed(&mut c, 7, &self_typed_slots(&a.schema, key_cols));
         let owned = c.worker_filter(keyed);
         let trace = c.integrate_trace(owned);
-        let delta = scan_keyed(&mut c, 9, &self_typed_slots(&b, &[1]));
+        let delta = scan_keyed(&mut c, 9, &self_typed_slots(&b.schema, &[1]));
         let joined = c.join(delta, trace, kind, false);
         c.sink(joined);
         derive(c, &sources([(7, a), (9, b)])).unwrap()
@@ -425,7 +438,7 @@ fn an_owner_trimmed_source_routes_by_the_key_it_states() {
 
     let meta = trimmed(JoinKind::Equi, &[1], [base, replicated]);
     assert_eq!(routes(&meta), [Route::Round, Route::Stays]);
-    assert_routes_by(meta.source_route(7), &base, &[1]);
+    assert_routes_by(meta.source_route(7), &base.schema, &[1]);
 
     let meta = trimmed(range(0), &[0], [base, base]);
     assert_eq!(
@@ -440,7 +453,7 @@ fn an_owner_trimmed_source_routes_by_the_key_it_states() {
         [Route::Share, Route::Broadcast],
         "a replicated copy is kept by key where it stands"
     );
-    assert_routes_by(meta.source_route(7), &replicated, &[0]);
+    assert_routes_by(meta.source_route(7), &replicated.schema, &[0]);
 }
 
 /// A source states one route however many reindexes name it, and none when it
@@ -580,10 +593,13 @@ fn a_circuit_derive_cannot_route_is_rejected() {
 /// region — and otherwise wherever they were produced.
 #[test]
 fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
-    let clustered = clustered_schema();
-    let inherited = clustered.placement();
-    let replicated = clustered.with_placement(Placement::Replicated);
-    let cases: [(&str, Build, [SchemaDescriptor; 2], usize, Placement); 11] = [
+    let clustered = clustered_source();
+    let inherited = clustered.placement;
+    let replicated = clustered.placed(Placement::Replicated);
+    // A view of `pk_arity` PK columns, and the placement by its own key.
+    let view = |pk_arity: usize| pk_payload_schema(&[TypeCode::U32, TypeCode::U64, TypeCode::U64][..pk_arity]);
+    let own_key = Placement::full_pk(&view(3));
+    let cases: [(&str, Build, [Source; 2], usize, Placement); 11] = [
         (
             "a bare scan re-emits its source's PK region",
             |c: &mut Circuit| {
@@ -647,7 +663,7 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
             },
             [clustered; 2],
             3,
-            Placement::KEYED_DEFAULT,
+            own_key,
         ),
         (
             "a join carries no shard and still re-keys",
@@ -658,7 +674,7 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
             },
             [clustered; 2],
             3,
-            Placement::KEYED_DEFAULT,
+            own_key,
         ),
         (
             "two keyed sources",
@@ -669,7 +685,7 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
             },
             [clustered; 2],
             3,
-            Placement::KEYED_DEFAULT,
+            own_key,
         ),
         (
             "every source replicated: each worker computes the whole result",
@@ -700,7 +716,7 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
                 let a = scan(c, 7);
                 c.sink(a);
             },
-            [clustered.with_placement(Placement::Local); 2],
+            [clustered.placed(Placement::Local); 2],
             3,
             Placement::Local,
         ),
@@ -708,7 +724,7 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
     for (why, build, [a, b], pk_arity, want) in cases {
         let mut c = Circuit::default();
         build(&mut c);
-        let (_, placement) = ViewMeta::derive(&loaded(c), &sources([(7, a), (9, b)]), pk_arity).unwrap();
+        let (_, placement) = ViewMeta::derive(&loaded(c), &sources([(7, a), (9, b)]), &view(pk_arity)).unwrap();
         assert_eq!(placement, want, "{why}");
     }
 }

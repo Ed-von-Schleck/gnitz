@@ -221,7 +221,8 @@ fn the_null_extend_schema_and_the_widened_rows_agree_on_both_sides() {
 #[test]
 fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
     let guard = format!(
-        "null-extend: merged schema exceeds MAX_COLUMNS ({})",
+        "null-extend: merged schema column count {} exceeds MAX_COLUMNS ({})",
+        crate::schema::MAX_COLUMNS + 1,
         crate::schema::MAX_COLUMNS
     );
     let extend = |s: &SchemaDescriptor, n: usize| null_extend_output_schema(s, &vec![TypeCode::I64; n], false);

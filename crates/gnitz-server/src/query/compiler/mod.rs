@@ -16,7 +16,7 @@ use gnitz_store::relation::{Relation, RelationRegistry, StateIdx, StateLayout};
 use gnitz_wire::{AggDescriptor, NodeId, NodeInputs};
 use gnitz_zset::algebra::MapPlan;
 use gnitz_zset::algebra::ScatterPlan;
-use gnitz_zset::schema::SchemaDescriptor;
+use gnitz_zset::schema::{Placement, SchemaDescriptor};
 
 mod emit;
 mod hydration;
@@ -290,10 +290,11 @@ pub(super) fn compile_view(
     loaded: &LoadedCircuit,
     registry: &RelationRegistry,
     view_schema: &SchemaDescriptor,
+    view_placement: Placement,
     bounded: bool,
 ) -> Result<(CompileOutput, StateLayout), String> {
     let carve = loaded.carve()?;
-    let self_contained = view_schema.placement().is_replicated() || registry.slot().of <= 1;
+    let self_contained = view_placement.is_replicated() || registry.slot().of <= 1;
     let mut layout = StateLayout::default();
     let mut side_plans = Vec::with_capacity(carve.sides.len());
     let mut seeds = Vec::with_capacity(carve.sides.len());

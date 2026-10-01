@@ -1,9 +1,9 @@
 use super::*;
 use crate::repr::{BatchBuilder, MemBatch};
-use crate::schema::{make_index_schema, Placement, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
+use crate::schema::{index_spec_and_schema, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
 use crate::test_support::Rng;
 use crate::test_support::{le_cell, pk_only_schema};
-use gnitz_wire::{cmp_col_window, image_mask, key_image, widen_pk_be, Cut, KeyRange, PkColList};
+use gnitz_wire::{cmp_col_window, image_mask, key_image, widen_pk_be};
 
 fn col(tc: TypeCode) -> SchemaColumn {
     SchemaColumn::new(tc, false)
@@ -146,71 +146,17 @@ fn key_increment_and_decrement_are_inverse_steps() {
     }
 }
 
-/// Worker count the confinement checks route against; any count works.
-const NW: usize = 4;
-
-/// Over a `(I8, U8)` PK — whose OPK bytes are its key images — and every cut
-/// pair on the images where order turns (the byte ends and the signed
-/// midpoint), as a range over the leading column and as a whole-PK range under
-/// each leading equality: `pk_range_keys` is the band of exactly the keys the
-/// range admits, and `confined_worker` answers an empty band from worker 0 and
-/// otherwise names the band's worker iff every key in it shares the
-/// distribution prefix.
+/// A narrow key's image, right-aligned at the key's width, is the key.
 #[test]
-fn pk_range_keys_and_confinement_follow_key_membership() {
-    let cols = [col(TypeCode::I8), col(TypeCode::U8)];
-    let placed = [
-        Placement::Keyed { prefix_len: 1 },
-        Placement::KEYED_DEFAULT,
-        Placement::Replicated,
-    ]
-    .map(|p| SchemaDescriptor::new_with_placement(&cols, &[0, 1], p));
-    let s = placed[1];
-    let edges = [0u128, 1, 0x7F, 0x80, 0xFE, 0xFF];
-    let probes = [0u8, 1, 2, 0x7E, 0x7F, 0x80, 0x81, 0xFD, 0xFE, 0xFF];
-    let cuts: Vec<Cut> = edges.iter().flat_map(|&e| [Cut::before(e), Cut::after(e)]).collect();
-    let mut ranges = Vec::new();
-    for &start in &cuts {
-        for &end in &cuts {
-            ranges.push(KeyRange::new(PkColList::from_slice(&[0]), &[], start, end));
-            for &e in &edges {
-                ranges.push(KeyRange::new(PkColList::from_slice(&[0, 1]), &[e], start, end));
-            }
+fn narrow_pk_opk_inverts_the_widening() {
+    let mut rng = Rng::new(0x0A11_6E00);
+    for _ in 0..2000 {
+        let bytes = rng.gen_u128().to_be_bytes();
+        for w in 1..=16 {
+            let opk = &bytes[..w];
+            assert_eq!(NarrowPkOpk::new(widen_pk_be(opk), w).bytes(), opk, "width {w}");
         }
     }
-
-    let key = |k: &PkBuf| u32::from(u16::from_be_bytes(k.pk_bytes().try_into().unwrap()));
-    for r in &ranges {
-        let (lo, hi) = match s.pk_range_keys(r) {
-            Some((start, end)) => (key(&start), end.as_ref().map_or(1 << 16, key)),
-            None => (0, 0),
-        };
-        let n = r.eq_vals().len();
-        for k0 in probes {
-            for k1 in probes {
-                let img = [k0 as u128, k1 as u128];
-                let admitted =
-                    img[..n] == r.eq_vals()[..] && r.start <= Cut::before(img[n]) && Cut::after(img[n]) <= r.end;
-                let k = u32::from(u16::from_be_bytes([k0, k1]));
-                assert_eq!((lo..hi).contains(&k), admitted, "{r:?}: key ({k0:#x}, {k1:#x})");
-            }
-        }
-        for t in &placed {
-            let shift = 8 * (2 - t.dist_stride());
-            let want = if lo == hi {
-                Some(0)
-            } else if t.placement().is_key_routed() && lo >> shift == (hi - 1) >> shift {
-                Some(t.worker_for_pk(&(lo as u16).to_be_bytes(), NW))
-            } else {
-                None
-            };
-            assert_eq!(t.confined_worker(r, NW), want, "{:?} {r:?}", t.placement());
-        }
-    }
-
-    // A range over a column that does not lead the PK walks an index or a scan.
-    let off_pk = KeyRange::point(PkColList::from_slice(&[1]), &[], 7);
-    assert_eq!(placed[0].confined_worker(&off_pk, NW), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -218,28 +164,26 @@ fn pk_range_keys_and_confinement_follow_key_membership() {
 // ---------------------------------------------------------------------------
 
 /// An index schema is the promoted key columns then the source PK, all in the
-/// PK. An arity past `MAX_PK_COLUMNS` is an `Err`, never the constructor's abort.
+/// PK, and its span schema the promoted key columns alone. An arity past
+/// `MAX_PK_COLUMNS` is an `Err`.
 #[test]
 fn index_schema_is_the_promoted_key_then_the_source_pk() {
     use TypeCode::{I16, I32, I64, I8, U128, U32, U64};
     let src = SchemaDescriptor::new(&[col(U64), col(U32), col(U128)], &[0]);
-    assert_eq!(
-        make_index_schema(&[1, 2], &src).unwrap(),
-        pk_only_schema(&[U64, U128, U64])
-    );
+    let (spec, index) = index_spec_and_schema(&[1, 2], &src).unwrap();
+    assert_eq!(index, pk_only_schema(&[U64, U128, U64]));
+    assert_eq!(spec.span_schema(), pk_only_schema(&[U64, U128]));
     for t in [I8, I16, I32, I64] {
         let src = SchemaDescriptor::new(&[col(U64), col(t)], &[0]);
-        assert_eq!(
-            make_index_schema(&[1], &src).unwrap(),
-            pk_only_schema(&[I64, U64]),
-            "{t}"
-        );
+        let (spec, index) = index_spec_and_schema(&[1], &src).unwrap();
+        assert_eq!(index, pk_only_schema(&[I64, U64]), "{t}");
+        assert_eq!(spec.span_schema(), pk_only_schema(&[I64]), "{t}");
     }
 
     let wide = SchemaDescriptor::new(&[col(U64); MAX_PK_COLUMNS + 1], &[0, 1]);
     let key: Vec<u32> = (2..=MAX_PK_COLUMNS as u32).collect();
-    assert!(make_index_schema(&key[1..], &wide).is_ok(), "arity MAX_PK_COLUMNS");
-    assert!(make_index_schema(&key, &wide).is_err(), "arity MAX_PK_COLUMNS + 1");
+    assert!(index_spec_and_schema(&key[1..], &wide).is_ok(), "arity MAX_PK_COLUMNS");
+    assert!(index_spec_and_schema(&key, &wide).is_err(), "arity MAX_PK_COLUMNS + 1");
 }
 
 /// The span `write_span` writes for a row: each indexed column decoded to its

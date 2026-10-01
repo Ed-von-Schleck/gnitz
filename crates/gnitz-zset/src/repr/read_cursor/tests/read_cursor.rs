@@ -316,7 +316,7 @@ fn a_skeleton_row_coarsens_its_whole_pk_group() {
         // PK 1: skeleton (coarse +3) plus two newer hydrated rows, one of which
         // compares `Equal` to a skeleton row under this arm. PK 2: hydrated only.
         // PK 3: skeleton whose coarse weight cancels.
-        let mut sk = BatchBuilder::new(super::super::compact::skeleton_schema(&schema));
+        let mut sk = BatchBuilder::new(schema.pk_only());
         for (pk, w) in [(1u128, 3), (3, 2)] {
             sk.begin_row(pk, w);
             sk.end_row();

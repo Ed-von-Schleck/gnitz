@@ -1,6 +1,7 @@
 use super::cache::RelationEntry;
 use super::*;
 use gnitz_expr::ColumnTable;
+use gnitz_wire::TableDistribution;
 use std::collections::hash_map::Entry;
 
 impl CatalogEngine {
@@ -41,12 +42,21 @@ impl CatalogEngine {
             schema_id: _,
             name,
             pk,
-            placement,
+            distribution,
             facts,
         } = reg;
         let col_defs = self.read_column_defs(id)?;
-        let schema = build_schema_from_col_defs(kind, &col_defs, pk.as_slice(), placement)
+        let schema = build_schema_from_col_defs(kind, &col_defs, pk.as_slice())
             .map_err(|e| format!("{} '{name}' (id={id}) {e}", kind.noun()))?;
+        let placement = match distribution {
+            None => self
+                .dag
+                .register_view(&self.registry, id, &schema)
+                .map_err(|e| format!("{e} (vid={id})"))?,
+            Some(TableDistribution::Replicated) => Placement::Replicated,
+            Some(TableDistribution::Keyed { prefix_len: 0 }) => Placement::full_pk(&schema),
+            Some(TableDistribution::Keyed { prefix_len }) => Placement::keyed(&schema, prefix_len as usize),
+        };
         gnitz_debug!(
             "catalog: creating {} name={} id={} workers={}",
             kind.noun(),
@@ -54,7 +64,7 @@ impl CatalogEngine {
             id,
             self.registry.slot().of
         );
-        self.registry.register(RelationSpec { id, kind, schema })?;
+        self.registry.register(RelationSpec { id, kind, schema, placement })?;
         self.enter_relation(id, kind, schema.pk_cols(), &col_defs, facts);
         // Derived, not stored: every process builds the same FK circuits from the same
         // column records. Every FK column carries one, a PK column included — a
@@ -132,7 +142,7 @@ impl CatalogEngine {
                 _ => {}
             }
         }
-        // Registering a view reads its sources' stamped placement, and ids ascend
+        // Registering a view reads its sources' placements, and ids ascend
         // along every scan edge, so id order registers a view after the views it
         // scans.
         creates.sort_unstable_by_key(|c| c.0);
@@ -152,12 +162,7 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// The registration values for VIEW_TAB row `i`: placement folded out of the
-    /// view's sources' own stamped placements, plus the `WITH` options.
-    ///
-    /// The view's physical PK is the persisted leading-k column list: a single
-    /// synthetic hash column for join/set-op/distinct views, or the source PK
-    /// passed through (0..k) for a plain projection over a compound-PK table.
+    /// The registration values for VIEW_TAB row `i`.
     fn view_registration<'a>(
         &mut self,
         batch: &'a Batch,
@@ -175,17 +180,13 @@ impl CatalogEngine {
         // Re-checked for the paths that skip the precheck: boot replay, a
         // worker's `ddl_sync`.
         self.validate_view_options(vid, name, props, owner_view_id)?;
-        let placement = self
-            .dag
-            .register_view(&self.registry, vid, pk.as_slice().len())
-            .map_err(|e| format!("{e} (vid={vid})"))?;
         Ok(RelationRegistration {
             kind: RelationKind::View(props),
             id: vid,
             schema_id,
             name,
             pk,
-            placement,
+            distribution: None,
             facts: RelFacts { pk_repeats, serial: false },
         })
     }
@@ -203,19 +204,18 @@ impl CatalogEngine {
             };
             let defs = self.read_column_defs(owner)?;
             if kind.is_base_table() {
-                let rebuilt =
-                    build_schema_from_col_defs(RelationKind::BaseTable, &defs, cur.pk_cols(), cur.placement())
-                        .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;
+                let rebuilt = build_schema_from_col_defs(RelationKind::BaseTable, &defs, cur.pk_cols())
+                    .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;
                 if rebuilt != cur {
                     self.reject_if_dependent_views(owner, "column ALTER")?;
                     self.registry.swap_schema(owner, rebuilt)?;
                 }
+                self.caches
+                    .relations
+                    .get_mut(&owner)
+                    .expect("every registered relation has an entry")
+                    .reschema(cur.pk_cols(), &defs);
             }
-            self.caches
-                .relations
-                .get_mut(&owner)
-                .expect("every registered relation has an entry")
-                .reschema(cur.pk_cols(), &defs);
         }
         Ok(())
     }

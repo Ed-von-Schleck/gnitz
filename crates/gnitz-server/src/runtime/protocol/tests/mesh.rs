@@ -23,7 +23,7 @@ fn by_pk(schema: &SchemaDescriptor) -> ScatterPlan {
 /// The receiver of 2 that [`by_pk`] routes a U64 `pk` to.
 fn owner(pk: u64) -> usize {
     let schema = make_schema_u64_i64();
-    schema.worker_for_pk(&opk_pk(&schema, &[pk as u128]), 2)
+    gnitz_zset::schema::worker_for_pk_bytes(&opk_pk(&schema, &[pk as u128]), 2)
 }
 
 /// The first `n` pks from `from` up that [`owner`] routes to receiver `r`.

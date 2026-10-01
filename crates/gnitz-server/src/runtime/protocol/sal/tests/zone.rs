@@ -252,8 +252,8 @@ fn slot_damage_in_an_unzoned_group_does_not_stop_the_walk() {
     let log = TestLog::new(SIZE, NW, 1);
     let batch = rows();
     let (member, stream) = (
-        WireSchema::encoded(TID, *batch.schema()),
-        WireSchema::encoded(TID + 1, *batch.schema()),
+        WireSchema::encoded(TID, batch.schema()),
+        WireSchema::encoded(TID + 1, batch.schema()),
     );
     let data = GroupData::Same(WireData::Whole(&batch));
     let (member, stream) = (DirectGroup::push(&member, data, 0), DirectGroup::push(&stream, data, 0));
@@ -305,7 +305,7 @@ impl TestLog {
         let batch = rows();
         let relations: Vec<WireSchema> = targets
             .iter()
-            .map(|&t| WireSchema::encoded(t, *batch.schema()))
+            .map(|&t| WireSchema::encoded(t, batch.schema()))
             .collect();
         let groups: Vec<DirectGroup> = relations
             .iter()

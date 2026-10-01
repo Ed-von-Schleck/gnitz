@@ -401,8 +401,7 @@ fn a_projection_must_name_payload_columns_that_fit_one_schema() {
         proj(vec![200]),
         "projection map: column 200 is not a payload column of a 2-column schema"
     );
-    // A PK source: `project_schema` drops it while `copy_cols` numbers
-    // destinations densely, so the copy would address a slot that does not exist.
+    // A PK source: the PK region already carries it.
     assert_eq!(
         proj(vec![0]),
         "projection map: column 0 is not a payload column of a 2-column schema"
@@ -410,7 +409,13 @@ fn a_projection_must_name_payload_columns_that_fit_one_schema() {
     // Each index is bounded but the list length is not, and duplicates are legal.
     // Exactly MAX_COLUMNS payload sources already overflow — the output also
     // carries the input's PK column, which a length-only bound misses.
-    assert_eq!(proj(vec![1; MAX_COLUMNS]), "projection map: output exceeds MAX_COLUMNS");
+    assert_eq!(
+        proj(vec![1; MAX_COLUMNS]),
+        format!(
+            "projection map: column count {} exceeds MAX_COLUMNS ({MAX_COLUMNS})",
+            MAX_COLUMNS + 1
+        )
+    );
 }
 
 /// A hash-row map over a `(U128 PK, I64)` input carries its payload column into
@@ -572,15 +577,20 @@ fn a_corrupt_compute_map_program_is_rejected() {
     }
 }
 
-/// A declaration wider than a schema holds is refused by the derivation, never
-/// reaching `SchemaDescriptor::new`'s release-active `assert!`.
+/// A declaration wider than a schema holds is refused by the derivation.
 #[test]
 fn compute_map_refuses_an_over_wide_declaration() {
     let mk = MapKind::Compute(gnitz_wire::ComputeMap {
         program: vec![1, 2, 3],
         out_cols: vec![(TypeCode::I64, false); MAX_COLUMNS],
     });
-    assert!(wire_rejection(&make_schema_u64_i64(), mk).starts_with("compute map: output exceeds MAX_COLUMNS"));
+    assert_eq!(
+        wire_rejection(&make_schema_u64_i64(), mk),
+        format!(
+            "compute map: output column count {} exceeds MAX_COLUMNS ({MAX_COLUMNS})",
+            MAX_COLUMNS + 1
+        )
+    );
 }
 
 // -----------------------------------------------------------------------

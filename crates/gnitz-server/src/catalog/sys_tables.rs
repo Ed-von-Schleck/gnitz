@@ -6,6 +6,7 @@
 //! CatalogEngine dependency.
 
 use rustc_hash::FxHashMap;
+use std::sync::LazyLock;
 
 use super::RelFacts;
 use gnitz_expr::RowSource;
@@ -15,7 +16,6 @@ use gnitz_wire::sys_rows::{
     write_col_tab_row, write_schema_tab_row, write_table_tab_row, ColTabRow, FkRef, SchemaTabRow, SysRowSink,
     TableTabRow,
 };
-use gnitz_wire::MAX_COLUMNS;
 use gnitz_wire::{ColType, ColumnDef, TableDistribution, ViewProps};
 use gnitz_wire::{
     COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME,
@@ -24,7 +24,7 @@ use gnitz_wire::{
     VIEWTAB_PAY_DELTA, VIEWTAB_PAY_FLAGS, VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX,
 };
 use gnitz_zset::repr::{Batch, BatchBuilder};
-use gnitz_zset::schema::{Placement, SchemaColumn, SchemaDescriptor};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -62,15 +62,16 @@ use gnitz_wire::{unpack_pk_cols, PkListRole};
 // ---------------------------------------------------------------------------
 
 /// What `register_relation` needs to build and register one relation: the values
-/// decoded off its TABLE_TAB / VIEW_TAB row, plus the placement its own family
-/// derives.
+/// decoded off its TABLE_TAB / VIEW_TAB row.
 pub(super) struct RelationRegistration<'a> {
     pub(super) kind: RelationKind,
     pub(super) id: u64,
     pub(super) schema_id: u64,
     pub(super) name: &'a str,
     pub(super) pk: PkColList,
-    pub(super) placement: Placement,
+    /// `Some` off a TABLE_TAB row; `None` for a view, whose placement its
+    /// circuit decides.
+    pub(super) distribution: Option<TableDistribution>,
     pub(super) facts: RelFacts,
 }
 
@@ -87,9 +88,6 @@ pub(super) fn read_table_tab_row(batch: &Batch, row: usize) -> Result<RelationRe
         RelationKind::BaseTable
     };
     let noun = kind.noun();
-    // The PK list is decoded before the placement is built: a `Keyed` prefix is
-    // a leading-prefix length into it, and nothing downstream re-checks it —
-    // `Placement::resolve` normalizes only the `0` sentinel.
     let pk = unpack_pk_cols(payload_u64(batch, row, TABTAB_PAY_PK_COL_IDX)).map_err(|rule| {
         format!(
             "catalog invariant violated: {noun} '{name}' {}",
@@ -105,10 +103,7 @@ pub(super) fn read_table_tab_row(batch: &Batch, row: usize) -> Result<RelationRe
         schema_id: payload_u64(batch, row, RELTAB_PAY_SCHEMA_ID),
         name,
         pk,
-        placement: match props.distribution {
-            TableDistribution::Replicated => Placement::Replicated,
-            TableDistribution::Keyed { prefix_len } => Placement::Keyed { prefix_len },
-        },
+        distribution: Some(props.distribution),
         facts: RelFacts {
             // A base table's PK is unique by `enforce_unique_pk`; a stream's is not.
             pk_repeats: props.stream,
@@ -117,8 +112,7 @@ pub(super) fn read_table_tab_row(batch: &Batch, row: usize) -> Result<RelationRe
     })
 }
 
-/// A VIEW_TAB row as decoded. Not yet a [`RelationRegistration`]: a view's
-/// placement is a fold over its sources, which this reader cannot see.
+/// A VIEW_TAB row as decoded.
 pub(super) struct ViewRegistration<'a> {
     pub(super) schema_id: u64,
     pub(super) name: &'a str,
@@ -357,34 +351,19 @@ pub(crate) fn idx_tab_partition(batch: &Batch) -> IdxPartition {
 // Schema derivation from the shared wire column slices
 // ---------------------------------------------------------------------------
 
-/// Build a `SchemaDescriptor` from one of `gnitz-wire`'s canonical system-table
-/// column arrays. `const`, so [`SCHEMAS`] below costs nothing at runtime. Every
-/// such family is [`Placement::Replicated`]: DDL is master-broadcast, so each
-/// worker holds an identical full copy, and a reader single-sources one copy
-/// instead of gathering N.
-const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: &[u32]) -> SchemaDescriptor {
-    let mut buf = [SchemaColumn::EMPTY; MAX_COLUMNS];
-    let mut i = 0;
-    while i < cols.len() {
-        buf[i] = SchemaColumn::new(cols[i].type_code, cols[i].nullable);
-        i += 1;
-    }
-    let (head, _) = buf.split_at(cols.len());
-    SchemaDescriptor::new_with_placement(head, pk_indices, Placement::Replicated)
-}
-
-/// Pre-computed schema statics, one per family, indexed by [`SysFamily::index`]
-/// — initialised at compile time, never reconstructed.
-static SCHEMAS: [SchemaDescriptor; SysFamily::COUNT] = {
-    let w = gnitz_wire::SYS_FAMILIES;
-    let mut arr = [from_wire_cols(w[0].cols, w[0].pk_cols); SysFamily::COUNT];
-    let mut i = 1;
-    while i < SysFamily::COUNT {
-        arr[i] = from_wire_cols(w[i].cols, w[i].pk_cols);
-        i += 1;
-    }
-    arr
-};
+/// One schema per family, indexed by [`SysFamily::index`], each built from
+/// `gnitz-wire`'s canonical system-table column array.
+static SCHEMAS: LazyLock<[SchemaDescriptor; SysFamily::COUNT]> = LazyLock::new(|| {
+    std::array::from_fn(|i| {
+        let f = &gnitz_wire::SYS_FAMILIES[i];
+        let cols: Vec<SchemaColumn> = f
+            .cols
+            .iter()
+            .map(|c| SchemaColumn::new(c.type_code, c.nullable))
+            .collect();
+        SchemaDescriptor::new(&cols, f.pk_cols)
+    })
+});
 
 // ---------------------------------------------------------------------------
 // Typed system family
@@ -455,9 +434,7 @@ impl SysFamily {
         self.wire().name
     }
 
-    /// This family's fixed schema. Borrowed from the `static` that holds it —
-    /// a `SchemaDescriptor` is 360 bytes, so returning it by value put a copy on
-    /// every catalog write.
+    /// This family's fixed schema.
     #[inline]
     pub(crate) fn schema(self) -> &'static SchemaDescriptor {
         &SCHEMAS[self.index()]

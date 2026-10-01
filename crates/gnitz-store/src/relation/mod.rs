@@ -13,7 +13,7 @@ use gnitz_zset::schema::{index_spec_and_schema, KeySpec, SchemaDescriptor};
 use crate::storage::{RecoverySource, StoreBudgets, Table};
 use gnitz_wire::{PkColList, PkKeys, ViewProps};
 use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError, StoredRow};
-use gnitz_zset::schema::Slot;
+use gnitz_zset::schema::{Placement, Slot};
 
 mod build;
 mod circuit_state;
@@ -222,6 +222,7 @@ pub struct Relation {
     delta: Option<Box<Table>>,
     indexes: Vec<SecondaryIndex>,
     kind: RelationKind,
+    placement: Placement,
 }
 
 impl Relation {
@@ -245,6 +246,11 @@ impl Relation {
         self.kind
     }
 
+    /// Where this relation's rows live.
+    pub fn placement(&self) -> Placement {
+        self.placement
+    }
+
     /// Whether this relation keeps a delta feed, whether or not this process holds
     /// its store.
     pub fn has_delta_feed(&self) -> bool {
@@ -260,7 +266,7 @@ impl Relation {
     /// Whether every worker holds the whole relation rather than a partition of
     /// it — so a read of it must single-source, and a write of it broadcasts.
     pub fn is_replicated(&self) -> bool {
-        self.schema().placement().is_replicated()
+        self.placement.is_replicated()
     }
 
     /// The unique secondary indexes a write must still check: one covering the
@@ -356,6 +362,7 @@ pub struct RelationSpec {
     pub id: u64,
     pub kind: RelationKind,
     pub schema: SchemaDescriptor,
+    pub placement: Placement,
 }
 
 // ---------------------------------------------------------------------------

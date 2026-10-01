@@ -21,6 +21,7 @@ use super::train::drain_rows;
 use crate::catalog::{FkEdge, RowConstraints};
 use crate::runtime::orchestration::TxnFamily;
 use gnitz_expr::{ColumnLocator, SchemaFacts};
+use gnitz_store::relation::Relation;
 use gnitz_wire::{PkColList, PkKeys, ProbeKeyspace, WireConflictMode, WireProbeMode, WireStatus};
 use gnitz_zset::repr::MemBatch;
 use gnitz_zset::schema::key::PkBuf;
@@ -64,7 +65,7 @@ impl PipelinedCheck {
     fn reply_schema(&self) -> &SchemaDescriptor {
         match &self.probe {
             Probe::Project { reply, .. } => reply.as_ref(),
-            _ => self.schema.descriptor(),
+            _ => self.batch.schema(),
         }
     }
 
@@ -83,13 +84,12 @@ impl PipelinedCheck {
     }
 }
 
-/// The PK-only image of `schema`, routed to where its keys are held; every
-/// worker holds a replicated source, so its probe spreads over the full PK.
-fn probe_schema(schema: &SchemaDescriptor) -> SchemaDescriptor {
-    let pk_only = gnitz_zset::schema::project_schema(schema, &[]).expect("a PK-only projection fits MAX_COLUMNS");
-    match schema.placement() {
-        Placement::Replicated => pk_only,
-        p => pk_only.with_placement(p),
+/// Where an own-PK probe of `rel` goes: to the owners of its keys — or, every
+/// worker holding a replicated relation whole, spread over the full key.
+fn probe_placement(rel: &Relation) -> Placement {
+    match rel.placement() {
+        Placement::Replicated => Placement::full_pk(&rel.schema()),
+        p => p,
     }
 }
 
@@ -419,21 +419,28 @@ async fn execute_probe_burst(
                 match check.keyspace {
                     // Each worker is sent the keys it holds; one holding none is
                     // not sent the probe.
-                    ProbeKeyspace::OwnPk => with_routed(&check.batch, &check.schema, nw, |rows, data| {
-                        let holders = rows
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, r)| !r.is_empty())
-                            .fold(WorkerSet::EMPTY, |set, (w, _)| set.with(w));
-                        cut.push(SalMessageKind::HasPk, holders, |excl, targets| {
-                            excl.write(&DirectGroup {
-                                template,
-                                data,
-                                targets,
-                                ..DirectGroup::new(SalMessageKind::HasPk)
+                    ProbeKeyspace::OwnPk => {
+                        let rel = disp
+                            .cat()
+                            .registry
+                            .relation(check.schema.tid())
+                            .expect("a probed relation is registered under the catalog lock");
+                        with_routed(&check.batch, probe_placement(rel), nw, |rows, data| {
+                            let holders = rows
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, r)| !r.is_empty())
+                                .fold(WorkerSet::EMPTY, |set, (w, _)| set.with(w));
+                            cut.push(SalMessageKind::HasPk, holders, |excl, targets| {
+                                excl.write(&DirectGroup {
+                                    template,
+                                    data,
+                                    targets,
+                                    ..DirectGroup::new(SalMessageKind::HasPk)
+                                })
                             })
-                        })
-                    })?,
+                        })?
+                    }
                     // Index entries are partitioned independently of the probe
                     // key, so every worker holding the relation is probed.
                     ProbeKeyspace::Index(_) => cut.read(DirectGroup {
@@ -586,12 +593,12 @@ fn plan_pk_checks(b: &TxnBundle<'_>, checks: &mut Vec<PipelinedCheck>) -> Vec<u6
         if keys.is_empty() {
             continue;
         }
-        let pk_only = probe_schema(&t.schema);
+        let pk_only = t.schema.pk_only();
         checks.push(PipelinedCheck {
             keyspace: ProbeKeyspace::OwnPk,
             probe: Probe::Exists,
             batch: build_check_batch_pk_bytes(&pk_only, keys.into_iter()),
-            schema: wire::WireSchema::encoded(t.tid, pk_only),
+            schema: wire::WireSchema::encoded(t.tid, &pk_only),
         });
         probed.push(t.tid);
     }
@@ -684,7 +691,7 @@ fn plan_unique_checks<'a>(
                 // span, not echo the probe key back.
                 probe: Probe::FirstHolder,
                 batch: build_check_batch_pk_bytes(&idx_schema, order.iter().map(|&x| probe_key(x))),
-                schema: wire::WireSchema::encoded(tid, idx_schema),
+                schema: wire::WireSchema::encoded(tid, &idx_schema),
             });
             plans.push(UniquePlan {
                 tid,
@@ -756,7 +763,7 @@ fn plan_fk_existence(
         let parent_schema = disp.cat().registry.relation_or_err(parent_tid)?.schema();
         let ref_tc = loc.type_code();
         let (key_schema, keyspace) = if parent_schema.lone_pk_col() == Some(parent_col) {
-            (probe_schema(&parent_schema), ProbeKeyspace::OwnPk)
+            (parent_schema.pk_only(), ProbeKeyspace::OwnPk)
         } else {
             let idx_schema = disp
                 .cat()
@@ -774,7 +781,7 @@ fn plan_fk_existence(
             keyspace,
             probe: Probe::Exists,
             batch: build_check_batch(&key_schema, &mut values, ref_tc),
-            schema: wire::WireSchema::encoded(parent_tid, key_schema),
+            schema: wire::WireSchema::encoded(parent_tid, &key_schema),
         });
         plans.push(FkProbePlan { edge, values });
     }
@@ -855,11 +862,11 @@ async fn resolve_parent_deltas(
             check_of.push(None);
             continue;
         }
-        let pk_only = probe_schema(&schema);
+        let pk_only = schema.pk_only();
         // The constructor the worker's projection uses, so a matching reply
         // validates by construction.
         let reply = gnitz_zset::schema::project_schema(&schema, &[pcol as u32])
-            .expect("a one-column projection fits MAX_COLUMNS");
+            .expect("an FK edge's parent column is a payload column of its parent");
         // The reply's one payload column, off the projected schema rather than
         // the parent's — and not column 0, since `project_schema` keeps the PK
         // region ahead of it.
@@ -868,7 +875,7 @@ async fn resolve_parent_deltas(
             keyspace: ProbeKeyspace::OwnPk,
             probe: Probe::Project { col: pcol, reply: Box::new(reply) },
             batch: build_check_batch_pk_bytes(&pk_only, keys.iter()),
-            schema: wire::WireSchema::encoded(ptid, pk_only),
+            schema: wire::WireSchema::encoded(ptid, &pk_only),
         });
         check_of.push(Some(checks.len() - 1));
     }
@@ -1023,7 +1030,7 @@ async fn txn_check_fk_restrict(
             keyspace: ProbeKeyspace::Index(PkColList::from_slice(&[fk_col as u32])),
             probe,
             batch,
-            schema: wire::WireSchema::encoded(child_tid, idx_schema),
+            schema: wire::WireSchema::encoded(child_tid, &idx_schema),
         });
         plans.push(RestrictPlan { edge, spec, values: v_check, bundled });
     }

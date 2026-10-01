@@ -141,7 +141,7 @@ impl TestLog {
     pub(crate) fn ddl_zone(&self, groups: &[(SysFamily, &Batch)]) -> u64 {
         let relations: Vec<WireSchema> = groups
             .iter()
-            .map(|(family, _)| WireSchema::encoded(family.id(), *family.schema()))
+            .map(|(family, _)| WireSchema::encoded(family.id(), family.schema()))
             .collect();
         let groups: Vec<DirectGroup> = relations
             .iter()

@@ -19,6 +19,7 @@ fn load(rows: Batch) -> Result<LoadedCircuit, String> {
             id: gnitz_wire::CIRCUIT_NODES_TAB,
             kind: RelationKind::SystemCatalog,
             schema: *SysFamily::CircuitNodes.schema(),
+            placement: gnitz_zset::schema::Placement::Replicated,
         })
         .unwrap();
     registry.ingest(gnitz_wire::CIRCUIT_NODES_TAB, rows).unwrap();

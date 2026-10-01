@@ -98,15 +98,11 @@ impl PkSetGather {
 
     /// Every remaining live row at weight 1, in the [`project_schema`] layout of
     /// `cols`: this source's PK, then the payload columns `cols` names.
-    pub fn project_live(&mut self, cols: &[u32]) -> Batch {
+    /// `Err` where `project_schema` refuses `cols`.
+    pub fn project_live(&mut self, cols: &[u32]) -> Result<Batch, String> {
         let schema = self.cursor.schema;
-        let out_schema = project_schema(&schema, cols).expect("a projection of a schema's own columns fits");
-        // The columns `project_schema` kept, in its order.
-        let locs: Vec<ColumnLocator> = cols
-            .iter()
-            .filter(|&&c| schema.payload_slot(c as usize).is_some())
-            .map(|&c| schema.locate(c as usize))
-            .collect();
+        let out_schema = project_schema(&schema, cols)?;
+        let locs: Vec<ColumnLocator> = cols.iter().map(|&c| schema.locate(c as usize)).collect();
         let mut out = Batch::with_capacity(&out_schema, self.remaining_keys());
         self.for_each_live_row(usize::MAX, |c| {
             let (src, row) = c.current_row_source();
@@ -115,7 +111,7 @@ impl PkSetGather {
             out.append_cells_from(0, &locs, src, row, &mut null_word);
             out.commit_row(null_word);
         });
-        out
+        Ok(out)
     }
 
     /// The next non-empty chunk of source rows, or `None` once the key list is
