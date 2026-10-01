@@ -3,7 +3,7 @@
 //! The crate graph cannot enforce this — the rungs are one crate, so
 //! nothing else stops a `relation` file from naming `crate::ops` tomorrow. The
 //! walk itself is `test_support::ladder`, shared with `gnitz-server`'s own
-//! guard; what is stated here is only this crate's table.
+//! guard; what is stated here is only this crate's ladder.
 
 use std::fs;
 use std::path::Path;
@@ -12,30 +12,22 @@ use crate::test_support::{assert_ladder, rung_files};
 
 const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
 
-/// Each rung and the rungs it may name — the table `CLAUDE.md` and the `mod.rs`
-/// headers state in prose.
-///
-/// `relation` and `ops` are incomparable: neither names the other, and `read` is
-/// the rung that may name both. That is why this is a table and not an ordering.
-const LADDER: &[(&str, &[&str])] = &[
-    ("schema", &[]),
-    ("storage", &["schema"]),
-    ("ops", &["schema", "storage"]),
-    ("relation", &["schema", "storage"]),
-    ("read", &["schema", "storage", "ops", "relation"]),
-];
+/// The tiers, bottom first — the ladder `CLAUDE.md` and the `mod.rs` headers
+/// state in prose. `ops` and `relation` share a tier: neither names the other,
+/// and `read` may name both.
+const LADDER: &[&[&str]] = &[&["schema"], &["storage"], &["ops", "relation"], &["read"]];
 
 #[test]
 fn every_rung_names_only_the_rungs_beneath_it() {
     assert_ladder(Path::new(SRC), LADDER);
 }
 
-/// The walk sees an edge the table withholds: `storage` does name `schema`.
+/// The walk sees an edge the ladder withholds: `storage` does name `schema`.
 #[test]
-#[should_panic(expected = "storage/ is not above schema")]
+#[should_panic(expected = "storage/ names crate::schema")]
 fn a_withheld_edge_fails_the_guard() {
     let mut ladder = LADDER.to_vec();
-    ladder[1].1 = &[];
+    ladder.swap(0, 1);
     assert_ladder(Path::new(SRC), &ladder);
 }
 

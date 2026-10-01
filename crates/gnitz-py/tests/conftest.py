@@ -116,7 +116,7 @@ class _Server:
         data_dir = os.path.join(self._data_dir, "data")
         self._proc = ServerProc(
             data_dir, self.sock_path,
-            workers=self._workers or int(os.environ.get("GNITZ_WORKERS", NUM_WORKERS)),
+            workers=self._workers,
             extra_env=self._extra_env, log_path=_LOG_PATH,
             args=[f"--tls-listen=127.0.0.1:{self.tls_port}"]).start()
         with open(os.path.join(data_dir, "tls_endpoint")) as f:
@@ -314,7 +314,7 @@ def dedicated_server(tmp_path_factory, _sock_path):
     started = []
 
     def make(env: dict[str, str]):
-        workers = int(env.get("GNITZ_WORKERS", os.environ.get("GNITZ_WORKERS", NUM_WORKERS)))
+        workers = int(env.get("GNITZ_WORKERS", NUM_WORKERS))
         s = _Server(_sock_path(), tmp_path_factory,
                     workers=workers if workers >= 2 else 4, extra_env=env)
         started.append(s)

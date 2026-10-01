@@ -84,10 +84,10 @@ Environment:
 ";
 
 fn parse_level(s: &str) -> Result<Level, String> {
-    match s.to_ascii_lowercase().as_str() {
-        "quiet" | "0" => Ok(Level::Quiet),
-        "normal" | "1" => Ok(Level::Normal),
-        "verbose" | "debug" | "2" => Ok(Level::Debug),
+    match s {
+        "quiet" => Ok(Level::Quiet),
+        "normal" => Ok(Level::Normal),
+        "verbose" | "debug" => Ok(Level::Debug),
         _ => Err(format!("invalid log level {s:?} (expected quiet, normal or verbose)")),
     }
 }
@@ -95,11 +95,10 @@ fn parse_level(s: &str) -> Result<Level, String> {
 /// Parse `--workers=N` into `1..=MAX_WORKERS`.
 fn parse_workers(val: &str) -> Result<u32, String> {
     const MAX: u32 = runtime::MAX_WORKERS as u32;
-    match val.parse::<u32>() {
-        Ok(n) if (1..=MAX).contains(&n) => Ok(n),
-        Ok(n) => Err(format!("--workers must be between 1 and {MAX} (got {n})")),
-        Err(_) => Err("invalid --workers value".to_string()),
-    }
+    val.parse()
+        .ok()
+        .filter(|n| (1..=MAX).contains(n))
+        .ok_or_else(|| format!("--workers must be between 1 and {MAX} (got {val:?})"))
 }
 
 /// What argv asks for: each flag parsed, and the TLS flags checked against each
@@ -139,14 +138,12 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
             allow_unauthenticated = true;
         } else if arg.starts_with('-') {
             return Err(format!("unknown option {arg:?}"));
-        } else if positional.len() == 2 {
-            return Err(format!("unexpected argument {arg:?}"));
         } else {
             positional.push(arg);
         }
     }
     let [data_dir, socket_path] = positional[..] else {
-        return Err("missing required arguments <data_dir> <socket_path>".to_string());
+        return Err(format!("expected <data_dir> <socket_path>, got {positional:?}"));
     };
     let tls = match tls_listen {
         Some(listen) => Some(runtime::TlsArgs {
@@ -178,7 +175,7 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        eprint!("{HELP_TEXT}");
+        print!("{HELP_TEXT}");
         process::exit(0);
     }
     let env_level = env::var("GNITZ_LOG_LEVEL").ok();

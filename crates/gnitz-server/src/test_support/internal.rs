@@ -1,5 +1,5 @@
-//! The catalog-level test helpers — the store-level ones are `gnitz-store`'s
-//! `shared` file, compiled here through a `#[path]`.
+//! The catalog-level test helpers — the store-level ones are
+//! `gnitz-store-testkit`'s.
 //!
 //! This file is compiled once, and only inside this crate, so it names
 //! crate-internals as `crate::` and widens no API — nothing links this crate.

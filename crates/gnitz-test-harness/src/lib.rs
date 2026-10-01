@@ -291,9 +291,7 @@ fn spawn_and_wait_ready(
         cmd.env("GNITZ_CPU_AFFINITY", "0");
     }
     cmd.envs(extra_env.iter().map(|(k, v)| (k, v)));
-    if workers > 1 {
-        cmd.arg(format!("--workers={workers}"));
-    }
+    cmd.arg(format!("--workers={workers}"));
     cmd.args(args);
     let mut proc = cmd.spawn().expect("failed to spawn server");
 

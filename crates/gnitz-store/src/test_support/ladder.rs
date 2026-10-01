@@ -4,40 +4,41 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// The crate-root names any file may use: the roots themselves and the test
+/// scaffolding beside the rungs.
+const UNLADDERED: [&str; 5] = ["lib", "main", "tests", "test_support", "test_rng"];
+
 /// Assert that every rung under `src_root` names only the rungs beneath it.
 ///
-/// `ladder` pairs each rung with the rungs it may name; anything in the table
-/// that is not in a rung's row and is not the rung itself sits above or beside
-/// it, and is forbidden. A table rather than an ordering because rungs can be
-/// incomparable — neither naming the other, with a third above both. Every
-/// module directory under `src_root` must be in the table.
+/// `ladder` lists the tiers bottom first: a rung may name itself and the rungs
+/// of every earlier tier, and rungs sharing a tier are incomparable. Every
+/// entry of `src_root` must be a rung or one of [`UNLADDERED`].
 ///
-/// It matches `crate::<up>` — which is why a grouped `crate::{…}` import is
-/// refused outright — and does not see `super::`-relative reaches, so it is a
-/// regression guard and not a proof.
-pub fn assert_ladder(src_root: &Path, ladder: &[(&str, &[&str])]) {
-    let rungs: Vec<&str> = ladder.iter().map(|&(name, _)| name).collect();
-    for dir in entries(src_root).into_iter().filter(|p| p.is_dir()) {
-        let name = dir.file_name().unwrap().to_str().unwrap();
+/// It reads the name each `crate::` path leads with, so a crate-root item and a
+/// grouped `crate::{…}` import are refused along with a higher rung. It does
+/// not see `super::`-relative reaches, so it is a regression guard and not a
+/// proof.
+pub fn assert_ladder(src_root: &Path, ladder: &[&[&str]]) {
+    for p in entries(src_root) {
+        let name = p.file_stem().unwrap().to_str().unwrap();
         assert!(
-            rungs.contains(&name) || name == "tests" || name == "test_support",
-            "{name}/ is a module root the ladder does not place",
+            ladder.concat().contains(&name) || UNLADDERED.contains(&name),
+            "{name} is a module root the ladder does not place",
         );
     }
-    for &(rung, allowed) in ladder {
-        for f in rung_files(src_root, rung) {
-            let src = fs::read_to_string(&f).unwrap();
-            assert!(
-                !src.contains("crate::{"),
-                "{}: a grouped crate import hides its rungs from the ladder guard",
-                f.display(),
-            );
-            for up in rungs.iter().filter(|up| **up != rung && !allowed.contains(up)) {
-                assert!(
-                    !src.contains(&format!("crate::{up}")),
-                    "{}: {rung}/ is not above {up} and must not name it",
-                    f.display(),
-                );
+    for (tier, rungs) in ladder.iter().enumerate() {
+        let beneath = ladder[..tier].concat();
+        for rung in *rungs {
+            for f in rung_files(src_root, rung) {
+                let src = fs::read_to_string(&f).unwrap();
+                for path in src.split("crate::").skip(1) {
+                    let named = path.split(|c: char| c != '_' && !c.is_alphanumeric()).next().unwrap();
+                    assert!(
+                        named == *rung || beneath.contains(&named) || UNLADDERED.contains(&named),
+                        "{}: {rung}/ names crate::{named}, which is not beneath it",
+                        f.display(),
+                    );
+                }
             }
         }
     }

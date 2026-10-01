@@ -2,20 +2,15 @@
 //!
 //! The crate graph cannot enforce this — the three rungs are one crate. The
 //! walk is `gnitz-store-testkit`'s, shared with `gnitz-store`'s own guard; what
-//! is stated here is only this crate's table.
+//! is stated here is only this crate's ladder.
 
 use std::path::Path;
 
 use crate::test_support::assert_ladder;
 
-/// Each rung and the rungs it may name — the ladder `CLAUDE.md` and the crate
-/// root state in prose. A total order here, unlike `gnitz-store`'s table: the
-/// catalog names the DAG, and the runtime names both.
-const LADDER: &[(&str, &[&str])] = &[
-    ("query", &[]),
-    ("catalog", &["query"]),
-    ("runtime", &["catalog", "query"]),
-];
+/// The tiers, bottom first — the ladder `CLAUDE.md` and the crate root state
+/// in prose.
+const LADDER: &[&[&str]] = &[&["query"], &["catalog"], &["runtime"]];
 
 #[test]
 fn every_rung_names_only_the_rungs_beneath_it() {

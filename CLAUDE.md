@@ -378,7 +378,7 @@ Strictly layered — every module depends only on those beneath it. The crate se
 sits between `query` and `read`:
 
 ```
-runtime (L7)   → catalog, query, read, ops, storage, schema   orchestration · protocol · reactor
+runtime (L7)   → catalog, query, read, relation, ops, storage, schema   orchestration · protocol · reactor
 catalog        → query, read, relation, ops, storage, schema
 query (L5)     → read, relation, ops, storage, schema         compiler · vm · dag
   ── the crate seam: everything above is `gnitz-server`, below is `gnitz-store` ──
@@ -395,8 +395,8 @@ needs from the DBSP layer — recomputing a capacity-bounded view's skeleton row
 — is injected as the `SkeletonHydrator` trait, which a host that maintains no
 circuit passes `None` for. The crate graph is what stops that host linking a
 compiler. Each side of the seam is one crate, so the ladder among the rungs
-within a side is pinned by a source-text test over a declared table rather than
-by the graph — one such table per crate, over the same walk. `catalog` and
+within a side is pinned by a source-text test over a declared ladder rather than
+by the graph — one such ladder per crate, over the same walk. `catalog` and
 `query` also cannot end the process: `gnitz_fatal_abort!` is private to
 `runtime`, so every fallible path in them returns its error.
 
