@@ -105,7 +105,7 @@ fn pipelined_verbs() {
             let (_, one, many, found, missing) = tokio::join!(
                 client.push(tid, &schema, &replaced),
                 client.scan_spec(tid, &ReadSpec::all_rows(ReadBound::PkSet(key.keys())), &schema),
-                client.scan_many(&[(tid, &schema), (empty, &schema)]),
+                client.scan_many(vec![(tid, Arc::clone(&schema)), (empty, Arc::clone(&schema))]),
                 client.resolve(&sn, "t"),
                 client.resolve(&sn, "nope"),
             );

@@ -185,7 +185,7 @@ pub enum Request<'a> {
     },
     /// SCAN_MULTI: every row of N relations at one cut, each replied in the
     /// layout of the schema paired with it.
-    ScanMulti(&'a [(u64, &'a Arc<Schema>)]),
+    ScanMulti(Vec<(u64, Arc<Schema>)>),
 }
 
 /// A [`Request`] validated and encoded, with how its reply decodes. Built
@@ -300,12 +300,11 @@ impl Request<'_> {
             Request::ScanMulti(rels) => {
                 let items: Vec<txn_frame::ScanMultiItem> = rels
                     .iter()
-                    .map(|&(tid, schema)| txn_frame::ScanMultiItem {
-                        tid,
+                    .map(|(tid, schema)| txn_frame::ScanMultiItem {
+                        tid: *tid,
                         reply_layout: schema.layout_digest(),
                     })
                     .collect();
-                let rels = rels.iter().map(|&(tid, schema)| (tid, Arc::clone(schema))).collect();
                 (txn_frame::encode_scan_multi(&items), SlotKind::Multi { rels })
             }
         };

@@ -497,7 +497,7 @@ impl GnitzClient {
     /// in request order. An atomic multi-table `txn_commit` is never observed torn
     /// across the result set.
     /// Each relation is replied in the layout of the schema paired with it.
-    pub fn scan_many(&mut self, relations: &[(u64, &Arc<Schema>)]) -> Result<Vec<ScanReply>, ClientError> {
+    pub fn scan_many(&mut self, relations: Vec<(u64, Arc<Schema>)>) -> Result<Vec<ScanReply>, ClientError> {
         self.round_trip(Request::ScanMulti(relations)).map(Reply::into_multi)
     }
 

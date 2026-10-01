@@ -4,9 +4,11 @@
 
 use crate::ir::BExpr;
 use gnitz_expr::calendar::MICROS_PER_DAY;
-use gnitz_expr::CmpOp;
+use gnitz_expr::place::{place_ratio, place_scaled, Round};
 use gnitz_wire::decimal::parse_decimal_text;
 use gnitz_wire::{ColType, FixedInt, TypeCode};
+
+pub(crate) use gnitz_expr::place::{Compared, Placed};
 
 /// A DATE/TIMESTAMP spelling as the integer a column of type `tc` stores; `None`
 /// for text that spells no such value, and for any other type.
@@ -21,56 +23,6 @@ pub(crate) fn parse_temporal(tc: TypeCode, s: &str) -> Option<i64> {
 /// The refusal of string `s` as a spelling of type `ty`.
 pub(crate) fn invalid_literal(ty: impl std::fmt::Display, s: &str) -> String {
     format!("invalid {ty} literal: '{s}'")
-}
-
-/// Where a literal falls among the values of a column type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Placed {
-    /// The value it spells, as the column's native image (low `wire_stride`
-    /// bytes, little-endian).
-    At(u128),
-    /// Strictly between the value `lo` and the next one. `nearest` is the one an
-    /// assignment stores: a numeric type rounds half away from zero, as a
-    /// DECIMAL→integer CAST does; DATE takes a TIMESTAMP's day.
-    Between { lo: u128, nearest: u128 },
-    /// Below every value. `nearest` is set when rounding an inexact literal
-    /// still lands on the type's minimum (`-128.4` into an I8).
-    Below { nearest: Option<u128> },
-    /// Above every value; `nearest` as for `Below`.
-    Above { nearest: Option<u128> },
-}
-
-/// `x CMP lit` over the values of `x`'s type, as [`Placed::compare`] rewrites it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Compared {
-    /// The same verdict for every value.
-    Always(bool),
-    /// `x CMP v` for one value `v` of the type, as its native image.
-    Cmp(CmpOp, u128),
-}
-
-impl Placed {
-    /// Whether the literal lies outside the type's range.
-    pub(crate) fn is_outside(self) -> bool {
-        matches!(self, Placed::Below { .. } | Placed::Above { .. })
-    }
-
-    /// `x cmp lit`, where this is `lit` placed among the values of `x`'s type,
-    /// as a comparison against one of those values or a constant verdict. Seek
-    /// keys and VM comparisons both read it.
-    pub(crate) fn compare(self, cmp: CmpOp) -> Compared {
-        use CmpOp::*;
-        match self {
-            Placed::At(v) => Compared::Cmp(cmp, v),
-            Placed::Between { lo, .. } => match cmp {
-                Eq | Ne => Compared::Always(cmp == Ne),
-                Lt | Le => Compared::Cmp(Le, lo),
-                Gt | Ge => Compared::Cmp(Gt, lo),
-            },
-            Placed::Below { .. } => Compared::Always(matches!(cmp, Ne | Gt | Ge)),
-            Placed::Above { .. } => Compared::Always(matches!(cmp, Ne | Lt | Le)),
-        }
-    }
 }
 
 /// The value an assignment of `lit` into `ty` stores, as its native image: the
@@ -151,48 +103,6 @@ pub(crate) fn place<R>(lit: &BExpr<R>, ty: ColType) -> Option<Placed> {
         None if tc == TypeCode::I128 => Some(Placed::At(v as u128)),
         None if v < 0 => Some(Placed::Below { nearest: None }),
         None => Some(Placed::At(v as u128)),
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Round {
-    Floor,
-    HalfAwayFromZero,
-}
-
-/// `v · 10^-s` among the values of `fi` read at scale `scale`.
-fn place_scaled(fi: FixedInt, v: i128, s: u8, scale: u8) -> Placed {
-    match scale.checked_sub(s) {
-        Some(up) => match 10i128.checked_pow(u32::from(up)).and_then(|p| v.checked_mul(p)) {
-            Some(n) => place_ratio(fi, n, 1, Round::Floor),
-            None if v < 0 => Placed::Below { nearest: None },
-            None => Placed::Above { nearest: None },
-        },
-        None => {
-            let den = 10i128
-                .checked_pow(u32::from(s - scale))
-                .expect("a decimal literal has at most 38 fractional digits");
-            place_ratio(fi, v, den, Round::HalfAwayFromZero)
-        }
-    }
-}
-
-/// The rational `num / den` (`den > 0`, in units of the stored integer) among
-/// `fi`'s values.
-fn place_ratio(fi: FixedInt, num: i128, den: i128, round: Round) -> Placed {
-    let (min, max) = fi.range();
-    let (lo, rem) = (num.div_euclid(den), num.rem_euclid(den));
-    let up = round == Round::HalfAwayFromZero && (rem > den - rem || (rem == den - rem && num > 0));
-    let near = lo + i128::from(up);
-    let nearest = (min..=max).contains(&near).then(|| fi.pack(near));
-    if lo < min {
-        Placed::Below { nearest }
-    } else if lo > max || (lo == max && rem != 0) {
-        Placed::Above { nearest }
-    } else if rem == 0 {
-        Placed::At(fi.pack(lo))
-    } else {
-        Placed::Between { lo: fi.pack(lo), nearest: fi.pack(near) }
     }
 }
 

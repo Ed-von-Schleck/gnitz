@@ -12,8 +12,8 @@ use crate::relation::RelationRegistry;
 use crate::relation::{delta_round, delta_round_prefix};
 use gnitz_expr::RowFilter;
 use gnitz_zset::algebra::SinkPlan;
-use gnitz_zset::repr::{pk_group_end, Batch, SkeletonKeys, SourceCursor};
-use gnitz_zset::schema::key::{compare_pk_bytes, key_range_between_cuts, KeyCut};
+use gnitz_zset::repr::{Batch, SkeletonKeys, SourceCursor};
+use gnitz_zset::schema::key::{key_range_between_cuts, KeyCut};
 use gnitz_zset::schema::SchemaDescriptor;
 
 impl RelationRegistry {
@@ -185,6 +185,9 @@ impl Survivors<'_, '_> {
 /// both ascending, so one co-walk checks every key and catches a PK no key named.
 #[cfg(debug_assertions)]
 fn assert_hydration_matches(out: &Batch, keys: &PkKeys, coarse: &[i64]) {
+    use gnitz_zset::repr::pk_group_end;
+    use gnitz_zset::schema::key::compare_pk_bytes;
+
     assert_eq!(keys.len(), coarse.len());
     let mut expected = keys.iter().zip(coarse).peekable();
     let mut i = 0;

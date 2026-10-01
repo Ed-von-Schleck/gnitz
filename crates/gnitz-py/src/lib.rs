@@ -3,7 +3,6 @@
 //! `_native` registration.
 
 use pyo3::prelude::*;
-use pyo3::types::PyList;
 
 use gnitz_core::{ClientError, GnitzClient, MirrorError};
 use gnitz_wire::{TypeCode, WireStatus};
@@ -90,19 +89,6 @@ pub(crate) fn sql_err(e: gnitz_sql::GnitzSqlError) -> PyErr {
     }
 }
 
-/// Collect a known-length fallible iterator into a Python list, reserving that
-/// length up front — which `collect::<PyResult<Vec<_>>>()` cannot do.
-pub(crate) fn build_pylist<'py, T: IntoPyObject<'py>>(
-    py: Python<'py>,
-    items: impl ExactSizeIterator<Item = PyResult<T>>,
-) -> PyResult<Bound<'py, PyList>> {
-    let mut out: Vec<T> = Vec::with_capacity(items.len());
-    for item in items {
-        out.push(item?);
-    }
-    PyList::new(py, out)
-}
-
 /// The one way this crate obtains a connection, so no caller can skip the park
 /// hook — what makes a blocking call Ctrl-C-interruptible. `gnitz-core` must not
 /// depend on pyo3, so the hook is the host's to supply.
@@ -119,6 +105,17 @@ pub(crate) fn connect_client(py: Python<'_>, target: &str) -> PyResult<GnitzClie
 #[pyfunction]
 fn type_codes() -> Vec<(&'static str, u8)> {
     TypeCode::ALL.iter().map(|&tc| (tc.wire_name(), tc.as_wire())).collect()
+}
+
+/// Instructions retired on this thread while `f()` runs, and whether the
+/// count includes the kernel's.
+#[pyfunction]
+fn instructions_retired(f: &Bound<'_, PyAny>) -> PyResult<(u64, bool)> {
+    let counter = gnitz_foundation::perf::Counter::instructions()
+        .ok_or_else(|| gnitz_err("the kernel refused the instructions counter"))?;
+    let (out, n) = counter.measure(|| f.call0());
+    out?;
+    Ok((n, counter.counts_kernel))
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +168,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("debug_assertions", cfg!(debug_assertions))?;
     m.add_class::<PyDeltaReply>()?;
     m.add_function(wrap_pyfunction!(type_codes, m)?)?;
+    m.add_function(wrap_pyfunction!(instructions_retired, m)?)?;
     m.add_function(wrap_pyfunction!(schema::sys_schema, m)?)?;
     Ok(())
 }

@@ -28,7 +28,11 @@ retraction that seeks a key no row carries, which leaves the old row behind at
 weight 1 beside the new one — and a row set reads that as correct.
 """
 
+from datetime import date, datetime
+from decimal import Decimal
+
 import pytest
+import gnitz
 from _read import access, bag, rows, scanned
 
 U64_MAX = 18446744073709551615
@@ -357,3 +361,38 @@ def test_a_date_and_a_timestamp_meet_in_microseconds(client):
     want = rows(client,
                 "SELECT id, CASE WHEN k = 1 THEN CAST(d AS TIMESTAMP) ELSE ts END AS t FROM t")
     assert bag(scanned(client, "v")) == bag(want)
+
+
+# ---------------------------------------------------------------------------
+# A lookup key the column cannot hold exactly
+# ---------------------------------------------------------------------------
+
+_NOON = datetime(2024, 2, 29, 13)
+
+# (PK column type, stored literal, the key as it reads back, a value a written
+# cell rounds onto that key)
+_INEXACT = [
+    ("DECIMAL(10, 2)", "5.00", Decimal("5.00"), Decimal("5.004")),
+    ("DATE", "DATE '2024-02-29'", date(2024, 2, 29), _NOON),
+]
+
+
+@pytest.mark.parametrize("pk_sql,stored,key,inexact", _INEXACT, ids=["decimal", "date"])
+def test_a_lookup_key_names_its_row_exactly_where_a_written_cell_rounds(
+        client, pk_sql, stored, key, inexact):
+    """`append` rounds a value onto the nearest key; `seek` and `delete` refuse
+    it, and the row that key names stays."""
+    _seed(client, f"CREATE TABLE t (k {pk_sql} NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+          f"({stored}, 1)")
+    tid, schema = client.resolve_table("t")
+
+    assert bag(client.seek(tid, schema, key)) == {(key, 1): 1}
+    with pytest.raises(ValueError):
+        client.seek(tid, schema, inexact)
+    with pytest.raises(ValueError):
+        client.delete(tid, schema, [inexact])
+    assert bag(scanned(client, "t")) == {(key, 1): 1}
+
+    assert bag(gnitz.ZSetBatch(schema).append(k=inexact, v=2).rows()) == {(key, 2): 1}
+    client.delete(tid, schema, [key])
+    assert bag(scanned(client, "t")) == {}

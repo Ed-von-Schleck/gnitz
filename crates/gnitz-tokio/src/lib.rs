@@ -136,7 +136,7 @@ impl AsyncClient {
     /// replied in the layout of the schema paired with it.
     pub fn scan_many(
         &self,
-        relations: &[(u64, &Arc<Schema>)],
+        relations: Vec<(u64, Arc<Schema>)>,
     ) -> impl Future<Output = Result<Vec<ScanReply>, ClientError>> {
         self.call(Request::ScanMulti(relations), Reply::into_multi)
     }

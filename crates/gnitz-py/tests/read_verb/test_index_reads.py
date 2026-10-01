@@ -13,6 +13,10 @@ be walked is padded with `PAD` rows no case's predicate selects: a NULL indexed
 cell, which the index does not hold, or an out-of-range value.
 """
 
+import uuid
+from datetime import date, datetime
+from decimal import Decimal
+
 import pytest
 from _read import access, bag, rows, scanned
 from _sql import insert
@@ -70,6 +74,44 @@ def test_index_seek_refuses_a_key_count_the_index_cannot_take(client, keys):
     tid, schema = client.resolve_table("t")
     with pytest.raises(ValueError, match="key value count"):
         client.seek_by_index(tid, schema, [1], keys)
+
+
+_DAY = date(2024, 2, 29)
+
+# (column type, stored literal, keys that find it, (key, error) it refuses)
+_TYPED_KEYS = [
+    ("TINYINT UNSIGNED", "7", [7], [(300, OverflowError)]),
+    ("BIGINT UNSIGNED", "7", [7], [(-1, OverflowError)]),
+    ("DATE", "DATE '2024-02-29'", [_DAY, datetime(2024, 2, 29)],
+     [(datetime(2024, 2, 29, 13), ValueError)]),
+    ("TIMESTAMP", "TIMESTAMP '2024-02-29 00:00:00'", [datetime(2024, 2, 29), _DAY], []),
+    ("DECIMAL(10, 2)", "5.00", [5, Decimal("5.00"), "5.00", 5.0, "5.000"],
+     [(Decimal("5.004"), ValueError), (5.0049999, ValueError)]),
+    ("BIGINT", "7", [7], [(str(uuid.UUID(int=7)), TypeError)]),
+]
+
+
+@pytest.mark.parametrize("col_type,stored,finds,refused", _TYPED_KEYS,
+                         ids=[t[0].split("(")[0].lower().replace(" ", "-") for t in _TYPED_KEYS])
+def test_index_seek_reads_a_key_as_its_columns_type(client, col_type, stored, finds, refused):
+    """A key the column holds exactly finds its row; one it cannot hold raises
+    rather than reaching another row."""
+    client.execute_sql(
+        f"CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v {col_type} NOT NULL); "
+        f"CREATE INDEX ON t(v); INSERT INTO t VALUES (1, {stored})")
+    tid, schema = client.resolve_table("t")
+    for key in finds:
+        assert bag(client.seek_by_index(tid, schema, [1], [key]), "pk") == {(1,): 1}, repr(key)
+    for key, error in refused:
+        with pytest.raises(error):
+            client.seek_by_index(tid, schema, [1], [key])
+
+
+def test_index_seek_refuses_a_column_that_cannot_be_a_key(client):
+    client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, s TEXT NOT NULL)")
+    tid, schema = client.resolve_table("t")
+    with pytest.raises(ValueError, match="cannot be a key column"):
+        client.seek_by_index(tid, schema, [1], ["x"])
 
 
 # ---------------------------------------------------------------------------

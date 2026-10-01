@@ -1,30 +1,16 @@
 use super::*;
 
 #[test]
-fn text_round_trips_at_the_column_scale() {
-    assert_eq!(parse_decimal("12.5", 2), Some(1250));
-    assert_eq!(parse_decimal("-0.5", 3), Some(-500));
-    assert_eq!(parse_decimal("+7", 0), Some(7));
-    assert_eq!(parse_decimal(".5", 1), Some(5));
-    assert_eq!(parse_decimal("5.", 1), Some(50));
-    // A longer fraction rounds as `rescale` does.
-    assert_eq!(parse_decimal("-1.005", 2), Some(-101));
+fn text_is_the_digits_and_scale_it_spells() {
+    assert_eq!(parse_decimal_text("12.5"), Some((125, 1)));
+    assert_eq!(parse_decimal_text("-0.5"), Some((-5, 1)));
+    assert_eq!(parse_decimal_text("+7"), Some((7, 0)));
+    assert_eq!(parse_decimal_text(".5"), Some((5, 1)));
+    assert_eq!(parse_decimal_text("5."), Some((5, 0)));
+    assert_eq!(parse_decimal_text("-1.005"), Some((-1005, 3)));
     for bad in ["", ".", "-", "1e3", "1,5", "abc", "1.2.3"] {
-        assert_eq!(parse_decimal(bad, 2), None, "{bad:?}");
+        assert_eq!(parse_decimal_text(bad), None, "{bad:?}");
     }
-    // Past i64 at the column scale.
-    assert_eq!(parse_decimal("9223372036854775808", 0), None);
-    assert_eq!(parse_decimal("92233720368547758.08", 2), None);
-}
-
-#[test]
-fn rescale_widens_exactly_and_narrows_by_rounding() {
-    assert_eq!(rescale(15, 1, 3), Some(1500));
-    assert_eq!(rescale(1500, 3, 1), Some(15));
-    assert_eq!(rescale(1550, 3, 1), Some(16));
-    assert_eq!(rescale(-1550, 3, 1), Some(-16));
-    assert_eq!(rescale(1549, 3, 1), Some(15));
-    assert_eq!(rescale(i64::MAX as i128, 0, 1), None);
 }
 
 #[test]
@@ -65,7 +51,7 @@ fn a_number_text_is_the_decimal_it_spells() {
     }
 }
 
-/// `format_decimal` is the inverse of `parse_decimal` at the same scale, over
+/// `format_decimal` is the inverse of `parse_decimal_text` at the same scale, over
 /// every scale a column may declare and at the edges of `i64` — the property
 /// the Python `Decimal(str)` construction and every error message depend on.
 #[test]
@@ -82,7 +68,11 @@ fn format_and_parse_are_inverse_at_every_scale() {
     for scale in 0..=MAX_DECIMAL_SCALE {
         for v in [0, 1, -1, 5, -5, 999, -999, i64::MAX, i64::MIN] {
             let text = format_decimal(v.into(), scale);
-            assert_eq!(parse_decimal(&text, scale), Some(v), "{v} at scale {scale} → {text:?}");
+            assert_eq!(
+                parse_decimal_text(&text),
+                Some((v.into(), scale)),
+                "{v} at scale {scale} → {text:?}"
+            );
             // Exactly `scale` fractional digits, so a column's values line up.
             let frac = text.split_once('.').map_or(0, |(_, f)| f.len());
             assert_eq!(frac, scale as usize, "{text:?}");

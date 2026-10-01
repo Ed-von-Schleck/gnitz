@@ -5,12 +5,14 @@
 //! The per-cell decode is private: what leaves this module is [`scan_result`],
 //! so no other module dispatches on a `TypeCode` to read a value.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDate, PyDateTime, PyDict, PyString, PyTuple, PyType};
+use pyo3::IntoPyObjectExt;
 
 use gnitz_core::{ScanReply, Schema, ZSetBatch};
 use gnitz_expr::{ColumnLocator, SchemaFacts};
@@ -22,8 +24,7 @@ use crate::schema::PySchema;
 
 /// `subclass` because a result presents its rows as a synthesised subclass
 /// carrying its field names and one [`ColumnDescriptor`] per column
-/// ([`row_type_for`]). `frozen` drops the borrow flag, and with it two atomic
-/// RMWs per `&self` method.
+/// ([`RowType`]). `frozen` drops the borrow flag.
 #[pyclass(name = "Row", frozen, subclass)]
 pub struct PyRow {
     values: Py<PyTuple>,
@@ -50,44 +51,58 @@ impl ColumnDescriptor {
     }
 }
 
-/// The row subclass for one presented-field tuple, built once per result and
-/// cached for every later result with the same column names. Process-global and
-/// never evicted; it grows with the program's distinct column-name tuples, not
-/// with the data.
-///
-/// Keyed by the tuple's *contents*, never by the `Arc<Schema>` address: a freed
-/// `Arc`'s address can be reused, which would hand a result someone else's
-/// descriptors.
-fn row_type_for<'py>(py: Python<'py>, fields: &Bound<'py, PyTuple>) -> PyResult<Bound<'py, PyType>> {
-    static CACHE: PyOnceLock<Py<PyDict>> = PyOnceLock::new();
-    let cache = CACHE
-        .get_or_try_init(py, || PyResult::Ok(PyDict::new(py).unbind()))?
-        .bind(py);
-    if let Some(ty) = cache.get_item(fields)? {
-        return ty.cast_into::<PyType>().map_err(Into::into);
-    }
-    let ns = PyDict::new(py);
-    // No `__dict__` / `__weakref__` per row: a row's namespace is its columns.
-    ns.set_item(intern!(py, "__slots__"), PyTuple::empty(py))?;
-    ns.set_item(intern!(py, "_fields"), fields)?;
-    let base = py.get_type::<PyRow>();
-    for (pos, name) in fields.as_slice().iter().enumerate() {
-        // A name the row object already answers (`_fields`, `_asdict`,
-        // `_weight`, a dunder) keeps that meaning; the column is read by
-        // position or through `_asdict()`. A repeated name keeps its first
-        // column.
-        if base.hasattr(name.cast::<PyString>()?)? || ns.contains(name)? {
-            continue;
+/// The `Row` subclass that presents columns named `names`.
+struct RowType(Py<PyType>);
+
+impl RowType {
+    /// One per distinct `names`, for the life of the process.
+    fn of(py: Python<'_>, names: &[&str]) -> PyResult<RowType> {
+        static CACHE: LazyLock<Mutex<HashMap<Vec<u8>, Py<PyType>>>> = LazyLock::new(Default::default);
+        // Length-prefixed, so no two name lists share a key.
+        let mut key = Vec::new();
+        for name in names {
+            key.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            key.extend_from_slice(name.as_bytes());
         }
-        ns.set_item(name, Bound::new(py, ColumnDescriptor { pos })?)?;
+        if let Some(ty) = CACHE.lock().unwrap().get(&key) {
+            return Ok(RowType(ty.clone_ref(py)));
+        }
+        let built = Self::build(py, names)?;
+        Ok(RowType(CACHE.lock().unwrap().entry(key).or_insert(built).clone_ref(py)))
     }
-    let bases = PyTuple::new(py, [base])?;
-    let ty = py
-        .get_type::<PyType>()
-        .call1((intern!(py, "Row"), bases, ns))?
-        .cast_into::<PyType>()?;
-    cache.set_item(fields, &ty)?;
-    Ok(ty)
+
+    fn build(py: Python<'_>, names: &[&str]) -> PyResult<Py<PyType>> {
+        // Interned: `field_pos` settles on a pointer compare.
+        let fields = PyTuple::new(py, names.iter().map(|n| PyString::intern(py, n)))?;
+        let ns = PyDict::new(py);
+        // No `__dict__` / `__weakref__` per row: a row's namespace is its columns.
+        ns.set_item(intern!(py, "__slots__"), PyTuple::empty(py))?;
+        ns.set_item(intern!(py, "_fields"), &fields)?;
+        let base = py.get_type::<PyRow>();
+        for (pos, name) in fields.as_slice().iter().enumerate() {
+            // A name the row object already answers (`_fields`, `_asdict`,
+            // `_weight`, a dunder) keeps that meaning; the column is read by
+            // position or through `_asdict()`. A repeated name keeps its first
+            // column.
+            if base.hasattr(name.cast::<PyString>()?)? || ns.contains(name)? {
+                continue;
+            }
+            ns.set_item(name, Bound::new(py, ColumnDescriptor { pos })?)?;
+        }
+        let bases = PyTuple::new(py, [base])?;
+        let ty = py.get_type::<PyType>().call1((intern!(py, "Row"), bases, ns))?;
+        Ok(ty.cast_into::<PyType>()?.unbind())
+    }
+
+    fn row(&self, py: Python<'_>, values: Bound<'_, PyTuple>, weight: i64) -> PyResult<Py<PyAny>> {
+        let init = PyClassInitializer::from(PyRow { values: values.unbind(), weight });
+        // SAFETY: `build` is the only source of the type: a `PyRow` subclass
+        // that adds no instance state.
+        unsafe {
+            let ptr = pyo3::impl_::pymethods::tp_new_impl::<_, PyRow>(py, init, self.0.bind(py).as_type_ptr())?;
+            Ok(Bound::from_owned_ptr(py, ptr).unbind())
+        }
+    }
 }
 
 /// Position of `name` among `fields`, or `None`. Field names are interned, so
@@ -187,7 +202,7 @@ impl PyRow {
     pub fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         if let Ok(other_row) = other.cast::<PyRow>() {
             let eq: bool = self.values.bind(py).eq(other_row.get().values.bind(py))?;
-            Ok(eq.into_pyobject(py)?.to_owned().into_any().unbind())
+            eq.into_py_any(py)
         } else {
             Ok(py.NotImplemented().into_any())
         }
@@ -231,24 +246,23 @@ fn py_decimal(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
 /// `datetime.datetime`, DECIMAL as `decimal.Decimal` at the column's scale,
 /// STRING as `str`, BLOB as `bytes`.
 fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType, row: usize) -> PyResult<Py<PyAny>> {
-    macro_rules! obj {
-        ($v:expr) => {
-            $v.into_pyobject(py)?.into_any().unbind()
-        };
-    }
     if loc.is_null(batch, row) {
         return Ok(py.None());
     }
     let mut scratch = [0u8; 16];
     let b = loc.native_le_bytes(batch, row, &mut scratch);
     Ok(match ty.tc {
-        TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => obj!(gnitz_wire::read_unsigned_exact(b)),
-        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => obj!(gnitz_wire::read_signed_exact(b)),
-        TypeCode::F32 => obj!(f32::from_le_bytes(b.try_into().unwrap())),
-        TypeCode::F64 => obj!(f64::from_le_bytes(b.try_into().unwrap())),
-        TypeCode::U128 => obj!(u128::from_le_bytes(b.try_into().unwrap())),
-        TypeCode::I128 => obj!(i128::from_le_bytes(b.try_into().unwrap())),
-        TypeCode::UUID => obj!(format_uuid(u128::from_le_bytes(b.try_into().unwrap()))),
+        TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => {
+            gnitz_wire::read_unsigned_exact(b).into_py_any(py)?
+        }
+        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
+            gnitz_wire::read_signed_exact(b).into_py_any(py)?
+        }
+        TypeCode::F32 => f32::from_le_bytes(b.try_into().unwrap()).into_py_any(py)?,
+        TypeCode::F64 => f64::from_le_bytes(b.try_into().unwrap()).into_py_any(py)?,
+        TypeCode::U128 => u128::from_le_bytes(b.try_into().unwrap()).into_py_any(py)?,
+        TypeCode::I128 => i128::from_le_bytes(b.try_into().unwrap()).into_py_any(py)?,
+        TypeCode::UUID => format_uuid(u128::from_le_bytes(b.try_into().unwrap())).into_py_any(py)?,
         TypeCode::Date => {
             let (y, m, d) = gnitz_expr::calendar::civil_from_days(gnitz_wire::read_signed_exact(b));
             PyDate::new(py, y as i32, m as u8, d as u8)?.into_any().unbind()
@@ -277,15 +291,6 @@ fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType
 // ScanResult
 // ---------------------------------------------------------------------------
 
-/// One result's presentation over a shared batch: the columns shown, in order,
-/// and the `Row` subclass that names them.
-struct Presented {
-    schema: Arc<Schema>,
-    batch: Arc<ZSetBatch>,
-    cols: Vec<(ColumnLocator, ColType)>,
-    row_type: Py<PyType>,
-}
-
 /// The visible columns of `schema` over `batch`, or every column when
 /// `include_hidden`.
 fn present(
@@ -293,33 +298,34 @@ fn present(
     schema: Arc<Schema>,
     batch: Arc<ZSetBatch>,
     include_hidden: bool,
-) -> PyResult<Arc<Presented>> {
-    let shown: Vec<usize> = if include_hidden {
-        (0..schema.columns.len()).collect()
-    } else {
-        schema.visible_columns().map(|(ci, _)| ci).collect()
-    };
-    let cols = shown
-        .iter()
-        .map(|&ci| (SchemaFacts::locate(schema.as_ref(), ci), schema.columns[ci].ty))
-        .collect();
-    // Interned: `field_pos` settles on a pointer compare, and the tuple's own
-    // hash reads each element's cached one.
-    let names = shown.iter().map(|&ci| PyString::intern(py, &schema.columns[ci].name));
-    let fields = PyTuple::new(py, names)?;
-    let row_type = row_type_for(py, &fields)?.unbind();
-    Ok(Arc::new(Presented { schema, batch, cols, row_type }))
+    lsn: Option<u64>,
+) -> PyResult<PyScanResult> {
+    let mut cols = Vec::with_capacity(schema.columns.len());
+    let mut names = Vec::with_capacity(schema.columns.len());
+    for (ci, c) in schema.columns.iter().enumerate() {
+        if c.is_hidden && !include_hidden {
+            continue;
+        }
+        cols.push((SchemaFacts::locate(schema.as_ref(), ci), c.ty));
+        names.push(c.name.as_str());
+    }
+    let row_type = RowType::of(py, &names)?;
+    Ok(PyScanResult { schema, batch, cols, row_type, lsn })
 }
 
 /// The one `ScanResult` build: read verbs, SQL rows, delta rows, `ZSetBatch.rows()`.
 pub(crate) fn scan_result(py: Python<'_>, reply: ScanReply) -> PyResult<Py<PyScanResult>> {
-    let data = present(py, reply.schema, Arc::new(reply.batch), false)?;
-    Py::new(py, PyScanResult { data, lsn: reply.lsn })
+    Py::new(py, present(py, reply.schema, Arc::new(reply.batch), false, reply.lsn)?)
 }
 
+/// One result's presentation over a shared batch: the columns shown, in order,
+/// and the `Row` subclass that names them.
 #[pyclass(name = "ScanResult", frozen)]
 pub struct PyScanResult {
-    data: Arc<Presented>,
+    schema: Arc<Schema>,
+    batch: Arc<ZSetBatch>,
+    cols: Vec<(ColumnLocator, ColType)>,
+    row_type: RowType,
     /// The server-side LSN this result was read at, or `None` where there is
     /// none — a local answer, SQL rows, delta rows. Reporting 0 would collide
     /// with a real LSN 0.
@@ -331,33 +337,28 @@ pub struct PyScanResult {
 impl PyScanResult {
     #[getter]
     fn schema(&self) -> PySchema {
-        PySchema { rust: Arc::clone(&self.data.schema) }
+        PySchema { rust: Arc::clone(&self.schema) }
     }
 
-    fn __iter__(&self) -> PyRowIterator {
-        PyRowIterator {
-            data: Arc::clone(&self.data),
-            row_buf: Vec::new(),
-            pos: 0,
-        }
+    fn __iter__(slf: Py<Self>) -> PyRowIterator {
+        PyRowIterator { data: slf, row_buf: Vec::new(), pos: 0 }
     }
 
     /// Truthiness follows from this: CPython derives `__bool__` from `__len__`
     /// when a type defines no `nb_bool`.
     fn __len__(&self) -> usize {
-        self.data.batch.len()
+        self.batch.len()
     }
 
     /// The same rows presenting every column, hidden key slots included.
     fn including_hidden(&self, py: Python<'_>) -> PyResult<PyScanResult> {
-        let data = present(py, Arc::clone(&self.data.schema), Arc::clone(&self.data.batch), true)?;
-        Ok(PyScanResult { data, lsn: self.lsn })
+        present(py, Arc::clone(&self.schema), Arc::clone(&self.batch), true, self.lsn)
     }
 }
 
 #[pyclass(name = "RowIterator")]
 pub struct PyRowIterator {
-    data: Arc<Presented>,
+    data: Py<PyScanResult>,
     row_buf: Vec<Py<PyAny>>,
     pos: usize,
 }
@@ -369,23 +370,22 @@ impl PyRowIterator {
     }
 
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        let data = &*self.data;
+        let data = self.data.get();
+        let batch: &ZSetBatch = &data.batch;
         let row = self.pos;
-        if row >= data.batch.len() {
+        if row >= batch.len() {
             return Ok(None);
         }
         self.row_buf.clear();
         for &(loc, ty) in &data.cols {
-            self.row_buf.push(cell_to_py(py, &data.batch, loc, ty, row)?);
+            self.row_buf.push(cell_to_py(py, batch, loc, ty, row)?);
         }
         // `drain` hands the values over already-owned, so the tuple build costs no
         // refcount traffic, and the Vec keeps its capacity for the next row.
         let values = PyTuple::new(py, self.row_buf.drain(..))?;
-        // Through the subclass's own `tp_call`: pyo3 gives Rust no way to
-        // instantiate a pyclass subtype.
-        let obj = data.row_type.bind(py).call1((values, data.batch.weights[row]))?;
+        let obj = data.row_type.row(py, values, batch.weights[row])?;
         self.pos += 1;
-        Ok(Some(obj.unbind()))
+        Ok(Some(obj))
     }
 }
 

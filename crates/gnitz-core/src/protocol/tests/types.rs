@@ -774,3 +774,39 @@ fn a_pk_wider_than_the_client_codec_is_rejected() {
     );
     assert!(Schema::from_block(&block).is_err());
 }
+
+/// A row pushed column by column is the row `push_natives` writes, and a column
+/// that fails leaves nothing of its row behind.
+#[test]
+fn push_row_encodes_each_column_and_appends_nothing_on_error() {
+    let schema = Schema {
+        columns: vec![
+            ColumnDef::new("a", TypeCode::I32, false),
+            ColumnDef::new("v", TypeCode::U64, false),
+            ColumnDef::new("b", TypeCode::U64, false),
+        ],
+        pk_cols: vec![2, 0],
+    };
+    let natives = [u64::MAX as u128, (-7i32) as u32 as u128];
+    let widths = [8, 4];
+    let mut got = PkColumn::empty_for_schema(&schema);
+    got.push_row(&schema, |k, buf| {
+        buf.extend_from_slice(&natives[k].to_le_bytes()[..widths[k]]);
+        Ok::<_, ()>(())
+    })
+    .unwrap();
+    let mut want = PkColumn::empty_for_schema(&schema);
+    want.push_natives(&schema, &natives);
+    assert_eq!(got, want);
+
+    let before = got.clone();
+    let failed = got.push_row(&schema, |k, buf| {
+        buf.extend_from_slice(&natives[k].to_le_bytes()[..widths[k]]);
+        if k == 1 {
+            Err("second column")
+        } else {
+            Ok(())
+        }
+    });
+    assert_eq!((failed, &got), (Err("second column"), &before));
+}

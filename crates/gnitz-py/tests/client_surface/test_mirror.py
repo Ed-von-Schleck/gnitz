@@ -108,6 +108,28 @@ def test_what_the_copy_does_not_hold_is_read_upstream(client, mirror):
     assert mirror.requests_sent > before, "a forgotten view must be read upstream again"
 
 
+def test_a_point_read_is_answered_off_the_copy(client, mirror):
+    """`seek` and `seek_by_index` over a mirrored view send nothing, carry no
+    LSN, and agree with the same read through a client that mirrors nothing."""
+    _fed_view(client)
+    vid = mirror.mirror_view("f").view_id
+    churn(client, 1, 60)
+    _quiesce(client, mirror)
+    _, schema = mirror.resolve_table("f")
+    for what, read in [
+        ("seek", lambda c: c.seek(vid, schema, 30)),
+        ("seek_by_index over the key", lambda c: c.seek_by_index(vid, schema, [0], [30])),
+        ("seek_by_index over a payload column", lambda c: c.seek_by_index(vid, schema, [1], [90])),
+    ]:
+        before = mirror.requests_sent
+        local = read(mirror)
+        assert mirror.requests_sent == before, f"{what}: the read was delegated upstream"
+        assert local.lsn is None, f"{what}: a local answer carries no LSN"
+        remote = read(client)
+        assert remote.lsn is not None
+        _samebag(what, local, remote)
+
+
 # ── the handle's life in an interpreter ─────────────────────────────────────
 
 
@@ -305,7 +327,9 @@ def test_the_copy_outlives_its_server_and_reseeds_on_reconnect(own_server, mirro
 
     own_server.stop()
     assert bag(_local(m, vid, q)) == expected
-    assert all(r.error is not None for r in m.poll()), "a dead connection fails every view's poll"
+    assert all(isinstance(r.error, gnitz.GnitzConnectionError) for r in m.poll()), (
+        "a dead connection fails every view's poll, and the exception says it was the connection"
+    )
     assert bag(_local(m, vid, q)) == expected, "and the copy still answers at the round it reached"
     with pytest.raises(gnitz.GnitzConnectionError):
         m.execute_sql("SELECT * FROM t")

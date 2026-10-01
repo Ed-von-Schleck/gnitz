@@ -371,7 +371,7 @@ crate graph rather than a convention: a host holding a mirrored view links
 | `gnitz-core` | Client core: connection, protocol, the logical type / expression model, and the mirror state machine | `foundation`, `wire`, `expr` |
 | `gnitz-sql` | SQL front end: parser, binder, query planner | `core`, `expr`, `wire` |
 | `gnitz-tokio` | The Rust async client: a `Connection` future over tokio's reactor, and the `AsyncClient` handle | `core` |
-| `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `expr`, `mirror`, `sql`, `wire` |
+| `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `expr`, `foundation`, `mirror`, `sql`, `wire` |
 | `gnitz-zset` | The Z-set kernel: the schema, columnar batches and the shard image, the cursor over runs, and the operators | `foundation`, `wire`, `expr` |
 | `gnitz-store` | The Z-set store: the LSM, the relation registry, the `ReadSpec` executor | `foundation`, `zset`, `wire`, `expr` |
 | `gnitz-server` | The multi-process server binary: the DBSP layer — circuit compiler, bytecode VM, epoch execution, system-table catalog — under the `runtime` rung that drives it | `foundation`, `store`, `zset`, `wire`, `expr` |

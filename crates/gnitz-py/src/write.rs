@@ -17,60 +17,51 @@ use pyo3::types::{PyDate, PyDateAccess, PyDateTime, PyDict, PyString, PyTimeAcce
 use pyo3::Borrowed;
 
 use gnitz_core::{PkColumn, ScanReply, Schema, ZSetBatch};
-use gnitz_expr::SchemaFacts;
-use gnitz_wire::decimal::{decimal_of_f64, parse_decimal, rescale};
-use gnitz_wire::{ColType, ReadBound, ReadSpec, TypeCode};
+use gnitz_expr::place::{place_scaled, Placed};
+use gnitz_wire::decimal::{decimal_of_f64, parse_decimal_text};
+use gnitz_wire::{ColType, ColumnDef, FixedInt, ReadBound, ReadSpec, TypeCode};
 
 use crate::read::{scan_result, PyScanResult};
 use crate::schema::resolve_py_schema;
 
-/// Encode the Python PK values `pks` into a `PkColumn` for `schema`: a
-/// single-column key is its value, a compound key a tuple of per-column values
-/// in PK order. Shared by `PyGnitzClient::delete` and `PyTxn::delete`; every
-/// column runs through the same encoder the append path uses.
+/// The lookup keys `pks` as a `PkColumn` for `schema`: a single-column key is
+/// its value, a compound key a tuple of its column values in PK order.
 pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyResult<PkColumn> {
     let mut pk_col = PkColumn::empty_for_schema(schema);
     pk_col.reserve(pks.len());
-    let mut native = Vec::with_capacity(schema.pk_stride());
-    for pk_val in pks {
-        native.clear();
-        match schema.lone_pk_col() {
-            Some(ci) => push_pk_col(&mut native, schema, ci, pk_val)?,
-            None => {
-                let tuple = pk_val.cast::<PyTuple>().map_err(|_| {
-                    pyo3::exceptions::PyTypeError::new_err("a compound pk must be a tuple of its column values")
-                })?;
-                if tuple.len() != schema.pk_cols.len() {
-                    return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                        "a compound pk takes {} values, got {}",
-                        schema.pk_cols.len(),
-                        tuple.len()
-                    )));
-                }
-                for (&ci, v) in schema.pk_cols.iter().zip(tuple.as_slice()) {
-                    push_pk_col(&mut native, schema, ci as usize, v)?;
-                }
-            }
+    for pk in pks {
+        let tuple;
+        let vals = if schema.pk_cols.len() == 1 {
+            std::slice::from_ref(pk)
+        } else {
+            tuple = pk.cast::<PyTuple>().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err("a compound pk must be a tuple of its column values")
+            })?;
+            tuple.as_slice()
+        };
+        if vals.len() != schema.pk_cols.len() {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "a compound pk takes {} values, got {}",
+                schema.pk_cols.len(),
+                vals.len()
+            )));
         }
-        pk_col.push_bytes(schema, &native);
+        pk_col.push_row(schema, |k, buf| {
+            let col = &schema.columns[schema.pk_cols[k] as usize];
+            if vals[k].is_none() {
+                return Err(not_nullable_err(&col.name));
+            }
+            push_fixed_le(buf, col.ty, &vals[k], Inexact::Refuse)
+        })?;
     }
     Ok(pk_col)
 }
 
 /// A read of the rows keyed `pk` — a single-column key's value, or a compound
-/// key's tuple — encoded exactly as [`py_pks_to_column`] encodes a pushed row's.
+/// key's tuple.
 pub(crate) fn pk_point_spec(schema: &Schema, pk: &Bound<'_, PyAny>) -> PyResult<ReadSpec> {
     let keys = py_pks_to_column(schema, std::slice::from_ref(pk))?.keys();
     Ok(ReadSpec::all_rows(ReadBound::PkSet(keys)))
-}
-
-/// Append PK column `ci`'s value `v` to `native`, refusing `None`.
-fn push_pk_col(native: &mut Vec<u8>, schema: &Schema, ci: usize, v: &Bound<'_, PyAny>) -> PyResult<()> {
-    let col = &schema.columns[ci];
-    if v.is_none() {
-        return Err(not_nullable_err(&col.name));
-    }
-    push_fixed_le(native, col.ty, v)
 }
 
 /// Stores batch data in Rust Vecs with a cached Schema. `append` / `extend`
@@ -87,9 +78,6 @@ pub struct PyZSetBatch {
     weight_is_column: bool,
     /// The plan the last row was written through — see [`KwPlan`].
     kw_plan: Option<KwPlan>,
-    /// One row's PK columns packed native-LE, reused so the per-row append
-    /// allocates nothing.
-    pk_scratch: Vec<u8>,
 }
 
 impl PyZSetBatch {
@@ -125,7 +113,7 @@ fn push_column_value(col: &mut Vec<u8>, blob: &mut Vec<u8>, ty: ColType, val: &B
             let b = val.extract::<Cow<[u8]>>()?;
             col.extend_from_slice(&gnitz_wire::encode_german_string(&b, blob));
         }
-        _ => push_fixed_le(col, ty, val)?,
+        _ => push_fixed_le(col, ty, val, Inexact::Round)?,
     }
     Ok(())
 }
@@ -161,22 +149,17 @@ const WEIGHT_KW: &str = "_weight";
 /// One resolved call shape: which argument feeds each schema slot. `append`
 /// resolves it from the keyword-name tuple CPython hands the call, `extend` from
 /// the key sequence it walks off a row dict.
-///
-/// A batch caches one. A receiver that alternates shapes rebuilds per row —
-/// correct, at roughly twice the cost of a row that hits the cache.
 struct KwPlan {
     kwnames: Py<PyTuple>,
     /// Argument position of [`WEIGHT_KW`], if the call passed it.
     weight: Option<usize>,
-    /// One entry per PK column, in PK order — the order their bytes are
-    /// appended to the batch's PK buffer.
+    /// One entry per PK column, in PK order.
     pks: Vec<PkPlan>,
     /// One entry per payload column, by dense payload index.
     payload: Vec<PayloadPlan>,
 }
 
-/// A PK column of the plan. Carries the type code so the row loop reads the
-/// schema only to name a column in an error.
+/// A PK column of the plan.
 #[derive(Clone, Copy)]
 struct PkPlan {
     pos: usize,
@@ -197,7 +180,8 @@ struct PayloadPlan {
 /// Where one payload slot's value comes from, for a call of this shape.
 #[derive(Clone, Copy)]
 enum PayloadSrc {
-    /// A DROP COLUMN tombstone: the type's zero filler, never a value.
+    /// A hidden column — in a base table's schema, a DROP COLUMN tombstone —
+    /// takes the type's zero filler.
     Filler,
     /// The keyword at this argument position.
     Arg(usize),
@@ -234,12 +218,6 @@ fn kw_position(names: &[&Bound<'_, PyString>], col: &str) -> Option<usize> {
 }
 
 /// Resolve a name tuple into a write plan. Cold: once per call shape.
-///
-/// Walks the *schema*, not the name list, so a name held by two columns feeds
-/// both — `Schema` admits duplicate names, since hidden columns are exempt from
-/// the duplicate-name check. A hidden payload column is a DROP COLUMN
-/// tombstone, planned as [`PayloadSrc::Filler`] and never named by a keyword —
-/// so one spelling it falls through to [`unexpected_name_err`].
 fn build_kw_plan(schema: &Schema, weight_is_column: bool, kwnames: &Bound<'_, PyTuple>) -> PyResult<KwPlan> {
     let mut names: Vec<&Bound<'_, PyString>> = Vec::with_capacity(kwnames.len());
     for item in kwnames.as_slice() {
@@ -314,13 +292,7 @@ impl PyZSetBatch {
         arg: impl Fn(usize) -> Borrowed<'a, 'py, PyAny>,
         default_weight: i64,
     ) -> PyResult<()> {
-        let PyZSetBatch {
-            batch,
-            schema,
-            weight_is_column,
-            kw_plan,
-            pk_scratch,
-        } = &mut *self;
+        let PyZSetBatch { batch, schema, weight_is_column, kw_plan } = &mut *self;
         let schema: &Schema = schema;
         let plan = match kw_plan {
             Some(p) if plan_hits(py, p, names, tuple) => p,
@@ -338,17 +310,14 @@ impl PyZSetBatch {
                 .map_err(|e| argument_extraction_error(py, WEIGHT_KW, e))?,
             None => default_weight,
         };
-        // Into the reused scratch first: a failed extraction must leave no
-        // half-written key behind.
-        pk_scratch.clear();
-        for &PkPlan { pos, ci, ty } in &plan.pks {
+        batch.pks.push_row(schema, |k, buf| {
+            let PkPlan { pos, ci, ty } = plan.pks[k];
             let v = arg(pos);
             if v.is_none() {
                 return Err(not_nullable_err(&schema.columns[ci].name));
             }
-            push_fixed_le(pk_scratch, ty, &v)?;
-        }
-        batch.pks.push_bytes(schema, pk_scratch);
+            push_fixed_le(buf, ty, &v, Inexact::Round)
+        })?;
         let mut nulls = 0u64;
         // `enumerate`, because the dense payload index is the null-bitmap bit
         // position.
@@ -396,8 +365,14 @@ impl PyZSetBatch {
         names.clear();
         args.clear();
         let mut supplied = None;
+        // A key the cached plan names at this position needs no text compare.
+        let planned = self
+            .kw_plan
+            .as_ref()
+            .map_or(&[][..], |p| p.kwnames.bind(dict.py()).as_slice());
         for (key, val) in dict.iter() {
-            if !self.weight_is_column && is_weight_key(&key) {
+            let known = planned.get(names.len()).is_some_and(|n| n.is(&key));
+            if !known && !self.weight_is_column && is_weight_key(&key) {
                 supplied = Some(val);
                 continue;
             }
@@ -423,14 +398,8 @@ fn is_weight_key(key: &Bound<'_, PyAny>) -> bool {
 
 /// `ZSetBatch.append(**columns)` — the raw `METH_FASTCALL | METH_KEYWORDS` slot.
 ///
-/// CPython compiles `b.append(pk=k, cust=c)` to `LOAD_CONST (('pk','cust'))` +
-/// `CALL_KW`: the keyword-name tuple is a code-object constant, the same object
-/// on every loop iteration, and the values arrive on the stack. Taking the
-/// fastcall entry directly is what lets a call site be matched by pointer and
-/// its resolved plan reused — no kwargs dict, no per-row name lookups, no args
-/// tuple. `#[pymethods]` already emits this calling convention, but hands the
-/// body a bound argument list rather than the raw `kwnames` tuple, so a plan
-/// would have nothing to key on.
+/// Raw for the `kwnames` tuple itself, which [`plan_hits`] matches a call site
+/// by.
 ///
 /// # Safety
 /// CPython calling convention: `args` points at `nargs` positional values
@@ -468,7 +437,7 @@ unsafe fn append_fastcall(
     let arg = |pos: usize| unsafe { Borrowed::from_ptr(py, *args.add(pos)) };
     b.with_rollback(|s| s.write_row(py, kwnames.as_slice(), Some(kwnames), arg, 1))?;
     drop(b);
-    // Chainable, like the pyo3 method it replaces: `b.append(…).append(…)`.
+    // Chainable: `b.append(…).append(…)`.
     Ok(batch.clone().into_ptr())
 }
 
@@ -513,18 +482,15 @@ impl PyZSetBatch {
     /// Construct a batch for `schema`, resolved at the parameter through
     /// [`resolve_py_schema`].
     #[new]
-    #[pyo3(signature = (schema))]
-    pub fn new(#[pyo3(from_py_with = resolve_py_schema)] schema: Arc<Schema>) -> PyResult<Self> {
+    pub fn new(#[pyo3(from_py_with = resolve_py_schema)] schema: Arc<Schema>) -> Self {
         let weight_is_column = schema.visible_columns().any(|(_, c)| c.name == WEIGHT_KW);
         let batch = ZSetBatch::new(&schema);
-        let pk_scratch = Vec::with_capacity(schema.pk_stride());
-        Ok(PyZSetBatch {
+        PyZSetBatch {
             batch,
             weight_is_column,
             kw_plan: None,
             schema,
-            pk_scratch,
-        })
+        }
     }
 
     /// Append rows from an iterable of dicts (one Rust call, no per-row
@@ -586,16 +552,8 @@ impl PyZSetBatch {
 // Value encoders
 // ---------------------------------------------------------------------------
 
-/// Accept a Python int, `uuid.UUID` object (via `.int`), or string, returning
-/// the 128-bit value. Int is tried first because it is the common case in
-/// bulk inserts and avoids a Python attribute lookup per row.
-///
-/// A string is UUID text — canonical or bare 32-hex — and nothing else
-/// (`gnitz_wire::parse_uuid`, the crate that owns wire-value text). Which
-/// *columns* a string may be written to is not decided here: this function is
-/// also reached from [`py_key_image`], which accepts UUID text for any key. The
-/// typed encoder [`push_fixed_le`] reaches it for UUID alone.
-pub(crate) fn extract_uuid_or_u128(val: &Bound<'_, PyAny>) -> PyResult<u128> {
+/// A UUID value: its integer, UUID text, or a `uuid.UUID` (read through `.int`).
+fn extract_uuid(val: &Bound<'_, PyAny>) -> PyResult<u128> {
     // `cast` before `extract` on both arms: a failed `extract` builds *and
     // normalizes* a full `PyErr` only to discard it, which a `uuid.UUID` or
     // string argument would otherwise pay on every row.
@@ -625,11 +583,18 @@ fn py_days(d: &impl PyDateAccess) -> i64 {
 
 /// A DATE value: a `datetime.date` (a `datetime.datetime` is one too, and
 /// contributes its date), or the day count as an int.
-fn extract_days(item: &Bound<'_, PyAny>) -> PyResult<i32> {
-    match item.cast::<PyDate>() {
-        Ok(d) => Ok(py_days(d) as i32),
-        Err(_) => item.extract::<i32>(),
+fn extract_days(item: &Bound<'_, PyAny>, inexact: Inexact) -> PyResult<i32> {
+    let Ok(d) = item.cast::<PyDate>() else {
+        return item.extract::<i32>();
+    };
+    if inexact == Inexact::Refuse {
+        if let Ok(t) = item.cast::<PyDateTime>() {
+            if (t.get_hour(), t.get_minute(), t.get_second(), t.get_microsecond()) != (0, 0, 0, 0) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!("{item} is not a DATE")));
+            }
+        }
     }
+    Ok(py_days(d) as i32)
 }
 
 /// A TIMESTAMP value: a naive `datetime.datetime`, a `datetime.date` at
@@ -654,45 +619,53 @@ fn extract_micros(item: &Bound<'_, PyAny>) -> PyResult<i64> {
     }
 }
 
-/// A DECIMAL value at the column's `scale`: a `decimal.Decimal` (or anything
-/// that formats as one with `format(x, 'f')`), a `str` of the same spelling, an
-/// `int`, or a `float` read at the digits it prints with — a longer fraction
-/// rounds half away from zero, as an SQL INSERT does.
-fn extract_decimal(item: &Bound<'_, PyAny>, scale: u8) -> PyResult<i64> {
+/// A DECIMAL value at the column's `scale`: an `int`, a `float` read at the
+/// digits it prints with, or decimal text — a `str`, or what `format(x, 'f')`
+/// gives, as for a `decimal.Decimal`.
+fn extract_decimal(item: &Bound<'_, PyAny>, scale: u8, inexact: Inexact) -> PyResult<i64> {
     let overflow =
         || pyo3::exceptions::PyOverflowError::new_err(format!("{item} does not fit a DECIMAL of scale {scale}"));
-    if item.cast::<pyo3::types::PyInt>().is_ok() {
-        return rescale(item.extract::<i128>()?, 0, scale).ok_or_else(overflow);
-    }
-    if let Ok(f) = item.cast::<pyo3::types::PyFloat>() {
+    let not_decimal = || pyo3::exceptions::PyValueError::new_err(format!("{item} is not a DECIMAL of scale {scale}"));
+    let (v, s) = if item.cast::<pyo3::types::PyInt>().is_ok() {
+        (item.extract::<i128>()?, 0)
+    } else if let Ok(f) = item.cast::<pyo3::types::PyFloat>() {
         let (v, s) = decimal_of_f64(f.value()).ok_or_else(overflow)?;
-        return rescale(v as i128, s, scale).ok_or_else(overflow);
-    }
-    // Borrowed on both branches: `to_cow` hands back CPython's own UTF-8 where
-    // it has one, so a row costs no copy of the spelling it already holds.
-    let formatted;
-    let text = match item.cast::<PyString>() {
-        Ok(s) => s.to_cow()?,
-        Err(_) => {
-            formatted = item.call_method1(pyo3::intern!(item.py(), "__format__"), ("f",))?;
-            formatted.cast::<PyString>()?.to_cow()?
-        }
+        (i128::from(v), s)
+    } else {
+        // Borrowed on both branches: `to_cow` hands back CPython's own UTF-8
+        // where it has one.
+        let formatted;
+        let text = match item.cast::<PyString>() {
+            Ok(s) => s.to_cow()?,
+            Err(_) => {
+                formatted = item.call_method1(pyo3::intern!(item.py(), "__format__"), ("f",))?;
+                formatted.cast::<PyString>()?.to_cow()?
+            }
+        };
+        parse_decimal_text(&text).ok_or_else(not_decimal)?
     };
-    parse_decimal(&text, scale)
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("{text:?} is not a DECIMAL of scale {scale}")))
+    match place_scaled(FixedInt::I64, v, s, scale) {
+        Placed::At(n) => Ok(n as i64),
+        Placed::Between { .. } if inexact == Inexact::Refuse => Err(not_decimal()),
+        Placed::Between { nearest, .. }
+        | Placed::Below { nearest: Some(nearest) }
+        | Placed::Above { nearest: Some(nearest) } => Ok(nearest as i64),
+        Placed::Below { .. } | Placed::Above { .. } => Err(overflow()),
+    }
+}
+
+/// What becomes of a value that falls between two of its column's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Inexact {
+    /// A written cell stores the nearest one.
+    Round,
+    /// A lookup key names no row, and raises.
+    Refuse,
 }
 
 /// Append one non-null fixed-width value to `buf` as its native little-endian
-/// bytes — the one typed encoder, serving the PK buffer and every `Fixed`
-/// payload column alike, so a key packs the same way whichever surface
-/// supplied it.
-///
-/// Per-arm `extract` is also the range check — `extract::<u8>()` raises
-/// Python's `OverflowError` for `append(c=300)` on a `U8` column, where a
-/// width-generic pack would silently truncate. Text is accepted for UUID alone,
-/// so a `U128` column takes an integer and nothing else; it extracts as `u128`
-/// because a value above `i128::MAX` is legal there.
-fn push_fixed_le(buf: &mut Vec<u8>, ty: ColType, item: &Bound<'_, PyAny>) -> PyResult<()> {
+/// bytes. Each arm's `extract` is its range check.
+fn push_fixed_le(buf: &mut Vec<u8>, ty: ColType, item: &Bound<'_, PyAny>, inexact: Inexact) -> PyResult<()> {
     match ty.tc {
         TypeCode::U8 => buf.push(item.extract::<u8>()?),
         TypeCode::I8 => buf.push(item.extract::<i8>()? as u8),
@@ -706,10 +679,10 @@ fn push_fixed_le(buf: &mut Vec<u8>, ty: ColType, item: &Bound<'_, PyAny>) -> PyR
         TypeCode::F64 => buf.extend_from_slice(&item.extract::<f64>()?.to_le_bytes()),
         TypeCode::U128 => buf.extend_from_slice(&item.extract::<u128>()?.to_le_bytes()),
         TypeCode::I128 => buf.extend_from_slice(&item.extract::<i128>()?.to_le_bytes()),
-        TypeCode::UUID => buf.extend_from_slice(&extract_uuid_or_u128(item)?.to_le_bytes()),
-        TypeCode::Date => buf.extend_from_slice(&extract_days(item)?.to_le_bytes()),
+        TypeCode::UUID => buf.extend_from_slice(&extract_uuid(item)?.to_le_bytes()),
+        TypeCode::Date => buf.extend_from_slice(&extract_days(item, inexact)?.to_le_bytes()),
         TypeCode::Timestamp => buf.extend_from_slice(&extract_micros(item)?.to_le_bytes()),
-        TypeCode::Decimal => buf.extend_from_slice(&extract_decimal(item, ty.scale)?.to_le_bytes()),
+        TypeCode::Decimal => buf.extend_from_slice(&extract_decimal(item, ty.scale, inexact)?.to_le_bytes()),
         TypeCode::String | TypeCode::Blob => {
             unreachable!("a German-string column is never a Fixed column or a PK column")
         }
@@ -717,26 +690,19 @@ fn push_fixed_le(buf: &mut Vec<u8>, ty: ColType, item: &Bound<'_, PyAny>) -> PyR
     Ok(())
 }
 
-/// One key value's image in a `tc` column's key order. The value is truncated to
-/// the column's width, not range-checked.
-pub(crate) fn py_key_image(tc: TypeCode, pk: &Bound<'_, PyAny>) -> PyResult<u128> {
-    Ok(gnitz_wire::key_image(tc, py_native_key(pk)?))
-}
-
-/// [`py_key_image`]'s value as a native word; a negative one is its
-/// two's-complement image.
-fn py_native_key(pk: &Bound<'_, PyAny>) -> PyResult<u128> {
-    // `i128` first, so a negative key does not build and discard an
-    // `OverflowError` on the unsigned arm; a `U128` key above `i128::MAX`, a
-    // `uuid.UUID` and UUID text all fall to the last.
-    if let Ok(val) = pk.extract::<i128>() {
-        return Ok(val as u128);
+/// One key value's image in `col`'s key order.
+pub(crate) fn py_key_image(col: &ColumnDef, v: &Bound<'_, PyAny>) -> PyResult<u128> {
+    if !col.ty.tc.is_pk_eligible() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "column {:?} cannot be a key column",
+            col.name
+        )));
     }
-    if pk.is_instance_of::<PyDateTime>() {
-        return Ok(extract_micros(pk)? as i128 as u128);
-    }
-    if pk.is_instance_of::<PyDate>() {
-        return Ok(extract_days(pk)? as i128 as u128);
-    }
-    extract_uuid_or_u128(pk)
+    let mut native = Vec::with_capacity(16);
+    push_fixed_le(&mut native, col.ty, v, Inexact::Refuse)?;
+    native.resize(16, 0);
+    Ok(gnitz_wire::key_image(
+        col.ty.tc,
+        u128::from_le_bytes(native.try_into().unwrap()),
+    ))
 }

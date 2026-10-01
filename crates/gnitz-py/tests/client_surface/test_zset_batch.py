@@ -188,6 +188,13 @@ class TestAppendKeywordPlan:
         # The batch-wide parameter still reaches such a schema.
         assert _dump(ZSetBatch(schema).extend([{"pk": 1, "_weight": 5}], -1)) == [((1, 5), -1)]
 
+    def test_extend_takes_its_weight_key_after_an_append_that_passed_one(self):
+        """`append(_weight=…)` leaves a plan naming the weight keyword; a row dict
+        whose keys line up with it still writes at its own weight."""
+        batch = ZSetBatch(KV).append(pk=1, val=10, _weight=2)
+        batch.extend([{"pk": 2, "val": 20, "_weight": 5}, {"pk": 3, "val": 30}], -1)
+        assert _dump(batch) == [((1, 10), 2), ((2, 20), 5), ((3, 30), -1)]
+
     def test_positional_argument_rejected(self):
         with pytest.raises(TypeError, match="positional"):
             ZSetBatch(KV).append(1, val=10)
@@ -393,9 +400,9 @@ class TestValueCoercion:
 
     def test_a_bad_compound_key_rolls_the_half_packed_key_back(self):
         """A compound key is packed column by column, so a refusal on the
-        *second* one leaves bytes already in the key scratch. Both refusals — a
-        NULL and an omitted column — must roll it back rather than leave a
-        half-written key for the next row to inherit."""
+        *second* one leaves the first one's bytes already in the batch's key
+        buffer. Both refusals — a NULL and an omitted column — must roll it back
+        rather than leave a half-written key for the next row to inherit."""
         schema = Schema([ColumnDef("a", TypeCode.U64),
                          ColumnDef("b", TypeCode.U32),
                          ColumnDef("v", TypeCode.I64)], pk_indices=[0, 1])
@@ -404,7 +411,7 @@ class TestValueCoercion:
             with pytest.raises(ValueError):
                 batch.append(**row)
             assert len(batch) == 0
-            batch.append(a=1, b=2, v=3)        # the scratch is clean
+            batch.append(a=1, b=2, v=3)        # the key buffer is clean
             assert [(r.a, r.b, r.v) for r in batch.rows()] == [(1, 2, 3)]
 
     def test_a_decimal_column_takes_every_spelling_of_one_value(self):
@@ -432,6 +439,24 @@ class TestValueCoercion:
             ZSetBatch(schema).append(id=9, v="abc")
         with pytest.raises(OverflowError):
             ZSetBatch(schema).append(id=9, v=10**16)
+
+    @pytest.mark.parametrize("scale,value,want", [
+        (0, "1.25" + "0" * 36, "1"),
+        (0, "-1.25" + "0" * 36, "-1"),
+        (0, "1.5" + "0" * 37, "2"),
+        (0, "9223372036854775808", OverflowError),
+        (2, "-1.005", "-1.01"),
+        (2, 1.005, "1.01"),
+        (2, Decimal("1.004"), "1.00"),
+    ])
+    def test_a_decimal_cell_rounds_half_away_from_zero_at_any_length(self, scale, value, want):
+        schema = Schema([ColumnDef("id", TypeCode.I64),
+                         ColumnDef("v", TypeCode.DECIMAL, scale=scale)], [0])
+        if isinstance(want, type):
+            with pytest.raises(want):
+                ZSetBatch(schema).append(id=1, v=value)
+        else:
+            assert _col(ZSetBatch(schema).append(id=1, v=value), "v") == [Decimal(want)]
 
     def test_a_temporal_column_takes_an_object_or_its_stored_integer(self):
         """DATE and TIMESTAMP are a day count and a microsecond count, so the

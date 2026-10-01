@@ -163,9 +163,7 @@ pub(crate) fn scan_pairs(pairs: &[(u64, Bound<'_, PyAny>)]) -> PyResult<Vec<(u64
 #[pyfunction]
 pub(crate) fn sys_schema(table_id: u64) -> PyResult<PySchema> {
     if gnitz_wire::sys_family_index(table_id).is_none() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "{table_id} is not a system table id"
-        )));
+        return Err(PyValueError::new_err(format!("{table_id} is not a system table id")));
     }
     Ok(PySchema {
         rust: Arc::clone(gnitz_core::sys_schema(table_id)),

@@ -8,14 +8,15 @@
 
 /// Render a UUID value in the canonical lowercase 8-4-4-4-12 hyphenated form.
 pub fn format_uuid(v: u128) -> String {
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        (v >> 96) as u32,
-        (v >> 80) as u16,
-        (v >> 64) as u16,
-        (v >> 48) as u16,
-        v & 0x0000_ffff_ffff_ffff
-    )
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    // Where each byte's two digits land: the hyphens sit at 8, 13, 18 and 23.
+    const AT: [usize; 16] = [0, 2, 4, 6, 9, 11, 14, 16, 19, 21, 24, 26, 28, 30, 32, 34];
+    let mut out = [b'-'; 36];
+    for (byte, at) in v.to_be_bytes().into_iter().zip(AT) {
+        out[at] = HEX[(byte >> 4) as usize];
+        out[at + 1] = HEX[(byte & 0xf) as usize];
+    }
+    String::from_utf8(out.to_vec()).expect("hex digits and hyphens")
 }
 
 /// Parse a UUID string: the canonical 36-char hyphenated form (hyphens at

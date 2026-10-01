@@ -18,10 +18,10 @@ use std::sync::Arc;
 use gnitz_core::{ClientError, Interest, Reply, Request, Schema, Session, SlotId};
 use gnitz_wire::{ReadBound, ReadSpec, WireConflictMode};
 
+use crate::client_err;
 use crate::read::scan_result;
 use crate::schema::{resolve_py_schema, scan_pairs};
 use crate::write::{pk_point_spec, PyZSetBatch};
-use crate::{build_pylist, client_err};
 
 #[pyclass(name = "AsyncTransport")]
 pub(crate) struct PyAsyncTransport {
@@ -46,10 +46,11 @@ fn narrow(py: Python<'_>, reply: Reply) -> PyResult<Py<PyAny>> {
         Reply::Scan(r) => Ok(scan_result(py, r)?.into_any()),
         // One PyScanResult per relation, in request order → a Python list,
         // resolving the single scan_many future.
-        Reply::Multi(replies) => {
-            let per_rel = replies.into_iter().map(|r| scan_result(py, r));
-            Ok(build_pylist(py, per_rel)?.into_any().unbind())
-        }
+        Reply::Multi(replies) => replies
+            .into_iter()
+            .map(|r| scan_result(py, r))
+            .collect::<PyResult<Vec<_>>>()?
+            .into_py_any(py),
         Reply::Resolve(_) | Reply::Id(_) | Reply::Polled => {
             unreachable!("this transport submits no verb with another reply shape")
         }
@@ -221,9 +222,7 @@ impl PyAsyncTransport {
     /// N `(table_id, schema)` relations at one server-side SAL cut, resolved as
     /// a list in request order.
     fn scan_many(slf: &Bound<'_, Self>, pairs: Vec<(u64, Bound<'_, PyAny>)>) -> PyResult<Py<PyAny>> {
-        let rels = scan_pairs(&pairs)?;
-        let rels: Vec<(u64, &Arc<Schema>)> = rels.iter().map(|(tid, s)| (*tid, s)).collect();
-        Self::submit(slf, Request::ScanMulti(&rels))
+        Self::submit(slf, Request::ScanMulti(scan_pairs(&pairs)?))
     }
 
     fn seek(

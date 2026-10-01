@@ -63,6 +63,7 @@ mod chars;
 mod eval;
 mod like;
 mod locator;
+pub mod place;
 mod program;
 mod range;
 mod schema_facts;

@@ -156,6 +156,39 @@ def test_a_binary_bundle_validates_its_frames_in_order(client, committed, frames
         (dict.fromkeys(committed, 1), {}) if refused else after)
 
 
+def test_the_block_opens_the_clients_own_transaction(client):
+    """`transaction()` opens nothing until its block is entered, and the block's
+    transaction is the one SQL's BEGIN, COMMIT and ROLLBACK act on."""
+    tid = client.create_table("a", KV)
+    one = gnitz.ZSetBatch(KV).append(pk=1, val=1)
+
+    client.transaction()
+    with pytest.raises(gnitz.GnitzRefusedError, match="no transaction open"):
+        client.execute_sql("ROLLBACK")
+
+    with client.transaction() as txn:
+        assert txn is client
+        txn.push(tid, one)
+    assert bag(scanned(client, "a")) == {(1, 1): 1}
+
+    with pytest.raises(RuntimeError, match="after ROLLBACK"):
+        with client.transaction():
+            client.execute_sql("ROLLBACK")
+            raise RuntimeError("after ROLLBACK")
+    with pytest.raises(gnitz.GnitzRefusedError, match="no transaction open"):
+        with client.transaction():
+            client.execute_sql("COMMIT")
+    assert bag(scanned(client, "a")) == {(1, 1): 1}
+
+
+def test_an_exception_survives_a_client_closed_inside_the_block(server):
+    conn = gnitz.connect(server)
+    with pytest.raises(RuntimeError, match="after close"):
+        with conn.transaction():
+            conn.close()
+            raise RuntimeError("after close")
+
+
 def test_a_bundle_into_a_table_dropped_before_commit_is_not_found(client, server):
     """The commit is validated against the catalog it reaches, not the one the
     transaction began under, and the refusal names the relation it concerns."""

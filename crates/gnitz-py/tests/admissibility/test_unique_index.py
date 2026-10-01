@@ -470,15 +470,12 @@ def _holder_table(client, col_type):
     return client.resolve_table("t")[0]
 
 
-# `(column type, the value whose order-preserving image is all-zero for it, that
-# value's unsigned native image)`. The last is what the seek API takes: its key
-# values are `u128`, the zero-extended cell the engine reads out of a row, so a
-# signed column's negative value arrives as its two's-complement image.
-@pytest.mark.parametrize("col_type,value,seek_key", [
-    ("BIGINT UNSIGNED", 0, 0),
-    ("INT", -2147483648, 1 << 31),
+# `(column type, the value whose order-preserving image is all-zero for it)`.
+@pytest.mark.parametrize("col_type,value", [
+    ("BIGINT UNSIGNED", 0),
+    ("INT", -2147483648),
 ])
-def test_the_zero_image_holder_survives_a_flood_of_nulls(client, col_type, value, seek_key):
+def test_the_zero_image_holder_survives_a_flood_of_nulls(client, col_type, value):
     """The index is NULL-distinct (a NULL row has no entry at all), so both a
     direct seek and an UPDATE/DELETE by the zero-image value must reach exactly
     the holder's one row, however many NULL rows were written after it."""
@@ -487,7 +484,7 @@ def test_the_zero_image_holder_survives_a_flood_of_nulls(client, col_type, value
     insert(client, "t", _NULLS)
 
     _, schema = client.resolve_table("t")
-    assert bag(client.seek_by_index(tid, schema, [1], [seek_key])) == {(_HOLDER_PK, value): 1}
+    assert bag(client.seek_by_index(tid, schema, [1], [value])) == {(_HOLDER_PK, value): 1}
     for stmt in (f"UPDATE t SET a = {value} WHERE a = {value}", f"DELETE FROM t WHERE a = {value}"):
         res = client.execute_sql(stmt)
         assert (res[0]["type"], res[0]["count"]) == ("RowsAffected", 1), stmt

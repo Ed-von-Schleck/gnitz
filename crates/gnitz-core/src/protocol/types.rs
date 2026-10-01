@@ -249,13 +249,32 @@ impl PkColumn {
         // Hard, not debug-only: in release the slice below would OOB-panic with
         // an opaque "index out of range".
         assert!(s <= 16, "push_u128: stride {s} > 16 cannot come from a u128");
-        self.push_bytes(schema, &pk.to_le_bytes()[..s]);
+        self.push_region_bytes(schema.opk_key(&pk.to_le_bytes()[..s]).pk_bytes());
     }
 
-    /// Append one row given as its `stride` native little-endian column bytes.
-    pub fn push_bytes(&mut self, schema: &Schema, native_le: &[u8]) {
-        debug_assert_eq!(native_le.len(), self.stride());
-        self.push_region_bytes(schema.opk_key(native_le).pk_bytes());
+    /// Append one row: `write(k, buf)` appends the native little-endian bytes
+    /// of the `k`-th PK column. An error appends nothing.
+    pub fn push_row<E>(
+        &mut self,
+        schema: &Schema,
+        mut write: impl FnMut(usize, &mut Vec<u8>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let row = self.buf.len();
+        for (k, &ci) in schema.pk_cols.iter().enumerate() {
+            let tc = schema.columns[ci as usize].ty.tc;
+            let at = self.buf.len();
+            if let Err(e) = write(k, &mut self.buf) {
+                self.buf.truncate(row);
+                return Err(e);
+            }
+            let w = self.buf.len() - at;
+            assert_eq!(w, tc.wire_stride(), "push_row: PK column {k} is a {tc:?}");
+            let mut native = [0u8; 16];
+            native[..w].copy_from_slice(&self.buf[at..]);
+            gnitz_wire::encode_pk_column(&native[..w], tc, &mut self.buf[at..]);
+        }
+        debug_assert_eq!(self.buf.len() - row, self.stride());
+        Ok(())
     }
 
     /// Append one row from the PK columns' native values in PK-list order.

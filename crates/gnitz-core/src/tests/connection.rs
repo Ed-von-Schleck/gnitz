@@ -113,7 +113,9 @@ fn scan_multi_decodes_each_train_under_its_own_relation() {
     let (sa, sb) = (schema_a(), schema_b());
     // Each train must decode under the schema paired with its relation — a
     // two-frame train for relation 2 included.
-    let slot = s.submit(Request::ScanMulti(&[(1, &sa), (2, &sb)])).unwrap();
+    let slot = s
+        .submit(Request::ScanMulti(vec![(1, Arc::clone(&sa)), (2, Arc::clone(&sb))]))
+        .unwrap();
     s.step(Interest::WRITE);
     let req = peer.recv();
     let ctrl = peek_control_block(&req).unwrap();
@@ -168,15 +170,19 @@ fn a_schema_block_on_a_read_reply_fails_the_slot_and_ends_the_session() {
 #[test]
 fn a_status_frame_fails_its_slot_alone() {
     let sa = schema_a();
-    let multi = [(1, &sa), (2, &sa), (3, &sa)];
     for (what, req, trains_before, status) in [
         (
             "the second of three trains",
-            Request::ScanMulti(&multi),
+            Request::ScanMulti((1..=3).map(|tid| (tid, Arc::clone(&sa))).collect()),
             1,
             WireStatus::Error,
         ),
-        ("an empty multi-read", Request::ScanMulti(&[]), 0, WireStatus::NotFound),
+        (
+            "an empty multi-read",
+            Request::ScanMulti(Vec::new()),
+            0,
+            WireStatus::NotFound,
+        ),
         ("a commit", COMMIT, 0, WireStatus::TxnConflict),
     ] {
         let (mut s, peer) = pair();
