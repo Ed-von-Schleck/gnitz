@@ -7,18 +7,23 @@ use gnitz_zset::schema::Slot;
 
 const ROWS: ChildAddr = ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO };
 
+/// The engine data directory of the store opened at `base_dir`.
+pub fn root(base_dir: &str) -> String {
+    format!("{base_dir}/_mirror")
+}
+
 /// Whether `tid`'s copy has a directory under `base_dir`.
 pub fn has_copy(base_dir: &str, tid: u64) -> bool {
-    std::path::Path::new(&relation_dir(base_dir, tid)).exists()
+    std::path::Path::new(&relation_dir(&root(base_dir), tid)).exists()
 }
 
 /// The directory `tid`'s rows live in.
 fn rows_dir(base_dir: &str, tid: u64) -> String {
-    ROWS.dir(&relation_dir(base_dir, tid))
+    ROWS.dir(&relation_dir(&root(base_dir), tid))
 }
 
 pub fn manifest_path(base_dir: &str, tid: u64) -> String {
-    ROWS.manifest(&relation_dir(base_dir, tid))
+    ROWS.manifest(&relation_dir(&root(base_dir), tid))
 }
 
 pub fn has_manifest(base_dir: &str, tid: u64) -> bool {

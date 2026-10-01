@@ -335,8 +335,8 @@ pub enum Reply {
     Resolve(Option<Arc<RelDescriptor>>),
     /// An id allocation's base id.
     Id(u64),
-    /// A delta poll: the slot is done, and every view's blocks went to the
-    /// poll's own listener as that view's terminal arrived.
+    /// A delta poll: the slot is done, and every view's blocks and terminal
+    /// went to the poll's own listener as their frames arrived.
     Polled,
 }
 
@@ -474,7 +474,6 @@ struct Slot {
 #[derive(Default)]
 struct Accumulator {
     data: Option<ZSetBatch>,
-    blocks: Vec<RawBlock>,
     /// Narrowed results of a `scan_multi`.
     replies: Vec<ScanReply>,
     /// The position of a multi-position slot (`Multi`, `DeltaPoll`) this train
@@ -482,16 +481,28 @@ struct Accumulator {
     at: usize,
 }
 
-/// One view's result, handed over as its terminal arrives — so a poll over M
-/// views holds one train, not M. Positions are filled in request order, and a
-/// terminal naming another view is refused, so the slot's next unanswered
-/// position is the one this belongs to.
+/// How one view's train ends: the cursor its terminal carries, or the fault
+/// that ended its position.
+pub(crate) type PollEnd = Result<DeltaCursor, ClientError>;
+
+/// What a delta poll hands its listener as each frame arrives.
+pub(crate) enum Polled {
+    /// One data block of the view's train.
+    Block(RawBlock),
+    /// The view's terminal; the position is answered.
+    End(PollEnd),
+}
+
+/// One view's whole train, for a listener that collects it.
 pub(crate) type PolledView = Result<(Vec<RawBlock>, DeltaCursor), ClientError>;
 
 /// The listener a delta poll's results go to, addressed by the slot that asked
 /// — so a train left behind by an abandoned poll is recognised rather than
 /// matched onto a live view of the same id.
-pub(crate) type PollSink<'a> = dyn FnMut(SlotId, PolledView) + 'a;
+pub(crate) type PollSink<'a> = dyn FnMut(SlotId, Polled) + 'a;
+
+/// What one frame owes a delta poll's listener: a block, a terminal, or both.
+type PollFrame = (SlotId, Option<RawBlock>, Option<PollEnd>);
 
 /// Why a session refuses work.
 enum Ended {
@@ -652,10 +663,13 @@ impl Session {
             // The sink runs after `feed` has returned, so an unwind out of the
             // caller's code finds the session consistent. No sink is an
             // abandoned poll — an interrupt, or an unwind past its driver — and
-            // the position is dropped, which is what its caller being gone wants.
-            if let Some((slot, result)) = self.feed(buf, done)? {
+            // the frame is dropped, which is what its caller being gone wants.
+            if let Some((slot, block, end)) = self.feed(buf, done)? {
                 if let Some(f) = sink.as_deref_mut() {
-                    f(slot, result);
+                    let polled = block.map(Polled::Block).into_iter().chain(end.map(Polled::End));
+                    for p in polled {
+                        f(slot, p);
+                    }
                 }
             }
         }
@@ -725,12 +739,8 @@ impl Session {
     /// One reply frame for the head slot. A non-OK frame ends the whole request, so
     /// its fault is read before the continuation test.
     ///
-    /// Returns the delta-poll position this frame filled, if it filled one.
-    fn feed(
-        &mut self,
-        mut buf: Vec<u8>,
-        done: &mut Completions,
-    ) -> Result<Option<(SlotId, PolledView)>, ProtocolError> {
+    /// Returns what the frame owes a delta poll's listener, if anything.
+    fn feed(&mut self, mut buf: Vec<u8>, done: &mut Completions) -> Result<Option<PollFrame>, ProtocolError> {
         // Destructured so the head slot stays borrowed for the whole function
         // while the accumulator is an independent `&mut`.
         let Session { pending, accum, .. } = self;
@@ -761,8 +771,8 @@ impl Session {
                     if ctrl.hdr.target_id != view {
                         return Err(out_of_order(view, ctrl.hdr.target_id));
                     }
-                    let failed = Err(ClientError::Refused(fault));
-                    return Ok(Some(fill_poll_position(pending, accum, done, positions, failed)));
+                    let slot = end_poll_position(pending, accum, done, positions);
+                    return Ok(Some((slot, None, Some(Err(ClientError::Refused(fault))))));
                 }
             }
             complete_head(pending, accum, Err(ClientError::Refused(fault)), done);
@@ -791,11 +801,14 @@ impl Session {
 
         // Decoded straight into the accumulator: a train carries one data frame
         // per worker, and a per-frame batch would be copied in and dropped.
+        let mut block = None;
         match ctrl.data.clone() {
-            Some(r) if head.kind.keeps_blocks_raw() => accum.blocks.push(RawBlock {
-                frame: std::mem::take(&mut buf),
-                block: r,
-            }),
+            Some(r) if head.kind.keeps_blocks_raw() => {
+                block = Some(RawBlock {
+                    frame: std::mem::take(&mut buf),
+                    block: r,
+                })
+            }
             Some(r) => {
                 let eff = head
                     .kind
@@ -808,7 +821,7 @@ impl Session {
         }
 
         if ctrl.hdr.flags.continuation {
-            return Ok(None);
+            return Ok(block.map(|b| (head.id, Some(b), None)));
         }
 
         // The train terminated.
@@ -816,10 +829,9 @@ impl Session {
         if let Some((_, positions)) = poll {
             let tick = NonZeroU64::new(ctrl.hdr.arg0)
                 .ok_or_else(|| ProtocolError::DecodeError("a delta-poll terminal at round 0".into()))?;
-            let blocks = std::mem::take(&mut accum.blocks);
             let cursor = DeltaCursor { tag: ctrl.hdr.arg1, tick };
-            let filled = Ok((blocks, cursor));
-            return Ok(Some(fill_poll_position(pending, accum, done, positions, filled)));
+            let slot = end_poll_position(pending, accum, done, positions);
+            return Ok(Some((slot, block, Some(Ok(cursor)))));
         }
         let scan_reply = |schema: &Arc<Schema>, data: Option<ZSetBatch>, lsn: u64| ScanReply {
             batch: data.unwrap_or_else(|| ZSetBatch::new(schema)),
@@ -858,22 +870,21 @@ fn out_of_order(want: u64, got: u64) -> ProtocolError {
     ProtocolError::DecodeError(format!("reply out of order: expected target {want}, got {got}"))
 }
 
-/// Fill the delta-poll position the head slot is on, and complete the slot once
-/// that was its last. Returns what the caller's sink is owed.
-fn fill_poll_position(
+/// End the delta-poll position the head slot is on, and complete the slot once
+/// that was its last. Returns the slot the position belonged to.
+fn end_poll_position(
     pending: &mut VecDeque<Slot>,
     accum: &mut Accumulator,
     done: &mut Completions,
     positions: usize,
-    result: PolledView,
-) -> (SlotId, PolledView) {
+) -> SlotId {
     let slot = pending.front().expect("a frame was fed to a pending head").id;
     // This position's train is over; the next one starts clean.
     *accum = Accumulator { at: accum.at + 1, ..Default::default() };
     if accum.at == positions {
         complete_head(pending, accum, Ok(Reply::Polled), done);
     }
-    (slot, result)
+    slot
 }
 
 /// The head slot is done: report it and hand the accumulator to the next.

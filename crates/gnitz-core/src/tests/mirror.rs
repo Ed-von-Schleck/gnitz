@@ -36,7 +36,11 @@ const TAG: u64 = 0xFEED;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ev {
     Invalidate(u64, Invalidate),
-    /// `(tid, the round the copy was filled at)`.
+    /// `tid`'s copy erased for a refill.
+    Erase(u64),
+    /// One block of a refill of `tid`.
+    Fill(u64),
+    /// `(tid, the round the refill was sealed at)`.
     Reseed(u64, u64),
     /// `(tid, the round the copy moved to)`.
     Advance(u64, u64),
@@ -96,16 +100,10 @@ impl MirrorStore for StubStore {
         Ok(())
     }
 
-    /// The live store's cursor rules.
-    fn reseed(&mut self, tid: u64, _b: &[&[u8]], cursor: DeltaCursor) -> Result<(), MirrorError> {
-        if self.cursors.contains_key(&tid) {
-            return Err(MirrorError::Engine(format!(
-                "stub: reseed of {tid}, which holds a cursor"
-            )));
-        }
-        self.log.push(Ev::Reseed(tid, cursor.tick.get()));
-        self.cursors.insert(tid, cursor);
-        Ok(())
+    fn refill(&mut self, tid: u64) -> Result<Box<dyn Refill + '_>, MirrorError> {
+        self.log.push(Ev::Erase(tid));
+        self.cursors.remove(&tid);
+        Ok(Box::new(StubRefill { store: self, tid }))
     }
 
     fn advance(&mut self, tid: u64, _b: &[&[u8]], next: DeltaCursor) -> Result<(), MirrorError> {
@@ -142,6 +140,24 @@ impl MirrorStore for StubStore {
 
     fn poisoned(&self) -> Option<&str> {
         None
+    }
+}
+
+struct StubRefill<'a> {
+    store: &'a mut StubStore,
+    tid: u64,
+}
+
+impl Refill for StubRefill<'_> {
+    fn block(&mut self, _block: &[u8]) -> Result<(), MirrorError> {
+        self.store.log.push(Ev::Fill(self.tid));
+        Ok(())
+    }
+
+    fn seal(self: Box<Self>, cursor: DeltaCursor) -> Result<(), MirrorError> {
+        self.store.log.push(Ev::Reseed(self.tid, cursor.tick.get()));
+        self.store.cursors.insert(self.tid, cursor);
+        Ok(())
     }
 }
 
@@ -334,6 +350,51 @@ fn only_a_vanished_relation_pays_a_probe() {
     }
 }
 
+/// A bootstrap's first block reaches the store before its terminal is sent.
+#[test]
+fn a_bootstrap_fills_the_store_frame_by_frame() {
+    let (mut client, peer, log) = fixture(&[(7, "a", 0)]);
+    let watched = log.clone();
+    let block = |rows: &[(u64, i64, i64)], tick: u64, continuation: bool| {
+        let hdr = ControlHeader {
+            target_id: 7,
+            flags: gnitz_wire::WireFlags { continuation, ..Default::default() },
+            arg0: tick,
+            arg1: TAG,
+            ..Default::default()
+        };
+        encode_frame(hdr, &[], None, Some(&crate::test_support::kv_rows(rows)))
+    };
+    let h = std::thread::spawn(move || {
+        peer.expect_request("the re-resolve");
+        peer.reply_resolved(7);
+        assert_eq!(peer.expect_poll("the bootstrap"), vec![7]);
+        peer.send(&block(&[(1, 10, 1)], 0, true));
+        let until = Instant::now() + PATIENCE;
+        while !watched.saw(|e| matches!(e, Ev::Fill(7))) {
+            assert!(Instant::now() < until, "the first block never reached the store");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        peer.send(&block(&[(2, 20, 1)], 20, false));
+    });
+    let report = client.poll_mirror().expect("the bootstrap lands");
+    h.join().unwrap();
+    assert!(
+        matches!(report.as_slice(), [o] if o.view_id == 7 && o.result.reseeded()),
+        "{report:?}"
+    );
+    assert_eq!(
+        log.take(),
+        [
+            Ev::Invalidate(7, Invalidate::Cursor),
+            Ev::Erase(7),
+            Ev::Fill(7),
+            Ev::Fill(7),
+            Ev::Reseed(7, 20),
+        ],
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Slot correlation
 // ---------------------------------------------------------------------------
@@ -464,9 +525,7 @@ fn a_reseed_onto_a_live_copy_does_not_erase_it() {
 
     let events = log.take();
     assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, Ev::Invalidate(8, Invalidate::Copy) | Ev::Reseed(8, _))),
+        !events.iter().any(|e| matches!(e, Ev::Erase(8) | Ev::Reseed(8, _))),
         "the live copy must be neither erased nor re-read whole: {events:?}",
     );
     assert!(

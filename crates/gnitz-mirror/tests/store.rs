@@ -1,7 +1,7 @@
 //! The store on its own: no server, no client, no connection.
 //!
 //! Every method is a statement about the copy it holds, so the store's lifecycle
-//! is tested here: the registration and what it retracts, the teardown ladder,
+//! is tested here: the registration and what it retracts, the two teardowns,
 //! what a drop forfeits, and what a checkpoint makes durable. The acceptance
 //! suite beside it (`mirror.rs`) drives a real client against a real server.
 //!
@@ -20,7 +20,7 @@ use tempfile::TempDir;
 
 #[path = "support/common.rs"]
 mod common;
-use common::{block_copy, has_copy, has_manifest, manifest_path, unblock_copy};
+use common::{block_copy, has_copy, has_manifest, manifest_path, root, unblock_copy};
 
 const SCHEMA: &str = "s";
 const TID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
@@ -50,6 +50,15 @@ fn plain(rows: &[(u64, i64, i64)]) -> Vec<u8> {
     gnitz_zset_testkit::encode_to_wire_vec(&make_batch(&make_schema_u64_i64(), rows))
 }
 
+/// Replace `tid`'s copy with `blocks`, the view's whole value at `cursor`.
+fn seed(store: &mut Mirror, tid: u64, blocks: &[&[u8]], cursor: DeltaCursor) -> Result<(), MirrorError> {
+    let mut refill = store.refill(tid)?;
+    for block in blocks {
+        refill.block(block)?;
+    }
+    refill.seal(cursor)
+}
+
 fn path(dir: &TempDir) -> &str {
     dir.path().to_str().unwrap()
 }
@@ -73,8 +82,8 @@ fn registered() -> (Mirror, TempDir) {
 fn two_copies() -> (Mirror, TempDir) {
     let (mut store, dir) = registered();
     store.register(OTHER_TID, SCHEMA, "w", &view_schema()).unwrap();
-    store.reseed(TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
-    store.reseed(OTHER_TID, &[&plain(&[(9, 1, 90)])], cursor(4)).unwrap();
+    seed(&mut store, TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
+    seed(&mut store, OTHER_TID, &[&plain(&[(9, 1, 90)])], cursor(4)).unwrap();
     (store, dir)
 }
 
@@ -119,7 +128,7 @@ fn whole_copy(store: &mut Mirror, tid: u64) -> Result<ZSetBatch, MirrorError> {
 #[test]
 fn a_registration_stands_while_the_id_and_the_layout_do() {
     let (mut store, dir) = registered();
-    store.reseed(TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
+    seed(&mut store, TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
 
     assert_eq!(store.register(TID, SCHEMA, "moved", &view_schema()).unwrap(), None);
     assert_eq!(store.cursor_of(TID), Some(cursor(4)), "a renamed copy keeps its cursor");
@@ -144,7 +153,7 @@ fn a_registration_stands_while_the_id_and_the_layout_do() {
     );
     assert!(!has_copy(path(&dir), TID), "and its copy is gone");
 
-    store.reseed(OTHER_TID, &[&plain(&[(9, 1, 90)])], cursor(4)).unwrap();
+    seed(&mut store, OTHER_TID, &[&plain(&[(9, 1, 90)])], cursor(4)).unwrap();
     let wide = schema_of(&make_schema_u128_i64());
     assert_eq!(store.register(OTHER_TID, SCHEMA, "v", &wide).unwrap(), None);
     assert_eq!(store.cursor_of(OTHER_TID), None, "another layout is another copy");
@@ -152,16 +161,14 @@ fn a_registration_stands_while_the_id_and_the_layout_do() {
     assert_eq!(rows.unwrap().weights.len(), 0, "which starts empty");
 }
 
-/// The ladder, level by level: each does everything the level above it does, and
-/// then more. Every level drops the cursor, so no delta continues it, and is
-/// idempotent.
+/// Either teardown drops the cursor, so no delta continues it, and is
+/// idempotent. `Cursor` keeps the rows; `Registration` takes them, the record and
+/// the directory.
 #[test]
-fn the_invalidate_ladder_stops_where_it_is_asked() {
-    for level in [Invalidate::Cursor, Invalidate::Copy, Invalidate::Registration] {
+fn a_teardown_stops_where_it_is_asked() {
+    for level in [Invalidate::Cursor, Invalidate::Registration] {
         let (mut store, dir) = registered();
-        store
-            .reseed(TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(4))
-            .unwrap();
+        seed(&mut store, TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(4)).unwrap();
         store.checkpoint().unwrap();
         store.invalidate(TID, level).unwrap();
         store.invalidate(TID, level).expect("a second teardown is a no-op");
@@ -174,36 +181,16 @@ fn the_invalidate_ladder_stops_where_it_is_asked() {
             ),
             "{level:?}: no cursor, so no delta continues it",
         );
-        let reseeded = store.reseed(TID, &[&plain(&[(7, 1, 70)])], cursor(4));
         match level {
-            Invalidate::Cursor => {
-                assert!(
-                    matches!(reseeded, Err(MirrorError::Engine(_))),
-                    "a whole value never lands on the rows it replaces",
-                );
-                assert_eq!(
-                    held(&mut store, TID),
-                    BTreeMap::from([((1, 10), 1), ((2, 20), 1)]),
-                    "Cursor keeps the rows, and neither refusal touched one",
-                );
-            }
-            Invalidate::Copy => {
-                reseeded.expect("an erased copy takes a reseed");
-                // Refilled to the cursor the last checkpoint published, so only
-                // the rows say the copy changed.
-                store.checkpoint().unwrap();
-                drop(store);
-                let mut store = open(&dir);
-                assert_eq!(store.cursor_of(TID), Some(cursor(4)));
-                assert_eq!(
-                    held(&mut store, TID),
-                    BTreeMap::from([((7, 70), 1)]),
-                    "the refill is what was published, over the rows it replaced",
-                );
-            }
+            Invalidate::Cursor => assert_eq!(
+                held(&mut store, TID),
+                BTreeMap::from([((1, 10), 1), ((2, 20), 1)]),
+                "Cursor keeps the rows, and the refused delta touched none",
+            ),
             Invalidate::Registration => {
+                let refilled = seed(&mut store, TID, &[&plain(&[(7, 1, 70)])], cursor(4));
                 assert!(
-                    matches!(reseeded, Err(MirrorError::Engine(_))),
+                    matches!(refilled, Err(MirrorError::Engine(_))),
                     "the registration that named its shape is gone",
                 );
                 assert!(whole_copy(&mut store, TID).is_err(), "and so is the copy");
@@ -221,16 +208,58 @@ fn the_invalidate_ladder_stops_where_it_is_asked() {
     }
 }
 
-/// An empty view's whole value fills a copy: the cursor says so where no row
-/// can, and a second whole value is refused on it.
+/// A refill replaces what the copy held, rows and cursor, and answers no read
+/// until it is sealed — at its cursor even when the value has no rows.
 #[test]
-fn a_copy_filled_with_no_rows_takes_no_second_reseed() {
-    let (mut store, _dir) = registered();
-    store.reseed(TID, &[], cursor(4)).unwrap();
-    let again = store.reseed(TID, &[&plain(&[(1, 1, 10)])], cursor(5));
-    assert!(matches!(again, Err(MirrorError::Engine(_))), "{again:?}");
+fn a_refill_replaces_the_copy_once_sealed() {
+    let (mut store, dir) = registered();
+    seed(&mut store, TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(4)).unwrap();
+    store.checkpoint().unwrap();
+
+    let mut refill = store.refill(TID).unwrap();
+    refill.block(&plain(&[(7, 1, 70)])).unwrap();
+    refill.block(&plain(&[(8, 1, 80)])).unwrap();
+    drop(refill);
+    assert_eq!(store.cursor_of(TID), None, "an unsealed refill answers no read");
+
+    seed(
+        &mut store,
+        TID,
+        &[&plain(&[(7, 1, 70)]), &plain(&[(8, 1, 80)])],
+        cursor(4),
+    )
+    .unwrap();
+    // Sealed at the cursor the last checkpoint published, so only the rows say
+    // the copy changed.
+    store.checkpoint().unwrap();
+    drop(store);
+    let mut store = open(&dir);
     assert_eq!(store.cursor_of(TID), Some(cursor(4)));
+    assert_eq!(held(&mut store, TID), BTreeMap::from([((7, 70), 1), ((8, 80), 1)]));
+
+    seed(&mut store, TID, &[], cursor(9)).unwrap();
+    assert_eq!(store.cursor_of(TID), Some(cursor(9)));
     assert!(held(&mut store, TID).is_empty());
+}
+
+/// A block that fails takes the blocks before it along, and the refill takes
+/// neither another block nor a seal. The failure is that copy's alone.
+#[test]
+fn a_failed_block_ends_its_refill() {
+    let (mut store, _dir) = registered();
+    let mut refill = store.refill(TID).unwrap();
+    refill.block(&plain(&[(5, 1, 50)])).unwrap();
+    let torn = refill.block(&[0xFF; 64]);
+    assert!(matches!(torn, Err(MirrorError::Engine(_))), "{torn:?}");
+    let next = refill.block(&plain(&[(6, 1, 60)]));
+    assert!(matches!(next, Err(MirrorError::Engine(_))), "{next:?}");
+    let sealed = refill.seal(cursor(5));
+    assert!(matches!(sealed, Err(MirrorError::Engine(_))), "{sealed:?}");
+    assert_eq!(store.cursor_of(TID), None);
+    assert!(store.poisoned().is_none());
+
+    seed(&mut store, TID, &[&plain(&[(7, 1, 70)])], cursor(6)).unwrap();
+    assert_eq!(held(&mut store, TID), BTreeMap::from([((7, 70), 1)]));
 }
 
 /// A round folds onto the rows the copy holds — a retraction, a second payload
@@ -240,9 +269,7 @@ fn a_copy_filled_with_no_rows_takes_no_second_reseed() {
 #[test]
 fn a_drop_forfeits_the_rounds_since_the_last_checkpoint() {
     let (mut store, dir) = registered();
-    store
-        .reseed(TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(4))
-        .unwrap();
+    seed(&mut store, TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(4)).unwrap();
     store.checkpoint().unwrap();
     let round = plain(&[(1, -1, 10), (1, 1, 11), (3, 1, 30)]);
     let after = BTreeMap::from([((1, 11), 1), ((2, 20), 1), ((3, 30), 1)]);
@@ -322,9 +349,7 @@ fn a_failed_apply_erases_that_copy_and_spares_the_rest() {
         .expect("a store holding one erased copy is still safe to publish");
 
     // With no cursor the next poll bootstraps, onto the erased copy.
-    store
-        .reseed(TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(9))
-        .unwrap();
+    seed(&mut store, TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(9)).unwrap();
     assert_eq!(
         held(&mut store, TID),
         BTreeMap::from([((1, 10), 1), ((2, 20), 1)]),
@@ -361,7 +386,8 @@ fn a_damaged_copy_costs_that_copy_alone() {
             }
             Damage::Record => {
                 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec};
-                let mut raw = RelationRegistry::new(path(&dir), gnitz_zset::schema::Slot::SOLO, Default::default());
+                let mut raw =
+                    RelationRegistry::new(&root(path(&dir)), gnitz_zset::schema::Slot::SOLO, Default::default());
                 raw.reopen_view(RelationSpec {
                     id: TID,
                     kind: RelationKind::View(gnitz_wire::ViewProps::Plain),
@@ -409,6 +435,38 @@ fn a_damaged_copy_costs_that_copy_alone() {
     }
 }
 
+/// A store leaves another host's relation directories and lock, in the
+/// directory it is opened at, as they were.
+#[test]
+fn a_store_leaves_whatever_else_its_directory_holds() {
+    use gnitz_store::relation::{lock_data_dir, relation_dir};
+    let dir = tempfile::tempdir().unwrap();
+    // A one-worker server's rows for the id the store is about to register, and
+    // a relation the store never hears of.
+    let theirs = [
+        format!("{}/w0of1/manifest.bin", relation_dir(path(&dir), TID)),
+        format!("{}/w0of1/shard_1.db", relation_dir(path(&dir), TID)),
+        format!("{}/manifest.bin", relation_dir(path(&dir), 1)),
+    ];
+    for file in &theirs {
+        std::fs::create_dir_all(std::path::Path::new(file).parent().unwrap()).unwrap();
+        std::fs::write(file, b"theirs").unwrap();
+    }
+
+    let mut store = open(&dir);
+    store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
+    seed(&mut store, TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
+    store.checkpoint().unwrap();
+    let _server = lock_data_dir(path(&dir)).expect("the directory's own lock is free");
+    drop(store);
+    let mut store = open(&dir);
+    store.invalidate(TID, Invalidate::Registration).unwrap();
+
+    for file in &theirs {
+        assert_eq!(std::fs::read(file).ok().as_deref(), Some(&b"theirs"[..]), "{file}");
+    }
+}
+
 /// A second store on a held directory is refused. `flock` conflicts on a fresh
 /// open file description whichever process holds the first, so a second open in
 /// this process stands for one in any other.
@@ -434,9 +492,7 @@ fn a_teardown_that_cannot_erase_poisons_the_store() {
     store.checkpoint().unwrap();
 
     block_copy(path(&dir), TID);
-    let err = store
-        .invalidate(TID, Invalidate::Copy)
-        .expect_err("an erase over a blocked copy must fail");
+    let err = store.refill(TID).err().expect("an erase over a blocked copy must fail");
     assert!(matches!(err, MirrorError::Poisoned(_)), "{err}");
     assert!(store.poisoned().is_some());
     assert_eq!(
@@ -452,7 +508,7 @@ fn a_teardown_that_cannot_erase_poisons_the_store() {
             store.register(OTHER_TID, SCHEMA, "w", &view_schema()).map(drop),
         ),
         ("invalidate", store.invalidate(OTHER_TID, Invalidate::Cursor)),
-        ("reseed", store.reseed(TID, &[&block], cursor(5))),
+        ("refill", seed(&mut store, TID, &[&block], cursor(5))),
         ("advance", store.advance(OTHER_TID, &[&block], cursor(5))),
         ("scan_spec", whole_copy(&mut store, OTHER_TID).map(drop)),
         ("checkpoint", store.checkpoint()),
@@ -486,7 +542,7 @@ fn a_teardown_that_cannot_erase_poisons_the_store() {
 #[test]
 fn a_failed_checkpoint_leaves_the_store_usable_and_the_retry_sound() {
     let (mut store, dir) = registered();
-    store.reseed(TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
+    seed(&mut store, TID, &[&plain(&[(1, 1, 10)])], cursor(4)).unwrap();
     store.checkpoint().unwrap();
     store
         .advance(TID, &[&plain(&[(1, 1, 10), (2, 1, 20)])], cursor(5))
@@ -537,9 +593,11 @@ fn a_failed_auto_checkpoint_costs_nothing_but_durability() {
     };
     let mut store = Mirror::open(path(&dir), config).unwrap();
     store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
+    let mut refill = store.refill(TID).unwrap();
     block_copy(path(&dir), TID);
-    store
-        .reseed(TID, &[&big(0)], cursor(4))
+    refill.block(&big(0)).unwrap();
+    refill
+        .seal(cursor(4))
         .expect("the threshold drives a checkpoint, and its failure is not the apply's");
     assert!(store.poisoned().is_none(), "a failed checkpoint is not a poisoning");
     assert_eq!(

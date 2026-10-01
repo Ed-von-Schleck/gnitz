@@ -730,7 +730,9 @@ fn resident_footprint_child() {
     mirror
         .attach_mirror(Mirror::open(&dir, config).expect("a store opens"))
         .expect("a fresh client attaches it");
+    gnitz_foundation::perf::reset_peak_rss();
     let tid = mirror.mirror_view("s", "v_keyed").expect("mirror").view_id;
+    let peak = gnitz_foundation::perf::peak_rss_bytes();
     mirror.checkpoint_mirror().expect("checkpoint");
     let rows = query(&mut mirror, "s", "SELECT a, b, v FROM v_keyed WHERE a = 2100")
         .1
@@ -740,8 +742,9 @@ fn resident_footprint_child() {
     let on_disk = dir_bytes(std::path::Path::new(&dir));
     println!(
         "copy of view {tid}: {on_disk} bytes on disk, host RSS {base} -> {held} \
-         (+{}), point read returned {rows} row(s)",
+         (+{}), bootstrap peak +{}, point read returned {rows} row(s)",
         held.saturating_sub(base),
+        peak.saturating_sub(base),
     );
     println!("{CHILD_OK}");
 }

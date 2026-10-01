@@ -1,6 +1,6 @@
 use crate::connection::{
-    DeltaCursor, IdRun, Interest, PollSink, PolledView, RawBlock, RelDescriptor, RelTarget, Reply, Request, ScanReply,
-    ScanResult, Session, SlotId,
+    DeltaCursor, IdRun, Interest, PollEnd, PollSink, Polled, PolledView, RawBlock, RelDescriptor, RelTarget, Reply,
+    Request, ScanReply, ScanResult, Session, SlotId,
 };
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
@@ -252,20 +252,7 @@ impl GnitzClient {
 
     pub(crate) fn round_trip(&mut self, req: Request<'_>) -> Result<Reply, ClientError> {
         let slot = self.session.submit(req)?;
-        self.await_slot(slot, None)
-    }
-
-    /// Step and park until `slot` completes, handing `sink` every delta-poll
-    /// position the steps fill.
-    fn await_slot(&mut self, slot: SlotId, mut sink: Option<&mut PollSink<'_>>) -> Result<Reply, ClientError> {
-        let mut ready = Interest::WRITE;
-        loop {
-            let mut done = self.session.step_polling(ready, sink.as_deref_mut());
-            if let Some(i) = done.iter().position(|(s, _)| *s == slot) {
-                return done.swap_remove(i).1;
-            }
-            ready = park(&self.session, &mut self.park_hook)?;
-        }
+        await_slot(&mut self.session, &mut self.park_hook, slot, None)
     }
 
     /// Reserve `count` contiguous SERIAL ids for `table_id` and return the first,
@@ -482,33 +469,32 @@ impl GnitzClient {
         after_tick: u64,
         reply_schema: &Arc<Schema>,
     ) -> Result<(ScanReply, DeltaCursor), ClientError> {
-        let (blocks, cursor) = self.delta_read_raw(DeltaPollItem {
+        let item = DeltaPollItem {
             view_id,
             after_tick,
             reply_layout: reply_schema.layout_digest(),
-        })?;
+        };
         let schema = Arc::clone(reply_schema);
         let mut batch = ZSetBatch::new(&schema);
-        for b in blocks {
-            crate::protocol::wal_block::decode_wal_block_into(&mut batch, b.block(), &schema)?;
-        }
+        let cursor = delta_read_blocks(&mut self.session, &mut self.park_hook, item, |b| {
+            Ok(crate::protocol::wal_block::decode_wal_block_into(
+                &mut batch,
+                b.block(),
+                &schema,
+            )?)
+        })?;
         Ok((ScanReply { schema, batch, lsn: None }, cursor))
     }
 
-    /// [`Self::delta_read`] keeping the reply's raw blocks. The cursor comes back
-    /// unchecked against a previous one.
-    pub(crate) fn delta_read_raw(&mut self, item: DeltaPollItem) -> Result<(Vec<RawBlock>, DeltaCursor), ClientError> {
-        let slot = self.session.submit_delta_poll(&[item])?;
-        let mut got: Option<PolledView> = None;
-        let mut sink = |s: SlotId, view: PolledView| {
-            if s == slot {
-                got = Some(view);
-            }
-        };
-        // A per-view fault fills the position and completes the slot `Ok`; a
-        // frame-level rejection completes it `Err` with no position filled.
-        self.await_slot(slot, Some(&mut sink))?;
-        got.expect("a one-view poll completes by filling its position")
+    /// [`Self::delta_read`] keeping the reply's raw blocks, the whole train in
+    /// hand. The cursor comes back unchecked against a previous one.
+    pub(crate) fn delta_read_raw(&mut self, item: DeltaPollItem) -> PolledView {
+        let mut blocks = Vec::new();
+        let cursor = delta_read_blocks(&mut self.session, &mut self.park_hook, item, |b| {
+            blocks.push(b);
+            Ok(())
+        })?;
+        Ok((blocks, cursor))
     }
 
     /// Consistent snapshot of N relations at one server-side SAL cut, returned
@@ -1366,6 +1352,51 @@ impl GnitzClient {
         let i = batch.live_rows().next().ok_or_else(missing)?;
         Ok((batch, i))
     }
+}
+
+/// Step and park until `slot` completes, handing `sink` what the steps read of
+/// a delta poll.
+fn await_slot(
+    session: &mut Session,
+    hook: &mut Option<ParkHook>,
+    slot: SlotId,
+    mut sink: Option<&mut PollSink<'_>>,
+) -> Result<Reply, ClientError> {
+    let mut ready = Interest::WRITE;
+    loop {
+        let mut done = session.step_polling(ready, sink.as_deref_mut());
+        if let Some(i) = done.iter().position(|(s, _)| *s == slot) {
+            return done.swap_remove(i).1;
+        }
+        ready = park(session, hook)?;
+    }
+}
+
+/// One view's delta read, handing `on_block` each block as its frame arrives.
+/// Returns the terminal's `(tag, T)` as a cursor, unchecked against a previous
+/// one, or the first error `on_block` returned.
+pub(crate) fn delta_read_blocks(
+    session: &mut Session,
+    hook: &mut Option<ParkHook>,
+    item: DeltaPollItem,
+    mut on_block: impl FnMut(RawBlock) -> Result<(), ClientError>,
+) -> Result<DeltaCursor, ClientError> {
+    let slot = session.submit_delta_poll(&[item])?;
+    let mut end: Option<PollEnd> = None;
+    let mut sink = |s: SlotId, polled: Polled| {
+        let refused = matches!(end, Some(Err(_)));
+        if s != slot || refused {
+            return;
+        }
+        end = match polled {
+            Polled::Block(b) => on_block(b).err().map(Err),
+            Polled::End(e) => Some(e),
+        };
+    };
+    // A per-view fault ends the position and completes the slot `Ok`; a
+    // frame-level rejection completes it `Err` with no position ended.
+    await_slot(session, hook, slot, Some(&mut sink))?;
+    end.expect("a one-view poll completes by ending its position")
 }
 
 /// Wait for the session's interest, running `hook` on every `EINTR`.

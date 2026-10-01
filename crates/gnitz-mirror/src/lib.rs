@@ -31,7 +31,11 @@
 //! There is **one store per data directory**. The engine's own `flock` refuses a
 //! second one, in this process or any other: a second [`Mirror::open`] takes a
 //! fresh file description, which `flock` treats as a conflict.
+//!
+//! The store keeps to a subdirectory of its own, lock included, so whatever
+//! else the directory holds is left as it was.
 
+mod guard;
 mod handle;
 mod record;
 
