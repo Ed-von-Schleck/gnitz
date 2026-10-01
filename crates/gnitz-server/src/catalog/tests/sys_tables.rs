@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::{idx_tab_batch, push_sys_row, table_tab_batch};
-use gnitz_store::storage::BatchBuilder;
 use gnitz_wire::IndexProps;
+use gnitz_zset::repr::BatchBuilder;
 
 /// A pair-keyed family's at-rest PK is `owner_BE ‖ member_BE`, so one owner's
 /// rows form one contiguous prefix band.

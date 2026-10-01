@@ -4,9 +4,9 @@ use crate::runtime::sal::fixtures::TestLog;
 use crate::test_support::{
     circuit_nodes_batch, col_def, col_tab_batch, identity_circuit, push_view_tab_row, sum_weights, table_tab_batch,
 };
-use gnitz_store::schema::Placement;
-use gnitz_store::storage::BatchBuilder;
 use gnitz_wire::TypeCode;
+use gnitz_zset::repr::BatchBuilder;
+use gnitz_zset::schema::Placement;
 
 /// Which of a group's written slots this rank replays. A wrong range silently
 /// loses or doubles ACKed rows, so every case is pinned.

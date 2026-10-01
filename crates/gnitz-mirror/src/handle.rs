@@ -1,7 +1,7 @@
 //! The store: what a host opens, and the `MirrorStore` surface a client drives
 //! it through.
 
-use gnitz_store::schema::SchemaFacts;
+use gnitz_zset::schema::SchemaFacts;
 use std::collections::HashMap;
 
 use gnitz_core::decode_regions_into;
@@ -12,9 +12,9 @@ use gnitz_foundation::{gnitz_debug, gnitz_error};
 use gnitz_store::relation::{
     lock_data_dir, DirLock, Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig,
 };
-use gnitz_store::schema::{SchemaDescriptor, Slot};
-use gnitz_store::storage::Batch;
 use gnitz_wire::ViewProps;
+use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::{SchemaDescriptor, Slot};
 
 use crate::record::{descriptor_of_block, MirrorRecord};
 

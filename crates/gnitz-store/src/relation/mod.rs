@@ -1,4 +1,4 @@
-//! L4 relation registry — what relations this process holds, and the stores
+//! The relation registry — what relations this process holds, and the stores
 //! behind them.
 //!
 //! Every relation enters through [`RelationRegistry::register`].
@@ -6,15 +6,18 @@
 use gnitz_foundation::env::env_num;
 use rustc_hash::FxHashMap;
 
-use crate::schema::key::{key_range_between_cuts, pk_in_range, KeyCut};
-use crate::schema::SchemaDescriptor;
+use gnitz_zset::algebra::index_entries;
+use gnitz_zset::schema::key::{key_range_between_cuts, pk_in_range, KeyCut};
+use gnitz_zset::schema::{index_spec_and_schema, KeySpec, SchemaDescriptor};
 
-use crate::schema::Slot;
-use crate::storage::{Batch, PkSetGather, ReadCursor, RecoverySource, StorageError, StoreBudgets, StoredRow, Table};
+use crate::storage::{RecoverySource, StoreBudgets, Table};
 use gnitz_wire::{PkColList, PkKeys, ViewProps};
+use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError, StoredRow};
+use gnitz_zset::schema::Slot;
 
 mod build;
 mod circuit_state;
+mod delta;
 mod dirs;
 mod ingest;
 mod repartition;
@@ -23,6 +26,7 @@ mod store_lifecycle;
 mod unique_pk;
 
 pub use circuit_state::{CircuitState, StateIdx, StateLayout};
+pub(crate) use delta::{delta_round, delta_round_prefix};
 pub(crate) use dirs::ensure_dir;
 pub use dirs::{lock_data_dir, relation_dir, relations_dir, ChildAddr, ChildKind, DirLock};
 pub(crate) use store::Store;
@@ -52,7 +56,7 @@ pub struct SecondaryIndex {
     /// consumers do no per-call spec rebuild. It survives every column ALTER of
     /// the owner — [`RelationRegistry::swap_schema`] rejects any descriptor that
     /// would not leave it valid.
-    key_spec: crate::schema::KeySpec,
+    key_spec: KeySpec,
     /// Every holder of this circuit.
     claims: Vec<IndexClaim>,
     /// Whether `cols` covers the owner's PK, so the index can never collide.
@@ -70,7 +74,7 @@ impl SecondaryIndex {
         *self.store.schema()
     }
 
-    pub fn key_spec(&self) -> crate::schema::KeySpec {
+    pub fn key_spec(&self) -> KeySpec {
         self.key_spec
     }
 
@@ -86,7 +90,7 @@ impl SecondaryIndex {
     }
 
     /// Non-compacting cursor over this index's store, in the index schema.
-    pub fn cursor(&self) -> crate::storage::ReadCursor {
+    pub fn cursor(&self) -> ReadCursor {
         self.store.held().open_cursor()
     }
 
@@ -101,7 +105,7 @@ impl SecondaryIndex {
     /// a non-empty `source` can still project to nothing.
     pub(crate) fn project_and_ingest(&mut self, source: &Batch) -> Result<bool, StorageError> {
         let table = self.store.held_mut();
-        let projected = project_index(source, &self.key_spec, table.schema());
+        let projected = index_entries(source, &self.key_spec, table.schema());
         if projected.is_empty() {
             return Ok(false);
         }
@@ -113,27 +117,6 @@ impl SecondaryIndex {
     pub fn resumed(&self) -> bool {
         self.store.held().resumed_from_checkpoint()
     }
-}
-
-/// Each nonzero-weight row of `source` that `spec` indexes, as its index entry at
-/// that row's weight, in source order.
-fn project_index(source: &Batch, spec: &crate::schema::KeySpec, idx_schema: &SchemaDescriptor) -> Batch {
-    let idx_stride = idx_schema.pk_stride();
-    assert_eq!(
-        idx_stride,
-        spec.key_size() + source.schema().pk_stride(),
-        "index schema of another spec"
-    );
-    let mut out = Batch::with_capacity(idx_schema, source.len());
-    let mut entry = [0u8; crate::schema::MAX_PK_BYTES];
-    let mb = source.as_mem_batch();
-    for row in 0..source.len() {
-        let weight = source.get_weight(row);
-        if weight != 0 && spec.write_entry(&mb, row, &mut entry) {
-            out.push_key_row(&entry[..idx_stride], weight);
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -287,7 +270,7 @@ impl Relation {
     }
 
     /// Non-compacting cursor over this relation's store.
-    pub fn cursor(&self) -> crate::storage::ReadCursor {
+    pub fn cursor(&self) -> ReadCursor {
         self.store.held().open_cursor()
     }
 
@@ -489,7 +472,7 @@ impl RelationRegistry {
             ix.claims.push(claim);
             return Ok(());
         }
-        let (key_spec, index_schema) = crate::schema::index_spec_and_schema(cols, &owner_schema)?;
+        let (key_spec, index_schema) = index_spec_and_schema(cols, &owner_schema)?;
         let mut ix = SecondaryIndex {
             cols: PkColList::from_slice(cols),
             store: Store::Absent(Box::new(index_schema)),

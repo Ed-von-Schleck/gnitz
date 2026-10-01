@@ -2,15 +2,15 @@
 //! VM, epoch execution and the system-table catalog — plus the process model,
 //! wire protocol and reactor that drive it.
 //!
-//! The Z-set store beneath it — the columnar batch representation, the LSM, the
-//! operators, the relation registry and the `ReadSpec` executor — is
-//! `gnitz-store`, a separate crate this one depends on. That split is what makes
-//! "a client links no compiler, no VM and no catalog" a fact of the crate graph
-//! rather than a convention: a host holding a mirrored view links `gnitz-store`
-//! alone, and nothing in this crate is linkable at all.
+//! Two crates sit beneath it. `gnitz-zset` is the kernel: the schema, the
+//! columnar batch and its cursor, and every operator a circuit dispatches to.
+//! `gnitz-store` keeps Z-sets: the LSM, the relation registry and the `ReadSpec`
+//! executor. That split is what makes "a client links no compiler, no VM and no
+//! catalog" a fact of the crate graph rather than a convention: a host holding a
+//! mirrored view links those two, and nothing in this crate is linkable at all.
 //!
 //! The three module roots below are the layer ladder: `runtime` over `catalog`
-//! over `query` over everything `gnitz-store` publishes. The submodules under
+//! over `query` over everything `gnitz-store` and `gnitz-zset` publish. The submodules under
 //! each root are private; what a root re-exports is what it publishes to the
 //! rungs above it, scoped `pub(in crate::<root>)` when it publishes to none.
 //! There is no crate-root re-export façade: a type's rung is part of what its

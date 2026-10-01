@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 gnitz-foundation = { path = "../gnitz-foundation" }
 gnitz-store = { path = "../gnitz-store" }
+gnitz-zset = { path = "../gnitz-zset" }
 gnitz-wire = { path = "../gnitz-wire" }
 gnitz-expr = { path = "../gnitz-expr" }
 libc.workspace = true
@@ -23,7 +24,7 @@ rcgen.workspace = true
 # DDL-bundle client→server pairing and of the layout-digest agreement (the
 # schema-codec suite).
 gnitz-core = { path = "../gnitz-core" }
-gnitz-store-testkit = { path = "../gnitz-store-testkit" }
+gnitz-zset-testkit = { path = "../gnitz-zset-testkit" }
 proptest.workspace = true
 tempfile.workspace = true
 

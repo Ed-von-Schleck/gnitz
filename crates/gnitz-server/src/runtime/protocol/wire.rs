@@ -2,10 +2,10 @@
 
 use std::rc::Rc;
 
-use gnitz_store::schema::{decode_schema_block, encode_schema_block, SchemaDescriptor};
-use gnitz_store::storage::{Batch, Layout, WireFrame};
 use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::{WireFlags, WireStatus};
+use gnitz_zset::repr::{Batch, Layout, WireFrame};
+use gnitz_zset::schema::{decode_schema_block, encode_schema_block, SchemaDescriptor};
 
 /// The error text for a reply past [`gnitz_wire::MAX_FRAME_PAYLOAD`].
 pub(crate) fn oversized_frame_message(sz: usize) -> String {

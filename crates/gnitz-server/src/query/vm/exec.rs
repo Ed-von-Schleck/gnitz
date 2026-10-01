@@ -2,8 +2,8 @@
 
 use super::*;
 use gnitz_expr::SchemaFacts;
-use gnitz_store::ops;
-use gnitz_store::storage::{Batch, StorageError};
+use gnitz_zset::repr::{Batch, StorageError};
+use gnitz_zset::{algebra, stream};
 
 /// The one context template for a `vm:` ingest fault.
 #[cold]
@@ -113,7 +113,7 @@ fn run_instructions(vm: &mut Vm, state: &mut CircuitState, start_pc: usize) -> R
             Batch::empty_with_schema(&regs[out_reg.at()].schema)
         } else {
             match &mut instr.op {
-                Op::Filter(pred) => ops::op_filter(&batches[in_reg.at()], pred)
+                Op::Filter(pred) => algebra::op_filter(&batches[in_reg.at()], pred)
                     .unwrap_or_else(|| take_or_clone(batches, in_reg, takes(in_reg))),
 
                 Op::Map(plan) => plan.evaluate_map_batch(&batches[in_reg.at()]),
@@ -135,7 +135,7 @@ fn run_instructions(vm: &mut Vm, state: &mut CircuitState, start_pc: usize) -> R
                         // The union's own (nullability-merged) schema, not the
                         // left input's — see `union_nullability_merge` for why a
                         // narrower one mis-sorts nulls.
-                        ops::op_union(
+                        algebra::op_union(
                             take_or_clone(batches, in_reg, takes(in_reg)),
                             &batches[in_b.at()],
                             &regs[out_reg.at()].schema,
@@ -146,7 +146,7 @@ fn run_instructions(vm: &mut Vm, state: &mut CircuitState, start_pc: usize) -> R
                 Op::WeightClamp { hist, kind } => {
                     let delta = &batches[in_reg.at()];
                     let mut cursor = state.cursor_for_keys(*hist, delta);
-                    ops::op_weight_clamp(delta, &mut cursor, *kind)
+                    stream::op_weight_clamp(delta, &mut cursor, *kind)
                 }
 
                 Op::JoinDT { trace, probe } => {
@@ -155,10 +155,10 @@ fn run_instructions(vm: &mut Vm, state: &mut CircuitState, start_pc: usize) -> R
                         true => state.cursor_for_keys(*trace, delta),
                         false => state.cursor(*trace),
                     };
-                    ops::op_join_delta_trace(delta, &mut cursor, &regs[out_reg.at()].schema, *probe)
+                    stream::op_join_delta_trace(delta, &mut cursor, &regs[out_reg.at()].schema, *probe)
                 }
 
-                Op::WorkerFilter { slot } => ops::op_worker_filter(&batches[in_reg.at()], *slot),
+                Op::WorkerFilter { slot } => algebra::op_worker_filter(&batches[in_reg.at()], *slot),
 
                 Op::NullExtend { nulls_first } => {
                     batches[in_reg.at()].widened_with_nulls(&regs[out_reg.at()].schema, *nulls_first)
@@ -167,12 +167,14 @@ fn run_instructions(vm: &mut Vm, state: &mut CircuitState, start_pc: usize) -> R
                 Op::Reduce { out_trace, plan } => {
                     // An empty delta touches no group; only a ground-seeding
                     // reduce reaches here with one.
-                    let mut avi_cursor = match plan.avi() {
-                        Some((idx, bake)) if !batches[in_reg.at()].is_empty() => Some(
-                            state
-                                .ingest_then_cursor(idx, ops::avi_batch(&batches[in_reg.at()], bake))
-                                .map_err(|e| ingest_err("avi", idx, e))?,
-                        ),
+                    let delta = &batches[in_reg.at()];
+                    let mut avi_cursor = match plan.avi_table {
+                        Some(idx) if !delta.is_empty() => plan
+                            .plan
+                            .index_batch(delta)
+                            .map(|entries| state.ingest_then_cursor(idx, entries))
+                            .transpose()
+                            .map_err(|e| ingest_err("avi", idx, e))?,
                         _ => None,
                     };
 
@@ -183,7 +185,7 @@ fn run_instructions(vm: &mut Vm, state: &mut CircuitState, start_pc: usize) -> R
                     );
 
                     let mut to_cursor = state.cursor(*out_trace);
-                    ops::op_reduce(&batches[in_reg.at()], &mut to_cursor, avi_cursor.as_mut(), &plan.plan)
+                    stream::op_reduce(&batches[in_reg.at()], &mut to_cursor, avi_cursor.as_mut(), &plan.plan)
                 }
 
                 Op::TopN { out_trace, plan } => {
@@ -192,7 +194,7 @@ fn run_instructions(vm: &mut Vm, state: &mut CircuitState, start_pc: usize) -> R
                         .ingest_then_cursor(idx, plan.plan.index_batch(&batches[in_reg.at()]))
                         .map_err(|e| ingest_err("topn index", idx, e))?;
                     let mut to_cursor = state.cursor(*out_trace);
-                    ops::op_topn(&batches[in_reg.at()], &mut to_cursor, &mut history, &plan.plan)
+                    stream::op_topn(&batches[in_reg.at()], &mut to_cursor, &mut history, &plan.plan)
                 }
             }
         };

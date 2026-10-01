@@ -13,9 +13,9 @@ use std::num::NonZeroU64;
 
 use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, Schema, ZSetBatch};
 use gnitz_mirror::{Mirror, MirrorConfig};
-use gnitz_store::schema::{encode_schema_block, SchemaDescriptor};
-use gnitz_store_testkit::{make_batch, make_schema_u128_i64, make_schema_u64_i64};
 use gnitz_wire::{ReadBound, ReadSpec};
+use gnitz_zset::schema::{encode_schema_block, SchemaDescriptor};
+use gnitz_zset_testkit::{make_batch, make_schema_u128_i64, make_schema_u64_i64};
 use tempfile::TempDir;
 
 #[path = "support/common.rs"]
@@ -47,7 +47,7 @@ fn cursor(tick: u64) -> DeltaCursor {
 /// One wire block of the view's own rows, in the view's own schema — the shape
 /// a bootstrap and a poll both reply in.
 fn plain(rows: &[(u64, i64, i64)]) -> Vec<u8> {
-    gnitz_store_testkit::encode_to_wire_vec(&make_batch(&make_schema_u64_i64(), rows))
+    gnitz_zset_testkit::encode_to_wire_vec(&make_batch(&make_schema_u64_i64(), rows))
 }
 
 fn path(dir: &TempDir) -> &str {
@@ -361,7 +361,7 @@ fn a_damaged_copy_costs_that_copy_alone() {
             }
             Damage::Record => {
                 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec};
-                let mut raw = RelationRegistry::new(path(&dir), gnitz_store::schema::Slot::SOLO, Default::default());
+                let mut raw = RelationRegistry::new(path(&dir), gnitz_zset::schema::Slot::SOLO, Default::default());
                 raw.reopen_view(RelationSpec {
                     id: TID,
                     kind: RelationKind::View(gnitz_wire::ViewProps::Plain),

@@ -1,14 +1,14 @@
 //! Dispatch-loop tests: epochs of hand-built programs, one per path the VM
-//! itself owns — operator semantics are `gnitz-store`'s to test.
+//! itself owns — operator semantics are `gnitz-zset`'s to test.
 
 use super::fixtures::*;
 use super::*;
 use crate::test_support::{
     join_reference, make_batch_u128, make_batch_u128_raw, make_schema_u128_i64, opk_pk, weighted_rows, zset_of,
 };
-use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, BatchBuilder};
 use gnitz_wire::{AggDescriptor, AggFunc, TypeCode};
+use gnitz_zset::repr::{Batch, BatchBuilder};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
 /// Each row's payload cells as signed integers of their own width, with its
 /// weight, sorted — the Z-set of an output whose key the test need not spell.
@@ -99,7 +99,7 @@ fn a_union_runs_and_leaves_under_its_merged_schema() {
     let pk = SchemaColumn::new(TypeCode::U128, false);
     let not_null = SchemaDescriptor::new(&[pk, SchemaColumn::new(TypeCode::I64, false)], &[0]);
     let nullable = SchemaDescriptor::new(&[pk, SchemaColumn::new(TypeCode::I64, true)], &[0]);
-    let merged = ops::union_nullability_merge(&not_null, &nullable).unwrap();
+    let merged = algebra::union_nullability_merge(&not_null, &nullable).unwrap();
 
     let mut p = TestPlan::default();
     let (a, b) = (p.seed(not_null), p.seed(nullable));
@@ -162,7 +162,7 @@ fn a_global_min_mints_its_ground_row_then_tracks_its_history() {
         AggDescriptor { col_idx: 1, agg_op: AggFunc::Min },
         AggDescriptor::COUNT_STAR,
     ];
-    let plan = ops::ReducePlan::from_wire(&schema, &[], &aggs, true).unwrap();
+    let plan = stream::ReducePlan::from_wire(&schema, &[], &aggs, true).unwrap();
     let mut p = TestPlan::default();
     let r0 = p.seed(schema);
     let (out, trace) = p.reduce(r0, plan);
@@ -190,7 +190,7 @@ fn a_global_min_mints_its_ground_row_then_tracks_its_history() {
 #[test]
 fn a_non_empty_first_epoch_spends_the_ground_latch_too() {
     let schema = make_schema_u128_i64();
-    let plan = ops::ReducePlan::from_wire(&schema, &[], &[AggDescriptor::COUNT_STAR], true).unwrap();
+    let plan = stream::ReducePlan::from_wire(&schema, &[], &[AggDescriptor::COUNT_STAR], true).unwrap();
     let mut p = TestPlan::default();
     let r0 = p.seed(schema);
     let (out, _) = p.reduce(r0, plan);
@@ -245,7 +245,7 @@ fn a_two_term_join_denotes_the_product_across_its_epochs() {
     let b_rows = make_batch_u128_raw(&schema, &[(2, 1, 200), (1, 1, 100), (1, -1, 100), (1, 1, 101)]);
 
     for kind in [gnitz_wire::JoinKind::Equi, gnitz_wire::JoinKind::Cross] {
-        let plan = |right: bool| ops::JoinPlan::from_wire(kind, right, &schema, &schema).unwrap();
+        let plan = |right: bool| stream::JoinPlan::from_wire(kind, right, &schema, &schema).unwrap();
         let out_schema = plan(false).out_schema;
         let mut p = TestPlan::default();
         let (trace_a, trace_b) = (p.table("ta", schema), p.table("tb", schema));
@@ -278,7 +278,7 @@ fn a_two_term_join_denotes_the_product_across_its_epochs() {
 fn a_second_topn_epoch_displaces_the_first_ones_row() {
     let schema = make_schema_u128_i64();
     let order = [gnitz_wire::OrderKey { col: 1, desc: true, nulls_first: false }];
-    let plan = ops::TopNPlan::from_wire(&schema, &[], &order, 1, 0).unwrap();
+    let plan = stream::TopNPlan::from_wire(&schema, &[], &order, 1, 0).unwrap();
     let out_schema = plan.output_schema;
     let mut p = TestPlan::default();
     let out_trace = p.table("topn", out_schema);
@@ -336,7 +336,7 @@ fn a_replay_runs_from_its_entry_and_leaves_every_trace_as_it_found_it() {
 fn replay_entry_refuses_a_stateful_operator_past_the_entry() {
     let schema = make_schema_u128_i64();
 
-    let plan = ops::ReducePlan::from_wire(&schema, &[], &[AggDescriptor::COUNT_STAR], false).unwrap();
+    let plan = stream::ReducePlan::from_wire(&schema, &[], &[AggDescriptor::COUNT_STAR], false).unwrap();
     let mut p = TestPlan::default();
     let r0 = p.seed(schema);
     let (reduced, _) = p.reduce(r0, plan);

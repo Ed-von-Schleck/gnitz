@@ -11,7 +11,7 @@ use std::ops::Range;
 
 use crate::runtime::reactor::TrainFrame;
 use gnitz_store::relation::Relation;
-use gnitz_store::schema::key::PkBuf;
+use gnitz_zset::schema::key::PkBuf;
 
 /// One worker's sorted spans in `merge_index_scan`: the frame being read, which
 /// pins its ring bytes, and the byte range of its unread keys inside them.

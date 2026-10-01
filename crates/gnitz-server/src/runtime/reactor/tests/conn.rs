@@ -8,7 +8,7 @@ use std::time::Duration;
 use super::super::test_support::*;
 use super::*;
 use crate::runtime::test_support::try_poll_once;
-use gnitz_store::storage::PooledBuf;
+use gnitz_zset::repr::PooledBuf;
 
 /// A send's carry: `body`, over a connection of its own.
 fn outbound(r: &Reactor, body: SendBody) -> Outbound {

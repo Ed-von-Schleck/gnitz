@@ -12,11 +12,11 @@ use rustc_hash::FxHashMap;
 
 use crate::query::vm::{DeltaReg, Vm};
 use gnitz_expr::LogicalProgram;
-use gnitz_store::ops::MapPlan;
-use gnitz_store::ops::ScatterPlan;
 use gnitz_store::relation::{Relation, RelationRegistry, StateIdx, StateLayout};
-use gnitz_store::schema::SchemaDescriptor;
 use gnitz_wire::{AggDescriptor, NodeId, NodeInputs};
+use gnitz_zset::algebra::MapPlan;
+use gnitz_zset::algebra::ScatterPlan;
+use gnitz_zset::schema::SchemaDescriptor;
 
 mod emit;
 mod hydration;

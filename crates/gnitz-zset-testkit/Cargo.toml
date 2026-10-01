@@ -1,0 +1,21 @@
+[package]
+name = "gnitz-zset-testkit"
+version = "0.1.0"
+edition = "2021"
+
+# A library of helpers: no unit tests and no doctests of its own to build.
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+gnitz-zset   = { path = "../gnitz-zset" }
+gnitz-wire   = { path = "../gnitz-wire" }
+gnitz-expr   = { path = "../gnitz-expr" }
+# A normal dependency, not a dev one: the shared file this crate compiles builds
+# its strategies with it, and `arb_type_code` returns `impl Strategy` in a
+# published signature.
+proptest.workspace = true
+
+[lints]
+workspace = true

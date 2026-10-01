@@ -6,9 +6,9 @@ use rustc_hash::FxHashSet;
 
 use super::*;
 use gnitz_expr::{RowSource, SchemaFacts};
-use gnitz_store::schema::make_index_schema;
 use gnitz_wire::{low_bits_mask, BitIter, TypeCode, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME};
 use gnitz_wire::{ViewProps, MAX_COLUMNS};
+use gnitz_zset::schema::make_index_schema;
 
 /// The name rules a catalog row must satisfy to be *stored*: non-empty
 /// `[A-Za-z0-9_]` and already canonical, since every cache key is compared

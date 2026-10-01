@@ -48,7 +48,7 @@ fn bounded_fixture(name: &str, capacity: u64) -> (CatalogEngine, u64, u64) {
     let mut cols = vec![col_def("id", TypeCode::U64)];
     cols.extend((0..PAYLOAD_COLS).map(|c| col_def(&format!("v{c}"), TypeCode::I64)));
     std::env::set_var("GNITZ_RAM_TIER_BYTES", RAM_TIER_BYTES.to_string());
-    let (mut engine, base) = ingest_fixture(name, &cols, ROWS, 1, |bb, id| {
+    let (mut engine, base) = ingest_fixture(name, &cols, ROWS, |bb, id| {
         for c in 0..PAYLOAD_COLS {
             bb.put_u64(scramble(id ^ c));
         }
@@ -165,7 +165,7 @@ fn hydrate_filtered_limit_bench() {
     let schema = engine.registry.relation(view).map(Relation::schema).unwrap();
     let spec = ReadSpec {
         bound: ReadBound::None,
-        predicate: pred_cmp_blob(gnitz_expr::CmpOp::Eq, 1, scramble(M) as i64),
+        predicate: cmp_const(gnitz_expr::CmpOp::Eq, 1, scramble(M) as i64).to_blob_bytes(),
         sink: gnitz_wire::ReadSink {
             map: None,
             kind: gnitz_wire::SinkKind::Rows { order: Vec::new(), limit_k: 1 },

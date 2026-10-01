@@ -1,9 +1,9 @@
 use super::*;
-use crate::schema::TypeCode;
 use crate::storage::{manifest_path, read_at, read_intact};
 use crate::test_support::{
     flip_last_byte_in_place, make_batch_raw, make_schema_u64_i64, pk_only_schema, pk_u64_two_i64_schema, zset_of,
 };
+use gnitz_wire::TypeCode;
 
 /// A one-worker registry over `base`.
 fn solo(base: &std::path::Path) -> RelationRegistry {
@@ -119,14 +119,14 @@ fn ingest_refuses_a_batch_of_another_arity() {
     let tmp = tempfile::tempdir().unwrap();
     let mut registry = solo(tmp.path());
     registry.register(table(50, make_schema_u64_i64())).unwrap();
-    let mut wide = crate::storage::BatchBuilder::new(pk_u64_two_i64_schema());
+    let mut wide = gnitz_zset::repr::BatchBuilder::new(pk_u64_two_i64_schema());
     wide.begin_row(1, 1);
     wide.put_int(1);
     wide.put_int(2);
     wide.end_row();
     assert!(registry.ingest(50, wide.finish()).is_err());
     assert_eq!(
-        registry.relation(50).unwrap().full_scan().count,
+        registry.relation(50).unwrap().full_scan().len(),
         0,
         "nothing was written"
     );
@@ -145,7 +145,8 @@ fn an_upsert_moves_the_index_entry() {
     registry.ingest(50, make_batch_raw(&schema, &[(1, 1, 20)])).unwrap();
 
     let ix = registry.relation(50).unwrap().index_on(&[1]).unwrap();
-    let want = project_index(&make_batch_raw(&schema, &[(1, 1, 20)]), &ix.key_spec(), &ix.schema());
+    let want =
+        gnitz_zset::algebra::index_entries(&make_batch_raw(&schema, &[(1, 1, 20)]), &ix.key_spec(), &ix.schema());
     assert_eq!(
         zset_of(&ix.cursor().materialize(), &ix.schema()),
         zset_of(&want, &ix.schema())
@@ -246,23 +247,4 @@ fn a_resumed_view_refuses_a_missing_manifest() {
     assert!(worker(true).is_err());
     // Last: a rebuild erases the traces.
     worker(false).expect("told to rebuild, a worker opens the view");
-}
-
-/// Each nonzero-weight source row projects to exactly its `write_entry` key at
-/// its own weight, retractions included; a weight-0 row projects to nothing.
-#[test]
-fn project_index_writes_each_entry_at_its_rows_weight() {
-    let owner = make_schema_u64_i64();
-    let (spec, idx_schema) = crate::schema::index_spec_and_schema(&[1], &owner).unwrap();
-    let src = make_batch_raw(&owner, &[(1, 1, 10), (2, 0, 20), (3, -1, 30)]);
-    let entry = |row: usize| {
-        let mut e = vec![0u8; idx_schema.pk_stride()];
-        assert!(spec.write_entry(&src.as_mem_batch(), row, &mut e));
-        e
-    };
-    let projected = project_index(&src, &spec, &idx_schema);
-    let got: Vec<(Vec<u8>, i64)> = (0..projected.len())
-        .map(|r| (projected.get_pk_bytes(r).to_vec(), projected.get_weight(r)))
-        .collect();
-    assert_eq!(got, [(entry(0), 1), (entry(2), -1)]);
 }

@@ -1,7 +1,7 @@
 //! The ladder guard: every rung names only the rungs beneath it.
 //!
 //! The crate graph cannot enforce this — the three rungs are one crate. The
-//! walk is `gnitz-store-testkit`'s, shared with `gnitz-store`'s own guard; what
+//! walk is `gnitz-zset-testkit`'s, shared with the guards of the crates beneath; what
 //! is stated here is only this crate's ladder.
 
 use std::path::Path;

@@ -6,7 +6,7 @@ use super::dirs::children_at_generation;
 use super::relation_dir;
 use super::ChildKind;
 use super::{RelationKind, RelationRegistry, RelationSpec, Residency, SecondaryIndex, Store};
-use crate::schema::Slot;
+use gnitz_zset::schema::Slot;
 
 impl RelationRegistry {
     // -- Store management (for multi-worker fork) -----------------------------

@@ -22,9 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::runtime::sal::MAX_WORKERS;
 use crate::runtime::w2m::SalWake;
 use gnitz_foundation::posix_io;
-use gnitz_store::ops::{op_exchange_gather, ScatterPlan};
-use gnitz_store::schema::SchemaDescriptor;
-use gnitz_store::storage::{Batch, Layout, WalBlock};
+use gnitz_zset::algebra::{op_exchange_gather, ScatterPlan};
+use gnitz_zset::repr::{Batch, Layout, WalBlock};
+use gnitz_zset::schema::SchemaDescriptor;
 
 /// The default and largest virtual size of one outbox.
 pub(crate) const OUTBOX_BYTES: usize = 1 << 30;
@@ -134,8 +134,9 @@ struct Open {
 /// `routed[list][offset..]`.
 #[derive(Clone, Copy)]
 struct Cursor {
-    /// `routed[0]` goes to every receiver.
-    shared: bool,
+    /// How many lists the round's plan routed into: one per receiver, or the
+    /// one list every receiver is sent.
+    lists: usize,
     list: usize,
     offset: usize,
 }
@@ -185,32 +186,19 @@ impl Mesh {
         (self.part % 2) as usize
     }
 
-    /// Open a round of `view`: send the live rows of `batch` split by `plan` or,
-    /// with none, all of them to every worker, as the round's first part; `fold`
-    /// is [`crate::query::DriveHost::exchange`]'s. Fatal while a round is open,
-    /// or on a row larger than an outbox.
-    pub(crate) fn publish(&mut self, view: u64, drained: bool, batch: &Batch, plan: Option<&ScatterPlan>, fold: bool) {
+    /// Open a round of `view`: send the live rows of `batch` split by `plan` as
+    /// the round's first part; `fold` is [`crate::query::DriveHost::exchange`]'s.
+    /// Fatal while a round is open, or on a row larger than an outbox.
+    pub(crate) fn publish(&mut self, view: u64, drained: bool, batch: &Batch, plan: &ScatterPlan, fold: bool) {
         assert!(self.open.is_none(), "exchange of view {view}: a round is already open");
         let nw = self.nw();
-        let shared = match plan {
-            Some(p) => {
-                p.route(batch, &mut self.routed, nw);
-                false
-            }
-            None => {
-                self.routed.resize_with(1, Vec::new);
-                let live = &mut self.routed[0];
-                live.clear();
-                live.extend((0..batch.len()).filter(|&i| batch.get_weight(i) != 0).map(|i| i as u32));
-                true
-            }
-        };
+        let lists = plan.route(batch, &mut self.routed, nw).len();
         self.open = Some(Open {
             view,
             schema: *batch.schema(),
             drained,
             consolidated: fold && batch.layout() == Layout::Consolidated,
-            unsent: Some(Cursor { shared, list: 0, offset: 0 }),
+            unsent: Some(Cursor { lists, list: 0, offset: 0 }),
             saved: Vec::new(),
             saved_consolidated: true,
         });
@@ -259,9 +247,8 @@ impl Mesh {
     fn write_rows(&self, batch: &Batch, at: &mut Cursor, blocks: &mut [Span; MAX_WORKERS]) -> (usize, bool) {
         let nw = self.nw();
         let outbox = self.outbox(self.rank);
-        let lists = if at.shared { 1 } else { nw };
         let mut end = BLOCKS_AT;
-        while at.list < lists {
+        while at.list < at.lists {
             let rest = &self.routed[at.list][at.offset..];
             if !rest.is_empty() {
                 // SAFETY: `[end, outbox_bytes)` lies inside this worker's own
@@ -271,9 +258,9 @@ impl Mesh {
                     return (end, true);
                 };
                 let span = Span { at: end as u64, len: len as u64 };
-                match at.shared {
-                    true => blocks[..nw].fill(span),
-                    false => blocks[at.list] = span,
+                match at.lists {
+                    1 => blocks[..nw].fill(span),
+                    _ => blocks[at.list] = span,
                 }
                 end = (end + len).next_multiple_of(8);
                 if n < rest.len() {

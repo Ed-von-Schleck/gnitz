@@ -1,48 +1,31 @@
 use super::*;
-use crate::relation::{IndexClaim, RelationKind, RelationSpec, StoreConfig};
-use crate::schema::{SchemaColumn, Slot, TypeCode};
-use crate::storage::BatchBuilder;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, opk_pk, payload0_i64};
+use crate::relation::{RelationKind, RelationSpec};
+use crate::test_support::{
+    make_batch_raw, make_schema_u64_i64, map_of, opk_pk, payload0_i64, relation_fixture, rows_spec, RelationFixture,
+    TID,
+};
 use gnitz_expr::{
     payload_is_null, payload_string, payload_u64, CmpOp, ExprBuilder, LogicalInstr, LogicalProgram, Sink,
 };
-use gnitz_wire::{key_image, AggDescriptor, AggReadSpec, ComputeMap, Cut, KeyRange, OrderKey, PkColList, ReadSink};
+use gnitz_wire::TypeCode;
+use gnitz_wire::{key_image, AggDescriptor, AggReadSpec, Cut, KeyRange, OrderKey, PkColList, ReadSink};
 use gnitz_wire::{PkKeys, ViewProps};
+use gnitz_zset::repr::BatchBuilder;
+use gnitz_zset::schema::SchemaColumn;
 
-/// The relation every test below reads.
-const TID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
-
-/// A registry holding `TID` as a `kind` relation over `schema`, with an index on
-/// each column of `indexed`, holding `rows`.
-fn fixture(name: &str, kind: RelationKind, schema: SchemaDescriptor, indexed: &[u32], rows: Batch) -> RelationRegistry {
-    let mut registry = RelationRegistry::new(
-        &crate::test_support::scratch_dir("read", name),
-        Slot::SOLO,
-        StoreConfig::default(),
-    );
-    registry.register(RelationSpec { id: TID, kind, schema }).unwrap();
-    for (id, &col) in (TID + 1..).zip(indexed) {
-        registry
-            .add_index(TID, IndexClaim::Index { id, unique: false }, &[col])
-            .unwrap();
-    }
-    registry.ingest(TID, rows).unwrap();
-    registry
-}
-
-/// [`fixture`] over a plain `(id U64 PK | val I64)` view holding the
+/// [`relation_fixture`] over a plain `(id U64 PK | val I64)` view holding the
 /// `(id, weight, val)` `rows`. A view's store runs no `enforce_unique_pk`, so a PK
 /// may repeat and a weight above 1 is admitted verbatim.
-fn view(name: &str, rows: &[(u64, i64, i64)]) -> RelationRegistry {
+fn view(rows: &[(u64, i64, i64)]) -> RelationFixture {
     let schema = make_schema_u64_i64();
     let kind = RelationKind::View(ViewProps::Plain);
-    fixture(name, kind, schema, &[], make_batch_raw(&schema, rows))
+    relation_fixture(kind, schema, &[], make_batch_raw(&schema, rows))
 }
 
 /// A `(id U64 PK | val I64)` reply's `(id, weight, val)` rows, sorted: a reply's
 /// order is not a contract, the client re-sorts it.
 fn rows_of(b: &Batch) -> Vec<(u64, i64, i64)> {
-    let mut rows: Vec<_> = (0..b.count)
+    let mut rows: Vec<_> = (0..b.len())
         .map(|i| (b.get_pk(i) as u64, b.get_weight(i), payload0_i64(b, i)))
         .collect();
     rows.sort_unstable();
@@ -55,32 +38,16 @@ fn run(r: &RelationRegistry, spec: ReadSpec) -> Result<Rc<Batch>, String> {
     r.scan_spec(TID, spec, layout, None)
 }
 
-/// A rows spec with no bound and no predicate.
-fn rows_spec(map: Option<ComputeMap>, order: Vec<OrderKey>, limit_k: u64) -> ReadSpec {
-    ReadSpec {
-        bound: ReadBound::None,
-        predicate: Vec::new(),
-        sink: ReadSink {
-            map,
-            kind: SinkKind::Rows { order, limit_k },
-        },
-    }
+/// The layout `sink` replies in over `schema`.
+fn fold_layout(schema: &SchemaDescriptor, sink: &ReadSink) -> u64 {
+    SinkPlan::from_wire(schema, sink, usize::MAX)
+        .unwrap()
+        .output_schema()
+        .layout_digest()
 }
 
 fn order_by(col: u16, desc: bool) -> Vec<OrderKey> {
     vec![OrderKey { col, desc, nulls_first: false }]
-}
-
-/// `program` as a sink map declaring `reply`'s payload columns.
-fn map_of(program: LogicalProgram, reply: &SchemaDescriptor) -> Option<ComputeMap> {
-    let out_cols = reply
-        .payload_columns()
-        .map(|(_, c)| (c.type_code, c.nullable))
-        .collect();
-    Some(ComputeMap {
-        program: program.to_blob_bytes(),
-        out_cols,
-    })
 }
 
 /// `lo <= col`, and `col < hi` under `Some(hi)`, as a wire predicate.
@@ -120,7 +87,7 @@ fn pk_range(start: Cut, end: Cut) -> ReadBound {
 /// relation is the store's cached snapshot itself.
 #[test]
 fn every_sink_answers_only_in_its_own_layout() {
-    let r = view("layouts", &[(1, 1, 10), (2, 1, 20)]);
+    let r = view(&[(1, 1, 10), (2, 1, 20)]);
     let schema = make_schema_u64_i64();
     let whole = rows_spec(None, vec![], 0);
     let snapshot = r.relation(TID).unwrap().full_scan();
@@ -130,14 +97,11 @@ fn every_sink_answers_only_in_its_own_layout() {
         group_cols: vec![1],
         aggs: vec![AggDescriptor::COUNT_STAR],
     };
-    let fold_layout = AdhocFold::new(&schema, &agg, usize::MAX)
-        .unwrap()
-        .output_schema()
-        .layout_digest();
     let fold = ReadSpec {
         sink: ReadSink { map: None, kind: SinkKind::Fold(agg) },
         ..whole.clone()
     };
+    let fold_layout = fold_layout(&schema, &fold.sink);
     let own = schema.layout_digest();
     let sinks = [
         (whole, own),
@@ -173,7 +137,7 @@ fn top_k_keeps_the_smallest_rows_covering_the_window() {
     ];
     let schema = make_schema_u64_i64();
     for (i, (rows, desc, limit_k, want)) in cases.into_iter().enumerate() {
-        let mut r = view(&format!("topk_{i}"), &rows);
+        let mut r = view(&rows);
         r.set_scan_chunk_rows(8);
         for map in [None, map_of(LogicalProgram::copy_cols(&[1]), &schema)] {
             let mapped = map.is_some();
@@ -197,16 +161,16 @@ fn a_limit_without_order_stops_at_the_row_covering_the_window() {
         (1, u64::MAX, (40, 40)),
     ] {
         let rows: Vec<_> = (0..40).map(|id| (id, w, id as i64)).collect();
-        let mut r = view(&format!("limit_{w}_{limit_k}"), &rows);
+        let mut r = view(&rows);
         r.set_scan_chunk_rows(8);
         let got = run(&r, rows_spec(None, vec![], limit_k)).unwrap();
-        let summed: i64 = (0..got.count).map(|i| got.get_weight(i)).sum();
-        assert_eq!((got.count, summed), want, "weight {w}, limit_k {limit_k}");
+        let summed: i64 = (0..got.len()).map(|i| got.get_weight(i)).sum();
+        assert_eq!((got.len(), summed), want, "weight {w}, limit_k {limit_k}");
     }
 
     // `val = id % 2`, and `val < 1` keeps every other row: one range per survivor.
     let rows: Vec<_> = (0..500).map(|id| (id, 1, id as i64 % 2)).collect();
-    let r = view("limit_ranges", &rows);
+    let r = view(&rows);
     let spec = ReadSpec {
         predicate: between(1, 0, Some(1)),
         ..rows_spec(
@@ -226,16 +190,19 @@ fn a_limit_without_order_stops_at_the_row_covering_the_window() {
 fn a_fold_counts_the_survivors_of_every_chunk() {
     let schema = make_schema_u64_i64();
     let rows: Vec<_> = (0..20).map(|id| (id, 2, id as i64 % 3)).collect();
-    let mut r = view("fold", &rows);
+    let mut r = view(&rows);
     r.set_scan_chunk_rows(4);
     let agg = AggReadSpec {
         group_cols: vec![1],
         aggs: vec![AggDescriptor::COUNT_STAR],
     };
-    let layout = AdhocFold::new(&schema, &agg, usize::MAX)
-        .unwrap()
-        .output_schema()
-        .layout_digest();
+    let layout = fold_layout(
+        &schema,
+        &ReadSink {
+            map: None,
+            kind: SinkKind::Fold(agg.clone()),
+        },
+    );
     for map in [None, map_of(LogicalProgram::copy_cols(&[1]), &schema)] {
         let spec = ReadSpec {
             bound: ReadBound::None,
@@ -243,7 +210,7 @@ fn a_fold_counts_the_survivors_of_every_chunk() {
             sink: ReadSink { map, kind: SinkKind::Fold(agg.clone()) },
         };
         let got = r.scan_spec(TID, spec, layout, None).unwrap();
-        let mut groups: Vec<(i64, i64, i64)> = (0..got.count)
+        let mut groups: Vec<(i64, i64, i64)> = (0..got.len())
             .map(|i| {
                 (
                     gnitz_wire::decode_opk_i64(got.get_pk_bytes(i), gnitz_wire::FixedInt::I64),
@@ -266,7 +233,7 @@ fn a_malformed_request_is_refused() {
     let col = |tc| SchemaColumn::new(tc, false);
     let schema = SchemaDescriptor::new(&[col(TypeCode::U64), col(TypeCode::I64), col(TypeCode::F64)], &[0]);
     let kind = RelationKind::View(ViewProps::Plain);
-    let r = fixture("refusals", kind, schema, &[], Batch::empty_with_schema(&schema));
+    let r = relation_fixture(kind, schema, &[], Batch::empty_with_schema(&schema));
     let walk = |c: u32| {
         let r = KeyRange::new(PkColList::from_slice(&[c]), &[], Cut::before(0), Cut::after(9));
         ReadSpec::all_rows(ReadBound::Range(r))
@@ -299,7 +266,7 @@ fn keyed_reads_return_each_named_keys_whole_group() {
     let schema = make_schema_u64_i64();
     let mut rows: Vec<_> = (0..10).map(|id| (id, 1, id as i64 * 10)).collect();
     rows.extend([(7, 1, 71), (7, 1, 72), (7, 1, 73)]);
-    let mut r = view("keyed", &rows);
+    let mut r = view(&rows);
     // Retracted in a later ingest, (7, 70) is a ghost every read must drop.
     r.ingest(TID, make_batch_raw(&schema, &[(7, -1, 70)])).unwrap();
     r.set_scan_chunk_rows(2);
@@ -366,7 +333,7 @@ fn an_index_walk_returns_exactly_its_range() {
         bb.put_opt_int(big);
         bb.end_row();
     }
-    let r = fixture("walks", RelationKind::BaseTable, schema, &[1, 2], bb.finish());
+    let r = relation_fixture(RelationKind::BaseTable, schema, &[1, 2], bb.finish());
 
     let vals = |keep: &dyn Fn(i64) -> bool| -> Vec<u64> {
         (0..WALK_ROWS).filter(|&id| walk_row(id).0.is_some_and(keep)).collect()
@@ -421,7 +388,7 @@ fn an_index_walk_returns_exactly_its_range() {
 
 /// A walk reply's ids, sorted, each at weight 1.
 fn rows_of_walk(b: &Batch) -> Vec<u64> {
-    let mut ids: Vec<u64> = (0..b.count)
+    let mut ids: Vec<u64> = (0..b.len())
         .map(|i| {
             assert_eq!(b.get_weight(i), 1);
             b.get_pk(i) as u64
@@ -438,12 +405,11 @@ fn rows_of_walk(b: &Batch) -> Vec<u64> {
 /// reused across chunks — the only way a stale-byte leak in a map's tail writes
 /// would show.
 fn map_fixture(
-    name: &str,
     cols: &[SchemaColumn],
     n: u64,
     chunk_rows: usize,
     mut put_row: impl FnMut(&mut BatchBuilder, u64),
-) -> RelationRegistry {
+) -> RelationFixture {
     let schema = SchemaDescriptor::new(cols, &[0]);
     let mut bb = BatchBuilder::new(schema);
     for id in 0..n {
@@ -451,7 +417,7 @@ fn map_fixture(
         put_row(&mut bb, id);
         bb.end_row();
     }
-    let mut r = fixture(name, RelationKind::BaseTable, schema, &[], bb.finish());
+    let mut r = relation_fixture(RelationKind::BaseTable, schema, &[], bb.finish());
     r.set_scan_chunk_rows(chunk_rows);
     r
 }
@@ -464,7 +430,7 @@ fn a_copy_of_64_payload_columns_covers_every_slot() {
     const P: usize = 64;
     let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
     cols.extend((0..P).map(|_| SchemaColumn::new(TypeCode::I64, false)));
-    let r = map_fixture("map_64", &cols, 40, 16, |bb, id| {
+    let r = map_fixture(&cols, 40, 16, |bb, id| {
         for k in 0..P {
             bb.put_u64(id * 100 + k as u64);
         }
@@ -473,8 +439,8 @@ fn a_copy_of_64_payload_columns_covers_every_slot() {
     let copies: Vec<u32> = (1..=P as u32).collect();
     let spec = rows_spec(map_of(LogicalProgram::copy_cols(&copies), &reply), vec![], 0);
     let got = r.scan_spec(TID, spec, reply.layout_digest(), None).unwrap();
-    assert_eq!(got.count, 40);
-    for row in 0..got.count {
+    assert_eq!(got.len(), 40);
+    for row in 0..got.len() {
         let id = got.get_pk(row) as u64;
         for k in 0..P {
             assert_eq!(payload_u64(&*got, row, k), id * 100 + k as u64, "row {row} slot {k}");
@@ -486,16 +452,13 @@ fn a_copy_of_64_payload_columns_covers_every_slot() {
 /// every null word: an unwritten word would surface the recycled keeper's bytes.
 #[test]
 fn a_pk_sourced_map_zeroes_every_null_word() {
-    let mut r = view(
-        "map_pk_only",
-        &(0..300).map(|id| (id, 1, id as i64 * 7)).collect::<Vec<_>>(),
-    );
+    let mut r = view(&(0..300).map(|id| (id, 1, id as i64 * 7)).collect::<Vec<_>>());
     r.set_scan_chunk_rows(32);
     let reply = crate::test_support::u64_pk_schema(SchemaColumn::new(TypeCode::U64, false));
     let spec = rows_spec(map_of(LogicalProgram::copy_cols(&[0]), &reply), vec![], 0);
     let got = r.scan_spec(TID, spec, reply.layout_digest(), None).unwrap();
-    assert_eq!(got.count, 300);
-    for row in 0..got.count {
+    assert_eq!(got.len(), 300);
+    for row in 0..got.len() {
         assert_eq!(got.get_null_word(row), 0, "row {row}");
         assert_eq!(payload_u64(&*got, row, 0), got.get_pk(row) as u64, "row {row}");
     }
@@ -517,7 +480,7 @@ fn a_permuted_copy_relocates_strings_and_nulls() {
         SchemaColumn::new(TypeCode::I64, true),
         SchemaColumn::new(TypeCode::String, false),
     ];
-    let r = map_fixture("map_permuted", &cols, N, 24, |bb, id| {
+    let r = map_fixture(&cols, N, 24, |bb, id| {
         bb.put_opt_int((!id.is_multiple_of(5)).then_some(id as u128 * 3));
         bb.put_string(&string(id));
     });
@@ -533,7 +496,7 @@ fn a_permuted_copy_relocates_strings_and_nulls() {
     );
     let spec = rows_spec(map_of(LogicalProgram::copy_cols(&[2, 0, 1]), &reply), vec![], 0);
     let got = r.scan_spec(TID, spec, reply.layout_digest(), None).unwrap();
-    let mut decoded: Vec<_> = (0..got.count)
+    let mut decoded: Vec<_> = (0..got.len())
         .map(|row| {
             let nv = (!payload_is_null(&*got, row, 2)).then(|| payload_u64(&*got, row, 2) as i64);
             let s = payload_string(&*got, row, 0);
@@ -558,7 +521,7 @@ fn a_computed_map_writes_at_the_keepers_tail() {
         SchemaColumn::new(TypeCode::I64, true),
         SchemaColumn::new(TypeCode::I64, false),
     ];
-    let r = map_fixture("map_compute", &cols, N, 32, |bb, id| {
+    let r = map_fixture(&cols, N, 32, |bb, id| {
         bb.put_opt_int((!id.is_multiple_of(4)).then_some(id as u128));
         bb.put_u64(id * 10);
     });
@@ -581,7 +544,7 @@ fn a_computed_map_writes_at_the_keepers_tail() {
         ..rows_spec(map_of(program, &reply), vec![], 0)
     };
     let got = r.scan_spec(TID, spec, reply.layout_digest(), None).unwrap();
-    let mut decoded: Vec<_> = (0..got.count)
+    let mut decoded: Vec<_> = (0..got.len())
         .map(|row| {
             let doubled = (!payload_is_null(&*got, row, 0)).then(|| payload_u64(&*got, row, 0) as i64);
             (got.get_pk(row) as u64, doubled, payload_u64(&*got, row, 1) as i64)
@@ -598,12 +561,12 @@ fn a_computed_map_writes_at_the_keepers_tail() {
 
 /// A bounded view whose sweep has dehydrated every row of `on_disk`, plus the rows of
 /// `in_ram` still in the RAM tier, each `(id, 1, id)`.
-fn dehydrated_fixture(name: &str, on_disk: std::ops::Range<u64>, in_ram: std::ops::Range<u64>) -> RelationRegistry {
+fn dehydrated_fixture(on_disk: std::ops::Range<u64>, in_ram: std::ops::Range<u64>) -> RelationFixture {
     let schema = make_schema_u64_i64();
     let rows =
         |ids: std::ops::Range<u64>| make_batch_raw(&schema, &ids.map(|id| (id, 1, id as i64)).collect::<Vec<_>>());
     let kind = RelationKind::View(ViewProps::Bounded { capacity_bytes: 1 });
-    let mut registry = fixture(name, kind, schema, &[], rows(on_disk));
+    let mut registry = relation_fixture(kind, schema, &[], rows(on_disk));
     registry.set_resume_generation(1);
     registry.checkpoint_ephemeral([]).unwrap();
     assert!(
@@ -620,7 +583,7 @@ fn dehydrated_fixture(name: &str, on_disk: std::ops::Range<u64>, in_ram: std::op
 /// has nothing to recompute it with.
 #[test]
 fn a_bound_that_prunes_every_skeleton_shard_streams() {
-    let r = dehydrated_fixture("skeleton_prune", 0..5, 100..105);
+    let r = dehydrated_fixture(0..5, 100..105);
     let got = run(&r, ReadSpec::all_rows(pk_range(Cut::before(100), Cut::after(104)))).unwrap();
     assert_eq!(
         rows_of(&got),
@@ -635,8 +598,8 @@ fn a_bound_that_prunes_every_skeleton_shard_streams() {
 
 /// [`dehydrated_fixture`] over keys `0..5` on disk and `100..105` in RAM, plus a second
 /// row `(2, val = 7)` under skeleton key 2, read two merge groups a chunk.
-fn skeleton_fixture(name: &str) -> RelationRegistry {
-    let mut registry = dehydrated_fixture(name, 0..5, 100..105);
+fn skeleton_fixture() -> RelationFixture {
+    let mut registry = dehydrated_fixture(0..5, 100..105);
     registry
         .ingest(TID, make_batch_raw(&make_schema_u64_i64(), &[(2, 1, 7)]))
         .unwrap();
@@ -681,7 +644,7 @@ impl SkeletonHydrator for Recompute {
 /// chunked walk hydrates once per chunk, only the skeleton keys that chunk met.
 #[test]
 fn a_skeleton_store_hydrates_chunk_by_chunk() {
-    let r = skeleton_fixture("skeleton_chunks");
+    let r = skeleton_fixture();
     let layout = make_schema_u64_i64().layout_digest();
     let mut h = Recompute::default();
     let every: Vec<u64> = (0..5).chain(100..105).collect();
@@ -707,7 +670,7 @@ fn a_skeleton_store_hydrates_chunk_by_chunk() {
 /// of live rows; the chunks still concatenate.
 #[test]
 fn a_scan_chunk_boundary_inside_a_pk_group() {
-    let mut r = dehydrated_fixture("skeleton_split_group", 0..2, 100..102);
+    let mut r = dehydrated_fixture(0..2, 100..102);
     r.ingest(TID, make_batch_raw(&make_schema_u64_i64(), &[(100, 1, 7)]))
         .unwrap();
     // Groups: skeleton 0, skeleton 1, (100, 7) | (100, 100), (101, 101).
@@ -731,7 +694,7 @@ fn a_scan_chunk_boundary_inside_a_pk_group() {
 /// and `LIMIT 1` ships one of them.
 #[test]
 fn a_limit_stops_at_the_row_inside_a_hydrated_group() {
-    let r = skeleton_fixture("skeleton_limit");
+    let r = skeleton_fixture();
     let spec = ReadSpec {
         bound: pk_set(&[2]),
         ..rows_spec(None, vec![], 1)
@@ -745,7 +708,7 @@ fn a_limit_stops_at_the_row_inside_a_hydrated_group() {
 #[test]
 #[should_panic(expected = "a raw drain met a skeleton row")]
 fn a_raw_drain_over_a_skeleton_run_panics() {
-    let r = dehydrated_fixture("skeleton_raw_drain", 0..5, 100..105);
+    let r = dehydrated_fixture(0..5, 100..105);
     r.open_bound(TID, ReadBound::None).unwrap().0.drain_chunk(usize::MAX);
 }
 
@@ -755,7 +718,7 @@ fn a_raw_drain_over_a_skeleton_run_panics() {
 #[test]
 #[should_panic(expected = "hydration weight mismatch")]
 fn a_hydration_off_the_skeleton_weight_panics() {
-    let r = skeleton_fixture("skeleton_tripwire");
+    let r = skeleton_fixture();
     let mut h = Recompute { short: true, ..Recompute::default() };
     let layout = make_schema_u64_i64().layout_digest();
     let _ = r.scan_spec(TID, ReadSpec::all_rows(pk_set(&[2])), layout, Some(&mut h));
@@ -771,7 +734,7 @@ fn a_hydration_off_the_skeleton_weight_panics() {
 fn a_delta_read_answers_the_rounds_past_its_cursor() {
     let schema = make_schema_u64_i64();
     let kind = RelationKind::View(ViewProps::Fed { delta_bytes: 1 << 20 });
-    let mut r = fixture("delta", kind, schema, &[], Batch::empty_with_schema(&schema));
+    let mut r = relation_fixture(kind, schema, &[], Batch::empty_with_schema(&schema));
     r.ingest_view_delta(TID, make_batch_raw(&schema, &[(7, 1, 70)]), Some(4), false)
         .unwrap();
     r.ingest_view_delta(TID, make_batch_raw(&schema, &[(7, -1, 70), (8, 1, 80)]), Some(5), false)
@@ -841,10 +804,7 @@ fn survivors_membership_bench() {
     let sel: u64 = std::env::var("GNITZ_BENCH_SEL").map_or(10, |s| s.parse().unwrap());
     let passes: usize = std::env::var("GNITZ_BENCH_PASSES").map_or(1, |s| s.parse().unwrap());
     let hi = (N * sel / 100) as i64;
-    let r = view(
-        "survivors_bench",
-        &(0..N).map(|id| (id, 1, id as i64)).collect::<Vec<_>>(),
-    );
+    let r = view(&(0..N).map(|id| (id, 1, id as i64)).collect::<Vec<_>>());
     let walk = ReadBound::Range(KeyRange::new(
         PkColList::from_slice(&[1]),
         &[],
@@ -871,7 +831,7 @@ fn survivors_membership_bench() {
     };
     for _ in 0..passes {
         let got = black_box(run(&r, spec.clone()).unwrap());
-        assert_eq!(got.count as i64, want);
+        assert_eq!(got.len() as i64, want);
     }
     println!("survivors {shape} sel {sel}% passes {passes}");
 }

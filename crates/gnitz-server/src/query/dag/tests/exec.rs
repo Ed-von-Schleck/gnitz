@@ -7,8 +7,8 @@ use crate::test_support::{
     try_register_view, zset_of, LocalDrive, RowKey,
 };
 use gnitz_store::relation::Relation;
-use gnitz_store::schema::Slot;
 use gnitz_wire::{ColumnDef, TypeCode};
+use gnitz_zset::schema::Slot;
 use std::collections::HashMap;
 
 fn view_cols() -> Vec<CatalogColumn> {
@@ -166,8 +166,8 @@ fn backfill_chunk_runs_only_the_named_view() {
 
 // ── A side's output relay ───────────────────────────────────────────────────
 
-/// Records the row count and whether a plan came with every batch a relay
-/// sends, and relays it back.
+/// Records the row count and whether the plan keeps rank 0's rows alone for
+/// every batch a relay sends, and relays it back.
 struct Recorder {
     dag: DagEngine,
     registry: RelationRegistry,
@@ -179,8 +179,9 @@ impl DriveHost for Recorder {
         (&mut self.dag, &mut self.registry)
     }
 
-    fn exchange(&mut self, _view_id: u64, batch: Cow<'_, Batch>, plan: Option<&ScatterPlan>, _fold: bool) -> Batch {
-        self.sent.push((batch.len(), plan.is_some()));
+    fn exchange(&mut self, _view_id: u64, batch: Cow<'_, Batch>, plan: &ScatterPlan, _fold: bool) -> Batch {
+        let splits = plan.share(&batch, Slot::new(0, 2)).len() < batch.len();
+        self.sent.push((batch.len(), splits));
         batch.into_owned()
     }
 }
@@ -229,7 +230,7 @@ fn a_replica_sides_output_is_shared_without_a_round() {
 const BENCH_TICKS: u64 = 10_000;
 
 /// Column records for a view whose output is `schema`.
-fn cols_of(schema: &gnitz_store::schema::SchemaDescriptor) -> Vec<CatalogColumn> {
+fn cols_of(schema: &gnitz_zset::schema::SchemaDescriptor) -> Vec<CatalogColumn> {
     (0..schema.num_columns())
         .map(|ci| {
             let c = schema.column(ci).expect("in range");
@@ -244,10 +245,9 @@ fn engine_with_every_plan_shape(name: &str) -> (CatalogEngine, u64, u64) {
     let base_schema = engine.registry.relation(base).map(Relation::schema).unwrap();
 
     let (group, aggs) = ([1u32], [gnitz_wire::AggDescriptor::COUNT_STAR]);
-    let grouped = gnitz_store::ops::ReducePlan::from_wire(&base_schema, &group, &aggs, false)
+    let grouped = *gnitz_zset::stream::ReducePlan::from_wire(&base_schema, &group, &aggs, false)
         .unwrap()
-        .shape
-        .output_schema;
+        .output_schema();
     let mut circuit = gnitz_wire::Circuit::default();
     let scan = circuit.input_delta(base, gnitz_wire::ReadBound::None);
     let reduced = circuit.reduce_multi(scan, &group, &aggs, false);

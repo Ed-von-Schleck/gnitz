@@ -4,7 +4,7 @@
 use super::*;
 
 use crate::runtime::peer::Peer;
-use gnitz_store::storage::MemBatch;
+use gnitz_zset::repr::MemBatch;
 
 /// Hand `on_batch` the rows of every frame of `lease`, workers in ascending order,
 /// each decoded against `expected`.

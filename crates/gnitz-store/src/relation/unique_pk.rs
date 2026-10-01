@@ -5,7 +5,9 @@ use std::collections::hash_map::Entry;
 
 use rustc_hash::FxHashMap;
 
-use crate::storage::{Batch, StoredRow, Table};
+use crate::storage::Table;
+
+use gnitz_zset::repr::{Batch, StoredRow};
 
 /// Enforce unique-PK semantics on an ingest batch: per PK, the batch's last
 /// non-zero row decides over whatever the store holds. A held key's stored row
@@ -19,8 +21,8 @@ pub(crate) fn enforce_unique_pk(store: &Table, mut batch: Batch) -> Batch {
     let mut dropped: Vec<usize> = Vec::new();
     let mut stored: Vec<StoredRow> = Vec::new();
     let mut live_insert: FxHashMap<&[u8], Option<usize>> =
-        FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
-    for row in 0..batch.count {
+        FxHashMap::with_capacity_and_hasher(batch.len(), Default::default());
+    for row in 0..batch.len() {
         let w = batch.get_weight(row);
         if w <= 0 {
             dropped.push(row);
@@ -44,15 +46,9 @@ pub(crate) fn enforce_unique_pk(store: &Table, mut batch: Batch) -> Batch {
     if dropped.is_empty() && stored.is_empty() {
         return batch;
     }
-    let kept = complement(dropped, batch.count);
+    let kept = complement(dropped, batch.len());
     let mut effective = Batch::from_ranges(&batch, &kept, stored.len());
-    if !stored.is_empty() {
-        let mut sink = effective.append_session(stored.len());
-        for s in &stored {
-            let (src, row) = s.source();
-            sink.push_row(src, row, -1);
-        }
-    }
+    effective.append_stored(&stored, -1);
     effective
 }
 

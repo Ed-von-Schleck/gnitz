@@ -1,9 +1,9 @@
 use super::super::fixtures::test_dispatcher;
 use super::*;
 use crate::test_support::u64_pk_schema;
-use gnitz_store::schema::SchemaColumn;
-use gnitz_store::storage::BatchBuilder;
 use gnitz_wire::TypeCode;
+use gnitz_zset::repr::BatchBuilder;
+use gnitz_zset::schema::SchemaColumn;
 
 /// The filter never proves a present span absent. The cap is tested before the
 /// insert, so a repeat span still fits at exactly `cap`; the first distinct span
@@ -41,10 +41,7 @@ fn extract_into_filter_takes_only_live_non_null_spans() {
     let mut bb = BatchBuilder::new(schema);
     for (pk, weight, payload) in [(1, 1, Some(100)), (2, 1, None), (3, -1, Some(300))] {
         bb.begin_row(pk, weight);
-        match payload {
-            Some(v) => bb.put_int(v),
-            None => bb.put_null(),
-        }
+        bb.put_opt_int(payload);
         bb.end_row();
     }
     let batch = bb.finish();

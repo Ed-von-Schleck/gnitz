@@ -6,8 +6,8 @@ use crate::test_support::{
     make_batch, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
     weighted_rows, zset_of,
 };
-use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
 use gnitz_wire::TypeCode;
+use gnitz_zset::schema::{Placement, SchemaColumn, SchemaDescriptor};
 
 /// Write `batch` to `log` as the master's push of it to relation 16, handing
 /// `inspect` the layout the scatter picked.
@@ -136,7 +136,7 @@ fn a_push_group_decodes_to_each_workers_rows() {
 #[test]
 #[ignore]
 fn push_group_layout_bench() {
-    use gnitz_store::storage::BatchBuilder;
+    use gnitz_zset::repr::BatchBuilder;
     use std::hint::black_box;
     use std::time::Instant;
 

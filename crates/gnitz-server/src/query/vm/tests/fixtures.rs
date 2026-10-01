@@ -37,10 +37,10 @@ impl TestPlan {
     /// Push `plan`'s reduce over `in_reg`, declaring its output trace and, for a
     /// MIN/MAX, its value index — as the emitter does. Returns the output
     /// register and trace.
-    pub(super) fn reduce(&mut self, in_reg: DeltaReg, plan: ops::ReducePlan) -> (DeltaReg, StateIdx) {
-        let out_schema = plan.shape.output_schema;
+    pub(super) fn reduce(&mut self, in_reg: DeltaReg, plan: stream::ReducePlan) -> (DeltaReg, StateIdx) {
+        let out_schema = *plan.output_schema();
         let out_trace = self.table("reduce", out_schema);
-        let avi_table = plan.avi.as_ref().map(|bake| self.table("avidx", bake.schema));
+        let avi_table = plan.index_schema().map(|schema| self.table("avidx", *schema));
         let plan = Box::new(BakedReduce::new(plan, avi_table));
         (
             self.prog.push(in_reg, out_schema, Op::Reduce { out_trace, plan }),
@@ -107,14 +107,7 @@ impl std::ops::Deref for TestVm {
 
 /// `Filter(col > lit)` over `schema`'s integer column `col`.
 pub(super) fn filter_gt(schema: &SchemaDescriptor, col: u32, lit: i64) -> Op {
-    use gnitz_expr::LogicalInstr::{Cmp, LoadColInt, LoadConst};
-    let mut eb = gnitz_expr::ExprBuilder::new();
-    let (a, b) = (
-        eb.emit(LoadColInt { col }),
-        eb.emit(LoadConst { val: lit, unsigned: false }),
-    );
-    let r = eb.emit(Cmp { op: gnitz_expr::CmpOp::Gt, a, b });
-    let program = eb.build(vec![gnitz_expr::Sink::Reg(r)]).unwrap();
+    let program = crate::test_support::cmp_const(gnitz_expr::CmpOp::Gt, col, lit);
     Op::Filter(Box::new(program.resolve_filter(schema).unwrap()))
 }
 

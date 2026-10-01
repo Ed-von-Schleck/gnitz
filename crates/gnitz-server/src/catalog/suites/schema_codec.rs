@@ -6,87 +6,32 @@
 
 use crate::catalog::cache::CatalogRecord;
 use crate::catalog::CatalogColumn;
-use crate::test_support::arb_type_code;
+use crate::test_support::arb_schema;
 use gnitz_expr::{ColumnTable, SchemaFacts};
-use gnitz_store::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::Batch;
 use gnitz_wire::{ColumnDef, TypeCode, MAX_PK_COLUMNS};
-use proptest::collection::vec;
+use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 
-/// One generated schema — per column its type and nullability, and the PK list
-/// in declared order — from which every builder below is fed, so each describes
-/// the same columns.
-type Cols = (Vec<TypeCode>, Vec<bool>, Vec<u32>);
-
-/// `max_pk` bounds the generated PK arity: the engine's schemas run to
-/// `MAX_PK_COLUMNS` (5, the secondary-index schema width), but the persisted
-/// client codec caps at `PK_LIST_MAX_COLS` (4) — tests that go through the
-/// client (`Schema::from_block` → `Schema::validate`) must stay within it.
-fn arb_schema(max_pk: usize) -> impl Strategy<Value = Cols> {
-    // n_cols ≥ 1, so `1..=n_cols.min(max_pk)` is never empty.
-    (1usize..=8)
-        .prop_flat_map(move |n_cols| {
-            (
-                Just(n_cols),
-                vec(arb_type_code(), n_cols), // column types
-                vec(any::<bool>(), n_cols),   // nullability
-                vec(any::<u32>(), n_cols),    // permutation weights
-                1usize..=n_cols.min(max_pk),  // PK arity
-            )
-        })
-        .prop_map(|(n_cols, types, nullables, weights, k)| {
-            // PK index set = first `k` columns ordered by their weight.
-            // The order is the "declared" PK order the encoder must preserve.
-            let mut idx: Vec<u32> = (0..n_cols as u32).collect();
-            idx.sort_by_key(|&i| weights[i as usize]);
-            let pk: Vec<u32> = idx[..k].to_vec();
-            // PK columns must be PK-eligible and non-nullable; remap ineligible
-            // draws to U64 so every builder accepts the schema.
-            let is_pk = |i: usize| pk.contains(&(i as u32));
-            let types = (0..n_cols)
-                .map(|i| {
-                    if is_pk(i) && !types[i].is_pk_eligible() {
-                        TypeCode::U64
-                    } else {
-                        types[i]
-                    }
-                })
-                .collect();
-            let nullables = (0..n_cols).map(|i| !is_pk(i) && nullables[i]).collect();
-            (types, nullables, pk)
-        })
+/// The catalog's column records for `schema`, named `c{i}`.
+fn catalog_defs(schema: &SchemaDescriptor) -> Vec<CatalogColumn> {
+    column_defs(schema).map(Into::into).collect()
 }
 
-fn descriptor((types, nullables, pk): &Cols) -> SchemaDescriptor {
-    let cols: Vec<SchemaColumn> = types
-        .iter()
-        .zip(nullables)
-        .map(|(&tc, &nullable)| SchemaColumn::new(tc, nullable))
-        .collect();
-    SchemaDescriptor::new(&cols, pk)
+/// The client's schema for `schema`, named `c{i}`.
+fn client_schema(schema: &SchemaDescriptor) -> gnitz_core::Schema {
+    gnitz_core::Schema {
+        columns: column_defs(schema).collect(),
+        pk_cols: schema.pk_cols().to_vec(),
+    }
 }
 
-/// The catalog's column records, named `c{i}`.
-fn catalog_defs((types, nullables, _): &Cols) -> Vec<CatalogColumn> {
-    types
+fn column_defs(schema: &SchemaDescriptor) -> impl Iterator<Item = ColumnDef> + '_ {
+    schema.columns[..schema.num_columns()]
         .iter()
-        .zip(nullables)
         .enumerate()
-        .map(|(i, (&tc, &nullable))| ColumnDef::new(format!("c{i}"), tc, nullable).into())
-        .collect()
-}
-
-/// The client's schema, named `c{i}`.
-fn client_schema((types, nullables, pk): &Cols) -> gnitz_core::Schema {
-    let columns = types
-        .iter()
-        .zip(nullables)
-        .enumerate()
-        .map(|(i, (&tc, &nullable))| ColumnDef::new(format!("c{i}"), tc, nullable))
-        .collect();
-    gnitz_core::Schema { columns, pk_cols: pk.clone() }
+        .map(|(i, c)| ColumnDef::new(format!("c{i}"), c.type_code, c.nullable))
 }
 
 fn assert_descriptor_eq(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Result<(), TestCaseError> {
@@ -116,19 +61,19 @@ fn assert_descriptor_eq(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Result<()
 proptest! {
     /// Catalog encoder → catalog decoder.
     #[test]
-    fn schema_roundtrip_catalog_codec(cols in arb_schema(MAX_PK_COLUMNS)) {
-        let wire = CatalogRecord::new(&cols.2, &catalog_defs(&cols)).bytes;
+    fn schema_roundtrip_catalog_codec(schema in arb_schema(MAX_PK_COLUMNS)) {
+        let wire = CatalogRecord::new(schema.pk_cols(), &catalog_defs(&schema)).bytes;
         let decoded = decode_schema_block(&wire)
             .expect("decode must succeed for any valid schema");
-        assert_descriptor_eq(&descriptor(&cols), &decoded)?;
+        assert_descriptor_eq(&schema, &decoded)?;
     }
 
     /// A record the catalog admits for a relation — names and hidden flags free
     /// to differ — decodes to exactly what decoding it would give.
     #[test]
-    fn an_admitted_record_decodes_as_itself(cols in arb_schema(MAX_PK_COLUMNS), hidden in any::<bool>()) {
-        let catalog = CatalogRecord::new(&cols.2, &catalog_defs(&cols));
-        let mut client = client_schema(&cols);
+    fn an_admitted_record_decodes_as_itself(schema in arb_schema(MAX_PK_COLUMNS), hidden in any::<bool>()) {
+        let catalog = CatalogRecord::new(schema.pk_cols(), &catalog_defs(&schema));
+        let mut client = client_schema(&schema);
         for c in &mut client.columns {
             c.name = format!("renamed_{}", c.name);
             c.is_hidden = hidden;
@@ -147,7 +92,6 @@ proptest! {
         a in arb_schema(gnitz_wire::PK_LIST_MAX_COLS),
         b in arb_schema(gnitz_wire::PK_LIST_MAX_COLS),
     ) {
-        let (a, b) = (descriptor(&a), descriptor(&b));
         let flipped: Vec<SchemaColumn> = a.columns[..a.num_columns()]
             .iter()
             .enumerate()

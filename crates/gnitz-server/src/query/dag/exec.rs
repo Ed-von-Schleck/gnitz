@@ -35,8 +35,8 @@ pub(crate) enum Drive {
 fn relay(host: &mut impl DriveHost, view_id: u64, batch: Cow<'_, Batch>, how: Option<&Relay>, fold: bool) -> Batch {
     match how {
         None => batch.into_owned(),
-        Some(Relay::Broadcast) => host.exchange(view_id, batch, None, fold),
-        Some(Relay::Round(p)) => host.exchange(view_id, batch, Some(p), fold),
+        Some(Relay::Broadcast) => host.exchange(view_id, batch, &ScatterPlan::broadcast(), fold),
+        Some(Relay::Round(p)) => host.exchange(view_id, batch, p, fold),
         Some(Relay::Share(p)) => {
             let slot = host.parts().1.slot();
             p.share(&batch, slot)
@@ -196,7 +196,7 @@ pub(crate) fn drive(host: &mut impl DriveHost, what: Drive, delta: Batch) -> Res
                 Some(held) if !held.is_empty() => {
                     // The held batch's schema: the union is certified under it.
                     let schema = *held.schema();
-                    ops::op_union(held, &out, &schema)
+                    algebra::op_union(held, &out, &schema)
                 }
                 _ => out,
             };

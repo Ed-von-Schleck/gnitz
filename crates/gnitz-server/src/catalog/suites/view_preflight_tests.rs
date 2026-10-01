@@ -52,7 +52,7 @@ fn test_preflight_compile_verdict() {
         &mut engine,
         base_tid,
         "vok",
-        &pred_cmp_blob(gnitz_expr::CmpOp::Lt, 1, 100),
+        &cmp_const(gnitz_expr::CmpOp::Lt, 1, 100).to_blob_bytes(),
     );
     assert!(
         crate::query::preflight_compile(&engine.registry, ok_vid).is_ok(),
@@ -123,7 +123,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
         &mut engine,
         base_tid,
         "vw",
-        &pred_cmp_blob(gnitz_expr::CmpOp::Lt, 1, 100),
+        &cmp_const(gnitz_expr::CmpOp::Lt, 1, 100).to_blob_bytes(),
     );
 
     // The replacement's own rows must exist before its VIEW_TAB row is checked.
@@ -132,7 +132,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
         &mut engine,
         new_vid,
         base_tid,
-        &pred_cmp_blob(gnitz_expr::CmpOp::Lt, 1, 50),
+        &cmp_const(gnitz_expr::CmpOp::Lt, 1, 50).to_blob_bytes(),
     );
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     engine.write_column_records(new_vid, &cols).unwrap();
@@ -173,7 +173,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
         &mut engine,
         base_tid,
         "vw",
-        &pred_cmp_blob(gnitz_expr::CmpOp::Lt, 1, 100),
+        &cmp_const(gnitz_expr::CmpOp::Lt, 1, 100).to_blob_bytes(),
     );
     let old_dir = relation_dir(&dir, old_vid);
 
@@ -187,7 +187,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
         &mut engine,
         new_vid,
         base_tid,
-        &pred_cmp_blob(gnitz_expr::CmpOp::Lt, 1, 50),
+        &cmp_const(gnitz_expr::CmpOp::Lt, 1, 50).to_blob_bytes(),
     );
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     engine.write_column_records(new_vid, &cols).unwrap();

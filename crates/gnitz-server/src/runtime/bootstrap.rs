@@ -27,9 +27,9 @@ use crate::runtime::w2m::{self, SalWake, W2mReceiver, W2mWriter, BOOT_READY_REQU
 use crate::runtime::wire as ipc;
 use crate::runtime::worker::WorkerProcess;
 use gnitz_store::relation::{Relation, Residency};
-use gnitz_store::schema::SchemaDescriptor;
-use gnitz_store::schema::Slot;
-use gnitz_store::storage::Batch;
+use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::SchemaDescriptor;
+use gnitz_zset::schema::Slot;
 
 // ---------------------------------------------------------------------------
 // SAL recovery: both drivers below read the log through `sal::zone::CommittedTail`
@@ -154,7 +154,6 @@ fn recover_from_sal(
     // previously-used epoch, so every group a walk sees carries the same width.
     let mut replayed: u32 = 0;
     let mut resliced_from: Option<u32> = None;
-    let mut rows: Vec<Vec<u32>> = Vec::new();
     for msg in tail.groups().filter(|m| m.kind == SalMessageKind::Push) {
         let tid = msg.target_id;
         // The catalog's schema, not the wire's: only the catalog stamps the
@@ -177,9 +176,7 @@ fn recover_from_sal(
                 // The write path's own router, so what survives is exactly what the master
                 // would have written to this rank's slot. It reads only weights and PK
                 // bytes, so it cuts before the widening below.
-                let slots =
-                    gnitz_store::storage::route_rows_by_pk(&batch.as_mem_batch(), &schema, &mut rows, slot.of as usize);
-                batch.ascending_subset(&slots[slot.rank as usize])
+                gnitz_zset::algebra::ScatterPlan::native(&schema).share(&batch, slot)
             } else {
                 batch
             };

@@ -2,15 +2,15 @@
 //! circuit recorded, over the indexes the catalog holds now.
 
 use super::*;
-use gnitz_store::read::SourceCursor;
 use gnitz_wire::{key_image, Cut, KeyRange, PkColList};
+use gnitz_zset::repr::SourceCursor;
 
 /// A `(id U64 PK | val I64)` base of 200 rows at `val = id * 10`, indexed on
 /// `val`, and an identity view over it carrying `bound`. Returns
 /// `(engine, base tid, view id)`.
 fn fixture(name: &str, bound: Option<KeyRange>) -> (CatalogEngine, u64, u64) {
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
-    let (mut engine, tid) = ingest_fixture(name, &cols, 200, 1, |bb, id| bb.put_u64(id * 10));
+    let (mut engine, tid) = ingest_fixture(name, &cols, 200, |bb, id| bb.put_u64(id * 10));
     engine.create_index("public.t", &["val"], false).unwrap();
 
     let vid = engine.allocate_ids(1).unwrap();

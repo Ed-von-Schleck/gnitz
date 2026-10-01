@@ -4,13 +4,13 @@
 //! An arm resolves its operands, asks the operator's own constructor for its
 //! artifact, and pushes an instruction into a fresh register. The artifacts —
 //! output schemas, probes, packers, plans — and the guards a client-supplied
-//! circuit clears to get one belong to `gnitz-store`, beside the kernels that
+//! circuit clears to get one belong to `gnitz-zset`, beside the kernels that
 //! read them.
 
 use super::*;
 use crate::query::vm::{BakedReduce, BakedTopN, Op, ProgramBuilder};
-use gnitz_store::ops::JoinPlan;
 use gnitz_store::relation::StateLayout;
+use gnitz_zset::stream::JoinPlan;
 
 // ---------------------------------------------------------------------------
 // EmitCtx — the per-plan build state every emit arm works against
@@ -151,7 +151,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
         gnitz_wire::OpNode::Union => {
             let (in_a, in_b) = ctx.binary_delta_in(nid)?;
             let out_schema =
-                gnitz_store::ops::union_nullability_merge(&ctx.prog.schema_of(in_a), &ctx.prog.schema_of(in_b))?;
+                gnitz_zset::algebra::union_nullability_merge(&ctx.prog.schema_of(in_a), &ctx.prog.schema_of(in_b))?;
             Ok(OutReg::Delta(ctx.prog.push(in_a, out_schema, Op::Union { in_b })))
         }
 
@@ -174,8 +174,8 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             let in_reg = ctx.unary_delta_in(nid)?;
             let in_schema = ctx.prog.schema_of(in_reg);
             let plan = match ctx.reads_partials(nid) {
-                true => gnitz_store::ops::TopNPlan::combine(&in_schema, order, *limit, *offset)?,
-                false => gnitz_store::ops::TopNPlan::from_wire(&in_schema, group_cols, order, *limit, *offset)?,
+                true => gnitz_zset::stream::TopNPlan::combine(&in_schema, order, *limit, *offset)?,
+                false => gnitz_zset::stream::TopNPlan::from_wire(&in_schema, group_cols, order, *limit, *offset)?,
             };
             Ok(OutReg::Delta(push_topn(ctx, nid, FUNNEL_TOPN, in_reg, plan)))
         }
@@ -230,7 +230,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
         gnitz_wire::OpNode::NullExtend { type_codes, nulls_first } => {
             let in_reg = ctx.unary_delta_in(nid)?;
             let out_schema =
-                gnitz_store::ops::null_extend_output_schema(&ctx.prog.schema_of(in_reg), type_codes, *nulls_first)?;
+                gnitz_zset::algebra::null_extend_output_schema(&ctx.prog.schema_of(in_reg), type_codes, *nulls_first)?;
             let op = Op::NullExtend { nulls_first: *nulls_first };
             Ok(OutReg::Delta(ctx.prog.push(in_reg, out_schema, op)))
         }
@@ -275,8 +275,8 @@ fn emit_reduce(
     let in_schema = ctx.prog.schema_of(in_reg);
     let seeds_ground = global_ground && owns_ground(ctx, nid)?;
     let plan = match ctx.reads_partials(nid) {
-        true => gnitz_store::ops::ReducePlan::combine(&in_schema, agg, seeds_ground)?,
-        false => gnitz_store::ops::ReducePlan::from_wire(&in_schema, group_cols, agg, seeds_ground)?,
+        true => gnitz_zset::stream::ReducePlan::combine(&in_schema, agg, seeds_ground)?,
+        false => gnitz_zset::stream::ReducePlan::from_wire(&in_schema, group_cols, agg, seeds_ground)?,
     };
     Ok(OutReg::Delta(push_reduce(ctx, nid, FUNNEL_REDUCE, in_reg, plan)))
 }
@@ -291,7 +291,7 @@ fn owns_ground(ctx: &EmitCtx, nid: NodeId) -> Result<bool, String> {
         }
         _ if ctx.self_contained => Ok(true),
         gnitz_wire::OpNode::ExchangeShard { .. } => {
-            Ok(slot.rank as usize == gnitz_store::schema::ground_owner(slot.of as usize))
+            Ok(slot.rank as usize == gnitz_zset::schema::ground_owner(slot.of as usize))
         }
         _ => Err("reduce: a global aggregate over a partitioned input with no exchange".into()),
     }
@@ -310,17 +310,16 @@ fn push_reduce(
     nid: NodeId,
     [trace_kind, index_kind]: StateKinds,
     in_reg: DeltaReg,
-    plan: gnitz_store::ops::ReducePlan,
+    plan: gnitz_zset::stream::ReducePlan,
 ) -> DeltaReg {
-    let out_schema = plan.shape.output_schema;
+    let out_schema = *plan.output_schema();
     let out_trace = ctx.declare_child(trace_kind, nid, out_schema);
     // One table per reduce, serving every MIN/MAX of it — so per-aggregate entries
     // share a table_id, scratch dir and compaction namespace and cannot collide on
     // a memory-pressure flush.
     let avi_table = plan
-        .avi
-        .as_ref()
-        .map(|bake| ctx.declare_child(index_kind, nid, bake.schema));
+        .index_schema()
+        .map(|schema| ctx.declare_child(index_kind, nid, *schema));
     let baked = Box::new(BakedReduce::new(plan, avi_table));
     ctx.prog.push(in_reg, out_schema, Op::Reduce { out_trace, plan: baked })
 }
@@ -331,7 +330,7 @@ fn push_topn(
     nid: NodeId,
     [trace_kind, index_kind]: StateKinds,
     in_reg: DeltaReg,
-    plan: gnitz_store::ops::TopNPlan,
+    plan: gnitz_zset::stream::TopNPlan,
 ) -> DeltaReg {
     let out_schema = plan.output_schema;
     let out_trace = ctx.declare_child(trace_kind, nid, out_schema);
@@ -348,10 +347,10 @@ fn emit_partial(ctx: &mut EmitCtx, consumer: NodeId) -> Result<Option<DeltaReg>,
     let in_reg = ctx.unary_delta_in(shard)?;
     let in_schema = ctx.prog.schema_of(in_reg);
     Ok(match ctx.loaded.op(consumer) {
-        gnitz_wire::OpNode::Reduce { agg, .. } => gnitz_store::ops::ReducePlan::partial(&in_schema, agg)?
+        gnitz_wire::OpNode::Reduce { agg, .. } => gnitz_zset::stream::ReducePlan::partial(&in_schema, agg)?
             .map(|plan| push_reduce(ctx, shard, PARTIAL, in_reg, plan)),
         gnitz_wire::OpNode::TopN { order, limit, offset, .. } => {
-            let plan = gnitz_store::ops::TopNPlan::partial(&in_schema, order, *limit, *offset)?;
+            let plan = gnitz_zset::stream::TopNPlan::partial(&in_schema, order, *limit, *offset)?;
             Some(push_topn(ctx, shard, PARTIAL, in_reg, plan))
         }
         _ => unreachable!("`global_split` names only a Reduce or a TopN"),

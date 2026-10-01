@@ -2,8 +2,8 @@
 //! directions, and the unique secondary indexes a write must check.
 
 use super::*;
-use gnitz_store::schema::KeySpec;
 use gnitz_wire::PkColList;
+use gnitz_zset::schema::KeySpec;
 
 /// Every constraint on one table whose validation reads committed state.
 pub(crate) struct RowConstraints {

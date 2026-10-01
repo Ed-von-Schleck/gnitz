@@ -1,9 +1,10 @@
 //! The ingestion pipeline: unique-PK enforcement, store + secondary-index
 //! application, delta capture, and the flush / checkpoint table collection.
 
+use super::delta::delta_round_prefix;
 use super::{Relation, RelationKind, RelationRegistry, SecondaryIndex, Store};
-use crate::schema::write_delta_key;
-use crate::storage::{Batch, StorageError, Table};
+use crate::storage::Table;
+use gnitz_zset::repr::{Batch, StorageError};
 
 /// `GNITZ_INJECT_INGEST_APPLY_ERROR=store|index`: report `Err(Io)` from the
 /// matching ingest below, which has already run — so what fires is the error
@@ -125,16 +126,15 @@ impl RelationRegistry {
             RelationKind::View(_) => batch.into_consolidated(),
             RelationKind::SystemCatalog => batch,
         };
-        if effective.count == 0 {
+        if effective.is_empty() {
             return Ok(needed.then_some(effective));
         }
 
-        let pending = entry.delta.as_deref().zip(round).map(|(feed, r)| {
-            let mut stamped = effective.rekeyed(feed.schema(), |src, dst| write_delta_key(r, src, dst));
-            // One round's keys share their prefix, so the order holds.
-            stamped.inherit_layout(&effective);
-            (stamped, r)
-        });
+        let pending = entry
+            .delta
+            .as_deref()
+            .zip(round)
+            .map(|(feed, r)| (effective.with_key_prefix(feed.schema(), &delta_round_prefix(r)), r));
 
         for ix in entry.indexes.iter_mut() {
             let cols = ix.cols;

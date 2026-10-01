@@ -4,8 +4,8 @@ use crate::runtime::test_support::try_poll_once;
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{WireData, WireMsg};
 use crate::test_support::{make_batch, make_schema_u64_i64, weighted_rows};
-use gnitz_store::storage::Batch;
 use gnitz_wire::WireStatus;
+use gnitz_zset::repr::Batch;
 
 /// A scan lease over `n` workers' fresh rings, with each ring's writer.
 fn scan_lease(n: usize) -> (Rc<Reactor>, TrainLease, Vec<W2mWriter>) {

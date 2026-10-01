@@ -19,9 +19,9 @@ mod support;
 use gnitz_core::{ClientError, GnitzClient, MirrorError, PollOutcome, PollResult, Schema};
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_sql::GnitzSqlError;
-use gnitz_store_testkit::{assert_child_ok, run_test_in_child, CHILD_OK};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::WireStatus;
+use gnitz_zset_testkit::{assert_child_ok, run_test_in_child, CHILD_OK};
 use support::common::{block_copy, has_copy, has_manifest, manifest_path, unblock_copy};
 use support::{canonical, canonical_rows, cost, differential, query, sql, Answer, Reply};
 

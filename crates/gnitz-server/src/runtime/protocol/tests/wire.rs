@@ -1,9 +1,9 @@
 use crate::runtime::wire::{decode_client_frame, decode_sal_slot, unknown, WireData, WireMsg, WireSchema};
 use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, make_string_batch, weighted_rows};
-use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, BatchBuilder, Layout};
 use gnitz_wire::control::{encode_frame_head, frame_head_size, peek_control_block, ControlHeader};
 use gnitz_wire::{ClientVerb, TypeCode, WireFlags, WireStatus};
+use gnitz_zset::repr::{Batch, BatchBuilder, Layout};
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
 /// The source batch and the rows of it `data` sends, in the order it sends them.
 fn sent(data: WireData<'_>) -> Option<(&Batch, Vec<usize>)> {

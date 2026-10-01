@@ -21,10 +21,10 @@ use super::train::drain_rows;
 use crate::catalog::{FkEdge, RowConstraints};
 use crate::runtime::orchestration::TxnFamily;
 use gnitz_expr::{ColumnLocator, SchemaFacts};
-use gnitz_store::schema::key::PkBuf;
-use gnitz_store::schema::KeySpec;
-use gnitz_store::storage::MemBatch;
 use gnitz_wire::{PkColList, PkKeys, ProbeKeyspace, WireConflictMode, WireProbeMode, WireStatus};
+use gnitz_zset::repr::MemBatch;
+use gnitz_zset::schema::key::PkBuf;
+use gnitz_zset::schema::KeySpec;
 
 // ---------------------------------------------------------------------------
 // Pipelined validation checks
@@ -86,7 +86,7 @@ impl PipelinedCheck {
 /// The PK-only image of `schema`, routed to where its keys are held; every
 /// worker holds a replicated source, so its probe spreads over the full PK.
 fn probe_schema(schema: &SchemaDescriptor) -> SchemaDescriptor {
-    let pk_only = gnitz_store::schema::project_schema(schema, &[]).expect("a PK-only projection fits MAX_COLUMNS");
+    let pk_only = gnitz_zset::schema::project_schema(schema, &[]).expect("a PK-only projection fits MAX_COLUMNS");
     match schema.placement() {
         Placement::Replicated => pk_only,
         p => pk_only.with_placement(p),
@@ -664,7 +664,7 @@ fn plan_unique_checks<'a>(
             // Also the order the check batch is emitted in: the worker probes
             // it with one cursor, and `advance_to` gallops in place only on a
             // strictly greater key.
-            gnitz_store::schema::key::sort_indices(&spans, stride, &mut order);
+            gnitz_zset::schema::key::sort_indices(&spans, stride, &mut order);
             // `surviving` yields each PK once, so an adjacent-equal pair comes
             // from two different rows: this IS the in-bundle duplicate rule. It
             // must fire whatever committed state holds, so it stays above the
@@ -858,7 +858,7 @@ async fn resolve_parent_deltas(
         let pk_only = probe_schema(&schema);
         // The constructor the worker's projection uses, so a matching reply
         // validates by construction.
-        let reply = gnitz_store::schema::project_schema(&schema, &[pcol as u32])
+        let reply = gnitz_zset::schema::project_schema(&schema, &[pcol as u32])
             .expect("a one-column projection fits MAX_COLUMNS");
         // The reply's one payload column, off the projected schema rather than
         // the parent's — and not column 0, since `project_schema` keeps the PK

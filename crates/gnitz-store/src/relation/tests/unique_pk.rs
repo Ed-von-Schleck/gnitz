@@ -1,9 +1,9 @@
 use super::enforce_unique_pk;
-use crate::schema::TypeCode;
 use crate::test_support::{
     make_batch_bytes, make_batch_opk, make_schema_pk_u64_payload_string, opk_pk, payload0_i64, pk_payload_schema,
     scratch_table, zset_of,
 };
+use gnitz_wire::TypeCode;
 
 /// `(key index, weight, payload)`.
 type Row = (usize, i64, i64);
@@ -104,12 +104,12 @@ fn enforce_unique_pk_holds_at_every_pk_shape() {
             let what = format!("{name}: {step}");
             let eff = enforce_unique_pk(&pt, batch(push));
             assert_eq!(zset_of(&eff, &schema), zset_of(&batch(want), &schema), "{what}");
-            assert_eq!(eff.count, want.len(), "{what}: effective row count");
+            assert_eq!(eff.len(), want.len(), "{what}: effective row count");
             pt.ingest_borrowed_batch(&eff).unwrap();
             for &(i, net, payload) in live {
                 let (w, row) = pt.live_row_at(&k[i]);
                 assert_eq!(
-                    (w, row.as_ref().map(|r| payload0_i64(&r.run, r.row))),
+                    (w, row.as_ref().map(|r| r.source()).map(|(src, i)| payload0_i64(src, i))),
                     (net, payload),
                     "{what}: key {i}"
                 );
@@ -143,5 +143,5 @@ fn enforce_unique_pk_keeps_heap_strings_intact() {
             &schema
         ),
     );
-    assert_eq!(eff.count, 3);
+    assert_eq!(eff.len(), 3);
 }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use gnitz_core::{GnitzClient, Schema, ZSetBatch};
 use gnitz_sql::SqlResult;
-use gnitz_store_testkit::{row_key, RowKey};
+use gnitz_zset_testkit::{row_key, RowKey};
 
 pub mod common;
 

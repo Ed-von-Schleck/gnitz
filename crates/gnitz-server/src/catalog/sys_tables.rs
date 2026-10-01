@@ -11,8 +11,6 @@ use super::{CatalogColumn, RelFacts};
 use gnitz_expr::RowSource;
 use gnitz_expr::{payload_str, payload_string, payload_u64};
 use gnitz_store::relation::RelationKind;
-use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, BatchBuilder};
 use gnitz_wire::sys_rows::{
     write_col_tab_row, write_schema_tab_row, write_table_tab_row, ColTabRow, SchemaTabRow, SysRowSink, TableTabRow,
 };
@@ -24,6 +22,8 @@ use gnitz_wire::{
     RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY,
     VIEWTAB_PAY_DELTA, VIEWTAB_PAY_FLAGS, VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX,
 };
+use gnitz_zset::repr::{Batch, BatchBuilder};
+use gnitz_zset::schema::{Placement, SchemaColumn, SchemaDescriptor};
 
 // ---------------------------------------------------------------------------
 // Constants

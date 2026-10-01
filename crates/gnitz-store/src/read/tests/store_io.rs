@@ -1,32 +1,20 @@
 use super::*;
-use crate::relation::{IndexClaim, RelationSpec, StoreConfig};
-use crate::schema::{Slot, TypeCode};
-use crate::storage::BatchBuilder;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, opk_pk, payload0_i64, pk_only_schema};
+use crate::test_support::{
+    make_batch_raw, make_schema_u64_i64, opk_pk, payload0_i64, pk_only_schema, relation_fixture, RelationFixture, TID,
+};
+use gnitz_wire::TypeCode;
 use gnitz_wire::{key_image, Cut, PkColList};
-
-/// The base relation every test below reads.
-const TID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
+use gnitz_zset::repr::BatchBuilder;
 
 const NBASE: u64 = 200;
 
 /// A `(id U64 PK | val I64)` base of `NBASE` rows at `val = val_of(id)`, indexed
 /// on `val`.
-fn fixture(name: &str, val_of: impl Fn(u64) -> i64) -> RelationRegistry {
+fn fixture(val_of: impl Fn(u64) -> i64) -> RelationFixture {
     let schema = make_schema_u64_i64();
-    let mut registry = RelationRegistry::new(
-        &crate::test_support::scratch_dir("store_io", name),
-        Slot::SOLO,
-        StoreConfig::default(),
-    );
-    let kind = RelationKind::BaseTable;
-    registry.register(RelationSpec { id: TID, kind, schema }).unwrap();
-    registry
-        .add_index(TID, IndexClaim::Index { id: TID + 1, unique: false }, &[1])
-        .unwrap();
     let rows: Vec<_> = (0..NBASE).map(|id| (id, 1, val_of(id))).collect();
-    registry.ingest(TID, make_batch_raw(&schema, &rows)).unwrap();
-    registry
+    let rows = make_batch_raw(&schema, &rows);
+    relation_fixture(RelationKind::BaseTable, schema, &[1], rows)
 }
 
 /// `v`'s key image in the I64 `val` column.
@@ -71,7 +59,7 @@ fn ids(ids: impl IntoIterator<Item = u128>) -> Vec<(u128, i64)> {
 /// at every chunk size.
 #[test]
 fn a_selective_range_walks_the_index_at_every_chunk_size() {
-    let r = fixture("walk_chunks", |id| id as i64 * 10);
+    let r = fixture(|id| id as i64 * 10);
     for chunk in [1, 3, 7, 64, usize::MAX] {
         let (mut cur, unapplied) = r.open_bound(TID, val_range(500, 600)).unwrap();
         assert!(matches!(cur, SourceCursor::Bounded(_)), "chunk {chunk}");
@@ -86,7 +74,7 @@ fn a_selective_range_walks_the_index_at_every_chunk_size() {
 /// cursor.
 #[test]
 fn a_walk_reseeks_backward_from_an_exhausted_base_cursor() {
-    let r = fixture("walk_backward", |id| (NBASE - id) as i64 * 10);
+    let r = fixture(|id| (NBASE - id) as i64 * 10);
     let (mut cur, _) = r.open_bound(TID, val_range(10, 110)).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)));
     assert_eq!(drain_all(&mut cur, 3), ids(190..200));
@@ -97,7 +85,7 @@ fn a_walk_reseeks_backward_from_an_exhausted_base_cursor() {
 /// updated out of it is gone.
 #[test]
 fn a_walk_follows_the_bases_updates() {
-    let mut r = fixture("walk_updates", |id| id as i64 * 10);
+    let mut r = fixture(|id| id as i64 * 10);
     let updates = [
         (55, -1, 550),
         (10, -1, 100),
@@ -118,7 +106,7 @@ fn a_walk_follows_the_bases_updates() {
 /// source is a full scan and the range comes back unapplied, for the caller's filter.
 #[test]
 fn a_range_walks_the_index_only_within_the_selectivity_gate() {
-    let mut r = fixture("walk_gate", |id| id as i64 * 10);
+    let mut r = fixture(|id| id as i64 * 10);
     let point = ReadBound::Range(KeyRange::point(PkColList::from_slice(&[1]), &[], img(730)));
     let inverted = ReadBound::Range(KeyRange::new(
         PkColList::from_slice(&[1]),
@@ -154,15 +142,6 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
 #[test]
 fn a_pk_prefix_range_walks_the_store_over_a_matching_index() {
     let schema = pk_only_schema(&[TypeCode::U64, TypeCode::U64]);
-    let mut r = RelationRegistry::new(
-        &crate::test_support::scratch_dir("store_io", "pk_prefix"),
-        Slot::SOLO,
-        StoreConfig::default(),
-    );
-    let kind = RelationKind::BaseTable;
-    r.register(RelationSpec { id: TID, kind, schema }).unwrap();
-    r.add_index(TID, IndexClaim::Index { id: TID + 1, unique: false }, &[0])
-        .unwrap();
     let mut bb = BatchBuilder::new(schema);
     for a in 0..8u128 {
         for b in 0..3u128 {
@@ -170,7 +149,7 @@ fn a_pk_prefix_range_walks_the_store_over_a_matching_index() {
             bb.end_row();
         }
     }
-    r.ingest(TID, bb.finish()).unwrap();
+    let r = relation_fixture(RelationKind::BaseTable, schema, &[0], bb.finish());
 
     let range = KeyRange::point(PkColList::from_slice(&[0]), &[], 5);
     let (mut cur, unapplied) = r.open_bound(TID, ReadBound::Range(range)).unwrap();
@@ -183,7 +162,7 @@ fn a_pk_prefix_range_walks_the_store_over_a_matching_index() {
 /// unregistered id names no relation: both are refused.
 #[test]
 fn open_bound_refuses_a_foreign_key_stride_and_an_unknown_relation() {
-    let r = fixture("refusals", |id| id as i64);
+    let r = fixture(|id| id as i64);
     let wide = ReadBound::PkSet(PkKeys::from_keys(16, [&[0u8; 16][..]]));
     assert!(r.open_bound(TID, wide).is_err());
     assert!(r.open_bound(999_999, ReadBound::None).is_err());
@@ -193,7 +172,7 @@ fn open_bound_refuses_a_foreign_key_stride_and_an_unknown_relation() {
 /// the referenced column, and nothing for a key with no row.
 #[test]
 fn gather_bytes_projects_each_live_parent_to_its_referenced_column() {
-    let mut r = fixture("gather", |id| id as i64 * 10);
+    let mut r = fixture(|id| id as i64 * 10);
     let schema = make_schema_u64_i64();
     r.ingest(TID, make_batch_raw(&schema, &[(5, -1, 50)])).unwrap();
     let keys: Vec<_> = [2, 5, 7, 300].map(|k| opk_pk(&schema, &[k])).to_vec();

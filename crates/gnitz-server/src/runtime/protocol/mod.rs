@@ -1,4 +1,4 @@
-//! L7 protocol — the IPC wire format, the shared append-only log (SAL), the
+//! The protocol — the IPC wire format, the shared append-only log (SAL), the
 //! lock-free worker→master ring (`w2m`), which also carries the worker's park on
 //! the SAL, and the worker↔worker exchange `mesh`.
 //!

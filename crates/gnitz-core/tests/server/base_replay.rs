@@ -15,7 +15,7 @@ fn acked_pushes_survive_a_worker_counter_ahead_of_the_zone_seed() {
     let keys: Vec<u64> = (0u64..)
         .filter(|&k| {
             let opk = PkColumn::from_natives(&schema, [k as u128]);
-            gnitz_store::schema::worker_for_pk_bytes(opk.get_bytes(0), WORKERS) == 1
+            gnitz_zset::schema::worker_for_pk_bytes(opk.get_bytes(0), WORKERS) == 1
         })
         .take(420)
         .collect();

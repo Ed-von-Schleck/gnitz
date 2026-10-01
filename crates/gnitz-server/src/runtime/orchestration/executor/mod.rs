@@ -31,10 +31,10 @@ use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, ReadG
 use crate::runtime::sal::{DirectGroup, GroupTargets, SalMessageKind};
 use crate::runtime::wire as ipc;
 use gnitz_store::relation::{Relation, RelationKind};
-use gnitz_store::storage::Batch;
 use gnitz_wire::control::DecodedControl;
 use gnitz_wire::txn_frame::DeltaPollItem;
 use gnitz_wire::{ReadBound, ReadSpec, WireFault, WireStatus};
+use gnitz_zset::repr::Batch;
 
 const TICK_COALESCE_ROWS: usize = 10_000;
 

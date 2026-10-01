@@ -4,8 +4,8 @@
 use std::num::NonZeroU64;
 
 use gnitz_core::{DeltaCursor, MirrorError};
-use gnitz_store::schema::SchemaDescriptor;
 use gnitz_wire::{decode_all, Reader, Writer};
+use gnitz_zset::schema::SchemaDescriptor;
 
 /// What one copy's registration fixed, and where its feed got to.
 #[derive(Debug, PartialEq, Eq)]
@@ -54,7 +54,7 @@ impl MirrorRecord {
 
 /// The engine descriptor a wire schema record denotes.
 pub(crate) fn descriptor_of_block(block: &[u8]) -> Result<SchemaDescriptor, MirrorError> {
-    gnitz_store::schema::decode_schema_block(block).map_err(|e| MirrorError::Engine(format!("schema record: {e}")))
+    gnitz_zset::schema::decode_schema_block(block).map_err(|e| MirrorError::Engine(format!("schema record: {e}")))
 }
 
 #[cfg(test)]

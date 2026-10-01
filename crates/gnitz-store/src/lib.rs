@@ -1,19 +1,25 @@
-//! GnitzDB's Z-set store: the columnar batch representation, the LSM, the DBSP
-//! operators, the relation registry and the `ReadSpec` executor.
+//! GnitzDB's Z-set store: the LSM that keeps a relation on disk, the relation
+//! registry and the `ReadSpec` executor.
 //!
-//! This is the half a **client** links. A host holding a mirrored view drives
-//! `relation` and `read` directly and links neither the circuit compiler, the
-//! DBSP VM, epoch execution nor the system-table catalog — all of which live in
-//! `gnitz-server`, the binary that depends on this crate. The seam is the crate
-//! graph, not a comment: nothing here can name anything there, and nothing links
-//! what is there.
+//! The Z-sets it stores — the schema, the columnar batch, the shard image, the
+//! cursor and every operator over them — are `gnitz-zset`, the kernel crate
+//! beneath this one. This crate owns their lifecycle: which runs a store holds,
+//! when they flush, compact and publish a manifest, which relations a process
+//! registered, and how one is read.
 //!
-//! The public module roots below are the API. They form a layer ladder,
-//! each naming only those beneath it — `tests/rungs.rs` states that table and
-//! enforces it. The submodules under each root are private; what a root
-//! re-exports is what it publishes, plus `schema::key`, named as a
-//! module. An item is `pub` because another crate names it;
-//! everything else is `pub(crate)`.
+//! This and the kernel are what a **client** links. A host holding a mirrored
+//! view drives `relation` and `read` directly and links neither the circuit
+//! compiler, the DBSP VM, epoch execution nor the system-table catalog — all of
+//! which live in `gnitz-server`, the binary that depends on this crate. The seam
+//! is the crate graph, not a comment: nothing here can name anything there, and
+//! nothing links what is there.
+//!
+//! The module roots below form a layer ladder, each naming only those beneath it
+//! — `tests/rungs.rs` states that table and enforces it. `relation` and `read`
+//! are the API; `storage`, the LSM under them, is reached only through a
+//! relation's stores. The submodules under each root are private; what a root
+//! re-exports is what it publishes. An item is `pub` because another crate
+//! names it; everything else is `pub(crate)`.
 //!
 //! There is no crate-root re-export façade: a type's rung is part of what its
 //! path says, and the root itself holds no name.
@@ -33,24 +39,14 @@
 #[macro_use]
 extern crate gnitz_foundation;
 
-pub mod ops;
 pub mod read;
 pub mod relation;
-pub mod schema;
-pub mod storage;
-
-#[cfg(test)]
-mod test_rng;
+mod storage;
 
 /// Tests no single module owns: the rung guard over the module roots above.
 #[cfg(test)]
 #[path = "tests/rungs.rs"]
 mod rung_tests;
 
-// `test_support::shared` is compiled here and again as `gnitz-store-testkit` —
-// from one source, which spells every path `gnitz_store::`. This alias is what
-// makes those paths resolve in this crate.
-#[cfg(test)]
-extern crate self as gnitz_store;
 #[cfg(test)]
 pub mod test_support;

@@ -115,7 +115,7 @@ fn next_yields_the_row_frames_and_releases_the_rest() {
     let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::ScanSpec);
     let schema = crate::test_support::make_schema_u64_i64();
     let rows = |pk| crate::test_support::make_batch(&schema, &[(pk, 1, 0)]);
-    let send = |w: usize, last, batch: Option<&gnitz_store::storage::Batch>| {
+    let send = |w: usize, last, batch: Option<&gnitz_zset::repr::Batch>| {
         let msg = crate::runtime::wire::WireMsg {
             flags: gnitz_wire::WireFlags::train_frame(last),
             data: batch.map_or(

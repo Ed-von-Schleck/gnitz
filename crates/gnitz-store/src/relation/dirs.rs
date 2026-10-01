@@ -11,8 +11,9 @@ use gnitz_foundation::posix_io::{create_dir, fsync_dir};
 use gnitz_wire::PkColList;
 
 use super::RelationRegistry;
-use crate::schema::Slot;
-use crate::storage::{manifest_path, read_at, read_intact, retire_store, StorageError};
+use crate::storage::{manifest_path, read_at, read_intact, retire_store};
+use gnitz_zset::repr::StorageError;
+use gnitz_zset::schema::Slot;
 
 /// What a child directory holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

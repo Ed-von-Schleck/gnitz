@@ -41,8 +41,8 @@ use std::rc::Rc;
 
 use crate::query::DagEngine;
 use gnitz_store::relation::{IndexClaim, Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
-use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, ReadCursor, StoredRow};
+use gnitz_zset::repr::{Batch, ReadCursor, StoredRow};
+use gnitz_zset::schema::{Placement, SchemaColumn, SchemaDescriptor};
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
 // The DDL_TXN driver's bundle decoders: it resolves each family once, carries
@@ -68,9 +68,9 @@ pub(in crate::catalog) use cache::{CatalogCacheSet, RelFacts};
 pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
 // Directory primitives the catalog consumes rather than owns.
 pub(in crate::catalog) use gnitz_store::relation::{lock_data_dir, DirLock};
-// `BatchBuilder` holds no catalog state and lives in `storage`; re-export it
-// for the catalog's row builders.
-pub(in crate::catalog) use gnitz_store::storage::BatchBuilder;
+// `BatchBuilder` holds no catalog state; re-exported for the catalog's row
+// builders.
+pub(in crate::catalog) use gnitz_zset::repr::BatchBuilder;
 // The generic payload-cell readers, for the submodules' `use super::*`.
 pub(in crate::catalog) use gnitz_expr::{payload_string, payload_u64};
 

@@ -1,9 +1,9 @@
 use super::fixtures::*;
 use super::*;
 use crate::test_support::{make_batch_u128, make_schema_u128_i64, zset_of};
-use gnitz_store::schema::SchemaColumn;
-use gnitz_store::storage::{BatchBuilder, Layout};
 use gnitz_wire::TypeCode;
+use gnitz_zset::repr::{BatchBuilder, Layout};
+use gnitz_zset::schema::SchemaColumn;
 
 /// An integrate runs after every instruction, so it takes its register from the
 /// instructions reading it — unless that register is the sink, which the epoch
@@ -75,7 +75,7 @@ fn a_register_read_at_net_weights_is_folded_when_written() {
     let pk = SchemaColumn::new(TypeCode::U128, false);
     let int = SchemaColumn::new(TypeCode::I64, false);
     let wide = SchemaDescriptor::new(&[pk, int, int], &[0]);
-    let map = ops::MapPlan::from_wire(&wide, &gnitz_wire::MapKind::Projection(vec![2])).unwrap();
+    let map = MapPlan::from_wire(&wide, &gnitz_wire::MapKind::Projection(vec![2])).unwrap();
     let narrow = *map.out_schema();
 
     let mut p = TestPlan::default();

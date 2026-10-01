@@ -1,18 +1,37 @@
-//! The catalog-level test helpers — the store-level ones are
-//! `gnitz-store-testkit`'s.
+//! The catalog-level test helpers — the batch-level ones are
+//! `gnitz-zset-testkit`'s.
 //!
 //! This file is compiled once, and only inside this crate, so it names
 //! crate-internals as `crate::` and widens no API — nothing links this crate.
 
 use crate::catalog::{CatalogColumn, CatalogEngine, SysFamily, PUBLIC_SCHEMA_ID};
 use gnitz_expr::{ColumnTable, SchemaFacts};
-use gnitz_store::storage::{Batch, BatchBuilder, ReadCursor};
 use gnitz_wire::sys_rows::{
     write_circuit_rows, write_idx_tab_row, write_schema_tab_row, write_table_tab_row, IdxTabRow, SchemaTabRow,
     SysRowSink, TableTabRow,
 };
 use gnitz_wire::Circuit;
 use gnitz_wire::{ColumnDef, TypeCode};
+use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
+
+/// A scratch directory for a test that needs a real on-disk tree, wiped at the
+/// start of the run so the previous same-user run self-cleans. `scope` names the
+/// subsystem, `name` the test.
+///
+/// The path is namespaced by `$USER` (pid if unset): `/tmp` is shared and
+/// sticky, so a directory left by a *different* user occupies the bare path
+/// forever — the start-of-test `remove_dir_all` cannot delete it (sticky bit)
+/// and `CatalogEngine::open` then fails EACCES creating subdirs under it.
+pub fn scratch_dir(scope: &str, name: &str) -> String {
+    let owner = std::env::var("USER").unwrap_or_else(|_| std::process::id().to_string());
+    let path = std::env::temp_dir()
+        .join(format!("gnitz_{scope}_test_{owner}_{name}"))
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let _ = std::fs::remove_dir_all(&path);
+    path
+}
 
 // ── Catalog column fixtures ─────────────────────────────────────────────────
 
@@ -173,7 +192,7 @@ impl crate::query::DriveHost for LocalDrive<'_> {
         &mut self,
         view_id: u64,
         _batch: std::borrow::Cow<'_, Batch>,
-        _plan: Option<&gnitz_store::ops::ScatterPlan>,
+        _plan: &gnitz_zset::algebra::ScatterPlan,
         _fold: bool,
     ) -> Batch {
         panic!("view {view_id} relayed: this host serves exchange-free circuits only");
@@ -329,7 +348,7 @@ pub fn seek_by_index_range(
     eq: &[u128],
     start: gnitz_wire::Cut,
     end: gnitz_wire::Cut,
-) -> Result<(Option<std::rc::Rc<Batch>>, gnitz_store::schema::SchemaDescriptor), gnitz_wire::WireFault> {
+) -> Result<(Option<std::rc::Rc<Batch>>, gnitz_zset::schema::SchemaDescriptor), gnitz_wire::WireFault> {
     let schema = engine.registry.relation_or_err(tid)?.schema();
     let range = gnitz_wire::KeyRange::new(gnitz_wire::PkColList::from_slice(cols), eq, start, end);
     let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::Range(range));
@@ -344,7 +363,7 @@ pub fn seek_by_index(
     tid: u64,
     cols: &[u32],
     natives: &[u128],
-) -> Result<(Option<std::rc::Rc<Batch>>, gnitz_store::schema::SchemaDescriptor), gnitz_wire::WireFault> {
+) -> Result<(Option<std::rc::Rc<Batch>>, gnitz_zset::schema::SchemaDescriptor), gnitz_wire::WireFault> {
     let schema = engine.registry.relation_or_err(tid)?.schema();
     let images: Vec<u128> = cols
         .iter()

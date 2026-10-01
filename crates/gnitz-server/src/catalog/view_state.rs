@@ -3,9 +3,9 @@
 //! wrappers that add what a caller cannot — the hydrator.
 
 use super::*;
-use gnitz_store::read::SourceCursor;
 use gnitz_store::relation::Residency;
 use gnitz_wire::ReadSpec;
+use gnitz_zset::repr::SourceCursor;
 use rustc_hash::FxHashSet;
 use std::rc::Rc;
 

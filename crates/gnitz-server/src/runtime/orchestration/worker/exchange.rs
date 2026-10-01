@@ -3,7 +3,7 @@
 //! SAL group arriving during that wait does.
 
 use super::*;
-use gnitz_store::ops::ScatterPlan;
+use gnitz_zset::algebra::ScatterPlan;
 use std::borrow::Cow;
 
 /// The worker as a drive's [`DriveHost`].
@@ -22,7 +22,7 @@ impl DriveHost for DagExchangeCtx<'_> {
         (&mut cat.dag, &mut cat.registry)
     }
 
-    fn exchange(&mut self, view_id: u64, batch: Cow<'_, Batch>, plan: Option<&ScatterPlan>, fold: bool) -> Batch {
+    fn exchange(&mut self, view_id: u64, batch: Cow<'_, Batch>, plan: &ScatterPlan, fold: bool) -> Batch {
         let (batch, all_drained) = self.worker.exchange(view_id, batch, plan, fold, self.own_drained);
         self.all_drained = all_drained;
         batch
@@ -38,7 +38,7 @@ impl WorkerProcess {
         &mut self,
         view_id: u64,
         batch: Cow<'_, Batch>,
-        plan: Option<&ScatterPlan>,
+        plan: &ScatterPlan,
         fold: bool,
         drained: bool,
     ) -> (Batch, bool) {

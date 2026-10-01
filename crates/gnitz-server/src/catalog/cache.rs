@@ -1,9 +1,9 @@
 use super::*;
 use gnitz_expr::payload_str;
-use gnitz_store::schema::decode_schema_block;
 use gnitz_wire::schema_block::check_same_types;
 use gnitz_wire::{RelDescriptorBlob, RelIndex};
 use gnitz_wire::{IDXTAB_PAY_NAME, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME};
+use gnitz_zset::schema::decode_schema_block;
 use rustc_hash::FxHashMap;
 use std::hash::Hash;
 

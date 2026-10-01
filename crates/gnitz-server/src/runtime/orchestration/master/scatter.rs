@@ -1,11 +1,10 @@
 //! Write-path fan-out: turns a pushed batch into a SAL group's per-worker
-//! payload over the table-key router `route_rows_by_pk`. Distinct from the
-//! exchange operator's routing (`ops::exchange`), which routes a *join/group*
-//! key over a derived schema.
+//! payload, routed by the relation's native `ScatterPlan`.
 
 use std::cell::RefCell;
 
-use gnitz_store::storage::{route_rows_by_pk, Batch};
+use gnitz_zset::algebra::ScatterPlan;
+use gnitz_zset::repr::Batch;
 
 use crate::runtime::sal::GroupData;
 use crate::runtime::wire::{WireData, WireSchema};
@@ -25,7 +24,7 @@ pub(crate) fn with_routed<R>(
 ) -> R {
     SCATTER_INDICES.with(|pool| {
         let mut pool = pool.borrow_mut();
-        let rows: &[Vec<u32>] = route_rows_by_pk(&batch.as_mem_batch(), relation.descriptor(), &mut pool, num_workers);
+        let rows = ScatterPlan::native(relation.descriptor()).route(batch, &mut pool, num_workers);
         let subs: Vec<Batch>;
         let data = match rows {
             [all] if all.len() == batch.len() => GroupData::Same(WireData::Whole(batch)),

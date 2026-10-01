@@ -1,9 +1,9 @@
 use super::*;
 use crate::query::compiler::fixtures::*;
 use crate::test_support::{make_schema_u64_i64, pk_payload_schema, scan_keyed, self_typed_slots};
-use gnitz_store::schema::{Placement, SchemaColumn};
-use gnitz_store::storage::BatchBuilder;
 use gnitz_wire::{Circuit, ComputeMap, JoinKind, KeyRange, NullKeys, PkColList, RangeRel, ReindexRole, TypeCode};
+use gnitz_zset::repr::BatchBuilder;
+use gnitz_zset::schema::{Placement, SchemaColumn};
 
 /// `derive`'s routing metadata, placed as a one-column-PK view.
 fn derive(c: Circuit, registry: &RelationRegistry) -> Result<ViewMeta, String> {

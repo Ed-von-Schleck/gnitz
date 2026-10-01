@@ -82,7 +82,7 @@ fn a_corrupt_source_body_fails_the_relayout_and_keeps_the_source_set() {
     ));
     assert!(std::path::Path::new(&shard).exists(), "the source shard survives");
     assert_eq!(
-        open_child(rel, 0, 1).full_scan().count,
+        open_child(rel, 0, 1).full_scan().len(),
         100,
         "the source set still reads whole"
     );

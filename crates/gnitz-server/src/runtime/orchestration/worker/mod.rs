@@ -16,10 +16,9 @@ use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{self as ipc};
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::{Relation, RelationRegistry};
-use gnitz_store::schema::key::PkBuf;
-use gnitz_store::schema::SchemaDescriptor;
-use gnitz_store::storage::Batch;
 use gnitz_wire::{WireFlags, WireStatus};
+use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::SchemaDescriptor;
 
 /// One dispatched request. Fully owned — a parked request must not borrow the
 /// SAL mapping, which an inline `Flush` resets.
@@ -365,22 +364,15 @@ impl WorkerProcess {
         let e = self.cat().registry.relation_or_err(owner_id)?;
         let (schema, mut handle) = (e.schema(), e.cursor());
         let dir = gnitz_store::relation::relation_dir(self.cat().registry.base_dir(), owner_id);
-        let (spec, idx_schema) = gnitz_store::schema::index_spec_and_schema(col_indices, &schema)?;
+        let (spec, idx_schema) = gnitz_zset::schema::index_spec_and_schema(col_indices, &schema)?;
         let frame_schema = crate::runtime::wire::unique_preflight_wire_schema(&idx_schema, col_indices.len());
 
         let stride = spec.key_size();
         let chunk_rows = self.cat().registry.scan_chunk_rows();
 
-        let mut sorter = gnitz_store::storage::SpillSort::new(&dir, stride, unique_preflight_spill_bytes());
-        let mut keybuf = PkBuf::zeroed(0);
+        let mut sorter = gnitz_zset::repr::SpillSort::new(&dir, stride, unique_preflight_spill_bytes());
         while let Some(chunk) = handle.drain_chunk(chunk_rows) {
-            let mb = chunk.as_mem_batch();
-            for row in 0..chunk.len() {
-                debug_assert_eq!(chunk.get_weight(row), 1, "a base table's consolidated row");
-                if spec.key_bytes(&mb, row, &mut keybuf) {
-                    sorter.push(keybuf.pk_bytes())?;
-                }
-            }
+            sorter.push_spans(&chunk, &spec)?;
         }
 
         let mut producer = sorter.finish()?;

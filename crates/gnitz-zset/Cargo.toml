@@ -1,0 +1,30 @@
+[package]
+name = "gnitz-zset"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gnitz-foundation = { path = "../gnitz-foundation" }
+gnitz-wire = { path = "../gnitz-wire" }
+gnitz-expr = { path = "../gnitz-expr" }
+xorf = { version = "0.13", default-features = false, features = ["binary-fuse"] }
+rustc-hash.workspace = true
+# `O_TMPFILE`, for the spill sort's nameless run file.
+libc.workspace = true
+# The UTF-8 check on a pushed block's STRING cells.
+simdutf8 = "0.1"
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+
+# Spelled out rather than `workspace = true`, which cannot be extended: this
+# crate publishes an API to the store and the server above it, so it also wants
+# `unreachable_pub` — allow-by-default, so `warnings = "deny"` does not imply it
+# — to make an over-wide `pub` inside a private module a compile error.
+[lints.rust]
+warnings = "deny"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

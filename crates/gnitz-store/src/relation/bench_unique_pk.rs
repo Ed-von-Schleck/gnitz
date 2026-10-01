@@ -2,10 +2,11 @@
 //! — one arm per push shape. Report `ns/row` and instructions per row.
 
 use super::enforce_unique_pk;
-use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, BatchBuilder, RecoverySource, StoreBudgets, Table};
-use crate::test_rng::Rng;
+use crate::storage::{RecoverySource, StoreBudgets, Table};
+use crate::test_support::Rng;
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64};
+use gnitz_zset::repr::{Batch, BatchBuilder};
+use gnitz_zset::schema::SchemaDescriptor;
 
 /// Rows every arm pushes, however it splits them.
 const TOTAL_ROWS: usize = 500_000;
@@ -146,7 +147,7 @@ fn unique_pk_bench() {
         let ((), instructions) = counter.measure(|| {
             for b in batches {
                 let eff = enforce_unique_pk(&table, b);
-                eff_rows += eff.count;
+                eff_rows += eff.len();
                 table.ingest_borrowed_batch(&eff).unwrap();
             }
         });

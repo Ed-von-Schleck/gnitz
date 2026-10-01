@@ -11,9 +11,9 @@ use rustc_hash::FxHashSet;
 use super::train::drain_rows;
 use super::*;
 use gnitz_expr::SchemaFacts;
-use gnitz_store::schema::key::{probe_key, PkBuf};
-use gnitz_store::schema::KeySpec;
 use gnitz_wire::{ReadBound, ReadSpec};
+use gnitz_zset::schema::key::{probe_key, PkBuf};
+use gnitz_zset::schema::KeySpec;
 
 /// Spans tracked per filter before it disables itself: `FxHashSet<u64>`'s
 /// 2^23-bucket table at its 7/8 load factor, the largest count that never grows
@@ -80,11 +80,7 @@ impl UniqueFilter {
 
 /// Insert the indexed span of every live row of `batch` into `filter`; a NULL
 /// in an indexed column means no span (`key_bytes` → false) and no occupancy.
-pub(super) fn extract_into_filter(
-    filter: &mut UniqueFilter,
-    batch: &gnitz_store::storage::MemBatch<'_>,
-    spec: &KeySpec,
-) {
+pub(super) fn extract_into_filter(filter: &mut UniqueFilter, batch: &gnitz_zset::repr::MemBatch<'_>, spec: &KeySpec) {
     let mut keybuf = PkBuf::zeroed(0);
     for row in 0..batch.len() {
         if batch.get_weight(row) <= 0 {

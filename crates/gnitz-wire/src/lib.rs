@@ -1,7 +1,7 @@
 //! Shared wire-protocol definitions for GnitzDB.
 //!
 //! Single source of truth for what the client (gnitz-core) and the engine
-//! (gnitz-store and gnitz-server) must agree on: the constants and codecs, the
+//! (gnitz-zset, gnitz-store and gnitz-server) must agree on: the constants and codecs, the
 //! typed forms of the wire payloads, and the semantic rules both sides compute
 //! with. It is the lowest crate every consumer of a rule links, so a rule that
 //! lands anywhere else can drift.

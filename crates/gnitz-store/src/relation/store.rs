@@ -1,8 +1,9 @@
 //! `Store` — this process's store of one relation or index, or its absence.
 //! Every row verb is the `Table`'s own, reached through [`Store::held`].
 
-use crate::schema::SchemaDescriptor;
-use crate::storage::{StorageError, Table};
+use crate::storage::Table;
+use gnitz_zset::repr::StorageError;
+use gnitz_zset::schema::SchemaDescriptor;
 
 /// This process's store of one relation or index.
 pub(crate) enum Store {

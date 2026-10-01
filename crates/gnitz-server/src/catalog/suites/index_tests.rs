@@ -1830,7 +1830,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     // Wide PKs are DDL-rejected for base tables, so this registers the relation
     // and its index directly (as `wide_pk_validation.rs` does).
     use gnitz_store::relation::RelationKind;
-    use gnitz_store::schema::SchemaDescriptor;
+    use gnitz_zset::schema::SchemaDescriptor;
 
     let dir = temp_dir("catalog_range_wide_pk");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();

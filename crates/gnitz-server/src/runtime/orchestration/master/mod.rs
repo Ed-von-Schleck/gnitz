@@ -24,9 +24,9 @@ use crate::catalog::CatalogEngine;
 use crate::runtime::reactor::{AckLease, Reactor, TrainLease};
 use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalExcl, SalMessageKind, SalWriter, WorkerSet};
 use crate::runtime::wire;
-use gnitz_store::schema::{Placement, SchemaDescriptor};
-use gnitz_store::storage::Batch;
 use gnitz_wire::{BoundPeek, PkColList, WireFault, WireFlags};
+use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::{Placement, SchemaDescriptor};
 
 pub(crate) use dispatch::{FlushRound, WORKER_WATCH};
 pub(crate) use train::forward_scan;

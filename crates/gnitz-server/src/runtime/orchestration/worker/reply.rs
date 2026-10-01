@@ -132,15 +132,12 @@ pub(crate) fn send_unique_preflight_keys(
     request_id: u32,
     budget: usize,
     chunk_rows: usize,
-    keys: &mut gnitz_store::storage::KeyProducer,
+    keys: &mut gnitz_zset::repr::KeyProducer,
 ) {
     let route = ReplyRoute { target_id, request_id, fifo: false };
     let mut chunk = Batch::with_capacity(frame_schema, keys.remaining().min(chunk_rows));
     loop {
-        chunk.clear();
-        for _ in 0..keys.remaining().min(chunk_rows) {
-            chunk.push_key_row(keys.next().expect("producer lends `remaining` spans"), 1);
-        }
+        keys.fill(&mut chunk, chunk_rows);
         let drained = keys.remaining() == 0;
         // Every chunk sends at least one frame, so an empty key set still ends
         // its train.

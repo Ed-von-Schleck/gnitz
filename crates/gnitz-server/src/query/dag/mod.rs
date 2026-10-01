@@ -12,10 +12,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::query::compiler::{self, CompileOutput, Relay, SubPlan, ViewMeta};
 use crate::query::vm;
-use gnitz_store::ops::{self, ScatterPlan};
 use gnitz_store::relation::{CircuitState, Relation, RelationRegistry, StateLayout};
-use gnitz_store::schema::Placement;
-use gnitz_store::storage::Batch;
+use gnitz_zset::algebra::{self, ScatterPlan};
+use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::Placement;
 
 mod exec;
 mod hydrate;
@@ -30,10 +30,10 @@ use meta::DepMap;
 pub(crate) trait DriveHost {
     fn parts(&mut self) -> (&mut DagEngine, &mut RelationRegistry);
     /// This worker's share of every worker's `batch` for `view_id` under
-    /// `plan`; with none, all of it. `fold`: the share lands in a register that
-    /// folds it, so gathering consolidated slices merges them, saving that fold
-    /// its sort; otherwise it concatenates.
-    fn exchange(&mut self, view_id: u64, batch: Cow<'_, Batch>, plan: Option<&ScatterPlan>, fold: bool) -> Batch;
+    /// `plan`. `fold`: the share lands in a register that folds it, so gathering
+    /// consolidated slices merges them, saving that fold its sort; otherwise it
+    /// concatenates.
+    fn exchange(&mut self, view_id: u64, batch: Cow<'_, Batch>, plan: &ScatterPlan, fold: bool) -> Batch;
 }
 
 // ---------------------------------------------------------------------------

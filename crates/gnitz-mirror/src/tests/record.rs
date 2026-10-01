@@ -1,7 +1,7 @@
 //! The record codec: what a round trip preserves, and what bytes it refuses.
 
-use gnitz_store::schema::encode_schema_block;
-use gnitz_store_testkit::make_schema_u64_i64;
+use gnitz_zset::schema::encode_schema_block;
+use gnitz_zset_testkit::make_schema_u64_i64;
 
 use super::*;
 

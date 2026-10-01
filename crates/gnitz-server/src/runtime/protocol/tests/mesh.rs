@@ -3,8 +3,8 @@ use crate::test_support::{
     make_batch, make_batch_bytes_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, make_string_batch,
     opk_pk, weighted_rows,
 };
-use gnitz_store::schema::Slot;
 use gnitz_wire::wal::WAL_HEADER_SIZE;
+use gnitz_zset::schema::Slot;
 
 const NW: usize = 3;
 
@@ -47,19 +47,16 @@ fn partition(w: usize, round: u64) -> Batch {
 }
 
 /// What receiver `r` must gather from `parts` under `spec`: its share of every
-/// sender's partition summed, or with no spec all of it.
-fn expected_of(parts: &[Batch], spec: Option<&ScatterPlan>, r: usize) -> Batch {
+/// sender's partition summed.
+fn expected_of(parts: &[Batch], spec: &ScatterPlan, r: usize) -> Batch {
     let schema = *parts[0].schema();
     let summed = Batch::concat(&schema, parts.iter().map(Batch::as_mem_batch)).into_consolidated();
-    match spec {
-        None => summed,
-        Some(spec) => spec.share(&summed, Slot::new(r as u32, parts.len() as u32)),
-    }
+    spec.share(&summed, Slot::new(r as u32, parts.len() as u32))
 }
 
 /// Publish every worker's round-`round` partition in rank order: the round
 /// completes on the last publish and not before.
-fn publish_all(mesh: &mut [Mesh], round: u64, spec: Option<&ScatterPlan>, drained: [bool; NW]) {
+fn publish_all(mesh: &mut [Mesh], round: u64, spec: &ScatterPlan, drained: [bool; NW]) {
     for w in 0..NW {
         assert!(
             mesh.iter().all(|m| !m.complete()),
@@ -75,7 +72,7 @@ fn publish_all(mesh: &mut [Mesh], round: u64, spec: Option<&ScatterPlan>, draine
 
 /// Worker `r` gathers round `round`, a single part: what every sender routed to
 /// it, and the AND of the drained bits.
-fn gather_one(mesh: &mut Mesh, round: u64, spec: Option<&ScatterPlan>, drained: [bool; NW]) {
+fn gather_one(mesh: &mut Mesh, round: u64, spec: &ScatterPlan, drained: [bool; NW]) {
     let r = mesh.rank;
     let parts: Vec<Batch> = (0..NW).map(|w| partition(w, round)).collect();
     let (got, all_drained) = mesh.advance(None).expect("a round that fits one part");
@@ -92,7 +89,7 @@ fn gather_one(mesh: &mut Mesh, round: u64, spec: Option<&ScatterPlan>, drained: 
 fn run_round(
     mesh: &mut [Mesh],
     parts: &[Batch],
-    spec: Option<&ScatterPlan>,
+    spec: &ScatterPlan,
     drained: &[bool],
     fold: bool,
 ) -> (Vec<(Batch, bool)>, usize) {
@@ -126,7 +123,7 @@ fn finish_round(mesh: &mut [Mesh], parts: &[Batch]) -> (Vec<(Batch, bool)>, usiz
 fn every_worker_gathers_each_round_from_every_peer() {
     let mut mesh = meshes(NW);
     let pk = by_pk(&make_schema_u64_i64());
-    let routes = [Some(&pk), None];
+    let routes = [&pk, &ScatterPlan::broadcast()];
     let drained = [[true, true, false], [true; NW]];
 
     publish_all(&mut mesh, 0, routes[0], drained[0]);
@@ -152,8 +149,8 @@ fn every_worker_gathers_each_round_from_every_peer() {
 fn a_second_publish_before_the_round_closes_is_refused() {
     let mut mesh = meshes(NW);
     let batch = partition(0, 0);
-    mesh[0].publish(9, false, &batch, None, true);
-    mesh[0].publish(9, false, &batch, None, true);
+    mesh[0].publish(9, false, &batch, &ScatterPlan::broadcast(), true);
+    mesh[0].publish(9, false, &batch, &ScatterPlan::broadcast(), true);
 }
 
 /// An advance before every worker published would read outboxes not yet written.
@@ -161,7 +158,7 @@ fn a_second_publish_before_the_round_closes_is_refused() {
 #[should_panic(expected = "advanced before every worker published")]
 fn an_advance_before_the_part_completes_is_refused() {
     let mut mesh = meshes(NW);
-    mesh[0].publish(9, false, &partition(0, 0), None, true);
+    mesh[0].publish(9, false, &partition(0, 0), &ScatterPlan::broadcast(), true);
     mesh[0].advance(None);
 }
 
@@ -182,7 +179,7 @@ fn an_oversize_round_crosses_in_parts() {
     let mut mesh = meshes(NW);
     let pk = by_pk(&make_schema_u64_i64());
     for fold in [true, false] {
-        for (spec, drained) in [(Some(&pk), [true, false, true]), (None, [true; NW])] {
+        for (spec, drained) in [(&pk, [true, false, true]), (&ScatterPlan::broadcast(), [true; NW])] {
             let parts: Vec<Batch> = (0..NW).map(|w| wide_partition(w, 1000)).collect();
             let (got, count) = run_round(&mut mesh, &parts, spec, &drained, fold);
             assert!(count > 2, "1000 rows per sender take several parts, not {count}");
@@ -208,7 +205,7 @@ fn a_sender_with_nothing_left_sends_empty_parts() {
     let mut mesh = meshes(NW);
     let schema = make_schema_u64_i64();
     let pk = by_pk(&schema);
-    for spec in [Some(&pk), None] {
+    for spec in [&pk, &ScatterPlan::broadcast()] {
         let parts = vec![
             wide_partition(0, 1000),
             wide_partition(1, 40),
@@ -254,7 +251,7 @@ fn a_heap_heavy_round_is_sized_by_its_relocated_heap() {
     );
     let pk = by_pk(&make_schema_pk_u64_payload_string());
     let parts = vec![consolidated, raw];
-    for spec in [Some(&pk), None] {
+    for spec in [&pk, &ScatterPlan::broadcast()] {
         let (got, count) = run_round(&mut mesh, &parts, spec, &[true, true], true);
         assert!(
             count > 2,
@@ -309,7 +306,7 @@ fn a_list_that_fills_the_outbox_exactly_defers_the_next() {
 
     let mut mesh = meshes(2);
     let pk = by_pk(&schema);
-    let spec = Some(&pk);
+    let spec = &pk;
     let parts = vec![full, Batch::empty_with_schema(&schema)];
     for (m, batch) in mesh.iter_mut().zip(&parts) {
         m.publish(9, true, batch, spec, true);
@@ -349,7 +346,7 @@ fn a_heap_row_that_fits_only_a_fresh_part_moves_to_it() {
     let schema = make_schema_pk_u64_payload_string();
     let mut mesh = meshes(2);
     let pk = by_pk(&schema);
-    let spec = Some(&pk);
+    let spec = &pk;
     let parts = vec![partition, Batch::empty_with_schema(&schema)];
     let (got, count) = run_round(&mut mesh, &parts, spec, &[true, true], true);
     assert_eq!(count, 2, "the long row takes the second part");

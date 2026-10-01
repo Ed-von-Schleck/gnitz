@@ -4,8 +4,8 @@ use crate::runtime::w2m::fixtures::make_ring;
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::wire::unique_preflight_wire_schema;
 use crate::test_support::pk_only_schema;
-use gnitz_store::schema::SchemaDescriptor;
 use gnitz_wire::{TypeCode, WireStatus};
+use gnitz_zset::schema::SchemaDescriptor;
 
 /// Read one pre-flight train off `receiver`, checking the flag and schema
 /// discipline the master's merge relies on: the spans, decoded against
@@ -24,8 +24,7 @@ fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, request_
         );
         assert!(ctrl.schema.is_none(), "the master builds the frame schema itself");
         if let Some(data) = ctrl.data.clone() {
-            let block =
-                gnitz_store::storage::WalBlock::parse(&slot.bytes()[data], frame_schema).expect("frame decodes");
+            let block = gnitz_zset::repr::WalBlock::parse(&slot.bytes()[data], frame_schema).expect("frame decodes");
             let mb = block.view();
             keys.extend((0..mb.len()).map(|i| mb.get_pk_bytes(i).to_vec()));
         }

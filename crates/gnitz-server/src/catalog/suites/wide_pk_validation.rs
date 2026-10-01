@@ -7,8 +7,8 @@
 
 use super::*;
 use gnitz_store::relation::{Relation, RelationKind};
-use gnitz_store::schema::SchemaDescriptor;
-use gnitz_store::storage::BatchBuilder;
+use gnitz_zset::repr::BatchBuilder;
+use gnitz_zset::schema::SchemaDescriptor;
 
 /// `pk_stride` = 24 (wide): three U64 PK columns + one U64 payload `val`.
 fn wide_unique_schema() -> SchemaDescriptor {

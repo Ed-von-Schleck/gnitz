@@ -5,8 +5,8 @@ use crate::test_support::{
     u64_pk_schema,
 };
 use gnitz_expr::SchemaFacts;
-use gnitz_store::schema::{Placement, SchemaColumn, Slot};
 use gnitz_wire::{AggDescriptor, AggFunc, Circuit, OpNode, ReadBound, TypeCode};
+use gnitz_zset::schema::{Placement, SchemaColumn, Slot};
 
 // ── The shapes a compile refuses ────────────────────────────────────────
 
@@ -256,13 +256,12 @@ fn compile_global(circuit: Circuit, source: SchemaDescriptor, slot: Slot) -> Res
         .iter()
         .find_map(|n| match &n.op {
             OpNode::Reduce { agg, .. } => Some(
-                gnitz_store::ops::ReducePlan::from_wire(&source, &[], agg, true)
+                *gnitz_zset::stream::ReducePlan::from_wire(&source, &[], agg, true)
                     .unwrap()
-                    .shape
-                    .output_schema,
+                    .output_schema(),
             ),
             OpNode::TopN { order, limit, offset, .. } => Some(
-                gnitz_store::ops::TopNPlan::from_wire(&source, &[], order, *limit, *offset)
+                gnitz_zset::stream::TopNPlan::from_wire(&source, &[], order, *limit, *offset)
                     .unwrap()
                     .output_schema,
             ),

@@ -4,8 +4,8 @@
 
 use super::*;
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
-use gnitz_store::schema::Slot;
 use gnitz_wire::Circuit;
+use gnitz_zset::schema::Slot;
 
 pub(super) fn loaded(circuit: Circuit) -> LoadedCircuit {
     LoadedCircuit::new(circuit).expect("test circuit within the node limit")

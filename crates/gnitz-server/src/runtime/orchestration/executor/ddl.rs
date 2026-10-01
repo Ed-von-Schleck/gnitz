@@ -26,9 +26,9 @@ use crate::runtime::reactor::WriteGuard;
 use crate::runtime::sal::SalExcl;
 use crate::runtime::wire as ipc;
 use gnitz_foundation::fault::Seam;
-use gnitz_store::storage::Batch;
 use gnitz_wire::control::DecodedControl;
 use gnitz_wire::{ClientVerb, PkColList, WireFault};
+use gnitz_zset::repr::Batch;
 
 /// `GNITZ_INJECT_TICK_HOLD_FOR_DDL`: see `hold_tick_for_ddl`.
 pub(super) static TICK_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_TICK_HOLD_FOR_DDL");

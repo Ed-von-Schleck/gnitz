@@ -3,7 +3,7 @@
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use gnitz_store::storage::PooledBuf;
+use gnitz_zset::repr::PooledBuf;
 
 use super::io::{ClientConn, RecvEnd, RecvFilter};
 use super::*;

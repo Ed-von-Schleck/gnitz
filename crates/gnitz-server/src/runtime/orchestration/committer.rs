@@ -29,8 +29,8 @@ use super::TxnFamily;
 use crate::runtime::master::FlushRound;
 use crate::runtime::reactor::{chan, oneshot, AckLease};
 use crate::runtime::sal::SalScope;
-use gnitz_store::storage::Batch;
 use gnitz_wire::WireFault;
+use gnitz_zset::repr::Batch;
 use std::rc::Rc;
 
 /// Row ceiling on one committer batch. Tested before the receive, so a batch is

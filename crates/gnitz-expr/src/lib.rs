@@ -44,7 +44,7 @@
 //!
 //! > A non-generic item is codegen'd in this crate's rlib, at opt-level 1. A
 //! > generic one is re-instantiated in the *consuming* crate, at that crate's
-//! > opt-level — 0 for gnitz-store and gnitz-server in dev.
+//! > opt-level — 0 for gnitz-zset, gnitz-store and gnitz-server in dev.
 //!
 //! So moving a body out of a generic function into a non-generic one *improves*
 //! the debug build, and the reverse costs. `nm -C` on the rlibs is what shows

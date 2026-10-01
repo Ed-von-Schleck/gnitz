@@ -1,8 +1,11 @@
 //! The read rung — the `ReadSpec` executor and the store read verbs, as
-//! `impl RelationRegistry` blocks over `relation` and `ops`.
+//! `impl RelationRegistry` blocks over `relation`.
 //!
-//! It is a rung of its own because it names the operator layer — the fold and
-//! map plans `scan_spec` runs — which `relation` may not.
+//! What is decided here is which source serves a bound — the store, or an index
+//! over it — and how a skeleton row is hydrated. The filter `scan_spec` drives is
+//! `gnitz-expr`'s, the map and the sink are `gnitz_zset::algebra`'s — the same
+//! kernels a circuit's linear operators dispatch to — so a read here and a view
+//! there compute a row the same way.
 //!
 //! Nothing here reaches a `CatalogEngine` or a `DagEngine`: those are in
 //! `gnitz-server`, which depends on this crate, so the direction is the crate
@@ -16,11 +19,13 @@
 
 mod scan_spec;
 mod store_io;
-pub use store_io::SourceCursor;
+
+#[cfg(test)]
+mod bench_scan_spec;
 
 use crate::relation::RelationRegistry;
-use crate::storage::Batch;
 use gnitz_wire::PkKeys;
+use gnitz_zset::repr::Batch;
 
 /// Recomputes a capacity-bounded view's rows at its skeleton keys, from the view's
 /// own maintained state. A host that maintains no circuit has none.

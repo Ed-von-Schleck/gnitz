@@ -1,4 +1,4 @@
-//! L7 orchestration — the master SAL dispatcher, the worker dispatch loop, the
+//! Orchestration — the master SAL dispatcher, the worker dispatch loop, the
 //! single-threaded server executor, and the durable-commit batcher.
 //!
 //! Internal grouping, not a facade: `runtime/mod.rs` re-aliases these submodules
@@ -12,8 +12,8 @@
 use std::future::Future;
 use std::task::Poll;
 
-use gnitz_store::storage::Batch;
 use gnitz_wire::WireConflictMode;
+use gnitz_zset::repr::Batch;
 
 /// One decoded, shape-validated transaction family: the target `tid`, its
 /// conflict `mode`, and the decoded batch. The executor decodes into these, the

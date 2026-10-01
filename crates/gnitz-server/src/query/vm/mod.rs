@@ -4,13 +4,13 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-use gnitz_store::ops;
-use gnitz_store::ops::MapPlan;
 use gnitz_store::relation::{CircuitState, StateIdx};
-use gnitz_store::schema::SchemaDescriptor;
-use gnitz_store::schema::Slot;
-use gnitz_store::storage::Batch;
 use gnitz_wire::ClampKind;
+use gnitz_zset::algebra::MapPlan;
+use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::SchemaDescriptor;
+use gnitz_zset::schema::Slot;
+use gnitz_zset::stream;
 
 mod builder;
 mod exec;
@@ -70,7 +70,7 @@ pub(in crate::query) enum Op {
     /// spelling reaches the instruction set.
     JoinDT {
         trace: StateIdx,
-        probe: ops::JoinProbe,
+        probe: stream::JoinProbe,
     },
     WorkerFilter {
         slot: Slot,
@@ -96,30 +96,25 @@ pub(in crate::query) enum Op {
 /// One `Op::Reduce`'s baked operator data: the plan and the table its combined
 /// value index lives in.
 pub(in crate::query) struct BakedReduce {
-    plan: ops::ReducePlan,
+    plan: stream::ReducePlan,
     avi_table: Option<StateIdx>,
 }
 
 impl BakedReduce {
-    pub(in crate::query) fn new(plan: ops::ReducePlan, avi_table: Option<StateIdx>) -> BakedReduce {
+    pub(in crate::query) fn new(plan: stream::ReducePlan, avi_table: Option<StateIdx>) -> BakedReduce {
         assert_eq!(
-            plan.avi.is_some(),
+            plan.index_schema().is_some(),
             avi_table.is_some(),
-            "a reduce's value-index bake and its table are set together",
+            "a reduce's value index and its table are set together",
         );
         BakedReduce { plan, avi_table }
-    }
-
-    /// The combined value index: its table and the bake that projects into it.
-    fn avi(&self) -> Option<(StateIdx, &ops::AviBake)> {
-        self.avi_table.zip(self.plan.avi.as_ref())
     }
 }
 
 /// One `Op::TopN`'s baked operator data: the plan and the table its ordered
 /// index lives in.
 pub(in crate::query) struct BakedTopN {
-    pub(in crate::query) plan: gnitz_store::ops::TopNPlan,
+    pub(in crate::query) plan: gnitz_zset::stream::TopNPlan,
     pub(in crate::query) index_table: StateIdx,
 }
 

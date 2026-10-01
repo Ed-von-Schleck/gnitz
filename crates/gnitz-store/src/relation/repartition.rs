@@ -14,11 +14,10 @@ use gnitz_foundation::posix_io::fsync_dir;
 
 use super::dirs::{cluster_children, subdir_names};
 use super::{ChildAddr, ChildKind};
-use crate::schema::{SchemaDescriptor, Slot};
-use crate::storage::{
-    flush_barrier, from_runs, link_store, retire_store, route_rows_by_pk, Batch, Layout, RecoverySource, StorageError,
-    StoreBudgets, Table,
-};
+use crate::storage::{flush_barrier, link_store, retire_store, RecoverySource, StoreBudgets, Table};
+use gnitz_zset::algebra::ScatterPlan;
+use gnitz_zset::repr::{from_runs, Batch, StorageError};
+use gnitz_zset::schema::{SchemaDescriptor, Slot};
 
 /// The worker count of the complete child set to relay onto `launched`; `None`
 /// when nothing moves. A set missing a rank's manifest never finished a
@@ -136,32 +135,30 @@ fn rewrite_targets(
     let mut cursor = from_runs(sources.iter().flat_map(Table::runs), *schema, 0);
     let mut targets = open(launched)?;
     let mut buffers: Vec<Batch> = targets.iter().map(|_| Batch::empty_with_schema(schema)).collect();
+    let plan = ScatterPlan::native(schema);
     let mut rows: Vec<Vec<u32>> = Vec::new();
     while let Some(chunk) = cursor.drain_chunk(chunk_rows) {
-        let slots = route_rows_by_pk(&chunk.as_mem_batch(), schema, &mut rows, launched as usize);
+        let slots = plan.route(&chunk, &mut rows, launched as usize);
         for ((target, buffer), idx) in targets.iter_mut().zip(&mut buffers).zip(slots.iter()) {
             if idx.is_empty() {
                 continue;
             }
-            let slice = chunk.ascending_subset(idx);
-            buffer.append_batch(&slice);
+            // Ascending subsets of one consolidated cursor, in cursor order.
+            buffer.append_above(chunk.ascending_subset(idx));
             if buffer.total_bytes() >= ram_tier_bytes {
                 write_run(target, buffer)?;
             }
         }
     }
     for (target, buffer) in targets.iter_mut().zip(&mut buffers) {
-        if buffer.count > 0 {
+        if !buffer.is_empty() {
             write_run(target, buffer)?;
         }
     }
     flush_barrier(targets.iter_mut(), 0)
 }
 
-/// `run` is ascending subsets of one consolidated cursor, appended in cursor
-/// order, so it is consolidated itself.
 fn write_run(target: &mut Table, run: &mut Batch) -> Result<(), StorageError> {
-    run.certify_layout(Layout::Consolidated);
     target.append_terminal_run(run)?;
     run.clear();
     Ok(())

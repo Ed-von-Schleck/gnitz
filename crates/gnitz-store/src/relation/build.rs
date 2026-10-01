@@ -91,7 +91,7 @@ impl RelationRegistry {
         let delta = match feed {
             Some(budget) if schema.placement().counts_on(self.slot.rank) => {
                 // Admitted by the catalog precheck; a host registering outside it gets the refusal here.
-                let delta_schema = crate::schema::make_delta_schema(&schema)
+                let delta_schema = super::delta::make_delta_schema(&schema)
                     .ok_or_else(|| format!("view {id} has too many columns to carry a delta feed"))?;
                 // Erased at open: no delta expresses what a boot does to a view, so every cursor restarts.
                 let table = self.open_child(

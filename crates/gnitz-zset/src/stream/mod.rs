@@ -1,0 +1,29 @@
+//! The stream operators: the kernels that take this tick's delta together with
+//! a cursor over its history, and emit the output delta.
+//!
+//!   - `clamp`  — distinct and positive_part, the weight clamps
+//!   - `join`   — the bilinear operator, equi, range and cross, over one probe
+//!   - `reduce` — the incremental aggregate and its combined value index (`avi`)
+//!   - `topn`   — per-group top-N over an ordered index of every input row
+//!
+//! These are the operators whose incremental form is not the operator itself:
+//! each consults an integral. Only a circuit dispatches to them, and each builds
+//! its artifact (plan, probe, output schema) through the constructor here that
+//! owns the guards a client-supplied circuit clears.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
+
+mod clamp;
+mod join;
+mod reduce;
+mod topn;
+
+#[cfg(test)]
+mod bench_join;
+
+pub use clamp::op_weight_clamp;
+pub use join::{op_join_delta_trace, JoinPlan, JoinProbe};
+pub use reduce::{op_reduce, ReducePlan};
+pub use topn::{op_topn, TopNPlan};

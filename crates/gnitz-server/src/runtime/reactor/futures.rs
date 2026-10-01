@@ -3,9 +3,9 @@
 
 use std::ops::Range;
 
-use gnitz_store::schema::SchemaDescriptor;
-use gnitz_store::storage::WalBlock;
 use gnitz_wire::WireFault;
+use gnitz_zset::repr::WalBlock;
+use gnitz_zset::schema::SchemaDescriptor;
 
 use super::*;
 use crate::runtime::sal::{SalMessageKind, WorkerSet};

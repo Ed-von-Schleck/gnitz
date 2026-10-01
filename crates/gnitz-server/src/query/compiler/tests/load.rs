@@ -3,10 +3,10 @@ use crate::catalog::SysFamily;
 use crate::query::compiler::fixtures::*;
 use crate::test_support::circuit_nodes_batch;
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
-use gnitz_store::schema::Slot;
-use gnitz_store::storage::{Batch, BatchBuilder};
 use gnitz_wire::sys_rows::{write_circuit_node_row, CircuitNodeRow};
 use gnitz_wire::{Circuit, KeyRange, PkColList, ReadBound};
+use gnitz_zset::repr::{Batch, BatchBuilder};
+use gnitz_zset::schema::Slot;
 
 const VIEW_ID: u64 = 1;
 

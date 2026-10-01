@@ -22,10 +22,10 @@ use crate::runtime::w2m::SalWake;
 use crate::runtime::wire::{WireData, WireMsg, WireSchema};
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io;
-use gnitz_store::storage::Batch;
 use gnitz_wire::control::frame_head_size;
 use gnitz_wire::{low_bits_mask, read_u32_le, read_u64_le, write_u32_le, write_u64_le, BitIter};
 use gnitz_wire::{WireFault, WireStatus};
+use gnitz_zset::repr::Batch;
 
 /// `GNITZ_INJECT_SAL_ZONE_PANIC=<scope tag>`: crash the master between a zone's
 /// groups publishing and its closing member. The tag (`"ddl"` / `"commit"`)

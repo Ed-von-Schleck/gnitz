@@ -3,9 +3,10 @@
 
 use super::ChildKind;
 use super::RelationRegistry;
-use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, PkSetGather, ReadCursor, StorageError, Table};
+use crate::storage::Table;
 use gnitz_wire::PkKeys;
+use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError};
+use gnitz_zset::schema::SchemaDescriptor;
 
 /// A `u16` index into one [`CircuitState`], minted only by
 /// [`StateLayout::declare`].
@@ -75,9 +76,9 @@ impl CircuitState {
 
     /// A cursor over `idx` ranged to the PKs of `keys`, for probing at them.
     pub fn cursor_for_keys(&self, idx: StateIdx, keys: &Batch) -> ReadCursor {
-        debug_assert!(keys.is_consolidated() && keys.count > 0);
+        debug_assert!(keys.is_consolidated() && !keys.is_empty());
         self.at(idx)
-            .open_cursor_in_range(keys.get_pk_bytes(0), keys.get_pk_bytes(keys.count - 1))
+            .open_cursor_in_range(keys.get_pk_bytes(0), keys.get_pk_bytes(keys.len() - 1))
     }
 
     pub fn ingest_owned(&mut self, idx: StateIdx, batch: Batch) -> Result<(), StorageError> {

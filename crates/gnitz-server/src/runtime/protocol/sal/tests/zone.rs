@@ -3,7 +3,7 @@ use crate::runtime::sal::fixtures::{group_at, TestLog};
 use crate::runtime::sal::{DirectGroup, GroupData, SalMessageKind, ANCHOR_BYTES, ANCHOR_RECORD, PREFIX_BYTES};
 use crate::runtime::wire::{WireData, WireMsg, WireSchema};
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
-use gnitz_store::storage::Batch;
+use gnitz_zset::repr::Batch;
 
 const SIZE: usize = 1 << 20;
 const NW: usize = 4;

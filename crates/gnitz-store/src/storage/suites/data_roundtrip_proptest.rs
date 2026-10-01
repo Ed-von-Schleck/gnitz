@@ -9,79 +9,39 @@
 
 use proptest::prelude::*;
 
-use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_PK_BYTES, MAX_PK_COLUMNS};
-use crate::storage::{Batch, RecoverySource, StoreBudgets, Table};
-use crate::test_support::{arb_pk_type, arb_type_code, row_key, zset_of};
+use gnitz_wire::MAX_PK_COLUMNS;
+
+use crate::storage::{RecoverySource, StoreBudgets, Table};
+use crate::test_support::{arb_schema, row_key, zset_of};
 use gnitz_expr::RowSource;
-
-// ---------------------------------------------------------------------------
-// Strategies
-// ---------------------------------------------------------------------------
-
-/// Arbitrary valid schema. PK arity is 1..=MAX_PK_COLUMNS (== 5 — the in-memory
-/// descriptor cap = 4 user columns + 1 index-prefix slot; the user-facing SQL
-/// cap PK_LIST_MAX_COLS == 4 is intentionally exceeded to reach internal
-/// index-shaped schemas). Columns are shuffled so PK columns are not always a
-/// prefix — that exercises `compute_mappings`' payload renumbering around every
-/// PK position, where the closed form `payload_idx = ci - pk_count` breaks.
-/// PK columns are non-nullable (SchemaDescriptor::new rejects nullable PKs). The
-/// stride filter is a safety net (currently always true: MAX_PK_COLUMNS * 16 ==
-/// MAX_PK_BYTES) that auto-corrects if either constant changes.
-fn arb_schema() -> impl Strategy<Value = SchemaDescriptor> {
-    let pk = prop::collection::vec(arb_pk_type(), 1..=MAX_PK_COLUMNS);
-    // Any type code is a valid payload column, so payloads draw from the full set.
-    let payload = prop::collection::vec((arb_type_code(), any::<bool>()), 0..=4);
-    (pk, payload)
-        // (type_code, nullable, is_pk); PK columns are non-nullable.
-        .prop_map(|(pk_types, payloads)| {
-            let mut specs: Vec<(TypeCode, bool, bool)> = pk_types.into_iter().map(|tc| (tc, false, true)).collect();
-            specs.extend(payloads.into_iter().map(|(tc, n)| (tc, n, false)));
-            specs
-        })
-        .prop_shuffle() // interleave PK and payload columns
-        .prop_filter("pk_stride must fit MAX_PK_BYTES", |specs| {
-            specs
-                .iter()
-                .filter(|&&(_, _, is_pk)| is_pk)
-                .map(|&(tc, _, _)| tc.wire_stride())
-                .sum::<usize>()
-                <= MAX_PK_BYTES
-        })
-        .prop_map(|specs| {
-            let mut cols = Vec::with_capacity(specs.len());
-            let mut pk_indices = Vec::new();
-            for (i, (tc, nullable, is_pk)) in specs.into_iter().enumerate() {
-                cols.push(SchemaColumn::new(tc, nullable));
-                if is_pk {
-                    pk_indices.push(i as u32);
-                }
-            }
-            SchemaDescriptor::new(&cols, &pk_indices)
-        })
-}
+use gnitz_expr::{ColumnTable, SchemaFacts};
+use gnitz_zset::repr::{Batch, BatchBuilder};
+use gnitz_zset::schema::SchemaDescriptor;
 
 // ---------------------------------------------------------------------------
 // Row generation
 // ---------------------------------------------------------------------------
 
-/// Build a batch row-by-row via `Batch::with_capacity` and the public `extend_*`
-/// appenders.
+/// Build a batch row by row through [`BatchBuilder`].
 ///
 /// Returns the batch plus the fixed leading PK column values (empty for a
 /// single-column PK), so a caller can synthesize an absent prefix-twin key.
 fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128>) {
-    let mut rng = crate::test_rng::Rng::new(seed);
-    let mut batch = Batch::with_capacity(schema, n);
+    let mut rng = crate::test_support::Rng::new(seed);
+    let mut batch = BatchBuilder::new(*schema);
 
-    let pk_count = schema.pk_columns().count();
+    let pk_widths: Vec<usize> = schema
+        .pk_cols()
+        .iter()
+        .map(|&c| schema.columns[c as usize].size() as usize)
+        .collect();
     // The leading PK columns are fixed once; only the trailing column varies
     // (= row ordinal). That keeps PKs distinct (the ordinal `< n ≤ 64 < 256 ≤
     // 2^(8·width)` of the narrowest column, so no truncation collision) and,
     // for wide PKs, makes every row share a `≥ 16`-byte OPK prefix.
-    let leading: Vec<u128> = schema
-        .pk_columns()
-        .take(pk_count - 1)
-        .map(|(_, c)| rng.gen_u128() & gnitz_wire::image_mask(c.size() as usize))
+    let leading: Vec<u128> = pk_widths[..pk_widths.len() - 1]
+        .iter()
+        .map(|&w| rng.gen_u128() & gnitz_wire::image_mask(w))
         .collect();
 
     for i in 0..n {
@@ -90,38 +50,30 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
         let mut pk_vals = leading.clone();
         pk_vals.push(i as u128);
         let w = 1 + rng.gen_range(4) as i64;
-        batch.begin_row(schema.opk_key_cols(&pk_vals).pk_bytes(), w);
+        batch.begin_row_bytes(schema.opk_key_cols(&pk_vals).pk_bytes(), w);
 
-        // Null bitmap: a null bit only where the column is nullable.
-        let mut nw: u64 = 0;
-        for (pi, col) in schema.payload_columns() {
+        // Payload columns, in payload (not schema-column) index order; a NULL
+        // only where the column is nullable.
+        for (_, col) in schema.payload_columns() {
             if col.nullable && rng.gen_range(2) == 0 {
-                gnitz_wire::null_word_set(&mut nw, pi, true);
-            }
-        }
-        // Payload columns, in payload (not schema-column) index order.
-        for (pi, col) in schema.payload_columns() {
-            let cs = col.size() as usize;
-            if gnitz_wire::null_word_get(nw, pi) {
-                batch.fill_col_zero(pi);
+                batch.put_null();
             } else if col.type_code.is_german_string() {
-                batch.extend_col_blob(pi, &arb_string(&mut rng));
+                batch.put_blob(&arb_string(&mut rng));
             } else {
-                let v = rng.gen_u128();
-                batch.extend_col(pi, &v.to_le_bytes()[..cs]);
+                batch.put_int(rng.gen_u128() & gnitz_wire::image_mask(col.size() as usize));
             }
         }
-        batch.commit_row(nw);
+        batch.end_row();
     }
 
     // Raw, so ingest_owned_batch sorts and consolidates it.
-    (batch, leading)
+    (batch.finish(), leading)
 }
 
 /// Empty / inline (<=12) / blob (>12) lengths exercise the inline German-string
 /// struct, the blob arena, and the offset path. Bytes need not be valid UTF-8:
 /// the storage layer stores raw bytes and decode returns them verbatim.
-fn arb_string(rng: &mut crate::test_rng::Rng) -> Vec<u8> {
+fn arb_string(rng: &mut crate::test_support::Rng) -> Vec<u8> {
     let len = match rng.gen_range(3) {
         0 => 0,
         1 => 1 + rng.gen_range(12) as usize,  // 1..=12, inline
@@ -148,7 +100,7 @@ proptest! {
     /// modes at every PK width and column interleaving.
     #[test]
     fn batch_roundtrip(
-        schema in arb_schema(),
+        schema in arb_schema(MAX_PK_COLUMNS),
         rows in 1usize..=64,
         durable in any::<bool>(),
         seed in any::<u64>(),
@@ -186,7 +138,7 @@ proptest! {
     /// absent prefix-twin is rejected both times. Durable so the post-flush
     /// shard PK filter is probed.
     #[test]
-    fn point_lookup_after_flush(schema in arb_schema(), rows in 1usize..=64, seed in any::<u64>()) {
+    fn point_lookup_after_flush(schema in arb_schema(MAX_PK_COLUMNS), rows in 1usize..=64, seed in any::<u64>()) {
         let dir = tempfile::tempdir().unwrap();
         let mut table = new_table(&dir.path().join("pl"), schema, true);
         let (original, leading) = arb_batch(&schema, rows, seed);
@@ -216,7 +168,7 @@ proptest! {
     /// live_row_at is a read-only probe; physical retraction ingests a
     /// negated batch. full_scan nets shard (+w) against memtable (-w) to zero.
     #[test]
-    fn retract_then_scan(schema in arb_schema(), rows in 2usize..=64, seed in any::<u64>()) {
+    fn retract_then_scan(schema in arb_schema(MAX_PK_COLUMNS), rows in 2usize..=64, seed in any::<u64>()) {
         let dir = tempfile::tempdir().unwrap();
         let mut table = new_table(&dir.path().join("rx"), schema, true);
         let (original, _) = arb_batch(&schema, rows, seed);
@@ -234,8 +186,7 @@ proptest! {
         }
 
         // Physical retraction: ingest the same rows negated into the memtable.
-        let mut neg = Batch::with_capacity(&schema, half.max(1));
-        neg.append_ranges(&original.as_mem_batch(), &[(0, half)]);
+        let neg = Batch::from_ranges(&original, &[(0, half)], 0);
         table.ingest_owned_batch(neg.negated()).unwrap();
 
         for i in 0..half {
@@ -253,7 +204,7 @@ proptest! {
     /// Flush in 5 waves (> L0_COMPACT_THRESHOLD == 4), then compact: the k-way
     /// shard merge must preserve the multiset over a random schema.
     #[test]
-    fn compaction_roundtrip(schema in arb_schema(), rows in 5usize..=64, seed in any::<u64>()) {
+    fn compaction_roundtrip(schema in arb_schema(MAX_PK_COLUMNS), rows in 5usize..=64, seed in any::<u64>()) {
         let dir = tempfile::tempdir().unwrap();
         let mut table = new_table(&dir.path().join("cp"), schema, true);
         let (original, _) = arb_batch(&schema, rows, seed);
@@ -268,8 +219,7 @@ proptest! {
         for k in 0..WAVES {
             let start = k * rows / WAVES;
             let end = (k + 1) * rows / WAVES;
-            let mut wave = Batch::with_capacity(&schema, end - start);
-            wave.append_ranges(&original.as_mem_batch(), &[(start, end)]);
+            let wave = Batch::from_ranges(&original, &[(start, end)], 0);
             table.ingest_owned_batch(wave).unwrap();
             table.flush().unwrap();
         }

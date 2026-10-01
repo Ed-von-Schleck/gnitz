@@ -6,8 +6,8 @@ use std::rc::Rc;
 
 use super::*;
 use gnitz_expr::ColumnTable;
-use gnitz_store::schema::Placement;
 use gnitz_wire::{ClampKind, ReadBound};
+use gnitz_zset::schema::Placement;
 
 /// How a batch reaches the workers that consume it.
 #[derive(Clone)]
