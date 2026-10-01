@@ -69,12 +69,12 @@ accumulate one. Load-bearing: `distinct` assumes it, and DBSP Propositions
 **Indexed Z-Sets** map keys to Z-Sets, `K → (V → ℤ)`. GROUP BY produces one via a
 grouping function that is **linear**, so GROUP BY itself needs no state and is
 incrementally free; only the aggregation within each group needs the integral.
-`map_reindex` (repartitioning by group/join key) is its physical form.
+Repartitioning by group/join key is its physical form.
 
 **PK uniqueness is not a general invariant.** The PK region is a sort/routing
-key. It is unique for base-table batches (`enforce_unique_pk` on ingest) and for
-reduce output (one row per group). It is **not** unique for intermediate batches:
-`map_reindex` overwrites the PK region with a join/group column value, and join
+key. It is unique for base-table batches (enforced on ingest) and for reduce
+output (one row per group). It is **not** unique for intermediate batches:
+repartitioning overwrites the PK region with a join/group column value, and join
 output inherits the left input's PK. Every operator uses full (PK, payload)
 identity; none may assume PK uniqueness.
 
@@ -84,20 +84,16 @@ IEEE-754 breaks the byte-equal key contract, since ±0.0 differ byte-wise but
 compare equal numerically, and NaN has no canonical bit pattern.
 
 **A PK is an opaque, ordered byte string wherever it flows.** It is stored as an
-order-preserving key (OPK, §4) whose plain unsigned byte comparison *is* the
-typed lexicographic PK order, at any width — so every ordered operation (merge,
-sort, consolidation, range scan) is one `compare_pk_bytes`, and the encode/decode
-boundary is the only type-aware code. The encoding is also a bijection, so
-byte-equal ⟺ key-equal and consolidation and dedup group on the raw bytes.
-Routing and shard PK-filter probes hash those same bytes, making the hash a **pure function
-of the logical key**: equal keys co-partition and co-probe, and physical width or
-padding at the wire boundary never moves a key.
+order-preserving key (OPK, §4) whose unsigned byte comparison *is* the typed
+lexicographic PK order — so every ordered operation is one byte comparison, and
+the encode/decode boundary is the only type-aware code. The encoding is a
+bijection, so byte-equal ⟺ key-equal, and routing hashes those same bytes: the
+hash is a **pure function of the logical key**.
 
-**Hidden key slots.** Synthetic view keys (`_join_pk`, `_set_pk`, `_group_pk`, …)
-and unprojected passthrough PK columns are real schema columns flagged hidden
-(the schema record's `hidden` flag on the wire, `COL_TAB.is_hidden` in the catalog). They are excluded from wildcard expansion, name resolution,
-duplicate-name checks and client rows; PK region, routing, sort and consolidation
-are unaffected.
+**Hidden key slots.** Synthetic view keys and unprojected passthrough PK columns
+are real schema columns flagged hidden: invisible to name resolution, wildcard
+expansion and client rows, and ordinary columns to the PK region, routing, sort
+and consolidation.
 
 ## 2. Z-Set Operations
 
@@ -113,12 +109,10 @@ drops elements whose net weight is zero ("ghost elimination").
 
 Consolidation uses a **total order**, not hash grouping — sort-merge is what
 enables N-way merging, range scans and compaction. Sort key: PK first, by
-unsigned byte comparison over the OPK region (`compare_pk_bytes`), then payload
-columns in schema order (`compare_rows`). Payload comparison skips PK columns:
-null < non-null and null == null; STRING by German-string comparison; F64/F32 by
-`total_cmp`, so NaN has a defined position and transitivity holds for every
-input; every other column by its own type's order — signed integers signed,
-unsigned (incl. UUID) unsigned.
+unsigned byte comparison over the OPK region, then payload columns in schema
+order, each by its own type's order. The order is total for every input: null
+sorts before non-null, and floats compare by a total order, so NaN has a defined
+position.
 
 > **Every merge and consolidation path must sort by (PK, payload), never by PK
 > alone.** PK-only ordering interleaves rows that share a PK but differ in
@@ -172,9 +166,7 @@ Join is bilinear: output weight = product of input weights. Both operands need
 their integral, and consolidation is required.
 
 Thm 3.4 (*Bilinear*) takes the two **change** streams `dA`, `dB` as its inputs;
-`I(dA)` and `I(dB)` are the relations they accumulate. Keep the `d` on both
-operands of a term or on neither — `I(A)` would be a second integral, not a
-relation.
+`I(dA)` and `I(dB)` are the relations they accumulate.
 
 ```
 ⋈Δ(dA, dB) = dA ⋈ dB + z⁻¹(I(dA)) ⋈ dB + dA ⋈ z⁻¹(I(dB))
@@ -197,15 +189,11 @@ guard; the discriminator is source-id equality, not base-table overlap).
 **Join output schema** is `[key, left_payload..., right_payload...]` over the
 **SQL sides**, not the delta/trace ports — so both terms of the symmetric form
 share one schema. The key is the shared join key; the other input's PK region is
-not duplicated. Original table PKs survive as payload columns, moved there by
-`map_reindex`.
+not duplicated. Original table PKs survive as payload columns.
 
-**Keyless (cross) joins** — `CROSS JOIN`, a comma-separated FROM, or an ON/WHERE
-with no cross-table comparison — are INNER only; every other kind is rejected at
-plan time. The output PK is the pair `[a.pk…, b.pk…]`, a residual (`ON a.v <> b.w`)
-filters the product, and the product is computed partition-locally under a
-broadcast of the delta, with no second exchange. Every epoch emits
-`|Δ| × |other side|` rows.
+**Keyless (cross) joins** are INNER only. The product is computed
+partition-locally under a broadcast of the delta, with no second exchange, so
+every epoch emits `|Δ| × |other side|` rows.
 
 ### Outer joins (LEFT / RIGHT / FULL)
 
@@ -213,12 +201,6 @@ Described for LEFT; RIGHT is the mirror, FULL does both sides. For each delta
 row: if inner matches exist, emit them at `w_delta × w_trace`; if none, emit one
 null-filled row at `w_delta`. This is **not bilinear** — output weight depends on
 match *existence*, not on weight arithmetic alone.
-
-The paper does not incrementalize outer joins — it lowers them to plans with
-extra joins, as Feldera does by injecting ghost `(k, NULL)` tuples into an inner
-join. GnitzDB's is its own: against a side unique on the key, `ν = all − π_P(inner)`; otherwise
-`ν = all − (P ⋈ distinct(keys of the other side))` for equi, and
-`positive_part(all − π_P(inner))` for band.
 
 There is **no fused outer opcode**. `LEFT JOIN = inner ∪ null_extend(ν)`, where
 `ν` is the unmatched preserved rows at their true multiplicity: per preserved
@@ -231,11 +213,6 @@ matches, `ν(x) = w_A · [S = 0]`. Two contracts bind every realization:
 - **Computable partition-locally**, cancelling per worker before any output
   exchange. A realization needing a second sequential exchange to co-locate both
   operands is inadmissible — the compiler forbids it.
-
-Equi and band joins implement all three orientations. Pure range (`n_eq == 0`)
-supports LEFT only — RIGHT/FULL is rejected at plan time — and derives from a
-MIN/MAX threshold row that is reindexed back onto the range slot, at the common
-type of the two range columns.
 
 ### Non-linear operators
 
@@ -256,13 +233,8 @@ at weight −1, the new at +1.
   from history, so they carry a secondary value index instead of scanning the trace.
 - **Float SUM/AVG is order-dependent** — addition is non-associative, so the value
   is a function of (query, data, worker count, access path, chunk size) and
-  reproduces only while all of those hold. A *maintained* view is worker-count
-  stable (the two-phase combine excludes float SUM, so a global one keeps the
-  single-worker funnel and a grouped one lands each group on one worker), but its
-  **backfill** chunks per worker over whatever cursor the cost gate picks, so
-  `CREATE INDEX`, more data, or a different worker count each move the low bits;
-  the **ad-hoc fold** reassociates once more, summing per-worker partials in reply
-  order. Use an integer type where exactness matters.
+  reproduces only while all of those hold. Use an integer type where exactness
+  matters.
 
 *Set operations* (UNION/INTERSECT/EXCEPT, DISTINCT and ALL) are **join-free**:
 each is a linear combination of `{union, negate}` plus the weight-clamp primitive
@@ -298,15 +270,11 @@ The PK region holds the **order-preserving key (OPK)** — the same encoding at 
 and in-engine: the PK columns concatenated in PK-list order, each big-endian with
 signed columns sign-flipped. PK columns are not repeated in the payload regions.
 
-The blob region may carry dead bytes in memory — bytes no string cell
-references; an engine WAL block states an upper bound on them in its header, and
-a shard carries none.
-
 Null bitmap uses **payload column indexing**: bit N is the N-th non-PK column in
 schema order. For a **single-PK** schema this is `payload_idx = ci if ci <
 pk_index else ci - 1`; with a **compound PK** the columns are renumbered around
-*every* PK position, so that closed form does not hold — read the schema's
-`payload_mapping`, never `ci - 1`.
+*every* PK position, so that closed form does not hold — read the mapping from
+the schema, never `ci - 1`.
 
 ---
 
@@ -347,12 +315,6 @@ never links the planner. `gnitz-mirror` is the sole crate on both sides, and
 links no planner either; `gnitz-py` links it, so the Python extension carries the
 Z-set kernel and store too — but not the DBSP layer.
 
-The engine is three crates. **`gnitz-zset`** is the kernel: the schema, a Z-set
-as bytes and the cursor over it, and every operator. **`gnitz-store`** keeps
-Z-sets: the LSM, the relation registry and the `ReadSpec` executor.
-**`gnitz-server`** is the circuit compiler, the bytecode VM, epoch execution, the
-system-table catalog and the process model. Each depends on those before it.
-
 Two contracts decide what goes where. **The row kernels are `gnitz-zset`'s** —
 every operator, merge, sort, encoder and cursor — and the crates above call them
 once per batch, per run or per probed key. A loop over rows above the kernel
@@ -363,21 +325,21 @@ crate graph rather than a convention: a host holding a mirrored view links
 
 ### Workspace crates
 
-| Crate | Role | Depends on |
-|-------|------|------------|
-| `gnitz-foundation` | The process and the OS under it: logging, `GNITZ_*` env overrides, fault-injection seams, host RAM and POSIX file-I/O — independent leaves every other crate may name | — |
-| `gnitz-wire` | Wire-protocol constants + codecs and the circuit graph — the one definition client and engine must agree on. Also the one owner of XXH3, since a client computes some of the same digests | — |
-| `gnitz-expr` | The one expression evaluator, and the resolved column addressing it reads through | `wire` |
-| `gnitz-core` | Client core: connection, protocol, the logical type / expression model, and the mirror state machine | `foundation`, `wire`, `expr` |
-| `gnitz-sql` | SQL front end: parser, binder, query planner | `core`, `expr`, `wire` |
-| `gnitz-tokio` | The Rust async client: a `Connection` future over tokio's reactor, and the `AsyncClient` handle | `core` |
-| `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `expr`, `foundation`, `mirror`, `sql`, `wire` |
-| `gnitz-zset` | The Z-set kernel: the schema, columnar batches and the shard image, the cursor over runs, and the operators | `foundation`, `wire`, `expr` |
-| `gnitz-store` | The Z-set store: the LSM, the relation registry, the `ReadSpec` executor | `foundation`, `zset`, `wire`, `expr` |
-| `gnitz-server` | The multi-process server binary: the DBSP layer — circuit compiler, bytecode VM, epoch execution, system-table catalog — under the `runtime` rung that drives it | `foundation`, `store`, `zset`, `wire`, `expr` |
-| `gnitz-mirror` | The mirror store: the local copy a client reads through, and the one implementor of `gnitz-core`'s `MirrorStore` — the one crate on both sides, and a leaf. Drives `gnitz-store` directly and links no DBSP layer | `foundation`, `core`, `store`, `zset`, `wire` |
-| `gnitz-zset-testkit` | Dev-only: `gnitz-zset`'s test helpers, compiled as a library so other crates' tests reach them | `zset`, `wire`, `expr` |
-| `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests | — |
+| Crate | Role |
+|-------|------|
+| `gnitz-foundation` | The process and the OS under it: logging, `GNITZ_*` env overrides, fault-injection seams, host RAM and POSIX file-I/O — independent leaves every other crate may name |
+| `gnitz-wire` | Wire-protocol constants + codecs and the circuit graph — the one definition client and engine must agree on. Also the one owner of XXH3, since a client computes some of the same digests |
+| `gnitz-expr` | The one expression evaluator, and the resolved column addressing it reads through |
+| `gnitz-core` | Client core: connection, protocol, the client schema and batch, and the mirror state machine |
+| `gnitz-sql` | SQL front end: parser, binder, query planner |
+| `gnitz-tokio` | The Rust async client: a `Connection` future over tokio's reactor, and the `AsyncClient` handle |
+| `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against |
+| `gnitz-zset` | The Z-set kernel: the schema, columnar batches and the shard image, the cursor over runs, and the operators |
+| `gnitz-store` | The Z-set store: the LSM, the relation registry, the `ReadSpec` executor |
+| `gnitz-server` | The multi-process server binary: the DBSP layer — circuit compiler, bytecode VM, epoch execution, system-table catalog — under the `runtime` rung that drives it |
+| `gnitz-mirror` | The mirror store: the local copy a client reads through, and the one implementor of `gnitz-core`'s `MirrorStore` — the one crate on both sides, and a leaf. Drives `gnitz-store` directly and links no DBSP layer |
+| `gnitz-zset-testkit` | Dev-only: `gnitz-zset`'s test helpers, compiled as a library so other crates' tests reach them |
+| `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests |
 
 ### The engine (`gnitz-zset` + `gnitz-store` + `gnitz-server`)
 
@@ -405,15 +367,9 @@ circuit run the same kernels there. `stream` holds the operators that take this 
 over its history; only a circuit dispatches to them, and nothing in `gnitz-store`
 names one.
 
-`read` hangs its entry points off `RelationRegistry` as `impl` blocks, and the one
-thing it needs from the DBSP layer — recomputing a capacity-bounded view's
-skeleton row — is injected as the `SkeletonHydrator` trait, which a host that
-maintains no circuit passes `None` for. The crate graph is what stops that host
-linking a compiler. Each crate is one compilation unit, so the ladder among its
-own rungs is pinned by a source-text test over a declared ladder rather than by
-the graph — one such ladder per crate, over the same walk. `catalog` and
-`query` also cannot end the process: `gnitz_fatal_abort!` is private to
-`runtime`, so every fallible path in them returns its error.
+Each crate is one compilation unit, so the ladder among its own rungs is pinned
+by a source-text test rather than by the crate graph. `catalog` and `query`
+cannot end the process: every fallible path in them returns its error.
 
 Each subsystem's `mod.rs` header states its own surface, its internal split, and
 what is deliberately closed off. Read that rather than a summary here.
@@ -421,24 +377,18 @@ what is deliberately closed off. Read that rather than a summary here.
 `gnitz-foundation`, `gnitz-wire` and `gnitz-expr` sit **below this whole
 table**: they are separate crates.
 
-A relation is stored as one `Table` per worker. A relation's id exceeds the id of
-every relation it scans (refused at DDL precheck), so ascending id order is
-dependency order. Test scaffolding lives in `test_support` and per-module
-`tests/`. Each of the three crates has its own `test_support`. `gnitz-zset`
-splits its by reach: `shared` — with the test PRNG and the rung walk — is
-compiled again as `gnitz-zset-testkit`, which other crates' tests link, so it
-sees only that crate's public API, where
-`internal` is that crate's own. A helper goes in `internal` unless another crate
-needs it; putting a local helper in `shared` forces whatever it touches to become
-published API. `gnitz-store` and `gnitz-server` keep only an `internal`: their
-tests take the shared helpers from the testkit.
+A relation is stored once per worker. A relation's id exceeds the id of every
+relation it scans, so ascending id order is dependency order.
+
+Test helpers live in each engine crate's `test_support`. A helper stays
+crate-internal unless another crate's tests need it; only then does it go in the
+`shared` part of `gnitz-zset`'s, which is compiled again as `gnitz-zset-testkit`
+and so turns whatever it touches into published API.
 
 A module's unit tests live in `<dir>/tests/<module>.rs`, attached back with
-`#[cfg(test)] #[path]` so they stay that module's own `tests` child and keep
-private access; `<dir>/mod.rs`'s own go to `<dir>/tests/<dir-name>.rs`. Tests no
-single module owns live in the subsystem's `suites/`, a declared `mod suites;`
-child that reaches only that subsystem's surface. `#[ignore]`d microbenchmarks
-are not suites and this does not govern them.
+`#[cfg(test)] #[path]` so they keep private access; `<dir>/mod.rs`'s own go to
+`<dir>/tests/<dir-name>.rs`. Tests no single module owns live in the subsystem's
+`suites/`, which reaches only that subsystem's surface.
 
 ## Running E2E tests
 
@@ -462,12 +412,7 @@ The knobs a session usually reaches for. This is not the full set — every
 |-----|--------|
 | `GNITZ_WORKERS` | Worker count (Makefile/tests → server `--workers`) |
 | `GNITZ_LOG_LEVEL` | `quiet` / `normal` / `verbose` (`debug` = alias) |
-| `GNITZ_CPU_AFFINITY` | Pin master and workers to CPUs (default on); `0` when servers share a host |
 | `GNITZ_SERVER_BIN` | Override server binary (e.g. aim E2E at the release build) |
-| `GNITZ_CHECKPOINT_BYTES` | SAL checkpoint threshold |
-| `GNITZ_SAL_BYTES` | SAL mapping size; floor 16 MiB. Keep it constant across restarts of one data dir: recovery walks only the mapped bytes, so shrinking it after a crash fails the boot when fsynced groups lie past the new bound |
-| `GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES` | CREATE UNIQUE INDEX pre-flight in-RAM sort budget before spilling to disk |
-| `GNITZ_CLIENT_SEND_TIMEOUT_MS` | Per-frame deadline on ring-slot client egress before a stalled client is evicted |
 | `GNITZ_RAM_TIER_BYTES` | Per-store RAM-tier ceiling before it spills to a shard; shrink it to reach the disk regime on small data |
 
 ## Debug logging
@@ -486,47 +431,19 @@ For temporary logging: `gnitz_debug!` / `gnitz_info!` macros. Remove before comm
 
 ### Where test logs go
 
-Python E2E scratch lives in the gitignored `<repo>/tmp`, under pytest's
-`pytest-of-<user>/pytest-<N>/`. A green run deletes the whole thing at the end;
-a run with **any** failure keeps every failed test's data dir for post-mortem,
-and one such run-generation survives into the next (a SIGKILLed run's for three
-days). `make clean` reclaims them. The logs below sit in `<repo>/tmp` at a
-stable path instead, so they outlive the run.
+Everything is under the gitignored `<repo>/tmp` and is overwritten by the next
+run — copy out what you need before re-running.
 
-Server stderr of the shared session server: always written to
-`<repo>/tmp/server_debug.log`. Pytest's `-s` flag does NOT capture this — it
-lives on disk regardless of pytest's stdout/stderr capture mode.
+- **Session server stderr:** `tmp/server_debug.log`, on disk regardless of
+  pytest's capture mode (`-s` does not show it).
+- **A test's own server** (the `own_server` fixture): `<data_dir>.log`, stdout
+  and stderr of every boot that test ran.
+- **Workers:** `<data_dir>/worker_<N>.log`; the session server's are copied to
+  `tmp/last_worker_N.log` at teardown.
+- **Data dirs:** `tmp/pytest-of-<user>/pytest-<N>/`. A green run deletes them; a
+  failed test's is kept for post-mortem. `make clean` reclaims them.
 
-A test that starts its own server (the `own_server` fixture) gets a private log
-next to its data dir, `<data_dir>.log`, holding both stdout and stderr of every
-boot that test ran.
-
-Worker logs: workers write to `<data_dir>/worker_<N>.log`. The conftest copies
-the session server's to `<repo>/tmp/last_worker_N.log` on session teardown.
-
-Live tail (during a long-running test):
-`tail -f tmp/pytest-of-*/pytest-*/*/data/worker_*.log`
-
-Pre-existing logs from the previous session are overwritten on the next test
-run, so save copies before re-running if you need them.
-
-### Using tests for debugging
-
-1. **Reproduce the failure on a single test** with `pytest <test-file>::<test> -v`.
-   Always pass `GNITZ_WORKERS=4` — multi-worker bugs hide at W=1.
-2. **Re-run a few times** to check determinism. Flaky failures often point to
-   a race that the deterministic single-test run will mask.
-3. **Read both logs side-by-side** — the master log shows what was
-   dispatched; the worker log shows what was processed. Discrepancies in
-   ordering between them are usually the smoking gun.
-4. **Add temporary `gnitz_info!` lines** at the suspected boundary
-   (handler entry, SAL emit, ACK reply). `make server pyext` then re-run.
-   Strip them before committing.
-5. **Use the debug binary** (the default `make server` output). Release
-   builds clamp corrupt values silently and hide the real failure mode.
-6. **Test logs survive the session**, code state does NOT — if you want
-   to attach a log to a bug report, copy it out of `<repo>/tmp/`
-   before the next test run overwrites it.
+Live tail: `tail -f tmp/pytest-of-*/pytest-*/*/data/worker_*.log`
 
 ## Capacity-bounded views
 
@@ -540,18 +457,12 @@ output store as **skeleton rows**: the PK and one coarse summed weight, no
 payload. A read touching such a key recomputes it from the view's operator traces
 (join) or source store (linear), which stay full-fidelity.
 
-Capacity bounds the **registered on-disk shard bytes of that one store on one
-worker**, victim-ordered by *write* recency — nothing records that a row was
-read. Not the traces, not per-row residency, not cluster-wide, and not a bound on
-read peak: a read over hydrated keys materializes them, so peak is higher than
-the unbounded twin's, not lower. Eligible bodies are a filter/projection over one
-relation or over one inner equi-join (an `EXISTS` / `IN` semi-join included); the
-engine decides when the view is compiled. Bounded views are **leaf** views:
-nothing may be created over one, and `ALTER VIEW … AS` cannot retarget one.
+Capacity bounds one store's on-disk bytes on one worker — not the traces, not
+the cluster, and not read peak. Bounded views are **leaf** views: nothing may be
+created over one.
 
 Read paths branch on whether a store *holds* a skeleton row, never on whether it
-has a capacity — so a bounded view under its cap reads exactly like any other
-relation, and the branch cannot disagree with what the sweep did.
+has a capacity.
 
 This is the one deliberate local exception to the (PK, payload) element identity
 of §1/§2: when a cursor holds a skeleton run, its merge comparators fold a whole
@@ -582,40 +493,25 @@ every view reaching a stream is reset and rebuilt at boot. The stream's
 *definition* is ordinary durable catalog state. Target: log-structured ingestion,
 where the raw log lives upstream and only the derived view state is worth keeping.
 
-A stream push skips the pre-ACK `fdatasync` and the durable write. Removing the
-sync is a **latency** win, so it concentrates at small batch sizes and amortizes
-away as the batch grows. It accrues to *stream-only* commit batches — a stream
-push the committer coalesces with a base-table push rides that batch's sync, so
-those rows do reach the disk, and are discarded on replay.
+A stream push skips the pre-ACK `fdatasync` and the durable write.
 
 **A stream is append-only.** Pushed weights must be `>= 1`; the engine rejects a
 batch containing any weight `<= 0`, which is what keeps §1's positivity invariant
-engine-enforced (nothing clamps a stream's weights the way `enforce_unique_pk`
-clamps a base table's). CDC input carrying a before-image retraction is therefore
-not expressible against a stream.
+engine-enforced. CDC input carrying a before-image retraction is therefore not
+expressible against a stream.
 
 Its PK is a routing, sort and identity key and is **not unique**: duplicate PKs
 with different payloads are legal, exactly as for intermediate batches inside a
 circuit. So `INSERT INTO events VALUES (1, …)` twice yields one element at weight
 2, where the same statement against a table raises a duplicate-key error.
 
-`WITH (replicated = true)` and `CLUSTER BY` mean what they mean for a table.
-Rejected: reading a stream anywhere outside a view body (SQL or wire), `UPDATE`,
-`DELETE`, `CREATE INDEX`, `ALTER TABLE` column ops, `INSERT … ON CONFLICT`,
-`SERIAL`, a `FOREIGN KEY` to or from one, a write inside a transaction, and
-a capacity-bounded filter/projection over one (a bounded join over one is legal). `DROP TABLE` and `ALTER TABLE … RENAME
-TO` work.
+A stream is readable only inside a view body, and takes no `UPDATE`, `DELETE`,
+index, foreign key or transactional write.
 
 At boot, a view reaching a stream **returns to the value it would have if the
 stream had never received a row** — zero rows for `stream ⋈ table`, fully
 null-filled for `table LEFT JOIN stream`, and *grown* for
 `SELECT id FROM t EXCEPT SELECT id FROM s`. Non-monotone, and correct.
-
-Backpressure: pushed batches sit in RAM until a tick drains them, bounded by the
-tick trigger; the client is bounded by waiting on the push ACK. A stream's rows
-occupy the SAL exactly as a table's do, so it is reclaimed by the same byte-based
-checkpoint test and at the same rate — except inside a DDL window, where no
-checkpoint runs, and where a stream is the most likely thing to reach the ceiling.
 
 A read of a view drains pending ticks when a push it reaches has not been
 ticked yet — a stream push exactly as a table's.
@@ -630,39 +526,27 @@ ORDER BY extended by the input's row key, so it needs one.
 ## Delta feeds
 
 `CREATE VIEW … WITH (delta = '32 MB')` retains a view's recent deltas, read back
-through a `DELTA_POLL` item's `after_tick` as ordinary batches — **weights and
-all**, so a row-set comparison of a feed tests nothing. No subscription verb and
-no server-side cursor registry: the engine stays request/response, the cursor
-lives on the client, nothing retained survives a restart, `capacity` is refused
-with it, and `ALTER VIEW … AS` cannot retarget a fed view.
+by polling from a client-held cursor as ordinary batches — **weights and all**,
+so a row-set comparison of a feed tests nothing. No subscription verb and no
+server-side cursor registry: the engine stays request/response, the cursor lives
+on the client, and nothing retained survives a restart.
 
-**A delta read is the one read verb that does not drain pending ticks** — the
-exception to the paragraph above. It answers "what has happened", not "what is
-current", so a push the tick loop has not run yet is a round the next poll
-carries.
+**A delta read is the one read verb that does not drain pending ticks.** It
+answers "what has happened", not "what is current", so a push the tick loop has
+not run yet is a round the next poll carries.
 
-**A cursor can expire, and every subscriber must handle it.** The budget bounds
-**registered on-disk shard bytes**, exactly as `capacity` does, and the sweep
-drops the oldest rounds whether or not anyone is still reading them; the RAM tier
-beneath it is bounded separately. A cursor *below* what a worker has dropped
-is refused, and so is one whose tag names a different boot or a different
-relation; a cursor sitting exactly at the floor is served, since the walk it
-opens is above it. The recovery is always the same and is not optional: discard the copy
-and bootstrap. A `CREATE VIEW` backfill never enters the delta store, which is
-what makes a foreign cursor unsafe rather than merely stale.
-
-The feed is per-worker; a replicated view's feed lives on worker 0 alone.
+**A cursor can expire, and every subscriber must handle it.** The budget is a
+byte bound, and the oldest rounds are dropped whether or not anyone is still
+reading them. An expired cursor is refused, and so is one from a different boot
+or a different relation. The recovery is always the same and is not optional:
+discard the copy and bootstrap.
 
 A **mirror** is a local copy of a view fed by that feed, held by a client and
 read in the host's process at its last polled round: not read-your-own-writes,
 and two mirrors are no consistent cut; a relation the copy does not hold is
-delegated upstream. The copy lives in a **store** (`gnitz-mirror`) the host opens
-and attaches to a client; one store per data directory, refused by the engine's
-own `flock` in this process or any other. An ingest error costs the one copy it
-hit, which bootstraps again. A store poisons when a copy may be torn — a teardown
-that failed, a panic mid-ingest — and then refuses the reads it would have
-answered — and only those — until it is closed, which is the one recovery. Every
-client can mirror — the blocking one, the async one, and Python.
+delegated upstream. The copy lives in a store (`gnitz-mirror`) the host opens and
+attaches to a client. An ingest error costs the one copy it hit, which bootstraps
+again; a store whose copy may be torn refuses reads until it is closed.
 
 **A poll reports, per view, whether it reseeded** — discarded the copy and read
 the view whole. That is a discontinuity every subscriber has to react to, and no
@@ -675,9 +559,8 @@ the tick forward, which is exactly what an ordinary advance looks like.
 restart must recover.**
 
 The SAL (Shared Append-Only Log) carries both data writes and ephemeral
-commands on the same mmap'd fd. Workers see all SAL entries immediately
-via Acquire/Release atomics on the size prefix — fdatasync is irrelevant
-for cross-process visibility. It exists solely for crash recovery.
+commands. Workers see every SAL entry immediately — fdatasync is irrelevant for
+cross-process visibility. It exists solely for crash recovery.
 
 Durable operations are atomic: crash recovery applies an operation in full
 or not at all, so a crash never leaves a half-written DDL or push behind.
@@ -687,35 +570,20 @@ command-only operations — view ticks, scans, seeks, backfills, validation
 queries — plus a push to a **stream**, which upserts nothing that survives a
 restart. The dichotomy is what must be recovered, not what carries rows.
 
-The **checkpoint** is the sole shard-durability point: between checkpoints no
-table publishes a manifest on the ingest path, so the fsynced SAL alone carries
-durability and every table's overflow lives in the RAM tier. A checkpoint
-persists the base and system tables, then, after draining pending view ticks,
-every view's operator traces and output stores under a monotonic checkpoint
-generation. Each store's publish is skipped only when the manifest it would
-write is byte-identical to the one this process last made durable; every store
-publishes at its first checkpoint in a process, so the resume verdict and the
-boot relayout can each decide by "every child carries a manifest".
+The **checkpoint** is the sole shard-durability point: between checkpoints the
+fsynced SAL alone carries durability. A checkpoint persists the base and system
+tables, then, after draining pending view ticks, every view's operator traces
+and output stores.
 
-At open a view is **resumed from its checkpoint when generation-valid, rebuilt
-otherwise; a secondary index resumes on its own generation check alone, outside
-that verdict.** Resume is *incremental*: the
-checkpointed output store and operator traces load from their shards, and only
-the un-checkpointed SAL tail is fed through the circuit — the view is never
-re-derived from the base. A view resumes iff the recorded topology matches the
-launched `(worker_count, STATE_FORMAT)`, every one of its output children is at
-the committed generation, and every view it scans is itself valid; else it is
-reset and rebuilt from base. Recovery is **non-windowed**: the un-checkpointed
-tail is replayed once on a freshly-reset SAL, so peak recovery RAM is
-~(tail)/W per worker. The checkpoint generation is durably advanced before the
-fork, which closes the reset→boot-checkpoint crash window: a crash there leaves
-the durable generation ahead of every un-checkpointed view, forcing a rebuild
-rather than a silently-stale resume.
+At open a view is **resumed from its checkpoint when that checkpoint is valid,
+rebuilt from base otherwise**. Resume is *incremental*: only the un-checkpointed
+SAL tail is fed through the circuit — the view is never re-derived from the
+base. A view is valid only if every view it scans is, and a crash at any point
+must force a rebuild rather than a silently-stale resume.
 
-A restart at a **different worker count** relays each base relation's children
-onto the launched count before any store opens — writing the new set beside the
-old and removing the source only once every target is durable, so a crash at any
-point leaves the older set intact and the next boot redoes the work.
+A restart at a **different worker count** relays each base relation's stores
+onto the launched count before any store opens; a crash at any point leaves the
+older set intact and the next boot redoes the work.
 
 ## Benchmarking
 
@@ -725,11 +593,8 @@ make bench-full                     # full mode, 4 workers
 make bench WORKERS=4 PERF=1         # knobs: WORKERS, CLIENTS, FULL=1, PERF=1
 ```
 
-`make help` lists the rest (feature/transaction tiers, worker×client sweeps,
-`perf` and DWARF profiling variants, native-CPU builds).
-
-Results: `benchmarks/results/` (gitignored). The runner rotates old results (keeps 10).
-Generate report tables with `benchmarks/report.py`.
+`make help` lists the rest. Results land in the gitignored `benchmarks/results/`;
+`benchmarks/report.py` turns them into report tables.
 
 Workflow: `make bench` → change → commit → `make bench` → compare `summary.json`.
 
@@ -767,24 +632,25 @@ anything the optimizer could elide.
 3. **Confirm the size before optimizing the cost.** A path that is slow only at an input
    size nothing can produce is not slow. Bound the reachable input from its producer first.
 4. **Log first, never guess.** Rebuilds are expensive. One well-instrumented
-   run reveals more than ten speculative attempts.
-   - `gnitz_debug!` / `gnitz_info!` for structured logging
-   - `GNITZ_LOG_LEVEL=debug` to enable debug-level messages
-   - `RUST_BACKTRACE=1` for panic backtraces
-5. **Use the debug binary for crashes.** Release builds silently clamp
-   corrupt values.
-6. **Isolate with 1 worker first.** Pass with W=1 but fail with W=4 →
-   bug is in exchange/fanout, not computation.
-7. **Bisect by sub-path.** Disable the new fast-path to confirm the bug
-   is in the new code.
-8. **Verify your fix is in the binary.** `make e2e` rebuilds both the
-   server and the Python extension before running tests.
+   run reveals more than ten speculative attempts. Add temporary `gnitz_debug!` /
+   `gnitz_info!` lines at the suspected boundary, run with
+   `GNITZ_LOG_LEVEL=debug` and `RUST_BACKTRACE=1`, and strip them before
+   committing.
+5. **Reproduce on a single test** with `pytest <test-file>::<test> -v` at
+   `GNITZ_WORKERS=4`, and re-run it a few times: a flaky failure often points to
+   a race that one deterministic run masks.
+6. **Read the master and worker logs side by side** — the master log shows what
+   was dispatched, the worker log what was processed. Discrepancies in ordering
+   between them are usually the smoking gun.
+7. **Use the debug binary.** Release builds silently clamp corrupt values and
+   hide the real failure mode.
+8. **Isolate with 1 worker.** Pass with W=1 but fail with W=4 → bug is in
+   exchange/fanout, not computation.
+9. **Bisect by sub-path.** Disable the new fast-path to confirm the bug is in
+   the new code.
+10. **Verify your fix is in the binary.** `make e2e` rebuilds both the server
+    and the Python extension before running tests.
 
 ## GIT Branches
 
 All development happens on main for now; never branch off.
-
-## Compat / Legacy code
-
-Gnitz is pre-alpha, there are no production uses of this software. Keeping legacy code in
-the codebase is strictly not allowed.
