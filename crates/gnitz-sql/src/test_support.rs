@@ -1,14 +1,12 @@
-//! Shared `#[cfg(test)]` test helpers: column/schema builders and `sqlparser`
-//! expression literals reused across the codec, exec, and dml unit tests. A
-//! single source of truth so the canonical schemas (PK widths, UUID columns,
-//! compound PKs) and the literal-expression shapes can't drift between modules.
+//! Shared `#[cfg(test)]` helpers: column, schema, catalog and batch builders,
+//! and the parse/bind entry points the unit tests and the suites drive.
 
 use crate::bind::Catalog;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use gnitz_core::{PkColumn, PlannedView, RelDescriptor, Schema, ZSetBatch};
-use gnitz_wire::{ColumnDef, PkBuf, PkColList, RelClass, RelIndex, TypeCode};
-use sqlparser::ast::{BinaryOperator, Expr, Ident, Value};
+use gnitz_core::{BatchAppender, PlannedView, RelDescriptor, Schema, ZSetBatch};
+use gnitz_wire::{ColType, ColumnDef, PkColList, RelClass, RelIndex, TypeCode};
+use sqlparser::ast::Expr;
 use std::sync::Arc;
 
 /// The schema every test catalog resolves under.
@@ -24,8 +22,26 @@ pub(crate) fn ncol(name: &str, tc: TypeCode) -> ColumnDef {
     ColumnDef::new(name, tc, true)
 }
 
-/// A relation descriptor over `indexes`.
-fn descriptor(
+/// A schema, held to the rules every decoded schema is.
+pub(crate) fn schema(columns: Vec<ColumnDef>, pk_cols: &[u32]) -> Schema {
+    Schema::from_parts(columns, pk_cols.to_vec()).expect("a valid test schema")
+}
+
+/// A non-unique secondary index over `cols`.
+pub(crate) fn ix(cols: &[u32]) -> RelIndex {
+    RelIndex {
+        cols: PkColList::from_slice(cols),
+        is_unique: false,
+    }
+}
+
+/// A unique secondary index over `cols`.
+pub(crate) fn uq(cols: &[u32]) -> RelIndex {
+    RelIndex { is_unique: true, ..ix(cols) }
+}
+
+/// A relation descriptor.
+pub(crate) fn rel(
     tid: u64,
     class: RelClass,
     columns: Vec<ColumnDef>,
@@ -37,37 +53,14 @@ fn descriptor(
         class,
         pk_repeats: class == RelClass::Stream,
         serial: false,
-        schema: Arc::new(Schema { columns, pk_cols }),
+        schema: Arc::new(schema(columns, &pk_cols)),
         indexes,
     })
 }
 
-/// A relation descriptor. `indexes` lists secondary indexes as
-/// `(column indices, is_unique)`.
-pub(crate) fn rel_with(
-    tid: u64,
-    class: RelClass,
-    columns: Vec<ColumnDef>,
-    pk_cols: Vec<u32>,
-    indexes: &[(&[u32], bool)],
-) -> Arc<RelDescriptor> {
-    descriptor(tid, class, columns, pk_cols, idx_metas_flagged(indexes))
-}
-
-/// [`rel_with`], every index non-unique — what a read plan cares about.
-pub(crate) fn rel(
-    tid: u64,
-    class: RelClass,
-    columns: Vec<ColumnDef>,
-    pk_cols: Vec<u32>,
-    indexes: &[&[u32]],
-) -> Arc<RelDescriptor> {
-    descriptor(tid, class, columns, pk_cols, idx_metas(indexes))
-}
-
 /// A plain, partitioned, unindexed base table.
 pub(crate) fn table(tid: u64, columns: Vec<ColumnDef>, pk_cols: Vec<u32>) -> Arc<RelDescriptor> {
-    rel(tid, RelClass::Table, columns, pk_cols, &[])
+    rel(tid, RelClass::Table, columns, pk_cols, Vec::new())
 }
 
 /// A resolver that knows no relation.
@@ -100,83 +93,72 @@ pub(crate) fn register(cat: &Catalog<'_>, name: &str, tid: u64, class: RelClass,
     );
 }
 
-/// `(pk pk_tc, v I64)` — single-column PK of a chosen type plus one payload.
+/// `(id pk_tc PK, v I64)`.
 pub(crate) fn pk_schema(pk_tc: TypeCode) -> Schema {
-    Schema {
-        columns: vec![col("id", pk_tc), col("v", TypeCode::I64)],
-        pk_cols: vec![0],
-    }
+    schema(vec![col("id", pk_tc), col("v", TypeCode::I64)], &[0])
 }
 
-/// `(pk U64, val val_tc nullable)` — single-PK schema with one nullable payload.
+/// `(pk U64 PK, val val_tc nullable)`.
 pub(crate) fn two_col(val_tc: TypeCode) -> Schema {
-    Schema {
-        columns: vec![col("pk", TypeCode::U64), ncol("val", val_tc)],
-        pk_cols: vec![0],
-    }
+    schema(vec![col("pk", TypeCode::U64), ncol("val", val_tc)], &[0])
 }
 
-/// A single-row batch for [`two_col`]: pk = 1, the given payload bytes/null bits.
-pub(crate) fn batch_2col(val_bytes: Vec<u8>, val_tc: TypeCode, null_bits: u64) -> ZSetBatch {
-    let schema = two_col(val_tc);
-    let mut b = ZSetBatch::new(&schema);
-    b.pks.push_u128(&schema, 1u128);
-    b.weights.push(1);
-    b.nulls.push(null_bits);
-    b.payload[0].bytes.extend(val_bytes);
-    b
+/// `(pk U64 PK, c1, c2, …)`, the payload columns of types `tys`, all nullable.
+pub(crate) fn typed_schema<T: Into<ColType> + Copy>(tys: &[T]) -> Schema {
+    let mut columns = vec![col("pk", TypeCode::U64)];
+    columns.extend(
+        tys.iter()
+            .enumerate()
+            .map(|(i, &ty)| ColumnDef::typed(format!("c{}", i + 1), ty.into(), true)),
+    );
+    schema(columns, &[0])
 }
 
-/// A single UUID PK column.
-pub(crate) fn uuid_schema_pk() -> Schema {
-    Schema {
-        columns: vec![col("id", TypeCode::UUID)],
-        pk_cols: vec![0],
-    }
-}
-
-/// `(pk U64, uid UUID nullable)` — a UUID in a non-PK (payload) slot.
-pub(crate) fn uuid_schema_payload() -> Schema {
-    Schema {
-        columns: vec![col("pk", TypeCode::U64), ncol("uid", TypeCode::UUID)],
-        pk_cols: vec![0],
-    }
-}
-
-/// `(a U64, b U64) PRIMARY KEY (a, b)` plus a nullable I64 payload — the
-/// canonical compound-PK test schema (`pk_stride = 16`).
+/// `(a U64, b U64) PRIMARY KEY (a, b)` plus a nullable I64 payload.
 pub(crate) fn compound_schema_u64_u64() -> Schema {
-    Schema {
-        columns: vec![
+    schema(
+        vec![
             col("a", TypeCode::U64),
             col("b", TypeCode::U64),
             ncol("v", TypeCode::I64),
         ],
-        pk_cols: vec![0, 1],
+        &[0, 1],
+    )
+}
+
+/// One payload cell, written into a batch or read back out of a result.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Cell<'a> {
+    Int(i128),
+    F64(f64),
+    Str(&'a str),
+    Null,
+}
+
+impl Cell<'_> {
+    /// Append this cell as the row's next payload column.
+    pub(crate) fn push(self, app: &mut BatchAppender<'_>) {
+        match self {
+            Cell::Int(v) => app.int_val(v),
+            Cell::F64(v) => app.f64_val(v),
+            Cell::Str(s) => app.str_val(s),
+            Cell::Null => app.null(),
+        };
     }
 }
 
-/// A numeric literal bound as the binder binds it, e.g. `lit("1.5")`.
-pub(crate) fn lit(n: &str) -> BoundExpr {
-    crate::ast_util::bind_literal(&Value::Number(n.into(), false)).expect("a numeric literal")
-}
-
-/// A `col = rhs` equality expression (AST), for building recognizer/parity inputs.
-pub(crate) fn eq_expr(col: &str, rhs: Expr) -> Expr {
-    Expr::BinaryOp {
-        left: Box::new(Expr::Identifier(Ident::new(col))),
-        op: BinaryOperator::Eq,
-        right: Box::new(rhs),
+/// A batch of `schema`, single-column PK: one weight-1 row per entry of `rows`,
+/// its PK the row's 1-based position, its payload the entry's cells.
+pub(crate) fn batch_of(schema: &Schema, rows: &[&[Cell]]) -> ZSetBatch {
+    let mut b = ZSetBatch::new(schema);
+    let mut app = BatchAppender::new(&mut b, schema);
+    for (r, cells) in rows.iter().enumerate() {
+        app.add_row(r as u128 + 1, 1);
+        for cell in *cells {
+            cell.push(&mut app);
+        }
     }
-}
-
-/// A `col IN (items…)` expression (AST).
-pub(crate) fn in_list_expr(col: &str, items: Vec<Expr>) -> Expr {
-    Expr::InList {
-        expr: Box::new(Expr::Identifier(Ident::new(col))),
-        list: items,
-        negated: false,
-    }
+    b
 }
 
 /// Parse + bind an expression against `schema` as relation `t`, which is what
@@ -194,10 +176,11 @@ pub(crate) fn rejected<T>(r: Result<T, GnitzSqlError>) -> String {
     }
 }
 
-/// [`bind_sql`] of a WHERE predicate, as its bound conjuncts — the production
-/// shape, and the input of the `access` recognizers.
+/// [`bind_sql`] of a WHERE predicate, as its bound conjuncts.
 pub(crate) fn bind_where(sql: &str, schema: &Schema) -> Vec<BoundExpr> {
-    bind_sql(sql, schema).expect("bind WHERE").conjuncts()
+    bind_sql(sql, schema)
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .conjuncts()
 }
 
 /// [`bind_where`] for a predicate that is one conjunct — the input of the
@@ -237,34 +220,4 @@ pub(crate) fn parse_query(sql: &str) -> sqlparser::ast::Query {
         sqlparser::ast::Statement::Query(q) => *q,
         other => panic!("not a query: {other}"),
     }
-}
-
-/// Non-unique `RelIndex` list from raw column-index lists.
-pub(crate) fn idx_metas(col_lists: &[&[u32]]) -> Vec<RelIndex> {
-    let flagged: Vec<(&[u32], bool)> = col_lists.iter().map(|cols| (*cols, false)).collect();
-    idx_metas_flagged(&flagged)
-}
-
-/// `RelIndex` list from raw column-index lists, each with its `is_unique` flag.
-pub(crate) fn idx_metas_flagged(col_lists: &[(&[u32], bool)]) -> Vec<RelIndex> {
-    col_lists
-        .iter()
-        .map(|(cols, is_unique)| RelIndex {
-            cols: PkColList::from_slice(cols),
-            is_unique: *is_unique,
-        })
-        .collect()
-}
-
-/// The primary key of a VALUES row of written expressions, through the INSERT
-/// path's [`PkPlan`](crate::dml::PkPlan) with the identity slot map.
-pub(crate) fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<PkBuf, GnitzSqlError> {
-    let slot_of: Vec<Option<usize>> = (0..row.len()).map(Some).collect();
-    let cells = row
-        .iter()
-        .map(crate::bind::structural::bind_constant)
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut pks = PkColumn::empty_for_schema(schema);
-    crate::dml::PkPlan::written(&slot_of, schema)?.push(schema, 0, &cells, &mut pks)?;
-    Ok(PkBuf::from_bytes(pks.get_bytes(0)))
 }

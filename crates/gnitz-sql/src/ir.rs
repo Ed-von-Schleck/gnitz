@@ -547,11 +547,26 @@ impl<R> BExpr<R> {
     }
 
     /// Whether the expression can never evaluate to NULL, parameterized over
-    /// whether a leaf reference can. Each arm mirrors which engine kernels make a
-    /// NULL of their own from non-NULL operands. Conservative: `false` is always
-    /// safe.
-    pub(crate) fn never_null_with<F: Fn(&R) -> bool>(&self, leaf_nullable: &F) -> bool {
-        let go = |e: &BExpr<R>| e.never_null_with(leaf_nullable);
+    /// whether a leaf reference can and over its type. Each arm mirrors which
+    /// engine kernels make a NULL of their own from non-NULL operands.
+    /// Conservative: `false` is always safe.
+    pub(crate) fn never_null_with<N, T>(&self, leaf_nullable: &N, leaf_ty: &T) -> bool
+    where
+        N: Fn(&R) -> bool,
+        T: Fn(&R) -> ColType,
+    {
+        let go = |e: &BExpr<R>| e.never_null_with(leaf_nullable, leaf_ty);
+        let is = |e: &BExpr<R>, tc: TypeCode| e.infer_ty_with(leaf_ty).tc == tc;
+        // Operands lowering brings to one type: a DATE among them beside a
+        // TIMESTAMP is widened to microseconds, which is NULL past `i64`.
+        let widens_a_date = |operands: &mut dyn Iterator<Item = &BExpr<R>>| {
+            let (mut date, mut timestamp) = (false, false);
+            for e in operands {
+                date |= is(e, TypeCode::Date);
+                timestamp |= is(e, TypeCode::Timestamp);
+            }
+            date && timestamp
+        };
         match self {
             BExpr::ColRef(r) => !leaf_nullable(r),
             BExpr::LitInt(_)
@@ -563,18 +578,25 @@ impl<R> BExpr<R> {
             BExpr::BinOp(l, BinOp::Div | BinOp::Mod, r) => matches!(r.as_ref(), BExpr::LitInt(n) if *n != 0) && go(l),
             // A concatenation past `u32::MAX` bytes is NULL.
             BExpr::BinOp(_, BinOp::Concat, _) => false,
-            BExpr::BinOp(l, _, r) => go(l) && go(r),
+            BExpr::BinOp(l, _, r) => go(l) && go(r) && !widens_a_date(&mut [l.as_ref(), r.as_ref()].into_iter()),
             BExpr::Not(inner) => go(inner),
             BExpr::NullTest { .. } => true,
             BExpr::Case { branches, else_ } => {
-                else_.as_deref().is_some_and(go) && branches.iter().all(|(_, result)| go(result))
+                let results = || branches.iter().map(|(_, result)| result).chain(else_.as_deref());
+                else_.is_some() && results().all(go) && !widens_a_date(&mut results())
             }
             // The numeric kernels, LIKE and TRIM introduce no NULL of their own.
             BExpr::Func { arg, .. } | BExpr::Like { s: arg, .. } | BExpr::TrimCall { s: arg, .. } => go(arg),
             BExpr::Calendar { op, arg } => !op.may_null() && go(arg),
-            BExpr::InList { inner, items } => go(inner) && items.iter().all(go),
-            // GREATEST/LEAST skip a NULL argument.
-            BExpr::MinMaxN { args, .. } => args.iter().any(go),
+            BExpr::InList { inner, items } => {
+                let operands = || std::iter::once(inner.as_ref()).chain(items);
+                operands().all(go) && !widens_a_date(&mut operands())
+            }
+            // GREATEST/LEAST skip a NULL argument, a DATE widened to one included.
+            BExpr::MinMaxN { args, .. } => {
+                let widens = widens_a_date(&mut args.iter());
+                args.iter().any(|a| go(a) && !(widens && is(a, TypeCode::Date)))
+            }
             BExpr::StrCall { f, args } => !f.may_null(args.len()) && args.iter().all(go),
             // Text is a total rendering of any scalar; the other targets can refuse a value.
             BExpr::Cast { expr, to } if to.tc == TypeCode::String => go(expr),

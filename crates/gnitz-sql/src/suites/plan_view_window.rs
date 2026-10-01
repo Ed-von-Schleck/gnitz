@@ -23,7 +23,7 @@ fn cat() -> Catalog<'static> {
         ("t", table(1, t_cols(), vec![0])),
         ("u", table(2, vec![col("uid", i), col("k", i)], vec![0])),
         // A stream's PK is a routing and sort key, never unique.
-        ("st", rel(3, RelClass::Stream, t_cols(), vec![0], &[])),
+        ("st", rel(3, RelClass::Stream, t_cols(), vec![0], vec![])),
         (
             "x",
             table(4, vec![col("id", i), col("a", i), col("big", TypeCode::U128)], vec![0]),
@@ -51,7 +51,7 @@ fn a_window_call_types_and_names_like_the_aggregate_it_is() {
     for (body, want) in [
         (
             "SELECT id, COUNT(*) OVER (), SUM(b) OVER (), AVG(a) OVER (), MIN(b) OVER (PARTITION BY k), \
-             RANK() OVER (ORDER BY a), ROW_NUMBER() OVER (PARTITION BY k ORDER BY a DESC) FROM t",
+             RANK() OVER (ORDER BY a), ROW_NUMBER() OVER (PARTITION BY k ORDER BY a DESC), MAX(b) OVER () FROM t",
             vec![
                 c("id", i, false),
                 c("_count1", i, false),
@@ -60,6 +60,7 @@ fn a_window_call_types_and_names_like_the_aggregate_it_is() {
                 c("_min4", i, true),
                 c("_rank5", i, false),
                 c("_row_number6", i, false),
+                c("_max7", i, true),
             ],
         ),
         // A windowed MIN/MAX selects a row, so a TEXT argument survives the
@@ -261,12 +262,7 @@ fn every_unsupported_window_names_its_clause() {
             "ROW_NUMBER needs an input with a unique row key",
         ),
     ] {
-        assert_rejects(
-            body,
-            plan(&cat, &format!("CREATE VIEW v AS {body}")),
-            "Rejected",
-            needle,
-        );
+        assert_rejects(body, plan(&cat, &format!("CREATE VIEW v AS {body}")), needle);
     }
 }
 
@@ -307,14 +303,13 @@ fn row_number_reads_the_row_key_off_the_relation() {
         over(name).unwrap_or_else(|e| panic!("{name}: {e:?}"));
     }
     for name in ["sv", "jv", "tv2"] {
-        assert_rejects(name, over(name), "Rejected", "unique row key");
+        assert_rejects(name, over(name), "unique row key");
     }
     // `tv1` keeps its row key, a hidden 128-bit `_group_pk` no later ORDER BY key
     // can compare.
     assert_rejects(
         "tv1",
         over("tv1"),
-        "Rejected",
         "ROW_NUMBER's tiebreak (the input's row key): a 128-bit key",
     );
 }

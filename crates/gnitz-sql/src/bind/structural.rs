@@ -10,7 +10,7 @@ use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, NumFunc, StrArg, StrFunc,
 use crate::types::sql_col_type;
 use gnitz_core::Schema;
 use gnitz_expr::{CalendarOp, LikePattern};
-use gnitz_wire::ColumnDef;
+use gnitz_wire::{ColType, ColumnDef};
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, CeilFloorKind, DataType, DateTimeField, Expr, Function, TrimWhereField, TypedString,
     UnaryOperator, Value, ValueWithSpan,
@@ -64,9 +64,10 @@ pub(crate) trait LeafBinder<R> {
     fn bind_function(&self, f: &Function) -> Result<BExpr<R>, GnitzSqlError> {
         Err(aggregate_not_allowed(f))
     }
-    /// Whether the value a leaf reference names can be NULL — the one
-    /// nullability fact a leaf owns, which [`nullness`] folds a test by.
+    /// Whether the value a leaf reference names can be NULL, and its declared
+    /// type — the two facts a leaf owns that [`nullness`] folds a test by.
     fn is_nullable(&self, r: &R) -> bool;
+    fn type_of(&self, r: &R) -> ColType;
     /// A windowed call (`f(…) OVER (…)`). Only a view body's windowed SELECT
     /// list and QUALIFY admit one; every other context keeps this rejection.
     fn bind_window(&self, _f: &Function) -> Result<BExpr<R>, GnitzSqlError> {
@@ -434,6 +435,9 @@ impl LeafBinder<Infallible> for NoColumns {
     fn is_nullable(&self, r: &Infallible) -> bool {
         match *r {}
     }
+    fn type_of(&self, r: &Infallible) -> ColType {
+        match *r {}
+    }
 }
 
 /// A string literal only, so `s LIKE NULL` is rejected where PostgreSQL
@@ -799,7 +803,7 @@ enum Nullness {
 fn nullness<R, L: LeafBinder<R>>(value: &BExpr<R>, leaf: &L) -> Nullness {
     match value {
         BExpr::LitNull => Nullness::Always,
-        v if v.never_null_with(&|r| leaf.is_nullable(r)) => Nullness::Never,
+        v if v.never_null_with(&|r| leaf.is_nullable(r), &|r| leaf.type_of(r)) => Nullness::Never,
         _ => Nullness::Unknown,
     }
 }
@@ -869,6 +873,9 @@ impl LeafBinder<usize> for SingleTable<'_> {
     }
     fn is_nullable(&self, r: &usize) -> bool {
         self.schema.columns[*r].is_nullable
+    }
+    fn type_of(&self, r: &usize) -> ColType {
+        self.schema.columns[*r].ty
     }
 }
 

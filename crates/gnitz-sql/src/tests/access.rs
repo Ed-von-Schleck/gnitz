@@ -1,394 +1,307 @@
 use super::*;
-use crate::bind::bind_single_table;
 use crate::test_support::{
-    bind_conjunct, bind_sql, bind_where, col, compound_schema_u64_u64, eq_expr, extract_pk_value, idx_metas,
-    idx_metas_flagged, in_list_expr, ncol, parse_expr_sql, pk_schema, two_col, uuid_schema_payload, uuid_schema_pk,
+    bind_conjunct, bind_where, col, compound_schema_u64_u64, ix, pk_schema, schema, two_col, uq,
 };
-use gnitz_wire::{ColumnDef, PkBuf};
-use sqlparser::ast::Expr;
+use gnitz_wire::{ColType, ColumnDef, PkBuf};
+use Tier as T;
+
+const U64_MAX: u128 = u64::MAX as u128;
+const UUID_LIT: &str = "'550e8400-e29b-41d4-a716-446655440000'";
+const UUID_VALUE: u128 = 0x550e8400_e29b_41d4_a716_446655440000;
 
 /// `v`'s key image in a `tc` column.
 fn img(tc: TypeCode, v: i128) -> u128 {
     key_image(tc, v as u128)
 }
 
-/// The point `v` over the key list `cols`, `eq` pinning its leading columns.
-fn pt(cols: &[u32], eq: &[u128], v: u128) -> KeyRange {
-    KeyRange::point(PkColList::from_slice(cols), eq, v)
+/// One candidate: its tier, its bound, and the conjuncts (by position) it leaves
+/// residual.
+type Ranked = (Tier, ReadBound, Vec<usize>);
+
+/// Every candidate `sql` admits over `schema` and `indexes`, best first.
+fn ranked_of(sql: &str, schema: &Schema, indexes: &[RelIndex]) -> Vec<Ranked> {
+    ranked_conjuncts(&bind_where(sql, schema), schema, indexes)
 }
 
-/// `(id U64 pk, a tc, b tc)` — indexable cols a=1, b=2, `b` nullable per arg.
+fn ranked_conjuncts(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[RelIndex]) -> Vec<Ranked> {
+    ranked(conjuncts, schema, indexes)
+        .into_iter()
+        .map(|(tier, c)| {
+            let left = (0..conjuncts.len()).filter(|i| !c.consumed.contains(i)).collect();
+            (tier, c.bound, left)
+        })
+        .collect()
+}
+
+/// The range over the key list `cols` with `eq` pinned and the next column's
+/// image in `lo..=hi`.
+fn rng(cols: &[u32], eq: &[u128], lo: u128, hi: u128) -> ReadBound {
+    ReadBound::Range(KeyRange::new(
+        PkColList::from_slice(cols),
+        eq,
+        Cut::before(lo),
+        Cut::after(hi),
+    ))
+}
+
+/// The key set of `keys`, each the PK columns' native values in PK-list order.
+fn keys(schema: &Schema, keys: &[&[u128]]) -> ReadBound {
+    let bufs: Vec<PkBuf> = keys.iter().map(|k| schema.opk_key_cols(k)).collect();
+    ReadBound::PkSet(PkKeys::from_keys(schema.pk_stride(), bufs.iter().map(|b| b.pk_bytes())))
+}
+
+/// `(id U64 pk, a tc, b tc)`, `b` nullable per the flag.
 fn schema3(tc: TypeCode, b_nullable: bool) -> Schema {
-    Schema {
-        columns: vec![
+    schema(
+        vec![
             col("id", TypeCode::U64),
             col("a", tc),
             ColumnDef::new("b", tc, b_nullable),
         ],
-        pk_cols: vec![0],
-    }
+        &[0],
+    )
 }
 
-/// The classified terms of `conjuncts`.
-fn terms_of(conjuncts: &[BoundExpr], sch: &Schema) -> Vec<Term> {
-    conjuncts
-        .iter()
-        .enumerate()
-        .filter_map(|(i, c)| term(c, sch).map(|(col, pin)| Term { conjunct: i, col, pin }))
-        .collect()
-}
-
-/// The first index candidate for `conjuncts` — a range over one of `metas`' column
-/// lists: that list, its range, and how many conjuncts stay residual.
-fn first_index(conjuncts: &[BoundExpr], sch: &Schema, metas: &[RelIndex]) -> Option<(Vec<u32>, KeyRange, usize)> {
-    candidates(conjuncts, sch, metas)
-        .into_iter()
-        .find_map(|c| match c.bound {
-            ReadBound::Range(r) if metas.iter().any(|m| m.cols == r.cols()) => {
-                Some((r.cols().as_slice().to_vec(), r, conjuncts.len() - c.consumed.len()))
-            }
-            _ => None,
-        })
-}
-
-/// The best index candidate for `where_sql`: the winning index's declared column
-/// list and its descriptor. `lists` carries each index's `is_unique` flag.
-fn picked_flagged(where_sql: &str, sch: &Schema, lists: &[(&[u32], bool)]) -> Option<(Vec<u32>, KeyRange)> {
-    let bound = bind_where(where_sql, sch);
-    first_index(&bound, sch, &idx_metas_flagged(lists)).map(|(cols, desc, _)| (cols, desc))
-}
-
-/// [`picked_flagged`] over non-unique indexes.
-fn picked(where_sql: &str, sch: &Schema, lists: &[&[u32]]) -> Option<(Vec<u32>, KeyRange)> {
-    let flagged: Vec<(&[u32], bool)> = lists.iter().map(|&cols| (cols, false)).collect();
-    picked_flagged(where_sql, sch, &flagged)
-}
-
-/// The bound [`bound_column_list`] derives for the key list `cols`, plus its
-/// residual — the one recognizer alone, without the candidate ordering around it.
-fn bound_list_of<'e>(conjuncts: &'e [BoundExpr], cols: &[u32], sch: &Schema) -> Option<(KeyRange, Vec<&'e BoundExpr>)> {
-    let b = bound_column_list(PkColList::from_slice(cols), &terms_of(conjuncts, sch), sch)?;
-    Some((b.range, residual(conjuncts, &b.consumed)))
-}
-
-/// The first PK candidate (`PkSet` or a PK range) for `conjuncts`, with how many
-/// conjuncts stay residual.
-fn pk_bound(conjuncts: &[BoundExpr], schema: &Schema) -> Option<(ReadBound, usize)> {
-    candidates(conjuncts, schema, &[])
-        .into_iter()
-        .find(|c| match &c.bound {
-            ReadBound::PkSet(_) => true,
-            ReadBound::Range(r) => r.walks_pk(&schema.pk_cols),
-            ReadBound::None => false,
-        })
-        .map(|c| (c.bound, conjuncts.len() - c.consumed.len()))
-}
-
-/// The one key a WHERE names as a one-key `PkSet`, with its residual count.
-fn pk_point_of(conjuncts: &[BoundExpr], schema: &Schema) -> Option<(Vec<u8>, usize)> {
-    match pk_bound(conjuncts, schema)? {
-        (ReadBound::PkSet(keys), residual) if keys.len() == 1 => Some((keys.as_bytes().to_vec(), residual)),
-        _ => None,
-    }
-}
-
-/// The `(column, key image)` an equality conjunct pins.
-fn eq_of(expr: &BoundExpr, schema: &Schema) -> Option<(usize, u128)> {
-    match term(expr, schema)? {
-        (col, Pin::Range(r)) if r.start() == r.end() => Some((col, *r.start())),
-        _ => None,
-    }
+/// `(id U64 pk, x, a, b, c)`, every column U64 NOT NULL.
+fn five_u64() -> Schema {
+    schema(["id", "x", "a", "b", "c"].map(|n| col(n, TypeCode::U64)).to_vec(), &[0])
 }
 
 // ------------------------------------------------------------------
-// Equality terms — UUID + signed/wide seek keys
+// One conjunct, one pin
 // ------------------------------------------------------------------
 
+/// The images `sql` admits on the `val` column of a `(pk, val tc)` table; `None`
+/// when the conjunct is no term.
+fn pin(tc: TypeCode, sql: &str) -> Option<RangeInclusive<u128>> {
+    let schema = two_col(tc);
+    match term(&bind_conjunct(sql, &schema), &schema)? {
+        (1, Pin::Range(r)) => Some(r),
+        (col, _) => panic!("{sql}: a pin on column {col}"),
+    }
+}
+
+/// Each comparison against a literal as the interval of key images it admits: the
+/// literal on either side, a value outside the type saturating, one between two
+/// values cutting at its neighbour. A conjunct of any other shape, or over a
+/// column with no key image, is no term.
 #[test]
-fn test_uuid_index_seek_string_literal() {
-    let schema = uuid_schema_payload();
-    let expr = bind_conjunct("uid = '550e8400-e29b-41d4-a716-446655440000'", &schema);
-    assert_eq!(
-        eq_of(&expr, &schema),
-        Some((1, 0x550e8400_e29b_41d4_a716_446655440000_u128))
+fn a_comparison_pins_the_images_it_admits() {
+    use TypeCode::*;
+    let max = |tc: TypeCode| image_max(tc).unwrap();
+    let at = |tc, v| img(tc, v)..=img(tc, v);
+    let uuid_eq = format!("val = {UUID_LIT}");
+    let rows: Vec<(TypeCode, &str, Option<RangeInclusive<u128>>)> = vec![
+        // Each operator, in both operand orders.
+        (I64, "val = 5", Some(at(I64, 5))),
+        (I64, "5 = t.val", Some(at(I64, 5))),
+        (I64, "val >= 5", Some(img(I64, 5)..=max(I64))),
+        (I64, "val > 5", Some(img(I64, 6)..=max(I64))),
+        (I64, "5 < val", Some(img(I64, 6)..=max(I64))),
+        (I64, "val <= 5", Some(0..=img(I64, 5))),
+        (I64, "5 >= val", Some(0..=img(I64, 5))),
+        (I64, "val < 5", Some(0..=img(I64, 4))),
+        // A signed value packs at the column's own width.
+        (I64, "val = -1", Some(at(I64, -1))),
+        (I32, "val = -1", Some(at(I32, -1))),
+        (I16, "val = -1", Some(at(I16, -1))),
+        (I8, "val = -5", Some(at(I8, -5))),
+        (I32, "val >= -5", Some(img(I32, -5)..=max(I32))),
+        // Past `i64` the literal is wide, and still packs exactly.
+        (U64, "val = 18446744073709551615", Some(U64_MAX..=U64_MAX)),
+        (
+            U128,
+            "val >= 340282366920938463463374607431768211455",
+            Some(u128::MAX..=u128::MAX),
+        ),
+        (U128, "val > 340282366920938463463374607431768211455", Some(NOTHING)),
+        (UUID, &uuid_eq, Some(UUID_VALUE..=UUID_VALUE)),
+        // The strict operators at the type's edges admit nothing.
+        (I32, "val > 2147483647", Some(NOTHING)),
+        (I32, "val < -2147483648", Some(NOTHING)),
+        (U64, "val > 18446744073709551615", Some(NOTHING)),
+        // A literal outside the type admits nothing or everything.
+        (U64, "val = -1", Some(NOTHING)),
+        (I32, "val >= 3000000000", Some(NOTHING)),
+        (I32, "val <= 3000000000", Some(0..=max(I32))),
+        (I32, "val >= -3000000000", Some(0..=max(I32))),
+        (I32, "val < -3000000000", Some(NOTHING)),
+        (I32, "val <= -340282366920938463463374607431768211455", Some(NOTHING)),
+        (U8, "val < 300", Some(0..=255)),
+        (U128, "val >= -5", Some(0..=u128::MAX)),
+        // A literal between two values cuts at the neighbour it admits.
+        (I32, "val > 1.5", Some(img(I32, 2)..=max(I32))),
+        (I32, "val < 1.5", Some(0..=img(I32, 1))),
+        // No term: a float column, `<>`, a computed operand, a negated range, and
+        // a list on a column that is no PK column.
+        (F64, "val = 1", None),
+        (F64, "val < 5", None),
+        (I64, "val <> 5", None),
+        (I64, "val + 1 > 3", None),
+        (I64, "val NOT BETWEEN 1 AND 2", None),
+        (I64, "val IN (1, 2)", None),
+    ];
+    for (tc, sql, want) in rows {
+        assert_eq!(pin(tc, sql), want, "{tc:?}: {sql}");
+    }
+}
+
+// ------------------------------------------------------------------
+// The candidate list
+// ------------------------------------------------------------------
+
+/// Assert the whole candidate list of each `(indexes, sql)` over `schema`.
+fn check(schema: &Schema, rows: Vec<(Vec<RelIndex>, &str, Vec<Ranked>)>) {
+    for (indexes, sql, want) in rows {
+        assert_eq!(ranked_of(sql, schema, &indexes), want, "{sql} over {indexes:?}");
+    }
+}
+
+/// A WHERE that names whole keys gathers them, however the point or the list is
+/// spelled; whatever does not bind the PK stays residual.
+#[test]
+fn a_where_naming_whole_keys_is_a_key_set() {
+    let s = pk_schema(TypeCode::U64);
+    let one = |sql, key: u128, left: Vec<usize>| (vec![], sql, vec![(T::PkKeys, keys(&s, &[&[key]]), left)]);
+    check(
+        &s,
+        vec![
+            one("id = 5", 5, vec![]),
+            one("t.id = 5", 5, vec![]),
+            one("id >= 5 AND id <= 5", 5, vec![]),
+            one("id > 4 AND id <= 5", 5, vec![]),
+            one("id >= 5 AND id < 6", 5, vec![]),
+            one("id >= 18446744073709551615", U64_MAX, vec![]),
+            one("id > 18446744073709551614", U64_MAX, vec![]),
+            one("id <= 0", 0, vec![]),
+            one("id < 1", 0, vec![]),
+            one("id = 1 AND v = 9", 1, vec![1]),
+            (
+                vec![],
+                "v > 5 AND id IN (7, 9)",
+                vec![(T::PkKeys, keys(&s, &[&[7], &[9]]), vec![0])],
+            ),
+            // A NULL member admits no row, and one between two values names none.
+            (
+                vec![],
+                "id IN (1, NULL, 1.5)",
+                vec![(T::PkKeys, keys(&s, &[&[1]]), vec![])],
+            ),
+            // No member is a key: the range that admits nothing.
+            (
+                vec![],
+                "id IN (NULL, 1.5)",
+                vec![(T::PkRange, rng(&[0], &[], 1, 0), vec![])],
+            ),
+        ],
+    );
+
+    let c = compound_schema_u64_u64();
+    let set = |sql, ks: &[&[u128]], left: Vec<usize>| (vec![], sql, vec![(T::PkKeys, keys(&c, ks), left)]);
+    check(
+        &c,
+        vec![
+            set("a = 1 AND b = 2", &[&[1, 2]], vec![]),
+            set("b = 2 AND a = 1", &[&[1, 2]], vec![]),
+            set("a = 1 AND b = 2 AND v = 9", &[&[1, 2]], vec![2]),
+            set("a >= 1 AND a <= 1 AND b = 2", &[&[1, 2]], vec![]),
+            set("a = 1 AND b >= 18446744073709551615", &[&[1, U64_MAX]], vec![]),
+            set("a IN (7, 8) AND b = 3", &[&[7, 3], &[8, 3]], vec![]),
+            set("a IN (1, 1, 2) AND b = 3", &[&[1, 3], &[2, 3]], vec![]),
+            set("a IN (7) AND b = 3", &[&[7, 3]], vec![]),
+            // A prefix names a key group, never a key.
+            (vec![], "a IN (1, 2)", vec![]),
+            (
+                vec![],
+                "a = 1",
+                vec![(T::PinnedPkRange, rng(&[0, 1], &[], 1, 1), vec![])],
+            ),
+            (
+                vec![],
+                "a = 1 AND v = 9",
+                vec![(T::PinnedPkRange, rng(&[0, 1], &[], 1, 1), vec![1])],
+            ),
+            // Contradictory pins fold to the interval that admits nothing.
+            (
+                vec![],
+                "a = 1 AND a = 2",
+                vec![(T::PkRange, rng(&[0, 1], &[], 2, 1), vec![])],
+            ),
+        ],
+    );
+
+    // Crossed lists, the PK list against schema order and a signed column beside
+    // an unsigned one.
+    let crossed = schema(vec![col("a", TypeCode::I32), col("b", TypeCode::U16)], &[1, 0]);
+    let a = |v: i32| v as u32 as u128;
+    check(
+        &crossed,
+        vec![(
+            vec![],
+            "a IN (2, -1, -3) AND b IN (5, 1)",
+            vec![(
+                T::PkKeys,
+                keys(
+                    &crossed,
+                    &[
+                        &[1, a(-3)],
+                        &[1, a(-1)],
+                        &[1, a(2)],
+                        &[5, a(-3)],
+                        &[5, a(-1)],
+                        &[5, a(2)],
+                    ],
+                ),
+                vec![],
+            )],
+        )],
     );
 }
 
-/// The seek key `col = literal` packs, per column type: a negative signed
-/// literal packs at the column's own width, an unsigned column takes none, and
-/// a magnitude past `i64` (which binds as `LitWide`) still packs exactly.
+/// Every PK type's literal names the one key an INSERT of it stores, as a point
+/// and as a list.
 #[test]
-fn an_equality_packs_its_key_at_the_columns_width() {
-    for (tc, sql, want) in [
-        (TypeCode::I64, "val = -1", Some(((-1i64) as u64) as u128)),
-        (TypeCode::I32, "val = -1", Some(((-1i32) as u32) as u128)),
-        (TypeCode::I16, "val = -1", Some(((-1i16) as u16) as u128)),
-        (TypeCode::I8, "val = -5", Some(((-5i8) as u8) as u128)),
-        (TypeCode::I64, "val = 42", Some(42u128)),
-        // An unsigned column holds no negative value.
-        (TypeCode::U64, "val = -1", None),
-        // u64::MAX overflows i64 → binds to `LitWide`; the recognizer parses it
-        // byte-exactly for a U64 column (the servable wide index seek).
-        (TypeCode::U64, "val = 18446744073709551615", Some(u64::MAX as u128)),
+fn every_pk_type_names_its_key() {
+    use TypeCode::*;
+    let uuid2 = "'6ba7b810-9dad-11d1-80b4-00c04fd430c8'";
+    for (tc, lit, native) in [
+        (I8, "-1", (-1i8 as u8) as u128),
+        (I16, "-1", (-1i16 as u16) as u128),
+        (I32, "-1", (-1i32 as u32) as u128),
+        (I64, "-1", (-1i64 as u64) as u128),
+        (I64, "-9223372036854775808", (i64::MIN as u64) as u128),
+        (U16, "65535", 65535),
+        (U32, "4294967295", 4294967295),
+        (U64, "18446744073709551615", U64_MAX),
+        // `-0` names the value `0`, so an unsigned column takes it.
+        (U128, "-0", 0),
+        (UUID, "-0", 0),
+        (UUID, UUID_LIT, UUID_VALUE),
     ] {
-        let schema = two_col(tc);
-        let expr = bind_conjunct(sql, &schema);
+        let s = pk_schema(tc);
+        let want = vec![(T::PkKeys, keys(&s, &[&[native]]), vec![])];
+        assert_eq!(ranked_of(&format!("id = {lit}"), &s, &[]), want, "{tc:?} = {lit}");
+        // A repeat keeps the list a list, and is no second key.
         assert_eq!(
-            eq_of(&expr, &schema),
-            want.map(|key| (1, key_image(tc, key))),
-            "{tc:?}: {sql}"
+            ranked_of(&format!("id IN ({lit}, {lit})"), &s, &[]),
+            want,
+            "{tc:?} IN {lit}"
         );
     }
-}
-
-/// A single-quoted UUID binds as a servable seek literal; a double-quoted token
-/// is an `Identifier` in `GenericDialect`, so binding it as a column reference
-/// fails (no such column) — it is never a seek literal. The double-quote
-/// guarantee moved from the AST recognizer to the parser + binder.
-#[test]
-fn double_quoted_uuid_binds_as_column_ref_not_seek() {
-    let schema = uuid_schema_payload();
-    let sq = bind_sql("uid = '550e8400-e29b-41d4-a716-446655440000'", &schema).unwrap();
-    assert!(eq_of(&sq, &schema).is_some(), "single-quoted UUID is a seek key");
-
-    let err = bind_sql("uid = \"550e8400-e29b-41d4-a716-446655440000\"", &schema)
-        .expect_err("double-quoted token must not bind as a literal");
-    assert!(matches!(err, crate::GnitzSqlError::Rejected(_)), "got {err:?}");
-}
-
-/// A qualified reference resolves to the same column (the single-relation
-/// leniency at bind), and the literal may sit on EITHER side of the `=` — the
-/// mirrored arm of `bound_col_vs_literal` no other equality test reaches.
-#[test]
-fn a_flipped_qualified_equality_is_the_same_seek_key() {
-    let schema = pk_schema(TypeCode::U64); // (id U64 pk, v I64)
+    let s = pk_schema(UUID);
     assert_eq!(
-        eq_of(&bind_conjunct("5 = t.v", &schema), &schema),
-        Some((1, img(TypeCode::I64, 5)))
+        ranked_of(&format!("id IN ({uuid2}, {})", UUID_LIT), &s, &[]),
+        vec![(
+            T::PkKeys,
+            keys(&s, &[&[UUID_VALUE], &[0x6ba7b810_9dad_11d1_80b4_00c04fd430c8]]),
+            vec![]
+        )]
     );
-}
-
-// ------------------------------------------------------------------
-// The exact key a fully-pinned PK names
-// ------------------------------------------------------------------
-
-/// Which WHEREs over a compound PK name a single key, and which name only a
-/// key *group* — a group must never restrict a caller's buffered rows to one
-/// PK. The named key packs in pk-list order however the conjuncts were
-/// spelled, and whatever does not bind the PK rides the residual.
-#[test]
-fn a_compound_pk_point_names_a_key_only_when_every_column_binds() {
-    let schema = compound_schema_u64_u64();
-    // OPK: each unsigned column big-endian, at its pk-list offset.
-    let mut key_1_2 = [0u8; 16];
-    key_1_2[..8].copy_from_slice(&1u64.to_be_bytes());
-    key_1_2[8..16].copy_from_slice(&2u64.to_be_bytes());
-
-    for (sql, want_residual) in [
-        ("a = 1 AND b = 2", 0),
-        // Order swapped; the tuple must still pack in pk-list order.
-        ("b = 2 AND a = 1", 0),
-        ("a = 1 AND b = 2 AND v = 9", 1),
-        // A range-spelled point extends the equality prefix.
-        ("a >= 1 AND a <= 1 AND b = 2", 0),
-    ] {
-        let expr = bind_where(sql, &schema);
-        let (pk, residual) = pk_point_of(&expr, &schema).unwrap_or_else(|| panic!("{sql}: must bind"));
-        assert_eq!(pk, &key_1_2[..], "{sql}");
-        assert_eq!(residual, want_residual, "{sql}: residual");
-    }
-
-    for (sql, want_residual) in [
-        // A bare prefix: the worker still walks the `a = 1` group.
-        ("a = 1", 0),
-        // `a` binds, `v` is a payload conjunct → residual; the PK stays incomplete.
-        ("a = 1 AND v = 9", 1),
-    ] {
-        let expr = bind_where(sql, &schema);
-        let (bound, residual) = pk_bound(&expr, &schema).unwrap_or_else(|| panic!("{sql}: still bounds"));
-        assert_eq!(bound, ReadBound::Range(pt(&[0, 1], &[], 1)), "{sql}");
-        assert_eq!(residual, want_residual, "{sql}: residual");
-    }
-
-    // Contradictory pins fold to the inverted interval on `a`, which names no key
-    // and returns nothing.
-    let expr = bind_where("a = 1 AND a = 2", &schema);
-    let (bound, residual) = pk_bound(&expr, &schema).expect("still bounds");
+    // A member that spells no UUID is no key list at all.
     assert_eq!(
-        bound,
-        ReadBound::Range(KeyRange::new(
-            PkColList::from_slice(&[0, 1]),
-            &[],
-            Cut::before(2),
-            Cut::after(1)
-        ))
+        ranked_of(&format!("id IN ({}, 'not-a-uuid')", UUID_LIT), &s, &[]),
+        vec![]
     );
-    assert_eq!(residual, 0);
-}
-
-/// A single-column PK point names one OPK key however it is spelled, consuming
-/// every conjunct; an open range names no key.
-#[test]
-fn a_single_pk_point_is_the_same_key_however_it_is_spelled() {
-    let schema = pk_schema(TypeCode::U64);
-    for sql in [
-        "id = 5",
-        "id >= 5 AND id <= 5",
-        "id > 4 AND id <= 5",
-        "id >= 5 AND id < 6",
-    ] {
-        let expr = bind_where(sql, &schema);
-        let (pk, residual) = pk_point_of(&expr, &schema).unwrap_or_else(|| panic!("{sql}: must bind"));
-        assert_eq!(pk, &5u64.to_be_bytes()[..], "{sql}");
-        assert_eq!(residual, 0, "{sql}: every conjunct is consumed by the walk");
-    }
-    let with_payload = bind_where("id = 1 AND v = 9", &schema);
-    let (pk, residual) = pk_point_of(&with_payload, &schema).expect("PK binds");
-    assert_eq!(pk, &1u64.to_be_bytes()[..]);
-    assert_eq!(residual, 1, "the non-PK conjunct rides the residual");
-    assert!(pk_point_of(&bind_where("id > 5", &schema), &schema).is_none());
-
-    let qualified = bind_where("t.id = 1", &schema);
-    let (pk, residual) = pk_point_of(&qualified, &schema).expect("a qualified PK binds");
-    assert_eq!(pk, &1u64.to_be_bytes()[..]);
-    assert_eq!(residual, 0);
-}
-
-/// Redundant ends on a U128 PK fold into one exact interval, so no conjunct is
-/// left for the expression VM, which has no 16-byte slot.
-#[test]
-fn redundant_wide_pk_ends_consume_every_conjunct() {
-    let schema = pk_schema(TypeCode::U128);
-    let expr = bind_where("id > 5 AND id > 7", &schema);
-    let (bound, residual) = pk_bound(&expr, &schema).expect("bounds");
-    let ReadBound::Range(desc) = bound else {
-        panic!("expected a PK range, got {bound:?}");
-    };
-    assert_eq!((desc.start, desc.end), (Cut::before(8), Cut::after(u128::MAX)));
-    assert_eq!(residual, 0);
-}
-
-// ------------------------------------------------------------------
-// What a column list matches at all
-// ------------------------------------------------------------------
-
-/// `WHERE val = 1` on a float column bounds nothing: a type that has no packed
-/// key is no term, so no index can serve it.
-#[test]
-fn a_float_column_is_never_an_index_key() {
-    let schema = two_col(TypeCode::F64);
-    let expr = bind_where("val = 1", &schema);
-    assert!(candidates(&expr, &schema, &idx_metas(&[&[1]])).is_empty());
-}
-
-/// The whole AND-tree is walked. `a = 1 AND b = 2 AND c = 3` binds as
-/// `((a = 1 AND b = 2) AND c = 3)`, so finding the leftmost-deepest conjunct
-/// and the rightmost one — each against an index that names only its column —
-/// proves every leaf is reached.
-#[test]
-fn every_leaf_of_the_and_tree_is_reached() {
-    let schema = Schema {
-        columns: vec![
-            col("pk", TypeCode::U64),
-            ncol("a", TypeCode::U64),
-            ncol("b", TypeCode::U64),
-            ncol("c", TypeCode::U64),
-        ],
-        pk_cols: vec![0],
-    };
-    let expr = bind_where("a = 1 AND b = 2 AND c = 3", &schema);
-    for (col, key) in [(1u32, 1u128), (3, 3)] {
-        let cands = candidates(&expr, &schema, &idx_metas(&[&[col]]));
-        assert_eq!(cands.len(), 1, "INDEX({col})");
-        let (_, desc, residual) = first_index(&expr, &schema, &idx_metas(&[&[col]])).unwrap();
-        assert_eq!(desc, pt(&[col], &[], key), "INDEX({col})");
-        assert_eq!(residual, 2, "INDEX({col})");
-    }
-}
-
-/// `(id U64 pk, x U64, a U64, b U64, c U64)` — every payload col non-nullable,
-/// so no candidate is dropped by the nullable trailing-column guard.
-fn seek_rank_schema() -> Schema {
-    Schema {
-        columns: vec![
-            col("id", TypeCode::U64),
-            col("x", TypeCode::U64),
-            col("a", TypeCode::U64),
-            col("b", TypeCode::U64),
-            col("c", TypeCode::U64),
-        ],
-        pk_cols: vec![0],
-    }
-}
-
-/// A point covering every column of UNIQUE(x) selects at most one row, so it
-/// outranks the longer — but non-unique, and disjoint — prefix of INDEX(a, b).
-#[test]
-fn a_covered_unique_index_outranks_a_longer_disjoint_prefix() {
-    let (cols, _) = picked_flagged(
-        "x = 1 AND a = 2 AND b = 3",
-        &seek_rank_schema(),
-        &[(&[1], true), (&[2, 3], false)],
-    )
-    .expect("some index must bound");
-    assert_eq!(cols, vec![1], "UNIQUE(x) admits one row; INDEX(a, b) admits many");
-}
-
-/// With no candidate fully covered the leading term is false for both, so the
-/// rest of the rank decides: equal pinned depth, then the tighter index.
-/// (`seek_rank_schema`'s payload columns are all non-nullable, so the
-/// uncovered trailing column of each index does not reject it outright.)
-#[test]
-fn a_partial_cover_of_a_unique_index_does_not_jump_the_queue() {
-    let (cols, _) = picked_flagged("a = 1", &seek_rank_schema(), &[(&[2, 3], true), (&[2, 3, 4], false)])
-        .expect("some index must bound");
-    assert_eq!(cols, vec![2, 3], "a prefix point on UNIQUE(a, b) is not itself unique");
-}
-
-// ------------------------------------------------------------------
-// The PK key set
-// ------------------------------------------------------------------
-
-/// The gather keys of `sql`, decoded to native values.
-fn pk_in_keys_of(sql: &str, schema: &Schema) -> Option<Vec<u128>> {
-    set_keys_of(&bind_where(sql, schema), schema)
-}
-
-/// The first `PkSet` candidate's keys, decoded to native values.
-fn set_keys_of(conjuncts: &[BoundExpr], schema: &Schema) -> Option<Vec<u128>> {
-    candidates(conjuncts, schema, &[])
-        .into_iter()
-        .find_map(|c| match c.bound {
-            ReadBound::PkSet(keys) => Some(natives(schema, &keys)),
-            _ => None,
-        })
-}
-
-/// A gather's OPK keys decoded back to native values, in key order.
-fn natives(schema: &Schema, keys: &PkKeys) -> Vec<u128> {
-    keys.iter()
-        .map(|k| u128::from_le_bytes(schema.native_le_key(k)[..16].try_into().unwrap()))
-        .collect()
-}
-
-/// A list gather needs every PK column: a list on a PK prefix names no key, a
-/// companion point completes it, and a one-key list is the point it folds to.
-#[test]
-fn a_list_gather_needs_every_pk_column() {
-    let compound = compound_schema_u64_u64();
-    assert!(pk_in_keys_of("a IN (1, 2)", &compound).is_none());
-    // Native images pack `a` in the low 8 bytes and `b` above them.
-    let key = |a: u128, b: u128| a | (b << 64);
-    assert_eq!(
-        pk_in_keys_of("a IN (7, 8) AND b = 3", &compound),
-        Some(vec![key(7, 3), key(8, 3)])
-    );
-    // A repeat is no second key.
-    assert_eq!(
-        pk_in_keys_of("a IN (1, 1, 2) AND b = 3", &compound),
-        Some(vec![key(1, 3), key(2, 3)])
-    );
-    assert_eq!(pk_in_keys_of("id IN (7)", &pk_schema(TypeCode::U64)), Some(vec![7]));
 }
 
 /// A cross product of lists past the cap gathers nothing; a lone list that long gathers.
@@ -400,707 +313,285 @@ fn a_list_product_past_the_cap_is_no_set() {
         items: (0..n).map(BoundExpr::LitInt).collect(),
     };
     const { assert!(300 * 300 > MAX_CROSS_PRODUCT_KEYS) };
-    assert!(set_keys_of(&[list(0, 300), list(1, 300)], &schema).is_none());
-    let point = bind_where("b = 3", &schema);
-    let lone = [list(0, MAX_CROSS_PRODUCT_KEYS as i64 + 1), point[0].clone()];
-    assert_eq!(
-        set_keys_of(&lone, &schema).map(|k| k.len()),
-        Some(MAX_CROSS_PRODUCT_KEYS + 1)
-    );
-}
-
-/// Crossed keys ascend in OPK order with the PK list against schema order and a signed
-/// column beside an unsigned one.
-#[test]
-fn crossed_keys_ascend_in_pk_list_order() {
-    let schema = Schema {
-        columns: vec![col("a", TypeCode::I32), col("b", TypeCode::U16)],
-        pk_cols: vec![1, 0],
-    };
-    let where_expr = bind_where("a IN (2, -1, -3) AND b IN (5, 1)", &schema);
-    let keys = candidates(&where_expr, &schema, &[])
-        .into_iter()
-        .find_map(|c| match c.bound {
-            ReadBound::PkSet(keys) => Some(keys),
-            _ => None,
-        })
-        .expect("both PK columns carry a list");
-    let (i32_tc, u16_tc) = (TypeCode::I32, TypeCode::U16);
-    let mut want = Vec::new();
-    for b in [1u128, 5] {
-        for a in [-3i128, -1, 2] {
-            let key = gnitz_wire::encode_pk_images([(u16_tc, u16_tc, b), (i32_tc, i32_tc, img(i32_tc, a))]);
-            want.extend_from_slice(key.pk_bytes());
-        }
-    }
-    assert_eq!(keys.as_bytes(), &want[..]);
-}
-
-#[test]
-fn a_uuid_string_list_gathers() {
-    assert_eq!(
-        pk_in_keys_of(
-            "id IN ('550e8400-e29b-41d4-a716-446655440000', '6ba7b810-9dad-11d1-80b4-00c04fd430c8')",
-            &uuid_schema_pk()
-        ),
-        Some(vec![
-            0x550e8400_e29b_41d4_a716_446655440000,
-            0x6ba7b810_9dad_11d1_80b4_00c04fd430c8
-        ])
-    );
-}
-
-#[test]
-fn an_invalid_uuid_in_a_list_gathers_nothing() {
+    assert_eq!(ranked_conjuncts(&[list(0, 300), list(1, 300)], &schema, &[]), vec![]);
+    let point = bind_conjunct("b = 3", &schema);
+    let lone = ranked_conjuncts(&[list(0, MAX_CROSS_PRODUCT_KEYS as i64 + 1), point], &schema, &[]);
     assert!(
-        pk_in_keys_of(
-            "id IN ('550e8400-e29b-41d4-a716-446655440000', 'not-a-uuid')",
-            &uuid_schema_pk()
-        )
-        .is_none(),
-        "invalid UUID in list should fall back to slow scan"
+        matches!(&lone[..], [(T::PkKeys, ReadBound::PkSet(keys), left)]
+            if keys.len() == MAX_CROSS_PRODUCT_KEYS + 1 && left.is_empty()),
+        "{:?}",
+        lone.iter().map(|(tier, ..)| *tier).collect::<Vec<_>>()
     );
 }
 
+/// A PK range, on every key type: the interval its conjuncts fold to, every one
+/// of them consumed — the 16-byte types have no register to re-impose one in.
 #[test]
-fn a_negative_i32_list_gathers_in_key_order() {
-    assert_eq!(
-        pk_in_keys_of("id IN (-1, -2)", &pk_schema(TypeCode::I32)),
-        // In key order: the gather sorts its keys, and -2 sorts first.
-        Some(vec![(-2i32 as u32) as u128, (-1i32 as u32) as u128])
+fn a_pk_range_is_the_interval_its_conjuncts_fold_to() {
+    use TypeCode::*;
+    let decimal = schema(
+        vec![ColumnDef::typed("id", ColType::decimal(2), false), col("v", I64)],
+        &[0],
     );
-}
-
-/// A list inside an AND-tree still gathers, its companion conjunct left residual.
-#[test]
-fn pk_in_inside_an_and_tree_gathers_with_a_residual() {
-    let schema = pk_schema(TypeCode::U64);
-    let expr = bind_where("v > 5 AND id IN (7, 9)", &schema);
-    let (bound, residual) = pk_bound(&expr, &schema).expect("the IN conjunct bounds the gather");
-    let ReadBound::PkSet(keys) = bound else {
-        panic!("expected a gather, got {bound:?}");
-    };
-    assert_eq!(natives(&schema, &keys), vec![7, 9]);
-    assert_eq!(residual, 1, "`v > 5` stays residual");
-    assert_eq!(pk_in_keys_of("t.id IN (1, 2)", &schema), Some(vec![1, 2]));
-}
-
-// ------------------------------------------------------------------
-// A one-element IN list is the equality it spells. `bind::structural` pins the
-// fold itself.
-// ------------------------------------------------------------------
-
-/// On `PRIMARY KEY (a, b)`, `a IN (7) AND b = 3` names the whole key.
-#[test]
-fn one_key_in_list_names_the_pk_key() {
-    let schema = compound_schema_u64_u64();
-    let expr = bind_where("a IN (7) AND b = 3", &schema);
-    let (pk, residual) = pk_point_of(&expr, &schema).expect("one-key IN names a key");
-    assert_eq!(pk, schema.opk_key_cols(&[7, 3]).pk_bytes());
-    assert_eq!(residual, 0);
-}
-
-/// On a U128 column the index bound must consume the conjunct outright — nothing
-/// may reach the expression VM, which has no 16-byte slot for the OR-chain a
-/// list lowers to.
-#[test]
-fn one_key_in_list_takes_an_index_bound() {
-    let schema = two_col(TypeCode::U128);
-    let expr = bind_where("val IN (7)", &schema);
-    let (_, desc, residual) =
-        first_index(&expr, &schema, &idx_metas(&[&[1]])).expect("one-key IN must take an index bound");
-    assert_eq!(desc, pt(&[1], &[], 7));
-    assert_eq!(residual, 0, "the bound consumes the conjunct");
-}
-
-// ------------------------------------------------------------------
-// Routing parity: extract_pk_value (INSERT, AST) / the equality term / the PK key
-// set (bound) must agree byte-for-byte on the packed u128.
-// ------------------------------------------------------------------
-
-fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
-    let schema = pk_schema(pk_tc);
-
-    // 1. extract_pk_value (INSERT row), AST-based.
-    let row = vec![literal.clone(), parse_expr_sql("0")];
-    let got_insert: PkBuf =
-        extract_pk_value(&row, &schema).unwrap_or_else(|e| panic!("extract_pk_value({pk_tc:?}): {e}"));
-    assert_eq!(got_insert, schema.opk_key_cols(&[expected]), "extract_pk_value");
-
-    // 2. The equality term (bound WHERE pk = literal).
-    let eq = bind_single_table(&eq_expr("id", literal.clone()), &schema, "t").expect("bind eq");
-    assert_eq!(
-        eq_of(&eq, &schema),
-        Some((0, key_image(pk_tc, expected))),
-        "equality term"
-    );
-
-    // 3. The key set — the repeat keeps it an `InList` (a one-item list folds to
-    // the `Eq` leg 2 already covers); the dedup collapses it to one key.
-    let in_e = bind_single_table(&in_list_expr("id", vec![literal.clone(), literal]), &schema, "t").expect("bind in");
-    assert_eq!(set_keys_of(&[in_e], &schema), Some(vec![expected]), "key set");
-}
-
-#[test]
-fn every_pk_type_routes_to_one_packed_key() {
-    for (tc, literal, expected) in [
-        (TypeCode::I8, parse_expr_sql("-1"), (-1i8 as u8) as u128),
-        (TypeCode::I16, parse_expr_sql("-1"), (-1i16 as u16) as u128),
-        (TypeCode::I32, parse_expr_sql("-1"), (-1i32 as u32) as u128),
-        (TypeCode::I64, parse_expr_sql("-1"), ((-1i64) as u64) as u128),
-        // The prepend-`-` parse rule: the `i64::MIN` magnitude overflows i64 →
-        // `LitWide`, and every path parses it byte-exactly.
+    for (s, sql, tier, lo, hi) in [
+        (pk_schema(U64), "id > 5", T::PkRange, 6, U64_MAX),
+        (pk_schema(U64), "id < -1", T::PkRange, 1, 0),
+        (pk_schema(U64), "id = -1", T::PkRange, 1, 0),
+        (pk_schema(U64), "id = 3.5", T::PkRange, 1, 0),
+        // Bounding nothing, it still consumes its conjunct.
+        (pk_schema(U64), "id > -5", T::UnboundedPkRange, 0, U64_MAX),
+        (pk_schema(U128), "id > 5 AND id > 7", T::PkRange, 8, u128::MAX),
+        (pk_schema(I128), "id > 5", T::PkRange, img(I128, 6), u128::MAX),
         (
-            TypeCode::I64,
-            parse_expr_sql("-9223372036854775808"),
-            (i64::MIN as u64) as u128,
+            pk_schema(UUID),
+            &format!("id > {}", UUID_LIT)[..],
+            T::PkRange,
+            UUID_VALUE + 1,
+            u128::MAX,
         ),
-        (TypeCode::U16, parse_expr_sql("65535"), 65535u128),
-        (TypeCode::U32, parse_expr_sql("4294967295"), 4294967295u128),
-        // u64::MAX binds to `LitWide` for the WHERE seeks; INSERT parses it directly.
-        (TypeCode::U64, parse_expr_sql("18446744073709551615"), u64::MAX as u128),
-        // `-0` names the value `0`: the sign carries no information for an
-        // integer, so an unsigned column takes it on every path. `-1` does not
-        // (`extract_pk_value_u128_rejects_negative`).
-        (TypeCode::U128, parse_expr_sql("-0"), 0),
-        (TypeCode::UUID, parse_expr_sql("-0"), 0),
+        // A literal finer than the column's scale cuts after the value below it.
+        (decimal, "id < 1.005", T::PkRange, 0, img(Decimal, 100)),
     ] {
-        check_pk_parity(tc, literal, expected);
-    }
-}
-
-// ------------------------------------------------------------------
-// Range terms
-// ------------------------------------------------------------------
-
-/// The images `val OP lit` admits on a `tc` column: a literal outside the type
-/// saturates, and one between two values admits from the value above it or up to the
-/// value below it.
-#[test]
-fn a_range_end_admits_the_images_it_names() {
-    let pin = |tc, sql: &str| {
-        let schema = two_col(tc);
-        match term(&bind_conjunct(sql, &schema), &schema) {
-            Some((1, Pin::Range(r))) => Some(r),
-            _ => None,
-        }
-    };
-    let i = |v: i128| img(TypeCode::I32, v);
-    let max = image_max(TypeCode::I32).unwrap();
-    assert_eq!(pin(TypeCode::I32, "val >= 5"), Some(i(5)..=max));
-    assert_eq!(pin(TypeCode::I32, "val > 5"), Some(i(6)..=max));
-    assert_eq!(pin(TypeCode::I32, "val >= -5"), Some(i(-5)..=max));
-    assert_eq!(pin(TypeCode::I32, "val >= 3000000000"), Some(NOTHING));
-    assert_eq!(pin(TypeCode::I32, "val <= 3000000000"), Some(0..=max));
-    assert_eq!(pin(TypeCode::I32, "val >= -3000000000"), Some(0..=max));
-    assert_eq!(pin(TypeCode::I32, "val < -3000000000"), Some(NOTHING));
-    assert_eq!(
-        pin(TypeCode::I32, "val <= -340282366920938463463374607431768211455"),
-        Some(NOTHING)
-    );
-    assert_eq!(pin(TypeCode::I32, "val > 2147483647"), Some(NOTHING));
-    assert_eq!(pin(TypeCode::U64, "val > 18446744073709551615"), Some(NOTHING));
-    assert_eq!(pin(TypeCode::I32, "val < -2147483648"), Some(NOTHING));
-    assert_eq!(pin(TypeCode::U8, "val < 300"), Some(0..=255));
-    assert_eq!(pin(TypeCode::I32, "val > 1.5"), Some(i(2)..=max));
-    assert_eq!(pin(TypeCode::I32, "val < 1.5"), Some(0..=i(1)));
-    assert_eq!(pin(TypeCode::F64, "val < 5"), None);
-    assert_eq!(
-        pin(TypeCode::U128, "val >= 340282366920938463463374607431768211455"),
-        Some(u128::MAX..=u128::MAX)
-    );
-    assert_eq!(
-        pin(TypeCode::U128, "val > 340282366920938463463374607431768211455"),
-        Some(NOTHING)
-    );
-    assert_eq!(pin(TypeCode::U128, "val >= -5"), Some(0..=u128::MAX));
-}
-
-#[test]
-fn range_term_orientations() {
-    let schema = two_col(TypeCode::I64);
-    let max = image_max(TypeCode::I64).unwrap();
-    let i = |v: i128| img(TypeCode::I64, v);
-    let ck = |sql: &str| match term(&bind_conjunct(sql, &schema), &schema) {
-        Some((col, Pin::Range(r))) => Some((col, r)),
-        _ => None,
-    };
-    assert_eq!(ck("val > 5"), Some((1, i(6)..=max)));
-    assert_eq!(ck("5 < val"), Some((1, i(6)..=max)));
-    assert_eq!(ck("val <= 5"), Some((1, 0..=i(5))));
-    assert_eq!(ck("5 >= val"), Some((1, 0..=i(5))));
-    assert_eq!(ck("val >= 5"), Some((1, i(5)..=max)));
-    assert_eq!(ck("val < 5"), Some((1, 0..=i(4))));
-    assert_eq!(ck("val = 5"), Some((1, i(5)..=i(5))));
-}
-
-// ── bound_column_list: the one recognizer, over one key list ────────────────
-
-#[test]
-fn a_composite_eq_prefix_pins_and_then_bounds() {
-    let schema = schema3(TypeCode::U64, false);
-    let expr = bind_where("a = 7 AND b < 50", &schema);
-    let (desc, residual) = bound_list_of(&expr, &[1, 2], &schema).expect("the eq prefix + range bounds");
-    assert_eq!(desc.eq_vals(), &[7u128]);
-    assert_eq!(desc.start, Cut::before(0));
-    assert_eq!(desc.end, Cut::after(49));
-    assert!(residual.is_empty(), "both conjuncts consumed");
-}
-
-#[test]
-fn between_desugars_to_two_ends_and_not_between_to_none() {
-    let schema = two_col(TypeCode::I64);
-    // BETWEEN desugars at bind to `val >= 10 AND val <= 20` → two consumed ends.
-    let expr = bind_where("val BETWEEN 10 AND 20", &schema);
-    let (desc, residual) = bound_list_of(&expr, &[1], &schema).expect("BETWEEN bounds");
-    let i = |v: i128| img(TypeCode::I64, v);
-    assert_eq!((desc.start, desc.end), (Cut::before(i(10)), Cut::after(i(20))));
-    assert!(residual.is_empty());
-
-    // NOT BETWEEN binds to `Not(val >= 10 AND val <= 20)` — one leaf conjunct,
-    // no range end → nothing bounds.
-    let expr = bind_where("val NOT BETWEEN 10 AND 20", &schema);
-    assert!(bound_list_of(&expr, &[1], &schema).is_none());
-}
-
-/// Every pin on a column intersects into one interval, and all of them are
-/// consumed: the intersection is exact, so nothing is left to re-impose.
-#[test]
-fn redundant_pins_fold_to_their_intersection() {
-    let schema = two_col(TypeCode::U64);
-    for sql in ["val > 5 AND val > 10", "val > 10 AND val > 5"] {
-        let expr = bind_where(sql, &schema);
-        let (desc, residual) = bound_list_of(&expr, &[1], &schema).unwrap_or_else(|| panic!("{sql}: bounds"));
-        assert_eq!(desc.start, Cut::before(11), "{sql}");
-        assert!(residual.is_empty(), "{sql}");
-    }
-    let expr = bind_where("val = 5 AND val > 3", &schema);
-    let (desc, residual) = bound_list_of(&expr, &[1], &schema).expect("bounds");
-    assert_eq!(desc, pt(&[1], &[], 5));
-    assert!(residual.is_empty());
-}
-
-/// Signed values fold in signed order, not in the order of their packed images.
-#[test]
-fn a_signed_column_folds_in_signed_order() {
-    let schema = two_col(TypeCode::I32);
-    let expr = bind_where("val > -5 AND val > 3", &schema);
-    let (desc, _) = bound_list_of(&expr, &[1], &schema).expect("bounds");
-    assert_eq!(desc.start, Cut::before(img(TypeCode::I32, 4)));
-    let expr = bind_where("val < -5 AND val < 3", &schema);
-    let (desc, _) = bound_list_of(&expr, &[1], &schema).expect("bounds");
-    assert_eq!(desc.end, Cut::after(img(TypeCode::I32, -6)));
-}
-
-#[test]
-fn an_out_of_range_end_saturates_to_the_type_edge() {
-    let schema = two_col(TypeCode::I32);
-    let (lo, hi) = (Cut::before(0), Cut::after(image_mask(4)));
-
-    let expr = bind_where("val > 3000000000", &schema);
-    let (desc, _) = bound_list_of(&expr, &[1], &schema).expect("a saturated end still bounds");
-    assert_eq!((desc.start, desc.end), (Cut::before(1), Cut::after(0)));
-
-    let expr = bind_where("val < 3000000000", &schema);
-    let (desc, _) = bound_list_of(&expr, &[1], &schema).expect("a saturated end still bounds");
-    assert_eq!((desc.start, desc.end), (lo, hi));
-}
-
-/// A string range end on a DATE column is a key through the same temporal rule
-/// its equality takes.
-#[test]
-fn a_date_string_range_end_bounds_its_index() {
-    let schema = Schema {
-        columns: vec![col("id", TypeCode::U64), col("d", TypeCode::Date)],
-        pk_cols: vec![0],
-    };
-    let (cols, desc) = picked("d >= '2024-01-01'", &schema, &[&[1]]).expect("the string end bounds INDEX(d)");
-    assert_eq!(cols, vec![1]);
-    assert_eq!(desc.start, Cut::before(img(TypeCode::Date, 19723)));
-}
-
-#[test]
-fn a_conjunct_the_key_list_does_not_name_stays_residual() {
-    let schema = schema3(TypeCode::U64, false);
-    // The list names `b` only, so `a = 7` is not consumed.
-    let expr = bind_where("b > 10 AND a = 7", &schema);
-    let (desc, residual) = bound_list_of(&expr, &[2], &schema).expect("`b > 10` bounds INDEX(b)");
-    assert!(desc.eq_vals().is_empty());
-    assert_eq!(desc.start, Cut::before(11));
-    assert_eq!(residual.len(), 1, "`a = 7` is a residual conjunct");
-}
-
-// ── candidates: the whole-WHERE arbitration ─────────────────────────────────
-//
-// These pin the *chosen* bound, not just the recognizer above: which candidate
-// wins across shapes and across separate indexes.
-
-/// A pure equality on a 1-column index lowers to a degenerate point range.
-#[test]
-fn equality_lowers_to_a_degenerate_point_range() {
-    let (idx_cols, desc) =
-        picked("a = 5", &schema3(TypeCode::U64, false), &[&[1]]).expect("a = 5 on an index over `a` must bound");
-    assert_eq!(idx_cols, vec![1]);
-    assert_eq!(desc, pt(&[1], &[], 5));
-}
-
-/// A two-column equality pins the leading column and points at the last.
-#[test]
-fn compound_equality_pins_the_leading_column() {
-    let b = picked("a = 5 AND b = 7", &schema3(TypeCode::U64, false), &[&[1, 2]]);
-    let (idx_cols, desc) = b.expect("a compound equality must bound the compound index");
-    assert_eq!(idx_cols, vec![1, 2]);
-    assert_eq!(desc, pt(&[1, 2], &[5], 7));
-}
-
-/// An equality prefix plus a range on ONE index takes the range.
-#[test]
-fn equality_prefix_plus_range_takes_the_range_candidate() {
-    let b = picked("a = 5 AND b > 10", &schema3(TypeCode::U64, false), &[&[1, 2]]);
-    let (_, desc) = b.expect("an eq-prefix + range must bound");
-    assert_eq!(desc.eq_vals(), &[5u128], "`a` is the pinned prefix");
-    assert_eq!(desc.start, Cut::before(11), "`b > 10` admits from 11");
-    assert_eq!(
-        desc.end,
-        Cut::after(u64::MAX as u128),
-        "the upper side stays open, not a point"
-    );
-}
-
-/// Across SEPARATE indexes, most-pinned wins.
-#[test]
-fn point_on_one_index_beats_half_open_range_on_another() {
-    let b = picked("a = 5 AND b > 10", &schema3(TypeCode::U64, false), &[&[1], &[2]]);
-    let (idx_cols, desc) = b.expect("the point candidate must bound");
-    assert_eq!(idx_cols, vec![1], "INDEX(a)'s point beats INDEX(b)'s range");
-    assert_eq!(desc, pt(&[1], &[], 5));
-}
-
-/// A PK column is an ordinary index column: an equality on it bounds nothing
-/// against an index that does not name it, and points one that does.
-#[test]
-fn a_pk_equality_bounds_the_index_that_names_it() {
-    let sch = schema3(TypeCode::U64, false);
-    assert!(picked("id = 5", &sch, &[&[1]]).is_none());
-    let (idx_cols, desc) = picked("id = 5", &sch, &[&[0]]).expect("INDEX(id) is bounded by `id = 5`");
-    assert_eq!(idx_cols, vec![0]);
-    assert_eq!(desc, pt(&[0], &[], 5));
-}
-
-/// An index over a PK column of a COMPOUND PK is the shape no PK candidate can
-/// serve: nothing pins the leading PK column, so only the index bounds.
-#[test]
-fn an_index_over_a_compound_pk_column_bounds_like_any_other() {
-    let sch = Schema {
-        columns: vec![
-            col("a", TypeCode::U64),
-            col("b", TypeCode::U64),
-            col("v", TypeCode::U64),
-        ],
-        pk_cols: vec![0, 1],
-    };
-    for sql in ["b = 1 AND v = 2", "b > 5"] {
-        assert!(
-            pk_bound(&bind_where(sql, &sch), &sch).is_none(),
-            "{sql}: nothing pins the leading PK column"
+        assert_eq!(
+            ranked_of(sql, &s, &[]),
+            vec![(tier, rng(&[0], &[], lo, hi), vec![])],
+            "{sql}"
         );
     }
-    let (idx_cols, desc) = picked("b = 1 AND v = 2", &sch, &[&[1, 2]]).expect("INDEX(b, v) is fully pinned");
-    assert_eq!(idx_cols, vec![1, 2]);
-    assert_eq!(desc, pt(&[1, 2], &[1], 2));
-
-    let (_, desc) = picked("b > 5", &sch, &[&[1, 2]]).expect("a range on a PK column bounds the index");
-    assert_eq!(desc.start, Cut::before(6));
 }
 
-/// An uncovered NULLABLE trailing index column must NOT bound.
+/// What an index's column list bounds: its leading points, then the next column's
+/// interval, with every conjunct on another column left residual.
 #[test]
-fn uncovered_nullable_trailing_column_never_bounds() {
-    assert!(picked("a = 5", &schema3(TypeCode::U64, true), &[&[1, 2]]).is_none());
-    assert!(picked("a = 5", &schema3(TypeCode::U64, false), &[&[1, 2]]).is_some());
-}
-
-/// A column no index covers bounds nothing, and neither does a WHERE with no
-/// `col OP literal` conjunct at all.
-#[test]
-fn unindexed_column_bounds_nothing() {
-    assert!(picked("a = 5", &schema3(TypeCode::U64, false), &[&[2]]).is_none());
-    assert!(picked("a + b > 3", &schema3(TypeCode::U64, false), &[&[1]]).is_none());
-}
-
-/// A BETWEEN is a two-sided range over one column (desugared at bind).
-#[test]
-fn between_bounds_both_sides() {
-    let b = picked("a BETWEEN 5 AND 9", &schema3(TypeCode::U64, false), &[&[1]]);
-    let (_, desc) = b.expect("BETWEEN must bound");
-    assert_eq!(desc.eq_vals(), &[] as &[u128]);
-    assert_eq!((desc.start, desc.end), (Cut::before(5), Cut::after(9)));
-}
-
-/// A UUID index column. Such a predicate has no index-free plan — the VM has no
-/// 128-bit register — so the bound must consume the conjunct outright.
-#[test]
-fn a_uuid_index_equality_bounds_a_point() {
-    let schema = uuid_schema_payload();
-    let expr = bind_where("uid = '550e8400-e29b-41d4-a716-446655440000'", &schema);
-    let metas = idx_metas(&[&[1]]);
-    assert_eq!(candidates(&expr, &schema, &metas).len(), 1);
-    let (_, desc, residual) = first_index(&expr, &schema, &metas).unwrap();
-    assert_eq!(desc, pt(&[1], &[], 0x550e8400_e29b_41d4_a716_446655440000_u128));
-    assert_eq!(residual, 0);
-}
-
-// ── the rank: a point outranks an interval at equal depth ───────────────────
-
-/// A full point on a UNIQUE index beats a two-sided interval on another index,
-/// on a signed column and on an unsigned one.
-#[test]
-fn full_unique_point_beats_an_interval() {
-    for (tc, pt) in [(TypeCode::U64, "5"), (TypeCode::I64, "5")] {
-        let sch = schema3(tc, false);
-        let where_sql = format!("a = {pt} AND b BETWEEN 1 AND 9");
-        let (cols, desc) = picked_flagged(&where_sql, &sch, &[(&[1], true), (&[2], false)]).expect("must bound");
-        assert_eq!(cols, vec![1], "{tc:?}: the unique point on `a` must win");
-        let i = img(tc, 5);
-        assert_eq!((desc.start, desc.end), (Cut::before(i), Cut::after(i)));
-    }
-}
-
-/// The same at both type edges of both signednesses.
-#[test]
-fn full_unique_point_wins_at_the_type_edges() {
-    for (tc, lit) in [
-        (TypeCode::U64, "0"),
-        (TypeCode::U64, "18446744073709551615"),
-        (TypeCode::I64, "-9223372036854775808"),
-        (TypeCode::I64, "9223372036854775807"),
-    ] {
-        let sch = schema3(tc, false);
-        let where_sql = format!("a = {lit} AND b BETWEEN 1 AND 9");
-        let (cols, _) = picked_flagged(&where_sql, &sch, &[(&[1], true), (&[2], false)]).expect("must bound");
-        assert_eq!(cols, vec![1], "{tc:?} `a = {lit}` must win");
-    }
-}
-
-/// Uniqueness is not what decides it: at equal pinned depth a point outranks a
-/// two-sided interval outright, because it pins its column where the interval
-/// only narrows one.
-#[test]
-fn a_point_outranks_an_interval_at_equal_depth() {
-    let sch = schema3(TypeCode::I64, false);
-    let (cols, _) = picked("a = 5 AND b BETWEEN 1 AND 9", &sch, &[&[1], &[2]]).expect("some index must bound");
-    assert_eq!(cols, vec![1], "the point on `a` admits one group, the interval nine");
-}
-
-/// A point on a PREFIX of a UNIQUE index is not a unique point — it leaves the
-/// index's trailing column free — but it still pins one column, which outranks
-/// the interval's none.
-#[test]
-fn a_partial_prefix_of_a_unique_index_is_not_a_unique_point() {
-    // `(id U64 pk, a I64, b I64, c I64)` — `b` non-nullable, or the partial
-    // candidate is rejected outright by the nullable trailing-column guard.
-    let sch = Schema {
-        columns: vec![
-            col("id", TypeCode::U64),
-            col("a", TypeCode::I64),
-            col("b", TypeCode::I64),
-            col("c", TypeCode::I64),
+fn an_index_is_bounded_by_its_point_prefix_and_one_interval() {
+    use TypeCode::*;
+    let index = |cols: &[u32], eq: &[u128], lo, hi, left: Vec<usize>| vec![(T::Index, rng(cols, eq, lo, hi), left)];
+    check(
+        &schema3(U64, false),
+        vec![
+            (vec![ix(&[1])], "a = 5", index(&[1], &[], 5, 5, vec![])),
+            (vec![ix(&[1])], "a BETWEEN 5 AND 9", index(&[1], &[], 5, 9, vec![])),
+            (vec![ix(&[1, 2])], "a = 5", index(&[1, 2], &[], 5, 5, vec![])),
+            (vec![ix(&[1, 2])], "a = 5 AND b = 7", index(&[1, 2], &[5], 7, 7, vec![])),
+            (
+                vec![ix(&[1, 2])],
+                "a = 5 AND b > 10",
+                index(&[1, 2], &[5], 11, U64_MAX, vec![]),
+            ),
+            (
+                vec![ix(&[1, 2])],
+                "a = 7 AND b < 50",
+                index(&[1, 2], &[7], 0, 49, vec![]),
+            ),
+            (
+                vec![ix(&[2])],
+                "b > 10 AND a = 7",
+                index(&[2], &[], 11, U64_MAX, vec![1]),
+            ),
+            // Every pin on a column intersects into its one interval.
+            (
+                vec![ix(&[1])],
+                "a > 5 AND a > 10",
+                index(&[1], &[], 11, U64_MAX, vec![]),
+            ),
+            (vec![ix(&[1])], "a = 5 AND a > 3", index(&[1], &[], 5, 5, vec![])),
+            // No conjunct names the index's leading column.
+            (vec![ix(&[2])], "a = 5", vec![]),
+            (vec![ix(&[1])], "a + b > 3", vec![]),
+            (vec![ix(&[1])], "a NOT BETWEEN 5 AND 9", vec![]),
+            (vec![ix(&[1])], "a IN (1, 2)", vec![]),
+            // A PK column is an index column like any other.
+            (
+                vec![ix(&[0])],
+                "id > 5",
+                vec![
+                    (T::PkRange, rng(&[0], &[], 6, U64_MAX), vec![]),
+                    (T::Index, rng(&[0], &[], 6, U64_MAX), vec![]),
+                ],
+            ),
         ],
-        pk_cols: vec![0],
-    };
-    let (cols, desc) =
-        picked_flagged("a = 5 AND c BETWEEN 1 AND 9", &sch, &[(&[1, 2], true), (&[3], false)]).expect("bounds");
-    assert_eq!(cols, vec![1, 2]);
-    assert!(
-        desc.eq_vals().len() + 1 < desc.cols().as_slice().len(),
-        "a prefix point on UNIQUE(a, b) selects more than one row"
     );
-}
-
-/// The uniqueness lookup is not equality-only: a degenerate point the range
-/// ends fold to (`a >= 5 AND a <= 5`) is scored unique too.
-#[test]
-fn a_range_spelled_point_is_scored_unique() {
-    let sch = schema3(TypeCode::I64, false);
-    let (cols, desc) = picked_flagged(
-        "a >= 5 AND a <= 5 AND b BETWEEN 1 AND 9",
-        &sch,
-        &[(&[1], true), (&[2], false)],
-    )
-    .expect("must bound");
-    assert_eq!(cols, vec![1]);
-    let i = img(TypeCode::I64, 5);
-    assert_eq!((desc.start, desc.end), (Cut::before(i), Cut::after(i)));
-}
-
-/// The spellings of one point rank identically. `0` sits on U64's lower edge, so
-/// scoring a point by comparing its cuts against the edges would rank `a = 0`
-/// below the interval it must beat, and split the spellings apart.
-#[test]
-fn a_point_ranks_the_same_however_it_is_spelled() {
-    let sch = schema3(TypeCode::U64, false);
-    for sql in [
-        "a = 0 AND b BETWEEN 1 AND 9",
-        "a >= 0 AND a <= 0 AND b BETWEEN 1 AND 9",
-        "a <= 0 AND b BETWEEN 1 AND 9",
-        "a < 1 AND b BETWEEN 1 AND 9",
-    ] {
-        let (cols, desc) = picked(sql, &sch, &[&[1], &[2]]).unwrap_or_else(|| panic!("{sql}: must bound"));
-        assert_eq!(cols, vec![1], "{sql}");
-        assert_eq!(desc, pt(&[1], &[], 0), "{sql}");
-    }
-}
-
-// ── where the PK range sits among the index candidates ──────────────────────
-
-fn kinds(conjuncts: &[BoundExpr], sch: &Schema, lists: &[(&[u32], bool)]) -> Vec<&'static str> {
-    candidates(conjuncts, sch, &idx_metas_flagged(lists))
-        .iter()
-        .map(|c| match &c.bound {
-            ReadBound::None => "None",
-            ReadBound::Range(r) if r.walks_pk(&sch.pk_cols) => "PkRange",
-            ReadBound::Range(_) => "IndexRange",
-            ReadBound::PkSet(_) => "PkSet",
-        })
-        .collect()
-}
-
-/// An unpinned PK range yields only to a full unique point; a pinned one keeps
-/// its place ahead of every index.
-#[test]
-fn an_unpinned_pk_range_yields_only_to_a_full_unique_point() {
-    let sch = schema3(TypeCode::U64, false);
-    let expr = bind_where("id > 0 AND a = 42", &sch);
-    assert_eq!(kinds(&expr, &sch, &[(&[1], true)]), ["IndexRange", "PkRange"]);
-    assert_eq!(kinds(&expr, &sch, &[(&[1], false)]), ["PkRange", "IndexRange"]);
-    let expr = bind_where("id = 7 AND a = 42", &sch);
-    assert_eq!(kinds(&expr, &sch, &[(&[1], true)]), ["PkSet", "IndexRange"]);
-}
-
-/// A PK range whose cuts sit on its column's type edges bounds nothing, so it
-/// falls behind every index — but stays a candidate.
-#[test]
-fn a_pk_range_bounding_nothing_falls_behind_every_index() {
-    let sch = two_col(TypeCode::U64);
-    let expr = bind_where("pk >= 0 AND val = 7", &sch);
-    assert_eq!(kinds(&expr, &sch, &[(&[1], false)]), ["IndexRange", "PkRange"]);
-}
-
-// ------------------------------------------------------------------
-// Literals outside or between a column's values
-// ------------------------------------------------------------------
-
-/// The PK range `where_sql` walks, and whether it consumed every conjunct.
-fn pk_range_of(where_sql: &str, schema: &Schema) -> (KeyRange, bool) {
-    let conjuncts = bind_where(where_sql, schema);
-    candidates(&conjuncts, schema, &[])
-        .into_iter()
-        .find_map(|c| match c.bound {
-            ReadBound::Range(r) if r.walks_pk(&schema.pk_cols) => Some((r, c.consumed.len() == conjuncts.len())),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("{where_sql}: a PK range"))
-}
-
-/// A literal below every U64 value bounds the walk to nothing on the side it
-/// excludes, and to everything on the side it admits — the answer the filter
-/// gives the same predicate.
-#[test]
-fn a_u64_pk_against_a_negative_literal() {
-    let schema = pk_schema(TypeCode::U64);
-    let top = u128::from(u64::MAX);
-    let range = |start, end| KeyRange::new(PkColList::from_slice(&[0]), &[], start, end);
-    let nothing = range(Cut::before(1), Cut::after(0));
-    assert_eq!(pk_range_of("id < -1", &schema), (nothing, true));
-    assert_eq!(pk_range_of("id = -1", &schema), (nothing, true));
-    assert_eq!(
-        pk_range_of("id > -5", &schema),
-        (range(Cut::before(0), Cut::after(top)), true)
-    );
-}
-
-/// A DECIMAL literal finer than the column's scale cuts after the value below it.
-#[test]
-fn a_decimal_pk_against_a_finer_literal() {
-    let schema = Schema {
-        columns: vec![
-            gnitz_wire::ColumnDef::typed("d", gnitz_wire::ColType::decimal(2), false),
-            col("v", TypeCode::I64),
+    // An index holds no row with a NULL in any of its columns, so an uncovered
+    // nullable trailing column leaves it unusable.
+    check(&schema3(U64, true), vec![(vec![ix(&[1, 2])], "a = 5", vec![])]);
+    // Signed values fold in signed order, not in the order of their images.
+    let i32_max = image_max(I32).unwrap();
+    check(
+        &schema3(I32, false),
+        vec![
+            (
+                vec![ix(&[1])],
+                "a > -5 AND a > 3",
+                index(&[1], &[], img(I32, 4), i32_max, vec![]),
+            ),
+            (
+                vec![ix(&[1])],
+                "a < -5 AND a < 3",
+                index(&[1], &[], 0, img(I32, -6), vec![]),
+            ),
         ],
-        pk_cols: vec![0],
-    };
-    let end = Cut::after(img(TypeCode::Decimal, 100));
-    assert_eq!(
-        pk_range_of("d < 1.005", &schema),
-        (
-            KeyRange::new(PkColList::from_slice(&[0]), &[], Cut::before(0), end),
-            true
-        )
     );
+    // A string end on a DATE column is a key through the rule its equality takes.
+    check(
+        &schema3(Date, false),
+        vec![(
+            vec![ix(&[1])],
+            "a >= '2024-01-01'",
+            index(&[1], &[], img(Date, 19723), image_max(Date).unwrap(), vec![]),
+        )],
+    );
+    // A 16-byte column has no register, so its bound consumes the conjunct.
+    check(
+        &schema3(U128, false),
+        vec![(vec![ix(&[1])], "a IN (7)", index(&[1], &[], 7, 7, vec![]))],
+    );
+    check(
+        &schema3(UUID, false),
+        vec![(
+            vec![ix(&[1])],
+            &format!("a = {}", UUID_LIT)[..],
+            index(&[1], &[], UUID_VALUE, UUID_VALUE, vec![]),
+        )],
+    );
+    // Over a compound PK's second column no PK candidate exists: nothing pins the
+    // leading PK column.
+    let compound = schema(["a", "b", "v"].map(|n| col(n, U64)).to_vec(), &[0, 1]);
+    check(
+        &compound,
+        vec![
+            (vec![ix(&[1, 2])], "b = 1 AND v = 2", index(&[1, 2], &[1], 2, 2, vec![])),
+            (vec![ix(&[1, 2])], "b > 5", index(&[1, 2], &[], 6, U64_MAX, vec![])),
+        ],
+    );
+    // A float column has no key image.
+    check(&two_col(F64), vec![(vec![ix(&[1])], "val = 1", vec![])]);
 }
 
-/// A NULL member of a key list admits no row, and a member between two values
-/// names none.
+/// The order of the list. Each row flips with the rule it names.
 #[test]
-fn a_key_list_keeps_only_the_members_it_holds() {
-    let schema = pk_schema(TypeCode::I64);
-    let conjuncts = bind_where("id IN (1, NULL, 1.5)", &schema);
-    assert_eq!(set_keys_of(&conjuncts, &schema), Some(vec![1]));
-}
-
-// ------------------------------------------------------------------
-// Every spelling of a point is one key; every key type ranges
-// ------------------------------------------------------------------
-
-/// A point spelled through a saturated or other-kind end is the same one-key `PkSet`
-/// an equality names, consuming every conjunct.
-#[test]
-fn every_spelling_of_a_u64_point_is_one_key() {
-    let schema = pk_schema(TypeCode::U64);
-    for (sql, key) in [
-        ("id >= 18446744073709551615", u64::MAX),
-        ("id > 18446744073709551614", u64::MAX),
-        ("id <= 0", 0),
-        ("id < 1", 0),
-        ("id > 4 AND id <= 5", 5),
-    ] {
-        let expr = bind_where(sql, &schema);
-        let (pk, residual) = pk_point_of(&expr, &schema).unwrap_or_else(|| panic!("{sql}: a one-key set"));
-        assert_eq!(pk, &key.to_be_bytes()[..], "{sql}");
-        assert_eq!(residual, 0, "{sql}");
+fn candidates_rank_by_tier_then_by_how_much_they_pin() {
+    let s = five_u64(); // (id pk, x, a, b, c)
+    let point = |cols: &[u32], v| rng(cols, &[], v, v);
+    check(
+        &s,
+        vec![
+            // A point covering a whole unique index outranks a deeper prefix of a
+            // non-unique one.
+            (
+                vec![uq(&[1]), ix(&[2, 3])],
+                "x = 1 AND a = 2 AND b = 3",
+                vec![
+                    (T::UniqueIndexPoint, point(&[1], 1), vec![1, 2]),
+                    (T::Index, rng(&[2, 3], &[2], 3, 3), vec![0]),
+                ],
+            ),
+            // A prefix of a unique index is no unique point; at equal depth the
+            // narrower index leads, whatever the declared order.
+            (
+                vec![uq(&[2, 3, 4]), ix(&[2, 3])],
+                "a = 1",
+                vec![
+                    (T::Index, point(&[2, 3], 1), vec![]),
+                    (T::Index, point(&[2, 3, 4], 1), vec![]),
+                ],
+            ),
+            // A point pins its column where an interval only narrows one.
+            (
+                vec![ix(&[3]), ix(&[2])],
+                "a = 5 AND b BETWEEN 1 AND 9",
+                vec![
+                    (T::Index, point(&[2], 5), vec![1, 2]),
+                    (T::Index, rng(&[3], &[], 1, 9), vec![0]),
+                ],
+            ),
+            // With nothing pinned, two bounded sides lead one.
+            (
+                vec![ix(&[2]), ix(&[3])],
+                "a > 5 AND b BETWEEN 1 AND 9",
+                vec![
+                    (T::Index, rng(&[3], &[], 1, 9), vec![0]),
+                    (T::Index, rng(&[2], &[], 6, U64_MAX), vec![1, 2]),
+                ],
+            ),
+            // An unpinned PK range yields to a full unique point, and to nothing else.
+            (
+                vec![uq(&[2])],
+                "id > 0 AND a = 42",
+                vec![
+                    (T::UniqueIndexPoint, point(&[2], 42), vec![0]),
+                    (T::PkRange, rng(&[0], &[], 1, U64_MAX), vec![1]),
+                ],
+            ),
+            (
+                vec![ix(&[2])],
+                "id > 0 AND a = 42",
+                vec![
+                    (T::PkRange, rng(&[0], &[], 1, U64_MAX), vec![1]),
+                    (T::Index, point(&[2], 42), vec![0]),
+                ],
+            ),
+            (
+                vec![uq(&[2, 3])],
+                "id > 0 AND a = 42",
+                vec![
+                    (T::PkRange, rng(&[0], &[], 1, U64_MAX), vec![1]),
+                    (T::Index, point(&[2, 3], 42), vec![0]),
+                ],
+            ),
+            // A key set leads everything.
+            (
+                vec![uq(&[2])],
+                "id = 7 AND a = 42",
+                vec![
+                    (T::PkKeys, keys(&s, &[&[7]]), vec![1]),
+                    (T::UniqueIndexPoint, point(&[2], 42), vec![0]),
+                ],
+            ),
+            // A PK range bounding nothing falls behind every index.
+            (
+                vec![ix(&[2])],
+                "id >= 0 AND a = 7",
+                vec![
+                    (T::Index, point(&[2], 7), vec![0]),
+                    (T::UnboundedPkRange, rng(&[0], &[], 0, U64_MAX), vec![1]),
+                ],
+            ),
+        ],
+    );
+    // A unique point is one however it is spelled, `0` on the type's lower edge
+    // included.
+    for sql in ["a = 0", "a >= 0 AND a <= 0", "a <= 0", "a < 1"] {
+        let got = ranked_of(&format!("id > 0 AND {sql}"), &s, &[uq(&[2])]);
+        assert_eq!(
+            got.first().map(|(tier, bound, _)| (*tier, bound)),
+            Some((T::UniqueIndexPoint, &point(&[2], 0))),
+            "{sql}"
+        );
     }
-}
-
-/// A saturated end on a compound PK's last column completes the key.
-#[test]
-fn a_saturated_last_pk_column_completes_the_key() {
-    let schema = compound_schema_u64_u64();
-    let expr = bind_where("a = 1 AND b >= 18446744073709551615", &schema);
-    let (pk, residual) = pk_point_of(&expr, &schema).expect("a one-key set");
-    assert_eq!(pk, schema.opk_key_cols(&[1, u64::MAX as u128]).pk_bytes());
-    assert_eq!(residual, 0);
-}
-
-/// An I128 and a UUID PK range consume their conjunct like a U128 one: the expression
-/// VM has no 16-byte register to re-impose it.
-#[test]
-fn wide_signed_and_uuid_pk_ranges_consume_their_conjunct() {
-    let i128s = pk_schema(TypeCode::I128);
-    let (range, all) = pk_range_of("id > 5", &i128s);
-    assert!(all, "the range consumes `id > 5`");
-    assert_eq!(
-        (range.start, range.end),
-        (Cut::before(img(TypeCode::I128, 6)), Cut::after(u128::MAX))
+    // A PK range pinning a leading column keeps its place ahead of a unique point.
+    let tenants = schema(
+        ["tenant", "id", "email"].map(|n| col(n, TypeCode::U64)).to_vec(),
+        &[0, 1],
     );
-
-    let uuids = uuid_schema_pk();
-    let (range, all) = pk_range_of("id > '550e8400-e29b-41d4-a716-446655440000'", &uuids);
-    assert!(all, "the range consumes the UUID end");
-    assert_eq!(
-        (range.start, range.end),
-        (
-            Cut::before(0x550e8400_e29b_41d4_a716_446655440001),
-            Cut::after(u128::MAX)
-        )
+    check(
+        &tenants,
+        vec![
+            (
+                vec![uq(&[2])],
+                "tenant = 7 AND email = 42",
+                vec![
+                    (T::PinnedPkRange, rng(&[0, 1], &[], 7, 7), vec![1]),
+                    (T::UniqueIndexPoint, point(&[2], 42), vec![0]),
+                ],
+            ),
+            (
+                vec![uq(&[2])],
+                "tenant = 7 AND id > 0 AND email = 42",
+                vec![
+                    (T::PinnedPkRange, rng(&[0, 1], &[7], 1, U64_MAX), vec![2]),
+                    (T::UniqueIndexPoint, point(&[2], 42), vec![0, 1]),
+                ],
+            ),
+        ],
     );
 }

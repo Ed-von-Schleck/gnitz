@@ -292,7 +292,7 @@ fn indexed(indexes: &[&[u32]]) -> Catalog<'static> {
                 gnitz_wire::RelClass::Table,
                 vec![col("pk", i), col("g", i), col("ind", i), col("other", i)],
                 vec![0],
-                indexes,
+                indexes.iter().map(|cols| ix(cols)).collect(),
             ),
         ),
         ("u", table(41, vec![col("pk", i), col("val", i)], vec![0])),

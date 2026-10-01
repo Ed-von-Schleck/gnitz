@@ -15,8 +15,6 @@ pub(crate) use explain::execute_explain;
 #[cfg(test)]
 pub(crate) use explain::explain_lines;
 pub(crate) use insert::execute_insert;
-#[cfg(test)]
-pub(crate) use insert::PkPlan;
 pub(crate) use mutate::{execute_delete, execute_update};
 #[cfg(test)]
 pub(crate) use select::ReadPlan;

@@ -17,7 +17,7 @@ fn cat() -> Catalog<'static> {
     let u = TypeCode::U64;
     let tvw = || vec![col("id", u), col("v", u), col("w", u)];
     catalog(vec![
-        ("t", rel(16, RelClass::Table, tvw(), vec![0], &[&[1], &[2]])),
+        ("t", rel(16, RelClass::Table, tvw(), vec![0], vec![ix(&[1]), ix(&[2])])),
         (
             "wide",
             rel(
@@ -25,14 +25,14 @@ fn cat() -> Catalog<'static> {
                 RelClass::Table,
                 vec![col("id", u), col("flag", u), col("big", TypeCode::U128)],
                 vec![0],
-                &[&[1], &[2]],
+                vec![ix(&[1]), ix(&[2])],
             ),
         ),
         (
             "c",
             table(18, vec![col("a", u), col("b", u), col("x", TypeCode::I64)], vec![0, 1]),
         ),
-        ("tv", rel(19, RelClass::View, tvw(), vec![0], &[])),
+        ("tv", rel(19, RelClass::View, tvw(), vec![0], vec![])),
         (
             "tw",
             table(20, vec![col("id", TypeCode::I64), col("w", TypeCode::U128)], vec![0]),
@@ -413,30 +413,23 @@ fn explain_plans_the_query_it_describes_and_shares_its_rejection() {
         );
         assert_eq!(direct.spec(), described.spec(), "`{sql}`");
     }
-    for (sql, variant, msg) in [
-        (
-            "SELECT v, COUNT(*) AS n FROM t GROUP BY v ORDER BY nope",
-            "Rejected",
-            "nope",
-        ),
-        ("SELECT t.v FROM t JOIN u ON t.id = u.id", "Rejected", "CREATE VIEW"),
+    for (sql, msg) in [
+        ("SELECT v, COUNT(*) AS n FROM t GROUP BY v ORDER BY nope", "nope"),
+        ("SELECT t.v FROM t JOIN u ON t.id = u.id", "CREATE VIEW"),
         // Unsupported on two axes at once: which one is named pins that the fold
         // sink plans the WHERE and its shape in the same order the rows sink does.
         (
             "SELECT DISTINCT v + 1 FROM t WHERE CAST(v AS CHAR) LIKE CAST(w AS CHAR)",
-            "Rejected",
             "LIKE pattern must be a string literal",
         ),
     ] {
-        let direct = err_of(read(&cat, sql));
-        let described = err_of(read(&cat, &format!("EXPLAIN {sql}")));
-        assert_eq!(variant_of(&direct), variant_of(&described), "`{sql}`");
-        assert_rejects(sql, Err::<(), _>(direct), variant, msg);
+        let direct = rejected(read(&cat, sql));
+        assert_eq!(direct, rejected(read(&cat, &format!("EXPLAIN {sql}"))), "`{sql}`");
+        assert!(direct.contains(msg), "`{sql}`: {direct}");
     }
     assert_rejects(
         "EXPLAIN INSERT",
         read(&cat, "EXPLAIN INSERT INTO t (id, v, w) VALUES (9, 9, 9)"),
-        "Rejected",
         "EXPLAIN",
     );
 }
@@ -455,7 +448,7 @@ fn explain_rejected_clause_matrix() {
         ("EXPLAIN FORMAT JSON SELECT v FROM t", "FORMAT"),
         ("EXPLAIN (FORMAT JSON) SELECT v FROM t", "the parenthesized option list"),
     ] {
-        assert_rejects(sql, read(&cat, sql), "Rejected", clause);
+        assert_rejects(sql, read(&cat, sql), clause);
     }
 }
 
@@ -595,135 +588,97 @@ fn a_read_the_planner_rejects_names_its_rule() {
     cat.insert("r", Some(r));
     let jv = view(&cat, "SELECT * FROM l JOIN r ON l.val = r.val");
     register(&cat, "jv", 32, jv.props.into(), final_view(&jv));
-    let st = rel(33, RelClass::Stream, vec![col("id", TypeCode::I64)], vec![0], &[]);
+    let st = rel(33, RelClass::Stream, vec![col("id", TypeCode::I64)], vec![0], vec![]);
     cat.insert("st", Some(st));
 
-    for (sql, variant, msg) in [
+    for (sql, msg) in [
         // A query deriving a new relation is refused from the AST alone, naming
         // the construct and pointing at CREATE VIEW.
-        ("SELECT t.id FROM t JOIN u ON t.v = u.k", "Rejected", "(JOIN)"),
-        ("SELECT v FROM t UNION SELECT k FROM u", "Rejected", "(set operation)"),
+        ("SELECT t.id FROM t JOIN u ON t.v = u.k", "(JOIN)"),
+        ("SELECT v FROM t UNION SELECT k FROM u", "(set operation)"),
         (
             "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.v)",
-            "Rejected",
             "(EXISTS/IN subquery)",
         ),
-        (
-            "SELECT id FROM t WHERE v IN (SELECT k FROM u)",
-            "Rejected",
-            "(EXISTS/IN subquery)",
-        ),
-        (
-            "SELECT id, (SELECT MAX(k) FROM u) FROM t",
-            "Rejected",
-            "(scalar subquery)",
-        ),
-        (
-            "SELECT x FROM (SELECT v AS x FROM t) d",
-            "Rejected",
-            "(derived table in FROM)",
-        ),
-        ("SELECT t.id FROM t, u WHERE t.v = u.k", "Rejected", "CREATE VIEW"),
+        ("SELECT id FROM t WHERE v IN (SELECT k FROM u)", "(EXISTS/IN subquery)"),
+        ("SELECT id, (SELECT MAX(k) FROM u) FROM t", "(scalar subquery)"),
+        ("SELECT x FROM (SELECT v AS x FROM t) d", "(derived table in FROM)"),
+        ("SELECT t.id FROM t, u WHERE t.v = u.k", "CREATE VIEW"),
         // A clause the parser accepts and the read path would otherwise drop.
-        ("SELECT DISTINCT ON (id) id FROM t", "Rejected", "DISTINCT ON"),
-        ("SELECT * FROM t LIMIT 2 BY v", "Rejected", "LIMIT: BY is not supported"),
+        ("SELECT DISTINCT ON (id) id FROM t", "DISTINCT ON"),
+        ("SELECT * FROM t LIMIT 2 BY v", "LIMIT: BY is not supported"),
+        ("SELECT * FROM t LIMIT 1+1", "LIMIT must be an integer literal"),
         (
-            "SELECT * FROM t LIMIT 1+1",
-            "Rejected",
-            "LIMIT must be an integer literal",
+            "SELECT * FROM t ORDER BY v WITH FILL",
+            "ORDER BY: WITH FILL is not supported",
+        ),
+        (
+            "SELECT * FROM t ORDER BY v INTERPOLATE (v AS v + 1)",
+            "ORDER BY: INTERPOLATE is not supported",
         ),
         (
             "SELECT * FROM t LIMIT 1 OFFSET 1+1",
-            "Rejected",
             "OFFSET must be an integer literal",
         ),
-        ("SELECT * FROM t FETCH FIRST 2 ROWS ONLY", "Rejected", "FETCH"),
-        ("SELECT id FROM t PREWHERE v > 5", "Rejected", "PREWHERE"),
-        ("SELECT TOP 2 id FROM t", "Rejected", "TOP"),
+        ("SELECT * FROM t FETCH FIRST 2 ROWS ONLY", "FETCH"),
+        ("SELECT id FROM t PREWHERE v > 5", "PREWHERE"),
+        ("SELECT TOP 2 id FROM t", "TOP"),
         (
             "SELECT id FROM t QUALIFY ROW_NUMBER() OVER (ORDER BY id) = 1",
-            "Rejected",
             "QUALIFY",
         ),
-        ("SELECT id FROM t FOR UPDATE", "Rejected", "FOR UPDATE"),
-        ("SELECT id FROM t SETTINGS max_threads = 1", "Rejected", "SETTINGS"),
-        ("SELECT id FROM t FORMAT JSON", "Rejected", "FORMAT"),
-        ("SELECT * REPLACE (v + 1 AS v) FROM t", "Rejected", "REPLACE"),
-        ("SELECT * ILIKE 'v%' FROM t", "Rejected", "ILIKE"),
+        ("SELECT id FROM t FOR UPDATE", "FOR UPDATE"),
+        ("SELECT id FROM t SETTINGS max_threads = 1", "SETTINGS"),
+        ("SELECT id FROM t FORMAT JSON", "FORMAT"),
+        ("SELECT * REPLACE (v + 1 AS v) FROM t", "REPLACE"),
+        ("SELECT * ILIKE 'v%' FROM t", "ILIKE"),
         // Zero rows would make a stream indistinguishable from an empty table.
-        ("SELECT * FROM st", "Rejected", "is a stream"),
-        (
-            "WITH c AS (SELECT id FROM st) SELECT id FROM c",
-            "Rejected",
-            "is a stream",
-        ),
-        (
-            "SELECT w, COUNT(*) FROM tw GROUP BY w HAVING w > 5",
-            "Rejected",
-            "128-bit",
-        ),
-        (
-            "WITH x AS (SELECT DISTINCT v FROM t) SELECT v FROM x",
-            "Rejected",
-            "CTE 'x'",
-        ),
-        ("SELECT v AS x, w AS x FROM t", "Rejected", "duplicate column name 'x'"),
-        (
-            "SELECT DISTINCT v AS x, w AS x FROM t",
-            "Rejected",
-            "duplicate column name 'x'",
-        ),
-        ("SELECT id, v, v FROM t", "Rejected", "duplicate column name 'v'"),
-        ("SELECT *, * FROM t", "Rejected", "duplicate column name"),
-        ("SELECT *, * FROM t WHERE v > 0", "Rejected", "duplicate column name"),
-        ("SELECT DISTINCT *, * FROM t", "Rejected", "duplicate column name"),
-        ("SELECT t.*, t.* FROM t", "Rejected", "SELECT item"),
+        ("SELECT * FROM st", "is a stream"),
+        ("WITH c AS (SELECT id FROM st) SELECT id FROM c", "is a stream"),
+        ("SELECT w, COUNT(*) FROM tw GROUP BY w HAVING w > 5", "128-bit"),
+        ("WITH x AS (SELECT DISTINCT v FROM t) SELECT v FROM x", "CTE 'x'"),
+        ("SELECT v AS x, w AS x FROM t", "duplicate column name 'x'"),
+        ("SELECT DISTINCT v AS x, w AS x FROM t", "duplicate column name 'x'"),
+        ("SELECT id, v, v FROM t", "duplicate column name 'v'"),
+        ("SELECT *, * FROM t", "duplicate column name"),
+        ("SELECT *, * FROM t WHERE v > 0", "duplicate column name"),
+        ("SELECT DISTINCT *, * FROM t", "duplicate column name"),
+        ("SELECT t.*, t.* FROM t", "SELECT item"),
         // `AS d(x, y)` renames the columns positionally; honoring only the
         // relation alias would answer under `t`'s own column names.
-        ("SELECT * FROM t AS d(x, y)", "Rejected", "positional column aliases"),
+        ("SELECT * FROM t AS d(x, y)", "positional column aliases"),
         // The FROM name is checked before the clause gate, on either sink.
         (
             "SELECT DISTINCT ON (v) * FROM t AS d(x, y)",
-            "Rejected",
             "positional column aliases",
         ),
         // ORDER BY parses before the SELECT list binds, on every surface.
-        ("SELECT nope FROM t ORDER BY 1.5", "Rejected", "ORDER BY position"),
-        ("SELECT id FROM jv", "Rejected", "is ambiguous"),
-        ("SELECT * FROM jv WHERE id = 5", "Rejected", "is ambiguous"),
-        ("SELECT _join_pk FROM jv", "Rejected", "not found"),
+        ("SELECT nope FROM t ORDER BY 1.5", "ORDER BY position"),
+        ("SELECT id FROM jv", "is ambiguous"),
+        ("SELECT * FROM jv WHERE id = 5", "is ambiguous"),
+        ("SELECT _join_pk FROM jv", "not found"),
         // A window call in an ad-hoc grouped SELECT list: windows are a view-body
         // feature, so the leaf's own rejection answers rather than the fold
         // lowering's internal error.
         (
             "SELECT v, ROW_NUMBER() OVER (ORDER BY v) FROM t GROUP BY v",
-            "Rejected",
             "only supported in the SELECT list and QUALIFY of a CREATE VIEW",
         ),
         (
             "SELECT v, SUM(w) OVER (PARTITION BY v) FROM t GROUP BY v",
-            "Rejected",
             "only supported in the SELECT list and QUALIFY of a CREATE VIEW",
         ),
         (
             "SELECT id, RANK() OVER (ORDER BY v) FROM t",
-            "Rejected",
             "only supported in the SELECT list and QUALIFY of a CREATE VIEW",
         ),
         // The fold is one stateless pass over one scan: no DISTINCT segment.
-        (
-            "SELECT v, COUNT(DISTINCT w) FROM t GROUP BY v",
-            "Rejected",
-            "CREATE VIEW body only",
-        ),
+        ("SELECT v, COUNT(DISTINCT w) FROM t GROUP BY v", "CREATE VIEW body only"),
     ] {
-        assert_rejects(sql, read(&cat, sql), variant, msg);
+        assert_rejects(sql, read(&cat, sql), msg);
     }
     // The CTE rejection names the offending clause too.
-    let (_, m) = variant_of(&err_of(read(
-        &cat,
-        "WITH x AS (SELECT DISTINCT v FROM t) SELECT v FROM x",
-    )));
+    let m = rejected(read(&cat, "WITH x AS (SELECT DISTINCT v FROM t) SELECT v FROM x"));
     assert!(m.contains("DISTINCT"), "got {m}");
 }
 
@@ -776,52 +731,38 @@ fn a_cte_expands_to_the_flat_query() {
         assert_eq!(c.spec(), f.spec(), "`{cte}`");
         assert_eq!(visible(c.reply_schema()), visible(f.reply_schema()), "`{cte}`");
     }
-    for (sql, variant, msg) in [
-        (
-            "WITH x AS (SELECT id FROM t) SELECT v FROM x",
-            "Rejected",
-            "column 'v' not found",
-        ),
+    for (sql, msg) in [
+        ("WITH x AS (SELECT id FROM t) SELECT v FROM x", "column 'v' not found"),
         (
             "WITH x AS (SELECT id FROM t) SELECT t.id FROM x",
-            "Rejected",
             "table alias 't' not found",
         ),
         (
             "WITH x AS (SELECT id, v FROM t) SELECT id FROM x ORDER BY g",
-            "Rejected",
             "column 'g' not found",
         ),
         // A qualified ORDER BY key names a relation's column, never an output
         // column, so its qualifier is checked.
-        (
-            "SELECT v FROM t ORDER BY zzz.v",
-            "Rejected",
-            "table alias 'zzz' not found",
-        ),
-        ("SELECT v AS w FROM t ORDER BY t.w", "Rejected", "'w' not found"),
+        ("SELECT v FROM t ORDER BY zzz.v", "table alias 'zzz' not found"),
+        ("SELECT v AS w FROM t ORDER BY t.w", "'w' not found"),
         (
             "WITH x(i) AS (SELECT id, v FROM t) SELECT i FROM x",
-            "Rejected",
             "1 column aliases but body returns 2",
         ),
         (
             "WITH x AS (SELECT v, v FROM t) SELECT v FROM x",
-            "Rejected",
             "duplicate column name 'v'",
         ),
         (
             "WITH x AS (SELECT g, COUNT(*) AS n FROM t GROUP BY g) SELECT g FROM x",
-            "Rejected",
             "derives a new one (grouped CTE)",
         ),
         (
             "WITH x AS (SELECT t.id FROM t JOIN u ON t.g = u.g) SELECT id FROM x",
-            "Rejected",
             "derives a new one (JOIN)",
         ),
     ] {
-        assert_rejects(sql, read(&cat, sql), variant, msg);
+        assert_rejects(sql, read(&cat, sql), msg);
     }
 
     // A join view surfaces both sides' `v`: a wildcard carries the duplicate
@@ -834,7 +775,7 @@ fn a_cte_expands_to_the_flat_query() {
             RelClass::View,
             vec![col("id", i), col("v", i), col("v", i)],
             vec![0],
-            &[],
+            vec![],
         ),
     )]);
     let (cte, flat) = ("WITH x AS (SELECT * FROM jv) SELECT * FROM x", "SELECT * FROM jv");
@@ -853,7 +794,7 @@ fn a_cte_expands_to_the_flat_query() {
         // wildcard passes positionally — a rejection, never a silent first match.
         "WITH x AS (SELECT * EXCEPT (id) FROM jv) SELECT * FROM x",
     ] {
-        assert_rejects(sql, read(&jv, sql), "Rejected", "'v' is ambiguous");
+        assert_rejects(sql, read(&jv, sql), "'v' is ambiguous");
     }
 }
 
@@ -873,7 +814,7 @@ fn a_cte_chain_that_doubles_each_level_is_refused() {
     let ok = chain(10);
     read(&cat, &ok).unwrap_or_else(|e| panic!("`{ok}`: {e:?}"));
     let big = chain(30);
-    assert_rejects(&big, read(&cat, &big), "Rejected", "expression nodes");
+    assert_rejects(&big, read(&cat, &big), "expression nodes");
 }
 
 /// An ORDER BY key that is not an output column binds in the SELECT list's own
@@ -941,24 +882,18 @@ fn an_order_by_key_binds_where_the_select_list_does() {
         assert_eq!(visible(plan.reply_schema()), visible(twin.reply_schema()), "`{sql}`");
         assert_eq!(explain(&cat, sql), explain(&cat, named), "`{sql}`");
     }
-    for (sql, variant, msg) in [
+    for (sql, msg) in [
         (
             "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY v",
-            "Rejected",
             "ORDER BY: column 'v' must appear in GROUP BY or an aggregate function",
         ),
         (
             "SELECT DISTINCT v FROM t ORDER BY v + 1",
-            "Rejected",
             "SELECT projection: an ORDER BY key under SELECT DISTINCT must be a selected column",
         ),
-        (
-            "SELECT id FROM t ORDER BY nope + 1",
-            "Rejected",
-            "column 'nope' not found",
-        ),
+        ("SELECT id FROM t ORDER BY nope + 1", "column 'nope' not found"),
     ] {
-        assert_rejects(sql, read(&cat, sql), variant, msg);
+        assert_rejects(sql, read(&cat, sql), msg);
     }
 }
 
@@ -989,26 +924,18 @@ fn a_from_less_select_plans_a_constant_row() {
             "order/limit: client window",
         ]
     );
-    for (sql, variant, msg) in [
-        ("SELECT x", "Rejected", "column 'x' not found"),
-        ("SELECT 1 + t.x", "Rejected", "column 't.x' not found"),
-        ("SELECT *", "Rejected", "SELECT * is not a supported SELECT item"),
-        (
-            "SELECT 1 WHERE 1 = 1",
-            "Rejected",
-            "SELECT without FROM: WHERE is not supported",
-        ),
-        ("SELECT COUNT(*)", "Rejected", "aggregate"),
-        ("SELECT 1 AS a, 2 AS a", "Rejected", "duplicate column name 'a'"),
-        (
-            "SELECT 1 AS a ORDER BY 2",
-            "Rejected",
-            "ORDER BY position 2 is out of range",
-        ),
-        ("SELECT 1 AS a ORDER BY x", "Rejected", "column 'x' not found"),
-        ("SELECT (SELECT 1)", "Rejected", "scalar subquery"),
+    for (sql, msg) in [
+        ("SELECT x", "column 'x' not found"),
+        ("SELECT 1 + t.x", "column 't.x' not found"),
+        ("SELECT *", "SELECT * is not a supported SELECT item"),
+        ("SELECT 1 WHERE 1 = 1", "SELECT without FROM: WHERE is not supported"),
+        ("SELECT COUNT(*)", "aggregate"),
+        ("SELECT 1 AS a, 2 AS a", "duplicate column name 'a'"),
+        ("SELECT 1 AS a ORDER BY 2", "ORDER BY position 2 is out of range"),
+        ("SELECT 1 AS a ORDER BY x", "column 'x' not found"),
+        ("SELECT (SELECT 1)", "scalar subquery"),
     ] {
-        assert_rejects(sql, read(&cat, sql), variant, msg);
+        assert_rejects(sql, read(&cat, sql), msg);
     }
 }
 
@@ -1053,26 +980,29 @@ fn a_plan_resolves_only_the_relations_it_reads() {
         }
     }
 
-    let e = err_of(read(&catalog(vec![]), "SELECT id FROM t"));
+    let e = read(&catalog(vec![]), "SELECT id FROM t").err();
     assert!(
         matches!(
             e,
-            GnitzSqlError::Client(ClientError::Refused(WireFault { status: WireStatus::NotFound, .. }))
+            Some(GnitzSqlError::Client(ClientError::Refused(WireFault {
+                status: WireStatus::NotFound,
+                ..
+            })))
         ),
         "got {e:?}"
     );
 
-    for (sql, variant) in [
-        ("SELECT t.id FROM t JOIN u ON t.g = u.g", "Rejected"),
-        ("SELECT id FROM _seg4096", "Rejected"),
-        ("CREATE VIEW v AS SELECT * FROM _seg4096", "Rejected"),
+    for sql in [
+        "SELECT t.id FROM t JOIN u ON t.g = u.g",
+        "SELECT id FROM _seg4096",
+        "CREATE VIEW v AS SELECT * FROM _seg4096",
     ] {
         let stmt = parse_stmt(sql);
         let (plan, asked) = resolving(&known, |c| match &stmt {
             Statement::CreateView(_) => plan(c, sql).map(|_| ()),
             _ => read(c, sql).map(|_| ()),
         });
-        assert_eq!(variant_of(&err_of(plan)).0, variant, "`{sql}`");
+        rejected(plan);
         assert!(asked.is_empty(), "`{sql}` costs no resolve, asked: {asked:?}");
     }
 }

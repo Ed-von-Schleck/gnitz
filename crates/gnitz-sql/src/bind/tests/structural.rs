@@ -1,20 +1,20 @@
 use super::*;
 use crate::ir::NumLit;
-use crate::test_support::{bind_sql, col, in_list_expr, ncol, parse_expr_sql, rejected};
+use crate::test_support::{bind_sql, col, ncol, parse_expr_sql, rejected};
 use gnitz_wire::TypeCode;
 
 /// `(pk U64, c I64 nullable, n I64 NOT NULL)`. The binder reads a column's
 /// position and nullability only, so one schema serves the numeric and the
 /// string surface alike.
 fn schema() -> Schema {
-    Schema {
-        columns: vec![
+    crate::test_support::schema(
+        vec![
             col("pk", TypeCode::U64),
             ncol("c", TypeCode::I64),
             col("n", TypeCode::I64),
         ],
-        pk_cols: vec![0],
-    }
+        &[0],
+    )
 }
 
 fn b(src: &str) -> BoundExpr {
@@ -475,7 +475,11 @@ fn each_unsupported_form_is_rejected_by_name() {
         assert!(msg.contains(want), "{src}: {msg}");
     }
     // The parser never produces an empty list; the binder still refuses one.
-    let empty = in_list_expr("c", vec![]);
+    let empty = Expr::InList {
+        expr: Box::new(parse_expr_sql("c")),
+        list: vec![],
+        negated: false,
+    };
     assert!(rejected(bind_single_table(&empty, &schema(), "t")).contains("empty list"));
     // No relation in scope: there is no alias a qualifier could name.
     assert_eq!(

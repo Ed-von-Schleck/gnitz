@@ -1,35 +1,144 @@
 use super::*;
-use crate::test_support::lit;
+use crate::test_support::{bind_sql, bind_where, col, ncol, schema};
 use gnitz_core::Schema;
 use gnitz_wire::ColumnDef;
 
-fn schema(cols: &[TypeCode]) -> Schema {
-    Schema {
-        columns: cols
-            .iter()
-            .enumerate()
-            .map(|(i, tc)| ColumnDef::new(format!("c{i}"), *tc, i != 0))
-            .collect(),
-        pk_cols: vec![0],
+/// `(pk | u U64 | u32 | i8 | i I64 | f F64 | f32 | s STRING | d DATE | ts TIMESTAMP
+/// | p DECIMAL(·,2) | q DECIMAL(·,3))`, every payload column nullable.
+fn typed() -> Schema {
+    use TypeCode::*;
+    let (t, dec) = (ColType::of, ColType::decimal);
+    let payload = [
+        ("u", t(U64)),
+        ("u32", t(U32)),
+        ("i8", t(I8)),
+        ("i", t(I64)),
+        ("f", t(F64)),
+        ("f32", t(F32)),
+        ("s", t(String)),
+        ("d", t(Date)),
+        ("ts", t(Timestamp)),
+        ("p", dec(2)),
+        ("q", dec(3)),
+    ];
+    let mut columns = vec![col("pk", U64)];
+    columns.extend(payload.map(|(n, ty)| ColumnDef::typed(n, ty, true)));
+    schema(columns, &[0])
+}
+
+/// Every node types as the value it computes.
+#[test]
+fn each_node_types_as_the_value_it_computes() {
+    use TypeCode::*;
+    let (t, dec) = (ColType::of, ColType::decimal);
+    let s = typed();
+    for (sql, want) in [
+        // Literals. NULL is the blend's neutral I64; a wide literal a U64 register
+        // holds is U64.
+        ("NULL", t(I64)),
+        ("1.5", t(F64)),
+        ("'x'", t(String)),
+        ("DATE '2020-01-01'", t(Date)),
+        ("18446744073709551615", t(U64)),
+        ("18446744073709551616", t(I64)),
+        ("-18446744073709551616", t(I64)),
+        // Booleans.
+        ("u > u32", t(I64)),
+        ("NOT u", t(I64)),
+        ("u IS NULL", t(I64)),
+        ("u IS NOT NULL", t(I64)),
+        ("u IN (1, 2)", t(I64)),
+        ("s LIKE 'a%'", t(I64)),
+        // Arithmetic keeps U64, so a materialized column re-seeds a downstream
+        // unsigned compare; a narrow integer computes in I64.
+        ("u + u", t(U64)),
+        ("u + f", t(F64)),
+        ("u32 + u32", t(I64)),
+        ("POWER(i, 2)", t(F64)),
+        ("-u32", t(I64)),
+        ("-i8", t(I64)),
+        ("-f32", t(F64)),
+        ("-u", t(U64)),
+        ("-p", dec(2)),
+        // A shift keeps the temporal type; a difference is an integer.
+        ("d + 1", t(Date)),
+        ("ts - d", t(I64)),
+        ("d - d", t(I64)),
+        ("DATE_TRUNC('month', ts)", t(Timestamp)),
+        ("EXTRACT(YEAR FROM d)", t(I64)),
+        // Strings: the measures and STRPOS are integers.
+        ("LENGTH(s)", t(I64)),
+        ("OCTET_LENGTH(s)", t(I64)),
+        ("STRPOS(s, 'x')", t(I64)),
+        ("UPPER(s)", t(String)),
+        ("s || 'x'", t(String)),
+        ("CONCAT(s, 1)", t(String)),
+        ("TRIM(s)", t(String)),
+        // CASE and GREATEST blend their results; a NULL one is neutral.
+        ("CASE WHEN 1 THEN u ELSE i END", t(U64)),
+        ("CASE WHEN 1 THEN f ELSE u END", t(F64)),
+        ("CASE WHEN 1 THEN NULL END", t(I64)),
+        ("CASE WHEN 1 THEN NULL WHEN 1 THEN u END", t(U64)),
+        ("CASE WHEN 1 THEN d ELSE ts END", t(Timestamp)),
+        ("CASE WHEN 1 THEN s ELSE 'x' END", t(String)),
+        ("CASE WHEN 1 THEN p ELSE 0.5 END", dec(2)),
+        ("GREATEST(p, q, i)", dec(3)),
+        // CAST: a float target is an f64 register, anything else its target, which
+        // the cast range-checks into.
+        ("CAST(i AS FLOAT)", t(F64)),
+        ("CAST(i AS SMALLINT)", t(I16)),
+        ("CAST(i AS DECIMAL(10, 3))", dec(3)),
+        // DECIMAL: `*` adds scales, `+`/`-`/`%` take the wider, `/` and a float
+        // operand lift to F64; a float literal beside a DECIMAL is the decimal it
+        // spells, unless no register holds it.
+        ("p + q", dec(3)),
+        ("p - i", dec(2)),
+        ("p * q", dec(5)),
+        ("p * i", dec(2)),
+        ("p % q", dec(3)),
+        ("p / q", t(F64)),
+        ("p / 3", t(F64)),
+        ("p + f", t(F64)),
+        ("p > q", t(I64)),
+        ("p * 1.1", dec(3)),
+        ("p + 1.255", dec(3)),
+        ("i * 1.1", t(F64)),
+        ("p * 0.1234567890123456789", t(F64)),
+        ("ROUND(q, 1)", dec(1)),
+        ("ROUND(q, 5)", dec(3)),
+        ("FLOOR(q)", dec(0)),
+        ("ABS(q)", dec(3)),
+        ("SQRT(q)", t(F64)),
+        ("SIGN(q)", t(I64)),
+    ] {
+        let bound = bind_sql(sql, &s).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(bound.infer_ty(&s.columns), want, "{sql}");
     }
 }
 
+/// The blend of two types, in either order: String > F64 > DECIMAL > U64 > I64,
+/// a temporal type absorbing I64 and DATE meeting TIMESTAMP at TIMESTAMP.
 #[test]
 fn unify_blend_type_rule() {
     use TypeCode::*;
-    // Any float → F64.
-    assert_eq!(unify_blend_type(U64.into(), F64.into()), F64.into());
-    assert_eq!(unify_blend_type(F32.into(), I64.into()), F64.into());
-    // Else any U64 → U64.
-    assert_eq!(unify_blend_type(U64.into(), I64.into()), U64.into());
-    assert_eq!(unify_blend_type(I64.into(), U64.into()), U64.into());
-    // Else I64 — narrow unsigned stays I64 (its value stays < 2^63).
-    assert_eq!(unify_blend_type(I64.into(), I64.into()), I64.into());
-    assert_eq!(unify_blend_type(U32.into(), U16.into()), I64.into());
-    // A temporal type absorbs I64, and DATE with TIMESTAMP meets at TIMESTAMP.
-    assert_eq!(unify_blend_type(Date.into(), I64.into()), Date.into());
-    assert_eq!(unify_blend_type(Date.into(), Timestamp.into()), Timestamp.into());
-    assert_eq!(unify_blend_type(Timestamp.into(), Date.into()), Timestamp.into());
+    let (t, dec) = (ColType::of, ColType::decimal);
+    for (a, b, want) in [
+        (t(String), t(F64), t(String)),
+        (t(U64), t(F64), t(F64)),
+        (t(F32), t(I64), t(F64)),
+        (dec(2), dec(3), dec(3)),
+        (dec(2), t(U64), dec(2)),
+        (t(U64), t(I64), t(U64)),
+        (t(I64), t(I64), t(I64)),
+        // A narrow unsigned value stays below 2^63.
+        (t(U32), t(U16), t(I64)),
+        (t(Date), t(I64), t(Date)),
+        (t(Date), t(Date), t(Date)),
+        (t(Date), t(Timestamp), t(Timestamp)),
+    ] {
+        assert_eq!(unify_blend_type(a, b), want, "{a} with {b}");
+        assert_eq!(unify_blend_type(b, a), want, "{b} with {a}");
+    }
 }
 
 /// Arithmetic with a temporal operand: a shift keeps the type, a difference is
@@ -55,427 +164,125 @@ fn temporal_arithmetic_is_an_allow_list() {
     }
 }
 
-/// A wide literal a U64 register holds types as U64.
-#[test]
-fn a_wide_literal_up_to_u64_max_is_u64() {
-    let s = schema(&[TypeCode::U64]);
-    let wide = |mag, neg| BoundExpr::LitWide(NumLit { mag, neg }).infer_ty(&s.columns).tc;
-    assert_eq!(wide(u64::MAX.into(), false), TypeCode::U64);
-    assert_eq!(wide(1 << 64, false), TypeCode::I64);
-    assert_eq!(wide(1 << 64, true), TypeCode::I64);
-}
-
-#[test]
-fn binop_arithmetic_preserves_u64() {
-    // pk U64, c1 U64, c2 U64, c3 U32, c4 F64.
-    let s = schema(&[
-        TypeCode::U64,
-        TypeCode::U64,
-        TypeCode::U64,
-        TypeCode::U32,
-        TypeCode::F64,
-    ]);
-    let add = |a, b| BoundExpr::bin(BoundExpr::ColRef(a), BinOp::Add, BoundExpr::ColRef(b));
-    // u64 + u64 → U64: a materialized column must re-seed a downstream
-    // unsigned compare.
-    assert_eq!(add(1, 2).infer_ty(&s.columns).tc, TypeCode::U64);
-    // u64 + f64 → F64.
-    assert_eq!(add(1, 4).infer_ty(&s.columns).tc, TypeCode::F64);
-    // u32 + u32 → I64 (unchanged; value stays < 2^63).
-    assert_eq!(add(3, 3).infer_ty(&s.columns).tc, TypeCode::I64);
-    // Comparisons stay I64.
-    assert_eq!(
-        BoundExpr::bin(BoundExpr::ColRef(1), BinOp::Gt, BoundExpr::ColRef(2))
-            .infer_ty(&s.columns)
-            .tc,
-        TypeCode::I64
-    );
-}
-
-#[test]
-fn case_infer_type_folds_branches() {
-    let s = schema(&[TypeCode::U64, TypeCode::U64, TypeCode::I64, TypeCode::F64]);
-    let case = |branches, else_| BoundExpr::Case { branches, else_ };
-    // CASE with a U64 result branch and an I64 else → U64.
-    assert_eq!(
-        case(
-            vec![(BoundExpr::LitInt(1), BoundExpr::ColRef(1))],
-            Some(Box::new(BoundExpr::ColRef(2)))
-        )
-        .infer_ty(&s.columns)
-        .tc,
-        TypeCode::U64
-    );
-    // A float branch dominates → F64.
-    assert_eq!(
-        case(
-            vec![(BoundExpr::LitInt(1), BoundExpr::ColRef(3))],
-            Some(Box::new(BoundExpr::ColRef(1)))
-        )
-        .infer_ty(&s.columns)
-        .tc,
-        TypeCode::F64
-    );
-    // All-NULL CASE stays I64 (LitNull is the neutral element, seed I64).
-    assert_eq!(
-        case(vec![(BoundExpr::LitInt(1), BoundExpr::LitNull)], None)
-            .infer_ty(&s.columns)
-            .tc,
-        TypeCode::I64
-    );
-    // A NULL branch never drags a U64 sibling back down.
-    assert_eq!(
-        case(
-            vec![
-                (BoundExpr::LitInt(1), BoundExpr::LitNull),
-                (BoundExpr::LitInt(1), BoundExpr::ColRef(1)),
-            ],
-            None
-        )
-        .infer_ty(&s.columns)
-        .tc,
-        TypeCode::U64
-    );
-}
-
-/// A node types as the value it computes: a negation is the numeric function
-/// over its operand's register, so a narrow integer negates in I64 (where
-/// `-(-2^31)` lives), a float in F64, while U64 keeps its tracking and a DECIMAL
-/// its scale.
-#[test]
-fn neg_types_as_the_register_it_computes() {
-    let cols = [
-        ColumnDef::new("pk", TypeCode::U64, false),
-        ColumnDef::new("u32", TypeCode::U32, true),
-        ColumnDef::new("i8", TypeCode::I8, true),
-        ColumnDef::new("f32", TypeCode::F32, true),
-        ColumnDef::new("u64", TypeCode::U64, true),
-        ColumnDef::typed("d", ColType::decimal(2), true),
-    ];
-    let neg = |c: usize| {
-        BoundExpr::Func {
-            f: NumFunc::Unary(FloatUnaryOp::Neg),
-            arg: Box::new(BoundExpr::ColRef(c)),
-        }
-        .infer_ty(&cols)
-    };
-    assert_eq!(neg(1), TypeCode::I64.into());
-    assert_eq!(neg(2), TypeCode::I64.into());
-    assert_eq!(neg(3), TypeCode::F64.into());
-    assert_eq!(neg(4), TypeCode::U64.into());
-    assert_eq!(neg(5), ColType::decimal(2));
-}
-
-/// A cast to a float computes an f64 register whatever its declared width; a
-/// narrowing integer or DECIMAL cast is its target, which it range-checks into.
-#[test]
-fn a_cast_types_as_its_register_or_its_range_checked_target() {
-    let s = schema(&[TypeCode::U64, TypeCode::I64]);
-    let cast = |to: ColType| BoundExpr::Cast { expr: Box::new(BoundExpr::ColRef(1)), to }.infer_ty(&s.columns);
-    assert_eq!(cast(TypeCode::F32.into()), TypeCode::F64.into());
-    assert_eq!(cast(TypeCode::I16.into()), TypeCode::I16.into());
-    assert_eq!(cast(ColType::decimal(3)), ColType::decimal(3));
-}
-
-/// A temporal literal types as its temporal type and is never NULL.
-#[test]
-fn a_temporal_literal_is_a_typed_non_null_integer() {
-    let s = schema(&[TypeCode::U64]);
-    let date = BoundExpr::LitTemporal { tc: TypeCode::Date, v: 18262 };
-    assert_eq!(date.infer_ty(&s.columns), TypeCode::Date.into());
-    assert!(date.never_null_with(&|_: &usize| true));
-}
-
-/// Each shape over a NOT NULL column and over a nullable one: `never_null_with`
-/// proves the first exactly when the engine kernels the node lowers to make no
-/// NULL of their own, and never proves the second.
-#[test]
-fn never_null_follows_the_engine_null_table() {
-    use BoundExpr as E;
-    let nn = |e: &E| e.never_null_with(&|i: &usize| *i == 1);
-    type Shape = fn(E) -> E;
-    let shapes: &[(Shape, bool)] = &[
-        (|x| E::bin(x, BinOp::Add, E::LitInt(1)), true),
-        (|x| E::bin(x, BinOp::Pow, E::LitInt(2)), true),
-        (|x| E::bin(x, BinOp::Div, E::LitInt(2)), true),
-        (|x| E::bin(x.clone(), BinOp::Div, x), false),
-        (|x| E::bin(x.clone(), BinOp::Concat, x), false),
-        (|x| E::Not(Box::new(x)), true),
-        (
-            |x| E::Func {
-                f: NumFunc::Unary(FloatUnaryOp::Abs),
-                arg: Box::new(x),
-            },
-            true,
-        ),
-        (
-            |x| E::Like {
-                s: Box::new(x),
-                pattern: gnitz_expr::LikePattern::encode("a%", None).unwrap(),
-                ci: false,
-            },
-            true,
-        ),
-        (
-            |x| E::TrimCall {
-                s: Box::new(x),
-                mode: TrimMode::Both,
-                set: " ".into(),
-            },
-            true,
-        ),
-        (|x| E::Calendar { op: CalendarOp::Year, arg: Box::new(x) }, true),
-        (
-            |x| E::Calendar {
-                op: CalendarOp::ToMicros,
-                arg: Box::new(x),
-            },
-            false,
-        ),
-        (
-            |x| E::InList {
-                inner: Box::new(x),
-                items: vec![E::LitInt(1), E::LitInt(2)],
-            },
-            true,
-        ),
-        (|x| E::MinMaxN { is_max: true, args: vec![x, E::LitNull] }, true),
-        (|x| E::StrCall { f: StrFunc::Upper, args: vec![x] }, true),
-        (
-            |x| E::StrCall {
-                f: StrFunc::Substr,
-                args: vec![x, E::LitInt(1)],
-            },
-            true,
-        ),
-        (
-            |x| E::StrCall {
-                f: StrFunc::Substr,
-                args: vec![x, E::LitInt(1), E::LitInt(2)],
-            },
-            false,
-        ),
-        (
-            |x| E::StrCall {
-                f: StrFunc::Replace,
-                args: vec![x.clone(), x.clone(), x],
-            },
-            false,
-        ),
-        (
-            |x| E::Cast {
-                expr: Box::new(x),
-                to: TypeCode::String.into(),
-            },
-            true,
-        ),
-        (
-            |x| E::Cast {
-                expr: Box::new(x),
-                to: TypeCode::I16.into(),
-            },
-            false,
-        ),
-        (|x| E::ConcatN { args: vec![x] }, false),
-        (
-            |x| E::Case {
-                branches: vec![(E::LitInt(1), x.clone())],
-                else_: Some(Box::new(x)),
-            },
-            true,
-        ),
-        (
-            |x| E::Case {
-                branches: vec![(E::LitInt(1), x)],
-                else_: None,
-            },
-            false,
-        ),
-    ];
-    for &(shape, over_not_null) in shapes {
-        let e = shape(E::ColRef(0));
-        assert_eq!(nn(&e), over_not_null, "{e:?}");
-        let e = shape(E::ColRef(1));
-        assert!(!nn(&e), "{e:?}");
-    }
-    assert!(nn(&lit("1.5")) && !nn(&E::LitNull));
-}
-
-#[test]
-fn lit_null_infers_i64() {
-    let s = schema(&[TypeCode::U64, TypeCode::I64]);
-    assert_eq!(BoundExpr::LitNull.infer_ty(&s.columns).tc, TypeCode::I64);
-}
-
-/// Pins the `infer_ty_with` arms the tests above do not reach — the
-/// literal, `NOT`, null-test and InList ones.
-#[test]
-fn infer_type_covers_remaining_arms() {
-    // pk U64, c1 U64, c2 String.
-    let s = schema(&[TypeCode::U64, TypeCode::U64, TypeCode::String]);
-
-    // Literal arms fix their type.
-    assert_eq!(lit("1.5").infer_ty(&s.columns).tc, TypeCode::F64);
-    assert_eq!(BoundExpr::LitStr("x".into()).infer_ty(&s.columns).tc, TypeCode::String);
-
-    // NOT is boolean I64.
-    let not = BoundExpr::Not(Box::new(BoundExpr::ColRef(1)));
-    assert_eq!(not.infer_ty(&s.columns).tc, TypeCode::I64);
-
-    // IS [NOT] NULL are boolean I64.
-    for want_null in [true, false] {
-        let t = BoundExpr::NullTest {
-            inner: Box::new(BoundExpr::ColRef(1)),
-            want_null,
-        };
-        assert_eq!(t.infer_ty(&s.columns).tc, TypeCode::I64);
-    }
-
-    // InList is a boolean membership test → I64.
-    assert_eq!(
-        BoundExpr::InList {
-            inner: Box::new(BoundExpr::ColRef(1)),
-            items: vec![BoundExpr::LitInt(1), BoundExpr::LitInt(2)],
-        }
-        .infer_ty(&s.columns)
-        .tc,
-        TypeCode::I64
-    );
-}
-
 /// The numeric functions' result types: the rounding family and ABS keep the
 /// argument's register image, the transcendentals lift to F64, and SIGN is a
 /// signed integer over any integer argument and a float over a float one.
 #[test]
 fn num_func_result_types() {
-    for f in [
-        NumFunc::Unary(FloatUnaryOp::Abs),
-        NumFunc::Unary(FloatUnaryOp::Floor),
-        NumFunc::Unary(FloatUnaryOp::Ceil),
-        NumFunc::Unary(FloatUnaryOp::Trunc),
-        NumFunc::Round(2),
-    ] {
-        assert_eq!(f.result_type(TypeCode::U64.into()), TypeCode::U64.into(), "{f:?}");
-        assert_eq!(f.result_type(TypeCode::I32.into()), TypeCode::I64.into(), "{f:?}");
-        assert_eq!(f.result_type(TypeCode::F32.into()), TypeCode::F64.into(), "{f:?}");
+    use FloatUnaryOp as F;
+    use TypeCode::*;
+    let ty = |f: NumFunc, arg: TypeCode| f.result_type(arg.into());
+    for f in [F::Abs, F::Floor, F::Ceil, F::Trunc, F::Round].map(NumFunc::Unary) {
+        assert_eq!(ty(f, U64), U64.into(), "{f:?}");
+        assert_eq!(ty(f, I32), I64.into(), "{f:?}");
+        assert_eq!(ty(f, F32), F64.into(), "{f:?}");
     }
-    assert_eq!(
-        NumFunc::Round(-1).result_type(TypeCode::I64.into()),
-        TypeCode::F64.into()
-    );
-    for f in [
-        NumFunc::Unary(FloatUnaryOp::Sqrt),
-        NumFunc::Unary(FloatUnaryOp::Ln),
-        NumFunc::Unary(FloatUnaryOp::Log10),
-        NumFunc::Unary(FloatUnaryOp::Exp),
-    ] {
-        assert_eq!(f.result_type(TypeCode::I64.into()), TypeCode::F64.into(), "{f:?}");
-        assert_eq!(f.result_type(TypeCode::F64.into()), TypeCode::F64.into(), "{f:?}");
+    assert_eq!(ty(NumFunc::Round(2), U64), U64.into());
+    assert_eq!(ty(NumFunc::Round(-1), I64), F64.into());
+    for f in [F::Sqrt, F::Ln, F::Log10, F::Exp].map(NumFunc::Unary) {
+        assert_eq!(ty(f, I64), F64.into(), "{f:?}");
+        assert_eq!(ty(f, F64), F64.into(), "{f:?}");
     }
-    assert_eq!(
-        NumFunc::Unary(FloatUnaryOp::Sign).result_type(TypeCode::U64.into()),
-        TypeCode::I64.into()
-    );
-    assert_eq!(
-        NumFunc::Unary(FloatUnaryOp::Sign).result_type(TypeCode::I8.into()),
-        TypeCode::I64.into()
-    );
-    assert_eq!(
-        NumFunc::Unary(FloatUnaryOp::Sign).result_type(TypeCode::F32.into()),
-        TypeCode::F64.into()
-    );
-    // POWER is float over any operands.
-    let s = schema(&[TypeCode::U64, TypeCode::I64]);
-    let pow = BoundExpr::bin(BoundExpr::ColRef(1), BinOp::Pow, BoundExpr::LitInt(2));
-    assert_eq!(pow.infer_ty(&s.columns).tc, TypeCode::F64);
+    let sign = NumFunc::Unary(F::Sign);
+    assert_eq!(ty(sign, U64), I64.into());
+    assert_eq!(ty(sign, I8), I64.into());
+    assert_eq!(ty(sign, F32), F64.into());
 }
 
-/// Every string function's result type and signature agree with its node's
-/// arity: the measures and STRPOS are integers, everything else a string.
+/// Each shape with `{x}` a NOT NULL column and with it a nullable one:
+/// `never_null_with` proves the first exactly when no kernel the shape lowers to
+/// makes a NULL of its own, and never proves the second.
 #[test]
-fn str_func_result_types_and_signatures() {
-    use crate::ir::{StrArg, StrFunc};
-    for f in [StrFunc::LenBytes, StrFunc::LenChars, StrFunc::Pos] {
-        assert_eq!(f.result_type(), TypeCode::I64, "{f:?}");
-    }
-    for f in [
-        StrFunc::Upper,
-        StrFunc::Lower,
-        StrFunc::Reverse,
-        StrFunc::Left,
-        StrFunc::Right,
-        StrFunc::Replace,
-        StrFunc::Lpad,
-        StrFunc::Rpad,
-        StrFunc::SplitPart,
-        StrFunc::Substr,
-    ] {
-        assert_eq!(f.result_type(), TypeCode::String, "{f:?}");
-    }
-    assert_eq!(StrFunc::Substr.signature(), &[StrArg::Str, StrArg::Int, StrArg::IntOpt]);
-    assert_eq!(StrFunc::Left.signature(), &[StrArg::Str, StrArg::Int]);
-    assert_eq!(
-        StrFunc::Lpad.signature(),
-        &[StrArg::Str, StrArg::Int, StrArg::StrOr(" ")]
+fn never_null_follows_the_kernels_that_make_a_null() {
+    // `c` and `nts` are nullable, every other column NOT NULL.
+    let s = schema(
+        vec![
+            col("pk", TypeCode::U64),
+            col("n", TypeCode::I64),
+            ncol("c", TypeCode::I64),
+            col("d", TypeCode::Date),
+            col("ts", TypeCode::Timestamp),
+            ncol("nts", TypeCode::Timestamp),
+        ],
+        &[0],
     );
-    assert_eq!(StrFunc::SplitPart.signature(), &[StrArg::Str, StrArg::Str, StrArg::Int]);
-    // The first argument of every string function is the string it acts on.
-    for f in [StrFunc::Pos, StrFunc::Replace, StrFunc::Reverse] {
-        assert_eq!(f.signature()[0], StrArg::Str);
-    }
-}
-
-/// DECIMAL typing: a float literal is adopted at its own scale beside a
-/// DECIMAL operand and stays a float elsewhere; `*` adds scales, `+`/`-` take
-/// the wider, `/` and a float operand lift to F64, and the rounding family
-/// lands on the scale it names.
-#[test]
-fn decimal_arithmetic_and_blend_typing() {
-    let cols = vec![
-        ColumnDef::new("pk", TypeCode::U64, false),
-        ColumnDef::typed("p", ColType::decimal(2), true),
-        ColumnDef::typed("q", ColType::decimal(3), true),
-        ColumnDef::new("i", TypeCode::I64, true),
-        ColumnDef::new("f", TypeCode::F64, true),
-    ];
-    let c = |i: usize| BoundExpr::ColRef(i);
-    let ty = |e: &BoundExpr| e.infer_ty(&cols);
-    let dec = ColType::decimal;
-    let f64 = ColType::of(TypeCode::F64);
-    assert_eq!(ty(&BoundExpr::bin(c(1), BinOp::Add, c(2))), dec(3));
-    assert_eq!(ty(&BoundExpr::bin(c(1), BinOp::Sub, c(3))), dec(2));
-    assert_eq!(ty(&BoundExpr::bin(c(1), BinOp::Mul, c(2))), dec(5));
-    assert_eq!(ty(&BoundExpr::bin(c(1), BinOp::Mul, c(3))), dec(2));
-    assert_eq!(ty(&BoundExpr::bin(c(1), BinOp::Mod, c(2))), dec(3));
-    assert_eq!(ty(&BoundExpr::bin(c(1), BinOp::Div, c(2))), f64);
-    assert_eq!(ty(&BoundExpr::bin(c(1), BinOp::Div, BoundExpr::LitInt(3))), f64);
-    assert_eq!(ty(&BoundExpr::bin(c(1), BinOp::Add, c(4))), f64);
-    assert_eq!(ty(&BoundExpr::bin(c(1), BinOp::Gt, c(2))), ColType::of(TypeCode::I64));
-    // `price * 1.1` is exact at three places; `i * 1.1` is the float it was.
-    assert_eq!(ty(&BoundExpr::bin(c(1), BinOp::Mul, lit("1.1"))), dec(3));
-    assert_eq!(ty(&BoundExpr::bin(c(1), BinOp::Add, lit("1.255"))), dec(3));
-    assert_eq!(ty(&BoundExpr::bin(c(3), BinOp::Mul, lit("1.1"))), f64);
-    // CASE / GREATEST blend to the wider scale, adopting a literal the same way.
-    let case = BoundExpr::Case {
-        branches: vec![(BoundExpr::LitInt(1), c(1))],
-        else_: Some(Box::new(lit("0.5"))),
+    let never_null = |sql: &str| {
+        bind_sql(sql, &s)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .never_null_with(&|i: &usize| s.columns[*i].is_nullable, &|i: &usize| s.columns[*i].ty)
     };
-    assert_eq!(ty(&case), dec(2));
-    assert_eq!(
-        ty(&BoundExpr::MinMaxN {
-            is_max: true,
-            args: vec![c(1), c(2), c(3)]
-        }),
-        dec(3)
-    );
-    let func = |f, e: BoundExpr| BoundExpr::Func { f, arg: Box::new(e) };
-    assert_eq!(ty(&func(NumFunc::Round(1), c(2))), dec(1));
-    assert_eq!(ty(&func(NumFunc::Round(5), c(2))), dec(3));
-    assert_eq!(ty(&func(NumFunc::Unary(FloatUnaryOp::Floor), c(2))), dec(0));
-    assert_eq!(ty(&func(NumFunc::Unary(FloatUnaryOp::Abs), c(2))), dec(3));
-    assert_eq!(ty(&func(NumFunc::Unary(FloatUnaryOp::Sqrt), c(2))), f64);
-    assert_eq!(
-        ty(&func(NumFunc::Unary(FloatUnaryOp::Sign), c(2))),
-        ColType::of(TypeCode::I64)
-    );
+    for (shape, over_not_null) in [
+        ("{x} + 1", true),
+        ("POWER({x}, 2)", true),
+        ("NOT {x}", true),
+        ("ABS({x})", true),
+        ("{x} LIKE 'a%'", true),
+        ("TRIM({x})", true),
+        ("UPPER({x})", true),
+        ("EXTRACT(YEAR FROM {x})", true),
+        // A zero divisor is NULL, so only a non-zero literal one is proven.
+        ("{x} / 2", true),
+        ("{x} % 2", true),
+        ("{x} / 0", false),
+        ("{x} % 0", false),
+        ("{x} / {x}", false),
+        // A string past `u32::MAX` bytes is NULL.
+        ("{x} || {x}", false),
+        ("CONCAT({x})", false),
+        ("REPLACE({x}, {x}, {x})", false),
+        // SUBSTRING's negative length is NULL; without one it cannot be.
+        ("SUBSTR({x}, 1)", true),
+        ("SUBSTR({x}, 1, 2)", false),
+        ("{x} IN (1, 2)", true),
+        ("{x} IN (1, c)", false),
+        // GREATEST skips a NULL argument.
+        ("GREATEST({x}, NULL)", true),
+        // Text renders any scalar; every other target can refuse a value.
+        ("CAST({x} AS VARCHAR)", true),
+        ("CAST({x} AS SMALLINT)", false),
+        ("CASE WHEN 1 THEN {x} ELSE {x} END", true),
+        ("CASE WHEN 1 THEN c ELSE {x} END", false),
+        ("CASE WHEN 1 THEN {x} END", false),
+    ] {
+        assert_eq!(never_null(&shape.replace("{x}", "n")), over_not_null, "{shape}");
+        assert!(
+            !never_null(&shape.replace("{x}", "c")),
+            "{shape} over a nullable column"
+        );
+    }
+    for (sql, want) in [
+        ("1.5", true),
+        ("DATE '2020-01-01'", true),
+        ("NULL", false),
+        ("c IS NULL", true),
+        // A DATE meeting a TIMESTAMP is widened to microseconds, which a day count
+        // past `i64` microseconds has none of.
+        ("d - d", true),
+        ("ts - d", false),
+        ("d = ts", false),
+        ("d + 1 < ts", false),
+        ("CASE WHEN n = 1 THEN d ELSE ts END", false),
+        ("ts IN (d, ts)", false),
+        // GREATEST skips the DATE it NULLed, so another argument must hold.
+        ("GREATEST(d, ts)", true),
+        ("GREATEST(d, nts)", false),
+    ] {
+        assert_eq!(never_null(sql), want, "{sql}");
+    }
+}
+
+/// A predicate splits at every top-level AND, however the tree nests, in written
+/// order.
+#[test]
+fn conjuncts_are_the_leaves_of_the_and_tree_in_order() {
+    let s = typed();
+    let leaves: Vec<BoundExpr> = ["u = 1", "i = 2 OR f = 0", "d = 3"]
+        .map(|sql| bind_sql(sql, &s).unwrap())
+        .to_vec();
+    for sql in [
+        "u = 1 AND (i = 2 OR f = 0) AND d = 3",
+        "u = 1 AND ((i = 2 OR f = 0) AND d = 3)",
+    ] {
+        assert_eq!(bind_where(sql, &s), leaves, "{sql}");
+    }
 }

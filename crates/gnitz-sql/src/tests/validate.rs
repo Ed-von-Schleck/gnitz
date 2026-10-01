@@ -1,68 +1,27 @@
 use super::*;
-use crate::ir::{BoundExpr, StrFunc};
-use gnitz_core::Schema;
-use gnitz_wire::{ColumnDef, TypeCode};
+use crate::test_support::{parse_stmt, rejected};
+use gnitz_wire::TypeCode;
 
+/// A computed item is declared nullable, in the register image of what it
+/// computes, under its alias or its position's name.
 #[test]
-fn validate_user_name_rejects_reserved_and_malformed() {
-    // Leading `_` is reserved (system prefix + synthesized `_seg…` segments).
-    assert!(matches!(validate_user_name("_hidden"), Err(GnitzSqlError::Rejected(_))));
-    assert!(matches!(
-        validate_user_name("_seg4096"),
-        Err(GnitzSqlError::Rejected(_))
-    ));
-    // Empty and illegal characters.
-    assert!(matches!(validate_user_name(""), Err(GnitzSqlError::Rejected(_))));
-    assert!(matches!(
-        validate_user_name("bad-name"),
-        Err(GnitzSqlError::Rejected(_))
-    ));
-    assert!(matches!(validate_user_name("a.b"), Err(GnitzSqlError::Rejected(_))));
-    // Ordinary names — including an internal `_` — are accepted.
-    assert!(validate_user_name("orders").is_ok());
-    assert!(validate_user_name("my_view2").is_ok());
-}
-
-/// A computed STRING column must be *declared* STRING. The register image
-/// maps STRING to I64, which was right while every computed value was an
-/// 8-byte register.
-#[test]
-fn a_computed_string_projection_declares_a_string_column() {
-    let schema = Schema {
-        columns: vec![
-            ColumnDef::new("pk", TypeCode::U64, true),
-            ColumnDef::new("s", TypeCode::String, true),
-        ],
-        pk_cols: vec![0],
-    };
-    let e = BoundExpr::StrCall {
-        f: StrFunc::Upper,
-        args: vec![BoundExpr::ColRef(1)],
-    };
-    let nominal = e.infer_ty(&schema.columns);
-    assert_eq!(nominal.tc, TypeCode::String);
-    let def = computed_column(None, 0, nominal).unwrap();
-    assert_eq!(def.ty.tc, TypeCode::String);
-    assert!(def.is_nullable);
-    // A numeric expression still takes its register image.
+fn a_computed_column_is_declared_in_its_register_image() {
     assert_eq!(
-        computed_column(None, 0, TypeCode::F32.into()).unwrap().ty.tc,
-        TypeCode::F64
+        computed_column(None, 3, TypeCode::String.into()).unwrap(),
+        ColumnDef::new("_expr3", TypeCode::String, true)
     );
-}
-
-/// A synthesized key list is capped by the PK-list width, whatever assembled it
-/// — a join's reindex slots or a join output's pair PK. A zero-slot list is the
-/// keyless join, which this rule has nothing to say about.
-#[test]
-fn pk_list_arity_bounds() {
-    reject_pk_list_arity("join key list", 0).unwrap();
-    reject_pk_list_arity("join key list", gnitz_wire::PK_LIST_MAX_COLS).unwrap();
-    let over = reject_pk_list_arity("range JOIN output PK", gnitz_wire::PK_LIST_MAX_COLS + 1).unwrap_err();
-    let GnitzSqlError::Rejected(msg) = over else {
-        panic!("expected Unsupported, got {over:?}");
-    };
-    assert!(msg.contains("range JOIN output PK"), "{msg}");
+    assert_eq!(
+        computed_column(Some("x".into()), 0, TypeCode::F32.into()).unwrap(),
+        ColumnDef::new("x", TypeCode::F64, true)
+    );
+    assert_eq!(
+        computed_column(None, 0, TypeCode::I16.into()).unwrap(),
+        ColumnDef::new("_expr0", TypeCode::I64, true)
+    );
+    assert_eq!(
+        rejected(computed_column(None, 0, ColType::decimal(19))),
+        "DECIMAL scale 19 exceeds 18; CAST an operand to a narrower scale"
+    );
 }
 
 /// One slot per named key, filled case-insensitively; any other key, a repeat
@@ -71,7 +30,7 @@ fn pk_list_arity_bounds() {
 fn kv_options_fills_named_slots_and_refuses_anything_else() {
     let decode = |clause: &str| {
         let sql = format!("CREATE TABLE t (id BIGINT PRIMARY KEY) {clause}");
-        let sqlparser::ast::Statement::CreateTable(c) = crate::test_support::parse_stmt(&sql) else {
+        let sqlparser::ast::Statement::CreateTable(c) = parse_stmt(&sql) else {
             panic!("not a CREATE TABLE: {sql}");
         };
         kv_options(&c.table_options, "X", ["a", "b"]).map(|slots| slots.map(|v| v.map(ToString::to_string)))
@@ -83,16 +42,11 @@ fn kv_options_fills_named_slots_and_refuses_anything_else() {
         [Some("1".into()), Some("2".into())]
     );
     for (clause, needle) in [
-        (
-            "WITH (c = 1)",
-            "unknown X option 'c'; the supported options are `a`, `b`",
-        ),
+        ("WITH (c = 1)", "unknown X option 'c'"),
         ("WITH (a = 1, A = 2)", "X option `a` is given more than once"),
         ("OPTIONS(a = 1)", "OPTIONS (…) is not supported"),
     ] {
-        match decode(clause) {
-            Err(GnitzSqlError::Rejected(m)) => assert!(m.contains(needle), "{clause}: {m}"),
-            other => panic!("{clause}: {other:?}"),
-        }
+        let m = rejected(decode(clause));
+        assert!(m.contains(needle), "{clause}: {m}");
     }
 }

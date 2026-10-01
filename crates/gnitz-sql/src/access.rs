@@ -279,7 +279,7 @@ pub(crate) fn residual<'e>(conjuncts: &'e [BoundExpr], consumed: &[usize]) -> Ve
 }
 
 /// A candidate's place in [`candidates`], first to last.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Tier {
     PkKeys,
     /// Bet to unicast under a `CLUSTER BY` shorter than the PK.
@@ -294,6 +294,11 @@ enum Tier {
 /// Every bound `conjuncts` admit, best first. A list, because a candidate whose
 /// residual does not compile gives way to the next.
 pub(crate) fn candidates(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[RelIndex]) -> Vec<Candidate> {
+    ranked(conjuncts, schema, indexes).into_iter().map(|(_, c)| c).collect()
+}
+
+/// [`candidates`], each beside the tier that placed it.
+fn ranked(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[RelIndex]) -> Vec<(Tier, Candidate)> {
     let terms: Vec<Term> = conjuncts
         .iter()
         .enumerate()
@@ -354,7 +359,7 @@ pub(crate) fn candidates(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[Re
     }
     // Stable, so a full tie keeps declared order.
     out.sort_by_key(|(tier, rank, _)| (*tier, Reverse(*rank)));
-    out.into_iter().map(|(_, _, c)| c).collect()
+    out.into_iter().map(|(tier, _, c)| (tier, c)).collect()
 }
 
 /// How constrained an index walk is within its tier; fields compare in order.

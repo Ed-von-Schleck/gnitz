@@ -471,12 +471,6 @@ pub(crate) trait ItemLeaf: LeafBinder<ColId> {
     /// The columns in scope — the typing table for every `ColId` this leaf
     /// hands out.
     fn env(&self) -> &[HirCol];
-    /// The declared type of a leaf reference. A leaf minting columns of its own
-    /// (a window placeholder, a subquery's column) answers for those; everything
-    /// else is the env's.
-    fn type_of(&self, id: &ColId) -> ColType {
-        hircol_of(self.env(), *id).def.ty
-    }
     /// The projection of `items` over `source`. The subquery-binding leaf joins in
     /// the subqueries its items and `source`'s filter read.
     fn project(&self, source: Rc<RelExpr>, items: Vec<ProjEntry>) -> Result<Rc<RelExpr>, GnitzSqlError> {
@@ -623,13 +617,6 @@ impl ItemLeaf for ScopeLeaf<'_> {
     fn env(&self) -> &[HirCol] {
         &self.scope.combined
     }
-    fn type_of(&self, id: &ColId) -> ColType {
-        match self.recorded(*id) {
-            Some(SubqueryKind::Exists { .. }) => ColType::of(TypeCode::I64),
-            Some(SubqueryKind::Scalar { ty, .. }) => ty,
-            None => hircol_of(self.env(), *id).def.ty,
-        }
-    }
     fn wildcard_cols(&self) -> Option<Vec<&HirCol>> {
         Some(self.scope.unmerged())
     }
@@ -671,6 +658,13 @@ impl LeafBinder<ColId> for ScopeLeaf<'_> {
             Some(SubqueryKind::Exists { nullable }) => nullable,
             Some(SubqueryKind::Scalar { count, .. }) => !count,
             None => hircol_of(self.env(), *id).def.is_nullable,
+        }
+    }
+    fn type_of(&self, id: &ColId) -> ColType {
+        match self.recorded(*id) {
+            Some(SubqueryKind::Exists { .. }) => ColType::of(TypeCode::I64),
+            Some(SubqueryKind::Scalar { ty, .. }) => ty,
+            None => hircol_of(self.env(), *id).def.ty,
         }
     }
 
@@ -1805,6 +1799,9 @@ impl LeafBinder<ColId> for GroupedLeaf<'_> {
     }
     fn is_nullable(&self, id: &ColId) -> bool {
         hircol_of(self.env, *id).def.is_nullable
+    }
+    fn type_of(&self, id: &ColId) -> ColType {
+        hircol_of(self.env, *id).def.ty
     }
 }
 

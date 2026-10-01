@@ -1,6 +1,6 @@
 use super::*;
 use crate::codec::project_schema::reply_program;
-use crate::test_support::{col, ncol};
+use crate::test_support::{col, ncol, schema};
 use gnitz_core::BatchAppender;
 use gnitz_expr::{payload_is_null, payload_string, payload_u64};
 use gnitz_wire::{ColumnDef, TypeCode};
@@ -11,14 +11,14 @@ const FALLBACK: &str = "a computed fallback past the inline prefix";
 
 /// `(k I64 PK, v I64 NULL, s STRING NULL)`.
 fn source() -> Schema {
-    Schema {
-        columns: vec![
+    schema(
+        vec![
             col("k", TypeCode::I64),
             ncol("v", TypeCode::I64),
             ncol("s", TypeCode::String),
         ],
-        pk_cols: vec![0],
-    }
+        &[0],
+    )
 }
 
 /// The reply map of the SELECT list `sql` over [`source`]: the hidden key, then the items.

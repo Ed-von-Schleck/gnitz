@@ -1,210 +1,48 @@
 use super::*;
 use crate::expr_lower::compile_wire_conjuncts;
-use crate::test_support::{bind_where, col, idx_metas_flagged, pk_schema, two_col};
+use crate::test_support::{bind_where, col, ix, pk_schema, schema, two_col};
 use gnitz_wire::TypeCode;
 
-/// The plan for `where_expr` against `lists` (the table's indexes).
-/// An access path's bound and compiled predicate.
-struct AccessPlan {
-    bound: ReadBound,
-    predicate: Vec<u8>,
-}
-
-fn plan_of(conjuncts: &[BoundExpr], schema: &Schema, lists: &[(&[u32], bool)]) -> AccessPlan {
-    let (bound, predicate) =
-        bound_and_predicate(schema, conjuncts, &idx_metas_flagged(lists)).expect("the WHERE must plan");
-    AccessPlan { bound, predicate }
-}
-
-/// The predicate the conjuncts of `residual` compile to; empty for none.
-fn predicate_of(residual: Option<&str>, schema: &Schema) -> Vec<u8> {
-    let conjuncts = residual.map(|s| bind_where(s, schema)).unwrap_or_default();
-    compile_wire_conjuncts(&conjuncts, &schema.columns).expect("the residual compiles")
-}
-
-/// How many keys `plan`'s bound pins; `None` when it pins none.
-fn pinned_keys(plan: &AccessPlan) -> Option<usize> {
-    match &plan.bound {
-        ReadBound::PkSet(keys) => Some(keys.len()),
-        _ => None,
-    }
-}
-
-/// The bound's kind over `schema`, for a shape assertion that does not care about
-/// the range's contents: a range names the store it walks.
-fn shape(bound: &ReadBound, schema: &Schema) -> &'static str {
-    match bound {
-        ReadBound::None => "None",
-        ReadBound::Range(r) if r.walks_pk(&schema.pk_cols) => "PkRange",
-        ReadBound::Range(_) => "IndexRange",
-        ReadBound::PkSet(_) => "PkSet",
-    }
-}
-
-/// Every WHERE shape, one ladder: which bound it takes, which of it stays
-/// residual, and how many keys the bound pins. The schema is `(id U64 pk, v
-/// I64)` with an index on `v`, so every rung is reachable from one table.
+/// The first candidate whose residual compiles serves the WHERE and ships exactly
+/// the conjuncts it leaves; with no candidate the whole WHERE ships under no bound.
+/// `Some(k)` names the candidate, by rank, whose bound the plan must carry.
 #[test]
-fn the_ladder_maps_each_where_shape_to_its_bound() {
-    let schema = pk_schema(TypeCode::U64);
-    let idx: &[(&[u32], bool)] = &[(&[1], false)];
-    for (sql, want_shape, want_residual, want_keys) in [
-        // No WHERE: nothing to walk, nothing to re-impose.
-        (None, "None", None, 0),
-        // A `pk IN (…)` gather, and the point a one-key list folds to at bind.
-        (Some("id IN (7, 9)"), "PkSet", None, 2),
-        (Some("id IN (7)"), "PkSet", None, 1),
-        (Some("id = 7"), "PkSet", None, 1),
-        // `NOT IN` binds to `Not(…)`, which no PK recognizer matches.
-        (Some("id NOT IN (7, 9)"), "None", Some("id NOT IN (7, 9)"), 0),
-        // A companion conjunct rides the residual of a key-pinning bound: the
-        // key restriction supplies the consumed PK conjunct, the residual the rest.
-        (Some("id IN (7, 9) AND v > 5"), "PkSet", Some("v > 5"), 2),
-        (Some("id = 7 AND v > 5"), "PkSet", Some("v > 5"), 1),
-        // No PK conjunct: the index rung, which applies its conjunct exactly, then
-        // the unbounded scan. An arithmetic WHERE has no `col OP literal` conjunct.
-        (Some("v = 7"), "IndexRange", None, 0),
-        (Some("id + v = 7"), "None", Some("id + v = 7"), 0),
-        // A non-integral literal names no key, so the bound is the empty range;
-        // a top-level OR pins nothing and stays a predicate over the whole table.
-        (Some("id = 3.5"), "PkRange", None, 0),
-        (Some("v = 5 OR id = 1"), "None", Some("v = 5 OR id = 1"), 0),
+fn the_first_servable_candidate_bounds_the_read_and_ships_its_residual() {
+    let by_pk = pk_schema(TypeCode::U64); // (id pk, v), v indexed
+    let narrow = schema(["id", "v", "w"].map(|n| col(n, TypeCode::U64)).to_vec(), &[0]);
+    // No register holds `val`, so a residual naming it does not compile.
+    let wide = two_col(TypeCode::U128);
+    for (s, sql, served_by, residual) in [
+        (&by_pk, "", None, ""),
+        (&by_pk, "id IN (7, 9) AND v > 5", Some(0), "v > 5"),
+        (&by_pk, "v = 7", Some(0), ""),
+        // No conjunct any bound consumes.
+        (&by_pk, "id NOT IN (7, 9)", None, "id NOT IN (7, 9)"),
+        (&by_pk, "id + v = 7", None, "id + v = 7"),
+        (&by_pk, "v = 5 OR id = 1", None, "v = 5 OR id = 1"),
+        (&narrow, "v = 5 AND w = 9", Some(0), "w = 9"),
+        (&narrow, "v = 18446744073709551615", Some(0), ""),
+        (&wide, "val = 7", Some(0), ""),
+        (&wide, "val > 7", Some(0), ""),
+        // The PK walk would leave `val = 7` residual, so the index walk serves.
+        (&wide, "pk > 5 AND val = 7", Some(1), "pk > 5"),
+        (&wide, "pk IN (1, 2) AND val = 7", Some(1), "pk IN (1, 2)"),
     ] {
-        let bound_where = sql.map(|s| bind_where(s, &schema)).unwrap_or_default();
-        let plan = plan_of(&bound_where, &schema, idx);
-        let label = sql.unwrap_or("<no WHERE>");
-        assert_eq!(shape(&plan.bound, &schema), want_shape, "{label}");
-        assert_eq!(pinned_keys(&plan).unwrap_or(0), want_keys, "{label}: pinned keys");
+        let conjuncts = |sql: &str| match sql {
+            "" => Vec::new(),
+            sql => bind_where(sql, s),
+        };
+        let indexes = [ix(&[1])];
+        let (bound, predicate) = bound_and_predicate(s, &conjuncts(sql), &indexes).expect(sql);
+        let want = match served_by {
+            Some(k) => candidates(&conjuncts(sql), s, &indexes).swap_remove(k).bound,
+            None => ReadBound::None,
+        };
+        assert_eq!(bound, want, "{sql}");
         assert_eq!(
-            plan.predicate,
-            predicate_of(want_residual, &schema),
-            "{label}: the residual is what ships as a predicate"
-        );
-    }
-}
-
-/// A lone `pk IN (…)` list is keys the statement spelled out, so however long it is
-/// it plans one gather.
-#[test]
-fn a_long_in_list_plans_one_pk_set() {
-    let schema = pk_schema(TypeCode::U64);
-    let n = 70_000;
-    // Built directly: the same list as SQL text is megabytes for the parser.
-    let where_expr = [BoundExpr::InList {
-        inner: Box::new(BoundExpr::ColRef(0)),
-        items: (0..n as i64).map(BoundExpr::LitInt).collect(),
-    }];
-    let plan = plan_of(&where_expr, &schema, &[]);
-    assert_eq!(shape(&plan.bound, &schema), "PkSet");
-    assert_eq!(pinned_keys(&plan), Some(n));
-    assert!(plan.predicate.is_empty());
-}
-
-/// When a PK bound yields to a unique index point, and when it keeps the PK
-/// walk instead. Asserted on the resulting bound rather than on a predicate,
-/// so it states the plan the rule exists to produce.
-#[test]
-fn a_pk_bound_yields_only_to_a_unique_index_point() {
-    // `(id U64 pk, v I64)`, with `v` indexed — unique or not per case.
-    let schema = pk_schema(TypeCode::U64);
-    let uniq: &[(&[u32], bool)] = &[(&[1], true)];
-    let non_uniq: &[(&[u32], bool)] = &[(&[1], false)];
-    for (sql, idx, want, why) in [
-        // Nothing pinned on the PK and a unique point available: the point
-        // admits one row where the open PK range admits the table.
-        ("id > 0 AND v = 42", uniq, "IndexRange", "unpinned PK range yields"),
-        // A degenerate range IS a point, so it yields on the same rule — the
-        // shape of the conjuncts that produced it does not matter.
-        (
-            "id > 0 AND v >= 5 AND v <= 5",
-            uniq,
-            "IndexRange",
-            "a degenerate range is a point",
-        ),
-        // A non-unique index point admits many rows, so it does not beat the
-        // PK walk.
-        ("id > 0 AND v = 42", non_uniq, "PkRange", "a non-unique point does not"),
-        // No index point to build at all.
-        ("id > 5 AND v > 1", uniq, "PkRange", "no point available"),
-        // A pinned PK point already admits one row.
-        ("id = 7 AND v = 42", uniq, "PkSet", "a PK point is never given up"),
-    ] {
-        let where_expr = bind_where(sql, &schema);
-        let plan = plan_of(&where_expr, &schema, idx);
-        assert_eq!(shape(&plan.bound, &schema), want, "{sql}: {why}");
-    }
-
-    // A descriptor pinning any PK column keeps the PK walk, unique point on
-    // offer or not — the client cannot see the distribution prefix, so the ladder
-    // bets on the `CLUSTER BY` unicast rather than measuring it.
-    let compound = Schema {
-        columns: vec![
-            col("tenant", TypeCode::U64),
-            col("id", TypeCode::U64),
-            col("email", TypeCode::U64),
-        ],
-        pk_cols: vec![0, 1],
-    };
-    let email_uniq: &[(&[u32], bool)] = &[(&[2], true)];
-    for (sql, why) in [
-        ("tenant = 7 AND id > 0 AND email = 42", "an equality prefix is pinned"),
-        // The bare prefix lowers to a point over `tenant` with nothing pinned
-        // before it — still one worker's rows, not one row.
-        ("tenant = 7 AND email = 42", "a bare prefix lowers to a pinned point"),
-    ] {
-        let where_expr = bind_where(sql, &compound);
-        let plan = plan_of(&where_expr, &compound, email_uniq);
-        assert_eq!(shape(&plan.bound, &compound), "PkRange", "{sql}: {why}");
-    }
-}
-
-/// An index walk is exact, so it ships only the conjuncts it does not consume — a
-/// wide literal or a wide-int column included.
-#[test]
-fn an_index_walk_ships_only_its_residual() {
-    // `(id U64 pk, v U64, w U64)` — `w` keeps a companion conjunct off the PK,
-    // which would otherwise take the PK-range rung ahead of any index.
-    let narrow = Schema {
-        columns: vec![
-            col("id", TypeCode::U64),
-            col("v", TypeCode::U64),
-            col("w", TypeCode::U64),
-        ],
-        pk_cols: vec![0],
-    };
-    let wide = two_col(TypeCode::U128); // `val` is U128
-    let idx: &[(&[u32], bool)] = &[(&[1], false)];
-    for (schema, sql, want_residual) in [
-        (&narrow, "v = 5", None),
-        (&narrow, "v = 5 AND w = 9", Some("w = 9")),
-        (&narrow, "v = 18446744073709551615", None),
-        (&wide, "val = 7", None),
-        (&wide, "val > 7", None),
-    ] {
-        let where_expr = bind_where(sql, schema);
-        let plan = plan_of(&where_expr, schema, idx);
-        assert_eq!(shape(&plan.bound, schema), "IndexRange", "{sql}");
-        assert_eq!(plan.predicate, predicate_of(want_residual, schema), "{sql}: predicate");
-    }
-}
-
-/// A candidate whose residual the expression VM refuses falls through to the next:
-/// the PK walk keeps `val = 7` on a U128 column residual, where the index walk
-/// consumes it and keeps only the PK conjunct.
-#[test]
-fn an_uncompilable_pk_residual_falls_through_to_the_index() {
-    let schema = two_col(TypeCode::U128);
-    for (sql, pk_conjunct) in [
-        ("pk > 5 AND val = 7", "pk > 5"),
-        ("pk IN (1, 2) AND val = 7", "pk IN (1, 2)"),
-    ] {
-        let where_expr = bind_where(sql, &schema);
-        let plan = plan_of(&where_expr, &schema, &[(&[1], false)]);
-        assert_eq!(shape(&plan.bound, &schema), "IndexRange", "{sql}");
-        assert_eq!(
-            plan.predicate,
-            predicate_of(Some(pk_conjunct), &schema),
-            "{sql}: the PK conjunct stays residual"
+            predicate,
+            compile_wire_conjuncts(&conjuncts(residual), &s.columns).unwrap(),
+            "{sql}: the residual is what ships as a predicate"
         );
     }
 }
@@ -213,10 +51,7 @@ fn an_uncompilable_pk_residual_falls_through_to_the_index() {
 /// conjunct that candidate could not consume, not one it did.
 #[test]
 fn an_unsupported_residual_reports_the_best_candidates_blocker() {
-    let schema = Schema {
-        columns: vec![col("id", TypeCode::U128), col("name", TypeCode::String)],
-        pk_cols: vec![0],
-    };
+    let schema = schema(vec![col("id", TypeCode::U128), col("name", TypeCode::String)], &[0]);
     let where_expr = bind_where("id = 7 AND name + 1 > 0", &schema);
     let Err(err) = bound_and_predicate(&schema, &where_expr, &[]) else {
         panic!("`name + 1` cannot compile");

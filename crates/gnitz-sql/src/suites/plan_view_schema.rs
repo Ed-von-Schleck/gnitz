@@ -140,6 +140,11 @@ fn a_projection_places_the_source_pk_first() {
         assert_eq!(&output_shape(&chain), shape, "{body}");
         assert_eq!(&pk(&chain), pk_cols, "{body}");
     }
+    // A computed item is declared in the type it computes.
+    assert_eq!(
+        types(&view(&cat, "SELECT id, UPPER(name) AS u, age + 0.5 AS f FROM late")),
+        [i, s, TypeCode::F64]
+    );
 }
 
 /// A view over a compound-PK view inherits the compound PK.
@@ -366,7 +371,7 @@ fn an_identity_cte_of_a_view_keeps_its_row_key() {
             RelClass::View,
             vec![col("id", i).hidden(), col("x", i)],
             vec![0],
-            &[],
+            vec![],
         ),
     )]);
     view(

@@ -23,36 +23,17 @@ use gnitz_core::PlannedView;
 use gnitz_wire::{Circuit, OpNode, RelClass, TypeCode};
 use sqlparser::ast::Statement;
 
-/// `Err` unwrapped without demanding `Debug` of the success value.
-fn err_of<T>(r: Result<T, GnitzSqlError>) -> GnitzSqlError {
-    match r {
-        Err(e) => e,
-        Ok(_) => panic!("expected a rejection"),
-    }
-}
-
-/// The error's variant name and message.
-fn variant_of(e: &GnitzSqlError) -> (&'static str, String) {
-    match e {
-        GnitzSqlError::Rejected(m) => ("Rejected", m.clone()),
-        GnitzSqlError::Client(m) => ("Client", m.to_string()),
-        GnitzSqlError::Internal(m) => ("Internal", m.clone()),
-    }
-}
-
-/// Assert `r` is the rejection `want_variant` whose message contains
-/// `want_msg` — the guard's identity, not its wording. `what` labels the
-/// failure (the SQL, usually).
-fn assert_rejects<T>(what: &str, r: Result<T, GnitzSqlError>, want_variant: &str, want_msg: &str) {
-    let e = match r {
-        Err(e) => e,
+/// Assert `r` is a rejection whose message contains `want` — the guard's
+/// identity, not its wording. `what` labels the failure (the SQL, usually).
+fn assert_rejects<T>(what: &str, r: Result<T, GnitzSqlError>, want: &str) {
+    let msg = match r {
+        Err(GnitzSqlError::Rejected(m)) => m,
+        Err(e) => panic!("`{what}`: expected a rejection, got {e:?}"),
         Ok(_) => panic!("`{what}` was accepted"),
     };
-    let (variant, msg) = variant_of(&e);
-    assert_eq!(variant, want_variant, "variant mismatch for `{what}`: {e:?}");
     assert!(
-        msg.contains(want_msg),
-        "for `{what}`\n  expected substring: {want_msg:?}\n  got: {msg:?}"
+        msg.contains(want),
+        "for `{what}`\n  expected substring: {want:?}\n  got: {msg:?}"
     );
 }
 
@@ -75,7 +56,7 @@ fn base() -> Catalog<'static> {
     let i = TypeCode::I64;
     let tgv = || vec![col("id", i), col("g", i), col("v", i)];
     catalog(vec![
-        ("t", rel(16, RelClass::Table, tgv(), vec![0], &[&[2]])),
+        ("t", rel(16, RelClass::Table, tgv(), vec![0], vec![ix(&[2])])),
         ("u", table(17, tgv(), vec![0])),
         ("a", table(18, vec![col("id", i), col("k", i), col("v", i)], vec![0])),
         ("b", table(19, vec![col("id", i), col("k", i), col("w", i)], vec![0])),
@@ -107,11 +88,11 @@ fn base() -> Catalog<'static> {
         ),
         (
             "r",
-            rel(23, RelClass::Table, vec![col("id", i), col("v", i)], vec![0], &[]),
+            rel(23, RelClass::Table, vec![col("id", i), col("v", i)], vec![0], vec![]),
         ),
-        ("tv", rel(24, RelClass::View, tgv(), vec![0], &[])),
-        ("bv", rel(25, RelClass::BoundedView, tgv(), vec![0], &[])),
-        ("fv", rel(26, RelClass::FedView, tgv(), vec![0], &[])),
+        ("tv", rel(24, RelClass::View, tgv(), vec![0], vec![])),
+        ("bv", rel(25, RelClass::BoundedView, tgv(), vec![0], vec![])),
+        ("fv", rel(26, RelClass::FedView, tgv(), vec![0], vec![])),
     ])
 }
 

@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{col, ncol};
+use crate::test_support::{col, ncol, schema};
 use gnitz_core::BatchAppender;
 use gnitz_wire::{OrderKey, TypeCode};
 
@@ -15,14 +15,14 @@ const UNCUT: Window = Window { offset: 0, limit: None };
 
 /// `(id U64 pk, v I64 nullable, s STRING nullable)`.
 fn kv_schema() -> Schema {
-    Schema {
-        columns: vec![
+    schema(
+        vec![
             col("id", TypeCode::U64),
             ncol("v", TypeCode::I64),
             ncol("s", TypeCode::String),
         ],
-        pk_cols: vec![0],
-    }
+        &[0],
+    )
 }
 
 /// A `kv_schema` batch of `(id, v, s, weight)` rows.

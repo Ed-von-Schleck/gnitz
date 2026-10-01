@@ -1,5 +1,6 @@
 use super::*;
 use crate::hir::bind_and_lower_fold;
+use crate::test_support::Cell::{self, Int, Null, Str, F64};
 use crate::test_support::{col, ncol, parse_query, table};
 use gnitz_core::{BatchAppender, PkColumn, RelDescriptor};
 use gnitz_expr::{payload_str, payload_u64};
@@ -8,16 +9,6 @@ use gnitz_wire::{global_group_key, FixedInt, TypeCode};
 /// A long body, spilled to the arena rather than inlined in its German cell.
 const LONG_M: &str = "a string past the inline prefix: m";
 const LONG_Z: &str = "a string past the inline prefix: z";
-
-/// One payload cell, written into a partial reply or read back out of a result.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Cell<'a> {
-    Int(i128),
-    F64(f64),
-    Str(&'a str),
-    Null,
-}
-use self::Cell::{Int, Null, Str, F64};
 
 /// `(pk U64 | g I64 | s STRING | sm I16 | x I64 | f F64 | u U64)`, every payload nullable.
 fn t() -> Arc<RelDescriptor> {
@@ -59,13 +50,8 @@ fn reply(f: &FoldFinish, rows: &[(&[u128], &[Cell])]) -> ZSetBatch {
     let mut app = BatchAppender::new(&mut b, schema);
     for &(key, cells) in rows {
         app.add_row_natives(key, 1);
-        for &cell in cells {
-            match cell {
-                Int(v) => app.int_val(v),
-                F64(v) => app.f64_val(v),
-                Str(s) => app.str_val(s),
-                Null => app.null(),
-            };
+        for cell in cells {
+            cell.push(&mut app);
         }
     }
     b

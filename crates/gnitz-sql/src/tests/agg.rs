@@ -1,107 +1,52 @@
 use super::*;
-use crate::test_support::{col, ncol};
+use crate::test_support::{col, ncol, rejected};
+use WireAggFunc as W;
 
-// Columns: 0=pk(U64), 1=n(I64), 2=b(Blob), 3=u(UUID), 4=s(String).
-fn schema() -> Schema {
-    Schema {
-        columns: vec![
-            col("pk", TypeCode::U64),
-            ncol("n", TypeCode::I64),
-            ncol("b", TypeCode::Blob),
-            ncol("u", TypeCode::UUID),
-            ncol("s", TypeCode::String),
-        ],
-        pk_cols: vec![0],
-    }
-}
-
-fn try_push(func: AggFunc, arg_col: Option<usize>) -> Result<(), GnitzSqlError> {
-    let s = schema();
-    agg_ops(func, arg_col.map(|c| &s.columns[c]), false).map(|_| ())
-}
-
+/// An aggregate's physical ops: a count over a NOT NULL argument counts rows, a
+/// count companion rides exactly where null-ness needs one, and only SUM and AVG
+/// are refused a type — MIN, MAX and COUNT select or count a row of any.
 #[test]
-fn agg_ops_rejects_unevaluatable_arg_types() {
-    for (func, ci) in [
-        (AggFunc::Sum, 2), // SUM(blob)
-        (AggFunc::Avg, 3), // AVG(uuid)
-        (AggFunc::Sum, 4), // SUM(str)
-    ] {
-        assert!(matches!(try_push(func, Some(ci)), Err(GnitzSqlError::Rejected(_))));
-    }
-}
-
-#[test]
-fn agg_ops_accepts_valid_arg_types() {
-    assert!(try_push(AggFunc::Sum, Some(1)).is_ok()); // SUM(i64)
-    assert!(try_push(AggFunc::Avg, Some(1)).is_ok()); // AVG(i64)
-    assert!(try_push(AggFunc::Min, Some(1)).is_ok()); // MIN(i64)
-    assert!(try_push(AggFunc::Count, None).is_ok()); // COUNT(*)
-    assert!(try_push(AggFunc::Count, Some(2)).is_ok()); // COUNT(blob) — presence only
-                                                        // MIN/MAX select a row, so a wide type is as good as a narrow one — the
-                                                        // very types SUM/AVG are refused over above.
-    assert!(try_push(AggFunc::Min, Some(4)).is_ok()); // MIN(str)
-    assert!(try_push(AggFunc::Max, Some(2)).is_ok()); // MAX(blob)
-    assert!(try_push(AggFunc::Max, Some(3)).is_ok()); // MAX(uuid)
-}
-
-/// An aggregate's physical ops: a count over a NOT NULL argument counts rows,
-/// and a count companion rides exactly where null-ness needs one.
-#[test]
-fn agg_ops_shares_the_row_count_over_a_not_null_argument() {
-    use WireAggFunc as W;
+fn agg_ops_picks_the_value_op_and_the_count_its_nullness_needs() {
+    use AggFunc::*;
     let nullable = ncol("x", TypeCode::I64);
     let not_null = col("y", TypeCode::I64);
-    let ops = |f, c| agg_ops(f, Some(c), false).unwrap();
-    assert_eq!(ops(AggFunc::Count, &nullable), (W::CountNonNull, None));
-    assert_eq!(ops(AggFunc::Count, &not_null), (W::Count, None));
-    assert_eq!(ops(AggFunc::Avg, &not_null), (W::Sum, Some(W::Count)));
-    assert_eq!(ops(AggFunc::Avg, &nullable), (W::Sum, Some(W::CountNonNull)));
-    assert_eq!(ops(AggFunc::Sum, &nullable), (W::Sum, Some(W::CountNonNull)));
-    assert_eq!(ops(AggFunc::Sum, &not_null), (W::Sum, None));
-    let global = |f, c| agg_ops(f, Some(c), true).unwrap();
-    assert_eq!(global(AggFunc::Sum, &not_null), (W::Sum, Some(W::Count)));
-    assert_eq!(global(AggFunc::Sum, &nullable), (W::Sum, Some(W::CountNonNull)));
-    assert_eq!(global(AggFunc::Min, &not_null), (W::Min, None));
+    let (blob, uuid, string) = (
+        ncol("b", TypeCode::Blob),
+        col("u", TypeCode::UUID),
+        col("s", TypeCode::String),
+    );
+    for (func, arg, ungrouped, want) in [
+        (Count, None, false, (W::Count, None)),
+        (Count, Some(&nullable), false, (W::CountNonNull, None)),
+        (Count, Some(&not_null), false, (W::Count, None)),
+        (Count, Some(&blob), false, (W::CountNonNull, None)),
+        (Avg, Some(&not_null), false, (W::Sum, Some(W::Count))),
+        (Avg, Some(&nullable), false, (W::Sum, Some(W::CountNonNull))),
+        (Sum, Some(&nullable), false, (W::Sum, Some(W::CountNonNull))),
+        (Sum, Some(&not_null), false, (W::Sum, None)),
+        (Sum, Some(&not_null), true, (W::Sum, Some(W::Count))),
+        (Sum, Some(&nullable), true, (W::Sum, Some(W::CountNonNull))),
+        (Min, Some(&not_null), true, (W::Min, None)),
+        (Min, Some(&string), false, (W::Min, None)),
+        (Max, Some(&uuid), false, (W::Max, None)),
+        (Max, Some(&blob), false, (W::Max, None)),
+    ] {
+        assert_eq!(agg_ops(func, arg, ungrouped).unwrap(), want, "{func:?}({arg:?})");
+    }
+    for (func, arg, want) in [
+        (Sum, &blob, "SUM: not supported on BLOB column 'b'"),
+        (Avg, &uuid, "AVG: not supported on UUID column 'u'"),
+        (Sum, &string, "SUM: not supported on STRING column 's'"),
+    ] {
+        assert_eq!(rejected(agg_ops(func, Some(arg), false)), want);
+    }
 }
 
-/// SUM over a U64 source is typed U64 (bit pattern is the correct unsigned
-/// sum), so a downstream unsigned compare re-seeds; a narrow unsigned / signed
-/// source widens to I64. MIN/MAX preserve the U64 source type as before.
+/// The raw reduce column carries a DECIMAL argument's scale.
 #[test]
-fn agg_result_type_sum_preserves_u64() {
-    let s = Schema {
-        columns: vec![
-            col("pk", TypeCode::U64),
-            ncol("u", TypeCode::U64),
-            ncol("w", TypeCode::U32),
-            ncol("i", TypeCode::I64),
-            ncol("f", TypeCode::F64),
-        ],
-        pk_cols: vec![0],
-    };
-    // The raw reduce value type; only AVG (untested here) diverges from it, and
-    // `HirAgg::view_type` is what renders that.
-    let rt = |f, i: usize| {
-        let c = Some(&s.columns[i]);
-        agg_col_def(agg_ops(f, c, false).unwrap().0, c, false).ty
-    };
-    assert_eq!(rt(AggFunc::Sum, 1), TypeCode::U64.into()); // SUM(u64) → U64
-    assert_eq!(rt(AggFunc::Sum, 2), TypeCode::I64.into()); // SUM(u32) → I64
-    assert_eq!(rt(AggFunc::Sum, 3), TypeCode::I64.into()); // SUM(i64) → I64
-    assert_eq!(rt(AggFunc::Sum, 4), TypeCode::F64.into()); // SUM(f64) → F64
-    assert_eq!(rt(AggFunc::Min, 1), TypeCode::U64.into());
-    // MIN(u64) preserved
-}
-
-/// The unaliased aggregate column names are user-visible in the view schema
-/// (e2e-pinned), so the derivation from the canonical name table must render
-/// exactly these.
-#[test]
-fn default_agg_name_renders_pinned_view_column_names() {
-    assert_eq!(default_agg_name(AggFunc::Count, 0), "_count0");
-    assert_eq!(default_agg_name(AggFunc::Sum, 1), "_sum1");
-    assert_eq!(default_agg_name(AggFunc::Min, 2), "_min2");
-    assert_eq!(default_agg_name(AggFunc::Max, 3), "_max3");
-    assert_eq!(default_agg_name(AggFunc::Avg, 4), "_avg4");
+fn a_decimal_aggregate_keeps_its_arguments_scale() {
+    let price = ColumnDef::typed("price", ColType::decimal(2), true);
+    for op in [W::Sum, W::Min, W::Max] {
+        assert_eq!(agg_col_def(op, Some(&price), false).ty, ColType::decimal(2), "{op:?}");
+    }
 }

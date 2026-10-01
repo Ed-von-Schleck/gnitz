@@ -1,120 +1,106 @@
 use super::*;
-use crate::test_support::parse_stmt;
-use sqlparser::ast::{DataType, ExactNumberInfo as N, Statement, TimezoneInfo};
+use crate::test_support::{parse_stmt, rejected};
+use sqlparser::ast::Statement;
 
-/// Every accepted arm of `sql_col_type`, once.
+/// `CREATE TABLE t (c <decl>)`'s one column, through `column_def`.
+fn declared(decl: &str) -> Result<(ColumnDef, bool), GnitzSqlError> {
+    let Statement::CreateTable(create) = parse_stmt(&format!("CREATE TABLE t (c {decl})")) else {
+        panic!("{decl}: not a CREATE TABLE");
+    };
+    column_def(&create.columns[0])
+}
+
+/// Every accepted spelling, as the type it declares. A column is nullable unless
+/// it says otherwise, and a SERIAL spelling is its signed integer, NOT NULL.
 #[test]
-fn each_accepted_spelling_maps_to_its_type() {
+fn each_accepted_spelling_declares_its_type() {
+    use TypeCode::*;
     let t = ColType::of;
-    let ok: &[(DataType, ColType)] = &[
-        (DataType::TinyInt(None), t(TypeCode::I8)),
-        (DataType::TinyInt(Some(3)), t(TypeCode::I8)),
-        (DataType::SmallInt(None), t(TypeCode::I16)),
-        (DataType::Int(None), t(TypeCode::I32)),
-        (DataType::Integer(None), t(TypeCode::I32)),
-        (DataType::BigInt(None), t(TypeCode::I64)),
-        (DataType::TinyIntUnsigned(None), t(TypeCode::U8)),
-        (DataType::SmallIntUnsigned(None), t(TypeCode::U16)),
-        (DataType::IntUnsigned(None), t(TypeCode::U32)),
-        (DataType::IntegerUnsigned(None), t(TypeCode::U32)),
-        (DataType::UnsignedInteger, t(TypeCode::U32)),
-        (DataType::BigIntUnsigned(None), t(TypeCode::U64)),
-        (DataType::UInt128, t(TypeCode::U128)),
-        (DataType::UHugeInt, t(TypeCode::U128)),
-        (DataType::Int128, t(TypeCode::I128)),
-        (DataType::HugeInt, t(TypeCode::I128)),
-        (DataType::Float(N::None), t(TypeCode::F32)),
-        (DataType::Float(N::Precision(24)), t(TypeCode::F32)),
-        (DataType::Double(N::None), t(TypeCode::F64)),
-        (DataType::DoublePrecision, t(TypeCode::F64)),
-        (DataType::Real, t(TypeCode::F64)),
-        (DataType::Varchar(None), t(TypeCode::String)),
-        (DataType::Text, t(TypeCode::String)),
-        (DataType::Char(None), t(TypeCode::String)),
-        (DataType::Uuid, t(TypeCode::UUID)),
-        (DataType::Date, t(TypeCode::Date)),
-        (DataType::Timestamp(None, TimezoneInfo::None), t(TypeCode::Timestamp)),
-        (
-            DataType::Timestamp(None, TimezoneInfo::WithoutTimeZone),
-            t(TypeCode::Timestamp),
-        ),
-        (DataType::Datetime(None), t(TypeCode::Timestamp)),
-        (DataType::TimestampNtz(None), t(TypeCode::Timestamp)),
-        (DataType::Decimal(N::PrecisionAndScale(10, 2)), ColType::decimal(2)),
-        (DataType::Decimal(N::PrecisionAndScale(18, 0)), ColType::decimal(0)),
-        (DataType::Decimal(N::Precision(5)), ColType::decimal(0)),
-        (DataType::Numeric(N::PrecisionAndScale(18, 18)), ColType::decimal(18)),
-        (DataType::Dec(N::PrecisionAndScale(4, 1)), ColType::decimal(1)),
+    let dec = ColType::decimal;
+    let plain: &[(&str, ColType)] = &[
+        ("TINYINT", t(I8)),
+        ("TINYINT(3)", t(I8)),
+        ("SMALLINT", t(I16)),
+        ("INT", t(I32)),
+        ("INTEGER", t(I32)),
+        ("BIGINT", t(I64)),
+        ("TINYINT UNSIGNED", t(U8)),
+        ("SMALLINT UNSIGNED", t(U16)),
+        ("INT UNSIGNED", t(U32)),
+        ("INTEGER UNSIGNED", t(U32)),
+        ("UNSIGNED INTEGER", t(U32)),
+        ("BIGINT UNSIGNED", t(U64)),
+        ("UINT128", t(U128)),
+        ("UHUGEINT", t(U128)),
+        ("INT128", t(I128)),
+        ("HUGEINT", t(I128)),
+        ("FLOAT", t(F32)),
+        ("FLOAT(24)", t(F32)),
+        ("DOUBLE", t(F64)),
+        ("DOUBLE PRECISION", t(F64)),
+        ("REAL", t(F64)),
+        ("VARCHAR", t(String)),
+        ("TEXT", t(String)),
+        ("CHAR", t(String)),
+        ("UUID", t(UUID)),
+        ("DATE", t(Date)),
+        ("TIMESTAMP", t(Timestamp)),
+        ("TIMESTAMP WITHOUT TIME ZONE", t(Timestamp)),
+        ("DATETIME", t(Timestamp)),
+        ("TIMESTAMP_NTZ", t(Timestamp)),
+        ("DECIMAL(10, 2)", dec(2)),
+        ("DECIMAL(18, 0)", dec(0)),
+        ("DECIMAL(5)", dec(0)),
+        ("NUMERIC(18, 18)", dec(18)),
+        ("DEC(4, 1)", dec(1)),
     ];
-    for (dt, want) in ok {
-        assert_eq!(sql_col_type(dt).unwrap_or_else(|e| panic!("{dt}: {e}")), *want, "{dt}");
+    for &(decl, ty) in plain {
+        let got = declared(decl).unwrap_or_else(|e| panic!("{decl}: {e}"));
+        assert_eq!(got, (ColumnDef::typed("c", ty, true), false), "{decl}");
+    }
+    assert_eq!(
+        declared("BIGINT NOT NULL").unwrap(),
+        (ColumnDef::new("c", I64, false), false)
+    );
+    for (decl, tc) in [
+        ("SMALLSERIAL", I16),
+        ("SERIAL2", I16),
+        ("SERIAL", I32),
+        ("SERIAL4", I32),
+        ("serial", I32),
+        ("BIGSERIAL", I64),
+        ("SERIAL8", I64),
+        ("BigSerial", I64),
+    ] {
+        assert_eq!(
+            declared(decl).unwrap(),
+            (ColumnDef::new("c", tc, false), true),
+            "{decl}"
+        );
     }
 }
 
 /// Every refused spelling names what is wrong with it.
 #[test]
 fn each_refused_spelling_names_its_reason() {
-    let err: &[(DataType, &str)] = &[
-        (DataType::Boolean, "TINYINT(1)"),
-        (DataType::Bool, "TINYINT(1)"),
-        (DataType::Timestamp(None, TimezoneInfo::WithTimeZone), "time zone"),
-        (DataType::Decimal(N::None), "precision and scale"),
-        (DataType::Decimal(N::PrecisionAndScale(19, 2)), "precision"),
-        // The 128-bit integer is spelled UINT128, not as a DECIMAL.
-        (DataType::Decimal(N::PrecisionAndScale(38, 0)), "precision"),
-        (DataType::Decimal(N::PrecisionAndScale(5, 6)), "scale"),
-        (DataType::Decimal(N::PrecisionAndScale(0, 0)), "precision"),
-        // Echoed as written, not as a parser dump.
-        (
-            DataType::Interval { fields: None, precision: None },
-            "unsupported SQL type: INTERVAL",
-        ),
-    ];
-    for (dt, needle) in err {
-        let msg = sql_col_type(dt).expect_err(&dt.to_string()).to_string();
-        assert!(msg.contains(needle), "{dt}: {msg:?} does not name {needle:?}");
-    }
-}
-
-/// `CREATE TABLE t (<decl>)`'s one column, through `column_def`.
-fn declared(decl: &str) -> Result<(ColumnDef, bool), GnitzSqlError> {
-    let Statement::CreateTable(create) = parse_stmt(&format!("CREATE TABLE t ({decl})")) else {
-        panic!("{decl}: not a CREATE TABLE");
-    };
-    column_def(&create.columns[0])
-}
-
-/// A SERIAL spelling is its signed integer, NOT NULL, and reported as SERIAL;
-/// any other column carries its declared nullability.
-#[test]
-fn column_def_reads_serial_and_nullability() {
-    let ok: &[(&str, TypeCode, bool, bool)] = &[
-        // (declaration, type, nullable, declared SERIAL)
-        ("c SMALLSERIAL", TypeCode::I16, false, true),
-        ("c SERIAL2", TypeCode::I16, false, true),
-        ("c SERIAL", TypeCode::I32, false, true),
-        ("c SERIAL4", TypeCode::I32, false, true),
-        ("c BIGSERIAL", TypeCode::I64, false, true),
-        ("c SERIAL8", TypeCode::I64, false, true),
-        ("c serial", TypeCode::I32, false, true),
-        ("c BigSerial", TypeCode::I64, false, true),
-        ("c BIGINT NOT NULL", TypeCode::I64, false, false),
-        ("c TEXT", TypeCode::String, true, false),
-    ];
-    for &(decl, tc, nullable, serial) in ok {
-        let (def, is_serial) = declared(decl).unwrap_or_else(|e| panic!("{decl}: {e}"));
-        assert_eq!(
-            (def.name.as_str(), def.ty, def.is_nullable, is_serial),
-            ("c", ColType::of(tc), nullable, serial),
-            "{decl}"
-        );
-    }
     for (decl, needle) in [
+        ("BOOLEAN", "TINYINT(1)"),
+        ("BOOL", "TINYINT(1)"),
+        ("TIMESTAMP WITH TIME ZONE", "time zone"),
+        ("TIMESTAMPTZ", "time zone"),
+        ("DECIMAL", "precision and scale"),
+        ("DECIMAL(19, 2)", "the precision must be 1..=18"),
+        // The 128-bit integer is spelled UINT128, not as a DECIMAL.
+        ("DECIMAL(38, 0)", "the precision must be 1..=18"),
+        ("DECIMAL(0, 0)", "the precision must be 1..=18"),
+        ("DECIMAL(5, 6)", "the scale must be 0..=5"),
+        // Echoed as written, not as a parser dump.
+        ("INTERVAL", "unsupported SQL type: INTERVAL"),
+        ("HYPERLOGLOG", "unsupported SQL type: HYPERLOGLOG"),
         // A modifier makes it no SERIAL spelling, so it falls to the type map.
-        ("c SERIAL(5)", "unsupported SQL type: SERIAL(5)"),
-        ("c HYPERLOGLOG", "unsupported SQL type: HYPERLOGLOG"),
+        ("SERIAL(5)", "unsupported SQL type: SERIAL(5)"),
     ] {
-        let msg = declared(decl).expect_err(decl).to_string();
-        assert!(msg.contains(needle), "{decl}: {msg:?} does not name {needle:?}");
+        let m = rejected(declared(decl));
+        assert!(m.contains(needle), "{decl}: {m:?} does not name {needle:?}");
     }
 }

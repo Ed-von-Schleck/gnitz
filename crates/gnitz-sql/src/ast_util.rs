@@ -557,134 +557,93 @@ pub(crate) fn group_by_target<'a>(
     Ok(peel_nested(target))
 }
 
-/// The direct operand subexpressions of `e`. Subquery nodes contribute none: no
-/// walker may silently descend into a subquery. Must cover every node
-/// `bind_structural` recurses through — only `tests/ast_util.rs` enforces that,
-/// and a node it misses is invisible to every walker, silently.
-pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Expr> {
-    use sqlparser::ast::{CaseWhen, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
-    match e {
-        Expr::BinaryOp { left, right, .. } => vec![left, right],
-        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
-            vec![expr]
-        }
-        Expr::Between { expr, low, high, .. } => vec![expr, low, high],
-        Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => vec![a, b],
-        Expr::Position { expr, r#in } => vec![expr, r#in],
-        // Keyword-dispatched: sqlparser gives these their own node rather than an
-        // `Expr::Function`, so their operand is named here explicitly.
-        Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } | Expr::Cast { expr, .. } | Expr::Extract { expr, .. } => {
-            vec![expr]
-        }
-        // SUBSTRING and TRIM are keyword-dispatched too. TRIM's `trim_what` is a
-        // literal by the time the binder accepts it, but it is a bound operand
-        // position and belongs in the walk regardless.
-        Expr::Substring { expr, substring_from, substring_for, .. } => std::iter::once(expr.as_ref())
-            .chain(substring_from.as_deref())
-            .chain(substring_for.as_deref())
-            .collect(),
-        Expr::Trim { expr, trim_what, .. } => std::iter::once(expr.as_ref()).chain(trim_what.as_deref()).collect(),
-        // Same for LIKE's pattern. Its `escape_char` is a `Value`, not an `Expr`,
-        // so it contributes nothing.
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => vec![expr, pattern],
-        Expr::InList { expr, list, .. } => std::iter::once(expr.as_ref()).chain(list).collect(),
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            case_token: _,
-            end_token: _,
-        } => {
-            let mut ops: Vec<&Expr> = Vec::new();
-            ops.extend(operand.as_deref());
-            for CaseWhen { condition, result } in conditions {
-                ops.push(condition);
-                ops.push(result);
+/// The one body of [`expr_operands`] and [`expr_operands_mut`], instantiated for
+/// `&` and for `&mut`, so a rewriter substitutes at exactly the positions a
+/// reader sees.
+macro_rules! operands {
+    ($e:expr, $unbox:ident, $deref:ident, $iter:ident $(, $m:tt)?) => {{
+        use sqlparser::ast::{CaseWhen, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, WindowType};
+        match $e {
+            Expr::BinaryOp { left, right, .. } => vec![left.$unbox(), right.$unbox()],
+            Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
+                vec![expr.$unbox()]
             }
-            ops.extend(else_result.as_deref());
-            ops
-        }
-        // An inline window specification's keys are operands too, so the walkers
-        // see the aggregate in `ORDER BY SUM(x)` and a subquery written there.
-        Expr::Function(f) => {
-            let mut ops: Vec<&Expr> = match &f.args {
-                FunctionArguments::List(list) => list
-                    .args
-                    .iter()
-                    .filter_map(|a| match a {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => Some(inner),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
-            if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &f.over {
-                ops.extend(window_spec_keys(spec));
+            Expr::Between { expr, low, high, .. } => vec![expr.$unbox(), low.$unbox(), high.$unbox()],
+            Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => vec![a.$unbox(), b.$unbox()],
+            Expr::Position { expr, r#in } => vec![expr.$unbox(), r#in.$unbox()],
+            // Keyword-dispatched: sqlparser gives these their own node rather than an
+            // `Expr::Function`, so their operand is named here explicitly.
+            Expr::Ceil { expr, .. }
+            | Expr::Floor { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::Extract { expr, .. } => vec![expr.$unbox()],
+            // SUBSTRING and TRIM are keyword-dispatched too. TRIM's `trim_what` is a
+            // literal by the time the binder accepts it, but it is a bound operand
+            // position and belongs in the walk regardless.
+            Expr::Substring { expr, substring_from, substring_for, .. } => std::iter::once(expr.$unbox())
+                .chain(substring_from.$deref())
+                .chain(substring_for.$deref())
+                .collect(),
+            Expr::Trim { expr, trim_what, .. } => std::iter::once(expr.$unbox()).chain(trim_what.$deref()).collect(),
+            // Same for LIKE's pattern. Its `escape_char` is a `Value`, not an `Expr`,
+            // so it contributes nothing.
+            Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+                vec![expr.$unbox(), pattern.$unbox()]
             }
-            ops
+            Expr::InList { expr, list, .. } => std::iter::once(expr.$unbox()).chain(list).collect(),
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                case_token: _,
+                end_token: _,
+            } => {
+                let mut ops = Vec::new();
+                ops.extend(operand.$deref());
+                for CaseWhen { condition, result } in conditions {
+                    ops.push(condition);
+                    ops.push(result);
+                }
+                ops.extend(else_result.$deref());
+                ops
+            }
+            // An inline window specification's keys ([`window_spec_keys`]) are
+            // operands too, so the walkers see the aggregate in `ORDER BY SUM(x)`
+            // and a subquery written there.
+            Expr::Function(f) => {
+                let mut ops: Vec<_> = match &$($m)? f.args {
+                    FunctionArguments::List(list) => list
+                        .args
+                        .$iter()
+                        .filter_map(|a| match a {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => Some(inner),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                if let Some(WindowType::WindowSpec(spec)) = &$($m)? f.over {
+                    ops.extend(spec.partition_by.$iter());
+                    ops.extend(spec.order_by.$iter().map(|o| &$($m)? o.expr));
+                }
+                ops
+            }
+            _ => Vec::new(),
         }
-        _ => Vec::new(),
-    }
+    }};
 }
 
-/// [`expr_operands`] over `&mut`, for a rewriter: the same node set, so a
-/// substitution reaches exactly the positions the binder reads.
+/// The direct operand subexpressions of `e`. Subquery nodes contribute none: no
+/// walker may silently descend into a subquery. Must cover every node
+/// `bind_structural` recurses through — only this module's tests enforce that,
+/// and a node it misses is invisible to every walker, silently.
+pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Expr> {
+    operands!(e, as_ref, as_deref, iter)
+}
+
+/// [`expr_operands`] over `&mut`, for a rewriter.
 pub(crate) fn expr_operands_mut(e: &mut sqlparser::ast::Expr) -> Vec<&mut sqlparser::ast::Expr> {
-    use sqlparser::ast::{CaseWhen, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
-    match e {
-        Expr::BinaryOp { left, right, .. } => vec![left, right],
-        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
-            vec![expr]
-        }
-        Expr::Between { expr, low, high, .. } => vec![expr, low, high],
-        Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => vec![a, b],
-        Expr::Position { expr, r#in } => vec![expr, r#in],
-        Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } | Expr::Cast { expr, .. } | Expr::Extract { expr, .. } => {
-            vec![expr]
-        }
-        Expr::Substring { expr, substring_from, substring_for, .. } => std::iter::once(expr.as_mut())
-            .chain(substring_from.as_deref_mut())
-            .chain(substring_for.as_deref_mut())
-            .collect(),
-        Expr::Trim { expr, trim_what, .. } => std::iter::once(expr.as_mut()).chain(trim_what.as_deref_mut()).collect(),
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => vec![expr, pattern],
-        Expr::InList { expr, list, .. } => std::iter::once(expr.as_mut()).chain(list).collect(),
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            case_token: _,
-            end_token: _,
-        } => {
-            let mut ops: Vec<&mut Expr> = Vec::new();
-            ops.extend(operand.as_deref_mut());
-            for CaseWhen { condition, result } in conditions {
-                ops.push(condition);
-                ops.push(result);
-            }
-            ops.extend(else_result.as_deref_mut());
-            ops
-        }
-        Expr::Function(f) => {
-            let mut ops: Vec<&mut Expr> = match &mut f.args {
-                FunctionArguments::List(list) => list
-                    .args
-                    .iter_mut()
-                    .filter_map(|a| match a {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => Some(inner),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
-            if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &mut f.over {
-                ops.extend(spec.partition_by.iter_mut());
-                ops.extend(spec.order_by.iter_mut().map(|o| &mut o.expr));
-            }
-            ops
-        }
-        _ => Vec::new(),
-    }
+    operands!(e, as_mut, as_deref_mut, iter_mut, mut)
 }
 
 /// The scalar expression of a projection item, or `None` for a wildcard.
@@ -857,7 +816,7 @@ pub(crate) fn extract_table_name_and_alias(
 }
 
 /// A strictly simple identifier expression's name, or the shared
-/// "column must be a simple identifier" Unsupported error. Backs [`index_column_ident`]
+/// "column must be a simple identifier" rejection. Backs [`index_column_ident`]
 /// and the CLUSTER BY column list (a `Vec<Expr>` in sqlparser).
 pub(crate) fn simple_ident_expr<'a>(e: &'a sqlparser::ast::Expr, context: &str) -> Result<&'a str, GnitzSqlError> {
     match e {

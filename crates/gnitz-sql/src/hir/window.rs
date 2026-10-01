@@ -264,7 +264,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
     }
 
     fn never_null(&self, e: &HirExpr) -> bool {
-        e.never_null_with(&|r| self.inner.is_nullable(r))
+        e.never_null_with(&|r| self.inner.is_nullable(r), &|r| self.inner.type_of(r))
     }
 
     /// The window specification a call names: written inline, or defined in
@@ -496,6 +496,9 @@ impl<L: ItemLeaf> LeafBinder<ColId> for WindowLeaf<'_, L> {
         self.placeholder(r)
             .map_or_else(|| self.inner.is_nullable(r), |(_, nullable)| nullable)
     }
+    fn type_of(&self, r: &ColId) -> ColType {
+        self.placeholder(r).map_or_else(|| self.inner.type_of(r), |(ty, _)| ty)
+    }
     fn bind_subquery(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
         self.inner.bind_subquery(e)
     }
@@ -504,9 +507,6 @@ impl<L: ItemLeaf> LeafBinder<ColId> for WindowLeaf<'_, L> {
 impl<L: ItemLeaf> ItemLeaf for WindowLeaf<'_, L> {
     fn env(&self) -> &[HirCol] {
         self.inner.env()
-    }
-    fn type_of(&self, r: &ColId) -> ColType {
-        self.placeholder(r).map_or_else(|| self.inner.type_of(r), |(ty, _)| ty)
     }
     fn project(&self, source: Rc<RelExpr>, items: Vec<ProjEntry>) -> Result<Rc<RelExpr>, GnitzSqlError> {
         self.inner.project(source, items)
@@ -622,7 +622,7 @@ impl<'a, L: ItemLeaf> Hoist<'a, L> {
             return it.out.id;
         }
         let ty = e.infer_ty_with(&|r| self.leaf.type_of(r));
-        let nullable = !e.never_null_with(&|r| self.leaf.is_nullable(r));
+        let nullable = !e.never_null_with(&|r| self.leaf.is_nullable(r), &|r| self.leaf.type_of(r));
         let out = HirCol::new(
             self.ids.next(),
             ColumnDef::typed(format!("_w{}", self.items.len()), ty, nullable),
