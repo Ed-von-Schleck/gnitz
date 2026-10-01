@@ -1,38 +1,23 @@
 #![cfg(feature = "integration")]
 
-//! The tokio client against a real server: the guards that only a live
-//! connection can show — an idle driver that spins, and a burst that leaves one
-//! frame at a time.
+//! The tokio client against a real server: what needs real replies — verbs
+//! pipelined over both transports, the syscalls a burst costs, and the blocking
+//! client every clone shares.
 
-use std::future::Future;
-use std::pin::Pin;
+mod support;
+
+use std::ops::Range;
 use std::sync::Arc;
-use std::task::Poll;
-use std::time::Duration;
 
-use gnitz_core::{GnitzClient, PkColumn, Schema, ZSetBatch};
+use gnitz_core::{BatchAppender, GnitzClient, PkColumn, PollResult, Schema, ZSetBatch};
 use gnitz_mirror::Mirror;
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
-use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, WireConflictMode};
+use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, ViewProps, WireConflictMode};
+use support::submitted;
 use tokio::runtime::Runtime;
 
-/// A `(pk BIGINT, a BIGINT)` table, the blocking client that made it, and the
-/// schema name it lives under.
-fn table(target: &str) -> (GnitzClient, u64, Arc<Schema>, String) {
-    let mut client = GnitzClient::connect(target).expect("connect");
-    let sn = unique_schema("tokio");
-    client.create_schema(&sn).unwrap();
-    client
-        .create_table(&sn, "t", &local_schema(), &[], TableProps::default(), &[])
-        .unwrap();
-    let rel = client.resolve_relation(&sn, "t").unwrap();
-    let (tid, schema) = (rel.tid, rel.schema.clone());
-    (client, tid, schema, sn)
-}
-
-/// The fixture table's schema, built locally — `table()` creates it, and the
-/// batch builders below need it to encode a key.
-fn local_schema() -> Schema {
+/// `(pk BIGINT, a BIGINT)`.
+fn schema() -> Schema {
     Schema {
         columns: vec![
             ColumnDef::new("pk", TypeCode::I64, false),
@@ -42,140 +27,109 @@ fn local_schema() -> Schema {
     }
 }
 
-fn rows(start: i64, count: usize) -> ZSetBatch {
-    let mut a = Vec::with_capacity(count * 8);
-    for i in 0..count as i64 {
-        a.extend_from_slice(&((start + i) * 3).to_le_bytes());
-    }
-    let schema = local_schema();
-    let mut b = ZSetBatch::new(&schema);
-    b.pks = PkColumn::from_natives(&schema, (0..count as i64).map(|i| (start + i) as u128));
-    b.weights = vec![1; count];
-    b.nulls = vec![0; count];
-    b.payload[0].bytes = a;
-    b
-}
-
-/// Drive every future in **one** task: the first poll takes each through its
-/// submit, so all N reach the channel before the driver is polled at all. That
-/// is what makes "one burst, one writev" the driver's property rather than the
-/// scheduler's.
-async fn all<F: Future>(futs: Vec<F>) -> Vec<F::Output> {
-    let mut pinned: Vec<Pin<Box<F>>> = futs.into_iter().map(Box::pin).collect();
-    let mut out: Vec<Option<F::Output>> = pinned.iter().map(|_| None).collect();
-    std::future::poll_fn(move |cx| {
-        for (slot, f) in out.iter_mut().zip(pinned.iter_mut()) {
-            if slot.is_none() {
-                if let Poll::Ready(v) = f.as_mut().poll(cx) {
-                    *slot = Some(v);
-                }
-            }
-        }
-        if out.iter().all(Option::is_some) {
-            Poll::Ready(out.iter_mut().map(|s| s.take().expect("just checked")).collect())
-        } else {
-            Poll::Pending
-        }
-    })
-    .await
-}
-
-/// Process CPU time so far — user plus system, every thread of this process.
-fn cpu_time() -> Duration {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: one valid timespec, a clock id the kernel always knows.
-    unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
-    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
-}
-
-/// The busy-loop guard: an idle connection must consume no CPU. A driver that
-/// returns `Ready` where it should park spins here.
-#[test]
-fn an_idle_connection_consumes_no_cpu() {
-    let srv = ServerHandle::start_with_env(1, &[]);
-    let (_blocking, tid, schema, _sn) = table(srv.sock_path());
-    let rt = Runtime::new().unwrap();
-    let (client, conn) = rt.block_on(gnitz_tokio::connect(srv.sock_path())).expect("connect");
-    let driver = rt.spawn(conn);
-
-    rt.block_on(client.push(tid, Arc::clone(&schema), rows(0, 4))).unwrap();
-    let before = cpu_time();
-    std::thread::sleep(Duration::from_secs(1));
-    let spent = cpu_time() - before;
-    // A spin burns a whole core, so 250ms of the second still catches one four
-    // times over. Loose because this counts every thread, and tokio's idle
-    // workers spin before parking — more so when the rest of the suite is busy.
-    assert!(
-        spent < Duration::from_millis(250),
-        "an idle connection spent {spent:?} of CPU over a quiet second",
-    );
-
-    drop(client);
-    rt.block_on(driver).unwrap();
-}
-
-/// N operations on cloned handles across tasks, each to its own result; the
-/// driver serves one connection for all of them.
-#[test]
-fn cloned_handles_across_tasks_each_get_their_own_result() {
-    let srv = ServerHandle::start_with_env(4, &[]);
-    let (mut blocking, tid, schema, sn) = table(srv.sock_path());
-    let rt = Runtime::new().unwrap();
-    let (client, conn) = rt.block_on(gnitz_tokio::connect(srv.sock_path())).expect("connect");
-    let driver = rt.spawn(conn);
-
-    let n = 32usize;
-    let pushes: Vec<_> = (0..n)
-        .map(|i| {
-            let (c, s) = (client.clone(), Arc::clone(&schema));
-            rt.spawn(async move { c.push(tid, s, rows((i * 10) as i64, 10)).await })
-        })
-        .collect();
-    for p in pushes {
-        assert!(rt.block_on(p).unwrap().unwrap() > 0, "each push gets its own LSN");
-    }
-
-    // Every read verb, and a keyed read whose row is its own.
-    let all = || ReadSpec::all_rows(ReadBound::None);
-    assert_eq!(
-        rt.block_on(client.scan_spec(tid, all(), Arc::clone(&schema)))
-            .unwrap()
-            .batch
-            .len(),
-        n * 10
-    );
-    let key = PkColumn::from_natives(&schema, [7]);
-    let one = ReadSpec::all_rows(ReadBound::PkSet(key.keys()));
-    assert_eq!(
-        rt.block_on(client.scan_spec(tid, one, Arc::clone(&schema)))
-            .unwrap()
-            .batch
-            .len(),
-        1
-    );
-    // A repeated tid is two positions, each answered in full.
-    let many = rt
-        .block_on(client.scan_many(vec![(tid, Arc::clone(&schema)), (tid, Arc::clone(&schema))]))
+/// A [`schema`] table `t`: the blocking client that made it, its id, its
+/// schema, and the schema name it lives under.
+fn table(target: &str) -> (GnitzClient, u64, Arc<Schema>, String) {
+    let mut client = GnitzClient::connect(target).expect("connect");
+    let sn = unique_schema("tokio");
+    client.create_schema(&sn).unwrap();
+    let schema = schema();
+    let tid = client
+        .create_table(&sn, "t", &schema, &[], TableProps::default(), &[])
         .unwrap();
-    assert_eq!(many.len(), 2);
-    assert!(many.iter().all(|r| r.batch.len() == n * 10));
-    let many = rt.block_on(client.scan_many(vec![(tid, Arc::clone(&schema))])).unwrap();
-    assert_eq!(many.len(), 1);
-    assert_eq!(many[0].batch.len(), n * 10);
+    (client, tid, Arc::new(schema), sn)
+}
 
-    // `resolve` must agree with the blocking client's.
-    let theirs = blocking.resolve(&sn, "t").unwrap().expect("the table exists");
-    let ours = rt
-        .block_on(client.resolve(&sn, "t"))
-        .unwrap()
-        .expect("the table exists");
-    assert_eq!(ours.tid, theirs.tid);
-    assert_eq!(ours.class, theirs.class);
-    assert_eq!(ours.schema.columns.len(), theirs.schema.columns.len());
-    assert!(rt.block_on(client.resolve(&sn, "nope")).unwrap().is_none());
+/// `pks` at weight 1.
+fn rows(schema: &Schema, pks: Range<i64>) -> ZSetBatch {
+    let mut batch = ZSetBatch::new(schema);
+    let mut app = BatchAppender::new(&mut batch, schema);
+    for pk in pks {
+        app.add_row(pk as u128, 1).i64_val(pk * 3);
+    }
+    batch
+}
 
-    drop(client);
-    rt.block_on(driver).unwrap();
+/// How many rows a read returned, every one of them at weight 1. Every relation
+/// here is keyed uniquely, so a row counted twice is one row at weight 2.
+fn unit_rows(batch: &ZSetBatch) -> usize {
+    assert!(batch.weights.iter().all(|w| *w == 1), "{:?}", batch.weights);
+    batch.len()
+}
+
+fn all_rows() -> ReadSpec {
+    ReadSpec::all_rows(ReadBound::None)
+}
+
+// ── Pipelining ────────────────────────────────────────────────────────────
+
+/// Many verbs in flight on one connection: each resolves to its own reply, and
+/// the server takes them in the order they were submitted.
+fn pipelined_verbs(target: &str) {
+    let (_blocking, tid, schema, sn) = table(target);
+    Runtime::new().unwrap().block_on(async {
+        let (client, conn) = gnitz_tokio::connect(target).await.expect("connect");
+        let driver = tokio::spawn(conn);
+
+        // Megabytes each way, so neither direction fits a socket buffer: writes
+        // resume after the socket refused them and replies span many reads.
+        let (n, per) = (40, 5_000);
+        let mut rounds = Vec::new();
+        for i in 0..n {
+            rounds.push((
+                submitted(client.push(tid, Arc::clone(&schema), rows(&schema, i * per..(i + 1) * per))).await,
+                submitted(client.scan_spec(tid, all_rows(), Arc::clone(&schema))).await,
+            ));
+        }
+        for (i, (push, scan)) in rounds.into_iter().enumerate() {
+            assert!(push.await.unwrap() > 0, "a push resolves to its ingest LSN");
+            assert_eq!(
+                unit_rows(&scan.await.unwrap().batch),
+                (i + 1) * per as usize,
+                "a scan sees exactly the pushes submitted ahead of it"
+            );
+        }
+
+        // A verb dropped after its submit is not cancelled: the server commits it.
+        let last = n * per;
+        drop(submitted(client.push(tid, Arc::clone(&schema), rows(&schema, last..last + 1))).await);
+        let total = last as usize + 1;
+
+        // Every kind of verb in flight together.
+        let key = PkColumn::from_natives(&schema, [7]);
+        let (one, many, found, missing) = tokio::join!(
+            client.scan_spec(
+                tid,
+                ReadSpec::all_rows(ReadBound::PkSet(key.keys())),
+                Arc::clone(&schema)
+            ),
+            client.scan_many(vec![(tid, Arc::clone(&schema)), (tid, Arc::clone(&schema))]),
+            client.resolve(&sn, "t"),
+            client.resolve(&sn, "nope"),
+        );
+        let one = one.unwrap().batch;
+        assert_eq!((unit_rows(&one), one.pks.get(&schema, 0)), (1, 7));
+        let many: Vec<usize> = many.unwrap().iter().map(|r| unit_rows(&r.batch)).collect();
+        assert_eq!(many, [total, total]);
+        let found = found.unwrap().expect("the table exists");
+        assert_eq!((found.tid, &found.schema), (tid, &schema));
+        assert!(missing.unwrap().is_none());
+
+        drop(client);
+        driver.await.unwrap();
+    });
+}
+
+#[test]
+fn pipelined_verbs_unix() {
+    let srv = ServerHandle::start_n(4);
+    pipelined_verbs(srv.sock_path());
+}
+
+#[test]
+fn pipelined_verbs_tls() {
+    let srv = ServerHandle::start_tls(4);
+    pipelined_verbs(&srv.tls_target());
 }
 
 // ── Syscalls per burst ────────────────────────────────────────────────────
@@ -193,24 +147,27 @@ fn syscall_count_child() {
         return;
     };
     let tid: u64 = tid.parse().unwrap();
-    let n: usize = n.parse().unwrap();
-    let schema = Arc::new(local_schema());
+    let n: i64 = n.parse().unwrap();
+    let schema = Arc::new(schema());
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     rt.block_on(async move {
         let (client, conn) = gnitz_tokio::connect(&target).await.unwrap();
-        let work = async move {
-            let futs: Vec<_> = (0..n)
-                .map(|i| client.push(tid, Arc::clone(&schema), rows(i as i64, 1)))
-                .collect();
-            for r in all(futs).await {
-                r.unwrap();
+        // One task beside the driver, so all N are submitted before the driver
+        // is polled again.
+        let burst = async move {
+            let mut pushes = Vec::new();
+            for pk in 0..n {
+                pushes.push(submitted(client.push(tid, Arc::clone(&schema), rows(&schema, pk..pk + 1))).await);
+            }
+            for push in pushes {
+                push.await.unwrap();
             }
             // The last handle goes, which is what lets the driver finish.
         };
-        tokio::join!(conn, work);
+        tokio::join!(conn, burst);
     });
 }
 
@@ -218,12 +175,11 @@ fn syscall_count_child() {
 /// driver drains the whole channel before it steps.
 #[test]
 fn one_writev_per_burst() {
-    let srv = ServerHandle::start_with_env(1, &[]);
-    let (_c, tid, _s, _sn) = table(srv.sock_path());
-    // Every push carries its schema record, which sizes the frames so the burst
-    // stays within one writev quantum; a larger `n`, or a control-only burst, can
-    // legitimately move the count.
-    let n = 200usize;
+    let srv = ServerHandle::start();
+    let (mut blocking, tid, schema, _sn) = table(srv.sock_path());
+    // Within tokio's per-poll budget: past it a submit suspends, and the burst
+    // legitimately leaves in more than one piece.
+    let n = 100;
     let Some(counts) = strace_test(
         "syscall_count_child",
         &[
@@ -235,206 +191,86 @@ fn one_writev_per_burst() {
         eprintln!("strace not installed; skipping the syscall count");
         return;
     };
-    // `writev` only: the transport writes the socket through `write_vectored`,
-    // where plain `write` is the harness's own stdout. One for the HELLO, one
-    // for the burst; the slack is for a partial write.
-    let writes = counts.sum(&["writev", "sendto", "sendmsg"]);
-    assert!(
-        writes <= 4,
-        "expected the {n}-push burst to leave in one writev, strace counted {writes}:\n{}",
+    let pushed = blocking.scan_spec(tid, &all_rows(), &schema).unwrap().batch;
+    assert_eq!(unit_rows(&pushed), n, "the traced child pushed its burst");
+    // The transport writes the socket through `write_vectored`; plain `write`
+    // is the harness's own stdout. One for the HELLO, one for the burst.
+    assert_eq!(
+        counts.sum(&["writev", "sendto", "sendmsg"]),
+        2,
+        "the {n}-push burst did not leave in one writev:\n{}",
         counts.report
     );
 }
 
-// ── Mirroring ─────────────────────────────────────────────────────────────
+// ── The shared blocking client ────────────────────────────────────────────
 
-/// A fed pass-through view over `tid`, built by hand: this crate links no
-/// planner, so the circuit is a `ScanDelta` into the sink the compiler takes as
-/// the plan's output register.
-fn fed_view(client: &mut GnitzClient, sn: &str, tid: u64) -> u64 {
-    let mut circuit = gnitz_wire::Circuit::default();
-    let src = circuit.input_delta(tid, gnitz_wire::ReadBound::None);
-    circuit.sink(src);
-    client
-        .create_view_chain(
-            sn,
-            "v",
-            gnitz_core::PlannedView {
-                circuit,
-                schema: Arc::new(local_schema()),
-                pk_repeats: false,
-            }
-            .into(),
-            gnitz_wire::ViewProps::Fed { delta_bytes: 8 << 20 },
-            None,
-        )
-        .expect("create the fed view")
-}
-
-/// `pk → summed weight`, so a comparison is weight-exact: a poll applied twice
-/// leaves the row set identical and doubles every weight in the interval.
-fn weights(b: &ZSetBatch) -> std::collections::BTreeMap<u64, i64> {
-    let mut out = std::collections::BTreeMap::new();
-    for row in 0..b.weights.len() {
-        let pk = b.pks.get(&local_schema(), row) as u64;
-        *out.entry(pk).or_insert(0) += b.weights[row];
-    }
-    out.retain(|_, w| *w != 0);
-    out
-}
-
-/// The async handle's whole mirroring surface: what it refuses, what it answers
-/// off the copy, and what two clones doing the same thing at once leave behind.
+/// Every clone drives one blocking client, one call at a time, and a
+/// local-first read routes on what that client mirrors.
 #[test]
-fn an_async_handle_mirrors_through_a_blocking_client() {
-    let srv = ServerHandle::start_with_env(4, &[]);
+fn clones_share_one_blocking_client() {
+    let srv = ServerHandle::start_n(4);
     let (mut blocking, tid, schema, sn) = table(srv.sock_path());
-    let vid = fed_view(&mut blocking, &sn, tid);
-    blocking
-        .push(tid, &schema, &rows(0, 50), WireConflictMode::Update)
+    let vid = blocking
+        .create_view(&sn, "v", tid, ViewProps::Fed { delta_bytes: 8 << 20 })
         .unwrap();
-    // A read against the server drains the pending ticks, so the rounds a
-    // bootstrap reads already exist.
-    let all = || ReadSpec::all_rows(ReadBound::None);
-    let _ = blocking.scan_spec(vid, &all(), &schema).unwrap();
+    // A push, then a read against the server: the read drains the pending
+    // ticks, so the rounds a mirror reads already exist.
+    let mut push_and_tick = |pks| {
+        blocking
+            .push(tid, &schema, &rows(&schema, pks), WireConflictMode::Update)
+            .unwrap();
+        blocking.scan_spec(vid, &all_rows(), &schema).unwrap();
+    };
+    push_and_tick(0..50);
 
-    let rt = Runtime::new().unwrap();
-    let (client, conn) = rt.block_on(gnitz_tokio::connect(srv.sock_path())).expect("connect");
-    let driver = rt.spawn(conn);
+    Runtime::new().unwrap().block_on(async {
+        let (client, conn) = gnitz_tokio::connect(srv.sock_path()).await.expect("connect");
+        let driver = tokio::spawn(conn);
+        {
+            let read = |tid| client.scan_spec_local_first(tid, all_rows(), Arc::clone(&schema));
 
-    // A handle that never attached answers exactly what `scan_spec` answers, served
-    // LSN included — the observable half of the unattached fast path. That it
-    // took no `spawn_blocking` is not assertable and is not asserted.
-    let bare = rt
-        .block_on(client.scan_spec_local_first(vid, all(), Arc::clone(&schema)))
-        .unwrap();
-    let plain = rt.block_on(client.scan_spec(vid, all(), Arc::clone(&schema))).unwrap();
-    assert_eq!(weights(&bare.batch), weights(&plain.batch));
-    assert!(bare.lsn.is_some(), "an unmirrored read carries the server's LSN");
-    assert_eq!(bare.lsn, plain.lsn);
-    assert!(
-        !weights(&bare.batch).is_empty(),
-        "the view must hold rows, or this proves nothing"
-    );
+            // No blocking client yet, so nothing is mirrored: the server answers.
+            let served = read(vid).await.unwrap();
+            assert!(served.lsn.is_some(), "a served read carries the server's LSN");
+            assert_eq!(unit_rows(&served.batch), 50);
 
-    // Two clones attaching at once install once and refuse once. Two stores on
-    // two directories, because two on *one* never get this far: the engine's
-    // lock refuses the second open.
-    let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let (p1, p2) = (
-        d1.path().to_str().unwrap().to_string(),
-        d2.path().to_str().unwrap().to_string(),
-    );
-    let (a, b) = (client.clone(), client.clone());
-    let (s1, s2) = (Mirror::open(&p1).unwrap(), Mirror::open(&p2).unwrap());
-    let (ra, rb) = rt.block_on(async {
-        tokio::join!(
-            a.with_blocking_client(move |c| c.attach_mirror(s1)),
-            b.with_blocking_client(move |c| c.attach_mirror(s2)),
-        )
+            // One clone mirrors the view; every other reads off that copy.
+            let dir = tempfile::tempdir().unwrap();
+            let store = Mirror::open(dir.path().to_str().unwrap()).unwrap();
+            let name = sn.clone();
+            let mirrored = client
+                .clone()
+                .with_blocking_client(move |c| {
+                    c.attach_mirror(store)?;
+                    c.mirror_view(&name, "v")
+                })
+                .await
+                .expect("mirror the view");
+            assert_eq!(mirrored.view_id, vid);
+
+            // Two clones polling at once. One whole advance runs under one lock,
+            // so they serialize instead of both fetching the same interval and
+            // both applying it, which would leave every new row at weight 2.
+            push_and_tick(50..100);
+            let (a, b) = (client.clone(), client.clone());
+            let (polled_a, polled_b) = tokio::join!(
+                a.with_blocking_client(GnitzClient::poll_mirror),
+                b.with_blocking_client(GnitzClient::poll_mirror),
+            );
+            for outcome in polled_a.unwrap().into_iter().chain(polled_b.unwrap()) {
+                assert!(matches!(outcome.result, PollResult::Advanced), "{outcome:?}");
+            }
+            let local = read(vid).await.unwrap();
+            assert!(local.lsn.is_none(), "a local answer carries no served LSN");
+            assert_eq!(unit_rows(&local.batch), 100);
+
+            // A relation the copy does not hold still reads, over the wire.
+            let unheld = read(tid).await.unwrap();
+            assert!(unheld.lsn.is_some(), "a delegated read carries the server's LSN");
+            assert_eq!(unit_rows(&unheld.batch), 100);
+        }
+        drop(client);
+        driver.await.unwrap();
     });
-    drop((a, b));
-    assert_eq!(
-        [ra.is_ok(), rb.is_ok()].iter().filter(|ok| **ok).count(),
-        1,
-        "exactly one of two concurrent attaches installs",
-    );
-    // The refused one dropped the store it was passed, so its directory is free.
-    let loser = if ra.is_ok() { &p2 } else { &p1 };
-    Mirror::open(loser).expect("a refused attach releases the store it was passed");
-    rt.block_on(client.with_blocking_client(GnitzClient::close_mirror))
-        .expect("close");
-
-    // The real one: attach, mirror, poll, read off the copy.
-    let store = Mirror::open(&p1).unwrap();
-    rt.block_on(client.with_blocking_client(move |c| c.attach_mirror(store)))
-        .expect("attach");
-    let view_schema = sn.clone();
-    let outcome = rt
-        .block_on(client.with_blocking_client(move |c| c.mirror_view(&view_schema, "v")))
-        .expect("mirror the view");
-    assert_eq!(outcome.view_id, vid);
-    assert!(rt
-        .block_on(client.with_blocking_client(move |c| Ok(c.mirrors(vid))))
-        .unwrap());
-    assert_eq!(
-        rt.block_on(client.with_blocking_client(|c| Ok(c.mirrored_ids())))
-            .unwrap(),
-        vec![vid]
-    );
-    assert!(rt
-        .block_on(client.with_blocking_client(move |c| Ok(c.cursor_of(vid))))
-        .unwrap()
-        .is_some());
-    assert!(rt
-        .block_on(client.with_blocking_client(|c| Ok(c.mirror_poisoned().map(str::to_string))))
-        .unwrap()
-        .is_none());
-
-    // Two clones polling one view concurrently. One whole advance runs under one
-    // lock, so they serialize instead of both fetching `(c, …]` and both
-    // applying it.
-    blocking
-        .push(tid, &schema, &rows(50, 50), WireConflictMode::Update)
-        .unwrap();
-    let expected = weights(&blocking.scan_spec(vid, &all(), &schema).unwrap().batch);
-    let (a, b) = (client.clone(), client.clone());
-    let (ra, rb) = rt.block_on(async {
-        tokio::join!(
-            a.with_blocking_client(GnitzClient::poll_mirror),
-            b.with_blocking_client(GnitzClient::poll_mirror),
-        )
-    });
-    ra.expect("the first poll");
-    rb.expect("the second poll");
-    drop((a, b));
-    rt.block_on(client.with_blocking_client(GnitzClient::poll_mirror))
-        .expect("a third, for the tail round");
-
-    let local = rt
-        .block_on(client.scan_spec_local_first(vid, all(), Arc::clone(&schema)))
-        .unwrap();
-    assert!(local.lsn.is_none(), "a local answer carries no served LSN");
-    assert_eq!(
-        weights(&local.batch),
-        expected,
-        "two concurrent polls must leave the weights one poll produces",
-    );
-
-    // A relation the copy does not hold still reads, over the wire.
-    let unheld = rt
-        .block_on(client.scan_spec_local_first(tid, all(), Arc::clone(&schema)))
-        .unwrap();
-    assert!(unheld.lsn.is_some(), "a delegated read carries the server's LSN");
-    assert_eq!(weights(&unheld.batch).len(), 100);
-
-    // A dead or replaced connection is recovered in place, and the copies ride
-    // along: the next poll re-resolves and the view is mirrored again.
-    let target = srv.sock_path().to_string();
-    rt.block_on(client.with_blocking_client(move |c| c.reconnect(&target)))
-        .expect("reconnect");
-    rt.block_on(client.with_blocking_client(GnitzClient::poll_mirror))
-        .expect("a poll after reconnect");
-    assert!(rt
-        .block_on(client.with_blocking_client(move |c| Ok(c.mirrors(vid))))
-        .unwrap());
-
-    rt.block_on(client.with_blocking_client(GnitzClient::checkpoint_mirror))
-        .expect("checkpoint");
-    rt.block_on(client.with_blocking_client(move |c| c.forget_view(vid)))
-        .expect("forget");
-    assert!(!rt
-        .block_on(client.with_blocking_client(move |c| Ok(c.mirrors(vid))))
-        .unwrap());
-
-    rt.block_on(client.with_blocking_client(GnitzClient::close_mirror))
-        .expect("close the store");
-    let store = Mirror::open(&p1).unwrap();
-    rt.block_on(client.with_blocking_client(move |c| c.attach_mirror(store)))
-        .expect("the same directory can be attached again");
-    rt.block_on(client.with_blocking_client(GnitzClient::close_mirror))
-        .expect("close it again");
-
-    drop(client);
-    rt.block_on(driver).unwrap();
 }

@@ -217,8 +217,9 @@ impl AsyncClient {
 /// A lost connection does not end it: every verb, outstanding or later,
 /// resolves [`ClientError::ConnectionLost`].
 ///
-/// Dropping a verb's future is not cancellation: the frame is written and the
-/// server commits it; the driver just drops a result nobody is left to receive.
+/// Dropping a verb's future once it has submitted is not cancellation: the
+/// frame is written and the server commits it; the driver just drops a result
+/// nobody is left to receive.
 pub struct Connection {
     session: Session,
     fd: AsyncFd<OwnedFd>,

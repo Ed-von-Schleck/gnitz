@@ -5,7 +5,7 @@
 use super::*;
 use gnitz_core::sys_schema;
 use gnitz_wire::sys_rows::{write_idx_tab_row, write_schema_tab_row, IdxTabRow, SchemaTabRow};
-use gnitz_wire::{IndexProps, IDX_TAB, SCHEMA_TAB, SEQ_TAB};
+use gnitz_wire::{IndexProps, ViewProps, IDX_TAB, SCHEMA_TAB, SEQ_TAB};
 
 /// A SCHEMA_TAB batch registering `(schema_id, name)`.
 fn schema_row(schema_id: u64, name: &str) -> ZSetBatch {
@@ -70,7 +70,7 @@ fn a_unique_index_the_catalog_refuses_is_not_scanned_for_duplicates() {
     };
 
     // The backfill copies both rows into the view.
-    let vid = client.create_view(&sn, "v", tid).unwrap();
+    let vid = client.create_view(&sn, "v", tid, ViewProps::default()).unwrap();
     let err = unique_on_v(&mut client, vid);
     assert!(err.contains("only a base table can be indexed"), "{err}");
 

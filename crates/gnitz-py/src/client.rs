@@ -17,7 +17,7 @@ use gnitz_core::{ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult,
 use gnitz_mirror::Mirror;
 use gnitz_sql::SqlResult;
 use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec};
-use gnitz_wire::{TableProps, WireConflictMode};
+use gnitz_wire::{TableProps, ViewProps, WireConflictMode};
 
 use crate::read::{scan_result, PyDeltaReply, PyScanResult};
 use crate::schema::{resolve_py_schema, scan_pairs, PySchema};
@@ -225,7 +225,9 @@ impl PyGnitzClient {
         view_name: &str,
         source_table_id: u64,
     ) -> PyResult<u64> {
-        self.call(py, |c| c.create_view(schema_name, view_name, source_table_id))
+        self.call(py, |c| {
+            c.create_view(schema_name, view_name, source_table_id, ViewProps::default())
+        })
     }
 
     pub fn drop_view(&mut self, py: Python<'_>, schema_name: &str, view_name: &str) -> PyResult<()> {

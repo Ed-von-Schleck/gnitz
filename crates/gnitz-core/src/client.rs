@@ -954,11 +954,13 @@ impl GnitzClient {
         self.drop_relations(TABLE_TAB, "table", schema_name, table_names, if_exists)
     }
 
+    /// Create a passthrough view over `source_table_id` and return its id.
     pub fn create_view(
         &mut self,
         schema_name: &str,
         view_name: &str,
         source_table_id: u64,
+        props: ViewProps,
     ) -> Result<u64, ClientError> {
         // A passthrough's layout must equal its source's, so the whole output
         // schema and its PK-repeat flag are the source's own.
@@ -974,7 +976,7 @@ impl GnitzClient {
             schema: Arc::clone(&src.schema),
             pk_repeats: src.pk_repeats,
         };
-        self.create_view_chain(schema_name, view_name, view.into(), ViewProps::default(), None)
+        self.create_view_chain(schema_name, view_name, view.into(), props, None)
     }
 
     /// Create `bundle` in one atomic `DDL_TXN` and return the user-named view's id.

@@ -416,8 +416,10 @@ pub fn strace_test(child_test: &str, env: &[(&str, &str)]) -> Option<SyscallCoun
     let strace =
         env::var_os("PATH").and_then(|p| env::split_paths(&p).map(|d| d.join("strace")).find(|c| c.is_file()))?;
     let exe = env::current_exe().expect("current_exe");
+    // A file rather than the child's stdout, which carries libtest's own report.
+    let report = tempfile::NamedTempFile::new().expect("strace report file");
     let mut cmd = Command::new(strace);
-    cmd.args(["-f", "-c", "-o", "/dev/stdout"]).arg(&exe).args([
+    cmd.args(["-f", "-c", "-o"]).arg(report.path()).arg(&exe).args([
         "--exact",
         child_test,
         "--nocapture",
@@ -432,7 +434,13 @@ pub fn strace_test(child_test: &str, env: &[(&str, &str)]) -> Option<SyscallCoun
         "the traced child failed:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let report = String::from_utf8_lossy(&out.stdout).into_owned();
+    // libtest exits 0 when its filter matches nothing.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1 passed"),
+        "`{child_test}` names no test in this binary:\n{stdout}"
+    );
+    let report = fs::read_to_string(report.path()).expect("read the strace report");
     // A summary row is `% time  seconds  usecs/call  calls [errors] syscall`,
     // so the name is last and the call count is column 3 either way.
     let calls = report
