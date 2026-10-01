@@ -2,16 +2,10 @@
 //!
 //! The schema codec has its own round-trip proptest; this is the analogous
 //! coverage for the **data** layer — the path from `Batch` → run set →
-//! shard file → `MappedShard` / `ReadCursor`. Every existing storage unit test
-//! fixes one concrete schema (almost always `(U64 PK)` or `(U64 PK, I64)`) and
-//! exercises one code path; PK-width and PK-arity assumptions hard-coded across
-//! unrelated files stay quiet until a single change routes traffic through them.
-//!
-//! A single proptest that iterates over `(type codes, PK arity, payload shape,
-//! column interleaving)` instead of fixing them sweeps every PK-width arm
-//! (narrow `≤ 16`, non-power-of-two narrow `6/10/12`, wide `> 16`), both read
-//! paths (the `full_scan` byte-merge cursor and the direct `slice_to_owned_batch`
-//! shard decode), and the non-prefix payload-slot renumbering in one place.
+//! shard file → `MappedShard` / `ReadCursor` — over random `(type codes, PK
+//! arity, payload shape, column interleaving)`: every PK-width arm, both read
+//! paths (the `full_scan` merge cursor and the direct `slice_to_owned_batch`
+//! shard decode), and the non-prefix payload-slot renumbering.
 
 use proptest::prelude::*;
 
@@ -35,8 +29,7 @@ use gnitz_expr::RowSource;
 /// MAX_PK_BYTES) that auto-corrects if either constant changes.
 fn arb_schema() -> impl Strategy<Value = SchemaDescriptor> {
     let pk = prop::collection::vec(arb_pk_type(), 1..=MAX_PK_COLUMNS);
-    // Any of the 15 type codes is a valid payload column (incl. F32/F64 and the
-    // German-string STRING/BLOB), so payloads draw from the full type set.
+    // Any type code is a valid payload column, so payloads draw from the full set.
     let payload = prop::collection::vec((arb_type_code(), any::<bool>()), 0..=4);
     (pk, payload)
         // (type_code, nullable, is_pk); PK columns are non-nullable.
@@ -72,8 +65,7 @@ fn arb_schema() -> impl Strategy<Value = SchemaDescriptor> {
 // ---------------------------------------------------------------------------
 
 /// Build a batch row-by-row via `Batch::with_capacity` and the public `extend_*`
-/// appenders. The helper IS the test: its correctness over arbitrary
-/// width/interleaving is what makes the proptest interesting.
+/// appenders.
 ///
 /// Returns the batch plus the fixed leading PK column values (empty for a
 /// single-column PK), so a caller can synthesize an absent prefix-twin key.
@@ -180,7 +172,7 @@ proptest! {
         if durable {
             // A durable flush synchronously commits exactly one on-disk shard.
             prop_assert_eq!(shards.len(), 1);
-            // Direct shard decode: on-disk region layout + wide-PK Raw guard.
+            // Direct shard decode of the on-disk region layout.
             let owned = shards[0].slice_to_owned_batch(0, shards[0].row_count());
             prop_assert_eq!(&expected, &zset_of(&owned, &schema));
         } else {
@@ -269,9 +261,7 @@ proptest! {
         // Exactly WAVES non-empty flushes -> WAVES L0 shards. WAVES == 5 is the
         // minimum that crosses the strictly-greater trigger (l0.len() > 4). The
         // boundaries k*rows/WAVES distribute rows evenly; rows >= WAVES makes
-        // every wave non-empty (each gets >= floor(rows/WAVES) >= 1 rows). A
-        // fixed chunk = rows.div_ceil(6) is WRONG: at rows in {7, 8} it forms
-        // only 4 waves (chunk 2, ceil(7/2) == 4), so `len() > 4` would fail.
+        // every wave non-empty (each gets >= floor(rows/WAVES) >= 1 rows).
         // append_batch relocates string blobs (the batch has a schema), so each
         // wave is self-contained.
         const WAVES: usize = 5;

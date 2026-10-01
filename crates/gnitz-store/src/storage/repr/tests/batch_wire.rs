@@ -251,23 +251,25 @@ fn dead_heap_round_trips_an_engine_block() {
 #[test]
 fn a_foreign_decode_measures_the_dead_heap_exactly() {
     let schema = make_schema_pk_u64_payload_string();
-    let heap: Vec<u8> = (0..62u8).collect();
+    // Longer than one word of the span bitset.
+    let heap: Vec<u8> = (0..200u8).map(|b| b % 128).collect();
     let cell = |start: usize, len: usize| {
         let mut c = gnitz_wire::encode_german_string(&heap[start..start + len], &mut Vec::new());
         gnitz_wire::write_u64_le(&mut c, 8, start as u64);
         c
     };
-    // [0, 20) twice, [10, 30) overlapping it: bytes [30, 62) are dead.
-    let cells = [cell(0, 20), cell(0, 20), cell(10, 20)].concat();
-    let pks: Vec<u8> = (1..=3u64).flat_map(|k| k.to_be_bytes()).collect();
-    let weights: Vec<u8> = (0..3).flat_map(|_| 1i64.to_le_bytes()).collect();
-    let nulls = [0u8; 24];
+    // [0, 20) twice, [10, 30) overlapping it, and [50, 150): bytes [30, 50) and
+    // [150, 200) are dead.
+    let cells = [cell(0, 20), cell(0, 20), cell(10, 20), cell(50, 100)].concat();
+    let pks: Vec<u8> = (1..=4u64).flat_map(|k| k.to_be_bytes()).collect();
+    let weights: Vec<u8> = (0..4).flat_map(|_| 1i64.to_le_bytes()).collect();
+    let nulls = [0u8; 32];
     let regions: [&[u8]; 5] = [&pks, &weights, &nulls, &cells, &heap];
     for claimed in [0, 5, heap.len()] {
         let mut block = Vec::new();
         wal::append_block(&regions, claimed, &mut block);
         let decoded = Batch::decode_foreign_wal_block(&block, &schema).unwrap();
-        assert_eq!(decoded.dead_heap, 32, "header claimed {claimed}");
+        assert_eq!(decoded.dead_heap, 70, "header claimed {claimed}");
         assert_eq!(
             Batch::decode_from_wal_block(&block, &schema).unwrap().dead_heap,
             claimed

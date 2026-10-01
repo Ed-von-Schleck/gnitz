@@ -1,8 +1,8 @@
 use super::enforce_unique_pk;
 use crate::schema::TypeCode;
 use crate::test_support::{
-    make_batch_bytes, make_batch_opk, make_schema_pk_u64_payload_string, opk_pk, pk_payload_schema, scratch_table,
-    stored_payload0_i64, zset_of,
+    make_batch_bytes, make_batch_opk, make_schema_pk_u64_payload_string, opk_pk, payload0_i64, pk_payload_schema,
+    scratch_table, zset_of,
 };
 
 /// `(key index, weight, payload)`.
@@ -109,7 +109,7 @@ fn enforce_unique_pk_holds_at_every_pk_shape() {
             for &(i, net, payload) in live {
                 let (w, row) = pt.live_row_at(&k[i]);
                 assert_eq!(
-                    (w, row.as_ref().map(stored_payload0_i64)),
+                    (w, row.as_ref().map(|r| payload0_i64(&r.run, r.row))),
                     (net, payload),
                     "{what}: key {i}"
                 );

@@ -2,8 +2,8 @@ use super::*;
 use crate::schema::{ColumnTable, SchemaColumn, TypeCode};
 use crate::storage::{Batch, BatchBuilder};
 use crate::test_support::{
-    arb_fold_case, batch_of_pk_bytes, cell, fold_batch, fold_schemas, le_cell, opk_pk, pk_only_schema,
-    pk_payload_schema, wide_pk_3xu64_schema,
+    arb_fold_case, cell, fold_batch, fold_schemas, le_cell, opk_pk, pk_only_schema, pk_payload_schema,
+    wide_pk_3xu64_schema,
 };
 use proptest::prelude::*;
 
@@ -111,7 +111,7 @@ fn assert_runs_group_by_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
                 prop_assert!(prev.is_none_or(|p| p < first), "{:?}: runs out of order", cols);
                 prev = Some(first);
             }
-            if std::ptr::eq(batch, &consolidated) && (cols[..] == [0] || *cols == pk) {
+            if std::ptr::eq(batch, &consolidated) && (cols[..] == pk[..1] || *cols == pk) {
                 prop_assert!(runs.in_row_order(), "{:?}: a PK prefix of a consolidated batch", cols);
             }
             let group =
@@ -214,7 +214,10 @@ fn reduce_sort_argsort_bench() {
         ("image u128", &mixed, &[1]),
         ("fold 2-col", &wide, &[0, 1]),
     ] {
-        let batch = batch_of_pk_bytes(schema, &bench_rows(n, schema.pk_stride()));
+        let mut batch = Batch::with_capacity(schema, n);
+        for pk in bench_rows(n, schema.pk_stride()) {
+            batch.push_zero_filled_row(&pk, 1);
+        }
         let key = GroupOutKey::new(schema, group_cols, []).unwrap().0;
 
         let t = std::time::Instant::now();

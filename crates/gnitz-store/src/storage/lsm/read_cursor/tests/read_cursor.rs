@@ -131,9 +131,15 @@ proptest! {
             prop_assert_eq!(group, rows_where(&|p, _| p == &k[..]));
 
             for n in [1, stride] {
+                let want = rows_where(&|p, w| p[..n] == k[..n] && w > 0);
                 let mut positive = Vec::new();
                 open().for_each_positive_with_prefix(&k[..n], |c| positive.push(current(c)));
-                prop_assert_eq!(positive, rows_where(&|p, w| p[..n] == k[..n] && w > 0));
+                prop_assert_eq!(&positive, &want);
+                for max in [0, 1, 3] {
+                    let mut capped = Vec::new();
+                    open().for_each_positive_with_prefix_capped(&k[..n], max, |c| capped.push(current(c)));
+                    prop_assert_eq!(&capped[..], &want[..max.min(want.len())]);
+                }
             }
         }
 
@@ -299,7 +305,8 @@ fn bounded_string_read_carries_only_its_own_rows() {
 }
 
 /// A PK group holding a skeleton row collapses to one coarse row under both
-/// payload comparators, beside a hydrated row that compares `Equal` to it.
+/// payload comparators, beside a hydrated row that compares `Equal` to it; a
+/// split drain hands that row's key back and copies only the hydrated groups.
 #[test]
 fn a_skeleton_row_coarsens_its_whole_pk_group() {
     let dir = tempfile::tempdir().unwrap();
@@ -331,7 +338,7 @@ fn a_skeleton_row_coarsens_its_whole_pk_group() {
         }
         let mem = Rc::new(bb.finish().into_consolidated());
 
-        let mut c = create_read_cursor(&[mem], &[sk], schema);
+        let mut c = create_read_cursor(std::slice::from_ref(&mem), std::slice::from_ref(&sk), schema);
         let mut groups = Vec::new();
         while c.valid {
             groups.push((c.current_key_narrow(), c.current_weight, c.current_is_skeleton()));
@@ -341,6 +348,17 @@ fn a_skeleton_row_coarsens_its_whole_pk_group() {
             groups,
             vec![(1, 15, true), (2, 4, false)],
             "{name}: PK 1 folds to one coarse row (3+5+7), PK 3 ghosts at 2-2",
+        );
+
+        let mut skeletons = SkeletonKeys::default();
+        let live = create_read_cursor(&[mem], &[sk], schema)
+            .drain_live_chunk(usize::MAX, &mut skeletons)
+            .unwrap();
+        assert_eq!(skeletons.keys, 1u64.to_be_bytes(), "{name}");
+        assert_eq!(
+            (live.count, live.get_pk_bytes(0), live.get_weight(0)),
+            (1, &2u64.to_be_bytes()[..], 4),
+            "{name}"
         );
     }
 }

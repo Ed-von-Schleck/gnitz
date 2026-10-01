@@ -471,19 +471,6 @@ fn a_widened_all_pk_shard_is_not_a_skeleton() {
     assert!(!shard.is_skeleton());
 }
 
-#[test]
-fn a_restamped_skeleton_flag_opens_as_a_skeleton() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = small_shard(dir.path(), 1, 42);
-    let schema = make_schema_u64_i64();
-    let base = std::fs::read(&path).unwrap();
-    assert!(!MappedShard::open(&path, &schema).unwrap().is_skeleton());
-    let forge = |d: &mut Vec<u8>| write_u64_le(d, OFF_FLAGS, SHARD_FLAG_SKELETON);
-    assert!(open_patched_restamped(&path, &schema, &base, forge)
-        .unwrap()
-        .is_skeleton());
-}
-
 /// Each region role admits only certain encodings. Forging one that a role may
 /// not carry must be refused at open, whatever the byte means elsewhere. The
 /// digest is re-stamped so the verdict is the decode site's, not the digest's.

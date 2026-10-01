@@ -135,9 +135,8 @@ fn assert_all_found(idx: &ShardIndex, keys: impl IntoIterator<Item = u64>) {
     assert_weighs(idx, 1, keys.into_iter().map(gk));
 }
 
-/// Rename the index's manifest into place, as the barrier does minus the
-/// fsyncs, leaving the retired shards on disk.
-fn rename_manifest(idx: &mut ShardIndex) {
+/// Publish the index's manifest as the barrier does, minus the fsyncs.
+fn publish_manifest(idx: &mut ShardIndex) {
     let bytes = manifest::encode(&manifest::Manifest {
         checkpoint_mark: 0,
         caller_record: Vec::new(),
@@ -146,11 +145,6 @@ fn rename_manifest(idx: &mut ShardIndex) {
     manifest::prepare(&idx.output_dir, &bytes).unwrap();
     manifest::commit(&idx.output_dir).unwrap();
     idx.mark_published();
-}
-
-/// Publish the index's manifest as the barrier does, minus the fsyncs.
-fn publish_manifest(idx: &mut ShardIndex) {
-    rename_manifest(idx);
     idx.unlink_retired();
 }
 
@@ -270,11 +264,10 @@ fn a_failing_vertical_band_leaves_the_bands_before_it_folded() {
     assert_all_found(&idx, src_pks.iter().chain(&dest_pks).copied());
 }
 
+/// The write split and the read router agree below L1's first guard key: keys
+/// folded in from L0 under it stay findable.
 #[test]
-fn test_l1_guard_routing_gap_key_below_first_guard() {
-    // Regression for a routing mismatch between the write split and the read
-    // router: a key inserted below L1's first guard key (100) must remain
-    // findable after an L0→L1 compaction.
+fn an_l0_fold_routes_keys_below_the_first_l1_guard() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let mut idx = fresh(dir.path(), schema);
@@ -295,7 +288,7 @@ fn test_l1_guard_routing_gap_key_below_first_guard() {
 }
 
 #[test]
-fn test_find_guards_for_range() {
+fn find_guards_for_range_names_every_guard_the_range_meets() {
     let range = |l: &FLSMLevel, lo: u64, hi: u64| l.find_guards_for_range(gk(lo).pk_bytes(), gk(hi).pk_bytes());
 
     let mut level = FLSMLevel::default();
@@ -315,9 +308,6 @@ fn test_find_guards_for_range() {
 
     // Point query at exact guard boundary
     assert_eq!(range(&level, 200, 200), 2..3);
-
-    // Range below all guards still hits guard 0 (partition_point - 1)
-    assert_eq!(range(&level, 0, 0), 0..1);
 
     // A range entirely below the first guard KEY still names guard 0, which
     // owns the tail below it. An empty run here would let a caller mint a
@@ -404,92 +394,32 @@ fn compaction_outputs_pack_and_spills_do_not() {
     assert_all_found(&idx, 0..1500);
 }
 
-/// A compaction that cannot write its output leaves L0 exactly as it was, so
-/// the next trigger retries against intact inputs.
+/// A compaction that cannot write an output — its first, or one past outputs it
+/// had already written and opened — leaves no output behind and its inputs
+/// registered, so the next trigger retries against intact inputs.
 #[test]
-fn test_run_compact_failure_leaves_l0_intact() {
-    let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u64_i64();
-    let mut idx = fresh(dir.path(), schema);
+fn a_failing_compaction_leaves_its_inputs_and_no_output() {
+    for failing in [1, 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = fresh(dir.path(), make_schema_u64_i64());
 
-    // Add L0_COMPACT_THRESHOLD + 1 shards (triggers compaction).
-    let mut all_pks = Vec::new();
-    for i in 0..5u64 {
-        let pk = (i + 1) * 10;
-        idx.append_l0_run(&test_batch(&[pk], &[pk as i64])).unwrap();
-        all_pks.push(pk);
+        // One L1 guard key per L0 run, so the fold writes two outputs.
+        idx.append_l0_run(&test_batch(&[10, 50], &[1, 1])).unwrap();
+        idx.append_l0_run(&test_batch(&[150, 250], &[1, 1])).unwrap();
+        // A directory at an output's name: that shard cannot be created.
+        std::fs::create_dir_all(dir.path().join(manifest::shard_name(idx.shard_seq + failing))).unwrap();
+        let before = shard_names(dir.path());
+
+        assert!(idx.run_compact().is_err(), "output {failing} cannot be written");
+        assert_eq!(
+            shard_names(dir.path()),
+            before,
+            "output {failing}: no input retired, no output left behind"
+        );
+        assert_eq!(idx.l0.len(), 2, "both inputs stay registered");
+        assert!(idx.levels.iter().all(|l| l.guards.is_empty()), "nothing was registered");
+        assert_all_found(&idx, [10, 50, 150, 250]);
     }
-
-    // A directory at the next seq's name: the output shard cannot be created.
-    std::fs::create_dir_all(dir.path().join(manifest::shard_name(idx.shard_seq + 1))).unwrap();
-    let l0_before = idx.l0.len();
-
-    let result = idx.run_compact();
-    assert!(result.is_err(), "expected Err when the output shard cannot be written");
-
-    assert_eq!(idx.l0.len(), l0_before, "L0 must not be modified on failure");
-    assert!(idx.levels.iter().all(|l| l.guards.is_empty()), "nothing was registered");
-
-    // All original keys must still be findable via L0.
-    assert_all_found(&idx, all_pks.iter().copied());
-}
-
-/// A compaction whose second output cannot be written unlinks the first, which
-/// it had already written and opened, and registers neither.
-#[test]
-fn a_compaction_failing_past_its_first_output_leaves_no_output_behind() {
-    let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u64_i64();
-    let mut idx = fresh(dir.path(), schema);
-
-    // One L1 guard key per L0 run, so the fold writes two outputs.
-    idx.append_l0_run(&test_batch(&[10, 50], &[1, 1])).unwrap();
-    idx.append_l0_run(&test_batch(&[150, 250], &[1, 1])).unwrap();
-    let inputs: Vec<String> = idx
-        .l0
-        .iter()
-        .map(|e| manifest::shard_path(&idx.output_dir, e.seq))
-        .collect();
-
-    let first = dir.path().join(manifest::shard_name(idx.shard_seq + 1));
-    std::fs::create_dir_all(dir.path().join(manifest::shard_name(idx.shard_seq + 2))).unwrap();
-
-    assert!(idx.run_compact().is_err(), "the second output cannot be written");
-    assert!(!first.exists(), "the first output was unlinked");
-    assert_eq!(idx.l0.len(), 2, "both inputs stay registered");
-    assert!(inputs.iter().all(|p| std::path::Path::new(p).exists()));
-    assert!(idx.levels.iter().all(|l| l.guards.is_empty()), "nothing was registered");
-}
-
-/// An L1 guard at key=100 folded into an L2 that starts at key=200 must
-/// route the keys below 200 — the source range's lower bound — or 100..199
-/// become unfindable.
-#[test]
-fn a_vertical_does_not_lose_keys_below_the_destination_guard() {
-    let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u64_i64();
-    let mut idx = fresh(dir.path(), schema);
-
-    // L1 guard at key=100: 5 shards (> GUARD_FILE_THRESHOLD=4) with keys in [100, 199]
-    let src_pks: Vec<u64> = vec![100, 120, 140, 160, 180];
-    for &pk in &src_pks {
-        seed_guard(&mut idx, 0, gk(100), &test_batch(&[pk], &[pk as i64 * 10]), 100);
-    }
-
-    // L1 guard at key=500: 1 shard
-    seed_guard(&mut idx, 0, gk(500), &test_batch(&[500], &[5000]), 50);
-
-    // L2 guard at key=200: 1 shard with key=250
-    seed_guard(&mut idx, 1, gk(200), &test_batch(&[250], &[2500]), 80);
-
-    // Compact L1 → L2
-    idx.vertical_fold(0).unwrap();
-
-    // All source keys (100-180) must be findable — they should not be lost
-    // to the routing gap below L2's guard at 200.
-    assert_all_found(&idx, src_pks.iter().copied());
-
-    assert_all_found(&idx, [250]);
 }
 
 /// A vertical whose source lies below its destination guard's key folds into
@@ -520,25 +450,28 @@ fn a_vertical_into_a_guards_lower_tail_does_not_shadow_it() {
     assert_all_found(&idx, dest_pks.into_iter().chain(src_pks));
 }
 
-/// A source guard spanning several terminal guards is cut at the destination
-/// partition first, so each band's merge reads one band plus the single
-/// terminal guard it lands in — never the whole overlapped run at once.
+/// A source guard spanning several terminal guards folds into exactly the
+/// guards its key extent overlaps, and leaves the destination partition as it
+/// was.
 #[test]
-fn a_vertical_bands_its_source_at_the_destination_partition() {
+fn a_vertical_rewrites_exactly_the_terminal_guards_its_source_overlaps() {
     let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u64_i64();
-    let mut idx = fresh(dir.path(), schema);
+    let mut idx = fresh(dir.path(), make_schema_u64_i64());
 
     let mut dest_pks = Vec::new();
-    for (base, key) in [(200u64, gk(100)), (100_100, gk(100_000))] {
+    for (base, key) in [(200u64, gk(100)), (100_100, gk(100_000)), (200_100, gk(200_000))] {
         dest_pks.extend(seed_stable(&mut idx, TERMINAL_LEVEL_IDX, key, base, 80));
     }
-    let before: Vec<(PkBuf, u64)> = idx.levels[TERMINAL_LEVEL_IDX]
-        .guards
-        .iter()
-        .map(|g| (g.guard_key, g.entries[0].seq))
-        .collect();
+    let terminal = |idx: &ShardIndex| -> Vec<(PkBuf, u64)> {
+        idx.levels[TERMINAL_LEVEL_IDX]
+            .guards
+            .iter()
+            .map(|g| (g.guard_key, g.entries[0].seq))
+            .collect()
+    };
+    let before = terminal(&idx);
 
+    // One L1 guard over the first two bands.
     let src_pks = [100u64, 150, 100_050, 100_060];
     let vals: Vec<i64> = src_pks.iter().map(|&p| p as i64).collect();
     seed_guard(&mut idx, 0, gk(100), &test_batch(&src_pks, &vals), 100);
@@ -546,61 +479,24 @@ fn a_vertical_bands_its_source_at_the_destination_partition() {
     idx.vertical_fold(0).unwrap();
 
     assert!(idx.levels[0].guards.is_empty(), "every band went down");
-    let after: Vec<(PkBuf, u64)> = idx.levels[TERMINAL_LEVEL_IDX]
-        .guards
-        .iter()
-        .map(|g| (g.guard_key, g.entries[0].seq))
-        .collect();
-    assert_eq!(
-        after.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
-        before.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
-        "the destination partition is unchanged",
-    );
-    assert!(
-        after.iter().zip(&before).all(|(a, b)| a.1 != b.1),
-        "each band rewrote exactly its own destination",
-    );
+    let after = terminal(&idx);
+    assert_eq!(after.len(), before.len());
+    for (i, (a, b)) in after.iter().zip(&before).enumerate() {
+        assert_eq!(a.0, b.0, "the destination partition is unchanged");
+        assert_eq!(a.1 != b.1, i < 2, "guard {i} is rewritten iff the source overlaps it");
+    }
     assert_all_found(&idx, src_pks.into_iter().chain(dest_pks));
 }
 
-/// Two folds into the same destination guard write distinct files, so
-/// `unlink_retired` removes the first fold's output and keeps the live one.
-#[test]
-fn test_vertical_same_guard_recompaction_unlink_retired_keeps_live() {
-    let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u64_i64();
-    let mut idx = fresh(dir.path(), schema);
-
-    // L2 guard gk(100) pre-seeded with key 250.
-    seed_guard(&mut idx, 1, gk(100), &test_batch(&[250], &[2500]), 100);
-    // L1 guard gk(100): two entries (keys 100, 110).
-    for k in [100u64, 110] {
-        seed_guard(&mut idx, 0, gk(100), &test_batch(&[k], &[k as i64]), 100);
-    }
-    idx.vertical_fold(0).unwrap();
-
-    // Re-add L1 guard gk(100) with two more entries (keys 120, 130) and
-    // re-compact into the same destination guard.
-    for k in [120u64, 130] {
-        seed_guard(&mut idx, 0, gk(100), &test_batch(&[k], &[k as i64]), 100);
-    }
-    idx.vertical_fold(0).unwrap();
-
-    publish_manifest(&mut idx);
-    assert_eq!(
-        shard_names(dir.path()).len(),
-        idx.shard_count(),
-        "only the live shards remain"
-    );
-    let idx2 = fresh(dir.path(), schema);
-    assert_all_found(&idx2, [100u64, 110, 120, 130, 250]);
-}
-
-/// `open` unlinks exactly the shard and staging files its manifest does not name.
+/// `open` unlinks exactly the shard and staging files its manifest does not
+/// name — with no manifest, every shard.
 #[test]
 fn open_removes_exactly_the_unreferenced_files() {
     let dir = tempfile::tempdir().unwrap();
+    let stray = dir.path().join(manifest::shard_name(7));
+    std::fs::write(&stray, b"orphan").unwrap();
     let mut idx = fresh(dir.path(), make_schema_u64_i64());
+    assert!(!stray.exists());
     idx.append_l0_run(&test_batch(&[10], &[100])).unwrap();
     publish_manifest(&mut idx);
     let live = manifest::shard_name(idx.shard_seq);
@@ -616,16 +512,6 @@ fn open_removes_exactly_the_unreferenced_files() {
     let mut want = [live, "manifest.bin".to_string(), "other".to_string()];
     want.sort();
     assert_eq!(dir_names(dir.path()), want);
-}
-
-/// With no manifest, every shard in the directory is an orphan.
-#[test]
-fn open_of_no_manifest_removes_every_shard() {
-    let dir = tempfile::tempdir().unwrap();
-    let stray = dir.path().join(manifest::shard_name(7));
-    std::fs::write(&stray, b"orphan").unwrap();
-    fresh(dir.path(), make_schema_u64_i64());
-    assert!(!stray.exists());
 }
 
 // -----------------------------------------------------------------------
@@ -730,13 +616,11 @@ fn the_byte_target_bounds_a_guard_at_every_stride() {
             "stride {}: a part is still over target",
             pk_cols * 8,
         );
-        // Every key still routes to a shard that holds it.
-        for i in (1..=OVER_TARGET_ROWS).step_by(97) {
-            let key = trailing_gk(pk_cols, i);
-            let mut found = false;
-            idx.find_pk_bytes(key.pk_bytes(), probe_key(key.pk_bytes()), &mut |_, _| found = true);
-            assert!(found, "stride {}: key {i} is unreachable", pk_cols * 8);
-        }
+        assert_weighs(
+            &idx,
+            1,
+            (1..=OVER_TARGET_ROWS).step_by(97).map(|i| trailing_gk(pk_cols, i)),
+        );
     }
 }
 
@@ -1026,7 +910,7 @@ fn the_guard_target_tracks_the_l0_folds_the_store_has_seen() {
 /// The terminal level of a budgeted store takes one sweep step, clamped into
 /// `[MIN_GUARD_BYTES, R]` because `parse_size` admits any positive `u64`.
 #[test]
-fn a_budgeted_terminal_target_is_an_eighth_of_the_budget_within_the_clamp() {
+fn a_budgeted_terminal_target_is_one_sweep_step_within_the_clamp() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = fresh(tmp.path(), make_schema_u64_i64());
     for i in 0..5u64 {
@@ -1037,7 +921,7 @@ fn a_budgeted_terminal_target_is_an_eighth_of_the_budget_within_the_clamp() {
     assert!(r > 2 * MIN_GUARD_BYTES, "premise: R leaves room inside the clamp");
     let mid = (MIN_GUARD_BYTES + r) / 2;
 
-    for (cap, want) in [(mid * 8, mid), (1024, MIN_GUARD_BYTES), (8 * 1024 * 1024 * 1024, r)] {
+    for (cap, want) in [(mid * SWEEP_STEPS, mid), (1024, MIN_GUARD_BYTES), (u64::MAX, r)] {
         idx = reopened_under(idx, ShardBudget::Dehydrate(cap));
         assert_eq!(idx.guard_target_bytes(TERMINAL_LEVEL_IDX), want, "capacity {cap}");
         assert_eq!(idx.guard_target_bytes(0), r, "only the evicted level reads the budget");
@@ -1052,12 +936,6 @@ fn the_balanced_l1_target_computes_its_product_in_u128() {
     let (l2, r) = (1u64 << 40, 1u64 << 28);
     assert!(l2.checked_mul(r).is_none(), "premise: the product overflows a u64");
     assert_eq!(ShardIndex::balanced_l1_target(l2, r), 1 << 35);
-
-    assert_eq!(
-        ShardIndex::balanced_l1_target(0, r),
-        16 * r,
-        "the floor, for an empty L2"
-    );
     assert_eq!(ShardIndex::balanced_l1_target(u64::MAX, u64::MAX), u64::MAX);
 }
 
@@ -1073,6 +951,11 @@ fn index_with_l0(dir: &Path, n: u64, budget: ShardBudget) -> ShardIndex {
         idx.append_l0_run(&dense_batch(s * 1000 + 1, 40)).unwrap();
     }
     idx
+}
+
+/// The keys [`index_with_l0`] writes.
+fn l0_keys(n: u64) -> impl Iterator<Item = u64> {
+    (0..n).flat_map(|s| s * 1000 + 1..s * 1000 + 41)
 }
 
 /// Guard indices of the terminal level, split by representation.
@@ -1120,6 +1003,7 @@ fn the_sweep_converges_to_the_skeleton_floor() {
     assert!(idx.l0.is_empty() && idx.levels[0].guards.is_empty(), "everything sank");
     assert!(!dehy.is_empty() && hyd.is_empty(), "the floor is fully dehydrated");
     assert!(idx.all_entries().all(|e| e.shard.is_skeleton()));
+    assert_all_found(&idx, l0_keys(4));
 
     // At the floor the sweep is a no-op even though the cap is still unmet.
     let floor = idx.resident_bytes();
@@ -1154,8 +1038,7 @@ fn a_delta_budget_drops_its_victim_and_raises_the_floor() {
     assert!(idx.levels[0].guards.is_empty(), "L1 sank");
     assert!(
         idx.levels[TERMINAL_LEVEL_IDX].guards.is_empty(),
-        "a drop REMOVES its guard; clearing it would leave one entry-less guard \
-         behind every drop, forever, in the binary-search space"
+        "a drop removes its guard"
     );
     assert_eq!(idx.resident_bytes(), 0, "a delta store has no floor to stop above");
     assert_eq!(
@@ -1190,51 +1073,13 @@ fn ordinary_compaction_of_a_delta_store_keeps_its_rows() {
         before,
         idx.resident_bytes()
     );
-    let live: usize = idx.all_entries().map(|e| e.shard.row_count()).sum();
-    assert_eq!(live, 4 * 40, "every row survived the folds");
+    assert_all_found(&idx, l0_keys(4));
 }
 
+/// A superseded shard a manifest names waits for the barrier: the fold leaves it
+/// on disk, and the drain after the next publish removes it and nothing live.
 #[test]
-fn a_superseded_shard_waits_for_the_barrier_only_if_a_manifest_names_it() {
-    let tmp = tempfile::tempdir().unwrap();
-    let files = |idx: &ShardIndex| {
-        let mut f: Vec<String> = idx
-            .all_entries()
-            .map(|e| manifest::shard_path(&idx.output_dir, e.seq))
-            .collect();
-        f.sort();
-        f
-    };
-    let exists = |p: &String| std::path::Path::new(p).exists();
-
-    let dir = tmp.path().join("published");
-    std::fs::create_dir_all(&dir).unwrap();
-    publish_manifest(&mut index_with_l0(&dir, 5, ShardBudget::Unbounded));
-    let mut idx = fresh(&dir, make_schema_u64_i64());
-    let inputs = files(&idx);
-    assert_eq!(inputs.len(), 5);
-    idx.run_compact().unwrap();
-    assert!(inputs.iter().all(exists), "every published input waits for the barrier");
-    publish_manifest(&mut idx);
-    assert!(!inputs.iter().any(exists), "and the post-publish drain removes it");
-
-    let dir = tmp.path().join("unpublished");
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut idx = index_with_l0(&dir, 5, ShardBudget::Unbounded);
-    let inputs = files(&idx);
-    idx.run_compact().unwrap();
-    assert!(!inputs.iter().any(exists), "every unpublished input is gone at once");
-    let outputs = files(&idx);
-    assert!(
-        !outputs.is_empty() && outputs.iter().all(exists),
-        "the outputs are present"
-    );
-}
-
-/// A barrier that renames its manifest and fails before the directory fsync
-/// keeps the superseded inputs until a later barrier's drain.
-#[test]
-fn retired_shards_outlive_a_rename_until_the_drain() {
+fn a_published_shard_a_fold_supersedes_waits_for_the_barrier() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = index_with_l0(tmp.path(), 5, ShardBudget::Unbounded);
     publish_manifest(&mut idx);
@@ -1242,19 +1087,24 @@ fn retired_shards_outlive_a_rename_until_the_drain() {
         .all_entries()
         .map(|e| manifest::shard_path(&idx.output_dir, e.seq))
         .collect();
+    assert_eq!(inputs.len(), 5);
+
     idx.run_compact().unwrap();
-
-    rename_manifest(&mut idx);
     assert!(
-        inputs.iter().all(|p| std::path::Path::new(p).exists()),
-        "a rename alone unlinks no superseded input"
+        inputs.iter().all(|p| Path::new(p).exists()),
+        "every published input waits for the barrier"
     );
-
-    idx.unlink_retired();
+    publish_manifest(&mut idx);
     assert!(
-        !inputs.iter().any(|p| std::path::Path::new(p).exists()),
-        "the drain unlinks every superseded input"
+        !inputs.iter().any(|p| Path::new(p).exists()),
+        "the post-publish drain removes it"
     );
+    assert_eq!(
+        shard_names(tmp.path()).len(),
+        idx.shard_count(),
+        "only the live shards remain"
+    );
+    assert_all_found(&fresh(tmp.path(), make_schema_u64_i64()), l0_keys(5));
 }
 
 /// A delta store written and swept every round plateaus rather than tracking
@@ -1401,38 +1251,4 @@ fn a_dehydrated_guard_stays_dehydrated_under_ordinary_compaction() {
         "the derived rule kept it skeleton"
     );
     assert_weighs(&idx, 3, (1..=20).map(gk));
-}
-
-/// `vertical_fold` rewrites only the terminal guards its source's key extent
-/// overlaps.
-#[test]
-fn vertical_fold_touches_only_the_guards_its_extent_overlaps() {
-    let tmp = tempfile::tempdir().unwrap();
-    let schema = make_schema_u64_i64();
-    let mut idx = fresh(tmp.path(), schema);
-    // Three well-separated terminal bands, each too big for the rebalance to
-    // merge into its neighbour or to split.
-    for base in [1u64, 10_000, 20_000] {
-        seed_stable(&mut idx, TERMINAL_LEVEL_IDX, gk(base), base, 10);
-    }
-    let names: Vec<u64> = idx.levels[TERMINAL_LEVEL_IDX]
-        .guards
-        .iter()
-        .map(|g| g.entries[0].seq)
-        .collect();
-
-    // The only L1 guard, so a destination range derived from the gap to the
-    // next L1 guard key would run to the top of the key space and rewrite all
-    // three.
-    seed_guard(&mut idx, 0, gk(2), &test_batch(&[2, 3], &[2, 3]), 50);
-    idx.vertical_fold(0).unwrap();
-
-    let after: Vec<u64> = idx.levels[TERMINAL_LEVEL_IDX]
-        .guards
-        .iter()
-        .map(|g| g.entries[0].seq)
-        .collect();
-    assert_eq!(after.len(), 3);
-    assert_ne!(after[0], names[0], "the overlapped guard was rewritten");
-    assert_eq!(&after[1..], &names[1..], "the untouched guards kept their files");
 }

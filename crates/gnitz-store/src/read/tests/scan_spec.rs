@@ -2,7 +2,7 @@ use super::*;
 use crate::relation::{IndexClaim, RelationKind, RelationSpec, StoreConfig};
 use crate::schema::{SchemaColumn, Slot, TypeCode};
 use crate::storage::BatchBuilder;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, opk_pk, opk_pk_i64, payload0_i64};
+use crate::test_support::{make_batch_raw, make_schema_u64_i64, opk_pk, payload0_i64};
 use gnitz_expr::{
     payload_is_null, payload_string, payload_u64, CmpOp, ExprBuilder, LogicalInstr, LogicalProgram, Sink,
 };
@@ -246,7 +246,7 @@ fn a_fold_counts_the_survivors_of_every_chunk() {
         let mut groups: Vec<(i64, i64, i64)> = (0..got.count)
             .map(|i| {
                 (
-                    opk_pk_i64(got.get_pk_bytes(i)),
+                    gnitz_wire::decode_opk_i64(got.get_pk_bytes(i), gnitz_wire::FixedInt::I64),
                     got.get_weight(i),
                     payload0_i64(&*got, i),
                 )

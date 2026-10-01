@@ -1,52 +1,50 @@
 use super::*;
 use proptest::prelude::*;
-
-fn run_case(stride: usize, recs: &[(u8, u8)], budget: Option<usize>) {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = SpillSort::new(dir.path().to_str().unwrap(), stride, budget.unwrap_or(usize::MAX));
-    let mut reference: Vec<Vec<u8>> = Vec::new();
-    for &(a, b) in recs {
-        // First and last byte vary: duplicates, and records differing only at the end.
-        let mut r = vec![0u8; stride];
-        r[0] = a;
-        r[stride - 1] = b;
-        s.push(&r).unwrap();
-        reference.push(r);
-    }
-    let spills = budget.is_some_and(|b| recs.len() >= b.div_ceil(stride).max(1));
-    assert_eq!(s.spill.is_some(), spills);
-    reference.sort_unstable();
-    let mut p = s.finish().unwrap();
-    let mut left = p.remaining();
-    assert_eq!(left, recs.len());
-    let mut out = Vec::new();
-    while let Some(k) = p.next() {
-        out.push(k.to_vec());
-        left -= 1;
-        assert_eq!(p.remaining(), left);
-    }
-    assert_eq!(out, reference);
-}
+use std::os::unix::fs::MetadataExt;
 
 proptest! {
     #[test]
     fn spill_sort_equals_reference(
         w in 1usize..=10,
+        at in (0usize..80, 0usize..80),
         recs in proptest::collection::vec((0u8..4, 0u8..4), 0..300),
-        budget in proptest::option::of(0usize..=720),
+        budget in prop_oneof![Just(usize::MAX), 0usize..=720],
     ) {
-        run_case(w * 8, &recs, budget);
+        let stride = w * 8;
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = SpillSort::new(dir.path().to_str().unwrap(), stride, budget);
+        let mut reference: Vec<Vec<u8>> = Vec::new();
+        for &(a, b) in &recs {
+            // Two bytes vary, anywhere in the record and across the sign bit:
+            // duplicates, and records differing in any word at any byte of it.
+            let mut r = vec![0u8; stride];
+            r[at.0 % stride] = a * 0x55;
+            r[at.1 % stride] = b * 0x55;
+            s.push(&r).unwrap();
+            reference.push(r);
+        }
+        // Spilled exactly when a run's worth of bytes was pushed, into a file with no name.
+        let spills = !recs.is_empty() && recs.len() * stride >= budget;
+        assert_eq!(s.spill.as_ref().map(|f| f.metadata().unwrap().nlink()), spills.then_some(0));
+        reference.sort_unstable();
+        let mut p = s.finish().unwrap();
+        let mut out = Vec::new();
+        loop {
+            assert_eq!(p.remaining(), reference.len() - out.len());
+            let Some(k) = p.next() else { break };
+            out.push(k.to_vec());
+        }
+        assert_eq!(out, reference);
     }
 }
 
+/// The dir is opened by the first spill: a sort that stays in RAM never touches
+/// it, and an unusable one fails the push that spills.
 #[test]
-fn spill_file_is_anonymous() {
-    use std::os::unix::fs::MetadataExt;
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = SpillSort::new(dir.path().to_str().unwrap(), 8, 8);
-    s.push(&[1u8; 8]).unwrap();
-    assert_eq!(s.spill.as_ref().unwrap().metadata().unwrap().nlink(), 0);
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+fn the_spill_dir_is_opened_by_the_first_spill() {
+    let mut s = SpillSort::new("/nonexistent-gnitz-spill-dir", 8, 16);
+    s.push(&[0; 8]).unwrap();
+    assert!(s.push(&[0; 8]).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -54,15 +52,15 @@ fn spill_file_is_anonymous() {
 // ---------------------------------------------------------------------------
 
 /// The whole pipeline — push 128 MiB of random records, `finish`, drain — at
-/// every stride class the pre-flight reaches, with the data in one RAM run, in
-/// 4 spilled runs and in 32.
+/// stride classes up to the widest the pre-flight reaches, with the data in one
+/// RAM run, in 4 spilled runs and in 32.
 #[test]
 #[ignore = "microbenchmark; run explicitly with --release --ignored --nocapture"]
 fn spill_sort_bench() {
     use crate::test_rng::Rng;
 
     const DATA: usize = 128 << 20;
-    for &stride in &[8usize, 16, 24, 40, 64, 80] {
+    for &stride in &[8usize, 16, 24, 40, 64] {
         let n = DATA / stride;
         let mut rng = Rng::new(0x5EED_0000 + stride as u64);
         let mut flat = vec![0u8; n * stride];

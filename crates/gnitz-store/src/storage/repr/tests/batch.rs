@@ -8,14 +8,15 @@ use crate::test_support::{
 };
 
 /// `append_row_from_source` copies the PK verbatim and carries the
-/// caller's weight, not the source row's.
+/// caller's weight, not the source row's; a zero weight appends nothing.
 #[test]
-fn append_row_from_source_copies_pk_weight_and_payload() {
+fn append_row_from_source_carries_the_callers_weight() {
     let schema = make_schema_u64_i64();
     let src = make_batch(&schema, &[(0xDEAD_BEEF, 1, 0x4242)]);
 
     let mut dst = Batch::with_capacity(&schema, 1);
     dst.append_row_from_source(-1, &src, 0, None);
+    dst.append_row_from_source(0, &src, 0, None);
 
     assert_eq!(dst.count, 1);
     assert_eq!(dst.get_pk_bytes(0), &0xDEAD_BEEFu64.to_be_bytes());

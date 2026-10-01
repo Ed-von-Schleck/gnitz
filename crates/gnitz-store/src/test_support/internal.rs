@@ -80,20 +80,9 @@ pub fn trace_cursor(batch: Batch) -> ReadCursor {
     crate::storage::create_read_cursor(&[Rc::new(batch)], &[], schema)
 }
 
-/// Decode a single signed I64 PK column from its OPK (big-endian, sign-flipped)
-/// bytes back to the native value — the inverse of `BatchBuilder::begin_row` for an I64 PK.
-pub fn opk_pk_i64(opk_bytes: &[u8]) -> i64 {
-    gnitz_wire::decode_opk_i64(&opk_bytes[..8], gnitz_wire::FixedInt::I64)
-}
-
 /// Payload column 0 of row `row`, an 8-byte integer.
 pub fn payload0_i64<S: gnitz_expr::RowSource>(src: &S, row: usize) -> i64 {
     gnitz_expr::payload_u64(src, row, 0) as i64
-}
-
-/// [`payload0_i64`] of a located store row.
-pub fn stored_payload0_i64(fr: &crate::storage::StoredRow) -> i64 {
-    payload0_i64(&fr.run, fr.row)
 }
 
 /// I64 pk + I64 payload schema — the signed-PK exercise of the order-preserving
@@ -262,7 +251,8 @@ pub(crate) fn assert_folds(inputs: &[Batch], got: &Batch, what: &str) {
 
 /// One fixed-int schema per `pk_width_dispatch` arm — `≤8` (strides 1, 4, 8),
 /// `9..=16`, `17..=32` and the `>32` fallback — and a nullable-string schema
-/// under the generic comparator at a narrow and a wide PK.
+/// under the generic comparator at a narrow PK, a wide one, and one whose PK
+/// columns sit among the payload columns in an order other than the schema's.
 pub(crate) fn fold_schemas() -> Vec<SchemaDescriptor> {
     use TypeCode::*;
     let generic = |pk: &[TypeCode]| {
@@ -280,6 +270,15 @@ pub(crate) fn fold_schemas() -> Vec<SchemaDescriptor> {
         pk_payload_schema(&[U128; 5]),
         generic(&[U64]),
         generic(&[U64; 3]),
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(String, true),
+                SchemaColumn::new(U64, false),
+                SchemaColumn::new(I64, true),
+                SchemaColumn::new(I32, false),
+            ],
+            &[3, 1],
+        ),
     ]
 }
 
