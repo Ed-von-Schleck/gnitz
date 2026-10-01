@@ -90,6 +90,18 @@ _VIEWS = [
     # The WHERE runs first; one named window serves both calls; both keys are computed.
     "named AS SELECT id, k % 2 AS parity, a, SUM(a) OVER w AS s, RANK() OVER w AS r FROM ev WHERE a > 1 "
     "WINDOW w AS (PARTITION BY k % 2 ORDER BY a * 2 DESC)",
+    # COUNT(*) and COUNT(a) over a NOT NULL `a` are one column of the peer-group
+    # reduce, which also carries AVG's and RANK's counts; ROW_NUMBER counts the peer
+    # groups of its own specification, each one row, beside an aggregate over it.
+    "shared AS SELECT id, COUNT(*) OVER w AS c, COUNT(a) OVER w AS ca, AVG(a) OVER w AS av, SUM(b) OVER w AS sb, "
+    "RANK() OVER w AS r, ROW_NUMBER() OVER w AS rn, COUNT(*) OVER (PARTITION BY k ORDER BY a, id) AS cid "
+    "FROM ev WINDOW w AS (PARTITION BY k ORDER BY a)",
+    # A ranking function ignores its frame.
+    "framed AS SELECT id, ROW_NUMBER() OVER w AS rn, RANK() OVER w AS r FROM ev "
+    "WINDOW w AS (PARTITION BY k ORDER BY a DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
+    # An order key the partition fixes orders nothing: every row is its partition's peer.
+    "fixed AS SELECT id, RANK() OVER (PARTITION BY k ORDER BY k) AS r, SUM(a) OVER (PARTITION BY k ORDER BY k) AS s "
+    "FROM ev",
     # A windowed view is a source like any other.
     "ranked AS SELECT id, k, a, RANK() OVER (PARTITION BY k ORDER BY a DESC) AS r FROM ev",
     "best AS SELECT k, SUM(a) AS s FROM ranked WHERE r <= 2 GROUP BY k",
@@ -170,7 +182,15 @@ def test_every_window_moves_with_the_data(client):
         check("ranks", ("id", "k", "a", "r", "d", "rn", "g"),
               [(i, x["k"], x["a"], r_asc[i], d_desc[i], rn_desc[i], g[i]) for i, x in ev.items()])
 
+        by_a = [("a", True)]
+        sc, sav, ssb = (_running(rows, ["k"], by_a, *f) for f in (("COUNT*",), ("AVG", "a"), ("SUM", "b")))
+        srn = _rank(rows, ["k"], [("a", True), ("id", True)])
+        check("shared", ("id", "c", "ca", "av", "sb", "r", "rn", "cid"),
+              [(i, sc[i], sc[i], sav[i], ssb[i], r_asc[i], srn[i], srn[i]) for i in ev])
+
         r_desc = _rank(rows, ["k"], [("a", False)])
+        check("framed", ("id", "rn", "r"), [(i, rn_desc[i], r_desc[i]) for i in ev])
+        check("fixed", ("id", "r", "s"), [(i, 1, s[i]) for i in ev])
         check("top_rank", ("id", "k", "r"), [(i, x["k"], r_desc[i]) for i, x in ev.items() if r_desc[i] <= 2])
         check("ranked", ("id", "k", "a", "r"), [(i, x["k"], x["a"], r_desc[i]) for i, x in ev.items()])
         best = Counter()

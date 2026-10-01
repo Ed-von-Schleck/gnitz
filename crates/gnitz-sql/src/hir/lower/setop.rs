@@ -18,7 +18,9 @@ pub(super) fn lower_setop(
 ) -> Result<EmitPieces, GnitzSqlError> {
     let mut cb = Circuit::default();
     let top = combine(chain, &mut cb, rel, out)?;
-    hashed_pieces(cb, top, "_set_pk", out)
+    // An ALL root can hold an element at weight above 1; any other clamps to a set.
+    let bag = matches!(rel.as_ref(), RelExpr::SetOp { all: true, .. });
+    hashed_pieces(cb, top, "_set_pk", out, bag)
 }
 
 /// `rel` as weight arithmetic over its hashed leaves.
@@ -78,7 +80,7 @@ pub(super) fn lower_distinct(chain: &mut ViewChain, input: &Rc<RelExpr>) -> Resu
     let mut cb = Circuit::default();
     let side = hashed_side(chain, &mut cb, input, &cols)?;
     let top = cb.distinct(side);
-    hashed_pieces(cb, top, "_distinct_pk", &cols)
+    hashed_pieces(cb, top, "_distinct_pk", &cols, false)
 }
 
 /// `side` opened and keyed by a hash of its columns, each widened to its
@@ -100,8 +102,16 @@ fn hashed_side(
     Ok(cb.map_hash_row(node, &key))
 }
 
-/// The circuit and its frame: the hidden U128 content-hash PK, then `cols`.
-fn hashed_pieces(cb: Circuit, top: NodeId, pk_name: &str, cols: &[HirCol]) -> Result<EmitPieces, GnitzSqlError> {
+/// The circuit and its frame: the hidden U128 content-hash PK, then `cols`. A
+/// content hash identifies its own element, so the PK repeats only where an
+/// element's weight can exceed 1 — `bag`.
+fn hashed_pieces(
+    cb: Circuit,
+    top: NodeId,
+    pk_name: &str,
+    cols: &[HirCol],
+    bag: bool,
+) -> Result<EmitPieces, GnitzSqlError> {
     Ok(EmitPieces {
         circuit: cb,
         top,
@@ -109,7 +119,6 @@ fn hashed_pieces(cb: Circuit, top: NodeId, pk_name: &str, cols: &[HirCol]) -> Re
             vec![ColumnDef::new(pk_name, TypeCode::U128, false).hidden()],
             cols.iter().map(|c| (Some(c.id), c.def.clone())),
         )?,
-        // A content hash identifies its own row.
-        pk_repeats: false,
+        pk_repeats: bag,
     })
 }

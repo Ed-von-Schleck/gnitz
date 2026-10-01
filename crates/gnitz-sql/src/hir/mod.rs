@@ -741,60 +741,31 @@ impl RelExpr {
         Rc::new(RelExpr::Alias { input, cols })
     }
 
-    /// The output columns identifying a row uniquely, or `None` where rows have no
-    /// unique key.
-    pub(crate) fn row_key(&self) -> Option<Vec<ColId>> {
-        if let Some(mapped) = self.key_through(RelExpr::row_key) {
-            return mapped;
-        }
-        match self {
-            RelExpr::Get { desc, cols } => {
-                if desc.pk_repeats {
-                    return None;
-                }
-                Some(desc.schema.pk_cols.iter().map(|&i| cols[i as usize].id).collect())
-            }
-            RelExpr::Filter { .. } | RelExpr::Project { .. } | RelExpr::Alias { .. } => {
-                unreachable!("key_through maps a pass-through node")
-            }
-            RelExpr::Unit => Some(Vec::new()),
-            RelExpr::Reduce { group_cols, .. } => Some(group_cols.clone()),
-            RelExpr::Distinct { input } => Some(input.cols().iter().map(|c| c.id).collect()),
-            RelExpr::SetOp { out, .. } => Some(out.iter().map(|c| c.id).collect()),
-            // A subset of its input's rows under its input's identities.
-            RelExpr::TopN { input, .. } => input.row_key(),
-            RelExpr::Join { left, right, kind, on } => match kind {
-                // One output row per left row.
-                k if k.is_decorrelated() => left.row_key(),
-                // At most one right row matches a left row when the right key is equated.
-                JoinType::Inner | JoinType::Left
-                    if right
-                        .row_key()
-                        .is_some_and(|rk| rk.iter().all(|c| on.eq.iter().any(|p| p.right == *c))) =>
-                {
-                    left.row_key()
-                }
-                _ => None,
-            },
-        }
-    }
-
-    /// Columns no two live rows share a value of, where that is enforced rather than
-    /// inferred: a base table's PK, a reduce's group columns, and every column of a
-    /// DISTINCT or a deduplicating set operation, whose clamp holds each row at
-    /// weight 1 — through filters, pass-through projections and aliases.
+    /// Columns no two live rows share a value of, each row at weight 1: a relation
+    /// whose PK does not repeat, a reduce's group columns, every column of a DISTINCT
+    /// or a deduplicating set operation — through filters, pass-through projections,
+    /// aliases, a top-N, and a join matching each row of one side at most once.
     pub(crate) fn unique_key(&self) -> Option<Vec<ColId>> {
         if let Some(mapped) = self.key_through(RelExpr::unique_key) {
             return mapped;
         }
         match self {
             RelExpr::Unit => Some(Vec::new()),
-            RelExpr::Get { desc, cols } if desc.class == gnitz_wire::RelClass::Table => {
+            RelExpr::Get { desc, cols } if !desc.pk_repeats => {
                 Some(desc.schema.pk_cols.iter().map(|&i| cols[i as usize].id).collect())
             }
             RelExpr::Reduce { group_cols, .. } => Some(group_cols.clone()),
             RelExpr::Distinct { input } => Some(input.cols().iter().map(|c| c.id).collect()),
             RelExpr::SetOp { all: false, out, .. } => Some(out.iter().map(|c| c.id).collect()),
+            // A subset of its input's rows under its input's identities.
+            RelExpr::TopN { input, .. } => input.unique_key(),
+            RelExpr::Join { left, right, kind, on } => match kind {
+                // One output row per left row.
+                k if k.is_decorrelated() => left.unique_key(),
+                JoinType::Inner | JoinType::Left if on.side_unique(right, false) => left.unique_key(),
+                JoinType::Inner | JoinType::Right if on.side_unique(left, true) => right.unique_key(),
+                _ => None,
+            },
             _ => None,
         }
     }

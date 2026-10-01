@@ -495,15 +495,27 @@ fn every_read_shape_plans_to_its_sink() {
     }
 }
 
-/// A DISTINCT drops only over a base table read whole on its key: a compound key
-/// needs every column, and a view's key does not make its rows a set.
+/// A DISTINCT drops only over a set read whole on its key: a compound key needs
+/// every column, and a view is a set only where its PK does not repeat.
 #[test]
-fn a_distinct_reads_as_rows_only_over_a_tables_whole_key() {
+fn a_distinct_reads_as_rows_only_over_a_sets_whole_key() {
     let cat = cat();
+    let tv = cat.probe_relation("tv").unwrap();
+    let bag = gnitz_core::RelDescriptor {
+        tid: 22,
+        class: RelClass::View,
+        pk_repeats: true,
+        serial: false,
+        schema: std::sync::Arc::clone(&tv.schema),
+        indexes: Vec::new(),
+    };
+    cat.insert("bv", Some(std::sync::Arc::new(bag)));
     for (sql, shape) in [
         ("SELECT DISTINCT a, b FROM c", "projection:"),
         ("SELECT DISTINCT a, x FROM c", "fold: distinct on (a, x)"),
-        ("SELECT DISTINCT * FROM tv", "fold: distinct on (id, v, w)"),
+        ("SELECT DISTINCT * FROM tv", "projection:"),
+        ("SELECT DISTINCT v, w FROM tv", "fold: distinct on (v, w)"),
+        ("SELECT DISTINCT * FROM bv", "fold: distinct on (id, v, w)"),
     ] {
         let line = &explain(&cat, sql)[3];
         assert!(line.starts_with(shape), "`{sql}`: {line}");
@@ -662,15 +674,15 @@ fn a_read_the_planner_rejects_names_its_rule() {
         // lowering's internal error.
         (
             "SELECT v, ROW_NUMBER() OVER (ORDER BY v) FROM t GROUP BY v",
-            "only supported in the SELECT list and QUALIFY of a CREATE VIEW",
+            "only supported in the SELECT list, QUALIFY and ORDER BY of a CREATE VIEW",
         ),
         (
             "SELECT v, SUM(w) OVER (PARTITION BY v) FROM t GROUP BY v",
-            "only supported in the SELECT list and QUALIFY of a CREATE VIEW",
+            "only supported in the SELECT list, QUALIFY and ORDER BY of a CREATE VIEW",
         ),
         (
             "SELECT id, RANK() OVER (ORDER BY v) FROM t",
-            "only supported in the SELECT list and QUALIFY of a CREATE VIEW",
+            "only supported in the SELECT list, QUALIFY and ORDER BY of a CREATE VIEW",
         ),
         // The fold is one stateless pass over one scan: no DISTINCT segment.
         ("SELECT v, COUNT(DISTINCT w) FROM t GROUP BY v", "CREATE VIEW body only"),

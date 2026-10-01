@@ -756,9 +756,10 @@ const TABLE_FLAG_DIST_MASK: u64 = 0xFF;
 const TABLE_FLAGS_DEFINED: u64 =
     TABLE_FLAG_REPLICATED | TABLE_FLAG_STREAM | TABLE_FLAG_SERIAL | (TABLE_FLAG_DIST_MASK << TABLE_FLAG_DIST_SHIFT);
 
-/// `VIEW_TAB.flags` bit 0: two of the view's rows may carry the same PK, so its
-/// PK region identifies no row — a view over a stream, one keyed on a join key or
-/// a source-PK pair, or a top-N holding more than one slot per partition. The
+/// `VIEW_TAB.flags` bit 0: two of the view's rows may carry the same PK, or one
+/// may stand at weight above 1, so its PK region identifies no single row — a view
+/// over a stream, one keyed on a join key or a source-PK pair, a top-N holding
+/// more than one slot per partition, or an ALL set operation. The
 /// planner that compiled the view states it; the engine stores it verbatim.
 const VIEW_FLAG_PK_REPEATS: u64 = 1 << 0;
 

@@ -50,7 +50,7 @@ fn expression_keys_consume_placements_in_order() {
 #[test]
 fn null_placement_defaults_follow_the_direction() {
     let q = parse_query("SELECT * FROM t ORDER BY a, b DESC, c ASC NULLS FIRST, a DESC NULLS LAST");
-    let dirs: Vec<(bool, bool)> = keys_of(&q).iter().map(OrderKey::dir).collect();
+    let dirs: Vec<(bool, bool)> = keys_of(&q).iter().map(|k| (k.desc, k.nulls_first)).collect();
     assert_eq!(dirs, [(false, false), (true, true), (false, true), (true, false)]);
 }
 

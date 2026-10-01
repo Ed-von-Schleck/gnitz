@@ -144,15 +144,7 @@ pub(crate) fn reject_unhonored_select_clauses(
     reject_if(!cluster_by.is_empty(), context, "CLUSTER BY")?;
     reject_if(!distribute_by.is_empty(), context, "DISTRIBUTE BY")?;
     reject_if(!sort_by.is_empty(), context, "SORT BY")?;
-    if honored.windows {
-        // Honored, so not reported unsupported — but a QUALIFY with no window
-        // value to filter on would then be silently dropped.
-        if qualify.is_some() && !crate::ast_util::select_has_window(select) {
-            return Err(GnitzSqlError::Rejected(
-                "QUALIFY needs a window function in the SELECT list or in the QUALIFY predicate".into(),
-            ));
-        }
-    } else {
+    if !honored.windows {
         reject_if(qualify.is_some(), context, "QUALIFY")?;
         reject_if(!named_window.is_empty(), context, "WINDOW")?;
     }

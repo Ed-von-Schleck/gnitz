@@ -16,12 +16,12 @@ mod subquery;
 
 use super::{
     as_col, col_by_id, hircol_of, ColId, ColIdGen, HirCol, HirExpr, JoinType, ProjEntry, RelExpr, SetOpKind,
-    SubqueryKind, SubqueryRef, TopNKey, Value,
+    SubqueryKind, SubqueryRef, TopNKey,
 };
 use crate::ast_util::{
     body_is_grouped, col_ref_parts, expand_wildcard_item, extract_table_name_and_alias, has_exists_in_subquery,
-    has_scalar_subquery, has_visible_column, peel_nested, scalar_projection_item, select_has_window,
-    select_is_distinct, single_fn_name,
+    has_scalar_subquery, has_visible_column, is_agg_call, peel_nested, scalar_projection_item, select_is_distinct,
+    single_fn_name,
 };
 use crate::bind::apply_positional_aliases;
 use crate::bind::{bind_conjuncts, bind_structural, find_unique_column, output_column, Catalog, LeafBinder};
@@ -224,9 +224,10 @@ impl<'a> QueryTail<'a> {
         let order = key_slots(&self.keys, cols.iter().map(|c| &c.def), placed.iter().copied())?
             .into_iter()
             .zip(&self.keys)
-            .map(|(at, key)| {
-                let (desc, nulls_first) = key.dir();
-                TopNKey { col: cols[at].id, desc, nulls_first }
+            .map(|(at, key)| TopNKey {
+                col: cols[at].id,
+                desc: key.desc,
+                nulls_first: key.nulls_first,
             })
             .collect();
         Ok(RelExpr::top_n(rel, Vec::new(), order, self.limit, self.offset))
@@ -437,20 +438,31 @@ fn bind_body_suffix(
     if body_is_grouped(select) && !distinct {
         return bind_grouped_suffix(ids, select, rel, leaf, surface, order_exprs);
     }
-    // The window desugar owns its own projection (it must place the SELECT list
-    // over the joined-in window values), so it hands back the projected relation.
-    let (projected, placed) = if surface == Surface::ViewBody && select_has_window(select) {
-        super::window::bind_window_final(ids, select, rel, leaf, ctx, order_exprs)?
-    } else {
-        let mut items = bind_projection(&select.projection, leaf, ids, ctx)?;
-        let placed = place_order_keys(order_exprs, &mut items, ids, leaf)?;
-        (leaf.project(rel, items)?, placed)
-    };
+    let (projected, placed) = bind_select_list(ids, select, rel, [leaf, leaf], ctx, order_exprs, surface)?;
     if !distinct {
         return Ok((projected, placed));
     }
     reject_unselected_distinct_keys(&projected, &placed, ctx)?;
     Ok((RelExpr::distinct(projected, "SELECT DISTINCT")?, placed))
+}
+
+/// The SELECT list over `rel` and the item each ORDER BY key sorts on. `order_leaf`
+/// binds the keys; a view body also binds its window calls and its QUALIFY.
+pub(super) fn bind_select_list<L: ItemLeaf>(
+    ids: &ColIdGen,
+    select: &Select,
+    rel: Rc<RelExpr>,
+    [leaf, order_leaf]: [&L; 2],
+    ctx: &str,
+    order_exprs: &[&Expr],
+    surface: Surface,
+) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
+    if surface == Surface::ViewBody {
+        return super::window::bind_view_select_list(ids, select, rel, [leaf, order_leaf], ctx, order_exprs);
+    }
+    let mut items = bind_projection(&select.projection, leaf, ids, ctx)?;
+    let placed = place_order_keys(order_exprs, &mut items, ids, order_leaf)?;
+    Ok((leaf.project(rel, items)?, placed))
 }
 
 /// DISTINCT dedups the selected columns, so an ORDER BY key that is not one of them —
@@ -497,11 +509,6 @@ pub(crate) trait ItemLeaf: LeafBinder<ColId> {
     /// wildcard is not an item: a grouped body, where every item is a group key
     /// or an aggregate, and a body reading no relation.
     fn wildcard_cols(&self, qualifier: Option<&str>) -> Result<Option<Vec<&HirCol>>, GnitzSqlError>;
-    /// A top-level function-call item's value, type and nullability — or `None` to
-    /// bind the item as any other expression.
-    fn call_item(&self, _f: &Function) -> Option<Result<Value, GnitzSqlError>> {
-        None
-    }
 }
 
 /// Resolve every SELECT item into a `ProjEntry` in SELECT order, expanding a bare
@@ -549,26 +556,26 @@ fn bind_scalar_item<L: ItemLeaf>(
     leaf: &L,
     ids: &ColIdGen,
 ) -> Result<ProjEntry, GnitzSqlError> {
-    let default = |stem: &str| format!("_{stem}{idx}");
-    if let Expr::Function(f) = peel_nested(expr) {
-        if let Some(call) = leaf.call_item(f) {
-            let (expr, ty, nullable) = call?;
-            let stem = single_fn_name(f).unwrap_or("expr").to_ascii_lowercase();
-            let def = ColumnDef::typed(alias.unwrap_or_else(|| default(&stem)), ty, nullable);
-            return Ok(ProjEntry { expr, out: HirCol::new(ids.next(), def) });
-        }
-    }
     let bound = bind_structural(expr, leaf)?;
     let copied = as_col(&bound);
     // `None` for a column the leaf minted.
-    let src = copied.and_then(|id| col_by_id(leaf.env(), id));
-    let src_name = src.filter(|c| !c.def.is_hidden).map(|c| c.def.name.clone());
+    let src_name = copied
+        .and_then(|id| col_by_id(leaf.env(), id))
+        .filter(|c| !c.def.is_hidden)
+        .map(|c| c.def.name.clone());
+    // An aggregate or window call is named for its function.
+    let stem = match peel_nested(expr) {
+        Expr::Function(f) if is_agg_call(f) || f.over.is_some() => single_fn_name(f).map(str::to_ascii_lowercase),
+        _ => None,
+    };
     let ty = bound.infer_ty_with(&|r| leaf.type_of(r));
     let def = ColumnDef::typed(
-        alias.or(src_name).unwrap_or_else(|| default("expr")),
+        alias
+            .or(src_name)
+            .unwrap_or_else(|| format!("_{}{idx}", stem.as_deref().unwrap_or("expr"))),
         // A copied column keeps its type; a computed one is stored as its register.
         if copied.is_some() { ty } else { ty.register_image() },
-        src.is_none_or(|c| c.def.is_nullable),
+        copied.is_none_or(|id| leaf.is_nullable(&id)),
     );
     Ok(ProjEntry {
         expr: bound,
@@ -840,7 +847,7 @@ pub(crate) fn bind_returning(
 
 /// Which statement a body is bound for.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Surface {
+pub(super) enum Surface {
     /// A view body.
     ViewBody,
     /// An ad-hoc read, which lowers to one stateless read of one relation. `op`
@@ -863,8 +870,8 @@ pub(super) fn place_order_keys<L: ItemLeaf>(
             cols.push(at);
             continue;
         }
-        // A leaf that registers while binding (a window call, a subquery) hands back a
-        // column no existing item names, so such an entry never matches and is appended.
+        // A leaf that registers while binding (a subquery) hands back a column no
+        // existing item names, so such an entry never matches and is appended.
         let mut entry = bind_scalar_item(e, Some(format!("_order{i}")), i, leaf, ids)?;
         cols.push(match items.iter().position(|it| it.expr == entry.expr) {
             Some(at) => at,

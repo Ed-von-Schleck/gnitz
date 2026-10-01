@@ -1,12 +1,11 @@
 //! GROUP BY / aggregate / HAVING binding: the reduce, the pre-map under it and
 //! the leaf its HAVING and SELECT list bind through.
 
-use super::super::{as_col, hircol_of, ColId, ColIdGen, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr, Value};
-use super::{bind_projection, clause_error, place_order_keys, ItemLeaf, ScopeLeaf, Surface};
+use super::super::{as_col, hircol_of, ColId, ColIdGen, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr};
+use super::{bind_select_list, clause_error, ItemLeaf, ScopeLeaf, Surface};
 use crate::agg::AggFunc;
 use crate::ast_util::{
-    classify_agg_call, col_ref_parts, for_each_agg_call, group_by_exprs, is_agg_call, projection_item_expr,
-    select_has_window, window_spec_keys, AggArg,
+    classify_agg_call, col_ref_parts, for_each_agg_call, group_by_exprs, projection_item_expr, window_spec_keys, AggArg,
 };
 use crate::bind::{bind_structural, LeafBinder};
 use crate::error::GnitzSqlError;
@@ -265,14 +264,8 @@ pub(super) fn bind_grouped_suffix(
         rel = RelExpr::filter(rel, vec![hexpr])?;
     }
 
-    let select_leaf = grouped("GROUP BY SELECT");
-    if surface == Surface::ViewBody && select_has_window(select) {
-        // The desugar owns its own projection.
-        return super::super::window::bind_window_final(ids, select, rel, &select_leaf, "GROUP BY", order_exprs);
-    }
-    let mut items = bind_projection(&select.projection, &select_leaf, ids, "GROUP BY")?;
-    let order_cols = place_order_keys(order_exprs, &mut items, ids, &grouped("ORDER BY"))?;
-    Ok((RelExpr::project(rel, items), order_cols))
+    let leaves = [&grouped("GROUP BY SELECT"), &grouped("ORDER BY")];
+    bind_select_list(ids, select, rel, leaves, "GROUP BY", order_exprs, surface)
 }
 
 /// The leaf for an expression over the grouped relation — HAVING and the finalize
@@ -336,10 +329,6 @@ impl ItemLeaf for GroupedLeaf<'_> {
     }
     fn wildcard_cols(&self, _: Option<&str>) -> Result<Option<Vec<&HirCol>>, GnitzSqlError> {
         Ok(None)
-    }
-    /// An aggregate call item takes that aggregate's own type and nullability.
-    fn call_item(&self, f: &Function) -> Option<Result<Value, GnitzSqlError>> {
-        is_agg_call(f).then(|| self.find_agg(f).map(HirAgg::as_value))
     }
 }
 

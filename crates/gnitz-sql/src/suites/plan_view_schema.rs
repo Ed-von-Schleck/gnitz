@@ -695,8 +695,9 @@ fn an_aggregate_output_column_is_typed_by_its_argument_and_grouping() {
     }
 }
 
-/// A copied column keeps its type, whatever minted it; a computed one is
-/// nullable, at its register image, under its alias or `_expr{idx}`.
+/// A copied column keeps its type and the nullability its leaf answers for it,
+/// whatever minted it; a computed one is nullable, at its register image, under
+/// its alias or `_expr{idx}`.
 #[test]
 fn an_item_is_declared_by_whether_it_is_copied_or_computed() {
     use TypeCode::{String as Str, F32, F64, I32, I64};
@@ -735,13 +736,19 @@ fn an_item_is_declared_by_whether_it_is_copied_or_computed() {
             "SELECT o.id, (SELECT COUNT(*) FROM d WHERE d.k = o.k) AS n FROM o",
             "n",
             I64,
-            true,
+            false,
+        ),
+        (
+            "SELECT o.id, EXISTS (SELECT 1 FROM d WHERE d.k = o.k) AS e FROM o",
+            "e",
+            I64,
+            false,
         ),
         (
             "SELECT id, COALESCE(MIN(w) OVER (PARTITION BY k), 0) AS m FROM d",
             "m",
             I32,
-            true,
+            false,
         ),
         ("SELECT id, MIN(w) OVER (PARTITION BY k) AS m FROM d", "m", I32, false),
         // The raw count is NOT NULL, and COALESCE over it is that column.

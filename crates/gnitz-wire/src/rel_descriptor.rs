@@ -54,7 +54,7 @@ pub struct RelIndex {
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct RelDescriptorBlob {
     pub class: RelClass,
-    /// Whether two rows may share a PK.
+    /// Whether two rows may share a PK, or one may stand at weight above 1.
     pub pk_repeats: bool,
     /// [`crate::TableProps::serial`].
     pub serial: bool,

@@ -392,17 +392,6 @@ pub(crate) fn window_spec_keys(spec: &sqlparser::ast::WindowSpec) -> impl Iterat
     spec.partition_by.iter().chain(spec.order_by.iter().map(|o| &o.expr))
 }
 
-/// Whether a SELECT carries a window call (`… OVER (…)`) in its projection or
-/// its QUALIFY — the routing test for the windowed SELECT list.
-pub(crate) fn select_has_window(select: &sqlparser::ast::Select) -> bool {
-    select_exprs(select).any(|e| {
-        expr_any(
-            e,
-            &|e| matches!(e, sqlparser::ast::Expr::Function(f) if f.over.is_some()),
-        )
-    })
-}
-
 /// Strip redundant parentheses.
 pub(crate) fn peel_nested(e: &sqlparser::ast::Expr) -> &sqlparser::ast::Expr {
     let mut cur = e;
@@ -516,8 +505,7 @@ pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Ex
                 _ => Vec::new(),
             };
             if let Some(WindowType::WindowSpec(spec)) = &f.over {
-                ops.extend(spec.partition_by.iter());
-                ops.extend(spec.order_by.iter().map(|o| &o.expr));
+                ops.extend(window_spec_keys(spec));
             }
             ops
         }
@@ -558,10 +546,10 @@ pub(crate) fn scalar_projection_item<'a>(
     }
 }
 
-/// The expression surfaces subquery and window detection scan — a SELECT's
+/// The expression surfaces subquery detection scans — a SELECT's
 /// WHERE, its projection items (a wildcard contributes none) and its QUALIFY.
 /// The one definition of "which surfaces decide detection", shared by the
-/// EXISTS/IN, scalar/ANY/ALL and window detectors.
+/// EXISTS/IN and scalar/ANY/ALL detectors.
 fn select_exprs(select: &sqlparser::ast::Select) -> impl Iterator<Item = &sqlparser::ast::Expr> {
     select
         .selection

@@ -146,7 +146,8 @@ impl SegSource {
         }
     }
 
-    /// Whether two of the source's rows may share its leading key.
+    /// Whether two of the source's rows may share its leading key, or one may stand
+    /// at weight above 1.
     pub(crate) fn pk_repeats(&self) -> bool {
         match self {
             SegSource::Catalog(d) => d.pk_repeats,

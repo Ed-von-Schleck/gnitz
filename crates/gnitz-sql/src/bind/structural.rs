@@ -68,12 +68,12 @@ pub(crate) trait LeafBinder<R> {
     /// type — the two facts a leaf owns that [`nullness`] folds a test by.
     fn is_nullable(&self, r: &R) -> bool;
     fn type_of(&self, r: &R) -> ColType;
-    /// A windowed call (`f(…) OVER (…)`). Only a view body's windowed SELECT
-    /// list and QUALIFY admit one; every other context keeps this rejection.
+    /// A windowed call (`f(…) OVER (…)`). Only a view body's SELECT list, QUALIFY
+    /// and ORDER BY admit one; every other context keeps this rejection.
     fn bind_window(&self, _f: &Function) -> Result<BExpr<R>, GnitzSqlError> {
         Err(GnitzSqlError::Rejected(
-            "window functions (OVER) are only supported in the SELECT list and QUALIFY of a CREATE VIEW \
-             body, and cannot be nested in another window function's operands"
+            "window functions (OVER) are only supported in the SELECT list, QUALIFY and ORDER BY of a \
+             CREATE VIEW body, and cannot be nested in another window function's operands"
                 .into(),
         ))
     }

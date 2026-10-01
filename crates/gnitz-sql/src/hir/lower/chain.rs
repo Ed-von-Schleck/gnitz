@@ -17,7 +17,8 @@ pub(crate) struct EmitPieces {
     pub circuit: Circuit,
     pub top: NodeId,
     pub out: Frame,
-    /// Whether two output rows may share the frame's leading key.
+    /// Whether two output rows may share the frame's leading key, or one may stand
+    /// at weight above 1.
     pub pk_repeats: bool,
 }
 

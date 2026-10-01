@@ -91,22 +91,30 @@ pub(crate) enum OrderTarget<'a> {
 /// placement (default NULLS LAST for ASC, FIRST for DESC).
 pub(crate) struct OrderKey<'a> {
     pub(crate) target: OrderTarget<'a>,
-    asc: bool,
-    nulls_first: bool,
+    pub(crate) desc: bool,
+    pub(crate) nulls_first: bool,
 }
 
 impl OrderKey<'_> {
-    /// Direction and absolute NULL placement, in the sense every consumer of a
-    /// resolved key uses: `desc` rather than `asc`. The one place the sense is
-    /// flipped, so an ad-hoc sink and a maintained window cannot disagree on it.
-    pub(crate) fn dir(&self) -> (bool, bool) {
-        (!self.asc, self.nulls_first)
-    }
-
     pub(crate) fn wire(&self, col: usize) -> gnitz_wire::OrderKey {
-        let (desc, nulls_first) = self.dir();
-        gnitz_wire::OrderKey { col: col as u16, desc, nulls_first }
+        gnitz_wire::OrderKey {
+            col: col as u16,
+            desc: self.desc,
+            nulls_first: self.nulls_first,
+        }
     }
+}
+
+/// One ORDER BY key: its expression, whether it descends, and its absolute NULL
+/// placement (default NULLS LAST ascending, FIRST descending). `clause` names the
+/// ORDER BY in the refusal.
+pub(crate) fn parse_order_key<'a>(obe: &'a OrderByExpr, clause: &str) -> Result<(&'a Expr, bool, bool), GnitzSqlError> {
+    // Exhaustive (no `..`): a dropped modifier is a wrong result.
+    let OrderByExpr { expr, options, with_fill } = obe;
+    reject_if(with_fill.is_some(), clause, "WITH FILL")?;
+    let OrderByOptions { asc, nulls_first } = options;
+    let desc = !asc.unwrap_or(true);
+    Ok((expr, desc, nulls_first.unwrap_or(desc)))
 }
 
 /// The expression keys of `keys`, in key order — the list a SELECT list's binder
@@ -147,7 +155,7 @@ pub(crate) fn parse_order_by(order_by: Option<&OrderBy>) -> Result<Vec<OrderKey<
 /// Parse the whole ORDER BY clause into resolved key specs, rejecting the
 /// unsupported ClickHouse/DuckDB extensions.
 fn resolve_order_by(ob: &OrderBy) -> Result<Vec<OrderKey<'_>>, GnitzSqlError> {
-    // Exhaustive (no `..`) at each of the three levels: a dropped ORDER BY
+    // Exhaustive (no `..`) here and in `parse_order_key`: a dropped ORDER BY
     // modifier is a wrong result, so a future `sqlparser` field stops the build.
     let OrderBy { kind, interpolate } = ob;
     reject_if(interpolate.is_some(), "ORDER BY", "INTERPOLATE")?;
@@ -157,15 +165,11 @@ fn resolve_order_by(ob: &OrderBy) -> Result<Vec<OrderKey<'_>>, GnitzSqlError> {
     };
     let mut keys = Vec::with_capacity(exprs.len());
     for obe in exprs {
-        let OrderByExpr { expr, options, with_fill } = obe;
-        reject_if(with_fill.is_some(), "ORDER BY", "WITH FILL")?;
-        let OrderByOptions { asc, nulls_first } = options;
-        let asc = asc.unwrap_or(true);
+        let (expr, desc, nulls_first) = parse_order_key(obe, "ORDER BY")?;
         keys.push(OrderKey {
             target: order_target(expr)?,
-            asc,
-            // Absolute default: ASC → NULLS LAST, DESC → NULLS FIRST.
-            nulls_first: nulls_first.unwrap_or(!asc),
+            desc,
+            nulls_first,
         });
     }
     Ok(keys)

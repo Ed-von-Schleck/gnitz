@@ -67,7 +67,8 @@ impl Node {
     }
 }
 
-/// [`base`] plus `m`, a second table with nullable join keys.
+/// [`base`] plus `m`, a second table with nullable join keys, and `rv`, a
+/// registered reduce view `(g, n)` keyed by its one group column.
 fn cat() -> Catalog<'static> {
     let cat = base();
     let i = TypeCode::I64;
@@ -75,6 +76,8 @@ fn cat() -> Catalog<'static> {
         "m",
         Some(table(30, vec![col("id", i), ncol("k", i), ncol("v", i)], vec![0])),
     );
+    let rv = view(&cat, "SELECT g, COUNT(*) AS n FROM t GROUP BY g");
+    register(&cat, "rv", 31, gnitz_wire::RelClass::View, final_view(&rv));
     cat
 }
 
@@ -194,6 +197,10 @@ const SHAPES: &[Row] = &[
     ("SELECT id, g FROM t EXCEPT SELECT id, g FROM u", 1, &[&[0], &[0]], &[(PositivePart, 1)]),
     ("SELECT g FROM t INTERSECT SELECT id FROM u", 1, &[&[0], &[0]], &[(PositivePart, 1)]),
     ("SELECT DISTINCT id, g FROM t", 1, &[], &[]),
+    // A view whose PK does not repeat is a set as a table is: a DISTINCT over its
+    // key is the input, and a null-fill against it subtracts without a clamp.
+    ("SELECT DISTINCT g, n FROM rv", 1, &[], &[]),
+    ("SELECT a.id AS aid, rv.n FROM a LEFT JOIN rv ON a.k = rv.g", 1, &[], &[(EquiJoin, 2), (NullExtend, 1)]),
     // A tree of directly nested set operations is one circuit, one exchange per
     // leaf; a UNION DISTINCT clamps once over all of its leaves.
     ("SELECT g FROM t UNION SELECT g FROM u UNION SELECT v FROM a", 1, &[&[0], &[0], &[0]], &[(Distinct, 1)]),
@@ -219,11 +226,16 @@ const SHAPES: &[Row] = &[
     ("SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM t", 2, &[&[1]], &[(EquiJoin, 2), (Reduce, 1)]),
     ("SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS s FROM t", 2, &[&[1]], &[(EquiJoin, 2), (Reduce, 1)]),
     ("SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v) AS s FROM t", 5, &[&[0, 1], &[1, 2], &[2, 3]], &[(EquiJoin, 2), (RangeJoin, 2), (Reduce, 2)]),
+    // An order key a whole-partition frame drops is not computed.
+    ("SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v + 1 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS s FROM t", 2, &[&[1]], &[(EquiJoin, 2), (Reduce, 1)]),
     // A QUALIFY bounding an unprojected ROW_NUMBER is a top-N per partition,
-    // with no band join; a projected one is the ranking desugar.
+    // with no band join — cutting the outer side of whatever else the body
+    // joins in; a projected one is the ranking desugar.
     ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) <= 2", 2, &[&[1]], &[(TopN, 1)]),
     ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) < 3", 2, &[&[1]], &[(TopN, 1)]),
-    ("SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t QUALIFY rn <= 2", 5, &[&[0, 1], &[1, 2, 0], &[2, 3, 4, 5]], &[(EquiJoin, 2), (RangeJoin, 2), (Reduce, 2), (Filter, 2)]),
+    ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) <= 2 AND v > 0", 2, &[&[1]], &[(TopN, 1), (Filter, 1)]),
+    ("SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) = 1", 3, &[&[1], &[2]], &[(TopN, 1), (EquiJoin, 2), (Reduce, 1)]),
+    ("SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t QUALIFY rn <= 2", 5, &[&[0, 1], &[1, 2, 0], &[2, 3, 4]], &[(EquiJoin, 2), (RangeJoin, 2), (Reduce, 2), (Filter, 2)]),
 ];
 
 #[test]

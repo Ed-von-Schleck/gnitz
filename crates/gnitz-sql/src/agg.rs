@@ -132,9 +132,7 @@ pub(crate) fn finalize_agg_bexpr<R>(value: BExpr<R>, count: Option<BExpr<R>>, fu
     }
 }
 
-/// AVG divides to F64; every other aggregate renders its raw value type. The one
-/// home for the rule, read by [`crate::hir::HirAgg::view_type`] and by the window
-/// desugar, which types a call before it has a `HirAgg` to ask.
+/// AVG divides to F64; every other aggregate renders its raw value type.
 pub(crate) fn agg_view_type(func: AggFunc, raw: ColType) -> ColType {
     if func == AggFunc::Avg {
         ColType::of(TypeCode::F64)

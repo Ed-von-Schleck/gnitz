@@ -528,10 +528,11 @@ ticked yet — a stream push exactly as a table's.
 ## Window functions
 
 A window call (`f(…) OVER (…)`, `QUALIFY`, `WINDOW`) desugars in the planner into
-operators that exist without it, and is legal only in a view body. Partition and
-order
-keys are join keys and carry the join-key rules; `ROW_NUMBER` is `RANK` over the
-ORDER BY extended by the input's row key, so it needs one.
+operators that exist without it, and is legal only in a view body. A QUALIFY bounding a
+`ROW_NUMBER` nothing else reads cuts each partition with a top-N. Every other window is
+keyed on its partition and order keys by joins: they carry the join-key rules and must
+be provably NOT NULL, and `ROW_NUMBER` there is numbered over the ORDER BY extended by
+the input's unique key, so the input must be a set with one.
 
 ## Delta feeds
 

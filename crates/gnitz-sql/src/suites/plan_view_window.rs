@@ -5,8 +5,8 @@
 use super::*;
 
 /// `t(id BIGINT PK, k BIGINT, a BIGINT, b BIGINT NULL, s TEXT, f DOUBLE)`,
-/// `u(uid BIGINT PK, k BIGINT)`, `st`, a stream with `t`'s columns, and `x(id
-/// BIGINT PK, a BIGINT, big UINT128)`.
+/// `u(uid BIGINT PK, k BIGINT)`, `st`, a stream with `t`'s columns, `x(id
+/// BIGINT PK, a BIGINT, big UINT128)` and `wk(big UINT128 PK, k BIGINT, a BIGINT)`.
 fn cat() -> Catalog<'static> {
     let i = TypeCode::I64;
     let t_cols = || {
@@ -27,6 +27,10 @@ fn cat() -> Catalog<'static> {
         (
             "x",
             table(4, vec![col("id", i), col("a", i), col("big", TypeCode::U128)], vec![0]),
+        ),
+        (
+            "wk",
+            table(5, vec![col("big", TypeCode::U128), col("k", i), col("a", i)], vec![0]),
         ),
     ])
 }
@@ -132,8 +136,78 @@ fn every_supported_window_shape_lowers() {
         "SELECT t.id, ROW_NUMBER() OVER (ORDER BY t.a) FROM t JOIN u ON t.k = u.uid",
         "SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM (SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k)) d",
         "SELECT a, ROW_NUMBER() OVER (ORDER BY a) FROM (SELECT id, a, k FROM t) d",
+        // Two calls one physical aggregate column serves, and a ROW_NUMBER beside
+        // an aggregate of its specification.
+        "SELECT id, COUNT(*) OVER (ORDER BY a), COUNT(a) OVER (ORDER BY a) FROM t",
+        "SELECT id, COUNT(*) OVER (ORDER BY a), COUNT(b) OVER (ORDER BY a), SUM(b) OVER (ORDER BY a) FROM t",
+        "SELECT id, RANK() OVER w AS r, AVG(a) OVER w AS av FROM t WINDOW w AS (ORDER BY a)",
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY id), COUNT(a) OVER (ORDER BY id) FROM t",
+        // A ranking function ignores its frame.
+        "SELECT id, RANK() OVER (PARTITION BY k ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t",
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY k ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t",
+        "SELECT id, RANK() OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+        // A key the partition or an earlier key fixes orders nothing.
+        "SELECT id, RANK() OVER (PARTITION BY k ORDER BY k) AS r, SUM(a) OVER (PARTITION BY k ORDER BY k) AS s FROM t",
+        "SELECT id, RANK() OVER (ORDER BY a, a) AS r, SUM(a) OVER (ORDER BY a, a) AS s FROM t",
+        "SELECT id, SUM(a) OVER (PARTITION BY k, k) AS s FROM t",
+        // A window call in ORDER BY alone, and one that is also an item.
+        "SELECT id FROM t ORDER BY RANK() OVER (ORDER BY a) LIMIT 3",
+        "SELECT id, RANK() OVER (ORDER BY a) AS r FROM t ORDER BY RANK() OVER (ORDER BY a) LIMIT 3",
+        "SELECT k, SUM(a) AS s FROM t GROUP BY k ORDER BY RANK() OVER (ORDER BY SUM(a)) LIMIT 3",
     ] {
         view(&cat, body);
+    }
+}
+
+/// A QUALIFY-bounded ROW_NUMBER nothing else reads is a top-N, which takes the
+/// keys a top-N takes: a nullable, string or float order key, a nullable
+/// partition, a 128-bit tiebreak, and an input with no unique key.
+#[test]
+fn a_bounded_row_number_takes_a_top_ns_keys() {
+    let cat = cat();
+    for over in [
+        "FROM t QUALIFY ROW_NUMBER() OVER (ORDER BY b) = 1",
+        "FROM t QUALIFY ROW_NUMBER() OVER (ORDER BY s) = 1",
+        "FROM t QUALIFY ROW_NUMBER() OVER (ORDER BY f) = 1",
+        "FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY b ORDER BY a NULLS FIRST) = 1",
+        "FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY s ORDER BY a DESC) <= 3",
+        "FROM wk QUALIFY ROW_NUMBER() OVER (PARTITION BY k ORDER BY a DESC) = 1",
+        "FROM t JOIN u ON t.k = u.k QUALIFY ROW_NUMBER() OVER (PARTITION BY u.uid ORDER BY t.a) = 1",
+        "FROM st QUALIFY ROW_NUMBER() OVER (PARTITION BY k ORDER BY a) = 1",
+        "FROM (SELECT a FROM t UNION ALL SELECT a FROM t) d QUALIFY ROW_NUMBER() OVER (ORDER BY a) <= 1",
+        // Any slot, not only the first.
+        "FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY k ORDER BY a) = 2",
+        // With no ORDER BY the unique key orders the partition; where the partition
+        // holds that key no order is left, and every row is numbered 1.
+        "FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY k) = 1",
+        "FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY id) <= 1",
+        // Beside another window, and beside another QUALIFY conjunct.
+        "FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY k ORDER BY a) <= 2 AND SUM(a) OVER (PARTITION BY k) > 10",
+        "FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY k ORDER BY a) <= 2 AND a > 0",
+    ] {
+        view(&cat, &format!("SELECT a {over}"));
+    }
+    for (body, needle) in [
+        (
+            "SELECT id FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY f ORDER BY a) = 1",
+            "window PARTITION BY: a float-valued expression",
+        ),
+        // No ORDER BY and no unique key: nothing orders the partition.
+        (
+            "SELECT id FROM st QUALIFY ROW_NUMBER() OVER (PARTITION BY k) = 1",
+            "ROW_NUMBER needs an input with a unique row key",
+        ),
+        // A selected number is a value, which the join-keyed shape computes.
+        (
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY b) AS rn FROM t QUALIFY rn = 1",
+            "window ORDER BY: the key must be provably NOT NULL",
+        ),
+        (
+            "SELECT big, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM wk QUALIFY rn = 1",
+            "ROW_NUMBER's tiebreak (the input's row key): a 128-bit key",
+        ),
+    ] {
+        assert_rejects(body, plan(&cat, &format!("CREATE VIEW v AS {body}")), needle);
     }
 }
 
@@ -222,11 +296,11 @@ fn every_unsupported_window_names_its_clause() {
         // A window call belongs to the SELECT list and QUALIFY only.
         (
             "SELECT id FROM t WHERE SUM(a) OVER () > 1",
-            "only supported in the SELECT list and QUALIFY",
+            "only supported in the SELECT list, QUALIFY and ORDER BY",
         ),
         (
             "SELECT k FROM t GROUP BY k HAVING RANK() OVER (ORDER BY k) = 1",
-            "only supported in the SELECT list and QUALIFY",
+            "only supported in the SELECT list, QUALIFY and ORDER BY",
         ),
         (
             "SELECT id, SUM(RANK() OVER (ORDER BY a)) OVER () FROM t",
@@ -261,16 +335,35 @@ fn every_unsupported_window_names_its_clause() {
             "SELECT a, ROW_NUMBER() OVER (ORDER BY a) FROM (SELECT a, k FROM t) d",
             "ROW_NUMBER needs an input with a unique row key",
         ),
+        // A bag holds a row at weight above 1, which no key numbers.
+        (
+            "SELECT a, ROW_NUMBER() OVER (ORDER BY a) FROM (SELECT a FROM t UNION ALL SELECT a FROM t) d",
+            "ROW_NUMBER needs an input with a unique row key",
+        ),
+        // QUALIFY names a SELECT alias only where the list has exactly one visible
+        // item of that name.
+        (
+            "SELECT * FROM t JOIN u ON t.k = u.k QUALIFY RANK() OVER (ORDER BY t.a) = 1 AND k > 0",
+            "ambiguous",
+        ),
+        (
+            "SELECT id, RANK() OVER (ORDER BY a) AS r FROM t QUALIFY _order0 > 1 ORDER BY a + 1 LIMIT 2",
+            "column '_order0' not found",
+        ),
+        (
+            "SELECT id, RANK() OVER w FROM t WINDOW w AS (ORDER BY a), w AS (ORDER BY k)",
+            "WINDOW clause defines 'w' twice",
+        ),
     ] {
         assert_rejects(body, plan(&cat, &format!("CREATE VIEW v AS {body}")), needle);
     }
 }
 
-/// `ROW_NUMBER` reads the row key off the relation, so a registered view whose
+/// `ROW_NUMBER` reads the unique key off the relation, so a registered view whose
 /// own lowering said its PK repeats loses it — over a stream, over a join key,
-/// or over a partition holding more than one slot — and no key column's *name*
-/// is read: a user may name one `_join_pk`, over a table or through a view's
-/// alias, and keep its row key.
+/// over a partition holding more than one slot, or over a `UNION ALL` — and no
+/// key column's *name* is read: a user may name one `_join_pk`, over a table or
+/// through a view's alias, and keep its unique key.
 #[test]
 fn row_number_reads_the_row_key_off_the_relation() {
     let cat = cat();
@@ -289,6 +382,8 @@ fn row_number_reads_the_row_key_off_the_relation() {
         (23, "pv", "SELECT id, a FROM t"),
         (24, "tv1", "SELECT id, a FROM t ORDER BY a LIMIT 1"),
         (25, "av", "SELECT id AS _join_pk, a FROM t"),
+        (26, "uv", "SELECT id, a FROM t UNION ALL SELECT uid, k FROM u"),
+        (27, "dv", "SELECT id, a FROM t UNION SELECT uid, k FROM u"),
     ] {
         let chain = view(&cat, body);
         register(&cat, name, tid, RelClass::View, final_view(&chain));
@@ -302,11 +397,16 @@ fn row_number_reads_the_row_key_off_the_relation() {
     for name in ["pv", "jt", "av"] {
         over(name).unwrap_or_else(|e| panic!("{name}: {e:?}"));
     }
-    for name in ["sv", "jv", "tv2"] {
+    for name in ["sv", "jv", "tv2", "uv"] {
         assert_rejects(name, over(name), "unique row key");
     }
-    // `tv1` keeps its row key, a hidden 128-bit `_group_pk` no later ORDER BY key
-    // can compare.
+    // `tv1` and `dv` keep their unique key, a hidden 128-bit column no later
+    // ORDER BY key can compare.
+    assert_rejects(
+        "dv",
+        over("dv"),
+        "ROW_NUMBER's tiebreak (the input's row key): a 128-bit key",
+    );
     assert_rejects(
         "tv1",
         over("tv1"),
