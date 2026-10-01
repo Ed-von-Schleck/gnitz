@@ -15,6 +15,7 @@ decisions are only real at W > 1.
 from collections import Counter
 
 from _read import bag, scanned
+from _sql import churn
 
 
 def _fold(vals):
@@ -31,15 +32,6 @@ def _groups(rows, key):
     for r in rows:
         out.setdefault(key(r), []).append(r)
     return out
-
-
-def _apply(rows, changes):
-    """Upsert `{pk: row}` into `rows`; a `None` row deletes the pk."""
-    for pk, row in changes.items():
-        if row is None:
-            del rows[pk]
-        else:
-            rows[pk] = row
 
 
 _LONG1, _LONG2 = "long-heap-backed-key-1", "long-heap-backed-key-2"
@@ -66,7 +58,7 @@ _GROUPED_CHURN = [
 ]
 
 
-def test_a_grouped_reduce_tracks_every_aggregate_through_churn(client, schema_name):
+def test_a_grouped_reduce_tracks_every_aggregate_through_churn(client):
     """COUNT/SUM/AVG/MIN/MAX over a NOT NULL and a nullable column after every
     epoch. The `lone_*` views carry no COUNT(*), so group existence rides on the
     hidden cardinality: an emptied group vanishes rather than surviving as a
@@ -75,7 +67,6 @@ def test_a_grouped_reduce_tracks_every_aggregate_through_churn(client, schema_na
     finalize map above the reduce, which must carry a TEXT key (inline and
     heap-backed) and a compound key through. A WHERE runs below the fold, so a
     group whose every row fails it never appears. `COUNT(ALL n)` is `COUNT(n)`."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, s TEXT NOT NULL, "
         "a BIGINT NOT NULL, n BIGINT); "
@@ -87,49 +78,46 @@ def test_a_grouped_reduce_tracks_every_aggregate_through_churn(client, schema_na
         "CREATE VIEW by_s AS SELECT s, AVG(a) AS aa, SUM(n) AS sn FROM t GROUP BY s; "
         "CREATE VIEW by_gs AS SELECT g, s, COUNT(*) AS c, AVG(a) AS aa FROM t GROUP BY g, s; "
         "CREATE VIEW filtered AS SELECT g, COUNT(*) AS c, SUM(a) AS sa FROM t "
-        "WHERE a > 100 GROUP BY g", schema_name=sn)
+        "WHERE a > 100 GROUP BY g")
 
     rows = {}
-    for sql, changes in _GROUPED_CHURN:
-        client.execute_sql(sql, schema_name=sn)
-        _apply(rows, changes)
+    for sql in churn(client, rows, _GROUPED_CHURN):
         by_g = {g: (len(rs), _fold(r[2] for r in rs), _fold(r[3] for r in rs))
                 for g, rs in _groups(rows.values(), lambda r: r[0]).items()}
 
-        assert bag(scanned(client, sn, "every"), "g", "c", "sa", "aa", "mina", "maxa", "cn",
+        assert bag(scanned(client, "every"), "g", "c", "sa", "aa", "mina", "maxa", "cn",
                    "can", "sn", "an", "minn", "maxn") == {
             (g, c, *fa[1:], fn[0], *fn): 1 for g, (c, fa, fn) in by_g.items()}, sql
         for f, i in (("count", 0), ("sum", 1), ("avg", 2), ("min", 3)):
-            assert bag(scanned(client, sn, f"lone_{f}"), "g", "m") == {
+            assert bag(scanned(client, f"lone_{f}"), "g", "m") == {
                 (g, fn[i]): 1 for g, (_, _, fn) in by_g.items()}, (sql, f)
-        assert bag(scanned(client, sn, "by_s"), "s", "aa", "sn") == {
+        assert bag(scanned(client, "by_s"), "s", "aa", "sn") == {
             (s, _fold(r[2] for r in rs)[2], _fold(r[3] for r in rs)[1]): 1
             for s, rs in _groups(rows.values(), lambda r: r[1]).items()}, sql
-        assert bag(scanned(client, sn, "by_gs"), "g", "s", "c", "aa") == {
+        assert bag(scanned(client, "by_gs"), "g", "s", "c", "aa") == {
             (g, s, len(rs), _fold(r[2] for r in rs)[2]): 1
             for (g, s), rs in _groups(rows.values(), lambda r: r[:2]).items()}, sql
-        assert bag(scanned(client, sn, "filtered"), "g", "c", "sa") == {
+        assert bag(scanned(client, "filtered"), "g", "c", "sa") == {
             (g, len(rs), sum(r[2] for r in rs)): 1
             for g, rs in _groups([r for r in rows.values() if r[2] > 100], lambda r: r[0]).items()}, sql
 
 
-def test_a_reduce_over_a_derived_delta_sees_only_net_changes(client, schema_name):
+def test_a_reduce_over_a_derived_delta_sees_only_net_changes(client):
     """Three reduce inputs that are another operator's output deltas: a DISTINCT,
     whose boundary crossings reach COUNT(*) once per pair, through duplicate
     carriers and a cross-group move; another reduce, whose emptied group must
     vanish rather than feed a phantom `(s=0, c=1)` downstream; and a fan-out join,
     where one join-output key spans several groups, so a group's extremes must
     never pull a neighbour's rows."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE e (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, k BIGINT NOT NULL); "
         "CREATE VIEW d AS SELECT DISTINCT g, k FROM e; "
         "CREATE VIEW dc AS SELECT g, COUNT(*) AS c FROM d GROUP BY g; "
         "CREATE VIEW iv AS SELECT g, SUM(k) AS s FROM e GROUP BY g; "
-        "CREATE VIEW ov AS SELECT s, COUNT(*) AS c FROM iv GROUP BY s", schema_name=sn)
+        "CREATE VIEW ov AS SELECT s, COUNT(*) AS c FROM iv GROUP BY s")
 
     rows = {}
-    for sql, changes in [
+    for sql in churn(client, rows, [
         ("INSERT INTO e VALUES (1, 1, 7), (2, 1, 7), (3, 1, 8), (4, 2, 9), (5, 2, 10)",
          {1: (1, 7), 2: (1, 7), 3: (1, 8), 4: (2, 9), 5: (2, 10)}),
         ("DELETE FROM e WHERE pk = 1", {1: None}),
@@ -139,13 +127,11 @@ def test_a_reduce_over_a_derived_delta_sees_only_net_changes(client, schema_name
         # One epoch retracting a pair from one group and inserting it into another.
         ("UPDATE e SET g = 1 WHERE pk = 4", {4: (1, 9)}),
         ("DELETE FROM e WHERE g = 2", {5: None, 6: None}),
-    ]:
-        client.execute_sql(sql, schema_name=sn)
-        _apply(rows, changes)
+    ]):
         by_g = _groups(rows.values(), lambda r: r[0])
-        assert bag(scanned(client, sn, "dc"), "g", "c") == {
+        assert bag(scanned(client, "dc"), "g", "c") == {
             (g, len({k for _, k in rs})): 1 for g, rs in by_g.items()}, sql
-        assert bag(scanned(client, sn, "ov"), "s", "c") == {
+        assert bag(scanned(client, "ov"), "s", "c") == {
             sc: 1 for sc in Counter(sum(k for _, k in rs) for rs in by_g.values()).items()}, sql
 
     client.execute_sql(
@@ -157,12 +143,12 @@ def test_a_reduce_over_a_derived_delta_sees_only_net_changes(client, schema_name
         "CREATE VIEW agg AS SELECT g, MIN(x) AS lo, MAX(y) AS hi, COUNT(*) AS c FROM j GROUP BY g; "
         "INSERT INTO fact VALUES (1), (2); "
         "INSERT INTO dim VALUES (1, 1, 10, 5, 100), (2, 1, 20, 7, 200), (3, 2, 10, 3, 50), "
-        "(4, 2, 20, 9, 300)", schema_name=sn)
-    assert bag(scanned(client, sn, "agg"), "g", "lo", "hi", "c") == {
+        "(4, 2, 20, 9, 300)")
+    assert bag(scanned(client, "agg"), "g", "lo", "hi", "c") == {
         (10, 3, 100, 2): 1, (20, 7, 300, 2): 1}
     # g=10's MIN holder goes: it recomputes to 5, never to g=20's smaller entry.
-    client.execute_sql("DELETE FROM dim WHERE did = 3", schema_name=sn)
-    assert bag(scanned(client, sn, "agg"), "g", "lo", "hi", "c") == {
+    client.execute_sql("DELETE FROM dim WHERE did = 3")
+    assert bag(scanned(client, "agg"), "g", "lo", "hi", "c") == {
         (10, 5, 100, 1): 1, (20, 7, 300, 2): 1}
 
 
@@ -195,7 +181,7 @@ _HAVING = {
 }
 
 
-def test_having_filters_groups_on_the_grouped_relation(client, schema_name):
+def test_having_filters_groups_on_the_grouped_relation(client):
     """HAVING is a full expression over the grouped relation: `Mul`, `NOT`, CASE
     and the `BETWEEN` desugar bind there, and an aggregate buried in one is
     materialised in the reduce though the SELECT list never names it. A NULL
@@ -205,7 +191,6 @@ def test_having_filters_groups_on_the_grouped_relation(client, schema_name):
     column's source name where SELECT aliases it; a null test on a PK group column
     folds at plan time, for a single-column and a compound key alike; and a
     SMALLINT MAX is read at its own width by both HAVING and the projection."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE h (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT, "
         "w SMALLINT NOT NULL); "
@@ -222,29 +207,29 @@ def test_having_filters_groups_on_the_grouped_relation(client, schema_name):
         "CREATE VIEW narrow AS SELECT k, MAX(w) AS m FROM h GROUP BY k HAVING MAX(w) > 1000; "
         "INSERT INTO h VALUES (1, 10, 5, 900), (2, 10, NULL, 1500), (3, 20, NULL, 30000), "
         "(4, 30, 0, 1000), (5, 40, 5, -32768), (6, 40, -5, 7); "
-        "INSERT INTO h2 VALUES (5, 6), (5, 7)", schema_name=sn)
+        "INSERT INTO h2 VALUES (5, 6), (5, 7)")
 
     counts = {10: 2, 20: 1, 30: 1, 40: 2}
     for step in (0, 1):
         if step:
-            client.execute_sql("DELETE FROM h WHERE pk = 1", schema_name=sn)
+            client.execute_sql("DELETE FROM h WHERE pk = 1")
             counts[10] = 1
         for i, (pred, admitted) in enumerate(_HAVING.items()):
-            assert bag(scanned(client, sn, f"p{i}"), "k", "c") == {
+            assert bag(scanned(client, f"p{i}"), "k", "c") == {
                 (k, counts[k]): 1 for k in admitted[step]}, (step, pred)
-        assert bag(scanned(client, sn, "unprojected_key"), "k", "c") == \
+        assert bag(scanned(client, "unprojected_key"), "k", "c") == \
             ({(10, 1): 1, (40, 1): 1} if step == 0 else {(40, 1): 1})
-        assert bag(scanned(client, sn, "aliased"), "x", "c") == {(30, 1): 1, (40, 2): 1}
-        assert bag(scanned(client, sn, "unprojected_agg"), "k") == \
+        assert bag(scanned(client, "aliased"), "x", "c") == {(30, 1): 1, (40, 2): 1}
+        assert bag(scanned(client, "unprojected_agg"), "k") == \
             ({(10,): 1, (40,): 1} if step == 0 else {(40,): 1})
-        assert bag(scanned(client, sn, "pk_null"), "pk", "c") == {}
-        assert bag(scanned(client, sn, "pk_not_null"), "pk", "c") == {
+        assert bag(scanned(client, "pk_null"), "pk", "c") == {}
+        assert bag(scanned(client, "pk_not_null"), "pk", "c") == {
             (pk, 1): 1 for pk in range(1 + step, 7)}
-        assert bag(scanned(client, sn, "compound_pk"), "a", "b", "c") == {(5, 6, 1): 1, (5, 7, 1): 1}
-        assert bag(scanned(client, sn, "narrow"), "k", "m") == {(10, 1500): 1, (20, 30000): 1}
+        assert bag(scanned(client, "compound_pk"), "a", "b", "c") == {(5, 6, 1): 1, (5, 7, 1): 1}
+        assert bag(scanned(client, "narrow"), "k", "m") == {(10, 1500): 1, (20, 30000): 1}
 
 
-def test_a_global_aggregate_is_one_row_over_any_source(client, schema_name):
+def test_a_global_aggregate_is_one_row_over_any_source(client):
     """No GROUP BY is one logical group, and SQL requires exactly one output row
     even over an empty or fully retracted source: the ground row supplies COUNT 0
     and every other aggregate NULL. MIN/MAX funnel every row onto one worker;
@@ -256,7 +241,6 @@ def test_a_global_aggregate_is_one_row_over_any_source(client, schema_name):
     where a derived table's projection is all that carries the column; and
     HAVING filters the ground row like any other,
     so `SUM(a) = 0` admits a genuine zero sum and never the ground's NULL."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, n BIGINT); "
         "CREATE VIEW funnel AS SELECT COUNT(*) AS c, SUM(a) AS sa, AVG(a) AS aa, MIN(a) AS lo, "
@@ -270,12 +254,11 @@ def test_a_global_aggregate_is_one_row_over_any_source(client, schema_name):
         "CREATE VIEW count_not_null AS SELECT COUNT(a) AS ca FROM (SELECT pk, a FROM t) d; "
         "CREATE VIEW computed AS SELECT COUNT(*) + 1 AS c, SUM(a * 2) AS s, 'x' AS lit FROM t; "
         "CREATE VIEW having_count AS SELECT COUNT(*) AS c FROM t HAVING COUNT(*) > 2; "
-        "CREATE VIEW having_zero AS SELECT SUM(a) AS s FROM t HAVING SUM(a) = 0",
-        schema_name=sn)
+        "CREATE VIEW having_zero AS SELECT SUM(a) AS s FROM t HAVING SUM(a) = 0")
 
     mixed = {pk: ((pk * 7) % 50, None if pk % 3 == 0 else pk) for pk in range(10, 50)}
     rows = {}
-    for sql, changes in [
+    for sql in churn(client, rows, [
         ("SELECT 1", {}),
         # A genuine zero sum, with `n` fresh and all NULL.
         ("INSERT INTO t VALUES (1, 5, NULL), (2, -5, NULL)", {1: (5, None), 2: (-5, None)}),
@@ -287,28 +270,26 @@ def test_a_global_aggregate_is_one_row_over_any_source(client, schema_name):
          {pk: None for pk in [1, *range(11, 50, 2)]}),
         ("DELETE FROM t", {pk: None for pk in [2, *range(10, 50, 2)]}),
         ("INSERT INTO t VALUES (99, 3, 4)", {99: (3, 4)}),
-    ]:
-        client.execute_sql(sql, schema_name=sn)
-        _apply(rows, changes)
+    ]):
         c = len(rows)
         _, sa, aa, lo, hi = _fold(a for a, _ in rows.values())
         fn = _fold(n for _, n in rows.values())
 
-        assert bag(scanned(client, sn, "funnel"), "c", "sa", "aa", "lo", "hi") == \
+        assert bag(scanned(client, "funnel"), "c", "sa", "aa", "lo", "hi") == \
             {(c, sa, aa, lo, hi): 1}, sql
-        assert bag(scanned(client, sn, "two_phase"), "c", "sa", "aa", "cn") == \
+        assert bag(scanned(client, "two_phase"), "c", "sa", "aa", "cn") == \
             {(c, sa, aa, fn[0]): 1}, sql
-        assert bag(scanned(client, sn, "nullable"), "cn", "sn", "an", "lo", "hi") == {fn: 1}, sql
-        assert bag(scanned(client, sn, "lone_count"), "cn") == {(fn[0],): 1}, sql
-        assert bag(scanned(client, sn, "lone_sum"), "sa") == {(sa,): 1}, sql
-        assert bag(scanned(client, sn, "count_not_null"), "ca") == {(c,): 1}, sql
-        assert bag(scanned(client, sn, "computed"), "c", "s", "lit") == \
+        assert bag(scanned(client, "nullable"), "cn", "sn", "an", "lo", "hi") == {fn: 1}, sql
+        assert bag(scanned(client, "lone_count"), "cn") == {(fn[0],): 1}, sql
+        assert bag(scanned(client, "lone_sum"), "sa") == {(sa,): 1}, sql
+        assert bag(scanned(client, "count_not_null"), "ca") == {(c,): 1}, sql
+        assert bag(scanned(client, "computed"), "c", "s", "lit") == \
             {(c + 1, None if sa is None else 2 * sa, "x"): 1}, sql
-        assert bag(scanned(client, sn, "having_count"), "c") == ({(c,): 1} if c > 2 else {}), sql
-        assert bag(scanned(client, sn, "having_zero"), "s") == ({(0,): 1} if sa == 0 else {}), sql
+        assert bag(scanned(client, "having_count"), "c") == ({(c,): 1} if c > 2 else {}), sql
+        assert bag(scanned(client, "having_zero"), "s") == ({(0,): 1} if sa == 0 else {}), sql
 
 
-def test_a_distinct_aggregate_is_distinct_composed_into_the_aggregate(client, schema_name):
+def test_a_distinct_aggregate_is_distinct_composed_into_the_aggregate(client):
     """`agg(DISTINCT x)` lowers to a plain aggregate over a hidden DISTINCT
     (group cols, x) segment, so it tracks the churn like its definition: NULL is
     not a distinct value, a group whose only value is NULL still exists, and a
@@ -316,7 +297,6 @@ def test_a_distinct_aggregate_is_distinct_composed_into_the_aggregate(client, sc
     one argument shares one segment, including in HAVING and over a computed
     argument or group key; `MIN`/`MAX(DISTINCT x)` is the plain aggregate, so it
     may keep company with a COUNT(*) and a second DISTINCT argument."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE ev (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, u BIGINT, "
         "s TEXT NOT NULL); "
@@ -328,10 +308,10 @@ def test_a_distinct_aggregate_is_distinct_composed_into_the_aggregate(client, sc
         "COUNT(DISTINCT u) AS n FROM ev WHERE k < 30 GROUP BY k; "
         "CREATE VIEW computed AS SELECT COUNT(DISTINCT u % 2) AS n FROM ev GROUP BY k * 2; "
         "CREATE VIEW plain AS SELECT k, MAX(DISTINCT u) AS mu, MIN(DISTINCT pk) AS lo, "
-        "COUNT(*) AS c FROM ev GROUP BY k", schema_name=sn)
+        "COUNT(*) AS c FROM ev GROUP BY k")
 
     rows = {}
-    for sql, changes in [
+    for sql in churn(client, rows, [
         ("INSERT INTO ev VALUES (1, 10, 7, 'a'), (2, 10, 7, 'b'), (3, 10, 8, 'a'), "
          "(4, 20, 7, 'a'), (5, 20, NULL, 'a'), (6, 30, NULL, 'c')",
          {1: (10, 7, "a"), 2: (10, 7, "b"), 3: (10, 8, "a"), 4: (20, 7, "a"),
@@ -341,30 +321,28 @@ def test_a_distinct_aggregate_is_distinct_composed_into_the_aggregate(client, sc
         ("UPDATE ev SET k = 10 WHERE pk = 4", {4: (10, 7, "a")}),
         ("INSERT INTO ev VALUES (7, 20, 1, 'z')", {7: (20, 1, "z")}),
         ("DELETE FROM ev WHERE pk = 6", {6: None}),
-    ]:
-        client.execute_sql(sql, schema_name=sn)
-        _apply(rows, changes)
+    ]):
         by_k = {k: (rs, {r[1] for r in rs} - {None})
                 for k, rs in _groups(rows.values(), lambda r: r[0]).items()}
 
-        assert bag(scanned(client, sn, "per_k"), "k", "n") == {
+        assert bag(scanned(client, "per_k"), "k", "n") == {
             (k, len(us)): 1 for k, (_, us) in by_k.items()}, sql
-        assert bag(scanned(client, sn, "overall"), "n") == {
+        assert bag(scanned(client, "overall"), "n") == {
             (len({r[2] for r in rows.values()}),): 1}, sql
-        assert bag(scanned(client, sn, "in_having"), "k", "n") == {
+        assert bag(scanned(client, "in_having"), "k", "n") == {
             (k, len({r[2] for r in rs})): 1 for k, (rs, _) in by_k.items()
             if len({r[2] for r in rs}) > 1}, sql
-        assert bag(scanned(client, sn, "shared"), "k", "su", "mu", "n") == {
+        assert bag(scanned(client, "shared"), "k", "su", "mu", "n") == {
             (k, sum(us) if us else None, max(us, default=None), len(us)): 1
             for k, (_, us) in by_k.items() if k < 30}, sql
-        assert bag(scanned(client, sn, "computed"), "n") == Counter(
+        assert bag(scanned(client, "computed"), "n") == Counter(
             (len({u % 2 for u in us}),) for _, us in by_k.values()), sql
-        assert bag(scanned(client, sn, "plain"), "k", "mu", "lo", "c") == {
+        assert bag(scanned(client, "plain"), "k", "mu", "lo", "c") == {
             (k, max(us, default=None), min(pk for pk, r in rows.items() if r[0] == k), len(rs)): 1
             for k, (rs, us) in by_k.items()}, sql
 
 
-def test_a_compound_group_key_is_emitted_in_source_key_order(client, schema_name):
+def test_a_compound_group_key_is_emitted_in_source_key_order(client):
     """The grouping *list* is not the output key order: a reduce over a whole
     compound source key emits it in the key's declared order, whatever order the
     GROUP BY named its columns — `ka` must carry `a`'s values, not `b`'s. HAVING
@@ -372,7 +350,6 @@ def test_a_compound_group_key_is_emitted_in_source_key_order(client, schema_name
     selects a different pair than one on the trailing column would. The
     four-column key is the widest a reduce carries, and a singleton group's
     retraction takes its extremes with it."""
-    sn = schema_name
     quads = [(1, 1, 1, 1, 10), (1, 1, 1, 2, 20), (1, 2, 3, 4, 30), (2, 1, 1, 1, 40)]
     client.execute_sql(
         "CREATE TABLE t2 (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL, "
@@ -385,15 +362,15 @@ def test_a_compound_group_key_is_emitted_in_source_key_order(client, schema_name
         "CREATE VIEW g4 AS SELECT a, b, c, d, COUNT(*) AS n, MIN(v) AS lo, MAX(v) AS hi "
         "FROM t4 GROUP BY a, b, c, d; "
         "INSERT INTO t2 VALUES (1, 7, 100), (2, 8, 200), (3, 1, 300); "
-        f"INSERT INTO t4 VALUES {', '.join(map(str, quads))}", schema_name=sn)
+        f"INSERT INTO t4 VALUES {', '.join(map(str, quads))}")
 
-    assert bag(scanned(client, sn, "perm"), "ka", "kb", "s") == {
+    assert bag(scanned(client, "perm"), "ka", "kb", "s") == {
         (1, 7, 100): 1, (2, 8, 200): 1, (3, 1, 300): 1}
     # A `b > 1` mis-binding would keep (1,7) and (2,8) instead.
-    assert bag(scanned(client, sn, "hav"), "ka", "kb", "s") == {(2, 8, 200): 1, (3, 1, 300): 1}
+    assert bag(scanned(client, "hav"), "ka", "kb", "s") == {(2, 8, 200): 1, (3, 1, 300): 1}
 
     cols = ("a", "b", "c", "d", "n", "lo", "hi")
-    assert bag(scanned(client, sn, "g4"), *cols) == {(*q[:4], 1, q[4], q[4]): 1 for q in quads}
-    client.execute_sql("DELETE FROM t4 WHERE a = 1 AND b = 1 AND c = 1 AND d = 2", schema_name=sn)
-    assert bag(scanned(client, sn, "g4"), *cols) == {
+    assert bag(scanned(client, "g4"), *cols) == {(*q[:4], 1, q[4], q[4]): 1 for q in quads}
+    client.execute_sql("DELETE FROM t4 WHERE a = 1 AND b = 1 AND c = 1 AND d = 2")
+    assert bag(scanned(client, "g4"), *cols) == {
         (*q[:4], 1, q[4], q[4]): 1 for q in quads if q[3] != 2}

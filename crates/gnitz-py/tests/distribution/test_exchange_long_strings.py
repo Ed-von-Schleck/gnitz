@@ -15,8 +15,6 @@ from _sql import insert
 
 pytestmark = NEEDS_MULTI
 
-_SMALL_OUTBOX_ENV = {"GNITZ_MESH_OUTBOX_BYTES": "8192"}
-
 _T = [(i, i % 400, f"row-{i}-" + "z" * 200) for i in range(800)]   # (pk, k, body)
 _U = [(i, i * 3) for i in range(400)]                               # (id, b)
 
@@ -30,55 +28,30 @@ _EXPECTED = {
 }
 
 
-def _create_tables(client, sn):
+def _exchange(client, views_first):
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, body TEXT NOT NULL); "
-        "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, b BIGINT NOT NULL)",
-        schema_name=sn)
-
-
-def _create_views(client, sn):
-    for name, body in _VIEWS.items():
-        client.execute_sql(f"CREATE VIEW {name} AS {body}", schema_name=sn)
-
-
-def _fill(client, sn):
-    insert(client, sn, "t", _T)
-    insert(client, sn, "u", _U)
-
-
-def _assert_views(client, sn):
+        "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, b BIGINT NOT NULL)")
+    views = "; ".join(f"CREATE VIEW {name} AS {body}" for name, body in _VIEWS.items())
+    if views_first:
+        client.execute_sql(views)
+    insert(client, "t", _T)
+    insert(client, "u", _U)
+    if not views_first:
+        client.execute_sql(views)
     for name, expected in _EXPECTED.items():
-        assert bag(rows(client, sn, f"SELECT * FROM {name}")) == expected, name
+        assert bag(rows(client, f"SELECT * FROM {name}")) == expected, name
 
 
-def test_a_tick_exchanges_long_string_rows(client, schema_name):
-    sn = schema_name
-    _create_tables(client, sn)
-    _create_views(client, sn)
-    _fill(client, sn)
-    _assert_views(client, sn)
+_EACH_PATH = pytest.mark.parametrize("views_first", [True, False], ids=["tick", "backfill"])
 
 
-def test_a_backfill_exchanges_long_string_rows(client, schema_name):
-    sn = schema_name
-    _create_tables(client, sn)
-    _fill(client, sn)
-    _create_views(client, sn)
-    _assert_views(client, sn)
+@_EACH_PATH
+def test_a_round_exchanges_long_string_rows(client, views_first):
+    _exchange(client, views_first)
 
 
-@pytest.mark.parametrize("views_first", [True, False], ids=["tick", "backfill"])
+@_EACH_PATH
 def test_long_string_rounds_span_many_parts(own_server, views_first):
-    own_server.start(extra_env=_SMALL_OUTBOX_ENV)
-    with gnitz.connect(own_server.sock_path) as client:
-        sn = "parts"
-        client.create_schema(sn)
-        _create_tables(client, sn)
-        if views_first:
-            _create_views(client, sn)
-            _fill(client, sn)
-        else:
-            _fill(client, sn)
-            _create_views(client, sn)
-        _assert_views(client, sn)
+    own_server.start(extra_env={"GNITZ_MESH_OUTBOX_BYTES": "8192"})
+    _exchange(gnitz.connect(own_server.target), views_first)

@@ -32,12 +32,12 @@ def _sz(scale_mode):
 # atomic_multitable — native atomic multi-table commit throughput
 # ---------------------------------------------------------------------------
 
-def _atomic_worker(socket_path, sn, k_lines, ops, widx, barrier, queue):
+def _atomic_worker(socket_path, schema, k_lines, ops, widx, barrier, queue):
     commits = conflicts = 0
     lat = []
-    with gnitz.connect(socket_path) as c:
-        o_tid, o_sch = c.resolve_table(sn, "orders")
-        l_tid, l_sch = c.resolve_table(sn, "lineitem")
+    with gnitz.connect(socket_path, schema=schema) as c:
+        o_tid, o_sch = c.resolve_table("orders")
+        l_tid, l_sch = c.resolve_table("lineitem")
         base = widx * ops + 1  # disjoint order-key range per writer
         barrier.wait()
         t0 = time.perf_counter()
@@ -61,15 +61,15 @@ def _atomic_worker(socket_path, sn, k_lines, ops, widx, barrier, queue):
     queue.put({"commits": commits, "conflicts": conflicts, "latencies_ms": lat, "elapsed_s": elapsed})
 
 
-def test_atomic_multitable(client, socket_path, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, _sz(scale_mode)
+def test_atomic_multitable(client, socket_path, bench_timer, scale_mode):
+    sz = _sz(scale_mode)
     client.execute_sql("CREATE TABLE orders (o_key BIGINT NOT NULL PRIMARY KEY, "
-                       "o_cust BIGINT NOT NULL, o_amt BIGINT NOT NULL)", schema_name=sn)
+                       "o_cust BIGINT NOT NULL, o_amt BIGINT NOT NULL)")
     client.execute_sql("CREATE TABLE lineitem (l_order BIGINT NOT NULL, l_line BIGINT NOT NULL, "
-                       "l_qty BIGINT NOT NULL, PRIMARY KEY (l_order, l_line))", schema_name=sn)
+                       "l_qty BIGINT NOT NULL, PRIMARY KEY (l_order, l_line))")
 
     ops, k = sz["ops"], sz["K_lines"]
-    parts = run_pool([(_atomic_worker, (socket_path, sn, k, ops, w)) for w in range(POOL)])
+    parts = run_pool([(_atomic_worker, (socket_path, client.schema, k, ops, w)) for w in range(POOL)])
 
     commits = sum(p["commits"] for p in parts)
     lat = [x for p in parts for x in p["latencies_ms"]]
@@ -79,25 +79,24 @@ def test_atomic_multitable(client, socket_path, schema_name, bench_timer, scale_
     bench_timer.extra.update(txns_per_sec=round(commits / elapsed, 1) if elapsed else 0.0,
                              conflicts=sum(p["conflicts"] for p in parts), commits=commits)
     assert commits > 0
-    assert len(client.scan(*client.resolve_table(sn, "orders"))) > 0
+    assert len(client.scan(*client.resolve_table("orders"))) > 0
 
 
 # ---------------------------------------------------------------------------
 # ryow_overlay — multi-statement SQL transaction with compounding UPDATEs
 # ---------------------------------------------------------------------------
 
-def test_ryow_overlay(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, _sz(scale_mode)
-    client.execute_sql("CREATE TABLE acc (pk BIGINT NOT NULL PRIMARY KEY, bal BIGINT NOT NULL)",
-                       schema_name=sn)
-    client.execute_sql("INSERT INTO acc VALUES (1, 1000000000)", schema_name=sn)
+def test_ryow_overlay(client, bench_timer, scale_mode):
+    sz = _sz(scale_mode)
+    client.execute_sql("CREATE TABLE acc (pk BIGINT NOT NULL PRIMARY KEY, bal BIGINT NOT NULL)")
+    client.execute_sql("INSERT INTO acc VALUES (1, 1000000000)")
     m = sz["K_lines"] * 2  # UPDATEs per transaction
 
     def txn_block():
-        client.execute_sql("BEGIN", schema_name=sn)
+        client.execute_sql("BEGIN")
         for _ in range(m):
-            client.execute_sql("UPDATE acc SET bal = bal - 1 WHERE pk = 1", schema_name=sn)
-        client.execute_sql("COMMIT", schema_name=sn)
+            client.execute_sql("UPDATE acc SET bal = bal - 1 WHERE pk = 1")
+        client.execute_sql("COMMIT")
 
     iters = min(sz["ops"], 300)
     for _ in range(iters):
@@ -108,7 +107,7 @@ def test_ryow_overlay(client, schema_name, bench_timer, scale_mode):
     t0 = time.perf_counter()
     for _ in range(base_iters):
         for _ in range(m):
-            client.execute_sql("UPDATE acc SET bal = bal - 1 WHERE pk = 1", schema_name=sn)
+            client.execute_sql("UPDATE acc SET bal = bal - 1 WHERE pk = 1")
     autocommit_ms = (time.perf_counter() - t0) / base_iters * 1000.0
     bench_timer.extra.update(autocommit_ms=round(autocommit_ms, 3), updates_per_txn=m)
 
@@ -118,11 +117,10 @@ def test_ryow_overlay(client, schema_name, bench_timer, scale_mode):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("variant", ["empty_begin_commit", "one_write_txn", "autocommit_push"])
-def test_begin_commit_overhead(client, schema_name, bench_timer, scale_mode, variant):
-    sn, sz = schema_name, _sz(scale_mode)
-    client.execute_sql("CREATE TABLE kv (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-                       schema_name=sn)
-    tid, schema = client.resolve_table(sn, "kv")
+def test_begin_commit_overhead(client, bench_timer, scale_mode, variant):
+    sz = _sz(scale_mode)
+    client.execute_sql("CREATE TABLE kv (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
+    tid, schema = client.resolve_table("kv")
     iters = min(sz["ops"], 500)
 
     def one_row_batch(pk):
@@ -132,8 +130,8 @@ def test_begin_commit_overhead(client, schema_name, bench_timer, scale_mode, var
 
     if variant == "empty_begin_commit":
         def op(_i):
-            client.execute_sql("BEGIN", schema_name=sn)
-            client.execute_sql("COMMIT", schema_name=sn)
+            client.execute_sql("BEGIN")
+            client.execute_sql("COMMIT")
     elif variant == "one_write_txn":
         def op(i):
             with client.transaction() as txn:

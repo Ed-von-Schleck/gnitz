@@ -17,6 +17,7 @@ cap.
 from collections import Counter
 
 from _read import bag, scanned
+from _sql import churn
 
 # (statement, table, {id: row}); a `None` row deletes the id. Rows are
 # a: (k, v, p, dead), b: (k, v, q), c: (k, v).
@@ -39,7 +40,7 @@ _CHURN = [
 ]
 
 
-def test_a_chain_resolves_every_relation_below_each_step(client, schema_name):
+def test_a_chain_resolves_every_relation_below_each_step(client):
     """A hand-written segment and the direct form compile to one chain. A later
     ON may key on a column deep in the accumulator, and a WHERE over the whole
     chain lands at the step whose inputs it names. A CTE alias list lines up with
@@ -50,7 +51,6 @@ def test_a_chain_resolves_every_relation_below_each_step(client, schema_name):
     preserved row retracts its fill. A range step composes with the equi segment
     below it, and a residual reading columns nothing projects keeps them alive
     while an unread column's update leaves the result alone."""
-    sn = schema_name
     ab = "FROM a JOIN b ON a.k = b.id"
     client.execute_sql(
         "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL, "
@@ -72,45 +72,37 @@ def test_a_chain_resolves_every_relation_below_each_step(client, schema_name):
         "FROM a FULL JOIN b ON a.k = b.id JOIN c ON a.k = c.id; "
         f"CREATE VIEW range_step AS SELECT a.id AS aid, c.id AS cid {ab} JOIN c ON a.v < c.k; "
         "CREATE VIEW residual AS SELECT a.id AS aid, c.v AS cv "
-        "FROM a JOIN b ON a.k = b.id AND a.p > b.q JOIN c ON a.v = c.id",
-        schema_name=sn)
+        "FROM a JOIN b ON a.k = b.id AND a.p > b.q JOIN c ON a.v = c.id")
 
     state = {"a": {}, "b": {}, "c": {}}
-    for sql, table, changes in _CHURN:
-        client.execute_sql(sql, schema_name=sn)
-        for i, row in changes.items():
-            if row is None:
-                del state[table][i]
-            else:
-                state[table][i] = row
+    for sql in churn(client, state, _CHURN):
         a, b, c = state["a"], state["b"], state["c"]
         via_b = {i: b[k] for i, (k, *_) in a.items() if k in b}
 
         direct = Counter((i, c[bk][1]) for i, (bk, *_) in via_b.items() if bk in c)
         for name in ("direct", "nested_cte"):
-            assert bag(scanned(client, sn, name), "aid", "cv") == direct, (sql, name)
-        assert bag(scanned(client, sn, "aliased"), "x") == Counter((i,) for i, _ in direct), sql
-        assert bag(scanned(client, sn, "deep"), "av", "bv", "cv") == Counter(
+            assert bag(scanned(client, name), "aid", "cv") == direct, (sql, name)
+        assert bag(scanned(client, "aliased"), "x") == Counter((i,) for i, _ in direct), sql
+        assert bag(scanned(client, "deep"), "av", "bv", "cv") == Counter(
             (a[i][1], bv, c[a[i][1]][1]) for i, (_, bv, _) in via_b.items()
             if a[i][1] in c and c[a[i][1]][1] > 50), sql
-        assert bag(scanned(client, sn, "first_left"), "aid", "bid", "cv") == Counter(
+        assert bag(scanned(client, "first_left"), "aid", "bid", "cv") == Counter(
             (i, k if k in b else None, c[v][1]) for i, (k, v, *_) in a.items() if v in c), sql
-        assert bag(scanned(client, sn, "last_left"), "aid", "cid") == Counter(
+        assert bag(scanned(client, "last_left"), "aid", "cid") == Counter(
             (i, bk if bk in c else None) for i, (bk, *_) in via_b.items()), sql
-        assert bag(scanned(client, sn, "full_mid"), "ak", "bv", "cv") == Counter(
+        assert bag(scanned(client, "full_mid"), "ak", "bv", "cv") == Counter(
             (k, b[k][1] if k in b else None, c[k][1]) for k, *_ in a.values() if k in c), sql
-        assert bag(scanned(client, sn, "range_step"), "aid", "cid") == Counter(
+        assert bag(scanned(client, "range_step"), "aid", "cid") == Counter(
             (i, ci) for i in via_b for ci, (ck, _) in c.items() if a[i][1] < ck), sql
-        assert bag(scanned(client, sn, "residual"), "aid", "cv") == Counter(
+        assert bag(scanned(client, "residual"), "aid", "cv") == Counter(
             (i, c[a[i][1]][1]) for i, (_, _, q) in via_b.items() if a[i][2] > q and a[i][1] in c), sql
 
 
-def test_a_deep_or_wide_chain_compiles_and_maintains(client, schema_name):
+def test_a_deep_or_wide_chain_compiles_and_maintains(client):
     """Seven hidden segments stacked: the decomposition is not depth-limited.
     And four 18-column tables under a two-column SELECT: carrying every source
     column forward would put the last segment at 1 + 55 + 18 = 74 columns, over
     the 65-column cap, so pruning to live columns is what lets it compile."""
-    sn = schema_name
     n = 8
     pads = ", ".join(f"p{i} BIGINT NOT NULL" for i in range(16))
     zeros = ", ".join("0" for _ in range(16))
@@ -125,14 +117,12 @@ def test_a_deep_or_wide_chain_compiles_and_maintains(client, schema_name):
         "JOIN wc ON wb.k2 = wc.id JOIN wd ON wc.k3 = wd.id; "
         + "; ".join(f"INSERT INTO t{i} VALUES (1, {1 if i < n - 1 else 0}, {100 + i})" for i in range(n))
         + f"; INSERT INTO wd VALUES (30, 42, {zeros}); INSERT INTO wc VALUES (20, 30, {zeros}); "
-        f"INSERT INTO wb VALUES (10, 20, {zeros}); INSERT INTO wa VALUES (1, 10, {zeros})",
-        schema_name=sn)
-    assert bag(scanned(client, sn, "deep"), "x", "y") == {(1, 100 + n - 1): 1}
-    assert bag(scanned(client, sn, "wide"), "aid", "dval") == {(1, 42): 1}
+        f"INSERT INTO wb VALUES (10, 20, {zeros}); INSERT INTO wa VALUES (1, 10, {zeros})")
+    assert bag(scanned(client, "deep"), "x", "y") == {(1, 100 + n - 1): 1}
+    assert bag(scanned(client, "wide"), "aid", "dval") == {(1, 42): 1}
 
-    client.execute_sql("DELETE FROM wc WHERE id = 20; DELETE FROM t3 WHERE id = 1", schema_name=sn)
-    assert bag(scanned(client, sn, "wide"), "aid", "dval") == {}
-    assert bag(scanned(client, sn, "deep"), "x", "y") == {}
-    client.execute_sql(f"INSERT INTO wc VALUES (20, 30, {zeros}); UPDATE wd SET val = 99 WHERE id = 30",
-                       schema_name=sn)
-    assert bag(scanned(client, sn, "wide"), "aid", "dval") == {(1, 99): 1}
+    client.execute_sql("DELETE FROM wc WHERE id = 20; DELETE FROM t3 WHERE id = 1")
+    assert bag(scanned(client, "wide"), "aid", "dval") == {}
+    assert bag(scanned(client, "deep"), "x", "y") == {}
+    client.execute_sql(f"INSERT INTO wc VALUES (20, 30, {zeros}); UPDATE wd SET val = 99 WHERE id = 30")
+    assert bag(scanned(client, "wide"), "aid", "dval") == {(1, 99): 1}

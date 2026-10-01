@@ -1,35 +1,31 @@
-"""The mirroring-client bodies that have to run in an interpreter of their own.
+"""The mirroring-client bodies that have to run in an interpreter of their own
+(see `_childproc`): `python -m _mirrorchild <case> <copy dir> <target> <schema>`.
 
-Real module rather than a source string passed to `python -c`: these are sixty
-lines of assertions, and inside a literal they are invisible to linting and
-formatting and a typo surfaces only as a missing sentinel.
-
-Each case reads `MIRROR_TARGET`, `MIRROR_DIR` and `MIRROR_SCHEMA` from its
-environment; a failed assertion, a `SystemExit` with a message and a Rust abort
-all exit non-zero.
+A failed assertion, a `SystemExit` with a message and a Rust abort all exit
+non-zero.
 """
-import os
 import sys
 import time
 
 import gnitz
-from _read import rows, scanned
-
-READY = "MIRROR-CHILD-READY"
-
-
-def _env():
-    return os.environ["MIRROR_DIR"], os.environ["MIRROR_TARGET"], os.environ["MIRROR_SCHEMA"]
+from _childproc import READY
+from _feedviews import churn
+from _read import bag, rows, scanned
 
 
-def erase():
+def _delegated(m, plain, q):
+    """A read the copy cannot answer is delegated, and answers what the server does."""
+    got = bag(rows(m, q))
+    assert got and got == bag(rows(plain, q)), q
+
+
+def erase(base, target, sn):
     """An armed ingest seam erases the copy it was applying to; the store and the
     process both live on."""
-    base, target, sn = _env()
-    m = gnitz.connect(target)
+    m, plain = gnitz.connect(target, schema=sn), gnitz.connect(target, schema=sn)
     m.mirror_at(base)
     try:
-        m.mirror_view(sn, "f")
+        m.mirror_view("f")
         raise SystemExit("the armed seam must fail the bootstrap ingest")
     except gnitz.GnitzMirrorPoisonedError:
         raise SystemExit("one copy's fault must not poison the store")
@@ -45,36 +41,32 @@ def erase():
     # one is delegated rather than refused.
     [vid] = m.mirrored_ids()
     assert m.mirrors(vid) is False
-    assert rows(m, sn, "SELECT * FROM f"), "a read the copy cannot answer is delegated"
-    assert scanned(m, sn, "f"), "and so is a scan of it"
-    assert rows(m, sn, "SELECT * FROM t")
+    _delegated(m, plain, "SELECT * FROM f")
+    assert bag(scanned(m, "f")) == bag(scanned(plain, "f")), "and so is a scan of it"
+    _delegated(m, plain, "SELECT * FROM t")
 
     # The copy goes, the directory is released, and the client can attach again;
     # reopening `base` from a second client checks the lock came back.
     m.close_mirror()
-    second = gnitz.connect(target)
-    second.mirror_at(base)
-    second.close()
+    plain.mirror_at(base)
+    plain.close()
     m.mirror_at(base)
     m.close()
 
 
-def panic():
+def panic(base, target, sn):
     """A panic inside the guarded apply poisons a copy that is still gated in,
     and every read that would have come off it is refused — including the one
     that arrives through the SQL layer, whose own error channel would otherwise
     flatten the poison into a plain GnitzError."""
-    from _feedviews import _churn
-
-    base, target, sn = _env()
-    m = gnitz.connect(target)
+    m, plain = gnitz.connect(target, schema=sn), gnitz.connect(target, schema=sn)
     m.mirror_at(base)
-    vid = m.mirror_view(sn, "f").view_id
-    f_schema = m.resolve_table(sn, "f")[1]
+    vid = m.mirror_view("f").view_id
+    f_schema = m.resolve_table("f")[1]
     assert m.mirrors(vid), "the bootstrap succeeds; the seam fires on a poll"
 
-    _churn(m, sn, 61, 120)
-    m.execute_sql("SELECT COUNT(*) AS n FROM f", schema_name=sn)
+    churn(m, 61, 120)
+    m.execute_sql("SELECT COUNT(*) AS n FROM f")
     try:
         m.poll()
         raise SystemExit("the armed seam must panic inside the guarded apply")
@@ -84,7 +76,7 @@ def panic():
 
     # The copy is still gated in, so these are reads it would have answered.
     assert m.mirrors(vid)
-    for call in (lambda: m.execute_sql("SELECT * FROM f", schema_name=sn),
+    for call in (lambda: m.execute_sql("SELECT * FROM f"),
                  lambda: m.scan(vid, f_schema)):
         try:
             call()
@@ -93,29 +85,26 @@ def panic():
             pass
 
     # And a relation the copy does not hold is untouched.
-    assert rows(m, sn, "SELECT * FROM t")
+    _delegated(m, plain, "SELECT * FROM t")
     m.close_mirror()
     m.close()
 
 
-def crash():
+def crash(base, target, sn):
     """Poll past a checkpoint, then block so the parent can SIGKILL us.
 
     The rounds applied after the checkpoint are what the kill loses, and what
     the parent's reopen must recover from the feed rather than double.
     """
-    from _feedviews import _churn
-
-    base, target, sn = _env()
-    m = gnitz.connect(target)
+    m = gnitz.connect(target, schema=sn)
     m.mirror_at(base)
-    m.mirror_view(sn, "f")
-    m.execute_sql("SELECT COUNT(*) AS n FROM f", schema_name=sn)
+    m.mirror_view("f")
+    m.execute_sql("SELECT COUNT(*) AS n FROM f")
     m.poll()
     m.checkpoint()
 
-    _churn(m, sn, 61, 120)
-    m.execute_sql("SELECT COUNT(*) AS n FROM f", schema_name=sn)
+    churn(m, 61, 120)
+    m.execute_sql("SELECT COUNT(*) AS n FROM f")
     m.poll()
 
     print(READY, flush=True)
@@ -124,4 +113,4 @@ def crash():
 
 
 if __name__ == "__main__":
-    {"erase": erase, "panic": panic, "crash": crash}[sys.argv[1]]()
+    {"erase": erase, "panic": panic, "crash": crash}[sys.argv[1]](*sys.argv[2:])

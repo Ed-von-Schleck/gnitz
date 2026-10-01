@@ -51,25 +51,24 @@ _READ_VIEWS = ["q1", "q3", "q6", "q12", "q4"]
 _CHUNK = 250_000
 
 
-def _bulk(client, sn, name, rows):
-    tid, schema = client.resolve_table(sn, name)
+def _bulk(client, name, rows):
+    tid, schema = client.resolve_table(name)
     for i in range(0, len(rows), _CHUNK):
         push_rows(client, tid, schema, rows[i:i + _CHUNK])
 
 
-def test_tpch(client, schema_name, bench_timer, scale_mode):
-    sn = schema_name
+def test_tpch(client, bench_timer, scale_mode):
     sz = TPCH_SIZES[scale_mode]
-    tpch.create_tables(client, sn)
+    tpch.create_tables(client)
     for ddl in _VIEW_DDLS:
-        client.execute_sql(ddl, schema_name=sn)
+        client.execute_sql(ddl)
 
     data = tpch.generate_all(sz["sf"], skew=True)
     for name in ("region", "nation", "customer", "orders", "lineitem"):
-        _bulk(client, sn, name, data[name])
+        _bulk(client, name, data[name])
 
     orders = data["orders"]
-    li_tid, li_schema = client.resolve_table(sn, "lineitem")
+    li_tid, li_schema = client.resolve_table("lineitem")
     delta, iters = sz["delta"], sz["iters"]
     prev = None
     for it in range(iters):
@@ -85,4 +84,4 @@ def test_tpch(client, schema_name, bench_timer, scale_mode):
         prev = rows
 
     for v in _READ_VIEWS:
-        assert len(client.scan(*client.resolve_table(sn, v))) > 0, f"{v} empty after streaming"
+        assert len(client.scan(*client.resolve_table(v))) > 0, f"{v} empty after streaming"

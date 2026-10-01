@@ -12,7 +12,7 @@ def test_connect_shapes_close_and_refuse(server):
     assert len(conn.scan(gnitz.SCHEMA_TAB, gnitz.sys_schema(gnitz.SCHEMA_TAB))) > 0
     conn.close()
     conn.close()                                  # idempotent
-    with pytest.raises(gnitz.GnitzError, match="closed"):
+    with pytest.raises(gnitz.GnitzConnectionError, match="closed"):
         conn.scan(gnitz.SCHEMA_TAB, gnitz.sys_schema(gnitz.SCHEMA_TAB))
 
     with gnitz.connect(server) as fresh:

@@ -66,33 +66,30 @@ _CHURN = [
 ]
 
 
-def test_a_global_window_is_a_cut_in_one_weighted_order(client, schema_name):
+def test_a_global_window_is_a_cut_in_one_weighted_order(client):
     """The index holds the rows below the cut too, so deleting a member promotes
     the next one rather than shrinking the window, an update moves a row into or
     out of it, and emptying the source empties it. The hidden sort key never
     widens the presented row."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE scores (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, "
         "score BIGINT NOT NULL, ns BIGINT, name TEXT NOT NULL); "
         "CREATE VIEW dup AS SELECT id, score FROM scores UNION ALL SELECT id, score FROM scores WHERE grp = 1; "
-        + "; ".join(f"CREATE VIEW {name} AS {body}" for name, (body, _) in _WINDOWS.items()),
-        schema_name=sn)
+        + "; ".join(f"CREATE VIEW {name} AS {body}" for name, (body, _) in _WINDOWS.items()))
 
     for sql, want in _CHURN:
-        client.execute_sql(sql, schema_name=sn)
+        client.execute_sql(sql)
         for name, (_, cols) in _WINDOWS.items():
-            rows = scanned(client, sn, name)
+            rows = scanned(client, name)
             assert bag(rows, *cols) == want[name], (sql, name)
             assert all(set(r._fields) == set(cols) for r in rows), (sql, name)
 
 
-def test_the_window_cuts_a_grouped_or_set_op_body(client, schema_name):
+def test_the_window_cuts_a_grouped_or_set_op_body(client):
     """The ordered index sits over whatever the body emits, so it cuts groups of
     a GROUP BY and the output of a set operation exactly as it cuts base rows —
     and a group whose aggregate moves moves in the order. QUALIFY reaches the same
     cut over a grouped body with an aggregate as its order key."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE scores (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, score BIGINT NOT NULL); "
         "CREATE VIEW leaders AS SELECT grp, SUM(score) AS total FROM scores "
@@ -101,26 +98,24 @@ def test_the_window_cuts_a_grouped_or_set_op_body(client, schema_name):
         "QUALIFY ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC, grp) <= 2; "
         "CREATE VIEW u AS SELECT id, score FROM scores WHERE grp = 1 "
         "UNION SELECT id, score FROM scores WHERE grp = 4 ORDER BY score LIMIT 2; "
-        "INSERT INTO scores VALUES (1, 1, 10), (2, 1, 12), (3, 2, 15), (4, 3, 30), (5, 4, 1)",
-        schema_name=sn)
-    assert bag(scanned(client, sn, "leaders"), "grp", "total") == {(3, 30): 1, (1, 22): 1}
-    assert bag(scanned(client, sn, "busiest"), "grp", "n") == {(1, 2): 1, (2, 1): 1}
-    assert bag(scanned(client, sn, "u"), "id") == {(5,): 1, (1,): 1}
+        "INSERT INTO scores VALUES (1, 1, 10), (2, 1, 12), (3, 2, 15), (4, 3, 30), (5, 4, 1)")
+    assert bag(scanned(client, "leaders"), "grp", "total") == {(3, 30): 1, (1, 22): 1}
+    assert bag(scanned(client, "busiest"), "grp", "n") == {(1, 2): 1, (2, 1): 1}
+    assert bag(scanned(client, "u"), "id") == {(5,): 1, (1,): 1}
 
-    client.execute_sql("INSERT INTO scores VALUES (6, 4, 100)", schema_name=sn)
-    assert bag(scanned(client, sn, "leaders"), "grp", "total") == {(4, 101): 1, (3, 30): 1}
-    assert bag(scanned(client, sn, "busiest"), "grp", "n") == {(1, 2): 1, (4, 2): 1}
-    assert bag(scanned(client, sn, "u"), "id") == {(5,): 1, (1,): 1}
+    client.execute_sql("INSERT INTO scores VALUES (6, 4, 100)")
+    assert bag(scanned(client, "leaders"), "grp", "total") == {(4, 101): 1, (3, 30): 1}
+    assert bag(scanned(client, "busiest"), "grp", "n") == {(1, 2): 1, (4, 2): 1}
+    assert bag(scanned(client, "u"), "id") == {(5,): 1, (1,): 1}
 
 
-def test_qualify_cuts_each_partition(client, schema_name):
+def test_qualify_cuts_each_partition(client):
     """`rn <= n`, `n > rn` and `rn = 1` are the bounds the recognizer reads, so
     each takes the top rows of each partition, and a partition emptied loses its
     rows while a new one gains them. A *projected* `rn` is a value the top-N
     operator cannot supply, so the desugar answers instead and must select the
     same rows. A partition key naming the whole PK in another order is one row
     per PK, and the operator must shard by the PK's own order to find them."""
-    sn = schema_name
     rn = "ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score"
     client.execute_sql(
         "CREATE TABLE scores (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, score BIGINT NOT NULL); "
@@ -132,22 +127,21 @@ def test_qualify_cuts_each_partition(client, schema_name):
         "CREATE TABLE pairs (a BIGINT NOT NULL, b BIGINT NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (a, b)); "
         "CREATE VIEW p AS SELECT a, b, v FROM pairs QUALIFY ROW_NUMBER() OVER (PARTITION BY b, a ORDER BY v DESC) <= 1; "
         "INSERT INTO pairs VALUES " + ", ".join(f"({a}, {b}, {a * 10 + b})" for a in range(4) for b in range(4))
-        + "; INSERT INTO scores VALUES (1, 1, 10), (2, 1, 30), (3, 1, 20), (4, 2, 25)", schema_name=sn)
+        + "; INSERT INTO scores VALUES (1, 1, 10), (2, 1, 30), (3, 1, 20), (4, 2, 25)")
 
     def expect(lowest_two, lowest, highest_two):
         for name in ("le", "gt"):
-            assert bag(scanned(client, sn, name), "grp", "id") == dict.fromkeys(lowest_two, 1), name
-        assert bag(scanned(client, sn, "eq"), "grp", "id") == dict.fromkeys(lowest, 1)
-        assert bag(scanned(client, sn, "ranked"), "grp", "id", "rn") == dict.fromkeys(highest_two, 1)
-        assert bag(scanned(client, sn, "cut"), "grp", "id") == dict.fromkeys(((g, i) for g, i, _ in highest_two), 1)
+            assert bag(scanned(client, name), "grp", "id") == dict.fromkeys(lowest_two, 1), name
+        assert bag(scanned(client, "eq"), "grp", "id") == dict.fromkeys(lowest, 1)
+        assert bag(scanned(client, "ranked"), "grp", "id", "rn") == dict.fromkeys(highest_two, 1)
+        assert bag(scanned(client, "cut"), "grp", "id") == dict.fromkeys(((g, i) for g, i, _ in highest_two), 1)
 
     expect([(1, 1), (1, 3), (2, 4)], [(1, 1), (2, 4)], [(1, 2, 1), (1, 3, 2), (2, 4, 1)])
     # Partition 2 empties and partition 3 appears in one commit batch, where two
     # autocommit statements would be two ticks.
-    client.execute_sql("BEGIN; DELETE FROM scores WHERE id = 4; INSERT INTO scores VALUES (5, 3, 1); COMMIT",
-                       schema_name=sn)
+    client.execute_sql("BEGIN; DELETE FROM scores WHERE id = 4; INSERT INTO scores VALUES (5, 3, 1); COMMIT")
     expect([(1, 1), (1, 3), (3, 5)], [(1, 1), (3, 5)], [(1, 2, 1), (1, 3, 2), (3, 5, 1)])
 
-    assert bag(scanned(client, sn, "p"), "a", "b") == {(a, b): 1 for a in range(4) for b in range(4)}
-    client.execute_sql("DELETE FROM pairs WHERE a = 2", schema_name=sn)
-    assert bag(scanned(client, sn, "p"), "a", "b") == {(a, b): 1 for a in (0, 1, 3) for b in range(4)}
+    assert bag(scanned(client, "p"), "a", "b") == {(a, b): 1 for a in range(4) for b in range(4)}
+    client.execute_sql("DELETE FROM pairs WHERE a = 2")
+    assert bag(scanned(client, "p"), "a", "b") == {(a, b): 1 for a in (0, 1, 3) for b in range(4)}

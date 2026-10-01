@@ -10,10 +10,10 @@ weight-0 ghost as correct.
 import math
 
 
-def rows(client, sn, q):
+def rows(client, q):
     """The rows of a one-statement SELECT, in result order. `client` is anything
     with `execute_sql` — a connection or a mirroring client."""
-    results = client.execute_sql(q, schema_name=sn)
+    results = client.execute_sql(q)
     assert len(results) == 1, f"expected one statement result, got {len(results)}"
     res = results[0]
     assert res["type"] == "Rows", f"expected Rows, got {res['type']}: {res}"
@@ -47,19 +47,19 @@ def ordered(rows):
     return [(tuple(r._asdict().items()), r._weight) for r in rows]
 
 
-def access(client, sn, q):
-    """EXPLAIN's `access:` line for `q` — which walk the plan chose. Found by
-    prefix rather than by row position, so adding a plan line cannot silently
-    make this read a different fact."""
-    lines = [r[0] for r in rows(client, sn, "EXPLAIN " + q)]
-    got = [ln for ln in lines if ln.startswith("access: ")]
+def access(client, q):
+    """What EXPLAIN's `access:` line says of `q` — which walk the plan chose.
+    Found by prefix rather than by row position, so adding a plan line cannot
+    silently make this read a different fact."""
+    lines = [r[0] for r in rows(client, "EXPLAIN " + q)]
+    got = [ln.removeprefix("access: ") for ln in lines if ln.startswith("access: ")]
     assert len(got) == 1, lines
     return got[0]
 
 
-def scanned(client, sn, name, *, hidden=False):
-    """The rows of a full scan of a relation named in `sn`, hidden columns
-    included when `hidden` — the scan-side counterpart of `rows`, so both
+def scanned(client, name, *, hidden=False):
+    """The rows of a full scan of relation `name`, hidden columns included when
+    `hidden` — the scan-side counterpart of `rows`, so both
     compose with `bag`."""
-    result = client.scan(*client.resolve_table(sn, name))
+    result = client.scan(*client.resolve_table(name))
     return list(result.including_hidden() if hidden else result)

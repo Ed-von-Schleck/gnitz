@@ -9,11 +9,9 @@ the read that needs it; and the watermark moves only after a tick's worker ACKs,
 so a tick still in flight reads as un-absorbed.
 """
 
-import threading
-
 import gnitz
 from _read import bag, scanned
-from _serverproc import join_or_fail
+from _serverproc import join_or_fail, spawn
 
 # 4x the 10 000-row coalesce threshold: crossing it fires the auto-tick, and the
 # excess is how long that tick is still running when the next statement lands —
@@ -23,7 +21,7 @@ BIG_ROWS = 40_000
 _TABLE = "CREATE TABLE {} (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)"
 
 
-def test_a_seek_reflects_every_acked_push_under_concurrent_ddl(client, server, schema_name):
+def test_a_seek_reflects_every_acked_push_under_concurrent_ddl(client, server):
     """Connection A pushes key k; connection B then seeks it through a view over a
     view, and through the view beneath. Each must return k at weight 1: the
     drain runs off shared master state, so it covers another connection's commit,
@@ -33,27 +31,20 @@ def test_a_seek_reflects_every_acked_push_under_concurrent_ddl(client, server, s
     A third connection churns CREATE/DROP VIEW on an unrelated table throughout.
     The seek releases the catalog read lock to drain and re-takes it; a drain
     under the lock would deadlock against the writer-preferring DDL."""
-    sn = schema_name
     for sql in (_TABLE.format("t"), _TABLE.format("t2"),
                 "CREATE VIEW v1 AS SELECT * FROM t WHERE val >= 0",
                 "CREATE VIEW v2 AS SELECT * FROM v1 WHERE val >= 0"):
-        client.execute_sql(sql, schema_name=sn)
-    tid, schema = client.resolve_table(sn, "t")
-    (v1, v1_schema), (v2, v2_schema) = (client.resolve_table(sn, v) for v in ("v1", "v2"))
-    errors = []
+        client.execute_sql(sql)
+    tid, schema = client.resolve_table("t")
+    (v1, v1_schema), (v2, v2_schema) = (client.resolve_table(v) for v in ("v1", "v2"))
 
     def churn():
-        try:
-            with gnitz.connect(server) as c:
-                for i in range(20):
-                    c.execute_sql(f"CREATE VIEW dv{i} AS SELECT * FROM t2 WHERE val >= 0",
-                                  schema_name=sn)
-                    c.execute_sql(f"DROP VIEW dv{i}", schema_name=sn)
-        except Exception as e:  # noqa: BLE001 — surfaced after the join
-            errors.append(e)
+        with gnitz.connect(server, schema=client.schema) as c:
+            for i in range(20):
+                c.execute_sql(f"CREATE VIEW dv{i} AS SELECT * FROM t2 WHERE val >= 0")
+                c.execute_sql(f"DROP VIEW dv{i}")
 
-    th = threading.Thread(target=churn, daemon=True)
-    th.start()
+    th = spawn(churn)
     k = 0
     try:
         with gnitz.connect(server) as b:
@@ -65,11 +56,10 @@ def test_a_seek_reflects_every_acked_push_under_concurrent_ddl(client, server, s
                 assert bag(b.seek(v1, v1_schema, pk=k), "pk", "val") == {(k, k * 10): 1}, f"v1 seek {k}"
     finally:
         join_or_fail("the DDL churn hung", th)
-    assert not errors, errors
-    assert bag(scanned(client, sn, "v2"), "pk", "val") == {(i, i * 10): 1 for i in range(1, k + 1)}
+    assert bag(scanned(client, "v2"), "pk", "val") == {(i, i * 10): 1 for i in range(1, k + 1)}
 
 
-def test_a_read_waits_for_its_own_in_flight_tick(client, schema_name):
+def test_a_read_waits_for_its_own_in_flight_tick(client):
     """A push crossing the coalesce threshold ACKs while the tick it fired is
     still running, and the read that follows with nothing in between must see
     every group at weight 1. The pending-tick queue is already empty once the tick
@@ -79,12 +69,10 @@ def test_a_read_waits_for_its_own_in_flight_tick(client, schema_name):
     A second such push fires another tick, and INSERTs run against it: each takes
     the PK-rejection probe burst into workers still evaluating the GROUP BY's
     exchange. Neither may wedge, and the view converges exactly."""
-    sn = schema_name
-    client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL)",
-                       schema_name=sn)
-    client.execute_sql("CREATE VIEW v AS SELECT g, COUNT(*) AS n FROM t GROUP BY g", schema_name=sn)
-    tid, schema = client.resolve_table(sn, "t")
-    vid, v_schema = client.resolve_table(sn, "v")
+    client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL)")
+    client.execute_sql("CREATE VIEW v AS SELECT g, COUNT(*) AS n FROM t GROUP BY g")
+    tid, schema = client.resolve_table("t")
+    vid, v_schema = client.resolve_table("v")
 
     def push_range(lo, hi):
         client.push(tid, gnitz.ZSetBatch(schema).extend([{"pk": i, "g": i} for i in range(lo, hi)]))
@@ -95,23 +83,21 @@ def test_a_read_waits_for_its_own_in_flight_tick(client, schema_name):
     push_range(BIG_ROWS, 2 * BIG_ROWS)
     end = 2 * BIG_ROWS + 300
     for lo in range(2 * BIG_ROWS, end, 100):
-        client.execute_sql("INSERT INTO t VALUES " + ", ".join(f"({i}, {i})" for i in range(lo, lo + 100)),
-                           schema_name=sn)
+        client.execute_sql("INSERT INTO t VALUES " + ", ".join(f"({i}, {i})" for i in range(lo, lo + 100)))
     assert bag(client.scan(vid, v_schema), "g", "n") == {(i, 1): 1 for i in range(end)}
 
 
-def test_an_unrelated_pending_tick_does_not_gate_the_read(client, schema_name):
+def test_an_unrelated_pending_tick_does_not_gate_the_read(client):
     """A read of a clean `v1` must not tick `t2`, which `v1` does not depend on.
 
     Asserted on the watermark a scan reports, which only a completed tick moves:
     had the read drained, it would jump past `t2`'s commit."""
-    sn = schema_name
     for sql in (_TABLE.format("t1"), _TABLE.format("t2"),
                 "CREATE VIEW v1 AS SELECT pk, val FROM t1 WHERE val >= 0",
                 "CREATE VIEW v2 AS SELECT val, COUNT(*) AS n FROM t2 GROUP BY val"):
-        client.execute_sql(sql, schema_name=sn)
-    (t1, schema), (t2, _) = client.resolve_table(sn, "t1"), client.resolve_table(sn, "t2")
-    (v1, v1_schema), (v2, v2_schema) = (client.resolve_table(sn, v) for v in ("v1", "v2"))
+        client.execute_sql(sql)
+    (t1, schema), (t2, _) = client.resolve_table("t1"), client.resolve_table("t2")
+    (v1, v1_schema), (v2, v2_schema) = (client.resolve_table(v) for v in ("v1", "v2"))
 
     def push_small(tid):
         # Under the coalesce threshold: no auto-tick, the tid sits pending.

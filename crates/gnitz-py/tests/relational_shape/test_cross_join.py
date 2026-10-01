@@ -13,6 +13,7 @@ Run with GNITZ_WORKERS=4 — the broadcast and the trace's worker filter are wha
 keep the product from multiplying.
 """
 from _read import bag, scanned
+from _sql import churn
 
 # view -> (FROM clause, what it admits of (t.v, u.w)). `CROSS JOIN`, the comma
 # and an ON comparing no column across the sides are one keyless step; a residual
@@ -48,7 +49,7 @@ _CHURN = [
 ]
 
 
-def test_each_delta_adds_or_retracts_exactly_its_pairs(client, schema_name):
+def test_each_delta_adds_or_retracts_exactly_its_pairs(client):
     """Every keyless shape over one churn: the spellings of one step; a table
     paired with itself, whose second copy is wrapped in a segment so the two
     inputs are distinct sources; a three-way product, whose inner product is cut
@@ -56,7 +57,6 @@ def test_each_delta_adds_or_retracts_exactly_its_pairs(client, schema_name):
     slots stay hidden under `SELECT *` while strings past the inline length ride
     through; and a GROUP BY over the product. Each delta, on any side, adds or
     retracts exactly the pairs it forms with the other sides' current rows."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL); "
         "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, w BIGINT NOT NULL); "
@@ -69,32 +69,25 @@ def test_each_delta_adds_or_retracts_exactly_its_pairs(client, schema_name):
         "CREATE VIEW tri AS SELECT t.id AS tid, u.id AS uid, c.a AS ca, c.b AS cb FROM t, u, c; "
         "CREATE VIEW star AS SELECT * FROM c CROSS JOIN u; "
         "CREATE VIEW x AS SELECT t.id AS tid, u.w AS uw FROM t CROSS JOIN u; "
-        "CREATE VIEW g AS SELECT tid, COUNT(*) AS n, SUM(uw) AS s FROM x GROUP BY tid",
-        schema_name=sn)
+        "CREATE VIEW g AS SELECT tid, COUNT(*) AS n, SUM(uw) AS s FROM x GROUP BY tid")
 
     state = {"t": {}, "u": {}, "c": {}}
-    for sql, table, changes in _CHURN:
-        client.execute_sql(sql, schema_name=sn)
-        for pk, row in changes.items():
-            if row is None:
-                del state[table][pk]
-            else:
-                state[table][pk] = row
+    for sql in churn(client, state, _CHURN):
         t, u, c = state["t"], state["u"], state["c"]
 
         for name, (_, admits) in _SPELLINGS.items():
-            assert bag(scanned(client, sn, name), "tid", "tv", "uid", "uw") == {
+            assert bag(scanned(client, name), "tid", "tv", "uid", "uw") == {
                 (ti, tv, ui, uw): 1 for ti, tv in t.items() for ui, uw in u.items()
                 if admits(tv, uw)}, (sql, name)
-        assert bag(scanned(client, sn, "sq"), "xid", "yid") == \
+        assert bag(scanned(client, "sq"), "xid", "yid") == \
             {(x, y): 1 for x in t for y in t}, sql
-        assert bag(scanned(client, sn, "offdiag"), "xid", "yid") == \
+        assert bag(scanned(client, "offdiag"), "xid", "yid") == \
             {(x, y): 1 for x in t for y in t if x != y}, sql
-        assert bag(scanned(client, sn, "tri"), "tid", "uid", "ca", "cb") == \
+        assert bag(scanned(client, "tri"), "tid", "uid", "ca", "cb") == \
             {(ti, ui, a, b): 1 for ti in t for ui in u for a, b in c}, sql
-        star = scanned(client, sn, "star")
+        star = scanned(client, "star")
         assert bag(star, "a", "b", "s", "id", "w") == {
             (a, b, s, ui, uw): 1 for (a, b), s in c.items() for ui, uw in u.items()}, sql
         assert all(set(r._fields) == {"a", "b", "s", "id", "w"} for r in star), sql
-        assert bag(scanned(client, sn, "g"), "tid", "n", "s") == (
+        assert bag(scanned(client, "g"), "tid", "n", "s") == (
             {(ti, len(u), sum(u.values())): 1 for ti in t} if u else {}), sql

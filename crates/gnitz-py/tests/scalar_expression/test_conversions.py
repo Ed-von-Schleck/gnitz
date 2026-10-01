@@ -70,38 +70,37 @@ _CONVERSIONS = {
 
 
 def test_a_conversion_lands_on_its_register_image_or_a_null_never_a_dropped_row(
-        client, schema_name):
+        client):
     """No fault-delivery mechanism exists at row granularity, so a failed
     conversion nulls the value and keeps the row at its weight — asserted as one
     bag over the whole row, through a maintained view and the ad-hoc binder's
     own path alike. A predicate over such a NULL is unknown, so the row does
     not pass."""
-    sn = schema_name
     select = "SELECT id, " + ", ".join(
         f"{e} AS c{n}" for n, e in enumerate(_CONVERSIONS)) + " FROM t"
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, i BIGINT NOT NULL, "
         "u BIGINT UNSIGNED NOT NULL, f DOUBLE NOT NULL, g FLOAT NOT NULL, "
-        "w INT UNSIGNED NOT NULL, s TEXT NOT NULL)", schema_name=sn)
-    client.execute_sql(f"CREATE VIEW v AS {select}", schema_name=sn)
-    client.execute_sql(f"INSERT INTO t VALUES {_ROWS}", schema_name=sn)
+        "w INT UNSIGNED NOT NULL, s TEXT NOT NULL)")
+    client.execute_sql(f"CREATE VIEW v AS {select}")
+    client.execute_sql(f"INSERT INTO t VALUES {_ROWS}")
 
-    declared = [c.type_code for c in client.resolve_table(sn, "v")[1].columns[1:]]
+    declared = [c.type_code for c in client.resolve_table("v")[1].columns[1:]]
     assert declared == [tc for tc, _ in _CONVERSIONS.values()]
     expected = {r: 1 for r in zip([1, 2, 3, 4, 5], *(vs for _, vs in _CONVERSIONS.values()))}
-    assert bag(scanned(client, sn, "v")) == expected
-    assert bag(rows(client, sn, select)) == expected
+    assert bag(scanned(client, "v")) == expected
+    assert bag(rows(client, select)) == expected
 
     # Outside [1e-4, 1e15) the float form goes scientific, which is what keeps
     # the printed length bounded.
-    ft = dict(rows(client, sn, "SELECT id, CAST(f AS TEXT) AS ft FROM t"))
+    ft = dict(rows(client, "SELECT id, CAST(f AS TEXT) AS ft FROM t"))
     assert ft[4] == "1.5"
     assert len(ft[2]) < 12 and float(ft[2]) == 1e300
 
-    assert bag(rows(client, sn, "SELECT id FROM t WHERE CAST(f AS INT) = 2")) == {(1,): 1}
+    assert bag(rows(client, "SELECT id FROM t WHERE CAST(f AS INT) = 2")) == {(1,): 1}
 
 
-def test_an_unsigned_value_keeps_its_domain_through_a_view_chain(client, schema_name):
+def test_an_unsigned_value_keeps_its_domain_through_a_view_chain(client):
     """A value at or above 2^63 has a negative i64 bit pattern, so a downstream
     reader that lost the unsignedness answers `> 100` FALSE. The verdict rides
     the register through arithmetic, a CASE blend, an extremum fold in either
@@ -110,40 +109,36 @@ def test_an_unsigned_value_keeps_its_domain_through_a_view_chain(client, schema_
 
     An elided `u32 -> BIGINT UNSIGNED` cast and a native one must agree: every
     unsigned value is above -1, so `> -1` admits every row of both."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
         "a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL, flag BIGINT NOT NULL, "
-        "w INT UNSIGNED NOT NULL)", schema_name=sn)
+        "w INT UNSIGNED NOT NULL)")
     client.execute_sql(
         "CREATE VIEW v AS SELECT id, a + b AS arith, "
         "CASE WHEN flag > 0 THEN a + b ELSE 0 END AS blend, GREATEST(a + b, 1) AS ext, "
-        "GREATEST(-1, 1, a) AS late, GREATEST(a, -1, 1) AS early FROM t", schema_name=sn)
+        "GREATEST(-1, 1, a) AS late, GREATEST(a, -1, 1) AS early FROM t")
     client.execute_sql(
         "CREATE VIEW v2 AS SELECT id, arith > 100 AS p1, blend > 100 AS p2, ext > 100 AS p3, "
-        "late > 100 AS p4, early > 100 AS p5 FROM v", schema_name=sn)
-    client.execute_sql("CREATE VIEW s AS SELECT g, SUM(a) AS total FROM t GROUP BY g",
-                       schema_name=sn)
-    client.execute_sql("CREATE VIEW s2 AS SELECT g FROM s WHERE total > 100", schema_name=sn)
+        "late > 100 AS p4, early > 100 AS p5 FROM v")
+    client.execute_sql("CREATE VIEW s AS SELECT g, SUM(a) AS total FROM t GROUP BY g")
+    client.execute_sql("CREATE VIEW s2 AS SELECT g FROM s WHERE total > 100")
     client.execute_sql(
-        "CREATE VIEW reseeded AS SELECT id FROM t WHERE CAST(w AS BIGINT UNSIGNED) > -1",
-        schema_name=sn)
+        "CREATE VIEW reseeded AS SELECT id FROM t WHERE CAST(w AS BIGINT UNSIGNED) > -1")
     client.execute_sql(
-        "CREATE VIEW native AS SELECT id FROM t WHERE CAST(a AS BIGINT UNSIGNED) > -1",
-        schema_name=sn)
+        "CREATE VIEW native AS SELECT id FROM t WHERE CAST(a AS BIGINT UNSIGNED) > -1")
     half = 2**62
     client.execute_sql(
         f"INSERT INTO t VALUES (1, 1, {half}, {half}, 1, 7), (2, 1, {half}, {half}, 0, 7), "
-        "(3, 2, 1, 1, 1, 7)", schema_name=sn)
+        "(3, 2, 1, 1, 1, 7)")
 
-    assert bag(scanned(client, sn, "v2")) == {
+    assert bag(scanned(client, "v2")) == {
         (1, 1, 1, 1, 1, 1): 1,
         (2, 1, 0, 1, 1, 1): 1,
         # `-1` is u64::MAX once one U64 argument fixes the fold's domain.
         (3, 0, 0, 0, 1, 1): 1,
     }
-    assert bag(scanned(client, sn, "s2")) == {(1,): 1}
+    assert bag(scanned(client, "s2")) == {(1,): 1}
     every = {(1,): 1, (2,): 1, (3,): 1}
-    assert bag(scanned(client, sn, "reseeded")) == every
-    assert bag(scanned(client, sn, "native")) == every
-    assert bag(rows(client, sn, "SELECT id FROM t WHERE CAST(w AS BIGINT UNSIGNED) > 0")) == every
+    assert bag(scanned(client, "reseeded")) == every
+    assert bag(scanned(client, "native")) == every
+    assert bag(rows(client, "SELECT id FROM t WHERE CAST(w AS BIGINT UNSIGNED) > 0")) == every

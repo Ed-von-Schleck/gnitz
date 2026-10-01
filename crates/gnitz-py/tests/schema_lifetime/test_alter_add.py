@@ -15,7 +15,7 @@ from _serverproc import NEEDS_MULTI
 
 
 @NEEDS_MULTI
-def test_add_column_pads_every_pre_alter_row_with_null(client, schema_name):
+def test_add_column_pads_every_pre_alter_row_with_null(client):
     """Two serialized ADD COLUMNs — a BIGINT and a TEXT — over enough rows to
     land on every partition: the columns append in order, existing rows read
     both as NULL, and both are writable through INSERT, an UPDATE of a pre-ALTER
@@ -29,15 +29,14 @@ def test_add_column_pads_every_pre_alter_row_with_null(client, schema_name):
     Asserted as weighted bags: a partition left at the old width moves a weight,
     not the row set.
     """
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL); "
         "INSERT INTO t VALUES " + ", ".join(f"({k}, {k * 10})" for k in range(1, 41)) + "; "
         "CREATE INDEX ia ON t (a); "
         "ALTER TABLE t ADD COLUMN c BIGINT; "
-        "ALTER TABLE t ADD COLUMN s TEXT", schema_name=sn)
+        "ALTER TABLE t ADD COLUMN s TEXT")
 
-    got = rows(client, sn, "SELECT * FROM t")
+    got = rows(client, "SELECT * FROM t")
     assert got[0]._fields == ("id", "a", "c", "s")
     assert bag(got, "id", "a", "c", "s") == {(k, k * 10, None, None): 1 for k in range(1, 41)}
 
@@ -45,18 +44,17 @@ def test_add_column_pads_every_pre_alter_row_with_null(client, schema_name):
     client.execute_sql(
         f"INSERT INTO t VALUES (41, 410, 4100, 'short'), (42, 420, NULL, '{long}'); "
         "UPDATE t SET c = 55, s = 'set later' WHERE id = 1; "
-        "DELETE FROM t WHERE id = 2", schema_name=sn)
+        "DELETE FROM t WHERE id = 2")
 
     want = {(k, k * 10, None, None): 1 for k in range(3, 41)}
     want |= {(1, 10, 55, "set later"): 1, (41, 410, 4100, "short"): 1, (42, 420, None, long): 1}
-    assert bag(rows(client, sn, "SELECT * FROM t"), "id", "a", "c", "s") == want
+    assert bag(rows(client, "SELECT * FROM t"), "id", "a", "c", "s") == want
 
-    assert bag(rows(client, sn, "SELECT c FROM t WHERE id = 3"), "c") == {(None,): 1}
-    assert bag(rows(client, sn, "SELECT id FROM t WHERE c = 55"), "id") == {(1,): 1}
+    assert bag(rows(client, "SELECT c FROM t WHERE id = 3"), "c") == {(None,): 1}
+    assert bag(rows(client, "SELECT id FROM t WHERE c = 55"), "id") == {(1,): 1}
 
     for q, want in (("SELECT id, c FROM t WHERE a = 30", {(3, None): 1}),
                     ("SELECT id, c FROM t WHERE a >= 390",
                      {(39, None): 1, (40, None): 1, (41, 4100): 1, (42, None): 1})):
-        plan = access(client, sn, q)
-        assert "index" in plan, plan
-        assert bag(rows(client, sn, q), "id", "c") == want, q
+        assert access(client, q) == "index range on (a)", q
+        assert bag(rows(client, q), "id", "c") == want, q

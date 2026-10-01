@@ -41,14 +41,14 @@ _REJECTED = {
 
 
 @pytest.mark.parametrize("ddl,committed,refused", _REJECTED.values(), ids=_REJECTED.keys())
-def test_duplicate_pk_rejects_the_whole_statement(client, schema_name, ddl, committed, refused):
-    client.execute_sql(ddl, schema_name=schema_name)
+def test_duplicate_pk_rejects_the_whole_statement(client, ddl, committed, refused):
+    client.execute_sql(ddl)
     if committed:
-        insert(client, schema_name, "t", committed)
+        insert(client, "t", committed)
     for stmt in refused:
         with pytest.raises(gnitz.GnitzIntegrityError, match="(?i)duplicate key"):
-            client.execute_sql(stmt, schema_name=schema_name)
-    assert bag(scanned(client, schema_name, "t")) == dict.fromkeys(committed, 1)
+            client.execute_sql(stmt)
+    assert bag(scanned(client, "t")) == dict.fromkeys(committed, 1)
 
 
 _ON_CONFLICT = [
@@ -77,74 +77,70 @@ _ON_CONFLICT = [
 
 @pytest.mark.parametrize("seed,stmt,final", [c[1:] for c in _ON_CONFLICT],
                          ids=[c[0] for c in _ON_CONFLICT])
-def test_on_conflict_resolves_instead_of_rejecting(client, schema_name, seed, stmt, final):
-    client.execute_sql(_T, schema_name=schema_name)
-    client.execute_sql(seed, schema_name=schema_name)
-    client.execute_sql(stmt, schema_name=schema_name)
+def test_on_conflict_resolves_instead_of_rejecting(client, seed, stmt, final):
+    client.execute_sql(_T)
+    client.execute_sql(seed)
+    client.execute_sql(stmt)
     # A conflict resolved on a worker other than the key's owner leaves the
     # original row beside its replacement.
-    assert bag(scanned(client, schema_name, "t")) == dict.fromkeys(final, 1)
+    assert bag(scanned(client, "t")) == dict.fromkeys(final, 1)
 
 
-def test_insert_partial_column_list(client, schema_name):
+def test_insert_partial_column_list(client):
     """A column list may name a subset in any order; every column it omits is
     written NULL (gnitz has no column DEFAULTs), so omitting a NOT NULL one is
     the NOT NULL violation — raised before anything is written."""
-    sn = schema_name
-    client.execute_sql("CREATE TABLE p (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, b TEXT); " + _T,
-                       schema_name=sn)
+    client.execute_sql("CREATE TABLE p (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, b TEXT); " + _T)
     # Reordered as well as partial: the slot map, not the position, decides
     # which column each VALUES element lands in.
-    client.execute_sql("INSERT INTO p (b, pk) VALUES ('x', 1)", schema_name=sn)
-    client.execute_sql("INSERT INTO p (pk, a, b) VALUES (2, 20, 'y')", schema_name=sn)
-    assert bag(scanned(client, sn, "p")) == {(1, None, "x"): 1, (2, 20, "y"): 1}
+    client.execute_sql("INSERT INTO p (b, pk) VALUES ('x', 1)")
+    client.execute_sql("INSERT INTO p (pk, a, b) VALUES (2, 20, 'y')")
+    assert bag(scanned(client, "p")) == {(1, None, "x"): 1, (2, 20, "y"): 1}
 
-    with pytest.raises(gnitz.GnitzError, match="(?i)not null"):
-        client.execute_sql("INSERT INTO t (pk) VALUES (1)", schema_name=sn)
-    assert bag(scanned(client, sn, "t")) == {}
+    with pytest.raises(gnitz.GnitzRefusedError, match="(?i)not null"):
+        client.execute_sql("INSERT INTO t (pk) VALUES (1)")
+    assert bag(scanned(client, "t")) == {}
 
 
-def test_do_update_over_a_string_column_and_a_rejected_null(client, schema_name):
+def test_do_update_over_a_string_column_and_a_rejected_null(client):
     """`SET s = EXCLUDED.s` takes the string classifier arm, which the integer
     tables above never reach. A NULL under a NOT NULL column has to be refused
     before the merge reads it: the merged batch is the only thing this plan
     pushes, so an unvalidated NULL would be read back as a real 0 and committed
     silently."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE s (pk BIGINT NOT NULL PRIMARY KEY, txt TEXT NOT NULL, "
-        "v BIGINT NOT NULL)", schema_name=sn)
-    client.execute_sql("INSERT INTO s VALUES (1, 'old', 10)", schema_name=sn)
+        "v BIGINT NOT NULL)")
+    client.execute_sql("INSERT INTO s VALUES (1, 'old', 10)")
 
     client.execute_sql(
         "INSERT INTO s VALUES (1, 'new', 11), (2, 'fresh', 22) "
-        "ON CONFLICT (pk) DO UPDATE SET txt = EXCLUDED.txt", schema_name=sn)
+        "ON CONFLICT (pk) DO UPDATE SET txt = EXCLUDED.txt")
     want = {(1, "new", 10): 1, (2, "fresh", 22): 1}
-    assert bag(scanned(client, sn, "s")) == want
+    assert bag(scanned(client, "s")) == want
 
-    with pytest.raises(gnitz.GnitzError):
+    with pytest.raises(gnitz.GnitzRefusedError, match="(?i)not null"):
         client.execute_sql(
-            "INSERT INTO s VALUES (1, NULL, 0) ON CONFLICT (pk) DO UPDATE SET txt = EXCLUDED.txt",
-            schema_name=sn)
-    assert bag(scanned(client, sn, "s")) == want, "no silent write survived the refusal"
+            "INSERT INTO s VALUES (1, NULL, 0) ON CONFLICT (pk) DO UPDATE SET txt = EXCLUDED.txt")
+    assert bag(scanned(client, "s")) == want, "no silent write survived the refusal"
 
 
 @pytest.mark.parametrize("arity", [2, 3])
-def test_a_conflict_target_may_name_a_whole_compound_key(client, schema_name, arity):
+def test_a_conflict_target_may_name_a_whole_compound_key(client, arity):
     """The target is the primary key whatever its arity, so the probe resolving
     which rows conflict has to compare the whole packed key. A probe that
     compared a prefix would report the new key as a conflict and update the wrong
     row; one that compared nothing would insert a duplicate."""
-    sn, keys = schema_name, ", ".join("abc"[:arity])
+    keys = ", ".join("abc"[:arity])
 
     def row(k, v):
         return (k,) * arity + (v,)
 
     client.execute_sql(
         "CREATE TABLE c (" + ", ".join(f"{k} BIGINT UNSIGNED NOT NULL" for k in "abc"[:arity])
-        + f", v BIGINT NOT NULL, PRIMARY KEY ({keys}))", schema_name=sn)
-    insert(client, sn, "c", [row(1, 10), row(2, 20)])
+        + f", v BIGINT NOT NULL, PRIMARY KEY ({keys}))")
+    insert(client, "c", [row(1, 10), row(2, 20)])
     client.execute_sql(
         f"INSERT INTO c VALUES {values([row(1, 111), row(3, 30)])} "
-        f"ON CONFLICT ({keys}) DO UPDATE SET v = EXCLUDED.v", schema_name=sn)
-    assert bag(scanned(client, sn, "c")) == dict.fromkeys([row(1, 111), row(2, 20), row(3, 30)], 1)
+        f"ON CONFLICT ({keys}) DO UPDATE SET v = EXCLUDED.v")
+    assert bag(scanned(client, "c")) == dict.fromkeys([row(1, 111), row(2, 20), row(3, 30)], 1)

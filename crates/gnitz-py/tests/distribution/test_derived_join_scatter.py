@@ -26,74 +26,60 @@ _U = [(1000 + i, i * 100 + 1) for i in range(1, 25)]   # (id, b)
 
 
 @pytest.fixture
-def joined(client, schema_name):
+def joined(client):
     """`t` and `u` filled, ready for a view over a derived table of `t`."""
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, a BIGINT NOT NULL); "
-        "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, b BIGINT NOT NULL)",
-        schema_name=schema_name)
-    insert(client, schema_name, "t", _T)
-    insert(client, schema_name, "u", _U)
-    return schema_name
+        "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, b BIGINT NOT NULL)")
+    insert(client, "t", _T)
+    insert(client, "u", _U)
 
 
-def _view(client, sn, body):
-    client.execute_sql(f"CREATE VIEW v AS {body}", schema_name=sn)
-    return bag(rows(client, sn, "SELECT * FROM v"))
+_DERIVED = {
+    # `s` is computed, so the projection emits a `Map` and the PK-front rule
+    # moves `k` behind `t`'s own PK. `k` is still a source column — column 1 —
+    # which is where `t`'s delta has to scatter from.
+    "a computed projection over the key": (
+        "SELECT x.k AS k, x.s AS s, u.b AS b FROM (SELECT a + 1 AS s, k FROM t) x JOIN u ON x.k = u.id",
+        {(k, a + 1, i * 100 + 1): 1 for i, k, a in _T}),
+    # The same displacement through a pass-through `Map` rather than a computed
+    # one: two output columns off one source column cannot be a rename in place,
+    # so the projection emits a node and `k2` lands a slot away from the column
+    # it copies.
+    "a duplicating projection over the key": (
+        "SELECT x.k AS k, x.k2 AS k2, u.b AS b FROM (SELECT k, k AS k2 FROM t) x JOIN u ON x.k2 = u.id",
+        {(k, k, i * 100 + 1): 1 for i, k, _ in _T}),
+    # `x.s` is no column of `t` at all, so no key over `t` can state where its
+    # delta scatters and the side is cut to a hidden segment instead.
+    # `a * 10 + 1` is `u.b` on every row.
+    "a computed join key": (
+        "SELECT x.id AS id, u.b AS b FROM (SELECT id, a * 10 + 1 AS s FROM t) x JOIN u ON x.s = u.b",
+        {(i, a * 10 + 1): 1 for i, _, a in _T}),
+    # The control: a projection of bare, distinct columns renames the frame's
+    # slots in place and emits no `Map`, so the node's key and the source's have
+    # always agreed.
+    "a projection that moves nothing": (
+        "SELECT x.k AS k, x.a AS a, u.b AS b FROM (SELECT a, k FROM t) x JOIN u ON x.k = u.id",
+        {(k, a, i * 100 + 1): 1 for i, k, a in _T}),
+}
 
 
-def test_a_computed_projection_over_the_join_key_still_scatters_by_it(client, joined):
-    """`s` is computed, so the projection emits a `Map` and the PK-front rule
-    moves `k` behind `t`'s own PK. `k` is still a source column — column 1 —
-    which is where `t`'s delta has to scatter from."""
-    got = _view(client, joined,
-                "SELECT x.k AS k, x.s AS s, u.b AS b FROM (SELECT a + 1 AS s, k FROM t) x "
-                "JOIN u ON x.k = u.id")
-    assert got == {(k, a + 1, i * 100 + 1): 1 for i, k, a in _T}
-
-
-def test_a_duplicating_projection_over_the_join_key_still_scatters_by_it(client, joined):
-    """The same displacement through a pass-through `Map` rather than a computed
-    one: two output columns off one source column cannot be a rename in place,
-    so the projection emits a node and `k2` lands a slot away from the column it
-    copies."""
-    got = _view(client, joined,
-                "SELECT x.k AS k, x.k2 AS k2, u.b AS b FROM (SELECT k, k AS k2 FROM t) x "
-                "JOIN u ON x.k2 = u.id")
-    assert got == {(k, k, i * 100 + 1): 1 for i, k, _ in _T}
-
-
-def test_a_computed_join_key_joins_every_matching_pair(client, joined):
-    """`x.s` is no column of `t` at all, so no key over `t` can state where its
-    delta scatters and the side is cut to a hidden segment instead. `a * 10 + 1`
-    is `u.b` on every row."""
-    got = _view(client, joined,
-                "SELECT x.id AS id, u.b AS b FROM (SELECT id, a * 10 + 1 AS s FROM t) x "
-                "JOIN u ON x.s = u.b")
-    assert got == {(i, a * 10 + 1): 1 for i, _, a in _T}
-
-
-def test_a_derived_table_that_moves_nothing_is_unchanged(client, joined):
-    """The control: a projection of bare, distinct columns renames the frame's
-    slots in place and emits no `Map`, so the node's key and the source's have
-    always agreed."""
-    got = _view(client, joined,
-                "SELECT x.k AS k, x.a AS a, u.b AS b FROM (SELECT a, k FROM t) x "
-                "JOIN u ON x.k = u.id")
-    assert got == {(k, a, i * 100 + 1): 1 for i, k, a in _T}
+@pytest.mark.parametrize("body,want", _DERIVED.values(), ids=_DERIVED.keys())
+def test_a_derived_side_joins_every_matching_pair(client, joined, body, want):
+    client.execute_sql(f"CREATE VIEW v AS {body}")
+    assert bag(rows(client, "SELECT * FROM v")) == want
 
 
 def test_a_delta_after_the_view_reaches_both_sides(client, joined):
     """The scatter runs per delta, so the routing has to hold for rows inserted
     after the view exists as well as for its backfill."""
-    sn = joined
     client.execute_sql(
         "CREATE VIEW v AS SELECT x.k AS k, x.s AS s, u.b AS b "
-        "FROM (SELECT a + 1 AS s, k FROM t) x JOIN u ON x.k = u.id", schema_name=sn)
-    insert(client, sn, "t", [(100, 2000, 5000)])
-    insert(client, sn, "u", [(2000, 77)])
-    client.execute_sql("DELETE FROM u WHERE id = 1003", schema_name=sn)
+        "FROM (SELECT a + 1 AS s, k FROM t) x JOIN u ON x.k = u.id")
+    insert(client, "t", [(100, 2000, 5000)])
+    insert(client, "u", [(2000, 77)])
+    client.execute_sql("DELETE FROM u WHERE id = 1003")
 
     want = {(k, a + 1, i * 100 + 1): 1 for i, k, a in _T if k != 1003}
     want[(2000, 5001, 77)] = 1
-    assert bag(rows(client, sn, "SELECT * FROM v")) == want
+    assert bag(rows(client, "SELECT * FROM v")) == want

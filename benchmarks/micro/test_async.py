@@ -40,8 +40,8 @@ async def _push_loop(target, tid, n):
 
 
 @pytest.mark.parametrize("busy", [False, True], ids=["idle", "busy_thread"])
-def test_async_push_await_loop(client, schema_name, socket_path, bench_timer, scale_mode, busy):
-    tid = client.create_table(schema_name, "t", _SCHEMA)
+def test_async_push_await_loop(client, socket_path, bench_timer, scale_mode, busy):
+    tid = client.create_table("t", _SCHEMA)
     n = _OPS[scale_mode]
     stop = threading.Event()
     spinner = threading.Thread(target=_spin, args=(stop,), daemon=True) if busy else None

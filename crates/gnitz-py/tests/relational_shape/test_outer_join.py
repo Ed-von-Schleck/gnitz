@@ -21,6 +21,7 @@ import operator
 from collections import Counter
 
 from _read import bag, scanned
+from _sql import churn
 
 
 def _cmp(op):
@@ -83,39 +84,39 @@ _VIEWS = {
 
 _OUT = "a.id2 AS aid, a.s AS s, a.note AS note, b.id AS bid"
 
-_DEL = object()
+_COLS = {"a": ("k", "x", "s", "note"), "b": ("k", "y")}
 
-# (statement, changes to a by id2, changes to b by id) — rows as column dicts,
-# `_DEL` deleting the key. Every `a` row has id1 = 0.
+# (statement, table, {key: row}) with `a` keyed by id2 and `b` by id, rows in
+# `_COLS` order; a `None` row deletes the key. Every `a` row has id1 = 0.
 _CHURN = [
     # No b yet: every preserved row fills, a NULL key and a NULL range column alike.
     ("INSERT INTO a VALUES (0, 1, 1, 10, 'alpha', 7), (0, 2, 2, 20, 'beta', NULL), "
-     "(0, 3, NULL, 30, 'gamma', 42), (0, 4, 3, NULL, 'delta', NULL)",
+     "(0, 3, NULL, 30, 'gamma', 42), (0, 4, 3, NULL, 'delta', NULL)", "a",
      {1: (1, 10, "alpha", 7), 2: (2, 20, "beta", None), 3: (None, 30, "gamma", 42),
-      4: (3, None, "delta", None)}, {}),
+      4: (3, None, "delta", None)}),
     # b rows no key matches; b(2) is still a range match for `>`.
-    ("INSERT INTO b VALUES (1, NULL, NULL), (2, NULL, 5)", {}, {1: (None, None), 2: (None, 5)}),
+    ("INSERT INTO b VALUES (1, NULL, NULL), (2, NULL, 5)", "b", {1: (None, None), 2: (None, 5)}),
     # a(1)'s first match retracts its fill in the epoch the pair appears.
-    ("INSERT INTO b VALUES (3, 1, 50)", {}, {3: (1, 50)}),
+    ("INSERT INTO b VALUES (3, 1, 50)", "b", {3: (1, 50)}),
     # A second match leaves a(1) matched at weight 1; b(6) completes a(2)'s k=2 key.
-    ("INSERT INTO b VALUES (4, 1, 15), (6, 2, 20)", {}, {4: (1, 15), 6: (2, 20)}),
+    ("INSERT INTO b VALUES (4, 1, 15), (6, 2, 20)", "b", {4: (1, 15), 6: (2, 20)}),
     # The extreme `y`, and a b row no a row matches.
-    ("INSERT INTO b VALUES (5, 9, 100)", {}, {5: (9, 100)}),
+    ("INSERT INTO b VALUES (5, 9, 100)", "b", {5: (9, 100)}),
     # Deleting the extreme moves the pure-range threshold; the next b does not.
-    ("DELETE FROM b WHERE id = 5", {}, {5: _DEL}),
-    ("DELETE FROM b WHERE id = 4", {}, {4: _DEL}),
+    ("DELETE FROM b WHERE id = 5", "b", {5: None}),
+    ("DELETE FROM b WHERE id = 4", "b", {4: None}),
     # A matched preserved row leaves no `(x, NULL)` tombstone.
-    ("DELETE FROM a WHERE id1 = 0 AND id2 = 1", {1: _DEL}, {}),
+    ("DELETE FROM a WHERE id1 = 0 AND id2 = 1", "a", {1: None}),
     # b is seeded, so a new a's match is decided in the epoch it arrives.
-    ("INSERT INTO a VALUES (0, 5, 1, 12, 'epsilon', 3)", {5: (1, 12, "epsilon", 3)}, {}),
+    ("INSERT INTO a VALUES (0, 5, 1, 12, 'epsilon', 3)", "a", {5: (1, 12, "epsilon", 3)}),
     # A left-only and a right-only fill that both pack their pair key to zeros,
     # told apart only by their null bitmaps.
-    ("INSERT INTO a VALUES (0, 0, 77, 1000, 'zero', NULL)", {0: (77, 1000, "zero", None)}, {}),
-    ("INSERT INTO b VALUES (0, 78, 1)", {}, {0: (78, 1)}),
+    ("INSERT INTO a VALUES (0, 0, 77, 1000, 'zero', NULL)", "a", {0: (77, 1000, "zero", None)}),
+    ("INSERT INTO b VALUES (0, 78, 1)", "b", {0: (78, 1)}),
 ]
 
 
-def test_an_outer_join_null_fills_exactly_its_unmatched_rows_through_churn(client, schema_name):
+def test_an_outer_join_null_fills_exactly_its_unmatched_rows_through_churn(client):
     """Every orientation and shape over one churn: a preserved row null-fills
     once while nothing matches it — however many rows match its partner, and
     whether its key is absent or NULL — retracts the fill in the epoch a match
@@ -127,7 +128,6 @@ def test_an_outer_join_null_fills_exactly_its_unmatched_rows_through_churn(clien
     holds one NULL that leaves with its last carrier, a cut segment emits the
     fills itself, and an INNER step keyed through a null-filled column matches
     nothing — a NULL key and a residual `NULL = x` both drop the row."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE a (id1 BIGINT NOT NULL, id2 BIGINT NOT NULL, k BIGINT, x BIGINT, "
         "s TEXT NOT NULL, note BIGINT, PRIMARY KEY (id1, id2)); "
@@ -147,34 +147,26 @@ def test_an_outer_join_null_fills_exactly_its_unmatched_rows_through_churn(clien
                     f"FROM a LEFT JOIN b ON {_ON[on][0]}) SELECT aid, bid FROM d"
                     for on in ("band", "range_lt")) + "; "
         "CREATE VIEW promoted AS SELECT a.id2 AS aid, c.id AS cid "
-        "FROM a LEFT JOIN b ON a.k = b.k JOIN c ON a.id2 = c.id WHERE b.y = c.w",
-        schema_name=sn)
+        "FROM a LEFT JOIN b ON a.k = b.k JOIN c ON a.id2 = c.id WHERE b.y = c.w")
     c = {1: 50, 2: 5, 3: 0}
 
-    a, b = {}, {}
-    for sql, a_changes, b_changes in _CHURN:
-        client.execute_sql(sql, schema_name=sn)
-        for state, changes, cols in ((a, a_changes, ("k", "x", "s", "note")), (b, b_changes, ("k", "y"))):
-            for key, row in changes.items():
-                if row is _DEL:
-                    del state[key]
-                else:
-                    state[key] = {"id": key, **dict(zip(cols, row))}
-        A, B = list(a.values()), list(b.values())
+    state = {"a": {}, "b": {}}
+    for sql in churn(client, state, _CHURN):
+        A, B = ([{"id": key, **dict(zip(_COLS[t], row))} for key, row in state[t].items()] for t in "ab")
 
         for name, (on, kind, _, where) in _VIEWS.items():
-            assert bag(scanned(client, sn, name), "aid", "s", "note", "bid") == Counter(
+            assert bag(scanned(client, name), "aid", "s", "note", "bid") == Counter(
                 (_col(ar, "id"), _col(ar, "s"), _col(ar, "note"), _col(br, "id"))
                 for ar, br in _join(A, B, _ON[on][1], kind) if where is None or where(ar, br)), (sql, name)
         for name, on in (("grouped", "eq"), ("band_grouped", "band")):
-            assert bag(scanned(client, sn, name), "yy", "n") == dict.fromkeys(Counter(
+            assert bag(scanned(client, name), "yy", "n") == dict.fromkeys(Counter(
                 _col(br, "y") for ar, br in _join(A, B, _ON[on][1], "LEFT") if _GT(ar["x"], 15)).items(), 1), \
                 (sql, name)
-        assert bag(scanned(client, sn, "range_distinct"), "bid") == {
+        assert bag(scanned(client, "range_distinct"), "bid") == {
             (_col(br, "id"),): 1 for ar, br in _join(A, B, _ON["range_lt"][1], "LEFT") if _GT(ar["x"], 15)}, sql
         for on in ("band", "range_lt"):
-            assert bag(scanned(client, sn, f"cut_{on}"), "aid", "bid") == Counter(
+            assert bag(scanned(client, f"cut_{on}"), "aid", "bid") == Counter(
                 (ar["id"], _col(br, "id")) for ar, br in _join(A, B, _ON[on][1], "LEFT")), (sql, on)
-        assert bag(scanned(client, sn, "promoted"), "aid", "cid") == Counter(
+        assert bag(scanned(client, "promoted"), "aid", "cid") == Counter(
             (ar["id"], ar["id"]) for ar, br in _join(A, B, _ON["eq"][1], "LEFT")
             if ar["id"] in c and _EQ(_col(br, "y"), c[ar["id"]])), sql

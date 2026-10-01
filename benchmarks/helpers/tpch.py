@@ -40,10 +40,10 @@ TABLE_DDL = {
 }
 
 
-def create_tables(client, sn: str) -> None:
-    """Create region/nation/customer/orders/lineitem in schema `sn`."""
+def create_tables(client) -> None:
+    """Create region/nation/customer/orders/lineitem."""
     for name in ("region", "nation", "customer", "orders", "lineitem"):
-        client.execute_sql(TABLE_DDL[name], schema_name=sn)
+        client.execute_sql(TABLE_DDL[name])
 
 
 def generate_region():

@@ -209,7 +209,6 @@ def gen_value(rng, name, tc, pools=None, skew=None):
 
 def bulk_load(
     conn,
-    schema_name: str,
     table_name: str,
     num_rows: int,
     seed: int = 42,
@@ -224,7 +223,7 @@ def bulk_load(
     Honors STRING/float/narrow types, nullable columns (emit None at
     `null_rate`), and a `skew` {col: (n, s)} FK-selection map.
     """
-    tid, schema = conn.resolve_table(schema_name, table_name)
+    tid, schema = conn.resolve_table(table_name)
     rng = random.Random(seed)
     cols = schema.columns
     # Keys are sequential integers, so the table has exactly one PK column.
@@ -378,12 +377,12 @@ def stream_factory(append_row, vals):
     return base, stream
 
 
-def stream_and_assert(client, sn, bench_timer, tid, schema, build, sz, read_view,
+def stream_and_assert(client, bench_timer, tid, schema, build, sz, read_view,
                       *, allow_empty=False):
     """Stream `sz["iters"]` delta epochs into (tid, schema), then assert
     `read_view` is non-empty (unless allow_empty). Returns rows streamed."""
     n = stream_deltas(client, bench_timer, tid, schema, build, sz["iters"], sz["delta"])
-    vid, v_sch = client.resolve_table(sn, read_view)
+    vid, v_sch = client.resolve_table(read_view)
     if not allow_empty:
         assert len(client.scan(vid, v_sch)) > 0, f"{read_view} empty after streaming {n} rows"
     return n
@@ -399,9 +398,9 @@ PROBE_BASE = PAYLOAD_MAX + 1
 PROBE_COUNT = max(max(s["read_iters"], s["write_iters"]) for s in SCALES.values())
 
 
-def seed_index_probes(conn, schema_name: str, table_name: str, first_pk: int) -> None:
+def seed_index_probes(conn, table_name: str, first_pk: int) -> None:
     """Push PROBE_COUNT rows into a `(pk, val, cat)` table for `probe_val` to hit."""
-    tid, schema = conn.resolve_table(schema_name, table_name)
+    tid, schema = conn.resolve_table(table_name)
     push_rows(conn, tid, schema,
               [{"pk": first_pk + i, "val": PROBE_BASE + i, "cat": 0}
                for i in range(PROBE_COUNT)])

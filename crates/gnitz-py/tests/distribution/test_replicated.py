@@ -17,20 +17,11 @@ import gnitz
 import pytest
 from _serverproc import NEEDS_MULTI
 from _read import bag, rows, scanned
-from _sql import insert, values
+from _sql import churn, insert, values
 
 pytestmark = NEEDS_MULTI
 
 _REPL = " WITH (replicated = true)"
-
-
-def _apply(state, changes):
-    """`changes` as `{pk: row}` onto `state`; a `None` row deletes the pk."""
-    for pk, row in changes.items():
-        if row is None:
-            del state[pk]
-        else:
-            state[pk] = row
 
 
 # ── Reads return one copy, whatever the verb ─────────────────────────────────
@@ -43,16 +34,15 @@ _DIM = [(i, i % 7, i * 10) for i in range(1, 41)] + \
 
 
 @pytest.fixture(scope="module")
-def dim(module_schema):
-    """A replicated `dim` carrying both index kinds. Read-only."""
-    conn, sn = module_schema
+def dim(module_client):
+    """A connection holding a replicated `dim` with both index kinds. Read-only."""
+    conn = module_client
     conn.execute_sql(
         "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, cust BIGINT NOT NULL, "
-        "val BIGINT NOT NULL)" + _REPL, schema_name=sn)
-    insert(conn, sn, "dim", _DIM)
-    conn.execute_sql("CREATE INDEX ON dim(cust); CREATE UNIQUE INDEX ON dim(val)",
-                     schema_name=sn)
-    return sn
+        "val BIGINT NOT NULL)" + _REPL)
+    insert(conn, "dim", _DIM)
+    conn.execute_sql("CREATE INDEX ON dim(cust); CREATE UNIQUE INDEX ON dim(val)")
+    return conn
 
 
 @pytest.mark.parametrize("where,keep", [
@@ -70,40 +60,36 @@ def dim(module_schema):
                  id="pk-in-list"),
     pytest.param("id BETWEEN 5 AND 12", lambda i, c, v: 5 <= i <= 12, id="pk-range"),
 ])
-def test_a_read_of_a_replicated_table_returns_one_copy(client, dim, where, keep):
+def test_a_read_of_a_replicated_table_returns_one_copy(dim, where, keep):
     """Every worker's copy matches every predicate, so a read that gathered from
     all of them returns each row at weight W. The PK-keyed reads carry the
     opposite hazard: confining one to the worker its key would hash to under
     partitioning is correct only by accident of which copy answers."""
-    got = (scanned(client, dim, "dim") if where is None
-           else rows(client, dim, f"SELECT * FROM dim WHERE {where}"))
+    got = scanned(dim, "dim") if where is None else rows(dim, f"SELECT * FROM dim WHERE {where}")
     assert bag(got, "id", "cust", "val") == {r: 1 for r in _DIM if keep(*r)}
 
 
 @pytest.mark.parametrize("options", ["replicated = true", "stream = true, replicated = true"],
                          ids=["table", "stream"])
-def test_an_aggregate_over_a_replicated_source_counts_one_copy(client, schema_name, options):
+def test_an_aggregate_over_a_replicated_source_counts_one_copy(client, options):
     """Every worker holds the whole relation, so a view that combined the copies
     would count each row W times."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE src (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, "
         f"amount BIGINT NOT NULL) WITH ({options}); "
         "CREATE VIEW per_grp AS SELECT grp, COUNT(*) AS cnt, SUM(amount) AS total "
         "FROM src GROUP BY grp; "
         "CREATE VIEW overall AS SELECT COUNT(*) AS cnt, SUM(amount) AS total FROM src; "
-        "CREATE VIEW top2 AS SELECT id, amount FROM src ORDER BY amount DESC LIMIT 2",
-        schema_name=sn)
+        "CREATE VIEW top2 AS SELECT id, amount FROM src ORDER BY amount DESC LIMIT 2")
 
-    assert bag(scanned(client, sn, "per_grp"), "grp", "cnt", "total") == {}
-    assert bag(scanned(client, sn, "overall"), "cnt", "total") == {(0, None): 1}
-    assert bag(scanned(client, sn, "top2"), "id", "amount") == {}
-    client.execute_sql("INSERT INTO src VALUES (1, 10, 100), (2, 10, 200), (3, 20, 350)",
-                       schema_name=sn)
-    assert bag(scanned(client, sn, "per_grp"), "grp", "cnt", "total") == {
+    assert bag(scanned(client, "per_grp"), "grp", "cnt", "total") == {}
+    assert bag(scanned(client, "overall"), "cnt", "total") == {(0, None): 1}
+    assert bag(scanned(client, "top2"), "id", "amount") == {}
+    client.execute_sql("INSERT INTO src VALUES (1, 10, 100), (2, 10, 200), (3, 20, 350)")
+    assert bag(scanned(client, "per_grp"), "grp", "cnt", "total") == {
         (10, 2, 300): 1, (20, 1, 350): 1}
-    assert bag(scanned(client, sn, "overall"), "cnt", "total") == {(3, 650): 1}
-    assert bag(scanned(client, sn, "top2"), "id", "amount") == {(3, 350): 1, (2, 200): 1}
+    assert bag(scanned(client, "overall"), "cnt", "total") == {(3, 650): 1}
+    assert bag(scanned(client, "top2"), "id", "amount") == {(3, 350): 1, (2, 200): 1}
 
 
 # ── Writes reach every copy ──────────────────────────────────────────────────
@@ -112,7 +98,7 @@ def test_an_aggregate_over_a_replicated_source_counts_one_copy(client, schema_na
 _FACTS = {i: (i % 4 + 1, i % 2 + 1) for i in range(1, 41)}
 
 
-def test_every_write_reaches_every_copy(client, schema_name):
+def test_every_write_reaches_every_copy(client):
     """Replicated `dim` and `dim2`, a partitioned `fact`, and the star
     `(fact ⋈ dim) ⋈ dim2` over them, checked after every write.
 
@@ -126,7 +112,6 @@ def test_every_write_reaches_every_copy(client, schema_name):
     `j` is keyed by its join key, the dim id, but its rows sit on their fact's
     worker, so a seek of it must gather from every worker.
     """
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, nm BIGINT NOT NULL)" + _REPL + "; "
         "CREATE TABLE dim2 (id BIGINT NOT NULL PRIMARY KEY, b BIGINT NOT NULL)" + _REPL + "; "
@@ -135,11 +120,10 @@ def test_every_write_reaches_every_copy(client, schema_name):
         "CREATE VIEW j AS SELECT fact.id AS fid, fact.r2 AS r2, dim.nm AS nm "
         "FROM fact JOIN dim ON fact.r1 = dim.id; "
         "CREATE VIEW star AS SELECT j.fid AS fid, j.nm AS nm, dim2.b AS b "
-        "FROM j JOIN dim2 ON j.r2 = dim2.id", schema_name=sn)
-    dim_id, dim_schema = client.resolve_table(sn, "dim")
-    jid, j_schema = client.resolve_table(sn, "j")
+        "FROM j JOIN dim2 ON j.r2 = dim2.id")
+    dim_id, dim_schema = client.resolve_table("dim")
+    jid, j_schema = client.resolve_table("j")
 
-    # (statement, table, changes); a `None` statement pushes the changes raw.
     steps = [
         ("INSERT INTO dim2 VALUES (1, 1000), (2, 2000)", "dim2", {1: 1000, 2: 2000}),
         ("INSERT INTO dim VALUES (1, 100), (2, 200)", "dim", {1: 100, 2: 200}),
@@ -148,26 +132,19 @@ def test_every_write_reaches_every_copy(client, schema_name):
         ("INSERT INTO dim VALUES (3, 300), (4, 400)", "dim", {3: 300, 4: 400}),
         ("UPDATE dim SET nm = 999 WHERE id = 2", "dim", {2: 999}),
         ("DELETE FROM dim WHERE id = 3", "dim", {3: None}),
-        (None, "dim", {1: 555}),
+        (lambda c: c.push(dim_id, gnitz.ZSetBatch(dim_schema).extend([{"id": 1, "nm": 555}])),
+         "dim", {1: 555}),
         ("DELETE FROM dim2 WHERE id = 1", "dim2", {1: None}),
     ]
     state = {"dim": {}, "dim2": {}, "fact": {}}
-    for sql, table, changes in steps:
-        if sql is None:
-            batch = gnitz.ZSetBatch(dim_schema)
-            for pk, nm in changes.items():
-                batch.append(id=pk, nm=nm)
-            client.push(dim_id, batch)
-        else:
-            client.execute_sql(sql, schema_name=sn)
-        _apply(state[table], changes)
+    for sql in churn(client, state, steps):
         dims, dims2 = state["dim"], state["dim2"]
 
         # joined row -> the dim id it joined on, the key `j` is sought by
         joined = {(f, r2, dims[r1]): r1 for f, (r1, r2) in state["fact"].items() if r1 in dims}
-        assert bag(scanned(client, sn, "dim"), "id", "nm") == dict.fromkeys(dims.items(), 1), sql
-        assert bag(scanned(client, sn, "j"), "fid", "r2", "nm") == dict.fromkeys(joined, 1), sql
-        assert bag(scanned(client, sn, "star"), "fid", "nm", "b") == {
+        assert bag(scanned(client, "dim"), "id", "nm") == dict.fromkeys(dims.items(), 1), sql
+        assert bag(scanned(client, "j"), "fid", "r2", "nm") == dict.fromkeys(joined, 1), sql
+        assert bag(scanned(client, "star"), "fid", "nm", "b") == {
             (f, nm, dims2[r2]): 1 for f, r2, nm in joined if r2 in dims2}, sql
         for k in range(1, 5):
             assert bag(client.seek(jid, j_schema, pk=k), "fid", "r2", "nm") == {
@@ -274,7 +251,7 @@ def _want(a, b, c):
 
 @pytest.mark.parametrize("a_repl,b_repl", [(True, True), (False, True), (True, False)],
                          ids=["both-replicated", "b-replicated", "a-replicated"])
-def test_every_shape_keeps_its_weights_over_replicated_sources(client, schema_name,
+def test_every_shape_keeps_its_weights_over_replicated_sources(client,
                                                                a_repl, b_repl):
     """Each view equals its Z-set definition after every epoch, whichever of its
     sources are replicated.
@@ -293,20 +270,39 @@ def test_every_shape_keeps_its_weights_over_replicated_sources(client, schema_na
     unions a partitioned table with `ua`, which is replicated when both its
     sources are.
     """
-    sn = schema_name
     client.execute_sql(
         f"CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, x BIGINT)"
         f"{_REPL if a_repl else ''}; "
         f"CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, y BIGINT NOT NULL)"
         f"{_REPL if b_repl else ''}; "
         "CREATE TABLE c (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, x BIGINT); "
-        + "; ".join(f"CREATE VIEW {n} AS {body}" for n, (_, body) in _VIEWS.items()),
-        schema_name=sn)
+        + "; ".join(f"CREATE VIEW {n} AS {body}" for n, (_, body) in _VIEWS.items()))
 
     state = {"a": {}, "b": {}, "c": {}}
-    for sql, table, changes in _CHURN:
-        client.execute_sql(sql, schema_name=sn)
-        _apply(state[table], changes)
+    for sql in churn(client, state, _CHURN):
         want = _want(state["a"], state["b"], state["c"])
         for name, (cols, _) in _VIEWS.items():
-            assert bag(scanned(client, sn, name), *cols) == want[name], (sql, name)
+            assert bag(scanned(client, name), *cols) == want[name], (sql, name)
+
+
+def test_an_uncorrelated_scalar_over_a_replicated_relation_counts_once(client):
+    """The subquery's one row is computed on every worker that holds the
+    replicated relation, and must reach each outer row once — through an empty
+    relation, where it is the ground row, at both ends."""
+    client.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL); "
+        "CREATE TABLE rb (id BIGINT NOT NULL PRIMARY KEY, w BIGINT NOT NULL) WITH (replicated = true); "
+        "CREATE VIEW lt_max_r AS SELECT a.id FROM a WHERE a.v < (SELECT MAX(w) FROM rb); "
+        "CREATE VIEW proj_r AS SELECT a.id, (SELECT COUNT(*) FROM rb) AS n FROM a; "
+        "INSERT INTO a VALUES " + ", ".join(f"({i}, {i})" for i in range(1, 21)))
+    rb = {}
+    for sql in churn(client, rb, [
+        ("SELECT 1", {}),
+        ("INSERT INTO rb VALUES (1, 5), (2, 12)", {1: 5, 2: 12}),
+        ("INSERT INTO rb VALUES (3, 30)", {3: 30}),
+        ("DELETE FROM rb WHERE id = 3", {3: None}),
+        ("DELETE FROM rb", {1: None, 2: None}),
+    ]):
+        top = max(rb.values(), default=None)
+        assert bag(scanned(client, "lt_max_r"), "id") == {(i,): 1 for i in range(1, 21) if _lt(i, top)}, sql
+        assert bag(scanned(client, "proj_r"), "id", "n") == {(i, len(rb)): 1 for i in range(1, 21)}, sql

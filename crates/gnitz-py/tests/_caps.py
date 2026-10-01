@@ -8,6 +8,7 @@ tells them nothing, which is why it is asserted against here rather than
 tolerated as "some error".
 """
 
+import gnitz
 import pytest
 
 
@@ -35,7 +36,7 @@ def first_rejected(run, ns):
     for n in ns:
         try:
             run(n)
-        except Exception as e:
+        except gnitz.GnitzRefusedError as e:
             assert names_a_cap(e), f"n={n}: the message must name the limit, got: {e}"
             assert n > ns.start, f"n={n}: the smallest shape must be servable"
             return n

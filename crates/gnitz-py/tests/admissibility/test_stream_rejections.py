@@ -12,23 +12,19 @@ from _read import bag
 
 
 @pytest.fixture(scope="module")
-def streamed(module_schema):
-    """`(conn, schema)` holding a stream `s` and an ordinary table `t`; no test
-    here changes either."""
-    conn, sn = module_schema
-    conn.execute_sql(
+def conn(module_client):
+    """A stream `s` and an ordinary table `t`; no test here changes either."""
+    module_client.execute_sql(
         "CREATE TABLE s (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, kind BIGINT NOT NULL, "
         "amount BIGINT NOT NULL) WITH (stream = true); "
         "CREATE TABLE t (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, kind BIGINT NOT NULL)",
-        schema_name=sn,
     )
-    return conn, sn
+    return module_client
 
 
-def test_no_binary_read_verb_serves_a_stream(streamed):
+def test_no_binary_read_verb_serves_a_stream(conn):
     """Each verb is wired to the guard on its own."""
-    conn, sn = streamed
-    tid, schema = conn.resolve_table(sn, "s")
+    tid, schema = conn.resolve_table("s")
     for verb in (
         lambda: conn.scan(tid, schema),
         lambda: conn.seek(tid, schema, 1),
@@ -36,18 +32,17 @@ def test_no_binary_read_verb_serves_a_stream(streamed):
         lambda: conn.scan_many([(tid, schema)]),
         lambda: conn.delta_bootstrap(tid, schema),
     ):
-        with pytest.raises(gnitz.GnitzError, match="stream"):
+        with pytest.raises(gnitz.GnitzRefusedError, match="stream"):
             verb()
 
 
-def test_a_transaction_writing_a_stream_is_refused_whole(streamed):
+def test_a_transaction_writing_a_stream_is_refused_whole(conn):
     """A transaction promises all-or-nothing recovery and stream data is never
     recovered, so a transaction touching a stream is refused — its writes to the
     ordinary table included, rather than lost after a partial commit."""
-    conn, sn = streamed
-    t_tid, t_schema = conn.resolve_table(sn, "t")
-    s_tid, s_schema = conn.resolve_table(sn, "s")
-    with pytest.raises(gnitz.GnitzError, match="stream"):
+    t_tid, t_schema = conn.resolve_table("t")
+    s_tid, s_schema = conn.resolve_table("s")
+    with pytest.raises(gnitz.GnitzRefusedError, match="stream"):
         with conn.transaction() as txn:
             txn.push(t_tid, gnitz.ZSetBatch(t_schema).extend([{"id": 1, "kind": 1}]))
             txn.push(s_tid, gnitz.ZSetBatch(s_schema).extend([{"id": 2, "kind": 2, "amount": 2}]))

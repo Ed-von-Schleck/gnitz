@@ -11,7 +11,9 @@ Run with GNITZ_WORKERS=4 — the desugared joins exchange.
 """
 from collections import Counter
 
-from _read import bag, rows, scanned
+import gnitz
+import pytest
+from _read import bag, scanned
 
 
 def _agg(kind, vals):
@@ -130,19 +132,18 @@ _CHURN = [
 ]
 
 
-def test_every_window_moves_with_the_data(client, schema_name):
+def test_every_window_moves_with_the_data(client):
     """Every frame shape over one churn, each view compared whole after every
     epoch."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE ev (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, ts BIGINT NOT NULL, "
         "a BIGINT NOT NULL, b BIGINT); "
         "CREATE TABLE grp (id BIGINT NOT NULL PRIMARY KEY, region BIGINT NOT NULL); "
-        + "; ".join(f"CREATE VIEW {v}" for v in _VIEWS), schema_name=sn)
+        + "; ".join(f"CREATE VIEW {v}" for v in _VIEWS))
 
     state = {"ev": {}, "grp": {}}
     for sql, table, changes in _CHURN:
-        client.execute_sql(sql, schema_name=sn)
+        client.execute_sql(sql)
         for i, change in changes.items():
             if change is None:
                 del state[table][i]
@@ -152,7 +153,7 @@ def test_every_window_moves_with_the_data(client, schema_name):
         rows = list(ev.values())
 
         def check(view, cols, want):
-            assert bag(scanned(client, sn, view), *cols) == Counter(want), (sql, view)
+            assert bag(scanned(client, view), *cols) == Counter(want), (sql, view)
 
         s, c, cb, sb = (_whole(rows, ["k"], *f) for f in (("SUM", "a"), ("COUNT*",), ("COUNT", "b"), ("SUM", "b")))
         mn, mx, av = (_whole(rows, ["k"], *f) for f in (("MIN", "a"), ("MAX", "b"), ("AVG", "a")))
@@ -206,47 +207,44 @@ def test_every_window_moves_with_the_data(client, schema_name):
               [(x["id"], x["parity"], x["a"], ns[x["id"]], nr[x["id"]]) for x in kept])
 
 
-def test_a_computed_window_argument_or_key_is_declared_as_the_value_it_computes(client, schema_name):
+def test_a_computed_window_argument_or_key_is_declared_as_the_value_it_computes(client):
     """A window hoists each computed argument and key into a column of its own,
     declared as the value it computes: `-q` over an unsigned column is a negative
     64-bit value, a cast to REAL a double. A date difference over a NOT NULL date
     is a provably NOT NULL key — a date literal is never NULL — and partitions
     exactly as the date does."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE w (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, q INT UNSIGNED NOT NULL, "
         "x BIGINT NOT NULL, d DATE NOT NULL); "
         "CREATE VIEW neg AS SELECT id, g, SUM(-q) OVER (PARTITION BY g) AS s FROM w; "
         "CREATE VIEW reals AS SELECT id, g, SUM(CAST(x AS REAL)) OVER (PARTITION BY g) AS s FROM w; "
         "CREATE VIEW by_day AS SELECT id, COUNT(*) OVER (PARTITION BY d - DATE '2020-01-01') AS c FROM w; "
-        "CREATE VIEW by_d AS SELECT id, COUNT(*) OVER (PARTITION BY d) AS c FROM w", schema_name=sn)
+        "CREATE VIEW by_d AS SELECT id, COUNT(*) OVER (PARTITION BY d) AS c FROM w")
 
-    def check():
-        for view, agg in (("neg", "SUM(-q)"), ("reals", "SUM(CAST(x AS REAL))")):
-            per_group = {g: s for (g, s) in bag(rows(client, sn, f"SELECT g, {agg} AS s FROM w GROUP BY g"), "g", "s")}
-            got = bag(scanned(client, sn, view), "id", "g", "s")
-            assert got == {(i, g, per_group[g]): 1 for (i, g, _) in got}, view
-            assert {g for (_, g, _) in got} == set(per_group), view
-        assert bag(scanned(client, sn, "by_day"), "id", "c") == bag(scanned(client, sn, "by_d"), "id", "c")
+    def check(neg, reals, per_day):
+        assert bag(scanned(client, "neg"), "id", "g", "s") == dict.fromkeys(neg, 1)
+        assert bag(scanned(client, "reals"), "id", "g", "s") == dict.fromkeys(reals, 1)
+        assert bag(scanned(client, "by_day"), "id", "c") == bag(scanned(client, "by_d"), "id", "c") \
+            == dict.fromkeys(per_day, 1)
 
     client.execute_sql(
         "INSERT INTO w VALUES (1, 1, 4000000000, 5, DATE '2020-01-03'), (2, 1, 3, -7, DATE '2020-01-03'), "
-        "(3, 2, 10, 70000, DATE '2019-12-31')", schema_name=sn)
-    check()
-    assert bag(scanned(client, sn, "neg"), "id", "s") == {(1, -4000000003): 1, (2, -4000000003): 1, (3, -10): 1}
-    assert bag(scanned(client, sn, "by_day"), "id", "c") == {(1, 2): 1, (2, 2): 1, (3, 1): 1}
-    client.execute_sql("UPDATE w SET d = DATE '2019-12-31', g = 2 WHERE id = 2", schema_name=sn)
-    check()
-    assert bag(scanned(client, sn, "by_day"), "id", "c") == {(1, 1): 1, (2, 2): 1, (3, 2): 1}
+        "(3, 2, 10, 70000, DATE '2019-12-31')")
+    check([(1, 1, -4000000003), (2, 1, -4000000003), (3, 2, -10)],
+          [(1, 1, -2.0), (2, 1, -2.0), (3, 2, 70000.0)],
+          [(1, 2), (2, 2), (3, 1)])
+    client.execute_sql("UPDATE w SET d = DATE '2019-12-31', g = 2 WHERE id = 2")
+    check([(1, 1, -4000000000), (2, 2, -13), (3, 2, -13)],
+          [(1, 1, 5.0), (2, 2, 69993.0), (3, 2, 69993.0)],
+          [(1, 1), (2, 2), (3, 2)])
 
 
-def test_row_number_reads_the_row_key_off_the_registered_view(client, schema_name):
+def test_row_number_reads_the_row_key_off_the_registered_view(client):
     """`ROW_NUMBER` numbers the rows of its input, so it needs one whose PK
     identifies a row. Which relations have one is carried on the relation itself
     and travels back to a later statement's planner through RESOLVE: a view over
     a stream, a join view keyed on the join key and a `LIMIT n > 1` top-N view all
     lose it, while a plain projection over a table keeps it."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE s (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, a BIGINT NOT NULL) "
         "WITH (stream = true); "
@@ -255,18 +253,13 @@ def test_row_number_reads_the_row_key_off_the_registered_view(client, schema_nam
         "CREATE VIEW sv AS SELECT id, a FROM s; "
         "CREATE VIEW jv AS SELECT t.id AS id, t.a AS a FROM t JOIN u ON t.k = u.k; "
         "CREATE VIEW tv AS SELECT id, a FROM t ORDER BY a LIMIT 2; "
-        "CREATE VIEW pv AS SELECT id, a FROM t", schema_name=sn)
+        "CREATE VIEW pv AS SELECT id, a FROM t")
 
     for name in ("sv", "jv", "tv"):
-        try:
+        with pytest.raises(gnitz.GnitzRefusedError, match="unique row key"):
             client.execute_sql(
-                f"CREATE VIEW rn_{name} AS SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM {name}",
-                schema_name=sn)
-        except Exception as e:
-            assert "unique row key" in str(e), (name, e)
-        else:
-            raise AssertionError(f"{name}: ROW_NUMBER over a repeating PK must be refused")
+                f"CREATE VIEW rn_{name} AS SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM {name}")
     client.execute_sql(
-        "CREATE VIEW rn_pv AS SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM pv", schema_name=sn)
-    client.execute_sql("INSERT INTO t VALUES (1, 1, 30), (2, 1, 10), (3, 2, 20)", schema_name=sn)
-    assert bag(scanned(client, sn, "rn_pv"), "a", "rn") == {(10, 1): 1, (20, 2): 1, (30, 3): 1}
+        "CREATE VIEW rn_pv AS SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM pv")
+    client.execute_sql("INSERT INTO t VALUES (1, 1, 30), (2, 1, 10), (3, 2, 20)")
+    assert bag(scanned(client, "rn_pv"), "a", "rn") == {(10, 1): 1, (20, 2): 1, (30, 3): 1}

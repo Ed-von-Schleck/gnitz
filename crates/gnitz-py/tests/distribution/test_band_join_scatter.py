@@ -28,23 +28,21 @@ _Q = [(k, b, k * 10 + 2 * b) for k in range(1, 7) for b in range(1, 4)]
 
 
 @pytest.mark.parametrize("cluster_by_k", [True, False], ids=["cluster_by_k", "cluster_by_the_whole_pk"])
-def test_a_band_join_matches_whatever_the_distribution_prefix_is(client, schema_name, cluster_by_k):
+def test_a_band_join_matches_whatever_the_distribution_prefix_is(client, cluster_by_k):
     clause = " CLUSTER BY k" if cluster_by_k else ""
     for name in ("p", "q"):
         client.execute_sql(
             f"CREATE TABLE {name} (k BIGINT NOT NULL, b BIGINT NOT NULL, t BIGINT NOT NULL, "
-            f"PRIMARY KEY (k, b)){clause}",
-            schema_name=schema_name)
+            f"PRIMARY KEY (k, b)){clause}")
     # Half the rows before the view (backfill) and half after (the relay under
     # test), so one run covers both paths into the join.
-    insert(client, schema_name, "p", _P[::2])
-    insert(client, schema_name, "q", _Q[::2])
+    insert(client, "p", _P[::2])
+    insert(client, "q", _Q[::2])
     client.execute_sql(
         "CREATE VIEW v AS SELECT p.k AS k, p.b AS pb, q.b AS qb "
-        "FROM p JOIN q ON p.k = q.k AND p.t < q.t",
-        schema_name=schema_name)
-    insert(client, schema_name, "p", _P[1::2])
-    insert(client, schema_name, "q", _Q[1::2])
+        "FROM p JOIN q ON p.k = q.k AND p.t < q.t")
+    insert(client, "p", _P[1::2])
+    insert(client, "q", _Q[1::2])
 
     want = Counter((pk, pb, qb) for pk, pb, pt in _P for qk, qb, qt in _Q if pk == qk and pt < qt)
-    assert bag(rows(client, schema_name, "SELECT * FROM v")) == dict(want)
+    assert bag(rows(client, "SELECT * FROM v")) == dict(want)

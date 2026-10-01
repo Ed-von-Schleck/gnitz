@@ -1,5 +1,6 @@
 from gnitz._native import (
-    GnitzError, GnitzConflictError, GnitzDeltaExpiredError,
+    GnitzError, GnitzRefusedError, GnitzConnectionError,
+    GnitzConflictError, GnitzDeltaExpiredError,
     GnitzSalFullError, GnitzMirrorPoisonedError, GnitzNotFoundError,
     GnitzIntegrityError, Row, ScanResult,
     ColumnDef, Schema, ZSetBatch, GnitzClient, DeltaReply,
@@ -11,5 +12,6 @@ from gnitz._native import (
 from gnitz._types import TypeCode
 
 
-def connect(target):
-    return GnitzClient(target)
+def connect(target, schema="public"):
+    """A connection whose names resolve in `schema`."""
+    return GnitzClient(target, schema)

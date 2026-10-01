@@ -28,25 +28,24 @@ DURATION = {"quick": 3.0, "full": 10.0}
 READERS = 3
 
 
-def _setup(client, sn, groups):
+def _setup(client, groups):
     client.execute_sql("CREATE TABLE o (pk BIGINT NOT NULL PRIMARY KEY, "
-                       "cust BIGINT UNSIGNED NOT NULL, amt BIGINT NOT NULL)", schema_name=sn)
+                       "cust BIGINT UNSIGNED NOT NULL, amt BIGINT NOT NULL)")
     # Natural-key view: group column cust is single non-nullable U64 (R3).
-    client.execute_sql("CREATE VIEW rev AS SELECT cust, SUM(amt) AS s FROM o GROUP BY cust",
-                       schema_name=sn)
+    client.execute_sql("CREATE VIEW rev AS SELECT cust, SUM(amt) AS s FROM o GROUP BY cust")
     # Passthrough filter view, seekable by base PK.
-    client.execute_sql("CREATE VIEW passthru AS SELECT * FROM o WHERE amt >= 0", schema_name=sn)
-    tid, schema = client.resolve_table(sn, "o")
+    client.execute_sql("CREATE VIEW passthru AS SELECT * FROM o WHERE amt >= 0")
+    tid, schema = client.resolve_table("o")
     b = gnitz.ZSetBatch(schema)
     for k in range(1, groups + 1):
         b.append(pk=k, cust=k, amt=(k % 100) + 1)
     client.push(tid, b)
 
 
-def _bg_writer(sn, groups):
+def _bg_writer(groups):
     """Background load: stream fresh base rows to random base custs."""
     def writer_fn(conn, deadline):
-        tid, schema = conn.resolve_table(sn, "o")
+        tid, schema = conn.resolve_table("o")
         rng = random.Random(os.getpid())
         pk = PK_BASE + os.getpid() * 100_000_000
         commits = 0
@@ -74,15 +73,14 @@ def _record(bench_timer, res, dur):
     assert res["torn_reads"] == 0, f"observed {res['torn_reads']} stale seeks (RYOW violated)"
 
 
-def test_serving_natural(client, socket_path, schema_name, bench_timer, scale_mode):
-    sn = schema_name
+def test_serving_natural(client, socket_path, bench_timer, scale_mode):
     sz = SERVING_SIZES[scale_mode]
     dur = DURATION[scale_mode]
-    _setup(client, sn, sz["groups"])
+    _setup(client, sz["groups"])
 
     def reader_fn(conn, deadline):
-        o_tid, o_sch = conn.resolve_table(sn, "o")
-        vid, v_sch = conn.resolve_table(sn, "rev")
+        o_tid, o_sch = conn.resolve_table("o")
+        vid, v_sch = conn.resolve_table("rev")
         mygroup = READER_GROUP_BASE + (os.getpid() % 5_000_000)
         pk = PK_BASE + os.getpid() * 100_000_000
         total = ops = stale = 0
@@ -100,19 +98,18 @@ def test_serving_natural(client, socket_path, schema_name, bench_timer, scale_mo
             ops += 1
         return {"ops": ops, "latencies": lat, "torn_reads": stale}
 
-    res = run_htap(socket_path, _bg_writer(sn, sz["groups"]), reader_fn, 1, READERS, dur)
+    res = run_htap(socket_path, client.schema, _bg_writer(sz["groups"]), reader_fn, 1, READERS, dur)
     _record(bench_timer, res, dur)
 
 
-def test_serving_passthrough(client, socket_path, schema_name, bench_timer, scale_mode):
-    sn = schema_name
+def test_serving_passthrough(client, socket_path, bench_timer, scale_mode):
     sz = SERVING_SIZES[scale_mode]
     dur = DURATION[scale_mode]
-    _setup(client, sn, sz["groups"])
+    _setup(client, sz["groups"])
 
     def reader_fn(conn, deadline):
-        o_tid, o_sch = conn.resolve_table(sn, "o")
-        vid, v_sch = conn.resolve_table(sn, "passthru")
+        o_tid, o_sch = conn.resolve_table("o")
+        vid, v_sch = conn.resolve_table("passthru")
         pk = PK_BASE + os.getpid() * 100_000_000
         ops = stale = 0
         lat = []
@@ -128,5 +125,5 @@ def test_serving_passthrough(client, socket_path, schema_name, bench_timer, scal
             ops += 1
         return {"ops": ops, "latencies": lat, "torn_reads": stale}
 
-    res = run_htap(socket_path, _bg_writer(sn, sz["groups"]), reader_fn, 1, READERS, dur)
+    res = run_htap(socket_path, client.schema, _bg_writer(sz["groups"]), reader_fn, 1, READERS, dur)
     _record(bench_timer, res, dur)

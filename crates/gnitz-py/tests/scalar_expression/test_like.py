@@ -51,43 +51,42 @@ _PATTERNS = {
 _FLAGS = "SELECT id, s LIKE 'a%' AS flag, s ILIKE 'A%' AS iflag FROM t"
 
 
-def test_a_pattern_answers_alike_on_every_surface_as_its_rows_move(client, schema_name):
+def test_a_pattern_answers_alike_on_every_surface_as_its_rows_move(client):
     """The pattern is compiled into the circuit at CREATE time and into a
     residual at read and DML time; the compilations must agree row for row. A
     row whose value changes must be retracted from every view it no longer
     matches and admitted to every one it now does — each exactly once — and a
     row that arrives only later is matched by the pattern compiled earlier."""
-    sn = schema_name
-    client.execute_sql("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT)", schema_name=sn)
+    client.execute_sql("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
     views = {p: f"v{n}" for n, p in enumerate(_PATTERNS)}
     for p, v in views.items():
-        client.execute_sql(f"CREATE VIEW {v} AS SELECT id FROM t WHERE {p}", schema_name=sn)
+        client.execute_sql(f"CREATE VIEW {v} AS SELECT id FROM t WHERE {p}")
     # A LIKE is a value as much as a predicate, so it can be projected and
     # stored — with the NULL a NULL subject produces surviving into the column.
-    client.execute_sql(f"CREATE VIEW flags AS {_FLAGS}", schema_name=sn)
-    client.execute_sql(f"INSERT INTO t VALUES {_ROWS}", schema_name=sn)
+    client.execute_sql(f"CREATE VIEW flags AS {_FLAGS}")
+    client.execute_sql(f"INSERT INTO t VALUES {_ROWS}")
 
     def ids(pred):
-        return bag(scanned(client, sn, views[pred]))
+        return bag(scanned(client, views[pred]))
 
     def every_surface_agrees():
         for p, v in views.items():
-            assert bag(scanned(client, sn, v)) == \
-                bag(rows(client, sn, f"SELECT id FROM t WHERE {p}")), p
-        assert bag(scanned(client, sn, "flags")) == bag(rows(client, sn, _FLAGS))
+            assert bag(scanned(client, v)) == \
+                bag(rows(client, f"SELECT id FROM t WHERE {p}")), p
+        assert bag(scanned(client, "flags")) == bag(rows(client, _FLAGS))
 
     for p, want in _PATTERNS.items():
         assert ids(p) == {(i,): 1 for i in want}, p
-    assert bag(scanned(client, sn, "flags")) == {
+    assert bag(scanned(client, "flags")) == {
         (1, 1, 1): 1, (2, 1, 1): 1, (3, 0, 0): 1, (4, 0, 0): 1,
         (5, 0, 1): 1, (6, 0, 0): 1, (7, 0, 0): 1, (8, None, None): 1,
     }
     every_surface_agrees()
 
-    client.execute_sql("DELETE FROM t WHERE id = 2", schema_name=sn)
-    client.execute_sql("UPDATE t SET s = 'abq' WHERE id = 5", schema_name=sn)
-    client.execute_sql("UPDATE t SET s = 'inexact' WHERE id = 4", schema_name=sn)
-    client.execute_sql("INSERT INTO t VALUES (9, 'abz')", schema_name=sn)
+    client.execute_sql("DELETE FROM t WHERE id = 2")
+    client.execute_sql("UPDATE t SET s = 'abq' WHERE id = 5")
+    client.execute_sql("UPDATE t SET s = 'inexact' WHERE id = 4")
+    client.execute_sql("INSERT INTO t VALUES (9, 'abz')")
     assert ids("s LIKE 'ab%'") == {(1,): 1, (5,): 1, (9,): 1}
     assert ids("s LIKE '%yz'") == {}
     assert ids("s LIKE 'a_c%'") == {(1,): 1}, "`a_c%` needs a `c` in third place"
@@ -95,9 +94,9 @@ def test_a_pattern_answers_alike_on_every_surface_as_its_rows_move(client, schem
     every_surface_agrees()
 
     # What a LIKE view holds is exactly what a LIKE delete removes.
-    client.execute_sql("DELETE FROM t WHERE s ILIKE 'a%'", schema_name=sn)
-    client.execute_sql("UPDATE t SET s = 'touched' WHERE s LIKE '100%'", schema_name=sn)
-    assert bag(scanned(client, sn, "t")) == {
+    client.execute_sql("DELETE FROM t WHERE s ILIKE 'a%'")
+    client.execute_sql("UPDATE t SET s = 'touched' WHERE s LIKE '100%'")
+    assert bag(scanned(client, "t")) == {
         (3, "xxmidxx"): 1, (4, "inexact"): 1, (6, "touched"): 1, (7, "touched"): 1,
         (8, None): 1}
     every_surface_agrees()

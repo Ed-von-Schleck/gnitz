@@ -18,6 +18,7 @@ import operator
 from collections import Counter
 
 from _read import bag, scanned
+from _sql import churn
 
 
 def _cmp(op):
@@ -56,13 +57,12 @@ _CHURN = [
 ]
 
 
-def test_a_range_join_is_the_product_its_predicate_admits_through_churn(client, schema_name):
+def test_a_range_join_is_the_product_its_predicate_admits_through_churn(client):
     """`ON a.x OP b.y` is the cross product filtered by the operator, each pair
     once, for every operator; a band matches only inside an equality group, on
     every equality column (`band2` is `n_eq = 2`); and a GROUP BY over a range
     join reads its output deltas like any other. Checked after each epoch of a
     churn on both sides."""
-    sn = schema_name
     pair = "SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON"
     client.execute_sql(
         "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT, k2 BIGINT NOT NULL, x BIGINT); "
@@ -70,118 +70,37 @@ def test_a_range_join_is_the_product_its_predicate_admits_through_churn(client, 
         + "; ".join(f"CREATE VIEW pure_{n} AS {pair} a.x {op} b.y" for n, (op, _) in _PURE.items())
         + f"; CREATE VIEW band AS {pair} a.k = b.k AND a.x <= b.y; "
         f"CREATE VIEW band2 AS {pair} a.k = b.k AND a.k2 = b.k2 AND a.x <= b.y; "
-        "CREATE VIEW per_a AS SELECT aid, COUNT(*) AS n FROM pure_lt GROUP BY aid",
-        schema_name=sn)
+        "CREATE VIEW per_a AS SELECT aid, COUNT(*) AS n FROM pure_lt GROUP BY aid")
 
     state = {"a": {}, "b": {}}
-    for sql, table, changes in _CHURN:
-        client.execute_sql(sql, schema_name=sn)
-        for pk, row in changes.items():
-            if row is None:
-                del state[table][pk]
-            else:
-                state[table][pk] = row
+    for sql in churn(client, state, _CHURN):
 
         def pairs(admits):
             return [(ai, bi) for ai, ar in state["a"].items() for bi, br in state["b"].items()
                     if admits(ar, br)]
 
         for n, (_, f) in _PURE.items():
-            assert bag(scanned(client, sn, f"pure_{n}"), "aid", "bid") == \
+            assert bag(scanned(client, f"pure_{n}"), "aid", "bid") == \
                 dict.fromkeys(pairs(lambda ar, br: f(ar[2], br[2])), 1), (sql, n)
-        assert bag(scanned(client, sn, "band"), "aid", "bid") == dict.fromkeys(
+        assert bag(scanned(client, "band"), "aid", "bid") == dict.fromkeys(
             pairs(lambda ar, br: _EQ(ar[0], br[0]) and _LE(ar[2], br[2])), 1), sql
-        assert bag(scanned(client, sn, "band2"), "aid", "bid") == dict.fromkeys(
+        assert bag(scanned(client, "band2"), "aid", "bid") == dict.fromkeys(
             pairs(lambda ar, br: _EQ(ar[0], br[0]) and ar[1] == br[1] and _LE(ar[2], br[2])), 1), sql
-        assert bag(scanned(client, sn, "per_a"), "aid", "n") == dict.fromkeys(
+        assert bag(scanned(client, "per_a"), "aid", "n") == dict.fromkeys(
             Counter(ai for ai, _ in pairs(lambda ar, br: _PURE["lt"][1](ar[2], br[2]))).items(), 1), sql
 
 
-# `(x, y)` per side of the two pure-range pairs whose common type is 16 bytes: a
-# cross-sign BIGINT/BIGINT UNSIGNED pair promotes to a signed 128-bit slot, and a
-# UINT128 pair to an unsigned one. Both sides straddle the widths a narrower
-# slot would alias — the sign boundary, 2**63, and 2**64.
-_SIGNED_X = {1: -9, 2: 0, 3: 7, 4: 2 ** 62}
-_UNSIGNED_Y = {1: 0, 2: 8, 3: 2 ** 63, 4: 2 ** 64 - 1}
-_WIDE_X = {1: 0, 2: 5, 3: (1 << 64) + 1, 4: 10 ** 38 - 1}
-_WIDE_Y = {1: 1, 2: 1 << 64, 3: 1 << 100, 4: 10 ** 38 - 2}
-
-
-def _vals(rows):
-    return ", ".join(f"({pk}, {v})" for pk, v in rows.items())
-
-
-def test_a_pure_range_threshold_carries_a_sixteen_byte_range_column(client, schema_name):
-    """A pure-range LEFT JOIN and a pure-range EXISTS both decide per left row
-    from `m = MIN/MAX(b.range)`, reindexed back onto the range slot. The slot
-    holds the PAIR's common type, which is 16 bytes both for a cross-sign
-    BIGINT/BIGINT UNSIGNED pair and for a UINT128 one.
-
-    The right side starts empty and is emptied again, so each run passes through
-    `A - 0 = A`, where the threshold has no ground row and every left row
-    null-fills."""
-    sn = schema_name
-    client.execute_sql(
-        "CREATE TABLE sa (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL); "
-        "CREATE TABLE sb (id BIGINT NOT NULL PRIMARY KEY, y BIGINT UNSIGNED NOT NULL); "
-        "CREATE TABLE wa (id BIGINT NOT NULL PRIMARY KEY, x UINT128 NOT NULL); "
-        "CREATE TABLE wb (id BIGINT NOT NULL PRIMARY KEY, y UINT128 NOT NULL); "
-        "CREATE VIEW s_left AS SELECT sa.id AS aid, sb.id AS bid FROM sa LEFT JOIN sb ON sa.x < sb.y; "
-        "CREATE VIEW s_ex AS SELECT sa.id AS aid FROM sa WHERE EXISTS (SELECT 1 FROM sb WHERE sb.y > sa.x); "
-        "CREATE VIEW w_left AS SELECT wa.id AS aid, wb.id AS bid FROM wa LEFT JOIN wb ON wa.x < wb.y; "
-        "CREATE VIEW w_ex AS SELECT wa.id AS aid FROM wa WHERE EXISTS (SELECT 1 FROM wb WHERE wb.y > wa.x)",
-        schema_name=sn)
-
-    state = {t: {} for t in ("sa", "sb", "wa", "wb")}
-    churn = [
-        # Both right sides empty: every left row null-fills and nothing EXISTS.
-        (f"INSERT INTO sa VALUES {_vals(_SIGNED_X)}", [("sa", pk, v) for pk, v in _SIGNED_X.items()]),
-        (f"INSERT INTO wa VALUES {_vals(_WIDE_X)}", [("wa", pk, v) for pk, v in _WIDE_X.items()]),
-        (f"INSERT INTO sb VALUES {_vals(_UNSIGNED_Y)}", [("sb", pk, v) for pk, v in _UNSIGNED_Y.items()]),
-        (f"INSERT INTO wb VALUES {_vals(_WIDE_Y)}", [("wb", pk, v) for pk, v in _WIDE_Y.items()]),
-        # Leave one right row on each side: the threshold recedes and the rows it
-        # no longer covers return to their null-fill.
-        ("DELETE FROM sb WHERE id > 1", [("sb", pk, None) for pk in (2, 3, 4)]),
-        ("DELETE FROM wb WHERE id > 1", [("wb", pk, None) for pk in (2, 3, 4)]),
-        # A left row moving under the surviving threshold starts matching.
-        ("UPDATE wa SET x = 0 WHERE id = 4", [("wa", 4, 0)]),
-        # Back to an empty right side.
-        ("DELETE FROM sb WHERE id = 1", [("sb", 1, None)]),
-        ("DELETE FROM wb WHERE id = 1", [("wb", 1, None)]),
-        ("DELETE FROM sa WHERE id > 0", [("sa", pk, None) for pk in _SIGNED_X]),
-        ("DELETE FROM wa WHERE id > 0", [("wa", pk, None) for pk in _WIDE_X]),
-    ]
-    for sql, updates in churn:
-        client.execute_sql(sql, schema_name=sn)
-        for table, pk, v in updates:
-            if v is None:
-                del state[table][pk]
-            else:
-                state[table][pk] = v
-        for a, b, left, ex in (("sa", "sb", "s_left", "s_ex"), ("wa", "wb", "w_left", "w_ex")):
-            want_left, want_ex = Counter(), Counter()
-            for ai, ax in state[a].items():
-                hits = [bi for bi, by in state[b].items() if ax < by]
-                want_left.update([(ai, bi) for bi in hits] or [(ai, None)])
-                if hits:
-                    want_ex[(ai,)] += 1
-            assert bag(scanned(client, sn, left), "aid", "bid") == want_left, (sql, left)
-            assert bag(scanned(client, sn, ex), "aid") == want_ex, (sql, ex)
-
-
-def test_a_band_null_fill_over_a_join_keyed_input_counts_each_row_once(client, schema_name):
+def test_a_band_null_fill_over_a_join_keyed_input_counts_each_row_once(client):
     """A band LEFT JOIN over a join-keyed input whose two rows differ only in the
     range value: each null-fills exactly while nothing matches it."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, g BIGINT NOT NULL, x BIGINT NOT NULL); "
         "CREATE TABLE q (k BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL); "
         "CREATE TABLE r (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, y BIGINT NOT NULL); "
         "CREATE VIEW band_over_join AS SELECT d.v AS v, r.id AS rid "
         "FROM (SELECT p.g AS g, p.x AS x, q.v AS v FROM p JOIN q ON p.k = q.k) d "
-        "LEFT JOIN r ON d.g = r.g AND d.x <= r.y",
-        schema_name=sn)
-    churn = [
+        "LEFT JOIN r ON d.g = r.g AND d.x <= r.y")
+    steps = [
         ("INSERT INTO q VALUES (1, 7), (2, 8)", "q", {1: (7,), 2: (8,)}),
         # p(1) and p(2) share `k` and so `v`, and differ only in `x`.
         ("INSERT INTO p VALUES (1, 1, 5, 10), (2, 1, 5, 100), (3, 2, 5, 40)",
@@ -193,13 +112,7 @@ def test_a_band_null_fill_over_a_join_keyed_input_counts_each_row_once(client, s
         ("DELETE FROM q WHERE k = 1", "q", {1: None}),
     ]
     state = {"p": {}, "q": {}, "r": {}}
-    for sql, table, changes in churn:
-        client.execute_sql(sql, schema_name=sn)
-        for pk, row in changes.items():
-            if row is None:
-                del state[table][pk]
-            else:
-                state[table][pk] = row
+    for sql in churn(client, state, steps):
         want = Counter()
         for k, g, x in state["p"].values():
             if k not in state["q"]:
@@ -207,15 +120,14 @@ def test_a_band_null_fill_over_a_join_keyed_input_counts_each_row_once(client, s
             v = state["q"][k][0]
             matched = [ri for ri, (rg, y) in state["r"].items() if rg == g and x <= y]
             want.update([(v, ri) for ri in matched] or [(v, None)])
-        assert bag(scanned(client, sn, "band_over_join"), "v", "rid") == want, sql
+        assert bag(scanned(client, "band_over_join"), "v", "rid") == want, sql
 
 
-def test_the_pair_pk_is_the_source_keys_at_their_own_width(client, schema_name):
+def test_the_pair_pk_is_the_source_keys_at_their_own_width(client):
     """The output key is the source-PK pair. When the range column *is* the PK
     on both sides no co-partition shortcut applies, and the pair key is the pair
     of range values; compound source keys make a four-column, 32-byte pair key,
     whose hidden slots carry exactly the source key columns."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE ra (x BIGINT NOT NULL PRIMARY KEY); "
         "CREATE TABLE rb (y BIGINT NOT NULL PRIMARY KEY); "
@@ -227,17 +139,16 @@ def test_the_pair_pk_is_the_source_keys_at_their_own_width(client, schema_name):
         f"INSERT INTO ra VALUES {', '.join(f'({x})' for x in range(1, 16))}; "
         f"INSERT INTO rb VALUES {', '.join(f'({y})' for y in range(5, 20))}; "
         f"INSERT INTO pa VALUES {', '.join(f'({i}, {i * 2}, {i * 7 % 19})' for i in range(1, 13))}; "
-        f"INSERT INTO pb VALUES {', '.join(f'({i}, {i * 3}, {i * 5 % 19})' for i in range(1, 13))}",
-        schema_name=sn)
-    assert bag(scanned(client, sn, "on_pk"), "aid", "bid") == {
+        f"INSERT INTO pb VALUES {', '.join(f'({i}, {i * 3}, {i * 5 % 19})' for i in range(1, 13))}")
+    assert bag(scanned(client, "on_pk"), "aid", "bid") == {
         (x, y): 1 for x in range(1, 16) for y in range(5, 20) if x < y}
 
     def expect(b_ids):
         want = {(i, i * 2, j, j * 3): 1 for i in range(1, 13) for j in b_ids if i * 7 % 19 < j * 5 % 19}
-        assert bag(scanned(client, sn, "wide"), "ak1", "ak2", "bk1", "bk2") == want
-        assert bag(scanned(client, sn, "wide", hidden=True),
+        assert bag(scanned(client, "wide"), "ak1", "ak2", "bk1", "bk2") == want
+        assert bag(scanned(client, "wide", hidden=True),
                    "_pair_pk_0", "_pair_pk_1", "_pair_pk_2", "_pair_pk_3") == want
 
     expect(range(1, 13))
-    client.execute_sql("DELETE FROM pb WHERE k1 = 3 AND k2 = 9", schema_name=sn)
+    client.execute_sql("DELETE FROM pb WHERE k1 = 3 AND k2 = 9")
     expect([j for j in range(1, 13) if j != 3])

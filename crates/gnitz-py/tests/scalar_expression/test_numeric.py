@@ -79,7 +79,7 @@ _FUNCTIONS = {
 
 
 def test_every_function_answers_over_each_sign_and_null_and_cancels_on_retraction(
-        client, schema_name):
+        client):
     """Every function over each sign and over NULL, as one bag over the whole
     row — a maintained view and an ad-hoc read of the same projection alike.
 
@@ -88,26 +88,24 @@ def test_every_function_answers_over_each_sign_and_null_and_cancels_on_retractio
     a NaN, which must cancel against its own re-derivation bit for bit. The
     ad-hoc read has no trace to accumulate in, so a view still equal to it has
     cancelled."""
-    sn = schema_name
     select = "SELECT id, " + ", ".join(
         f"{e} AS c{n}" for n, e in enumerate(_FUNCTIONS)) + " FROM t"
     client.execute_sql(
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, i BIGINT, f DOUBLE, u BIGINT UNSIGNED)",
-        schema_name=sn)
-    client.execute_sql(f"CREATE VIEW v AS {select}", schema_name=sn)
-    client.execute_sql(f"INSERT INTO t VALUES {_ROWS}", schema_name=sn)
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, i BIGINT, f DOUBLE, u BIGINT UNSIGNED)")
+    client.execute_sql(f"CREATE VIEW v AS {select}")
+    client.execute_sql(f"INSERT INTO t VALUES {_ROWS}")
 
-    rounded = client.resolve_table(sn, "v")[1].columns[1 + list(_FUNCTIONS).index("ROUND(i, 2)")]
+    rounded = client.resolve_table("v")[1].columns[1 + list(_FUNCTIONS).index("ROUND(i, 2)")]
     assert rounded.type_code == gnitz.TypeCode.I64, "a folded ROUND stays an integer"
 
     expected = {r: 1 for r in zip(_IDS, *_FUNCTIONS.values())}
-    assert bag(scanned(client, sn, "v")) == expected
-    assert bag(rows(client, sn, select)) == expected
+    assert bag(scanned(client, "v")) == expected
+    assert bag(rows(client, select)) == expected
 
-    client.execute_sql("UPDATE t SET i = 42 WHERE id = 1", schema_name=sn)
-    after = bag(scanned(client, sn, "v"))
-    assert after == bag(rows(client, sn, select))
-    assert len(after) == len(expected), "the pre-update row must have cancelled"
+    client.execute_sql("UPDATE t SET i = 42 WHERE id = 1")
+    assert bag(scanned(client, "v")) == bag(rows(client, select)) != expected
+    client.execute_sql("UPDATE t SET i = -7 WHERE id = 1")
+    assert bag(scanned(client, "v")) == expected, "every superseded row must have cancelled"
 
-    client.execute_sql("DELETE FROM t", schema_name=sn)
-    assert bag(scanned(client, sn, "v")) == {}
+    client.execute_sql("DELETE FROM t")
+    assert bag(scanned(client, "v")) == {}

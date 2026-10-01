@@ -27,46 +27,45 @@ SIZES = {
 }
 
 
-def setup_views(client, sn):
+def setup_views(client):
     client.execute_sql(
         "CREATE TABLE dim_customer (c_id BIGINT NOT NULL PRIMARY KEY, "
-        "c_region BIGINT NOT NULL, c_nation BIGINT NOT NULL)", schema_name=sn)
+        "c_region BIGINT NOT NULL, c_nation BIGINT NOT NULL)")
     client.execute_sql(
         "CREATE TABLE fact_orders (o_id BIGINT NOT NULL PRIMARY KEY, "
         "o_customer BIGINT NOT NULL, o_amount BIGINT NOT NULL, "
-        "o_status BIGINT NOT NULL)", schema_name=sn)
+        "o_status BIGINT NOT NULL)")
     # A view processes only deltas applied after it exists, so create the views
     # before loading any data.
     client.execute_sql(
         "CREATE VIEW v_open AS SELECT o_id, o_customer, o_amount "
-        "FROM fact_orders WHERE o_status = 1", schema_name=sn)
+        "FROM fact_orders WHERE o_status = 1")
     client.execute_sql(
         "CREATE VIEW v_join AS SELECT v_open.o_id AS o_id, "
         "v_open.o_amount AS o_amount, dim_customer.c_region AS c_region, "
         "dim_customer.c_nation AS c_nation FROM v_open "
-        "JOIN dim_customer ON v_open.o_customer = dim_customer.c_id", schema_name=sn)
+        "JOIN dim_customer ON v_open.o_customer = dim_customer.c_id")
     client.execute_sql(
         "CREATE VIEW v_rev AS SELECT c_region, SUM(o_amount) AS revenue, "
-        "COUNT(*) AS cnt FROM v_join GROUP BY c_region", schema_name=sn)
+        "COUNT(*) AS cnt FROM v_join GROUP BY c_region")
     client.execute_sql(
         "CREATE VIEW v_ext AS SELECT c_region, MIN(o_amount) AS lo, "
-        "MAX(o_amount) AS hi FROM v_join GROUP BY c_region", schema_name=sn)
+        "MAX(o_amount) AS hi FROM v_join GROUP BY c_region")
     client.execute_sql(
-        "CREATE VIEW v_active AS SELECT DISTINCT o_customer FROM v_open",
-        schema_name=sn)
+        "CREATE VIEW v_active AS SELECT DISTINCT o_customer FROM v_open")
 
 
 def status(rng):
     return 1 if rng.random() < OPEN_PROB else rng.choice(CLOSED_STATUSES)
 
 
-def seed(client, sn, sz, rng):
-    dim_tid, dim_schema = client.resolve_table(sn, "dim_customer")
+def seed(client, sz, rng):
+    dim_tid, dim_schema = client.resolve_table("dim_customer")
     push_stream(client, dim_tid, dim_schema,
                 lambda b, k: b.append(c_id=k + 1, c_region=(k + 1) % sz["REGION_CARD"],
                                       c_nation=(k + 1) % sz["NATION_CARD"]),
                 sz["DIM_ROWS"])
-    fact_tid, fact_schema = client.resolve_table(sn, "fact_orders")
+    fact_tid, fact_schema = client.resolve_table("fact_orders")
     dim_rows = sz["DIM_ROWS"]
     push_stream(client, fact_tid, fact_schema,
                 lambda b, k: b.append(o_id=k + 1, o_customer=rng.randint(1, dim_rows),

@@ -17,6 +17,7 @@ form is test_outer_join.py's.
 from collections import Counter
 
 from _read import bag, rows, scanned
+from _sql import churn
 
 _JOIN = "FROM orders JOIN customers ON orders.cid = customers.id"
 
@@ -57,28 +58,21 @@ _CHURN = [
 ]
 
 
-def test_a_reduce_and_a_join_compose_in_either_order_through_churn(client, schema_name):
+def test_a_reduce_and_a_join_compose_in_either_order_through_churn(client):
     """A new fact row re-aggregates its group and re-joins it, a group's last row
     retracts the joined row entirely, and a dimension update moves every fact
     joined to it into another group."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, amt BIGINT NOT NULL); "
         "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL, "
         "region BIGINT NOT NULL, amt BIGINT NOT NULL); "
         "CREATE TABLE zones (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL); "
-        + "; ".join(f"CREATE VIEW {v}" for v in _VIEWS), schema_name=sn)
+        + "; ".join(f"CREATE VIEW {v}" for v in _VIEWS))
     zones = {100: 7, 200: 7, 300: 8}
 
     state = {"orders": {}, "customers": {1: ("Alice", 100, 1000), 2: ("Bob", 200, 2000),
                                          3: ("Cy", 300, 3000)}}
-    for sql, table, changes in _CHURN:
-        client.execute_sql(sql, schema_name=sn)
-        for i, row in changes.items():
-            if row is None:
-                del state[table][i]
-            else:
-                state[table][i] = row
+    for sql in churn(client, state, _CHURN):
         orders, customers = state["orders"], state["customers"]
         joined = [(oi, amt, customers[cid]) for oi, (cid, amt) in orders.items() if cid in customers]
 
@@ -89,38 +83,37 @@ def test_a_reduce_and_a_join_compose_in_either_order_through_churn(client, schem
             return {(k, *fold(rs)): 1 for k, rs in out.items()}
 
         totals = grouped(orders.items(), lambda o: o[1][0], lambda rs: (sum(r[1][1] for r in rs),))
-        assert bag(scanned(client, sn, "cte_then_join"), "nm", "tot") == {
+        assert bag(scanned(client, "cte_then_join"), "nm", "tot") == {
             (customers[cid][0], t): 1 for cid, t in totals if cid in customers}, sql
-        assert bag(scanned(client, sn, "two_ctes"), "so", "sc") == {
+        assert bag(scanned(client, "two_ctes"), "so", "sc") == {
             (t, customers[cid][2]): 1 for cid, t in totals if cid in customers}, sql
-        assert bag(scanned(client, sn, "by_region"), "reg", "total") == grouped(
+        assert bag(scanned(client, "by_region"), "reg", "total") == grouped(
             joined, lambda j: j[2][1], lambda rs: (sum(r[1] for r in rs),)), sql
-        assert bag(scanned(client, sn, "filtered"), "reg", "n", "s") == grouped(
+        assert bag(scanned(client, "filtered"), "reg", "n", "s") == grouped(
             [j for j in joined if j[1] > 40], lambda j: j[2][1], lambda rs: (len(rs), sum(r[1] for r in rs))), sql
-        assert bag(scanned(client, sn, "by_order_id"), "reg", "n") == grouped(
+        assert bag(scanned(client, "by_order_id"), "reg", "n") == grouped(
             [j for j in joined if j[0] > 1], lambda j: j[2][1], lambda rs: (len(rs),)), sql
-        assert bag(scanned(client, sn, "global"), "s") == {(sum(j[1] for j in joined) if joined else None,): 1}, sql
-        assert bag(scanned(client, sn, "extremes"), "reg", "lo", "hi") == grouped(
+        assert bag(scanned(client, "global"), "s") == {(sum(j[1] for j in joined) if joined else None,): 1}, sql
+        assert bag(scanned(client, "extremes"), "reg", "lo", "hi") == grouped(
             joined, lambda j: j[2][1], lambda rs: (min(r[1] for r in rs), max(r[1] for r in rs))), sql
-        assert bag(scanned(client, sn, "counted"), "n") == {(len(joined),): 1}, sql
-        assert bag(scanned(client, sn, "regions"), "reg") == {(j[2][1],): 1 for j in joined}, sql
-        assert bag(scanned(client, sn, "star"), "grp", "total") == grouped(
+        assert bag(scanned(client, "counted"), "n") == {(len(joined),): 1}, sql
+        assert bag(scanned(client, "regions"), "reg") == {(j[2][1],): 1 for j in joined}, sql
+        assert bag(scanned(client, "star"), "grp", "total") == grouped(
             joined, lambda j: zones[j[2][1]], lambda rs: (sum(r[1] for r in rs),)), sql
-        assert bag(scanned(client, sn, "star_distinct"), "grp") == Counter(
+        assert bag(scanned(client, "star_distinct"), "grp") == Counter(
             {(zones[j[2][1]],): 1 for j in joined}), sql
 
 
-def test_a_computed_group_input_is_declared_as_the_value_it_computes(client, schema_name):
+def test_a_computed_group_input_is_declared_as_the_value_it_computes(client):
     """A grouped view declares a column for each computed group key and aggregate
     argument, and the declared type must be the value the expression computes: a
     negation of a narrow integer lives in a 64-bit register (`-(-2^31)` leaves
     INT, `-q` over an unsigned column goes negative), a cast to REAL computes a
     double, and a narrowing cast is its target. Each view equals its ad-hoc
     SELECT, which reads the register directly."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE n (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, q INT UNSIGNED NOT NULL, "
-        "i INT NOT NULL, x BIGINT NOT NULL)", schema_name=sn)
+        "i INT NOT NULL, x BIGINT NOT NULL)")
     bodies = {
         "neg_sum": ("SELECT g, SUM(-q) AS s FROM n GROUP BY g", ("g", "s")),
         "neg_key": ("SELECT -i AS k, COUNT(*) AS c FROM n GROUP BY -i", ("k", "c")),
@@ -129,24 +122,24 @@ def test_a_computed_group_input_is_declared_as_the_value_it_computes(client, sch
                        ("k", "c")),
     }
     for view, (body, _) in bodies.items():
-        client.execute_sql(f"CREATE VIEW {view} AS {body}", schema_name=sn)
+        client.execute_sql(f"CREATE VIEW {view} AS {body}")
 
     def check(expected):
         for view, (body, cols) in bodies.items():
-            got = bag(scanned(client, sn, view), *cols)
-            assert got == bag(rows(client, sn, body), *cols), view
+            got = bag(scanned(client, view), *cols)
+            assert got == bag(rows(client, body), *cols), view
             assert got == expected[view], view
 
     client.execute_sql(
         "INSERT INTO n VALUES (1, 1, 4000000000, -2147483648, 5), (2, 1, 3, 7, 70000), "
-        "(3, 2, 10, -2147483648, -3)", schema_name=sn)
+        "(3, 2, 10, -2147483648, -3)")
     check({
         "neg_sum": {(1, -4000000003): 1, (2, -10): 1},
         "neg_key": {(2147483648, 2): 1, (-7, 1): 1},
         "real_sum": {(1, 70005.0): 1, (2, -3.0): 1},
         "narrow_key": {(5, 1): 1, (None, 1): 1, (-3, 1): 1},
     })
-    client.execute_sql("DELETE FROM n WHERE id = 1", schema_name=sn)
+    client.execute_sql("DELETE FROM n WHERE id = 1")
     check({
         "neg_sum": {(1, -3): 1, (2, -10): 1},
         "neg_key": {(2147483648, 1): 1, (-7, 1): 1},

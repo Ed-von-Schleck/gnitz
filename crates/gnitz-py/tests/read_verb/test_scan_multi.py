@@ -17,15 +17,8 @@ import threading
 import gnitz
 import pytest
 from _read import bag
-from _serverproc import join_or_fail
+from _serverproc import TINY_REPLY_FRAMES, join_or_fail, spawn
 from _schemas import KV
-
-
-
-
-def _kv(client, sn, name):
-    """A `(pk U64 PK, val I64)` table's id."""
-    return client.create_table(sn, name, KV)
 
 
 def _kvs(*tids):
@@ -37,14 +30,13 @@ def _batch(values):
     return gnitz.ZSetBatch(KV).extend({"pk": pk, "val": val} for pk, val in values)
 
 
-def test_the_results_line_up_with_the_requested_tids(client, schema_name):
+def test_the_results_line_up_with_the_requested_tids(client):
     """Request order is reply order, and an empty relation still occupies its
     slot. Such a relation contributes no worker frame at all — the master
     forwards only frames carrying rows — so its train is delimited by its
     master-authored terminal alone. However many relations it names, it is one
     request."""
-    sn = schema_name
-    a, empty, b = (_kv(client, sn, name) for name in ("a", "empty", "b"))
+    a, empty, b = (client.create_table(name, KV) for name in ("a", "empty", "b"))
     client.push(a, _batch([(pk, pk * 10) for pk in range(20)]))
     client.push(b, _batch([(99, 990)]))
 
@@ -58,36 +50,32 @@ def test_the_results_line_up_with_the_requested_tids(client, schema_name):
         [{(99, 990): 1}, {}, want_a]
 
 
-def test_a_base_and_a_view_snapshot_at_one_cut(client, schema_name):
+def test_a_base_and_a_view_snapshot_at_one_cut(client):
     """One hash-partitioned base table and one aggregate view (single-row output,
     read via the replicated/unicast path) agree at the same cut."""
-    sn = schema_name
-    t = _kv(client, sn, "t")
+    t = client.create_table("t", KV)
     client.push(t, _batch([(i, 1) for i in range(20)]))
-    client.execute_sql("CREATE VIEW v AS SELECT COUNT(*) AS c FROM t", schema_name=sn)
-    v = client.resolve_table(sn, "v")
+    client.execute_sql("CREATE VIEW v AS SELECT COUNT(*) AS c FROM t")
+    v = client.resolve_table("v")
 
     assert [bag(r) for r in client.scan_many([(t, KV), v])] == \
         [{(i, 1): 1 for i in range(20)}, {(20,): 1}]
 
 
-def test_a_base_read_is_fresh_whatever_its_views_are_doing(client, schema_name):
+def test_a_base_read_is_fresh_whatever_its_views_are_doing(client):
     """A base table's own read is fully fresh the moment a push ACKs, whatever
     its dependent views are doing — a pending tick can only change what a VIEW
     sees. Three GROUP BY views ride on `t` so the tick queue is non-empty at read
     time; both read verbs must still return every pushed row at weight 1, and a
     one-relation scan_many is exactly a scan, lsn included."""
-    sn = schema_name
     client.execute_sql(
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT, v BIGINT)", schema_name=sn)
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT, v BIGINT)")
     for i in range(3):
         client.execute_sql(
-            f"CREATE VIEW agg{i} AS SELECT g, SUM(v) AS s FROM t WHERE v > {i} GROUP BY g",
-            schema_name=sn)
-    tid, schema = client.resolve_table(sn, "t")
+            f"CREATE VIEW agg{i} AS SELECT g, SUM(v) AS s FROM t WHERE v > {i} GROUP BY g")
+    tid, schema = client.resolve_table("t")
     client.execute_sql(
-        "INSERT INTO t VALUES " + ",".join(f"({i}, {i % 4}, {i})" for i in range(60)),
-        schema_name=sn)
+        "INSERT INTO t VALUES " + ",".join(f"({i}, {i % 4}, {i})" for i in range(60)))
 
     want = {(i, i % 4, i): 1 for i in range(60)}
     single, multi = client.scan(tid, schema), client.scan_many([(tid, schema)])
@@ -101,7 +89,7 @@ def test_a_base_read_is_fresh_whatever_its_views_are_doing(client, schema_name):
 # ---------------------------------------------------------------------------
 
 
-def test_a_commit_is_never_observed_torn(server, schema_name):
+def test_a_commit_is_never_observed_torn(client, server):
     """A writer commits atomic {a: i->i, b: i->i} transactions in a tight loop; a
     reader hammers scan_many([a, b]). Every result set has a's bag == b's bag —
     an atomic commit is never observed torn, and no row is ever observed at a
@@ -110,81 +98,68 @@ def test_a_commit_is_never_observed_torn(server, schema_name):
     interleaved with the writer (so the 'no tear' result is meaningful, not a
     quiescent artefact)."""
     N = 400
-    sn = schema_name
-    with gnitz.connect(server) as wc:
-        a, b = _kv(wc, sn, "a"), _kv(wc, sn, "b")
+    a, b = client.create_table("a", KV), client.create_table("b", KV)
+    stop = threading.Event()
+    sizes = set()
 
-        stop = threading.Event()
-        bad, sizes = [], set()
+    def writer():
+        try:
+            for i in range(N):
+                with client.transaction() as txn:
+                    txn.push(a, _batch([(i, i)]))
+                    txn.push(b, _batch([(i, i)]))
+        finally:
+            stop.set()
 
-        def writer():
-            try:
-                for i in range(N):
-                    with wc.transaction() as txn:
-                        txn.push(a, _batch([(i, i)]))
-                        txn.push(b, _batch([(i, i)]))
-            finally:
-                stop.set()
+    def reader():
+        with gnitz.connect(server) as rc:
+            while not stop.is_set():
+                ra, rb = (bag(r) for r in rc.scan_many(_kvs(a, b)))
+                sizes.add(len(ra))
+                assert ra == rb and set(ra.values()) <= {1}, "torn or mis-weighted snapshot"
 
-        def reader():
-            with gnitz.connect(server) as rc:
-                while not stop.is_set():
-                    ra, rb = (bag(r) for r in rc.scan_many(_kvs(a, b)))
-                    sizes.add(len(ra))
-                    if ra != rb or set(ra.values()) - {1}:
-                        bad.append((ra != rb, sorted(set(ra.values()))))
-                        return
+    join_or_fail("the writer or reader hung", spawn(reader), spawn(writer))
 
-        rt, wt = threading.Thread(target=reader), threading.Thread(target=writer)
-        rt.start(), wt.start()
-        join_or_fail("the writer or reader hung", wt, rt)
-
-        assert not bad, f"torn or mis-weighted snapshot: {bad}"
-        final = wc.scan_many(_kvs(a, b))
-        assert bag(final[0]) == bag(final[1]) == {(i, i): 1 for i in range(N)}
-        # Evidence the reader interleaved with the writer (saw the table grow).
-        assert len([s for s in sizes if 0 < s < N]) >= 2, \
-            f"reader did not interleave; sizes={sorted(sizes)}"
+    final = client.scan_many(_kvs(a, b))
+    assert bag(final[0]) == bag(final[1]) == {(i, i): 1 for i in range(N)}
+    assert len([s for s in sizes if 0 < s < N]) >= 2, \
+        f"reader did not interleave; sizes={sorted(sizes)}"
 
 
-def test_a_view_never_leads_its_base(server, schema_name):
+def test_a_view_never_leads_its_base(client, server):
     """`scan_many([t, v])` with v derived from t (insert-only). Quiescent → they
-    agree; under concurrent inserts the only asserted invariant is that the view
-    never leads the base — every view row's key is present in the base
-    snapshot."""
-    sn = schema_name
-    with gnitz.connect(server) as wc:
-        t = _kv(wc, sn, "t")
-        wc.execute_sql(
-            "CREATE VIEW v AS SELECT pk, val FROM t WHERE val >= 0", schema_name=sn)
-        v = wc.resolve_table(sn, "v")
+    agree; under concurrent inserts the invariant is that the view never leads
+    the base — every view row is in the base snapshot, at the same weight. The
+    reader must observe several intermediate sizes, or it never interleaved."""
+    N = 200
+    t = client.create_table("t", KV)
+    client.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t WHERE val >= 0")
+    v = client.resolve_table("v")
 
-        wc.push(t, _batch([(i, i) for i in range(10)]))
-        res = wc.scan_many([(t, KV), v])
-        assert bag(res[0]) == bag(res[1]) == {(i, i): 1 for i in range(10)}
+    client.push(t, _batch([(i, i) for i in range(10)]))
+    res = client.scan_many([(t, KV), v])
+    assert bag(res[0]) == bag(res[1]) == {(i, i): 1 for i in range(10)}
 
-        stop = threading.Event()
-        violations = []
+    stop = threading.Event()
+    sizes = set()
 
-        def writer():
-            try:
-                for i in range(10, 210):
-                    wc.push(t, _batch([(i, i)]))
-            finally:
-                stop.set()
+    def writer():
+        try:
+            for i in range(10, 10 + N):
+                client.push(t, _batch([(i, i)]))
+        finally:
+            stop.set()
 
-        def reader():
-            with gnitz.connect(server) as rc:
-                while not stop.is_set():
-                    rt_, rv = (bag(r) for r in rc.scan_many([(t, KV), v]))
-                    if not rv.keys() <= rt_.keys():
-                        violations.append((len(rt_), len(rv)))
-                        return
+    def reader():
+        with gnitz.connect(server) as rc:
+            while not stop.is_set():
+                rt, rv = (bag(r) for r in rc.scan_many([(t, KV), v]))
+                sizes.add(len(rt))
+                assert rv.items() <= rt.items(), f"view led the base: {len(rt)} < {len(rv)}"
 
-        wt, rt = threading.Thread(target=writer), threading.Thread(target=reader)
-        rt.start(), wt.start()
-        join_or_fail("the writer or reader hung", wt, rt)
-        assert not violations, f"view led the base: {violations}"
+    join_or_fail("the writer or reader hung", spawn(reader), spawn(writer))
+    assert len([s for s in sizes if 10 < s < 10 + N]) >= 2, \
+        f"reader did not interleave; sizes={sorted(sizes)}"
 
 
 # ---------------------------------------------------------------------------
@@ -192,18 +167,18 @@ def test_a_view_never_leads_its_base(server, schema_name):
 # ---------------------------------------------------------------------------
 
 
-def test_every_refusal_leaves_the_server_serving(client, schema_name):
-    sn = schema_name
-    t = _kv(client, sn, "t")
+def test_every_refusal_leaves_the_server_serving(client):
+    t = client.create_table("t", KV)
     client.push(t, _batch([(1, 1)]))
 
     for why, rels in [
-        ("empty list", []),
-        ("too many relations", _kvs(*(t + 1 + i for i in range(17)))),
+        ("empty item list", []),
+        # A repeated tid is legal, so the count alone is what this one crosses.
+        ("too many items", _kvs(t) * 1000),
         # A fan-out read has no form for a system relation — refused server-side.
-        ("system tid", [(gnitz.TABLE_TAB, gnitz.sys_schema(gnitz.TABLE_TAB))]),
+        ("system catalog family", [(gnitz.TABLE_TAB, gnitz.sys_schema(gnitz.TABLE_TAB))]),
     ]:
-        with pytest.raises(gnitz.GnitzError):
+        with pytest.raises(gnitz.GnitzRefusedError, match=why):
             client.scan_many(rels)
         assert bag(client.scan_many(_kvs(t))[0]) == {(1, 1): 1}, f"unhealthy after {why}"
 
@@ -214,13 +189,13 @@ def test_every_refusal_leaves_the_server_serving(client, schema_name):
     assert bag(client.scan_many(_kvs(t))[0]) == {(1, 1): 1}, "unhealthy after unknown tid"
 
 
-def test_a_repeated_tid_is_answered_at_each_position(client, schema_name):
-    t = _kv(client, schema_name, "t")
+def test_a_repeated_tid_is_answered_at_each_position(client):
+    t = client.create_table("t", KV)
     client.push(t, _batch([(1, 1), (2, 2)]))
     assert [bag(r) for r in client.scan_many(_kvs(t, t))] == [{(1, 1): 1, (2, 2): 1}] * 2
 
 
-def test_a_chunked_train_does_not_let_its_siblings_jump_it(reply_frame_budget_server):
+def test_a_chunked_train_does_not_let_its_siblings_jump_it(own_server):
     """With a 16 KiB reply budget, `big` chunks into a multi-frame train per
     worker while the tiny siblings are one frame each. `scan_many` of `[big, s...]`
     must stream in request order without wedging — the shape that deadlocks
@@ -233,15 +208,15 @@ def test_a_chunked_train_does_not_let_its_siblings_jump_it(reply_frame_budget_se
     here; the bags below are what rules out a silently reordered or truncated
     train once it does complete.
     """
-    c, sn = reply_frame_budget_server, "public"
-    big = _kv(c, sn, "big")
+    c = gnitz.connect(own_server.start(extra_env=TINY_REPLY_FRAMES).target)
+    big = c.create_table("big", KV)
     # 4000 rows * 32 B/row wire ≈ 128 KiB total. Even split across 4 workers
     # (~32 KiB each) it exceeds the 16 KiB budget, so every worker's train is
     # genuinely multi-chunk.
     c.push(big, _batch([(i, i) for i in range(4000)]))
     want_big = {(i, i): 1 for i in range(4000)}
 
-    ids = [_kv(c, sn, f"s{k}") for k in range(8)]
+    ids = [c.create_table(f"s{k}", KV) for k in range(8)]
     for k, tid in enumerate(ids):
         c.push(tid, _batch([(k, k * 10)]))
     wants = [{(k, k * 10): 1} for k in range(8)]
@@ -255,7 +230,7 @@ def test_a_chunked_train_does_not_let_its_siblings_jump_it(reply_frame_budget_se
     # ~23 KiB per worker against the 16 KiB budget.
     dim_schema = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
                                gnitz.ColumnDef("s", gnitz.TypeCode.STRING)], [0])
-    dim = c.create_table(sn, "dim_text", dim_schema)
+    dim = c.create_table("dim_text", dim_schema)
     names = [f"name-{i}-" + "z" * 200 for i in range(400)]
     c.push(dim, gnitz.ZSetBatch(dim_schema).extend(
         {"pk": i, "s": nm} for i, nm in enumerate(names)))

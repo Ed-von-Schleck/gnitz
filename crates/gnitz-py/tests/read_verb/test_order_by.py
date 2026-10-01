@@ -19,26 +19,26 @@ from _sql import insert
 
 
 @pytest.fixture(scope="module")
-def src(module_schema):
-    """Read-only sources for every case: `t (id, v, w, a)`, a TEXT column with
+def src(module_client):
+    """A connection holding the read-only sources for every case: `t (id, v, w, a)`, a TEXT column with
     NULLs, a DOUBLE column, and `dup` — a `UNION ALL` of two identical tables,
     so every row carries logical multiplicity 2."""
-    conn, sn = module_schema
+    conn = module_client
     conn.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT, w BIGINT, a BIGINT NOT NULL); "
         "CREATE TABLE names (id BIGINT PRIMARY KEY, name TEXT); "
         "CREATE TABLE floats (id BIGINT PRIMARY KEY, x DOUBLE); "
         "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
         "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
-        "CREATE VIEW dup AS SELECT * FROM a UNION ALL SELECT * FROM b", schema_name=sn)
-    insert(conn, sn, "t", [(1, 30, 10, 1), (2, 10, None, 1), (3, 20, 20, 2), (4, 40, 5, 2),
+        "CREATE VIEW dup AS SELECT * FROM a UNION ALL SELECT * FROM b")
+    insert(conn, "t", [(1, 30, 10, 1), (2, 10, None, 1), (3, 20, 20, 2), (4, 40, 5, 2),
                            (5, 50, 15, 3)])
-    insert(conn, sn, "names", [(1, "pear"), (2, "apple"), (3, None), (4, "banana"),
+    insert(conn, "names", [(1, "pear"), (2, "apple"), (3, None), (4, "banana"),
                                (5, "apricot"), (6, None), (7, "cherry")])
-    insert(conn, sn, "floats", [(1, 2.5), (2, -1.75), (3, 0.0), (4, -3.25), (5, 1.25)])
+    insert(conn, "floats", [(1, 2.5), (2, -1.75), (3, 0.0), (4, -3.25), (5, 1.25)])
     for name in ("a", "b"):
-        insert(conn, sn, name, [(1, 10), (2, 20)])
-    return sn
+        insert(conn, name, [(1, 10), (2, 20)])
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -80,8 +80,8 @@ _ALL = ["id", "v", "w", "a"]
     ("SELECT id FROM t ORDER BY 0 - v", [5, 4, 1, 3, 2], ["id"]),
     ("SELECT id FROM t ORDER BY v % 20, id DESC LIMIT 2", [4, 3], ["id"]),
 ])
-def test_a_base_table_sort_and_window(client, src, q, want, fields):
-    got = rows(client, src, q)
+def test_a_base_table_sort_and_window(src, q, want, fields):
+    got = rows(src, q)
     assert [r.id for r in got] == want
     if got:
         assert list(got[0]._fields) == fields
@@ -103,8 +103,8 @@ def test_a_base_table_sort_and_window(client, src, q, want, fields):
     ("SELECT id FROM floats ORDER BY x LIMIT 3", [4, 2, 3]),
     ("SELECT id FROM floats ORDER BY x DESC LIMIT 2", [1, 5]),
 ])
-def test_a_top_k_cuts_where_the_client_would(client, src, q, want):
-    assert [r[0] for r in rows(client, src, q)] == want
+def test_a_top_k_cuts_where_the_client_would(src, q, want):
+    assert [r[0] for r in rows(src, q)] == want
 
 
 # ---------------------------------------------------------------------------
@@ -123,20 +123,18 @@ def test_a_top_k_cuts_where_the_client_would(client, src, q, want):
     ("ORDER BY val DESC LIMIT 3", {(20,): 2, (10,): 1}),
     ("ORDER BY val", {(10,): 2, (20,): 2}),
 ])
-def test_a_cut_over_a_bag_counts_logical_rows(client, src, tail, want):
-    assert bag(rows(client, src, f"SELECT val FROM dup {tail}")) == want
+def test_a_cut_over_a_bag_counts_logical_rows(src, tail, want):
+    assert bag(rows(src, f"SELECT val FROM dup {tail}")) == want
 
 
-def test_a_grouped_views_hidden_key_is_not_a_positional_column(client, schema_name):
+def test_a_grouped_views_hidden_key_is_not_a_positional_column(client):
     """A GROUP BY view over a nullable column carries a hidden `_group_pk`, so
     positional ORDER BY must target the first VISIBLE column — and ORDER BY over
     the aggregate works."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cat BIGINT); "
         "CREATE VIEW v AS SELECT cat, COUNT(*) AS cnt FROM orders GROUP BY cat; "
-        "INSERT INTO orders VALUES (1,10),(2,10),(3,10),(4,20),(5,30),(6,30)",
-        schema_name=sn)
-    assert [(r.cat, r.cnt) for r in rows(client, sn, "SELECT * FROM v ORDER BY cnt DESC LIMIT 2")] \
+        "INSERT INTO orders VALUES (1,10),(2,10),(3,10),(4,20),(5,30),(6,30)")
+    assert [(r.cat, r.cnt) for r in rows(client, "SELECT * FROM v ORDER BY cnt DESC LIMIT 2")] \
         == [(10, 3), (30, 2)]
-    assert [r.cat for r in rows(client, sn, "SELECT * FROM v ORDER BY 1")] == [10, 20, 30]
+    assert [r.cat for r in rows(client, "SELECT * FROM v ORDER BY 1")] == [10, 20, 30]

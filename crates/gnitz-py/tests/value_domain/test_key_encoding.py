@@ -34,9 +34,9 @@ from _read import access, bag, rows, scanned
 U64_MAX = 18446744073709551615
 
 
-def _seed(client, sn, ddl, rows_sql):
-    client.execute_sql(ddl, schema_name=sn)
-    client.execute_sql(f"INSERT INTO t VALUES {rows_sql}", schema_name=sn)
+def _seed(client, ddl, rows_sql):
+    client.execute_sql(ddl)
+    client.execute_sql(f"INSERT INTO t VALUES {rows_sql}")
 
 
 # ---------------------------------------------------------------------------
@@ -60,41 +60,39 @@ _UNSIGNED_KEYS = [
 @pytest.mark.parametrize("pk_sql,keys", _SIGNED_KEYS,
                          ids=[t[0].lower() for t in _SIGNED_KEYS])
 def test_a_signed_key_range_cuts_at_zero_not_at_the_wrap(
-        client, schema_name, pk_sql, keys):
+        client, pk_sql, keys):
     """Without the sign flip a negative key encodes above every positive one, so
     `k >= 0` would return the negatives and `k < 0` nothing. The two halves are
     asserted as exact complements, which no single range can fake."""
-    sn = schema_name
-    _seed(client, sn,
+    _seed(client,
           f"CREATE TABLE t (k {pk_sql} NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
           ", ".join(f"({k}, {i})" for i, k in enumerate(keys)))
 
     neg = {(k, i) for i, k in enumerate(keys) if k < 0}
     pos = {(k, i) for i, k in enumerate(keys) if k >= 0}
-    assert bag(rows(client, sn, "SELECT k, v FROM t WHERE k < 0")) == {p: 1 for p in neg}
-    assert bag(rows(client, sn, "SELECT k, v FROM t WHERE k >= 0")) == {p: 1 for p in pos}
+    assert bag(rows(client, "SELECT k, v FROM t WHERE k < 0")) == {p: 1 for p in neg}
+    assert bag(rows(client, "SELECT k, v FROM t WHERE k >= 0")) == {p: 1 for p in pos}
     # A strict bound at the minimum still admits the other negative, so the order
     # holds inside the negative run too, not merely between the signs.
-    assert bag(rows(client, sn, f"SELECT k FROM t WHERE k > {keys[0]}")) == \
+    assert bag(rows(client, f"SELECT k FROM t WHERE k > {keys[0]}")) == \
         {(k,): 1 for k in keys[1:]}
 
 
 @pytest.mark.parametrize("pk_sql,keys", _UNSIGNED_KEYS,
                          ids=[t[0].split()[0].lower() + "u" for t in _UNSIGNED_KEYS])
 def test_an_unsigned_key_range_orders_past_the_signed_midpoint(
-        client, schema_name, pk_sql, keys):
+        client, pk_sql, keys):
     """The mirror case: an unsigned column must *not* flip. A spurious flip
     would sort the values above the signed midpoint below the ones under it, so
     the cut is taken there."""
-    sn = schema_name
     mid = 1 << (keys[-1].bit_length() - 1)
-    _seed(client, sn,
+    _seed(client,
           f"CREATE TABLE t (k {pk_sql} NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
           ", ".join(f"({k}, {i})" for i, k in enumerate(keys)))
 
-    assert bag(rows(client, sn, f"SELECT k FROM t WHERE k >= {mid}")) == \
+    assert bag(rows(client, f"SELECT k FROM t WHERE k >= {mid}")) == \
         {(k,): 1 for k in keys if k >= mid}
-    assert bag(rows(client, sn, f"SELECT k FROM t WHERE k < {mid}")) == \
+    assert bag(rows(client, f"SELECT k FROM t WHERE k < {mid}")) == \
         {(k,): 1 for k in keys if k < mid}
 
 
@@ -123,49 +121,46 @@ _COMPOUND = [
 
 @pytest.mark.parametrize("cols,seed,retract", _COMPOUND)
 def test_an_earlier_key_column_dominates_a_later_one(
-        client, schema_name, cols, seed, retract):
+        client, cols, seed, retract):
     """Rows arrive scrambled and must consolidate into exactly the tuples
     written, each at weight 1 — a mis-ordered key groups two distinct rows and
     their weights accumulate against the wrong element. The retracted row is the
     one a compare stopping at the leading column would fold against its sibling.
     """
-    sn = schema_name
-    _seed(client, sn,
+    _seed(client,
           f"CREATE TABLE t ({cols}, payload BIGINT, PRIMARY KEY (a, b))",
           ", ".join(f"({a}, {b}, {p})" for a, b, p in seed))
 
-    assert bag(scanned(client, sn, "t"), "a", "b", "payload") == {r: 1 for r in seed}
-    client.execute_sql(f"DELETE FROM t WHERE a = {retract[0]} AND b = {retract[1]}",
-                       schema_name=sn)
-    assert bag(scanned(client, sn, "t"), "a", "b", "payload") == \
+    assert bag(scanned(client, "t"), "a", "b", "payload") == {r: 1 for r in seed}
+    client.execute_sql(f"DELETE FROM t WHERE a = {retract[0]} AND b = {retract[1]}")
+    assert bag(scanned(client, "t"), "a", "b", "payload") == \
         {r: 1 for r in seed if r[:2] != retract}
 
 
-def test_a_range_on_a_later_key_column_confines_within_its_prefix(client, schema_name):
+def test_a_range_on_a_later_key_column_confines_within_its_prefix(client):
     """Pinning the leading column and ranging on the next one walks a contiguous
     run of the packed key. The PK list and the column order disagree below, so a
     pack following declaration order would interleave the two groups instead.
     """
-    sn = schema_name
     seed = [(1, 0, 1), (1, 5, 2), (1, U64_MAX, 3), (2, 0, 4), (2, 5, 5)]
     client.execute_sql(
         "CREATE TABLE t (b BIGINT UNSIGNED NOT NULL, payload BIGINT, "
-        "a BIGINT UNSIGNED NOT NULL, PRIMARY KEY (a, b))", schema_name=sn)
-    _, schema = client.resolve_table(sn, "t")
+        "a BIGINT UNSIGNED NOT NULL, PRIMARY KEY (a, b))")
+    _, schema = client.resolve_table("t")
     assert schema.pk_indices == [2, 0], "the PK list order, not the column order"
     client.execute_sql(
         "INSERT INTO t (a, b, payload) VALUES " +
-        ", ".join(f"({a}, {b}, {p})" for a, b, p in seed), schema_name=sn)
+        ", ".join(f"({a}, {b}, {p})" for a, b, p in seed))
 
-    assert bag(rows(client, sn, "SELECT b, payload FROM t WHERE a = 1 AND b > 0")) == \
+    assert bag(rows(client, "SELECT b, payload FROM t WHERE a = 1 AND b > 0")) == \
         {(b, p): 1 for a, b, p in seed if a == 1 and b > 0}
     # The whole leading group, including its extreme trailing value.
-    assert bag(rows(client, sn, "SELECT b FROM t WHERE a = 1")) == \
+    assert bag(rows(client, "SELECT b FROM t WHERE a = 1")) == \
         {(b,): 1 for a, b, _ in seed if a == 1}
 
 
 def test_a_wide_key_distinguishes_two_rows_that_share_their_first_sixteen_bytes(
-        client, schema_name):
+        client):
     """Past 16 bytes the comparison is a byte walk rather than a packed compare,
     and routing hashes the whole key rather than a widened word. Two rows
     agreeing on `(a, b)` and differing only in `c` therefore exercise both at
@@ -174,31 +169,30 @@ def test_a_wide_key_distinguishes_two_rows_that_share_their_first_sixteen_bytes(
     would come back empty rather than wrong. The leading column is signed, so the
     flip rides that same byte walk.
     """
-    sn = schema_name
     seed = [(-3, 1, 1, 311), (-3, 1, 2, 312), (-3, U64_MAX, 0, 1399),
             (-3, 2, 1, 321), (2, 1, 1, 211)]
-    _seed(client, sn,
+    _seed(client,
           "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT UNSIGNED NOT NULL, "
           "c BIGINT UNSIGNED NOT NULL, payload BIGINT, PRIMARY KEY (a, b, c))",
           ", ".join(f"({a}, {b}, {c}, {p})" for a, b, c, p in seed))
 
-    assert bag(scanned(client, sn, "t"), "a", "b", "c", "payload") == {r: 1 for r in seed}
-    assert bag(rows(client, sn, "SELECT payload FROM t WHERE a < 0")) == \
+    assert bag(scanned(client, "t"), "a", "b", "c", "payload") == {r: 1 for r in seed}
+    assert bag(rows(client, "SELECT payload FROM t WHERE a < 0")) == \
         {(p,): 1 for a, _, _, p in seed if a < 0}
 
     # Each prefix-sharing sibling resolves to its own row, never the other.
     for a, b, c, p in seed:
-        assert bag(rows(client, sn,
+        assert bag(rows(client,
                         f"SELECT payload FROM t WHERE a = {a} AND b = {b} AND c = {c}")) \
             == {(p,): 1}
     # A key sharing the 16-byte prefix but absent in `c` misses, rather than
     # matching the sibling that shares the prefix.
-    assert bag(rows(client, sn,
+    assert bag(rows(client,
                     "SELECT payload FROM t WHERE a = -3 AND b = 1 AND c = 99")) == {}
 
     # The retraction takes the sibling and leaves the other at weight 1.
-    client.execute_sql("DELETE FROM t WHERE a = -3 AND b = 1 AND c = 2", schema_name=sn)
-    assert bag(scanned(client, sn, "t"), "a", "b", "c", "payload") == \
+    client.execute_sql("DELETE FROM t WHERE a = -3 AND b = 1 AND c = 2")
+    assert bag(scanned(client, "t"), "a", "b", "c", "payload") == \
         {r: 1 for r in seed if r[:3] != (-3, 1, 2)}
 
 
@@ -206,7 +200,7 @@ def test_a_wide_key_distinguishes_two_rows_that_share_their_first_sixteen_bytes(
     ((8, 8), [(1, 2), (3, 4), (5, 6)]),
     ((8, 8, 8), [(1, 1, 1), (1, 1, 2), (2, 2, 2)]),
 ], ids=["stride16", "stride24"])
-def test_a_compound_retraction_names_its_row(client, schema_name, widths, keys):
+def test_a_compound_retraction_names_its_row(client, widths, keys):
     """The delete verb takes a compound key as the tuple of its column values,
     and the client packs it at `pk_stride` — the members' widths summed with no
     padding. A key packed at the wrong offset, width or order names a row that
@@ -214,19 +208,18 @@ def test_a_compound_retraction_names_its_row(client, schema_name, widths, keys):
     24 is past the width a single packed compare covers, so the engine locates
     it by a byte walk instead.
     """
-    sn = schema_name
     cols = "abc"[:len(widths)]
     ddl_cols = ", ".join(f"{c} BIGINT UNSIGNED NOT NULL" for c in cols)
-    _seed(client, sn,
+    _seed(client,
           f"CREATE TABLE t ({ddl_cols}, payload BIGINT, PRIMARY KEY ({', '.join(cols)}))",
           ", ".join("(" + ", ".join(str(x) for x in k) + f", {i})"
                     for i, k in enumerate(keys)))
-    tid, schema = client.resolve_table(sn, "t")
+    tid, schema = client.resolve_table("t")
 
     gone = keys[1]
     client.delete(tid, schema, [gone])
 
-    assert bag(scanned(client, sn, "t"), *cols, "payload") == \
+    assert bag(scanned(client, "t"), *cols, "payload") == \
         {k + (i,): 1 for i, k in enumerate(keys) if k != gone}
 
 
@@ -240,31 +233,28 @@ def test_a_compound_retraction_names_its_row(client, schema_name, widths, keys):
                   ("ffffffff-ffff-ffff-ffff-ffffffffffff",)], id="source-16"),
 ])
 def test_an_index_key_grows_with_its_sources_key_and_stays_exact(
-        client, schema_name, pk_ddl, pk_list, keys):
+        client, pk_ddl, pk_list, keys):
     """An index row is keyed by the indexed column followed by the whole source
     key, so its own key is 8 + the source's — 32 and 24 here, both past the
     packed-compare width. An index key truncated at the narrow width would fold
     the two rows sharing payload 100 into one entry and lose a row, and the
     `access:` line is what stops a full-scan fallback passing silently.
     """
-    sn = schema_name
     cols = ", ".join(pk_list.strip("()").split(", "))
     client.execute_sql(
-        f"CREATE TABLE src ({pk_ddl}, payload BIGINT NOT NULL, PRIMARY KEY {pk_list})",
-        schema_name=sn)
-    client.execute_sql("CREATE INDEX ON src (payload)", schema_name=sn)
+        f"CREATE TABLE src ({pk_ddl}, payload BIGINT NOT NULL, PRIMARY KEY {pk_list})")
+    client.execute_sql("CREATE INDEX ON src (payload)")
     # The first two rows share payload 100; the third carries 200.
     client.execute_sql(
         "INSERT INTO src VALUES " + ", ".join(
             "(" + ", ".join(repr(x) if isinstance(x, str) else str(x) for x in k)
-            + f", {p})" for k, p in zip(keys, [100, 100, 200])),
-        schema_name=sn)
+            + f", {p})" for k, p in zip(keys, [100, 100, 200])))
 
     q = f"SELECT {cols} FROM src WHERE payload = 100"
-    assert access(client, sn, q).startswith("access: index range on (payload)"), \
-        access(client, sn, q)
-    assert bag(rows(client, sn, q)) == {keys[0]: 1, keys[1]: 1}
-    assert bag(rows(client, sn, f"SELECT {cols} FROM src WHERE payload = 200")) == \
+    assert access(client, q) == "index range on (payload)", \
+        access(client, q)
+    assert bag(rows(client, q)) == {keys[0]: 1, keys[1]: 1}
+    assert bag(rows(client, f"SELECT {cols} FROM src WHERE payload = 200")) == \
         {keys[2]: 1}
 
 
@@ -281,98 +271,89 @@ _OPS = [("=", lambda a, b: a == b), ("<>", lambda a, b: a != b), ("<", lambda a,
         ("<=", lambda a, b: a <= b), (">", lambda a, b: a > b), (">=", lambda a, b: a >= b)]
 
 
-def test_a_u64_key_and_a_u64_column_agree_on_any_integer_literal(client, schema_name):
-    sn = schema_name
-    _seed(client, sn,
+def test_a_u64_key_and_a_u64_column_agree_on_any_integer_literal(client):
+    _seed(client,
           "CREATE TABLE t (k BIGINT UNSIGNED NOT NULL PRIMARY KEY, u BIGINT UNSIGNED NOT NULL, "
           "v BIGINT NOT NULL)",
           ", ".join(f"({k}, {k}, {i})" for i, k in enumerate(_U64_KEYS)))
-    assert access(client, sn, "SELECT v FROM t WHERE k < -1") != "access: full scan"
+    assert access(client, "SELECT v FROM t WHERE k < -1") == "pk range walk"
     for lit in [-5, -1, 0, U64_MAX, U64_MAX + 1]:
         for op, holds in _OPS:
             want = {(i,): 1 for i, k in enumerate(_U64_KEYS) if holds(k, lit)}
             for col in ("k", "u"):
                 q = f"SELECT v FROM t WHERE {col} {op} {lit}"
-                assert bag(rows(client, sn, q)) == want, q
+                assert bag(rows(client, q)) == want, q
 
 
-def test_a_view_over_a_negative_bound_does_not_depend_on_backfill(client, schema_name):
+def test_a_view_over_a_negative_bound_does_not_depend_on_backfill(client):
     """A view's backfill is bounded by the walk and its deltas pass the filter,
     so a view created before the rows and one created after must agree."""
-    sn = schema_name
     client.execute_sql(
-        "CREATE TABLE t (k BIGINT UNSIGNED NOT NULL PRIMARY KEY, v BIGINT NOT NULL)", schema_name=sn)
-    client.execute_sql("CREATE VIEW none_before AS SELECT k FROM t WHERE k <= -1", schema_name=sn)
-    client.execute_sql("CREATE VIEW all_before AS SELECT k FROM t WHERE k > -1", schema_name=sn)
+        "CREATE TABLE t (k BIGINT UNSIGNED NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
+    client.execute_sql("CREATE VIEW none_before AS SELECT k FROM t WHERE k <= -1")
+    client.execute_sql("CREATE VIEW all_before AS SELECT k FROM t WHERE k > -1")
     client.execute_sql(
-        "INSERT INTO t VALUES " + ", ".join(f"({k}, {i})" for i, k in enumerate(_U64_KEYS)),
-        schema_name=sn)
-    client.execute_sql("CREATE VIEW none_after AS SELECT k FROM t WHERE k <= -1", schema_name=sn)
-    client.execute_sql("CREATE VIEW all_after AS SELECT k FROM t WHERE k > -1", schema_name=sn)
+        "INSERT INTO t VALUES " + ", ".join(f"({k}, {i})" for i, k in enumerate(_U64_KEYS)))
+    client.execute_sql("CREATE VIEW none_after AS SELECT k FROM t WHERE k <= -1")
+    client.execute_sql("CREATE VIEW all_after AS SELECT k FROM t WHERE k > -1")
     every = {(k,): 1 for k in _U64_KEYS}
-    assert bag(scanned(client, sn, "none_before")) == {}
-    assert bag(scanned(client, sn, "none_after")) == {}
-    assert bag(scanned(client, sn, "all_before")) == every
-    assert bag(scanned(client, sn, "all_after")) == every
+    assert bag(scanned(client, "none_before")) == {}
+    assert bag(scanned(client, "none_after")) == {}
+    assert bag(scanned(client, "all_before")) == every
+    assert bag(scanned(client, "all_after")) == every
 
 
-def test_a_date_literal_is_a_timestamp_keys_midnight(client, schema_name):
-    sn = schema_name
-    client.execute_sql("CREATE TABLE t (ts TIMESTAMP NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-                       schema_name=sn)
-    client.execute_sql("INSERT INTO t VALUES (DATE '2020-01-02', 1)", schema_name=sn)
-    by_date = rows(client, sn, "SELECT ts, v FROM t WHERE ts = DATE '2020-01-02'")
-    by_ts = rows(client, sn, "SELECT ts, v FROM t WHERE ts = TIMESTAMP '2020-01-02 00:00:00'")
+def test_a_date_literal_is_a_timestamp_keys_midnight(client):
+    client.execute_sql("CREATE TABLE t (ts TIMESTAMP NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
+    client.execute_sql("INSERT INTO t VALUES (DATE '2020-01-02', 1)")
+    by_date = rows(client, "SELECT ts, v FROM t WHERE ts = DATE '2020-01-02'")
+    by_ts = rows(client, "SELECT ts, v FROM t WHERE ts = TIMESTAMP '2020-01-02 00:00:00'")
     assert bag(by_date) == bag(by_ts) and len(by_date) == 1
 
 
-def test_a_fraction_bounds_an_integer_key_as_the_filter_does(client, schema_name):
-    sn = schema_name
+def test_a_fraction_bounds_an_integer_key_as_the_filter_does(client):
     keys = [-2, -1, 0, 1, 2, 3]
-    _seed(client, sn,
+    _seed(client,
           "CREATE TABLE t (k BIGINT NOT NULL PRIMARY KEY, i BIGINT NOT NULL)",
           ", ".join(f"({k}, {k})" for k in keys))
-    assert access(client, sn, "SELECT k FROM t WHERE k < 1.5") != "access: full scan"
+    assert access(client, "SELECT k FROM t WHERE k < 1.5") == "pk range walk"
     for pred, holds in [("< 1.5", lambda x: x < 1.5), ("> -1.5", lambda x: x > -1.5),
                         ("= 1.5", lambda x: False), ("<> 1.5", lambda x: True)]:
         want = {(k,): 1 for k in keys if holds(k)}
         for col in ("k", "i"):
             q = f"SELECT k FROM t WHERE {col} {pred}"
-            assert bag(rows(client, sn, q)) == want, q
+            assert bag(rows(client, q)) == want, q
 
 
-def test_a_decimal_column_reads_a_string_literal_at_its_scale(client, schema_name):
-    sn = schema_name
-    _seed(client, sn,
+def test_a_decimal_column_reads_a_string_literal_at_its_scale(client):
+    _seed(client,
           "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, d DECIMAL(10, 2) NOT NULL)",
           "(1, 1.5), (2, 2.5)")
-    assert bag(rows(client, sn, "SELECT id FROM t WHERE d = '1.50'")) == {(1,): 1}
+    assert bag(rows(client, "SELECT id FROM t WHERE d = '1.50'")) == {(1,): 1}
 
 
-def test_a_u64_column_and_a_signed_column_compare_by_value(client, schema_name):
-    sn = schema_name
+def test_a_u64_column_and_a_signed_column_compare_by_value(client):
     pairs = [(U64_MAX, -1), (0, -1), (5, 5), (2**63, 2**63 - 1), (3, 7)]
-    _seed(client, sn,
+    _seed(client,
           "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, u BIGINT UNSIGNED NOT NULL, "
           "i BIGINT NOT NULL)",
           ", ".join(f"({n}, {u}, {i})" for n, (u, i) in enumerate(pairs)))
     for op, holds in _OPS:
         want = {(n,): 1 for n, (u, i) in enumerate(pairs) if holds(u, i)}
-        assert bag(rows(client, sn, f"SELECT id FROM t WHERE u {op} i")) == want, op
+        assert bag(rows(client, f"SELECT id FROM t WHERE u {op} i")) == want, op
 
 
-def test_a_date_and_a_timestamp_meet_in_microseconds(client, schema_name):
-    sn = schema_name
-    _seed(client, sn,
+def test_a_date_and_a_timestamp_meet_in_microseconds(client):
+    _seed(client,
           "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, d DATE NOT NULL, "
           "ts TIMESTAMP NOT NULL)",
           "(1, 1, DATE '2020-01-02', TIMESTAMP '2020-01-02 00:00:00'), "
           "(2, 0, DATE '2020-01-02', TIMESTAMP '2020-01-01 12:00:00'), "
           "(3, 1, DATE '2020-01-02', TIMESTAMP '2020-01-02 12:00:00')")
-    assert bag(rows(client, sn, "SELECT id FROM t WHERE d > ts")) == {(2,): 1}
-    assert bag(rows(client, sn, "SELECT id FROM t WHERE d = ts")) == {(1,): 1}
+    assert bag(rows(client, "SELECT id FROM t WHERE d > ts")) == {(2,): 1}
+    assert bag(rows(client, "SELECT id FROM t WHERE d = ts")) == {(1,): 1}
     client.execute_sql(
-        "CREATE VIEW v AS SELECT id, CASE WHEN k = 1 THEN d ELSE ts END AS t FROM t", schema_name=sn)
-    want = rows(client, sn,
+        "CREATE VIEW v AS SELECT id, CASE WHEN k = 1 THEN d ELSE ts END AS t FROM t")
+    want = rows(client,
                 "SELECT id, CASE WHEN k = 1 THEN CAST(d AS TIMESTAMP) ELSE ts END AS t FROM t")
-    assert bag(scanned(client, sn, "v")) == bag(want)
+    assert bag(scanned(client, "v")) == bag(want)

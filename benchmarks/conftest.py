@@ -32,21 +32,19 @@ _schema_counter = itertools.count()
 
 
 @pytest.fixture
-def client(socket_path):
-    with gnitz.connect(socket_path) as conn:
-        yield conn
-
-
-@pytest.fixture
-def schema_name(client, request):
-    # Leaking state across the session-scoped server silently breaks later tests
-    # with stale tick rows, so let drop_schema raise instead of swallowing:
-    # server-side cascade already handles non-empty schemas.
+def client(socket_path, request):
+    """A connection in a fresh schema of its own (`client.schema`), dropped
+    whole afterwards. A worker process reaches the same relations with
+    `gnitz.connect(socket_path, schema=client.schema)`."""
     tier = request.path.parent.name
     sn = f"{_TIER_PREFIX.get(tier, tier)}_{next(_schema_counter)}_{os.getpid()}"
-    client.create_schema(sn)
-    yield sn
-    client.drop_schema(sn)
+    with gnitz.connect(socket_path, schema=sn) as conn:
+        conn.create_schema(sn)
+        yield conn
+        # Leaking state across the session-scoped server silently breaks later
+        # tests with stale tick rows, so let drop_schema raise instead of
+        # swallowing: server-side cascade already handles non-empty schemas.
+        conn.drop_schema(sn)
 
 
 @pytest.fixture

@@ -19,16 +19,16 @@ def test_retarget_swaps_the_definition_and_backfills(client, base, retarget):
     """The retargeted view serves the NEW body's rows over the data already
     there, at weight 1 each — not the old body's, and not both — takes a fresh
     id, and stays maintained afterwards."""
-    client.execute_sql("CREATE VIEW v AS SELECT id, a FROM t", schema_name=base)
-    first = client.resolve_table(base, "v")[0]
-    assert bag(scanned(client, base, "v"), "id", "a") == {(1, 10): 1, (2, 20): 1}
+    client.execute_sql("CREATE VIEW v AS SELECT id, a FROM t")
+    first = client.resolve_table("v")[0]
+    assert bag(scanned(client, "v"), "id", "a") == {(1, 10): 1, (2, 20): 1}
 
-    client.execute_sql(f"{retarget} SELECT id, b FROM t", schema_name=base)
-    assert client.resolve_table(base, "v")[0] != first, "a retarget takes a fresh view id"
-    assert bag(scanned(client, base, "v"), "id", "b") == {(1, 100): 1, (2, 200): 1}
+    client.execute_sql(f"{retarget} SELECT id, b FROM t")
+    assert client.resolve_table("v")[0] != first, "a retarget takes a fresh view id"
+    assert bag(scanned(client, "v"), "id", "b") == {(1, 100): 1, (2, 200): 1}
 
-    client.execute_sql("INSERT INTO t VALUES (3, 30, 300)", schema_name=base)
-    assert bag(scanned(client, base, "v"), "id", "b") == {(1, 100): 1, (2, 200): 1, (3, 300): 1}
+    client.execute_sql("INSERT INTO t VALUES (3, 30, 300)")
+    assert bag(scanned(client, "v"), "id", "b") == {(1, 100): 1, (2, 200): 1, (3, 300): 1}
 
 
 def test_or_replace_writes_the_with_clause_out_as_stated(client, base):
@@ -45,19 +45,20 @@ def test_or_replace_writes_the_with_clause_out_as_stated(client, base):
         "CREATE VIEW bounded WITH (capacity = '4 MB') AS SELECT id, a FROM t; "
         "CREATE VIEW fed WITH (delta = '4 MB') AS SELECT id, a FROM t; "
         "CREATE OR REPLACE VIEW bounded WITH (capacity = '4 MB') AS SELECT id, b FROM t; "
-        "CREATE OR REPLACE VIEW fed WITH (delta = '4 MB') AS SELECT id, b FROM t", schema_name=base)
+        "CREATE OR REPLACE VIEW fed WITH (delta = '4 MB') AS SELECT id, b FROM t")
     for name in ("bounded", "fed"):
-        assert bag(scanned(client, base, name), "id", "b") == {(1, 100): 1, (2, 200): 1}, name
-    with pytest.raises(gnitz.GnitzError, match="views cannot be created over it"):
-        client.execute_sql("CREATE VIEW over_it AS SELECT id FROM bounded", schema_name=base)
-    client.delta_bootstrap(*client.resolve_table(base, "fed"))
+        assert bag(scanned(client, name), "id", "b") == {(1, 100): 1, (2, 200): 1}, name
+    with pytest.raises(gnitz.GnitzRefusedError, match="views cannot be created over it"):
+        client.execute_sql("CREATE VIEW over_it AS SELECT id FROM bounded")
+    assert bag(client.delta_bootstrap(*client.resolve_table("fed")).rows, "id", "b") == {
+        (1, 100): 1, (2, 200): 1}
 
     client.execute_sql(
         "CREATE OR REPLACE VIEW bounded AS SELECT id, a FROM t; "
         "CREATE OR REPLACE VIEW fed AS SELECT id, a FROM t; "
-        "CREATE VIEW over_it AS SELECT id FROM bounded", schema_name=base)
-    with pytest.raises(gnitz.GnitzError):
-        client.delta_bootstrap(*client.resolve_table(base, "fed"))
+        "CREATE VIEW over_it AS SELECT id FROM bounded")
+    with pytest.raises(gnitz.GnitzRefusedError, match="carries no delta feed"):
+        client.delta_bootstrap(*client.resolve_table("fed"))
 
 
 def test_aliases_rename_the_registered_output(client, base):
@@ -75,13 +76,13 @@ def test_aliases_rename_the_registered_output(client, base):
         "CREATE VIEW j (x, y) AS SELECT t.id, u.a FROM t JOIN u ON t.a = u.a; "
         "CREATE VIEW downstream AS SELECT x, y FROM v; "
         "CREATE VIEW w AS SELECT id, a FROM t; "
-        "ALTER VIEW w (x, y) AS SELECT id, b FROM t", schema_name=base)
+        "ALTER VIEW w (x, y) AS SELECT id, b FROM t")
 
     for name, want in (("v", ab), ("bv", ab), ("downstream", ab), ("j", {(1, 10): 1}),
                        ("w", {(1, 100): 1, (2, 200): 1})):
-        got = scanned(client, base, name)
+        got = scanned(client, name)
         assert got[0]._fields == ("x", "y"), name
         assert bag(got, "x", "y") == want, name
 
-    with pytest.raises(gnitz.GnitzError, match="column 'id' not found"):
-        client.execute_sql("CREATE VIEW nope AS SELECT id FROM v", schema_name=base)
+    with pytest.raises(gnitz.GnitzRefusedError, match="column 'id' not found"):
+        client.execute_sql("CREATE VIEW nope AS SELECT id FROM v")

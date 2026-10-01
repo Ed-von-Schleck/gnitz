@@ -28,34 +28,34 @@ def _e_row(batch, pk, w):
 _base_seed, _stream = seed_stream(_e_row)
 
 
-def _run(client, sn, bench_timer, view_ddl, sz):
-    client.execute_sql(_E_DDL, schema_name=sn)
-    client.execute_sql(view_ddl, schema_name=sn)
-    tid, schema = client.resolve_table(sn, "e")
+def _run(client, bench_timer, view_ddl, sz):
+    client.execute_sql(_E_DDL)
+    client.execute_sql(view_ddl)
+    tid, schema = client.resolve_table("e")
     push_stream(client, tid, schema, _base_seed, sz["base"])
-    stream_and_assert(client, sn, bench_timer, tid, schema, _stream, sz, "v")
+    stream_and_assert(client, bench_timer, tid, schema, _stream, sz, "v")
 
 
-def test_string_eq(client, schema_name, bench_timer, scale_mode):
-    _run(client, schema_name, bench_timer,
+def test_string_eq(client, bench_timer, scale_mode):
+    _run(client, bench_timer,
          "CREATE VIEW v AS SELECT pk AS id, v FROM e WHERE name = 'GERMANY'",
          feature_sz(scale_mode))
 
 
-def test_string_in_list(client, schema_name, bench_timer, scale_mode):
-    _run(client, schema_name, bench_timer,
+def test_string_in_list(client, bench_timer, scale_mode):
+    _run(client, bench_timer,
          "CREATE VIEW v AS SELECT pk AS id, v FROM e WHERE mode IN ('AIR', 'SHIP', 'MAIL')",
          feature_sz(scale_mode))
 
 
-def test_between_float(client, schema_name, bench_timer, scale_mode):
-    _run(client, schema_name, bench_timer,
+def test_between_float(client, bench_timer, scale_mode):
+    _run(client, bench_timer,
          "CREATE VIEW v AS SELECT pk AS id FROM e "
          "WHERE d BETWEEN 100 AND 200 AND disc BETWEEN 0.05 AND 0.07",
          feature_sz(scale_mode))
 
 
-def test_is_not_null(client, schema_name, bench_timer, scale_mode):
-    _run(client, schema_name, bench_timer,
+def test_is_not_null(client, bench_timer, scale_mode):
+    _run(client, bench_timer,
          "CREATE VIEW v AS SELECT pk AS id, v FROM e WHERE note IS NOT NULL",
          feature_sz(scale_mode))

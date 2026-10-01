@@ -25,77 +25,76 @@ def _ch_factory(dim):
     )
 
 
-def _run(client, sn, bench_timer, view_ddls, read_view, sz):
-    client.execute_sql("CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, region BIGINT NOT NULL)",
-                       schema_name=sn)
+def _run(client, bench_timer, view_ddls, read_view, sz):
+    client.execute_sql("CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, region BIGINT NOT NULL)")
     client.execute_sql("CREATE TABLE ch (id BIGINT NOT NULL PRIMARY KEY, "
-                       "pid BIGINT NOT NULL, v BIGINT NOT NULL)", schema_name=sn)
+                       "pid BIGINT NOT NULL, v BIGINT NOT NULL)")
     for ddl in view_ddls:
-        client.execute_sql(ddl, schema_name=sn)
-    p_tid, p_schema = client.resolve_table(sn, "p")
+        client.execute_sql(ddl)
+    p_tid, p_schema = client.resolve_table("p")
     push_stream(client, p_tid, p_schema, _p_seed, sz["dim"])
-    ch_tid, ch_schema = client.resolve_table(sn, "ch")
+    ch_tid, ch_schema = client.resolve_table("ch")
     ch_base, ch_stream = _ch_factory(sz["dim"])
     push_stream(client, ch_tid, ch_schema, ch_base, sz["base"])
-    stream_and_assert(client, sn, bench_timer, ch_tid, ch_schema, ch_stream, sz, read_view)
+    stream_and_assert(client, bench_timer, ch_tid, ch_schema, ch_stream, sz, read_view)
 
 
-def test_scalar_proj(client, schema_name, bench_timer, scale_mode):
-    _run(client, schema_name, bench_timer, [
+def test_scalar_proj(client, bench_timer, scale_mode):
+    _run(client, bench_timer, [
         "CREATE VIEW v AS SELECT p.id AS id, "
         "(SELECT COUNT(*) FROM ch WHERE ch.pid = p.id) AS cnt FROM p",
     ], "v", feature_sz(scale_mode))
 
 
-def test_scalar_where_corr(client, schema_name, bench_timer, scale_mode):
-    _run(client, schema_name, bench_timer, [
+def test_scalar_where_corr(client, bench_timer, scale_mode):
+    _run(client, bench_timer, [
         "CREATE VIEW v AS SELECT p.id AS id FROM p "
         "WHERE (SELECT COUNT(*) FROM ch WHERE ch.pid = p.id) >= 2",
     ], "v", feature_sz(scale_mode))
 
 
-def test_scalar_where_uncorr(client, schema_name, bench_timer, scale_mode):
-    _run(client, schema_name, bench_timer, [
+def test_scalar_where_uncorr(client, bench_timer, scale_mode):
+    _run(client, bench_timer, [
         "CREATE VIEW v AS SELECT o.id AS id FROM ch o WHERE o.v < (SELECT MAX(ci.v) FROM ch ci)",
     ], "v", feature_sz(scale_mode))
 
 
-def test_exists(client, schema_name, bench_timer, scale_mode):
-    _run(client, schema_name, bench_timer, [
+def test_exists(client, bench_timer, scale_mode):
+    _run(client, bench_timer, [
         "CREATE VIEW v AS SELECT p.id AS id, p.region AS region FROM p "
         "WHERE EXISTS (SELECT 1 FROM ch WHERE ch.pid = p.id)",
     ], "v", feature_sz(scale_mode))
 
 
-def test_exists_group(client, schema_name, bench_timer, scale_mode):
-    _run(client, schema_name, bench_timer, [
+def test_exists_group(client, bench_timer, scale_mode):
+    _run(client, bench_timer, [
         "CREATE VIEW vx AS SELECT p.id AS id, p.region AS region FROM p "
         "WHERE EXISTS (SELECT 1 FROM ch WHERE ch.pid = p.id)",
         "CREATE VIEW vg AS SELECT region, COUNT(*) AS cnt FROM vx GROUP BY region",
     ], "vg", feature_sz(scale_mode))
 
 
-def test_in_sub(client, schema_name, bench_timer, scale_mode):
-    _run(client, schema_name, bench_timer, [
+def test_in_sub(client, bench_timer, scale_mode):
+    _run(client, bench_timer, [
         "CREATE VIEW v AS SELECT p.id AS id FROM p WHERE p.id IN (SELECT ch.pid FROM ch)",
     ], "v", feature_sz(scale_mode))
 
 
-def test_any(client, schema_name, bench_timer, scale_mode):
-    _run(client, schema_name, bench_timer, [
+def test_any(client, bench_timer, scale_mode):
+    _run(client, bench_timer, [
         "CREATE VIEW v AS SELECT o.id AS id FROM ch o WHERE o.v < ANY (SELECT ci.v FROM ch ci)",
     ], "v", feature_sz(scale_mode))
 
 
-def test_derived(client, schema_name, bench_timer, scale_mode):
-    _run(client, schema_name, bench_timer, [
+def test_derived(client, bench_timer, scale_mode):
+    _run(client, bench_timer, [
         "CREATE VIEW v AS SELECT d.id AS id, ch.v AS v FROM "
         "(SELECT id, region FROM p WHERE region > 0) d JOIN ch ON d.id = ch.pid",
     ], "v", feature_sz(scale_mode))
 
 
-def test_cte(client, schema_name, bench_timer, scale_mode):
-    _run(client, schema_name, bench_timer, [
+def test_cte(client, bench_timer, scale_mode):
+    _run(client, bench_timer, [
         "CREATE VIEW v AS WITH big AS (SELECT id, region FROM p WHERE region > 0) "
         "SELECT big.id AS id, ch.v AS v FROM big JOIN ch ON big.id = ch.pid",
     ], "v", feature_sz(scale_mode))

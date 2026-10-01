@@ -42,17 +42,15 @@ _WIDTHS = [
 # ---------------------------------------------------------------------------
 
 
-def test_a_null_is_distinct_from_its_types_zero_at_every_width(client, schema_name):
+def test_a_null_is_distinct_from_its_types_zero_at_every_width(client):
     """`v = 0` must admit the written zero and exclude the NULL, though the
     NULL's payload cell holds the same zero bytes. `IS NULL` and `IS NOT NULL`
     are asserted as exact complements, and `v > 0` rides alongside because the
     ordering load is the other genuinely per-width part of the read."""
-    sn = schema_name
     cols = [f"v{i}" for i in range(len(_WIDTHS))]
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, " +
-        ", ".join(f"{c} {sql}" for c, (sql, _, _) in zip(cols, _WIDTHS)) + ")",
-        schema_name=sn)
+        ", ".join(f"{c} {sql}" for c, (sql, _, _) in zip(cols, _WIDTHS)) + ")")
     # One row per value class, every column at once. An unsigned minimum *is*
     # zero, so those two rows agree there and differ in every signed column.
     nulls = [None] * len(_WIDTHS)
@@ -63,8 +61,7 @@ def test_a_null_is_distinct_from_its_types_zero_at_every_width(client, schema_na
     client.execute_sql(
         "INSERT INTO t VALUES " + ", ".join(
             f"({i}, " + ", ".join("NULL" if v is None else str(v) for v in r) + ")"
-            for i, r in enumerate(seed)),
-        schema_name=sn)
+            for i, r in enumerate(seed)))
 
     for j, (sql, _lo, _hi) in enumerate(_WIDTHS):
         col = [r[j] for r in seed]
@@ -73,25 +70,23 @@ def test_a_null_is_distinct_from_its_types_zero_at_every_width(client, schema_na
                            ("IS NULL", lambda v: v is None),
                            ("IS NOT NULL", lambda v: v is not None)):
             want = {(i,): 1 for i, v in enumerate(col) if keep(v)}
-            assert bag(rows(client, sn,
+            assert bag(rows(client,
                             f"SELECT pk FROM t WHERE {cols[j]} {pred}")) == want, \
                 f"{sql} {pred}"
 
 
 def test_the_null_bit_follows_payload_position_around_an_interleaved_key(
-        client, schema_name):
+        client):
     """The PK columns sit *between* the payload columns, so a bitmap index that
     subtracted the PK count rather than the PK columns *before* each one maps
     `p1` to a negative and `p3` past the end. Writing all eight NULL patterns at
     once shows a mis-indexed bit as a NULL that moved to a neighbouring column
     rather than as a missing row.
     """
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE t (p1 BIGINT, a BIGINT UNSIGNED NOT NULL, p2 BIGINT, "
-        "b BIGINT UNSIGNED NOT NULL, p3 BIGINT, PRIMARY KEY (a, b))",
-        schema_name=sn)
-    _, schema = client.resolve_table(sn, "t")
+        "b BIGINT UNSIGNED NOT NULL, p3 BIGINT, PRIMARY KEY (a, b))")
+    _, schema = client.resolve_table("t")
     assert schema.pk_indices == [1, 3]
 
     # All eight NULL patterns over (p1, p2, p3), each under its own key.
@@ -102,17 +97,16 @@ def test_the_null_bit_follows_payload_position_around_an_interleaved_key(
     client.execute_sql(
         "INSERT INTO t (p1, a, p2, b, p3) VALUES " +
         ", ".join("(" + ", ".join("NULL" if v is None else str(v) for v in r) + ")"
-                  for r in seed),
-        schema_name=sn)
+                  for r in seed))
 
-    assert bag(scanned(client, sn, "t"), "p1", "a", "p2", "b", "p3") == \
+    assert bag(scanned(client, "t"), "p1", "a", "p2", "b", "p3") == \
         {r: 1 for r in seed}
 
     # A projection that reorders the payload rebuilds the bitmap, so the bits
     # must be re-indexed rather than copied across.
     client.execute_sql(
-        "CREATE VIEW v AS SELECT b, a, p3, p2, p1 FROM t", schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "b", "a", "p3", "p2", "p1") == \
+        "CREATE VIEW v AS SELECT b, a, p3, p2, p1 FROM t")
+    assert bag(scanned(client, "v"), "b", "a", "p3", "p2", "p1") == \
         {(r[3], r[1], r[4], r[2], r[0]): 1 for r in seed}
 
 
@@ -122,7 +116,7 @@ def test_the_null_bit_follows_payload_position_around_an_interleaved_key(
 
 
 @pytest.fixture
-def lr(client, schema_name):
+def lr(client):
     """`l(id, fk)` and `r(k, rk, name)`, both join keys nullable, with a real
     `0` key present on the right.
 
@@ -131,12 +125,9 @@ def lr(client, schema_name):
     one — the failure a "NULL matched nothing" assertion alone cannot see.
     """
     client.execute_sql(
-        "CREATE TABLE l (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT)",
-        schema_name=schema_name)
+        "CREATE TABLE l (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT)")
     client.execute_sql(
-        "CREATE TABLE r (k BIGINT NOT NULL PRIMARY KEY, rk BIGINT, name BIGINT)",
-        schema_name=schema_name)
-    return schema_name
+        "CREATE TABLE r (k BIGINT NOT NULL PRIMARY KEY, rk BIGINT, name BIGINT)")
 
 
 def test_a_null_key_matches_neither_a_zero_nor_another_null(client, lr):
@@ -148,49 +139,44 @@ def test_a_null_key_matches_neither_a_zero_nor_another_null(client, lr):
     left-join case below joins `r.k`, the key region itself — two routes to the
     same collision.
     """
-    sn = lr
     client.execute_sql(
-        "CREATE VIEW v AS SELECT l.id AS id, r.name AS name FROM l JOIN r ON l.fk = r.rk",
-        schema_name=sn)
+        "CREATE VIEW v AS SELECT l.id AS id, r.name AS name FROM l JOIN r ON l.fk = r.rk")
     client.execute_sql(
-        "INSERT INTO r VALUES (100, 0, 900), (101, NULL, 901), (102, 7, NULL)",
-        schema_name=sn)
+        "INSERT INTO r VALUES (100, 0, 900), (101, NULL, 901), (102, 7, NULL)")
     client.execute_sql(
-        "INSERT INTO l VALUES (1, NULL), (2, 0), (3, 7), (4, NULL)", schema_name=sn)
+        "INSERT INTO l VALUES (1, NULL), (2, 0), (3, 7), (4, NULL)")
 
     # id 2 matches the real 0; id 3 matches 7. The two NULL left rows match
     # neither the real 0 nor the NULL right row.
-    assert bag(scanned(client, sn, "v"), "id", "name") == {(2, 900): 1, (3, None): 1}
+    assert bag(scanned(client, "v"), "id", "name") == {(2, 900): 1, (3, None): 1}
 
 
 @pytest.mark.parametrize("key_sql,zero", [("BIGINT", "0"), ("TEXT", "''")], ids=["int", "text"])
-def test_a_null_key_fills_once_beside_its_types_zero(client, schema_name, key_sql, zero):
+def test_a_null_key_fills_once_beside_its_types_zero(client, key_sql, zero):
     """The preserved row whose key is NULL and the one whose key is the type's
     zero reindex to the same synthetic key, and both project the same `x`, so
     only the retained key column and its null bit keep them apart — through a
     LEFT JOIN's null-fill and a NOT EXISTS's alike. The zero-keyed row matches
     twice, so a merge would cancel the NULL row's unmatched weight, and the
     weights are the assertion because a double-emit holds the same rows."""
-    sn = schema_name
     client.execute_sql(
         f"CREATE TABLE l (id BIGINT NOT NULL PRIMARY KEY, k {key_sql}, x BIGINT NOT NULL); "
         f"CREATE TABLE r (id BIGINT NOT NULL PRIMARY KEY, k {key_sql} NOT NULL, name BIGINT NOT NULL); "
         "CREATE VIEW lj AS SELECT l.x, r.name FROM l LEFT JOIN r ON l.k = r.k; "
         "CREATE VIEW ne AS SELECT l.x FROM l WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.k = l.k); "
         f"INSERT INTO l VALUES (1, NULL, 5), (2, {zero}, 5); "
-        f"INSERT INTO r VALUES (10, {zero}, 100), (11, {zero}, 200)", schema_name=sn)
+        f"INSERT INTO r VALUES (10, {zero}, 100), (11, {zero}, 200)")
 
-    assert bag(scanned(client, sn, "lj"), "x", "name") == {(5, None): 1, (5, 100): 1, (5, 200): 1}
-    assert bag(scanned(client, sn, "ne"), "x") == {(5,): 1}
+    assert bag(scanned(client, "lj"), "x", "name") == {(5, None): 1, (5, 100): 1, (5, 200): 1}
+    assert bag(scanned(client, "ne"), "x") == {(5,): 1}
 
 
-def test_a_composite_key_with_one_nullable_column_fills_and_anti_joins_exactly(client, schema_name):
+def test_a_composite_key_with_one_nullable_column_fills_and_anti_joins_exactly(client):
     """A composite key pairing a NOT NULL column with a nullable one: a NULL in
     the nullable column matches nothing, and its row fills or survives the anti
     join once, beside a row whose nullable column is the zero and matches twice.
     The two preserved rows project the same `x`, so only the retained nullable
     key column keeps them apart."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE l (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, k BIGINT, x BIGINT NOT NULL); "
         "CREATE TABLE r (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, k BIGINT NOT NULL, "
@@ -199,45 +185,43 @@ def test_a_composite_key_with_one_nullable_column_fills_and_anti_joins_exactly(c
         "CREATE VIEW ne AS SELECT l.x FROM l "
         "WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.a = l.a AND r.k = l.k); "
         "INSERT INTO l VALUES (1, 1, NULL, 5), (2, 1, 0, 5), (3, 2, 0, 6); "
-        "INSERT INTO r VALUES (10, 1, 0, 100), (11, 1, 0, 200)", schema_name=sn)
+        "INSERT INTO r VALUES (10, 1, 0, 100), (11, 1, 0, 200)")
 
-    assert bag(scanned(client, sn, "lj"), "x", "name") == {
+    assert bag(scanned(client, "lj"), "x", "name") == {
         (5, None): 1, (5, 100): 1, (5, 200): 1, (6, None): 1}
-    assert bag(scanned(client, sn, "ne"), "x") == {(5,): 1, (6,): 1}
+    assert bag(scanned(client, "ne"), "x") == {(5,): 1, (6,): 1}
 
-    client.execute_sql("DELETE FROM r", schema_name=sn)
-    assert bag(scanned(client, sn, "lj"), "x", "name") == {(5, None): 2, (6, None): 1}
-    assert bag(scanned(client, sn, "ne"), "x") == {(5,): 2, (6,): 1}
+    client.execute_sql("DELETE FROM r")
+    assert bag(scanned(client, "lj"), "x", "name") == {(5, None): 2, (6, None): 1}
+    assert bag(scanned(client, "ne"), "x") == {(5,): 2, (6,): 1}
 
 
-def test_a_null_group_key_and_a_null_extremum_are_not_zero(client, schema_name):
+def test_a_null_group_key_and_a_null_extremum_are_not_zero(client):
     """A NULL group key must not merge with the 0 group — in the grouping, in
     each group's extremes, or in a HAVING null test. A NULL → 0 transition of a
     MIN changes only the null bit, so the reduce's `old @ -1` / `new @ +1` pair
     must still differ: were the trace compared null-blind the stale NULL row
     would survive and surface on the next transition, which retracts it."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT, v BIGINT); "
         "CREATE VIEW gv AS SELECT g, COUNT(*) AS c, MIN(v) AS lo, MAX(v) AS hi FROM t GROUP BY g; "
         "CREATE VIEW gn AS SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING g IS NULL; "
         "CREATE VIEW m7 AS SELECT MIN(v) AS m FROM t WHERE g = 7; "
-        "INSERT INTO t VALUES (1, NULL, 100), (2, 0, 7), (3, NULL, 50), (4, 0, 9), (5, 7, NULL)",
-        schema_name=sn)
+        "INSERT INTO t VALUES (1, NULL, 100), (2, 0, 7), (3, NULL, 50), (4, 0, 9), (5, 7, NULL)")
 
     def expect(seven, null_group=(2, 50, 100), zero_group=(2, 7, 9)):
-        assert bag(scanned(client, sn, "gv"), "g", "c", "lo", "hi") == {
+        assert bag(scanned(client, "gv"), "g", "c", "lo", "hi") == {
             (None, *null_group): 1, (0, *zero_group): 1, (7, 1, seven, seven): 1}
-        assert bag(scanned(client, sn, "gn"), "g", "c") == {(None, null_group[0]): 1}
-        assert bag(scanned(client, sn, "m7"), "m") == {(seven,): 1}
+        assert bag(scanned(client, "gn"), "g", "c") == {(None, null_group[0]): 1}
+        assert bag(scanned(client, "m7"), "m") == {(seven,): 1}
 
     expect(None)
     # Lower the NULL group's MIN and raise the zero group's MAX: neither moves the other.
-    client.execute_sql("INSERT INTO t VALUES (6, NULL, 10), (7, 0, 999)", schema_name=sn)
+    client.execute_sql("INSERT INTO t VALUES (6, NULL, 10), (7, 0, 999)")
     expect(None, null_group=(3, 10, 100), zero_group=(3, 7, 999))
-    client.execute_sql("UPDATE t SET v = 0 WHERE pk = 5", schema_name=sn)
+    client.execute_sql("UPDATE t SET v = 0 WHERE pk = 5")
     expect(0, null_group=(3, 10, 100), zero_group=(3, 7, 999))
-    client.execute_sql("UPDATE t SET v = 7 WHERE pk = 5", schema_name=sn)
+    client.execute_sql("UPDATE t SET v = 7 WHERE pk = 5")
     expect(7, null_group=(3, 10, 100), zero_group=(3, 7, 999))
 
 
@@ -251,61 +235,54 @@ def test_a_key_crossing_the_null_boundary_retracts_and_readmits_exactly(
     Going back to NULL is a delete plus an insert because `SET col = NULL` is not
     expressible — orthogonal to the key path under test.
     """
-    sn = lr
     client.execute_sql(
         f"CREATE VIEW v AS SELECT l.id AS id, r.name AS name "
-        f"FROM l {kind} r ON l.fk = r.k", schema_name=sn)
-    client.execute_sql("INSERT INTO r VALUES (5, NULL, 905)", schema_name=sn)
+        f"FROM l {kind} r ON l.fk = r.k")
+    client.execute_sql("INSERT INTO r VALUES (5, NULL, 905)")
     unmatched = {(1, None): 1} if kind == "LEFT JOIN" else {}
 
-    client.execute_sql("INSERT INTO l VALUES (1, NULL)", schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "id", "name") == unmatched
+    client.execute_sql("INSERT INTO l VALUES (1, NULL)")
+    assert bag(scanned(client, "v"), "id", "name") == unmatched
 
-    client.execute_sql("UPDATE l SET fk = 5 WHERE id = 1", schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "id", "name") == {(1, 905): 1}
+    client.execute_sql("UPDATE l SET fk = 5 WHERE id = 1")
+    assert bag(scanned(client, "v"), "id", "name") == {(1, 905): 1}
 
-    client.execute_sql("DELETE FROM l WHERE id = 1", schema_name=sn)
-    client.execute_sql("INSERT INTO l VALUES (1, NULL)", schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "id", "name") == unmatched
+    client.execute_sql("DELETE FROM l WHERE id = 1")
+    client.execute_sql("INSERT INTO l VALUES (1, NULL)")
+    assert bag(scanned(client, "v"), "id", "name") == unmatched
 
-    client.execute_sql("DELETE FROM l WHERE id = 1", schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "id", "name") == {}
+    client.execute_sql("DELETE FROM l WHERE id = 1")
+    assert bag(scanned(client, "v"), "id", "name") == {}
 
 
 def test_a_null_string_key_matches_neither_the_empty_string_nor_another_null(
-        client, schema_name):
+        client):
     """A string key routes by the hash of its content, and the empty string
     hashes what a NULL's absent content would. They must stay distinct — the
     string counterpart of the NULL-versus-zero collision above."""
-    sn = schema_name
     client.execute_sql(
-        "CREATE TABLE l (id BIGINT NOT NULL PRIMARY KEY, sk TEXT)", schema_name=sn)
+        "CREATE TABLE l (id BIGINT NOT NULL PRIMARY KEY, sk TEXT)")
     client.execute_sql(
-        "CREATE TABLE r (k BIGINT NOT NULL PRIMARY KEY, rk TEXT, name BIGINT NOT NULL)",
-        schema_name=sn)
+        "CREATE TABLE r (k BIGINT NOT NULL PRIMARY KEY, rk TEXT, name BIGINT NOT NULL)")
     client.execute_sql(
-        "CREATE VIEW v AS SELECT l.id AS id, r.name AS name FROM l JOIN r ON l.sk = r.rk",
-        schema_name=sn)
+        "CREATE VIEW v AS SELECT l.id AS id, r.name AS name FROM l JOIN r ON l.sk = r.rk")
     client.execute_sql(
-        "INSERT INTO r VALUES (1, '', 900), (2, 'x', 901), (3, NULL, 902)",
-        schema_name=sn)
+        "INSERT INTO r VALUES (1, '', 900), (2, 'x', 901), (3, NULL, 902)")
     client.execute_sql(
-        "INSERT INTO l VALUES (1, NULL), (2, ''), (3, 'x')", schema_name=sn)
+        "INSERT INTO l VALUES (1, NULL), (2, ''), (3, 'x')")
 
-    assert bag(scanned(client, sn, "v"), "id", "name") == {(2, 900): 1, (3, 901): 1}
+    assert bag(scanned(client, "v"), "id", "name") == {(2, 900): 1, (3, 901): 1}
 
 
-def test_the_minimum_literal_and_a_negated_unsigned_column_compute_exactly(client, schema_name):
+def test_the_minimum_literal_and_a_negated_unsigned_column_compute_exactly(client):
     """`-9223372036854775808` is a BIGINT literal a filter compares like any other,
     not only where a key seek or a written cell reads it; and ABS over `-u` of an
     unsigned column computes both kernels, so it answers `u` — with a NULL row
     left NULL rather than read as its zero."""
-    sn = schema_name
     client.execute_sql(
-        "CREATE TABLE m (pk BIGINT NOT NULL PRIMARY KEY, b BIGINT, u INT UNSIGNED)", schema_name=sn)
+        "CREATE TABLE m (pk BIGINT NOT NULL PRIMARY KEY, b BIGINT, u INT UNSIGNED)")
     client.execute_sql(
-        "INSERT INTO m VALUES (1, -9223372036854775808, 4000000000), (2, 0, 7), (3, NULL, NULL)",
-        schema_name=sn)
-    assert bag(rows(client, sn, "SELECT pk FROM m WHERE b = -9223372036854775808")) == {(1,): 1}
-    assert bag(rows(client, sn, "SELECT pk, ABS(-u) AS a FROM m"), "pk", "a") == {
+        "INSERT INTO m VALUES (1, -9223372036854775808, 4000000000), (2, 0, 7), (3, NULL, NULL)")
+    assert bag(rows(client, "SELECT pk FROM m WHERE b = -9223372036854775808")) == {(1,): 1}
+    assert bag(rows(client, "SELECT pk, ABS(-u) AS a FROM m"), "pk", "a") == {
         (1, 4000000000): 1, (2, 7): 1, (3, None): 1}

@@ -5,28 +5,26 @@ from helpers.datagen import bulk_load
 from helpers.timing import rows_affected
 
 
-def _setup(client, schema_name, num_rows):
+def _setup(client, num_rows):
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
         "val BIGINT NOT NULL, cat BIGINT NOT NULL)",
-        schema_name=schema_name,
     )
-    return bulk_load(client, schema_name, "t", num_rows)
+    return bulk_load(client, "t", num_rows)
 
 
-def test_delete_pk(client, schema_name, bench_timer, scale):
-    pks = _setup(client, schema_name, scale["rows"])
+def test_delete_pk(client, bench_timer, scale):
+    pks = _setup(client, scale["rows"])
     for i in range(min(scale["write_iters"], len(pks))):
         bench_timer.measure(
             client.execute_sql,
             f"DELETE FROM t WHERE pk = {pks[i]}",
-            schema_name,
             rows_per_call=1,
         )
 
 
-def test_delete_scan(client, schema_name, bench_timer, scale):
-    _setup(client, schema_name, scale["rows"])
+def test_delete_scan(client, bench_timer, scale):
+    _setup(client, scale["rows"])
     for i in range(scale["write_iters"]):
         # Delete a narrow slice each iteration to avoid emptying the table
         lo = 900_000 + i * 1000
@@ -34,6 +32,5 @@ def test_delete_scan(client, schema_name, bench_timer, scale):
         bench_timer.measure_rows(
             client.execute_sql,
             f"DELETE FROM t WHERE val > {lo} AND val < {hi}",
-            schema_name,
             rows_fn=rows_affected,
         )

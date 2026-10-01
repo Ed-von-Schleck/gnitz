@@ -61,40 +61,38 @@ _PREDICATES = {
 }
 
 
-def test_a_predicate_follows_the_three_valued_table_across_a_retraction(client, schema_name):
+def test_a_predicate_follows_the_three_valued_table_across_a_retraction(client):
     """One filter view per predicate over one insert holding every pairing. The
     verdict is recomputed on the retraction, so a row moving across the unknown
     boundary in either direction must cancel exactly — a stale verdict leaves
     the old row at weight 1 beside the new one."""
-    sn = schema_name
     client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, b BIGINT, s TEXT)",
-        schema_name=sn)
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, b BIGINT, s TEXT)")
     views = {p: f"v{n}" for n, p in enumerate(_PREDICATES)}
     for p, v in views.items():
-        client.execute_sql(f"CREATE VIEW {v} AS SELECT pk FROM t WHERE {p}", schema_name=sn)
+        client.execute_sql(f"CREATE VIEW {v} AS SELECT pk FROM t WHERE {p}")
     client.execute_sql(
         "INSERT INTO t VALUES (1, 1, 1, 'x'), (2, 1, 0, 'x'), (3, 0, 1, 'y'), (4, 0, 0, 'y'), "
         "(5, NULL, 1, NULL), (6, NULL, 0, NULL), (7, 1, NULL, 'x'), (8, 0, NULL, 'y'), "
-        "(9, NULL, NULL, NULL)", schema_name=sn)
+        "(9, NULL, NULL, NULL)")
 
     for p, want in _PREDICATES.items():
-        assert bag(scanned(client, sn, views[p])) == {(k,): 1 for k in want}, views[p]
+        assert bag(scanned(client, views[p])) == {(k,): 1 for k in want}, views[p]
 
     # A definite value becomes unknown, and an unknown becomes definite.
-    client.execute_sql("UPDATE t SET a = NULL WHERE pk = 3", schema_name=sn)
-    client.execute_sql("UPDATE t SET a = 0 WHERE pk = 5", schema_name=sn)
-    assert bag(scanned(client, sn, views["a = 0"])) == {(4,): 1, (5,): 1, (8,): 1}
+    client.execute_sql("UPDATE t SET a = NULL WHERE pk = 3")
+    client.execute_sql("UPDATE t SET a = 0 WHERE pk = 5")
+    assert bag(scanned(client, views["a = 0"])) == {(4,): 1, (5,): 1, (8,): 1}
     for p, v in views.items():
-        assert bag(scanned(client, sn, v)) == \
-            bag(rows(client, sn, f"SELECT pk FROM t WHERE {p}")), v
+        assert bag(scanned(client, v)) == \
+            bag(rows(client, f"SELECT pk FROM t WHERE {p}")), v
 
-    client.execute_sql("DELETE FROM t", schema_name=sn)
+    client.execute_sql("DELETE FROM t")
     for v in views.values():
-        assert bag(scanned(client, sn, v)) == {}, v
+        assert bag(scanned(client, v)) == {}, v
 
 
-def test_a_branch_is_taken_on_true_alone_and_a_missing_else_is_null(client, schema_name):
+def test_a_branch_is_taken_on_true_alone_and_a_missing_else_is_null(client):
     """A searched CASE and a simple CASE are one node — the operand form desugars
     to `operand = label` — and an absent ELSE is `ELSE NULL`, not a dropped row. A
     branch whose test is unknown is not taken, exactly as a FALSE one is not.
@@ -103,7 +101,6 @@ def test_a_branch_is_taken_on_true_alone_and_a_missing_else_is_null(client, sche
     stating is where each differs: COALESCE walks to its first non-NULL over any
     arity, NULLIF *introduces* a NULL, and IF takes its else branch on an unknown
     test. A string CASE and COALESCE resolve in the string channel."""
-    sn = schema_name
     exprs = ["CASE WHEN a > 10 THEN 100 WHEN a > 0 THEN 10 ELSE 0 END",
              "CASE a WHEN 1 THEN 111 WHEN 2 THEN 222 ELSE 999 END",
              "CASE WHEN a > 10 THEN a END", "COALESCE(a + b, a, -1)", "IFNULL(a * 2, 0)",
@@ -111,12 +108,11 @@ def test_a_branch_is_taken_on_true_alone_and_a_missing_else_is_null(client, sche
              "COALESCE(s, 'none')"]
     select = "SELECT pk, " + ", ".join(f"{e} AS c{n}" for n, e in enumerate(exprs)) + " FROM t"
     client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, b BIGINT, s TEXT)",
-        schema_name=sn)
-    client.execute_sql(f"CREATE VIEW v AS {select}", schema_name=sn)
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, b BIGINT, s TEXT)")
+    client.execute_sql(f"CREATE VIEW v AS {select}")
     client.execute_sql(
         "INSERT INTO t VALUES (1, 20, NULL, 'x'), (2, 1, 2, NULL), (3, 2, NULL, 'y'), "
-        "(4, -3, -3, NULL), (5, NULL, NULL, NULL), (6, 0, 0, 'z')", schema_name=sn)
+        "(4, -3, -3, NULL), (5, NULL, NULL, NULL), (6, 0, 0, 'z')")
 
     expected = {
         # `a + b` is NULL, so COALESCE steps to `a`; `20 < NULL` is unknown, so
@@ -132,5 +128,5 @@ def test_a_branch_is_taken_on_true_alone_and_a_missing_else_is_null(client, sche
         # NULLIF(0, 0) is the NULL it introduces, and `0 < 0` is FALSE.
         (6, 0, 999, None, 0, 0, 0, None, 0, None, "z"): 1,
     }
-    assert bag(scanned(client, sn, "v")) == expected
-    assert bag(rows(client, sn, select)) == expected
+    assert bag(scanned(client, "v")) == expected
+    assert bag(rows(client, select)) == expected

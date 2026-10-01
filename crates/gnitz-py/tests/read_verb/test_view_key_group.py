@@ -20,30 +20,27 @@ NDIMS = 4
 
 
 @pytest.fixture
-def fact_dim(client, schema_name):
+def fact_dim(client):
     """`fact JOIN dim` on `k`, with `NFACTS` facts spread over `NDIMS` dims — so
-    every `_join_pk` names `NFACTS // NDIMS` view rows. Yields `(sn, view id)`."""
-    sn = schema_name
+    every `_join_pk` names `NFACTS // NDIMS` view rows. The view's id and schema."""
     for name in ("dim", "fact"):
         client.execute_sql(
-            f"CREATE TABLE {name} (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)",
-            schema_name=sn)
+            f"CREATE TABLE {name} (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)")
     client.execute_sql(
         "CREATE VIEW jv AS SELECT f.id AS fid, d.id AS did "
-        "FROM fact f JOIN dim d ON f.k = d.k", schema_name=sn)
+        "FROM fact f JOIN dim d ON f.k = d.k")
     client.execute_sql(
-        "INSERT INTO dim VALUES " + ",".join(f"({i}, {i})" for i in range(NDIMS)),
-        schema_name=sn)
+        "INSERT INTO dim VALUES " + ",".join(f"({i}, {i})" for i in range(NDIMS)))
     client.execute_sql(
         "INSERT INTO fact VALUES "
-        + ",".join(f"({i}, {i % NDIMS})" for i in range(NFACTS)), schema_name=sn)
-    return sn, *client.resolve_table(sn, "jv")
+        + ",".join(f"({i}, {i % NDIMS})" for i in range(NFACTS)))
+    return client.resolve_table("jv")
 
 
 def test_a_join_view_seek_returns_every_row_of_its_key(client, fact_dim):
     """The ground truth is a full scan of the view grouped by key; a seek of each
     key must reproduce its whole group, weights included."""
-    _, vid, schema = fact_dim
+    vid, schema = fact_dim
     groups = {}
     before = client.requests_sent
     for r in client.scan(vid, schema).including_hidden():
@@ -64,53 +61,49 @@ def test_a_join_view_seek_returns_every_row_of_its_key(client, fact_dim):
 
 
 @pytest.mark.parametrize("replicated", [False, True])
-def test_a_base_table_seek_stays_one_row(client, schema_name, replicated):
+def test_a_base_table_seek_stays_one_row(client, replicated):
     """The group walk must not widen a unique PK: a base table's ingest enforces
     it, so each key's group is one row at weight 1 — under replication too, where
     every worker holds the whole table and a mis-scoped walk would answer once
     per worker."""
-    sn = schema_name
     opts = " WITH (replicated = true)" if replicated else ""
     client.execute_sql(
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)" + opts,
-        schema_name=sn)
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)" + opts)
     client.execute_sql(
-        "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 10})" for i in range(NFACTS)),
-        schema_name=sn)
-    tid, schema = client.resolve_table(sn, "t")
+        "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 10})" for i in range(NFACTS)))
+    tid, schema = client.resolve_table("t")
     for i in range(NFACTS):
         assert bag(client.seek(tid, schema, pk=i)) == {(i, i * 10): 1}, f"seek(t, {i})"
     assert list(client.seek(tid, schema, pk=NFACTS + 7)) == []
 
 
-def test_a_group_past_one_frame_is_returned_whole(client, schema_name):
+def test_a_group_past_one_frame_is_returned_whole(client):
     """A view key whose group exceeds one 64 MiB frame is returned whole, and the
     connection answers the next statement."""
-    sn = schema_name
     rows_per_push, npush, width = 272, 16, 16384
     client.execute_sql(
-        "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)",
-        schema_name=sn)
+        "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)")
     client.execute_sql(
         "CREATE TABLE fact (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
-        "s TEXT NOT NULL)", schema_name=sn)
+        "s TEXT NOT NULL)")
     client.execute_sql(
-        "CREATE VIEW jv AS SELECT f.s AS s FROM fact f JOIN dim d ON f.k = d.k",
-        schema_name=sn)
-    client.execute_sql("INSERT INTO dim VALUES (1, 1)", schema_name=sn)
+        "CREATE VIEW jv AS SELECT f.s AS s FROM fact f JOIN dim d ON f.k = d.k")
+    client.execute_sql("INSERT INTO dim VALUES (1, 1)")
 
     # Every fact carries the same join key, so the view is one PK group of
     # `rows_per_push * npush` rows at `width` bytes each — past 64 MiB.
     # Each string is distinct: the view projects `s` alone, and a Z-set row is
     # identified by (PK, payload), so equal payloads would consolidate the
     # group down to one row at weight N.
-    fact_id, fact_schema = client.resolve_table(sn, "fact")
+    fact_id, fact_schema = client.resolve_table("fact")
     for p in range(npush):
         fids = range(p * rows_per_push, (p + 1) * rows_per_push)
         client.push(fact_id, gnitz.ZSetBatch(fact_schema).extend(
             {"id": fid, "k": 1, "s": f"{fid:08d}" + "x" * (width - 8)} for fid in fids))
 
-    assert len(list(client.seek(*client.resolve_table(sn, "jv"), pk=1))) == rows_per_push * npush
+    got = list(client.seek(*client.resolve_table("jv"), pk=1))
+    assert all(r._weight == 1 and len(r.s) == width for r in got)
+    assert sorted(r.s[:8] for r in got) == [f"{fid:08d}" for fid in range(rows_per_push * npush)]
 
     # The connection is intact: the next statement answers normally.
-    assert bag(scanned(client, sn, "dim")) == {(1, 1): 1}
+    assert bag(scanned(client, "dim")) == {(1, 1): 1}

@@ -1,55 +1,59 @@
-"""Running one of `_mirrorchild.py`'s cases in a fresh interpreter.
+"""Running a module of this directory in a fresh interpreter.
 
-Two cases need one and no more. A fault seam is a per-process latch, so arming
-one in the pytest interpreter would contaminate every sibling test; and a host
-crash means `SIGKILL` with no destructor and therefore no exit checkpoint, which
-cannot be staged inside the process running the assertions.
+For what cannot be staged inside the process running the assertions: a fault
+seam is a per-process latch, so arming one in the pytest interpreter would
+contaminate every sibling test; a host crash means `SIGKILL` with no destructor;
+and a syscall count or an exit status is a property of a whole process.
 
-The child reads `MIRROR_TARGET`, `MIRROR_DIR` and `MIRROR_SCHEMA` out of its
-environment, plus whatever else the caller passes.
+The child is a real module (`python -m <module> <case> <args...>`) rather than a
+source string: inside a literal its assertions are invisible to linting and
+formatting, and a typo surfaces only as a missing sentinel.
 """
 import os
 import subprocess
 import sys
 import time
 
-from _mirrorchild import READY
 from _paths import REPO_ROOT
 
 _TESTS_DIR = str(REPO_ROOT / "crates" / "gnitz-py" / "tests")
 
+# What a child prints once it has reached the state its parent is waiting for.
+READY = "CHILD-READY"
 
-def _child_env(base_dir, target, schema, env):
+
+def argv(module, *args):
+    return [sys.executable, "-m", module, *map(str, args)]
+
+
+def env(extra=None):
+    """This process's environment, with the child able to import the helpers
+    beside it, plus `extra`."""
     e = dict(os.environ)
-    # So the child can import `_mirrorchild` and the helpers beside it.
     e["PYTHONPATH"] = os.pathsep.join([_TESTS_DIR, e.get("PYTHONPATH", "")]).rstrip(os.pathsep)
-    e["MIRROR_TARGET"] = target
-    e["MIRROR_DIR"] = base_dir
-    e["MIRROR_SCHEMA"] = schema
-    e.update(env or {})
+    e.update(extra or {})
     return e
 
 
-def spawn(case, base_dir, target, schema, env=None):
-    """Start `_mirrorchild.<case>` in a fresh interpreter and hand back the live
-    process.
+def spawn(module, *args, extra_env=None):
+    """Start the child and hand back the live process.
 
     For a child that prints `READY` and then blocks: the parent reads that line
     while the child is still running, and sends the signal itself.
     """
     return subprocess.Popen(
-        [sys.executable, "-m", "_mirrorchild", case],
+        argv(module, *args),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
-        env=_child_env(base_dir, target, schema, env),
+        env=env(extra_env),
     )
 
 
-def run(case, base_dir, target, schema, env=None, timeout=180):
-    """Run `_mirrorchild.<case>` to completion, asserting it exited cleanly."""
-    p = spawn(case, base_dir, target, schema, env)
+def run(module, *args, extra_env=None, timeout=180):
+    """Run the child to completion, asserting it exited cleanly."""
+    p = spawn(module, *args, extra_env=extra_env)
     out, err = p.communicate(timeout=timeout)
     assert p.returncode == 0, f"child exited {p.returncode}\nstdout:\n{out}\nstderr:\n{err}"
 

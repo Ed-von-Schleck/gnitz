@@ -15,6 +15,7 @@ to a row-set or `len()` comparison, and it is the one a replay bug produces.
 import pytest
 import gnitz
 from _read import bag, rows, scanned
+from _sql import insert
 
 _COLS = ("pk", "val", "s", "n")
 
@@ -25,33 +26,26 @@ _ROWS = [(i, i * 10, f"r{i}", i if i % 2 else None) for i in range(24)]
 _ROWS += [(100, 1000, "A" * 200, 5), (101, 1010, "B" * 250, None), (102, 1020, "", 7)]
 
 
-def _row_sql(rows):
-    return ", ".join(
-        "({}, {}, '{}', {})".format(pk, val, s, "NULL" if n is None else n)
-        for pk, val, s, n in rows)
-
-
 def test_a_commit_after_a_replayed_tail_survives_the_next_crash(own_server):
     """Many single-row commits replayed at boot, then one more and a crash: that
     commit's zone must sit above the watermark the replay persisted."""
     own_server.start()
-    with gnitz.connect(own_server.sock_path) as conn:
-        conn.create_schema("dur")
+    with gnitz.connect(own_server.target) as conn:
         conn.execute_sql(
             "CREATE TABLE r (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL) "
-            "WITH (replicated = true)", schema_name="dur")
+            "WITH (replicated = true)")
         for pk in range(16):
-            conn.execute_sql(f"INSERT INTO r VALUES ({pk}, {pk})", schema_name="dur")
+            conn.execute_sql(f"INSERT INTO r VALUES ({pk}, {pk})")
     want = {(pk, pk): 1 for pk in range(16)}
 
     own_server.restart()
-    with gnitz.connect(own_server.sock_path) as conn:
-        assert bag(scanned(conn, "dur", "r"), "pk", "val") == want
-        conn.execute_sql("INSERT INTO r VALUES (100, 100)", schema_name="dur")
+    with gnitz.connect(own_server.target) as conn:
+        assert bag(scanned(conn, "r"), "pk", "val") == want
+        conn.execute_sql("INSERT INTO r VALUES (100, 100)")
 
     own_server.restart()
-    with gnitz.connect(own_server.sock_path) as conn:
-        assert bag(scanned(conn, "dur", "r"), "pk", "val") == want | {(100, 100): 1}
+    with gnitz.connect(own_server.target) as conn:
+        assert bag(scanned(conn, "r"), "pk", "val") == want | {(100, 100): 1}
 
 
 def test_every_dml_verb_survives_two_crashes(own_server):
@@ -62,41 +56,38 @@ def test_every_dml_verb_survives_two_crashes(own_server):
     table rides along: every id drawn after a crash exceeds every id committed
     before it."""
     own_server.start()
-    with gnitz.connect(own_server.sock_path) as conn:
-        conn.create_schema("dur")
+    with gnitz.connect(own_server.target) as conn:
         conn.execute_sql(
             "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL, "
             "s VARCHAR(500) NOT NULL, n BIGINT); "
             "CREATE TABLE q (id SERIAL PRIMARY KEY, name TEXT NOT NULL); "
-            "INSERT INTO q (name) VALUES ('a'), ('b'), ('c')", schema_name="dur")
-        tid, _ = conn.resolve_table("dur", "t")
-        conn.execute_sql(f"INSERT INTO t VALUES {_row_sql(_ROWS)}", schema_name="dur")
+            "INSERT INTO q (name) VALUES ('a'), ('b'), ('c')")
+        tid, _ = conn.resolve_table("t")
+        insert(conn, "t", _ROWS)
         for v in (200, 300, 400):
-            conn.execute_sql(f"UPDATE t SET val = {v} WHERE pk = 1", schema_name="dur")
-        conn.execute_sql("DELETE FROM t WHERE pk = 3", schema_name="dur")
-        conn.execute_sql("INSERT INTO t VALUES (3, 999, 'again', NULL)",
-                         schema_name="dur")
-        conn.execute_sql("DELETE FROM t WHERE pk = 5", schema_name="dur")
+            conn.execute_sql(f"UPDATE t SET val = {v} WHERE pk = 1")
+        conn.execute_sql("DELETE FROM t WHERE pk = 3")
+        conn.execute_sql("INSERT INTO t VALUES (3, 999, 'again', NULL)")
+        conn.execute_sql("DELETE FROM t WHERE pk = 5")
 
     want = {r for r in _ROWS if r[0] not in (1, 3, 5)}
     want |= {(1, 400, "r1", 1), (3, 999, "again", None)}
     want = {r: 1 for r in want}
 
     own_server.restart()
-    with gnitz.connect(own_server.sock_path) as conn:
-        assert conn.resolve_table("dur", "t")[0] == tid, "table_id moved across a crash"
-        assert bag(scanned(conn, "dur", "t"), *_COLS) == want
-        conn.execute_sql("INSERT INTO t VALUES (300, 3000, 'post', 1)",
-                         schema_name="dur")
-        [d] = rows(conn, "dur", "INSERT INTO q (name) VALUES ('d') RETURNING id")
+    with gnitz.connect(own_server.target) as conn:
+        assert conn.resolve_table("t")[0] == tid, "table_id moved across a crash"
+        assert bag(scanned(conn, "t"), *_COLS) == want
+        conn.execute_sql("INSERT INTO t VALUES (300, 3000, 'post', 1)")
+        [d] = rows(conn, "INSERT INTO q (name) VALUES ('d') RETURNING id")
 
     own_server.restart()
-    with gnitz.connect(own_server.sock_path) as conn:
-        assert bag(scanned(conn, "dur", "t"), *_COLS) == want | {
+    with gnitz.connect(own_server.target) as conn:
+        assert bag(scanned(conn, "t"), *_COLS) == want | {
             (300, 3000, "post", 1): 1}, "a second crash with no clean stop between"
-        [e] = rows(conn, "dur", "INSERT INTO q (name) VALUES ('e') RETURNING id")
+        [e] = rows(conn, "INSERT INTO q (name) VALUES ('e') RETURNING id")
         assert 3 < d.id < e.id, "a SERIAL id reissued across a crash"
-        assert bag(scanned(conn, "dur", "q"), "id", "name") == {
+        assert bag(scanned(conn, "q"), "id", "name") == {
             (1, "a"): 1, (2, "b"): 1, (3, "c"): 1, (d.id, "d"): 1, (e.id, "e"): 1}
 
 
@@ -110,46 +101,39 @@ def test_every_ddl_kind_survives_a_crash(own_server):
     table: recovered from the stale shard rather than the SAL, the next CREATE
     re-issues an id already in use."""
     own_server.start()
-    with gnitz.connect(own_server.sock_path) as conn:
+    with gnitz.connect(own_server.target, schema="dur") as conn:
         sid = conn.create_schema("dur")
         conn.execute_sql(
-            "CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name="dur")
-        conn.execute_sql("INSERT INTO t1 VALUES (1, 10)", schema_name="dur")
+            "CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
+        conn.execute_sql("INSERT INTO t1 VALUES (1, 10)")
         conn.execute_sql(
-            "CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name="dur")
-        conn.execute_sql("INSERT INTO t2 VALUES (1, 20)", schema_name="dur")
-        conn.execute_sql("CREATE VIEW v AS SELECT pk, val * 2 AS doubled FROM t1",
-                         schema_name="dur")
-        conn.execute_sql("INSERT INTO t1 VALUES (2, 30)", schema_name="dur")
+            "CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
+        conn.execute_sql("INSERT INTO t2 VALUES (1, 20)")
+        conn.execute_sql("CREATE VIEW v AS SELECT pk, val * 2 AS doubled FROM t1")
+        conn.execute_sql("INSERT INTO t1 VALUES (2, 30)")
 
         # Rapid-fire CREATEs: one SAL broadcast each, one fdatasync for the lot.
         for i in range(10):
             conn.execute_sql(
-                f"CREATE TABLE b{i} (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-                schema_name="dur")
-        ids = {n: conn.resolve_table("dur", n)[0]
+                f"CREATE TABLE b{i} (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
+        ids = {n: conn.resolve_table(n)[0]
                for n in ["t1", "t2", "v"] + [f"b{i}" for i in range(10)]}
 
         conn.execute_sql(
-            "CREATE TABLE gone (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-            schema_name="dur")
-        conn.execute_sql("INSERT INTO gone VALUES (1, 1)", schema_name="dur")
-        dropped_ids = [conn.resolve_table("dur", "gone")[0]]
-        conn.execute_sql("DROP TABLE dur.gone", schema_name="dur")
-        conn.execute_sql("CREATE VIEW vgone AS SELECT pk, val FROM t1",
-                         schema_name="dur")
-        dropped_ids.append(conn.resolve_table("dur", "vgone")[0])
-        conn.execute_sql("DROP VIEW dur.vgone", schema_name="dur")
+            "CREATE TABLE gone (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
+        conn.execute_sql("INSERT INTO gone VALUES (1, 1)")
+        dropped_ids = [conn.resolve_table("gone")[0]]
+        conn.execute_sql("DROP TABLE dur.gone")
+        conn.execute_sql("CREATE VIEW vgone AS SELECT pk, val FROM t1")
+        dropped_ids.append(conn.resolve_table("vgone")[0])
+        conn.execute_sql("DROP VIEW dur.vgone")
 
     own_server.restart()
-    with gnitz.connect(own_server.sock_path) as conn:
-        assert {n: conn.resolve_table("dur", n)[0] for n in ids} == ids
+    with gnitz.connect(own_server.target, schema="dur") as conn:
+        assert {n: conn.resolve_table(n)[0] for n in ids} == ids
         sid2 = conn.create_schema("dur2")
-        conn.execute_sql("CREATE TABLE fresh (pk BIGINT NOT NULL PRIMARY KEY)",
-                         schema_name="dur2")
-        fresh = conn.resolve_table("dur2", "fresh")[0]
+        conn.execute_sql("CREATE TABLE fresh (pk BIGINT NOT NULL PRIMARY KEY)")
+        fresh = conn.resolve_table("fresh")[0]
         assert fresh > max(ids.values()), "table_id reissued across the crash"
         assert fresh > max(dropped_ids), \
             "an id created and dropped before the crash was reissued"
@@ -157,16 +141,16 @@ def test_every_ddl_kind_survives_a_crash(own_server):
 
         for dropped in ("gone", "vgone"):
             with pytest.raises(gnitz.GnitzNotFoundError):
-                conn.resolve_table("dur", dropped)
+                conn.resolve_table(dropped)
 
-        assert bag(scanned(conn, "dur", "t1"), "pk", "val") == {(1, 10): 1, (2, 30): 1}
-        assert bag(scanned(conn, "dur", "t2"), "pk", "val") == {(1, 20): 1}
+        assert bag(scanned(conn, "t1"), "pk", "val") == {(1, 10): 1, (2, 30): 1}
+        assert bag(scanned(conn, "t2"), "pk", "val") == {(1, 20): 1}
 
         # Every re-created relation is functional, and the view still ticks.
-        conn.execute_sql("INSERT INTO b7 VALUES (1, 42)", schema_name="dur")
-        assert bag(scanned(conn, "dur", "b7"), "pk", "v") == {(1, 42): 1}
-        conn.execute_sql("INSERT INTO t1 VALUES (3, 50)", schema_name="dur")
-        assert bag(scanned(conn, "dur", "v"), "pk", "doubled") == {
+        conn.execute_sql("INSERT INTO b7 VALUES (1, 42)")
+        assert bag(scanned(conn, "b7"), "pk", "v") == {(1, 42): 1}
+        conn.execute_sql("INSERT INTO t1 VALUES (3, 50)")
+        assert bag(scanned(conn, "v"), "pk", "doubled") == {
             (1, 20): 1, (2, 60): 1, (3, 100): 1}
 
 
@@ -176,11 +160,9 @@ def test_an_acked_create_index_survives_a_crash(own_server):
     # A tiny threshold so the DDL broadcasts below make the first INSERT's
     # committer cycle run a checkpoint.
     own_server.start(extra_env={"GNITZ_CHECKPOINT_BYTES": "1024"})
-    with gnitz.connect(own_server.sock_path) as conn:
-        conn.create_schema("idxcrash")
+    with gnitz.connect(own_server.target) as conn:
         conn.execute_sql(
-            "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name="idxcrash")
+            "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
         # Three children × four non-PK FK columns.
         for t in ("c1", "c2", "c3"):
             conn.execute_sql(
@@ -189,13 +171,12 @@ def test_an_acked_create_index_survives_a_crash(own_server):
                 "  f2 BIGINT NOT NULL REFERENCES p(id),"
                 "  f3 BIGINT NOT NULL REFERENCES p(id),"
                 "  f4 BIGINT NOT NULL REFERENCES p(id),"
-                "  val BIGINT NOT NULL)", schema_name="idxcrash")
-        conn.execute_sql("INSERT INTO p VALUES (1, 100)", schema_name="idxcrash")
-        conn.execute_sql("INSERT INTO c1 VALUES (1, 1, 1, 1, 1, 77)",
-                         schema_name="idxcrash")
+                "  val BIGINT NOT NULL)")
+        conn.execute_sql("INSERT INTO p VALUES (1, 100)")
+        conn.execute_sql("INSERT INTO c1 VALUES (1, 1, 1, 1, 1, 77)")
 
-        conn.execute_sql("CREATE INDEX ON c1(val)", schema_name="idxcrash")
-        c1, c1_schema = conn.resolve_table("idxcrash", "c1")
+        conn.execute_sql("CREATE INDEX ON c1(val)")
+        c1, c1_schema = conn.resolve_table("c1")
         VAL_COL = 5  # cid, f1..f4, val
         assert bag(conn.seek_by_index(c1, c1_schema, [VAL_COL], [77]), "cid") == {(1,): 1}, \
             "index missing pre-crash"
@@ -203,8 +184,8 @@ def test_an_acked_create_index_survives_a_crash(own_server):
     # SIGKILL before any further checkpoint: the CREATE INDEX lives only in the
     # SAL, guarded by the watermark dedup.
     own_server.restart()
-    with gnitz.connect(own_server.sock_path) as conn:
-        c1_again, c1_schema_again = conn.resolve_table("idxcrash", "c1")
+    with gnitz.connect(own_server.target) as conn:
+        c1_again, c1_schema_again = conn.resolve_table("c1")
         assert c1_again == c1
         assert bag(conn.seek_by_index(c1_again, c1_schema_again, [VAL_COL], [77]), "cid") == {(1,): 1}, \
             "acknowledged CREATE INDEX lost after crash recovery"
@@ -216,21 +197,18 @@ def test_an_acked_create_index_survives_a_crash(own_server):
 # width, and a checkpointed shard was written at it.
 
 
-def _alter_add_base(conn, sn, rows):
-    conn.create_schema(sn)
+def _alter_add_base(conn, rows):
     conn.execute_sql(
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
-        schema_name=sn)
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)")
     conn.execute_sql(
-        "INSERT INTO t VALUES " + ", ".join(f"({k}, {k * 10})" for k in rows),
-        schema_name=sn)
+        "INSERT INTO t VALUES " + ", ".join(f"({k}, {k * 10})" for k in rows))
 
 
-def _wide(conn, sn):
+def _wide(conn):
     """The widened table as a weight bag over `(id, a, c)`. A pk-keyed dict would
     read the doubled row a replayed push produces as correct — the one failure
     mode these two tests exist for."""
-    return bag(rows(conn, sn, "SELECT * FROM t"), "id", "a", "c")
+    return bag(rows(conn, "SELECT * FROM t"), "id", "a", "c")
 
 
 def test_add_column_then_crash_replays_the_pre_alter_sal_tail(own_server):
@@ -238,19 +216,18 @@ def test_add_column_then_crash_replays_the_pre_alter_sal_tail(own_server):
     On recovery the master applies the catalog tail pre-fork, so the table is
     already at its final width when the workers replay pushes embedded at the old
     width — each of which must be widened with a NULL tail exactly once."""
-    sn = "aadd_crash"
     own_server.start()
-    with gnitz.connect(own_server.sock_path) as conn:
-        _alter_add_base(conn, sn, range(1, 11))
-        conn.execute_sql("ALTER TABLE t ADD COLUMN c BIGINT", schema_name=sn)
-        conn.execute_sql("INSERT INTO t VALUES (11, 110, 1100)", schema_name=sn)
-        before = _wide(conn, sn)
+    with gnitz.connect(own_server.target) as conn:
+        _alter_add_base(conn, range(1, 11))
+        conn.execute_sql("ALTER TABLE t ADD COLUMN c BIGINT")
+        conn.execute_sql("INSERT INTO t VALUES (11, 110, 1100)")
+        before = _wide(conn)
         assert before == {(k, k * 10, None): 1 for k in range(1, 11)} | {
             (11, 110, 1100): 1}
 
     own_server.restart()
-    with gnitz.connect(own_server.sock_path) as conn:
-        assert _wide(conn, sn) == before
+    with gnitz.connect(own_server.target) as conn:
+        assert _wide(conn) == before
 
 
 def test_add_column_over_shards_written_at_the_old_arity(own_server):
@@ -262,25 +239,24 @@ def test_add_column_over_shards_written_at_the_old_arity(own_server):
     Both stops go through `restart(graceful=True)`, which asserts the master
     exited 0 — a failed shutdown checkpoint would leave the rows in the SAL and
     the replay path, not the pad path, would answer every assertion below."""
-    sn = "aadd_ckpt"
     own_server.start()
-    with gnitz.connect(own_server.sock_path) as conn:
-        _alter_add_base(conn, sn, range(1, 21))
+    with gnitz.connect(own_server.target) as conn:
+        _alter_add_base(conn, range(1, 21))
 
     # Checkpoint the narrow rows to disk, then ALTER against those shards.
     own_server.restart(graceful=True)
-    with gnitz.connect(own_server.sock_path) as conn:
-        conn.execute_sql("ALTER TABLE t ADD COLUMN c BIGINT", schema_name=sn)
-        assert _wide(conn, sn) == {(k, k * 10, None): 1 for k in range(1, 21)}
+    with gnitz.connect(own_server.target) as conn:
+        conn.execute_sql("ALTER TABLE t ADD COLUMN c BIGINT")
+        assert _wide(conn) == {(k, k * 10, None): 1 for k in range(1, 21)}
         # Write across the padded shards: a new row, and an UPDATE of a padded
         # one, whose retraction must match the stored NULL rather than a zero.
-        conn.execute_sql("INSERT INTO t VALUES (21, 210, 2100)", schema_name=sn)
-        conn.execute_sql("UPDATE t SET c = 7 WHERE id = 5", schema_name=sn)
+        conn.execute_sql("INSERT INTO t VALUES (21, 210, 2100)")
+        conn.execute_sql("UPDATE t SET c = 7 WHERE id = 5")
 
     # Checkpoint again — rewriting the padded shards at the new width — so the
     # reads below come off full-width files.
     own_server.restart(graceful=True)
-    with gnitz.connect(own_server.sock_path) as conn:
+    with gnitz.connect(own_server.target) as conn:
         want = {(k, k * 10, None): 1 for k in range(1, 21) if k != 5}
         want |= {(5, 50, 7): 1, (21, 210, 2100): 1}
-        assert _wide(conn, sn) == want
+        assert _wide(conn) == want

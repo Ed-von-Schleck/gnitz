@@ -16,17 +16,6 @@ def _read_status(path):
     return dict(line.split(":\t", 1) for line in text.splitlines() if ":\t" in line)
 
 
-def _children(pid):
-    kids = []
-    for name in os.listdir("/proc"):
-        if not name.isdigit():
-            continue
-        status = _read_status(f"/proc/{name}/status")
-        if status is not None and int(status["PPid"]) == pid:
-            kids.append(int(name))
-    return kids
-
-
 def _threads(pid):
     """`{tid: status}` for every live thread of `pid`."""
     out = {}
@@ -50,8 +39,8 @@ def test_every_process_and_thread_holds_its_share(own_server):
     if "affinity: not applied" in own_server.log_text():
         pytest.skip("host has too few cores to seat 2 workers and the master")
     master = own_server.proc.pid
-    workers = _children(master)
-    assert len(workers) == 2, workers
+    workers = own_server.worker_pids()
+    assert sorted(workers) == [0, 1], workers
 
     # An iou-wrk thread started before the master pinned would keep the unpinned mask.
     deadline = time.monotonic() + 10
@@ -60,7 +49,7 @@ def test_every_process_and_thread_holds_its_share(own_server):
         time.sleep(0.05)
 
     masks = []
-    for pid in [master, *workers]:
+    for pid in [master, *workers.values()]:
         per_thread = {tid: _cpus(s["Cpus_allowed_list"]) for tid, s in _threads(pid).items()}
         assert len(set(per_thread.values())) == 1, (pid, per_thread)
         masks.append(next(iter(per_thread.values())))

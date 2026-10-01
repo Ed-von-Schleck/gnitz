@@ -75,6 +75,10 @@ pub struct PyGnitzClient {
     /// A `Sync` shim: `#[pyclass]` demands `Sync` and a mirroring client is
     /// `Send` only. Never locked — [`Self::slot`] is the only way in.
     inner: Mutex<Option<GnitzClient>>,
+    /// The schema this connection's names resolve in: every SQL statement, and
+    /// every verb that takes a relation name.
+    #[pyo3(get, set)]
+    schema: String,
 }
 
 impl PyGnitzClient {
@@ -83,7 +87,7 @@ impl PyGnitzClient {
         self.inner.get_mut().expect("the mutex is never locked")
     }
 
-    /// The still-open client, or a `GnitzError` if `close()` already ran.
+    /// The still-open client, or a `GnitzConnectionError` if `close()` already ran.
     fn live(&mut self) -> PyResult<&mut GnitzClient> {
         self.slot().as_mut().ok_or_else(|| client_err(ClientError::Closed))
     }
@@ -103,9 +107,11 @@ impl PyGnitzClient {
 #[pymethods]
 impl PyGnitzClient {
     #[new]
-    pub fn new(py: Python<'_>, target: &str) -> PyResult<Self> {
+    #[pyo3(signature = (target, schema = "public"))]
+    pub fn new(py: Python<'_>, target: &str, schema: &str) -> PyResult<Self> {
         Ok(PyGnitzClient {
             inner: Mutex::new(Some(connect_client(py, target)?)),
+            schema: schema.to_string(),
         })
     }
 
@@ -152,22 +158,23 @@ impl PyGnitzClient {
         self.call(py, |c| c.drop_schema(name))
     }
 
-    /// create_table(schema_name, table_name, schema). Partitioned, default
-    /// distribution; no inline UNIQUE surface.
+    /// create_table(table_name, schema). Partitioned, default distribution; no
+    /// inline UNIQUE surface.
     pub fn create_table(
         &mut self,
         py: Python<'_>,
-        schema_name: &str,
         table_name: &str,
         #[pyo3(from_py_with = resolve_py_schema)] schema: Arc<Schema>,
     ) -> PyResult<u64> {
+        let sn = self.schema.clone();
         self.call(py, |c| {
-            c.create_table(schema_name, table_name, &schema, &[], TableProps::default(), &[])
+            c.create_table(&sn, table_name, &schema, &[], TableProps::default(), &[])
         })
     }
 
-    pub fn drop_table(&mut self, py: Python<'_>, schema_name: &str, table_name: &str) -> PyResult<()> {
-        self.call(py, |c| c.drop_table(schema_name, &[table_name], false))
+    pub fn drop_table(&mut self, py: Python<'_>, table_name: &str) -> PyResult<()> {
+        let sn = self.schema.clone();
+        self.call(py, |c| c.drop_table(&sn, &[table_name], false))
     }
 
     // ----- DML -----
@@ -216,27 +223,24 @@ impl PyGnitzClient {
 
     // ----- Views -----
 
-    /// create_view(schema_name, view_name, source_table_id) — a passthrough
-    /// view, whose schema is its source's.
-    pub fn create_view(
-        &mut self,
-        py: Python<'_>,
-        schema_name: &str,
-        view_name: &str,
-        source_table_id: u64,
-    ) -> PyResult<u64> {
+    /// create_view(view_name, source_table_id) — a passthrough view, whose
+    /// schema is its source's.
+    pub fn create_view(&mut self, py: Python<'_>, view_name: &str, source_table_id: u64) -> PyResult<u64> {
+        let sn = self.schema.clone();
         self.call(py, |c| {
-            c.create_view(schema_name, view_name, source_table_id, ViewProps::default())
+            c.create_view(&sn, view_name, source_table_id, ViewProps::default())
         })
     }
 
-    pub fn drop_view(&mut self, py: Python<'_>, schema_name: &str, view_name: &str) -> PyResult<()> {
-        self.call(py, |c| c.drop_view(schema_name, &[view_name], false))
+    pub fn drop_view(&mut self, py: Python<'_>, view_name: &str) -> PyResult<()> {
+        let sn = self.schema.clone();
+        self.call(py, |c| c.drop_view(&sn, &[view_name], false))
     }
 
-    /// resolve_table(schema_name, table_name) -> (tid: int, schema: Schema)
-    pub fn resolve_table(&mut self, py: Python<'_>, schema_name: &str, table_name: &str) -> PyResult<(u64, PySchema)> {
-        let rel = self.call(py, |c| c.resolve_relation(schema_name, table_name))?;
+    /// resolve_table(table_name) -> (tid: int, schema: Schema)
+    pub fn resolve_table(&mut self, py: Python<'_>, table_name: &str) -> PyResult<(u64, PySchema)> {
+        let sn = self.schema.clone();
+        let rel = self.call(py, |c| c.resolve_relation(&sn, table_name))?;
         Ok((rel.tid, PySchema { rust: Arc::clone(&rel.schema) }))
     }
 
@@ -365,16 +369,16 @@ impl PyGnitzClient {
         scan_result(py, self.call(py, |c| c.scan_spec(table_id, &spec, &schema))?)
     }
 
-    /// execute_sql(sql, schema_name="public") -> list of result dicts
+    /// execute_sql(sql) -> list of result dicts
     ///
     /// A `SELECT` (and the `EXPLAIN` of one) over a view this client mirrors is
     /// planned and answered against the local copy; every other statement, and
     /// every read of a relation the copy does not hold, runs on the connection.
-    #[pyo3(signature = (sql, schema_name = "public"))]
-    pub fn execute_sql(&mut self, py: Python<'_>, sql: &str, schema_name: &str) -> PyResult<Py<PyAny>> {
+    pub fn execute_sql(&mut self, py: Python<'_>, sql: &str) -> PyResult<Py<PyAny>> {
         // Plan + execute (all wire I/O, no Python) with the GIL released.
+        let sn = self.schema.clone();
         let c = self.live()?;
-        let results = py.detach(|| gnitz_sql::execute(c, schema_name, sql)).map_err(sql_err)?;
+        let results = py.detach(|| gnitz_sql::execute(c, &sn, sql)).map_err(sql_err)?;
         sql_results_to_py(py, results)
     }
 
@@ -391,7 +395,7 @@ impl PyGnitzClient {
         self.call(py, move |c| c.attach_mirror(Mirror::open(&base_dir)?))
     }
 
-    /// mirror_view(schema_name, name) -> PollResult
+    /// mirror_view(name) -> PollResult
     ///
     /// Register the view and bring its copy up to date; idempotent, and the
     /// result says whether this was a first registration or a reopen. Only a
@@ -399,8 +403,9 @@ impl PyGnitzClient {
     ///
     /// A mirrored read answers at the last poll, not at what the server holds
     /// now.
-    pub fn mirror_view(&mut self, py: Python<'_>, schema_name: &str, name: &str) -> PyResult<Py<PyPollResult>> {
-        let outcome = self.call(py, |c| c.mirror_view(schema_name, name))?;
+    pub fn mirror_view(&mut self, py: Python<'_>, name: &str) -> PyResult<Py<PyPollResult>> {
+        let sn = self.schema.clone();
+        let outcome = self.call(py, |c| c.mirror_view(&sn, name))?;
         Py::new(py, PyPollResult::from(outcome))
     }
 

@@ -24,30 +24,30 @@ RANGE_BASE_CAP = 30_000
 RANGE_DELTA_CAP = 500
 
 
-def _seed(client, sn, name, build, count):
-    tid, schema = client.resolve_table(sn, name)
+def _seed(client, name, build, count):
+    tid, schema = client.resolve_table(name)
     push_stream(client, tid, schema, build, count)
 
 
-def _run(client, bench_timer, sn, fact_name, stream_build, view_name, sz):
-    fact_tid, fact_schema = client.resolve_table(sn, fact_name)
-    stream_and_assert(client, sn, bench_timer, fact_tid, fact_schema, stream_build, sz, view_name)
+def _run(client, bench_timer, fact_name, stream_build, view_name, sz):
+    fact_tid, fact_schema = client.resolve_table(fact_name)
+    stream_and_assert(client, bench_timer, fact_tid, fact_schema, stream_build, sz, view_name)
 
 
 # ---------------------------------------------------------------------------
 # Equi-key star shapes: a(pk, k, av) fact ⋈ b(pk, k, bv) dim on k
 # ---------------------------------------------------------------------------
 
-def _make_ab(client, sn):
+def _make_ab(client):
     client.execute_sql("CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, "
-                       "k BIGINT NOT NULL, av BIGINT NOT NULL)", schema_name=sn)
+                       "k BIGINT NOT NULL, av BIGINT NOT NULL)")
     client.execute_sql("CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, "
-                       "k BIGINT NOT NULL, bv BIGINT NOT NULL)", schema_name=sn)
+                       "k BIGINT NOT NULL, bv BIGINT NOT NULL)")
 
 
-def _load_dim_b(client, sn, dim):
+def _load_dim_b(client, dim):
     # dim keyed by k == pk so each fact.k matches exactly one dim row.
-    _seed(client, sn, "b", lambda b, i: b.append(pk=i + 1, k=i + 1, bv=(i * 7) % 1000), dim)
+    _seed(client, "b", lambda b, i: b.append(pk=i + 1, k=i + 1, bv=(i * 7) % 1000), dim)
 
 
 def _fact_ab(dim):
@@ -57,29 +57,29 @@ def _fact_ab(dim):
     )
 
 
-def _equi_shape(client, sn, bench_timer, sz, view_name, view_sql):
-    _make_ab(client, sn)
-    client.execute_sql(view_sql, schema_name=sn)
-    _load_dim_b(client, sn, sz["dim"])
+def _equi_shape(client, bench_timer, sz, view_name, view_sql):
+    _make_ab(client)
+    client.execute_sql(view_sql)
+    _load_dim_b(client, sz["dim"])
     base, stream = _fact_ab(sz["dim"])
-    _seed(client, sn, "a", base, sz["base"])
-    _run(client, bench_timer, sn, "a", stream, view_name, sz)
+    _seed(client, "a", base, sz["base"])
+    _run(client, bench_timer, "a", stream, view_name, sz)
 
 
-def test_right(client, schema_name, bench_timer, scale_mode):
-    _equi_shape(client, schema_name, bench_timer, feature_sz(scale_mode), "v_right",
+def test_right(client, bench_timer, scale_mode):
+    _equi_shape(client, bench_timer, feature_sz(scale_mode), "v_right",
                 "CREATE VIEW v_right AS SELECT a.k AS k, a.av AS av, b.bv AS bv "
                 "FROM a RIGHT JOIN b ON a.k = b.k")
 
 
-def test_full(client, schema_name, bench_timer, scale_mode):
-    _equi_shape(client, schema_name, bench_timer, feature_sz(scale_mode), "v_full",
+def test_full(client, bench_timer, scale_mode):
+    _equi_shape(client, bench_timer, feature_sz(scale_mode), "v_full",
                 "CREATE VIEW v_full AS SELECT a.k AS k, a.av AS av, b.bv AS bv "
                 "FROM a FULL JOIN b ON a.k = b.k")
 
 
-def test_residual(client, schema_name, bench_timer, scale_mode):
-    _equi_shape(client, schema_name, bench_timer, feature_sz(scale_mode), "v_resid",
+def test_residual(client, bench_timer, scale_mode):
+    _equi_shape(client, bench_timer, feature_sz(scale_mode), "v_resid",
                 "CREATE VIEW v_resid AS SELECT a.k AS k, a.av AS av, b.bv AS bv "
                 "FROM a JOIN b ON a.k = b.k AND a.av <> b.bv")
 
@@ -88,76 +88,74 @@ def test_residual(client, schema_name, bench_timer, scale_mode):
 # Three-way multiway (join-body CTE): a ⋈ b ⋈ d on k
 # ---------------------------------------------------------------------------
 
-def test_multiway3(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, feature_sz(scale_mode)
-    _make_ab(client, sn)
+def test_multiway3(client, bench_timer, scale_mode):
+    sz = feature_sz(scale_mode)
+    _make_ab(client)
     client.execute_sql("CREATE TABLE d (pk BIGINT NOT NULL PRIMARY KEY, "
-                       "k BIGINT NOT NULL, dv BIGINT NOT NULL)", schema_name=sn)
+                       "k BIGINT NOT NULL, dv BIGINT NOT NULL)")
     client.execute_sql(
         "CREATE VIEW v_mw3 AS WITH h0 AS (SELECT a.k AS k, a.av AS av, b.bv AS bv "
         "FROM a JOIN b ON a.k=b.k) SELECT h0.k AS k, h0.av AS av, h0.bv AS bv, "
-        "d.dv AS dv FROM h0 JOIN d ON h0.k = d.k", schema_name=sn)
-    _load_dim_b(client, sn, sz["dim"])
-    _seed(client, sn, "d", lambda b, i: b.append(pk=i + 1, k=i + 1, dv=(i * 3) % 1000), sz["dim"])
+        "d.dv AS dv FROM h0 JOIN d ON h0.k = d.k")
+    _load_dim_b(client, sz["dim"])
+    _seed(client, "d", lambda b, i: b.append(pk=i + 1, k=i + 1, dv=(i * 3) % 1000), sz["dim"])
     base, stream = _fact_ab(sz["dim"])
-    _seed(client, sn, "a", base, sz["base"])
-    _run(client, bench_timer, sn, "a", stream, "v_mw3", sz)
+    _seed(client, "a", base, sz["base"])
+    _run(client, bench_timer, "a", stream, "v_mw3", sz)
 
 
 # ---------------------------------------------------------------------------
 # Self join: emp(id, mgr, sal) e ⋈ emp m ON e.mgr = m.id
 # ---------------------------------------------------------------------------
 
-def test_self(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, feature_sz(scale_mode)
+def test_self(client, bench_timer, scale_mode):
+    sz = feature_sz(scale_mode)
     dim = sz["dim"]
     client.execute_sql("CREATE TABLE emp (id BIGINT NOT NULL PRIMARY KEY, "
-                       "mgr BIGINT NOT NULL, sal BIGINT NOT NULL)", schema_name=sn)
+                       "mgr BIGINT NOT NULL, sal BIGINT NOT NULL)")
     client.execute_sql("CREATE VIEW v_self AS SELECT e.id AS id, e.sal AS esal, "
-                       "m.sal AS msal FROM emp e JOIN emp m ON e.mgr = m.id", schema_name=sn)
+                       "m.sal AS msal FROM emp e JOIN emp m ON e.mgr = m.id")
     # Managers occupy ids 1..dim; every employee's mgr points into that range.
-    _seed(client, sn, "emp",
+    _seed(client, "emp",
           lambda b, i: b.append(id=i + 1, mgr=(i % dim) + 1, sal=(i * 11) % 100000), dim)
     base, stream = stream_factory(
         lambda batch, pk, v, w: batch.append(id=pk, mgr=v[0], sal=v[1], _weight=w),
         lambda rng: (zipf_choice(rng, dim, SKEW_S), rng.randint(0, 100000)),
     )
-    _seed(client, sn, "emp", base, sz["base"])
-    _run(client, bench_timer, sn, "emp", stream, "v_self", sz)
+    _seed(client, "emp", base, sz["base"])
+    _run(client, bench_timer, "emp", stream, "v_self", sz)
 
 
 # ---------------------------------------------------------------------------
 # Band join: ba(pk, k, lo) ⋈ bb(pk, k, t) ON ba.k = bb.k AND ba.lo <= bb.t
 # ---------------------------------------------------------------------------
 
-def test_band(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, feature_sz(scale_mode)
+def test_band(client, bench_timer, scale_mode):
+    sz = feature_sz(scale_mode)
     dim = sz["dim"]
     client.execute_sql("CREATE TABLE ba (pk BIGINT NOT NULL PRIMARY KEY, "
-                       "k BIGINT NOT NULL, lo BIGINT NOT NULL)", schema_name=sn)
+                       "k BIGINT NOT NULL, lo BIGINT NOT NULL)")
     client.execute_sql("CREATE TABLE bb (pk BIGINT NOT NULL PRIMARY KEY, "
-                       "k BIGINT NOT NULL, t BIGINT NOT NULL)", schema_name=sn)
+                       "k BIGINT NOT NULL, t BIGINT NOT NULL)")
     client.execute_sql("CREATE VIEW v_band AS SELECT ba.k AS k, ba.lo AS lo, bb.t AS t "
-                       "FROM ba JOIN bb ON ba.k = bb.k AND ba.lo <= bb.t", schema_name=sn)
-    _seed(client, sn, "bb", lambda b, i: b.append(pk=i + 1, k=i + 1, t=500), dim)
+                       "FROM ba JOIN bb ON ba.k = bb.k AND ba.lo <= bb.t")
+    _seed(client, "bb", lambda b, i: b.append(pk=i + 1, k=i + 1, t=500), dim)
     base, stream = stream_factory(
         lambda batch, pk, v, w: batch.append(pk=pk, k=v[0], lo=v[1], _weight=w),
         lambda rng: (zipf_choice(rng, dim, SKEW_S), rng.randint(0, 1000)),
     )
-    _seed(client, sn, "ba", base, sz["base"])
-    _run(client, bench_timer, sn, "ba", stream, "v_band", sz)
+    _seed(client, "ba", base, sz["base"])
+    _run(client, bench_timer, "ba", stream, "v_band", sz)
 
 
 # ---------------------------------------------------------------------------
 # Pure-range joins: ra(pk, x) ⋈ rb(pk, y) ON ra.x < rb.y  (small dim bounds fan-out)
 # ---------------------------------------------------------------------------
 
-def _make_range(client, sn):
-    client.execute_sql("CREATE TABLE ra (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
-                       schema_name=sn)
-    client.execute_sql("CREATE TABLE rb (pk BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)",
-                       schema_name=sn)
-    _seed(client, sn, "rb", lambda b, i: b.append(pk=i + 1, y=i + 1), RANGE_DIM)
+def _make_range(client):
+    client.execute_sql("CREATE TABLE ra (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)")
+    client.execute_sql("CREATE TABLE rb (pk BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)")
+    _seed(client, "rb", lambda b, i: b.append(pk=i + 1, y=i + 1), RANGE_DIM)
 
 
 def _range_factory():
@@ -174,46 +172,46 @@ def _range_sz(scale_mode):
     return sz
 
 
-def test_range_inner(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, _range_sz(scale_mode)
-    _make_range(client, sn)
+def test_range_inner(client, bench_timer, scale_mode):
+    sz = _range_sz(scale_mode)
+    _make_range(client)
     client.execute_sql("CREATE VIEW v_ri AS SELECT ra.x AS x, rb.y AS y "
-                       "FROM ra JOIN rb ON ra.x < rb.y", schema_name=sn)
+                       "FROM ra JOIN rb ON ra.x < rb.y")
     base, stream = _range_factory()
-    _seed(client, sn, "ra", base, sz["base"])
-    _run(client, bench_timer, sn, "ra", stream, "v_ri", sz)
+    _seed(client, "ra", base, sz["base"])
+    _run(client, bench_timer, "ra", stream, "v_ri", sz)
 
 
-def test_range_left(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, _range_sz(scale_mode)
-    _make_range(client, sn)
+def test_range_left(client, bench_timer, scale_mode):
+    sz = _range_sz(scale_mode)
+    _make_range(client)
     client.execute_sql("CREATE VIEW v_rl AS SELECT ra.x AS x, rb.y AS y "
-                       "FROM ra LEFT JOIN rb ON ra.x < rb.y", schema_name=sn)
+                       "FROM ra LEFT JOIN rb ON ra.x < rb.y")
     base, stream = _range_factory()
-    _seed(client, sn, "ra", base, sz["base"])
-    _run(client, bench_timer, sn, "ra", stream, "v_rl", sz)
+    _seed(client, "ra", base, sz["base"])
+    _run(client, bench_timer, "ra", stream, "v_rl", sz)
 
 
 # ---------------------------------------------------------------------------
 # Compound-key equi join: ca(pk, x, y, av) ⋈ cb(pk, x, y, bv) ON x AND y
 # ---------------------------------------------------------------------------
 
-def test_compound_key(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, feature_sz(scale_mode)
+def test_compound_key(client, bench_timer, scale_mode):
+    sz = feature_sz(scale_mode)
     dim = sz["dim"]
     half = max(1, dim // 2)
     client.execute_sql("CREATE TABLE ca (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, "
-                       "y BIGINT NOT NULL, av BIGINT NOT NULL)", schema_name=sn)
+                       "y BIGINT NOT NULL, av BIGINT NOT NULL)")
     client.execute_sql("CREATE TABLE cb (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, "
-                       "y BIGINT NOT NULL, bv BIGINT NOT NULL)", schema_name=sn)
+                       "y BIGINT NOT NULL, bv BIGINT NOT NULL)")
     client.execute_sql("CREATE VIEW v_ckey AS SELECT ca.av AS av, cb.bv AS bv "
-                       "FROM ca JOIN cb ON ca.x = cb.x AND ca.y = cb.y", schema_name=sn)
+                       "FROM ca JOIN cb ON ca.x = cb.x AND ca.y = cb.y")
     # dim (x, y) grid: y in {0,1}, x in [1, dim/2] → distinct (x, y) pairs.
-    _seed(client, sn, "cb",
+    _seed(client, "cb",
           lambda b, i: b.append(pk=i + 1, x=(i % half) + 1, y=i // half, bv=(i * 5) % 1000), dim)
     base, stream = stream_factory(
         lambda batch, pk, v, w: batch.append(pk=pk, x=v[0], y=v[1], av=v[2], _weight=w),
         lambda rng: (zipf_choice(rng, half, SKEW_S), rng.randint(0, 1), rng.randint(0, 1000)),
     )
-    _seed(client, sn, "ca", base, sz["base"])
-    _run(client, bench_timer, sn, "ca", stream, "v_ckey", sz)
+    _seed(client, "ca", base, sz["base"])
+    _run(client, bench_timer, "ca", stream, "v_ckey", sz)

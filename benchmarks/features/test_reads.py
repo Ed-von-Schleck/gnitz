@@ -23,16 +23,15 @@ def _reads(scale_mode):
 # view_scan — scan a grouped view of N groups
 # ---------------------------------------------------------------------------
 
-def test_view_scan(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, feature_sz(scale_mode)
+def test_view_scan(client, bench_timer, scale_mode):
+    sz = feature_sz(scale_mode)
     client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
-                       "g BIGINT NOT NULL, v BIGINT NOT NULL)", schema_name=sn)
-    client.execute_sql("CREATE VIEW v AS SELECT g, SUM(v) AS s FROM t GROUP BY g",
-                       schema_name=sn)
-    tid, schema = client.resolve_table(sn, "t")
+                       "g BIGINT NOT NULL, v BIGINT NOT NULL)")
+    client.execute_sql("CREATE VIEW v AS SELECT g, SUM(v) AS s FROM t GROUP BY g")
+    tid, schema = client.resolve_table("t")
     push_stream(client, tid, schema,
                 lambda b, k: b.append(pk=k + 1, g=k % NGROUP, v=(k * 7) % 1000), sz["base"])
-    vid, v_sch = client.resolve_table(sn, "v")
+    vid, v_sch = client.resolve_table("v")
     for _ in range(_reads(scale_mode)):
         bench_timer.measure(client.scan, vid, v_sch, rows_per_call=NGROUP)
     assert len(client.scan(vid, v_sch)) > 0
@@ -42,18 +41,17 @@ def test_view_scan(client, schema_name, bench_timer, scale_mode):
 # view_seek_natural — seek a U64-keyed grouped view by natural key (R3)
 # ---------------------------------------------------------------------------
 
-def test_view_seek_natural(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, feature_sz(scale_mode)
+def test_view_seek_natural(client, bench_timer, scale_mode):
+    sz = feature_sz(scale_mode)
     client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
-                       "cust BIGINT UNSIGNED NOT NULL, amt BIGINT NOT NULL)", schema_name=sn)
+                       "cust BIGINT UNSIGNED NOT NULL, amt BIGINT NOT NULL)")
     # Group column `cust` is single non-nullable U64 → natural PK, seek-addressable.
-    client.execute_sql("CREATE VIEW v AS SELECT cust, SUM(amt) AS s FROM t GROUP BY cust",
-                       schema_name=sn)
-    tid, schema = client.resolve_table(sn, "t")
+    client.execute_sql("CREATE VIEW v AS SELECT cust, SUM(amt) AS s FROM t GROUP BY cust")
+    tid, schema = client.resolve_table("t")
     push_stream(client, tid, schema,
                 lambda b, k: b.append(pk=k + 1, cust=(k % NGROUP) + 1, amt=(k * 3) % 1000),
                 sz["base"])
-    vid, v_sch = client.resolve_table(sn, "v")
+    vid, v_sch = client.resolve_table("v")
     next_pk = sz["base"] + 1
     hot = 1
     for _ in range(_reads(scale_mode)):
@@ -67,14 +65,13 @@ def test_view_seek_natural(client, schema_name, bench_timer, scale_mode):
 # view_passthrough_seek — seek a filter/passthrough view by base PK
 # ---------------------------------------------------------------------------
 
-def test_view_passthrough_seek(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, feature_sz(scale_mode)
-    client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-                       schema_name=sn)
-    client.execute_sql("CREATE VIEW v AS SELECT * FROM t WHERE v >= 0", schema_name=sn)
-    tid, schema = client.resolve_table(sn, "t")
+def test_view_passthrough_seek(client, bench_timer, scale_mode):
+    sz = feature_sz(scale_mode)
+    client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
+    client.execute_sql("CREATE VIEW v AS SELECT * FROM t WHERE v >= 0")
+    tid, schema = client.resolve_table("t")
     push_stream(client, tid, schema, lambda b, k: b.append(pk=k + 1, v=(k * 5) % 1000), sz["base"])
-    vid, v_sch = client.resolve_table(sn, "v")
+    vid, v_sch = client.resolve_table("v")
     next_pk = sz["base"] + 1
     for _ in range(_reads(scale_mode)):
         push_one(client, tid, schema, pk=next_pk, v=1)  # RYOW write
@@ -88,14 +85,14 @@ def test_view_passthrough_seek(client, schema_name, bench_timer, scale_mode):
 # seek_by_index — binary secondary-index point seek on a base table
 # ---------------------------------------------------------------------------
 
-def test_seek_by_index(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, feature_sz(scale_mode)
+def test_seek_by_index(client, bench_timer, scale_mode):
+    sz = feature_sz(scale_mode)
     client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
-                       "val BIGINT NOT NULL, payload BIGINT NOT NULL)", schema_name=sn)
-    tid, schema = client.resolve_table(sn, "t")
+                       "val BIGINT NOT NULL, payload BIGINT NOT NULL)")
+    tid, schema = client.resolve_table("t")
     push_stream(client, tid, schema,
                 lambda b, k: b.append(pk=k + 1, val=k % NGROUP, payload=k), sz["base"])
-    client.execute_sql("CREATE INDEX ON t(val)", schema_name=sn)
+    client.execute_sql("CREATE INDEX ON t(val)")
     reads = _reads(scale_mode)
     for i in range(reads):
         key = i % NGROUP
@@ -118,46 +115,44 @@ NIND = 1001
 GROUPBY_ITERS = {"quick": 20, "full": 50}
 
 
-def test_groupby_indexed_filter(client, schema_name, bench_timer, scale_mode):
-    sn, sz = schema_name, feature_sz(scale_mode)
+def test_groupby_indexed_filter(client, bench_timer, scale_mode):
+    sz = feature_sz(scale_mode)
     client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
-                       "v BIGINT NOT NULL, ind BIGINT NOT NULL)", schema_name=sn)
-    tid, schema = client.resolve_table(sn, "t")
+                       "v BIGINT NOT NULL, ind BIGINT NOT NULL)")
+    tid, schema = client.resolve_table("t")
     push_stream(client, tid, schema,
                 lambda b, k: b.append(pk=k + 1, g=k % NGROUP, v=(k * 7) % 1000, ind=k % NIND),
                 sz["base"])
-    client.execute_sql("CREATE INDEX ON t(ind)", schema_name=sn)
+    client.execute_sql("CREATE INDEX ON t(ind)")
     # 1/1001 selectivity at every scale, an order of magnitude inside the
     # source drive's index-vs-full-scan gate.
     for i in range(GROUPBY_ITERS[scale_mode]):
         bench_timer.measure(client.execute_sql,
-                            f"SELECT g, SUM(v) AS s FROM t WHERE ind = {i % NIND} GROUP BY g",
-                            schema_name=sn, rows_per_call=max(1, sz["base"] // NIND))
+                            f"SELECT g, SUM(v) AS s FROM t WHERE ind = {i % NIND} GROUP BY g", rows_per_call=max(1, sz["base"] // NIND))
 
 
 # ---------------------------------------------------------------------------
 # scan_many_2 / scan_many_8 — consistent multi-view snapshot latency
 # ---------------------------------------------------------------------------
 
-def _scan_many_n(client, sn, bench_timer, sz, reads, nviews):
+def _scan_many_n(client, bench_timer, sz, reads, nviews):
     client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
-                       "g BIGINT NOT NULL, v BIGINT NOT NULL)", schema_name=sn)
+                       "g BIGINT NOT NULL, v BIGINT NOT NULL)")
     for i in range(nviews):
         client.execute_sql(
-            f"CREATE VIEW v{i} AS SELECT g, SUM(v) AS s FROM t WHERE v >= {i} GROUP BY g",
-            schema_name=sn)
-    tid, schema = client.resolve_table(sn, "t")
+            f"CREATE VIEW v{i} AS SELECT g, SUM(v) AS s FROM t WHERE v >= {i} GROUP BY g")
+    tid, schema = client.resolve_table("t")
     push_stream(client, tid, schema,
                 lambda b, k: b.append(pk=k + 1, g=k % NGROUP, v=(k * 7) % 1000), sz["base"])
-    views = [client.resolve_table(sn, f"v{i}") for i in range(nviews)]
+    views = [client.resolve_table(f"v{i}") for i in range(nviews)]
     for _ in range(reads):
         bench_timer.measure(client.scan_many, views, rows_per_call=NGROUP * nviews)
     assert all(len(r) > 0 for r in client.scan_many(views))
 
 
-def test_scan_many_2(client, schema_name, bench_timer, scale_mode):
-    _scan_many_n(client, schema_name, bench_timer, feature_sz(scale_mode), _reads(scale_mode), 2)
+def test_scan_many_2(client, bench_timer, scale_mode):
+    _scan_many_n(client, bench_timer, feature_sz(scale_mode), _reads(scale_mode), 2)
 
 
-def test_scan_many_8(client, schema_name, bench_timer, scale_mode):
-    _scan_many_n(client, schema_name, bench_timer, feature_sz(scale_mode), _reads(scale_mode), 8)
+def test_scan_many_8(client, bench_timer, scale_mode):
+    _scan_many_n(client, bench_timer, feature_sz(scale_mode), _reads(scale_mode), 8)

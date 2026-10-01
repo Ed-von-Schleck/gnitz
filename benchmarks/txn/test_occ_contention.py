@@ -25,18 +25,16 @@ def _positive(client, tid, schema):
 
 @pytest.mark.parametrize("n_clients", OCC_CLIENTS)
 @pytest.mark.parametrize("hot", OCC_HOT_SET)
-def test_occ_contention(client, socket_path, schema_name, bench_timer, scale_mode, n_clients, hot):
-    sn = schema_name
-    client.execute_sql("CREATE TABLE ctr (pk BIGINT NOT NULL PRIMARY KEY, n BIGINT NOT NULL)",
-                       schema_name=sn)
+def test_occ_contention(client, socket_path, bench_timer, scale_mode, n_clients, hot):
+    client.execute_sql("CREATE TABLE ctr (pk BIGINT NOT NULL PRIMARY KEY, n BIGINT NOT NULL)")
     seed = ",".join(f"({k}, 0)" for k in range(1, hot + 1))
-    client.execute_sql(f"INSERT INTO ctr VALUES {seed}", schema_name=sn)
+    client.execute_sql(f"INSERT INTO ctr VALUES {seed}")
 
     ops = CONTENTION_OPS[scale_mode]
     hot_list = ",".join(str(k) for k in range(1, hot + 1))
     sql = f"UPDATE ctr SET n = n + 1 WHERE pk IN ({hot_list})"
 
-    res = run_contended_rmw(socket_path, sql, sn, n_clients, ops, retry=True)
+    res = run_contended_rmw(socket_path, client.schema, sql, n_clients, ops, retry=True)
 
     bench_timer.num_clients = n_clients
     bench_timer.add_latencies(res["latencies_ms"], rows=res["commits"])
@@ -48,7 +46,7 @@ def test_occ_contention(client, socket_path, schema_name, bench_timer, scale_mod
 
     # No lost update: every hot row incremented exactly once per committed op.
     expected = n_clients * ops
-    tid, schema = client.resolve_table(sn, "ctr")
+    tid, schema = client.resolve_table("ctr")
     rows = _positive(client, tid, schema)
     assert len(rows) == hot
     for pk, val in rows:

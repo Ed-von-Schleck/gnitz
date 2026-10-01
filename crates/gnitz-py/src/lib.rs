@@ -29,18 +29,26 @@ pyo3::create_exception!(_native, GnitzError, pyo3::exceptions::PyException);
 // Every class below subclasses GnitzError, so `except GnitzError` catches them
 // all while a caller that branches on one can name it instead of matching prose.
 
-// WireStatus::TxnConflict.
-pyo3::create_exception!(_native, GnitzConflictError, GnitzError);
-// WireStatus::DeltaExpired.
-pyo3::create_exception!(_native, GnitzDeltaExpiredError, GnitzError);
-// WireStatus::SalFull.
-pyo3::create_exception!(_native, GnitzSalFullError, GnitzError);
+// The request was understood and declined: `ClientError::Refused` at any
+// status, and a statement the SQL planner rejects. The connection is intact.
+pyo3::create_exception!(_native, GnitzRefusedError, GnitzError);
+// The connection is unusable: it failed, was lost, or was closed.
+pyo3::create_exception!(_native, GnitzConnectionError, GnitzError);
 // MirrorError::Poisoned. Recovery is `close_mirror()`, and nothing else.
 pyo3::create_exception!(_native, GnitzMirrorPoisonedError, GnitzError);
+
+// A refusal whose status a caller branches on.
+
+// WireStatus::TxnConflict.
+pyo3::create_exception!(_native, GnitzConflictError, GnitzRefusedError);
+// WireStatus::DeltaExpired.
+pyo3::create_exception!(_native, GnitzDeltaExpiredError, GnitzRefusedError);
+// WireStatus::SalFull.
+pyo3::create_exception!(_native, GnitzSalFullError, GnitzRefusedError);
 // WireStatus::NotFound.
-pyo3::create_exception!(_native, GnitzNotFoundError, GnitzError);
+pyo3::create_exception!(_native, GnitzNotFoundError, GnitzRefusedError);
 // WireStatus::IntegrityViolation.
-pyo3::create_exception!(_native, GnitzIntegrityError, GnitzError);
+pyo3::create_exception!(_native, GnitzIntegrityError, GnitzRefusedError);
 
 /// Wrap any `Display` error as a plain `GnitzError`.
 pub(crate) fn gnitz_err(e: impl std::fmt::Display) -> PyErr {
@@ -59,8 +67,11 @@ pub(crate) fn client_err(e: ClientError) -> PyErr {
             WireStatus::SalFull => GnitzSalFullError::new_err(f.text),
             WireStatus::NotFound => GnitzNotFoundError::new_err(f.text),
             WireStatus::IntegrityViolation => GnitzIntegrityError::new_err(f.text),
-            WireStatus::Ok | WireStatus::Error => GnitzError::new_err(f.text),
+            WireStatus::Ok | WireStatus::Error => GnitzRefusedError::new_err(f.text),
         },
+        ClientError::Protocol(_) | ClientError::ConnectionLost(_) | ClientError::Closed => {
+            GnitzConnectionError::new_err(e.to_string())
+        }
         ClientError::Interrupted(inner) => match inner.downcast_ref::<PyErr>() {
             Some(py_err) => Python::attach(|py| py_err.clone_ref(py)),
             None => gnitz_err(inner),
@@ -74,7 +85,8 @@ pub(crate) fn client_err(e: ClientError) -> PyErr {
 pub(crate) fn sql_err(e: gnitz_sql::GnitzSqlError) -> PyErr {
     match e {
         gnitz_sql::GnitzSqlError::Client(inner) => client_err(inner),
-        other => gnitz_err(other),
+        gnitz_sql::GnitzSqlError::Rejected(text) => GnitzRefusedError::new_err(text),
+        internal @ gnitz_sql::GnitzSqlError::Internal(_) => gnitz_err(internal),
     }
 }
 
@@ -130,6 +142,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAsyncTransport>()?;
     m.add_class::<PyPollResult>()?;
     m.add("GnitzError", m.py().get_type::<GnitzError>())?;
+    m.add("GnitzRefusedError", m.py().get_type::<GnitzRefusedError>())?;
+    m.add("GnitzConnectionError", m.py().get_type::<GnitzConnectionError>())?;
     m.add("GnitzConflictError", m.py().get_type::<GnitzConflictError>())?;
     m.add("GnitzDeltaExpiredError", m.py().get_type::<GnitzDeltaExpiredError>())?;
     m.add("GnitzSalFullError", m.py().get_type::<GnitzSalFullError>())?;

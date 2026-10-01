@@ -43,19 +43,18 @@ _dim_seed, _dim_stream = seed_stream(
     lambda batch, pk, w: batch.append(pk=pk, val=pk % 1000, _weight=w))
 
 
-def _create_dim(client, sn, placement):
+def _create_dim(client, placement):
     opt = " WITH (replicated = true)" if placement == "replicated" else ""
     client.execute_sql(
-        f"CREATE TABLE dim (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL){opt}",
-        schema_name=sn)
-    return client.resolve_table(sn, "dim")
+        f"CREATE TABLE dim (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL){opt}")
+    return client.resolve_table("dim")
 
 
-def _create_fact(client, sn, rows):
+def _create_fact(client, rows):
     client.execute_sql(
         "CREATE TABLE fact (pk BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, "
-        "val BIGINT NOT NULL)", schema_name=sn)
-    tid, schema = client.resolve_table(sn, "fact")
+        "val BIGINT NOT NULL)")
+    tid, schema = client.resolve_table("fact")
     push_stream(client, tid, schema,
                 lambda b, k: b.append(pk=k + 1, fk=(k % 1000) + 1, val=k), rows)
     return tid, schema
@@ -71,7 +70,7 @@ def _stream_into_dim(client, bench_timer, tid, schema, sz):
 
 
 @pytest.mark.parametrize("placement", PLACEMENTS)
-def test_dim_write_cost(client, schema_name, bench_timer, scale_mode, placement):
+def test_dim_write_cost(client, bench_timer, scale_mode, placement):
     """Per-row write cost into the dimension at each placement.
 
     A replicated write broadcasts the whole batch into every worker's ingest and
@@ -79,14 +78,14 @@ def test_dim_write_cost(client, schema_name, bench_timer, scale_mode, placement)
     The ratio between the arms is replication's write amplification.
     """
     sz = feature_sz(scale_mode)
-    tid, schema = _create_dim(client, schema_name, placement)
+    tid, schema = _create_dim(client, placement)
     push_stream(client, tid, schema, _dim_seed, sz["dim"])
     _stream_into_dim(client, bench_timer, tid, schema, sz)
 
 
 @pytest.mark.parametrize("placement", PLACEMENTS)
 @pytest.mark.parametrize("tier", SIZE_TIERS)
-def test_dim_scan_cost(client, schema_name, bench_timer, scale_mode, placement, tier):
+def test_dim_scan_cost(client, bench_timer, scale_mode, placement, tier):
     """Full-scan cost of the dimension as it grows.
 
     A replicated scan is single-sourced from one worker, so it cannot spread over
@@ -94,7 +93,7 @@ def test_dim_scan_cost(client, schema_name, bench_timer, scale_mode, placement, 
     bottleneck if the replicated table is large or read-hot" means numerically.
     """
     dim_rows = DIM_SWEEP[scale_mode][tier]
-    tid, schema = _create_dim(client, schema_name, placement)
+    tid, schema = _create_dim(client, placement)
     push_stream(client, tid, schema, _dim_seed, dim_rows)
 
     for _ in range(5):
@@ -104,7 +103,7 @@ def test_dim_scan_cost(client, schema_name, bench_timer, scale_mode, placement, 
 
 @pytest.mark.parametrize("placement", PLACEMENTS)
 @pytest.mark.parametrize("tier", SIZE_TIERS)
-def test_mixed_view_backfill(client, schema_name, bench_timer, scale_mode,
+def test_mixed_view_backfill(client, bench_timer, scale_mode,
                              placement, tier):
     """CREATE VIEW backfill over a UNION ALL of the dimension and a fact.
 
@@ -113,16 +112,14 @@ def test_mixed_view_backfill(client, schema_name, bench_timer, scale_mode,
     W; for a partitioned dim each drains only its own slice.
     """
     dim_rows = DIM_SWEEP[scale_mode][tier]
-    sn = schema_name
-    tid, schema = _create_dim(client, sn, placement)
+    tid, schema = _create_dim(client, placement)
     push_stream(client, tid, schema, _dim_seed, dim_rows)
-    _create_fact(client, sn, dim_rows)
+    _create_fact(client, dim_rows)
 
     t0 = time.perf_counter()
     client.execute_sql(
-        "CREATE VIEW v AS SELECT pk, val FROM dim UNION ALL SELECT pk, val FROM fact",
-        schema_name=sn)
-    rows = sum(1 for _ in client.scan(*client.resolve_table(sn, "v")))
+        "CREATE VIEW v AS SELECT pk, val FROM dim UNION ALL SELECT pk, val FROM fact")
+    rows = sum(1 for _ in client.scan(*client.resolve_table("v")))
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     # A view backfills exactly once, and `measure` discards its warmup
@@ -133,22 +130,20 @@ def test_mixed_view_backfill(client, schema_name, bench_timer, scale_mode,
 
 
 @pytest.mark.parametrize("placement", PLACEMENTS)
-def test_setop_view_maintenance(client, schema_name, bench_timer, scale_mode, placement):
+def test_setop_view_maintenance(client, bench_timer, scale_mode, placement):
     """Incremental maintenance of a UNION ALL view while the dimension is written.
 
     A set-op does not elide its exchange the way an equi join against a
     replicated dim does, so this is the shape where a write-hot replicated table
     drives exchange traffic: the relay carries one payload per worker per round.
     """
-    sn = schema_name
     sz = feature_sz(scale_mode)
-    tid, schema = _create_dim(client, sn, placement)
+    tid, schema = _create_dim(client, placement)
     push_stream(client, tid, schema, _dim_seed, sz["dim"])
-    _create_fact(client, sn, sz["dim"])
+    _create_fact(client, sz["dim"])
     client.execute_sql(
-        "CREATE VIEW v AS SELECT pk, val FROM dim UNION ALL SELECT pk, val FROM fact",
-        schema_name=sn)
+        "CREATE VIEW v AS SELECT pk, val FROM dim UNION ALL SELECT pk, val FROM fact")
 
     _stream_into_dim(client, bench_timer, tid, schema, sz)
 
-    assert sum(1 for _ in client.scan(*client.resolve_table(sn, "v"))) > 0, "view empty after streaming"
+    assert sum(1 for _ in client.scan(*client.resolve_table("v"))) > 0, "view empty after streaming"

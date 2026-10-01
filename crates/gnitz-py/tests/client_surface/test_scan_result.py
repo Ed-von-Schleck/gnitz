@@ -24,13 +24,13 @@ _TABLES = {
 
 
 @pytest.fixture(scope="module")
-def scans(module_schema):
+def scans(module_client):
     """Each table in `_TABLES`, loaded and scanned once. A `ScanResult` retains
     its batch, so every test reads the same result objects."""
-    conn, sn = module_schema
+    conn = module_client
     out = {}
     for name, (schema, rows) in _TABLES.items():
-        tid = conn.create_table(sn, name, schema)
+        tid = conn.create_table(name, schema)
         conn.push(tid, ZSetBatch(schema).extend(rows))
         out[name] = conn.scan(tid, schema)
     return out
@@ -65,16 +65,16 @@ def test_an_empty_result(scans):
     assert [c.name for c in result.schema.columns] == ["pk", "val"]
 
 
-def test_including_hidden_presents_every_column_of_the_same_rows(module_schema):
+def test_including_hidden_presents_every_column_of_the_same_rows(module_client):
     """A dropped column is a hidden slot: absent from the default presentation,
     first-class in `including_hidden()`, which reads the same batch at the same
     LSN."""
-    conn, sn = module_schema
+    conn = module_client
     conn.execute_sql(
         "CREATE TABLE hid (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
         "INSERT INTO hid VALUES (1, 10, 100), (2, 20, 200); "
-        "ALTER TABLE hid DROP COLUMN a", schema_name=sn)
-    result = conn.scan(*conn.resolve_table(sn, "hid"))
+        "ALTER TABLE hid DROP COLUMN a")
+    result = conn.scan(*conn.resolve_table("hid"))
     full = result.including_hidden()
 
     assert [r._fields for r in result] == [("pk", "b")] * 2

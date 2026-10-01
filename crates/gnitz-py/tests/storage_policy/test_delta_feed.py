@@ -21,11 +21,10 @@ import os
 import pytest
 import gnitz
 from _feedviews import (
-    FEED, GROUPBY, JOIN, LINEAR, SETOP,
-    Subscriber, _base_tables, _churn, _flood, _mk_feed,
+    FEED, GROUPBY, JOIN, LINEAR, SETOP, SWEEP_ENV,
+    Subscriber, base_tables, churn, flood, mk_feed,
 )
 from _paths import relation_dir
-from _uid import uid as _uid
 from _serverproc import NEEDS_MULTI
 
 
@@ -34,82 +33,53 @@ from _serverproc import NEEDS_MULTI
 @pytest.mark.parametrize(
     "body", [LINEAR, JOIN, GROUPBY, SETOP], ids=["linear", "join", "groupby", "setop"]
 )
-def test_feed_converges_weight_exact(client, schema_name, body):
+def test_feed_converges_weight_exact(client, body):
     """Bootstrap, then poll to the end, and the applied copy equals the view as a
     multiset of (row, weight). The churn includes an UPDATE and a DELETE, so a
     capture that shipped `+1` with no `-1` fails here where a row-set test would
     pass. The `linear` body carries a >12-byte TEXT payload, so the delta rows
     carry out-of-line strings."""
-    sn = schema_name
-    _base_tables(client, sn)
-    _mk_feed(client, sn, "f", body)
-    sub = Subscriber(client, sn, "f")
+    base_tables(client)
+    mk_feed(client, "f", body)
+    sub = Subscriber(client, "f")
 
-    _churn(client, sn, 1, 200)
+    churn(client, 1, 200)
     sub.bootstrap()
     sub.assert_converged("after the bootstrap")
 
     for lo, hi in ((201, 400), (401, 600)):
-        _churn(client, sn, lo, hi)
+        churn(client, lo, hi)
         sub.assert_converged(f"through key {hi}")
 
 
 @NEEDS_MULTI
-def test_a_delta_touching_one_worker_only(client, schema_name):
+def test_a_delta_touching_one_worker_only(client):
     """A one-row insert lands on one worker; the other W−1 emit nothing and write
     no delta row. Any design that assembles whole rounds server-side waits
     forever for a round they will never report — and passes at W=1."""
-    sn = schema_name
-    _base_tables(client, sn)
-    _mk_feed(client, sn, "f", LINEAR)
-    sub = Subscriber(client, sn, "f")
+    base_tables(client)
+    mk_feed(client, "f", LINEAR)
+    sub = Subscriber(client, "f")
     sub.bootstrap()
 
     for i in range(1, 12):
-        client.execute_sql(f"INSERT INTO t VALUES ({i * 1000}, {i * 37}, 'solo-{i:0>20}')", schema_name=sn)
+        client.execute_sql(f"INSERT INTO t VALUES ({i * 1000}, {i * 37}, 'solo-{i:0>20}')")
         sub.assert_converged(f"single-key round {i}")
 
 
-@NEEDS_MULTI
-def test_replicated_source_feed_is_weight_exact(client, schema_name):
-    """A replicated view computes its entire result on every worker, so the feed
-    is read from one copy. A gather over all W identical stores would hand back
-    every row W times — invisible to a row-set comparison, which is why this is a
-    weight assertion."""
-    sn = schema_name
-    client.execute_sql(
-        "CREATE TABLE r (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL) WITH (replicated = true)",
-        schema_name=sn,
-    )
-    _mk_feed(client, sn, "f", "SELECT id, v FROM r WHERE v > 3")
-    sub = Subscriber(client, sn, "f")
-    sub.bootstrap()
-
-    for lo in (1, 41, 81):
-        client.execute_sql(
-            "INSERT INTO r VALUES " + ",".join(f"({i}, {i * 2})" for i in range(lo, lo + 40)),
-            schema_name=sn,
-        )
-        client.execute_sql(f"UPDATE r SET v = v + 5 WHERE id >= {lo} AND id < {lo + 10}", schema_name=sn)
-        sub.assert_converged(f"replicated through {lo + 40}")
-
-
-def test_a_four_column_pk_view_carries_a_feed(client, schema_name):
+def test_a_four_column_pk_view_carries_a_feed(client):
     """The stamp is one more PK column, so the widest declarable view PK plus the
     stamp is exactly `MAX_PK_COLUMNS`."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE q (a BIGINT NOT NULL, b BIGINT NOT NULL, c BIGINT NOT NULL, d BIGINT NOT NULL, "
         "v BIGINT NOT NULL, PRIMARY KEY (a, b, c, d))",
-        schema_name=sn,
     )
-    _mk_feed(client, sn, "f", "SELECT a, b, c, d, v FROM q WHERE v > 1")
-    sub = Subscriber(client, sn, "f")
+    mk_feed(client, "f", "SELECT a, b, c, d, v FROM q WHERE v > 1")
+    sub = Subscriber(client, "f")
     sub.bootstrap()
     for r in range(4):
         client.execute_sql(
             "INSERT INTO q VALUES " + ",".join(f"({r}, {i}, {i * 2}, {i * 3}, {i + 2})" for i in range(20)),
-            schema_name=sn,
         )
         sub.assert_converged(f"compound-PK round {r}")
 
@@ -117,15 +87,14 @@ def test_a_four_column_pk_view_carries_a_feed(client, schema_name):
 # ── which rounds a poll sees ─────────────────────────────────────────────────
 
 
-def test_a_round_ticked_by_a_ddl_drain_reaches_the_next_poll(client, schema_name):
+def test_a_round_ticked_by_a_ddl_drain_reaches_the_next_poll(client):
     """`CREATE VIEW` drains its source's pending ticks itself, outside the tick
     loop. That round must reach the subscriber like any other, not be gated away
     as "nothing changed"."""
-    sn = schema_name
-    _base_tables(client, sn)
-    _mk_feed(client, sn, "f", LINEAR)
-    sub = Subscriber(client, sn, "f")
-    client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')", schema_name=sn)
+    base_tables(client)
+    mk_feed(client, "f", LINEAR)
+    sub = Subscriber(client, "f")
+    client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
     sub.bootstrap()
     sub.drain()
 
@@ -133,9 +102,8 @@ def test_a_round_ticked_by_a_ddl_drain_reaches_the_next_poll(client, schema_name
     # what ticks them.
     client.execute_sql(
         "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 3}, 'late-{i}')" for i in range(2, 40)),
-        schema_name=sn,
     )
-    client.execute_sql("CREATE VIEW second AS SELECT id FROM t WHERE v > 1000", schema_name=sn)
+    client.execute_sql("CREATE VIEW second AS SELECT id FROM t WHERE v > 1000")
 
     sub.drain()
     # The seed plus ids 4..39, the ones `v > 10` keeps.
@@ -157,13 +125,11 @@ def test_an_up_to_date_poll_writes_no_sal_bytes(own_server):
         with open(sal, "rb") as fh:
             return hashlib.sha256(fh.read(4 << 20)).hexdigest()
 
-    with gnitz.connect(own_server.sock_path) as client:
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        _base_tables(client, sn)
-        _mk_feed(client, sn, "f", LINEAR)
-        sub = Subscriber(client, sn, "f")
-        client.execute_sql("INSERT INTO t VALUES (1, 100, 'x')", schema_name=sn)
+    with gnitz.connect(own_server.target) as client:
+        base_tables(client)
+        mk_feed(client, "f", LINEAR)
+        sub = Subscriber(client, "f")
+        client.execute_sql("INSERT INTO t VALUES (1, 100, 'x')")
         sub.bootstrap()
         sub.drain()
 
@@ -173,7 +139,7 @@ def test_an_up_to_date_poll_writes_no_sal_bytes(own_server):
         assert sal_digest() == before, "an up-to-date poll must write no SAL bytes"
 
 
-def test_a_poll_of_a_stream_fed_view_takes_no_tick_and_loses_no_round(client, schema_name):
+def test_a_poll_of_a_stream_fed_view_takes_no_tick_and_loses_no_round(client):
     """Every other read of a stream-fed view drains the tick a push leaves
     pending. A delta poll answers "what has
     happened", so it drains nothing — else every poll would tick the whole server.
@@ -184,21 +150,18 @@ def test_a_poll_of_a_stream_fed_view_takes_no_tick_and_loses_no_round(client, sc
     comes back empty — and each round must still arrive on a later poll, as its
     own round rather than folded into its neighbour.
     """
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE ev (id BIGINT NOT NULL PRIMARY KEY, kind BIGINT NOT NULL, amount BIGINT NOT NULL) "
         "WITH (stream = true)",
-        schema_name=sn,
     )
-    _mk_feed(client, sn, "f", "SELECT kind, SUM(amount) AS total FROM ev GROUP BY kind")
-    sub = Subscriber(client, sn, "f")
+    mk_feed(client, "f", "SELECT kind, SUM(amount) AS total FROM ev GROUP BY kind")
+    sub = Subscriber(client, "f")
     sub.bootstrap()
     sub.drain()
 
     for r in range(6):
         client.execute_sql(
             "INSERT INTO ev VALUES " + ",".join(f"({r * 50 + i}, {i % 4}, {i + 1})" for i in range(50)),
-            schema_name=sn,
         )
         assert len(sub.poll().rows) == 0, f"poll {r} carried the push it raced — it drove a tick"
 
@@ -208,23 +171,21 @@ def test_a_poll_of_a_stream_fed_view_takes_no_tick_and_loses_no_round(client, sc
 # ── refused cursors ──────────────────────────────────────────────────────────
 
 
-def test_a_cursor_below_the_floor_is_refused_as_a_code(sweeping_server):
+def test_a_cursor_below_the_floor_is_refused_as_a_code(own_server):
     """Retention drops the oldest rounds whether or not anyone still reads them,
     and a cursor below what was dropped is refused with `GnitzDeltaExpiredError`
     — a type the subscriber reacts to, not a string it matches. Recovery is the
     read it made on its first day."""
-    with gnitz.connect(sweeping_server.sock_path) as client:
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        _base_tables(client, sn)
-        _mk_feed(client, sn, "f", LINEAR, feed="1 KB")
-        sub = Subscriber(client, sn, "f")
+    with gnitz.connect(own_server.start(extra_env=SWEEP_ENV).target) as client:
+        base_tables(client)
+        mk_feed(client, "f", LINEAR, feed="1 KB")
+        sub = Subscriber(client, "f")
         sub.bootstrap()
         sub.drain()
 
         # Twice the volume measured to reach the first drop, so the margin is
         # the test's and not the box's.
-        _flood(client, sn, 1, 8_000)
+        flood(client, 1, 8_000)
 
         with pytest.raises(gnitz.GnitzDeltaExpiredError):
             sub.poll()
@@ -237,18 +198,17 @@ def test_a_cursor_below_the_floor_is_refused_as_a_code(sweeping_server):
         assert sub.copy == live, "after re-reading at 0"
 
 
-def test_a_delta_read_of_a_relation_with_no_feed_is_an_error(client, schema_name):
+def test_a_delta_read_of_a_relation_with_no_feed_is_an_error(client):
     """At **every** `after_tick`, zero included: the reply would otherwise promise
     a continuation the server cannot serve."""
-    sn = schema_name
-    _base_tables(client, sn)
-    client.execute_sql(f"CREATE VIEW plain AS {LINEAR}", schema_name=sn)
-    vid, schema = client.resolve_table(sn, "plain")
+    base_tables(client)
+    client.execute_sql(f"CREATE VIEW plain AS {LINEAR}")
+    vid, schema = client.resolve_table("plain")
     for verb in (
         lambda: client.delta_bootstrap(vid, schema),
         lambda: client.delta_poll(vid, schema, (0, 1)),
     ):
-        with pytest.raises(gnitz.GnitzError) as e:
+        with pytest.raises(gnitz.GnitzRefusedError, match="carries no delta feed") as e:
             verb()
         # Not the expiry code: a subscriber reacts to that by re-reading at 0,
         # so answering it here would spin one forever against a view that will
@@ -257,7 +217,7 @@ def test_a_delta_read_of_a_relation_with_no_feed_is_an_error(client, schema_name
 
 
 @pytest.mark.parametrize("recreate", ["drop-and-create", "or-replace"])
-def test_a_cursor_across_a_recreate_is_rejected(client, schema_name, recreate):
+def test_a_cursor_across_a_recreate_is_rejected(client, recreate):
     """A recreated view takes a fresh id whose rounds come from the same global
     counter, so an unrefused cursor would be answered with the *new* view's deltas
     above the stale round — and a recreated view's backfill never enters a delta
@@ -266,24 +226,23 @@ def test_a_cursor_across_a_recreate_is_rejected(client, schema_name, recreate):
     `CREATE OR REPLACE` is the case nothing else would tell a subscriber about:
     unlike the drop, the name still resolves.
     """
-    sn = schema_name
-    _base_tables(client, sn)
-    _mk_feed(client, sn, "f", LINEAR)
-    sub = Subscriber(client, sn, "f")
-    client.execute_sql("INSERT INTO t VALUES (1, 100, 'a')", schema_name=sn)
+    base_tables(client)
+    mk_feed(client, "f", LINEAR)
+    sub = Subscriber(client, "f")
+    client.execute_sql("INSERT INTO t VALUES (1, 100, 'a')")
     sub.bootstrap()
     sub.drain()
 
     if recreate == "drop-and-create":
-        client.execute_sql("DROP VIEW f", schema_name=sn)
-        _mk_feed(client, sn, "f", LINEAR)
+        client.execute_sql("DROP VIEW f")
+        mk_feed(client, "f", LINEAR)
     else:
         client.execute_sql(
-            f"CREATE OR REPLACE VIEW f WITH (delta = '{FEED}') AS {LINEAR}", schema_name=sn
+            f"CREATE OR REPLACE VIEW f WITH (delta = '{FEED}') AS {LINEAR}"
         )
-    client.execute_sql("INSERT INTO t VALUES (2, 200, 'b')", schema_name=sn)
+    client.execute_sql("INSERT INTO t VALUES (2, 200, 'b')")
 
-    fresh = Subscriber(client, sn, "f")
+    fresh = Subscriber(client, "f")
     assert fresh.vid != sub.vid, "a recreated view takes a fresh id"
     fresh.cursor = sub.cursor
     with pytest.raises(gnitz.GnitzDeltaExpiredError):
@@ -301,20 +260,18 @@ def test_a_feed_survives_a_restart_on_every_worker(own_server):
     at open and the boot mints a fresh tag.
     """
     own_server.start()
-    with gnitz.connect(own_server.sock_path) as client:
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        _base_tables(client, sn)
-        _mk_feed(client, sn, "f", LINEAR)
-        sub = Subscriber(client, sn, "f")
-        _churn(client, sn, 1, 120)
+    with gnitz.connect(own_server.target) as client:
+        base_tables(client)
+        mk_feed(client, "f", LINEAR)
+        sub = Subscriber(client, "f")
+        churn(client, 1, 120)
         sub.bootstrap()
         sub.drain()
         stale, vid = sub.cursor, sub.vid
 
     own_server.restart()
-    with gnitz.connect(own_server.sock_path) as client:
-        sub = Subscriber(client, sn, "f")
+    with gnitz.connect(own_server.target) as client:
+        sub = Subscriber(client, "f")
         assert sub.vid == vid, "the view keeps its id across a restart"
         sub.cursor = stale
         with pytest.raises(gnitz.GnitzDeltaExpiredError):
@@ -322,35 +279,36 @@ def test_a_feed_survives_a_restart_on_every_worker(own_server):
 
         sub.bootstrap()
         sub.assert_converged("after the restart's bootstrap")
-        _churn(client, sn, 121, 240)
+        churn(client, 121, 240)
         sub.assert_converged("after post-restart churn")
 
 
 @NEEDS_MULTI
 def test_a_replicated_feed_lives_on_worker_zero_alone(own_server):
-    """A replicated view's feed is served by worker 0, so worker 0 is the only
-    rank that opens a delta store for it. Asserted on the directories: the feed
-    itself is per-worker and every other rank's store would be written and never
-    read.
+    """A replicated view computes its entire result on every worker, so the feed
+    is read from one copy: a gather over all W identical stores would hand back
+    every row W times — invisible to a row-set comparison. Worker 0 serves it, so
+    worker 0 is the only rank that opens a delta store for it. Asserted on the
+    directories: the feed itself is per-worker and every other rank's store would
+    be written and never read.
 
     A view over only replicated sources is itself replicated, which is what makes
     this a feed over a replicated placement rather than over a partitioned one.
     """
     own_server.start()
-    with gnitz.connect(own_server.sock_path) as client:
-        sn = "s" + _uid()
-        client.create_schema(sn)
+    with gnitz.connect(own_server.target) as client:
         client.execute_sql(
             "CREATE TABLE r (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL) "
             "WITH (replicated = true)",
-            schema_name=sn,
         )
-        _mk_feed(client, sn, "f", "SELECT id, v FROM r WHERE v > 10")
-        sub = Subscriber(client, sn, "f")
+        mk_feed(client, "f", "SELECT id, v FROM r WHERE v > 10")
+        sub = Subscriber(client, "f")
         sub.bootstrap()
         for i in range(1, 40):
-            client.execute_sql(f"INSERT INTO r VALUES ({i}, {i * 10})", schema_name=sn)
+            client.execute_sql(f"INSERT INTO r VALUES ({i}, {i * 10})")
         sub.assert_converged("over a replicated source")
+        client.execute_sql("UPDATE r SET v = v + 5 WHERE id < 10; DELETE FROM r WHERE id > 30")
+        sub.assert_converged("retractions over a replicated source")
         # The bootstrap ran before the inserts, so every row in the copy reached
         # it as a retained round through the one rank that serves the feed.
         assert sub.copy, "the feed carried the rounds the churn produced"

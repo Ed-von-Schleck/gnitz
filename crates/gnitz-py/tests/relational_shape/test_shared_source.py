@@ -12,6 +12,7 @@ the same rule is test_set_ops.py's.
 from collections import Counter
 
 from _read import bag, scanned
+from _sql import churn
 
 _COLS = ("id", "mgr", "k", "v", "sal", "dept")
 
@@ -33,13 +34,12 @@ _CHURN = [
 ]
 
 
-def test_a_join_over_one_source_emits_every_product_row_once(client, schema_name):
+def test_a_join_over_one_source_emits_every_product_row_once(client):
     """`emp ⋈ positive` reads two dependency edges onto one relation; `positive
     ⋈ over50` two views over one base; employee-to-manager is `emp` twice, with a
     residual comparing the base against its pass-through copy, a third occurrence
     for the grand-manager, an ordinary relation beside the repeat, and a USING
     spelling, whose names resolve before the right alias enters scope."""
-    sn = schema_name
     em = "FROM emp e JOIN emp m ON e.mgr = m.id"
     client.execute_sql(
         "CREATE TABLE emp (id BIGINT NOT NULL PRIMARY KEY, mgr BIGINT NOT NULL, k BIGINT NOT NULL, "
@@ -57,17 +57,11 @@ def test_a_join_over_one_source_emits_every_product_row_once(client, schema_name
         f"CREATE VIEW grand AS SELECT e.id AS eid, g.id AS gid {em} JOIN emp g ON m.mgr = g.id; "
         f"CREATE VIEW with_dept AS SELECT e.id AS eid, m.id AS mid, d.budget AS bud {em} "
         "JOIN dept d ON e.dept = d.id; "
-        "CREATE VIEW using_self AS SELECT x.id AS xid, y.id AS yid FROM emp x JOIN emp y USING (k)",
-        schema_name=sn)
+        "CREATE VIEW using_self AS SELECT x.id AS xid, y.id AS yid FROM emp x JOIN emp y USING (k)")
 
-    emp = {}
-    for sql, changes in _CHURN:
-        client.execute_sql(sql, schema_name=sn)
-        for i, row in changes.items():
-            if row is None:
-                del emp[i]
-            else:
-                emp[i] = dict(zip(_COLS, (i, *row)))
+    state = {}
+    for sql in churn(client, state, _CHURN):
+        emp = {i: dict(zip(_COLS, (i, *row))) for i, row in state.items()}
         rows = list(emp.values())
 
         def pairs(left, right, on):
@@ -76,14 +70,14 @@ def test_a_join_over_one_source_emits_every_product_row_once(client, schema_name
         positive = [r for r in rows if r["v"] > 0]
         same_k = lambda l, r: l["k"] == r["k"]  # noqa: E731
         reports = pairs(rows, rows, lambda e, m: e["mgr"] == m["id"])
-        assert bag(scanned(client, sn, "base_view"), "lid", "rid") == pairs(rows, positive, same_k), sql
-        assert bag(scanned(client, sn, "two_views"), "lid", "rid") == \
+        assert bag(scanned(client, "base_view"), "lid", "rid") == pairs(rows, positive, same_k), sql
+        assert bag(scanned(client, "two_views"), "lid", "rid") == \
             pairs(positive, [r for r in rows if r["v"] > 50], same_k), sql
-        assert bag(scanned(client, sn, "boss"), "eid", "mid") == reports, sql
-        assert bag(scanned(client, sn, "richer"), "eid") == Counter(
+        assert bag(scanned(client, "boss"), "eid", "mid") == reports, sql
+        assert bag(scanned(client, "richer"), "eid") == Counter(
             (e,) for e, m in reports.elements() if emp[e]["sal"] > emp[m]["sal"]), sql
-        assert bag(scanned(client, sn, "grand"), "eid", "gid") == Counter(
+        assert bag(scanned(client, "grand"), "eid", "gid") == Counter(
             (e, emp[m]["mgr"]) for e, m in reports.elements() if emp[m]["mgr"] in emp), sql
-        assert bag(scanned(client, sn, "with_dept"), "eid", "mid", "bud") == Counter(
+        assert bag(scanned(client, "with_dept"), "eid", "mid", "bud") == Counter(
             (e, m, 999) for e, m in reports.elements() if emp[e]["dept"] == 10), sql
-        assert bag(scanned(client, sn, "using_self"), "xid", "yid") == pairs(rows, rows, same_k), sql
+        assert bag(scanned(client, "using_self"), "xid", "yid") == pairs(rows, rows, same_k), sql

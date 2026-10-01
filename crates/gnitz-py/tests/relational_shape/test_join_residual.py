@@ -11,6 +11,7 @@ Ground truth is recomputed from the rows the test wrote, never scanned back
 from the engine, and compared as a weighted bag.
 """
 from _read import bag, scanned
+from _sql import churn
 
 
 def _known(*vals):
@@ -46,33 +47,33 @@ _RESIDUALS = {
 _A = ("id", "k", "v", "lo", "x", "s")
 _B = ("id", "k", "v", "hi", "y", "s")
 
+# (statement, table, {id: the rest of the row}); a `None` row deletes the id.
 _CHURN = [
     ("INSERT INTO b VALUES (10, 1, 5, 50, 5, 'commonprefix_BBBB'), (11, 1, 8, 10, 5, 'commonprefix_SAME'), "
      "(12, 2, 9, 99, 0, 'commonprefix_ZZZZ')",
-     "b", [(10, 1, 5, 50, 5, "commonprefix_BBBB"), (11, 1, 8, 10, 5, "commonprefix_SAME"),
-           (12, 2, 9, 99, 0, "commonprefix_ZZZZ")]),
+     "b", {10: (1, 5, 50, 5, "commonprefix_BBBB"), 11: (1, 8, 10, 5, "commonprefix_SAME"),
+           12: (2, 9, 99, 0, "commonprefix_ZZZZ")}),
     # a(5)'s key has no b at all, so no predicate can readmit it.
     ("INSERT INTO a VALUES (1, 1, 5, 20, 9, 'commonprefix_AAAA'), (2, 1, 7, 5, 1, 'commonprefix_SAME'), "
      "(3, 2, NULL, 1, 200, 'commonprefix_SAME'), (4, 1, NULL, 1, 160, 'commonprefix_AAAB'), "
      "(5, 99, 1, 1, 400, 'commonprefix_SAME')",
-     "a", [(1, 1, 5, 20, 9, "commonprefix_AAAA"), (2, 1, 7, 5, 1, "commonprefix_SAME"),
-           (3, 2, None, 1, 200, "commonprefix_SAME"), (4, 1, None, 1, 160, "commonprefix_AAAB"),
-           (5, 99, 1, 1, 400, "commonprefix_SAME")]),
+     "a", {1: (1, 5, 20, 9, "commonprefix_AAAA"), 2: (1, 7, 5, 1, "commonprefix_SAME"),
+           3: (2, None, 1, 200, "commonprefix_SAME"), 4: (1, None, 1, 160, "commonprefix_AAAB"),
+           5: (99, 1, 1, 400, "commonprefix_SAME")}),
     # Deltas that change only a residual's outcome must still enter or leave.
-    ("UPDATE b SET v = 7 WHERE id = 11", "b", [(11, 1, 7, 10, 5, "commonprefix_SAME")]),
-    ("UPDATE a SET v = 6 WHERE id = 1", "a", [(1, 1, 6, 20, 9, "commonprefix_AAAA")]),
-    ("UPDATE a SET x = 0 WHERE id = 1", "a", [(1, 1, 6, 20, 0, "commonprefix_AAAA")]),
-    ("UPDATE a SET v = 9 WHERE id = 3", "a", [(3, 2, 9, 1, 200, "commonprefix_SAME")]),
-    ("DELETE FROM b WHERE id = 12", "b", [12]),
-    ("DELETE FROM a WHERE id = 2", "a", [2]),
+    ("UPDATE b SET v = 7 WHERE id = 11", "b", {11: (1, 7, 10, 5, "commonprefix_SAME")}),
+    ("UPDATE a SET v = 6 WHERE id = 1", "a", {1: (1, 6, 20, 9, "commonprefix_AAAA")}),
+    ("UPDATE a SET x = 0 WHERE id = 1", "a", {1: (1, 6, 20, 0, "commonprefix_AAAA")}),
+    ("UPDATE a SET v = 9 WHERE id = 3", "a", {3: (2, 9, 1, 200, "commonprefix_SAME")}),
+    ("DELETE FROM b WHERE id = 12", "b", {12: None}),
+    ("DELETE FROM a WHERE id = 2", "a", {2: None}),
 ]
 
 
-def test_a_residual_filters_the_join_output_through_churn(client, schema_name):
+def test_a_residual_filters_the_join_output_through_churn(client):
     """`ON k AND p` and `ON k WHERE p` select the same pairs after every epoch,
     and each residual shape is maintained through deltas that flip only its own
     outcome — an UPDATE on either side to a column that is not the key."""
-    sn = schema_name
     pair = "SELECT a.id AS aid, b.id AS bid FROM a JOIN b"
     client.execute_sql(
         "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT, "
@@ -82,18 +83,12 @@ def test_a_residual_filters_the_join_output_through_churn(client, schema_name):
         + "; ".join(f"CREATE VIEW on_{n} AS {pair} ON a.k = b.k AND ({p}); "
                     f"CREATE VIEW where_{n} AS {pair} ON a.k = b.k WHERE {p}"
                     for n, (p, _) in _PREDICATES.items()) + "; "
-        + "; ".join(f"CREATE VIEW {n} AS {pair} ON {on}" for n, (on, _) in _RESIDUALS.items()),
-        schema_name=sn)
+        + "; ".join(f"CREATE VIEW {n} AS {pair} ON {on}" for n, (on, _) in _RESIDUALS.items()))
 
-    a, b = {}, {}
-    for sql, table, changes in _CHURN:
-        client.execute_sql(sql, schema_name=sn)
-        state, cols = (a, _A) if table == "a" else (b, _B)
-        for change in changes:
-            if isinstance(change, int):
-                del state[change]
-            else:
-                state[change[0]] = dict(zip(cols, change))
+    state = {"a": {}, "b": {}}
+    for sql in churn(client, state, _CHURN):
+        a, b = ({i: dict(zip(cols, (i, *row))) for i, row in state[t].items()}
+                for t, cols in (("a", _A), ("b", _B)))
 
         def pairs(on):
             return {(ar["id"], br["id"]): 1 for ar in a.values() for br in b.values() if on(ar, br)}
@@ -101,6 +96,6 @@ def test_a_residual_filters_the_join_output_through_churn(client, schema_name):
         for n, (_, p) in _PREDICATES.items():
             want = pairs(lambda ar, br, p=p: ar["k"] == br["k"] and p(ar, br))
             for form in ("on", "where"):
-                assert bag(scanned(client, sn, f"{form}_{n}"), "aid", "bid") == want, (sql, form, n)
+                assert bag(scanned(client, f"{form}_{n}"), "aid", "bid") == want, (sql, form, n)
         for n, (_, on) in _RESIDUALS.items():
-            assert bag(scanned(client, sn, n), "aid", "bid") == pairs(on), (sql, n)
+            assert bag(scanned(client, n), "aid", "bid") == pairs(on), (sql, n)

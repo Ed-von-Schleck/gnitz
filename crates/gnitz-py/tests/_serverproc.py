@@ -26,8 +26,10 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
 
+import gnitz
 import pytest
 
 from _paths import REPO_ROOT
@@ -51,7 +53,30 @@ NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
 # `WORKERS=1` run honest about what it did not check.
 NEEDS_MULTI = pytest.mark.skipif(NUM_WORKERS < 2, reason="requires GNITZ_WORKERS >= 2")
 
-def test_server_env():
+# What a test on its own server boots when its claim needs more than one worker.
+MULTI = max(2, NUM_WORKERS)
+
+# Environments for `own_server.start(extra_env=...)` that more than one module boots.
+
+# Chunked scans drain in 3-row chunks, so a small table already spans many chunk
+# boundaries: the knob sizes index and view backfill, the bounded-view hydration
+# merge, and the ad-hoc `ReadSpec` scan alike. At the 65 536-row default a test
+# table is one chunk and pins nothing about chunk boundaries.
+TINY_SCAN_CHUNKS = {"GNITZ_SCAN_CHUNK_ROWS": "3"}
+
+# Workers chunk reply trains past a 16 KiB frame budget, so modest tables already
+# produce multi-frame seek / range / gather / scan reply trains per worker. Any
+# reply size is safe: the master parks a full train per ring while draining
+# another worker, but `InFlightState` grows to track it, so the ring
+# back-pressures by bytes, not a frame count.
+TINY_REPLY_FRAMES = {"GNITZ_REPLY_FRAME_BUDGET": str(16 * 1024)}
+
+# SAL pinned to its 16 MiB floor with the checkpoint threshold at 15 MiB, high
+# enough that a test's pushes stop short of it and only its reads cross it — so
+# the watchdog, which fires at the threshold, is the only thing that can reclaim.
+TINY_SAL = {"GNITZ_SAL_BYTES": str(16 * 1024 * 1024), "GNITZ_CHECKPOINT_BYTES": str(15 * 1024 * 1024)}
+
+def server_env():
     """The environment every test-spawned server boots in: this process's, plus
     the defaults below wherever the caller has not set one itself.
 
@@ -90,7 +115,9 @@ def kill_group(proc):
     a worker still mapping `wal.sal`. Requires the spawn to have used
     `start_new_session`, or this reaches the caller too."""
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        # The group id is the master's pid, and stays the group's after the
+        # master is reaped — which is when its workers most need killing.
+        os.killpg(proc.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
     proc.wait()
@@ -176,7 +203,10 @@ class ServerProc:
 
     `restart` reboots on the SAME data dir, which is what the recovery tests
     assert against; only the session server in conftest discards its data dir
-    between runs, and it does that by constructing a new `ServerProc`.
+    between runs, and it does that by pointing `data_dir` at a fresh one.
+
+    Every boot also listens for TLS on a port of the kernel's choosing, so
+    `target` can answer with either transport.
 
     Output goes to a file next to the data dir, never a pipe: the master logs
     unbuffered to fd 1/2, and at `GNITZ_LOG_LEVEL=debug` it would fill a 64 KiB
@@ -185,26 +215,34 @@ class ServerProc:
     earlier boot can never satisfy an assertion about this one.
     """
 
-    def __init__(self, data_dir, sock_path, *, workers=None, extra_env=None, log_path=None, args=()):
+    def __init__(self, data_dir, sock_path, *, log_path=None):
         self.data_dir = data_dir
         self.sock_path = sock_path
-        self.workers = NUM_WORKERS if workers is None else workers
-        self.extra_env = dict(extra_env or {})
+        self.workers = NUM_WORKERS
+        # Configuration of this server on every boot; `start(extra_env=...)` is
+        # for one boot only.
+        self.extra_env = {}
         self.log_path = log_path or data_dir.rstrip("/") + ".log"
-        self.args = list(args)
         self.proc = None
+        self.tls_target = None
         self._log_start = 0
+
+    @property
+    def target(self):
+        """Connect string for clients: the socket path, or this boot's TLS
+        address under GNITZ_TRANSPORT=tls (the full-suite transport sweep)."""
+        return self.tls_target if os.environ.get("GNITZ_TRANSPORT") == "tls" else self.sock_path
 
     # ── spawning ─────────────────────────────────────────────────────────────
 
     def _popen(self, spawn_env):
-        env = test_server_env()
+        env = server_env()
         env.update(self.extra_env)     # config of this server, every boot
         env.update(spawn_env or {})    # this boot only
         # A `GNITZ_INJECT_*` var names a `#[cfg(debug_assertions)]` seam a release
         # build folds away, leaving the test asserting against an ordinary healthy
         # run. Read off the prefix here rather than at the call site, so no boot
-        # that arms a seam can forget it — the same rule `dedicated_server` applies.
+        # that arms a seam can forget it.
         seams = [k for k in env if k.startswith("GNITZ_INJECT_")]
         if seams and not is_debug_build():
             pytest.skip(f"injection seam requires a debug build: {', '.join(seams)}")
@@ -217,7 +255,8 @@ class ServerProc:
         log = open(self.log_path, "ab")
         try:
             return subprocess.Popen(
-                [server_binary(), self.data_dir, self.sock_path, f"--workers={self.workers}", *self.args],
+                [server_binary(), self.data_dir, self.sock_path, f"--workers={self.workers}",
+                 "--tls-listen=127.0.0.1:0"],
                 stdout=log, stderr=log, env=env,
                 start_new_session=True, preexec_fn=server_preexec,
             )
@@ -239,6 +278,9 @@ class ServerProc:
         except TimeoutError as e:
             self.stop()
             raise RuntimeError(str(e)) from None
+        with open(os.path.join(self.data_dir, "tls_endpoint")) as f:
+            port = f.read().strip().rsplit(":", 1)[1]
+        self.tls_target = f"tls://127.0.0.1:{port}?ca={self.data_dir}/tls_dev_cert.pem"
         return self
 
     def start_expecting_exit(self, *, workers=None, extra_env=None, timeout=20.0):
@@ -296,6 +338,20 @@ class ServerProc:
         self.proc = None
         return rc
 
+    def exit_code_on(self, sql, seam):
+        """Reboot with the fault `seam` armed for that boot, issue `sql`, and
+        return the code the server died with. The request's own outcome is not
+        the observable — whether it errors depends on whether the abort lands
+        before or after its reply was queued. A statement that never reaches the
+        seam leaves the server up, which `wait_for_exit` reports."""
+        self.restart(extra_env=seam)
+        try:
+            with gnitz.connect(self.target) as conn:
+                conn.execute_sql(sql)
+        except gnitz.GnitzError:
+            pass
+        return self.wait_for_exit()
+
     # ── restarting ───────────────────────────────────────────────────────────
 
     def restart(self, *, graceful=False, workers=None, extra_env=None, timeout=10.0):
@@ -321,6 +377,24 @@ class ServerProc:
 
     def log_tail(self, max_bytes=4096):
         return self.log_text()[-max_bytes:]
+
+    def worker_pids(self):
+        """`{worker index: pid}` of the running master's children: each worker's
+        stdout is its own `worker_<N>.log`."""
+        pids = {}
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{name}/stat") as f:
+                    ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+                log = os.readlink(f"/proc/{name}/fd/1")
+            except (FileNotFoundError, ProcessLookupError, PermissionError, IndexError):
+                continue
+            m = re.search(r"worker_(\d+)\.log$", log)
+            if ppid == self.proc.pid and m:
+                pids[int(m.group(1))] = int(name)
+        return pids
 
     def worker_log_texts(self):
         """Each launched worker's log. Worker-side markers exist because a child
@@ -371,9 +445,30 @@ HANG_TIMEOUT = 180   # join ceiling for a group of threads
 START_TIMEOUT = 60   # thread waiting for the first concurrent write to land
 
 
+class _Spawned(threading.Thread):
+    error = None
+
+    def run(self):
+        try:
+            super().run()
+        except BaseException as e:  # noqa: BLE001 — re-raised by `join_or_fail`
+            self.error = e
+
+
+def spawn(target, *args):
+    """Start `target(*args)` on a thread that keeps what it raised, for
+    `join_or_fail` to re-raise — a plain thread's exception is printed and lost,
+    and the test goes on to pass. A daemon, so a wedged one fails its test
+    instead of hanging the interpreter's exit."""
+    t = _Spawned(target=target, args=args, daemon=True)
+    t.start()
+    return t
+
+
 def join_or_fail(why, *threads):
-    """Join `threads` against the ceiling above, failing with `why` on the first
-    still running. One deadline for the group, not one each.
+    """Join `spawn`ed `threads` against the ceiling above, failing with `why` on
+    the first still running, then re-raise the first exception one of them
+    raised. One deadline for the group, not one each.
 
     Joining and checking are one call because the ceiling catches a wedge only if
     someone looks afterwards: a bare `join(timeout=...)` returns silently and
@@ -382,3 +477,6 @@ def join_or_fail(why, *threads):
     for t in threads:
         t.join(max(0.0, deadline - time.monotonic()))
         assert not t.is_alive(), why
+    for t in threads:
+        if t.error is not None:
+            raise t.error

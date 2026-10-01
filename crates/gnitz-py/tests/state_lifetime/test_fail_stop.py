@@ -19,7 +19,6 @@ import pytest
 import gnitz
 from _read import bag, scanned
 from _sql import values
-from _uid import uid
 
 _ROWS = "INSERT INTO t VALUES (1, 100), (2, 200), (3, 300)"
 _WANT = {(1, 100): 1, (2, 200): 1, (3, 300): 1}
@@ -41,12 +40,10 @@ def test_a_failed_boot_leaves_the_sal_intact(seam, own_server):
     without binding the socket, and the next clean boot must recover every row —
     which it can only do if the failed boot left the SAL alone."""
     own_server.start()
-    with gnitz.connect(own_server.sock_path) as conn:
-        conn.create_schema("fs")
+    with gnitz.connect(own_server.target) as conn:
         conn.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name="fs")
-        conn.execute_sql(_ROWS, schema_name="fs")
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
+        conn.execute_sql(_ROWS)
     # Hard kill: the data directory takes one live process, so the failed boot
     # below must not race a still-running server.
     own_server.stop()
@@ -57,8 +54,8 @@ def test_a_failed_boot_leaves_the_sal_intact(seam, own_server):
         "a failed boot must not accept requests"
 
     own_server.start()
-    with gnitz.connect(own_server.sock_path) as conn:
-        assert bag(scanned(conn, "fs", "t"), "pk", "val") == _WANT
+    with gnitz.connect(own_server.target) as conn:
+        assert bag(scanned(conn, "t"), "pk", "val") == _WANT
 
 
 @pytest.mark.parametrize("inject,with_index", [("store", False), ("index", True)])
@@ -72,28 +69,18 @@ def test_a_failed_live_apply_aborts_the_cluster_and_replays(inject, with_index,
     the watermark and was replayed, so the rows the swallow would have orphaned
     are all there."""
     own_server.start()
-    with gnitz.connect(own_server.sock_path) as conn:
-        conn.create_schema("apply_err")
+    with gnitz.connect(own_server.target) as conn:
         conn.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name="apply_err")
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
         if with_index:
-            conn.execute_sql("CREATE INDEX ON t(val)", schema_name="apply_err")
+            conn.execute_sql("CREATE INDEX ON t(val)")
 
-    own_server.restart(extra_env={"GNITZ_INJECT_INGEST_APPLY_ERROR": inject})
-    try:
-        # The ACK races the abort — the apply aborts before it can be sent, so
-        # this raises on a dead socket (or, rarely, returns just before).
-        with gnitz.connect(own_server.sock_path) as conn:
-            conn.execute_sql(_ROWS, schema_name="apply_err")
-    except Exception:
-        pass
-    rc = own_server.wait_for_exit()
+    rc = own_server.exit_code_on(_ROWS, {"GNITZ_INJECT_INGEST_APPLY_ERROR": inject})
     assert rc == 2, f"a worker crash must exit 2, got {rc}"
 
     own_server.start()
-    with gnitz.connect(own_server.sock_path) as conn:
-        assert bag(scanned(conn, "apply_err", "t"), "pk", "val") == _WANT
+    with gnitz.connect(own_server.target) as conn:
+        assert bag(scanned(conn, "t"), "pk", "val") == _WANT
 
 
 def test_an_empty_index_projection_reports_no_write(own_server):
@@ -104,15 +91,12 @@ def test_an_empty_index_projection_reports_no_write(own_server):
     Absorbing the empty-projection skip into the ingest would make this abort the
     cluster over a write that never happened."""
     own_server.start(extra_env={"GNITZ_INJECT_INGEST_APPLY_ERROR": "index"})
-    with gnitz.connect(own_server.sock_path) as conn:
-        conn.create_schema("nullidx")
+    with gnitz.connect(own_server.target) as conn:
         conn.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT)",
-            schema_name="nullidx")
-        conn.execute_sql("CREATE INDEX ON t(val)", schema_name="nullidx")
-        conn.execute_sql("INSERT INTO t VALUES (1, NULL), (2, NULL)",
-                         schema_name="nullidx")
-        assert bag(scanned(conn, "nullidx", "t"), "pk", "val") == {(1, None): 1, (2, None): 1}
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT)")
+        conn.execute_sql("CREATE INDEX ON t(val)")
+        conn.execute_sql("INSERT INTO t VALUES (1, NULL), (2, NULL)")
+        assert bag(scanned(conn, "t"), "pk", "val") == {(1, None): 1, (2, None): 1}
     assert own_server.proc.poll() is None, \
         "no index ingest ran, so the seam must not have fired"
 
@@ -124,25 +108,22 @@ def test_a_restamp_owed_by_a_failed_drain_keeps_later_pushes_across_a_crash(own_
                                            "GNITZ_INJECT_TICK_EMIT_ERROR": "1"})
     pad = "x" * 64
     rows = [(pk, pad) for pk in range(2003)]
-    with gnitz.connect(own_server.sock_path) as conn:
-        conn.create_schema("ro")
-        conn.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v TEXT NOT NULL)",
-                         schema_name="ro")
-        conn.execute_sql("CREATE VIEW f AS SELECT pk, v FROM t WHERE pk % 2 = 0",
-                         schema_name="ro")
-        conn.execute_sql(f"INSERT INTO t VALUES {values(rows[:2000])}", schema_name="ro")
-        conn.execute_sql(f"INSERT INTO t VALUES {values(rows[2000:])}", schema_name="ro")
+    with gnitz.connect(own_server.target) as conn:
+        conn.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v TEXT NOT NULL)")
+        conn.execute_sql("CREATE VIEW f AS SELECT pk, v FROM t WHERE pk % 2 = 0")
+        conn.execute_sql(f"INSERT INTO t VALUES {values(rows[:2000])}")
+        conn.execute_sql(f"INSERT INTO t VALUES {values(rows[2000:])}")
         assert "checkpoint drain failed, skipping the ephemeral round" in own_server.log_text(), \
             "the checkpoint's drain must have failed, or no restamp is owed"
-        conn.execute_sql("CREATE TABLE u (pk BIGINT NOT NULL PRIMARY KEY)", schema_name="ro")
+        conn.execute_sql("CREATE TABLE u (pk BIGINT NOT NULL PRIMARY KEY)")
 
     own_server.restart()
-    with gnitz.connect(own_server.sock_path) as conn:
-        assert bag(scanned(conn, "ro", "t"), "pk", "v") == {r: 1 for r in rows}
-        assert bag(scanned(conn, "ro", "f"), "pk", "v") == {r: 1 for r in rows if r[0] % 2 == 0}
+    with gnitz.connect(own_server.target) as conn:
+        assert bag(scanned(conn, "t"), "pk", "v") == {r: 1 for r in rows}
+        assert bag(scanned(conn, "f"), "pk", "v") == {r: 1 for r in rows if r[0] % 2 == 0}
 
 
-def test_a_failed_tick_reports_and_requeues(tick_emit_fault_server):
+def test_a_failed_tick_reports_and_requeues(own_server):
     """The same rule one rung up: a *view tick* that fails to emit must report,
     not serve.
 
@@ -154,22 +135,21 @@ def test_a_failed_tick_reports_and_requeues(tick_emit_fault_server):
 
     The read that waited on the failed tick must error rather than serve the
     stale view, and the next read — which ticks the re-queued tid before it is
-    served — must be correct."""
-    client = tick_emit_fault_server
-    sn = "tef_" + uid()
-    client.create_schema(sn)
-    client.execute_sql(
-        "CREATE TABLE tickfault (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-        schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT pk, val FROM tickfault WHERE val > 5", schema_name=sn)
-    vid, schema = client.resolve_table(sn, "v")
+    served — must be correct.
 
-    client.execute_sql("INSERT INTO tickfault VALUES (1, 10), (2, 20), (3, 1)",
-                       schema_name=sn)
+    The seam fails the first *replied* tick emission. The CREATE's own
+    view-seeding drain writes a silent tick group and so cannot spend it."""
+    client = gnitz.connect(own_server.start(extra_env={"GNITZ_INJECT_TICK_EMIT_ERROR": "1"}).target)
+    client.execute_sql(
+        "CREATE TABLE tickfault (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT pk, val FROM tickfault WHERE val > 5")
+    vid, schema = client.resolve_table("v")
 
-    with pytest.raises(gnitz.GnitzError):
-        list(client.scan(vid, schema))
+    client.execute_sql("INSERT INTO tickfault VALUES (1, 10), (2, 20), (3, 1)")
+
+    with pytest.raises(gnitz.GnitzRefusedError):
+        client.scan(vid, schema)
 
     # The seam is spent and the tid was re-queued, so this read ticks it. A view
     # read is served only once its source closure is at the last completed tick's

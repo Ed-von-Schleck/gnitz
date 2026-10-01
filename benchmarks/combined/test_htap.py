@@ -27,49 +27,46 @@ N_CUST = 200
 SKEW_S = 1.1
 
 
-def test_htap(client, socket_path, schema_name, bench_timer, scale_mode):
+def test_htap(client, socket_path, bench_timer, scale_mode):
     import random
 
-    sn = schema_name
     sz = HTAP_SIZES[scale_mode]
     K, products, base_orders = sz["K_lines"], sz["products"], sz["base_orders"]
 
     client.execute_sql("CREATE TABLE customer (c_key BIGINT NOT NULL PRIMARY KEY, "
-                       "c_nation BIGINT NOT NULL)", schema_name=sn)
+                       "c_nation BIGINT NOT NULL)")
     client.execute_sql("CREATE TABLE orders (o_key BIGINT NOT NULL PRIMARY KEY, "
-                       "o_cust BIGINT NOT NULL, o_status TEXT NOT NULL, o_price BIGINT NOT NULL)",
-                       schema_name=sn)
+                       "o_cust BIGINT NOT NULL, o_status TEXT NOT NULL, o_price BIGINT NOT NULL)")
     client.execute_sql("CREATE TABLE lineitem (l_order BIGINT NOT NULL, l_line BIGINT NOT NULL, "
-                       "l_qty BIGINT NOT NULL, PRIMARY KEY (l_order, l_line))", schema_name=sn)
-    client.execute_sql("CREATE TABLE inventory (pk BIGINT NOT NULL PRIMARY KEY, qty BIGINT NOT NULL)",
-                       schema_name=sn)
+                       "l_qty BIGINT NOT NULL, PRIMARY KEY (l_order, l_line))")
+    client.execute_sql("CREATE TABLE inventory (pk BIGINT NOT NULL PRIMARY KEY, qty BIGINT NOT NULL)")
     # Dashboard views (R1: join projects col-refs only, then group downstream).
     client.execute_sql("CREATE VIEW v_co AS SELECT customer.c_nation AS c_nation, "
                        "orders.o_price AS o_price FROM customer "
-                       "JOIN orders ON orders.o_cust = customer.c_key", schema_name=sn)
+                       "JOIN orders ON orders.o_cust = customer.c_key")
     client.execute_sql("CREATE VIEW rev_by_nation AS SELECT c_nation, SUM(o_price) AS rev "
-                       "FROM v_co GROUP BY c_nation", schema_name=sn)
+                       "FROM v_co GROUP BY c_nation")
     client.execute_sql("CREATE VIEW orders_by_status AS SELECT o_status, COUNT(*) AS cnt "
-                       "FROM orders GROUP BY o_status", schema_name=sn)
+                       "FROM orders GROUP BY o_status")
 
     # Seed base.
     rng = random.Random(7)
-    c_tid, c_sch = client.resolve_table(sn, "customer")
+    c_tid, c_sch = client.resolve_table("customer")
     push_rows(client, c_tid, c_sch, [{"c_key": k, "c_nation": k % len(NATIONS)}
                                  for k in range(1, N_CUST + 1)])
-    o_tid, o_sch = client.resolve_table(sn, "orders")
+    o_tid, o_sch = client.resolve_table("orders")
     push_rows(client, o_tid, o_sch, [{"o_key": k, "o_cust": (k % N_CUST) + 1,
                                   "o_status": STATUS[k % len(STATUS)], "o_price": rng.randint(100, 50000)}
                                  for k in range(1, base_orders + 1)])
-    l_tid, l_sch = client.resolve_table(sn, "lineitem")
+    l_tid, l_sch = client.resolve_table("lineitem")
     push_rows(client, l_tid, l_sch, [{"l_order": k, "l_line": 1, "l_qty": (k % 20) + 1}
                                  for k in range(1, base_orders + 1)])
-    inv_tid, inv_sch = client.resolve_table(sn, "inventory")
+    inv_tid, inv_sch = client.resolve_table("inventory")
     push_rows(client, inv_tid, inv_sch, [{"pk": p, "qty": 1_000_000} for p in range(1, products + 1)])
 
     def writer_fn(conn, deadline):
-        wo_tid, wo_sch = conn.resolve_table(sn, "orders")
-        wl_tid, wl_sch = conn.resolve_table(sn, "lineitem")
+        wo_tid, wo_sch = conn.resolve_table("orders")
+        wl_tid, wl_sch = conn.resolve_table("lineitem")
         wrng = random.Random(os.getpid())
         base = WRITER_BASE + os.getpid() * 10_000_000
         commits = conflicts = 0
@@ -92,8 +89,7 @@ def test_htap(client, socket_path, schema_name, bench_timer, scale_mode):
             prod = zipf_choice(wrng, products, SKEW_S)
             for _ in range(64):
                 try:
-                    conn.execute_sql(f"UPDATE inventory SET qty = qty - 1 WHERE pk = {prod}",
-                                     schema_name=sn)
+                    conn.execute_sql(f"UPDATE inventory SET qty = qty - 1 WHERE pk = {prod}")
                     break
                 except gnitz.GnitzConflictError:
                     conflicts += 1
@@ -101,7 +97,7 @@ def test_htap(client, socket_path, schema_name, bench_timer, scale_mode):
         return {"commits": commits, "conflicts": conflicts, "latencies": lat}
 
     def reader_fn(conn, deadline):
-        rels = [conn.resolve_table(sn, name)
+        rels = [conn.resolve_table(name)
                 for name in ("orders", "lineitem", "rev_by_nation", "orders_by_status")]
         ops = torn = 0
         lat = []
@@ -131,7 +127,7 @@ def test_htap(client, socket_path, schema_name, bench_timer, scale_mode):
             ops += 1
         return {"ops": ops, "latencies": lat, "torn_reads": torn}
 
-    res = run_htap(socket_path, writer_fn, reader_fn, sz["writers"], sz["readers"], sz["duration_s"])
+    res = run_htap(socket_path, client.schema, writer_fn, reader_fn, sz["writers"], sz["readers"], sz["duration_s"])
 
     bench_timer.num_clients = sz["writers"] + sz["readers"]
     bench_timer.add_latencies(res["reader_latencies"], rows=res["reader_ops"])

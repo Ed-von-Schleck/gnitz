@@ -54,12 +54,11 @@ _SHAPES = {
 }
 
 
-def test_a_key_slot_is_absent_from_every_client_row(client, schema_name):
+def test_a_key_slot_is_absent_from_every_client_row(client):
     """For each emitter that fabricates or inherits a key, the presented fields
     are exactly the projected names, and the weights show the key still keying
     through a retraction. `including_hidden()` is the debugging escape hatch: it
     presents the synthetic key first, carrying the decoded join-key value."""
-    sn = schema_name
     join = "SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k"
     client.execute_sql(
         "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL, "
@@ -69,16 +68,16 @@ def test_a_key_slot_is_absent_from_every_client_row(client, schema_name):
         "CREATE VIEW over_jv1 AS SELECT * FROM jv1; "
         + "; ".join(f"CREATE VIEW {name} AS {body}" for name, (body, *_) in _SHAPES.items()) + "; "
         "INSERT INTO a VALUES (1, 7, 100, 'x'), (2, 5, 100, 'y'); "
-        "INSERT INTO b VALUES (1, 7, 200), (2, 9, 200)", schema_name=sn)
+        "INSERT INTO b VALUES (1, 7, 200), (2, 9, 200)")
 
     for step in ("before", "after"):
         if step == "after":
-            client.execute_sql("DELETE FROM a WHERE pk = 2", schema_name=sn)
+            client.execute_sql("DELETE FROM a WHERE pk = 2")
         for name, (_, cols, before, after) in _SHAPES.items():
-            rows = scanned(client, sn, name)
+            rows = scanned(client, name)
             assert bag(rows, *cols) == (before if step == "before" else after), (step, name)
             assert all(set(r._fields) == set(cols) for r in rows), (step, name, rows)
 
-    raw = scanned(client, sn, "jv1", hidden=True)
+    raw = scanned(client, "jv1", hidden=True)
     assert [r._fields[0] for r in raw] == ["_join_pk"], raw
     assert bag(raw, "_join_pk", "av", "bv") == {(7, 100, 200): 1}

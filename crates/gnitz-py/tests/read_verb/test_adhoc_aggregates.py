@@ -18,18 +18,19 @@ import gnitz
 import pytest
 from _caps import conjunct_ladder, first_rejected
 from _read import access, bag, ordered, rows, scanned
+from _serverproc import TINY_SCAN_CHUNKS
 from _sql import insert
 from _uid import uid as _uid
 
 
-def _parity(client, sn, query):
+def _parity(client, query):
     """Assert the ad-hoc result of `query` (no ORDER BY / LIMIT) equals a scan of
     a view built from the identical statement, as weighted bags, and return the
     ad-hoc rows. The view is left for the schema's teardown."""
-    adhoc = rows(client, sn, query)
+    adhoc = rows(client, query)
     vn = "pv_" + _uid()
-    client.execute_sql(f"CREATE VIEW {vn} AS {query}", schema_name=sn)
-    view = scanned(client, sn, vn)
+    client.execute_sql(f"CREATE VIEW {vn} AS {query}")
+    view = scanned(client, vn)
 
     assert bag(adhoc) == bag(view), f"ad-hoc != view for `{query}`"
     if adhoc and view:
@@ -38,7 +39,7 @@ def _parity(client, sn, query):
     return adhoc
 
 
-def _parity_ordered(client, sn, body, *tails):
+def _parity_ordered(client, body, *tails):
     """Assert the ad-hoc result of `body tail` equals reading a view of `body`
     with the same `tail` applied — row for row, in order, for each of `tails`
     against one shared view — and return the first ad-hoc result.
@@ -53,22 +54,22 @@ def _parity_ordered(client, sn, body, *tails):
     determinism alone.
     """
     vn = "po_" + _uid()
-    client.execute_sql(f"CREATE VIEW {vn} AS {body}", schema_name=sn)
+    client.execute_sql(f"CREATE VIEW {vn} AS {body}")
     out = []
     for tail in tails:
-        adhoc = rows(client, sn, f"{body} {tail}")
-        view = rows(client, sn, f"SELECT * FROM {vn} {tail}")
+        adhoc = rows(client, f"{body} {tail}")
+        view = rows(client, f"SELECT * FROM {vn} {tail}")
         assert ordered(adhoc) == ordered(view), f"ordered ad-hoc != view for `{body} {tail}`"
         out.append(adhoc)
     return out[0]
 
 
-def _reject_both(client, sn, query):
+def _reject_both(client, query):
     """Assert `query` is rejected on the direct path AND as a CREATE VIEW."""
-    with pytest.raises(gnitz.GnitzError):
-        rows(client, sn, query)
-    with pytest.raises(gnitz.GnitzError):
-        client.execute_sql(f"CREATE VIEW rv_{_uid()} AS {query}", schema_name=sn)
+    with pytest.raises(gnitz.GnitzRefusedError):
+        rows(client, query)
+    with pytest.raises(gnitz.GnitzRefusedError):
+        client.execute_sql(f"CREATE VIEW rv_{_uid()} AS {query}")
 
 
 def _grouped_oracle(src, key, value):
@@ -101,25 +102,25 @@ _WX = [(i, i % 3, _WX_LABELS[i % 5], f"550e8400-e29b-41d4-a716-4466554400{i:02d}
 
 
 @pytest.fixture(scope="module")
-def orders(module_schema):
-    conn, sn = module_schema
+def orders(module_client):
+    conn = module_client
     conn.execute_sql(
         "CREATE TABLE orders (pk BIGINT NOT NULL PRIMARY KEY, category BIGINT NOT NULL,"
-        " amount BIGINT NOT NULL, note BIGINT)", schema_name=sn)
-    insert(conn, sn, "orders", _ORDERS)
-    return sn
+        " amount BIGINT NOT NULL, note BIGINT)")
+    insert(conn, "orders", _ORDERS)
+    return conn
 
 
 @pytest.fixture(scope="module")
-def hg(module_schema):
+def hg(module_client):
     """The HAVING source: one column of each shape the compiled predicate has a
     separate arm for — a nullable TEXT, a U64 crossing i64::MAX, a narrow
     SMALLINT, a NOT NULL BIGINT and a nullable one."""
-    conn, sn = module_schema
+    conn = module_client
     conn.execute_sql(
         "CREATE TABLE hg (pk BIGINT NOT NULL PRIMARY KEY, cat BIGINT NOT NULL, s TEXT,"
         "                 u BIGINT UNSIGNED NOT NULL, sm SMALLINT, nn BIGINT NOT NULL,"
-        "                 v BIGINT)", schema_name=sn)
+        "                 v BIGINT)")
     conn.execute_sql(
         "INSERT INTO hg VALUES "
         "(1, 1, 'a',  9223372036854775808, -5,   10, 1),"
@@ -127,42 +128,41 @@ def hg(module_schema):
         "(3, 2, 'b',  5,                    3,   30, 7),"
         "(4, 2, NULL, 5,                    NULL, 40, NULL),"
         "(5, 3, 'c',  18446744073709551615, 9,   50, NULL),"
-        "(6, 3, 'c',  18446744073709551615, 2,   60, NULL)", schema_name=sn)
-    return sn
+        "(6, 3, 'c',  18446744073709551615, 2,   60, NULL)")
+    return conn
 
 
 @pytest.fixture(scope="module")
-def nl(module_schema):
+def nl(module_client):
     """`nl (x DOUBLE, s TEXT, id, v)` — a DOUBLE and a TEXT column ahead of the
     PK, holding `_NL`."""
-    conn, sn = module_schema
+    conn = module_client
     conn.execute_sql(
         "CREATE TABLE nl (x DOUBLE NOT NULL, s TEXT NOT NULL, id BIGINT NOT NULL,"
-        " v BIGINT NOT NULL, PRIMARY KEY (id))", schema_name=sn)
-    insert(conn, sn, "nl", _NL)
-    return sn
+        " v BIGINT NOT NULL, PRIMARY KEY (id))")
+    insert(conn, "nl", _NL)
+    return conn
 
 
 @pytest.fixture(scope="module")
-def wx(module_schema):
+def wx(module_client):
     """`wx (pk, g, label TEXT, u UUID)` holding `_WX`."""
-    conn, sn = module_schema
+    conn = module_client
     conn.execute_sql(
         "CREATE TABLE wx (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL,"
-        " label TEXT NOT NULL, u UUID NOT NULL)", schema_name=sn)
-    insert(conn, sn, "wx", _WX)
-    return sn
+        " label TEXT NOT NULL, u UUID NOT NULL)")
+    insert(conn, "wx", _WX)
+    return conn
 
 
 @pytest.fixture(scope="module")
-def gg(module_schema):
+def gg(module_client):
     """An empty `gg (pk, price DOUBLE, n)`: every grouped guard is a planning
     refusal, so no row is needed to reach one."""
-    conn, sn = module_schema
+    conn = module_client
     conn.execute_sql(
-        "CREATE TABLE gg (pk BIGINT PRIMARY KEY, price DOUBLE NOT NULL, n BIGINT NOT NULL)",
-        schema_name=sn)
-    return sn
+        "CREATE TABLE gg (pk BIGINT PRIMARY KEY, price DOUBLE NOT NULL, n BIGINT NOT NULL)")
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -170,18 +170,34 @@ def gg(module_schema):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("agg", ["COUNT(*) AS m", "COUNT(note) AS m", "SUM(amount) AS m",
-                                 "MIN(amount) AS m", "MAX(amount) AS m", "AVG(amount) AS m"])
-@pytest.mark.parametrize("select,tail", [
-    ("category, {agg}", "GROUP BY category"),
-    ("category, {agg}", "WHERE pk > 5 AND amount < 80 GROUP BY category"),
-    ("{agg}", ""),
-    ("{agg}", "WHERE category = 2"),
+# Each aggregate over a group's `_ORDERS` rows.
+_AGGS = {
+    "COUNT(*)": len,
+    "COUNT(note)": lambda g: sum(r[3] is not None for r in g),
+    "SUM(amount)": lambda g: sum(r[2] for r in g),
+    "MIN(amount)": lambda g: min(r[2] for r in g),
+    "MAX(amount)": lambda g: max(r[2] for r in g),
+    "AVG(amount)": lambda g: sum(r[2] for r in g) / len(g),
+}
+
+
+@pytest.mark.parametrize("agg", _AGGS)
+@pytest.mark.parametrize("grouped,where,keep", [
+    (True, "", lambda r: True),
+    (True, "WHERE pk > 5 AND amount < 80", lambda r: r[0] > 5 and r[2] < 80),
+    (False, "", lambda r: True),
+    (False, "WHERE category = 2", lambda r: r[1] == 2),
 ], ids=["grouped", "grouped-where", "global", "global-where"])
-def test_aggregate_parity(client, orders, agg, select, tail):
+def test_aggregate_parity(orders, agg, grouped, where, keep):
     """Every aggregate, grouped and global, with and without a WHERE that pushes
     a bounded PK range plus a residual."""
-    _parity(client, orders, f"SELECT {select.format(agg=agg)} FROM orders {tail}")
+    src = [r for r in _ORDERS if keep(r)]
+    if grouped:
+        got = _parity(orders, f"SELECT category, {agg} AS m FROM orders {where} GROUP BY category")
+        assert bag(got) == _grouped_oracle(src, lambda r: r[1], _AGGS[agg])
+    else:
+        got = _parity(orders, f"SELECT {agg} AS m FROM orders {where}")
+        assert bag(got) == {(_AGGS[agg](src),): 1}
 
 
 # ---------------------------------------------------------------------------
@@ -221,39 +237,39 @@ def test_aggregate_parity(client, orders, agg, select, tail):
     ("category + 1 AS k, SUM(amount * 3) AS m", "category + 1",
      lambda r: r[1] + 1, lambda g: sum(r[2] * 3 for r in g)),
 ])
-def test_computed_key_and_finalize_parity(client, orders, select, group, key, value):
+def test_computed_key_and_finalize_parity(orders, select, group, key, value):
     kname = "k" if " AS k" in select else "category"
-    got = _parity(client, orders, f"SELECT {select} FROM orders GROUP BY {group}")
+    got = _parity(orders, f"SELECT {select} FROM orders GROUP BY {group}")
     assert bag(got, kname, "m") == _grouped_oracle(_ORDERS, key, value)
 
 
-def test_a_computed_key_reaches_every_position_as_one_column(client, orders):
+def test_a_computed_key_reaches_every_position_as_one_column(orders):
     """The written key reaches the SELECT list and HAVING by its expression, not
     by a name, and the same expression written twice is ONE pre-map column
     rather than two."""
-    got = _parity(client, orders,
+    got = _parity(orders,
                   "SELECT amount * 2 AS k, SUM(pk) AS s FROM orders "
                   "GROUP BY amount * 2 HAVING SUM(pk) > 20")
     assert bag(got, "k", "s") == {
         (k, s): 1 for (k, s) in _grouped_oracle(
             _ORDERS, lambda r: r[2] * 2, lambda g: sum(r[0] for r in g)) if s > 20}
 
-    got = _parity(client, orders,
+    got = _parity(orders,
                   "SELECT category + amount AS k, category + amount AS again, "
                   "COUNT(*) AS c FROM orders GROUP BY category + amount")
-    assert all(r.k == r.again for r in got)
+    assert bag(got) == {
+        (k, k, c): 1 for k, c in _grouped_oracle(_ORDERS, lambda r: r[1] + r[2], len)}
 
 
-def test_a_premap_over_a_source_at_the_column_limit(client, schema_name):
+def test_a_premap_over_a_source_at_the_column_limit(client):
     """The pre-map carries only the PK and what the fold reads, so a computed key
     over a maximally wide source still fits."""
-    sn = schema_name
     name = f"w{gnitz.MAX_COLUMNS}"
     payload = ", ".join(f"c{i} BIGINT NOT NULL" for i in range(gnitz.MAX_COLUMNS - 1))
-    client.execute_sql(f"CREATE TABLE {name} (pk BIGINT PRIMARY KEY, {payload})", schema_name=sn)
-    insert(client, sn, name, [range(gnitz.MAX_COLUMNS)])
+    client.execute_sql(f"CREATE TABLE {name} (pk BIGINT PRIMARY KEY, {payload})")
+    insert(client, name, [range(gnitz.MAX_COLUMNS)])
     q = f"SELECT c0 + 1 AS k, COUNT(*) AS c FROM {name} GROUP BY c0 + 1"
-    assert bag(rows(client, sn, q)) == {(2, 1): 1}
+    assert bag(rows(client, q)) == {(2, 1): 1}
 
 
 @pytest.mark.parametrize("where,select,group,keep,key,value", [
@@ -269,7 +285,7 @@ def test_a_premap_over_a_source_at_the_column_limit(client, schema_name):
      lambda r: r[1] == "b", lambda r: r[3], lambda g: max(r[2] * 3 for r in g)),
 ])
 def test_a_premap_over_a_source_whose_pk_is_not_first(
-        client, nl, where, select, group, keep, key, value):
+        nl, where, select, group, keep, key, value):
     """The pre-map's output schema is the source's columns with the PK columns
     moved to the front, so it is a *permutation* of the source whenever the PK
     is not already leading — and a WHERE is resolved to positions against the
@@ -281,26 +297,25 @@ def test_a_premap_over_a_source_whose_pk_is_not_first(
     that confusion is a *type* mismatch at the permuted slot, where a same-width
     integer would just compare the wrong column.
     """
-    got = _parity(client, nl, f"SELECT {select} FROM nl WHERE {where} GROUP BY {group}")
+    got = _parity(nl, f"SELECT {select} FROM nl WHERE {where} GROUP BY {group}")
     assert bag(got, "k", "m") == _grouped_oracle([r for r in _NL if keep(r)], key, value)
 
 
-def test_a_computed_key_over_a_replicated_source(client, schema_name):
+def test_a_computed_key_over_a_replicated_source(client):
     """Replication is the trap for anything that touches reduce routing: every
     worker holds every row, so a fold that double-counted would still return
     plausible groups. The pre-map hands the fold a derived schema (source PK
     columns plus the computed ones), which must not change which rows a worker
     folds."""
-    sn = schema_name
     src = [(i, i % 3, i) for i in range(1, 13)]
     client.execute_sql(
         "CREATE TABLE rt (pk BIGINT PRIMARY KEY, c BIGINT NOT NULL, a BIGINT NOT NULL) "
-        "WITH (replicated = true)", schema_name=sn)
-    insert(client, sn, "rt", src)
+        "WITH (replicated = true)")
+    insert(client, "rt", src)
     # The control: no pre-map, so a double-count would show here too.
-    assert bag(_parity(client, sn, "SELECT c, COUNT(*) AS n FROM rt GROUP BY c")) == \
+    assert bag(_parity(client, "SELECT c, COUNT(*) AS n FROM rt GROUP BY c")) == \
         {(0, 4): 1, (1, 4): 1, (2, 4): 1}
-    got = _parity(client, sn, "SELECT c + 1 AS k, SUM(a * 2) AS s FROM rt GROUP BY c + 1")
+    got = _parity(client, "SELECT c + 1 AS k, SUM(a * 2) AS s FROM rt GROUP BY c + 1")
     assert bag(got) == _grouped_oracle(src, lambda r: r[1] + 1, lambda g: sum(r[2] * 2 for r in g))
 
 
@@ -325,10 +340,10 @@ def test_a_computed_key_over_a_replicated_source(client, schema_name):
     # HAVING over an ungrouped column.
     "SELECT n, COUNT(*) AS c FROM gg GROUP BY n HAVING pk > 1",
 ])
-def test_a_grouped_guard_fires_on_both_paths(client, gg, query):
+def test_a_grouped_guard_fires_on_both_paths(gg, query):
     """The grouped rejections a direct SELECT and a view body share. A guard that
     stops firing on one path turns that path's refusal into a wrong answer."""
-    _reject_both(client, gg, query)
+    _reject_both(gg, query)
 
 
 # ---------------------------------------------------------------------------
@@ -386,34 +401,34 @@ def test_a_grouped_guard_fires_on_both_paths(client, gg, query):
     ("SELECT 1 AS one FROM hg HAVING SUM(cat) > 1", "one", [1]),
     ("SELECT 1 AS one FROM hg HAVING 1 = 1", "one", [1]),
 ])
-def test_having_parity_and_value(client, hg, query, col, want):
-    assert bag(_parity(client, hg, query), col) == {(w,): 1 for w in want}
+def test_having_parity_and_value(hg, query, col, want):
+    assert bag(_parity(hg, query), col) == {(w,): 1 for w in want}
 
 
-def test_a_constant_having_that_never_reaches_the_engine(client, hg):
+def test_a_constant_having_that_never_reaches_the_engine(hg):
     """`HAVING 1` folds away at plan time and `HAVING 0` compiles to a constant
     that drops every group."""
-    assert bag(rows(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING 1")) == \
+    assert bag(rows(hg, "SELECT cat FROM hg GROUP BY cat HAVING 1")) == \
         {(1,): 1, (2,): 1, (3,): 1}
-    assert rows(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING 0") == []
+    assert rows(hg, "SELECT cat FROM hg GROUP BY cat HAVING 0") == []
 
 
-def test_the_register_cap_is_located_not_pinned(client, hg):
+def test_the_register_cap_is_located_not_pinned(hg):
     """The register cap on the direct path, found rather than hardcoded. The
     builder folds identical instructions, so the conjuncts must share nothing:
     `cat * k < k + 1` over distinct odd `k` is true exactly for `cat = 1`."""
     def having(k):
         return f"SELECT cat FROM hg GROUP BY cat HAVING {conjunct_ladder('cat', k)}"
 
-    k = first_rejected(lambda k: rows(client, hg, having(k)), range(1, 64))
-    assert bag(_parity(client, hg, having(k - 1)), "cat") == {(1,): 1}
+    k = first_rejected(lambda k: rows(hg, having(k)), range(1, 64))
+    assert bag(_parity(hg, having(k - 1)), "cat") == {(1,): 1}
 
     def having_in(n):
         items = ", ".join(repr(f"v{i}") for i in range(n))
         return f"SELECT s FROM hg GROUP BY s HAVING s IN ({items})"
 
-    n = first_rejected(lambda n: rows(client, hg, having_in(n)), range(1, 64))
-    assert _parity(client, hg, having_in(n - 1)) == []
+    n = first_rejected(lambda n: rows(hg, having_in(n)), range(1, 64))
+    assert _parity(hg, having_in(n - 1)) == []
 
 
 # ---------------------------------------------------------------------------
@@ -426,40 +441,40 @@ def test_the_register_cap_is_located_not_pinned(client, hg):
 # ---------------------------------------------------------------------------
 
 
-def test_avg_reads_its_accumulator_at_the_declared_type(client, hg):
+def test_avg_reads_its_accumulator_at_the_declared_type(hg):
     """cat = 3 sums two 2^64-1 cells: the high bit is set, so a signed read of
     the accumulator renders the average negative."""
     # 2^64-2 has no exact f64 image; it rounds to 2^64, so the average is 2^63.
-    got = _parity(client, hg, "SELECT cat, AVG(u) AS a FROM hg GROUP BY cat")
+    got = _parity(hg, "SELECT cat, AVG(u) AS a FROM hg GROUP BY cat")
     assert {r.cat: r.a for r in got}[3] == 9.223372036854776e18, got
     # The same accumulator with no group columns at all.
-    assert [r.a for r in _parity(client, hg, "SELECT AVG(u) AS a FROM hg WHERE cat = 3")] \
+    assert [r.a for r in _parity(hg, "SELECT AVG(u) AS a FROM hg WHERE cat = 3")] \
         == [9.223372036854776e18]
     # One 2^64-1 cell does not wrap, so its true average is representable.
-    assert [r.a for r in _parity(client, hg, "SELECT AVG(u) AS a FROM hg WHERE pk = 5")] \
+    assert [r.a for r in _parity(hg, "SELECT AVG(u) AS a FROM hg WHERE pk = 5")] \
         == [1.8446744073709552e19]
     # HAVING and the render read one accumulator: the predicate keeps cat = 3 on
     # a correctly-computed average, so a mis-signed render disagrees with itself.
-    got = _parity(client, hg, "SELECT cat, AVG(u) AS a FROM hg GROUP BY cat HAVING AVG(u) > 1.0")
+    got = _parity(hg, "SELECT cat, AVG(u) AS a FROM hg GROUP BY cat HAVING AVG(u) > 1.0")
     assert bag(got, "cat") == {(2,): 1, (3,): 1}, got
     # SUM's raw-bits render wraps to the u64.
-    got = _parity(client, hg, "SELECT cat, SUM(u) AS t FROM hg WHERE cat = 3 GROUP BY cat")
+    got = _parity(hg, "SELECT cat, SUM(u) AS t FROM hg WHERE cat = 3 GROUP BY cat")
     assert [r.t for r in got] == [18446744073709551614], got
 
     # What the unsigned read must not disturb: a signed source (every non-U64
     # integer widens to the same signed accumulator), an all-NULL group, and the
     # global ground row.
-    _parity(client, hg, "SELECT cat, AVG(sm) AS a FROM hg GROUP BY cat")
-    got = _parity(client, hg, "SELECT cat, AVG(v) AS a FROM hg GROUP BY cat")
+    _parity(hg, "SELECT cat, AVG(sm) AS a FROM hg GROUP BY cat")
+    got = _parity(hg, "SELECT cat, AVG(v) AS a FROM hg GROUP BY cat")
     assert {r.cat: r.a for r in got}[3] is None, got
-    assert [r.a for r in _parity(client, hg, "SELECT AVG(v) AS a FROM hg WHERE cat = 99")] \
+    assert [r.a for r in _parity(hg, "SELECT AVG(v) AS a FROM hg WHERE cat = 99")] \
         == [None]
 
 
-def test_a_null_group_and_an_all_null_aggregate(client, hg):
+def test_a_null_group_and_an_all_null_aggregate(hg):
     """A NULL group forms its own group, and a group whose aggregated column is
     entirely NULL still emits."""
-    got = _parity(client, hg,
+    got = _parity(hg,
                   "SELECT s, COUNT(v) AS cv, SUM(v) AS sv, MIN(v) AS mv FROM hg GROUP BY s")
     assert bag(got) == {("a", 1, 1, 1): 1, ("b", 1, 7, 7): 1,
                         ("c", 0, None, None): 1, (None, 0, None, None): 1}
@@ -470,67 +485,66 @@ def test_a_null_group_and_an_all_null_aggregate(client, hg):
 # ---------------------------------------------------------------------------
 
 
-def test_distinct_clamps_every_survivor_to_weight_one(client, schema_name):
+def test_distinct_clamps_every_survivor_to_weight_one(client):
     """DISTINCT is the weight-clamp primitive, so what it owes is not a row set
     but a weight: every survivor at exactly 1, however many source rows folded
     into it. A row count cannot see a survivor that kept weight 3."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE u (pk BIGINT PRIMARY KEY, city TEXT, region BIGINT); "
         "INSERT INTO u VALUES (1,'nyc',1),(2,'sf',2),(3,'nyc',1),(4,'sf',2),(5,'la',3),"
-        "(6,'nyc',1)", schema_name=sn)
-    assert bag(_parity(client, sn, "SELECT DISTINCT city FROM u")) == \
+        "(6,'nyc',1)")
+    assert bag(_parity(client, "SELECT DISTINCT city FROM u")) == \
         {("nyc",): 1, ("sf",): 1, ("la",): 1}
-    assert bag(_parity(client, sn, "SELECT DISTINCT city, region FROM u")) == \
+    assert bag(_parity(client, "SELECT DISTINCT city, region FROM u")) == \
         {("nyc", 1): 1, ("sf", 2): 1, ("la", 3): 1}
-    assert bag(_parity(client, sn, "SELECT DISTINCT region FROM u WHERE region > 1")) == \
+    assert bag(_parity(client, "SELECT DISTINCT region FROM u WHERE region > 1")) == \
         {(2,): 1, (3,): 1}
 
 
-def test_select_all_is_a_bag(client, schema_name):
+def test_select_all_is_a_bag(client):
     """`SELECT ALL` spells the default quantifier: the bag, never a DISTINCT."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE a (pk BIGINT PRIMARY KEY, v BIGINT NOT NULL); "
-        "INSERT INTO a VALUES (1, 5), (2, 5)", schema_name=sn)
-    assert bag(_parity(client, sn, "SELECT ALL v FROM a")) == {(5,): 2}
-    assert bag(_parity(client, sn, "SELECT ALL v, COUNT(*) AS c FROM a GROUP BY v")) == {(5, 2): 1}
+        "INSERT INTO a VALUES (1, 5), (2, 5)")
+    assert bag(_parity(client, "SELECT ALL v FROM a")) == {(5,): 2}
+    assert bag(_parity(client, "SELECT ALL v, COUNT(*) AS c FROM a GROUP BY v")) == {(5, 2): 1}
 
 
-def test_distinct_over_a_computed_key_and_a_duplicate_name(client, schema_name):
+def test_distinct_over_a_computed_key_and_a_duplicate_name(client):
     """`SELECT DISTINCT <expr>` and `SELECT DISTINCT *` over a duplicate-name view
     both bind through the one front end, so each accepts exactly what the
     identical `CREATE VIEW` body accepts."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE c (pk BIGINT PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
-        "INSERT INTO c VALUES (1,1,4),(2,2,3),(3,5,0),(4,1,4)", schema_name=sn)
+        "INSERT INTO c VALUES (1,1,4),(2,2,3),(3,5,0),(4,1,4)")
     # A computed set-identity key: rows 1, 2 and 4 all sum to 5, so the three
     # collapse to one survivor at weight 1.
-    assert bag(_parity(client, sn, "SELECT DISTINCT a + b AS s FROM c")) == {(5,): 1}
-    _parity(client, sn, "SELECT DISTINCT a, a + b AS s FROM c")
+    assert bag(_parity(client, "SELECT DISTINCT a + b AS s FROM c")) == {(5,): 1}
+    assert bag(_parity(client, "SELECT DISTINCT a, a + b AS s FROM c")) == {
+        (1, 5): 1, (2, 5): 1, (5, 5): 1}
 
     # A name-preserving wildcard names nothing of its own, so a duplicate among
     # the source's names rides through positionally — on both paths.
     client.execute_sql(
         "CREATE TABLE d (pk BIGINT PRIMARY KEY, a BIGINT NOT NULL); "
         "INSERT INTO d VALUES (1, 1), (2, 2); "
-        "CREATE VIEW dup AS SELECT * FROM c JOIN d ON c.a = d.pk", schema_name=sn)
-    assert sorted(bag(rows(client, sn, "SELECT DISTINCT * FROM dup")).values()) == [1, 1, 1]
+        "CREATE VIEW dup AS SELECT * FROM c JOIN d ON c.a = d.pk")
+    assert bag(rows(client, "SELECT DISTINCT * FROM dup")) == {
+        (1, 1, 4, 1, 1): 1, (2, 2, 3, 2, 2): 1, (4, 1, 4, 1, 1): 1}
 
 
-def test_distinct_over_a_wide_group(client, schema_name):
+def test_distinct_over_a_wide_group(client):
     """A >8-column group: DISTINCT over the 10 non-PK columns collapses the
     duplicate pair to one survivor at weight 1, and DISTINCT * keeps all three
     because the PK makes each row unique."""
-    sn = schema_name
     cols = ", ".join(f"c{i} BIGINT" for i in range(10))
-    client.execute_sql(f"CREATE TABLE w (pk BIGINT PRIMARY KEY, {cols})", schema_name=sn)
-    insert(client, sn, "w", [(1, *range(10)), (2, *range(10)), (3, *range(1, 11))])
+    client.execute_sql(f"CREATE TABLE w (pk BIGINT PRIMARY KEY, {cols})")
+    insert(client, "w", [(1, *range(10)), (2, *range(10)), (3, *range(1, 11))])
     proj = ", ".join(f"c{i}" for i in range(10))
-    got = bag(_parity(client, sn, f"SELECT DISTINCT {proj} FROM w"))
+    got = bag(_parity(client, f"SELECT DISTINCT {proj} FROM w"))
     assert got == {tuple(range(10)): 1, tuple(range(1, 11)): 1}
-    assert sorted(bag(_parity(client, sn, "SELECT DISTINCT * FROM w")).values()) == [1, 1, 1]
+    assert bag(_parity(client, "SELECT DISTINCT * FROM w")) == {
+        (1, *range(10)): 1, (2, *range(10)): 1, (3, *range(1, 11)): 1}
 
 
 # ---------------------------------------------------------------------------
@@ -538,65 +552,62 @@ def test_distinct_over_a_wide_group(client, schema_name):
 # ---------------------------------------------------------------------------
 
 
-def test_an_empty_source_grounds_a_global_fold_but_not_a_grouped_one(client, schema_name):
-    sn = schema_name
-    client.execute_sql("CREATE TABLE e (pk BIGINT PRIMARY KEY, v BIGINT)", schema_name=sn)
-    assert bag(rows(client, sn, "SELECT COUNT(*) AS c, SUM(v) AS s, MAX(v) AS m FROM e")) \
+def test_an_empty_source_grounds_a_global_fold_but_not_a_grouped_one(client):
+    client.execute_sql("CREATE TABLE e (pk BIGINT PRIMARY KEY, v BIGINT)")
+    assert bag(rows(client, "SELECT COUNT(*) AS c, SUM(v) AS s, MAX(v) AS m FROM e")) \
         == {(0, None, None): 1}
-    assert rows(client, sn, "SELECT v, COUNT(*) AS c FROM e GROUP BY v") == []
+    assert rows(client, "SELECT v, COUNT(*) AS c FROM e GROUP BY v") == []
     # HAVING still filters the ground row: a NULL aggregate drops it, COUNT
     # keeps it.
-    assert _parity(client, sn, "SELECT COUNT(*) AS c FROM e HAVING SUM(v) = 0") == []
-    assert _parity(client, sn, "SELECT COUNT(*) AS c FROM e HAVING MAX(v) >= 0") == []
-    assert bag(_parity(client, sn, "SELECT COUNT(*) AS c FROM e HAVING COUNT(*) = 0")) == \
+    assert _parity(client, "SELECT COUNT(*) AS c FROM e HAVING SUM(v) = 0") == []
+    assert _parity(client, "SELECT COUNT(*) AS c FROM e HAVING MAX(v) >= 0") == []
+    assert bag(_parity(client, "SELECT COUNT(*) AS c FROM e HAVING COUNT(*) = 0")) == \
         {(0,): 1}
     # A WHERE filtering out every row behaves identically to an empty table.
-    client.execute_sql("INSERT INTO e VALUES (1, 5)", schema_name=sn)
-    assert bag(rows(client, sn, "SELECT COUNT(*) AS c, SUM(v) AS s FROM e WHERE v > 100")) \
+    client.execute_sql("INSERT INTO e VALUES (1, 5)")
+    assert bag(rows(client, "SELECT COUNT(*) AS c, SUM(v) AS s FROM e WHERE v > 100")) \
         == {(0, None): 1}
-    assert rows(client, sn, "SELECT v, COUNT(*) AS c FROM e WHERE v > 100 GROUP BY v") == []
+    assert rows(client, "SELECT v, COUNT(*) AS c FROM e WHERE v > 100 GROUP BY v") == []
 
 
-def test_a_fold_over_a_bag_counts_logical_rows(client, schema_name):
+def test_a_fold_over_a_bag_counts_logical_rows(client):
     """A UNION ALL view whose rows carry weight 2: COUNT(*) counts the
     multiplicity, not the entries."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE base (pk BIGINT PRIMARY KEY, v BIGINT); "
         "INSERT INTO base VALUES (1, 10), (2, 20), (3, 10); "
-        "CREATE VIEW dbl AS SELECT pk, v FROM base UNION ALL SELECT pk, v FROM base",
-        schema_name=sn)
-    assert bag(rows(client, sn, "SELECT COUNT(*) AS c FROM dbl")) == {(6,): 1}
-    _parity(client, sn, "SELECT v, COUNT(*) AS c FROM dbl GROUP BY v")
+        "CREATE VIEW dbl AS SELECT pk, v FROM base UNION ALL SELECT pk, v FROM base")
+    assert bag(rows(client, "SELECT COUNT(*) AS c FROM dbl")) == {(6,): 1}
+    assert bag(_parity(client, "SELECT v, COUNT(*) AS c FROM dbl GROUP BY v")) == {(10, 4): 1, (20, 2): 1}
 
 
-def test_many_aggregates(client, schema_name):
+def test_many_aggregates(client):
     """A wide multi-aggregate query with a group column still folds, every
     accumulator kind at once."""
-    sn = schema_name
     n = 8
     cols = ", ".join(f"c{i} BIGINT" for i in range(n))
     client.execute_sql(
-        f"CREATE TABLE t (pk BIGINT PRIMARY KEY, g BIGINT NOT NULL, {cols})", schema_name=sn)
-    insert(client, sn, "t", [(i, i % 4, *((i * (j + 1)) % 50 for j in range(n)))
+        f"CREATE TABLE t (pk BIGINT PRIMARY KEY, g BIGINT NOT NULL, {cols})")
+    insert(client, "t", [(i, i % 4, *((i * (j + 1)) % 50 for j in range(n)))
                              for i in range(1, 31)])
     aggs = ", ".join(f"SUM(c{i}) AS s{i}, MIN(c{i}) AS l{i}, MAX(c{i}) AS m{i}, COUNT(c{i}) AS n{i}"
                      for i in range(n))
-    _parity(client, sn, f"SELECT g, {aggs} FROM t GROUP BY g")
+    _parity(client, f"SELECT g, {aggs} FROM t GROUP BY g")
 
 
-def test_the_per_worker_group_cap_aborts_and_the_worker_keeps_serving(adhoc_group_cap_server):
-    client, sn = adhoc_group_cap_server, "public"
-    client.execute_sql("CREATE TABLE t (pk BIGINT PRIMARY KEY, g BIGINT NOT NULL)", schema_name=sn)
+def test_the_per_worker_group_cap_aborts_and_the_worker_keeps_serving(own_server):
+    # Not a debug-only seam: the cap is read at bootstrap on every build.
+    client = gnitz.connect(own_server.start(extra_env={"GNITZ_ADHOC_GROUP_CAP": "4"}).target)
+    client.execute_sql("CREATE TABLE t (pk BIGINT PRIMARY KEY, g BIGINT NOT NULL)")
     # 100 distinct groups; with the cap at 4 per worker, some worker exceeds it.
-    insert(client, sn, "t", [(i, i) for i in range(1, 101)])
-    with pytest.raises(gnitz.GnitzError, match="CREATE VIEW"):
-        rows(client, sn, "SELECT g, COUNT(*) AS c FROM t GROUP BY g")
-    assert bag(rows(client, sn, "SELECT COUNT(*) AS c FROM t")) == {(100,): 1}
+    insert(client, "t", [(i, i) for i in range(1, 101)])
+    with pytest.raises(gnitz.GnitzRefusedError, match="CREATE VIEW"):
+        rows(client, "SELECT g, COUNT(*) AS c FROM t GROUP BY g")
+    assert bag(rows(client, "SELECT COUNT(*) AS c FROM t")) == {(100,): 1}
     # Rows already a set read as rows: no fold, so no cap.
     every_row = {(i, i): 1 for i in range(1, 101)}
-    assert bag(rows(client, sn, "SELECT DISTINCT * FROM t")) == every_row
-    assert bag(rows(client, sn, "SELECT DISTINCT pk, g FROM t")) == every_row
+    assert bag(rows(client, "SELECT DISTINCT * FROM t")) == every_row
+    assert bag(rows(client, "SELECT DISTINCT pk, g FROM t")) == every_row
 
 
 # ---------------------------------------------------------------------------
@@ -609,29 +620,32 @@ def test_the_per_worker_group_cap_aborts_and_the_worker_keeps_serving(adhoc_grou
 # ---------------------------------------------------------------------------
 
 
-def _tied_groups(client, sn):
+def _tied_groups(client):
     """16 groups of 3 rows each: every COUNT is tied, so an ORDER BY over the
     count leaves the whole result set for the tiebreak to order. `h` gives the
     DISTINCT case a tied non-key column to order by."""
     client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, h BIGINT NOT NULL)",
-        schema_name=sn)
-    insert(client, sn, "t", [(i, i % 16, i % 2) for i in range(1, 49)])
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, h BIGINT NOT NULL)")
+    insert(client, "t", [(i, i % 16, i % 2) for i in range(1, 49)])
 
 
-def test_a_tied_cut_is_worker_count_independent(seamed_server):
+def test_a_tied_cut_is_worker_count_independent(own_server):
     """16 fully-tied groups and a `LIMIT 4`: the cut is entirely the tiebreak's
-    to decide, so the same four groups must come back at every worker count."""
+    to decide, so the same four groups must come back when the same data is
+    served by a different worker count."""
     queries = {
         "asc": "SELECT g, COUNT(*) AS c FROM t GROUP BY g ORDER BY c LIMIT 4",
         "desc": "SELECT g, COUNT(*) AS c FROM t GROUP BY g ORDER BY c DESC LIMIT 4",
         "distinct": "SELECT DISTINCT g, h FROM t ORDER BY h LIMIT 4",
     }
     per_count = {}
-    for workers in ("2", "4"):
-        client = seamed_server({"GNITZ_WORKERS": workers})
-        _tied_groups(client, "public")
-        per_count[workers] = got = {k: rows(client, "public", q) for k, q in queries.items()}
+    for workers in (2, 4):
+        if workers == 2:
+            client = gnitz.connect(own_server.start(workers=2).target)
+            _tied_groups(client)
+        else:
+            client = gnitz.connect(own_server.restart(graceful=True, workers=4).target)
+        per_count[workers] = got = {k: rows(client, q) for k, q in queries.items()}
         # A single non-nullable integer group column keys on the
         # order-preserving route key, so the GROUP BY tie breaks ascending by `g`
         # — ASC in both directions, because tiebreak keys are always ASC. (DISTINCT
@@ -641,45 +655,49 @@ def test_a_tied_cut_is_worker_count_independent(seamed_server):
             assert [r.g for r in got[k]] == [0, 1, 2, 3], (workers, got[k])
 
     for k, q in queries.items():
-        assert ordered(per_count["2"][k]) == ordered(per_count["4"][k]), \
+        assert ordered(per_count[2][k]) == ordered(per_count[4][k]), \
             f"`{q}` differs across worker counts"
 
 
-def test_a_tied_cut_agrees_with_a_views_cut(client, schema_name):
+def test_a_tied_cut_agrees_with_a_views_cut(client):
     """The ad-hoc cut and a view's cut return the *same* tied rows. The two keys
     are not the same bytes — a view over a single non-nullable integer group
     column keys on that column's OPK, the fold on a wider group key — but the
     route key is order-preserving, so both induce the identical order."""
-    sn = schema_name
-    _tied_groups(client, sn)
+    _tied_groups(client)
     # A single natural group column: the key is the plain route key.
     first = _parity_ordered(
-        client, sn, "SELECT g, COUNT(*) AS c FROM t GROUP BY g",
+        client, "SELECT g, COUNT(*) AS c FROM t GROUP BY g",
         "ORDER BY c LIMIT 4", "ORDER BY c DESC LIMIT 4", "ORDER BY c OFFSET 5 LIMIT 6")
     assert [r.g for r in first] == [0, 1, 2, 3]
     # A two-column group key: both sides key on the digest, so this is where a
     # divergence between the fold's stamp and the view's would show.
-    _parity_ordered(client, sn, "SELECT g, h, COUNT(*) AS c FROM t GROUP BY g, h",
+    _parity_ordered(client, "SELECT g, h, COUNT(*) AS c FROM t GROUP BY g, h",
                     "ORDER BY c LIMIT 5")
 
 
-def test_order_by_an_aggregate_by_alias_call_and_position(client, orders):
+def test_order_by_an_aggregate_by_alias_call_and_position(orders):
     """ORDER BY an aggregate or an expression over the grouped relation binds
     like a SELECT item, by call or by alias alike; a column the grouping does not
     cover is rejected."""
-    by_call = rows(client, orders,
-                   "SELECT category, COUNT(*) FROM orders GROUP BY category "
-                   "ORDER BY COUNT(*) DESC, category")
-    by_alias = rows(client, orders,
-                    "SELECT category, COUNT(*) AS c FROM orders GROUP BY category "
-                    "ORDER BY c DESC, category")
-    assert [r.category for r in by_call] == [r.category for r in by_alias]
-    positional = rows(client, orders,
+    # Every category's sum is distinct, so the aggregate key alone decides the
+    # order and the category tiebreak never fires.
+    sums = _grouped_oracle(_ORDERS, lambda r: r[1], lambda g: sum(r[2] for r in g))
+    want = sorted(sums, key=lambda cs: -cs[1])
+    assert len({s for _, s in sums}) == len(sums) and want != sorted(sums)
+    by_call = rows(orders,
+                   "SELECT category, SUM(amount) FROM orders GROUP BY category "
+                   "ORDER BY SUM(amount) DESC, category")
+    by_alias = rows(orders,
+                    "SELECT category, SUM(amount) AS s FROM orders GROUP BY category "
+                    "ORDER BY s DESC, category")
+    assert [tuple(r) for r in by_call] == [tuple(r) for r in by_alias] == want
+    positional = rows(orders,
                       "SELECT category, COUNT(*) AS c FROM orders GROUP BY category ORDER BY 1")
-    assert [r.category for r in positional] == sorted(r.category for r in positional)
+    assert [r.category for r in positional] == [0, 1, 2, 3, 4]
 
-    with pytest.raises(gnitz.GnitzError, match="must appear in GROUP BY"):
-        rows(client, orders,
+    with pytest.raises(gnitz.GnitzRefusedError, match="must appear in GROUP BY"):
+        rows(orders,
              "SELECT category, COUNT(*) FROM orders GROUP BY category ORDER BY amount")
 
 
@@ -699,7 +717,7 @@ _FLOAT_ROWS = 2000
 _FLOAT_CATS = 500
 
 
-def _float_table(client, sn):
+def _float_table(client):
     rnd = random.Random(11)
     out = []
     for i in range(1, _FLOAT_ROWS + 1):
@@ -708,9 +726,8 @@ def _float_table(client, sn):
         mag = 1e15 if i % 4 == 0 else (-1e15 if i % 4 == 1 else 1e-8)
         out.append((i, (i * 37) % _FLOAT_CATS, mag * (1 + rnd.random())))
     client.execute_sql(
-        "CREATE TABLE f (pk BIGINT NOT NULL PRIMARY KEY, cat BIGINT NOT NULL, x DOUBLE NOT NULL)",
-        schema_name=sn)
-    insert(client, sn, "f", out)
+        "CREATE TABLE f (pk BIGINT NOT NULL PRIMARY KEY, cat BIGINT NOT NULL, x DOUBLE NOT NULL)")
+    insert(client, "f", out)
 
 
 def _bits(rows):
@@ -719,18 +736,17 @@ def _bits(rows):
     return [r.s.hex() for r in rows]
 
 
-def test_a_float_sum_is_stable_for_a_fixed_plan(client, schema_name):
+def test_a_float_sum_is_stable_for_a_fixed_plan(client):
     """Same query, same data, same worker count, same access path → bit-identical.
     The one reproducibility guarantee the float contract does make."""
-    sn = schema_name
-    _float_table(client, sn)
+    _float_table(client)
     for q in ("SELECT SUM(x) AS s FROM f",
               "SELECT cat, SUM(x) AS s FROM f GROUP BY cat",
               "SELECT cat, AVG(x) AS s FROM f GROUP BY cat"):
-        assert _bits(rows(client, sn, q)) == _bits(rows(client, sn, q)), f"`{q}` is not repeatable"
+        assert _bits(rows(client, q)) == _bits(rows(client, q)), f"`{q}` is not repeatable"
 
 
-def test_an_index_plan_keeps_the_exact_answer_and_a_repeatable_float_sum(tiny_ddl_chunk_server):
+def test_an_index_plan_keeps_the_exact_answer_and_a_repeatable_float_sum(own_server):
     """`CREATE INDEX` re-plans these reads onto an index-bounded walk, which sorts
     and dedups PKs one chunk at a time. What that owes the caller is pinned here:
     the same rows, and the same aggregates that are exact over them, chunk
@@ -743,8 +759,8 @@ def test_an_index_plan_keeps_the_exact_answer_and_a_repeatable_float_sum(tiny_dd
 
     The 3-row chunk is the point: each worker's share spans several chunks, the
     only regime in which the walk visits rows in an order a PK scan never would."""
-    client, sn = tiny_ddl_chunk_server, "public"
-    _float_table(client, sn)
+    client = gnitz.connect(own_server.start(extra_env=TINY_SCAN_CHUNKS).target)
+    _float_table(client)
     src = "FROM f WHERE cat >= 5 AND cat < 13"
     rows_q = f"SELECT pk, x {src}"
     exact_q = f"SELECT COUNT(*) AS c, SUM(pk) AS sp, MIN(x) AS mn, MAX(x) AS mx {src}"
@@ -753,27 +769,27 @@ def test_an_index_plan_keeps_the_exact_answer_and_a_repeatable_float_sum(tiny_dd
     # The control: with no index to bound on these are full scans, so the
     # assertion after CREATE INDEX reads the plan and not a constant.
     for q in (rows_q, exact_q, float_q):
-        assert access(client, sn, q).startswith("access: full scan"), q
-    before_rows = bag(rows(client, sn, rows_q))
-    before_exact = bag(rows(client, sn, exact_q))
+        assert access(client, q) == "full scan", q
+    before_rows = bag(rows(client, rows_q))
+    before_exact = bag(rows(client, exact_q))
     # 8 of `_FLOAT_CATS` categories at 4 rows each — coupled to that fixture.
     # 1.6% of the table, well inside the worker's cost gate, and 8 rows per
     # worker at 4 workers: three 3-row chunks each.
     assert len(before_rows) == 32, before_rows
 
-    client.execute_sql("CREATE INDEX fi ON f (cat)", schema_name=sn)
+    client.execute_sql("CREATE INDEX fi ON f (cat)")
     # One access planner serves the rows sink and the fold sink alike, so all
     # three re-plan.
     for q in (rows_q, exact_q, float_q):
-        assert access(client, sn, q).startswith("access: index range on (cat)"), q
+        assert access(client, q) == "index range on (cat)", q
 
     # A chunked drain and an unchunked one yield identical multisets: the rows,
     # then the aggregates exact over them — COUNT and an integer SUM fold
     # associatively, and MIN/MAX copy a cell's bits rather than combining them.
-    assert bag(rows(client, sn, rows_q)) == before_rows
-    assert bag(rows(client, sn, exact_q)) == before_exact
+    assert bag(rows(client, rows_q)) == before_rows
+    assert bag(rows(client, exact_q)) == before_exact
     # The float SUM under the index plan: repeatable, and that alone.
-    assert _bits(rows(client, sn, float_q)) == _bits(rows(client, sn, float_q))
+    assert _bits(rows(client, float_q)) == _bits(rows(client, float_q))
 
 
 # ---------------------------------------------------------------------------
@@ -782,36 +798,35 @@ def test_an_index_plan_keeps_the_exact_answer_and_a_repeatable_float_sum(tiny_dd
 
 
 @pytest.mark.parametrize("agg", ["MIN(label)", "MAX(label)", "MIN(u)", "MAX(u)"])
-def test_a_wide_extreme_combines_by_content(client, wx, agg):
+def test_a_wide_extreme_combines_by_content(wx, agg):
     """MIN/MAX over a TEXT or UUID column: every worker's partial carries the
     value itself, and the client's combine orders them as the engine does —
     strings by content, past the inline bound and across a shared prefix."""
     col = 2 if "label" in agg else 3
     pick = min if agg.startswith("MIN") else max
-    got = _parity(client, wx, f"SELECT g, {agg} AS m FROM wx GROUP BY g")
+    got = _parity(wx, f"SELECT g, {agg} AS m FROM wx GROUP BY g")
     assert bag(got, "g", "m") == _grouped_oracle(_WX, lambda r: r[1],
                                                  lambda g: pick(r[col] for r in g))
-    _parity(client, wx, f"SELECT {agg} AS m FROM wx")
+    _parity(wx, f"SELECT {agg} AS m FROM wx")
     # An empty source still grounds the global extreme to NULL.
-    assert [r.m for r in _parity(client, wx, f"SELECT {agg} AS m FROM wx WHERE pk > 100")] \
+    assert [r.m for r in _parity(wx, f"SELECT {agg} AS m FROM wx WHERE pk > 100")] \
         == [None]
 
 
-def test_a_spilling_string_group_column_survives_the_finalize(client, schema_name):
+def test_a_spilling_string_group_column_survives_the_finalize(client):
     """A GROUP BY over a TEXT column longer than the German-string inline bound.
 
     The group column is copied out of the fold's own group batch into the result,
     and a spilled cell's heap offset means nothing in the destination's arena —
     so a copy that moved the 16-byte struct verbatim would hand back an empty
     string for exactly the values that do not fit inline."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE labelled (pk BIGINT NOT NULL PRIMARY KEY, label TEXT NOT NULL,"
-        " amount BIGINT NOT NULL)", schema_name=sn)
+        " amount BIGINT NOT NULL)")
     # Two labels well past the 12-byte inline bound, one below it.
     labels = ["a string far past the inline bound", "another long spilling label", "short"]
     src = [(i, labels[i % 3], i) for i in range(12)]
-    insert(client, sn, "labelled", src)
+    insert(client, "labelled", src)
 
-    got = _parity(client, sn, "SELECT label, SUM(amount) AS s FROM labelled GROUP BY label")
+    got = _parity(client, "SELECT label, SUM(amount) AS s FROM labelled GROUP BY label")
     assert bag(got) == _grouped_oracle(src, lambda r: r[1], lambda g: sum(r[2] for r in g))

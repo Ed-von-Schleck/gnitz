@@ -20,23 +20,21 @@ _base_seed, _stream_build = seed_stream(
     lambda batch, pk, w: batch.append(pk=pk, val=pk % VMOD, _weight=w))
 
 
-def _setup(client, sn, view_sql, dim, base):
-    client.execute_sql("CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-                       schema_name=sn)
-    client.execute_sql("CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-                       schema_name=sn)
-    client.execute_sql(view_sql, schema_name=sn)
+def _setup(client, view_sql, dim, base):
+    client.execute_sql("CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
+    client.execute_sql("CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
+    client.execute_sql(view_sql)
     # t2 covers [1..dim]; t1 covers [1..base] (overlap on [1..dim], t1-only above).
-    t2_tid, t2_schema = client.resolve_table(sn, "t2")
+    t2_tid, t2_schema = client.resolve_table("t2")
     push_stream(client, t2_tid, t2_schema, _base_seed, dim)
-    t1_tid, t1_schema = client.resolve_table(sn, "t1")
+    t1_tid, t1_schema = client.resolve_table("t1")
     push_stream(client, t1_tid, t1_schema, _base_seed, base)
 
 
-def _run(client, sn, bench_timer, view_sql, streamed_table, sz, *, allow_empty=False):
-    _setup(client, sn, view_sql, sz["dim"], sz["base"])
-    tid, schema = client.resolve_table(sn, streamed_table)
-    stream_and_assert(client, sn, bench_timer, tid, schema, _stream_build, sz, "v",
+def _run(client, bench_timer, view_sql, streamed_table, sz, *, allow_empty=False):
+    _setup(client, view_sql, sz["dim"], sz["base"])
+    tid, schema = client.resolve_table(streamed_table)
+    stream_and_assert(client, bench_timer, tid, schema, _stream_build, sz, "v",
                       allow_empty=allow_empty)
 
 
@@ -48,18 +46,18 @@ def _run(client, sn, bench_timer, view_sql, streamed_table, sz, *, allow_empty=F
     ("except", "EXCEPT", False),
     ("except_all", "EXCEPT ALL", False),
 ])
-def test_setop_stream_t1(client, schema_name, bench_timer, scale_mode, op, keyword, empty):
+def test_setop_stream_t1(client, bench_timer, scale_mode, op, keyword, empty):
     """Stream deltas into t1 (the additive / left side of the operator)."""
     view = f"CREATE VIEW v AS SELECT * FROM t1 {keyword} SELECT * FROM t2"
-    _run(client, schema_name, bench_timer, view, "t1", feature_sz(scale_mode), allow_empty=empty)
+    _run(client, bench_timer, view, "t1", feature_sz(scale_mode), allow_empty=empty)
 
 
 @pytest.mark.parametrize("op,keyword", [
     ("except", "EXCEPT"),
     ("except_all", "EXCEPT ALL"),
 ])
-def test_setop_stream_t2(client, schema_name, bench_timer, scale_mode, op, keyword):
+def test_setop_stream_t2(client, bench_timer, scale_mode, op, keyword):
     """Stream deltas into t2 (the subtrahend side — drives the clamp differently).
     Streamed t2 rows are t2-only, so the EXCEPT view stays non-empty (t1's base)."""
     view = f"CREATE VIEW v AS SELECT * FROM t1 {keyword} SELECT * FROM t2"
-    _run(client, schema_name, bench_timer, view, "t2", feature_sz(scale_mode))
+    _run(client, bench_timer, view, "t2", feature_sz(scale_mode))

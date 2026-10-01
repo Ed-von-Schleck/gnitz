@@ -17,6 +17,7 @@ Run with GNITZ_WORKERS=4: the correlation key is an exchange key.
 from collections import Counter
 
 from _read import bag, scanned
+from _sql import churn
 
 
 def _lt(l, r):
@@ -50,33 +51,34 @@ _MARK = {
 _A_COLS = ("id", "k", "k1", "k2", "t", "x", "v")
 _B_COLS = ("id", "k", "k1", "k2", "t", "w", "y")
 
+# (statement, table, {id: the rest of the row}); a `None` row deletes the id.
 _CHURN = [
     # a(5) shares a(1)'s `k`, `k1` and `k2` but not its `v`.
     ("INSERT INTO a VALUES (1, 10, 7, 70, 50, 10, 100), (2, 20, 7, 71, 5, 20, 200), "
      "(3, NULL, 8, 70, 50, NULL, 300), (4, 30, 8, 80, 60, 30, 999), (5, 10, 7, 70, 50, NULL, 5)",
-     "a", [(1, 10, 7, 70, 50, 10, 100), (2, 20, 7, 71, 5, 20, 200),
-           (3, None, 8, 70, 50, None, 300), (4, 30, 8, 80, 60, 30, 999), (5, 10, 7, 70, 50, None, 5)]),
+     "a", {1: (10, 7, 70, 50, 10, 100), 2: (20, 7, 71, 5, 20, 200),
+           3: (None, 8, 70, 50, None, 300), 4: (30, 8, 80, 60, 30, 999), 5: (10, 7, 70, 50, None, 5)}),
     # A NULL-keyed inner row, and an all-NULL range column: an empty threshold.
-    ("INSERT INTO b VALUES (1, NULL, 7, 70, 40, 5, NULL)", "b", [(1, None, 7, 70, 40, 5, None)]),
-    ("INSERT INTO b VALUES (2, 10, 7, 70, 45, 8, 15)", "b", [(2, 10, 7, 70, 45, 8, 15)]),
+    ("INSERT INTO b VALUES (1, NULL, 7, 70, 40, 5, NULL)", "b", {1: (None, 7, 70, 40, 5, None)}),
+    ("INSERT INTO b VALUES (2, 10, 7, 70, 45, 8, 15)", "b", {2: (10, 7, 70, 45, 8, 15)}),
     # A second match for a(1) under every correlation: its weight stays 1.
-    ("INSERT INTO b VALUES (3, 10, 7, 71, 5, 9, 5)", "b", [(3, 10, 7, 71, 5, 9, 5)]),
-    ("INSERT INTO b VALUES (4, 20, 8, 80, 1, 3, 100)", "b", [(4, 20, 8, 80, 1, 3, 100)]),
-    ("INSERT INTO b VALUES (5, 20, 8, 80, 2, 6, 1)", "b", [(5, 20, 8, 80, 2, 6, 1)]),
+    ("INSERT INTO b VALUES (3, 10, 7, 71, 5, 9, 5)", "b", {3: (10, 7, 71, 5, 9, 5)}),
+    ("INSERT INTO b VALUES (4, 20, 8, 80, 1, 3, 100)", "b", {4: (20, 8, 80, 1, 3, 100)}),
+    ("INSERT INTO b VALUES (5, 20, 8, 80, 2, 6, 1)", "b", {5: (20, 8, 80, 2, 6, 1)}),
     # One of two matches goes; then the range threshold's holder.
-    ("DELETE FROM b WHERE id = 2", "b", [2]),
-    ("DELETE FROM b WHERE id = 5", "b", [5]),
+    ("DELETE FROM b WHERE id = 2", "b", {2: None}),
+    ("DELETE FROM b WHERE id = 5", "b", {5: None}),
     # A NULL outer key becomes a real one.
-    ("UPDATE a SET k = 20 WHERE id = 3", "a", [(3, 20, 8, 70, 50, None, 300)]),
-    ("DELETE FROM b", "b", [1, 3, 4]),
+    ("UPDATE a SET k = 20 WHERE id = 3", "a", {3: (20, 8, 70, 50, None, 300)}),
+    ("DELETE FROM b", "b", {1: None, 3: None, 4: None}),
     # With no `b.k = 10`, a(1) matches both rows on `k2` and `w < v` and a(5)
     # neither: two rows one `k` groups, whose match counts differ.
     ("INSERT INTO b VALUES (6, NULL, 7, 70, 1, 50, NULL), (7, NULL, 7, 70, 1, 60, NULL)",
-     "b", [(6, None, 7, 70, 1, 50, None), (7, None, 7, 70, 1, 60, None)]),
+     "b", {6: (None, 7, 70, 1, 50, None), 7: (None, 7, 70, 1, 60, None)}),
 ]
 
 
-def test_a_subquery_emits_each_outer_row_once_while_it_matches(client, schema_name):
+def test_a_subquery_emits_each_outer_row_once_while_it_matches(client):
     """Every correlation shape as a semi/anti pair, plus `IN`/`NOT IN` over the
     same shape, an EXISTS over views feeding a further view, and `SELECT *`,
     which takes the identity projection for the equi shape, the band shape and
@@ -84,7 +86,6 @@ def test_a_subquery_emits_each_outer_row_once_while_it_matches(client, schema_na
     is an ordinary boolean under OR, under NOT and as a `NOT IN`; projected bare
     or through a searched or a simple CASE, a flip must retract the old row. Two
     marks compose, and a subquery body reads a derived table with its own."""
-    sn = schema_name
     ex = "SELECT 1 FROM b WHERE"
     client.execute_sql(
         "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT, k1 INT NOT NULL, "
@@ -115,18 +116,12 @@ def test_a_subquery_emits_each_outer_row_once_while_it_matches(client, schema_na
         f"CREATE VIEW simple AS SELECT id, CASE EXISTS ({ex} {_MARK['eq'][0]}) WHEN 1 THEN 10 WHEN 0 THEN 20 END AS f FROM a; "
         f"CREATE VIEW mark_two AS SELECT k1 FROM a WHERE EXISTS ({ex} {_CORR['eq'][0]}) OR EXISTS ({ex} {_MARK['band'][0]}); "
         f"CREATE VIEW derived_exists AS SELECT id FROM (SELECT id, k2 FROM a WHERE EXISTS ({ex} {_CORR['eq'][0]})) d "
-        f"WHERE EXISTS ({ex} b.k2 = d.k2)",
-        schema_name=sn)
+        f"WHERE EXISTS ({ex} b.k2 = d.k2)")
 
-    a, b = {}, {}
-    for sql, table, changes in _CHURN:
-        client.execute_sql(sql, schema_name=sn)
-        state, cols = (a, _A_COLS) if table == "a" else (b, _B_COLS)
-        for change in changes:
-            if isinstance(change, int):
-                del state[change]
-            else:
-                state[change[0]] = dict(zip(cols, change))
+    state = {"a": {}, "b": {}}
+    for sql in churn(client, state, _CHURN):
+        a, b = ({i: dict(zip(cols, (i, *row))) for i, row in state[t].items()}
+                for t, cols in (("a", _A_COLS), ("b", _B_COLS)))
 
         def ids(keep):
             return {(r["id"],): 1 for r in a.values() if keep(r)}
@@ -135,20 +130,20 @@ def test_a_subquery_emits_each_outer_row_once_while_it_matches(client, schema_na
             return lambda r: any(pred(r, br) for br in b.values())
 
         for n, (_, pred) in _CORR.items():
-            assert bag(scanned(client, sn, f"semi_{n}"), "id") == \
+            assert bag(scanned(client, f"semi_{n}"), "id") == \
                 ids(lambda r: (n != "local" or r["v"] > 100) and exists(pred)(r)), (sql, n)
             if n != "local":
-                assert bag(scanned(client, sn, f"anti_{n}"), "id") == ids(lambda r: not exists(pred)(r)), (sql, n)
+                assert bag(scanned(client, f"anti_{n}"), "id") == ids(lambda r: not exists(pred)(r)), (sql, n)
         b_k1 = {br["k1"] for br in b.values()}
-        assert bag(scanned(client, sn, "in_k1"), "id") == ids(lambda r: r["k1"] in b_k1), sql
-        assert bag(scanned(client, sn, "not_in_k1"), "id") == ids(lambda r: r["k1"] not in b_k1), sql
+        assert bag(scanned(client, "in_k1"), "id") == ids(lambda r: r["k1"] in b_k1), sql
+        assert bag(scanned(client, "not_in_k1"), "id") == ids(lambda r: r["k1"] not in b_k1), sql
         in_eq = ids(exists(_CORR["eq"][1]))
-        assert bag(scanned(client, sn, "in_nullable"), "id") == in_eq, sql
-        assert bag(scanned(client, sn, "over_views"), "id") == in_eq, sql
-        assert bag(scanned(client, sn, "above"), "id") == {i: 1 for i in in_eq if i[0] >= 2}, sql
+        assert bag(scanned(client, "in_nullable"), "id") == in_eq, sql
+        assert bag(scanned(client, "over_views"), "id") == in_eq, sql
+        assert bag(scanned(client, "above"), "id") == {i: 1 for i in in_eq if i[0] >= 2}, sql
         for name, keep in (("star_eq", exists(_CORR["eq"][1])), ("star_band", exists(_CORR["band"][1])),
                            ("star_mark", lambda r: r["v"] == 999 or exists(_MARK["eq"][1])(r))):
-            star = scanned(client, sn, name)
+            star = scanned(client, name)
             assert bag(star, *_A_COLS) == {tuple(r.values()): 1 for r in a.values() if keep(r)}, (sql, name)
             assert all(set(row._fields) == set(_A_COLS) for row in star), (sql, name)
 
@@ -160,14 +155,14 @@ def test_a_subquery_emits_each_outer_row_once_while_it_matches(client, schema_na
             ("mark_band", lambda r: r["v"] == 100 or exists(_MARK["band"][1])(r)),
             ("mark_range", lambda r: r["v"] == 100 or exists(_MARK["range"][1])(r)),
         ):
-            assert bag(scanned(client, sn, name), "id") == ids(keep), (sql, name)
+            assert bag(scanned(client, name), "id") == ids(keep), (sql, name)
         in_band = exists(_MARK["band"][1])
-        assert bag(scanned(client, sn, "mark_two"), "k1") == Counter(
+        assert bag(scanned(client, "mark_two"), "k1") == Counter(
             (r["k1"],) for r in a.values() if exists(_CORR["eq"][1])(r) or in_band(r)), sql
-        assert bag(scanned(client, sn, "derived_exists"), "id") == \
+        assert bag(scanned(client, "derived_exists"), "id") == \
             ids(lambda r: exists(_CORR["eq"][1])(r) and mark(r)), sql
         for name, value in (("flag", lambda r: int(mark(r))),
                             ("searched", lambda r: r["v"] if mark(r) else 0),
                             ("simple", lambda r: 10 if mark(r) else 20)):
-            assert bag(scanned(client, sn, name), "id", "f") == {
+            assert bag(scanned(client, name), "id", "f") == {
                 (r["id"], value(r)): 1 for r in a.values()}, (sql, name)

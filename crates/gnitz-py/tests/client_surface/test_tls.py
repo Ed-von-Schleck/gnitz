@@ -1,5 +1,5 @@
-"""The Python clients over ``tls://…?ca=`` against the session server's
-always-on TLS listener, whatever GNITZ_TRANSPORT the suite runs under.
+"""The Python clients over ``tls://…?ca=`` against the session server's TLS
+listener, whatever GNITZ_TRANSPORT the suite runs under.
 
 The TLS transport itself is gnitz-core's and is tested there, and `make e2e-tls`
 runs this whole suite over it. What is here is what only the binding has: the
@@ -16,13 +16,11 @@ from _read import bag
 from _schemas import KV
 
 
-
-
 @pytest.mark.asyncio
-async def test_pipelined_pushes_over_tls(_srv, client, schema_name):
+async def test_pipelined_pushes_over_tls(_srv, client):
     """A gathered burst over TLS: every push lands exactly once, and a sync TLS
     connection reads back what the async one wrote."""
-    tid = client.create_table(schema_name, "t", KV)
+    tid = client.create_table("t", KV)
     rows = [{"pk": 100 * i + j, "val": j} for i in range(50) for j in range(1, 100)]
     async with aio.connect(_srv.tls_target) as aconn:
         await asyncio.gather(*[
@@ -33,6 +31,6 @@ async def test_pipelined_pushes_over_tls(_srv, client, schema_name):
 
 
 def test_a_bad_ca_path_is_refused(_srv):
-    target = f"tls://127.0.0.1:{_srv.tls_port}?ca=/nonexistent/ca.pem"
+    target = _srv.tls_target.split("?")[0] + "?ca=/nonexistent/ca.pem"
     with pytest.raises(gnitz.GnitzError, match="ca.pem"):
         gnitz.connect(target)

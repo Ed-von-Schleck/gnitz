@@ -25,20 +25,19 @@ _UUID_A = "550e8400-e29b-41d4-a716-446655440000"
 _UUID_B = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 
 
-def test_every_values_spelling_writes_its_rows(client, schema_name):
+def test_every_values_spelling_writes_its_rows(client):
     """`VALUES`, `ROW(…)`, the singular `VALUE`, a unary plus and a parenthesised
     literal are spellings of one decoder, in a PK slot and a payload slot alike.
     A signed NULL is the NULL it spells — not a zero with the null bit clear."""
-    sn = schema_name
-    client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT)", schema_name=sn)
+    client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT)")
     res = client.execute_sql(
         "INSERT INTO t VALUES (1, 10), (2, 20); "
         "INSERT INTO t VALUES ROW(3, 30); "
         "INSERT INTO t VALUE (4, 40); "
         "INSERT INTO t VALUES (+5, (50)), ((6), +60); "
-        "INSERT INTO t VALUES (7, +NULL), (8, -NULL), (9, NULL)", schema_name=sn)
+        "INSERT INTO t VALUES (7, +NULL), (8, -NULL), (9, NULL)")
     assert [r["count"] for r in res] == [2, 1, 1, 2, 3]
-    assert bag(scanned(client, sn, "t")) == {
+    assert bag(scanned(client, "t")) == {
         (1, 10): 1, (2, 20): 1, (3, 30): 1, (4, 40): 1, (5, 50): 1, (6, 60): 1,
         (7, None): 1, (8, None): 1, (9, None): 1}
 
@@ -140,54 +139,52 @@ _SCENARIOS = {
 
 @pytest.mark.parametrize("create,seed,steps,final", _SCENARIOS.values(), ids=_SCENARIOS.keys())
 def test_a_transaction_resolves_each_statement_as_autocommit_does(
-        client, schema_name, create, seed, steps, final):
-    sn = schema_name
+        client, create, seed, steps, final):
     for t in ("ac", "tx"):
-        client.execute_sql(f"{create}; INSERT INTO {{t}} VALUES {seed}".format(t=t), schema_name=sn)
+        client.execute_sql(f"{create}; INSERT INTO {{t}} VALUES {seed}".format(t=t))
     sqls, counts = [s for s, _ in steps], [n for _, n in steps]
 
-    ac = [client.execute_sql(s.format(t="ac"), schema_name=sn)[0]["count"] for s in sqls]
-    res = client.execute_sql("; ".join(["BEGIN", *sqls, "COMMIT"]).format(t="tx"), schema_name=sn)
+    ac = [client.execute_sql(s.format(t="ac"))[0]["count"] for s in sqls]
+    res = client.execute_sql("; ".join(["BEGIN", *sqls, "COMMIT"]).format(t="tx"))
     assert ac == [r["count"] for r in res[1:-1]] == counts
-    assert bag(scanned(client, sn, "ac")) == bag(scanned(client, sn, "tx")) == dict.fromkeys(final, 1)
+    assert bag(scanned(client, "ac")) == bag(scanned(client, "tx")) == dict.fromkeys(final, 1)
 
 
 @pytest.mark.parametrize("placement", ["keyed", "replicated", "view"])
-def test_a_long_pk_in_list_is_one_gather(client, schema_name, placement):
+def test_a_long_pk_in_list_is_one_gather(client, placement):
     """A `pk IN (…)` list is read as one gather however long it is, over a keyed
     table, a replicated one, and a view over the replicated one. Absent keys
     contribute nothing."""
-    sn, n = schema_name, 70_000
+    n = 70_000
     opts = "" if placement == "keyed" else " WITH (replicated = true)"
     client.execute_sql(
-        f"CREATE TABLE t (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, v BIGINT NOT NULL){opts}", schema_name=sn)
+        f"CREATE TABLE t (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, v BIGINT NOT NULL){opts}")
     read = "t"
     if placement == "view":
-        client.execute_sql("CREATE VIEW w AS SELECT id, v FROM t", schema_name=sn)
+        client.execute_sql("CREATE VIEW w AS SELECT id, v FROM t")
         read = "w"
-    tid, schema = client.resolve_table(sn, "t")
+    tid, schema = client.resolve_table("t")
     client.push(tid, gnitz.ZSetBatch(schema).extend([{"id": i, "v": i} for i in range(0, n + 10, 2)]))
 
     keys = ", ".join(str(i) for i in range(1, n + 1))
     inside = {(i, i): 1 for i in range(2, n + 1, 2)}
     outside = {(i, i): 1 for i in (0, *range(n + 2, n + 10, 2))}
-    assert bag(rows(client, sn, f"SELECT id, v FROM {read} WHERE id IN ({keys})")) == inside
-    res = client.execute_sql(f"DELETE FROM t WHERE id IN ({keys})", schema_name=sn)
+    assert bag(rows(client, f"SELECT id, v FROM {read} WHERE id IN ({keys})")) == inside
+    res = client.execute_sql(f"DELETE FROM t WHERE id IN ({keys})")
     assert res[0]["count"] == len(inside)
-    assert bag(scanned(client, sn, read)) == outside
+    assert bag(scanned(client, read)) == outside
 
 
-def test_an_update_over_a_pk_set_reads_back_every_committed_row(client, schema_name):
+def test_an_update_over_a_pk_set_reads_back_every_committed_row(client):
     """An UPDATE bounded by a PK set reads its committed rows back through the
     PkSet gather, over keys spanning every worker, so a key the gather drops is
     a row that silently keeps its old value."""
-    sn, n = schema_name, 400
+    n = 400
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL); "
-        "INSERT INTO t VALUES " + ", ".join(f"({i}, {i * 10})" for i in range(n)),
-        schema_name=sn)
+        "INSERT INTO t VALUES " + ", ".join(f"({i}, {i * 10})" for i in range(n)))
     wanted = set(range(0, n, 7))
     in_list = ", ".join(str(i) for i in sorted(wanted))
-    client.execute_sql(f"UPDATE t SET v = v + 1 WHERE id IN ({in_list})", schema_name=sn)
-    assert bag(scanned(client, sn, "t")) == \
+    client.execute_sql(f"UPDATE t SET v = v + 1 WHERE id IN ({in_list})")
+    assert bag(scanned(client, "t")) == \
         {(i, i * 10 + (i in wanted)): 1 for i in range(n)}

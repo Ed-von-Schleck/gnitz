@@ -8,25 +8,26 @@ table runs `enforce_unique_pk` and the view does not, so a weight the table
 clamps shows up in the view at whatever weight was actually emitted.
 """
 
-import threading
-
 import pytest
 import gnitz
 from _read import bag, scanned
-from _serverproc import join_or_fail
+from _serverproc import join_or_fail, spawn
 
 _INT = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
                      gnitz.ColumnDef("val", gnitz.TypeCode.I64, is_nullable=True)], [0])
 _STR = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
                      gnitz.ColumnDef("val", gnitz.TypeCode.STRING, is_nullable=True)], [0])
+_BLOB = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
+                      gnitz.ColumnDef("val", gnitz.TypeCode.BLOB, is_nullable=True)], [0])
 
-# A STRING table's push takes its own encoding and relocation path, so every
-# case runs over both; the four values are indexed by the cases below. The
-# string leg spans the empty string, the exact 12-byte inline limit, a heap
-# string and NULL.
+# A heap-backed table's push takes its own encoding and relocation path, so
+# every case runs over each; the four values are indexed by the cases below.
+# The string and blob legs span the empty value, the exact 12-byte inline limit,
+# a heap value and NULL.
 _LEGS = {
     "int": (_INT, [10, 20, 99, None]),
     "string": (_STR, ["", "abcdefghijkl", "this_is_a_longer_string_value", None]),
+    "blob": (_BLOB, [b"", b"abcdefghijkl", b"\x00\xff" * 12, None]),
 }
 
 # (committed (pk, value index), pushed (pk, value index, weight) or
@@ -48,11 +49,10 @@ _FOLD = {
 
 @pytest.mark.parametrize("leg", _LEGS)
 @pytest.mark.parametrize("committed,pushed,survivors", _FOLD.values(), ids=_FOLD.keys())
-def test_a_push_folds_by_pk(client, schema_name, leg, committed, pushed, survivors):
+def test_a_push_folds_by_pk(client, leg, committed, pushed, survivors):
     schema, vals = _LEGS[leg]
-    sn = schema_name
-    tid = client.create_table(sn, "t", schema)
-    client.execute_sql("CREATE VIEW v AS SELECT * FROM t", schema_name=sn)
+    tid = client.create_table("t", schema)
+    client.execute_sql("CREATE VIEW v AS SELECT * FROM t")
 
     def batch(rows):
         return gnitz.ZSetBatch(schema).extend(
@@ -66,23 +66,22 @@ def test_a_push_folds_by_pk(client, schema_name, leg, committed, pushed, survivo
         client.push(tid, batch(pushed))
 
     want = {(pk, vals[i]): 1 for pk, i in survivors}
-    assert bag(scanned(client, sn, "t")) == bag(scanned(client, sn, "v")) == want
+    assert bag(scanned(client, "t")) == bag(scanned(client, "v")) == want
 
 
-def test_an_empty_push_writes_nothing_and_keeps_the_connection_aligned(client, schema_name):
+def test_an_empty_push_writes_nothing_and_keeps_the_connection_aligned(client):
     """An empty batch ACKs with the "nothing written" LSN 0 — never a scan,
     whose streamed dump of the table's rows would desync the one-frame push
     reply. The pushes around it return real LSNs and land whole."""
-    sn = schema_name
-    tid = client.create_table(sn, "t", _INT)
+    tid = client.create_table("t", _INT)
     bulk = gnitz.ZSetBatch(_INT).extend([{"pk": i, "val": i * 10} for i in range(1, 1001)])
     assert client.push(tid, bulk) > 0
     assert client.push(tid, gnitz.ZSetBatch(_INT)) == 0
     assert client.push(tid, gnitz.ZSetBatch(_INT).extend([{"pk": 1001, "val": 0}])) > 0
-    assert bag(scanned(client, sn, "t")) == {(i, i * 10): 1 for i in range(1, 1001)} | {(1001, 0): 1}
+    assert bag(scanned(client, "t")) == {(i, i * 10): 1 for i in range(1, 1001)} | {(1001, 0): 1}
 
 
-def test_concurrent_pushes_coalesce_into_shared_commits(server, client, schema_name):
+def test_concurrent_pushes_coalesce_into_shared_commits(server, client):
     """Eight connections push at once, alternating between two tables. Each batch
     carries four rows under keys no other connection writes, alternating inline
     and heap strings, plus one row under the key every connection on its table
@@ -97,36 +96,27 @@ def test_concurrent_pushes_coalesce_into_shared_commits(server, client, schema_n
     batch's own heap, which a row count cannot check, and leaves each table's
     shared key as exactly one pushed row at weight 1."""
     conns, rounds, per = 8, 30, 4
-    sn = schema_name
-    tids = [client.create_table(sn, f"t{i}", _STR) for i in range(2)]
+    tids = [client.create_table(f"t{i}", _STR) for i in range(2)]
 
     def value(pk):
         return f"v{pk}" if pk % 2 == 0 else f"long-payload-for-row-{pk}"
 
     lsns = [[] for _ in range(conns)]
-    errors = []
 
     def worker(w):
-        try:
-            with gnitz.connect(server) as c:
-                for r in range(rounds):
-                    base = 1 + (w * rounds + r) * per
-                    batch = gnitz.ZSetBatch(_STR).extend(
-                        [{"pk": pk, "val": value(pk)} for pk in range(base, base + per)]
-                        + [{"pk": 0, "val": f"w{w}r{r}"}])
-                    lsns[w].append(c.push(tids[w % 2], batch))
-        except Exception as e:  # noqa: BLE001 — re-raised below
-            errors.append(e)
+        with gnitz.connect(server) as c:
+            for r in range(rounds):
+                base = 1 + (w * rounds + r) * per
+                batch = gnitz.ZSetBatch(_STR).extend(
+                    [{"pk": pk, "val": value(pk)} for pk in range(base, base + per)]
+                    + [{"pk": 0, "val": f"w{w}r{r}"}])
+                lsns[w].append(c.push(tids[w % 2], batch))
 
-    threads = [threading.Thread(target=worker, args=(w,), daemon=True) for w in range(conns)]
-    for t in threads:
-        t.start()
-    join_or_fail("a concurrent push hung", *threads)
-    assert not errors, errors
+    join_or_fail("a concurrent push hung", *[spawn(worker, w) for w in range(conns)])
 
     for i in range(2):
         writers = range(i, conns, 2)
-        got = bag(scanned(client, sn, f"t{i}"))
+        got = bag(scanned(client, f"t{i}"))
         [shared] = [k for k in got if k[0] == 0]
         assert shared[1] in {f"w{w}r{r}" for w in writers for r in range(rounds)}
         assert got == {(pk, value(pk)): 1 for w in writers

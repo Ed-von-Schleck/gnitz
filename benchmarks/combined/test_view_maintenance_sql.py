@@ -15,13 +15,12 @@ from helpers.vm_dag import (AMOUNT_MAX, DELETES_PER_ITER, SIZES, UPDATES_PER_ITE
                             seed, setup_views, status)
 
 
-def test_view_maintenance_sql(client, schema_name, bench_timer, scale_mode):
+def test_view_maintenance_sql(client, bench_timer, scale_mode):
     """Stream INSERT/UPDATE/DELETE via execute_sql over the view DAG."""
-    sn = schema_name
     sz = SIZES[scale_mode]
     rng = random.Random(42)
-    setup_views(client, sn)
-    seed(client, sn, sz, rng)
+    setup_views(client)
+    seed(client, sz, rng)
 
     dim_rows, insert_rows = sz["DIM_ROWS"], sz["INSERT_ROWS"]
     next_pk = sz["FACT_SEED"] + 1
@@ -35,17 +34,15 @@ def test_view_maintenance_sql(client, schema_name, bench_timer, scale_mode):
                         f"{rng.randint(0, AMOUNT_MAX)},{status(rng)})")
         ins = ("INSERT INTO fact_orders (o_id, o_customer, o_amount, o_status) "
                "VALUES " + ",".join(rows))
-        bench_timer.measure(client.execute_sql, ins, sn, rows_per_call=insert_rows)
+        bench_timer.measure(client.execute_sql, ins, rows_per_call=insert_rows)
 
         hi = next_pk - 1
         for _ in range(UPDATES_PER_ITER):
             client.execute_sql(
                 f"UPDATE fact_orders SET o_status={status(rng)}, "
-                f"o_amount={rng.randint(0, AMOUNT_MAX)} WHERE o_id={rng.randint(1, hi)}",
-                schema_name=sn)
+                f"o_amount={rng.randint(0, AMOUNT_MAX)} WHERE o_id={rng.randint(1, hi)}")
         for _ in range(DELETES_PER_ITER):
             client.execute_sql(
-                f"DELETE FROM fact_orders WHERE o_id={rng.randint(1, hi)}",
-                schema_name=sn)
+                f"DELETE FROM fact_orders WHERE o_id={rng.randint(1, hi)}")
 
-    assert len(client.scan(*client.resolve_table(sn, "v_rev"))) > 0, "v_rev empty"
+    assert len(client.scan(*client.resolve_table("v_rev"))) > 0, "v_rev empty"

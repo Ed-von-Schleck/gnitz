@@ -13,7 +13,7 @@ from _read import access, bag, rows, scanned
 from _serverproc import NEEDS_MULTI
 
 
-def test_rename_column_keeps_the_index_and_the_fk_bound_to_it(client, schema_name):
+def test_rename_column_keeps_the_index_and_the_fk_bound_to_it(client):
     """An index and a foreign key both bind by ordinal, so renaming the column
     each covers leaves them working under the new name.
 
@@ -30,21 +30,20 @@ def test_rename_column_keeps_the_index_and_the_fk_bound_to_it(client, schema_nam
         "INSERT INTO child VALUES (1, 1); "
         "ALTER TABLE parent RENAME COLUMN v TO w; "
         "ALTER TABLE child RENAME TO child2; "
-        "ALTER TABLE parent RENAME TO parent2", schema_name=schema_name)
+        "ALTER TABLE parent RENAME TO parent2")
 
     q = "SELECT id FROM parent2 WHERE w = 200"
-    plan = access(client, schema_name, q)
-    assert "index" in plan, plan
-    assert bag(rows(client, schema_name, q), "id") == {(2,): 1}
+    assert access(client, q) == "index range on (w)"
+    assert bag(rows(client, q), "id") == {(2,): 1}
 
     # A live reference is accepted and a dangling one refused.
-    client.execute_sql("INSERT INTO child2 VALUES (2, 1)", schema_name=schema_name)
+    client.execute_sql("INSERT INTO child2 VALUES (2, 1)")
     with pytest.raises(gnitz.GnitzIntegrityError, match="Foreign Key violation"):
-        client.execute_sql("INSERT INTO child2 VALUES (3, 999)", schema_name=schema_name)
+        client.execute_sql("INSERT INTO child2 VALUES (3, 999)")
 
 
 @NEEDS_MULTI
-def test_rename_populated_join_view_keeps_its_output_weights(client, schema_name):
+def test_rename_populated_join_view_keeps_its_output_weights(client):
     """Renaming a populated exchange-join view must not re-backfill it: the
     output Z-set is asserted whole before and after, so a second fill shows as
     doubled weights rather than as extra rows."""
@@ -54,13 +53,13 @@ def test_rename_populated_join_view_keeps_its_output_weights(client, schema_name
         "CREATE VIEW j AS SELECT a.id AS id, a.av AS av, b.bv AS bv "
         "FROM a JOIN b ON a.id = b.id; "
         "INSERT INTO a VALUES (1, 10), (2, 20); "
-        "INSERT INTO b VALUES (1, 100), (2, 200)", schema_name=schema_name)
+        "INSERT INTO b VALUES (1, 100), (2, 200)")
 
     want = {(10, 100): 1, (20, 200): 1}
-    assert bag(scanned(client, schema_name, "j"), "av", "bv") == want
+    assert bag(scanned(client, "j"), "av", "bv") == want
 
-    client.execute_sql("ALTER TABLE j RENAME TO j2", schema_name=schema_name)
-    assert bag(scanned(client, schema_name, "j2"), "av", "bv") == want
+    client.execute_sql("ALTER TABLE j RENAME TO j2")
+    assert bag(scanned(client, "j2"), "av", "bv") == want
 
 
 _RESTRICTED = [
@@ -73,28 +72,27 @@ _RESTRICTED = [
 ]
 
 
-def test_a_dependent_view_restricts_until_it_is_dropped(client, schema_name):
+def test_a_dependent_view_restricts_until_it_is_dropped(client):
     """A column transition under a view that scans the table, and a drop or a
     retarget of a view another view scans, are each refused — `IF EXISTS`
     included, since it answers "no such object" only. Nothing is torn down on
     the way: both views keep maintaining, and dropping them lifts the RESTRICT.
     """
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
         "CREATE VIEW v AS SELECT id, a FROM t WHERE a > 5; "
         "CREATE VIEW dep AS SELECT id FROM v; "
-        "INSERT INTO t VALUES (1, 10, 100)", schema_name=sn)
+        "INSERT INTO t VALUES (1, 10, 100)")
 
     for sql in _RESTRICTED:
-        with pytest.raises(gnitz.GnitzError, match="dependen"):
-            client.execute_sql(sql, schema_name=sn)
+        with pytest.raises(gnitz.GnitzRefusedError, match="dependen"):
+            client.execute_sql(sql)
 
-    client.execute_sql("INSERT INTO t VALUES (2, 20, 200)", schema_name=sn)
-    assert rows(client, sn, "SELECT * FROM t")[0]._fields == ("id", "a", "b")
-    assert bag(scanned(client, sn, "v"), "id", "a") == {(1, 10): 1, (2, 20): 1}
-    assert bag(scanned(client, sn, "dep"), "id") == {(1,): 1, (2,): 1}
+    client.execute_sql("INSERT INTO t VALUES (2, 20, 200)")
+    assert rows(client, "SELECT * FROM t")[0]._fields == ("id", "a", "b")
+    assert bag(scanned(client, "v"), "id", "a") == {(1, 10): 1, (2, 20): 1}
+    assert bag(scanned(client, "dep"), "id") == {(1,): 1, (2,): 1}
 
-    client.execute_sql("DROP VIEW dep; DROP VIEW v; " + "; ".join(_RESTRICTED[:3]), schema_name=sn)
-    assert bag(rows(client, sn, "SELECT * FROM t"), "id", "b", "c") == {
+    client.execute_sql("DROP VIEW dep; DROP VIEW v; " + "; ".join(_RESTRICTED[:3]))
+    assert bag(rows(client, "SELECT * FROM t"), "id", "b", "c") == {
         (1, 100, None): 1, (2, 200, None): 1}

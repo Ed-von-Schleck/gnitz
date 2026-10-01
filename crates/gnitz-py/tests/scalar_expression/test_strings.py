@@ -96,32 +96,30 @@ _FUNCTIONS = {
 }
 
 
-def test_every_function_counts_characters_over_each_cell_class_and_null(client, schema_name):
+def test_every_function_counts_characters_over_each_cell_class_and_null(client):
     """One projection per function over a corpus holding every cell shape at
     once, served alike by a maintained view and an ad-hoc read. The functions
     are split across views only to stay inside one program's register file."""
-    sn = schema_name
-    client.execute_sql("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT, n BIGINT)",
-                       schema_name=sn)
+    client.execute_sql("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT, n BIGINT)")
     funcs = list(_FUNCTIONS.items())
     parts = [dict(funcs[k:k + 12]) for k in range(0, len(funcs), 12)]
     selects = ["SELECT id, " + ", ".join(f"{e} AS c{n}" for n, e in enumerate(part)) + " FROM t"
                for part in parts]
     for n, select in enumerate(selects):
-        client.execute_sql(f"CREATE VIEW v{n} AS {select}", schema_name=sn)
-    client.execute_sql(f"INSERT INTO t VALUES {_ROWS}", schema_name=sn)
+        client.execute_sql(f"CREATE VIEW v{n} AS {select}")
+    client.execute_sql(f"INSERT INTO t VALUES {_ROWS}")
 
     for n, (part, select) in enumerate(zip(parts, selects)):
         expected = {r: 1 for r in zip(_IDS, *part.values())}
-        assert bag(scanned(client, sn, f"v{n}")) == expected
-        assert bag(rows(client, sn, select)) == expected
+        assert bag(scanned(client, f"v{n}")) == expected
+        assert bag(rows(client, select)) == expected
 
 
 def _ascii(s, fold):
     return "".join(fold(c) if c.isascii() else c for c in s)
 
 
-def test_a_retraction_re_derives_every_string_and_cancels_it(client, schema_name):
+def test_a_retraction_re_derives_every_string_and_cancels_it(client):
     """An UPDATE re-derives every computed string. Touching only the integer
     column forces the string-derived columns to reproduce byte for byte;
     touching the string itself moves a value across the inline/heap boundary in
@@ -131,25 +129,21 @@ def test_a_retraction_re_derives_every_string_and_cancels_it(client, schema_name
     Every check is a bag over the whole row: a retraction whose bytes differ
     leaves its own row at -1 beside the stale one at +1, which a bag keyed on
     `id` alone sums back to 1."""
-    sn = schema_name
     client.execute_sql(
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT NOT NULL, k BIGINT NOT NULL)",
-        schema_name=sn)
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT NOT NULL, k BIGINT NOT NULL)")
     client.execute_sql(
         "CREATE VIEW v AS SELECT id, UPPER(s) AS u, LENGTH(s) AS n, OCTET_LENGTH(s) AS b, "
         "SUBSTRING(TRIM(s) FROM 1 FOR 4) AS head, SUBSTRING(s FROM 2) AS tail, "
         "REVERSE(s) AS rv, LPAD(s, 30, '.') AS lp, SPLIT_PART(s, '-', k) AS sp, "
-        "CONCAT(s, '-', k) AS tag FROM t", schema_name=sn)
-    client.execute_sql("CREATE VIEW v2 AS SELECT id, LENGTH(u) AS n, LOWER(u) AS back FROM v",
-                       schema_name=sn)
+        "CONCAT(s, '-', k) AS tag FROM t")
+    client.execute_sql("CREATE VIEW v2 AS SELECT id, LENGTH(u) AS n, LOWER(u) AS back FROM v")
     # Both sides of the 12-byte boundary, scripts outside Latin-1, an
     # astral-plane character and the empty string.
     corpus = {1: (" a-long-value-past-twelve ", 2), 2: ("abc", 1), 3: ("exactly12chr", 1),
               4: ("thirteen-char", 2), 5: ("Grüße-Österreich", 2), 6: ("日本語-テキスト", 1),
               7: ("🙂-мир", 2), 8: ("", 1)}
     client.execute_sql(
-        "INSERT INTO t VALUES " + ", ".join(f"({i}, '{s}', {k})" for i, (s, k) in corpus.items()),
-        schema_name=sn)
+        "INSERT INTO t VALUES " + ", ".join(f"({i}, '{s}', {k})" for i, (s, k) in corpus.items()))
 
     def check():
         want = {}
@@ -158,21 +152,21 @@ def test_a_retraction_re_derives_every_string_and_cancels_it(client, schema_name
             want[(i, _ascii(s, str.upper), len(s), len(s.encode()), s.strip()[:4], s[1:],
                   s[::-1], s.rjust(30, ".")[:30], parts[k - 1] if k <= len(parts) else "",
                   f"{s}-{k}")] = 1
-        assert bag(scanned(client, sn, "v")) == want
-        assert bag(scanned(client, sn, "v2")) == {
+        assert bag(scanned(client, "v")) == want
+        assert bag(scanned(client, "v2")) == {
             (i, len(s), _ascii(_ascii(s, str.upper), str.lower)): 1
             for i, (s, _) in corpus.items()}
 
     check()
-    client.execute_sql("UPDATE t SET k = 3 WHERE id = 1", schema_name=sn)
+    client.execute_sql("UPDATE t SET k = 3 WHERE id = 1")
     corpus[1] = (corpus[1][0], 3)
     check()
     # Heap value shrinking inline, and inline value growing into the heap.
-    client.execute_sql("UPDATE t SET s = 'xy' WHERE id = 1", schema_name=sn)
-    client.execute_sql("UPDATE t SET s = 'another-long-one' WHERE id = 2", schema_name=sn)
+    client.execute_sql("UPDATE t SET s = 'xy' WHERE id = 1")
+    client.execute_sql("UPDATE t SET s = 'another-long-one' WHERE id = 2")
     corpus[1], corpus[2] = ("xy", 3), ("another-long-one", 1)
     check()
-    client.execute_sql("DELETE FROM t", schema_name=sn)
+    client.execute_sql("DELETE FROM t")
     corpus.clear()
     check()
 
@@ -201,20 +195,17 @@ _COMPARISONS = {
 }
 
 
-def test_a_string_comparison_orders_by_bytes_on_every_spelling(client, schema_name):
+def test_a_string_comparison_orders_by_bytes_on_every_spelling(client):
     """One fused opcode carries all six operators over a column and a constant,
     and the order is the cells' plain byte order at any length. A NULL never
     matches, and never matches the negation either."""
-    sn = schema_name
     client.execute_sql(
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, name TEXT, other TEXT NOT NULL)",
-        schema_name=sn)
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, name TEXT, other TEXT NOT NULL)")
     for n, pred in enumerate(_COMPARISONS):
-        client.execute_sql(f"CREATE VIEW v{n} AS SELECT id FROM t WHERE {pred}", schema_name=sn)
+        client.execute_sql(f"CREATE VIEW v{n} AS SELECT id FROM t WHERE {pred}")
     client.execute_sql(
         "INSERT INTO t VALUES (1, 'alice', 'b'), (2, 'bob', 'bob'), (3, 'charlie', 'abc'), "
-        "(4, 'dave', 'dave!'), (5, 'aa', 'a'), (6, 'ab', 'ab'), (7, 'ba', 'bz'), (8, NULL, 'x')",
-        schema_name=sn)
+        "(4, 'dave', 'dave!'), (5, 'aa', 'a'), (6, 'ab', 'ab'), (7, 'ba', 'bz'), (8, NULL, 'x')")
 
     for n, (pred, want) in enumerate(_COMPARISONS.items()):
-        assert bag(scanned(client, sn, f"v{n}")) == {(i,): 1 for i in want}, pred
+        assert bag(scanned(client, f"v{n}")) == {(i,): 1 for i in want}, pred

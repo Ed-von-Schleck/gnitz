@@ -26,14 +26,12 @@ _ROWS = {1: "(1, -9, 'alpha', 0.5, 5)", 2: f"(2, 3, 'beta', 1.5, {U64_HIGH})",
 
 
 @pytest.fixture
-def surf(client, schema_name):
+def surf(client):
     """`t (pk, i, s, f, u)` holding `_ROWS`."""
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, i BIGINT NOT NULL, "
-        "s TEXT, f DOUBLE NOT NULL, u BIGINT UNSIGNED NOT NULL)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO t VALUES " + ", ".join(_ROWS.values()),
-                       schema_name=schema_name)
-    return schema_name
+        "s TEXT, f DOUBLE NOT NULL, u BIGINT UNSIGNED NOT NULL)")
+    client.execute_sql("INSERT INTO t VALUES " + ", ".join(_ROWS.values()))
 
 
 # Each predicate against the pks it selects. Every operand class is here: an
@@ -68,21 +66,19 @@ def test_every_surface_selects_the_same_rows(client, surf):
     """For each predicate: what the maintained filter holds, the ad-hoc WHERE
     returns and the DELETE residual removes — after which the view retracts
     exactly those rows, and re-admits them when they return."""
-    sn = surf
     views = {p: f"v{n}" for n, p in enumerate(_PREDICATES)}
     for p, v in views.items():
-        client.execute_sql(f"CREATE VIEW {v} AS SELECT pk FROM t WHERE {p}", schema_name=sn)
+        client.execute_sql(f"CREATE VIEW {v} AS SELECT pk FROM t WHERE {p}")
 
     for p, want in _PREDICATES.items():
         selected = {(k,): 1 for k in want}
-        assert bag(scanned(client, sn, views[p])) == selected, p
-        assert bag(rows(client, sn, f"SELECT pk FROM t WHERE {p}")) == selected, p
+        assert bag(scanned(client, views[p])) == selected, p
+        assert bag(rows(client, f"SELECT pk FROM t WHERE {p}")) == selected, p
 
-        client.execute_sql(f"DELETE FROM t WHERE {p}", schema_name=sn)
-        assert bag(scanned(client, sn, "t"), "pk") == {(k,): 1 for k in _ROWS.keys() - want}, p
-        assert bag(scanned(client, sn, views[p])) == {}, p
-        client.execute_sql("INSERT INTO t VALUES " + ", ".join(_ROWS[k] for k in sorted(want)),
-                           schema_name=sn)
+        client.execute_sql(f"DELETE FROM t WHERE {p}")
+        assert bag(scanned(client, "t"), "pk") == {(k,): 1 for k in _ROWS.keys() - want}, p
+        assert bag(scanned(client, views[p])) == {}, p
+        client.execute_sql("INSERT INTO t VALUES " + ", ".join(_ROWS[k] for k in sorted(want)))
 
 
 def test_a_value_and_a_group_key_evaluate_alike_across_a_retraction(client, surf):
@@ -90,47 +86,45 @@ def test_a_value_and_a_group_key_evaluate_alike_across_a_retraction(client, surf
     a written group key maintained and ad hoc. A retraction under a computed
     group key has to leave the old group as well as join the new one; a stale
     group survives at weight 1 and a row count over the groups cannot see it."""
-    sn = surf
     proj = "SELECT pk, ABS(i) AS a, LEFT(s, 1) AS k, f * 2 AS f2, u / 2 AS h FROM t"
     grouped = "SELECT LEFT(s, 1) AS k, COUNT(*) AS c, SUM(i) AS si FROM t GROUP BY LEFT(s, 1)"
-    client.execute_sql(f"CREATE VIEW vp AS {proj}", schema_name=sn)
-    client.execute_sql(f"CREATE VIEW vg AS {grouped}", schema_name=sn)
+    client.execute_sql(f"CREATE VIEW vp AS {proj}")
+    client.execute_sql(f"CREATE VIEW vg AS {grouped}")
 
     unchanged = {(3, 1, "1", 5.4, 4): 1, (4, 0, None, 2e300, 0): 1}
-    assert bag(scanned(client, sn, "vp")) == bag(rows(client, sn, proj)) == {
+    assert bag(scanned(client, "vp")) == bag(rows(client, proj)) == {
         (1, 9, "a", 1.0, 2): 1, (2, 3, "b", 3.0, U64_HIGH // 2): 1, **unchanged}
-    assert bag(scanned(client, sn, "vg")) == bag(rows(client, sn, grouped)) == {
+    assert bag(scanned(client, "vg")) == bag(rows(client, grouped)) == {
         ("a", 1, -9): 1, ("b", 1, 3): 1, ("1", 1, -1): 1, (None, 1, 0): 1}
 
-    client.execute_sql("UPDATE t SET s = 'gamma', i = 9 WHERE pk = 1", schema_name=sn)
-    client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
-    assert bag(scanned(client, sn, "vp")) == bag(rows(client, sn, proj)) == {
+    client.execute_sql("UPDATE t SET s = 'gamma', i = 9 WHERE pk = 1")
+    client.execute_sql("DELETE FROM t WHERE pk = 2")
+    assert bag(scanned(client, "vp")) == bag(rows(client, proj)) == {
         (1, 9, "g", 1.0, 2): 1, **unchanged}
-    assert bag(scanned(client, sn, "vg")) == bag(rows(client, sn, grouped)) == {
+    assert bag(scanned(client, "vg")) == bag(rows(client, grouped)) == {
         ("g", 1, 9): 1, ("1", 1, -1): 1, (None, 1, 0): 1}
 
 
-def test_a_set_right_hand_side_computes_over_every_column_it_can_read(client, schema_name):
+def test_a_set_right_hand_side_computes_over_every_column_it_can_read(client):
     """SET compiles the same program with the target column's class as its sink.
     A nullable source resolves it with nullability on, so a NULL source writes
     NULL rather than the filler zeros read back as a real 0; the PK region is
     readable through the client adapter like any other column; and an unsigned
     operand divides in the unsigned domain."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, "
-        "s TEXT NOT NULL, u BIGINT UNSIGNED NOT NULL)", schema_name=sn)
+        "s TEXT NOT NULL, u BIGINT UNSIGNED NOT NULL)")
     client.execute_sql(f"INSERT INTO t VALUES (41, NULL, '  pad  ', {U64_HIGH}), "
-                       "(7, 5, 'keep', 4)", schema_name=sn)
+                       "(7, 5, 'keep', 4)")
 
-    client.execute_sql("UPDATE t SET a = a + pk, s = TRIM(s), u = u / 2", schema_name=sn)
-    assert bag(scanned(client, sn, "t")) == {
+    client.execute_sql("UPDATE t SET a = a + pk, s = TRIM(s), u = u / 2")
+    assert bag(scanned(client, "t")) == {
         (41, None, "pad", U64_HIGH // 2): 1,   # NULL + 41 stays NULL, not 41
         (7, 12, "keep", 2): 1,
     }
 
 
-def test_a_wide_literal_is_checked_against_its_target_before_any_row(client, schema_name):
+def test_a_wide_literal_is_checked_against_its_target_before_any_row(client):
     """An integer past `u64` has no register slot, so a residual computing with
     one cannot be compiled at all, and an assignment out of the target's range is
     refused at plan time — even when the statement would touch no row, since
@@ -141,26 +135,24 @@ def test_a_wide_literal_is_checked_against_its_target_before_any_row(client, sch
     SET parses its literal against the *target's* type rather than against the
     register file, so the top of the unsigned range is writable on both
     assignment surfaces."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT UNSIGNED NOT NULL PRIMARY KEY, "
-        "v BIGINT UNSIGNED NOT NULL)", schema_name=sn)
-    client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
+        "v BIGINT UNSIGNED NOT NULL)")
+    client.execute_sql("INSERT INTO t VALUES (1, 100)")
 
     for stmt in (f"DELETE FROM t WHERE v + {U64_MAX + 1} = 0",
                  f"UPDATE t SET v = {U64_MAX + 1} WHERE pk = 999",
                  "UPDATE t SET v = -1 WHERE pk = 999",
                  f"INSERT INTO t VALUES (2, 1) ON CONFLICT (pk) DO UPDATE SET v = {U64_MAX + 1}"):
-        with pytest.raises(gnitz.GnitzError):
-            client.execute_sql(stmt, schema_name=sn)
-    assert bag(scanned(client, sn, "t")) == {(1, 100): 1}
+        with pytest.raises(gnitz.GnitzRefusedError):
+            client.execute_sql(stmt)
+    assert bag(scanned(client, "t")) == {(1, 100): 1}
     # The top of the unsigned range is a comparison operand like any other.
-    client.execute_sql(f"DELETE FROM t WHERE v = {U64_MAX}", schema_name=sn)
-    assert bag(scanned(client, sn, "t")) == {(1, 100): 1}
+    client.execute_sql(f"DELETE FROM t WHERE v = {U64_MAX}")
+    assert bag(scanned(client, "t")) == {(1, 100): 1}
 
     client.execute_sql(
-        f"INSERT INTO t VALUES (1, 1) ON CONFLICT (pk) DO UPDATE SET v = {U64_MAX}",
-        schema_name=sn)
-    assert bag(scanned(client, sn, "t")) == {(1, U64_MAX): 1}
-    client.execute_sql(f"UPDATE t SET v = {U64_MAX - 1}", schema_name=sn)
-    assert bag(scanned(client, sn, "t")) == {(1, U64_MAX - 1): 1}
+        f"INSERT INTO t VALUES (1, 1) ON CONFLICT (pk) DO UPDATE SET v = {U64_MAX}")
+    assert bag(scanned(client, "t")) == {(1, U64_MAX): 1}
+    client.execute_sql(f"UPDATE t SET v = {U64_MAX - 1}")
+    assert bag(scanned(client, "t")) == {(1, U64_MAX - 1): 1}

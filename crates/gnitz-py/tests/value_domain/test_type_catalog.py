@@ -55,31 +55,30 @@ _SPELLINGS = [
 ]
 
 
-def test_every_spelling_stores_as_its_type_code_in_a_payload_column(client, schema_name):
+def test_every_spelling_stores_as_its_type_code_in_a_payload_column(client):
     """One column per spelling, so a retyped spelling is a changed entry beside
     the others. The name rides along: a list with the right types in the wrong
     order would otherwise pass."""
     cols = [f"c{i}" for i in range(len(_SPELLINGS))]
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT UNSIGNED NOT NULL PRIMARY KEY, " +
-        ", ".join(f"{c} {sql}" for c, (sql, _, _) in zip(cols, _SPELLINGS)) + ")",
-        schema_name=schema_name)
+        ", ".join(f"{c} {sql}" for c, (sql, _, _) in zip(cols, _SPELLINGS)) + ")")
 
-    _, schema = client.resolve_table(schema_name, "t")
+    _, schema = client.resolve_table("t")
     assert [(c.name, c.type_code) for c in schema.columns[1:]] == \
         [(c, tc) for c, (_, tc, _) in zip(cols, _SPELLINGS)]
 
 
-def test_only_an_integer_scalar_may_be_a_key_column(client, schema_name):
+def test_only_an_integer_scalar_may_be_a_key_column(client):
     """A PK column keeps its declared type rather than widening to U64, so the
     key's stride is the declared width; a type that cannot be compared as raw
     bytes is refused at CREATE TABLE rather than at the first ingest."""
     for i, (sql, tc, pk_ok) in enumerate(_SPELLINGS):
         ddl = f"CREATE TABLE t{i} (pk {sql} NOT NULL PRIMARY KEY, v BIGINT NOT NULL)"
         if not pk_ok:
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql(ddl, schema_name=schema_name)
+            with pytest.raises(gnitz.GnitzRefusedError):
+                client.execute_sql(ddl)
             continue
-        client.execute_sql(ddl, schema_name=schema_name)
-        _, schema = client.resolve_table(schema_name, f"t{i}")
+        client.execute_sql(ddl)
+        _, schema = client.resolve_table(f"t{i}")
         assert schema.columns[schema.pk_indices[0]].type_code == tc, sql

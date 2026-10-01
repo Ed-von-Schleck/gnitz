@@ -7,15 +7,16 @@ read-only workload never does, so only the watchdog's reclaim wake — sent once
 the cursor crosses that threshold, to make the committer re-test it — can free
 it without a write.
 
-`tiny_sal_server`'s threshold is high enough that the pushes below stop short of
-it and only the reads cross it: with the watchdog removed, the read loops wedge.
+The `TINY_SAL` threshold is high enough that the pushes below stop short of it
+and only the reads cross it: with the watchdog removed, the read loops wedge.
 """
 import threading
 import time
 
 import gnitz
+import pytest
 from _read import bag
-from _serverproc import join_or_fail
+from _serverproc import TINY_SAL, join_or_fail, spawn
 
 # Most of the 15 MiB to the checkpoint threshold is bought with wide rows, which
 # is far cheaper than ~1 KB scan groups. Sized to stop short of the threshold: a
@@ -36,29 +37,29 @@ SAL_FULL_GRACE_S = 5.0
 _EXPECTED = {(1, 10): 1, (2, 20): 1, (3, 30): 1}
 
 
+@pytest.fixture
+def target(own_server):
+    return own_server.start(extra_env=TINY_SAL).target
+
+
 def _setup(client):
     """`t` with three rows to read back, and `filler` pre-loaded with the wide
-    rows that put the SAL write cursor just short of the checkpoint threshold."""
-    sn = "sal"
-    client.create_schema(sn)
+    rows that put the SAL write cursor just short of the checkpoint threshold.
+    Returns `t`'s id and schema."""
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
-        "grp BIGINT NOT NULL, val BIGINT NOT NULL, tag BIGINT NOT NULL)",
-        schema_name=sn)
+        "grp BIGINT NOT NULL, val BIGINT NOT NULL, tag BIGINT NOT NULL)")
     client.execute_sql(
-        "INSERT INTO t VALUES (1, 1, 10, 100), (2, 1, 20, 200), (3, 2, 30, 300)",
-        schema_name=sn)
+        "INSERT INTO t VALUES (1, 1, 10, 100), (2, 1, 20, 200), (3, 2, 30, 300)")
 
     schema = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
                            gnitz.ColumnDef("pad", gnitz.TypeCode.STRING)], [0])
-    filler = client.create_table(sn, "filler", schema)
+    filler = client.create_table("filler", schema)
     for lo in range(0, _FILL_ROWS, _FILL_BATCH):
-        batch = gnitz.ZSetBatch(schema)
-        for i in range(lo, lo + _FILL_BATCH):
-            batch.append(pk=i, pad=_FILL_PAD)
-        client.push(filler, batch)
+        client.push(filler, gnitz.ZSetBatch(schema).extend(
+            {"pk": i, "pad": _FILL_PAD} for i in range(lo, lo + _FILL_BATCH)))
 
-    return sn, client.resolve_table(sn, "t")
+    return client.resolve_table("t")
 
 
 def _rows(client, rel):
@@ -82,19 +83,13 @@ def _served(client, rel):
                 raise AssertionError(f"SAL never reclaimed: {e!r}") from e
 
 
-def _read_loop(target, rel, errors, keep_going):
-    """Scan `rel` on its own connection while `keep_going()`, recording the first
-    wrong answer, wedge or connection failure in `errors`. One `keep_going` tick
-    is one scan, never one attempt."""
-    try:
-        with gnitz.connect(target) as c:
-            while keep_going():
-                got = _served(c, rel)
-                if got != _EXPECTED:
-                    errors.append(f"wrong rows: {got}")
-                    return
-    except Exception as e:  # a wedge, or a dead master breaking the connection
-        errors.append(repr(e))
+def _read_loop(target, rel, keep_going):
+    """Scan `rel` on its own connection while `keep_going()`, raising on the
+    first wrong answer, wedge or connection failure. One `keep_going` tick is one
+    scan, never one attempt."""
+    with gnitz.connect(target) as c:
+        while keep_going():
+            assert _served(c, rel) == _EXPECTED
 
 
 def _counted(n):
@@ -103,7 +98,7 @@ def _counted(n):
     return lambda: next(remaining, None) is not None
 
 
-def test_concurrent_read_only_clients_survive_reclaim(tiny_sal_server):
+def test_concurrent_read_only_clients_survive_reclaim(own_server, target):
     """Reads alone, with no intervening write, across a reclaim cycle — from four
     independent connections, then a write that must still commit.
 
@@ -112,29 +107,22 @@ def test_concurrent_read_only_clients_survive_reclaim(tiny_sal_server):
     Per-request refusals under this much concurrency are legitimate and retried;
     the process surviving, no reader wedging, and the write landing are not.
     """
-    target, proc = tiny_sal_server
-    with gnitz.connect(target) as client:
-        sn, rel = _setup(client)
+    client = gnitz.connect(target)
+    rel = _setup(client)
 
-        errors = []
-        threads = [threading.Thread(daemon=True, target=_read_loop,
-                                    args=(target, rel, errors, _counted(SCANS // 4)))
-                   for _ in range(4)]
-        for t in threads:
-            t.start()
-        join_or_fail("reader thread hung — the SAL wedged", *threads)
+    join_or_fail("reader thread hung — the SAL wedged",
+                 *[spawn(_read_loop, target, rel, _counted(SCANS // 4)) for _ in range(4)])
 
-        assert proc.poll() is None, "master died under concurrent read-only load"
-        assert not errors, f"concurrent readers failed: {errors[:3]}"
-        assert _rows(client, rel) == _EXPECTED
+    assert own_server.proc.poll() is None, "master died under concurrent read-only load"
+    assert _rows(client, rel) == _EXPECTED
 
-        # The first write after a long read-only stretch used to hit a full SAL
-        # inside `flush_round` and `_exit(134)`.
-        client.execute_sql("INSERT INTO t VALUES (4, 2, 40, 400)", schema_name=sn)
-        assert _rows(client, rel) == _EXPECTED | {(4, 40): 1}
+    # The first write after a long read-only stretch used to hit a full SAL
+    # inside `flush_round` and `_exit(134)`.
+    client.execute_sql("INSERT INTO t VALUES (4, 2, 40, 400)")
+    assert _rows(client, rel) == _EXPECTED | {(4, 40): 1}
 
 
-def test_a_ddl_concurrent_with_reclaim_does_not_deadlock(tiny_sal_server):
+def test_a_ddl_concurrent_with_reclaim_does_not_deadlock(own_server, target):
     """Two CREATE VIEWs while the read loops hold the SAL past the checkpoint
     threshold. A checkpoint sequence the watchdog's reclaim wake starts must not
     run while a DDL holds the tick gate — its drain would wait on a tick the DDL
@@ -142,51 +130,28 @@ def test_a_ddl_concurrent_with_reclaim_does_not_deadlock(tiny_sal_server):
 
     Two of them, not one: the second DDL queues on the gate the first holds.
     """
-    target, proc = tiny_sal_server
-    with gnitz.connect(target) as client:
-        sn, rel = _setup(client)
+    client = gnitz.connect(target)
+    rel = _setup(client)
 
-        # Cross the threshold before the DDLs, so the watchdog sends reclaim wakes
-        # for the whole window. Counted, not slept: the crossing is a number of scan
-        # groups, which no machine speed can under-shoot.
-        errors = []
-        _read_loop(target, rel, errors, _counted(SCANS))
-        assert not errors, f"readers failed before the DDL: {errors[:3]}"
+    # Cross the threshold before the DDLs, so the watchdog sends reclaim wakes
+    # for the whole window. Counted, not slept: the crossing is a number of scan
+    # groups, which no machine speed can under-shoot.
+    _read_loop(target, rel, _counted(SCANS))
 
-        stop = threading.Event()
-        readers = [threading.Thread(daemon=True, target=_read_loop,
-                                    args=(target, rel, errors, lambda: not stop.is_set()))
-                   for _ in range(4)]
-        for t in readers:
-            t.start()
-        try:
-            ddl_errors = []
+    stop = threading.Event()
+    readers = [spawn(_read_loop, target, rel, lambda: not stop.is_set()) for _ in range(4)]
+    try:
+        def create_view(name, grp):
+            with gnitz.connect(target) as c:
+                c.execute_sql(f"CREATE VIEW {name} AS SELECT pk, val FROM t WHERE grp = {grp}")
 
-            def create_view(name, grp):
-                try:
-                    with gnitz.connect(target) as c:
-                        c.execute_sql(
-                            f"CREATE VIEW {name} AS SELECT pk, val FROM t "
-                            f"WHERE grp = {grp}", schema_name=sn)
-                except Exception as e:
-                    ddl_errors.append(repr(e))
+        join_or_fail(
+            "CREATE VIEW hung — a checkpoint ran while a DDL held the tick gate",
+            spawn(create_view, "v1", 1), spawn(create_view, "v2", 2))
+    finally:
+        stop.set()
+        join_or_fail("reader thread hung after the DDL", *readers)
 
-            ddls = [threading.Thread(daemon=True, target=create_view, args=("v1", 1)),
-                    threading.Thread(daemon=True, target=create_view, args=("v2", 2))]
-            for t in ddls:
-                t.start()
-            join_or_fail(
-                "CREATE VIEW hung — a checkpoint ran while a DDL held the tick gate",
-                *ddls)
-            assert not ddl_errors, f"CREATE VIEW failed: {ddl_errors}"
-        finally:
-            stop.set()
-            join_or_fail("reader thread hung after the DDL", *readers)
-
-        assert proc.poll() is None, "master died on a DDL concurrent with reclaim"
-        assert not errors, f"readers failed during the DDL: {errors[:3]}"
-
-        v1 = client.resolve_table(sn, "v1")
-        v2 = client.resolve_table(sn, "v2")
-        assert bag(client.scan(*v1), "pk", "val") == {(1, 10): 1, (2, 20): 1}
-        assert bag(client.scan(*v2), "pk", "val") == {(3, 30): 1}
+    assert own_server.proc.poll() is None, "master died on a DDL concurrent with reclaim"
+    assert bag(client.scan(*client.resolve_table("v1")), "pk", "val") == {(1, 10): 1, (2, 20): 1}
+    assert bag(client.scan(*client.resolve_table("v2")), "pk", "val") == {(3, 30): 1}

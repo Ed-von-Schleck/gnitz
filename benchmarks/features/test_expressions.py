@@ -25,35 +25,35 @@ def _e_row(batch, pk, w):
 _base_seed, _stream = seed_stream(_e_row)
 
 
-def _run(client, sn, bench_timer, view_ddl, sz):
-    client.execute_sql(_E_DDL, schema_name=sn)
-    client.execute_sql(view_ddl, schema_name=sn)
-    tid, schema = client.resolve_table(sn, "e")
+def _run(client, bench_timer, view_ddl, sz):
+    client.execute_sql(_E_DDL)
+    client.execute_sql(view_ddl)
+    tid, schema = client.resolve_table("e")
     push_stream(client, tid, schema, _base_seed, sz["base"])
-    stream_and_assert(client, sn, bench_timer, tid, schema, _stream, sz, "v")
+    stream_and_assert(client, bench_timer, tid, schema, _stream, sz, "v")
 
 
-def test_case(client, schema_name, bench_timer, scale_mode):
-    _run(client, schema_name, bench_timer,
+def test_case(client, bench_timer, scale_mode):
+    _run(client, bench_timer,
          "CREATE VIEW v AS SELECT pk AS id, "
          "CASE WHEN a > 10 THEN 1 WHEN a > 5 THEN 2 ELSE 0 END AS hi FROM e",
          feature_sz(scale_mode))
 
 
-def test_simple_case(client, schema_name, bench_timer, scale_mode):
-    _run(client, schema_name, bench_timer,
+def test_simple_case(client, bench_timer, scale_mode):
+    _run(client, bench_timer,
          "CREATE VIEW v AS SELECT pk AS id, "
          "CASE a WHEN 1 THEN 111 WHEN 2 THEN 222 ELSE 999 END AS m FROM e",
          feature_sz(scale_mode))
 
 
-def test_coalesce_nullif(client, schema_name, bench_timer, scale_mode):
-    _run(client, schema_name, bench_timer,
+def test_coalesce_nullif(client, bench_timer, scale_mode):
+    _run(client, bench_timer,
          "CREATE VIEW v AS SELECT pk AS id, COALESCE(b, 0) AS bz, NULLIF(a, 0) AS an FROM e",
          feature_sz(scale_mode))
 
 
-def test_mixed_arith(client, schema_name, bench_timer, scale_mode):
-    _run(client, schema_name, bench_timer,
+def test_mixed_arith(client, bench_timer, scale_mode):
+    _run(client, bench_timer,
          "CREATE VIEW v AS SELECT pk AS id, price * (1 - disc) AS net FROM e",
          feature_sz(scale_mode))

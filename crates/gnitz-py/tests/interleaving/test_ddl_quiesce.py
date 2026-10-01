@@ -26,26 +26,25 @@ _T = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, c BIGINT NOT NULL)"
     ([], "CREATE VIEW v2 AS SELECT a, COUNT(*) AS n FROM src GROUP BY a", [],
      ("v2", ("a", "n"), _PARKED_VIEW)),
 ], ids=["index-then-indexed-delete", "table-then-transactional-insert", "view-over-the-parked-source"])
-def test_a_ddl_during_an_in_flight_tick(seamed_server, before, ddl, after, read):
+def test_a_ddl_during_an_in_flight_tick(own_server, before, ddl, after, read):
     """The indexed DELETE needs the index on every worker; the transaction's COMMIT
     reports Ok even when a worker dropped its partition's share, so only the rows
     show it; and a view created over the parked source must neither miss nor
     double-count the parked rows. The view the parked tick was maintaining still
     holds every source row once."""
-    c = seamed_server({"GNITZ_INJECT_TICK_HOLD_FOR_DDL": "1"})
-    c.create_schema("s")
+    c = gnitz.connect(own_server.start(extra_env={"GNITZ_INJECT_TICK_HOLD_FOR_DDL": "1"}).target)
     for sql in [*before,
                 "CREATE TABLE src (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
                 "CREATE VIEW v AS SELECT a, COUNT(*) AS n FROM src GROUP BY a"]:
-        c.execute_sql(sql, schema_name="s")
+        c.execute_sql(sql)
     # The GROUP BY seeds an exchange, and a push crossing the tick-coalesce
     # threshold fires its tick before the push ACKs.
-    tid, schema = c.resolve_table("s", "src")
+    tid, schema = c.resolve_table("src")
     c.push(tid, gnitz.ZSetBatch(schema).extend([{"pk": i, "a": i % PARKED_GROUPS} for i in range(PARKED_ROWS)]))
 
     for sql in [ddl, *after]:
-        c.execute_sql(sql, schema_name="s")
+        c.execute_sql(sql)
 
     name, cols, want = read
-    assert bag(scanned(c, "s", name), *cols) == want
-    assert bag(scanned(c, "s", "v"), "a", "n") == _PARKED_VIEW
+    assert bag(scanned(c, name), *cols) == want
+    assert bag(scanned(c, "v"), "a", "n") == _PARKED_VIEW

@@ -15,6 +15,7 @@ and not as an extra row.
 from collections import Counter
 
 from _read import bag, scanned
+from _sql import churn
 
 
 def _set(vals):
@@ -112,23 +113,15 @@ _CHURN = [
 ]
 
 
-def test_a_cut_segment_answers_as_the_body_it_was_cut_from(client, schema_name):
+def test_a_cut_segment_answers_as_the_body_it_was_cut_from(client):
     """Every cut, every consumer and every name crossing a cut, checked after
     each epoch of a churn on both sources."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
         "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
-        + "; ".join(f"CREATE VIEW {name} AS {body}" for name, (body, _, _) in _VIEWS.items()),
-        schema_name=sn)
+        + "; ".join(f"CREATE VIEW {name} AS {body}" for name, (body, _, _) in _VIEWS.items()))
 
     state = {"t": {}, "u": {}}
-    for sql, table, changes in _CHURN:
-        client.execute_sql(sql, schema_name=sn)
-        for i, row in changes.items():
-            if row is None:
-                del state[table][i]
-            else:
-                state[table][i] = row
+    for sql in churn(client, state, _CHURN):
         for name, (_, cols, want) in _VIEWS.items():
-            assert bag(scanned(client, sn, name), *cols) == want(state["t"], state["u"]), (sql, name)
+            assert bag(scanned(client, name), *cols) == want(state["t"], state["u"]), (sql, name)

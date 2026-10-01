@@ -129,20 +129,20 @@ def run_pool(specs, *, timeout: float = 300.0) -> list[dict]:
     return parts
 
 
-def _rmw_worker(socket_path, sql, schema_name, ops, retry, barrier, queue):
+def _rmw_worker(socket_path, schema, sql, ops, retry, barrier, queue):
     """Child: run `ops` autocommit RMW statements, counting commits/conflicts."""
     import gnitz
 
     commits = retries = conflicts = 0
     latencies: list[float] = []
-    with gnitz.connect(socket_path) as c:
+    with gnitz.connect(socket_path, schema=schema) as c:
         barrier.wait()
         t0 = time.perf_counter()
         for _ in range(ops):
             start = time.perf_counter()
             while True:
                 try:
-                    c.execute_sql(sql, schema_name=schema_name)
+                    c.execute_sql(sql)
                     commits += 1
                     break
                 except gnitz.GnitzConflictError:
@@ -163,8 +163,8 @@ def _rmw_worker(socket_path, sql, schema_name, ops, retry, barrier, queue):
 
 def run_contended_rmw(
     socket_path: str,
+    schema: str,
     sql: str,
-    schema_name: str,
     n_clients: int,
     ops_per_client: int,
     *,
@@ -177,7 +177,7 @@ def run_contended_rmw(
     Returns {commits, retries, conflicts, latencies_ms, elapsed_s}.
     """
     parts = run_pool(
-        [(_rmw_worker, (socket_path, sql, schema_name, ops_per_client, retry)) for _ in range(n_clients)]
+        [(_rmw_worker, (socket_path, schema, sql, ops_per_client, retry)) for _ in range(n_clients)]
     )
     return {
         "commits": sum(r["commits"] for r in parts),
@@ -188,11 +188,11 @@ def run_contended_rmw(
     }
 
 
-def _htap_worker(socket_path, fn, duration_s, barrier, queue):
+def _htap_worker(socket_path, schema, fn, duration_s, barrier, queue):
     """Child: connect, sync, run `fn(conn, deadline)` for a wall-clock window."""
     import gnitz
 
-    with gnitz.connect(socket_path) as c:
+    with gnitz.connect(socket_path, schema=schema) as c:
         barrier.wait()
         deadline = time.perf_counter() + duration_s
         stats = fn(c, deadline)
@@ -201,6 +201,7 @@ def _htap_worker(socket_path, fn, duration_s, barrier, queue):
 
 def run_htap(
     socket_path: str,
+    schema: str,
     writer_fn,
     reader_fn,
     n_writers: int,
@@ -222,10 +223,10 @@ def run_htap(
     procs = []
     for _ in range(n_writers):
         procs.append(multiprocessing.Process(
-            target=_htap_worker, args=(socket_path, writer_fn, duration_s, barrier, wq)))
+            target=_htap_worker, args=(socket_path, schema, writer_fn, duration_s, barrier, wq)))
     for _ in range(n_readers):
         procs.append(multiprocessing.Process(
-            target=_htap_worker, args=(socket_path, reader_fn, duration_s, barrier, rq)))
+            target=_htap_worker, args=(socket_path, schema, reader_fn, duration_s, barrier, rq)))
     for p in procs:
         p.start()
     w_parts = [wq.get() for _ in range(n_writers)]

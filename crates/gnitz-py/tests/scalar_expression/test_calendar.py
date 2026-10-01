@@ -27,20 +27,19 @@ DATE, TS, I64 = gnitz.TypeCode.DATE, gnitz.TypeCode.TIMESTAMP, gnitz.TypeCode.I6
 
 
 @pytest.fixture
-def cal(client, schema_name):
+def cal(client):
     """Four rows chosen so every calendar edge is present at once: a leap day, a
     month end at the last microsecond, a Sunday in an ISO week belonging to the
     previous year paired with a pre-epoch timestamp, and an all-NULL row."""
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, d DATE, ts TIMESTAMP, "
-        "amt BIGINT NOT NULL)", schema_name=schema_name)
+        "amt BIGINT NOT NULL)")
     client.execute_sql(
         "INSERT INTO t VALUES "
         "(1, DATE '2024-02-29', TIMESTAMP '2024-02-29 13:45:07', 10), "
         "(2, DATE '2024-03-31', TIMESTAMP '2024-03-31 23:59:59.999999', 20), "
         "(3, DATE '2021-01-03', TIMESTAMP '1969-12-31 23:00:00', 30), "
-        "(4, NULL, NULL, 40)", schema_name=schema_name)
-    return schema_name
+        "(4, NULL, NULL, 40)")
 
 
 # Each function against its result type and its value on ids 1..4. Every one
@@ -85,24 +84,23 @@ def test_each_calendar_function_keeps_its_own_result_type(client, cal):
     — served alike by a maintained view and an ad-hoc read. A predicate parses
     its literal at the column's type, so a bare string and a typed literal
     select the same rows, including a BETWEEN, whose bounds parse separately."""
-    sn = cal
     select = "SELECT id, " + ", ".join(
         f"{e} AS c{n}" for n, e in enumerate(_FUNCTIONS)) + " FROM t"
-    client.execute_sql(f"CREATE VIEW v AS {select}", schema_name=sn)
+    client.execute_sql(f"CREATE VIEW v AS {select}")
 
-    declared = [c.type_code for c in client.resolve_table(sn, "v")[1].columns[1:]]
+    declared = [c.type_code for c in client.resolve_table("v")[1].columns[1:]]
     assert declared == [tc for tc, _ in _FUNCTIONS.values()]
 
     expected = {r: 1 for r in zip([1, 2, 3, 4], *(vs for _, vs in _FUNCTIONS.values()))}
-    assert bag(scanned(client, sn, "v")) == expected
-    assert bag(rows(client, sn, select)) == expected
+    assert bag(scanned(client, "v")) == expected
+    assert bag(rows(client, select)) == expected
 
     client.execute_sql(
         "CREATE VIEW recent AS SELECT id FROM t "
-        "WHERE ts >= TIMESTAMP '2024-03-01 00:00:00' OR d < '2022-01-01'", schema_name=sn)
-    assert bag(scanned(client, sn, "recent")) == {(2,): 1, (3,): 1}
-    assert bag(rows(client, sn, "SELECT id FROM t WHERE d = DATE '2024-02-29'")) == {(1,): 1}
-    assert bag(rows(client, sn, "SELECT COUNT(*) AS n FROM t "
+        "WHERE ts >= TIMESTAMP '2024-03-01 00:00:00' OR d < '2022-01-01'")
+    assert bag(scanned(client, "recent")) == {(2,): 1, (3,): 1}
+    assert bag(rows(client, "SELECT id FROM t WHERE d = DATE '2024-02-29'")) == {(1,): 1}
+    assert bag(rows(client, "SELECT COUNT(*) AS n FROM t "
                                 "WHERE d BETWEEN '2024-01-01' AND '2024-12-31'")) == {(2,): 1}
 
 
@@ -110,17 +108,15 @@ def test_a_truncation_used_as_a_group_key_maintains_its_buckets(client, cal):
     """DATE_TRUNC in a GROUP BY makes the bucket a computed key, so the reduce
     must re-derive it on every delta. The NULL row forms its own bucket — a
     grouping that dropped it would lose a row rather than mis-place one."""
-    sn = cal
     client.execute_sql(
         "CREATE VIEW bym AS SELECT DATE_TRUNC('month', d) AS month, SUM(amt) AS total, "
         "MIN(ts) AS first_ts, MAX(d) AS last_d, COUNT(*) AS n "
-        "FROM t GROUP BY DATE_TRUNC('month', d)", schema_name=sn)
-    types = {c.name: c.type_code for c in client.resolve_table(sn, "bym")[1].columns}
+        "FROM t GROUP BY DATE_TRUNC('month', d)")
+    types = {c.name: c.type_code for c in client.resolve_table("bym")[1].columns}
     assert (types["month"], types["first_ts"], types["last_d"]) == (DATE, TS, DATE)
 
     client.execute_sql(
-        "INSERT INTO t VALUES (5, DATE '2024-02-01', TIMESTAMP '2024-02-01 00:00:00', 5)",
-        schema_name=sn)
+        "INSERT INTO t VALUES (5, DATE '2024-02-01', TIMESTAMP '2024-02-01 00:00:00', 5)")
     cols = ("month", "total", "first_ts", "last_d", "n")
     unchanged = {
         (date(2024, 3, 1), 20, datetime(2024, 3, 31, 23, 59, 59, 999_999),
@@ -128,10 +124,10 @@ def test_a_truncation_used_as_a_group_key_maintains_its_buckets(client, cal):
         (date(2021, 1, 1), 30, datetime(1969, 12, 31, 23), date(2021, 1, 3), 1): 1,
         (None, 40, None, None, 1): 1,
     }
-    assert bag(scanned(client, sn, "bym"), *cols) == {
+    assert bag(scanned(client, "bym"), *cols) == {
         (date(2024, 2, 1), 15, datetime(2024, 2, 1), date(2024, 2, 29), 2): 1, **unchanged}
 
     # Retracting the February extremum re-derives that bucket from what is left.
-    client.execute_sql("DELETE FROM t WHERE id = 1", schema_name=sn)
-    assert bag(scanned(client, sn, "bym"), *cols) == {
+    client.execute_sql("DELETE FROM t WHERE id = 1")
+    assert bag(scanned(client, "bym"), *cols) == {
         (date(2024, 2, 1), 5, datetime(2024, 2, 1), date(2024, 2, 1), 1): 1, **unchanged}

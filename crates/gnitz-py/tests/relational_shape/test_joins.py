@@ -15,6 +15,7 @@ only where a spelling's rule differs by orientation (the USING merge keeps the
 from collections import Counter
 
 from _read import bag, scanned
+from _sql import churn
 
 # (statement, table, {pk: row}); a `None` row deletes the pk. Rows are
 # l: (k, x, y, lv), r: (x, y, name), c: (x, y, cv) under the key (k1, k2, k3).
@@ -44,7 +45,7 @@ _CHURN = [
 ]
 
 
-def test_a_delta_on_either_side_joins_the_other_sides_trace(client, schema_name):
+def test_a_delta_on_either_side_joins_the_other_sides_trace(client):
     """Whichever input an epoch's delta arrives on, it joins the *other* input's
     pre-epoch integral: insert, payload update, re-key and delete on each side in
     turn. `one` keys a plain column against the key region, with a TEXT payload
@@ -53,7 +54,6 @@ def test_a_delta_on_either_side_joins_the_other_sides_trace(client, schema_name)
     of its INT-to-BIGINT promoted slots from one column, so the scatter must mirror
     the trace packer slot for slot; and `wide` carries a three-column source PK as
     payload, whose tie-break siblings must maintain independently."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE l (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, x INT NOT NULL, "
         "y BIGINT NOT NULL, lv BIGINT NOT NULL); "
@@ -66,33 +66,27 @@ def test_a_delta_on_either_side_joins_the_other_sides_trace(client, schema_name)
         "CREATE VIEW two AS SELECT l.id AS lid, r.id AS rid FROM l JOIN r ON l.x = r.x AND l.y = r.y; "
         "CREATE VIEW twin AS SELECT l.id AS lid, r.id AS rid FROM l JOIN r ON l.x = r.x AND l.x = r.y; "
         "CREATE VIEW wide AS SELECT c.k1, c.k2, c.k3, c.cv, r.id AS rid "
-        "FROM c JOIN r ON c.x = r.x AND c.y = r.y", schema_name=sn)
+        "FROM c JOIN r ON c.x = r.x AND c.y = r.y")
 
     state = {"l": {}, "r": {}, "c": {}}
-    for sql, table, changes in _CHURN:
-        client.execute_sql(sql, schema_name=sn)
-        for pk, row in changes.items():
-            if row is None:
-                del state[table][pk]
-            else:
-                state[table][pk] = row
+    for sql in churn(client, state, _CHURN):
         l, r, c = state["l"], state["r"], state["c"]
 
-        assert bag(scanned(client, sn, "one"), "lid", "lv", "rid", "name") == {
+        assert bag(scanned(client, "one"), "lid", "lv", "rid", "name") == {
             (li, lv, ri, name): 1 for li, (k, _, _, lv) in l.items()
             for ri, (_, _, name) in r.items() if k == ri}, sql
-        assert bag(scanned(client, sn, "two"), "lid", "rid") == {
+        assert bag(scanned(client, "two"), "lid", "rid") == {
             (li, ri): 1 for li, (_, x, y, _) in l.items() for ri, (rx, ry, _) in r.items()
             if (x, y) == (rx, ry)}, sql
-        assert bag(scanned(client, sn, "twin"), "lid", "rid") == {
+        assert bag(scanned(client, "twin"), "lid", "rid") == {
             (li, ri): 1 for li, (_, x, _, _) in l.items() for ri, (rx, ry, _) in r.items()
             if x == rx == ry}, sql
-        assert bag(scanned(client, sn, "wide"), "k1", "k2", "k3", "cv", "rid") == {
+        assert bag(scanned(client, "wide"), "k1", "k2", "k3", "cv", "rid") == {
             (*key, cv, ri): 1 for key, (x, y, cv) in c.items() for ri, (rx, ry, _) in r.items()
             if (x, y) == (rx, ry)}, sql
 
 
-def test_every_spelling_of_one_join_compiles_to_one_graph(client, schema_name):
+def test_every_spelling_of_one_join_compiles_to_one_graph(client):
     """The key can arrive from an ON, from the WHERE above a keyless step, or
     from a USING, and none of them is a different graph. A WHERE equality over an
     INNER join is promoted to a second key where it can be one and stays a
@@ -103,7 +97,6 @@ def test_every_spelling_of_one_join_compiles_to_one_graph(client, schema_name):
     its range slot alone. A derived table, a set-op branch and a CTE bind their
     bodies through the same binder, and a merged USING column resolves in the
     grouped and DISTINCT tails as in a plain projection."""
-    sn = schema_name
     pairs = "SELECT t.id AS tid, u.id AS uid"
     spine = "SELECT t.id AS tid, u.id AS uid, c.id AS cid"
     client.execute_sql(
@@ -130,48 +123,41 @@ def test_every_spelling_of_one_join_compiles_to_one_graph(client, schema_name):
         "CREATE VIEW distinct_k AS SELECT DISTINCT k FROM t JOIN u USING (k); "
         f"CREATE VIEW spine_comma AS {spine} FROM t, u, c WHERE t.k = u.k AND u.j = c.j; "
         f"CREATE VIEW spine_explicit AS {spine} FROM t JOIN u ON t.k = u.k JOIN c ON u.j = c.j; "
-        f"CREATE VIEW spine_mixed AS {spine} FROM t JOIN u ON t.k = u.k, c WHERE u.j = c.j",
-        schema_name=sn)
+        f"CREATE VIEW spine_mixed AS {spine} FROM t JOIN u ON t.k = u.k, c WHERE u.j = c.j")
 
     t, u, c = {}, {}, {}
-    for sql, table, changes in [
-        ("INSERT INTO c VALUES (20, 5), (21, 6)", c, {20: 5, 21: 6}),
+    for sql in churn(client, {"t": t, "u": u, "c": c}, [
+        ("INSERT INTO c VALUES (20, 5), (21, 6)", "c", {20: 5, 21: 6}),
         ("INSERT INTO u VALUES (10, 1, 5, 7, 1.5, 5), (11, 2, 1, 9, 2.5, 6), (12, 2, 6, 8, 3.5, 5)",
-         u, {10: (1, 5, 7, 1.5, 5), 11: (2, 1, 9, 2.5, 6), 12: (2, 6, 8, 3.5, 5)}),
+         "u", {10: (1, 5, 7, 1.5, 5), 11: (2, 1, 9, 2.5, 6), 12: (2, 6, 8, 3.5, 5)}),
         # k=1 is one-to-one, k=2 one-to-many, and t(3) is a second row at k=1.
         ("INSERT INTO t VALUES (1, 1, 1, 7, 1.5), (2, 2, 2, 8, 2.5), (3, 1, 3, 7, 9.5)",
-         t, {1: (1, 1, 7, 1.5), 2: (2, 2, 8, 2.5), 3: (1, 3, 7, 9.5)}),
-        ("UPDATE t SET k = 2 WHERE id = 1", t, {1: (2, 1, 7, 1.5)}),
-        ("DELETE FROM u WHERE id = 12", u, {12: None}),
-    ]:
-        client.execute_sql(sql, schema_name=sn)
-        for pk, row in changes.items():
-            if row is None:
-                del table[pk]
-            else:
-                table[pk] = row
+         "t", {1: (1, 1, 7, 1.5), 2: (2, 2, 8, 2.5), 3: (1, 3, 7, 9.5)}),
+        ("UPDATE t SET k = 2 WHERE id = 1", "t", {1: (2, 1, 7, 1.5)}),
+        ("DELETE FROM u WHERE id = 12", "u", {12: None}),
+    ]):
         keyed = [(ti, ui) for ti, tr in t.items() for ui, ur in u.items() if tr[0] == ur[0]]
 
         for name in ("k_on", "k_global", "k_comma", "k_cross", "k_using", "k_derived", "k_cte"):
-            assert bag(scanned(client, sn, name), "tid", "uid") == dict.fromkeys(keyed, 1), (sql, name)
+            assert bag(scanned(client, name), "tid", "uid") == dict.fromkeys(keyed, 1), (sql, name)
         for name in ("kn_split", "kn_fused"):
-            assert bag(scanned(client, sn, name), "tid", "uid") == {
+            assert bag(scanned(client, name), "tid", "uid") == {
                 p: 1 for p in keyed if t[p[0]][2] == u[p[1]][2]}, (sql, name)
-        assert bag(scanned(client, sn, "kf_residual"), "tid", "uid") == {
+        assert bag(scanned(client, "kf_residual"), "tid", "uid") == {
             p: 1 for p in keyed if t[p[0]][3] == u[p[1]][3]}, sql
-        assert bag(scanned(client, sn, "range_comma"), "tid", "uid") == {
+        assert bag(scanned(client, "range_comma"), "tid", "uid") == {
             (ti, ui): 1 for ti, tr in t.items() for ui, ur in u.items() if tr[1] < ur[1]}, sql
-        assert bag(scanned(client, sn, "branch"), "x") == \
+        assert bag(scanned(client, "branch"), "x") == \
             Counter((ti,) for ti, _ in keyed) + Counter((ui,) for ui in u), sql
-        assert bag(scanned(client, sn, "grouped"), "k", "n") == {
+        assert bag(scanned(client, "grouped"), "k", "n") == {
             kn: 1 for kn in Counter(t[ti][0] for ti, _ in keyed).items()}, sql
-        assert bag(scanned(client, sn, "distinct_k"), "k") == {(t[ti][0],): 1 for ti, _ in keyed}, sql
+        assert bag(scanned(client, "distinct_k"), "k") == {(t[ti][0],): 1 for ti, _ in keyed}, sql
         for name in ("spine_comma", "spine_explicit", "spine_mixed"):
-            assert bag(scanned(client, sn, name), "tid", "uid", "cid") == {
+            assert bag(scanned(client, name), "tid", "uid", "cid") == {
                 (ti, ui, ci): 1 for ti, ui in keyed for ci, j in c.items() if u[ui][4] == j}, (sql, name)
 
 
-def test_natural_and_using_merge_each_shared_name_into_one(client, schema_name):
+def test_natural_and_using_merge_each_shared_name_into_one(client):
     """NATURAL keys on every name the two sides' *visible* columns share, so a
     pair agreeing on only some of them does not join; chained, a name the first
     step merged is already gone from the left, so it survives the chain once.
@@ -180,7 +166,6 @@ def test_natural_and_using_merge_each_shared_name_into_one(client, schema_name):
     under an outer join it carries the *preserved* side's copy, since an unmatched
     preserved row keeps a key of its own while the other copy is null-filled.
     Once a first step merged `k`, a third relation's `USING (k)` pairs with it."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE na (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL); "
         "CREATE TABLE nb (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL); "
@@ -199,8 +184,8 @@ def test_natural_and_using_merge_each_shared_name_into_one(client, schema_name):
         "CREATE VIEW three AS SELECT na.id AS ai, nc.id AS ci FROM na JOIN nb USING (k) JOIN nc USING (k); "
         "INSERT INTO l VALUES (1, 10), (2, 20); "
         "INSERT INTO r VALUES (7, 70), (8, 80), (9, 90); "
-        "INSERT INTO nc VALUES (1, 5, 9), (6, 6, 9)", schema_name=sn)
-    assert bag(scanned(client, sn, "product"), "x", "y") == {
+        "INSERT INTO nc VALUES (1, 5, 9), (6, 6, 9)")
+    assert bag(scanned(client, "product"), "x", "y") == {
         (x, y): 1 for x in (10, 20) for y in (70, 80, 90)}
 
     na = {1: (5, 9), 2: (6, 9), 3: (7, 9), 4: (8, 0)}
@@ -212,22 +197,22 @@ def test_natural_and_using_merge_each_shared_name_into_one(client, schema_name):
          "INSERT INTO nb VALUES (1, 5, 9), (2, 6, 9), (3, 0, 9), (5, 8, 1)", {}),
         ("UPDATE nb SET k = 7 WHERE id = 3", {3: (7, 9)}),
     ]:
-        client.execute_sql(sql, schema_name=sn)
+        client.execute_sql(sql)
         nb.update(changes)
 
-        assert bag(scanned(client, sn, "pair"), "id", "k", "v") == {
+        assert bag(scanned(client, "pair"), "id", "k", "v") == {
             (i, *kv): 1 for i, kv in na.items() if nb.get(i) == kv}, sql
-        chain = scanned(client, sn, "chain")
+        chain = scanned(client, "chain")
         assert bag(chain, "id", "k", "v") == {
             (i, *kv): 1 for i, kv in na.items() if nb.get(i) == kv == nc.get(i)}, sql
         assert all(set(row._fields) == {"id", "k", "v"} for row in chain), sql
-        assert bag(scanned(client, sn, "both_merged"), "aid", "bid", "merged", "right_k", "v") == {
+        assert bag(scanned(client, "both_merged"), "aid", "bid", "merged", "right_k", "v") == {
             (ai, bi, k, k, v): 1 for ai, (k, v) in na.items() for bi, bkv in nb.items()
             if bkv == (k, v)}, sql
         for name, pres, other in (("left_merged", na, nb), ("right_merged", nb, na)):
-            assert bag(scanned(client, sn, name), "pid", "merged", "oid") == Counter(
+            assert bag(scanned(client, name), "pid", "merged", "oid") == Counter(
                 (pi, pk, oi) for pi, (pk, _) in pres.items()
                 for oi in ([oi for oi, (ok, _) in other.items() if ok == pk] or [None])), (sql, name)
-        assert bag(scanned(client, sn, "three"), "ai", "ci") == Counter(
+        assert bag(scanned(client, "three"), "ai", "ci") == Counter(
             (ai, ci) for ai, (k, _) in na.items() for bk, _ in nb.values() if bk == k
             for ci, (ck, _) in nc.items() if ck == k), sql

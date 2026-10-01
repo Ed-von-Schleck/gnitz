@@ -18,6 +18,7 @@ import operator
 from collections import Counter
 
 from _read import bag, scanned
+from _sql import churn
 
 _ID = "SELECT uv.k AS k, uv.x AS x, b.id AS bid"
 
@@ -47,11 +48,10 @@ _MATCH = {
 }
 
 
-def test_each_join_kind_owes_a_weight_two_identity_its_own_weight(client, schema_name):
+def test_each_join_kind_owes_a_weight_two_identity_its_own_weight(client):
     """Two matches, one, and none, for every kind over one weight-2 identity
     that matches and one that never does; a kind keyed on b's PK sees one match,
     then none."""
-    sn = schema_name
     client.execute_sql(
         "CREATE TABLE s1 (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, x BIGINT NOT NULL); "
         "CREATE TABLE s2 (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, x BIGINT NOT NULL); "
@@ -64,22 +64,16 @@ def test_each_join_kind_owes_a_weight_two_identity_its_own_weight(client, schema
         # (5, 10) and (9, 99) each arrive from both branches.
         "INSERT INTO s1 VALUES (1, 5, 10), (2, 9, 99); "
         "INSERT INTO s2 VALUES (1, 5, 10), (2, 9, 99); "
-        "INSERT INTO l VALUES (1, 5, 9, 100), (2, 5, 9, 200)", schema_name=sn)
+        "INSERT INTO l VALUES (1, 5, 9, 100), (2, 5, 9, 200)")
     uv = {(5, 10): 2, (9, 99): 2}
 
     b = {}
-    for sql, changes in [
+    for sql in churn(client, b, [
         ("SELECT 1", {}),
         ("INSERT INTO b VALUES (5, 5, 50)", {5: (5, 50)}),
         ("INSERT INTO b VALUES (6, 5, 60)", {6: (5, 60)}),
         ("DELETE FROM b", {5: None, 6: None}),
-    ]:
-        client.execute_sql(sql, schema_name=sn)
-        for pk, row in changes.items():
-            if row is None:
-                del b[pk]
-            else:
-                b[pk] = row
+    ]):
 
         for name, (_, match, owes) in _KINDS.items():
             want = Counter()
@@ -92,8 +86,8 @@ def test_each_join_kind_owes_a_weight_two_identity_its_own_weight(client, schema
                 if (owes == "semi" and hits) or (owes == "anti" and not hits):
                     want[(k, x)] += w
             cols = ("k", "x") if owes in ("semi", "anti") else ("k", "x", "bid")
-            assert bag(scanned(client, sn, name), *cols) == want, (sql, name)
+            assert bag(scanned(client, name), *cols) == want, (sql, name)
 
         # Both `l` rows coincide on (k, kept) once `dropped` is pruned.
-        assert bag(scanned(client, sn, "pruned"), "kept", "y") == (
+        assert bag(scanned(client, "pruned"), "kept", "y") == (
             {(9, y): 2 for _, y in b.values()} if b else {(9, None): 2}), sql

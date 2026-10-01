@@ -21,15 +21,12 @@ from _read import bag, scanned
 
 
 @pytest.fixture(scope="module")
-def caps(module_schema):
-    """A schema with every base relation the sweeps read, seeded so each correct
-    answer is non-empty (a zero-row answer would make the invariant
+def caps(module_client):
+    """A connection holding every base relation the sweeps read, seeded so each
+    correct answer is non-empty (a zero-row answer would make the invariant
     unfalsifiable). Each sweep drops the view it creates, and no DML below
     changes a row, so every test sees the same data."""
-    conn, sn = module_schema
-
-    def sql(q):
-        conn.execute_sql(q, schema_name=sn)
+    sql = module_client.execute_sql
 
     sql("CREATE TABLE hg (pk BIGINT NOT NULL PRIMARY KEY, cat BIGINT NOT NULL)")
     sql("INSERT INTO hg VALUES (1, 1), (2, 1), (3, 2)")
@@ -54,7 +51,7 @@ def caps(module_schema):
     row1 = ", ".join(str(i) for i in range(64))
     row2 = ", ".join(str(i + 100) for i in range(64))
     sql(f"INSERT INTO w VALUES (1, {row1}), (2, {row2})")
-    return sn
+    return module_client
 
 
 # `(id, range spanning the limit, body for n, rows the correct answer holds)`.
@@ -91,39 +88,36 @@ _SWEEPS = [
 
 @pytest.mark.parametrize("ns,sql_for,expected_rows", [s[1:] for s in _SWEEPS],
                          ids=[s[0] for s in _SWEEPS])
-def test_a_view_never_compiles_to_silently_empty(client, caps, ns, sql_for, expected_rows):
+def test_a_view_never_compiles_to_silently_empty(caps, ns, sql_for, expected_rows):
     """Across a range spanning the limit, `CREATE VIEW` either errors naming a
     cap, or creates a view holding exactly the correct rows, each once."""
     outcomes = set()
     for n in ns:
         try:
-            client.execute_sql(f"CREATE VIEW v AS {sql_for(n)}", schema_name=caps)
-        except gnitz.GnitzError as e:
+            caps.execute_sql(f"CREATE VIEW v AS {sql_for(n)}")
+        except gnitz.GnitzRefusedError as e:
             assert names_a_cap(e), f"n={n}: rejection must name a limit, got: {e}"
             outcomes.add("error")
             continue
-        weights = list(bag(scanned(client, caps, "v")).values())
-        client.drop_view(caps, "v")
+        weights = list(bag(scanned(caps, "v")).values())
+        caps.drop_view("v")
         assert weights == [1] * expected_rows, f"n={n}: expected {expected_rows} rows at weight 1, got {weights}"
         outcomes.add("ok")
     assert outcomes == {"ok", "error"}, f"the sweep must span the limit — outcomes were {outcomes}"
 
 
-def test_a_dml_residual_crosses_the_same_cap_and_says_so(client, caps):
+def test_a_dml_residual_crosses_the_same_cap_and_says_so(caps):
     """A residual is compiled by the client and shipped as a blob, not built
     into a circuit, so it is a second path to the one cap. Both shapes are
     located rather than pinned: every size below the boundary is served, and the
     first one past it names the limit."""
-    sn = caps
-
     def update(n):
-        res = client.execute_sql(
-            f"UPDATE hg SET cat = 1 WHERE {conjunct_ladder('cat', n)}", schema_name=sn)
+        res = caps.execute_sql(f"UPDATE hg SET cat = 1 WHERE {conjunct_ladder('cat', n)}")
         assert res[0]["count"] == 2, f"n={n}: both cat=1 rows satisfy every conjunct"
 
     def delete_in(n):
         items = ", ".join(f"'x{i}'" for i in range(n))
-        client.execute_sql(f"DELETE FROM ts WHERE s IN ({items})", schema_name=sn)
+        caps.execute_sql(f"DELETE FROM ts WHERE s IN ({items})")
 
     first_rejected(update, range(12, 20))
     first_rejected(delete_in, range(28, 40))

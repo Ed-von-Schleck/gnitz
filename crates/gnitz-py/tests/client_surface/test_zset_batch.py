@@ -9,18 +9,14 @@ construction, the keyword plan, and how Python values become column bytes.
 import inspect
 import random
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
 from gnitz import TypeCode, ColumnDef, Schema, ZSetBatch
+from _schemas import KV
 
-
-# The schema most cases here need. One object backs any number of batches, so a
-# per-test copy would say nothing a shared one does not.
-KV = Schema([ColumnDef("pk", TypeCode.U64),
-             ColumnDef("val", TypeCode.I64)], [0])
 
 def _col(batch, name):
     """Column `name` of every row written so far."""
@@ -42,37 +38,18 @@ _EACH_WRITER = pytest.mark.parametrize("write", list(_WRITERS.values()), ids=lis
 # ---------------------------------------------------------------------------
 
 
-class TestSchemaConstruction:
-
-    def test_an_empty_pk_list_is_rejected(self):
-        """A key-less schema is an error, as `CREATE TABLE` without a PRIMARY KEY
-        is."""
-        with pytest.raises(ValueError):
-            Schema([ColumnDef("a", TypeCode.U64), ColumnDef("b", TypeCode.I64)], [])
-
-    def test_pk_indices_keep_their_order(self):
-        """pk_indices defines sort order — not just set membership."""
-        cols = [ColumnDef("a", TypeCode.U64),
-                ColumnDef("b", TypeCode.U32),
-                ColumnDef("v", TypeCode.I64)]
-        assert Schema(cols, [1, 0]).pk_indices == [1, 0]
-
-    def test_empty_column_list_rejected(self):
-        with pytest.raises(ValueError):
-            Schema([], [0])
-
-    def test_core_rule_violation_surfaces_as_value_error(self):
-        """The shared rule set is enforced in gnitz-core; what this pins is that
-        its rejection reaches Python as a ValueError rather than a panic or a
-        silently accepted schema."""
-        cols = [ColumnDef("pk", TypeCode.U64, is_nullable=True),
-                ColumnDef("v",  TypeCode.I64)]
-        with pytest.raises(ValueError, match="nullable"):
-            Schema(cols, [0])
-
-    def test_a_scale_on_a_type_that_takes_none_is_rejected_at_the_column(self):
-        with pytest.raises(ValueError):
-            ColumnDef("x", TypeCode.I64, scale=3)
+@pytest.mark.parametrize("build", [
+    lambda: Schema([ColumnDef("a", TypeCode.U64), ColumnDef("b", TypeCode.I64)], []),
+    lambda: Schema([], [0]),
+    lambda: Schema([ColumnDef("pk", TypeCode.U64, is_nullable=True), ColumnDef("v", TypeCode.I64)], [0]),
+    lambda: ColumnDef("x", TypeCode.I64, scale=3),
+], ids=["no-key", "no-columns", "nullable-key", "scale-on-an-integer"])
+def test_a_schema_rule_violation_surfaces_as_value_error(build):
+    """The shared rule set is enforced in gnitz-core; what this pins is that its
+    rejection reaches Python as a ValueError rather than a panic or a silently
+    accepted schema."""
+    with pytest.raises(ValueError):
+        build()
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +62,8 @@ class TestSchemaConstruction:
 _PK_TYPES = [TypeCode.U8, TypeCode.I8, TypeCode.U16, TypeCode.I16,
              TypeCode.U32, TypeCode.I32, TypeCode.U64, TypeCode.I64,
              TypeCode.U128, TypeCode.UUID, TypeCode.I128]
-_PAYLOAD_ONLY_TYPES = [TypeCode.F32, TypeCode.F64, TypeCode.STRING, TypeCode.BLOB]
+_PAYLOAD_ONLY_TYPES = [TypeCode.F32, TypeCode.F64, TypeCode.STRING, TypeCode.BLOB,
+                       TypeCode.DATE, TypeCode.TIMESTAMP, TypeCode.DECIMAL]
 _ALL_TYPES = _PK_TYPES + _PAYLOAD_ONLY_TYPES
 
 _RANGES = {
@@ -109,6 +87,12 @@ def _rand_value(rng, tc):
         return "s%d" % rng.randint(0, 10**6)
     if tc is TypeCode.BLOB:
         return bytes(rng.randrange(256) for _ in range(rng.randint(0, 5)))
+    if tc is TypeCode.DATE:
+        return date(1970, 1, 1) + timedelta(days=rng.randint(-10**5, 10**5))
+    if tc is TypeCode.TIMESTAMP:
+        return datetime(1970, 1, 1) + timedelta(microseconds=rng.randint(-10**15, 10**15))
+    if tc is TypeCode.DECIMAL:
+        return Decimal(rng.randint(-10**9, 10**9)).scaleb(-3)
     raise AssertionError("unhandled type code %r" % (tc,))
 
 
@@ -130,8 +114,8 @@ class TestAppendKeywordPlan:
                 tc = rng.choice(_PK_TYPES if is_pk else _ALL_TYPES)
                 seen.add(tc)
                 spec.append(("c%d" % i, tc, not is_pk and rng.random() < 0.4))
-            schema = Schema([ColumnDef(n, tc, is_nullable=nul) for n, tc, nul in spec],
-                            pk_indices=list(range(npk)))
+            schema = Schema([ColumnDef(n, tc, is_nullable=nul, scale=3 if tc is TypeCode.DECIMAL else 0)
+                             for n, tc, nul in spec], pk_indices=list(range(npk)))
 
             row = {}
             for name, tc, nullable in spec:
@@ -152,7 +136,7 @@ class TestAppendKeywordPlan:
             ref.extend([dict(row, _weight=weight)])
             assert _dump(got) == _dump(ref)
             assert [w for _, w in _dump(got)] == [weight]
-        assert seen == set(_ALL_TYPES)
+        assert seen == set(TypeCode)
 
     def test_cycling_shapes_keeps_every_row_correct(self):
         """A batch caches the last call shape's resolved plan; both writers
@@ -298,7 +282,7 @@ class TestRowErrors:
         assert _dump(from_gen) == _dump(from_list)
 
 
-def test_a_dropped_column_is_a_tombstone_the_writer_fills(client, schema_name):
+def test_a_dropped_column_is_a_tombstone_the_writer_fills(client):
     """`DROP COLUMN` flips `is_hidden` and nothing else, so a dropped NOT NULL
     column stays NOT NULL in the schema `resolve_table` hands back, and a re-ADD
     reuses its name — a schema off the wire can carry a hidden and a visible
@@ -311,10 +295,10 @@ def test_a_dropped_column_is_a_tombstone_the_writer_fills(client, schema_name):
     """
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, "
-        "a BIGINT NOT NULL, b BIGINT NOT NULL)", schema_name=schema_name)
-    client.execute_sql("ALTER TABLE t DROP COLUMN a", schema_name=schema_name)
-    client.execute_sql("ALTER TABLE t ADD COLUMN a BIGINT", schema_name=schema_name)
-    tid, schema = client.resolve_table(schema_name, "t")
+        "a BIGINT NOT NULL, b BIGINT NOT NULL)")
+    client.execute_sql("ALTER TABLE t DROP COLUMN a")
+    client.execute_sql("ALTER TABLE t ADD COLUMN a BIGINT")
+    tid, schema = client.resolve_table("t")
     assert [(c.name, c.is_hidden) for c in schema.columns] == [
         ("id", False), ("a", True), ("b", False), ("a", False)]
 

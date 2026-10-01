@@ -18,201 +18,143 @@ import pytest
 import gnitz
 from _read import bag, scanned
 from _schemas import KV
-from _serverproc import START_TIMEOUT, join_or_fail
+from _serverproc import MULTI, START_TIMEOUT, join_or_fail, spawn
 
 
 @pytest.fixture
-def checkpoint_client(checkpoint_server):
-    with gnitz.connect(checkpoint_server) as conn:
-        yield conn
+def target(own_server):
+    """Connect target of a server whose SAL checkpoints at 32 KB: a single push
+    of ~500 rows encodes to roughly 30-60 KB, so checkpoints fire repeatedly
+    during a test's own writes. Multi-worker, since an exchange is what a
+    checkpoint can strand."""
+    return own_server.start(workers=MULTI, extra_env={"GNITZ_CHECKPOINT_BYTES": str(32 * 1024)}).target
 
 
-def _setup(client, table="t"):
-    """A fresh schema holding `(pk, val)`, with the client-side schema for
-    pushing to it. Returns `(sn, tid, schema)`."""
-    sn = "ck"
-    client.create_schema(sn)
-    return sn, client.create_table(sn, table, KV), KV
-
-
-def _push_loop(client, tid, schema, errors, started, n_batches=12, batch_size=400):
-    """Flood `tid` to trigger checkpoints. Sets `started` after the first push
-    (and on failure, so waiters wake) and records any exception in `errors`."""
+def _flood(client, tid, started, n_batches=12, batch_size=400):
+    """Push `(pk, pk)` rows into `tid` to trigger checkpoints, setting `started`
+    after the first push — and on failure, so waiters wake."""
     try:
         for i in range(n_batches):
-            batch = gnitz.ZSetBatch(schema)
-            for j in range(batch_size):
-                pk = i * batch_size + j
-                batch.append(pk=pk, val=pk)
-            client.push(tid, batch)
-            if i == 0:
-                started.set()
-    except Exception as exc:
-        errors.append(("push", exc))
+            client.push(tid, gnitz.ZSetBatch(KV).extend(
+                {"pk": pk, "val": pk} for pk in range(i * batch_size, (i + 1) * batch_size)))
+            started.set()
+    finally:
         started.set()
 
 
-def _run(errors, *threads):
-    """Start every thread, join it against the hang ceiling, fail naming the one
-    that did not finish, then re-raise whatever any of them recorded."""
-    for t in threads:
-        t.start()
-    join_or_fail("a thread hung during a concurrent checkpoint", *threads)
-    assert not errors, f"a worker thread raised: {errors}"
+_HUNG = "a thread hung during a concurrent checkpoint"
 
 
-def test_a_view_tracks_its_base_across_frequent_checkpoints(checkpoint_client):
+def test_a_view_tracks_its_base_across_frequent_checkpoints(target):
     """15 000 rows exceeds TICK_COALESCE_ROWS (10 000), so ticks fire mid-sequence
     and a checkpoint lands between committed-but-unticked view deltas and the tick
     that would apply them. If the checkpoint's flush discards the workers'
     buffered deltas the base keeps the rows but no later tick ever reaches the
     view, which stays diverged until a restart rebuilds it. The scan barrier
     drains pending ticks, so both must show every row afterwards."""
-    client = checkpoint_client
-    sn, tid, schema = _setup(client)
-    client.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t", schema_name=sn)
+    client = gnitz.connect(target)
+    tid = client.create_table("t", KV)
+    client.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t")
 
     total = 15_000
     for base in range(0, total, 1_000):
-        batch = gnitz.ZSetBatch(schema)
-        for i in range(base, base + 1_000):
-            batch.append(pk=i, val=i)
-        client.push(tid, batch)
+        client.push(tid, gnitz.ZSetBatch(KV).extend({"pk": i, "val": i} for i in range(base, base + 1_000)))
 
     want = {(i, i): 1 for i in range(total)}
-    assert bag(scanned(client, sn, "t"), "pk", "val") == want, "rows lost at a checkpoint"
-    assert bag(scanned(client, sn, "v"), "pk", "val") == want, \
+    assert bag(scanned(client, "t"), "pk", "val") == want, "rows lost at a checkpoint"
+    assert bag(scanned(client, "v"), "pk", "val") == want, \
         "a checkpoint dropped buffered view deltas"
 
 
-def test_a_view_tracks_its_base_under_sustained_ingest_with_scans(checkpoint_server):
+def test_a_view_tracks_its_base_under_sustained_ingest_with_scans(target):
     """Sustained ingest in sub-tick batches crosses many checkpoints without the
     auto-tick firing per batch, so buffered view deltas routinely straddle one,
     while a second connection scans the view throughout — each scan draining
     pending ticks. Neither thread may hang and the view must still equal its base.
     """
-    with gnitz.connect(checkpoint_server) as pusher, \
-         gnitz.connect(checkpoint_server) as scanner:
-        sn, tid, schema = _setup(pusher)
-        pusher.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t", schema_name=sn)
-        vid, v_schema = pusher.resolve_table(sn, "v")
+    pusher, scanner = gnitz.connect(target), gnitz.connect(target)
+    tid = pusher.create_table("t", KV)
+    pusher.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t")
+    vid, v_schema = pusher.resolve_table("v")
 
-        n_batches, batch_size = 40, 300   # 300 < TICK_COALESCE_ROWS: no auto-tick
-        errors = []
-        started = threading.Event()
+    n_batches, batch_size = 40, 300   # 300 < TICK_COALESCE_ROWS: no auto-tick
+    started = threading.Event()
 
-        def scan_loop():
-            started.wait(timeout=START_TIMEOUT)
-            try:
-                for _ in range(30):
-                    scanner.scan(vid, v_schema)
-            except Exception as exc:
-                errors.append(("scan", exc))
+    def scan_loop():
+        started.wait(timeout=START_TIMEOUT)
+        for _ in range(30):
+            scanner.scan(vid, v_schema)
 
-        _run(errors,
-             threading.Thread(name="push", daemon=True, target=_push_loop,
-                              args=(pusher, tid, schema, errors, started),
-                              kwargs={"n_batches": n_batches, "batch_size": batch_size}),
-             threading.Thread(name="scan", daemon=True, target=scan_loop))
+    join_or_fail(_HUNG, spawn(_flood, pusher, tid, started, n_batches, batch_size), spawn(scan_loop))
 
-        want = {(i, i): 1 for i in range(n_batches * batch_size)}
-        assert bag(scanned(pusher, sn, "t"), "pk", "val") == want
-        assert bag(scanned(pusher, sn, "v"), "pk", "val") == want
+    want = {(i, i): 1 for i in range(n_batches * batch_size)}
+    assert bag(scanned(pusher, "t"), "pk", "val") == want
+    assert bag(scanned(pusher, "v"), "pk", "val") == want
 
 
 @pytest.mark.parametrize("probe", ["seek", "scan"])
-def test_a_fanout_read_does_not_hang_during_a_checkpoint(probe, checkpoint_server):
+def test_a_fanout_read_does_not_hang_during_a_checkpoint(probe, target):
     """A keyed read (routed to one worker) and a full read (fanned out) each
     write their own SAL group. Writing it without holding the SAL writer lets a request that
     arrives in the Flush ACK-wait window use the old epoch, which every worker
     skips — and the read never returns."""
-    with gnitz.connect(checkpoint_server) as pusher, \
-         gnitz.connect(checkpoint_server) as reader:
-        sn, filler, schema = _setup(pusher, "filler")
-        pusher.execute_sql(
-            "CREATE TABLE target (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name=sn)
-        pusher.execute_sql("INSERT INTO target VALUES (1, 10), (42, 999)",
-                           schema_name=sn)
-        target, target_schema = pusher.resolve_table(sn, "target")
+    pusher, reader = gnitz.connect(target), gnitz.connect(target)
+    filler = pusher.create_table("filler", KV)
+    pusher.execute_sql(
+        "CREATE TABLE read (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
+        "INSERT INTO read VALUES (1, 10), (42, 999)")
+    read, read_schema = pusher.resolve_table("read")
+    started = threading.Event()
 
-        errors = []
-        started = threading.Event()
+    def read_loop():
+        started.wait(timeout=START_TIMEOUT)
+        for _ in range(40):
+            if probe == "seek":
+                assert bag(reader.seek(read, read_schema, pk=42), "pk", "val") == {(42, 999): 1}
+            else:
+                assert bag(reader.scan(read, read_schema), "pk", "val") == {(1, 10): 1, (42, 999): 1}
 
-        def read_loop():
-            started.wait(timeout=START_TIMEOUT)
-            try:
-                for _ in range(40):
-                    if probe == "seek":
-                        assert bag(reader.seek(target, target_schema, pk=42), "pk", "val") == \
-                            {(42, 999): 1}
-                    else:
-                        assert bag(reader.scan(target, target_schema), "pk", "val") == \
-                            {(1, 10): 1, (42, 999): 1}
-            except Exception as exc:
-                errors.append((probe, exc))
-
-        _run(errors,
-             threading.Thread(name="push", daemon=True, target=_push_loop,
-                              args=(pusher, filler, schema, errors, started)),
-             threading.Thread(name=probe, daemon=True, target=read_loop))
+    join_or_fail(_HUNG, spawn(_flood, pusher, filler, started), spawn(read_loop))
 
 
-def test_a_unique_constraint_holds_under_checkpoint_pressure(checkpoint_server):
+def test_a_unique_constraint_holds_under_checkpoint_pressure(target):
     """The unique filter must be updated exactly once per durably committed
     batch, and no checkpoint may reset it. Inserts against a unique indexed column
     run while the SAL floods; afterwards every row must be visible and a duplicate
     must still be rejected — a lost or reset filter accepts it."""
-    with gnitz.connect(checkpoint_server) as pusher, \
-         gnitz.connect(checkpoint_server) as inserter:
-        sn, filler, schema = _setup(pusher, "filler")
-        inserter.execute_sql(
-            "CREATE TABLE unique_t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name=sn)
-        inserter.execute_sql("CREATE UNIQUE INDEX ON unique_t(val)", schema_name=sn)
+    pusher, inserter = gnitz.connect(target), gnitz.connect(target)
+    filler = pusher.create_table("filler", KV)
+    inserter.execute_sql(
+        "CREATE TABLE unique_t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
+        "CREATE UNIQUE INDEX ON unique_t(val)")
+    started = threading.Event()
+    n_rows = 50
 
-        errors = []
-        started = threading.Event()
-        n_rows = 50
+    def insert_loop():
+        started.wait(timeout=START_TIMEOUT)
+        for i in range(n_rows):
+            inserter.execute_sql(f"INSERT INTO unique_t VALUES ({i}, {i * 10})")
 
-        def insert_loop():
-            started.wait(timeout=START_TIMEOUT)
-            try:
-                for i in range(n_rows):
-                    inserter.execute_sql(f"INSERT INTO unique_t VALUES ({i}, {i * 10})",
-                                         schema_name=sn)
-            except Exception as exc:
-                errors.append(("insert", exc))
+    join_or_fail(_HUNG, spawn(_flood, pusher, filler, started), spawn(insert_loop))
 
-        _run(errors,
-             threading.Thread(name="push", daemon=True, target=_push_loop,
-                              args=(pusher, filler, schema, errors, started)),
-             threading.Thread(name="insert", daemon=True, target=insert_loop))
-
-        assert bag(scanned(inserter, sn, "unique_t"), "pk", "val") == {
-            (i, i * 10): 1 for i in range(n_rows)}
-        with pytest.raises(gnitz.GnitzError):
-            inserter.execute_sql(f"INSERT INTO unique_t VALUES ({n_rows + 1}, 0)",
-                                 schema_name=sn)
+    assert bag(scanned(inserter, "unique_t"), "pk", "val") == {(i, i * 10): 1 for i in range(n_rows)}
+    with pytest.raises(gnitz.GnitzIntegrityError, match="[Uu]nique index violation"):
+        inserter.execute_sql(f"INSERT INTO unique_t VALUES ({n_rows + 1}, 0)")
 
 
-def test_a_view_created_over_committed_data_survives_a_checkpoint_window(checkpoint_client):
+def test_a_view_created_over_committed_data_survives_a_checkpoint_window(target):
     """Enough rows to cross the checkpoint threshold — draining the unticked deltas —
     and then a CREATE of an exchange GROUP BY view whose only driver is the
     committed store. A flushed-snapshot under-count and a
-    checkpoint-strands-exchange regression both surface as a wrong result.
-    `checkpoint_server` also forces W >= 2; at one worker there is no exchange."""
-    conn = checkpoint_client
-    conn.create_schema("ckv")
+    checkpoint-strands-exchange regression both surface as a wrong result."""
+    conn = gnitz.connect(target)
     conn.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
-        "n BIGINT NOT NULL)", schema_name="ckv")
+        "n BIGINT NOT NULL)")
     n, chunk = 2000, 1000
     for base in range(0, n, chunk):
         conn.execute_sql(
             "INSERT INTO t VALUES " + ", ".join(
-                f"({i}, {i % 10}, {i})" for i in range(base, base + chunk)),
-            schema_name="ckv")
-    conn.execute_sql("CREATE VIEW v AS SELECT g, COUNT(*) AS c FROM t GROUP BY g",
-                     schema_name="ckv")
-    assert bag(scanned(conn, "ckv", "v"), "g", "c") == {(g, n // 10): 1 for g in range(10)}
+                f"({i}, {i % 10}, {i})" for i in range(base, base + chunk)))
+    conn.execute_sql("CREATE VIEW v AS SELECT g, COUNT(*) AS c FROM t GROUP BY g")
+    assert bag(scanned(conn, "v"), "g", "c") == {(g, n // 10): 1 for g in range(10)}

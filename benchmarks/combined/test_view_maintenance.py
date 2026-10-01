@@ -18,16 +18,15 @@ from helpers.vm_dag import (AMOUNT_MAX, DELETES_PER_ITER, SIZES, UPDATES_PER_ITE
                             seed, setup_views, status)
 
 
-def test_view_maintenance(client, schema_name, bench_timer, scale_mode):
+def test_view_maintenance(client, bench_timer, scale_mode):
     """Stream inserts (measured) + upsert-updates + retract-deletes via push()
     over the view DAG for a wall-clock window."""
-    sn = schema_name
     sz = SIZES[scale_mode]
     rng = random.Random(42)
-    setup_views(client, sn)
-    seed(client, sn, sz, rng)
+    setup_views(client)
+    seed(client, sz, rng)
 
-    fact_tid, fact_schema = client.resolve_table(sn, "fact_orders")
+    fact_tid, fact_schema = client.resolve_table("fact_orders")
     dim_rows, insert_rows = sz["DIM_ROWS"], sz["INSERT_ROWS"]
     fact_seed = sz["FACT_SEED"]
     next_pk = fact_seed + 1
@@ -56,4 +55,4 @@ def test_view_maintenance(client, schema_name, bench_timer, scale_mode):
         if del_pks:
             client.delete(fact_tid, fact_schema, del_pks)
 
-    assert len(client.scan(*client.resolve_table(sn, "v_rev"))) > 0, "v_rev empty"
+    assert len(client.scan(*client.resolve_table("v_rev"))) > 0, "v_rev empty"
