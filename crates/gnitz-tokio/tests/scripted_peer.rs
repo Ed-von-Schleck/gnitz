@@ -14,32 +14,34 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gnitz_core::{BatchAppender, ClientError, ScanReply, Schema, ZSetBatch, MAX_IN_FLIGHT};
+use gnitz_core::{BatchAppender, ClientError, ScanReply, Schema, ZSetBatch, MAX_IN_FLIGHT, MAX_QUEUED_BYTES};
 use gnitz_tokio::{AsyncClient, Connection};
 use gnitz_wire::control::{append_frame, peek_control_block, ControlHeader};
 use gnitz_wire::{frame_len_prefix, ColumnDef, ReadBound, ReadSpec, TypeCode, FRAME_LEN_PREFIX_BYTES};
-use support::submitted;
+use support::{settled, PATIENCE};
 use tokio::runtime::Runtime;
-
-/// How long anything that is on its way may take. Paid in full only by a
-/// regression, which then fails rather than hangs.
-const PATIENCE: Duration = Duration::from_secs(5);
 
 /// A key column and nothing else; the peer never checks a layout.
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::from_parts(vec![ColumnDef::new("k", TypeCode::U64, false)], vec![0]).unwrap())
 }
 
-/// A read of every row of `tid`.
-async fn scan(c: AsyncClient, tid: u64) -> Result<ScanReply, ClientError> {
-    c.scan_spec(tid, ReadSpec::all_rows(ReadBound::None), schema()).await
+/// `rows` keys at weight 1. A row is its key, its weight and its null word.
+fn batch(schema: &Schema, rows: usize) -> ZSetBatch {
+    let mut batch = ZSetBatch::new(schema);
+    let mut app = BatchAppender::new(&mut batch, schema);
+    for pk in 0..rows {
+        app.add_row(pk as u128, 1);
+    }
+    batch
 }
+const ROW_BYTES: usize = 24;
+/// Rows whose push no socket buffer holds.
+const BIG: usize = 200_000;
 
-/// `f`'s output. A verb or a driver left pending is the failure most of these
-/// tests look for.
-fn settled<F: Future>(rt: &Runtime, f: F) -> F::Output {
-    rt.block_on(async { tokio::time::timeout(PATIENCE, f).await })
-        .expect("resolves rather than hangs")
+/// A read of every row of `tid`.
+fn scan(c: &AsyncClient, tid: u64) -> impl Future<Output = Result<ScanReply, ClientError>> {
+    c.scan_spec(tid, &ReadSpec::all_rows(ReadBound::None), &schema())
 }
 
 /// A client connected to a peer that has answered its HELLO, and the peer's end.
@@ -79,26 +81,27 @@ fn write_frame(s: &mut UnixStream, payload: &[u8]) {
     s.write_all(payload).expect("frame payload");
 }
 
-/// Wait until `len` bytes are readable, consuming none. Reading a request out
-/// frees socket buffer, which signals writability to the driver afresh — the
-/// very readiness a test may need it to have kept on its own.
-fn await_unread(s: &UnixStream, len: usize) {
+/// How many of the next `len` bytes have arrived, consuming none. Reading a
+/// request out frees socket buffer, which signals writability to the driver
+/// afresh — the very readiness a test may need it to have kept on its own.
+fn unread(s: &UnixStream, len: usize) -> usize {
     let mut buf = vec![0u8; len];
+    // SAFETY: an open socket, and a buffer of `len` bytes.
+    let n = unsafe {
+        libc::recv(
+            s.as_raw_fd(),
+            buf.as_mut_ptr().cast(),
+            len,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    n.max(0) as usize
+}
+
+fn await_unread(s: &UnixStream, len: usize) {
     let deadline = Instant::now() + PATIENCE;
-    loop {
-        // SAFETY: an open socket, and a buffer of `len` bytes.
-        let n = unsafe {
-            libc::recv(
-                s.as_raw_fd(),
-                buf.as_mut_ptr().cast(),
-                len,
-                libc::MSG_PEEK | libc::MSG_DONTWAIT,
-            )
-        };
-        if n == len as isize {
-            return;
-        }
-        assert!(Instant::now() < deadline, "{n} of {len} bytes arrived");
+    while unread(s, len) < len {
+        assert!(Instant::now() < deadline, "{len} bytes never arrived");
         std::thread::sleep(Duration::from_millis(1));
     }
 }
@@ -132,43 +135,52 @@ fn a_submit_flushes_while_a_reply_is_outstanding() {
     let (client, conn, mut peer) = connect_to_peer(&rt);
     rt.spawn(conn);
 
-    let first = rt.spawn(scan(client.clone(), 1));
+    let first = scan(&client, 1);
     let len = read_len(&mut peer);
     // Nothing has been answered, and the first request still sits in the
     // socket. The second must leave anyway.
-    let second = rt.spawn(scan(client, 2));
+    let second = scan(&client, 2);
     await_unread(&peer, len + 1);
     peer.read_exact(&mut vec![0u8; len]).expect("the first request");
     assert_eq!(request(&mut peer), 2);
 
     reply(&mut peer, 1, 11);
     reply(&mut peer, 2, 22);
-    assert_eq!(settled(&rt, first).unwrap().unwrap().lsn, Some(11));
-    assert_eq!(settled(&rt, second).unwrap().unwrap().lsn, Some(22));
+    assert_eq!(settled(&rt, first).unwrap().lsn, Some(11));
+    assert_eq!(settled(&rt, second).unwrap().lsn, Some(22));
 }
 
-/// Past the in-flight cap a verb waits for a slot; the spine's own refusal at
-/// the cap never reaches one.
+/// Past either cap a verb waits; the spine's own refusal at the cap never
+/// reaches one.
 #[test]
-fn past_the_in_flight_cap_a_verb_waits() {
-    let rt = Runtime::new().unwrap();
-    let (client, conn, mut peer) = connect_to_peer(&rt);
-    rt.spawn(conn);
+fn past_a_cap_a_verb_waits() {
+    // Every push is submitted before the peer reads a byte: one-row pushes past
+    // the in-flight cap, and big ones past the queued-bytes cap by half again.
+    let past_queued_bytes = MAX_QUEUED_BYTES * 3 / 2 / (BIG * ROW_BYTES);
+    for (rows, pushes) in [(1, MAX_IN_FLIGHT + 100), (BIG, past_queued_bytes)] {
+        let rt = Runtime::new().unwrap();
+        let (client, conn, mut peer) = connect_to_peer(&rt);
+        rt.spawn(conn);
 
-    let total = MAX_IN_FLIGHT as u64 + 100;
-    let verbs: Vec<_> = (1..=total).map(|tid| rt.spawn(scan(client.clone(), tid))).collect();
-    // The cap's worth arrives and goes unanswered, which is what holds the rest
-    // back; they follow as the answers free slots.
-    let held: Vec<u64> = (0..MAX_IN_FLIGHT).map(|_| request(&mut peer)).collect();
-    for tid in held {
-        reply(&mut peer, tid, tid);
-    }
-    for _ in MAX_IN_FLIGHT as u64..total {
-        let tid = request(&mut peer);
-        reply(&mut peer, tid, tid);
-    }
-    for (tid, verb) in (1..=total).zip(verbs) {
-        assert_eq!(settled(&rt, verb).unwrap().unwrap().lsn, Some(tid));
+        let schema = schema();
+        let batch = batch(&schema, rows);
+        let pushes = pushes as u64;
+        let verbs: Vec<_> = (1..=pushes).map(|tid| client.push(tid, &schema, &batch)).collect();
+        // As many as may be in flight arrive and go unanswered, which is what
+        // holds the rest back; they follow as the answers free slots.
+        let held = pushes.min(MAX_IN_FLIGHT as u64);
+        for tid in 1..=held {
+            assert_eq!(request(&mut peer), tid);
+        }
+        for tid in 1..=pushes {
+            if tid > held {
+                assert_eq!(request(&mut peer), tid);
+            }
+            reply(&mut peer, tid, tid);
+        }
+        for (tid, verb) in (1..).zip(verbs) {
+            assert_eq!(settled(&rt, verb).unwrap(), tid);
+        }
     }
 }
 
@@ -183,13 +195,13 @@ fn a_refused_verb_reaches_no_wire() {
     let schema = schema();
     let mut keyless = ZSetBatch::new(&schema);
     keyless.weights.push(1);
-    let refused = settled(&rt, client.push(1, schema, keyless));
+    let refused = settled(&rt, client.push(1, &schema, &keyless));
     assert!(matches!(refused, Err(ClientError::Refused(_))), "{refused:?}");
 
-    let next = rt.spawn(scan(client, 2));
+    let next = scan(&client, 2);
     assert_eq!(request(&mut peer), 2, "the refused push was never written");
     reply(&mut peer, 2, 22);
-    assert_eq!(settled(&rt, next).unwrap().unwrap().lsn, Some(22));
+    assert_eq!(settled(&rt, next).unwrap().lsn, Some(22));
 }
 
 /// A lost connection fails every verb — one holding a slot, one the loss is
@@ -203,40 +215,41 @@ fn a_lost_connection_fails_every_verb_and_the_driver_still_ends() {
         let (client, conn, mut peer) = connect_to_peer(&rt);
         let driver = rt.spawn(conn);
 
-        let verbs: Vec<_> = (1..=outstanding)
-            .map(|tid| rt.spawn(scan(client.clone(), tid)))
-            .collect();
+        let verbs: Vec<_> = (1..=outstanding).map(|tid| scan(&client, tid)).collect();
         // Every one of them is on the wire, so each holds a slot when the peer goes.
         for _ in &verbs {
             request(&mut peer);
         }
         drop(peer);
 
-        let mut results: Vec<_> = verbs.into_iter().map(|v| settled(&rt, v).unwrap()).collect();
-        results.push(settled(&rt, scan(client.clone(), 9)));
-        results.push(settled(&rt, scan(client, 10)));
+        let mut results: Vec<_> = verbs.into_iter().map(|v| settled(&rt, v)).collect();
+        results.push(settled(&rt, scan(&client, 9)));
+        results.push(settled(&rt, scan(&client, 10)));
         for r in results {
             assert!(matches!(r, Err(ClientError::ConnectionLost(_))), "{r:?}");
         }
+        drop(client);
         settled(&rt, driver).unwrap();
     }
 }
 
-/// Dropping a submitted verb cancels nothing, and a driver whose handles are
-/// all gone still writes what it was handed and waits for the reply.
+/// Dropping a verb cancels nothing, and a driver whose handles are all gone
+/// still writes what it was handed and waits for the reply.
 #[test]
 fn a_dropped_verb_is_still_written() {
     let rt = Runtime::new().unwrap();
     let (client, conn, mut peer) = connect_to_peer(&rt);
-    // The verb owns the only handle, so both go here.
-    rt.block_on(async { drop(submitted(scan(client, 1)).await) });
+    drop(scan(&client, 1));
+    drop(client);
 
     let driver = rt.spawn(conn);
     assert_eq!(request(&mut peer), 1);
-    assert!(!driver.is_finished(), "a reply is owed");
     // Its result has nobody to go to, which is not an error.
     reply(&mut peer, 1, 11);
     settled(&rt, driver).unwrap();
+    // A clean end of stream: the driver took the reply before it closed, where
+    // closing over an unread one resets the connection.
+    assert_eq!(peer.read(&mut [0]).map_err(|e| e.kind()), Ok(0));
 }
 
 /// A driver dropped before its handles fails their verbs rather than leaving
@@ -247,12 +260,11 @@ fn a_dropped_driver_closes_every_verb() {
     let (client, conn, mut peer) = connect_to_peer(&rt);
     let driver = rt.spawn(conn);
 
-    let outstanding = rt.spawn(scan(client.clone(), 1));
+    let outstanding = scan(&client, 1);
     request(&mut peer);
     driver.abort();
-    assert!(settled(&rt, driver).unwrap_err().is_cancelled());
 
-    for r in [settled(&rt, outstanding).unwrap(), settled(&rt, scan(client, 2))] {
+    for r in [settled(&rt, outstanding), settled(&rt, scan(&client, 2))] {
         assert!(matches!(r, Err(ClientError::Closed)), "{r:?}");
     }
 }
@@ -286,30 +298,25 @@ fn a_waiting_driver_is_not_polled() {
         })
     };
 
-    let first = rt.spawn(scan(client.clone(), 1));
+    let first = scan(&client, 1);
     assert_eq!(request(&mut peer), 1);
     assert_waiting("a reply outstanding");
 
     reply(&mut peer, 1, 11);
-    settled(&rt, first).unwrap().unwrap();
+    settled(&rt, first).unwrap();
     assert_waiting("nothing in flight");
 
-    // Megabytes, to a peer that reads no further than the length prefix: the
-    // socket takes what it buffers and refuses the rest.
+    // To a peer that reads no further than the length prefix: the socket takes
+    // what it buffers and refuses the rest.
     let schema = schema();
-    let mut big = ZSetBatch::new(&schema);
-    let mut rows = BatchAppender::new(&mut big, &schema);
-    for pk in 0..200_000 {
-        rows.add_row(pk, 1);
-    }
-    let stuck = rt.spawn(async move { client.push(3, schema, big).await });
+    let stuck = client.push(3, &schema, &batch(&schema, BIG));
     let len = read_len(&mut peer);
-    assert!(len > 1 << 20, "{len} bytes may fit the socket buffer");
     assert_waiting("bytes the socket refused");
+    assert!(unread(&peer, len) < len, "the socket took the whole push");
 
     // The other half of clearing write readiness: the wakeup is not lost, so
     // the rest follows once the peer reads.
     peer.read_exact(&mut vec![0u8; len]).expect("the rest of the push");
     reply(&mut peer, 3, 33);
-    assert_eq!(settled(&rt, stuck).unwrap().unwrap(), 33);
+    assert_eq!(settled(&rt, stuck).unwrap(), 33);
 }

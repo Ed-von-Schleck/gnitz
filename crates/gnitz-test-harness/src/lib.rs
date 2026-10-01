@@ -17,9 +17,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(2);
 /// What the server logs once every listener is bound and published.
 const READY_MARKER: &str = "GnitzDB ready";
 
-/// Server binary plus the tmpdir's data/socket/stderr paths — the spawn inputs
-/// every entry point passes together.
-#[derive(Clone)]
+/// Server binary plus the tmpdir's data/socket/stderr paths: what a boot and a
+/// restart both spawn from.
 struct BootPaths {
     bin: String,
     data_dir: PathBuf,
@@ -84,8 +83,25 @@ impl ServerHandle {
         Self::start_inner(workers, &[], Some("127.0.0.1:0"), true)
     }
 
+    /// A missing binary panics rather than skips: a suite passing without a
+    /// server tests nothing.
     fn start_inner(workers: usize, extra_env: &[(&str, &str)], tls_listen: Option<&str>, mtls: bool) -> Self {
-        let scaffold = boot_scaffold();
+        let bin = env::var("GNITZ_SERVER_BIN")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../gnitz-server").to_string());
+        assert!(
+            PathBuf::from(&bin).is_file(),
+            "no server binary at {bin}: `make server` builds one (`make test` does it for you)"
+        );
+        let tmpdir = tempfile::Builder::new()
+            .prefix("gnitz_test_")
+            .tempdir()
+            .expect("failed to create tempdir");
+        let paths = BootPaths {
+            bin,
+            data_dir: tmpdir.path().join("data"),
+            sock_path: tmpdir.path().join("gnitz.sock"),
+            stderr_path: tmpdir.path().join("server_stderr.log"),
+        };
         let env: Vec<(String, String)> = extra_env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
 
         // Build the TLS argv. mTLS additionally mints a client CA + a
@@ -95,37 +111,24 @@ impl ServerHandle {
         if let Some(addr) = tls_listen {
             args.push(format!("--tls-listen={addr}"));
             if mtls {
-                let (ca, leaf_cert, leaf_key) = mint_client_ca_and_leaf(scaffold.tmpdir.path());
+                let (ca, leaf_cert, leaf_key) = mint_client_ca_and_leaf(tmpdir.path());
                 args.push(format!("--tls-client-ca={}", ca.display()));
                 mtls_client = Some((leaf_cert, leaf_key));
             }
         }
 
-        let process = match spawn_and_wait_ready(&scaffold.paths, workers, &env, &args) {
+        let process = match spawn_and_wait_ready(&paths, workers, &env, &args) {
             Ok(p) => p,
             Err(msg) => {
-                let kept = scaffold.tmpdir.keep();
+                let kept = tmpdir.keep();
                 panic!("{msg}\nartifacts preserved at: {}", kept.display());
             }
         };
 
-        Self::assemble(process, scaffold, workers, args, env, mtls_client)
-    }
-
-    /// A handle owning `scaffold`'s tmpdir, recording the boot spec
-    /// [`Self::restart`] replays.
-    fn assemble(
-        process: Child,
-        scaffold: BootScaffold,
-        workers: usize,
-        args: Vec<String>,
-        env: Vec<(String, String)>,
-        mtls_client: Option<(PathBuf, PathBuf)>,
-    ) -> Self {
         ServerHandle {
             process,
-            paths: scaffold.paths,
-            tmpdir: Some(scaffold.tmpdir),
+            paths,
+            tmpdir: Some(tmpdir),
             workers,
             args,
             env,
@@ -196,35 +199,6 @@ impl ServerHandle {
         self.process = spawn_and_wait_ready(&self.paths, self.workers, &self.env, &self.args)
             // ServerHandle::Drop preserves the tmpdir during the unwind.
             .unwrap_or_else(|msg| panic!("restart failed: {msg}"));
-    }
-}
-
-/// A server binary and a fresh tmpdir laid out for one server; the tmpdir is
-/// removed on drop unless a [`ServerHandle`] takes it.
-struct BootScaffold {
-    paths: BootPaths,
-    tmpdir: TempDir,
-}
-
-/// A missing binary panics rather than skips: a suite passing without a server
-/// tests nothing.
-fn boot_scaffold() -> BootScaffold {
-    let bin = env::var("GNITZ_SERVER_BIN")
-        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../gnitz-server").to_string());
-    assert!(
-        PathBuf::from(&bin).is_file(),
-        "no server binary at {bin}: `make server` builds one (`make test` does it for you)"
-    );
-    let tmpdir = tempfile::Builder::new()
-        .prefix("gnitz_test_")
-        .tempdir()
-        .expect("failed to create tempdir");
-    let data_dir = tmpdir.path().join("data");
-    let sock_path = tmpdir.path().join("gnitz.sock");
-    let stderr_path = tmpdir.path().join("server_stderr.log");
-    BootScaffold {
-        paths: BootPaths { bin, data_dir, sock_path, stderr_path },
-        tmpdir,
     }
 }
 

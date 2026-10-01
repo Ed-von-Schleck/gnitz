@@ -17,34 +17,30 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use gnitz_core::{
-    qualified_name, ClientError, GnitzClient, Interest, RelDescriptor, RelTarget, Reply, Request, ScanReply, Schema,
-    Session, SlotId, ZSetBatch,
+    qualified_name, ClientError, Encoded, GnitzClient, Interest, RelDescriptor, RelTarget, Reply, Request, ScanReply,
+    Schema, Session, SlotId, ZSetBatch,
 };
 use gnitz_wire::{ReadSpec, WireConflictMode};
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::sync::{mpsc, oneshot};
 
-/// Depth of the request channel. `MAX_IN_FLIGHT` is the real in-flight bound;
-/// this only keeps a burst from round-tripping through the scheduler.
-const REQUEST_CHANNEL_DEPTH: usize = 256;
-
-/// One request's encode step, deferred because `Request<'_>` borrows and the
-/// borrow ends at `submit`, while the session lives in the driver task. Named
-/// because `clippy::type_complexity` refuses it inline.
-type Encode = Box<dyn FnOnce(&mut Session) -> Result<SlotId, ClientError> + Send>;
-
 /// One request as it crosses the channel.
 struct Submission {
-    encode: Encode,
+    request: Encoded,
     reply: oneshot::Sender<Result<Reply, ClientError>>,
 }
 
 /// A channel sender, plus the blocking client every clone shares:
 /// `Send + Sync + Clone`. Every method takes `&self`, so sharing one
 /// is a clone.
+///
+/// Calling a wire verb encodes and submits it, so verbs reach the server in
+/// call order; the future it returns only waits for the reply. A request waits
+/// in the channel, encoded, while the connection is at one of
+/// [`Session::enqueue`]'s caps.
 #[derive(Clone)]
 pub struct AsyncClient {
-    tx: mpsc::Sender<Submission>,
+    tx: mpsc::UnboundedSender<Submission>,
     /// What the blocking client connects to.
     target: Arc<str>,
     /// The blocking client, `None` until the first
@@ -85,7 +81,7 @@ pub async fn connect(target: &str) -> Result<(AsyncClient, Connection), ClientEr
     // rather than a number the session may already have closed and the kernel
     // handed out again.
     let fd = AsyncFd::new(session.try_clone_fd()?)?;
-    let (tx, rx) = mpsc::channel(REQUEST_CHANNEL_DEPTH);
+    let (tx, rx) = mpsc::unbounded_channel();
     Ok((
         AsyncClient {
             tx,
@@ -102,71 +98,58 @@ pub async fn connect(target: &str) -> Result<(AsyncClient, Connection), ClientEr
 }
 
 impl AsyncClient {
-    /// Hand one request's encode step to the driver and wait for its reply.
-    async fn call(
-        &self,
-        encode: impl FnOnce(&mut Session) -> Result<SlotId, ClientError> + Send + 'static,
-    ) -> Result<Reply, ClientError> {
+    /// Hand one request to the driver; the future is its reply.
+    fn call<T>(&self, req: Request<'_>, narrow: fn(Reply) -> T) -> impl Future<Output = Result<T, ClientError>> {
         let (reply, rx) = oneshot::channel();
-        // A full channel suspends here: `Connection` drains only below
-        // `Session::at_capacity`, so back-pressure is a wait, never its error.
-        self.tx
-            .send(Submission { encode: Box::new(encode), reply })
-            .await
-            .map_err(|_| ClientError::Closed)?;
-        rx.await.map_err(|_| ClientError::Closed)?
+        match req.encode() {
+            // A driver that is gone drops the submission, and with it `reply`.
+            Ok(request) => {
+                let _ = self.tx.send(Submission { request, reply });
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+            }
+        }
+        async move { rx.await.map_err(|_| ClientError::Closed)?.map(narrow) }
     }
 
     /// Push a batch and resolve to its ingest LSN.
-    pub async fn push(&self, tid: u64, schema: Arc<Schema>, batch: ZSetBatch) -> Result<u64, ClientError> {
-        self.call(move |s| {
-            s.submit(Request::Push {
-                target_id: tid,
-                schema: &schema,
-                batch: &batch,
-                mode: WireConflictMode::Update,
-            })
-        })
-        .await
-        .map(|r| r.into_lsn())
+    pub fn push(&self, tid: u64, schema: &Schema, batch: &ZSetBatch) -> impl Future<Output = Result<u64, ClientError>> {
+        let mode = WireConflictMode::Update;
+        self.call(Request::Push { target_id: tid, schema, batch, mode }, Reply::into_lsn)
     }
 
     /// Read `tid` under `spec`, replied in `reply_schema`'s layout.
-    pub async fn scan_spec(
+    pub fn scan_spec(
         &self,
         tid: u64,
-        spec: ReadSpec,
-        reply_schema: Arc<Schema>,
-    ) -> Result<ScanReply, ClientError> {
-        self.call(move |s| {
-            s.submit(Request::ScanSpec {
-                target_id: tid,
-                spec: &spec,
-                reply_schema: &reply_schema,
-            })
-        })
-        .await
-        .map(|r| r.into_scan())
+        spec: &ReadSpec,
+        reply_schema: &Arc<Schema>,
+    ) -> impl Future<Output = Result<ScanReply, ClientError>> {
+        self.call(
+            Request::ScanSpec { target_id: tid, spec, reply_schema },
+            Reply::into_scan,
+        )
     }
 
     /// Snapshot N relations at one server-side SAL cut, in request order, each
     /// replied in the layout of the schema paired with it.
-    pub async fn scan_many(&self, relations: Vec<(u64, Arc<Schema>)>) -> Result<Vec<ScanReply>, ClientError> {
-        self.call(move |s| {
-            let rels: Vec<(u64, &Arc<Schema>)> = relations.iter().map(|(tid, schema)| (*tid, schema)).collect();
-            s.submit(Request::ScanMulti(&rels))
-        })
-        .await
-        .map(|r| r.into_multi())
+    pub fn scan_many(
+        &self,
+        relations: &[(u64, &Arc<Schema>)],
+    ) -> impl Future<Output = Result<Vec<ScanReply>, ClientError>> {
+        self.call(Request::ScanMulti(relations), Reply::into_multi)
     }
 
     /// Describe one relation. Always a round trip. On the surface because every
     /// other verb takes a `tid` and nothing else here can produce one.
-    pub async fn resolve(&self, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
+    pub fn resolve(
+        &self,
+        schema_name: &str,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<Arc<RelDescriptor>>, ClientError>> {
         let qname = qualified_name(schema_name, name);
-        self.call(move |s| s.submit(Request::Resolve(RelTarget::Name(&qname))))
-            .await
-            .map(Reply::into_resolve)
+        self.call(Request::Resolve(RelTarget::Name(&qname)), Reply::into_resolve)
     }
 
     /// Run `f` on a blocking thread against the handle's `GnitzClient`, which
@@ -188,7 +171,8 @@ impl AsyncClient {
         .await?
     }
 
-    /// [`Self::scan_spec`], answered off the copy when it holds `tid`.
+    /// [`Self::scan_spec`], answered off the copy when it holds `tid`. It waits
+    /// for the blocking client first, so it submits when polled, not when called.
     pub async fn scan_spec_local_first(
         &self,
         tid: u64,
@@ -198,7 +182,7 @@ impl AsyncClient {
         let mut slot = Arc::clone(&self.client).lock_owned().await;
         if !slot.as_ref().is_some_and(|c| c.mirrors(tid)) {
             drop(slot);
-            return self.scan_spec(tid, spec, reply_schema).await;
+            return self.scan_spec(tid, &spec, &reply_schema).await;
         }
         blocking(move || {
             slot.as_mut()
@@ -217,13 +201,12 @@ impl AsyncClient {
 /// A lost connection does not end it: every verb, outstanding or later,
 /// resolves [`ClientError::ConnectionLost`].
 ///
-/// Dropping a verb's future once it has submitted is not cancellation: the
-/// frame is written and the server commits it; the driver just drops a result
-/// nobody is left to receive.
+/// Dropping a verb's future is not cancellation: the frame is written and the
+/// server commits it; the driver just drops a result nobody is left to receive.
 pub struct Connection {
     session: Session,
     fd: AsyncFd<OwnedFd>,
-    rx: mpsc::Receiver<Submission>,
+    rx: mpsc::UnboundedReceiver<Submission>,
     /// Registered slots in submit order. A queue, not a map: the spine holds one
     /// accumulator — the head slot's — and registers a slot only after every
     /// fallible step has passed, so completion is strictly FIFO.
@@ -231,9 +214,9 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Encode every submission the channel holds; `true` when the last handle is
-    /// gone. At either of `submit`'s caps the channel is left unpolled — that is
-    /// what makes them back-pressure rather than the error `submit` raises — and
+    /// Enqueue every submission the channel holds; `true` when the last handle is
+    /// gone. At either of `enqueue`'s caps the channel is left unpolled — that is
+    /// what makes them back-pressure rather than the error `enqueue` raises — and
     /// queued bytes arm `write`, so the next step brings the loop back round.
     fn drain_channel(&mut self, cx: &mut Context<'_>) -> bool {
         while !self.session.at_capacity() {
@@ -246,11 +229,10 @@ impl Connection {
         false
     }
 
-    /// Run one submission's encode step and register its slot. A request the
-    /// spine refuses fails that one future and reaches no wire.
-    fn submit(&mut self, sub: Submission) {
-        let Submission { encode, reply } = sub;
-        match encode(&mut self.session) {
+    /// Enqueue one submission and register its slot. A request the spine
+    /// refuses fails that one future and reaches no wire.
+    fn submit(&mut self, Submission { request, reply }: Submission) {
+        match self.session.enqueue(request) {
             Ok(id) => self.pending.push_back((id, reply)),
             Err(e) => {
                 let _ = reply.send(Err(e));

@@ -28,6 +28,8 @@ fn table(target: &str) -> (GnitzClient, u64, Arc<Schema>) {
 /// Pushes and scans interleaved, all submitted before any is driven; every
 /// slot completes, every scan sees every push submitted ahead of it.
 fn concurrent_pushes_and_scans(target: &str) {
+    // Shown only if the test fails.
+    eprintln!("pipelining over {target}");
     let (mut blocking, tid, schema) = table(target);
     let mut s = Session::connect(target).unwrap();
     // Small socket buffers so the outbound queue is drained across several
@@ -75,14 +77,9 @@ fn concurrent_pushes_and_scans(target: &str) {
 }
 
 #[test]
-fn concurrent_pushes_and_scans_unix() {
-    let srv = ServerHandle::start_n(4);
-    concurrent_pushes_and_scans(srv.sock_path());
-}
-
-#[test]
-fn concurrent_pushes_and_scans_tls() {
+fn concurrent_pushes_and_scans_on_each_transport() {
     let srv = ServerHandle::start_tls(4);
+    concurrent_pushes_and_scans(srv.sock_path());
     concurrent_pushes_and_scans(&srv.tls_target());
 }
 
@@ -106,7 +103,7 @@ fn every_slot_up_to_the_cap_completes() {
 
 // ── Syscalls per operation ────────────────────────────────────────────────
 
-/// The child half of `three_syscalls_per_push_*`: pushes `GNITZ_SYSCALL_N`
+/// The child half of [`three_syscalls_per_push_on_each_transport`]: pushes `GNITZ_SYSCALL_N`
 /// small batches over the blocking client against `GNITZ_SYSCALL_TARGET` and
 /// exits. Run under `strace -f -c` by the parent; a no-op otherwise.
 #[test]
@@ -132,7 +129,8 @@ fn syscall_count_child() {
 /// Run the child under `strace -f -c` and count the socket syscalls it made:
 /// `writev` (the request), `poll` (the park) and the one read that takes
 /// header and payload together, per push, plus connect-time slack.
-fn count_syscalls(target: &str, tid: u64) {
+fn count_syscalls(target: &str) {
+    let (_client, tid, _schema) = table(target);
     let n = 1000usize;
     let Some(counts) = strace_test(
         "spine::syscall_count_child",
@@ -153,27 +151,20 @@ fn count_syscalls(target: &str, tid: u64) {
     let slack = 400;
     assert!(
         io <= 3 * n + slack,
-        "expected ≤ {} socket syscalls for {n} pushes, strace counted {io}:\n{}",
+        "expected ≤ {} socket syscalls for {n} pushes to {target}, strace counted {io}:\n{}",
         3 * n + slack,
         counts.report
     );
     assert!(
         counts.get("writev") >= n && counts.get("poll") >= n,
-        "each push is one writev and one poll:\n{}",
+        "each push to {target} is one writev and one poll:\n{}",
         counts.report
     );
 }
 
 #[test]
-fn three_syscalls_per_push_unix() {
-    let srv = ServerHandle::start();
-    let (_c, tid, _s) = table(srv.sock_path());
-    count_syscalls(srv.sock_path(), tid);
-}
-
-#[test]
-fn three_syscalls_per_push_tls() {
+fn three_syscalls_per_push_on_each_transport() {
     let srv = ServerHandle::start_tls(1);
-    let (_c, tid, _s) = table(&srv.tls_target());
-    count_syscalls(&srv.tls_target(), tid);
+    count_syscalls(srv.sock_path());
+    count_syscalls(&srv.tls_target());
 }

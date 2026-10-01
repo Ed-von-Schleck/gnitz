@@ -18,8 +18,8 @@ pub use client::{
     InlineUniqueIndex, ParkHook, PlannedView, ViewBundle, MAX_CHAIN_SEGMENTS, RMW_MAX_ATTEMPTS,
 };
 pub use connection::{
-    Completions, DeltaCursor, IdRun, Interest, RelDescriptor, RelTarget, Reply, Request, ScanReply, ScanResult,
-    Session, SlotId, MAX_IN_FLIGHT,
+    Completions, DeltaCursor, Encoded, IdRun, Interest, RelDescriptor, RelTarget, Reply, Request, ScanReply,
+    ScanResult, Session, SlotId, MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
 };
 pub use error::ClientError;
 pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult};

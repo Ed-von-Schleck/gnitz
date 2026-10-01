@@ -9,11 +9,11 @@ mod support;
 use std::ops::Range;
 use std::sync::Arc;
 
-use gnitz_core::{BatchAppender, GnitzClient, PkColumn, PollResult, Schema, ZSetBatch};
+use gnitz_core::{BatchAppender, ClientError, GnitzClient, PkColumn, PollResult, Schema, ZSetBatch};
 use gnitz_mirror::Mirror;
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
-use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, ViewProps, WireConflictMode};
-use support::submitted;
+use gnitz_wire::{read_i64_le, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, ViewProps, WireConflictMode};
+use support::settled;
 use tokio::runtime::Runtime;
 
 /// `(pk BIGINT, a BIGINT)`.
@@ -63,150 +63,140 @@ fn all_rows() -> ReadSpec {
 
 // ── Pipelining ────────────────────────────────────────────────────────────
 
-/// Many verbs in flight on one connection: each resolves to its own reply, and
-/// the server takes them in the order they were submitted.
-fn pipelined_verbs(target: &str) {
-    let (_blocking, tid, schema, sn) = table(target);
-    Runtime::new().unwrap().block_on(async {
-        let (client, conn) = gnitz_tokio::connect(target).await.expect("connect");
-        let driver = tokio::spawn(conn);
-
-        // Megabytes each way, so neither direction fits a socket buffer: writes
-        // resume after the socket refused them and replies span many reads.
-        let (n, per) = (40, 5_000);
-        let mut rounds = Vec::new();
-        for i in 0..n {
-            rounds.push((
-                submitted(client.push(tid, Arc::clone(&schema), rows(&schema, i * per..(i + 1) * per))).await,
-                submitted(client.scan_spec(tid, all_rows(), Arc::clone(&schema))).await,
-            ));
-        }
-        for (i, (push, scan)) in rounds.into_iter().enumerate() {
-            assert!(push.await.unwrap() > 0, "a push resolves to its ingest LSN");
-            assert_eq!(
-                unit_rows(&scan.await.unwrap().batch),
-                (i + 1) * per as usize,
-                "a scan sees exactly the pushes submitted ahead of it"
-            );
-        }
-
-        // A verb dropped after its submit is not cancelled: the server commits it.
-        let last = n * per;
-        drop(submitted(client.push(tid, Arc::clone(&schema), rows(&schema, last..last + 1))).await);
-        let total = last as usize + 1;
-
-        // Every kind of verb in flight together.
-        let key = PkColumn::from_natives(&schema, [7]);
-        let (one, many, found, missing) = tokio::join!(
-            client.scan_spec(
-                tid,
-                ReadSpec::all_rows(ReadBound::PkSet(key.keys())),
-                Arc::clone(&schema)
-            ),
-            client.scan_many(vec![(tid, Arc::clone(&schema)), (tid, Arc::clone(&schema))]),
-            client.resolve(&sn, "t"),
-            client.resolve(&sn, "nope"),
-        );
-        let one = one.unwrap().batch;
-        assert_eq!((unit_rows(&one), one.pks.get(&schema, 0)), (1, 7));
-        let many: Vec<usize> = many.unwrap().iter().map(|r| unit_rows(&r.batch)).collect();
-        assert_eq!(many, [total, total]);
-        let found = found.unwrap().expect("the table exists");
-        assert_eq!((found.tid, &found.schema), (tid, &schema));
-        assert!(missing.unwrap().is_none());
-
-        drop(client);
-        driver.await.unwrap();
-    });
-}
-
+/// Many verbs in flight on one connection, over each transport: each resolves
+/// to its own reply, and the server takes them in the order they were called.
 #[test]
-fn pipelined_verbs_unix() {
-    let srv = ServerHandle::start_n(4);
-    pipelined_verbs(srv.sock_path());
-}
-
-#[test]
-fn pipelined_verbs_tls() {
+fn pipelined_verbs() {
     let srv = ServerHandle::start_tls(4);
-    pipelined_verbs(&srv.tls_target());
+    for target in [srv.sock_path().to_string(), srv.tls_target()] {
+        // Shown only if the test fails.
+        eprintln!("pipelining over {target}");
+        let (_blocking, tid, schema, sn) = table(&target);
+        let (_, empty, ..) = table(&target);
+        settled(&Runtime::new().unwrap(), async {
+            let (client, conn) = gnitz_tokio::connect(&target).await.expect("connect");
+            let driver = tokio::spawn(conn);
+
+            // Megabytes each way, so neither direction fits a socket buffer: writes
+            // resume after the socket refused them and replies span many reads.
+            let (n, per) = (40, 5_000);
+            let rounds: Vec<_> = (0..n)
+                .map(|i| {
+                    (
+                        client.push(tid, &schema, &rows(&schema, i * per..(i + 1) * per)),
+                        client.scan_spec(tid, &all_rows(), &schema),
+                    )
+                })
+                .collect();
+            for (i, (push, scan)) in rounds.into_iter().enumerate() {
+                assert!(push.await.unwrap() > 0, "a push resolves to its ingest LSN");
+                assert_eq!(
+                    unit_rows(&scan.await.unwrap().batch),
+                    (i + 1) * per as usize,
+                    "a scan sees exactly the pushes called ahead of it"
+                );
+            }
+
+            // Every kind of verb in flight together, behind a push that replaces
+            // a row rather than adding to it.
+            let mut replaced = ZSetBatch::new(&schema);
+            BatchAppender::new(&mut replaced, &schema).add_row(7, 1).i64_val(-1);
+            let key = PkColumn::from_natives(&schema, [7]);
+            let (_, one, many, found, missing) = tokio::join!(
+                client.push(tid, &schema, &replaced),
+                client.scan_spec(tid, &ReadSpec::all_rows(ReadBound::PkSet(key.keys())), &schema),
+                client.scan_many(&[(tid, &schema), (empty, &schema)]),
+                client.resolve(&sn, "t"),
+                client.resolve(&sn, "nope"),
+            );
+            let one = one.unwrap().batch;
+            assert_eq!(unit_rows(&one), 1);
+            assert_eq!(
+                (one.pks.get(&schema, 0), read_i64_le(&one.payload[0].bytes, 0)),
+                (7, -1)
+            );
+            let many: Vec<usize> = many.unwrap().iter().map(|r| unit_rows(&r.batch)).collect();
+            assert_eq!(
+                many,
+                [(n * per) as usize, 0],
+                "one reply per relation, in request order"
+            );
+            let found = found.unwrap().expect("the table exists");
+            assert_eq!((found.tid, &found.schema), (tid, &schema));
+            assert!(missing.unwrap().is_none());
+
+            drop(client);
+            driver.await.unwrap();
+        });
+    }
 }
 
 // ── Syscalls per burst ────────────────────────────────────────────────────
 
-/// The child half of [`one_writev_per_burst`]: `GNITZ_TOKIO_N` pushes issued as
-/// one burst from one task on a `current_thread` runtime. Run under
-/// `strace -f -c` by the parent; a no-op otherwise.
+/// Pushes in the burst [`one_writev_per_burst`] counts.
+const BURST: i64 = 100;
+
+/// The child half of [`one_writev_per_burst`]: the burst, called before the
+/// driver is first polled. Run under `strace -f -c` by the parent; a no-op
+/// otherwise.
 #[test]
 fn syscall_count_child() {
-    let (Ok(target), Ok(tid), Ok(n)) = (
-        std::env::var("GNITZ_TOKIO_TARGET"),
-        std::env::var("GNITZ_TOKIO_TID"),
-        std::env::var("GNITZ_TOKIO_N"),
-    ) else {
+    let (Ok(target), Ok(tid)) = (std::env::var("GNITZ_TOKIO_TARGET"), std::env::var("GNITZ_TOKIO_TID")) else {
         return;
     };
     let tid: u64 = tid.parse().unwrap();
-    let n: i64 = n.parse().unwrap();
-    let schema = Arc::new(schema());
+    let schema = schema();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    rt.block_on(async move {
+    settled(&rt, async {
         let (client, conn) = gnitz_tokio::connect(&target).await.unwrap();
-        // One task beside the driver, so all N are submitted before the driver
-        // is polled again.
-        let burst = async move {
-            let mut pushes = Vec::new();
-            for pk in 0..n {
-                pushes.push(submitted(client.push(tid, Arc::clone(&schema), rows(&schema, pk..pk + 1))).await);
-            }
-            for push in pushes {
-                push.await.unwrap();
-            }
-            // The last handle goes, which is what lets the driver finish.
-        };
-        tokio::join!(conn, burst);
+        let pushes: Vec<_> = (0..BURST)
+            .map(|pk| client.push(tid, &schema, &rows(&schema, pk..pk + 1)))
+            .collect();
+        // The last handle goes, which is what lets the driver finish.
+        drop(client);
+        conn.await;
+        for push in pushes {
+            push.await.unwrap();
+        }
     });
 }
 
-/// A burst of N pushes issued together leaves in one `writev`, not N: the
+/// A burst of pushes called together leaves in one `writev`, not one each: the
 /// driver drains the whole channel before it steps.
 #[test]
 fn one_writev_per_burst() {
     let srv = ServerHandle::start();
     let (mut blocking, tid, schema, _sn) = table(srv.sock_path());
-    // Within tokio's per-poll budget: past it a submit suspends, and the burst
-    // legitimately leaves in more than one piece.
-    let n = 100;
     let Some(counts) = strace_test(
         "syscall_count_child",
         &[
             ("GNITZ_TOKIO_TARGET", srv.sock_path()),
             ("GNITZ_TOKIO_TID", &tid.to_string()),
-            ("GNITZ_TOKIO_N", &n.to_string()),
         ],
     ) else {
         eprintln!("strace not installed; skipping the syscall count");
         return;
     };
     let pushed = blocking.scan_spec(tid, &all_rows(), &schema).unwrap().batch;
-    assert_eq!(unit_rows(&pushed), n, "the traced child pushed its burst");
+    assert_eq!(unit_rows(&pushed), BURST as usize, "the traced child pushed its burst");
     // The transport writes the socket through `write_vectored`; plain `write`
     // is the harness's own stdout. One for the HELLO, one for the burst.
     assert_eq!(
         counts.sum(&["writev", "sendto", "sendmsg"]),
         2,
-        "the {n}-push burst did not leave in one writev:\n{}",
+        "the {BURST}-push burst did not leave in one writev:\n{}",
         counts.report
     );
 }
 
 // ── The shared blocking client ────────────────────────────────────────────
 
-/// Every clone drives one blocking client, one call at a time, and a
-/// local-first read routes on what that client mirrors.
+/// Every clone drives one blocking client, one call at a time, which outlives
+/// a call that panics; and a local-first read routes on what that client
+/// mirrors.
 #[test]
 fn clones_share_one_blocking_client() {
     let srv = ServerHandle::start_n(4);
@@ -224,7 +214,7 @@ fn clones_share_one_blocking_client() {
     };
     push_and_tick(0..50);
 
-    Runtime::new().unwrap().block_on(async {
+    settled(&Runtime::new().unwrap(), async {
         let (client, conn) = gnitz_tokio::connect(srv.sock_path()).await.expect("connect");
         let driver = tokio::spawn(conn);
         {
@@ -249,9 +239,7 @@ fn clones_share_one_blocking_client() {
                 .expect("mirror the view");
             assert_eq!(mirrored.view_id, vid);
 
-            // Two clones polling at once. One whole advance runs under one lock,
-            // so they serialize instead of both fetching the same interval and
-            // both applying it, which would leave every new row at weight 2.
+            // Two clones polling at once: the second waits for the first's lock.
             push_and_tick(50..100);
             let (a, b) = (client.clone(), client.clone());
             let (polled_a, polled_b) = tokio::join!(
@@ -261,14 +249,32 @@ fn clones_share_one_blocking_client() {
             for outcome in polled_a.unwrap().into_iter().chain(polled_b.unwrap()) {
                 assert!(matches!(outcome.result, PollResult::Advanced), "{outcome:?}");
             }
+
+            // A panic in a call resumes on its caller and takes neither the lock
+            // nor the client with it: the reads below still find the copy.
+            let panicking = client.clone();
+            let panicked = tokio::spawn(async move {
+                let boom = |_: &mut GnitzClient| -> Result<(), ClientError> { panic!("inside the blocking call") };
+                panicking.with_blocking_client(boom).await
+            });
+            assert!(panicked.await.unwrap_err().is_panic());
+
+            let sent = || client.with_blocking_client(|c| Ok(c.requests_sent()));
+            let before = sent().await.unwrap();
             let local = read(vid).await.unwrap();
             assert!(local.lsn.is_none(), "a local answer carries no served LSN");
             assert_eq!(unit_rows(&local.batch), 100);
 
-            // A relation the copy does not hold still reads, over the wire.
+            // A relation the copy does not hold still reads, over the driver's
+            // connection rather than the blocking client's.
             let unheld = read(tid).await.unwrap();
             assert!(unheld.lsn.is_some(), "a delegated read carries the server's LSN");
             assert_eq!(unit_rows(&unheld.batch), 100);
+            assert_eq!(
+                sent().await.unwrap(),
+                before,
+                "neither read went through the blocking client"
+            );
         }
         drop(client);
         driver.await.unwrap();

@@ -34,7 +34,7 @@ pub const MAX_IN_FLIGHT: usize = 4096;
 /// memory on its own. Checked before queueing, so one frame up to the peer's
 /// egress limit always goes through — what it bounds is a driver that submits
 /// without flushing.
-pub(crate) const MAX_QUEUED_BYTES: usize = 64 << 20;
+pub const MAX_QUEUED_BYTES: usize = 64 << 20;
 
 /// One relation's read result. `lsn` is the server LSN the read was served
 /// at; a read answered off a mirrored copy has none.
@@ -156,7 +156,7 @@ pub struct SlotId(u64);
 
 /// One request, cut where the encoding or the decoding differs rather than
 /// where the verb names do. It borrows its inputs; the borrow ends at
-/// `submit`, which encodes there and then.
+/// [`Request::encode`].
 pub enum Request<'a> {
     /// An id allocation. Completes as [`Reply::Id`].
     Alloc(IdRun),
@@ -186,6 +186,131 @@ pub enum Request<'a> {
     /// SCAN_MULTI: every row of N relations at one cut, each replied in the
     /// layout of the schema paired with it.
     ScanMulti(&'a [(u64, &'a Arc<Schema>)]),
+}
+
+/// A [`Request`] validated and encoded, with how its reply decodes. Built
+/// without a session, so a driver whose session lives on another task encodes
+/// where the request's borrows do.
+pub struct Encoded {
+    frame: Vec<u8>,
+    kind: SlotKind,
+}
+
+impl Encoded {
+    /// A frame past the ceiling is refused here rather than by the server's
+    /// ingress cap, which would drop the connection.
+    fn new(frame: Vec<u8>, kind: SlotKind) -> Result<Self, ClientError> {
+        let total = frame.len();
+        let limit = gnitz_wire::MAX_FRAME_PAYLOAD;
+        if total > limit {
+            return Err(ClientError::from(format!(
+                "request frame is {total} bytes, exceeding the {limit}-byte server ingress cap; \
+                 split the request"
+            )));
+        }
+        Ok(Encoded { frame, kind })
+    }
+}
+
+impl Request<'_> {
+    /// Validate and encode, for [`Session::enqueue`].
+    pub fn encode(self) -> Result<Encoded, ClientError> {
+        let (frame, kind) = match self {
+            Request::Alloc(run) => {
+                let (target_id, verb, count) = match run {
+                    IdRun::Ids(n) => (0, ClientVerb::AllocIds, n),
+                    IdRun::Serial { table_id, count } => (table_id, ClientVerb::AllocSerialRange, count),
+                };
+                let hdr = ControlHeader {
+                    flags: WireFlags { verb, ..Default::default() },
+                    target_id,
+                    arg1: count,
+                    ..Default::default()
+                };
+                (encode_frame(hdr, &[], None, None), SlotKind::Alloc)
+            }
+            Request::DdlTxn(families) => {
+                for (tid, batch) in families {
+                    if gnitz_wire::sys_family_index(*tid).is_none() {
+                        return Err(ClientError::from(format!("DDL family {tid} is not a system table")));
+                    }
+                    batch.validate(sys_schema(*tid))?;
+                }
+                (encode_ddl_txn(families), SlotKind::Commit)
+            }
+            Request::PushTxn { families } => {
+                for f in families {
+                    f.batch.validate(f.schema)?;
+                }
+                (encode_push_txn(families), SlotKind::Commit)
+            }
+            Request::Resolve(target) => {
+                // The wire lets the name win over the id, so the name rides the blob.
+                let (target_id, qname) = match target {
+                    RelTarget::Name(q) => (0, q),
+                    RelTarget::Id(tid) => (tid, ""),
+                };
+                let hdr = ControlHeader {
+                    flags: WireFlags {
+                        verb: ClientVerb::Resolve,
+                        ..Default::default()
+                    },
+                    target_id,
+                    ..Default::default()
+                };
+                (encode_frame(hdr, qname.as_bytes(), None, None), SlotKind::Resolve)
+            }
+            Request::Push { target_id, schema, batch, mode } => {
+                // In-process, so a convenience and never a trust boundary; the
+                // server checks the same things. Here so no driver has to
+                // remember to.
+                batch.validate(schema)?;
+                // The push verb marks the frame as a push independent of data
+                // presence, so an empty batch (a legitimate empty Z-set delta)
+                // is ACKed as a no-op push instead of being mistaken for a scan.
+                let flags = WireFlags {
+                    verb: ClientVerb::Push,
+                    conflict_mode: mode,
+                    ..Default::default()
+                };
+                let hdr = ControlHeader { flags, target_id, ..Default::default() };
+                (
+                    encode_frame(hdr, &[], Some(&schema.to_block()), Some(batch)),
+                    SlotKind::Push { tid: target_id },
+                )
+            }
+            Request::ScanSpec { target_id, spec, reply_schema } => {
+                let hdr = ControlHeader {
+                    flags: WireFlags {
+                        verb: ClientVerb::ScanSpec,
+                        ..Default::default()
+                    },
+                    target_id,
+                    arg0: reply_schema.layout_digest(),
+                    ..Default::default()
+                };
+                (
+                    encode_frame(hdr, &spec.encode(), None, None),
+                    SlotKind::ScanSpec {
+                        tid: target_id,
+                        reply_schema: Arc::clone(reply_schema),
+                    },
+                )
+            }
+            Request::ScanMulti(rels) => {
+                let items: Vec<txn_frame::ScanMultiItem> = rels
+                    .iter()
+                    .map(|&(tid, schema)| txn_frame::ScanMultiItem {
+                        tid,
+                        reply_layout: schema.layout_digest(),
+                    })
+                    .collect();
+                let rels = rels.iter().map(|&(tid, schema)| (tid, Arc::clone(schema))).collect();
+                (txn_frame::encode_scan_multi(&items), SlotKind::Multi { rels })
+            }
+        };
+        Encoded::new(frame, kind)
+    }
 }
 
 /// A run of ids from one server-side sequence.
@@ -294,7 +419,7 @@ fn wrong_shape(got: &'static str, want: &'static str) -> ! {
 pub type Completions = Vec<(SlotId, Result<Reply, ClientError>)>;
 
 /// How a slot decodes its reply and what that reply becomes, read off the
-/// `Request` variant at `submit`.
+/// `Request` variant at [`Request::encode`].
 enum SlotKind {
     Push {
         tid: u64,
@@ -441,10 +566,14 @@ impl Session {
 
     // ── The spine ──────────────────────────────────────────────────────────
 
-    /// Encode, enqueue, register a slot.
-    /// Raises past the in-flight cap. `Request` borrows its inputs; the borrow
-    /// ends here, because encoding is what `submit` does.
+    /// Encode, enqueue, register a slot. `Request` borrows its inputs; the
+    /// borrow ends here.
     pub fn submit(&mut self, req: Request<'_>) -> Result<SlotId, ClientError> {
+        self.enqueue(req.encode()?)
+    }
+
+    /// Queue an encoded request and open its slot. Raises at either cap.
+    pub fn enqueue(&mut self, req: Encoded) -> Result<SlotId, ClientError> {
         self.check_open()?;
         // The predicate a driver reads for back-pressure, so the two can never
         // disagree; only the message re-derives which cap was hit.
@@ -456,136 +585,29 @@ impl Session {
                 format!("connection has {queued} unwritten bytes queued, at the {MAX_QUEUED_BYTES}-byte cap")
             }));
         }
-        let (frame, kind) = match req {
-            Request::Alloc(run) => {
-                let (target_id, verb, count) = match run {
-                    IdRun::Ids(n) => (0, ClientVerb::AllocIds, n),
-                    IdRun::Serial { table_id, count } => (table_id, ClientVerb::AllocSerialRange, count),
-                };
-                let hdr = ControlHeader {
-                    flags: WireFlags { verb, ..Default::default() },
-                    target_id,
-                    arg1: count,
-                    ..Default::default()
-                };
-                (encode_frame(hdr, &[], None, None), SlotKind::Alloc)
-            }
-            Request::DdlTxn(families) => {
-                for (tid, batch) in families {
-                    if gnitz_wire::sys_family_index(*tid).is_none() {
-                        return Err(ClientError::from(format!("DDL family {tid} is not a system table")));
-                    }
-                    batch.validate(sys_schema(*tid))?;
-                }
-                (encode_ddl_txn(families), SlotKind::Commit)
-            }
-            Request::PushTxn { families } => {
-                for f in families {
-                    f.batch.validate(f.schema)?;
-                }
-                (encode_push_txn(families), SlotKind::Commit)
-            }
-            Request::Resolve(target) => {
-                // The wire lets the name win over the id, so the name rides the blob.
-                let (target_id, qname) = match target {
-                    RelTarget::Name(q) => (0, q),
-                    RelTarget::Id(tid) => (tid, ""),
-                };
-                let hdr = ControlHeader {
-                    flags: WireFlags {
-                        verb: ClientVerb::Resolve,
-                        ..Default::default()
-                    },
-                    target_id,
-                    ..Default::default()
-                };
-                (encode_frame(hdr, qname.as_bytes(), None, None), SlotKind::Resolve)
-            }
-            Request::Push { target_id, schema, batch, mode } => {
-                // In-process, so a convenience and never a trust boundary; the
-                // server checks the same things. Here so no driver has to
-                // remember to.
-                batch.validate(schema)?;
-                // The push verb marks the frame as a push independent of data
-                // presence, so an empty batch (a legitimate empty Z-set delta)
-                // is ACKed as a no-op push instead of being mistaken for a scan.
-                let flags = WireFlags {
-                    verb: ClientVerb::Push,
-                    conflict_mode: mode,
-                    ..Default::default()
-                };
-                let hdr = ControlHeader { flags, target_id, ..Default::default() };
-                (
-                    encode_frame(hdr, &[], Some(&schema.to_block()), Some(batch)),
-                    SlotKind::Push { tid: target_id },
-                )
-            }
-            Request::ScanSpec { target_id, spec, reply_schema } => {
-                let hdr = ControlHeader {
-                    flags: WireFlags {
-                        verb: ClientVerb::ScanSpec,
-                        ..Default::default()
-                    },
-                    target_id,
-                    arg0: reply_schema.layout_digest(),
-                    ..Default::default()
-                };
-                (
-                    encode_frame(hdr, &spec.encode(), None, None),
-                    SlotKind::ScanSpec {
-                        tid: target_id,
-                        reply_schema: Arc::clone(reply_schema),
-                    },
-                )
-            }
-            Request::ScanMulti(rels) => {
-                let items: Vec<txn_frame::ScanMultiItem> = rels
-                    .iter()
-                    .map(|&(tid, schema)| txn_frame::ScanMultiItem {
-                        tid,
-                        reply_layout: schema.layout_digest(),
-                    })
-                    .collect();
-                let rels = rels.iter().map(|&(tid, schema)| (tid, Arc::clone(schema))).collect();
-                (txn_frame::encode_scan_multi(&items), SlotKind::Multi { rels })
-            }
-        };
-        self.enqueue_slot(frame, kind)
+        Ok(self.open_slot(req))
     }
 
     /// DELTA_POLL: one train per item, in order, delivered to the [`PollSink`] of a
     /// [`Self::step_polling`] drain — without which they are dropped, hence no [`Request`].
     pub(crate) fn submit_delta_poll(&mut self, views: &[txn_frame::DeltaPollItem]) -> Result<SlotId, ClientError> {
         self.check_open()?;
-        self.enqueue_slot(
-            txn_frame::encode_delta_poll(views),
-            SlotKind::DeltaPoll {
-                views: views.iter().map(|v| v.view_id).collect(),
-            },
-        )
+        let kind = SlotKind::DeltaPoll {
+            views: views.iter().map(|v| v.view_id).collect(),
+        };
+        Ok(self.open_slot(Encoded::new(txn_frame::encode_delta_poll(views), kind)?))
     }
 
     fn check_open(&self) -> Result<(), ClientError> {
         self.ended.as_ref().map_or(Ok(()), |e| Err(e.error()))
     }
 
-    /// Queue an encoded request and open its slot. A frame past the ceiling is
-    /// refused here rather than by the server's ingress cap, which would drop
-    /// the connection.
-    fn enqueue_slot(&mut self, frame: Vec<u8>, kind: SlotKind) -> Result<SlotId, ClientError> {
-        let total = frame.len();
-        let limit = gnitz_wire::MAX_FRAME_PAYLOAD;
-        if total > limit {
-            return Err(ClientError::from(format!(
-                "request frame is {total} bytes, exceeding the {limit}-byte server ingress cap; \
-                 split the request"
-            )));
-        }
+    fn open_slot(&mut self, Encoded { frame, kind }: Encoded) -> SlotId {
         self.transport.enqueue(frame);
         let id = SlotId(self.next_slot);
         self.next_slot += 1;
         self.pending.push_back(Slot { id, kind });
-        Ok(id)
+        id
     }
 
     /// Do the I/O `ready` allows and return every slot that completed. Afterwards
@@ -642,7 +664,7 @@ impl Session {
     }
 
     /// Frame bytes queued and not yet written, against [`MAX_QUEUED_BYTES`].
-    pub fn queued_bytes(&self) -> usize {
+    fn queued_bytes(&self) -> usize {
         self.transport.queued_bytes()
     }
 

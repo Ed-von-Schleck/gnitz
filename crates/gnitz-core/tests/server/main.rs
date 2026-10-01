@@ -76,7 +76,7 @@ fn weighted_rows(batch: &ZSetBatch, schema: &Schema) -> Vec<(u64, Vec<i64>, i64)
     out
 }
 
-/// Every row of `tid`, decoded under `schema`.
+/// A read of `tid` under `spec`, replied in `schema`'s layout.
 fn scan_req<'a>(tid: u64, spec: &'a ReadSpec, schema: &'a Arc<Schema>) -> Request<'a> {
     Request::ScanSpec {
         target_id: tid,
