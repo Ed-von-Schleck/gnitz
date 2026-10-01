@@ -1,446 +1,315 @@
 use super::*;
-use crate::test_support::{col, ncol, parse_expr_sql, parse_stmt, rejected, schema};
+use crate::test_support::Cell::{self, Int, Null, Str, F64};
+use crate::test_support::{
+    assert_rejects, batch_of, catalog, col, ncol, parse_stmt, rel, rows_of, table, typed_schema,
+};
 use gnitz_core::BatchAppender;
-use gnitz_expr::{payload_bytes, payload_is_null, payload_u64};
-use gnitz_wire::TypeCode;
+use gnitz_wire::{RelClass, TypeCode};
 use sqlparser::ast::Statement;
 
-/// `(pk U64 PK, cols…)`.
-fn table(cols: Vec<ColumnDef>) -> Schema {
-    let mut columns = vec![col("pk", TypeCode::U64)];
-    columns.extend(cols);
-    schema(columns, &[0])
-}
-
-/// The SET list of `UPDATE t SET <set>`, bound and compiled against `schema`.
-fn compile(set: &str, schema: &Schema) -> Result<Vec<SetCol>, GnitzSqlError> {
-    let Statement::Update(u) = parse_stmt(&format!("UPDATE t SET {set}")) else {
-        panic!("not an UPDATE");
-    };
-    bind_set_list(&u.assignments, schema, "t", SetClause::Update)
-}
-
-/// `rows` rewritten by `SET <set>`. A SET list that does not compile is a bug in
-/// the test.
-fn run(set: &str, schema: &Schema, rows: ZSetBatch) -> Result<ZSetBatch, GnitzSqlError> {
-    apply_set(
-        &mut compile(set, schema).expect("test SET list must compile"),
-        rows,
-        None,
-        schema,
-    )
-}
-
-/// A batch of `schema`, one `fill` call per row.
-fn rows_of(schema: &Schema, n: usize, mut fill: impl FnMut(&mut BatchAppender<'_>, usize)) -> ZSetBatch {
-    let mut b = ZSetBatch::new(schema);
-    let mut app = BatchAppender::new(&mut b, schema);
-    for r in 0..n {
-        app.add_row(r as u128 + 1, 1);
-        fill(&mut app, r);
-    }
-    b
-}
-
-// ------------------------------------------------------------------
-// Binding the target list
-// ------------------------------------------------------------------
-
-#[test]
-fn a_column_assigned_twice_is_rejected() {
-    let schema = table(vec![ncol("val", TypeCode::I64)]);
-    let m = rejected(compile("val = 1, val = 2", &schema));
-    assert!(m.contains("multiple assignments to column 'val'"), "{m}");
-}
-
-/// PostgreSQL refuses `SET t.val = …`; a qualifier must not be dropped.
-#[test]
-fn a_qualified_target_is_rejected() {
-    let schema = table(vec![ncol("val", TypeCode::I64)]);
-    match compile("t.val = 1", &schema) {
-        Err(GnitzSqlError::Rejected(m)) => assert!(m.contains("column must be a simple identifier"), "{m}"),
-        Err(e) => panic!("expected Plan, got {e:?}"),
-        Ok(_) => panic!("a qualified target must be rejected"),
+fn plan(cat: &Catalog<'_>, sql: &str) -> Result<MutationPlan, GnitzSqlError> {
+    match parse_stmt(sql) {
+        Statement::Update(u) => plan_update(&u, cat),
+        Statement::Delete(d) => plan_delete(&d, cat),
+        _ => panic!("`{sql}` is neither an UPDATE nor a DELETE"),
     }
 }
 
-// ------------------------------------------------------------------
-// Literals, through INSERT's cell encoder
-// ------------------------------------------------------------------
-
-/// A constant is range-checked against the column's width before any row is
-/// read; one that fits classifies as a constant.
-#[test]
-fn a_constant_set_value_is_range_checked_at_bind() {
-    let schema = table(vec![ncol("val", TypeCode::U8)]);
-    let m = rejected(compile("val = 300", &schema));
-    assert!(m.contains("out of range"), "{m}");
-    let set = compile("val = 255", &schema).unwrap();
-    assert!(matches!(&set[0].rhs, SetRhs::Const { cell, .. } if cell == &[255]));
+/// What `UPDATE t SET <set>` writes for the rows `held` of `schema`, each read at
+/// weight 3.
+fn updated(schema: &Schema, set: &str, held: &[&[Cell]]) -> Result<ZSetBatch, GnitzSqlError> {
+    let cat = catalog(vec![("t", table(1, schema.columns.clone(), vec![0]))]);
+    let mut plan = plan(&cat, &format!("UPDATE t SET {set}"))?;
+    let mut rows = batch_of(schema, held);
+    rows.weights.fill(3);
+    delta(plan.set.as_deref_mut(), rows, schema)
 }
 
-/// A fraction into an integer column rounds as a DECIMAL→integer CAST does; a
-/// string that spells no integer is refused, naming it.
-#[test]
-fn a_float_or_string_literal_into_an_integer_column() {
-    let schema = table(vec![ncol("i", TypeCode::I64)]);
-    let set = compile("i = 1.5", &schema).unwrap();
-    assert!(matches!(&set[0].rhs, SetRhs::Const { cell, .. } if cell == &2i64.to_le_bytes()));
-    let m = rejected(compile("i = 'abc'", &schema));
-    assert!(m.contains("column 'i': invalid I64 literal: 'abc'"), "{m}");
-}
+const I: ColType = ColType::of(TypeCode::I64);
+const F: ColType = ColType::of(TypeCode::F64);
+const S: ColType = ColType::of(TypeCode::String);
+const DATE: ColType = ColType::of(TypeCode::Date);
+const TS: ColType = ColType::of(TypeCode::Timestamp);
 
-#[test]
-fn a_non_null_assignment_clears_the_null_bit() {
-    let schema = table(vec![ncol("val", TypeCode::I64)]);
-    let rows = rows_of(&schema, 1, |a, _| {
-        a.null();
-    });
-    let out = run("val = 99", &schema, rows).unwrap();
-    assert!(!payload_is_null(&out, 0, 0));
-    assert_eq!(payload_u64(&out, 0, 0) as i64, 99);
-    assert_eq!(out.weights, [1]);
-}
+/// A string past the inline prefix, spilled to the arena.
+const LONG: &str = "a string past the inline prefix";
 
+/// Over `t (pk, c1, c2, …)` with `pk = 1`: every assigned column takes its value,
+/// read off the row as it was; every other column, null bits included, is carried;
+/// and the row is written at weight +1 whatever weight it was read at.
 #[test]
-fn unassigned_columns_carry_their_null_bits() {
-    let schema = table(vec![ncol("a", TypeCode::I64), ncol("b", TypeCode::I64)]);
-    let rows = rows_of(&schema, 1, |a, _| {
-        a.i64_val(5).null();
-    });
-    let out = run("a = 10", &schema, rows).unwrap();
-    assert!(!payload_is_null(&out, 0, 0), "a assigned non-null");
-    assert!(payload_is_null(&out, 0, 1), "b unassigned stays null");
-}
-
-#[test]
-fn a_decimal_literal_rounds_to_the_column_scale() {
-    let schema = table(vec![ColumnDef::typed("d", ColType::decimal(2), true)]);
-    let rows = rows_of(&schema, 1, |a, _| {
-        a.i64_val(0);
-    });
-    assert_eq!(payload_u64(&run("d = 1.005", &schema, rows).unwrap(), 0, 0) as i64, 101);
-    // A string literal spells a DECIMAL too, as it does in an INSERT cell.
-    let rows = rows_of(&schema, 1, |a, _| {
-        a.i64_val(0);
-    });
-    assert_eq!(
-        payload_u64(&run("d = '1.25'", &schema, rows).unwrap(), 0, 0) as i64,
-        125
-    );
-}
-
-#[test]
-fn a_wide_negative_literal_keeps_its_sign() {
-    for tc in [TypeCode::U64, TypeCode::U128] {
-        let schema = table(vec![ncol("u", tc)]);
-        let m = rejected(compile("u = -18446744073709551615", &schema));
-        assert!(m.contains("out of range"), "{tc:?}: {m}");
-    }
-    let schema = table(vec![ncol("f", TypeCode::F64)]);
-    let rows = rows_of(&schema, 1, |a, _| {
-        a.f64_val(0.0);
-    });
-    let out = run("f = -18446744073709551615", &schema, rows).unwrap();
-    assert_eq!(f64::from_bits(payload_u64(&out, 0, 0)), -18446744073709551615.0);
-}
-
-#[test]
-fn a_float_literal_writes_a_double_column() {
-    let schema = table(vec![ncol("f", TypeCode::F64)]);
-    let rows = rows_of(&schema, 1, |a, _| {
-        a.null();
-    });
-    let out = run("f = 1.5", &schema, rows).unwrap();
-    assert_eq!(f64::from_bits(payload_u64(&out, 0, 0)), 1.5);
-    assert!(!payload_is_null(&out, 0, 0));
-}
-
-/// A string literal is spilled once into the result arena, however many rows
-/// take it, and the arena holds nothing else.
-#[test]
-fn a_long_string_literal_spills_once() {
-    let schema = table(vec![ncol("s", TypeCode::String)]);
-    let rows = rows_of(&schema, 3, |a, _| {
-        a.str_val("a");
-    });
-    let long = "x".repeat(40);
-    let out = run(&format!("s = '{long}'"), &schema, rows).unwrap();
-    assert_eq!(out.blob.len(), long.len());
-    for r in 0..3 {
-        assert_eq!(payload_bytes(&out, r, 0), long.as_bytes());
+fn a_set_list_rewrites_the_row_it_read() {
+    /// `(payload types, SET list, row read, row written)`.
+    type Case<'a> = (&'a [ColType], &'a str, &'a [Cell<'a>], &'a [Cell<'a>]);
+    let cases: &[Case] = &[
+        // A literal, through INSERT's cell encoder.
+        (&[I, I], "c1 = 99", &[Null, Null], &[Int(99), Null]),
+        (&[I, I], "c1 = NULL", &[Int(5), Int(6)], &[Null, Int(6)]),
+        (&[F], "c1 = 1.5", &[Null], &[F64(1.5)]),
+        // A column of the target's own type is copied, NULL and spill included.
+        (&[I, I], "c1 = c2", &[Int(5), Null], &[Null, Null]),
+        (&[I, I], "c1 = c2, c2 = c1", &[Int(1), Int(2)], &[Int(2), Int(1)]),
+        (&[F, F], "c1 = c2", &[F64(0.0), F64(2.5)], &[F64(2.5), F64(2.5)]),
+        (&[S, S], "c1 = c2", &[Str("old"), Str(LONG)], &[Str(LONG), Str(LONG)]),
+        // A computed value; NULL in is NULL out, not the filler zero.
+        (&[I, I], "c1 = c2 + 1", &[Int(0), Int(5)], &[Int(6), Int(5)]),
+        (&[I, I], "c1 = c2 + 1", &[Int(0), Null], &[Null, Null]),
+        (&[I], "c1 = pk + 1", &[Int(0)], &[Int(2)]),
+        (&[I], "c1 = pk", &[Int(0)], &[Int(1)]),
+        (
+            &[S, S],
+            "c1 = UPPER(c2)",
+            &[Str("x"), Str("hello")],
+            &[Str("HELLO"), Str("hello")],
+        ),
+        (&[S, S], "c1 = UPPER(c2)", &[Str("x"), Null], &[Null, Null]),
+        // A source of another type converts as a CAST to the target does.
+        (
+            &[I, ColType::decimal(2)],
+            "c1 = c2",
+            &[Int(0), Int(150)],
+            &[Int(2), Int(150)],
+        ),
+        (
+            &[I, ColType::decimal(2)],
+            "c1 = c2",
+            &[Int(0), Int(149)],
+            &[Int(1), Int(149)],
+        ),
+        (
+            &[ColType::decimal(2), I],
+            "c1 = c2",
+            &[Int(150), Int(5)],
+            &[Int(500), Int(5)],
+        ),
+        (
+            &[ColType::decimal(2), ColType::decimal(4)],
+            "c1 = c2",
+            &[Int(150), Int(12345)],
+            &[Int(123), Int(12345)],
+        ),
+        (
+            &[DATE, TS],
+            "c2 = c1",
+            &[Int(2), Int(0)],
+            &[Int(2), Int(172_800_000_000)],
+        ),
+        (&[DATE, TS], "c1 = c2", &[Int(1), Int(-1)], &[Int(-1), Int(-1)]),
+    ];
+    for (tys, set, before, after) in cases {
+        let schema = typed_schema(tys);
+        let out = updated(&schema, set, &[before]).unwrap_or_else(|e| panic!("{set}: {e:?}"));
+        assert_eq!(rows_of(&schema, &out), [(after.to_vec(), 1)], "{set} over {before:?}");
     }
 }
 
-// ------------------------------------------------------------------
-// Column copies
-// ------------------------------------------------------------------
-
+/// A 16-byte column has no register, so it is assignable only as a copy.
 #[test]
-fn a_copy_from_a_null_source_sets_the_null_bit() {
-    let schema = table(vec![ncol("a", TypeCode::I64), ncol("b", TypeCode::I64)]);
-    let rows = rows_of(&schema, 1, |a, _| {
-        a.i64_val(5).null();
-    });
-    let mut set = compile("a = b", &schema).unwrap();
-    assert!(matches!(set[0].rhs, SetRhs::Copy { src: 1, .. }));
-    let out = apply_set(&mut set, rows, None, &schema).unwrap();
-    assert!(payload_is_null(&out, 0, 0), "a takes b's NULL");
-    assert!(payload_is_null(&out, 0, 1), "b stays null");
+fn a_uuid_column_is_copied() {
+    let schema = typed_schema(&[TypeCode::UUID, TypeCode::UUID]);
+    let mut rows = ZSetBatch::new(&schema);
+    BatchAppender::new(&mut rows, &schema)
+        .add_row(1, 1)
+        .u128_val(0)
+        .u128_val(u128::MAX - 7);
+    let cat = catalog(vec![("t", table(1, schema.columns.clone(), vec![0]))]);
+    let mut plan = plan(&cat, "UPDATE t SET c1 = c2").unwrap();
+    let out = delta(plan.set.as_deref_mut(), rows, &schema).unwrap();
+    assert_eq!(out.payload[0].bytes, (u128::MAX - 7).to_le_bytes());
 }
 
-/// Every right-hand side reads the rows as they were.
+/// A computed value outside its column's range is refused per row, not truncated
+/// to the low bits; in range it is written at the column's own width and sign.
 #[test]
-fn a_swap_reads_the_old_row() {
-    let schema = table(vec![ncol("a", TypeCode::I64), ncol("b", TypeCode::I64)]);
-    let rows = rows_of(&schema, 1, |a, _| {
-        a.i64_val(1).i64_val(2);
-    });
-    let out = run("a = b, b = a", &schema, rows).unwrap();
-    assert_eq!((payload_u64(&out, 0, 0) as i64, payload_u64(&out, 0, 1) as i64), (2, 1));
-}
-
-#[test]
-fn same_type_copies_work_for_float_and_uuid_columns() {
-    let schema = table(vec![
-        ncol("f", TypeCode::F64),
-        ncol("g", TypeCode::F64),
-        ncol("u", TypeCode::UUID),
-        ncol("w", TypeCode::UUID),
-    ]);
-    let rows = rows_of(&schema, 1, |a, _| {
-        a.f64_val(0.0).f64_val(2.5).u128_val(0).u128_val(u128::MAX - 7);
-    });
-    let out = run("f = g, u = w", &schema, rows).unwrap();
-    assert_eq!(f64::from_bits(payload_u64(&out, 0, 0)), 2.5);
-    assert_eq!(
-        u128::from_le_bytes(out.payload[2].bytes[..16].try_into().unwrap()),
-        u128::MAX - 7
-    );
-}
-
-/// A non-string SET keeps the rows' arena whole: an unassigned BLOB column's
-/// cells still point into it.
-#[test]
-fn a_non_string_set_leaves_the_arena_unchanged() {
-    let schema = table(vec![ncol("b", TypeCode::Blob), ncol("v", TypeCode::I64)]);
-    let long = [7u8; 30];
-    let rows = rows_of(&schema, 1, |a, _| {
-        a.bytes_val(&long).i64_val(7);
-    });
-    let blob = rows.blob.clone();
-    let out = run("v = 99", &schema, rows).unwrap();
-    assert_eq!(out.blob, blob);
-    assert_eq!(payload_bytes(&out, 0, 0), long);
-    assert_eq!(payload_u64(&out, 0, 1) as i64, 99);
-}
-
-/// Assigning one string column rebuilds the others into a fresh arena, so the
-/// replaced cell's spill does not survive.
-#[test]
-fn a_text_assignment_leaves_only_referenced_spill() {
-    let schema = table(vec![ncol("s", TypeCode::String), ncol("t", TypeCode::String)]);
-    let (old, kept) = ("o".repeat(30), "k".repeat(20));
-    let rows = rows_of(&schema, 1, |a, _| {
-        a.str_val(&old).str_val(&kept);
-    });
-    let out = run("s = 'x'", &schema, rows).unwrap();
-    assert_eq!(out.blob.len(), kept.len());
-    assert_eq!(payload_bytes(&out, 0, 0), b"x");
-    assert_eq!(payload_bytes(&out, 0, 1), kept.as_bytes());
-}
-
-// ------------------------------------------------------------------
-// Computed values
-// ------------------------------------------------------------------
-
-/// A NULL source must come back as NULL and set the destination's bit rather
-/// than reading the filler zeros as a real `0`.
-#[test]
-fn a_computed_value_over_a_nullable_column() {
-    let schema = table(vec![ncol("a", TypeCode::I64), ncol("b", TypeCode::I64)]);
-    let rows = rows_of(&schema, 2, |a, r| {
-        a.i64_val(0);
-        if r == 0 {
-            a.i64_val(5);
-        } else {
-            a.null();
+fn a_computed_value_is_range_checked_at_the_column_width() {
+    use TypeCode::*;
+    for (src, dst, v, fits) in [
+        (I64, U8, 300, false),
+        (I64, U8, -1, false),
+        (I64, I8, 128, false),
+        (I64, U16, 70000, false),
+        (I64, I16, -32769, false),
+        (I64, U32, -1, false),
+        (I64, U64, -1, false),
+        (U64, I64, 1 << 63, false),
+        (I64, U8, 255, true),
+        (I64, I8, -5, true),
+        (I64, U16, 65535, true),
+        (I64, I16, -2, true),
+        (I64, U32, 4294967295, true),
+        (I64, I32, -1, true),
+        (U64, U64, u64::MAX as i128, true),
+        (I64, I64, i64::MIN as i128, true),
+    ] {
+        let schema = typed_schema(&[src, dst]);
+        let out = updated(&schema, "c2 = c1 + 0", &[&[Int(v), Null]]);
+        match fits {
+            true => assert_eq!(
+                rows_of(&schema, &out.unwrap()),
+                [(vec![Int(v), Int(v)], 1)],
+                "{dst:?} {v}"
+            ),
+            false => assert_rejects(&format!("{dst:?} {v}"), out, "out of range"),
         }
-    });
-    let out = run("a = b + 1", &schema, rows).unwrap();
-    assert_eq!(payload_u64(&out, 0, 0) as i64, 6);
-    assert!(!payload_is_null(&out, 0, 0));
-    assert!(payload_is_null(&out, 1, 0), "NULL + 1 is NULL");
+    }
 }
 
+/// A NULL into a NOT NULL column is refused per row, whichever way the value is
+/// produced.
 #[test]
-fn set_reads_the_pk_column() {
-    let schema = table(vec![ncol("val", TypeCode::I64)]);
-    for (set, want) in [("val = pk + 1", 2), ("val = pk", 1)] {
-        let rows = rows_of(&schema, 1, |a, _| {
-            a.i64_val(0);
-        });
-        assert_eq!(
-            payload_u64(&run(set, &schema, rows).unwrap(), 0, 0) as i64,
-            want,
-            "{set}"
+fn a_null_into_a_not_null_column_is_refused() {
+    let schema = crate::test_support::schema(
+        vec![
+            col("pk", TypeCode::U64),
+            ncol("a", TypeCode::I64),
+            col("nn", TypeCode::I64),
+        ],
+        &[0],
+    );
+    for set in ["nn = NULL", "nn = a", "nn = a + 1"] {
+        assert_rejects(
+            set,
+            updated(&schema, set, &[&[Null, Int(1)]]),
+            "column 'nn' violates NOT NULL",
         );
     }
 }
 
-/// A float-typed RHS into an integer column is rejected at compile — the raw f64
-/// bit pattern would otherwise commit as a nonsense integer.
+/// The result arena holds exactly the spill its cells reference: a string literal
+/// is spilled once however many rows take it, assigning a string column drops the
+/// replaced cell's spill, and a SET naming no string column keeps the arena as read.
 #[test]
-fn set_int_column_from_float_expression_rejects() {
-    let schema = table(vec![ncol("n", TypeCode::I64), ncol("f", TypeCode::F64)]);
-    let Err(err) = compile("n = f", &schema) else {
-        panic!("SET int = float must reject");
-    };
-    assert!(err.to_string().contains("floating-point"), "{err}");
-    // A float *comparison* is integer-valued (0/1) and stays servable.
-    assert!(compile("n = f > 1.5", &schema).is_ok());
-}
-
-#[test]
-fn a_computed_string_evaluates_to_a_string() {
-    let schema = table(vec![ncol("val", TypeCode::String)]);
-    let mut set = compile("val = UPPER(val)", &schema).unwrap();
-    assert!(matches!(&set[0].rhs, SetRhs::Expr { ev, .. } if ev.result_is_str()));
-    let rows = rows_of(&schema, 1, |a, _| {
-        a.str_val("hello");
-    });
-    assert_eq!(
-        payload_bytes(&apply_set(&mut set, rows, None, &schema).unwrap(), 0, 0),
-        b"HELLO"
-    );
-}
-
-#[test]
-fn a_string_rhs_against_an_integer_column_is_rejected() {
-    let schema = table(vec![ncol("val", TypeCode::I64)]);
-    let concat = BoundExpr::ConcatN { args: vec![BoundExpr::LitInt(1)] };
-    rejected(classify_set_rhs(&concat, Scope::Existing, 1, &schema));
-}
-
-/// A computed value outside its column's range is rejected per row, not
-/// truncated to the low bits; in range it encodes to the native image at every
-/// width and sign.
-#[test]
-fn a_computed_value_is_range_checked_and_encodes_natively() {
-    for (tc, v) in [
-        (TypeCode::U8, 300i64),
-        (TypeCode::U8, -1),
-        (TypeCode::I8, 128),
-        (TypeCode::U16, 70000),
-        (TypeCode::I16, -32769),
-        (TypeCode::U32, -1),
-        (TypeCode::U64, -1),
-    ] {
-        let schema = table(vec![ncol("src", TypeCode::I64), ncol("dst", tc)]);
-        let rows = rows_of(&schema, 1, |a, _| {
-            a.i64_val(v).null();
-        });
-        let m = rejected(run("dst = src + 0", &schema, rows));
-        assert!(m.contains("out of range"), "{tc:?} {v}: {m}");
-    }
-    for (tc, src_tc, v, want) in [
-        (TypeCode::U8, TypeCode::I64, 255u64, vec![255u8]),
-        (TypeCode::I8, TypeCode::I64, (-5i64) as u64, vec![(-5i8) as u8]),
-        (TypeCode::U16, TypeCode::I64, 65535, 65535u16.to_le_bytes().to_vec()),
+fn the_arena_holds_only_referenced_spill() {
+    const KEPT: &str = "a shorter spilled string";
+    /// `(payload types, SET list, row read, how many of it, row written, arena bytes)`.
+    type Case<'a> = (&'a [ColType], String, &'a [Cell<'a>], usize, &'a [Cell<'a>], usize);
+    let cases: &[Case] = &[
+        (&[S], format!("c1 = '{LONG}'"), &[Str("a")], 3, &[Str(LONG)], LONG.len()),
         (
-            TypeCode::I16,
-            TypeCode::I64,
-            (-2i64) as u64,
-            (-2i16).to_le_bytes().to_vec(),
+            &[S, S],
+            "c1 = 'x'".into(),
+            &[Str(LONG), Str(KEPT)],
+            1,
+            &[Str("x"), Str(KEPT)],
+            KEPT.len(),
         ),
         (
-            TypeCode::U32,
-            TypeCode::I64,
-            4294967295,
-            4294967295u32.to_le_bytes().to_vec(),
+            &[S, I],
+            "c2 = 99".into(),
+            &[Str(LONG), Int(7)],
+            1,
+            &[Str(LONG), Int(99)],
+            LONG.len(),
         ),
-        (
-            TypeCode::I32,
-            TypeCode::I64,
-            (-1i64) as u64,
-            (-1i32).to_le_bytes().to_vec(),
-        ),
-        (TypeCode::U64, TypeCode::U64, u64::MAX, u64::MAX.to_le_bytes().to_vec()),
-        (
-            TypeCode::I64,
-            TypeCode::I64,
-            i64::MIN as u64,
-            i64::MIN.to_le_bytes().to_vec(),
-        ),
-    ] {
-        let schema = table(vec![ncol("src", src_tc), ncol("dst", tc)]);
-        let rows = rows_of(&schema, 1, |a, _| {
-            a.u64_val(v).null();
-        });
-        let out = run("dst = src + 0", &schema, rows).unwrap();
-        assert_eq!(out.payload[1].bytes, want, "{tc:?}");
+    ];
+    for (tys, set, before, n, after, blob_len) in cases {
+        let schema = typed_schema(tys);
+        let out = updated(&schema, set, &vec![*before; *n]).unwrap();
+        assert_eq!(rows_of(&schema, &out), vec![(after.to_vec(), 1); *n], "{set}");
+        assert_eq!(out.blob.len(), *blob_len, "{set}");
     }
 }
 
-#[test]
-fn a_u64_value_past_i64_max_writes() {
-    let schema = table(vec![ncol("u", TypeCode::U64)]);
-    let rows = rows_of(&schema, 1, |a, _| {
-        a.u64_val(1 << 63);
-    });
-    assert_eq!(
-        payload_u64(&run("u = u + 1", &schema, rows).unwrap(), 0, 0),
-        (1 << 63) + 1
-    );
+/// | name | shape |
+/// |---|---|
+/// | `t` | `(id PK, v NOT NULL, s TEXT)` |
+/// | `ty` | `(id PK, u8c U8, n, f DOUBLE, s TEXT)` |
+/// | `c` | `(a U64, b U64, v)` with `PRIMARY KEY (a, b)` |
+/// | `st` | a stream `(id PK, v)` |
+/// | `vw` | a view `(id PK, v)` |
+fn cat() -> Catalog<'static> {
+    let i = TypeCode::I64;
+    let idv = || vec![col("id", i), ncol("v", i)];
+    catalog(vec![
+        (
+            "t",
+            table(1, vec![col("id", i), col("v", i), ncol("s", TypeCode::String)], vec![0]),
+        ),
+        (
+            "ty",
+            table(
+                2,
+                vec![
+                    col("id", i),
+                    ncol("u8c", TypeCode::U8),
+                    ncol("n", i),
+                    ncol("f", TypeCode::F64),
+                    ncol("s", TypeCode::String),
+                ],
+                vec![0],
+            ),
+        ),
+        (
+            "c",
+            table(
+                3,
+                vec![col("a", TypeCode::U64), col("b", TypeCode::U64), ncol("v", i)],
+                vec![0, 1],
+            ),
+        ),
+        ("st", rel(4, RelClass::Stream, idv(), vec![0], vec![])),
+        ("vw", rel(5, RelClass::View, idv(), vec![0], vec![])),
+    ])
 }
 
+/// A clause gnitz does not honour is named rather than dropped, as is a target
+/// that holds no row to mutate and a SET list no row could take — all before any
+/// row is read.
 #[test]
-fn a_u64_value_past_i64_max_is_out_of_range_for_i64() {
-    let schema = table(vec![ncol("i", TypeCode::I64), ncol("u", TypeCode::U64)]);
-    let rows = rows_of(&schema, 1, |a, _| {
-        a.i64_val(0).u64_val(1 << 63);
-    });
-    let m = rejected(run("i = u", &schema, rows));
-    assert!(m.contains("out of range"), "{m}");
-}
-
-#[test]
-fn a_decimal_source_rounds_into_an_integer_column() {
-    let schema = table(vec![
-        ncol("i", TypeCode::I64),
-        ColumnDef::typed("d", ColType::decimal(2), true),
-    ]);
-    let rows = rows_of(&schema, 2, |a, r| {
-        a.i64_val(0).i64_val([150, 149][r]);
-    });
-    let out = run("i = d", &schema, rows).unwrap();
-    assert_eq!((payload_u64(&out, 0, 0) as i64, payload_u64(&out, 1, 0) as i64), (2, 1));
-}
-
-#[test]
-fn a_date_source_converts_into_a_timestamp_column() {
-    let schema = table(vec![ncol("d", TypeCode::Date), ncol("ts", TypeCode::Timestamp)]);
-    let rows = rows_of(&schema, 1, |a, _| {
-        a.int_val(2).i64_val(0);
-    });
-    let out = run("ts = d", &schema, rows).unwrap();
-    assert_eq!(payload_u64(&out, 0, 1) as i64, 2 * 86_400_000_000);
-}
-
-/// An `EXCLUDED.col` reference is found wherever `expr_operands` walks, so a
-/// compound RHS is rejected rather than the qualifier being silently dropped
-/// and the reference bound to the existing row's column.
-#[test]
-fn an_excluded_reference_is_found_at_any_depth() {
-    for (src, found) in [
-        ("EXCLUDED.a", true),
-        ("excluded.a", true),
-        ("(EXCLUDED.a)", true),
-        ("val + COALESCE(EXCLUDED.a, 0)", true),
-        ("val + 1", false),
-        ("t.a", false),
-        ("excluded", false),
+fn a_refused_mutation_names_its_rule() {
+    let cat = cat();
+    for (sql, needle) in [
+        ("UPDATE t SET v = 9 WHERE id = 1 RETURNING id", "RETURNING"),
+        ("DELETE FROM t WHERE id = 1 RETURNING id", "RETURNING"),
+        ("DELETE FROM t LIMIT 1", "LIMIT"),
+        ("DELETE FROM t ORDER BY id", "ORDER BY"),
+        // The join forms are refused before any name resolves, so `other` need
+        // not exist.
+        ("UPDATE t SET v = o.v FROM other o WHERE t.id = o.id", "join-update"),
+        ("DELETE FROM t USING other o WHERE t.id = o.id", "join-delete"),
+        ("UPDATE t JOIN c ON t.id = c.a SET v = 1", "exactly one simple FROM"),
+        // A written alias displaces the table name, and a qualifier naming
+        // anything else is not silently ignored.
+        ("UPDATE t AS x SET v = 1 WHERE t.v = 1", "not found"),
+        ("UPDATE t SET v = x.v", "table alias 'x' not found"),
+        ("UPDATE t SET v = EXCLUDED.v", "table alias 'EXCLUDED' not found"),
+        ("DELETE FROM t WHERE nope.v = 1", "not found"),
+        // A SET target is one plain name of a non-key column, assigned once.
+        ("UPDATE t SET id = 9 WHERE id = 1", "primary key column in UPDATE SET"),
+        ("UPDATE t SET v = 1, v = 2", "multiple assignments to column 'v'"),
+        ("UPDATE t SET t.v = 1", "simple identifier"),
+        ("UPDATE t SET (v, s) = (1, 'x')", "simple identifier"),
+        ("UPDATE t SET nope = 1", "'nope' not found"),
+        // A value its column cannot hold: a literal out of range, a float that is
+        // not a copy, and a string where an integer goes or the reverse.
+        ("UPDATE ty SET u8c = 300", "out of range"),
+        ("UPDATE ty SET n = f", "floating-point"),
+        ("UPDATE ty SET f = f + 1.0", "floating-point"),
+        ("UPDATE ty SET f = n", "cannot assign an integer value"),
+        ("UPDATE ty SET n = UPPER(s)", "cannot assign a string value"),
+        ("UPDATE ty SET s = n + 1", "cannot assign an integer value"),
+        // A view is read-only, and a stream holds no row.
+        ("UPDATE vw SET v = 1 WHERE id = 1", "is a view"),
+        ("DELETE FROM vw", "is a view"),
+        ("UPDATE st SET v = 1 WHERE id = 1", "is a stream"),
+        ("DELETE FROM st WHERE id = 1", "is a stream"),
     ] {
-        assert_eq!(expr_contains_excluded(&parse_expr_sql(src)), found, "{src}");
+        assert_rejects(sql, plan(&cat, sql), needle);
     }
+    // A float comparison is integer-valued, and the written alias is the one
+    // qualifier that answers.
+    for sql in ["UPDATE ty SET n = f > 1.5", "UPDATE t AS x SET v = 11 WHERE x.v = 10"] {
+        plan(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+    }
+}
+
+/// A DELETE writes the retraction of the keys it read.
+#[test]
+fn a_delete_retracts_the_keys_it_read() {
+    let mut plan = plan(&cat(), "DELETE FROM t WHERE v = 5").unwrap();
+    let schema = &plan.target.schema;
+    let held = batch_of(schema, &[&[Int(5), Null], &[Int(5), Str("x")]]);
+    let keys = held.pks.clone();
+    let out = delta(plan.set.as_deref_mut(), held, schema).unwrap();
+    assert_eq!((out.pks, out.weights), (keys, vec![-1, -1]));
 }

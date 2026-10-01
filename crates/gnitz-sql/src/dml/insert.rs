@@ -2,15 +2,17 @@
 //! with `WireConflictMode::Error`; `DO NOTHING` / `DO UPDATE` filter or merge the
 //! VALUES against the rows their keys hold, as a read-modify-write. `DO UPDATE
 //! SET` runs `mutate`'s SET list, so it behaves exactly like an `UPDATE ... SET`.
+//!
+//! [`plan_insert`] reads only the catalog, so a refused statement issues no
+//! request and consumes no SERIAL id; [`execute_insert`] runs what it planned.
 
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::Arc;
 
 use crate::ast_util::{extract_object_name, single_part_ident};
-use crate::bind::find_unique_column;
 use crate::bind::structural::bind_constant;
+use crate::bind::{find_unique_column, Catalog};
 use crate::codec::colwrite::{append_value_to_col, check_not_null, native_value};
 use crate::dml::mutate::{apply_set, bind_set_list, SetClause, SetCol};
 use crate::dml::plan::{rows_reply, RowsReply};
@@ -19,18 +21,17 @@ use crate::exec::client_map::ClientMap;
 use crate::ir::BExpr;
 use crate::validate::{reject_unhonored_insert_clauses, require_class, ClassWant};
 use crate::SqlResult;
-use gnitz_core::{GnitzClient, PkColumn, Schema, ZSetBatch};
+use gnitz_core::{GnitzClient, PkColumn, RelDescriptor, Schema, ZSetBatch};
 use gnitz_expr::SchemaFacts;
-use gnitz_wire::{FixedInt, RelClass, TypeCode, WireConflictMode};
-use gnitz_wire::{PkKeys, ReadBound};
+use gnitz_wire::{FixedInt, ReadBound, RelClass, WireConflictMode};
 use sqlparser::ast::{
     ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query, SetExpr,
     TableObject, Values,
 };
 
-/// The resolved INSERT disposition after the ON CONFLICT clause (if any) is bound.
-/// The conflict target itself is validated and discarded in `validate_conflict_target`;
-/// only the action survives into the plan.
+/// What an INSERT does about a key already held. The conflict target is
+/// validated and discarded in `validate_conflict_target`; only the action
+/// survives into the plan.
 enum ConflictPlan {
     /// Default SQL INSERT: push with WireConflictMode::Error.
     Error,
@@ -71,33 +72,23 @@ fn validate_conflict_target(target: &Option<ConflictTarget>, schema: &Schema) ->
     }
 }
 
-/// How an INSERT's VALUES rows map onto the table's columns.
-struct RowShape {
-    /// Physical column → VALUES slot. `None` where the column takes no user
-    /// value: SERIAL, hidden, or unnamed by an explicit column list.
-    slot_of: Vec<Option<usize>>,
-    /// Values every VALUES row must supply.
-    expected: usize,
-}
-
-/// A column list names the slots and the arity; without one a row supplies every
-/// visible column but `serial_ci` in schema order. An unnamed column is written NULL —
-/// gnitz has no column DEFAULTs, and `check_not_null` catches the rest.
-fn insert_row_shape(
+/// Physical column → VALUES slot, `None` where the column takes no user value:
+/// SERIAL, hidden, or unnamed by an explicit column list. A column list names the
+/// slots; without one a row supplies every visible column but `serial_ci` in
+/// schema order. An unnamed column is written NULL — gnitz has no column DEFAULTs,
+/// and `check_not_null` catches the rest.
+fn value_slots(
     columns: &[ObjectName],
     schema: &Schema,
     serial_ci: Option<usize>,
-) -> Result<RowShape, GnitzSqlError> {
+) -> Result<Vec<Option<usize>>, GnitzSqlError> {
     let mut slot_of: Vec<Option<usize>> = vec![None; schema.columns.len()];
     if columns.is_empty() {
-        let mut expected = 0usize;
-        for (ci, _) in schema.visible_columns() {
-            if Some(ci) != serial_ci {
-                slot_of[ci] = Some(expected);
-                expected += 1;
-            }
+        let unnamed = schema.visible_columns().filter(|&(ci, _)| Some(ci) != serial_ci);
+        for (slot, (ci, _)) in unnamed.enumerate() {
+            slot_of[ci] = Some(slot);
         }
-        return Ok(RowShape { slot_of, expected });
+        return Ok(slot_of);
     }
     for (k, name) in columns.iter().enumerate() {
         let ident = single_part_ident(name)
@@ -116,29 +107,42 @@ fn insert_row_shape(
         }
         slot_of[ci] = Some(k);
     }
-    Ok(RowShape { slot_of, expected: columns.len() })
+    Ok(slot_of)
 }
 
-pub(crate) fn execute_insert(
-    client: &mut GnitzClient,
-    schema_name: &str,
-    insert: &Insert,
-) -> Result<SqlResult, GnitzSqlError> {
+/// An INSERT, planned: everything but the SERIAL keys, which only the server
+/// can hand out.
+pub(crate) struct InsertPlan {
+    target: Arc<RelDescriptor>,
+    /// The VALUES rows at weight +1. Into a SERIAL table the key region is empty
+    /// until [`execute_insert`] stamps it.
+    rows: ZSetBatch,
+    conflict: ConflictPlan,
+    /// The RETURNING reply's schema, and the map filling it when it is not the
+    /// table's own layout.
+    returning: Option<(Arc<Schema>, Option<ClientMap>)>,
+}
+
+/// The table's SERIAL column, whose keys the server assigns.
+fn serial_col(target: &RelDescriptor) -> Option<usize> {
+    target.schema.lone_pk_col().filter(|_| target.serial)
+}
+
+pub(crate) fn plan_insert(insert: &Insert, cat: &Catalog<'_>) -> Result<InsertPlan, GnitzSqlError> {
     reject_unhonored_insert_clauses(insert)?;
-    let table_name_str = match &insert.table {
-        TableObject::TableName(obj_name) => extract_object_name(obj_name, schema_name, "INSERT")?,
+    let table_name = match &insert.table {
+        TableObject::TableName(obj_name) => extract_object_name(obj_name, cat.schema_name(), "INSERT")?,
         _ => return Err(unsupported_clause("INSERT", "a table function target")),
     };
     let source = insert
         .source
         .as_ref()
         .ok_or_else(|| GnitzSqlError::Rejected("INSERT without VALUES not supported".to_string()))?;
-    let rows = extract_values_rows(source)?;
+    let values = extract_values_rows(source)?;
 
-    let target = client.resolve_relation(schema_name, &table_name_str)?;
-    require_class(&target, &table_name_str, ClassWant::BaseTableOrStream, "INSERT")?;
-    let (tid, schema) = (target.tid, &target.schema);
-    let is_stream = target.class == RelClass::Stream;
+    let target = cat.probe_relation(&table_name)?;
+    require_class(&target, &table_name, ClassWant::BaseTableOrStream, "INSERT")?;
+    let schema = &target.schema;
 
     // RETURNING is supported on the plain-INSERT path only; capturing the
     // effective row under ON CONFLICT (which may UPDATE or skip a row) is out of
@@ -149,8 +153,7 @@ pub(crate) fn execute_insert(
         "RETURNING",
     )?;
 
-    // Resolve the ON CONFLICT clause into a `ConflictPlan`.
-    let plan = match insert.on.as_ref() {
+    let conflict = match insert.on.as_ref() {
         None => ConflictPlan::Error,
         Some(OnInsert::DuplicateKeyUpdate(_)) => {
             return Err(GnitzSqlError::Rejected(
@@ -162,14 +165,14 @@ pub(crate) fn execute_insert(
         Some(OnInsert::OnConflict(OnConflict { conflict_target, action })) => {
             // Both actions resolve the incoming row against stored rows, which a
             // stream does not have.
-            require_class(&target, &table_name_str, ClassWant::BaseTable, "INSERT … ON CONFLICT")?;
+            require_class(&target, &table_name, ClassWant::BaseTable, "INSERT … ON CONFLICT")?;
             validate_conflict_target(conflict_target, schema)?;
 
             match action {
                 OnConflictAction::DoNothing => ConflictPlan::Resolve { set: None },
                 OnConflictAction::DoUpdate(do_update) => {
                     reject_if(do_update.selection.is_some(), "INSERT … ON CONFLICT DO UPDATE", "WHERE")?;
-                    let set = bind_set_list(&do_update.assignments, schema, &table_name_str, SetClause::DoUpdate)?;
+                    let set = bind_set_list(&do_update.assignments, schema, &table_name, SetClause::DoUpdate)?;
                     ConflictPlan::Resolve { set: Some(set) }
                 }
             }
@@ -179,12 +182,26 @@ pub(crate) fn execute_insert(
         }
     };
 
-    // Build the incoming batch from VALUES rows, sized for the known row count.
-    let n = rows.len();
-    let mut batch = ZSetBatch::with_capacity(schema, n);
-
-    let serial_ci = schema.lone_pk_col().filter(|_| target.serial);
-    let RowShape { slot_of, expected } = insert_row_shape(&insert.columns, schema, serial_ci)?;
+    let serial_ci = serial_col(&target);
+    let slot_of = value_slots(&insert.columns, schema, serial_ci)?;
+    let expected = slot_of.iter().flatten().count();
+    // Per PK column in PK-list order, the VALUES slot it reads; a SERIAL key
+    // reads none.
+    let pk_slots: Vec<usize> = match serial_ci {
+        Some(_) => Vec::new(),
+        None => schema
+            .pk_cols
+            .iter()
+            .map(|&pi| {
+                slot_of[pi as usize].ok_or_else(|| {
+                    GnitzSqlError::Rejected(format!(
+                        "PK column '{}' missing from INSERT row",
+                        schema.columns[pi as usize].name
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?,
+    };
     let payload: Vec<_> = schema.payload_columns().collect();
     // What a column the list left out reads as.
     let null: BExpr<Infallible> = BExpr::LitNull;
@@ -192,15 +209,9 @@ pub(crate) fn execute_insert(
     // consumers below, so a row's PK slot and payload slot cannot disagree on
     // what a written constant is.
     let mut cells: Vec<BExpr<Infallible>> = Vec::new();
-    // The row count is known here, so a SERIAL statement's ids come from one
-    // durable advance and each row stamps `base + i`. A row failing the arity
-    // guard below abandons the rest — a wider gap of the same intentional kind.
-    let pk_plan = match serial_ci {
-        Some(ci) => PkPlan::serial(client.reserve_serial_ids(tid, n as u64)?, n, schema.columns[ci].ty.tc)?,
-        None => PkPlan::written(&slot_of, schema)?,
-    };
+    let mut rows = ZSetBatch::with_capacity(schema, values.len());
 
-    for (row_i, row) in rows.iter().enumerate() {
+    for row in values {
         // Standard SQL rejects a VALUES row whose arity differs from the expected
         // count, in either direction — too few values, or excess trailing ones.
         // This guard makes every per-column index below in-bounds.
@@ -213,7 +224,7 @@ pub(crate) fn execute_insert(
             return Err(GnitzSqlError::Rejected(format!(
                 "INSERT specifies {} value(s) but table '{}' expects {} value(s){}",
                 row.len(),
-                table_name_str,
+                table_name,
                 expected,
                 hint
             )));
@@ -222,8 +233,16 @@ pub(crate) fn execute_insert(
         for e in row.iter() {
             cells.push(bind_constant(e)?);
         }
-        pk_plan.push(schema, row_i, &cells, &mut batch.pks)?;
-        batch.weights.push(1);
+        if serial_ci.is_none() {
+            let mut natives = [0u128; gnitz_wire::MAX_PK_COLUMNS];
+            for (k, (&pi, &slot)) in schema.pk_cols.iter().zip(&pk_slots).enumerate() {
+                let def = &schema.columns[pi as usize];
+                check_not_null(def, matches!(cells[slot], BExpr::LitNull))?;
+                natives[k] = native_value(&cells[slot], def)?;
+            }
+            rows.pks.push_natives(schema, &natives[..pk_slots.len()]);
+        }
+        rows.weights.push(1);
 
         let mut null_bits: u64 = 0;
         for &(payload_idx, ci, col_def) in &payload {
@@ -231,7 +250,7 @@ pub(crate) fn execute_insert(
                 // Logical-dropped column: a zero-filled NOT-NULL filler cell (null
                 // bit left unset), keeping the batch rectangular and the table on
                 // the FixedIntNonnull comparator. The value is unobservable.
-                batch.payload[payload_idx].push_zero();
+                rows.payload[payload_idx].push_zero();
                 continue;
             }
             // Read off the *bound* constant, so `+NULL` is the NULL it spells;
@@ -242,31 +261,68 @@ pub(crate) fn execute_insert(
             if is_null {
                 gnitz_wire::null_word_set(&mut null_bits, payload_idx, true);
             }
-            let ZSetBatch { payload: cols, blob, .. } = &mut batch;
+            let ZSetBatch { payload: cols, blob, .. } = &mut rows;
             append_value_to_col(&mut cols[payload_idx].bytes, blob, col_def, cell)?;
         }
-        batch.nulls.push(null_bits);
+        rows.nulls.push(null_bits);
     }
 
-    match plan {
-        ConflictPlan::Error => {
-            // Before the push, so a RETURNING list that fails to bind writes nothing.
-            let returning = insert
-                .returning
-                .as_deref()
-                .map(|items| {
-                    let RowsReply { schema: out_schema, program, .. } =
-                        rows_reply(items, None, &target, &table_name_str)?;
-                    let map = program
-                        .map(|p| ClientMap::new(p, schema, Arc::clone(&out_schema)))
-                        .transpose()?;
-                    Ok::<_, GnitzSqlError>((out_schema, map))
-                })
+    // SERIAL keys are distinct by construction, and unknown until execute.
+    if let (ConflictPlan::Resolve { set }, None) = (&conflict, serial_ci) {
+        rows = first_per_key(rows, schema, set.is_some())?;
+    }
+    let returning = insert
+        .returning
+        .as_deref()
+        .map(|items| {
+            let RowsReply { schema: out_schema, program, .. } = rows_reply(items, None, &target, &table_name)?;
+            let map = program
+                .map(|p| ClientMap::new(p, schema, Arc::clone(&out_schema)))
                 .transpose()?;
+            Ok::<_, GnitzSqlError>((out_schema, map))
+        })
+        .transpose()?;
+    Ok(InsertPlan { target, rows, conflict, returning })
+}
+
+/// `rows` down to each key's first row, the one an ON CONFLICT resolves; under
+/// DO UPDATE (`refuse_repeat`) a second row for a key is refused instead.
+fn first_per_key(rows: ZSetBatch, schema: &Schema, refuse_repeat: bool) -> Result<ZSetBatch, GnitzSqlError> {
+    let mut seen: HashSet<&[u8]> = HashSet::with_capacity(rows.len());
+    let firsts: Vec<usize> = (0..rows.len())
+        .filter(|&i| seen.insert(rows.pks.get_bytes(i)))
+        .collect();
+    if firsts.len() == rows.len() {
+        return Ok(rows);
+    }
+    if refuse_repeat {
+        return Err(GnitzSqlError::Rejected(
+            "ON CONFLICT DO UPDATE cannot affect row a second time \
+             (duplicate PK in the same batch)"
+                .to_string(),
+        ));
+    }
+    let mut out = ZSetBatch::with_capacity(schema, firsts.len());
+    for i in firsts {
+        out.copy_row_at(&rows, i, 1);
+    }
+    Ok(out)
+}
+
+pub(crate) fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -> Result<SqlResult, GnitzSqlError> {
+    let InsertPlan { target, mut rows, conflict, returning } = plan;
+    let (tid, schema) = (target.tid, &target.schema);
+    if serial_col(&target).is_some() {
+        // One durable advance for the whole statement.
+        let n = rows.len();
+        rows.pks = serial_keys(client.reserve_serial_ids(tid, n as u64)?, n, schema)?;
+    }
+    match conflict {
+        ConflictPlan::Error => {
             // The engine refuses `Error` on a stream (its PK is not unique) and
             // leaves `Update` unread: the push appends, so the same row twice is
             // one element at weight 2.
-            let mode = if is_stream {
+            let mode = if target.class == RelClass::Stream {
                 WireConflictMode::Update
             } else {
                 WireConflictMode::Error
@@ -275,72 +331,58 @@ pub(crate) fn execute_insert(
             // will project it, saving a deep clone inside a transaction.
             match returning {
                 Some((schema_out, map)) => {
-                    client.push(tid, schema, &batch, mode)?;
+                    client.push(tid, schema, &rows, mode)?;
                     Ok(SqlResult::Rows {
                         schema: schema_out,
                         batch: match map {
-                            Some(mut m) => m.apply(batch),
-                            None => batch,
+                            Some(mut m) => m.apply(rows),
+                            None => rows,
                         },
                     })
                 }
                 None => {
-                    client.push_owned(tid, schema, batch, mode)?;
-                    Ok(SqlResult::RowsAffected { count: n })
+                    let count = rows.len();
+                    client.push_owned(tid, schema, rows, mode)?;
+                    Ok(SqlResult::RowsAffected { count })
                 }
             }
         }
         ConflictPlan::Resolve { mut set } => {
-            let mut first: HashMap<&[u8], usize> = HashMap::with_capacity(batch.len());
-            for i in 0..batch.len() {
-                match first.entry(batch.pks.get_bytes(i)) {
-                    Entry::Vacant(v) => {
-                        v.insert(i);
-                    }
-                    Entry::Occupied(_) if set.is_some() => {
-                        return Err(GnitzSqlError::Rejected(
-                            "ON CONFLICT DO UPDATE cannot affect row a second time \
-                             (duplicate PK in the same batch)"
-                                .to_string(),
-                        ))
-                    }
-                    Entry::Occupied(_) => {}
-                }
-            }
-            let bound = ReadBound::PkSet(PkKeys::from_keys(schema.pk_stride(), first.keys().copied()));
+            let bound = ReadBound::PkSet(rows.pks.keys());
             let keys_only = set.is_none();
             let count = client.read_modify_write(&target, bound, Vec::new(), keys_only, |held| {
-                resolve_conflicts(&batch, &first, held, set.as_deref_mut(), schema)
+                resolve_conflicts(&rows, held, set.as_deref_mut(), schema)
             })?;
             Ok(SqlResult::RowsAffected { count })
         }
     }
 }
 
-/// The batch an ON CONFLICT pushes: each key's `first` row of `batch`. A key no row
-/// holds passes through; a held key is dropped (DO NOTHING) or merged with the SET
-/// list (DO UPDATE).
+/// The delta an ON CONFLICT pushes, given the rows `held` under the keys of
+/// `rows` (one row per key): a row whose key nothing holds passes through; a
+/// held key is dropped (DO NOTHING) or merged with the SET list (DO UPDATE).
 fn resolve_conflicts(
-    batch: &ZSetBatch,
-    first: &HashMap<&[u8], usize>,
+    rows: &ZSetBatch,
     held: ZSetBatch,
     set: Option<&mut [SetCol]>,
     schema: &Schema,
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    let mut is_held = vec![false; batch.len()];
-    for r in 0..held.len() {
-        is_held[first[held.pks.get_bytes(r)]] = true;
+    let at: HashMap<&[u8], usize> = (0..rows.len()).map(|i| (rows.pks.get_bytes(i), i)).collect();
+    let collided: Vec<usize> = (0..held.len()).map(|r| at[held.pks.get_bytes(r)]).collect();
+    let mut is_held = vec![false; rows.len()];
+    for &i in &collided {
+        is_held[i] = true;
     }
-    let mut out = ZSetBatch::with_capacity(schema, first.len());
-    for i in (0..batch.len()).filter(|&i| !is_held[i] && first[batch.pks.get_bytes(i)] == i) {
-        out.copy_row_at(batch, i, batch.weights[i]);
+    let mut out = ZSetBatch::with_capacity(schema, rows.len());
+    for i in (0..rows.len()).filter(|&i| !is_held[i]) {
+        out.copy_row_at(rows, i, 1);
     }
     if let Some(set) = set {
         // `held` is the `Existing` scope, so `SET x = x + 1` reads the row a
         // transaction buffered; `excluded` is the VALUES row each one collided with.
         let mut excluded = ZSetBatch::with_capacity(schema, held.len());
-        for r in 0..held.len() {
-            excluded.copy_row_at(batch, first[held.pks.get_bytes(r)], 1);
+        for &i in &collided {
+            excluded.copy_row_at(rows, i, 1);
         }
         out.extend_from_owned(apply_set(set, held, Some(&excluded), schema)?);
     }
@@ -358,70 +400,24 @@ fn extract_values_rows(query: &Query) -> Result<&[Parens<Vec<Expr>>], GnitzSqlEr
     }
 }
 
-/// Where each INSERT row's PK comes from, resolved once per statement.
-pub(crate) enum PkPlan {
-    /// SERIAL: row `i` takes `base + i`; exhaustion is checked once, at construction.
-    Serial { base: u64 },
-    /// Written: per PK column in pk-list order, the VALUES slot it reads.
-    Written { slots: Vec<usize> },
-}
-
-impl PkPlan {
-    /// `n` rows drawn from `base`, refused when the last exceeds the type `tc`.
-    pub(crate) fn serial(base: u64, n: usize, tc: TypeCode) -> Result<Self, GnitzSqlError> {
-        let max = FixedInt::from_type_code(tc)
-            .expect("`validate_serial_key` admits only a fixed int")
-            .range()
-            .1;
-        if i128::from(base) + n as i128 - 1 > max {
-            let next = i128::from(base).max(max + 1);
-            return Err(GnitzSqlError::Rejected(format!(
-                "SERIAL primary key exhausted: next value {next} exceeds the column type maximum {max}"
-            )));
-        }
-        Ok(PkPlan::Serial { base })
+/// The keys of `n` SERIAL rows drawn from `base`, refused when the last exceeds
+/// the key column's type.
+fn serial_keys(base: u64, n: usize, schema: &Schema) -> Result<PkColumn, GnitzSqlError> {
+    let tc = schema.columns[schema.pk_cols[0] as usize].ty.tc;
+    let max = FixedInt::from_type_code(tc)
+        .expect("`validate_serial_key` admits only a fixed int")
+        .range()
+        .1;
+    if i128::from(base) + n as i128 - 1 > max {
+        let next = i128::from(base).max(max + 1);
+        return Err(GnitzSqlError::Rejected(format!(
+            "SERIAL primary key exhausted: next value {next} exceeds the column type maximum {max}"
+        )));
     }
-
-    /// `slot_of` is the INSERT's physical-column → VALUES-slot map, `None` where
-    /// a column takes no user value.
-    pub(crate) fn written(slot_of: &[Option<usize>], schema: &Schema) -> Result<Self, GnitzSqlError> {
-        let slots = schema
-            .pk_cols
-            .iter()
-            .map(|&pi| {
-                slot_of.get(pi as usize).copied().flatten().ok_or_else(|| {
-                    GnitzSqlError::Rejected(format!(
-                        "PK column '{}' missing from INSERT row",
-                        schema.columns[pi as usize].name
-                    ))
-                })
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(PkPlan::Written { slots })
-    }
-
-    /// Append row `row_i`'s primary key to `dst`.
-    pub(crate) fn push(
-        &self,
-        schema: &Schema,
-        row_i: usize,
-        cells: &[BExpr<Infallible>],
-        dst: &mut PkColumn,
-    ) -> Result<(), GnitzSqlError> {
-        match self {
-            PkPlan::Serial { base } => dst.push_natives(schema, &[u128::from(base + row_i as u64)]),
-            PkPlan::Written { slots } => {
-                let mut natives = [0u128; gnitz_wire::MAX_PK_COLUMNS];
-                for (k, (&pi, &slot)) in schema.pk_cols.iter().zip(slots).enumerate() {
-                    let def = &schema.columns[pi as usize];
-                    check_not_null(def, matches!(cells[slot], BExpr::LitNull))?;
-                    natives[k] = native_value(&cells[slot], def)?;
-                }
-                dst.push_natives(schema, &natives[..slots.len()]);
-            }
-        }
-        Ok(())
-    }
+    Ok(PkColumn::from_natives(
+        schema,
+        (0..n as u64).map(|i| u128::from(base + i)),
+    ))
 }
 
 #[cfg(test)]

@@ -5,102 +5,28 @@
 use super::*;
 use gnitz_wire::WireStatus::Error;
 
-/// A write clause gnitz does not honour is named rather than dropped, as is a
-/// write its target cannot take — a view, a stream, a reserved name, a row of
-/// the wrong shape; none of them writes anything.
+/// A write the planner refuses reaches the caller as its rejection and writes
+/// nothing, at each verb; the planner's own tests hold the rules.
 #[test]
-fn a_refused_write_names_its_rule_and_writes_nothing() {
+fn a_refused_write_writes_nothing() {
     let mut db = Db::boot(1);
     db.exec(
         "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT NOT NULL, s TEXT);
-         CREATE TABLE c (a BIGINT UNSIGNED, b BIGINT UNSIGNED, v BIGINT, PRIMARY KEY (a, b));
-         CREATE TABLE st (id BIGINT PRIMARY KEY, v BIGINT) WITH (stream = true);
-         CREATE VIEW vw AS SELECT * FROM t;
+         CREATE TABLE sr (id SERIAL PRIMARY KEY, v BIGINT NOT NULL);
          INSERT INTO t VALUES (1, 10, 'a')",
     );
     for (sql, needle) in [
-        // A VALUES row carries exactly one value per column, and only values the
-        // writer evaluates — an unsupported one echoed as written.
-        ("INSERT INTO t VALUES (2, 20)", "expects 3 value(s)"),
-        ("INSERT INTO t VALUES (2, 20, 'b', 99)", "expects 3 value(s)"),
-        (
-            "INSERT INTO t VALUES (2, EXTRACT(YEAR FROM 2), 'b')",
-            "EXTRACT(YEAR FROM 2)",
-        ),
-        ("INSERT INTO t VALUES (2, NULL, 'b')", "NOT NULL"),
-        ("INSERT INTO t VALUES (2, 20, 'b') LIMIT 1", "LIMIT/OFFSET"),
-        ("INSERT INTO t VALUES (2, 20, 'b') FOR UPDATE", "FOR UPDATE"),
-        ("INSERT IGNORE INTO t VALUES (2, 20, 'b')", "IGNORE"),
-        ("REPLACE INTO t VALUES (2, 20, 'b')", "REPLACE INTO"),
-        // RETURNING binds as a SELECT list does, so it refuses what one refuses,
-        // and it is not accepted beside ON CONFLICT.
-        (
-            "INSERT INTO t VALUES (2, 20, 'b') RETURNING * REPLACE (v + 1 AS v)",
-            "REPLACE",
-        ),
-        (
-            "INSERT INTO t VALUES (2, 20, 'b') ON CONFLICT (id) DO NOTHING RETURNING id",
-            "ON CONFLICT: RETURNING",
-        ),
-        // A conflict target names exactly the primary key: not another column,
-        // not more, not a prefix.
-        (
-            "INSERT INTO t VALUES (2, 20, 'b') ON CONFLICT (v) DO NOTHING",
-            "primary key",
-        ),
-        (
-            "INSERT INTO t VALUES (2, 20, 'b') ON CONFLICT (id, v) DO NOTHING",
-            "primary key",
-        ),
-        (
-            "INSERT INTO c VALUES (1, 1, 10) ON CONFLICT (a) DO NOTHING",
-            "primary key",
-        ),
-        (
-            "INSERT INTO t VALUES (1, 20, 'b') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v WHERE v > 5",
-            "DO UPDATE: WHERE",
-        ),
-        (
-            "INSERT INTO t VALUES (1, 20, 'b'), (1, 30, 'c') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
-            "second time",
-        ),
-        ("UPDATE t SET v = 9 WHERE id = 1 RETURNING id", "RETURNING"),
-        ("DELETE FROM t WHERE id = 1 RETURNING id", "RETURNING"),
-        ("DELETE FROM t LIMIT 1", "LIMIT"),
-        ("DELETE FROM t ORDER BY id", "ORDER BY"),
-        // The join forms are refused before any name resolves, so `other` need
-        // not exist.
-        ("UPDATE t SET v = o.v FROM other o WHERE t.id = o.id", "join-update"),
-        ("DELETE FROM t USING other o WHERE t.id = o.id", "join-delete"),
-        ("UPDATE t JOIN c ON t.id = c.a SET v = 1", "exactly one simple FROM"),
-        ("UPDATE t SET id = 9 WHERE id = 1", "primary key"),
+        ("INSERT INTO t VALUES (2, 20, 'b'), (3, NULL, 'c')", "NOT NULL"),
         ("UPDATE t SET v = UPPER(s)", "cannot assign a string value"),
-        // A written alias displaces the table name, and a qualifier naming
-        // anything else is not silently ignored.
-        ("UPDATE t AS x SET v = 1 WHERE t.v = 1", "not found"),
-        ("DELETE FROM t WHERE nope.v = 1", "not found"),
-        // A view is read-only.
-        ("INSERT INTO vw VALUES (2, 20, 'b')", "is a view"),
-        ("UPDATE vw SET v = 1 WHERE id = 1", "is a view"),
-        ("DELETE FROM vw", "is a view"),
-        ("CREATE INDEX ix ON vw (v)", "is a view"),
-        // A reserved name is refused before the catalog is probed.
-        ("INSERT INTO _seg999999 VALUES (1, 1)", "cannot start with '_'"),
-        ("CREATE INDEX ix ON _seg999999 (v)", "cannot start with '_'"),
-        // A stream has no stored row to mutate or to resolve a conflict against.
-        ("UPDATE st SET v = 1 WHERE id = 1", "is a stream"),
-        ("DELETE FROM st WHERE id = 1", "is a stream"),
-        (
-            "INSERT INTO st VALUES (1, 2) ON CONFLICT (id) DO NOTHING",
-            "is a stream",
-        ),
+        ("DELETE FROM t LIMIT 1", "LIMIT"),
+        ("INSERT INTO sr VALUES (1), (NULL)", "NOT NULL"),
     ] {
         db.refuses(sql, Rejected, needle);
     }
-    assert!(db.scan("c", &["a"]).is_empty());
-    // The written alias is the one qualifier that answers.
-    db.exec("UPDATE t AS x SET v = 11 WHERE x.v = 10");
-    assert_eq!(db.scan("t", &["id", "v"]), [[1, 11, 1]]);
+    assert_eq!(db.scan("t", &["id", "v"]), [[1, 10, 1]]);
+    // The refused statement drew no SERIAL id.
+    db.exec("INSERT INTO sr VALUES (7)");
+    assert_eq!(db.scan("sr", &["id", "v"]), [[1, 7, 1]]);
 }
 
 /// Transaction control is a client-side state machine: a COMMIT or ROLLBACK
@@ -246,18 +172,6 @@ fn a_text_table_past_one_frame_reads_back_whole() {
 }
 
 // ── ON CONFLICT / UPDATE / DELETE ────────────────────────────────────────────
-
-#[test]
-fn on_conflict_do_update_sets_a_double_from_excluded() {
-    let mut db = Db::boot(2);
-    db.exec(
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, f DOUBLE);
-         INSERT INTO t VALUES (1, 1.5);
-         INSERT INTO t VALUES (1, 2.25) ON CONFLICT (id) DO UPDATE SET f = EXCLUDED.f",
-    );
-    assert_eq!(db.rows("SELECT id FROM t WHERE f = 2.25", &["id"]), [[1, 1]]);
-    assert_eq!(db.scan("t", &["id"]), [[1, 1]]);
-}
 
 /// Inside a transaction, ON CONFLICT resolves each VALUES row against a buffered
 /// row, a buffered delete and a committed row. The VALUES rows run opposite to

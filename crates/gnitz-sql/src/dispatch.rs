@@ -91,9 +91,24 @@ pub(crate) fn execute_statement(
             client.txn_rollback()?;
             Ok(SqlResult::TransactionRolledBack)
         }
-        Statement::Insert(insert) => dml::execute_insert(client, schema_name, insert),
-        Statement::Update(update) => dml::execute_update(client, schema_name, update),
-        Statement::Delete(del) => dml::execute_delete(client, schema_name, del),
+        Statement::Insert(insert) => {
+            let plan = planned(client, schema_name, GnitzClient::resolve, |cat| {
+                dml::plan_insert(insert, cat)
+            })?;
+            dml::execute_insert(client, plan)
+        }
+        Statement::Update(update) => {
+            let plan = planned(client, schema_name, GnitzClient::resolve, |cat| {
+                dml::plan_update(update, cat)
+            })?;
+            dml::execute_mutation(client, plan)
+        }
+        Statement::Delete(del) => {
+            let plan = planned(client, schema_name, GnitzClient::resolve, |cat| {
+                dml::plan_delete(del, cat)
+            })?;
+            dml::execute_mutation(client, plan)
+        }
         // Refused, not failed: the transaction stays open.
         _ if client.txn_active() => Err(GnitzSqlError::Rejected(
             "this statement is not allowed inside a transaction".to_string(),

@@ -118,6 +118,7 @@ fn create_index_naming_and_rejections() {
         "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b_c BIGINT, a_b BIGINT, c BIGINT, s TEXT, \
          f DOUBLE PRECISION);
          CREATE TABLE st (id BIGINT PRIMARY KEY, v BIGINT) WITH (stream = true);
+         CREATE VIEW vw AS SELECT * FROM t;
          CREATE INDEX my_idx ON t(a)",
     );
     // A named index does not carry the auto-name, so the auto-named one on the
@@ -148,8 +149,11 @@ fn create_index_naming_and_rejections() {
         ("CREATE INDEX ON t(ghost)", "ghost"),
         ("CREATE INDEX ON t(a, a)", "duplicate column"),
         ("CREATE INDEX ix ON t (a) WHERE a > 0", "partial index"),
-        // A stream holds no rows to index.
+        // A stream holds no rows to index, a view is not a table, and a reserved
+        // name is refused before the catalog is probed.
         ("CREATE INDEX ON st(v)", "is a stream"),
+        ("CREATE INDEX ON vw(a)", "is a view"),
+        ("CREATE INDEX ON _seg999999 (v)", "cannot start with '_'"),
     ] {
         db.refuses(sql, Rejected, needle);
     }

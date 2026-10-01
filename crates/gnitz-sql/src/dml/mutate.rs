@@ -1,14 +1,17 @@
 //! UPDATE and DELETE, as one read-then-write flow: plan the WHERE through the
 //! shared access-path ladder (`dml::plan`), then, as one read-modify-write, read
 //! the rows it matches and write the rewritten rows (UPDATE) or the retraction of
-//! their keys (DELETE).
+//! their keys (DELETE). Planning reads only the catalog, so a refused statement
+//! issues no request.
 //!
 //! The SET list — [`bind_set_list`] binds the targets, [`classify_set_rhs`]
 //! compiles each value, [`apply_set`] rewrites a batch — is shared with INSERT's
 //! `ON CONFLICT DO UPDATE`.
 
-use crate::ast_util::{classify_from, extract_table_name_and_alias, single_part_ident, FromShape};
-use crate::bind::{bind_single_table, find_unique_column};
+use crate::ast_util::{
+    classify_from, col_ref_parts, expr_any, extract_table_name_and_alias, single_part_ident, FromShape,
+};
+use crate::bind::{bind_single_table, find_unique_column, Catalog};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
 use crate::dml::plan::access_path;
 use crate::error::GnitzSqlError;
@@ -16,50 +19,48 @@ use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::BoundExpr;
 use crate::validate::{reject_unhonored_delete_clauses, reject_unhonored_update_clauses, require_class, ClassWant};
 use crate::SqlResult;
-use gnitz_core::{retraction_batch, GnitzClient, Schema, ZSetBatch};
+use gnitz_core::{retraction_batch, GnitzClient, RelDescriptor, Schema, ZSetBatch};
 use gnitz_expr::{ExprResults, ScalarEval, SchemaFacts};
 use gnitz_wire::{encode_german_string, german_string_content, null_word_get, null_word_set};
-use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
+use gnitz_wire::{ColType, ColumnDef, FixedInt, ReadBound, TypeCode};
 use sqlparser::ast::{Assignment, AssignmentTarget, Delete, Expr, FromTable, TableWithJoins, Update};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // UPDATE / DELETE
 // ---------------------------------------------------------------------------
 
-pub(crate) fn execute_update(
-    client: &mut GnitzClient,
-    schema_name: &str,
-    update: &Update,
-) -> Result<SqlResult, GnitzSqlError> {
+/// A single-table UPDATE (`set` present) or DELETE, planned: the read that
+/// finds its rows and what to write for them.
+pub(crate) struct MutationPlan {
+    target: Arc<RelDescriptor>,
+    bound: ReadBound,
+    predicate: Vec<u8>,
+    set: Option<Vec<SetCol>>,
+}
+
+pub(crate) fn plan_update(update: &Update, cat: &Catalog<'_>) -> Result<MutationPlan, GnitzSqlError> {
     reject_unhonored_update_clauses(update)?;
-    execute_mutation(
-        client,
-        schema_name,
+    plan_mutation(
         std::slice::from_ref(&update.table),
         update.selection.as_ref(),
         Some(&update.assignments),
+        cat,
     )
 }
 
-pub(crate) fn execute_delete(
-    client: &mut GnitzClient,
-    schema_name: &str,
-    del: &Delete,
-) -> Result<SqlResult, GnitzSqlError> {
+pub(crate) fn plan_delete(del: &Delete, cat: &Catalog<'_>) -> Result<MutationPlan, GnitzSqlError> {
     reject_unhonored_delete_clauses(del)?;
     let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = &del.from;
-    execute_mutation(client, schema_name, from, del.selection.as_ref(), None)
+    plan_mutation(from, del.selection.as_ref(), None, cat)
 }
 
-/// A single-table UPDATE (`set` present) or DELETE: read the rows the WHERE
-/// matches, then write the rewritten rows or the retraction of their keys.
-fn execute_mutation(
-    client: &mut GnitzClient,
-    schema_name: &str,
+fn plan_mutation(
     from: &[TableWithJoins],
     selection: Option<&Expr>,
     set: Option<&[Assignment]>,
-) -> Result<SqlResult, GnitzSqlError> {
+    cat: &Catalog<'_>,
+) -> Result<MutationPlan, GnitzSqlError> {
     let verb = if set.is_some() { "UPDATE" } else { "DELETE" };
     // `UPDATE a JOIN b ON … SET v = 1` parses; honoring only the relation would
     // update all of `a`.
@@ -68,21 +69,34 @@ fn execute_mutation(
             "{verb}: exactly one simple FROM table required"
         )));
     };
-    let (table_name, alias) = extract_table_name_and_alias(factor, schema_name, verb)?;
-    let target = client.resolve_relation(schema_name, &table_name)?;
+    let (table_name, alias) = extract_table_name_and_alias(factor, cat.schema_name(), verb)?;
+    let target = cat.probe_relation(&table_name)?;
     require_class(&target, &table_name, ClassWant::BaseTable, verb)?;
     let schema = &target.schema;
-    // Before the read, so a bad SET list errors whether or not a row matches.
-    let mut set = set
+    let set = set
         .map(|raw| bind_set_list(raw, schema, &alias, SetClause::Update))
         .transpose()?;
     let (bound, predicate) = access_path(schema, &alias, selection, &target.indexes)?;
+    Ok(MutationPlan { target, bound, predicate, set })
+}
+
+/// Read the rows the WHERE matches, then write [`delta`] of them.
+pub(crate) fn execute_mutation(client: &mut GnitzClient, plan: MutationPlan) -> Result<SqlResult, GnitzSqlError> {
+    let MutationPlan { target, bound, predicate, mut set } = plan;
     let keys_only = set.is_none();
-    let count = client.read_modify_write(&target, bound, predicate, keys_only, |rows| match &mut set {
-        Some(set) => apply_set(set, rows, None, schema),
-        None => Ok(retraction_batch(schema, rows.pks)),
+    let count = client.read_modify_write(&target, bound, predicate, keys_only, |rows| {
+        delta(set.as_deref_mut(), rows, &target.schema)
     })?;
     Ok(SqlResult::RowsAffected { count })
+}
+
+/// What a mutation writes for the `rows` it read: under a SET list the rewritten
+/// rows (UPDATE), without one the retraction of their keys (DELETE).
+fn delta(set: Option<&mut [SetCol]>, rows: ZSetBatch, schema: &Schema) -> Result<ZSetBatch, GnitzSqlError> {
+    match set {
+        Some(set) => apply_set(set, rows, None, schema),
+        None => Ok(retraction_batch(schema, rows.pks)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -92,17 +106,17 @@ fn execute_mutation(
 /// Which row a SET right-hand side reads: the row being rewritten, or (ON
 /// CONFLICT DO UPDATE) the incoming VALUES row that collided with it.
 #[derive(Clone, Copy)]
-pub(crate) enum Scope {
+enum Scope {
     Existing,
     Excluded,
 }
 
-pub(crate) struct SetCol {
+pub(super) struct SetCol {
     ci: usize,
     rhs: SetRhs,
 }
 
-pub(crate) enum SetRhs {
+enum SetRhs {
     /// A literal, encoded once by INSERT's cell encoder into one target cell (a
     /// string's spill in `spill`).
     Const { cell: Vec<u8>, spill: Vec<u8>, null: bool },
@@ -184,7 +198,7 @@ fn bind_set_rhs(
         }
         // `col + EXCLUDED.col`. The binder already rejects it (`EXCLUDED` names no
         // relation in scope); this says why, which its message cannot.
-        if expr_contains_excluded(expr) {
+        if expr_any(expr, &|e| excluded_col(e).is_some()) {
             return Err(GnitzSqlError::Rejected(
                 "EXCLUDED column references inside compound expressions are not \
                  supported; use a simple `col = EXCLUDED.col` assignment"
@@ -200,35 +214,19 @@ fn bind_set_rhs(
     )
 }
 
-/// The column an `EXCLUDED.<col>` reference names. Deliberately unpeeled: the
-/// binder resolves `(EXCLUDED.a)` as an ordinary reference, so accepting the
-/// parenthesized form here would bind it to the *existing* row's column.
+/// The column an `EXCLUDED.<col>` reference names.
 fn excluded_col(e: &Expr) -> Option<&str> {
-    match e {
-        Expr::CompoundIdentifier(p) if p.len() == 2 && p[0].value.eq_ignore_ascii_case("EXCLUDED") => {
-            Some(p[1].value.as_str())
-        }
+    match col_ref_parts(e) {
+        Some((Some(q), col)) if q.eq_ignore_ascii_case("EXCLUDED") => Some(col),
         _ => None,
     }
-}
-
-/// True when `expr` references `EXCLUDED.<col>` anywhere the binder would reach.
-/// Recognized by [`excluded_col`], the same rule the accept path takes, so the
-/// guard cannot miss a form that path would have bound.
-fn expr_contains_excluded(expr: &Expr) -> bool {
-    crate::ast_util::expr_any(expr, &|e| excluded_col(e).is_some())
 }
 
 /// Compile one SET right-hand side for column `target`, against the schema the
 /// rows it reads carry. Every kind rejection happens here, before any row is
 /// read; a computed value's range and a NULL into a NOT NULL column are the
 /// verdicts [`apply_set`] takes per row.
-pub(crate) fn classify_set_rhs(
-    expr: &BoundExpr,
-    scope: Scope,
-    target: usize,
-    schema: &Schema,
-) -> Result<SetRhs, GnitzSqlError> {
+fn classify_set_rhs(expr: &BoundExpr, scope: Scope, target: usize, schema: &Schema) -> Result<SetRhs, GnitzSqlError> {
     let col = &schema.columns[target];
     let ty = col.ty;
     if expr.is_literal() {
@@ -293,7 +291,7 @@ pub(crate) fn classify_set_rhs(
 /// Rewritten columns are built in `new` and swapped in. Assigning a string column
 /// also rebuilds every other string column into `new`, whose arena then replaces
 /// `rows`'; otherwise nothing is encoded and `rows`' arena is kept.
-pub(crate) fn apply_set(
+pub(super) fn apply_set(
     set: &mut [SetCol],
     mut rows: ZSetBatch,
     excluded: Option<&ZSetBatch>,

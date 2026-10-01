@@ -5,7 +5,8 @@ use crate::bind::Catalog;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use gnitz_core::{BatchAppender, PlannedView, RelDescriptor, Schema, ZSetBatch};
-use gnitz_wire::{ColType, ColumnDef, PkColList, RelClass, RelIndex, TypeCode};
+use gnitz_expr::{payload_str, payload_u64, ColumnLocator, SchemaFacts};
+use gnitz_wire::{ColType, ColumnDef, FixedInt, PkColList, RelClass, RelIndex, TypeCode};
 use sqlparser::ast::Expr;
 use std::sync::Arc;
 
@@ -161,6 +162,34 @@ pub(crate) fn batch_of(schema: &Schema, rows: &[&[Cell]]) -> ZSetBatch {
     b
 }
 
+/// Each row of `b` (in `schema`) as its payload cells and weight — what
+/// [`batch_of`] wrote, read back.
+pub(crate) fn rows_of<'a>(schema: &Schema, b: &'a ZSetBatch) -> Vec<(Vec<Cell<'a>>, i64)> {
+    let locs = schema.payload_locators();
+    let cell = |r: usize, pi: usize, loc: &ColumnLocator| {
+        let tc = loc.type_code();
+        if loc.is_null(b, r) {
+            Cell::Null
+        } else if tc.is_german_string() {
+            Cell::Str(payload_str(b, r, pi))
+        } else if tc == TypeCode::F64 {
+            Cell::F64(f64::from_bits(payload_u64(b, r, pi)))
+        } else {
+            let fi = FixedInt::from_type_code(tc).expect("an integer column");
+            let v = loc.decode_i64(b, r, fi);
+            Cell::Int(if fi.is_signed() { v as i128 } else { v as u64 as i128 })
+        }
+    };
+    (0..b.len())
+        .map(|r| {
+            (
+                locs.iter().enumerate().map(|(pi, loc)| cell(r, pi, loc)).collect(),
+                b.weights[r],
+            )
+        })
+        .collect()
+}
+
 /// Parse + bind an expression against `schema` as relation `t`, which is what
 /// every qualified reference in these tests writes.
 pub(crate) fn bind_sql(sql: &str, schema: &Schema) -> Result<BoundExpr, GnitzSqlError> {
@@ -174,6 +203,20 @@ pub(crate) fn rejected<T>(r: Result<T, GnitzSqlError>) -> String {
         Err(e) => panic!("expected Rejected, got {e:?}"),
         Ok(_) => panic!("expected Rejected, got Ok"),
     }
+}
+
+/// Assert `r` is a rejection whose message contains `want` — the guard's
+/// identity, not its wording. `what` labels the failure (the SQL, usually).
+pub(crate) fn assert_rejects<T>(what: &str, r: Result<T, GnitzSqlError>, want: &str) {
+    let msg = match r {
+        Err(GnitzSqlError::Rejected(m)) => m,
+        Err(e) => panic!("`{what}`: expected a rejection, got {e:?}"),
+        Ok(_) => panic!("`{what}` was accepted"),
+    };
+    assert!(
+        msg.contains(want),
+        "for `{what}`\n  expected substring: {want:?}\n  got: {msg:?}"
+    );
 }
 
 /// [`bind_sql`] of a WHERE predicate, as its bound conjuncts.

@@ -23,20 +23,6 @@ use gnitz_core::PlannedView;
 use gnitz_wire::{Circuit, OpNode, RelClass, TypeCode};
 use sqlparser::ast::Statement;
 
-/// Assert `r` is a rejection whose message contains `want` — the guard's
-/// identity, not its wording. `what` labels the failure (the SQL, usually).
-fn assert_rejects<T>(what: &str, r: Result<T, GnitzSqlError>, want: &str) {
-    let msg = match r {
-        Err(GnitzSqlError::Rejected(m)) => m,
-        Err(e) => panic!("`{what}`: expected a rejection, got {e:?}"),
-        Ok(_) => panic!("`{what}` was accepted"),
-    };
-    assert!(
-        msg.contains(want),
-        "for `{what}`\n  expected substring: {want:?}\n  got: {msg:?}"
-    );
-}
-
 /// The fixture every pure file plans against. Every `BIGINT` column is `I64`.
 ///
 /// | name | shape |

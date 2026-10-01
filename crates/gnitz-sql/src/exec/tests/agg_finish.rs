@@ -1,10 +1,9 @@
 use super::*;
 use crate::hir::bind_and_lower_fold;
 use crate::test_support::Cell::{self, Int, Null, Str, F64};
-use crate::test_support::{col, ncol, parse_query, table};
+use crate::test_support::{col, ncol, parse_query, rows_of, table};
 use gnitz_core::{BatchAppender, PkColumn, RelDescriptor};
-use gnitz_expr::{payload_str, payload_u64};
-use gnitz_wire::{global_group_key, FixedInt, TypeCode};
+use gnitz_wire::{global_group_key, TypeCode};
 
 /// A long body, spilled to the arena rather than inlined in its German cell.
 const LONG_M: &str = "a string past the inline prefix: m";
@@ -57,33 +56,6 @@ fn reply(f: &FoldFinish, rows: &[(&[u128], &[Cell])]) -> ZSetBatch {
     b
 }
 
-/// Each row of `b` (in `schema`) as its payload cells and weight.
-fn rows<'a>(schema: &Schema, b: &'a ZSetBatch) -> Vec<(Vec<Cell<'a>>, i64)> {
-    let locs = schema.payload_locators();
-    let cell = |r: usize, pi: usize, loc: &ColumnLocator| {
-        let tc = loc.type_code();
-        if loc.is_null(b, r) {
-            Null
-        } else if tc.is_german_string() {
-            Str(payload_str(b, r, pi))
-        } else if tc == TypeCode::F64 {
-            F64(f64::from_bits(payload_u64(b, r, pi)))
-        } else {
-            let fi = FixedInt::from_type_code(tc).expect("an integer column");
-            let v = loc.decode_i64(b, r, fi);
-            Int(if fi.is_signed() { v as i128 } else { v as u64 as i128 })
-        }
-    };
-    (0..b.len())
-        .map(|r| {
-            (
-                locs.iter().enumerate().map(|(pi, loc)| cell(r, pi, loc)).collect(),
-                b.weights[r],
-            )
-        })
-        .collect()
-}
-
 /// Replies concatenate in worker order: keys unsorted, a group split across two workers.
 #[test]
 fn the_output_row_carries_the_engine_group_key() {
@@ -99,7 +71,7 @@ fn the_output_row_carries_the_engine_group_key() {
 
     assert_eq!(got.pks, PkColumn::from_natives(f.out_schema(), [0x2222, 0x1111]));
     assert_eq!(
-        rows(f.out_schema(), &got),
+        rows_of(f.out_schema(), &got),
         [(vec![Int(20), Int(1)], 1), (vec![Int(10), Int(5)], 1)]
     );
 }
@@ -127,12 +99,15 @@ fn partials_merge_per_aggregate_with_null_as_identity() {
     ));
     let (wrapped, signed_min, past_prefix) = (Int(i64::MIN as i128), Int(-7), Str(LONG_Z));
     assert_eq!(
-        rows(f.out_schema(), &got),
+        rows_of(f.out_schema(), &got),
         [(vec![Int(6), wrapped, F64(3.75), signed_min, past_prefix], 1)]
     );
 
     let got = f.finish(reply(&f, &[(&[v0], ground), (&[v0], ground)]));
-    assert_eq!(rows(f.out_schema(), &got), [(vec![Int(0), Null, Null, Null, Null], 1)]);
+    assert_eq!(
+        rows_of(f.out_schema(), &got),
+        [(vec![Int(0), Null, Null, Null, Null], 1)]
+    );
 }
 
 /// Group 0x2 passes HAVING only once its two partials merge.
@@ -155,7 +130,7 @@ fn having_filters_combined_groups_before_the_finalize_map() {
     got.validate(f.out_schema()).unwrap();
     assert_eq!(got.pks, PkColumn::from_natives(f.out_schema(), [0x1, 0x2]));
     assert_eq!(
-        rows(f.out_schema(), &got),
+        rows_of(f.out_schema(), &got),
         [(vec![Int(2), Null, Int(3)], 1), (vec![Int(2), Str(LONG_M), Int(3)], 1)]
     );
 }
@@ -169,7 +144,7 @@ fn avg_divides_an_unsigned_sum_unsigned_and_nulls_on_a_zero_count() {
     ));
 
     assert_eq!(
-        rows(f.out_schema(), &got),
+        rows_of(f.out_schema(), &got),
         [(vec![F64(u64::MAX as f64)], 1), (vec![Null], 1)]
     );
 }
@@ -199,7 +174,7 @@ fn a_whole_pk_natural_partial_merges_only_its_aggregates() {
     ));
 
     assert_eq!(
-        rows(f.out_schema(), &got),
+        rows_of(f.out_schema(), &got),
         [
             (vec![Int(7), Int(-1), Int(4), Int(30), Int(-4)], 1),
             (vec![Int(7), Int(2), Int(2), Int(5), Int(1)], 1)
