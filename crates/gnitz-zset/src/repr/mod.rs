@@ -48,7 +48,7 @@ pub use batch::Batch;
 pub use batch_builder::BatchBuilder;
 pub use batch_pool::PooledBuf;
 pub use batch_wire::{WalBlock, WireRows};
-pub use compact::{guard_slot, merge_and_route, EmitGuard};
+pub use compact::{guard_slot, merge_and_route};
 pub use error::StorageError;
 pub use merge::{merge_consolidated, MemBatch};
 pub use read_cursor::{

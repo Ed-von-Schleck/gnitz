@@ -11,10 +11,15 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 /// Every `(guard_key, skeleton, batch)` [`merge_and_route`] emits, in order.
-fn route(shards: &[Rc<MappedShard>], guards: &[(PkBuf, bool)], schema: &SchemaDescriptor) -> Vec<(PkBuf, bool, Batch)> {
+fn route(
+    shards: &[Rc<MappedShard>],
+    guards: &[PkBuf],
+    dehydrate: bool,
+    schema: &SchemaDescriptor,
+) -> Vec<(PkBuf, bool, Batch)> {
     let inputs: Vec<&MappedShard> = shards.iter().map(|s| &**s).collect();
     let mut out = Vec::new();
-    merge_and_route(&inputs, guards, schema, &mut |&(gk, skeleton), batch| {
+    merge_and_route(&inputs, guards, dehydrate, schema, &mut |gk, skeleton, batch| {
         out.push((gk, skeleton, batch));
         Ok(())
     })
@@ -52,7 +57,7 @@ fn guard_slot_saturates_at_both_ends() {
 #[test]
 #[should_panic(expected = "at least one guard")]
 fn merge_and_route_rejects_empty_guards() {
-    route(&[], &[], &make_schema_u64_i64());
+    route(&[], &[], false, &make_schema_u64_i64());
 }
 
 proptest! {
@@ -65,7 +70,7 @@ proptest! {
         (si, rows) in arb_fold_case(),
         picks in prop::collection::vec(any::<prop::sample::Index>(), 0..5),
         below_all in any::<bool>(),
-        skel in any::<u8>(),
+        dehydrate in any::<bool>(),
     ) {
         let s = fold_schemas()[si];
         let runs: Vec<Batch> = rows
@@ -106,14 +111,10 @@ proptest! {
         };
         // A skeleton fold asserts its per-PK sums are never negative, which a
         // positive integral guarantees; these rows carry no such guarantee.
-        let guards: Vec<(PkBuf, bool)> = keys
-            .iter()
-            .enumerate()
-            .map(|(g, &k)| (k, skel >> (g % 8) & 1 == 1 && per_pk(g).values().all(|&w| w >= 0)))
-            .collect();
+        let skeleton = dehydrate && (0..keys.len()).all(|g| per_pk(g).values().all(|&w| w >= 0));
 
-        let mut emitted = route(&shards, &guards, &s).into_iter().peekable();
-        for (g, &(key, skeleton)) in guards.iter().enumerate() {
+        let mut emitted = route(&shards, &keys, skeleton, &s).into_iter().peekable();
+        for (g, &key) in keys.iter().enumerate() {
             let what = format!("guard {g} (skeleton {skeleton})");
             let want_skeleton: Vec<(Vec<u8>, i64)> = per_pk(g).into_iter().filter(|&(_, w)| w != 0).collect();
             let hydrated_want = fold_batch(&s, &share(g));
@@ -146,7 +147,7 @@ fn a_skeleton_output_is_payload_free_on_disk() {
         &make_batch(&schema, &[(1, 1, 10), (1, 2, 20), (2, 5, 30)]),
         ShardWriteOpts::default(),
     );
-    let [(_, true, batch)] = &route(&[src], &[(PkBuf::zeroed(8), true)], &schema)[..] else {
+    let [(_, true, batch)] = &route(&[src], &[PkBuf::zeroed(8)], true, &schema)[..] else {
         panic!("one skeleton guard, one output");
     };
     let path = dir.path().join("out.db");
@@ -165,6 +166,56 @@ fn a_skeleton_output_is_payload_free_on_disk() {
     assert_eq!(header.file_npc, 0, "zero payload arity");
     assert!(header.skeleton, "declared skeleton");
     assert_eq!(region_dir(&raw, REG_NULL_BMP), (8, Encoding::Constant));
+}
+
+/// A skeleton input makes every output a skeleton, asked or not: its rows carry
+/// no payload to write back full width.
+#[test]
+fn a_skeleton_input_makes_every_output_a_skeleton() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    let hydrated = make_batch(&schema, &[(1, 1, 10), (9, 1, 90)]);
+    let [(_, true, coarse)] = &route(
+        &[map_shard(
+            &dir.path().join("a.db"),
+            &hydrated,
+            ShardWriteOpts::default(),
+        )],
+        &[PkBuf::zeroed(8)],
+        true,
+        &schema,
+    )[..] else {
+        panic!("one skeleton output");
+    };
+    // Written PK-only, read back under the relation's schema as a store does.
+    let path = dir.path().join("b.db");
+    let opts = ShardWriteOpts { skeleton: true, ..Default::default() };
+    coarse.write_as_shard(path.to_str().unwrap(), opts).unwrap();
+    let skeleton = Rc::new(MappedShard::open(path.to_str().unwrap(), &schema).unwrap());
+    let fresh = map_shard(
+        &dir.path().join("c.db"),
+        &make_batch(&schema, &[(1, 2, 11), (5, 1, 50)]),
+        ShardWriteOpts::default(),
+    );
+
+    let guards = [PkBuf::zeroed(8), PkBuf::from_bytes(&5u64.to_be_bytes())];
+    let out = route(&[skeleton, fresh], &guards, false, &schema);
+    let rows: Vec<(bool, Vec<(u64, i64)>)> = out
+        .iter()
+        .map(|(_, skel, b)| {
+            assert_eq!(*b.schema(), schema.pk_only());
+            let rows = (0..b.count)
+                .map(|r| {
+                    (
+                        u64::from_be_bytes(b.get_pk_bytes(r).try_into().unwrap()),
+                        b.get_weight(r),
+                    )
+                })
+                .collect();
+            (*skel, rows)
+        })
+        .collect();
+    assert_eq!(rows, [(true, vec![(1, 3)]), (true, vec![(5, 1), (9, 1)])]);
 }
 
 /// Compaction over packed inputs that all hold the same keys, so the merge breaks
@@ -200,14 +251,14 @@ fn for_compaction_bench() {
                 )
             })
             .collect();
-        let guard_keys: Vec<(PkBuf, bool)> = (0..guards)
-            .map(|g| (PkBuf::from_bytes(&((g * per / guards) as u64).to_be_bytes()), skeleton))
+        let guard_keys: Vec<PkBuf> = (0..guards)
+            .map(|g| PkBuf::from_bytes(&((g * per / guards) as u64).to_be_bytes()))
             .collect();
         let inputs: Vec<&MappedShard> = inputs.iter().map(|s| &**s).collect();
         let rss0 = settled_rss();
         let (((), i), c) = cycles.measure(|| {
             instructions.measure(|| {
-                merge_and_route(&inputs, &guard_keys, &schema, &mut |_, batch| {
+                merge_and_route(&inputs, &guard_keys, skeleton, &schema, &mut |_, _, batch| {
                     black_box(batch);
                     Ok(())
                 })

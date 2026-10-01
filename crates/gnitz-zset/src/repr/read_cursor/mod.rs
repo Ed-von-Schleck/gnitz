@@ -731,7 +731,9 @@ fn build(
 ) -> ReadCursor {
     let mut sources = Vec::with_capacity(cap);
     let mut states = Vec::with_capacity(cap);
-    for run in runs {
+    // `for_each`, not `for`: the stores hand in nested adaptors, which fold
+    // far cheaper than they step.
+    runs.into_iter().for_each(|run| {
         debug_assert!(
             !matches!(&run, Run::Mem(b) if !b.is_consolidated()),
             "a cursor run must be folded"
@@ -741,7 +743,7 @@ fn build(
             sources.push(run);
             states.push(PosCursor::new(count));
         }
-    }
+    });
     ReadCursor::new(sources, states, schema, position)
 }
 

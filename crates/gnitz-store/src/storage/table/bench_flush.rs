@@ -68,17 +68,105 @@ fn gen_churn(schema: &SchemaDescriptor, h: usize, d: usize, ticks: usize) -> Vec
         .collect()
 }
 
-/// One tick of `d` rows at keys drawn uniformly over `keyspace`, weight +1 — the
-/// arrival order a `map_reindex`'d store sees, and the expensive one for the FLSM
-/// tree: every L0 fold reaches every guard, and every vertical lands on terminal
-/// bytes already there. Streamed a tick at a time rather than materialized like
-/// the generators above, which run far fewer ticks.
-fn scatter_tick(schema: &SchemaDescriptor, rng: &mut crate::test_support::Rng, d: usize, keyspace: u64) -> Batch {
-    let mut keys: Vec<u64> = (0..d).map(|_| rng.gen_range(keyspace)).collect();
-    keys.sort_unstable();
+/// The arrival shapes `compaction_amplification_bench` sweeps, one tick of
+/// `(key, payload, weight)` rows at a time. A scattered tick reaches every
+/// guard; the others are the orders real tables arrive in.
+struct Arrival {
+    shape: String,
+    keyspace: u64,
+    ticks: usize,
+    rng: crate::test_support::Rng,
+    /// `churn`: each hot key's live payload, and the round-robin position.
+    live: Vec<Option<i64>>,
+    next: u64,
+}
+
+impl Arrival {
+    fn tick(&mut self, t: usize, d: u64) -> Vec<(u64, i64, i64)> {
+        let ks = self.keyspace;
+        let fresh = |i: u64| t as u64 * d + i;
+        match self.shape.as_str() {
+            // Uniform over the key space: the order a `map_reindex`'d store sees.
+            "scattered" => (0..d)
+                .map(|_| self.rng.gen_range(ks))
+                .map(|k| (k, k as i64, 1))
+                .collect(),
+            // Ascending and fresh: an INSERT stream, and every delta store.
+            "monotone" => (0..d).map(fresh).map(|k| (k, k as i64, 1)).collect(),
+            // 90 % of the rows in the lowest 1 % of the key space.
+            "skew" => (0..d)
+                .map(|_| match self.rng.gen_range(10) {
+                    0 => self.rng.gen_range(ks),
+                    _ => self.rng.gen_range(ks / 100),
+                })
+                .map(|k| (k, k as i64, 1))
+                .collect(),
+            // 64 interleaved ascending sequences, `(tenant, seq)`.
+            "tenants" => (0..d)
+                .map(|i| ((i % 64) << 40) | (t as u64 * (d / 64) + i / 64))
+                .map(|k| (k, k as i64, 1))
+                .collect(),
+            // An ascending load for the first half, then scattered fresh
+            // payloads over the loaded range.
+            "bulk" => match t < self.ticks / 2 {
+                true => (0..d).map(fresh).map(|k| (k, k as i64, 1)).collect(),
+                false => {
+                    let span = (self.ticks / 2) as u64 * d;
+                    (0..d).map(|_| (self.rng.gen_range(span), -(t as i64) - 1, 1)).collect()
+                }
+            },
+            // Round-robin updates over `keyspace` hot keys: retract and insert.
+            "churn" => {
+                self.live.resize(ks as usize, None);
+                let mut rows = Vec::with_capacity(d as usize);
+                for _ in 0..d / 2 {
+                    let k = (self.next % ks) as usize;
+                    let payload = self.next as i64;
+                    self.next += 1;
+                    if let Some(old) = self.live[k].replace(payload) {
+                        rows.push((k as u64, old, -1));
+                    }
+                    rows.push((k as u64, payload, 1));
+                }
+                rows
+            }
+            other => panic!("unknown GNITZ_BENCH_SHAPE {other}"),
+        }
+    }
+}
+
+/// `pk_cols` U64 PK columns over two I64 payload columns. The key varies in the
+/// last PK column alone, so past two columns every key shares its leading 16
+/// bytes.
+fn wide_pk_schema(pk_cols: usize) -> SchemaDescriptor {
+    use gnitz_wire::TypeCode;
+    use gnitz_zset::schema::SchemaColumn;
+    let mut cols = vec![SchemaColumn::new(TypeCode::U64, false); pk_cols];
+    cols.extend([SchemaColumn::new(TypeCode::I64, false); 2]);
+    SchemaDescriptor::new(&cols, &(0..pk_cols as u32).collect::<Vec<_>>())
+}
+
+fn wide_key(pk_cols: usize, k: u64) -> Vec<u8> {
+    let mut pk = vec![0u8; (pk_cols - 1) * 8];
+    pk.extend_from_slice(&k.to_be_bytes());
+    pk
+}
+
+/// `GNITZ_BENCH_SCRAMBLE=1` makes the payloads incompressible, so a skeleton
+/// row is a fraction of a full one and a `deh:` budget has something to evict.
+fn arrival_batch(schema: &SchemaDescriptor, pk_cols: usize, mut rows: Vec<(u64, i64, i64)>) -> Batch {
+    rows.sort_unstable();
+    let scramble = gnitz_foundation::env::env_flag("GNITZ_BENCH_SCRAMBLE", false);
     let mut b = BatchBuilder::new(schema);
-    for k in keys {
-        push_row(&mut b, k, k as i64, 1);
+    for (k, payload, weight) in rows {
+        let payload = match scramble {
+            true => (payload as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as i64,
+            false => payload,
+        };
+        b.begin_row_bytes(&wide_key(pk_cols, k), weight);
+        b.put_int(payload as u128);
+        b.put_int(payload as u128);
+        b.end_row();
     }
     b.finish()
 }
@@ -96,6 +184,17 @@ fn bench_budgets() -> StoreBudgets {
         "GNITZ_RAM_TIER_BYTES",
         DEFAULT_RAM_TIER_BYTES,
     ))
+}
+
+/// [`bench_budgets`] under `GNITZ_BENCH_BUDGET`: `deh:<bytes>` a
+/// capacity-bounded view's output store, `drop:<bytes>` a delta store.
+fn budgeted(budgets: StoreBudgets) -> StoreBudgets {
+    let spec = std::env::var("GNITZ_BENCH_BUDGET").unwrap_or_default();
+    match spec.split_once(':') {
+        Some(("deh", n)) => budgets.bounded(Some(n.parse().unwrap())),
+        Some(("drop", n)) => budgets.delta(n.parse().unwrap()),
+        _ => budgets,
+    }
 }
 
 /// The emptied scratch directory both compaction sweeps write into — a real
@@ -217,13 +316,17 @@ fn flush_cadence_amplification_bench() {
 
 /// Compaction bytes read per ingest byte, and the largest single unit each
 /// compaction phase reads — the two quantities the FLSM byte targets exist to
-/// bound. Stated in bytes because wall-clock on the development machine varies
-/// 3.6× on bit-identical compaction work.
+/// bound. Stated in bytes: the counts are reproducible where wall-clock is not.
 ///
 /// Acceptance: every phase's `max_in` settles at or under `2 × R` (printed), and
 /// `bytes_in/ingest` grows as √X rather than linearly across a doubling sweep.
 /// The second binds only once `l1_target` (printed) exceeds `16 R` — shrink
 /// `GNITZ_RAM_TIER_BYTES` to reach that regime rather than growing the sweep.
+///
+/// `GNITZ_BENCH_SHAPE` picks the arrival order ([`Arrival`]),
+/// `GNITZ_BENCH_PK_COLS` the PK width, `GNITZ_BENCH_BUDGET` a bounded or a delta
+/// store. Under a `deh:` budget the last line counts how many of one mid-run
+/// tick's keys still read without hydration.
 ///
 /// ```text
 /// for t in 2000 4000 8000 16000; do
@@ -237,14 +340,13 @@ fn flush_cadence_amplification_bench() {
 fn compaction_amplification_bench() {
     const ROWS_PER_TICK: usize = 4096;
 
-    use gnitz_foundation::env::{env_flag, env_num};
+    use gnitz_foundation::env::env_num;
     let ticks_n: usize = env_num("GNITZ_BENCH_TICKS", 2000);
     let keyspace: u64 = env_num("GNITZ_BENCH_KEYSPACE", 200_000_000);
-    // Both arrival orders: a monotone stream never makes a vertical overlap
-    // anything, so on its own it cannot tell a policy fix from a regression.
-    let monotone = env_flag("GNITZ_BENCH_MONOTONE", false);
+    let shape = std::env::var("GNITZ_BENCH_SHAPE").unwrap_or_else(|_| "scattered".into());
+    let pk_cols: usize = env_num("GNITZ_BENCH_PK_COLS", 1);
 
-    let schema = pk_u64_two_i64_schema();
+    let schema = wide_pk_schema(pk_cols);
     let tmp = tempfile::tempdir().unwrap();
     let dir = bench_dir(&tmp, format!("wa_{ticks_n}_{keyspace}"));
 
@@ -252,39 +354,49 @@ fn compaction_amplification_bench() {
         dir.to_str().unwrap(),
         schema,
         RecoverySource::Rederive { resume_at: None },
-        bench_budgets(),
+        budgeted(bench_budgets()),
     )
     .unwrap();
 
-    use crate::storage::shard_index::cstats;
-    let mut rng = start_compaction_sweep();
+    use crate::storage::shard_index::{cstats, CompactionKind};
+    let mut arrival = Arrival {
+        shape: shape.clone(),
+        keyspace,
+        ticks: ticks_n,
+        rng: start_compaction_sweep(),
+        live: Vec::new(),
+        next: 0,
+    };
+    let mut sampled: Vec<u64> = Vec::new();
     for t in 0..ticks_n {
-        let batch = match monotone {
-            true => distinct_tick(&schema, t, ROWS_PER_TICK),
-            false => scatter_tick(&schema, &mut rng, ROWS_PER_TICK, keyspace),
-        };
-        table.ingest_owned_batch(batch).unwrap();
+        let rows = arrival.tick(t, ROWS_PER_TICK as u64);
+        if t == ticks_n / 2 {
+            sampled = rows.iter().map(|r| r.0).collect();
+        }
+        table.ingest_owned_batch(arrival_batch(&schema, pk_cols, rows)).unwrap();
         table.fold_to_ram().unwrap();
     }
 
     let phases = cstats::dump();
-    let total_in: u64 = phases.iter().map(|p| p.in_bytes).sum();
-    let total_out: u64 = phases.iter().map(|p| p.out_bytes).sum();
+    let total_in: u64 = phases.values().map(|p| p.in_bytes).sum();
+    let total_out: u64 = phases.values().map(|p| p.out_bytes).sum();
     // Every spill is folded out of L0 exactly once, so the L0 fold's input is the
-    // bytes this store was handed — measured, where a nominal row width would not
-    // be (the flush schema's 40 B row lands at ~17 B once its constant regions
-    // collapse).
-    let spilled = phases[0].in_bytes.max(1);
+    // bytes this store was handed, as the shard encoding left them.
+    let spilled = phases.get(&CompactionKind::L0Fold).map_or(1, |p| p.in_bytes);
     println!(
-        "compaction_amplification/{ticks_n}t {} keyspace={keyspace}: {}",
-        if monotone { "monotone" } else { "scattered" },
+        "compaction_amplification/{ticks_n}t {shape} pk_cols={pk_cols} keyspace={keyspace}: {}",
         table.shard_index.tree_report()
     );
-    for (name, p) in cstats::PHASE_NAMES.iter().zip(&phases) {
-        let mean = p.in_bytes.checked_div(p.n as u64).unwrap_or(0);
+    for (kind, p) in &phases {
         println!(
-            "  {name:12} n={:<6} max_in={:>12} mean_in={:>12} in={:>13} out={:>13} in_files={}",
-            p.n, p.max_in, mean, p.in_bytes, p.out_bytes, p.in_files
+            "  {:12} n={:<6} max_in={:>12} mean_in={:>12} in={:>13} out={:>13} in_files={}",
+            format!("{kind:?}"),
+            p.n,
+            p.max_in,
+            p.in_bytes / p.n as u64,
+            p.in_bytes,
+            p.out_bytes,
+            p.in_files
         );
     }
     println!(
@@ -292,7 +404,27 @@ fn compaction_amplification_bench() {
         total_in as f64 / spilled as f64,
         total_out as f64 / spilled as f64,
     );
-    assert!(phases[0].n > 0, "no compaction ran — the sweep measures nothing");
+    if table.has_skeleton_rows() {
+        let hydrated = sampled
+            .iter()
+            .filter(|&&k| {
+                let key = wide_key(pk_cols, k);
+                let mut skeleton = false;
+                table
+                    .shard_index
+                    .find_pk_bytes(&key, gnitz_zset::schema::key::probe_key(&key), |shard, _| {
+                        skeleton |= shard.is_skeleton()
+                    });
+                !skeleton
+            })
+            .count();
+        println!(
+            "  hydrated: {hydrated} of the {} keys of tick {}",
+            sampled.len(),
+            ticks_n / 2
+        );
+    }
+    assert!(!phases.is_empty(), "no compaction ran — the sweep measures nothing");
 }
 
 /// The share of a probed store's work that is PK-filter work: the same ingest
@@ -301,9 +433,9 @@ fn compaction_amplification_bench() {
 /// instructions for cache behaviour, so the two counters need not move together
 /// and instructions alone can report the wrong sign.
 ///
-/// `SalReplay` because it is the one recovery source whose stores build a
-/// filter, and no per-tick `flush()` because a `SalReplay` barrier publishes a
-/// manifest per tick and its fsyncs dominate everything being measured — ingest
+/// The on arm is `SalReplay`, the one recovery source whose stores build a
+/// filter, and the off arm a rederived store, which builds none. No per-tick
+/// `flush()`, because a `SalReplay` barrier publishes a manifest per tick and its fsyncs dominate everything being measured — ingest
 /// overflow alone drives the RAM tier, the spill and the compaction. Both arms
 /// must report the same compacted bytes; if they diverge the arms are not
 /// comparable and the cycle delta means nothing.
@@ -333,32 +465,33 @@ fn filter_share_of_compaction_bench() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = bench_dir(&tmp, format!("fs_{ticks_n}_{}", filter_off as u8));
 
-    let mut table = Table::new(
-        dir.to_str().unwrap(),
-        schema,
-        RecoverySource::SalReplay,
-        bench_budgets(),
-    )
-    .unwrap();
-    // The off arm. Force-off only: every store that skips by policy is
-    // `Rederive` and never carries a base-table workload, so forcing a filter
-    // *on* would measure nothing.
-    if filter_off {
-        table.shard_index.set_skip_pk_filter_for_test(true);
-    }
+    // The recovery source is what decides whether a store builds a filter.
+    let recovery = match filter_off {
+        true => RecoverySource::Rederive { resume_at: None },
+        false => RecoverySource::SalReplay,
+    };
+    let mut table = Table::new(dir.to_str().unwrap(), schema, recovery, bench_budgets()).unwrap();
 
     use crate::storage::shard_index::cstats;
-    let mut rng = start_compaction_sweep();
+    let mut arrival = Arrival {
+        shape: "scattered".into(),
+        keyspace,
+        ticks: ticks_n,
+        rng: start_compaction_sweep(),
+        live: Vec::new(),
+        next: 0,
+    };
     let mut ingested: usize = 0;
     for _ in 0..ticks_n {
-        let batch = scatter_tick(&schema, &mut rng, ROWS_PER_TICK, keyspace);
+        let rows = arrival.tick(0, ROWS_PER_TICK as u64);
+        let batch = arrival_batch(&schema, 1, rows);
         ingested += batch.len();
         table.ingest_owned_batch(batch).unwrap();
     }
 
     let phases = cstats::dump();
-    let compactions: usize = phases.iter().map(|p| p.n).sum();
-    let bytes_in: u64 = phases.iter().map(|p| p.in_bytes).sum();
+    let compactions: usize = phases.values().map(|p| p.n).sum();
+    let bytes_in: u64 = phases.values().map(|p| p.in_bytes).sum();
     assert!(compactions > 0, "no compaction ran — the run measures nothing");
     println!(
         "filter_share/{ticks_n}t filter={}: {ingested} rows  {compactions} compactions  {bytes_in} compacted bytes in",

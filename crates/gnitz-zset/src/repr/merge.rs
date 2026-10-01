@@ -671,9 +671,10 @@ fn run_merge_body<S, P>(
         |i| cursors[i].is_valid().then(|| cursors[i].position as u32),
         merge_less(schema, sources, payload, false),
     );
-    // `coarsen: false` — skeleton folding is a read-path concern, and compaction
-    // re-materializes per PK anyway (`compact::merge_and_route`). The literal also
-    // const-folds the skeleton test out of this monomorphisation.
+    // `coarsen: false` — skeleton folding is a read-path concern; a compaction
+    // that writes skeleton rows merges under the PK-only schema instead
+    // (`compact::merge_and_route`). The literal also const-folds the skeleton
+    // test out of this monomorphisation.
     drive(&mut tree, schema, sources, cursors, payload, false, |src, row, w| {
         emit(src, row, w);
         ControlFlow::Continue(())

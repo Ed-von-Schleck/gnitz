@@ -13,7 +13,7 @@ use gnitz_zset::repr::StorageError;
 use gnitz_zset::schema::key::PkBuf;
 
 const MAGIC: u64 = 0x4D414E49464E5447;
-const VERSION: u64 = 16;
+const VERSION: u64 = 17;
 
 const MANIFEST_FILE: &str = "manifest.bin";
 /// The one file a manifest is staged under before its rename.
@@ -23,7 +23,7 @@ const STAGING_FILE: &str = "manifest.bin.tmp";
 pub(super) const SHARD_PREFIX: &str = "shard_";
 
 /// What a shard index publishes and reopens from.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ShardSet {
     /// The shard index's `R`. Stored, not derived: a guard of one distinct key
     /// outgrows `R` and cannot be split, so no shard size recovers it.
@@ -33,7 +33,7 @@ pub(crate) struct ShardSet {
 
 /// One store's published shard set and the counters that must survive a
 /// restart.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Manifest {
     /// The owner's word for this publish, read back at the next open.
     pub checkpoint_mark: u64,
@@ -49,9 +49,9 @@ pub(crate) struct ManifestEntry {
     pub seq: u64,
     /// The highest seq whose rows the shard holds.
     pub newest: u64,
-    /// 0 = L0.
+    /// The shard's level in the index, 0 at the top.
     pub level: u64,
-    /// The guard the shard sits under; width 0 at L0.
+    /// The guard the shard sits under.
     pub guard_key: PkBuf,
 }
 

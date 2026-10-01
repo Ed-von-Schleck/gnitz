@@ -2,8 +2,8 @@ use super::*;
 use crate::test_support::sweep_bit_flips;
 use gnitz_wire::write_u64_le;
 
-/// A manifest with `count` entries alternating L0 (empty guard key) and L1 (an
-/// 8-byte guard key), and a `count`-byte caller record, so every field shape
+/// A manifest with `count` entries alternating an empty and an 8-byte guard
+/// key over two levels, and a `count`-byte caller record, so every field shape
 /// round-trips.
 fn sample(count: usize) -> Manifest {
     Manifest {

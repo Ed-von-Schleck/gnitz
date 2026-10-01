@@ -11,7 +11,8 @@ use gnitz_zset::schema::SchemaDescriptor;
 /// Rows every arm pushes, however it splits them.
 const TOTAL_ROWS: usize = 500_000;
 /// Few enough that nearly every push after the first few is an update, many
-/// enough that the store spills and a probe crosses tiers.
+/// enough that the memtable folds and a probe crosses both RAM tiers. No arm
+/// reaches the shard tier.
 const HOT_KEYS: u64 = 50_000;
 
 /// `rows_per_push`-row pushes of `row(seq) = (pk, weight, payload)` for `seq` in

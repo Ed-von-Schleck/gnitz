@@ -475,8 +475,9 @@ has a capacity.
 This is the one deliberate local exception to the (PK, payload) element identity
 of §1/§2: when a cursor holds a skeleton run, its merge comparators fold a whole
 PK group to the skeleton row regardless of payload, because that row already
-carries the key's summed weight. Every other cursor, and every compaction merge,
-keeps (PK, payload).
+carries the key's summed weight. Every other cursor, and every compaction that
+writes payload, keeps (PK, payload); a compaction that writes skeleton rows
+merges by PK, its output being one row per key.
 
 **Fold totality** — every merge that can see a skeleton row folds a per-key
 *time-prefix* of the store's history, cut at an ingest boundary — becomes a

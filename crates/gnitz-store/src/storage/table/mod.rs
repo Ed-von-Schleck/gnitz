@@ -169,16 +169,13 @@ impl Table {
             },
             s => s,
         };
-        let (checkpoint_mark, caller_record, shards) = match loaded {
-            Some(Manifest { checkpoint_mark, caller_record, shards }) => (checkpoint_mark, caller_record, Some(shards)),
-            None => (0, Vec::new(), None),
-        };
+        let Manifest { checkpoint_mark, caller_record, shards } = loaded.unwrap_or_default();
         // Only a `SalReplay` store is point-probed by PK.
         let skip_pk_filter = rederived;
         Ok(Table {
             memtable: RunSet::new(MEMTABLE_BYTES),
             ram_tier: RunSet::new(budgets.ram_tier_bytes),
-            shard_index: ShardIndex::open(dir, schema, budgets.shard, skip_pk_filter, shards.as_ref())?,
+            shard_index: ShardIndex::open(dir, schema, budgets.shard, skip_pk_filter, &shards)?,
             recovery_source,
             checkpoint_mark,
             caller_record,
@@ -413,9 +410,9 @@ impl Table {
         self.shard_index.all_shard_arcs_iter().collect()
     }
 
-    /// `(L0 shard count, per-level guard count)`.
+    /// `(L0 shard count, L1 and terminal guard counts)`.
     #[cfg(test)]
-    pub(crate) fn level_shape(&self) -> (usize, [usize; super::shard_index::FLSM_LEVELS]) {
+    pub(crate) fn level_shape(&self) -> (usize, [usize; 2]) {
         self.shard_index.level_shape()
     }
 
@@ -447,8 +444,9 @@ impl Table {
                 visit(Run::Mem(Rc::clone(batch)), start)
             });
         }
-        self.shard_index
-            .find_pk_bytes(key, fingerprint, &mut |shard, start| visit(Run::Shard(shard), start));
+        self.shard_index.find_pk_bytes(key, fingerprint, |shard, start| {
+            visit(Run::Shard(Rc::clone(shard)), start)
+        });
     }
 
     /// The net weight at OPK `key` and, when it is positive, a live
