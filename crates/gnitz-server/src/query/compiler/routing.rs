@@ -339,7 +339,7 @@ fn scan_through_row_local(loaded: &LoadedCircuit, enid: NodeId) -> Option<(u64, 
 
 /// How a view's join, if it has one, needs its inputs placed — what a worker
 /// routes a source's delta by, and whether any source can skip the scatter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum JoinRelay {
     /// An equi join, whose matches share a key — as a GROUP BY's groups do.
     WholeKey,

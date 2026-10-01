@@ -559,15 +559,17 @@ fn a_hash_row_map_promotes_within_the_copy_kernel_domain_or_is_rejected() {
     );
 }
 
-/// A corrupt computed-map blob is refused, not decoded into a plan that maps
-/// garbage — and the rejection names the decode, not the schema.
+/// A corrupt computed-map blob, garbled or empty, is refused, not decoded into a
+/// plan that maps garbage — and the rejection names the decode, not the schema.
 #[test]
 fn a_corrupt_compute_map_program_is_rejected() {
-    let mk = MapKind::Compute(gnitz_wire::ComputeMap {
-        program: vec![0xff; 8],
-        out_cols: vec![(TypeCode::I64, false)],
-    });
-    assert!(wire_rejection(&make_schema_u64_i64(), mk).starts_with("map: invalid program"));
+    for program in [vec![0xff; 8], Vec::new()] {
+        let mk = MapKind::Compute(gnitz_wire::ComputeMap {
+            program,
+            out_cols: vec![(TypeCode::I64, false)],
+        });
+        assert!(wire_rejection(&make_schema_u64_i64(), mk).starts_with("map: invalid program"));
+    }
 }
 
 /// A declaration wider than a schema holds is refused by the derivation, never

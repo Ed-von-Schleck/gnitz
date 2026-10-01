@@ -74,39 +74,32 @@ fn test_preflight_compile_verdict() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A circuit whose routing or size the engine refuses is rejected before the
-/// DDL is durable.
+/// A circuit whose routing the engine refuses is rejected before the DDL is
+/// durable.
 #[test]
-fn a_view_whose_circuit_is_unroutable_or_over_cap_is_rejected_before_the_sal() {
+fn a_view_whose_circuit_is_unroutable_is_rejected_before_the_sal() {
     let dir = temp_dir("preflight_routing");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let a = engine.create_table("public.a", &cols, &[0]).unwrap();
     let b = engine.create_table("public.b", &cols, &[0]).unwrap();
 
-    for (circuit, want) in [
-        (
-            equi_join_circuit(a, b, TypeCode::I64, [false, true]),
-            format!("source {a} feeds a join and states no scatter key"),
-        ),
-        (
-            negate_chain(a, crate::query::MAX_CIRCUIT_NODES + 1),
-            "circuit exceeds the node limit".to_string(),
-        ),
-    ] {
-        // The setup is not part of the bundle being compensated.
-        let _ = engine.drain_pending_broadcasts();
-        let vid = engine.next_id;
-        let err = try_register_view(&mut engine, circuit, "v", &cols, 0, 0)
-            .expect_err("the register hook refuses the circuit");
-        assert!(err.contains(&want), "got: {err}");
-        engine.compensate_stage_a().unwrap();
-        assert!(!engine.registry.has_id(vid), "the view is not registered");
-        assert!(
-            engine.live_sys_row(SysFamily::View, vid).is_none(),
-            "no VIEW_TAB row of it is live"
-        );
-    }
+    // The setup is not part of the bundle being compensated.
+    let _ = engine.drain_pending_broadcasts();
+    let vid = engine.next_id;
+    let circuit = equi_join_circuit(a, b, TypeCode::I64, [false, true]);
+    let err =
+        try_register_view(&mut engine, circuit, "v", &cols, 0, 0).expect_err("the register hook refuses the circuit");
+    assert!(
+        err.contains(&format!("source {a} feeds a join and states no scatter key")),
+        "got: {err}"
+    );
+    engine.compensate_stage_a().unwrap();
+    assert!(!engine.registry.has_id(vid), "the view is not registered");
+    assert!(
+        engine.live_sys_row(SysFamily::View, vid).is_none(),
+        "no VIEW_TAB row of it is live"
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

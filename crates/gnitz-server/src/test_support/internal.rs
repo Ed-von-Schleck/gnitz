@@ -118,13 +118,17 @@ pub fn negate_chain(source: u64, n: usize) -> Circuit {
     circuit
 }
 
-/// `source` scanned and reindexed on its column 1, of type `tc`, keeping its
-/// column 0, which it states as its scatter key.
-pub fn reindexed_on_col1(circuit: &mut Circuit, source: u64, tc: gnitz_wire::TypeCode) -> gnitz_wire::NodeId {
-    let key = [(1, tc.reindex_output_type())];
+/// `source` scanned and reindexed on `key`, keeping its column 0, with `key`
+/// stated as its scatter key — what a spine that moves no column produces.
+pub fn scan_keyed(circuit: &mut Circuit, source: u64, key: &[gnitz_wire::ReindexSlot]) -> gnitz_wire::NodeId {
     let scan = circuit.input_delta(source, gnitz_wire::ReadBound::None);
     let role = gnitz_wire::ReindexRole::ScatterKey { source, source_key: key.to_vec() };
-    circuit.map_reindex(scan, &key, &[0], role, gnitz_wire::NullKeys::Keep)
+    circuit.map_reindex(scan, key, &[0], role, gnitz_wire::NullKeys::Keep)
+}
+
+/// [`scan_keyed`] on `source`'s column 1, of type `tc`.
+pub fn reindexed_on_col1(circuit: &mut Circuit, source: u64, tc: gnitz_wire::TypeCode) -> gnitz_wire::NodeId {
+    scan_keyed(circuit, source, &[(1, tc.reindex_output_type())])
 }
 
 /// An equi-join of `a` and `b` on their column 1, of type `tc`, each side

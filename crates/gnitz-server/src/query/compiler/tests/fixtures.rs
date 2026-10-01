@@ -1,98 +1,67 @@
-//! Compiler test fixtures: hand-built circuits and the relation registry they
-//! compile against. A child of `compiler`, so it reaches `LoadedCircuit`'s
-//! private items.
+//! Compiler test fixtures: the relation registry a circuit compiles against and
+//! the few helpers every test file shares. A child of `compiler`, so it reaches
+//! `LoadedCircuit`'s private items.
 
 use super::*;
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
 use gnitz_store::schema::Slot;
+use gnitz_wire::Circuit;
 
-// Input slots reach the compiler only in hand-written fixtures; every production
-// read of an operand goes through `NodeInputs`. Slot 0 is a unary operator's
-// input and a binary one's delta/left operand, slot 1 its second operand —
-// a join's trace port, a union's right-hand side.
-pub(in crate::query) const SLOT_IN: usize = 0;
-pub(in crate::query) const SLOT_B: usize = 1;
-
-/// Build a `LoadedCircuit` from raw nodes and `(producer, consumer, slot)` edges,
-/// pushing the nodes in id order from 0 — so a fixture holds to the same
-/// every-input-names-an-earlier-node rule a loaded circuit does.
-pub(in crate::query) fn loaded_for_test(
-    nodes: impl IntoIterator<Item = (NodeId, gnitz_wire::OpNode)>,
-    edges: Vec<(NodeId, NodeId, usize)>,
-) -> LoadedCircuit {
-    let mut nodes: Vec<(NodeId, gnitz_wire::OpNode)> = nodes.into_iter().collect();
-    nodes.sort_unstable_by_key(|&(nid, _)| nid);
-    let mut circuit = gnitz_wire::Circuit::default();
-    for (nid, op) in nodes {
-        let mut slots = [None; 2];
-        for &(src, _, slot) in edges.iter().filter(|&&(_, dst, _)| dst == nid) {
-            slots[slot] = Some(src as u64);
-        }
-        let pushed = NodeInputs::from_slots(slots).and_then(|inputs| circuit.push(op, inputs));
-        assert_eq!(
-            pushed,
-            Ok(nid),
-            "test circuit node {nid} must be dense and read earlier nodes"
-        );
-    }
+pub(super) fn loaded(circuit: Circuit) -> LoadedCircuit {
     LoadedCircuit::new(circuit).expect("test circuit within the node limit")
 }
 
-/// The sub-pipeline producing `out`'s value, in topological order.
-pub(in crate::query) fn subgraph_ordered(loaded: &LoadedCircuit, out: NodeId) -> Vec<NodeId> {
-    let set = loaded.ancestors_inclusive(out);
-    loaded.ordered_where(|n| set[n])
+/// One table row's circuit, built into an empty [`Circuit`].
+pub(super) type Build = fn(&mut Circuit);
+
+/// An unbounded delta scan of `source`.
+pub(super) fn scan(circuit: &mut Circuit, source: u64) -> NodeId {
+    circuit.input_delta(source, gnitz_wire::ReadBound::None)
 }
 
-/// An unbounded delta scan — every fixture circuit's source shape.
-pub(in crate::query) fn scan_delta(source: u64) -> gnitz_wire::OpNode {
-    gnitz_wire::OpNode::ScanDelta {
-        source,
-        bound: gnitz_wire::ReadBound::None,
-    }
-}
-
-/// A `ScatterKey` reindex on `key`, stating `source`'s route as the same
-/// slots — what a spine that moves no column produces. A fixture turning on
-/// any other field spells the variant out instead.
-pub(in crate::query) fn scatter_reindex(source: u64, key: Vec<gnitz_wire::ReindexSlot>) -> gnitz_wire::OpNode {
-    gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
-        keep: vec![0],
-        key: key.clone(),
-        role: gnitz_wire::ReindexRole::ScatterKey { source, source_key: key },
-        nulls: gnitz_wire::NullKeys::Keep,
-    })
-}
-
-/// An empty but decodable expr-program blob for tests that need a
-/// `Map(Expression { program, .. })` or `Filter(..)` to exist without
-/// ever executing it. Built through the real encoder rather than spelled as a
-/// byte literal, so it stays decodable when the blob header changes.
-pub(in crate::query) fn dummy_expr_blob() -> Vec<u8> {
+/// A decodable expr-program blob for a `Filter` or computed `Map` that must
+/// exist and is never executed.
+pub(super) fn dummy_expr_blob() -> Vec<u8> {
     gnitz_expr::LogicalProgram::copy_cols(&[]).to_blob_bytes()
 }
 
 /// The guard that rejected a build. Naming it is what makes a guard test
 /// attributable: a bare `is_err()` also passes when an unrelated guard fires.
-pub(in crate::query) fn rejection<T>(r: Result<T, String>) -> String {
+pub(super) fn rejection<T>(r: Result<T, String>) -> String {
     r.map(|_| "a plan").expect_err("expected a rejection")
 }
 
-/// Register each `(id, schema)` as a stream — a storeless kind, so a fixture
-/// enters the schemas a compile looks up without opening a store.
-pub(in crate::query) fn register_sources(
-    registry: &mut RelationRegistry,
-    rows: impl IntoIterator<Item = (u64, SchemaDescriptor)>,
-) {
+/// A registry for worker `slot` holding only `rows`, each registered as a stream —
+/// a storeless kind, so a compile finds its schemas without opening a store.
+pub(super) fn sources_at(slot: Slot, rows: impl IntoIterator<Item = (u64, SchemaDescriptor)>) -> RelationRegistry {
+    let mut registry = RelationRegistry::new("", slot, StoreConfig::default());
     for (id, schema) in rows {
         let spec = RelationSpec { id, kind: RelationKind::Stream, schema };
         registry.register(spec).expect("a stream registers without a store");
     }
+    registry
 }
 
-/// A fresh single-worker registry holding only `rows`.
-pub(in crate::query) fn sources(rows: impl IntoIterator<Item = (u64, SchemaDescriptor)>) -> RelationRegistry {
-    let mut registry = RelationRegistry::new("", Slot::SOLO, StoreConfig::default());
-    register_sources(&mut registry, rows);
-    registry
+/// [`sources_at`] the one worker of a single-worker process.
+pub(super) fn sources(rows: impl IntoIterator<Item = (u64, SchemaDescriptor)>) -> RelationRegistry {
+    sources_at(Slot::SOLO, rows)
+}
+
+/// A [`Relay`] without its key, `Stays` for none: the routing decision a test
+/// compares.
+#[derive(Debug, PartialEq)]
+pub(super) enum Route {
+    Stays,
+    Broadcast,
+    Round,
+    Share,
+}
+
+pub(super) fn route(relay: Option<&Relay>) -> Route {
+    match relay {
+        None => Route::Stays,
+        Some(Relay::Broadcast) => Route::Broadcast,
+        Some(Relay::Round(_)) => Route::Round,
+        Some(Relay::Share(_)) => Route::Share,
+    }
 }

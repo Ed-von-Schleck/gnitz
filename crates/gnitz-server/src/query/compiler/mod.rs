@@ -25,7 +25,7 @@ mod routing;
 
 #[cfg(test)]
 #[path = "tests/fixtures.rs"]
-pub(in crate::query) mod fixtures;
+mod fixtures;
 
 use emit::*;
 use hydration::derive_hydration;
@@ -37,7 +37,7 @@ pub(super) use load::{load_circuit, read_circuit_node_row};
 pub(super) use routing::{Relay, ViewMeta};
 
 /// The most nodes one view's circuit may hold.
-pub(crate) const MAX_CIRCUIT_NODES: usize = 16_384;
+const MAX_CIRCUIT_NODES: usize = 16_384;
 // Registers — up to three per node, plus the seeds — and child stores — up to
 // two per node — are `u16` ids.
 const _: () = assert!(3 * MAX_CIRCUIT_NODES + 2 < u16::MAX as usize);
@@ -323,7 +323,9 @@ pub(super) fn compile_view(
         });
         side_plans.push((plan, relay));
     }
-    let Built { plan: post, regs: post_regs, .. } = build_plan(
+    let Built {
+        plan: post, regs: post_regs, seed_regs, ..
+    } = build_plan(
         loaded,
         &carve.post,
         registry,
@@ -339,17 +341,9 @@ pub(super) fn compile_view(
     }
     let sides = side_plans
         .into_iter()
-        .zip(&carve.sides)
-        .map(|((plan, relay), c)| {
-            Ok(Side {
-                relay,
-                plan,
-                seed_reg: post_regs[c.shard]
-                    .ok_or("an exchange side seeds no register of the post phase")?
-                    .delta()?,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+        .zip(seed_regs)
+        .map(|((plan, relay), seed_reg)| Side { plan, seed_reg, relay })
+        .collect();
     let hydration = bounded
         .then(|| derive_hydration(loaded, registry, view_schema, &post, &post_regs))
         .transpose()?;

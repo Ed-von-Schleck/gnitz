@@ -1,10 +1,7 @@
 use super::*;
-use crate::test_support::{reindexed_on_col1, two_term_join_circuit};
-use gnitz_wire::{Circuit, JoinKind, OpNode, ReadBound, TypeCode};
-
-fn loaded(circuit: Circuit) -> LoadedCircuit {
-    LoadedCircuit::new(circuit).expect("test circuit within the node limit")
-}
+use crate::query::compiler::fixtures::{dummy_expr_blob, loaded, scan};
+use crate::test_support::reindexed_on_col1;
+use gnitz_wire::{Circuit, JoinKind, TypeCode};
 
 /// Sides reindexed from `sources`, each integrated, with `terms` building the
 /// sink's input out of `[da, db]` and `[ta, tb]`.
@@ -22,40 +19,33 @@ fn join_with(sources: [u64; 2], terms: impl FnOnce(&mut Circuit, [NodeId; 2], [N
 #[test]
 fn a_linear_chain_seeds_at_its_scan() {
     let mut c = Circuit::default();
-    let scan = c.input_delta(77, ReadBound::None);
-    let filtered = c.filter(scan, crate::query::compiler::fixtures::dummy_expr_blob());
+    let source = scan(&mut c, 77);
+    let filtered = c.filter(source, dummy_expr_blob());
     let mapped = c.map(filtered, &[0]);
     c.sink(mapped);
-    assert_eq!(seed_node(&loaded(c)), Ok(SeedAt::Scan { node: scan, source: 77 }));
+    assert_eq!(seed_node(&loaded(c)), Ok(SeedAt::Scan { node: source, source: 77 }));
 }
 
-/// The two-term join seeds from the trace integrating side A's reindex.
+/// The two-term join seeds from the trace integrating side A's delta — a
+/// semi-join's inner term included, whose side-B delta is a `distinct`.
 #[test]
 fn a_two_term_join_seeds_from_side_as_trace() {
-    let lc = loaded(two_term_join_circuit(100, 200, TypeCode::I64));
-    let Ok(SeedAt::Trace { delta, trace }) = seed_node(&lc) else {
-        panic!("a two-term join seeds at a trace");
-    };
-    assert!(matches!(lc.op(trace), OpNode::IntegrateTrace));
-    assert_eq!(lc.inputs(trace).unary(), delta);
-    assert!(matches!(
-        lc.op(lc.inputs(delta).unary()),
-        OpNode::ScanDelta { source: 100, .. }
-    ));
-}
-
-/// A semi-join's inner term, whose side-B delta is a `distinct`.
-#[test]
-fn a_semi_join_term_is_accepted() {
-    let mut c = Circuit::default();
-    let da = reindexed_on_col1(&mut c, 100, TypeCode::I64);
-    let rb = reindexed_on_col1(&mut c, 200, TypeCode::I64);
-    let db = c.distinct(rb);
-    let ta = c.integrate_trace(da);
-    let tb = c.integrate_trace(db);
-    let joined = c.join_terms([da, db], [ta, tb], JoinKind::Equi);
-    c.sink(joined);
-    assert_eq!(seed_node(&loaded(c)), Ok(SeedAt::Trace { delta: da, trace: ta }));
+    for semi in [false, true] {
+        let mut c = Circuit::default();
+        let da = reindexed_on_col1(&mut c, 100, TypeCode::I64);
+        let mut db = reindexed_on_col1(&mut c, 200, TypeCode::I64);
+        if semi {
+            db = c.distinct(db);
+        }
+        let [ta, tb] = [da, db].map(|d| c.integrate_trace(d));
+        let joined = c.join_terms([da, db], [ta, tb], JoinKind::Equi);
+        c.sink(joined);
+        assert_eq!(
+            seed_node(&loaded(c)),
+            Ok(SeedAt::Trace { delta: da, trace: ta }),
+            "semi: {semi}"
+        );
+    }
 }
 
 /// Every broken clause of the two-term form, and every other shape, is refused.
@@ -111,25 +101,20 @@ fn a_shape_outside_the_equation_is_refused() {
     );
 
     let mut c = Circuit::default();
-    let a = c.input_delta(1, ReadBound::None);
-    let b = c.input_delta(2, ReadBound::None);
+    let (a, b) = (scan(&mut c, 1), scan(&mut c, 2));
     let u = c.union(a, b);
     c.sink(u);
     refused(loaded(c), "a union input that is not a join");
 
     let mut c = Circuit::default();
-    let scan = c.input_delta(1, ReadBound::None);
-    let count = gnitz_wire::AggDescriptor {
-        agg_op: gnitz_wire::AggFunc::Count,
-        col_idx: 0,
-    };
-    let reduced = c.reduce_multi_local(scan, &[0], &[count], false);
+    let a = scan(&mut c, 1);
+    let reduced = c.reduce_multi_local(a, &[0], &[gnitz_wire::AggDescriptor::COUNT_STAR], false);
     c.sink(reduced);
     refused(loaded(c), "a reduce under the sink");
 
     let mut c = Circuit::default();
-    let scan = c.input_delta(1, ReadBound::None);
-    let sharded = c.shard(scan, &[0]);
+    let a = scan(&mut c, 1);
+    let sharded = c.shard(a, &[0]);
     c.sink(sharded);
     refused(loaded(c), "an exchange");
 }

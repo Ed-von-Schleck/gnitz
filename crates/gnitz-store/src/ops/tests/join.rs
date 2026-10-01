@@ -117,6 +117,22 @@ fn a_keyed_join_refuses_mismatched_pk_types() {
     assert!(JoinPlan::from_wire(JoinKind::Cross, false, &signed, &narrow).is_ok());
 }
 
+/// A range join's reindexed key is `[eq slots…, range slot]`, so an `n_eq` that
+/// leaves no range slot, or more than one, is refused.
+#[test]
+fn a_range_join_refuses_an_n_eq_that_is_not_one_short_of_the_key() {
+    let key = pk_payload_schema(&[TypeCode::U64; 2]);
+    let plan = |n_eq| JoinPlan::from_wire(JoinKind::Range { n_eq, rel: RangeRel::Lt }, false, &key, &key);
+    assert!(plan(1).is_ok());
+    for n_eq in [0, 2] {
+        assert_eq!(
+            plan(n_eq).err().expect("a refused arity").to_string(),
+            "range join: n_eq does not match trace key arity",
+            "n_eq {n_eq}"
+        );
+    }
+}
+
 // -----------------------------------------------------------------------
 // Literal output
 // -----------------------------------------------------------------------

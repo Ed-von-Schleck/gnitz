@@ -386,6 +386,8 @@ pub(super) struct Built {
     pub(super) plan: SubPlan,
     /// Each node's register in this plan.
     pub(super) regs: Vec<Option<OutReg>>,
+    /// The register each seed's relayed batch lands in, in seed order.
+    pub(super) seed_regs: Vec<DeltaReg>,
     /// The plan outputs a [`PlanOut::Split`]'s partial.
     pub(super) partial: bool,
 }
@@ -410,10 +412,14 @@ pub(super) fn build_plan(
         out_reg_of: vec![None; loaded.len()],
         source_reg_map: FxHashMap::default(),
     };
-    for seed in seeds {
-        let reg = ctx.prog.seed(seed.schema);
-        ctx.out_reg_of[seed.shard] = Some(OutReg::Delta(reg));
-    }
+    let seed_regs = seeds
+        .iter()
+        .map(|seed| {
+            let reg = ctx.prog.seed(seed.schema);
+            ctx.out_reg_of[seed.shard] = Some(OutReg::Delta(reg));
+            reg
+        })
+        .collect();
     for &nid in ordered {
         let reg = emit_node(&mut ctx, nid, loaded.op(nid))?;
         ctx.out_reg_of[nid] = Some(reg);
@@ -427,7 +433,12 @@ pub(super) fn build_plan(
     };
     let EmitCtx { prog, source_reg_map, out_reg_of, .. } = ctx;
     let plan = SubPlan { vm: prog.finish(out_reg), source_reg_map };
-    Ok(Built { plan, regs: out_reg_of, partial })
+    Ok(Built {
+        plan,
+        regs: out_reg_of,
+        seed_regs,
+        partial,
+    })
 }
 
 // ---------------------------------------------------------------------------
