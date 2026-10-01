@@ -56,24 +56,22 @@ fn tag() -> Option<Tag> {
     }
 }
 
+/// Whether lines gated on `level` emit.
 #[inline(always)]
-pub fn is_debug() -> bool {
-    LEVEL.load(Ordering::Relaxed) >= Level::Debug as u32
+pub fn enabled(level: Level) -> bool {
+    LEVEL.load(Ordering::Relaxed) >= level as u32
 }
 
-#[inline(always)]
-pub fn is_info() -> bool {
-    LEVEL.load(Ordering::Relaxed) >= Level::Normal as u32
-}
-
-/// Format and write a log line to stderr. Called by macros, not directly.
+/// Format and write a log line to stderr, whatever the level: what the
+/// `gnitz_*!` macros expand to, and the entry point for a macro that adds a
+/// `level_tag` of its own.
 ///
 /// Formats straight into a fixed stack buffer — no heap allocation, so a
 /// fail-stop path can log with a broken SAL mmap — and has no panic paths. An
 /// over-long message is truncated; the trailing `\n` is always the final byte,
 /// so even a truncated line terminates inside the one `write(2)`.
 #[cold]
-pub fn _emit(level_tag: &str, args: core::fmt::Arguments<'_>) {
+pub fn emit(level_tag: &str, args: core::fmt::Arguments<'_>) {
     let mut buf = [0u8; LINE_MAX];
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -131,17 +129,17 @@ fn format_line(
 /// Log at ERROR level (always emits).
 #[macro_export]
 macro_rules! gnitz_error {
-    ($($arg:tt)*) => {
-        $crate::log::_emit("ERROR", format_args!($($arg)*));
-    };
+    ($($arg:tt)*) => {{
+        $crate::log::emit("ERROR", format_args!($($arg)*));
+    }};
 }
 
 /// Log at WARN level (always emits).
 #[macro_export]
 macro_rules! gnitz_warn {
-    ($($arg:tt)*) => {
-        $crate::log::_emit("WARN", format_args!($($arg)*));
-    };
+    ($($arg:tt)*) => {{
+        $crate::log::emit("WARN", format_args!($($arg)*));
+    }};
 }
 
 /// Log at NOTE level (always emits). For a line that must appear whatever the
@@ -149,29 +147,29 @@ macro_rules! gnitz_warn {
 /// silent at the default QUIET.
 #[macro_export]
 macro_rules! gnitz_note {
-    ($($arg:tt)*) => {
-        $crate::log::_emit("NOTE", format_args!($($arg)*));
-    };
+    ($($arg:tt)*) => {{
+        $crate::log::emit("NOTE", format_args!($($arg)*));
+    }};
 }
 
 /// Log at INFO level (emits when level >= NORMAL).
 #[macro_export]
 macro_rules! gnitz_info {
-    ($($arg:tt)*) => {
-        if $crate::log::is_info() {
-            $crate::log::_emit("INFO", format_args!($($arg)*));
+    ($($arg:tt)*) => {{
+        if $crate::log::enabled($crate::log::Level::Normal) {
+            $crate::log::emit("INFO", format_args!($($arg)*));
         }
-    };
+    }};
 }
 
 /// Log at DEBUG level (emits when level >= DEBUG).
 #[macro_export]
 macro_rules! gnitz_debug {
-    ($($arg:tt)*) => {
-        if $crate::log::is_debug() {
-            $crate::log::_emit("DEBUG", format_args!($($arg)*));
+    ($($arg:tt)*) => {{
+        if $crate::log::enabled($crate::log::Level::Debug) {
+            $crate::log::emit("DEBUG", format_args!($($arg)*));
         }
-    };
+    }};
 }
 
 #[cfg(test)]

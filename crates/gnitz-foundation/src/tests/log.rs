@@ -10,12 +10,28 @@ fn init_sets_the_level_and_the_tag() {
         (Level::Debug, true, true),
     ] {
         init(level, Tag::Master);
-        assert_eq!((is_info(), is_debug()), (info, debug), "{level:?}");
+        assert_eq!(
+            (enabled(Level::Normal), enabled(Level::Debug)),
+            (info, debug),
+            "{level:?}"
+        );
     }
     assert_eq!(tag(), Some(Tag::Master));
     set_tag(Tag::Worker(63));
     assert_eq!(tag(), Some(Tag::Worker(63)));
-    assert!(is_debug(), "re-tagging leaves the level alone");
+    assert!(enabled(Level::Debug), "re-tagging leaves the level alone");
+}
+
+/// Each macro is one expression, so a match arm takes it without a block.
+#[test]
+fn the_macros_are_expressions() {
+    let _never_called = |n: u32| match n {
+        0 => gnitz_error!("{n}"),
+        1 => gnitz_warn!("{n}"),
+        2 => gnitz_note!("{n}"),
+        3 => gnitz_info!("{n}"),
+        _ => gnitz_debug!("{n}"),
+    };
 }
 
 fn line(now: Duration, tag: Option<Tag>, level_tag: &str, args: core::fmt::Arguments<'_>) -> String {

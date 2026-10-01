@@ -1,6 +1,5 @@
-//! The process and the OS under it — everything a gnitz crate needs from
-//! `libc` or the environment, and nothing else. Sibling leaves, NOT a unifying
-//! facade: each keeps its own narrow surface.
+//! The process and the OS under it. Sibling leaves, NOT a unifying facade: each
+//! keeps its own narrow surface.
 //!   - `log`        — level/tag state. The `gnitz_*!` macros it backs are
 //!     `#[macro_export]`ed, so they land at this crate's root, not in `log`
 //!   - `env`        — `GNITZ_*` environment-variable overrides

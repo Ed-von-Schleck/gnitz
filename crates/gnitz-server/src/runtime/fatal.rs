@@ -28,7 +28,7 @@ pub(super) fn abort_134() -> ! {
 /// uses it. The exit code matches the "aborted" convention systemd/monit expect.
 macro_rules! gnitz_fatal_abort {
     ($($arg:tt)*) => {{
-        gnitz_foundation::log::_emit("FATAL", format_args!($($arg)*));
+        gnitz_foundation::log::emit("FATAL", format_args!($($arg)*));
         $crate::runtime::fatal::abort_134()
     }};
 }

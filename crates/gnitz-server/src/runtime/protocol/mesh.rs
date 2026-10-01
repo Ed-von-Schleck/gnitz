@@ -298,8 +298,9 @@ impl Mesh {
         let p = self.parity();
         let end = end.next_multiple_of(PAGE_BYTES);
         if self.resident[p] > end + RESIDENT_SLACK_BYTES {
-            // SAFETY: `[end, resident)` lies inside this worker's own outbox.
-            posix_io::madvise_remove(unsafe { self.outbox(self.rank).add(end) }, self.resident[p] - end);
+            // SAFETY: `[end, resident)` lies inside this worker's own outbox, and
+            // every peer is done with what it held.
+            unsafe { posix_io::madvise_remove(self.outbox(self.rank).add(end), self.resident[p] - end) };
             self.resident[p] = end;
         }
         self.resident[p] = self.resident[p].max(end);

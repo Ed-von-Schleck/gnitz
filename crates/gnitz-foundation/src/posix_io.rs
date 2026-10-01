@@ -1,6 +1,7 @@
-//! POSIX syscall idioms: file I/O, mmap, the fd rlimit and socket options. A call whose failure a caller acts on
-//! returns `io::Result`, the errno captured at the syscall so no caller reads it
-//! back out of ambient state; a best-effort call returns `()`.
+//! POSIX syscall idioms: file I/O, mmap, the fd rlimit and socket options. A call
+//! whose failure a caller acts on returns `io::Result`, the errno captured at the
+//! syscall so no caller reads it back out of ambient state; a best-effort call
+//! returns `()`.
 
 use libc::c_int;
 
@@ -106,7 +107,11 @@ pub fn madvise_hugepage(ptr: *mut u8, size: usize) {
 /// Free the pages of [ptr, ptr+size) in a shared mapping (`MADV_REMOVE`), in
 /// every process that maps them; they read back as zeros. Best-effort: an error
 /// only leaves the pages resident.
-pub fn madvise_remove(ptr: *mut u8, size: usize) {
+///
+/// # Safety
+///
+/// Nothing in any process that maps the range may still read what it held.
+pub unsafe fn madvise_remove(ptr: *mut u8, size: usize) {
     unsafe {
         libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_REMOVE);
     }

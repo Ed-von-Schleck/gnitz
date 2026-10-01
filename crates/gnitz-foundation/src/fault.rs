@@ -9,10 +9,9 @@
 //! paths where a fresh `std::env::var` would allocate every call.
 //!
 //! Which build decides is *this* crate's: the `cfg!(debug_assertions)` below is
-//! evaluated in `gnitz-foundation`'s compilation unit, while most `Seam`
-//! declarations live in `gnitz-server`. The three profiles agree in this
-//! workspace, so a debug server arms its seams — but a profile that optimized
-//! only this crate would disarm every one of them, with no diagnostic.
+//! evaluated in `gnitz-foundation`'s compilation unit, so a per-package
+//! `debug-assertions` override on this crate arms or disarms every seam,
+//! wherever it is declared.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
