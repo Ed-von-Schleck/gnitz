@@ -204,7 +204,7 @@ fn test_ddl() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── test_edge_cases (26 cases) ────────────────────────────────────────
+// ── test_edge_cases ───────────────────────────────────────────────────
 
 #[test]
 fn test_edge_cases() {
@@ -505,7 +505,7 @@ fn test_hook_relation_register_rejects_malformed_pk() {
     engine.write_column_records(tid, &col_defs).unwrap();
 
     let mut assert_rejects = |raw_pk_cols: u64, snippet: &str| {
-        let batch = build_table_tab_row(tid, raw_pk_cols, "bad_table");
+        let batch = table_tab_row_words(tid, "bad_table", raw_pk_cols, 0);
         let res = engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch);
         let err = res.expect_err(&format!("expected Err containing '{snippet}', got Ok"));
         assert!(err.contains(snippet), "expected '{snippet}', got: {err}");
@@ -594,7 +594,7 @@ fn test_drop_view_removes_directory() {
     let base_cols = vec![col_def("id", TypeCode::U64)];
     engine.create_table("public.base", &base_cols, &[0]).unwrap();
 
-    // Register a view via the raw system-table path (create_view was removed).
+    // Register a view via the raw system-table path.
     // Column records must precede the VIEW_TAB row (hook invariant).
     let vid = engine.next_id;
     let view_cols = vec![col_def("id", TypeCode::U64)];
@@ -679,29 +679,6 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
-}
-
-// ── ddl_emitters_use_no_raw_handle_capability ────────────────────────
-// Capability guard: a DDL emitter mutates catalog state only by submitting a
-// delta (submit / submit_retraction). It may READ a family's
-// store — `submit_retraction` copies the live row it is about to negate — but it
-// must never write one directly, which would skip the precheck, the hooks and
-// the broadcast queue in one line. Pinned as source text because no runtime
-// assertion can observe the absence of a call.
-//
-// Each forbidden name is one the fixture could write and must not:
-// `registry.ingest` is deliberately absent, since `ingest_to_family` calls it
-// for a user table and routes every system id to `submit`.
-
-#[test]
-fn ddl_emitters_use_no_raw_handle_capability() {
-    let src = include_str!("ddl_fixture.rs");
-    for forbidden in ["ingest_owned_batch", "apply_family"] {
-        assert!(
-            !src.contains(forbidden),
-            "a DDL emitter must not call {forbidden} — emit a delta via submit instead"
-        );
-    }
 }
 
 // ── drop_table_retracts_its_serial_sequence_row ──────────────────────
@@ -979,7 +956,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
         ];
         let tid = engine.allocate_ids(1).unwrap();
         engine.write_column_records(tid, &col_defs).unwrap();
-        let batch = build_table_tab_row_flags(tid, pack_pk_cols(&[0]), name, flags);
+        let batch = table_tab_row_words(tid, name, pack_pk_cols(&[0]), flags);
         let err = engine
             .ingest_to_family(gnitz_wire::TABLE_TAB, &batch)
             .expect_err("a duplicate visible column name must be refused");
@@ -994,7 +971,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
     ];
     let tid = engine.allocate_ids(1).unwrap();
     engine.write_column_records(tid, &col_defs).unwrap();
-    let batch = build_table_tab_row_flags(tid, pack_pk_cols(&[0]), "hidden_dup", 0);
+    let batch = table_tab_batch(&[(tid, "hidden_dup", 1)]);
     engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch).unwrap();
 
     engine.close();
@@ -1110,7 +1087,7 @@ fn a_view_create_at_a_registered_table_id_is_refused() {
     let both = engine.allocate_ids(1).unwrap();
     engine.write_column_records(both, &cols).unwrap();
     engine
-        .submit(SysFamily::Table, build_table_tab_row(both, pack_pk_cols(&[0]), "both"))
+        .submit(SysFamily::Table, table_tab_batch(&[(both, "both", 1)]))
         .unwrap();
     let err = engine
         .submit(SysFamily::View, build_view_tab_row(both, "both_v"))

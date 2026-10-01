@@ -96,9 +96,6 @@ pub(in crate::catalog) fn build_schema_from_col_defs(
 fn check_row_weights(family: SysFamily, batch: &Batch) -> Result<(), String> {
     for i in 0..batch.len() {
         let w = batch.get_weight(i);
-        if w == 0 {
-            return Err("catalog delta carries a zero-weight row".into());
-        }
         if w.unsigned_abs() != 1 {
             return Err(format!(
                 "catalog delta carries a {} row at weight {w} (expected ±1)",
@@ -113,8 +110,7 @@ fn check_row_weights(family: SysFamily, batch: &Batch) -> Result<(), String> {
 fn check_pk_multiplicity(family: SysFamily, sig: &PkSignature) -> Result<(), String> {
     if sig.repeats_a_sign {
         return Err(format!(
-            "system-catalog write carries more than one row for {} {}",
-            family.row_noun(),
+            "system-catalog write carries more than one row for {}",
             family.pk_label(sig.pk)
         ));
     }
@@ -138,8 +134,7 @@ fn check_id_range(family: SysFamily, sig: &PkSignature) -> Result<(), String> {
     if let Some(ceiling) = family.id_ceiling() {
         if id >= ceiling {
             return Err(format!(
-                "{} {} is at or above the id ceiling ({ceiling})",
-                family.row_noun(),
+                "{} is at or above the id ceiling ({ceiling})",
                 family.pk_label(sig.pk)
             ));
         }
@@ -182,8 +177,7 @@ fn check_pair_fields(family: SysFamily, batch: &Batch, sig: &PkSignature) -> Res
     };
     if payload_differs(family.schema(), mask, batch, nj, batch, pj) {
         return Err(format!(
-            "a system-catalog rewrite pair on {} {} changes a field it may not",
-            family.row_noun(),
+            "a system-catalog rewrite pair on {} changes a field it may not",
             family.pk_label(sig.pk)
         ));
     }
@@ -212,10 +206,9 @@ fn check_batch_shape(family: SysFamily, batch: &Batch) -> Result<Vec<PkSignature
 /// A circuit `+1` may only name a view this same transaction creates — one under
 /// a foreign `view_id` would pin its source table's drop or rewrite a running
 /// circuit.
-fn check_circuit_rows(batch: &Batch, new_view_ids: &[u64]) -> Result<(), String> {
+fn check_circuit_rows(batch: &Batch, mut created: Vec<u64>) -> Result<(), String> {
     // Sorted once: this runs per row of a client-supplied block bounded only by
     // the 64 MB frame.
-    let mut created: Vec<u64> = new_view_ids.to_vec();
     created.sort_unstable();
     for i in batch.live_rows() {
         let view_id = SysFamily::CircuitNodes.leading_id(batch.get_pk(i));
@@ -370,7 +363,7 @@ impl CatalogEngine {
         let net = live_weight + sig.sum;
         if !(0..=1).contains(&net) {
             return Err(format!(
-                "system-catalog write would leave {noun} {} at net weight {net} (expected 0 or 1)",
+                "system-catalog write would leave {} at net weight {net} (expected 0 or 1)",
                 family.pk_label(sig.pk)
             ));
         }
@@ -397,7 +390,7 @@ impl CatalogEngine {
     /// cannot see. The guards are scoped to the transition rather than blanket —
     /// a blanket one would reject RENAME COLUMN, which is legal on a PK column
     /// and under a dependent view because views bind columns by ordinal.
-    fn precheck_column_family(&mut self, batch: &Batch, sigs: &[PkSignature]) -> Result<(), String> {
+    fn precheck_column_family(&self, batch: &Batch, sigs: &[PkSignature]) -> Result<(), String> {
         for sig in sigs {
             // COL_TAB PK = `(owner_id, col_idx)`.
             let (owner_id, col_idx) = (sig.leading, sig.pk as u64);
@@ -512,7 +505,7 @@ impl CatalogEngine {
     /// ADD COLUMN: one unpaired `+1` appending a trailing nullable payload
     /// column to registered base table `owner_id`.
     fn precheck_column_append(
-        &mut self,
+        &self,
         appended: CatalogColumn,
         owner_id: u64,
         col_idx: u64,
@@ -625,7 +618,7 @@ impl CatalogEngine {
     /// Exhaustive over `SysFamily` (like `fire_hooks`): a newly-added family must
     /// decide here whether it carries guards beyond the contract, rather than
     /// falling into a silent `_` arm.
-    pub(in crate::catalog) fn precheck_family(&mut self, family: SysFamily, batch: &Batch) -> Result<Vec<u64>, String> {
+    pub(in crate::catalog) fn precheck_family(&self, family: SysFamily, batch: &Batch) -> Result<Vec<u64>, String> {
         let (sigs, net_dead) = self.check_family_contract(family, batch)?;
         match family {
             SysFamily::Schema => self.precheck_schema_family(batch, &net_dead),
@@ -641,16 +634,14 @@ impl CatalogEngine {
     /// can see, because each is prechecked against a catalog the bundle's other
     /// families have not reached yet. Run before the first family is applied, so
     /// a rejection has written nothing and needs no compensation.
-    pub(crate) fn precheck_bundle(
-        &self,
-        families: &[Option<Batch>; SysFamily::COUNT],
-        new_view_ids: &[u64],
-    ) -> Result<(), String> {
+    pub(crate) fn precheck_bundle(&self, families: &[Option<Batch>; SysFamily::COUNT]) -> Result<(), String> {
         if let Some(cols) = families[SysFamily::Column.index()].as_ref() {
             self.check_column_owners(cols, families)?;
         }
         if let Some(b) = families[SysFamily::CircuitNodes.index()].as_ref() {
-            check_circuit_rows(b, new_view_ids)?;
+            let views = families[SysFamily::View.index()].as_ref();
+            let created = views.map(|v| family_pk_partition(SysFamily::View, v).creates);
+            check_circuit_rows(b, created.unwrap_or_default())?;
         }
         Ok(())
     }
@@ -688,7 +679,7 @@ impl CatalogEngine {
     /// this batch already claims — and a DROP must find the schema empty. Schema ids
     /// share one id space with relation ids, so the member count, not the
     /// relation-keyed dep map, is the whole drop guard.
-    fn precheck_schema_family(&mut self, batch: &Batch, net_dead: &[u64]) -> Result<(), String> {
+    fn precheck_schema_family(&self, batch: &Batch, net_dead: &[u64]) -> Result<(), String> {
         // Two `+1` rows under one name both pass the cache check below and both
         // apply: `schema_by_name` keeps the second, leaving the first id live and
         // unreachable.
@@ -726,7 +717,7 @@ impl CatalogEngine {
     /// raw `weight < 0`, so a rename pair's net-live `-1` is never rejected as
     /// "referenced by FK" / "View dependency".
     fn precheck_relation_family(
-        &mut self,
+        &self,
         family: SysFamily,
         batch: &Batch,
         sigs: &[PkSignature],
@@ -848,7 +839,7 @@ impl CatalogEngine {
     /// depends on. The drop guards read the batch row rather than probing: the
     /// contract's CAS proved every `-1` content-equals the live one, `name` and
     /// `source_cols` included.
-    fn precheck_index_family(&mut self, batch: &Batch, net_dead: &[u64]) -> Result<(), String> {
+    fn precheck_index_family(&self, batch: &Batch, net_dead: &[u64]) -> Result<(), String> {
         // The names this batch has already claimed, as `precheck_qname_unique`
         // threads one for relations. Without it two rows under one name both pass
         // the persisted-cache check and the second overwrites the first in

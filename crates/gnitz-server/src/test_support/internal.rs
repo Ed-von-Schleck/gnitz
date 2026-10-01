@@ -5,7 +5,7 @@
 //! crate-internals as `crate::` and widens no API — nothing links this crate.
 
 use crate::catalog::{CatalogColumn, CatalogEngine, SysFamily, PUBLIC_SCHEMA_ID};
-use gnitz_expr::SchemaFacts;
+use gnitz_expr::{ColumnTable, SchemaFacts};
 use gnitz_store::storage::{Batch, BatchBuilder, ReadCursor};
 use gnitz_wire::sys_rows::{
     write_circuit_rows, write_idx_tab_row, write_schema_tab_row, write_table_tab_row, IdxTabRow, SchemaTabRow,
@@ -181,32 +181,39 @@ pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: u64, source_tid: 
     write_circuit(engine, vid, identity_circuit(source_tid, bound));
 }
 
-// ── Positional row builders ──────────────────────────────────────────────
-//
-// Fixtures over `gnitz_wire::sys_rows`' codecs, defaulting what a test never
-// varies. Production writes the wire struct inline.
+// ── System-row fixtures ──────────────────────────────────────────────────
 
-/// Append one TABLE_TAB row at `weight`.
-pub fn push_table_tab_row(
-    bb: &mut BatchBuilder,
-    tid: u64,
-    schema_id: u64,
-    name: &str,
-    pk_col_idx: u64,
-    flags: u64,
-    weight: i64,
-) {
-    write_table_tab_row(
-        bb,
-        &TableTabRow {
-            table_id: tid,
-            schema_id,
+/// Append one `family` row keyed `key` — the leading id, then the member a
+/// pair-keyed family adds — at `weight`. Payload column `pi` holds `cell(pi)`: a
+/// U64 as it is, a STRING or BLOB as a text of it too long to sit inline, so a
+/// comparison of two such cells reads both blob heaps.
+pub fn push_sys_row(bb: &mut BatchBuilder, family: SysFamily, key: [u64; 2], weight: i64, cell: impl Fn(usize) -> u64) {
+    let schema = family.schema();
+    bb.begin_row_opk(&key.map(u128::from)[..schema.pk_cols().len()], weight);
+    for (pi, col) in schema.payload_columns() {
+        match col.type_code {
+            TypeCode::U64 => bb.put_u64(cell(pi)),
+            _ => bb.put_string(&format!("payload_cell_{}", cell(pi))),
+        }
+    }
+    bb.end_row();
+}
+
+/// A TABLE_TAB batch of `(table_id, name, weight)` rows: `public` tables keyed
+/// on column 0, under default props.
+pub fn table_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
+    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
+    for &(table_id, name, weight) in rows {
+        let row = TableTabRow {
+            table_id,
+            schema_id: PUBLIC_SCHEMA_ID,
             name,
-            pk_col_idx,
-            flags,
-        },
-        weight,
-    );
+            pk_col_idx: gnitz_wire::pack_pk_cols(&[0]),
+            flags: gnitz_wire::TableProps::default().pack(),
+        };
+        write_table_tab_row(&mut bb, &row, weight);
+    }
+    bb.finish()
 }
 
 /// A SCHEMA_TAB batch of `(schema_id, name, weight)` rows.
@@ -225,12 +232,11 @@ pub fn col_tab_batch(owner_id: u64, defs: &[CatalogColumn], weight: i64) -> Batc
     bb.finish()
 }
 
-/// The one-row IDX_TAB batch at `weight`. A `-1` must reproduce its `+1`'s
-/// payload exactly — the retraction CAS rejects a mismatch.
+/// The one-row IDX_TAB batch of an index over `cols` at `weight`.
 pub fn idx_tab_batch(
     index_id: u64,
     owner_id: u64,
-    packed_cols: u64,
+    cols: &[u32],
     name: &str,
     props: gnitz_wire::IndexProps,
     weight: i64,
@@ -241,7 +247,7 @@ pub fn idx_tab_batch(
         &IdxTabRow {
             index_id,
             owner_id,
-            source_col_idx: packed_cols,
+            source_col_idx: gnitz_wire::pack_pk_cols(cols),
             name,
             flags: props.pack(),
         },

@@ -1,51 +1,33 @@
-//! ALTER (rename) catalog mechanics driven directly at the `CatalogEngine`
-//! layer: the reconciling register hooks (a rename pair fires no cascade), the
-//! post-image retraction contract (CAS, system-range rewrite guard)
-//! exercised with names longer than 12 bytes so the German-string blob heap is on
-//! the CAS path, and the id-only directory resume
-//! across a reopen. The end-to-end SQL surface is in
-//! `crates/gnitz-sql/tests/engine/ddl.rs`.
+//! ALTER catalog mechanics driven directly at the `CatalogEngine` layer: the
+//! reconciling register hooks (a rename pair fires no cascade), the id-only
+//! directory resume across a reopen, and the column-ALTER guards. The
+//! end-to-end SQL surface is in `crates/gnitz-sql/tests/engine/ddl.rs`.
 
 use super::*;
-use gnitz_wire::{RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX};
+use gnitz_wire::sys_rows::{write_table_tab_row, TableTabRow};
+use gnitz_wire::{RELTAB_PAY_SCHEMA_ID, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX};
 use std::path::Path;
 
-/// The live TABLE_TAB row's payload for `tid`. Named fields rather than a tuple
-/// because these tests rebuild the row with one field changed.
-struct TableRow {
-    schema_id: u64,
-    name: String,
-    pk_col_idx: u64,
-    flags: u64,
-}
-
-fn live_table_row(engine: &CatalogEngine, tid: u64) -> TableRow {
-    let sr = engine
-        .live_sys_row(SysFamily::Table, tid)
-        .unwrap_or_else(|| panic!("live TABLE_TAB row for tid {tid} missing"));
-    let (src, row) = sr.source();
-    TableRow {
-        schema_id: payload_u64(src, row, RELTAB_PAY_SCHEMA_ID),
-        name: payload_string(src, row, RELTAB_PAY_NAME),
-        pk_col_idx: payload_u64(src, row, TABTAB_PAY_PK_COL_IDX),
-        flags: payload_u64(src, row, TABTAB_PAY_FLAGS),
-    }
-}
-
-/// One TABLE_TAB row at `weight` reproducing `row`, with `name` substituted.
-fn push_table_row(bb: &mut BatchBuilder, tid: u64, row: &TableRow, name: &str, weight: i64) {
-    push_table_tab_row(bb, tid, row.schema_id, name, row.pk_col_idx, row.flags, weight);
-}
-
-/// A TABLE_TAB rename pair: `-1` reproduces the live payload byte-for-byte (so
-/// the CAS accepts it), `+1` differs only in `name`.
-fn table_rename_pair(engine: &CatalogEngine, tid: u64, new_name: &str) -> Batch {
-    let row = live_table_row(engine, tid);
+/// A rename of `tid` to `new_name` as its two TABLE_TAB rows, `[-1, +1]`: the
+/// `-1` copies the live row, the `+1` differs from it only in `name`.
+fn table_rename_rows(engine: &CatalogEngine, tid: u64, new_name: &str) -> [Batch; 2] {
+    let minus = engine.retract_under(SysFamily::Table, &[tid]);
     let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-    for (weight, name) in [(-1i64, row.name.as_str()), (1i64, new_name)] {
-        push_table_row(&mut bb, tid, &row, name, weight);
-    }
-    bb.finish()
+    let row = TableTabRow {
+        table_id: tid,
+        schema_id: payload_u64(&minus, 0, RELTAB_PAY_SCHEMA_ID),
+        name: new_name,
+        pk_col_idx: payload_u64(&minus, 0, TABTAB_PAY_PK_COL_IDX),
+        flags: payload_u64(&minus, 0, TABTAB_PAY_FLAGS),
+    };
+    write_table_tab_row(&mut bb, &row, 1);
+    [minus, bb.finish()]
+}
+
+fn table_rename_pair(engine: &CatalogEngine, tid: u64, new_name: &str) -> Batch {
+    let [mut pair, plus] = table_rename_rows(engine, tid, new_name);
+    pair.append_batch(&plus);
+    pair
 }
 
 // ── Reconciling hooks: a rename fires no teardown ───────────────────────────
@@ -119,8 +101,6 @@ fn rename_then_reopen_resolves_flushed_data() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── The retraction contract, exercised with > 12-byte names ────────────────
-
 #[test]
 fn valid_long_name_rename_accepted() {
     // Regression against a naive region `memcmp`: a name > 12 bytes lives in the
@@ -140,185 +120,14 @@ fn valid_long_name_rename_accepted() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn stale_snapshot_rename_rejected_long_name() {
-    let dir = temp_dir("alter_stale");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", TypeCode::U64)];
-    let tid = engine.create_table("public.original_long_name", &cols, &[0]).unwrap();
-    // The `-1` carries a stale (wrong) old name > 12 bytes that does not match the
-    // live row — the CAS must reject it.
-    let row = live_table_row(&engine, tid);
-    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-    for (weight, name) in [(-1i64, "stale_wrong_long_name"), (1i64, "new_desired_long_name")] {
-        push_table_row(&mut bb, tid, &row, name, weight);
-    }
-    let err = engine
-        .ingest_to_family(gnitz_wire::TABLE_TAB, &bb.finish())
-        .unwrap_err();
-    assert!(
-        err.contains("catalog changed concurrently"),
-        "a stale-snapshot rename must be rejected: {err}"
-    );
-    // The catalog is unchanged (still the original name, one live row).
-    assert!(engine.caches.entity_by_qname.contains_key("public.original_long_name"));
-    assert_eq!(rows_under(&engine, SysFamily::Table, tid), 1);
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// The guard keys on the id space, not the batch shape: every sign is rejected,
-/// on both relation families, at an id the SQL layer cannot even name. Each
-/// batch reproduces the bootstrap row byte-for-byte where it carries a `-1`, so
-/// the CAS would pass and only the id-space guard can stop it.
-#[test]
-fn system_range_mutations_rejected() {
-    let dir = temp_dir("alter_sysrange");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    let table_drop = {
-        let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-        push_table_tab_row(
-            &mut bb,
-            gnitz_wire::IDX_TAB,
-            SYSTEM_SCHEMA_ID,
-            "_indices",
-            pack_pk_cols(&[0]),
-            0,
-            -1,
-        );
-        bb.finish()
-    };
-    let table_rename = {
-        let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-        push_table_tab_row(
-            &mut bb,
-            gnitz_wire::IDX_TAB,
-            SYSTEM_SCHEMA_ID,
-            "_indices",
-            pack_pk_cols(&[0]),
-            0,
-            -1,
-        );
-        push_table_tab_row(
-            &mut bb,
-            gnitz_wire::IDX_TAB,
-            SYSTEM_SCHEMA_ID,
-            "renamed",
-            pack_pk_cols(&[0]),
-            0,
-            1,
-        );
-        bb.finish()
-    };
-    let view_rename = {
-        let mut bb = BatchBuilder::new(*SysFamily::View.schema());
-        push_view_tab_row(&mut bb, -1, gnitz_wire::IDX_TAB, "a", 0, 0, 0);
-        push_view_tab_row(&mut bb, 1, gnitz_wire::IDX_TAB, "b", 0, 0, 0);
-        bb.finish()
-    };
-    // A bare `+1` on VIEW_TAB at a system TABLE_TAB id: VIEW_TAB holds no live
-    // row there, so the net test passes and the caches would alias
-    // `_system._indices` away.
-    let view_create = build_view_tab_row(gnitz_wire::IDX_TAB, "v");
-
-    let members = |engine: &CatalogEngine| {
-        [SysFamily::Table, SysFamily::View].map(|f| engine.schema_members(f, PUBLIC_SCHEMA_ID).len())
-    };
-    let members_before = members(&engine);
-    for (family, batch, verb, noun) in [
-        (SysFamily::Table, &table_drop, "DROP", "table"),
-        (SysFamily::Table, &table_rename, "ALTER", "table"),
-        (SysFamily::View, &view_rename, "ALTER", "view"),
-        (SysFamily::View, &view_create, "CREATE", "view"),
-    ] {
-        let err = engine.ingest_to_family(family.id(), batch).unwrap_err();
-        assert!(err.contains(&format!("cannot {verb} a system {noun}")), "{err}");
-    }
-
-    // Nothing was torn down or aliased on the way to the reject.
-    for family in SysFamily::ALL {
-        assert!(engine.registry.has_id(family.id()), "{} unregistered", family.name());
-    }
-    assert_eq!(
-        engine.qualified_name_or_unknown(gnitz_wire::IDX_TAB),
-        ("_system".to_string(), "_indices".to_string()),
-        "the system relation must still resolve under its own name"
-    );
-    assert_eq!(engine.caches.entity_by_qname.get("public.v"), None);
-    assert_eq!(members(&engine), members_before);
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// The same guard on the schema id space: `public` and `_system` are bootstrap
-/// rows, so no DROP or rename of one passes.
-#[test]
-fn system_range_schema_mutations_rejected() {
-    let dir = temp_dir("alter_sysrange_schema");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    for sid in [SYSTEM_SCHEMA_ID, PUBLIC_SCHEMA_ID] {
-        let err = engine
-            .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_tab_batch(&[(sid, "gone", -1)]))
-            .unwrap_err();
-        assert!(err.contains("cannot DROP a system schema"), "{err}");
-        assert!(engine.caches.schema_by_id.contains_key(&sid), "schema {sid} dropped");
-    }
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── COL_TAB: the column retraction contract ─────────────────────────────────
-
-#[test]
-fn stale_column_rename_rejected_and_drop_cascade_passes() {
-    let dir = temp_dir("alter_col");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![
-        col_def("id", TypeCode::U64),
-        col_def("original_column_name", TypeCode::U64),
-    ];
-    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let col_idx: i64 = 1;
-
-    // A COL_TAB rewrite pair whose `-1` carries a stale (wrong) old column name
-    // > 12 bytes — the Column precheck arm must reject it via the CAS.
-    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    for (weight, name) in [(-1i64, "stale_wrong_column_x"), (1i64, "new_column_name_here")] {
-        col_def(name, TypeCode::U64).write_col_tab_row(&mut bb, tid, col_idx as usize, weight);
-    }
-    let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
-    assert!(
-        err.contains("catalog changed concurrently"),
-        "a stale column rename must be rejected by the Column precheck arm: {err}"
-    );
-
-    // A DROP TABLE cascade (unpaired COL `-1`s with the full live payload) still
-    // passes the Column arm — the drop succeeds and removes the columns.
-    let cols_before = count_records(engine.sys_relation(SysFamily::Column).cursor());
-    engine.drop_table("public.t").unwrap();
-    let cols_after = count_records(engine.sys_relation(SysFamily::Column).cursor());
-    assert_eq!(
-        cols_after,
-        cols_before - 2,
-        "DROP TABLE must cascade-retract both columns"
-    );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
 // ── The column-ALTER owner guard covers every rewrite pair ──────────────────
 
 fn rename_to(new_name: &str) -> impl FnOnce(&mut CatalogColumn) + '_ {
     move |c: &mut CatalogColumn| c.def.name = new_name.to_string()
 }
 
-/// RENAME COLUMN on a view and on a system table — neither is a user base
-/// table, and the SQL planner is not the trust boundary that stops them.
+/// RENAME COLUMN on a view, which is no user base table; the SQL planner is not
+/// the trust boundary that stops it.
 #[test]
 fn column_rename_on_non_base_owner_rejected() {
     let dir = temp_dir("alter_col_owner");
@@ -332,19 +141,6 @@ fn column_rename_on_non_base_owner_rejected() {
         .precheck_family(SysFamily::Column, &col_alter_pair(vid, 0, &cols[0], rename_to("id2")))
         .unwrap_err();
     assert!(err.contains("not a user base table"), "view owner: {err}");
-
-    // A system table's own COL_TAB self-description row, read back from what
-    // bootstrap wrote so the `-1` cannot drift from it. A system owner packs a
-    // COL_TAB PK below the family's first user id, so the id-space floor is what
-    // catches this one, before the owner is ever resolved.
-    let sys_col = engine.read_column_defs(gnitz_wire::IDX_TAB).unwrap()[0].clone();
-    let err = engine
-        .precheck_family(
-            SysFamily::Column,
-            &col_alter_pair(gnitz_wire::IDX_TAB, 0, &sys_col, rename_to("renamed")),
-        )
-        .unwrap_err();
-    assert!(err.contains("cannot ALTER a system column"), "system owner: {err}");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -430,7 +226,7 @@ fn hiding_an_indexed_column_rejected_but_unnulling_it_accepted() {
 #[test]
 fn hiding_or_unnulling_a_pk_column_rejected() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
-    let (mut engine, tid, dir) = table_fixture("alter_pk_col", &cols);
+    let (engine, tid, dir) = table_fixture("alter_pk_col", &cols);
 
     for mutate in [hide as fn(&mut CatalogColumn), unnull] {
         let err = engine
@@ -517,7 +313,7 @@ fn a_dropped_column_cannot_be_renamed_or_indexed() {
     let idx = idx_tab_batch(
         engine.allocate_ids(1).unwrap(),
         tid,
-        pack_pk_cols(&[1]),
+        &[1],
         "public__t__idx_a",
         gnitz_wire::IndexProps { is_unique: false },
         1,
@@ -539,12 +335,9 @@ fn insert_first_rename_pair_lands_the_new_name() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
     let tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
 
-    let row = live_table_row(&engine, tid);
-    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-    for (weight, name) in [(1i64, "renamed"), (-1i64, row.name.as_str())] {
-        push_table_row(&mut bb, tid, &row, name, weight);
-    }
-    engine.ingest_to_family(gnitz_wire::TABLE_TAB, &bb.finish()).unwrap();
+    let [minus, mut pair] = table_rename_rows(&engine, tid, "renamed");
+    pair.append_batch(&minus);
+    engine.ingest_to_family(gnitz_wire::TABLE_TAB, &pair).unwrap();
 
     assert!(
         engine.caches.entity_by_qname.contains_key("public.renamed"),
@@ -600,12 +393,12 @@ fn a_column_alter_must_be_its_bundles_only_change() {
     families[SysFamily::Index.index()] = Some(idx_tab_batch(
         engine.allocate_ids(1).unwrap(),
         tid,
-        pack_pk_cols(&[1]),
+        &[1],
         "public__t__idx_v",
         gnitz_wire::IndexProps { is_unique: false },
         1,
     ));
-    let err = engine.precheck_bundle(&families, &[]).unwrap_err();
+    let err = engine.precheck_bundle(&families).unwrap_err();
     assert!(err.contains("only change"), "{err}");
 
     // One column block altering two owners.
@@ -614,7 +407,7 @@ fn a_column_alter_must_be_its_bundles_only_change() {
     append(other, &mut bb);
     let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
     families[SysFamily::Column.index()] = Some(bb.finish());
-    let err = engine.precheck_bundle(&families, &[]).unwrap_err();
+    let err = engine.precheck_bundle(&families).unwrap_err();
     assert!(err.contains("only change"), "{err}");
 
     engine.close();

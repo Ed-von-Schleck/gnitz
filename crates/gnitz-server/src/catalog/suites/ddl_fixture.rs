@@ -8,8 +8,8 @@
 //! without a server.
 
 use super::super::*;
-use crate::test_support::{col_tab_batch, idx_tab_batch, push_table_tab_row, schema_tab_batch};
-use gnitz_wire::pack_pk_cols;
+use crate::test_support::{col_tab_batch, idx_tab_batch, schema_tab_batch};
+use gnitz_wire::sys_rows::{write_table_tab_row, TableTabRow};
 
 /// Split `schema.name`, defaulting the schema half. Only these direct entry
 /// points take qualified-name strings; the wire path ships schema and entity ids
@@ -143,7 +143,6 @@ impl CatalogEngine {
         props: gnitz_wire::TableProps,
     ) -> Result<u64, String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_name, "public");
-        let raw_pk_cols = pack_pk_cols(pk_cols);
 
         // Only what `submit` cannot derive for itself: the schema id, and an id
         // for the new table. Every rule this shape must satisfy is the
@@ -155,19 +154,18 @@ impl CatalogEngine {
             .ok_or_else(|| format!("Schema does not exist: {schema_name}"))?;
         let tid = self.allocate_ids(1).unwrap();
 
-        let flags = props.pack();
-
-        // Write columns first (table hook reads them via sys_columns)
+        // Columns first: the table's register hook reads them.
         self.write_column_records(tid, col_defs)?;
-
-        // Write table record (triggers hook)
-        {
-            let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-            push_table_tab_row(&mut bb, tid, sid, table_name, raw_pk_cols, flags, 1);
-            let batch = bb.finish();
-            self.submit(SysFamily::Table, batch)?;
-        }
-
+        let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
+        let row = TableTabRow {
+            table_id: tid,
+            schema_id: sid,
+            name: table_name,
+            pk_col_idx: gnitz_wire::pack_pk_cols(pk_cols),
+            flags: props.pack(),
+        };
+        write_table_tab_row(&mut bb, &row, 1);
+        self.submit(SysFamily::Table, bb.finish())?;
         Ok(tid)
     }
 
@@ -232,11 +230,10 @@ impl CatalogEngine {
         let index_name = make_secondary_index_name(schema_name, table_name, &col_names.join("_"));
         let index_id = self.allocate_ids(1).unwrap();
 
-        let packed_cols = gnitz_wire::pack_pk_cols(&col_indices);
         let batch = idx_tab_batch(
             index_id,
             owner_id,
-            packed_cols,
+            &col_indices,
             &index_name,
             gnitz_wire::IndexProps { is_unique },
             1,
@@ -302,15 +299,14 @@ impl CatalogEngine {
         self.ddl_sync(SysFamily::Column.id(), col_batch)?;
 
         let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-        push_table_tab_row(
-            &mut bb,
-            tid,
+        let row = TableTabRow {
+            table_id: tid,
             schema_id,
             name,
-            gnitz_wire::pack_pk_cols(pk),
-            gnitz_wire::TableProps::default().pack(),
-            1,
-        );
+            pk_col_idx: gnitz_wire::pack_pk_cols(pk),
+            flags: gnitz_wire::TableProps::default().pack(),
+        };
+        write_table_tab_row(&mut bb, &row, 1);
         self.ddl_sync(SysFamily::Table.id(), bb.finish())
     }
 }

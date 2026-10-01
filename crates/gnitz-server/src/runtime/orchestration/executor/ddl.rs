@@ -160,7 +160,7 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
     // compensation. Placing it after the ingest loop instead would
     // make a check that needs no applied state indistinguishable from a
     // post-apply failure.
-    shared.cat().precheck_bundle(&families, &new_view_ids)?;
+    shared.cat().precheck_bundle(&families)?;
 
     // Pre-flight global uniqueness for every unique secondary index in this
     // bundle before reserving the zone LSN or mutating the catalog, so a

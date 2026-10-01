@@ -25,7 +25,7 @@ mod wide_pk_validation;
 
 use super::sys_tables::*;
 use super::*;
-use gnitz_store::relation::SecondaryIndex;
+use gnitz_store::relation::{relation_dir, relations_dir, ChildAddr, ChildKind, SecondaryIndex};
 use gnitz_store::schema::Slot;
 use gnitz_wire::{pack_pk_cols, TypeCode, PK_LIST_PACKED_FLAG};
 
@@ -50,8 +50,8 @@ fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> std::rc::
 
 use crate::test_support::{
     col_def, col_tab_batch, equi_join_circuit, fk_def, idx_tab_batch, negate_chain, nullable_def, opk_pk,
-    pk_payload_schema, push_table_tab_row, push_view_tab_row, read_rows, register_identity_view, scan_all,
-    schema_tab_batch, scratch_dir, seek_by_index, seek_by_index_range, sum_weights, try_register_identity_view,
+    pk_payload_schema, push_sys_row, push_view_tab_row, read_rows, register_identity_view, scan_all, schema_tab_batch,
+    scratch_dir, seek_by_index, seek_by_index_range, sum_weights, table_tab_batch, try_register_identity_view,
     try_register_view, uuid_def, write_circuit, write_identity_circuit, LocalDrive,
 };
 
@@ -235,19 +235,18 @@ fn ingest_fixture(
     (engine, tid)
 }
 
-/// Build a raw TABLE_TAB row for tests that drive the catalog applier or
-/// hook layer directly (bypassing `create_table`).
-fn build_table_tab_row(tid: u64, raw_pk_cols: u64, table_name: &str) -> Batch {
-    build_table_tab_row_flags(tid, raw_pk_cols, table_name, 0)
-}
-
-/// Like `build_table_tab_row` but with an explicit packed `flags` word — the
-/// routing shapes `create_table` cannot make. Writes through the production row
-/// builder, so a fixture cannot drift from the layout the engine registers
-/// tables with.
-fn build_table_tab_row_flags(tid: u64, raw_pk_cols: u64, table_name: &str, flags: u64) -> Batch {
+/// A one-row `public` TABLE_TAB `+1` under explicit packed `pk_col_idx` and
+/// `flags` words — the shapes `create_table` cannot make.
+fn table_tab_row_words(tid: u64, table_name: &str, pk_col_idx: u64, flags: u64) -> Batch {
     let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-    push_table_tab_row(&mut bb, tid, PUBLIC_SCHEMA_ID, table_name, raw_pk_cols, flags, 1);
+    let row = gnitz_wire::sys_rows::TableTabRow {
+        table_id: tid,
+        schema_id: PUBLIC_SCHEMA_ID,
+        name: table_name,
+        pk_col_idx,
+        flags,
+    };
+    gnitz_wire::sys_rows::write_table_tab_row(&mut bb, &row, 1);
     bb.finish()
 }
 
@@ -264,7 +263,7 @@ fn create_flagged_table(
 ) -> u64 {
     let tid = engine.allocate_ids(1).unwrap();
     engine.write_column_records(tid, cols).unwrap();
-    let batch = build_table_tab_row_flags(tid, pack_pk_cols(pk_cols), table_name, flags);
+    let batch = table_tab_row_words(tid, table_name, pack_pk_cols(pk_cols), flags);
     engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch).unwrap();
     tid
 }

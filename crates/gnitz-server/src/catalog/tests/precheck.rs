@@ -1,12 +1,10 @@
-//! The name rules and [`check_batch_shape`], each rule driven on a family whose
-//! declared facts make it the one that fires.
+//! The name rules and [`check_batch_shape`]. The shape rules read a row's key,
+//! weight and payload equality and never decode a cell, so every family is
+//! driven through one schema-generic row.
 
 use super::*;
-use crate::test_support::{col_def, idx_tab_batch, push_table_tab_row, push_view_tab_row, schema_tab_batch};
-use gnitz_wire::sys_rows::{write_circuit_node_row, CircuitNodeRow};
-use gnitz_wire::{pack_pk_cols, IndexProps, TypeCode};
-
-// ── The name rules ──────────────────────────────────────────────────────────
+use crate::test_support::push_sys_row;
+use gnitz_wire::{CATALOG_ID_CEILING, FIRST_USER_SCHEMA_ID, FIRST_USER_TABLE_ID};
 
 #[test]
 fn an_unstorable_name_is_rejected_and_a_leading_underscore_is_not() {
@@ -15,6 +13,7 @@ fn an_unstorable_name_is_rejected_and_a_leading_underscore_is_not() {
         ("a b", "invalid characters"),
         ("a.b", "invalid characters"),
         ("a/b", "invalid characters"),
+        ("é", "invalid characters"),
         ("MixedCase", "not canonical"),
     ] {
         let err = reject_unstorable_name(name, "table").unwrap_err();
@@ -25,185 +24,129 @@ fn an_unstorable_name_is_rejected_and_a_leading_underscore_is_not() {
     }
 }
 
-// ── Fixtures ────────────────────────────────────────────────────────────────
+/// An id every family's range admits.
+const ID: u64 = 20;
 
-/// A CIRCUIT_NODES batch of `(view_id, node_id, weight)` rows.
-fn circuit_batch(rows: &[(u64, u64, i64)]) -> Batch {
-    let mut bb = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
-    for &(view_id, node_id, weight) in rows {
-        write_circuit_node_row(
-            &mut bb,
-            &CircuitNodeRow {
-                view_id,
-                node_id,
-                opcode: gnitz_wire::Opcode::IntegrateSink.as_wire(),
-                source_table: None,
-                inputs: [None; 2],
-                params: None,
-            },
-            weight,
-        );
+/// What the shape rules say of `family` rows `(leading id, weight, differing
+/// column)`, `""` when they pass: every row carries the same payload, except
+/// that a row's named column holds another value.
+fn shape(family: SysFamily, rows: &[(u64, i64, &str)]) -> String {
+    let wire = family.wire();
+    let payload = &wire.cols[wire.pk_cols.len()..];
+    let mut bb = BatchBuilder::new(*family.schema());
+    for &(id, weight, differing) in rows {
+        push_sys_row(&mut bb, family, [id, 0], weight, |pi| {
+            (payload[pi].name == differing) as u64
+        });
     }
-    bb.finish()
+    check_batch_shape(family, &bb.finish()).err().unwrap_or_default()
 }
 
-/// A TABLE_TAB batch of `(table_id, schema_id, name, weight)` rows.
-fn table_batch(rows: &[(u64, u64, &str, i64)]) -> Batch {
-    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-    for &(tid, sid, name, weight) in rows {
-        push_table_tab_row(
-            &mut bb,
-            tid,
-            sid,
-            name,
-            pack_pk_cols(&[0]),
-            gnitz_wire::TableProps::default().pack(),
-            weight,
-        );
-    }
-    bb.finish()
+/// Rows a drop cascade retracts with their owner, and so no client delta may.
+fn owned(family: SysFamily) -> bool {
+    matches!(family, SysFamily::Column | SysFamily::CircuitNodes)
 }
-
-fn index_batch(index_id: u64, weight: i64) -> Batch {
-    idx_tab_batch(index_id, 16, pack_pk_cols(&[1]), "ix", IndexProps::default(), weight)
-}
-
-fn shape_err(family: SysFamily, batch: &Batch) -> String {
-    check_batch_shape(family, batch)
-        .err()
-        .expect("the shape rules must reject this batch")
-}
-
-// ── Row weights ─────────────────────────────────────────────────────────────
 
 #[test]
-fn a_system_row_may_only_be_written_at_weight_one() {
-    check_batch_shape(SysFamily::Schema, &schema_tab_batch(&[(20, "s", 1)])).unwrap();
-    for w in [0i64, 2, -2, i64::MIN] {
-        shape_err(SysFamily::Schema, &schema_tab_batch(&[(20, "s", w)]));
+fn a_system_row_is_written_at_weight_plus_or_minus_one() {
+    for family in SysFamily::ALL {
+        assert_eq!(shape(family, &[(ID, 1, "")]), "", "{family:?}");
+        for w in [0, 2, -2, i64::MIN] {
+            let err = shape(family, &[(ID, w, "")]);
+            assert!(err.contains("expected ±1"), "{family:?} at {w}: {err}");
+        }
     }
 }
-
-// ── Per-PK multiplicity ─────────────────────────────────────────────────────
 
 #[test]
 fn a_repeated_sign_on_one_pk_is_rejected() {
-    for (family, batch) in [
-        (
-            SysFamily::Table,
-            table_batch(&[(20, PUBLIC_SCHEMA_ID, "a", 1), (20, PUBLIC_SCHEMA_ID, "b", 1)]),
-        ),
-        (SysFamily::CircuitNodes, circuit_batch(&[(20, 0, 1), (20, 0, 1)])),
-    ] {
-        let err = shape_err(family, &batch);
-        assert!(err.contains("more than one row"), "{family:?}: {err}");
+    for family in SysFamily::ALL {
+        for w in [1, -1] {
+            let err = shape(family, &[(ID, w, ""), (ID, w, "")]);
+            assert!(err.contains("more than one row"), "{family:?} at {w}: {err}");
+        }
     }
 }
 
 #[test]
-fn a_row_retracted_only_with_its_owner_refuses_an_unpaired_retraction() {
-    let err = shape_err(SysFamily::CircuitNodes, &circuit_batch(&[(20, 0, -1)]));
-    assert!(err.contains("retracted only with its owner"), "{err}");
-
-    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    col_def("v", TypeCode::U64).write_col_tab_row(&mut bb, 300, 1, -1);
-    let err = shape_err(SysFamily::Column, &bb.finish());
-    assert!(err.contains("retracted only with its owner"), "{err}");
-    assert!(err.contains("column 1 of owner 300"), "{err}");
-}
-
-// ── The id range ────────────────────────────────────────────────────────────
-
-#[test]
-fn an_id_below_a_familys_first_user_id_is_rejected_whatever_its_sign() {
-    for w in [1i64, -1] {
-        let err = shape_err(
-            SysFamily::Schema,
-            &schema_tab_batch(&[(SYSTEM_SCHEMA_ID, "_system", w)]),
+fn only_an_owned_row_refuses_an_unpaired_retraction() {
+    for family in SysFamily::ALL {
+        let err = shape(family, &[(ID, -1, "")]);
+        let want = if owned(family) {
+            "retracted only with its owner"
+        } else {
+            ""
+        };
+        assert!(
+            err.contains(want) && err.is_empty() == want.is_empty(),
+            "{family:?}: {err}"
         );
-        assert!(err.contains("a system schema"), "w={w}: {err}");
     }
-
-    let err = shape_err(
-        SysFamily::Table,
-        &table_batch(&[(gnitz_wire::IDX_TAB, SYSTEM_SCHEMA_ID, "_indices", 1)]),
-    );
-    assert!(err.contains("a system table"), "{err}");
-
-    let err = shape_err(SysFamily::Index, &index_batch(0, 1));
-    assert!(err.contains("a system index"), "{err}");
-
-    let mut bb = BatchBuilder::new(*SysFamily::Sequence.schema());
-    bb.begin_row(SEQ_ID_NEXT_ID as u128, 1);
-    bb.put_u64(99);
-    bb.end_row();
-    let err = shape_err(SysFamily::Sequence, &bb.finish());
-    assert!(err.contains("a system sequence"), "{err}");
-
-    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    col_def("id", TypeCode::U64).write_col_tab_row(&mut bb, gnitz_wire::IDX_TAB, 0, 1);
-    let err = shape_err(SysFamily::Column, &bb.finish());
-    assert!(err.contains("a system column"), "{err}");
-    assert!(
-        err.contains(&format!("column 0 of owner {}", gnitz_wire::IDX_TAB)),
-        "{err}"
-    );
+    assert!(shape(SysFamily::Column, &[(ID, -1, "")]).contains("column 0 of owner 20"));
 }
 
 #[test]
-fn an_id_at_or_above_a_familys_ceiling_is_rejected() {
-    let ceiling = gnitz_wire::CATALOG_ID_CEILING;
-    check_batch_shape(SysFamily::Schema, &schema_tab_batch(&[(ceiling - 1, "s", 1)])).unwrap();
+fn an_id_outside_a_familys_range_is_rejected_whatever_its_sign() {
+    for family in SysFamily::ALL {
+        let floor = match family {
+            SysFamily::Schema => FIRST_USER_SCHEMA_ID,
+            SysFamily::Table | SysFamily::View | SysFamily::Column | SysFamily::Index | SysFamily::Sequence => {
+                FIRST_USER_TABLE_ID
+            }
+            SysFamily::CircuitNodes => 0,
+        };
+        assert_eq!(shape(family, &[(floor, 1, "")]), "", "{family:?}");
+        if let Some(below) = floor.checked_sub(1) {
+            let drop = if owned(family) {
+                "retracted only with its owner"
+            } else {
+                "cannot DROP a system"
+            };
+            for (rows, want) in [
+                (&[(below, 1, "")][..], "cannot CREATE a system"),
+                (&[(below, -1, "")], drop),
+                (&[(below, -1, ""), (below, 1, "name")], "cannot ALTER a system"),
+            ] {
+                let err = shape(family, rows);
+                assert!(err.contains(want), "{family:?} {want}: {err}");
+            }
+        }
 
-    let mut view = BatchBuilder::new(*SysFamily::View.schema());
-    push_view_tab_row(&mut view, 1, ceiling, "v", 0, 0, 0);
-    for (family, batch) in [
-        (SysFamily::Schema, schema_tab_batch(&[(ceiling, "s", 1)])),
-        (SysFamily::Table, table_batch(&[(ceiling, PUBLIC_SCHEMA_ID, "t", 1)])),
-        (SysFamily::View, view.finish()),
-        (SysFamily::Index, index_batch(ceiling, 1)),
-    ] {
-        let err = shape_err(family, &batch);
-        assert!(err.contains("id ceiling"), "{family:?}: {err}");
+        let capped = matches!(
+            family,
+            SysFamily::Schema | SysFamily::Table | SysFamily::View | SysFamily::Index
+        );
+        assert_eq!(shape(family, &[(CATALOG_ID_CEILING - 1, 1, "")]), "", "{family:?}");
+        let err = shape(family, &[(CATALOG_ID_CEILING, 1, "")]);
+        assert_eq!(err.contains("id ceiling"), capped, "{family:?}: {err}");
+        assert_eq!(err.is_empty(), !capped, "{family:?}: {err}");
     }
 }
 
-// ── What a rewrite pair may change ──────────────────────────────────────────
-
+/// The fields a client's rewrite pair may change, per column: everything else
+/// of a live row is fixed for its lifetime.
 #[test]
 fn a_rewrite_pair_may_change_only_the_fields_its_family_declares() {
-    check_batch_shape(
-        SysFamily::Table,
-        &table_batch(&[(20, PUBLIC_SCHEMA_ID, "t", -1), (20, PUBLIC_SCHEMA_ID, "t2", 1)]),
-    )
-    .unwrap();
-
-    let err = shape_err(
-        SysFamily::Table,
-        &table_batch(&[(20, PUBLIC_SCHEMA_ID, "t", -1), (20, SYSTEM_SCHEMA_ID, "t", 1)]),
-    );
-    assert!(err.contains("changes a field it may not"), "{err}");
-
-    let mut index_pair = index_batch(20, -1);
-    index_pair.append_batch(&index_batch(20, 1));
-    for (family, batch) in [
-        (SysFamily::Schema, schema_tab_batch(&[(20, "s", -1), (20, "s", 1)])),
-        (SysFamily::Index, index_pair),
-    ] {
-        let err = shape_err(family, &batch);
-        assert!(err.contains("admits no rewrite pair"), "{family:?}: {err}");
+    for family in SysFamily::ALL {
+        let may_change: &[&str] = match family {
+            SysFamily::Table | SysFamily::View => &["name"],
+            SysFamily::Column => &["name", "is_nullable", "is_hidden"],
+            SysFamily::Sequence => &["next_val"],
+            SysFamily::Schema | SysFamily::Index | SysFamily::CircuitNodes => &[],
+        };
+        let wire = family.wire();
+        for col in &wire.cols[wire.pk_cols.len()..] {
+            let err = shape(family, &[(ID, -1, ""), (ID, 1, col.name)]);
+            let want = match may_change {
+                [] => "admits no rewrite pair",
+                names if names.contains(&col.name) => "",
+                _ => "changes a field it may not",
+            };
+            assert!(
+                err.contains(want) && err.is_empty() == want.is_empty(),
+                "{family:?}.{}: {err}",
+                col.name
+            );
+        }
     }
-}
-
-// ── Bundle rules ────────────────────────────────────────────────────────────
-
-/// A circuit `+1` under a view its bundle does not create would inject nodes
-/// into a running view's circuit, or make its source's dependents permanently
-/// true.
-#[test]
-fn a_circuit_row_must_name_a_view_its_bundle_creates() {
-    let rows = circuit_batch(&[(20, 0, 1)]);
-    let err = check_circuit_rows(&rows, &[]).unwrap_err();
-    assert!(err.contains("view 20, which this transaction does not create"), "{err}");
-    check_circuit_rows(&rows, &[20]).unwrap();
 }

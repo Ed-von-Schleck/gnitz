@@ -577,14 +577,14 @@ impl SysFamily {
         }
     }
 
-    /// How a guard message names one row of this family: a pair-keyed family's
-    /// two ids are meaningless rendered as the one number the widened key is.
+    /// How a guard message names the row at `pk`: a pair-keyed family's two ids
+    /// are meaningless rendered as the one number the widened key is.
     pub(in crate::catalog) fn pk_label(self, pk: u128) -> String {
         let (hi, lo) = gnitz_wire::unpack_pair_pk(pk);
         match self {
             SysFamily::Column => format!("column {lo} of owner {hi}"),
-            SysFamily::CircuitNodes => format!("view {hi} node {lo}"),
-            _ => format!("id {pk}"),
+            SysFamily::CircuitNodes => format!("circuit row {lo} of view {hi}"),
+            _ => format!("{} {pk}", self.row_noun()),
         }
     }
 

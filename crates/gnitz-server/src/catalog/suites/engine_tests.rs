@@ -16,7 +16,7 @@ fn test_orphaned_metadata_recovery() {
                 idx_tab_batch(
                     888,
                     99999,
-                    1,
+                    &[1],
                     "orphaned_idx",
                     gnitz_wire::IndexProps { is_unique: false },
                     1,
@@ -27,9 +27,9 @@ fn test_orphaned_metadata_recovery() {
         engine.close();
     }
 
-    // Re-open should fail because the orphaned index references table 99999
-    let result = CatalogEngine::open(&dir, 1);
-    assert!(result.is_err(), "Orphaned index metadata should cause error on reload");
+    // The orphaned index names a table the reopened catalog does not hold.
+    let err = CatalogEngine::open(&dir, 1).err().expect("the reopen must fail");
+    assert!(err.contains("99999"), "{err}");
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -74,8 +74,8 @@ fn test_reserve_user_sequence_rejects_exhausted_range() {
         .unwrap();
     let err = engine.reserve_user_sequence(full, 64).err().unwrap();
     assert!(err.contains("invalid or exhausted"), "{err}");
-    engine.reserve_user_sequence(full, 0).err().unwrap();
     let edge = engine.create_serial_table("public.edge").unwrap();
+    engine.reserve_user_sequence(edge, 0).err().unwrap();
     engine.reserve_user_sequence(edge, 1 << 63).err().unwrap();
     engine.reserve_user_sequence(edge + 1000, 1).err().unwrap();
 
@@ -89,6 +89,21 @@ fn test_reserve_user_sequence_rejects_exhausted_range() {
     assert_eq!(base, i64::MAX - 64);
     assert_eq!(payload_u64(&delta, 1, 0), (i64::MAX - 1) as u64, "last = i64::MAX - 1");
 
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `count` arrives raw off the wire.
+#[test]
+fn allocate_ids_hands_out_contiguous_runs_under_the_ceiling() {
+    let dir = temp_dir("alloc_ids");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let a = engine.allocate_ids(3).unwrap();
+    assert_eq!(engine.allocate_ids(1).unwrap(), a + 3);
+    for count in [0, gnitz_wire::CATALOG_ID_CEILING, u64::MAX] {
+        engine.allocate_ids(count).unwrap_err();
+    }
+    assert_eq!(engine.allocate_ids(1).unwrap(), a + 4, "a refused run consumes nothing");
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -174,10 +189,7 @@ fn test_raised_counter_survives_drop_and_flush() {
         tid = engine.next_id + 500;
         engine.write_column_records(tid, &cols).unwrap();
         engine
-            .submit(
-                SysFamily::Table,
-                build_table_tab_row(tid, pack_pk_cols(&[0]), "unallocated"),
-            )
+            .submit(SysFamily::Table, table_tab_batch(&[(tid, "unallocated", 1)]))
             .unwrap();
         assert!(engine.next_id > tid);
         engine.submit_retraction(SysFamily::Table, tid).unwrap();
@@ -206,10 +218,7 @@ fn test_sequence_gap_recovery() {
         // Inject table record for tid=250 directly into sys_tables
         engine
             .registry
-            .ingest(
-                SysFamily::Table.id(),
-                build_table_tab_row(250, pack_pk_cols(&[0]), "gap_table"),
-            )
+            .ingest(SysFamily::Table.id(), table_tab_batch(&[(250, "gap_table", 1)]))
             .unwrap();
 
         // Inject column record for tid=250

@@ -68,10 +68,6 @@ pub(in crate::catalog) use cache::{CatalogCacheSet, RelFacts};
 pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
 // Directory primitives the catalog consumes rather than owns.
 pub(in crate::catalog) use gnitz_store::relation::{lock_data_dir, DirLock};
-#[cfg(test)]
-pub(in crate::catalog) use gnitz_store::relation::{relation_dir, relations_dir};
-#[cfg(test)]
-pub(in crate::catalog) use gnitz_store::relation::{ChildAddr, ChildKind};
 // `BatchBuilder` holds no catalog state and lives in `storage`; re-export it
 // for the catalog's row builders.
 pub(in crate::catalog) use gnitz_store::storage::BatchBuilder;

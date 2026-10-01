@@ -406,11 +406,9 @@ fn test_drop_table_cleans_up_indices() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── Regression: drop_table must cascade to owned indices ─────────────
-// Bug 1.3: drop_table used to only retract sys_tables + sys_columns,
-// leaving sys_indices rows whose owner table no longer existed.  On the
-// next restart, replay_catalog would fail with "Index: owner table N
-// not found", leaving the database un-openable.
+// ── drop_table cascades to owned indices ─────────────────────────────
+// A sys_indices row whose owner is gone fails the next boot's replay, leaving
+// the database un-openable.
 
 #[test]
 fn test_drop_table_cascades_secondary_index() {
@@ -809,14 +807,7 @@ fn compensated_drop_of_a_shared_index_keeps_its_directory() {
     let mut ids = Vec::new();
     for name in ["public__t__a", "public__t__b"] {
         let id = engine.allocate_ids(1).unwrap();
-        let idx = idx_tab_batch(
-            id,
-            tid,
-            pack_pk_cols(&[1]),
-            name,
-            gnitz_wire::IndexProps { is_unique: false },
-            1,
-        );
+        let idx = idx_tab_batch(id, tid, &[1], name, gnitz_wire::IndexProps { is_unique: false }, 1);
         engine.submit(SysFamily::Index, idx).unwrap();
         ids.push(id);
     }

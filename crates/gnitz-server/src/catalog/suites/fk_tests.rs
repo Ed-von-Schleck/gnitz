@@ -130,34 +130,43 @@ fn dropped_fk_child_leaves_no_edge() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// One TABLE_TAB batch dropping an FK parent and its child, in either row order:
+/// parent-first unregisters the parent before the child's column rows retract,
+/// child-first hands the precheck its dropped ids out of order.
 #[test]
 fn co_dropped_fk_parent_and_child_leave_no_edge() {
-    let dir = temp_dir("fk_co_drop_lock");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let parent_tid = engine
-        .create_table("public.parent", &[col_def("pid", TypeCode::U64)], &[0])
-        .unwrap();
-    let child_cols = vec![
-        col_def("cid", TypeCode::U64),
-        fk_def("pid_fk", TypeCode::U64, parent_tid, 0),
-    ];
-    let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
+    for child_first in [false, true] {
+        let dir = temp_dir(&format!("fk_co_drop_lock_{child_first}"));
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+        let parent_tid = engine
+            .create_table("public.parent", &[col_def("pid", TypeCode::U64)], &[0])
+            .unwrap();
+        let child_cols = vec![
+            col_def("cid", TypeCode::U64),
+            fk_def("pid_fk", TypeCode::U64, parent_tid, 0),
+        ];
+        let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
-    // One TABLE_TAB batch: the parent unregisters before the child's column rows
-    // retract.
-    let drop = engine.retract_under(SysFamily::Table, &[parent_tid, child_tid]);
-    engine.submit(SysFamily::Table, drop).unwrap();
+        let order = if child_first {
+            [child_tid, parent_tid]
+        } else {
+            [parent_tid, child_tid]
+        };
+        let mut drop = engine.retract_under(SysFamily::Table, &order[..1]);
+        drop.append_batch(&engine.retract_under(SysFamily::Table, &order[1..]));
+        engine.submit(SysFamily::Table, drop).unwrap();
 
-    assert!(engine.fk_constraints_of(child_tid).is_empty());
-    assert!(engine.fk_children_of(parent_tid).is_empty());
-    for tid in [parent_tid, child_tid] {
-        assert!(
-            !engine.caches.relations.contains_key(&tid),
-            "co-dropped table {tid} must keep no relation entry"
-        );
+        assert!(engine.fk_constraints_of(child_tid).is_empty());
+        assert!(engine.fk_children_of(parent_tid).is_empty());
+        for tid in [parent_tid, child_tid] {
+            assert!(
+                !engine.caches.relations.contains_key(&tid),
+                "co-dropped table {tid} must keep no relation entry"
+            );
+        }
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
     }
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -179,7 +188,7 @@ fn creating_a_child_of_a_parent_the_same_delta_drops_is_refused() {
         .unwrap();
 
     let mut batch = engine.retract_under(SysFamily::Table, &[parent_tid]);
-    batch.append_batch(&build_table_tab_row(child_tid, pack_pk_cols(&[0]), "child"));
+    batch.append_batch(&table_tab_batch(&[(child_tid, "child", 1)]));
     let err = engine
         .submit(SysFamily::Table, batch)
         .expect_err("a child of a parent this delta drops must be refused");
@@ -379,10 +388,6 @@ fn test_push_reads_committed_state() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
-
-// (test_fk_parent_restrict_blocks_delete removed: it existed only to exercise
-// a deleted test-only inline parent-restrict check. FK
-// RESTRICT-on-DELETE is covered end-to-end by gnitz-py/tests/admissibility/test_fk.py.)
 
 // ── test_fk_multiple_children_same_parent ───────────────────────────
 

@@ -1,130 +1,73 @@
-//! The per-PK CAS + net retraction contract on the IDX_TAB and SCHEMA_TAB
-//! families, whose drop consumers unmap a cached name read off the batch payload.
-//! Two shapes reach them without the contract: a stale `-1` whose row is already
-//! gone (`net = -1`) and a `-1` naming a different live row (`net = 0`).
-//!
-//! The relation families' equivalents are in `alter_tests`; the legitimate DROP
-//! paths these guards must not break are in `index_tests` / `fk_tests` /
-//! `ddl_tests` / `dir_deletion_tests`.
+//! The per-PK CAS + net retraction contract, which every family shares: a `-1`
+//! must reproduce the live row, and no write may leave a PK at a net weight
+//! outside `{0, 1}`. Each family's drop consumers unmap cached state read off
+//! the batch payload, so a `-1` the store does not hold must never reach them.
 
 use super::*;
-use gnitz_wire::IDXTAB_PAY_NAME;
-use std::path::Path;
 
-/// The live IDX_TAB payload for one index. Named fields rather than a tuple
-/// because these tests hand the row around and mutate one field of it, which a
-/// positional `.2` makes silently easy to get wrong.
-#[derive(Clone)]
-struct IdxRow {
-    owner_id: u64,
-    source_cols: u64,
-    name: String,
-    props: gnitz_wire::IndexProps,
-}
+#[test]
+fn a_write_must_retract_the_live_row_and_leave_one_or_none() {
+    let dir = temp_dir("sysretract_contract");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-fn live_index_row(engine: &CatalogEngine, idx_id: u64) -> IdxRow {
-    let sr = engine
-        .live_sys_row(SysFamily::Index, idx_id)
-        .unwrap_or_else(|| panic!("live IDX_TAB row for index {idx_id} missing"));
-    let (src, row) = sr.source();
-    // Through the production decoder, so the reproduced row is what the engine
-    // itself reads back; `name` is the one field it does not carry.
-    let (owner_id, cols, props) = read_idx_tab_row(src, row).expect("a live IDX_TAB row decodes");
-    IdxRow {
-        owner_id,
-        // `idx_tab_batch` writes the word, and the decoder hands back the list;
-        // re-packing is a round trip, so the reproduced row stays byte-equal and
-        // the retraction CAS passes.
-        source_cols: pack_pk_cols(cols.as_slice()),
-        name: payload_string(src, row, IDXTAB_PAY_NAME),
-        props,
+    // One live user row in every family, under names long enough to sit in the
+    // blob heap.
+    engine.create_schema("a_schema_with_a_long_name").unwrap();
+    let sid = engine.schema_id("a_schema_with_a_long_name").unwrap();
+    let cols = [
+        col_def("id", TypeCode::U64),
+        col_def("a_long_column_name", TypeCode::U64),
+    ];
+    let table = "a_schema_with_a_long_name.a_table_with_a_long_name";
+    let serial = gnitz_wire::TableProps { serial: true, ..Default::default() };
+    let tid = engine.create_table_with(table, &cols, &[0], serial).unwrap();
+    let (_, reserved) = engine.reserve_user_sequence(tid, 64).unwrap();
+    engine.ingest_to_family(gnitz_wire::SEQ_TAB, &reserved).unwrap();
+    let idx = engine.create_index(table, &["a_long_column_name"], false).unwrap();
+    let vid = register_identity_view(&mut engine, tid, "a_view_with_a_long_name", &cols);
+    let unused = engine.allocate_ids(1).unwrap();
+
+    for family in SysFamily::ALL {
+        let id = match family {
+            SysFamily::Schema => sid,
+            SysFamily::Table | SysFamily::Column | SysFamily::Sequence => tid,
+            SysFamily::View | SysFamily::CircuitNodes => vid,
+            SysFamily::Index => idx,
+        };
+
+        // The sys stores run no `enforce_unique_pk`, so nothing but the net
+        // stops a re-pushed `+1` from leaving two live heads under one PK.
+        let live = engine.retract_under(family, &[id]).negated();
+        assert!(!live.is_empty(), "{family:?}: the fixture holds no live row");
+        let err = engine.precheck_family(family, &live).unwrap_err();
+        assert!(err.contains("net weight 2"), "{family:?}: {err}");
+
+        // A retraction in the shape the family admits: a rewrite pair where it
+        // declares one, a bare `-1` where a client may drop a row. A circuit row
+        // admits neither.
+        if family == SysFamily::CircuitNodes {
+            continue;
+        }
+        let retraction = |leading: u64| {
+            let mut bb = BatchBuilder::new(*family.schema());
+            push_sys_row(&mut bb, family, [leading, 0], -1, |_| 7);
+            if family.pair_change_mask().is_some() {
+                push_sys_row(&mut bb, family, [leading, 0], 1, |_| 7);
+            }
+            bb.finish()
+        };
+        for (leading, why) in [(id, "differs from the current one"), (unused, "no longer exists")] {
+            let err = engine.precheck_family(family, &retraction(leading)).unwrap_err();
+            assert!(err.contains(why), "{family:?}: {err}");
+        }
     }
-}
-
-/// A one-row IDX_TAB batch at `weight` reproducing `row` — what a client's
-/// read-then-push drop helper builds.
-fn idx_row_batch(idx_id: u64, weight: i64, row: &IdxRow) -> Batch {
-    idx_tab_batch(idx_id, row.owner_id, row.source_cols, &row.name, row.props, weight)
-}
-
-// ── SCHEMA_TAB ──────────────────────────────────────────────────────────────
-
-#[test]
-fn stale_schema_retraction_spares_the_live_schemas_directory() {
-    // A resolved `s` to its id; B dropped and recreated `s`; A's `-1` for the
-    // dead id then lands carrying the name `s` — now the live schema's. Without
-    // the net check the live schema's name is unmapped.
-    let dir = temp_dir("sysretract_stale_schema");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", TypeCode::U64)];
-
-    engine.create_schema("s").unwrap();
-    let old_sid = engine.schema_id("s").expect("the schema exists");
-    engine.drop_schema("s").unwrap();
-    engine.create_schema("s").unwrap();
-    let new_sid = engine.schema_id("s").expect("the schema exists");
-    assert_ne!(old_sid, new_sid, "the recreate must allocate a fresh id");
-    let tid = engine.create_table("s.t", &cols, &[0]).unwrap();
-    let tbl_dir = relation_dir(&dir, tid);
-    assert!(Path::new(&tbl_dir).exists());
-
-    let err = engine
-        .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_tab_batch(&[(old_sid, "s", -1)]))
-        .unwrap_err();
-    assert!(
-        err.contains("catalog changed concurrently"),
-        "a `-1` for a schema id that is already gone must be rejected: {err}"
-    );
-
-    let _ = engine.drain_pending_broadcasts();
-    engine.reclaim_orphan_dirs();
-    assert!(
-        Path::new(&tbl_dir).exists(),
-        "the live schema's table directory must survive the sweep"
-    );
-    assert_eq!(engine.get_by_name("s", "t"), Some(tid));
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn schema_retraction_under_another_schemas_name_rejected() {
-    // `net = 0`, so only the CAS catches it — the member-count guard counts
-    // members of the retracted (empty) id, not of the named schema.
-    let dir = temp_dir("sysretract_schema_mismatch");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", TypeCode::U64)];
-
-    engine.create_schema("a").unwrap();
-    engine.create_schema("b").unwrap();
-    let sid_a = engine.schema_id("a").expect("the schema exists");
-    let tid = engine.create_table("b.t", &cols, &[0]).unwrap();
-    let b_dir = relation_dir(&dir, tid);
-
-    let err = engine
-        .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_tab_batch(&[(sid_a, "b", -1)]))
-        .unwrap_err();
-    assert!(
-        err.contains("catalog changed concurrently"),
-        "a `-1` on schema a's id carrying schema b's name must be rejected: {err}"
-    );
-
-    assert!(engine.has_schema("a") && engine.has_schema("b"));
-    assert_eq!(engine.get_by_name("b", "t"), Some(tid));
-    let _ = engine.drain_pending_broadcasts();
-    engine.reclaim_orphan_dirs();
-    assert!(Path::new(&b_dir).exists(), "b.t's directory must survive the sweep");
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── IDX_TAB ─────────────────────────────────────────────────────────────────
-
-/// The accepted path, to the tests below's rejected one: `drop_index` builds its
-/// `-1` by copying the live row, so the pair must consolidate away and leave no
-/// stored row at all.
+/// The accepted path: `drop_index` builds its `-1` by copying the live row, so
+/// the pair must consolidate away and leave no stored row at all.
 #[test]
 fn create_then_drop_unique_index_cancels_to_empty() {
     let dir = temp_dir("idx_create_drop_cancels");
@@ -146,141 +89,6 @@ fn create_then_drop_unique_index_cancels_to_empty() {
         idx_weights_for(&engine, idx_id).is_empty(),
         "the drop's `-1` must cancel the create's `+1`, leaving no stored row"
     );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn stale_index_retraction_leaves_no_ghost_row() {
-    let (mut engine, _tid, dir) = table_fixture(
-        "sysretract_stale_index",
-        &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
-    );
-    let idx = engine.create_index("public.t", &["val"], false).unwrap();
-    let row = live_index_row(&engine, idx);
-    engine.drop_index(&row.name).unwrap();
-
-    let err = engine
-        .ingest_to_family(gnitz_wire::IDX_TAB, &idx_row_batch(idx, -1, &row))
-        .unwrap_err();
-    assert!(
-        err.contains("catalog changed concurrently"),
-        "a `-1` for an index that is already net-dead must be rejected: {err}"
-    );
-    assert!(
-        idx_weights_for(&engine, idx).is_empty(),
-        "the rejected `-1` must leave no negative-weight row in sys_indices"
-    );
-    assert!(!engine.caches.index_by_name.contains_key(&row.name));
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn stale_index_retraction_after_recreate_keeps_the_live_index_nameable() {
-    // The stale `-1` unmaps `index_by_name` by its payload name, which now
-    // belongs to the recreated index — stranding a live index no client can name
-    // and freeing that name for a third row.
-    let (mut engine, _tid, dir) = table_fixture(
-        "sysretract_index_recreate",
-        &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
-    );
-    let idx1 = engine.create_index("public.t", &["val"], false).unwrap();
-    let row1 = live_index_row(&engine, idx1);
-    engine.drop_index(&row1.name).unwrap();
-    let idx2 = engine.create_index("public.t", &["val"], false).unwrap();
-    assert_ne!(idx1, idx2, "the recreate must allocate a fresh index id");
-
-    let err = engine
-        .ingest_to_family(gnitz_wire::IDX_TAB, &idx_row_batch(idx1, -1, &row1))
-        .unwrap_err();
-    assert!(
-        err.contains("catalog changed concurrently"),
-        "a `-1` for the dropped index's id must be rejected: {err}"
-    );
-
-    assert_eq!(
-        engine.caches.index_by_name.get(&row1.name),
-        Some(&idx2),
-        "the live index must keep its name mapping"
-    );
-    assert!(idx_weights_for(&engine, idx1).is_empty());
-    assert!(
-        engine.create_index("public.t", &["val"], false).is_err(),
-        "a second index under that name must still be refused"
-    );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn index_retraction_under_another_indexs_name_rejected() {
-    let (mut engine, _tid, dir) = table_fixture(
-        "sysretract_index_mismatch",
-        &[
-            col_def("id", TypeCode::U64),
-            col_def("a", TypeCode::U64),
-            col_def("b", TypeCode::U64),
-        ],
-    );
-    let i1 = engine.create_index("public.t", &["a"], false).unwrap();
-    let i2 = engine.create_index("public.t", &["b"], false).unwrap();
-    let row1 = live_index_row(&engine, i1);
-    let row2 = live_index_row(&engine, i2);
-
-    // i1's PK and payload, but i2's name — `net = 0`, so only the CAS sees it.
-    let mut mismatched = row1.clone();
-    mismatched.name = row2.name.clone();
-    let err = engine
-        .ingest_to_family(gnitz_wire::IDX_TAB, &idx_row_batch(i1, -1, &mismatched))
-        .unwrap_err();
-    assert!(
-        err.contains("catalog changed concurrently"),
-        "a `-1` on i1's id carrying i2's name must be rejected: {err}"
-    );
-
-    assert_eq!(engine.caches.index_by_name.get(&row1.name), Some(&i1));
-    assert_eq!(engine.caches.index_by_name.get(&row2.name), Some(&i2));
-    assert_eq!(idx_weights_for(&engine, i1), vec![1]);
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── Both families: the duplicate live head ──────────────────────────────────
-
-#[test]
-fn duplicate_live_head_rejected_for_index_and_schema() {
-    // The sys stores run no `enforce_unique_pk`, so nothing but the net stops a
-    // re-ingested `+1` from leaving two live heads under one PK.
-    let (mut engine, _tid, dir) = table_fixture(
-        "sysretract_dup_head",
-        &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
-    );
-    let idx = engine.create_index("public.t", &["val"], false).unwrap();
-    let row = live_index_row(&engine, idx);
-    let err = engine
-        .ingest_to_family(gnitz_wire::IDX_TAB, &idx_row_batch(idx, 1, &row))
-        .unwrap_err();
-    assert!(
-        err.contains("net weight 2"),
-        "a duplicate live IDX_TAB head must be rejected: {err}"
-    );
-    assert_eq!(idx_weights_for(&engine, idx), vec![1]);
-
-    engine.create_schema("s").unwrap();
-    let sid = engine.schema_id("s").expect("the schema exists");
-    let err = engine
-        .ingest_to_family(gnitz_wire::SCHEMA_TAB, &schema_tab_batch(&[(sid, "s", 1)]))
-        .unwrap_err();
-    assert!(
-        err.contains("net weight 2"),
-        "a duplicate live SCHEMA_TAB head must be rejected: {err}"
-    );
-    assert!(engine.has_schema("s"));
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

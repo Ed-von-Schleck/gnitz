@@ -1,384 +1,111 @@
 use super::*;
 use std::fs;
 
-// ---------------------------------------------------------------------------
-// Helpers (supplement the shared helpers in mod.rs)
-// ---------------------------------------------------------------------------
-
-/// A rejected relation CREATE must leave the catalog exactly as it was: no
-/// name/id cache entry, no DAG registration, and no orphaned row in the
-/// family's memtable. `init_rows` is the family's row count taken before the
-/// attempt.
-fn assert_no_relation_residue(engine: &mut CatalogEngine, family: SysFamily, id: u64, qname: &str, init_rows: usize) {
-    let noun = family.row_noun();
-    assert!(
-        !engine.caches.entity_by_qname.contains_key(qname),
-        "entity_by_qname holds the rejected {noun} {qname}"
-    );
-    assert_eq!(
-        engine.qualified_name_or_unknown(id),
-        ("?".to_string(), "?".to_string()),
-        "the catalog names the rejected {noun} {id}"
-    );
-    assert!(
-        !engine.registry.has_id(id),
-        "the registry holds the rejected {noun} {id}"
-    );
-    assert_eq!(
-        count_records(engine.sys_relation(family).cursor()),
-        init_rows,
-        "the {noun} family memtable holds an orphaned row"
-    );
-}
-
-/// Write one column record at an arbitrary `col_idx` — the gap and
-/// out-of-order shapes `col_tab_batch`, which numbers columns by position,
-/// cannot produce.
-fn write_col_at_index(
-    engine: &mut CatalogEngine,
-    owner_id: u64,
-    col_idx: i64,
-    cd: &CatalogColumn,
-) -> Result<(), String> {
-    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    cd.write_col_tab_row(&mut bb, owner_id, col_idx as usize, 1);
-    engine.ingest_to_family(gnitz_wire::COL_TAB, &bb.finish())
-}
-
-// ---------------------------------------------------------------------------
-// Part 1 — precheck-before-mutate tests
-//
-// `precheck_family` runs before any mutation, so a rejected positive-weight
-// (CREATE) row for TABLE_TAB, VIEW_TAB, or IDX_TAB leaves no orphaned memtable
-// row and no dirty cache entry behind.
-// ---------------------------------------------------------------------------
-
-// ── Part 1: TABLE_TAB, no column records ─────────────────────────────────────
-
+/// Every malformed CREATE below is refused by `precheck_family`, which takes the
+/// catalog by `&self`: a refusal there has written nothing.
 #[test]
-fn test_table_tab_no_cols_leaves_clean_state() {
-    let dir = temp_dir("atomicity_no_cols");
+fn a_malformed_create_is_refused_at_the_precheck() {
+    let dir = temp_dir("atomicity_precheck");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let init_rows = count_records(engine.sys_relation(SysFamily::Table).cursor());
-
-    let tid = engine.allocate_ids(1).unwrap();
-    // No column records written — TABLE_TAB ingestion must fail.
-    let batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "badtable");
-    let result = engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch);
-    assert!(result.is_err(), "expected error for TABLE_TAB with no column records");
-
-    assert_no_relation_residue(&mut engine, SysFamily::Table, tid, "public.badtable", init_rows);
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── Part 1: TABLE_TAB, non-pk-eligible PK column ─────────────────────────────
-
-#[test]
-fn test_table_tab_invalid_pk_col_type_leaves_clean_state() {
-    // The schema build runs inside hook_relation_register, *after*
-    // `apply_entity_caches`, so a hook rejection must leave no cache entry
-    // behind.
-    let dir = temp_dir("atomicity_bad_pk_type");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let init_rows = count_records(engine.sys_relation(SysFamily::Table).cursor());
-
-    let tid = engine.allocate_ids(1).unwrap();
-    // STRING column is not pk-eligible.
-    let cols = vec![col_def("label", TypeCode::String)];
-    engine.write_column_records(tid, &cols).unwrap();
-
-    let batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "badpktable");
-    let result = engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch);
-    assert!(
-        result.is_err(),
-        "expected error for TABLE_TAB with non-pk-eligible PK column"
-    );
-
-    assert_no_relation_residue(&mut engine, SysFamily::Table, tid, "public.badpktable", init_rows);
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── Part 1: TABLE_TAB, duplicate qualified name ───────────────────────────────
-
-#[test]
-fn test_table_tab_dup_name_leaves_clean_state() {
-    // A raw ingest_to_family with a duplicate qualified name should be
-    // rejected. `apply_entity_caches` would otherwise overwrite the cache entry
-    // with the new tid.
-    let dir = temp_dir("atomicity_dup_name");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
-    let orig_tid = engine.create_table("public.dupname", &cols, &[0]).unwrap();
-    let init_rows = count_records(engine.sys_relation(SysFamily::Table).cursor());
-
-    let new_tid = engine.allocate_ids(1).unwrap();
-    engine.write_column_records(new_tid, &cols).unwrap();
-
-    let batch = build_table_tab_row(new_tid, pack_pk_cols(&[0]), "dupname");
-    let result = engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch);
-    assert!(
-        result.is_err(),
-        "expected error: qualified name 'public.dupname' already exists"
-    );
-
-    assert_eq!(
-        engine.caches.entity_by_qname.get("public.dupname").copied(),
-        Some(orig_tid),
-        "entity_by_qname must still point to the original table after rejected duplicate"
-    );
-    assert!(
-        !engine.registry.has_id(new_tid),
-        "new_tid must not appear in the registry"
-    );
-    assert_eq!(
-        count_records(engine.sys_relation(SysFamily::Table).cursor()),
-        init_rows,
-        "sys_tables must have no extra orphaned row"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── Part 1: TABLE_TAB, non-contiguous column indices ─────────────────────────
-
-#[test]
-fn test_table_tab_col_contiguity_gap_rejected() {
-    // Pre-fix: the gap is not detected; the table is silently registered
-    // with two columns that are actually at positions 0 and 2 (not 0 and 1),
-    // causing schema mismatches downstream.  The test asserts the DDL fails
-    // and leaves no trace in the catalog.
-    let dir = temp_dir("atomicity_col_gap");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let init_rows = count_records(engine.sys_relation(SysFamily::Table).cursor());
-
-    let tid = engine.allocate_ids(1).unwrap();
-    // Insert columns at indices 0 and 2 — index 1 is absent (gap).
-    write_col_at_index(&mut engine, tid, 0, &col_def("id", TypeCode::U64)).unwrap();
-    write_col_at_index(&mut engine, tid, 2, &col_def("gapped", TypeCode::U64)).unwrap();
-
-    let batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "gaptable");
-    let result = engine.ingest_to_family(gnitz_wire::TABLE_TAB, &batch);
-    assert!(
-        result.is_err(),
-        "expected error for TABLE_TAB with non-contiguous column indices"
-    );
-
-    assert_no_relation_residue(&mut engine, SysFamily::Table, tid, "public.gaptable", init_rows);
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── Part 1: VIEW_TAB, no column records ──────────────────────────────────────
-
-#[test]
-fn test_view_tab_no_cols_leaves_clean_state() {
-    // hook_relation_register fires its col_defs.is_empty() rejection after
-    // apply_entity_caches has already written entity_by_qname.
-    let dir = temp_dir("atomicity_view_no_cols");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let init_rows = count_records(engine.sys_relation(SysFamily::View).cursor());
-
-    let vid = engine.allocate_ids(1).unwrap();
-    // No column records for vid.
-    let batch = build_view_tab_row(vid, "badview");
-    let result = engine.ingest_to_family(gnitz_wire::VIEW_TAB, &batch);
-    assert!(result.is_err(), "expected error for VIEW_TAB with no column records");
-
-    assert_no_relation_residue(&mut engine, SysFamily::View, vid, "public.badview", init_rows);
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── Part 1: VIEW_TAB, over-wide schema rejected cleanly ──────────────────────
-
-#[test]
-fn test_view_tab_too_many_cols_rejected() {
-    // An over-wide view must be rejected with a clean catalog error that leaves no
-    // orphaned cache/memtable state — mirroring the TABLE_TAB path, where the
-    // precheck rejects before `apply_entity_caches` mutates the caches.
-    // hook_relation_register reaches the same column cap through
-    // build_schema_from_col_defs. This is the engine-side counterpart to the
-    // client guard in create_view_chain.
-    let dir = temp_dir("atomicity_view_too_many_cols");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let init_rows = count_records(engine.sys_relation(SysFamily::View).cursor());
-
-    let vid = engine.allocate_ids(1).unwrap();
-    // MAX_COLUMNS + 1 contiguous column records (col 0 is a valid U64 PK).
-    for i in 0..(gnitz_wire::MAX_COLUMNS as i64 + 1) {
-        write_col_at_index(&mut engine, vid, i, &col_def(&format!("c{i}"), TypeCode::U64)).unwrap();
-    }
-    let batch = build_view_tab_row(vid, "wideview");
-    let err = engine
-        .ingest_to_family(gnitz_wire::VIEW_TAB, &batch)
-        .expect_err("expected error for over-wide view");
-    assert!(
-        err.contains("columns") && err.contains("max"),
-        "expected the column-count guard message, got: {err}"
-    );
-
-    assert_no_relation_residue(&mut engine, SysFamily::View, vid, "public.wideview", init_rows);
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── Part 1: IDX_TAB, non-existent owner ──────────────────────────────────────
-
-#[test]
-fn test_idx_tab_bad_owner_leaves_clean_state() {
-    // `apply_index_caches` runs before hook_index_register, so the
-    // cache entry is inserted before the hook returns Err for missing owner.
-    let dir = temp_dir("atomicity_idx_bad_owner");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let init_rows = count_records(engine.sys_relation(SysFamily::Index).cursor());
-
-    let nonexistent_owner = engine.allocate_ids(1).unwrap();
-    let idx_id = engine.allocate_ids(1).unwrap();
-    let batch = idx_tab_batch(
-        idx_id,
-        nonexistent_owner,
-        0,
-        "bad_owner_idx",
-        gnitz_wire::IndexProps { is_unique: false },
-        1,
-    );
-    let result = engine.ingest_to_family(gnitz_wire::IDX_TAB, &batch);
-    assert!(result.is_err(), "expected error for IDX_TAB with non-existent owner");
-
-    assert!(
-        !engine.caches.index_by_name.contains_key("bad_owner_idx"),
-        "index_by_name must not contain the rejected index"
-    );
-    assert_eq!(
-        count_records(engine.sys_relation(SysFamily::Index).cursor()),
-        init_rows,
-        "sys_indices memtable must have no orphaned row"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── Part 1: IDX_TAB, view owner ──────────────────────────────────────────────
-
-#[test]
-fn test_idx_tab_view_owner_rejected() {
-    // Only base tables can own a secondary index: index projection runs only
-    // on the base-table DML paths, so an index registered on a view would
-    // backfill once and then silently serve stale results. The SQL binder
-    // rejects CREATE INDEX on a view by name resolution; this is the
-    // engine-side guard for a raw IDX_TAB push naming a view owner.
-    let dir = temp_dir("atomicity_idx_view_owner");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    engine
-        .create_table("public.base", &[col_def("id", TypeCode::U64)], &[0])
-        .unwrap();
-
-    // Register a view via the raw system-table path (no circuit needed — the
-    // precheck must fire before any backfill).
-    let vid = engine.allocate_ids(1).unwrap();
-    engine
-        .write_column_records(vid, &[col_def("id", TypeCode::U64)])
-        .unwrap();
-    let batch = build_view_tab_row(vid, "vowner");
-    engine.ingest_to_family(gnitz_wire::VIEW_TAB, &batch).unwrap();
-    assert!(engine.registry.has_id(vid), "view registered");
-
-    let init_rows = count_records(engine.sys_relation(SysFamily::Index).cursor());
-    let idx_id = engine.allocate_ids(1).unwrap();
-    let batch = idx_tab_batch(
-        idx_id,
-        vid,
-        pack_pk_cols(&[0]),
-        "idx_on_view",
-        gnitz_wire::IndexProps { is_unique: false },
-        1,
-    );
-    let err = engine
-        .ingest_to_family(gnitz_wire::IDX_TAB, &batch)
-        .expect_err("IDX_TAB row naming a view owner must be rejected");
-    assert!(
-        err.contains("is a view") && err.contains("only a base table can be indexed"),
-        "expected the owner-kind guard message, got: {err}"
-    );
-
-    assert!(
-        !engine.caches.index_by_name.contains_key("idx_on_view"),
-        "index_by_name must not contain the rejected index"
-    );
-    assert_eq!(
-        count_records(engine.sys_relation(SysFamily::Index).cursor()),
-        init_rows,
-        "sys_indices must have no orphaned row"
-    );
-    assert!(
-        engine.registry.relation_or_err(vid).ok().unwrap().indexes().is_empty(),
-        "the view must not gain an index circuit"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── Part 1: IDX_TAB, duplicate index name ────────────────────────────────────
-
-#[test]
-fn test_idx_tab_dup_name_leaves_clean_state() {
-    // `apply_index_caches` would otherwise overwrite the cache entry with new_idx_id
-    // when two IDX_TAB rows carry the same name string.
-    let dir = temp_dir("atomicity_idx_dup");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
     let cols = vec![
         col_def("id", TypeCode::U64),
         col_def("val", TypeCode::I64),
         col_def("ts", TypeCode::I64),
     ];
-    let tid = engine.create_table("public.idxtest", &cols, &[0]).unwrap();
-    let orig_idx_id = engine.create_index("public.idxtest", &["val"], false).unwrap();
-    let init_rows = count_records(engine.sys_relation(SysFamily::Index).cursor());
+    let taken = engine.create_table("public.taken", &cols, &[0]).unwrap();
+    engine.create_index("public.taken", &["val"], false).unwrap();
+    let view = register_identity_view(&mut engine, taken, "a_view", &cols);
 
-    let orig_name = "public__idxtest__idx_val";
-    let new_idx_id = engine.allocate_ids(1).unwrap();
-    // Same name, different col (ts at index 2) — bypasses create_index dup check.
-    let batch = idx_tab_batch(
-        new_idx_id,
-        tid,
-        2,
-        orig_name,
-        gnitz_wire::IndexProps { is_unique: false },
-        1,
-    );
-    let result = engine.ingest_to_family(gnitz_wire::IDX_TAB, &batch);
-    assert!(
-        result.is_err(),
-        "expected error: index name '{orig_name}' already exists"
-    );
+    // A fresh relation id carrying `cols` as its column records.
+    let mut with_cols = |cols: &[CatalogColumn]| {
+        let id = engine.allocate_ids(1).unwrap();
+        engine.write_column_records(id, cols).unwrap();
+        id
+    };
+    let no_cols = with_cols(&[]);
+    let string_pk = with_cols(&[col_def("label", TypeCode::String)]);
+    let dup_name = with_cols(&cols);
+    let twins = [with_cols(&cols), with_cols(&cols)];
+    let too_wide: Vec<_> = (0..=gnitz_wire::MAX_COLUMNS)
+        .map(|i| col_def(&format!("c{i}"), TypeCode::U64))
+        .collect();
+    let too_wide = with_cols(&too_wide);
+    // Column records at indices 0 and 2: `col_tab_batch` numbers by position.
+    let gapped = engine.allocate_ids(1).unwrap();
+    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
+    for col_idx in [0, 2] {
+        col_def("c", TypeCode::U64).write_col_tab_row(&mut bb, gapped, col_idx, 1);
+    }
+    engine.submit(SysFamily::Column, bb.finish()).unwrap();
+    let unregistered = engine.allocate_ids(1).unwrap();
+    let index_on = |owner: u64, cols: &[u32], name: &str| {
+        idx_tab_batch(
+            unregistered + 1,
+            owner,
+            cols,
+            name,
+            gnitz_wire::IndexProps::default(),
+            1,
+        )
+    };
 
-    assert_eq!(
-        engine.caches.index_by_name.get(orig_name).copied(),
-        Some(orig_idx_id),
-        "index_by_name must still point to the original index"
-    );
-    assert_eq!(
-        engine.index_ids_of(tid),
-        vec![orig_idx_id],
-        "the rejected index id must not appear under its owner"
-    );
-    assert_eq!(
-        count_records(engine.sys_relation(SysFamily::Index).cursor()),
-        init_rows,
-        "sys_indices must have no extra orphaned row"
-    );
+    for (family, batch, why) in [
+        (
+            SysFamily::Table,
+            table_tab_batch(&[(no_cols, "t", 1)]),
+            "has no column records",
+        ),
+        (
+            SysFamily::Table,
+            table_tab_batch(&[(string_pk, "t", 1)]),
+            "has type_code STRING",
+        ),
+        (SysFamily::Table, table_tab_batch(&[(gapped, "t", 1)]), "non-contiguous"),
+        (
+            SysFamily::Table,
+            table_tab_batch(&[(dup_name, "taken", 1)]),
+            "already exists: public.taken",
+        ),
+        // The name test reads a cache this batch has not been applied to, so
+        // two rows under one new name both pass it.
+        (
+            SysFamily::Table,
+            table_tab_batch(&[(twins[0], "twins", 1), (twins[1], "twins", 1)]),
+            "already exists: public.twins",
+        ),
+        (
+            SysFamily::View,
+            build_view_tab_row(no_cols, "v"),
+            "has no column records",
+        ),
+        (SysFamily::View, build_view_tab_row(too_wide, "v"), "columns (max"),
+        (
+            SysFamily::Index,
+            index_on(unregistered, &[0], "ix"),
+            "is not registered",
+        ),
+        // Index projection runs on the base-table DML paths alone, so an index
+        // on a view would backfill once and then serve stale rows.
+        (
+            SysFamily::Index,
+            index_on(view, &[0], "ix"),
+            "only a base table can be indexed",
+        ),
+        (
+            SysFamily::Index,
+            index_on(taken, &[2], "public__taken__idx_val"),
+            "Index already exists",
+        ),
+    ] {
+        let err = engine.precheck_family(family, &batch).unwrap_err();
+        assert!(err.contains(why), "{why}: {err}");
+    }
 
+    engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ---------------------------------------------------------------------------
-// Part 6 — next_id follows applied index ids
-// ---------------------------------------------------------------------------
+// ── next_id follows applied ids ──────────────────────────────────────────────
 
 #[test]
 fn test_next_id_advances_on_index_register() {
@@ -393,7 +120,7 @@ fn test_next_id_advances_on_index_register() {
     let batch = idx_tab_batch(
         large_idx_id,
         tid,
-        pack_pk_cols(&[1]),
+        &[1],
         "public__seqsync__idx_val_sync",
         gnitz_wire::IndexProps { is_unique: false },
         1,
@@ -431,7 +158,7 @@ fn test_next_id_advances_on_schema_register() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── Part 2: DROP SCHEMA must not probe the table-keyed dep map ────────────────
+// ── DROP SCHEMA must not probe the table-keyed dep map ───────────────────────
 
 #[test]
 fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
@@ -500,7 +227,7 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
 
     // TABLE_TAB(6): precheck fails (duplicate name), so nothing of it is queued
     // or applied.
-    let table_batch = build_table_tab_row(new_tid, pack_pk_cols(&[0]), "dupname");
+    let table_batch = table_tab_batch(&[(new_tid, "dupname", 1)]);
     assert!(
         engine.submit(SysFamily::Table, table_batch).is_err(),
         "duplicate-name TABLE_TAB must fail precheck"
@@ -546,7 +273,7 @@ fn ddl_txn_hook_failure_is_compensated() {
     let blocker = relation_dir(&dir, new_tid);
     fs::write(&blocker, b"not a directory").unwrap();
 
-    let table_batch = build_table_tab_row(new_tid, pack_pk_cols(&[0]), "hooktbl");
+    let table_batch = table_tab_batch(&[(new_tid, "hooktbl", 1)]);
     engine
         .precheck_family(SysFamily::Table, &table_batch)
         .expect("the precheck reads no path, so the blocker is invisible to it");
@@ -579,44 +306,6 @@ fn ddl_txn_hook_failure_is_compensated() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── Two `+1` relation rows may not claim one qualified name ──────────────────
-// The name collision test reads `entity_by_qname`, which the batch has not been
-// applied to yet — so a bundle carrying two CREATEs of the same `schema.name`
-// under different ids passes it twice. Both would register, the second would
-// overwrite the cache entry, and the first's store would be stranded under a
-// name nothing resolves.
-
-#[test]
-fn two_creates_of_one_name_in_one_batch_rejected() {
-    let dir = temp_dir("atomicity_dup_name_in_batch");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let init_rows = count_records(engine.sys_relation(SysFamily::Table).cursor());
-
-    let cols = vec![col_def("id", TypeCode::U64)];
-    let (a, b) = (engine.allocate_ids(1).unwrap(), engine.allocate_ids(1).unwrap());
-    engine.write_column_records(a, &cols).unwrap();
-    engine.write_column_records(b, &cols).unwrap();
-
-    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-    for tid in [a, b] {
-        push_table_tab_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "twins", pack_pk_cols(&[0]), 0, 1);
-    }
-    let err = engine
-        .ingest_to_family(gnitz_wire::TABLE_TAB, &bb.finish())
-        .expect_err("two rows claiming public.twins must be rejected");
-    assert!(err.contains("already exists"), "{err}");
-
-    assert!(!engine.registry.has_id(a));
-    assert!(!engine.registry.has_id(b));
-    assert_eq!(
-        count_records(engine.sys_relation(SysFamily::Table).cursor()),
-        init_rows,
-        "the rejected batch must leave no TABLE_TAB row"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
 // ── `_sequences` never accumulates an unmatched retraction ───────────────────
 
 #[test]
@@ -641,38 +330,6 @@ fn sequence_advances_leave_no_negative_ghost() {
         count_negative_records(engine.sys_relation(SysFamily::Sequence).cursor()),
         0,
         "_sequences must hold no net-negative row"
-    );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── A rejected CREATE INDEX writes no compensating retraction ────────────────
-// `create_index` prechecks and applies as two steps: a precheck rejection wrote
-// nothing, so submitting the `-1` undo would leave a permanent net −1 ghost in
-// sys_indices (which runs no `enforce_unique_pk`).
-
-#[test]
-fn precheck_rejected_create_index_writes_no_ghost() {
-    let cols = vec![col_def("id", TypeCode::U64), col_def("name", TypeCode::String)];
-    let (mut engine, _tid, dir) = table_fixture("atomicity_idx_precheck_ghost", &cols);
-    let init_rows = count_records(engine.sys_relation(SysFamily::Index).cursor());
-
-    // A STRING column has no index key type — rejected inside `precheck_family`,
-    // before anything is applied.
-    engine
-        .create_index("public.t", &["name"], false)
-        .expect_err("an index on a STRING column must be rejected");
-
-    assert_eq!(
-        count_negative_records(engine.sys_relation(SysFamily::Index).cursor()),
-        0,
-        "a precheck rejection must write no compensating -1"
-    );
-    assert_eq!(
-        count_records(engine.sys_relation(SysFamily::Index).cursor()),
-        init_rows,
-        "and no +1 either"
     );
 
     engine.close();
@@ -733,43 +390,6 @@ fn compensating_a_drop_keeps_the_restored_relation_directory() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── A zero-weight catalog row is rejected at the precheck ───────────────────
-// It is not a Z-set element: `pk_signatures` skips it, so it carries neither the
-// CAS nor the per-PK net bound, while every applier's `if weight > 0 { … } else`
-// dispatch would act on it as a retraction — evicting a live relation or schema
-// from the caches while it stays live on disk and registered in the DAG.
-
-#[test]
-fn zero_weight_catalog_row_rejected() {
-    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
-    let (mut engine, tid, dir) = table_fixture("zero_weight_row", &cols);
-    let sid = engine.schema_id("public").unwrap();
-
-    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-    push_table_tab_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "t", pack_pk_cols(&[0]), 0, 0);
-    let err = engine.submit(SysFamily::Table, bb.finish()).unwrap_err();
-    assert!(err.contains("zero-weight row"), "unexpected error: {err}");
-
-    let err = engine
-        .submit(SysFamily::Schema, schema_tab_batch(&[(sid, "public", 0)]))
-        .unwrap_err();
-    assert!(err.contains("zero-weight row"), "unexpected error: {err}");
-
-    assert_eq!(
-        engine.caches.entity_by_qname.get("public.t").copied(),
-        Some(tid),
-        "the live relation must still resolve by name"
-    );
-    assert!(engine.registry.has_id(tid), "the relation must stay registered");
-    assert!(
-        engine.caches.schema_by_name.contains_key("public"),
-        "the live schema must still resolve by name"
-    );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
 // ── A compensated CREATE TABLE leaves nothing of the table behind ────────────
 // Its IDX_TAB family fails after COL_TAB and TABLE_TAB applied.
 
@@ -803,7 +423,7 @@ fn compensated_create_table_leaves_no_trace() {
     ];
     for (family, batch) in [
         (SysFamily::Column, col_tab_batch(tid, &cols, 1)),
-        (SysFamily::Table, build_table_tab_row(tid, pack_pk_cols(&[0]), "child")),
+        (SysFamily::Table, table_tab_batch(&[(tid, "child", 1)])),
     ] {
         engine.submit(family, batch).unwrap();
     }
@@ -816,7 +436,7 @@ fn compensated_create_table_leaves_no_trace() {
     let idx = idx_tab_batch(
         idx_id,
         tid,
-        pack_pk_cols(&[2]),
+        &[2],
         "public__child__idx_val",
         gnitz_wire::IndexProps { is_unique: false },
         1,

@@ -1,8 +1,8 @@
 use super::*;
-use crate::catalog::{CatalogColumn, SysFamily, PUBLIC_SCHEMA_ID};
+use crate::catalog::{CatalogColumn, SysFamily};
 use crate::runtime::sal::fixtures::TestLog;
 use crate::test_support::{
-    circuit_nodes_batch, col_def, col_tab_batch, identity_circuit, push_table_tab_row, push_view_tab_row, sum_weights,
+    circuit_nodes_batch, col_def, col_tab_batch, identity_circuit, push_view_tab_row, sum_weights, table_tab_batch,
 };
 use gnitz_store::schema::Placement;
 use gnitz_store::storage::BatchBuilder;
@@ -52,10 +52,7 @@ fn col_tab(owner: u64, weight: i64) -> Batch {
 }
 
 fn table_tab(tid: u64, weight: i64) -> Batch {
-    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
-    let pk = gnitz_wire::pack_pk_cols(&[0]);
-    push_table_tab_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "t", pk, 0, weight);
-    bb.finish()
+    table_tab_batch(&[(tid, "t", weight)])
 }
 
 /// Boot the catalog at `dir` over `log`'s committed tail.
