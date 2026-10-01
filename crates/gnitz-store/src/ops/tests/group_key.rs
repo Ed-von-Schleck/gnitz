@@ -2,8 +2,8 @@ use super::*;
 use crate::schema::{ColumnTable, SchemaColumn, TypeCode};
 use crate::storage::{Batch, BatchBuilder};
 use crate::test_support::{
-    arb_fold_case, batch_of_pk_bytes, fold_batch, fold_schemas, le_cell, opk_pk, pk_only_schema, pk_payload_schema,
-    wide_pk_3xu64_schema,
+    arb_fold_case, batch_of_pk_bytes, cell, fold_batch, fold_schemas, le_cell, opk_pk, pk_only_schema,
+    pk_payload_schema, wide_pk_3xu64_schema,
 };
 use proptest::prelude::*;
 
@@ -81,8 +81,9 @@ fn sorted_runs_break_ties_on_source_index() {
 /// (the leading PK column among them) and all of them — over `raw` and its
 /// consolidation: `runs` visits every row once, groups in strictly ascending
 /// `out_pk` order with a run ending exactly where `out_pk` changes, and two
-/// rows share an identity iff they share an `out_pk`. A consolidated batch
-/// grouped by a PK prefix is visited in place.
+/// rows share an `out_pk` iff they share their group columns' values, and iff
+/// they share an identity. A consolidated batch grouped by a PK prefix is
+/// visited in place.
 fn assert_runs_group_by_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
     let schema = *raw.schema();
     let consolidated = Batch::clone(raw).into_consolidated();
@@ -113,11 +114,15 @@ fn assert_runs_group_by_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
             if std::ptr::eq(batch, &consolidated) && (cols[..] == [0] || *cols == pk) {
                 prop_assert!(runs.in_row_order(), "{:?}: a PK prefix of a consolidated batch", cols);
             }
+            let group =
+                |r: usize| -> Vec<_> { cols.iter().map(|&c| cell(&mb, schema.locate(c as usize), r)).collect() };
             for a in 0..batch.count {
                 for b in a + 1..batch.count {
+                    let same_out_pk = key.out_pk(&mb, a).bytes() == key.out_pk(&mb, b).bytes();
+                    prop_assert_eq!(group(a) == group(b), same_out_pk, "{:?}: rows {} and {}", cols, a, b);
                     prop_assert_eq!(
                         key.identity(&mb, a) == key.identity(&mb, b),
-                        key.out_pk(&mb, a).bytes() == key.out_pk(&mb, b).bytes(),
+                        same_out_pk,
                         "{:?}: rows {} and {}",
                         cols,
                         a,

@@ -140,6 +140,8 @@ impl AviBake {
 
 /// The index entries `delta` contributes, each at its row's weight, unsorted.
 pub fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
+    // The VM folds this register before any reader, so no row is a ghost.
+    debug_assert!(delta.is_consolidated());
     if bake.has_wide {
         avi_entries::<true>(delta, bake)
     } else {
@@ -156,9 +158,6 @@ fn avi_entries<const HAS_WIDE: bool>(delta: &Batch, bake: &AviBake) -> Batch {
     let mut image = Vec::new();
     bake.key_packer.for_each_key(&mb, width, |row, key| {
         let weight = mb.get_weight(row);
-        if weight == 0 {
-            return;
-        }
         for (j, a) in bake.aggs.iter().enumerate() {
             let ExtremeSpec { loc, kind, max } = a.spec;
             // A NULL has no image: MIN/MAX skips it.
@@ -238,7 +237,3 @@ impl WideEntry<'_> {
         self.push(out, key, image)
     }
 }
-
-#[cfg(test)]
-#[path = "tests/avi.rs"]
-mod tests;

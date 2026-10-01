@@ -145,15 +145,6 @@ impl Accumulator {
         })
     }
 
-    /// [`Self::value`]'s scalar half.
-    #[cfg(test)]
-    pub(super) fn value_bits(&self) -> u64 {
-        let Some(AggValue::Bits(b)) = self.value() else {
-            panic!("value_bits over a NULL or wide accumulator")
-        };
-        b
-    }
-
     /// Seed a MIN/MAX with the extreme image the value index holds for it.
     pub(super) fn seed_from_index(&mut self, image: &[u8]) {
         let StepKind::Extreme { max, kind } = self.kind else {

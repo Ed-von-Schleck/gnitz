@@ -7,7 +7,7 @@ use proptest::prelude::*;
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
 use crate::storage::{Batch, BatchBuilder, Table};
-use crate::test_support::{assert_folds, scratch_table};
+use crate::test_support::{assert_folds, cell, scratch_table};
 use gnitz_expr::{cmp_order_keys, order_locators};
 use gnitz_wire::{OrderKey, ReduceOutSlot};
 
@@ -108,17 +108,12 @@ impl Harness {
         let b = self.trace_out.open_cursor().materialize();
         let mb = b.as_mem_batch();
         let out = self.plan.output_schema;
-        let mut scratch = [0u8; 16];
         (0..b.count)
             .map(|r| {
                 let mut row = vec![None; 5];
                 for (oc, ic) in self.layout.iter().enumerate() {
                     let Some(ic) = *ic else { continue };
-                    let loc = out.locate(oc);
-                    row[ic] = (!loc.is_null(&mb, r)).then(|| match loc.type_code() {
-                        TypeCode::String => gnitz_wire::german_string_content(loc.bytes(&mb, r), mb.blob).to_vec(),
-                        _ => loc.native_le_bytes(&mb, r, &mut scratch).to_vec(),
-                    });
+                    row[ic] = cell(&mb, out.locate(oc), r);
                 }
                 (row, b.get_weight(r))
             })
@@ -197,11 +192,17 @@ fn arb_keys() -> impl Strategy<Value = Vec<OrderKey>> {
     )
 }
 
-/// Each tick moves some rows to a new multiplicity in `0..=3`, as a retraction
-/// of the old one and an insertion of the new — so a delta carries cancelling
-/// pairs and weight-0 rows, and the integrated input stays a relation.
+/// Each tick moves some rows of a small pool to a new multiplicity in `0..=3`,
+/// as a retraction of the old one and an insertion of the new — so a row recurs
+/// across ticks and most ticks retract, a delta carries cancelling pairs and
+/// weight-0 rows, and the integrated input stays a relation.
 fn arb_ticks() -> impl Strategy<Value = Vec<Vec<(Row, i64)>>> {
-    prop::collection::vec(prop::collection::vec((arb_row(), 0i64..=3), 0..6), 1..6)
+    prop::collection::vec(arb_row(), 1..6).prop_flat_map(|pool| {
+        prop::collection::vec(
+            prop::collection::vec((prop::sample::select(pool), 0i64..=3), 0..6),
+            1..6,
+        )
+    })
 }
 
 fn arb_bound() -> impl Strategy<Value = u64> {

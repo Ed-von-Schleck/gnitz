@@ -130,9 +130,11 @@ proptest! {
             fresh.for_each_pk_group_row(k, |c| group.push(current(c)));
             prop_assert_eq!(group, rows_where(&|p, _| p == &k[..]));
 
-            let mut positive = Vec::new();
-            open().for_each_positive_with_prefix(&k[..1], |c| positive.push(current(c)));
-            prop_assert_eq!(positive, rows_where(&|p, w| p[0] == k[0] && w > 0));
+            for n in [1, stride] {
+                let mut positive = Vec::new();
+                open().for_each_positive_with_prefix(&k[..n], |c| positive.push(current(c)));
+                prop_assert_eq!(positive, rows_where(&|p, w| p[..n] == k[..n] && w > 0));
+            }
         }
 
         // Range seeks: exactly the window, and an estimate between the live rows

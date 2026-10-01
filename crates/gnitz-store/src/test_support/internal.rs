@@ -13,9 +13,9 @@ use std::rc::Rc;
 use proptest::prelude::*;
 
 use crate::schema::payload_order::compare_full_rows;
-use crate::schema::{SchemaColumn, SchemaDescriptor};
+use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor};
 use crate::storage::{
-    Batch, BatchBuilder, Layout, MappedShard, ReadCursor, RecoverySource, ShardWriteOpts, StoreBudgets, Table,
+    Batch, BatchBuilder, Layout, MappedShard, MemBatch, ReadCursor, RecoverySource, ShardWriteOpts, StoreBudgets, Table,
 };
 use gnitz_wire::TypeCode;
 
@@ -75,8 +75,9 @@ pub fn make_batch_opk(schema: &SchemaDescriptor, rows: &[(impl AsRef<[u8]>, i64,
 
 /// A [`ReadCursor`] over one in-memory batch: the integral an operator reads
 /// back as `z⁻¹(I(X))`, the shape every delta-against-trace unit test wants.
-pub fn trace_cursor(batch: Batch, schema: SchemaDescriptor) -> ReadCursor {
-    crate::storage::create_read_cursor(&[std::rc::Rc::new(batch)], &[], schema)
+pub fn trace_cursor(batch: Batch) -> ReadCursor {
+    let schema = *batch.schema();
+    crate::storage::create_read_cursor(&[Rc::new(batch)], &[], schema)
 }
 
 /// Decode a single signed I64 PK column from its OPK (big-endian, sign-flipped)
@@ -173,6 +174,16 @@ pub fn settled_rss() -> u64 {
     // SAFETY: `malloc_trim` only releases memory the allocator holds free.
     unsafe { libc::malloc_trim(0) };
     gnitz_foundation::perf::rss_bytes()
+}
+
+/// One column of one row as its native little-endian cell, a string as its
+/// content; `None` for NULL.
+pub(crate) fn cell(mb: &MemBatch, loc: ColumnLocator, row: usize) -> Option<Vec<u8>> {
+    let mut scratch = [0u8; 16];
+    (!loc.is_null(mb, row)).then(|| match loc.type_code().is_german_string() {
+        true => gnitz_wire::german_string_content(loc.bytes(mb, row), mb.blob).to_vec(),
+        false => loc.native_le_bytes(mb, row, &mut scratch).to_vec(),
+    })
 }
 
 /// A native little-endian cell of up to 16 bytes as the zero-extended value
@@ -275,7 +286,14 @@ pub(crate) fn fold_schemas() -> Vec<SchemaDescriptor> {
 /// `(pk bytes, weight, string, int)`; `None` is NULL.
 pub(crate) type FoldRow = (Vec<u8>, i64, Option<u8>, Option<i64>);
 
-const FOLD_STRS: [&[u8]; 3] = [b"inline", b"a-long-string-that-spills", b"another-long-spilling-value"];
+/// One inline string and three spilling ones, two of them equal in length and
+/// in all but their last byte.
+const FOLD_STRS: [&[u8]; 4] = [
+    b"inline",
+    b"a-long-string-that-spills",
+    b"a-long-string-that-spillz",
+    b"another-long-spilling-value",
+];
 
 /// An index into [`fold_schemas`] and rows over eight keys of its stride that
 /// differ only in their first and last byte, with small weight and payload
@@ -287,7 +305,7 @@ pub(crate) fn arb_fold_case() -> impl Strategy<Value = (usize, Vec<FoldRow>)> {
             0u8..2,
             0u8..4,
             -3i64..=3,
-            prop::option::of(0u8..3),
+            prop::option::of(0..FOLD_STRS.len() as u8),
             prop::option::of(0i64..2),
         );
         let rows = (

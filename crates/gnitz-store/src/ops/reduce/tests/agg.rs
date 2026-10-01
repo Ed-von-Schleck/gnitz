@@ -1,73 +1,14 @@
 use super::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::storage::{Batch, BatchBuilder};
+use crate::storage::BatchBuilder;
 use crate::test_support::le_cell;
 use gnitz_wire::AggDescriptor;
 
-/// Single-row batch with a U64 PK and one F64 payload column carrying `val`.
-fn f64_batch(val: f64) -> Batch {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::F64, false),
-        ],
-        &[0],
-    );
-    let mut b = BatchBuilder::new(schema);
-    b.begin_row(1u128, 1i64);
-    b.put_float(val);
-    b.end_row();
-    b.finish()
-}
-
-fn f64_acc(agg_op: AggFunc) -> Accumulator {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::F64, false),
-        ],
-        &[0],
-    );
-    let aggs = [AggDescriptor { col_idx: 1, agg_op }, AggDescriptor::COUNT_STAR];
-    let mut accs = super::super::plan::ReducePlan::from_wire(&schema, &[0], &aggs, false)
-        .unwrap()
-        .shape
-        .acc_template;
-    accs.swap_remove(0)
-}
-
-// A NaN seen first must not poison MIN. A subsequent finite value
-// is smaller under the total order and must replace it.
-#[test]
-fn min_nan_first_does_not_poison() {
-    let nan = f64_batch(f64::NAN);
-    let finite = f64_batch(5.0);
-    let mut acc = f64_acc(AggFunc::Min);
-    acc.step_from_batch(&nan.as_mem_batch(), 0, 1);
-    acc.step_from_batch(&finite.as_mem_batch(), 0, 1);
-    let got = f64::from_bits(acc.value_bits());
-    assert_eq!(got, 5.0, "finite value must displace a leading NaN in MIN");
-}
-
-// MAX must use the total order consistently. Under
-// total_cmp a quiet (positive) NaN is the greatest value, so once seen it
-// is retained as the max regardless of arrival order.
-#[test]
-fn max_uses_total_order_for_nan() {
-    let finite = f64_batch(5.0);
-    let nan = f64_batch(f64::NAN);
-    let mut acc = f64_acc(AggFunc::Max);
-    acc.step_from_batch(&finite.as_mem_batch(), 0, 1);
-    acc.step_from_batch(&nan.as_mem_batch(), 0, 1);
-    let got = f64::from_bits(acc.value_bits());
-    assert!(got.is_nan(), "MAX must adopt NaN as the greatest under total order");
-}
-
-/// `bulk_step` over a range reaches the same value as stepping each row with
+/// `fold_rows` over a range reaches the same value as stepping each row with
 /// `step_from_batch`, for every aggregate over every scalar payload width, with
 /// NULLs and non-unit weights.
 #[test]
-fn bulk_step_matches_step_from_batch() {
+fn fold_rows_matches_step_from_batch() {
     const N: usize = 97;
     let tcs = [
         TypeCode::U8,
@@ -117,7 +58,7 @@ fn bulk_step_matches_step_from_batch() {
                 .acc_template;
             let (mut bulk, mut each) = (template[0].clone(), template[0].clone());
             for (s, e) in [(0, 0), (0, 1), (3, 40), (40, 41), (41, N)] {
-                (bulk.bulk_step())(&mut bulk, &mb, s..e);
+                Accumulator::fold_rows(std::slice::from_mut(&mut bulk), &mb, s..e);
                 for row in s..e {
                     each.step_from_batch(&mb, row, mb.get_weight(row));
                 }

@@ -933,9 +933,9 @@ impl Batch {
 
     /// Test-only: force the layout tag without verifying the data — for tests that
     /// deliberately construct an inconsistent (spoofed) batch to exercise a
-    /// consumer's debug verifier or a defensive re-fold. Production has no such
-    /// path: `certify_layout` always verifies.
-    #[cfg(test)]
+    /// consumer's debug verifier, which only a debug build has. Production has no
+    /// such path: `certify_layout` always verifies.
+    #[cfg(all(test, debug_assertions))]
     pub(crate) fn set_layout_unchecked(&mut self, layout: Layout) {
         self.layout = layout;
     }

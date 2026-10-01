@@ -1,9 +1,8 @@
 //! Reduce operator: the accumulators, the combined aggregate-value index,
 //! `op_reduce` itself, and the ad-hoc aggregation hash-fold sink.
 //!
-//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
-//! they cover, so each stays that module's own `tests` child and reaches its
-//! private items.
+//! `tests/reduce.rs` holds the operator, its split and the ad-hoc fold to one
+//! model of their input; `tests/agg.rs` is the accumulator's own.
 
 mod adhoc_fold;
 mod agg;
@@ -13,7 +12,7 @@ mod op_reduce;
 mod plan;
 
 #[cfg(test)]
-mod bench_secondary_index;
+mod bench;
 
 #[cfg(test)]
 #[path = "tests/reduce.rs"]

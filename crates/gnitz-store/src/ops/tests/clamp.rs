@@ -63,7 +63,7 @@ fn weight_clamp_emits_each_elements_transition() {
     ];
     for (delta, trace) in cases {
         for kind in [Distinct, PositivePart] {
-            let mut ch = trace_cursor(make_batch(&schema, trace), schema);
+            let mut ch = trace_cursor(make_batch(&schema, trace));
             let out = op_weight_clamp(&make_batch(&schema, delta), &mut ch, kind);
             assert!(out.is_consolidated());
             assert_eq!(

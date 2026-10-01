@@ -185,7 +185,3 @@ impl IdentityLoop for FoldRows<'_> {
         Ok(())
     }
 }
-
-#[cfg(test)]
-#[path = "tests/adhoc_fold.rs"]
-mod tests;

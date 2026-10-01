@@ -168,7 +168,7 @@ fn range_join_cuts_the_span_each_rel_names() {
         (RangeRel::Gt, vec![130]),      // y > 20
         (RangeRel::Ge, vec![120, 130]), // y >= 20
     ] {
-        let mut ch = trace_cursor(make_batch(&schema, &[(10, 1, 110), (20, 1, 120), (30, 1, 130)]), schema);
+        let mut ch = trace_cursor(make_batch(&schema, &[(10, 1, 110), (20, 1, 120), (30, 1, 130)]));
         let delta = make_batch(&schema, &[(20, 1, 200)]);
         let out = range_join(&schema, 0, rel, &delta, &mut ch);
 
@@ -192,7 +192,7 @@ fn range_join_orders_a_signed_key_by_its_opk_image() {
     let trace_rows = [(-100i64 as u64, 1, 1), (0, 1, 2), (50, 1, 3)];
     let delta = make_batch(&schema, &[(0, 1, 9)]);
     for (rel, want) in [(RangeRel::Gt, vec![3]), (RangeRel::Lt, vec![1])] {
-        let mut ch = trace_cursor(make_batch(&schema, &trace_rows), schema);
+        let mut ch = trace_cursor(make_batch(&schema, &trace_rows));
         let out = range_join(&schema, 0, rel, &delta, &mut ch);
         let got: Vec<i64> = out_triples(&out).into_iter().map(|(t, _, _)| t).collect();
         assert_eq!(got, want, "rel {rel:?}");
@@ -216,7 +216,7 @@ fn a_used_trace_cursor_yields_the_fresh_cursor_output() {
     let ranges = RangeRel::ALL.iter().map(|&rel| JoinKind::Range { n_eq: 1, rel });
     for kind in ranges.chain([JoinKind::Cross]) {
         let out_schema = plan(kind, true, &schema, &schema).out_schema;
-        let cursor = || trace_cursor(make_range_batch(&schema, &trace_rows).into_consolidated(), schema);
+        let cursor = || trace_cursor(make_range_batch(&schema, &trace_rows).into_consolidated());
         let want = join(kind, true, &schema, &schema, &delta, &mut cursor());
         for park_past_end in [false, true] {
             let mut ch = cursor();
@@ -483,7 +483,7 @@ fn assert_matches_reference(
         })
         .collect();
     let cursors = [
-        ("one run", trace_cursor(folded, trace_schema)),
+        ("one run", trace_cursor(folded)),
         ("three runs", create_read_cursor(&dealt, &[], trace_schema)),
     ];
     for (runs, mut ch) in cursors {
