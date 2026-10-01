@@ -293,18 +293,25 @@ impl ReadCursor {
         }
     }
 
-    /// Position on `key`'s PK group; `true` when the cursor stands on it. Across calls,
-    /// keys must strictly ascend, the first at or above where the cursor was positioned.
+    /// Position on `key`'s PK group; `true` when the cursor stands on it. `key` is
+    /// a whole PK, or leading columns of one, whose group is every row it
+    /// prefixes. Across calls, keys must strictly ascend, the first at or above
+    /// where the cursor was positioned.
     pub(crate) fn seek_pk_group_ascending(&mut self, key: &[u8]) -> bool {
         if !self.valid {
             return false;
         }
-        match self.current_pk_cmp_bytes(key) {
+        match compare_pk_ordering(&self.current_pk_bytes()[..key.len()], key) {
             Ordering::Greater => false,
             Ordering::Equal => true,
             Ordering::Less => {
-                self.advance_to_forward(key);
-                self.valid && self.current_pk_eq(key)
+                let stride = self.schema.pk_stride();
+                match key.len() == stride {
+                    true => self.advance_to_forward(key),
+                    // The prefix over an all-zero rest is its group's lower bound.
+                    false => self.advance_to_forward(PkBuf::from_bytes(key).padded(stride)),
+                }
+                self.valid && self.current_pk_starts_with(key)
             }
         }
     }
@@ -369,8 +376,15 @@ impl ReadCursor {
         pk_bytes_eq(self.current_pk_bytes(), key_bytes)
     }
 
-    /// Walk the equal-`key` PK group from wherever the cursor stands, invoking
-    /// `f` at each emitted row; on return the cursor sits past the group.
+    /// Whether the current row's PK begins with `key`, a whole PK included.
+    #[inline]
+    fn current_pk_starts_with(&self, key: &[u8]) -> bool {
+        pk_bytes_eq(&self.current_pk_bytes()[..key.len()], key)
+    }
+
+    /// Walk `key`'s PK group — as [`Self::seek_pk_group_ascending`] reads a key —
+    /// from wherever the cursor stands, invoking `f` at each emitted row; on
+    /// return the cursor sits past the group.
     ///
     /// Not [`Self::for_each_row_while`] with an equality `cont`: this crate
     /// builds at `opt-level = 0` in dev, where that closure is a real call per row.
@@ -380,7 +394,7 @@ impl ReadCursor {
 
     #[inline]
     fn for_each_pk_group_row_with<P: PayloadOrder, F: FnMut(&ReadCursor)>(&mut self, key: &[u8], mut f: F, payload: P) {
-        while self.valid && self.current_pk_eq(key) {
+        while self.valid && self.current_pk_starts_with(key) {
             f(&*self);
             self.advance_with(payload);
         }

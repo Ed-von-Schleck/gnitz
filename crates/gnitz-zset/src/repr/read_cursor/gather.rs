@@ -2,6 +2,9 @@
 //! forward sweep of one cursor. Each key is settled against where the previous
 //! one left the cursor. Each group is visited whole, at net weights in
 //! (PK, payload) order, so a chunk boundary never splits one.
+//!
+//! A key is a whole PK, or the same leading columns of one: then its group is
+//! every row whose PK it prefixes.
 
 use gnitz_wire::PkKeys;
 
@@ -9,6 +12,7 @@ use super::{empty_cursor, from_runs_at, ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
 use crate::repr::run::Run;
 use crate::repr::scatter::gather_rows;
+use crate::schema::key::PkBuf;
 use crate::schema::{project_schema, ColumnLocator, SchemaDescriptor, SchemaFacts};
 
 pub struct PkSetGather {
@@ -29,9 +33,9 @@ impl PkSetGather {
 
     /// A gather of `keys` over a cursor it opens on `runs` at the first key.
     pub fn over_runs(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor, cap: usize, keys: PkKeys) -> Self {
-        debug_assert_eq!(keys.stride(), schema.pk_stride());
+        debug_assert!(keys.stride() <= schema.pk_stride());
         let cursor = match keys.iter().next() {
-            Some(first) => from_runs_at(runs, schema, cap, first),
+            Some(first) => from_runs_at(runs, schema, cap, PkBuf::from_bytes(first).padded(schema.pk_stride())),
             None => empty_cursor(schema),
         };
         PkSetGather { cursor, keys, next: 0 }

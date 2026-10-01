@@ -33,6 +33,30 @@ pub(crate) fn create_read_cursor(
     )
 }
 
+/// `rows` dealt round-robin into `runs` runs, each consolidated alone, under one
+/// cursor: an element can cancel across runs.
+pub(crate) fn dealt_cursor(rows: &Batch, runs: usize) -> ReadCursor {
+    let dealt: Vec<Rc<Batch>> = (0..runs)
+        .map(|k| {
+            let rows_k: Vec<(usize, usize)> = (k..rows.count).step_by(runs).map(|r| (r, r + 1)).collect();
+            Rc::new(Batch::from_ranges(rows, &rows_k, 0).into_consolidated())
+        })
+        .collect();
+    create_read_cursor(&dealt, &[], *rows.schema())
+}
+
+/// The reindex of `source` onto its columns `key`, each at its own type,
+/// keeping `keep`: the map a join's trace integrates behind.
+pub(crate) fn rekey_plan(source: &SchemaDescriptor, key: &[u32], keep: &[u32]) -> crate::algebra::MapPlan {
+    let rekey = gnitz_wire::MapKind::Reindex {
+        keep: keep.to_vec(),
+        key: key.iter().map(|&c| (c, source.columns[c as usize].type_code)).collect(),
+        role: gnitz_wire::ReindexRole::Auxiliary,
+        nulls: gnitz_wire::NullKeys::Drop,
+    };
+    crate::algebra::MapPlan::from_wire(source, &rekey).expect("fixture reindex is well-formed")
+}
+
 /// A [`ReadCursor`] over one in-memory batch: the integral an operator reads
 /// back as `z⁻¹(I(X))`, the shape every delta-against-trace unit test wants.
 pub fn trace_cursor(batch: Batch) -> ReadCursor {

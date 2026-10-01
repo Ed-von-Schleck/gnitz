@@ -2,8 +2,57 @@
 
 use super::*;
 use gnitz_expr::SchemaFacts;
-use gnitz_zset::repr::{Batch, StorageError};
+use gnitz_store::relation::RelationRegistry;
+use gnitz_wire::PkKeys;
+use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError};
 use gnitz_zset::{algebra, stream};
+use rustc_hash::FxHashMap;
+
+/// What an epoch reads of the relations its plan scans beyond their deltas: the
+/// stores behind its [`Integral::Source`]s.
+pub(in crate::query) struct SourceReads<'a> {
+    pub(in crate::query) registry: &'a RelationRegistry,
+    /// Each relation's ingests its dependents have not been ticked over, which a
+    /// probe reads its store without.
+    pub(in crate::query) unticked: &'a FxHashMap<u64, Batch>,
+    /// The scanned relations this view has been fed no row of: the sources a
+    /// backfill has yet to reach. Each reads empty.
+    pub(in crate::query) unfed: &'a [u64],
+}
+
+impl SourceReads<'_> {
+    /// A cursor over `integral` for probing at `delta`'s keys: a source's rows
+    /// there as the view last absorbed them.
+    fn cursor_for_keys(&self, state: &CircuitState, integral: Integral, delta: &Batch) -> Result<ReadCursor, String> {
+        let source = match integral {
+            Integral::Own(trace) => return Ok(state.cursor_for_keys(trace, delta)),
+            Integral::Source(source) => source,
+        };
+        let relation = self.registry.relation_or_err(source)?;
+        if self.unfed.contains(&source) {
+            return Ok(gnitz_zset::repr::empty_cursor(relation.schema()));
+        }
+        debug_assert!(delta.is_consolidated() && !delta.is_empty());
+        Ok(relation.cursor_for_keys(delta, self.unticked.get(&source)))
+    }
+
+    /// Every live row of `keys` in `integral`: a source's as the view last
+    /// absorbed them.
+    pub(in crate::query) fn gather(
+        &self,
+        state: &CircuitState,
+        integral: Integral,
+        keys: PkKeys,
+    ) -> Result<PkSetGather, String> {
+        Ok(match integral {
+            Integral::Own(trace) => state.gather(trace, keys),
+            Integral::Source(source) => self
+                .registry
+                .relation_or_err(source)?
+                .gather(keys, self.unticked.get(&source)),
+        })
+    }
+}
 
 /// The one context template for a `vm:` ingest fault.
 #[cold]
@@ -17,6 +66,7 @@ fn ingest_err(op: &str, idx: StateIdx, e: StorageError) -> String {
 pub(in crate::query) fn execute_epoch_multi(
     vm: &mut Vm,
     state: &mut CircuitState,
+    sources: &SourceReads<'_>,
     inputs: impl IntoIterator<Item = (DeltaReg, Batch)>,
 ) -> Result<Batch, String> {
     let all_empty = seed_inputs(vm, inputs);
@@ -26,7 +76,7 @@ pub(in crate::query) fn execute_epoch_multi(
     if all_empty && !ground_pending {
         return Ok(Batch::empty_with_schema(vm.program.out_schema()));
     }
-    run_instructions(vm, state, 0)?;
+    run_instructions(vm, state, sources, 0)?;
     run_integrates(vm, state)?;
     Ok(take_output(vm))
 }
@@ -36,11 +86,12 @@ pub(in crate::query) fn execute_epoch_multi(
 pub(in crate::query) fn replay_chunk(
     vm: &mut Vm,
     state: &mut CircuitState,
+    sources: &SourceReads<'_>,
     entry: ReplayEntry,
     seed: Batch,
 ) -> Result<Batch, String> {
     seed_inputs(vm, std::iter::once((entry.reg, seed)));
-    run_instructions(vm, state, entry.pc)?;
+    run_instructions(vm, state, sources, entry.pc)?;
     let out = take_output(vm);
     // Frees the seed, which no integrate took, before the next chunk is gathered.
     vm.release();
@@ -93,7 +144,12 @@ fn take_or_clone(batches: &mut [Batch], reg: DeltaReg, take: bool) -> Batch {
 }
 
 /// Run the instruction stream from `start_pc`.
-fn run_instructions(vm: &mut Vm, state: &mut CircuitState, start_pc: usize) -> Result<(), String> {
+fn run_instructions(
+    vm: &mut Vm,
+    state: &mut CircuitState,
+    sources: &SourceReads<'_>,
+    start_pc: usize,
+) -> Result<(), String> {
     let Vm { program, batches, .. } = vm;
 
     gnitz_debug!(
@@ -151,11 +207,12 @@ fn run_instructions(vm: &mut Vm, state: &mut CircuitState, start_pc: usize) -> R
 
                 Op::JoinDT { trace, probe } => {
                     let delta = &batches[in_reg.at()];
-                    let mut cursor = match probe.probes_delta_keys() {
-                        true => state.cursor_for_keys(*trace, delta),
-                        false => state.cursor(*trace),
+                    let mut cursor = match (*trace, probe.probes_delta_keys()) {
+                        (Integral::Own(trace), false) => state.cursor(trace),
+                        // The compiler bakes a source under an equi probe alone.
+                        (integral, _) => sources.cursor_for_keys(state, integral, delta)?,
                     };
-                    stream::op_join_delta_trace(delta, &mut cursor, &regs[out_reg.at()].schema, *probe)
+                    stream::op_join_delta_trace(delta, &mut cursor, &regs[out_reg.at()].schema, probe)
                 }
 
                 Op::WorkerFilter { slot } => algebra::op_worker_filter(&batches[in_reg.at()], *slot),

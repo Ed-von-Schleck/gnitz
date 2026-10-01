@@ -38,22 +38,13 @@ impl ScatterPlan {
     /// An equi-join key, keyed by the `_join_pk` the reindex Map packs from `slots`.
     pub fn join(schema: &SchemaDescriptor, slots: &[gnitz_wire::ReindexSlot]) -> Result<Self, String> {
         let packer = ReindexPacker::new(schema, slots)?;
-        let key = packer.identity_columns().and_then(|locs| {
-            // The PK region holds the PK columns contiguously in PK order.
-            let mut at = 0;
-            let pk_prefix = locs.iter().all(|l| match *l {
-                ColumnLocator::Pk { byte_off, size, .. } if byte_off as usize == at => {
-                    at += size as usize;
-                    true
-                }
-                _ => false,
-            });
-            match &locs[..] {
-                _ if pk_prefix => Some(GroupKey::PkPrefix(at)),
-                &[loc] => Some(GroupKey::Image(loc)),
+        let key = match packer.pk_prefix_len() {
+            Some(n) => Some(GroupKey::PkPrefix(n)),
+            None => match packer.identity_columns().as_deref() {
+                Some(&[loc]) => Some(GroupKey::Image(loc)),
                 _ => None,
-            }
-        });
+            },
+        };
         Ok(ScatterPlan(key.map_or(Key::Packed(packer), Key::Group)))
     }
 

@@ -10,7 +10,7 @@ use std::rc::Rc;
 use gnitz_expr::SchemaFacts;
 use rustc_hash::FxHashMap;
 
-use crate::query::vm::{DeltaReg, Vm};
+use crate::query::vm::{DeltaReg, Integral, Vm};
 use gnitz_expr::LogicalProgram;
 use gnitz_store::relation::{Relation, RelationRegistry, StateIdx, StateLayout};
 use gnitz_wire::{AggDescriptor, NodeId, NodeInputs};
@@ -29,7 +29,7 @@ mod fixtures;
 
 use emit::*;
 use hydration::derive_hydration;
-pub(super) use hydration::{Hydration, HydrationSeed};
+pub(super) use hydration::Hydration;
 
 // `pub(super)` by default: `dag` is the only module that names the compiler, so
 // a `pub(crate)` would publish it to the catalog and runtime rungs too.
@@ -95,6 +95,11 @@ impl LoadedCircuit {
     /// plan is built over is produced this way.
     fn ordered_where(&self, keep: impl Fn(NodeId) -> bool) -> Vec<NodeId> {
         (0..self.len()).filter(|&n| keep(n)).collect()
+    }
+
+    /// Every node reading `nid`, in topological order.
+    fn readers(&self, nid: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        (nid + 1..self.len()).filter(move |&n| self.inputs(n).iter().any(|p| p == nid))
     }
 
     /// Backward pass: `start` and every node it reads, directly or transitively.
@@ -191,7 +196,7 @@ impl LoadedCircuit {
         if !matches!(self.op(shard), gnitz_wire::OpNode::ExchangeShard { shard_cols } if shard_cols.is_empty()) {
             return None;
         }
-        let mut readers = (shard + 1..self.len()).filter(|&n| self.inputs(n).iter().any(|p| p == shard));
+        let mut readers = self.readers(shard);
         let (Some(consumer), None) = (readers.next(), readers.next()) else {
             return None;
         };

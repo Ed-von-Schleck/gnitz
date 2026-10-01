@@ -2,7 +2,6 @@
 //! output rows by replaying the view's own program over a key-restricted seed.
 
 use super::*;
-use crate::query::compiler::HydrationSeed;
 use gnitz_store::read::SkeletonHydrator;
 use gnitz_wire::PkKeys;
 
@@ -16,16 +15,11 @@ impl SkeletonHydrator for DagEngine {
             .expect("a store holding skeleton rows is a bounded view's, compiled with its hydration");
 
         let vm = &mut code.post.vm;
-        let mut gather = match hydration.seed {
-            HydrationSeed::Relation(source) => {
-                let since_last_tick = unticked.get(&source);
-                registry.relation_or_err(source)?.gather(keys, since_last_tick)
-            }
-            HydrationSeed::Trace(seed_table) => state.gather(seed_table, keys),
-        };
+        let reads = vm::SourceReads { registry, unticked, unfed: &[] };
+        let mut gather = reads.gather(state, hydration.seed, keys)?;
         let mut out = Batch::empty_with_schema(&view_schema);
         while let Some(seed) = gather.drain_chunk(registry.scan_chunk_rows()) {
-            let produced = vm::replay_chunk(vm, state, hydration.entry, seed)?;
+            let produced = vm::replay_chunk(vm, state, &reads, hydration.entry, seed)?;
             out.append_above(produced.into_consolidated());
         }
         Ok(out)

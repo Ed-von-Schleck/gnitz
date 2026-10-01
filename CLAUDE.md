@@ -253,6 +253,10 @@ summing weights of matching (PK, payload) entries and dropping ghosts — so eve
 tier depends on §2's sort invariant. An operator reading a trace sees
 `z⁻¹(I(X))`, the integral *before* the current delta.
 
+**A trace is not always a store of its own.** A join side that is a base table
+re-keyed onto leading columns of its own PK reads the table's store — **as the
+view last absorbed it** — instead of keeping a copy.
+
 ## 4. The Region Convention
 
 Column buffers are flat (pointer, size) pairs in canonical order — the layout of
@@ -459,7 +463,7 @@ The view is maintained exactly as any other — **correctness is never a functio
 of what is resident**. Past the capacity a sweep rewrites parts of the view's
 output store as **skeleton rows**: the PK and one coarse summed weight, no
 payload. A read touching such a key recomputes it from the view's operator traces
-(join) or source store (linear), which stay full-fidelity.
+or its source tables' stores, which stay full-fidelity.
 
 Capacity bounds one store's shard bytes on one worker — not the traces, not
 the cluster, and not read peak. Bounded views are **leaf** views: nothing may be

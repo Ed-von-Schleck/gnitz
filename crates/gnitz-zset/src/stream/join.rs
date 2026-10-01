@@ -19,7 +19,8 @@ use crate::repr::{
 use crate::schema::key::{compare_pk_ordering, key_range_between_cuts, KeyCut, PkBuf};
 use crate::schema::{DerivedSchema, SchemaDescriptor, SchemaFacts, MAX_PK_BYTES};
 
-use gnitz_expr::RowSource;
+use crate::algebra::MapPlan;
+use gnitz_expr::{ColCopy, ColumnLocator, NullPerm, RowSource};
 use gnitz_wire::{null_word_at, JoinKind, RangeRel, TypeCode};
 
 // ---------------------------------------------------------------------------
@@ -36,12 +37,16 @@ pub struct JoinPlan {
 /// How one join instruction probes its trace, and where each input's columns
 /// land in the output row — both baked by the compiler, which holds the two
 /// input schemas the kernel never sees.
-#[derive(Clone, Copy)]
 pub struct JoinProbe {
     walk: Walk,
-    /// The output payload slots the delta's columns fill, and the trace's.
-    d_slots: Slots,
-    t_slots: Slots,
+    /// The first output payload slot the delta's columns fill.
+    d_first: u16,
+    /// Each trace payload column: where the rows the cursor walks hold it, and
+    /// the output slot it fills. Those rows are the trace's own, or the rows of
+    /// the relation the trace re-keys.
+    t_cols: Box<[ColCopy]>,
+    /// The null bits `t_cols` carries, from a walked row's word to the output's.
+    t_nulls: NullPerm,
 }
 
 impl JoinProbe {
@@ -74,7 +79,8 @@ impl Slots {
 /// Which trace walk a probe drives.
 #[derive(Clone, Copy)]
 enum Walk {
-    /// Equal key: the trace group at each delta group's own PK.
+    /// Equal key: the trace group at each delta group's own PK — the rows it
+    /// prefixes, over a cursor keyed wider than the delta.
     Equi,
     /// An ordered span within an equality group.
     Range(RangeProbe),
@@ -96,6 +102,35 @@ impl JoinPlan {
         delta_is_right: bool,
         delta: &SchemaDescriptor,
         trace: &SchemaDescriptor,
+    ) -> Result<JoinPlan, String> {
+        Self::new(kind, delta_is_right, delta, trace, trace, trace.payload_locators())
+    }
+
+    /// [`Self::from_wire`] for an equi join whose trace is not stored: the trace
+    /// is `source`'s rows as `rekey` maps them, onto leading bytes of their own
+    /// PK, so the probe walks `source`'s rows and reads the trace's columns out
+    /// of them. The output is what the stored trace would give.
+    pub fn over_source(
+        delta_is_right: bool,
+        delta: &SchemaDescriptor,
+        source: &SchemaDescriptor,
+        rekey: &MapPlan,
+    ) -> Result<JoinPlan, String> {
+        let cols = rekey
+            .rekeys_onto_pk_prefix()
+            .ok_or("join: the trace is not its source re-keyed onto leading primary-key columns")?;
+        Self::new(JoinKind::Equi, delta_is_right, delta, rekey.out_schema(), source, cols)
+    }
+
+    /// The plan of `delta` against `trace`, whose payload columns the cursor's
+    /// rows — in schema `walked` — hold at `t_cols`.
+    fn new(
+        kind: JoinKind,
+        delta_is_right: bool,
+        delta: &SchemaDescriptor,
+        trace: &SchemaDescriptor,
+        walked: &SchemaDescriptor,
+        t_cols: Vec<ColumnLocator>,
     ) -> Result<JoinPlan, String> {
         let (left, right) = match delta_is_right {
             true => (trace, delta),
@@ -135,10 +170,18 @@ impl JoinPlan {
                 }
             }
         };
-        Ok(JoinPlan {
-            probe: JoinProbe { walk, d_slots, t_slots },
-            out_schema,
-        })
+        let t_cols: Box<[ColCopy]> = (t_slots.start as usize..)
+            .zip(t_cols)
+            .map(|(slot, src)| ColCopy { src, slot, width: src.size() })
+            .collect();
+        let t_nulls = NullPerm::new(&t_cols, walked.nullable_payload_slots());
+        let probe = JoinProbe {
+            walk,
+            d_first: d_slots.start,
+            t_cols,
+            t_nulls,
+        };
+        Ok(JoinPlan { probe, out_schema })
     }
 }
 
@@ -262,7 +305,7 @@ pub fn op_join_delta_trace(
     delta: &Batch,
     cursor: &mut ReadCursor,
     out_schema: &SchemaDescriptor,
-    probe: JoinProbe,
+    probe: &JoinProbe,
 ) -> Batch {
     // The VM folds this register before any reader.
     debug_assert!(delta.is_consolidated());
@@ -303,7 +346,7 @@ fn write_pairings(
     delta: &Batch,
     cursor: &ReadCursor,
     out_schema: &SchemaDescriptor,
-    probe: JoinProbe,
+    probe: &JoinProbe,
     pairs: &[Pairing],
     rows: usize,
 ) -> Batch {
@@ -311,7 +354,7 @@ fn write_pairings(
         return Batch::empty_with_schema(out_schema);
     }
     let d_schema = delta.schema();
-    let (d_first, t_first) = (probe.d_slots.start as usize, probe.t_slots.start as usize);
+    let d_first = probe.d_first as usize;
     let trace_row = |p: &Pairing| (cursor.source_at(p.src as usize), p.row as usize);
     let mut out = Batch::with_capacity(out_schema, rows);
     out.grow_rows(rows);
@@ -360,7 +403,7 @@ fn write_pairings(
         let mut dst = out.null_bmp_data_mut().as_chunks_mut::<8>().0.iter_mut();
         for p in pairs {
             let (t_src, t_row) = trace_row(p);
-            let t_bits = null_word_at(t_src.get_null_word(t_row), t_first);
+            let t_bits = probe.t_nulls.apply(t_src.get_null_word(t_row));
             for (d_null, word) in src[p.delta_rows()].iter().zip(&mut dst) {
                 *word = (t_bits | null_word_at(u64::from_le_bytes(*d_null), d_first)).to_le_bytes();
             }
@@ -403,23 +446,36 @@ fn write_pairings(
         }
     }
 
-    for (pi, col) in cursor.schema.payload_columns() {
-        let (dst, _, dst_blob) = out.col_null_and_blob_mut(t_first + pi);
-        if !col.type_code.is_german_string() {
-            width_dispatch!(col.size() as usize, repeat_cells, cursor, pi, dst, pairs);
-            continue;
-        }
-        // One relocation per trace row, whatever its fan-out.
-        let mut cells = dst.as_chunks_mut::<16>().0.iter_mut();
-        for p in pairs {
-            let (t_src, t_row) = trace_row(p);
-            let cell = relocate_german_string_vec(
-                t_src.get_col_ptr(t_row, pi, 16),
-                t_src.blob(),
-                dst_blob,
-                Some(&mut cache),
-            );
-            cells.by_ref().take(p.len()).for_each(|c| *c = cell);
+    for &ColCopy { src, slot, .. } in &probe.t_cols {
+        let (dst, _, dst_blob) = out.col_null_and_blob_mut(slot);
+        // Destructured once per column, so no pairing dispatches on the locator.
+        match src {
+            ColumnLocator::Payload { slot: pi, type_code, .. } if type_code.is_german_string() => {
+                // One relocation per trace row, whatever its fan-out.
+                let mut cells = dst.as_chunks_mut::<16>().0.iter_mut();
+                for p in pairs {
+                    let (t_src, t_row) = trace_row(p);
+                    let cell = relocate_german_string_vec(
+                        t_src.get_col_ptr(t_row, pi as usize, 16),
+                        t_src.blob(),
+                        dst_blob,
+                        Some(&mut cache),
+                    );
+                    cells.by_ref().take(p.len()).for_each(|c| *c = cell);
+                }
+            }
+            ColumnLocator::Payload { slot: pi, size, .. } => {
+                width_dispatch!(size as usize, repeat_cells, cursor, pi as usize, dst, pairs)
+            }
+            ColumnLocator::Pk { byte_off, size, type_code } => width_dispatch!(
+                size as usize,
+                repeat_pk_cells,
+                cursor,
+                byte_off as usize,
+                type_code.is_signed_int(),
+                dst,
+                pairs
+            ),
         }
     }
 
@@ -464,14 +520,39 @@ fn repeat_cells<const N: usize>(cursor: &ReadCursor, pi: usize, dst: &mut [u8], 
     }
 }
 
+/// [`repeat_cells`] for the PK column at byte `off` of the walked row's key,
+/// decoded to its native bytes.
+#[inline(always)]
+fn repeat_pk_cells<const N: usize>(
+    cursor: &ReadCursor,
+    off: usize,
+    signed: bool,
+    dst: &mut [u8],
+    pairs: &[Pairing],
+    width: usize,
+) {
+    assert!(N != 0, "a PK column is 1, 2, 4, 8 or 16 bytes, not {width}");
+    let mut cells = dst.as_chunks_mut::<N>().0.iter_mut();
+    for p in pairs {
+        let pk = cursor.source_at(p.src as usize).get_pk_bytes(p.row as usize);
+        let mut cell = [0u8; N];
+        gnitz_wire::decode_pk_cell(&pk[off..off + N], signed, &mut cell);
+        cells.by_ref().take(p.len()).for_each(|c| *c = cell);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The equi walk
 // ---------------------------------------------------------------------------
 
 /// Equal-key merge walk over a fresh cursor. Both pointers galloping-skip to catch
 /// up, so the cost is bounded by the smaller side's matches whichever side that is.
+///
+/// The cursor's rows may be keyed wider than the delta: a delta group then
+/// matches the rows its PK prefixes, which sit together because the cursor
+/// orders by the whole PK.
 fn equi_merge_walk(delta: &Batch, m: &mut ReadCursor, mut emit: impl FnMut(usize, usize, &ReadCursor)) {
-    let n = delta.count;
+    let (n, k) = (delta.count, delta.schema().pk_stride());
     let mut i = 0;
     while i < n {
         let dk = delta.get_pk_bytes(i);
@@ -480,7 +561,7 @@ fn equi_merge_walk(delta: &Batch, m: &mut ReadCursor, mut emit: impl FnMut(usize
             m.for_each_pk_group_row(dk, |c| emit(i, j, c));
             i = j;
         } else if m.valid {
-            i = delta.advance_to(m.current_pk_bytes(), i); // skip delta
+            i = delta.advance_to(&m.current_pk_bytes()[..k], i); // skip delta
         } else {
             break;
         }

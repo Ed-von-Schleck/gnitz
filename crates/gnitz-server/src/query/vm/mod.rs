@@ -20,15 +20,15 @@ mod exec;
 mod fixtures;
 
 pub(in crate::query) use builder::ProgramBuilder;
-pub(in crate::query) use exec::{execute_epoch_multi, replay_chunk};
+pub(in crate::query) use exec::{execute_epoch_multi, replay_chunk, SourceReads};
 
 // ---------------------------------------------------------------------------
 // Instruction set
 // ---------------------------------------------------------------------------
 
 /// A register whose batch an instruction reads or writes — the one index space
-/// a `Program` has, a trace being named by the [`StateIdx`] of its store. Minted
-/// only by [`ProgramBuilder`].
+/// a `Program` has, a trace being named by its [`Integral`]. Minted only by
+/// [`ProgramBuilder`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(in crate::query) struct DeltaReg(u16);
 
@@ -69,7 +69,7 @@ pub(in crate::query) enum Op {
     /// baked by the compiler from the wire's `JoinKind` and side flag, so neither
     /// spelling reaches the instruction set.
     JoinDT {
-        trace: StateIdx,
+        trace: Integral,
         probe: stream::JoinProbe,
     },
     WorkerFilter {
@@ -91,6 +91,18 @@ pub(in crate::query) enum Op {
         out_trace: StateIdx,
         plan: Box<BakedTopN>,
     },
+}
+
+/// The integral of a delta, as its readers find it: a join's probe, and a
+/// bounded view's replay, which seeds from it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::query) enum Integral {
+    /// A child store the circuit integrates a register into.
+    Own(StateIdx),
+    /// The store of the relation the delta is scanned from, read as it stood
+    /// when the view last absorbed that relation: nothing is integrated, because
+    /// the relation's own ingest already holds every row a trace would.
+    Source(u64),
 }
 
 /// One `Op::Reduce`'s baked operator data: the plan and the table its combined
@@ -228,7 +240,8 @@ impl Vm {
 // ---------------------------------------------------------------------------
 
 /// A compiled DBSP program, owning every resource its instructions name except
-/// the child stores ([`CircuitState`]).
+/// the stores: the view's own children ([`CircuitState`]) and the relations an
+/// [`Integral::Source`] reads.
 pub(in crate::query) struct Program {
     instructions: Box<[Instr]>,
     /// Each tick's accumulation of a register into its trace. Run after the
@@ -267,12 +280,6 @@ pub(in crate::query) struct ReplayEntry {
     pc: usize,
 }
 
-impl ReplayEntry {
-    pub(in crate::query) fn reg(self) -> DeltaReg {
-        self.reg
-    }
-}
-
 impl Program {
     /// The schema register `reg` is labelled with. By reference: the dispatch
     /// loop hands it straight to kernels, and a `SchemaDescriptor` is not cheap
@@ -299,16 +306,24 @@ impl Program {
             .any(|i| matches!(i.op, Op::WorkerFilter { .. }))
     }
 
-    /// Enter a read-only replay at `reg`'s first reader.
+    /// Enter a read-only replay at `reg`'s first reader. Refused where the seed
+    /// would reach a stateful operator, or where one runs without it: every
+    /// other register is empty in a replay, so an operator the seed does not
+    /// reach is skipped exactly when it is inert on an empty delta.
     pub(in crate::query) fn replay_entry(&self, reg: DeltaReg) -> Result<ReplayEntry, String> {
         let pc = self
             .instructions
             .iter()
             .position(|i| i.reads().into_iter().flatten().any(|r| r == reg))
             .unwrap_or(self.instructions.len());
-        let rest = &self.instructions[pc..];
-        if rest.iter().any(|i| facts(&i.op).stateful) {
-            return Err("replay: the program has a stateful operator past its entry".into());
+        let mut seeded = vec![false; self.regs.len()];
+        seeded[reg.at()] = true;
+        for instr in &self.instructions[pc..] {
+            let reads_seed = instr.reads().into_iter().flatten().any(|r| seeded[r.at()]);
+            if facts(&instr.op).stateful && (reads_seed || !instr.inert_on_empty) {
+                return Err("replay: the seed reaches a stateful operator".into());
+            }
+            seeded[instr.out_reg.at()] |= reads_seed;
         }
         Ok(ReplayEntry { reg, pc })
     }

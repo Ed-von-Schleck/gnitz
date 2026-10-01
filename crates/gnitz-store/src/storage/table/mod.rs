@@ -20,7 +20,7 @@ use gnitz_zset::repr::MappedShard;
 use gnitz_zset::repr::StorageError;
 use gnitz_zset::repr::{empty_cursor, from_runs, from_runs_at, from_runs_in_band, PkSetGather, ReadCursor};
 use gnitz_zset::repr::{first_live_payload_group, Run, StoredRow};
-use gnitz_zset::schema::key::{probe_key, PkBuf};
+use gnitz_zset::schema::key::{key_range_between_cuts, probe_key, KeyCut, PkBuf};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// Ingest runs fold into the RAM tier once they pass this.
@@ -327,11 +327,29 @@ impl Table {
         from_runs(self.runs(), self.shard_index.schema, cap)
     }
 
-    /// A cursor over the keys in `[first, last]`, positioned on the first live row
-    /// `>= first`.
-    pub(crate) fn open_cursor_in_range(&self, first: &[u8], last: &[u8]) -> ReadCursor {
-        let (runs, cap) = self.runs_in_range(first, Some(last));
-        from_runs_at(runs, self.shard_index.schema, cap, first)
+    /// A cursor over the rows whose PK begins with a key in `[first, last]` —
+    /// whole PKs, or the same leading columns of one — positioned on the first,
+    /// with `extra` merged in as one more run. It does not end at the last: the
+    /// rows past it are a walk's to stop at.
+    pub(crate) fn open_cursor_over_prefixes(&self, first: &[u8], last: &[u8], extra: Option<Rc<Batch>>) -> ReadCursor {
+        let (runs, cap, start) = self.runs_over_prefixes(first, last, extra);
+        from_runs_at(runs, self.shard_index.schema, cap, start.pk_bytes())
+    }
+
+    /// The runs that can hold a row whose PK begins with a key in `[first,
+    /// last]`, then `extra`; a capacity hint for a cursor over them; and the
+    /// least PK such a row can have.
+    fn runs_over_prefixes<'a>(
+        &'a self,
+        first: &[u8],
+        last: &[u8],
+        extra: Option<Rc<Batch>>,
+    ) -> (impl Iterator<Item = Run> + 'a, usize, PkBuf) {
+        let stride = self.shard_index.schema.pk_stride();
+        let (start, end) = key_range_between_cuts(KeyCut::min_of(first), KeyCut::above(last), stride)
+            .expect("`first <= last`, so the band from one's group to the other's holds a key");
+        let (runs, cap) = self.runs_in_range(start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes));
+        (runs.chain(extra.map(Run::Mem)), cap + 1, start)
     }
 
     /// The runs that can hold a key in `[start, end]` (`None`: the top of the key
@@ -363,14 +381,15 @@ impl Table {
         from_runs_in_band(runs, self.shard_index.schema, cap, start.pk_bytes(), end)
     }
 
-    /// Every live row of `keys`, over the runs the span they cover can reach.
+    /// Every live row of `keys` — whole PKs, or the same leading columns of
+    /// one — over the runs the span they cover can reach.
     pub(crate) fn gather(&self, keys: PkKeys, extra: Option<Rc<Batch>>) -> PkSetGather {
         let schema = self.shard_index.schema;
         let Some((first, last)) = keys.bounds() else {
             return PkSetGather::over_runs(std::iter::empty(), schema, 0, keys);
         };
-        let (runs, cap) = self.runs_in_range(first, Some(last));
-        PkSetGather::over_runs(runs.chain(extra.map(Run::Mem)), schema, cap + 1, keys)
+        let (runs, cap, _) = self.runs_over_prefixes(first, last, extra);
+        PkSetGather::over_runs(runs, schema, cap, keys)
     }
 
     /// The consolidated batch of all live rows, cached until the row set moves.

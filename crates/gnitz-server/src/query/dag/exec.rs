@@ -51,12 +51,29 @@ fn plan_of(host: &mut impl DriveHost, view_id: u64) -> &mut ViewPlan {
 
 // ── Epoch execution ─────────────────────────────────────────────────────
 
-/// Run one view's epoch over `src_id`'s delta.
+/// `view_id`'s plan and state, beside what its epoch reads of its sources.
+fn plan_and_reads<'a>(
+    host: &'a mut impl DriveHost,
+    view_id: u64,
+    unfed: &'a [u64],
+) -> (&'a mut ViewPlan, vm::SourceReads<'a>) {
+    let (dag, registry) = host.parts();
+    let DagEngine { views, unticked, .. } = dag;
+    let plan = views
+        .get_mut(&view_id)
+        .and_then(|v| v.plan.as_mut())
+        .expect("compiled on the epoch's entry");
+    (plan, vm::SourceReads { registry, unticked, unfed })
+}
+
+/// Run one view's epoch over `src_id`'s delta. `unfed`: the sources the view
+/// has been fed no row of.
 fn run_view_epoch(
     host: &mut impl DriveHost,
     view_id: u64,
     input: Cow<'_, Batch>,
     src_id: u64,
+    unfed: &[u64],
 ) -> Result<Batch, String> {
     let (route, fold) = {
         let (dag, registry) = host.parts();
@@ -73,15 +90,21 @@ fn run_view_epoch(
         (route, fold)
     };
     let input = relay(host, view_id, input, route.as_ref(), fold);
-    run_plan(host, view_id, input, src_id)
+    run_plan(host, view_id, input, src_id, unfed)
 }
 
 /// Run every side that scans `src_id` over its delta, then the post combine.
-fn run_plan(host: &mut impl DriveHost, view_id: u64, input: Batch, src_id: u64) -> Result<Batch, String> {
+fn run_plan(
+    host: &mut impl DriveHost,
+    view_id: u64,
+    input: Batch,
+    src_id: u64,
+    unfed: &[u64],
+) -> Result<Batch, String> {
     let code = &plan_of(host, view_id).code;
     if code.sides.is_empty() {
         let seed = sub_seed(&code.post, input, src_id);
-        return run_post(host, view_id, [seed]);
+        return run_post(host, view_id, [seed], unfed);
     }
     // `a UNION a` scans the source on more than one side.
     let scanning: Vec<usize> = (0..code.sides.len())
@@ -90,11 +113,11 @@ fn run_plan(host: &mut impl DriveHost, view_id: u64, input: Batch, src_id: u64) 
     let mut seeds = Vec::with_capacity(scanning.len());
     if let Some((&last, rest)) = scanning.split_last() {
         for &i in rest {
-            seeds.push(run_side(host, view_id, i, Batch::clone(&input), src_id)?);
+            seeds.push(run_side(host, view_id, i, Batch::clone(&input), src_id, unfed)?);
         }
-        seeds.push(run_side(host, view_id, last, input, src_id)?);
+        seeds.push(run_side(host, view_id, last, input, src_id, unfed)?);
     }
-    run_post(host, view_id, seeds)
+    run_post(host, view_id, seeds, unfed)
 }
 
 /// The post phase over the seeds the sides produced.
@@ -102,9 +125,10 @@ fn run_post(
     host: &mut impl DriveHost,
     view_id: u64,
     seeds: impl IntoIterator<Item = (vm::DeltaReg, Batch)>,
+    unfed: &[u64],
 ) -> Result<Batch, String> {
-    let ViewPlan { code, state } = plan_of(host, view_id);
-    vm::execute_epoch_multi(&mut code.post.vm, state, seeds)
+    let (ViewPlan { code, state }, reads) = plan_and_reads(host, view_id, unfed);
+    vm::execute_epoch_multi(&mut code.post.vm, state, &reads, seeds)
 }
 
 /// Side `i`'s seed for the post phase: its relayed output.
@@ -114,13 +138,14 @@ fn run_side(
     i: usize,
     delta: Batch,
     src_id: u64,
+    unfed: &[u64],
 ) -> Result<(vm::DeltaReg, Batch), String> {
     let (pre, seed_reg, how, fold) = {
-        let ViewPlan { code, state } = plan_of(host, view_id);
+        let (ViewPlan { code, state }, reads) = plan_and_reads(host, view_id, unfed);
         let fold = code.post.vm.program.folds(code.sides[i].seed_reg);
         let side = &mut code.sides[i];
         let seed = sub_seed(&side.plan, delta, src_id);
-        let pre = vm::execute_epoch_multi(&mut side.plan.vm, state, [seed])?;
+        let pre = vm::execute_epoch_multi(&mut side.plan.vm, state, &reads, [seed])?;
         (pre, side.seed_reg, side.relay.clone(), fold)
     };
     Ok((seed_reg, relay(host, view_id, Cow::Owned(pre), how.as_ref(), fold)))
@@ -163,12 +188,19 @@ impl DagEngine {
 
 /// Run `what` over `delta` and ingest every view's output into its family.
 pub(crate) fn drive(host: &mut impl DriveHost, what: Drive, delta: Batch) -> Result<(), String> {
-    let (source, schedule, round) = match what {
+    let (source, schedule, round, unfed) = match what {
         Drive::Tick { source, round } => {
             let (dag, _) = host.parts();
-            (source, dag.tick_schedule(source), Some(round))
+            (source, dag.tick_schedule(source), Some(round), Vec::new())
         }
-        Drive::Backfill { view, source } => (source, vec![Step { view, producer: source }], None),
+        Drive::Backfill { view, source } => {
+            // A backfill feeds the view its sources in this order, one after the
+            // other: the ones behind `source` have reached it with nothing yet.
+            let sources = host.parts().0.sources_of(view);
+            let behind = sources.iter().position(|&s| s == source).map_or(0, |at| at + 1);
+            let unfed = sources[behind..].to_vec();
+            (source, vec![Step { view, producer: source }], None, unfed)
+        }
     };
     // How many steps still read each producer's output.
     let mut readers: FxHashMap<u64, usize> = FxHashMap::default();
@@ -188,7 +220,7 @@ pub(crate) fn drive(host: &mut impl DriveHost, what: Drive, delta: Batch) -> Res
         }
         .expect("the schedule runs every producer before the steps it feeds");
         let needed = readers.contains_key(&step.view);
-        let out = run_view_epoch(host, step.view, input, step.producer)?;
+        let out = run_view_epoch(host, step.view, input, step.producer, &unfed)?;
         let echo = host.parts().1.ingest_view_delta(step.view, out, round, needed)?;
         // Kept even when empty, so a reader's exchange rounds run on every worker.
         if let Some(out) = echo {

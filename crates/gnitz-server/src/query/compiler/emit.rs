@@ -40,7 +40,7 @@ pub(super) struct EmitCtx<'a> {
 #[derive(Clone, Copy)]
 pub(super) enum OutReg {
     Delta(DeltaReg),
-    Trace(StateIdx),
+    Trace(Integral),
 }
 
 impl OutReg {
@@ -51,7 +51,7 @@ impl OutReg {
         }
     }
 
-    pub(super) fn trace(self) -> Result<StateIdx, String> {
+    pub(super) fn trace(self) -> Result<Integral, String> {
         match self {
             OutReg::Trace(t) => Ok(t),
             OutReg::Delta(_) => Err("operand port takes an integral, not a delta".into()),
@@ -89,9 +89,25 @@ impl EmitCtx<'_> {
     }
 
     /// A join's `(delta, trace)` operands.
-    fn join_in(&self, nid: NodeId) -> Result<(DeltaReg, StateIdx), String> {
+    fn join_in(&self, nid: NodeId) -> Result<(DeltaReg, Integral), String> {
         let (d, t) = self.loaded.inputs(nid).binary();
         Ok((self.reg_of(d)?.delta()?, self.reg_of(t)?.trace()?))
+    }
+
+    /// The base relation `trace` integrates a reindex of, with nothing in
+    /// between, and that reindex over the relation's rows.
+    fn scanned_rekey(&self, trace: NodeId) -> Option<(&Relation, &gnitz_wire::MapKind, MapPlan)> {
+        use gnitz_wire::{MapKind, OpNode};
+        let rekey = self.loaded.inputs(trace).unary();
+        let OpNode::Map(mk @ MapKind::Reindex { .. }) = self.loaded.op(rekey) else {
+            return None;
+        };
+        let OpNode::ScanDelta { source, .. } = self.loaded.op(self.loaded.inputs(rekey).unary()) else {
+            return None;
+        };
+        let relation = self.registry.relation(*source)?;
+        let map = MapPlan::from_wire(&relation.schema(), mk).ok()?;
+        Some((relation, mk, map))
     }
 }
 
@@ -182,13 +198,19 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
 
         gnitz_wire::OpNode::Join { kind, delta_is_right } => {
             let (delta_reg, trace) = ctx.join_in(nid)?;
+            let delta_schema = ctx.prog.schema_of(delta_reg);
             // One constructor owns every kind's guards and its output layout.
-            let plan = JoinPlan::from_wire(
-                *kind,
-                *delta_is_right,
-                &ctx.prog.schema_of(delta_reg),
-                ctx.layout.schema_of(trace),
-            )?;
+            let plan = match trace {
+                Integral::Own(trace) => {
+                    JoinPlan::from_wire(*kind, *delta_is_right, &delta_schema, ctx.layout.schema_of(trace))?
+                }
+                Integral::Source(_) => {
+                    let (relation, _, rekey) = ctx
+                        .scanned_rekey(ctx.loaded.inputs(nid).binary().1)
+                        .expect("`source_trace` found the reindex this trace stands for");
+                    JoinPlan::over_source(*delta_is_right, &delta_schema, &relation.schema(), &rekey)?
+                }
+            };
             Ok(OutReg::Delta(ctx.prog.push(
                 delta_reg,
                 plan.out_schema,
@@ -204,10 +226,13 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
 
         gnitz_wire::OpNode::IntegrateTrace => {
             let in_reg = ctx.unary_delta_in(nid)?;
+            if let Some(relation) = source_trace(ctx, nid) {
+                return Ok(OutReg::Trace(Integral::Source(relation)));
+            }
             let in_reg_schema = ctx.prog.schema_of(in_reg);
             let trace = ctx.declare_child("int", nid, in_reg_schema);
             ctx.prog.integrate(in_reg, trace);
-            Ok(OutReg::Trace(trace))
+            Ok(OutReg::Trace(Integral::Own(trace)))
         }
 
         gnitz_wire::OpNode::ExchangeShard { .. } => {
@@ -235,6 +260,45 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             Ok(OutReg::Delta(ctx.prog.push(in_reg, out_schema, op)))
         }
     }
+}
+
+/// The relation whose store already is trace `nid`, when there is one: the
+/// trace integrates a base table's delta re-keyed, with nothing in between, onto
+/// leading bytes of the table's own primary key, and this worker holds every
+/// row the table has under a key the trace would hold here. Every reader is an
+/// equi join, the one probe that can walk rows keyed wider than its delta.
+///
+/// The table's rows sort by that key first, so each key's rows sit together in
+/// its store exactly as they would in the trace.
+///
+/// A view's store is no such trace: within one drive it has already absorbed
+/// the delta a later step of the reading view is still to be fed, and nothing
+/// holds that delta to read the store without.
+fn source_trace(ctx: &EmitCtx, nid: NodeId) -> Option<u64> {
+    use gnitz_wire::{JoinKind, MapKind, OpNode, ReindexRole};
+    let (relation, MapKind::Reindex { key, role, .. }, rekey) = ctx.scanned_rekey(nid)? else {
+        return None;
+    };
+    if !relation.kind().is_base_table() {
+        return None;
+    }
+    rekey.rekeys_onto_pk_prefix()?;
+    let all_here = ctx.self_contained
+        || match relation.placement() {
+            Placement::Replicated => true,
+            // The delta scatters by this key, which is what places the table's rows.
+            Placement::Keyed { dist_stride } => {
+                dist_stride as usize == rekey.out_schema().pk_stride()
+                    && matches!(role, ReindexRole::ScatterKey { source, source_key }
+                        if *source == relation.id() && source_key == key)
+            }
+            Placement::Local => false,
+        };
+    let readers_probe_equal_keys = ctx
+        .loaded
+        .readers(nid)
+        .all(|n| matches!(ctx.loaded.op(n), OpNode::Join { kind: JoinKind::Equi, .. }));
+    (all_here && readers_probe_equal_keys).then_some(relation.id())
 }
 
 // ---------------------------------------------------------------------------

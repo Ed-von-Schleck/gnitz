@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8a295d47fd441859c794320feee2dd67f5ea2a128fd0e5c496bd3ad85f428333 # shrinks to schema = SchemaDescriptor { columns: [U64 pk, U16 pk, U64 pk, U64 pk, Decimal?, UUID?, Timestamp, Timestamp], pk_indices: [2, 1, 0, 3] }, rows = 10, seed = 14789186877143982800
+cc 079c12d8bde770cc9058342215ac56f0ed0b271dab2758dc2ceeccf498d4b0f1 # shrinks to schema = SchemaDescriptor { columns: [U8 pk], pk_indices: [0] }, rows = 5, seed = 0

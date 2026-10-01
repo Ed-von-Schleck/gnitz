@@ -144,7 +144,7 @@ fn time_join(
     let plan = JoinPlan::from_wire(kind, delta_is_right, schema, schema).expect("bench join plan is well-formed");
     let mut out_rows = 0;
     let elapsed = bench_time_each(ITERS, cursor, |mut cursor| {
-        let out = op_join_delta_trace(delta, &mut cursor, &plan.out_schema, plan.probe);
+        let out = op_join_delta_trace(delta, &mut cursor, &plan.out_schema, &plan.probe);
         out_rows = out.count;
         std::hint::black_box(&out);
     });
@@ -247,6 +247,70 @@ fn join_equi_dt_bench() {
                         || cursor_over(&schema, p, &trace_rows, srcs),
                     );
                 }
+            }
+        }
+    }
+}
+
+/// What the probe costs over a trace's source instead of over the stored trace,
+/// in instructions per output row, over one run and over several: once with the
+/// source keyed exactly as the trace, where the two walk the same rows, and once
+/// keyed one column wider, where the walk matches a prefix and the kept key
+/// column is read out of the PK.
+#[test]
+#[ignore]
+fn join_over_source_bench() {
+    use crate::test_support::rekey_plan;
+    use gnitz_foundation::perf::Counter;
+    let instructions = Counter::instructions().unwrap();
+    // `runs` round-robin slices of `rows`, each mapped by `run`, under one cursor.
+    let cursor_of = |rows: &Batch, runs: usize, run: &mut dyn FnMut(Batch) -> Batch| {
+        let parts: Vec<Rc<Batch>> = (0..runs)
+            .map(|s| {
+                let picks: Vec<u32> = (s..rows.count).step_by(runs).map(|i| i as u32).collect();
+                Rc::new(run(rows.ascending_subset(&picks)))
+            })
+            .collect();
+        let schema = *parts[0].schema();
+        crate::test_support::create_read_cursor(&parts, &[], schema)
+    };
+    let per_out = |plan: &JoinPlan, delta: &Batch, mut cursor: ReadCursor| {
+        let (out, n) = instructions.measure(|| op_join_delta_trace(delta, &mut cursor, &plan.out_schema, &plan.probe));
+        (n / out.count.max(1) as u64, out.count)
+    };
+    println!("\n=== equi join over the trace's source, instructions per output row ===");
+    for p in [Payload::Int, Payload::Nullable, Payload::Str] {
+        let narrow = schema_for(&[TypeCode::U64], p);
+        let wide = schema_for(&[TypeCode::U64, TypeCode::U64], p);
+        let keep_narrow: Vec<u32> = (1..narrow.num_columns() as u32).collect();
+        let keep_wide: Vec<u32> = (1..wide.num_columns() as u32).collect();
+        for shape in &EQUI_SHAPES {
+            let (delta_rows, trace_rows) = equi_rows(shape);
+            let delta = build(&narrow, p, &delta_rows);
+            let trace = build(&narrow, p, &trace_rows);
+            // The source keyed `(k, i)`; its stored trace is that re-keyed on `k`.
+            let wide_rows: Vec<Row> = trace_rows.iter().map(|(k, i)| (vec![k[0], *i as u128], *i)).collect();
+            let source = build(&wide, p, &wide_rows);
+            let same = rekey_plan(&narrow, &[0], &keep_narrow);
+            let mut map = rekey_plan(&wide, &[0], &keep_wide);
+            let trace_schema = *map.out_schema();
+            for runs in SOURCE_COUNTS {
+                let stored = JoinPlan::from_wire(JoinKind::Equi, false, &narrow, &narrow).unwrap();
+                let over = JoinPlan::over_source(false, &narrow, &narrow, &same).unwrap();
+                let (same_stored, out) = per_out(&stored, &delta, cursor_of(&trace, runs, &mut |b| b));
+                let (same_over, _) = per_out(&over, &delta, cursor_of(&trace, runs, &mut |b| b));
+
+                let stored = JoinPlan::from_wire(JoinKind::Equi, false, &narrow, &trace_schema).unwrap();
+                let over = JoinPlan::over_source(false, &narrow, &wide, &map).unwrap();
+                let rekeyed = cursor_of(&source, runs, &mut |b| map.evaluate_map_batch(&b).into_consolidated());
+                let (prefix_stored, _) = per_out(&stored, &delta, rekeyed);
+                let (prefix_over, _) = per_out(&over, &delta, cursor_of(&source, runs, &mut |b| b));
+                println!(
+                    "{:<24} {:<8} src={runs} out {out:>5}: same key {same_stored:>4} stored, {same_over:>4} over \
+                     source; key prefix {prefix_stored:>4} stored, {prefix_over:>4} over source",
+                    shape.name,
+                    p.tag(),
+                );
             }
         }
     }

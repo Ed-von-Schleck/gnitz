@@ -6,21 +6,13 @@ use crate::query::vm::ReplayEntry;
 use gnitz_store::relation::RelationKind;
 
 /// Where a bounded view's per-key replay seeds: the register it enters at, and
-/// the store that register is fed from.
+/// the integral of that register's delta, which the seed is gathered from —
+/// the scanned relation's store behind a `ScanDelta`'s register, one branch's
+/// trace behind that branch's delta port of an inner equi-join.
 #[derive(Clone, Copy)]
 pub(in crate::query) struct Hydration {
     pub(in crate::query) entry: ReplayEntry,
-    pub(in crate::query) seed: HydrationSeed,
-}
-
-/// The store a [`Hydration`] seeds from.
-#[derive(Clone, Copy)]
-pub(in crate::query) enum HydrationSeed {
-    /// Linear (`ScanDelta → Filter/Map* → IntegrateSink`): the source relation's
-    /// own store, feeding the `ScanDelta`'s register.
-    Relation(u64),
-    /// Inner equi-join: one branch's trace, feeding that branch's delta port.
-    Trace(StateIdx),
+    pub(in crate::query) seed: Integral,
 }
 
 const UNSUPPORTED: &str =
@@ -109,7 +101,7 @@ pub(super) fn derive_hydration(
     regs: &[Option<OutReg>],
 ) -> Result<Hydration, String> {
     let reg = |n: NodeId| regs[n].expect("an exchange-free plan emits every node");
-    let (in_node, seed) = match seed_node(loaded)? {
+    let (in_node, seed, keyed) = match seed_node(loaded)? {
         SeedAt::Scan { node, source } => {
             if registry
                 .relation(source)
@@ -120,13 +112,22 @@ pub(super) fn derive_hydration(
                         .into(),
                 );
             }
-            (node, HydrationSeed::Relation(source))
+            (node, Integral::Source(source), node)
         }
-        SeedAt::Trace { delta, trace } => (delta, HydrationSeed::Trace(reg(trace).trace()?)),
+        SeedAt::Trace { delta, trace } => {
+            let seed = reg(trace).trace()?;
+            let in_node = match seed {
+                Integral::Own(_) => delta,
+                // The relation's own rows enter where its delta does, and are
+                // re-keyed by `delta`, the reindex the trace stands for.
+                Integral::Source(_) => loaded.inputs(delta).unary(),
+            };
+            (in_node, seed, delta)
+        }
     };
     let entry = plan.vm.program.replay_entry(reg(in_node).delta()?)?;
     // The view's own keys gather the seed.
-    if plan.vm.program.schema_of(entry.reg()).pk_stride() != view_schema.pk_stride() {
+    if plan.vm.program.schema_of(reg(keyed).delta()?).pk_stride() != view_schema.pk_stride() {
         return Err(UNSUPPORTED.into());
     }
     Ok(Hydration { entry, seed })

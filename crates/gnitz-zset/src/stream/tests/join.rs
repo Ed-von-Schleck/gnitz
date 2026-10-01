@@ -1,14 +1,11 @@
-use std::rc::Rc;
-
 use proptest::prelude::*;
 
 use super::*;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::test_support::create_read_cursor;
 use crate::test_support::{
-    join_reference, make_batch, make_batch_opk, make_schema_i64pk_i64, make_schema_u128_i64, make_schema_u64_i64,
-    opk_pk, pk_only_schema, pk_payload_schema, trace_cursor, zset_of,
+    dealt_cursor, join_reference, make_batch, make_batch_opk, make_schema_i64pk_i64, make_schema_u128_i64,
+    make_schema_u64_i64, opk_pk, pk_only_schema, pk_payload_schema, rekey_plan, trace_cursor, zset_of,
 };
 use gnitz_wire::read_i64_le;
 
@@ -34,7 +31,7 @@ fn join(
 ) -> Batch {
     let p = plan(kind, delta_is_right, delta_schema, trace_schema);
     // The VM hands the kernel a folded register; these fixtures build raw ones.
-    op_join_delta_trace(&delta.to_consolidated(), cursor, &p.out_schema, p.probe)
+    op_join_delta_trace(&delta.to_consolidated(), cursor, &p.out_schema, &p.probe)
 }
 
 // -----------------------------------------------------------------------
@@ -491,18 +488,12 @@ fn assert_matches_reference(
     let folded = Batch::clone(trace).into_consolidated();
     let (want, want_rows) = join_reference(kind, delta_is_right, &delta_schema, &trace_schema, delta, &folded);
 
-    let dealt: Vec<Rc<Batch>> = (0..3)
-        .map(|k| {
-            let rows: Vec<(usize, usize)> = (k..trace.count).step_by(3).map(|r| (r, r + 1)).collect();
-            Rc::new(Batch::from_ranges(trace, &rows, 0).into_consolidated())
-        })
-        .collect();
     let cursors = [
         ("one run", trace_cursor(folded)),
-        ("three runs", create_read_cursor(&dealt, &[], trace_schema)),
+        ("three runs", dealt_cursor(trace, 3)),
     ];
     for (runs, mut ch) in cursors {
-        let out = op_join_delta_trace(delta, &mut ch, &p.out_schema, p.probe);
+        let out = op_join_delta_trace(delta, &mut ch, &p.out_schema, &p.probe);
         let at = format!("{what}: kind={kind:?} delta_is_right={delta_is_right}, {runs}");
         assert_eq!(out.count, want_rows, "{at}: row count");
         assert_eq!(zset_of(&out, &p.out_schema), want, "{at}: z-set");
@@ -615,4 +606,137 @@ fn cut_points_bound_every_rel_within_its_eq_group() {
             assert_eq!(cuts(eq, d, *rel), want, "eq={eq:02x?} d={d:02x?} rel={rel:?}");
         }
     }
+}
+
+// -----------------------------------------------------------------------
+// A trace read off the relation it re-keys
+// -----------------------------------------------------------------------
+
+/// `(a, b | s, v)`: a two-column key, a string and a nullable integer.
+fn keyed_source() -> SchemaDescriptor {
+    use TypeCode::*;
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(I64, false),
+            SchemaColumn::new(U64, false),
+            SchemaColumn::new(String, false),
+            SchemaColumn::new(I64, true),
+        ],
+        &[0, 1],
+    )
+}
+
+/// `rows` of [`keyed_source`], each `(a, b, weight)`, with a long string that
+/// repeats and a NULL in every third `v`.
+fn keyed_source_batch(rows: &[(i64, u64, i64)]) -> Batch {
+    let schema = keyed_source();
+    let mut b = BatchBuilder::new(&schema);
+    for &(a, k, w) in rows {
+        b.begin_row_opk(&[a as u128, k as u128], w);
+        b.put_string(&format!("a string long enough for the heap, number {}", k % 3));
+        b.put_opt_int((k % 3 != 0).then_some((a * 100 + k as i64) as u128));
+        b.end_row();
+    }
+    b.finish().into_consolidated()
+}
+
+/// A join whose trace is read off its source is the join over the stored trace:
+/// keyed on the whole PK and on a prefix of it, with the kept columns in any
+/// order and a PK column among them, on either port, over one run and three.
+#[test]
+fn a_join_over_its_traces_source_is_the_join_over_the_trace() {
+    let source_schema = keyed_source();
+    let source = keyed_source_batch(&[
+        (-3, 1, 1),
+        (-3, 2, 1),
+        (1, 0, 2),
+        (1, 4, 1),
+        (1, 5, -1),
+        (2, 9, 1),
+        (7, 3, 1),
+        (7, 6, 1),
+    ]);
+    // (key columns, kept columns)
+    let cases: &[(&[u32], &[u32])] = &[
+        (&[0], &[1, 2, 3]),
+        (&[0], &[3, 2]),
+        (&[0], &[]),
+        (&[0, 1], &[2, 3]),
+        (&[0, 1], &[3, 1, 0, 2]),
+    ];
+    for &(key, keep) in cases {
+        let mut map = rekey_plan(&source_schema, key, keep);
+        let trace = map.evaluate_map_batch(&source).into_consolidated();
+        let trace_schema = *map.out_schema();
+
+        // A delta on the same key: a payload of its own, keys present and absent.
+        let delta_schema = SchemaDescriptor::new(
+            &key.iter()
+                .map(|&c| source_schema.columns[c as usize])
+                .chain([SchemaColumn::new(TypeCode::I64, false)])
+                .collect::<Vec<_>>(),
+            &(0..key.len() as u32).collect::<Vec<_>>(),
+        );
+        let mut d = BatchBuilder::new(&delta_schema);
+        for (a, k, w) in [
+            (-9i64, 0u64, 1i64),
+            (-3, 2, 2),
+            (1, 4, -1),
+            (1, 5, 1),
+            (5, 5, 1),
+            (7, 6, 3),
+            (8, 0, 1),
+        ] {
+            let pk: Vec<u128> = [a as u128, k as u128][..key.len()].to_vec();
+            d.begin_row_opk(&pk, w);
+            d.put_int((a * 7) as u128);
+            d.end_row();
+        }
+        let delta = d.finish().into_consolidated();
+
+        for delta_is_right in [false, true] {
+            let stored = plan(JoinKind::Equi, delta_is_right, &delta_schema, &trace_schema);
+            let want = op_join_delta_trace(
+                &delta,
+                &mut trace_cursor(trace.clone()),
+                &stored.out_schema,
+                &stored.probe,
+            );
+            let over = JoinPlan::over_source(delta_is_right, &delta_schema, &source_schema, &map).unwrap();
+            assert!(over.out_schema.same_layout(&stored.out_schema));
+            assert!(!want.is_empty(), "premise: key {key:?} matches something");
+            for runs in [1, 3] {
+                let got = op_join_delta_trace(&delta, &mut dealt_cursor(&source, runs), &over.out_schema, &over.probe);
+                assert_eq!(
+                    zset_of(&got, &over.out_schema),
+                    zset_of(&want, &stored.out_schema),
+                    "key {key:?} keep {keep:?} delta_is_right={delta_is_right} runs={runs}"
+                );
+            }
+        }
+    }
+}
+
+/// A trace that is no re-key of its source onto leading PK columns is refused:
+/// a key that skips the first PK column, runs out of PK order, or is a payload
+/// column.
+#[test]
+fn over_source_refuses_a_trace_its_source_does_not_prefix() {
+    let source = keyed_source();
+    let col = |c: u32| source.columns[c as usize];
+    for key in [&[1u32][..], &[1, 0], &[3]] {
+        let delta = SchemaDescriptor::new(
+            &key.iter()
+                .map(|&c| SchemaColumn::new(col(c).type_code, false))
+                .collect::<Vec<_>>(),
+            &(0..key.len() as u32).collect::<Vec<_>>(),
+        );
+        let map = rekey_plan(&source, key, &[2]);
+        assert!(
+            JoinPlan::over_source(false, &delta, &source, &map).is_err(),
+            "key {key:?}"
+        );
+    }
+    let delta = SchemaDescriptor::new(&[col(0)], &[0]);
+    assert!(JoinPlan::over_source(false, &delta, &source, &rekey_plan(&source, &[0], &[2])).is_ok());
 }

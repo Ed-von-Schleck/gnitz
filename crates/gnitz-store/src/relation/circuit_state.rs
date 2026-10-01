@@ -78,7 +78,7 @@ impl CircuitState {
     pub fn cursor_for_keys(&self, idx: StateIdx, keys: &Batch) -> ReadCursor {
         debug_assert!(keys.is_consolidated() && !keys.is_empty());
         self.at(idx)
-            .open_cursor_in_range(keys.get_pk_bytes(0), keys.get_pk_bytes(keys.len() - 1))
+            .open_cursor_over_prefixes(keys.get_pk_bytes(0), keys.get_pk_bytes(keys.len() - 1), None)
     }
 
     pub fn ingest_owned(&mut self, idx: StateIdx, batch: Batch) -> Result<(), StorageError> {

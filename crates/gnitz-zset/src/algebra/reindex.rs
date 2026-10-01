@@ -214,6 +214,22 @@ impl ReindexPacker {
             .then(|| cols.iter().map(|c| c.loc).collect())
     }
 
+    /// The key's width, when it is the leading bytes of the input's own PK
+    /// region: the PK columns' own images, in PK order from the first.
+    pub(crate) fn pk_prefix_len(&self) -> Option<usize> {
+        let mut at = 0;
+        self.identity_columns()?
+            .iter()
+            .all(|l| match *l {
+                ColumnLocator::Pk { byte_off, size, .. } if byte_off as usize == at => {
+                    at += size as usize;
+                    true
+                }
+                _ => false,
+            })
+            .then_some(at)
+    }
+
     /// The reindex Map's output schema: [`Self::key_columns`], then
     /// `payload_cols` of `in_schema`.
     pub(crate) fn output_schema(

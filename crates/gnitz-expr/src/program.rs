@@ -2134,10 +2134,14 @@ fn decode_int_set(bytes: &[u8]) -> Vec<i64> {
 // NullPerm — columnar null bitmap permutation
 // ---------------------------------------------------------------------------
 
-/// How a map derives each output row's null word from its input row's: one move
-/// per distance a copied nullable column's bit travels.
-pub(crate) struct NullPerm {
-    moves: Vec<NullMove>,
+/// How column copies derive each output row's null word from its input row's:
+/// one move per distance a copied nullable column's bit travels.
+pub struct NullPerm {
+    /// The nearest move — for most copy lists the only one, held inline so a
+    /// per-row [`Self::apply`] reads no heap. Its mask is zero when no nullable
+    /// column is copied.
+    first: NullMove,
+    rest: Vec<NullMove>,
 }
 
 /// The source bits that all travel one distance: `up` slots toward the high end
@@ -2159,7 +2163,7 @@ impl NullMove {
 impl NullPerm {
     /// Build from the column moves; `nullable` is the input's payload slots that
     /// admit NULL.
-    pub(crate) fn new(copies: &[ColCopy], nullable: u64) -> Self {
+    pub fn new(copies: &[ColCopy], nullable: u64) -> Self {
         let mut moves: Vec<NullMove> = Vec::new();
         for c in copies {
             let ColumnLocator::Payload { slot: src, .. } = c.src else {
@@ -2178,7 +2182,17 @@ impl NullPerm {
         // Nearest first: bits that stay put take the first pass, which then
         // needs no shift.
         moves.sort_by_key(|m| m.up.max(m.down));
-        NullPerm { moves }
+        let mut moves = moves.into_iter();
+        let first = moves.next().unwrap_or(NullMove { mask: 0, up: 0, down: 0 });
+        NullPerm { first, rest: moves.collect() }
+    }
+
+    /// One input row's null word as its output row's.
+    #[inline(always)]
+    pub fn apply(&self, word: u64) -> u64 {
+        self.rest
+            .iter()
+            .fold(self.first.apply(word), |bits, m| bits | m.apply(word))
     }
 
     /// Derive the null words of `out` rows `[dst_base, dst_base + n)` from
@@ -2188,9 +2202,10 @@ impl NullPerm {
         let dst = &mut out[dst_base * 8..(dst_base + n) * 8];
         let src = in_null_bmp[src_start * 8..(src_start + n) * 8].as_chunks::<8>().0;
         let word = |w: &[u8; 8]| u64::from_le_bytes(*w);
-        let Some((&first, rest)) = self.moves.split_first() else {
+        let (first, rest) = (self.first, &self.rest[..]);
+        if first.mask == 0 {
             return dst.fill(0);
-        };
+        }
         // A move at a time, each pass one uniform shift; several moves go block by
         // block so the words they revisit stay in L1.
         let block = if rest.is_empty() { n.max(1) } else { 256 };

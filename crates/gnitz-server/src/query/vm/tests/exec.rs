@@ -250,8 +250,22 @@ fn a_two_term_join_denotes_the_product_across_its_epochs() {
         let mut p = TestPlan::default();
         let (trace_a, trace_b) = (p.table("ta", schema), p.table("tb", schema));
         let (a, b) = (p.seed(schema), p.seed(schema));
-        let ab = p.push(a, out_schema, Op::JoinDT { trace: trace_b, probe: plan(false).probe });
-        let ba = p.push(b, out_schema, Op::JoinDT { trace: trace_a, probe: plan(true).probe });
+        let ab = p.push(
+            a,
+            out_schema,
+            Op::JoinDT {
+                trace: Integral::Own(trace_b),
+                probe: plan(false).probe,
+            },
+        );
+        let ba = p.push(
+            b,
+            out_schema,
+            Op::JoinDT {
+                trace: Integral::Own(trace_a),
+                probe: plan(true).probe,
+            },
+        );
         let out = p.push(ab, out_schema, Op::Union { in_b: ba });
         p.integrate(a, trace_a);
         p.integrate(b, trace_b);
@@ -266,6 +280,128 @@ fn a_two_term_join_denotes_the_product_across_its_epochs() {
         let (want, _) = join_reference(kind, false, &schema, &schema, &a_rows, &b_rows);
         assert_eq!(zset_of(&vm.epoch([(b, b_rows.clone())]), &out_schema), want, "{kind:?}");
     }
+}
+
+/// A join whose B side is a table's own store: the A-sourced term reads the
+/// table as the program last absorbed it, so a row the table has ingested and
+/// the program has not been run over joins once, in its own epoch — whether it
+/// is new, replaces a row, or removes one.
+#[test]
+fn a_join_over_its_source_reads_it_without_what_it_has_not_absorbed() {
+    use gnitz_store::relation::{RelationKind, RelationSpec};
+    const TABLE: u64 = gnitz_wire::FIRST_USER_TABLE_ID + 1;
+    let schema = make_schema_u128_i64();
+    let stored = stream::JoinPlan::from_wire(gnitz_wire::JoinKind::Equi, true, &schema, &schema).unwrap();
+    let rekey = gnitz_wire::MapKind::Reindex {
+        keep: vec![1],
+        key: vec![(0, gnitz_wire::TypeCode::U128)],
+        role: gnitz_wire::ReindexRole::Auxiliary,
+        nulls: gnitz_wire::NullKeys::Drop,
+    };
+    let rekey = MapPlan::from_wire(&schema, &rekey).unwrap();
+    let over = stream::JoinPlan::over_source(false, &schema, &schema, &rekey).unwrap();
+    let out_schema = over.out_schema;
+    let mut p = TestPlan::default();
+    let trace_a = p.table("ta", schema);
+    let (a, b) = (p.seed(schema), p.seed(schema));
+    let ab = p.push(
+        a,
+        out_schema,
+        Op::JoinDT {
+            trace: Integral::Source(TABLE),
+            probe: over.probe,
+        },
+    );
+    let ba = p.push(
+        b,
+        out_schema,
+        Op::JoinDT {
+            trace: Integral::Own(trace_a),
+            probe: stored.probe,
+        },
+    );
+    let out = p.push(ab, out_schema, Op::Union { in_b: ba });
+    p.integrate(a, trace_a);
+    let mut vm = p.open(out);
+    vm.registry
+        .register(RelationSpec {
+            id: TABLE,
+            kind: RelationKind::BaseTable,
+            schema,
+            placement: gnitz_zset::schema::Placement::full_pk(&schema),
+        })
+        .unwrap();
+
+    let mut a_all = Batch::empty_with_schema(&schema);
+    let mut got: std::collections::HashMap<_, i64> = Default::default();
+    let mut absorb = |out: Batch| {
+        for (row, w) in zset_of(&out, &out_schema) {
+            *got.entry(row).or_default() += w;
+        }
+    };
+    // A table write lands in the store at once and reaches the program at its tick.
+    let write = |vm: &mut TestVm, rows: &[(u128, i64, i64)]| {
+        let effective = vm
+            .registry
+            .ingest_returning(TABLE, make_batch_u128(&schema, rows))
+            .unwrap();
+        match vm.unticked.get_mut(&TABLE) {
+            Some(held) => held.append_batch(&effective),
+            None => drop(vm.unticked.insert(TABLE, effective)),
+        }
+    };
+    type Rows = &'static [(u128, i64, i64)];
+    let steps: [(Rows, Rows); 4] = [
+        // (written to the table, then A's delta — run before the table's tick)
+        (&[(1, 1, 100), (2, 1, 200)], &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]),
+        // Key 1 replaced, key 3 new, while A gains a second row on key 1.
+        (&[(1, 1, 101), (3, 1, 300)], &[(1, 1, 11)]),
+        // Key 2 removed, while A retracts its row there and adds one on key 3.
+        (&[(2, -1, 200)], &[(2, -1, 20), (3, 1, 31)]),
+        (&[], &[(1, -1, 10)]),
+    ];
+    for (i, (table_rows, a_rows)) in steps.into_iter().enumerate() {
+        if !table_rows.is_empty() {
+            write(&mut vm, table_rows);
+        }
+        let before = vm.unticked.get(&TABLE).map(|held| held.to_consolidated().negated());
+        let a_delta = make_batch_u128_raw(&schema, a_rows);
+        let ticked = vm.epoch([(a, a_delta.clone())]);
+        // What the term may pair with is the table less its un-ticked writes.
+        let mut table_then = vm
+            .registry
+            .relation(TABLE)
+            .unwrap()
+            .cursor()
+            .materialize()
+            .as_ref()
+            .clone();
+        if let Some(undo) = &before {
+            table_then.append_batch(undo);
+        }
+        let (want, _) = join_reference(
+            gnitz_wire::JoinKind::Equi,
+            false,
+            &schema,
+            &schema,
+            &a_delta,
+            &table_then,
+        );
+        assert_eq!(zset_of(&ticked, &out_schema), want, "step {i}: A's epoch");
+        absorb(ticked);
+        a_all.append_batch(&a_delta);
+        if let Some(delta) = vm.unticked.remove(&TABLE) {
+            absorb(vm.epoch([(b, delta)]));
+        }
+    }
+    let table_now = vm.registry.relation(TABLE).unwrap().cursor().materialize();
+    let (want, _) = join_reference(gnitz_wire::JoinKind::Equi, false, &schema, &schema, &a_all, &table_now);
+    got.retain(|_, w| *w != 0);
+    assert_eq!(got, want, "the epochs together are the join of A with the table");
+
+    // A source the program has been fed nothing of reads empty, whatever it holds.
+    vm.unfed = vec![TABLE];
+    assert!(vm.epoch([(a, make_batch_u128_raw(&schema, &[(1, 1, 12)]))]).is_empty());
 }
 
 // ── Integrates run after the range, and a replay runs none ───────────────
@@ -331,9 +467,10 @@ fn a_replay_runs_from_its_entry_and_leaves_every_trace_as_it_found_it() {
     assert_eq!(vm.trace(trace), before);
 }
 
-/// A replay may not enter before a stateful operator.
+/// A replay may not seed a register a stateful operator reads, directly or
+/// through other operators.
 #[test]
-fn replay_entry_refuses_a_stateful_operator_past_the_entry() {
+fn replay_entry_refuses_a_stateful_operator_the_seed_reaches() {
     let schema = make_schema_u128_i64();
 
     let plan = stream::ReducePlan::from_wire(&schema, &[], &[AggDescriptor::COUNT_STAR], false).unwrap();
@@ -362,4 +499,33 @@ fn replay_entry_refuses_a_stateful_operator_past_the_entry() {
         p.open(out).program.replay_entry(r0).is_err(),
         "the clamp reads the seed"
     );
+}
+
+/// A stateful operator the seed does not reach sits on an empty register for
+/// the whole replay, so it is skipped and its state is neither read nor moved —
+/// wherever it stands in the program.
+#[test]
+fn a_replay_passes_a_stateful_operator_its_seed_does_not_reach() {
+    let schema = make_schema_u128_i64();
+    let mut p = TestPlan::default();
+    let hist = p.table("hist", schema);
+    let (a, b) = (p.seed(schema), p.seed(schema));
+    let negated = p.push(a, schema, Op::Negate);
+    let clamped = p.push(
+        b,
+        schema,
+        Op::WeightClamp {
+            hist,
+            kind: gnitz_wire::ClampKind::Distinct,
+        },
+    );
+    let out = p.push(negated, schema, Op::Union { in_b: clamped });
+    let mut vm = p.open(out);
+    assert!(vm.program.replay_entry(b).is_err(), "the clamp reads this seed");
+
+    vm.epoch([(b, make_batch_u128(&schema, &[(1, 1, 10)]))]);
+    let before = vm.trace(hist);
+    let replayed = vm.replay(a, make_batch_u128(&schema, &[(2, 1, 20)]));
+    assert_rows(&replayed, &[(2, -1, 20)]);
+    assert_eq!(vm.trace(hist), before);
 }

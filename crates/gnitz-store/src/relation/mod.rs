@@ -7,7 +7,7 @@ use gnitz_foundation::env::env_num;
 use rustc_hash::FxHashMap;
 
 use gnitz_zset::algebra::index_entries;
-use gnitz_zset::schema::key::{key_range_between_cuts, pk_in_range, KeyCut};
+use gnitz_zset::schema::key::{key_range_between_cuts, KeyCut};
 use gnitz_zset::schema::{index_spec_and_schema, KeySpec, SchemaDescriptor};
 
 use crate::storage::{RecoverySource, StoreBudgets, Table};
@@ -32,6 +32,30 @@ pub(crate) use dirs::ensure_dir;
 pub use dirs::{lock_data_dir, relation_dir, relations_dir, ChildAddr, ChildKind, DirLock};
 pub use disk_usage::{disk_usage, DiskUsage};
 pub(crate) use store::Store;
+
+/// What cancels `unticked`'s rows at `keys` when merged into a read of the
+/// store that ingested them; `None` when it holds none there. `keys` ascend,
+/// each `width` bytes and naming every row whose PK it begins.
+fn undo_at(unticked: &Batch, keys: &[u8], width: usize) -> Option<std::rc::Rc<Batch>> {
+    let key = |i: usize| &keys[i * width..(i + 1) * width];
+    let named = |pk: &[u8]| {
+        let (mut lo, mut hi) = (0, keys.len() / width);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match key(mid).cmp(&pk[..width]) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Equal => return true,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        false
+    };
+    let at_keys: Vec<u32> = (0..unticked.len())
+        .filter(|&i| unticked.get_weight(i) != 0 && named(unticked.get_pk_bytes(i)))
+        .map(|i| i as u32)
+        .collect();
+    (!at_keys.is_empty()).then(|| std::rc::Rc::new(unticked.ascending_subset(&at_keys).into_consolidated().negated()))
+}
 
 // ---------------------------------------------------------------------------
 // Secondary index
@@ -282,19 +306,23 @@ impl Relation {
         self.store.held().open_cursor()
     }
 
-    /// Every live row of `keys`. With `unticked`, the store is read as it was before
-    /// those ingests.
+    /// Every live row of `keys` — whole PKs, or the same leading columns of one,
+    /// each then naming every row it prefixes. With `unticked`, the store is read
+    /// as it was before those ingests.
     pub fn gather(&self, keys: PkKeys, unticked: Option<&Batch>) -> PkSetGather {
-        let table = self.store.held();
-        let undo = unticked.zip(keys.bounds()).map(|(b, (first, last))| {
-            let in_range: Vec<u32> = (0..b.len())
-                .filter(|&i| b.get_weight(i) != 0 && pk_in_range(first, last, b.get_pk_bytes(i)))
-                .map(|i| i as u32)
-                .collect();
-            let undo = b.ascending_subset(&in_range).into_consolidated().negated();
-            std::rc::Rc::new(undo)
-        });
-        table.gather(keys, undo)
+        let undo = unticked.and_then(|b| undo_at(b, keys.as_bytes(), keys.stride()));
+        self.store.held().gather(keys, undo)
+    }
+
+    /// A cursor for probing at the PKs of the non-empty, PK-ordered `keys` —
+    /// this relation's whole PKs, or the same leading columns of one, each then
+    /// naming every row it prefixes — positioned on the first. With `unticked`,
+    /// the store is read at those keys as it was before those ingests.
+    pub fn cursor_for_keys(&self, keys: &Batch, unticked: Option<&Batch>) -> ReadCursor {
+        let undo = unticked.and_then(|b| undo_at(b, keys.pk_data(), keys.schema().pk_stride()));
+        self.store
+            .held()
+            .open_cursor_over_prefixes(keys.get_pk_bytes(0), keys.get_pk_bytes(keys.len() - 1), undo)
     }
 
     /// Visit every positive-weight row whose OPK key begins with `prefix`.

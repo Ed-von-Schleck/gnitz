@@ -342,6 +342,22 @@ impl MapPlan {
         &self.out_schema
     }
 
+    /// The input column behind each output payload slot, when this map only
+    /// re-keys its rows onto leading bytes of their own PK: the input, read in
+    /// its own order, then holds each output key's rows together. `None` for
+    /// every other map.
+    pub fn rekeys_onto_pk_prefix(&self) -> Option<Vec<ColumnLocator>> {
+        let PkSource::Pack(packer) = &self.pk_source else {
+            return None;
+        };
+        packer.pk_prefix_len()?;
+        // A PK column is never NULL, and a reindex copies each kept column at
+        // its own type.
+        debug_assert!(self.null_key_mask == 0 && !self.ev.emits_anything());
+        debug_assert!(self.ev.copies().iter().all(|c| c.width == c.src.size()));
+        Some(self.ev.copies().iter().map(|c| c.src).collect())
+    }
+
     /// True iff running this map would reproduce its input batch. A compiler
     /// elides such a node entirely and lets its consumers read the input.
     pub fn is_identity(&self) -> bool {

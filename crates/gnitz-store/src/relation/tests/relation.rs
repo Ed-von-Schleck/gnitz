@@ -251,3 +251,82 @@ fn a_resumed_view_refuses_a_missing_manifest() {
     // Last: a rebuild erases the traces.
     worker(false).expect("told to rebuild, a worker opens the view");
 }
+
+/// A `(a, b | v)` table read by its leading key column: a gather and a cursor
+/// both take `a` alone and answer every row under each key they are given, and
+/// with the un-ticked ingests handed in, the rows as they stood before those —
+/// a replaced row at its old value, a removed one present, a new one absent.
+#[test]
+fn a_table_is_read_by_a_key_prefix_as_it_stood_before_its_unticked_ingests() {
+    use gnitz_zset::repr::BatchBuilder;
+    use gnitz_zset::schema::SchemaColumn;
+    let col = SchemaColumn::new(TypeCode::U64, false);
+    let schema = SchemaDescriptor::new(&[col, col, SchemaColumn::new(TypeCode::I64, false)], &[0, 1]);
+    let rows = |rows: &[(u64, u64, i64, i64)]| {
+        let mut b = BatchBuilder::new(&schema);
+        for &(a, k, w, v) in rows {
+            b.begin_row_opk(&[a as u128, k as u128], w);
+            b.put_int(v as u128);
+            b.end_row();
+        }
+        b.finish()
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let mut registry = solo(tmp.path());
+    registry.register(table(50, schema)).unwrap();
+    let before = [
+        (1, 1, 1, 10),
+        (1, 2, 1, 20),
+        (2, 1, 1, 30),
+        (3, 7, 1, 40),
+        (5, 1, 1, 50),
+    ];
+    registry.ingest(50, rows(&before)).unwrap();
+    // (1, 2) replaced, (3, 7) removed, (2, 9) and (4, 4) new.
+    let unticked = registry
+        .ingest_returning(50, rows(&[(1, 2, 1, 21), (3, 7, -1, 40), (2, 9, 1, 60), (4, 4, 1, 70)]))
+        .unwrap();
+    let relation = registry.relation(50).unwrap();
+    let now = [
+        (1, 1, 1, 10),
+        (1, 2, 1, 21),
+        (2, 1, 1, 30),
+        (2, 9, 1, 60),
+        (4, 4, 1, 70),
+        (5, 1, 1, 50),
+    ];
+    let under = |all: &[(u64, u64, i64, i64)], keys: &[u64]| {
+        let kept: Vec<_> = all.iter().copied().filter(|r| keys.contains(&r.0)).collect();
+        zset_of(&rows(&kept), &schema)
+    };
+
+    for (state, held) in [(&now[..], None), (&before[..], Some(&unticked))] {
+        let keys = [1u64, 3, 4];
+        let pk_keys = PkKeys::from_keys(
+            8,
+            keys.iter()
+                .map(|k| k.to_be_bytes())
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|k| &k[..]),
+        );
+        let mut gather = relation.gather(pk_keys, held);
+        let mut gathered = std::collections::HashMap::new();
+        while let Some(chunk) = gather.drain_chunk(2) {
+            gathered.extend(zset_of(&chunk, &schema));
+        }
+        assert_eq!(gathered, under(state, &keys), "gather, unticked={}", held.is_some());
+
+        // Positioned on the first key's first row and exact at each key: the
+        // rows of every other key are a walk's to skip.
+        let mut probe = BatchBuilder::new(&SchemaDescriptor::new(&[col], &[0]));
+        for k in keys {
+            probe.begin_row_opk(&[k as u128], 1);
+            probe.end_row();
+        }
+        let cursor = relation.cursor_for_keys(&probe.finish(), held);
+        let mut read = zset_of(&cursor.materialize(), &schema);
+        read.retain(|row, _| keys.iter().any(|k| row.0[..8] == k.to_be_bytes()));
+        assert_eq!(read, under(state, &keys), "cursor, unticked={}", held.is_some());
+    }
+}
