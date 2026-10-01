@@ -439,7 +439,7 @@ fn a_decimal_column_against_a_finer_literal_is_exact() {
     assert_eq!(
         instrs("c1 < 1.005", &[dec(2)]),
         [
-            L::LoadColInt { col: 1 },
+            L::LoadCol { col: 1 },
             L::LoadConst { val: 100, unsigned: false },
             L::Cmp { op: CmpOp::Le, a: Reg(0), b: Reg(1) }
         ]
@@ -457,6 +457,53 @@ fn a_u64_and_a_signed_column_compare_exactly() {
         let want = pairs.map(|(u, i)| Int(i128::from(holds(cmp, u, i))));
         assert_eval(&format!("c1 {op} c2"), &[T::U64, T::I64], &rows, &want);
     }
+}
+
+/// A signed operand of a result read unsigned is range-cast into it, and an
+/// unsigned operand of temporal arithmetic into the signed domain: a value the
+/// result cannot hold is NULL, never a misread.
+#[test]
+fn an_operand_takes_the_signedness_of_its_result() {
+    let big = (1i128 << 63) + 5;
+    // c1 = i, c2 = u.
+    check(
+        &[T::I64, T::U64],
+        &[
+            ("c1 / c2", &[Int(-6), Int(2)], Null),
+            ("c1 / c2", &[Int(6), Int(2)], Int(3)),
+            ("c2 / (2 * 3)", &[Int(0), Int(big)], Int(big / 6)),
+            ("c2 % c1", &[Int(-7), Int(20)], Null),
+            ("c2 % c1", &[Int(7), Int(big)], Int(big % 7)),
+            ("GREATEST(c1, c2)", &[Int(-1), Int(5)], Int(5)),
+            ("LEAST(c1, c2)", &[Int(-1), Int(5)], Int(5)),
+            ("GREATEST(c1, c2)", &[Int(7), Int(big)], Int(big)),
+            ("LEAST(c1, c2)", &[Int(7), Int(big)], Int(7)),
+            ("GREATEST(-1, 1, c2)", &[Int(0), Int(0)], Int(1)),
+            ("CASE WHEN c1 < 0 THEN c1 ELSE c2 END", &[Int(-3), Int(5)], Null),
+            ("CASE WHEN c1 < 0 THEN c1 ELSE c2 END", &[Int(3), Int(big)], Int(big)),
+            ("COALESCE(c2, 1 + 1)", &[Int(0), Int(big)], Int(big)),
+            ("COALESCE(c2, 1 + 1)", &[Int(0), Null], Int(2)),
+        ],
+    );
+    // c1 = d = 1960-01-01, c2 = u, c3 = d2.
+    let d = i128::from(gnitz_expr::calendar::days_from_civil(1960, 1, 1));
+    check(
+        &[T::Date, T::U64, T::Date],
+        &[
+            ("(c1 + c2) < c3", &[Int(d), Int(10), Int(d + 13)], Int(1)),
+            ("GREATEST(c1 + c2, c3)", &[Int(d), Int(10), Int(d + 13)], Int(d + 13)),
+            ("GREATEST(c1 + c2, c3)", &[Int(d), Int(20), Int(d + 13)], Int(d + 20)),
+            ("c1 + c2", &[Int(d), Int(big), Int(0)], Null),
+        ],
+    );
+    // c1 = t1, c2 = t2, c3 = u.
+    check(
+        &[T::Timestamp, T::Timestamp, T::U64],
+        &[
+            ("(c1 - (c2 + c3)) / 1000", &[Int(0), Int(4000), Int(1000)], Int(-5)),
+            ("SIGN(c1 - (c2 + c3))", &[Int(0), Int(4000), Int(1000)], Int(-1)),
+        ],
+    );
 }
 
 // ------------------------------------------------------------------
@@ -499,7 +546,7 @@ fn cast_elision_preserves_u64_tracking() {
 /// of an unsigned one: nothing is emitted.
 #[test]
 fn an_integer_argument_folds_the_identity_transforms_away() {
-    let load = [L::LoadColInt { col: 1 }];
+    let load = [L::LoadCol { col: 1 }];
     for sql in ["FLOOR(c1)", "CEIL(c1)", "ROUND(c1)", "TRUNC(c1)", "ROUND(c1, 2)"] {
         assert_eq!(instrs(sql, &[T::I32]), load, "{sql}");
     }
@@ -520,7 +567,7 @@ fn a_float_round_scales_by_a_positive_power_in_either_direction() {
     assert_eq!(
         instrs("ROUND(c1)", &[T::F64]),
         [
-            L::LoadColFloat { col: 1 },
+            L::LoadCol { col: 1 },
             L::FloatUnary { op: FloatUnaryOp::Round, a: Reg(0) }
         ]
     );
@@ -540,25 +587,31 @@ fn a_float_round_scales_by_a_positive_power_in_either_direction() {
     assert_eq!(steps("ROUND(c1, -2)"), "DRM");
 }
 
-/// GREATEST/LEAST is a left chain of 2-ary opcodes, so its registers are linear
-/// in arity and the register file bounds it. A U64 argument heads the fold
-/// wherever it was written: the engine taints a register unsigned only from the
-/// first U64 operand onward, so an earlier signed pair would compare signed.
+/// GREATEST/LEAST is a left chain of 2-ary opcodes in written order, so its
+/// registers are linear in arity and the register file bounds it.
 #[test]
-fn min_max_n_is_a_left_fold_headed_by_its_u64_argument() {
+fn min_max_n_is_a_left_fold_in_written_order() {
     assert_eq!(
         instrs("GREATEST(c1, c2, c3)", &[T::I64, T::I64, T::I64]),
         [
-            L::LoadColInt { col: 1 },
-            L::LoadColInt { col: 2 },
+            L::LoadCol { col: 1 },
+            L::LoadCol { col: 2 },
             L::IntMinMax2 { a: Reg(0), b: Reg(1), is_max: true },
-            L::LoadColInt { col: 3 },
+            L::LoadCol { col: 3 },
             L::IntMinMax2 { a: Reg(2), b: Reg(3), is_max: true },
         ]
     );
-    for sql in ["GREATEST(-1, 1, c1)", "GREATEST(c1, -1, 1)"] {
-        assert_eq!(instrs(sql, &[T::U64])[0], L::LoadColInt { col: 1 }, "{sql}");
-    }
+    assert_eq!(
+        instrs("GREATEST(-1, 1, c1)", &[T::U64]),
+        [
+            L::LoadConst { val: -1, unsigned: false },
+            L::IntCast { a: Reg(0), fi: FixedInt::U64 },
+            L::LoadConst { val: 1, unsigned: false },
+            L::IntMinMax2 { a: Reg(1), b: Reg(2), is_max: true },
+            L::LoadCol { col: 1 },
+            L::IntMinMax2 { a: Reg(3), b: Reg(4), is_max: true },
+        ]
+    );
     // Distinct literals: the builder folds identical instructions.
     let greatest = |n: usize| {
         let args: Vec<String> = (0..n).map(|i| i.to_string()).collect();
@@ -610,7 +663,7 @@ fn an_integer_in_list_is_one_set_probe() {
     let is_set = |p: &LogicalProgram| {
         matches!(
             p.instrs(),
-            [L::LoadColInt { col: 1 }, L::IntInSet { value_reg: Reg(0), .. }]
+            [L::LoadCol { col: 1 }, L::IntInSet { value_reg: Reg(0), .. }]
         )
     };
     let p = lowered("c1 IN (2, 1, 1, -1)", &[T::I64]);
@@ -641,10 +694,10 @@ fn an_in_list_or_chain_shares_its_operand() {
     assert_eq!(
         instrs("c1 IN (1, c2)", &[T::I64, T::I64]),
         [
-            L::LoadColInt { col: 1 },
+            L::LoadCol { col: 1 },
             L::LoadConst { val: 1, unsigned: false },
             L::Cmp { op: CmpOp::Eq, a: Reg(0), b: Reg(1) },
-            L::LoadColInt { col: 2 },
+            L::LoadCol { col: 2 },
             L::Cmp { op: CmpOp::Eq, a: Reg(0), b: Reg(3) },
             L::BoolBinary { a: Reg(2), b: Reg(4), is_or: true },
         ]
@@ -678,7 +731,7 @@ fn an_in_list_or_chain_shares_its_operand() {
 fn a_wide_literal_past_the_column_is_decided_without_a_constant() {
     assert_eq!(
         instrs("c1 = 18446744073709551615", &[T::I64]),
-        [L::LoadColInt { col: 1 }, L::Cmp { op: CmpOp::Ne, a: Reg(0), b: Reg(0) }]
+        [L::LoadCol { col: 1 }, L::Cmp { op: CmpOp::Ne, a: Reg(0), b: Reg(0) }]
     );
 }
 

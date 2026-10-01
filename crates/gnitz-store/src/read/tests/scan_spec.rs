@@ -53,7 +53,7 @@ fn order_by(col: u16, desc: bool) -> Vec<OrderKey> {
 /// `lo <= col`, and `col < hi` under `Some(hi)`, as a wire predicate.
 fn between(col: u32, lo: i64, hi: Option<i64>) -> Vec<u8> {
     let mut eb = ExprBuilder::new();
-    let v = eb.emit(LogicalInstr::LoadColInt { col });
+    let v = eb.emit(LogicalInstr::LoadCol { col });
     let lo_c = eb.emit(LogicalInstr::LoadConst { val: lo, unsigned: false });
     let mut keep = eb.emit(LogicalInstr::Cmp { op: CmpOp::Ge, a: v, b: lo_c });
     if let Some(hi) = hi {
@@ -529,7 +529,7 @@ fn a_computed_map_writes_at_the_keepers_tail() {
     let reply = SchemaDescriptor::new(&cols, &[0]);
     let mut eb = ExprBuilder::new();
     let (v, two) = (
-        eb.emit(LogicalInstr::LoadColInt { col: 1 }),
+        eb.emit(LogicalInstr::LoadCol { col: 1 }),
         eb.emit(LogicalInstr::LoadConst { val: 2, unsigned: false }),
     );
     let doubled = eb.emit(LogicalInstr::IntArith {

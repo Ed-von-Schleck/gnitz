@@ -148,8 +148,8 @@ fn scan_spec_sinks_bench() {
     let compute_proj = {
         let mut eb = ExprBuilder::new();
         let (a, b) = (
-            eb.emit(LogicalInstr::LoadColInt { col: 3 }),
-            eb.emit(LogicalInstr::LoadColInt { col: 4 }),
+            eb.emit(LogicalInstr::LoadCol { col: 3 }),
+            eb.emit(LogicalInstr::LoadCol { col: 4 }),
         );
         let sum = eb.emit(LogicalInstr::IntArith { op: IntArithOp::Add, a, b });
         eb.build(vec![Sink::Reg(sum), Sink::Col(1)]).unwrap()

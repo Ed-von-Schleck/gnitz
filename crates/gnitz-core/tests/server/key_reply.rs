@@ -17,7 +17,7 @@ use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr as L, Sink};
 /// column indices.
 fn gt_predicate(col: usize, threshold: i64) -> Vec<u8> {
     let mut b = ExprBuilder::new();
-    let c = b.emit(L::LoadColInt { col: col as u32 });
+    let c = b.emit(L::LoadCol { col: col as u32 });
     let k = b.emit(L::LoadConst { val: threshold, unsigned: false });
     let cond = b.emit(L::Cmp { op: CmpOp::Gt, a: c, b: k });
     b.build(vec![Sink::Reg(cond)])

@@ -44,7 +44,7 @@ fn a_map_writes_its_computed_slots_and_moves_the_copied_null_bits() {
     }
 
     let instrs = vec![
-        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::LoadCol { col: 1 },
         LogicalInstr::LoadConst { val: 300, unsigned: false },
         LogicalInstr::IntArith {
             op: IntArithOp::Mul,
@@ -128,7 +128,7 @@ fn filter_emits_exact_maximal_ranges() {
     for nullable in [false, true] {
         let schema = schema_pk_ints(1, nullable);
         let instrs = vec![
-            LogicalInstr::LoadColInt { col: 1 },
+            LogicalInstr::LoadCol { col: 1 },
             LogicalInstr::LoadConst { val: 0, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         ];
@@ -187,13 +187,13 @@ fn three_and_chain_matches_the_three_valued_reference() {
     for (label, nullable, null_at) in arrangements {
         let schema = schema_pk_ints(3, nullable);
         let instrs = vec![
-            LogicalInstr::LoadColInt { col: 1 },                             // r0 = col0
+            LogicalInstr::LoadCol { col: 1 },                                // r0 = col0
             LogicalInstr::LoadConst { val: 1, unsigned: false },             // r1 = 1
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },       // r2 = col0 > 1
-            LogicalInstr::LoadColInt { col: 2 },                             // r3 = col1
+            LogicalInstr::LoadCol { col: 2 },                                // r3 = col1
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(3), b: Reg(1) },       // r4 = col1 > 1
             LogicalInstr::BoolBinary { is_or: false, a: Reg(2), b: Reg(4) }, // r5 = r2 AND r4
-            LogicalInstr::LoadColInt { col: 3 },                             // r6 = col2
+            LogicalInstr::LoadCol { col: 3 },                                // r6 = col2
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(6), b: Reg(1) },       // r7 = col2 > 1
             LogicalInstr::BoolBinary { is_or: false, a: Reg(5), b: Reg(7) }, // r8 = r5 AND r7
         ];
@@ -238,7 +238,7 @@ fn every_boolean_combinator_covers_the_whole_three_valued_table() {
     );
     let verdicts = |want: &[Option<bool>]| want.iter().map(|&w| w == Some(true)).collect::<Vec<_>>();
 
-    let (a, b) = (LogicalInstr::LoadColInt { col: 1 }, LogicalInstr::LoadColInt { col: 2 });
+    let (a, b) = (LogicalInstr::LoadCol { col: 1 }, LogicalInstr::LoadCol { col: 2 });
     // A bare load as a filter: no boolean producer wrote it, so the filter packs
     // its truthiness itself.
     let want: Vec<Option<bool>> = cells.iter().map(|c| c[0]).collect();
@@ -277,7 +277,7 @@ fn every_boolean_combinator_covers_the_whole_three_valued_table() {
 fn not_leaves_no_run_past_the_last_row() {
     let schema = schema_pk_ints(1, true);
     let instrs = vec![
-        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::LoadCol { col: 1 },
         LogicalInstr::LoadConst { val: 0, unsigned: false },
         LogicalInstr::Cmp { op: CmpOp::Ge, a: Reg(0), b: Reg(1) },
         LogicalInstr::BoolNot { a: Reg(2) },
@@ -441,10 +441,10 @@ fn nullable_and_not_null_columns_side_by_side() {
     }
 
     let instrs = vec![
-        LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::LoadColInt { col: 2 },
-        LogicalInstr::LoadColFloat { col: 5 },
-        LogicalInstr::LoadColFloat { col: 6 },
+        LogicalInstr::LoadCol { col: 1 },
+        LogicalInstr::LoadCol { col: 2 },
+        LogicalInstr::LoadCol { col: 5 },
+        LogicalInstr::LoadCol { col: 6 },
         LogicalInstr::LoadColStr { col: 3 },
         LogicalInstr::LoadColStr { col: 4 },
         LogicalInstr::StrColConst {
@@ -491,8 +491,8 @@ fn int_results_widen_by_the_result_registers_signedness() {
     // Bit 63 set, so an unsigned and a signed reading differ.
     let big = (1u64 << 63) | 6;
     let mb = make_n_col_view(&schema, 1, |_, col| [big as i64, -1][col], |_, _| false);
-    let u64_col = LogicalInstr::LoadColInt { col: 1 };
-    let i64_col = LogicalInstr::LoadColInt { col: 2 };
+    let u64_col = LogicalInstr::LoadCol { col: 1 };
+    let i64_col = LogicalInstr::LoadCol { col: 2 };
     let k = |val| LogicalInstr::LoadConst { val, unsigned: false };
     let arith = |op| LogicalInstr::IntArith { op, a: Reg(0), b: Reg(1) };
     let max = |a, b| LogicalInstr::IntMinMax2 { a: Reg(a), b: Reg(b), is_max: true };
@@ -573,7 +573,7 @@ fn row_filter_keeps_the_intersection_of_its_predicate_and_its_bound() {
     let schema = schema_pk_ints(1, true);
     let v_gt_3 = crate::LogicalProgram::new(
         vec![
-            LogicalInstr::LoadColInt { col: 1 },
+            LogicalInstr::LoadCol { col: 1 },
             LogicalInstr::LoadConst { val: 3, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         ],

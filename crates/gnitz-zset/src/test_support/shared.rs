@@ -180,10 +180,10 @@ pub fn sweep_bit_flips(buf: &mut [u8], span: std::ops::Range<usize>, mut check: 
 /// `col <op> lit` over a fixed-int column — the program shape a `WHERE`
 /// conjunct compiles to, built through the client's own `ExprBuilder`.
 pub fn cmp_const(op: gnitz_expr::CmpOp, col: u32, lit: i64) -> gnitz_expr::LogicalProgram {
-    use gnitz_expr::LogicalInstr::{Cmp, LoadColInt, LoadConst};
+    use gnitz_expr::LogicalInstr::{Cmp, LoadCol, LoadConst};
     let mut eb = gnitz_expr::ExprBuilder::new();
     let (a, b) = (
-        eb.emit(LoadColInt { col }),
+        eb.emit(LoadCol { col }),
         eb.emit(LoadConst { val: lit, unsigned: false }),
     );
     let r = eb.emit(Cmp { op, a, b });

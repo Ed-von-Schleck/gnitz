@@ -31,19 +31,18 @@ pub(crate) struct Evaluator {
     scratch: EvalScratch,
 }
 
-/// The only way to obtain an evaluator: each constructor validates the program
-/// against the schemas it will run on, then resolves it against them.
+/// The only way to obtain an evaluator: each constructor resolves the program
+/// against the schemas it will run on, which is what checks it against them.
 impl LogicalProgram {
     /// A filter predicate; its result must not be a string.
     pub fn resolve_filter(self, schema: &dyn SchemaFacts) -> Result<RowFilter, ExprValidateErr> {
         let [Sink::Reg(r)] = self.sinks[..] else {
             return Err(ExprValidateErr::OutputRoleMismatch);
         };
-        if (self.str_class >> r.0) & 1 != 0 {
+        if self.is_str(r) {
             return Err(ExprValidateErr::RegClassMismatch { reg: r.0 });
         }
-        self.validate(schema, None)?;
-        let (prog, _) = self.resolve_program(schema, ReadAs::Bool);
+        let prog = self.resolve_program(schema, ReadAs::Bool)?;
         let pred = FilterEval {
             ev: Evaluator::new(prog),
             result_reg: r.0 as usize,
@@ -60,10 +59,8 @@ impl LogicalProgram {
         let [Sink::Reg(r)] = self.sinks[..] else {
             return Err(ExprValidateErr::OutputRoleMismatch);
         };
-        self.validate(schema, None)?;
-        let is_str = (self.str_class >> r.0) & 1 != 0;
-        let (prog, reg_u64) = self.resolve_program(schema, ReadAs::Value);
-        let class = match (is_str, (reg_u64 >> r.0) & 1 != 0) {
+        let prog = self.resolve_program(schema, ReadAs::Value)?;
+        let class = match (self.is_str(r), (prog.reg_u64 >> r.0) & 1 != 0) {
             (true, _) => ResultClass::Str,
             (false, true) => ResultClass::Unsigned,
             (false, false) => ResultClass::Signed,
@@ -82,10 +79,9 @@ impl LogicalProgram {
         in_schema: &dyn SchemaFacts,
         out_schema: &dyn SchemaFacts,
     ) -> Result<MapEval, ExprValidateErr> {
-        self.validate(in_schema, Some(out_schema))?;
+        let prog = self.resolve_program(in_schema, ReadAs::Value)?;
+        let sinks = self.map_sinks(in_schema, out_schema)?;
         let is_identity = self.is_identity_map(in_schema, out_schema);
-        let sinks = self.map_sinks(in_schema, out_schema);
-        let (prog, _) = self.resolve_program(in_schema, ReadAs::Value);
         Ok(MapEval {
             ev: Evaluator::new(prog),
             sinks,

@@ -134,8 +134,8 @@ def test_an_unsigned_value_keeps_its_domain_through_a_view_chain(client):
     assert bag(scanned(client, "v2")) == {
         (1, 1, 1, 1, 1, 1): 1,
         (2, 1, 0, 1, 1, 1): 1,
-        # `-1` is u64::MAX once one U64 argument fixes the fold's domain.
-        (3, 0, 0, 0, 1, 1): 1,
+        # `-1` has no unsigned value, so the fold skips it.
+        (3, 0, 0, 0, 0, 0): 1,
     }
     assert bag(scanned(client, "s2")) == {(1,): 1}
     every = {(1,): 1, (2,): 1, (3,): 1}

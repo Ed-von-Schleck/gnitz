@@ -17,8 +17,8 @@ use crate::test_support::{
     schema_pk_strings, TestSchema, TestView,
 };
 use crate::{
-    payload_u64, CmpOp, ConstIdx, ExprBuilder, IntArithOp, LikePattern, LogicalInstr, LogicalProgram, MapEval, Reg,
-    RowFilter, ScalarEval, Sink,
+    payload_u64, BatchView, CalendarOp, CmpOp, ConstIdx, ExprBuilder, IntArithOp, LikePattern, LogicalInstr,
+    LogicalProgram, MapEval, Reg, RowFilter, ScalarEval, Sink,
 };
 
 /// The one case a `GNITZ_BENCH_*` variable drives, every case when unset; every
@@ -181,7 +181,7 @@ fn filter_kernel_bench() {
     // `col <op> k` over one column of `schema`.
     let col_cmp = |schema: &TestSchema, col: u32, op, val| {
         let instrs = vec![
-            LogicalInstr::LoadColInt { col },
+            LogicalInstr::LoadCol { col },
             LogicalInstr::LoadConst { val, unsigned: false },
             LogicalInstr::Cmp { op, a: Reg(0), b: Reg(1) },
         ];
@@ -205,6 +205,25 @@ fn filter_kernel_bench() {
     let i32_view = make_n_col_view(&i32_schema, n, |row, _| (row % 1000) as i64, |_, _| false);
     let mut i32_filter = col_cmp(&i32_schema, 1, CmpOp::Gt, 500);
 
+    // `f > 500.0` over one NOT NULL `F32` payload column: the widening load.
+    let f32_schema = TestSchema::new(&[(TypeCode::U64, false), (TypeCode::F32, false)], &[0]);
+    let mut f32_view = TestView::for_schema(&f32_schema, n);
+    for row in 0..n {
+        f32_view.set_payload(row, 0, &((row % 1000) as f32).to_le_bytes());
+    }
+    let mut f32_filter = filter_prog(
+        &f32_schema,
+        vec![
+            LogicalInstr::LoadCol { col: 1 },
+            LogicalInstr::LoadConst {
+                val: crate::batch::encode_f64(500.0),
+                unsigned: false,
+            },
+            LogicalInstr::FCmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
+        ],
+        vec![],
+    );
+
     // `-a > 0 AND b < 80` over nullable columns — unary, the 3VL AND, and the
     // per-column null-bit gather.
     let nn_schema = schema_pk_ints(2, true);
@@ -217,14 +236,14 @@ fn filter_kernel_bench() {
     let mut nn_filter = filter_prog(
         &nn_schema,
         vec![
-            LogicalInstr::LoadColInt { col: 1 },
+            LogicalInstr::LoadCol { col: 1 },
             LogicalInstr::IntUnary {
                 op: crate::program::IntUnaryOp::Neg,
                 a: Reg(0),
             },
             LogicalInstr::LoadConst { val: 0, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(1), b: Reg(2) },
-            LogicalInstr::LoadColInt { col: 2 },
+            LogicalInstr::LoadCol { col: 2 },
             LogicalInstr::LoadConst { val: 80, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Lt, a: Reg(4), b: Reg(5) },
             LogicalInstr::BoolBinary { is_or: false, a: Reg(3), b: Reg(6) },
@@ -237,7 +256,7 @@ fn filter_kernel_bench() {
     // a per-morsel constant refill would show.
     let lit_schema = schema_pk_ints(1, false);
     let lit_view = make_n_col_view(&lit_schema, n, |row, _| (row % 1000) as i64, |_, _| false);
-    let mut lit_instrs = vec![LogicalInstr::LoadColInt { col: 1 }];
+    let mut lit_instrs = vec![LogicalInstr::LoadCol { col: 1 }];
     for (i, (op, val)) in [
         (CmpOp::Gt, 1i64),
         (CmpOp::Lt, 999),
@@ -265,6 +284,7 @@ fn filter_kernel_bench() {
         ("pk", &mut pk_filter, &pk_view),
         ("pk_i64", &mut pk_i64_filter, &pk_i64_view),
         ("i32", &mut i32_filter, &i32_view),
+        ("f32", &mut f32_filter, &f32_view),
         ("nullable", &mut nn_filter, &nn_view),
         ("literals", &mut lit_filter, &lit_view),
     ] {
@@ -287,7 +307,7 @@ fn is_null_chain(k: i64, n_cmp: u32) -> Vec<LogicalInstr> {
     instrs.push(LogicalInstr::LoadConst { val: k, unsigned: false });
     for col in 2..n_cmp + 2 {
         let acc = if col == 2 { Reg(0) } else { last(&instrs) };
-        instrs.push(LogicalInstr::LoadColInt { col });
+        instrs.push(LogicalInstr::LoadCol { col });
         instrs.push(LogicalInstr::Cmp {
             op: CmpOp::Gt,
             a: last(&instrs),
@@ -433,7 +453,7 @@ fn expr_kernel_bench() {
         |row, col| ((row * 7 + col) % 1000 + 1) as i64,
         |row, _| row % 32 == 0,
     );
-    let load2 = |c: u32| LogicalInstr::LoadColInt { col: c };
+    let load2 = |c: u32| LogicalInstr::LoadCol { col: c };
 
     let int_cast = scalar_prog(
         &ints,
@@ -466,6 +486,20 @@ fn expr_kernel_bench() {
         vec![],
     );
     let int_to_str = scalar_prog(&ints, vec![load2(1), LogicalInstr::IntToStr { a: Reg(0) }], vec![]);
+    // `GREATEST(a, b)`: over the nullable columns the null-skipping arm, over the
+    // NOT NULL ones the plain pick.
+    let minmax_of = |schema: &TestSchema| {
+        scalar_prog(
+            schema,
+            vec![
+                load2(1),
+                load2(2),
+                LogicalInstr::IntMinMax2 { a: Reg(0), b: Reg(1), is_max: true },
+            ],
+            vec![],
+        )
+    };
+    let minmax = minmax_of(&ints);
 
     // --- string shapes over two NOT NULL STRING columns ---
     let strs = schema_pk_strings(2, false);
@@ -641,7 +675,7 @@ fn expr_kernel_bench() {
         vec![
             load2(1),
             load2(2),
-            LogicalInstr::LoadColInt { col: 3 },
+            LogicalInstr::LoadCol { col: 3 },
             LogicalInstr::IntArith {
                 op: IntArithOp::Add,
                 a: Reg(0),
@@ -662,6 +696,75 @@ fn expr_kernel_bench() {
         vec![],
     );
 
+    // --- the `no_nulls` arms of the extremum and the blend, over the map's view.
+    let minmax_nn = minmax_of(&map_in);
+    let select_nn = scalar_prog(
+        &map_in,
+        vec![
+            load2(1),
+            load2(2),
+            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
+            LogicalInstr::Select { cond: Reg(2), a: Reg(0), b: Reg(1) },
+        ],
+        vec![],
+    );
+
+    // --- calendar kernels over a NOT NULL column, read as days or scaled to
+    //     microseconds with a time of day.
+    let cal = |op, micros: bool| {
+        let mut instrs = vec![load2(1)];
+        if micros {
+            instrs.push(LogicalInstr::LoadConst { val: 86_400_000_123, unsigned: false });
+            instrs.push(LogicalInstr::IntArith {
+                op: IntArithOp::Mul,
+                a: Reg(0),
+                b: Reg(1),
+            });
+        }
+        instrs.push(LogicalInstr::Calendar { op, a: last(&instrs), micros });
+        scalar_prog(&map_in, instrs, vec![])
+    };
+
+    // --- `CASE WHEN k > 500 THEN s1 ELSE s2 END`: a condition no branch
+    //     predictor learns, and a NULL in the first branch so the blend runs on
+    //     the nullable arm.
+    let sel_schema = TestSchema::new(
+        &[
+            (TypeCode::U64, false),
+            (TypeCode::I64, false),
+            (TypeCode::String, true),
+            (TypeCode::String, true),
+        ],
+        &[0],
+    );
+    let mut sel_view = TestView::for_schema(&sel_schema, n);
+    for row in 0..n {
+        let k = ((row as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) % 1000;
+        sel_view.set_int(row, 0, k as i64);
+        for pi in [1, 2] {
+            let s = match row % 3 {
+                0 => format!("row-{row}-col-{pi}-past-the-inline-boundary"),
+                _ => format!("r{}{pi}", row % 100),
+            };
+            sel_view.set_string(row, pi, s.as_bytes());
+        }
+        if row % 32 == 0 {
+            sel_view.set_null(row, 1);
+        }
+    }
+    let str_select = scalar_prog(
+        &sel_schema,
+        vec![
+            load2(1),
+            LogicalInstr::LoadConst { val: 500, unsigned: false },
+            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
+            load_str(2),
+            load_str(3),
+            LogicalInstr::StrSelect { cond: Reg(2), a: Reg(3), b: Reg(4) },
+        ],
+        vec![],
+    );
+
     let mut acc = 0i64;
     if shape.drives("map") {
         let mut out = TestView::for_schema(&map_out, n);
@@ -677,6 +780,18 @@ fn expr_kernel_bench() {
         ("int_cast".into(), int_cast, &int_view),
         ("int_div".into(), int_div, &int_view),
         ("select".into(), select, &int_view),
+        ("select_nn".into(), select_nn, &map_view),
+        ("minmax".into(), minmax, &int_view),
+        ("minmax_nn".into(), minmax_nn, &map_view),
+        ("cal_year_date".into(), cal(CalendarOp::Year, false), &map_view),
+        ("cal_year_ts".into(), cal(CalendarOp::Year, true), &map_view),
+        ("cal_hour_ts".into(), cal(CalendarOp::Hour, true), &map_view),
+        (
+            "cal_trunc_month_ts".into(),
+            cal(CalendarOp::TruncMonth, true),
+            &map_view,
+        ),
+        ("cal_to_days".into(), cal(CalendarOp::ToDays, true), &map_view),
         ("str_len".into(), str_len, &str_view),
         ("str_like".into(), str_like, &str_view),
     ];
@@ -734,6 +849,7 @@ fn expr_kernel_bench() {
         ("str_upper", str_upper, &str_view),
         ("str_substr", str_substr, &str_view),
         ("str_concat", str_concat, &str_view),
+        ("str_select", str_select, &sel_view),
         ("str_side_64", str_side(), &side_64),
         ("str_side_512", str_side(), &like_views[2]),
         ("str_reverse_128", str_reverse(), &like_views[1]),
@@ -762,6 +878,47 @@ fn expr_kernel_bench() {
     );
 }
 
+/// The null-word permutation of a copy-only map over eight nullable columns,
+/// per `GNITZ_BENCH_SHAPE`: a column prefix, every column moved one slot down,
+/// and the columns reversed.
+#[test]
+#[ignore]
+fn null_perm_bench() {
+    let passes = bench_passes();
+    let mut shape = Selector::new("GNITZ_BENCH_SHAPE");
+    let n = 200_000usize;
+    let in_schema = schema_pk_ints(8, true);
+    let view = make_n_col_view(
+        &in_schema,
+        n,
+        |row, col| (row + col) as i64,
+        |row, col| (row * 7 + col * 13) % 5 == 0,
+    );
+    let shapes: [(&str, Vec<u32>); 3] = [
+        ("prefix", (1..=7).collect()),
+        ("shift", (2..=8).collect()),
+        ("reversed", (1..=8).rev().collect()),
+    ];
+    let mut acc = 0u64;
+    for (name, cols) in shapes {
+        let out_schema = schema_pk_ints(cols.len(), true);
+        let mut map = LogicalProgram::copy_cols(&cols)
+            .resolve_map(&in_schema, &out_schema)
+            .expect("a copy-only map");
+        let mut out = TestView::for_schema(&out_schema, n);
+        if shape.drives(name) {
+            for _ in 0..passes {
+                map.write_computed(&view, 0, n, &mut out, 0);
+                acc ^= gnitz_wire::read_u64_le(out.null_bmp(), (n - 1) * 8);
+            }
+        }
+    }
+    println!(
+        "null_perm_bench passes={passes} n={n} acc={}",
+        std::hint::black_box(acc)
+    );
+}
+
 /// The decode a predicate-only read pays per request per worker: `from_blob`
 /// and the `resolve_filter` that decodes an IN list's pool entry.
 #[test]
@@ -773,7 +930,7 @@ fn from_blob_bench() {
     let set: Vec<i64> = (0..n as i64).collect();
     let mut b = ExprBuilder::new();
     let set_idx = b.add_const_int_set(set);
-    let col = b.emit(LogicalInstr::LoadColInt { col: 1 });
+    let col = b.emit(LogicalInstr::LoadCol { col: 1 });
     let hit = b.emit(LogicalInstr::IntInSet { value_reg: col, set_idx });
     let blob = b
         .build(vec![Sink::Reg(hit)])

@@ -194,7 +194,7 @@ fn num_func_result_types() {
 /// makes a NULL of its own, and never proves the second.
 #[test]
 fn never_null_follows_the_kernels_that_make_a_null() {
-    // `c` and `nts` are nullable, every other column NOT NULL.
+    // `c`, `nts` and `nu` are nullable, every other column NOT NULL.
     let s = schema(
         vec![
             col("pk", TypeCode::U64),
@@ -203,6 +203,7 @@ fn never_null_follows_the_kernels_that_make_a_null() {
             col("d", TypeCode::Date),
             col("ts", TypeCode::Timestamp),
             ncol("nts", TypeCode::Timestamp),
+            ncol("nu", TypeCode::U64),
         ],
         &[0],
     );
@@ -243,6 +244,12 @@ fn never_null_follows_the_kernels_that_make_a_null() {
         ("CASE WHEN 1 THEN {x} ELSE {x} END", true),
         ("CASE WHEN 1 THEN c ELSE {x} END", false),
         ("CASE WHEN 1 THEN {x} END", false),
+        // A signed operand of an unsigned result is range-cast, and an unsigned
+        // operand of temporal arithmetic is: either cast can refuse a value.
+        ("GREATEST({x}, nu)", false),
+        ("CASE WHEN 1 THEN {x} ELSE pk END", false),
+        ("pk / -2 + 0 * {x}", false),
+        ("d + pk < d OR {x} = 1", false),
     ] {
         assert_eq!(never_null(&shape.replace("{x}", "n")), over_not_null, "{shape}");
         assert!(

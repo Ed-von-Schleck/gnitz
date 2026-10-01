@@ -8,8 +8,8 @@
 use crate::codec::literal::{assign, invalid_literal, place, Compared, Placed};
 use crate::error::GnitzSqlError;
 use crate::ir::{
-    blend_type, check_decimal_scale, decimal_compute_type, operand_ty_pair, operand_tys, temporal_arith_type, BExpr,
-    BinOp, BoundExpr, NumFunc, StrArg, StrFunc, TrimMode,
+    blend_type, check_decimal_scale, decimal_compute_type, operand_ty_pair, operand_tys, reads_unsigned,
+    temporal_arith_type, BExpr, BinOp, BoundExpr, NumFunc, StrArg, StrFunc, TrimMode,
 };
 use gnitz_core::Schema;
 use gnitz_expr::{
@@ -112,8 +112,8 @@ impl OpcodeBackend<'_> {
     fn col_ref(&mut self, idx: usize) -> Result<(Reg, ExprKind), GnitzSqlError> {
         let tc = self.cols[idx].ty.tc;
         let col = idx as u32;
-        // Both rejections exist for their wording: the engine's validator refuses
-        // a wide column on the integer load too, but names it by position only.
+        // Both rejections exist for their wording: the engine refuses these
+        // columns too, but names them by position only.
         if tc.is_wide_int() {
             return Err(GnitzSqlError::Rejected(format!(
                 "column {:?} is {}; 128-bit columns cannot be used in expressions",
@@ -129,8 +129,7 @@ impl OpcodeBackend<'_> {
                 )))
             }
             TypeCode::String => (self.eb.emit(L::LoadColStr { col }), ExprKind::Str),
-            _ if tc.is_float() => (self.eb.emit(L::LoadColFloat { col }), ExprKind::Float),
-            _ => (self.eb.emit(L::LoadColInt { col }), ExprKind::of(self.cols[idx].ty)),
+            _ => (self.eb.emit(L::LoadCol { col }), ExprKind::of(self.cols[idx].ty)),
         })
     }
 
@@ -249,7 +248,7 @@ impl OpcodeBackend<'_> {
         let (mut r, kind) = self.lower_num(e)?;
         // A DECIMAL is an i64, so a U64 value at or above 2^63 has none: the
         // range cast makes it NULL, and the scaling below then runs signed.
-        if kind == ExprKind::Int && e.infer_ty(self.cols).register_image().tc == TypeCode::U64 {
+        if kind == ExprKind::Int && reads_unsigned(e.infer_ty(self.cols)) {
             r = self.eb.emit(L::IntCast { a: r, fi: FixedInt::I64 });
         }
         Ok(self.as_decimal(r, kind, to))
@@ -279,7 +278,25 @@ impl OpcodeBackend<'_> {
                 let (r, kind) = self.lower_num(e)?;
                 Ok(self.as_float(r, kind))
             }
-            ExprKind::Int => Ok(self.lower_num(e)?.0),
+            ExprKind::Int => {
+                let r = self.lower_num(e)?.0;
+                Ok(if reads_unsigned(target) {
+                    self.as_unsigned(r, e)
+                } else {
+                    r
+                })
+            }
+        }
+    }
+
+    /// `r`, holding `e`, as an operand of a result read unsigned: a value that
+    /// may be negative is range-cast, so a negative one is NULL rather than a
+    /// number near 2^64.
+    fn as_unsigned(&mut self, r: Reg, e: &BoundExpr) -> Reg {
+        if e.never_negative_with(&|i: &usize| self.cols[*i].ty) {
+            r
+        } else {
+            self.eb.emit(L::IntCast { a: r, fi: FixedInt::U64 })
         }
     }
 
@@ -453,8 +470,7 @@ impl OpcodeBackend<'_> {
     /// `CONCAT(args…)`, a strictly left fold seeded with the empty string, so
     /// every arity has one shape and the one-argument case is non-NULL. Every
     /// argument lands in the `b` operand, where a NULL contributes the empty
-    /// string; only the accumulator's own NULL (from `str_concat_nn`)
-    /// propagates.
+    /// string; only the accumulator's own NULL propagates.
     fn concat_n(&mut self, args: &[BoundExpr]) -> Result<(Reg, ExprKind), GnitzSqlError> {
         let empty = self.eb.add_const_bytes(b"");
         let mut acc = self.eb.emit(L::LoadConstStr { const_idx: empty });
@@ -478,19 +494,8 @@ impl OpcodeBackend<'_> {
                 }
             }
         }
-        // The engine taints a register unsigned only from the first U64 operand
-        // onward, so a U64 argument must head the fold — otherwise an earlier
-        // signed pair would compare signed and the answer would depend on the
-        // order the arguments were written in.
-        let head = types
-            .iter()
-            .position(|t| t.register_image().tc == TypeCode::U64)
-            .unwrap_or(0);
-        let mut acc = self.lower_to(&args[head], ty)?;
-        for (i, a) in args.iter().enumerate() {
-            if i == head {
-                continue;
-            }
+        let mut acc = self.lower_to(&args[0], ty)?;
+        for a in &args[1..] {
             let b = self.lower_to(a, ty)?;
             acc = if ty.tc.is_float() {
                 self.eb.emit(L::FloatMinMax2 { a: acc, b, is_max })
@@ -809,6 +814,23 @@ impl OpcodeBackend<'_> {
         if is_float {
             l = self.as_float(l, l_kind);
             r = self.as_float(r, r_kind);
+        }
+        if !is_float {
+            if lt.tc.is_temporal() || rt.tc.is_temporal() {
+                // Temporal arithmetic is signed.
+                if op.as_cmp().is_none() {
+                    if reads_unsigned(lt) {
+                        l = self.eb.emit(L::IntCast { a: l, fi: FixedInt::I64 });
+                    }
+                    if reads_unsigned(rt) {
+                        r = self.eb.emit(L::IntCast { a: r, fi: FixedInt::I64 });
+                    }
+                }
+            } else if matches!(op, BinOp::Div | BinOp::Mod) && (reads_unsigned(lt) || reads_unsigned(rt)) {
+                // A quotient read unsigned takes both operands unsigned.
+                l = self.as_unsigned(l, left);
+                r = self.as_unsigned(r, right);
+            }
         }
         let out = match is_float {
             true => ExprKind::Float,

@@ -45,8 +45,7 @@ impl Col {
     fn load(&self, col: u32) -> LogicalInstr {
         match self.tc {
             TypeCode::String => LogicalInstr::LoadColStr { col },
-            TypeCode::F32 | TypeCode::F64 => LogicalInstr::LoadColFloat { col },
-            _ => LogicalInstr::LoadColInt { col },
+            _ => LogicalInstr::LoadCol { col },
         }
     }
 }
@@ -249,7 +248,7 @@ fn every_int_load_reads_its_value_from_either_region() {
             }
         }
         for col in [0, 2, 3] {
-            let mut ev = scalar_prog(&schema, vec![LogicalInstr::LoadColInt { col }], vec![]);
+            let mut ev = scalar_prog(&schema, vec![LogicalInstr::LoadCol { col }], vec![]);
             let want: Vec<Option<i64>> = PATTERNS
                 .iter()
                 .map(|&p| Some(fi.unpack(u128::from(value(col, p)))))
@@ -1016,10 +1015,10 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
     }
 }
 
-/// The fused compares name pool entries 2 then 1 behind an IN set at 0, so no
-/// cell index equals its pool index; both constants live on the program's heap.
+/// The fused compares name pool entries 2 then 1 behind an IN set at 0; both
+/// constants live on the program's heap.
 #[test]
-fn a_cell_index_is_dense_over_the_constants_the_fused_compare_names() {
+fn a_fused_compare_reads_its_constant_at_any_pool_index() {
     let schema = schema_pk_strings(2, false);
     let a: &[u8] = b"alpha-value-past-twelve";
     let b: &[u8] = b"bravo-value-past-twelve-and-then-some";
@@ -1030,7 +1029,7 @@ fn a_cell_index_is_dense_over_the_constants_the_fused_compare_names() {
     let mut ev = filter_prog(
         &schema,
         vec![
-            LogicalInstr::LoadColInt { col: 0 },
+            LogicalInstr::LoadCol { col: 0 },
             LogicalInstr::IntInSet { value_reg: Reg(0), set_idx: ConstIdx(0) },
             LogicalInstr::StrColConst {
                 op: CmpOp::Eq,

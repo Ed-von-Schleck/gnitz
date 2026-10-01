@@ -49,11 +49,10 @@ _FUNCTIONS = {
     # 2^53 + 1, and rounding an integer to more places changes nothing.
     "ROUND(i, 2)": [-7, 7, 9, 0, None, B, -1, 3],
     "FLOOR(i)": [-7, 7, 9, 0, None, B, -1, 3],
-    # One U64 argument is rotated to the head of the fold, which fixes the
-    # unsigned domain for every pair: `-1` is `u64::MAX` there, in either
-    # spelling, and it is the greatest.
-    "GREATEST(-1, 1, u)": [M] * 8,
-    "GREATEST(u, -1, 1)": [M] * 8,
+    # A U64 argument makes the result unsigned, where `-1` has no value: it is
+    # NULL in either spelling, and the fold skips it.
+    "GREATEST(-1, 1, u)": [5, M, 1, 7, 1, 1, 2, 3],
+    "GREATEST(u, -1, 1)": [5, M, 1, 7, 1, 1, 2, 3],
     "ABS(f)": [2.5, 2.5, 100.0, 0.0, None, 2.665, 2.675, F8],
     "FLOOR(f)": [-3.0, 2.0, 100.0, 0.0, None, 2.0, 2.0, 881469.0],
     "CEIL(f)": [-2.0, 3.0, 100.0, 0.0, None, 3.0, 3.0, 881470.0],

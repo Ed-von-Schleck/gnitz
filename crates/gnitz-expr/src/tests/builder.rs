@@ -7,9 +7,9 @@ use crate::{IntArithOp, LogicalInstr as L};
 #[test]
 fn the_builder_folds_identical_instructions_and_pool_entries() {
     let mut b = ExprBuilder::new();
-    let a = b.emit(L::LoadColInt { col: 1 });
-    assert_eq!(b.emit(L::LoadColInt { col: 1 }), a);
-    let c = b.emit(L::LoadColInt { col: 2 });
+    let a = b.emit(L::LoadCol { col: 1 });
+    assert_eq!(b.emit(L::LoadCol { col: 1 }), a);
+    let c = b.emit(L::LoadCol { col: 2 });
     assert_ne!(c, a);
     let sum = b.emit(L::IntArith { op: IntArithOp::Add, a, b: c });
     assert_eq!(b.emit(L::IntArith { op: IntArithOp::Add, a, b: c }), sum);
@@ -41,10 +41,10 @@ fn a_lift_over_a_constant_folds_to_a_float_constant() {
 
     // A lift over a computed register is untouched.
     let mut b = ExprBuilder::new();
-    let col = b.emit(L::LoadColInt { col: 1 });
+    let col = b.emit(L::LoadCol { col: 1 });
     let lifted = b.emit(L::IntToFloat { a: col });
     let prog = b.build(vec![Sink::Reg(lifted)]).expect("a well-formed program");
-    assert!(matches!(prog.instrs(), [L::LoadColInt { .. }, L::IntToFloat { .. }]));
+    assert!(matches!(prog.instrs(), [L::LoadCol { .. }, L::IntToFloat { .. }]));
 }
 
 /// A range check over a value already range-checked into the same type is that
@@ -54,7 +54,7 @@ fn a_lift_over_a_constant_folds_to_a_float_constant() {
 fn a_range_check_over_the_same_range_check_folds() {
     use gnitz_wire::FixedInt;
     let mut b = ExprBuilder::new();
-    let col = b.emit(L::LoadColInt { col: 1 });
+    let col = b.emit(L::LoadCol { col: 1 });
     let narrow = b.emit(L::IntCast { a: col, fi: FixedInt::I16 });
     assert_eq!(b.emit(L::IntCast { a: narrow, fi: FixedInt::I16 }), narrow);
     let narrower = b.emit(L::IntCast { a: narrow, fi: FixedInt::I8 });

@@ -86,8 +86,8 @@ impl TypeCode {
     }
 
     /// The type of the register image the engine materializes for a computed
-    /// value of this source type: any float lands as `F64` (`LoadColFloat`
-    /// widens `F32` on load), `U64` stays unsigned so a downstream compare
+    /// value of this source type: any float lands as `F64` (an `F32`
+    /// column widens on load), `U64` stays unsigned so a downstream compare
     /// re-seeds the unsigned variant, and every other integer normalizes to
     /// `I64`. A register sink stores that image whole, so a computed column typed
     /// any narrower would ship the low half of an `f64` or wrap a negative value
@@ -101,7 +101,7 @@ impl TypeCode {
     /// A temporal or decimal type also maps to itself: the register holds the
     /// 8-byte integer while the declared column keeps its name. A `DATE` slot is
     /// narrower than that register, so a sink into one is admitted only behind a
-    /// cast that range-checks the value into that width (`check_emit_slot`).
+    /// cast that range-checks the value into that width.
     #[inline]
     pub const fn register_image(self) -> TypeCode {
         match self {

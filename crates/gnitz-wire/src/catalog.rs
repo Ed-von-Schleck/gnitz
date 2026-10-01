@@ -309,7 +309,7 @@ pub const SYS_SCHEMA_DIGEST: u64 = {
 /// Carried by no blob — each rides a slot of an already-versioned container.
 /// Bumping it rejects both carriers of a stale one: a stored
 /// `CIRCUIT_NODES.params` cell, and an old client's live `ReadSpec` predicate.
-pub const EXPR_BLOB_VERSION: u8 = 6;
+pub const EXPR_BLOB_VERSION: u8 = 7;
 
 // ---------------------------------------------------------------------------
 // System table IDs

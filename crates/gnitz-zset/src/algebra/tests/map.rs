@@ -53,8 +53,8 @@ fn a_computed_map_copies_and_computes_every_row_at_its_weight() {
     let in_schema = make_schema(&[TypeCode::U64, TypeCode::I64, TypeCode::I64]);
     let prog = LogicalProgram::new(
         vec![
-            LogicalInstr::LoadColInt { col: 1 },
-            LogicalInstr::LoadColInt { col: 2 },
+            LogicalInstr::LoadCol { col: 1 },
+            LogicalInstr::LoadCol { col: 2 },
             LogicalInstr::IntArith {
                 op: IntArithOp::Add,
                 a: Reg(0),
@@ -675,9 +675,9 @@ fn map_ranges_bench() {
     let int3 = || {
         let prog = LogicalProgram::new(
             vec![
-                LogicalInstr::LoadColInt { col: 1 },
-                LogicalInstr::LoadColInt { col: 2 },
-                LogicalInstr::LoadColInt { col: 3 },
+                LogicalInstr::LoadCol { col: 1 },
+                LogicalInstr::LoadCol { col: 2 },
+                LogicalInstr::LoadCol { col: 3 },
                 arith(IntArithOp::Add, 0, 1),
                 arith(IntArithOp::Mul, 1, 2),
                 arith(IntArithOp::Sub, 2, 0),

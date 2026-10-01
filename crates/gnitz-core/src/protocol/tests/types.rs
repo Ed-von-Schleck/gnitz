@@ -667,8 +667,8 @@ fn the_shared_evaluator_reads_a_client_batch() {
     for (ci, col) in [(1, c1), (2, c2)] {
         let mut ev = LogicalProgram::new(
             vec![
-                LogicalInstr::LoadColInt { col: 3 },
-                LogicalInstr::LoadColInt { col: ci },
+                LogicalInstr::LoadCol { col: 3 },
+                LogicalInstr::LoadCol { col: ci },
                 LogicalInstr::IntArith {
                     op: IntArithOp::Add,
                     a: Reg(0),
@@ -694,7 +694,7 @@ fn filter_over_the_region_path() {
     // `bool_bits & !null_bits`), row 2 fails (-3000).
     let mut ev = LogicalProgram::new(
         vec![
-            LogicalInstr::LoadColInt { col: 2 },
+            LogicalInstr::LoadCol { col: 2 },
             LogicalInstr::LoadConst { val: 0, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         ],

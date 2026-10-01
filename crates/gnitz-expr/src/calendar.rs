@@ -225,6 +225,7 @@ pub(crate) fn days_to_micros(days: i64) -> (i64, bool) {
 /// Apply `op` to `v`, read as microseconds when `micros` and as days
 /// otherwise. Total: `ToMicros` yields `days_to_micros`'s value, whose overflow
 /// only the caller that wants the NULL asks about.
+#[inline(always)]
 pub(crate) fn eval(op: CalendarOp, v: i64, micros: bool) -> i64 {
     use CalendarOp as C;
     let (days, tod) = if micros {

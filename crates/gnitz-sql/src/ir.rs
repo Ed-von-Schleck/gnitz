@@ -1,6 +1,6 @@
 use gnitz_expr::CalendarOp;
 use gnitz_wire::decimal::MAX_DECIMAL_SCALE;
-use gnitz_wire::{ColType, ColumnDef, TypeCode};
+use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
 
 /// Both are instruction selectors, so the evaluator crate owns their
 /// definitions; the IR carries each verbatim rather than restating it.
@@ -343,6 +343,12 @@ pub(crate) fn unify_blend_type(a: ColType, b: ColType) -> ColType {
     }
 }
 
+/// Whether a value of type `t` is computed in a register the engine reads as a
+/// `u64`.
+pub(crate) fn reads_unsigned(t: ColType) -> bool {
+    t.register_image().tc == TypeCode::U64
+}
+
 /// Arithmetic with a temporal operand: a date or timestamp shifted by an
 /// integer keeps its type, and the difference of two is an integer — in
 /// microseconds when one of them is a TIMESTAMP. `None` for every other
@@ -577,6 +583,16 @@ impl<R> BExpr<R> {
         }
     }
 
+    /// Whether this value is never negative, so reading its register unsigned is
+    /// exact: an unsigned type, a non-negative integer literal, or NULL.
+    pub(crate) fn never_negative_with<F: Fn(&R) -> ColType>(&self, leaf_ty: &F) -> bool {
+        match self {
+            BExpr::LitInt(v) => *v >= 0,
+            BExpr::LitNull => true,
+            e => FixedInt::from_type_code(e.infer_ty_with(leaf_ty).tc).is_some_and(|fi| !fi.is_signed()),
+        }
+    }
+
     /// Whether the expression can never evaluate to NULL, parameterized over
     /// whether a leaf reference can and over its type. Each arm mirrors which
     /// engine kernels make a NULL of their own from non-NULL operands.
@@ -598,6 +614,11 @@ impl<R> BExpr<R> {
             }
             date && timestamp
         };
+        // Operands of a result read unsigned: lowering range-casts one that may
+        // be negative, which is NULL for a negative value.
+        let casts = |operands: &mut dyn Iterator<Item = &BExpr<R>>, blend: ColType| {
+            reads_unsigned(blend) && operands.fold(false, |any, e| any | !e.never_negative_with(leaf_ty))
+        };
         match self {
             BExpr::ColRef(r) => !leaf_nullable(r),
             BExpr::LitInt(_)
@@ -606,15 +627,33 @@ impl<R> BExpr<R> {
             | BExpr::LitWide(_)
             | BExpr::LitTemporal { .. } => true,
             BExpr::LitNull => false,
-            BExpr::BinOp(l, BinOp::Div | BinOp::Mod, r) => matches!(r.as_ref(), BExpr::LitInt(n) if *n != 0) && go(l),
+            BExpr::BinOp(l, BinOp::Div | BinOp::Mod, r) => {
+                let (lt, rt) = operand_ty_pair(l, r, leaf_ty);
+                matches!(r.as_ref(), BExpr::LitInt(n) if *n != 0)
+                    && go(l)
+                    && !casts(&mut [l.as_ref(), r.as_ref()].into_iter(), unify_blend_type(lt, rt))
+            }
             // A concatenation past `u32::MAX` bytes is NULL.
             BExpr::BinOp(_, BinOp::Concat, _) => false,
-            BExpr::BinOp(l, _, r) => go(l) && go(r) && !widens_a_date(&mut [l.as_ref(), r.as_ref()].into_iter()),
+            BExpr::BinOp(l, op, r) => {
+                let (lt, rt) = operand_ty_pair(l, r, leaf_ty);
+                // Temporal arithmetic is signed: an unsigned operand is range-cast.
+                let casts_unsigned = op.as_cmp().is_none()
+                    && (lt.tc.is_temporal() || rt.tc.is_temporal())
+                    && (reads_unsigned(lt) || reads_unsigned(rt));
+                go(l) && go(r) && !widens_a_date(&mut [l.as_ref(), r.as_ref()].into_iter()) && !casts_unsigned
+            }
             BExpr::Not(inner) => go(inner),
             BExpr::NullTest { .. } => true,
             BExpr::Case { branches, else_ } => {
                 let results = || branches.iter().map(|(_, result)| result).chain(else_.as_deref());
-                else_.is_some() && results().all(go) && !widens_a_date(&mut results())
+                else_.is_some()
+                    && results().all(go)
+                    && !widens_a_date(&mut results())
+                    && !casts(
+                        &mut results(),
+                        blend_type(&operand_tys(&results().collect::<Vec<_>>(), leaf_ty)),
+                    )
             }
             // The numeric kernels, LIKE and TRIM introduce no NULL of their own.
             BExpr::Func { arg, .. } | BExpr::Like { s: arg, .. } | BExpr::TrimCall { s: arg, .. } => go(arg),
@@ -623,10 +662,13 @@ impl<R> BExpr<R> {
                 let operands = || std::iter::once(inner.as_ref()).chain(items);
                 operands().all(go) && !widens_a_date(&mut operands())
             }
-            // GREATEST/LEAST skip a NULL argument, a DATE widened to one included.
+            // GREATEST/LEAST skip a NULL argument, a DATE widened or a negative
+            // value range-cast to one included.
             BExpr::MinMaxN { args, .. } => {
                 let widens = widens_a_date(&mut args.iter());
-                args.iter().any(|a| go(a) && !(widens && is(a, TypeCode::Date)))
+                let blend = blend_type(&operand_tys(&args.iter().collect::<Vec<_>>(), leaf_ty));
+                args.iter()
+                    .any(|a| go(a) && !(widens && is(a, TypeCode::Date)) && !casts(&mut std::iter::once(a), blend))
             }
             BExpr::StrCall { f, args } => !f.may_null(args.len()) && args.iter().all(go),
             // Text is a total rendering of any scalar; the other targets can refuse a value.

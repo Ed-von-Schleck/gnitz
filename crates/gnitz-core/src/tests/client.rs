@@ -99,7 +99,7 @@ fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
 fn the_overlay_replaces_committed_rows_with_the_last_buffered_op() {
     // `v > 15`, over the source schema's column indices.
     let mut b = gnitz_expr::ExprBuilder::new();
-    let c = b.emit(gnitz_expr::LogicalInstr::LoadColInt { col: 1 });
+    let c = b.emit(gnitz_expr::LogicalInstr::LoadCol { col: 1 });
     let k = b.emit(gnitz_expr::LogicalInstr::LoadConst { val: 15, unsigned: false });
     let cond = b.emit(gnitz_expr::LogicalInstr::Cmp { op: gnitz_expr::CmpOp::Gt, a: c, b: k });
     let over_15 = b.build(vec![gnitz_expr::Sink::Reg(cond)]).unwrap().to_blob_bytes();
