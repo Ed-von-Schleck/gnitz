@@ -641,10 +641,11 @@ read in the host's process at its last polled round: not read-your-own-writes,
 and two mirrors are no consistent cut; a relation the copy does not hold is
 delegated upstream. The copy lives in a **store** (`gnitz-mirror`) the host opens
 and attaches to a client; one store per data directory, refused by the engine's
-own `flock` in this process or any other. A store poisons on an ingest error and
-then refuses the reads it would have answered — and only those — until it is
-closed, which is the one recovery. Every client can mirror — the blocking one,
-the async one, and Python.
+own `flock` in this process or any other. An ingest error costs the one copy it
+hit, which bootstraps again. A store poisons when a copy may be torn — a teardown
+that failed, a panic mid-ingest — and then refuses the reads it would have
+answered — and only those — until it is closed, which is the one recovery. Every
+client can mirror — the blocking one, the async one, and Python.
 
 **A poll reports, per view, whether it reseeded** — discarded the copy and read
 the view whole. That is a discontinuity every subscriber has to react to, and no

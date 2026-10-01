@@ -546,7 +546,7 @@ impl GnitzClient {
     ///
     /// It takes an opened store rather than a directory, because opening one is
     /// the engine's job and this crate does not link it: a host writes
-    /// `client.attach_mirror(gnitz_mirror::Mirror::open(dir)?)?`, and the
+    /// `client.attach_mirror(gnitz_mirror::Mirror::open(dir, config)?)?`, and the
     /// dependency is the host's. The directory has no default — a derived one
     /// would collide on the engine's `flock`.
     ///

@@ -11,7 +11,7 @@
 //! A host opens one and hands it to a client:
 //!
 //! ```ignore
-//! client.attach_mirror(gnitz_mirror::Mirror::open(dir)?)?;
+//! client.attach_mirror(gnitz_mirror::Mirror::open(dir, MirrorConfig::from_env())?)?;
 //! client.mirror_view("public", "recent")?;
 //! ```
 //!
@@ -35,4 +35,5 @@
 mod handle;
 mod record;
 
-pub use handle::Mirror;
+pub use gnitz_store::relation::StoreConfig;
+pub use handle::{Mirror, MirrorConfig};

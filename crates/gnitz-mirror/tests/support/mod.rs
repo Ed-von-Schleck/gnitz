@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use gnitz_core::{GnitzClient, Schema, ZSetBatch};
 use gnitz_sql::SqlResult;
+use gnitz_store_testkit::{row_key, RowKey};
 
 pub mod common;
 
@@ -15,7 +16,7 @@ pub fn sql(client: &mut GnitzClient, schema: &str, statements: &str) {
 
 /// Run one `SELECT` and return `(schema, rows)`. Local-first: a client holding a
 /// valid copy of the relation answers off it.
-pub fn query(client: &mut GnitzClient, schema: &str, s: &str) -> (Arc<Schema>, ZSetBatch) {
+pub fn query(client: &mut GnitzClient, schema: &str, s: &str) -> Reply {
     let mut results = gnitz_sql::execute(client, schema, s).unwrap_or_else(|e| panic!("{s}: {e}"));
     assert_eq!(results.len(), 1, "{s} is not one statement");
     match results.remove(0) {
@@ -24,8 +25,8 @@ pub fn query(client: &mut GnitzClient, schema: &str, s: &str) -> (Arc<Schema>, Z
     }
 }
 
-/// One canonical row: its OPK image, then one cell per payload column.
-pub type Row = (Vec<u8>, Vec<Option<Vec<u8>>>);
+/// One `SELECT`'s reply: its schema and its rows.
+pub type Reply = (Arc<Schema>, ZSetBatch);
 
 /// The Z-set a reply denotes: `(OPK image, cells) → summed weight`, net-zero
 /// entries dropped.
@@ -36,9 +37,9 @@ pub type Row = (Vec<u8>, Vec<Option<Vec<u8>>>);
 /// **Weight-exact because that is what correctness means here.** A row-set
 /// comparison would accept a replicated view read as if it were keyed, which
 /// returns W copies and inflates every weight W-fold while replying OK.
-pub fn canonical(batch: &ZSetBatch) -> BTreeMap<Row, i64> {
-    let mut out: BTreeMap<Row, i64> = BTreeMap::new();
-    for (row, w) in canonical_rows(batch) {
+pub fn canonical(reply: &Reply) -> BTreeMap<RowKey, i64> {
+    let mut out: BTreeMap<RowKey, i64> = BTreeMap::new();
+    for (row, w) in canonical_rows(reply) {
         *out.entry(row).or_insert(0) += w;
     }
     out.retain(|_, w| *w != 0);
@@ -48,30 +49,17 @@ pub fn canonical(batch: &ZSetBatch) -> BTreeMap<Row, i64> {
 /// The same canonical rows **in reply order**, weights beside them — what an
 /// `ORDER BY` comparison needs, since the multiset above is order-blind and so
 /// accepts the right rows in the wrong order.
-pub fn canonical_rows(batch: &ZSetBatch) -> Vec<(Row, i64)> {
-    let mut out: Vec<(Row, i64)> = Vec::with_capacity(batch.weights.len());
-    for row in 0..batch.weights.len() {
-        let opk = batch.pks.get_bytes(row).to_vec();
-        let cells = batch
-            .payload
-            .iter()
-            .enumerate()
-            .map(|(pi, col)| {
-                if gnitz_wire::null_word_get(batch.nulls[row], pi) {
-                    return None;
-                }
-                let w = col.stride();
-                let cell = &col.bytes[row * w..(row + 1) * w];
-                Some(if col.tc().is_german_string() {
-                    gnitz_wire::german_string_content(cell, &batch.blob).to_vec()
-                } else {
-                    cell.to_vec()
-                })
-            })
-            .collect();
-        out.push(((opk, cells), batch.weights[row]));
-    }
-    out
+pub fn canonical_rows((schema, batch): &Reply) -> Vec<(RowKey, i64)> {
+    (0..batch.weights.len())
+        .map(|row| (row_key(batch, schema.as_ref(), row), batch.weights[row]))
+        .collect()
+}
+
+/// `f`'s result, and how many requests it sent through `client`.
+pub fn cost<T>(client: &mut GnitzClient, f: impl FnOnce(&mut GnitzClient) -> T) -> (T, u64) {
+    let before = client.requests_sent();
+    let out = f(client);
+    (out, client.requests_sent() - before)
 }
 
 /// Where a read through a mirroring client must be answered.
@@ -101,9 +89,7 @@ pub fn differential(
     sql_text: &str,
     answer: Answer,
 ) -> usize {
-    let before = mirror.requests_sent();
-    let local = query(mirror, schema, sql_text);
-    let sent = mirror.requests_sent() - before;
+    let (local, sent) = cost(mirror, |m| query(m, schema, sql_text));
     match answer {
         Answer::Local => assert_eq!(sent, 0, "{sql_text}: must be answered off the copy"),
         Answer::Upstream => assert!(sent > 0, "{sql_text}: must be delegated, not answered off a copy"),
@@ -111,15 +97,15 @@ pub fn differential(
     let remote = query(server, schema, sql_text);
     assert_eq!(local.0, remote.0, "{sql_text}: the two replies have different schemas");
     if sql_text.contains("ORDER BY") {
-        assert_same_sequence(sql_text, &local.1, &remote.1)
+        assert_same_sequence(sql_text, &local, &remote)
     } else {
-        assert_same_zset(sql_text, &local.1, &remote.1)
+        assert_same_zset(sql_text, &local, &remote)
     }
 }
 
 /// Assert two replies denote the same Z-set, naming the first difference, and
 /// refuse a vacuous pass: two empty replies agree about nothing.
-fn assert_same_zset(what: &str, a: &ZSetBatch, b: &ZSetBatch) -> usize {
+fn assert_same_zset(what: &str, a: &Reply, b: &Reply) -> usize {
     let (ca, cb) = (canonical(a), canonical(b));
     assert!(
         !(ca.is_empty() && cb.is_empty()),
@@ -143,7 +129,7 @@ fn assert_same_zset(what: &str, a: &ZSetBatch, b: &ZSetBatch) -> usize {
 
 /// Assert two replies are the same rows in the same order, and refuse the
 /// vacuous pass.
-fn assert_same_sequence(what: &str, a: &ZSetBatch, b: &ZSetBatch) -> usize {
+fn assert_same_sequence(what: &str, a: &Reply, b: &Reply) -> usize {
     let (ra, rb) = (canonical_rows(a), canonical_rows(b));
     assert!(
         !ra.is_empty(),

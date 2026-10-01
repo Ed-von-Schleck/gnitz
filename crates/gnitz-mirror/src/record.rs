@@ -21,12 +21,12 @@ pub(crate) struct MirrorRecord {
 impl MirrorRecord {
     /// The bytes a copy's manifest carries for it.
     pub(crate) fn encode(&self) -> Vec<u8> {
+        // Round 0 is no cursor here as on the wire, where it asks for a bootstrap.
+        let (tag, tick) = self.cursor.map_or((0, 0), |c| (c.tag, c.tick.get()));
         let mut w = Writer::new();
-        w.bool(self.cursor.is_some());
-        if let Some(c) = self.cursor {
-            w.u64(c.tag).u64(c.tick.get());
-        }
-        w.bytes32(self.schema_name.as_bytes())
+        w.u64(tag)
+            .u64(tick)
+            .bytes32(self.schema_name.as_bytes())
             .bytes32(self.name.as_bytes())
             .bytes32(&self.block);
         w.into_vec()
@@ -36,14 +36,8 @@ impl MirrorRecord {
     /// [`Self::encode`] did not produce, or whose block describes no layout.
     pub(crate) fn decode(bytes: &[u8]) -> Option<(Self, SchemaDescriptor)> {
         let rec = decode_all(bytes, "mirror record", |r| {
-            let cursor = match r.bool()? {
-                false => None,
-                true => {
-                    let tag = r.u64()?;
-                    let tick = NonZeroU64::new(r.u64()?).ok_or_else(|| "a cursor at round 0".to_string())?;
-                    Some(DeltaCursor { tag, tick })
-                }
-            };
+            let (tag, tick) = (r.u64()?, r.u64()?);
+            let cursor = NonZeroU64::new(tick).map(|tick| DeltaCursor { tag, tick });
             let text = |r: &mut Reader| String::from_utf8(r.bytes32()?.to_vec()).map_err(|e| e.to_string());
             Ok(MirrorRecord {
                 cursor,

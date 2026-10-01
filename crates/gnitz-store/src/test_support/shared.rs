@@ -5,6 +5,7 @@
 
 use proptest::prelude::*;
 
+use gnitz_expr::RowSource;
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts};
 use gnitz_store::storage::{Batch, BatchBuilder, Layout};
 use gnitz_wire::TypeCode;
@@ -181,31 +182,31 @@ pub fn scratch_dir(scope: &str, name: &str) -> String {
 /// A row's logical identity: its PK bytes plus one entry per payload column.
 pub type RowKey = (Vec<u8>, Vec<Option<Vec<u8>>>);
 
-/// Reduce a row to its logical identity. NULL is `None`, distinct from an empty
-/// string `Some(vec![])` — keeping the raw null word out of the key, so its
-/// non-load-bearing unused bits cannot cause a spurious mismatch while every
-/// meaningful null bit is still reflected. STRING / BLOB cells are **decoded**:
+/// Reduce a row of any source — an engine batch or a client reply — to its
+/// logical identity. NULL is `None`, distinct from an empty string
+/// `Some(vec![])` — keeping the raw null word out of the key, so its unused bits
+/// cannot cause a spurious mismatch while every meaningful null bit is still
+/// reflected. STRING / BLOB cells are **decoded**:
 /// the 16-byte German-string struct embeds a blob offset, so two batches holding
 /// the same logical string carry different struct bytes.
-pub fn row_key(batch: &Batch, schema: &SchemaDescriptor, row: usize) -> RowKey {
-    let nw = batch.get_null_word(row);
-    let vals = schema
-        .payload_columns()
-        .map(|(pi, col)| {
+pub fn row_key<S: RowSource>(src: &S, schema: &(impl SchemaFacts + ?Sized), row: usize) -> RowKey {
+    let nw = src.get_null_word(row);
+    let vals = (0..schema.num_payload_cols())
+        .map(|pi| {
             if gnitz_wire::null_word_get(nw, pi) {
                 return None;
             }
-            let cs = col.size() as usize;
-            let raw = batch.get_col_ptr(row, pi, cs);
-            Some(if col.type_code.is_german_string() {
+            let tc = schema.col_type_code(schema.payload_col_idx(pi));
+            let raw = src.get_col_ptr(row, pi, tc.wire_stride());
+            Some(if tc.is_german_string() {
                 let st: [u8; 16] = raw.try_into().unwrap();
-                gnitz_wire::try_decode_german_string(&st, batch.blob()).unwrap()
+                gnitz_wire::try_decode_german_string(&st, src.blob()).unwrap()
             } else {
                 raw.to_vec()
             })
         })
         .collect();
-    (batch.get_pk_bytes(row).to_vec(), vals)
+    (src.get_pk_bytes(row).to_vec(), vals)
 }
 
 // ── Helpers `gnitz-server`'s own tests share ──────────────────────────────

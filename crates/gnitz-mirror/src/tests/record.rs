@@ -1,22 +1,15 @@
 //! The record codec: what a round trip preserves, and what bytes it refuses.
 
-use gnitz_core::Schema;
-use gnitz_wire::{ColumnDef, TypeCode};
+use gnitz_store::schema::encode_schema_block;
+use gnitz_store_testkit::make_schema_u64_i64;
 
 use super::*;
 
 fn record(cursor: Option<DeltaCursor>) -> MirrorRecord {
-    let schema = Schema {
-        columns: vec![
-            ColumnDef::new("id", TypeCode::U64, false),
-            ColumnDef::new("v", TypeCode::I64, true),
-        ],
-        pk_cols: vec![0],
-    };
     MirrorRecord {
         schema_name: "public".to_string(),
         name: "recent".to_string(),
-        block: schema.to_block(),
+        block: encode_schema_block(&make_schema_u64_i64()),
         cursor,
     }
 }
@@ -28,19 +21,18 @@ fn one_cursor() -> Option<DeltaCursor> {
     })
 }
 
-/// A registration round-trips with its cursor, and one with no feed position
-/// comes back with none rather than as a cursor at round 0 — which the next poll
-/// would answer off a copy the gate is there to refuse.
+/// A registration round-trips with its cursor and decodes to the layout its
+/// block describes; one with no feed position comes back with none.
 #[test]
 fn a_record_round_trips() {
     for cursor in [one_cursor(), None] {
         let rec = record(cursor);
-        assert_eq!(MirrorRecord::decode(&rec.encode()).map(|(r, _)| r), Some(rec));
+        assert_eq!(MirrorRecord::decode(&rec.encode()), Some((rec, make_schema_u64_i64())));
     }
 }
 
 #[test]
-fn bytes_encode_did_not_produce_are_refused() {
+fn bytes_that_are_no_record_are_refused() {
     let good = record(one_cursor()).encode();
     let mut refused: Vec<(String, Vec<u8>)> = (0..good.len())
         .map(|cut| (format!("cut at {cut}"), good[..cut].to_vec()))
@@ -48,13 +40,10 @@ fn bytes_encode_did_not_produce_are_refused() {
     let mut overlong = good.clone();
     overlong.push(0);
     refused.push(("a trailing byte".into(), overlong));
-    let mut flag = good.clone();
-    flag[0] = 2;
-    refused.push(("an unknown cursor flag".into(), flag));
-    // The flag byte, then the tag, then the tick.
-    let mut round_0 = good.clone();
-    round_0[9..17].fill(0);
-    refused.push(("a cursor at round 0".into(), round_0));
+    let mut name = good.clone();
+    let at = name.windows(6).position(|w| w == b"recent").unwrap();
+    name[at] = 0xFF;
+    refused.push(("a name that is not UTF-8".into(), name));
     let no_layout = MirrorRecord {
         block: vec![0xAB; 20],
         ..record(one_cursor())

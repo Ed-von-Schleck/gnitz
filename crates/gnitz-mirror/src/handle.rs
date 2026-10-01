@@ -18,9 +18,35 @@ use gnitz_wire::ViewProps;
 
 use crate::record::{descriptor_of_block, MirrorRecord};
 
-/// Applied delta bytes after which an apply drives a checkpoint of its own.
-/// `GNITZ_MIRROR_CHECKPOINT_BYTES` overrides it.
-const DEFAULT_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
+/// What a store is sized by. `Default` is the production value of every field.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MirrorConfig {
+    /// The tuning of the engine stores behind the copies.
+    pub store: StoreConfig,
+    /// Applied delta bytes after which an apply drives a checkpoint of its own.
+    pub checkpoint_bytes: usize,
+}
+
+impl Default for MirrorConfig {
+    fn default() -> Self {
+        MirrorConfig {
+            store: StoreConfig::default(),
+            checkpoint_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl MirrorConfig {
+    /// Every field from its `GNITZ_MIRROR_*` override — [`StoreConfig::from_env`]'s
+    /// three under that prefix, and `GNITZ_MIRROR_CHECKPOINT_BYTES` — each falling
+    /// back to [`Default`].
+    pub fn from_env() -> Self {
+        MirrorConfig {
+            store: StoreConfig::from_env("GNITZ_MIRROR_"),
+            checkpoint_bytes: env_num("GNITZ_MIRROR_CHECKPOINT_BYTES", Self::default().checkpoint_bytes),
+        }
+    }
+}
 
 /// `GNITZ_INJECT_MIRROR_INGEST_PANIC`: panic once on an advance, idle polls
 /// included. A panic rather than an `Err`: nothing else reaches
@@ -54,9 +80,9 @@ unsafe impl Send for Mirror {}
 impl Mirror {
     /// Open (or create) a store at `base_dir`. Fails if another store, in this
     /// process or another, holds it.
-    pub fn open(base_dir: &str) -> Result<Self, MirrorError> {
+    pub fn open(base_dir: &str, config: MirrorConfig) -> Result<Self, MirrorError> {
         let dir_lock = lock_data_dir(base_dir).map_err(MirrorError::Engine)?;
-        let registry = RelationRegistry::new(base_dir, Slot::SOLO, StoreConfig::from_env("GNITZ_MIRROR_"));
+        let registry = RelationRegistry::new(base_dir, Slot::SOLO, config.store);
         let persisted = registry.persisted_records().map_err(MirrorError::Engine)?;
         let mut mirror = Mirror {
             registry,
@@ -64,7 +90,7 @@ impl Mirror {
             _dir_lock: dir_lock,
             poison: None,
             applied_bytes: 0,
-            checkpoint_bytes: env_num("GNITZ_MIRROR_CHECKPOINT_BYTES", DEFAULT_CHECKPOINT_BYTES),
+            checkpoint_bytes: config.checkpoint_bytes,
         };
         let mut all_reopened = true;
         for (tid, record) in persisted {
@@ -73,7 +99,7 @@ impl Mirror {
                 Ok(Some((rec, schema))) => mirror.registry.reopen_view(copy_spec(tid, schema)).map(|()| {
                     mirror.records.insert(tid, rec);
                 }),
-                // Damage: the sweep below removes the directory.
+                // Not a record this store wrote; the directory is the orphan sweep's.
                 Ok(None) => continue,
                 Err(e) => Err(e),
             };

@@ -14,7 +14,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use gnitz_core::{ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, ScanReply, Schema};
-use gnitz_mirror::Mirror;
+use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_sql::SqlResult;
 use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec};
 use gnitz_wire::{TableProps, ViewProps, WireConflictMode};
@@ -392,7 +392,9 @@ impl PyGnitzClient {
     /// does closing the client.
     pub fn mirror_at(&mut self, py: Python<'_>, base_dir: &str) -> PyResult<()> {
         let base_dir = base_dir.to_string();
-        self.call(py, move |c| c.attach_mirror(Mirror::open(&base_dir)?))
+        self.call(py, move |c| {
+            c.attach_mirror(Mirror::open(&base_dir, MirrorConfig::from_env())?)
+        })
     }
 
     /// mirror_view(name) -> PollResult

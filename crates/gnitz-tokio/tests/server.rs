@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gnitz_core::{BatchAppender, ClientError, GnitzClient, PkColumn, PollResult, Schema, ZSetBatch};
-use gnitz_mirror::Mirror;
+use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
 use gnitz_wire::{read_i64_le, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, ViewProps, WireConflictMode};
 use support::settled;
@@ -227,7 +227,7 @@ fn clones_share_one_blocking_client() {
 
             // One clone mirrors the view; every other reads off that copy.
             let dir = tempfile::tempdir().unwrap();
-            let store = Mirror::open(dir.path().to_str().unwrap()).unwrap();
+            let store = Mirror::open(dir.path().to_str().unwrap(), MirrorConfig::default()).unwrap();
             let name = sn.clone();
             let mirrored = client
                 .clone()
