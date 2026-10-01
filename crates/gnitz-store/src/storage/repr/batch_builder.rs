@@ -144,7 +144,7 @@ impl BatchBuilder {
     pub fn end_row(&mut self) {
         // Nothing else notices a row that skipped a column: the count still
         // advances and the short region keeps whatever bytes were there.
-        debug_assert_eq!(
+        assert_eq!(
             self.curr_col,
             self.schema().num_payload_cols(),
             "BatchBuilder row got {} of {} payload columns",

@@ -165,7 +165,8 @@ pub struct Batch {
     offsets: [usize; MAX_BATCH_REGIONS],
     strides: [u8; MAX_BATCH_REGIONS],
     capacity: usize,
-    /// Live row count; [`Batch::len`] outside the crate.
+    /// Live row count; [`Batch::len`] outside the crate. Not `pub`: a counted
+    /// row whose regions were not all written reads uninitialised arena bytes.
     pub(crate) count: usize,
     /// Cached row-layout claim (private; mutated only through the layout API).
     /// Fresh batches default to `Raw` — a forgotten raise degrades to a safe

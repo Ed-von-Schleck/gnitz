@@ -1,9 +1,8 @@
 //! The read rung — the `ReadSpec` executor and the store read verbs, as
 //! `impl RelationRegistry` blocks over `relation` and `ops`.
 //!
-//! It is a rung of its own because it names the operator layer — `AdhocFold` in
-//! `scan_spec` — which `relation` may not. One symbol, but it is what puts
-//! `read` above `ops`.
+//! It is a rung of its own because it names the operator layer — the fold and
+//! map plans `scan_spec` runs — which `relation` may not.
 //!
 //! Nothing here reaches a `CatalogEngine` or a `DagEngine`: those are in
 //! `gnitz-server`, which depends on this crate, so the direction is the crate

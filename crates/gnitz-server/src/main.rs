@@ -25,18 +25,8 @@
 #[macro_use]
 extern crate gnitz_foundation;
 
-// Declared *above* `#[macro_use] mod fatal;`, and that ordering is the whole
-// enforcement: `gnitz_fatal_abort!` is not in scope for anything before it, so
-// nothing under `catalog/` or `query/` can end the calling process. Every
-// fallible path there returns its error instead. `tests/rungs.rs` asserts it.
 mod catalog;
 mod query;
-
-// Before `mod runtime;`, which invokes `gnitz_fatal_abort!` unqualified:
-// `#[macro_use] mod` reaches only the code that follows the item.
-#[macro_use]
-mod fatal;
-
 mod runtime;
 
 use gnitz_foundation::log::Level;

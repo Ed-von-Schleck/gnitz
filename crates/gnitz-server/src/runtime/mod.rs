@@ -18,6 +18,10 @@
 // below are what `crate::runtime::<mod>` resolves through — no path names the
 // grouping directory. There is no syscall tier: every syscall lives in the
 // module holding the protocol or policy it serves.
+// First: `#[macro_use]` reaches only the submodules declared after it.
+#[macro_use]
+mod fatal;
+
 mod affinity;
 mod bootstrap;
 mod listen;

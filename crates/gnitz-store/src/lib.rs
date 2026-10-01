@@ -42,15 +42,10 @@ pub mod storage;
 #[cfg(test)]
 mod test_rng;
 
-/// Tests no single module owns: the rung guard over `relation/` and `read/`.
+/// Tests no single module owns: the rung guard over the module roots above.
 #[cfg(test)]
 #[path = "tests/rungs.rs"]
 mod rung_tests;
-
-/// Tests no single module owns: the guard that no other crate writes a row count.
-#[cfg(test)]
-#[path = "tests/row_count.rs"]
-mod row_count_tests;
 
 // `test_support::shared` is compiled here and again as `gnitz-store-testkit` —
 // from one source, which spells every path `gnitz_store::`. This alias is what

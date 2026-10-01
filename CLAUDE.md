@@ -397,8 +397,8 @@ circuit passes `None` for. The crate graph is what stops that host linking a
 compiler. Each side of the seam is one crate, so the ladder among the rungs
 within a side is pinned by a source-text test over a declared table rather than
 by the graph — one such table per crate, over the same walk. `catalog` and
-`query` also carry a second guard: neither may name `gnitz_fatal_abort!`, which
-the crate root enforces by declaring them before the module that defines it.
+`query` also cannot end the process: `gnitz_fatal_abort!` is private to
+`runtime`, so every fallible path in them returns its error.
 
 Each subsystem's `mod.rs` header states its own surface, its internal split, and
 what is deliberately closed off. Read that rather than a summary here.
