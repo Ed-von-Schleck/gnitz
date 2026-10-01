@@ -152,7 +152,7 @@ impl Cell<'_> {
 /// its PK the row's 1-based position, its payload the entry's cells.
 pub(crate) fn batch_of(schema: &Schema, rows: &[&[Cell]]) -> ZSetBatch {
     let mut b = ZSetBatch::new(schema);
-    let mut app = BatchAppender::new(&mut b, schema);
+    let mut app = BatchAppender::new(&mut b);
     for (r, cells) in rows.iter().enumerate() {
         app.add_row(r as u128 + 1, 1);
         for cell in *cells {

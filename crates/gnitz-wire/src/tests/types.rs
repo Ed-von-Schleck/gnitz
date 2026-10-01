@@ -40,7 +40,7 @@ fn type_predicates_partition_the_type_table() {
         assert_eq!(tc.is_german_string(), german, "is_german_string({tc:?})");
         assert_eq!(tc.is_wide_int(), wide, "is_wide_int({tc:?})");
         assert_eq!(tc.is_pk_eligible(), pk, "is_pk_eligible({tc:?})");
-        assert_eq!(tc.is_serial_eligible(), serial, "is_serial_eligible({tc:?})");
+        assert_eq!(FixedInt::exact(tc).is_some(), serial, "FixedInt::exact({tc:?})");
     }
 }
 
@@ -267,14 +267,14 @@ fn every_accepted_join_key_pair_copartitions() {
     }
 }
 
-/// The PK admission rule, one refusal per rule, and the stride it returns.
+/// The PK admission rule, one refusal per rule.
 #[test]
 fn validate_pk_tuple_names_each_rule() {
     use TypeCode::*;
     // (type, nullable) per column.
     let cols = [(U64, false), (I32, false), (String, false), (F64, false), (I64, true)];
     let check = |pk: &[u32], max| validate_pk_tuple(pk, cols.len(), max, |c| cols[c as usize]);
-    assert_eq!(check(&[0, 1], 4), Ok(12));
+    assert_eq!(check(&[0, 1], 4), Ok(()));
     for (pk, max, want) in [
         (&[][..], 4, PkRule::Empty),
         (&[0, 1], 1, PkRule::TooManyColumns { count: 2, max: 1 }),

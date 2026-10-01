@@ -346,7 +346,7 @@ pub(crate) fn decimal_compute_type(op: BinOp, lt: ColType, rt: ColType) -> ColTy
         // Neither has a scale of its own: truncating a quotient to one would
         // make `1 / 3.0` read `0.3`.
         BinOp::Div | BinOp::Pow => ColType::of(TypeCode::F64),
-        BinOp::Mul => ColType::decimal(lt.scale + rt.scale),
+        BinOp::Mul => ColType::decimal(lt.scale.saturating_add(rt.scale)),
         _ => blend,
     }
 }

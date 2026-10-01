@@ -4,7 +4,7 @@ use crate::connection::{
 };
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
-use crate::{sys_schema, BatchAppender, FkTarget, PkColumn, ProtocolError, PushFamily, Schema, ZSetBatch};
+use crate::{sys_schema, BatchAppender, PkColumn, ProtocolError, PushFamily, Schema, ZSetBatch};
 use gnitz_expr::{ColumnTable, SchemaFacts};
 use gnitz_wire::{ColumnDef, PkBuf, WireConflictMode};
 use gnitz_wire::{WireFault, WireStatus};
@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gnitz_expr::{payload_bytes, payload_is_null, payload_u64, LogicalProgram, RowFilter};
-use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow, ViewTabRow};
+use gnitz_wire::sys_rows::{ColTabRow, FkRef, IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::txn_frame::{DeltaPollItem, BLIND};
 use gnitz_wire::{Circuit, ComputeMap, ReadBound, ReadSink, ReadSpec};
 use gnitz_wire::{
@@ -97,6 +97,24 @@ pub const RMW_MAX_ATTEMPTS: usize = 4;
 pub struct InlineUniqueIndex {
     pub col_indices: Vec<u32>,
     pub name: String,
+}
+
+/// The column a FOREIGN KEY column references. `SelfTable` names the table
+/// being created, which has no id yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FkTarget {
+    Table(FkRef),
+    SelfTable { col: u32 },
+}
+
+impl FkTarget {
+    /// The referenced column, once the table being created has the id `own_id`.
+    fn resolve(self, own_id: u64) -> FkRef {
+        match self {
+            FkTarget::Table(fk) => fk,
+            FkTarget::SelfTable { col } => FkRef { table_id: own_id, col },
+        }
+    }
 }
 
 /// One FOREIGN KEY column of a `CREATE TABLE`.
@@ -529,7 +547,7 @@ impl GnitzClient {
         let idx_schema = sys_schema(IDX_TAB);
         let mut batch = ZSetBatch::new(idx_schema);
         gnitz_wire::sys_rows::write_idx_tab_row(
-            &mut BatchAppender::new(&mut batch, idx_schema),
+            &mut BatchAppender::new(&mut batch),
             &IdxTabRow {
                 index_id,
                 owner_id: table_id,
@@ -611,9 +629,14 @@ impl GnitzClient {
         let mut out = Vec::new();
         for i in idx_batch.live_rows() {
             let name = col_str(&idx_batch, IDXTAB_PAY_NAME, i)?.to_string();
-            let cols = gnitz_wire::unpack_pk_cols(payload_u64(&idx_batch, i, IDXTAB_PAY_SOURCE_COLS))
-                .map_err(|rule| ProtocolError::DecodeError(format!("index '{name}': {rule}")))?;
-            out.push((idx_batch.pks.get(sys_schema(IDX_TAB), i) as u64, name, cols));
+            let cols =
+                gnitz_wire::unpack_pk_cols(payload_u64(&idx_batch, i, IDXTAB_PAY_SOURCE_COLS)).map_err(|rule| {
+                    ProtocolError::DecodeError(format!(
+                        "index '{name}': {}",
+                        rule.for_role(gnitz_wire::PkListRole::ColumnList)
+                    ))
+                })?;
+            out.push((idx_batch.pks.get(i) as u64, name, cols));
         }
         Ok(out)
     }
@@ -757,8 +780,7 @@ impl GnitzClient {
         let Some((_, b)) = families.iter().find(|(family, _)| *family == VIEW_TAB) else {
             return;
         };
-        let s = sys_schema(VIEW_TAB);
-        let vid = |i| b.pks.get(s, i) as u64;
+        let vid = |i| b.pks.get(i) as u64;
         let mut dropped: Vec<u64> = Vec::new();
         let mut renamed: Vec<(String, String, Arc<RelDescriptor>)> = Vec::new();
         for v in (0..b.len()).filter(|&i| b.weights[i] < 0).map(vid) {
@@ -791,7 +813,7 @@ impl GnitzClient {
         let schema = sys_schema(SCHEMA_TAB);
         let mut batch = ZSetBatch::new(schema);
         gnitz_wire::sys_rows::write_schema_tab_row(
-            &mut BatchAppender::new(&mut batch, schema),
+            &mut BatchAppender::new(&mut batch),
             &gnitz_wire::sys_rows::SchemaTabRow { schema_id: new_sid, name: &name },
             1,
         );
@@ -828,7 +850,7 @@ impl GnitzClient {
         // family keeps exactly one writer.
         let mut sb = ZSetBatch::new(schema_s);
         gnitz_wire::sys_rows::write_schema_tab_row(
-            &mut BatchAppender::new(&mut sb, schema_s),
+            &mut BatchAppender::new(&mut sb),
             &gnitz_wire::sys_rows::SchemaTabRow { schema_id, name: &name },
             -1,
         );
@@ -878,6 +900,21 @@ impl GnitzClient {
             })
             .map_err(|e| ClientError::from(format!("create_table: {e}")))?;
 
+        for (j, fk) in fks.iter().enumerate() {
+            let ci = fk.col_idx;
+            if ci as usize >= schema.columns.len() {
+                return Err(ClientError::from(format!(
+                    "create_table: foreign key names column {ci}, past the table's {} columns",
+                    schema.columns.len()
+                )));
+            }
+            if fks[..j].iter().any(|prev| prev.col_idx == ci) {
+                return Err(ClientError::from(format!(
+                    "create_table: column {ci} carries more than one foreign key"
+                )));
+            }
+        }
+
         for spec in unique_indexes {
             // Structural rules only (arity, in-range, no duplicates) — unlike a
             // PK, an indexed column may be nullable. They are `pack_pk_cols`'s
@@ -899,18 +936,13 @@ impl GnitzClient {
         // ingests columns before the TABLE_TAB register hook that reads them.
         let col_s = sys_schema(COL_TAB);
         let mut col_batch = ZSetBatch::new(col_s);
-        append_col_rows(
-            &mut BatchAppender::new(&mut col_batch, col_s),
-            new_tid,
-            &schema.columns,
-            fks,
-        );
+        append_col_rows(&mut BatchAppender::new(&mut col_batch), new_tid, &schema.columns, fks);
 
         // TABLE_TAB family.
         let tbl_schema = sys_schema(TABLE_TAB);
         let mut tb = ZSetBatch::new(tbl_schema);
         gnitz_wire::sys_rows::write_table_tab_row(
-            &mut BatchAppender::new(&mut tb, tbl_schema),
+            &mut BatchAppender::new(&mut tb),
             &TableTabRow {
                 table_id: new_tid,
                 schema_id,
@@ -926,7 +958,7 @@ impl GnitzClient {
             let idx_schema = sys_schema(IDX_TAB);
             let mut idx_batch = ZSetBatch::new(idx_schema);
             {
-                let mut a = BatchAppender::new(&mut idx_batch, idx_schema);
+                let mut a = BatchAppender::new(&mut idx_batch);
                 for (k, spec) in unique_indexes.iter().enumerate() {
                     gnitz_wire::sys_rows::write_idx_tab_row(
                         &mut a,
@@ -1013,7 +1045,7 @@ impl GnitzClient {
         // Only the user-named view: the engine cascades its segments.
         let replaced = match replace {
             Some(vid) => {
-                Some(self.seek_sys_row(VIEW_TAB, vid as u128, || not_found("view", &schema_name, &view_name))?)
+                Some(self.seek_sys_row(VIEW_TAB, &[vid as u128], || not_found("view", &schema_name, &view_name))?)
             }
             None => None,
         };
@@ -1047,9 +1079,9 @@ impl GnitzClient {
         }
 
         {
-            let mut col_a = BatchAppender::new(&mut col_batch, col_s);
-            let mut nodes_a = BatchAppender::new(&mut nodes_batch, nodes_s);
-            let mut view_a = BatchAppender::new(&mut view_batch, view_s);
+            let mut col_a = BatchAppender::new(&mut col_batch);
+            let mut nodes_a = BatchAppender::new(&mut nodes_batch);
+            let mut view_a = BatchAppender::new(&mut view_batch);
 
             let ViewBundle { segments, view } = bundle;
             let views = segments.into_iter().map(|pv| (pv, false)).chain([(view, true)]);
@@ -1140,7 +1172,7 @@ impl GnitzClient {
                 }
                 return Err(not_found(noun, &schema_name, raw));
             };
-            let id = scanned.pks.get(s, i) as u64;
+            let id = scanned.pks.get(i) as u64;
             if !retired.contains(&id) {
                 retired.push(id);
                 batch.copy_row_at(&scanned, i, -1);
@@ -1181,7 +1213,7 @@ impl GnitzClient {
         let Some(desc) = self.resolve(schema_name, name)? else {
             return Ok(None);
         };
-        self.seek_sys_row(family, desc.tid as u128, || not_found(noun, schema_name, name))
+        self.seek_sys_row(family, &[desc.tid as u128], || not_found(noun, schema_name, name))
             .map(Some)
     }
 
@@ -1192,7 +1224,7 @@ impl GnitzClient {
         let family = if rel.class.is_view() { VIEW_TAB } else { TABLE_TAB };
         self.rewrite_sys_row(
             family,
-            tid as u128,
+            &[tid as u128],
             || absent(format!("relation {tid} not found")),
             |b, row| b.set_string_cell(row, RELTAB_PAY_NAME, &new_name),
         )
@@ -1225,13 +1257,12 @@ impl GnitzClient {
         let col_s = sys_schema(COL_TAB);
         let mut cb = ZSetBatch::new(col_s);
         {
-            let mut a = BatchAppender::new(&mut cb, col_s);
+            let mut a = BatchAppender::new(&mut cb);
             let row = ColTabRow {
                 owner_id: tid,
                 col_idx: col_idx as u64,
                 col: def,
-                fk_table_id: 0,
-                fk_col_idx: 0,
+                fk: None,
             };
             gnitz_wire::sys_rows::write_col_tab_row(&mut a, &row, 1);
         }
@@ -1248,7 +1279,7 @@ impl GnitzClient {
     ) -> Result<(), ClientError> {
         self.rewrite_sys_row(
             COL_TAB,
-            tid as u128 | (col_idx as u128) << 64,
+            &[tid as u128, col_idx as u128],
             || absent(format!("column index {col_idx} not found on table {tid}")),
             patch,
         )
@@ -1259,7 +1290,7 @@ impl GnitzClient {
     fn rewrite_sys_row(
         &mut self,
         family: u64,
-        key: u128,
+        key: &[u128],
         missing: impl FnOnce() -> ClientError,
         patch: impl FnOnce(&mut ZSetBatch, usize),
     ) -> Result<(), ClientError> {
@@ -1318,18 +1349,20 @@ impl GnitzClient {
             .batch)
     }
 
-    /// The live `family` row keyed `key`, by one master-local keyed read: the
+    /// The live `family` row keyed `key` — its PK columns' native values in
+    /// PK-list order — by one master-local keyed read: the
     /// reply batch and the row's index in it, for a caller to copy the stored row
     /// out of. `PkSet` is exact, so a live row in the reply is that key's; none is
     /// `missing()`.
     fn seek_sys_row(
         &mut self,
         family: u64,
-        key: u128,
+        key: &[u128],
         missing: impl FnOnce() -> ClientError,
     ) -> Result<(ZSetBatch, usize), ClientError> {
-        let keys = PkColumn::from_natives(sys_schema(family), [key]).keys();
-        let batch = self.sys_rows(family, ReadBound::PkSet(keys))?;
+        let mut keys = PkColumn::empty_for_schema(sys_schema(family));
+        keys.push_natives(key);
+        let batch = self.sys_rows(family, ReadBound::PkSet(keys.keys()))?;
         let i = batch.live_rows().next().ok_or_else(missing)?;
         Ok((batch, i))
     }
@@ -1417,6 +1450,9 @@ impl TxnBuffer {
         mode: WireConflictMode,
         basis: u64,
     ) -> Result<(), ClientError> {
+        batch
+            .layout_matches(schema)
+            .map_err(|e| ClientError::from(format!("relation {tid}: the batch is not in its schema's layout: {e}")))?;
         if batch.is_empty() {
             return Ok(());
         }
@@ -1544,7 +1580,7 @@ impl TxnBuffer {
 fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<Option<u64>, ClientError> {
     for i in batch.live_rows() {
         if col_str(batch, SCHEMATAB_PAY_NAME, i)? == name {
-            return Ok(Some(batch.pks.get(sys_schema(SCHEMA_TAB), i) as u64));
+            return Ok(Some(batch.pks.get(i) as u64));
         }
     }
     Ok(None)
@@ -1553,17 +1589,14 @@ fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<Option<u64>, ClientEr
 /// Append one `COL_TAB` row per column of `owner_id`, at `+1`.
 fn append_col_rows(a: &mut BatchAppender<'_>, owner_id: u64, columns: &[ColumnDef], fks: &[InlineForeignKey]) {
     for (i, cd) in columns.iter().enumerate() {
-        let (fk_table_id, fk_col_idx) = match fks.iter().find(|fk| fk.col_idx as usize == i).map(|fk| fk.target) {
-            None => (0, 0),
-            Some(FkTarget::SelfTable { col }) => (owner_id, col as u64),
-            Some(FkTarget::Table { id, col }) => (id, col as u64),
-        };
         let row = ColTabRow {
             owner_id,
             col_idx: i as u64,
             col: cd,
-            fk_table_id,
-            fk_col_idx,
+            fk: fks
+                .iter()
+                .find(|fk| fk.col_idx as usize == i)
+                .map(|fk| fk.target.resolve(owner_id)),
         };
         gnitz_wire::sys_rows::write_col_tab_row(a, &row, 1);
     }

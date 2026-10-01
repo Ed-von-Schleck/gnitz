@@ -81,12 +81,13 @@ impl CatalogEngine {
         let fks: Vec<FkEdge> = defs
             .iter()
             .enumerate()
-            .filter(|(_, cd)| kind.is_base_table() && cd.fk_table_id != 0)
-            .map(|(ci, cd)| FkEdge {
-                child_tid: id,
-                fk_col: ci,
-                parent_tid: cd.fk_table_id,
-                parent_col: cd.fk_col_idx as usize,
+            .filter_map(|(ci, cd)| {
+                cd.fk.filter(|_| kind.is_base_table()).map(|fk| FkEdge {
+                    child_tid: id,
+                    fk_col: ci,
+                    parent_tid: fk.table_id,
+                    parent_col: fk.col as usize,
+                })
             })
             .collect();
         for e in &fks {

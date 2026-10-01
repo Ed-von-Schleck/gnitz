@@ -71,8 +71,8 @@ fn concurrent_pushes_and_scans(target: &str) {
     assert_eq!(s.interest(), Interest::NONE);
     // The blocking client and the driver agree on the table.
     assert_eq!(
-        weighted_rows(&scan_all(&mut blocking, tid, &schema), &schema),
-        weighted_rows(&rows(&schema, 0..n * per), &schema)
+        weighted_rows(&scan_all(&mut blocking, tid, &schema)),
+        weighted_rows(&rows(&schema, 0..n * per))
     );
 }
 

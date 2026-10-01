@@ -251,7 +251,7 @@ fn a_second_client_pushes_after_a_column_alter() {
     a.exec(T_ID_V);
     let rel = b.rel("t");
     let mut batch = ZSetBatch::new(&rel.schema);
-    BatchAppender::new(&mut batch, &rel.schema).add_row(1, 1).i64_val(10);
+    BatchAppender::new(&mut batch).add_row(1, 1).i64_val(10);
     b.client.push(rel.tid, &rel.schema, &batch, Update).unwrap();
 
     a.exec("ALTER TABLE t ALTER COLUMN v DROP NOT NULL");
@@ -260,7 +260,7 @@ fn a_second_client_pushes_after_a_column_alter() {
     assert_eq!(rel2.tid, rel.tid);
     assert!(rel2.schema.columns[1].is_nullable, "B sees the relaxed column");
     let mut batch = ZSetBatch::new(&rel2.schema);
-    BatchAppender::new(&mut batch, &rel2.schema).add_row(2, 1).null();
+    BatchAppender::new(&mut batch).add_row(2, 1).null();
     b.client.push(rel2.tid, &rel2.schema, &batch, Update).unwrap();
 
     assert_eq!(a.scan("t", &["id", "v"]), [[1, 10, 1], [2, NULL, 1]]);

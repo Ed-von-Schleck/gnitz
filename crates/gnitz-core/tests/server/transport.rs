@@ -138,8 +138,8 @@ fn an_mtls_server_admits_only_a_leaf_its_client_ca_signed() {
     let pushed = rows(&schema, 0..500);
     client.push(tid, &schema, &pushed, WireConflictMode::Update).unwrap();
     assert_eq!(
-        weighted_rows(&scan_all(&mut client, tid, &schema), &schema),
-        weighted_rows(&pushed, &schema)
+        weighted_rows(&scan_all(&mut client, tid, &schema)),
+        weighted_rows(&pushed)
     );
 
     // The handshake completes inside the HELLO exchange, so a full connect fails.
@@ -260,9 +260,9 @@ fn both_transports_carry_every_cell_at_its_net_weight() {
     retract.weights[0] = -1;
     unix.push(tid, &schema, &retract, WireConflictMode::Update).unwrap();
 
-    let want = weighted_rows(&rows(&schema, (0..700_000).filter(|&pk| pk != 500)), &schema);
+    let want = weighted_rows(&rows(&schema, (0..700_000).filter(|&pk| pk != 500)));
     for client in [&mut tls, &mut unix] {
-        assert_eq!(weighted_rows(&scan_all(client, tid, &schema), &schema), want);
+        assert_eq!(weighted_rows(&scan_all(client, tid, &schema)), want);
     }
 }
 

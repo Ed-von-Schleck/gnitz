@@ -13,7 +13,7 @@ fn system_table_keys_are_valid_for_their_columns() {
             let col = &cols[c as usize];
             (col.type_code, col.nullable)
         })
-        .unwrap_or_else(|rule| panic!("{name}: invalid primary key: {rule}"));
+        .unwrap_or_else(|rule| panic!("{name}: {}", rule.for_role(crate::PkListRole::PrimaryKey)));
     }
 }
 

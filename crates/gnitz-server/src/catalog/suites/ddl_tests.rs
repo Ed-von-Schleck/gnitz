@@ -967,7 +967,10 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
     let col_defs = vec![
         col_def("id", TypeCode::U64),
         col_def("a", TypeCode::I64),
-        ColumnDef::new("a", TypeCode::I64, false).hidden().into(),
+        CatalogColumn {
+            def: ColumnDef::new("a", TypeCode::I64, false).hidden(),
+            fk: None,
+        },
     ];
     let tid = engine.allocate_ids(1).unwrap();
     engine.write_column_records(tid, &col_defs).unwrap();

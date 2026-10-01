@@ -30,7 +30,6 @@ mod hooks;
 mod precheck;
 mod registry;
 mod sys_tables;
-mod types;
 mod view_state;
 mod write_path;
 
@@ -48,20 +47,21 @@ use gnitz_zset::schema::{Placement, SchemaColumn, SchemaDescriptor};
 // The DDL_TXN driver's bundle decoders: it resolves each family once, carries
 // the value, and reads back what the bundle created or dropped.
 pub(crate) use bootstrap::UnreplayedCatalog;
+pub(crate) use constraints::FkEdge;
 pub(crate) use constraints::RowConstraints;
 #[cfg(test)]
 pub(crate) use sys_tables::write_col_tab_rows;
+pub(crate) use sys_tables::CatalogColumn;
 pub(crate) use sys_tables::SysFamily;
 #[cfg(test)]
 pub(crate) use sys_tables::PUBLIC_SCHEMA_ID;
 pub(crate) use sys_tables::{family_pk_partition, idx_tab_partition, PkPartition};
-pub(crate) use types::{CatalogColumn, FkEdge};
 
 // Import everything from sys_tables for internal use.
 use precheck::build_schema_from_col_defs;
 use sys_tables::*;
 
-// ── Catalog-internal re-exports — no out-of-catalog consumer (W8). These reach
+// ── Catalog-internal re-exports — no out-of-catalog consumer. These reach
 //    the submodules through their `use super::*` glob, so they stay re-exported
 //    but scoped to the catalog subtree rather than the crate-wide surface. ─────
 pub(in crate::catalog) use cache::{CatalogCacheSet, RelFacts};

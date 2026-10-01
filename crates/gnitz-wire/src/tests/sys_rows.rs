@@ -78,8 +78,9 @@ fn assert_col_tab_slots(r: &ColTabRow, weight: i64) {
     assert_eq!(v[COLTAB_PAY_NAME], Val::Str(r.col.name.clone()));
     assert_eq!(v[COLTAB_PAY_TYPE_CODE], Val::U64(r.col.ty.tc.as_wire() as u64));
     assert_eq!(v[COLTAB_PAY_IS_NULLABLE], Val::U64(r.col.is_nullable as u64));
-    assert_eq!(v[COLTAB_PAY_FK_TABLE_ID], Val::U64(r.fk_table_id));
-    assert_eq!(v[COLTAB_PAY_FK_COL_IDX], Val::U64(r.fk_col_idx));
+    let (fk_table_id, fk_col_idx) = r.fk.map_or((0, 0), |fk| (fk.table_id, fk.col as u64));
+    assert_eq!(v[COLTAB_PAY_FK_TABLE_ID], Val::U64(fk_table_id));
+    assert_eq!(v[COLTAB_PAY_FK_COL_IDX], Val::U64(fk_col_idx));
     assert_eq!(v[COLTAB_PAY_IS_HIDDEN], Val::U64(r.col.is_hidden as u64));
     assert_eq!(v[COLTAB_PAY_SCALE], Val::U64(r.col.ty.scale as u64));
 }
@@ -93,10 +94,10 @@ fn values_land_in_their_named_payload_slots() {
         owner_id: 16,
         col_idx: 2,
         col: &score,
-        fk_table_id: 17,
-        fk_col_idx: 3,
+        fk: Some(FkRef { table_id: 17, col: 3 }),
     };
     assert_col_tab_slots(&witness, -1);
+    assert_col_tab_slots(&ColTabRow { fk: None, ..witness }, 1);
     // Both booleans flipped, so a transposed pair fails one of the two rows.
     let flipped = crate::ColumnDef {
         is_nullable: false,

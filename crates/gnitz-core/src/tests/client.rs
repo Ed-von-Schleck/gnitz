@@ -13,9 +13,8 @@ fn del(pk: u64) -> ZSetBatch {
 
 /// `(pk, v, weight)` of a `kv_schema(I64)` batch, sorted.
 fn contents(b: &ZSetBatch) -> Vec<(u64, i64, i64)> {
-    let s = kv_schema(TypeCode::I64);
     let mut out: Vec<_> = (0..b.len())
-        .map(|i| (b.pks.get(&s, i) as u64, payload_u64(b, i, 0) as i64, b.weights[i]))
+        .map(|i| (b.pks.get(i) as u64, payload_u64(b, i, 0) as i64, b.weights[i]))
         .collect();
     out.sort();
     out
@@ -207,7 +206,7 @@ fn a_tid_refuses_a_second_layout() {
     wide.columns.push(ColumnDef::new("w", TypeCode::I64, false));
     let wide_row = || {
         let mut b = ZSetBatch::new(&wide);
-        BatchAppender::new(&mut b, &wide).add_row(2, 1).i64_val(20).i64_val(30);
+        BatchAppender::new(&mut b).add_row(2, 1).i64_val(20).i64_val(30);
         b
     };
     let mut buf = TxnBuffer::default();
@@ -223,6 +222,59 @@ fn a_tid_refuses_a_second_layout() {
     buf.push(17, &wide, wide_row(), Error, BLIND).unwrap();
 }
 
+/// A batch built under another schema is refused at the push, a tid's first
+/// included, and the transaction stays open.
+#[test]
+fn a_transaction_refuses_a_batch_of_another_schema_and_stays_open() {
+    let (s, _peer) = session_pair();
+    let mut c = GnitzClient::from_session(s);
+    c.txn_begin().unwrap();
+    let signed = Schema {
+        columns: vec![
+            ColumnDef::new("pk", TypeCode::I64, false),
+            ColumnDef::new("v", TypeCode::I64, false),
+        ],
+        pk_cols: vec![0],
+    };
+    let batch = kv_rows(&[(1, 10, 1)]);
+    for push in [
+        c.push(16, &signed, &batch, Update),
+        c.push_owned(16, &signed, batch.clone(), Update),
+    ] {
+        let err = push.unwrap_err().to_string();
+        assert!(err.contains("mismatched key column types"), "{err}");
+    }
+    assert!(c.txn_active());
+    assert!(c.txn.as_ref().unwrap().families.is_empty());
+    c.push(16, &kv_schema(TypeCode::I64), &batch, Update).unwrap();
+    assert_eq!(c.txn.as_ref().unwrap().families.len(), 1);
+}
+
+/// An FK that names no column, or a second one on a column, is refused before
+/// anything is sent — the peer is gone, so a request would fail as a transport
+/// error instead.
+#[test]
+fn create_table_refuses_an_fk_it_cannot_write() {
+    let (s, peer) = session_pair();
+    drop(peer);
+    let mut c = GnitzClient::from_session(s);
+    let schema = kv_schema(TypeCode::I64);
+    let fk = |col_idx| InlineForeignKey {
+        col_idx,
+        target: FkTarget::Table(FkRef { table_id: 16, col: 0 }),
+    };
+    for (fks, want) in [
+        (vec![fk(2)], "foreign key names column 2"),
+        (vec![fk(1), fk(1)], "column 1 carries more than one foreign key"),
+    ] {
+        let err = c
+            .create_table("public", "t", &schema, &fks, TableProps::default(), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(want), "{err}");
+    }
+}
+
 /// A keys reply carries no payload, so a buffered row joins it as its key alone.
 #[test]
 fn a_keys_reply_appends_keys_only() {
@@ -236,11 +288,11 @@ fn a_keys_reply_appends_keys_only() {
         sink,
     };
     let mut committed = ZSetBatch::new(&reply);
-    BatchAppender::new(&mut committed, &reply).add_row(1, 1);
+    BatchAppender::new(&mut committed).add_row(1, 1);
     let out = buf.overlay(7, &s, &spec, true, committed).unwrap();
 
     let mut want = ZSetBatch::new(&reply);
-    let mut app = BatchAppender::new(&mut want, &reply);
+    let mut app = BatchAppender::new(&mut want);
     app.add_row(1, 1);
     app.add_row(3, 1);
     assert_eq!(out, want);

@@ -1023,7 +1023,7 @@ fn churn_shapes(client: &mut GnitzClient, lo: i64, hi: i64) {
     let rel = client.resolve_relation(SH, "blb").unwrap();
     let mut batch = gnitz_core::ZSetBatch::new(&rel.schema);
     {
-        let mut app = gnitz_core::BatchAppender::new(&mut batch, &rel.schema);
+        let mut app = gnitz_core::BatchAppender::new(&mut batch);
         for i in lo..=hi {
             app.add_row(i as u128, 1);
             if i % 4 == 0 {

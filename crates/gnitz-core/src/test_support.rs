@@ -29,7 +29,7 @@ pub(crate) fn kv_schema(v: TypeCode) -> Schema {
 pub(crate) fn kv_rows(rows: &[(u64, i64, i64)]) -> ZSetBatch {
     let schema = kv_schema(TypeCode::I64);
     let mut b = ZSetBatch::new(&schema);
-    let mut app = BatchAppender::new(&mut b, &schema);
+    let mut app = BatchAppender::new(&mut b);
     for &(pk, v, w) in rows {
         app.add_row(pk as u128, w).i64_val(v);
     }

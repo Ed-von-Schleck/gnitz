@@ -3,6 +3,7 @@
 //! and the bundle a plan carries.
 
 use gnitz_core::{FkTarget, InlineForeignKey, InlineUniqueIndex};
+use gnitz_wire::sys_rows::FkRef;
 use gnitz_wire::{RelClass, TableDistribution, TypeCode};
 
 use super::*;
@@ -402,7 +403,7 @@ fn an_fk_child_adopts_the_parent_type_before_the_index_is_checked() {
         c.fks,
         vec![InlineForeignKey {
             col_idx: 1,
-            target: FkTarget::Table { id: 41, col: 0 }
+            target: FkTarget::Table(FkRef { table_id: 41, col: 0 })
         }]
     );
     assert_eq!(c.unique_indexes, vec![unique(&[1], &format!("{SN}__c__idx_r"))]);
@@ -458,6 +459,34 @@ fn a_self_fk_targets_the_lone_pk_and_adopts_its_type() {
     ] {
         assert_rejects(sql, plan_table(&cat, sql), needle);
     }
+}
+
+/// A self-reference adopts the PK column's type as the cross-table FK on that
+/// column leaves it, whichever column is declared first.
+#[test]
+fn a_self_fk_adopts_the_type_its_pk_column_adopted() {
+    let cat = fk_catalog();
+    for sql in [
+        "CREATE TABLE t (parent INT REFERENCES t(id), id INT PRIMARY KEY REFERENCES p(id))",
+        "CREATE TABLE t (id INT PRIMARY KEY REFERENCES p(id), parent INT REFERENCES t(id))",
+    ] {
+        let c = created(&cat, sql);
+        let types: Vec<TypeCode> = c.schema.columns.iter().map(|c| c.ty.tc).collect();
+        assert_eq!(types, [TypeCode::I64, TypeCode::I64], "{sql}");
+    }
+}
+
+/// Every FK column carries an index, so it takes only a type an index key has.
+#[test]
+fn an_fk_column_must_be_an_admissible_index_key() {
+    let parent = rel(42, RelClass::Table, vec![col("id", TypeCode::I128)], vec![0], vec![]);
+    let cat = catalog(vec![("parent", parent)]);
+    let sql = "CREATE TABLE c (id BIGINT PRIMARY KEY, p HUGEINT REFERENCES parent(id))";
+    assert_rejects(
+        sql,
+        plan_table(&cat, sql),
+        "FOREIGN KEY column 'p' of type I128 cannot be a FOREIGN KEY key",
+    );
 }
 
 /// A repeated column is the definition's error, reported before a column list

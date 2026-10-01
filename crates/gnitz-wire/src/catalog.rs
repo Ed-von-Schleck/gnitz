@@ -136,7 +136,7 @@ pub(crate) const COL_TAB_COLS: &[WireSysCol] = &[
     // the record's `hidden` flag.
     col("is_hidden", TypeCode::U64, false),
     // A DECIMAL column's scale, else 0. Echoed into a reply schema block's
-    // column type; the engine never branches on it.
+    // column type.
     col("scale", TypeCode::U64, false),
 ];
 
@@ -908,7 +908,7 @@ impl TableProps {
 
 /// The type rule on a SERIAL table's PK columns, given as `(name, type)`.
 pub fn validate_serial_key<'a>(pk: impl IntoIterator<Item = (&'a str, ColType)>) -> Result<(), String> {
-    match pk.into_iter().find(|(_, ty)| !ty.tc.is_serial_eligible()) {
+    match pk.into_iter().find(|(_, ty)| crate::FixedInt::exact(ty.tc).is_none()) {
         Some((name, ty)) => Err(format!(
             "SERIAL primary key column '{name}' is {ty}; SERIAL needs an integer of at most 8 bytes"
         )),

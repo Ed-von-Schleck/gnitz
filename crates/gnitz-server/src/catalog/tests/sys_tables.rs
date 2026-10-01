@@ -88,6 +88,7 @@ fn read_col_tab_row_refuses_forged_words() {
         (COLTAB_PAY_IS_NULLABLE, 2, "is_nullable"),
         (COLTAB_PAY_IS_HIDDEN, 2, "is_hidden"),
         (COLTAB_PAY_FK_COL_IDX, 1 << 32, "fk_col_idx"),
+        (COLTAB_PAY_FK_COL_IDX, 3, "FK column 3 with no FK table"),
         (COLTAB_PAY_SCALE, 256, "scale"),
         // A scale on a type that carries none.
         (COLTAB_PAY_SCALE, 3, "invalid column type"),
@@ -95,4 +96,21 @@ fn read_col_tab_row_refuses_forged_words() {
         let err = read(Some((slot, word))).unwrap_err();
         assert!(err.contains(names), "{names} = {word}: {err}");
     }
+}
+
+/// An IDX_TAB word that is not a packed list is refused as a column list.
+#[test]
+fn read_idx_tab_row_refuses_an_unpacked_column_list() {
+    let mut bb = BatchBuilder::new(*SysFamily::Index.schema());
+    push_sys_row(&mut bb, SysFamily::Index, [53, 0], 1, |pi| {
+        if pi == IDXTAB_PAY_SOURCE_COLS {
+            gnitz_wire::pack_pk_cols(&[1]) & !gnitz_wire::PK_LIST_PACKED_FLAG
+        } else {
+            0
+        }
+    });
+    assert_eq!(
+        read_idx_tab_row(&bb.finish(), 0).unwrap_err(),
+        "column list word carries no packed-list flag"
+    );
 }

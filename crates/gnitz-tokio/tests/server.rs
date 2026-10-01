@@ -43,7 +43,7 @@ fn table(target: &str) -> (GnitzClient, u64, Arc<Schema>, String) {
 /// `pks` at weight 1.
 fn rows(schema: &Schema, pks: Range<i64>) -> ZSetBatch {
     let mut batch = ZSetBatch::new(schema);
-    let mut app = BatchAppender::new(&mut batch, schema);
+    let mut app = BatchAppender::new(&mut batch);
     for pk in pks {
         app.add_row(pk as u128, 1).i64_val(pk * 3);
     }
@@ -100,7 +100,7 @@ fn pipelined_verbs() {
             // Every kind of verb in flight together, behind a push that replaces
             // a row rather than adding to it.
             let mut replaced = ZSetBatch::new(&schema);
-            BatchAppender::new(&mut replaced, &schema).add_row(7, 1).i64_val(-1);
+            BatchAppender::new(&mut replaced).add_row(7, 1).i64_val(-1);
             let key = PkColumn::from_natives(&schema, [7]);
             let (_, one, many, found, missing) = tokio::join!(
                 client.push(tid, &schema, &replaced),
@@ -111,10 +111,7 @@ fn pipelined_verbs() {
             );
             let one = one.unwrap().batch;
             assert_eq!(unit_rows(&one), 1);
-            assert_eq!(
-                (one.pks.get(&schema, 0), read_i64_le(&one.payload[0].bytes, 0)),
-                (7, -1)
-            );
+            assert_eq!((one.pks.get(0), read_i64_le(&one.payload[0].bytes, 0)), (7, -1));
             let many: Vec<usize> = many.unwrap().iter().map(|r| unit_rows(&r.batch)).collect();
             assert_eq!(
                 many,

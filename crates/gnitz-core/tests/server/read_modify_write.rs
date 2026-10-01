@@ -28,7 +28,7 @@ fn boot() -> Fixture {
 fn commit(client: &mut GnitzClient, target: &RelDescriptor, pk: u128, val: i64) {
     let s = &target.schema;
     let mut batch = ZSetBatch::new(s);
-    BatchAppender::new(&mut batch, s).add_row(pk, 1).i64_val(val);
+    BatchAppender::new(&mut batch).add_row(pk, 1).i64_val(val);
     client.push(target.tid, s, &batch, WireConflictMode::Update).unwrap();
 }
 
@@ -57,7 +57,7 @@ fn run_increment(
 /// Every row of `t` at pk 1, as `(val, weight)`.
 fn row_1(client: &mut GnitzClient, target: &RelDescriptor) -> Vec<(i64, i64)> {
     let b = scan_all(client, target.tid, &target.schema);
-    weighted_rows(&b, &target.schema)
+    weighted_rows(&b)
         .into_iter()
         .filter(|&(pk, ..)| pk == 1)
         .map(|(_, cells, w)| (cells[0], w))

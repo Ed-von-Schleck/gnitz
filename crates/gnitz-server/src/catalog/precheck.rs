@@ -6,7 +6,8 @@ use rustc_hash::FxHashSet;
 
 use super::*;
 use gnitz_expr::{RowSource, SchemaFacts};
-use gnitz_wire::{low_bits_mask, BitIter, TypeCode, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME};
+use gnitz_wire::sys_rows::FkRef;
+use gnitz_wire::{low_bits_mask, BitIter, ColType, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME};
 use gnitz_wire::{ViewProps, MAX_COLUMNS};
 use gnitz_zset::schema::make_index_schema;
 
@@ -70,8 +71,7 @@ fn validate_pk_against_cols(col_defs: &[CatalogColumn], pk_cols: &[u32]) -> Resu
         let cd = &col_defs[c as usize];
         (cd.def.ty.tc, cd.def.is_nullable)
     })
-    .map(|_stride| ())
-    .map_err(|rule| rule.to_string())
+    .map_err(|rule| rule.for_role(gnitz_wire::PkListRole::PrimaryKey))
 }
 
 /// The `SchemaDescriptor` COL_TAB records describe, or the first admissibility
@@ -233,9 +233,11 @@ impl CatalogEngine {
         pk: &[u32],
         net_dead: &[u64],
     ) -> Result<(), String> {
-        let self_pk_type = col_defs[pk[0] as usize].def.ty.tc;
-        for cd in col_defs.iter().filter(|cd| cd.fk_table_id != 0) {
-            self.validate_fk_column(cd, tid, pk, self_pk_type, net_dead)?;
+        let self_pk_type = col_defs[pk[0] as usize].def.ty;
+        for cd in col_defs {
+            if let Some(fk) = cd.fk {
+                self.validate_fk_column(cd, fk, tid, pk, self_pk_type, net_dead)?;
+            }
         }
         Ok(())
     }
@@ -243,64 +245,65 @@ impl CatalogEngine {
     fn validate_fk_column(
         &self,
         col: &CatalogColumn,
+        fk: FkRef,
         self_table_id: u64,
         self_pk: &[u32],
-        self_pk_type: TypeCode,
+        self_pk_type: ColType,
         net_dead: &[u64],
     ) -> Result<(), String> {
-        // `col.fk_col_idx` here is the PARENT's referenced column index (the
-        // planner sets the child column's fk_col_idx to it). The target is a
-        // legal reference iff it is the parent's lone PK column, or it carries
-        // its own UNIQUE index. Mirrors the production planner gate.
-        let target_type = if col.fk_table_id == self_table_id {
+        // The target is a legal reference iff it is the parent's lone PK column,
+        // or it carries its own UNIQUE index. Mirrors the production planner gate.
+        let target_type = if fk.table_id == self_table_id {
             // Self-referential FK: the table has no UNIQUE index yet, so the
             // target must be its lone PK column. The downstream probe reads the
             // referenced value out of the packed PK region, which is the whole
             // key only when the PK is a single column.
-            if self_pk != [col.fk_col_idx] {
+            if self_pk != [fk.col] {
                 return Err("FK must reference the primary key or a UNIQUE-indexed column".into());
             }
             self_pk_type
         } else {
-            if net_dead.contains(&col.fk_table_id) {
+            if net_dead.contains(&fk.table_id) {
                 return Err(format!(
                     "FK references table {}, which this transaction drops",
-                    col.fk_table_id
+                    fk.table_id
                 ));
             }
             let entry = self
                 .registry
-                .relation(col.fk_table_id)
-                .ok_or_else(|| format!("FK references unknown table_id {}", col.fk_table_id))?;
+                .relation(fk.table_id)
+                .ok_or_else(|| format!("FK references unknown table_id {}", fk.table_id))?;
             // Not covered by the PK/UNIQUE tests below, which read only the schema:
             // a stream and a view both have a PK that looks exactly like a base
             // table's without being the unique, stored key the parent probe reads.
             if !entry.kind().is_base_table() {
                 return Err(format!(
                     "FK references relation {}, which is a {}; a FOREIGN KEY must reference a base table",
-                    col.fk_table_id,
+                    fk.table_id,
                     entry.kind().noun()
                 ));
             }
-            if entry.schema().lone_pk_col() != Some(col.fk_col_idx as usize) {
+            if entry.schema().lone_pk_col() != Some(fk.col as usize) {
                 // A composite index does not satisfy a single-column FK: a
                 // unique (a, b) does not guarantee uniqueness of `a` alone, so
                 // match only a single-column unique index on the referenced col.
-                let has_unique = entry.index_on(&[col.fk_col_idx]).is_some_and(|ic| ic.is_unique());
+                let has_unique = entry.index_on(&[fk.col]).is_some_and(|ic| ic.is_unique());
                 if !has_unique {
                     return Err("FK must reference the primary key or a UNIQUE-indexed column".into());
                 }
             }
-            entry.schema().columns[col.fk_col_idx as usize].type_code
+            // In range: the checks above admit only the parent's lone PK column
+            // or a column a unique index names.
+            self.read_column_defs(fk.table_id)?[fk.col as usize].def.ty
         };
 
         // The preflight compares child and parent values as the referenced
         // column's key image, so both columns carry one type; SQL adopts the
         // parent's type before the engine sees the column.
-        if col.def.ty.tc != target_type {
+        if col.def.ty != target_type {
             return Err(format!(
-                "FK type mismatch: child type code {} cannot reference target type code {target_type}",
-                col.def.ty.tc
+                "FK type mismatch: child type {} cannot reference target type {target_type}",
+                col.def.ty
             ));
         }
         Ok(())
@@ -448,7 +451,7 @@ impl CatalogEngine {
                     }
                     if hides {
                         // Before the index test: an FK column also carries its FK index.
-                        if old.fk_table_id != 0 {
+                        if old.fk.is_some() {
                             return Err(format!("cannot DROP COLUMN '{name}': it carries a foreign key"));
                         }
                         let indexed = self.registry.relation(owner_id).is_some_and(|e| {
@@ -533,7 +536,7 @@ impl CatalogEngine {
         if !appended.def.is_nullable {
             return Err("ADD COLUMN must append a nullable column".into());
         }
-        if appended.def.is_hidden || appended.fk_table_id != 0 {
+        if appended.def.is_hidden || appended.fk.is_some() {
             return Err("ADD COLUMN must not append a hidden or foreign-key column".into());
         }
         // Last, as in the rewrite-pair arm: a malformed append is reported as
@@ -739,9 +742,9 @@ impl CatalogEngine {
         for i in batch.live_rows() {
             let id = batch.get_pk(i) as u64;
             let col_defs = self.read_column_defs(id)?;
-            let (sid, name, pk, kind, serial) = if is_table {
+            let (sid, name, pk, kind, table) = if is_table {
                 let r = read_table_tab_row(batch, i).map_err(|e| format!("{e} (tid={id})"))?;
-                (r.schema_id, r.name, r.pk, r.kind, r.facts.serial)
+                (r.schema_id, r.name, r.pk, r.kind, Some((r.facts.serial, r.placement)))
             } else {
                 let v = read_view_tab_row(batch, i).map_err(|e| format!("{e} (vid={id})"))?;
                 // `topo_priority` applies CircuitNodes (2) before View (6) in a
@@ -750,18 +753,18 @@ impl CatalogEngine {
                 // row to validate.
                 self.validate_view_options(id, v.name, v.props, v.owner_view_id)?;
                 self.validate_view_owner(id, v.name, v.owner_view_id, &creates)?;
-                (v.schema_id, v.name, v.pk, RelationKind::View(v.props), false)
+                (v.schema_id, v.name, v.pk, RelationKind::View(v.props), None)
             };
             check_col_defs(kind, &col_defs)
                 .and_then(|()| validate_pk_against_cols(&col_defs, pk.as_slice()))
                 .map_err(|e| format!("{} '{name}' (id={id}) {e}", kind.noun()))?;
             reject_unstorable_name(name, kind.noun())?;
 
-            if is_table {
+            if let Some((serial, placement)) = table {
                 // A stream push must stay a pure append: an FK would probe a
                 // parent store, putting a store read on every one.
                 if kind == RelationKind::Stream {
-                    if let Some(cd) = col_defs.iter().find(|cd| cd.fk_table_id != 0) {
+                    if let Some(cd) = col_defs.iter().find(|cd| cd.fk.is_some()) {
                         return Err(format!(
                             "relation {id} is a stream: column '{}' may not carry a FOREIGN KEY",
                             cd.def.name
@@ -777,6 +780,15 @@ impl CatalogEngine {
                 // and in range, which is what makes the self-reference type
                 // lookup inside sound.
                 self.validate_fk_columns(id, &col_defs, pk.as_slice(), net_dead)?;
+                // The register hook indexes every FK column; an index it cannot
+                // build is refused here, before anything is applied.
+                let noun = kind.noun();
+                let schema = build_schema_from_col_defs(kind, &col_defs, pk.as_slice(), placement)
+                    .map_err(|e| format!("{noun} '{name}' (id={id}) {e}"))?;
+                for (ci, _) in col_defs.iter().enumerate().filter(|(_, cd)| cd.fk.is_some()) {
+                    make_index_schema(&[ci as u32], &schema)
+                        .map_err(|e| format!("{noun} '{name}' (id={id}) FK column {ci}: {e}"))?;
+                }
             }
 
             self.precheck_qname_unique(sid, name, id, net_dead, &mut claimed)?;

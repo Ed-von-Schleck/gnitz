@@ -42,7 +42,7 @@ fn map_of(src: &Schema, sql: &[&str]) -> ClientMap {
 fn a_key_copy_decodes_and_a_payload_copy_moves() {
     let src = source();
     let mut b = ZSetBatch::new(&src);
-    let mut app = BatchAppender::new(&mut b, &src);
+    let mut app = BatchAppender::new(&mut b);
     app.add_row((-5i64) as u128, 1).i64_val(7).null();
     app.add_row(3, 2).null().null();
     let pks = b.pks.clone();
@@ -66,7 +66,7 @@ fn a_key_copy_decodes_and_a_payload_copy_moves() {
 fn a_computed_string_spills_beside_a_copied_one() {
     let src = source();
     let mut b = ZSetBatch::new(&src);
-    let mut app = BatchAppender::new(&mut b, &src);
+    let mut app = BatchAppender::new(&mut b);
     app.add_row(1, 1).i64_val(0).str_val(LONG);
     app.add_row(2, 1).null().null();
 

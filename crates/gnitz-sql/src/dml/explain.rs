@@ -223,7 +223,7 @@ fn plan_rows(lines: &[String]) -> SqlResult {
     {
         // Through the row sink, so the row-completeness check `end_row` carries
         // applies here as it does to every catalog row.
-        let mut a = BatchAppender::new(&mut batch, &schema);
+        let mut a = BatchAppender::new(&mut batch);
         for (i, line) in lines.iter().enumerate() {
             a.begin_row(&[i as u128 + 1], 1);
             a.put_string(line);

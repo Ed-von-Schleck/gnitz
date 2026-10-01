@@ -57,16 +57,14 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
     );
 
     let mut batch = ZSetBatch::new(&schema);
-    let mut app = BatchAppender::new(&mut batch, &schema);
+    let mut app = BatchAppender::new(&mut batch);
     for i in 1u64..=200 {
         app.add_row(i as u128, 1).i64_val(i as i64).str_val(&"x".repeat(300));
     }
     client.push(tid, &schema, &batch, WireConflictMode::Update).unwrap();
 
-    let (reply_schema, reply) = read_keys(&mut client, tid, &schema, gt_predicate(1, 150));
-    let mut got: Vec<u64> = (0..reply.len())
-        .map(|i| reply.pks.get(&reply_schema, i) as u64)
-        .collect();
+    let (_, reply) = read_keys(&mut client, tid, &schema, gt_predicate(1, 150));
+    let mut got: Vec<u64> = (0..reply.len()).map(|i| reply.pks.get(i) as u64).collect();
     got.sort_unstable();
     assert_eq!(got, (151u64..=200).collect::<Vec<_>>());
 }
@@ -90,14 +88,13 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     let (_, tid, schema) = create_table(&mut client, schema);
     assert_eq!(schema.pk_stride(), 12, "I64 then U32, tightly packed");
 
-    // `(c3, c0)` packed native little-endian in PK-list order — c3 at offset 0,
-    // c0 at 8 — which `add_row` OPK-encodes on append.
-    let key = |c3: i64, c0: u32| -> u128 { (c3 as u64 as u128) | ((c0 as u128) << 64) };
     let rows: Vec<(i64, u32, i64)> = vec![(-9_000_000_000, 7, 10), (-1, 4_294_967_295, 20), (0, 0, 30), (5, 1, 40)];
     let mut batch = ZSetBatch::new(&schema);
-    let mut app = BatchAppender::new(&mut batch, &schema);
+    let mut app = BatchAppender::new(&mut batch);
     for &(c3, c0, c2) in &rows {
-        app.add_row(key(c3, c0), 1).str_val("payload").i64_val(c2);
+        app.add_row_natives(&[c3 as u128, c0 as u128], 1)
+            .str_val("payload")
+            .i64_val(c2);
     }
     client.push(tid, &schema, &batch, WireConflictMode::Update).unwrap();
 

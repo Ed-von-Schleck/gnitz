@@ -5,6 +5,22 @@ use super::*;
 use gnitz_wire::PkColList;
 use gnitz_zset::schema::KeySpec;
 
+/// One FK constraint as a directed edge, identical whichever end it was reached
+/// from: the child's relation entry holds the edges it declares, `fk_by_parent`
+/// those whose `parent_tid` is the key. The two column positions are
+/// easy to transpose, so they are named rather than left as a bare tuple.
+#[derive(Clone, Copy)]
+pub(crate) struct FkEdge {
+    /// Referencing child table id.
+    pub(crate) child_tid: u64,
+    /// Child column position.
+    pub(crate) fk_col: usize,
+    /// Referenced parent table id.
+    pub(crate) parent_tid: u64,
+    /// Referenced parent column position.
+    pub(crate) parent_col: usize,
+}
+
 /// Every constraint on one table whose validation reads committed state.
 pub(crate) struct RowConstraints {
     pub(crate) fks_as_child: Vec<FkEdge>,

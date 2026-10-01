@@ -9,7 +9,7 @@ use gnitz_wire::TypeCode;
 fn a_string_cell_pointing_past_the_blob_is_refused_whole() {
     let schema = kv_schema(TypeCode::String);
     let mut batch = ZSetBatch::new(&schema);
-    BatchAppender::new(&mut batch, &schema)
+    BatchAppender::new(&mut batch)
         .add_row(1, 1)
         .str_val("a value well past the inline cell");
     let mut forged = batch.clone();
@@ -30,7 +30,7 @@ fn a_null_bit_under_a_not_null_column_is_a_decode_error() {
     let schema = kv_schema(TypeCode::I64);
     let mut b = ZSetBatch::new(&schema);
     {
-        let mut a = BatchAppender::new(&mut b, &schema);
+        let mut a = BatchAppender::new(&mut b);
         a.add_row(1, 1).i64_val(7);
         a.add_row(2, 1).i64_val(8);
     }

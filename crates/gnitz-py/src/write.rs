@@ -46,7 +46,7 @@ pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyR
                 vals.len()
             )));
         }
-        pk_col.push_row(schema, |k, buf| {
+        pk_col.push_row(|k, buf| {
             let col = &schema.columns[schema.pk_cols[k] as usize];
             if vals[k].is_none() {
                 return Err(not_nullable_err(&col.name));
@@ -310,7 +310,7 @@ impl PyZSetBatch {
                 .map_err(|e| argument_extraction_error(py, WEIGHT_KW, e))?,
             None => default_weight,
         };
-        batch.pks.push_row(schema, |k, buf| {
+        batch.pks.push_row(|k, buf| {
             let PkPlan { pos, ci, ty } = plan.pks[k];
             let v = arg(pos);
             if v.is_none() {
@@ -684,7 +684,7 @@ fn push_fixed_le(buf: &mut Vec<u8>, ty: ColType, item: &Bound<'_, PyAny>, inexac
         TypeCode::Timestamp => buf.extend_from_slice(&extract_micros(item)?.to_le_bytes()),
         TypeCode::Decimal => buf.extend_from_slice(&extract_decimal(item, ty.scale, inexact)?.to_le_bytes()),
         TypeCode::String | TypeCode::Blob => {
-            unreachable!("a German-string column is never a Fixed column or a PK column")
+            unreachable!("a German-string column is never a fixed-width column or a PK column")
         }
     }
     Ok(())

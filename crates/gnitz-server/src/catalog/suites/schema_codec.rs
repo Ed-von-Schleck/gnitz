@@ -16,7 +16,7 @@ use proptest::test_runner::TestCaseError;
 
 /// The catalog's column records for `schema`, named `c{i}`.
 fn catalog_defs(schema: &SchemaDescriptor) -> Vec<CatalogColumn> {
-    column_defs(schema).map(Into::into).collect()
+    column_defs(schema).map(|def| CatalogColumn { def, fk: None }).collect()
 }
 
 /// The client's schema for `schema`, named `c{i}`.
@@ -128,15 +128,14 @@ fn ddl_txn_roundtrip_client_to_server() {
     let col_batch = |oid: u64, n: usize| -> ZSetBatch {
         let s = sys_schema(COL_TAB);
         let mut b = ZSetBatch::new(s);
-        let mut a = BatchAppender::new(&mut b, s);
+        let mut a = BatchAppender::new(&mut b);
         for i in 0..n {
             let col = ColumnDef::new(format!("c{i}"), TypeCode::U64, false);
             let row = ColTabRow {
                 owner_id: oid,
                 col_idx: i as u64,
                 col: &col,
-                fk_table_id: 0,
-                fk_col_idx: 0,
+                fk: None,
             };
             write_col_tab_row(&mut a, &row, 1);
         }
@@ -152,7 +151,7 @@ fn ddl_txn_roundtrip_client_to_server() {
             pk_col_idx: 0,
             flags: 0,
         };
-        write_table_tab_row(&mut BatchAppender::new(&mut b, s), &row, weight);
+        write_table_tab_row(&mut BatchAppender::new(&mut b), &row, weight);
         b
     };
     let idx_batch = |idx_id: u64, owner: u64| -> ZSetBatch {
@@ -165,15 +164,13 @@ fn ddl_txn_roundtrip_client_to_server() {
             name: "idx_t_b",
             flags: 1, // unique, not internal
         };
-        write_idx_tab_row(&mut BatchAppender::new(&mut b, s), &row, 1);
+        write_idx_tab_row(&mut BatchAppender::new(&mut b), &row, 1);
         b
     };
 
-    // Verify a bundle roundtrips: family count, order (tid), per-row weight,
-    // and — where `check_pk` says so — the PK. It is off for the compound-PK
-    // families, whose two scalar forms differ (the engine reads the widened key
-    // high-half-first, the client low-half-first) over identical wire bytes.
-    let verify = |families: &[(u64, ZSetBatch)], check_pk: &[bool]| {
+    // Verify a bundle roundtrips: family count, order (tid), and per-row weight
+    // and key bytes.
+    let verify = |families: &[(u64, ZSetBatch)]| {
         let payload = gnitz_core::encode_ddl_txn(families);
         let ctrl = gnitz_wire::control::peek_control_block(&payload).expect("control header");
         let decoded = decode_items(&payload[ctrl.body], gnitz_wire::ClientVerb::DdlTxn).expect("decode_items");
@@ -193,35 +190,27 @@ fn ddl_txn_roundtrip_client_to_server() {
                     exp_batch.weights[i],
                     "weight row {i} tid {got_tid}"
                 );
-                if check_pk[fi] {
-                    assert_eq!(
-                        batch.get_pk(i),
-                        exp_batch.pks.get(gnitz_core::sys_schema(*exp_tid), i),
-                        "pk row {i} tid {got_tid}"
-                    );
-                }
+                assert_eq!(
+                    batch.get_pk_bytes(i),
+                    exp_batch.pks.get_bytes(i),
+                    "pk row {i} tid {got_tid}"
+                );
             }
         }
     };
 
     // 1-family: DROP TABLE (one TABLE_TAB -1).
-    verify(&[(TABLE_TAB, table_batch(16, -1))], &[true]);
+    verify(&[(TABLE_TAB, table_batch(16, -1))]);
 
     // 2-family: CREATE TABLE (COL_TAB + TABLE_TAB).
-    verify(
-        &[(COL_TAB, col_batch(17, 2)), (TABLE_TAB, table_batch(17, 1))],
-        &[false, true],
-    );
+    verify(&[(COL_TAB, col_batch(17, 2)), (TABLE_TAB, table_batch(17, 1))]);
 
     // 3-family: CREATE TABLE + inline UNIQUE index (COL_TAB + TABLE_TAB + IDX_TAB).
-    verify(
-        &[
-            (COL_TAB, col_batch(18, 2)),
-            (TABLE_TAB, table_batch(18, 1)),
-            (IDX_TAB, idx_batch(100, 18)),
-        ],
-        &[false, true, true],
-    );
+    verify(&[
+        (COL_TAB, col_batch(18, 2)),
+        (TABLE_TAB, table_batch(18, 1)),
+        (IDX_TAB, idx_batch(100, 18)),
+    ]);
 
     // 3-family: CREATE VIEW (COL_TAB + circuit nodes + VIEW_TAB).
     let vid: u64 = 20;
@@ -229,7 +218,7 @@ fn ddl_txn_roundtrip_client_to_server() {
     let nodes = {
         let s = sys_schema(CIRCUIT_NODES_TAB);
         let mut b = ZSetBatch::new(s);
-        let mut a = BatchAppender::new(&mut b, s);
+        let mut a = BatchAppender::new(&mut b);
         // ScanDelta(src), unwired and parameterless.
         let scan = CircuitNodeRow {
             view_id: vid,
@@ -263,16 +252,12 @@ fn ddl_txn_roundtrip_client_to_server() {
             owner_view_id: 0,
             pk_repeats: false,
         };
-        write_view_tab_row(&mut BatchAppender::new(&mut b, s), &row, 1);
+        write_view_tab_row(&mut BatchAppender::new(&mut b), &row, 1);
         b
     };
-    verify(
-        &[
-            (COL_TAB, col_batch(vid, 1)),
-            (CIRCUIT_NODES_TAB, nodes),
-            (VIEW_TAB, view),
-        ],
-        // Skip the pk check on the two compound-PK families.
-        &[false, false, true],
-    );
+    verify(&[
+        (COL_TAB, col_batch(vid, 1)),
+        (CIRCUIT_NODES_TAB, nodes),
+        (VIEW_TAB, view),
+    ]);
 }

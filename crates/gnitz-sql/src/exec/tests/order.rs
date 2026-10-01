@@ -29,7 +29,7 @@ fn kv_schema() -> Schema {
 fn kv(rows: &[(u64, Option<i64>, Option<&str>, i64)]) -> ZSetBatch {
     let schema = kv_schema();
     let mut b = ZSetBatch::new(&schema);
-    let mut app = BatchAppender::new(&mut b, &schema);
+    let mut app = BatchAppender::new(&mut b);
     for &(id, v, s, w) in rows {
         app.add_row(id as u128, w);
         match v {
@@ -46,7 +46,7 @@ fn kv(rows: &[(u64, Option<i64>, Option<&str>, i64)]) -> ZSetBatch {
 
 /// The id of each entry of `out`, in order.
 fn ids(out: &ZSetBatch) -> Vec<u64> {
-    (0..out.len()).map(|i| out.pks.get(&kv_schema(), i) as u64).collect()
+    (0..out.len()).map(|i| out.pks.get(i) as u64).collect()
 }
 
 #[test]

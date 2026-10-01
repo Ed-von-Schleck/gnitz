@@ -43,7 +43,7 @@ fn batch_a(pks: &[u64]) -> ZSetBatch {
 fn batch_b(pks: &[u64]) -> ZSetBatch {
     let schema = schema_b();
     let mut b = ZSetBatch::new(&schema);
-    let mut app = BatchAppender::new(&mut b, &schema);
+    let mut app = BatchAppender::new(&mut b);
     for &pk in pks {
         app.add_row(pk as u128, 1)
             .str_val(&format!("s{pk}"))
@@ -223,7 +223,7 @@ fn a_refused_submit_leaves_the_session_as_it_was() {
     // One cell alone past the server's ingress cap, refused before it is sent.
     let sb = schema_b();
     let mut oversize = ZSetBatch::new(&sb);
-    BatchAppender::new(&mut oversize, &sb)
+    BatchAppender::new(&mut oversize)
         .add_row(1, 1)
         .str_val(&"x".repeat(gnitz_wire::MAX_FRAME_PAYLOAD))
         .f64_val(0.0);

@@ -14,6 +14,7 @@ use crate::validate::{
 use crate::SqlResult;
 use gnitz_core::{FkTarget, GnitzClient, InlineForeignKey, InlineUniqueIndex, Schema};
 use gnitz_expr::SchemaFacts;
+use gnitz_wire::sys_rows::FkRef;
 use gnitz_wire::TableDistribution;
 use gnitz_wire::{ColType, ColumnDef, TableProps, TypeCode};
 use sqlparser::ast::{
@@ -153,36 +154,35 @@ fn resolve_fk_target_inline(
     ))
 }
 
-/// Resolve a REFERENCES clause to its target and the parent column's type.
-/// The referenced column is a legal target iff it is the parent's lone PK
-/// column or it carries its own single-column UNIQUE index. Validates that the
-/// child's type is compatible with the referenced column's and returns that
-/// type so the caller can widen the child column.
+/// Resolve a REFERENCES clause naming `ref_table` to its target and the parent
+/// column's type. The referenced column is a legal target iff it is the
+/// parent's lone PK column or it carries its own single-column UNIQUE index.
+/// Validates that the child's type is compatible with the referenced column's
+/// and returns that type so the caller can widen the child column.
 fn resolve_fk_target(
     cat: &Catalog<'_>,
     site: &FkSite<'_>,
+    ref_table: &str,
     current_table_name: &str,
     current_cols: &[ColumnDef],
     current_pk_cols: &[u32],
 ) -> Result<(FkTarget, ColType), GnitzSqlError> {
-    let ref_table = extract_object_name(site.foreign_table, cat.schema_name(), "REFERENCES")?;
-
     // Self-referencing FK: the table being created is not yet in the catalog,
     // so resolve the referenced column against the in-flight column list.
     if ref_table.eq_ignore_ascii_case(current_table_name) {
-        return resolve_fk_target_inline(current_cols, current_pk_cols, &ref_table, site);
+        return resolve_fk_target_inline(current_cols, current_pk_cols, ref_table, site);
     }
 
-    let ref_rel = cat.probe_relation(&ref_table)?;
+    let ref_rel = cat.probe_relation(ref_table)?;
     let ref_schema = &ref_rel.schema;
     // The PK/UNIQUE tests below read only the schema, and both a view's and a
     // stream's PK look exactly like a base table's without being the unique, stored
     // key the parent probe reads.
-    require_class(&ref_rel, &ref_table, ClassWant::BaseTable, "a FOREIGN KEY target")?;
+    require_class(&ref_rel, ref_table, ClassWant::BaseTable, "a FOREIGN KEY target")?;
     let ref_tid = ref_rel.tid;
 
     let pk_single = ref_schema.lone_pk_col();
-    let ref_col_idx = resolve_referred_column(site.referred_columns, &ref_table, &ref_schema.columns, pk_single)?;
+    let ref_col_idx = resolve_referred_column(site.referred_columns, ref_table, &ref_schema.columns, pk_single)?;
 
     // Legal target iff the referenced column is the parent's lone PK or carries a
     // UNIQUE index of its own. A composite unique `(a, b)` does not make `a`
@@ -205,7 +205,10 @@ fn resolve_fk_target(
     check_fk_type_compat(current_cols[site.col_idx].ty, ref_schema.columns[ref_col_idx].ty)?;
 
     Ok((
-        FkTarget::Table { id: ref_tid, col: ref_col_idx as u32 },
+        FkTarget::Table(FkRef {
+            table_id: ref_tid,
+            col: ref_col_idx as u32,
+        }),
         ref_schema.columns[ref_col_idx].ty,
     ))
 }
@@ -517,15 +520,27 @@ pub(crate) fn plan_create_table(
 
     // A self-FK resolves against the whole PK, and each resolve REWRITES its child
     // column's type to the parent's — so this runs after collection, not inside it.
-    let mut fks: Vec<InlineForeignKey> = Vec::with_capacity(fk_sites.len());
-    for site in &fk_sites {
+    // The self-references go last: one adopts the PK column's type, which a
+    // cross-table FK on that column rewrites.
+    let mut sites: Vec<(String, &FkSite<'_>)> = fk_sites
+        .iter()
+        .map(|site| {
+            Ok((
+                extract_object_name(site.foreign_table, schema_name, "REFERENCES")?,
+                site,
+            ))
+        })
+        .collect::<Result<_, GnitzSqlError>>()?;
+    sites.sort_by_key(|(ref_table, _)| ref_table.eq_ignore_ascii_case(&table_name));
+    let mut fks: Vec<InlineForeignKey> = Vec::with_capacity(sites.len());
+    for (ref_table, site) in sites {
         if fks.iter().any(|fk| fk.col_idx as usize == site.col_idx) {
             return Err(GnitzSqlError::Rejected(format!(
                 "column '{}' carries more than one FOREIGN KEY",
                 cols[site.col_idx].name
             )));
         }
-        let (fk, parent_pk_type) = resolve_fk_target(cat, site, &table_name, &cols, &pk_indices)?;
+        let (fk, parent_pk_type) = resolve_fk_target(cat, site, &ref_table, &table_name, &cols, &pk_indices)?;
         fks.push(InlineForeignKey { col_idx: site.col_idx as u32, target: fk });
         cols[site.col_idx].ty = parent_pk_type;
     }
@@ -545,7 +560,7 @@ pub(crate) fn plan_create_table(
             let cd = &cols[col as usize];
             non_key_eligible_error(&cd.name, cd.ty.tc, "PRIMARY KEY")
         }
-        other => GnitzSqlError::Rejected(other.to_string()),
+        other => GnitzSqlError::Rejected(other.for_role(gnitz_wire::PkListRole::PrimaryKey)),
     })?;
 
     // The generated id has no compound form: a column spelled SERIAL is the table's
@@ -566,6 +581,11 @@ pub(crate) fn plan_create_table(
         let names: Vec<&str> = u.cols.iter().map(|&c| cols[c as usize].name.as_str()).collect();
         let types: Vec<TypeCode> = u.cols.iter().map(|&c| cols[c as usize].ty.tc).collect();
         reject_unbuildable_index_key(&names, &types, pk_indices.len(), "UNIQUE")?;
+    }
+    // Every FK column carries an index of its own.
+    for fk in &fks {
+        let cd = &cols[fk.col_idx as usize];
+        reject_unbuildable_index_key(&[cd.name.as_str()], &[cd.ty.tc], pk_indices.len(), "FOREIGN KEY")?;
     }
 
     // CLUSTER BY (hash distribution key). The named columns must be the PK's

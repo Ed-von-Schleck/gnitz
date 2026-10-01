@@ -263,8 +263,12 @@ impl WorkerProcess {
             }
 
             SalMessageKind::UniquePreflight => {
-                let cols = gnitz_wire::unpack_pk_cols(hdr.arg1)
-                    .map_err(|e| format!("unique pre-flight on table {target_id}: {e}"))?;
+                let cols = gnitz_wire::unpack_pk_cols(hdr.arg1).map_err(|e| {
+                    format!(
+                        "unique pre-flight on table {target_id}: {}",
+                        e.for_role(gnitz_wire::PkListRole::ColumnList)
+                    )
+                })?;
                 self.handle_unique_preflight(target_id, cols.as_slice(), request_id)?;
                 Ok(())
             }

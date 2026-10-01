@@ -29,7 +29,7 @@ fn schema() -> Arc<Schema> {
 /// `rows` keys at weight 1. A row is its key, its weight and its null word.
 fn batch(schema: &Schema, rows: usize) -> ZSetBatch {
     let mut batch = ZSetBatch::new(schema);
-    let mut app = BatchAppender::new(&mut batch, schema);
+    let mut app = BatchAppender::new(&mut batch);
     for pk in 0..rows {
         app.add_row(pk as u128, 1);
     }

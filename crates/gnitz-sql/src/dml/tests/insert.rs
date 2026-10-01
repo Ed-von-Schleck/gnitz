@@ -62,8 +62,8 @@ fn insert(cat: &Catalog<'_>, sql: &str) -> Result<InsertPlan, GnitzSqlError> {
 }
 
 /// Each row's key as its native value.
-fn keys(schema: &Schema, b: &ZSetBatch) -> Vec<u128> {
-    (0..b.pks.len()).map(|r| b.pks.get(schema, r)).collect()
+fn keys(b: &ZSetBatch) -> Vec<u128> {
+    (0..b.pks.len()).map(|r| b.pks.get(r)).collect()
 }
 
 /// A column list names which column each value lands in, in any order and case; a
@@ -98,7 +98,7 @@ fn values_land_in_the_columns_the_list_names() {
     ] {
         let plan = insert(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
         let schema = &plan.target.schema;
-        assert_eq!(keys(schema, &plan.rows), want_keys, "`{sql}`");
+        assert_eq!(keys(&plan.rows), want_keys, "`{sql}`");
         assert_eq!(rows_of(schema, &plan.rows), want_rows, "`{sql}`");
     }
 }
@@ -305,7 +305,7 @@ fn on_conflict_resolves_each_row_against_the_row_its_key_holds() {
         };
         let schema = &target.schema;
         let out = resolve_conflicts(&rows, batch_of(schema, held), set.as_deref_mut(), schema).unwrap();
-        assert_eq!(&keys(schema, &out), want_keys, "`{sql}`");
+        assert_eq!(&keys(&out), want_keys, "`{sql}`");
         let want: Vec<_> = want_rows.iter().map(|cells| (cells.to_vec(), 1)).collect();
         assert_eq!(rows_of(schema, &out), want, "`{sql}`");
     }

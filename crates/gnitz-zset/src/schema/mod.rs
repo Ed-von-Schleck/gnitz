@@ -367,7 +367,7 @@ impl SchemaDescriptor {
             let col = &cols[c as usize];
             (col.type_code, col.nullable)
         })
-        .map_err(|rule| rule.to_string())?;
+        .map_err(|rule| rule.for_role(gnitz_wire::PkListRole::PrimaryKey))?;
         Ok(Self::new(cols, pk_indices))
     }
 

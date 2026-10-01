@@ -240,7 +240,7 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &Catalog<'_>) -> Result<InsertPl
                 check_not_null(def, matches!(cells[slot], BExpr::LitNull))?;
                 natives[k] = native_value(&cells[slot], def)?;
             }
-            rows.pks.push_natives(schema, &natives[..pk_slots.len()]);
+            rows.pks.push_natives(&natives[..pk_slots.len()]);
         }
         rows.weights.push(1);
 

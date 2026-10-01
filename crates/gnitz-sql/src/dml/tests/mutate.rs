@@ -108,7 +108,7 @@ fn a_set_list_rewrites_the_row_it_read() {
 fn a_uuid_column_is_copied() {
     let schema = typed_schema(&[TypeCode::UUID, TypeCode::UUID]);
     let mut rows = ZSetBatch::new(&schema);
-    BatchAppender::new(&mut rows, &schema)
+    BatchAppender::new(&mut rows)
         .add_row(1, 1)
         .u128_val(0)
         .u128_val(u128::MAX - 7);

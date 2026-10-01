@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_wire::sys_rows::FkRef;
 
 // ── test_fk_lock_set ─────────────────────────────────────────────────
 
@@ -268,6 +269,57 @@ fn test_fk_child_type_must_equal_parent() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A DECIMAL's scale is part of its type: the stored integers of two scales
+/// never mean the same number.
+#[test]
+fn a_decimal_fk_child_must_carry_the_parents_scale() {
+    let dir = temp_dir("fk_decimal_scale");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let decimal = |name: &str, scale: u8| CatalogColumn {
+        def: gnitz_wire::ColumnDef::typed(name, gnitz_wire::ColType::decimal(scale), false),
+        fk: None,
+    };
+    let parent_tid = engine.create_table("public.p", &[decimal("id", 4)], &[0]).unwrap();
+    let child = |scale: u8| {
+        let fk = Some(FkRef { table_id: parent_tid, col: 0 });
+        vec![
+            col_def("cid", TypeCode::U64),
+            CatalogColumn { fk, ..decimal("pid", scale) },
+        ]
+    };
+
+    let err = engine
+        .create_table("public.c_scale2", &child(2), &[0])
+        .expect_err("a child of another scale must be refused");
+    assert!(err.contains("FK type mismatch"), "got: {err}");
+    engine.create_table("public.c_scale4", &child(4), &[0]).unwrap();
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An FK column whose index cannot be built is refused by the precheck, before
+/// the register hook reaches it.
+#[test]
+fn an_fk_column_with_no_index_key_is_refused_by_the_precheck() {
+    let dir = temp_dir("fk_unindexable");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let parent_tid = engine
+        .create_table("public.p", &[col_def("id", TypeCode::I128)], &[0])
+        .unwrap();
+    let child = vec![
+        col_def("cid", TypeCode::U64),
+        fk_def("pid", TypeCode::I128, parent_tid, 0),
+    ];
+    let err = engine
+        .create_table("public.c", &child, &[0])
+        .expect_err("an I128 column has no index key");
+    assert!(err.contains("FK column 1:"), "got: {err}");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── test_fk_self_reference ───────────────────────────────────────────
 
 #[test]
@@ -280,8 +332,7 @@ fn test_fk_self_reference() {
     let emp_cols = vec![
         col_def("emp_id", TypeCode::U64),
         CatalogColumn {
-            fk_table_id: next_tid,
-            fk_col_idx: 0,
+            fk: Some(FkRef { table_id: next_tid, col: 0 }),
             ..nullable_def("mgr_id", TypeCode::U64)
         },
     ];
@@ -377,8 +428,7 @@ fn test_push_reads_committed_state() {
     let tree_cols = vec![
         col_def("id", TypeCode::U64),
         CatalogColumn {
-            fk_table_id: next_tid,
-            fk_col_idx: 0,
+            fk: Some(FkRef { table_id: next_tid, col: 0 }),
             ..nullable_def("parent_id", TypeCode::U64)
         },
     ];

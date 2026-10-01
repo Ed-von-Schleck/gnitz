@@ -1549,7 +1549,7 @@ impl LogicalProgram {
                     // Total on a validated program: `validate` runs
                     // `check_col(.., ColKind::FixedIntCol)` on every `LoadColInt`,
                     // and that predicate is `TypeCode::is_fixed_int` — the same
-                    // eight codes `from_type_code` answers `Some` for. It covers
+                    // codes `from_type_code` answers `Some` for. It covers
                     // the PK arm too (`ColKind::FixedIntCol` is not payload-only, so
                     // a U128/UUID PK is rejected as `ColKindMismatch`), which is
                     // what makes the kernel's wide-column wildcard unnecessary.
@@ -2214,7 +2214,7 @@ fn cast_target(op: u32, selector: u32) -> Result<FixedInt, ExprValidateErr> {
         .and_then(TypeCode::from_wire)
         // A temporal code names no cast target of its own: the encoder spells
         // the storage type, so a decoded selector must be one too.
-        .and_then(|tc| FixedInt::from_type_code(tc).filter(|fi| fi.type_code() == tc))
+        .and_then(FixedInt::exact)
         .ok_or(ExprValidateErr::BadSelector { op, selector })
 }
 

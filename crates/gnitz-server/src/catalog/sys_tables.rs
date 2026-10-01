@@ -7,12 +7,13 @@
 
 use rustc_hash::FxHashMap;
 
-use super::{CatalogColumn, RelFacts};
+use super::RelFacts;
 use gnitz_expr::RowSource;
 use gnitz_expr::{payload_str, payload_string, payload_u64};
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::sys_rows::{
-    write_col_tab_row, write_schema_tab_row, write_table_tab_row, ColTabRow, SchemaTabRow, SysRowSink, TableTabRow,
+    write_col_tab_row, write_schema_tab_row, write_table_tab_row, ColTabRow, FkRef, SchemaTabRow, SysRowSink,
+    TableTabRow,
 };
 use gnitz_wire::MAX_COLUMNS;
 use gnitz_wire::{ColType, ColumnDef, TableDistribution, ViewProps};
@@ -46,8 +47,8 @@ const _: () = assert!(FIRST_ALLOCATED_ID >= gnitz_wire::FIRST_USER_SCHEMA_ID);
 // PK list encoding lives in gnitz-wire so the client and engine cannot drift on
 // the on-disk format. Every site spells the packers `gnitz_wire::…`, or reaches
 // them through the row decoders below.
-use gnitz_wire::unpack_pk_cols;
 pub(super) use gnitz_wire::PkColList;
+use gnitz_wire::{unpack_pk_cols, PkListRole};
 
 // ---------------------------------------------------------------------------
 // Per-family row-view decoders — the one reading of each family's *full row
@@ -89,8 +90,12 @@ pub(super) fn read_table_tab_row(batch: &Batch, row: usize) -> Result<RelationRe
     // The PK list is decoded before the placement is built: a `Keyed` prefix is
     // a leading-prefix length into it, and nothing downstream re-checks it —
     // `Placement::resolve` normalizes only the `0` sentinel.
-    let pk = unpack_pk_cols(payload_u64(batch, row, TABTAB_PAY_PK_COL_IDX))
-        .map_err(|rule| format!("catalog invariant violated: {noun} '{name}' {rule}"))?;
+    let pk = unpack_pk_cols(payload_u64(batch, row, TABTAB_PAY_PK_COL_IDX)).map_err(|rule| {
+        format!(
+            "catalog invariant violated: {noun} '{name}' {}",
+            rule.for_role(PkListRole::PrimaryKey)
+        )
+    })?;
     props
         .validate(pk.as_slice().len())
         .map_err(|e| format!("catalog invariant violated: {noun} '{name}' {e}"))?;
@@ -129,8 +134,12 @@ pub(super) struct ViewRegistration<'a> {
 /// Decode VIEW_TAB `row`.
 pub(super) fn read_view_tab_row(batch: &Batch, row: usize) -> Result<ViewRegistration<'_>, String> {
     let name = payload_str(batch, row, RELTAB_PAY_NAME);
-    let pk = unpack_pk_cols(payload_u64(batch, row, VIEWTAB_PAY_PK_COL_IDX))
-        .map_err(|rule| format!("catalog invariant violated: view '{name}' {rule}"))?;
+    let pk = unpack_pk_cols(payload_u64(batch, row, VIEWTAB_PAY_PK_COL_IDX)).map_err(|rule| {
+        format!(
+            "catalog invariant violated: view '{name}' {}",
+            rule.for_role(PkListRole::PrimaryKey)
+        )
+    })?;
     let props = ViewProps::from_row(
         payload_u64(batch, row, VIEWTAB_PAY_CAPACITY),
         payload_u64(batch, row, VIEWTAB_PAY_DELTA),
@@ -156,9 +165,17 @@ pub(super) fn read_idx_tab_row<S: RowSource>(
 ) -> Result<(u64, PkColList, gnitz_wire::IndexProps), String> {
     Ok((
         payload_u64(src, row, IDXTAB_PAY_OWNER_ID),
-        unpack_pk_cols(payload_u64(src, row, IDXTAB_PAY_SOURCE_COLS)).map_err(|rule| format!("column list {rule}"))?,
+        unpack_pk_cols(payload_u64(src, row, IDXTAB_PAY_SOURCE_COLS))
+            .map_err(|rule| rule.for_role(PkListRole::ColumnList))?,
         gnitz_wire::IndexProps::from_flags(payload_u64(src, row, IDXTAB_PAY_FLAGS))?,
     ))
+}
+
+/// A catalog column: the logical column plus its FK, already resolved.
+#[derive(Clone, Debug)]
+pub(crate) struct CatalogColumn {
+    pub(crate) def: ColumnDef,
+    pub(crate) fk: Option<FkRef>,
 }
 
 /// Decode COL_TAB `row` into the `CatalogColumn` the schema builder consumes. Every
@@ -180,6 +197,12 @@ pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> Result<Cata
     let scale = word("scale", COLTAB_PAY_SCALE, u8::MAX as u64)? as u8;
     let ty = ColType::from_wire(code, scale)
         .ok_or_else(|| format!("column record carries an invalid column type {code}/{scale}"))?;
+    let fk_col = word("fk_col_idx", COLTAB_PAY_FK_COL_IDX, u32::MAX as u64)? as u32;
+    let fk = match (payload_u64(src, row, COLTAB_PAY_FK_TABLE_ID), fk_col) {
+        (0, 0) => None,
+        (0, col) => return Err(format!("column record carries FK column {col} with no FK table")),
+        (table_id, col) => Some(FkRef { table_id, col }),
+    };
     Ok(CatalogColumn {
         def: ColumnDef {
             name: payload_string(src, row, COLTAB_PAY_NAME),
@@ -187,8 +210,7 @@ pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> Result<Cata
             is_nullable: flag("is_nullable", COLTAB_PAY_IS_NULLABLE)?,
             is_hidden: flag("is_hidden", COLTAB_PAY_IS_HIDDEN)?,
         },
-        fk_table_id: payload_u64(src, row, COLTAB_PAY_FK_TABLE_ID),
-        fk_col_idx: word("fk_col_idx", COLTAB_PAY_FK_COL_IDX, u32::MAX as u64)? as u32,
+        fk,
     })
 }
 
@@ -200,8 +222,7 @@ impl CatalogColumn {
             owner_id,
             col_idx: col_idx as u64,
             col: &self.def,
-            fk_table_id: self.fk_table_id,
-            fk_col_idx: self.fk_col_idx as u64,
+            fk: self.fk,
         };
         write_col_tab_row(sink, &row, weight);
     }
@@ -448,7 +469,10 @@ impl SysFamily {
         self.wire()
             .cols
             .iter()
-            .map(|c| ColumnDef::new(c.name, c.type_code, c.nullable).into())
+            .map(|c| CatalogColumn {
+                def: ColumnDef::new(c.name, c.type_code, c.nullable),
+                fk: None,
+            })
             .collect()
     }
 

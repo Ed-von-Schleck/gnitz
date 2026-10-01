@@ -56,7 +56,7 @@ fn live_views(client: &mut GnitzClient) -> Vec<(u64, u64)> {
     let owners = &b.payload[VIEWTAB_PAY_OWNER_VIEW_ID].bytes;
     let mut out: Vec<_> = (0..b.len())
         .filter(|&i| b.weights[i] > 0)
-        .map(|i| (b.pks.get(view_tab, i) as u64, gnitz_wire::read_u64_le(owners, i * 8)))
+        .map(|i| (b.pks.get(i) as u64, gnitz_wire::read_u64_le(owners, i * 8)))
         .collect();
     out.sort();
     out
@@ -64,7 +64,7 @@ fn live_views(client: &mut GnitzClient) -> Vec<(u64, u64)> {
 
 /// Every row view `vid` holds, as [`weighted_rows`].
 fn view_rows(client: &mut GnitzClient, vid: u64, schema: &Arc<Schema>) -> Vec<(u64, Vec<i64>, i64)> {
-    weighted_rows(&scan_all(client, vid, schema), schema)
+    weighted_rows(&scan_all(client, vid, schema))
 }
 
 #[test]
@@ -86,7 +86,7 @@ fn a_chain_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
     assert_eq!(live_views(&mut client), chain_views);
 
     // Every view holds the base's rows at weight 1.
-    let base = weighted_rows(&base_rows(&schema), &schema);
+    let base = weighted_rows(&base_rows(&schema));
     for &(vid, _) in &chain_views {
         assert_eq!(view_rows(&mut client, vid, &schema), base, "view {vid}");
     }
@@ -136,7 +136,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
     assert_eq!(live_views(&mut client), only_taken);
     assert_eq!(
         view_rows(&mut client, taken, &schema),
-        weighted_rows(&base_rows(&schema), &schema)
+        weighted_rows(&base_rows(&schema))
     );
 
     // A segment naming a later segment scans a relation no older than itself.

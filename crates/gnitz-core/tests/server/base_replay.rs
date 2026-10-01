@@ -42,8 +42,8 @@ fn acked_pushes_survive_a_worker_counter_ahead_of_the_zone_seed() {
 
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     assert_eq!(
-        weighted_rows(&scan_all(&mut client, tid, &schema), &schema),
-        weighted_rows(&rows(&schema, keys), &schema),
+        weighted_rows(&scan_all(&mut client, tid, &schema)),
+        weighted_rows(&rows(&schema, keys)),
         "every ACKed push must survive at weight 1"
     );
 }

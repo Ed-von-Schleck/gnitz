@@ -234,7 +234,10 @@ fn cols_of(schema: &gnitz_zset::schema::SchemaDescriptor) -> Vec<CatalogColumn> 
     (0..schema.num_columns())
         .map(|ci| {
             let c = schema.column(ci).expect("in range");
-            ColumnDef::new(format!("c{ci}"), c.type_code, c.nullable).into()
+            CatalogColumn {
+                def: ColumnDef::new(format!("c{ci}"), c.type_code, c.nullable),
+                fk: None,
+            }
         })
         .collect()
 }

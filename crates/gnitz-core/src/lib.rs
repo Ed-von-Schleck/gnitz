@@ -14,7 +14,7 @@ mod protocol;
 mod test_support;
 
 pub use client::{
-    key_reply, not_found, qualified_name, retraction_batch, segment_id, GnitzClient, InlineForeignKey,
+    key_reply, not_found, qualified_name, retraction_batch, segment_id, FkTarget, GnitzClient, InlineForeignKey,
     InlineUniqueIndex, ParkHook, PlannedView, ViewBundle, MAX_CHAIN_SEGMENTS, RMW_MAX_ATTEMPTS,
 };
 pub use connection::{
@@ -28,6 +28,6 @@ pub use protocol::message::{encode_ddl_txn, PushFamily};
 pub(crate) use protocol::message::{encode_frame, encode_push_txn};
 pub(crate) use protocol::transport::{hello_handshake, ClientTransport};
 pub use protocol::types::{
-    push_zero_cell, sys_schema, BatchAppender, BatchMark, FkTarget, PayloadColumn, PkColumn, Schema, ZSetBatch,
+    push_zero_cell, sys_schema, BatchAppender, BatchMark, PayloadColumn, PkColumn, Schema, ZSetBatch,
 };
 pub use protocol::wal_block::decode_regions_into;

@@ -45,7 +45,7 @@ fn create_table(client: &mut GnitzClient, schema: Schema) -> (String, u64, Arc<S
 /// payload column of `schema` is an I64.
 fn rows(schema: &Schema, pks: impl IntoIterator<Item = u64>) -> ZSetBatch {
     let mut batch = ZSetBatch::new(schema);
-    let mut app = BatchAppender::new(&mut batch, schema);
+    let mut app = BatchAppender::new(&mut batch);
     for pk in pks {
         let row = app.add_row(pk as u128, 1);
         for j in 0..schema.columns.len() - 1 {
@@ -64,12 +64,12 @@ fn scan_all(client: &mut GnitzClient, tid: u64, schema: &Arc<Schema>) -> ZSetBat
 }
 
 /// `(pk, payload cells, weight)` of every row of `batch`, sorted; every payload
-/// column of `schema` is an I64.
-fn weighted_rows(batch: &ZSetBatch, schema: &Schema) -> Vec<(u64, Vec<i64>, i64)> {
+/// column is an I64.
+fn weighted_rows(batch: &ZSetBatch) -> Vec<(u64, Vec<i64>, i64)> {
     let mut out: Vec<_> = (0..batch.len())
         .map(|i| {
             let cells = batch.payload.iter().map(|p| read_i64_le(&p.bytes, i * 8)).collect();
-            (batch.pks.get(schema, i) as u64, cells, batch.weights[i])
+            (batch.pks.get(i) as u64, cells, batch.weights[i])
         })
         .collect();
     out.sort();

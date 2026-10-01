@@ -19,7 +19,7 @@ fn scan_spec_at_a_system_tid_is_served_once_and_checks_its_layout() {
         .scan_spec(TABLE_TAB, &ReadSpec::all_rows(ReadBound::None), tables)
         .unwrap()
         .batch;
-    let mut pks: Vec<u128> = (0..batch.len()).map(|i| batch.pks.get(tables, i)).collect();
+    let mut pks: Vec<u128> = (0..batch.len()).map(|i| batch.pks.get(i)).collect();
     pks.sort_unstable();
     pks.dedup();
     assert!(!pks.is_empty(), "the family holds its own seed rows");

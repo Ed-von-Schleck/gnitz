@@ -834,6 +834,8 @@ fn each_refused_form_names_its_rule() {
             vec![dec(2), dec(3)],
             "DECIMAL scale 24 exceeds 18",
         ),
+        // Past what the scale's own `u8` holds.
+        (&["c1"; 15].join(" * "), vec![dec(18)], "DECIMAL scale 255 exceeds 18"),
         (
             &format!("c1 + {q7}"),
             vec![dec(2), dec(3)],

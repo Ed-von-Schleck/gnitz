@@ -27,7 +27,7 @@ crate::wire_enum! {
         Timestamp = 17,
         /// A fixed-point number: physically an `I64` holding the value times
         /// `10^scale`. The scale is a per-column fact carried beside the code
-        /// ([`ColType`], `META_FLAG` scale bits, `COL_TAB.scale`); storage, ordering,
+        /// ([`ColType`], the schema record's scale byte, `COL_TAB.scale`); storage, ordering,
         /// routing and the VM see the integer alone.
         Decimal = 18,
     }
@@ -61,8 +61,7 @@ impl TypeCode {
 
     /// The two calendar types. Each is an integer of a fixed width under a
     /// different name: every storage, ordering and VM path treats it as
-    /// [`Self::storage_type`], and only the SQL surface and the clients see the
-    /// name.
+    /// [`Self::storage_type`].
     #[inline(always)]
     pub const fn is_temporal(self) -> bool {
         matches!(self, TypeCode::Date | TypeCode::Timestamp)
@@ -70,11 +69,7 @@ impl TypeCode {
 
     /// The integer type a value of this type is stored, ordered and computed as:
     /// `I32` for `Date`, `I64` for `Timestamp` and `Decimal`, and the type
-    /// itself otherwise. The one place that map is written: the predicates such a
-    /// type must answer like its storage type ([`Self::is_signed_int`],
-    /// [`Self::is_fixed_int`]) and the promotions it must follow
-    /// ([`index_key_type`], [`Self::join_key_common_type`]) all read it, so a
-    /// further named integer needs no arm of its own in any of them.
+    /// itself otherwise.
     #[inline(always)]
     pub const fn storage_type(self) -> TypeCode {
         match self {
@@ -91,7 +86,7 @@ impl TypeCode {
     }
 
     /// The type of the register image the engine materializes for a computed
-    /// value of this source type: any float lands as `F64` (`LOAD_COL_FLOAT`
+    /// value of this source type: any float lands as `F64` (`LoadColFloat`
     /// widens `F32` on load), `U64` stays unsigned so a downstream compare
     /// re-seeds the unsigned variant, and every other integer normalizes to
     /// `I64`. A register sink stores that image whole, so a computed column typed
@@ -173,25 +168,7 @@ impl TypeCode {
         self.is_fixed_int() || self.is_wide_int()
     }
 
-    /// Whether a SERIAL primary key may have this type: the plain integers of at
-    /// most 8 bytes, which store a drawn id as itself.
-    #[inline(always)]
-    pub const fn is_serial_eligible(self) -> bool {
-        matches!(
-            self,
-            TypeCode::U8
-                | TypeCode::I8
-                | TypeCode::U16
-                | TypeCode::I16
-                | TypeCode::U32
-                | TypeCode::I32
-                | TypeCode::U64
-                | TypeCode::I64
-        )
-    }
-
-    /// Byte stride (width) of this type in a column payload. The single width
-    /// table.
+    /// Byte stride (width) of this type in a column payload.
     #[inline(always)]
     pub const fn wire_stride(self) -> usize {
         match self {
@@ -436,13 +413,11 @@ pub fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], tc: Type
 /// `wire_stride(I64) == wire_stride(U64) == 8`, so the sign the promotion picks
 /// never moves the index record's arity or stride.
 pub fn index_key_type(field_type: TypeCode) -> Option<TypeCode> {
-    use TypeCode as T;
-    match field_type.storage_type() {
-        T::U128 => Some(T::U128),
-        T::UUID => Some(T::UUID),
-        T::U64 | T::U32 | T::U16 | T::U8 => Some(T::U64),
-        T::I64 | T::I32 | T::I16 | T::I8 => Some(T::I64),
-        T::F32 | T::F64 | T::String | T::Blob | T::I128 | T::Date | T::Timestamp | T::Decimal => None,
+    match FixedInt::from_type_code(field_type) {
+        Some(fi) if fi.is_signed() => Some(TypeCode::I64),
+        Some(_) => Some(TypeCode::U64),
+        None if matches!(field_type, TypeCode::U128 | TypeCode::UUID) => Some(field_type),
+        None => None,
     }
 }
 
@@ -476,8 +451,7 @@ pub fn index_key_types(col_types: &[TypeCode], src_pk_count: usize) -> Result<Ve
 /// only the indexed columns are promoted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexKeyRule {
-    /// STRING/BLOB/float/I128 has no order-preserving
-    /// fixed-width index key to promote to.
+    /// A column type [`index_key_type`] promotes to no index key.
     NotEligible { col: usize, type_code: TypeCode },
     /// The index record is the indexed columns plus the source PK, and every one
     /// of them is a PK column, so their total arity is capped by
@@ -506,7 +480,7 @@ impl core::fmt::Display for IndexKeyRule {
 /// string, so the *rule set* stays in one place while a layer that can say more
 /// than the rule knows renders its own message. Only the SQL planner does: it
 /// names the offending column by its SQL identifier. The client and the engine
-/// catalog both take `Display`'s neutral wording.
+/// catalog both take [`PkRule::for_role`]'s wording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkRule {
     /// The word carries no [`crate::PK_LIST_PACKED_FLAG`]. The one rule about the
@@ -533,7 +507,7 @@ pub enum PkRule {
 /// rules are equally a secondary index's column-list rules, so only the noun
 /// differs. Not a `&str`, which a call site could spell wrong unnoticed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PkListRole {
+pub enum PkListRole {
     PrimaryKey,
     ColumnList,
 }
@@ -550,7 +524,7 @@ impl PkListRole {
 
 impl PkRule {
     /// This rule's message, worded for the list it is about.
-    pub(crate) fn for_role(&self, role: PkListRole) -> String {
+    pub fn for_role(&self, role: PkListRole) -> String {
         let what = role.noun();
         match *self {
             PkRule::NotPacked => format!("{what} word carries no packed-list flag"),
@@ -567,14 +541,6 @@ impl PkRule {
             ),
             PkRule::Nullable { col } => format!("{what} column {col} must not be nullable"),
         }
-    }
-}
-
-/// The primary-key wording — the role every caller that does not say otherwise
-/// is about.
-impl core::fmt::Display for PkRule {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.for_role(PkListRole::PrimaryKey))
     }
 }
 
@@ -607,17 +573,15 @@ pub(crate) fn validate_pk_indices(pk_cols: &[u32], ncols: usize, max_pk: usize) 
 
 /// Both halves of the primary-key admission rule — the structural half, then
 /// each column's type and nullability — for the callers that hold the columns up
-/// front. Returns the validated `pk_stride`, within `MAX_PK_BYTES` since `max_pk`
-/// is at most `MAX_PK_COLUMNS` and every PK-eligible type at most 16 bytes.
+/// front.
 pub fn validate_pk_tuple(
     pk_cols: &[u32],
     ncols: usize,
     max_pk: usize,
     col: impl Fn(u32) -> (TypeCode, bool),
-) -> Result<usize, PkRule> {
+) -> Result<(), PkRule> {
     debug_assert!(max_pk <= crate::MAX_PK_COLUMNS);
     validate_pk_indices(pk_cols, ncols, max_pk)?;
-    let mut stride = 0;
     for &c in pk_cols {
         let (type_code, nullable) = col(c);
         if !type_code.is_pk_eligible() {
@@ -626,9 +590,8 @@ pub fn validate_pk_tuple(
         if nullable {
             return Err(PkRule::Nullable { col: c });
         }
-        stride += type_code.wire_stride();
     }
-    Ok(stride)
+    Ok(())
 }
 
 /// A fixed-width integer column type — ≤ 8 bytes, any sign. This is the exact
@@ -673,8 +636,16 @@ impl FixedInt {
         }
     }
 
-    /// The type code this width names — the inverse of [`Self::from_type_code`],
-    /// so a narrowed target can be written back to the wire.
+    /// `tc` itself as a fixed int: `None` for a type that is only stored as one.
+    pub const fn exact(tc: TypeCode) -> Option<Self> {
+        match Self::from_type_code(tc) {
+            Some(fi) if fi.type_code().as_wire() == tc.as_wire() => Some(fi),
+            _ => None,
+        }
+    }
+
+    /// The type code this fixed int is stored as. It inverts
+    /// [`Self::from_type_code`] only where [`Self::exact`] is `Some`.
     pub const fn type_code(self) -> TypeCode {
         match self {
             Self::U8 => TypeCode::U8,
@@ -765,8 +736,7 @@ impl FixedInt {
 }
 
 /// The ≤8-byte scalar register image of a column type: the domain on which
-/// "read these native-LE bytes as a number" is total. THE shared rule: every
-/// consumer resolves a column through it, so no two can disagree about one.
+/// "read these native-LE bytes as a number" is total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarKind {
     Int(FixedInt),
@@ -783,11 +753,6 @@ impl ScalarKind {
             (TypeCode::F64, None) => Some(Self::F64),
             _ => None,
         }
-    }
-
-    #[inline(always)]
-    pub const fn is_float(self) -> bool {
-        matches!(self, Self::F32 | Self::F64)
     }
 }
 

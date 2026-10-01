@@ -7,7 +7,7 @@
 use crate::catalog::{CatalogColumn, CatalogEngine, SysFamily, PUBLIC_SCHEMA_ID};
 use gnitz_expr::{ColumnTable, SchemaFacts};
 use gnitz_wire::sys_rows::{
-    write_circuit_rows, write_idx_tab_row, write_schema_tab_row, write_table_tab_row, IdxTabRow, SchemaTabRow,
+    write_circuit_rows, write_idx_tab_row, write_schema_tab_row, write_table_tab_row, FkRef, IdxTabRow, SchemaTabRow,
     SysRowSink, TableTabRow,
 };
 use gnitz_wire::Circuit;
@@ -37,7 +37,10 @@ pub fn scratch_dir(scope: &str, name: &str) -> String {
 
 /// A plain non-nullable, non-FK, non-hidden column of the given type.
 pub fn col_def(name: &str, type_code: TypeCode) -> CatalogColumn {
-    ColumnDef::new(name, type_code, false).into()
+    CatalogColumn {
+        def: ColumnDef::new(name, type_code, false),
+        fk: None,
+    }
 }
 
 /// A plain non-nullable UUID column.
@@ -47,14 +50,16 @@ pub fn uuid_def(name: &str) -> CatalogColumn {
 
 /// A nullable column of the given type.
 pub fn nullable_def(name: &str, type_code: TypeCode) -> CatalogColumn {
-    ColumnDef::new(name, type_code, true).into()
+    CatalogColumn {
+        def: ColumnDef::new(name, type_code, true),
+        fk: None,
+    }
 }
 
 /// A column of `type_code` carrying an FK onto `(parent_tid, parent_col)`.
 pub fn fk_def(name: &str, type_code: TypeCode, parent_tid: u64, parent_col: u32) -> CatalogColumn {
     CatalogColumn {
-        fk_table_id: parent_tid,
-        fk_col_idx: parent_col,
+        fk: Some(FkRef { table_id: parent_tid, col: parent_col }),
         ..col_def(name, type_code)
     }
 }

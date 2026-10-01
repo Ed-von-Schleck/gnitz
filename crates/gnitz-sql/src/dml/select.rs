@@ -346,7 +346,7 @@ fn plan_constant(query: &Query, select: &Select) -> Result<(Arc<Schema>, ZSetBat
     }
     let mut finish = FoldFinish::new(Arc::new(ground), [], &[], items)?;
     let mut ground_row = ZSetBatch::with_capacity(&finish.partial_schema, 1);
-    BatchAppender::new(&mut ground_row, &finish.partial_schema).add_row(gnitz_wire::global_group_key(), 1);
+    BatchAppender::new(&mut ground_row).add_row(gnitz_wire::global_group_key(), 1);
     Ok((Arc::clone(finish.out_schema()), finish.finish(ground_row)))
 }
 

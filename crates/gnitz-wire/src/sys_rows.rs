@@ -54,27 +54,34 @@ pub fn write_schema_tab_row(sink: &mut impl SysRowSink, r: &SchemaTabRow, weight
 // COL_TAB
 // ---------------------------------------------------------------------------
 
+/// The column a FOREIGN KEY column references.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FkRef {
+    pub table_id: u64,
+    pub col: u32,
+}
+
 /// One `COL_TAB` row: column `col_idx` of the table or view `owner_id`.
-///
-/// `fk_table_id` is the **resolved** parent id; `0` means "no FK". A client's
-/// deferred self-reference is substituted before a row reaches here.
 pub struct ColTabRow<'a> {
     pub owner_id: u64,
     pub col_idx: u64,
     pub col: &'a crate::ColumnDef,
-    pub fk_table_id: u64,
-    pub fk_col_idx: u64,
+    /// The **resolved** parent column. A client's deferred self-reference is
+    /// substituted before a row reaches here.
+    pub fk: Option<FkRef>,
 }
 
 /// Write one `COL_TAB` row, keyed by the compound `(owner_id, col_idx)` — the
 /// identity of a column record, so neither half is repeated in the payload.
 pub fn write_col_tab_row(sink: &mut impl SysRowSink, r: &ColTabRow, weight: i64) {
+    // COL_TAB stores "no FK" as table id 0, which no relation has.
+    let (fk_table_id, fk_col_idx) = r.fk.map_or((0, 0), |fk| (fk.table_id, fk.col as u64));
     sink.begin_row(&[r.owner_id as u128, r.col_idx as u128], weight);
     sink.put_string(&r.col.name);
     sink.put_u64(r.col.ty.tc.as_wire() as u64);
     sink.put_u64(r.col.is_nullable as u64);
-    sink.put_u64(r.fk_table_id);
-    sink.put_u64(r.fk_col_idx);
+    sink.put_u64(fk_table_id);
+    sink.put_u64(fk_col_idx);
     sink.put_u64(r.col.is_hidden as u64);
     sink.put_u64(r.col.ty.scale as u64);
     sink.end_row();

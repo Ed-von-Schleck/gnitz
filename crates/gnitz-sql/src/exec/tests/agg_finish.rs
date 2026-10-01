@@ -46,7 +46,7 @@ fn plan(sql: &str, rel: &Arc<RelDescriptor>) -> FoldFinish {
 fn reply(f: &FoldFinish, rows: &[(&[u128], &[Cell])]) -> ZSetBatch {
     let schema = f.partial_schema.as_ref();
     let mut b = ZSetBatch::new(schema);
-    let mut app = BatchAppender::new(&mut b, schema);
+    let mut app = BatchAppender::new(&mut b);
     for &(key, cells) in rows {
         app.add_row_natives(key, 1);
         for cell in cells {
