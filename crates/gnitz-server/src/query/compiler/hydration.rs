@@ -78,7 +78,7 @@ fn seed_node(loaded: &LoadedCircuit) -> Result<SeedAt, String> {
     if loaded.exchange_shards().next().is_some() {
         return Err(UNSUPPORTED.into());
     }
-    let (origin, _) = row_local_origin(loaded, loaded.inputs(loaded.sink()?).unary());
+    let origin = row_local_origin(loaded, loaded.inputs(loaded.sink()?).unary());
     match loaded.op(origin) {
         OpNode::ScanDelta { source, .. } => return Ok(SeedAt::Scan { node: origin, source: *source }),
         OpNode::Union => {}

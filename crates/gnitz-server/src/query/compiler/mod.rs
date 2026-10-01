@@ -123,14 +123,12 @@ fn keeps_rows_and_pk_region(op: &gnitz_wire::OpNode) -> bool {
 }
 
 /// Walk back from `from` through nodes that keep rows and the PK region, to the
-/// first node that does not: `(that node, whether a Map was crossed)`.
-fn row_local_origin(loaded: &LoadedCircuit, mut from: NodeId) -> (NodeId, bool) {
-    let mut mapped = false;
+/// first node that does not.
+fn row_local_origin(loaded: &LoadedCircuit, mut from: NodeId) -> NodeId {
     while keeps_rows_and_pk_region(loaded.op(from)) {
-        mapped |= matches!(loaded.op(from), gnitz_wire::OpNode::Map(_));
         from = loaded.inputs(from).unary();
     }
-    (from, mapped)
+    from
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +308,7 @@ pub(super) fn compile_view(
         let schema = *plan.vm.program.out_schema();
         let scatter = Rc::new(ScatterPlan::group(&schema, side.cols)?);
         let stays = self_contained
-            || (carve.sides.len() == 1 && routing::skips_output_exchange(loaded, side.shard, side.cols, registry));
+            || (carve.sides.len() == 1 && routing::skips_output_exchange(loaded, side.shard, &scatter, registry));
         let relay = match () {
             _ if stays => None,
             _ if emits_replica(&plan, registry) => Some(Relay::Share(scatter)),

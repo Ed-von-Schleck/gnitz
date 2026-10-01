@@ -361,6 +361,16 @@ mod pack_proptest {
                     let mut got = vec![0xA5u8; n * stride];
                     packer.pack_rows(&mut got, stride, &mb, start, n);
                     prop_assert_eq!(&got, &want, "first key column {}", first);
+                    // An identity key is each column's own OPK image, end to end:
+                    // every unpromoted one, which the scatter then routes unpacked.
+                    let own = packer.identity_columns().map(|locs| -> Vec<u8> {
+                        (start..rows)
+                            .flat_map(|r| locs.iter().map(move |l| (r, *l)))
+                            .flat_map(|(r, l)| l.opk_image(&mb, r).to_be_bytes()[16 - l.size()..].to_vec())
+                            .collect()
+                    });
+                    prop_assert!(own.is_some() || promoted, "an unpromoted key is an identity");
+                    prop_assert!(own.is_none_or(|own| own == want), "first key column {}", first);
                     for (i, row) in want.chunks_exact(stride).enumerate() {
                         let mut one = vec![0u8; stride];
                         packer.pack_into(&mut one, &mb, start + i);

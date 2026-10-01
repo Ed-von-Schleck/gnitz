@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::runtime::sal::MAX_WORKERS;
 use crate::runtime::w2m::SalWake;
 use gnitz_foundation::posix_io;
-use gnitz_store::ops::{op_exchange_gather, op_exchange_route, ScatterPlan};
+use gnitz_store::ops::{op_exchange_gather, ScatterPlan};
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::{Batch, Layout, WalBlock};
 
@@ -194,7 +194,7 @@ impl Mesh {
         let nw = self.nw();
         let shared = match plan {
             Some(p) => {
-                op_exchange_route(batch, p, &mut self.routed, nw);
+                p.route(batch, &mut self.routed, nw);
                 false
             }
             None => {

@@ -1,7 +1,6 @@
 use super::*;
 use crate::query::compiler::fixtures::*;
 use crate::test_support::{make_schema_u64_i64, pk_payload_schema, scan_keyed, self_typed_slots};
-use gnitz_store::ops::op_exchange_route;
 use gnitz_store::schema::{Placement, SchemaColumn};
 use gnitz_store::storage::BatchBuilder;
 use gnitz_wire::{Circuit, ComputeMap, JoinKind, KeyRange, NullKeys, PkColList, RangeRel, ReindexRole, TypeCode};
@@ -64,8 +63,8 @@ fn assert_routes_by(relay: Option<&Relay>, schema: &SchemaDescriptor, cols: &[u3
     let want = ScatterPlan::join(schema, &self_typed_slots(schema, cols)).unwrap();
     let (mut got_lists, mut want_lists) = (Vec::new(), Vec::new());
     assert_eq!(
-        op_exchange_route(&probe, got, &mut got_lists, 4),
-        op_exchange_route(&probe, &want, &mut want_lists, 4)
+        got.route(&probe, &mut got_lists, 4),
+        want.route(&probe, &mut want_lists, 4)
     );
 }
 
@@ -78,14 +77,10 @@ fn assert_routes_by(relay: Option<&Relay>, schema: &SchemaDescriptor, cols: &[u3
 fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_by_the_shard_key() {
     // PK last, so a shard column behind a map — an index into the map's output,
     // whose leading slots are the source PK — is not the source's column index.
-    let pk_last = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::U64, false),
-        ],
-        &[2],
-    );
+    let i64 = SchemaColumn::new(TypeCode::I64, false);
+    let u64 = SchemaColumn::new(TypeCode::U64, false);
+    let pk_last = SchemaDescriptor::new(&[i64, i64, u64], &[2]);
+    let clustered = clustered_schema();
     let compute = |c: &mut Circuit, n: NodeId| {
         c.map_expr(
             n,
@@ -96,16 +91,29 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
         )
     };
     type Mid = fn(&mut Circuit, NodeId) -> NodeId;
-    let cases: [(&str, SchemaDescriptor, Mid, &[u32], bool); 14] = [
-        ("a bare scan", pk_last, |_, n| n, &[2], true),
-        ("a payload column", pk_last, |_, n| n, &[0], false),
-        ("an empty key", pk_last, |_, n| n, &[], false),
-        ("the CLUSTER BY prefix", clustered_schema(), |_, n| n, &[0], true),
-        ("not the leading PK column", clustered_schema(), |_, n| n, &[1], false),
+    let mapped = SchemaDescriptor::new(&[u64, i64, i64], &[0]);
+    let key_only = SchemaDescriptor::new(&[u64], &[0]);
+    let rekeyed = SchemaDescriptor::new(&[i64, i64], &[0]);
+    // (why, the source, the walk, the schema it hands the shard, shard columns, skipped)
+    type Case = (
+        &'static str,
+        SchemaDescriptor,
+        Mid,
+        SchemaDescriptor,
+        &'static [u32],
+        bool,
+    );
+    let cases: [Case; 14] = [
+        ("a bare scan", pk_last, |_, n| n, pk_last, &[2], true),
+        ("a payload column", pk_last, |_, n| n, pk_last, &[0], false),
+        ("an empty key", pk_last, |_, n| n, pk_last, &[], false),
+        ("the CLUSTER BY prefix", clustered, |_, n| n, clustered, &[0], true),
+        ("not the leading PK column", clustered, |_, n| n, clustered, &[1], false),
         (
             "a filter is transparent",
             pk_last,
             |c, n| c.filter(n, dummy_expr_blob()),
+            pk_last,
             &[2],
             true,
         ),
@@ -113,6 +121,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
             "a copy list carries the PK region to its leading slot",
             pk_last,
             |c, n| c.map(n, &[0, 1]),
+            mapped,
             &[0],
             true,
         ),
@@ -120,10 +129,18 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
             "a payload slot behind a map",
             pk_last,
             |c, n| c.map(n, &[0, 1]),
+            mapped,
             &[1],
             false,
         ),
-        ("an expression map carries the PK region", pk_last, compute, &[0], true),
+        (
+            "an expression map carries the PK region",
+            pk_last,
+            compute,
+            key_only,
+            &[0],
+            true,
+        ),
         (
             "filters and maps interleave",
             pk_last,
@@ -132,6 +149,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
                 let m = c.map(f, &[0, 1]);
                 c.filter(m, dummy_expr_blob())
             },
+            mapped,
             &[0],
             true,
         ),
@@ -139,6 +157,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
             "a reindex re-keys the PK",
             pk_last,
             |c, n| aux_reindex(c, n, &[(0, TypeCode::I64)]),
+            rekeyed,
             &[0],
             false,
         ),
@@ -146,6 +165,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
             "a WorkerFilter is not a Filter",
             pk_last,
             |c, n| c.worker_filter(n),
+            pk_last,
             &[2],
             false,
         ),
@@ -156,6 +176,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
                 let other = scan(c, 8);
                 c.union(n, other)
             },
+            pk_last,
             &[2],
             false,
         ),
@@ -167,17 +188,19 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
                 let u = c.union(n, other);
                 c.filter(u, dummy_expr_blob())
             },
+            pk_last,
             &[2],
             false,
         ),
     ];
-    for (why, schema, mid, cols, want) in cases {
+    for (why, schema, mid, at_shard, cols, want) in cases {
         let mut c = Circuit::default();
         let source = scan(&mut c, 7);
         let tip = mid(&mut c, source);
         let shard = c.shard(tip, cols);
+        let scatter = ScatterPlan::group(&at_shard, cols).expect(why);
         assert_eq!(
-            skips_output_exchange(&loaded(c), shard, cols, &sources([(7, schema)])),
+            skips_output_exchange(&loaded(c), shard, &scatter, &sources([(7, schema)])),
             want,
             "{why}"
         );

@@ -1,8 +1,8 @@
 //! XXH3 hashing — the one owner in the workspace.
 //!
-//! Both ends compute some of these (the wide-PK routing hash, the global group
-//! key) and the engine alone computes the rest (shard and manifest header
-//! digests, row and group identity). They live together because a second XXH3
+//! Both ends compute the global group key and the engine alone computes the
+//! rest (the wide-PK routing hash, shard and manifest header digests, row and
+//! group identity). They live together because a second XXH3
 //! definition elsewhere could drift from this one with nothing to catch it:
 //! `global_group_key` and `FoldCols::key_row` have to agree bit for bit across
 //! the wire, and they only do so by calling the same function.

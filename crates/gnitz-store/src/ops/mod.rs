@@ -8,7 +8,7 @@
 //!   - `topn`      — per-group top-N over an ordered index of every input row
 //!   - `order_image` — the byte images both indexes order by
 //!   - `clamp`     — the weight clamps every set operation is built from
-//!   - `exchange`  — repartition and broadcast across workers
+//!   - `exchange`  — the scatter plan and the gather of a worker exchange
 //!   - `group_key` — the shared key machinery
 //!   - `reindex`   — the key composers a reindex Map and an exchange scatter share
 //!
@@ -38,8 +38,7 @@ mod topn;
 mod bench_join;
 
 pub use clamp::op_weight_clamp;
-pub use exchange::op_worker_filter;
-pub use exchange::{op_exchange_gather, op_exchange_route, ScatterPlan};
+pub use exchange::{op_exchange_gather, op_worker_filter, ScatterPlan};
 pub use join::{op_join_delta_trace, JoinPlan, JoinProbe};
 pub use linear::{null_extend_output_schema, op_filter, op_union, union_nullability_merge};
 pub use map::MapPlan;

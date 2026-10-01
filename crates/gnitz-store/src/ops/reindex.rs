@@ -1,8 +1,9 @@
 //! The operator key composers: the hashed key bytes of a string column's content
 //! and a group key's fold slot, and [`ReindexPacker`], which packs a reindex
 //! column list into the contiguous OPK region a `_join_pk` or a group key holds.
-//! The reindex Map and the exchange scatter both key rows through it, so the
-//! reindexed trace side and the scattered delta co-partition byte-for-byte.
+//! The reindex Map keys rows through it and the exchange scatter routes by the
+//! bytes it packs, so the reindexed trace side and the scattered delta
+//! co-partition byte-for-byte.
 
 use std::cell::Cell;
 

@@ -132,11 +132,7 @@ impl ViewMeta {
 /// The relation whose PK region the view's output PK region is, byte for byte.
 /// `None` unless a walk back from the sink proves it.
 fn pk_source(loaded: &LoadedCircuit) -> Option<u64> {
-    loaded
-        .sink()
-        .ok()
-        .and_then(|sink| scan_through_row_local(loaded, sink))
-        .map(|(tid, _)| tid)
+    loaded.sink().ok().and_then(|sink| scan_through_row_local(loaded, sink))
 }
 
 /// The key whose owner a view's rows sit on.
@@ -327,12 +323,11 @@ fn source_uses(loaded: &LoadedCircuit) -> Result<(FxHashMap<u64, SourceUse>, Opt
     Ok((uses, circuit_relay))
 }
 
-/// The `ScanDelta` the row-local walk back from `enid`'s input ends at: `(table
-/// id, whether a Map was crossed)`.
-fn scan_through_row_local(loaded: &LoadedCircuit, enid: NodeId) -> Option<(u64, bool)> {
-    let (origin, mapped) = row_local_origin(loaded, loaded.inputs(enid).unary());
-    match loaded.op(origin) {
-        gnitz_wire::OpNode::ScanDelta { source, .. } => Some(((*source), mapped)),
+/// The source of the `ScanDelta` the row-local walk back from `enid`'s input
+/// ends at.
+fn scan_through_row_local(loaded: &LoadedCircuit, enid: NodeId) -> Option<u64> {
+    match loaded.op(row_local_origin(loaded, loaded.inputs(enid).unary())) {
+        gnitz_wire::OpNode::ScanDelta { source, .. } => Some(*source),
         _ => None,
     }
 }
@@ -349,29 +344,19 @@ enum JoinRelay {
     Broadcast,
 }
 
-/// True iff the view's output `ExchangeShard` at `enid` would move nothing: it
-/// shards by a key its scan's own distribution already routes rows to.
+/// True when the view's output `ExchangeShard` at `enid` moves nothing:
+/// `scatter`, the plan over the shard's input, hashes the bytes the scan behind
+/// it placed its rows by. The row-local walk back to that scan carries the PK
+/// region through, so a prefix of the input's PK is that prefix of the scan's.
 pub(super) fn skips_output_exchange(
     loaded: &LoadedCircuit,
     enid: NodeId,
-    shard_cols: &[u32],
+    scatter: &ScatterPlan,
     registry: &RelationRegistry,
 ) -> bool {
-    let Some((tid, mapped)) = scan_through_row_local(loaded, enid) else {
-        return false;
-    };
-    let Some(schema) = registry.relation(tid).map(Relation::schema) else {
-        return false;
-    };
-    // Behind a map, shard column `c` is source PK column `c`, or a payload slot.
-    let source_cols: Option<Vec<u32>> = match mapped {
-        false => Some(shard_cols.to_vec()),
-        true => shard_cols
-            .iter()
-            .map(|&c| schema.pk_cols().get(c as usize).copied())
-            .collect(),
-    };
-    source_cols.is_some_and(|c| ScatterPlan::group(&schema, &c).is_ok_and(|p| p.routes_to_native_owner(&schema)))
+    scan_through_row_local(loaded, enid)
+        .and_then(|tid| registry.relation(tid))
+        .is_some_and(|source| scatter.routes_to_native_owner(&source.schema()))
 }
 
 /// The relay one `Join` node's kind calls for.

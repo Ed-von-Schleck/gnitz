@@ -6,7 +6,7 @@ use crate::ops::reindex::{FoldCols, ReindexPacker};
 use crate::schema::Slot;
 use crate::schema::{worker_for_key, worker_for_pk_bytes};
 use crate::schema::{ColumnLocator, SchemaDescriptor};
-use crate::storage::{Batch, MemBatch};
+use crate::storage::{reset_slots, Batch, MemBatch};
 
 /// Keep only the live rows `slot` owns: those whose PK `worker_for_pk_bytes`
 /// routes to it, the hash the equality scatter routes a join key by. A broadcast
@@ -60,18 +60,20 @@ impl ScatterPlan {
         ScatterPlan(Key::Group(GroupKey::PkPrefix(schema.pk_stride())))
     }
 
-    /// True iff the exchange this plan describes would move nothing: it hashes
-    /// exactly the bytes `worker_for_pk` placed `schema`'s rows by.
+    /// When true, the exchange this plan describes moves nothing: it hashes
+    /// exactly the bytes `worker_for_pk` placed `schema`'s rows by, `schema` being
+    /// the relation whose PK region the plan's input carries.
     pub fn routes_to_native_owner(&self, schema: &SchemaDescriptor) -> bool {
         schema.placement().is_key_routed()
             && matches!(self.0, Key::Group(GroupKey::PkPrefix(n)) if n == schema.dist_stride())
     }
 
-    /// Route every live row of `mb` — a weight-0 row is not a Z-set element —
-    /// into `slots`, one ascending row list per worker.
-    pub(super) fn route(&self, mb: &MemBatch, slots: &mut [Vec<u32>]) {
-        let nw = slots.len();
-        self.route_into(mb, nw, &mut EveryWorker(slots));
+    /// Reset `out` to one ascending list per worker of the live rows of `batch`
+    /// that worker owns — a weight-0 row is not a Z-set element.
+    pub fn route<'a>(&self, batch: &Batch, out: &'a mut Vec<Vec<u32>>, num_workers: usize) -> &'a [Vec<u32>] {
+        let slots = reset_slots(out, num_workers);
+        self.route_into(&batch.as_mem_batch(), num_workers, &mut EveryWorker(slots));
+        slots
     }
 
     /// The live rows of `batch` that `slot` owns: its share of a batch every

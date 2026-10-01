@@ -15,7 +15,7 @@ use proptest::prelude::*;
 use crate::schema::payload_order::compare_full_rows;
 use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor};
 use crate::storage::{
-    Batch, BatchBuilder, Layout, MappedShard, MemBatch, ReadCursor, RecoverySource, ShardWriteOpts, StoreBudgets, Table,
+    Batch, BatchBuilder, MappedShard, MemBatch, ReadCursor, RecoverySource, ShardWriteOpts, StoreBudgets, Table,
 };
 use gnitz_wire::TypeCode;
 
@@ -38,20 +38,6 @@ pub fn pk_u64_two_i64_schema() -> SchemaDescriptor {
         ],
         &[0],
     )
-}
-
-/// A consolidated batch over [`wide_pk_3xu64_schema`] from native
-/// `(c0, c1, c2, weight, payload)` rows, which must be (PK, payload)-sorted.
-pub fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i64)]) -> Batch {
-    let mut b = BatchBuilder::new(*schema);
-    for &(c0, c1, c2, w, val) in rows {
-        b.begin_row_opk(&[c0 as u128, c1 as u128, c2 as u128], w);
-        b.put_int(val as u128);
-        b.end_row();
-    }
-    let mut b = b.finish();
-    b.certify_layout(Layout::Consolidated);
-    b
 }
 
 /// Build a batch from raw OPK key bytes, one row per `(pk, weight, payload)`,
