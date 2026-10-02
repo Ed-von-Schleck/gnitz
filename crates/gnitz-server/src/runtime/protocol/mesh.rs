@@ -16,12 +16,13 @@
 //! schema, which every worker already holds from its own partition; an empty
 //! [`Span`] sends none. The [`Head`] names the view, and is the divergence check.
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::runtime::park::WorkerParks;
 use crate::runtime::sal::MAX_WORKERS;
-use crate::runtime::w2m::SalWake;
 use gnitz_foundation::posix_io;
 use gnitz_zset::algebra::{op_exchange_gather, ScatterPlan};
 use gnitz_zset::repr::{Batch, MemBatch};
@@ -60,11 +61,11 @@ pub(crate) fn outbox_bytes() -> usize {
     size
 }
 
-/// Map the mesh for `wakes.len()` workers' outboxes of `outbox_bytes` each, and
-/// build every worker's view of it. Zeroed, shared with every forked child and
-/// never unmapped. A memfd, so [`Mesh::trim`] can return pages by file offset.
-pub(crate) fn create(outbox_bytes: usize, wakes: &[SalWake]) -> std::io::Result<Vec<Mesh>> {
-    let nw = wakes.len();
+/// The mesh among `parks.len()` workers, over outboxes of `outbox_bytes`: one fresh
+/// shared mapping, never unmapped, and every worker's view of it in rank order.
+/// Zeroed. A memfd, so [`Mesh::trim`] can return pages by file offset.
+pub(crate) fn create(outbox_bytes: usize, parks: WorkerParks) -> std::io::Result<Vec<Mesh>> {
+    let nw = parks.len();
     assert!(nw <= MAX_WORKERS, "{nw} workers");
     let len = HEADER_BYTES + 2 * nw * outbox_bytes;
     // SAFETY: the name is a NUL-terminated literal.
@@ -96,11 +97,10 @@ pub(crate) fn create(outbox_bytes: usize, wakes: &[SalWake]) -> std::io::Result<
             rank,
             outbox_bytes,
             part: 0,
-            open: None,
-            wakes: wakes.to_vec(),
+            in_round: false,
+            parks,
             routed: Vec::new(),
             resident: [0; 2],
-            drained: false,
         })
         .collect())
 }
@@ -122,8 +122,7 @@ impl Span {
 #[repr(C)]
 struct Head {
     view: u64,
-    /// The publisher's source partition is drained — a backfill stops once every
-    /// worker's is.
+    /// The publisher's claim that its source is drained.
     drained: u64,
     /// The published partition was consolidated and the round lands where it
     /// folds, so every block is merged on gather.
@@ -133,6 +132,7 @@ struct Head {
     blocks: [Span; MAX_WORKERS],
 }
 
+/// One worker's view of the mesh.
 pub(crate) struct Mesh {
     base: *mut u8,
     /// The memfd behind `base`.
@@ -142,28 +142,28 @@ pub(crate) struct Mesh {
     /// Parts gathered since boot — identical on every worker; its parity picks
     /// the outbox.
     part: u64,
-    open: Option<Open>,
-    /// One per worker, on its W2M header's `sal_park` word.
-    wakes: Vec<SalWake>,
+    /// A [`Round`] is open: [`Self::open`] returned it and no [`Self::step`] has
+    /// closed it.
+    in_round: bool,
+    /// Every worker's park; a part's last arrival wakes the peers.
+    parks: WorkerParks,
     /// Per-receiver row lists of the round being sent, reused across rounds.
     routed: Vec<Vec<u32>>,
     /// How far into each of this worker's outboxes pages may be resident.
     resident: [usize; 2],
-    /// This worker's claim that its source is drained, published with every round
-    /// until one closes; from then, whether every worker's was.
-    drained: bool,
 }
 
-/// A round between its [`Mesh::publish`] and the [`Mesh::advance`] that
-/// finishes it.
-struct Open {
+/// One exchange round, from [`Mesh::open`] to the [`Mesh::step`] that closes it.
+pub(crate) struct Round<'b> {
     view: u64,
     schema: SchemaDescriptor,
+    /// This worker's claim that its source is drained, sent with every part.
+    drained: bool,
     /// The published batch was consolidated and the round lands where it folds.
     consolidated: bool,
-    /// How far this worker's writing has come; `None` once every row it sends
-    /// is written.
-    unsent: Option<Cursor>,
+    /// How far this worker's writing has come, and the batch it writes from;
+    /// `None`, dropping the batch, once every row it sends is written.
+    unsent: Option<(Cursor, Cow<'b, Batch>)>,
     /// This receiver's non-empty blocks from the round's earlier parts, copied
     /// out raw.
     saved: Vec<Vec<u8>>,
@@ -184,7 +184,7 @@ struct Cursor {
 
 impl Mesh {
     fn nw(&self) -> usize {
-        self.wakes.len()
+        self.parks.len()
     }
 
     fn arrivals(&self) -> &AtomicU64 {
@@ -206,56 +206,46 @@ impl Mesh {
         (self.part % 2) as usize
     }
 
-    /// Claim that this worker's source is, or is not, drained.
-    pub(crate) fn set_drained(&mut self, own: bool) {
-        self.drained = own;
-    }
-
-    /// The claim [`Self::set_drained`] made, until a round closes; from then,
-    /// whether every worker's source was drained.
-    pub(crate) fn drained(&self) -> bool {
-        self.drained
-    }
-
-    /// Open a round of `view`: send the live rows of `batch` split by `plan` as
-    /// the round's first part; `fold` is [`crate::query::DriveHost::exchange`]'s.
+    /// Open a round of `view`: send the live rows of `batch` split by `plan` as its
+    /// first part. `fold` is [`crate::query::DriveHost::exchange`]'s; `drained` is
+    /// this worker's claim, which [`Self::step`] answers with every worker's.
     /// Fatal while a round is open, or on a row larger than an outbox.
-    pub(crate) fn publish(&mut self, view: u64, batch: &Batch, plan: &ScatterPlan, fold: bool) {
-        assert!(self.open.is_none(), "exchange of view {view}: a round is already open");
+    pub(crate) fn open<'b>(
+        &mut self,
+        view: u64,
+        batch: Cow<'b, Batch>,
+        plan: &ScatterPlan,
+        fold: bool,
+        drained: bool,
+    ) -> Round<'b> {
+        assert!(!self.in_round, "exchange of view {view}: a round is already open");
+        self.in_round = true;
         let nw = self.nw();
-        let lists = plan.route(batch, &mut self.routed, nw).len();
-        self.open = Some(Open {
+        let lists = plan.route(&batch, &mut self.routed, nw).len();
+        let mut round = Round {
             view,
             schema: *batch.schema(),
+            drained,
             consolidated: fold && batch.is_consolidated(),
-            unsent: Some(Cursor { lists, list: 0, offset: 0 }),
+            unsent: Some((Cursor { lists, list: 0, offset: 0 }, batch)),
             saved: Vec::new(),
             saved_consolidated: true,
-        });
-        self.send_part(Some(batch));
+        };
+        self.send_part(&mut round);
+        round
     }
 
-    /// This worker has rows of the open round still to write, from the batch it
-    /// published.
-    pub(crate) fn sending(&self) -> bool {
-        self.open.as_ref().is_some_and(|open| open.unsent.is_some())
-    }
-
-    /// Send the open round's next part: what is left of `batch`'s rows, or
-    /// nothing once they are all written.
-    fn send_part(&mut self, batch: Option<&Batch>) {
-        let open = self.open.as_ref().expect("a part of an open round");
+    /// Send `round`'s next part: what is left of its rows, or nothing.
+    fn send_part(&mut self, round: &mut Round<'_>) {
         let mut head = Head {
-            view: open.view,
-            drained: self.drained as u64,
-            consolidated: open.consolidated as u64,
+            view: round.view,
+            drained: round.drained as u64,
+            consolidated: round.consolidated as u64,
             more: 0,
             blocks: [Span::EMPTY; MAX_WORKERS],
         };
-        let mut unsent = open.unsent;
         let mut end = BLOCKS_AT;
-        if let Some(at) = &mut unsent {
-            let batch = batch.expect("the batch of a round still being sent");
+        if let Some((at, batch)) = &mut round.unsent {
             let more;
             (end, more) = self.write_rows(batch, at, &mut head.blocks);
             if more && end == BLOCKS_AT {
@@ -266,8 +256,10 @@ impl Mesh {
                 );
             }
             head.more = more as u64;
+            if !more {
+                round.unsent = None;
+            }
         }
-        self.open.as_mut().expect("still open").unsent = unsent.filter(|_| head.more != 0);
         self.arrive(&head, end);
     }
 
@@ -314,10 +306,8 @@ impl Mesh {
         let nw = self.nw() as u64;
         // Release: a peer that sees the count sees the outbox writes above.
         if self.arrivals().fetch_add(1, Ordering::AcqRel) == (self.part + 1) * nw - 1 {
-            for (w, wake) in self.wakes.iter().enumerate() {
-                if w != self.rank {
-                    wake.wake();
-                }
+            for w in (0..self.nw()).filter(|&w| w != self.rank) {
+                self.parks.wake(w);
             }
         }
     }
@@ -349,14 +339,14 @@ impl Mesh {
         self.arrivals().load(Ordering::Acquire) >= (self.part + 1) * self.nw() as u64
     }
 
-    /// Take in the completed part and send the next from `batch`, the one
-    /// published, which is needed while [`Self::sending`]; or on the round's
-    /// last part close it: the rows every peer sent this worker.
-    pub(crate) fn advance(&mut self, batch: Option<&Batch>) -> Option<Batch> {
-        assert!(self.complete(), "advanced before every worker published");
-        let mut open = self.open.take().expect("advance without an open round");
-        let view = open.view;
-        let (mut drained, mut more, mut consolidated) = (true, false, open.saved_consolidated);
+    /// Take in the completed part. `None`: `round`'s next part was sent. `Some`:
+    /// the round is closed — the rows every peer sent this worker, and whether
+    /// every worker's source was drained.
+    pub(crate) fn step(&mut self, round: &mut Round<'_>) -> Option<(Batch, bool)> {
+        assert!(self.in_round, "step without an open round");
+        assert!(self.complete(), "stepped before every worker published");
+        let view = round.view;
+        let (mut drained, mut more, mut consolidated) = (true, false, round.saved_consolidated);
         let mut blocks = Vec::with_capacity(self.nw());
         for peer in 0..self.nw() {
             // SAFETY: the peer wrote its head before the arrival `complete`
@@ -377,15 +367,14 @@ impl Mesh {
             }
         }
         if more {
-            open.saved.extend(blocks.into_iter().map(<[u8]>::to_vec));
-            open.saved_consolidated = consolidated;
-            self.open = Some(open);
+            round.saved.extend(blocks.into_iter().map(<[u8]>::to_vec));
+            round.saved_consolidated = consolidated;
             self.part += 1;
-            self.send_part(batch);
+            self.send_part(round);
             return None;
         }
-        let schema = open.schema;
-        let slices: Vec<MemBatch> = open
+        let schema = round.schema;
+        let slices: Vec<MemBatch> = round
             .saved
             .iter()
             .map(Vec::as_slice)
@@ -397,8 +386,8 @@ impl Mesh {
             .collect();
         let rows = op_exchange_gather(&slices, &schema, consolidated);
         self.part += 1;
-        self.drained = drained;
-        Some(rows)
+        self.in_round = false;
+        Some((rows, drained))
     }
 
     /// The block `span` names in `peer`'s outbox for the current part.

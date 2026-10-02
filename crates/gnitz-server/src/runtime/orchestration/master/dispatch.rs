@@ -187,8 +187,11 @@ impl MasterDispatcher {
     /// addresses none. Publishes nothing; that is the scope's commit.
     pub(crate) fn broadcast_ddl(&self, scope: &SalScope, family: SysFamily, batch: &Batch) -> Result<(), WireFault> {
         let target_id = family.id();
-        let relation = wire::WireSchema::from_catalog(self.cat(), target_id);
-        let mut group = DirectGroup::ddl_sync(&relation, batch);
+        let record = self
+            .cat()
+            .schema_record(target_id)
+            .expect("a wire target is registered under the catalog lock");
+        let mut group = DirectGroup::ddl_sync(target_id, &record, batch);
         if family == SysFamily::Sequence {
             group.targets = GroupTargets {
                 set: WorkerSet::EMPTY,
@@ -341,7 +344,9 @@ impl MasterDispatcher {
             self.unflushed_pushes.set(true);
         }
         let cat = self.cat();
-        let relation = wire::WireSchema::from_catalog(cat, target_id);
+        let record = cat
+            .schema_record(target_id)
+            .expect("a wire target is registered under the catalog lock");
         let placement = cat
             .registry
             .relation(target_id)
@@ -350,7 +355,10 @@ impl MasterDispatcher {
         with_routed(batch, placement, self.num_workers(), |data| {
             // Leased before the group is laid out, so no ACK arrives unrouted.
             let lease = self.reactor.lease_acks(data.holders());
-            scope.write(&DirectGroup::push(&relation, data, lease.targets()), recoverable)?;
+            scope.write(
+                &DirectGroup::push(target_id, &record, data, lease.targets()),
+                recoverable,
+            )?;
             Ok(lease)
         })
     }

@@ -10,44 +10,39 @@ use std::os::fd::FromRawFd;
 use super::*;
 use crate::catalog::SysFamily;
 use crate::runtime::test_support::try_poll_once;
-use crate::runtime::w2m::fixtures::test_rings;
-use crate::runtime::w2m::SalWake;
+use gnitz_zset::schema::encode_schema_block;
 
-/// A writer over a fresh `size`-byte ring, written at one worker per wake in
-/// `wakes`. Unrewound, as a boot's writer is before [`SalExcl::boot_rewind`].
-pub(crate) fn test_writer(size: usize, wakes: Vec<SalWake>) -> SalWriter {
+/// A writer over a fresh `size`-byte ring, written at one worker per park of
+/// `parks`. Unrewound, as a boot's writer is before [`SalExcl::boot_rewind`].
+pub(crate) fn test_writer(size: usize, parks: WorkerParks) -> SalWriter {
     let len = ANCHOR_BYTES + size;
     let fd = unsafe { libc::memfd_create(c"test_sal".as_ptr(), libc::MFD_CLOEXEC) };
     assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
     // SAFETY: a descriptor nothing else owns. Leaked: open and mapped for the rest of the process.
     let file: &'static File = Box::leak(Box::new(unsafe { File::from_raw_fd(fd) }));
-    SalWriter::new(SalLog::map(file, len).expect("map the test SAL"), wakes)
+    SalWriter::new(SalLog::map(file, len).expect("map the test SAL"), parks)
 }
 
 /// A SAL over its own file.
 pub(crate) struct TestLog {
     pub(crate) writer: SalWriter,
-    /// One per worker, on the park the writer's wakes land on.
-    wakes: Vec<SalWake>,
+    /// The parks the writer's wakes land on.
+    parks: WorkerParks,
 }
 
 impl TestLog {
     /// A log with a `size`-byte ring written at `workers` workers, rewound to
     /// cursor 0 of `epoch`.
     pub(crate) fn new(size: usize, workers: usize, epoch: u32) -> TestLog {
-        Self::with_wakes(size, test_rings(vec![4096; workers]).2, epoch)
-    }
-
-    /// [`Self::new`] over the wakes of the caller's W2M rings, one per worker.
-    pub(crate) fn with_wakes(size: usize, wakes: Vec<SalWake>, epoch: u32) -> TestLog {
-        let writer = test_writer(size, wakes.clone());
+        let parks = WorkerParks::create(workers).expect("map the parks");
+        let writer = test_writer(size, parks);
         writer.rewind(epoch);
-        TestLog { writer, wakes }
+        TestLog { writer, parks }
     }
 
-    /// Worker `w`'s wake.
-    pub(crate) fn wake(&self, w: usize) -> &SalWake {
-        &self.wakes[w]
+    /// Every worker's park.
+    pub(crate) fn parks(&self) -> WorkerParks {
+        self.parks
     }
 
     /// The ring's first byte — offset 0 of every group base.
@@ -137,14 +132,14 @@ impl TestLog {
     /// One committed, synced zone of `DdlSync` groups, as a DDL's broadcasts
     /// write it. Returns its LSN.
     pub(crate) fn ddl_zone(&self, groups: &[(SysFamily, &Batch)]) -> u64 {
-        let relations: Vec<WireSchema> = groups
+        let records: Vec<Vec<u8>> = groups
             .iter()
-            .map(|(family, _)| WireSchema::encoded(family.id(), family.schema()))
+            .map(|(family, _)| encode_schema_block(family.schema()))
             .collect();
-        let groups: Vec<DirectGroup> = relations
+        let groups: Vec<DirectGroup> = records
             .iter()
             .zip(groups)
-            .map(|(relation, &(_, batch))| DirectGroup::ddl_sync(relation, batch))
+            .map(|(record, &(family, batch))| DirectGroup::ddl_sync(family.id(), record, batch))
             .collect();
         let (lsn, _) = self.commit_zone(&groups);
         self.synced_through(self.cursor());

@@ -3,9 +3,9 @@ use std::num::NonZeroU64;
 use super::*;
 use crate::runtime::sal::fixtures::TestLog;
 use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalReader};
-use crate::runtime::wire::WireSchema;
 use crate::test_support::{make_batch, make_schema_u64_i64};
 use gnitz_wire::control::peek_control_block;
+use gnitz_zset::schema::encode_schema_block;
 
 /// Every request, each field a value no other field of it holds, so a swapped
 /// argument decodes to a different request.
@@ -75,15 +75,15 @@ fn every_request_decodes_from_its_own_template() {
 #[test]
 fn every_request_decodes_from_its_written_group() {
     let batch = make_batch(&make_schema_u64_i64(), &[(1, 1, 10)]);
-    let relation = WireSchema::encoded(15, batch.schema());
-    let family = WireSchema::encoded(12, batch.schema());
+    let record = encode_schema_block(batch.schema());
     let mut groups: Vec<DirectGroup> = every_request().into_iter().map(DirectGroup::new).collect();
     groups.push(DirectGroup::push(
-        &relation,
+        15,
+        &record,
         GroupData::Same(batch.wire_whole()),
         GroupTargets::UNADDRESSED,
     ));
-    groups.push(DirectGroup::ddl_sync(&family, &batch));
+    groups.push(DirectGroup::ddl_sync(12, &record, &batch));
 
     for group in groups {
         // A fresh log each: a flush moves a reader to the next epoch.

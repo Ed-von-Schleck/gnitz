@@ -10,6 +10,9 @@ use gnitz_zset::schema::SchemaDescriptor;
 use super::*;
 use crate::runtime::sal::{GroupTargets, SalMessageKind, WorkerSet};
 
+/// The request id every worker's boot verdict answers on.
+pub(crate) const BOOT_READY_REQUEST_ID: u32 = 1;
+
 /// Worker `w`'s fault `f`, its text naming the worker and `op`.
 fn worker_fault(w: usize, op: &str, f: WireFault) -> WireFault {
     WireFault {
@@ -98,11 +101,9 @@ impl Reactor {
         id
     }
 
-    /// One request id, answered by one ACK from every worker in `set`. See
-    /// [`AckLease`].
-    pub(crate) fn lease_acks(&self, set: WorkerSet) -> AckLease {
+    /// `id`, answered by one ACK from every worker in `set`.
+    fn lease_acks_on(&self, id: u32, set: WorkerSet) -> AckLease {
         let set = set.within(self.w2m.num_workers());
-        let id = self.alloc_request_id();
         let route = AckRoute {
             expected: set,
             answered: WorkerSet::EMPTY,
@@ -110,6 +111,17 @@ impl Reactor {
         };
         self.routes.borrow_mut().insert(id, Route::Acks(route));
         AckLease { reactor: self.clone(), id, workers: set }
+    }
+
+    /// One request id, answered by one ACK from every worker in `set`. See
+    /// [`AckLease`].
+    pub(crate) fn lease_acks(&self, set: WorkerSet) -> AckLease {
+        self.lease_acks_on(self.alloc_request_id(), set)
+    }
+
+    /// The lease every worker's ready ACK answers.
+    pub(crate) fn lease_ready(&self) -> AckLease {
+        self.lease_acks_on(BOOT_READY_REQUEST_ID, WorkerSet::ALL)
     }
 
     /// One request id, answered by a train of frames from every worker in `set`,
@@ -145,6 +157,7 @@ pub(crate) struct AckLease {
 }
 
 impl AckLease {
+    #[cfg(test)]
     pub(crate) fn id(&self) -> u32 {
         self.id
     }
@@ -220,6 +233,7 @@ impl TrainFrame {
 
 impl TrainLease {
     /// The request id, for a test to answer on.
+    #[cfg(test)]
     #[cfg(test)]
     pub(crate) fn id(&self) -> u32 {
         self.id

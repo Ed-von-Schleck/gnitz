@@ -60,7 +60,7 @@ fn fsync_is_submitted_eagerly_and_yields_the_cqe_res() {
 /// are never waited on — and one over the empty set is complete at once.
 #[test]
 fn an_ack_lease_completes_on_its_own_sets_acks() {
-    let (r, writers) = reactor_with_rings(4);
+    let (r, mut writers) = reactor_with_rings(4);
     let lease = r.lease_acks(WorkerSet::one(1).with(3));
     let targets = lease.targets();
     assert_eq!(
@@ -89,7 +89,7 @@ fn an_ack_lease_completes_on_its_own_sets_acks() {
 #[test]
 fn a_train_route_queues_past_worker_count_in_arrival_order() {
     const N: usize = 100; // > MAX_WORKERS
-    let (r, writers) = reactor_with_rings(1);
+    let (r, mut writers) = reactor_with_rings(1);
     let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::ScanSpec);
     for i in 0..N {
         let msg = crate::runtime::wire::WireMsg {
@@ -114,7 +114,7 @@ fn a_train_route_queues_past_worker_count_in_arrival_order() {
 /// Dropping a train lease releases the frames it still holds.
 #[test]
 fn a_dropped_lease_releases_the_frames_it_holds() {
-    let (r, writers) = reactor_with_rings(1);
+    let (r, mut writers) = reactor_with_rings(1);
     let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::ScanSpec);
     for _ in 0..3 {
         writers[0].send_msg(lease.id(), &Default::default());
@@ -130,15 +130,14 @@ fn a_dropped_lease_releases_the_frames_it_holds() {
 /// included. Every slot it passes over is released at its ring.
 #[test]
 fn next_yields_the_row_frames_and_releases_the_rest() {
-    let (r, writers) = reactor_with_rings(2);
+    let (r, mut writers) = reactor_with_rings(2);
     let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::ScanSpec);
     let schema = crate::test_support::make_schema_u64_i64();
     let rows = |pk| crate::test_support::make_batch(&schema, &[(pk, 1, 0)]);
-    let send = |w: usize, last, batch: Option<&gnitz_zset::repr::Batch>| {
+    let mut send = |w: usize, last, batch: Option<&gnitz_zset::repr::Batch>| {
         let msg = crate::runtime::wire::WireMsg {
-            flags: gnitz_wire::WireFlags::train_frame(last),
             data: batch.and_then(gnitz_zset::repr::Batch::wire_whole),
-            ..Default::default()
+            ..crate::runtime::wire::WireMsg::train_frame(0, last)
         };
         writers[w].send_msg(lease.id(), &msg);
     };

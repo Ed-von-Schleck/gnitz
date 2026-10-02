@@ -1,6 +1,6 @@
 //! Master-side dispatcher: fans out push/scan operations to worker processes
 //! via the shared append-only log (SAL) and collects responses via per-worker
-//! W2M regions, whose headers also carry each worker's park on the SAL.
+//! W2M regions.
 
 pub(crate) mod scatter;
 
@@ -24,7 +24,6 @@ use crate::runtime::reactor::{Reactor, TrainLease};
 use crate::runtime::sal::{
     Apply, DirectGroup, GroupData, GroupTargets, Read, SalExcl, SalRequest, SalWriter, WorkerSet,
 };
-use crate::runtime::wire;
 use gnitz_wire::{BoundPeek, PkColList, WireFault};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{Placement, SchemaDescriptor};

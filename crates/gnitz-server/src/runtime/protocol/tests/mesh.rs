@@ -54,30 +54,31 @@ fn expected_of(parts: &[Batch], spec: &ScatterPlan, r: usize) -> Batch {
     spec.share(&summed, Slot::new(r as u32, parts.len() as u32))
 }
 
-/// Publish every worker's round-`round` partition in rank order: the round
-/// completes on the last publish and not before.
-fn publish_all(mesh: &mut [Mesh], round: u64, spec: &ScatterPlan, drained: [bool; NW]) {
-    for w in 0..NW {
-        assert!(
-            mesh.iter().all(|m| !m.complete()),
-            "round {round}: incomplete before worker {w}"
-        );
-        mesh[w].set_drained(drained[w]);
-        mesh[w].publish(9, &partition(w, round), spec, true);
-    }
+/// Open round `round` on every worker in rank order, each sending its
+/// partition of it: the round completes on the last open and not before.
+fn open_all(mesh: &mut [Mesh], round: u64, spec: &ScatterPlan, drained: [bool; NW]) -> Vec<Round<'static>> {
+    let rounds = (0..NW)
+        .map(|w| {
+            assert!(
+                mesh.iter().all(|m| !m.complete()),
+                "round {round}: incomplete before worker {w}"
+            );
+            mesh[w].open(9, Cow::Owned(partition(w, round)), spec, true, drained[w])
+        })
+        .collect();
     assert!(
         mesh.iter().all(Mesh::complete),
-        "round {round}: complete on the last publish"
+        "round {round}: complete on the last open"
     );
+    rounds
 }
 
 /// Worker `r` gathers round `round`, a single part: what every sender routed to
-/// it, and the AND of the drained bits.
-fn gather_one(mesh: &mut Mesh, round: u64, spec: &ScatterPlan, drained: [bool; NW]) {
+/// it, and the AND of the drained claims.
+fn gather_one(mesh: &mut Mesh, open: &mut Round<'_>, round: u64, spec: &ScatterPlan, drained: [bool; NW]) {
     let r = mesh.rank;
     let parts: Vec<Batch> = (0..NW).map(|w| partition(w, round)).collect();
-    let got = mesh.advance(None).expect("a round that fits one part");
-    let all_drained = mesh.drained();
+    let (got, all_drained) = mesh.step(open).expect("a round that fits one part");
     assert_eq!(
         weighted_rows(&got),
         weighted_rows(&expected_of(&parts, spec, r)),
@@ -87,7 +88,7 @@ fn gather_one(mesh: &mut Mesh, round: u64, spec: &ScatterPlan, drained: [bool; N
     assert_eq!(all_drained, drained.iter().all(|&d| d), "round {round}: worker {r}");
 }
 
-/// Publish `parts[w]` on worker `w`, then [`finish_round`].
+/// Open a round of `parts[w]` on worker `w`, then [`finish_round`].
 fn run_round(
     mesh: &mut [Mesh],
     parts: &[Batch],
@@ -95,26 +96,25 @@ fn run_round(
     drained: &[bool],
     fold: bool,
 ) -> (Vec<(Batch, bool)>, usize) {
-    for ((m, batch), &d) in mesh.iter_mut().zip(parts).zip(drained) {
-        m.set_drained(d);
-        m.publish(9, batch, spec, fold);
-    }
-    finish_round(mesh, parts)
+    let rounds = mesh
+        .iter_mut()
+        .zip(parts)
+        .zip(drained)
+        .map(|((m, batch), &d)| m.open(9, Cow::Borrowed(batch), spec, fold, d))
+        .collect();
+    finish_round(mesh, rounds)
 }
 
-/// Advance every worker of a published round part by part until it closes:
-/// each worker's rows and drained bit, and how many parts the round took.
-fn finish_round(mesh: &mut [Mesh], parts: &[Batch]) -> (Vec<(Batch, bool)>, usize) {
+/// Step every worker of an open round part by part until it closes: each
+/// worker's rows and the verdict it was answered, and how many parts the round
+/// took.
+fn finish_round(mesh: &mut [Mesh], mut rounds: Vec<Round<'_>>) -> (Vec<(Batch, bool)>, usize) {
     let mut count = 1;
     loop {
         assert!(mesh.iter().all(Mesh::complete), "part {count} completes");
-        let out: Vec<Option<Batch>> = mesh.iter_mut().zip(parts).map(|(m, b)| m.advance(Some(b))).collect();
+        let out: Vec<Option<(Batch, bool)>> = mesh.iter_mut().zip(&mut rounds).map(|(m, r)| m.step(r)).collect();
         if out.iter().all(Option::is_some) {
-            let closed = out
-                .into_iter()
-                .zip(mesh.iter())
-                .map(|(rows, m)| (rows.unwrap(), m.drained()));
-            return (closed.collect(), count);
+            return (out.into_iter().flatten().collect(), count);
         }
         assert!(
             out.iter().all(Option::is_none),
@@ -125,7 +125,7 @@ fn finish_round(mesh: &mut [Mesh], parts: &[Batch]) -> (Vec<(Batch, bool)>, usiz
 }
 
 /// A scattered round then a broadcast one, each gathered intact by every worker,
-/// with round 1 published by two workers before the third gathered round 0.
+/// with round 1 opened by two workers before the third gathered round 0.
 #[test]
 fn every_worker_gathers_each_round_from_every_peer() {
     let mut mesh = meshes(NW);
@@ -133,72 +133,56 @@ fn every_worker_gathers_each_round_from_every_peer() {
     let routes = [&pk, &ScatterPlan::broadcast()];
     let drained = [[true, true, false], [true; NW]];
 
-    publish_all(&mut mesh, 0, routes[0], drained[0]);
+    let mut rounds = open_all(&mut mesh, 0, routes[0], drained[0]);
     for w in 0..NW - 1 {
-        gather_one(&mut mesh[w], 0, routes[0], drained[0]);
-        mesh[w].set_drained(drained[1][w]);
-        mesh[w].publish(9, &partition(w, 1), routes[1], true);
+        gather_one(&mut mesh[w], &mut rounds[w], 0, routes[0], drained[0]);
+        rounds[w] = mesh[w].open(9, Cow::Owned(partition(w, 1)), routes[1], true, drained[1][w]);
     }
     assert!(
         !mesh[0].complete(),
-        "round 1 is incomplete until the last worker publishes it"
+        "round 1 is incomplete until the last worker opens it"
     );
-    gather_one(&mut mesh[NW - 1], 0, routes[0], drained[0]);
-    mesh[NW - 1].set_drained(drained[1][NW - 1]);
-    mesh[NW - 1].publish(9, &partition(NW - 1, 1), routes[1], true);
-    for m in mesh.iter_mut() {
-        gather_one(m, 1, routes[1], drained[1]);
+    let last = NW - 1;
+    gather_one(&mut mesh[last], &mut rounds[last], 0, routes[0], drained[0]);
+    rounds[last] = mesh[last].open(9, Cow::Owned(partition(last, 1)), routes[1], true, drained[1][last]);
+    for (m, open) in mesh.iter_mut().zip(&mut rounds) {
+        gather_one(m, open, 1, routes[1], drained[1]);
     }
 }
 
-/// `drained` is a worker's own claim until a round closes, and from then whether
-/// every worker claimed it — which a later round of the same drive republishes
-/// to the same answer.
+/// A closing `step` answers the AND of the claims its round was opened with, on
+/// every worker, and a later round answers its own claims.
 #[test]
-fn drained_is_the_own_claim_before_a_round_and_every_workers_after_one() {
+fn a_closing_step_answers_the_and_of_every_workers_claim() {
     let spec = ScatterPlan::broadcast();
-    for claims in [[true, true, false], [true; NW]] {
-        let mut mesh = meshes(NW);
-        for (m, &claim) in mesh.iter_mut().zip(&claims) {
-            m.set_drained(claim);
-            assert_eq!(m.drained(), claim, "no round has run");
-        }
-        let all = claims.iter().all(|&c| c);
-        for round in 0..2 {
-            for (w, m) in mesh.iter_mut().enumerate() {
-                m.publish(9, &partition(w, round), &spec, true);
-                assert_eq!(
-                    m.drained(),
-                    if round == 0 { claims[w] } else { all },
-                    "round {round} is open"
-                );
-            }
-            for m in mesh.iter_mut() {
-                m.advance(None).expect("a round that fits one part");
-                assert_eq!(m.drained(), all, "round {round} closed");
-            }
+    let mut mesh = meshes(NW);
+    for (round, claims) in [[true, true, false], [true; NW], [false; NW]].into_iter().enumerate() {
+        let mut rounds = open_all(&mut mesh, round as u64, &spec, claims);
+        for (m, open) in mesh.iter_mut().zip(&mut rounds) {
+            let (_, drained) = m.step(open).expect("a round that fits one part");
+            assert_eq!(drained, claims.iter().all(|&c| c), "round {round}: worker {}", m.rank);
         }
     }
 }
 
-/// Publishing again before the round closes would overwrite a part peers may
+/// Opening again before the round closes would overwrite a part peers may
 /// still be reading.
 #[test]
 #[should_panic(expected = "a round is already open")]
-fn a_second_publish_before_the_round_closes_is_refused() {
+fn a_second_open_before_the_round_closes_is_refused() {
     let mut mesh = meshes(NW);
     let batch = partition(0, 0);
-    mesh[0].publish(9, &batch, &ScatterPlan::broadcast(), true);
-    mesh[0].publish(9, &batch, &ScatterPlan::broadcast(), true);
+    let _first = mesh[0].open(9, Cow::Borrowed(&batch), &ScatterPlan::broadcast(), true, true);
+    mesh[0].open(9, Cow::Borrowed(&batch), &ScatterPlan::broadcast(), true, true);
 }
 
-/// An advance before every worker published would read outboxes not yet written.
+/// A step before every worker published would read outboxes not yet written.
 #[test]
-#[should_panic(expected = "advanced before every worker published")]
-fn an_advance_before_the_part_completes_is_refused() {
+#[should_panic(expected = "stepped before every worker published")]
+fn a_step_before_the_part_completes_is_refused() {
     let mut mesh = meshes(NW);
-    mesh[0].publish(9, &partition(0, 0), &ScatterPlan::broadcast(), true);
-    mesh[0].advance(None);
+    let mut round = mesh[0].open(9, Cow::Owned(partition(0, 0)), &ScatterPlan::broadcast(), true, true);
+    mesh[0].step(&mut round);
 }
 
 // ── Multi-part rounds ───────────────────────────────────────────────────────
@@ -345,10 +329,11 @@ fn a_list_that_fills_the_outbox_exactly_defers_the_next() {
     let pk = by_pk(&schema);
     let spec = &pk;
     let parts = vec![full, Batch::empty_with_schema(&schema)];
-    for (m, batch) in mesh.iter_mut().zip(&parts) {
-        m.set_drained(true);
-        m.publish(9, batch, spec, true);
-    }
+    let rounds: Vec<Round> = mesh
+        .iter_mut()
+        .zip(&parts)
+        .map(|(m, batch)| m.open(9, Cow::Borrowed(batch), spec, true, true))
+        .collect();
     // SAFETY: worker 0 wrote its head before its arrival.
     let head = unsafe { &*mesh[0].outbox(0).cast::<Head>() };
     assert_eq!(
@@ -357,7 +342,7 @@ fn a_list_that_fills_the_outbox_exactly_defers_the_next() {
         "list 0 fills the outbox"
     );
     assert_eq!(head.blocks[1].len, 0, "list 1 waits for the next part");
-    let (got, count) = finish_round(&mut mesh, &parts);
+    let (got, count) = finish_round(&mut mesh, rounds);
     assert_eq!(count, 2);
     for (r, (got, _)) in got.iter().enumerate() {
         assert_eq!(
@@ -407,4 +392,41 @@ fn trim_returns_the_pages_past_a_part() {
     m.trim(BLOCKS_AT);
     assert_eq!(unsafe { m.outbox(0).add(resident - 1).read() }, 0);
     assert_eq!(m.resident[0], BLOCKS_AT);
+}
+
+/// One exchange round's cost on the mesh, in instructions: every worker opens the
+/// round and every worker steps it to its close. The outboxes hold a whole
+/// partition, so every round is one part.
+///
+/// `cd crates && cargo test -p gnitz-server --release mesh_round_bench -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn mesh_round_bench() {
+    use std::hint::black_box;
+
+    const ROUNDS: u64 = 200;
+
+    let counter = gnitz_foundation::perf::Counter::instructions().expect("instructions counter");
+    let pk = by_pk(&make_schema_u64_i64());
+    for nw in [2, 4] {
+        for rows in [1, 1_000, 100_000] {
+            let mut mesh = super::fixtures::meshes(nw, 64 << 20);
+            let parts: Vec<Batch> = (0..nw).map(|w| wide_partition(w, rows)).collect();
+            let mut rounds: Vec<Round> = Vec::with_capacity(nw);
+            let ((), instructions) = counter.measure(|| {
+                for _ in 0..ROUNDS {
+                    rounds.clear();
+                    let opened = mesh.iter_mut().zip(&parts);
+                    rounds.extend(opened.map(|(m, batch)| m.open(9, Cow::Borrowed(batch), &pk, true, true)));
+                    for (m, round) in mesh.iter_mut().zip(&mut rounds) {
+                        black_box(m.step(round).expect("a round that fits one part"));
+                    }
+                }
+            });
+            println!(
+                "mesh_round_bench nw={nw} rows={rows:<6} {:>12.1} instr/round",
+                instructions as f64 / ROUNDS as f64
+            );
+        }
+    }
 }

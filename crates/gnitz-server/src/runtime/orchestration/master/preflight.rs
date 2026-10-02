@@ -24,7 +24,7 @@ use gnitz_store::relation::Relation;
 use gnitz_wire::{PkColList, PkKeys, Probe, WireConflictMode, WireStatus};
 use gnitz_zset::repr::MemBatch;
 use gnitz_zset::schema::key::PkBuf;
-use gnitz_zset::schema::KeySpec;
+use gnitz_zset::schema::{encode_schema_block, KeySpec};
 
 /// One probe of relation `tid` at `keys`, queued for a burst, with the state
 /// `plan` its replies fold into.
@@ -378,9 +378,9 @@ async fn execute_probe_burst<P>(
     let leases = disp
         .scan_cut(|cut| {
             for check in checks.iter() {
-                let schema = wire::WireSchema::encoded(check.tid, check.keys.schema());
+                let record = encode_schema_block(check.keys.schema());
                 let probe = DirectGroup {
-                    schema: Some(schema.block()),
+                    schema: Some(&record),
                     ..DirectGroup::new(Read::HasPk { tid: check.tid, probe: check.probe })
                 };
                 match check.probe {

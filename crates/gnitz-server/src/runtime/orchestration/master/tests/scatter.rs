@@ -1,12 +1,13 @@
 use super::*;
 use crate::runtime::sal::fixtures::{group_at, TestLog};
 use crate::runtime::sal::{DirectGroup, GroupTargets, WorkerSet};
-use crate::runtime::wire::{decode_sal_frame, WireSchema};
 use crate::test_support::{
     make_batch, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
     weighted_rows, zset_of,
 };
+use gnitz_wire::control::peek_control_block;
 use gnitz_wire::TypeCode;
+use gnitz_zset::schema::encode_schema_block;
 use gnitz_zset::schema::{Placement, SchemaColumn, SchemaDescriptor};
 
 /// The targets of a push of `data` nothing answers: the workers that hold its rows.
@@ -20,10 +21,11 @@ fn holders_of(data: &GroupData) -> GroupTargets {
 /// Write `batch` to `log` as the master's push of it to relation 16, placed by
 /// `placement`, handing `inspect` the layout the scatter picked.
 fn push(log: &TestLog, batch: &Batch, placement: Placement, inspect: impl FnOnce(&GroupData)) {
-    let relation = WireSchema::encoded(16, batch.schema());
+    let record = encode_schema_block(batch.schema());
     with_routed(batch, placement, log.writer.num_workers(), |data| {
         inspect(&data);
-        log.excl().write(&DirectGroup::push(&relation, data, holders_of(&data)))
+        log.excl()
+            .write(&DirectGroup::push(16, &record, data, holders_of(&data)))
     })
     .expect("group fits");
 }
@@ -103,7 +105,8 @@ fn a_push_group_decodes_to_each_workers_rows() {
         let sent: Vec<(usize, Batch)> = (0..nw)
             .filter_map(|w| {
                 let bytes = msg.slot(w as u32)?;
-                let (control, rows) = decode_sal_frame(bytes, |_, _| None).expect("every payload decodes");
+                let control = peek_control_block(bytes).expect("a control block");
+                let rows = msg.rows(bytes, |_, _| None).expect("every payload decodes");
                 assert_eq!(
                     control.schema.is_some(),
                     rows.is_some(),
@@ -179,7 +182,7 @@ fn a_keyed_push_of_rows_sharing_a_span_keeps_each_heap_within_the_pushed_one() {
     let sent: Vec<Batch> = (0..nw)
         .filter_map(|w| {
             let bytes = msg.slot(w as u32)?;
-            decode_sal_frame(bytes, |_, _| None).expect("every payload decodes").1
+            msg.rows(bytes, |_, _| None).expect("every payload decodes")
         })
         .collect();
     assert!(
@@ -275,7 +278,7 @@ fn push_group_layout_bench() {
             } else {
                 Placement::Replicated
             };
-            let relation = WireSchema::encoded(16, batch.schema());
+            let record = encode_schema_block(batch.schema());
             let mut layout = "";
             let (instructions, bytes) = measure(&mut |scope| {
                 with_routed(&batch, placement, nw, |data| {
@@ -283,7 +286,7 @@ fn push_group_layout_bench() {
                         GroupData::Same(_) => "Same",
                         GroupData::Each(_) => "Each",
                     };
-                    scope.write(&DirectGroup::push(&relation, data, holders_of(&data)), true)
+                    scope.write(&DirectGroup::push(16, &record, data, holders_of(&data)), true)
                 })
                 .expect("group fits");
             });

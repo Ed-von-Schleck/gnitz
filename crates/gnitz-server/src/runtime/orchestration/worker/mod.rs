@@ -11,34 +11,14 @@ use std::rc::Rc;
 use crate::catalog::CatalogEngine;
 use crate::query::{DagEngine, Drive, DriveHost};
 use crate::runtime::mesh::Mesh;
-use crate::runtime::sal::{Apply, Read, SalMessageKind, SalReader, SalRequest};
+use crate::runtime::park::WorkerPark;
+use crate::runtime::sal::{Apply, Inbound, Read, ReplyRoute, SalReader, SalRequest};
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{self as ipc};
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::RelationRegistry;
-use gnitz_wire::{WireFault, WireFlags};
+use gnitz_wire::WireFault;
 use gnitz_zset::repr::Batch;
-
-/// One SAL group addressed to this worker. Owned: a parked read outlives the SAL
-/// bytes it was decoded from, which an inline `Flush` lets the master rewrite.
-struct Request {
-    route: ReplyRoute,
-    what: SalRequest<'static>,
-    /// Boxed, so a request moves from its decode to where it is served or parked
-    /// as a few words: held inline, the batch would be copied whole at each of
-    /// those moves, for a request that carries none as well.
-    rows: Option<Box<Batch>>,
-}
-
-/// Where a reply goes.
-#[derive(Clone, Copy)]
-struct ReplyRoute {
-    target_id: u64,
-    /// `0`: nothing answers.
-    request_id: u32,
-    /// The cut the request was written in; see [`SalReader::cut`].
-    cut: u64,
-}
 
 // ---------------------------------------------------------------------------
 // WorkerProcess
@@ -48,8 +28,13 @@ pub struct WorkerProcess<'c> {
     catalog: &'c mut CatalogEngine,
     sal_reader: SalReader,
     w2m_writer: W2mWriter,
+    /// Where this worker sleeps for a SAL group or an exchange part.
+    park: WorkerPark,
     /// Where this worker trades its exchange rounds with its peers.
     mesh: Mesh,
+    /// The running drive's vote on "every source is drained": this worker's own
+    /// claim until an exchange round closes, every worker's from then.
+    drained: bool,
     /// Replies this worker owes, in the order they reach the ring. A cut's reader
     /// drains its leases in request order and a ring frees only a released prefix,
     /// so within a cut ring order must be request order. Replies of different cuts
@@ -69,12 +54,20 @@ use reply::{Owed, Rows};
 static KEY_SPANS_ERROR: Seam = Seam::new("GNITZ_INJECT_KEY_SPANS_ERROR");
 
 impl<'c> WorkerProcess<'c> {
-    pub fn new(catalog: &'c mut CatalogEngine, sal_reader: SalReader, w2m_writer: W2mWriter, mesh: Mesh) -> Self {
+    pub fn new(
+        catalog: &'c mut CatalogEngine,
+        sal_reader: SalReader,
+        w2m_writer: W2mWriter,
+        park: WorkerPark,
+        mesh: Mesh,
+    ) -> Self {
         WorkerProcess {
             catalog,
             sal_reader,
             w2m_writer,
+            park,
             mesh,
+            drained: false,
             replies: VecDeque::new(),
             reply_frame_budget: gnitz_foundation::env::env_num(
                 "GNITZ_REPLY_FRAME_BUDGET",
@@ -91,7 +84,7 @@ impl<'c> WorkerProcess<'c> {
         loop {
             // An owed reply emits its next frame without waiting on the SAL.
             if self.replies.is_empty() {
-                self.w2m_writer.sal_park().park(|| self.sal_reader.is_empty());
+                self.park.park(|| self.sal_reader.is_empty());
             }
 
             self.drain_sal();
@@ -114,41 +107,17 @@ impl<'c> WorkerProcess<'c> {
         }
     }
 
-    /// The next SAL group this worker acts on, decoded into an owned
-    /// [`Request`]: the single decode point of both drain loops. The master
-    /// authored the frame, so one that does not decode is corruption.
-    fn next_request(&mut self) -> Option<Request> {
-        let (msg, wire) = self.sal_reader.next()?;
-        // The kinds the master frames with their target's catalog record.
-        let catalog_record = matches!(msg.kind, SalMessageKind::Push | SalMessageKind::DdlSync);
-        let known = |tid, record: &[u8]| catalog_record.then(|| self.catalog.known_decode(tid, record)).flatten();
-        // Fail-stop: a dropped group diverges this worker from the master.
-        let undecodable =
-            |e: String| -> ! { gnitz_fatal_abort!("failed to decode {:?} for tid={}: {e}", msg.kind, msg.target_id) };
-        // Read in place: the rows move once, out of the decoded frame.
-        let mut decoded = ipc::decode_sal_frame(wire, known);
-        let (control, rows) = match &mut decoded {
-            Ok(frame) => frame,
-            Err(e) => undecodable(std::mem::take(e)),
-        };
-        let what = match SalRequest::decode(msg.kind, &control.hdr, &wire[control.blob.clone()]) {
-            Ok(what) => what,
-            Err(e) => undecodable(e),
-        };
-        Some(Request {
-            route: ReplyRoute {
-                target_id: control.hdr.target_id,
-                request_id: msg.request_id,
-                cut: self.sal_reader.cut(),
-            },
-            what,
-            rows: rows.take().map(Box::new),
-        })
+    /// The next SAL group this worker acts on: the single decode point of both
+    /// drain loops.
+    fn next_request(&mut self) -> Option<Inbound> {
+        let cat = &*self.catalog;
+        self.sal_reader
+            .next_request(|tid, record| cat.known_decode(tid, record))
     }
 
     /// Run one request — the one place its outcome is chosen: a read's failure
     /// is a fault frame to its asker, a state change's a fail-stop.
-    fn handle_request(&mut self, req: Request) {
+    fn handle_request(&mut self, req: Inbound) {
         match req.what {
             SalRequest::Shutdown => unsafe { libc::_exit(0) },
             SalRequest::Read(read) => {

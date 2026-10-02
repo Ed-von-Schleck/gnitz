@@ -19,7 +19,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use self::uring::IoUringRing;
 
-use crate::runtime::w2m::{W2mReceiver, W2mSlot, BOOT_READY_REQUEST_ID};
+use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 
 mod conn;
 mod futures;
@@ -38,7 +38,7 @@ mod wake_queue;
 
 pub(crate) use conn::{PeerGone, SendBody};
 
-pub(crate) use futures::{AckLease, TrainFrame, TrainLease};
+pub(crate) use futures::{AckLease, TrainFrame, TrainLease, BOOT_READY_REQUEST_ID};
 use futures::{Route, TimerFuture};
 use runloop::run_queue_is_empty;
 use wake_queue::WakeQueue;
@@ -129,7 +129,7 @@ const fn udata_id(u: u64) -> u64 {
 type Task = Pin<Box<dyn Future<Output = ()>>>;
 
 /// The state behind every [`Reactor`] handle. Field order is drop order, and
-/// both ends of it are fixed; see `ring` and `w2m`.
+/// its head is fixed; see `ring`.
 pub struct ReactorShared {
     /// First, so it drops before the memory its SQEs point into.
     ring: RefCell<IoUringRing>,
@@ -165,8 +165,6 @@ pub struct ReactorShared {
     conn_slots: Rc<io::Budget>,
     /// The deadlines and ceilings this reactor was built with.
     limits: Limits,
-    /// Last: every `W2mSlot` the reactor holds, in a field or in a task, releases
-    /// through it on drop.
     w2m: W2mReceiver,
 }
 
@@ -203,7 +201,7 @@ impl Reactor {
             tasks: RefCell::new(FxHashMap::default()),
             next_task_key: Cell::new(0),
             routes: RefCell::new(FxHashMap::default()),
-            next_request_id: Cell::new(BOOT_READY_REQUEST_ID),
+            next_request_id: Cell::new(BOOT_READY_REQUEST_ID + 1),
             ops: RefCell::new(FxHashMap::default()),
             futex_waitv: RefCell::new(futex_waitv),
             futex_waitv_armed: Cell::new(false),

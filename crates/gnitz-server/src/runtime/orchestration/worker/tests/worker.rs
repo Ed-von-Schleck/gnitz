@@ -11,13 +11,14 @@ use gnitz_expr::SchemaFacts;
 use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::{PkColList, Probe, ReadBound, ReadSpec, TypeCode, WireStatus};
 use gnitz_zset::algebra::ScatterPlan;
-use gnitz_zset::schema::SchemaDescriptor;
+use gnitz_zset::schema::{encode_schema_block, SchemaDescriptor};
+use std::borrow::Cow;
 
 // -- fixtures ---------------------------------------------------------------
 
-/// A worker over a real SAL and a real W2M ring — the one ring its replies and
-/// its SAL wakes share, as in production — through the production constructor
-/// so a new field cannot be missed here, with the receiver that reads its ring. The budget is pinned rather than read from the environment,
+/// A worker over a real SAL and a real W2M ring, through the production
+/// constructor so a new field cannot be missed here, with the receiver that
+/// reads its ring. The budget is pinned rather than read from the environment,
 /// so a shell that exports `GNITZ_REPLY_FRAME_BUDGET` does not reshape these
 /// frames.
 fn test_worker(catalog: &mut CatalogEngine) -> (WorkerProcess<'_>, TestLog, W2mReceiver) {
@@ -30,12 +31,18 @@ fn worker_over(
     ring_bytes: usize,
     sal_bytes: usize,
 ) -> (WorkerProcess<'_>, TestLog, W2mReceiver) {
-    let (mut writers, receiver, wakes) = w2m::fixtures::test_rings([ring_bytes]);
-    let sal = TestLog::with_wakes(sal_bytes, wakes, 1);
+    let (mut writers, receiver) = w2m::fixtures::test_rings(&[ring_bytes]);
+    let sal = TestLog::new(sal_bytes, 1, 1);
     let mesh = crate::runtime::mesh::fixtures::meshes(1, crate::runtime::mesh::OUTBOX_BYTES)
         .pop()
         .unwrap();
-    let mut wp = WorkerProcess::new(catalog, SalReader::new(sal.log(), 0, 1), writers.pop().unwrap(), mesh);
+    let mut wp = WorkerProcess::new(
+        catalog,
+        SalReader::new(sal.log(), 0, 1),
+        writers.pop().unwrap(),
+        sal.parks().park(0),
+        mesh,
+    );
     wp.reply_frame_budget = gnitz_wire::MAX_FRAME_PAYLOAD;
     (wp, sal, receiver)
 }
@@ -79,29 +86,31 @@ fn scan(tid: u64, schema: &SchemaDescriptor) -> Read<'static> {
     }
 }
 
-/// `ids` as the keys a PK probe of a `U64`-keyed relation carries.
-fn pk_keys(ids: &[u64]) -> (ipc::WireSchema, Batch) {
+/// `ids` as the keys a PK probe of a `U64`-keyed relation carries, behind their
+/// schema record.
+fn pk_keys(ids: &[u64]) -> (Vec<u8>, Batch) {
     let schema = pk_only_schema(&[TypeCode::U64]);
     let mut keys = Batch::with_capacity(&schema, ids.len());
     for id in ids {
         keys.push_key_row(&id.to_be_bytes(), 1);
     }
-    (ipc::WireSchema::encoded(0, &schema), keys)
+    (encode_schema_block(&schema), keys)
 }
 
 /// A PK probe of `tid` at `keys`.
-fn probe<'a>(tid: u64, keys: &'a (ipc::WireSchema, Batch), request_id: u32, later: bool) -> DirectGroup<'a> {
+fn probe<'a>(tid: u64, keys: &'a (Vec<u8>, Batch), request_id: u32, later: bool) -> DirectGroup<'a> {
     DirectGroup {
-        schema: Some(keys.0.block()),
+        schema: Some(&keys.0),
         data: GroupData::Same(keys.1.wire_whole()),
         ..addressed(Read::HasPk { tid, probe: Probe::Pk }, request_id, later)
     }
 }
 
-/// A push of `rows` into `tid`, ACKed on `request_id`.
-fn push<'a>(relation: &'a ipc::WireSchema, rows: &'a Batch, request_id: u32) -> DirectGroup<'a> {
+/// A push of `rows` into `tid`, whose schema record is `record`, ACKed on
+/// `request_id`.
+fn push<'a>(tid: u64, record: &'a [u8], rows: &'a Batch, request_id: u32) -> DirectGroup<'a> {
     let targets = GroupTargets { request_id, ..GroupTargets::UNADDRESSED };
-    DirectGroup::push(relation, GroupData::Same(rows.wire_whole()), targets)
+    DirectGroup::push(tid, record, GroupData::Same(rows.wire_whole()), targets)
 }
 
 /// One published ring message: its ring-prefix request id, control block and
@@ -301,14 +310,14 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
 fn a_push_does_not_reach_a_base_table_read_ahead_of_it() {
     let (mut engine, tid) = engine_with_table("push_behind_read");
     let schema = make_schema_u64_i64();
-    let relation = ipc::WireSchema::from_catalog(&engine, tid);
+    let record = engine.schema_record(tid).expect("a registered table");
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
     sal.excl()
         .write(&addressed(scan(tid, &schema), 1, false))
         .expect("group fits");
-    sal.excl().write(&push(&relation, &row, 2)).expect("group fits");
+    sal.excl().write(&push(tid, &record, &row, 2)).expect("group fits");
     drain_in_wait(&mut wp);
 
     let out = frames(&rx);
@@ -396,11 +405,31 @@ fn a_complete_round_goes_ahead_of_the_reads_on_the_sal() {
 
     // One worker: its own publish completes the round.
     let part = make_batch_raw(&schema, &[(1, 1, 10)]);
-    let got = wp.exchange(9, std::borrow::Cow::Borrowed(&part), &ScatterPlan::broadcast(), false);
+    let got = wp.exchange(9, Cow::Borrowed(&part), &ScatterPlan::broadcast(), false);
     assert_eq!(weighted_rows(&got), weighted_rows(&part));
     assert_eq!(reqs(&frames(&rx)), [1]);
     let next = wp.next_request().expect("the second read is still on the SAL");
     assert_eq!(next.route.request_id, 2);
+}
+
+/// A round is opened with the drive's own claim, and its close leaves every
+/// worker's in `drained`: a peer whose source is not drained overturns it.
+#[test]
+fn exchange_leaves_the_rounds_verdict_in_drained() {
+    let (mut engine, _) = engine_with_table("exchange_verdict");
+    let (mut wp, _sal, _rx) = test_worker(&mut engine);
+    let part = make_batch_raw(&make_schema_u64_i64(), &[(1, 1, 10)]);
+    let plan = ScatterPlan::broadcast();
+    for (own, peers, all) in [(true, true, true), (true, false, false), (false, true, false)] {
+        let mut meshes = crate::runtime::mesh::fixtures::meshes(2, 1 << 16);
+        let mut peer = meshes.pop().unwrap();
+        wp.mesh = meshes.pop().unwrap();
+        // The peer arrives first, so this worker's own open completes the round.
+        let _peers_round = peer.open(9, Cow::Borrowed(&part), &plan, false, peers);
+        wp.drained = own;
+        wp.exchange(9, Cow::Borrowed(&part), &plan, false);
+        assert_eq!(wp.drained, all, "own claim {own}, the peer's {peers}");
+    }
 }
 
 // -- the reply queue --------------------------------------------------------
@@ -747,6 +776,9 @@ const BENCH_GROUPS: u64 = 10_000;
 /// Rows a chunk of the bench's span train holds.
 const BENCH_CHUNK_ROWS: u64 = 1024;
 
+/// Writes a bench arm's groups to the SAL: its table's schema record, schema and id.
+type WriteGroups<'a> = &'a dyn Fn(&TestLog, &[u8], &SchemaDescriptor, u64);
+
 /// [`test_worker`] over a SAL and a ring that hold a whole bench arm.
 fn bench_worker(catalog: &mut CatalogEngine) -> (WorkerProcess<'_>, TestLog, W2mReceiver) {
     worker_over(catalog, 1 << 26, 32 << 20)
@@ -768,11 +800,7 @@ fn worker_request_bench() {
 
     // One arm: a fresh table of `rows` rows, the groups `write` puts on the SAL,
     // and `drain_sal` until nothing is owed. `per` is what the count is divided by.
-    let arm = |label: &str,
-               rows: u64,
-               index: bool,
-               write: &dyn Fn(&TestLog, &ipc::WireSchema, &SchemaDescriptor, u64),
-               per: &dyn Fn(usize) -> (u64, &'static str)| {
+    let arm = |label: &str, rows: u64, index: bool, write: WriteGroups, per: &dyn Fn(usize) -> (u64, &'static str)| {
         if std::env::var("GNITZ_BENCH_ARM").is_ok_and(|only| only != label) {
             return;
         }
@@ -792,9 +820,9 @@ fn worker_request_bench() {
             let held: Vec<_> = (0..rows).map(|i| (i, 1, i as i64)).collect();
             engine.registry.ingest(tid, make_batch_raw(&schema, &held)).unwrap();
         }
-        let relation = ipc::WireSchema::from_catalog(&engine, tid);
+        let record = engine.schema_record(tid).expect("a registered table");
         let (mut wp, sal, rx) = bench_worker(&mut engine);
-        write(&sal, &relation, &schema, tid);
+        write(&sal, &record, &schema, tid);
         let ((), instructions) = counter.measure(|| loop {
             wp.drain_sal();
             if wp.replies.is_empty() {
@@ -818,7 +846,7 @@ fn worker_request_bench() {
         "push",
         0,
         false,
-        &|sal, relation, schema, _| {
+        &|sal, record, schema, tid| {
             let excl = sal.excl();
             for i in 0..BENCH_GROUPS {
                 let row = make_batch_raw(schema, &[(i, 1, i as i64)]);
@@ -826,8 +854,13 @@ fn worker_request_bench() {
                     request_id: i as u32 + 1,
                     ..GroupTargets::UNADDRESSED
                 };
-                excl.write(&DirectGroup::push(relation, GroupData::Same(row.wire_whole()), targets))
-                    .expect("group fits");
+                excl.write(&DirectGroup::push(
+                    tid,
+                    record,
+                    GroupData::Same(row.wire_whole()),
+                    targets,
+                ))
+                .expect("group fits");
             }
         },
         &per_group,

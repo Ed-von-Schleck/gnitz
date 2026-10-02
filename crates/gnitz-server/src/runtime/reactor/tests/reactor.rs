@@ -12,7 +12,7 @@ use crate::runtime::test_support::fork_child;
 /// parks until the last worker has answered OK.
 #[test]
 fn acks_keep_early_answers_and_resolve_on_the_last_ok() {
-    let (r, writers) = reactor_with_rings(3);
+    let (r, mut writers) = reactor_with_rings(3);
     let lease = r.lease_acks(WorkerSet::ALL);
     writers[0].send_ack(lease.id());
     writers[1].send_ack(lease.id());
@@ -37,7 +37,7 @@ fn acks_keep_early_answers_and_resolve_on_the_last_ok() {
 /// does not take that id straight back.
 #[test]
 fn a_dropped_leases_late_frame_is_released_and_its_id_not_reused() {
-    let (r, writers) = reactor_with_rings(3);
+    let (r, mut writers) = reactor_with_rings(3);
     let id = r.lease_acks(WorkerSet::ALL).id();
     writers[0].send_ack(id);
     r.drain_all_w2m();
@@ -74,7 +74,7 @@ fn lease_ids_wrap_past_zero_and_skip_live_ids() {
 fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
     within(|| {
         let (r, mut writers) = reactor_with_rings(1);
-        let writer = writers.pop().expect("one ring");
+        let mut writer = writers.pop().expect("one ring");
         let lease = r.lease_acks(WorkerSet::ALL);
         let id = lease.id();
         let done = Rc::new(Cell::new(false));
@@ -133,20 +133,18 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
     const N_MESSAGES: u32 = 500;
     const TIMEOUT: Duration = Duration::from_secs(30);
 
-    let (reactor, writers) = reactor_with_rings(1);
-    // Only id 1, a fresh reactor's first lease, is leased, and published last: the
-    // rest are released unrouted, and the lease resolves only once the reactor has
-    // drained every one. As fast as possible, so the drain-refresh-arm race is
-    // under pressure.
+    let (reactor, mut writers) = reactor_with_rings(1);
+    // Only the ready id is leased, and published last: the rest are released
+    // unrouted, and the lease resolves only once the reactor has drained every
+    // one. As fast as possible, so the drain-refresh-arm race is under pressure.
     let child = || {
-        for req_id in (2..=N_MESSAGES).chain([1]) {
+        for req_id in (BOOT_READY_REQUEST_ID + 1..=N_MESSAGES).chain([BOOT_READY_REQUEST_ID]) {
             writers[0].send_ack(req_id);
         }
     };
     let pid = unsafe { fork_child(child) };
 
-    let lease = reactor.lease_acks(WorkerSet::ALL);
-    assert_eq!(lease.id(), 1);
+    let lease = reactor.lease_ready();
     let timer = reactor.sleep(TIMEOUT);
     let out = reactor.block_on(async move { select2(lease.acks(), timer).await });
     if let Either::B(()) = out {
@@ -160,26 +158,25 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
 /// child answers on ring 0, waits until the reactor parks, then answers on ring 1.
 #[test]
 fn a_publish_on_a_later_ring_wakes_the_reactor() {
-    use crate::runtime::w2m::fixtures::{master_parked, test_rings};
+    use crate::runtime::w2m::fixtures::test_rings;
 
     const TIMEOUT: Duration = Duration::from_secs(30);
 
-    let (writers, receiver, _) = test_rings([64 * 1024; 2]);
+    let (mut writers, receiver) = test_rings(&[64 * 1024; 2]);
 
     let child = || {
-        writers[0].send_ack(1);
+        writers[0].send_ack(BOOT_READY_REQUEST_ID);
         let deadline = Instant::now() + TIMEOUT;
-        while !master_parked(&receiver, 1) {
+        while !writers[1].master_parked() {
             assert!(Instant::now() < deadline, "the reactor never parked on ring 1");
             std::thread::yield_now();
         }
-        writers[1].send_ack(1);
+        writers[1].send_ack(BOOT_READY_REQUEST_ID);
     };
     let pid = unsafe { fork_child(child) };
 
     let r = make_reactor_over(receiver);
-    // Request id 1 is a fresh reactor's first.
-    let lease = r.lease_acks(WorkerSet::ALL);
+    let lease = r.lease_ready();
     let timer = r.sleep(TIMEOUT);
     let out = r.block_on(async move { select2(lease.acks(), timer).await });
     if let Either::B(()) = out {

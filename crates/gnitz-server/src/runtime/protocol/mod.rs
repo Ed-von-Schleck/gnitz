@@ -1,8 +1,8 @@
 //! The protocol — the IPC wire format, the shared append-only log (SAL), the
-//! lock-free worker→master ring (`w2m`), which also carries the worker's park on
-//! the SAL, and the worker↔worker exchange `mesh`.
+//! lock-free worker→master ring (`w2m`), the worker↔worker exchange `mesh`, and
+//! the futex `park` they sleep through.
 //!
-//! A layer grouping, not a namespace callers name: `runtime/mod.rs` aliases these
+//! A grouping, not a namespace callers name: `runtime/mod.rs` aliases these
 //! submodules, and `crate::runtime::<mod>` is how the whole subsystem reaches
 //! them.
 //!
@@ -11,6 +11,7 @@
 //! private items.
 
 pub(super) mod mesh;
+pub(super) mod park;
 pub(super) mod sal;
 pub(super) mod w2m;
 pub(super) mod wire;

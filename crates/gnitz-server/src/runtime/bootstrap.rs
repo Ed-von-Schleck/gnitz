@@ -17,37 +17,21 @@ use crate::runtime::executor::ServerExecutor;
 use crate::runtime::listen;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::mesh::{self, Mesh};
-use crate::runtime::reactor::{select2, AckLease, Either, Limits, Reactor};
+use crate::runtime::park::{WorkerPark, WorkerParks};
+use crate::runtime::reactor::{select2, AckLease, Either, Limits, Reactor, BOOT_READY_REQUEST_ID};
 use crate::runtime::sal::zone::CommittedTail;
-use crate::runtime::sal::{SalLog, SalMessage, SalMessageKind, SalReader, SalWriter, WorkerSet};
+use crate::runtime::sal::{SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
 use crate::runtime::tls::TlsArgs;
-use crate::runtime::w2m::{self, SalWake, W2mReceiver, W2mWriter, BOOT_READY_REQUEST_ID};
-use crate::runtime::wire as ipc;
+use crate::runtime::w2m::{self, W2mReceiver, W2mWriter};
 use crate::runtime::worker::WorkerProcess;
 use gnitz_store::relation::Residency;
-use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::SchemaDescriptor;
 use gnitz_zset::schema::Slot;
 
 // ---------------------------------------------------------------------------
 // SAL recovery: both drivers below read the log through `sal::zone::CommittedTail`
 // and differ only in which groups are theirs and what they do with the bytes.
+// A group whose rows do not decode fails the boot.
 // ---------------------------------------------------------------------------
-
-/// Decode one committed group slot's batch, `None` if it carries no rows; one
-/// that does not decode fails the boot.
-fn decode_group_slot(
-    msg: &SalMessage,
-    data: &[u8],
-    known: impl FnOnce(u64, &[u8]) -> Option<SchemaDescriptor>,
-) -> Result<Option<Batch>, String> {
-    ipc::decode_sal_frame(data, known).map(|(_, batch)| batch).map_err(|e| {
-        format!(
-            "SAL replay: corrupt block at offset={} lsn={} target={}: {e}",
-            msg.base, msg.lsn, msg.target_id
-        )
-    })
-}
 
 /// Stage every committed DdlSync group above its family's replay floor into the
 /// system stores.
@@ -66,7 +50,7 @@ fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Re
                 msg.base, msg.lsn
             ));
         };
-        let Some(batch) = decode_group_slot(&msg, data, |_, _| None)? else {
+        let Some(batch) = msg.rows(data, |_, _| None)? else {
             continue;
         };
         // Master-validated rows that already carry a drop's children.
@@ -149,7 +133,7 @@ fn recover_from_sal(
         let all = reslice.then(|| msg.payloads()).into_iter().flatten();
         let mut applied = false;
         for data in own.into_iter().chain(all) {
-            let Some(batch) = decode_group_slot(&msg, data, |tid, record| catalog.known_decode(tid, record))? else {
+            let Some(batch) = msg.rows(data, |tid, record| catalog.known_decode(tid, record))? else {
                 continue;
             };
             let mut owned = if reslice {
@@ -248,6 +232,7 @@ struct WorkerIpc {
     sal: SalLog,
     tail: CommittedTail,
     w2m_writer: W2mWriter,
+    park: WorkerPark,
     mesh: Mesh,
 }
 
@@ -263,24 +248,34 @@ struct SharedIpc {
     tail: CommittedTail,
     /// In rank order.
     workers: Vec<WorkerIpc>,
-    /// The master's ends: the reader over every ring, and a wake per worker.
+    /// The master's ends: the reader over every ring, and every worker's park
+    /// to wake.
     receiver: W2mReceiver,
-    wakes: Vec<SalWake>,
+    parks: WorkerParks,
 }
 
-/// Open and map the SAL, one W2M ring per worker, and the exchange mesh.
+/// Open and map the SAL, the workers' parks, one W2M ring per worker, and the
+/// exchange mesh.
 fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
     let sal = SalLog::open(data_dir)?;
     let tail = CommittedTail::read(sal)?;
-    let (writers, receiver, wakes) = w2m::create(nw).map_err(|e| format!("failed to map the W2M rings: {e}"))?;
+    let parks = WorkerParks::create(nw).map_err(|e| format!("failed to map the worker parks: {e}"))?;
+    let (writers, receiver) = w2m::create(nw).map_err(|e| format!("failed to map the W2M rings: {e}"))?;
     let meshes =
-        mesh::create(mesh::outbox_bytes(), &wakes).map_err(|e| format!("failed to map the exchange mesh: {e}"))?;
+        mesh::create(mesh::outbox_bytes(), parks).map_err(|e| format!("failed to map the exchange mesh: {e}"))?;
     let workers = writers
         .into_iter()
         .zip(meshes)
-        .map(|(w2m_writer, mesh)| WorkerIpc { sal, tail, w2m_writer, mesh })
+        .enumerate()
+        .map(|(w, (w2m_writer, mesh))| WorkerIpc {
+            sal,
+            tail,
+            w2m_writer,
+            park: parks.park(w),
+            mesh,
+        })
         .collect();
-    Ok(SharedIpc { sal, tail, workers, receiver, wakes })
+    Ok(SharedIpc { sal, tail, workers, receiver, parks })
 }
 
 /// The forked child's whole life: latch its rank, redirect its logs to
@@ -291,7 +286,7 @@ fn run_worker_child(
     data_dir: &str,
     master_pid: i32,
     catalog: &mut CatalogEngine,
-    ipc: WorkerIpc,
+    mut ipc: WorkerIpc,
     swept_bases: &[u64],
     pinning: Option<&affinity::Pinning>,
 ) -> ! {
@@ -330,9 +325,9 @@ fn run_worker_child(
     gnitz_note!("Worker {} (pid {}) of {}", w, unsafe { libc::getpid() }, slot.of);
 
     let sal_reader = SalReader::new(ipc.sal, slot.rank, ipc.tail.live_epoch());
-    // The id the master leased before it collects.
+    // The id the master leases before it collects.
     ipc.w2m_writer.send_ack(BOOT_READY_REQUEST_ID);
-    WorkerProcess::new(catalog, sal_reader, ipc.w2m_writer, ipc.mesh).run()
+    WorkerProcess::new(catalog, sal_reader, ipc.w2m_writer, ipc.park, ipc.mesh).run()
 }
 
 /// The master's half of recovery before any worker exists: the sweep set every
@@ -481,7 +476,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
 
     let swept_bases = master_pre_fork_recovery(catalog)?;
 
-    let SharedIpc { sal, tail, workers, receiver, wakes } = ipc;
+    let SharedIpc { sal, tail, workers, receiver, parks } = ipc;
     let worker_pids = fork_workers(catalog, data_dir, workers, &swept_bases, pinning.as_ref())?;
 
     // --- Parent process ---
@@ -490,18 +485,13 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<T
     let dispatcher = Rc::new(MasterDispatcher::new(
         worker_pids,
         catalog,
-        SalWriter::new(sal, wakes),
+        SalWriter::new(sal, parks),
         reactor,
     ));
 
     // The workers' ready ACKs. Leased before the loop first runs, which drops
     // every W2M frame no lease routes.
-    let ready = dispatcher.reactor().lease_acks(WorkerSet::ALL);
-    assert_eq!(
-        ready.id(),
-        BOOT_READY_REQUEST_ID,
-        "the ready ACKs name the reactor's first lease"
-    );
+    let ready = dispatcher.reactor().lease_ready();
     let live_epoch = tail.live_epoch();
     let d = Rc::clone(&dispatcher);
     let logs = data_dir.to_owned();

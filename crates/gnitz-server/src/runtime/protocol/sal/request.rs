@@ -136,7 +136,7 @@ impl SalRequest<'_> {
 impl SalRequest<'static> {
     /// The inverse of [`Self::kind`] + [`Self::template`], owning what it read
     /// of `blob`: a worker holds its request past the SAL bytes it came in.
-    pub(crate) fn decode(kind: SalMessageKind, hdr: &ControlHeader, blob: &[u8]) -> Result<Self, String> {
+    pub(super) fn decode(kind: SalMessageKind, hdr: &ControlHeader, blob: &[u8]) -> Result<Self, String> {
         let tid = hdr.target_id;
         Ok(match kind {
             SalMessageKind::Shutdown => SalRequest::Shutdown,

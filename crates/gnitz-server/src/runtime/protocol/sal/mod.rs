@@ -21,15 +21,16 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::runtime::park::WorkerParks;
 use crate::runtime::reactor::{AsyncRwLock, Reactor, WriteGuard};
-use crate::runtime::w2m::SalWake;
-use crate::runtime::wire::{WireMsg, WireSchema};
+use crate::runtime::wire::WireMsg;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io;
-use gnitz_wire::control::frame_head_size;
+use gnitz_wire::control::{frame_head_size, peek_control_block, DecodedControl};
 use gnitz_wire::{low_bits_mask, read_u32_le, read_u64_le, write_u32_le, write_u64_le, BitIter};
 use gnitz_wire::{WireFault, WireStatus};
 use gnitz_zset::repr::{Batch, WireRows};
+use gnitz_zset::schema::{decode_schema_block, SchemaDescriptor};
 
 /// `GNITZ_INJECT_SAL_ZONE_PANIC=<scope tag>`: crash the master between a zone's
 /// groups publishing and its closing member. The tag (`"ddl"` / `"commit"`)
@@ -272,22 +273,24 @@ impl<'a> DirectGroup<'a> {
         }
     }
 
-    /// A push of `data` into `relation`, written to `targets`.
-    pub(crate) fn push(relation: &'a WireSchema, data: GroupData<'a>, targets: GroupTargets) -> Self {
+    /// A push of `data` into `tid`, whose schema record is `record`, written to
+    /// `targets`.
+    pub(crate) fn push(tid: u64, record: &'a [u8], data: GroupData<'a>, targets: GroupTargets) -> Self {
         DirectGroup {
-            schema: Some(relation.block()),
+            schema: Some(record),
             data,
             targets,
-            ..Self::new(Apply::Push { tid: relation.tid() })
+            ..Self::new(Apply::Push { tid })
         }
     }
 
-    /// A catalog mutation of `relation`: `batch`, sent whole to every worker.
-    pub(crate) fn ddl_sync(relation: &'a WireSchema, batch: &'a Batch) -> Self {
+    /// A catalog mutation of `family`, whose schema record is `record`: `batch`,
+    /// sent whole to every worker.
+    pub(crate) fn ddl_sync(family: u64, record: &'a [u8], batch: &'a Batch) -> Self {
         DirectGroup {
-            schema: Some(relation.block()),
+            schema: Some(record),
             data: GroupData::Same(batch.wire_whole()),
-            ..Self::new(Apply::DdlSync { family: relation.tid() })
+            ..Self::new(Apply::DdlSync { family })
         }
     }
 
@@ -515,6 +518,42 @@ impl SalMessage {
             .then(|| self.payloads().nth(if self.shared { 0 } else { self.targets.rank(w) }))
             .flatten()
     }
+
+    /// The rows `payload`, one of this group's, carries; `known` as
+    /// [`decode_sal_frame`]'s. The error names the group's offset, LSN and target.
+    pub(crate) fn rows(
+        &self,
+        payload: &[u8],
+        known: impl FnOnce(u64, &[u8]) -> Option<SchemaDescriptor>,
+    ) -> Result<Option<Batch>, String> {
+        decode_sal_frame(payload, known).map(|(_, batch)| batch).map_err(|e| {
+            format!(
+                "SAL replay: corrupt block at offset={} lsn={} target={}: {e}",
+                self.base, self.lsn, self.target_id
+            )
+        })
+    }
+}
+
+/// A payload's control block, and the rows of its data block under the payload's
+/// own schema record; `known` answers what that record decodes to when the
+/// caller already knows.
+fn decode_sal_frame(
+    bytes: &[u8],
+    known: impl FnOnce(u64, &[u8]) -> Option<SchemaDescriptor>,
+) -> Result<(DecodedControl, Option<Batch>), String> {
+    let control = peek_control_block(bytes)?;
+    let Some(r) = control.data.clone() else {
+        return Ok((control, None));
+    };
+    let record = &bytes[control.schema.clone().ok_or("a data block without a schema block")?];
+    let schema = match known(control.hdr.target_id, record) {
+        Some(s) => s,
+        None => decode_schema_block(record)?,
+    };
+    let batch = Batch::decode_from_wal_block(&bytes[r], &schema)?;
+    batch.debug_verify_null_bits();
+    Ok((control, Some(batch)))
 }
 
 /// What the bytes at an offset are.
@@ -821,8 +860,8 @@ pub(crate) struct SalWriter {
     refused_transient: Cell<bool>,
     /// Taken by every [`SalExcl`].
     excl: AsyncRwLock,
-    /// One wake per worker, in worker order.
-    wakes: Vec<SalWake>,
+    /// Every worker's park; its length is the worker count groups are written at.
+    parks: WorkerParks,
     /// The workers groups written since the last [`SalExcl::wake`] reached.
     reached: Cell<WorkerSet>,
 }
@@ -830,9 +869,9 @@ pub(crate) struct SalWriter {
 impl SalWriter {
     /// Starts at epoch 0, which [`Self::write_slots`] refuses: nothing can be
     /// written before the boot [`SalExcl::boot_rewind`] sets the live epoch.
-    pub(crate) fn new(log: SalLog, wakes: Vec<SalWake>) -> Self {
+    pub(crate) fn new(log: SalLog, parks: WorkerParks) -> Self {
         assert!(
-            wakes.len() <= MAX_WORKERS,
+            parks.len() <= MAX_WORKERS,
             "a SAL group cannot address more than MAX_WORKERS workers"
         );
         assert!(
@@ -850,7 +889,7 @@ impl SalWriter {
             checkpoint_threshold,
             refused_transient: Cell::new(false),
             excl: AsyncRwLock::default(),
-            wakes,
+            parks,
             reached: Cell::new(WorkerSet::EMPTY),
         }
     }
@@ -865,7 +904,7 @@ impl SalWriter {
 
     /// The worker count every group is written at.
     pub(crate) fn num_workers(&self) -> usize {
-        self.wakes.len()
+        self.parks.len()
     }
 
     /// Lay one group out at the write cursor, `fill(index, bytes)` per payload,
@@ -885,7 +924,7 @@ impl SalWriter {
             epoch >= 1,
             "SAL group epoch must be >= 1 — epoch 0 is indistinguishable from the empty prefix"
         );
-        let width = self.wakes.len();
+        let width = self.parks.len();
         debug_assert_eq!(sizes.len(), payload_count(head.flags, head.targets));
         debug_assert_eq!(
             head.targets,
@@ -999,7 +1038,7 @@ impl SalWriter {
     /// Lay `g` out at the write cursor, unpublished, stamped with `lsn`. The one
     /// encode path.
     fn lay_out(&self, g: &DirectGroup, lsn: u64) -> Result<u64, WireFault> {
-        let nw = self.wakes.len();
+        let nw = self.parks.len();
         let per_worker = match g.data {
             GroupData::Same(_) => nw,
             GroupData::Each(each) => each.len(),
@@ -1179,7 +1218,7 @@ impl<'a> SalExcl<'a> {
     pub(crate) fn wake(&self) {
         let w = self.writer;
         for worker in w.reached.replace(WorkerSet::EMPTY).iter() {
-            w.wakes[worker].wake();
+            w.parks.wake(worker);
         }
     }
 }
@@ -1276,6 +1315,29 @@ impl Drop for SalScope<'_> {
 // SalReader — one worker's live drain over a SalLog
 // ---------------------------------------------------------------------------
 
+/// Where the reply to a group goes.
+#[derive(Clone, Copy)]
+pub(crate) struct ReplyRoute {
+    pub(crate) target_id: u64,
+    /// `0`: nothing answers.
+    pub(crate) request_id: u32,
+    /// The cut the group was written in: how many groups not flagged in request
+    /// order the drain had passed. A cut's groups are consecutive and only its
+    /// first is unflagged, so every member reads one count and no two cuts share one.
+    pub(crate) cut: u64,
+}
+
+/// One group addressed to a worker, decoded and owned: a parked read outlives the
+/// SAL bytes it came in, which an inline `Flush` lets the master rewrite.
+pub(crate) struct Inbound {
+    pub(crate) route: ReplyRoute,
+    pub(crate) what: SalRequest<'static>,
+    /// Boxed, so a request moves from its decode to where it is served or parked
+    /// as a few words: held inline, the batch would be copied whole at each of
+    /// those moves, for a request that carries none as well.
+    pub(crate) rows: Option<Box<Batch>>,
+}
+
 pub(crate) struct SalReader {
     log: SalLog,
     worker_id: u32,
@@ -1306,7 +1368,7 @@ impl SalReader {
     /// epoch parks.
     /// A digest failure under a passing epoch gate can only be corruption, and
     /// parking on it would read as end-of-drain, so it fail-stops.
-    pub(crate) fn next(&self) -> Option<(SalMessage, &'static [u8])> {
+    fn next(&self) -> Option<(SalMessage, &'static [u8])> {
         loop {
             let cursor = self.read_cursor.get();
             match self.log.read_at(cursor, EpochGate::Live(self.expected_epoch.get())) {
@@ -1334,12 +1396,46 @@ impl SalReader {
         }
     }
 
-    /// The cut of the group [`Self::next`] last returned: how many groups not
-    /// flagged in request order the drain has passed. A cut's groups are
-    /// consecutive and only its first is unflagged, so every member of a cut reads
-    /// one count and no two cuts share one.
-    pub(crate) fn cut(&self) -> u64 {
+    /// The cut of the group [`Self::next`] last returned; see [`ReplyRoute::cut`].
+    fn cut(&self) -> u64 {
         self.cut.get()
+    }
+
+    /// The next group addressed to this worker. The master authored it, so bytes
+    /// that do not decode fail-stop, as a corrupt header does in [`Self::next`].
+    /// `catalog_schema` answers what a relation's catalog record decodes to.
+    #[inline]
+    pub(crate) fn next_request(
+        &self,
+        catalog_schema: impl FnOnce(u64, &[u8]) -> Option<SchemaDescriptor>,
+    ) -> Option<Inbound> {
+        let (msg, wire) = self.next()?;
+        // The kinds [`DirectGroup::push`] and [`DirectGroup::ddl_sync`] frame with
+        // their target's catalog record.
+        let catalog_record = matches!(msg.kind, SalMessageKind::Push | SalMessageKind::DdlSync);
+        let known = |tid, record: &[u8]| catalog_record.then(|| catalog_schema(tid, record)).flatten();
+        // Fail-stop: a dropped group diverges this worker from the master.
+        let undecodable =
+            |e: String| -> ! { gnitz_fatal_abort!("failed to decode {:?} for tid={}: {e}", msg.kind, msg.target_id) };
+        // Read in place: the rows move once, out of the decoded frame.
+        let mut decoded = decode_sal_frame(wire, known);
+        let (control, rows) = match &mut decoded {
+            Ok(frame) => frame,
+            Err(e) => undecodable(std::mem::take(e)),
+        };
+        let what = match SalRequest::decode(msg.kind, &control.hdr, &wire[control.blob.clone()]) {
+            Ok(what) => what,
+            Err(e) => undecodable(e),
+        };
+        Some(Inbound {
+            route: ReplyRoute {
+                target_id: control.hdr.target_id,
+                request_id: msg.request_id,
+                cut: self.cut(),
+            },
+            what,
+            rows: rows.take().map(Box::new),
+        })
     }
 
     /// No group is readable or corrupt at the cursor.

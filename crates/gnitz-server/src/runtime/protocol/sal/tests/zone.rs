@@ -1,9 +1,9 @@
 use super::*;
 use crate::runtime::sal::fixtures::{group_at, TestLog};
 use crate::runtime::sal::{Apply, DirectGroup, GroupData, GroupTargets, SalMessageKind, ANCHOR_RECORD, PREFIX_BYTES};
-use crate::runtime::wire::WireSchema;
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::encode_schema_block;
 
 const SIZE: usize = 1 << 20;
 const NW: usize = 4;
@@ -275,14 +275,11 @@ fn the_demotion_is_global_across_slots() {
 fn slot_damage_in_an_unzoned_group_does_not_stop_the_walk() {
     let log = TestLog::new(SIZE, NW, 1);
     let batch = rows();
-    let (member, stream) = (
-        WireSchema::encoded(TID, batch.schema()),
-        WireSchema::encoded(TID + 1, batch.schema()),
-    );
+    let record = encode_schema_block(batch.schema());
     let data = GroupData::Same(batch.wire_whole());
     let (member, stream) = (
-        DirectGroup::push(&member, data, GroupTargets::UNADDRESSED),
-        DirectGroup::push(&stream, data, GroupTargets::UNADDRESSED),
+        DirectGroup::push(TID, &record, data, GroupTargets::UNADDRESSED),
+        DirectGroup::push(TID + 1, &record, data, GroupTargets::UNADDRESSED),
     );
     let mut excl = log.excl();
     let scope = excl.begin("test");
@@ -328,13 +325,10 @@ impl TestLog {
     fn push_zone(&self, targets: &[u64]) -> (u64, Vec<u64>) {
         let batch = rows();
         let each = vec![batch.wire_whole(); self.writer.num_workers()];
-        let relations: Vec<WireSchema> = targets
+        let record = encode_schema_block(batch.schema());
+        let groups: Vec<DirectGroup> = targets
             .iter()
-            .map(|&t| WireSchema::encoded(t, batch.schema()))
-            .collect();
-        let groups: Vec<DirectGroup> = relations
-            .iter()
-            .map(|r| DirectGroup::push(r, GroupData::Each(&each), GroupTargets::UNADDRESSED))
+            .map(|&t| DirectGroup::push(t, &record, GroupData::Each(&each), GroupTargets::UNADDRESSED))
             .collect();
         self.commit_zone(&groups)
     }

@@ -1,34 +1,11 @@
-use super::fixtures::{master_parked, ring_capacity, sal_wake_seq, test_rings};
+use super::super::park::futex_wait_u32;
+use super::fixtures::{make_ring, ring_capacity, test_rings};
 use super::*;
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child, within};
 use gnitz_wire::control::CTRL_HEADER_SIZE;
 use proptest::prelude::*;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
-
-/// One ring holding `n_msgs` messages of `msg_sz` bytes plus `slack` spare
-/// bytes: its writer, its reader and its wake.
-fn make_ring(msg_sz: usize, n_msgs: usize, slack: u64) -> (W2mWriter, W2mReceiver, SalWake) {
-    let (mut writers, receiver, mut wakes) = test_rings([ring_capacity(msg_sz, n_msgs, slack)]);
-    (writers.pop().unwrap(), receiver, wakes.pop().unwrap())
-}
-
-/// Publish one message directly, without `W2mWriter`'s park loop; `false` when
-/// the ring is full.
-fn publish(writer: &W2mWriter, sz: usize, internal_req_id: u32, encode: impl FnOnce(&mut [u8])) -> bool {
-    let mut wc = writer.cursor.get();
-    // SAFETY: `writer` is its ring's sole producer, and the slot is filled
-    // before it is committed.
-    unsafe {
-        let Some(mut reservation) = try_reserve(&wc, sz, internal_req_id) else {
-            return false;
-        };
-        encode(reservation.slot());
-        commit(&mut wc, reservation);
-    }
-    writer.cursor.set(wc);
-    true
-}
 
 // -- ring layout ---------------------------------------------------------
 
@@ -46,20 +23,16 @@ unsafe fn consume_one(recv: &W2mReceiver) -> Option<&'static [u8]> {
 #[test]
 fn a_published_message_is_read_in_place_as_a_client_frame() {
     unsafe {
-        let (writer, recv, _) = make_ring(128, 4, 8);
+        let (mut writer, recv) = make_ring(128, 4, 8);
         let payload: Vec<u8> = (0..128).collect();
-        assert!(publish(&writer, payload.len(), 5, |slot| slot.copy_from_slice(&payload)));
+        assert!(writer.try_publish(5, payload.len(), |slot| slot.copy_from_slice(&payload)));
 
         let slot = recv.try_read_slot(0).expect("message must be visible");
         assert_eq!(slot.internal_req_id, 5);
         assert_eq!(slot.frame_bytes(), [128u32.to_le_bytes().as_slice(), &payload].concat());
         assert_eq!(
             slot.bytes().as_ptr(),
-            writer
-                .cursor
-                .get()
-                .base
-                .add(W2M_HEADER_SIZE + RING_PREFIX_BYTES as usize) as *const u8,
+            writer.wc.base.add(W2M_HEADER_SIZE + RING_PREFIX_BYTES as usize) as *const u8,
             "the payload must be mmap-resident — a train frame's rows are read in place"
         );
         drop(slot);
@@ -91,13 +64,13 @@ proptest! {
             1..80,
         ),
     ) {
-        let (writer, recv, _) = make_ring(MSG, 4, slack);
+        let (mut writer, recv) = make_ring(MSG, 4, slack);
         let mut unread: VecDeque<(u8, usize)> = VecDeque::new();
         for (tag, op) in ops.into_iter().enumerate() {
             let tag = tag as u8;
             match op {
                 RingOp::Publish(len) => {
-                    if publish(&writer, len, 0, |slot| slot.fill(tag)) {
+                    if writer.try_publish(0, len, |slot| slot.fill(tag)) {
                         unread.push_back((tag, len));
                     } else {
                         prop_assert!(!unread.is_empty(), "an empty ring refused a {len}-byte publish");
@@ -124,9 +97,9 @@ proptest! {
 #[test]
 #[should_panic(expected = "exceeds this ring's")]
 fn an_oversized_publish_panics() {
-    let (writer, ..) = make_ring(64, 4, 8);
-    let dcap = writer.cursor.get().dcap();
-    publish(&writer, dcap as usize + 1, 0, |_| {});
+    let (mut writer, _receiver) = make_ring(64, 4, 8);
+    let dcap = writer.wc.dcap();
+    writer.try_publish(0, dcap as usize + 1, |_| {});
 }
 
 // -- slot retirement -----------------------------------------------------
@@ -142,9 +115,9 @@ fn release_follows_the_front_consecutive_prefix() {
         (0..N).rev().collect(),
         evens_back_then_odds.collect::<Vec<_>>(),
     ] {
-        let (writer, receiver, _) = make_ring(8, N, 8);
+        let (mut writer, receiver) = make_ring(8, N, 8);
         for i in 0..N {
-            assert!(publish(&writer, 8, 0, |s| s[0] = i as u8), "publish #{i}");
+            assert!(writer.try_publish(0, 8, |s| s[0] = i as u8), "publish #{i}");
         }
         let mut slots: Vec<Option<W2mSlot>> = Vec::with_capacity(N);
         let mut vrcs = Vec::with_capacity(N);
@@ -157,7 +130,7 @@ fn release_follows_the_front_consecutive_prefix() {
             slots[idx] = None;
             released[idx] = true;
             let p = released.iter().position(|&r| !r).unwrap_or(N);
-            let expected = if p == 0 { W2M_HEADER_SIZE as u64 } else { vrcs[p - 1] };
+            let expected = if p == 0 { 0 } else { vrcs[p - 1] };
             assert_eq!(receiver.release_cursor(0), expected, "front-consecutive prefix of {p}");
         }
     }
@@ -167,14 +140,52 @@ fn release_follows_the_front_consecutive_prefix() {
 #[test]
 fn a_retired_slot_unparks_the_writer() {
     within(|| {
-        let (writer, receiver, _) = make_ring(CTRL_HEADER_SIZE, 1, 8);
-        assert!(publish(&writer, CTRL_HEADER_SIZE, 0, |s| s[0] = 1));
+        let (mut writer, receiver) = make_ring(CTRL_HEADER_SIZE, 1, 8);
+        assert!(writer.try_publish(0, CTRL_HEADER_SIZE, |s| s[0] = 1));
         let writer = std::thread::spawn(move || writer.send_ack(1));
-        while receiver.header(0).writer_park.flags.load(Ordering::Acquire) & FLAG_WRITER_PARKED == 0 {
+        while !receiver.header(0).release.armed() {
             std::thread::yield_now();
         }
         drop(receiver.try_read_slot(0).expect("slot"));
         writer.join().expect("writer thread panicked");
+    });
+}
+
+/// A release that frees too little leaves the writer waiting, and the release
+/// that frees enough still wakes it: the writer re-arms after every wake.
+#[test]
+fn a_writer_short_of_room_after_a_release_waits_for_the_next() {
+    within(|| {
+        // Three small slots fill the ring; the big message needs all three back.
+        let small = CTRL_HEADER_SIZE;
+        let (mut writer, receiver) = make_ring(small, 3, 0);
+        for id in 1..=3 {
+            assert!(writer.try_publish(id, small, |s| s[0] = id as u8));
+        }
+        let big = (3 * slot_stride(small) - RING_PREFIX_BYTES) as usize;
+        let writer = std::thread::spawn(move || {
+            writer.send_msg(
+                9,
+                &WireMsg {
+                    blob: &vec![7u8; big - CTRL_HEADER_SIZE],
+                    ..Default::default()
+                },
+            )
+        });
+        let armed = || receiver.header(0).release.armed();
+        for _ in 0..2 {
+            while !armed() {
+                std::thread::yield_now();
+            }
+            // Takes the arm; too little room, so the writer arms again.
+            drop(receiver.try_read_slot(0).expect("slot"));
+        }
+        while !armed() {
+            std::thread::yield_now();
+        }
+        drop(receiver.try_read_slot(0).expect("slot"));
+        writer.join().expect("writer thread panicked");
+        assert_eq!(receiver.try_read_slot(0).expect("the big message").internal_req_id, 9);
     });
 }
 
@@ -184,28 +195,16 @@ fn a_retired_slot_unparks_the_writer() {
 /// ring's arm.
 #[test]
 fn arm_waitv_arms_only_while_every_ring_is_quiet() {
-    let (writers, receiver, _) = test_rings([ring_capacity(64, 4, 8); 2]);
-    let parked = || [master_parked(&receiver, 0), master_parked(&receiver, 1)];
+    let (mut writers, receiver) = test_rings(&[ring_capacity(64, 4, 8); 2]);
+    let parked = |writers: &[W2mWriter]| [writers[0].master_parked(), writers[1].master_parked()];
     let mut out = [FutexWaitV::new(); 2];
 
     assert!(receiver.arm_waitv(&mut out).is_some(), "quiet rings arm");
-    assert_eq!(parked(), [true, true]);
-    assert!(publish(&writers[1], 64, 0, |s| s[0] = 1));
-    assert_eq!(parked(), [true, false], "a publish takes its ring's arm");
+    assert_eq!(parked(&writers), [true, true]);
+    assert!(writers[1].try_publish(0, 64, |s| s[0] = 1));
+    assert_eq!(parked(&writers), [true, false], "a publish takes its ring's arm");
     assert!(receiver.arm_waitv(&mut out).is_none(), "unread data refuses the arm");
-    assert_eq!(parked(), [false, false], "and every ring is disarmed again");
-}
-
-/// An arm taken after a publish sees it, and survives it: only a later publish
-/// takes the arm.
-#[test]
-fn a_publish_before_an_arm_leaves_it_armed() {
-    let park = MasterPark { word: AtomicU64::new(0), _pad: 0 };
-    park.publish(8);
-    assert_eq!(park.arm(), 8);
-    assert!(park.armed());
-    park.publish(16);
-    assert!(!park.armed());
+    assert_eq!(parked(&writers), [false, false], "and every ring is disarmed again");
 }
 
 /// Publish/drain throughput over one ring, and how many publishes spend a
@@ -226,17 +225,16 @@ fn w2m_publish_drain_bench() {
     const N: u64 = 200_000;
     const RING_FRAMES: usize = 64;
 
-    let (writer, receiver, _) = make_ring(CTRL_HEADER_SIZE, RING_FRAMES, 8);
+    let (mut writer, receiver) = make_ring(CTRL_HEADER_SIZE, RING_FRAMES, 8);
     // Two u64s the child fills before `_exit`: publishes that found a master
     // park armed, and the child's own elapsed nanos.
     let cptr = map_anon_shared(4096).unwrap().cast::<u64>();
 
     let child = || {
-        let hdr = writer.cursor.get().header();
         let t = Instant::now();
         let mut woke_master = 0u64;
         for req in 1..=N {
-            if hdr.master_park.armed() {
+            if writer.master_parked() {
                 woke_master += 1;
             }
             writer.send_ack(req as u32);
@@ -263,7 +261,7 @@ fn w2m_publish_drain_bench() {
                 // A successful arm means the armed value equals the read cursor.
                 if receiver.arm_waitv(&mut waitv).is_some() {
                     futex_wait_u32(
-                        receiver.header(0).master_park.futex_word(),
+                        receiver.header(0).write.futex_word(),
                         receiver.read_cursor(0) as u32,
                         "bench",
                     );
@@ -295,7 +293,7 @@ fn w2m_publish_drain_bench() {
 #[test]
 fn concurrent_publishes_drain_in_order() {
     for (ring_frames, n, pad) in [(8, 2_000u32, &[][..]), (4, 500, &[b'x'; 4000][..])] {
-        let (writer, receiver, _) = make_ring(CTRL_HEADER_SIZE + pad.len(), ring_frames, 8);
+        let (mut writer, receiver) = make_ring(CTRL_HEADER_SIZE + pad.len(), ring_frames, 8);
         let pad_w = pad.to_vec();
         let writer = std::thread::spawn(move || {
             for req_id in 1..=n {
@@ -329,7 +327,7 @@ fn concurrent_publishes_drain_in_order() {
 /// its worker.
 #[test]
 fn a_slot_names_the_worker_whose_ring_it_was_read_from() {
-    let (writers, receiver, _) = test_rings([ring_capacity(CTRL_HEADER_SIZE, 2, 8); 2]);
+    let (mut writers, receiver) = test_rings(&[ring_capacity(CTRL_HEADER_SIZE, 2, 8); 2]);
     writers[1].send_ack(7);
     assert!(receiver.try_read_slot(0).is_none());
     assert_eq!(receiver.try_read_slot(1).expect("worker 1's frame").worker, 1);
@@ -339,7 +337,7 @@ fn a_slot_names_the_worker_whose_ring_it_was_read_from() {
 /// again it sends.
 #[test]
 fn try_send_msg_on_a_full_ring_writes_nothing() {
-    let (writer, receiver, _) = make_ring(CTRL_HEADER_SIZE, 2, 0);
+    let (mut writer, receiver) = make_ring(CTRL_HEADER_SIZE, 2, 0);
     let msg = WireMsg { arg0: 7, ..Default::default() };
     assert!(
         writer.try_send_msg(1, &msg) && writer.try_send_msg(2, &msg),
@@ -358,39 +356,4 @@ fn try_send_msg_on_a_full_ring_writes_nothing() {
     assert!(receiver.try_read_slot(0).is_none(), "nothing of the refused frame");
     assert!(writer.try_send_msg(3, &msg), "the released slots make room");
     assert_eq!(ids(1), [3]);
-}
-
-/// A park whose re-test behind the armed flag finds a group returns without
-/// sleeping, and leaves the flag clear.
-#[test]
-fn a_sal_park_returns_at_once_when_its_retest_finds_a_group() {
-    let (writer, receiver, _) = make_ring(CTRL_HEADER_SIZE, 2, 8);
-    let hdr = receiver.header(0);
-    let mut armed_when_tested = false;
-    writer.sal_park().park(|| {
-        armed_when_tested = hdr.sal_park.flags.load(Ordering::Acquire) & FLAG_SAL_PARKED != 0;
-        false
-    });
-    assert!(armed_when_tested, "the re-test runs behind the armed flag");
-    assert_eq!(hdr.sal_park.flags.load(Ordering::Acquire), 0, "and the park disarms");
-}
-
-/// A worker parked on an empty SAL wakes on another process's `SalWake`.
-#[test]
-fn a_parked_worker_wakes_on_a_forked_masters_sal_wake() {
-    let (writer, _receiver, wake) = make_ring(CTRL_HEADER_SIZE, 2, 8);
-    let child = || {
-        while wake.park.flags.load(Ordering::Acquire) & FLAG_SAL_PARKED == 0 {
-            std::thread::yield_now();
-        }
-        wake.wake();
-    };
-    let pid = unsafe { fork_child(child) };
-    within(move || {
-        let seq = || sal_wake_seq(&wake);
-        // The wake sequence stands in for the SAL the worker re-tests.
-        writer.sal_park().park(|| seq() == 0);
-        assert_eq!(seq(), 1, "the park ended on the wake");
-    });
-    unsafe { assert_child_exited_ok(pid) };
 }

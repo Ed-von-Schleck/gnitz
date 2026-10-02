@@ -19,7 +19,7 @@ pub(super) fn make_reactor() -> Reactor {
 
 /// [`make_reactor`] built with `limits`.
 pub(crate) fn make_reactor_with(limits: Limits) -> Reactor {
-    Reactor::new(16, limits, test_rings([]).1).expect("reactor")
+    Reactor::new(16, limits, test_rings(&[]).1).expect("reactor")
 }
 
 /// A test reactor reading the rings `w2m` covers.
@@ -55,14 +55,14 @@ impl Reactor {
 
 /// A reactor over `n` fresh W2M rings, with the writer of each.
 pub(crate) fn reactor_with_rings(n: usize) -> (Reactor, Vec<W2mWriter>) {
-    let (writers, receiver, _) = test_rings(vec![64 * 1024; n]);
+    let (writers, receiver) = test_rings(&vec![64 * 1024; n]);
     (make_reactor_over(receiver), writers)
 }
 
 /// A fresh ring holding one frame whose error text is `pad` bytes, read back as a
 /// slot.
 pub(crate) fn ring_slot(pad: usize) -> (W2mReceiver, W2mSlot) {
-    let (writers, receiver, _) = test_rings([256 * 1024]);
+    let (mut writers, receiver) = test_rings(&[256 * 1024]);
     let text = vec![0x42u8; pad];
     let msg = crate::runtime::wire::WireMsg { blob: &text, ..Default::default() };
     writers[0].send_msg(1, &msg);

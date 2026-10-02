@@ -1,8 +1,8 @@
 use super::*;
-use crate::runtime::w2m::fixtures::test_rings;
 
-/// `nw` workers' views of one mesh of `outbox_bytes` outboxes, each with the
-/// wakes of every peer's ring.
+/// `nw` workers' views of one mesh of `outbox_bytes` outboxes, over parks of
+/// their own.
 pub(crate) fn meshes(nw: usize, outbox_bytes: usize) -> Vec<Mesh> {
-    create(outbox_bytes, &test_rings(vec![4096; nw]).2).expect("map the mesh")
+    let parks = WorkerParks::create(nw).expect("map the parks");
+    create(outbox_bytes, parks).expect("map the mesh")
 }

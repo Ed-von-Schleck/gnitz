@@ -4,15 +4,13 @@ use crate::runtime::sal::SalMessageKind;
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::WireMsg;
 use crate::test_support::pk_only_schema;
-use gnitz_wire::{TypeCode, WireFlags};
+use gnitz_wire::TypeCode;
 
 /// One frame of a span train answering `req`.
-fn send(writer: &W2mWriter, req: u32, last: bool, spans: &Batch) {
+fn send(writer: &mut W2mWriter, req: u32, last: bool, spans: &Batch) {
     let msg = WireMsg {
-        target_id: 1,
-        flags: WireFlags::train_frame(last),
         data: spans.wire_whole(),
-        ..Default::default()
+        ..WireMsg::train_frame(1, last)
     };
     writer.send_msg(req, &msg);
 }
@@ -21,9 +19,9 @@ fn send(writer: &W2mWriter, req: u32, last: bool, spans: &Batch) {
 /// a row-less terminal frame.
 fn merge(partitions: &[&[u64]]) -> Option<UniqueFilter> {
     let frame_schema = pk_only_schema(&[TypeCode::U64]);
-    let (reactor, writers) = reactor_with_rings(partitions.len());
+    let (reactor, mut writers) = reactor_with_rings(partitions.len());
     let lease = reactor.lease_train(WorkerSet::ALL, SalMessageKind::KeySpans);
-    for (writer, keys) in writers.iter().zip(partitions) {
+    for (writer, keys) in writers.iter_mut().zip(partitions) {
         let mut spans = Batch::empty_with_schema(&frame_schema);
         for pair in keys.chunks(2) {
             spans.clear();

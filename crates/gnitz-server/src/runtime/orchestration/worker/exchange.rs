@@ -16,14 +16,9 @@ impl DriveHost for WorkerProcess<'_> {
     /// part of it is complete. SAL groups arriving meanwhile go through
     /// [`Self::dispatch_in_wait`].
     fn exchange(&mut self, view_id: u64, batch: Cow<'_, Batch>, plan: &ScatterPlan, fold: bool) -> Batch {
-        self.mesh.publish(view_id, &batch, plan, fold);
-        // Dropped once every row is written, so this worker holds the partition
-        // it sends beside the one it gathers only while its rows span parts.
-        let mut batch = self.mesh.sending().then_some(batch);
+        let mut round = self.mesh.open(view_id, batch, plan, fold, self.drained);
         loop {
-            self.w2m_writer
-                .sal_park()
-                .park(|| self.sal_reader.is_empty() && !self.mesh.complete());
+            self.park.park(|| self.sal_reader.is_empty() && !self.mesh.complete());
             while let Some(req) = self.next_request() {
                 // Once the round is complete the drive goes on; the next wait, or
                 // the top level, serves what the SAL still holds, in order.
@@ -32,11 +27,9 @@ impl DriveHost for WorkerProcess<'_> {
                 }
             }
             if self.mesh.complete() {
-                if let Some(out) = self.mesh.advance(batch.as_deref()) {
-                    return out;
-                }
-                if !self.mesh.sending() {
-                    batch = None;
+                if let Some((rows, drained)) = self.mesh.step(&mut round) {
+                    self.drained = drained;
+                    return rows;
                 }
             }
         }
@@ -46,15 +39,15 @@ impl DriveHost for WorkerProcess<'_> {
 impl WorkerProcess<'_> {
     /// Run one drive; whether every worker's source was drained.
     pub(super) fn drive(&mut self, what: Drive, delta: Option<Batch>) -> Result<bool, String> {
-        self.mesh.set_drained(delta.is_none());
+        self.drained = delta.is_none();
         crate::query::drive(self, what, delta)?;
-        Ok(self.mesh.drained())
+        Ok(self.drained)
     }
 
     /// Dispatch a group drained inside an exchange wait; whether it was a read.
     /// Total, so a new request cannot compile without a decision.
-    pub(super) fn dispatch_in_wait(&mut self, req: Request) -> bool {
-        let Request { route, what, rows } = req;
+    pub(super) fn dispatch_in_wait(&mut self, req: Inbound) -> bool {
+        let Inbound { route, what, rows } = req;
         match what {
             // A drive writes views, so a read of one would see the tick half-run:
             // it parks. A drive writes no other store, so every other read is

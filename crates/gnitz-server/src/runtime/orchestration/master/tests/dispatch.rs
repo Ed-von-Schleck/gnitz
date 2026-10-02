@@ -67,7 +67,7 @@ fn worker_death_names_the_dead_worker() {
 fn an_acked_group_ends_on_its_acks_or_is_refused() {
     within(|| {
         for refused in [false, true] {
-            let (disp, writers) = test_dispatcher(vec![0, 0], std::ptr::null_mut());
+            let (disp, mut writers) = test_dispatcher(vec![0, 0], std::ptr::null_mut());
             let disp = Rc::new(disp);
             let d = Rc::clone(&disp);
             let got = disp.reactor().block_on(async move {
@@ -77,7 +77,7 @@ fn an_acked_group_ends_on_its_acks_or_is_refused() {
                     tids: vec![0u8; if refused { 2 << 20 } else { 8 }].into(),
                 };
                 let lease = d.write_acked(&d.sal().lock().await, DirectGroup::new(tick))?;
-                writers.iter().for_each(|w| w.send_ack(lease.id()));
+                writers.iter_mut().for_each(|w| w.send_ack(lease.id()));
                 lease.acks().await;
                 Ok::<(), WireFault>(())
             });

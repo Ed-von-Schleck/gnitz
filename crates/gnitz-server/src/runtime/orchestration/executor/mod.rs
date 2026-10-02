@@ -1328,15 +1328,7 @@ fn send_id(peer: &Peer, id: u64) {
 /// A failure carrying its own status, master-minted or forwarded from a worker.
 /// A failure describes no rows, so it carries no schema block.
 fn send_fault(peer: &Peer, target_id: u64, fault: &WireFault) {
-    send_msg(
-        peer,
-        ipc::WireMsg {
-            target_id,
-            status: fault.status,
-            blob: fault.text.as_bytes(),
-            ..Default::default()
-        },
-    )
+    send_msg(peer, ipc::WireMsg { target_id, ..ipc::WireMsg::fault(fault) })
 }
 
 /// Refuse a push a stream cannot accept; `batch` is `None` for an empty delta.

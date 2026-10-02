@@ -3,13 +3,12 @@ use crate::catalog::{CatalogColumn, SysFamily};
 use crate::runtime::master::scatter::with_routed;
 use crate::runtime::sal::fixtures::TestLog;
 use crate::runtime::sal::{DirectGroup, GroupTargets};
-use crate::runtime::wire::WireSchema;
 use crate::test_support::{
     circuit_batch, col_def, col_tab_batch, identity_circuit, make_batch, push_view_tab_row, sum_weights,
     table_tab_batch,
 };
 use gnitz_wire::TypeCode;
-use gnitz_zset::repr::BatchBuilder;
+use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::Placement;
 
 // -- Boot staging -----------------------------------------------------------
@@ -135,13 +134,13 @@ fn a_tail_written_at_another_width_replays_for_the_launched_one() {
     for (tid, written_at) in [(r, 4), (k, 1)] {
         let log = TestLog::new(SAL_SIZE, written_at, 1);
         let placement = engine.registry.relation(tid).unwrap().placement();
-        let relation = WireSchema::from_catalog(&engine, tid);
+        let record = engine.schema_record(tid).expect("a registered table");
         with_routed(&rows, placement, written_at, |data| {
             let targets = GroupTargets {
                 set: data.holders(),
                 ..GroupTargets::UNADDRESSED
             };
-            log.commit_zone(&[DirectGroup::push(&relation, data, targets)]);
+            log.commit_zone(&[DirectGroup::push(tid, &record, data, targets)]);
         });
         log.synced_through(log.cursor());
 
