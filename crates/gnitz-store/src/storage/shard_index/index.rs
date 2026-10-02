@@ -20,14 +20,6 @@ use gnitz_zset::repr::StorageError;
 use gnitz_zset::repr::{merge_and_route, MappedShard};
 use gnitz_zset::schema::key::{pk_ranges_overlap, PkBuf};
 
-/// The write policy of a shard below L0: FoR-packed integer payload regions.
-/// `write_shard` overrides `skip_pk_filter` per store.
-const COMPACTED: ShardWriteOpts = ShardWriteOpts {
-    pack_ints: true,
-    skeleton: false,
-    skip_pk_filter: false,
-};
-
 impl ShardIndex {
     pub(super) fn all_entries(&self) -> impl Iterator<Item = &ShardEntry> {
         self.settled_entries().chain(&self.pending)
@@ -48,14 +40,9 @@ impl ShardIndex {
             .chain(&mut self.pending)
     }
 
-    /// Write `batch` as an unpublished shard named by a fresh seq. `newest`
-    /// defaults to that seq.
-    fn write_shard(
-        &mut self,
-        batch: &Batch,
-        opts: ShardWriteOpts,
-        newest: Option<u64>,
-    ) -> Result<ShardEntry, StorageError> {
+    /// Write `batch` as an unpublished shard named by a fresh seq, its integer
+    /// payload regions FoR-packed. `newest` defaults to that seq.
+    fn write_shard(&mut self, batch: &Batch, skeleton: bool, newest: Option<u64>) -> Result<ShardEntry, StorageError> {
         self.shard_seq += 1;
         let seq = self.shard_seq;
         let path = manifest::shard_path(&self.output_dir, seq);
@@ -63,8 +50,9 @@ impl ShardIndex {
             .write_as_shard(
                 &path,
                 ShardWriteOpts {
+                    pack_ints: true,
+                    skeleton,
                     skip_pk_filter: self.skip_pk_filter,
-                    ..opts
                 },
             )
             .and_then(|()| ShardEntry::open(&self.output_dir, seq, &self.schema, newest.unwrap_or(seq)))
@@ -78,7 +66,7 @@ impl ShardIndex {
 
     /// Append `run` to L0 as one unpublished shard: the spill.
     pub(crate) fn append_l0_run(&mut self, run: &Batch) -> Result<(), StorageError> {
-        let entry = self.write_shard(run, ShardWriteOpts::default(), None)?;
+        let entry = self.write_shard(run, false, None)?;
         let whole = PkBuf::zeroed(self.schema.pk_stride());
         self.levels[L0].get_or_create_guard(whole).entries.push(entry);
         Ok(())
@@ -87,7 +75,7 @@ impl ShardIndex {
     /// Write `run`, rows above the store's cut, as one unpublished shard outside
     /// every level.
     pub(crate) fn append_pending_run(&mut self, run: &Batch) -> Result<(), StorageError> {
-        let entry = self.write_shard(run, ShardWriteOpts::default(), None)?;
+        let entry = self.write_shard(run, false, None)?;
         self.pending.push(entry);
         Ok(())
     }
@@ -130,7 +118,7 @@ impl ShardIndex {
             terminal.guards.last().is_none_or(|g| g.key_extent().1 < first),
             "a terminal run ascends past every key its level holds"
         );
-        let entry = self.write_shard(run, COMPACTED, None)?;
+        let entry = self.write_shard(run, false, None)?;
         self.l0_run_bytes = self.l0_run_bytes.max(entry.shard.file_len());
         self.levels[TERMINAL]
             .guards
@@ -252,8 +240,7 @@ impl ShardIndex {
         let mut opened: Vec<(PkBuf, ShardEntry)> = Vec::with_capacity(keys.len());
         let dehydrate = kind == CompactionKind::Dehydrate;
         let merged = merge_and_route(&inputs, keys, dehydrate, &schema, &mut |key, skeleton, batch| {
-            let opts = ShardWriteOpts { skeleton, ..COMPACTED };
-            opened.push((key, self.write_shard(&batch, opts, Some(newest))?));
+            opened.push((key, self.write_shard(&batch, skeleton, Some(newest))?));
             Ok(())
         });
         if let Err(e) = merged {

@@ -36,7 +36,9 @@ fn encode_region<'a>(
         return (Encoding::Constant, Cow::Borrowed(&src[..width]));
     }
     let packed = if i == REG_WEIGHT {
-        two_value_encode(src).map(|image| (Encoding::TwoValue, image))
+        two_value_encode(src)
+            .map(|image| (Encoding::TwoValue, image))
+            .or_else(|| for_encode(src, gnitz_wire::FixedInt::I64).map(|image| (Encoding::For, image)))
     } else if pack_ints && i >= REG_PAYLOAD_START {
         let col = &schema.columns[schema.payload_col_idx(i - REG_PAYLOAD_START)];
         col.fixed_int()
@@ -68,8 +70,8 @@ const SAMPLE_RUNS: usize = 64;
 
 /// Whether a sample of `cells` holds one content twice. The sample is runs of
 /// adjacent cells spread evenly over the column, so it sees a value repeated
-/// across the column and one repeated only in a run of neighbours. The empty
-/// string, which a NULL cell also reads as, is no repeat.
+/// across the column and one repeated only in a run of neighbours. A NULL cell
+/// reads as the empty string, so a column of mostly NULLs repeats.
 fn sample_repeats(cells: &[[u8; 16]], heap: &[u8]) -> bool {
     let stride = (cells.len() / SAMPLE_RUNS).max(SAMPLE_RUN);
     let mut seen = FxHashSet::default();
@@ -77,7 +79,7 @@ fn sample_repeats(cells: &[[u8; 16]], heap: &[u8]) -> bool {
         .chunks(stride)
         .flat_map(|run| &run[..run.len().min(SAMPLE_RUN)])
         .map(|cell| german_string_content(cell, heap))
-        .any(|content| !content.is_empty() && !seen.insert(Content(content)))
+        .any(|content| !seen.insert(Content(content)))
 }
 
 /// A string column's image over `heap`, which gains each of the column's

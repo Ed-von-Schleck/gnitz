@@ -4,7 +4,7 @@ use crate::test_support::{
     make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_payload_schema,
 };
 use gnitz_wire::TypeCode;
-use gnitz_zset::repr::{pk_group_end, Batch, BatchBuilder, ShardWriteOpts};
+use gnitz_zset::repr::{pk_group_end, Batch, BatchBuilder};
 use gnitz_zset::schema::key::probe_key;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 use std::path::Path;
@@ -50,10 +50,21 @@ fn test_batch(pks: &[u64], values: &[i64]) -> Batch {
     make_batch_raw(&make_schema_u64_i64(), &rows)
 }
 
-/// A `(U64 PK | I64)` batch of `n` dense keys from `base`, payload = key.
+/// A payload for row `i` that spans the whole I64 range across a batch, so the
+/// writer cannot pack the column and a fixture's bytes follow from its rows.
+fn spread(i: u64) -> i64 {
+    i.wrapping_mul(0x9E37_79B9_7F4A_7C15) as i64
+}
+
+/// [`spread`]'s ascending twin, for the rows of one key: payloads sort a batch.
+fn ramp(i: u64) -> i64 {
+    i64::MIN + ((i as i64) << 48)
+}
+
+/// A `(U64 PK | I64)` batch of `n` dense keys from `base`, payload [`spread`].
 fn dense_batch(base: u64, n: u64) -> Batch {
     let pks: Vec<u64> = (base..base + n).collect();
-    let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
+    let vals: Vec<i64> = pks.iter().map(|&p| spread(p)).collect();
     test_batch(&pks, &vals)
 }
 
@@ -85,7 +96,7 @@ fn assert_stable(len: u64) {
 /// Write `batch` as a published entry of `level_idx`'s guard `key`, creating it,
 /// stamped `stamp`.
 fn seed_guard(idx: &mut ShardIndex, level_idx: usize, key: PkBuf, batch: &Batch, stamp: u64) {
-    let entry = idx.write_shard(batch, ShardWriteOpts::default(), Some(stamp)).unwrap();
+    let entry = idx.write_shard(batch, false, Some(stamp)).unwrap();
     idx.levels[level_idx].get_or_create_guard(key).entries.push(entry);
     idx.mark_published();
 }
@@ -374,16 +385,18 @@ fn a_corrupt_input_body_fails_the_compaction() {
     );
 }
 
-/// Only compaction packs integer payloads; an L0 spill stays raw.
+/// A spill packs its integer payloads as a compaction output does.
 #[test]
-fn compaction_outputs_pack_and_spills_do_not() {
+fn spills_and_compaction_outputs_pack() {
     let dir = tempfile::tempdir().unwrap();
     let mut idx = fresh(dir.path(), make_schema_u64_i64());
     let packed = |e: &ShardEntry| e.shard.packs_payload(0);
     for i in 0..5u64 {
-        idx.append_l0_run(&dense_batch(i * 300, 300)).unwrap();
+        let pks: Vec<u64> = (i * 300..(i + 1) * 300).collect();
+        let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
+        idx.append_l0_run(&test_batch(&pks, &vals)).unwrap();
     }
-    assert!(idx.levels[L0].entries().all(|e| !packed(e)));
+    assert!(idx.levels[L0].entries().all(packed));
     idx.run_compact().unwrap();
     assert!(idx.all_entries().all(packed));
     assert_all_found(&idx, 0..1500);
@@ -547,7 +560,7 @@ fn a_guard_of_one_distinct_key_neither_splits_nor_refolds() {
     // shape, and past the target even with the PK region as compressible as
     // it gets.
     let pks = vec![7u64; 9000];
-    let vals: Vec<i64> = (0..9000).collect();
+    let vals: Vec<i64> = (0..9000).map(ramp).collect();
     seed_guard(&mut idx, L1, gk(7), &test_batch(&pks, &vals), 1);
 
     let target = idx.guard_target_bytes(L1);
@@ -585,7 +598,7 @@ fn trailing_gk(pk_cols: usize, i: u64) -> PkBuf {
 /// One batch of rows `base..base + n` at [`trailing_gk`]'s keys.
 fn trailing_key_batch(pk_cols: usize, base: u64, n: u64) -> Batch {
     let rows: Vec<_> = (base..base + n)
-        .map(|i| (trailing_gk(pk_cols, i).pk_bytes().to_vec(), 1, i as i64))
+        .map(|i| (trailing_gk(pk_cols, i).pk_bytes().to_vec(), 1, spread(i)))
         .collect();
     make_batch_opk(&stride_schema(pk_cols), &rows)
 }
@@ -784,7 +797,7 @@ fn the_guard_count_comes_back_down_after_the_bytes_do() {
     // row, which is the order-of-magnitude shrink the merge pass exists for.
     let keys = 2_500u64;
     let pks: Vec<u64> = (1..=keys).flat_map(|k| std::iter::repeat_n(k, 8)).collect();
-    let vals: Vec<i64> = (0..pks.len() as i64).collect();
+    let vals: Vec<i64> = (0..pks.len() as u64).map(ramp).collect();
     seed_guard(&mut idx, TERMINAL, gk(1), &test_batch(&pks, &vals), 1);
 
     idx.split_overfull_guards(TERMINAL).unwrap();

@@ -26,7 +26,7 @@ use StorageError::Corrupt;
 /// I64 column is one page.
 const DECODE_BLOCK_ROWS: usize = 512;
 
-/// A payload-column region — the only role that may carry [`Encoding::For`].
+/// A payload-column region.
 pub(crate) enum PayloadRegion {
     /// Readable in place: a Raw (stride = width) or Constant (stride 0) region
     /// of the mapping, or `ZERO_CELL` at stride 0 for a column the file predates
@@ -59,6 +59,11 @@ pub(crate) enum WeightRegion {
         value_a: i64,
         value_b: i64,
         bits: *const [u8],
+    },
+    /// An [`Encoding::For`] image of `bw`-byte offsets, read per row in place.
+    For {
+        image: *const [u8],
+        bw: usize,
     },
 }
 
@@ -201,6 +206,10 @@ impl MappedShard {
                 }
                 let (value_a, value_b, bits) = two_value_decode(w.bytes(data));
                 WeightRegion::TwoValue { value_a, value_b, bits }
+            }
+            Encoding::For => {
+                let bw = for_image_bw(w.size, count, FIXED_REGION_BYTES).ok_or(Corrupt("region size"))?;
+                WeightRegion::For { image: w.bytes(data), bw }
             }
             _ => WeightRegion::Mapped(direct_region(data, w, count, FIXED_REGION_BYTES)?),
         };
@@ -397,7 +406,7 @@ impl MappedShard {
             copy_rows(self.pk, schema.pk_stride(), w.pk);
             match &self.weight {
                 WeightRegion::Mapped(cp) => copy_rows(*cp, FIXED_REGION_BYTES, w.weight),
-                WeightRegion::TwoValue { .. } => {
+                WeightRegion::TwoValue { .. } | WeightRegion::For { .. } => {
                     for (i, cell) in w.weight.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                         *cell = self.get_weight(start + i).to_le_bytes();
                     }
@@ -536,6 +545,7 @@ impl ColumnarSource for MappedShard {
             WeightRegion::TwoValue { value_a, value_b, bits } => {
                 two_value_at(*value_a, *value_b, self.mapped(*bits), row)
             }
+            WeightRegion::For { image, bw } => for_at(self.mapped(*image), *bw, row) as i64,
         }
     }
 

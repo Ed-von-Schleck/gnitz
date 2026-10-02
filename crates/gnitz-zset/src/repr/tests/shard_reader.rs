@@ -238,7 +238,7 @@ fn shapes() -> Vec<Shape> {
             ],
         },
         Shape {
-            label: "raw weight, nullable raw i64",
+            label: "for weight, nullable raw i64",
             written: build(nullable_i64, 30, |b, i| {
                 b.begin_row(i as u128 * 5, [1, -1, 2][i % 3]);
                 match i % 4 {
@@ -250,10 +250,21 @@ fn shapes() -> Vec<Shape> {
             pack: true,
             encodings: vec![
                 (REG_PK, Raw),
-                (REG_WEIGHT, Raw),
+                (REG_WEIGHT, For),
                 (REG_NULL_BMP, Raw),
                 (REG_PAYLOAD_START, Raw),
             ],
+        },
+        // Three weights spanning more than a FoR offset holds.
+        Shape {
+            label: "raw weight",
+            written: build(u64_i64, 12, |b, i| {
+                b.begin_row(i as u128, [1, -1, i64::MAX][i % 3]);
+                b.put_int(i as u128);
+            }),
+            reader: u64_i64,
+            pack: false,
+            encodings: vec![(REG_WEIGHT, Raw)],
         },
         Shape {
             label: "constant weight, null and payload",
@@ -609,7 +620,6 @@ fn an_encoding_a_role_may_not_carry_is_rejected() {
         (REG_PK, 0x10), // not an encoding at all
         (REG_PK, Encoding::TwoValue as u8),
         (REG_PK, Encoding::For as u8),
-        (REG_WEIGHT, Encoding::For as u8),
         (REG_NULL_BMP, Encoding::For as u8),
         (blob, Encoding::For as u8),
         (REG_PAYLOAD_START, Encoding::TwoValue as u8),

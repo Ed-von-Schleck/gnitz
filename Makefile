@@ -15,8 +15,10 @@ CLIENTS    ?= 1
 FULL       ?=
 PERF       ?=
 PERF_DWARF ?=
-ROWS       ?=                                # bench-disk: events loaded
-RAM_TIER   ?=                                # bench-disk: GNITZ_RAM_TIER_BYTES for its server
+ROWS       ?=                                # bench-disk: rows loaded per scenario
+RAM_TIER   ?=                                # bench-disk: GNITZ_RAM_TIER_BYTES of its compacted regime
+SCENARIO   ?=                                # bench-disk: comma-separated scenario names
+REGIME     ?=                                # bench-disk: l0, compacted or both
 T          ?=                                # cargo test name filter
 K          ?=                                # pytest -k expression
 
@@ -172,10 +174,11 @@ bench: release-server pyext-release ## Run the SQL benchmark suite
 # Bytes, not time: a run prints what the data directory holds once the final
 # checkpoint has put every store on disk.
 bench-disk: WORKERS = 4
-bench-disk: release-server pyext-release ## Disk footprint of a string-heavy table and its views (knobs: WORKERS, ROWS, RAM_TIER)
+bench-disk: release-server pyext-release ## Disk footprint by scenario and LSM regime (knobs: WORKERS, ROWS, RAM_TIER, SCENARIO, REGIME)
 	cd crates/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release \
 		uv run python ../../benchmarks/disk.py --workers=$(WORKERS) \
-		$(if $(ROWS),--rows=$(ROWS)) $(if $(RAM_TIER),--ram-tier-bytes=$(RAM_TIER))
+		$(if $(ROWS),--rows=$(ROWS)) $(if $(RAM_TIER),--ram-tier-bytes=$(RAM_TIER)) \
+		$(if $(SCENARIO),--scenario=$(SCENARIO)) $(if $(REGIME),--regime=$(REGIME))
 
 bench-full: WORKERS = 4
 bench-full: FULL    = 1

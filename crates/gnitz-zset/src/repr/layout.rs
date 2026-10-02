@@ -9,7 +9,7 @@ use StorageError::Corrupt;
 pub(crate) const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
 /// Bumped by hand for any change to the bytes a writer produces;
 /// `shard_bytes_are_pinned` fails until it is.
-pub(crate) const SHARD_EPOCH: u64 = 22;
+pub(crate) const SHARD_EPOCH: u64 = 23;
 
 /// Compared for equality at open. A shard sizes its regions from the live
 /// schema, so a system-table shape change must refuse the file, not reinterpret it.
@@ -289,6 +289,13 @@ fn for_encode_cells<const W: usize, const SIGNED: bool>(src: &[u8]) -> Option<Ve
     Some(image)
 }
 
+/// Row `row` of a FoR image of `bw`-byte offsets, widened to 64 bits.
+#[inline(always)]
+pub(crate) fn for_at(image: &[u8], bw: usize, row: usize) -> u64 {
+    let packed = u64::from_le_bytes(*image[for_cell_at(row, bw)..].first_chunk().unwrap());
+    (packed & gnitz_wire::low_bits_mask(8 * bw)).wrapping_add(read_u64_le(image, FOR_REFERENCE_AT))
+}
+
 /// Decode rows `first_row..` of a FoR image back to their raw little-endian
 /// form, `out.len() / elem_width` rows.
 pub(crate) fn for_decode(image: &[u8], bw: usize, elem_width: usize, first_row: usize, out: &mut [u8]) {
@@ -437,7 +444,8 @@ pub(crate) enum Encoding {
     Constant = 1,
     /// A weight region of exactly two distinct weights.
     TwoValue = 2,
-    /// Frame-of-reference: a payload column of a 2-, 4- or 8-byte integer type.
+    /// Frame-of-reference: a payload column of a 2-, 4- or 8-byte integer type,
+    /// or a weight region of three or more distinct weights.
     For = 3,
     /// Dictionary: a German-string payload column as its distinct cells and one
     /// code per row.
